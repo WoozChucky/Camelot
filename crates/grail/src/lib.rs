@@ -14,6 +14,7 @@ pub mod display;
 pub mod elf;
 pub mod framebuffer;
 pub mod keyboard;
+pub mod pointer;
 pub mod sysinfo;
 pub mod trap;
 #[cfg(windows)]
@@ -26,6 +27,7 @@ use bus::{Bus, Exit, MAX_DISKS};
 pub use config::{parse_clock, parse_ram_mib, DiskConfig, MachineConfig, DEFAULT_RAM_SIZE};
 use cpu::Cpu;
 use keyboard::KeyEvent;
+use pointer::PointerInput;
 use std::io::Write;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -134,6 +136,16 @@ impl Machine {
     /// code table (see [`keyboard::code::is_valid`]), or the keyboard FIFO is full.
     pub fn key_event(&mut self, ev: KeyEvent) -> bool {
         self.cpu.bus.kbd.push(ev)
+    }
+
+    /// Hands a change of the host's pointer (mouse) to the pointer device (spec section
+    /// 9.7): where it is now, in framebuffer pixels, or how far it moved; the buttons
+    /// held; the wheel notches turned. Like [`Machine::key_event`], this is the one way in
+    /// for every producer: the framebuffer window, tests, or a remote viewer. Returns
+    /// true if it queued an event; false if the change is invisible to the program in
+    /// the mode it chose (see [`pointer::Pointer::push`]) or the FIFO is full.
+    pub fn pointer_event(&mut self, input: PointerInput) -> bool {
+        self.cpu.bus.ptr.push(input)
     }
 
     /// Exit code, once the program has asked to stop.
