@@ -102,6 +102,8 @@ const BOOT_FAULT_MEGAPAGE: u32 = 8;
 const BOOT_FAULT_KFREE_UNALIGNED: u32 = 9;
 const BOOT_FAULT_KFREE_KERNEL: u32 = 10;
 const BOOT_FAULT_KFREE_PAST_RAM: u32 = 11;
+const BOOT_FAULT_DOUBLE_ACQUIRE: u32 = 12;
+const BOOT_FAULT_RELEASE_UNHELD: u32 = 13;
 /// Where `BOOT_FAULT_LOAD` loads from: below the boot ROM, nothing is mapped.
 const UNMAPPED_ADDR: u32 = 0x100;
 
@@ -985,6 +987,24 @@ fn kfree_panics_on_a_bad_page() {
     assert!(addr > sym(&elf, "__kernel_end") && addr < ram_end, "{addr:#x}");
 }
 
+#[test]
+fn acquiring_a_held_lock_panics() {
+    // Issue #61: a hart that acquires a lock it already holds would spin on
+    // it forever; acquire panics instead, naming the lock and the hart.
+    assert_misuse_panics(
+        BOOT_FAULT_DOUBLE_ACQUIRE,
+        "panic: acquire: lock \"boot_fault\" already held by hart 0\n",
+    );
+}
+
+#[test]
+fn releasing_a_lock_not_held_panics() {
+    assert_misuse_panics(
+        BOOT_FAULT_RELEASE_UNHELD,
+        "panic: release: lock \"boot_fault\" not held by hart 0\n",
+    );
+}
+
 // ---- Memory: the page allocator and the kernel page table ----
 
 const PAGE: u32 = 4096;
@@ -1831,7 +1851,7 @@ const USER_LOAD_TOP: u32 = USER_STACK - PAGE;
 /// Where user programs start (kernel/user/user.ld): crt0's `_start`.
 const USER_TEXT: u32 = 0x1000;
 /// `sizeof(struct trap_frame)` (kernel/include/trap.h).
-const TRAP_FRAME_SIZE: u32 = 144;
+const TRAP_FRAME_SIZE: u32 = 160;
 /// Process slots (`NPROC`, kernel/include/proc.h).
 const NPROC: usize = 8;
 /// Offset of `name` in `struct proc` (kernel/include/proc.h).
@@ -1937,8 +1957,8 @@ fn user_string(m: &Machine, satp: u32, va: u32) -> String {
     String::from_utf8(s).unwrap()
 }
 
-/// The name of the process on the CPU (`current` in kernel/proc.c), or
-/// `None` in the scheduler.
+/// The name of the process on hart 0 (`cpus[0].proc` in kernel/spinlock.c,
+/// the first field of `struct cpu`), or `None` in the scheduler.
 fn current_name(cpu: &grail::cpu::Cpu, current: u32) -> Option<String> {
     let p = cpu.bus.peek(current).unwrap();
     if p == 0 {
@@ -1953,7 +1973,7 @@ fn current_name(cpu: &grail::cpu::Cpu, current: u32) -> Option<String> {
 
 /// Steps `m` until program `name` runs in U-mode.
 fn step_to_user(m: &mut Machine, elf: &grail::elf::Elf, name: &str) {
-    let current = sym(elf, "current");
+    let current = sym(elf, "cpus");
     step_until(
         m,
         RUN_MAX_STEPS,
@@ -2046,8 +2066,8 @@ fn the_shell_is_the_first_process() {
     let (mut m, elf) = load_committed();
     step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
     let c = &m.cpu;
-    assert_eq!(current_name(c, sym(&elf, "current")).as_deref(), Some("sh"));
-    let pid = m.cpu.bus.peek(m.cpu.bus.peek(sym(&elf, "current")).unwrap() + 4);
+    assert_eq!(current_name(c, sym(&elf, "cpus")).as_deref(), Some("sh"));
+    let pid = m.cpu.bus.peek(m.cpu.bus.peek(sym(&elf, "cpus")).unwrap() + 4);
     assert_eq!(pid, Some(1));
     assert_eq!(c.pc, USER_TEXT);
     let (sp, argv) = (c.x[2], c.x[x("a1") as usize]);
@@ -2142,7 +2162,7 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
         MachineConfig::default(),
         Some(kernel::typed(b"ding & dong\nwait\nexit\n")),
     );
-    let (user_vec, current) = (sym(&elf, "user_vec"), sym(&elf, "current"));
+    let (user_vec, current) = (sym(&elf, "user_vec"), sym(&elf, "cpus"));
     // The process of each stretch in U-mode, and the last trap from it:
     // (scause, whether it was the exit call).
     let mut stretches: Vec<(String, u32)> = Vec::new();
@@ -2705,6 +2725,76 @@ fn processes_give_back_every_page() {
     step_to_user(&mut m, &elf, "ding");
     let pages = expected_user_pages(&user_program("ding").elf).len() as u32;
     assert_eq!(free_pages(&m, &elf), before - 3 - pages);
+}
+
+/// Checks stress's console output for `workers` workers and `rounds` rounds
+/// (kernel/user/stress.c): each `stress W: round R` line exactly once, each
+/// worker's rounds in order, and the final verdict.
+fn check_stress_output(lines: &[&str], workers: u32, rounds: u32) {
+    let mut next = vec![1; workers as usize + 1];
+    for line in &lines[..lines.len() - 1] {
+        let (w, r) = line
+            .strip_prefix("stress ")
+            .and_then(|l| l.split_once(": round "))
+            .unwrap_or_else(|| panic!("{line:?} in {lines:#?}"));
+        let (w, r): (usize, u32) = (w.parse().unwrap(), r.parse().unwrap());
+        assert_eq!(r, next[w], "worker {w} in {lines:#?}");
+        next[w] += 1;
+    }
+    assert!(next[1..].iter().all(|&n| n == rounds + 1), "{lines:#?}");
+    assert_eq!(
+        lines.last(),
+        Some(
+            &format!(
+                "stress: {workers} workers, {rounds} rounds, {} bytes: ok",
+                workers * rounds * 200
+            )
+            .as_str()
+        )
+    );
+}
+
+#[test]
+fn stress_runs_many_processes_through_the_locks() {
+    // Issue #61's stress program: six workers (with the shell and stress,
+    // every process slot) allocating and freeing pages, printing, and
+    // writing records down one pipe, all under timer preemption. Every
+    // record arrives whole and in order, every page comes back, and the
+    // workers really do take turns in the middle of their rounds.
+    const LINE: &str = "stress 6 3";
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
+    step_to_prompt(&mut m, 1);
+    let before = free_pages(&m, &elf);
+    for b in format!("{LINE}\n").bytes() {
+        tx.send(b).unwrap();
+    }
+    // Counts the switches from one process to another in U-mode: with the
+    // workers spinning, most are timer ticks preempting them.
+    let current = sym(&elf, "cpus");
+    let (mut last, mut switches) = (0, 0);
+    let printed_before = m.cpu.bus.uart.captured.len();
+    let mut steps = 0;
+    while !m.cpu.bus.uart.captured[printed_before..].ends_with(PROMPT.as_bytes()) {
+        assert!(steps < RUN_MAX_STEPS, "stress never ended:\n{}", printed(&m));
+        let p = m.cpu.bus.peek(current).unwrap();
+        if m.cpu.mode == Mode::U && p != last {
+            if last != 0 && current_name(&m.cpu, current).as_deref() == Some("stress") {
+                switches += 1;
+            }
+            last = p;
+        }
+        m.cpu.step();
+        steps += 1;
+    }
+    let out = printed(&m);
+    check_stress_output(&command_output(&out, LINE), 6, 3);
+    assert!(switches >= 6 * 3, "{switches} switches between processes");
+    assert_eq!(free_pages(&m, &elf), before);
+    for &b in EXIT {
+        tx.send(b).unwrap();
+    }
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
 }
 
 #[test]
