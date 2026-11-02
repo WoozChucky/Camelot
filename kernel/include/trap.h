@@ -2,28 +2,42 @@
 #ifndef CAMELOT_TRAP_H
 #define CAMELOT_TRAP_H
 
+#include "spinlock.h"
 #include "types.h"
 
 /* What kernel_vec (kernelvec.s) saves on the stack, and user_vec (uservec.s)
  * in a process's trap frame. The offsets are a contract with both: regs[i]
- * at 4*i, sepc at 128, scause at 132, stval at 136, sstatus at 140. Both
- * write sepc and sstatus back before sret, so a handler may change where
- * execution resumes. */
+ * at 4*i, sepc at 128, scause at 132, stval at 136, sstatus at 140,
+ * kernel_tp at 144. Both write sepc and sstatus back before sret, so a
+ * handler may change where execution resumes. */
 struct trap_frame {
     u32 regs[32]; /* x0-x31 as they were at the trap; regs[0] is always 0 */
     u32 sepc;
     u32 scause;
     u32 stval;
     u32 sstatus;
+    /* The hart's id, which user_vec puts in tp (the program's tp is in
+     * regs[4]): user_trap_return() sets it before each return to U-mode, so
+     * a process that moves to another hart takes that hart's id with it.
+     * Not used in kernel_vec's frames, where tp is the kernel's already. */
+    u32 kernel_tp;
+    u32 pad[3]; /* to a multiple of 16 bytes, for the stack below */
 };
 
-#define TRAP_FRAME_SIZE 144
+#define TRAP_FRAME_SIZE 160
 
 /* Exit code after a kernel panic. (0xff means an unexpected M-mode trap.) */
 #define PANIC_EXIT_CODE 0xfe
 
-/* Timer ticks since boot, counted by kernel_trap. */
+/* Timer ticks since boot, counted by kernel_trap under `tickslock` (which
+ * the sleep system call sleeps with). A single aligned word, so reading it
+ * needs no lock. */
 extern volatile u32 ticks;
+extern struct spinlock tickslock;
+
+/* Set once the kernel panics: kprintf() stops taking the UART's lock, which
+ * the code that panicked may hold. */
+extern volatile bool panicking;
 
 /* S-mode trap vector; start() points stvec at it. */
 void kernel_vec(void);

@@ -102,6 +102,11 @@ const BOOT_FAULT_MEGAPAGE: u32 = 8;
 const BOOT_FAULT_KFREE_UNALIGNED: u32 = 9;
 const BOOT_FAULT_KFREE_KERNEL: u32 = 10;
 const BOOT_FAULT_KFREE_PAST_RAM: u32 = 11;
+const BOOT_FAULT_DOUBLE_ACQUIRE: u32 = 12;
+const BOOT_FAULT_RELEASE_UNHELD: u32 = 13;
+const BOOT_FAULT_YIELD_HOLDING: u32 = 14;
+const BOOT_FAULT_POP_UNMATCHED: u32 = 15;
+const BOOT_FAULT_POP_INTR_ON: u32 = 16;
 /// Where `BOOT_FAULT_LOAD` loads from: below the boot ROM, nothing is mapped.
 const UNMAPPED_ADDR: u32 = 0x100;
 
@@ -578,7 +583,7 @@ fn reg_pattern(tag: u32, sp: u32) -> [u32; 32] {
 }
 
 /// Boots the committed kernel up to kmain, then turns kmain into `j .; j .`
-/// and fills every register but sp with `reg_pattern(0xa5, ..)`: busy code
+/// and fills every register but sp and tp with `reg_pattern(0xa5, ..)`: busy code
 /// with every register live. S-mode interrupts are on, as after trap_init.
 /// Returns the machine, the ELF and the registers.
 fn busy_kmain() -> (Machine, grail::elf::Elf, [u32; 32]) {
@@ -587,7 +592,10 @@ fn busy_kmain() -> (Machine, grail::elf::Elf, [u32; 32]) {
     step_to(&mut m, kmain);
     let code: Vec<u8> = [J_SELF, J_SELF].iter().flat_map(|w| w.to_le_bytes()).collect();
     m.cpu.bus.load(kmain, &code).unwrap();
-    let regs = reg_pattern(0xa5, m.cpu.x[2]);
+    let mut regs = reg_pattern(0xa5, m.cpu.x[2]);
+    // tp keeps the hart's id: kernel code finds its `struct cpu` through it
+    // (spec section 10, "Kernel locking"), and the trap handlers take locks.
+    regs[x("tp") as usize] = m.cpu.x[x("tp") as usize];
     m.cpu.x = regs;
     m.cpu.csr.mie |= 1 << IRQ_S_SOFT;
     m.cpu.csr.mstatus |= MSTATUS_SIE;
@@ -983,6 +991,43 @@ fn kfree_panics_on_a_bad_page() {
     let addr = u32::from_str_radix(addr, 16).unwrap();
     assert_eq!(addr % PAGE, 4, "{addr:#x}");
     assert!(addr > sym(&elf, "__kernel_end") && addr < ram_end, "{addr:#x}");
+}
+
+#[test]
+fn acquiring_a_held_lock_panics() {
+    // Issue #61: a hart that acquires a lock it already holds would spin on
+    // it forever; acquire panics instead, naming the lock and the hart.
+    assert_misuse_panics(
+        BOOT_FAULT_DOUBLE_ACQUIRE,
+        "panic: acquire: lock \"boot_fault\" already held by hart 0\n",
+    );
+}
+
+#[test]
+fn releasing_a_lock_not_held_panics() {
+    assert_misuse_panics(
+        BOOT_FAULT_RELEASE_UNHELD,
+        "panic: release: lock \"boot_fault\" not held by hart 0\n",
+    );
+}
+
+#[test]
+fn yielding_while_holding_a_lock_panics() {
+    // A process that gave up the CPU holding a spinlock would leave
+    // interrupts off and the lock taken for whoever runs next: sched()
+    // allows proc_lock and nothing else.
+    assert_misuse_panics(
+        BOOT_FAULT_YIELD_HOLDING,
+        "panic: sched: holding a lock other than proc_lock\n",
+    );
+}
+
+#[test]
+fn unbalanced_pop_off_panics() {
+    // A pop_off() with no push_off() to match, and one that finds
+    // interrupts back on under a push_off().
+    assert_misuse_panics(BOOT_FAULT_POP_UNMATCHED, "panic: pop_off: no push_off to match\n");
+    assert_misuse_panics(BOOT_FAULT_POP_INTR_ON, "panic: pop_off: interrupts are on\n");
 }
 
 // ---- Memory: the page allocator and the kernel page table ----
@@ -1831,7 +1876,7 @@ const USER_LOAD_TOP: u32 = USER_STACK - PAGE;
 /// Where user programs start (kernel/user/user.ld): crt0's `_start`.
 const USER_TEXT: u32 = 0x1000;
 /// `sizeof(struct trap_frame)` (kernel/include/trap.h).
-const TRAP_FRAME_SIZE: u32 = 144;
+const TRAP_FRAME_SIZE: u32 = 160;
 /// Process slots (`NPROC`, kernel/include/proc.h).
 const NPROC: usize = 8;
 /// Offset of `name` in `struct proc` (kernel/include/proc.h).
@@ -1937,23 +1982,86 @@ fn user_string(m: &Machine, satp: u32, va: u32) -> String {
     String::from_utf8(s).unwrap()
 }
 
-/// The name of the process on the CPU (`current` in kernel/proc.c), or
-/// `None` in the scheduler.
+/// The name of the process on hart 0 (`cpus[0].proc` in kernel/spinlock.c,
+/// the first field of `struct cpu`), or `None` in the scheduler.
 fn current_name(cpu: &grail::cpu::Cpu, current: u32) -> Option<String> {
     let p = cpu.bus.peek(current).unwrap();
     if p == 0 {
         return None;
     }
+    Some(proc_name(cpu, p))
+}
+
+/// The name of the process whose `struct proc` is at `p`.
+fn proc_name(cpu: &grail::cpu::Cpu, p: u32) -> String {
     let bytes: Vec<u8> = (0..16)
         .map(|i| peek_byte(&cpu.bus, p + PROC_NAME + i))
         .take_while(|&b| b != 0)
         .collect();
-    Some(String::from_utf8(bytes).unwrap())
+    String::from_utf8(bytes).unwrap()
+}
+
+/// The kernel's spinlocks that are variables of their own (the per-pipe,
+/// per-disk and the log's live inside other structures).
+const NAMED_LOCKS: [&str; 9] = [
+    "kmem_lock",
+    "proc_lock",
+    "tickslock",
+    "cons_lock",
+    "uart_tx_lock",
+    "ftable_lock",
+    "bcache_lock",
+    "itable_lock",
+    "net_lock",
+];
+/// Offsets in `struct cpu` and `struct spinlock` (kernel/include/spinlock.h).
+const CPU_NOFF: u32 = 4;
+const LOCK_CPU: u32 = 4;
+
+/// Watches hart 0's locking state: whenever a process runs in U-mode, the
+/// hart holds no spinlock and has no push_off() pending (a lock or a
+/// push_off leaked on some path would show up here long before the deadlock
+/// it leads to).
+struct LockWatch {
+    noff: u32,
+    locks: Vec<(&'static str, u32)>,
+    was_user: bool,
+}
+
+impl LockWatch {
+    fn new(elf: &grail::elf::Elf) -> LockWatch {
+        LockWatch {
+            noff: sym(elf, "cpus") + CPU_NOFF,
+            locks: NAMED_LOCKS.iter().map(|&n| (n, sym(elf, n))).collect(),
+            was_user: false,
+        }
+    }
+
+    /// Called before each step: checks the state on every entry to U-mode.
+    fn step(&mut self, cpu: &grail::cpu::Cpu) {
+        let is_user = cpu.mode == Mode::U;
+        if is_user && !self.was_user {
+            assert_eq!(
+                cpu.bus.peek(self.noff),
+                Some(0),
+                "push_off() depth in U-mode at {:#x}",
+                cpu.pc
+            );
+            for &(name, lock) in &self.locks {
+                let held = (
+                    cpu.bus.peek(lock).unwrap(),
+                    cpu.bus.peek(lock + LOCK_CPU).unwrap(),
+                );
+                assert_eq!(held, (0, 0), "{name} held in U-mode at {:#x}", cpu.pc);
+            }
+        }
+        self.was_user = is_user;
+    }
 }
 
 /// Steps `m` until program `name` runs in U-mode.
 fn step_to_user(m: &mut Machine, elf: &grail::elf::Elf, name: &str) {
-    let current = sym(elf, "current");
+    let current = sym(elf, "cpus");
     step_until(
         m,
         RUN_MAX_STEPS,
@@ -2051,8 +2159,8 @@ fn the_shell_is_the_first_process() {
     let (mut m, elf) = load_committed();
     step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
     let c = &m.cpu;
-    assert_eq!(current_name(c, sym(&elf, "current")).as_deref(), Some("sh"));
-    let pid = m.cpu.bus.peek(m.cpu.bus.peek(sym(&elf, "current")).unwrap() + 4);
+    assert_eq!(current_name(c, sym(&elf, "cpus")).as_deref(), Some("sh"));
+    let pid = m.cpu.bus.peek(m.cpu.bus.peek(sym(&elf, "cpus")).unwrap() + 4);
     assert_eq!(pid, Some(1));
     assert_eq!(c.pc, USER_TEXT);
     let (sp, argv) = (c.x[2], c.x[x("a1") as usize]);
@@ -2147,7 +2255,7 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
         MachineConfig::default(),
         Some(kernel::typed(b"ding & dong\nwait\nexit\n")),
     );
-    let (user_vec, current) = (sym(&elf, "user_vec"), sym(&elf, "current"));
+    let (user_vec, current) = (sym(&elf, "user_vec"), sym(&elf, "cpus"));
     // The process of each stretch in U-mode, and the last trap from it:
     // (scause, whether it was the exit call).
     let mut stretches: Vec<(String, u32)> = Vec::new();
@@ -2214,6 +2322,31 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
         out.contains(&format!("{PROMPT}wait\n[2] ding: exit 0\n{PROMPT}exit\n")),
         "{out}"
     );
+}
+
+/// Offset of `kernel_tp` in the trap frame (kernel/include/trap.h).
+const FRAME_KERNEL_TP: u32 = 144;
+
+#[test]
+fn every_return_to_user_mode_sets_the_frames_hart_id() {
+    // user_vec loads tp, the hart's id in the kernel, from the frame's
+    // kernel_tp, so user_trap_return must write it on every way back to
+    // U-mode. On hart 0 a frame that was never written already reads 0, so
+    // the test spoils it while the process is in the kernel and checks that
+    // it reads 0 again once the process is back in U-mode.
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(kernel::typed(b"ding\nexit\n")));
+    step_to_user(&mut m, &elf, "ding");
+    let user_trap = sym(&elf, "user_trap");
+    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.pc == user_trap);
+    let frame = m.cpu.x[x("a0") as usize];
+    assert_eq!(m.cpu.bus.peek(frame + FRAME_KERNEL_TP), Some(0));
+    m.cpu
+        .bus
+        .load(frame + FRAME_KERNEL_TP, &0xdead_beefu32.to_le_bytes())
+        .unwrap();
+    step_to_user(&mut m, &elf, "ding");
+    assert_eq!(m.cpu.bus.peek(frame + FRAME_KERNEL_TP), Some(0));
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
 }
 
 #[test]
@@ -2710,6 +2843,187 @@ fn processes_give_back_every_page() {
     step_to_user(&mut m, &elf, "ding");
     let pages = expected_user_pages(&user_program("ding").elf).len() as u32;
     assert_eq!(free_pages(&m, &elf), before - 3 - pages);
+}
+
+/// Checks stress's console output for `workers` workers and `rounds` rounds
+/// (kernel/user/stress.c): each `stress W: round R` line exactly once, each
+/// worker's rounds in order, and the final verdict.
+fn check_stress_output(lines: &[&str], workers: u32, rounds: u32) {
+    let mut next = vec![1; workers as usize + 1];
+    for line in &lines[..lines.len() - 1] {
+        let (w, r) = line
+            .strip_prefix("stress ")
+            .and_then(|l| l.split_once(": round "))
+            .unwrap_or_else(|| panic!("{line:?} in {lines:#?}"));
+        let (w, r): (usize, u32) = (w.parse().unwrap(), r.parse().unwrap());
+        assert_eq!(r, next[w], "worker {w} in {lines:#?}");
+        next[w] += 1;
+    }
+    assert!(next[1..].iter().all(|&n| n == rounds + 1), "{lines:#?}");
+    assert_eq!(
+        lines.last(),
+        Some(
+            &format!(
+                "stress: {workers} workers, {rounds} rounds, {} bytes: ok",
+                workers * rounds * 200
+            )
+            .as_str()
+        )
+    );
+}
+
+#[test]
+fn stress_runs_many_processes_through_the_locks() {
+    // Issue #61's stress program: six workers (with the shell and stress,
+    // every process slot) allocating and freeing pages, printing, and
+    // writing records down one pipe, all under timer preemption. Each
+    // worker's bytes arrive complete and in order (possibly interleaved
+    // with the other workers'), every page comes back, the workers really
+    // are preempted by timer ticks in the middle of their rounds, and no
+    // lock is left held whenever a process runs in U-mode.
+    const LINE: &str = "stress 6 3";
+    const WORKERS: usize = 6;
+    const ROUNDS: u32 = 3;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
+    step_to_prompt(&mut m, 1);
+    let before = free_pages(&m, &elf);
+    for b in format!("{LINE}\n").bytes() {
+        tx.send(b).unwrap();
+    }
+    // A worker in spin() is inside heap_round, between the sbrk that grows
+    // its heap and the one that shrinks it.
+    let spin = elf32::Elf::parse(&user_program("stress").elf)
+        .unwrap()
+        .symbols()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.name == "spin")
+        .map(|s| s.value..s.value + s.size)
+        .unwrap();
+    assert!(!spin.is_empty());
+    // Every switch from a stress process to another process in U-mode, and
+    // what made it leave: preemptions are the switches whose last trap from
+    // U-mode was a timer tick (as in ding_and_dong_take_turns_on_timer_ticks).
+    let (current, user_vec) = (sym(&elf, "cpus"), sym(&elf, "user_vec"));
+    let (mut last, mut last_trap) = (0, None);
+    let (mut preemptions, mut in_heap_round) = (0, HashMap::new());
+    let mut locks = LockWatch::new(&elf);
+    let printed_before = m.cpu.bus.uart.captured.len();
+    let mut steps = 0;
+    while !m.cpu.bus.uart.captured[printed_before..].ends_with(PROMPT.as_bytes()) {
+        assert!(steps < RUN_MAX_STEPS, "stress never ended:\n{}", printed(&m));
+        locks.step(&m.cpu);
+        if m.cpu.mode == Mode::U {
+            let p = m.cpu.bus.peek(current).unwrap();
+            if p != last {
+                let prev = last;
+                last = p;
+                if let Some((cause, pc)) = last_trap.take() {
+                    if prev != 0 && cause == INTERRUPT_BIT | IRQ_S_SOFT && proc_name(&m.cpu, prev) == "stress"
+                    {
+                        preemptions += 1;
+                        if spin.contains(&pc) {
+                            *in_heap_round.entry(prev).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if m.cpu.pc == user_vec {
+            last_trap = Some((m.cpu.csr.scause, m.cpu.csr.sepc));
+        }
+        m.cpu.step();
+        steps += 1;
+    }
+    let out = printed(&m);
+    check_stress_output(&command_output(&out, LINE), WORKERS as u32, ROUNDS);
+    // Each worker spins about half a tick per round, so ticks land in most
+    // rounds' spins (28 of the 18 rounds' spins and 45 preemptions in all
+    // when this was written); voluntary switches, sleeping on the pipe or
+    // exiting, don't count. With the tick's yield() taken out of user_trap
+    // there are none, though the processes still switch dozens of times.
+    assert!(
+        in_heap_round.len() == WORKERS && in_heap_round.values().all(|&n| n >= 1),
+        "workers preempted in heap_round: {in_heap_round:?}"
+    );
+    let total: u32 = in_heap_round.values().sum();
+    assert!(
+        total >= WORKERS as u32 * ROUNDS / 2,
+        "{total} preemptions in heap_round"
+    );
+    assert!(
+        preemptions >= WORKERS as u32 * ROUNDS,
+        "{preemptions} preemptions"
+    );
+    assert_eq!(free_pages(&m, &elf), before);
+    for &b in EXIT {
+        tx.send(b).unwrap();
+    }
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
+}
+
+#[test]
+fn killing_stress_workers_mid_run_leaves_no_lock_held() {
+    // Two of stress's workers killed while they go through the locked paths
+    // (sbrk, the console, the pipe): they end with -1, stress says so, the
+    // others finish, and no lock or push_off() is left behind.
+    const LINE: &str = "stress 4 8 &";
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
+    step_to_prompt(&mut m, 1);
+    let before = free_pages(&m, &elf);
+    // stress is pid 2 and its workers 4 to 7 (the shell starts `sleep 3`, pid
+    // 3, before stress spawns them); by the end of the sleep each is a few
+    // rounds in, so the kills land in the middle of their work.
+    for b in format!("{LINE}\nsleep 3\nps\nkill 4\nkill 6\nwait\n").bytes() {
+        tx.send(b).unwrap();
+    }
+    let mut locks = LockWatch::new(&elf);
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |cpu| locks.step(cpu),
+        |m| m.cpu.bus.uart.captured.ends_with(b"[2] stress: exit 1\n$ "),
+    );
+    let out = printed(&m);
+    // ps shows whom the kills hit: two of stress's children.
+    for pid in ["4", "6"] {
+        assert!(
+            command_output(&out, "ps").iter().any(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() == 5 && f[0] == pid && f[1] == "2" && f[4] == "stress"
+            }),
+            "{out}"
+        );
+    }
+    let lines: Vec<&str> = out[out.find(&format!("{PROMPT}{LINE}\n")).unwrap()..]
+        .lines()
+        .collect();
+    for w in 1..=4 {
+        // The killed workers stop partway; the others finish every round.
+        let rounds = lines
+            .iter()
+            .filter(|l| l.starts_with(&format!("stress {w}: round ")))
+            .count();
+        assert_eq!(rounds == 8, w % 2 == 0, "worker {w}: {rounds} rounds\n{out}");
+    }
+    assert!(
+        command_output(&out, "wait").ends_with(&[
+            "stress: worker 1: exit -1",
+            "stress: worker 3: exit -1",
+            "[2] stress: exit 1"
+        ]),
+        "{out}"
+    );
+    assert_eq!(free_pages(&m, &elf), before);
+    for &b in EXIT {
+        tx.send(b).unwrap();
+    }
+    assert_eq!(
+        m.run(Some(RUN_MAX_STEPS), |cpu| locks.step(cpu)),
+        RunResult::Exited(0)
+    );
 }
 
 #[test]

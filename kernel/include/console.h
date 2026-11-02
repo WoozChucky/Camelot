@@ -11,6 +11,9 @@
 /* Longest input line in bytes, its newline included. */
 #define CONSOLE_LINE_MAX 128
 
+/* Sets up the console's lock. kmain calls it before interrupts are on. */
+void console_init(void);
+
 /* The UART's interrupt: moves received bytes into its ring buffer
  * (uart_intr) and wakes the processes waiting in console_read(). */
 void console_intr(void);

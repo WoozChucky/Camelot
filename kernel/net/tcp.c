@@ -235,7 +235,7 @@ static void drop_buffers(struct tcp_sock *s) {
 
 /* ---- sockets ---- */
 
-static void release(struct tcp_sock *s) {
+static void tcp_free(struct tcp_sock *s) {
     drop_buffers(s);
     s->used = false;
     s->state = TCP_CLOSED;
@@ -262,7 +262,7 @@ static struct tcp_sock *alloc(void) {
         if (s == NULL) {
             return NULL;
         }
-        release(s);
+        tcp_free(s);
     }
     memset(s, 0, sizeof *s);
     s->used = true;
@@ -493,7 +493,7 @@ static void closed(struct tcp_sock *s, int err) {
             s->listener->queued--;
             s->listener = NULL;
         }
-        release(s);
+        tcp_free(s);
     }
 }
 
@@ -646,7 +646,7 @@ static void listen_input(struct tcp_sock *l, const struct seg *g) {
     }
     struct tcp_sock *c = l->queued < l->backlog ? alloc() : NULL;
     if (c != NULL && !get_buffers(c)) {
-        release(c);
+        tcp_free(c);
         c = NULL;
     }
     if (c == NULL) {
@@ -1295,14 +1295,14 @@ void tcp_close(struct tcp_sock *s) {
             if (c->used && c->listener == s) {
                 send_rst(c);
                 c->listener = NULL;
-                release(c);
+                tcp_free(c);
             }
         }
-        release(s);
+        tcp_free(s);
         return;
     }
     if (s->state == TCP_CLOSED || s->state == TCP_SYN_SENT) {
-        release(s);
+        tcp_free(s);
         return;
     }
     bool open = s->state == TCP_SYN_RECEIVED || s->state == TCP_ESTABLISHED || s->state == TCP_CLOSE_WAIT ||
@@ -1310,7 +1310,7 @@ void tcp_close(struct tcp_sock *s) {
     if (open && (s->rlen > 0 || s->state == TCP_SYN_RECEIVED)) {
         /* Data that will never be read: the peer must not think it was. */
         send_rst(s);
-        release(s);
+        tcp_free(s);
         return;
     }
     s->owned = false;

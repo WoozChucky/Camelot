@@ -7,8 +7,10 @@
 #ifndef CAMELOT_PROC_H
 #define CAMELOT_PROC_H
 
+#include "context.h"
 #include "elf.h"
 #include "file.h"
+#include "spinlock.h"
 #include "syscall.h"
 #include "trap.h"
 #include "types.h"
@@ -28,18 +30,15 @@
 #define PROC_SLEEPING 4 /* waiting in sleep() for a wakeup() on its channel */
 #define PROC_NEW 5      /* taken by proc_create(), which may sleep reading the program */
 
-/* What swtch() saves of a kernel thread: the return address, the stack
- * pointer and the callee-saved registers, which is all a function call has
- * to preserve. swtch.s uses the same offsets (ra at 0, sp at 4, s0-s11 from
- * 8): keep them in sync. */
-struct context {
-    u32 ra;
-    u32 sp;
-    u32 s[12];
-};
-
 /* The fields up to `name` are at fixed offsets (state 0, pid 4, name 8):
- * the kernel tests read them. */
+ * the kernel tests read them.
+ *
+ * Locking: `proc_lock` (proc.c) protects every slot's state, pid, name,
+ * parent, xstatus, chan and killed, and the scheduler's choices. What only
+ * the process itself changes (its address space, heap, files, working
+ * directory, trap frame and context) needs no lock while it runs; others
+ * (ps) read it under proc_lock and may see it just before or after a
+ * change. */
 struct proc {
     u32 state;
     u32 pid;
@@ -110,8 +109,12 @@ struct proc_args {
     char strings[ARG_MAX];
 };
 
-/* The process on the CPU, or NULL while the kernel runs for itself (kmain,
- * the scheduler loop). */
+/* Sets up the process table's lock. kmain calls it before anything starts a
+ * process. */
+void proc_init(void);
+
+/* The process on this hart (mycpu()->proc), or NULL while the kernel runs
+ * for itself (kmain, the scheduler loop). */
 struct proc *myproc(void);
 
 /* Makes a runnable process called `name` from the executable `prog`, a
@@ -159,14 +162,19 @@ void scheduler(void);
 
 /* Puts the current process to sleep on `chan` and gives up the CPU; returns
  * once wakeup(chan) has made it runnable and the scheduler picked it again.
- * Callers check their condition in a loop around it: a wakeup only says it
- * may have changed. Must be called from a process's kernel code, where
- * interrupts are off, so nothing can wake the channel between the caller's
- * check and the sleep. */
-void sleep(const void *chan);
+ * The caller holds `lk`, the spinlock that protects the condition it waits
+ * for (checked under `lk` before the call): sleep() takes proc_lock before
+ * it lets go of `lk`, and wakeup() needs proc_lock too, so a wakeup that
+ * comes after the check finds the process asleep and none is lost. `lk` is
+ * held again when sleep() returns. Callers check their condition in a loop
+ * around it: a wakeup only says it may have changed. Must be called from a
+ * process's kernel code, holding no other spinlock than `lk`. */
+void sleep(const void *chan, struct spinlock *lk);
 
 /* Makes every process sleeping on `chan` runnable. Callable anywhere,
- * interrupt handlers included. */
+ * interrupt handlers included, except with proc_lock held; callers hold the
+ * lock that protects what changed, the one the sleepers passed to
+ * sleep(). */
 void wakeup(const void *chan);
 
 /* Gives the CPU back to the scheduler; the process stays runnable. */
@@ -208,8 +216,5 @@ int proc_wait(int pid, u32 status);
  * USER_LOAD_TOP or a page can't be had (nothing changes then), -EINVAL if it
  * would shrink below its start. */
 int proc_sbrk(i32 increment);
-
-/* Saves the callee-saved registers in `old` and resumes `new` (swtch.s). */
-void swtch(struct context *old, struct context *new);
 
 #endif

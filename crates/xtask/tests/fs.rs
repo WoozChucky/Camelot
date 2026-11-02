@@ -1122,6 +1122,47 @@ fn filetest_passes_on_the_root_image_and_leaves_it_as_it_was() {
 }
 
 #[test]
+fn stress_on_the_root_image_leaves_it_as_it_was() {
+    // Issue #61's stress program with a filesystem: six workers, each
+    // also writing, reading back and removing a file of its own every
+    // round, side by side with the pipe and the page allocator, under
+    // timer preemption. The transactions interleave in the log; the disk
+    // ends consistent and as it began. That ticks really do preempt the
+    // workers mid-round is checked by kernel.rs's
+    // stress_runs_many_processes_through_the_locks, which watches the hart.
+    let image = root_image(2048);
+    let run = boot(
+        image.clone(),
+        Boot {
+            input: b"stress 6 3\nexit\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    let out = shell_output(&run.out, "stress 6 3");
+    assert!(
+        out.ends_with("stress: 6 workers, 3 rounds, 3600 bytes: ok\n"),
+        "{out}"
+    );
+    for w in 1..=6 {
+        for r in 1..=3 {
+            assert_eq!(
+                out.matches(&format!("stress {w}: round {r}\n")).count(),
+                1,
+                "{out}"
+            );
+        }
+    }
+    let after = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    assert_eq!((after.replayed, after.orphans), (0, 0));
+    assert_eq!(state(&run.disk), state(&image));
+    let disk_blocks = (run.disk.len() / BSIZE) as u32;
+    // A file, its directory entry and its inode each round: 18 at least.
+    assert!(check_commits(&run.record.ops, &after.sb, disk_blocks) >= 18);
+}
+
+#[test]
 fn a_crash_during_the_file_system_calls_leaves_whole_transactions() {
     // The crash test of issue #66, for the calls that change the disk:
     // `filetest ops` makes directories and files, links, truncates and

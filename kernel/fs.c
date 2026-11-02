@@ -3,13 +3,13 @@
  * file contents, directories and paths, and the create/unlink/link
  * operations the file system calls (sysfile.c) use. The log is in log.c.
  *
- * Locking, as in xv6 but without spinlocks (kernel code is never
- * preempted, so code between two sleeps runs alone):
+ * Locking, as in xv6:
  *
  * - an in-memory inode is shared by everyone using its file: `ref` counts
- *   them, and `locked` is a sleep lock held while its fields are read or
- *   changed (ilock to iunlock). Holding a reference keeps the inode in the
- *   cache; it says nothing about its fields;
+ *   them, under itable_lock, a spinlock that also covers which inode each
+ *   slot holds; and `lock` is a sleep lock held while its fields are read
+ *   or changed (ilock to iunlock). Holding a reference keeps the inode in
+ *   the cache; it says nothing about its fields;
  * - blocks are locked by the buffer cache, from bread to brelse;
  * - lookups lock one directory at a time, going down the path, so they
  *   never wait for each other in a cycle (`..` is looked up with the child
@@ -32,6 +32,14 @@ u32 fs_dev;
 struct superblock fs_sb;
 
 static struct inode itable[NINODE];
+static struct spinlock itable_lock;
+
+void fs_init(void) {
+    initlock(&itable_lock, "itable");
+    for (u32 i = 0; i < NINODE; i++) {
+        initsleeplock(&itable[i].lock, "inode");
+    }
+}
 
 /* iget() panics when the cache is full, so it must hold every inode that
  * can be in use at once: one per open file (an FD_INODE file, or a device
@@ -278,10 +286,12 @@ void iupdate(struct inode *ip) {
 
 struct inode *iget(u32 dev, u32 inum) {
     struct inode *empty = NULL;
+    acquire(&itable_lock);
     for (u32 i = 0; i < NINODE; i++) {
         struct inode *ip = &itable[i];
         if (ip->ref > 0 && ip->dev == dev && ip->inum == inum) {
             ip->ref++;
+            release(&itable_lock);
             return ip;
         }
         if (empty == NULL && ip->ref == 0) {
@@ -294,13 +304,17 @@ struct inode *iget(u32 dev, u32 inum) {
     empty->dev = dev;
     empty->inum = inum;
     empty->ref = 1;
+    /* Nobody else has a reference, so nobody holds the sleep lock or
+     * reads `valid`. */
     empty->valid = false;
-    empty->locked = false;
+    release(&itable_lock);
     return empty;
 }
 
 struct inode *idup(struct inode *ip) {
+    acquire(&itable_lock);
     ip->ref++;
+    release(&itable_lock);
     return ip;
 }
 
@@ -308,10 +322,7 @@ void ilock(struct inode *ip) {
     if (ip == NULL || ip->ref < 1) {
         panic("ilock: no reference");
     }
-    while (ip->locked) {
-        sleep(ip);
-    }
-    ip->locked = true;
+    acquiresleep(&ip->lock);
     if (!ip->valid) {
         struct buf *b = fs_bread(ip->dev, IBLOCK(ip->inum, fs_sb));
         const struct dinode *dip = (const struct dinode *)b->data + ip->inum % IPB;
@@ -330,11 +341,10 @@ void ilock(struct inode *ip) {
 }
 
 void iunlock(struct inode *ip) {
-    if (ip == NULL || !ip->locked || ip->ref < 1) {
+    if (ip == NULL || !holdingsleep(&ip->lock) || ip->ref < 1) {
         panic("iunlock: not locked");
     }
-    ip->locked = false;
-    wakeup(ip);
+    releasesleep(&ip->lock);
 }
 
 void itrunc(struct inode *ip) {
@@ -361,20 +371,26 @@ void itrunc(struct inode *ip) {
 }
 
 void iput(struct inode *ip) {
+    acquire(&itable_lock);
     if (ip->ref == 1 && ip->valid && ip->nlink == 0) {
         /* Nobody else has it (and no directory names it), so nobody can be
-         * holding its lock or get a new reference while it is freed. */
-        if (ip->locked) {
+         * holding its lock or get a new reference while it is freed: the
+         * sleep lock is free, and itable_lock can go while the blocks are
+         * freed (which sleeps on the disk). */
+        if (ip->lock.locked) {
             panic("iput: locked");
         }
-        ip->locked = true;
+        acquiresleep(&ip->lock);
+        release(&itable_lock);
         itrunc(ip);
         ip->type = T_FREE;
         iupdate(ip);
         ip->valid = false;
-        ip->locked = false;
+        releasesleep(&ip->lock);
+        acquire(&itable_lock);
     }
     ip->ref--;
+    release(&itable_lock);
 }
 
 void iunlockput(struct inode *ip) {

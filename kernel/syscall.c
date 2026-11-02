@@ -22,12 +22,14 @@ static u32 arg(struct trap_frame *f, int n) {
 
 static int sys_sleep(struct trap_frame *f) {
     u32 n = arg(f, 0);
+    acquire(&tickslock);
     u32 start = ticks;
     /* Unsigned differences, so the count may wrap. Every tick wakes the
      * sleepers (clock_tick in trap.c), which check again. */
     while (ticks - start < n && !proc_killed()) {
-        sleep((const void *)&ticks);
+        sleep((const void *)&ticks, &tickslock);
     }
+    release(&tickslock);
     return 0;
 }
 
@@ -109,10 +111,21 @@ static int sys_procs(struct trap_frame *f) {
     return n;
 }
 
+/* Whether call `num` goes into the network stack: netinfo to setsockopt,
+ * numbered one after another. They run under net_lock (net.h). */
+static bool is_net_call(u32 num) {
+    return num >= SYS_netinfo && num <= SYS_setsockopt;
+}
+
 void syscall(struct trap_frame *f) {
     struct proc *p = myproc();
     int ret;
-    switch (f->regs[REG_A7]) {
+    u32 num = f->regs[REG_A7];
+    bool net = is_net_call(num);
+    if (net) {
+        acquire(&net_lock);
+    }
+    switch (num) {
     case SYS_exit:
         proc_exit((int)arg(f, 0));
         ret = 0; /* not reached */
@@ -237,6 +250,9 @@ void syscall(struct trap_frame *f) {
     default:
         ret = -ENOSYS;
         break;
+    }
+    if (net) {
+        release(&net_lock);
     }
     f->regs[REG_A0] = (u32)ret;
 }

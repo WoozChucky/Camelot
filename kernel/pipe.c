@@ -1,18 +1,23 @@
-/* Pipes (pipe.h), after xv6's pipe.c, without its spinlock: kernel code is
- * never preempted, so everything between two sleeps runs alone, and a
- * reader's check that the pipe is empty and its sleep can't miss a writer's
- * wakeup.
+/* Pipes (pipe.h), after xv6's pipe.c.
  *
  * The buffer is a ring: `nread` and `nwrite` count the bytes ever read and
  * written, so the pipe holds nwrite - nread bytes, from data[nread %
  * PIPESIZE] on. They wrap at 2^32, a multiple of PIPESIZE, and the
- * differences stay right. Readers sleep on &nread, writers on &nwrite. */
+ * differences stay right. Readers sleep on &nread, writers on &nwrite.
+ *
+ * Locking: each pipe's spinlock protects all of it. Readers and writers
+ * check the ring and sleep with it, so a reader's check that the pipe is
+ * empty and its sleep can't miss a writer's wakeup. Copying from and to
+ * user memory happens under it: copyin() and copyout() walk the page table
+ * and never sleep. */
 #include "pipe.h"
 #include "kalloc.h"
 #include "memlayout.h"
 #include "proc.h"
+#include "spinlock.h"
 
 struct pipe {
+    struct spinlock lock;
     char data[PIPESIZE];
     u32 nread;
     u32 nwrite;
@@ -34,11 +39,12 @@ int pipealloc(struct file **rf, struct file **wf) {
     *wf = *rf != NULL ? filealloc() : NULL;
     if (*wf == NULL) {
         if (*rf != NULL) {
-            (*rf)->ref = 0; /* nothing else set: just give the slot back */
+            fileclose(*rf); /* nothing else set: just gives the slot back */
         }
         kfree(p);
         return -ENFILE;
     }
+    initlock(&p->lock, "pipe");
     p->nread = 0;
     p->nwrite = 0;
     p->readopen = true;
@@ -53,6 +59,7 @@ int pipealloc(struct file **rf, struct file **wf) {
 }
 
 void pipeclose(struct pipe *p, bool writable) {
+    acquire(&p->lock);
     if (writable) {
         p->writeopen = false;
         wakeup(&p->nread); /* readers now see the end */
@@ -60,16 +67,20 @@ void pipeclose(struct pipe *p, bool writable) {
         p->readopen = false;
         wakeup(&p->nwrite); /* writers now fail */
     }
-    if (!p->readopen && !p->writeopen) {
+    bool gone = !p->readopen && !p->writeopen;
+    release(&p->lock);
+    if (gone) {
         kfree(p);
     }
 }
 
 int pipewrite(struct pipe *p, pagetable_t pt, u32 src, u32 n) {
     u32 done = 0;
+    acquire(&p->lock);
     while (done < n) {
         if (!p->readopen) {
             /* Nobody will ever read the rest. */
+            release(&p->lock);
             return done > 0 ? (int)done : -EPIPE;
         }
         u32 used = p->nwrite - p->nread;
@@ -79,7 +90,7 @@ int pipewrite(struct pipe *p, pagetable_t pt, u32 src, u32 n) {
             }
             /* Full: let the readers at what is there, and wait for room. */
             wakeup(&p->nread);
-            sleep(&p->nwrite);
+            sleep(&p->nwrite, &p->lock);
             continue;
         }
         /* As much as fits before the end of the ring. */
@@ -90,12 +101,14 @@ int pipewrite(struct pipe *p, pagetable_t pt, u32 src, u32 n) {
         done += m;
     }
     wakeup(&p->nread);
+    release(&p->lock);
     return (int)done;
 }
 
 int piperead(struct pipe *p, pagetable_t pt, u32 dst, u32 n) {
+    acquire(&p->lock);
     while (p->nread == p->nwrite && p->writeopen && !proc_killed()) {
-        sleep(&p->nread);
+        sleep(&p->nread, &p->lock);
     }
     u32 count = 0;
     while (count < n && p->nread != p->nwrite) {
@@ -107,9 +120,13 @@ int piperead(struct pipe *p, pagetable_t pt, u32 dst, u32 n) {
     }
     /* Room for the writers. */
     wakeup(&p->nwrite);
+    release(&p->lock);
     return (int)count;
 }
 
-u32 pipe_bytes(const struct pipe *p) {
-    return p->nwrite - p->nread;
+u32 pipe_bytes(struct pipe *p) {
+    acquire(&p->lock);
+    u32 n = p->nwrite - p->nread;
+    release(&p->lock);
+    return n;
 }

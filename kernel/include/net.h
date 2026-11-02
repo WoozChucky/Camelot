@@ -17,17 +17,18 @@
  *   net.c    the interface's configuration, boot, the counters, the timer
  *            and the system calls netinfo, netconf and ping
  *
- * Everything runs with interrupts off, as all kernel code does (proc.c), on
- * one hart: a frame is handled from start to end inside the card's
- * interrupt (an answer, such as an echo reply, is sent from there), and a
- * process that waits for the network sleeps on `netif` until a packet or a
- * timer tick wakes it. No locks.
+ * One spinlock, net_lock (below), covers the whole stack: a frame is
+ * handled from start to end inside the card's interrupt, under it (an
+ * answer, such as an echo reply, is sent from there), and a process that
+ * waits for the network sleeps on `netif` with it until a packet or a timer
+ * tick wakes it.
  *
  * Addresses are u32 in host order (10.0.2.15 is 0x0a00020f) and ports u16;
  * packets hold them big-endian, and get16/get32/put16/put32 convert. */
 #ifndef CAMELOT_NET_H
 #define CAMELOT_NET_H
 
+#include "spinlock.h"
 #include "syscall.h"
 #include "types.h"
 #include "vm.h"
@@ -182,8 +183,22 @@ void net_configure(u32 addr, u32 mask, u32 gateway, u32 dns, u32 how);
  * theirs. */
 void net_timer(void);
 
-/* A process waits for the network: it sleeps until a packet for it or the
- * next timer tick. Callers check their condition in a loop around it. */
+/* The network's lock (spec section 10, "Kernel locking"): one spinlock for
+ * the whole stack, taken where the stack is entered and held until it is
+ * left: the card's interrupt (nic_intr), the timer (net_timer), the system
+ * calls (syscall.c around netinfo ... setsockopt; socket_read,
+ * socket_write, socket_bytes and socket_close for a socket's file), the
+ * DHCP client's process and the boot code. Everything inside, from the
+ * card's rings and the pbuf pool through ARP, IP, ICMP and UDP to TCP's
+ * connections and the socket table, runs under it and takes it nowhere
+ * else, so a packet looped back from ip_output() to ip_input() needs
+ * nothing more. Under it the stack may take the file table's lock, the
+ * process lock (wakeup, sleep), the allocator's and the UART's. */
+extern struct spinlock net_lock;
+
+/* A process waits for the network, holding net_lock: it sleeps until a
+ * packet for it or the next timer tick, with net_lock let go meanwhile.
+ * Callers check their condition in a loop around it. */
 void net_sleep(void);
 /* Wakes every process in net_sleep(): something arrived. */
 void net_wakeup(void);

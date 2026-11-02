@@ -1,15 +1,22 @@
 /* Interrupt-driven UART driver. The receive interrupt handler is the only code
  * that reads RBR: it fills a ring buffer that the console drains, so nothing
  * in the kernel busy-waits for input. Transmit still polls LSR.THRE, which
- * Grail always reports as set. */
+ * Grail always reports as set.
+ *
+ * Locking: transmitting is serialized by uart_tx_lock, which the callers of
+ * uart_putc() hold (uart.h); it is a leaf of the lock order. The receive
+ * ring is the console's: console.c's lock covers both uart_intr() and
+ * uart_rx_pop(). */
 #include "uart.h"
 #include "mmio.h"
 
-/* The receive ring buffer. Single producer (uart_intr, in the trap handler)
- * and single consumer (uart_rx_pop), so each index has one writer and no lock
- * is needed. The indices count bytes forever and wrap at 2^32; since
- * UART_RX_SIZE divides 2^32, `index % UART_RX_SIZE` stays right across the
- * wrap, and `rx_head - rx_tail` is always the number of buffered bytes. */
+struct spinlock uart_tx_lock;
+
+/* The receive ring buffer, filled by uart_intr (in the trap handler) and
+ * drained by uart_rx_pop, both under the console's lock. The indices count
+ * bytes forever and wrap at 2^32; since UART_RX_SIZE divides 2^32, `index %
+ * UART_RX_SIZE` stays right across the wrap, and `rx_head - rx_tail` is
+ * always the number of buffered bytes. */
 static volatile u8 rx_buf[UART_RX_SIZE];
 static volatile u32 rx_head; /* bytes ever received: written by uart_intr */
 static volatile u32 rx_tail; /* bytes ever taken: written by uart_rx_pop */
@@ -20,6 +27,7 @@ static volatile u32 rx_tail; /* bytes ever taken: written by uart_rx_pop */
 static volatile bool rx_stalled;
 
 void uart_init(void) {
+    initlock(&uart_tx_lock, "uart");
     mmio_write8(UART_BASE + UART_LCR, UART_LCR_8N1);
     mmio_write8(UART_BASE + UART_IER, UART_IER_ERBFI);
 }

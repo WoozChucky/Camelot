@@ -94,6 +94,7 @@ the last line once `http://127.0.0.1:8080/README` was opened on the host.
 | `badptr` | hands the system calls bad pointers, which must all fail with `-EFAULT` |
 | `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |
 | `filetest` | checks the file system calls on a writable root filesystem (`filetest: N checks, 0 failed`) |
+| `stress` | many processes at once: pages, the console, a shared pipe and files under timer preemption (`stress: W workers, R rounds, N bytes: ok`) |
 | `libtest` | checks the C library (`libtest: N checks, 0 failed`) |
 | `nettest` | moves known bytes through TCP: `nettest connect ADDR PORT BYTES [TIMES]` sends a pattern and reads to the end, `nettest serve PORT CONNECTIONS [BACKLOG]` echoes what each connection sends; each prints the bytes' counts and FNV-1a hash (the TCP tests' program) |
 | `socktest` | checks the socket calls, their results and their errors, over loopback (`socktest: N checks, 0 failed`; needs a network card) |

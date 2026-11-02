@@ -8,18 +8,22 @@
  * raises its PLIC source when the command is done; blk_intr() takes the
  * result, acknowledges it and wakes the process. Nothing polls the device.
  *
- * As in proc.c there are no locks: a process's kernel code runs with
- * interrupts off and is never preempted, so checking a flag and sleeping on
- * it is atomic, and blk_intr() only runs when the scheduler (or kmain) lets
- * interrupts in. */
+ * Locking: each disk has a spinlock for its request state (busy, done,
+ * error) and its registers; the process waiting for the disk sleeps on the
+ * disk with it, and blk_intr() takes it to post the result. The fields set
+ * up by blk_init() never change afterwards and are read without it. */
 #include "blk.h"
 #include "mmio.h"
 #include "plic.h"
 #include "proc.h"
+#include "spinlock.h"
 #include "sysinfo.h"
 #include "trap.h"
 
+/* The first field is the request state's lock, so the disk's address (what
+ * the processes waiting for it sleep on) is also the lock's. */
 struct disk {
+    struct spinlock lock;
     uintptr base; /* its page of registers */
     u32 irq;      /* its PLIC source */
     u32 capacity; /* in sectors */
@@ -48,6 +52,7 @@ void blk_init(void) {
             continue;
         }
         struct disk *d = &disks[ndisks];
+        initlock(&d->lock, "disk");
         d->base = dev.base;
         d->irq = dev.irq;
         d->capacity = mmio_read32(d->base + BLK_CAPACITY);
@@ -93,9 +98,10 @@ static u32 request(u32 dev, u32 cmd, u32 sector, uintptr buf, u32 count) {
     if (myproc() == NULL) {
         panic("blk: request outside a process");
     }
+    acquire(&d->lock);
     /* One request at a time: wait for the one in flight to be taken. */
     while (d->busy) {
-        sleep(d);
+        sleep(d, &d->lock);
     }
     d->busy = true;
     d->done = false;
@@ -110,12 +116,13 @@ static u32 request(u32 dev, u32 cmd, u32 sector, uintptr buf, u32 count) {
      * sleeps, and the scheduler runs something else or idles in wfi until
      * blk_intr() wakes it. */
     while (!d->done) {
-        sleep(d);
+        sleep(d, &d->lock);
     }
     u32 err = d->error;
     d->busy = false;
     /* The next process waiting for the disk, if any. */
     wakeup(d);
+    release(&d->lock);
     return err;
 }
 
@@ -137,12 +144,14 @@ bool blk_intr(u32 irq) {
         if (d->irq != irq) {
             continue;
         }
+        acquire(&d->lock);
         d->error = mmio_read32(d->base + BLK_ERROR);
         /* Clearing DONE lowers the line, so the source isn't pending again
          * once the trap code completes it. */
         mmio_write32(d->base + BLK_STATUS, BLK_STATUS_DONE);
         d->done = true;
         wakeup(d);
+        release(&d->lock);
         return true;
     }
     return false;

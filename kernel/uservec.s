@@ -8,7 +8,8 @@
 # kernel stack page; user_vec swaps it into a0, saves every register there
 # (the same struct trap_frame as kernel_vec's, include/trap.h), and runs
 # user_trap() with sp just below the frame. So each trap from U-mode starts
-# on an empty kernel stack.
+# on an empty kernel stack. The user's tp is saved like the others and tp is
+# set to the frame's kernel_tp, the hart's id (as xv6's kernel_hartid).
 #
 # user_trap_return() points stvec here, with interrupts off, right before
 # user_return; user_trap() points it back at kernel_vec first thing.
@@ -17,6 +18,7 @@
     .equ FRAME_SCAUSE, 132
     .equ FRAME_STVAL, 136
     .equ FRAME_SSTATUS, 140
+    .equ FRAME_KERNEL_TP, 144
 
     .text
     .align 2
@@ -65,6 +67,9 @@ user_vec:
     csrr  t0, sstatus
     sw    t0, FRAME_SSTATUS(a0)
 
+    # The program may have used tp for anything (it is saved above): the
+    # kernel's tp is the hart's id, which mycpu() and the locks rely on.
+    lw    tp, FRAME_KERNEL_TP(a0)
     mv    sp, a0                # the kernel stack grows down from the frame
     call  user_trap             # returns to U-mode through user_return
 1:  j     1b

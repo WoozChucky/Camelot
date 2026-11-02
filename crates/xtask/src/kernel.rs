@@ -27,7 +27,7 @@ use std::sync::mpsc::{self, Receiver};
 /// relaxation, since merlin-as and merlin-ld won't do it either.
 pub const TARGET_FLAGS: &[&str] = &[
     "--target=riscv32-unknown-elf",
-    "-march=rv32im_zicsr",
+    "-march=rv32ima_zicsr",
     "-mabi=ilp32",
     "-mno-relax",
 ];
@@ -741,7 +741,7 @@ mod tests {
         }));
         for flag in [
             "--target=riscv32-unknown-elf",
-            "-march=rv32im_zicsr",
+            "-march=rv32ima_zicsr",
             "-mabi=ilp32",
             "-mno-relax",
             "-ffreestanding",

@@ -1,16 +1,25 @@
 /* Processes and the scheduler (spec section 10, "Kernel processes"), after
- * xv6-riscv's proc.c, for one hart and without locks: the kernel never takes
- * an interrupt while it works for a process (see user_trap), so nothing here
- * runs concurrently with anything else. The interrupt handlers only call
- * wakeup(), from the scheduler's own loop.
+ * xv6-riscv's proc.c.
  *
  * Each process has two threads of control: its user program in U-mode, and
  * a kernel thread on its own kernel stack that runs whenever the process
- * traps. A kernel process has only the kernel thread. The scheduler runs on
- * kmain's boot stack; swtch() moves between it and the processes' kernel
- * threads. A process gives up the CPU only from its kernel thread: in yield()
- * at the end of its time slice (one timer tick) or for the yield system call,
- * in sleep() when it has to wait, or in proc_exit(). */
+ * traps. A kernel process has only the kernel thread. Each hart's scheduler
+ * loop runs on the stack it booted with; swtch() moves between it and the
+ * processes' kernel threads. A process gives up the CPU only from its kernel
+ * thread: in yield() at the end of its time slice (one timer tick) or for
+ * the yield system call, in sleep() when it has to wait, or in proc_exit().
+ *
+ * Locking (spec section 10, "Kernel locking"): one spinlock, proc_lock,
+ * protects the whole process table, as in the x86 xv6 (xv6-riscv has one per
+ * process). It is held across every switch between a process and the
+ * scheduler: whoever gives up the CPU (yield, sleep, proc_exit) takes it and
+ * calls sched(), and whoever the scheduler switches to lets go of it, either
+ * on its way back out of sched() or, for a new process, first thing in
+ * proc_start(). So a process's state and the switch away from it change
+ * together, as far as any other hart can see: none can pick a process that
+ * is still running on its own kernel stack. sleep() takes it before letting
+ * go of the caller's lock, which is how no wakeup is lost. It comes after
+ * every other lock but the allocator's and the UART's in the lock order. */
 #include "proc.h"
 #include "elf.h"
 #include "exec.h"
@@ -20,15 +29,14 @@
 #include "log.h"
 #include "memlayout.h"
 #include "riscv.h"
+#include "spinlock.h"
 #include "string.h"
 
 static struct proc procs[NPROC];
 
-/* The process on the CPU; NULL in the scheduler. */
-static struct proc *current;
-
-/* The scheduler's registers while a process runs. */
-static struct context scheduler_context;
+/* The process table, the pids, the first process's status, and every
+ * switch between a process and a scheduler. */
+static struct spinlock proc_lock;
 
 static u32 next_pid = 1;
 
@@ -43,8 +51,14 @@ static const char *init_path;
 static const char *init_name;
 static int init_status;
 
+void proc_init(void) {
+    initlock(&proc_lock, "proc");
+}
+
+/* No push_off() around the two reads, as xv6 has: a kernel thread is never
+ * preempted, so it can't move to another hart in between. */
 struct proc *myproc(void) {
-    return current;
+    return mycpu()->proc;
 }
 
 const struct user_program *user_program_find(const char *name) {
@@ -57,25 +71,30 @@ const struct user_program *user_program_find(const char *name) {
 }
 
 /* A new process's kernel thread starts here, from the scheduler's swtch(),
- * and goes straight to U-mode at the program's entry point, unless it was
- * killed before it got its first turn: then it ends before running any of
- * its code, as user_trap() would end it on any later way back. */
+ * which still holds proc_lock, and goes straight to U-mode at the program's
+ * entry point, unless it was killed before it got its first turn: then it
+ * ends before running any of its code, as user_trap() would end it on any
+ * later way back. */
 static void proc_start(void) {
-    if (current->killed) {
+    release(&proc_lock);
+    if (proc_killed()) {
         proc_exit(-1);
     }
-    user_trap_return(current->frame);
+    user_trap_return(myproc()->frame);
 }
 
-/* A new kernel process starts here: runs its function, then ends. It has no
- * parent, so the scheduler frees it. */
+/* A new kernel process starts here, holding proc_lock as proc_start does:
+ * runs its function, then ends. It has no parent, so the scheduler frees
+ * it. */
 static void kproc_start(void) {
-    current->kfn();
+    release(&proc_lock);
+    myproc()->kfn();
     proc_exit(0);
 }
 
 /* Releases everything `p` holds (any of it may be missing) and frees its
- * slot. Its page table must not be the active one. */
+ * slot. Its page table must not be the active one. Called with proc_lock
+ * held. */
 static void proc_free(struct proc *p) {
     if (p->pagetable != NULL) {
         uvm_free(p->pagetable);
@@ -91,7 +110,15 @@ static void proc_free(struct proc *p) {
     p->state = PROC_UNUSED;
 }
 
-/* Copies at most PROC_NAME_MAX characters of `name`. */
+/* proc_free() for a slot the caller took and never made runnable. */
+static void proc_unalloc(struct proc *p) {
+    acquire(&proc_lock);
+    proc_free(p);
+    release(&proc_lock);
+}
+
+/* Copies at most PROC_NAME_MAX characters of `name`. Called with proc_lock
+ * held, or on a slot nobody else looks at yet. */
 static void set_name(struct proc *p, const char *name) {
     u32 i = 0;
     while (name[i] != 0 && i < PROC_NAME_MAX) {
@@ -130,9 +157,11 @@ static void push_args(struct trap_frame *f, u8 *stack, const struct proc_args *a
 /* A free slot, cleared, with a kernel stack; NULL with *err set to -EAGAIN
  * (no free slot) or -ENOMEM if it can't. The slot is PROC_NEW until
  * proc_ready(), so that nobody else takes it while proc_create() sleeps
- * reading the program from the disk. */
+ * reading the program from the disk, and nobody else looks at its fields:
+ * the caller sets them up without proc_lock. */
 static struct proc *proc_alloc(int *err) {
     struct proc *p = NULL;
+    acquire(&proc_lock);
     for (u32 i = 0; i < NPROC; i++) {
         if (procs[i].state == PROC_UNUSED) {
             p = &procs[i];
@@ -140,25 +169,32 @@ static struct proc *proc_alloc(int *err) {
         }
     }
     if (p == NULL) {
+        release(&proc_lock);
         *err = -EAGAIN;
         return NULL;
     }
     memset(p, 0, sizeof *p);
+    p->state = PROC_NEW;
+    release(&proc_lock);
     p->kstack = kalloc();
     if (p->kstack == NULL) {
+        proc_unalloc(p);
         *err = -ENOMEM;
         return NULL;
     }
-    p->state = PROC_NEW;
     return p;
 }
 
-/* Gives a fully set up `p` its pid and name and makes it runnable. */
-static struct proc *proc_ready(struct proc *p, const char *name) {
+/* Gives a fully set up `p` its pid, name and parent and makes it
+ * runnable. */
+static struct proc *proc_ready(struct proc *p, const char *name, struct proc *parent) {
+    acquire(&proc_lock);
     p->pid = next_pid;
     next_pid++;
     set_name(p, name);
+    p->parent = parent;
     p->state = PROC_RUNNABLE;
+    release(&proc_lock);
     return p;
 }
 
@@ -220,7 +256,7 @@ struct proc *proc_create(const struct elf_file *prog, const char *path, const ch
     u32 heap;
     p->pagetable = build_space(prog, "spawn", path, args, p->frame, &heap, err);
     if (p->pagetable == NULL) {
-        proc_free(p);
+        proc_unalloc(p);
         return NULL;
     }
     p->heap_base = heap;
@@ -230,26 +266,26 @@ struct proc *proc_create(const struct elf_file *prog, const char *path, const ch
      * kernel stack below the frame. */
     p->context.ra = (u32)(uintptr)proc_start;
     p->context.sp = (u32)(uintptr)p->frame;
-    p->parent = current;
     /* What the child inherits: the standard descriptors, sharing their open
      * files (and offsets), and the working directory. A descriptor above 2
      * stays the parent's own, so a pipe end the parent keeps for itself
      * doesn't keep the pipe open in every child. */
-    if (current != NULL) {
+    struct proc *parent = myproc();
+    if (parent != NULL) {
         for (u32 fd = 0; fd <= FD_STDERR; fd++) {
-            if (current->ofile[fd] != NULL) {
-                p->ofile[fd] = filedup(current->ofile[fd]);
+            if (parent->ofile[fd] != NULL) {
+                p->ofile[fd] = filedup(parent->ofile[fd]);
             }
         }
-        if (current->cwd != NULL) {
-            p->cwd = idup(current->cwd);
+        if (parent->cwd != NULL) {
+            p->cwd = idup(parent->cwd);
         }
     }
-    return proc_ready(p, name);
+    return proc_ready(p, name, parent);
 }
 
 int proc_exec(const struct elf_file *prog, const char *path, const char *name, const struct proc_args *args) {
-    struct proc *p = current;
+    struct proc *p = myproc();
     pagetable_t old = p->pagetable;
     u32 heap;
     int err;
@@ -260,7 +296,9 @@ int proc_exec(const struct elf_file *prog, const char *path, const char *name, c
     p->pagetable = pt;
     p->heap_base = heap;
     p->brk = heap;
+    acquire(&proc_lock);
     set_name(p, name);
+    release(&proc_lock);
     /* The new table holds the kernel's mappings too: switch to it before
      * freeing the old one, which satp points at. */
     w_satp(MAKE_SATP(pt));
@@ -283,15 +321,16 @@ struct proc *kproc_create(const char *name, void (*fn)(void), const char **err) 
     p->kfn = fn;
     p->context.ra = (u32)(uintptr)kproc_start;
     p->context.sp = (u32)(uintptr)p->kstack + PGSIZE;
-    return proc_ready(p, name);
+    return proc_ready(p, name, NULL);
 }
 
-/* The first process's kernel thread starts here, from the scheduler: it
- * gets the console as its descriptors and the root as its working
- * directory, loads its program (which may sleep on the disk, so it has to
- * be done by a process) and goes to U-mode. */
+/* The first process's kernel thread starts here, from the scheduler (holding
+ * proc_lock, as for proc_start): it gets the console as its descriptors and
+ * the root as its working directory, loads its program (which may sleep on
+ * the disk, so it has to be done by a process) and goes to U-mode. */
 static void init_start(void) {
-    struct proc *p = current;
+    release(&proc_lock);
+    struct proc *p = myproc();
     p->ofile[FD_STDIN] = file_console(true, false);
     p->ofile[FD_STDOUT] = file_console(false, true);
     p->ofile[FD_STDERR] = file_console(false, true);
@@ -326,15 +365,21 @@ bool proc_run_init(const char *path, const char *name, int *status) {
     memset(p->frame, 0, sizeof *p->frame);
     p->context.ra = (u32)(uintptr)init_start;
     p->context.sp = (u32)(uintptr)p->frame;
+    acquire(&proc_lock);
     init_path = path;
     init_name = name;
-    init_proc = proc_ready(p, name);
+    init_proc = p;
+    release(&proc_lock);
+    proc_ready(p, name, NULL);
     scheduler();
+    acquire(&proc_lock);
     *status = init_status;
+    release(&proc_lock);
     return true;
 }
 
-/* The next runnable process after the last one that ran, or NULL. */
+/* The next runnable process after the last one that ran, or NULL. Called
+ * with proc_lock held. */
 static struct proc *pick_next(void) {
     for (u32 i = 0; i < NPROC; i++) {
         u32 slot = (next_slot + i) % NPROC;
@@ -346,7 +391,8 @@ static struct proc *pick_next(void) {
     return NULL;
 }
 
-/* Whether any slot holds a process that hasn't been freed. */
+/* Whether any slot holds a process that hasn't been freed. Called with
+ * proc_lock held. */
 static bool any_process(void) {
     for (u32 i = 0; i < NPROC; i++) {
         if (procs[i].state != PROC_UNUSED) {
@@ -366,67 +412,114 @@ static pagetable_t proc_pagetable(struct proc *p) {
 }
 
 void scheduler(void) {
+    struct cpu *c = mycpu();
     /* proc_create() fills the lowest free slots, so the processes start in
      * the order they were created. */
+    acquire(&proc_lock);
     next_slot = 0;
+    release(&proc_lock);
     for (;;) {
         /* Let pending interrupts in (a byte typed on the console, a tick
          * that came while the last process was in the kernel, a disk's
          * completion) before going on with interrupts off. Their handlers
-         * may wake processes up. */
+         * may wake processes up. Interrupts stay off from here on: the
+         * acquire() below finds them off, so its release() leaves them
+         * off. */
         intr_on();
         intr_off();
+        acquire(&proc_lock);
         struct proc *p = pick_next();
         if (p == NULL) {
-            if (!any_process()) {
+            bool left = any_process();
+            release(&proc_lock);
+            if (!left) {
                 break;
             }
             /* Everyone sleeps (or is a zombie its parent will free). Idle
              * until an interrupt: interrupts are off from the search to wfi,
              * so one arriving in between still wakes it, and is taken by the
-             * intr_on() at the top of the loop. */
+             * intr_on() at the top of the loop. proc_lock is not held across
+             * the wait, so other harts can go on scheduling. */
             wfi();
             continue;
         }
         p->state = PROC_RUNNING;
-        current = p;
+        c->proc = p;
         /* Its page table holds the kernel's mappings too, so the kernel
          * carries on as before; from the next sret on, U-mode sees the
          * process's memory. */
         w_satp(MAKE_SATP(proc_pagetable(p)));
         sfence_vma();
-        swtch(&scheduler_context, &p->context);
+        /* proc_lock stays held across the switch: the process lets go of
+         * it (proc_start, or the end of yield, sleep), and takes it again
+         * before it switches back here (sched). */
+        swtch(&c->context, &p->context);
         /* Back when it yields, sleeps or exits. */
         w_satp(MAKE_SATP(kernel_pagetable));
         sfence_vma();
-        current = NULL;
+        c->proc = NULL;
         /* A zombie with a parent waits for it; an orphan has no one. */
         if (p->state == PROC_ZOMBIE && p->parent == NULL) {
             proc_free(p);
         }
+        release(&proc_lock);
     }
     intr_on();
 }
 
 /* Back to the scheduler, which resumes this process's kernel thread here
- * when the process's turn comes again. */
+ * when the process's turn comes again. The caller holds proc_lock and no
+ * other spinlock, and has changed the process's state. `intena` belongs to
+ * this kernel thread rather than to the hart, so it is saved and restored
+ * around the switch (another thread may run on the hart meanwhile). */
 static void sched(void) {
-    swtch(&current->context, &scheduler_context);
+    struct proc *p = myproc();
+    struct cpu *c = mycpu();
+    if (!holding(&proc_lock)) {
+        panic("sched: proc_lock not held");
+    }
+    if (c->noff != 1) {
+        panic("sched: holding a lock other than proc_lock");
+    }
+    if (p->state == PROC_RUNNING) {
+        panic("sched: the process is still running");
+    }
+    if ((r_sstatus() & SSTATUS_SIE) != 0) {
+        panic("sched: interrupts are on");
+    }
+    u32 intena = c->intena;
+    swtch(&p->context, &c->context);
+    mycpu()->intena = intena;
 }
 
 void yield(void) {
-    current->state = PROC_RUNNABLE;
+    acquire(&proc_lock);
+    myproc()->state = PROC_RUNNABLE;
     sched();
+    release(&proc_lock);
 }
 
-void sleep(const void *chan) {
-    current->chan = chan;
-    current->state = PROC_SLEEPING;
+void sleep(const void *chan, struct spinlock *lk) {
+    struct proc *p = myproc();
+    /* proc_lock first, then let go of lk: a wakeup(chan) needs proc_lock,
+     * so it can't run between the caller's check (under lk) and the
+     * process being marked asleep. */
+    if (lk != &proc_lock) {
+        acquire(&proc_lock);
+        release(lk);
+    }
+    p->chan = chan;
+    p->state = PROC_SLEEPING;
     sched();
-    current->chan = NULL;
+    p->chan = NULL;
+    if (lk != &proc_lock) {
+        release(&proc_lock);
+        acquire(lk);
+    }
 }
 
-void wakeup(const void *chan) {
+/* wakeup(), with proc_lock held. */
+static void wakeup_locked(const void *chan) {
     for (u32 i = 0; i < NPROC; i++) {
         if (procs[i].state == PROC_SLEEPING && procs[i].chan == chan) {
             procs[i].state = PROC_RUNNABLE;
@@ -434,8 +527,14 @@ void wakeup(const void *chan) {
     }
 }
 
+void wakeup(const void *chan) {
+    acquire(&proc_lock);
+    wakeup_locked(chan);
+    release(&proc_lock);
+}
+
 void proc_exit(int status) {
-    struct proc *p = current;
+    struct proc *p = myproc();
     /* Its files and working directory, while it can still sleep: closing a
      * file or letting go of a directory may free an unlinked inode, a
      * transaction. */
@@ -452,6 +551,7 @@ void proc_exit(int status) {
         end_op();
         p->cwd = NULL;
     }
+    acquire(&proc_lock);
     for (u32 i = 0; i < NPROC; i++) {
         struct proc *child = &procs[i];
         if (child->state == PROC_UNUSED || child->parent != p) {
@@ -471,7 +571,7 @@ void proc_exit(int status) {
         init_proc = NULL;
     }
     if (p->parent != NULL) {
-        wakeup(p->parent);
+        wakeup_locked(p->parent);
     }
     p->state = PROC_ZOMBIE;
     sched();
@@ -479,15 +579,18 @@ void proc_exit(int status) {
 }
 
 void proc_kill(struct trap_frame *f) {
-    kprintf("pid %u (%s) killed: %s\n", current->pid, current->name, trap_cause_name(f->scause));
+    struct proc *p = myproc();
+    kprintf("pid %u (%s) killed: %s\n", p->pid, p->name, trap_cause_name(f->scause));
     kprintf("  scause 0x%08x  sepc 0x%08x  stval 0x%08x\n", f->scause, f->sepc, f->stval);
     if (is_page_fault(f->scause)) {
-        vm_print_mapping(current->pagetable, f->stval);
+        vm_print_mapping(p->pagetable, f->stval);
     }
     proc_exit(-1);
 }
 
 int proc_kill_pid(int pid) {
+    int r = -ESRCH;
+    acquire(&proc_lock);
     for (u32 i = 0; i < NPROC; i++) {
         struct proc *p = &procs[i];
         if (p->state == PROC_UNUSED || p->state == PROC_NEW || p->pid != (u32)pid) {
@@ -496,7 +599,8 @@ int proc_kill_pid(int pid) {
         /* Neither the kernel's own processes nor the first one, the shell,
          * whose end is Camelot's. */
         if (p->kfn != NULL || p == init_proc) {
-            return -EPERM;
+            r = -EPERM;
+            break;
         }
         if (p->state != PROC_ZOMBIE) {
             p->killed = true;
@@ -506,18 +610,28 @@ int proc_kill_pid(int pid) {
                 p->state = PROC_RUNNABLE;
             }
         }
-        return 0;
+        r = 0;
+        break;
     }
-    return -ESRCH;
+    release(&proc_lock);
+    return r;
 }
 
 bool proc_killed(void) {
-    return current != NULL && current->killed;
+    struct proc *p = myproc();
+    if (p == NULL) {
+        return false;
+    }
+    acquire(&proc_lock);
+    bool killed = p->killed;
+    release(&proc_lock);
+    return killed;
 }
 
 int proc_list(struct procinfo *out, int max) {
     int n = 0;
     u32 last = 0;
+    acquire(&proc_lock);
     /* In pid order: the smallest pid above the last one, each time. */
     for (;;) {
         struct proc *next = NULL;
@@ -531,6 +645,7 @@ int proc_list(struct procinfo *out, int max) {
             }
         }
         if (next == NULL) {
+            release(&proc_lock);
             return n;
         }
         if (n < max) {
@@ -548,10 +663,11 @@ int proc_list(struct procinfo *out, int max) {
 }
 
 int proc_wait(int pid, u32 status) {
-    struct proc *p = current;
+    struct proc *p = myproc();
     if (status != 0 && !uvm_range_ok(p->pagetable, status, sizeof(int), PTE_W)) {
         return -EFAULT;
     }
+    acquire(&proc_lock);
     for (;;) {
         bool found = false;
         for (u32 i = 0; i < NPROC; i++) {
@@ -566,27 +682,30 @@ int proc_wait(int pid, u32 status) {
             if (child->state == PROC_ZOMBIE) {
                 int child_pid = (int)child->pid;
                 int xstatus = child->xstatus;
-                /* Checked above, and nothing unmaps it while we sleep. */
+                /* Checked above, and nothing unmaps it while we sleep.
+                 * copyout() walks the page table and never sleeps, so it
+                 * may run under the lock. */
                 if (status != 0 && copyout(p->pagetable, status, &xstatus, sizeof xstatus) != 0) {
+                    release(&proc_lock);
                     return -EFAULT;
                 }
                 proc_free(child);
+                release(&proc_lock);
                 return child_pid;
             }
         }
-        if (!found) {
+        if (!found || p->killed) {
+            /* Killed: never seen, the caller ends on the way out. */
+            release(&proc_lock);
             return -ECHILD;
         }
-        if (p->killed) {
-            return -ECHILD; /* never seen: the caller ends on the way out */
-        }
         /* proc_exit() wakes the parent. */
-        sleep(p);
+        sleep(p, &proc_lock);
     }
 }
 
 int proc_sbrk(i32 increment) {
-    struct proc *p = current;
+    struct proc *p = myproc();
     u32 old = p->brk;
     if (increment > 0) {
         u32 grow = (u32)increment;

@@ -385,13 +385,18 @@ static int write_chunk(struct inode *ip, u32 off, u32 n, u32 seed) {
 /* Starts a kernel process for each of `fns` and sleeps until each has
  * called proc_done(). */
 static u32 procs_left;
+static struct spinlock procs_left_lock;
 
 static void proc_done(void) {
+    acquire(&procs_left_lock);
     procs_left--;
     wakeup(&procs_left);
+    release(&procs_left_lock);
 }
 
 static bool run_procs(void (*const *fns)(void), u32 n) {
+    initlock(&procs_left_lock, "fstest");
+    acquire(&procs_left_lock);
     procs_left = 0;
     for (u32 i = 0; i < n; i++) {
         const char *why;
@@ -402,9 +407,11 @@ static bool run_procs(void (*const *fns)(void), u32 n) {
         procs_left++;
     }
     while (procs_left > 0) {
-        sleep(&procs_left);
+        sleep(&procs_left, &procs_left_lock);
     }
-    return procs_left == 0 && n > 0;
+    bool ok = procs_left == 0 && n > 0;
+    release(&procs_left_lock);
+    return ok;
 }
 
 /* How long a process waits for another to get somewhere: it yields up to
