@@ -123,7 +123,9 @@ fn shell_output(out: &str) -> &str {
 fn kernel_ticks_ten_times_then_starts_the_shell() {
     let (code, out) = grail(&kernel_elf(), b"exit\n");
     assert_eq!(code, Some(0), "output:\n{out}");
-    assert!(out.starts_with("Camelot v0.1.0 booting...\n"), "{out}");
+    // The banner (its exact text is checked in xtask's kernel tests), then the version.
+    assert!(out.starts_with("\n    ____ "), "{out}");
+    assert!(out.contains("|_|\n\nCamelot v0.1.0 booting...\n"), "{out}");
     assert!(
         out.ends_with(&format!(
             "{}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{SHELL_BANNER}{PROMPT}exit\n",

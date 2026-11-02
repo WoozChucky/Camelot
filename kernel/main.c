@@ -24,6 +24,18 @@
 
 #define CAMELOT_VERSION "0.1.0"
 
+/* The banner printed first at boot, before the version line. Plain ASCII, so it
+ * shows the same on a serial console, in Herald and in Grail's window. */
+static const char *const banner[] = {
+    "\n",
+    "    ____      _      __  __   _____   _        ___    _____\n",
+    "   / ___|    / \\    |  \\/  | | ____| | |      / _ \\  |_   _|\n",
+    "  | |       / _ \\   | |\\/| | |  _|   | |     | | | |   | |\n",
+    "  | |___   / ___ \\  | |  | | | |___  | |___  | |_| |   | |\n",
+    "   \\____| /_/   \\_\\ |_|  |_| |_____| |_____|  \\___/    |_|\n",
+    "\n",
+};
+
 /* Timer ticks to wait for before starting the shell. */
 #define BOOT_TICKS 10
 
@@ -205,6 +217,8 @@ static void print_disks(void) {
 
 int kmain(void) {
     uart_init();
+    for (u32 i = 0; i < sizeof banner / sizeof banner[0]; i++)
+        kprintf("%s", banner[i]);
     kprintf("Camelot v%s booting...\n", CAMELOT_VERSION);
 
     kprintf("kprintf: d=%d u=%u x=%x p=%p s=%s c=%c %%=%%\n", -42, 4294967295u, 0xcafef00du,

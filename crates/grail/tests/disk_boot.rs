@@ -329,9 +329,10 @@ fn grail_boots_the_kernel_from_disk_with_no_program() {
         assert_eq!(code, Some(0), "{harts} harts:\n{out}");
         // The bootloader's line, then the kernel as if Grail had loaded its ELF.
         assert!(
-            out.starts_with("boot: kernel at sector 0x00000800\nCamelot v0.1.0 booting...\n"),
+            out.starts_with("boot: kernel at sector 0x00000800\n\n    ____ "),
             "{out}"
         );
+        assert!(out.contains("|_|\n\nCamelot v0.1.0 booting...\n"), "{out}");
         assert!(out.contains("fs: disk 0 mounted: 1024 blocks"), "{out}");
         assert!(out.ends_with(&format!("{SHELL}exit\n")), "{out}");
     }
