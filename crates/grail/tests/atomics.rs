@@ -91,6 +91,15 @@ fn step_traps(m: &mut Machine, cause: u32, tval: u32) {
 }
 
 #[test]
+fn misa_reports_a() {
+    // csrr a0, misa: RV32 with A, I, M, S, U and X.
+    let mut m = machine(&[0x3010_2573]);
+    step(&mut m);
+    assert_eq!(reg(&m, A0), 0x4094_1101);
+    assert_ne!(reg(&m, A0) & 1, 0, "A is bit 0");
+}
+
+#[test]
 fn every_amo_returns_the_old_word_and_writes_the_result() {
     let (neg, pos) = (0x8000_0000u32, 1u32);
     // (funct5, memory before, rs2, memory after)
