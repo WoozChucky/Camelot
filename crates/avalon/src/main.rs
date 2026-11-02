@@ -8,7 +8,8 @@ use std::time::Duration;
 const USAGE: &str = "usage: avalon [--listen ADDR] [--max-ram MiB]
 
 Runs Grail virtual machines and serves the Avalon protocol (docs/avalon-protocol.md):
-Round Table creates and controls the VMs, Herald attaches to their consoles.
+Round Table creates and controls the VMs, Herald attaches to their consoles and
+screens.
 
   --listen ADDR   where to listen: host:port, or a host or IP address for port 7400
                   (default 127.0.0.1:7400). The protocol has no authentication, so

@@ -25,8 +25,17 @@ pub enum Kw {
     Long,
     Signed,
     Unsigned,
+    Bool,
+    Struct,
+    Union,
+    Enum,
+    Const,
+    Volatile,
+    Restrict,
     Static,
     Extern,
+    Typedef,
+    Inline,
     Sizeof,
     Return,
     If,
@@ -36,6 +45,10 @@ pub enum Kw {
     For,
     Break,
     Continue,
+    Switch,
+    Case,
+    Default,
+    Goto,
 }
 
 /// Every keyword merlin handles, in [`Kw`] order.
@@ -47,8 +60,17 @@ pub const KEYWORDS: &[(Kw, &str)] = &[
     (Kw::Long, "long"),
     (Kw::Signed, "signed"),
     (Kw::Unsigned, "unsigned"),
+    (Kw::Bool, "_Bool"),
+    (Kw::Struct, "struct"),
+    (Kw::Union, "union"),
+    (Kw::Enum, "enum"),
+    (Kw::Const, "const"),
+    (Kw::Volatile, "volatile"),
+    (Kw::Restrict, "restrict"),
     (Kw::Static, "static"),
     (Kw::Extern, "extern"),
+    (Kw::Typedef, "typedef"),
+    (Kw::Inline, "inline"),
     (Kw::Sizeof, "sizeof"),
     (Kw::Return, "return"),
     (Kw::If, "if"),
@@ -58,6 +80,10 @@ pub const KEYWORDS: &[(Kw, &str)] = &[
     (Kw::For, "for"),
     (Kw::Break, "break"),
     (Kw::Continue, "continue"),
+    (Kw::Switch, "switch"),
+    (Kw::Case, "case"),
+    (Kw::Default, "default"),
+    (Kw::Goto, "goto"),
 ];
 
 impl Kw {
@@ -73,7 +99,9 @@ impl Kw {
             .1
     }
 
-    /// Keywords that start a declaration: type specifiers and storage classes.
+    /// Keywords that start a declaration: type specifiers and qualifiers,
+    /// storage classes and `inline`. (A typedef name starts one too, which
+    /// only the parser knows.)
     pub fn starts_decl(self) -> bool {
         matches!(
             self,
@@ -84,30 +112,37 @@ impl Kw {
                 | Kw::Long
                 | Kw::Signed
                 | Kw::Unsigned
+                | Kw::Bool
+                | Kw::Struct
+                | Kw::Union
+                | Kw::Enum
+                | Kw::Const
+                | Kw::Volatile
+                | Kw::Restrict
                 | Kw::Static
                 | Kw::Extern
+                | Kw::Typedef
+                | Kw::Inline
         )
     }
 }
 
 /// C keywords that merlin doesn't handle yet. Using one is a clear error rather
 /// than a confusing parse error further on.
-const UNSUPPORTED_KEYWORDS: &[&str] = &[
-    "auto", "case", "const", "default", "double", "enum", "float", "goto", "inline", "register", "restrict",
-    "struct", "switch", "typedef", "union", "volatile", "_Bool", "_Complex",
-];
+const UNSUPPORTED_KEYWORDS: &[&str] = &["auto", "double", "float", "register", "_Complex", "_Imaginary"];
 
-/// Punctuators, longest first so `<<=` wins over `<<` and `<`.
+/// Punctuators, longest first so `<<=` wins over `<<` and `<`, and `->` over
+/// `-` (`a->b` is never `a - > b`).
 const PUNCTS: &[&str] = &[
-    "<<=", ">>=", "==", "!=", "<=", ">=", "&&", "||", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=",
-    "^=", "<<", ">>", "(", ")", "{", "}", "[", "]", ";", ",", "=", "+", "-", "*", "/", "%", "<", ">", "!",
-    "~", "&", "|", "^", "?", ":",
+    "<<=", ">>=", "->", "==", "!=", "<=", ">=", "&&", "||", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=",
+    "|=", "^=", "<<", ">>", "(", ")", "{", "}", "[", "]", ";", ",", "=", "+", "-", "*", "/", "%", "<", ">",
+    "!", "~", "&", "|", "^", "?", ":", ".",
 ];
 
-/// C punctuators merlin doesn't handle yet (structs, varargs). `->` is
-/// matched before `-`, as C's longest-match rule demands, so `a->b` is an
-/// error rather than `a - > b`.
-const UNSUPPORTED_PUNCTS: &[&str] = &["...", "->", "."];
+/// C punctuators merlin doesn't handle yet (varargs). `...` is matched
+/// before `.`, as C's longest-match rule demands, so it is an error rather
+/// than three dots.
+const UNSUPPORTED_PUNCTS: &[&str] = &["..."];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Tok {
@@ -282,6 +317,9 @@ impl Lexer {
 
     fn number(&mut self, pos: Pos) -> Result<Tok, Error> {
         let text = self.take_while(|c| c.is_ascii_alphanumeric() || c == '_');
+        if self.peek(0) == Some('.') {
+            return Err(Error::new(pos, "floating-point literals are not supported"));
+        }
         let lower = text.to_ascii_lowercase();
         // Split off the suffix: any mix of `u` and `l` at the end.
         let digits_end = lower.trim_end_matches(['u', 'l']).len();
@@ -665,9 +703,30 @@ mod tests {
 
     #[test]
     fn unsupported_punctuators_are_not_split() {
-        assert_eq!(err("a->b"), "1:2: '->' is not supported yet");
-        assert_eq!(err("s.x"), "1:2: '.' is not supported yet");
         assert_eq!(err("f(int a, ...)"), "1:10: '...' is not supported yet");
+        assert_eq!(err("x = 1.5;"), "1:5: floating-point literals are not supported");
+        // `->` is one token, `.` another.
+        assert_eq!(
+            toks("p->x.y"),
+            vec![
+                Tok::Ident("p".into()),
+                Tok::Punct("->"),
+                Tok::Ident("x".into()),
+                Tok::Punct("."),
+                Tok::Ident("y".into()),
+                Tok::Eof
+            ]
+        );
+        assert_eq!(
+            toks("a-->b"),
+            vec![
+                Tok::Ident("a".into()),
+                Tok::Punct("--"),
+                Tok::Punct(">"),
+                Tok::Ident("b".into()),
+                Tok::Eof
+            ]
+        );
         // With a space they are separate tokens, in C too.
         assert_eq!(
             toks("- -x"),
@@ -709,11 +768,8 @@ mod tests {
             err("#include <x.h>"),
             "1:1: preprocessor directives are not supported yet"
         );
-        assert_eq!(
-            err("int f() { struct s; }"),
-            "1:11: 'struct' is not supported yet"
-        );
-        assert_eq!(err("const int x;"), "1:1: 'const' is not supported yet");
+        assert_eq!(err("int f() { float s; }"), "1:11: 'float' is not supported yet");
+        assert_eq!(err("register int x;"), "1:1: 'register' is not supported yet");
     }
 
     #[test]

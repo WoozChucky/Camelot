@@ -2,10 +2,10 @@
 //! variant, its type code, and its payload layout.
 //!
 //! Type codes are grouped by their high byte: `0x00` session, `0x01` VM control, `0x02`
-//! console, `0x03` screen and input, `0x04` block I/O, `0x05` disk management, `0x06`
-//! virtual network (Avalon's switches). Every
-//! message is a request (answered by exactly one reply), a reply, or an event (never
-//! answered); see [`MessageKind`].
+//! console, `0x03` screen and input (keyboard and pointer), `0x04` block I/O, `0x05`
+//! disk management, `0x06` virtual network (Avalon's switches). Every message is a
+//! request (answered by exactly one reply), a reply, or an event (never answered); see
+//! [`MessageKind`].
 
 use crate::wire::{Reader, Writer};
 use crate::{Error, Result, MAGIC, MAX_BLOCK_SECTORS, SECTOR_SIZE};
@@ -46,6 +46,7 @@ pub mod ty {
     pub const SCREEN_FRAME: u16 = 0x0303;
     pub const KEY_INPUT: u16 = 0x0304;
     pub const SCREEN_DETACH: u16 = 0x0305;
+    pub const POINTER_INPUT: u16 = 0x0306;
     // Block I/O.
     pub const BLOCK_OPEN: u16 = 0x0401;
     pub const BLOCK_OPENED: u16 = 0x0402;
@@ -105,6 +106,7 @@ pub const CATALOGUE: &[(u16, &str, MessageKind)] = {
         (ty::SCREEN_FRAME, "ScreenFrame", Event),
         (ty::KEY_INPUT, "KeyInput", Event),
         (ty::SCREEN_DETACH, "ScreenDetach", Request),
+        (ty::POINTER_INPUT, "PointerInput", Event),
         (ty::BLOCK_OPEN, "BlockOpen", Request),
         (ty::BLOCK_OPENED, "BlockOpened", Reply),
         (ty::BLOCK_READ, "BlockRead", Request),
@@ -356,6 +358,39 @@ pub struct KeyEvent {
 const KEY_RELEASE: u8 = 1 << 0;
 const KEY_SHIFT: u8 = 1 << 1;
 const KEY_CTRL: u8 = 1 << 2;
+
+/// Pointer button bits of [`PointerChange::buttons`], as in the guest's pointer device
+/// (Excalibur spec section 9.7).
+pub const POINTER_LEFT: u8 = 1 << 0;
+pub const POINTER_RIGHT: u8 = 1 << 1;
+pub const POINTER_MIDDLE: u8 = 1 << 2;
+/// Every pointer button bit; the others must be 0.
+pub const POINTER_BUTTONS: u8 = POINTER_LEFT | POINTER_RIGHT | POINTER_MIDDLE;
+
+/// How a viewer's pointer moved, in screen pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PointerMotion {
+    /// It did not: a button or wheel change only.
+    #[default]
+    None,
+    /// To this pixel of the screen (absolute, like a tablet). The server clamps it to
+    /// the screen.
+    To { x: u32, y: u32 },
+    /// By this many pixels (relative, for a viewer that only has deltas).
+    By { dx: i32, dy: i32 },
+}
+
+/// One change of a viewer's pointer, for the guest's pointer device (Excalibur spec
+/// section 9.7): how it moved, the buttons held after the change, and the wheel
+/// notches turned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PointerChange {
+    pub motion: PointerMotion,
+    /// [`POINTER_LEFT`], [`POINTER_RIGHT`], [`POINTER_MIDDLE`]; other bits must be 0.
+    pub buttons: u8,
+    /// Notches, positive away from the user (up).
+    pub wheel: i8,
+}
 
 /// One image in a `DiskList`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,6 +678,11 @@ pub enum Message {
     ScreenDetach {
         vm: u32,
     },
+    /// Client: a change of its pointer for the VM's pointer device.
+    PointerInput {
+        vm: u32,
+        pointer: PointerChange,
+    },
 
     // ---- Block I/O (Lake) ----
     /// Attach a disk image. Answered by `BlockOpened` with a handle for the requests
@@ -773,6 +813,7 @@ impl Message {
             ScreenFrame { .. } => ty::SCREEN_FRAME,
             KeyInput { .. } => ty::KEY_INPUT,
             ScreenDetach { .. } => ty::SCREEN_DETACH,
+            PointerInput { .. } => ty::POINTER_INPUT,
             BlockOpen { .. } => ty::BLOCK_OPEN,
             BlockOpened { .. } => ty::BLOCK_OPENED,
             BlockRead { .. } => ty::BLOCK_READ,
@@ -846,6 +887,9 @@ impl Message {
                 ));
             }
             Message::KeyInput { key, .. } if key.code == 0 => return invalid("key code 0".into()),
+            Message::PointerInput { pointer, .. } if pointer.buttons & !POINTER_BUTTONS != 0 => {
+                return invalid(format!("reserved pointer buttons {:#04x}", pointer.buttons));
+            }
             Message::BlockRead { count, .. } if !(1..=MAX_BLOCK_SECTORS).contains(count) => {
                 return invalid(format!(
                     "block read of {count} sectors (1 to {MAX_BLOCK_SECTORS})"
@@ -971,6 +1015,24 @@ impl Message {
                     }
                 }
                 w.u8(flags);
+            }
+            PointerInput { vm, pointer } => {
+                w.u32(*vm);
+                match pointer.motion {
+                    PointerMotion::None => w.u8(0),
+                    PointerMotion::To { x, y } => {
+                        w.u8(1);
+                        w.u32(x);
+                        w.u32(y);
+                    }
+                    PointerMotion::By { dx, dy } => {
+                        w.u8(2);
+                        w.i32(dx);
+                        w.i32(dy);
+                    }
+                }
+                w.u8(pointer.buttons);
+                w.i8(pointer.wheel);
             }
             BlockOpen { name, read_only } => {
                 w.str(name);
@@ -1151,6 +1213,25 @@ impl Message {
                 }
             }
             ty::SCREEN_DETACH => ScreenDetach { vm: r.u32()? },
+            ty::POINTER_INPUT => PointerInput {
+                vm: r.u32()?,
+                pointer: PointerChange {
+                    motion: match r.u8()? {
+                        0 => PointerMotion::None,
+                        1 => PointerMotion::To {
+                            x: r.u32()?,
+                            y: r.u32()?,
+                        },
+                        2 => PointerMotion::By {
+                            dx: r.i32()?,
+                            dy: r.i32()?,
+                        },
+                        t => return Err(bad_tag("pointer motion", t)),
+                    },
+                    buttons: r.u8()?,
+                    wheel: r.i8()?,
+                },
+            },
             ty::BLOCK_OPEN => BlockOpen {
                 name: r.string()?,
                 read_only: r.bool()?,

@@ -1,8 +1,8 @@
 //! The protocol mirrors Grail's types: the hardware profile is `grail::MachineConfig`,
-//! a VM's device table is Grail's sysinfo table, keys and pixels are Grail's keyboard
-//! events and VRAM format. The conversions below destructure Grail's structs without
-//! `..`, so adding a field there stops this test compiling until the protocol (and
-//! `docs/avalon-protocol.md`) carry it too.
+//! a VM's device table is Grail's sysinfo table, keys, pointer buttons and pixels are
+//! Grail's keyboard events, pointer buttons and VRAM format. The conversions below
+//! destructure Grail's structs without `..`, so adding a field there stops this test
+//! compiling until the protocol (and `docs/avalon-protocol.md`) carry it too.
 //!
 //! Network cards: a Grail config plugs a card into an in-process hub, a profile into
 //! one of the server's switches, by name. The two are the same idea (a network the
@@ -291,4 +291,14 @@ fn keys_and_pixels_mirror_grail() {
     };
     assert!(grail::keyboard::code::is_valid(key.code));
     assert_eq!(PIXEL_FORMAT_XRGB8888, grail::framebuffer::FB_FORMAT_XRGB8888);
+}
+
+#[test]
+fn pointer_buttons_are_grails() {
+    use avalon_proto::{POINTER_BUTTONS, POINTER_LEFT, POINTER_MIDDLE, POINTER_RIGHT};
+    use grail::pointer::{BUTTONS_MASK, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT};
+    assert_eq!(
+        [POINTER_LEFT, POINTER_RIGHT, POINTER_MIDDLE, POINTER_BUTTONS],
+        [BUTTON_LEFT, BUTTON_RIGHT, BUTTON_MIDDLE, BUTTONS_MASK]
+    );
 }

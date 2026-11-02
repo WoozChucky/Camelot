@@ -311,6 +311,37 @@ pub fn samples() -> Vec<Message> {
             message: format!("{code} \u{2014} détails"),
         });
     }
+    for pointer in [
+        PointerChange::default(),
+        PointerChange {
+            motion: PointerMotion::To { x: 639, y: 0 },
+            buttons: POINTER_LEFT,
+            wheel: 0,
+        },
+        PointerChange {
+            motion: PointerMotion::To {
+                x: u32::MAX,
+                y: u32::MAX,
+            },
+            buttons: POINTER_BUTTONS,
+            wheel: i8::MIN,
+        },
+        PointerChange {
+            motion: PointerMotion::By { dx: -5, dy: 7 },
+            buttons: POINTER_RIGHT | POINTER_MIDDLE,
+            wheel: 3,
+        },
+        PointerChange {
+            motion: PointerMotion::By {
+                dx: i32::MIN,
+                dy: i32::MAX,
+            },
+            buttons: 0,
+            wheel: i8::MAX,
+        },
+    ] {
+        v.push(PointerInput { vm: 4, pointer });
+    }
     for (code, release, shift, ctrl) in [
         (b'a', false, false, false),
         (b'A', false, true, false),

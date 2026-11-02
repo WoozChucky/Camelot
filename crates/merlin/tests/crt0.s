@@ -21,3 +21,17 @@ memset:
     addi  t0, t0, 1
     j     2b
 3:  ret
+
+# void *memcpy(void *dst, const void *src, size_t n): clang calls it to copy
+# large structs. merlin copies them inline and never calls it.
+    .globl memcpy
+memcpy:
+    mv    t0, a0
+    add   a2, a0, a2        # end
+4:  beq   t0, a2, 5f
+    lbu   t1, 0(a1)
+    sb    t1, 0(t0)
+    addi  t0, t0, 1
+    addi  a1, a1, 1
+    j     4b
+5:  ret

@@ -2,7 +2,7 @@
 //! writer thread.
 //!
 //! Replies come from the thread reading the client's requests, events from any VM the
-//! client is attached to (console output, state changes). Both go through this queue,
+//! client is attached to (console output, screen frames, state changes). Both go through this queue,
 //! so each frame reaches the socket whole and in the order it was queued, and a VM
 //! thread never waits for a slow client's socket.
 //!
@@ -119,6 +119,12 @@ impl Outbox {
         self.changed.notify_all();
     }
 
+    /// Bytes queued and not yet written: how far behind the client is. A VM streaming
+    /// its screen holds frames back from a client this far behind (see `vm.rs`).
+    pub fn queued(&self) -> usize {
+        lock(&self.queue).bytes
+    }
+
     /// Whether [`Outbox::close`] (or a cut-off) happened.
     pub fn is_closed(&self) -> bool {
         lock(&self.queue).closed
@@ -219,6 +225,7 @@ mod tests {
         outbox.reply(&Message::Ok);
         assert!(outbox.event(&output(3)));
         outbox.reply_now(&Message::Pong { token: 9 });
+        assert_eq!(outbox.queued(), 6 + 6 + 8 + 3 + 6 + 4);
         outbox.close();
         assert!(!outbox.event(&output(1)), "closed");
         outbox.reply(&Message::Ok); // dropped

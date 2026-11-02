@@ -1,10 +1,13 @@
 //! Helpers for the server tests: an in-process Avalon on an ephemeral port, clients,
-//! console readers, and guest programs.
+//! console readers, screen viewers, and guest programs.
 
 #![allow(dead_code)]
 
 use avalon::{Config, Server, ServerThread};
-use avalon_proto::{Connection, HardwareProfile, Message, MessageKind, VmDetails, VmRef, VmState};
+use avalon_proto::{
+    Connection, HardwareProfile, KeyEvent, Message, MessageKind, PointerChange, Rect, Screen, VmDetails,
+    VmRef, VmState,
+};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -312,6 +315,163 @@ impl Drop for Console {
     /// Closes the connection (the reading thread holds a second handle on it).
     fn drop(&mut self) {
         let _ = self.conn.get_ref().shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// A connection attached to a VM's screen: a thread reads everything the server sends,
+/// and the frames are applied to [`Viewer::screen`] as they come, as a viewer does.
+pub struct Viewer {
+    pub conn: Connection<TcpStream>,
+    pub vm: u32,
+    /// The screen as the frames received so far draw it.
+    pub screen: Screen,
+    /// Every frame's rectangle, in order.
+    pub rects: Vec<Rect>,
+    /// Other events, in order.
+    pub events: Vec<Message>,
+    rx: Receiver<Message>,
+}
+
+impl Viewer {
+    /// Attaches to `vm`'s screen on a new connection, and waits for the full frame
+    /// that follows the attach.
+    pub fn attach(server: &ServerThread, vm: VmRef) -> Viewer {
+        Viewer::attach_on(connect(server), vm)
+    }
+
+    pub fn attach_on(mut conn: Connection<TcpStream>, vm: VmRef) -> Viewer {
+        let (vm, width, height) = match conn.request(&Message::ScreenAttach { vm }) {
+            Ok(Message::ScreenAttached {
+                vm,
+                width,
+                height,
+                format,
+            }) => {
+                assert_eq!(format, avalon_proto::PIXEL_FORMAT_XRGB8888);
+                (vm, width, height)
+            }
+            other => panic!("attach: {other:?}"),
+        };
+        let mut reader = conn.try_clone().unwrap();
+        reader.get_ref().set_read_timeout(None).unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(msg) = reader.recv() {
+                if tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut viewer = Viewer {
+            conn,
+            vm,
+            screen: Screen::new(width, height),
+            rects: Vec::new(),
+            events: Vec::new(),
+            rx,
+        };
+        viewer.wait_until(|v| !v.rects.is_empty(), "the first frame");
+        assert_eq!(viewer.rects[0], viewer.screen.bounds(), "the first frame is full");
+        viewer
+    }
+
+    pub fn key(&mut self, key: KeyEvent) {
+        self.conn.send(&Message::KeyInput { vm: self.vm, key }).unwrap();
+    }
+
+    pub fn pointer(&mut self, pointer: PointerChange) {
+        self.conn
+            .send(&Message::PointerInput { vm: self.vm, pointer })
+            .unwrap();
+    }
+
+    /// Takes in what has arrived, waiting at most `timeout` for the next message.
+    /// Returns false once the connection has ended.
+    pub fn pump(&mut self, timeout: Duration) -> bool {
+        match self.rx.recv_timeout(timeout) {
+            Ok(frame @ Message::ScreenFrame { .. }) => {
+                if let Message::ScreenFrame { vm, .. } = frame {
+                    assert_eq!(vm, self.vm);
+                }
+                let rect = self.screen.apply_frame(&frame).unwrap();
+                self.rects.push(rect);
+                true
+            }
+            Ok(other) => {
+                self.events.push(other);
+                true
+            }
+            Err(RecvTimeoutError::Timeout) => true,
+            Err(RecvTimeoutError::Disconnected) => false,
+        }
+    }
+
+    /// Waits until `done` holds for this viewer.
+    pub fn wait_until(&mut self, done: impl Fn(&Viewer) -> bool, what: &str) {
+        let start = Instant::now();
+        while !done(self) {
+            assert!(
+                start.elapsed() < SLOW,
+                "waiting for {what}; {} frames, events {:?}",
+                self.rects.len(),
+                self.events
+            );
+            if !self.pump(Duration::from_millis(20)) && !done(self) {
+                panic!("connection ended waiting for {what}; events {:?}", self.events);
+            }
+        }
+    }
+
+    /// Waits for an event.
+    pub fn wait_for_event(&mut self, event: Message) {
+        let what = format!("{event:?}");
+        self.wait_until(|v| v.events.contains(&event), &what);
+    }
+
+    /// Collects whatever arrives during `time`.
+    pub fn idle(&mut self, time: Duration) {
+        let end = Instant::now() + time;
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            if !self.pump(left.min(Duration::from_millis(20))) {
+                break;
+            }
+        }
+    }
+
+    /// Sends a request on this connection and returns its reply, keeping what comes
+    /// before it.
+    pub fn request(&mut self, msg: &Message) -> Message {
+        self.conn.send(msg).unwrap();
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < SLOW, "no reply to {msg:?}");
+            let before = self.events.len();
+            assert!(self.pump(Duration::from_millis(20)), "connection closed");
+            if self.events.len() > before && self.events[before].kind() == MessageKind::Reply {
+                return self.events.remove(before);
+            }
+        }
+    }
+}
+
+impl Drop for Viewer {
+    /// Closes the connection (the reading thread holds a second handle on it).
+    fn drop(&mut self) {
+        let _ = self.conn.get_ref().shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// The framebuffer a program leaves when Grail runs it to its end on its own, for
+/// comparing with what a viewer received: black where the display is off.
+pub fn grail_screen(program: &[u8]) -> Vec<u8> {
+    let mut m = grail::Machine::with_ram(16 * 1024 * 1024);
+    m.load_elf(program).unwrap();
+    assert_eq!(m.run(Some(100_000_000), |_| {}), grail::RunResult::Exited(0));
+    let fb = &m.cpu.bus.fb;
+    if fb.enabled() {
+        fb.vram.clone()
+    } else {
+        vec![0; fb.vram.len()]
     }
 }
 

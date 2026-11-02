@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use MessageKind::{Event, Reply, Request};
 
 /// Section 6, the message catalogue: (code, name, kind).
-const SPEC_CATALOGUE: [(u16, &str, MessageKind); 49] = [
+const SPEC_CATALOGUE: [(u16, &str, MessageKind); 50] = [
     (0x0001, "Hello", Request),
     (0x0002, "Welcome", Reply),
     (0x0003, "Error", Reply),
@@ -38,6 +38,7 @@ const SPEC_CATALOGUE: [(u16, &str, MessageKind); 49] = [
     (0x0303, "ScreenFrame", Event),
     (0x0304, "KeyInput", Event),
     (0x0305, "ScreenDetach", Request),
+    (0x0306, "PointerInput", Event),
     (0x0401, "BlockOpen", Request),
     (0x0402, "BlockOpened", Reply),
     (0x0403, "BlockRead", Request),
@@ -123,6 +124,14 @@ impl P {
         self
     }
     fn u64(mut self, v: u64) -> Self {
+        self.0.extend(v.to_le_bytes());
+        self
+    }
+    fn i8(mut self, v: i8) -> Self {
+        self.0.extend(v.to_le_bytes());
+        self
+    }
+    fn i32(mut self, v: i32) -> Self {
         self.0.extend(v.to_le_bytes());
         self
     }
@@ -401,6 +410,24 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
         ),
         (ScreenDetach { vm: 5 }, P::default().u32(5).frame(0x0305)),
         (
+            PointerInput {
+                vm: 6,
+                pointer: PointerChange {
+                    motion: PointerMotion::To { x: 100, y: 50 },
+                    buttons: POINTER_LEFT,
+                    wheel: -1,
+                },
+            },
+            P::default()
+                .u32(6)
+                .u8(1)
+                .u32(100)
+                .u32(50)
+                .u8(1)
+                .i8(-1)
+                .frame(0x0306),
+        ),
+        (
             BlockOpen {
                 name: "d".into(),
                 read_only: true,
@@ -598,6 +625,39 @@ fn every_enum_tag_is_the_documented_one() {
             P::default().u32(1).u8(1).u8(flags).frame(0x0304)
         );
     }
+    for (motion, fields) in [
+        (PointerMotion::None, P::default().u8(0)),
+        (PointerMotion::To { x: 7, y: 8 }, P::default().u8(1).u32(7).u32(8)),
+        (
+            PointerMotion::By { dx: -7, dy: 8 },
+            P::default().u8(2).i32(-7).i32(8),
+        ),
+    ] {
+        for (buttons, wheel) in [
+            (POINTER_LEFT, 0),
+            (POINTER_RIGHT, 1),
+            (POINTER_MIDDLE, -1),
+            (0b111, 127),
+        ] {
+            let msg = Message::PointerInput {
+                vm: 1,
+                pointer: PointerChange {
+                    motion,
+                    buttons,
+                    wheel,
+                },
+            };
+            let want = P::default()
+                .u32(1)
+                .raw(&fields.0)
+                .u8(buttons)
+                .i8(wheel)
+                .frame(0x0306);
+            assert_eq!(encode(&msg).unwrap(), want, "{msg:?}");
+            assert_eq!(decode(&want).unwrap().0, msg);
+        }
+    }
+    assert_eq!((POINTER_LEFT, POINTER_RIGHT, POINTER_MIDDLE), (1, 2, 4));
 }
 
 #[test]
@@ -622,15 +682,17 @@ fn optional_fields_are_tagged() {
 
 #[test]
 fn doc_examples_are_exact() {
-    // Section 6.1: Hello version 1 from agent "rt".
+    // Section 6.1: Hello version 3 from agent "rt".
     assert_eq!(
         encode(&Message::Hello {
-            version: 1,
+            version: 3,
             agent: "rt".into()
         })
         .unwrap(),
-        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x01, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
+        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x03, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
     );
+    // Section 7: the version this document describes.
+    assert_eq!(PROTOCOL_VERSION, 3);
     // Section 6.2: StartVm by id 5.
     assert_eq!(
         encode(&Message::StartVm { vm: VmRef::Id(5) }).unwrap(),

@@ -5,11 +5,20 @@
 //! generation but the checked tree: memory is a flat byte array, globals and
 //! string literals are laid out from a low address, each call's locals get a
 //! fresh area further up, and every value is 32 bits interpreted by its C type.
+//! A struct's value is its address (as an array's), and assigning, passing or
+//! returning it copies its bytes. Functions get made-up addresses below the
+//! data, so pointers to them compare and convert like any pointer but cannot
+//! be read through.
+//!
 //! Semantics match what the generated code must do on Excalibur (spec section
 //! 10, "Merlin C subset"): 32-bit wrapping arithmetic, `div`/`rem` rounding
 //! toward zero with RISC-V's results for `i32::MIN / -1` and division by zero,
 //! shifts by the low 5 bits of the amount, comparisons and `! && ||` give 0 or
 //! 1, and falling off the end of a function returns 0.
+//!
+//! `switch` and `goto` run by seeking: the statements are walked without
+//! being run until the `case`, `default` or label is found, and run normally
+//! from there (into and out of blocks and loops, as C's jumps go).
 
 use merlin::ast::*;
 use merlin::consteval::{self, Base, Const};
@@ -33,6 +42,9 @@ pub fn run(prog: &Program, entry: &str) -> Result<i32, String> {
 const MAX_STEPS: u64 = 50_000_000;
 /// Keeps runaway recursion from overflowing the interpreter's stack.
 const MAX_DEPTH: usize = 1_000;
+/// Where the made-up function addresses start: below the data, so reading
+/// through a function pointer traps.
+const FUNCS_START: u32 = 0x100;
 /// Where globals and string literals start: address 0 stays invalid, so null
 /// pointers trap.
 const DATA_START: u32 = 0x1000;
@@ -43,11 +55,7 @@ const MEMORY: usize = 16 << 20;
 
 fn run_here(prog: &Program, entry: &str) -> Result<i32, String> {
     let mut it = Interp {
-        funcs: prog
-            .funcs()
-            .filter(|f| f.body.is_some())
-            .map(|f| (f.name.as_str(), f))
-            .collect(),
+        funcs: HashMap::new(),
         mem: vec![0; MEMORY],
         symbols: HashMap::new(),
         strings: HashMap::new(),
@@ -56,6 +64,16 @@ fn run_here(prog: &Program, entry: &str) -> Result<i32, String> {
         steps: 0,
         depth: 0,
     };
+    // Every function gets an address (a declared one too: calling it is an
+    // error only if it happens), its definition if it has one.
+    for f in prog.funcs() {
+        let next = FUNCS_START + 4 * it.symbols.len() as u32;
+        let addr = *it.symbols.entry(f.name.clone()).or_insert(next);
+        let def = it.funcs.entry(addr).or_insert((f.name.as_str(), None));
+        if f.body.is_some() {
+            def.1 = Some(f);
+        }
+    }
     // Lay out every defined global and static local, then initialize them
     // (an initializer may point at a variable defined further down).
     let mut defs = Vec::new();
@@ -79,29 +97,34 @@ fn run_here(prog: &Program, entry: &str) -> Result<i32, String> {
             it.static_init(&d.ty, init, addr)?;
         }
     }
-    it.call(entry, Vec::new()).map(|v| v as i32)
+    let entry = *it.symbols.get(entry).ok_or("no entry function")?;
+    it.call(entry, Vec::new(), None).map(|v| v as i32)
 }
 
 /// Every `static` local in a function body.
 fn statics<'a>(body: &'a [Stmt], out: &mut Vec<&'a Declarator>) {
     for s in body {
+        let one = std::slice::from_ref;
         match &s.kind {
             StmtKind::Decl(ds) => out.extend(ds.iter().filter(|d| matches!(d.var, Some(VarRef::Global(_))))),
             StmtKind::Block(b) => statics(b, out),
             StmtKind::If { then, els, .. } => {
-                statics(std::slice::from_ref(&**then), out);
+                statics(one(then), out);
                 if let Some(e) = els {
-                    statics(std::slice::from_ref(&**e), out);
+                    statics(one(e), out);
                 }
             }
-            StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => {
-                statics(std::slice::from_ref(&**body), out)
-            }
+            StmtKind::While { body, .. }
+            | StmtKind::DoWhile { body, .. }
+            | StmtKind::Switch { body, .. }
+            | StmtKind::Case { body, .. }
+            | StmtKind::Default { body, .. }
+            | StmtKind::Label { body, .. } => statics(one(body), out),
             StmtKind::For { init, body, .. } => {
                 if let Some(i) = init {
-                    statics(std::slice::from_ref(&**i), out);
+                    statics(one(i), out);
                 }
-                statics(std::slice::from_ref(&**body), out);
+                statics(one(body), out);
             }
             _ => {}
         }
@@ -120,9 +143,10 @@ fn size_of(ty: &Type) -> u32 {
 }
 
 struct Interp<'a> {
-    funcs: HashMap<&'a str, &'a Function>,
+    /// Each function's name and definition, by its made-up address.
+    funcs: HashMap<u32, (&'a str, Option<&'a Function>)>,
     mem: Vec<u8>,
-    /// Address of every global symbol.
+    /// Address of every global symbol (functions too).
     symbols: HashMap<String, u32>,
     /// Address of each string literal node (a literal is one object).
     strings: HashMap<*const Expr, u32>,
@@ -138,7 +162,17 @@ enum Flow {
     Next,
     Break,
     Continue,
+    /// A value, or for a struct its address.
     Return(u32),
+    /// A `goto` to this label, which the function seeks from its start.
+    Goto(String),
+}
+
+/// What a jump looks for while statements are skipped.
+#[derive(PartialEq)]
+enum Target {
+    Case(usize),
+    Label(String),
 }
 
 impl<'a> Interp<'a> {
@@ -191,6 +225,25 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// Copies an object of type `ty` (a struct) from `src` to `dst`.
+    fn copy(&mut self, dst: u32, src: u32, ty: &Type) -> Result<(), String> {
+        let size = size_of(ty);
+        let s = self.check(src, size)?;
+        let d = self.check(dst, size)?;
+        self.mem.copy_within(s..s + size as usize, d);
+        Ok(())
+    }
+
+    /// Stores the value `v` of type `ty` at `addr`: a struct's value is the
+    /// address of its bytes, which are copied.
+    fn put(&mut self, addr: u32, ty: &Type, v: u32) -> Result<(), String> {
+        if ty.is_record() {
+            self.copy(addr, v, ty)
+        } else {
+            self.store(addr, ty, v)
+        }
+    }
+
     fn string(&mut self, e: &Expr, bytes: &[u8]) -> u32 {
         if let Some(&a) = self.strings.get(&(e as *const Expr)) {
             return a;
@@ -203,10 +256,16 @@ impl<'a> Interp<'a> {
 
     /// Writes a global's or static's constant initializer.
     fn static_init(&mut self, ty: &Type, init: &Init, addr: u32) -> Result<(), String> {
-        match (ty, init) {
+        match (ty.unqual(), init) {
             (Type::Array(elem, _), Init::List(items, _)) => {
                 for (i, item) in items.iter().enumerate() {
                     self.static_init(elem, item, addr + i as u32 * size_of(elem))?;
+                }
+            }
+            (Type::Record(r), Init::List(items, _)) => {
+                let body = r.body().ok_or("incomplete struct")?;
+                for (m, item) in body.members.iter().zip(items) {
+                    self.static_init(&m.ty, item, addr + m.offset)?;
                 }
             }
             (
@@ -245,11 +304,16 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    fn call(&mut self, name: &str, args: Vec<u32>) -> Result<u32, String> {
-        let f = *self
+    /// Calls the function at address `addr`. A struct argument is the
+    /// address of its bytes; a struct result is copied to `result` (the
+    /// caller's hidden local) before the callee's frame goes, and that
+    /// address is returned.
+    fn call(&mut self, addr: u32, args: Vec<u32>, result: Option<u32>) -> Result<u32, String> {
+        let (name, f) = *self
             .funcs
-            .get(name)
-            .ok_or_else(|| format!("call to '{name}', which has no definition"))?;
+            .get(&addr)
+            .ok_or_else(|| format!("call through {addr:#x}, which is not a function"))?;
+        let f = f.ok_or_else(|| format!("call to '{name}', which has no definition"))?;
         if self.depth == MAX_DEPTH {
             return Err(format!("recursion deeper than {MAX_DEPTH} calls"));
         }
@@ -257,19 +321,30 @@ impl<'a> Interp<'a> {
         let saved_top = self.top;
         let frame: Vec<u32> = f.locals.iter().map(|l| self.alloc_frame(&l.ty)).collect();
         for (i, v) in args.into_iter().enumerate() {
-            self.store(frame[i], &f.locals[i].ty, v)?;
+            self.put(frame[i], &f.locals[i].ty, v)?;
         }
         self.depth += 1;
-        let mut result = 0;
-        for s in f.body.as_ref().unwrap() {
-            if let Flow::Return(v) = self.stmt(s, &frame)? {
-                result = v;
-                break;
+        let body = f.body.as_ref().unwrap();
+        let mut seek = None;
+        let mut value = 0;
+        loop {
+            match self.block(body, &frame, &mut seek)? {
+                Flow::Return(v) => {
+                    value = v;
+                    break;
+                }
+                // Labels belong to the whole function: look from the top.
+                Flow::Goto(label) => seek = Some(Target::Label(label)),
+                _ => break,
             }
+        }
+        if let Some(dst) = result {
+            self.copy(dst, value, &f.ret)?;
+            value = dst;
         }
         self.depth -= 1;
         self.top = saved_top;
-        Ok(result)
+        Ok(value)
     }
 
     fn tick(&mut self) -> Result<(), String> {
@@ -280,9 +355,9 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    fn block(&mut self, body: &'a [Stmt], frame: &[u32]) -> Result<Flow, String> {
+    fn block(&mut self, body: &'a [Stmt], frame: &[u32], seek: &mut Option<Target>) -> Result<Flow, String> {
         for s in body {
-            match self.stmt(s, frame)? {
+            match self.stmt(s, frame, seek)? {
                 Flow::Next => {}
                 other => return Ok(other),
             }
@@ -291,23 +366,130 @@ impl<'a> Interp<'a> {
     }
 
     /// Runs a loop body: whether the loop goes on, or how it ends.
-    fn body(&mut self, body: &'a Stmt, frame: &[u32]) -> Result<Option<Flow>, String> {
-        Ok(match self.stmt(body, frame)? {
+    fn body(
+        &mut self,
+        body: &'a Stmt,
+        frame: &[u32],
+        seek: &mut Option<Target>,
+    ) -> Result<Option<Flow>, String> {
+        Ok(match self.stmt(body, frame, seek)? {
             Flow::Break => Some(Flow::Next),
-            Flow::Return(v) => Some(Flow::Return(v)),
             Flow::Next | Flow::Continue => None,
+            other => Some(other),
         })
     }
 
-    fn stmt(&mut self, s: &'a Stmt, frame: &[u32]) -> Result<Flow, String> {
+    /// Runs a statement, or while `seek` is set, looks for its target in it
+    /// (and runs the rest of the statement from there once found).
+    fn stmt(&mut self, s: &'a Stmt, frame: &[u32], seek: &mut Option<Target>) -> Result<Flow, String> {
         self.tick()?;
         Ok(match &s.kind {
-            StmtKind::Block(body) => self.block(body, frame)?,
+            StmtKind::Block(body) => self.block(body, frame, seek)?,
+            StmtKind::Case { id, body, .. } | StmtKind::Default { id, body } => {
+                if seek.as_ref() == Some(&Target::Case(*id)) {
+                    *seek = None;
+                }
+                self.stmt(body, frame, seek)?
+            }
+            StmtKind::Label { name, body } => {
+                if matches!(seek, Some(Target::Label(l)) if l == name) {
+                    *seek = None;
+                }
+                self.stmt(body, frame, seek)?
+            }
+            StmtKind::If { cond, then, els } => {
+                if seek.is_some() {
+                    let f = self.stmt(then, frame, seek)?;
+                    match els {
+                        Some(e) if seek.is_some() => self.stmt(e, frame, seek)?,
+                        _ => f,
+                    }
+                } else if self.expr(cond, frame)? != 0 {
+                    self.stmt(then, frame, seek)?
+                } else if let Some(e) = els {
+                    self.stmt(e, frame, seek)?
+                } else {
+                    Flow::Next
+                }
+            }
+            StmtKind::While { cond, body } => loop {
+                if seek.is_none() && self.expr(cond, frame)? == 0 {
+                    break Flow::Next;
+                }
+                if let Some(f) = self.body(body, frame, seek)? {
+                    break f;
+                }
+                if seek.is_some() {
+                    break Flow::Next; // the target is not in this loop
+                }
+            },
+            StmtKind::DoWhile { body, cond } => loop {
+                if let Some(f) = self.body(body, frame, seek)? {
+                    break f;
+                }
+                if seek.is_some() {
+                    break Flow::Next;
+                }
+                if self.expr(cond, frame)? == 0 {
+                    break Flow::Next;
+                }
+            },
+            StmtKind::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                if let (Some(i), None) = (init, &seek) {
+                    self.stmt(i, frame, seek)?;
+                }
+                loop {
+                    if let (Some(c), None) = (cond, &seek) {
+                        if self.expr(c, frame)? == 0 {
+                            break Flow::Next;
+                        }
+                    }
+                    if let Some(f) = self.body(body, frame, seek)? {
+                        break f;
+                    }
+                    if seek.is_some() {
+                        break Flow::Next;
+                    }
+                    if let Some(e) = step {
+                        self.expr(e, frame)?;
+                    }
+                }
+            }
+            StmtKind::Switch {
+                cond,
+                body,
+                cases,
+                default,
+            } => {
+                if seek.is_none() {
+                    let v = self.expr(cond, frame)?;
+                    let target = cases
+                        .iter()
+                        .find(|(value, _)| *value as u32 == v)
+                        .map(|&(_, id)| id)
+                        .or(*default);
+                    let Some(id) = target else {
+                        return Ok(Flow::Next);
+                    };
+                    *seek = Some(Target::Case(id));
+                }
+                match self.stmt(body, frame, seek)? {
+                    Flow::Break => Flow::Next,
+                    other => other,
+                }
+            }
+            // While seeking, nothing else runs.
+            _ if seek.is_some() => Flow::Next,
             StmtKind::Decl(decls) => {
                 for d in decls {
                     if let (Some(VarRef::Local(id)), Some(init)) = (&d.var, &d.init) {
                         let addr = frame[id.0];
-                        if d.ty.is_array() {
+                        if d.ty.is_array() || d.ty.is_record() {
                             let size = size_of(&d.ty) as usize;
                             self.mem[addr as usize..addr as usize + size].fill(0);
                         }
@@ -321,68 +503,27 @@ impl<'a> Interp<'a> {
                 Flow::Next
             }
             StmtKind::Empty => Flow::Next,
-            StmtKind::If { cond, then, els } => {
-                if self.expr(cond, frame)? != 0 {
-                    self.stmt(then, frame)?
-                } else if let Some(e) = els {
-                    self.stmt(e, frame)?
-                } else {
-                    Flow::Next
-                }
-            }
-            StmtKind::While { cond, body } => loop {
-                if self.expr(cond, frame)? == 0 {
-                    break Flow::Next;
-                }
-                if let Some(f) = self.body(body, frame)? {
-                    break f;
-                }
-            },
-            StmtKind::DoWhile { body, cond } => loop {
-                if let Some(f) = self.body(body, frame)? {
-                    break f;
-                }
-                if self.expr(cond, frame)? == 0 {
-                    break Flow::Next;
-                }
-            },
-            StmtKind::For {
-                init,
-                cond,
-                step,
-                body,
-            } => {
-                if let Some(i) = init {
-                    self.stmt(i, frame)?;
-                }
-                loop {
-                    if let Some(c) = cond {
-                        if self.expr(c, frame)? == 0 {
-                            break Flow::Next;
-                        }
-                    }
-                    if let Some(f) = self.body(body, frame)? {
-                        break f;
-                    }
-                    if let Some(e) = step {
-                        self.expr(e, frame)?;
-                    }
-                }
-            }
             StmtKind::Return(e) => Flow::Return(match e {
                 Some(e) => self.expr(e, frame)?,
                 None => 0,
             }),
             StmtKind::Break => Flow::Break,
             StmtKind::Continue => Flow::Continue,
+            StmtKind::Goto(label) => Flow::Goto(label.clone()),
         })
     }
 
     fn local_init(&mut self, ty: &Type, init: &'a Init, addr: u32, frame: &[u32]) -> Result<(), String> {
-        match (ty, init) {
+        match (ty.unqual(), init) {
             (Type::Array(elem, _), Init::List(items, _)) => {
                 for (i, item) in items.iter().enumerate() {
                     self.local_init(elem, item, addr + i as u32 * size_of(elem), frame)?;
+                }
+            }
+            (Type::Record(r), Init::List(items, _)) => {
+                let body = r.body().ok_or("incomplete struct")?;
+                for (m, item) in body.members.iter().zip(items) {
+                    self.local_init(&m.ty, item, addr + m.offset, frame)?;
                 }
             }
             (
@@ -397,14 +538,14 @@ impl<'a> Interp<'a> {
             }
             (_, Init::Expr(e)) => {
                 let v = self.expr(e, frame)?;
-                self.store(addr, ty, v)?;
+                self.put(addr, ty, v)?;
             }
             _ => return Err("bad initializer shape".into()),
         }
         Ok(())
     }
 
-    /// The address of an lvalue.
+    /// The address of an lvalue (or of any struct value).
     fn addr(&mut self, e: &'a Expr, frame: &[u32]) -> Result<u32, String> {
         match &e.kind {
             ExprKind::Var { var, .. } => match var {
@@ -418,13 +559,16 @@ impl<'a> Interp<'a> {
             },
             ExprKind::Deref(p) => self.expr(p, frame),
             ExprKind::Str(b) => Ok(self.string(e, b)),
+            // `s.m`: `s`'s value is its address; `p->m`: `p` is one.
+            ExprKind::Member { base, offset, .. } => Ok(self.expr(base, frame)?.wrapping_add(*offset)),
             _ => Err(format!("{}: not an lvalue", e.pos)),
         }
     }
 
-    /// The value of an lvalue: loaded, or the address itself for an array.
+    /// The value of an lvalue: loaded, or the address itself for an array, a
+    /// struct or a function.
     fn value_at(&self, addr: u32, ty: &Type) -> Result<u32, String> {
-        if ty.is_array() {
+        if ty.is_addressed() {
             Ok(addr)
         } else {
             self.load(addr, ty)
@@ -435,7 +579,7 @@ impl<'a> Interp<'a> {
         self.tick()?;
         Ok(match &e.kind {
             ExprKind::Num(v) => *v as u32,
-            ExprKind::Var { .. } | ExprKind::Str(_) | ExprKind::Deref(_) => {
+            ExprKind::Var { .. } | ExprKind::Str(_) | ExprKind::Deref(_) | ExprKind::Member { .. } => {
                 let a = self.addr(e, frame)?;
                 self.value_at(a, &e.ty)?
             }
@@ -451,13 +595,18 @@ impl<'a> Interp<'a> {
                         convert(binary(*op, old, &t, v, &vt)?, &target.ty)
                     }
                 };
-                self.store(a, &target.ty, v)?;
-                v
+                self.put(a, &target.ty, v)?;
+                // A struct assignment's value is the target.
+                if target.ty.is_record() {
+                    a
+                } else {
+                    v
+                }
             }
             ExprKind::IncDec { inc, prefix, target } => {
                 let a = self.addr(target, frame)?;
                 let old = self.load(a, &target.ty)?;
-                let step = match &target.ty {
+                let step = match target.ty.unqual() {
                     Type::Ptr(t) => size_of(t),
                     _ => 1,
                 };
@@ -512,23 +661,27 @@ impl<'a> Interp<'a> {
                 self.expr(a, frame)?;
                 self.expr(b, frame)?
             }
-            ExprKind::Call(name, args) => {
-                // Left to right; C leaves the order unspecified, so harness programs
-                // must not depend on it.
+            ExprKind::Call {
+                callee, args, result, ..
+            } => {
+                // The callee, then the arguments left to right; C leaves the
+                // order unspecified, so harness programs must not depend on it.
+                let f = self.expr(callee, frame)?;
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     vals.push(self.expr(a, frame)?);
                 }
-                self.call(name, vals)?
+                self.call(f, vals, result.map(|id| frame[id.0]))?
             }
         })
     }
 }
 
 /// A 32-bit value converted to `ty`: narrow integers are cut and widened by
-/// their signedness, everything else is already 32 bits.
+/// their signedness (`_Bool` becomes 0 or 1), everything else is already 32
+/// bits.
 fn convert(v: u32, ty: &Type) -> u32 {
-    match ty {
+    match ty.unqual() {
         Type::Int(k) => k.wrap(v as i64) as u32,
         Type::Void => 0,
         _ => v,
