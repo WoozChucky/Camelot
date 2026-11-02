@@ -12,6 +12,9 @@ tests/riscv-tests/rv32* binary
 *.ld text eol=lf
 *.ast text eol=lf
 kernel/kernel.elf.clang-version text eol=lf
+# Built by `cargo xtask kernel`; collapsed in GitHub diffs.
+kernel/kernel.elf binary linguist-generated
+kernel/kernel-disk.elf binary linguist-generated
 # llvm-objdump output, compared line by line (keep LF so it diffs cleanly).
 crates/merlin-objdump/tests/golden/*.txt text eol=lf
 crates/merlin-as/tests/golden/*.txt text eol=lf

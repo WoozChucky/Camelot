@@ -2068,9 +2068,13 @@ fn kernel_c_stays_freestanding() {
 
 #[test]
 fn kernel_asm_is_merlin_dialect() {
-    // The .s files must use only what merlin-as understands.
+    // The .s files must use only what merlin-as understands (userprogs.s is
+    // generated, and assembled by merlin-as whenever the kernel is built).
     let sources = kernel::sources(&kernel_dir()).unwrap();
-    let asm: Vec<_> = sources.iter().filter(|s| s.lang == Lang::Asm).collect();
+    let asm: Vec<_> = sources
+        .iter()
+        .filter(|s| s.lang == Lang::Asm && !s.is_generated())
+        .collect();
     assert!(!asm.is_empty());
     for s in asm {
         let text = std::fs::read_to_string(kernel_dir().join(&s.name)).unwrap();
@@ -3499,16 +3503,14 @@ fn the_elf_loader_refuses_bad_images() {
 }
 
 #[test]
-fn userprogs_s_is_up_to_date() {
-    // kernel/userprogs.s is generated from kernel/user by merlin, merlin-as
-    // and merlin-ld (no LLVM): it must be what the current sources and
-    // tools give, or `cargo xtask kernel` wasn't run after a change.
-    let committed = std::fs::read_to_string(repo_root().join(xtask::userprogs::GENERATED)).unwrap();
-    let fresh = xtask::userprogs::generated(&repo_root()).unwrap();
-    assert!(
-        committed == fresh,
-        "kernel/userprogs.s is out of date: run `cargo xtask kernel` and commit it"
-    );
+fn userprogs_s_is_generated_by_merlin() {
+    // The kernel's userprogs.s is generated from kernel/user by merlin,
+    // merlin-as and merlin-ld (no LLVM) whenever the kernel is built, and is
+    // not a file in kernel/: a stale committed copy would be an error
+    // (`kernel::sources`). Its contents are checked through kernel.elf
+    // (committed_kernel_is_what_our_toolchain_builds).
+    assert!(!kernel_dir().join(kernel::USERPROGS).exists());
+    let fresh = kernel::userprogs(&kernel_dir()).unwrap();
     // Most programs are C, compiled by merlin.
     let dir = xtask::userprogs::user_dir(&repo_root());
     let c = xtask::userprogs::sources(&dir)
@@ -3517,7 +3519,10 @@ fn userprogs_s_is_up_to_date() {
         .filter(|s| s.lang == xtask::userprogs::Lang::C)
         .count();
     assert!(c >= 8, "{c} C files");
-    assert!(committed.contains("compiled by merlin,"));
+    assert!(fresh.contains("compiled by merlin,"));
+    for name in program_names() {
+        assert!(fresh.contains(&format!("\nuser_elf_{name}:\n")), "{name}");
+    }
 }
 
 #[test]

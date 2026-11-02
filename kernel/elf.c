@@ -1,10 +1,10 @@
 /* The ELF loader: puts an executable's PT_LOAD segments into a process's user
  * space. The executables come from the filesystem, or from the kernel itself
- * (kernel/userprogs.s) when there is none, and are checked as untrusted
- * either way: a bad image is an error, never a panic or a mapping outside
- * user space. Everything is copied out through the elf_file's read(), so
- * an image in memory needs no particular alignment, and a file is read
- * piece by piece rather than whole. */
+ * (userprogs.s, which `cargo xtask kernel` generates) when there is none,
+ * and are checked as untrusted either way: a bad image is an error, never a
+ * panic or a mapping outside user space. Everything is copied out through
+ * the elf_file's read(), so an image in memory needs no particular
+ * alignment, and a file is read piece by piece rather than whole. */
 #include "elf.h"
 #include "kalloc.h"
 #include "memlayout.h"

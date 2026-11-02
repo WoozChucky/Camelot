@@ -17,7 +17,8 @@ tasks:
                --check: build in memory and report stale .elf files instead of writing
                -v: print the equivalent merlin-as/merlin-ld command lines
   kernel       build kernel/kernel.elf with our own toolchain (merlin, merlin-as, merlin-ld;
-               no LLVM), after regenerating kernel/userprogs.s from kernel/user the same way,
+               no LLVM), with the user programs of kernel/user built the same way and embedded
+               as data (their generated userprogs.s goes to target/kernel/obj with the objects),
                and kernel/kernel-disk.elf, the same kernel without the user programs built in
                (it runs them from /bin: the kernel of a bootable root image).
                --cc clang: the reference build instead (clang -O2 + ld.lld from the official
@@ -513,16 +514,8 @@ fn kernel(k: KernelArgs) -> ExitCode {
     };
     let built = match k.cc.unwrap_or_default() {
         Cc::Merlin => {
-            // The user programs first: their images are part of the
-            // kernel's sources.
-            match xtask::userprogs::write(&root) {
-                Ok(true) => eprintln!("regenerated {}", xtask::userprogs::GENERATED),
-                Ok(false) => {}
-                Err(e) => {
-                    eprintln!("xtask: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
+            // The user programs' assembly (userprogs.s) is generated into the
+            // object directory first: their images are part of the kernel.
             Build {
                 out: out.unwrap_or_else(|| kernel_dir.join("kernel.elf")),
                 obj_dir: root.join("target").join("kernel").join("obj"),

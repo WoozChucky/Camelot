@@ -1,13 +1,15 @@
 //! Building and running the Camelot kernel (`kernel/`).
 //!
 //! Every `*.c` and `*.s` file directly in `kernel/` or in one of its source
-//! subdirectories ([`SUBDIRS`], e.g. `net/arp.c`) is one object, and the
-//! objects are linked in name order with `kernel/kernel.ld`. Our own tools
-//! build it ([`Toolchain::Merlin`], [`build_merlin`]): merlin compiles each C
-//! file, merlin-as assembles it and the `.s` files and merlin-ld links them,
-//! all in memory, with no LLVM. That is how the committed
-//! `kernel/kernel.elf` is made, and `cargo test` checks it is what the
-//! current sources and tools give.
+//! subdirectories ([`SUBDIRS`], e.g. `net/arp.c`) is one object, and so is
+//! [`USERPROGS`], `userprogs.s`: the user programs of `kernel/user/` as data,
+//! which is not a file in `kernel/` but generated at build time
+//! ([`crate::userprogs`]). The objects are linked in name order with
+//! `kernel/kernel.ld`. Our own tools build it ([`Toolchain::Merlin`],
+//! [`build_merlin`]): merlin compiles each C file, merlin-as assembles it and
+//! the `.s` files and merlin-ld links them, all in memory, with no LLVM. That
+//! is how the committed `kernel/kernel.elf` is made, and `cargo test` checks
+//! it is what the current sources and tools give.
 //!
 //! The reference build ([`Toolchain::Clang`], `cargo xtask kernel --cc
 //! clang`) compiles the C with clang `-O2`, assembles with clang (or
@@ -101,8 +103,15 @@ pub const INCLUDE_DIR: &str = "include";
 /// The kernel's linker script, in the kernel directory.
 pub const SCRIPT: &str = "kernel.ld";
 /// The generated source that holds the user programs
-/// (`crate::userprogs::GENERATED`), in the kernel directory.
+/// ([`crate::userprogs::generate`]). It is a source of the kernel, linked in
+/// its name order like the others, but no file in the kernel directory: it is
+/// built from [`USER_DIR`] every time, and a file of that name in the kernel
+/// directory (a stale copy from when it was committed) is an error.
 pub const USERPROGS: &str = "userprogs.s";
+/// The user programs' directory, in the kernel directory
+/// ([`crate::userprogs::USER_DIR`] from the repository root). A kernel
+/// directory without one has no [`USERPROGS`].
+pub const USER_DIR: &str = "user";
 /// The kernel with its user programs built in, in the kernel directory: what
 /// Grail runs as a program (`grail kernel/kernel.elf`), with or without a disk.
 pub const KERNEL_ELF: &str = "kernel.elf";
@@ -159,6 +168,12 @@ impl Source {
     pub fn asm_name(&self) -> String {
         format!("{}.s", self.name)
     }
+
+    /// Whether this is [`USERPROGS`], generated at build time rather than
+    /// read from the kernel directory.
+    pub fn is_generated(&self) -> bool {
+        self.name == USERPROGS
+    }
 }
 
 /// The subdirectories of the kernel directory whose `*.c` and `*.s` files
@@ -167,10 +182,25 @@ impl Source {
 pub const SUBDIRS: &[&str] = &["net"];
 
 /// Lists the kernel's sources (`*.c`, `*.s`, in `kernel_dir` and its
-/// [`SUBDIRS`]) in name order.
+/// [`SUBDIRS`], and the generated [`USERPROGS`] if `kernel_dir` has a
+/// [`USER_DIR`]) in name order. A `userprogs.s` file in `kernel_dir` is an
+/// error rather than a second copy of the programs.
 pub fn sources(kernel_dir: &Path) -> Result<Vec<Source>, String> {
     let mut out = Vec::new();
     list_sources(kernel_dir, "", &mut out)?;
+    if out.iter().any(Source::is_generated) {
+        return Err(format!(
+            "{}: the user programs' assembly is generated at build time from {USER_DIR}/ \
+             and is not a source file any more; delete this stale copy",
+            kernel_dir.join(USERPROGS).display()
+        ));
+    }
+    if kernel_dir.join(USER_DIR).is_dir() {
+        out.push(Source {
+            name: USERPROGS.into(),
+            lang: Lang::Asm,
+        });
+    }
     for sub in SUBDIRS {
         let dir = kernel_dir.join(sub);
         if dir.is_dir() {
@@ -227,12 +257,20 @@ pub struct Built {
     pub elf: Vec<u8>,
 }
 
+/// The text of [`USERPROGS`] for the kernel in `kernel_dir`: every program in
+/// its [`USER_DIR`] built by merlin, merlin-as and merlin-ld, in memory
+/// ([`crate::userprogs::generated`]).
+pub fn userprogs(kernel_dir: &Path) -> Result<String, String> {
+    crate::userprogs::generated(&kernel_dir.join(USER_DIR))
+}
+
 /// Builds the kernel in `kernel_dir` with merlin, merlin-as and merlin-ld, in
 /// memory: merlin compiles each C file (`-I include`), merlin-as assembles
 /// that and each `.s` file, and merlin-ld links the objects in name order
-/// with `kernel.ld`. `userprogs`, if given, is assembled instead of
-/// `kernel_dir/userprogs.s`. No LLVM; nothing is written.
-pub fn build_merlin(kernel_dir: &Path, userprogs: Option<&Path>) -> Result<Built, String> {
+/// with `kernel.ld`. [`USERPROGS`] is `userprogs` if given (the text of
+/// another build of the programs), or else generated from the user programs
+/// ([`userprogs()`]). No LLVM; nothing is written.
+pub fn build_merlin(kernel_dir: &Path, userprogs: Option<&str>) -> Result<Built, String> {
     let mut objects = Vec::new();
     for source in sources(kernel_dir)? {
         let (asm, obj) = match source.lang {
@@ -241,11 +279,15 @@ pub fn build_merlin(kernel_dir: &Path, userprogs: Option<&Path>) -> Result<Built
                 let obj = toolchain::assemble(&format!("{} (merlin's assembly)", source.asm_name()), &asm)?;
                 (Some(asm), obj)
             }
-            Lang::Asm => {
-                let path = match userprogs {
-                    Some(p) if source.name == USERPROGS => p.to_path_buf(),
-                    _ => kernel_dir.join(&source.name),
+            Lang::Asm if source.is_generated() => {
+                let text = match userprogs {
+                    Some(text) => text.to_string(),
+                    None => self::userprogs(kernel_dir)?,
                 };
+                (None, toolchain::assemble(&source.name, &text)?)
+            }
+            Lang::Asm => {
+                let path = kernel_dir.join(&source.name);
                 let text = std::fs::read_to_string(&path)
                     .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
                 (None, toolchain::assemble(&source.name, &text)?)
@@ -276,7 +318,7 @@ pub fn build_merlin(kernel_dir: &Path, userprogs: Option<&Path>) -> Result<Built
 /// size. Booted with no shell in `/bin` (or with no root filesystem at all) it
 /// panics: there is nothing else to run.
 pub fn disk_kernel(kernel_dir: &Path, built: &Built) -> Result<Vec<u8>, String> {
-    if !built.objects.iter().any(|o| o.source.name == USERPROGS) {
+    if !built.objects.iter().any(|o| o.source.is_generated()) {
         return Err(format!("the kernel has no {USERPROGS} to leave out"));
     }
     // The same link, in the same order, with the empty table's object in place
@@ -287,7 +329,7 @@ pub fn disk_kernel(kernel_dir: &Path, built: &Built) -> Result<Vec<u8>, String> 
         .iter()
         .map(|o| merlin_ld::Input {
             name: o.source.object_name(),
-            data: if o.source.name == USERPROGS {
+            data: if o.source.is_generated() {
                 empty.clone()
             } else {
                 o.obj.clone()
@@ -320,20 +362,32 @@ pub struct Build {
     /// The linked ELF.
     pub out: PathBuf,
     pub toolchain: Toolchain,
-    /// Assembled instead of `kernel_dir/userprogs.s`: the reference build
-    /// embeds user programs built from clang's assembly.
+    /// The file assembled as [`USERPROGS`]: the reference build embeds user
+    /// programs built from clang's assembly. Without one, [`Build::run`]
+    /// generates it from the user programs (merlin, merlin-as, merlin-ld) and
+    /// writes it to the object directory, where every tool can read it.
     pub userprogs: Option<PathBuf>,
     /// Print each command (or its command-line equivalent) before running it.
     pub verbose: bool,
 }
 
 impl Build {
-    /// What a tool reads for `src`, relative to the kernel directory unless
-    /// [`Build::userprogs`] replaces it.
-    fn input(&self, src: &Source) -> OsString {
+    /// The [`USERPROGS`] file the tools read: [`Build::userprogs`], or the
+    /// generated one in the object directory.
+    pub fn userprogs_path(&self) -> PathBuf {
         match &self.userprogs {
-            Some(p) if src.name == USERPROGS => p.clone().into(),
-            _ => src.name.clone().into(),
+            Some(p) => p.clone(),
+            None => self.obj_dir.join(USERPROGS),
+        }
+    }
+
+    /// What a tool reads for `src`: its path relative to the kernel
+    /// directory, or [`Build::userprogs_path`] for [`USERPROGS`].
+    fn input(&self, src: &Source) -> OsString {
+        if src.is_generated() {
+            self.userprogs_path().into()
+        } else {
+            src.name.clone().into()
         }
     }
 
@@ -371,8 +425,10 @@ impl Build {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
+        // The user programs first: their images are part of the kernel.
+        let userprogs = self.userprogs(&sources)?;
         match &self.toolchain {
-            Toolchain::Merlin => self.run_merlin(&sources)?,
+            Toolchain::Merlin => self.run_merlin(&sources, userprogs.as_deref())?,
             Toolchain::Clang {
                 clang,
                 lld,
@@ -391,10 +447,35 @@ impl Build {
         Ok(self.out.clone())
     }
 
-    /// [`build_merlin`], then writes merlin's assembly and the objects to
-    /// the object directory (for merlin-objdump and for comparing with the
-    /// reference build) and the kernel to the output.
-    fn run_merlin(&self, sources: &[Source]) -> Result<(), String> {
+    /// [`USERPROGS`]'s text, if the kernel has one: [`Build::userprogs`]'s, or
+    /// generated by [`userprogs()`] and written to [`Build::userprogs_path`]
+    /// for the tools that read files.
+    fn userprogs(&self, sources: &[Source]) -> Result<Option<String>, String> {
+        if !sources.iter().any(Source::is_generated) {
+            return Ok(None);
+        }
+        let path = self.kernel_dir.join(self.userprogs_path());
+        if self.userprogs.is_some() {
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            return Ok(Some(text));
+        }
+        if self.verbose {
+            eprintln!(
+                "(every program in {USER_DIR}/, built with merlin, merlin-as and merlin-ld, as data) > {}",
+                self.userprogs_path().display()
+            );
+        }
+        let text = userprogs(&self.kernel_dir)?;
+        std::fs::write(&path, &text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        Ok(Some(text))
+    }
+
+    /// [`build_merlin`] with `userprogs` ([`Build::userprogs`]'s text), then
+    /// writes merlin's assembly and the objects to the object directory (for
+    /// merlin-objdump and for comparing with the reference build) and the
+    /// kernel to the output.
+    fn run_merlin(&self, sources: &[Source], userprogs: Option<&str>) -> Result<(), String> {
         if self.verbose {
             // What the same build is from the command line, inside kernel/.
             let obj = |name: String| self.obj_dir.join(name).display().to_string();
@@ -414,8 +495,7 @@ impl Build {
                 .collect();
             eprintln!("merlin-ld {}", args.join(" "));
         }
-        let userprogs = self.userprogs.as_ref().map(|p| self.kernel_dir.join(p));
-        let built = build_merlin(&self.kernel_dir, userprogs.as_deref())?;
+        let built = build_merlin(&self.kernel_dir, userprogs)?;
         let write = |path: PathBuf, bytes: &[u8]| {
             std::fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
         };
@@ -481,7 +561,7 @@ pub const REFERENCE_DIR: &str = "target/kernel/clang";
 /// The reference build (`cargo xtask kernel --cc clang`) of the kernel under
 /// `root`, into `work` (absolute): clang compiles the user programs' C to
 /// assembly, merlin-as and merlin-ld build the programs from it as usual
-/// (into `work/userprogs.s`, not the committed file), then clang compiles
+/// (into `work/userprogs.s`), then clang compiles
 /// the kernel's C, `assembler` assembles its `.s` files and ld.lld links
 /// `out`. Returns `out`.
 pub fn build_reference(
@@ -618,9 +698,17 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted);
-        for want in ["entry.s", "kprintf.c", "main.c", "uart.c"] {
+        for want in ["entry.s", "kprintf.c", "main.c", "uart.c", USERPROGS] {
             assert!(names.contains(&want), "{want} missing from {names:?}");
         }
+        // userprogs.s is generated, not read from kernel/ (where it is not).
+        let generated: Vec<&str> = srcs
+            .iter()
+            .filter(|s| s.is_generated())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(generated, [USERPROGS]);
+        assert!(!crate::repo_root().join("kernel").join(USERPROGS).exists());
         assert!(srcs
             .iter()
             .all(|s| (s.lang == Lang::Asm) == s.name.ends_with(".s")));
@@ -661,11 +749,15 @@ mod tests {
             name: USERPROGS.into(),
             lang: Lang::Asm,
         };
+        // By default the generated file, in the object directory (never in
+        // the kernel directory).
+        let generated = b.obj_dir.join(USERPROGS).display().to_string();
         let args = strings(&b.compile_args(&progs));
-        assert!(args.contains(&"userprogs.s".to_string()), "{args:?}");
+        assert!(args.contains(&generated), "{args:?}");
+        assert!(!args.contains(&"userprogs.s".to_string()), "{args:?}");
         b.userprogs = Some(PathBuf::from("/elsewhere/userprogs.s"));
         let args = strings(&b.compile_args(&progs));
-        assert!(!args.contains(&"userprogs.s".to_string()), "{args:?}");
+        assert!(!args.contains(&generated), "{args:?}");
         assert!(args.contains(&"/elsewhere/userprogs.s".to_string()), "{args:?}");
         // Other sources are unaffected.
         let args = strings(&b.compile_args(&Source {
@@ -706,9 +798,20 @@ mod tests {
         assert!(programs(&elf) > 0);
         assert_eq!(programs(&disk), 0);
         assert!(disk.len() < elf.len());
-        for f in ["main.c.s", "main.c.o", "entry.s.o", "userprogs.s.o"] {
+        for f in [
+            "main.c.s",
+            "main.c.o",
+            "entry.s.o",
+            "userprogs.s",
+            "userprogs.s.o",
+        ] {
             assert!(b.obj_dir.join(f).is_file(), "{f}");
         }
+        // The generated programs, written where the objects go.
+        assert_eq!(
+            std::fs::read_to_string(b.obj_dir.join(USERPROGS)).unwrap(),
+            userprogs(&b.kernel_dir).unwrap()
+        );
         assert!(!b.obj_dir.join("entry.s.s").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -736,11 +839,24 @@ mod tests {
         let names: Vec<&str> = built.objects.iter().map(|o| o.source.name.as_str()).collect();
         assert_eq!(names, ["a.c", "b.s"]);
         assert!(built.objects[0].asm.is_some() && built.objects[1].asm.is_none());
-        // userprogs.s can be replaced by another file.
-        std::fs::write(dir.join(USERPROGS), "    bogus\n").unwrap();
-        assert!(build_merlin(&dir, None).is_err());
-        std::fs::write(dir.join("other.s"), "    .text\n    nop\n").unwrap();
-        assert!(build_merlin(&dir, Some(&dir.join("other.s"))).is_ok());
+        // With a user/ directory, userprogs.s is generated from it, or given.
+        std::fs::create_dir_all(dir.join(USER_DIR)).unwrap();
+        let err = build_merlin(&dir, None).unwrap_err();
+        assert!(err.contains("no programs in"), "{err}");
+        let err = build_merlin(&dir, Some("    bogus\n")).unwrap_err();
+        assert!(err.starts_with("userprogs.s:1: error"), "{err}");
+        let built = build_merlin(&dir, Some("    .text\n    nop\n")).unwrap();
+        let names: Vec<&str> = built.objects.iter().map(|o| o.source.name.as_str()).collect();
+        assert_eq!(names, ["a.c", "b.s", USERPROGS]);
+        // A stale userprogs.s file in the kernel directory is an error, not a
+        // second copy of the programs.
+        std::fs::write(dir.join(USERPROGS), "    .text\n    nop\n").unwrap();
+        let err = build_merlin(&dir, None).unwrap_err();
+        assert!(
+            err.contains("generated at build time") && err.contains("delete"),
+            "{err}"
+        );
+        assert!(sources(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

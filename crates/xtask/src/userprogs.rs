@@ -12,15 +12,16 @@
 //! that and the `.s` files, and merlin-ld links each program with the
 //! runtime, the library members it needs and `kernel/user/user.ld`. The
 //! runtime and the library are built once for all the programs. The
-//! executables then go into
-//! `kernel/userprogs.s` as ELF images in `.rodata`, with a table the
-//! kernel's loader looks programs up in. That file is generated, but
-//! committed with the kernel sources, so building the kernel needs nothing
-//! but its own directory.
+//! executables then go into the kernel's `userprogs.s` ([`generate`]) as ELF
+//! images in `.rodata`, with a table the kernel's loader looks programs up
+//! in.
 //!
-//! `cargo xtask kernel` regenerates `userprogs.s` ([`write`]), and `cargo
-//! test` checks that the committed one is what the current sources and tools
-//! give. The reference build, `cargo xtask kernel --cc clang`, has clang
+//! That assembly is generated every time the kernel is built
+//! (`crate::kernel::USERPROGS`), in memory, and is not committed: its
+//! contents are in the committed `kernel/kernel.elf`, which `cargo test`
+//! checks is what the current sources and tools give. `cargo xtask kernel`
+//! leaves a copy next to the kernel's objects (`target/kernel/obj`). The
+//! reference build, `cargo xtask kernel --cc clang`, has clang
 //! compile the C files to assembly instead ([`compile_clang`], into a
 //! scratch directory) and builds the same programs from that
 //! ([`build_all_with`], [`CCompiler::Clang`]).
@@ -40,8 +41,6 @@ pub const RUNTIME: &[&str] = &["crt0.s", "usys.s"];
 pub const LIB_DIR: &str = "lib";
 /// The linker script every program is linked with.
 pub const SCRIPT: &str = "user.ld";
-/// The generated assembly file, relative to the repository root.
-pub const GENERATED: &str = "kernel/userprogs.s";
 /// The longest program name: the kernel keeps 15 characters and a NUL
 /// (`struct proc`'s `name`, kernel/include/proc.h).
 pub const MAX_NAME: usize = 15;
@@ -409,7 +408,7 @@ fn emit_bytes(out: &mut String, bytes: &[u8]) {
     }
 }
 
-/// The text of `kernel/userprogs.s` for `programs`: the table
+/// The text of the kernel's `userprogs.s` for `programs`: the table
 /// `user_programs` (one `struct user_program { const char *name; const u8
 /// *elf; u32 size; }` per program, in order), `user_program_count`, then the
 /// names and the images, each image 4-byte aligned under a global label
@@ -482,22 +481,10 @@ pub fn empty() -> String {
         .to_string()
 }
 
-/// Builds every program under `root` and returns the text of
-/// `kernel/userprogs.s`.
-pub fn generated(root: &Path) -> Result<String, String> {
-    Ok(generate(&build_all(&user_dir(root))?, CCompiler::Merlin))
-}
-
-/// Regenerates `kernel/userprogs.s` under `root`. Returns whether the file
-/// changed (it is left alone when it is already up to date).
-pub fn write(root: &Path) -> Result<bool, String> {
-    let text = generated(root)?;
-    let path = root.join(GENERATED);
-    if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
-        return Ok(false);
-    }
-    std::fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    Ok(true)
+/// Builds every program in `dir` (`kernel/user`) with our own tools and
+/// returns the text of the kernel's `userprogs.s` ([`generate`]).
+pub fn generated(dir: &Path) -> Result<String, String> {
+    Ok(generate(&build_all(dir)?, CCompiler::Merlin))
 }
 
 #[cfg(test)]
