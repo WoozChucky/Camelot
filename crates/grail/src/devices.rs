@@ -62,7 +62,7 @@ impl Clint {
 
 /// PLIC interrupt source of the UART's "received data available" line.
 pub const UART_IRQ: u32 = 1;
-/// PLIC interrupt source reserved for the keyboard (spec section 9.4).
+/// PLIC interrupt source of the keyboard's "event available" line (spec section 9.4).
 pub const KBD_IRQ: u32 = 2;
 
 /// Interrupt sources 1..=31 exist; source 0 means "no interrupt".
@@ -215,18 +215,23 @@ enum PlicReg {
     Reserved,
 }
 
-/// A small subset of a 16550 UART. Transmit goes straight to the host's stdout,
-/// receive comes from a host input channel. The only interrupt is "received data
-/// available" (IER bit 0), raised on PLIC source [`UART_IRQ`].
+/// A small subset of a 16550 UART. Transmit goes to the machine's own output sink,
+/// receive comes from its own input channel: nothing is tied to the process's stdio,
+/// so each machine in a process has a separate console (the CLI wires stdin/stdout).
+/// The only interrupt is "received data available" (IER bit 0), raised on PLIC source
+/// [`UART_IRQ`].
 #[derive(Default)]
 pub struct Uart {
     pub input: Option<Receiver<u8>>,
+    /// Where transmitted bytes go, flushed after each byte. `None` drops them.
+    pub output: Option<Box<dyn Write + Send>>,
     rx: VecDeque<u8>,
     ier: u8,
     lcr: u8,
     mcr: u8,
     scr: u8,
-    /// Everything transmitted, kept when `capture` is on (used by tests).
+    /// Everything transmitted, kept instead of going to `output` when `capture` is on
+    /// (used by tests).
     pub captured: Vec<u8>,
     pub capture: bool,
 }
@@ -288,8 +293,7 @@ impl Uart {
             0 if !dlab => {
                 if self.capture {
                     self.captured.push(b);
-                } else {
-                    let mut out = std::io::stdout().lock();
+                } else if let Some(out) = &mut self.output {
                     let _ = out.write_all(&[b]);
                     let _ = out.flush();
                 }
@@ -569,5 +573,44 @@ mod tests {
         assert_eq!(u.read(0, 1).unwrap(), b'x' as u32);
         assert!(!u.irq(), "RBR drained");
         assert_eq!(u.read(2, 1).unwrap(), IIR_NONE as u32);
+    }
+
+    /// Records writes and flushes, so the test can see each byte is flushed on its own.
+    struct Log(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Write for Log {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let s = String::from_utf8_lossy(buf).into_owned();
+            self.0.lock().unwrap().push(s);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.lock().unwrap().push("<flush>".into());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn uart_transmits_to_its_own_sink() {
+        let log = std::sync::Arc::default();
+        let mut u = Uart::default();
+        u.write(0, 1, b'x' as u32).unwrap(); // no sink: dropped
+        u.output = Some(Box::new(Log(std::sync::Arc::clone(&log))));
+        u.write(0, 1, b'h' as u32).unwrap();
+        u.write(0, 1, 0x100 | b'i' as u32).unwrap(); // only the low byte is sent
+        assert_eq!(*log.lock().unwrap(), ["h", "<flush>", "i", "<flush>"]);
+
+        // DLAB set: offset 0 is the divisor latch, nothing is sent.
+        u.write(3, 1, 0x80).unwrap();
+        u.write(0, 1, b'z' as u32).unwrap();
+        u.write(3, 1, 0x03).unwrap();
+        u.capture = true;
+        u.write(0, 1, b'c' as u32).unwrap();
+        assert_eq!(u.captured, b"c");
+        assert_eq!(
+            log.lock().unwrap().len(),
+            4,
+            "captured bytes do not reach the sink"
+        );
     }
 }

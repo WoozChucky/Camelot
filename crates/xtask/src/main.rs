@@ -229,14 +229,19 @@ fn kernel(k: KernelArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut m = grail::Machine::new(grail::DEFAULT_RAM_SIZE);
-    if let Err(e) = m.load_elf(&file) {
-        eprintln!("xtask: {e}");
-        return ExitCode::FAILURE;
-    }
-    match m.run(Some(xtask::kernel::BOOT_MAX_STEPS), |_| {}) {
-        grail::RunResult::Exited(code) => ExitCode::from(code.min(255) as u8),
-        grail::RunResult::StepLimit => {
+    let run = xtask::kernel::run_with_output(
+        &file,
+        xtask::kernel::BOOT_MAX_STEPS,
+        std::io::stdout(),
+        std::io::stderr(),
+    );
+    match run {
+        Err(e) => {
+            eprintln!("xtask: {e}");
+            ExitCode::FAILURE
+        }
+        Ok((grail::RunResult::Exited(code), _)) => ExitCode::from(code.min(255) as u8),
+        Ok((grail::RunResult::StepLimit, m)) => {
             eprintln!("xtask: step limit reached at pc={:#010x}", m.cpu.pc);
             ExitCode::from(124)
         }

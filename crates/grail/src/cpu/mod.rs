@@ -37,6 +37,10 @@ pub struct Cpu {
     pub bus: Bus,
     /// Stalled in `wfi` until an interrupt becomes pending.
     pub waiting: bool,
+    /// While stalled in `wfi`, jump `mtime` straight to `mtimecmp` instead of letting it
+    /// tick (the default, full-speed mode). A real-time machine turns this off and lets
+    /// the wait take wall-clock time instead (see [`Cpu::idle`]).
+    pub wfi_skips_to_timer: bool,
     /// Set when the current instruction wrote minstret, which suppresses its increment.
     instret_written: bool,
 }
@@ -60,8 +64,33 @@ impl Cpu {
             csr: Csrs::default(),
             bus,
             waiting: false,
+            wfi_skips_to_timer: true,
             instret_written: false,
         }
+    }
+
+    /// While stalled in `wfi` with nothing pending, lets up to `max` ticks pass at once,
+    /// exactly as `max` idle steps would: `mtime` advances and nothing else changes. When
+    /// the timer can wake the hart (`mie.MTIE` set), it stops one tick short of
+    /// `mtimecmp`, so the next step raises the timer on time; a masked timer cannot end
+    /// the wait (and nothing reads `mip` meanwhile), so it does not limit the skip.
+    /// Returns the ticks skipped (0 when not stalled or an interrupt is pending).
+    ///
+    /// Device lines are not sampled during the skip, so host input that arrives in the
+    /// meantime is seen at the next step: callers keep `max` small (a pacing batch).
+    pub fn idle(&mut self, max: u64) -> u64 {
+        if !self.waiting || self.mip() & self.csr.mie != 0 {
+            return 0;
+        }
+        let clint = &mut self.bus.clint;
+        let to_timer = if self.csr.mie & (1 << IRQ_M_TIMER) != 0 {
+            clint.mtimecmp.saturating_sub(clint.mtime).saturating_sub(1)
+        } else {
+            u64::MAX
+        };
+        let ticks = max.min(to_timer);
+        clint.mtime = clint.mtime.wrapping_add(ticks);
+        ticks
     }
 
     #[inline]
@@ -94,7 +123,7 @@ impl Cpu {
                 // Nothing to do until the timer fires or a device raises a line: skip
                 // straight to the timer. Device lines are sampled again next step.
                 let clint = &mut self.bus.clint;
-                if clint.mtimecmp != u64::MAX && clint.mtimecmp > clint.mtime {
+                if self.wfi_skips_to_timer && clint.mtimecmp != u64::MAX && clint.mtimecmp > clint.mtime {
                     clint.mtime = clint.mtimecmp;
                 }
                 return;

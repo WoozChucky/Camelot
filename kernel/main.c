@@ -1,12 +1,33 @@
 /* Camelot kernel: C entry point. entry.s sets up the stack and clears .bss,
- * then calls kmain() in M-mode; its return value becomes the exit code. */
+ * start() drops to S-mode, then supervisor_entry calls kmain(); its return
+ * value becomes the exit code. */
 #include "kprintf.h"
+#include "mmio.h"
+#include "riscv.h"
 #include "string.h"
+#include "timer.h"
+#include "trap.h"
 #include "types.h"
 #include "uart.h"
 #include "xcal.h"
 
 #define CAMELOT_VERSION "0.1.0"
+
+/* Timer ticks to wait for before halting. */
+#define BOOT_TICKS 10
+
+/* Deliberate faults, to exercise the panic path. The image ships with
+ * BOOT_FAULT_NONE; tests patch `boot_fault` in it to pick another one. The
+ * value is non-zero so the variable lives in .data, which is part of the
+ * image, rather than in .bss, which entry.s clears. */
+#define BOOT_FAULT_NONE 1
+#define BOOT_FAULT_ILLEGAL 2 /* illegal_instruction(): unimp, registers marked */
+#define BOOT_FAULT_LOAD 3    /* a load from UNMAPPED_ADDR */
+
+/* Nothing is mapped below the boot ROM (spec section 7). */
+#define UNMAPPED_ADDR 0x00000100
+
+volatile u32 boot_fault = BOOT_FAULT_NONE;
 
 static char buf[64];
 static int passed;
@@ -61,6 +82,38 @@ static void kprintf_selftest(void) {
     }
 }
 
+/* Idles in wfi until `count` timer ticks have passed, printing "tick N" for
+ * each one. The lines count the ticks rather than sample `ticks`, so none is
+ * skipped when several arrive while a line is printed. Needs interrupts on
+ * (trap_init). */
+static void wait_ticks(u32 count) {
+    u32 printed = 0;
+    while (printed < count) {
+        /* Interrupts off from the check to wfi: a tick taken in between would
+         * leave wfi asleep for a whole interval. wfi still wakes on the
+         * pending tick, which is taken as soon as intr_on() runs. */
+        intr_off();
+        if (ticks == printed) {
+            wfi();
+        }
+        intr_on();
+        if (ticks != printed) {
+            printed++;
+            kprintf("tick %u\n", printed);
+        }
+    }
+}
+
+static void deliberate_fault(void) {
+    if (boot_fault == BOOT_FAULT_ILLEGAL) {
+        illegal_instruction();
+    } else if (boot_fault == BOOT_FAULT_LOAD) {
+        u32 v = mmio_read32(UNMAPPED_ADDR);
+        kprintf("load from %p returned %x instead of faulting\n", (void *)UNMAPPED_ADDR, v);
+        failed++;
+    }
+}
+
 int kmain(void) {
     uart_init();
     kprintf("Camelot v%s booting...\n", CAMELOT_VERSION);
@@ -72,5 +125,11 @@ int kmain(void) {
 
     /* The debug console works without any driver: show the failure count. */
     xcal_dbg((u32)failed);
+
+    trap_init();
+    kprintf("timer: %u Hz tick, %u Hz timebase\n", TICK_HZ, timebase_hz());
+    wait_ticks(BOOT_TICKS);
+
+    deliberate_fault();
     return failed;
 }

@@ -1,10 +1,12 @@
 //! Framebuffer end to end: runs `examples/colorbars` headless through the `grail`
 //! binary, dumps PPM frames, and checks them against the expected test pattern.
 
+use grail::display::{self, DisplayOptions, Outcome};
 use grail::framebuffer::{FB_HEIGHT, FB_WIDTH};
-use grail::{Machine, RunResult};
+use grail::{Machine, MachineConfig, RunResult};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// FNV-1a 64 of the expected `frame-*.ppm` for `examples/colorbars`. If the pattern
 /// changes on purpose, update `expected_pixel` and this hash together.
@@ -144,12 +146,12 @@ fn fb_dump_needs_a_directory() {
 }
 
 #[test]
-fn run_slice_stops_right_after_present() {
+fn run_for_stops_right_after_present() {
     let file = std::fs::read(colorbars_elf()).unwrap();
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.load_elf(&file).unwrap();
 
-    let steps = m.run_slice(u64::MAX, &mut |_| {});
+    let steps = m.run_for(u64::MAX, &mut |_| {});
     assert!(steps > 640 * 480, "drew the whole frame first ({steps} steps)");
     assert_eq!(m.exit_code(), None);
     let fb = &mut m.cpu.bus.fb;
@@ -170,17 +172,52 @@ fn run_slice_stops_right_after_present() {
     check_colorbars_ppm(&fb.to_ppm());
 
     // The next instruction is xcal.halt.
-    assert_eq!(m.run_slice(u64::MAX, &mut |_| {}), 1);
+    assert_eq!(m.run_for(u64::MAX, &mut |_| {}), 1);
     assert_eq!(m.exit_code(), Some(0));
-    assert_eq!(m.run_slice(10, &mut |_| {}), 0);
+    assert_eq!(m.run_for(10, &mut |_| {}), 0);
 }
 
 #[test]
 fn colorbars_runs_under_plain_run() {
     // Machine::run ignores FB_PRESENT and just runs to the end.
     let file = std::fs::read(colorbars_elf()).unwrap();
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.load_elf(&file).unwrap();
     assert_eq!(m.run(Some(10_000_000), |_| {}), RunResult::Exited(0));
     assert_eq!(m.cpu.bus.fb.presents, 1);
+}
+
+#[test]
+fn display_run_follows_a_real_time_clock() {
+    // The host loop behind --fb and --fb-dump: at a clock that makes colorbars last at
+    // least 0.25 s, it must take that long and still dump the right frames.
+    let file = std::fs::read(colorbars_elf()).unwrap();
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+    m.load_elf(&file).unwrap();
+    let mut steps = 0u64;
+    assert_eq!(m.run(None, |_| steps += 1), RunResult::Exited(0));
+    let hz = u32::try_from(steps * 4).unwrap();
+
+    let mut m = Machine::new(MachineConfig {
+        clock_hz: Some(hz),
+        ..MachineConfig::default()
+    })
+    .unwrap();
+    m.load_elf(&file).unwrap();
+    let dir = scratch("colorbars-clock");
+    let opts = DisplayOptions {
+        dump_dir: Some(dir.clone()),
+        ..DisplayOptions::default()
+    };
+    let t = Instant::now();
+    let outcome = display::run(&mut m, None, |_| {}, &opts).unwrap();
+    let elapsed = t.elapsed();
+    assert_eq!(outcome, Outcome::Program(RunResult::Exited(0)));
+    assert!(
+        elapsed >= Duration::from_millis(240),
+        "{steps} steps at {hz} Hz in {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    check_colorbars_ppm(&std::fs::read(dir.join("frame-0000.ppm")).unwrap());
+    check_colorbars_ppm(&std::fs::read(dir.join("frame-0001.ppm")).unwrap());
 }

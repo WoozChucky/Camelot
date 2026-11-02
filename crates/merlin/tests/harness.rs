@@ -182,7 +182,7 @@ fn reference_interpreter_semantics() {
 
 /// Loads an executable into Grail and returns its exit code.
 fn run_in_grail(elf: &[u8]) -> Result<u8, String> {
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.load_elf(elf)?;
     match m.run(Some(100_000_000), |_| {}) {
         RunResult::Exited(code) => Ok(code as u8),

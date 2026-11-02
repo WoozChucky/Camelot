@@ -1,14 +1,20 @@
 //! `grail [options] <program.elf>`
 
 use grail::display::{self, DisplayOptions, Outcome};
-use grail::{Machine, RunResult, DEFAULT_RAM_SIZE};
+use grail::{Machine, MachineConfig, RunResult};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: grail [options] <program.elf>
 
   --trace         print every instruction before it runs
   --max-steps N   stop after N steps (exit code 124)
-  --ram MiB       RAM size in MiB (default 128)
+  --ram MiB       RAM size in MiB, 1 to 2048 (default 128)
+  --clock FREQ    real time: run FREQ instructions per second, and mtime ticks at FREQ.
+                  FREQ is a number with an optional unit, Hz, kHz or MHz (any case;
+                  no unit = Hz); fractions are fine if the result is whole Hz:
+                  --clock 10MHz, --clock 500kHz, --clock 1.5MHz, --clock 5Hz.
+                  Without it Grail runs at full speed, deterministically, and reports
+                  a nominal 10 MHz clock to software
   --fb            show the framebuffer in a window (Windows only)
   --headless      no window, even with --fb (the default)
   --fb-dump DIR   write DIR/frame-NNNN.ppm on every FB_PRESENT and at exit";
@@ -16,7 +22,7 @@ const USAGE: &str = "usage: grail [options] <program.elf>
 fn main() -> ExitCode {
     let mut trace = false;
     let mut max_steps = None;
-    let mut ram = DEFAULT_RAM_SIZE;
+    let mut config = MachineConfig::default();
     let mut path = None;
     let mut fb = false;
     let mut headless = false;
@@ -24,13 +30,6 @@ fn main() -> ExitCode {
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        let mut num = |name: &str| -> Option<u64> {
-            let v = args.next().and_then(|s| s.parse().ok());
-            if v.is_none() {
-                eprintln!("grail: {name} needs a number");
-            }
-            v
-        };
         match a.as_str() {
             "--trace" => trace = true,
             "--fb" => fb = true,
@@ -42,12 +41,19 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
-            "--max-steps" => match num("--max-steps") {
-                Some(n) => max_steps = Some(n),
+            "--max-steps" => {
+                let parse = |s: &str| s.parse().map_err(|_| format!("'{s}' is not a number"));
+                match value(&mut args, "--max-steps", parse) {
+                    Some(n) => max_steps = Some(n),
+                    None => return ExitCode::from(2),
+                }
+            }
+            "--ram" => match value(&mut args, "--ram", grail::parse_ram_mib) {
+                Some(size) => config.ram_size = size,
                 None => return ExitCode::from(2),
             },
-            "--ram" => match num("--ram") {
-                Some(n) => ram = n as usize * 1024 * 1024,
+            "--clock" => match value(&mut args, "--clock", grail::parse_clock) {
+                Some(hz) => config.clock_hz = Some(hz),
                 None => return ExitCode::from(2),
             },
             "-h" | "--help" => {
@@ -73,12 +79,21 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut m = Machine::new(ram);
+    let mut m = match Machine::new(config) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("grail: {e}");
+            return ExitCode::from(2);
+        }
+    };
     if let Err(e) = m.load_elf(&file) {
         eprintln!("grail: {path}: {e}");
         return ExitCode::from(2);
     }
-    m.cpu.bus.uart.input = Some(spawn_stdin_reader());
+    // The machine's console is this process's terminal.
+    m.set_uart_input(spawn_stdin_reader());
+    m.set_uart_output(std::io::stdout());
+    m.set_debug_output(std::io::stderr());
 
     if fb && !headless && !display::WINDOW_SUPPORTED {
         eprintln!("grail: no framebuffer window on this platform, running headless");
@@ -116,6 +131,19 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// The value of option `name`, parsed with `parse`. Prints why it is missing or wrong.
+fn value<T>(
+    args: &mut impl Iterator<Item = String>,
+    name: &str,
+    parse: impl Fn(&str) -> Result<T, String>,
+) -> Option<T> {
+    let Some(v) = args.next() else {
+        eprintln!("grail: {name} needs a value\n{USAGE}");
+        return None;
+    };
+    parse(&v).map_err(|e| eprintln!("grail: {name}: {e}")).ok()
 }
 
 /// Feeds host stdin to the UART from a background thread.

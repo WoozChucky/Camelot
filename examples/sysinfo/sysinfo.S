@@ -1,0 +1,218 @@
+# Prints what the Xcal sysinfo block (spec section 9.5) says about the machine: RAM,
+# clock, timebase and the device table. Try different hardware:
+#
+#   grail examples/sysinfo/sysinfo.elf
+#   grail --ram 64 --clock 2MHz examples/sysinfo/sysinfo.elf
+#
+# Halts with exit code 0, or 1 if there is no sysinfo block (bad magic).
+#
+# Built with clang for now; merlin-as will assemble this same file once it exists:
+#
+#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -nostdlib -static \
+#         -fuse-ld=lld -T examples/sysinfo/link.ld examples/sysinfo/sysinfo.S \
+#         -o examples/sysinfo/sysinfo.elf
+
+    .equ UART_BASE,       0x10000000
+    .equ UART_LSR,        5
+    .equ LSR_THRE,        0x20
+
+    .equ SYSINFO_BASE,    0x30002000
+    .equ SYS_MAGIC,       0x00
+    .equ SYS_VERSION,     0x04
+    .equ SYS_RAM_BASE,    0x08
+    .equ SYS_RAM_SIZE,    0x0c
+    .equ SYS_TIMEBASE_HZ, 0x10
+    .equ SYS_CPU_HZ,      0x14
+    .equ SYS_FLAGS,       0x18
+    .equ SYS_DEV_COUNT,   0x1c
+    .equ SYS_DEV_TABLE,   0x40
+    .equ DEV_ENTRY_SIZE,  16            # type, base, size, irq
+    .equ SYSINFO_MAGIC,   0x53595349
+    .equ FLAG_REAL_TIME,  1
+    .equ DEV_TYPES,       8             # highest type code with a name below
+
+    .section .text.start
+    .globl _start
+_start:
+    la    sp, __stack_top
+    li    s0, SYSINFO_BASE
+    lw    t0, SYS_MAGIC(s0)
+    li    t1, SYSINFO_MAGIC
+    bne   t0, t1, no_sysinfo
+
+    la    a0, s_title               # "sysinfo v<version>"
+    call  puts
+    lw    a0, SYS_VERSION(s0)
+    call  put_dec
+    call  newline
+
+    la    a0, s_ram                 # "RAM      <MiB> MiB at <base>"
+    call  puts
+    lw    a0, SYS_RAM_SIZE(s0)
+    srli  a0, a0, 20
+    call  put_dec
+    la    a0, s_mib_at
+    call  puts
+    lw    a0, SYS_RAM_BASE(s0)
+    call  put_hex
+    call  newline
+
+    la    a0, s_cpu                 # "CPU      <hz> Hz (nominal | real time)"
+    call  puts
+    lw    a0, SYS_CPU_HZ(s0)
+    call  put_dec
+    lw    t0, SYS_FLAGS(s0)
+    andi  t0, t0, FLAG_REAL_TIME
+    la    a0, s_nominal
+    beqz  t0, 1f
+    la    a0, s_real_time
+1:  call  puts
+
+    la    a0, s_timebase            # "timebase <hz> Hz"
+    call  puts
+    lw    a0, SYS_TIMEBASE_HZ(s0)
+    call  put_dec
+    la    a0, s_hz
+    call  puts
+    call  newline
+
+    lw    s1, SYS_DEV_COUNT(s0)     # "<n> devices:", then one line each
+    mv    a0, s1
+    call  put_dec
+    la    a0, s_devices
+    call  puts
+    addi  s2, s0, SYS_DEV_TABLE
+2:  beqz  s1, 4f
+    lw    a0, 0(s2)                 # type -> padded name
+    li    t0, DEV_TYPES
+    bgtu  a0, t0, 3f
+    slli  a0, a0, 2
+    la    t0, dev_names
+    add   t0, t0, a0
+    lw    a0, 0(t0)
+    j     5f
+3:  la    a0, s_unknown
+5:  call  puts
+    lw    a0, 4(s2)                 # base
+    call  put_hex
+    la    a0, s_plus
+    call  puts
+    lw    a0, 8(s2)                 # size
+    call  put_hex
+    lw    s3, 12(s2)                # irq, if it has one
+    beqz  s3, 6f
+    la    a0, s_irq
+    call  puts
+    mv    a0, s3
+    call  put_dec
+6:  call  newline
+    addi  s2, s2, DEV_ENTRY_SIZE
+    addi  s1, s1, -1
+    j     2b
+
+    # xcal.halt zero: stop the machine with exit code 0.
+4:  .insn i 0x0b, 1, x0, zero, 0
+
+no_sysinfo:
+    la    a0, s_no_sysinfo
+    call  puts
+    li    a0, 1
+    .insn i 0x0b, 1, x0, a0, 0
+
+# putc(a0 = byte). Clobbers t0, t1 only.
+putc:
+    li    t0, UART_BASE
+1:  lbu   t1, UART_LSR(t0)          # wait until the transmitter is free
+    andi  t1, t1, LSR_THRE
+    beqz  t1, 1b
+    sb    a0, 0(t0)
+    ret
+
+newline:
+    li    a0, '\n'
+    j     putc
+
+# puts(a0 = NUL-terminated string)
+puts:
+    addi  sp, sp, -16
+    sw    ra, 12(sp)
+    mv    a1, a0
+1:  lbu   a0, 0(a1)
+    beqz  a0, 2f
+    call  putc
+    addi  a1, a1, 1
+    j     1b
+2:  lw    ra, 12(sp)
+    addi  sp, sp, 16
+    ret
+
+# put_dec(a0 = unsigned value): decimal, no padding.
+put_dec:
+    addi  sp, sp, -32
+    sw    ra, 28(sp)
+    addi  a1, sp, 12                # digits go backwards into sp+2 .. sp+11
+    li    a2, 10
+1:  remu  a3, a0, a2
+    divu  a0, a0, a2
+    addi  a3, a3, '0'
+    addi  a1, a1, -1
+    sb    a3, 0(a1)
+    bnez  a0, 1b
+    addi  a2, sp, 12
+2:  lbu   a0, 0(a1)
+    call  putc
+    addi  a1, a1, 1
+    bne   a1, a2, 2b
+    lw    ra, 28(sp)
+    addi  sp, sp, 32
+    ret
+
+# put_hex(a0 = value): "0x" and 8 lowercase hex digits.
+put_hex:
+    addi  sp, sp, -16
+    sw    ra, 12(sp)
+    mv    a1, a0
+    li    a0, '0'
+    call  putc
+    li    a0, 'x'
+    call  putc
+    li    a2, 28                    # shift of the next digit
+    li    a3, 10
+1:  srl   a0, a1, a2
+    andi  a0, a0, 15
+    blt   a0, a3, 2f
+    addi  a0, a0, 'a' - 10 - '0'
+2:  addi  a0, a0, '0'
+    call  putc
+    addi  a2, a2, -4
+    bgez  a2, 1b
+    lw    ra, 12(sp)
+    addi  sp, sp, 16
+    ret
+
+    .section .rodata
+    .balign 4
+# Device names by type code (spec section 9.5), padded to one column.
+dev_names:
+    .word s_unknown, s_clint, s_plic, s_uart, s_test, s_fb_ctrl, s_fb_vram, s_sysinfo, s_keyboard
+s_unknown:      .asciz "  unknown   "
+s_clint:        .asciz "  CLINT     "
+s_plic:         .asciz "  PLIC      "
+s_uart:         .asciz "  UART      "
+s_test:         .asciz "  test      "
+s_fb_ctrl:      .asciz "  fb-ctrl   "
+s_fb_vram:      .asciz "  fb-vram   "
+s_sysinfo:      .asciz "  sysinfo   "
+s_keyboard:     .asciz "  keyboard  "
+s_title:        .asciz "sysinfo v"
+s_ram:          .asciz "RAM      "
+s_mib_at:       .asciz " MiB at "
+s_cpu:          .asciz "CPU      "
+s_nominal:      .asciz " Hz (nominal)\n"
+s_real_time:    .asciz " Hz (real time)\n"
+s_timebase:     .asciz "timebase "
+s_hz:           .asciz " Hz"
+s_devices:      .asciz " devices:\n"
+s_plus:         .asciz " + "
+s_irq:          .asciz "  irq "
+s_no_sysinfo:   .asciz "no sysinfo block\n"
