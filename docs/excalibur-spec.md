@@ -157,13 +157,14 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 |---|---|
 | 0x0000_1000 - 0x0000_1FFF | Boot ROM (reset vector 0x1000, jumps to 0x8000_0000) |
 | 0x0200_0000 - 0x0200_FFFF | CLINT: msip @+0x0, mtimecmp @+0x4000, mtime @+0xBFF8 |
-| 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART, keyboard and disks (section 7.1) |
+| 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART, keyboard, disks and pointer (section 7.1) |
 | 0x1000_0000 - 0x1000_00FF | UART, 16550-compatible subset (THR/RBR @+0, IER @+1, IIR @+2, LSR @+5) |
 | 0x1000_1000 - 0x1000_8FFF | Block devices: disk `i` at 0x1000_1000 + 0x1000·i, up to 8 (`--disk`; Xcal, section 9.6). Only the pages of attached disks are mapped |
 | 0x0010_0000 | Test/exit device: write 0x5555 = pass/exit, 0x3333 = fail (used by riscv-tests) |
 | 0x3000_0000 - 0x3000_0FFF | Framebuffer control (Xcal, section 9.3) |
 | 0x3000_1000 - 0x3000_1FFF | Keyboard (Xcal, section 9.4) |
 | 0x3000_2000 - 0x3000_2FFF | Sysinfo: RAM size, clock, device table (Xcal, section 9.5) |
+| 0x3000_3000 - 0x3000_3FFF | Pointer: mouse/tablet (Xcal, section 9.7) |
 | 0x3100_0000 - 0x3112_BFFF | Framebuffer VRAM |
 | 0x8000_0000 - 0x87FF_FFFF | RAM, 128 MiB default (`--ram`, 1-2048 MiB; software reads the size from sysinfo) |
 
@@ -190,7 +191,8 @@ A minimal RISC-V PLIC (riscv-plic-spec) with the QEMU `virt` register layout: on
 | 1 | UART receive (section 7) |
 | 2 | Keyboard (section 9.4) |
 | 3-10 | Disks 0-7: disk `i` is source 3 + `i` (section 9.6) |
-| 11-31 | unused, never asserted |
+| 11 | Pointer (section 9.7) |
+| 12-31 | unused, never asserted |
 
 QEMU `virt` puts UART0 on source 10; Excalibur numbers its few devices from 1 instead, so drivers must take the source numbers from this table rather than from `virt` device trees.
 
@@ -334,8 +336,9 @@ Device table entry `i` (for `i` < `SYS_DEV_COUNT`; at most 252 fit in the page):
 | 7 | Sysinfo (this block) |
 | 8 | Keyboard (section 9.4) |
 | 9 | Block device, one entry per disk (section 9.6) |
+| 10 | Pointer (section 9.7) |
 
-Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device gets the next code and an entry, with no new registers and no change to this layout (the block device, type 9, was added this way). Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), one block device per disk (disk `i` at 0x1000_1000 + 0x1000·`i`, irq 3 + `i`; none without `--disk`), framebuffer control, keyboard (irq 2), sysinfo and VRAM; `examples/sysinfo` prints the table.
+Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device gets the next code and an entry, with no new registers and no change to this layout (the block device, type 9, and the pointer, type 10, were added this way). Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), one block device per disk (disk `i` at 0x1000_1000 + 0x1000·`i`, irq 3 + `i`; none without `--disk`), framebuffer control, keyboard (irq 2), sysinfo, pointer (irq 11) and VRAM; `examples/sysinfo` prints the table.
 
 The registers are 32-bit only: byte or halfword accesses raise access faults. Word writes are ignored, as for the framebuffer's read-only registers. Offsets past the last entry read as 0.
 
@@ -376,6 +379,49 @@ Details:
 - **Backends.** Where a disk's sectors live is up to the host: Grail gives each disk of each machine its own backend (`BlockBackend` in the grail library: capacity, read, write, flush). `--disk IMG` uses an image file on the host, `--disk-ro IMG` the same file opened read-only (`BLK_FLAGS.0` set); tests use in-memory disks, and a host can hand Grail backends of its own (`Machine::with_backends`; the Lake storage server will add a network one). An image is raw: sector `n` is bytes 512·`n` to 512·`n` + 511 of the file. Its size must be a whole number of sectors, or Grail refuses to start; it never grows. Writes go to the file as they happen. Grail does not lock images, so two machines must not attach the same image read-write.
 
 `examples/disk` finds the first disk in the device table, prints its sector 0 as text, checks that a read past the end fails with error 2, and runs a write/read-back test on the last sector (saving and restoring it), waiting for the completion interrupt after every command: `grail --disk examples/disk/disk.img examples/disk/disk.elf`.
+
+### 9.7 Pointer (MMIO)
+
+A mouse for graphical guests, and for remote viewers that forward the host's mouse. It has a 4 KiB page of registers at 0x3000_3000, PLIC source 11 and an entry of type 10 in the sysinfo device table.
+
+**Absolute mode** (the default) reports where the pointer is, in framebuffer pixels: `x` from 0 to `FB_WIDTH` - 1 and `y` from 0 to `FB_HEIGHT` - 1 (section 9.3), like a USB tablet. The guest's cursor is then exactly where the host's is: no drift between the two, and a viewer never has to grab ("capture") the host mouse. **Relative mode** (`PTR_CTRL` bit 1) reports the motion since the previous event (`dx`, `dy`) instead, for software that wants deltas (a game, a guest with its own acceleration).
+
+| Offset | Register | Notes |
+|---|---|---|
+| +0x00 | `PTR_STATUS` | bit 0 = an event is waiting (read-only); bit 1 = OVERFLOW: an event was dropped because the FIFO was full. OVERFLOW stays set until software writes 1 to bit 1. Other bits read as 0 and ignore writes |
+| +0x04 | `PTR_EVENT` (RO) | reading it pops the oldest event and returns its first word (below), and latches its position into `PTR_EVENT_XY`. Reads 0 when the FIFO is empty |
+| +0x08 | `PTR_EVENT_XY` (RO) | position word of the event last popped through `PTR_EVENT` (below). Reading it pops nothing. 0 at reset and after a pop that found the FIFO empty |
+| +0x0C | `PTR_CTRL` | bit 0 = interrupt enable (PLIC source 11); bit 1 = relative mode (0 = absolute). Other bits read as 0 |
+| +0x10 | `PTR_POS` (RO) | where the pointer is now, absolute in both modes: `x` in bits 15:0, `y` in bits 31:16 |
+| +0x14 | `PTR_BUTTONS` (RO) | the buttons held now, in the bits of `PTR_EVENT` 2:0 |
+
+An event is two words. `PTR_EVENT`:
+
+| Bits | Field |
+|---|---|
+| 0 | left button held |
+| 1 | right button held |
+| 2 | middle button held |
+| 3 | RELATIVE: the position word holds `dx`, `dy` (the event was made in relative mode) |
+| 7:4 | reserved, 0 |
+| 15:8 | wheel: notches turned, signed (two's complement), positive away from the user ("up") |
+| 30:16 | reserved, 0 |
+| 31 | VALID: 1 for every event, so a `PTR_EVENT` of 0 means "empty" |
+
+`PTR_EVENT_XY`: `x` in bits 15:0 and `y` in bits 31:16. In absolute mode they are the pixel the pointer is on (unsigned, within the framebuffer). In relative mode they are `dx` and `dy`, signed 16-bit (saturated at -32768 and 32767): right and down are positive, as in framebuffer coordinates. The buttons in an event are the ones held after it, so a click is an event with the bit set followed by one with it clear, each with the position where it happened.
+
+Reading an event: read `PTR_EVENT` (it pops), then `PTR_EVENT_XY`. Software that only wants to know where the pointer is now can read `PTR_POS` and `PTR_BUTTONS` instead, without touching the FIFO.
+
+Details:
+
+- The registers are 32-bit only: byte or halfword accesses in 0x3000_3000 - 0x3000_3FFF raise access faults (and pop nothing). Unused offsets read as 0 and ignore writes, as do writes to the read-only registers. Everything resets to 0: absolute mode, interrupts off, the pointer at (0, 0) with no buttons held, the FIFO empty.
+- **Events** wait in a FIFO of 64. Each change the host reports makes one event, in the mode `PTR_CTRL` selects at that moment; switching modes does not change the events already queued (their RELATIVE bit says how to read them). A change that the program could not see makes no event: no motion (in relative mode, a zero `dx`, `dy`; in absolute mode, the same pixel), the same buttons and no wheel.
+- **Clamping**: absolute positions are clamped to the framebuffer, so a drag that leaves the host's window pins the pointer to the edge. In relative mode a host that reports motion as deltas has them passed on as they are, even against an edge (the absolute position, `PTR_POS`, still stops there); a host that reports positions has its deltas computed between clamped positions.
+- **Overflow**: an event that arrives while the FIFO is full is dropped (the older ones are kept) and sets OVERFLOW. `PTR_POS` and `PTR_BUTTONS` follow every change, dropped ones included, so after an overflow a program catches up by reading them, then writes 2 to `PTR_STATUS`.
+- **Interrupt**: the pointer holds PLIC source 11 high while `PTR_CTRL.0` and `PTR_STATUS.0` are both set, so reading `PTR_EVENT` until `PTR_STATUS.0` clears lowers it. OVERFLOW alone does not interrupt. A handler may read every waiting event at once, or one per interrupt and let the line raise the next.
+- **Host side**: Grail delivers the mouse over the framebuffer window between instruction slices, like keys (sections 9.3, 9.4): motion (`WM_MOUSEMOVE`), the left, right and middle buttons and the wheel (`WM_MOUSEWHEEL`; fractions of a notch from precise wheels add up until they make one). Window coordinates are mapped to framebuffer pixels through the stretch, so the mapping holds at any window size. While a button is held the window captures the mouse, so a drag keeps reporting (clamped) positions outside it and its release is not lost; if the window loses the mouse or the focus with buttons held, they are released. Without a window nothing produces events. Each machine has its own pointer, and hosts that embed Grail as a library (a remote viewer, a test) inject input with `Machine::pointer_event`: a new position (in framebuffer pixels) or a motion in pixels, the buttons held, and the wheel notches; the device turns it into an event in the guest's mode.
+
+`examples/pointer` draws an arrow cursor that follows the pointer and changes colour while buttons are held, reading the events on the pointer's interrupt; Esc on the keyboard ends it: `grail --fb examples/pointer/pointer.elf`.
 
 ## 10. Toolchain (all our own)
 
@@ -495,7 +541,7 @@ Steps 1 and 2 together, our assembler and our linker with no LLVM at all, is how
 
 ### Examples
 
-The programs in `examples/` are built by `cargo xtask examples` (`crates/xtask/src/examples.rs`): each source is assembled by merlin-as and the objects are linked by merlin-ld, with the example's `link.ld` (or the default layout for `muldiv`). Both tools run as libraries inside xtask, the same code as their command lines, which the comment at the top of each source spells out. The linked `examples/<dir>/<name>.elf` files are committed so Grail can run them without building anything, and `cargo test` (`crates/xtask/tests/examples.rs`) rebuilds every example from source, requires the result to equal the committed file byte for byte, and runs it in Grail with its input (UART bytes, key events, a disk image), checking the output and the exit code. Nothing in that needs LLVM. `examples/multiobj` exists to exercise multi-object linking: two sources with calls, pc-relative addresses and `.word` pointers between them, `.data` written at run time, `.bss` in the other object, and a non-zero exit code (42).
+The programs in `examples/` are built by `cargo xtask examples` (`crates/xtask/src/examples.rs`): each source is assembled by merlin-as and the objects are linked by merlin-ld, with the example's `link.ld` (or the default layout for `muldiv`). Both tools run as libraries inside xtask, the same code as their command lines, which the comment at the top of each source spells out. The linked `examples/<dir>/<name>.elf` files are committed so Grail can run them without building anything, and `cargo test` (`crates/xtask/tests/examples.rs`) rebuilds every example from source, requires the result to equal the committed file byte for byte, and runs it in Grail with its input (UART bytes, key events, pointer input, a disk image), checking the output and the exit code. Nothing in that needs LLVM. `examples/multiobj` exists to exercise multi-object linking: two sources with calls, pc-relative addresses and `.word` pointers between them, `.data` written at run time, `.bss` in the other object, and a non-zero exit code (42).
 
 clang and ld.lld are only the reference. Each source carries the command that builds the same program with them:
 
@@ -678,7 +724,7 @@ camelot>
 4. **merlin-as** emitting ELF `.o`. Validate with `llvm-objdump` and ld.lld.
 5. **merlin-ld**. Validate against clang-produced objects.
 6. **Bare-metal hello world** written in our assembly, built entirely with our tools.
-7. **M extension** in merlin-as (Grail already passes rv32um), then the **A extension** (LR/SC and AMOs, section 4.1) in Grail and the toolchain. **Xcal devices** in Grail: framebuffer window and keyboard via Win32 FFI, sysinfo, block devices with pluggable backends, and a configurable machine (RAM size, real-time clock, disks) that a host can run several of.
+7. **M extension** in merlin-as (Grail already passes rv32um), then the **A extension** (LR/SC and AMOs, section 4.1) in Grail and the toolchain. **Xcal devices** in Grail: framebuffer window, keyboard and pointer via Win32 FFI, sysinfo, block devices with pluggable backends, and a configurable machine (RAM size, real-time clock, disks) that a host can run several of.
 8. **Merlin v0**: C subset → assembly. Grow it test by test.
 9. **Camelot kernel** in C (clang first, our compiler as it catches up): trap handling, timer, UART driver, then paging (Sv32), processes, syscalls.
 10. **Self-hosting stretch goal**: our tools running on our OS.

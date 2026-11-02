@@ -53,6 +53,8 @@ pub enum DeviceType {
     Keyboard = 8,
     /// Xcal block device, one entry per disk (spec section 9.6).
     Block = 9,
+    /// Xcal pointer (mouse/tablet, spec section 9.7).
+    Pointer = 10,
 }
 
 /// One device table entry. `irq` is the device's PLIC source, 0 if it has none.

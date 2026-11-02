@@ -324,7 +324,7 @@ pub fn sysinfo_output(ram_mib: u32, hz: u32, real_time: bool) -> String {
 RAM      {ram_mib} MiB at 0x80000000
 CPU      {hz} Hz ({kind})
 timebase {hz} Hz
-8 devices:
+9 devices:
   test      0x00100000 + 0x00001000
   CLINT     0x02000000 + 0x00010000
   PLIC      0x0c000000 + 0x04000000
@@ -332,6 +332,7 @@ timebase {hz} Hz
   fb-ctrl   0x30000000 + 0x00001000
   keyboard  0x30001000 + 0x00001000  irq 2
   sysinfo   0x30002000 + 0x00001000
+  pointer   0x30003000 + 0x00001000  irq 11
   fb-vram   0x31000000 + 0x0012c000
 "
     )

@@ -77,7 +77,7 @@ fn two_vms_with_their_own_profiles() {
         })
         .collect();
     assert_eq!(details.devices, expected);
-    assert_eq!(details.devices.len(), 8);
+    assert_eq!(details.devices.len(), 9);
     assert!(details.steps > 1000, "{}", details.steps);
     let small_steps = info(&mut rt, small).steps;
     assert!(small_steps > 1000);
