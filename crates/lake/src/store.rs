@@ -374,7 +374,7 @@ fn clone_target(file: &str) -> Option<&str> {
 
 /// Copies the image attached as `src` into a new file at `path`, `len` bytes long
 /// (zeros after the source's end), and makes it durable. On a filesystem with sparse
-/// files, chunks of zeros are skipped (the file reads as zeros there); elsewhere every
+/// files, sectors of zeros are skipped (the file reads as zeros there); elsewhere every
 /// byte is written, as [`Store::create`] does.
 fn copy_image(src: &mut Image, path: &Path, len: u64) -> Result<(), Fail> {
     let fail = |e: io::Error| io_fail("cannot write the copy", e);
@@ -390,10 +390,23 @@ fn copy_image(src: &mut Image, path: &Path, len: u64) -> Result<(), Fail> {
     while sector < src.sectors() {
         let count = CLONE_CHUNK.min(src.sectors() - sector);
         let data = src.read(sector, count as u32)?;
-        if !sparse || data.iter().any(|&b| b != 0) {
-            file.seek(SeekFrom::Start(sector * SECTOR))
-                .and_then(|_| file.write_all(&data))
+        // Write the chunk as runs of sectors: on a sparse file, only the runs that hold
+        // data, so one written sector does not allocate the whole chunk.
+        let mut run = 0;
+        while run < data.len() {
+            let zero = |at: usize| sparse && data[at..at + SECTOR_SIZE].iter().all(|&b| b == 0);
+            if zero(run) {
+                run += SECTOR_SIZE;
+                continue;
+            }
+            let mut end = run + SECTOR_SIZE;
+            while end < data.len() && !zero(end) {
+                end += SECTOR_SIZE;
+            }
+            file.seek(SeekFrom::Start(sector * SECTOR + run as u64))
+                .and_then(|_| file.write_all(&data[run..end]))
                 .map_err(fail)?;
+            run = end;
         }
         sector += count;
     }
