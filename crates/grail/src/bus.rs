@@ -122,6 +122,8 @@ pub struct Bus {
     pub tohost: Option<u32>,
     /// Set when a device or `tohost` asks the machine to stop.
     pub exit: Option<Exit>,
+    /// A debugger's watchpoints, which the harts' loads and stores report to.
+    pub(crate) watches: crate::debug::Watches,
     /// Hart `i`'s LR/SC reservation. They live here, next to memory, because every
     /// write to memory goes through the bus: a hart's store, an AMO or a `sc.w`
     /// ([`Bus::snoop_store`]), and a device's DMA ([`Bus::tick`], [`Bus::write`]), so
@@ -161,6 +163,7 @@ impl Bus {
             debug: None,
             tohost: None,
             exit: None,
+            watches: Default::default(),
             reservations: vec![Reservation::default(); harts],
         };
         if harts > 1 {
@@ -457,6 +460,31 @@ impl Bus {
             self.rom.get(off..off + 4)?
         };
         Some(u32::from_le_bytes([mem[0], mem[1], mem[2], mem[3]]))
+    }
+
+    /// A debugger's read of the byte at physical `addr`: RAM, VRAM or the boot ROM, never
+    /// a device register (reading one can change it). `None` elsewhere.
+    pub fn debug_read(&self, addr: u32) -> Option<u8> {
+        if let Some(off) = self.ram_range(addr, 1) {
+            return Some(self.ram[off]);
+        }
+        if let Some(off) = Self::vram_range(addr, 1) {
+            return Some(self.fb.vram[off]);
+        }
+        self.read_mem(addr, 1).ok().map(|v| v as u8)
+    }
+
+    /// A debugger's write of the byte at physical `addr`, in RAM or VRAM; false elsewhere.
+    /// Like a store, it breaks the LR/SC reservations on its word.
+    pub fn debug_write(&mut self, addr: u32, val: u8) -> bool {
+        let Some(mem) = self.memory(addr, 1) else {
+            return false;
+        };
+        mem[0] = val;
+        for r in &mut self.reservations {
+            r.snoop(addr, 1);
+        }
+        true
     }
 
     /// Copies bytes into physical memory (used by the loader).

@@ -7,13 +7,16 @@
 pub mod block;
 pub mod boot;
 pub mod bus;
+pub mod cli;
 pub mod config;
 pub mod console;
 pub mod cpu;
+pub mod debug;
 pub mod devices;
 pub mod display;
 pub mod elf;
 pub mod framebuffer;
+pub mod gdb;
 pub mod keyboard;
 pub mod lake;
 pub mod net;
@@ -50,6 +53,8 @@ pub struct Machine {
     config: MachineConfig,
     /// Real-time pacing, when the config has a clock.
     pacer: Option<Pacer>,
+    /// Breakpoints and the hart a debugger looks at ([`debug`]).
+    debug: debug::Debug,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -128,7 +133,12 @@ impl Machine {
         let pacer = config.clock_hz.map(Pacer::new);
         // With a real-time clock a wfi takes real time; see `run_steps`.
         cpu.wfi_skips_to_timer = pacer.is_none();
-        Ok(Machine { cpu, config, pacer })
+        Ok(Machine {
+            cpu,
+            config,
+            pacer,
+            debug: debug::Debug::default(),
+        })
     }
 
     /// The default machine with `ram_size` bytes of RAM. Panics if that is not a valid

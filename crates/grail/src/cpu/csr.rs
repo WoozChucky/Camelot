@@ -133,8 +133,19 @@ impl Hart {
 
     pub fn csr_read(&mut self, bus: &Bus, addr: u16) -> Result<u32, Trap> {
         self.check_access(addr, false)?;
+        let counter = (0xc00..=0xc1f).contains(&addr) || (0xc80..=0xc9f).contains(&addr);
+        if counter && !self.counter_allowed(addr) {
+            return Err(illegal());
+        }
+        self.csr_value(bus, addr).ok_or_else(illegal)
+    }
+
+    /// The value of CSR `addr` as an M-mode read would see it, without the privilege
+    /// checks: `None` if Grail has no such CSR. For [`Hart::csr_read`], and for a
+    /// debugger, which may read any CSR whatever the hart's mode.
+    pub fn csr_value(&self, bus: &Bus, addr: u16) -> Option<u32> {
         let c = &self.csr;
-        Ok(match addr {
+        Some(match addr {
             SSTATUS => c.mstatus & SSTATUS_MASK,
             SIE => c.mie & c.mideleg,
             STVEC => c.stvec,
@@ -172,9 +183,6 @@ impl Hart {
             0xb03..=0xb1f | 0xb83..=0xb9f => 0, // mhpmcounter3..31(h)
 
             0xc00..=0xc1f | 0xc80..=0xc9f => {
-                if !self.counter_allowed(addr) {
-                    return Err(illegal());
-                }
                 let time = bus.clint.mtime;
                 match addr {
                     CYCLE => c.mcycle as u32,
@@ -193,12 +201,24 @@ impl Hart {
 
             MHARTID => self.id,
             MVENDORID | MARCHID | MIMPID | MCONFIGPTR => 0,
-            _ => return Err(illegal()),
+            _ => return None,
         })
     }
 
     pub fn csr_write(&mut self, addr: u16, v: u32) -> Result<(), Trap> {
         self.check_access(addr, true)?;
+        if self.csr_store(addr, v) {
+            Ok(())
+        } else {
+            Err(illegal())
+        }
+    }
+
+    /// Writes `v` to CSR `addr` as an M-mode write would, with its WARL rules but
+    /// without the privilege and read-only checks: false if Grail has no such CSR or it
+    /// is read-only (`misa`'s writes are ignored, a read-only counter's are refused).
+    /// For [`Hart::csr_write`], and for a debugger.
+    pub fn csr_store(&mut self, addr: u16, v: u32) -> bool {
         let c = &mut self.csr;
         match addr {
             SSTATUS => c.mstatus = (c.mstatus & !SSTATUS_MASK) | (v & SSTATUS_MASK),
@@ -254,8 +274,8 @@ impl Hart {
             0xb03..=0xb1f | 0xb83..=0xb9f => {}
 
             0x7a0..=0x7a5 => {}
-            _ => return Err(illegal()),
+            _ => return false,
         }
-        Ok(())
+        true
     }
 }

@@ -18,6 +18,66 @@ const PTE_D: u32 = 1 << 7;
 
 const PAGE_SIZE: u32 = 4096;
 
+/// The leaf of a successful Sv32 page-table walk.
+struct Leaf {
+    pte: u32,
+    /// Where the PTE is, for the A/D update.
+    addr: u32,
+    /// The physical address the walk translated to.
+    paddr: u32,
+}
+
+/// Why a walk failed: an invalid or missing entry (a page fault), or a PTE outside
+/// memory (an access fault).
+enum WalkError {
+    PageFault,
+    AccessFault,
+}
+
+impl WalkError {
+    fn trap(self, page_fault: Trap, access_fault: Trap) -> Trap {
+        match self {
+            WalkError::PageFault => page_fault,
+            WalkError::AccessFault => access_fault,
+        }
+    }
+}
+
+/// Walks the Sv32 page table `satp` points at for `vaddr`, down to its leaf: no
+/// permission checks and no A/D update, which are the caller's.
+fn walk(bus: &Bus, satp: u32, vaddr: u32) -> Result<Leaf, WalkError> {
+    let vpn = [(vaddr >> 12) & 0x3ff, vaddr >> 22];
+    let mut table = (satp & 0x3f_ffff).wrapping_mul(PAGE_SIZE);
+    let mut level = 1usize;
+    let (pte, addr) = loop {
+        let pte_addr = table.wrapping_add(vpn[level] * 4);
+        // Page tables must live in memory: a PTE address on a device is an access fault.
+        let pte = bus.read_mem(pte_addr, 4).map_err(|_| WalkError::AccessFault)?;
+        if pte & PTE_V == 0 || (pte & PTE_R == 0 && pte & PTE_W != 0) {
+            return Err(WalkError::PageFault);
+        }
+        if pte & (PTE_R | PTE_X) != 0 {
+            break (pte, pte_addr);
+        }
+        if level == 0 {
+            return Err(WalkError::PageFault);
+        }
+        level -= 1;
+        table = (pte >> 10).wrapping_mul(PAGE_SIZE);
+    };
+    // A 4 MiB superpage must be 4 MiB aligned.
+    let ppn = pte >> 10;
+    if level == 1 && ppn & 0x3ff != 0 {
+        return Err(WalkError::PageFault);
+    }
+    let paddr = if level == 1 {
+        (ppn << 12) & 0xffc0_0000 | (vaddr & 0x003f_ffff)
+    } else {
+        (ppn << 12) | (vaddr & 0xfff)
+    };
+    Ok(Leaf { pte, addr, paddr })
+}
+
 impl Hart {
     /// Privilege used for data accesses: MPRV makes M-mode loads/stores act as MPP.
     fn data_mode(&self) -> Mode {
@@ -43,26 +103,8 @@ impl Hart {
 
         let page_fault = Trap::new(access.page_fault(), vaddr);
         let access_fault = Trap::new(access.access_fault(), vaddr);
-        let vpn = [(vaddr >> 12) & 0x3ff, vaddr >> 22];
-        let mut table = (satp & 0x3f_ffff).wrapping_mul(PAGE_SIZE);
-        let mut level = 1usize;
-
-        let (pte, pte_addr) = loop {
-            let pte_addr = table.wrapping_add(vpn[level] * 4);
-            // Page tables must live in memory: a PTE address on a device is an access fault.
-            let pte = bus.read_mem(pte_addr, 4).map_err(|_| access_fault)?;
-            if pte & PTE_V == 0 || (pte & PTE_R == 0 && pte & PTE_W != 0) {
-                return Err(page_fault);
-            }
-            if pte & (PTE_R | PTE_X) != 0 {
-                break (pte, pte_addr);
-            }
-            if level == 0 {
-                return Err(page_fault);
-            }
-            level -= 1;
-            table = (pte >> 10).wrapping_mul(PAGE_SIZE);
-        };
+        let leaf = walk(bus, satp, vaddr).map_err(|e| e.trap(page_fault, access_fault))?;
+        let pte = leaf.pte;
 
         // Permission checks on the leaf.
         let status = self.csr.mstatus;
@@ -82,11 +124,6 @@ impl Hart {
             }
             _ => {}
         }
-        // A 4 MiB superpage must be 4 MiB aligned.
-        let ppn = pte >> 10;
-        if level == 1 && ppn & 0x3ff != 0 {
-            return Err(page_fault);
-        }
 
         // Hardware-managed accessed/dirty bits.
         let mut new_pte = pte | PTE_A;
@@ -94,15 +131,22 @@ impl Hart {
             new_pte |= PTE_D;
         }
         if new_pte != pte {
-            self.write_phys(bus, pte_addr, 4, new_pte)
+            self.write_phys(bus, leaf.addr, 4, new_pte)
                 .map_err(|_| access_fault)?;
         }
+        Ok(leaf.paddr)
+    }
 
-        Ok(if level == 1 {
-            (ppn << 12) & 0xffc0_0000 | (vaddr & 0x003f_ffff)
-        } else {
-            (ppn << 12) | (vaddr & 0xfff)
-        })
+    /// A debugger's view of `vaddr`: the physical address the hart's instruction fetches
+    /// would use, in its current mode, with the hart's `satp`. Unlike [`Hart::translate`]
+    /// it changes nothing (no A/D bits) and checks no permissions, so a debugger can read
+    /// a page the hart could not (a U-mode page from S-mode, execute-only code). `None`
+    /// when the page is not mapped.
+    pub fn debug_translate(&self, bus: &Bus, vaddr: u32) -> Option<u32> {
+        if self.mode == Mode::M || self.csr.satp >> 31 == 0 {
+            return Some(vaddr);
+        }
+        walk(bus, self.csr.satp, vaddr).ok().map(|leaf| leaf.paddr)
     }
 
     pub fn fetch(&mut self, bus: &mut Bus, pc: u32) -> Result<u32, Trap> {
@@ -118,8 +162,11 @@ impl Hart {
             return Err(Trap::new(Access::Load.misaligned(), vaddr));
         }
         let paddr = self.translate(bus, vaddr, Access::Load)?;
-        bus.read(paddr, size)
-            .map_err(|_| Trap::new(Access::Load.access_fault(), vaddr))
+        let v = bus
+            .read(paddr, size)
+            .map_err(|_| Trap::new(Access::Load.access_fault(), vaddr))?;
+        bus.watches.note(self.id, vaddr, size, true, false);
+        Ok(v)
     }
 
     pub fn store(&mut self, bus: &mut Bus, vaddr: u32, size: u32, val: u32) -> Result<(), Trap> {
@@ -128,7 +175,9 @@ impl Hart {
         }
         let paddr = self.translate(bus, vaddr, Access::Store)?;
         self.write_phys(bus, paddr, size, val)
-            .map_err(|_| Trap::new(Access::Store.access_fault(), vaddr))
+            .map_err(|_| Trap::new(Access::Store.access_fault(), vaddr))?;
+        bus.watches.note(self.id, vaddr, size, false, true);
+        Ok(())
     }
 
     /// Every write the hart makes goes through here (`sb`/`sh`/`sw`, `sc.w`,

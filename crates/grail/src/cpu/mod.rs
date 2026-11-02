@@ -72,6 +72,12 @@ pub struct Cpu {
     /// real-time machine turns this off and lets the wait take wall-clock time instead
     /// (see [`Cpu::idle`]).
     pub wfi_skips_to_timer: bool,
+    /// The hart whose turn comes next in the current step: 0 between steps. A step is
+    /// normally run whole, but a debugger stops between two turns ([`Cpu::turn_traced`]),
+    /// and the step then resumes where it stopped.
+    turn: usize,
+    /// Every hart that has had its turn in the current step waited in `wfi`.
+    step_idle: bool,
 }
 
 /// Interrupts in priority order (highest first).
@@ -118,7 +124,15 @@ impl Cpu {
             current: 0,
             bus,
             wfi_skips_to_timer: true,
+            turn: 0,
+            step_idle: true,
         }
+    }
+
+    /// The hart whose turn comes next: 0 at the start of a step, more when a debugger
+    /// stopped the machine in the middle of one.
+    pub fn next_hart(&self) -> usize {
+        self.turn
     }
 
     /// Every hart, hart `i` at index `i`.
@@ -165,7 +179,7 @@ impl Cpu {
     /// Device lines are not sampled during the skip, so host input that arrives in the
     /// meantime is seen at the next step: callers keep `max` small (a pacing batch).
     pub fn idle(&mut self, max: u64) -> u64 {
-        if !self.all_idle() {
+        if self.turn != 0 || !self.all_idle() {
             return 0;
         }
         let clint = &mut self.bus.clint;
@@ -191,30 +205,41 @@ impl Cpu {
     /// [`Cpu::step`], calling `trace` before each hart's turn, with the `Cpu`
     /// dereferencing to that hart (hart 0's call comes first, before the tick). A
     /// program that stops the machine (`xcal.halt`, the test device) ends the step
-    /// there: the harts after it do not run.
+    /// there: the harts after it do not run. If a debugger stopped the machine in the
+    /// middle of a step, this runs the rest of that step.
     pub fn step_traced(&mut self, trace: &mut impl FnMut(&Cpu)) {
-        self.current = 0;
+        while !self.turn_traced(trace) {}
+    }
+
+    /// Runs the next hart's turn of the current step (hart 0's first, which starts the
+    /// step with the tick), calling `trace` before it. Returns true if that turn ended
+    /// the step: it was the last hart's, or the program stopped the machine. A step is
+    /// the same whether it runs whole or a turn at a time, which is what lets a debugger
+    /// stop between two harts' turns without changing what the machine does.
+    #[inline]
+    pub fn turn_traced(&mut self, trace: &mut impl FnMut(&Cpu)) -> bool {
+        let i = self.turn;
+        self.current = i;
         trace(self);
-        self.bus.tick();
-        let mut idle = true;
-        for i in 0..self.harts.len() {
-            if i > 0 {
-                if self.bus.exit.is_some() {
-                    break;
-                }
-                self.current = i;
-                trace(self);
-            }
-            idle &= self.harts[i].step(&mut self.bus);
+        if i == 0 {
+            self.bus.tick();
+            self.step_idle = true;
         }
+        self.step_idle &= self.harts[i].step(&mut self.bus);
         self.current = 0;
-        if idle && self.wfi_skips_to_timer {
+        self.turn = i + 1;
+        if self.turn < self.harts.len() && self.bus.exit.is_none() {
+            return false;
+        }
+        self.turn = 0;
+        if self.step_idle && self.wfi_skips_to_timer {
             // Nothing to do until a timer fires or a device raises a line: skip straight
             // to the next timer. Device lines are sampled again next step.
             if let Some(deadline) = self.bus.clint.next_deadline() {
                 self.bus.clint.mtime = deadline;
             }
         }
+        true
     }
 }
 
@@ -230,6 +255,12 @@ impl Hart {
             waiting: false,
             instret_written: false,
         }
+    }
+
+    /// Whether the hart's next turn executes the instruction at `pc`, rather than taking
+    /// an interrupt or waiting in `wfi`: when a debugger's breakpoint at `pc` is hit.
+    pub fn will_execute(&self, bus: &Bus) -> bool {
+        self.pending_interrupt(bus).is_none() && (!self.waiting || self.mip(bus) & self.csr.mie != 0)
     }
 
     #[inline]
