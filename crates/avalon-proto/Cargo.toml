@@ -8,5 +8,5 @@ license.workspace = true
 [dependencies]
 
 [dev-dependencies]
-# Only to check that the hardware profile mirrors grail::MachineConfig field for field.
+# Only to check that the protocol mirrors grail: MachineConfig field for field, the pointer buttons.
 grail = { path = "../grail" }

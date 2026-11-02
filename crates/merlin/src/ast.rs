@@ -10,9 +10,14 @@
 //! * every expression has its C type in [`Expr::ty`], and conversions C does
 //!   implicitly (assigning an `int` to a `char`, passing arguments, returning)
 //!   are explicit [`ExprKind::Cast`] nodes with `implicit: true`;
-//! * `sizeof` has been replaced by its value.
+//! * `sizeof` has been replaced by its value;
+//! * every member access knows its member's offset, every `switch` its
+//!   `case` values, and every call that passes or returns a struct by value
+//!   the hidden locals it needs ([`Local::temp`]).
 //!
 //! So code generation never has to track scopes or C's conversion rules.
+//! Typedefs, struct tags and enum constants are gone even earlier: the parser
+//! resolves them, so the tree only has types and numbers.
 
 use crate::types::Type;
 use crate::Pos;
@@ -71,29 +76,58 @@ pub struct Function {
     pub params: Vec<Param>,
     /// `static`: not visible to other files (no `.globl`).
     pub is_static: bool,
+    /// Declared `inline`.
+    pub is_inline: bool,
+    /// Declared `extern` (which only matters with `inline`).
+    pub is_extern: bool,
+    /// Set by sema on a definition that C99 calls an *inline definition*
+    /// (every file-scope declaration says `inline` and none `extern`): it
+    /// provides no external definition, so it is emitted without `.globl`.
+    pub inline_only: bool,
     /// `None` for a prototype (`int f(int a);`): declared here, defined elsewhere.
     pub body: Option<Vec<Stmt>>,
     /// Filled in by sema: parameters first (in order), then every local declared in
-    /// the body, in source order. Shadowed names get their own entry; `static`
-    /// locals are globals and are not listed.
+    /// the body, in source order, and the hidden temporaries calls need.
+    /// Shadowed names get their own entry; `static` locals are globals and are
+    /// not listed.
     pub locals: Vec<Local>,
+    /// Set by sema when the function returns a struct too big for registers:
+    /// the hidden local that keeps the address the caller passed in `a0`, of
+    /// the memory the result goes to.
+    pub ret_ptr: Option<LocalId>,
     pub pos: Pos,
+}
+
+impl Function {
+    /// The function's type.
+    pub fn ty(&self) -> Type {
+        Type::func(
+            self.ret.clone(),
+            self.params.iter().map(|p| p.ty.unqual().clone()).collect(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Param {
     /// Empty in a prototype that leaves the parameter unnamed (`int f(char *)`).
     pub name: String,
-    /// Arrays are already adjusted to pointers, as C does for parameters.
+    /// Arrays and functions are already adjusted to pointers, as C does for
+    /// parameters.
     pub ty: Type,
     pub pos: Pos,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Local {
+    /// The variable's name; for a temporary, what it holds.
     pub name: String,
     pub ty: Type,
     pub pos: Pos,
+    /// A temporary sema added, with no name in the source: the result of a
+    /// call returning a struct, a copy of a struct argument passed by
+    /// reference, or the address a big struct result goes to.
+    pub temp: bool,
 }
 
 /// One name in a declaration: `x`, `*p = &x`, `a[3] = {1, 2, 3}`.
@@ -118,8 +152,13 @@ pub struct Declarator {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Init {
     Expr(Expr),
-    /// Elements in order; elements left out are zero. After sema, a list only
-    /// initializes arrays: a scalar's `{ x }` has become `x`.
+    /// Elements in order; elements left out are zero. After sema the list is
+    /// fully braced, with exactly the shape of the object: one item per
+    /// array element or struct member given (a union's list has one item, for
+    /// its first member), each a list itself if its subobject is an array or
+    /// a struct initialized element by element. A scalar's `{ x }` has become
+    /// `x`, and C's brace elision (`int m[2][2] = {1, 2, 3, 4}`) has been
+    /// made explicit.
     List(Vec<Init>, Pos),
 }
 
@@ -175,6 +214,35 @@ pub enum StmtKind {
     Return(Option<Expr>),
     Break,
     Continue,
+    /// `switch (cond) body`. Sema fills in every `case` of this switch (its
+    /// value, converted to the promoted type of `cond`, and its id) and the
+    /// id of `default`, if there is one.
+    Switch {
+        cond: Expr,
+        body: Box<Stmt>,
+        cases: Vec<(i64, usize)>,
+        default: Option<usize>,
+    },
+    /// `case expr: body`. Sema sets the value and an id, unique in the
+    /// function, that its switch refers to.
+    Case {
+        expr: Expr,
+        value: i64,
+        id: usize,
+        body: Box<Stmt>,
+    },
+    /// `default: body`, with an id like a case's.
+    Default {
+        id: usize,
+        body: Box<Stmt>,
+    },
+    /// `name: body`
+    Label {
+        name: String,
+        body: Box<Stmt>,
+    },
+    /// `goto name;`
+    Goto(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -318,7 +386,50 @@ pub enum ExprKind {
     Cond(Box<Expr>, Box<Expr>, Box<Expr>),
     /// `a, b`
     Comma(Box<Expr>, Box<Expr>),
-    Call(String, Vec<Expr>),
+    /// `s.name` or, with `arrow`, `p->name`. Sema sets the member's offset.
+    Member {
+        base: Box<Expr>,
+        name: String,
+        arrow: bool,
+        offset: u32,
+    },
+    /// `callee(args)`. The callee is a function designator (a function's
+    /// name, or `*fp`) or a pointer to a function. Set by sema when the call
+    /// returns a struct or union: `result`, the hidden local the result is
+    /// kept in; and for every argument passed by reference (a struct bigger
+    /// than two registers), the hidden local the caller copies it to.
+    Call {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+        result: Option<LocalId>,
+        arg_copies: Vec<Option<LocalId>>,
+    },
+}
+
+impl ExprKind {
+    /// A call, before sema: no temporaries yet.
+    pub fn call(callee: Expr, args: Vec<Expr>) -> ExprKind {
+        ExprKind::Call {
+            callee: Box::new(callee),
+            args,
+            result: None,
+            arg_copies: Vec::new(),
+        }
+    }
+}
+
+impl Expr {
+    /// In a checked tree, the symbol of the function a call goes straight to
+    /// (`f(x)`), as opposed to through a pointer (`fp(x)`, `(*fp)(x)`).
+    pub fn direct_callee(&self) -> Option<&str> {
+        match &self.kind {
+            ExprKind::Var {
+                var: Some(VarRef::Global(sym)),
+                ..
+            } if self.ty.is_func() => Some(sym),
+            _ => None,
+        }
+    }
 }
 
 /// Renders the tree as indented text, one node per line, with source positions.
@@ -361,15 +472,24 @@ impl Dumper {
         };
         let what = if f.body.is_some() { "Function" } else { "Prototype" };
         let stat = if f.is_static { "static " } else { "" };
+        let inline = if f.is_inline { "inline " } else { "" };
         self.line(
             0,
             f.pos,
-            &format!("{what} {stat}{}", f.ret.declare(&format!("{}({params})", f.name))),
+            &format!(
+                "{what} {stat}{inline}{}",
+                f.ret.declare(&format!("{}({params})", f.name))
+            ),
         );
         if let Some(body) = &f.body {
             for (i, l) in f.locals.iter().enumerate() {
-                let what = if i < f.params.len() { "Param" } else { "Local" };
-                self.line(1, l.pos, &format!("{what} #{i} {}", l.ty.declare(&l.name)));
+                let text = if l.temp {
+                    format!("Temp #{i} {} ({})", l.ty, l.name)
+                } else {
+                    let what = if i < f.params.len() { "Param" } else { "Local" };
+                    format!("{what} #{i} {}", l.ty.declare(&l.name))
+                };
+                self.line(1, l.pos, &text);
             }
             for s in body {
                 self.stmt(1, s);
@@ -477,6 +597,24 @@ impl Dumper {
             }
             StmtKind::Break => self.line(d, s.pos, "Break"),
             StmtKind::Continue => self.line(d, s.pos, "Continue"),
+            StmtKind::Switch { cond, body, .. } => {
+                self.line(d, s.pos, "Switch");
+                self.expr(d + 1, cond);
+                self.stmt(d + 1, body);
+            }
+            StmtKind::Case { value, body, .. } => {
+                self.line(d, s.pos, &format!("Case {value}"));
+                self.stmt(d + 1, body);
+            }
+            StmtKind::Default { body, .. } => {
+                self.line(d, s.pos, "Default");
+                self.stmt(d + 1, body);
+            }
+            StmtKind::Label { name, body } => {
+                self.line(d, s.pos, &format!("Label {name}"));
+                self.stmt(d + 1, body);
+            }
+            StmtKind::Goto(name) => self.line(d, s.pos, &format!("Goto {name}")),
         }
     }
 
@@ -536,10 +674,41 @@ impl Dumper {
                 self.expr(d + 1, a);
                 self.expr(d + 1, b);
             }
-            ExprKind::Call(name, args) => {
-                node(self, format!("Call {name}"));
-                for a in args {
-                    self.expr(d + 1, a);
+            ExprKind::Member {
+                base,
+                name,
+                arrow,
+                offset,
+            } => {
+                let op = if *arrow { "->" } else { "." };
+                node(self, format!("Member {op}{name} (offset {offset})"));
+                self.expr(d + 1, base);
+            }
+            ExprKind::Call {
+                callee,
+                args,
+                result,
+                arg_copies,
+            } => {
+                let mut text = match callee.direct_callee() {
+                    Some(name) => format!("Call {name}"),
+                    None => "Call".to_string(),
+                };
+                if let Some(LocalId(r)) = result {
+                    let _ = write!(text, " (result in #{r})");
+                }
+                node(self, text);
+                if callee.direct_callee().is_none() {
+                    self.expr(d + 1, callee);
+                }
+                for (i, a) in args.iter().enumerate() {
+                    match arg_copies.get(i) {
+                        Some(Some(LocalId(c))) => {
+                            self.line(d + 1, a.pos, &format!("ByReference (copied to #{c})"));
+                            self.expr(d + 2, a);
+                        }
+                        _ => self.expr(d + 1, a),
+                    }
                 }
             }
         }

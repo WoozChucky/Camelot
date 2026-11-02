@@ -3,15 +3,20 @@
 //! Pipeline: [`lexer`] → [`parser`] → [`sema`] (name resolution, type
 //! checking) → [`codegen`]. [`parse`] runs the front end and returns a checked,
 //! typed AST; [`compile`] goes all the way to assembly text. [`types`] has the
-//! C types and their ILP32 sizes, [`consteval`] evaluates constant expressions.
+//! C types and their ILP32 layout, [`consteval`] evaluates constant
+//! expressions, and [`abi`] says how arguments and results travel (the RISC-V
+//! ILP32 calling convention).
 //!
-//! The language (spec section 10) is a subset of C99: the integer types
-//! (`char`, `short`, `int`, `long`, signed and unsigned), pointers, arrays,
-//! global and `static` variables with initializers, string and character
-//! literals, functions with up to 8 parameters, the statements `if`/`else`,
-//! `while`, `do`/`while`, `for`, `return`, `break`, `continue`, and every C
-//! operator except `->` and `.` (no structs yet).
+//! The language (spec section 10) is a subset of C99 without the preprocessor
+//! and floating point: the integer types (`_Bool`, `char`, `short`, `int`,
+//! `long`, signed and unsigned), `enum`, pointers (to functions too), arrays,
+//! structs and unions (passed and returned by value as clang does), `typedef`,
+//! the `const` and `volatile` qualifiers, global and `static` variables with
+//! initializers, string and character literals, functions with up to 8
+//! parameters (`inline` accepted), every statement (`switch`, `goto` and labels
+//! included), and every C operator.
 
+pub mod abi;
 pub mod ast;
 pub mod codegen;
 pub mod consteval;

@@ -10,20 +10,27 @@
 //! ## Contract
 //!
 //! * Input: a [`Program`] that passed [`crate::sema`]. Every expression has its
-//!   C type, conversions are explicit cast nodes, `sizeof` is folded, and every
-//!   variable says where it lives: local `#i` of its function (parameters
-//!   first) or a global symbol. Every call names a declared function with the
-//!   right number of arguments (at most 8, in `a0-a7`).
+//!   C type, conversions are explicit cast nodes, `sizeof` is folded, every
+//!   member access knows its offset, initializer lists are fully braced, and
+//!   every variable says where it lives: local `#i` of its function
+//!   (parameters first, then the declared locals and the hidden ones calls
+//!   need) or a global symbol. Every call has the right number of arguments,
+//!   and they fit `a0-a7`.
 //! * Output: assembly merlin-as accepts (and so does clang): functions in
 //!   `.text`, initialized variables in `.data`, zero-initialized ones in
-//!   `.bss`, string literals in `.rodata`. Every function and variable that is
-//!   not `static` gets `.globl`; declarations without a definition emit nothing
+//!   `.bss`, `const` ones and string literals in `.rodata`. Every function and
+//!   variable that is not `static` gets `.globl` (except a C99 inline
+//!   definition, kept local); declarations without a definition emit nothing
 //!   (the linker finds them).
 //! * Semantics: 32-bit wrapping arithmetic, `/` and `%` truncate toward zero
 //!   (`div`/`rem`, or `divu`/`remu` when unsigned), shifts use the low 5 bits
 //!   of the amount, comparisons and `! && ||` produce 0 or 1, `&&`/`||`
 //!   short-circuit, an assignment evaluates to the stored value. Falling off
 //!   the end of a function returns 0.
+//! * Memory: every read and write the source asks for is done, once, in
+//!   order, and nothing is kept in a register across statements. So
+//!   `volatile` needs nothing special: the code generator never caches,
+//!   removes, merges or reorders memory accesses.
 //!
 //! ## Values and types
 //!
@@ -46,19 +53,51 @@
 //! int` or `unsigned long`, or a pointer), `div`, `rem`, `slt` and `sra`
 //! otherwise.
 //!
+//! A `_Bool` holds 0 or 1: converting to it is `snez a0, a0` (from a pointer
+//! too), and it is loaded with `lbu`.
+//!
 //! An array is never loaded: an expression of array type leaves its address in
-//! `a0`, which is exactly C's array-to-pointer decay.
+//! `a0`, which is exactly C's array-to-pointer decay. A function's name
+//! leaves the function's address (`la a0, f`), and so does `*fp`.
+//!
+//! ## Structs and unions
+//!
+//! A struct (or union) is not a value that fits a register, so an expression
+//! of struct type leaves the struct's *address* in `a0`, like an array: a
+//! variable's slot, `*p`'s `p`, a member's address inside its parent. Then
+//!
+//! * `s.m` and `p->m` add the member's offset (sema worked it out) to that
+//!   address, and load the member if it is a scalar;
+//! * `a = b` copies the bytes from `b`'s address to `a`'s, and leaves `a`'s
+//!   address (the assignment's value);
+//! * a struct a call returns is kept in a hidden local of the caller (sema
+//!   adds one per such call), whose address is the call's value: so
+//!   `f().m` is a member access like any other.
+//!
+//! Copies go in units of the struct's alignment, at most a word (`lw`/`sw`,
+//! `lhu`/`sh`, `lbu`/`sb`), so no access is misaligned: unrolled for up to 16
+//! units, a loop for more. Struct locals get word-aligned slots that are a
+//! whole number of words long, so that a struct arriving in registers can be
+//! stored with `sw`.
 //!
 //! ## Calling convention (RISC-V ILP32)
 //!
 //! * Arguments go in `a0-a7`, left to right; the result comes back in `a0`.
 //!   Arguments and results narrower than 32 bits travel widened by their type
 //!   (sema's casts do that).
-//! * `ra` holds the return address (`call f` is `auipc ra` + `jalr ra`).
+//! * A struct of up to 8 bytes travels in one or two registers, its bytes as
+//!   they lie in memory: it is loaded from its address word by word (put
+//!   together from smaller aligned pieces if it is not word-aligned). A
+//!   bigger one is passed as the address of a copy the caller makes (in a
+//!   hidden local), and returned through memory: the caller passes the
+//!   address of its result local as a hidden first argument in `a0`, and the
+//!   callee copies the result there. [`crate::abi`] has the rules.
+//! * `ra` holds the return address (`call f` is `auipc ra` + `jalr ra`; a
+//!   call through a pointer loads it into `t1` and does `jalr t1`).
 //! * `sp`, `s0-s11` must look untouched to the caller when we return; the
 //!   `a` and `t` registers may be clobbered by any call. We only ever use
-//!   `s0` (saved in the prologue), `a0`, `a1`, the argument registers, `t0`
-//!   and `t1`.
+//!   `s0` (saved in the prologue), the argument registers, and `t0-t4` as
+//!   scratch.
 //! * `sp` is 16-byte aligned at every call.
 //!
 //! ## Stack frame
@@ -98,6 +137,11 @@
 //!       addi  sp, sp, -(frame - 16)    addi  sp, sp, 16
 //!       sw    a0, -12(s0)  # params    ret
 //! ```
+//!
+//! A struct parameter that came in registers is stored word by word; one
+//! passed by reference is copied from the caller's copy into its slot. A
+//! function returning a big struct saves the result address (`a0`) in a
+//! hidden local.
 //!
 //! ## Expressions
 //!
@@ -152,23 +196,26 @@
 //!
 //! A call evaluates its arguments left to right, pushing all but the last;
 //! the last goes from `a0` to `a(n-1)` with `mv`, then the others are popped
-//! into `a(n-2)` down to `a0`. If temporaries of an enclosing expression
-//! are still pushed (as in `x + f(y)`), `sp` is lowered to a multiple of 16
-//! around the `call`, to keep the convention's alignment.
+//! into `a(n-2)` down to `a0` (a small struct's address is popped into `t1`
+//! and its words loaded from there). A call through a pointer evaluates the
+//! pointer first and pops it into `t1` last. If temporaries of an enclosing
+//! expression are still pushed (as in `x + f(y)`), `sp` is lowered to a
+//! multiple of 16 around the `call`, to keep the convention's alignment.
 //!
 //! ## Initializers
 //!
-//! A local scalar's initializer is an assignment. A local array with an
-//! initializer is first cleared (word by word, or with a loop when it is
-//! big), then each element given is stored. A local without an initializer is
+//! A local scalar's initializer is an assignment. A local array or struct
+//! with an initializer list is first cleared (word by word, or with a loop
+//! when it is big), then each element or member given is stored; a struct
+//! initialized by another struct is copied. A local without an initializer is
 //! left as it is (C: indeterminate).
 //!
 //! Globals and `static` locals are data: the initializer, a constant
 //! expression, is written out with `.byte`, `.half`, `.word` (`.word sym+off`
-//! for an address, which the linker fills in), `.ascii` and `.zero`, after a
-//! `.balign` for the type. A `static` local's symbol is `function.name`, a
-//! local symbol (no `.globl`). Each string literal gets a label `.L.str.<n>`
-//! in `.rodata`.
+//! for an address, which the linker fills in), `.ascii` and `.zero` (struct
+//! padding too), after a `.balign` for the type. A `static` local's symbol is
+//! `function.name`, a local symbol (no `.globl`). Each string literal gets a
+//! label `.L.str.<n>` in `.rodata`.
 //!
 //! ## Control flow
 //!
@@ -176,6 +223,14 @@
 //! to local labels named `.L.<what>.<n>`, numbered across the whole file
 //! (`.L.else.3`, `.L.break.7`); every function returns through
 //! `.L.return.<name>`.
+//!
+//! A `switch` is a chain of compares, one `li t0, value` + `beq a0, t0` per
+//! `case` in source order, then a jump to `default` (or past the body). The
+//! body follows unchanged, its `case` labels (`.L.case.<function>.<n>`) where
+//! they stand, so control falls through from one to the next, and `break`
+//! jumps to the end. A table of addresses would be faster for dense cases; a
+//! chain is simpler to read and works for any values. A C label `name` is
+//! `.L.label.<function>.<name>`, and `goto` is a `j` to it.
 //!
 //! A conditional branch reaches only ±4 KiB, and merlin-as reports a branch
 //! that cannot reach its label as an error rather than rewriting it. So once a
@@ -188,11 +243,14 @@
 //!                                        j     .L.end.4
 //!                                     1:
 //! ```
+//!
+//! (and `beq a0, t0, ...` becomes `bne a0, t0, 1f` over a `j`).
 
+use crate::abi::{self, Pass};
 use crate::ast::*;
 use crate::consteval::{self, Base, Const};
 use crate::sema::arith_type;
-use crate::types::{IntKind, Type};
+use crate::types::{FuncType, IntKind, Type};
 use crate::Error;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -240,7 +298,8 @@ pub fn generate(prog: &Program) -> Result<String, Error> {
                     frame,
                     lines: Vec::new(),
                     depth: 0,
-                    loops: Vec::new(),
+                    breaks: Vec::new(),
+                    continues: Vec::new(),
                     file: &mut file,
                     ret_label: format!(".L.return.{}", f.name),
                     statics: Vec::new(),
@@ -282,13 +341,18 @@ fn layout(locals: &[Local]) -> Option<(Vec<i32>, i32)> {
     let mut off = -i64::from(SAVED_REGS);
     let mut offsets = Vec::with_capacity(locals.len());
     for l in locals {
-        let size = l.ty.size().expect("sema: locals have complete types");
-        // Arrays are word-aligned so that clearing them can use `sw`.
-        let align = if l.ty.is_array() {
+        let mut size = l.ty.size().expect("sema: locals have complete types");
+        // Arrays and structs are word-aligned so that clearing them can use
+        // `sw`, and a struct's slot is a whole number of words, so that one
+        // arriving in registers can be stored with `sw` (see [`abi`]).
+        let align = if l.ty.is_array() || l.ty.is_record() {
             l.ty.align().max(4)
         } else {
             l.ty.align()
         };
+        if l.ty.is_record() {
+            size = size.next_multiple_of(4);
+        }
         // Round down to the alignment (two's complement: works below zero).
         off = (off - i64::from(size)) & !(i64::from(align) - 1);
         if (-off + 15) & !15 > MAX_FRAME {
@@ -306,7 +370,8 @@ fn fits_imm12(v: i32) -> bool {
 
 /// The load that brings a value of type `ty` into a register, widened.
 fn load_op(ty: &Type) -> &'static str {
-    match ty {
+    match ty.unqual() {
+        // `_Bool` holds 0 or 1: `lbu`.
         Type::Int(k) => match (k.size(), k.signed()) {
             (1, true) => "lb",
             (1, false) => "lbu",
@@ -315,7 +380,7 @@ fn load_op(ty: &Type) -> &'static str {
             _ => "lw",
         },
         Type::Ptr(_) => "lw",
-        Type::Void | Type::Array(..) => unreachable!("no value of type '{ty}' is loaded"),
+        _ => unreachable!("no value of type '{ty}' is loaded"),
     }
 }
 
@@ -375,12 +440,19 @@ impl FileGen {
             unreachable!("sema gives globals and statics a symbol")
         };
         let mut data = Vec::new();
-        match &d.init {
-            Some(init) => {
-                self.data(&d.ty, init, &mut data);
-                self.switch(".data");
-            }
-            None => self.switch(".bss"),
+        if let Some(init) = &d.init {
+            self.data(&d.ty, init, &mut data);
+        }
+        // A `const` object never changes: read-only data, as clang does (a
+        // `const volatile` one may be changed from outside, so it stays
+        // writable).
+        let quals = d.ty.quals();
+        if quals.konst && !quals.volatile {
+            self.switch(".rodata");
+        } else if d.init.is_some() {
+            self.switch(".data");
+        } else {
+            self.switch(".bss");
         }
         let size = d.ty.size().expect("sema: definitions have complete types");
         let storage = if d.storage == Storage::Static {
@@ -411,7 +483,24 @@ impl FileGen {
 
     /// The directives for an object of type `ty` initialized by `init`.
     fn data(&mut self, ty: &Type, init: &Init, out: &mut Vec<String>) {
-        match (ty, init) {
+        match (ty.unqual(), init) {
+            (Type::Record(r), Init::List(items, _)) => {
+                // Members in order (sema's list is fully braced; a union's has
+                // at most its first member), with the padding between them and
+                // after the last as zeros.
+                let body = r.body().expect("sema: definitions have complete types");
+                let mut at = 0;
+                for (m, item) in body.members.iter().zip(items) {
+                    if m.offset > at {
+                        out.push(format!(".zero {}", m.offset - at));
+                    }
+                    self.data(&m.ty, item, out);
+                    at = m.offset + m.ty.size().expect("complete member");
+                }
+                if body.size > at {
+                    out.push(format!(".zero {}", body.size - at));
+                }
+            }
             (Type::Array(elem, Some(n)), Init::List(items, _)) => {
                 for item in items {
                     self.data(elem, item, out);
@@ -532,9 +621,13 @@ enum Line {
     /// An instruction, already formatted, and the most bytes it can assemble
     /// to (pseudo-instructions like `li`, `la` and `call` can take two words).
     Insn(String, u32),
-    /// `beqz a0, target` (`if_zero`) or `bnez a0, target`: a conditional jump
-    /// whose reach is limited, see [`relax_branches`].
-    Branch { if_zero: bool, target: String },
+    /// A conditional jump, `op regs, target` (`beqz a0, .L.end.3`, `beq a0,
+    /// t0, .L.case.f.2`), whose reach is limited: see [`relax_branches`].
+    Branch {
+        op: &'static str,
+        regs: &'static str,
+        target: String,
+    },
     /// `# text`, or a directive such as `.globl f`: no bytes.
     Text(String),
 }
@@ -558,8 +651,10 @@ struct FuncGen<'a, 'f> {
     /// How many 4-byte temporaries expression evaluation has pushed right now.
     /// Always 0 between statements.
     depth: u32,
-    /// `(continue target, break target)` for each enclosing loop, innermost last.
-    loops: Vec<(String, String)>,
+    /// Where `break` goes for each enclosing loop or `switch`, and where
+    /// `continue` goes for each enclosing loop, innermost last.
+    breaks: Vec<String>,
+    continues: Vec<String>,
     file: &'f mut FileGen,
     /// Every `return` jumps here, to the epilogue.
     ret_label: String,
@@ -599,18 +694,20 @@ impl<'a> FuncGen<'a, '_> {
         self.lines.push(Line::Label(name.to_string()));
     }
 
-    fn branch_if_zero(&mut self, target: &str) {
+    fn branch(&mut self, op: &'static str, regs: &'static str, target: &str) {
         self.lines.push(Line::Branch {
-            if_zero: true,
+            op,
+            regs,
             target: target.to_string(),
         });
     }
 
+    fn branch_if_zero(&mut self, target: &str) {
+        self.branch("beqz", "a0", target);
+    }
+
     fn branch_if_nonzero(&mut self, target: &str) {
-        self.lines.push(Line::Branch {
-            if_zero: false,
-            target: target.to_string(),
-        });
+        self.branch("bnez", "a0", target);
     }
 
     /// A fresh label name, `.L.<what>.<n>`.
@@ -678,11 +775,21 @@ impl<'a> FuncGen<'a, '_> {
             f.ret.declare(&format!("{}({params})", f.name))
         ));
         for (i, l) in f.locals.iter().enumerate() {
-            let what = if i < f.params.len() { "param" } else { "local" };
             let off = self.offsets[i];
-            self.comment(format!("  {off:>5}(s0)  {what} {}", l.ty.declare(&l.name)));
+            let what = if i < f.params.len() {
+                format!("param {}", l.ty.declare(&l.name))
+            } else if l.temp {
+                // A hidden local for a call or a return (sema's names say what).
+                format!("temp {} ({})", l.ty, l.name)
+            } else {
+                format!("local {}", l.ty.declare(&l.name))
+            };
+            self.comment(format!("  {off:>5}(s0)  {what}"));
         }
-        if !f.is_static {
+        // An inline definition (C99 `inline` without `extern`) provides no
+        // external definition: merlin keeps it local to the file, like a
+        // `static` function.
+        if !f.is_static && !f.inline_only {
             self.lines.push(Line::Text(format!(".globl {}", f.name)));
         }
         self.label(&f.name);
@@ -695,10 +802,36 @@ impl<'a> FuncGen<'a, '_> {
         if frame > SAVE_AREA {
             self.add_imm("sp", "sp", -(frame - SAVE_AREA));
         }
-        // Parameters arrive in a0-a7; give them their slots like any local.
-        for (i, p) in f.params.iter().enumerate() {
+        // Parameters arrive in a0-a7 (see [`abi`]); give them their slots like
+        // any local. A big struct result's address comes first, in a0.
+        let Type::Func(ft) = f.ty() else {
+            unreachable!("a function's type")
+        };
+        if let Some(ret_ptr) = f.ret_ptr {
+            let off = self.offset(ret_ptr);
+            self.access_local("sw", "a0", off);
+        }
+        let (regs, _) = abi::arguments(&ft);
+        for (i, (p, (reg, pass))) in f.params.iter().zip(regs).enumerate() {
             let off = self.offsets[i];
-            self.access_local(store_op(&p.ty), &format!("a{i}"), off);
+            match pass {
+                Pass::Scalar => self.access_local(store_op(&p.ty), &format!("a{reg}"), off),
+                // A small struct: its words, as they lie in memory (the slot is
+                // a whole number of words).
+                Pass::Words(n) => {
+                    for w in 0..n {
+                        self.access_local("sw", &format!("a{}", reg + w as usize), off + 4 * w as i32);
+                    }
+                }
+                // A big struct: the caller's copy, at the address in the
+                // register, is copied into the slot. (Changing the caller's
+                // copy in place would do too; a copy keeps every parameter
+                // in the frame.)
+                Pass::Ref => {
+                    self.add_imm("t4", "s0", off);
+                    self.copy("t4", &format!("a{reg}"), &p.ty);
+                }
+            }
         }
 
         for s in body {
@@ -839,33 +972,117 @@ impl<'a> FuncGen<'a, '_> {
             StmtKind::Return(e) => {
                 if let Some(e) = e {
                     self.expr(e);
+                    if e.ty.is_record() {
+                        self.return_record(&e.ty);
+                    }
                 }
                 let ret = self.ret_label.clone();
                 self.ins("j", ret);
             }
             StmtKind::Break => {
-                let (_, brk) = self
-                    .loops
+                let brk = self
+                    .breaks
                     .last()
-                    .expect("sema rejects break outside a loop")
+                    .expect("sema: break in a loop or switch")
                     .clone();
                 self.ins("j", brk);
             }
             StmtKind::Continue => {
-                let (cont, _) = self
-                    .loops
-                    .last()
-                    .expect("sema rejects continue outside a loop")
-                    .clone();
+                let cont = self.continues.last().expect("sema: continue in a loop").clone();
                 self.ins("j", cont);
+            }
+            StmtKind::Switch {
+                cond,
+                body,
+                cases,
+                default,
+            } => {
+                // A chain of compares, one per `case`, in source order; then
+                // `default` (or the end, when there is none). The body is
+                // emitted as it is, its `case` and `default` labels where they
+                // stand, so control falls through from one to the next as C
+                // says:
+                //
+                //     <cond>                   (promoted: a 32-bit value)
+                //     li   t0, 1
+                //     beq  a0, t0, .L.case.f.0
+                //     li   t0, 7
+                //     beq  a0, t0, .L.case.f.1
+                //     j    .L.case.f.2         (default; or .L.break.N)
+                //     <body>                   (with .L.case.f.<id>: labels)
+                //   .L.break.N:
+                let brk = self.new_label("break");
+                self.expr(cond);
+                for &(value, id) in cases {
+                    // The bit pattern: an `unsigned` 0xffffffff is `li t0, -1`.
+                    self.li("t0", IntKind::Int.wrap(value) as i32);
+                    let target = self.case_label(id);
+                    self.branch("beq", "a0, t0", &target);
+                }
+                let otherwise = match default {
+                    Some(id) => self.case_label(*id),
+                    None => brk.clone(),
+                };
+                self.ins("j", otherwise);
+                self.breaks.push(brk.clone());
+                self.stmt(body);
+                self.breaks.pop();
+                self.label(&brk);
+            }
+            StmtKind::Case { id, body, .. } | StmtKind::Default { id, body } => {
+                let label = self.case_label(*id);
+                self.label(&label);
+                self.stmt(body);
+            }
+            StmtKind::Label { name, body } => {
+                let label = self.goto_label(name);
+                self.label(&label);
+                self.stmt(body);
+            }
+            StmtKind::Goto(name) => {
+                let label = self.goto_label(name);
+                self.ins("j", label);
             }
         }
     }
 
     fn loop_body(&mut self, body: &'a Stmt, cont: &str, brk: &str) {
-        self.loops.push((cont.to_string(), brk.to_string()));
+        self.continues.push(cont.to_string());
+        self.breaks.push(brk.to_string());
         self.stmt(body);
-        self.loops.pop();
+        self.continues.pop();
+        self.breaks.pop();
+    }
+
+    /// The label of `case` or `default` number `id` (numbered by sema, per
+    /// function).
+    fn case_label(&self, id: usize) -> String {
+        format!(".L.case.{}.{id}", self.func.name)
+    }
+
+    /// The label of the C label `name`: `.L.label.<function>.<name>`.
+    fn goto_label(&self, name: &str) -> String {
+        format!(".L.label.{}.{name}", self.func.name)
+    }
+
+    /// Returns the struct whose address is in `a0` from the function: in
+    /// `a0` (and `a1`) when it is small, otherwise copied to where the caller
+    /// asked, the address that came in `a0` (see [`abi`]).
+    fn return_record(&mut self, ty: &Type) {
+        match self.func.ret_ptr {
+            Some(ret_ptr) => {
+                let off = self.offset(ret_ptr);
+                self.access_local("lw", "a1", off);
+                self.copy("a1", "a0", ty);
+            }
+            None => {
+                let Pass::Words(n) = abi::classify(ty) else {
+                    unreachable!("a big result has a result address")
+                };
+                self.ins("mv", "t1, a0");
+                self.load_words("t1", 0, n, ty);
+            }
+        }
     }
 
     fn local_decl(&mut self, d: &'a Declarator) {
@@ -878,23 +1095,38 @@ impl<'a> FuncGen<'a, '_> {
         // Without an initializer the local is left as it is (C: indeterminate).
         let Some(init) = &d.init else { return };
         let off = self.offset(id);
-        if d.ty.is_array() {
-            // Clear the whole array, then store what the initializer gives.
+        // An array, or a struct given member by member: clear the whole
+        // object, then store what the initializer gives.
+        if d.ty.is_array() || (d.ty.is_record() && matches!(init, Init::List(..))) {
             self.comment(format!("{} = ...", d.ty.declare(&d.name)));
             self.clear_local(off, d.ty.size().unwrap() as i32);
         }
         self.init_local(&d.ty, init, off);
     }
 
-    /// Stores an initializer into the local object at `off(s0)`; arrays have
-    /// been cleared, so zeros are skipped.
+    /// Stores an initializer into the local object at `off(s0)`; arrays and
+    /// structs initialized by a list have been cleared, so what the list
+    /// leaves out is zero already.
     fn init_local(&mut self, ty: &Type, init: &'a Init, off: i32) {
-        match (ty, init) {
+        match (ty.unqual(), init) {
             (Type::Array(elem, _), Init::List(items, _)) => {
                 let size = elem.size().unwrap() as i32;
                 for (i, item) in items.iter().enumerate() {
                     self.init_local(elem, item, off + i as i32 * size);
                 }
+            }
+            (Type::Record(r), Init::List(items, _)) => {
+                // Sema's list is fully braced: one item per member, in order.
+                let body = r.body().expect("sema: locals have complete types");
+                for (m, item) in body.members.iter().zip(items) {
+                    self.init_local(&m.ty, item, off + m.offset as i32);
+                }
+            }
+            (Type::Record(_), Init::Expr(e)) => {
+                // A struct initialized by a struct: copy it.
+                self.expr(e);
+                self.add_imm("a1", "s0", off);
+                self.copy("a1", "a0", ty);
             }
             (
                 Type::Array(_, Some(n)),
@@ -955,8 +1187,8 @@ impl<'a> FuncGen<'a, '_> {
             ExprKind::Var { var, .. } => match var {
                 Some(VarRef::Local(id)) => {
                     let off = self.offset(*id);
-                    if e.ty.is_array() {
-                        self.add_imm("a0", "s0", off); // an array's value is its address
+                    if e.ty.is_addressed() {
+                        self.add_imm("a0", "s0", off); // an array or struct: its address
                     } else {
                         self.access_local(load_op(&e.ty), "a0", off);
                     }
@@ -967,6 +1199,19 @@ impl<'a> FuncGen<'a, '_> {
                 }
                 None => unreachable!("sema resolves every variable"),
             },
+            ExprKind::Assign {
+                op: None,
+                target,
+                value,
+            } if target.ty.is_record() => {
+                // Struct assignment copies the bytes; its value is the target.
+                self.addr(target);
+                self.push();
+                self.expr(value); // a0 = the source's address
+                self.pop("a1");
+                self.copy("a1", "a0", &target.ty);
+                self.ins("mv", "a0, a1");
+            }
             ExprKind::Assign {
                 op: None,
                 target,
@@ -994,13 +1239,25 @@ impl<'a> FuncGen<'a, '_> {
             }
             ExprKind::IncDec { inc, prefix, target } => {
                 let ty = &target.ty;
-                let step = match ty {
+                let step = match ty.unqual() {
                     Type::Ptr(to) => to.size().expect("sema: pointer to a complete type") as i32,
                     _ => 1,
                 };
                 let delta = if *inc { step } else { -step };
                 let place = self.place(target);
                 self.load_place(&place, ty);
+                if ty.int_kind() == Some(IntKind::Bool) {
+                    // `b++` sets a `_Bool`, `b--` flips it: the old value
+                    // cannot be worked out from the new one, so keep it.
+                    self.ins("mv", "t1, a0");
+                    self.add_imm("a0", "a0", delta);
+                    self.wrap_int(ty);
+                    self.store_place(place, ty);
+                    if !prefix {
+                        self.ins("mv", "a0, t1");
+                    }
+                    return;
+                }
                 self.add_imm("a0", "a0", delta);
                 self.wrap_int(ty);
                 self.store_place(place, ty);
@@ -1088,14 +1345,23 @@ impl<'a> FuncGen<'a, '_> {
                 self.expr(a);
                 self.expr(b);
             }
-            ExprKind::Call(name, args) => self.call(name, args),
+            ExprKind::Member { .. } => {
+                self.addr(e);
+                self.load(&e.ty);
+            }
+            ExprKind::Call {
+                callee,
+                args,
+                result,
+                arg_copies,
+            } => self.call(callee, args, *result, arg_copies),
         }
     }
 
-    /// Loads the value of type `ty` at the address in `a0`. Arrays are not
-    /// loaded: their value is that address.
+    /// Loads the value of type `ty` at the address in `a0`. Arrays, structs
+    /// and functions are not loaded: their value is that address.
     fn load(&mut self, ty: &Type) {
-        if !ty.is_array() {
+        if !ty.is_addressed() {
             self.ins(load_op(ty), "a0, 0(a0)");
         }
     }
@@ -1114,6 +1380,16 @@ impl<'a> FuncGen<'a, '_> {
             // The address of *p is p.
             ExprKind::Deref(p) => self.expr(p),
             ExprKind::Str(_) => self.expr(e),
+            // A member is at its offset from the start of the struct. The
+            // struct's value is its address (also when it is not an lvalue,
+            // like a call's result, kept in a hidden local), and `p->m`'s `p`
+            // is one too.
+            ExprKind::Member { base, offset, .. } => {
+                self.expr(base);
+                if *offset != 0 {
+                    self.add_imm("a0", "a0", *offset as i32);
+                }
+            }
             _ => unreachable!("sema only takes the address of lvalues"),
         }
     }
@@ -1158,6 +1434,14 @@ impl<'a> FuncGen<'a, '_> {
     /// narrowing to `char` or `short` changes bits: everything else is 32 bits
     /// already, and an array's value is its address, already a pointer.
     fn convert(&mut self, from: &Type, to: &Type) {
+        let (from, to) = (from.unqual(), to.unqual());
+        if to.int_kind() == Some(IntKind::Bool) {
+            // To `_Bool`: 0 stays 0, anything else (a pointer too) becomes 1.
+            if from != to {
+                self.ins("snez", "a0, a0");
+            }
+            return;
+        }
         if let (Type::Int(f), Type::Int(t)) = (from, to) {
             // A narrower or equal type whose values all fit is already right.
             let fits = (f.size() < t.size() && (t.signed() || !f.signed()))
@@ -1172,9 +1456,10 @@ impl<'a> FuncGen<'a, '_> {
     /// If `ty` is narrower than 32 bits, cuts `a0` down to it and widens it
     /// back by its signedness.
     fn wrap_int(&mut self, ty: &Type) {
-        let Type::Int(k) = ty else { return };
+        let Some(k) = ty.int_kind() else { return };
         let shift = 32 - 8 * k.size();
         match (k.size(), k.signed()) {
+            _ if k == IntKind::Bool => self.ins("snez", "a0, a0"),
             (4, _) => {}
             (1, false) => self.ins("andi", "a0, a0, 255"),
             (_, signed) => {
@@ -1267,24 +1552,72 @@ impl<'a> FuncGen<'a, '_> {
         }
     }
 
-    fn call(&mut self, name: &str, args: &'a [Expr]) {
-        assert!(args.len() <= 8, "sema allows at most 8 arguments");
+    /// A call: `f(args)` with `f` a function's name (`call f`), or through any
+    /// other expression of function or pointer-to-function type (`jalr`).
+    /// Arguments and the result travel as [`abi`] says.
+    fn call(
+        &mut self,
+        callee: &'a Expr,
+        args: &'a [Expr],
+        result: Option<LocalId>,
+        copies: &[Option<LocalId>],
+    ) {
+        let ft: FuncType = callee
+            .ty
+            .decay()
+            .pointee()
+            .and_then(Type::func_type)
+            .expect("sema: the callee is a function")
+            .clone();
+        let (regs, used) = abi::arguments(&ft);
+        assert!(used <= abi::ARG_REGS, "sema checks that the arguments fit a0-a7");
+        // Through a pointer: the function's address is evaluated first and
+        // waits on the stack, under the arguments, until they are loaded.
+        let direct = callee.direct_callee();
+        if direct.is_none() {
+            self.expr(callee);
+            if args.is_empty() {
+                self.ins("mv", "t1, a0");
+            } else {
+                self.push();
+            }
+        }
         // Evaluate every argument before loading any argument register: a later
         // argument may itself contain a call, which would clobber a0-a7. So all
         // but the last are pushed; the last one, already in a0, goes straight
-        // to its register, and then the others are popped into theirs.
-        if let Some((last, rest)) = args.split_last() {
-            for a in rest {
-                self.expr(a);
+        // to its register(s), and then the others are popped into theirs. A
+        // struct's value is its address: its words are loaded from there.
+        if let Some(last) = args.len().checked_sub(1) {
+            for i in 0..last {
+                self.argument(&args[i], copies[i]);
                 self.push();
             }
-            self.expr(last);
-            if !rest.is_empty() {
-                self.ins("mv", format!("a{}, a0", rest.len()));
+            self.argument(&args[last], copies[last]);
+            match regs[last] {
+                (0, Pass::Scalar | Pass::Ref) => {}
+                (r, Pass::Scalar | Pass::Ref) => self.ins("mv", format!("a{r}, a0")),
+                (r, Pass::Words(n)) => {
+                    self.ins("mv", "t1, a0");
+                    self.load_words("t1", r, n, &ft.params[last]);
+                }
             }
-            for i in (0..rest.len()).rev() {
-                self.pop(&format!("a{i}"));
+            for i in (0..last).rev() {
+                match regs[i] {
+                    (r, Pass::Scalar | Pass::Ref) => self.pop(&format!("a{r}")),
+                    (r, Pass::Words(n)) => {
+                        self.pop("t1");
+                        self.load_words("t1", r, n, &ft.params[i]);
+                    }
+                }
             }
+            if direct.is_none() {
+                self.pop("t1");
+            }
+        }
+        // A big struct result goes to the hidden local: its address in a0.
+        if abi::returns_in_memory(&ft.ret) {
+            let off = self.offset(result.expect("sema: a struct result has a local"));
+            self.add_imm("a0", "s0", off);
         }
         // Temporaries of an enclosing expression may still be pushed (in
         // `x + f(y)`, x is). The convention wants sp 16-byte aligned at the
@@ -1293,10 +1626,105 @@ impl<'a> FuncGen<'a, '_> {
         if pad != 0 {
             self.ins("addi", format!("sp, sp, {}", -pad));
         }
-        // `call` is `auipc ra` + `jalr ra`: two words.
-        self.ins_sized(8, "call", name);
+        match direct {
+            // `call` is `auipc ra` + `jalr ra`: two words.
+            Some(name) => self.ins_sized(8, "call", name),
+            None => self.ins("jalr", "t1"),
+        }
         if pad != 0 {
             self.ins("addi", format!("sp, sp, {pad}"));
+        }
+        // A struct result is kept in its hidden local (a small one arrives in
+        // a0/a1 and is stored there); the call's value is that address.
+        if let Some(result) = result {
+            let off = self.offset(result);
+            if let Pass::Words(n) = abi::classify(&ft.ret) {
+                for w in 0..n {
+                    self.access_local("sw", &format!("a{w}"), off + 4 * w as i32);
+                }
+            }
+            self.add_imm("a0", "s0", off);
+        }
+    }
+
+    /// Evaluates an argument into `a0`: a scalar's value, or a struct's
+    /// address. A struct passed by reference is first copied to its hidden
+    /// local (`copy`), and that copy's address is what is passed.
+    fn argument(&mut self, arg: &'a Expr, copy: Option<LocalId>) {
+        self.expr(arg);
+        if let Some(copy) = copy {
+            let off = self.offset(copy);
+            self.add_imm("a1", "s0", off);
+            self.copy("a1", "a0", &arg.ty);
+            self.ins("mv", "a0, a1");
+        }
+    }
+
+    /// Loads the `n` words of the struct of type `ty` at the address in
+    /// `src` into `a<first>`, `a<first+1>`: how a small struct is passed
+    /// and returned.
+    fn load_words(&mut self, src: &str, first: usize, n: u32, ty: &Type) {
+        for w in 0..n {
+            self.load_word(&format!("a{}", first + w as usize), src, w, ty);
+        }
+    }
+
+    /// Loads word `w` of the struct of type `ty` at the address in `src` into
+    /// `reg`. A struct aligned to less than 4 bytes may not be at a word
+    /// boundary, so its word is put together from aligned bytes or halves
+    /// (in `t0`); bytes past the struct's end read as zero.
+    fn load_word(&mut self, reg: &str, src: &str, w: u32, ty: &Type) {
+        let size = ty.size().expect("a complete struct");
+        let unit = ty.align().min(4);
+        if unit == 4 {
+            self.ins("lw", format!("{reg}, {}({src})", 4 * w));
+            return;
+        }
+        let load = if unit == 1 { "lbu" } else { "lhu" };
+        for k in (0..4).step_by(unit as usize) {
+            let at = 4 * w + k;
+            if at >= size {
+                break;
+            }
+            if k == 0 {
+                self.ins(load, format!("{reg}, {at}({src})"));
+            } else {
+                self.ins(load, format!("t0, {at}({src})"));
+                self.ins("slli", format!("t0, t0, {}", 8 * k));
+                self.ins("or", format!("{reg}, {reg}, t0"));
+            }
+        }
+    }
+
+    /// Copies the struct of type `ty` from the address in `src` to the one in
+    /// `dst` (neither of them `t0-t3`, both left as they are). It goes in
+    /// units of the struct's alignment (at most a word), so no access is
+    /// misaligned: unrolled up to 16 units, a loop beyond. Clobbers `t0`, and
+    /// `t1-t3` for the loop.
+    fn copy(&mut self, dst: &str, src: &str, ty: &Type) {
+        let size = ty.size().expect("sema: a complete struct");
+        let unit = ty.align().min(4);
+        let (load, store) = match unit {
+            1 => ("lbu", "sb"),
+            2 => ("lhu", "sh"),
+            _ => ("lw", "sw"),
+        };
+        if size / unit <= 16 {
+            for at in (0..size).step_by(unit as usize) {
+                self.ins(load, format!("t0, {at}({src})"));
+                self.ins(store, format!("t0, {at}({dst})"));
+            }
+        } else {
+            self.ins("mv", format!("t1, {src}")); // t1 = from
+            self.ins("mv", format!("t2, {dst}")); // t2 = to
+            self.li("t3", size as i32); //            t3 = end of from
+            self.ins("add", "t3, t1, t3");
+            self.label("2");
+            self.ins(load, "t0, 0(t1)");
+            self.ins(store, "t0, 0(t2)");
+            self.ins("addi", format!("t1, t1, {unit}"));
+            self.ins("addi", format!("t2, t2, {unit}"));
+            self.ins("bltu", "t1, t3, 2b");
         }
     }
 }
@@ -1370,19 +1798,21 @@ fn render(lines: &[Line], long: &[bool], out: &mut String) {
             Line::Text(text) => {
                 let _ = writeln!(out, "    {text}");
             }
-            Line::Branch { if_zero, target } => {
-                let (near, inverse) = if *if_zero {
-                    ("beqz", "bnez")
-                } else {
-                    ("bnez", "beqz")
-                };
+            Line::Branch { op, regs, target } => {
                 if long {
                     // Too far for a branch: skip over a `j` when the condition fails.
-                    let _ = writeln!(out, "    {}", insn_text(inverse, "a0, 1f"));
+                    let inverse = match *op {
+                        "beqz" => "bnez",
+                        "bnez" => "beqz",
+                        "beq" => "bne",
+                        "bne" => "beq",
+                        _ => unreachable!("codegen emits no other branches"),
+                    };
+                    let _ = writeln!(out, "    {}", insn_text(inverse, &format!("{regs}, 1f")));
                     let _ = writeln!(out, "    {}", insn_text("j", target));
                     let _ = writeln!(out, "1:");
                 } else {
-                    let _ = writeln!(out, "    {}", insn_text(near, &format!("a0, {target}")));
+                    let _ = writeln!(out, "    {}", insn_text(op, &format!("{regs}, {target}")));
                 }
             }
         }
@@ -1829,7 +2259,8 @@ main:
     fn far_branches_are_rewritten() {
         let lines = |n| {
             let mut v = vec![Line::Branch {
-                if_zero: true,
+                op: "beqz",
+                regs: "a0",
                 target: "end".into(),
             }];
             v.extend((0..n).map(|_| Line::Insn("nop".into(), 4)));
@@ -1846,7 +2277,8 @@ main:
             let mut v = vec![Line::Label("top".into())];
             v.extend((0..n).map(|_| Line::Insn("nop".into(), 4)));
             v.push(Line::Branch {
-                if_zero: false,
+                op: "bnez",
+                regs: "a0",
                 target: "top".into(),
             });
             v
@@ -1865,11 +2297,13 @@ main:
         // Branch A spans branch B and 1022 words: exactly in reach, until B
         // grows to two words. B spans 2000 words and is long from the start.
         let mut v = vec![Line::Branch {
-            if_zero: true,
+            op: "beqz",
+            regs: "a0",
             target: "a".into(),
         }];
         v.push(Line::Branch {
-            if_zero: true,
+            op: "beqz",
+            regs: "a0",
             target: "b".into(),
         });
         v.extend((0..1021).map(|_| Line::Insn("nop".into(), 4)));
@@ -1877,6 +2311,312 @@ main:
         v.extend((0..2000).map(|_| Line::Insn("nop".into(), 4)));
         v.push(Line::Label("b".into()));
         assert_eq!(&relax_branches(&v)[..2], [true, true]);
+    }
+
+    #[test]
+    fn far_compare_branches_are_rewritten() {
+        let mut v = vec![Line::Branch {
+            op: "beq",
+            regs: "a0, t0",
+            target: "far".into(),
+        }];
+        v.extend((0..2000).map(|_| Line::Insn("nop".into(), 4)));
+        v.push(Line::Label("far".into()));
+        let mut out = String::new();
+        render(&v[..1], &relax_branches(&v)[..1], &mut out);
+        assert_eq!(out, "    bne   a0, t0, 1f\n    j     far\n1:\n");
+    }
+
+    #[test]
+    fn members_are_at_their_offsets() {
+        let s = "struct s { char c; int i; };";
+        assert_eq!(
+            main_body(s, "struct s v; v.i = 5;"),
+            "addi a0, s0, -16; addi a0, a0, 4; addi sp, sp, -4; sw a0, 0(sp); li a0, 5; lw a1, 0(sp); \
+             addi sp, sp, 4; sw a0, 0(a1); li a0, 0"
+        );
+        // `p->i` adds the offset to the pointer's value.
+        assert_eq!(
+            main_body(s, "struct s *p; return p->i;"),
+            "lw a0, -12(s0); addi a0, a0, 4; lw a0, 0(a0)"
+        );
+        // A struct's value is its address: `.c` at offset 0 adds nothing.
+        assert_eq!(
+            main_body(s, "struct s v; return v.c;"),
+            "addi a0, s0, -16; lbu a0, 0(a0)"
+        );
+    }
+
+    #[test]
+    fn struct_assignment_copies() {
+        // Word-aligned: one word at a time, unrolled.
+        assert_eq!(
+            main_body("struct s { int a, b; } x, y;", "x = y;"),
+            "la a0, x; addi sp, sp, -4; sw a0, 0(sp); la a0, y; lw a1, 0(sp); addi sp, sp, 4; \
+             lw t0, 0(a0); sw t0, 0(a1); lw t0, 4(a0); sw t0, 4(a1); mv a0, a1; li a0, 0"
+        );
+        // Aligned to 2: halves, so no access is misaligned.
+        assert!(main_body("struct s { short a, b, c; } x, y;", "x = y;").contains(
+            "lhu t0, 0(a0); sh t0, 0(a1); lhu t0, 2(a0); sh t0, 2(a1); lhu t0, 4(a0); sh t0, 4(a1)"
+        ));
+        // Big: a loop.
+        let body = main_body("struct s { int v[40]; } x, y;", "x = y;");
+        assert!(
+            body.contains(
+                "mv t1, a0; mv t2, a1; li t3, 160; add t3, t1, t3; lw t0, 0(t1); sw t0, 0(t2); \
+                 addi t1, t1, 4; addi t2, t2, 4; bltu t1, t3, 2b"
+            ),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn small_structs_travel_in_registers() {
+        let asm = compile(
+            "struct s { int a, b; }; struct s f(struct s x) { return x; }
+             int main() { struct s v; return f(v).b; }",
+        );
+        // The callee stores both words, and returns them from the struct's address.
+        assert_eq!(
+            body_of(&asm, "f")[4..],
+            [
+                "sw a0, -16(s0)",
+                "sw a1, -12(s0)",
+                "addi a0, s0, -16",
+                "mv t1, a0",
+                "lw a0, 0(t1)",
+                "lw a1, 4(t1)",
+            ]
+        );
+        // The caller loads them, and keeps the result in a hidden local.
+        assert_eq!(
+            body_of(&asm, "main")[5..].join("; "),
+            "addi a0, s0, -16; mv t1, a0; lw a0, 0(t1); lw a1, 4(t1); call f; sw a0, -24(s0); \
+             sw a1, -20(s0); addi a0, s0, -24; addi a0, a0, 4; lw a0, 0(a0)"
+        );
+        assert!(
+            asm.contains("#     -24(s0)  temp struct s (call result)\n"),
+            "{asm}"
+        );
+        // Aligned to less than a word: each word is put together from aligned pieces.
+        let asm =
+            compile("struct s { char c[3]; }; int f(struct s x); int main() { struct s v; return f(v); }");
+        assert!(
+            body_of(&asm, "main").join("; ").contains(
+                "mv t1, a0; lbu a0, 0(t1); lbu t0, 1(t1); slli t0, t0, 8; or a0, a0, t0; \
+                 lbu t0, 2(t1); slli t0, t0, 16; or a0, a0, t0; call f"
+            ),
+            "{asm}"
+        );
+    }
+
+    #[test]
+    fn big_structs_travel_by_reference() {
+        let asm = compile(
+            "struct b { int v[3]; }; struct b f(int k, struct b x) { return x; }
+             int main() { struct b v; return f(1, v).v[2]; }",
+        );
+        // The callee keeps the result's address (a0) and copies its argument
+        // from the caller's copy (a2: the result address took a0).
+        let f = body_of(&asm, "f").join("; ");
+        assert!(
+            f.starts_with(
+                "addi sp, sp, -16; sw ra, 12(sp); sw s0, 8(sp); addi s0, sp, 16; addi sp, sp, -16; \
+                 sw a0, -28(s0); sw a1, -12(s0); addi t4, s0, -24; lw t0, 0(a2); sw t0, 0(t4)"
+            ),
+            "{f}"
+        );
+        // `return x` copies x to where the caller asked.
+        assert!(
+            f.ends_with(
+                "addi a0, s0, -24; lw a1, -28(s0); lw t0, 0(a0); sw t0, 0(a1); lw t0, 4(a0); \
+                 sw t0, 4(a1); lw t0, 8(a0); sw t0, 8(a1)"
+            ),
+            "{f}"
+        );
+        // The caller copies the argument, passes the copy's address and the result's.
+        let main = body_of(&asm, "main").join("; ");
+        assert!(
+            main.contains(
+                "addi a0, s0, -20; addi a1, s0, -32; lw t0, 0(a0); sw t0, 0(a1); lw t0, 4(a0); \
+                 sw t0, 4(a1); lw t0, 8(a0); sw t0, 8(a1); mv a0, a1; mv a2, a0; lw a1, 0(sp); \
+                 addi sp, sp, 4; addi a0, s0, -44; call f; addi a0, s0, -44"
+            ),
+            "{main}"
+        );
+    }
+
+    #[test]
+    fn calls_through_pointers() {
+        let asm = compile("int f(int a, int b); int main() { int (*p)(int, int) = f; return p(1, 2); }");
+        assert_eq!(
+            body_of(&asm, "main")[4..].join("; "),
+            "la a0, f; sw a0, -12(s0); lw a0, -12(s0); addi sp, sp, -4; sw a0, 0(sp); li a0, 1; \
+             addi sp, sp, -4; sw a0, 0(sp); li a0, 2; mv a1, a0; lw a0, 0(sp); addi sp, sp, 4; \
+             lw t1, 0(sp); addi sp, sp, 4; jalr t1"
+        );
+        let asm = compile("int main() { int (*p)(void) = 0; return p(); }");
+        assert!(body_of(&asm, "main")
+            .join("; ")
+            .ends_with("lw a0, -12(s0); mv t1, a0; jalr t1"));
+        // A function table is data with relocations.
+        let asm = compile("int f(void); int g(void); int (*t[2])(void) = {f, g}; int main() { return 0; }");
+        assert!(asm.contains("t:\n    .word f\n    .word g\n"), "{asm}");
+    }
+
+    #[test]
+    fn switch_is_a_compare_chain() {
+        let asm = compile(
+            "int main(int x) { switch (x) { case 1: return 5; case -2: default: break; } return 0; }",
+        );
+        assert_eq!(
+            body_of(&asm, "main")[5..].join("; "),
+            "lw a0, -12(s0); li t0, 1; beq a0, t0, .L.case.main.0; li t0, -2; beq a0, t0, .L.case.main.1; \
+             j .L.case.main.2; li a0, 5; j .L.return.main; j .L.break.1; li a0, 0"
+        );
+        assert!(asm.contains("\n.L.case.main.1:\n.L.case.main.2:\n"), "{asm}");
+        // No default: past the body.
+        let asm = compile("int main(unsigned x) { switch (x) { case 0xffffffff: x = 1; } return x; }");
+        assert!(
+            body_of(&asm, "main")
+                .join("; ")
+                .contains("li t0, -1; beq a0, t0, .L.case.main.0; j .L.break.1"),
+            "{asm}"
+        );
+    }
+
+    #[test]
+    fn goto_jumps_to_function_labels() {
+        let asm = compile("int main() { goto out; out: return 1; }");
+        assert_eq!(body_of(&asm, "main")[4..], ["j .L.label.main.out", "li a0, 1"]);
+        assert!(asm.contains("\n.L.label.main.out:\n"), "{asm}");
+    }
+
+    #[test]
+    fn bool_conversions() {
+        let cast = |from: &str| {
+            body_of(
+                &compile(&format!("int main({from} x) {{ return (_Bool)x; }}")),
+                "main",
+            )[6..]
+                .join("; ")
+        };
+        assert_eq!(cast("int"), "snez a0, a0");
+        assert_eq!(cast("char *"), "snez a0, a0");
+        assert_eq!(cast("_Bool"), "");
+        assert_eq!(
+            main_body("", "_Bool b = 5; return b;"),
+            "li a0, 1; sb a0, -9(s0); lbu a0, -9(s0)"
+        );
+        // `b--` cannot be undone from the new value: the old one is kept in t1.
+        assert_eq!(
+            main_body("", "_Bool b; return b--;"),
+            "lbu a0, -9(s0); mv t1, a0; addi a0, a0, -1; snez a0, a0; sb a0, -9(s0); mv a0, t1"
+        );
+    }
+
+    #[test]
+    fn qualified_objects() {
+        let asm = compile(
+            "const int k = 3; const char msg[] = \"hi\"; const int z; volatile int v = 1; const volatile int cv = 2;
+             int main() { return k + v; }",
+        );
+        for want in [
+            "    .section .rodata\n\n    # const int k: 4 bytes\n    .globl k\n    .balign 4\nk:\n    .word 3\n",
+            "msg:\n    .ascii \"hi\"\n    .zero 1\n",
+            "z:\n    .zero 4\n",
+            "    .data\n\n    # volatile int v: 4 bytes\n",
+            "# const volatile int cv: 4 bytes",
+        ] {
+            assert!(asm.contains(want), "missing {want:?} in\n{asm}");
+        }
+        assert!(
+            !asm[asm.find("cv:").unwrap() - 200..].contains(".rodata"),
+            "{asm}"
+        );
+    }
+
+    /// Volatile objects are memory-mapped registers: every access in the
+    /// source must be exactly one load or store, in source order, even when
+    /// its value is discarded or it repeats the previous one. merlin has no
+    /// optimizer, so today this holds by construction; the test keeps it so.
+    #[test]
+    fn volatile_accesses_are_kept() {
+        // The loads and stores of `f` that do not go through sp or s0 (the
+        // frame and the expression stack): here, exactly the volatile ones.
+        let accesses = |src: &str, f: &str| -> Vec<String> {
+            body_of(&compile(src), f)
+                .into_iter()
+                .filter(|l| {
+                    let op = l.split(' ').next().unwrap();
+                    matches!(op, "lw" | "lh" | "lhu" | "lb" | "lbu" | "sw" | "sh" | "sb")
+                        && !l.ends_with("(sp)")
+                        && !l.ends_with("(s0)")
+                })
+                .collect()
+        };
+        // `v; v;` are two reads, `v = 1; v = 1;` two writes, `v + v` two
+        // more reads.
+        assert_eq!(
+            accesses(
+                "volatile int v; int main() { v; v; v = 1; v = 1; return v + v; }",
+                "main"
+            ),
+            [
+                "lw a0, 0(a0)",
+                "lw a0, 0(a0)",
+                "sw a0, 0(a1)",
+                "sw a0, 0(a1)",
+                "lw a0, 0(a0)",
+                "lw a0, 0(a0)"
+            ]
+        );
+        // Through a pointer to a volatile struct and a cast of an address,
+        // as a driver writes them.
+        let src = "struct regs { int status; short data; };
+             int g(volatile struct regs *r) {
+                 r->data; (void)r->status; r->data = 5; r->data = 5;
+                 *(volatile int *)0x10000000; *(volatile unsigned char *)0x10000000 |= 4;
+                 while (r->status & 1) {}
+                 return r->data + r->data;
+             }";
+        assert_eq!(
+            accesses(src, "g"),
+            [
+                "lh a0, 0(a0)",  // r->data;
+                "lw a0, 0(a0)",  // (void)r->status;
+                "sh a0, 0(a1)",  // r->data = 5;
+                "sh a0, 0(a1)",  // r->data = 5;
+                "lw a0, 0(a0)",  // *(volatile int *)0x10000000;
+                "lbu a0, 0(a0)", // ... |= 4 reads once
+                "sb a0, 0(a1)",  // and writes once
+                "lw a0, 0(a0)",  // r->status, in the loop condition
+                "lh a0, 0(a0)",  // r->data +
+                "lh a0, 0(a0)",  // r->data
+            ]
+        );
+    }
+
+    #[test]
+    fn struct_data() {
+        let asm = compile(
+            "struct s { char c; int i; short h[3]; }; struct s g = {1, 2, {3}}; union u { char c; int i; } w = {7};
+             int main() { return 0; }",
+        );
+        assert!(
+            asm.contains(
+                "g:\n    .byte 1\n    .zero 3\n    .word 2\n    .half 3\n    .zero 4\n    .zero 2\n"
+            ),
+            "{asm}"
+        );
+        assert!(asm.contains("w:\n    .byte 7\n    .zero 3\n"), "{asm}");
+    }
+
+    #[test]
+    fn inline_definitions_are_local() {
+        let asm = compile("inline int f(void) { return 1; } extern inline int g(void) { return 2; } int main() { return f(); }");
+        assert!(!asm.contains(".globl f"), "{asm}");
+        assert!(asm.contains(".globl g"), "{asm}");
     }
 
     #[test]
