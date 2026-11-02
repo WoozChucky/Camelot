@@ -470,7 +470,7 @@ struct tcp_sock *tcp_socket(int *err);
 int tcp_bind(struct tcp_sock *s, u32 port);
 
 /* Makes the bound socket `s` a listener: connections to its port wait for
- * accept(), at most `backlog` (1 to TCP_BACKLOG_MAX) at once; a SYN past
+ * accept(), at most `backlog` (taken as 1 to TCP_BACKLOG_MAX) at once; a SYN past
  * them is dropped, and the peer sends it again. -EINVAL unless `s` is
  * bound and not connected. */
 int tcp_listen(struct tcp_sock *s, u32 backlog);

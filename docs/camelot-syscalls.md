@@ -86,6 +86,7 @@ there is a filesystem to look it up in.
 | 24 | `netinfo` | `struct netinfo *info` | 0; `-ENODEV`, `-EFAULT` |
 | 25 | `netconf` | `uint addr, uint mask, uint gateway` | 0; `-ENODEV`, `-EINVAL` |
 | 26 | `ping` | `uint addr, uint seq, struct ping_reply *reply` | 0; `-ETIMEDOUT`, `-EHOSTUNREACH`, `-ENETUNREACH`, `-ENOBUFS`, `-ENODEV`, `-EINVAL`, `-EFAULT` |
+| 27 | `tcptest` | `uint op, uint a, uint b, uint c, struct tcptest_report *report` | 0, or a listener's handle; `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT`, `-ENETUNREACH`, `-EADDRINUSE`, `-ENOBUFS`, `-EINTR`, `-ENODEV`, `-EINVAL`, `-EFAULT` |
 
 **exit(status)** ends the caller. Its exit status is kept for its parent's
 `wait`; the slot and every page the process held are freed once the parent
@@ -316,14 +317,14 @@ describes the stack behind them. Addresses are `uint`s in host order
 (10.0.2.15 is 0x0a00020f). Without a network card each fails with
 `-ENODEV` (after the pointer check).
 
-**netinfo(info)** stores a `struct netinfo` (`user.h`, 104 bytes) at
+**netinfo(info)** stores a `struct netinfo` (`user.h`, 132 bytes) at
 `info`: the interface's MAC address, `flags` (`NETINFO_LINK` the card's
 link is up, `NETINFO_UP` it has an address, `NETINFO_DHCP` from DHCP),
 its address, netmask, default gateway and DNS server (0 when it has none),
-and `stats`, a `struct net_stats` of 20 counters: frames and bytes received
-and sent, then the frames and packets dropped, by reason
-(`docs/camelot-net.md`, "Counters"). `-EFAULT` if `info` is not 104
-writable bytes.
+and `stats`, a `struct net_stats` of 27 counters: frames and bytes received
+and sent, the frames and packets dropped, by reason, and what TCP's
+connections went through (`docs/camelot-net.md`, "Counters"). `-EFAULT` if
+`info` is not 132 writable bytes.
 
 **netconf(addr, mask, gateway)** gives the interface a static address,
 replacing what DHCP or the boot configuration gave it: `addr` with netmask
@@ -347,6 +348,31 @@ the last three seconds), `-ENETUNREACH` (the interface has no address, or
 free), `-EINVAL` (`addr` 0, or `seq` over 65535) and `-EFAULT` (`reply` is
 not 16 writable bytes; checked before anything is sent).
 
+**tcptest(op, a, b, c, report)** is temporary: it drives the kernel's TCP
+from a process until #85's socket calls replace it (`docs/camelot-net.md`,
+"Testing TCP until #85"; the `tcptest` program is its user). `op` is one of:
+
+- `TCPTEST_CONNECT` (`a` address, `b` port, `c` bytes): connects, sends `c`
+  bytes of a fixed pattern (byte `i` is `i ^ i >> 8 ^ i >> 16`), ends its
+  side and reads until the other side ends its own, then closes;
+- `TCPTEST_LISTEN` (`a` port, `b` backlog, taken as 1 to 8): a listener, held by the
+  caller until `TCPTEST_CLOSE` or its exit; returns its handle (0 to 3);
+- `TCPTEST_ACCEPT` (`a` handle): waits for a connection, sends back what it
+  sends until it ends its side, then closes it;
+- `TCPTEST_CLOSE` (`a` handle): closes the listener, resetting the
+  connections still waiting in its backlog.
+
+`CONNECT` and `ACCEPT` store a `struct tcptest_report` (`user.h`, 28
+bytes) at `report`, even when they fail: the connection's two ends (all 0
+if it never had them), the bytes sent and received, and the FNV-1a hash of
+what was received. The other two ignore `report`. Errors: what ended the
+connection (`-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT`), `-ENETUNREACH`
+(no route), `-EADDRINUSE` (a port with a listener), `-ENOBUFS` (no socket,
+handle or memory left), `-EINTR` (the process was killed while it waited),
+`-EINVAL` (an unknown `op`, a handle the caller doesn't hold, a port of 0 or
+over 65535, an address no connection can go to) and `-EFAULT` (`report` is not 28
+writable bytes, for `CONNECT` and `ACCEPT`; checked first).
+
 ## Error numbers
 
 Linux's values for the same conditions.
@@ -356,6 +382,7 @@ Linux's values for the same conditions.
 | 1 | `EPERM` | link: not for a directory; kill: a kernel process, or the shell |
 | 2 | `ENOENT` | no such file or directory |
 | 3 | `ESRCH` | kill: no such process |
+| 4 | `EINTR` | a wait ended because the process was killed |
 | 7 | `E2BIG` | spawn, exec: argument list too long |
 | 8 | `ENOEXEC` | spawn, exec: the file is not a valid executable |
 | 9 | `EBADF` | not an open descriptor, or not open for that |
@@ -382,8 +409,12 @@ Linux's values for the same conditions.
 | 90 | `EMSGSIZE` | a datagram too big for one packet (the kernel's UDP API) |
 | 98 | `EADDRINUSE` | a UDP port that is taken (the kernel's UDP API) |
 | 101 | `ENETUNREACH` | no route: the interface has no address, or no gateway |
+| 104 | `ECONNRESET` | TCP: the peer reset the connection |
 | 105 | `ENOBUFS` | the network's buffers or sockets are all in use |
-| 110 | `ETIMEDOUT` | ping: no reply in time |
+| 106 | `EISCONN` | TCP: the socket is connected already (the kernel's TCP API) |
+| 107 | `ENOTCONN` | TCP: the socket is not connected (the kernel's TCP API) |
+| 110 | `ETIMEDOUT` | ping: no reply in time; TCP: the peer stopped answering |
+| 111 | `ECONNREFUSED` | TCP: nothing listens on that port |
 | 113 | `EHOSTUNREACH` | ARP got no answer from the address |
 
 `strerror` in `kernel/user/lib/strerror.c` has a short message for each.
@@ -526,7 +557,7 @@ calls above (the stubs in `usys.s`, which return the raw result, a negative
 error number included), their constants and structures (`O_*`, `SEEK_*`,
 `struct stat`, `struct dirent`, `T_*`, `struct procinfo`, `PROC_*`,
 `struct netinfo`, `struct net_stats`, `NETINFO_*`, `struct ping_reply`,
-`MAXPATH`, `DIRSIZ`) and the C library in `kernel/user/lib/`, described in
+`TCPTEST_*`, `struct tcptest_report`, `MAXPATH`, `DIRSIZ`) and the C library in `kernel/user/lib/`, described in
 its `README.md`: strings and memory (`strlen`, `strcmp`, `strncmp`,
 `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`,
 `memmove`, `memcmp`), numbers (`atoi`, `strtol`), the heap (`malloc`,
