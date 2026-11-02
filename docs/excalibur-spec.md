@@ -119,9 +119,9 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 |---|---|
 | 0x0000_1000 - 0x0000_1FFF | Boot ROM (reset vector 0x1000, jumps to 0x8000_0000) |
 | 0x0200_0000 - 0x0200_FFFF | CLINT: msip @+0x0, mtimecmp @+0x4000, mtime @+0xBFF8 |
-| 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART and keyboard (section 7.1) |
+| 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART, keyboard and disks (section 7.1) |
 | 0x1000_0000 - 0x1000_00FF | UART, 16550-compatible subset (THR/RBR @+0, IER @+1, IIR @+2, LSR @+5) |
-| 0x1000_1000 - 0x1000_1FFF | Reserved: virtio block device (later, for a filesystem) |
+| 0x1000_1000 - 0x1000_8FFF | Block devices: disk `i` at 0x1000_1000 + 0x1000·i, up to 8 (`--disk`; Xcal, section 9.6). Only the pages of attached disks are mapped |
 | 0x0010_0000 | Test/exit device: write 0x5555 = pass/exit, 0x3333 = fail (used by riscv-tests) |
 | 0x3000_0000 - 0x3000_0FFF | Framebuffer control (Xcal, section 9.3) |
 | 0x3000_1000 - 0x3000_1FFF | Keyboard (Xcal, section 9.4) |
@@ -151,7 +151,8 @@ A minimal RISC-V PLIC (riscv-plic-spec) with the QEMU `virt` register layout: on
 | 0 | none ("no interrupt" when claimed) |
 | 1 | UART receive (section 7) |
 | 2 | Keyboard (section 9.4) |
-| 3-31 | unused, never asserted |
+| 3-10 | Disks 0-7: disk `i` is source 3 + `i` (section 9.6) |
+| 11-31 | unused, never asserted |
 
 QEMU `virt` puts UART0 on source 10; Excalibur numbers its few devices from 1 instead, so drivers must take the source numbers from this table rather than from `virt` device trees.
 
@@ -294,10 +295,49 @@ Device table entry `i` (for `i` < `SYS_DEV_COUNT`; at most 252 fit in the page):
 | 6 | Framebuffer VRAM (section 9.3) |
 | 7 | Sysinfo (this block) |
 | 8 | Keyboard (section 9.4) |
+| 9 | Block device, one entry per disk (section 9.6) |
 
-Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device (block storage, say) gets the next code and an entry, with no new registers and no change to this layout. Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), framebuffer control, keyboard (irq 2), sysinfo and VRAM; `examples/sysinfo` prints the table.
+Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device gets the next code and an entry, with no new registers and no change to this layout (the block device, type 9, was added this way). Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), one block device per disk (disk `i` at 0x1000_1000 + 0x1000·`i`, irq 3 + `i`; none without `--disk`), framebuffer control, keyboard (irq 2), sysinfo and VRAM; `examples/sysinfo` prints the table.
 
 The registers are 32-bit only: byte or halfword accesses raise access faults. Word writes are ignored, as for the framebuffer's read-only registers. Offsets past the last entry read as 0.
+
+### 9.6 Block device (MMIO)
+
+Disks of 512-byte sectors. A machine has 0 to 8 of them, in the order they are given (`grail --disk IMG`, repeatable; `MachineConfig::disks` for a host using Grail as a library). Disk `i` has a 4 KiB page of registers at 0x1000_1000 + 0x1000·`i` and interrupts on PLIC source 3 + `i`, and it has an entry of type 9 in the sysinfo device table (section 9.5), which is how software finds it. The pages of disks the machine does not have are unmapped.
+
+The interface is one command at a time with DMA: software writes the first sector, the buffer's address in RAM and the sector count, then a command; the device copies the sectors between the disk and RAM itself, sets `BLK_STATUS.DONE` and, if enabled, raises its interrupt. The memory map used to reserve this slot for a virtio-blk device. Virtio was set aside because a driver must negotiate features and build a virtqueue in guest memory (descriptor table, available ring, used ring) behind the virtio-mmio transport registers before the first sector moves, while a driver for this device is about twenty instructions (`examples/disk`) that a first kernel driver can copy. Having only one request in flight costs nothing in an emulator that finishes each request at once. A queued device can still be added later as a new type code.
+
+| Offset | Register | Notes |
+|---|---|---|
+| +0x00 | `BLK_CAPACITY` (RO) | disk size in sectors (at most 2^32 - 1, just under 2 TiB) |
+| +0x04 | `BLK_FLAGS` (RO) | bit 0 = the disk is read-only. Other bits read as 0 |
+| +0x08 | `BLK_SECTOR` | first sector of the transfer |
+| +0x0C | `BLK_DMA` | physical address of the buffer in RAM |
+| +0x10 | `BLK_COUNT` | number of sectors to transfer |
+| +0x14 | `BLK_CMD` (WO) | writing a command runs it: 1 = read (disk to RAM), 2 = write (RAM to disk), 3 = flush. Reads as 0 |
+| +0x18 | `BLK_STATUS` | bit 0 = BUSY (read-only); bit 1 = DONE: a command finished and has not been acknowledged. Writing 1 to bit 1 clears it; other bits ignore writes |
+| +0x1C | `BLK_ERROR` (RO) | outcome of the last command, below |
+| +0x20 | `BLK_CTRL` | bit 0 = completion interrupt enable. Other bits read as 0 |
+
+| `BLK_ERROR` | Meaning |
+|---|---|
+| 0 | none: the command worked |
+| 1 | unknown command |
+| 2 | out of range: `BLK_SECTOR + BLK_COUNT` is past `BLK_CAPACITY` |
+| 3 | bad buffer: the `BLK_COUNT` × 512 bytes at `BLK_DMA` are not all in RAM |
+| 4 | write to a read-only disk |
+| 5 | I/O error on the host side (the backend failed) |
+
+Details:
+
+- The registers are 32-bit only: byte or halfword accesses in a disk's page raise access faults and run nothing. Unused offsets read as 0 and ignore writes, as do writes to the read-only registers. Everything writable resets to 0. `BLK_SECTOR`, `BLK_DMA` and `BLK_COUNT` keep their values after a command.
+- **Commands complete at once.** Grail runs a command to completion during the store to `BLK_CMD`, so BUSY never reads 1 and DONE is already set when the next instruction runs. BUSY is defined anyway, so that a driver which waits for BUSY to clear or for DONE (by polling or by interrupt) also works with a disk that takes time. A command written while BUSY is set is ignored. Every command written sets DONE and `BLK_ERROR`, failed ones included.
+- **Checks come first**, in the order of the error codes (1 to 4), before any data moves: a command that fails one transfers nothing. The range check is done without overflow, so a huge `BLK_SECTOR` or `BLK_COUNT` fails with 2 instead of wrapping. The buffer must lie in RAM (not VRAM, the boot ROM or device registers); it may start at any byte address. `BLK_DMA` is a physical address: the device does not use the MMU. With `BLK_COUNT` 0 a read or write transfers nothing, and succeeds if the checks pass (`BLK_SECTOR` at most `BLK_CAPACITY`, `BLK_DMA` in RAM or just past its end). Only error 5 can leave a transfer half done. Nothing a program writes makes the host panic or touches memory outside the buffer.
+- **Flush** ignores `BLK_SECTOR`, `BLK_DMA` and `BLK_COUNT`, and completes once every earlier write is durable on the host (for an image file, the host OS has written it to its own disk). It succeeds on a read-only disk.
+- **Interrupt**: a disk holds its PLIC source high while `BLK_CTRL.0` and `BLK_STATUS.DONE` are both set. A handler claims the source, reads `BLK_ERROR`, writes 2 to `BLK_STATUS` (which lowers the line) and completes. If it completes without acknowledging, the source is pending again at once (section 7.1).
+- **Backends.** Where a disk's sectors live is up to the host: Grail gives each disk of each machine its own backend (`BlockBackend` in the grail library: capacity, read, write, flush). `--disk IMG` uses an image file on the host, `--disk-ro IMG` the same file opened read-only (`BLK_FLAGS.0` set); tests use in-memory disks, and a host can hand Grail backends of its own (`Machine::with_backends`; the Lake storage server will add a network one). An image is raw: sector `n` is bytes 512·`n` to 512·`n` + 511 of the file. Its size must be a whole number of sectors, or Grail refuses to start; it never grows. Writes go to the file as they happen. Grail does not lock images, so two machines must not attach the same image read-write.
+
+`examples/disk` finds the first disk in the device table, prints its sector 0 as text, checks that a read past the end fails with error 2, and runs a write/read-back test on the last sector (saving and restoring it), waiting for the completion interrupt after every command: `grail --disk examples/disk/disk.img examples/disk/disk.elf`.
 
 ## 10. Toolchain (all our own)
 
@@ -462,7 +502,7 @@ Kernel C stays inside what Merlin will compile: no libc headers (`-nostdinc`), n
 4. **merlin-as** emitting ELF `.o`. Validate with `llvm-objdump` and ld.lld.
 5. **merlin-ld**. Validate against clang-produced objects.
 6. **Bare-metal hello world** written in our assembly, built entirely with our tools.
-7. **M extension** in merlin-as (Grail already passes rv32um). **Xcal devices** in Grail: framebuffer window and keyboard via Win32 FFI, sysinfo, and a configurable machine (RAM size, real-time clock) that a host can run several of.
+7. **M extension** in merlin-as (Grail already passes rv32um). **Xcal devices** in Grail: framebuffer window and keyboard via Win32 FFI, sysinfo, block devices with pluggable backends, and a configurable machine (RAM size, real-time clock, disks) that a host can run several of.
 8. **Merlin v0**: C subset → assembly. Grow it test by test.
 9. **Camelot kernel** in C (clang first, our compiler as it catches up): trap handling, timer, UART driver, then paging (Sv32), processes, syscalls.
 10. **Self-hosting stretch goal**: our tools running on our OS.

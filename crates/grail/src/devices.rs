@@ -64,6 +64,9 @@ impl Clint {
 pub const UART_IRQ: u32 = 1;
 /// PLIC interrupt source of the keyboard's "event available" line (spec section 9.4).
 pub const KBD_IRQ: u32 = 2;
+/// PLIC interrupt source of disk 0's completion line; disk `i` uses `BLK_IRQ + i`
+/// (spec section 9.6).
+pub const BLK_IRQ: u32 = 3;
 
 /// Interrupt sources 1..=31 exist; source 0 means "no interrupt".
 pub const PLIC_SOURCES: u32 = 32;
