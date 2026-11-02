@@ -8,13 +8,15 @@
 //! change a hart between steps (its pc, to make it fault, skip a call or make
 //! one).
 
+mod common;
+
 use camelot_fs::fsck;
+use common::*;
 use grail::cpu::{Cpu, Mode};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::mpsc::Receiver;
 use xtask::kernel;
 use xtask::repo_root;
 
@@ -46,149 +48,13 @@ tick 10
 );
 
 const SHELL_BANNER: &str = "Type help for the list of commands.\n";
-const PROMPT: &str = "$ ";
 
 /// mtime ticks between timer interrupts: the 10 MHz timebase / 10 Hz.
 const TICK_INTERVAL: u64 = 1_000_000;
 
-/// Enough steps for a boot and a few programs (kernel.rs's budget). Each step
-/// runs every hart one instruction.
-const RUN_MAX_STEPS: u64 = 150_000_000;
-
-// Kernel layouts, from the headers named in each comment.
-
-/// `sizeof(struct cpu)` (`CPU_SIZE` in kernel/include/spinlock.h): hart `h`'s
-/// entry is at `cpus + h * CPU_SIZE`.
-const CPU_SIZE: u32 = 88;
-/// Offsets in `struct cpu`: the running process and the push_off() depth.
-const CPU_PROC: u32 = 0;
-const CPU_NOFF: u32 = 4;
-/// Offset of the holding cpu in `struct spinlock`.
-const LOCK_CPU: u32 = 4;
-/// Offsets in `struct proc` (kernel/include/proc.h): its name (16 bytes) and
-/// its parent.
-const PROC_NAME: u32 = 8;
-const PROC_PARENT: u32 = 24;
-
-/// The kernel's spinlocks that are variables of their own (kernel.rs's list).
-const NAMED_LOCKS: [&str; 9] = [
-    "kmem_lock",
-    "proc_lock",
-    "tickslock",
-    "cons_lock",
-    "uart_tx_lock",
-    "ftable_lock",
-    "bcache_lock",
-    "itable_lock",
-    "net_lock",
-];
-
-fn committed_elf() -> Vec<u8> {
-    let path = repo_root().join("kernel/kernel.elf");
-    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
-
-fn on_harts(harts: usize) -> MachineConfig {
-    MachineConfig {
-        harts,
-        ..MachineConfig::default()
-    }
-}
-
-/// Loads the committed kernel on a machine of `harts` harts, the UART reading
-/// `input`.
-fn load(harts: usize, input: Receiver<u8>) -> (Machine, grail::elf::Elf) {
-    let file = committed_elf();
-    let elf = grail::elf::parse(&file).unwrap();
-    let mut m = Machine::new(on_harts(harts)).unwrap();
-    m.cpu.bus.uart.capture = true;
-    m.load_elf(&file).unwrap();
-    m.set_uart_input(input);
-    (m, elf)
-}
-
-fn printed(m: &Machine) -> String {
-    String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned()
-}
-
-fn sym(elf: &grail::elf::Elf, name: &str) -> u32 {
-    elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"))
-}
-
-/// The addresses of function `name` in the committed kernel.
-fn function(name: &str) -> Range<u32> {
-    let file = committed_elf();
-    let s = elf32::Elf::parse(&file)
-        .unwrap()
-        .symbols()
-        .unwrap()
-        .into_iter()
-        .find(|s| s.name == name)
-        .unwrap_or_else(|| panic!("no symbol {name}"));
-    assert!(s.size > 0, "{name} has no size");
-    s.value..s.value + s.size
-}
-
-fn peek_byte(cpu: &Cpu, addr: u32) -> u8 {
-    (cpu.bus.peek(addr & !3).unwrap() >> (8 * (addr & 3))) as u8
-}
-
-fn proc_name(cpu: &Cpu, p: u32) -> String {
-    let bytes: Vec<u8> = (0..16)
-        .map(|i| peek_byte(cpu, p + PROC_NAME + i))
-        .take_while(|&b| b != 0)
-        .collect();
-    String::from_utf8(bytes).unwrap()
-}
-
 /// The process running on the hart whose turn it is (0 for none).
 fn running(cpu: &Cpu, cpus: u32) -> u32 {
     cpu.bus.peek(cpus + cpu.id * CPU_SIZE + CPU_PROC).unwrap()
-}
-
-/// The lines between the last echo of `command` and the next prompt.
-fn command_output<'a>(out: &'a str, command: &str) -> Vec<&'a str> {
-    let start = format!("{PROMPT}{command}\n");
-    let at = out
-        .rfind(&start)
-        .unwrap_or_else(|| panic!("no `{command}` in:\n{out}"))
-        + start.len();
-    let rest = &out[at..];
-    rest[..rest
-        .find(PROMPT)
-        .unwrap_or_else(|| panic!("`{command}` never ended:\n{out}"))]
-        .lines()
-        .collect()
-}
-
-/// Steps `m` until the shell has printed its first prompt.
-fn step_to_prompt(m: &mut Machine) {
-    for _ in 0..RUN_MAX_STEPS {
-        if m.cpu.bus.uart.captured.ends_with(PROMPT.as_bytes()) {
-            return;
-        }
-        m.cpu.step();
-    }
-    panic!("no prompt:\n{}", printed(m));
-}
-
-/// Types `line` and steps `m`, calling `each` before every hart's turn,
-/// until the shell prompts again.
-fn run_command(m: &mut Machine, tx: &std::sync::mpsc::Sender<u8>, line: &str, mut each: impl FnMut(&Cpu)) {
-    for b in format!("{line}\n").bytes() {
-        tx.send(b).unwrap();
-    }
-    let from = m.cpu.bus.uart.captured.len();
-    let mut steps = 0;
-    while !m.cpu.bus.uart.captured[from..].ends_with(PROMPT.as_bytes()) {
-        assert!(steps < RUN_MAX_STEPS, "`{line}` never ended:\n{}", printed(m));
-        m.cpu.step_traced(&mut each);
-        steps += 1;
-    }
-}
-
-fn free_pages(m: &Machine, elf: &grail::elf::Elf) -> u32 {
-    m.cpu.bus.peek(sym(elf, "nfree")).unwrap()
 }
 
 /// One line of the `harts` program: hart, pid (None while idle), ticks and
@@ -391,9 +257,6 @@ fn a_shootdown_waits_for_a_hart_slow_to_flush() {
     assert!(out.contains("\nsmp: 4 harts running\n"), "{out}");
     assert!(!out.contains("missed"), "{out}");
 }
-
-/// Offset of `pagetable` in `struct cpu` (kernel/include/spinlock.h).
-const CPU_PAGETABLE: u32 = 72;
 
 #[test]
 fn a_kernel_shootdown_reaches_harts_running_processes() {
@@ -706,50 +569,6 @@ fn primes_workers_run_side_by_side_on_four_harts() {
         tx.send(*b).unwrap();
     }
     assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
-}
-
-/// Watches every hart's locking state, as kernel.rs's LockWatch does hart
-/// 0's: whenever a hart enters U-mode, it holds no spinlock (no named lock's
-/// cpu is its own) and has no push_off() pending. Other harts may hold
-/// locks meanwhile.
-struct LockWatch {
-    cpus: u32,
-    locks: Vec<(&'static str, u32)>,
-    was_user: [bool; grail::MAX_HARTS],
-}
-
-impl LockWatch {
-    fn new(elf: &grail::elf::Elf) -> LockWatch {
-        LockWatch {
-            cpus: sym(elf, "cpus"),
-            locks: NAMED_LOCKS.iter().map(|&n| (n, sym(elf, n))).collect(),
-            was_user: [false; grail::MAX_HARTS],
-        }
-    }
-
-    /// Called before each hart's turn.
-    fn step(&mut self, cpu: &Cpu) {
-        let h = cpu.id as usize;
-        let is_user = cpu.mode == Mode::U;
-        if is_user && !self.was_user[h] {
-            let me = self.cpus + cpu.id * CPU_SIZE;
-            assert_eq!(
-                cpu.bus.peek(me + CPU_NOFF),
-                Some(0),
-                "push_off() depth on hart {h} in U-mode at {:#x}",
-                cpu.pc
-            );
-            for &(name, lock) in &self.locks {
-                assert_ne!(
-                    cpu.bus.peek(lock + LOCK_CPU),
-                    Some(me),
-                    "{name} held by hart {h} in U-mode at {:#x}",
-                    cpu.pc
-                );
-            }
-        }
-        self.was_user[h] = is_user;
-    }
 }
 
 /// Checks stress's output for `workers` workers and `rounds` rounds

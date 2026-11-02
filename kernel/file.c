@@ -142,7 +142,14 @@ static int inode_read(struct file *f, pagetable_t pt, u32 dst, u32 n) {
         if (r <= 0) {
             break; /* the end of the file */
         }
-        copyout(pt, dst + done, buf, (u32)r);
+        /* Checked by fileread(), but another thread may have unmapped the
+         * buffer since (sbrk): the read stops short, the offset left after
+         * what was copied. */
+        if (copyout(pt, dst + done, buf, (u32)r) != 0) {
+            iunlock(f->ip);
+            kfree(buf);
+            return done > 0 ? (int)done : -EFAULT;
+        }
         f->off += (u32)r;
         done += (u32)r;
         if ((u32)r < m) {
@@ -164,7 +171,12 @@ static int inode_write(struct file *f, pagetable_t pt, u32 src, u32 n) {
     int err = 0;
     while (done < n) {
         u32 m = MIN(n - done, MAXWRITE);
-        copyin(pt, buf, src + done, m);
+        /* As in inode_read: never write a chunk that wasn't copied in (the
+         * page holds whatever it held last). */
+        if (copyin(pt, buf, src + done, m) != 0) {
+            err = -EFAULT;
+            break;
+        }
         begin_op();
         ilock(f->ip);
         int r = writei(f->ip, buf, f->off, m);

@@ -135,7 +135,11 @@ int console_write(pagetable_t pt, u32 src, u32 n) {
     char chunk[WRITE_CHUNK];
     for (u32 done = 0; done < n;) {
         u32 count = n - done < WRITE_CHUNK ? n - done : WRITE_CHUNK;
-        copyin(pt, chunk, src + done, count);
+        /* Checked above, but another thread of the process may have
+         * unmapped part of the buffer since (sbrk). */
+        if (copyin(pt, chunk, src + done, count) != 0) {
+            return done > 0 ? (int)done : -EFAULT;
+        }
         acquire(&uart_tx_lock);
         for (u32 i = 0; i < count; i++) {
             uart_putc(chunk[i]);

@@ -96,7 +96,14 @@ int pipewrite(struct pipe *p, pagetable_t pt, u32 src, u32 n) {
         /* As much as fits before the end of the ring. */
         u32 at = p->nwrite % PIPESIZE;
         u32 m = MIN(MIN(n - done, PIPESIZE - used), PIPESIZE - at);
-        copyin(pt, p->data + at, src + done, m);
+        /* The caller checked the buffer, but another thread of the process
+         * may have unmapped part of it since (sbrk): what is left of the
+         * write fails, and the reader never sees what wasn't copied. */
+        if (copyin(pt, p->data + at, src + done, m) != 0) {
+            wakeup(&p->nread);
+            release(&p->lock);
+            return done > 0 ? (int)done : -EFAULT;
+        }
         p->nwrite += m;
         done += m;
     }
@@ -114,7 +121,14 @@ int piperead(struct pipe *p, pagetable_t pt, u32 dst, u32 n) {
     while (count < n && p->nread != p->nwrite) {
         u32 at = p->nread % PIPESIZE;
         u32 m = MIN(MIN(n - count, p->nwrite - p->nread), PIPESIZE - at);
-        copyout(pt, dst + count, p->data + at, m);
+        /* As in pipewrite: bytes that couldn't be copied stay in the pipe. */
+        if (copyout(pt, dst + count, p->data + at, m) != 0) {
+            if (count == 0) {
+                release(&p->lock);
+                return -EFAULT;
+            }
+            break;
+        }
         p->nread += m;
         count += m;
     }

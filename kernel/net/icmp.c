@@ -31,9 +31,9 @@ struct ping_wait {
     struct ping_reply reply;
 };
 
-/* One per process slot is enough: a process waits for one reply at a
+/* One per thread slot is enough: a thread waits for one reply at a
  * time. */
-#define PING_WAITS NPROC
+#define PING_WAITS NTHREAD
 
 static struct ping_wait waits[PING_WAITS];
 
