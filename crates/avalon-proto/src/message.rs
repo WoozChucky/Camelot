@@ -121,6 +121,17 @@ pub fn type_name(code: u16) -> String {
     }
 }
 
+/// The kind of message type `code`, or `None` if it is not in the catalogue. Useful
+/// when a frame fails to decode: a server answers a bad request with an `Error` reply
+/// but never answers a bad event, and a client waiting for a reply can tell a bad event
+/// (set aside) from a bad reply (the answer to its request).
+pub fn kind_of(code: u16) -> Option<MessageKind> {
+    CATALOGUE
+        .iter()
+        .find(|(c, _, _)| *c == code)
+        .map(|(_, _, kind)| *kind)
+}
+
 /// How a message is used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
@@ -216,6 +227,10 @@ pub enum VmRef {
 
 impl VmRef {
     /// Parses a command-line VM argument: all digits is an id, anything else a name.
+    /// Valid names are never all digits ([`validate_name`]), so every VM can be named
+    /// this way.
+    ///
+    /// [`validate_name`]: crate::validate_name
     pub fn parse(s: &str) -> VmRef {
         match s.parse() {
             Ok(id) if s.bytes().all(|b| b.is_ascii_digit()) => VmRef::Id(id),
@@ -330,7 +345,8 @@ pub enum ErrorCode {
     /// The message type is not in the catalogue.
     UnknownMessage,
     /// A valid message that is not allowed here: not `Hello` before the handshake, a
-    /// reply sent as a request, an event in the wrong direction.
+    /// reply sent by a client. (Events are never answered, even in the wrong
+    /// direction.)
     Unexpected,
     /// This server does not serve that message group (Lake asked to create a VM).
     Unsupported,
@@ -360,7 +376,8 @@ pub enum ErrorCode {
     Io,
     /// A bug or unexpected condition in the server.
     Internal,
-    /// A code this version does not know.
+    /// A code this version does not know. Never the number of a named code:
+    /// [`Message::check`] refuses `Other(5)`, which would decode as `NoSuchVm`.
     Other(u16),
 }
 
@@ -669,12 +686,7 @@ impl Message {
     }
 
     pub fn kind(&self) -> MessageKind {
-        let code = self.type_code();
-        CATALOGUE
-            .iter()
-            .find(|(c, _, _)| *c == code)
-            .expect("every message is catalogued")
-            .2
+        kind_of(self.type_code()).expect("every message is catalogued")
     }
 
     pub fn name(&self) -> &'static str {
@@ -712,6 +724,15 @@ impl Message {
                         pixels.len()
                     ));
                 }
+            }
+            Message::Error {
+                code: ErrorCode::Other(n),
+                ..
+            } if ErrorCode::from_u16(*n) != ErrorCode::Other(*n) => {
+                return invalid(format!(
+                    "error code Other({n}) is {:?}; use the named code",
+                    ErrorCode::from_u16(*n)
+                ));
             }
             Message::KeyInput { key, .. } if key.code == 0 => return invalid("key code 0".into()),
             Message::BlockRead { count, .. } if !(1..=MAX_BLOCK_SECTORS).contains(count) => {

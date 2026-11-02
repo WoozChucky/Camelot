@@ -9,7 +9,7 @@ The wire protocol of the Avalon platform. Every program in it speaks this protoc
 | **Herald** | attaches to one VM | uses console, screen and input |
 | **Lake** | storage server: serves disk images | serves session, block I/O, disk management |
 
-The implementation is the `avalon-proto` crate (`crates/avalon-proto`): the messages as Rust types, `encode`/`decode`, and a blocking `Connection` over any `Read + Write`. This document and the crate must agree; `crates/avalon-proto/tests/roundtrip.rs` checks some layouts byte for byte.
+The implementation is the `avalon-proto` crate (`crates/avalon-proto`): the messages as Rust types, `encode`/`decode`, and a blocking `Connection` over any `Read + Write`. This document and the crate must agree; `crates/avalon-proto/tests/spec.rs` checks the type codes, the error codes and one layout of every message byte for byte against the tables below.
 
 ## 1. Transport
 
@@ -33,7 +33,7 @@ Every message travels in one frame:
 - The payload is binary, in the layout of that message type. Console bytes, pixels and disk blocks are carried as they are: no escaping, no text encoding.
 - The 6 bytes before the payload are the header (`HEADER_LEN`).
 
-The maximum frame size bounds what a peer can make the other side allocate: a receiver checks the length before reading the body and never allocates more than the length says. For scale: a full 640×480 screen is 1 228 800 bytes, a block request at most 1 MiB, and the rest is room for program images.
+The maximum frame size bounds what a peer can make the other side allocate: a receiver checks the length before reading the body and never reserves more than the length says for it. Decoding the payload then takes memory in proportion to the payload, never to a count written in it (section 3). For scale: a full 640×480 screen is 1 228 800 bytes, a block request at most 1 MiB, and the rest is room for program images.
 
 Receiving:
 
@@ -46,7 +46,7 @@ Receiving:
 | unknown `type` | `UnknownType`; the frame is consumed | in step |
 | payload that does not decode (section 3) | `Truncated`, `TrailingBytes` or `Invalid`; the frame is consumed | in step |
 
-Because a whole frame is read before its payload is decoded, a bad payload never desynchronises the stream: a server answers it with an `Error` reply (`Malformed` or `UnknownMessage`) and carries on. Only an oversize length, a broken transport or a failed handshake ends a connection.
+Because a whole frame is read before its payload is decoded, a bad payload never desynchronises the stream: a server answers it with an `Error` reply (`Malformed` or `UnknownMessage`), unless its type is an event (section 4), and carries on. Only an oversize length, a broken transport or a failed handshake ends a connection.
 
 Sending: a message that would make a frame larger than 16 MiB, or that breaks a rule of section 3, is refused by the encoder (nothing is written). A frame is written with a single write, then flushed.
 
@@ -66,7 +66,7 @@ Payloads are sequences of fields, in the order the message tables list them, wit
 
 Decoding is strict:
 
-- A payload that ends before its message does is **truncated**. Lengths and counts are checked against the bytes left before anything is allocated, so a forged count of 4 billion costs nothing.
+- A payload that ends before its message does is **truncated**. Lengths and counts are checked against the bytes left before anything is read. An element of a list can take many times more memory than its bytes on the wire, so a count never sizes a memory reservation on its own (the crate reserves at most 1024 elements, and no more bytes than are left, before decoding them): a forged count of 4 billion costs nothing.
 - Bytes left over after the message are **trailing bytes**, an error.
 - With these rules the encoding is canonical: each message has exactly one encoding, and decoding then re-encoding gives back the same bytes (the fuzz tests check this).
 
@@ -77,6 +77,7 @@ Rules beyond the field types, enforced by both the encoder and the decoder (`Mes
 - `BlockRead`: `count` from 1 to `MAX_BLOCK_SECTORS` (2048).
 - `BlockData`, `BlockWrite`: `data` a non-zero whole number of 512-byte sectors, at most 2048 sectors (1 MiB).
 - `Hello`: the payload starts with the magic `"AVLN"`.
+- `Error`: the crate's `ErrorCode::Other(n)` stands for a code this version has no name for, so it may not carry a named code's number (it would decode as the named code).
 
 Other values (names, hardware profiles, ids, sector numbers) are checked by the server, which answers with a precise error code (section 5) rather than `Malformed`.
 
@@ -89,7 +90,7 @@ Other values (names, hardware profiles, ids, sector numbers) are checked by the 
 | 0 | by id | `id: u32` |
 | 1 | by name | `name: string` |
 
-Round Table and Herald take a VM argument that is all digits as an id, anything else as a name.
+Round Table and Herald take a VM argument that is all digits as an id, anything else as a name. Names are never all digits (see **Names**), so every VM can be named either way.
 
 **VmState**:
 
@@ -133,7 +134,13 @@ The guest reads these values from its sysinfo block (Excalibur spec section 9.5)
 
 **DiskInfo**: `name: string`, `sectors: u64` (512-byte sectors), `readers: u32` (read-only attachments now), `writer: bool` (a writer has it attached).
 
-**Names**: VM and disk names are 1 to 64 bytes of ASCII letters, digits, `.`, `_` and `-`, not starting with `.` or `-` (`validate_name`). Disk names are file names on Lake's host, so they can never name a path. A request with any other name gets `InvalidName`.
+**Names**: VM and disk names (`validate_name`) are 1 to 64 bytes of lowercase ASCII letters, digits, `.`, `_` and `-`, and
+
+- do not start with `.` or `-`, and do not end with `.`;
+- are not all digits (an all-digit argument is a VM id);
+- are not a Windows device name, alone or before a `.`: `con`, `prn`, `aux`, `nul`, `com0` to `com9`, `lpt0` to `lpt9` (so `nul` and `com1.img` are refused).
+
+Disk names are file names on Lake's host, and the rule makes each one a plain file of its own on Windows too: no path, no device, and no two names reaching the same file (Windows ignores case and trailing dots, so `disk`, `Disk` and `disk.` would all be one file). Names compare byte for byte. A request with any other name gets `InvalidName`.
 
 ## 4. Sessions, requests, replies and events
 
@@ -161,7 +168,11 @@ Every message type is one of three kinds (the catalogue in section 6 says which)
 - **Reply**, server to client: `Ok` (success, nothing to return), `Error` (section 5), or a request-specific result (`VmCreated`, `VmList`, ...).
 - **Event**, never answered: console and screen streams (`ConsoleOutput`, `ScreenFrame`), client input (`ConsoleInput`, `KeyInput`), and notifications (`VmStateChanged`, `Detached`). Server events can arrive at any time between replies, so a client reading a reply sets aside the events it reads first (the crate's `Connection::request` queues them for `recv`).
 
-There are no request ids: replies match requests by order. A client that sends a reply or an event the server does not accept from clients gets `Error(Unexpected)` back, which is that frame's one reply. An event that names something that does not exist (input to a VM the client is not attached to) is dropped.
+There are no request ids: replies match requests by order. So that order is never lost, these rules hold even for bad frames:
+
+- **Events are never answered**, not even with `Error`. A server drops an event it cannot decode, an event that travels in the wrong direction (a client sending `ConsoleOutput`) and an event that names something that does not exist (input to a VM the client is not attached to); it may log them.
+- **Every other frame a client sends gets exactly one reply**: a request, a reply (answered by `Error(Unexpected)`), a frame of unknown type (`Error(UnknownMessage)`) and a request that fails to decode (`Error(Malformed)`).
+- A client waiting for a reply sets aside the events it reads, including those that fail to decode. A reply-type frame is the reply, even when it fails to decode. Any other frame (a request, an unknown type, a frame shorter than its type) cannot be placed: the client no longer knows which reply belongs to which request and closes the connection (the crate's `Error::OutOfStep`).
 
 ## 5. Error model
 
@@ -173,7 +184,7 @@ A failed request is answered by:
 |---|---|---|
 | 1 | `Malformed` | the frame or payload could not be decoded (section 3), including a too-short or too-long frame and a bad `Hello` magic |
 | 2 | `UnknownMessage` | the type code is not in the catalogue |
-| 3 | `Unexpected` | a valid message that is not allowed here: anything but `Hello` before the handshake, a reply or a server event sent by a client |
+| 3 | `Unexpected` | a valid message that is not allowed here: anything but `Hello` before the handshake, a reply sent by a client |
 | 4 | `Unsupported` | this server does not serve that message group (Lake asked to create a VM, Avalon asked for a block) |
 | 5 | `NoSuchVm` | no VM with that id or name |
 | 6 | `NoSuchDisk` | no disk image with that name |

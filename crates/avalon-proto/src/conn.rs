@@ -2,7 +2,7 @@
 //! handshake, and request/reply matching.
 
 use crate::frame::{read_frame, write_frame, Frame};
-use crate::message::{Message, MessageKind};
+use crate::message::{kind_of, Message, MessageKind};
 use crate::{Error, Result, PROTOCOL_VERSION};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -12,11 +12,15 @@ use std::net::{TcpStream, ToSocketAddrs};
 ///
 /// Requests are answered in order, one reply each, but events (console output, screen
 /// frames, state changes) can arrive between them. [`Connection::request`] returns the
-/// reply and queues any events it reads on the way; [`Connection::recv`] hands those
-/// out first, so nothing is lost or reordered.
+/// reply and queues any events it reads on the way, including events that fail to
+/// decode (as their errors); [`Connection::recv`] hands those out first, so nothing is
+/// lost or reordered.
 pub struct Connection<S> {
     stream: S,
-    events: VecDeque<Message>,
+    events: VecDeque<Result<Message>>,
+    /// Set once `request` read a frame it could not place as either an event or the
+    /// reply: from then on replies can no longer be matched to requests.
+    out_of_step: bool,
 }
 
 impl<S: Read + Write> Connection<S> {
@@ -24,6 +28,7 @@ impl<S: Read + Write> Connection<S> {
         Connection {
             stream,
             events: VecDeque::new(),
+            out_of_step: false,
         }
     }
 
@@ -49,14 +54,26 @@ impl<S: Read + Write> Connection<S> {
         write_frame(&mut self.stream, frame)
     }
 
-    /// The next message: a queued event if there is one, else the next frame from the
-    /// stream. On a non-fatal error ([`Error::is_fatal`]) the bad frame has been
-    /// consumed and the connection can go on.
+    /// The next message: a queued event (or a queued event's decode error) if there is
+    /// one, else the next frame from the stream. On a non-fatal error
+    /// ([`Error::is_fatal`]) the bad frame has been consumed and the connection can go
+    /// on.
     pub fn recv(&mut self) -> Result<Message> {
         match self.events.pop_front() {
-            Some(msg) => Ok(msg),
+            Some(event) => event,
             None => self.read_message(),
         }
+    }
+
+    /// The next frame from the stream, undecoded, so a server that cannot decode it
+    /// still knows its type: it answers a bad request (or a frame of unknown type)
+    /// with an `Error` reply, but never answers an event, even a bad one
+    /// ([`kind_of`]). This bypasses the event queue, which only
+    /// [`Connection::request`] fills.
+    ///
+    /// [`kind_of`]: crate::kind_of
+    pub fn recv_frame(&mut self) -> Result<Frame> {
+        read_frame(&mut self.stream)
     }
 
     /// Events read by [`Connection::request`] and not yet returned by `recv`.
@@ -69,25 +86,51 @@ impl<S: Read + Write> Connection<S> {
     }
 
     /// Sends a request and waits for its reply. An `Error` reply comes back as
-    /// [`Error::Remote`]; events that arrive first are queued for [`Connection::recv`].
+    /// [`Error::Remote`]; events that arrive first are queued for [`Connection::recv`],
+    /// and so are events that fail to decode, as their errors.
+    ///
+    /// Replies carry no request id, so this must never take the wrong frame for the
+    /// reply. A reply-type frame that fails to decode is the reply, and comes back as
+    /// its decode error (non-fatal: the next request gets the next reply). A frame it
+    /// cannot place (a request, an unknown type, a too-short frame) gives the fatal
+    /// [`Error::OutOfStep`], and every later `request` fails the same way: close the
+    /// connection. After any error for which [`Error::is_fatal`] is false, the
+    /// connection is still in step.
     pub fn request(&mut self, msg: &Message) -> Result<Message> {
+        if self.out_of_step {
+            return Err(Error::OutOfStep(
+                "an earlier request lost track of its reply".into(),
+            ));
+        }
         if msg.kind() != MessageKind::Request {
             return Err(Error::Invalid(format!("{} is not a request", msg.name())));
         }
         self.send(msg)?;
         loop {
-            let reply = self.read_message()?;
-            match reply.kind() {
-                MessageKind::Event => self.events.push_back(reply),
-                MessageKind::Request => return Err(Error::Unexpected(reply.type_code())),
-                MessageKind::Reply => {
-                    return match reply {
-                        Message::Error { code, message } => Err(Error::Remote { code, message }),
-                        reply => Ok(reply),
-                    }
+            let frame = match read_frame(&mut self.stream) {
+                Ok(frame) => frame,
+                Err(e) if e.is_fatal() => return Err(e),
+                Err(e) => return Err(self.lose_step(e)),
+            };
+            match (kind_of(frame.ty), frame.message()) {
+                (Some(MessageKind::Event), event) => self.events.push_back(event),
+                (Some(MessageKind::Reply), Ok(Message::Error { code, message })) => {
+                    return Err(Error::Remote { code, message })
                 }
+                (Some(MessageKind::Reply), reply) => return reply,
+                (Some(MessageKind::Request), Ok(_)) => {
+                    return Err(self.lose_step(Error::Unexpected(frame.ty)))
+                }
+                (Some(MessageKind::Request) | None, Err(e)) => return Err(self.lose_step(e)),
+                (None, Ok(_)) => unreachable!("a frame of unknown type decoded"),
             }
         }
+    }
+
+    /// Marks the connection out of step after `cause`, read where a reply was due.
+    fn lose_step(&mut self, cause: Error) -> Error {
+        self.out_of_step = true;
+        Error::OutOfStep(format!("waiting for a reply, got: {cause}"))
     }
 
     /// Like [`Connection::request`] for requests answered by `Ok`.

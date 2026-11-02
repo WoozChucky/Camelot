@@ -53,24 +53,48 @@ pub const MAX_BLOCK_SECTORS: u32 = 2048;
 pub const MAX_NAME_LEN: usize = 64;
 
 /// Where Avalon listens by default. Listening on any other interface takes an explicit
-/// flag, since v0 has no authentication.
+/// flag, since v1 has no authentication.
 pub const DEFAULT_AVALON_ADDR: &str = "127.0.0.1:7400";
 
 /// Where Lake listens by default.
 pub const DEFAULT_LAKE_ADDR: &str = "127.0.0.1:7401";
 
-/// Checks a VM or disk name: 1 to [`MAX_NAME_LEN`] bytes of ASCII letters, digits, `.`,
-/// `_` and `-`, not starting with `.` or `-`. Disk names become file names on Lake's
-/// host, so this also keeps them from naming paths. Servers check names; the decoder
-/// does not, so a bad name gets a precise `InvalidName` error instead of `Malformed`.
+/// Checks a VM or disk name (protocol doc, section 3): 1 to [`MAX_NAME_LEN`] bytes of
+/// lowercase ASCII letters, digits, `.`, `_` and `-`; not starting with `.` or `-`, not
+/// ending with `.`, not all digits, and not a Windows device name (`con`, `prn`, `aux`,
+/// `nul`, `com0`-`com9`, `lpt0`-`lpt9`, alone or before a `.`).
+///
+/// Disk names become file names on Lake's host, so the rule keeps every name a plain
+/// file of its own on Windows as well: no path separators, no device, and no two names
+/// that reach the same file (Windows ignores case and trailing dots). All-digit names
+/// are left out because a command-line VM argument that is all digits is an id
+/// ([`VmRef::parse`]). Servers check names; the decoder does not, so a bad name gets a
+/// precise `InvalidName` error instead of `Malformed`.
 pub fn validate_name(name: &str) -> Result<(), String> {
-    let ok_byte = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-');
+    let ok_byte = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-');
     if name.is_empty() || name.len() > MAX_NAME_LEN {
         return Err(format!("name must be 1 to {MAX_NAME_LEN} characters long"));
     }
-    if name.starts_with(['.', '-']) || !name.bytes().all(ok_byte) {
+    if name.starts_with(['.', '-']) || name.ends_with('.') || !name.bytes().all(ok_byte) {
         return Err(format!(
-            "'{name}' is not a valid name (letters, digits, '.', '_' and '-', not starting with '.' or '-')"
+            "'{name}' is not a valid name (lowercase letters, digits, '.', '_' and '-', \
+             not starting with '.' or '-', not ending with '.')"
+        ));
+    }
+    if name.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "'{name}' is not a valid name (all digits would read as a VM id)"
+        ));
+    }
+    let stem = name.split('.').next().unwrap_or(name);
+    let device = match stem.as_bytes() {
+        b"con" | b"prn" | b"aux" | b"nul" => true,
+        [b'c', b'o', b'm', d] | [b'l', b'p', b't', d] => d.is_ascii_digit(),
+        _ => false,
+    };
+    if device {
+        return Err(format!(
+            "'{name}' is not a valid name ('{stem}' is a Windows device)"
         ));
     }
     Ok(())
@@ -105,22 +129,32 @@ pub enum Error {
     VersionMismatch { ours: u16, theirs: u16 },
     /// The peer answered a request with an `Error` message.
     Remote { code: ErrorCode, message: String },
-    /// The peer sent a well-formed message that is not allowed here (a request where a
-    /// reply was expected, anything but `Hello` before the handshake, ...). Carries
-    /// the message type.
+    /// The peer sent a well-formed message that is not allowed here (anything but
+    /// `Hello` before the handshake, a reply of the wrong type, ...). Carries the
+    /// message type.
     Unexpected(u16),
+    /// [`Connection::request`] read a frame, while waiting for a reply, that it cannot
+    /// tell apart from the reply (a request, an unknown type, a too-short frame).
+    /// Replies match requests only by order, so this connection can no longer pair
+    /// them and must be closed.
+    OutOfStep(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
     /// Whether the connection is unusable after this error. After the other errors the
-    /// whole frame has been consumed, so the stream is still in step and a server can
-    /// reply with an `Error` message and carry on.
+    /// whole frame has been consumed and accounted for, so the stream is still in step:
+    /// a server can reply with an `Error` message (unless the frame was an event) and
+    /// carry on, and a client's next request still gets its own reply.
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            Error::Io(_) | Error::Closed | Error::FrameTooLarge(_) | Error::VersionMismatch { .. }
+            Error::Io(_)
+                | Error::Closed
+                | Error::FrameTooLarge(_)
+                | Error::VersionMismatch { .. }
+                | Error::OutOfStep(_)
         )
     }
 
@@ -134,7 +168,7 @@ impl Error {
             | Error::Invalid(_)
             | Error::BadMagic(_) => ErrorCode::Malformed,
             Error::UnknownType(_) => ErrorCode::UnknownMessage,
-            Error::Unexpected(_) => ErrorCode::Unexpected,
+            Error::Unexpected(_) | Error::OutOfStep(_) => ErrorCode::Unexpected,
             Error::Remote { code, .. } => *code,
             Error::VersionMismatch { .. } | Error::Io(_) | Error::Closed => ErrorCode::Internal,
         }
@@ -164,6 +198,7 @@ impl fmt::Display for Error {
             ),
             Error::Remote { code, message } => write!(f, "{code}: {message}"),
             Error::Unexpected(t) => write!(f, "unexpected message {}", message::type_name(*t)),
+            Error::OutOfStep(why) => write!(f, "replies out of step with requests: {why}"),
         }
     }
 }

@@ -138,6 +138,23 @@ fn error_codes_round_trip() {
     assert_eq!(ErrorCode::from_u16(0), ErrorCode::Other(0));
     assert_eq!(ErrorCode::from_u16(500).to_u16(), 500);
     assert_eq!(ErrorCode::Other(500).to_string(), "error 500");
+
+    // `Other` with a named code's number would come back as the named code, so the
+    // encoder refuses it: every message that encodes decodes to itself.
+    for n in 1..=18 {
+        let msg = Message::Error {
+            code: ErrorCode::Other(n),
+            message: "x".into(),
+        };
+        assert!(matches!(encode(&msg), Err(Error::Invalid(_))), "{n}");
+    }
+    for n in [0, 19, u16::MAX] {
+        let msg = Message::Error {
+            code: ErrorCode::Other(n),
+            message: "x".into(),
+        };
+        assert_eq!(decode(&encode(&msg).unwrap()).unwrap().0, msg);
+    }
 }
 
 #[test]
@@ -214,20 +231,119 @@ fn request_turns_error_replies_into_remote_errors() {
 #[test]
 fn request_refuses_non_requests_and_unexpected_replies() {
     let mut conn = Connection::new(Duplex::with_messages(&[
-        Message::ListVms,
         Message::Pong { token: 1 },
+        Message::Pong { token: 2 },
     ]));
     assert!(matches!(conn.request(&Message::Ok), Err(Error::Invalid(_))));
     assert!(conn.get_ref().output.is_empty(), "nothing is sent");
-    // A request arriving where a reply belongs.
-    assert!(matches!(
-        conn.request(&Message::ListDisks),
-        Err(Error::Unexpected(ty::LIST_VMS))
+    // A reply of the wrong type is still the reply: the next request gets its own.
+    match conn.request_ok(&Message::Ping { token: 1 }) {
+        Err(e @ Error::Unexpected(ty::PONG)) => assert!(!e.is_fatal()),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        conn.request(&Message::Ping { token: 2 }).unwrap(),
+        Message::Pong { token: 2 }
+    );
+}
+
+/// Frames as a server would send them: `bad` (raw bytes), then the given messages.
+fn bad_then(bad: Vec<u8>, msgs: &[Message]) -> Duplex {
+    let mut input = bad;
+    input.extend(msgs.iter().flat_map(|m| encode(m).unwrap()));
+    Duplex::new(input)
+}
+
+fn raw_frame(ty: u16, payload: &[u8]) -> Vec<u8> {
+    Frame {
+        ty,
+        payload: payload.to_vec(),
+    }
+    .to_bytes()
+}
+
+#[test]
+fn a_bad_event_before_the_reply_does_not_shift_replies() {
+    // A KeyInput with a reserved flag bit and a VmStateChanged with an unknown state
+    // tag arrive before the replies. Both are set aside as errors for `recv`; each
+    // request still gets its own reply.
+    let mut input = raw_frame(ty::KEY_INPUT, &[1, 0, 0, 0, b'a', 0x80]);
+    input.extend(raw_frame(ty::VM_STATE_CHANGED, &[1, 0, 0, 0, 9]));
+    let mut conn = Connection::new(bad_then(
+        input,
+        &[
+            Message::Pong { token: 1 },
+            Message::Ok,
+            Message::Pong { token: 2 },
+        ],
     ));
-    assert!(matches!(
-        conn.request_ok(&Message::Ping { token: 1 }),
-        Err(Error::Unexpected(ty::PONG))
+    assert_eq!(
+        conn.request(&Message::Ping { token: 1 }).unwrap(),
+        Message::Pong { token: 1 }
+    );
+    conn.request_ok(&Message::PauseVm { vm: VmRef::Id(1) }).unwrap();
+    assert_eq!(
+        conn.request(&Message::Ping { token: 2 }).unwrap(),
+        Message::Pong { token: 2 }
+    );
+    assert_eq!(conn.queued_events(), 2);
+    for _ in 0..2 {
+        match conn.recv() {
+            Err(e @ Error::Invalid(_)) => assert!(!e.is_fatal()),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(matches!(conn.recv(), Err(Error::Closed)));
+}
+
+#[test]
+fn a_bad_reply_is_the_reply() {
+    // A Pong too short to decode is still the Ping's one reply.
+    let mut conn = Connection::new(bad_then(
+        raw_frame(ty::PONG, &[1, 0]),
+        &[Message::Pong { token: 2 }],
     ));
+    match conn.request(&Message::Ping { token: 1 }) {
+        Err(e @ Error::Truncated) => assert!(!e.is_fatal()),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        conn.request(&Message::Ping { token: 2 }).unwrap(),
+        Message::Pong { token: 2 }
+    );
+}
+
+#[test]
+fn a_frame_that_might_be_the_reply_puts_the_connection_out_of_step() {
+    let ping = Message::Ping { token: 1 };
+    let cases = [
+        // A request where a reply belongs, well-formed or not.
+        encode(&Message::ListVms).unwrap(),
+        raw_frame(ty::START_VM, &[9]),
+        // A type this version does not know.
+        raw_frame(0x0777, &[]),
+        // A frame too short to hold a type.
+        vec![1, 0, 0, 0, 0xee],
+    ];
+    for bad in cases {
+        let mut conn = Connection::new(bad_then(
+            bad.clone(),
+            &[Message::Pong { token: 1 }, Message::Pong { token: 2 }],
+        ));
+        match conn.request(&ping) {
+            Err(e @ Error::OutOfStep(_)) => {
+                assert!(e.is_fatal());
+                assert!(e.to_string().contains("out of step"), "{e}");
+            }
+            other => panic!("{bad:02x?}: {other:?}"),
+        }
+        // Never hands out a reply that may belong to the earlier request.
+        assert!(matches!(
+            conn.request(&Message::Ping { token: 2 }),
+            Err(Error::OutOfStep(_))
+        ));
+        assert_eq!(decode_all(&conn.get_ref().output), std::slice::from_ref(&ping));
+    }
 }
 
 fn tcp_pair() -> (TcpStream, TcpStream) {
@@ -420,13 +536,35 @@ fn vm_ref_parses_ids_and_names() {
     assert_eq!(VmRef::parse("web-1"), VmRef::Name("web-1".into()));
     assert_eq!(VmRef::parse("+1"), VmRef::Name("+1".into()));
     assert_eq!(VmRef::parse("99999999999"), VmRef::Name("99999999999".into()));
+    // A valid name never parses as an id.
+    for name in ["web-1", "1a", "1.5", "0x10", "_7"] {
+        assert_eq!(validate_name(name), Ok(()), "{name}");
+        assert_eq!(VmRef::parse(name), VmRef::Name(name.into()));
+    }
     assert_eq!(VmRef::Id(3).to_string(), "3");
     assert_eq!(VmState::Exited(2).to_string(), "exited(2)");
 }
 
 #[test]
 fn names_are_validated() {
-    for ok in ["a", "web-1", "root.img", "A_b.c-9", &"x".repeat(MAX_NAME_LEN)] {
+    for ok in [
+        "a",
+        "web-1",
+        "root.img",
+        "a_b.c-9",
+        "a.b.c",
+        "x-",
+        "x_",
+        "7z",
+        // Device names only count as the whole stem.
+        "cons",
+        "nul_",
+        "com10",
+        "lpt",
+        "my.con",
+        "aux-1.img",
+        &"x".repeat(MAX_NAME_LEN),
+    ] {
         assert_eq!(validate_name(ok), Ok(()), "{ok}");
     }
     for bad in [
@@ -435,10 +573,37 @@ fn names_are_validated() {
         "-x",
         "a/b",
         "a\\b",
+        "a:b",
         "..",
         "a b",
         "é",
         &"x".repeat(MAX_NAME_LEN + 1),
+        // Windows ignores case and trailing dots: these would share a file with
+        // "disk".
+        "Disk",
+        "DISK",
+        "disk.",
+        "x..",
+        "a...",
+        // Windows devices, with or without an extension, in any case.
+        "con",
+        "CON",
+        "prn",
+        "aux",
+        "aux.img",
+        "nul",
+        "nul.tar.gz",
+        "com0",
+        "com1",
+        "COM1",
+        "com9.img",
+        "lpt0",
+        "lpt1",
+        "LPT1.img",
+        // All digits: a VM argument like that is an id.
+        "42",
+        "007",
+        "4294967296",
     ] {
         assert!(validate_name(bad).is_err(), "{bad}");
     }

@@ -3,7 +3,8 @@
 //! and counted lists.
 //!
 //! The reader never trusts a length: every one is checked against the bytes actually
-//! left in the payload before anything is allocated, so a forged count costs nothing.
+//! left in the payload before anything is read, and a list count never decides how
+//! much memory is reserved up front, so a forged count costs nothing.
 
 use crate::{Error, Result};
 
@@ -58,6 +59,9 @@ impl Writer {
         }
     }
 }
+
+/// Most list elements [`Reader::list`] reserves room for before decoding any.
+const MAX_LIST_PREALLOC: usize = 1024;
 
 /// Reads a payload front to back.
 pub(crate) struct Reader<'a> {
@@ -130,13 +134,19 @@ impl<'a> Reader<'a> {
     }
 
     /// A counted list. Every element takes at least one byte, so a count larger than
-    /// the bytes left is truncated before any element is read or allocated.
+    /// the bytes left is truncated before any element is read.
+    ///
+    /// The count is the peer's word, and an element in memory can be many times its
+    /// wire size, so it only bounds the up-front reservation: at most
+    /// [`MAX_LIST_PREALLOC`] elements, and never more bytes than the payload has left.
+    /// A longer list grows as its elements actually decode.
     pub fn list<T>(&mut self, mut get: impl FnMut(&mut Self) -> Result<T>) -> Result<Vec<T>> {
         let count = self.u32()? as usize;
         if count > self.remaining() {
             return Err(Error::Truncated);
         }
-        let mut v = Vec::with_capacity(count);
+        let fit = self.remaining() / std::mem::size_of::<T>().max(1);
+        let mut v = Vec::with_capacity(count.min(fit).min(MAX_LIST_PREALLOC));
         for _ in 0..count {
             v.push(get(self)?);
         }
@@ -207,5 +217,18 @@ mod tests {
     fn huge_list_count_is_rejected_before_allocating() {
         let mut r = Reader::new(&[0xff, 0xff, 0xff, 0xff, 0]);
         assert!(matches!(r.list(|r| r.u8()), Err(Error::Truncated)));
+    }
+
+    #[test]
+    fn lists_longer_than_the_reservation_still_decode() {
+        // 4096 elements of 512 bytes each in memory, one byte each on the wire: more
+        // than both preallocation caps, so the vector has to grow.
+        let mut payload = 4096u32.to_le_bytes().to_vec();
+        payload.resize(4 + 4096, 7);
+        let list = Reader::new(&payload)
+            .list(|r| r.u8().map(|b| [b as u64; 64]))
+            .unwrap();
+        assert_eq!(list.len(), 4096);
+        assert!(list.iter().all(|e| e[63] == 7));
     }
 }

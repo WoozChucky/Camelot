@@ -392,6 +392,7 @@ fn error_display_and_codes() {
             false,
         ),
         (Error::Unexpected(ty::OK), ErrorCode::Unexpected, false),
+        (Error::OutOfStep("x".into()), ErrorCode::Unexpected, true),
     ];
     for (err, code, fatal) in cases {
         assert_eq!(err.code(), code, "{err:?}");
