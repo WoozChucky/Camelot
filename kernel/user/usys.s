@@ -27,6 +27,9 @@
     .equ SYS_dup, 19
     .equ SYS_pipe, 20
     .equ SYS_exec, 21
+    .equ SYS_netinfo, 40
+    .equ SYS_netconf, 41
+    .equ SYS_ping, 42
 
     .text
 
@@ -174,6 +177,27 @@ pipe:
     .globl exec
 exec:
     li    a7, SYS_exec
+    ecall
+    ret
+
+# int netinfo(struct netinfo *info)
+    .globl netinfo
+netinfo:
+    li    a7, SYS_netinfo
+    ecall
+    ret
+
+# int netconf(uint addr, uint mask, uint gateway)
+    .globl netconf
+netconf:
+    li    a7, SYS_netconf
+    ecall
+    ret
+
+# int ping(uint addr, uint seq, struct ping_reply *reply)
+    .globl ping
+ping:
+    li    a7, SYS_ping
     ecall
     ret
 

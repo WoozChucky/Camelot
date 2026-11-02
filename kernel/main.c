@@ -9,6 +9,7 @@
 #include "kalloc.h"
 #include "kprintf.h"
 #include "memlayout.h"
+#include "net.h"
 #include "mmio.h"
 #include "proc.h"
 #include "riscv.h"
@@ -228,11 +229,13 @@ int kmain(void) {
     blk_init();
     binit();
     print_disks();
+    net_init();
     wait_ticks(BOOT_TICKS);
 
     deliberate_fault();
     failed += blk_selftest();
     failed += fs_boot();
+    failed += net_boot();
     int status = run_shell();
     /* Failed self-tests are what the exit code reports first. */
     return failed != 0 ? failed : status;

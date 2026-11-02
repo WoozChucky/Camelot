@@ -38,6 +38,12 @@ typedef unsigned long size_t;
 #define ENAMETOOLONG 36 /* a name longer than DIRSIZ, or a path longer than MAXPATH */
 #define ENOSYS 38       /* no such system call */
 #define ENOTEMPTY 39    /* unlink: a directory with entries */
+#define EMSGSIZE 90     /* a datagram too big for one packet */
+#define EADDRINUSE 98   /* a UDP port that is taken */
+#define ENETUNREACH 101 /* no route: no address yet, or no gateway */
+#define ENOBUFS 105     /* the network's buffers or sockets are all in use */
+#define ETIMEDOUT 110   /* ping: no reply in time */
+#define EHOSTUNREACH 113 /* ARP got no answer from the address */
 
 /* The standard file descriptors: the console's in the shell, and what a
  * child inherits from its parent. */
@@ -89,6 +95,53 @@ struct dirent {
     char name[DIRSIZ];
 };
 
+/* The network (docs/camelot-net.md). Addresses are in host order:
+ * 10.0.2.15 is 0x0a00020f. These are kernel/include/syscall.h's: keep them
+ * in sync. */
+struct net_stats {
+    uint rx_frames;       /* frames taken from the card */
+    uint rx_bytes;
+    uint tx_frames;       /* frames handed to the card */
+    uint tx_bytes;
+    uint rx_card_dropped; /* lost by the card itself */
+    uint rx_filtered;     /* not for this host */
+    uint rx_bad_ether;    /* an EtherType other than IPv4 and ARP */
+    uint rx_bad_arp;      /* a truncated or unsupported ARP packet */
+    uint rx_bad_ip;       /* a bad IPv4 header */
+    uint rx_bad_ip_sum;   /* a wrong IPv4 header checksum */
+    uint rx_fragment;     /* an IPv4 fragment */
+    uint rx_bad_proto;    /* an IPv4 protocol other than ICMP and UDP */
+    uint rx_bad_icmp;     /* a truncated ICMP message or a wrong checksum */
+    uint rx_bad_udp;      /* a truncated UDP datagram or a wrong length */
+    uint rx_bad_udp_sum;  /* a wrong UDP checksum */
+    uint rx_no_port;      /* a datagram for a port with no socket */
+    uint rx_queue_full;   /* a datagram for a full socket */
+    uint no_buffer;       /* a frame dropped or not sent for want of a buffer */
+    uint arp_failed;      /* a packet whose next hop ARP could not find */
+    uint tx_errors;       /* a frame the card refused or could not queue */
+};
+
+struct netinfo {
+    uchar mac[6];
+    ushort flags; /* NETINFO_ */
+    uint addr;    /* 0 if none */
+    uint mask;
+    uint gateway; /* 0: none */
+    uint dns;     /* 0: none */
+    struct net_stats stats;
+};
+
+#define NETINFO_LINK 0x1 /* the card's link is up */
+#define NETINFO_UP 0x2   /* the interface has an address */
+#define NETINFO_DHCP 0x4 /* which DHCP gave it */
+
+struct ping_reply {
+    uint from;   /* who answered */
+    uint ttl;    /* the reply's time to live */
+    uint len;    /* its ICMP message's length */
+    uint rtt_us; /* the round trip, in microseconds */
+};
+
 /* The system calls. */
 void exit(int status);
 int write(int fd, const void *buf, uint len);
@@ -111,6 +164,9 @@ int chdir(const char *path);
 int dup(int fd);
 int pipe(int *fds);
 int exec(const char *path, char *const argv[]);
+int netinfo(struct netinfo *info);
+int netconf(uint addr, uint mask, uint gateway);
+int ping(uint addr, uint seq, struct ping_reply *reply);
 /* Any call by number (for tests). */
 int syscall(int number, uint a0, uint a1, uint a2);
 

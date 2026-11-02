@@ -177,6 +177,8 @@ fn shell_accepts_windows_line_ends() {
          exit [N]        leave the shell, with status N or the last program's\n\
          wait            wait for every background program\n\
          cd [DIR]        change the working directory, to / without DIR\n\
+         ifconfig        show the network interface; ifconfig ADDR [MASK [GATEWAY]] sets its address\n\
+         ping ADDR [N]   send N (4) echo requests to ADDR, a.b.c.d, and wait for the replies\n\
          PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /\n\
          CMD < FILE      read the input from FILE\n\
          CMD > FILE      write the output to FILE\n\

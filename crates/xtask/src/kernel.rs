@@ -1,6 +1,7 @@
 //! Building and running the Camelot kernel (`kernel/`).
 //!
-//! Every `*.c` and `*.s` file directly in `kernel/` is one object, and the
+//! Every `*.c` and `*.s` file directly in `kernel/` or in one of its source
+//! subdirectories ([`SUBDIRS`], e.g. `net/arp.c`) is one object, and the
 //! objects are linked in name order with `kernel/kernel.ld`. Our own tools
 //! build it ([`Toolchain::Merlin`], [`build_merlin`]): merlin compiles each C
 //! file, merlin-as assembles it and the `.s` files and merlin-ld links them,
@@ -126,11 +127,33 @@ impl Source {
     }
 }
 
-/// Lists the kernel's sources (`*.c`, `*.s`) in name order.
+/// The subdirectories of the kernel directory whose `*.c` and `*.s` files
+/// are kernel sources too, named `dir/file` (the others hold the user
+/// programs, the bootloader, the headers and the root image's files).
+pub const SUBDIRS: &[&str] = &["net"];
+
+/// Lists the kernel's sources (`*.c`, `*.s`, in `kernel_dir` and its
+/// [`SUBDIRS`]) in name order.
 pub fn sources(kernel_dir: &Path) -> Result<Vec<Source>, String> {
-    let entries =
-        std::fs::read_dir(kernel_dir).map_err(|e| format!("cannot read {}: {e}", kernel_dir.display()))?;
     let mut out = Vec::new();
+    list_sources(kernel_dir, "", &mut out)?;
+    for sub in SUBDIRS {
+        let dir = kernel_dir.join(sub);
+        if dir.is_dir() {
+            list_sources(&dir, &format!("{sub}/"), &mut out)?;
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    if out.is_empty() {
+        return Err(format!("no .c or .s files in {}", kernel_dir.display()));
+    }
+    Ok(out)
+}
+
+/// Adds the `*.c` and `*.s` files of `dir` to `out`, named `prefix` + their
+/// file name.
+fn list_sources(dir: &Path, prefix: &str, out: &mut Vec<Source>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
     for e in entries {
         let e = e.map_err(|e| e.to_string())?;
         if !e.file_type().map_err(|e| e.to_string())?.is_file() {
@@ -144,13 +167,12 @@ pub fn sources(kernel_dir: &Path) -> Result<Vec<Source>, String> {
             Some("s") => Lang::Asm,
             _ => continue,
         };
-        out.push(Source { name, lang });
+        out.push(Source {
+            name: format!("{prefix}{name}"),
+            lang,
+        });
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    if out.is_empty() {
-        return Err(format!("no .c or .s files in {}", kernel_dir.display()));
-    }
-    Ok(out)
+    Ok(())
 }
 
 /// One source of the kernel built by our own tools.
@@ -262,7 +284,10 @@ impl Build {
     pub fn run(&self) -> Result<PathBuf, String> {
         let sources = sources(&self.kernel_dir)?;
         let obj_dir = self.kernel_dir.join(&self.obj_dir);
-        std::fs::create_dir_all(&obj_dir).map_err(|e| format!("cannot create {}: {e}", obj_dir.display()))?;
+        // `net/arp.c` becomes `net/arp.c.o` there.
+        for dir in std::iter::once(obj_dir.clone()).chain(SUBDIRS.iter().map(|s| obj_dir.join(s))) {
+            std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
         let out = self.kernel_dir.join(&self.out);
         if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
