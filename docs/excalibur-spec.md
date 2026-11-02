@@ -118,7 +118,7 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 | 0x0000_1000 - 0x0000_1FFF | Boot ROM (reset vector 0x1000, jumps to 0x8000_0000) |
 | 0x0200_0000 - 0x0200_FFFF | CLINT: msip @+0x0, mtimecmp @+0x4000, mtime @+0xBFF8 |
 | 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART and keyboard (section 7.1) |
-| 0x1000_0000 - 0x1000_00FF | UART, 16550-compatible subset (THR/RBR @+0, IER @+1, LSR @+5) |
+| 0x1000_0000 - 0x1000_00FF | UART, 16550-compatible subset (THR/RBR @+0, IER @+1, IIR @+2, LSR @+5) |
 | 0x1000_1000 - 0x1000_1FFF | Reserved: virtio block device (later, for a filesystem) |
 | 0x0010_0000 | Test/exit device: write 0x5555 = pass/exit, 0x3333 = fail (used by riscv-tests) |
 | 0x3000_0000 - 0x3000_0FFF | Framebuffer control (Xcal, section 9.3) |
@@ -126,7 +126,7 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 | 0x3100_0000 - 0x3112_BFFF | Framebuffer VRAM |
 | 0x8000_0000 - 0x87FF_FFFF | RAM, 128 MiB default (configurable) |
 
-Unmapped accesses raise access-fault exceptions.
+Unmapped accesses raise access-fault exceptions. Only RAM and the boot ROM are memory: an instruction fetch from any other range raises an instruction access fault, and a Sv32 page-table walk that reads a PTE outside them raises an access fault of the original access type. So neither can trigger a device register's read side effect (such as a PLIC claim).
 
 Timer: `mtime` increments once per executed instruction, so runs are deterministic and reproducible. During `wfi`, Grail jumps `mtime` forward to `mtimecmp` instead of spinning. (A real-time mode can be added later.) MTIP is pending while `mtime >= mtimecmp`.
 

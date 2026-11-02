@@ -111,6 +111,10 @@ impl Plic {
     /// threshold (ties go to the lowest source number), or 0 if there is none.
     pub fn best(&self, ctx: usize) -> u32 {
         let candidates = self.pending & self.enable[ctx];
+        if candidates == 0 {
+            // The common case (checked every step): skip the scan over all sources.
+            return 0;
+        }
         let mut best = (0, self.threshold[ctx]);
         for src in 1..PLIC_SOURCES {
             if candidates & (1 << src) != 0 && self.priority[src as usize] > best.1 {
@@ -236,9 +240,16 @@ const LSR_TEMT: u8 = 1 << 6; // transmitter empty
 
 impl Uart {
     /// Level of the UART's PLIC line: high while IER.ERBFI is set and a byte is waiting in RBR.
+    /// The bus samples it every step, so the host channel is only polled when the answer
+    /// depends on it (interrupt enabled, nothing buffered yet).
     pub fn irq(&mut self) -> bool {
-        self.poll_input();
-        self.ier & IER_ERBFI != 0 && !self.rx.is_empty()
+        if self.ier & IER_ERBFI == 0 {
+            return false;
+        }
+        if self.rx.is_empty() {
+            self.poll_input();
+        }
+        !self.rx.is_empty()
     }
 
     fn poll_input(&mut self) {
@@ -463,8 +474,31 @@ mod tests {
         w(&mut p, THRESHOLD1, 0);
         assert_eq!(r(&mut p, CLAIM0), 0);
         assert_eq!(r(&mut p, CLAIM1), 1);
+
+        // In flight: the line stays high, but nothing pends until context 1 completes.
+        p.set_level(1, true);
+        assert!(!p.irq(1));
+        w(&mut p, CLAIM0, 1);
+        p.set_level(1, true);
+        assert_eq!(
+            r(&mut p, PLIC_PENDING),
+            0,
+            "context 0 does not enable source 1, so its complete is ignored"
+        );
+        w(&mut p, CLAIM1, 1);
+        p.set_level(1, true);
+        assert_eq!(
+            r(&mut p, PLIC_PENDING),
+            0b0010,
+            "context 1's complete ended the claim"
+        );
+        assert!(p.irq(1));
+
+        assert_eq!(r(&mut p, CLAIM1), 1);
         p.set_level(1, false);
         w(&mut p, CLAIM1, 1);
+        p.set_level(1, false);
+        assert_eq!(r(&mut p, PLIC_PENDING), 0);
         assert!(!p.irq(1));
     }
 
@@ -487,6 +521,30 @@ mod tests {
             "no context 2"
         );
         assert_eq!(r(&mut p, PLIC_ENABLE + 2 * PLIC_ENABLE_STRIDE), 0, "no context 2");
+        // Only the first word of each enable block (sources 0..=31) exists. Drivers that
+        // clear every enable word must not wipe the real one.
+        w(&mut p, PLIC_ENABLE + PLIC_ENABLE_STRIDE, 0b0110);
+        for ctx in 0..PLIC_CONTEXTS as u32 {
+            for word in [4, 8, PLIC_ENABLE_STRIDE - 4] {
+                let off = PLIC_ENABLE + ctx * PLIC_ENABLE_STRIDE + word;
+                w(&mut p, off, 0);
+                w(&mut p, off, 0xffff_ffff);
+                assert_eq!(r(&mut p, off), 0, "enable word {off:#x} is reserved");
+            }
+        }
+        assert_eq!(r(&mut p, PLIC_ENABLE), 0xffff_fffe);
+        assert_eq!(r(&mut p, PLIC_ENABLE + PLIC_ENABLE_STRIDE), 0b0110);
+        // Same for the words after each context's threshold and claim/complete registers.
+        w(&mut p, THRESHOLD1, 5);
+        for ctx in 0..PLIC_CONTEXTS as u32 {
+            for word in [8, 12, PLIC_CONTEXT_STRIDE - 4] {
+                let off = PLIC_CONTEXT + ctx * PLIC_CONTEXT_STRIDE + word;
+                w(&mut p, off, 0xffff_ffff);
+                assert_eq!(r(&mut p, off), 0, "context word {off:#x} is reserved");
+            }
+        }
+        assert_eq!(r(&mut p, THRESHOLD0), 7);
+        assert_eq!(r(&mut p, THRESHOLD1), 5);
         assert_eq!(p.read(4, 1), Err(BusFault), "32-bit accesses only");
         assert_eq!(p.write(6, 2, 0), Err(BusFault));
         p.set_level(0, true);

@@ -74,24 +74,32 @@ impl Bus {
         (addr >= RAM_BASE && off + size as usize <= self.ram.len()).then_some(off)
     }
 
+    /// Reads `size` (1, 2 or 4) bytes of RAM or boot ROM, little-endian, zero-extended.
+    /// Device registers fault here: instruction fetches and page-table walks use this, so
+    /// they can never trigger a device's read side effect (such as a PLIC claim).
+    pub fn read_mem(&self, addr: u32, size: u32) -> Result<u32, BusFault> {
+        let bytes = if let Some(off) = self.ram_range(addr, size) {
+            &self.ram[off..off + size as usize]
+        } else if (BOOT_ROM_BASE..BOOT_ROM_BASE + 0x1000).contains(&addr) {
+            // Past the end of the stub (but inside the ROM window) reads as 0.
+            let off = (addr - BOOT_ROM_BASE) as usize;
+            self.rom.get(off..).unwrap_or(&[])
+        } else {
+            return Err(BusFault);
+        };
+        let mut v = 0u32;
+        for i in (0..size as usize).rev() {
+            v = (v << 8) | *bytes.get(i).unwrap_or(&0) as u32;
+        }
+        Ok(v)
+    }
+
     /// Reads `size` (1, 2 or 4) bytes, little-endian, zero-extended.
     pub fn read(&mut self, addr: u32, size: u32) -> Result<u32, BusFault> {
-        if let Some(off) = self.ram_range(addr, size) {
-            let mut v = 0u32;
-            for i in (0..size as usize).rev() {
-                v = (v << 8) | self.ram[off + i] as u32;
-            }
+        if let Ok(v) = self.read_mem(addr, size) {
             return Ok(v);
         }
         match addr {
-            a if (BOOT_ROM_BASE..BOOT_ROM_BASE + 0x1000).contains(&a) => {
-                let off = (a - BOOT_ROM_BASE) as usize;
-                let mut v = 0u32;
-                for i in (0..size as usize).rev() {
-                    v = (v << 8) | *self.rom.get(off + i).unwrap_or(&0) as u32;
-                }
-                Ok(v)
-            }
             a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => self.clint.read(a - CLINT_BASE, size),
             a if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&a) => self.plic.read(a - PLIC_BASE, size),
             a if (UART_BASE..UART_BASE + UART_SIZE).contains(&a) => self.uart.read(a - UART_BASE, size),
