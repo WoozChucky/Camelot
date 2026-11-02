@@ -3055,11 +3055,17 @@ fn blk_pattern() -> Vec<u8> {
     (0..BSIZE).map(|i| (i * 7 + 3) as u8).collect()
 }
 
+/// What the kernel says after the disk self-test when disk 0 holds no
+/// filesystem, as none of these disks does (kernel/fstest.c; the
+/// filesystem's own tests are in tests/fs.rs).
+const NO_FILESYSTEM: &str = "fs: no filesystem on disk 0\n";
+
 /// The boot output with `disks` (the kernel's lines about them) in place of
-/// `disk: none`, and `selftest` after the ticks.
+/// `disk: none`, and `selftest` after the ticks, then the line saying disk 0
+/// has no filesystem.
 fn boot_output_with(disks: &str, selftest: &str) -> String {
     format!(
-        "{}{selftest}{SHELL_BANNER}{PROMPT}exit\n",
+        "{}{selftest}{NO_FILESYSTEM}{SHELL_BANNER}{PROMPT}exit\n",
         BOOT_OUTPUT.replace("disk: none\n", disks)
     )
 }
@@ -3268,8 +3274,10 @@ fn disk_blocks_round_trip_through_the_cache_with_interrupts() {
     assert_eq!(misses, buffer_reads);
     // Reader c, the scratch block read back and read again to restore it;
     // in the LRU check blocks 0 and 1 (left there by the readers) at the
-    // start of its loop, block 0 again after it, then blocks 0 and NBUF.
-    assert_eq!(hits, 8);
+    // start of its loop, block 0 again after it, then blocks 0 and NBUF;
+    // last, the filesystem's mount looking for a superblock in block 1,
+    // which the LRU check read last.
+    assert_eq!(hits, 9);
     assert!(bufs.len() >= NBUF as usize * BSIZE);
 
     // Which buffer each miss took. A buffer whose read failed holds nothing,

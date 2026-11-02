@@ -29,6 +29,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "camelot-fs"
+version = "0.1.0"
+
+[[package]]
 name = "elf32"
 version = "0.1.0"
 
@@ -105,6 +109,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pendragon"
+version = "0.1.0"
+dependencies = [
+ "avalon",
+ "avalon-client",
+ "avalon-proto",
+ "lake",
+]
+
+[[package]]
 name = "round-table"
 version = "0.1.0"
 dependencies = [
@@ -118,6 +132,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "camelot-fs",
  "elf32",
  "excalibur",
  "grail",
