@@ -20,6 +20,11 @@
 //! The table of attachments lives behind one lock, which every create, list, delete,
 //! attach and detach takes; reads and writes go through the attachment's own file
 //! handle without it, so one client's I/O never waits for another's.
+//!
+//! A clone ([`Store::clone_from`]) copies without the lock too: it attaches its source
+//! read-only for the copy, reserves the new name in the table (so nothing else can
+//! create it meanwhile), copies into a file whose name is not a disk name, and renames
+//! that into place when it is complete.
 
 use crate::{lock, Fail};
 use avalon_proto::{validate_name, DiskInfo, ErrorCode, MAX_BLOCK_SECTORS, SECTOR_SIZE};
@@ -43,12 +48,25 @@ pub struct Store {
     attached: Mutex<BTreeMap<String, Attachments>>,
 }
 
-/// The attachments of one image. An image with none has no entry.
+/// The attachments of one image. An image with none (and no clone being made under
+/// its name) has no entry.
 #[derive(Debug, Default, Clone, Copy)]
 struct Attachments {
     readers: u32,
     writer: bool,
+    /// A clone is being copied to this name: it is taken, though there is no image by
+    /// that name yet.
+    creating: bool,
 }
+
+impl Attachments {
+    fn unused(&self) -> bool {
+        self.readers == 0 && !self.writer && !self.creating
+    }
+}
+
+/// Sectors a clone copies at a time: one block request's worth.
+const CLONE_CHUNK: u64 = MAX_BLOCK_SECTORS as u64;
 
 impl Store {
     /// Serves the images in `dir`, creating the directory if it does not exist. New
@@ -101,17 +119,13 @@ impl Store {
         }
         // `max_sectors` is the server's to choose; no size may overflow a file length.
         let len = sectors.checked_mul(SECTOR).ok_or_else(too_big)?;
-        let _table = lock(&self.attached);
+        let table = lock(&self.attached);
         let path = self.path(name);
-        let exists = || {
-            Fail::new(
-                ErrorCode::AlreadyExists,
-                format!("a disk named '{name}' already exists"),
-            )
-        };
-        // Anything by that name, a disk or not, is in the way. (Windows refuses to
-        // create a file over a directory as "access denied", so look first.)
-        if fs::symlink_metadata(&path).is_ok() {
+        let exists = || already_exists(name);
+        // Anything by that name, a disk or not, is in the way, and so is a clone being
+        // made. (Windows refuses to create a file over a directory as "access denied",
+        // so look first.)
+        if fs::symlink_metadata(&path).is_ok() || table.get(name).is_some_and(|a| a.creating) {
             return Err(exists());
         }
         let file = match File::options().write(true).create_new(true).open(&path) {
@@ -138,6 +152,68 @@ impl Store {
             ));
         }
         Ok(())
+    }
+
+    /// `DiskCreate` with a source: a new image `name` that is a copy of image
+    /// `source`, `sectors` long (zeros after the source's end), or as long as the
+    /// source when `sectors` is 0. Returns the new image's size in sectors.
+    ///
+    /// The source may have readers but not a writer: it is attached read-only for the
+    /// copy, which also keeps writers away until the copy is done. The new name is
+    /// reserved in the table first, then the copy is written to `.NAME.clone` (not a
+    /// disk name: never listed, attached or deleted) and renamed to `NAME` once it is
+    /// complete and on the host's disk. A failed copy is removed. Chunks of zeros are
+    /// not written to a sparse copy, so a clone of a sparse image stays sparse.
+    ///
+    /// Checks come in the order: both names (`InvalidName`), the source (`NoSuchDisk`,
+    /// `Busy`), the size (`OutOfRange` below the source's, `OverBudget` above the
+    /// maximum), the new name (`AlreadyExists`).
+    pub fn clone_from(self: &Arc<Self>, name: &str, source: &str, sectors: u64) -> Result<u64, Fail> {
+        check_name(name)?;
+        check_name(source)?;
+        let mut src = self.attach(source, true)?;
+        let sectors = match sectors {
+            0 => src.sectors(),
+            n if n < src.sectors() => {
+                return Err(Fail::new(
+                    ErrorCode::OutOfRange,
+                    format!(
+                        "a copy of disk '{source}' needs at least its {} sectors, not {n}",
+                        src.sectors()
+                    ),
+                ))
+            }
+            n => n,
+        };
+        if sectors > self.max_sectors {
+            return Err(Fail::new(
+                ErrorCode::OverBudget,
+                format!("a disk is 1 to {} sectors, not {sectors}", self.max_sectors),
+            ));
+        }
+        let len = sectors * SECTOR;
+
+        // Reserve the name.
+        {
+            let mut table = lock(&self.attached);
+            if fs::symlink_metadata(self.path(name)).is_ok() || table.get(name).is_some_and(|a| a.creating) {
+                return Err(already_exists(name));
+            }
+            table.entry(name.to_string()).or_default().creating = true;
+        }
+        let _reservation = Reservation { store: self, name };
+
+        let temp = self.dir.join(format!(".{name}.clone"));
+        let copied = copy_image(&mut src, &temp, len);
+        drop(src);
+        let placed = copied.and_then(|()| {
+            fs::rename(&temp, self.path(name))
+                .map_err(|e| io_fail(&format!("cannot create disk '{name}'"), e))
+        });
+        if placed.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        placed.map(|()| sectors)
     }
 
     /// The size in sectors of disk `name`, if there is one: the directory has an entry
@@ -244,11 +320,64 @@ impl Store {
             } else {
                 a.writer = false;
             }
-            if a.readers == 0 && !a.writer {
+            if a.unused() {
                 table.remove(name);
             }
         }
     }
+}
+
+/// A name taken for a clone being made ([`Store::clone_from`]); dropping it frees the
+/// name (by then the image has it, or the copy failed).
+struct Reservation<'a> {
+    store: &'a Store,
+    name: &'a str,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        let mut table = lock(&self.store.attached);
+        if let Some(a) = table.get_mut(self.name) {
+            a.creating = false;
+            if a.unused() {
+                table.remove(self.name);
+            }
+        }
+    }
+}
+
+/// Copies the image attached as `src` into a new file at `path`, `len` bytes long
+/// (zeros after the source's end), and makes it durable. On a filesystem with sparse
+/// files, chunks of zeros are skipped (the file reads as zeros there); elsewhere every
+/// byte is written, as [`Store::create`] does.
+fn copy_image(src: &mut Image, path: &Path, len: u64) -> Result<(), Fail> {
+    let fail = |e: io::Error| io_fail("cannot write the copy", e);
+    let mut file = File::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(fail)?;
+    let sparse = make_sparse(&file).is_ok();
+    file.set_len(len).map_err(fail)?;
+    let mut sector = 0;
+    while sector < src.sectors() {
+        let count = CLONE_CHUNK.min(src.sectors() - sector);
+        let data = src.read(sector, count as u32)?;
+        if !sparse || data.iter().any(|&b| b != 0) {
+            file.seek(SeekFrom::Start(sector * SECTOR))
+                .and_then(|_| file.write_all(&data))
+                .map_err(fail)?;
+        }
+        sector += count;
+    }
+    if !sparse && len > src.sectors() * SECTOR {
+        // Have the filesystem fill the zeros in now, as `create` does.
+        file.seek(SeekFrom::Start(len - SECTOR))
+            .and_then(|_| file.write_all(&[0; SECTOR_SIZE]))
+            .map_err(fail)?;
+    }
+    file.sync_all().map_err(fail)
 }
 
 /// One attachment of an image: its own file handle, for block I/O. Dropping it
@@ -421,6 +550,13 @@ fn make_sparse(_file: &File) -> io::Result<()> {
 
 fn check_name(name: &str) -> Result<(), Fail> {
     validate_name(name).map_err(|e| Fail::new(ErrorCode::InvalidName, e))
+}
+
+fn already_exists(name: &str) -> Fail {
+    Fail::new(
+        ErrorCode::AlreadyExists,
+        format!("a disk named '{name}' already exists"),
+    )
 }
 
 fn no_such_disk(name: &str) -> Fail {
@@ -651,6 +787,96 @@ mod tests {
         assert_eq!(code(r.write(0, &[0; 512])), ErrorCode::ReadOnly);
         r.flush().unwrap();
         assert_eq!(fs::read(dir.0.join("d")).unwrap()[1024..], data[..]);
+    }
+
+    #[test]
+    fn clones_are_copies() {
+        let dir = TempDir::new("clone");
+        let s = store(&dir);
+        s.create("base", 8).unwrap();
+        let mut w = s.attach("base", false).unwrap();
+        w.write(1, &[0xab; 512]).unwrap();
+        w.write(7, &[0xcd; 512]).unwrap();
+        assert_eq!(code(s.clone_from("copy", "base", 0)), ErrorCode::Busy);
+        drop(w);
+
+        assert_eq!(s.clone_from("copy", "base", 0).unwrap(), 8);
+        let base = fs::read(dir.0.join("base")).unwrap();
+        assert_eq!(fs::read(dir.0.join("copy")).unwrap(), base);
+        assert_eq!(s.clone_from("big", "base", 20).unwrap(), 20);
+        let big = fs::read(dir.0.join("big")).unwrap();
+        assert_eq!((&big[..base.len()], big.len()), (&base[..], 20 * 512));
+        assert!(big[base.len()..].iter().all(|&b| b == 0));
+
+        // Readers may share the source with the copy.
+        let r = s.attach("base", true).unwrap();
+        s.clone_from("shared", "base", 8).unwrap();
+        drop(r);
+
+        assert_eq!(code(s.clone_from("x", "none", 0)), ErrorCode::NoSuchDisk);
+        assert_eq!(code(s.clone_from("copy", "base", 0)), ErrorCode::AlreadyExists);
+        assert_eq!(code(s.clone_from("x", "base", 7)), ErrorCode::OutOfRange);
+        assert_eq!(code(s.clone_from("x", "base", 1001)), ErrorCode::OverBudget);
+        assert_eq!(code(s.clone_from("X", "base", 0)), ErrorCode::InvalidName);
+        assert_eq!(code(s.clone_from("x", "Base", 0)), ErrorCode::InvalidName);
+        // Every attachment, the copies' own included, is released.
+        assert!(lock(&s.attached).is_empty());
+        let names: Vec<_> = s.list().unwrap().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, ["base", "big", "copy", "shared"]);
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 4, "no copy left behind");
+    }
+
+    #[test]
+    fn a_name_being_cloned_is_taken() {
+        let dir = TempDir::new("reserved");
+        let s = store(&dir);
+        s.create("base", 1).unwrap();
+        // What clone_from holds while it copies.
+        lock(&s.attached).entry("new".into()).or_default().creating = true;
+        assert_eq!(code(s.create("new", 1)), ErrorCode::AlreadyExists);
+        assert_eq!(code(s.clone_from("new", "base", 0)), ErrorCode::AlreadyExists);
+        assert_eq!(code(s.attach("new", true)), ErrorCode::NoSuchDisk);
+        assert_eq!(code(s.delete("new")), ErrorCode::NoSuchDisk);
+        assert_eq!(s.list().unwrap().len(), 1);
+        drop(Reservation {
+            store: &s,
+            name: "new",
+        });
+        assert!(lock(&s.attached).is_empty());
+        s.clone_from("new", "base", 0).unwrap();
+    }
+
+    #[test]
+    fn clones_of_sparse_images_are_sparse() {
+        let dir = TempDir::new("sparse-clone");
+        let s = Arc::new(Store::open(&dir.0, MAX_IMAGE_SECTORS).unwrap());
+        let sectors = 1 << 21; // 1 GiB
+        s.create("big", sectors).unwrap();
+        let mut w = s.attach("big", false).unwrap();
+        w.write(sectors - 1, &[0xab; 512]).unwrap();
+        drop(w);
+        s.clone_from("copy", "big", 0).unwrap();
+        let mut r = s.attach("copy", true).unwrap();
+        assert_eq!(r.read(sectors - 1, 1).unwrap(), [0xab; 512]);
+        assert_eq!(r.read(0, 1).unwrap(), [0; 512]);
+        drop(r);
+        let meta = fs::metadata(dir.0.join("copy")).unwrap();
+        assert_eq!(meta.len(), sectors * SECTOR);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+            assert_ne!(meta.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE, 0);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert!(
+                meta.blocks() * 512 < 1 << 20,
+                "{} blocks allocated",
+                meta.blocks()
+            );
+        }
     }
 
     #[test]

@@ -370,6 +370,7 @@ fn the_readme_lake_example() -> Result<(), Box<dyn std::error::Error>> {
     lake.request_ok(&Message::DiskCreate {
         name: "root".into(),
         sectors: 2048,
+        source: None,
     })?;
     let source = DiskSource::parse(&format!("lake://{lake_addr}/root"))?;
     let profile = HardwareProfile {

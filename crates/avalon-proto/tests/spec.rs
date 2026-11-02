@@ -492,8 +492,17 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
             DiskCreate {
                 name: "d".into(),
                 sectors: 0x44,
+                source: None,
             },
-            P::default().str("d").u64(0x44).frame(0x0501),
+            P::default().str("d").u64(0x44).u8(0).frame(0x0501),
+        ),
+        (
+            DiskCreate {
+                name: "e".into(),
+                sectors: 0,
+                source: Some("base".into()),
+            },
+            P::default().str("e").u64(0).u8(1).str("base").frame(0x0501),
         ),
         (ListDisks, P::default().frame(0x0502)),
         (
@@ -766,17 +775,17 @@ fn optional_fields_are_tagged() {
 
 #[test]
 fn doc_examples_are_exact() {
-    // Section 6.1: Hello version 6 from agent "rt".
+    // Section 6.1: Hello version 7 from agent "rt".
     assert_eq!(
         encode(&Message::Hello {
-            version: 6,
+            version: 7,
             agent: "rt".into()
         })
         .unwrap(),
-        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x06, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
+        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x07, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
     );
     // Section 7: the version this document describes.
-    assert_eq!(PROTOCOL_VERSION, 6);
+    assert_eq!(PROTOCOL_VERSION, 7);
     // Section 6.2: StartVm by id 5.
     assert_eq!(
         encode(&Message::StartVm { vm: VmRef::Id(5) }).unwrap(),

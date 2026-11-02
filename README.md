@@ -298,7 +298,7 @@ A VM uses a Lake disk through Grail's network backend (`grail::lake::LakeDisk`):
 use avalon_proto::{Connection, DeviceSpec, DiskSource, DiskSpec, HardwareProfile, Message};
 
 let mut lake = Connection::connect("127.0.0.1:7401", "example")?;
-lake.request_ok(&Message::DiskCreate { name: "root".into(), sectors: 2048 })?; // 1 MiB
+lake.request_ok(&Message::DiskCreate { name: "root".into(), sectors: 2048, source: None })?; // 1 MiB
 let source = DiskSource::parse("lake://127.0.0.1:7401/root")?;
 let profile = HardwareProfile {
     devices: vec![DeviceSpec::Disk(DiskSpec { source, read_only: false })],
