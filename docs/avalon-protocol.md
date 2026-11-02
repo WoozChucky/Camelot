@@ -377,4 +377,4 @@ Concurrency: an image has at most one writer at a time, and a writer excludes re
 | default Avalon address | `127.0.0.1:7400` | |
 | default Lake address | `127.0.0.1:7401` | |
 
-Servers may set lower limits of their own (a RAM budget, a maximum image size) and answer with `OverBudget`. A server may also close the connection of a client that does not read what is sent to it, rather than hold unbounded output for it: Avalon does once 8 MiB of events are waiting for one client.
+Servers may set lower limits of their own (a RAM budget, a maximum image size) and answer with `OverBudget`. A server may also close the connection of a client that does not read what is sent to it, rather than hold unbounded output for it: Avalon does once 8 MiB of output (events and replies) are waiting for one client.

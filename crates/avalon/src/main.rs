@@ -47,7 +47,9 @@ fn main() -> ExitCode {
         }
     };
     on_ctrl_c(server.shutdown_handle());
-    match server.run() {
+    let result = server.run();
+    SHUT_DOWN.store(true, Ordering::SeqCst);
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("avalon: {e}");
@@ -68,6 +70,10 @@ fn value<T>(
 /// Set by the Ctrl-C handler.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+/// Set once the server has shut down (the Windows close handler waits for it).
+#[cfg_attr(not(windows), allow(dead_code))]
+static SHUT_DOWN: AtomicBool = AtomicBool::new(false);
+
 /// Shuts the server down on Ctrl-C (and SIGTERM on Unix). The handler only sets a
 /// flag, the one thing a Unix signal handler may safely do; a thread watches it. A
 /// second Ctrl-C while shutting down exits at once.
@@ -84,8 +90,9 @@ fn on_ctrl_c(handle: ShutdownHandle) {
 
 #[cfg(windows)]
 mod sys {
-    use super::INTERRUPTED;
+    use super::{INTERRUPTED, SHUT_DOWN};
     use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
     type Bool = i32;
     type HandlerRoutine = Option<unsafe extern "system" fn(u32) -> Bool>;
@@ -96,12 +103,27 @@ mod sys {
     }
 
     /// CTRL_C_EVENT, CTRL_BREAK_EVENT and CTRL_CLOSE_EVENT (wincon.h).
-    const HANDLED: [u32; 3] = [0, 1, 2];
+    const HANDLED: [u32; 3] = [0, 1, CTRL_CLOSE_EVENT];
+    const CTRL_CLOSE_EVENT: u32 = 2;
+
+    /// How long the handler holds a closing console window open for the shutdown.
+    /// Windows ends the process anyway some 5 s after a close event.
+    const CLOSE_GRACE: Duration = Duration::from_millis(4500);
 
     /// Runs on a thread Windows creates for the event.
     unsafe extern "system" fn on_ctrl(event: u32) -> Bool {
         if !HANDLED.contains(&event) {
             return 0;
+        }
+        if event == CTRL_CLOSE_EVENT {
+            // Windows ends the process as soon as this returns, so wait here for the
+            // shutdown the watcher thread starts.
+            INTERRUPTED.store(true, Ordering::SeqCst);
+            let start = Instant::now();
+            while !SHUT_DOWN.load(Ordering::SeqCst) && start.elapsed() < CLOSE_GRACE {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return 1;
         }
         if INTERRUPTED.swap(true, Ordering::SeqCst) {
             std::process::exit(130);

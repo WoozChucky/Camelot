@@ -18,11 +18,19 @@ pub const SLOW: Duration = Duration::from_secs(10);
 
 /// A server on 127.0.0.1 and an ephemeral port, quiet, with a RAM budget.
 pub fn server(max_ram: Option<u64>) -> ServerThread {
-    let config = Config {
+    server_with(Config { max_ram, ..quiet() })
+}
+
+/// The configuration [`server`] starts from: 127.0.0.1, an ephemeral port, no log.
+pub fn quiet() -> Config {
+    Config {
         listen: "127.0.0.1:0".parse().unwrap(),
-        max_ram,
         log: false,
-    };
+        ..Config::default()
+    }
+}
+
+pub fn server_with(config: Config) -> ServerThread {
     Server::bind(&config).unwrap().spawn().unwrap()
 }
 
@@ -116,6 +124,20 @@ pub fn info(conn: &mut Connection<TcpStream>, vm: u32) -> VmDetails {
     match conn.request(&Message::GetVmInfo { vm: VmRef::Id(vm) }) {
         Ok(Message::VmInfo(details)) => details,
         other => panic!("info {vm}: {other:?}"),
+    }
+}
+
+/// Slices VM `vm`'s thread has run (calls of Grail's `run_for`).
+pub fn slices(server: &ServerThread, vm: u32) -> u64 {
+    server.debug_vm(vm).expect("the VM exists").slices
+}
+
+/// Waits until `done` holds, polling.
+pub fn wait_until(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(start.elapsed() < limit, "still waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 

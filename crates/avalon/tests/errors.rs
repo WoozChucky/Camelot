@@ -4,12 +4,16 @@
 
 mod common;
 
+use avalon::Config;
 use avalon_proto::{
-    encode, ty, DeviceSpec, DiskSource, DiskSpec, ErrorCode, Frame, HardwareProfile, Message, VmRef,
+    encode, ty, DeviceSpec, DiskSource, DiskSpec, ErrorCode, Frame, HardwareProfile, Message, VmRef, VmState,
 };
 use common::*;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn create_error(
     conn: &mut avalon_proto::Connection<TcpStream>,
@@ -475,9 +479,242 @@ fn a_client_that_leaves_is_detached() {
         console.wait_for("x");
         drop(console);
     }
+    // Detached as they left, not only once the VM next writes to them.
+    wait_until("the clients to be detached", SLOW, || {
+        server.debug_vm(id).unwrap().consoles == 0
+    });
     let mut last = Console::attach(&server, VmRef::Id(id));
     assert_eq!(last.scrollback, b"xxx");
     last.send(b"y");
     last.wait_for("y");
     server.stop().unwrap();
+}
+
+/// Reads what the server sends on `s` until it closes the connection; panics if it
+/// is still open after `limit`. Returns the bytes read.
+fn read_until_closed(s: &mut TcpStream, limit: Duration) -> Vec<u8> {
+    let start = Instant::now();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let left = limit.saturating_sub(start.elapsed());
+        assert!(!left.is_zero(), "the server did not close the connection");
+        s.set_read_timeout(Some(left)).unwrap();
+        match s.read(&mut buf) {
+            Ok(0) => return got,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return got,
+        }
+    }
+}
+
+#[test]
+fn a_client_gets_a_limited_time_to_say_hello() {
+    let timeout = Duration::from_millis(300);
+    let server = server_with(Config {
+        handshake_timeout: timeout,
+        ..quiet()
+    });
+
+    // Silent: closed once the time is up, with nothing said.
+    let start = Instant::now();
+    let mut silent = TcpStream::connect(server.addr()).unwrap();
+    assert!(read_until_closed(&mut silent, SLOW).is_empty());
+    assert!(start.elapsed() >= timeout - Duration::from_millis(50));
+
+    // Trickling a long Hello in byte by byte, each byte well within the time: still
+    // closed once the time is up, long before the Hello is complete.
+    let hello = encode(&Message::Hello {
+        version: avalon_proto::PROTOCOL_VERSION,
+        agent: "a".repeat(300),
+    })
+    .unwrap();
+    let mut slow = TcpStream::connect(server.addr()).unwrap();
+    slow.set_nodelay(true).unwrap();
+    let mut writer = slow.try_clone().unwrap();
+    let trickle = std::thread::spawn(move || {
+        for &b in &hello {
+            if writer.write_all(&[b]).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let start = Instant::now();
+    assert!(read_until_closed(&mut slow, SLOW).is_empty(), "no Welcome");
+    assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+    trickle.join().unwrap();
+    wait_until("the connections to end", SLOW, || server.debug_connections() == 0);
+
+    // Once the session is open, the time limit is gone.
+    let mut conn = connect(&server);
+    std::thread::sleep(timeout * 2);
+    assert_eq!(
+        conn.request(&Message::Ping { token: 5 }).unwrap(),
+        Message::Pong { token: 5 }
+    );
+    server.stop().unwrap();
+}
+
+/// A client that attaches to a chatty console and stops reading is cut off once
+/// [`avalon::MAX_QUEUED`] bytes wait for it; the VM and the other clients carry on.
+#[test]
+fn a_client_that_stops_reading_is_cut_off() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    // Prints `x` forever, a few instructions apart.
+    let chatty = guest(
+        "
+    .globl _start
+_start:
+    li    t0, 0x10000000
+    li    t1, 120
+1:  sb    t1, 0(t0)
+    li    t2, 4
+2:  addi  t2, t2, -1
+    bnez  t2, 2b
+    j     1b
+",
+    );
+    let id = create(&mut rt, "chatty", profile(1, None), chatty);
+
+    // A client that reads everything, counting the console's bytes.
+    let received = Arc::new(AtomicU64::new(0));
+    let mut reader = connect(&server);
+    reader.get_ref().set_read_timeout(None).unwrap();
+    reader
+        .request(&Message::ConsoleAttach { vm: VmRef::Id(id) })
+        .unwrap();
+    let reading = {
+        let received = Arc::clone(&received);
+        std::thread::spawn(move || {
+            while let Ok(msg) = reader.recv() {
+                if let Message::ConsoleOutput { data, .. } = msg {
+                    received.fetch_add(data.len() as u64, Ordering::SeqCst);
+                }
+            }
+        })
+    };
+    // And one that attaches, then reads nothing more.
+    let mut stuck = connect(&server);
+    stuck
+        .request(&Message::ConsoleAttach { vm: VmRef::Id(id) })
+        .unwrap();
+    assert_eq!(server.debug_connections(), 3);
+    assert_eq!(server.debug_vm(id).unwrap().consoles, 2);
+
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    let limit = Duration::from_secs(60);
+    wait_until("the stuck client to be cut off", limit, || {
+        server.debug_vm(id).unwrap().consoles == 1
+    });
+    // Its connection ends: the server's threads for it are gone, and what reaches it is
+    // what was in flight, then the end.
+    wait_until("its connection to end", SLOW, || server.debug_connections() == 2);
+    let rest = read_until_closed(stuck.get_mut(), SLOW);
+    assert!(rest.len() < 2 * avalon::MAX_QUEUED, "{} bytes", rest.len());
+
+    // The VM runs on, the reading client still gets its output, requests are answered.
+    let at = received.load(Ordering::SeqCst);
+    let steps = info(&mut rt, id).steps;
+    wait_until("more output", SLOW, || {
+        received.load(Ordering::SeqCst) > at + 100_000
+    });
+    assert!(info(&mut rt, id).steps > steps);
+    assert_eq!(state(&mut rt, id), VmState::Running);
+    assert_eq!(
+        rt.request(&Message::Ping { token: 8 }).unwrap(),
+        Message::Pong { token: 8 }
+    );
+    server.stop().unwrap();
+    reading.join().unwrap();
+}
+
+/// A create whose disk image takes a long time to open holds up no other request:
+/// here a FIFO, whose open blocks until someone opens it for writing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_slow_create_holds_up_no_one_else() {
+    use std::os::unix::ffi::OsStrExt;
+
+    extern "C" {
+        fn mkfifo(path: *const std::os::raw::c_char, mode: u32) -> i32;
+    }
+    let dir = std::env::temp_dir().join(format!("avalon-fifo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("disk.img");
+    let _ = std::fs::remove_file(&fifo);
+    let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path and a mode.
+    assert_eq!(unsafe { mkfifo(path.as_ptr(), 0o600) }, 0);
+
+    let server = server(Some(64 * MIB));
+    let profile_with_fifo = HardwareProfile {
+        devices: vec![DeviceSpec::Disk(DiskSpec {
+            source: DiskSource::File(fifo.to_string_lossy().into_owned()),
+            read_only: true,
+        })],
+        ..HardwareProfile::with_ram(40 * MIB)
+    };
+    let slow = {
+        let mut conn = connect(&server);
+        conn.get_ref().set_read_timeout(None).unwrap();
+        std::thread::spawn(move || {
+            conn.request(&Message::CreateVm {
+                name: "slow".into(),
+                profile: profile_with_fifo,
+                program: spinner(),
+            })
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!slow.is_finished(), "the open of a FIFO blocks");
+
+    // Everyone else is served meanwhile; the slow VM's name and RAM are taken.
+    let mut rt = connect(&server);
+    let start = Instant::now();
+    assert_eq!(
+        rt.request(&Message::ListVms).unwrap(),
+        Message::VmList { vms: vec![] }
+    );
+    assert_eq!(
+        create_error(&mut rt, "slow", profile(1, None), spinner()),
+        ErrorCode::AlreadyExists
+    );
+    assert_eq!(
+        create_error(&mut rt, "big", profile(30, None), spinner()),
+        ErrorCode::OverBudget
+    );
+    let other = create(&mut rt, "other", profile(20, None), spinner());
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(other) }).unwrap();
+    assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+    assert!(!slow.is_finished());
+
+    // A writer lets the open finish. A FIFO reads as an empty image: a disk of no
+    // sectors, or one Grail refuses; either way the create ends.
+    let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+    match slow.join().unwrap() {
+        Ok(Message::VmCreated { id }) => {
+            assert_ne!(id, other);
+            rt.request_ok(&Message::DestroyVm {
+                vm: VmRef::Name("slow".into()),
+            })
+            .unwrap();
+        }
+        Err(avalon_proto::Error::Remote {
+            code: ErrorCode::InvalidProfile,
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+    drop(writer);
+    // Its name and RAM are free again.
+    create(&mut rt, "slow", profile(40, None), spinner());
+    server.stop().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

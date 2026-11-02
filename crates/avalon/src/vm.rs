@@ -45,6 +45,7 @@ const SLICE: u64 = 100_000;
 const PARKED_NAP: Duration = Duration::from_millis(50);
 
 pub struct Vm {
+    /// Set by the server when the VM goes into its table.
     pub id: u32,
     pub name: String,
     pub profile: HardwareProfile,
@@ -52,6 +53,9 @@ pub struct Vm {
     pub devices: Vec<DeviceEntry>,
     /// Steps run so far (instructions, and idle ticks of a machine waiting in `wfi`).
     steps: AtomicU64,
+    /// Slices run so far (calls of `run_for`, empty ones included): how tests see that
+    /// the thread sleeps when it has nothing to run.
+    slices: AtomicU64,
     inner: Mutex<Inner>,
     /// Signalled whenever `inner` changes in a way the thread or a waiting request
     /// cares about.
@@ -110,10 +114,11 @@ fn wrong_state(vm: &Vm, state: VmState, want: &str) -> Fail {
 }
 
 impl Vm {
-    /// Builds the machine `config` describes and loads `program` into it. Errors:
-    /// `InvalidProfile` (a disk image that cannot be opened) and `InvalidProgram`.
+    /// Builds the machine `config` describes and loads `program` into it, as VM 0 until
+    /// the server gives it an id. Errors: `InvalidProfile` (a disk image that cannot be
+    /// opened) and `InvalidProgram`. This can take a while (it opens files on the host
+    /// and allocates the guest's RAM), so the server calls it without holding its table.
     pub fn new(
-        id: u32,
         name: String,
         profile: HardwareProfile,
         config: MachineConfig,
@@ -142,11 +147,12 @@ impl Vm {
             })
             .collect();
         Ok(Vm {
-            id,
+            id: 0,
             name,
             profile,
             devices,
             steps: AtomicU64::new(0),
+            slices: AtomicU64::new(0),
             inner: Mutex::new(Inner {
                 state: VmState::Created,
                 gone: false,
@@ -178,6 +184,15 @@ impl Vm {
 
     pub fn steps(&self) -> u64 {
         self.steps.load(Ordering::Relaxed)
+    }
+
+    pub fn slices(&self) -> u64 {
+        self.slices.load(Ordering::Relaxed)
+    }
+
+    /// How many clients are attached to the console.
+    pub fn console_count(&self) -> usize {
+        self.lock().consoles.len()
     }
 
     pub fn summary(&self) -> VmSummary {
@@ -397,7 +412,12 @@ impl Vm {
             }
 
             let steps = machine.run_for(SLICE, &mut |_| {});
+            // `run_for` ends a slice early once the guest has written FB_PRESENT, until
+            // the host takes that frame: take it, or every later slice is a single step.
+            // (Nothing streams screens yet; this is where a frame would be sent.)
+            machine.cpu.bus.fb.take_present();
             self.steps.fetch_add(steps, Ordering::Relaxed);
+            self.slices.fetch_add(1, Ordering::Relaxed);
             let output = self.output.take();
 
             let mut inner = self.lock();
@@ -487,7 +507,6 @@ mod tests {
     #[test]
     fn scrollback_keeps_the_latest_bytes() {
         let vm = Vm::new(
-            1,
             "t".into(),
             HardwareProfile::with_ram(4096),
             MachineConfig::with_ram(4096),
@@ -503,7 +522,6 @@ mod tests {
         ));
 
         let vm = Vm::new(
-            1,
             "t".into(),
             HardwareProfile::with_ram(1 << 20),
             MachineConfig::with_ram(1 << 20),

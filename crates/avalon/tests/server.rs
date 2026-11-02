@@ -377,9 +377,12 @@ fn a_full_speed_vm_waiting_for_input_sleeps() {
     // Parked in wfi with only the UART interrupt enabled, it runs one slice every
     // 50 ms rather than spinning (which is tens of millions of steps a second).
     let before = info(&mut rt, id).steps;
+    let slices_before = slices(&server, id);
     std::thread::sleep(Duration::from_millis(300));
     let idle_steps = info(&mut rt, id).steps - before;
+    let idle_slices = slices(&server, id) - slices_before;
     assert!(idle_steps < 5_000_000, "{idle_steps} steps while idle");
+    assert!(idle_slices < 100, "{idle_slices} slices while idle");
     // And input still wakes it at once.
     let start = Instant::now();
     console.send(b"b");
@@ -403,6 +406,7 @@ fn a_real_time_vm_keeps_to_its_clock() {
     let start = Instant::now();
     std::thread::sleep(Duration::from_millis(300));
     let steps = info(&mut rt, id).steps;
+    let slices = slices(&server, id);
     let elapsed = start.elapsed().as_secs_f64();
     // Never ahead of the clock (give or take a 1 ms batch); behind only on a slow host.
     assert!(
@@ -410,6 +414,49 @@ fn a_real_time_vm_keeps_to_its_clock() {
         "{steps} steps in {elapsed} s"
     );
     assert!(steps > 50_000, "{steps} steps in {elapsed} s");
+    // And the thread sleeps between its ~1 ms batches instead of asking the machine
+    // for more steps over and over (millions of empty slices a second).
+    assert!(slices < 3_000, "{slices} slices in {elapsed} s");
+    server.stop().unwrap();
+}
+
+#[test]
+fn a_guest_that_presents_frames_runs_at_full_speed() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    // Presents a frame once, then prints `P` and counts forever.
+    let presenter = guest(
+        "
+    .globl _start
+_start:
+    li    t0, 0x30000014
+    sw    zero, 0(t0)
+    li    t0, 0x10000000
+    li    t1, 80
+    sb    t1, 0(t0)
+1:  addi  t2, t2, 1
+    j     1b
+",
+    );
+    let id = create(&mut rt, "presenter", profile(4, None), presenter);
+    let mut console = Console::attach(&server, VmRef::Id(id));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    console.wait_for("P");
+    let (steps_before, slices_before) = (info(&mut rt, id).steps, slices(&server, id));
+    std::thread::sleep(Duration::from_millis(300));
+    let steps = info(&mut rt, id).steps - steps_before;
+    let slices = slices(&server, id) - slices_before;
+    // The frame is taken, so slices are full ones again rather than a step each.
+    assert!(slices > 0);
+    assert!(steps / slices > 10_000, "{steps} steps in {slices} slices");
+
+    // examples/colorbars draws, presents once and halts.
+    let bars = create(&mut rt, "colorbars", profile(4, None), example("colorbars"));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(bars) }).unwrap();
+    assert_eq!(
+        wait_for_state(&mut rt, bars, |s| s != VmState::Running),
+        VmState::Exited(0)
+    );
     server.stop().unwrap();
 }
 
@@ -482,6 +529,37 @@ fn many_clients_at_once() {
     server.stop().unwrap();
 }
 
+/// The README's client example is the test below, but for the server's address, where
+/// the program is read from, and the live output the README leaves in a comment: each
+/// of its statements must be there, word for word (spaces and commas aside, so
+/// rustfmt's line breaks do not count).
+#[test]
+fn the_readme_client_example_is_the_test() {
+    let readme = include_str!("../../../README.md");
+    let section = &readme[readme.find("## The Avalon platform").unwrap()..];
+    let start = section.find("```rust\n").unwrap() + "```rust\n".len();
+    let block = &section[start..start + section[start..].find("```").unwrap()];
+    let squash = |s: &str| {
+        s.chars()
+            .filter(|c| !c.is_whitespace() && *c != ',')
+            .collect::<String>()
+    };
+    let test = squash(include_str!("server.rs"));
+    let mut checked = 0;
+    for line in block.lines() {
+        if line.is_empty() || line.starts_with("use ") || line.starts_with("print!") {
+            continue;
+        }
+        let line = line.replace("\"127.0.0.1:7400\"", "addr.as_str()").replace(
+            "std::fs::read(\"examples/sysinfo/sysinfo.elf\")",
+            "std::fs::read(examples_dir().join(\"sysinfo/sysinfo.elf\"))",
+        );
+        assert!(test.contains(&squash(&line)), "not in the test: {line}");
+        checked += 1;
+    }
+    assert_eq!(checked, 6);
+}
+
 /// The client example in the README, against an in-process server.
 #[test]
 fn the_readme_client_example() -> Result<(), Box<dyn std::error::Error>> {
@@ -504,23 +582,24 @@ fn the_readme_client_example() -> Result<(), Box<dyn std::error::Error>> {
         panic!()
     };
     avalon.request_ok(&Message::StartVm { vm: VmRef::Id(id) })?;
-    let Message::ConsoleAttached { mut scrollback, .. } =
+    let Message::ConsoleAttached { scrollback, .. } =
         avalon.request(&Message::ConsoleAttach { vm: VmRef::Id(id) })?
     else {
         panic!()
     };
 
     // Then the rest of the output, live.
+    let mut output = scrollback;
     let expected = sysinfo_output(64, 2_000_000, true);
     avalon.get_ref().set_read_timeout(Some(SLOW))?;
-    while scrollback.len() < expected.len() {
+    while output.len() < expected.len() {
         match avalon.recv()? {
-            Message::ConsoleOutput { data, .. } => scrollback.extend(data),
+            Message::ConsoleOutput { data, .. } => output.extend(data),
             Message::VmStateChanged { .. } => {}
             other => panic!("{other:?}"),
         }
     }
-    assert_eq!(String::from_utf8(scrollback)?, expected);
+    assert_eq!(String::from_utf8(output)?, expected);
     server.stop()?;
     Ok(())
 }

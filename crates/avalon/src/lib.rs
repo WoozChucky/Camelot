@@ -22,7 +22,8 @@ mod vm;
 pub use outbox::MAX_QUEUED;
 pub use profile::machine_config;
 pub use server::{
-    parse_listen, parse_max_ram, Config, Server, ServerThread, ShutdownHandle, DEFAULT_MAX_RAM,
+    parse_listen, parse_max_ram, Config, Server, ServerThread, ShutdownHandle, VmDebug, DEFAULT_MAX_RAM,
+    HANDSHAKE_TIMEOUT,
 };
 pub use vm::SCROLLBACK;
 

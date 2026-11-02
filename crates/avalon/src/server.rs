@@ -30,8 +30,8 @@ pub const DEFAULT_MAX_RAM: u64 = 4096 * MIB;
 /// What the server says in `Welcome`.
 const SERVER_NAME: &str = concat!("avalon ", env!("CARGO_PKG_VERSION"));
 
-/// How long a new connection has to send its `Hello`.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a new connection has to send its `Hello`, by default.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long shutdown waits for a client's last frames to go out before it closes the
 /// socket anyway, and then for its threads to end.
@@ -51,6 +51,9 @@ pub struct Config {
     pub max_ram: Option<u64>,
     /// Log connections and VM state changes to stderr.
     pub log: bool,
+    /// How long a new connection has to complete its `Hello` (all of it, however
+    /// slowly it trickles in) before it is closed.
+    pub handshake_timeout: Duration,
 }
 
 impl Default for Config {
@@ -59,6 +62,7 @@ impl Default for Config {
             listen: DEFAULT_AVALON_ADDR.parse().expect("the default address parses"),
             max_ram: Some(DEFAULT_MAX_RAM),
             log: true,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }
 }
@@ -124,6 +128,7 @@ pub struct ServerThread {
 struct Shared {
     max_ram: Option<u64>,
     log: bool,
+    handshake_timeout: Duration,
     addr: SocketAddr,
     stopping: AtomicBool,
     table: Mutex<Table>,
@@ -132,6 +137,8 @@ struct Shared {
 
 struct Table {
     vms: BTreeMap<u32, Arc<Vm>>,
+    /// VMs being built (outside the lock): their names and RAM are taken already.
+    pending: Vec<(String, u64)>,
     next_id: u32,
     /// The server is shutting down: no more VMs.
     closed: bool,
@@ -164,10 +171,12 @@ impl Server {
             shared: Arc::new(Shared {
                 max_ram: config.max_ram,
                 log: config.log,
+                handshake_timeout: config.handshake_timeout,
                 addr,
                 stopping: AtomicBool::new(false),
                 table: Mutex::new(Table {
                     vms: BTreeMap::new(),
+                    pending: Vec::new(),
                     next_id: 1,
                     closed: false,
                 }),
@@ -258,6 +267,22 @@ impl ServerThread {
         self.handle.clone()
     }
 
+    /// For tests: how VM `id`'s thread is doing.
+    #[doc(hidden)]
+    pub fn debug_vm(&self, id: u32) -> Option<VmDebug> {
+        let vm = lock(&self.handle.shared.table).vms.get(&id).cloned()?;
+        Some(VmDebug {
+            slices: vm.slices(),
+            consoles: vm.console_count(),
+        })
+    }
+
+    /// For tests: how many connections the server is serving (handshake or not).
+    #[doc(hidden)]
+    pub fn debug_connections(&self) -> usize {
+        lock(&self.handle.shared.clients).live.len()
+    }
+
     /// Shuts the server down and waits until it has.
     pub fn stop(self) -> io::Result<()> {
         self.handle.shutdown();
@@ -265,6 +290,16 @@ impl ServerThread {
             .join()
             .unwrap_or_else(|_| Err(io::Error::other("the server thread panicked")))
     }
+}
+
+/// What [`ServerThread::debug_vm`] reports.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmDebug {
+    /// Calls of Grail's `run_for` so far, empty ones included.
+    pub slices: u64,
+    /// Clients attached to the console.
+    pub consoles: usize,
 }
 
 impl Shared {
@@ -280,7 +315,7 @@ impl Shared {
         let socket = Socket {
             stream,
             hang_up: Arc::clone(&hang_up),
-            deadline: Some(Instant::now() + HANDSHAKE_TIMEOUT),
+            deadline: Some(Instant::now() + self.handshake_timeout),
         };
         let shared = Arc::clone(&self);
         let spawned = std::thread::Builder::new()
@@ -336,6 +371,7 @@ impl Shared {
             }
         };
         conn.get_mut().deadline = None;
+        let _ = conn.get_ref().stream.set_read_timeout(Some(POLL));
         let outbox = Arc::new(Outbox::new(id, move || {
             hang_up.store(true, Ordering::SeqCst);
             let _ = cut.shutdown(Shutdown::Both);
@@ -387,7 +423,13 @@ impl Shared {
 
         session.detach_everywhere();
         outbox.close();
-        let _ = writer.join();
+        // A writer blocked on a client that stopped reading (one that was cut off, say)
+        // is not woken by its socket's shutdown everywhere: on Windows it waits for the
+        // peer. Give it a moment; past that it is left to end by itself, once the
+        // client reads or goes, and the connection is forgotten now.
+        if outbox.wait_done(DRAIN_TIMEOUT) {
+            let _ = writer.join();
+        }
         self.forget(id);
         if self.log {
             eprintln!("avalon: {peer}: '{agent}' disconnected");
@@ -465,48 +507,29 @@ impl Shared {
 
     /// `CreateVm`: checks the name, the profile, the RAM budget and the program, in
     /// that order, and adds the VM in state created.
+    ///
+    /// The name and the RAM are reserved under the table's lock, so two creates cannot
+    /// both take the last of the budget or the same name; the machine is built without
+    /// it, so a slow build (a disk image on a slow path, gigabytes of RAM) holds up no
+    /// other request.
     fn create(&self, name: String, profile: HardwareProfile, program: &[u8]) -> Result<u32, Fail> {
         validate_name(&name).map_err(|e| Fail::new(ErrorCode::InvalidName, e))?;
         let config = machine_config(&profile).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
-        // Held to the end, so two creates cannot both take the last of the budget or
-        // the same name.
+        self.reserve(&name, profile.ram_size)?;
+        let built = self.build(name.clone(), profile, config, program);
         let mut table = lock(&self.table);
+        if let Some(i) = table.pending.iter().position(|(n, _)| *n == name) {
+            table.pending.swap_remove(i);
+        }
+        let mut vm = built?;
         if table.closed {
-            return Err(Fail::new(ErrorCode::Internal, "the server is shutting down"));
-        }
-        if table.vms.values().any(|vm| vm.name == name) {
-            return Err(Fail::new(
-                ErrorCode::AlreadyExists,
-                format!("a VM named '{name}' already exists"),
-            ));
-        }
-        let used: u64 = table.vms.values().map(|vm| vm.profile.ram_size).sum();
-        if let Some(max) = self.max_ram {
-            if used + profile.ram_size > max {
-                return Err(Fail::new(
-                    ErrorCode::OverBudget,
-                    format!(
-                        "the VM needs {} of RAM, and {} of the server's {} are in use",
-                        show_size(profile.ram_size),
-                        show_size(used),
-                        show_size(max)
-                    ),
-                ));
-            }
-        }
-        // Grail allocates RAM with no way to fail but aborting the process, so make
-        // sure the host can give it first.
-        if Vec::<u8>::new().try_reserve_exact(config.ram_size).is_err() {
-            return Err(Fail::new(
-                ErrorCode::OverBudget,
-                format!("the host cannot allocate {} of RAM", show_size(profile.ram_size)),
-            ));
+            return Err(shutting_down());
         }
         let id = table.next_id;
         let next = id
             .checked_add(1)
             .ok_or_else(|| Fail::new(ErrorCode::Internal, "out of VM ids"))?;
-        let vm = Vm::new(id, name, profile, config, program, self.log)?;
+        vm.id = id;
         if self.log {
             eprintln!(
                 "avalon: VM {id} ('{}') created: {} RAM, {}",
@@ -521,6 +544,58 @@ impl Shared {
         table.next_id = next;
         table.vms.insert(id, Arc::new(vm));
         Ok(id)
+    }
+
+    /// Takes `name` and `ram` bytes of the budget for a VM about to be built.
+    fn reserve(&self, name: &str, ram: u64) -> Result<(), Fail> {
+        let mut table = lock(&self.table);
+        if table.closed {
+            return Err(shutting_down());
+        }
+        let taken =
+            table.vms.values().any(|vm| vm.name == name) || table.pending.iter().any(|(n, _)| n == name);
+        if taken {
+            return Err(Fail::new(
+                ErrorCode::AlreadyExists,
+                format!("a VM named '{name}' already exists"),
+            ));
+        }
+        let used: u64 = table.vms.values().map(|vm| vm.profile.ram_size).sum::<u64>()
+            + table.pending.iter().map(|(_, ram)| ram).sum::<u64>();
+        if let Some(max) = self.max_ram {
+            if used.saturating_add(ram) > max {
+                return Err(Fail::new(
+                    ErrorCode::OverBudget,
+                    format!(
+                        "the VM needs {} of RAM, and {} of the server's {} are in use",
+                        show_size(ram),
+                        show_size(used),
+                        show_size(max)
+                    ),
+                ));
+            }
+        }
+        table.pending.push((name.to_string(), ram));
+        Ok(())
+    }
+
+    /// Builds a reserved VM, without the table's lock.
+    fn build(
+        &self,
+        name: String,
+        profile: HardwareProfile,
+        config: grail::MachineConfig,
+        program: &[u8],
+    ) -> Result<Vm, Fail> {
+        // Grail allocates RAM with no way to fail but aborting the process, so make
+        // sure the host can give it first.
+        if Vec::<u8>::new().try_reserve_exact(config.ram_size).is_err() {
+            return Err(Fail::new(
+                ErrorCode::OverBudget,
+                format!("the host cannot allocate {} of RAM", show_size(profile.ram_size)),
+            ));
+        }
+        Vm::new(name, profile, config, program, self.log)
     }
 
     fn destroy(&self, vm: &VmRef) -> Result<(), Fail> {
@@ -543,8 +618,9 @@ impl Shared {
 /// A client's socket as its reading thread sees it. Shutting a socket down from
 /// another thread does not wake a blocked read on every platform (on Windows it waits
 /// for the peer), so reads time out every [`POLL`] and are retried, invisibly to the
-/// frame reader, until the connection is told to hang up or the handshake deadline
-/// passes.
+/// frame reader, until the connection is told to hang up. Until the handshake is done,
+/// every read also fails once the deadline has passed, data or not: a client that
+/// trickles its `Hello` in byte by byte gets no more time than a silent one.
 struct Socket {
     stream: TcpStream,
     hang_up: Arc<AtomicBool>,
@@ -555,13 +631,17 @@ struct Socket {
 impl Read for Socket {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
+            if let Some(deadline) = self.deadline {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                self.stream.set_read_timeout(Some(left.min(POLL)))?;
+            }
             match self.stream.read(buf) {
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
                     if self.hang_up.load(Ordering::SeqCst) {
                         return Err(io::ErrorKind::ConnectionAborted.into());
-                    }
-                    if self.deadline.is_some_and(|d| Instant::now() >= d) {
-                        return Err(io::ErrorKind::TimedOut.into());
                     }
                 }
                 result => return result,
@@ -578,6 +658,10 @@ impl Write for Socket {
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
     }
+}
+
+fn shutting_down() -> Fail {
+    Fail::new(ErrorCode::Internal, "the server is shutting down")
 }
 
 fn no_such_vm(vm: &VmRef) -> Fail {
