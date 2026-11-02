@@ -1,6 +1,6 @@
-//! The few Win32 (user32/gdi32/kernel32) declarations the framebuffer window needs,
-//! written by hand instead of pulling in a bindings crate. Names and layouts follow
-//! the Windows SDK headers (winuser.h, wingdi.h).
+//! The few Win32 (user32/gdi32/kernel32) declarations the framebuffer window and the
+//! console's raw mode need, written by hand instead of pulling in a bindings crate.
+//! Names and layouts follow the Windows SDK headers (winuser.h, wingdi.h, consoleapi.h).
 
 #![allow(non_snake_case, clippy::upper_case_acronyms)]
 
@@ -78,6 +78,15 @@ pub const BI_RGB: u32 = 0;
 pub const DIB_RGB_COLORS: u32 = 0;
 pub const SRCCOPY: u32 = 0x00cc_0020;
 pub const COLORONCOLOR: i32 = 3;
+
+// Console input (consoleapi.h, processenv.h).
+/// `GetStdHandle` argument: `(DWORD)-10`.
+pub const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+pub const ENABLE_LINE_INPUT: u32 = 0x0002;
+pub const ENABLE_ECHO_INPUT: u32 = 0x0004;
+/// A `SetConsoleCtrlHandler` routine: gets the event, returns TRUE if it handled it.
+#[allow(non_camel_case_types)]
+pub type PHANDLER_ROUTINE = Option<unsafe extern "system" fn(u32) -> BOOL>;
 
 #[repr(C)]
 pub struct WNDCLASSEXW {
@@ -175,6 +184,10 @@ pub struct BITMAPINFO {
 #[link(name = "kernel32")]
 extern "system" {
     pub fn GetModuleHandleW(lpModuleName: *const u16) -> HINSTANCE;
+    pub fn GetStdHandle(nStdHandle: u32) -> HANDLE;
+    pub fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *mut u32) -> BOOL;
+    pub fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: u32) -> BOOL;
+    pub fn SetConsoleCtrlHandler(HandlerRoutine: PHANDLER_ROUTINE, Add: BOOL) -> BOOL;
 }
 
 #[link(name = "user32")]

@@ -30,8 +30,9 @@ void kernel_vec(void);
 /* Called by kernel_vec with the saved registers. */
 void kernel_trap(struct trap_frame *f);
 
-/* Enables the interrupts the kernel handles (the forwarded timer tick) and
- * turns interrupts on in S-mode. */
+/* Sets up the PLIC and enables the interrupts the kernel handles (the
+ * forwarded timer tick and external interrupts), then turns interrupts on in
+ * S-mode. */
 void trap_init(void);
 
 /* Name of a trap cause, e.g. "illegal instruction". `cause` is a raw scause
