@@ -209,7 +209,11 @@ impl Shell {
         let mut buf = [0u8; 512];
         while !self.output.ends_with(end) {
             let n = self.stream.read(&mut buf).unwrap();
-            assert!(n > 0, "the shell ended: {:?}", String::from_utf8_lossy(&self.output));
+            assert!(
+                n > 0,
+                "the shell ended: {:?}",
+                String::from_utf8_lossy(&self.output)
+            );
             self.output.extend_from_slice(&buf[..n]);
         }
     }
@@ -372,9 +376,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         "cargo run --release -p herald -- --server {} vm001",
         platform.avalon
     )));
-    assert!(summary.contains(&format!(
-        "cargo run --release -p herald -- --tcp {shd}"
-    )));
+    assert!(summary.contains(&format!("cargo run --release -p herald -- --tcp {shd}")));
     check_summary(&summary, 4);
 
     // Ctrl-C: the flag `up`'s handler sets.

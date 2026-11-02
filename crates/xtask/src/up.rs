@@ -713,9 +713,9 @@ impl Platform {
         // The VM to attach to: the demo's, or the one the create command makes.
         let vm = if demo { DEMO_VM } else { "web" };
         let shell = match self.shd {
-            Some(shd) if demo => format!(
-                "\x20 cargo run --release -p herald -- --tcp {shd}      (a shell of its own: shd)\n"
-            ),
+            Some(shd) if demo => {
+                format!("\x20 cargo run --release -p herald -- --tcp {shd}      (a shell of its own: shd)\n")
+            }
             _ => String::new(),
         };
         format!(

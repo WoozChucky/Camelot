@@ -161,7 +161,10 @@ struct Proc {
 fn parse_ps(out: &str) -> Vec<Proc> {
     let mut lines = out.lines();
     assert_eq!(
-        lines.next().map(str::split_whitespace).map(Iterator::collect::<Vec<_>>),
+        lines
+            .next()
+            .map(str::split_whitespace)
+            .map(Iterator::collect::<Vec<_>>),
         Some(vec!["PID", "PPID", "STATE", "SIZE", "NAME"]),
         "{out}"
     );
@@ -180,7 +183,10 @@ fn parse_ps(out: &str) -> Vec<Proc> {
 
 /// The pid in a background job's `[PID]` line.
 fn job_pid(out: &str) -> u32 {
-    let line = out.lines().find(|l| l.starts_with('[')).unwrap_or_else(|| panic!("{out}"));
+    let line = out
+        .lines()
+        .find(|l| l.starts_with('['))
+        .unwrap_or_else(|| panic!("{out}"));
     line[1..line.find(']').unwrap()].parse().unwrap()
 }
 
@@ -191,14 +197,15 @@ fn shd_log(out: &str) -> Vec<String> {
         .filter_map(|l| l.find("shd: ").map(|at| &l[at + 5..]))
         .filter(|l| l.contains("10.0.2.2:"))
         .map(|l| {
-            let l = match (l.find('['), l.find(']')) {
-                (Some(0), Some(end)) => format!("[]{}", &l[end + 1..]),
-                _ => l.to_string(),
-            };
-            match (l.find("10.0.2.2:"), l[l.find("10.0.2.2:").map_or(0, |a| a + 9)..].find(' ')) {
-                (Some(at), Some(space)) => format!("{}{}", &l[..at + 9], &l[at + 9 + space..]),
-                _ => l,
-            }
+            let words: Vec<&str> = l
+                .split(' ')
+                .map(|w| match w {
+                    _ if w.starts_with('[') && w.ends_with(']') => "[]",
+                    _ if w.starts_with("10.0.2.2:") => "10.0.2.2:",
+                    _ => w,
+                })
+                .collect();
+            words.join(" ")
         })
         .collect()
 }
@@ -248,7 +255,10 @@ fn finish(mut vm: Vm, shd: u32, pages: u32) {
 /// The free pages once the programs these tests run have each run once (whatever the
 /// first run of one costs is then paid on both sides of the comparison).
 fn warm_up(vm: &mut Vm) -> u32 {
-    assert_eq!(console(vm, "shd -x"), "usage: shd [-p PORT] [-n MAX] [-v]\nshd: exit 1\n");
+    assert_eq!(
+        console(vm, "shd -x"),
+        "usage: shd [-p PORT] [-n MAX] [-v]\nshd: exit 1\n"
+    );
     assert_eq!(console(vm, "sleep 0"), "");
     assert_eq!(console(vm, "echo x | cat"), "x\n");
     parse_ps(&console(vm, "ps"));
@@ -317,11 +327,15 @@ fn sessions_run_side_by_side_and_end_with_their_connections() {
     // it taken by the shell. It is killed from the console.
     let before = clients[1].got.len();
     clients[1].send(b"cat\nfor cat\n");
-    run(&mut vm, &mut clients, |_, c| c[1].text()[before..].contains("for cat\n"));
+    run(&mut vm, &mut clients, |_, c| {
+        c[1].text()[before..].contains("for cat\n")
+    });
     let ps = parse_ps(&console(&mut vm, "ps"));
     let cat = ps.iter().find(|p| p.name == "cat" && p.ppid == sh_b).unwrap().pid;
     assert_eq!(console(&mut vm, &format!("kill {cat}")), "");
-    run(&mut vm, &mut [&mut a, &mut b], |_, c| c[1].got.ends_with(PROMPT.as_bytes()));
+    run(&mut vm, &mut [&mut a, &mut b], |_, c| {
+        c[1].got.ends_with(PROMPT.as_bytes())
+    });
     assert_eq!(&b.text()[before..], "for cat\ncat: exit -1\n$ ");
 
     // The console is unaffected throughout.
@@ -395,7 +409,10 @@ fn the_session_limit_turns_connections_away() {
     let mut b = Client::connect(addr);
     run(&mut vm, &mut [&mut a, &mut b], |_, c| c[1].closed);
     assert_eq!(b.text(), "shd: too many sessions (1), try again later\n");
-    assert_eq!(command(&mut vm, &mut [&mut a], 0, "echo still here"), "still here\n");
+    assert_eq!(
+        command(&mut vm, &mut [&mut a], 0, "echo still here"),
+        "still here\n"
+    );
     a.send(b"exit\n");
     run(&mut vm, &mut [&mut a], |_, c| c[0].closed);
     wait_console(&mut vm, &mut [], " ended, exit 0\n", 1);
