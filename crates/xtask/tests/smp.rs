@@ -200,7 +200,12 @@ fn parse_harts(lines: &[&str]) -> Vec<HartLine> {
             let f: Vec<&str> = l.split_whitespace().collect();
             assert_eq!(f.len(), 4, "{l:?}");
             let pid = (f[1] != "-").then(|| f[1].parse().unwrap());
-            (f[0].parse().unwrap(), pid, f[2].parse().unwrap(), f[3].parse().unwrap())
+            (
+                f[0].parse().unwrap(),
+                pid,
+                f[2].parse().unwrap(),
+                f[3].parse().unwrap(),
+            )
         })
         .collect()
 }
@@ -263,7 +268,11 @@ fn boots_on_every_hart_count() {
             boot += &format!("smp: {harts} harts running\n");
         }
         assert_eq!(kernel::mask_dbg_pc(&out[..at]), boot, "{harts} harts");
-        assert_eq!(flushed, (1..harts as u32).collect::<HashSet<_>>(), "{harts} harts");
+        assert_eq!(
+            flushed,
+            (1..harts as u32).collect::<HashSet<_>>(),
+            "{harts} harts"
+        );
         let lines = parse_harts(&command_output(&out, "harts"));
         assert_eq!(prompts.len(), 2, "{harts} harts:\n{out}");
         check_harts(&lines, harts as u32, prompts[1] - first_tick.unwrap());
@@ -328,13 +337,20 @@ fn primes_workers_run_side_by_side_on_four_harts() {
     let lines = command_output(&out, LINE);
     assert_eq!(lines.len(), 5, "{lines:#?}");
     let mut slices: Vec<&str> = lines[..4].to_vec();
-    slices.sort_by_key(|l| l[l.find('[').unwrap() + 1..l.find(',').unwrap()].parse::<u32>().unwrap());
+    slices.sort_by_key(|l| {
+        l[l.find('[').unwrap() + 1..l.find(',').unwrap()]
+            .parse::<u32>()
+            .unwrap()
+    });
     let slice = LIMIT / 4;
     for (w, line) in slices.iter().enumerate() {
         let (from, to) = (w as u32 * slice, (w as u32 + 1) * slice);
         assert_eq!(*line, format!("primes [{from}, {to}): {}", primes_in(from..to)));
     }
-    assert_eq!(lines[4], format!("primes: {} below {LIMIT}, 4 workers", primes_in(0..LIMIT)));
+    assert_eq!(
+        lines[4],
+        format!("primes: {} below {LIMIT}, 4 workers", primes_in(0..LIMIT))
+    );
     for b in b"exit\n" {
         tx.send(*b).unwrap();
     }
@@ -401,7 +417,13 @@ fn check_stress_output(lines: &[&str], workers: u32, rounds: u32) {
     assert!(next[1..].iter().all(|&n| n == rounds + 1), "{lines:#?}");
     assert_eq!(
         lines.last().copied(),
-        Some(format!("stress: {workers} workers, {rounds} rounds, {} bytes: ok", workers * rounds * 200).as_str())
+        Some(
+            format!(
+                "stress: {workers} workers, {rounds} rounds, {} bytes: ok",
+                workers * rounds * 200
+            )
+            .as_str()
+        )
     );
 }
 
