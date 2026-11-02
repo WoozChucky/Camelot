@@ -156,6 +156,12 @@ impl Bus {
         (addr >= VRAM_BASE && off < VRAM_SIZE && VRAM_SIZE - off >= size).then_some(off as usize)
     }
 
+    /// Whether `[addr, addr + size)` is plain memory (RAM or VRAM) rather than a device
+    /// register or nothing. Atomics (LR/SC, AMOs) only work there.
+    pub fn is_memory(&self, addr: u32, size: u32) -> bool {
+        self.ram_range(addr, size).is_some() || Self::vram_range(addr, size).is_some()
+    }
+
     /// RAM and VRAM: plain memory, accessed directly instead of through a device.
     fn memory(&mut self, addr: u32, size: u32) -> Option<&mut [u8]> {
         if let Some(off) = self.ram_range(addr, size) {
