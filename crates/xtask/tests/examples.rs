@@ -84,7 +84,7 @@ fn scenario(name: &str) -> Scenario {
         "muldiv" => plain("[dbg] pc=80000168 a0 = 0x00000011 (17)\n", 0),
         "sysinfo" => plain(
             "sysinfo v1\n\
-             RAM      128 MiB at 0x80000000\n\
+             RAM      4 MiB at 0x80000000\n\
              CPU      10000000 Hz (nominal)\n\
              timebase 10000000 Hz\n\
              9 devices:\n  \

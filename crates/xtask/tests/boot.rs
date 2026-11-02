@@ -1,12 +1,35 @@
 //! Booting Camelot from its disk (issue #69, spec section 7, "Boot from disk"):
 //! the committed boot programs are what `cargo xtask boot` builds, and the root
 //! image of `cargo xtask fs`, made bootable, boots the kernel on Grail with no
-//! program, whose shell then runs programs from the disk's `/bin`.
+//! program, whose shell then runs programs from the disk's `/bin`. The image is
+//! 2 MiB and holds the disk kernel, which has no programs of its own (issue #108):
+//! it boots in a machine of the default 4 MiB, and panics when there is no shell
+//! to run.
 
-use camelot_fs::{boot, fsck, BSIZE};
+use camelot_fs::mkfs::{Mkfs, Options};
+use camelot_fs::{boot, fsck, read::Fs, BSIZE};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use xtask::kernel::BOOT_MAX_STEPS;
 use xtask::repo_root;
+
+/// Boots `image` on a machine of the default hardware with no program, `input`
+/// typed for the shell. Returns how it ended, what it printed, and the disk.
+fn boot_image(image: Vec<u8>, input: &[u8]) -> (RunResult, String, Vec<u8>, Machine) {
+    let config = MachineConfig {
+        disks: vec![DiskConfig::memory(image)],
+        ..MachineConfig::default()
+    };
+    let mut m = Machine::new(config).unwrap();
+    m.boot_from_disk().unwrap();
+    m.cpu.bus.uart.capture = true;
+    m.set_uart_input(xtask::kernel::typed(input));
+    let result = m.run(Some(2 * BOOT_MAX_STEPS), |_| {});
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+    let d = &mut m.cpu.bus.disks[0];
+    let mut disk = vec![0; d.capacity() as usize * 512];
+    d.backend().read(0, &mut disk).unwrap();
+    (result, out, disk, m)
+}
 
 #[test]
 fn committed_boot_programs_are_up_to_date() {
@@ -44,48 +67,165 @@ fn the_commands_match_the_build() {
 #[test]
 fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     let root = repo_root();
-    let opts = camelot_fs::mkfs::Options::default();
-    let image = xtask::fs::build_bootable(&root, &opts).unwrap();
-    let plain = xtask::fs::build(&root, &opts).unwrap();
+    let image = xtask::fs::build_bootable(&root, xtask::fs::IMAGE_SIZE).unwrap();
     let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
+    let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
+    let plain = xtask::fs::build(&root, &opts).unwrap();
 
-    // The filesystem is the same as without booting; the kernel follows it.
+    // 2 MiB in all: the filesystem, the same as without booting, and the disk
+    // kernel after it, as much of it as the bootloader loads (no symbols).
+    assert_eq!(image.len(), 2 << 20);
+    let loadable = boot::loadable(&kernel).unwrap();
+    assert!(loadable.len() < kernel.len());
+    assert_eq!(opts.size as usize, 2048 - loadable.len().div_ceil(BSIZE));
     let info = boot::boot_info(&image).unwrap().expect("bootable");
     assert_eq!(info.kernel_sector, 2 * opts.size);
     assert_eq!(&image[BSIZE..plain.len()], &plain[BSIZE..]);
-    assert_eq!(&boot::kernel_image(&image).unwrap()[..kernel.len()], &kernel[..]);
     assert_eq!(
-        fsck::check(&image).unwrap().files,
-        fsck::check(&plain).unwrap().files
+        &boot::kernel_image(&image).unwrap()[..loadable.len()],
+        &loadable[..]
+    );
+    let report = fsck::check(&image).unwrap();
+    assert_eq!(report.files, fsck::check(&plain).unwrap().files);
+    // Room for the shell to write files: the free blocks are reported, and more
+    // than a quarter of the filesystem.
+    eprintln!(
+        "the 2 MiB root image: a filesystem of {} blocks, {} free; a kernel of {} blocks",
+        report.sb.size,
+        report.free_blocks,
+        loadable.len().div_ceil(BSIZE)
+    );
+    assert!(
+        report.free_blocks > report.sb.size / 4,
+        "{} free",
+        report.free_blocks
     );
 
-    let config = MachineConfig {
-        disks: vec![DiskConfig::memory(image)],
-        ..MachineConfig::default()
-    };
-    let mut m = Machine::new(config).unwrap();
-    m.boot_from_disk().unwrap();
-    m.cpu.bus.uart.capture = true;
-    m.set_uart_input(xtask::kernel::typed(b"echo from the disk\nexit\n"));
-    let result = m.run(Some(2 * BOOT_MAX_STEPS), |_| {});
-    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+    // The default machine: 4 MiB of RAM.
+    assert_eq!(MachineConfig::default().ram_size, 4 << 20);
+    let (result, out, disk, m) = boot_image(
+        image,
+        b"echo from the disk\nls /bin | wc > /count\ncat /count\nexit\n",
+    );
     assert_eq!(result, RunResult::Exited(0), "{out}");
     assert!(
         out.starts_with(&format!(
-            "boot: kernel at sector 0x00001000\n{}Camelot v0.1.0 booting...\n",
+            "boot: kernel at sector 0x{:08x}\n{}Camelot v0.1.0 booting...\n",
+            info.kernel_sector,
             xtask::kernel::BANNER
         )),
         "{out}"
     );
-    assert!(out.contains("fs: /bin holds "), "{out}");
+    assert!(out.contains("\nram: 4 MiB at 0x80000000\n"), "{out}");
+    let programs = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&root)).unwrap();
     assert!(
-        out.ends_with("$ echo from the disk\nfrom the disk\n$ exit\n"),
+        out.contains(&format!(
+            "fs: /bin holds {} programs, the kernel none\n",
+            programs.len()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("fs self-test: 12/12 passed\n"), "{out}");
+    // `ls /bin` lists `.`, `..` and the programs; its count went to a new file.
+    // and is on the disk.
+    let written = Fs::open(&disk).unwrap().read_file("/count").unwrap();
+    let written = String::from_utf8(written).unwrap();
+    assert!(
+        written.starts_with(&format!("{} ", programs.len() + 2)),
+        "{written}"
+    );
+    assert!(
+        out.ends_with(&format!(
+            "$ echo from the disk\nfrom the disk\n$ ls /bin | wc > /count\n$ cat /count\n{written}$ exit\n"
+        )),
         "{out}"
     );
     // The bootloader pointed the ROM's entry word at the kernel, so harts the kernel
     // wakes with an IPI go there from the park loop, as after an ELF boot.
     let entry = elf32::Elf::parse(&kernel).unwrap().header.entry;
     assert_eq!(m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR), Some(entry));
+}
+
+#[test]
+fn the_image_size_is_the_whole_image_and_too_small_is_refused() {
+    let root = repo_root();
+    let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
+    let kernel_blocks = boot::loadable(&kernel).unwrap().len().div_ceil(BSIZE) as u32;
+    // A bigger --size: a bigger filesystem, the same kernel.
+    let image = xtask::fs::build_bootable(&root, 3000).unwrap();
+    assert_eq!(image.len(), 3000 * BSIZE);
+    assert_eq!(fsck::check(&image).unwrap().sb.size, 3000 - kernel_blocks);
+    // The programs do not fit in 1 MiB, nor anything in the kernel's own size.
+    let err = xtask::fs::build_bootable(&root, 1024).unwrap_err();
+    assert!(
+        err.starts_with(&format!(
+            "the root filesystem does not fit in a 1024-block image, where the kernel leaves it {} blocks",
+            1024 - kernel_blocks
+        )) && err.ends_with("give a bigger --size"),
+        "{err}"
+    );
+    let err = xtask::fs::build_bootable(&root, kernel_blocks).unwrap_err();
+    assert_eq!(
+        err,
+        format!(
+            "a {kernel_blocks}-block image has no room for a filesystem: the kernel alone takes \
+             {kernel_blocks} blocks"
+        )
+    );
+}
+
+/// The disk kernel has no programs of its own: with no shell in `/bin`, or no
+/// root filesystem at all, it has nothing to run, and says so.
+#[test]
+fn the_disk_kernel_panics_without_a_shell() {
+    let root = repo_root();
+    let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
+    let boot = xtask::boot::bootloader(&root).unwrap();
+    // A filesystem with an empty /bin.
+    let mut fs = Mkfs::new(&Options {
+        size: 200,
+        ..Options::default()
+    })
+    .unwrap();
+    fs.mkdir("/bin").unwrap();
+    let mut image = fs.finish();
+    boot::install(&mut image, &boot, &kernel).unwrap();
+    let (result, out, _, _) = boot_image(image, b"exit\n");
+    assert_eq!(result, RunResult::Exited(0xfe), "a panic:\n{out}");
+    assert!(
+        out.contains("fs: /bin holds 0 programs, the kernel none\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("fs self-test FAILED: /bin holds the programs\n"),
+        "{out}"
+    );
+    assert!(
+        out.ends_with(
+            "cannot start /bin/sh: error 2\npanic: no shell in /bin, and no programs built into the kernel\n"
+        ),
+        "{out}"
+    );
+
+    // Not a filesystem at all: the kernel is loaded as a program, with a blank disk.
+    let config = MachineConfig {
+        disks: vec![DiskConfig::memory(vec![0; 64 * 512])],
+        ..MachineConfig::default()
+    };
+    let mut m = Machine::new(config).unwrap();
+    m.cpu.bus.uart.capture = true;
+    m.load_elf(&kernel).unwrap();
+    m.set_uart_input(xtask::kernel::typed(b"exit\n"));
+    let result = m.run(Some(BOOT_MAX_STEPS), |_| {});
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+    assert_eq!(result, RunResult::Exited(0xfe), "{out}");
+    assert!(
+        out.ends_with(
+            "fs: no filesystem on disk 0\ncannot start /bin/sh: error 2\npanic: no root filesystem, and no \
+             programs built into the kernel\n"
+        ),
+        "{out}"
+    );
 }
 
 /// The value of `.equ NAME, VALUE` in an assembly source.

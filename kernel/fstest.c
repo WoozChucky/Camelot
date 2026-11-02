@@ -13,7 +13,8 @@
  *   the last name; the first file of `/` reads back whole in odd-sized
  *   pieces; and each file in `/bin` named after one of the kernel's
  *   embedded programs is byte for byte that program (`cargo xtask fs` puts
- *   them there);
+ *   them there), or, for the disk kernel, which embeds none, that /bin
+ *   holds programs;
  * - with `fs_test` = FS_TEST_WRITE (patched in by the tests) and a writable
  *   disk, transactions: make /fstest and /fstest/a (2500 bytes) in one, then
  *   /fstest/b (700 bytes), remove a, make /fstest/x (a block), write
@@ -176,7 +177,21 @@ static bool holds(const char *p, const u8 *want, u32 len) {
     return ok;
 }
 
-/* Each embedded program that /bin has. */
+/* The regular files of /bin, counted by count_file(). */
+static u32 bin_files;
+
+static void count_file(const char *name, u32 inum) {
+    (void)name;
+    struct dinode d;
+    dinode(inum, &d);
+    if (d.type == T_FILE) {
+        bin_files++;
+    }
+}
+
+/* Each embedded program that /bin has. A kernel with none (the disk kernel,
+ * kernel/kernel-disk.elf) runs every program from /bin: then the check is
+ * that /bin has some. */
 static void check_programs(void) {
     int err;
     struct inode *bin = namei("/bin", &err);
@@ -184,6 +199,13 @@ static void check_programs(void) {
         return;
     }
     iput(bin);
+    if (user_program_count == 0) {
+        bin_files = 0;
+        for_each_entry("/bin", count_file);
+        kprintf("fs: /bin holds %u programs, the kernel none\n", bin_files);
+        check(bin_files > 0, "/bin holds the programs");
+        return;
+    }
     u32 found = 0;
     u32 same = 0;
     for (u32 i = 0; i < user_program_count; i++) {

@@ -13,6 +13,11 @@
 //! `size` belong to the filesystem, so a bootable image is still a valid
 //! version 1 filesystem, and fsck, the reader and the kernel see no
 //! difference.
+//!
+//! Only what the bootloader loads is stored ([`loadable`]): the ELF header, the
+//! program headers and the bytes of the loadable segments, at their offsets. The
+//! section headers, the symbols and their names stay in the kernel's file on the
+//! host, for the disassembler and the tests.
 
 use crate::{Superblock, BSIZE, SECTOR_SIZE, SUPER_BLOCK};
 
@@ -113,14 +118,46 @@ pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// What of the kernel ELF `elf` a bootable image stores: the ELF header and the
+/// program headers, and each loadable segment's bytes at their offset in the file,
+/// up to the end of the last one; the gaps between them are zeros. The section
+/// headers (and with them the symbols) are gone: the header says there are none.
+/// The bootloader reads only these parts, and the result is still an ELF file that
+/// loads the same.
+pub fn loadable(elf: &[u8]) -> Result<Vec<u8>, String> {
+    let e = elf32::Elf::parse(elf).map_err(|e| format!("kernel: {e}"))?;
+    let h = &e.header;
+    let headers = h.phoff as usize + h.phnum as usize * elf32::PHDR_SIZE;
+    let mut out = elf
+        .get(..headers.max(elf32::EHDR_SIZE))
+        .ok_or("kernel: the program headers run past the file")?
+        .to_vec();
+    for p in e
+        .segments
+        .iter()
+        .filter(|p| p.ty == elf32::PT_LOAD && p.filesz != 0)
+    {
+        let data = e.segment_data(p).map_err(|e| format!("kernel: {e}"))?;
+        let at = p.offset as usize;
+        out.resize(out.len().max(at + data.len()), 0);
+        out[at..at + data.len()].copy_from_slice(data);
+    }
+    // No section headers: e_shoff, then e_shentsize, e_shnum and e_shstrndx.
+    out[32..36].fill(0);
+    out[46..52].fill(0);
+    Ok(out)
+}
+
 /// Makes the filesystem `image` bootable: the bootloader's code (from its ELF,
-/// see [`boot_code`]) in the boot block, the kernel ELF (see [`check_kernel`])
-/// appended after the filesystem's last block and padded to a whole block, and
-/// the boot block's fields and checksum filled in. `image` must hold exactly
-/// the filesystem, as [`crate::mkfs`] makes it, with nothing in the boot block.
+/// see [`boot_code`]) in the boot block, the kernel ELF (see [`check_kernel`];
+/// only its [`loadable`] part) appended after the filesystem's last block and
+/// padded to a whole block, and the boot block's fields and checksum filled in.
+/// `image` must hold exactly the filesystem, as [`crate::mkfs`] makes it, with
+/// nothing in the boot block.
 pub fn install(image: &mut Vec<u8>, boot_elf: &[u8], kernel_elf: &[u8]) -> Result<BootInfo, String> {
     let code = boot_code(boot_elf)?;
     check_kernel(kernel_elf)?;
+    let kernel_elf = &loadable(kernel_elf)?;
     let sb = Superblock::decode(crate::block(image, SUPER_BLOCK));
     sb.validate((image.len() / BSIZE) as u64)?;
     if image.len() != sb.size as usize * BSIZE {
@@ -263,6 +300,71 @@ mod tests {
         );
         f[0x400..].fill(0xab);
         f
+    }
+
+    /// A kernel with two segments, a gap between them, and after them what a
+    /// linker puts there: section headers (which the ELF header points to) and
+    /// symbols.
+    fn kernel_with_sections() -> Vec<u8> {
+        let mut f = elf(
+            RAM_BASE,
+            &[
+                (elf32::PT_LOAD, 0x200, RAM_BASE, 0x100, 0x100),
+                (elf32::PT_NULL, 0, 0, 0, 0),
+                (elf32::PT_LOAD, 0x600, RAM_BASE + 0x1000, 0x80, 0x400),
+            ],
+            0x900,
+        );
+        f[0x200..0x300].fill(0x11);
+        f[0x300..0x600].fill(0xee); // not part of any segment
+        f[0x600..0x680].fill(0x22);
+        f[0x680..].fill(0x33); // symbols, names, ...
+        f[32..36].copy_from_slice(&0x800u32.to_le_bytes()); // e_shoff
+        f[46..48].copy_from_slice(&40u16.to_le_bytes()); // e_shentsize
+        f[48..50].copy_from_slice(&0u16.to_le_bytes()); // e_shnum: none to parse
+        f[50..52].copy_from_slice(&7u16.to_le_bytes()); // e_shstrndx
+        f
+    }
+
+    #[test]
+    fn only_what_the_bootloader_loads_is_kept() {
+        let full = kernel_with_sections();
+        let kept = loadable(&full).unwrap();
+        // Up to the end of the last segment's bytes.
+        assert_eq!(kept.len(), 0x680);
+        // The headers, but no section headers.
+        assert_eq!(&kept[..32], &full[..32]);
+        assert_eq!(&kept[36..46], &full[36..46]);
+        assert!(kept[32..36].iter().chain(&kept[46..52]).all(|&b| b == 0));
+        assert_eq!(&kept[52..52 + 3 * 32], &full[52..52 + 3 * 32]);
+        // The segments where they were; nothing else.
+        assert!(kept[0x200..0x300].iter().all(|&b| b == 0x11));
+        assert!(kept[0x300..0x600].iter().all(|&b| b == 0));
+        assert!(kept[0x600..0x680].iter().all(|&b| b == 0x22));
+        // It loads the same.
+        let (a, b) = (
+            elf32::Elf::parse(&full).unwrap(),
+            elf32::Elf::parse(&kept).unwrap(),
+        );
+        assert_eq!(a.header.entry, b.header.entry);
+        assert_eq!(a.segments, b.segments);
+        for p in a.segments.iter().filter(|p| p.ty == elf32::PT_LOAD) {
+            assert_eq!(a.segment_data(p).unwrap(), b.segment_data(p).unwrap());
+        }
+        assert!(b.sections.is_empty());
+        assert_eq!(check_kernel(&kept), Ok(()));
+        // Twice is once.
+        assert_eq!(loadable(&kept).unwrap(), kept);
+
+        // install stores just that.
+        let mut image = mkfs::mkfs(&small(), None).unwrap();
+        let info = install(&mut image, &bootloader(100), &full).unwrap();
+        assert_eq!(
+            info.kernel_sectors, 4,
+            "0x680 bytes, two blocks (the whole file would take three)"
+        );
+        assert_eq!(&kernel_image(&image).unwrap()[..kept.len()], &kept[..]);
+        assert!(loadable(b"not an elf").unwrap_err().starts_with("kernel:"));
     }
 
     #[test]

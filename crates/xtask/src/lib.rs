@@ -4,10 +4,11 @@
 //!
 //! * [`examples`]: builds every program in `examples/` with merlin-as +
 //!   merlin-ld, no LLVM (the default way to build them).
-//! * [`kernel`]: builds `kernel/kernel.elf` with merlin + merlin-as +
+//! * [`kernel`]: builds `kernel/kernel.elf` and `kernel/kernel-disk.elf` (the same
+//!   kernel without its built-in programs) with merlin + merlin-as +
 //!   merlin-ld, no LLVM, or the clang -O2 + ld.lld reference build.
 //! * [`fs`]: builds the root filesystem image (the user programs and a
-//!   README) with the `camelot-fs` crate's mkfs, bootable.
+//!   README) with the `camelot-fs` crate's mkfs, bootable: 2 MiB with the disk kernel.
 //! * [`boot`]: builds the boot ROM's disk loader and Camelot's bootloader
 //!   with merlin-as + merlin-ld.
 //! * [`toolchain`]: merlin, merlin-as and merlin-ld as libraries, for the
@@ -18,7 +19,7 @@
 //!   llvm-readobj).
 //! * [`tools`]: finds the LLVM tools.
 //! * [`up`]: brings the Avalon platform up (Lake, Avalon and Pendragon, with
-//!   Camelot's root image as Lake's image `camelot`) until Ctrl-C.
+//!   Camelot's root image as Lake's image `os-base`) until Ctrl-C.
 //! * [`userprogs`]: builds the user programs in `kernel/user/` with merlin,
 //!   merlin-as and merlin-ld (or clang's C output, for the reference build)
 //!   and embeds them in the kernel (`kernel/userprogs.s`).

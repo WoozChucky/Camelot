@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 pub const MIB: usize = 1024 * 1024;
 /// RAM size when nothing else is asked for.
-pub const DEFAULT_RAM_SIZE: usize = 128 * MIB;
+pub const DEFAULT_RAM_SIZE: usize = 4 * MIB;
 /// RAM must end at or below 4 GiB: everything from `RAM_BASE` to the top of the address
 /// space, 2 GiB.
 pub const MAX_RAM_SIZE: usize = (u32::MAX - RAM_BASE) as usize + 1;
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn default_config() {
         let c = MachineConfig::default();
-        assert_eq!(c.ram_size, 128 * MIB);
+        assert_eq!(c.ram_size, 4 * MIB);
         assert_eq!(c.clock_hz, None);
         assert_eq!(c.cpu_hz(), 10_000_000);
         assert_eq!(c.harts, 1);

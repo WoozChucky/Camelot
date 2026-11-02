@@ -241,7 +241,7 @@ mod tests {
         for off in [REG_MAGIC, REG_RAM_SIZE, REG_CPU_HZ, REG_DEV_COUNT, DEV_TABLE] {
             assert_eq!(s.write(off, 4, 0xdead_beef), Ok(()));
         }
-        assert_eq!(s.read(REG_RAM_SIZE, 4), Ok(128 * MIB as u32));
+        assert_eq!(s.read(REG_RAM_SIZE, 4), Ok(4 * MIB as u32));
         assert_eq!(s.read(REG_DEV_COUNT, 4), Ok(2));
         assert_eq!(s.read(REG_MAGIC, 1), Err(BusFault));
         assert_eq!(s.read(REG_MAGIC, 2), Err(BusFault));

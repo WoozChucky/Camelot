@@ -291,7 +291,7 @@ after the filesystem:
 ```
 block 0            boot block: the bootloader and where the kernel is
 blocks 1 ... size - 1     the filesystem
-blocks size ...    the kernel ELF, as a file, padded with zeros to a whole block
+blocks size ...    the kernel ELF, what the bootloader loads of it, padded with zeros to a whole block
 ```
 
 The boot block:
@@ -309,12 +309,26 @@ whose words do not add up to 0. `camelot-fs mkfs --boot BOOT --kernel
 KERNEL` (or `boot::install` in the crate) fills in all of it: the
 bootloader's code from the executable BOOT (`kernel/boot/boot.elf`, linked
 at 0 and position-independent, at most 1008 bytes, no `.bss`), the kernel
-ELF KERNEL after the filesystem. `cargo xtask fs` makes the root image this
-way, with `kernel/kernel.elf`.
+ELF KERNEL after the filesystem. Only the parts of the kernel the bootloader
+reads are stored (`boot::loadable`): the ELF header, the program headers and
+each `PT_LOAD` segment's file bytes at their offsets, zeros between them, up
+to the end of the last one; the section headers, symbols and their names are
+left out (the header says there are no sections), which saves about 60 KiB.
+
+`cargo xtask fs` makes the root image this way, with the disk kernel,
+`kernel/kernel-disk.elf`: the kernel linked without the user programs that
+`kernel/kernel.elf` carries for running without a disk, since the image has
+them in `/bin`. It is Linux's split: a kernel image and the programs on the
+root filesystem, with `kernel.elf` playing the part of an initramfs for a
+machine with no disk. The image is 2 MiB in all by default (`--size N` for N
+blocks): the kernel takes about 280 blocks and the filesystem every block it
+leaves, so `size` is 2048 minus the kernel's blocks. A disk kernel that finds
+no `/bin/sh` panics, having no programs of its own to fall back on.
 
 The kernel is not a file of the filesystem (`/boot/kernel`, say), for two
-reasons: it is bigger than the largest file (the kernel with its built-in
-programs is over 500 KiB, a file at most 268 KiB), and a bootloader that
+reasons: it is bigger than the largest file (the disk kernel is about
+280 KiB, the kernel with its built-in programs 1.4 MB, a file at most
+268 KiB), and a bootloader that
 must fit in 1008 bytes reads a run of sectors far more simply than it could
 walk directories, inodes, indirect blocks and the log. The price is that the
 kernel cannot be replaced from inside Camelot; mkfs installs it.

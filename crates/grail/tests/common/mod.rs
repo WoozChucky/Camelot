@@ -12,8 +12,8 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// 16 MiB boots faster than the default 128 (the kernel puts every page on its free
-/// list) and is plenty.
+/// 16 MiB rather than the default 4: room to spare for the tests that run several
+/// programs at once.
 pub const RAM: usize = 16 << 20;
 /// Steps a machine runs per turn.
 pub const SLICE: u64 = 2_000;
