@@ -2,7 +2,8 @@
 
 use grail::console;
 use grail::display::{self, DisplayOptions, Outcome};
-use grail::{DiskConfig, Machine, MachineConfig, RunResult};
+use grail::net::Hub;
+use grail::{DiskConfig, Machine, MachineConfig, NetConfig, RunResult};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: grail [options] <program.elf>
@@ -22,6 +23,13 @@ const USAGE: &str = "usage: grail [options] <program.elf>
                   IMG may also be lake://host:port/name, image 'name' on a Lake
                   storage server (port 7401 if left out)
   --disk-ro IMG   the same, read-only
+  --net hub[,mac=ADDR]
+                  add a network card (spec section 9.8) on a port of this process's
+                  Ethernet hub; every card on the hub sees the frames the others send.
+                  Repeat for more cards (up to 4). The MAC address is
+                  02:ca:00:00:00:NN for port NN unless mac= sets one
+  --pcap FILE     write every frame the card of the last --net sends or receives to
+                  FILE, a pcap capture (Wireshark, tcpdump)
   --fb            show the framebuffer in a window (Windows only)
   --headless      no window, even with --fb (the default)
   --fb-dump DIR   write DIR/frame-NNNN.ppm on every FB_PRESENT and at exit";
@@ -34,6 +42,8 @@ fn main() -> ExitCode {
     let mut fb = false;
     let mut headless = false;
     let mut dump_dir = None;
+    // The hub every `--net hub` card plugs into.
+    let hub = Hub::new();
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -66,6 +76,25 @@ fn main() -> ExitCode {
             "--disk" | "--disk-ro" => match value(&mut args, &a, DiskConfig::parse) {
                 Some(disk) => config.disks.push(disk.with_read_only(a == "--disk-ro")),
                 None => return ExitCode::from(2),
+            },
+            "--net" => match value(&mut args, "--net", |s| NetConfig::parse(s, &hub)) {
+                Some(net) => config.nets.push(net),
+                None => return ExitCode::from(2),
+            },
+            "--pcap" => match (args.next(), config.nets.last_mut()) {
+                (Some(file), Some(net)) if net.pcap.is_none() => net.pcap = Some(file.into()),
+                (Some(_), Some(_)) => {
+                    eprintln!("grail: --pcap: that card is already captured");
+                    return ExitCode::from(2);
+                }
+                (Some(_), None) => {
+                    eprintln!("grail: --pcap needs a --net before it");
+                    return ExitCode::from(2);
+                }
+                (None, _) => {
+                    eprintln!("grail: --pcap needs a file");
+                    return ExitCode::from(2);
+                }
             },
             "-h" | "--help" => {
                 println!("{USAGE}");

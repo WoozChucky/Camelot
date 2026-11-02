@@ -1,0 +1,318 @@
+Var struct point origin @origin (definition) <15:14>
+Var struct rect unit @unit (definition) <16:13>
+  InitList <16:20>
+    InitList <16:21>
+      Num 0 : int <16:22>
+      Num 0 : int <16:25>
+    InitList <16:29>
+      Num 1 : int <16:30>
+      Num 1 : int <16:33>
+    ImplicitCast : char <16:37>
+      Num 117 : int <16:37>
+Function int area(struct rect *r) <18:5>
+  Param #0 struct rect *r <18:23>
+  Return <19:5>
+    Binary * : int <19:34>
+      Binary - : int <19:22>
+        Member .x (offset 0) : int <19:19>
+          Member ->max (offset 8) : struct point <19:14>
+            Var r #0 : struct rect * <19:13>
+        Member .x (offset 0) : int <19:30>
+          Member ->min (offset 0) : struct point <19:25>
+            Var r #0 : struct rect * <19:24>
+      Binary - : int <19:46>
+        Member .y (offset 4) : int <19:43>
+          Member ->max (offset 8) : struct point <19:38>
+            Var r #0 : struct rect * <19:37>
+        Member .y (offset 4) : int <19:54>
+          Member ->min (offset 0) : struct point <19:49>
+            Var r #0 : struct rect * <19:48>
+Function void grow(struct rect *r, int by) <22:6>
+  Param #0 struct rect *r <22:24>
+  Param #1 int by <22:31>
+  ExprStmt <23:5>
+    Assign += : int <23:14>
+      Member .x (offset 0) : int <23:11>
+        Member ->max (offset 8) : struct point <23:6>
+          Var r #0 : struct rect * <23:5>
+      Var by #1 : int <23:17>
+  ExprStmt <24:5>
+    Assign : int <24:14>
+      Member .y (offset 4) : int <24:11>
+        Member ->max (offset 8) : struct point <24:6>
+          Var r #0 : struct rect * <24:5>
+      Binary + : int <24:25>
+        Member .y (offset 4) : int <24:22>
+          Member ->max (offset 8) : struct point <24:17>
+            Var r #0 : struct rect * <24:16>
+        Var by #1 : int <24:27>
+Function int main(void) <27:5>
+  Local #0 int ok <28:9>
+  Local #1 struct rect r <29:17>
+  Local #2 struct point pts[3] <30:18>
+  Local #3 struct point *p <31:19>
+  Local #4 int i <32:9>
+  Local #5 struct rect copy <58:21>
+  Decl <28:5>
+    Var int ok #0 <28:9>
+      Num 0 : int <28:14>
+  Decl <29:5>
+    Var struct rect r #1 <29:17>
+  Decl <30:5>
+    Var struct point pts[3] #2 <30:18>
+  Decl <31:5>
+    Var struct point *p #3 <31:19>
+      ImplicitCast : struct point * <31:23>
+        Var pts #2 : struct point [3] <31:23>
+  Decl <32:5>
+    Var int i #4 <32:9>
+  ExprStmt <33:5>
+    Assign : int <33:13>
+      Member .x (offset 0) : int <33:10>
+        Member .min (offset 0) : struct point <33:6>
+          Var r #1 : struct rect <33:5>
+      Num 1 : int <33:15>
+  ExprStmt <34:5>
+    Assign : int <34:13>
+      Member .y (offset 4) : int <34:10>
+        Member .min (offset 0) : struct point <34:6>
+          Var r #1 : struct rect <34:5>
+      Num 2 : int <34:15>
+  ExprStmt <35:5>
+    Assign : int <35:13>
+      Member .x (offset 0) : int <35:10>
+        Member .max (offset 8) : struct point <35:6>
+          Var r #1 : struct rect <35:5>
+      Num 4 : int <35:15>
+  ExprStmt <36:5>
+    Assign : int <36:13>
+      Member .y (offset 4) : int <36:10>
+        Member .max (offset 8) : struct point <36:6>
+          Var r #1 : struct rect <36:5>
+      Num 6 : int <36:15>
+  ExprStmt <37:5>
+    Assign : char <37:11>
+      Member .tag (offset 16) : char <37:6>
+        Var r #1 : struct rect <37:5>
+      ImplicitCast : char <37:13>
+        Num 114 : int <37:13>
+  ExprStmt <38:5>
+    Assign += : int <38:8>
+      Var ok #0 : int <38:5>
+      Binary == : int <38:20>
+        Call area : int <38:11>
+          Addr : struct rect * <38:16>
+            Var r #1 : struct rect <38:17>
+        Num 12 : int <38:23>
+  ExprStmt <39:5>
+    Call grow : void <39:5>
+      Addr : struct rect * <39:10>
+        Var r #1 : struct rect <39:11>
+      Num 2 : int <39:14>
+  ExprStmt <40:5>
+    Assign += : int <40:8>
+      Var ok #0 : int <40:5>
+      Binary == : int <40:20>
+        Call area : int <40:11>
+          Addr : struct rect * <40:16>
+            Var r #1 : struct rect <40:17>
+        Num 30 : int <40:23>
+  ExprStmt <41:5>
+    Assign += : int <41:8>
+      Var ok #0 : int <41:5>
+      Binary == : int <41:17>
+        Member .tag (offset 16) : char <41:12>
+          Var r #1 : struct rect <41:11>
+        Num 114 : int <41:20>
+  For <42:5>
+    ExprStmt <42:10>
+      Assign : int <42:12>
+        Var i #4 : int <42:10>
+        Num 0 : int <42:14>
+    Binary < : int <42:19>
+      Var i #4 : int <42:17>
+      Num 3 : int <42:21>
+    Post++ : int <42:25>
+      Var i #4 : int <42:24>
+    Block <42:29>
+      ExprStmt <43:9>
+        Assign : int <43:18>
+          Member .x (offset 0) : int <43:15>
+            Deref : struct point <43:12>
+              Binary + : struct point * <43:12>
+                Var pts #2 : struct point [3] <43:9>
+                Var i #4 : int <43:13>
+          Var i #4 : int <43:20>
+      ExprStmt <44:9>
+        Assign : int <44:18>
+          Member .y (offset 4) : int <44:15>
+            Deref : struct point <44:12>
+              Binary + : struct point * <44:12>
+                Var pts #2 : struct point [3] <44:9>
+                Var i #4 : int <44:13>
+          Binary * : int <44:22>
+            Var i #4 : int <44:20>
+            Var i #4 : int <44:24>
+  ExprStmt <46:5>
+    Assign += : int <46:8>
+      Var ok #0 : int <46:5>
+      Binary == : int <46:20>
+        Member .y (offset 4) : int <46:17>
+          Deref : struct point <46:14>
+            Binary + : struct point * <46:14>
+              Var pts #2 : struct point [3] <46:11>
+              Num 2 : int <46:15>
+        Num 4 : int <46:23>
+  ExprStmt <47:5>
+    Assign += : int <47:8>
+      Var ok #0 : int <47:5>
+      Binary == : int <47:22>
+        Member ->x (offset 0) : int <47:18>
+          Binary + : struct point * <47:14>
+            Var p #3 : struct point * <47:12>
+            Num 1 : int <47:16>
+        Num 1 : int <47:25>
+  ExprStmt <48:5>
+    Assign += : int <48:8>
+      Var ok #0 : int <48:5>
+      Binary == : int <48:18>
+        Member .y (offset 4) : int <48:15>
+          Deref : struct point <48:12>
+            Var p #3 : struct point * <48:13>
+        Num 0 : int <48:21>
+  ExprStmt <49:5>
+    Post++ : struct point * <49:6>
+      Var p #3 : struct point * <49:5>
+  ExprStmt <50:5>
+    Assign += : int <50:8>
+      Var ok #0 : int <50:5>
+      Binary == : int <50:16>
+        Member ->y (offset 4) : int <50:12>
+          Var p #3 : struct point * <50:11>
+        Num 1 : int <50:19>
+  ExprStmt <51:5>
+    Assign : struct point <51:11>
+      Member .min (offset 0) : struct point <51:6>
+        Var r #1 : struct rect <51:5>
+      Deref : struct point <51:16>
+        Binary + : struct point * <51:16>
+          Var pts #2 : struct point [3] <51:13>
+          Num 2 : int <51:17>
+  ExprStmt <52:5>
+    Assign += : int <52:8>
+      Var ok #0 : int <52:5>
+      Binary && : int <52:24>
+        Binary == : int <52:19>
+          Member .x (offset 0) : int <52:16>
+            Member .min (offset 0) : struct point <52:12>
+              Var r #1 : struct rect <52:11>
+          Num 2 : int <52:22>
+        Binary == : int <52:35>
+          Member .y (offset 4) : int <52:32>
+            Member .min (offset 0) : struct point <52:28>
+              Var r #1 : struct rect <52:27>
+          Num 4 : int <52:38>
+  ExprStmt <53:5>
+    Assign : struct point <53:14>
+      Member .max (offset 8) : struct point <53:9>
+        Var unit @unit : struct rect <53:5>
+      Member .min (offset 0) : struct point <53:17>
+        Var r #1 : struct rect <53:16>
+  ExprStmt <54:5>
+    Assign += : int <54:8>
+      Var ok #0 : int <54:5>
+      Binary == : int <54:22>
+        Member .y (offset 4) : int <54:19>
+          Member .max (offset 8) : struct point <54:15>
+            Var unit @unit : struct rect <54:11>
+        Num 4 : int <54:25>
+  ExprStmt <55:5>
+    Assign += : int <55:8>
+      Var ok #0 : int <55:5>
+      Binary == : int <55:20>
+        Member .tag (offset 16) : char <55:15>
+          Var unit @unit : struct rect <55:11>
+        Num 117 : int <55:23>
+  ExprStmt <56:5>
+    Assign += : int <56:8>
+      Var ok #0 : int <56:5>
+      Binary && : int <56:25>
+        Binary == : int <56:20>
+          Member .x (offset 0) : int <56:17>
+            Var origin @origin : struct point <56:11>
+          Num 0 : int <56:23>
+        Binary == : int <56:37>
+          Member .y (offset 4) : int <56:34>
+            Var origin @origin : struct point <56:28>
+          Num 0 : int <56:40>
+  Block <57:5>
+    Decl <58:9>
+      Var struct rect copy #5 <58:21>
+        Var r #1 : struct rect <58:28>
+    ExprStmt <59:9>
+      Assign : int <59:20>
+        Member .x (offset 0) : int <59:17>
+          Member .max (offset 8) : struct point <59:13>
+            Var copy #5 : struct rect <59:9>
+        Num 100 : int <59:22>
+    ExprStmt <60:9>
+      Assign += : int <60:12>
+        Var ok #0 : int <60:9>
+        Binary && : int <60:28>
+          Binary == : int <60:23>
+            Member .x (offset 0) : int <60:20>
+              Member .max (offset 8) : struct point <60:16>
+                Var r #1 : struct rect <60:15>
+            Num 6 : int <60:26>
+          Binary == : int <60:42>
+            Member .x (offset 0) : int <60:39>
+              Member .max (offset 8) : struct point <60:35>
+                Var copy #5 : struct rect <60:31>
+            Num 100 : int <60:45>
+    ExprStmt <61:9>
+      Assign += : int <61:12>
+        Var ok #0 : int <61:9>
+        Binary == : int <61:24>
+          Member .tag (offset 16) : char <61:19>
+            Var copy #5 : struct rect <61:15>
+          Num 114 : int <61:27>
+  ExprStmt <63:5>
+    Assign += : int <63:8>
+      Var ok #0 : int <63:5>
+      Binary == : int <63:31>
+        Num 20 : unsigned int <63:11>
+        Num 20 : int <63:34>
+  ExprStmt <64:5>
+    Assign += : int <64:8>
+      Var ok #0 : int <64:5>
+      Binary == : int <64:22>
+        Num 24 : unsigned int <64:11>
+        Num 24 : int <64:25>
+  ExprStmt <66:5>
+    Assign += : int <66:8>
+      Var ok #0 : int <66:5>
+      Binary && : int <66:44>
+        Binary == : int <66:39>
+          Member .y (offset 4) : int <66:36>
+            Assign : struct point <66:19>
+              Deref : struct point <66:15>
+                Binary + : struct point * <66:15>
+                  Var pts #2 : struct point [3] <66:12>
+                  Num 0 : int <66:16>
+              Assign : struct point <66:28>
+                Deref : struct point <66:24>
+                  Binary + : struct point * <66:24>
+                    Var pts #2 : struct point [3] <66:21>
+                    Num 1 : int <66:25>
+                Member .max (offset 8) : struct point <66:31>
+                  Var r #1 : struct rect <66:30>
+          Num 8 : int <66:42>
+        Binary == : int <66:56>
+          Member .x (offset 0) : int <66:53>
+            Deref : struct point <66:50>
+              Binary + : struct point * <66:50>
+                Var pts #2 : struct point [3] <66:47>
+                Num 0 : int <66:51>
+          Num 6 : int <66:59>
+  Return <67:5>
+    Var ok #0 : int <67:12>
