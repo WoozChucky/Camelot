@@ -272,9 +272,23 @@ fn usage_errors() {
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).starts_with("merlin: unknown option --bogus"));
 
-    let out = merlin(&[Path::new("a.c"), Path::new("b.c")]);
+    let out = merlin(&[
+        Path::new("-o"),
+        Path::new("x.s"),
+        Path::new("a.c"),
+        Path::new("b.c"),
+    ]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(stderr(&out).starts_with("merlin: one input file per invocation"));
+    assert!(stderr(&out).starts_with("merlin: -o needs a single input file"));
+
+    for flag in ["-I", "-D", "-U", "-o"] {
+        let out = merlin(&[Path::new(flag)]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(
+            stderr(&out).starts_with(&format!("merlin: {flag} needs a")),
+            "{flag}"
+        );
+    }
 
     let out = merlin(&[Path::new("does-not-exist.c")]);
     assert_eq!(out.status.code(), Some(2));

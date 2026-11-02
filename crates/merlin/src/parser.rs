@@ -2343,7 +2343,10 @@ mod tests {
         assert_eq!(ex("(*fp)(1)"), "(call (* fp) 1)");
         assert_eq!(ex("table[i](x)"), "(call (* (+ table i)) x)");
         assert_eq!(ex("s.f(1).g"), "(. (call (. s f) 1) g)");
-        assert_eq!(err("int f() { s.1; }"), "1:13: expected a member name, found '1'");
+        assert_eq!(
+            err("int f() { s.(1); }"),
+            "1:13: expected a member name, found '('"
+        );
     }
 
     #[test]
