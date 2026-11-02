@@ -299,7 +299,8 @@ static void ping_cmd(struct cmd *c) {
     int received = 0;
     for (int seq = 1; seq <= count; seq++) {
         struct ping_reply r;
-        int e = ping(addr, (uint)seq, &r);
+        /* The sequence number is 16 bits on the wire: it wraps. */
+        int e = ping(addr, (uint)seq & 0xffff, &r);
         if (e == 0) {
             received++;
             printf("%u bytes from ", r.len);
@@ -312,7 +313,9 @@ static void ping_cmd(struct cmd *c) {
         } else {
             printf("seq=%d: %s\n", seq, strerror(-e));
         }
-        if (seq < count && e == 0) {
+        /* A second between requests: after a reply or an error that came
+         * at once; a timeout has already waited it. */
+        if (seq < count && e != -ETIMEDOUT) {
             sleep(10);
         }
     }

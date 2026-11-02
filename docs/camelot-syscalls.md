@@ -309,6 +309,7 @@ name of the path it was started from, at most 15 characters). A process
 that `spawn` is still loading is not listed. All of `buf`, `max` entries,
 must be writable, however many are stored, or it is `-EFAULT` and nothing
 is.
+
 The network's calls are what the shell's `ifconfig` and `ping` built-ins
 use until #85 brings sockets and network programs; `docs/camelot-net.md`
 describes the stack behind them. Addresses are `uint`s in host order

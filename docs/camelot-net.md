@@ -149,11 +149,17 @@ in this order:
 2. the header checksum: `ip-checksum`;
 3. not a fragment (MF set, or an offset): `fragment`. Reassembly is not
    supported, and nothing this stack sends needs it;
-4. for this host: the interface's address, 255.255.255.255 or the subnet's
+4. from the wire, a source address a host can have (RFC 1122 3.2.1.3): not
+   255.255.255.255 or the subnet's broadcast address, not multicast or
+   reserved (224.0.0.0 and up), not 127.0.0.0/8, not the interface's own
+   address; 0.0.0.0 is allowed (a host with no address yet), though nothing
+   answers it. Otherwise `ip`: answering a broadcast source would send the
+   answer to the whole segment;
+5. for this host: the interface's address, 255.255.255.255 or the subnet's
    broadcast address; while the interface has no address, any UDP (a DHCP
    offer may come to the address offered). 127.0.0.0/8 never comes from the
    wire. Otherwise `filtered`;
-5. ICMP (1) or UDP (17): otherwise `protocol`.
+6. ICMP (1) or UDP (17): otherwise `protocol`.
 
 **Output** writes a 20-byte header: TTL 64 (`IP_TTL`), DF set, an
 identification counter, the checksum. A packet over 1500 bytes (`NET_MTU`)
@@ -272,7 +278,7 @@ the configuration, and `ifconfig` prints them:
 | `filtered` | `rx_filtered` | not for this host: another MAC or address, ARP not about it |
 | `ether` | `rx_bad_ether` | an unknown EtherType or a short frame |
 | `arp` | `rx_bad_arp` | a malformed ARP packet |
-| `ip` | `rx_bad_ip` | a malformed IPv4 header or length |
+| `ip` | `rx_bad_ip` | a malformed IPv4 header or length, or a source no host can have |
 | `ip-checksum` | `rx_bad_ip_sum` | a wrong header checksum |
 | `fragment` | `rx_fragment` | a fragment |
 | `protocol` | `rx_bad_proto` | neither ICMP nor UDP |
@@ -313,7 +319,10 @@ depend on how fast the host runs Grail.
 `ping ADDR [N]` sends N echo requests (4 by default), a second apart, each
 waiting a second for its reply: `seq=N: timed out` when none comes, or the
 error (`host unreachable`, `network unreachable`) when the request couldn't
-be sent. `ping` alone still runs the `/bin/ping` demo program.
+be sent. After a reply or an error the shell sleeps a second before the next
+request; after a timeout it doesn't, the wait having taken the second. The
+sequence number wraps at 65536, as it does on the wire. A process killed
+while it waits for a reply stops waiting at once. `ping` alone still runs the `/bin/ping` demo program.
 
 ## Running it
 
@@ -339,17 +348,30 @@ Grail's cards, by step counts, so what the kernel does is deterministic:
 - UDP end to end: a host socket sends to a forwarded port, the gateway (which
   checks every checksum) passes it to the echo service, and the echo comes
   back. The gateway runs on a clock driven by the machine's steps, not the
-  wall clock; the two hops through host sockets are bounded waits (the
+  wall clock (it services its host sockets on every poll, so waiting for the
+  datagram doesn't move its clock); the two hops through host sockets are bounded waits (the
   datagram is in the gateway's queue before the machine runs on, and the
   echo has been handed to the host before the test reads it), never sleeps;
 - two kernels on a hub: one with a patched static configuration, the other
   falling back from DHCP and then given its address with `ifconfig`; they
-  ping each other, and a ping off the subnet has no route;
+  ping each other, and a ping off the subnet has no route. Every address,
+  mask and gateway `netconf` refuses, and what the shell can't parse, leave
+  the configuration as it was;
 - the test as the other host on a hub, sending crafted frames: every kind of
   malformed or unwanted frame above (bad checksums, truncated headers, wrong
   lengths, fragments, unknown EtherTypes and protocols, ports nobody has,
-  frames the card refuses) is dropped and counted under its reason, the
-  stack still answers ARP, echo and UDP afterwards with correct checksums,
-  and the frame counts add up;
+  frames the card refuses, sources no host can have) is dropped and counted
+  under its reason, the stack still answers ARP, echo and UDP afterwards with
+  correct checksums, and the frame counts add up;
 - ARP giving up: three requests a second apart, the pings time out, the next
-  one fails at once.
+  one fails at once; and an answered entry expiring after a minute (the
+  machine sleeps through it: idle, it skips ahead to its next tick).
+
+At the end of each, with the machine idle, every packet buffer but the
+receive ring's 16 is back in the pool (the test reads `free_count` from the
+kernel's RAM), so a drop path that forgets to free its buffer fails them.
+
+UDP's socket API is only exercised by DHCP and the echo service until #85
+gives programs sockets; its tests (a full queue counted in `queue-full`,
+`-EADDRINUSE`, ephemeral ports, running out of sockets, `udp_recvfrom`'s
+timeout) come with the socket calls.

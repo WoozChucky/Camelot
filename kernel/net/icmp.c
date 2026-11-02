@@ -124,7 +124,9 @@ int icmp_ping(u32 dst, u32 id, u32 seq, u32 timeout, struct ping_reply *r) {
     /* A request to this host comes back during the call. */
     int err = ip_output(p, 0, dst, IP_PROTO_ICMP, ICMP_HLEN + PING_DATA);
     while (err == 0 && !w->done) {
-        if (ticks - start >= timeout) {
+        /* A process killed while it waits gives up at once: the error is
+         * never seen, the process ends on its way out of the call. */
+        if (ticks - start >= timeout || proc_killed()) {
             err = -ETIMEDOUT;
             break;
         }

@@ -13,6 +13,7 @@
  * carry a checksum. A socket is bound to a port, not to an address: it
  * gets what comes to that port on any of the host's addresses. */
 #include "net.h"
+#include "proc.h"
 #include "string.h"
 #include "trap.h"
 
@@ -119,7 +120,9 @@ int udp_recvfrom(struct udp_sock *s, void *buf, u32 size, u32 *from, u32 *port, 
             pbuf_free(p);
             return (int)len;
         }
-        if (timeout != 0 && ticks - start >= timeout) {
+        /* A killed process gives up at once (it ends on its way out of the
+         * call, never seeing the error); a kernel process is never killed. */
+        if ((timeout != 0 && ticks - start >= timeout) || proc_killed()) {
             return -ETIMEDOUT;
         }
         net_sleep();

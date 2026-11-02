@@ -13,7 +13,11 @@
  * frame or shorter than the header, a wrong checksum, or a fragment (MF set
  * or an offset: reassembly is not supported) and the packet is dropped and
  * counted. Bytes past the total length are the frame's padding, ignored.
- * The TTL matters only to routers; this host forwards nothing.
+ * So is a packet from the wire whose source no host can have (RFC 1122
+ * 3.2.1.3): a broadcast, multicast or loopback address, or this host's own.
+ * Answering one would reflect the answer to the whole segment (a broadcast
+ * source) or to this host itself. The TTL matters only to routers; this
+ * host forwards nothing.
  *
  * Output never fragments: it refuses packets over NET_MTU (-EMSGSIZE) and
  * sets DF in the rest. Routing is a host's: one interface with its subnet
@@ -69,6 +73,16 @@ u32 ip_source(u32 dst) {
     return is_loopback(dst) ? IP_LOOPBACK : netif.addr;
 }
 
+/* Whether `src`, the source of a packet from the card, is one a host can
+ * have: not a broadcast address (255.255.255.255 or the subnet's), not
+ * multicast or reserved (224.0.0.0 and up), not loopback, not this host's
+ * own. 0.0.0.0 is allowed: a host with no address yet sends from it, and
+ * the protocols above never answer it. */
+static bool valid_source(u32 src) {
+    return (src >> 28) < 0xe && !is_loopback(src) && !ip_is_broadcast(src) &&
+           (netif.addr == 0 || src != netif.addr);
+}
+
 /* Whether a packet to `dst` from the card is for this host. While the
  * interface has no address, UDP to any address is taken: DHCP's offer may
  * come to the address being offered. Loopback addresses never come from
@@ -104,6 +118,11 @@ void ip_input(struct pbuf *p, const u8 *ip, u32 len, bool loopback) {
     u32 proto = ip[9];
     u32 src = get32(ip + 12);
     u32 dst = get32(ip + 16);
+    if (!loopback && !valid_source(src)) {
+        net_stats.rx_bad_ip++;
+        pbuf_free(p);
+        return;
+    }
     if (!loopback && !for_this_host(dst, proto)) {
         net_stats.rx_filtered++;
         pbuf_free(p);

@@ -7,9 +7,11 @@
 //! - two kernels on a hub, with static addresses (one from the kernel's configuration,
 //!   one from `ifconfig` after DHCP found no server), ping each other;
 //! - on a hub with this test as the other host, crafted frames (bad checksums,
-//!   truncated headers, wrong lengths, fragments, unknown protocols) are dropped and
-//!   counted, never a panic, and the stack still answers afterwards; ARP gives up on an
-//!   address nobody has.
+//!   truncated headers, wrong lengths, fragments, unknown protocols, sources no host can
+//!   have) are dropped and counted, never a panic, and the stack still answers
+//!   afterwards; ARP gives up on an address nobody has, and forgets answered ones after
+//!   a minute;
+//! - after each, every packet buffer is back in the pool but the receive ring's.
 //!
 //! The machines run in this thread, in turns of a few thousand steps, so what they do is
 //! deterministic: time is Grail's steps, the forwarded port's gateway included. Only
@@ -59,6 +61,9 @@ fn static_config(addr: [u8; 4], mask: [u8; 4]) -> Vec<(&'static str, u32)> {
 struct Vm {
     m: Machine,
     input: Sender<u8>,
+    /// The address of the packet buffer pool's free count (`free_count` in
+    /// kernel/net/pbuf.c).
+    free_count: u32,
 }
 
 impl Vm {
@@ -79,9 +84,10 @@ impl Vm {
             let addr = elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"));
             m.cpu.bus.load(addr, &value.to_le_bytes()).unwrap();
         }
+        let free_count = elf.symbol("free_count").expect("no symbol free_count");
         let (input, rx) = channel();
         m.set_uart_input(rx);
-        Vm { m, input }
+        Vm { m, input, free_count }
     }
 
     fn out(&self) -> String {
@@ -134,6 +140,23 @@ fn command(vms: &mut [&mut Vm], i: usize, host: Option<&mut Host>, line: &str) -
         .strip_prefix(&format!("{line}\n"))
         .unwrap_or_else(|| panic!("{line:?} not echoed:\n{out}"));
     text.strip_suffix(PROMPT).unwrap().to_string()
+}
+
+/// Buffers the kernel's pool holds (`NPBUF`, kernel/include/net.h) and the ones its
+/// card's receive ring always has (`NIC_RX_RING`, kernel/include/nic.h).
+const NPBUF: u32 = 64;
+const NIC_RX_RING: u32 = 16;
+
+/// Checks that every packet buffer is back in the pool but the receive ring's: a path
+/// that forgets to free one would drain the pool, slowly, until the network stops. The
+/// machine runs a little first, idle at its prompt, so the card's last interrupt has
+/// reclaimed what it sent.
+fn assert_buffers_back(vm: &mut Vm) {
+    for _ in 0..50 {
+        vm.m.run_for(SLICE, &mut |_| {});
+    }
+    let free = vm.m.cpu.bus.read_mem(vm.free_count, 4).unwrap();
+    assert_eq!(free, NPBUF - NIC_RX_RING, "packet buffers leaked:\n{}", vm.out());
 }
 
 /// Leaves the shell; the machine must stop with status 0.
@@ -195,6 +218,10 @@ fn traffic(ifconfig: &str) -> (u32, u32) {
 }
 
 // ---- crafting frames ----
+//
+// gateway::wire has builders and parsers for all of these, but the test keeps its own,
+// written from the RFCs: the kernel's checksums and layouts are checked against a second,
+// independent implementation, so a mistake shared with the gateway's can't hide.
 
 const IP_TYPE: u16 = 0x0800;
 const ARP_TYPE: u16 = 0x0806;
@@ -501,6 +528,7 @@ fn user_networking_gets_a_lease_by_dhcp_and_pings_the_gateway() {
     // three echo requests; received their answers. Loopback never reaches the card.
     assert!(counters(&ifconfig).values().all(|&n| n == 0), "{ifconfig}");
     assert_eq!(traffic(&ifconfig), (6, 6), "{ifconfig}");
+    assert_buffers_back(&mut vm);
     exit(&mut vm);
 }
 
@@ -571,14 +599,14 @@ impl SteppedGateway {
     }
 
     /// Services the gateway's host sockets, with the machine stopped, until what a host
-    /// program sent has reached them and become a frame for the machine. Only the
-    /// host's own loopback delivery is left to the wall clock here, and it is bounded.
+    /// program sent has reached them and become a frame for the machine. The gateway's
+    /// clock stands still meanwhile (its service interval is 0, so each call reads the
+    /// sockets): only the host's own loopback delivery is left to the wall clock here,
+    /// and it is bounded.
     fn wait_for_host(&self) {
         let start = Instant::now();
         loop {
             let mut s = self.0.lock().unwrap();
-            // Past the service interval, so each call reads the sockets.
-            s.now += Duration::from_millis(1);
             let now = s.now;
             if let Some(frame) = s.gw.recv_at(now) {
                 s.early.push_back(frame);
@@ -631,6 +659,12 @@ fn the_udp_echo_service_answers_through_a_forwarded_port() {
     // for it, with a read timeout.
     let gw = gateway::Gateway::new(gateway::Config {
         hostfwd: vec![gateway::HostFwd::udp(0, 7)],
+        // Host sockets serviced on every poll, so the gateway's clock need only follow
+        // the machine's steps (SteppedGateway::wait_for_host).
+        limits: gateway::Limits {
+            service_interval: Duration::ZERO,
+            ..gateway::Limits::default()
+        },
         ..gateway::Config::default()
     })
     .unwrap();
@@ -668,6 +702,7 @@ fn the_udp_echo_service_answers_through_a_forwarded_port() {
 
     let ifconfig = command(&mut [&mut vm], 0, None, "ifconfig");
     assert!(counters(&ifconfig).values().all(|&n| n == 0), "{ifconfig}");
+    assert_buffers_back(&mut vm);
     exit(&mut vm);
 }
 
@@ -707,6 +742,30 @@ fn two_kernels_on_a_hub_ping_each_other() {
         vms[1].out()
     );
     assert_eq!(command(vms, 1, None, "ifconfig 192.168.7.2"), "");
+    // What netconf refuses, and what the shell can't parse, change nothing: the subnet's
+    // network and broadcast addresses, loopback, multicast, 0.0.0.0/8, masks that aren't
+    // ones then zeros, a gateway off the subnet or the address itself.
+    for (line, error) in [
+        ("ifconfig 192.168.7.255", "invalid argument"),
+        ("ifconfig 192.168.7.0", "invalid argument"),
+        ("ifconfig 127.0.0.5", "invalid argument"),
+        ("ifconfig 224.0.0.1", "invalid argument"),
+        ("ifconfig 0.1.2.3", "invalid argument"),
+        ("ifconfig 10.0.0.1 255.0.255.0", "invalid argument"),
+        ("ifconfig 10.0.0.1 0.0.0.0", "invalid argument"),
+        ("ifconfig 10.0.0.1 255.255.255.0 10.0.1.1", "invalid argument"),
+        ("ifconfig 10.0.0.1 255.255.255.0 10.0.0.1", "invalid argument"),
+        ("ifconfig foo", "foo: not an address"),
+        ("ifconfig 10.0.0.256", "10.0.0.256: not an address"),
+        ("ifconfig 10.0.0.1 255.255.255.0 x", "x: not an address"),
+    ] {
+        assert_eq!(
+            command(vms, 1, None, line),
+            format!("sh: ifconfig: {error}\n"),
+            "{line}"
+        );
+    }
+    assert_eq!(command(vms, 1, None, "ping x"), "sh: ping: x: not an address\n");
     let ifconfig = command(vms, 1, None, "ifconfig");
     assert!(
         ifconfig.contains("\n  inet 192.168.7.2 netmask 255.255.255.0 (static)\n"),
@@ -740,6 +799,8 @@ fn two_kernels_on_a_hub_ping_each_other() {
         c.remove("filtered");
         assert!(c.values().all(|&n| n == 0), "{ifconfig}");
     }
+    assert_buffers_back(&mut a);
+    assert_buffers_back(&mut b);
     exit(&mut a);
     exit(&mut b);
 }
@@ -978,6 +1039,48 @@ fn malformed_frames_are_dropped_and_counted() {
         "echo from port 7",
         to_vm(&ipv4(HOST_IP, VM_IP, 17, &from_7)),
     );
+    // Sources no host can have (RFC 1122 3.2.1.3), to the echo services: answering would
+    // send the answer to everyone on the segment (a broadcast source), to a group, or to
+    // this host itself.
+    for src in [
+        [10, 0, 9, 255],
+        [255, 255, 255, 255],
+        [224, 0, 0, 1],
+        [240, 0, 0, 1],
+        [127, 0, 0, 1],
+        VM_IP,
+    ] {
+        drop(
+            &mut vm,
+            &mut host,
+            "ip",
+            &format!("echo request from {src:?}"),
+            to_vm(&ipv4(src, VM_IP, 1, &good_icmp)),
+        );
+        let u = udp(src, VM_IP, 40000, 7, b"reflect me");
+        drop(
+            &mut vm,
+            &mut host,
+            "ip",
+            &format!("UDP echo from {src:?}"),
+            to_vm(&ipv4(src, VM_IP, 17, &u)),
+        );
+    }
+    // From 0.0.0.0, a host with no address yet: taken, but nothing answers it.
+    ignored(
+        &mut vm,
+        &mut host,
+        "echo request from 0.0.0.0",
+        to_vm(&ipv4([0; 4], VM_IP, 1, &good_icmp)),
+    );
+    let u = udp([0; 4], VM_IP, 40000, 7, b"reflect me");
+    drop(
+        &mut vm,
+        &mut host,
+        "no-port",
+        "UDP echo from 0.0.0.0",
+        to_vm(&ipv4([0; 4], VM_IP, 17, &u)),
+    );
     // Lengths the card itself refuses: shorter than a header, longer than 1514.
     drop(&mut vm, &mut host, "card", "10-byte frame", vec![0xff; 10]);
     drop(
@@ -1010,6 +1113,7 @@ fn malformed_frames_are_dropped_and_counted() {
         (host.sent, 8 + host.asked.len() as u32),
         "{ifconfig}"
     );
+    assert_buffers_back(&mut vm);
     exit(&mut vm);
 }
 
@@ -1053,5 +1157,43 @@ fn arp_gives_up_on_an_address_nobody_has() {
     // Each ping's packet but the last was replaced in the ARP entry by the next one;
     // the last was dropped when ARP gave up; the fourth was refused.
     assert_eq!(counters(&ifconfig)["arp-failed"], 4, "{ifconfig}");
+    assert_buffers_back(&mut vm);
+    exit(&mut vm);
+}
+
+#[test]
+fn arp_entries_expire() {
+    // An answered address is good for ARP_TIMEOUT ticks (60 s), then asked again.
+    let hub = Hub::new();
+    let mut vm = Vm::new(
+        vec![NetConfig::hub(&hub)],
+        Vec::new(),
+        &static_config(VM_IP, MASK),
+    );
+    let mut host = Host::new(&hub);
+    boot(&mut [&mut vm], Some(&mut host));
+    let vms = &mut [&mut vm];
+    assert_eq!(
+        mask_times(&command(vms, 0, Some(&mut host), "ping 10.0.9.1 1")),
+        ping_ok("10.0.9.1", 1)
+    );
+    assert_eq!(host.asked.len(), 1, "the first ping asks");
+    assert_eq!(
+        mask_times(&command(vms, 0, Some(&mut host), "ping 10.0.9.1 1")),
+        ping_ok("10.0.9.1", 1)
+    );
+    assert_eq!(
+        host.asked.len(),
+        1,
+        "the second one finds the address in the cache"
+    );
+    // An idle machine skips ahead to its next timer interrupt, so a minute is cheap.
+    assert_eq!(command(vms, 0, Some(&mut host), "sleep 61"), "");
+    assert_eq!(
+        mask_times(&command(vms, 0, Some(&mut host), "ping 10.0.9.1 1")),
+        ping_ok("10.0.9.1", 1)
+    );
+    assert_eq!(host.asked.len(), 2, "after a minute the entry has expired");
+    assert_buffers_back(&mut vm);
     exit(&mut vm);
 }

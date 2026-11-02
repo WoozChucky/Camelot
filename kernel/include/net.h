@@ -280,8 +280,8 @@ void icmp_input(struct pbuf *p, u32 src, u32 dst, u32 ttl, const u8 *icmp, u32 l
 
 /* Sends an echo request to `dst` with identifier `id` and sequence number
  * `seq`, and waits up to `timeout` ticks for its reply. Fills in `r` and
- * returns 0, or -ETIMEDOUT, or ip_output()'s error. Must be called by a
- * process. */
+ * returns 0, or -ETIMEDOUT (also when the process is killed while it
+ * waits), or ip_output()'s error. Must be called by a process. */
 int icmp_ping(u32 dst, u32 id, u32 seq, u32 timeout, struct ping_reply *r);
 
 /* ---- UDP (udp.c): the kernel-internal socket API ---- */
@@ -321,7 +321,8 @@ int udp_sendto(struct udp_sock *s, u32 dst, u32 port, const void *buf, u32 len);
  * of it to `buf` (the rest is lost, as with any datagram socket), stores
  * its sender in *from and *port (unless NULL) and returns its length.
  * Sleeps while there is none, for at most `timeout` ticks (0: no limit),
- * then -ETIMEDOUT. Must be called by a process. */
+ * then -ETIMEDOUT (at once if the process is killed). Must be called by a
+ * process. */
 int udp_recvfrom(struct udp_sock *s, void *buf, u32 size, u32 *from, u32 *port, u32 timeout);
 
 /* A UDP datagram (`len` bytes at `udp`) for this host from `src` to
