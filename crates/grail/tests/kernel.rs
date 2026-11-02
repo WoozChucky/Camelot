@@ -10,8 +10,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Far more than a run needs (a boot is about 16 million steps with the default 4 MiB
-/// of RAM, 36 million with 128 MiB, most of them setting up memory; `wfi` skips ahead to each
+/// Far more than a run needs (a boot is about 3 million steps with the default 4 MiB
+/// of RAM, 16 million with 128 MiB, most of them setting up memory; `wfi` skips ahead to each
 /// tick), so hitting it means the kernel hung. Generous because stdin reaches
 /// the machine through a thread: until the bytes arrive the kernel idles
 /// through timer ticks, which costs steps.
@@ -353,6 +353,24 @@ fn faulting_user_programs_are_killed_and_the_kernel_carries_on() {
     assert_eq!(command_output(&out, "hello"), ["hello from user mode"]);
     assert!(out.contains(&format!("{PROMPT}ticks\nticks: ")), "{out}");
     assert!(out.ends_with(&format!("{PROMPT}exit\n")), "{out}");
+}
+
+#[test]
+fn a_fault_in_a_megapage_reports_its_mapping() {
+    // The kernel maps the 64 MiB PLIC with 4 MiB megapages. `badload plic`
+    // loads 2 MiB into one of them from U-mode: the report shows the
+    // megapage's PTE and the physical address with the whole 22-bit offset
+    // (the kernel has written there, so A and D are set).
+    let (code, out) = grail(&kernel_elf(), b"badload plic\nhello\nexit\n");
+    assert_eq!(code, Some(0), "output:\n{out}");
+    let lines = command_output(&out, "badload plic");
+    assert_eq!(lines[0], "pid 2 (badload) killed: load page fault");
+    assert!(lines[1].ends_with("  stval 0x0c201000"), "{out}");
+    assert_eq!(
+        lines[2],
+        "  va 0x0c201000 maps to pa 0x0c201000, pte 0x030000c7 DA---WRV"
+    );
+    assert_eq!(lines[3], "badload: exit -1");
 }
 
 #[test]

@@ -7,8 +7,11 @@
  * A PTE with R, W or X set is a leaf; a valid one without them points at the
  * next table. Grail sets A and D itself (hardware-managed) and has no TLB.
  *
- * The kernel only makes 4 KiB leaves, so walk() and unmap_pages() need not
- * handle 4 MiB megapages (leaves in the root table). */
+ * A leaf in the root table maps a whole 4 MiB megapage. The kernel makes
+ * them only in its own address space, in kvminit(), for the 4 MiB stretches
+ * of RAM and devices that a range covers whole: mapping the 64 MiB PLIC page
+ * by page would be 16384 PTEs, most of a boot. Nothing ever unmaps them, so
+ * walk() and unmap_pages() need not handle them: walk() panics on one. */
 #ifndef CAMELOT_VM_H
 #define CAMELOT_VM_H
 
