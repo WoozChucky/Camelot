@@ -14,6 +14,7 @@ pub mod display;
 pub mod elf;
 pub mod framebuffer;
 pub mod keyboard;
+pub mod lake;
 pub mod pointer;
 pub mod sysinfo;
 pub mod trap;

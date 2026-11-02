@@ -32,6 +32,7 @@ version = "0.1.0"
 name = "grail"
 version = "0.1.0"
 dependencies = [
+ "avalon-proto",
  "elf32",
  "excalibur",
 ]
