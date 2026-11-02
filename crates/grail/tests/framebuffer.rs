@@ -1,10 +1,12 @@
 //! Framebuffer end to end: runs `examples/colorbars` headless through the `grail`
 //! binary, dumps PPM frames, and checks them against the expected test pattern.
 
+use grail::display::{self, DisplayOptions, Outcome};
 use grail::framebuffer::{FB_HEIGHT, FB_WIDTH};
-use grail::{Machine, RunResult};
+use grail::{Machine, MachineConfig, RunResult};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// FNV-1a 64 of the expected `frame-*.ppm` for `examples/colorbars`. If the pattern
 /// changes on purpose, update `expected_pixel` and this hash together.
@@ -183,4 +185,39 @@ fn colorbars_runs_under_plain_run() {
     m.load_elf(&file).unwrap();
     assert_eq!(m.run(Some(10_000_000), |_| {}), RunResult::Exited(0));
     assert_eq!(m.cpu.bus.fb.presents, 1);
+}
+
+#[test]
+fn display_run_follows_a_real_time_clock() {
+    // The host loop behind --fb and --fb-dump: at a clock that makes colorbars last at
+    // least 0.25 s, it must take that long and still dump the right frames.
+    let file = std::fs::read(colorbars_elf()).unwrap();
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+    m.load_elf(&file).unwrap();
+    let mut steps = 0u64;
+    assert_eq!(m.run(None, |_| steps += 1), RunResult::Exited(0));
+    let hz = u32::try_from(steps * 4).unwrap();
+
+    let mut m = Machine::new(MachineConfig {
+        clock_hz: Some(hz),
+        ..MachineConfig::default()
+    })
+    .unwrap();
+    m.load_elf(&file).unwrap();
+    let dir = scratch("colorbars-clock");
+    let opts = DisplayOptions {
+        dump_dir: Some(dir.clone()),
+        ..DisplayOptions::default()
+    };
+    let t = Instant::now();
+    let outcome = display::run(&mut m, None, |_| {}, &opts).unwrap();
+    let elapsed = t.elapsed();
+    assert_eq!(outcome, Outcome::Program(RunResult::Exited(0)));
+    assert!(
+        elapsed >= Duration::from_millis(240),
+        "{steps} steps at {hz} Hz in {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    check_colorbars_ppm(&std::fs::read(dir.join("frame-0000.ppm")).unwrap());
+    check_colorbars_ppm(&std::fs::read(dir.join("frame-0001.ppm")).unwrap());
 }

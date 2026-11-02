@@ -108,6 +108,12 @@ pub fn parse_clock(s: &str) -> Result<u32, String> {
     if !digits_only(whole) || (number.contains('.') && !digits_only(frac)) {
         return Err(bad());
     }
+    // Trailing zeros change nothing. A non-zero digit past the 6th decimal place (the
+    // largest scale is 10^6) leaves a fraction of a Hz, however long the number is.
+    let frac = frac.trim_end_matches('0');
+    if frac.len() > 6 {
+        return Err(format!("{s} is not a whole number of Hz"));
+    }
     // value = whole.frac * scale, in exact integer arithmetic: (whole.frac * 10^k) * scale / 10^k.
     let too_big = || format!("{s} does not fit in 32 bits (at most {} Hz)", u32::MAX);
     let mut mantissa: u128 = 0;
@@ -238,7 +244,12 @@ mod tests {
         assert_eq!(parse_clock("3.0"), Ok(3));
         assert_eq!(parse_clock("3.000Hz"), Ok(3));
         assert_eq!(parse_clock("1.00000000000000000000kHz"), Ok(1000));
-        for bad in ["1.5Hz", "1.5", "0.0005kHz", "0.0000001MHz"] {
+        // Long runs of trailing zeros used to overflow the mantissa and read as too big.
+        let zeros = "0".repeat(60);
+        assert_eq!(parse_clock(&format!("1.{zeros}kHz")), Ok(1000));
+        assert_eq!(parse_clock(&format!("4294.967295{zeros}MHz")), Ok(u32::MAX));
+        let tiny = format!("0.{zeros}1MHz");
+        for bad in ["1.5Hz", "1.5", "0.0005kHz", "0.0000001MHz", "1.0000001MHz", &tiny] {
             let e = parse_clock(bad).unwrap_err();
             assert!(e.contains("whole number of Hz"), "{bad:?}: {e}");
         }

@@ -8,6 +8,7 @@
 
 use grail::{Machine, RunResult};
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -234,6 +235,24 @@ pub fn run_on_grail(elf: &[u8], max_steps: u64) -> Result<(RunResult, String), S
     let r = m.run(Some(max_steps), |_| {});
     let out = std::mem::take(&mut m.cpu.bus.uart.captured);
     Ok((r, String::from_utf8_lossy(&out).into_owned()))
+}
+
+/// What `cargo xtask kernel --run` does once the image is built: boots `elf` on a
+/// default Grail machine for at most `max_steps` steps, with UART output going to `uart`
+/// and `xcal.dbg` output to `debug`. Returns the result and the machine in its final
+/// state.
+pub fn run_with_output(
+    elf: &[u8],
+    max_steps: u64,
+    uart: impl Write + Send + 'static,
+    debug: impl Write + Send + 'static,
+) -> Result<(RunResult, Machine), String> {
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+    m.load_elf(elf)?;
+    m.set_uart_output(uart);
+    m.set_debug_output(debug);
+    let r = m.run(Some(max_steps), |_| {});
+    Ok((r, m))
 }
 
 /// Replaces the program counter in `[dbg] pc=XXXXXXXX` lines with dots, so

@@ -70,8 +70,10 @@ impl Cpu {
     }
 
     /// While stalled in `wfi` with nothing pending, lets up to `max` ticks pass at once,
-    /// exactly as `max` idle steps would: `mtime` advances and nothing else changes. It
-    /// stops one tick short of `mtimecmp`, so the next step raises the timer on time.
+    /// exactly as `max` idle steps would: `mtime` advances and nothing else changes. When
+    /// the timer can wake the hart (`mie.MTIE` set), it stops one tick short of
+    /// `mtimecmp`, so the next step raises the timer on time; a masked timer cannot end
+    /// the wait (and nothing reads `mip` meanwhile), so it does not limit the skip.
     /// Returns the ticks skipped (0 when not stalled or an interrupt is pending).
     ///
     /// Device lines are not sampled during the skip, so host input that arrives in the
@@ -81,7 +83,11 @@ impl Cpu {
             return 0;
         }
         let clint = &mut self.bus.clint;
-        let to_timer = clint.mtimecmp.saturating_sub(clint.mtime).saturating_sub(1);
+        let to_timer = if self.csr.mie & (1 << IRQ_M_TIMER) != 0 {
+            clint.mtimecmp.saturating_sub(clint.mtime).saturating_sub(1)
+        } else {
+            u64::MAX
+        };
         let ticks = max.min(to_timer);
         clint.mtime = clint.mtime.wrapping_add(ticks);
         ticks

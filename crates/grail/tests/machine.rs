@@ -211,23 +211,36 @@ fn clock_paces_instructions() {
     assert_eq!(m.cpu.bus.clint.mtime, 300);
 }
 
-/// Sets mtimecmp to `when`, enables only the machine timer interrupt (with mstatus.MIE
-/// still clear, so it wakes wfi without trapping), waits, then halts.
+/// `lui rd, %hi(v); addi rd, rd, %lo(v)`: loads any 32-bit `v` into `rd`.
+fn li(rd: u32, v: u32) -> [u32; 2] {
+    let hi = v.wrapping_add(0x800) >> 12;
+    let lo = v.wrapping_sub(hi << 12) & 0xfff;
+    [0x37 | rd << 7 | hi << 12, 0x13 | rd << 7 | rd << 15 | lo << 20]
+}
+
+const MTIE: u32 = 1 << 7;
+const MEIE: u32 = 1 << 11;
+
+/// Sets mtimecmp to `when`, sets mie to `mie` (with mstatus.MIE still clear, so an
+/// enabled interrupt wakes wfi without trapping), waits, then halts.
+fn wfi_program(when: u32, mie: u32) -> Vec<u32> {
+    const T0: u32 = 5;
+    const T1: u32 = 6;
+    let mut p = Vec::new();
+    p.extend(li(T0, CLINT_BASE + 0x4000)); // t0 = &mtimecmp
+    p.extend(li(T1, when));
+    p.push(0x0062_a023); // sw   t1, 0(t0)
+    p.push(0x0002_a223); // sw   zero, 4(t0)
+    p.extend(li(T1, mie));
+    p.push(0x3043_1073); // csrw mie, t1
+    p.push(0x1050_0073); // wfi
+    p.push(0x0000_100b); // xcal.halt zero
+    p
+}
+
+/// Sets mtimecmp to `when`, enables only the machine timer interrupt, waits, then halts.
 fn wfi_until(when: u32) -> Vec<u32> {
-    assert!(when < 1 << 19);
-    let hi = (when + 0x800) >> 12;
-    let lo = when.wrapping_sub(hi << 12) & 0xfff;
-    vec![
-        0x0000_02b7 | ((CLINT_BASE + 0x4000) & !0xfff), // lui  t0, %hi(mtimecmp)
-        0x0000_0337 | (hi << 12),                       // lui  t1, %hi(when)
-        0x0003_0313 | (lo << 20),                       // addi t1, t1, %lo(when)
-        0x0062_a023,                                    // sw   t1, 0(t0)
-        0x0002_a223,                                    // sw   zero, 4(t0)
-        0x0800_0313,                                    // li   t1, MTIE
-        0x3043_1073,                                    // csrw mie, t1
-        0x1050_0073,                                    // wfi
-        0x0000_100b,                                    // xcal.halt zero
-    ]
+    wfi_program(when, MTIE)
 }
 
 #[test]
@@ -258,6 +271,44 @@ fn paced_wfi_sleeps_until_the_timer() {
         traced < 1000,
         "idle ticks were skipped in bulk ({traced} steps traced)"
     );
+}
+
+#[test]
+fn paced_wfi_skips_past_a_masked_timer() {
+    // Only MEIE is enabled, so the timer cannot end the wait: whether mtimecmp is already
+    // behind mtime (0) or still ahead (1000), the idle ticks must keep being skipped in
+    // bulk rather than one step per tick once mtime reaches mtimecmp.
+    for when in [0, 1000] {
+        let mut m = bare_machine(clock(10_000_000), &wfi_program(when, MEIE));
+        let mut traced = 0u64;
+        assert_eq!(m.run(Some(1_000_000), |_| traced += 1), RunResult::StepLimit);
+        assert!(m.cpu.waiting, "still waiting (mtimecmp {when})");
+        assert_eq!(m.cpu.bus.clint.mtime, 1_000_000);
+        assert!(
+            traced < 10_000,
+            "mtimecmp {when}: {traced} steps traced for 1 000 000 idle ticks"
+        );
+    }
+}
+
+#[test]
+fn paced_idle_stays_within_the_step_limit() {
+    // Parked in wfi with the timer far away, a paced machine skips idle ticks in bulk,
+    // but run_for(k) still runs exactly k ticks (well inside one 1000-tick batch) and
+    // run(Some(n)) stops at n.
+    let mut m = bare_machine(clock(1_000_000), &wfi_until(400_000));
+    assert_eq!(m.run_for(20, &mut |_| {}), 20);
+    assert!(m.cpu.waiting, "parked in wfi");
+    for k in [1, 2, 5, 10, 100] {
+        let before = m.cpu.bus.clint.mtime;
+        assert_eq!(m.run_for(k, &mut |_| {}), k, "run_for({k})");
+        assert_eq!(m.cpu.bus.clint.mtime - before, k, "mtime after run_for({k})");
+    }
+
+    let mut m = bare_machine(clock(1_000_000), &wfi_until(400_000));
+    assert_eq!(m.run(Some(50_000), |_| {}), RunResult::StepLimit);
+    assert!(m.cpu.waiting);
+    assert_eq!(m.cpu.bus.clint.mtime, 50_000);
 }
 
 #[test]
@@ -304,8 +355,11 @@ fn run_for_never_sleeps() {
     assert!(delay <= Duration::from_millis(200), "{delay:?}");
     std::thread::sleep(delay);
     assert_eq!(m.pace_delay(), None);
-    assert_eq!(m.run_for(1000, &mut |_| {}), 1);
-    assert_eq!(m.cpu.bus.clint.mtime, 2);
+    // At least the step that just became due; more if this thread was held up long
+    // enough for the next one to be due too.
+    let ran = m.run_for(1000, &mut |_| {});
+    assert!(ran >= 1, "{ran}");
+    assert_eq!(m.cpu.bus.clint.mtime, 1 + ran);
 }
 
 #[test]

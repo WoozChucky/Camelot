@@ -3,7 +3,9 @@
 //! also rebuilt from source and checked against the committed image.
 
 use grail::{Machine, RunResult};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use xtask::kernel::{self, Assembler, Build, Lang, BOOT_MAX_STEPS};
 use xtask::{repo_root, tools};
 
@@ -47,6 +49,39 @@ fn sym(elf: &grail::elf::Elf, name: &str) -> u32 {
 #[test]
 fn committed_kernel_boots() {
     assert_boots(&committed_elf());
+}
+
+/// A `Write` the test can read back after giving it to a machine.
+#[derive(Clone, Default)]
+struct Shared(Arc<Mutex<Vec<u8>>>);
+
+impl Shared {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl Write for Shared {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn run_sends_uart_and_debug_output_to_the_given_sinks() {
+    // What `cargo xtask kernel --run` uses (with stdout and stderr): the UART text and
+    // the xcal.dbg line must each reach their own sink.
+    let (uart, debug) = (Shared::default(), Shared::default());
+    let (r, _) =
+        kernel::run_with_output(&committed_elf(), BOOT_MAX_STEPS, uart.clone(), debug.clone()).unwrap();
+    assert_eq!(r, RunResult::Exited(0));
+    let (console, dbg) = BOOT_OUTPUT.split_at(BOOT_OUTPUT.find("[dbg]").unwrap());
+    assert_eq!(uart.text(), console);
+    assert_eq!(kernel::mask_dbg_pc(&debug.text()), dbg);
 }
 
 #[test]

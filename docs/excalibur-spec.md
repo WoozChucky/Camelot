@@ -246,7 +246,7 @@ Read-only registers that describe the machine, so software discovers its hardwar
 | 0x3000_200C | `SYS_RAM_SIZE` | RAM size in bytes (a multiple of 4 KiB; 0x0800_0000 by default, 0x8000_0000 at most) |
 | 0x3000_2010 | `SYS_TIMEBASE_HZ` | `mtime` frequency in Hz |
 | 0x3000_2014 | `SYS_CPU_HZ` | CPU clock in Hz; equal to the timebase (one instruction per tick) |
-| 0x3000_2018 | `SYS_FLAGS` | bit 0 = the clock is real time (`--clock`); clear = nominal (default 10 MHz, runs at full speed) |
+| 0x3000_2018 | `SYS_FLAGS` | bit 0 = the clock is real time (`--clock`); clear = nominal (default 10 MHz, runs at full speed). Other bits are reserved and read as 0 |
 | 0x3000_201C | `SYS_DEV_COUNT` | number of device table entries |
 | 0x3000_2020 - 0x3000_203F | reserved | read as 0 |
 | 0x3000_2040 + 16·i | device table entry `i` | four words, below |
