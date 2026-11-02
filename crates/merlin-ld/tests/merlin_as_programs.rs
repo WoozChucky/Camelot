@@ -1,9 +1,5 @@
 //! Programs built entirely with our own tools: assembled by merlin-as, linked
 //! by merlin-ld (default layout), run in Grail.
-//!
-//! Until merlin-ld applies relocations (#7) the programs must not need any:
-//! merlin-as resolves references to local labels in the same section itself,
-//! so code that stays in one section with local labels links already.
 
 use grail::{Machine, RunResult};
 use merlin_ld::{Input, Options};
@@ -13,11 +9,6 @@ const MULDIV: &str = include_str!("../../../examples/muldiv/muldiv.S");
 /// Assembles, links and runs `src`; returns how it ended and what it printed.
 fn build_and_run(src: &str) -> (RunResult, String) {
     let obj = merlin_as::assemble(src).unwrap_or_else(|e| panic!("merlin-as: {e:?}"));
-    let relocs: usize = obj.sections.iter().map(|s| s.relocs.len()).sum();
-    assert_eq!(
-        relocs, 0,
-        "the program needs relocations, which merlin-ld can't apply yet"
-    );
     let input = Input {
         name: "prog.o".into(),
         data: merlin_as::elf::write(&obj),
