@@ -143,3 +143,17 @@ void brelse(struct buf *b) {
         }
     }
 }
+
+void bpin(struct buf *b) {
+    if (!b->locked) {
+        panic("bpin: buffer not locked");
+    }
+    b->refcnt++;
+}
+
+void bunpin(struct buf *b) {
+    if (!b->locked || b->refcnt < 2) {
+        panic("bunpin: buffer not pinned");
+    }
+    b->refcnt--;
+}

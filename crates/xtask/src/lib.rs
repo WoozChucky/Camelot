@@ -6,6 +6,8 @@
 //!   merlin-ld, no LLVM (the default way to build them).
 //! * [`kernel`]: builds `kernel/kernel.elf` with clang + ld.lld, or with
 //!   merlin-as for the assembly files.
+//! * [`fs`]: builds the root filesystem image (the user programs and a
+//!   README) with the `camelot-fs` crate's mkfs.
 //! * [`hello`]: builds `examples/hello/hello.S` with merlin-as + ld.lld into a
 //!   committed reference image.
 //! * [`ld_fixtures`]: regenerates merlin-ld's test fixtures (clang, ld.lld,
@@ -15,6 +17,7 @@
 //!   merlin-ld and embeds them in the kernel (`kernel/userprogs.s`).
 
 pub mod examples;
+pub mod fs;
 pub mod hello;
 pub mod kernel;
 pub mod ld_fixtures;

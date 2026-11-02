@@ -2,17 +2,24 @@
 //! Avalon protocol (`docs/avalon-protocol.md`).
 //!
 //! - [`Client`]: one session with a server. VM control (create, list, info, start,
-//!   pause, resume, stop, destroy) talks to Avalon; disk management (create, list,
-//!   delete) talks to Lake. Each operation is one request and its typed reply.
-//! - [`parse`]: the text people type for addresses, RAM sizes, clocks, disk sources and
-//!   disk sizes, so every front end accepts the same syntax (`--ram` and `--clock` are
-//!   Grail's own parsers).
-//! - [`show`]: the same values as text again (sizes, frequencies, device names).
+//!   pause, resume, stop, destroy) and the virtual network (switches, plugging cards
+//!   into them, captures) talk to Avalon; disk management (create, list, delete) talks
+//!   to Lake. Each operation is one request and its typed reply.
+//! - [`parse`]: the text people type for addresses, RAM sizes, clocks, disk sources,
+//!   disk sizes and network cards, so every front end accepts the same syntax (`--ram`
+//!   and `--clock` are Grail's own parsers).
+//! - [`show`]: the same values as text again (sizes, frequencies, device names, MAC
+//!   addresses).
+//! - [`VmAction::allowed_in`], [`holds_disks`] and [`lake_disks`]: what a VM's state
+//!   and profile mean for what a person may do with it and its disks.
 //!
 //! Round Table, the command-line client, is a thin layer over this crate, and so is
 //! Pendragon, the web console: the two cannot drift apart.
 
-use avalon_proto::{Connection, DiskInfo, ErrorCode, HardwareProfile, Message, VmDetails, VmRef, VmSummary};
+use avalon_proto::{
+    Connection, DeviceSpec, DiskInfo, DiskSource, ErrorCode, HardwareProfile, Message, SwitchInfo, VmDetails,
+    VmRef, VmState, VmSummary,
+};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -21,8 +28,8 @@ use std::time::Duration;
 pub mod parse;
 pub mod show;
 
-pub use parse::{parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_ram};
-pub use show::{device_name, disk_source_text, format_hz, format_size};
+pub use parse::{parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_net, parse_ram};
+pub use show::{device_name, disk_source_text, format_hz, format_size, mac_text};
 
 /// How long [`Client::connect`] tries each address of the server before giving up.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -151,6 +158,19 @@ impl VmAction {
         }
     }
 
+    /// Whether the server accepts this action on a VM in `state` (protocol doc,
+    /// section 6.2): front ends offer only these.
+    pub fn allowed_in(self, state: VmState) -> bool {
+        use VmState::*;
+        match self {
+            VmAction::Start => state == Created,
+            VmAction::Pause => state == Running,
+            VmAction::Resume => state == Paused,
+            VmAction::Stop => matches!(state, Created | Running | Paused),
+            VmAction::Destroy => true,
+        }
+    }
+
     /// The request for this action on `vm`.
     pub fn request(self, vm: VmRef) -> Message {
         match self {
@@ -161,6 +181,25 @@ impl VmAction {
             VmAction::Destroy => Message::DestroyVm { vm },
         }
     }
+}
+
+/// Whether a VM in `state` still has its machine, and so holds its disks: a VM's disks
+/// are attached when it is created and released when its machine ends, when it is
+/// stopped or its program exits (protocol doc, section 6.6).
+pub fn holds_disks(state: VmState) -> bool {
+    matches!(state, VmState::Created | VmState::Running | VmState::Paused)
+}
+
+/// The Lake images in a hardware profile, as (server address, image name, read-only),
+/// in the profile's order.
+pub fn lake_disks(profile: &HardwareProfile) -> impl Iterator<Item = (&str, &str, bool)> {
+    profile.devices.iter().filter_map(|device| match device {
+        DeviceSpec::Disk(disk) => match &disk.source {
+            DiskSource::Lake { addr, name } => Some((addr.as_str(), name.as_str(), disk.read_only)),
+            DiskSource::File(_) => None,
+        },
+        DeviceSpec::Net(_) => None,
+    })
 }
 
 /// One session with an Avalon or Lake server.
@@ -233,6 +272,12 @@ impl<S: Read + Write> Client<S> {
         &mut self.conn
     }
 
+    /// The session's connection, for a client that goes on with events of its own (a
+    /// console attached with [`Client::attach_console`]).
+    pub fn into_connection(self) -> Connection<S> {
+        self.conn
+    }
+
     /// Checks that the server answers.
     pub fn ping(&mut self) -> Result<()> {
         let token = 0x5254_0001;
@@ -297,6 +342,68 @@ impl<S: Read + Write> Client<S> {
 
     pub fn destroy_vm(&mut self, vm: &VmRef) -> Result<()> {
         self.vm_action(VmAction::Destroy, vm)
+    }
+
+    // ---- Console (Avalon) ----
+
+    /// Attaches this session to a VM's console: returns the VM's id and its
+    /// scrollback (its recent output). `ConsoleOutput` events follow on the
+    /// connection, read with [`Client::connection`]'s `recv`, until the session ends
+    /// or detaches; `ConsoleInput` events sent on it reach the VM's UART.
+    pub fn attach_console(&mut self, vm: &VmRef) -> Result<(u32, Vec<u8>)> {
+        match self.conn.request(&Message::ConsoleAttach { vm: vm.clone() })? {
+            Message::ConsoleAttached { vm, scrollback } => Ok((vm, scrollback)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    // ---- Virtual network (Avalon) ----
+
+    /// Creates an empty virtual switch.
+    pub fn create_switch(&mut self, name: &str) -> Result<()> {
+        Ok(self.conn.request_ok(&Message::CreateSwitch {
+            name: name.to_string(),
+        })?)
+    }
+
+    /// Deletes a switch, unplugging every card from it.
+    pub fn delete_switch(&mut self, name: &str) -> Result<()> {
+        Ok(self.conn.request_ok(&Message::DeleteSwitch {
+            name: name.to_string(),
+        })?)
+    }
+
+    /// Every switch, in name order, with its ports and their counters.
+    pub fn list_switches(&mut self) -> Result<Vec<SwitchInfo>> {
+        match self.conn.request(&Message::ListSwitches)? {
+            Message::SwitchList { switches } => Ok(switches),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Plugs network card `card` of `vm` into `switch`.
+    pub fn attach_card(&mut self, vm: &VmRef, card: u8, switch: &str) -> Result<()> {
+        Ok(self.conn.request_ok(&Message::AttachCard {
+            vm: vm.clone(),
+            card,
+            switch: switch.to_string(),
+        })?)
+    }
+
+    /// Unplugs network card `card` of `vm` from its switch.
+    pub fn detach_card(&mut self, vm: &VmRef, card: u8) -> Result<()> {
+        Ok(self
+            .conn
+            .request_ok(&Message::DetachCard { vm: vm.clone(), card })?)
+    }
+
+    /// Starts capturing `switch` into the pcap file `path` on the server's host, or
+    /// stops (`None`).
+    pub fn capture_switch(&mut self, switch: &str, path: Option<&str>) -> Result<()> {
+        Ok(self.conn.request_ok(&Message::CaptureSwitch {
+            switch: switch.to_string(),
+            path: path.map(str::to_string),
+        })?)
     }
 
     // ---- Disk management (Lake) ----
@@ -404,5 +511,46 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(err.code(), None);
+    }
+
+    #[test]
+    fn actions_by_state() {
+        use VmState::*;
+        let allowed = |state| -> Vec<&str> {
+            VmAction::ALL
+                .into_iter()
+                .filter(|a| a.allowed_in(state))
+                .map(VmAction::name)
+                .collect()
+        };
+        assert_eq!(allowed(Created), ["start", "stop", "destroy"]);
+        assert_eq!(allowed(Running), ["pause", "stop", "destroy"]);
+        assert_eq!(allowed(Paused), ["resume", "stop", "destroy"]);
+        assert_eq!(allowed(Stopped), ["destroy"]);
+        assert_eq!(allowed(Exited(3)), ["destroy"]);
+        assert!(holds_disks(Created) && holds_disks(Running) && holds_disks(Paused));
+        assert!(!holds_disks(Stopped) && !holds_disks(Exited(0)));
+    }
+
+    #[test]
+    fn lake_disks_of_a_profile() {
+        let disk = |source: &str, read_only| {
+            DeviceSpec::Disk(avalon_proto::DiskSpec {
+                source: crate::parse_disk_source(source).unwrap(),
+                read_only,
+            })
+        };
+        let profile = HardwareProfile {
+            devices: vec![
+                disk("lake://10.0.0.9:7401/data", false),
+                disk("boot.img", true),
+                disk("lake://store/root", true),
+            ],
+            ..HardwareProfile::default()
+        };
+        assert_eq!(
+            lake_disks(&profile).collect::<Vec<_>>(),
+            [("10.0.0.9:7401", "data", false), ("store:7401", "root", true)]
+        );
     }
 }
