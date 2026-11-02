@@ -1,0 +1,16 @@
+[package]
+name = "round-table"
+description = "Round Table, the control CLI of the Avalon platform: creates, lists and controls VMs on Avalon, and manages disk images on Lake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+avalon-client = { path = "../avalon-client" }
+avalon-proto = { path = "../avalon-proto" }
+
+[dev-dependencies]
+# The integration tests run an Avalon server, and a Lake server (tests/lake.rs), in
+# process and drive them through Round Table.
+avalon = { path = "../avalon" }
+lake = { path = "../lake" }

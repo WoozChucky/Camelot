@@ -14,6 +14,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "avalon-client"
+version = "0.1.0"
+dependencies = [
+ "avalon-proto",
+ "grail",
+]
+
+[[package]]
 name = "avalon-proto"
 version = "0.1.0"
 dependencies = [
@@ -32,6 +40,7 @@ version = "0.1.0"
 name = "grail"
 version = "0.1.0"
 dependencies = [
+ "avalon-proto",
  "elf32",
  "excalibur",
 ]
@@ -43,6 +52,17 @@ dependencies = [
  "avalon",
  "avalon-proto",
  "grail",
+]
+
+[[package]]
+name = "lake"
+version = "0.1.0"
+dependencies = [
+ "avalon",
+ "avalon-proto",
+ "grail",
+ "merlin-as",
+ "merlin-ld",
 ]
 
 [[package]]
@@ -82,6 +102,16 @@ dependencies = [
  "elf32",
  "excalibur",
  "merlin-as",
+]
+
+[[package]]
+name = "round-table"
+version = "0.1.0"
+dependencies = [
+ "avalon",
+ "avalon-client",
+ "avalon-proto",
+ "lake",
 ]
 
 [[package]]

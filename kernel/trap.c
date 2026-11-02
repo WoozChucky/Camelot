@@ -5,11 +5,12 @@
  *
  * Two interrupts are handled: the timer tick, which arrives as a supervisor
  * software interrupt forwarded by machine_vec, and the supervisor external
- * interrupt from the PLIC, so far only the UART's receive line. In the kernel
- * an exception is a bug, so it panics, unless a memory probe (probe.s) caused
- * it. In U-mode, ecall is a call into the kernel (syscall.c) and any other
- * exception kills the process. */
+ * interrupt from the PLIC: the UART's receive line and the disks' completions.
+ * In the kernel an exception is a bug, so it panics, unless a memory probe
+ * (probe.s) caused it. In U-mode, ecall is a call into the kernel (syscall.c)
+ * and any other exception kills the process. */
 #include "trap.h"
+#include "blk.h"
 #include "kprintf.h"
 #include "machine.h"
 #include "plic.h"
@@ -124,6 +125,8 @@ static void external_interrupt(void) {
     u32 irq = plic_claim();
     if (irq == PLIC_IRQ_UART) {
         uart_intr();
+    } else {
+        blk_intr(irq);
     }
     /* 0: nothing left to claim. Only enabled sources can be claimed, so any
      * other number is one the kernel set up. */

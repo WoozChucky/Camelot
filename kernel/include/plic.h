@@ -17,12 +17,17 @@
 #define PLIC_CTX_S 1
 
 /* Interrupt sources (spec section 7.1). Excalibur numbers its devices from 1,
- * unlike QEMU `virt`, which puts the UART on 10. */
+ * unlike QEMU `virt`, which puts the UART on 10. Other devices' sources (the
+ * disks') come from the sysinfo device table. */
 #define PLIC_IRQ_UART 1
 
-/* UART source priority 1, enabled for the S-mode context, threshold 0: the
+/* Threshold 0 for the S-mode context and the UART's source enabled: the
  * UART's receive line then raises sip.SEIP. */
 void plic_init(void);
+
+/* Gives source `irq` (1-31) priority 1 and enables it for the S-mode
+ * context, keeping the sources already enabled. */
+void plic_enable(u32 irq);
 
 /* Claims the highest-priority pending source for the S-mode context, or 0 if
  * there is none. */
