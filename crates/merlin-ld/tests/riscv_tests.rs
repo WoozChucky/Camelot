@@ -69,7 +69,7 @@ fn check(name: &str, opts: &Options) -> Result<(), String> {
     if NOT_RUN.contains(&name) {
         return Ok(());
     }
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.cpu.bus.uart.capture = true;
     m.load_elf(&linked.elf).map_err(|e| format!("load: {e}"))?;
     match m.run(Some(5_000_000), |_| {}) {

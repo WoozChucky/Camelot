@@ -32,7 +32,6 @@ pub const WM_KILLFOCUS: u32 = 0x0008;
 #[cfg(test)]
 pub const WM_CLOSE: u32 = 0x0010;
 pub const WM_PAINT: u32 = 0x000f;
-pub const WM_QUIT: u32 = 0x0012;
 pub const WM_NCCREATE: u32 = 0x0081;
 pub const WM_NCDESTROY: u32 = 0x0082;
 pub const WM_KEYDOWN: u32 = 0x0100;
@@ -113,6 +112,18 @@ pub struct RECT {
 }
 
 #[repr(C)]
+pub struct MSG {
+    pub hwnd: HWND,
+    pub message: u32,
+    pub wParam: WPARAM,
+    pub lParam: LPARAM,
+    pub time: u32,
+    pub pt: POINT,
+    pub lPrivate: u32,
+}
+
+/// What `CreateWindowExW` was called with; `lParam` of `WM_NCCREATE` points at it.
+#[repr(C)]
 pub struct CREATESTRUCTW {
     pub lpCreateParams: *mut c_void,
     pub hInstance: HINSTANCE,
@@ -126,17 +137,6 @@ pub struct CREATESTRUCTW {
     pub lpszName: *const u16,
     pub lpszClass: *const u16,
     pub dwExStyle: u32,
-}
-
-#[repr(C)]
-pub struct MSG {
-    pub hwnd: HWND,
-    pub message: u32,
-    pub wParam: WPARAM,
-    pub lParam: LPARAM,
-    pub time: u32,
-    pub pt: POINT,
-    pub lPrivate: u32,
 }
 
 #[repr(C)]
@@ -200,7 +200,6 @@ extern "system" {
     pub fn TranslateMessage(msg: *const MSG) -> BOOL;
     pub fn DispatchMessageW(msg: *const MSG) -> LRESULT;
     pub fn WaitMessage() -> BOOL;
-    pub fn PostQuitMessage(exit_code: i32);
     pub fn AdjustWindowRect(rect: *mut RECT, style: u32, menu: BOOL) -> BOOL;
     pub fn GetClientRect(hwnd: HWND, rect: *mut RECT) -> BOOL;
     pub fn SetWindowTextW(hwnd: HWND, text: *const u16) -> BOOL;
