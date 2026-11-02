@@ -111,6 +111,9 @@ pub struct Assembler {
     /// `%pcrel_lo(label)` relocations to check once every label is known:
     /// (section, label, source line). See [`Assembler::check_pcrel_lo`].
     pcrel_lo: Vec<(usize, String, usize)>,
+    /// Names given to `.local`, so that a later `.comm` allocates them in
+    /// `.bss` (see the `.comm` directive).
+    locals: HashSet<String>,
     errors: Vec<Error>,
     line: usize,
 }
@@ -183,6 +186,7 @@ impl Assembler {
             hidden_labels: 0,
             dot_labels: 0,
             pcrel_lo: Vec::new(),
+            locals: HashSet::new(),
             errors: Vec::new(),
             line: 0,
         };
@@ -662,6 +666,79 @@ impl Assembler {
         }
     }
 
+    /// `.set name, label + offset` (or `name = label + offset`): `name`
+    /// becomes another label at that address, in the label's section. clang
+    /// writes these when it merges a file's `static` variables into one
+    /// block (`.L_MergedGlobals`) and names each part of it. The label must
+    /// be defined already, so the address is known.
+    fn alias(&mut self, directive: &str, name: &str, e: &Expr) {
+        let ctx = Ctx { asm: self };
+        let Some((target, addend)) = ctx.symbol(e) else {
+            return self.error(format!("{directive}: expected a constant or label(+offset)"));
+        };
+        let i = self.symbol_index(&target);
+        let t = &self.symbols[i];
+        let (Some(section), true, None) = (t.section, t.defined, t.constant) else {
+            let shown = shown_name(&target).to_string();
+            return self.error(format!(
+                "{directive}: '{shown}' must be a label defined before this"
+            ));
+        };
+        let value = t.value as i64 + addend;
+        if !(0..=u32::MAX as i64).contains(&value) {
+            return self.error(format!("{directive}: '{name}' would be outside its section"));
+        }
+        self.define(name, section, value as u32);
+    }
+
+    /// `.comm sym, size[, align]` for a symbol made `.local` first, or
+    /// `.lcomm sym, size[, align]`: reserves `size` zero bytes for `sym` in
+    /// `.bss`, aligned to `align` bytes, as clang's assembler does. This is
+    /// how clang writes a `static` variable without an initializer in its
+    /// assembly output (`.local buf` then `.comm buf,100,1`). The current
+    /// section stays what it was. A global `.comm` would be an
+    /// `SHN_COMMON` symbol for the linker to merge, which merlin-ld doesn't
+    /// do: it is an error (compile with `-fno-common`).
+    fn common(&mut self, name: &str, args: &[DirArg]) {
+        let Some(sym) = self.arg_name(args, 0, name) else {
+            return;
+        };
+        if name == ".comm" && !self.locals.contains(&sym) {
+            return self.error(format!(
+                ".comm: '{sym}' is not .local; common symbols are not supported (use -fno-common)"
+            ));
+        }
+        let Some(size) = self.arg_const(args, 1, name) else {
+            return;
+        };
+        let align = if args.len() > 2 {
+            match self.arg_const(args, 2, name) {
+                Some(a) => a,
+                None => return,
+            }
+        } else {
+            1
+        };
+        if !(0..=u32::MAX as i64).contains(&size) {
+            return self.error(format!("{name}: bad size {size}"));
+        }
+        if align <= 0 || align & (align - 1) != 0 || align > 1 << 16 {
+            return self.error(format!("{name}: alignment must be a power of two up to 65536"));
+        }
+        let back = self.current;
+        self.switch_section(".bss");
+        self.align_to(align as u32);
+        let off = self.sections[self.current].size;
+        self.define(&sym, self.current, off);
+        let i = self.symbol_index(&sym);
+        self.symbols[i].size = size as u32;
+        if self.symbols[i].ty == SymType::NoType {
+            self.symbols[i].ty = SymType::Object;
+        }
+        self.emit_zeros(size as u32);
+        self.current = back;
+    }
+
     fn directive(&mut self, name: &str, args: &[DirArg]) {
         match name {
             ".text" | ".data" | ".rodata" | ".bss" => self.switch_section(name),
@@ -678,9 +755,24 @@ impl Assembler {
                     }
                 }
             }
-            ".local" => {}
+            ".local" => {
+                for i in 0..args.len() {
+                    if let Some(n) = self.arg_name(args, i, name) {
+                        self.locals.insert(n);
+                    }
+                }
+            }
+            ".comm" | ".lcomm" => self.common(name, args),
             ".equ" | ".set" => {
-                let (Some(n), Some(v)) = (self.arg_name(args, 0, name), self.arg_const(args, 1, name)) else {
+                let Some(n) = self.arg_name(args, 0, name) else {
+                    return;
+                };
+                if let Some(DirArg::Expr(e)) = args.get(1) {
+                    if self.eval(e).is_none() {
+                        return self.alias(name, &n, e);
+                    }
+                }
+                let Some(v) = self.arg_const(args, 1, name) else {
                     return;
                 };
                 let s = self.symbol_index(&n);
@@ -756,8 +848,8 @@ impl Assembler {
                 }
             }
             // Accepted and ignored: metadata that does not change the output.
-            ".file" | ".ident" | ".option" | ".attribute" | ".addrsig" | ".cfi_startproc"
-            | ".cfi_endproc" => {}
+            ".file" | ".ident" | ".option" | ".attribute" | ".addrsig" | ".addrsig_sym"
+            | ".cfi_startproc" | ".cfi_endproc" => {}
             _ => self.error(format!("unknown directive '{name}'")),
         }
     }
@@ -1089,5 +1181,104 @@ other:  j local
         // A label in the other section: a relocation there too.
         assert_eq!(obj.sections[1].relocs[0].kind, RelocKind::Jal);
         assert_eq!(obj.sections[1].relocs[0].symbol, "local");
+    }
+
+    // ----- what clang -S writes for C files -----
+
+    fn sym<'a>(obj: &'a Object, name: &str) -> &'a Symbol {
+        obj.symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no symbol {name}"))
+    }
+
+    fn section<'a>(obj: &'a Object, name: &str) -> (usize, &'a Section) {
+        obj.sections
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.name == name)
+            .unwrap_or_else(|| panic!("no section {name}"))
+    }
+
+    #[test]
+    fn local_common_symbols_go_in_bss() {
+        // clang's output for `static char buf[100]; static int n;` in a
+        // function's file: .local, then .comm with size and alignment.
+        let src = "
+        .text
+f:      nop
+        .local  buf
+        .comm   buf,100,1
+        .local  n
+        .comm   n,4,4
+        .lcomm  big, 16, 8
+g:      nop
+";
+        let obj = crate::assemble(src).unwrap();
+        let (bss, s) = section(&obj, ".bss");
+        // buf at 0, n aligned up to 100, big aligned up to 104.
+        assert_eq!(s.size, 120);
+        assert_eq!(s.align, 8);
+        for (name, value, size) in [("buf", 0, 100), ("n", 100, 4), ("big", 104, 16)] {
+            let s = sym(&obj, name);
+            assert_eq!((s.section, s.value, s.size), (Some(bss), value, size), "{name}");
+            assert!(s.defined && !s.global, "{name}");
+            assert_eq!(s.ty, SymType::Object, "{name}");
+        }
+        // The section in use is still .text: g follows f.
+        let (text, _) = section(&obj, ".text");
+        assert_eq!((sym(&obj, "g").section, sym(&obj, "g").value), (Some(text), 4));
+    }
+
+    #[test]
+    fn global_common_symbols_are_refused() {
+        let errs = crate::assemble("        .comm shared, 4, 4\n").unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].msg.contains("-fno-common"), "{}", errs[0].msg);
+        for bad in [
+            ".local x\n.comm x, 4, 3\n",
+            ".local x\n.comm x, -1\n",
+            ".lcomm x\n",
+        ] {
+            assert!(crate::assemble(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn set_to_a_label_defines_an_alias() {
+        // clang merges a file's static variables into one block and names
+        // its parts: `name = .L_MergedGlobals+offset`.
+        let src = "
+        .data
+.L_MergedGlobals:
+        .word 1, 2, 3
+        .set second, .L_MergedGlobals+4
+third = .L_MergedGlobals+8
+        .equ  four, 4
+        .addrsig
+        .addrsig_sym second
+        .text
+        la   a0, third
+";
+        let obj = crate::assemble(src).unwrap();
+        let (data, _) = section(&obj, ".data");
+        assert_eq!(
+            (sym(&obj, "second").section, sym(&obj, "second").value),
+            (Some(data), 4)
+        );
+        assert_eq!(
+            (sym(&obj, "third").section, sym(&obj, "third").value),
+            (Some(data), 8)
+        );
+        assert_eq!(sym(&obj, "four").constant, Some(4));
+
+        // The label must be defined first, and be a label.
+        for bad in [".set early, later\nlater: nop\n", ".set c, 5\n.set e, nowhere\n"] {
+            let errs = crate::assemble(bad).unwrap_err();
+            assert!(
+                errs[0].msg.contains("must be a label defined before this"),
+                "{bad}: {errs:?}"
+            );
+        }
     }
 }
