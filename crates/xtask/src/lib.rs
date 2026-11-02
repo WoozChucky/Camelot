@@ -8,7 +8,7 @@
 //!   kernel without its built-in programs) with merlin + merlin-as +
 //!   merlin-ld, no LLVM, or the clang -O2 + ld.lld reference build.
 //! * [`fs`]: builds the root filesystem image (the user programs and a
-//!   README) with the `camelot-fs` crate's mkfs, bootable: 2 MiB with the disk kernel.
+//!   README) with the `camelot-fs` crate's mkfs, bootable: 4 MiB with the disk kernel.
 //! * [`boot`]: builds the boot ROM's disk loader and Camelot's bootloader
 //!   with merlin-as + merlin-ld.
 //! * [`toolchain`]: merlin, merlin-as and merlin-ld as libraries, for the

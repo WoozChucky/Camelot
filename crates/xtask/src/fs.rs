@@ -10,7 +10,7 @@
 //! after the filesystem, so Grail needs no program to run it. The disk kernel
 //! has no programs built in (the Linux way: the programs are on the root
 //! filesystem, and only `kernel/kernel.elf`, run without a disk, carries its own,
-//! as an initramfs would), so the whole system fits in a 2 MiB image
+//! as an initramfs would), so the whole system fits in a 4 MiB image
 //! ([`IMAGE_SIZE`]): the filesystem gets the blocks the kernel leaves.
 //!
 //! ```text
@@ -27,9 +27,11 @@ use std::path::{Path, PathBuf};
 /// The kernel installed in a bootable image (under the repository root): the one
 /// without built-in programs (`crate::kernel::disk_kernel`).
 pub const KERNEL: &str = "kernel/kernel-disk.elf";
-/// A bootable image's size by default, in 1 KiB blocks: 2 MiB, the boot block,
-/// the filesystem and the kernel together.
-pub const IMAGE_SIZE: u32 = 2048;
+/// A bootable image's size by default, in 1 KiB blocks: 4 MiB, the boot block,
+/// the filesystem and the kernel together. The programs in `/bin` take about
+/// half of the filesystem; the rest is the shell's to write files in
+/// (`crates/xtask/tests/boot.rs` checks that at least a fifth is free).
+pub const IMAGE_SIZE: u32 = 4096;
 /// The host directory copied to `/`.
 pub const ROOT_DIR: &str = "kernel/fs";
 /// Where the image goes by default (under the repository root).
