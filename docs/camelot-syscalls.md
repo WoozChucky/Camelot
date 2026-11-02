@@ -4,7 +4,8 @@ The interface between Camelot's user programs and its kernel: how a program
 starts, how it calls the kernel, what each call does and how it fails. The
 kernel side is `kernel/syscall.c` and `kernel/sysfile.c` (with
 `kernel/proc.c`, `kernel/exec.c`, `kernel/file.c`, `kernel/pipe.c`,
-`kernel/console.c`, `kernel/fs.c` and `kernel/vm.c`), the numbers are in
+`kernel/console.c`, `kernel/fs.c` and `kernel/vm.c`; the network's calls
+in `kernel/net/net.c`, `docs/camelot-net.md`), the numbers are in
 `kernel/include/syscall.h`; the user side is `kernel/user/usys.s` (one stub
 per call), `kernel/user/user.h` (their C declarations, the error numbers,
 `open`'s flags and `struct stat`) and `kernel/user/crt0.s` (the start-up
@@ -82,6 +83,9 @@ there is a filesystem to look it up in.
 | 21 | `exec` | `const char *path, char *const argv[]` | does not return; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-ENOMEM`, `-EFAULT` |
 | 22 | `kill` | `int pid` | 0; `-ESRCH`, `-EPERM` |
 | 23 | `procs` | `struct procinfo *buf, uint max` | the number of processes; `-EFAULT` |
+| 24 | `netinfo` | `struct netinfo *info` | 0; `-ENODEV`, `-EFAULT` |
+| 25 | `netconf` | `uint addr, uint mask, uint gateway` | 0; `-ENODEV`, `-EINVAL` |
+| 26 | `ping` | `uint addr, uint seq, struct ping_reply *reply` | 0; `-ETIMEDOUT`, `-EHOSTUNREACH`, `-ENETUNREACH`, `-ENOBUFS`, `-ENODEV`, `-EINVAL`, `-EFAULT` |
 
 **exit(status)** ends the caller. Its exit status is kept for its parent's
 `wait`; the slot and every page the process held are freed once the parent
@@ -306,6 +310,43 @@ that `spawn` is still loading is not listed. All of `buf`, `max` entries,
 must be writable, however many are stored, or it is `-EFAULT` and nothing
 is.
 
+The network's calls are what the shell's `ifconfig` and `ping` built-ins
+use until #85 brings sockets and network programs; `docs/camelot-net.md`
+describes the stack behind them. Addresses are `uint`s in host order
+(10.0.2.15 is 0x0a00020f). Without a network card each fails with
+`-ENODEV` (after the pointer check).
+
+**netinfo(info)** stores a `struct netinfo` (`user.h`, 104 bytes) at
+`info`: the interface's MAC address, `flags` (`NETINFO_LINK` the card's
+link is up, `NETINFO_UP` it has an address, `NETINFO_DHCP` from DHCP),
+its address, netmask, default gateway and DNS server (0 when it has none),
+and `stats`, a `struct net_stats` of 20 counters: frames and bytes received
+and sent, then the frames and packets dropped, by reason
+(`docs/camelot-net.md`, "Counters"). `-EFAULT` if `info` is not 104
+writable bytes.
+
+**netconf(addr, mask, gateway)** gives the interface a static address,
+replacing what DHCP or the boot configuration gave it: `addr` with netmask
+`mask`, and `gateway` as the default route (0 for none, so only the subnet
+is reachable). The ARP cache is emptied. `-EINVAL`, changing nothing, if
+`mask` is not ones then zeros (at least one of each), if `addr` is not an
+ordinary unicast address (0.0.0.0/8, 127.0.0.0/8 and 224.0.0.0 up are not)
+or is its subnet's network or broadcast address, or if `gateway` is not
+another such address on the subnet.
+
+**ping(addr, seq, reply)** sends an ICMP echo request with 56 bytes of data
+to `addr`, with the caller's pid as its identifier and `seq` (0 to 65535)
+as its sequence number, and waits up to one second (10 ticks) for the
+matching echo reply; then stores a `struct ping_reply` at `reply` (who
+answered, the reply's TTL, the ICMP message's length, 64, and the round
+trip in microseconds of `mtime`) and returns 0. 127.0.0.1 and the
+interface's own address answer through loopback. Errors: `-ETIMEDOUT` (no
+reply in time), `-EHOSTUNREACH` (ARP got no answer from the next hop within
+the last three seconds), `-ENETUNREACH` (the interface has no address, or
+`addr` is off the subnet with no gateway), `-ENOBUFS` (no packet buffer
+free), `-EINVAL` (`addr` 0, or `seq` over 65535) and `-EFAULT` (`reply` is
+not 16 writable bytes; checked before anything is sent).
+
 ## Error numbers
 
 Linux's values for the same conditions.
@@ -338,6 +379,12 @@ Linux's values for the same conditions.
 | 36 | `ENAMETOOLONG` | a name longer than 14 bytes, or a path longer than `MAXPATH` |
 | 38 | `ENOSYS` | no such system call |
 | 39 | `ENOTEMPTY` | unlink: a directory with entries |
+| 90 | `EMSGSIZE` | a datagram too big for one packet (the kernel's UDP API) |
+| 98 | `EADDRINUSE` | a UDP port that is taken (the kernel's UDP API) |
+| 101 | `ENETUNREACH` | no route: the interface has no address, or no gateway |
+| 105 | `ENOBUFS` | the network's buffers or sockets are all in use |
+| 110 | `ETIMEDOUT` | ping: no reply in time |
+| 113 | `EHOSTUNREACH` | ARP got no answer from the address |
 
 `strerror` in `kernel/user/lib/strerror.c` has a short message for each.
 
@@ -478,6 +525,7 @@ Programs are compiled freestanding with only `user.h`, which declares the
 calls above (the stubs in `usys.s`, which return the raw result, a negative
 error number included), their constants and structures (`O_*`, `SEEK_*`,
 `struct stat`, `struct dirent`, `T_*`, `struct procinfo`, `PROC_*`,
+`struct netinfo`, `struct net_stats`, `NETINFO_*`, `struct ping_reply`,
 `MAXPATH`, `DIRSIZ`) and the C library in `kernel/user/lib/`, described in
 its `README.md`: strings and memory (`strlen`, `strcmp`, `strncmp`,
 `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`,

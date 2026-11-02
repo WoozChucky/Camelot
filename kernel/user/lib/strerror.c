@@ -56,6 +56,18 @@ const char *strerror(int err) {
         return "no such system call";
     case ENOTEMPTY:
         return "directory not empty";
+    case EMSGSIZE:
+        return "message too long";
+    case EADDRINUSE:
+        return "address in use";
+    case ENETUNREACH:
+        return "network unreachable";
+    case ENOBUFS:
+        return "no buffer space";
+    case ETIMEDOUT:
+        return "timed out";
+    case EHOSTUNREACH:
+        return "host unreachable";
     default:
         return "unknown error";
     }

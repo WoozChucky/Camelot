@@ -36,6 +36,9 @@
 #define SYS_exec 21   /* exec(path, argv): does not return */
 #define SYS_kill 22   /* kill(pid): 0, the process ends before it runs U-mode code again */
 #define SYS_procs 23  /* procs(buf, max): the number of processes, up to max described in buf */
+#define SYS_netinfo 24 /* netinfo(info): 0, with *info filled in */
+#define SYS_netconf 25 /* netconf(addr, mask, gateway): 0 */
+#define SYS_ping 26    /* ping(addr, seq, reply): 0, with *reply filled in */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process */
@@ -64,6 +67,12 @@
 #define ENAMETOOLONG 36 /* a name longer than DIRSIZ, or a path longer than MAXPATH */
 #define ENOSYS 38       /* no such system call */
 #define ENOTEMPTY 39    /* unlink: a directory with entries */
+#define EMSGSIZE 90     /* a datagram too big for one packet */
+#define EADDRINUSE 98   /* a UDP port that is taken */
+#define ENETUNREACH 101 /* no route: no address yet, or no gateway */
+#define ENOBUFS 105     /* the network's buffers or sockets are all in use */
+#define ETIMEDOUT 110   /* ping: no reply in time */
+#define EHOSTUNREACH 113 /* ARP got no answer from the address */
 
 /* The console's file descriptors, open in the first process (0 for
  * reading, 1 and 2 for writing) and passed on by spawn. */
@@ -113,6 +122,55 @@ struct procinfo {
     u32 state;
     u32 size;
     char name[16];
+};
+
+/* The network's counters, in netinfo's `stats` (docs/camelot-net.md,
+ * "Counters"): frames and bytes through the card, then everything
+ * dropped, by reason. kernel/user/user.h has a copy: keep them in sync. */
+struct net_stats {
+    u32 rx_frames;       /* frames taken from the card */
+    u32 rx_bytes;
+    u32 tx_frames;       /* frames handed to the card */
+    u32 tx_bytes;
+    u32 rx_card_dropped; /* lost by the card itself (NET_RX_DROPPED) */
+    u32 rx_filtered;     /* not for this host: another MAC or IPv4 address */
+    u32 rx_bad_ether;    /* an EtherType other than IPv4 and ARP */
+    u32 rx_bad_arp;      /* a truncated or unsupported ARP packet */
+    u32 rx_bad_ip;       /* a bad IPv4 header: truncated, version, lengths */
+    u32 rx_bad_ip_sum;   /* a wrong IPv4 header checksum */
+    u32 rx_fragment;     /* an IPv4 fragment (not supported) */
+    u32 rx_bad_proto;    /* an IPv4 protocol other than ICMP and UDP */
+    u32 rx_bad_icmp;     /* a truncated ICMP message or a wrong checksum */
+    u32 rx_bad_udp;      /* a truncated UDP datagram or a wrong length */
+    u32 rx_bad_udp_sum;  /* a wrong UDP checksum */
+    u32 rx_no_port;      /* a datagram for a port with no socket */
+    u32 rx_queue_full;   /* a datagram for a socket holding UDP_QUEUE_MAX */
+    u32 no_buffer;       /* a frame dropped, or not sent, for want of a buffer */
+    u32 arp_failed;      /* a packet whose next hop ARP could not find */
+    u32 tx_errors;       /* a frame the card refused, or the transmit queue was full */
+};
+
+/* What netinfo stores: the interface and its counters. */
+struct netinfo {
+    u8 mac[6];
+    u16 flags;   /* NETINFO_ */
+    u32 addr;    /* in host order, 0 if none */
+    u32 mask;
+    u32 gateway; /* 0: none */
+    u32 dns;     /* 0: none */
+    struct net_stats stats;
+};
+
+#define NETINFO_LINK 0x1 /* the card's link is up */
+#define NETINFO_UP 0x2   /* the interface has an address */
+#define NETINFO_DHCP 0x4 /* which DHCP gave it */
+
+/* What ping stores about the echo reply. */
+struct ping_reply {
+    u32 from;   /* who answered */
+    u32 ttl;    /* the reply's time to live */
+    u32 len;    /* its ICMP message's length */
+    u32 rtt_us; /* the round trip, in microseconds of mtime */
 };
 
 /* spawn's and exec's limits: at most MAXARG arguments (argv[0] included), whose strings

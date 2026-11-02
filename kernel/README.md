@@ -5,8 +5,9 @@ up trap delegation and the timer, then the kernel runs in S-mode: it prints a
 banner and a `kprintf` self-test over the UART, puts every free page of RAM on
 the page allocator's free list, turns on Sv32 paging with a kernel page table,
 runs the memory self-tests, lists the disks, takes ten timer ticks, tests the
-first disk if there is one and mounts the filesystem on it, and starts the
-shell, a user program, as the first process. User programs run in U-mode, each in its own page table, switching on
+first disk if there is one and mounts the filesystem on it, gives the first
+network card an address (DHCP, or a static one), and starts the shell, a
+user program, as the first process. User programs run in U-mode, each in its own page table, switching on
 every timer tick; they call the kernel through system calls
 (`docs/camelot-syscalls.md`): files, directories, the console and pipes
 through file descriptors, starting and waiting for programs (from `/bin` on
@@ -108,13 +109,37 @@ the image. `cargo run -p camelot-fs -- ls target/camelot-fs.img /bin` (and
 the same programs, built into the kernel, stand in for `/bin`, and there are
 no other files.
 
+With a network card (`--net user`, `--net hub`, spec section 9.8), the
+kernel brings up the first one: it lists the card, gets an address by DHCP
+(or falls back to a static one) after the ticks, and the shell's `ifconfig`
+and `ping` use it (`docs/camelot-net.md`):
+
+```
+cargo run --release -p grail -- --net user kernel/kernel.elf
+```
+
+```
+disk: none
+net 0: mac 52:54:00:12:34:56, irq 12, link up
+tick 1
+...
+tick 10
+net: 10.0.2.15/24, gateway 10.0.2.2, dns 10.0.2.3 (dhcp)
+Type help for the list of commands.
+$ ping 10.0.2.2 1
+PING 10.0.2.2: 56 data bytes
+64 bytes from 10.0.2.2: seq=1 ttl=64 time=1.211 ms
+1 sent, 1 received
+```
+
 The shell (`user/sh.c`) runs programs by name, with arguments: `PROG
 [ARG...]` runs `/bin/PROG`, and a word with a `/` in it is a path to the
 program. `CMD < FILE` and `CMD > FILE` redirect its input and output, `CMD |
 CMD` sends the first one's output to the second, and `CMD & CMD` runs the
 first in the background (the shell prints its pid) and the last in the
 foreground; `wait` collects the background ones, `cd [DIR]` changes the
-working directory, `help` lists the built-ins, and `exit [N]` (or Ctrl-D on
+working directory, `ifconfig` and `ping ADDR [N]` show and use the network,
+`help` lists the built-ins, and `exit [N]` (or Ctrl-D on
 an empty line) ends the shell, after which the kernel stops the machine with
 its status as the exit code. Lines are edited with backspace and end with Enter. In a terminal,
 Grail passes each key to the kernel as it is typed and the kernel does the
@@ -212,7 +237,8 @@ UART driver and the console in "Kernel console"; processes, the system calls,
 the user programs and the shell in "Kernel processes"; the disk driver and the
 buffer cache in "Kernel disks"; the log, the filesystem and mounting in
 "Kernel filesystem" (the on-disk format in `docs/camelot-fs.md`); file
-descriptors, devices, pipes and the file system calls in "Kernel files". A failed
+descriptors, devices, pipes and the file system calls in "Kernel files"; the
+network stack in "Kernel network" and `docs/camelot-net.md`. A failed
 disk or filesystem self-test check counts in the exit code like the others.
 
 A panic looks like this (from the deliberate illegal instruction the tests
@@ -279,16 +305,17 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `log.c` | the filesystem's write-ahead log (xv6's): `begin_op()`/`end_op()` around each operation, `log_write()` pinning changed buffers, group commit (slots, flush, header, flush, install, flush, empty header, flush), and the replay at mount |
 | `fs.c` | the filesystem (xv6's): `fs_mount()`, the bitmap allocator, the inode cache (`iget`/`ilock`/`iput`, `readi`/`writei`), directories, path lookup (`namei`/`nameiparent`, from the working directory for a relative path), `fs_create()`/`fs_unlink()`/`fs_link()`, `itrunc()` |
 | `fstest.c` | `fs_boot()`: mounts disk 0 in a kernel process, lists `/`, runs the filesystem self-test (and, with `fs_test` patched to 2, its transactions; to 3, filling the disk) |
+| `net/` | the network stack (`docs/camelot-net.md`), a file per layer: `nic.c` (the card driver: descriptor rings, `nic_intr()`, the transmit queue), `pbuf.c` (the buffer pool), `ether.c`, `arp.c` (the cache), `ip.c` (checks, routing, loopback), `icmp.c` (echo, `icmp_ping()`), `udp.c` (the kernel-internal socket API, the echo service), `dhcp.c` (the client), `net.c` (configuration, `net_boot()`, the counters, `net_timer()`, the `netinfo`/`netconf`/`ping` system calls) |
 | `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin`, and `/dev/console` is made too |
 | `boot/` | the bootloader of a bootable disk (`boot.s`, linked by `link.ld` into the committed `boot.elf` with `cargo xtask boot`): the boot block, which loads the kernel ELF stored after the filesystem; `camelot-fs mkfs --boot` installs it |
 | `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()` and `wfi()` |
-| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, the filesystem (`fs_boot`), then the user-space shell as the first process |
+| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, the network cards (`net_init`), ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, the filesystem (`fs_boot`), the network's address (`net_boot`), then the user-space shell as the first process |
 | `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |
 | `console.c` | the console device (`read` and `write` on it): `console_read()` (line editing and echo: backspace, CR/LF/CR LF, Ctrl-D; sleeps until a line is complete), `console_write()`, `console_intr()` (the UART interrupt, waking readers) |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |
 | `kernel.ld` | layout: `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end` |
-| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct context`, `struct user_program`), `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`), and the headers for the above |
+| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct context`, `struct user_program`), `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
 | `kernel.elf` | the prebuilt image, committed so `cargo test` and Grail need no build |
 
 ## Building
@@ -316,14 +343,17 @@ build is:
 merlin -I include main.c -o main.c.s         # and each other .c
 merlin-as main.c.s -o main.c.o
 merlin-as entry.s -o entry.s.o               # and each other .s
+merlin -I include net/arp.c -o net/arp.c.s   # the network stack's files too
 merlin-ld -T kernel.ld -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf.c.o entry.s.o \
        exec.c.o file.c.o fs.c.o fstest.c.o kalloc.c.o kernelvec.s.o kprintf.c.o log.c.o machine.s.o \
-       main.c.o pipe.c.o plic.c.o probe.s.o proc.c.o riscv.s.o start.c.o string.c.o swtch.s.o \
-       syscall.c.o sysfile.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o userprogs.s.o uservec.s.o \
-       vm.c.o vmtest.c.o
+       main.c.o net/arp.c.o net/dhcp.c.o net/ether.c.o net/icmp.c.o net/ip.c.o net/net.c.o \
+       net/nic.c.o net/pbuf.c.o net/udp.c.o pipe.c.o plic.c.o probe.s.o proc.c.o riscv.s.o start.c.o \
+       string.c.o swtch.s.o syscall.c.o sysfile.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
+       userprogs.s.o uservec.s.o vm.c.o vmtest.c.o
 ```
 
-(`cargo xtask kernel` keeps the `.s` and `.o` files in `target/kernel/obj`.)
+(`cargo xtask kernel` keeps the `.s` and `.o` files in `target/kernel/obj`,
+`net/`'s in `target/kernel/obj/net`.)
 The build is reproducible. **After changing anything here, or merlin,
 merlin-as or merlin-ld, run `cargo xtask kernel` and commit `kernel.elf` and
 `userprogs.s` with the sources.** `cargo test` rebuilds both in memory and

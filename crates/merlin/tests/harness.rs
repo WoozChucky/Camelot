@@ -596,9 +596,9 @@ fn multi_file_clang_reference() {
     }
 }
 
-/// Every C file of the kernel and its user programs compiles with merlin,
-/// with the include directories `cargo xtask kernel` gives clang, and the
-/// result assembles.
+/// Every C file of the kernel (its network stack in `kernel/net` too) and its
+/// user programs compiles with merlin, with the include directories `cargo xtask
+/// kernel` gives clang, and the result assembles.
 #[test]
 fn kernel_sources_compile() {
     let kernel = tests_dir().join("../../../kernel");
@@ -606,6 +606,7 @@ fn kernel_sources_compile() {
     let mut count = 0;
     for (dir, includes) in [
         (kernel.clone(), vec![kernel.join("include")]),
+        (kernel.join("net"), vec![kernel.join("include")]),
         (kernel.join("user"), vec![kernel.join("user")]),
     ] {
         let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)

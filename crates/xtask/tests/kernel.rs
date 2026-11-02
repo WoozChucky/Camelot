@@ -1231,6 +1231,8 @@ help            this list
 exit [N]        leave the shell, with status N or the last program's
 wait            wait for every background program
 cd [DIR]        change the working directory, to / without DIR
+ifconfig        show the network interface; ifconfig ADDR [MASK [GATEWAY]] sets its address
+ping ADDR [N]   send N (4) echo requests to ADDR, a.b.c.d, and wait for the replies
 PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /
 CMD < FILE      read the input from FILE
 CMD > FILE      write the output to FILE
@@ -1507,7 +1509,10 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
     let wfi = sym(&elf, "wfi");
 
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
-    assert_eq!(tick_count(&m), 10);
+    // The ten boot ticks, and maybe one more while the shell starts.
+    let start = tick_count(&m);
+    assert!((10..=11).contains(&start), "{start} ticks at the prompt");
+    let idle_end = start + 50;
 
     // Fifty idle ticks: the hart spends them in wfi (Grail skips the wait to
     // the next tick), waking only for the tick itself, a couple of hundred
@@ -1525,7 +1530,7 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
                 wfis += 1;
             }
         },
-        |m| tick_count(m) == 60,
+        |m| tick_count(m) == idle_end,
     );
     assert_eq!(uart_reads, 0, "the kernel polls the UART while idle");
     assert!((50..=51).contains(&wfis), "{wfis} wfi for 50 ticks");
@@ -1557,8 +1562,11 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
         },
         |m| printed(m).ends_with(PROMPT) && printed(m).len() > before,
     );
-    assert_eq!(&printed(&m)[before..], format!("ticks\nticks: 60\n{PROMPT}"));
-    assert_eq!(tick_count(&m), 60);
+    assert_eq!(
+        &printed(&m)[before..],
+        format!("ticks\nticks: {idle_end}\n{PROMPT}")
+    );
+    assert_eq!(tick_count(&m), idle_end);
     assert_eq!(rbr_reads.len(), 6, "one read per byte");
     assert!(
         rbr_reads.iter().all(|&(_, inside)| inside),
@@ -2781,13 +2789,11 @@ fn the_elf_loader_refuses_bad_images() {
     let text = &parsed.segments[loads[0] as usize];
     let rodata = &parsed.segments[loads[1] as usize];
     // The cases rely on this layout: the text from the first page on, then
-    // less than a page of rodata on a page of its own, less than a page
-    // before the end of the file.
+    // less than a page of rodata on a page of its own.
     assert_eq!(text.vaddr, USER_TEXT);
     assert!(rodata.vaddr >= text.vaddr + text.memsz && rodata.vaddr.is_multiple_of(PAGE));
     assert!(rodata.memsz < PAGE);
     assert_eq!(rodata.filesz, rodata.memsz);
-    assert!(rodata.offset + PAGE > size);
     // hello reaches its rodata pc-relatively (-mcmodel=medany), so it still
     // runs with both segments moved by the same amount: here, so that its
     // rodata, given a whole page, ends right at USER_LOAD_TOP.
@@ -2876,8 +2882,8 @@ fn the_elf_loader_refuses_bad_images() {
         (
             Some("segment outside the file"),
             &[
-                (ph(1, P_FILESZ), &PAGE.to_le_bytes()),
-                (ph(1, P_MEMSZ), &PAGE.to_le_bytes()),
+                (ph(1, P_FILESZ), &(size - rodata.offset + 1).to_le_bytes()),
+                (ph(1, P_MEMSZ), &(size - rodata.offset + 1).to_le_bytes()),
             ],
         ),
         // p_filesz > p_memsz, with the file bytes inside it.
@@ -3058,7 +3064,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 23, "{calls:?}");
+    assert_eq!(calls.len(), 26, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()
@@ -3084,7 +3090,7 @@ fn the_system_call_document_matches_the_code() {
     }
 
     let errors = doc_table(&doc, "## Error numbers");
-    assert_eq!(errors.len(), 26, "{errors:?}");
+    assert_eq!(errors.len(), 32, "{errors:?}");
     assert_eq!(defines(&header, "E"), errors, "syscall.h");
     assert_eq!(defines(&user_h, "E"), errors, "user.h");
 

@@ -4,10 +4,12 @@
  * never dereferences it, but checks it against the process's page table and
  * copies through the physical pages (copyin, copyout, copyinstr in vm.c), so
  * a bad pointer is an -EFAULT, never a fault in the kernel. The calls on
- * files and paths are in sysfile.c; running programs in exec.c. */
+ * files and paths are in sysfile.c; running programs in exec.c; the
+ * network's in net/net.c. */
 #include "syscall.h"
 #include "exec.h"
 #include "kalloc.h"
+#include "net.h"
 #include "proc.h"
 #include "string.h"
 #include "sysfile.h"
@@ -183,6 +185,15 @@ void syscall(struct trap_frame *f) {
         break;
     case SYS_procs:
         ret = sys_procs(f);
+        break;
+    case SYS_netinfo:
+        ret = net_sys_info(arg(f, 0));
+        break;
+    case SYS_netconf:
+        ret = net_sys_conf(arg(f, 0), arg(f, 1), arg(f, 2));
+        break;
+    case SYS_ping:
+        ret = net_sys_ping(arg(f, 0), arg(f, 1), arg(f, 2));
         break;
     default:
         ret = -ENOSYS;

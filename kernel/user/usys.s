@@ -29,6 +29,9 @@
     .equ SYS_exec, 21
     .equ SYS_kill, 22
     .equ SYS_procs, 23
+    .equ SYS_netinfo, 24
+    .equ SYS_netconf, 25
+    .equ SYS_ping, 26
 
     .text
 
@@ -190,6 +193,27 @@ kill:
     .globl procs
 procs:
     li    a7, SYS_procs
+    ecall
+    ret
+
+# int netinfo(struct netinfo *info)
+    .globl netinfo
+netinfo:
+    li    a7, SYS_netinfo
+    ecall
+    ret
+
+# int netconf(uint addr, uint mask, uint gateway)
+    .globl netconf
+netconf:
+    li    a7, SYS_netconf
+    ecall
+    ret
+
+# int ping(uint addr, uint seq, struct ping_reply *reply)
+    .globl ping
+ping:
+    li    a7, SYS_ping
     ecall
     ret
 
