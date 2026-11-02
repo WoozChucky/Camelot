@@ -1127,7 +1127,9 @@ fn stress_on_the_root_image_leaves_it_as_it_was() {
     // also writing, reading back and removing a file of its own every
     // round, side by side with the pipe and the page allocator, under
     // timer preemption. The transactions interleave in the log; the disk
-    // ends consistent and as it began.
+    // ends consistent and as it began. That ticks really do preempt the
+    // workers mid-round is checked by kernel.rs's
+    // stress_runs_many_processes_through_the_locks, which watches the hart.
     let image = root_image(2048);
     let run = boot(
         image.clone(),

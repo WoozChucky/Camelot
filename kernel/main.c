@@ -62,9 +62,13 @@ static const char *const banner[] = {
 #define BOOT_FAULT_KFREE_UNALIGNED 9 /* kfree of a pointer inside a page */
 #define BOOT_FAULT_KFREE_KERNEL 10  /* kfree of the kernel's first page */
 #define BOOT_FAULT_KFREE_PAST_RAM 11 /* kfree of the page after the end of RAM */
-/* Misuses of a spinlock, each caught by acquire() or release(). */
+/* Misuses of a spinlock or of interrupt nesting, each caught by acquire(),
+ * release(), sched() or pop_off(). */
 #define BOOT_FAULT_DOUBLE_ACQUIRE 12 /* acquire of a lock this hart holds */
 #define BOOT_FAULT_RELEASE_UNHELD 13 /* release of a lock nobody holds */
+#define BOOT_FAULT_YIELD_HOLDING 14  /* a kernel process yields holding a lock */
+#define BOOT_FAULT_POP_UNMATCHED 15  /* pop_off with no push_off */
+#define BOOT_FAULT_POP_INTR_ON 16    /* pop_off with interrupts back on */
 
 /* Nothing is mapped below the boot ROM (spec section 7), so the kernel page
  * table doesn't map it either. */
@@ -182,7 +186,15 @@ static void memory_misuse(void) {
 /* The lock the BOOT_FAULT_ values from 12 up misuse. */
 static struct spinlock fault_lock;
 
-/* The BOOT_FAULT_ values from 12 up: each should panic, naming the lock. */
+/* BOOT_FAULT_YIELD_HOLDING's kernel process: gives up the CPU while it
+ * holds a spinlock, which sched() refuses (with interrupts off, a thread
+ * that then wanted the lock would spin on it forever). */
+static void yield_holding(void) {
+    acquire(&fault_lock);
+    yield();
+}
+
+/* The BOOT_FAULT_ values from 12 up: each should panic. */
 static void lock_misuse(void) {
     initlock(&fault_lock, "boot_fault");
     if (boot_fault == BOOT_FAULT_DOUBLE_ACQUIRE) {
@@ -190,6 +202,21 @@ static void lock_misuse(void) {
         acquire(&fault_lock);
     } else if (boot_fault == BOOT_FAULT_RELEASE_UNHELD) {
         release(&fault_lock);
+    } else if (boot_fault == BOOT_FAULT_YIELD_HOLDING) {
+        const char *err;
+        if (kproc_create("yield_holding", yield_holding, &err) == NULL) {
+            kprintf("lock misuse %u: cannot start a process: %s\n", boot_fault, err);
+            failed++;
+            return;
+        }
+        scheduler();
+    } else if (boot_fault == BOOT_FAULT_POP_UNMATCHED) {
+        intr_off();
+        pop_off();
+    } else if (boot_fault == BOOT_FAULT_POP_INTR_ON) {
+        push_off();
+        intr_on();
+        pop_off();
     } else {
         return;
     }

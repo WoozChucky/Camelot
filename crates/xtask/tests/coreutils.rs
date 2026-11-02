@@ -425,8 +425,10 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool) {
         format!("usage: sleep SECONDS\n{}", exit_line("sleep", 1))
     );
 
-    // ps, with a sleeper in the background; kill ends it.
-    let started = s.run("sleep 100 &");
+    // ps, with a sleeper in the background; kill ends it. The sleeps here
+    // are long: while everything sleeps, Grail skips ahead to the next tick,
+    // so thousands of ticks can pass between two commands.
+    let started = s.run("sleep 100000 &");
     let pid: u32 = started
         .strip_prefix('[')
         .and_then(|r| r.strip_suffix("]\n"))
@@ -441,7 +443,10 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool) {
     let shell_pid: u32 = sh.parse().unwrap();
     let size = |prog: &str| size_of(&host, prog).to_string();
     let (pid_s, ps_pid) = (pid.to_string(), (pid + 1).to_string());
-    assert_eq!(rows[0], [sh, "0", "sleep", &size("sh"), "sh"], "{ps}");
+    // The shell sleeps in wait() for ps, unless a tick preempted it between
+    // starting ps and waiting: then it is still ready to run.
+    let sh_state = if rows[0][2] == "ready" { "ready" } else { "sleep" };
+    assert_eq!(rows[0], [sh, "0", sh_state, &size("sh"), "sh"], "{ps}");
     assert_eq!(rows[1], [&pid_s, sh, "sleep", &size("sleep"), "sleep"], "{ps}");
     assert_eq!(rows[2], [&ps_pid, sh, "run", &size("ps"), "ps"], "{ps}");
     assert!(shell_pid < pid);
@@ -485,7 +490,7 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool) {
     // A pipeline in the background, its reader asleep on the pipe and its
     // writer asleep in sleep. Killing the reader alone ends it while the
     // writer, which would end its input, still sleeps; then the writer.
-    let started = s.run("sleep 50 | cat &");
+    let started = s.run("sleep 50000 | cat &");
     let pids: Vec<u32> = started
         .lines()
         .map(|l| l.trim_matches(['[', ']']).parse().unwrap())
@@ -499,10 +504,16 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool) {
         .map(|r| r.split_whitespace().collect::<Vec<_>>())
         .map(|r| (r[2], r[4]))
         .collect();
+    // The shell may be ready rather than asleep, as above.
+    let sh_state = if states.first() == Some(&("ready", "sh")) {
+        "ready"
+    } else {
+        "sleep"
+    };
     assert_eq!(
         states,
         [
-            ("sleep", "sh"),
+            (sh_state, "sh"),
             ("sleep", "sleep"),
             ("zombie", "cat"),
             ("run", "ps")

@@ -68,7 +68,7 @@ push_off:
 #     if (r_sstatus() & SSTATUS_SIE)
 #         panic("pop_off: interrupts are on");
 #     if (c->noff < 1)
-#         panic("pop_off: no push_off");
+#         panic("pop_off: no push_off to match");
 #     c->noff -= 1;
 #     if (c->noff == 0 && c->intena)
 #         intr_on();

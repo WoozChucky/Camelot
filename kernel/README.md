@@ -283,7 +283,10 @@ unmapped page, a W-only mapping, a megapage, `kfree` of a bad page), so the
 tests see each of its checks panic, e.g. `panic: map_pages: remap`. Values
 12 and 13 misuse a spinlock: 12 acquires one twice, 13 releases one it
 doesn't hold, and each panics naming the lock and the hart, e.g.
-`panic: acquire: lock "boot_fault" already held by hart 0`.
+`panic: acquire: lock "boot_fault" already held by hart 0`. 14 has a kernel
+process yield while it holds a spinlock (`panic: sched: holding a lock
+other than proc_lock`), 15 calls `pop_off()` with no `push_off()` and 16
+turns interrupts on under a `push_off()` before its `pop_off()`.
 
 ## Locking
 
@@ -303,8 +306,8 @@ other:
 
 1. sleep locks: `begin_op()` (the log), then inode locks (a parent
    directory before its child), then buffer locks;
-2. one of `net`, `console`, `pipe`, `disk`, `log`, `itable`, `ticks` (never
-   two of them at once);
+2. one of `net`, `console`, `pipe`, `disk`, `log`, `itable`, `ticks`,
+   `fstest` (never two of them at once);
 3. `ftable`, `bcache`, or a sleep lock's own spinlock;
 4. `proc` (taken by `sleep()`, `wakeup()` and the scheduler);
 5. `kmem` or `uart` (leaves: nothing is taken while they are held).
