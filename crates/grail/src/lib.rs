@@ -5,6 +5,7 @@
 //! several machines, each on its own thread.
 
 pub mod block;
+pub mod boot;
 pub mod bus;
 pub mod config;
 pub mod console;
@@ -168,6 +169,20 @@ impl Machine {
         }
         bus.tohost = elf.symbol("tohost");
         bus.set_boot_entry(elf.entry);
+        Ok(())
+    }
+
+    /// Boots from disk 0 instead of a program: the boot ROM's disk loader reads the
+    /// disk's boot block into RAM and jumps to it (spec section 7, "Boot from disk";
+    /// [`boot`]). The checks happen when the machine runs: a disk with no valid boot
+    /// block stops it with [`boot::EXIT_BOOT_FAILED`] and a message on the UART. An
+    /// error here only if the machine has no disk.
+    pub fn boot_from_disk(&mut self) -> Result<(), String> {
+        if self.cpu.bus.disks.is_empty() {
+            return Err("no disk to boot from".into());
+        }
+        self.cpu.bus.tohost = None;
+        self.cpu.bus.set_disk_boot();
         Ok(())
     }
 

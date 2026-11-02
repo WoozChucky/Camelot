@@ -29,8 +29,8 @@ crates/merlin           the C-subset compiler (C → .s), with its test programs
 crates/merlin-as        the assembler (source → ELF32 .o)
 crates/merlin-ld        the linker (.o files → ELF32 executable)
 crates/merlin-objdump   the disassembler / object dumper (llvm-objdump compatible output)
-crates/xtask            build tasks: `cargo xtask examples`, `cargo xtask kernel`, `cargo xtask fs`, `cargo xtask hello`, `cargo xtask ld-fixtures`
-kernel/                 the Camelot kernel (C + assembly) and its prebuilt kernel.elf; kernel/user holds the user programs it embeds, kernel/fs the root image's files
+crates/xtask            build tasks: `cargo xtask examples`, `cargo xtask kernel`, `cargo xtask fs`, `cargo xtask boot`, `cargo xtask hello`, `cargo xtask ld-fixtures`
+kernel/                 the Camelot kernel (C + assembly) and its prebuilt kernel.elf; kernel/user holds the user programs it embeds, kernel/fs the root image's files, kernel/boot the bootloader of a bootable disk
 examples/               bare-metal programs, built with merlin-as + merlin-ld (the .elf files are committed)
 tests/riscv-tests       prebuilt riscv-tests ELFs and their objects for merlin-ld (rebuild with scripts/build-riscv-tests.sh)
 scripts/                test-data generators (riscv-tests, merlin-as golden encodings, merlin-objdump goldens)
@@ -172,12 +172,14 @@ write/read-back of sector 7: ok
 
 As a library, disks are `MachineConfig::disks` (image files or in-memory disks); a host with its own storage implements the `BlockBackend` trait (capacity, read, write, flush) and passes it to `Machine::with_backends`.
 
-The Camelot kernel mounts disk 0 as its root filesystem when it holds one (format in [docs/camelot-fs.md](docs/camelot-fs.md)). `cargo xtask fs` builds such an image, `target/camelot-fs.img`, with the user programs in `/bin`; the `camelot-fs` command builds, checks and reads images on the host:
+The Camelot kernel mounts disk 0 as its root filesystem when it holds one (format in [docs/camelot-fs.md](docs/camelot-fs.md)). `cargo xtask fs` builds such an image, `target/camelot-fs.img`, with the user programs in `/bin`, and makes it bootable: the image holds the whole system, so Grail needs no program to run it. Started with a disk and no ELF, Grail's boot ROM loads the disk's boot block (its first 1 KiB, checked by a signature and a checksum) into RAM and runs it, as a PC's BIOS runs the master boot record; Camelot's bootloader (`kernel/boot/boot.s`) then loads the kernel, stored after the filesystem (spec section 7, "Boot from disk"; docs/camelot-fs.md, "Booting"). A disk that is not bootable stops the machine with a message from the boot ROM (`boot ROM: disk 0 is not bootable (no boot signature)`, exit code 253). The `camelot-fs` command builds, checks and reads images on the host:
 
 ```
 cargo xtask fs
-cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf
+cargo run --release -p grail -- --disk target/camelot-fs.img                   # boots from the disk
+cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf # or runs the kernel given
 cargo run --release -p camelot-fs -- mkfs disk.img some/dir --size 4M   # a new image holding a copy of some/dir
+cargo run --release -p camelot-fs -- mkfs root.img --boot kernel/boot/boot.elf --kernel kernel/kernel.elf   # bootable
 cargo run --release -p camelot-fs -- fsck disk.img                      # every consistency rule (--recover replays the log)
 cargo run --release -p camelot-fs -- ls disk.img /bin
 cargo run --release -p camelot-fs -- cat disk.img /README

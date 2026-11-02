@@ -12,3 +12,7 @@ elf32 = { path = "../elf32" }
 avalon-proto = { path = "../avalon-proto" }
 # The user-mode NAT gateway behind `--net user` (src/net/user.rs).
 gateway = { path = "../gateway" }
+
+[dev-dependencies]
+# tests/disk_boot.rs makes bootable images of the Camelot kernel to boot from.
+camelot-fs = { path = "../camelot-fs" }

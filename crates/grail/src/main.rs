@@ -1,12 +1,17 @@
-//! `grail [options] <program.elf>`
+//! `grail [options] [program.elf]`: runs the program, or with none boots from disk 0.
 
+use grail::config::DiskSource;
 use grail::console;
 use grail::display::{self, DisplayOptions, Outcome};
 use grail::net::Hub;
 use grail::{DiskConfig, Machine, MachineConfig, NetConfig, RunResult};
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: grail [options] <program.elf>
+const USAGE: &str = "usage: grail [options] [program.elf]
+
+Runs the program. Without one, boots from disk 0 (--disk): the boot ROM loads
+its boot block (its first 1 KiB) and runs it, as camelot-fs mkfs --boot makes
+for the Camelot kernel (spec section 7, \"Boot from disk\").
 
   --trace         print every instruction before it runs (with its hart's
                   number, h0, h1, ..., on a machine of several harts)
@@ -123,18 +128,22 @@ fn main() -> ExitCode {
             _ => path = Some(a),
         }
     }
-    let Some(path) = path else {
-        eprintln!("{USAGE}");
+    if path.is_none() && config.disks.is_empty() {
+        eprintln!("grail: give a program to run, or a disk to boot from\n{USAGE}");
         return ExitCode::from(2);
+    }
+    let file = match &path {
+        Some(path) => match std::fs::read(path) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("grail: cannot read {path}: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
     };
-
-    let file = match std::fs::read(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("grail: cannot read {path}: {e}");
-            return ExitCode::from(2);
-        }
-    };
+    // What the window's title calls the machine: the program, or the disk it boots from.
+    let shown = path.clone().unwrap_or_else(|| disk_name(&config.disks[0].source));
     let mut m = match Machine::new(config) {
         Ok(m) => m,
         Err(e) => {
@@ -142,8 +151,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Err(e) = m.load_elf(&file) {
-        eprintln!("grail: {path}: {e}");
+    let loaded = match &file {
+        Some(file) => m.load_elf(file),
+        None => m.boot_from_disk(),
+    };
+    if let Err(e) = loaded {
+        eprintln!("grail: {shown}: {e}");
         return ExitCode::from(2);
     }
     // The machine's console is this process's terminal. An interactive one is switched
@@ -161,9 +174,9 @@ fn main() -> ExitCode {
         eprintln!("grail: no framebuffer window on this platform, running headless");
     }
     let several_harts = m.config().harts > 1;
-    let name = std::path::Path::new(&path)
+    let name = std::path::Path::new(&shown)
         .file_name()
-        .map_or(path.clone(), |n| n.to_string_lossy().into());
+        .map_or(shown.clone(), |n| n.to_string_lossy().into());
     let opts = DisplayOptions {
         window: fb && !headless && display::WINDOW_SUPPORTED,
         dump_dir,
@@ -211,4 +224,13 @@ fn value<T>(
         return None;
     };
     parse(&v).map_err(|e| eprintln!("grail: {name}: {e}")).ok()
+}
+
+/// A disk as the command line named it.
+fn disk_name(source: &DiskSource) -> String {
+    match source {
+        DiskSource::File(path) => path.display().to_string(),
+        DiskSource::Lake { addr, name } => format!("lake://{addr}/{name}"),
+        DiskSource::Memory(_) => "disk 0".into(),
+    }
 }
