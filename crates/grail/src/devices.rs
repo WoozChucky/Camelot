@@ -70,6 +70,9 @@ pub const BLK_IRQ: u32 = 3;
 /// PLIC interrupt source of the pointer's "event available" line (spec section 9.7):
 /// the first one after the disks' (3 to 10).
 pub const PTR_IRQ: u32 = 11;
+/// PLIC interrupt source of network card 0; card `i` uses `NET_IRQ + i` (spec section
+/// 9.8).
+pub const NET_IRQ: u32 = 12;
 
 /// Interrupt sources 1..=31 exist; source 0 means "no interrupt".
 pub const PLIC_SOURCES: u32 = 32;
