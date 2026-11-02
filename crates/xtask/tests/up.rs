@@ -288,8 +288,11 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     all_answer(&platform);
 
     // The demo: a NAT switch and a VM, vm001, that boots Camelot from its own copy
-    // of the 4 MiB image, to the shell, with the default hardware: 4 MiB of RAM.
-    assert_eq!(root_image().len(), 4 << 20);
+    // of the root image, to the shell, with the default hardware: 4 MiB of RAM.
+    assert_eq!(
+        root_image().len(),
+        xtask::fs::IMAGE_SIZE as usize * camelot_fs::BSIZE
+    );
     let id = platform.demo(log).unwrap();
     let shd = platform.shd.expect("the demo forwards a port to its VM's shd");
     assert!(shd.ip().is_loopback() && shd.port() != 0, "{shd}");

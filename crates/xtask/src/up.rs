@@ -5,7 +5,7 @@
 //!    and the bootable Camelot root image, as `cargo xtask fs` builds it
 //!    (`target/camelot-fs.img`). `--no-build` skips both and uses what is there.
 //! 2. **Seed** ([`seed`]): Lake's images directory (`target/platform/images` by
-//!    default) gets the root image (4 MiB) as the disk `os-base`, the image a Camelot
+//!    default) gets the root image as the disk `os-base`, the image a Camelot
 //!    VM's disk is a copy of (`avalon_client::BASE_IMAGE`). It is written when it is missing
 //!    and replaced when it differs from the one just built; nothing else in the
 //!    directory is touched.

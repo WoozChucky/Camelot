@@ -91,9 +91,9 @@ filesystem's `/bin`, and with no `/bin/sh` (or no filesystem) it panics
 (`panic: no shell in /bin, and no programs built into the kernel`).
 `kernel.elf` is the same kernel with a copy of every program built in (1.7
 MB), which play the part of an initramfs: they are what it runs without a
-disk. So the whole system fits in a 4 MiB image (the kernel about 300
-blocks, the filesystem the rest, about three fifths of it free); `cargo xtask fs
---size N` makes an image of N blocks.
+disk. So the whole system fits in one image (the kernel about 300 blocks,
+the filesystem the rest; its size is in the spec, section 10, "Root image");
+`cargo xtask fs --size N` makes an image of N blocks.
 
 ```
 cargo xtask fs
