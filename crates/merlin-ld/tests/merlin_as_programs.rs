@@ -89,19 +89,8 @@ fn multiobj_example_with_the_merlin_ld_binary() {
         ours == committed,
         "examples/multiobj/multiobj.elf is not the CLI's link"
     );
-
-    // In the other order print.S's code comes first in .text, but _start is
-    // in .text.start, which the script places before it: still a program.
-    merlin_ld(&dir, &["-T", "link.ld", "print.o", "main.o", "-o", "swapped.elf"]);
-    let swapped = std::fs::read(dir.join("swapped.elf")).unwrap();
-    assert_ne!(swapped, committed);
-    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
-    m.cpu.bus.uart.capture = true;
-    m.load_elf(&swapped).unwrap();
-    assert_eq!(m.run(Some(100_000), |_| {}), RunResult::Exited(42));
-    let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
-    assert!(
-        out.starts_with("Hello from two objects!\nputs lives in print.S.\n"),
-        "{out}"
-    );
+    // (No output section of multiobj takes input from both objects, so the
+    // object order does not move anything it loads; concatenating the same
+    // section from several objects is covered by the fixtures in
+    // tests/link.rs.)
 }

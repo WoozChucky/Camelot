@@ -984,8 +984,8 @@ fn li(rd: Reg, value: i32) -> Result<Vec<Emit>, String> {
 }
 
 /// `.insn`: an instruction written field by field, for encodings the
-/// assembler has no mnemonic for (hello.S writes `xcal.dbg a0` as
-/// `.insn i 0x0b, 0, x0, a0, 0` so that clang can build it too). The parser
+/// assembler has no mnemonic for (examples/xcal.inc expands `xcal.dbg a0` to
+/// `.insn i 0x0b, 0, x0, a0, 0` so that clang can build the examples too). The parser
 /// turns `.insn i ...` into the mnemonic `.insn i`. Forms, as in LLVM:
 ///
 /// ```text

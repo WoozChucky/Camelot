@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "avalon-proto"
+version = "0.1.0"
+dependencies = [
+ "grail",
+]
+
+[[package]]
 name = "elf32"
 version = "0.1.0"
 
@@ -22,8 +29,11 @@ dependencies = [
 name = "merlin"
 version = "0.1.0"
 dependencies = [
+ "elf32",
+ "excalibur",
  "grail",
  "merlin-as",
+ "merlin-ld",
 ]
 
 [[package]]

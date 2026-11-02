@@ -51,6 +51,8 @@ pub enum DeviceType {
     Sysinfo = 7,
     /// Xcal keyboard (spec section 9.4).
     Keyboard = 8,
+    /// Xcal block device, one entry per disk (spec section 9.6).
+    Block = 9,
 }
 
 /// One device table entry. `irq` is the device's PLIC source, 0 if it has none.

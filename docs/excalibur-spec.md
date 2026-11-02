@@ -119,9 +119,9 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 |---|---|
 | 0x0000_1000 - 0x0000_1FFF | Boot ROM (reset vector 0x1000, jumps to 0x8000_0000) |
 | 0x0200_0000 - 0x0200_FFFF | CLINT: msip @+0x0, mtimecmp @+0x4000, mtime @+0xBFF8 |
-| 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART and keyboard (section 7.1) |
+| 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART, keyboard and disks (section 7.1) |
 | 0x1000_0000 - 0x1000_00FF | UART, 16550-compatible subset (THR/RBR @+0, IER @+1, IIR @+2, LSR @+5) |
-| 0x1000_1000 - 0x1000_1FFF | Reserved: virtio block device (later, for a filesystem) |
+| 0x1000_1000 - 0x1000_8FFF | Block devices: disk `i` at 0x1000_1000 + 0x1000·i, up to 8 (`--disk`; Xcal, section 9.6). Only the pages of attached disks are mapped |
 | 0x0010_0000 | Test/exit device: write 0x5555 = pass/exit, 0x3333 = fail (used by riscv-tests) |
 | 0x3000_0000 - 0x3000_0FFF | Framebuffer control (Xcal, section 9.3) |
 | 0x3000_1000 - 0x3000_1FFF | Keyboard (Xcal, section 9.4) |
@@ -151,7 +151,8 @@ A minimal RISC-V PLIC (riscv-plic-spec) with the QEMU `virt` register layout: on
 | 0 | none ("no interrupt" when claimed) |
 | 1 | UART receive (section 7) |
 | 2 | Keyboard (section 9.4) |
-| 3-31 | unused, never asserted |
+| 3-10 | Disks 0-7: disk `i` is source 3 + `i` (section 9.6) |
+| 11-31 | unused, never asserted |
 
 QEMU `virt` puts UART0 on source 10; Excalibur numbers its few devices from 1 instead, so drivers must take the source numbers from this table rather than from `virt` device trees.
 
@@ -294,10 +295,49 @@ Device table entry `i` (for `i` < `SYS_DEV_COUNT`; at most 252 fit in the page):
 | 6 | Framebuffer VRAM (section 9.3) |
 | 7 | Sysinfo (this block) |
 | 8 | Keyboard (section 9.4) |
+| 9 | Block device, one entry per disk (section 9.6) |
 
-Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device (block storage, say) gets the next code and an entry, with no new registers and no change to this layout. Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), framebuffer control, keyboard (irq 2), sysinfo and VRAM; `examples/sysinfo` prints the table.
+Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device gets the next code and an entry, with no new registers and no change to this layout (the block device, type 9, was added this way). Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), one block device per disk (disk `i` at 0x1000_1000 + 0x1000·`i`, irq 3 + `i`; none without `--disk`), framebuffer control, keyboard (irq 2), sysinfo and VRAM; `examples/sysinfo` prints the table.
 
 The registers are 32-bit only: byte or halfword accesses raise access faults. Word writes are ignored, as for the framebuffer's read-only registers. Offsets past the last entry read as 0.
+
+### 9.6 Block device (MMIO)
+
+Disks of 512-byte sectors. A machine has 0 to 8 of them, in the order they are given (`grail --disk IMG`, repeatable; `MachineConfig::disks` for a host using Grail as a library). Disk `i` has a 4 KiB page of registers at 0x1000_1000 + 0x1000·`i` and interrupts on PLIC source 3 + `i`, and it has an entry of type 9 in the sysinfo device table (section 9.5), which is how software finds it. The pages of disks the machine does not have are unmapped.
+
+The interface is one command at a time with DMA: software writes the first sector, the buffer's address in RAM and the sector count, then a command; the device copies the sectors between the disk and RAM itself, sets `BLK_STATUS.DONE` and, if enabled, raises its interrupt. The memory map used to reserve this slot for a virtio-blk device. Virtio was set aside because a driver must negotiate features and build a virtqueue in guest memory (descriptor table, available ring, used ring) behind the virtio-mmio transport registers before the first sector moves, while a driver for this device is about twenty instructions (`examples/disk`) that a first kernel driver can copy. Having only one request in flight costs nothing in an emulator that finishes each request at once. A queued device can still be added later as a new type code.
+
+| Offset | Register | Notes |
+|---|---|---|
+| +0x00 | `BLK_CAPACITY` (RO) | disk size in sectors (at most 2^32 - 1, just under 2 TiB) |
+| +0x04 | `BLK_FLAGS` (RO) | bit 0 = the disk is read-only. Other bits read as 0 |
+| +0x08 | `BLK_SECTOR` | first sector of the transfer |
+| +0x0C | `BLK_DMA` | physical address of the buffer in RAM |
+| +0x10 | `BLK_COUNT` | number of sectors to transfer |
+| +0x14 | `BLK_CMD` (WO) | writing a command runs it: 1 = read (disk to RAM), 2 = write (RAM to disk), 3 = flush. Reads as 0 |
+| +0x18 | `BLK_STATUS` | bit 0 = BUSY (read-only); bit 1 = DONE: a command finished and has not been acknowledged. Writing 1 to bit 1 clears it; other bits ignore writes |
+| +0x1C | `BLK_ERROR` (RO) | outcome of the last command, below |
+| +0x20 | `BLK_CTRL` | bit 0 = completion interrupt enable. Other bits read as 0 |
+
+| `BLK_ERROR` | Meaning |
+|---|---|
+| 0 | none: the command worked |
+| 1 | unknown command |
+| 2 | out of range: `BLK_SECTOR + BLK_COUNT` is past `BLK_CAPACITY` |
+| 3 | bad buffer: the `BLK_COUNT` × 512 bytes at `BLK_DMA` are not all in RAM |
+| 4 | write to a read-only disk |
+| 5 | I/O error on the host side (the backend failed) |
+
+Details:
+
+- The registers are 32-bit only: byte or halfword accesses in a disk's page raise access faults and run nothing. Unused offsets read as 0 and ignore writes, as do writes to the read-only registers. Everything writable resets to 0. `BLK_SECTOR`, `BLK_DMA` and `BLK_COUNT` keep their values after a command.
+- **Commands complete at once.** Grail runs a command to completion during the store to `BLK_CMD`, so BUSY never reads 1 and DONE is already set when the next instruction runs. BUSY is defined anyway, so that a driver which waits for BUSY to clear or for DONE (by polling or by interrupt) also works with a disk that takes time. A command written while BUSY is set is ignored. Every command written sets DONE and `BLK_ERROR`, failed ones included.
+- **Checks come first**, in the order of the error codes (1 to 4), before any data moves: a command that fails one transfers nothing. The range check is done without overflow, so a huge `BLK_SECTOR` or `BLK_COUNT` fails with 2 instead of wrapping. The buffer must lie in RAM (not VRAM, the boot ROM or device registers); it may start at any byte address. `BLK_DMA` is a physical address: the device does not use the MMU. With `BLK_COUNT` 0 a read or write transfers nothing, and succeeds if the checks pass (`BLK_SECTOR` at most `BLK_CAPACITY`, `BLK_DMA` in RAM or just past its end). Only error 5 can leave a transfer half done. Nothing a program writes makes the host panic or touches memory outside the buffer.
+- **Flush** ignores `BLK_SECTOR`, `BLK_DMA` and `BLK_COUNT`, and completes once every earlier write is durable on the host (for an image file, the host OS has written it to its own disk). It succeeds on a read-only disk.
+- **Interrupt**: a disk holds its PLIC source high while `BLK_CTRL.0` and `BLK_STATUS.DONE` are both set. A handler claims the source, reads `BLK_ERROR`, writes 2 to `BLK_STATUS` (which lowers the line) and completes. If it completes without acknowledging, the source is pending again at once (section 7.1).
+- **Backends.** Where a disk's sectors live is up to the host: Grail gives each disk of each machine its own backend (`BlockBackend` in the grail library: capacity, read, write, flush). `--disk IMG` uses an image file on the host, `--disk-ro IMG` the same file opened read-only (`BLK_FLAGS.0` set); tests use in-memory disks, and a host can hand Grail backends of its own (`Machine::with_backends`; the Lake storage server will add a network one). An image is raw: sector `n` is bytes 512·`n` to 512·`n` + 511 of the file. Its size must be a whole number of sectors, or Grail refuses to start; it never grows. Writes go to the file as they happen. Grail does not lock images, so two machines must not attach the same image read-write.
+
+`examples/disk` finds the first disk in the device table, prints its sector 0 as text, checks that a read past the end fails with error 2, and runs a write/read-back test on the last sector (saving and restoring it), waiting for the completion interrupt after every command: `grail --disk examples/disk/disk.img examples/disk/disk.elf`.
 
 ## 10. Toolchain (all our own)
 
@@ -324,6 +364,14 @@ Everything that runs on the host is written by us, with no third-party libraries
 - Expressions, loosest first: `=` (right-associative, value is the assigned value), `||`, `&&`, `== !=`, `< <= > >=`, `+ -`, `* / %`, unary `- !`, then literals, variables, calls and parentheses. Literals are decimal, hex (`0x`) or octal (`0`), up to `2147483647` (`0x7FFFFFFF`): larger ones would be `unsigned int` or `long long` in C, so they are rejected until those types exist (write `INT_MIN` as `-2147483647 - 1`). Operators C lexes as one token, such as `++ -- += -> <<`, are rejected rather than split, so `--x` is never read as `-(-x)`.
 - Statements and expressions nest at most 256 levels deep (each nested statement, `=`, unary operator, parenthesis, call argument or chained binary operator is a level); deeper input is an error.
 - Where C leaves behavior undefined, merlin defines it the way the hardware does: arithmetic wraps, `/` and `%` round toward zero (`div`/`rem`, so `INT_MIN / -1` wraps and division by zero gives RISC-V's results), and falling off the end of a function returns 0. Argument evaluation order is unspecified; tests must not depend on it.
+
+Code generation (`crates/merlin/src/codegen.rs`, whose module docs walk through it) is a stack machine: every expression leaves its value in `a0`, operands waiting for the other side are pushed on the stack, every local lives in memory. The output is plain merlin-as source (`.text`, `.globl f`, `f:`, local labels `.L.<what>.<n>`) that clang assembles to the same code. Functions follow the ILP32 convention:
+
+- Frame: `s0` is the frame pointer, equal to `sp` on entry. `ra` is saved at `-4(s0)`, the caller's `s0` at `-8(s0)`, and local `#i` (parameters first, as numbered by `--dump-ast`) at `-(12 + 4*i)(s0)`. The frame is `8 + 4*locals` bytes rounded up to 16; prologue and epilogue use `t0` for frames or offsets beyond a 12-bit immediate.
+- Parameters arrive in `a0-a7` and are stored to their slots in the prologue; the result returns in `a0`. Arguments are evaluated left to right (C leaves the order unspecified) before any argument register is loaded, and `sp` is padded to a multiple of 16 around a `call` made while temporaries are pushed.
+- A local declared without an initializer is not cleared (C: indeterminate).
+- A function may not be named like a register (`sp`, `a0`, `x5`, `fp`...), since merlin-as never reads those as symbols: it is a compile error. Names of instructions, pseudo-instructions or CSRs (`add`, `call`, `mstatus`) are fine.
+- merlin-as does not relax branches, so codegen does: before printing a function it estimates every instruction's address (pseudo-instructions at their largest) and writes a conditional branch that may not reach its label (±4 KiB) as the opposite branch over a `j` (±1 MiB).
 
 Test programs live in `crates/merlin/tests/cases/*.c`, each starting with `// expect: N` (the exit code); the ones in `crates/merlin/tests/cases-merlin/` rely on the definitions above for what C leaves undefined, so they are not checked against clang. The harness links them with a small `crt0.s` (set `sp` to the top of RAM, `call main`, `xcal.halt a0`) and runs them in Grail, so the exit code is the low 8 bits of `main`'s return value.
 
@@ -409,7 +457,7 @@ Steps 1 and 2 together, our assembler and our linker with no LLVM at all, is how
 
 ### Examples
 
-The programs in `examples/` are built by `cargo xtask examples` (`crates/xtask/src/examples.rs`): each source is assembled by merlin-as and the objects are linked by merlin-ld, with the example's `link.ld` (or the default layout for `muldiv`). Both tools run as libraries inside xtask, the same code as their command lines, which the comment at the top of each source spells out. The linked `examples/<dir>/<name>.elf` files are committed so Grail can run them without building anything, and `cargo test` (`crates/xtask/tests/examples.rs`) rebuilds every example from source, requires the result to equal the committed file byte for byte, and runs it in Grail with its input (UART bytes, key events), checking the output and the exit code. Nothing in that needs LLVM. `examples/multiobj` exists to exercise multi-object linking: two sources with calls, pc-relative addresses and `.word` pointers between them, `.data` written at run time, `.bss` in the other object, and a non-zero exit code (42).
+The programs in `examples/` are built by `cargo xtask examples` (`crates/xtask/src/examples.rs`): each source is assembled by merlin-as and the objects are linked by merlin-ld, with the example's `link.ld` (or the default layout for `muldiv`). Both tools run as libraries inside xtask, the same code as their command lines, which the comment at the top of each source spells out. The linked `examples/<dir>/<name>.elf` files are committed so Grail can run them without building anything, and `cargo test` (`crates/xtask/tests/examples.rs`) rebuilds every example from source, requires the result to equal the committed file byte for byte, and runs it in Grail with its input (UART bytes, key events, a disk image), checking the output and the exit code. Nothing in that needs LLVM. `examples/multiobj` exists to exercise multi-object linking: two sources with calls, pc-relative addresses and `.word` pointers between them, `.data` written at run time, `.bss` in the other object, and a non-zero exit code (42).
 
 clang and ld.lld are only the reference. Each source carries the command that builds the same program with them:
 
@@ -432,7 +480,7 @@ With relaxation on (clang's default, which is how the examples used to be built)
 
 The kernel (`kernel/`) is built by `cargo xtask kernel`, a Rust build task (`crates/xtask`), not a Makefile or shell script: clang compiles each `.c`, clang or merlin-as (`--as merlin`, step 1 above) assembles each `.s`, and `ld.lld` links them with `kernel/kernel.ld`. The full command lines are in `kernel/README.md`. The linked `kernel/kernel.elf` is committed, so running and testing the kernel needs no LLVM; the build is reproducible, and when the installed clang matches the one recorded in `kernel/kernel.elf.clang-version`, `cargo test` checks the committed image is up to date.
 
-Boot contract: Grail's boot ROM jumps to `_start` at 0x8000_0000 in M-mode. `_start` points `mtvec` at an early trap handler, sets `sp` to the top of a 16 KiB stack, zeroes `.bss` (`__bss_start`..`__bss_end`, both 4-byte aligned), and calls `start()`, the M-mode setup below, then executes `mret`, which enters S-mode at `supervisor_entry`. That calls `int kmain(void)` in S-mode; when `kmain` returns, the machine call `MCALL_HALT` stops the machine with its return value as the exit code. Until `start()` installs the M-mode trap handler, any trap prints `mcause`, `mepc` and `mtval` with `xcal.dbg` and halts with exit code 0xFF. `__kernel_end` (page aligned) marks the first free byte of RAM after the image.
+Boot contract: Grail's boot ROM jumps to `_start` at 0x8000_0000 in M-mode. `_start` points `mtvec` at an early trap handler, sets `sp` to the top of a 16 KiB stack, zeroes `.bss` (`__bss_start`..`__bss_end`, both 4-byte aligned), and calls `start()`, the M-mode setup below, then executes `mret`, which enters S-mode at `supervisor_entry`. That calls `int kmain(void)` in S-mode; when `kmain` returns, the machine call `MCALL_HALT` stops the machine with its return value as the exit code. Until `start()` installs the M-mode trap handler, any trap prints `mcause`, `mepc` and `mtval` with `xcal.dbg` and halts with exit code 0xFF. `.text` starts at `__text_start` (= `_start`), and `.rodata` (`__rodata_start`) and `.data` (`__data_start`) each start on a page boundary, so the kernel page table can map them with different permissions. `__kernel_end` (page aligned) marks the first free byte of RAM after the image.
 
 ### Kernel traps
 
@@ -456,18 +504,53 @@ Timer: the tick rate is 10 Hz, an interval of `timebase / 10` `mtime` ticks with
 
 `kernel_vec` (S-mode, `kernel/kernelvec.s`) saves x1-x31 and `sepc`, `scause`, `stval`, `sstatus` in a `struct trap_frame` on the current stack (`regs[32]` with x*n* at offset 4*n*, then the four CSRs at 128-140; 144 bytes), calls `kernel_trap(frame)`, restores `sepc`, `sstatus` and the registers from the frame, and returns with `sret`. Every trap comes from S-mode until there are user processes, so `sscratch` is unused for now.
 
-`kernel_trap` (`kernel/trap.c`): a supervisor software interrupt clears `sip.SSIP` and increments `ticks`. Any other trap is a panic: it prints
+`kernel_trap` (`kernel/trap.c`): a supervisor software interrupt clears `sip.SSIP` and increments `ticks`. An exception at one of the memory probes' load or store (see "Kernel memory") resumes the probe instead. Any other trap is a panic: it prints
 
 ```
 panic: <cause name>
   scause 0x........  sepc 0x........  stval 0x........  sstatus 0x........
 ```
 
-followed by x1-x31 four per line (`   ra 01010101   sp 80007400 ...`), and halts with exit code 0xFE. After its self-tests the kernel enables the tick (`sie.SSIE`, `sstatus.SIE`), idles in `wfi` printing `tick 1` ... `tick 10`, and returns.
+then, for a page fault (cause 12, 13 or 15), how the kernel page table maps `stval`: `  va 0x........ is not mapped` or `  va 0x........ maps to pa 0x........, pte 0x........ DAGUXWRV`, the flags printed bit 7 to bit 0 with `-` for a clear bit. Then x1-x31 four per line (`   ra 01010101   sp 80007400 ...`), and it halts with exit code 0xFE. After its self-tests the kernel enables the tick (`sie.SSIE`, `sstatus.SIE`), idles in `wfi` printing `tick 1` ... `tick 10`, and returns.
 
-For testing the panic path, the image has a word `boot_fault` in `.data`, normally 1. Patching it to 2 makes the kernel execute an illegal instruction after the ticks (with every register but sp set to its number in each byte, x5 = 0x05050505); 3 makes it load from the unmapped address 0x100.
+For testing the panic path, the image has a word `boot_fault` in `.data`, normally 1. Patching it to 2 makes the kernel execute an illegal instruction after the ticks (with every register but sp set to its number in each byte, x5 = 0x05050505); 3 makes it load from the unmapped address 0x100, a load page fault since paging is on; 4 makes it store to `kmain`'s first instruction, a store page fault since kernel text is read and execute only. Values 5 to 11 misuse the memory API after the ticks, and each must end in a plain `panic: <message>` from the check that catches it: 5 maps the first kernel text page again (`map_pages: remap`), 6 unmaps page 0 (`unmap_pages: not mapped`), 7 maps a page with W but not R (`map_pages: bad permissions`), 8 plants a 4 MiB leaf in the root table and walks it (`walk: unexpected megapage`), and 9, 10 and 11 `kfree` a page pointer plus 4, the kernel's first page and the page after the end of RAM (`kfree`, after a `kfree: bad page <pa>` line).
 
 Kernel C stays inside what Merlin will compile: no libc headers (`-nostdinc`), no floating point, no inline `asm()` (CSR access and Xcal instructions live in `.s` files, with Xcal instructions written as `.word`), and `.s` files use only merlin-as syntax. The one exception is varargs: `kprintf` uses `__builtin_va_list`/`__builtin_va_start`/`__builtin_va_arg`/`__builtin_va_end` (via `kernel/include/varargs.h`), so Merlin must provide those builtins with the ILP32 convention (variadic arguments travel in a0-a7 and then on the stack like named ones; the callee spills a0-a7 next to its stack arguments and `va_list` is a pointer walking that area).
+
+### Kernel memory
+
+The kernel manages physical memory in 4 KiB pages and runs with Sv32 paging on (`kernel/kalloc.c`, `kernel/vm.c`), the xv6-riscv design.
+
+**RAM** comes from sysinfo (section 9.5), not from a fixed size or a boot argument: `kinit()` checks `SYS_MAGIC` and `SYS_VERSION` (1), reads `SYS_RAM_BASE` and `SYS_RAM_SIZE`, and panics unless the image starts RAM (`__text_start` = `SYS_RAM_BASE`) and RAM is a whole number of pages. So the allocator follows `--ram`. With 2 GiB, RAM ends at 2^32, which wraps to 0 in 32 bits: the kernel counts pages and compares `pa - ram_base < ram_size` instead of computing an end address.
+
+**Page allocator**: one free list threaded through the free pages (each free page's first word points to the next), holding every page from `__kernel_end` to the end of RAM. `kalloc()` pops a page (NULL when none is left), `kfree(pa)` pushes one and panics unless `pa` is a page-aligned address in that range, `kzalloc()` is `kalloc()` plus zeroing, and `kfree_pages()` is the free count. Unlike xv6, pages are not filled with junk on free or alloc: at about a thousand stores a page it would dominate the boot.
+
+**Page tables**: `pagetable_t` is a page of 1024 PTEs. `walk(pt, va, alloc)` returns the level-0 PTE for `va`, creating the second-level table (a zeroed page) when `alloc` is set. `map_pages(pt, va, pa, size, perm)` maps a page-aligned range with permissions R/W/X/U (W without R and remapping a valid PTE panic), returning -1 if a table can't be allocated. `unmap_pages(pt, va, size, free)` clears mapped PTEs (panics on an unmapped page) and optionally frees the pages. `pagetable_free(pt)` frees the second-level tables and the root, and panics if a leaf is still mapped. The kernel only creates 4 KiB leaves: no megapages, so a 4 MiB leaf in a root table is treated as corruption. PTEs are created with A and D clear; Grail sets them (section 5), so the kernel never has to.
+
+**Kernel address space**: identity mapped (virtual = physical), so physical addresses (page tables, pages from `kalloc`) stay usable as pointers. `kvminit()` maps
+
+| Range | Permissions |
+|---|---|
+| `__text_start` .. `__rodata_start`: kernel text | R+X |
+| `__rodata_start` .. `__data_start`: read-only data | R |
+| `__data_start` .. end of RAM: data, `.bss`, boot stack, free pages | R+W |
+| every device in the sysinfo device table, rounded out to whole pages; a page that devices share is mapped once | R+W |
+
+and nothing else: no U, no G, nothing executable outside the kernel text, and the boot ROM, the gaps and address 0 unmapped, so a stray access is a page fault. The devices come from the table rather than from constants, so a new Grail device is mapped without a kernel change. `kvminithart()` then executes `sfence.vma`, writes `satp` (MODE = Sv32, PPN = root), and `sfence.vma` again. Grail has no TLB, so the fences cost nothing there, but the ISA requires them. M-mode code (`machine_vec`) ignores `satp` and keeps using physical addresses.
+
+Boot order in `kmain`: UART banner and `kprintf` self-test, `kinit()`, `kvminit()`, `kvminithart()`, then the memory self-tests, then `trap_init()` and the ticks, which run with paging on. Setting up 128 MiB takes about 4.5 million instructions, nearly all of them freeing, mapping and (in the self-test) allocating one page at a time; a few machine timer ticks fire meanwhile and pile up in `sip.SSIP`. `trap_init()` clears that bit before it enables the interrupt, so the first tick the kernel counts is a whole interval long, like the others.
+
+**Memory probes** (`kernel/probe.s`): `probe_load(addr, &val, &stval)` and `probe_store(addr, val, &stval)` make one word access and return 0, or the trap cause with `stval` when it faults. `kernel_trap` recognises an exception whose `sepc` is a probe's access instruction, sets a0 = `scause` and a1 = `stval` in the frame and resumes at `probe_fault`, which stores `stval` and returns (an exception table, as in Linux). The self-tests use them to expect faults; copying to and from user memory will too. Any other page fault panics until there are processes.
+
+**Self-tests** (`kernel/vmtest.c`), printed as `vm self-test: N/M passed` and counted in `kmain`'s exit code:
+
+- allocate every free page (each aligned and after the kernel) until `kalloc()` returns NULL, check the count, check that `pagetable_create()` and a `map_pages()` needing a new table fail while memory is exhausted, then free every page and check the count again;
+- fill a page with all ones (every word a valid-looking PTE) and free it, then check that `kzalloc()` hands it back zeroed; the same for `pagetable_create()`, which `walk()` also uses. RAM starts out zero on Grail, so only a reused page shows the zeroing;
+- map a page a second time at 0x4000_0000, write through each address and read through the other, check the hardware set A and D in the PTE, unmap it (freeing the page) and check a load and a store there are page faults 13 and 15 with `stval` = the address;
+- a store to the first word of the kernel text and one to `.rodata` are store page faults (cause 15) caught by the probe, the text is unchanged and readable, and a store to `.data` works;
+- build a separate page table, map two pages across a 4 MiB boundary and a three-page range, check the PTEs with `walk()`, unmap, free the table, and check every page came back.
+
+The alias test leaves its second-level table in the kernel page table; everything else ends as it started.
 
 ## 11. Roadmap
 
@@ -477,7 +560,7 @@ Kernel C stays inside what Merlin will compile: no libc headers (`-nostdinc`), n
 4. **merlin-as** emitting ELF `.o`. Validate with `llvm-objdump` and ld.lld.
 5. **merlin-ld**. Validate against clang-produced objects.
 6. **Bare-metal hello world** written in our assembly, built entirely with our tools.
-7. **M extension** in merlin-as (Grail already passes rv32um). **Xcal devices** in Grail: framebuffer window and keyboard via Win32 FFI, sysinfo, and a configurable machine (RAM size, real-time clock) that a host can run several of.
+7. **M extension** in merlin-as (Grail already passes rv32um). **Xcal devices** in Grail: framebuffer window and keyboard via Win32 FFI, sysinfo, block devices with pluggable backends, and a configurable machine (RAM size, real-time clock, disks) that a host can run several of.
 8. **Merlin v0**: C subset → assembly. Grow it test by test.
 9. **Camelot kernel** in C (clang first, our compiler as it catches up): trap handling, timer, UART driver, then paging (Sv32), processes, syscalls.
 10. **Self-hosting stretch goal**: our tools running on our OS.

@@ -153,7 +153,6 @@ fn build_examples(args: ExamplesArgs) -> ExitCode {
     };
     let mut failed = false;
     for ex in selected {
-        let obj_dir = root.join("target").join("examples").join(ex.dir);
         if args.verbose {
             for cmd in examples::commands(ex, &format!("target/examples/{}", ex.dir)) {
                 eprintln!("{cmd}");
@@ -170,11 +169,10 @@ fn build_examples(args: ExamplesArgs) -> ExitCode {
         for w in &built.warnings {
             eprintln!("merlin-ld: warning: {w}");
         }
-        let elf = ex.elf_path(&root);
         if args.check {
-            match std::fs::read(&elf) {
-                Ok(committed) if committed == built.elf => eprintln!("{} is up to date", ex.elf_name()),
-                Ok(_) => {
+            match examples::check(&root, ex, &built) {
+                examples::Status::UpToDate => eprintln!("{} is up to date", ex.elf_name()),
+                examples::Status::Stale => {
                     eprintln!(
                         "{} is out of date: run `cargo xtask examples {}`",
                         ex.elf_name(),
@@ -182,22 +180,14 @@ fn build_examples(args: ExamplesArgs) -> ExitCode {
                     );
                     failed = true;
                 }
-                Err(e) => {
-                    eprintln!("cannot read {}: {e}", elf.display());
+                examples::Status::Unreadable(e) => {
+                    eprintln!("{e}");
                     failed = true;
                 }
             }
             continue;
         }
-        let written = std::fs::create_dir_all(&obj_dir)
-            .and_then(|()| {
-                built
-                    .objects
-                    .iter()
-                    .try_for_each(|o| std::fs::write(obj_dir.join(&o.name), &o.data))
-            })
-            .and_then(|()| std::fs::write(&elf, &built.elf));
-        match written {
+        match examples::write(&root, ex, &built) {
             Ok(()) => eprintln!("built {}", ex.elf_name()),
             Err(e) => {
                 eprintln!("xtask: cannot write {}: {e}", ex.name);

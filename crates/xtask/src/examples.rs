@@ -55,6 +55,12 @@ pub const EXAMPLES: &[Example] = &[
         script: Some("link.ld"),
     },
     Example {
+        name: "disk",
+        dir: "disk",
+        sources: &["disk.S"],
+        script: Some("link.ld"),
+    },
+    Example {
         name: "uart-echo",
         dir: "uart-echo",
         sources: &["uart-echo.S"],
@@ -189,6 +195,44 @@ pub fn build(root: &Path, ex: &Example) -> Result<Built, String> {
     })
 }
 
+/// How the committed executable compares with a fresh build ([`check`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Status {
+    UpToDate,
+    /// It differs from what the tools build.
+    Stale,
+    /// It cannot be read (the message says why).
+    Unreadable(String),
+}
+
+/// Compares `examples/<dir>/<name>.elf` under `root` with `built`
+/// (`cargo xtask examples --check`).
+pub fn check(root: &Path, ex: &Example, built: &Built) -> Status {
+    let path = ex.elf_path(root);
+    match std::fs::read(&path) {
+        Ok(committed) if committed == built.elf => Status::UpToDate,
+        Ok(_) => Status::Stale,
+        Err(e) => Status::Unreadable(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
+/// Where `cargo xtask examples` leaves the objects of `ex`:
+/// `target/examples/<dir>` under `root`.
+pub fn obj_dir(root: &Path, ex: &Example) -> PathBuf {
+    root.join("target").join("examples").join(ex.dir)
+}
+
+/// Writes the objects to [`obj_dir`] and the executable to
+/// `examples/<dir>/<name>.elf`, under `root`.
+pub fn write(root: &Path, ex: &Example, built: &Built) -> std::io::Result<()> {
+    let objs = obj_dir(root, ex);
+    std::fs::create_dir_all(&objs)?;
+    for o in &built.objects {
+        std::fs::write(objs.join(&o.name), &o.data)?;
+    }
+    std::fs::write(ex.elf_path(root), &built.elf)
+}
+
 /// The command lines [`build`] stands for, as a user would type them from the
 /// repository root, with the objects in `obj_dir`.
 pub fn commands(ex: &Example, obj_dir: &str) -> Vec<String> {
@@ -263,6 +307,56 @@ mod tests {
                 "merlin-ld o/muldiv.o -o examples/muldiv/muldiv.elf",
             ]
         );
+    }
+
+    /// `cargo xtask examples [--check]` on a scratch tree: a missing, a
+    /// written (up-to-date) and a changed (stale) executable.
+    #[test]
+    fn check_and_write() {
+        let root = std::env::temp_dir().join(format!("xtask-examples-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("examples").join("two");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.S"),
+            "    .globl _start\n_start:\n    call f\n    xcal.halt a0\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("b.S"), "    .globl f\nf:\n    li a0, 7\n    ret\n").unwrap();
+        let ex = Example {
+            name: "two",
+            dir: "two",
+            sources: &["a.S", "b.S"],
+            script: None,
+        };
+        let built = build(&root, &ex).unwrap();
+
+        match check(&root, &ex, &built) {
+            Status::Unreadable(e) => assert!(e.starts_with("cannot read "), "{e}"),
+            other => panic!("missing executable: {other:?}"),
+        }
+
+        write(&root, &ex, &built).unwrap();
+        assert_eq!(std::fs::read(ex.elf_path(&root)).unwrap(), built.elf);
+        for o in &built.objects {
+            assert_eq!(std::fs::read(obj_dir(&root, &ex).join(&o.name)).unwrap(), o.data);
+        }
+        assert_eq!(check(&root, &ex, &built), Status::UpToDate);
+
+        // One byte more, one byte changed: both stale.
+        let mut longer = built.elf.clone();
+        longer.push(0);
+        std::fs::write(ex.elf_path(&root), &longer).unwrap();
+        assert_eq!(check(&root, &ex, &built), Status::Stale);
+        let mut changed = built.elf.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        std::fs::write(ex.elf_path(&root), &changed).unwrap();
+        assert_eq!(check(&root, &ex, &built), Status::Stale);
+
+        // Writing again brings it up to date.
+        write(&root, &ex, &built).unwrap();
+        assert_eq!(check(&root, &ex, &built), Status::UpToDate);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

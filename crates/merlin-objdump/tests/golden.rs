@@ -249,6 +249,35 @@ fn matches_llvm_objdump() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
 }
 
+/// scripts/gen-objdump-golden.sh rebuilds every fixture a golden file is made
+/// from, so regenerating the goldens never reads a stale object.
+#[test]
+fn generator_script_builds_every_fixture() {
+    let script = std::fs::read_to_string(root().join("scripts/gen-objdump-golden.sh")).unwrap();
+    const FIX: &str = "crates/merlin-objdump/tests/fixtures/";
+    let mut missing = Vec::new();
+    for &(name, input, _) in CASES {
+        let Some(file) = input.strip_prefix(FIX) else {
+            continue; // the riscv-tests ELFs come from scripts/build-riscv-tests.sh
+        };
+        let output = format!("-o \"$FIX/{file}\"");
+        if !script
+            .lines()
+            .any(|l| !l.trim_start().starts_with('#') && l.contains(&output))
+        {
+            missing.push(format!("{name}: nothing writes {file}"));
+        }
+        let consumer = format!("\"$FIX/{file}\"");
+        assert!(
+            script
+                .lines()
+                .any(|l| l.starts_with(&format!("gen {name} ")) && l.contains(&consumer)),
+            "{name} is not generated from {file}"
+        );
+    }
+    assert!(missing.is_empty(), "{missing:?}");
+}
+
 /// Acceptance check for issue #5: every instruction of hello.elf, mnemonic
 /// and operands, against `llvm-objdump -d --no-show-raw-insn`.
 #[test]

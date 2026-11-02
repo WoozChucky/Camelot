@@ -33,6 +33,7 @@ $CC "$FIX/relocs.S" -o "$FIX/relocs.o"
 $CC -include examples/xcal.inc examples/hello/hello.S -o "$FIX/hello.o"
 clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -nostdlib -static -fuse-ld=lld \
   -include examples/xcal.inc -T examples/hello/link.ld examples/hello/hello.S -o "$FIX/hello.elf"
+$CC -mno-relax "$FIX/misc.S" -o "$FIX/misc.o"
 # -fdebug-compilation-dir keeps the build directory out of the debug info.
 $CC -O1 -g -fdebug-compilation-dir=. "$FIX/debug.c" -o "$FIX/debug.o"
 $CC -mno-relax "$FIX/linked.S" -o "$FIX/linked.o"

@@ -3,8 +3,9 @@
 //!
 //! * the committed `examples/<dir>/<name>.elf` files are exactly what the
 //!   current tools build from the sources;
-//! * each freshly built program runs in Grail, with input where it reads some,
-//!   and prints what it should and exits with the right code;
+//! * each freshly built program runs in Grail, with input where it reads some
+//!   (UART bytes, key events, a disk), and prints what it should and exits
+//!   with the right code;
 //! * `hello` and `multiobj` load byte for byte like ld.lld's link of clang's
 //!   objects (the references in `crates/merlin-ld/tests/fixtures`, made by
 //!   `cargo xtask ld-fixtures`), and merlin-objdump's disassembly of them is
@@ -12,8 +13,9 @@
 //!   pinned down here and listed in docs/excalibur-spec.md section 10.
 
 use elf32::{Elf, PT_GNU_STACK, PT_LOAD, PT_RISCV_ATTRIBUTES, SHF_ALLOC, SHT_SYMTAB};
+use grail::block::SECTOR_SIZE;
 use grail::keyboard::{code, KeyEvent};
-use grail::{Machine, RunResult};
+use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
@@ -37,6 +39,9 @@ struct Scenario {
     stdin: &'static [u8],
     /// Key events waiting in the keyboard FIFO.
     keys: Vec<KeyEvent>,
+    /// A disk image (relative to the repository root) attached as disk 0, in
+    /// memory so the committed file is never written.
+    disk: Option<&'static str>,
     /// Everything the UART and `xcal.dbg` print.
     output: &'static str,
     exit: u32,
@@ -57,6 +62,7 @@ fn scenario(name: &str) -> Scenario {
     let plain = |output, exit| Scenario {
         stdin: b"",
         keys: Vec::new(),
+        disk: None,
         output,
         exit,
     };
@@ -86,6 +92,20 @@ fn scenario(name: &str) -> Scenario {
              fb-vram   0x31000000 + 0x0012c000\n",
             0,
         ),
+        // Sector 0's text, the failed read past the end, and the write test on
+        // the last sector.
+        "disk" => Scenario {
+            disk: Some(DISK_IMG),
+            ..plain(
+                "disk 0x10001000, irq 3: 8 sectors\n\
+                 sector 0:\n\
+                 Hello from sector 0 of disk.img!\n\
+                 This text is on the disk image, not in the program.\n\
+                 read past the end: error 2\n\
+                 write/read-back of sector 7: ok\n",
+                0,
+            )
+        },
         // One interrupt per byte, EOT included (and not echoed).
         "uart-echo" => Scenario {
             stdin: b"hi\n\x04",
@@ -107,10 +127,21 @@ fn scenario(name: &str) -> Scenario {
     }
 }
 
+/// The image `examples/disk` reads, relative to the repository root.
+const DISK_IMG: &str = "examples/disk/disk.img";
+
 /// Runs `elf` on a default machine whose RAM starts as garbage (so `.bss`
 /// must really be zeroed by the loader) with the scenario's input.
 fn run(elf: &[u8], s: &Scenario) -> (RunResult, String, Machine) {
-    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+    let disks = match s.disk {
+        Some(img) => vec![DiskConfig::memory(std::fs::read(repo_root().join(img)).unwrap())],
+        None => Vec::new(),
+    };
+    let mut m = Machine::new(MachineConfig {
+        disks,
+        ..MachineConfig::default()
+    })
+    .unwrap();
     m.cpu.bus.ram.fill(0xa5);
     m.cpu.bus.uart.capture = true;
     m.load_elf(elf).unwrap();
@@ -180,7 +211,7 @@ fn committed_examples_are_current() {
 fn examples_run_in_grail() {
     for ex in EXAMPLES {
         let s = scenario(ex.name);
-        let (r, out, m) = run(&build(ex).elf, &s);
+        let (r, out, mut m) = run(&build(ex).elf, &s);
         assert_eq!(
             (r, out.as_str()),
             (RunResult::Exited(s.exit), s.output),
@@ -196,6 +227,17 @@ fn examples_run_in_grail() {
             assert_eq!(fb.pixel(8, 8), 0xffffff);
             assert_eq!(fb.pixel(631, 471), 0x000000);
         }
+        if let Some(img) = s.disk {
+            // The write test put the last sector back as it was.
+            let backend = m.cpu.bus.disks[0].backend();
+            let mut data = vec![0; backend.capacity() as usize * SECTOR_SIZE];
+            backend.read(0, &mut data).unwrap();
+            assert!(
+                data == std::fs::read(repo_root().join(img)).unwrap(),
+                "{}: disk changed",
+                ex.name
+            );
+        }
     }
 }
 
@@ -207,12 +249,28 @@ fn interactive_examples_wait_for_input() {
         let idle = Scenario {
             stdin: b"",
             keys: Vec::new(),
+            disk: None,
             output: "",
             exit: 0,
         };
         let (r, out, _) = run(&build(example(name)).elf, &idle);
         assert_eq!((r, out.as_str()), (RunResult::StepLimit, ""), "{name}");
     }
+}
+
+/// Without a disk, `examples/disk` says so and exits with 1: the scenario's
+/// disk is what it reads.
+#[test]
+fn disk_example_needs_its_disk() {
+    let no_disk = Scenario {
+        stdin: b"",
+        keys: Vec::new(),
+        disk: None,
+        output: "",
+        exit: 1,
+    };
+    let (r, _, _) = run(&build(example("disk")).elf, &no_disk);
+    assert_eq!(r, RunResult::Exited(1));
 }
 
 /// The multi-object example breaks if a cross-object reference is wrong: the

@@ -4,7 +4,9 @@
 //! its flags, a hypervisor from its own configuration). The parsers are public for the
 //! same reason: every front end accepts the same `--ram` and `--clock` syntax.
 
-use crate::bus::RAM_BASE;
+use crate::block::{BlockBackend, FileDisk, MemDisk, MAX_SECTORS, SECTOR_SIZE};
+use crate::bus::{MAX_DISKS, RAM_BASE};
+use std::path::PathBuf;
 
 pub const MIB: usize = 1024 * 1024;
 /// RAM size when nothing else is asked for.
@@ -31,6 +33,76 @@ pub struct MachineConfig {
     /// The CPU and timebase frequency reported to software when `clock_hz` is `None`,
     /// so it computes timer intervals the same way in both modes.
     pub nominal_hz: u32,
+    /// Block devices (spec section 9.6): disk `i` is mapped at `BLK_BASE + i * BLK_SIZE`
+    /// and interrupts on PLIC source `BLK_IRQ + i`. At most [`MAX_DISKS`], counting any
+    /// backends handed to [`crate::Machine::with_backends`].
+    pub disks: Vec<DiskConfig>,
+}
+
+/// One disk of a [`MachineConfig`]: where its sectors come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskConfig {
+    pub source: DiskSource,
+    /// Refuse writes (`BLK_FLAGS.0`); a file is then opened read-only.
+    pub read_only: bool,
+}
+
+/// Where a configured disk's sectors live. A host with a backend of its own (a network
+/// disk, say) passes it to [`crate::Machine::with_backends`] instead.
+#[derive(Clone, PartialEq, Eq)]
+pub enum DiskSource {
+    /// An image file on the host, a whole number of 512-byte sectors. It is opened when
+    /// the machine is built, and written in place.
+    File(PathBuf),
+    /// A disk in host memory that starts as a copy of these bytes (a whole number of
+    /// sectors) and is gone when the machine is.
+    Memory(Vec<u8>),
+}
+
+impl std::fmt::Debug for DiskSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiskSource::File(path) => f.debug_tuple("File").field(path).finish(),
+            // Not the bytes: an image can be megabytes long.
+            DiskSource::Memory(image) => write!(f, "Memory({} bytes)", image.len()),
+        }
+    }
+}
+
+impl DiskConfig {
+    /// A read-write disk backed by the image file at `path`.
+    pub fn file(path: impl Into<PathBuf>) -> Self {
+        DiskConfig {
+            source: DiskSource::File(path.into()),
+            read_only: false,
+        }
+    }
+
+    /// A read-write disk in memory, starting as a copy of `image`.
+    pub fn memory(image: Vec<u8>) -> Self {
+        DiskConfig {
+            source: DiskSource::Memory(image),
+            read_only: false,
+        }
+    }
+
+    pub fn with_read_only(self, read_only: bool) -> Self {
+        DiskConfig { read_only, ..self }
+    }
+
+    /// Opens the backend this disk describes.
+    pub fn open(&self) -> Result<Box<dyn BlockBackend>, String> {
+        match &self.source {
+            DiskSource::File(path) => match FileDisk::open(path, self.read_only) {
+                Ok(disk) => Ok(Box::new(disk)),
+                Err(e) => Err(format!("{}: {e}", path.display())),
+            },
+            DiskSource::Memory(image) => match MemDisk::from_image(image.clone()) {
+                Ok(disk) => Ok(Box::new(disk.with_read_only(self.read_only))),
+                Err(e) => Err(format!("memory image: {e}")),
+            },
+        }
+    }
 }
 
 impl Default for MachineConfig {
@@ -39,6 +111,7 @@ impl Default for MachineConfig {
             ram_size: DEFAULT_RAM_SIZE,
             clock_hz: None,
             nominal_hz: DEFAULT_NOMINAL_HZ,
+            disks: Vec::new(),
         }
     }
 }
@@ -67,6 +140,20 @@ impl MachineConfig {
         }
         if self.clock_hz == Some(0) || self.nominal_hz == 0 {
             return Err("clock frequency must not be 0 Hz".into());
+        }
+        if self.disks.len() > MAX_DISKS {
+            return Err(format!("{} disks, at most {MAX_DISKS}", self.disks.len()));
+        }
+        // Image files are checked when they are opened (`Machine::new`).
+        for disk in &self.disks {
+            if let DiskSource::Memory(image) = &disk.source {
+                let len = image.len();
+                if !len.is_multiple_of(SECTOR_SIZE) || (len / SECTOR_SIZE) as u64 > MAX_SECTORS {
+                    return Err(format!(
+                        "memory disk of {len} bytes must be a whole number of {SECTOR_SIZE}-byte sectors, at most {MAX_SECTORS}"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -172,6 +259,52 @@ mod tests {
             ..MachineConfig::default()
         };
         assert!(zero_nominal.validate().is_err());
+    }
+
+    #[test]
+    fn validate_checks_disks() {
+        assert!(MachineConfig::default().disks.is_empty());
+        let disks = |disks: Vec<DiskConfig>| MachineConfig {
+            disks,
+            ..MachineConfig::default()
+        };
+        let sector = || DiskConfig::memory(vec![0; SECTOR_SIZE]);
+        assert_eq!(disks(vec![sector(); MAX_DISKS]).validate(), Ok(()));
+        let e = disks(vec![sector(); MAX_DISKS + 1]).validate().unwrap_err();
+        assert!(e.contains("at most 8"), "{e}");
+        assert_eq!(disks(vec![DiskConfig::memory(Vec::new())]).validate(), Ok(()));
+        let e = disks(vec![DiskConfig::memory(vec![0; 100])])
+            .validate()
+            .unwrap_err();
+        assert!(e.contains("whole number"), "{e}");
+        // Files are only looked at when opened.
+        assert_eq!(
+            disks(vec![DiskConfig::file("no/such/file.img")]).validate(),
+            Ok(())
+        );
+        let e = DiskConfig::file("no/such/file.img").open().err().unwrap();
+        assert!(e.starts_with("no/such/file.img: "), "{e}");
+    }
+
+    #[test]
+    fn disk_configs_open_their_backends() {
+        let mut image = vec![0; 2 * SECTOR_SIZE];
+        image[SECTOR_SIZE] = 0x42;
+        let config = DiskConfig::memory(image.clone());
+        assert!(!config.read_only);
+        let mut disk = config.open().unwrap();
+        assert_eq!(disk.capacity(), 2);
+        assert!(!disk.read_only());
+        let mut buf = [0; SECTOR_SIZE];
+        disk.read(1, &mut buf).unwrap();
+        assert_eq!(buf[0], 0x42);
+        disk.write(1, &[0; SECTOR_SIZE]).unwrap();
+        // The backend has its own copy: the config (and the next machine) are unchanged.
+        assert_eq!(config.source, DiskSource::Memory(image));
+        let ro = config.with_read_only(true).open().unwrap();
+        assert!(ro.read_only());
+        let debug = format!("{:?}", DiskConfig::memory(vec![0; 1024]).source);
+        assert_eq!(debug, "Memory(1024 bytes)");
     }
 
     #[test]

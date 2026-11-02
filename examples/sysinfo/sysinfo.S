@@ -3,6 +3,7 @@
 #
 #   grail examples/sysinfo/sysinfo.elf
 #   grail --ram 64 --clock 2MHz examples/sysinfo/sysinfo.elf
+#   grail --disk examples/disk/disk.img examples/sysinfo/sysinfo.elf
 #
 # Halts with exit code 0, or 1 if there is no sysinfo block (bad magic).
 #
@@ -34,7 +35,7 @@
     .equ DEV_ENTRY_SIZE,  16            # type, base, size, irq
     .equ SYSINFO_MAGIC,   0x53595349
     .equ FLAG_REAL_TIME,  1
-    .equ DEV_TYPES,       8             # highest type code with a name below
+    .equ DEV_TYPES,       9             # highest type code with a name below
 
     .section .text.start
     .globl _start
@@ -199,7 +200,7 @@ put_hex:
     .balign 4
 # Device names by type code (spec section 9.5), padded to one column.
 dev_names:
-    .word s_unknown, s_clint, s_plic, s_uart, s_test, s_fb_ctrl, s_fb_vram, s_sysinfo, s_keyboard
+    .word s_unknown, s_clint, s_plic, s_uart, s_test, s_fb_ctrl, s_fb_vram, s_sysinfo, s_keyboard, s_block
 s_unknown:      .asciz "  unknown   "
 s_clint:        .asciz "  CLINT     "
 s_plic:         .asciz "  PLIC      "
@@ -209,6 +210,7 @@ s_fb_ctrl:      .asciz "  fb-ctrl   "
 s_fb_vram:      .asciz "  fb-vram   "
 s_sysinfo:      .asciz "  sysinfo   "
 s_keyboard:     .asciz "  keyboard  "
+s_block:        .asciz "  block     "
 s_title:        .asciz "sysinfo v"
 s_ram:          .asciz "RAM      "
 s_mib_at:       .asciz " MiB at "

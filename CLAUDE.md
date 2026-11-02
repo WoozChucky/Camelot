@@ -21,13 +21,14 @@ Camelot is a learning project: the Excalibur ISA (RV32IM + Zicsr, M/S/U, Sv32, X
 crates/excalibur        encodings, decoder, disassembler (shared by every tool)
 crates/elf32            ELF32 reader (grail, merlin-objdump, merlin-ld)
 crates/grail            the emulator
-crates/merlin           the C-subset compiler (front end + test harness; codegen is #14)
+crates/avalon-proto     Avalon protocol (framing, messages, Connection), shared by the Avalon platform's programs; spec in docs/avalon-protocol.md
+crates/merlin           the C-subset compiler, C to .s (src/codegen.rs explains the stack frames and calling convention)
 crates/merlin-as        the assembler
 crates/merlin-ld        the linker (src/reloc.rs explains every relocation it applies)
 crates/merlin-objdump   the disassembler; output matches llvm-objdump 21
 crates/xtask            build tasks (`cargo xtask examples` builds every example with merlin-as + merlin-ld, no LLVM; `cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld; `cargo xtask hello` rebuilds merlin-as's ld.lld-linked hello reference; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
 kernel/                 the Camelot kernel (C + assembly); kernel.elf is committed, rebuild it after changes
-docs/                   ISA spec
+docs/                   ISA spec, Avalon protocol
 examples/               bare-metal programs; their .elf files are committed, rebuild them with `cargo xtask examples` after changes (`cargo test` checks)
 tests/riscv-tests       prebuilt riscv-tests ELFs, and obj/ with their objects (merlin-ld relinks them)
 ```
