@@ -1,0 +1,3 @@
+[alias]
+# `cargo xtask kernel` and friends; see crates/xtask.
+xtask = "run --quiet --package xtask --"

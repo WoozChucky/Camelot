@@ -1,6 +1,7 @@
 //! Physical address space. See spec section 7 for the memory map.
 
 use crate::devices::{Clint, Plic, TestDevice, Uart, UART_IRQ};
+use crate::framebuffer::{Framebuffer, VRAM_SIZE};
 
 pub const BOOT_ROM_BASE: u32 = 0x0000_1000;
 pub const TEST_DEV_BASE: u32 = 0x0010_0000;
@@ -10,6 +11,9 @@ pub const PLIC_BASE: u32 = 0x0C00_0000;
 pub const PLIC_SIZE: u32 = 0x0400_0000;
 pub const UART_BASE: u32 = 0x1000_0000;
 pub const UART_SIZE: u32 = 0x100;
+pub const FB_CTRL_BASE: u32 = 0x3000_0000;
+pub const FB_CTRL_SIZE: u32 = 0x1000;
+pub const VRAM_BASE: u32 = 0x3100_0000;
 pub const RAM_BASE: u32 = 0x8000_0000;
 
 /// Physical access failed: nothing mapped there, or the device refused the width.
@@ -29,6 +33,7 @@ pub struct Bus {
     pub clint: Clint,
     pub plic: Plic,
     pub uart: Uart,
+    pub fb: Framebuffer,
     pub test: TestDevice,
     /// Address of the riscv-tests `tohost` symbol, if the loaded ELF has one.
     pub tohost: Option<u32>,
@@ -44,6 +49,7 @@ impl Bus {
             clint: Clint::default(),
             plic: Plic::default(),
             uart: Uart::default(),
+            fb: Framebuffer::default(),
             test: TestDevice,
             tohost: None,
             exit: None,
@@ -74,6 +80,19 @@ impl Bus {
         (addr >= RAM_BASE && off + size as usize <= self.ram.len()).then_some(off)
     }
 
+    fn vram_range(addr: u32, size: u32) -> Option<usize> {
+        let off = addr.wrapping_sub(VRAM_BASE);
+        (addr >= VRAM_BASE && off < VRAM_SIZE && VRAM_SIZE - off >= size).then_some(off as usize)
+    }
+
+    /// RAM and VRAM: plain memory, accessed directly instead of through a device.
+    fn memory(&mut self, addr: u32, size: u32) -> Option<&mut [u8]> {
+        if let Some(off) = self.ram_range(addr, size) {
+            return Some(&mut self.ram[off..off + size as usize]);
+        }
+        Self::vram_range(addr, size).map(|off| &mut self.fb.vram[off..off + size as usize])
+    }
+
     /// Reads `size` (1, 2 or 4) bytes of RAM or boot ROM, little-endian, zero-extended.
     /// Device registers fault here: instruction fetches and page-table walks use this, so
     /// they can never trigger a device's read side effect (such as a PLIC claim).
@@ -96,6 +115,9 @@ impl Bus {
 
     /// Reads `size` (1, 2 or 4) bytes, little-endian, zero-extended.
     pub fn read(&mut self, addr: u32, size: u32) -> Result<u32, BusFault> {
+        if let Some(mem) = self.memory(addr, size) {
+            return Ok(mem.iter().rev().fold(0, |v, &b| (v << 8) | b as u32));
+        }
         if let Ok(v) = self.read_mem(addr, size) {
             return Ok(v);
         }
@@ -103,16 +125,17 @@ impl Bus {
             a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => self.clint.read(a - CLINT_BASE, size),
             a if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&a) => self.plic.read(a - PLIC_BASE, size),
             a if (UART_BASE..UART_BASE + UART_SIZE).contains(&a) => self.uart.read(a - UART_BASE, size),
+            a if (FB_CTRL_BASE..FB_CTRL_BASE + FB_CTRL_SIZE).contains(&a) => {
+                self.fb.read(a - FB_CTRL_BASE, size)
+            }
             a if (TEST_DEV_BASE..TEST_DEV_BASE + 0x1000).contains(&a) => Ok(0),
             _ => Err(BusFault),
         }
     }
 
     pub fn write(&mut self, addr: u32, size: u32, val: u32) -> Result<(), BusFault> {
-        if let Some(off) = self.ram_range(addr, size) {
-            for i in 0..size as usize {
-                self.ram[off + i] = (val >> (8 * i)) as u8;
-            }
+        if let Some(mem) = self.memory(addr, size) {
+            mem.copy_from_slice(&val.to_le_bytes()[..size as usize]);
             if self.tohost == Some(addr) && val != 0 {
                 // riscv-tests convention: 1 = pass, otherwise (test_number << 1) | 1.
                 self.exit = Some(Exit::Code(if val == 1 { 0 } else { val >> 1 }));
@@ -125,6 +148,9 @@ impl Bus {
             }
             a if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&a) => self.plic.write(a - PLIC_BASE, size, val),
             a if (UART_BASE..UART_BASE + UART_SIZE).contains(&a) => self.uart.write(a - UART_BASE, size, val),
+            a if (FB_CTRL_BASE..FB_CTRL_BASE + FB_CTRL_SIZE).contains(&a) => {
+                self.fb.write(a - FB_CTRL_BASE, size, val)
+            }
             a if (TEST_DEV_BASE..TEST_DEV_BASE + 0x1000).contains(&a) => {
                 if let Some(e) = self.test.write(a - TEST_DEV_BASE, val) {
                     self.exit = Some(e);
@@ -161,5 +187,57 @@ impl Bus {
         let off = self.ram_range(addr, data.len() as u32).ok_or(BusFault)?;
         self.ram[off..off + data.len()].copy_from_slice(data);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vram_is_plain_memory() {
+        let mut bus = Bus::new(4096);
+        bus.write(VRAM_BASE, 4, 0x00ff_8040).unwrap();
+        assert_eq!(bus.read(VRAM_BASE, 4), Ok(0x00ff_8040));
+        assert_eq!(bus.read(VRAM_BASE, 1), Ok(0x40));
+        assert_eq!(bus.read(VRAM_BASE + 1, 1), Ok(0x80));
+        assert_eq!(bus.read(VRAM_BASE + 2, 2), Ok(0x00ff));
+        assert_eq!(&bus.fb.vram[..4], &[0x40, 0x80, 0xff, 0x00]);
+
+        bus.write(VRAM_BASE + 5, 1, 0xabcd).unwrap();
+        bus.write(VRAM_BASE + 6, 2, 0x1234_5678).unwrap();
+        assert_eq!(bus.read(VRAM_BASE + 4, 4), Ok(0x5678_cd00));
+
+        // Data accesses only: no instruction fetches or page-table walks from VRAM.
+        assert_eq!(bus.read_mem(VRAM_BASE, 4), Err(BusFault));
+    }
+
+    #[test]
+    fn vram_bounds() {
+        let mut bus = Bus::new(4096);
+        let last = VRAM_BASE + VRAM_SIZE - 4;
+        assert_eq!(last, 0x3112_bffc);
+        bus.write(last, 4, 0x0011_2233).unwrap();
+        assert_eq!(bus.read(last, 4), Ok(0x0011_2233));
+        assert_eq!(bus.fb.pixel(639, 479), 0x0011_2233);
+        assert_eq!(bus.read(last + 3, 1), Ok(0));
+        assert_eq!(bus.read(last + 4, 1), Err(BusFault));
+        assert_eq!(bus.write(last + 4, 4, 0), Err(BusFault));
+        assert_eq!(bus.read(VRAM_BASE - 4, 4), Err(BusFault));
+    }
+
+    #[test]
+    fn framebuffer_registers_on_the_bus() {
+        let mut bus = Bus::new(4096);
+        assert_eq!(bus.read(FB_CTRL_BASE, 4), Ok(640));
+        assert_eq!(bus.read(FB_CTRL_BASE + 4, 4), Ok(480));
+        assert_eq!(bus.read(FB_CTRL_BASE + 8, 4), Ok(2560));
+        assert_eq!(bus.read(FB_CTRL_BASE + 0xc, 4), Ok(0));
+        bus.write(FB_CTRL_BASE + 0x10, 4, 1).unwrap();
+        assert!(bus.fb.enabled());
+        bus.write(FB_CTRL_BASE + 0x14, 4, 1).unwrap();
+        assert!(bus.fb.take_present());
+        assert_eq!(bus.read(FB_CTRL_BASE, 1), Err(BusFault));
+        assert_eq!(bus.read(FB_CTRL_BASE + FB_CTRL_SIZE, 4), Err(BusFault));
     }
 }
