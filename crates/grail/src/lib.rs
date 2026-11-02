@@ -3,8 +3,14 @@
 pub mod bus;
 pub mod cpu;
 pub mod devices;
+pub mod display;
 pub mod elf;
+pub mod framebuffer;
 pub mod trap;
+#[cfg(windows)]
+mod win32;
+#[cfg(windows)]
+mod window;
 
 use bus::{Bus, Exit};
 use cpu::Cpu;
@@ -42,6 +48,27 @@ impl Machine {
         bus.tohost = elf.symbol("tohost");
         bus.set_boot_entry(elf.entry);
         Ok(())
+    }
+
+    /// Exit code, once the program has asked to stop.
+    pub fn exit_code(&self) -> Option<u32> {
+        self.cpu.bus.exit.map(|Exit::Code(c)| c)
+    }
+
+    /// Runs at most `steps` steps. Stops early, right after the instruction that did
+    /// it, when the program exits or writes `FB_PRESENT`, so the host can show or dump
+    /// that exact frame. Returns how many steps ran.
+    pub fn run_slice(&mut self, steps: u64, trace: &mut impl FnMut(&Cpu)) -> u64 {
+        let mut n = 0;
+        while n < steps && self.cpu.bus.exit.is_none() {
+            trace(&self.cpu);
+            self.cpu.step();
+            n += 1;
+            if self.cpu.bus.fb.present_pending() {
+                break;
+            }
+        }
+        n
     }
 
     /// Runs until the program exits or `max_steps` steps have run.
