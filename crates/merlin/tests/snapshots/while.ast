@@ -1,28 +1,28 @@
-Function main() <3:5>
-  Local #0 i <4:9>
-  Local #1 sum <5:9>
+Function int main(void) <3:5>
+  Local #0 int i <4:9>
+  Local #1 int sum <5:9>
   Decl <4:5>
-    Var i #0 <4:9>
-      Num 1 <4:13>
+    Var int i #0 <4:9>
+      Num 1 : int <4:13>
   Decl <5:5>
-    Var sum #1 <5:9>
-      Num 0 <5:15>
+    Var int sum #1 <5:9>
+      Num 0 : int <5:15>
   While <6:5>
-    Binary <= <6:14>
-      Var i #0 <6:12>
-      Num 10 <6:17>
+    Binary <= : int <6:14>
+      Var i #0 : int <6:12>
+      Num 10 : int <6:17>
     Block <6:21>
       ExprStmt <7:9>
-        Assign <7:13>
-          Var sum #1 <7:9>
-          Binary + <7:19>
-            Var sum #1 <7:15>
-            Var i #0 <7:21>
+        Assign : int <7:13>
+          Var sum #1 : int <7:9>
+          Binary + : int <7:19>
+            Var sum #1 : int <7:15>
+            Var i #0 : int <7:21>
       ExprStmt <8:9>
-        Assign <8:11>
-          Var i #0 <8:9>
-          Binary + <8:15>
-            Var i #0 <8:13>
-            Num 1 <8:17>
+        Assign : int <8:11>
+          Var i #0 : int <8:9>
+          Binary + : int <8:15>
+            Var i #0 : int <8:13>
+            Num 1 : int <8:17>
   Return <10:5>
-    Var sum #1 <10:12>
+    Var sum #1 : int <10:12>

@@ -1,100 +1,100 @@
-Function main() <4:5>
-  Local #0 sum <5:9>
-  Local #1 i <6:14>
-  Local #2 n <13:9>
-  Local #3 k <20:9>
-  Local #4 m <22:18>
+Function int main(void) <4:5>
+  Local #0 int sum <5:9>
+  Local #1 int i <6:14>
+  Local #2 int n <13:9>
+  Local #3 int k <20:9>
+  Local #4 int m <22:18>
   Decl <5:5>
-    Var sum #0 <5:9>
-      Num 0 <5:15>
+    Var int sum #0 <5:9>
+      Num 0 : int <5:15>
   For <6:5>
     Decl <6:10>
-      Var i #1 <6:14>
-        Num 0 <6:18>
-    Binary < <6:23>
-      Var i #1 <6:21>
-      Num 100 <6:25>
-    Assign <6:32>
-      Var i #1 <6:30>
-      Binary + <6:36>
-        Var i #1 <6:34>
-        Num 1 <6:38>
+      Var int i #1 <6:14>
+        Num 0 : int <6:18>
+    Binary < : int <6:23>
+      Var i #1 : int <6:21>
+      Num 100 : int <6:25>
+    Assign : int <6:32>
+      Var i #1 : int <6:30>
+      Binary + : int <6:36>
+        Var i #1 : int <6:34>
+        Num 1 : int <6:38>
     Block <6:41>
       If <7:9>
-        Binary == <7:19>
-          Binary % <7:15>
-            Var i #1 <7:13>
-            Num 2 <7:17>
-          Num 0 <7:22>
+        Binary == : int <7:19>
+          Binary % : int <7:15>
+            Var i #1 : int <7:13>
+            Num 2 : int <7:17>
+          Num 0 : int <7:22>
         Continue <8:13>
       If <9:9>
-        Binary > <9:15>
-          Var i #1 <9:13>
-          Num 9 <9:17>
+        Binary > : int <9:15>
+          Var i #1 : int <9:13>
+          Num 9 : int <9:17>
         Break <10:13>
       ExprStmt <11:9>
-        Assign <11:13>
-          Var sum #0 <11:9>
-          Binary + <11:19>
-            Var sum #0 <11:15>
-            Var i #1 <11:21>
+        Assign : int <11:13>
+          Var sum #0 : int <11:9>
+          Binary + : int <11:19>
+            Var sum #0 : int <11:15>
+            Var i #1 : int <11:21>
   Decl <13:5>
-    Var n #2 <13:9>
-      Num 0 <13:13>
+    Var int n #2 <13:9>
+      Num 0 : int <13:13>
   While <14:5>
-    Num 1 <14:12>
+    Num 1 : int <14:12>
     Block <14:15>
       ExprStmt <15:9>
-        Assign <15:11>
-          Var n #2 <15:9>
-          Binary + <15:15>
-            Var n #2 <15:13>
-            Num 1 <15:17>
+        Assign : int <15:11>
+          Var n #2 : int <15:9>
+          Binary + : int <15:15>
+            Var n #2 : int <15:13>
+            Num 1 : int <15:17>
       If <16:9>
-        Binary < <16:15>
-          Var n #2 <16:13>
-          Num 5 <16:17>
+        Binary < : int <16:15>
+          Var n #2 : int <16:13>
+          Num 5 : int <16:17>
         Continue <17:13>
       Break <18:9>
   Decl <20:5>
-    Var k #3 <20:9>
-      Num 0 <20:13>
+    Var int k #3 <20:9>
+      Num 0 : int <20:13>
   While <21:5>
-    Binary < <21:14>
-      Var k #3 <21:12>
-      Num 3 <21:16>
+    Binary < : int <21:14>
+      Var k #3 : int <21:12>
+      Num 3 : int <21:16>
     Block <21:19>
       For <22:9>
         Decl <22:14>
-          Var m #4 <22:18>
-            Num 0 <22:22>
+          Var int m #4 <22:18>
+            Num 0 : int <22:22>
         NoCond <22:9>
-        Assign <22:29>
-          Var m #4 <22:27>
-          Binary + <22:33>
-            Var m #4 <22:31>
-            Num 1 <22:35>
+        Assign : int <22:29>
+          Var m #4 : int <22:27>
+          Binary + : int <22:33>
+            Var m #4 : int <22:31>
+            Num 1 : int <22:35>
         Block <22:38>
           If <23:13>
-            Binary == <23:19>
-              Var m #4 <23:17>
-              Num 2 <23:22>
+            Binary == : int <23:19>
+              Var m #4 : int <23:17>
+              Num 2 : int <23:22>
             Break <24:17>
           ExprStmt <25:13>
-            Assign <25:17>
-              Var sum #0 <25:13>
-              Binary + <25:23>
-                Var sum #0 <25:19>
-                Num 1 <25:25>
+            Assign : int <25:17>
+              Var sum #0 : int <25:13>
+              Binary + : int <25:23>
+                Var sum #0 : int <25:19>
+                Num 1 : int <25:25>
       ExprStmt <27:9>
-        Assign <27:11>
-          Var k #3 <27:9>
-          Binary + <27:15>
-            Var k #3 <27:13>
-            Num 1 <27:17>
+        Assign : int <27:11>
+          Var k #3 : int <27:9>
+          Binary + : int <27:15>
+            Var k #3 : int <27:13>
+            Num 1 : int <27:17>
   Return <29:5>
-    Binary + <29:20>
-      Binary + <29:16>
-        Var sum #0 <29:12>
-        Var n #2 <29:18>
-      Var k #3 <29:22>
+    Binary + : int <29:20>
+      Binary + : int <29:16>
+        Var sum #0 : int <29:12>
+        Var n #2 : int <29:18>
+      Var k #3 : int <29:22>
