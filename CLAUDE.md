@@ -23,6 +23,8 @@ crates/excalibur   encodings, decoder, disassembler (shared by every tool)
 crates/grail       the emulator
 crates/merlin      the C-subset compiler (front end + test harness; codegen is #14)
 crates/merlin-as   the assembler
+crates/xtask       build tasks (`cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld)
+kernel/            the Camelot kernel (C + assembly); kernel.elf is committed, rebuild it after changes
 docs/              ISA spec
 examples/          bare-metal programs
 tests/riscv-tests  prebuilt riscv-tests ELFs

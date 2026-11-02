@@ -27,3 +27,11 @@ version = "0.1.0"
 dependencies = [
  "excalibur",
 ]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "grail",
+ "merlin-as",
+]

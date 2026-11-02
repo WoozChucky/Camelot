@@ -48,7 +48,8 @@ impl Cpu {
 
         let (pte, pte_addr) = loop {
             let pte_addr = table.wrapping_add(vpn[level] * 4);
-            let pte = self.bus.read(pte_addr, 4).map_err(|_| access_fault)?;
+            // Page tables must live in memory: a PTE address on a device is an access fault.
+            let pte = self.bus.read_mem(pte_addr, 4).map_err(|_| access_fault)?;
             if pte & PTE_V == 0 || (pte & PTE_R == 0 && pte & PTE_W != 0) {
                 return Err(page_fault);
             }
@@ -104,8 +105,9 @@ impl Cpu {
 
     pub fn fetch(&mut self, pc: u32) -> Result<u32, Trap> {
         let paddr = self.translate(pc, Access::Fetch)?;
+        // Only memory is executable: fetching from a device is an access fault.
         self.bus
-            .read(paddr, 4)
+            .read_mem(paddr, 4)
             .map_err(|_| Trap::new(Access::Fetch.access_fault(), pc))
     }
 

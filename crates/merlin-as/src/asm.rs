@@ -78,6 +78,9 @@ pub struct Assembler {
     /// How many times each numeric label (`1:`) has been defined so far.
     local_counts: HashMap<u32, u32>,
     hidden_labels: u32,
+    /// `%pcrel_lo(label)` relocations to check once every label is known:
+    /// (section, label, source line). See [`Assembler::check_pcrel_lo`].
+    pcrel_lo: Vec<(usize, String, usize)>,
     errors: Vec<Error>,
     line: usize,
 }
@@ -136,6 +139,7 @@ impl Assembler {
             by_name: HashMap::new(),
             local_counts: HashMap::new(),
             hidden_labels: 0,
+            pcrel_lo: Vec::new(),
             errors: Vec::new(),
             line: 0,
         };
@@ -160,14 +164,10 @@ impl Assembler {
     }
 
     fn finish(mut self) -> Result<Object, Vec<Error>> {
+        self.check_pcrel_lo();
         for s in &self.symbols {
             if !s.defined && s.name.starts_with(".L") {
-                let shown = s
-                    .name
-                    .split('$')
-                    .next()
-                    .unwrap_or(&s.name)
-                    .trim_start_matches(".L");
+                let shown = shown_name(&s.name);
                 self.errors
                     .push(Error::new(0, format!("undefined local label '{shown}'")));
             }
@@ -180,6 +180,36 @@ impl Assembler {
             sections: self.sections,
             symbols: self.symbols,
         })
+    }
+
+    /// The low half of an explicit pc-relative pair (`addi a0, a0, %pcrel_lo(1b)`)
+    /// names the label on its `auipc`, not the final symbol: the linker reads the
+    /// `R_RISCV_PCREL_HI20` at that label to find the address. A label in another
+    /// section, or one with no `%pcrel_hi` auipc on it, would link to garbage, so
+    /// it is an error here (llvm-mc: "could not find corresponding %pcrel_hi").
+    /// The encoder can't check this itself: the label may be defined later.
+    fn check_pcrel_lo(&mut self) {
+        for (section, name, line) in std::mem::take(&mut self.pcrel_lo) {
+            let sym = self.by_name.get(&name).map(|&i| &self.symbols[i]);
+            if sym.is_some_and(|s| !s.defined && s.name.starts_with(".L")) {
+                continue; // reported below as an undefined local label
+            }
+            let paired = sym.is_some_and(|s| {
+                s.defined
+                    && s.section == Some(section)
+                    && self.sections[section]
+                        .relocs
+                        .iter()
+                        .any(|r| r.offset == s.value && r.kind == RelocKind::PcrelHi20)
+            });
+            if !paired {
+                let shown = shown_name(&name);
+                self.errors.push(Error::new(
+                    line,
+                    format!("%pcrel_lo({shown}): no auipc with %pcrel_hi at that label in this section"),
+                ));
+            }
+        }
     }
 
     // ----- symbols -----
@@ -340,10 +370,15 @@ impl Assembler {
     }
 
     fn instruction(&mut self, mnemonic: &str, ops: &[Operand]) {
-        let emits = match encode::encode(mnemonic, ops, &Ctx { asm: self }) {
-            Ok(e) => e,
-            Err(msg) => return self.error(msg),
-        };
+        match encode::encode(mnemonic, ops, &Ctx { asm: self }) {
+            Ok(emits) => self.place(mnemonic, emits),
+            Err(msg) => self.error(msg),
+        }
+    }
+
+    /// Appends the encoder's words to the current section and turns their
+    /// fixups into relocations.
+    fn place(&mut self, mnemonic: &str, emits: Vec<Emit>) {
         if self.sections[self.current].kind == SectionKind::Bss {
             return self.error("instructions are not allowed in .bss");
         }
@@ -374,7 +409,12 @@ impl Assembler {
             let offset = base + 4 * i as u32;
             if let Some(f) = fixup {
                 let (symbol, addend) = match f.target {
-                    Target::Symbol { name, addend } => (name, addend),
+                    Target::Symbol { name, addend } => {
+                        if matches!(f.kind, RelocKind::PcrelLo12I | RelocKind::PcrelLo12S) {
+                            self.pcrel_lo.push((self.current, name.clone(), self.line));
+                        }
+                        (name, addend)
+                    }
                     Target::Auipc(j) => (auipc_labels[&j].clone(), 0),
                 };
                 self.add_reloc(offset, f.kind, symbol, addend);
@@ -540,5 +580,96 @@ impl Assembler {
 impl Default for Assembler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// How a label is named in errors: `.L1$0` (the internal name of the numeric
+/// label `1:`) → `1`, `.Lfoo` → `foo`, other names unchanged.
+fn shown_name(name: &str) -> &str {
+    match name.strip_prefix(".L") {
+        Some(rest) => rest.split('$').next().unwrap_or(rest),
+        None => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AUIPC_A0: u32 = 0x0000_0517;
+    const ADDI_A0: u32 = 0x0005_0513;
+
+    fn hi(sym: &str) -> Emit {
+        let target = Target::Symbol {
+            name: sym.into(),
+            addend: 0,
+        };
+        Emit::with_fixup(AUIPC_A0, RelocKind::PcrelHi20, target)
+    }
+
+    fn lo(label: &str) -> Emit {
+        let target = Target::Symbol {
+            name: label.into(),
+            addend: 0,
+        };
+        Emit::with_fixup(ADDI_A0, RelocKind::PcrelLo12I, target)
+    }
+
+    /// Feeds `place` the words an encoder would return, one instruction per
+    /// line, with `labels` defined just before the instruction on that line.
+    fn assemble(lines: &[(&[&str], Emit)]) -> Result<Object, Vec<Error>> {
+        let mut a = Assembler::new();
+        for (i, (labels, emit)) in lines.iter().enumerate() {
+            a.line = i + 1;
+            for l in *labels {
+                a.label(l);
+            }
+            a.place("test", vec![emit.clone()]);
+        }
+        a.finish()
+    }
+
+    #[test]
+    fn pcrel_lo_pairs_with_the_auipc_label() {
+        let obj = assemble(&[(&["1"], hi("target")), (&[], lo(".L1$0"))]).unwrap();
+        let r = &obj.sections[0].relocs;
+        assert_eq!((r[1].offset, r[1].kind), (4, RelocKind::PcrelLo12I));
+        assert_eq!(r[1].symbol, ".L1$0");
+
+        // The label may come after the %pcrel_lo.
+        assemble(&[(&[], lo("later")), (&["later"], hi("target"))]).unwrap();
+    }
+
+    #[test]
+    fn pcrel_lo_without_pcrel_hi_is_an_error() {
+        // The label is on the addi itself, not on an auipc with %pcrel_hi.
+        let errs = assemble(&[(&["start"], lo("start"))]).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].line, 1);
+        assert!(errs[0].msg.contains("%pcrel_lo(start)"), "{}", errs[0].msg);
+
+        // An external symbol has no auipc in this object.
+        let errs = assemble(&[(&[], lo("elsewhere"))]).unwrap_err();
+        assert_eq!((errs.len(), errs[0].line), (1, 1));
+
+        // An undefined numeric label is reported once, as undefined.
+        let errs = assemble(&[(&[], lo(".L1$0"))]).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].msg, "undefined local label '1'");
+    }
+
+    #[test]
+    fn pcrel_lo_label_in_another_section_is_an_error() {
+        let mut a = Assembler::new();
+        a.line = 1;
+        a.label("1");
+        a.place("test", vec![hi("target")]);
+        a.switch_section(".text.other");
+        a.line = 2;
+        a.place("test", vec![lo(".L1$0")]);
+        let errs = a.finish().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].line, 2);
+        assert!(errs[0].msg.contains("%pcrel_lo(1)"), "{}", errs[0].msg);
     }
 }
