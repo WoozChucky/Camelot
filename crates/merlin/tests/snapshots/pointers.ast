@@ -1,0 +1,118 @@
+Function void swap(int *a, int *b) <4:6>
+  Param #0 int *a <4:16>
+  Param #1 int *b <4:24>
+  Local #2 int t <5:9>
+  Decl <5:5>
+    Var int t #2 <5:9>
+      Deref : int <5:13>
+        Var a #0 : int * <5:14>
+  ExprStmt <6:5>
+    Assign : int <6:8>
+      Deref : int <6:5>
+        Var a #0 : int * <6:6>
+      Deref : int <6:10>
+        Var b #1 : int * <6:11>
+  ExprStmt <7:5>
+    Assign : int <7:8>
+      Deref : int <7:5>
+        Var b #1 : int * <7:6>
+      Var t #2 : int <7:10>
+Function void set_through(int **pp, int *target) <10:6>
+  Param #0 int **pp <10:24>
+  Param #1 int *target <10:33>
+  ExprStmt <11:5>
+    Assign : int * <11:9>
+      Deref : int * <11:5>
+        Var pp #0 : int ** <11:6>
+      Var target #1 : int * <11:11>
+Function int main(void) <14:5>
+  Local #0 int x <15:9>
+  Local #1 int y <16:9>
+  Local #2 int *p <18:10>
+  Local #3 int **pp <20:11>
+  Local #4 int *null <24:10>
+  Local #5 int r <25:9>
+  Decl <15:5>
+    Var int x #0 <15:9>
+      Num 3 : int <15:13>
+  Decl <16:5>
+    Var int y #1 <16:9>
+      Num 7 : int <16:13>
+  ExprStmt <17:5>
+    Call swap : void <17:5>
+      Addr : int * <17:10>
+        Var x #0 : int <17:11>
+      Addr : int * <17:14>
+        Var y #1 : int <17:15>
+  Decl <18:5>
+    Var int *p #2 <18:10>
+      Addr : int * <18:14>
+        Var x #0 : int <18:15>
+  ExprStmt <19:5>
+    Assign : int <19:8>
+      Deref : int <19:5>
+        Var p #2 : int * <19:6>
+      Binary * : int <19:13>
+        Deref : int <19:10>
+          Var p #2 : int * <19:11>
+        Num 10 : int <19:15>
+  Decl <20:5>
+    Var int **pp #3 <20:11>
+      Addr : int ** <20:16>
+        Var p #2 : int * <20:17>
+  ExprStmt <21:5>
+    Assign : int <21:10>
+      Deref : int <21:5>
+        Deref : int * <21:6>
+          Var pp #3 : int ** <21:7>
+      Binary + : int <21:17>
+        Deref : int <21:12>
+          Deref : int * <21:13>
+            Var pp #3 : int ** <21:14>
+        Num 1 : int <21:19>
+  ExprStmt <22:5>
+    Call set_through : void <22:5>
+      Var pp #3 : int ** <22:17>
+      Addr : int * <22:21>
+        Var y #1 : int <22:22>
+  ExprStmt <23:5>
+    Assign : int <23:8>
+      Deref : int <23:5>
+        Var p #2 : int * <23:6>
+      Binary + : int <23:13>
+        Deref : int <23:10>
+          Var p #2 : int * <23:11>
+        Num 20 : int <23:15>
+  Decl <24:5>
+    Var int *null #4 <24:10>
+      ImplicitCast : int * <24:17>
+        Num 0 : int <24:17>
+  Decl <25:5>
+    Var int r #5 <25:9>
+      Binary + : int <25:15>
+        Var x #0 : int <25:13>
+        Var y #1 : int <25:17>
+  If <26:5>
+    Binary && : int <26:43>
+      Binary && : int <26:30>
+        Binary && : int <26:17>
+          Binary == : int <26:11>
+            Var p #2 : int * <26:9>
+            Addr : int * <26:14>
+              Var y #1 : int <26:15>
+          Binary == : int <26:25>
+            Var null #4 : int * <26:20>
+            Num 0 : int <26:28>
+        Binary != : int <26:35>
+          Var p #2 : int * <26:33>
+          Var null #4 : int * <26:38>
+      Unary ! : int <26:46>
+        Var null #4 : int * <26:47>
+    ExprStmt <27:9>
+      Assign : int <27:11>
+        Var r #5 : int <27:9>
+        Binary - : int <27:15>
+          Var r #5 : int <27:13>
+          Num 1 : int <27:17>
+  Return <28:5>
+    Var r #5 : int <28:12>

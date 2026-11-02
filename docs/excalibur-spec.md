@@ -7,8 +7,8 @@ Status: draft. Base is stock RISC-V, plus the Xcal extensions in section 9.
 ## 1. Overview
 
 - 32-bit, little-endian, load/store architecture.
-- Base: **RV32I** (unprivileged spec 20191213), plus **Zicsr** and **Zifencei**.
-- Planned extensions, in order: **M** (mul/div), **A** (atomics, needed once the kernel has locks), **C** optional and late.
+- Base ISA: **RV32IMA + Zicsr + Zifencei**: RV32I (unprivileged spec 20191213), **M** (multiply/divide) and **A** (atomics: LR/SC and AMOs, section 4.1).
+- Planned extensions: **C** optional and late.
 - Privilege: **M-mode** and **S-mode**, plus **U-mode** for user programs. Follows the RISC-V privileged spec (20211203) subset described below.
 - Goal: a stock RV32I program built with `riscv32i-unknown-none-elf` runs unmodified. Custom features (Excalibur extensions, prefixed `xcal`, e.g. `Xcaldbg`) are additive and never change the meaning of standard encodings.
 
@@ -59,12 +59,50 @@ Immediates are sign-extended from their top bit. B and J immediates are multiple
 | 0100011 STORE | `sb sh sw` |
 | 0010011 OP-IMM | `addi slti sltiu xori ori andi slli srli srai` |
 | 0110011 OP | `add sub sll slt sltu xor srl sra or and` (+ M: `mul mulh mulhsu mulhu div divu rem remu`, funct7=0000001) |
+| 0101111 AMO | A, funct3=010 (word): `lr.w sc.w amoswap.w amoadd.w amoxor.w amoand.w amoor.w amomin.w amomax.w amominu.w amomaxu.w`, each with `.aq`/`.rl`/`.aqrl` (section 4.1) |
 | 0001111 MISC-MEM | `fence`, `fence.tso`, `fence.i` (reserved `fm`/rd/rs1 encodings execute as a plain `fence`; Grail is single-hart, so all are no-ops) |
 | 1110011 SYSTEM | `ecall ebreak mret sret wfi sfence.vma csrrw csrrs csrrc csrrwi csrrsi csrrci` |
 | 0001011 custom-0 | Xcal: `xcal.dbg`, `xcal.halt` (section 9) |
 | 0101011 custom-1 | reserved for future Xcal extensions |
 
 Misaligned loads/stores trap (address-misaligned exception) rather than being emulated. This keeps the emulator simple and is spec-legal. Consequence: riscv-tests `rv32ui-p-ma_data`, which assumes hardware misaligned support, is excluded.
+
+### 4.1 A extension (atomics)
+
+All A instructions are R-type on the AMO opcode with funct3 = 010 (32-bit word; the `.d` forms are RV64 only). funct7 is split: funct5 in bits [31:27] selects the instruction, bit 26 is `aq` and bit 25 is `rl`:
+
+```
+funct5[31:27] aq[26] rl[25] rs2[24:20] rs1[19:15] 010 rd[11:7] 0101111
+```
+
+| funct5 | Instruction | Effect (`M` = the word at address rs1) |
+|---|---|---|
+| 00010 | `lr.w rd, (rs1)` | rd = M; reserve M. rs2 must be 0 (else reserved: illegal instruction) |
+| 00011 | `sc.w rd, rs2, (rs1)` | if M is reserved: M = rs2, rd = 0; else rd = 1. The reservation is gone either way |
+| 00001 | `amoswap.w rd, rs2, (rs1)` | rd = M; M = rs2 |
+| 00000 | `amoadd.w` | rd = M; M = M + rs2 |
+| 00100 | `amoxor.w` | rd = M; M = M ^ rs2 |
+| 01100 | `amoand.w` | rd = M; M = M & rs2 |
+| 01000 | `amoor.w` | rd = M; M = M \| rs2 |
+| 10000 / 10100 | `amomin.w` / `amomax.w` | rd = M; M = signed min / max(M, rs2) |
+| 11000 / 11100 | `amominu.w` / `amomaxu.w` | rd = M; M = unsigned min / max(M, rs2) |
+
+Other funct5 values (`amocas.w` of Zacas, ...) are reserved and raise illegal-instruction. Assembly writes the ordering bits as a suffix: none, `.aq`, `.rl` or `.aqrl` (`amoadd.w.aqrl`). The address is written `(rs1)`, or `0(rs1)`; there is no offset field. Grail runs one hart, one instruction at a time, so an AMO is atomic by construction and `aq`/`rl` change nothing; they are still encoded, decoded and disassembled.
+
+Addresses (checked in this order):
+
+- **Alignment**: the address must be 4-byte aligned. A misaligned `lr.w` raises load address misaligned (4); a misaligned `sc.w` (even one that would fail) or AMO raises store/AMO address misaligned (6). `xtval` = the address.
+- **Translation** (Sv32): `lr.w` is checked and sets A like a load (load page fault, 13); `sc.w` and the AMOs like a store: the page must be writable, A and D are set, and a fault is a store/AMO page fault (15).
+- **Memory only**: atomics work on RAM and VRAM. On any other physical address (device registers, the boot ROM, unmapped space) `lr.w` raises a load access fault (5), `sc.w` and the AMOs a store/AMO access fault (7). Device registers are not read or written.
+
+**Reservations.** Each hart has one reservation set: the naturally aligned word `lr.w` read, by physical address (so two virtual mappings of a word share it). A new `lr.w` replaces it. `sc.w` succeeds only if the hart holds a reservation on the word it writes. A `sc.w` with no reservation at all fails without accessing memory: no translation, no page fault, no A/D update (it still traps if misaligned). With a reservation, the address is translated and checked first (faults as above, A/D set), then compared. The reservation is lost when:
+
+- the hart executes any `sc.w`;
+- the hart takes a trap (exception or interrupt);
+- any write touches a byte of the reserved word: a store, an AMO, a successful `sc.w`, or a hardware A/D update of a PTE (so an LR/SC update of a PTE cannot overwrite a bit the page walker just set). On a multi-hart machine this includes writes by other harts;
+- the hart stores to a device register: the store may start a DMA (the block device's, section 9.6) that writes RAM without a hart storing there.
+
+The constrained LR/SC loop (an `lr.w`, a few ALU instructions and a `sc.w` to the same word) always succeeds on Grail unless an interrupt arrives in between, in which case the loop retries.
 
 ## 5. Privilege and CSRs
 
@@ -75,7 +113,7 @@ Minimum CSR set:
 | CSR | Addr | Notes |
 |---|---|---|
 | mstatus | 0x300 | MIE, MPIE, MPP, SIE, SPIE, SPP, SUM, MXR |
-| misa | 0x301 | RV32, I, M, S, U, X (read-only) |
+| misa | 0x301 | RV32, A, I, M, S, U, X: 0x4094_1101 (read-only) |
 | medeleg / mideleg | 0x302 / 0x303 | delegate traps to S-mode (section 6, "Delegation") |
 | mie / mip | 0x304 / 0x344 | MSIE/MTIE/MEIE, SSIE/STIE/SEIE |
 | mtvec | 0x305 | direct mode required, vectored optional |
@@ -101,7 +139,7 @@ On a trap taken into mode X (M, or S if delegated and current mode is not M):
 
 `mret`/`sret` reverse this.
 
-Exception causes implemented: 0 instr misaligned, 1 instr access fault, 2 illegal instruction, 3 breakpoint, 4 load misaligned, 5 load access fault, 6 store misaligned, 7 store access fault, 8 ecall from U, 9 ecall from S, 11 ecall from M, 12/13/15 page faults (with Sv32).
+Exception causes implemented: 0 instr misaligned, 1 instr access fault, 2 illegal instruction, 3 breakpoint, 4 load misaligned, 5 load access fault, 6 store/AMO misaligned, 7 store/AMO access fault, 8 ecall from U, 9 ecall from S, 11 ecall from M, 12/13/15 instruction/load/store-AMO page faults (with Sv32).
 
 Interrupt causes: 1 SSI, 3 MSI, 5 STI, 7 MTI, 9 SEI, 11 MEI.
 
@@ -179,7 +217,7 @@ Typical handler: claim, service the device until it lowers its line (for the UAR
 
 ## 8. Emulator conformance
 
-- Pass `riscv-tests` rv32ui-p-*, rv32mi-p-*, rv32si-p-* (and rv32um-p-* once M is in). Tests are loaded as ELF and report via the test device (or `tohost` symbol).
+- Pass `riscv-tests` rv32ui-p-*, rv32um-p-*, rv32ua-p-*, rv32mi-p-* and rv32si-p-* (all but `rv32ui-p-ma_data`, section 4). Tests are loaded as ELF and report via the test device (or `tohost` symbol).
 - Prebuilt test ELFs are committed to the repo so no cross toolchain is needed on Windows.
 
 ## 9. Excalibur extensions (Xcal)
@@ -395,31 +433,38 @@ Everything that runs on the host is written by us, with no third-party libraries
 | Linker (`merlin-ld`) | `.o` files → executable | Symbol resolution, relocation, section merging, simple linker script (or fixed layout: `.text` at 0x8000_0000) |
 | Emulator (`grail`) | executable → runs it | Loads ELF directly, no boot loader needed early on |
 | Disassembler (`merlin-objdump`) | `.o`/exe → text | Shares the decoder with the emulator; essential for debugging |
-| Compiler (`merlin`) | C subset → `.s` | Emits assembly for our assembler. Starts small (int, pointers, structs, functions), grows toward enough C for the kernel |
+| Compiler (`merlin`) | C subset → `.s` | Emits assembly for our assembler. Integer types, pointers, arrays, globals and strings so far; grows toward enough C for the kernel (see "Merlin C subset") |
 
 ### Merlin C subset
 
 `merlin input.c -o output.s` compiles one translation unit; `--dump-ast` prints the checked syntax tree instead. Errors are reported as `file.c:line:col: error: message` (columns count characters from 1); lexing and parsing stop at the first error, name resolution reports all of them.
 
-**v0** (a strict subset of C99: a v0 program whose behavior C defines means the same thing to clang; anything outside the subset is an error, never a different meaning):
+The language is a strict subset of C99: a program whose behavior C defines means the same thing to clang (`--target=riscv32`, `-std=c99`); anything outside the subset is an error, never a different meaning. It grows toward what the kernel needs (tracking issue #15). v0 was `int` only; the current subset adds the integer types, pointers, arrays, globals and strings:
 
-- Types: `int` only (32-bit two's complement). No globals, pointers, arrays or structs yet; no preprocessor.
-- Functions: `int f(int a, ...)` with at most 8 parameters, passed in `a0-a7` (ILP32 calling convention, result in `a0`). `int f(void)` and `int f()` both mean no parameters. Prototypes (`int f(int a);`) declare functions defined later or in another file.
+- **Types**: `char`, `signed char`, `unsigned char`, `short`, `unsigned short`, `int`, `unsigned` (`unsigned int`), `long`, `unsigned long` (specifiers in any order, `signed`/`short int`/`long int` spellings included), `void` as a function result and behind pointers, pointers to any of these, and arrays of them (any number of dimensions). Sizes are ILP32: `char` 1, `short` 2, `int`/`long`/pointers 4, each aligned to its size. Plain `char` is **unsigned**, as on every RISC-V target. `long long`, `_Bool`, floating point, `struct`/`union`/`enum`, `typedef`, `const`/`volatile` and function pointers are errors for now ("... is not supported yet").
+- **Declarations**: one specifier list, then declarators made of `*`s, a name and `[N]`s, with an optional initializer (`int a = 1, *p = &a, v[4];`). Array sizes are integer constant expressions made of literals, operators, casts and `sizeof(type)` (`sizeof expr` in an array size is an error for now); `int a[] = {...}` and `char s[] = "..."` take their size from the initializer, unless an earlier declaration gave one (`int a[3]; int a[] = {1};` is an `int[3]`). A name is in scope inside its own initializer, as in C, for globals and `static` locals too (`static void *head[2] = {head, head};`). Parenthesized declarators are errors.
+- **Functions**: `T f(T1 a, ...)` with at most 8 parameters, passed in `a0-a7` (ILP32 calling convention, result in `a0`); `void` functions and `return;`. `f(void)` and `f()` both mean no parameters. Array parameters are pointers (`int m[3][3]` is `int (*m)[3]`). Prototypes may leave parameter names out; definitions may not. Arguments are converted to the parameter types as by assignment. `static` functions get no `.globl`.
+- **Globals**: file-scope variables, `static` or not, and `extern` declarations; repeated declarations must agree on the type, and a tentative definition (`int x;`) counts once. Initializers must be constant: integer constant expressions, `0` for a null pointer, the address of a global or of an element of one (`&table[2]`, `table + 4`), a string literal, or a brace list of those, with each inner array in its own braces (or a string literal, for a `char` array): C's brace elision (`int m[2][2] = {1, 2, 3, 4};`) is an error for now. Missing elements are zero. A variable with an initializer goes to `.data`, one without to `.bss` (zero, as C requires). A `static` local is a global too, named `func.name` (`func.name.1` for a second one with the same name), initialized once before the program starts.
+- **Literals**: decimal, hex (`0x`) and octal (`0`) integers with `u`/`l` suffixes, typed by C's rules for the types merlin has: a decimal literal is `int` or `long`, a hex or octal one may also be `unsigned int`/`unsigned long` (`0xffffffff` is `unsigned int`), and a literal that would need `long long` (`2147483648`, `4294967296u`) is an error (write `INT_MIN` as `-2147483647 - 1`). Character constants (`'a'`, type `int`) and string literals (`char[N]`, in `.rodata`, adjacent ones joined) with the escapes `\n \t \r \0 \\ \' \" \a \b \f \v \?`, octal `\ooo` and hex `\xhh`. String literals are read-only: storing into one is undefined. Trigraphs (`??=`, `??/`...) and line splices (a backslash at the end of a line), which C rewrites before reading tokens, are errors wherever they would change the meaning (in a `//` comment, a splice would continue the comment); write `\?` for a `?` that would start a trigraph.
+- **Statements**: blocks, declarations (anywhere in a block, and in a `for` initializer), expression statements, `if`/`else`, `while`, `do`/`while`, `for`, `return`, `break`, `continue`.
+- **Expressions**: every C operator except `.`, `->` and function calls through pointers: `= += -= *= /= %= <<= >>= &= ^= |=`, `?:`, `,`, `|| &&`, `| ^ &`, `== != < <= > >=`, `<< >>`, `+ - * / %`, unary `- + ! ~ & * ++ --` (prefix and postfix), casts, `sizeof` (of a type or an expression, which is not evaluated; its result is `unsigned int`, C's `size_t`), indexing (`a[i]` is `*(a + i)`, so `i[a]` works too) and calls. Operators C lexes as one token that merlin lacks (`->`, `...`) are rejected rather than split.
+- **Conversions**: integer promotion and the usual arithmetic conversions as in C (an `unsigned int` operand makes the operation unsigned; `long` and `int` are both 32 bits, so `long` with `unsigned int` is `unsigned long`). Arrays decay to pointers. Pointer arithmetic counts in elements, and the difference of two pointers is an `int`. Implicit conversions between integers and pointers (other than a null pointer constant) and between different pointer types (other than to and from `void *`) are errors where clang only warns; casts allow them. Converting an out-of-range value to a signed type keeps the low bytes, as clang does.
 - Names must be declared before use, as in C99: a call to a function not yet declared is an error (no implicit declarations), and so is a wrong argument count. Block scoping follows C: inner blocks and `for` initializers may shadow outer names; parameters share the scope of the function body's outermost block.
-- Statements: blocks, `int` declarations with optional initializers (`int a = 1, b;`), expression statements, `if`/`else`, `while`, `for`, `return expr`, `break`, `continue`.
-- Expressions, loosest first: `=` (right-associative, value is the assigned value), `||`, `&&`, `== !=`, `< <= > >=`, `+ -`, `* / %`, unary `- !`, then literals, variables, calls and parentheses. Literals are decimal, hex (`0x`) or octal (`0`), up to `2147483647` (`0x7FFFFFFF`): larger ones would be `unsigned int` or `long long` in C, so they are rejected until those types exist (write `INT_MIN` as `-2147483647 - 1`). Operators C lexes as one token, such as `++ -- += -> <<`, are rejected rather than split, so `--x` is never read as `-(-x)`.
-- Statements and expressions nest at most 256 levels deep (each nested statement, `=`, unary operator, parenthesis, call argument or chained binary operator is a level); deeper input is an error.
-- Where C leaves behavior undefined, merlin defines it the way the hardware does: arithmetic wraps, `/` and `%` round toward zero (`div`/`rem`, so `INT_MIN / -1` wraps and division by zero gives RISC-V's results), and falling off the end of a function returns 0. Argument evaluation order is unspecified; tests must not depend on it.
+- Statements and expressions nest at most 256 levels deep (each nested statement, `=`, unary operator, parenthesis, call argument or chained binary operator is a level); deeper input is an error. So is a declarator with more than 256 `*`s or 256 array dimensions, and a function whose locals need a frame over 2 GiB.
+- Where C leaves behavior undefined, merlin defines it the way the hardware does: signed arithmetic wraps, `/` and `%` round toward zero (`div`/`rem`, so `INT_MIN / -1` wraps and division by zero gives RISC-V's results), a shift uses the low 5 bits of its amount (`sll`/`srl`/`sra`), and falling off the end of a non-`void` function returns 0. Argument evaluation order is unspecified; tests must not depend on it.
+- There is no inline `asm()`, on purpose: code that needs particular instructions (CSRs, `sfence.vma`, Xcal) lives in `.s` files and is called like any function, which the kernel already does. No preprocessor yet.
 
-Code generation (`crates/merlin/src/codegen.rs`, whose module docs walk through it) is a stack machine: every expression leaves its value in `a0`, operands waiting for the other side are pushed on the stack, every local lives in memory. The output is plain merlin-as source (`.text`, `.globl f`, `f:`, local labels `.L.<what>.<n>`) that clang assembles to the same code. Functions follow the ILP32 convention:
+Still to come, in the order the kernel needs them (issue #15): `struct`/`union` (with the ILP32 layout and by-value passing), `typedef`, `enum`, `const`/`volatile`, `switch`, `goto`, function pointers, a preprocessor (`#include`, `#define`, `#if`), `__builtin_va_*` for `kprintf`, `inline`, and `_Bool`; then building the kernel with merlin.
 
-- Frame: `s0` is the frame pointer, equal to `sp` on entry. `ra` is saved at `-4(s0)`, the caller's `s0` at `-8(s0)`, and local `#i` (parameters first, as numbered by `--dump-ast`) at `-(12 + 4*i)(s0)`. The frame is `8 + 4*locals` bytes rounded up to 16; prologue and epilogue use `t0` for frames or offsets beyond a 12-bit immediate.
-- Parameters arrive in `a0-a7` and are stored to their slots in the prologue; the result returns in `a0`. Arguments are evaluated left to right (C leaves the order unspecified) before any argument register is loaded, and `sp` is padded to a multiple of 16 around a `call` made while temporaries are pushed.
-- A local declared without an initializer is not cleared (C: indeterminate).
-- A function may not be named like a register (`sp`, `a0`, `x5`, `fp`...), since merlin-as never reads those as symbols: it is a compile error. Names of instructions, pseudo-instructions or CSRs (`add`, `call`, `mstatus`) are fine.
+Code generation (`crates/merlin/src/codegen.rs`, whose module docs walk through it) is a stack machine: every expression leaves its value in `a0`, operands waiting for the other side are pushed on the stack, every variable lives in memory. The output is plain merlin-as source (`.text`/`.data`/`.bss`/`.section .rodata`, `.globl f`, `f:`, local labels `.L.<what>.<n>`, string literals `.L.str.<n>`) that clang assembles to the same bytes and relocations in every section. Values in registers are 32 bits: `char` and `short` are widened when loaded (`lbu`/`lb`, `lhu`/`lh`) and narrowed when stored (`sb`, `sh`); unsigned operations use `divu`, `remu`, `sltu` and `srl`. Functions follow the ILP32 convention:
+
+- Frame: `s0` is the frame pointer, equal to `sp` on entry. `ra` is saved at `-4(s0)`, the caller's `s0` at `-8(s0)`, then the locals (parameters first, as numbered by `--dump-ast`) downward from there, each at the next offset aligned to its type (arrays to at least 4), so with only `int`s local `#i` is at `-(12 + 4*i)(s0)`. The frame is rounded up to 16 bytes; a comment above each function lists every local's offset. Prologue and epilogue use `t0` for frames or offsets beyond a 12-bit immediate.
+- Parameters arrive in `a0-a7`, widened by their type, and are stored to their slots in the prologue; the result returns in `a0`. Arguments are evaluated left to right (C leaves the order unspecified) before any argument register is loaded, and `sp` is padded to a multiple of 16 around a `call` made while temporaries are pushed.
+- A local declared without an initializer is not cleared (C: indeterminate). A local array with an initializer is cleared first (word stores, or a loop for more than 16 words), then its elements are stored.
+- A function or global may not be named like a register (`sp`, `a0`, `x5`, `fp`...), since merlin-as never reads those as symbols: it is a compile error. Names of instructions, pseudo-instructions or CSRs (`add`, `call`, `mstatus`) are fine.
 - merlin-as does not relax branches, so codegen does: before printing a function it estimates every instruction's address (pseudo-instructions at their largest) and writes a conditional branch that may not reach its label (±4 KiB) as the opposite branch over a `j` (±1 MiB).
 
-Test programs live in `crates/merlin/tests/cases/*.c`, each starting with `// expect: N` (the exit code); the ones in `crates/merlin/tests/cases-merlin/` rely on the definitions above for what C leaves undefined, so they are not checked against clang. The harness links them with a small `crt0.s` (set `sp` to the top of RAM, `call main`, `xcal.halt a0`) and runs them in Grail, so the exit code is the low 8 bits of `main`'s return value.
+Test programs live in `crates/merlin/tests/cases/*.c`, each starting with `// expect: N` (the exit code); the ones in `crates/merlin/tests/cases-merlin/` rely on the definitions above for what C leaves undefined, so they are not checked against clang. The harness links them with a small `crt0.s` (set `sp` to the top of RAM, `call main`, `xcal.halt a0`; plus a `memset`, which clang calls to clear large local arrays) and runs them in Grail, so the exit code is the low 8 bits of `main`'s return value. A reference interpreter in the harness (`tests/common/interp.rs`, byte-addressed memory with every object bounds-checked) runs the checked syntax tree too, and must agree.
 
 ### Object and executable format
 
@@ -435,16 +480,16 @@ All reading goes through one crate, `elf32` (header, program headers, sections, 
 
 ### Assembler (`merlin-as`)
 
-`merlin-as [-o out.o] input.s`. The reference is clang's integrated assembler with `-march=rv32im_zicsr_zifencei -mno-relax`: for the same source, `llvm-objdump -dr` must print the same text for both objects (checked for every source in `examples/`, which clang assembles with `-include examples/xcal.inc`), and every encoding matches llvm-mc (`crates/merlin-as/tests/golden/encode.golden`). The encoder, the pseudo-instruction expansions and `li`'s choice of sequence are documented in `crates/merlin-as/ENCODER.md`.
+`merlin-as [-o out.o] input.s`. The reference is clang's integrated assembler with `-march=rv32ima_zicsr_zifencei -mno-relax` (the examples use no A instructions and are compared with `rv32im_zicsr_zifencei` builds): for the same source, `llvm-objdump -dr` must print the same text for both objects (checked for every source in `examples/`, which clang assembles with `-include examples/xcal.inc`), and every encoding matches LLVM's (`crates/merlin-as/tests/golden/encode.golden`). The encoder, the pseudo-instruction expansions and `li`'s choice of sequence are documented in `crates/merlin-as/ENCODER.md`.
 
 - **Single pass.** No instruction's size depends on a label's address; `.equ`/`.set` constants must be defined before use. Every label reference is first recorded as a fixup with its immediate left zero.
 - **Local labels are resolved by the assembler**, as clang does with `-mno-relax`. When the file has been read, a pc-relative reference to a label that is local (not `.globl`, also when `.globl` comes later in the file) and defined in the same section is patched in and gets no relocation: branches, `jal`/`j`, `call`/`tail` (both words), and `auipc` + `%pcrel_lo` pairs (`la`, `lla`, `lw rd, sym`, `sw rs, sym, rt`, explicit `%pcrel_hi`/`%pcrel_lo`). A branch or jump out of range is an error on its line. Everything else stays a relocation for the linker: references to global or undefined symbols, to labels in other sections, and absolute ones (`%hi`, `%lo`, `.word sym`).
 - **`.`** is the location counter: the address of the instruction (its first word, for a pseudo-instruction) or data word it appears in. Each use becomes a hidden local label there, so `j .`, `beq a0, a1, .-8` and `la a0, .` resolve like any local label, and `.word .` gets an `R_RISCV_32` against that label (clang's `.L0`).
 - **Symbols**: `.L` labels (numeric labels like `1:`, hidden `.Lpcrel_hiN` labels on `auipc`s, `.Ldot$N` labels for `.`) are written to `.symtab` only when a relocation refers to them, as in clang.
 - **`.insn`** spells out an instruction by fields, with LLVM's forms and encodings: `.insn r opcode, funct3, funct7, rd, rs1, rs2`, `.insn i opcode, funct3, rd, rs1, imm` (or `rd, imm(rs1)`), `.insn s opcode, funct3, rs2, imm(rs1)`, `.insn b opcode, funct3, rs1, rs2, target`, `.insn u opcode, rd, imm20`, and `.insn value` / `.insn 4, value`. Opcodes must be 32-bit ones (low bits `11`). The examples write the Xcal instructions as mnemonics (`xcal.dbg a0`); clang does not know them, so `examples/xcal.inc` defines them as assembler macros that expand to the `.insn` with the same encoding, and clang reference builds pass `-include examples/xcal.inc`.
-- **`.riscv.attributes`**: every object carries clang's `Tag_RISCV_arch` for `rv32im_zicsr_zifencei` (`rv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0`), so llvm-objdump decodes M instructions without `--mattr`.
+- **`.riscv.attributes`**: every object carries clang's `Tag_RISCV_arch` for `rv32ima_zicsr_zifencei` (`rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0`), so llvm-objdump decodes M and A instructions without `--mattr`.
 - **Differences from clang**, on purpose:
-  - No branch relaxation. clang rewrites a conditional branch it cannot resolve or reach (to a global or undefined symbol, another section, or beyond ±4 KiB) into the inverted branch over a `jal`, even with `-mno-relax`; merlin-as keeps one instruction with `R_RISCV_BRANCH`, or reports the branch out of range. (llvm-mc's `-riscv-asm-relax-branches=0` behaves like merlin-as; the golden encodings are made with it.)
+  - No branch relaxation. clang rewrites a conditional branch it cannot resolve or reach (to a global or undefined symbol, another section, or beyond ±4 KiB) into the inverted branch over a `jal`, even with `-mno-relax`; merlin-as keeps one instruction with `R_RISCV_BRANCH`, or reports the branch out of range. (llvm-mc 18's `-riscv-asm-relax-branches=0` behaves like merlin-as, and made the golden lines for such branches; LLVM 21 no longer has the option, so `scripts/gen-encode-golden.sh` keeps those lines and assembles the rest with clang.)
   - A numeric label that a relocation refers to is named `.L<n>$<k>` (the k-th definition of `n:`); clang names it `.Ltmp<m>`. No `$x`/`$d` mapping symbols are written.
   - `.insn j` is not accepted: LLVM 21 packs its numeric offset without the J-type bit scrambling.
   - Register names are never symbols: `lw a0, a1` is an error, where LLVM reads `a1` as a symbol.
@@ -715,7 +760,7 @@ On a 64 KiB read-write disk that is 16 checks (14 when it is read-only). `crates
 4. **merlin-as** emitting ELF `.o`. Validate with `llvm-objdump` and ld.lld.
 5. **merlin-ld**. Validate against clang-produced objects.
 6. **Bare-metal hello world** written in our assembly, built entirely with our tools.
-7. **M extension** in merlin-as (Grail already passes rv32um). **Xcal devices** in Grail: framebuffer window, keyboard and pointer via Win32 FFI, sysinfo, block devices with pluggable backends, and a configurable machine (RAM size, real-time clock, disks) that a host can run several of.
-8. **Merlin v0**: C subset → assembly. Grow it test by test.
+7. **M extension** in merlin-as (Grail already passes rv32um), then the **A extension** (LR/SC and AMOs, section 4.1) in Grail and the toolchain. **Xcal devices** in Grail: framebuffer window, keyboard and pointer via Win32 FFI, sysinfo, block devices with pluggable backends, and a configurable machine (RAM size, real-time clock, disks) that a host can run several of.
+8. **Merlin v0**: C subset → assembly. Grow it test by test (integer types, pointers, arrays, globals and strings done; structs, preprocessor and the rest tracked in #15).
 9. **Camelot kernel** in C (clang first, our compiler as it catches up): trap handling, timer, UART driver, then paging (Sv32), processes, a disk driver and buffer cache, syscalls.
 10. **Self-hosting stretch goal**: our tools running on our OS.

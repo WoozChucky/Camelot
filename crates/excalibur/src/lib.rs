@@ -17,8 +17,8 @@ pub use decode::decode;
 /// Major opcodes, bits [6:0] of every instruction (spec section 4).
 pub mod opcode {
     pub use crate::decode::{
-        OP_AUIPC, OP_BRANCH, OP_CUSTOM0, OP_IMM, OP_JAL, OP_JALR, OP_LOAD, OP_LUI, OP_MISC_MEM, OP_OP,
-        OP_STORE, OP_SYSTEM,
+        OP_AMO, OP_AUIPC, OP_BRANCH, OP_CUSTOM0, OP_IMM, OP_JAL, OP_JALR, OP_LOAD, OP_LUI, OP_MISC_MEM,
+        OP_OP, OP_STORE, OP_SYSTEM,
     };
 }
 pub use disasm::{Disasm, Syntax};
@@ -101,6 +101,64 @@ pub enum MulOp {
     Remu,
 }
 
+/// A extension read-modify-write operations (`amo<op>.w`): memory gets
+/// `op(old, rs2)` and rd gets the old value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AmoOp {
+    Swap,
+    Add,
+    Xor,
+    And,
+    Or,
+    /// Signed minimum.
+    Min,
+    /// Signed maximum.
+    Max,
+    Minu,
+    Maxu,
+}
+
+impl AmoOp {
+    /// Every operation.
+    pub const ALL: [AmoOp; 9] = [
+        AmoOp::Swap,
+        AmoOp::Add,
+        AmoOp::Xor,
+        AmoOp::And,
+        AmoOp::Or,
+        AmoOp::Min,
+        AmoOp::Max,
+        AmoOp::Minu,
+        AmoOp::Maxu,
+    ];
+}
+
+/// Memory-ordering bits of an A instruction (bits 26 and 25). Grail is a
+/// single in-order hart, so they do not change what an instruction does; they
+/// only change its encoding and its `.aq`/`.rl`/`.aqrl` mnemonic suffix.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ordering {
+    /// Acquire: no later memory access is seen before this one.
+    pub aq: bool,
+    /// Release: no earlier memory access is seen after this one.
+    pub rl: bool,
+}
+
+impl Ordering {
+    /// Neither bit set.
+    pub const NONE: Ordering = Ordering { aq: false, rl: false };
+
+    /// The mnemonic suffix: `""`, `".aq"`, `".rl"` or `".aqrl"`.
+    pub fn suffix(self) -> &'static str {
+        match (self.aq, self.rl) {
+            (false, false) => "",
+            (true, false) => ".aq",
+            (false, true) => ".rl",
+            (true, true) => ".aqrl",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CsrOp {
     /// Read and write.
@@ -176,6 +234,29 @@ pub enum Inst {
         rd: Reg,
         rs1: Reg,
         rs2: Reg,
+    },
+    /// `lr.w rd, (rs1)`: load-reserved word. The encoding's rs2 field must
+    /// be 0; anything else decodes as [`Inst::Illegal`].
+    Lr {
+        rd: Reg,
+        rs1: Reg,
+        order: Ordering,
+    },
+    /// `sc.w rd, rs2, (rs1)`: store-conditional word. rd = 0 on success,
+    /// 1 on failure.
+    Sc {
+        rd: Reg,
+        rs1: Reg,
+        rs2: Reg,
+        order: Ordering,
+    },
+    /// `amo<op>.w rd, rs2, (rs1)`: atomic memory operation on a word.
+    Amo {
+        op: AmoOp,
+        rd: Reg,
+        rs1: Reg,
+        rs2: Reg,
+        order: Ordering,
     },
     /// `pred`/`succ` are the 4-bit I/O/R/W sets (bit 3 = I ... bit 0 = W).
     /// Reserved encodings (non-zero rd/rs1, unknown `fm`) decode as a plain

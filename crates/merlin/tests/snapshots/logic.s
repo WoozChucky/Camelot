@@ -1,7 +1,7 @@
     .text
 
-    # int bump(v): frame 16 bytes
-    #     -12(s0)  param v
+    # int bump(int v): frame 16 bytes
+    #     -12(s0)  param int v
     .globl bump
 bump:
     addi  sp, sp, -16
@@ -23,9 +23,9 @@ bump:
     addi  sp, sp, 16
     ret
 
-    # int main(): frame 16 bytes
-    #     -12(s0)  local hits
-    #     -16(s0)  local r
+    # int main(void): frame 16 bytes
+    #     -12(s0)  local int hits
+    #     -16(s0)  local int r
     .globl main
 main:
     addi  sp, sp, -16

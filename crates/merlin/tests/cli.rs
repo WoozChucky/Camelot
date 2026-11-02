@@ -127,25 +127,25 @@ fn dump_ast_reads_like_the_source() {
     assert_eq!(
         text,
         "\
-Prototype add(a, b) <1:5>
-Function main() <2:5>
-  Local #0 x <3:9>
+Prototype int add(int a, int b) <1:5>
+Function int main(void) <2:5>
+  Local #0 int x <3:9>
   Decl <3:5>
-    Var x #0 <3:9>
-      Num 1 <3:13>
+    Var int x #0 <3:9>
+      Num 1 : int <3:13>
   For <4:5>
     NoInit <4:5>
     NoCond <4:5>
     NoStep <4:5>
     Break <4:14>
   Return <5:5>
-    Binary || <5:23>
-      Call add <5:12>
-        Var x #0 <5:16>
-        Unary - <5:19>
-          Num 2 <5:20>
-      Unary ! <5:26>
-        Var x #0 <5:27>
+    Binary || : int <5:23>
+      Call add : int <5:12>
+        Var x #0 : int <5:16>
+        Unary - : int <5:19>
+          Num 2 : int <5:20>
+      Unary ! : int <5:26>
+        Var x #0 : int <5:27>
 "
     );
 }
@@ -257,7 +257,7 @@ fn codegen_errors_use_file_line_col_format() {
     let file = t.file.display().to_string();
     assert_eq!(
         stderr(&out),
-        format!("{file}:2:5: error: 'ra' is a register name, which cannot be used as a function name\n")
+        format!("{file}:2:5: error: 'ra' is a register name, which cannot be used as a symbol name\n")
     );
     assert!(!t.dir.join("reg.s").exists(), "no output on error");
 }

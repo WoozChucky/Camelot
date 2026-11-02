@@ -1,5 +1,5 @@
 # One instruction per line. scripts/gen-encode-golden.sh assembles each line
-# with llvm-mc and writes the expected words and relocations to encode.golden.
+# with clang and writes the expected words and relocations to encode.golden.
 
 # --- RV32I: upper immediates and jumps
 lui a0, 0x12345
@@ -62,6 +62,57 @@ div a0, a1, a2
 divu a0, a1, a2
 rem a0, a1, a2
 remu a0, a1, a2
+
+# --- A extension: every mnemonic with every ordering suffix
+lr.w a0, (a1)
+lr.w.aq t0, (s1)
+lr.w.rl s1, (t6)
+lr.w.aqrl a5, (sp)
+sc.w a0, a1, (a2)
+sc.w.aq t0, t1, (t2)
+sc.w.rl s1, s2, (s3)
+sc.w.aqrl a5, a6, (a7)
+amoswap.w a0, a1, (a2)
+amoswap.w.aq t3, t4, (t5)
+amoswap.w.rl ra, sp, (gp)
+amoswap.w.aqrl s10, s11, (tp)
+amoadd.w a0, a1, (a2)
+amoadd.w.aq a3, a4, (a5)
+amoadd.w.rl t0, t1, (t2)
+amoadd.w.aqrl s0, s1, (s2)
+amoxor.w a0, a1, (a2)
+amoxor.w.aq s3, s4, (s5)
+amoxor.w.rl s6, s7, (s8)
+amoxor.w.aqrl s9, t3, (t6)
+amoand.w a0, a1, (a2)
+amoand.w.aq a6, a7, (ra)
+amoand.w.rl t0, a0, (sp)
+amoand.w.aqrl t1, a1, (gp)
+amoor.w a0, a1, (a2)
+amoor.w.aq t2, a2, (tp)
+amoor.w.rl s0, a3, (t0)
+amoor.w.aqrl s1, a4, (t1)
+amomin.w a0, a1, (a2)
+amomin.w.aq a5, s2, (t2)
+amomin.w.rl a6, s3, (s0)
+amomin.w.aqrl a7, s4, (s1)
+amomax.w a0, a1, (a2)
+amomax.w.aq s5, t3, (a0)
+amomax.w.rl s6, t4, (a1)
+amomax.w.aqrl s7, t5, (a2)
+amominu.w a0, a1, (a2)
+amominu.w.aq s8, t6, (a3)
+amominu.w.rl s9, ra, (a4)
+amominu.w.aqrl s10, sp, (a5)
+amomaxu.w a0, a1, (a2)
+amomaxu.w.aq s11, gp, (a6)
+amomaxu.w.rl t3, tp, (a7)
+amomaxu.w.aqrl t4, t0, (s2)
+# rd = zero, x-register names, and the optional 0 offset
+lr.w zero, 0(x31)
+sc.w x0, x31, 0(a0)
+amoadd.w zero, a1, 0(a2)
+amoswap.w.aqrl x31, x0, (x0)
 
 # --- system
 fence
