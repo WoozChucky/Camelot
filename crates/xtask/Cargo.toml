@@ -9,3 +9,6 @@ publish = false
 [dependencies]
 grail = { path = "../grail" }
 merlin-as = { path = "../merlin-as" }
+
+[dev-dependencies]
+excalibur = { path = "../excalibur" }
