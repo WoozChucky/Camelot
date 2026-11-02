@@ -37,13 +37,44 @@ Two more suites follow the same rules (unimplemented lines are counted, not
 failed; `-- --ignored` requires everything):
 
 - `encode_roundtrip`: `excalibur::decode` of your words must give back the
-  operation and operands in a hand-written table (covers Xcal, CSRs by name,
-  the `li` hi20/lo12 split), and every golden line must survive
-  decode → disassemble → assemble unchanged.
-- `encode_errors`: out-of-range immediates, bad operands and unknown
-  mnemonics must be rejected on their own source line. Unknown mnemonics
-  currently land in the `UNIMPLEMENTED` arm; the complete run wants a real
-  error there that names the mnemonic.
+  operation and operands in a hand-written table that has every golden
+  mnemonic plus Xcal, CSRs by name, `li` splits and explicit
+  `%pcrel_hi`/`%pcrel_lo` pairs. Each word must carry exactly the relocation
+  the table lists, or none. Every llvm-mc word in the golden file, decoded and
+  printed by the disassembler, must also assemble back to that exact word.
+- `encode_errors`: out-of-range immediates, bad operands, misplaced
+  `%hi`/`%lo`/`%pcrel_*` modifiers and unknown mnemonics must be rejected on
+  their own source line. Unknown mnemonics currently land in the
+  `UNIMPLEMENTED` arm; the complete run wants a real error there that names
+  the mnemonic.
+
+`encode_hello` has a single ignored test that assembles
+`examples/hello/hello.S` and compares `.text.start` with clang
+(`tests/golden/hello.ref`). It needs more than the encoder; see below.
+
+## hello.S (acceptance criteria 3 and 4)
+
+A finished encoder is not enough to assemble `examples/hello/hello.S`:
+
+- **`.insn`.** hello.S writes the two Xcal instructions as
+  `.insn i 0x0b, 0, x0, a0, 0` so that clang can build it. The merlin-as
+  parser rejects that line (`unexpected text at end of line`) before
+  `encode()` is ever called. Writing `xcal.dbg a0` instead fixes merlin-as but
+  breaks the clang build, which is the reference. So either merlin-as learns
+  `.insn i opcode, funct3, rd, rs1, imm` (parser plus an I-type encode), or
+  the clang build stops using hello.S as is. That needs a decision.
+- **Same-section labels.** merlin-as is single pass and turns every label
+  reference into a relocation. clang resolves branches, jumps and `call` to
+  labels in the same section, so `llvm-objdump -d -r` of the two objects
+  differs even with a correct encoder. (With relaxation on, clang also adds
+  `R_RISCV_RELAX` to every relocation.) `encode_hello` compares against
+  clang with `-mno-relax` and accepts the extra relocations, as long as the
+  bits outside the immediate match and the label is where clang's resolved
+  offset points. Resolving same-section fixups in `asm.rs` is the other
+  option.
+
+Running the result in Grail still needs `ld.lld -T examples/hello/link.ld`
+and is checked by hand.
 
 ## Suggested order
 
@@ -61,21 +92,34 @@ failed; `-- --ignored` requires everything):
    `csrr*` forms, and the `csrr csrw csrs csrc csrwi csrsi csrci` aliases.
 7. **Simple pseudo-instructions**: `nop mv not neg seqz snez sltz sgtz j jr ret`,
    the `beqz`-style branches and the swapped ones (`bgt a, b` = `blt b, a`).
-8. **`li`**: 1 word if the value fits in 12 signed bits (`addi`), 1 word if the low
-   12 bits are zero (`lui`), else `lui` + `addi`. Remember `addi` sign-extends,
-   so the upper part is `(v + 0x800) >> 12`.
+8. **`li`**, following LLVM (which the golden file comes from):
+   - fits in 12 signed bits: `addi rd, zero, v`;
+   - low 12 bits zero: `lui`;
+   - `v` is `c << s` with `c` in -32..=31: `addi rd, zero, c` + `slli rd, rd, s`
+     (`li a0, 2048` is `addi a0, zero, 1; slli a0, a0, 11`);
+   - anything else: `lui` + `addi`. Remember `addi` sign-extends, so the upper
+     part is `(v + 0x800) >> 12`.
 9. **Symbols and relocations**: branches/jal to labels (`Branch`, `Jal`),
    `call`/`tail` (auipc + jalr, one `CallPlt` fixup on the auipc), `la`/`lla`
    (auipc `PcrelHi20` + addi `PcrelLo12I` targeting `Target::Auipc(0)`),
-   `%hi`/`%lo` operands (`Hi20`, `Lo12I`, `Lo12S`), and `lw a0, sym` /
-   `sw a0, sym, t0`.
+   `%hi`/`%lo` operands (`Hi20`, `Lo12I`, `Lo12S`), `lw a0, sym` /
+   `sw a0, sym, t0`, and explicit pairs: `1: auipc a0, %pcrel_hi(sym)`
+   (`PcrelHi20`) with `addi a0, a0, %pcrel_lo(1b)` (`PcrelLo12I`, or
+   `PcrelLo12S` in a store), whose target is the label `ctx.symbol` gives for
+   `1b`. The driver checks that the label really is on an auipc with
+   `%pcrel_hi`. Reject a modifier in the wrong place (`addi` with `%hi`, `lui`
+   with `%lo`, `auipc` with `%hi`, any modifier on a branch, jump or shift
+   amount) and a label where only a constant fits (`li a0, sym`).
 10. **Xcal** (not in the golden file because llvm-mc doesn't know them; spec
     section 9): `xcal.dbg rs1` = custom-0 funct3 0, `xcal.halt rs1` = funct3 1.
-    Once these work, `examples/hello/hello.S` can drop its `.insn` lines.
+    For hello.S, see the `.insn` note above.
 
-## Regenerating the golden file
+## Regenerating the golden files
 
 Add lines to `tests/golden/encode.s` and run `scripts/gen-encode-golden.sh`
 (needs llvm-mc, llvm-objcopy and llvm-readelf from any LLVM install, plus bash,
 for example Git Bash on Windows). Addends in the relocation column are hex, as
 llvm-readelf prints them.
+
+`tests/golden/hello.ref` comes from `scripts/gen-hello-ref.sh` (clang and
+llvm-objdump). Rerun it whenever `examples/hello/hello.S` changes.

@@ -61,11 +61,34 @@ const CASES: &[(&str, &str)] = &[
         "sub a0, a1, 5",
         "immediate where a register belongs (sub has no immediate form)",
     ),
+    // Deliberately stricter than LLVM, which reads `a1` here as a symbol named
+    // a1 (`lw rd, symbol`). In merlin-as register names are never symbols.
     ("lw a0, a1", "register where a memory operand or symbol belongs"),
     ("ecall a0", "operand on a no-operand instruction"),
     ("xcal.dbg 5", "xcal.dbg needs a register"),
     ("xcal.halt", "xcal.halt needs a register"),
     ("ret a0", "operand on ret"),
+    // Relocation modifiers in the wrong place, and labels where only a constant
+    // fits: each would otherwise be encoded with the wrong relocation, or none.
+    ("addi a0, a0, %hi(target)", "%hi where a 12-bit field belongs"),
+    ("lw a0, %hi(target)(a1)", "%hi as a load offset"),
+    ("lui a0, %lo(target)", "%lo where a 20-bit field belongs"),
+    ("lui a0, %pcrel_hi(target)", "lui needs %hi, not %pcrel_hi"),
+    ("auipc a0, %hi(target)", "auipc needs %pcrel_hi, not %hi"),
+    (
+        "auipc a0, %pcrel_lo(target)",
+        "%pcrel_lo where a 20-bit field belongs",
+    ),
+    ("beq a0, a1, %lo(target)", "modifier on a branch target"),
+    ("jal ra, %lo(target)", "modifier on a jump target"),
+    ("slli a0, a0, %lo(target)", "a shift amount must be a constant"),
+    ("li a0, target", "li takes a constant (la loads an address)"),
+    // `start:` labels this addi, which is not an auipc with %pcrel_hi
+    // (llvm-mc: "could not find corresponding %pcrel_hi").
+    (
+        "addi a0, a0, %pcrel_lo(start)",
+        "%pcrel_lo label without a %pcrel_hi",
+    ),
     // Unknown mnemonics
     ("frobnicate a0, a1", "unknown mnemonic"),
     ("mulw a0, a1, a2", "RV64-only mnemonic"),

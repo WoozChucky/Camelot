@@ -3,12 +3,16 @@
 //! llvm-mc:
 //!
 //! * `expected`: a hand-written table of source lines and the [`Inst`] values
-//!   `excalibur::decode` must give back for each word. This covers what the
-//!   golden file can't (Xcal, CSRs by name, `li` splits) and spells out the
-//!   operation and operands of every format.
-//! * `disasm`: every golden line, assembled, decoded, printed with the
-//!   disassembler, assembled again: both decodes must agree. Catches swapped
-//!   fields and bit-scrambling mistakes in S/B/J immediates.
+//!   `excalibur::decode` must give back for each word, plus the relocation
+//!   each word carries (`expected_relocs`; every other word must carry none).
+//!   This covers what the golden file can't (Xcal, CSRs by name, `li` splits,
+//!   explicit `%pcrel_hi`/`%pcrel_lo` pairs on user labels) and spells out the
+//!   operation and operands of every mnemonic in the golden file.
+//! * `disasm`: every word llvm-mc produced for the golden file (plus a few
+//!   more from clang), decoded and printed with the disassembler, must
+//!   assemble back to exactly that word. Proves the disassembler's syntax
+//!   reassembles, and catches bits `decode` ignores, like fence's pred/succ.
+//!   Words patched by a relocation are left out: their fields are zero.
 //!
 //! Same progress rules as `encode_golden`: mnemonics that still return
 //! "not implemented yet" are counted, not failed. The `_complete` variants
@@ -19,11 +23,29 @@
 
 use excalibur::{decode, AluOp, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, StoreOp};
 use merlin_as::encode::UNIMPLEMENTED;
+use merlin_as::reloc::RelocKind;
 
-/// One word of `.text` and whether a relocation will patch it.
+/// One word of `.text` and the relocation that will patch it, if any.
 struct Word {
     word: u32,
-    relocated: bool,
+    reloc: Option<Reloc>,
+}
+
+#[derive(Debug, PartialEq)]
+struct Reloc {
+    kind: RelocKind,
+    to: To,
+}
+
+/// What a relocation points at.
+#[derive(Debug, PartialEq)]
+enum To {
+    /// A named symbol plus addend. Numeric labels appear by their internal
+    /// name: `1:` is `.L1$0`, the next `1:` is `.L1$1`.
+    Sym(String, i64),
+    /// A hidden label the assembler put on the auipc at this `.text` offset
+    /// (`Target::Auipc`, for `la`, `lw a0, sym`, ...).
+    Auipc(u32),
 }
 
 enum Assembled {
@@ -41,13 +63,23 @@ fn assemble(src: &str) -> Assembled {
         Err(errs) => return Assembled::Error(errs[0].to_string()),
     };
     let text = &obj.sections[0];
+    let reloc_at = |offset: u32| {
+        let r = text.relocs.iter().find(|r| r.offset == offset)?;
+        let to = if r.symbol.starts_with(".Lpcrel_hi") {
+            let sym = obj.symbols.iter().find(|s| s.name == r.symbol);
+            To::Auipc(sym.map_or(u32::MAX, |s| s.value))
+        } else {
+            To::Sym(r.symbol.clone(), r.addend)
+        };
+        Some(Reloc { kind: r.kind, to })
+    };
     let words = text
         .data
         .chunks(4)
         .enumerate()
         .map(|(i, c)| Word {
             word: u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
-            relocated: text.relocs.iter().any(|r| r.offset == 4 * i as u32),
+            reloc: reloc_at(4 * i as u32),
         })
         .collect();
     Assembled::Words(words)
@@ -115,6 +147,9 @@ fn r(op: AluOp, rd: u8, rs1: u8, rs2: u8) -> Inst {
 }
 fn i(op: AluOp, rd: u8, rs1: u8, imm: i32) -> Inst {
     Inst::OpImm { op, rd, rs1, imm }
+}
+fn m(op: MulOp, rd: u8, rs1: u8, rs2: u8) -> Inst {
+    Inst::Mul { op, rd, rs1, rs2 }
 }
 fn csr(op: CsrOp, rd: u8, src: CsrSrc, csr: u16) -> Inst {
     Inst::Csr { op, rd, src, csr }
@@ -218,8 +253,29 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
                 imm: 0,
             }],
         ),
+        (
+            "lh a0, -1(sp)",
+            vec![Load {
+                op: LoadOp::Lh,
+                rd: A0,
+                rs1: SP,
+                imm: -1,
+            }],
+        ),
+        (
+            "lbu t0, -2048(t1)",
+            vec![Load {
+                op: LoadOp::Lbu,
+                rd: T0,
+                rs1: T1,
+                imm: -2048,
+            }],
+        ),
         ("addi sp, sp, -2048", vec![i(AluOp::Add, SP, SP, -2048)]),
+        ("slti a0, a1, -5", vec![i(AluOp::Slt, A0, A1, -5)]),
         ("sltiu t0, t1, -1", vec![i(AluOp::Sltu, T0, T1, -1)]),
+        ("xori a0, a1, 0x555", vec![i(AluOp::Xor, A0, A1, 0x555)]),
+        ("ori a0, a1, -2048", vec![i(AluOp::Or, A0, A1, -2048)]),
         ("andi a0, a1, 0x7ff", vec![i(AluOp::And, A0, A1, 0x7ff)]),
         ("slli a0, a1, 31", vec![i(AluOp::Sll, A0, A1, 31)]),
         ("srli a0, a1, 0", vec![i(AluOp::Srl, A0, A1, 0)]),
@@ -262,6 +318,24 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
             }],
         ),
         (
+            "bne t0, t1, -8",
+            vec![Branch {
+                op: BranchOp::Bne,
+                rs1: T0,
+                rs2: T1,
+                imm: -8,
+            }],
+        ),
+        (
+            "blt a0, a1, 16",
+            vec![Branch {
+                op: BranchOp::Blt,
+                rs1: A0,
+                rs2: A1,
+                imm: 16,
+            }],
+        ),
+        (
             "bge a2, a3, -4096",
             vec![Branch {
                 op: BranchOp::Bge,
@@ -289,27 +363,24 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
             }],
         ),
         // R and M
+        ("add a0, a1, a2", vec![r(AluOp::Add, A0, A1, A2)]),
         ("sub a0, a1, a2", vec![r(AluOp::Sub, A0, A1, A2)]),
-        ("sra a1, a2, a3", vec![r(AluOp::Sra, A1, A2, A3)]),
+        ("sll t0, t1, t2", vec![r(AluOp::Sll, T0, T1, T2)]),
+        ("slt a0, a1, a2", vec![r(AluOp::Slt, A0, A1, A2)]),
         ("sltu t0, t1, t2", vec![r(AluOp::Sltu, T0, T1, T2)]),
-        (
-            "mulhsu a0, a1, a2",
-            vec![Mul {
-                op: MulOp::Mulhsu,
-                rd: A0,
-                rs1: A1,
-                rs2: A2,
-            }],
-        ),
-        (
-            "remu t0, t1, t2",
-            vec![Mul {
-                op: MulOp::Remu,
-                rd: T0,
-                rs1: T1,
-                rs2: T2,
-            }],
-        ),
+        ("xor a0, a1, a2", vec![r(AluOp::Xor, A0, A1, A2)]),
+        ("srl a1, a2, a3", vec![r(AluOp::Srl, A1, A2, A3)]),
+        ("sra a1, a2, a3", vec![r(AluOp::Sra, A1, A2, A3)]),
+        ("or t5, t6, a0", vec![r(AluOp::Or, T5, T6, A0)]),
+        ("and a0, a1, a2", vec![r(AluOp::And, A0, A1, A2)]),
+        ("mul a0, a1, a2", vec![m(MulOp::Mul, A0, A1, A2)]),
+        ("mulh a0, a1, a2", vec![m(MulOp::Mulh, A0, A1, A2)]),
+        ("mulhsu a0, a1, a2", vec![m(MulOp::Mulhsu, A0, A1, A2)]),
+        ("mulhu t0, t1, t2", vec![m(MulOp::Mulhu, T0, T1, T2)]),
+        ("div a0, a1, a2", vec![m(MulOp::Div, A0, A1, A2)]),
+        ("divu a0, a1, a2", vec![m(MulOp::Divu, A0, A1, A2)]),
+        ("rem s2, s3, a0", vec![m(MulOp::Rem, S2, S3, A0)]),
+        ("remu t0, t1, t2", vec![m(MulOp::Remu, T0, T1, T2)]),
         // System
         ("fence", vec![Fence]),
         ("fence.i", vec![FenceI]),
@@ -382,6 +453,8 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
         ("neg a0, a1", vec![r(AluOp::Sub, A0, ZERO, A1)]),
         ("seqz a0, a1", vec![i(AluOp::Sltu, A0, A1, 1)]),
         ("snez a0, a1", vec![r(AluOp::Sltu, A0, ZERO, A1)]),
+        ("sltz a0, a1", vec![r(AluOp::Slt, A0, A1, ZERO)]),
+        ("sgtz a0, a1", vec![r(AluOp::Slt, A0, ZERO, A1)]),
         ("j -8", vec![Jal { rd: ZERO, imm: -8 }]),
         (
             "jr t0",
@@ -490,8 +563,35 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
                 imm: 8,
             }],
         ),
-        // li: 1 word when it fits in 12 bits or the low 12 bits are zero, else lui + addi.
+        // li, in LLVM's order of preference (encode.golden follows LLVM):
+        //   fits in 12 signed bits          -> addi
+        //   low 12 bits are zero            -> lui
+        //   c << s with c in -32..=31       -> addi c + slli s (both compress to 16 bits with C)
+        //   anything else                   -> lui + addi
         ("li a0, -2048", vec![i(AluOp::Add, A0, ZERO, -2048)]),
+        (
+            "li a0, 2048",
+            vec![i(AluOp::Add, A0, ZERO, 1), i(AluOp::Sll, A0, A0, 11)],
+        ),
+        (
+            "li a0, 0x1800",
+            vec![i(AluOp::Add, A0, ZERO, 3), i(AluOp::Sll, A0, A0, 11)],
+        ),
+        (
+            "li a0, -6144",
+            vec![i(AluOp::Add, A0, ZERO, -3), i(AluOp::Sll, A0, A0, 11)],
+        ),
+        // 0x7ff << 11: c doesn't fit in 6 bits, so lui + addi.
+        (
+            "li a0, 0x3ff800",
+            vec![
+                Lui {
+                    rd: A0,
+                    imm: 0x0040_0000,
+                },
+                i(AluOp::Add, A0, A0, -2048),
+            ],
+        ),
         (
             "li a0, 0x80000000",
             vec![Lui {
@@ -576,6 +676,10 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
             vec![Auipc { rd: A0, imm: 0 }, i(AluOp::Add, A0, A0, 0)],
         ),
         (
+            "lla a0, target",
+            vec![Auipc { rd: A0, imm: 0 }, i(AluOp::Add, A0, A0, 0)],
+        ),
+        (
             "lw a0, target",
             vec![
                 Auipc { rd: A0, imm: 0 },
@@ -620,11 +724,102 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
                 imm: 0,
             }],
         ),
+        // Explicit pc-relative pairs: %pcrel_lo names the label on the auipc.
+        (
+            "1: auipc a0, %pcrel_hi(target)\naddi a0, a0, %pcrel_lo(1b)",
+            vec![Auipc { rd: A0, imm: 0 }, i(AluOp::Add, A0, A0, 0)],
+        ),
+        (
+            "1: auipc a0, %pcrel_hi(target)\nlw a1, %pcrel_lo(1b)(a0)",
+            vec![
+                Auipc { rd: A0, imm: 0 },
+                Load {
+                    op: LoadOp::Lw,
+                    rd: A1,
+                    rs1: A0,
+                    imm: 0,
+                },
+            ],
+        ),
+        (
+            "2: auipc t0, %pcrel_hi(target+8)\nsw a1, %pcrel_lo(2b)(t0)",
+            vec![
+                Auipc { rd: T0, imm: 0 },
+                Store {
+                    op: StoreOp::Sw,
+                    rs1: T0,
+                    rs2: A1,
+                    imm: 0,
+                },
+            ],
+        ),
     ]
+}
+
+/// (word index, kind, target)
+type WordReloc = (usize, RelocKind, To);
+
+/// The relocation on each word of the rows above that refer to a label.
+/// Every word not listed must carry no relocation. Matches clang/llvm-mc with
+/// relaxation off.
+fn expected_relocs() -> Vec<(&'static str, Vec<WordReloc>)> {
+    use RelocKind::*;
+    let target = || To::Sym("target".into(), 0);
+    let pcrel = |lo| vec![(0, PcrelHi20, target()), (1, lo, To::Auipc(0))];
+    vec![
+        ("call target", vec![(0, CallPlt, target())]),
+        ("tail target", vec![(0, CallPlt, target())]),
+        ("la a0, target", pcrel(PcrelLo12I)),
+        ("lla a0, target", pcrel(PcrelLo12I)),
+        ("lw a0, target", pcrel(PcrelLo12I)),
+        ("sw a0, target, t0", pcrel(PcrelLo12S)),
+        ("beq a0, a1, target", vec![(0, Branch, target())]),
+        ("jal target", vec![(0, Jal, target())]),
+        ("lui a0, %hi(target)", vec![(0, Hi20, target())]),
+        ("addi a0, a0, %lo(target)", vec![(0, Lo12I, target())]),
+        ("sw a1, %lo(target)(a0)", vec![(0, Lo12S, target())]),
+        // The low half points at the user's label (`1:` is `.L1$0`), not the symbol.
+        (
+            "1: auipc a0, %pcrel_hi(target)\naddi a0, a0, %pcrel_lo(1b)",
+            vec![
+                (0, PcrelHi20, target()),
+                (1, PcrelLo12I, To::Sym(".L1$0".into(), 0)),
+            ],
+        ),
+        (
+            "1: auipc a0, %pcrel_hi(target)\nlw a1, %pcrel_lo(1b)(a0)",
+            vec![
+                (0, PcrelHi20, target()),
+                (1, PcrelLo12I, To::Sym(".L1$0".into(), 0)),
+            ],
+        ),
+        (
+            "2: auipc t0, %pcrel_hi(target+8)\nsw a1, %pcrel_lo(2b)(t0)",
+            vec![
+                (0, PcrelHi20, To::Sym("target".into(), 8)),
+                (1, PcrelLo12S, To::Sym(".L2$0".into(), 0)),
+            ],
+        ),
+    ]
+}
+
+/// A typo in `expected_relocs` would silently drop its checks.
+#[test]
+fn every_expected_reloc_row_is_in_the_table() {
+    let rows: Vec<&str> = expected().iter().map(|(src, _)| *src).collect();
+    for (src, relocs) in expected_relocs() {
+        assert!(rows.contains(&src), "'{src}' is not in expected()");
+        let words = expected().into_iter().find(|(s, _)| *s == src).unwrap().1.len();
+        assert!(
+            relocs.iter().all(|r| r.0 < words),
+            "'{src}': word index out of range"
+        );
+    }
 }
 
 fn run_expected(require_all: bool) {
     let mut rep = Report::new("decode(encode(x)) == x");
+    let relocs = expected_relocs();
     for (src, want) in expected() {
         rep.total += 1;
         let shown = src.replace('\n', "; ");
@@ -641,11 +836,26 @@ fn run_expected(require_all: bool) {
             }
         };
         let got: Vec<Inst> = words.iter().map(|w| decode(w.word)).collect();
-        if got == want {
-            rep.pass += 1;
-        } else {
+        if got != want {
             rep.fails
                 .push(format!("  {shown:<34} got {got:?}\n  {:<34} want {want:?}", ""));
+            continue;
+        }
+        let want_relocs = relocs
+            .iter()
+            .find(|(s, _)| *s == src)
+            .map_or(&[][..], |r| &r.1[..]);
+        let mismatch = words.iter().enumerate().find_map(|(n, w)| {
+            let want = want_relocs
+                .iter()
+                .find(|r| r.0 == n)
+                .map(|(_, kind, to)| (*kind, to));
+            let got = w.reloc.as_ref().map(|r| (r.kind, &r.to));
+            (got != want).then(|| format!("word {n}: relocation {got:?}, want {want:?}"))
+        });
+        match mismatch {
+            None => rep.pass += 1,
+            Some(why) => rep.fails.push(format!("  {shown:<34} {why}")),
         }
     }
     rep.finish(require_all);
@@ -653,71 +863,75 @@ fn run_expected(require_all: bool) {
 
 // ----- decode → disassemble → assemble again -----
 
-/// Every source line of the llvm-mc golden file.
-fn golden_sources() -> Vec<&'static str> {
+/// Each golden line with llvm-mc's words for it, leaving out the words a
+/// relocation patches (their fields are zero, so they don't disassemble back
+/// to the source). Lines left with no words are dropped.
+fn golden_words() -> Vec<(&'static str, Vec<u32>)> {
+    let hex = |s: &str| u32::from_str_radix(s, 16).unwrap();
     include_str!("golden/encode.golden")
         .lines()
-        .map(|l| l.split(" | ").next().unwrap().trim())
+        .filter_map(|l| {
+            let mut parts = l.split(" | ");
+            let src = parts.next().unwrap().trim();
+            let words = parts.next().unwrap().split_whitespace().map(hex);
+            let relocated: Vec<u32> = parts
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .map(|r| hex(r.split(':').next().unwrap()))
+                .collect();
+            let words: Vec<u32> = words
+                .enumerate()
+                .filter(|(i, _)| !relocated.contains(&(4 * *i as u32)))
+                .map(|(_, w)| w)
+                .collect();
+            (!words.is_empty()).then_some((src, words))
+        })
         .collect()
 }
 
 fn run_disasm(require_all: bool) {
     let mut rep = Report::new("encode(disasm(decode(w))) == w");
+    // Not in the golden file. Words from clang (Xcal written as `.insn i 0x0b, ...`).
     let extra = [
-        "xcal.dbg a0",
-        "xcal.halt zero",
-        "csrrw a0, satp, a0",
-        "csrrs a0, 0x7c0, zero",
+        ("xcal.dbg a0", vec![0x0005_000b]),
+        ("xcal.halt zero", vec![0x0000_100b]),
+        ("csrrw a0, satp, a0", vec![0x1805_1573]),
+        ("csrrs a0, 0x7c0, zero", vec![0x7c00_2573]),
     ];
-    for src in golden_sources().into_iter().chain(extra) {
+    for (src, words) in golden_words().into_iter().chain(extra) {
         rep.total += 1;
-        let words = match assemble(src) {
-            Assembled::Words(w) => w,
-            Assembled::Unimplemented => {
-                rep.todo.push(src.to_string());
-                continue;
-            }
-            Assembled::Error(e) => {
-                rep.fails.push(format!("  {src:<28} error: {e}"));
-                continue;
-            }
-        };
-        let mut outcome = Ok(true);
-        for w in &words {
-            let inst = decode(w.word);
-            if let Inst::Illegal(_) = inst {
-                outcome = Err(format!("{:08x} does not decode", w.word));
-                break;
-            }
-            if w.relocated {
-                // Zeroed fields; the decode check above is all we can say.
-                continue;
-            }
+        let mut outcome = Ok(());
+        for w in words {
             // `{inst}` is the disassembler's syntax, which merlin-as accepts.
-            let text = inst.to_string();
+            // Words are compared, not decoded `Inst`s: `decode` ignores some
+            // bits (fence's pred/succ, for one) that must still come out right.
+            let text = decode(w).to_string();
             match assemble(&text) {
-                Assembled::Words(again) if again.len() == 1 && decode(again[0].word) == inst => {}
+                Assembled::Words(again) if again.len() == 1 && again[0].word == w => {}
                 Assembled::Words(again) => {
                     let again: Vec<String> = again.iter().map(|w| format!("{:08x}", w.word)).collect();
-                    outcome = Err(format!(
-                        "{:08x} disassembles to '{text}', which assembles to [{}]",
-                        w.word,
+                    outcome = Err(Some(format!(
+                        "{w:08x} disassembles to '{text}', which assembles to [{}]",
                         again.join(" ")
-                    ));
+                    )));
                     break;
                 }
-                Assembled::Unimplemented => outcome = Ok(false),
+                // The disassembly uses a mnemonic not written yet.
+                Assembled::Unimplemented => {
+                    outcome = Err(None);
+                    break;
+                }
                 Assembled::Error(e) => {
-                    outcome = Err(format!("{:08x} disassembles to '{text}': {e}", w.word));
+                    outcome = Err(Some(format!("{w:08x} disassembles to '{text}': {e}")));
                     break;
                 }
             }
         }
         match outcome {
-            Ok(true) => rep.pass += 1,
-            // The line works but its disassembly uses a mnemonic not written yet.
-            Ok(false) => rep.todo.push(src.to_string()),
-            Err(why) => rep.fails.push(format!("  {src:<28} {why}")),
+            Ok(()) => rep.pass += 1,
+            Err(None) => rep.todo.push(src.to_string()),
+            Err(Some(why)) => rep.fails.push(format!("  {src:<28} {why}")),
         }
     }
     rep.finish(require_all);
