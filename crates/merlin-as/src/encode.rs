@@ -3,7 +3,7 @@
 //! Turns one instruction (mnemonic + parsed operands) into machine words.
 //! Everything around it (lexing, parsing, labels, sections, directives,
 //! relocations, ELF output) lives elsewhere; this module is the whole ISA:
-//! RV32I, M, Zicsr, Zifencei, the privileged instructions, Xcal (spec section
+//! RV32I, M, A, Zicsr, Zifencei, the privileged instructions, Xcal (spec section
 //! 9), the standard pseudo-instructions and the `.insn` directive.
 //!
 //! ## Contract with the assembler driver ([`crate::asm`])
@@ -47,8 +47,8 @@ use excalibur::{csr, Reg};
 // Major opcodes, bits [6:0] (spec section 4): the decoder's own constants.
 // custom-0 holds the Xcal instructions (spec section 9).
 use excalibur::opcode::{
-    OP_AUIPC as AUIPC, OP_BRANCH as BRANCH, OP_CUSTOM0 as CUSTOM_0, OP_IMM, OP_JAL as JAL, OP_JALR as JALR,
-    OP_LOAD as LOAD, OP_LUI as LUI, OP_MISC_MEM as MISC_MEM, OP_OP as OP, OP_STORE as STORE,
+    OP_AMO as AMO, OP_AUIPC as AUIPC, OP_BRANCH as BRANCH, OP_CUSTOM0 as CUSTOM_0, OP_IMM, OP_JAL as JAL,
+    OP_JALR as JALR, OP_LOAD as LOAD, OP_LUI as LUI, OP_MISC_MEM as MISC_MEM, OP_OP as OP, OP_STORE as STORE,
     OP_SYSTEM as SYSTEM,
 };
 
@@ -87,7 +87,8 @@ const T1: Reg = 6;
 // a word the encoder left zero.
 // ===================================================================
 
-/// R-type: register-register operations (OP, including the M extension).
+/// R-type: register-register operations (OP, including the M extension, and
+/// the A extension, whose funct7 is funct5 plus the aq and rl bits).
 ///
 /// ```text
 ///  31     25 24  20 19  15 14  12 11   7 6      0
@@ -572,6 +573,35 @@ fn csr_funct3(m: &str) -> Option<u32> {
     })
 }
 
+/// A extension: funct5 (bits [31:27]) of each `.w` mnemonic, without its
+/// ordering suffix.
+fn atomic_funct5(m: &str) -> Option<u32> {
+    Some(match m {
+        "lr.w" => 0b00010,
+        "sc.w" => 0b00011,
+        "amoswap.w" => 0b00001,
+        "amoadd.w" => 0b00000,
+        "amoxor.w" => 0b00100,
+        "amoand.w" => 0b01100,
+        "amoor.w" => 0b01000,
+        "amomin.w" => 0b10000,
+        "amomax.w" => 0b10100,
+        "amominu.w" => 0b11000,
+        "amomaxu.w" => 0b11100,
+        _ => return None,
+    })
+}
+
+/// Splits an A mnemonic into its base (`amoadd.w`) and its ordering bits
+/// aq|rl, from the suffix: none, `.aq` (10), `.rl` (01) or `.aqrl` (11).
+fn atomic(m: &str) -> Option<(&str, u32, u32)> {
+    let (base, aqrl) = [(".aqrl", 0b11), (".aq", 0b10), (".rl", 0b01)]
+        .into_iter()
+        .find_map(|(suffix, bits)| Some((m.strip_suffix(suffix)?, bits)))
+        .unwrap_or((m, 0b00));
+    Some((base, atomic_funct5(base)?, aqrl))
+}
+
 /// SYSTEM instructions with no operands: their funct12 (the I-type immediate).
 fn system_funct12(m: &str) -> Option<i32> {
     Some(match m {
@@ -662,6 +692,20 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
     if let Some(funct12) = system_funct12(m) {
         let [] = ops else { return usage("") };
         return one(i_type(SYSTEM, 0, ZERO, ZERO, funct12));
+    }
+
+    // ----- A extension (R-type, AMO opcode) -----
+    // funct7 is funct5 followed by the aq and rl bits; funct3 = 010 (word).
+    // lr.w has no rs2 (the field is zero).
+    if let Some((base, funct5, aqrl)) = atomic(m) {
+        let (rd, rs2, addr) = match (base, ops) {
+            ("lr.w", [rd, addr]) => (rd, ZERO, addr),
+            ("lr.w", _) => return usage("rd, (rs1)"),
+            (_, [rd, rs2, addr]) => (rd, reg(rs2)?, addr),
+            _ => return usage("rd, rs2, (rs1)"),
+        };
+        let rs1 = atomic_address(m, addr, ctx)?;
+        return one(r_type(AMO, 0b010, funct5 << 2 | aqrl, reg(rd)?, rs1, rs2));
     }
 
     match m {
@@ -941,6 +985,17 @@ fn store(m: &str, funct3: u32, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, 
             ])
         }
         _ => Err(format!("usage: {m} rs2, offset(rs1)  or  {m} rs2, symbol, rt")),
+    }
+}
+
+/// The address operand of an A instruction: `(rs1)`. An A instruction has no
+/// offset field, so `0(rs1)` is accepted (as LLVM does) and any other offset
+/// is an error.
+fn atomic_address(m: &str, addr: &Operand, ctx: &Ctx) -> Result<Reg, String> {
+    let (offset, base) = mem(addr).map_err(|e| format!("{e}: {m} takes its address as (rs1)"))?;
+    match ctx.constant(offset) {
+        Some(0) => Ok(base),
+        _ => Err(format!("{m} has no offset field: write the address as (rs1)")),
     }
 }
 

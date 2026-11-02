@@ -1,22 +1,22 @@
-Function fib(n) <3:5>
-  Param #0 n <3:13>
+Function int fib(int n) <3:5>
+  Param #0 int n <3:13>
   If <4:5>
-    Binary < <4:11>
-      Var n #0 <4:9>
-      Num 2 <4:13>
+    Binary < : int <4:11>
+      Var n #0 : int <4:9>
+      Num 2 : int <4:13>
     Return <5:9>
-      Var n #0 <5:16>
+      Var n #0 : int <5:16>
   Return <6:5>
-    Binary + <6:23>
-      Call fib <6:12>
-        Binary - <6:18>
-          Var n #0 <6:16>
-          Num 1 <6:20>
-      Call fib <6:25>
-        Binary - <6:31>
-          Var n #0 <6:29>
-          Num 2 <6:33>
-Function main() <8:5>
+    Binary + : int <6:23>
+      Call fib : int <6:12>
+        Binary - : int <6:18>
+          Var n #0 : int <6:16>
+          Num 1 : int <6:20>
+      Call fib : int <6:25>
+        Binary - : int <6:31>
+          Var n #0 : int <6:29>
+          Num 2 : int <6:33>
+Function int main(void) <8:5>
   Return <9:5>
-    Call fib <9:12>
-      Num 20 <9:16>
+    Call fib : int <9:12>
+      Num 20 : int <9:16>

@@ -1,4 +1,4 @@
-//! Grail: an emulator for the Excalibur ISA (RV32IM + Zicsr, M/S/U modes, Sv32).
+//! Grail: an emulator for the Excalibur ISA (RV32IMA + Zicsr, M/S/U modes, Sv32).
 //!
 //! A [`Machine`] is built from a [`MachineConfig`] and owns all of its state, I/O
 //! included (UART and debug output go to sinks the host hands it), so a process can run

@@ -1,70 +1,70 @@
-Function classify(n) <3:5>
-  Param #0 n <3:18>
+Function int classify(int n) <3:5>
+  Param #0 int n <3:18>
   If <4:5>
-    Binary < <4:11>
-      Var n #0 <4:9>
-      Num 0 <4:13>
+    Binary < : int <4:11>
+      Var n #0 : int <4:9>
+      Num 0 : int <4:13>
     Return <5:9>
-      Num 1 <5:16>
+      Num 1 : int <5:16>
   Else <6:10>
     If <6:10>
-      Binary == <6:16>
-        Var n #0 <6:14>
-        Num 0 <6:19>
+      Binary == : int <6:16>
+        Var n #0 : int <6:14>
+        Num 0 : int <6:19>
       Return <7:9>
-        Num 2 <7:16>
+        Num 2 : int <7:16>
     Else <8:10>
       If <8:10>
-        Binary < <8:16>
-          Var n #0 <8:14>
-          Num 10 <8:18>
+        Binary < : int <8:16>
+          Var n #0 : int <8:14>
+          Num 10 : int <8:18>
         Return <9:9>
-          Num 3 <9:16>
+          Num 3 : int <9:16>
   Return <10:5>
-    Num 4 <10:12>
-Function main() <12:5>
-  Local #0 r <13:9>
+    Num 4 : int <10:12>
+Function int main(void) <12:5>
+  Local #0 int r <13:9>
   Decl <13:5>
-    Var r #0 <13:9>
-      Binary + <13:62>
-        Binary + <13:44>
-          Binary + <13:26>
-            Call classify <13:13>
-              Unary - <13:22>
-                Num 5 <13:23>
-            Binary * <13:40>
-              Call classify <13:28>
-                Num 0 <13:37>
-              Num 2 <13:42>
-          Binary * <13:58>
-            Call classify <13:46>
-              Num 7 <13:55>
-            Num 3 <13:60>
-        Binary * <13:77>
-          Call classify <13:64>
-            Num 99 <13:73>
-          Num 4 <13:79>
+    Var int r #0 <13:9>
+      Binary + : int <13:62>
+        Binary + : int <13:44>
+          Binary + : int <13:26>
+            Call classify : int <13:13>
+              Unary - : int <13:22>
+                Num 5 : int <13:23>
+            Binary * : int <13:40>
+              Call classify : int <13:28>
+                Num 0 : int <13:37>
+              Num 2 : int <13:42>
+          Binary * : int <13:58>
+            Call classify : int <13:46>
+              Num 7 : int <13:55>
+            Num 3 : int <13:60>
+        Binary * : int <13:77>
+          Call classify : int <13:64>
+            Num 99 : int <13:73>
+          Num 4 : int <13:79>
   If <14:5>
-    Num 1 <14:9>
+    Num 1 : int <14:9>
     If <15:9>
-      Num 0 <15:13>
+      Num 0 : int <15:13>
       ExprStmt <16:13>
-        Assign <16:15>
-          Var r #0 <16:13>
-          Num 0 <16:17>
+        Assign : int <16:15>
+          Var r #0 : int <16:13>
+          Num 0 : int <16:17>
     Else <18:13>
       ExprStmt <18:13>
-        Assign <18:15>
-          Var r #0 <18:13>
-          Binary + <18:19>
-            Var r #0 <18:17>
-            Num 7 <18:21>
+        Assign : int <18:15>
+          Var r #0 : int <18:13>
+          Binary + : int <18:19>
+            Var r #0 : int <18:17>
+            Num 7 : int <18:21>
   If <19:5>
-    Num 0 <19:9>
+    Num 0 : int <19:9>
     Block <19:12>
       ExprStmt <20:9>
-        Assign <20:11>
-          Var r #0 <20:9>
-          Num 0 <20:13>
+        Assign : int <20:11>
+          Var r #0 : int <20:9>
+          Num 0 : int <20:13>
   Return <22:5>
-    Var r #0 <22:12>
+    Var r #0 : int <22:12>

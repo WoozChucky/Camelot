@@ -28,7 +28,9 @@ OUT=crates/merlin-objdump/tests/golden
 mkdir -p "$OUT"
 
 CC="clang --target=riscv32 -march=rv32im_zicsr_zifencei -mabi=ilp32 -c"
-$CC -mno-relax "$FIX/isa.S" -o "$FIX/isa.o"
+# isa.S has the A instructions too: its .riscv.attributes must name A, or
+# llvm-objdump prints them as <unknown>.
+clang --target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32 -c -mno-relax "$FIX/isa.S" -o "$FIX/isa.o"
 $CC "$FIX/relocs.S" -o "$FIX/relocs.o"
 $CC -include examples/xcal.inc examples/hello/hello.S -o "$FIX/hello.o"
 clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -nostdlib -static -fuse-ld=lld \
@@ -71,5 +73,6 @@ gen linked-elf.x               "$FIX/linked.elf" -x
 gen rv32ui-p-add.d             tests/riscv-tests/rv32ui-p-add -d
 gen rv32mi-p-csr.d             tests/riscv-tests/rv32mi-p-csr -d
 gen rv32si-p-dirty.dx          tests/riscv-tests/rv32si-p-dirty -d -x
+gen rv32ua-p-lrsc.d            tests/riscv-tests/rv32ua-p-lrsc -d
 
 echo "wrote $(ls "$OUT" | wc -l) golden files"

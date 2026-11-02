@@ -13,6 +13,7 @@ pub const OP_OP: u32 = 0b0110011;
 pub const OP_MISC_MEM: u32 = 0b0001111;
 pub const OP_SYSTEM: u32 = 0b1110011;
 pub const OP_CUSTOM0: u32 = 0b0001011;
+pub const OP_AMO: u32 = 0b0101111;
 
 #[inline]
 fn rd(w: u32) -> Reg {
@@ -190,6 +191,37 @@ pub fn decode(w: u32) -> Inst {
             };
             Inst::Op { op, rd, rs1, rs2 }
         }
+        // A extension: funct5 in [31:27], aq in [26], rl in [25], and funct3 =
+        // 010 (word; .d needs RV64). Unknown funct5 values (amocas, ...) and an
+        // lr.w whose rs2 field is not zero are reserved.
+        OP_AMO if funct3(w) == 2 => {
+            let (rd, rs1, rs2) = (rd(w), rs1(w), rs2(w));
+            let order = Ordering {
+                aq: (w >> 26) & 1 != 0,
+                rl: (w >> 25) & 1 != 0,
+            };
+            let op = match w >> 27 {
+                0b00010 if rs2 == 0 => return Inst::Lr { rd, rs1, order },
+                0b00011 => return Inst::Sc { rd, rs1, rs2, order },
+                0b00001 => AmoOp::Swap,
+                0b00000 => AmoOp::Add,
+                0b00100 => AmoOp::Xor,
+                0b01100 => AmoOp::And,
+                0b01000 => AmoOp::Or,
+                0b10000 => AmoOp::Min,
+                0b10100 => AmoOp::Max,
+                0b11000 => AmoOp::Minu,
+                0b11100 => AmoOp::Maxu,
+                _ => return illegal,
+            };
+            Inst::Amo {
+                op,
+                rd,
+                rs1,
+                rs2,
+                order,
+            }
+        }
         OP_MISC_MEM => match funct3(w) {
             0 if w >> 20 == 0x833 => Inst::FenceTso,
             0 => Inst::Fence {
@@ -328,6 +360,85 @@ mod tests {
         // Reserved fm / rd / rs1 values execute as a normal fence.
         assert_eq!(decode(0x8ff0000f), Inst::Fence { pred: 0xf, succ: 0xf });
         assert_eq!(decode(0x0ff5008f), Inst::Fence { pred: 0xf, succ: 0xf });
+    }
+
+    #[test]
+    fn atomics() {
+        // Encodings from clang -march=rv32ima.
+        let none = Ordering::NONE;
+        let aqrl = Ordering { aq: true, rl: true };
+        // lr.w a0, (a1) / lr.w.aqrl a0, (a1)
+        assert_eq!(
+            decode(0x1005a52f),
+            Inst::Lr {
+                rd: 10,
+                rs1: 11,
+                order: none
+            }
+        );
+        assert_eq!(
+            decode(0x1605a52f),
+            Inst::Lr {
+                rd: 10,
+                rs1: 11,
+                order: aqrl
+            }
+        );
+        // sc.w.aqrl t0, t1, (t2)
+        assert_eq!(
+            decode(0x1e63a2af),
+            Inst::Sc {
+                rd: 5,
+                rs1: 7,
+                rs2: 6,
+                order: aqrl
+            }
+        );
+        // amoadd.w.aq a0, a1, (a2), amoand.w.rl a0, a1, (a2)
+        assert_eq!(
+            decode(0x04b6252f),
+            Inst::Amo {
+                op: AmoOp::Add,
+                rd: 10,
+                rs1: 12,
+                rs2: 11,
+                order: Ordering { aq: true, rl: false }
+            }
+        );
+        assert_eq!(
+            decode(0x62b6252f),
+            Inst::Amo {
+                op: AmoOp::And,
+                rd: 10,
+                rs1: 12,
+                rs2: 11,
+                order: Ordering { aq: false, rl: true }
+            }
+        );
+        let ops = [
+            (0x08b6252f, AmoOp::Swap),
+            (0x20b6252f, AmoOp::Xor),
+            (0x40b6252f, AmoOp::Or),
+            (0x80b6252f, AmoOp::Min),
+            (0xa0b6252f, AmoOp::Max),
+            (0xc0b6252f, AmoOp::Minu),
+            (0xe0b6252f, AmoOp::Maxu),
+        ];
+        for (w, op) in ops {
+            let want = Inst::Amo {
+                op,
+                rd: 10,
+                rs1: 12,
+                rs2: 11,
+                order: none,
+            };
+            assert_eq!(decode(w), want, "{w:#010x}");
+        }
+        // Reserved: lr.w with rs2 != 0, unknown funct5 (amocas.w is Zacas),
+        // and funct3 other than .w (.d is RV64 only).
+        for w in [0x1015a52f, 0x2805a52f, 0xf805a52f, 0x0005b52f, 0x0005c52f] {
+            assert_eq!(decode(w), Inst::Illegal(w), "{w:#010x}");
+        }
     }
 
     #[test]
