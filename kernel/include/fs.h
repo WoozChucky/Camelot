@@ -118,16 +118,23 @@ struct inode {
 /* Inodes in the cache, as in xv6. iget() panics if every one is in use. */
 #define NINODE 50
 
-/* The mounted filesystem: its disk, superblock, and whether the disk is
- * read-only (then nothing writes to it). */
+/* The mounted filesystem: its disk, superblock, and whether it is
+ * read-only (then nothing writes to it): because the disk is, or because
+ * its log has fewer than MAXOPBLOCKS slots (`fs_log_too_small`), too few
+ * for an operation. `fs_orphans` counts the inodes the mount freed that a
+ * crash had left allocated with no links. */
 extern bool fs_mounted;
 extern bool fs_readonly;
+extern bool fs_log_too_small;
+extern u32 fs_orphans;
 extern u32 fs_dev;
 extern struct superblock fs_sb;
 
 /* Mounts disk `dev` as the root: reads and checks the superblock (every
  * rule of the format document's superblock section), replays a committed
- * transaction from the log, checks the root is a directory. Returns 0, or:
+ * transaction from the log, checks the root is a directory, and frees the
+ * inodes left with no links (unless the filesystem is read-only, which it
+ * is on a read-only disk or with a log too small to write). Returns 0, or:
  * -ENOENT if the disk has no filesystem (another magic), -EINVAL if its
  * superblock or log header is broken, -EROFS if it is read-only and its log
  * needs replaying, -EIO if the superblock can't be read; *why then says

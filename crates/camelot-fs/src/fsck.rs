@@ -4,12 +4,15 @@
 //! [`check`] looks at the disk as a mount would leave it: a committed
 //! transaction still in the log is replayed into a copy first (and counted in
 //! the report). [`recover`] does that replay in place, as the kernel does at
-//! mount.
+//! mount, and [`free_orphans`] then frees the inodes a crash left allocated
+//! with no links, as the kernel's mount does next. [`check`] counts those
+//! orphans in its report: they are allowed (docs/camelot-fs.md, "Link
+//! count").
 
 use crate::{
-    block, block_mut, bmap, contents, dirents, read_inode, show_name, superblock, valid_name, LogHeader,
-    Superblock, BITS_PER_BLOCK, BSIZE, DIRENT_SIZE, MAX_FILE_SIZE, NDIRECT, NINDIRECT, NO_INODE, ROOT_INODE,
-    T_DEVICE, T_DIR, T_FILE, T_FREE,
+    block, block_mut, bmap, contents, dirents, read_inode, show_name, superblock, valid_name, write_inode,
+    LogHeader, Superblock, BITS_PER_BLOCK, BSIZE, DIRENT_SIZE, MAX_FILE_SIZE, NDIRECT, NINDIRECT, NO_INODE,
+    ROOT_INODE, T_DEVICE, T_DIR, T_FILE, T_FREE,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -36,6 +39,55 @@ pub fn recover(image: &mut [u8]) -> Result<usize, String> {
     Ok(header.blocks.len())
 }
 
+/// Frees every orphaned inode of `image` (allocated, with `nlink` 0) as the
+/// kernel's mount does (`free_orphans` in kernel/fs.c, through `iput`): its
+/// blocks, the indirect one included, are marked free in the bitmap, and its
+/// `type`, `size` and pointers become 0 (`major`, `minor` and `nlink` stay as
+/// they were; the blocks' contents too). The root is never freed. Run it on
+/// a replayed image ([`recover`]). Returns how many it freed; errors, leaving
+/// `image` as it was, if the superblock is invalid or an orphan's pointers
+/// leave the data region.
+pub fn free_orphans(image: &mut [u8]) -> Result<usize, String> {
+    let sb = superblock(image)?;
+    let mut frees: Vec<(u32, Vec<u32>)> = Vec::new();
+    for inum in ROOT_INODE + 1..sb.ninodes {
+        let d = read_inode(image, &sb, inum);
+        if d.kind == T_FREE || d.nlink != 0 {
+            continue;
+        }
+        // Every non-zero pointer, as the kernel's itrunc() frees them.
+        let mut blocks: Vec<u32> = d.addrs[..NDIRECT].iter().copied().filter(|&a| a != 0).collect();
+        let ind = d.indirect();
+        if ind != 0 {
+            for k in NDIRECT..NDIRECT + NINDIRECT {
+                let a = bmap(image, &sb, &d, k).map_err(|e| format!("orphan inode {inum}: {e}"))?;
+                if a != 0 {
+                    blocks.push(a);
+                }
+            }
+            blocks.push(ind);
+        }
+        if let Some(b) = blocks.iter().find(|&&b| !sb.is_data(b)) {
+            return Err(format!(
+                "orphan inode {inum}: block {b} is outside the data region"
+            ));
+        }
+        frees.push((inum, blocks));
+    }
+    for (inum, blocks) in &frees {
+        for &b in blocks {
+            let (blk, byte, mask) = sb.bit_pos(b);
+            block_mut(image, blk)[byte] &= !mask;
+        }
+        let mut d = read_inode(image, &sb, *inum);
+        d.kind = T_FREE;
+        d.size = 0;
+        d.addrs = [0; NDIRECT + 1];
+        write_inode(image, &sb, *inum, &d);
+    }
+    Ok(frees.len())
+}
+
 /// What a consistent image holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
@@ -47,6 +99,10 @@ pub struct Report {
     pub devices: u32,
     /// Inodes of type 0, inode 0 not counted.
     pub free_inodes: u32,
+    /// Orphans: allocated inodes with no links and in no directory, which
+    /// the next mount (or [`free_orphans`]) frees. Counted in `dirs`, `files`
+    /// or `devices` too, and their blocks in `used_blocks`.
+    pub orphans: u32,
     /// Data blocks in use, and free.
     pub used_blocks: u32,
     pub free_blocks: u32,
@@ -67,7 +123,7 @@ pub fn check(image: &[u8]) -> Result<Report, Vec<String>> {
     c.inodes();
     c.bitmap();
     let refs = c.tree();
-    c.links(&refs);
+    let orphans = c.links(&refs);
     if !c.problems.is_empty() {
         return Err(c.problems);
     }
@@ -78,6 +134,7 @@ pub fn check(image: &[u8]) -> Result<Report, Vec<String>> {
         files: 0,
         devices: 0,
         free_inodes: 0,
+        orphans,
         used_blocks: c.owner.len() as u32,
         free_blocks: sb.nblocks - c.owner.len() as u32,
     };
@@ -354,15 +411,21 @@ impl Checker<'_> {
         refs
     }
 
-    /// Rule 5's reachability and rule 6, the link counts.
-    fn links(&mut self, refs: &HashMap<u32, u32>) {
+    /// Rule 5's reachability and rule 6, the link counts. Returns how many
+    /// orphans there are: inodes in no directory with `nlink` 0, which are
+    /// allowed (the entries of an orphaned directory are not walked, so its
+    /// `..` doesn't count for its old parent, as in the kernel).
+    fn links(&mut self, refs: &HashMap<u32, u32>) -> u32 {
+        let mut orphans = 0;
         for inum in 1..self.sb.ninodes {
             let d = read_inode(self.image, &self.sb, inum);
             if d.kind == T_FREE || d.kind > T_DEVICE {
                 continue;
             }
             let n = refs.get(&inum).copied().unwrap_or(0);
-            if n == 0 {
+            if n == 0 && d.nlink == 0 && inum != ROOT_INODE {
+                orphans += 1;
+            } else if n == 0 {
                 self.problem(format!("inode {inum} ({}) is in no directory", type_name(d.kind)));
             } else if u32::from(d.nlink) != n {
                 self.problem(format!(
@@ -371,6 +434,7 @@ impl Checker<'_> {
                 ));
             }
         }
+        orphans
     }
 }
 
@@ -438,6 +502,9 @@ mod tests {
     #[test]
     fn every_kind_of_damage_is_found() {
         broken("no filesystem", |img, _| block_mut(img, 1)[0] = 0);
+        broken("superblock byte 140 is not zero", |img, _| {
+            block_mut(img, 1)[140] = 0xff
+        });
         broken("misplaced", |img, _| block_mut(img, 1)[36] += 1);
         broken("inode 0 has type", |img, sb| {
             edit_inode(img, sb, 0, |d| d.kind = T_FILE)
@@ -611,6 +678,71 @@ mod tests {
                 .unwrap(),
             b"hello\n"
         );
+    }
+
+    /// Removes the entry `name` from directory `dir` (its first block), as
+    /// the kernel's unlink does: the slot's inode number becomes 0.
+    fn remove_entry(image: &mut [u8], sb: &Superblock, dir: &str, name: &[u8]) {
+        let d = read_inode(image, sb, inode_of(image, dir));
+        let b = block_mut(image, d.addrs[0]);
+        let i = dirents(b)
+            .iter()
+            .position(|e| e.inum != 0 && e.name() == name)
+            .unwrap();
+        b[i * DIRENT_SIZE..i * DIRENT_SIZE + 2].fill(0);
+    }
+
+    #[test]
+    fn orphans_are_allowed_and_freed() {
+        // A crash between unlinking a file still in use and its last user
+        // letting go leaves it allocated, with no links and in no directory:
+        // an orphan. That disk is consistent; free_orphans() frees it as the
+        // kernel's next mount does.
+        let mut image = sample();
+        let sb = superblock(&image).unwrap();
+        let before = check(&image).unwrap();
+        let big = inode_of(&image, "/bin/big");
+        let empty = inode_of(&image, "/empty");
+        let big_d = read_inode(&image, &sb, big);
+        remove_entry(&mut image, &sb, "/bin", b"big");
+        edit_inode(&mut image, &sb, big, |d| d.nlink = 0);
+        remove_entry(&mut image, &sb, "/", b"empty");
+        edit_inode(&mut image, &sb, empty, |d| d.nlink = 0);
+        let r = check(&image).unwrap();
+        assert_eq!(r.orphans, 2);
+        assert_eq!((r.files, r.used_blocks), (before.files, before.used_blocks));
+
+        // Named by an entry, a count of 0 is still wrong.
+        let mut named = sample();
+        edit_inode(&mut named, &sb, empty, |d| d.nlink = 0);
+        let problems = check(&named).unwrap_err();
+        assert!(
+            problems.iter().any(|p| p.contains("nlink is 0, but 1 entries")),
+            "{problems:#?}"
+        );
+
+        assert_eq!(free_orphans(&mut image), Ok(2));
+        let r = check(&image).unwrap();
+        assert_eq!(r.orphans, 0);
+        assert_eq!(r.files, before.files - 2);
+        assert_eq!(r.free_inodes, before.free_inodes + 2);
+        // big's 21 blocks and its indirect block.
+        assert_eq!(r.used_blocks, before.used_blocks - 22);
+        let d = read_inode(&image, &sb, big);
+        assert_eq!(
+            d,
+            Dinode {
+                kind: T_FREE,
+                nlink: 0,
+                size: 0,
+                addrs: [0; NDIRECT + 1],
+                ..big_d
+            }
+        );
+        // Nothing left to free.
+        let once = image.clone();
+        assert_eq!(free_orphans(&mut image), Ok(0));
+        assert_eq!(image, once);
     }
 
     #[test]

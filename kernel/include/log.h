@@ -35,6 +35,13 @@ extern u32 log_recovered;
 /* Transactions committed since boot. */
 extern u32 log_commits;
 
+/* For the self-test: how often begin_op() has gone to sleep because the
+ * operations in progress could fill the log, and because a commit was
+ * under way; and whether one is now (its writer sleeping on the disk). */
+extern u32 log_room_waits;
+extern u32 log_commit_waits;
+bool log_committing(void);
+
 /* Sets the log up for the filesystem `sb` on disk `dev` and replays a
  * committed transaction if the header holds one. Returns 0, -EINVAL with
  * *why for a header that breaks the format's rules, or -EROFS if there is

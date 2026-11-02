@@ -2,9 +2,10 @@
  * "Kernel filesystem"). Disk requests sleep, so it all runs in a kernel
  * process, on disk 0:
  *
- * - mount: the superblock is checked and a committed transaction left in
- *   the log by a crash is replayed ("fs: replayed N blocks from the log");
- *   then one line with the sizes and what is free, and a listing of `/`;
+ * - mount: the superblock is checked, a committed transaction left in the
+ *   log by a crash is replayed ("fs: replayed N blocks from the log"), and
+ *   inodes a crash left with no links are freed; then one line with the
+ *   sizes and what is free, and a listing of `/`;
  * - read checks, on any filesystem: the root is inode 1 and its own `.` and
  *   `..`; spellings of `/` (`//`, `/.`, `/..`, ...) all find it; every entry
  *   of `/` is found by its path; missing names, names that are too long and
@@ -15,14 +16,19 @@
  *   them there);
  * - with `fs_test` = FS_TEST_WRITE (patched in by the tests) and a writable
  *   disk, transactions: make /fstest and /fstest/a (2500 bytes) in one, then
- *   /fstest/b (700 bytes), remove a, write /fstest/big (13 KiB + 100 bytes,
- *   so past the direct blocks) 3 KiB per transaction, make and remove
- *   /fstest/d, then have two kernel processes make /fstest/p1 and p2 at
- *   once (their operations share one transaction: group commit); read
- *   everything back, check the errors, the free counts and the number of
- *   commits, and list /fstest. The tests stop the machine
- *   after every disk write of this and check that the disk, replayed, holds
- *   all of each transaction or none of it. */
+ *   /fstest/b (700 bytes), remove a, make /fstest/x (a block), write
+ *   /fstest/big (13 KiB + 100 bytes, so past the direct blocks) 3 KiB per
+ *   transaction, removing x while holding a reference to it (an inode with
+ *   no links until the next transaction frees it) just before big's
+ *   indirect block is allocated, on x's block; make and remove /fstest/d;
+ *   have two kernel processes make /fstest/p1 and p2 at once (their
+ *   operations share one transaction: group commit), then more processes
+ *   make begin_op() wait for room in the log and for a commit; read
+ *   everything back, remove big, check the errors, the free counts and the
+ *   number of commits, and list /fstest. The tests stop the machine after
+ *   every disk write of this and check that the disk, replayed, holds all
+ *   of each transaction or none of it;
+ * - with `fs_test` = FS_TEST_FULL, a file written until the disk is full. */
 #include "fstest.h"
 #include "blk.h"
 #include "fs.h"
@@ -272,17 +278,22 @@ static void read_checks(void) {
 
 #define A_LEN 2500
 #define B_LEN 700
+#define X_LEN BSIZE
 #define BIG_LEN (13 * BSIZE + 100)
 #define CHUNK (3 * BSIZE)
 #define BIG_CHUNKS ((BIG_LEN + CHUNK - 1) / CHUNK)
 #define P_LEN 1500
-/* /fstest, b, big (14 blocks and the indirect one), p1 and p2 (2 blocks
- * each) are left. */
-#define BLOCKS_LEFT (1 + 1 + 14 + 1 + 2 + 2)
-#define INODES_LEFT 5
-/* T1 (/fstest and a), b, removing a, making big, its chunks, making d,
- * removing d, the two writers' operations together. */
-#define COMMITS (3 + 1 + BIG_CHUNKS + 2 + 1)
+/* /fstest, b, p1 and p2 (2 blocks each) are left; the files of the
+ * begin_op() tests (r1, r2, j2, j3, c1, c2) are empty. */
+#define BLOCKS_LEFT (1 + 1 + 2 + 2)
+#define INODES_LEFT 10
+/* T1 (/fstest and a), b, removing a, making x, making big, its chunks,
+ * removing x and freeing it, making d, removing d, the two writers'
+ * operations together, the begin_op() tests (2 + 1 + 2), removing big. */
+#define COMMITS (3 + 1 + 1 + BIG_CHUNKS + 2 + 2 + 1 + 5 + 1)
+
+/* The chunk that takes /fstest/big past its direct blocks starts a chunk. */
+_Static_assert(NDIRECT * BSIZE % CHUNK == 0, "big's chunks");
 
 /* The contents of the test files: byte i of the file with `seed` is
  * i * 7 + seed + i / 251 (so no two blocks are alike). */
@@ -334,13 +345,65 @@ static void make_file(const char *p, u32 len, u32 seed, u8 *buf) {
     iunlockput(ip);
 }
 
-/* Two kernel processes, each making a file in an operation of its own.
- * Each starts its operation and yields, so both are in progress before
- * either writes (once the transaction holds a block, begin_op() would hold
- * a second operation back until the commit: the log must have room for
- * MAXOPBLOCKS more per operation). Then the last to end commits both: one
- * transaction. Each has its own buffer, since they run at the same time. */
-static u32 writers_done;
+/* Writes `n` bytes of the pattern with `seed` at `off` of `ip` (unlocked,
+ * with a reference), in a transaction of its own; returns what writei()
+ * did. */
+static int write_chunk(struct inode *ip, u32 off, u32 n, u32 seed) {
+    begin_op();
+    ilock(ip);
+    fill(data, off, n, seed);
+    int r = writei(ip, data, off, n);
+    iunlock(ip);
+    end_op();
+    return r;
+}
+
+/* ---- Kernel processes at once ---- */
+
+/* Starts a kernel process for each of `fns` and sleeps until each has
+ * called proc_done(). */
+static u32 procs_left;
+
+static void proc_done(void) {
+    procs_left--;
+    wakeup(&procs_left);
+}
+
+static bool run_procs(void (*const *fns)(void), u32 n) {
+    procs_left = 0;
+    for (u32 i = 0; i < n; i++) {
+        const char *why;
+        if (kproc_create("fstest", fns[i], &why) == NULL) {
+            kprintf("fs self-test: cannot start a process: %s\n", why);
+            break;
+        }
+        procs_left++;
+    }
+    while (procs_left > 0) {
+        sleep(&procs_left);
+    }
+    return procs_left == 0 && n > 0;
+}
+
+/* How long a process waits for another to get somewhere: it yields up to
+ * PATIENCE times, so a broken log makes a check fail instead of the test
+ * hanging. The others need a few rounds at most. */
+#define PATIENCE 1000
+
+static bool yield_until(bool (*cond)(void)) {
+    for (u32 i = 0; i < PATIENCE && !cond(); i++) {
+        yield();
+    }
+    return cond();
+}
+
+/* Group commit: two kernel processes, each making a file in an operation of
+ * its own. Each starts its operation and yields, so both are in progress
+ * before either writes (once the transaction holds a block, begin_op()
+ * would hold a second operation back until the commit: the log must have
+ * room for MAXOPBLOCKS more per operation, as the tests below check). Then
+ * the last to end commits both: one transaction. Each has its own buffer,
+ * since they run at the same time. */
 static u8 writer_data[2][P_LEN];
 
 static void writer(u32 n) {
@@ -348,8 +411,7 @@ static void writer(u32 n) {
     yield();
     make_file(n == 0 ? "/fstest/p1" : "/fstest/p2", P_LEN, 4 + n, writer_data[n]);
     end_op();
-    writers_done++;
-    wakeup(&writers_done);
+    proc_done();
 }
 
 static void writer1(void) {
@@ -358,6 +420,127 @@ static void writer1(void) {
 
 static void writer2(void) {
     writer(1);
+}
+
+/* begin_op()'s waits (log.c), each made to happen: the room tests, where
+ * an operation must wait because those in progress could fill the log, and
+ * the commit test, where one must wait for a commit sleeping on the disk.
+ * The files are empty: making one changes /fstest's block, the inode block
+ * and nothing else. */
+static u32 room_waits0;
+static bool r1_logged;
+static bool j1_in;
+static bool j2_in;
+static bool j3_in;
+
+static bool someone_waits_for_room(void) {
+    return log_room_waits > room_waits0;
+}
+
+static bool r1_has_logged(void) {
+    return r1_logged;
+}
+
+static bool j1_j2_in(void) {
+    return j1_in && j2_in;
+}
+
+static bool j3_started(void) {
+    return j3_in;
+}
+
+static bool committing(void) {
+    return log_committing();
+}
+
+/* Room, 1: r1's operation has written blocks when r2 begins one. Both
+ * reserving MAXOPBLOCKS could overflow the log (lh.n + 2 * 10 > 20), so r2
+ * waits, r1 commits alone, then r2 runs: two transactions. */
+static void room1(void) {
+    begin_op();
+    make_file("/fstest/r1", 0, 0, writer_data[0]);
+    r1_logged = true;
+    check(yield_until(someone_waits_for_room), "an operation waits while one that wrote is in progress");
+    end_op();
+    proc_done();
+}
+
+static void room2(void) {
+    yield_until(r1_has_logged);
+    begin_op();
+    make_file("/fstest/r2", 0, 0, writer_data[1]);
+    end_op();
+    proc_done();
+}
+
+/* Room, 2: j1 and j2 are in operations, neither has written, and j3 must
+ * wait (3 * 10 > 20). j1 ends without writing: its end_op() wakes j3, which
+ * now fits beside j2 (2 * 10) and joins its transaction before j2 writes
+ * anything. One commit for both files. */
+static void join1(void) {
+    begin_op();
+    j1_in = true;
+    check(yield_until(someone_waits_for_room), "a third operation waits for room");
+    end_op();
+    proc_done();
+}
+
+static void join2(void) {
+    begin_op();
+    j2_in = true;
+    check(yield_until(j3_started), "an operation ending makes room for a waiting one");
+    make_file("/fstest/j2", 0, 0, writer_data[0]);
+    end_op();
+    proc_done();
+}
+
+static void join3(void) {
+    yield_until(j1_j2_in);
+    begin_op();
+    j3_in = true;
+    make_file("/fstest/j3", 0, 0, writer_data[1]);
+    end_op();
+    proc_done();
+}
+
+/* Commit: c1's end_op() commits, sleeping on the disk; c2 begins an
+ * operation meanwhile, and must wait for the commit to finish: its blocks
+ * go in the next transaction. */
+static void commit1(void) {
+    begin_op();
+    make_file("/fstest/c1", 0, 0, writer_data[0]);
+    end_op();
+    proc_done();
+}
+
+static void commit2(void) {
+    check(yield_until(committing), "a commit sleeps on the disk");
+    begin_op();
+    make_file("/fstest/c2", 0, 0, writer_data[1]);
+    end_op();
+    proc_done();
+}
+
+static void admission_test(void) {
+    static void (*const room[])(void) = {room1, room2};
+    static void (*const join[])(void) = {join1, join2, join3};
+    static void (*const commit[])(void) = {commit1, commit2};
+
+    u32 commits = log_commits;
+    room_waits0 = log_room_waits;
+    bool ran = run_procs(room, 2);
+    check(ran && log_commits == commits + 2, "a waiting operation goes in the next transaction");
+
+    commits = log_commits;
+    room_waits0 = log_room_waits;
+    ran = run_procs(join, 3);
+    check(ran && log_commits == commits + 1, "a woken operation shares the transaction");
+
+    commits = log_commits;
+    u32 commit_waits = log_commit_waits;
+    ran = run_procs(commit, 2);
+    check(ran && log_commit_waits > commit_waits && log_commits == commits + 2,
+          "an operation waits for a commit under way");
 }
 
 /* The link count of the directory or file at `p`, in a transaction of its
@@ -382,6 +565,7 @@ static void write_test(void) {
     fs_count_free(&blocks0, &inodes0);
     u32 commits0 = log_commits;
     int err;
+    struct dinode d;
 
     /* T1: a directory and a file in it. */
     begin_op();
@@ -401,6 +585,14 @@ static void write_test(void) {
     check(fs_unlink("/fstest/a") == 0, "remove /fstest/a");
     end_op();
 
+    /* x: one block, full of the pattern (no zero word at its start). It is
+     * removed just before /fstest/big needs its indirect block, so that
+     * block is x's, reused: it must come zeroed, or big would find x's
+     * bytes as pointers. */
+    begin_op();
+    make_file("/fstest/x", X_LEN, 6, data);
+    end_op();
+
     /* A file bigger than one transaction may write: made empty, then
      * written CHUNK bytes at a time, each in its own transaction (as the
      * write system call will). The reference outlives the transactions. */
@@ -412,17 +604,40 @@ static void write_test(void) {
     }
     end_op();
     bool wrote = big != NULL;
-    for (u32 off = 0; wrote && off < BIG_LEN; off += CHUNK) {
-        u32 n = BIG_LEN - off < CHUNK ? BIG_LEN - off : CHUNK;
+    u32 off;
+    for (off = 0; wrote && off < NDIRECT * BSIZE; off += CHUNK) {
+        wrote = write_chunk(big, off, CHUNK, 3) == CHUNK;
+    }
+
+    /* x removed while still in use (as an open file will be, #67): the
+     * unlink commits its last link, and the inode stays allocated until the
+     * last iput(), in the next transaction. A crash in between leaves it
+     * for the next mount to free. */
+    begin_op();
+    struct inode *x = namei("/fstest/x", &err);
+    check(x != NULL && fs_unlink("/fstest/x") == 0, "remove /fstest/x while it is in use");
+    end_op();
+    u32 x_block = 0;
+    if (x != NULL) {
+        u32 x_inum = x->inum;
+        dinode(x_inum, &d);
+        x_block = d.addrs[0];
+        check(d.type == T_FILE && d.nlink == 0 && x_block != 0, "a file in use keeps its inode and blocks");
         begin_op();
-        ilock(big);
-        fill(data, off, n, 3);
-        wrote = writei(big, data, off, n) == (int)n;
-        iunlock(big);
+        iput(x);
         end_op();
+        dinode(x_inum, &d);
+        check(d.type == T_FREE && d.addrs[0] == 0, "the last user frees it");
+    }
+
+    for (; wrote && off < BIG_LEN; off += CHUNK) {
+        u32 n = BIG_LEN - off < CHUNK ? BIG_LEN - off : CHUNK;
+        wrote = write_chunk(big, off, n, 3) == (int)n;
     }
     check(wrote, "write /fstest/big a piece per transaction");
     if (big != NULL) {
+        dinode(big->inum, &d);
+        check(d.addrs[NDIRECT] == x_block, "big's indirect block is x's freed block, zeroed");
         begin_op();
         iput(big);
         end_op();
@@ -443,22 +658,30 @@ static void write_test(void) {
     check(nlink("/fstest") == 1, "and the link goes with it");
 
     /* Group commit. */
+    static void (*const writers[])(void) = {writer1, writer2};
     u32 commits = log_commits;
-    writers_done = 0;
-    const char *why;
-    bool started = kproc_create("fswrite1", writer1, &why) != NULL;
-    started = started && kproc_create("fswrite2", writer2, &why) != NULL;
-    check(started, "start two writers");
-    while (started && writers_done < 2) {
-        sleep(&writers_done);
-    }
+    check(run_procs(writers, 2), "start two writers");
     check(log_commits == commits + 1, "two writers' operations commit together");
+
+    admission_test();
 
     /* Read it all back. */
     check(holds_pattern("/fstest/b", B_LEN, 2), "/fstest/b reads back");
     check(holds_pattern("/fstest/big", BIG_LEN, 3), "/fstest/big reads back, past its direct blocks");
     check(holds_pattern("/fstest/p1", P_LEN, 4) && holds_pattern("/fstest/p2", P_LEN, 5),
           "the two writers' files read back");
+    static const char *const empty[] = {"/fstest/r1", "/fstest/r2", "/fstest/j2",
+                                        "/fstest/j3", "/fstest/c1", "/fstest/c2"};
+    bool all = true;
+    for (u32 i = 0; i < sizeof empty / sizeof empty[0]; i++) {
+        all = all && holds_pattern(empty[i], 0, 0);
+    }
+    check(all, "the begin_op() tests' files are there");
+
+    /* big goes, with its indirect block and the blocks it lists. */
+    begin_op();
+    check(fs_unlink("/fstest/big") == 0, "remove /fstest/big");
+    end_op();
 
     /* Errors, which change nothing. */
     begin_op();
@@ -492,6 +715,46 @@ static void write_test(void) {
     ls("/fstest");
 }
 
+/* ---- A full disk (FS_TEST_FULL) ---- */
+
+/* Writes /full a chunk per transaction until the disk is full. The tests
+ * give it a disk with 13 free blocks: 12 direct blocks fill, then the 13th
+ * gets the indirect block and finds nothing left for itself. Then the
+ * indirect block must go back (no indirect block in a file of 12 blocks),
+ * leaving 1 block free. */
+static void full_test(void) {
+    int err;
+    begin_op();
+    struct inode *ip = fs_create("/full", T_FILE, 0, 0, &err);
+    check(ip != NULL, "make /full");
+    if (ip != NULL) {
+        iunlock(ip);
+    }
+    end_op();
+    if (ip == NULL) {
+        return;
+    }
+    u32 off = 0;
+    int r;
+    while ((r = write_chunk(ip, off, CHUNK, 7)) > 0) {
+        off += (u32)r;
+    }
+    check(r == -ENOSPC, "writing to a full disk fails with ENOSPC");
+    struct dinode d;
+    dinode(ip->inum, &d);
+    u32 blocks;
+    u32 inodes;
+    fs_count_free(&blocks, &inodes);
+    check(d.size == off && (d.addrs[NDIRECT] != 0) == (off > NDIRECT * BSIZE),
+          "a file has an indirect block only past its direct blocks");
+    check(blocks == (off == NDIRECT * BSIZE ? 1u : 0u), "and no block is lost");
+    begin_op();
+    iput(ip);
+    end_op();
+    check(holds_pattern("/full", off, 7), "/full reads back");
+    kprintf("fs: the disk filled up at %u bytes\n", off);
+}
+
 /* ---- Boot ---- */
 
 static void fs_main(void) {
@@ -508,19 +771,26 @@ static void fs_main(void) {
     if (log_recovered > 0) {
         kprintf("fs: replayed %u blocks from the log\n", log_recovered);
     }
+    if (fs_orphans > 0) {
+        kprintf("fs: freed %u inodes that no directory named\n", fs_orphans);
+    }
     u32 blocks;
     u32 inodes;
     fs_count_free(&blocks, &inodes);
     kprintf("fs: disk 0 mounted: %u blocks (%u free), %u inodes (%u free), %u log blocks%s\n", fs_sb.size,
-            blocks, fs_sb.ninodes, inodes, fs_sb.nlog, fs_readonly ? ", read-only" : "");
+            blocks, fs_sb.ninodes, inodes, fs_sb.nlog,
+            fs_log_too_small ? ", read-only: the log is too small to write" : fs_readonly ? ", read-only" : "");
     ls("/");
     tested = true;
     read_checks();
-    if (fs_test == FS_TEST_WRITE) {
+    if (fs_test == FS_TEST_WRITE || fs_test == FS_TEST_FULL) {
         if (fs_readonly) {
-            kprintf("fs: write test skipped: the disk is read-only\n");
-        } else {
+            kprintf("fs: write test skipped: the %s\n",
+                    fs_log_too_small ? "log is too small to write" : "disk is read-only");
+        } else if (fs_test == FS_TEST_WRITE) {
             write_test();
+        } else {
+            full_test();
         }
     }
 }

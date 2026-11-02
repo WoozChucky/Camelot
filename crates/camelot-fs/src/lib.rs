@@ -7,8 +7,9 @@
 //! * [`mkfs`]: builds an image, empty or filled from a host directory;
 //! * [`read`]: reads one back ([`read::Fs`]: paths, directories, files), seeing
 //!   a pending log as recovery would;
-//! * [`fsck`]: checks every consistency rule of the document, and replays the
-//!   log ([`fsck::recover`]).
+//! * [`fsck`]: checks every consistency rule of the document, replays the
+//!   log ([`fsck::recover`]) and frees orphaned inodes
+//!   ([`fsck::free_orphans`]), as the kernel's mount does.
 //!
 //! An image is a byte slice holding the disk from its first block. Everything
 //! here works on images in memory; the `camelot-fs` binary reads and writes
@@ -492,8 +493,16 @@ pub fn superblock(image: &[u8]) -> Result<Superblock, String> {
     if !image.len().is_multiple_of(SECTOR_SIZE) {
         return Err(format!("{} bytes is not a whole number of sectors", image.len()));
     }
-    let sb = Superblock::decode(block(image, SUPER_BLOCK));
+    let b = block(image, SUPER_BLOCK);
+    let sb = Superblock::decode(b);
     sb.validate((image.len() / BSIZE) as u64)?;
+    if let Some(i) = b[SUPERBLOCK_SIZE..].iter().position(|&x| x != 0) {
+        return Err(format!(
+            "superblock byte {} is not zero (bytes {SUPERBLOCK_SIZE} to {} must be)",
+            SUPERBLOCK_SIZE + i,
+            BSIZE - 1
+        ));
+    }
     Ok(sb)
 }
 

@@ -239,7 +239,7 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `blktest.c` | the disk self-test, in kernel processes: three readers at once, write and read back a scratch block (restored afterwards), errors, LRU reuse |
 | `log.c` | the filesystem's write-ahead log (xv6's): `begin_op()`/`end_op()` around each operation, `log_write()` pinning changed buffers, group commit (slots, flush, header, flush, install, flush, empty header, flush), and the replay at mount |
 | `fs.c` | the filesystem (xv6's): `fs_mount()`, the bitmap allocator, the inode cache (`iget`/`ilock`/`iput`, `readi`/`writei`), directories, path lookup (`namei`/`nameiparent`), `fs_create()`/`fs_unlink()` |
-| `fstest.c` | `fs_boot()`: mounts disk 0 in a kernel process, lists `/`, runs the filesystem self-test (and, with `fs_test` patched to 2, its transactions) |
+| `fstest.c` | `fs_boot()`: mounts disk 0 in a kernel process, lists `/`, runs the filesystem self-test (and, with `fs_test` patched to 2, its transactions; to 3, filling the disk) |
 | `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin` |
 | `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()` and `wfi()` |
 | `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, the filesystem (`fs_boot`), then the user-space shell as the first process |

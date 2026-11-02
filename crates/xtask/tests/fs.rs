@@ -7,7 +7,8 @@
 //! The crash tests stop the machine after each sector the self-test's
 //! transactions write, check with fsck that the disk replayed is
 //! consistent and holds all of each transaction or none of it, then reboot
-//! the kernel on it and check it replays the log exactly as the host does.
+//! the kernel on it and check it replays the log (and frees the inodes left
+//! with no links) exactly as the host does.
 
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::read::Fs;
@@ -21,14 +22,16 @@ use xtask::repo_root;
 /// Values of the kernel's `fs_test` (kernel/include/fstest.h).
 const FS_TEST_READ: u32 = 1;
 const FS_TEST_WRITE: u32 = 2;
+const FS_TEST_FULL: u32 = 3;
 
 /// Checks the self-test runs (kernel/fstest.c): the read checks, one fewer
 /// without a /bin, and the transactions'.
 const READ_CHECKS: u32 = 12;
 const READ_CHECKS_NO_BIN: u32 = 11;
-const WRITE_CHECKS: u32 = 34;
+const WRITE_CHECKS: u32 = 61;
+const FULL_CHECKS: u32 = 5;
 /// Transactions the write test commits (`COMMITS` in kernel/fstest.c).
-const COMMITS: usize = 12;
+const COMMITS: usize = 21;
 
 /// The write test's files (kernel/fstest.c): lengths and pattern seeds.
 const B_LEN: usize = 700;
@@ -241,18 +244,52 @@ fn root_image(size: u32) -> Vec<u8> {
     .unwrap()
 }
 
+/// The layout of the small images.
+const SMALL: Options = Options {
+    size: 160,
+    ninodes: 32,
+    nlog: 21,
+};
+
 /// A small image without /bin: a README and an empty directory. Small, so
 /// that the crash tests' snapshots are cheap.
 fn small_image() -> Vec<u8> {
-    let mut fs = Mkfs::new(&Options {
-        size: 160,
-        ninodes: 32,
-        nlog: 21,
-    })
-    .unwrap();
+    small_image_with(&SMALL)
+}
+
+fn small_image_with(opts: &Options) -> Vec<u8> {
+    let mut fs = Mkfs::new(opts).unwrap();
     fs.add_file("/README", b"a small disk\n").unwrap();
     fs.mkdir("/tmp").unwrap();
     fs.finish()
+}
+
+/// A small image holding only /filler, a file that leaves exactly `free`
+/// data blocks free. mkfs allocates in order, so those are the last ones.
+fn image_with_free_blocks(free: u32) -> Vec<u8> {
+    let have = fsck::check(&Mkfs::new(&SMALL).unwrap().finish())
+        .unwrap()
+        .free_blocks;
+    // The filler's blocks, and its indirect block past 12.
+    let used = have - free;
+    let blocks = if used > 12 { used - 1 } else { used };
+    let mut fs = Mkfs::new(&SMALL).unwrap();
+    fs.add_file("/filler", &pattern(blocks as usize * BSIZE, 9))
+        .unwrap();
+    let image = fs.finish();
+    assert_eq!(fsck::check(&image).unwrap().free_blocks, free);
+    image
+}
+
+/// `image` with its log slots zeroed: what is left to compare once a
+/// transaction has gone through them.
+fn without_log_slots(image: &[u8]) -> Vec<u8> {
+    let sb = camelot_fs::superblock(image).unwrap();
+    let mut out = image.to_vec();
+    for b in sb.logstart + 1..sb.inodestart {
+        camelot_fs::block_mut(&mut out, b).fill(0);
+    }
+    out
 }
 
 fn programs() -> usize {
@@ -261,11 +298,15 @@ fn programs() -> usize {
         .len()
 }
 
-/// A disk's state as the files see it: every path, its inode, type, links
-/// and contents, after replaying the log.
-fn state(image: &[u8]) -> Vec<(String, u32, u16, u16, Vec<u8>)> {
+/// A disk's state, after replaying the log: every path, its inode, type,
+/// links and contents, and the free blocks and inodes (which an inode with
+/// no links, in no directory, still holds until it is freed).
+type State = (Vec<(String, u32, u16, u16, Vec<u8>)>, u32, u32);
+
+fn state(image: &[u8]) -> State {
     let fs = Fs::open(image).unwrap();
-    fs.walk()
+    let files = fs
+        .walk()
         .unwrap()
         .into_iter()
         .map(|(path, e)| {
@@ -276,7 +317,9 @@ fn state(image: &[u8]) -> Vec<(String, u32, u16, u16, Vec<u8>)> {
             };
             (path, e.inum, e.inode.kind, e.inode.nlink, contents)
         })
-        .collect()
+        .collect();
+    let r = fsck::check(image).unwrap();
+    (files, r.free_blocks, r.free_inodes)
 }
 
 /// The block writes among `ops`, two sectors each, with the first word of
@@ -401,7 +444,8 @@ fn the_kernel_mounts_the_root_image_and_lists_it() {
     );
     assert!(host.ls("/").unwrap().contains(" README\n"));
     // Reading changes nothing; the only writes were the disk self-test's
-    // to its scratch block (the last), which it put back.
+    // to its scratch block (the last), which on a disk with a filesystem
+    // it writes with its own contents.
     assert_eq!(run.disk, image);
     let last = (image.len() / BSIZE) as u64 - 1;
     for op in &run.record.ops {
@@ -414,9 +458,10 @@ fn the_kernel_mounts_the_root_image_and_lists_it() {
 #[test]
 fn the_kernels_transactions_are_what_the_host_reads_back() {
     // The write test's transactions on the root image: fsck finds the disk
-    // consistent, the host reads the files the kernel wrote (one past its
-    // direct blocks) and finds the removed ones gone, the kernel's listing
-    // of /fstest is the host's, and every commit followed the protocol.
+    // consistent, the host reads the files the kernel wrote and finds the
+    // removed ones gone (one past its direct blocks, whose blocks all came
+    // back), the kernel's listing of /fstest is the host's, and every commit
+    // followed the protocol.
     let image = root_image(2048);
     let before = fsck::check(&image).unwrap();
     let root_listing = Fs::open(&image).unwrap().ls("/").unwrap();
@@ -437,19 +482,22 @@ fn the_kernels_transactions_are_what_the_host_reads_back() {
         )
     );
     assert_eq!(fs.read_file("/fstest/b").unwrap(), pattern(B_LEN, 2));
-    assert_eq!(fs.read_file("/fstest/big").unwrap(), pattern(BIG_LEN, 3));
     assert_eq!(fs.read_file("/fstest/p1").unwrap(), pattern(P_LEN, 4));
     assert_eq!(fs.read_file("/fstest/p2").unwrap(), pattern(P_LEN, 5));
-    let big = fs.inode(fs.lookup("/fstest/big").unwrap()).unwrap();
-    assert_ne!(big.indirect(), 0);
-    assert!(fs.lookup("/fstest/a").is_err());
-    assert!(fs.lookup("/fstest/d").is_err());
+    for gone in ["a", "x", "big", "d"] {
+        assert!(fs.lookup(&format!("/fstest/{gone}")).is_err(), "{gone}");
+    }
     let names: Vec<String> = fs.list("/fstest").unwrap().iter().map(|e| e.name()).collect();
-    // big took a's free slot, p1 d's.
-    assert_eq!(names, [".", "..", "big", "b", "p1", "p2"]);
-    assert_eq!((after.dirs, after.files), (before.dirs + 1, before.files + 4));
-    assert_eq!(after.free_blocks, before.free_blocks - 21);
-    assert_eq!(after.free_inodes, before.free_inodes - 5);
+    // Free slots are reused: x took a's, then d x's, then p1 d's.
+    assert_eq!(
+        names,
+        [".", "..", "p1", "b", "p2", "r1", "r2", "j3", "j2", "c1", "c2"]
+    );
+    assert_eq!((after.dirs, after.files), (before.dirs + 1, before.files + 9));
+    assert_eq!(after.orphans, 0);
+    // /fstest's block, b's, and p1's and p2's two each.
+    assert_eq!(after.free_blocks, before.free_blocks - 6);
+    assert_eq!(after.free_inodes, before.free_inodes - 10);
     let disk_blocks = (run.disk.len() / BSIZE) as u32;
     assert_eq!(check_commits(&run.record.ops, &after.sb, disk_blocks), COMMITS);
 }
@@ -462,9 +510,11 @@ fn a_crash_after_any_write_leaves_whole_transactions() {
     // those disks is consistent, and holds the state before or after each
     // transaction, never one in between: the state changes exactly when a
     // header with n > 0 is written, to the state of that commit, in order.
-    // Then the kernel boots on each one, replays its log as the host did
-    // (the disk afterwards is byte for byte the host's replay) and passes
-    // its self-test.
+    // Then the kernel boots on each one, replays its log and frees an inode
+    // left with no links (the write test removes /fstest/x while holding a
+    // reference to it, and frees it a transaction later) as the host does
+    // (the disk afterwards is byte for byte the host's, but for the log
+    // slots that freeing went through) and passes its self-test.
     let image = small_image();
     let run = boot(
         image.clone(),
@@ -502,8 +552,18 @@ fn a_crash_after_any_write_leaves_whole_transactions() {
         }
     }
     assert!(pending > COMMITS, "{pending} disks with a transaction to replay");
+    assert!(
+        snapshots.iter().any(|s| fsck::check(s).unwrap().orphans == 1),
+        "no disk with an orphan"
+    );
     assert_eq!(commits.len(), COMMITS);
     assert_eq!(states[1..], commits[..]);
+    // The host reads /fstest/big, past its direct blocks, as the kernel
+    // wrote it, before it is removed.
+    let big = pattern(BIG_LEN, 3);
+    assert!(states
+        .iter()
+        .any(|(files, _, _)| files.iter().any(|f| f.0 == "/fstest/big" && f.4 == big)));
     assert_eq!(states.last().unwrap(), &state(&run.disk));
 
     // Reboot on every one, several machines at a time.
@@ -519,6 +579,7 @@ fn a_crash_after_any_write_leaves_whole_transactions() {
                     let replayed = fsck::check(snap).unwrap().replayed;
                     let mut want = snap.clone();
                     fsck::recover(&mut want).unwrap();
+                    let orphans = fsck::free_orphans(&mut want).unwrap();
                     let again = boot(snap.clone(), READ);
                     assert_eq!(
                         again.result,
@@ -532,14 +593,28 @@ fn a_crash_after_any_write_leaves_whole_transactions() {
                         replayed > 0,
                         "after write {i}:\n{lines}"
                     );
+                    assert_eq!(
+                        lines.contains(&format!("fs: freed {orphans} inodes that no directory named\n")),
+                        orphans > 0,
+                        "after write {i}:\n{lines}"
+                    );
                     assert!(
                         lines.ends_with(&passed(READ_CHECKS_NO_BIN)),
                         "after write {i}:\n{lines}"
                     );
-                    assert!(
-                        again.disk == want,
-                        "after write {i}: the kernel's replay is not the host's"
-                    );
+                    if orphans == 0 {
+                        assert!(
+                            again.disk == want,
+                            "after write {i}: the kernel's replay is not the host's"
+                        );
+                    } else {
+                        assert!(
+                            without_log_slots(&again.disk) == without_log_slots(&want),
+                            "after write {i}: the kernel's recovery is not the host's"
+                        );
+                    }
+                    let r = fsck::check(&again.disk).unwrap();
+                    assert_eq!((r.replayed, r.orphans), (0, 0), "after write {i}");
                 }
             });
         }
@@ -676,6 +751,10 @@ fn a_disk_that_cannot_be_mounted_is_left_alone() {
         ),
         (broken(&|i| i.truncate(100 * BSIZE)), "bigger than the disk"),
         (
+            broken(&|i| i[BSIZE + 100] = 0xff),
+            "the superblock's bytes past its fields are not zero",
+        ),
+        (
             broken(&|i| set_u32(i, sb.logstart, 0, sb.nlog)),
             "the log header counts more blocks than the log has",
         ),
@@ -743,6 +822,118 @@ fn a_read_only_root_is_read_but_never_written() {
     assert!(run.disk == image);
     // The device refuses writes before the backend sees them: nothing came.
     assert_eq!(run.record.ops, []);
+}
+
+#[test]
+fn a_full_disk_leaves_no_indirect_block_behind() {
+    // 13 free blocks: /full's 12 direct blocks take 12, then its 13th block
+    // gets the indirect block and finds no block for itself. The indirect
+    // block must go back: a file of 12 blocks has none, and fsck would find
+    // it allocated for nothing.
+    let image = image_with_free_blocks(13);
+    let before = fsck::check(&image).unwrap();
+    let run = boot(
+        image,
+        Boot {
+            fs_test: FS_TEST_FULL,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    let lines = fs_lines(&run.out);
+    assert!(
+        lines.ends_with(&format!(
+            "fs: the disk filled up at {} bytes\n{}",
+            12 * BSIZE,
+            passed(READ_CHECKS_NO_BIN + FULL_CHECKS)
+        )),
+        "{lines}"
+    );
+    let after = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    assert_eq!(after.free_blocks, 1);
+    assert_eq!(after.files, before.files + 1);
+    let fs = Fs::open(&run.disk).unwrap();
+    assert_eq!(fs.read_file("/full").unwrap(), pattern(12 * BSIZE, 7));
+    assert_eq!(fs.inode(fs.lookup("/full").unwrap()).unwrap().indirect(), 0);
+}
+
+#[test]
+fn a_log_too_small_for_an_operation_is_mounted_read_only() {
+    // The format allows 1 to 127 log slots; an operation may change
+    // MAXOPBLOCKS (10) blocks. With fewer slots the kernel only reads the
+    // disk, rather than panic on the first big transaction.
+    let image = small_image_with(&Options { nlog: 10, ..SMALL });
+    let report = fsck::check(&image).unwrap();
+    let run = boot(image.clone(), WRITE);
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    assert_eq!(
+        fs_lines(&run.out),
+        format!(
+            "{}fs: ls /\n{}fs: write test skipped: the log is too small to write\n{}",
+            mount_line(&report, false).replace("\n", ", read-only: the log is too small to write\n"),
+            Fs::open(&image).unwrap().ls("/").unwrap(),
+            passed(READ_CHECKS_NO_BIN)
+        )
+    );
+    assert!(run.disk == image);
+    // 11 blocks, a header and MAXOPBLOCKS slots, is enough (for one
+    // operation at a time): the disk is filled a transaction at a time.
+    let image = small_image_with(&Options { nlog: 11, ..SMALL });
+    let run = boot(
+        image,
+        Boot {
+            fs_test: FS_TEST_FULL,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    assert!(
+        run.out.contains(&passed(READ_CHECKS_NO_BIN + FULL_CHECKS)),
+        "{}",
+        run.out
+    );
+    let r = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    assert_eq!(r.free_blocks, 0);
+}
+
+#[test]
+fn the_disk_self_test_never_changes_a_filesystems_blocks() {
+    // The disk self-test writes its scratch block, the disk's last, before
+    // the filesystem is mounted. Here that block is /filler's: wherever the
+    // machine stops, the disk holds what it held, so the file is intact.
+    let image = image_with_free_blocks(0);
+    let last = (image.len() / BSIZE) as u64 - 1;
+    let full = boot(image.clone(), READ);
+    assert_eq!(full.result, RunResult::Exited(0), "{}", full.out);
+    assert!(full.disk == image);
+    let writes: Vec<u64> = full
+        .record
+        .ops
+        .iter()
+        .filter_map(|o| match o {
+            Op::Write { sector, .. } => Some(*sector),
+            Op::Flush => None,
+        })
+        .collect();
+    assert_eq!(
+        writes,
+        [2 * last, 2 * last + 1, 2 * last, 2 * last + 1],
+        "the scratch block, written twice"
+    );
+    // A block's two sectors go to the disk in one request.
+    for n in (2..=writes.len()).step_by(2) {
+        let run = boot(
+            image.clone(),
+            Boot {
+                stop_after: Some(n),
+                ..READ
+            },
+        );
+        assert!(
+            run.disk == image,
+            "stopped after sector write {n}: the disk changed"
+        );
+    }
 }
 
 #[test]

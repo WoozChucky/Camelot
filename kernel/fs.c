@@ -26,6 +26,8 @@
 
 bool fs_mounted;
 bool fs_readonly;
+bool fs_log_too_small;
+u32 fs_orphans;
 u32 fs_dev;
 struct superblock fs_sb;
 
@@ -74,6 +76,34 @@ static const char *check_superblock(const struct superblock *sb, u32 disk_sector
     return NULL;
 }
 
+/* Frees the inodes a crash left allocated with no links. fs_unlink() takes
+ * a file's last link in one transaction, and the last iput() frees it in
+ * another, when whoever still used it (an open file, #67) lets go; a crash
+ * in between leaves it on the disk, unnamed (docs/camelot-fs.md, "Link
+ * count"). Each is freed in a transaction of its own, by iput() as it would
+ * have been. The root is never one: if its count is 0 the disk is broken,
+ * and freeing it would make that worse. Returns how many were freed. */
+static u32 free_orphans(void) {
+    u32 n = 0;
+    for (u32 inum = ROOTINO + 1; inum < fs_sb.ninodes; inum++) {
+        struct buf *b = fs_bread(fs_dev, IBLOCK(inum, fs_sb));
+        const struct dinode *dip = (const struct dinode *)b->data + inum % IPB;
+        bool orphan = dip->type != T_FREE && dip->nlink == 0;
+        brelse(b);
+        if (!orphan) {
+            continue;
+        }
+        begin_op();
+        struct inode *ip = iget(fs_dev, inum);
+        ilock(ip); /* reads it in: valid, with no links */
+        iunlock(ip);
+        iput(ip); /* the last reference: frees its blocks and the inode */
+        end_op();
+        n++;
+    }
+    return n;
+}
+
 int fs_mount(u32 dev, const char **why) {
     if (fs_mounted) {
         panic("fs_mount: already mounted");
@@ -90,12 +120,19 @@ int fs_mount(u32 dev, const char **why) {
         return -EIO;
     }
     memcpy(&fs_sb, b->data, sizeof fs_sb);
+    bool padded = true;
+    for (u32 i = sizeof fs_sb; i < BSIZE; i++) {
+        padded = padded && b->data[i] == 0;
+    }
     brelse(b);
     if (fs_sb.magic != FS_MAGIC) {
         *why = "no filesystem";
         return -ENOENT;
     }
     const char *bad = check_superblock(&fs_sb, blk_capacity(dev));
+    if (bad == NULL && !padded) {
+        bad = "the superblock's bytes past its fields are not zero";
+    }
     if (bad != NULL) {
         *why = bad;
         return -EINVAL;
@@ -114,7 +151,16 @@ int fs_mount(u32 dev, const char **why) {
         *why = "the root is not a directory";
         return -EINVAL;
     }
+    /* An operation may change MAXOPBLOCKS blocks, and begin_op() lets one
+     * start alone whatever the log's size: with fewer slots it could
+     * overflow the transaction. The format allows such a log (the
+     * replay above is fine), but the kernel only reads that disk. */
+    fs_log_too_small = !fs_readonly && fs_sb.nlog - 1 < MAXOPBLOCKS;
+    if (fs_log_too_small) {
+        fs_readonly = true;
+    }
     fs_mounted = true;
+    fs_orphans = fs_readonly ? 0 : free_orphans();
     return 0;
 }
 
@@ -342,6 +388,7 @@ static u32 bmap(struct inode *ip, u32 bn, bool alloc) {
     if (bn >= NINDIRECT) {
         panic("bmap: past the largest file");
     }
+    bool new_indirect = false;
     if (ip->addrs[NDIRECT] == 0) {
         if (!alloc) {
             return 0;
@@ -350,6 +397,7 @@ static u32 bmap(struct inode *ip, u32 bn, bool alloc) {
         if (ip->addrs[NDIRECT] == 0) {
             return 0;
         }
+        new_indirect = true;
     }
     struct buf *b = fs_bread(ip->dev, ip->addrs[NDIRECT]);
     u32 *a = (u32 *)b->data;
@@ -362,6 +410,14 @@ static u32 bmap(struct inode *ip, u32 bn, bool alloc) {
         }
     }
     brelse(b);
+    if (addr == 0 && new_indirect) {
+        /* The indirect block was got for this block, and there is none for
+         * it (the disk is full): give the indirect block back. A file has
+         * one exactly when it has more than NDIRECT blocks (no holes), and
+         * the caller writes the inode with what bmap() leaves in addrs. */
+        bfree(ip->dev, ip->addrs[NDIRECT]);
+        ip->addrs[NDIRECT] = 0;
+    }
     return addr;
 }
 

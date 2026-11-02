@@ -161,6 +161,41 @@ fn fsck_reports_damage_and_recover_replays_the_log() {
     assert!(block(&after, sb.logstart).iter().all(|&b| b == 0));
     assert_eq!(&block(&after, readme.addrs[0])[..5], b"HELLO");
     assert_eq!(fsck::check(&after).unwrap().replayed, 0);
+
+    // An orphan: README's entry gone and its count 0, as a crash leaves a
+    // file unlinked while in use. Clean, reported; --recover frees it.
+    let mut orphan = after.clone();
+    let root = camelot_fs::read_inode(&orphan, &sb, camelot_fs::ROOT_INODE);
+    let inum = fs.lookup("/README").unwrap();
+    let dir = block_mut(&mut orphan, root.addrs[0]);
+    let at = (0..dir.len())
+        .step_by(camelot_fs::DIRENT_SIZE)
+        .find(|&i| u32::from(u16::from_le_bytes([dir[i], dir[i + 1]])) == inum)
+        .unwrap();
+    dir[at..at + 2].fill(0);
+    let mut d = camelot_fs::read_inode(&orphan, &sb, inum);
+    d.nlink = 0;
+    camelot_fs::write_inode(&mut orphan, &sb, inum, &d);
+    std::fs::write(&img, &orphan).unwrap();
+    let o = run(&["fsck", img_s]);
+    assert!(o.status.success(), "{o:?}");
+    assert!(
+        stdout(&o).starts_with("1 orphaned inodes (no links, in no directory) for the next mount to free\n"),
+        "{}",
+        stdout(&o)
+    );
+    let o = run(&["fsck", "--recover", img_s]);
+    assert!(o.status.success(), "{o:?}");
+    assert!(
+        stdout(&o).starts_with("freed 1 orphaned inodes\n"),
+        "{}",
+        stdout(&o)
+    );
+    let freed = std::fs::read(&img).unwrap();
+    let r = fsck::check(&freed).unwrap();
+    assert_eq!(r.orphans, 0);
+    assert_eq!(r.free_blocks, fsck::check(&after).unwrap().free_blocks + 1);
+    assert_eq!(camelot_fs::read_inode(&freed, &sb, inum).kind, camelot_fs::T_FREE);
 }
 
 #[test]

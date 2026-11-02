@@ -52,6 +52,8 @@ static struct {
 
 u32 log_recovered;
 u32 log_commits;
+u32 log_room_waits;
+u32 log_commit_waits;
 
 /* The replay's list of home blocks: up to LOG_MAX - 1, whatever LOGSIZE is,
  * since the disk may come from a writer with a bigger log. */
@@ -191,17 +193,25 @@ int log_init(u32 dev, const struct superblock *sb, const char **why) {
 void begin_op(void) {
     for (;;) {
         if (log.committing) {
+            log_commit_waits++;
             sleep(&log);
         } else if (log.lh.n + (log.outstanding + 1) * MAXOPBLOCKS > log.slots && log.outstanding > 0) {
             /* This operation might fill the log: wait for the transaction
-             * to commit. (Alone, an operation always starts: a log smaller
-             * than MAXOPBLOCKS only limits what it may write.) */
+             * to commit, or for an operation in it to end without having
+             * used all of its room. (Alone, an operation always starts: a
+             * writable mount has at least MAXOPBLOCKS slots, see
+             * fs_mount(), and a read-only one writes nothing.) */
+            log_room_waits++;
             sleep(&log);
         } else {
             log.outstanding++;
             return;
         }
     }
+}
+
+bool log_committing(void) {
+    return log.committing;
 }
 
 void end_op(void) {

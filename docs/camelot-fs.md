@@ -8,7 +8,8 @@ against each other:
   root at boot (`docs/excalibur-spec.md` section 10, "Kernel filesystem");
 - the host's, the `camelot-fs` crate (`crates/camelot-fs`): `mkfs` builds
   images from a host directory, `fsck` checks every rule below and replays a
-  pending log, and `ls`/`cat` read files back. `cargo xtask fs` uses it to
+  pending log and frees orphaned inodes as a mount does, and `ls`/`cat` read
+  files back. `cargo xtask fs` uses it to
   build the root image with the user programs.
 
 The design is xv6's (MIT 6.1810), kept simple enough to learn from: a
@@ -60,7 +61,10 @@ superblock stores the results anyway, and a reader must check they agree.
 | 32 | `bmapstart` (u32) | `inodestart` + ceil(`ninodes` / 16) |
 | 36 | `datastart` (u32) | `bmapstart` + ceil(`size` / 8192) |
 
-Bytes 40 to 1023 are zero. Limits: 2 ≤ `nlog` ≤ 128; 2 ≤ `ninodes` ≤ 65536
+Bytes 40 to 1023 are zero (readers check it: a superblock with other bytes
+there is broken). Limits: 2 ≤ `nlog` ≤ 128 (the kernel writes only to a
+filesystem whose log has room for one operation, 11 blocks or more; see
+"Limits on transactions"); 2 ≤ `ninodes` ≤ 65536
 (inode numbers must fit a directory entry's `u16`); `datastart` < `size`, so
 there is at least one data block (the root directory's); `size` × 2 sectors
 must fit on the disk. A filesystem is at most 2^31 blocks (the buffer cache's
@@ -118,9 +122,17 @@ inode, not counting any `.` entry. A file in one directory has 1. A
 directory has 1 for its entry in its parent (the root, which has none: its
 own `..`, which names itself) plus 1 for the `..` of each subdirectory: 1 +
 the number of its subdirectories.
-An allocated inode always has `nlink` ≥ 1 on a consistent disk: the kernel
-frees an inode whose count reaches 0 when its last user lets go (no inode is
-held across a reboot, so none is left at 0).
+**Orphans.** Removing an inode's last entry and freeing the inode are two
+transactions: the kernel's unlink writes `nlink` = 0, and the inode is freed
+when its last user lets go, which may be much later (a file still open,
+#67). A crash in between leaves an **orphan** on the disk: an allocated
+inode with `nlink` 0, named by no entry, its blocks still marked in use.
+That is allowed (see "Consistency rules"): nothing can reach it, and the
+next writable mount frees it, after the log's recovery and as the last
+user would have: its blocks are marked free in the bitmap, and its `type`,
+`size` and pointers set to 0, one transaction per orphan. Every other
+allocated inode has `nlink` ≥ 1. The root is never an orphan: a root with
+`nlink` 0 is a broken disk.
 
 ## Directories
 
@@ -222,7 +234,8 @@ follows the rules above; if not, the filesystem is corrupt and must not be
 mounted), install every slot to its home block as in step 5, flush, write an
 all-zero header, flush. Installing is idempotent, so a crash during recovery
 is harmless: the next mount does it again. A disk that is read-only and has
-`n` > 0 cannot be recovered, and is not mounted.
+`n` > 0 cannot be recovered, and is not mounted. A writable mount then frees
+the orphans (see "Link count"), in transactions of their own.
 
 Readers that do not write (`camelot-fs ls`, `fsck` without `--recover`) see
 the disk as recovery would leave it: they read a block from its slot when the
@@ -234,7 +247,11 @@ kernel. A block changed twice in one transaction takes one slot (absorption).
 Each operation reserves `MAXOPBLOCKS` = 10 blocks, and operations of several
 processes may share one transaction (group commit): a new operation waits
 while the ones in progress could fill the log, and the transaction commits
-when the last operation in it ends.
+when the last operation in it ends. An operation alone always starts, so the
+log must have room for one: the kernel mounts a filesystem whose log has
+fewer than `MAXOPBLOCKS` slots (`nlog` < 11) read-only (after replaying its
+log, which needs no room). Such a disk is valid; `camelot-fs mkfs --log`
+can make one.
 
 ## Consistency rules
 
@@ -247,11 +264,16 @@ A disk is consistent, after replaying the log, when:
 4. the bitmap marks exactly the blocks before `datastart` and the blocks some
    inode uses, and no bit at or past `size`;
 5. every directory follows the rules of "Directories", and the directories
-   form one tree under the root that reaches every allocated inode;
+   form one tree under the root that reaches every allocated inode but the
+   orphans (an orphaned directory's entries are not part of the tree: its
+   `..` doesn't count for its old parent);
 6. every allocated inode's `nlink` is the number of entries naming it, `.`
-   entries not counted.
+   entries not counted; an inode no entry names has `nlink` 0 (an orphan,
+   which the next mount frees) or is an error.
 
-`camelot-fs fsck` checks all of these and reports each break it finds. The
+`camelot-fs fsck` checks all of these and reports each break it finds, and
+the orphans it found; `fsck --recover` replays the log and frees them, as a
+mount would. The
 kernel trusts a mounted disk and checks only the superblock and the log
 header; a broken disk may make it panic.
 

@@ -5,10 +5,12 @@
 #include "types.h"
 
 /* What the self-test does, from `fs_test` in fstest.c: the image ships with
- * FS_TEST_READ; tests patch it to FS_TEST_WRITE for the transactions (on a
- * scratch disk: they leave /fstest behind). */
+ * FS_TEST_READ; tests patch it to FS_TEST_WRITE for the transactions, or
+ * FS_TEST_FULL to fill the disk (on scratch disks: they leave /fstest or
+ * /full behind). */
 #define FS_TEST_READ 1
 #define FS_TEST_WRITE 2
+#define FS_TEST_FULL 3
 
 extern volatile u32 fs_test;
 

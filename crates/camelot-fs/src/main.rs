@@ -16,10 +16,13 @@ commands:
         (its files and subdirectories) if given. --size is in 1 KiB blocks, or
         with a K or M suffix in KiB or MiB (default 2048 blocks, 2 MiB);
         --inodes counts inode slots (default 256), --log the log's blocks with
-        its header (default 21)
+        its header (default 21; the kernel mounts a log of fewer than 11
+        blocks read-only)
   fsck [--recover] IMAGE
         check every consistency rule; a committed transaction still in the log
-        is checked as replayed, and --recover writes the replay to IMAGE
+        is checked as replayed, and --recover writes the replay to IMAGE, then
+        frees the inodes a crash left with no links, as the kernel's mount
+        does
   ls IMAGE [PATH]
         list a directory (default /): type, inode, links, size, name
   cat IMAGE PATH
@@ -110,14 +113,27 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             let path = Path::new(path);
             let mut image = read_image(path)?;
             match fsck::check(&image) {
-                Ok(r) => {
-                    if r.replayed > 0 {
-                        if recover {
-                            fsck::recover(&mut image)?;
-                            std::fs::write(path, &image).map_err(|e| format!("{}: {e}", path.display()))?;
-                            println!("replayed {} blocks from the log", r.replayed);
-                        } else {
+                Ok(mut r) => {
+                    if recover && (r.replayed > 0 || r.orphans > 0) {
+                        let replayed = fsck::recover(&mut image)?;
+                        let freed = fsck::free_orphans(&mut image)?;
+                        std::fs::write(path, &image).map_err(|e| format!("{}: {e}", path.display()))?;
+                        if replayed > 0 {
+                            println!("replayed {replayed} blocks from the log");
+                        }
+                        if freed > 0 {
+                            println!("freed {freed} orphaned inodes");
+                        }
+                        r = fsck::check(&image).map_err(|p| p.join("\n"))?;
+                    } else {
+                        if r.replayed > 0 {
                             println!("the log holds a committed transaction of {} blocks", r.replayed);
+                        }
+                        if r.orphans > 0 {
+                            println!(
+                                "{} orphaned inodes (no links, in no directory) for the next mount to free",
+                                r.orphans
+                            );
                         }
                     }
                     println!(
