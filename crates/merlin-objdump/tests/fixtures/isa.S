@@ -1,9 +1,9 @@
-# merlin-objdump fixture: every RV32IM/Zicsr/Zifencei/privileged encoding,
+# merlin-objdump fixture: every RV32IMA/Zicsr/Zifencei/privileged encoding,
 # the operand forms where llvm-objdump picks a pseudo-instruction (and the
 # tie-breaks when both registers are zero), Xcal words, data words in code,
 # and auipc+jalr pairs whose targets the disassembler resolves (or must not).
 # Built by scripts/gen-objdump-golden.sh:
-#   clang --target=riscv32 -march=rv32im_zicsr_zifencei -mabi=ilp32 -c -mno-relax isa.S -o isa.o
+#   clang --target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32 -c -mno-relax isa.S -o isa.o
 
     .text
     .globl isa_start
@@ -211,4 +211,41 @@ regs:
     jalr ra, 0(a3)
     auipc a3, 0
     fence
+    jalr ra, 0(a3)
+atomics:
+    # The A extension: every mnemonic, every ordering suffix, rd = zero.
+    lr.w a0, (a1)
+    lr.w.aq t0, (s1)
+    lr.w.rl zero, (t6)
+    lr.w.aqrl a5, (sp)
+    sc.w a0, a1, (a2)
+    sc.w.aq t0, t1, (t2)
+    sc.w.rl s1, s2, (s3)
+    sc.w.aqrl a5, zero, (a7)
+    amoswap.w a0, a1, (a2)
+    amoadd.w.aq a3, a4, (a5)
+    amoxor.w.rl s6, s7, (s8)
+    amoand.w.aqrl a6, a7, (ra)
+    amoor.w zero, a2, (tp)
+    amomin.w.aq a5, s2, (t2)
+    amomax.w.rl s5, t3, (a0)
+    amominu.w.aqrl s8, t6, (a3)
+    amomaxu.w t3, tp, (a7)
+    # Reserved: lr.w with rs2 != 0, and amocas.w (Zacas, not in Excalibur).
+    .word 0x1015a52f
+    .word 0x2805a52f
+    # lr/sc/amo write rd, so they forget a tracked rd; reading it as the
+    # address keeps it.
+    auipc a3, 0
+    amoswap.w a3, a1, (a0)
+    jalr ra, 0(a3)
+    auipc a3, 0
+    sc.w a3, a1, (a0)
+    jalr ra, 0(a3)
+    auipc a3, 0
+    lr.w a3, (a0)
+    jalr ra, 0(a3)
+    auipc a3, 0
+    lr.w a4, (a3)
+    amoadd.w a4, a3, (a3)
     jalr ra, 0(a3)
