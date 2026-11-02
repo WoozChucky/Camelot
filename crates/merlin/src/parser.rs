@@ -1269,6 +1269,10 @@ impl Parser<'_> {
     /// A top-level function or declaration; `None` for a declaration that
     /// only declares types (a typedef, a struct, an enum).
     fn item(&mut self) -> Result<Option<Item>, Error> {
+        if *self.peek() == Tok::Kw(Kw::StaticAssert) {
+            self.static_assert()?;
+            return Ok(None);
+        }
         if !self.at_decl() {
             return Err(self.unexpected("a declaration"));
         }
@@ -1360,13 +1364,47 @@ impl Parser<'_> {
             if *self.peek() == Tok::Eof {
                 return Err(self.unexpected("'}'"));
             }
-            if self.at_decl() {
+            if *self.peek() == Tok::Kw(Kw::StaticAssert) {
+                self.static_assert()?;
+            } else if self.at_decl() {
                 if let Some(s) = self.decl(Ctx::Block)? {
                     items.push(s);
                 }
             } else {
                 items.push(self.stmt()?);
             }
+        }
+    }
+
+    /// `_Static_assert(constant, "message");` (C11, which clang accepts in
+    /// C99 too), at file or block scope. The parser evaluates constants, so
+    /// it checks the assertion here; nothing is left of it.
+    fn static_assert(&mut self) -> Result<(), Error> {
+        let pos = self.advance().pos;
+        self.expect_punct("(")?;
+        let at = self.here();
+        let cond = self.cond()?;
+        self.expect_punct(",")?;
+        let mut msg = Vec::new();
+        if !matches!(self.peek(), Tok::Str(_)) {
+            return Err(self.unexpected("a string literal"));
+        }
+        while let Tok::Str(s) = self.peek() {
+            msg.extend_from_slice(s);
+            self.advance();
+        }
+        self.expect_punct(")")?;
+        self.expect_punct(";")?;
+        match consteval::int(&cond) {
+            None => Err(Error::new(
+                at,
+                "static assertion expression is not an integer constant expression",
+            )),
+            Some(0) => Err(Error::new(
+                pos,
+                format!("static assertion failed: {}", String::from_utf8_lossy(&msg)),
+            )),
+            Some(_) => Ok(()),
         }
     }
 
@@ -3070,6 +3108,28 @@ mod tests {
             err("int f(int a, ..., int b);"),
             "1:17: expected ')' after '...', found ','"
         );
+    }
+
+    #[test]
+    fn static_assertions() {
+        assert!(
+            prog(
+                "_Static_assert(sizeof(int) == 4, \"ILP32\"); enum { N = 3 }; \
+                      int f() { _Static_assert(N * 2 == 6, \"in a \" \"block\"); return 0; }"
+            )
+            .items
+            .len()
+                == 1
+        );
+        assert_eq!(
+            err("_Static_assert(1 + 1 == 3, \"math\");"),
+            "1:1: static assertion failed: math"
+        );
+        assert_eq!(
+            err("int x; _Static_assert(x, \"x\");"),
+            "1:23: static assertion expression is not an integer constant expression"
+        );
+        assert_eq!(err("_Static_assert(1);"), "1:17: expected ',', found ')'");
     }
 
     #[test]

@@ -58,6 +58,7 @@ pub enum Kw {
     Case,
     Default,
     Goto,
+    StaticAssert,
 }
 
 /// Every keyword merlin handles, in [`Kw`] order.
@@ -93,6 +94,8 @@ pub const KEYWORDS: &[(Kw, &str)] = &[
     (Kw::Case, "case"),
     (Kw::Default, "default"),
     (Kw::Goto, "goto"),
+    // C11, which clang accepts in C99 mode too (the name is reserved in C99).
+    (Kw::StaticAssert, "_Static_assert"),
 ];
 
 impl Kw {
