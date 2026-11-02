@@ -154,7 +154,12 @@ impl Session {
                     self.send(&r)?;
                     continue;
                 }
-                Action::Kill => return Ok(Ended::Killed),
+                Action::Kill => {
+                    // GDB expects no reply to `k`; LLDB waits for one. `X09`, "ended
+                    // by SIGKILL", satisfies LLDB, and GDB never reads it.
+                    let _ = self.send(b"X09");
+                    return Ok(Ended::Killed);
+                }
                 Action::Detach => {
                     self.send(b"OK")?;
                     return Ok(Ended::Detached);

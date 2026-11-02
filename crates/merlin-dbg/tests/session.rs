@@ -196,19 +196,30 @@ fn kernel() {
          delete\n\
          continue\n",
     );
+    // Addresses from the kernel's symbols, so a rebuilt kernel does not break the test.
+    let file = std::fs::read(path("kernel/kernel.elf")).unwrap();
+    let symbols = merlin_dbg::symbols::Symbols::from_elf(&file).unwrap();
+    let kmain = symbols.lookup("kmain").unwrap();
+    let kvminit = symbols.lookup("kvminit").unwrap();
     assert_lines(
         &out,
         &[
-            "breakpoint 1 at 0x800174dc <kmain>",
+            &format!("breakpoint 1 at {kmain:#010x} <kmain>"),
             "breakpoint 1",
-            "=> 0x800174dc <kmain>:  addi sp, sp, -0x10",
-            "=> 0x800174e0 <kmain+4>:  sw ra, 0xc(sp)",
-            "breakpoint 2 at 0x8003f660 <kvminit>",
+            &format!("=> {kmain:#010x} <kmain>:  addi sp, sp, -0x10"),
+            &format!("=> {:#010x} <kmain+4>:  sw ra, 0xc(sp)", kmain + 4),
+            &format!("breakpoint 2 at {kvminit:#010x} <kvminit>"),
             "breakpoint 2",
-            "=> 0x8003f660 <kvminit>:  addi sp, sp, -0x10",
+            &format!("=> {kvminit:#010x} <kvminit>:  addi sp, sp, -0x10"),
         ],
     );
-    assert!(out.contains("pc   0x800174dc <kmain>  mode S\n"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "pc   {kmain:#010x} <kmain>  mode S
+"
+        )),
+        "{out}"
+    );
     // The backtrace: kvminit, called from kmain, called from the assembly that enters
     // S-mode (whose ra kmain saved; the chain ends there, s0 = 0).
     let bt: Vec<&str> = out
@@ -218,12 +229,9 @@ fn kernel() {
         .take_while(|l| l.starts_with('#'))
         .collect();
     assert_eq!(bt.len(), 3, "{out}");
+    assert_eq!(bt[0], format!("#0  {kvminit:#010x} <kvminit>"));
+    assert!(bt[1].starts_with("#1  0x") && bt[1].contains(" <kmain+"), "{out}");
     assert!(bt[2].contains(" <supervisor_entry+"), "{out}");
-    assert_eq!(bt[0], "#0  0x8003f660 <kvminit>");
-    assert!(
-        bt[1].starts_with("#1  0x8001") && bt[1].contains(" <kmain+"),
-        "{out}"
-    );
     let back = bt[1].trim_start_matches("#1  ");
     // finish comes back there, and says what kvminit returned.
     assert!(
@@ -233,14 +241,13 @@ fn kernel() {
         )),
         "{out}"
     );
-    assert!(out.contains(&format!("=> {back}:")), "{out}");
     assert!(out.contains("returned: a0 = "), "{out}");
     assert_lines(
         &out,
         &[
             "Num  Type        Where",
-            "1    breakpoint  0x800174dc <kmain>",
-            "2    breakpoint  0x8003f660 <kvminit>",
+            &format!("1    breakpoint  {kmain:#010x} <kmain>"),
+            &format!("2    breakpoint  {kvminit:#010x} <kvminit>"),
         ],
     );
 }

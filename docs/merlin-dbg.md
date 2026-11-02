@@ -140,9 +140,9 @@ Packets are `$payload#checksum`, with `+`/`-` acks until `QStartNoAckMode`. A 0x
 | `qThreadExtraInfo,thread` | e.g. `hart 1, S-mode, in wfi`, hex encoded |
 | `qAttached` | `1` |
 | `qXfer:features:read:target.xml:off,len` | the target description: `riscv:rv32`, the `org.gnu.gdb.riscv.cpu` registers, every CSR Grail implements that has a name, and `priv` |
-| `qRegisterInfoN` | LLDB's register description, for `x0`-`x31` and `pc` (LLDB builds without XML support, its Windows builds among them, ask for these instead of `target.xml`) |
+| `qRegisterInfoN` | LLDB's register description, for `x0`-`x31` and `pc` (LLDB builds without XML support, such as LLVM 21's Windows build, ask for these instead of `target.xml`) |
 | `qHostInfo`, `qProcessInfo` | LLDB's: triple `riscv32-unknown-unknown-elf`, little endian, 4-byte pointers |
-| `k`, `vKill` | kills the machine, no reply |
+| `k`, `vKill` | `X09` (ended by SIGKILL), then kills the machine. GDB expects no reply to `k` and ignores it; LLDB waits for one |
 | `D` | `OK`, then detaches |
 | anything else | empty: not supported |
 
@@ -180,7 +180,14 @@ target create hello.elf
 gdb-remote 127.0.0.1:1234
 ```
 
-On Windows, LLDB needs the Python its build was made with on the PATH: `python310.dll` for LLVM 21. Without it, `lldb.exe` exits at once with "DLL not found". LLDB on Windows reads the general registers through `qRegisterInfo`, so it can't see the CSRs; GDB and merlin-dbg can. `cargo test -p grail --test gdb -- --ignored` runs LLDB against the stub (`LLDB=path` if it is not on the PATH) and checks it can break, step and read registers and memory.
+On Windows, LLDB needs a Python runtime on the PATH, or `lldb.exe` exits at once:
+
+- LLVM 23 loads `python3.dll`, which any Python 3 installation has.
+- LLVM 21 wanted exactly `python310.dll`.
+
+LLDB 23 reads the target description and sees the CSRs. LLDB builds without XML support (LLVM 21's Windows build) read the general registers through `qRegisterInfo` and can't see the CSRs. GDB and merlin-dbg always see them.
+
+`cargo test -p grail --test gdb -- --ignored` runs LLDB against the stub (set `LLDB=path` if it is not on the PATH). It checks that LLDB can break, step, and read registers and memory. It passes with LLDB 21 and 23.
 
 ## merlin-dbg
 

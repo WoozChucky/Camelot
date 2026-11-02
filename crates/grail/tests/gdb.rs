@@ -151,6 +151,8 @@ fn a_client_stops_a_running_machine_interrupts_and_kills_it() {
     assert_eq!(c.ask("p1041"), "01000000");
     c.stream.write_all(&packet::frame(b"k")).unwrap();
     assert_eq!(c.event(), Event::Ack);
+    // A reply LLDB waits for (GDB does not): ended by SIGKILL.
+    assert_eq!(c.event(), Event::Packet(b"X09".to_vec()));
     assert_eq!(child.wait().unwrap().code(), Some(137));
 }
 
@@ -184,8 +186,9 @@ fn gdb_options_are_checked() {
 
 /// LLDB (from the LLVM installer) connected to `grail --gdb`, as a standard client:
 /// it must break at a symbol, read registers and step. Ignored: it needs LLDB, and
-/// LLDB on Windows needs the Python its build was made with (python310.dll for LLVM
-/// 21) on the PATH. `LLDB` names the binary if it is not on the PATH.
+/// LLDB on Windows needs a Python runtime on the PATH (`python3.dll` of any Python 3
+/// for LLVM 23; LLVM 21 wanted exactly `python310.dll`). `LLDB` names the binary if it
+/// is not on the PATH.
 #[test]
 #[ignore]
 fn lldb_breaks_steps_and_reads_registers() {
@@ -210,18 +213,23 @@ fn lldb_breaks_steps_and_reads_registers() {
     }
     let out = cmd.output().unwrap_or_else(|e| panic!("cannot run {lldb}: {e}"));
     let text = String::from_utf8_lossy(&out.stdout);
-    for want in [
-        "stop reason = breakpoint 1.1",
-        "pc = 0x80000020  hello.elf`puts",
-        "a0 = 0x80000050  hello.elf`message",
-        "pc = 0x80000024  hello.elf`puts + 4",
-        "t0 = 0x10000000",
-        "0x48 0x65 0x6c 0x6c 0x6f",
-        "exited with status = 0",
-    ] {
+    // Each check is a line holding all its parts: LLDB's spacing and how it shows
+    // symbols change between versions (21: `pc = 0x80000020  hello.elf`puts`, 23:
+    // `pc = 0x80000020 hello.elf`puts  hello.elf`puts`).
+    let checks: [&[&str]; 7] = [
+        &["stop reason = breakpoint 1.1"],
+        &["pc = 0x80000020", "hello.elf`puts"],
+        &["a0 = 0x80000050", "hello.elf`message"],
+        &["pc = 0x80000024", "hello.elf`puts + 4"],
+        &["t0 = 0x10000000"],
+        &["0x48 0x65 0x6c 0x6c 0x6f"],
+        &["exited with status = 0"],
+    ];
+    for parts in checks {
         assert!(
-            text.contains(want),
-            "no {want:?} in:\n{text}{}",
+            text.lines().any(|l| parts.iter().all(|p| l.contains(p))),
+            "no line with {parts:?} in:
+{text}{}",
             String::from_utf8_lossy(&out.stderr)
         );
     }

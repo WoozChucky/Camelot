@@ -26,7 +26,7 @@ pub enum Action {
     Continue,
     /// Run one instruction of the selected hart, then send the stop reply.
     Step,
-    /// Stop the machine for good (`k`, `vKill`): no reply.
+    /// Stop the machine for good (`k`, `vKill`); the session replies `X09`.
     Kill,
     /// Reply `OK`, forget the breakpoints and let the machine run on its own (`D`).
     Detach,
