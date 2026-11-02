@@ -1,0 +1,9 @@
+[package]
+name = "grail"
+description = "Grail, the emulator for the Excalibur ISA"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+excalibur = { path = "../excalibur" }

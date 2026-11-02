@@ -1,0 +1,8 @@
+[package]
+name = "excalibur"
+description = "Excalibur ISA definitions shared by Grail, merlin-as and the disassembler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/excalibur", "crates/grail"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[profile.release]
+debug = 1
