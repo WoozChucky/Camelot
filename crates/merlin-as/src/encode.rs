@@ -1,4 +1,4 @@
-//! # The encoder: Nuno's part of merlin-as
+//! # The encoder
 //!
 //! Turns one instruction (mnemonic + parsed operands) into machine words.
 //! Everything around it (lexing, parsing, labels, sections, directives,
