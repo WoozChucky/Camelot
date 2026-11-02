@@ -253,6 +253,34 @@ fn reads_linked_executable() {
 }
 
 #[test]
+fn a_global_symbol_wins_over_a_local_of_the_same_name() {
+    let sym = |name: &str, value, bind: u8, shndx| Symbol {
+        name: name.into(),
+        value,
+        size: 0,
+        info: bind << 4,
+        other: 0,
+        shndx,
+    };
+    // A `static void start(...)` in one file and the global `start` in
+    // another: locals come first in an executable's .symtab.
+    let syms = [
+        sym("", 0, STB_LOCAL, SHN_UNDEF),
+        sym("start", 0x10, STB_LOCAL, 1),
+        sym("only_local", 0x14, STB_LOCAL, 1),
+        sym("start", 0x20, STB_GLOBAL, 1),
+        sym("weak", 0x30, STB_WEAK, 1),
+        sym("ext", 0, STB_GLOBAL, SHN_UNDEF),
+    ];
+    let value = |name| find_symbol(&syms, name).map(|s| s.value);
+    assert_eq!(value("start"), Some(0x20));
+    assert_eq!(value("only_local"), Some(0x14));
+    assert_eq!(value("weak"), Some(0x30));
+    assert_eq!(value("ext"), None);
+    assert_eq!(value("nothing"), None);
+}
+
+#[test]
 fn reloc_names() {
     assert_eq!(reloc_name(19), Some("R_RISCV_CALL_PLT"));
     assert_eq!(reloc_name(23), Some("R_RISCV_PCREL_HI20"));

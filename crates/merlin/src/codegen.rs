@@ -22,7 +22,9 @@
 //!   `.bss`, `const` ones and string literals in `.rodata`. Every function and
 //!   variable that is not `static` gets `.globl` (except a C99 inline
 //!   definition, kept local); declarations without a definition emit nothing
-//!   (the linker finds them).
+//!   (the linker finds them). Like clang, every function and variable gets
+//!   `.type` (`@function` or `@object`) and `.size`, so the symbol table says
+//!   what each address belongs to.
 //! * Semantics: 32-bit wrapping arithmetic, `/` and `%` truncate toward zero
 //!   (`div`/`rem`, or `divu`/`remu` when unsigned), shifts use the low 5 bits
 //!   of the amount, comparisons and `! && ||` produce 0 or 1, `&&`/`||`
@@ -564,6 +566,10 @@ impl FileGen {
         if d.ty.align() > 1 {
             let _ = writeln!(self.out, "    .balign {}", d.ty.align());
         }
+        // An object symbol with its size, as for functions: debuggers and
+        // tests find what an address belongs to from the symbol table.
+        let _ = writeln!(self.out, "    .type {sym}, @object");
+        let _ = writeln!(self.out, "    .size {sym}, {size}");
         let _ = writeln!(self.out, "{sym}:");
         if d.init.is_none() {
             data.push(format!(".zero {size}"));
@@ -914,6 +920,11 @@ impl<'a> FuncGen<'a, '_> {
         if !f.is_static && !f.inline_only {
             self.lines.push(Line::Text(format!(".globl {}", f.name)));
         }
+        // A function symbol with its size, as clang marks them, so that
+        // merlin-objdump, Grail's traces and tests can tell which function an
+        // address is in (the `.size` follows the epilogue).
+        self.lines
+            .push(Line::Text(format!(".type {}, @function", f.name)));
         self.label(&f.name);
 
         // Prologue: save ra and the caller's s0, set up s0, make room for locals.
@@ -1003,6 +1014,7 @@ impl<'a> FuncGen<'a, '_> {
         self.ins("lw", format!("s0, {}(sp)", top - va_save - 8));
         self.ins("addi", format!("sp, sp, {top}"));
         self.ins("ret", "");
+        self.lines.push(Line::Text(format!(".size {0}, . - {0}", f.name)));
     }
 
     /// The top of the frame, which the prologue sets up first: `ra`, `s0`
@@ -2232,6 +2244,7 @@ mod tests {
 
     # int main(void): frame 16 bytes
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -2244,8 +2257,37 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main
 "
         );
+        // Each function symbol carries its type and size, as clang's do: ten
+        // instructions here, and the static one's too.
+        let obj = merlin_as::assemble(&compile(
+            "int main(void) { return 42; } static int f(void) { return 1; }",
+        ))
+        .unwrap();
+        for name in ["main", "f"] {
+            let s = obj.symbols.iter().find(|s| s.name == name).unwrap();
+            assert_eq!((s.size, s.ty), (40, merlin_as::asm::SymType::Func), "{name}");
+        }
+    }
+
+    #[test]
+    fn variables_are_sized_objects() {
+        // The kernel's tests find which buffer an address is in from the
+        // symbol's size, in .bss, .data and .rodata alike, static or not.
+        let src = "struct s { int a; char b; } bufs[3]; int n = 5; static const char k[7] = \"abc\";
+                   int f(void) { static short count; return k[0] + count; }";
+        let asm = compile(src);
+        assert!(
+            asm.contains("    .type bufs, @object\n    .size bufs, 24\nbufs:\n"),
+            "{asm}"
+        );
+        let obj = merlin_as::assemble(&asm).unwrap();
+        for (name, size) in [("bufs", 24), ("n", 4), ("k", 7), ("f.count", 2)] {
+            let s = obj.symbols.iter().find(|s| s.name == name).unwrap();
+            assert_eq!((s.size, s.ty), (size, merlin_as::asm::SymType::Object), "{name}");
+        }
     }
 
     #[test]
@@ -2469,16 +2511,16 @@ main:
         let data = &asm;
         for want in [
             // No empty `.text` first: sections are switched as needed.
-            "    .data\n\n    # int g: 4 bytes\n    .globl g\n    .balign 4\ng:\n    .word 5\n",
-            "\n    # char c: 1 byte\n    .globl c\nc:\n    .byte 120\n",
-            "\n    .balign 2\nh:\n    .half 1\n    .half -1\n    .zero 2\n",
+            "    .data\n\n    # int g: 4 bytes\n    .globl g\n    .balign 4\n    .type g, @object\n    .size g, 4\ng:\n    .word 5\n",
+            "\n    # char c: 1 byte\n    .globl c\n    .type c, @object\n    .size c, 1\nc:\n    .byte 120\n",
+            "\n    .balign 2\n    .type h, @object\n    .size h, 6\nh:\n    .half 1\n    .half -1\n    .zero 2\n",
             "p:\n    .word g+4\n",
             "s:\n    .ascii \"hi\\n\"\n    .zero 1\n",
-            "    .bss\n\n    # static unsigned int u: 4 bytes\n    .balign 4\nu:\n    .zero 4\n",
+            "    .bss\n\n    # static unsigned int u: 4 bytes\n    .balign 4\n    .type u, @object\n    .size u, 4\nu:\n    .zero 4\n",
             "str:\n    .word .L.str.0\n",
             "raw:\n    .byte 1\n    .byte 2\n    .byte 255\n",
             "zeros:\n    .word 0\n    .zero 4\n",
-            "\n    # static int n: 4 bytes\n    .balign 4\nmain.n:\n    .word 3\n",
+            "\n    # static int n: 4 bytes\n    .balign 4\n    .type main.n, @object\n    .size main.n, 4\nmain.n:\n    .word 3\n",
             "    .section .rodata\n\n.L.str.0:\n    .asciz \"a\\\"b\\\\\"\n",
         ] {
             assert!(data.contains(want), "missing {want:?} in\n{data}");
@@ -2866,7 +2908,7 @@ main:
              int main() { return k + v; }",
         );
         for want in [
-            "    .section .rodata\n\n    # const int k: 4 bytes\n    .globl k\n    .balign 4\nk:\n    .word 3\n",
+            "    .section .rodata\n\n    # const int k: 4 bytes\n    .globl k\n    .balign 4\n    .type k, @object\n    .size k, 4\nk:\n    .word 3\n",
             "msg:\n    .ascii \"hi\"\n    .zero 1\n",
             "z:\n    .zero 4\n",
             "    .data\n\n    # volatile int v: 4 bytes\n",

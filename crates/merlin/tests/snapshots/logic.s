@@ -3,6 +3,7 @@
     # int bump(int v): frame 16 bytes
     #     -12(s0)  param int v
     .globl bump
+    .type bump, @function
 bump:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -22,11 +23,13 @@ bump:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size bump, . - bump
 
     # int main(void): frame 16 bytes
     #     -12(s0)  local int hits
     #     -16(s0)  local int r
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -130,3 +133,4 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main

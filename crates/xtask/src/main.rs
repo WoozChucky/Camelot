@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use xtask::kernel::{Assembler, Build};
+use xtask::kernel::{Assembler, Build, Toolchain};
 use xtask::{examples, repo_root, tools};
 
 const USAGE: &str = "usage: cargo xtask <task> [options]
@@ -12,11 +12,12 @@ tasks:
                examples/<dir>/<name>.elf; no LLVM needed. Objects go to target/examples.
                --check: build in memory and report stale .elf files instead of writing
                -v: print the equivalent merlin-as/merlin-ld command lines
-  kernel       build kernel/kernel.elf (clang + ld.lld from the official LLVM install),
-               after compiling kernel/user/*.c to kernel/user/clang/*.s (clang) and
-               regenerating kernel/userprogs.s from kernel/user (merlin-as + merlin-ld)
+  kernel       build kernel/kernel.elf with our own toolchain (merlin, merlin-as, merlin-ld;
+               no LLVM), after regenerating kernel/userprogs.s from kernel/user the same way.
+               --cc clang: the reference build instead (clang -O2 + ld.lld from the official
+               LLVM install, the user programs' C compiled by clang too), in target/kernel/clang
   fs           build the root filesystem image (target/camelot-fs.img): kernel/fs/ at /,
-               the user programs in /bin (merlin-as + merlin-ld; no LLVM needed), /dev/console
+               the user programs in /bin (merlin, merlin-as, merlin-ld; no LLVM), /dev/console
                -o PATH: output file; --size N: blocks (1 KiB each, default 2048)
   hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
                with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
@@ -24,16 +25,29 @@ tasks:
                takes --clang, --lld and -v like kernel
 
 kernel options:
+  --cc merlin|clang  C compiler (default: merlin); clang is the reference build
   --clang PATH       clang to use (default: PATH, then C:\\Program Files\\LLVM\\bin)
   --lld PATH         ld.lld to use (default: next to clang, then the same search)
-  --as clang|merlin  assembler for the .s files (default: clang)
-  -o PATH            output file (default: kernel/kernel.elf)
+  --as clang|merlin  assembler for the .s files with --cc clang (default: clang)
+  -o PATH            output file (default: kernel/kernel.elf; with --cc clang,
+                     target/kernel/clang/kernel.elf)
   --run              run the result on Grail afterwards, with this terminal as its
                      console (type exit to stop it); exit with its exit code
-  -v, --verbose      print each command";
+  -v, --verbose      print each command (for merlin, its command-line equivalent)";
+
+/// `--cc`: which C compiler builds the kernel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Cc {
+    /// Our own toolchain: how kernel/kernel.elf is built.
+    #[default]
+    Merlin,
+    /// The reference build.
+    Clang,
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct KernelArgs {
+    cc: Option<Cc>,
     clang: Option<PathBuf>,
     lld: Option<PathBuf>,
     assembler: Option<Assembler>,
@@ -58,12 +72,38 @@ fn parse_kernel_args(args: &[String]) -> Result<KernelArgs, String> {
                     other => return Err(format!("unknown assembler {other} (clang or merlin)")),
                 })
             }
+            "--cc" => {
+                k.cc = Some(match value("--cc")?.as_str() {
+                    "merlin" => Cc::Merlin,
+                    "clang" => Cc::Clang,
+                    other => return Err(format!("unknown compiler {other} (merlin or clang)")),
+                })
+            }
             "--run" => k.run = true,
             "-v" | "--verbose" => k.verbose = true,
             other => return Err(format!("unknown option {other}")),
         }
     }
     Ok(k)
+}
+
+/// Checks the options `cargo xtask kernel` got fit together: LLVM's tools
+/// only matter to the reference build.
+fn check_kernel_args(k: &KernelArgs) -> Result<(), String> {
+    if k.cc.unwrap_or_default() == Cc::Merlin {
+        for (given, name) in [
+            (k.clang.is_some(), "--clang"),
+            (k.lld.is_some(), "--lld"),
+            (k.assembler.is_some(), "--as"),
+        ] {
+            if given {
+                return Err(format!(
+                    "{name} is for the reference build only (--cc clang); merlin needs no LLVM"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -124,7 +164,8 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Some("kernel") => match parse_kernel_args(&args[1..]) {
+        Some("kernel") => match parse_kernel_args(&args[1..]).and_then(|k| check_kernel_args(&k).map(|()| k))
+        {
             Ok(k) => kernel(k),
             Err(e) => {
                 eprintln!("xtask: {e}\n{USAGE}");
@@ -139,7 +180,15 @@ fn main() -> ExitCode {
             }
         },
         Some("hello") => match parse_kernel_args(&args[1..]) {
-            Ok(k) if k.clang.is_none() && k.assembler.is_none() && k.out.is_none() && !k.run => hello(k),
+            Ok(k)
+                if k.clang.is_none()
+                    && k.assembler.is_none()
+                    && k.cc.is_none()
+                    && k.out.is_none()
+                    && !k.run =>
+            {
+                hello(k)
+            }
             Ok(_) => {
                 eprintln!("xtask: hello takes only --lld and -v\n{USAGE}");
                 ExitCode::from(2)
@@ -150,7 +199,7 @@ fn main() -> ExitCode {
             }
         },
         Some("ld-fixtures") => match parse_kernel_args(&args[1..]) {
-            Ok(k) if k.assembler.is_none() && k.out.is_none() && !k.run => ld_fixtures(k),
+            Ok(k) if k.assembler.is_none() && k.cc.is_none() && k.out.is_none() && !k.run => ld_fixtures(k),
             Ok(_) => {
                 eprintln!("xtask: ld-fixtures takes only --clang, --lld and -v\n{USAGE}");
                 ExitCode::from(2)
@@ -339,63 +388,67 @@ fn ld_fixtures(k: KernelArgs) -> ExitCode {
 }
 
 fn kernel(k: KernelArgs) -> ExitCode {
-    let Some(clang) = k.clang.or_else(|| tools::find("clang")) else {
-        eprintln!(
-            "xtask: clang not found. Install LLVM (https://github.com/llvm/llvm-project/releases) \
-             or pass --clang PATH"
-        );
-        return ExitCode::FAILURE;
-    };
-    let Some(lld) = k.lld.or_else(|| tools::find_beside("ld.lld", &clang)) else {
-        eprintln!(
-            "xtask: ld.lld not found next to {} or on PATH; pass --lld PATH",
-            clang.display()
-        );
-        return ExitCode::FAILURE;
-    };
     let root = repo_root();
     let kernel_dir = root.join("kernel");
-    // The user programs first: clang turns their C into assembly, then
-    // merlin-as + merlin-ld build them. Their images are part of the
-    // kernel's sources.
-    match xtask::userprogs::write_clang(&root, &clang, k.verbose) {
-        Ok(changed) => {
-            for f in changed {
-                eprintln!("regenerated {f}");
-            }
-        }
-        Err(e) => {
-            eprintln!("xtask: {e}");
-            return ExitCode::FAILURE;
-        }
-    }
-    match xtask::userprogs::write(&root) {
-        Ok(true) => eprintln!("regenerated {}", xtask::userprogs::GENERATED),
-        Ok(false) => {}
-        Err(e) => {
-            eprintln!("xtask: {e}");
-            return ExitCode::FAILURE;
-        }
-    }
-    let default_out = k.out.is_none();
     // The tools run inside kernel/, so a relative -o must be made absolute here.
     let out = match k.out.map(std::path::absolute).transpose() {
-        Ok(out) => out.unwrap_or_else(|| kernel_dir.join("kernel.elf")),
+        Ok(out) => out,
         Err(e) => {
             eprintln!("xtask: bad output path: {e}");
             return ExitCode::from(2);
         }
     };
-    let build = Build {
-        out,
-        obj_dir: root.join("target").join("kernel").join("obj"),
-        kernel_dir,
-        clang,
-        lld,
-        assembler: k.assembler.unwrap_or(Assembler::Clang),
-        verbose: k.verbose,
+    let built = match k.cc.unwrap_or_default() {
+        Cc::Merlin => {
+            // The user programs first: their images are part of the
+            // kernel's sources.
+            match xtask::userprogs::write(&root) {
+                Ok(true) => eprintln!("regenerated {}", xtask::userprogs::GENERATED),
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("xtask: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            Build {
+                out: out.unwrap_or_else(|| kernel_dir.join("kernel.elf")),
+                obj_dir: root.join("target").join("kernel").join("obj"),
+                kernel_dir,
+                toolchain: Toolchain::Merlin,
+                userprogs: None,
+                verbose: k.verbose,
+            }
+            .run()
+        }
+        Cc::Clang => {
+            let Some(clang) = k.clang.or_else(|| tools::find("clang")) else {
+                eprintln!(
+                    "xtask: clang not found. Install LLVM (https://github.com/llvm/llvm-project/releases) \
+                     or pass --clang PATH"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(lld) = k.lld.or_else(|| tools::find_beside("ld.lld", &clang)) else {
+                eprintln!(
+                    "xtask: ld.lld not found next to {} or on PATH; pass --lld PATH",
+                    clang.display()
+                );
+                return ExitCode::FAILURE;
+            };
+            match xtask::kernel::clang_version(&clang) {
+                Ok(v) => eprintln!("reference build with {v}"),
+                Err(e) => {
+                    eprintln!("xtask: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let work = root.join(xtask::kernel::REFERENCE_DIR);
+            let out = out.unwrap_or_else(|| work.join("kernel.elf"));
+            let assembler = k.assembler.unwrap_or(Assembler::Clang);
+            xtask::kernel::build_reference(&root, &clang, &lld, assembler, &work, &out, k.verbose)
+        }
     };
-    let out = match build.run() {
+    let out = match built {
         Ok(out) => out,
         Err(e) => {
             eprintln!("xtask: {e}");
@@ -403,20 +456,6 @@ fn kernel(k: KernelArgs) -> ExitCode {
         }
     };
     eprintln!("built {}", out.display());
-    // Record which clang produced the committed image (see VERSION_FILE).
-    if default_out && build.assembler == Assembler::Clang {
-        let file = build.kernel_dir.join(xtask::kernel::VERSION_FILE);
-        let written = build
-            .clang_version()
-            .and_then(|v| std::fs::write(&file, format!("{v}\n")).map_err(|e| e.to_string()));
-        if let Err(e) = written {
-            eprintln!(
-                "xtask: cannot record the clang version in {}: {e}",
-                file.display()
-            );
-            return ExitCode::FAILURE;
-        }
-    }
     if !k.run {
         return ExitCode::SUCCESS;
     }
@@ -467,12 +506,13 @@ mod tests {
     #[test]
     fn all_options() {
         let k = parse(&[
-            "--clang", "c", "--lld", "l", "--as", "merlin", "-o", "k.elf", "--run", "-v",
+            "--cc", "clang", "--clang", "c", "--lld", "l", "--as", "merlin", "-o", "k.elf", "--run", "-v",
         ])
         .unwrap();
         assert_eq!(
             k,
             KernelArgs {
+                cc: Some(Cc::Clang),
                 clang: Some("c".into()),
                 lld: Some("l".into()),
                 assembler: Some(Assembler::Merlin),
@@ -481,10 +521,27 @@ mod tests {
                 verbose: true,
             }
         );
+        assert_eq!(check_kernel_args(&k), Ok(()));
         assert_eq!(
             parse(&["--as", "clang"]).unwrap().assembler,
             Some(Assembler::Clang)
         );
+        assert_eq!(parse(&["--cc", "merlin"]).unwrap().cc, Some(Cc::Merlin));
+    }
+
+    #[test]
+    fn llvm_options_need_the_reference_build() {
+        for args in [
+            &["--clang", "c"][..],
+            &["--lld", "l"],
+            &["--as", "merlin"],
+            &["--cc", "merlin", "--as", "clang"],
+        ] {
+            let k = parse(args).unwrap();
+            let err = check_kernel_args(&k).unwrap_err();
+            assert!(err.contains("--cc clang"), "{args:?}: {err}");
+        }
+        assert_eq!(check_kernel_args(&parse(&["-o", "k", "--run"]).unwrap()), Ok(()));
     }
 
     fn parse_examples(args: &[&str]) -> Result<ExamplesArgs, String> {
@@ -528,6 +585,9 @@ mod tests {
     fn errors() {
         assert!(parse(&["--clang"]).unwrap_err().contains("needs a value"));
         assert!(parse(&["--as", "gas"]).unwrap_err().contains("unknown assembler"));
+        assert!(parse(&["--cc", "gcc"])
+            .unwrap_err()
+            .contains("unknown compiler gcc"));
         assert!(parse(&["--frobnicate"]).unwrap_err().contains("unknown option"));
     }
 }

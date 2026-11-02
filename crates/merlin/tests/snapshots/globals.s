@@ -3,6 +3,8 @@
     # int counter: 4 bytes
     .globl counter
     .balign 4
+    .type counter, @object
+    .size counter, 4
 counter:
     .zero 4
 
@@ -11,23 +13,31 @@ counter:
     # int base: 4 bytes
     .globl base
     .balign 4
+    .type base, @object
+    .size base, 4
 base:
     .word 40
 
     # int *pbase: 4 bytes
     .globl pbase
     .balign 4
+    .type pbase, @object
+    .size pbase, 4
 pbase:
     .word base
 
     # static int hidden: 4 bytes
     .balign 4
+    .type hidden, @object
+    .size hidden, 4
 hidden:
     .word 5
 
     # int table[4]: 16 bytes
     .globl table
     .balign 4
+    .type table, @object
+    .size table, 16
 table:
     .word 1
     .word 2
@@ -37,12 +47,16 @@ table:
     # int *third: 4 bytes
     .globl third
     .balign 4
+    .type third, @object
+    .size third, 4
 third:
     .word table+8
 
     # int *past: 4 bytes
     .globl past
     .balign 4
+    .type past, @object
+    .size past, 4
 past:
     .word table+16
 
@@ -50,6 +64,7 @@ past:
 
     # void bump(void): frame 16 bytes
     .globl bump
+    .type bump, @function
 bump:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -86,12 +101,15 @@ bump:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size bump, . - bump
 
     .data
 
     # int later: 4 bytes
     .globl later
     .balign 4
+    .type later, @object
+    .size later, 4
 later:
     .word 10
 
@@ -100,6 +118,7 @@ later:
     # int main(void): frame 16 bytes
     #     -12(s0)  local int r
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -216,3 +235,4 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main

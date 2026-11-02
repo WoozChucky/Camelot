@@ -6,6 +6,7 @@
     #     -44(s0)  local void *ap
     #     -48(s0)  local int s
     .globl sum
+    .type sum, @function
 sum:
     addi  sp, sp, -48
     sw    ra, 16(sp)
@@ -58,6 +59,7 @@ sum:
     lw    s0, 12(sp)
     addi  sp, sp, 48
     ret
+    .size sum, . - sum
 
     # int mix(const char *fmt, ...): frame 80 bytes
     #     -28(s0)  a1-a7, saved for va_arg
@@ -69,6 +71,7 @@ sum:
     #     -64(s0)  local struct pair q
     #     -80(s0)  local struct big b
     .globl mix
+    .type mix, @function
 mix:
     addi  sp, sp, -48
     sw    ra, 16(sp)
@@ -353,6 +356,7 @@ mix:
     lw    s0, 12(sp)
     addi  sp, sp, 48
     ret
+    .size mix, . - mix
 
     # int late(int a, int b, int c, int d, int e, int f, int g, ...): frame 64 bytes
     #     -4(s0)  a7, saved for va_arg
@@ -367,6 +371,7 @@ mix:
     #     -52(s0)  local struct pair q
     #     -56(s0)  local int x
     .globl late
+    .type late, @function
 late:
     addi  sp, sp, -16
     sw    ra, 8(sp)
@@ -478,6 +483,7 @@ late:
     lw    s0, 4(sp)
     addi  sp, sp, 16
     ret
+    .size late, . - late
 
     # int beyond(int a, int b, int c, int d, int e, int f, int g, int h, int i, ...): frame 64 bytes
     #     -12(s0)  param int a
@@ -492,6 +498,7 @@ late:
     #     -48(s0)  local void *ap
     #     -52(s0)  local int s
     .globl beyond
+    .type beyond, @function
 beyond:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -596,12 +603,14 @@ beyond:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size beyond, . - beyond
 
     # int vsum(int n, void *ap): frame 32 bytes
     #     -12(s0)  param int n
     #     -16(s0)  param void *ap
     #     -20(s0)  local int s
     .globl vsum
+    .type vsum, @function
 vsum:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -645,6 +654,7 @@ vsum:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size vsum, . - vsum
 
     # int forward(int n, ...): frame 48 bytes
     #     -28(s0)  a1-a7, saved for va_arg
@@ -652,6 +662,7 @@ vsum:
     #     -44(s0)  local void *ap
     #     -48(s0)  local int s
     .globl forward
+    .type forward, @function
 forward:
     addi  sp, sp, -48
     sw    ra, 16(sp)
@@ -685,6 +696,7 @@ forward:
     lw    s0, 12(sp)
     addi  sp, sp, 48
     ret
+    .size forward, . - forward
 
     # int main(void): frame 64 bytes
     #     -16(s0)  local struct pair q
@@ -695,6 +707,7 @@ forward:
     #     -44(s0)  local int r
     #     -60(s0)  temp struct big (argument copy)
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -1290,6 +1303,7 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main
 
     .section .rodata
 

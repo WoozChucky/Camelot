@@ -144,6 +144,7 @@ dependencies = [
  "elf32",
  "excalibur",
  "grail",
+ "merlin",
  "merlin-as",
  "merlin-ld",
  "merlin-objdump",

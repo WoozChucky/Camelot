@@ -4,6 +4,7 @@
     #     -12(s0)  param char *s
     #     -16(s0)  local int n
     .globl length
+    .type length, @function
 length:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -32,11 +33,13 @@ length:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size length, . - length
 
     # int same(char *a, char *b): frame 16 bytes
     #     -12(s0)  param char *a
     #     -16(s0)  param char *b
     .globl same
+    .type same, @function
 same:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -87,12 +90,14 @@ same:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size same, . - same
 
     # int main(void): frame 32 bytes
     #     -12(s0)  local char *greeting
     #     -16(s0)  local int r
     #     -17(s0)  local char quote
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -301,6 +306,7 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main
 
     .section .rodata
 

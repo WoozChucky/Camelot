@@ -4,6 +4,7 @@
     #     -12(s0)  param int a
     #     -16(s0)  param int b
     .globl add
+    .type add, @function
 add:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -24,11 +25,13 @@ add:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size add, . - add
 
     # int sub(int a, int b): frame 16 bytes
     #     -12(s0)  param int a
     #     -16(s0)  param int b
     .globl sub
+    .type sub, @function
 sub:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -49,11 +52,13 @@ sub:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size sub, . - sub
 
     # int mul(int a, int b): frame 16 bytes
     #     -12(s0)  param int a
     #     -16(s0)  param int b
     .globl mul
+    .type mul, @function
 mul:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -74,12 +79,15 @@ mul:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size mul, . - mul
 
     .data
 
     # int (*ops[3])(int, int): 12 bytes
     .globl ops
     .balign 4
+    .type ops, @object
+    .size ops, 12
 ops:
     .word add
     .word sub
@@ -90,6 +98,7 @@ ops:
     # int (*pick(int which))(int, int): frame 16 bytes
     #     -12(s0)  param int which
     .globl pick
+    .type pick, @function
 pick:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -111,12 +120,14 @@ pick:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size pick, . - pick
 
     # int apply(int (*f)(int, int), int a, int b): frame 32 bytes
     #     -12(s0)  param int (*f)(int, int)
     #     -16(s0)  param int a
     #     -20(s0)  param int b
     .globl apply
+    .type apply, @function
 apply:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -145,9 +156,11 @@ apply:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size apply, . - apply
 
     # int twice(int x): frame 16 bytes
     #     -12(s0)  param int x
+    .type twice, @function
 twice:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -167,12 +180,15 @@ twice:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size twice, . - twice
 
     .bss
 
     # void (*nothing)(void): 4 bytes
     .globl nothing
     .balign 4
+    .type nothing, @object
+    .size nothing, 4
 nothing:
     .zero 4
 
@@ -185,6 +201,7 @@ nothing:
     #     -24(s0)  param int acc
     #     -28(s0)  local int i
     .globl fold
+    .type fold, @function
 fold:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -242,6 +259,7 @@ fold:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size fold, . - fold
 
     # int main(void): frame 48 bytes
     #     -12(s0)  local int ok
@@ -251,6 +269,7 @@ fold:
     #     -32(s0)  local struct vtable *pv
     #     -48(s0)  local int nums[4]
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -748,3 +767,4 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main

@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 camelot-fs = { path = "../camelot-fs" }
 grail = { path = "../grail" }
+merlin = { path = "../merlin" }
 merlin-as = { path = "../merlin-as" }
 merlin-ld = { path = "../merlin-ld" }
 

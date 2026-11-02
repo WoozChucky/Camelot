@@ -4,23 +4,27 @@
 //!
 //! * [`examples`]: builds every program in `examples/` with merlin-as +
 //!   merlin-ld, no LLVM (the default way to build them).
-//! * [`kernel`]: builds `kernel/kernel.elf` with clang + ld.lld, or with
-//!   merlin-as for the assembly files.
+//! * [`kernel`]: builds `kernel/kernel.elf` with merlin + merlin-as +
+//!   merlin-ld, no LLVM, or the clang -O2 + ld.lld reference build.
 //! * [`fs`]: builds the root filesystem image (the user programs and a
 //!   README) with the `camelot-fs` crate's mkfs.
+//! * [`toolchain`]: merlin, merlin-as and merlin-ld as libraries, for the
+//!   kernel and its user programs.
 //! * [`hello`]: builds `examples/hello/hello.S` with merlin-as + ld.lld into a
 //!   committed reference image.
 //! * [`ld_fixtures`]: regenerates merlin-ld's test fixtures (clang, ld.lld,
 //!   llvm-readobj).
 //! * [`tools`]: finds the LLVM tools.
-//! * [`userprogs`]: builds the user programs in `kernel/user/` with merlin-as +
-//!   merlin-ld and embeds them in the kernel (`kernel/userprogs.s`).
+//! * [`userprogs`]: builds the user programs in `kernel/user/` with merlin,
+//!   merlin-as and merlin-ld (or clang's C output, for the reference build)
+//!   and embeds them in the kernel (`kernel/userprogs.s`).
 
 pub mod examples;
 pub mod fs;
 pub mod hello;
 pub mod kernel;
 pub mod ld_fixtures;
+pub mod toolchain;
 pub mod tools;
 pub mod userprogs;
 

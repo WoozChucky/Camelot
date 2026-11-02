@@ -34,8 +34,8 @@
 //!   `main.c` is `// expect: N`.
 //! * `kernel_sources_compile`: merlin compiles every C file of the Camelot
 //!   kernel and its user programs (`kernel/*.c`, `kernel/user/*.c`), and
-//!   merlin-as assembles the result. Nothing runs: the kernel is still
-//!   built with clang (`cargo xtask kernel`).
+//!   merlin-as assembles the result. Nothing runs here: `cargo xtask kernel`
+//!   builds the kernel this way, and xtask's tests boot it.
 //!
 //! Ignored, since they need LLVM:
 //!

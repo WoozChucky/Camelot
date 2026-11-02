@@ -19,6 +19,7 @@
     #     -39(s0)  local unsigned char uc2
     #     -40(s0)  local signed char sc2
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -356,3 +357,4 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main

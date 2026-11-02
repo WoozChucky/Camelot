@@ -20,6 +20,7 @@
     #    -148(s0)  local int here
     #    -152(s0)  local int order
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -368,3 +369,4 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main

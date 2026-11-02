@@ -3,24 +3,24 @@
 //!
 //! Every `kernel/user/*.c` and `*.s` is one program, but for the runtime
 //! linked into each of them ([`RUNTIME`]: `crt0.s`, the system call stubs
-//! `usys.s` and the C library `ulib.c`). A program in assembly is assembled
-//! from its source; one in C from the assembly clang made of it, which is
-//! committed next to it in `kernel/user/clang/` (until Merlin, #15, compiles
-//! this much C). merlin-as assembles everything, and merlin-ld links each
-//! program with the runtime and `kernel/user/user.ld`, all in memory: our own
-//! tools, no LLVM. The executables then go into `kernel/userprogs.s` as ELF
-//! images in `.rodata`, with a table the kernel's loader looks programs up
-//! in. That file is generated, but committed with the kernel sources, so
-//! building the kernel needs nothing but its own directory.
+//! `usys.s` and the C library `ulib.c`). Our own tools build them, in
+//! memory, with no LLVM: merlin compiles each C file to assembly, merlin-as
+//! assembles that and the `.s` files, and merlin-ld links each program with
+//! the runtime and `kernel/user/user.ld`. The executables then go into
+//! `kernel/userprogs.s` as ELF images in `.rodata`, with a table the
+//! kernel's loader looks programs up in. That file is generated, but
+//! committed with the kernel sources, so building the kernel needs nothing
+//! but its own directory.
 //!
-//! `cargo xtask kernel` first recompiles the C files with clang
-//! ([`compile_c`], [`write_clang`]), then regenerates `userprogs.s`
-//! ([`write`]). `cargo test` checks that the committed `userprogs.s` is what
-//! the current sources and tools give (no LLVM needed), and, when the
-//! installed clang is the one that built `kernel/kernel.elf`, that the
-//! committed clang output is current too.
+//! `cargo xtask kernel` regenerates `userprogs.s` ([`write`]), and `cargo
+//! test` checks that the committed one is what the current sources and tools
+//! give. The reference build, `cargo xtask kernel --cc clang`, has clang
+//! compile the C files to assembly instead ([`compile_clang`], into a
+//! scratch directory) and builds the same programs from that
+//! ([`build_all_with`], [`CCompiler::Clang`]).
 
 use crate::kernel::TARGET_FLAGS;
+use crate::toolchain;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,19 +31,16 @@ pub const USER_DIR: &str = "kernel/user";
 pub const RUNTIME: &[&str] = &["crt0.s", "usys.s", "ulib.c"];
 /// The linker script every program is linked with.
 pub const SCRIPT: &str = "user.ld";
-/// Where clang's assembly for each `X.c` is committed, as `X.s`: a
-/// subdirectory of [`USER_DIR`].
-pub const CLANG_DIR: &str = "clang";
 /// The generated assembly file, relative to the repository root.
 pub const GENERATED: &str = "kernel/userprogs.s";
 /// The longest program name: the kernel keeps 15 characters and a NUL
 /// (`struct proc`'s `name`, kernel/include/proc.h).
 pub const MAX_NAME: usize = 15;
 
-/// clang's flags for the user C files, after [`TARGET_FLAGS`]: like the
-/// kernel's (freestanding, no libc headers, no hidden runtime, nothing that
-/// records the clang version), with `user.h` from the same directory. `-S`:
-/// the output is assembly, for merlin-as.
+/// clang's flags for the user C files in the reference build, after
+/// [`TARGET_FLAGS`]: like the kernel's (freestanding, no libc headers, no
+/// hidden runtime, nothing that records the clang version), with `user.h`
+/// from the same directory. `-S`: the output is assembly, for merlin-as.
 pub const C_FLAGS: &[&str] = &[
     "-mcmodel=medany",
     "-std=c11",
@@ -88,15 +85,6 @@ impl Source {
         }
     }
 
-    /// Where the assembly merlin-as reads is, relative to [`USER_DIR`]: the
-    /// source itself, or clang's output for it.
-    pub fn asm_file(&self) -> String {
-        match self.lang {
-            Lang::C => format!("{CLANG_DIR}/{}.s", self.stem),
-            Lang::Asm => self.file(),
-        }
-    }
-
     fn from_file(file: &str) -> Option<Source> {
         if let Some(stem) = file.strip_suffix(".c") {
             Some(Source {
@@ -110,6 +98,16 @@ impl Source {
             })
         }
     }
+}
+
+/// What turns the C files into assembly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CCompiler<'a> {
+    /// merlin, in memory: how the programs are built.
+    Merlin,
+    /// The reference build: clang already compiled each `X.c` to `X.s` in
+    /// this directory ([`compile_clang`]).
+    Clang(&'a Path),
 }
 
 /// A linked user program.
@@ -190,34 +188,29 @@ pub fn program_names(dir: &Path) -> Result<Vec<String>, String> {
     Ok(programs(dir)?.into_iter().map(|s| s.stem).collect())
 }
 
-/// Assembles `src` (from `dir`) with merlin-as. Errors name the file and
-/// line, like merlin-as itself; a C file whose clang output is missing says
-/// how to make it.
-fn assemble(dir: &Path, src: &Source) -> Result<Vec<u8>, String> {
-    let file = src.asm_file();
-    let path = dir.join(&file);
-    let text = std::fs::read_to_string(&path).map_err(|e| {
-        if src.lang == Lang::C {
-            format!(
-                "cannot read {}: {e}\n(clang's assembly for {USER_DIR}/{}: run `cargo xtask kernel`, which needs clang)",
-                path.display(),
-                src.file()
-            )
-        } else {
-            format!("cannot read {}: {e}", path.display())
+/// The assembly for `src` (in `dir`): the file itself, merlin's output for
+/// a C file, or clang's. Also returns the name errors in it are shown under.
+fn asm_text(dir: &Path, src: &Source, cc: CCompiler) -> Result<(String, String), String> {
+    let read = |path: &Path| {
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+    };
+    match (src.lang, cc) {
+        (Lang::Asm, _) => Ok((format!("{USER_DIR}/{}", src.file()), read(&dir.join(src.file()))?)),
+        (Lang::C, CCompiler::Merlin) => {
+            // Errors read `kernel/user/x.c:line:col: error: ...`.
+            let asm = toolchain::compile_c(dir, &src.file(), &[]).map_err(|e| {
+                e.lines()
+                    .map(|l| format!("{USER_DIR}/{l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
+            Ok((format!("{USER_DIR}/{}.s (merlin's assembly)", src.file()), asm))
         }
-    })?;
-    merlin_as::assemble_to_elf(&text).map_err(|errors| {
-        let shown = format!("{USER_DIR}/{file}");
-        let lines: Vec<String> = errors
-            .iter()
-            .map(|e| match e.line {
-                0 => format!("{shown}: error: {}", e.msg),
-                n => format!("{shown}:{n}: error: {}", e.msg),
-            })
-            .collect();
-        lines.join("\n")
-    })
+        (Lang::C, CCompiler::Clang(asm_dir)) => {
+            let path = asm_dir.join(format!("{}.s", src.stem));
+            Ok((path.display().to_string(), read(&path)?))
+        }
+    }
 }
 
 /// The runtime's sources.
@@ -225,38 +218,27 @@ fn runtime() -> Vec<Source> {
     RUNTIME.iter().filter_map(|f| Source::from_file(f)).collect()
 }
 
-/// Builds program `prog` from `dir`: it and the [`RUNTIME`] assembled, then
-/// linked with [`SCRIPT`], the program first. merlin-ld's warnings are errors
-/// here.
-pub fn build_program(dir: &Path, prog: &Source) -> Result<Program, String> {
+/// Builds program `prog` from `dir`: it and the [`RUNTIME`] compiled by `cc`
+/// (C) and assembled, then linked with [`SCRIPT`], the program first.
+/// merlin-ld's warnings are errors here.
+pub fn build_program_with(dir: &Path, prog: &Source, cc: CCompiler) -> Result<Program, String> {
     let mut inputs = Vec::new();
     for src in std::iter::once(prog.clone()).chain(runtime()) {
+        let (shown, text) = asm_text(dir, &src, cc)?;
         inputs.push(merlin_ld::Input {
             name: format!("{}.o", src.file()),
-            data: assemble(dir, &src)?,
+            data: toolchain::assemble(&shown, &text)?,
         });
     }
-    let path = dir.join(SCRIPT);
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let opts = merlin_ld::Options {
-        script: Some(merlin_ld::ScriptSource {
-            name: SCRIPT.into(),
-            text,
-        }),
-        entry: None,
-    };
-    let name = &prog.stem;
-    let linked = merlin_ld::link(&inputs, &opts).map_err(|errors| {
-        let lines: Vec<String> = errors.iter().map(|e| format!("merlin-ld: error: {e}")).collect();
-        format!("linking {name}:\n{}", lines.join("\n"))
-    })?;
-    if let Some(w) = linked.layout.warnings.first() {
-        return Err(format!("linking {name}: merlin-ld: warning: {w}"));
-    }
     Ok(Program {
-        name: name.clone(),
-        elf: linked.elf,
+        name: prog.stem.clone(),
+        elf: toolchain::link(dir, SCRIPT, &inputs, &prog.stem)?,
     })
+}
+
+/// Builds program `prog` from `dir` with our own tools.
+pub fn build_program(dir: &Path, prog: &Source) -> Result<Program, String> {
+    build_program_with(dir, prog, CCompiler::Merlin)
 }
 
 /// Builds the program called `name` in `dir`.
@@ -268,20 +250,17 @@ pub fn build_named(dir: &Path, name: &str) -> Result<Program, String> {
     build_program(dir, &prog)
 }
 
-/// Builds every program in `dir`, by name.
-pub fn build_all(dir: &Path) -> Result<Vec<Program>, String> {
+/// Builds every program in `dir`, by name, its C compiled by `cc`.
+pub fn build_all_with(dir: &Path, cc: CCompiler) -> Result<Vec<Program>, String> {
     programs(dir)?
         .iter()
-        .map(|prog| build_program(dir, prog))
+        .map(|prog| build_program_with(dir, prog, cc))
         .collect()
 }
 
-/// The first line of every file in [`CLANG_DIR`].
-const CLANG_HEADER: &str = "# Generated by `cargo xtask kernel` with clang: do not edit.";
-
-/// What [`compile_c`] writes for `file` (e.g. `sh.c`), given clang's output.
-fn clang_file_text(file: &str, asm: &str) -> String {
-    format!("{CLANG_HEADER}\n# Source: {USER_DIR}/{file} (flags in crates/xtask/src/userprogs.rs).\n\n{asm}")
+/// Builds every program in `dir` with our own tools, by name.
+pub fn build_all(dir: &Path) -> Result<Vec<Program>, String> {
+    build_all_with(dir, CCompiler::Merlin)
 }
 
 /// clang's arguments for `src` (run in [`USER_DIR`]), writing to `out`.
@@ -297,22 +276,15 @@ pub fn clang_args(src: &Source, out: &Path) -> Vec<String> {
     args
 }
 
-/// Compiles every C file in `dir` with `clang` to assembly, in `work` (a
-/// scratch directory). Returns, for each, the path under [`CLANG_DIR`] its
-/// output belongs at and the text to put there. clang runs inside `dir`
-/// with relative names, so the output doesn't depend on where the
-/// repository is.
-pub fn compile_c(
-    clang: &Path,
-    dir: &Path,
-    work: &Path,
-    verbose: bool,
-) -> Result<Vec<(String, String)>, String> {
-    std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
-    let mut out = Vec::new();
+/// The reference build's first step: compiles every C file in `dir` with
+/// `clang` to assembly, `X.c` to `out/X.s`, for [`CCompiler::Clang`]. clang
+/// runs inside `dir` with relative names, so the output doesn't depend on
+/// where the repository is.
+pub fn compile_clang(clang: &Path, dir: &Path, out: &Path, verbose: bool) -> Result<(), String> {
+    std::fs::create_dir_all(out).map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+    let out = std::path::absolute(out).map_err(|e| format!("bad path {}: {e}", out.display()))?;
     for src in sources(dir)?.into_iter().filter(|s| s.lang == Lang::C) {
-        let asm = work.join(format!("{}.s", src.stem));
-        let args = clang_args(&src, &asm);
+        let args = clang_args(&src, &out.join(format!("{}.s", src.stem)));
         if verbose {
             eprintln!("{} {}", clang.display(), args.join(" "));
         }
@@ -324,62 +296,8 @@ pub fn compile_c(
         if !status.success() {
             return Err(format!("clang failed ({status}) on {USER_DIR}/{}", src.file()));
         }
-        let text =
-            std::fs::read_to_string(&asm).map_err(|e| format!("cannot read {}: {e}", asm.display()))?;
-        // Windows clang writes CR LF line ends; the committed files have LF.
-        let text = text.replace("\r\n", "\n");
-        out.push((src.asm_file(), clang_file_text(&src.file(), &text)));
     }
-    Ok(out)
-}
-
-/// The files in `dir`/[`CLANG_DIR`] that don't belong to any C file in `dir`.
-pub fn stale_clang_files(dir: &Path) -> Result<Vec<String>, String> {
-    let wanted: Vec<String> = sources(dir)?
-        .into_iter()
-        .filter(|s| s.lang == Lang::C)
-        .map(|s| s.asm_file())
-        .collect();
-    let clang_dir = dir.join(CLANG_DIR);
-    let Ok(entries) = std::fs::read_dir(&clang_dir) else {
-        return Ok(Vec::new());
-    };
-    let mut stale = Vec::new();
-    for e in entries {
-        let e = e.map_err(|e| e.to_string())?;
-        let rel = format!("{CLANG_DIR}/{}", e.file_name().to_string_lossy());
-        if !wanted.contains(&rel) {
-            stale.push(rel);
-        }
-    }
-    stale.sort();
-    Ok(stale)
-}
-
-/// Recompiles the C files under `root` with `clang` and writes their
-/// assembly into [`CLANG_DIR`], leaving files that didn't change alone and
-/// deleting any that no C file makes. Returns the files written or deleted.
-pub fn write_clang(root: &Path, clang: &Path, verbose: bool) -> Result<Vec<String>, String> {
-    let dir = user_dir(root);
-    let work = root.join("target").join("userprogs");
-    let compiled = compile_c(clang, &dir, &work, verbose)?;
-    let clang_dir = dir.join(CLANG_DIR);
-    std::fs::create_dir_all(&clang_dir).map_err(|e| format!("cannot create {}: {e}", clang_dir.display()))?;
-    let mut changed = Vec::new();
-    for (rel, text) in compiled {
-        let path = dir.join(&rel);
-        if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
-            continue;
-        }
-        std::fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-        changed.push(format!("{USER_DIR}/{rel}"));
-    }
-    for rel in stale_clang_files(&dir)? {
-        let path = dir.join(&rel);
-        std::fs::remove_file(&path).map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
-        changed.push(format!("{USER_DIR}/{rel} (removed)"));
-    }
-    Ok(changed)
+    Ok(())
 }
 
 /// Words of zeros from which a run is written as `.zero` rather than as
@@ -427,23 +345,28 @@ fn emit_bytes(out: &mut String, bytes: &[u8]) {
 /// `user_programs` (one `struct user_program { const char *name; const u8
 /// *elf; u32 size; }` per program, in order), `user_program_count`, then the
 /// names and the images, each image 4-byte aligned under a global label
-/// `user_elf_<name>`.
-pub fn generate(programs: &[Program]) -> String {
+/// `user_elf_<name>`. `cc` is what compiled their C, which the header says.
+pub fn generate(programs: &[Program], cc: CCompiler) -> String {
     let mut s = String::new();
-    s.push_str(
+    let cc = match cc {
+        CCompiler::Merlin => "merlin",
+        CCompiler::Clang(_) => "clang (the reference build)",
+    };
+    let _ = write!(
+        s,
         "# Generated by `cargo xtask kernel` from kernel/user/: do not edit.\n\
          #\n\
-         # The user programs as ELF images for the kernel's loader, each assembled\n\
-         # by merlin-as (C programs from clang's assembly in kernel/user/clang)\n\
-         # with the runtime (crt0.s, usys.s, ulib.c) and linked by merlin-ld with\n\
-         # kernel/user/user.ld (crates/xtask/src/userprogs.rs). The table is the\n\
-         # array kernel/include/proc.h declares:\n\
-         #   struct user_program { const char *name; const u8 *elf; u32 size; };\n\
+         # The user programs as ELF images for the kernel's loader: each one's C\n\
+         # compiled by {cc}, assembled by merlin-as with the runtime (crt0.s,\n\
+         # usys.s, ulib.c) and linked by merlin-ld with kernel/user/user.ld\n\
+         # (crates/xtask/src/userprogs.rs). The table is the array\n\
+         # kernel/include/proc.h declares:\n\
+         #   struct user_program {{ const char *name; const u8 *elf; u32 size; }};\n\
          \n\
          \x20   .section .rodata\n\
          \x20   .align 2\n\
          \x20   .globl user_programs\n\
-         user_programs:\n",
+         user_programs:\n"
     );
     for p in programs {
         let _ = writeln!(
@@ -475,7 +398,7 @@ pub fn generate(programs: &[Program]) -> String {
 /// Builds every program under `root` and returns the text of
 /// `kernel/userprogs.s`.
 pub fn generated(root: &Path) -> Result<String, String> {
-    Ok(generate(&build_all(&user_dir(root))?))
+    Ok(generate(&build_all(&user_dir(root))?, CCompiler::Merlin))
 }
 
 /// Regenerates `kernel/userprogs.s` under `root`. Returns whether the file
@@ -502,7 +425,7 @@ mod tests {
     }
 
     /// A minimal runtime in `dir`: `_start` calls main and exit, `exit` is
-    /// an ecall, and ulib.c's committed assembly has one function.
+    /// an ecall, and ulib.c has one function.
     fn write_runtime(dir: &Path) {
         std::fs::write(
             dir.join("crt0.s"),
@@ -515,12 +438,6 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("ulib.c"), "int nothing(void) { return 0; }\n").unwrap();
-        std::fs::create_dir_all(dir.join(CLANG_DIR)).unwrap();
-        std::fs::write(
-            dir.join(CLANG_DIR).join("ulib.s"),
-            "    .globl nothing\nnothing:\n    li a0, 0\n    ret\n",
-        )
-        .unwrap();
         std::fs::write(
             dir.join(SCRIPT),
             "ENTRY(_start)\nSECTIONS { . = 0x1000; .text : { *(.text.start) *(.text*) } }\n",
@@ -547,10 +464,8 @@ mod tests {
 
     #[test]
     fn source_files() {
-        let c = src("sh", Lang::C);
-        assert_eq!((c.file(), c.asm_file()), ("sh.c".into(), "clang/sh.s".into()));
-        let s = src("regs", Lang::Asm);
-        assert_eq!((s.file(), s.asm_file()), ("regs.s".into(), "regs.s".into()));
+        assert_eq!(src("sh", Lang::C).file(), "sh.c");
+        assert_eq!(src("regs", Lang::Asm).file(), "regs.s");
         assert_eq!(Source::from_file("ulib.c"), Some(src("ulib", Lang::C)));
         assert_eq!(Source::from_file("user.h"), None);
         assert_eq!(Source::from_file("user.ld"), None);
@@ -579,8 +494,9 @@ mod tests {
         assert!(program_names(&dir).unwrap_err().contains("no programs"));
         std::fs::write(dir.join("b.c"), "").unwrap();
         std::fs::write(dir.join("a.s"), "").unwrap();
-        // clang's output is not a program of its own.
-        std::fs::write(dir.join(CLANG_DIR).join("b.s"), "").unwrap();
+        // Files in subdirectories are not programs.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("c.s"), "").unwrap();
         assert_eq!(program_names(&dir).unwrap(), ["a", "b"]);
         assert_eq!(programs(&dir).unwrap(), [src("a", Lang::Asm), src("b", Lang::C)]);
         std::fs::write(dir.join("a.c"), "").unwrap();
@@ -633,7 +549,7 @@ mod tests {
                 elf: vec![0; 4096],
             },
         ];
-        let text = generate(&programs);
+        let text = generate(&programs, CCompiler::Merlin);
         let obj = merlin_as::assemble(&text).unwrap_or_else(|e| panic!("{e:?}\n{text}"));
         let rodata = obj
             .sections
@@ -662,6 +578,15 @@ mod tests {
             assert_eq!(&data[at..at + p.elf.len()], &p.elf[..]);
         }
         assert!(text.starts_with("# Generated by `cargo xtask kernel`"));
+        assert!(text.contains("compiled by merlin,"), "{text}");
+        // The reference build's says so; the data is the same.
+        let clang = generate(&programs, CCompiler::Clang(Path::new("x")));
+        assert!(
+            clang.contains("compiled by clang (the reference build)"),
+            "{clang}"
+        );
+        let body = |t: &str| t[t.find(".section").unwrap()..].to_string();
+        assert_eq!(body(&clang), body(&text));
     }
 
     #[test]
@@ -684,16 +609,11 @@ mod tests {
         }
         assert_eq!(build_all(&dir).unwrap(), std::slice::from_ref(&p));
 
-        // A C program: its committed clang output is what gets assembled.
-        std::fs::write(dir.join("cprog.c"), "int main(void) { return 0; }\n").unwrap();
-        let err = build_all(&dir).unwrap_err();
-        assert!(
-            err.contains("clang/cprog.s") && err.contains("run `cargo xtask kernel`"),
-            "{err}"
-        );
+        // A C program, compiled by merlin with user.h from its directory.
+        std::fs::write(dir.join("user.h"), "#define ZERO 0\nint nothing(void);\n").unwrap();
         std::fs::write(
-            dir.join(CLANG_DIR).join("cprog.s"),
-            "    .globl main\nmain:\n    li a0, 0\n    ret\n",
+            dir.join("cprog.c"),
+            "#include \"user.h\"\nint main(void) { return nothing() + ZERO; }\n",
         )
         .unwrap();
         let built = build_all(&dir).unwrap();
@@ -701,6 +621,35 @@ mod tests {
             built.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
             ["cprog", "ok"]
         );
+        // A merlin error names the file under kernel/user.
+        std::fs::write(dir.join("cprog.c"), "int main(void) { return nope; }\n").unwrap();
+        let err = build_all(&dir).unwrap_err();
+        assert!(err.starts_with("kernel/user/cprog.c:1:"), "{err}");
+        assert!(err.contains("nope"), "{err}");
+
+        // The reference build reads clang's assembly from its directory.
+        let asm = dir.join("asm");
+        std::fs::create_dir_all(&asm).unwrap();
+        let cprog = programs(&dir)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.stem == "cprog")
+            .unwrap();
+        let err = build_program_with(&dir, &cprog, CCompiler::Clang(&asm)).unwrap_err();
+        assert!(err.contains("cannot read") && err.contains("cprog.s"), "{err}");
+        std::fs::write(
+            asm.join("cprog.s"),
+            "    .globl main\nmain:\n    li a0, 0\n    ret\n",
+        )
+        .unwrap();
+        std::fs::write(
+            asm.join("ulib.s"),
+            "    .globl nothing\nnothing:\n    li a0, 0\n    ret\n",
+        )
+        .unwrap();
+        let p = build_program_with(&dir, &cprog, CCompiler::Clang(&asm)).unwrap();
+        assert!(elf32::Elf::parse(&p.elf).is_ok());
+        std::fs::write(dir.join("cprog.c"), "int main(void) { return 0; }\n").unwrap();
 
         std::fs::write(dir.join("bad.s"), "    nop\n    frobnicate a0\n").unwrap();
         let err = build_all(&dir).unwrap_err();
@@ -722,26 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn finds_stale_clang_output() {
-        let dir = scratch("stale");
-        write_runtime(&dir);
-        assert!(stale_clang_files(&dir).unwrap().is_empty());
-        std::fs::write(dir.join("a.c"), "").unwrap();
-        std::fs::write(dir.join(CLANG_DIR).join("a.s"), "").unwrap();
-        std::fs::write(dir.join(CLANG_DIR).join("gone.s"), "").unwrap();
-        std::fs::write(dir.join(CLANG_DIR).join("notes.txt"), "").unwrap();
-        assert_eq!(
-            stale_clang_files(&dir).unwrap(),
-            ["clang/gone.s", "clang/notes.txt"]
-        );
-        // The repository's own: none.
-        assert!(stale_clang_files(&user_dir(&crate::repo_root()))
-            .unwrap()
-            .is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn clang_compiles_to_assembly_in_the_user_directory() {
         let args = clang_args(&src("sh", Lang::C), Path::new("out/sh.s"));
         for flag in [
@@ -758,9 +687,10 @@ mod tests {
         // The source by its bare name: clang runs in kernel/user.
         let n = args.len();
         assert_eq!(args[n - 3..], ["sh.c", "-o", "out/sh.s"]);
-        let text = clang_file_text("sh.c", "\t.text\n");
-        assert!(text.starts_with(CLANG_HEADER));
-        assert!(text.contains("kernel/user/sh.c"));
-        assert!(text.ends_with("\n\n\t.text\n"));
+        let dir = scratch("noclang");
+        std::fs::write(dir.join("a.c"), "").unwrap();
+        let err = compile_clang(&dir.join("no-such-clang"), &dir, &dir.join("out"), false).unwrap_err();
+        assert!(err.contains("cannot run"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -238,7 +238,10 @@ fn compiles_to_assembly() {
     let out = merlin(&[&t.file, Path::new("-o"), &out_s]);
     assert!(out.status.success(), "{}", stderr(&out));
     let asm = std::fs::read_to_string(&out_s).unwrap();
-    assert!(asm.contains(".globl main\nmain:\n"), "{asm}");
+    assert!(
+        asm.contains(".globl main\n    .type main, @function\nmain:\n"),
+        "{asm}"
+    );
     // Without it, the output goes next to the input, with a .s extension.
     let out = merlin(&[&t.file]);
     assert!(out.status.success(), "{}", stderr(&out));

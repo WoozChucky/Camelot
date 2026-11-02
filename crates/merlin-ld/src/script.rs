@@ -9,6 +9,8 @@
 //! {
 //!     . = expr;   . += expr;   symbol = expr;
 //!     .name : { *(pattern pattern ...) ... . = ALIGN(n); . += n; symbol = expr; } > RAM
+//!     .name (NOLOAD) : ALIGN(n) { ... } > RAM    both optional
+//!     /DISCARD/ : { *(pattern ...) }
 //! }
 //! ```
 //!
@@ -52,11 +54,28 @@ pub struct Assign {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputDesc {
+    /// `/DISCARD/` for the sections to throw away (see [`OutputDesc::is_discard`]).
     pub name: String,
+    /// `(NOLOAD)`: the section takes no file space (`SHT_NOBITS`), whatever
+    /// its inputs are.
+    pub noload: bool,
+    /// `ALIGN(n)` after the colon: the section starts at least this aligned.
+    pub align: Option<Expr>,
     pub items: Vec<Item>,
     /// `> REGION`.
     pub region: Option<String>,
     pub line: usize,
+}
+
+impl OutputDesc {
+    /// The name of the output section whose inputs are thrown away.
+    pub const DISCARD: &'static str = "/DISCARD/";
+
+    /// Whether this is `/DISCARD/`: the input sections it matches are not
+    /// placed anywhere.
+    pub fn is_discard(&self) -> bool {
+        self.name == Self::DISCARD
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,10 +166,9 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, ScriptError> {
             '/' => {
                 chars.next();
                 if chars.clone().take(8).eq("DISCARD/".chars()) {
-                    return error(
-                        line,
-                        "/DISCARD/ is not supported (non-allocated sections are dropped without it)",
-                    );
+                    chars.nth(7);
+                    toks.push((Tok::Word(OutputDesc::DISCARD.into()), line));
+                    continue;
                 }
                 if chars.peek() != Some(&'*') {
                     return error(line, "unexpected '/' (only /* */ comments are supported)");
@@ -421,8 +439,18 @@ impl Parser {
                 cmds.push(Command::Assign(self.assign(name, line)?));
                 continue;
             }
+            // `name (NOLOAD) :`, the only output section type supported.
+            let noload = self.is("(")
+                && matches!(self.toks.get(self.pos + 1), Some((Tok::Word(w), _)) if w == "NOLOAD");
+            if noload {
+                self.pos += 2;
+                self.expect(")")?;
+                if !self.is(":") {
+                    return error(line, format!("expected ':' after '{name} (NOLOAD)'"));
+                }
+            }
             if self.eat(":") {
-                cmds.push(Command::Output(self.output_section(name, line)?));
+                cmds.push(Command::Output(self.output_section(name, noload, line)?));
                 continue;
             }
             return match self.peek() {
@@ -431,7 +459,7 @@ impl Parser {
                     line,
                     format!(
                         "unsupported syntax after '{name}': found {t} (output sections are \
-                         `name : {{ ... }}`, without address or attributes)"
+                         `name [(NOLOAD)] : [ALIGN(n)] {{ ... }}`, without an address or other attributes)"
                     ),
                 ),
                 None => error(line, "unexpected end of script"),
@@ -460,16 +488,51 @@ impl Parser {
         })
     }
 
-    fn output_section(&mut self, name: String, line: usize) -> Result<OutputDesc, ScriptError> {
-        if name == "." || name == "/DISCARD/" {
+    /// The rest of an output section after its name, its `(NOLOAD)` and the
+    /// colon: `[ALIGN(n)] { items } [> REGION]`.
+    fn output_section(&mut self, name: String, noload: bool, line: usize) -> Result<OutputDesc, ScriptError> {
+        if name == "." {
             return error(line, format!("'{name}' is not a valid output section name"));
         }
+        let discard = name == OutputDesc::DISCARD;
+        if discard && noload {
+            return error(line, "/DISCARD/ cannot be NOLOAD");
+        }
+        let align = match self.peek() {
+            Some(Tok::Word(w)) if w == "ALIGN" => {
+                let aline = self.line();
+                if discard {
+                    return error(aline, "/DISCARD/ cannot have an ALIGN");
+                }
+                self.pos += 1;
+                self.expect("(")?;
+                let e = self.expr()?;
+                if self.is(",") {
+                    return error(aline, "only the one-argument form ALIGN(n) is supported");
+                }
+                self.expect(")")?;
+                Some(e)
+            }
+            Some(Tok::Punct("{")) => None,
+            Some(t) => {
+                return error(
+                    self.line(),
+                    format!(
+                        "unsupported syntax after '{name} :': found {t} (only ALIGN(n) may come before '{{')"
+                    ),
+                )
+            }
+            None => return error(self.line(), "unexpected end of script"),
+        };
         self.expect("{")?;
         let mut items = Vec::new();
         while !self.eat("}") {
             let iline = self.line();
             let w = self.word("an input section list or an assignment")?;
             if self.is("=") || self.is("+=") {
+                if discard {
+                    return error(iline, "/DISCARD/ may only list input sections");
+                }
                 let a = self.assign(w, iline)?;
                 if a.symbol.is_none() && !a.add && !a.expr.uses_dot() {
                     return error(
@@ -509,6 +572,9 @@ impl Parser {
             items.push(Item::Input(patterns));
         }
         let region = if self.eat(">") {
+            if discard {
+                return error(self.line(), "/DISCARD/ cannot go in a memory region");
+            }
             Some(self.word("a memory region name")?)
         } else {
             None
@@ -516,6 +582,8 @@ impl Parser {
         self.eat(";");
         Ok(OutputDesc {
             name,
+            noload,
+            align,
             items,
             region,
             line,
@@ -720,6 +788,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_kernels_script() {
+        // kernel/kernel.ld: ALIGN(n) after the colon, NOLOAD, /DISCARD/.
+        let s = parse(include_str!("../../../kernel/kernel.ld")).unwrap();
+        let outs: Vec<&OutputDesc> = s
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::Output(o) => Some(o),
+                Command::Assign(_) => None,
+            })
+            .collect();
+        let shape: Vec<(&str, bool, Option<&Expr>, bool)> = outs
+            .iter()
+            .map(|o| (o.name.as_str(), o.noload, o.align.as_ref(), o.is_discard()))
+            .collect();
+        let page = Expr::Num(4096);
+        let sixteen = Expr::Num(16);
+        assert_eq!(
+            shape,
+            [
+                (".text", false, None, false),
+                (".rodata", false, Some(&page), false),
+                (".data", false, Some(&page), false),
+                (".bss", true, Some(&sixteen), false),
+                (".stack", true, Some(&sixteen), false),
+                ("/DISCARD/", false, None, true),
+            ]
+        );
+        assert_eq!(
+            outs[5].items,
+            [
+                Item::Input(vec![".comment".into()]),
+                Item::Input(vec![".note".into(), ".note.*".into()]),
+                Item::Input(vec![".eh_frame".into()])
+            ]
+        );
+        assert_eq!(outs[0].region.as_deref(), Some("RAM"));
+        assert_eq!(outs[5].region, None);
+        // `/DISCARD/` reads as one word wherever it is.
+        let s = parse("SECTIONS{/DISCARD/:{*(.x)}}").unwrap();
+        assert!(matches!(&s.commands[0], Command::Output(o) if o.is_discard()));
+    }
+
+    #[test]
     fn default_script_parses() {
         let s = parse(DEFAULT_SCRIPT).unwrap();
         assert_eq!(s.commands.len(), 5);
@@ -793,16 +905,41 @@ mod tests {
             ),
             (
                 "SECTIONS { .text 0x100 : { *(.text) } }",
-                "without address or attributes",
+                "without an address or other attributes",
+            ),
+            (
+                "SECTIONS { .bss (COPY) : { *(.bss) } }",
+                "unsupported linker script command '.bss'",
+            ),
+            (
+                "SECTIONS { .bss (NOLOAD) { *(.bss) } }",
+                "expected ':' after '.bss (NOLOAD)'",
+            ),
+            (
+                "SECTIONS { .text : AT(0x100) { *(.text) } }",
+                "only ALIGN(n) may come before '{'",
+            ),
+            ("SECTIONS { .text : ALIGN(4, 8) { } }", "one-argument form"),
+            (
+                "SECTIONS { /DISCARD/ (NOLOAD) : { *(.comment) } }",
+                "/DISCARD/ cannot be NOLOAD",
+            ),
+            (
+                "SECTIONS { /DISCARD/ : ALIGN(4) { *(.comment) } }",
+                "/DISCARD/ cannot have an ALIGN",
+            ),
+            (
+                "SECTIONS { /DISCARD/ : { x = .; } }",
+                "/DISCARD/ may only list input sections",
+            ),
+            (
+                "MEMORY { RAM : o = 0, l = 1M } SECTIONS { /DISCARD/ : { *(.note) } > RAM }",
+                "/DISCARD/ cannot go in a memory region",
             ),
             ("SECTIONS { .text : { *(.text) } > ROM }", "unknown region 'ROM'"),
             (
                 "SECTIONS { .text : { *(.text) } AT> ROM }",
                 "unsupported syntax after 'AT'",
-            ),
-            (
-                "SECTIONS { /DISCARD/ : { *(.comment) } }",
-                "/DISCARD/ is not supported",
             ),
             ("SECTIONS { . = 4 / 2; }", "unexpected '/'"),
             ("SECTIONS { x += 4; }", "only supported for the location counter"),

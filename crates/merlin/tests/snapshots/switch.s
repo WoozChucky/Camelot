@@ -4,6 +4,7 @@
     #     -12(s0)  param int x
     #     -16(s0)  local int y
     .globl classify
+    .type classify, @function
 classify:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -55,11 +56,13 @@ classify:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size classify, . - classify
 
     # int fall(int x): frame 16 bytes
     #     -12(s0)  param int x
     #     -16(s0)  local int r
     .globl fall
+    .type fall, @function
 fall:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -123,11 +126,13 @@ fall:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size fall, . - fall
 
     # int nested(int a, int b): frame 16 bytes
     #     -12(s0)  param int a
     #     -16(s0)  param int b
     .globl nested
+    .type nested, @function
 nested:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -196,11 +201,13 @@ nested:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size nested, . - nested
 
     # int loop_continue(void): frame 16 bytes
     #     -12(s0)  local int i
     #     -16(s0)  local int s
     .globl loop_continue
+    .type loop_continue, @function
 loop_continue:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -275,6 +282,7 @@ loop_continue:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size loop_continue, . - loop_continue
 
     # void copy(char *to, const char *from, int count): frame 32 bytes
     #     -12(s0)  param char *to
@@ -282,6 +290,7 @@ loop_continue:
     #     -20(s0)  param int count
     #     -24(s0)  local int n
     .globl copy
+    .type copy, @function
 copy:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -402,10 +411,12 @@ copy:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size copy, . - copy
 
     # int kind(unsigned int u): frame 16 bytes
     #     -12(s0)  param unsigned int u
     .globl kind
+    .type kind, @function
 kind:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -432,10 +443,12 @@ kind:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size kind, . - kind
 
     # int letter(char c): frame 16 bytes
     #      -9(s0)  param char c
     .globl letter
+    .type letter, @function
 letter:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -465,11 +478,13 @@ letter:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size letter, . - letter
 
     # int main(void): frame 32 bytes
     #     -12(s0)  local int ok
     #     -20(s0)  local char dst[8]
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -977,6 +992,7 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main
 
     .section .rodata
 
