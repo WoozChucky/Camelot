@@ -44,7 +44,7 @@ const POLL: Duration = Duration::from_millis(100);
 /// How the server runs.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Where to listen. Loopback by default: v1 of the protocol has no authentication.
+    /// Where to listen. Loopback by default: the protocol has no authentication.
     pub listen: SocketAddr,
     /// Total RAM of all VMs in bytes; creating a VM that would exceed it is refused
     /// with `OverBudget`. `None` is no limit.
@@ -181,7 +181,7 @@ impl Server {
             eprintln!("avalon: listening on {}", shared.addr);
             if !shared.addr.ip().is_loopback() {
                 eprintln!(
-                    "avalon: warning: {} is not a loopback address, and protocol v1 has no \
+                    "avalon: warning: {} is not a loopback address, and the protocol has no \
                      authentication: anyone who can reach it can control the VMs",
                     shared.addr
                 );
@@ -252,6 +252,7 @@ impl ServerThread {
         Some(VmDebug {
             slices: vm.slices(),
             consoles: vm.console_count(),
+            viewers: vm.viewer_count(),
         })
     }
 
@@ -278,6 +279,8 @@ pub struct VmDebug {
     pub slices: u64,
     /// Clients attached to the console.
     pub consoles: usize,
+    /// Clients attached to the screen.
+    pub viewers: usize,
 }
 
 impl Shared {
@@ -755,28 +758,57 @@ impl Session<'_> {
                 }
                 Message::Ok
             }
+            Message::ScreenAttach { vm } => {
+                server.find(&vm)?.attach_screen(self.outbox)?;
+                return Ok(None);
+            }
+            Message::ScreenDetach { vm } => {
+                if !server.find(&VmRef::Id(vm))?.detach_screen(self.outbox.id) {
+                    return Err(Fail::new(
+                        ErrorCode::InvalidState,
+                        format!("not attached to the screen of VM {vm}"),
+                    ));
+                }
+                Message::Ok
+            }
             other => return Err(unsupported(&other)),
         };
         Ok(Some(reply))
     }
 
-    /// Serves one event: console input for a VM this client is attached to. Every
-    /// other event is dropped: input for a VM it is not attached to, key input (it
-    /// needs a screen attachment, which this version does not serve), and events only
-    /// servers send.
+    /// Serves one event: console input for a VM whose console this client is attached
+    /// to, keys and pointer changes for a VM whose screen it is attached to. Every other
+    /// event is dropped: input for a VM it is not attached to (or that does not exist),
+    /// and events only servers send.
     fn event(&self, msg: Message) {
-        if let Message::ConsoleInput { vm, data } = msg {
-            if let Ok(vm) = self.server.find(&VmRef::Id(vm)) {
-                vm.console_input(self.outbox.id, &data);
+        let id = self.outbox.id;
+        let find = |vm: u32| self.server.find(&VmRef::Id(vm)).ok();
+        match msg {
+            Message::ConsoleInput { vm, data } => {
+                if let Some(vm) = find(vm) {
+                    vm.console_input(id, &data);
+                }
             }
+            Message::KeyInput { vm, key } => {
+                if let Some(vm) = find(vm) {
+                    vm.key_input(id, key);
+                }
+            }
+            Message::PointerInput { vm, pointer } => {
+                if let Some(vm) = find(vm) {
+                    vm.pointer_input(id, pointer);
+                }
+            }
+            _ => {}
         }
     }
 
-    /// The connection is ending: detach it from every console.
+    /// The connection is ending: detach it from every console and screen.
     fn detach_everywhere(&self) {
         let vms: Vec<Arc<Vm>> = lock(&self.server.table).vms.values().cloned().collect();
         for vm in vms {
             vm.detach_console(self.outbox.id);
+            vm.detach_screen(self.outbox.id);
         }
     }
 }
@@ -784,7 +816,6 @@ impl Session<'_> {
 /// The reply to a request from a group this server does not serve.
 fn unsupported(msg: &Message) -> Fail {
     let why = match msg.type_code() >> 8 {
-        0x03 => "this Avalon does not stream screens yet",
         0x04 | 0x05 => "Avalon runs VMs; block I/O and disk management are served by Lake",
         _ => "not served by Avalon",
     };

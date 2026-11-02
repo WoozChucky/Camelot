@@ -1,5 +1,5 @@
-//! One virtual machine: a Grail [`Machine`], its life cycle, its thread and its
-//! console.
+//! One virtual machine: a Grail [`Machine`], its life cycle, its thread, its console
+//! and its screen.
 //!
 //! A VM is created with its program loaded and its machine parked here, in state
 //! created. Starting it moves the machine onto a thread of its own, which runs it in
@@ -13,6 +13,31 @@
 //! scrollback, and streams new output to the clients attached to its console. Their
 //! input goes to the UART's receiver, in the order the server receives it.
 //!
+//! The screen (the framebuffer) streams to the clients attached to it, the viewers
+//! (protocol doc, section 6.4). The VM keeps one [`Screen`]: exactly what every viewer
+//! has been sent. Between slices the thread compares the framebuffer with it and sends
+//! the rectangles that changed to every viewer; an unchanged screen sends nothing. Two
+//! limits keep a busy guest from flooding the link:
+//!
+//! - **Rate**: the thread looks at the screen at most once per [`SCREEN_INTERVAL`]
+//!   (~30 times a second), however often the guest redraws. Changes between two looks
+//!   go out together, as their final pixels.
+//! - **Backlog**: a viewer with more than [`SCREEN_BACKLOG`] bytes still queued (a slow
+//!   link) is sent no rectangles, and is marked behind. Once its queue has drained it
+//!   gets one full frame, which brings it level with the others. So a slow viewer sees
+//!   fewer frames rather than falling ever further behind and being cut off.
+//!
+//! The comparison is skipped while nobody is attached; the VM only remembers that the
+//! machine ran since its last look. A viewer that attaches is sent the screen as it
+//! was last captured (with `ScreenAttached`, under the lock), and the thread's next
+//! look brings it, like everyone else, up to date. When the machine ends (stopped,
+//! exited) the thread captures the screen one last time, so later viewers see its last
+//! frame.
+//!
+//! Keys and pointer changes from viewers queue here (at most [`MAX_INPUT_QUEUE`] of
+//! each) and the thread hands them to the machine's keyboard and pointer devices
+//! before its next slice, as Grail's own window does between slices.
+//!
 //! Locking: everything that changes is in [`Inner`], behind one mutex per VM, which
 //! the VM thread takes only between slices. Events for attached clients are queued
 //! under that lock, so every client sees them in the order they happened.
@@ -20,17 +45,20 @@
 use crate::outbox::Outbox;
 use crate::{lock, Fail};
 use avalon_proto::{
-    AttachKind, DeviceEntry, ErrorCode, Frame, HardwareProfile, Message, VmDetails, VmState, VmSummary,
+    AttachKind, DeviceEntry, ErrorCode, Frame, HardwareProfile, KeyEvent, Message, PointerChange,
+    PointerMotion, Screen, VmDetails, VmState, VmSummary, PIXEL_FORMAT_XRGB8888,
 };
 use excalibur::csr::IRQ_M_TIMER;
-use grail::{Machine, MachineConfig};
+use grail::framebuffer::{FB_HEIGHT, FB_WIDTH};
+use grail::pointer::{Motion, PointerInput};
+use grail::{keyboard, Machine, MachineConfig};
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Bytes of recent console output each VM keeps, sent to every client that attaches.
 pub const SCROLLBACK: usize = 64 * 1024;
@@ -43,6 +71,21 @@ const SLICE: u64 = 100_000;
 /// How long a full-speed machine parked in `wfi` sleeps before it looks again, if
 /// nothing wakes it first (input and requests do).
 const PARKED_NAP: Duration = Duration::from_millis(50);
+
+/// Shortest time between two looks at the screen: at most ~30 updates a second go to
+/// the viewers, however fast the guest draws.
+pub const SCREEN_INTERVAL: Duration = Duration::from_millis(33);
+
+/// A viewer with more than this many bytes queued and not yet written is sent no
+/// screen updates until it has caught up (then one full frame). A little over one full
+/// 640x480 frame (1.2 MB), and well below [`crate::MAX_QUEUED`], where a client is cut
+/// off.
+pub const SCREEN_BACKLOG: usize = 2 * 1024 * 1024;
+
+/// Most keys, and most pointer changes, waiting for the machine. The devices' own
+/// FIFOs hold 64; more than this waiting means the guest is not reading them (or is
+/// paused), and further input is dropped, as a full FIFO drops it.
+pub const MAX_INPUT_QUEUE: usize = 256;
 
 pub struct Vm {
     /// Set by the server when the VM goes into its table.
@@ -82,6 +125,25 @@ struct Inner {
     scrollback: VecDeque<u8>,
     /// Clients attached to the console, at most once each.
     consoles: Vec<Arc<Outbox>>,
+    /// Clients attached to the screen, at most once each.
+    viewers: Vec<Viewer>,
+    /// The screen as the viewers have it: what was captured last.
+    screen: Screen,
+    /// The machine has run since the last capture, so its framebuffer may differ.
+    screen_owed: bool,
+    /// When the screen was last looked at, for [`SCREEN_INTERVAL`].
+    screen_looked: Option<Instant>,
+    /// Viewers' keys and pointer changes, for the thread to hand to the machine.
+    keys: VecDeque<keyboard::KeyEvent>,
+    pointer: VecDeque<PointerInput>,
+}
+
+/// A client attached to the screen.
+struct Viewer {
+    outbox: Arc<Outbox>,
+    /// Updates were held back from it (its queue was over [`SCREEN_BACKLOG`]): it gets a
+    /// full frame once it has caught up.
+    behind: bool,
 }
 
 /// Collects what a machine writes to its UART. Only the VM's own thread touches it,
@@ -162,6 +224,12 @@ impl Vm {
                 input: Some(input),
                 scrollback: VecDeque::new(),
                 consoles: Vec::new(),
+                viewers: Vec::new(),
+                screen: Screen::new(FB_WIDTH, FB_HEIGHT),
+                screen_owed: false,
+                screen_looked: None,
+                keys: VecDeque::new(),
+                pointer: VecDeque::new(),
             }),
             wake: Condvar::new(),
             thread: Mutex::new(None),
@@ -195,6 +263,11 @@ impl Vm {
         self.lock().consoles.len()
     }
 
+    /// How many clients are attached to the screen.
+    pub fn viewer_count(&self) -> usize {
+        self.lock().viewers.len()
+    }
+
     pub fn summary(&self) -> VmSummary {
         VmSummary {
             id: self.id,
@@ -218,10 +291,13 @@ impl Vm {
         if self.log {
             eprintln!("avalon: VM {} ('{}') {state}", self.id, self.name);
         }
-        broadcast(
-            &mut inner.consoles,
-            &Message::VmStateChanged { vm: self.id, state },
-        );
+        let event = event_frame(&Message::VmStateChanged { vm: self.id, state });
+        inner.consoles.retain(|c| c.event(&event));
+        // Once to each client, also to one attached to both the console and the screen.
+        let consoles = &inner.consoles;
+        inner
+            .viewers
+            .retain(|v| consoles.iter().any(|c| c.id == v.outbox.id) || v.outbox.event(&event));
         self.wake.notify_all();
     }
 
@@ -301,20 +377,23 @@ impl Vm {
     /// Ends the VM for good: its thread stops and is joined, its machine is dropped,
     /// and attached clients get `Detached`. The caller has taken it out of the table.
     pub fn destroy(&self) {
-        let consoles = {
+        let (consoles, viewers) = {
             let mut inner = self.lock();
             inner.gone = true;
             inner.machine = None;
             inner.input = None;
             self.wake.notify_all();
-            std::mem::take(&mut inner.consoles)
+            (
+                std::mem::take(&mut inner.consoles),
+                std::mem::take(&mut inner.viewers),
+            )
         };
-        let detached = event_frame(&Message::Detached {
-            vm: self.id,
-            kind: AttachKind::Console,
-        });
-        for client in consoles {
-            client.event(&detached);
+        let viewers = viewers.into_iter().map(|v| v.outbox).collect();
+        for (clients, kind) in [(consoles, AttachKind::Console), (viewers, AttachKind::Screen)] {
+            let detached = event_frame(&Message::Detached { vm: self.id, kind });
+            for client in clients {
+                client.event(&detached);
+            }
         }
         self.join();
         if self.log {
@@ -391,30 +470,125 @@ impl Vm {
         true
     }
 
+    /// Attaches `client` to the screen: queues `ScreenAttached` and a full frame of the
+    /// screen as the other viewers have it, under the lock, so the updates that follow
+    /// apply to it. Attaching again just sends the full frame again.
+    pub fn attach_screen(&self, client: &Arc<Outbox>) -> Result<(), Fail> {
+        let mut inner = self.lock();
+        if inner.gone {
+            return Err(Fail::new(
+                ErrorCode::NoSuchVm,
+                format!("VM {} is being destroyed", self.id),
+            ));
+        }
+        client.reply_now(&Message::ScreenAttached {
+            vm: self.id,
+            width: inner.screen.width(),
+            height: inner.screen.height(),
+            format: PIXEL_FORMAT_XRGB8888,
+        });
+        let full = event_frame(&inner.screen.frame(self.id, inner.screen.bounds()));
+        if client.event(&full) {
+            match inner.viewers.iter_mut().find(|v| v.outbox.id == client.id) {
+                Some(v) => v.behind = false,
+                None => inner.viewers.push(Viewer {
+                    outbox: Arc::clone(client),
+                    behind: false,
+                }),
+            }
+        }
+        // A paused thread that owes the screen a look takes it now.
+        self.wake.notify_all();
+        Ok(())
+    }
+
+    /// Detaches client `id` from the screen. False if it was not attached.
+    pub fn detach_screen(&self, id: u64) -> bool {
+        let mut inner = self.lock();
+        let before = inner.viewers.len();
+        inner.viewers.retain(|v| v.outbox.id != id);
+        inner.viewers.len() != before
+    }
+
+    /// A key from client `id` for the keyboard device. Dropped (false) unless that
+    /// client is attached to the screen and the machine can still run, and also when
+    /// [`MAX_INPUT_QUEUE`] keys are waiting already.
+    pub fn key_input(&self, id: u64, key: KeyEvent) -> bool {
+        let key = keyboard::KeyEvent {
+            code: key.code,
+            release: key.release,
+            shift: key.shift,
+            ctrl: key.ctrl,
+        };
+        self.input_event(id, |inner| queue(&mut inner.keys, key))
+    }
+
+    /// A pointer change from client `id` for the pointer device; dropped as
+    /// [`Vm::key_input`] drops keys.
+    pub fn pointer_input(&self, id: u64, change: PointerChange) -> bool {
+        self.input_event(id, |inner| queue(&mut inner.pointer, pointer_input(change)))
+    }
+
+    fn input_event(&self, id: u64, push: impl FnOnce(&mut Inner) -> bool) -> bool {
+        let mut inner = self.lock();
+        let live = matches!(inner.state, VmState::Created | VmState::Running | VmState::Paused);
+        if inner.gone || !live || !inner.viewers.iter().any(|v| v.outbox.id == id) || !push(&mut inner) {
+            return false;
+        }
+        inner.kick = true;
+        self.wake.notify_all();
+        true
+    }
+
     /// The VM thread: runs the machine in slices while the VM is running.
     fn run(self: Arc<Self>, mut machine: Machine) {
         let _guard = ThreadGuard(&self);
         let paced = machine.config().clock_hz.is_some();
         loop {
-            {
+            let (keys, pointer) = {
                 let mut inner = self.lock();
                 loop {
                     if inner.gone || matches!(inner.state, VmState::Stopped | VmState::Exited(_)) {
+                        self.last_look(&mut inner, &machine);
                         return;
                     }
                     if inner.state == VmState::Running {
                         break;
                     }
-                    inner = self.wait(inner);
+                    // Paused: the viewers still get what the last slices drew, and a
+                    // viewer that falls behind still catches up.
+                    self.look(&mut inner, &machine);
+                    inner = match self.screen_due(&inner) {
+                        Some(due) => {
+                            let left = due.saturating_duration_since(Instant::now());
+                            self.wake
+                                .wait_timeout(inner, left)
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .0
+                        }
+                        None => self.wait(inner),
+                    };
                 }
                 inner.busy = true;
                 inner.kick = false;
-            }
+                (
+                    std::mem::take(&mut inner.keys),
+                    std::mem::take(&mut inner.pointer),
+                )
+            };
 
+            // Viewers' input first, as Grail's window hands it over between slices.
+            for key in keys {
+                machine.key_event(key);
+            }
+            for change in pointer {
+                machine.pointer_event(change);
+            }
             let steps = machine.run_for(SLICE, &mut |_| {});
             // `run_for` ends a slice early once the guest has written FB_PRESENT, until
             // the host takes that frame: take it, or every later slice is a single step.
-            // (Nothing streams screens yet; this is where a frame would be sent.)
+            // The screen goes out at the pace of `look`, not on presents: viewers see
+            // the framebuffer, presented or not, as Grail's window does.
             machine.cpu.bus.fb.take_present();
             self.steps.fetch_add(steps, Ordering::Relaxed);
             self.slices.fetch_add(1, Ordering::Relaxed);
@@ -426,25 +600,105 @@ impl Vm {
             if !output.is_empty() {
                 self.console_output(&mut inner, output);
             }
+            if steps > 0 {
+                inner.screen_owed = true;
+            }
             if let Some(code) = machine.exit_code() {
+                // The last frame before the state change, so that viewers have it by
+                // the time they hear the program has ended.
+                self.last_look(&mut inner, &machine);
                 if !inner.gone && matches!(inner.state, VmState::Running | VmState::Paused) {
                     self.set_state(&mut inner, VmState::Exited(code));
                 }
                 return;
             }
+            self.look(&mut inner, &machine);
             // Nothing to run right now: a real-time machine ahead of the wall clock, or
-            // a full-speed one parked in wfi. Requests and input wake the thread early.
+            // a full-speed one parked in wfi. Requests and input wake the thread early,
+            // and so does the next look at the screen, when one is owed.
             let nap = if paced {
                 machine.pace_delay()
             } else {
                 parked(&machine).then_some(PARKED_NAP)
             };
-            if let Some(nap) = nap {
+            if let Some(mut nap) = nap {
+                if let Some(due) = self.screen_due(&inner) {
+                    nap = nap.min(due.saturating_duration_since(Instant::now()));
+                }
                 if inner.state == VmState::Running && !inner.kick && !inner.gone {
                     drop(self.wake.wait_timeout(inner, nap));
                 }
             }
         }
+    }
+
+    /// When the thread should next look at the screen: `None` when nobody is attached
+    /// or there is nothing to look for (the machine has not run since the last look,
+    /// and no viewer is behind).
+    fn screen_due(&self, inner: &Inner) -> Option<Instant> {
+        let behind = inner.viewers.iter().any(|v| v.behind);
+        if inner.viewers.is_empty() || !(inner.screen_owed || behind) {
+            return None;
+        }
+        Some(
+            inner
+                .screen_looked
+                .map_or_else(Instant::now, |t| t + SCREEN_INTERVAL),
+        )
+    }
+
+    /// Looks at the screen if that is due: sends the viewers what changed since the
+    /// last look, and a full frame to a viewer that has caught up.
+    fn look(&self, inner: &mut Inner, machine: &Machine) {
+        if self.screen_due(inner).is_some_and(|due| due <= Instant::now()) {
+            self.update_viewers(inner, machine, false);
+        }
+    }
+
+    /// The machine is ending: the last capture, made whether or not anyone is attached
+    /// (it is what later viewers will be sent), and sent to every viewer, behind or not.
+    fn last_look(&self, inner: &mut Inner, machine: &Machine) {
+        inner.screen_owed = true;
+        self.update_viewers(inner, machine, true);
+    }
+
+    /// Captures the screen if the machine has run since the last capture, and sends
+    /// the rectangles that changed to every viewer that keeps up. A viewer over
+    /// [`SCREEN_BACKLOG`] gets nothing and is marked behind; a viewer that is behind
+    /// gets a full frame once it is under it again (or at once when `last`).
+    fn update_viewers(&self, inner: &mut Inner, machine: &Machine, last: bool) {
+        inner.screen_looked = Some(Instant::now());
+        let rects = if std::mem::take(&mut inner.screen_owed) {
+            let fb = &machine.cpu.bus.fb;
+            // A display that is off shows black, as Grail's window does.
+            inner.screen.update(fb.enabled().then_some(fb.vram.as_slice()))
+        } else {
+            Vec::new()
+        };
+        let id = self.id;
+        let Inner { viewers, screen, .. } = inner;
+        let frames: Vec<Frame> = rects.iter().map(|&r| event_frame(&screen.frame(id, r))).collect();
+        let mut full = None;
+        viewers.retain_mut(|v| {
+            let keeping_up = v.outbox.queued() <= SCREEN_BACKLOG;
+            if v.behind {
+                if !(keeping_up || last) {
+                    return true;
+                }
+                v.behind = false;
+                let full = full.get_or_insert_with(|| event_frame(&screen.frame(id, screen.bounds())));
+                return v.outbox.event(full);
+            }
+            if frames.is_empty() {
+                return true;
+            }
+            if !(keeping_up || last) {
+                v.behind = true;
+                return true;
+            }
+            // `event` is false once the client is gone (or cut off): it is dropped.
+            frames.iter().all(|f| v.outbox.event(f))
+        });
     }
 
     /// New console output: into the scrollback and to every attached client.
@@ -455,6 +709,33 @@ impl Vm {
         inner.scrollback.extend(&data[data.len() - keep..]);
         // A slice writes at most SLICE bytes, far below the frame limit.
         broadcast(&mut inner.consoles, &Message::ConsoleOutput { vm: self.id, data });
+    }
+}
+
+/// Queues `item` unless [`MAX_INPUT_QUEUE`] are waiting. Returns whether it did.
+fn queue<T>(q: &mut VecDeque<T>, item: T) -> bool {
+    if q.len() >= MAX_INPUT_QUEUE {
+        return false;
+    }
+    q.push_back(item);
+    true
+}
+
+/// A viewer's pointer change as the input of Grail's pointer device. Positions past
+/// `i32::MAX` are past the screen's edge either way: the device clamps them to it.
+fn pointer_input(change: PointerChange) -> PointerInput {
+    let motion = match change.motion {
+        PointerMotion::None => Motion::None,
+        PointerMotion::To { x, y } => Motion::To {
+            x: x.min(i32::MAX as u32) as i32,
+            y: y.min(i32::MAX as u32) as i32,
+        },
+        PointerMotion::By { dx, dy } => Motion::By { dx, dy },
+    };
+    PointerInput {
+        motion,
+        buttons: change.buttons,
+        wheel: change.wheel as i32,
     }
 }
 

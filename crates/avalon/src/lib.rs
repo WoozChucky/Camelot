@@ -1,10 +1,11 @@
 //! Avalon: the hypervisor server of the Avalon platform. One long-running process that
 //! creates and runs any number of Grail virtual machines, each with its own hardware
 //! profile, and serves the Avalon protocol (`docs/avalon-protocol.md`) so that Round
-//! Table can manage them and Herald can attach to their consoles.
+//! Table can manage them and Herald can attach to their consoles and screens.
 //!
 //! - [`Server`] (`server.rs`): the listener, the VM table and two threads per client.
-//! - `vm.rs`: one VM, its life cycle, its thread and its console.
+//! - `vm.rs`: one VM, its life cycle, its thread, its console and its screen (with the
+//!   keyboard and pointer input of the clients that view it).
 //! - `outbox.rs`: a client's outgoing queue (replies and events).
 //! - [`machine_config`]: a hardware profile from the wire as a Grail `MachineConfig`.
 //!
@@ -25,7 +26,7 @@ pub use server::{
     parse_listen, parse_max_ram, Config, Server, ServerThread, ShutdownHandle, VmDebug, DEFAULT_MAX_RAM,
     HANDSHAKE_TIMEOUT,
 };
-pub use vm::SCROLLBACK;
+pub use vm::{MAX_INPUT_QUEUE, SCREEN_BACKLOG, SCREEN_INTERVAL, SCROLLBACK};
 
 /// Locks `m`, carrying on if a thread panicked while holding it: the server's state
 /// stays usable for every other VM and client.
