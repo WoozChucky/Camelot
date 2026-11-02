@@ -4,7 +4,10 @@
 
 mod common;
 
-use avalon_proto::{AttachKind, DeviceEntry, ErrorCode, Message, VmRef, VmState, VmSummary};
+use avalon_proto::{
+    AttachKind, DeviceEntry, DeviceSpec, DiskSource, DiskSpec, ErrorCode, HardwareProfile, Message, VmRef,
+    VmState, VmSummary,
+};
 use common::*;
 use std::time::{Duration, Instant};
 
@@ -603,4 +606,63 @@ fn the_readme_client_example() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(String::from_utf8(output)?, expected);
     server.stop()?;
     Ok(())
+}
+
+/// A VM created with no program boots from its disk 0 (spec section 7, "Boot from
+/// disk"): here a boot block that says `bye` and halts with exit code 3. A VM whose
+/// disk has no boot block stops with the boot ROM's message and exit code.
+#[test]
+fn a_vm_with_no_program_boots_from_its_disk() {
+    let dir = std::env::temp_dir().join(format!("avalon-disk-boot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = grail::elf::parse(&exits_with(3)).unwrap();
+    let mut block = [0u8; grail::boot::BOOT_BLOCK_SIZE];
+    block[..file.segments[0].data.len()].copy_from_slice(&file.segments[0].data);
+    grail::boot::seal(&mut block);
+    let bootable = dir.join("bootable.img");
+    std::fs::write(&bootable, [&block[..], &[0; 3072]].concat()).unwrap();
+    let empty = dir.join("empty.img");
+    std::fs::write(&empty, [0u8; 4096]).unwrap();
+
+    let server = server(None);
+    let mut rt = connect(&server);
+    let disk = |path: &std::path::Path| HardwareProfile {
+        devices: vec![DeviceSpec::Disk(DiskSpec {
+            source: DiskSource::File(path.to_string_lossy().into_owned()),
+            read_only: true,
+        })],
+        ..profile(4, None)
+    };
+    for (path, code, out) in [
+        (&bootable, 3, "bye".to_string()),
+        (
+            &empty,
+            grail::boot::EXIT_BOOT_FAILED,
+            "boot ROM: disk 0 is not bootable (no boot signature)\n".to_string(),
+        ),
+    ] {
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let vm = create(&mut rt, &name, disk(path), Vec::new());
+        let mut console = Console::attach(&server, VmRef::Id(vm));
+        rt.request_ok(&Message::StartVm { vm: VmRef::Id(vm) }).unwrap();
+        console.wait_for_event(Message::VmStateChanged {
+            vm,
+            state: VmState::Exited(code),
+        });
+        assert_eq!(String::from_utf8_lossy(&console.output), out);
+    }
+    // No program and no disk: nothing to run.
+    assert_eq!(
+        error_of(
+            &mut rt,
+            &Message::CreateVm {
+                name: "nothing".into(),
+                profile: profile(4, None),
+                program: Vec::new(),
+            }
+        ),
+        ErrorCode::InvalidProgram
+    );
+    server.stop().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

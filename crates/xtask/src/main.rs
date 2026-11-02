@@ -17,9 +17,16 @@ tasks:
                --cc clang: the reference build instead (clang -O2 + ld.lld from the official
                LLVM install, the user programs' C compiled by clang too), in target/kernel/clang
   fs           build the root filesystem image (target/camelot-fs.img): kernel/fs/ at /,
-               the user programs in /bin (merlin, merlin-as, merlin-ld; no LLVM), /dev/console
-               -o PATH: output file; --size N: blocks (1 KiB each, default 2048)
-  hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
+               the user programs in /bin (merlin, merlin-as, merlin-ld; no LLVM), /dev/console,
+               made bootable with kernel/boot/boot.s and kernel/kernel.elf
+               (grail --disk target/camelot-fs.img boots it)
+               -o PATH: output file; --size N: blocks (1 KiB each, default 2048);
+               --no-boot: the filesystem alone
+  boot         build the boot ROM's disk loader (crates/grail/rom/diskboot.elf) and
+               Camelot's bootloader (kernel/boot/boot.elf) with merlin-as + merlin-ld
+               --check: build in memory and report stale .elf files instead of writing
+               -v: print the equivalent merlin-as/merlin-ld command lines
+  hello       reference build: assemble examples/hello/hello.S with merlin-as, link it
                with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
   ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj, llvm-objdump);
                takes --clang, --lld and -v like kernel
@@ -110,6 +117,7 @@ fn check_kernel_args(k: &KernelArgs) -> Result<(), String> {
 struct FsArgs {
     out: Option<PathBuf>,
     size: Option<u32>,
+    no_boot: bool,
 }
 
 fn parse_fs_args(args: &[String]) -> Result<FsArgs, String> {
@@ -123,6 +131,7 @@ fn parse_fs_args(args: &[String]) -> Result<FsArgs, String> {
                 let v = value("--size")?;
                 f.size = Some(v.parse().map_err(|_| format!("bad size {v} (blocks)"))?);
             }
+            "--no-boot" => f.no_boot = true,
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -176,6 +185,13 @@ fn main() -> ExitCode {
             Ok(f) => build_fs(f),
             Err(e) => {
                 eprintln!("xtask: {e}\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        Some("boot") => match parse_examples_args(&args[1..]) {
+            Ok(e) if e.names.is_empty() => build_boot(e),
+            Ok(_) | Err(_) => {
+                eprintln!("xtask: boot takes only --check and -v\n{USAGE}");
                 ExitCode::from(2)
             }
         },
@@ -287,8 +303,61 @@ fn build_examples(args: ExamplesArgs) -> ExitCode {
     }
 }
 
-/// `cargo xtask fs`: the root filesystem image, checked with fsck after it
-/// is built.
+/// `cargo xtask boot`: the boot ROM's disk loader and Camelot's bootloader,
+/// written over their committed `.elf` files; with `--check`, writes nothing
+/// and fails if a committed file is not what the current tools build.
+fn build_boot(args: ExamplesArgs) -> ExitCode {
+    let root = repo_root();
+    let mut failed = false;
+    for p in xtask::boot::PROGRAMS {
+        if args.verbose {
+            for cmd in p.commands() {
+                eprintln!("{cmd}");
+            }
+        }
+        let built = match xtask::boot::build(&root, p) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("{e}");
+                failed = true;
+                continue;
+            }
+        };
+        for w in &built.warnings {
+            eprintln!("merlin-ld: warning: {w}");
+        }
+        let path = p.elf_path(&root);
+        if args.check {
+            match std::fs::read(&path) {
+                Ok(committed) if committed == built.elf => eprintln!("{} is up to date", p.elf_name()),
+                Ok(_) => {
+                    eprintln!("{} is out of date: run `cargo xtask boot`", p.elf_name());
+                    failed = true;
+                }
+                Err(e) => {
+                    eprintln!("cannot read {}: {e}", path.display());
+                    failed = true;
+                }
+            }
+            continue;
+        }
+        match std::fs::write(&path, &built.elf) {
+            Ok(()) => eprintln!("built {}", p.elf_name()),
+            Err(e) => {
+                eprintln!("xtask: cannot write {}: {e}", path.display());
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `cargo xtask fs`: the root filesystem image, bootable unless `--no-boot`,
+/// checked with fsck after it is built.
 fn build_fs(f: FsArgs) -> ExitCode {
     let root = repo_root();
     let mut opts = camelot_fs::mkfs::Options::default();
@@ -296,7 +365,12 @@ fn build_fs(f: FsArgs) -> ExitCode {
         opts.size = size;
     }
     let out = f.out.unwrap_or_else(|| xtask::fs::default_out(&root));
-    let image = match xtask::fs::build(&root, &opts) {
+    let built = if f.no_boot {
+        xtask::fs::build(&root, &opts)
+    } else {
+        xtask::fs::build_bootable(&root, &opts)
+    };
+    let image = match built {
         Ok(image) => image,
         Err(e) => {
             eprintln!("xtask: {e}");
@@ -318,11 +392,12 @@ fn build_fs(f: FsArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
     eprintln!(
-        "built {}: {} blocks ({} free), {} files",
+        "built {}: {} blocks ({} free), {} files{}",
         out.display(),
         report.sb.size,
         report.free_blocks,
-        report.files
+        report.files,
+        if f.no_boot { "" } else { ", bootable" }
     );
     ExitCode::SUCCESS
 }
@@ -574,9 +649,11 @@ mod tests {
             parse(&["-o", "d.img", "--size", "512"]).unwrap(),
             FsArgs {
                 out: Some("d.img".into()),
-                size: Some(512)
+                size: Some(512),
+                no_boot: false,
             }
         );
+        assert!(parse(&["--no-boot"]).unwrap().no_boot);
         assert!(parse(&["--size", "1M"]).unwrap_err().contains("bad size"));
         assert!(parse(&["-v"]).unwrap_err().contains("unknown option"));
     }

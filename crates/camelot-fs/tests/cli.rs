@@ -234,3 +234,123 @@ fn usage_and_errors() {
         "{o:?}"
     );
 }
+
+/// `mkfs --boot --kernel` with Camelot's committed bootloader and kernel: the
+/// boot block, then the kernel after the filesystem, which fsck still finds
+/// clean and says is bootable.
+#[test]
+fn mkfs_makes_a_bootable_image() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let boot = repo.join("kernel/boot/boot.elf");
+    let kernel = repo.join("kernel/kernel.elf");
+    let dir = scratch("bootable");
+    let img = dir.join("root.img");
+    let img_s = img.to_str().unwrap();
+    let o = run(&[
+        "mkfs",
+        img_s,
+        "--size",
+        "1M",
+        "--boot",
+        boot.to_str().unwrap(),
+        "--kernel",
+        kernel.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{o:?}");
+    let image = std::fs::read(&img).unwrap();
+    let kernel = std::fs::read(&kernel).unwrap();
+    let info = camelot_fs::boot::boot_info(&image).unwrap().expect("bootable");
+    assert_eq!(info.kernel_sector, 2048, "right after the 1 MiB filesystem");
+    assert_eq!(image.len(), 1024 * BSIZE + kernel.len().div_ceil(BSIZE) * BSIZE);
+    assert_eq!(
+        &camelot_fs::boot::kernel_image(&image).unwrap()[..kernel.len()],
+        &kernel[..]
+    );
+    let line = format!("bootable: kernel at sector 2048, {} sectors", info.kernel_sectors);
+    assert!(stdout(&o).contains(&line), "{}", stdout(&o));
+
+    let o = run(&["fsck", img_s]);
+    assert!(o.status.success(), "{o:?}");
+    assert!(stdout(&o).contains(": clean: 1024 blocks"), "{}", stdout(&o));
+    assert!(stdout(&o).contains(&line), "{}", stdout(&o));
+
+    // Half of the pair is an error; so is a kernel that is not an ELF.
+    let o = run(&["mkfs", img_s, "--boot", boot.to_str().unwrap()]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("go together"));
+    let o = run(&[
+        "mkfs",
+        img_s,
+        "--boot",
+        boot.to_str().unwrap(),
+        "--kernel",
+        boot.to_str().unwrap().replace("boot.elf", "boot.s").as_str(),
+    ]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("kernel:"), "{o:?}");
+}
+
+/// A signed boot block that is not Camelot's (the boot ROM boots any block with
+/// the signature and a good checksum) leaves fsck's verdict alone: the
+/// filesystem is clean, and fsck says what is odd about the block as a warning.
+#[test]
+fn fsck_warns_about_a_boot_block_it_does_not_know() {
+    let dir = scratch("foreign-boot");
+    let img = dir.join("foreign.img");
+    let img_s = img.to_str().unwrap();
+    let seal = |sector: u32, sectors: u32| {
+        let mut image = camelot_fs::mkfs::mkfs(&Default::default(), None).unwrap();
+        let words: [(usize, u32); 4] = [
+            (0, 0x0000_100b),
+            (1008, sector),
+            (1012, sectors),
+            (1020, 0x544f_4f42),
+        ];
+        for (at, v) in words {
+            image[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let sum = (0..256).fold(0u32, |s, i| {
+            s.wrapping_add(u32::from_le_bytes(image[4 * i..4 * i + 4].try_into().unwrap()))
+        });
+        image[1016..1020].copy_from_slice(&0u32.wrapping_sub(sum).to_le_bytes());
+        std::fs::write(&img, &image).unwrap();
+    };
+
+    for (sector, sectors, want) in [
+        (
+            0xdead_beef,
+            0x10,
+            "warning: the boot block's kernel (sectors 3735928559 to 3735928574) runs past the image",
+        ),
+        (0xdead_beef, 0, "not bootable: the boot block names no kernel"),
+    ] {
+        seal(sector, sectors);
+        for args in [&["fsck", img_s][..], &["fsck", "--recover", img_s]] {
+            let o = run(args);
+            assert!(o.status.success(), "{o:?}");
+            let out = stdout(&o);
+            assert!(out.contains(": clean: 2048 blocks"), "{out}");
+            assert!(
+                out.ends_with(&format!(
+                    "{want}
+"
+                )),
+                "{out}"
+            );
+        }
+    }
+    // A bad checksum is a warning too.
+    let mut image = std::fs::read(&img).unwrap();
+    image[0] ^= 1;
+    std::fs::write(&img, &image).unwrap();
+    let o = run(&["fsck", img_s]);
+    assert!(o.status.success(), "{o:?}");
+    assert!(
+        stdout(&o).ends_with(
+            "warning: the boot block is corrupt (bad checksum)
+"
+        ),
+        "{}",
+        stdout(&o)
+    );
+}

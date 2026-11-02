@@ -67,10 +67,16 @@ Disk 0 holding a Camelot filesystem (`docs/camelot-fs.md`) is mounted as the
 root: the kernel replays its log if a crash left a transaction there, lists
 `/` and runs its filesystem self-test (spec section 10, "Kernel
 filesystem"). `cargo xtask fs` builds the root image with the user programs
-in `/bin` and the files of `fs/` at `/`, no LLVM needed:
+in `/bin` and the files of `fs/` at `/`, no LLVM needed. The image is
+bootable: it holds the bootloader (`boot/boot.s`) in its boot block and
+`kernel.elf` after the filesystem, so Grail can boot it with no program
+(spec section 7, "Boot from disk"; `docs/camelot-fs.md`, "Booting"). The
+bootloader prints one line, `boot: kernel at sector 0x00001000`, then the
+kernel starts as if Grail had loaded its ELF:
 
 ```
 cargo xtask fs
+cargo run --release -p grail -- --disk target/camelot-fs.img
 cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf
 ```
 
@@ -266,6 +272,7 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `fs.c` | the filesystem (xv6's): `fs_mount()`, the bitmap allocator, the inode cache (`iget`/`ilock`/`iput`, `readi`/`writei`), directories, path lookup (`namei`/`nameiparent`, from the working directory for a relative path), `fs_create()`/`fs_unlink()`/`fs_link()`, `itrunc()` |
 | `fstest.c` | `fs_boot()`: mounts disk 0 in a kernel process, lists `/`, runs the filesystem self-test (and, with `fs_test` patched to 2, its transactions; to 3, filling the disk) |
 | `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin`, and `/dev/console` is made too |
+| `boot/` | the bootloader of a bootable disk (`boot.s`, linked by `link.ld` into the committed `boot.elf` with `cargo xtask boot`): the boot block, which loads the kernel ELF stored after the filesystem; `camelot-fs mkfs --boot` installs it |
 | `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()` and `wfi()` |
 | `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, the filesystem (`fs_boot`), then the user-space shell as the first process |
 | `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |

@@ -4,8 +4,14 @@
 //! built with merlin, merlin-as and merlin-ld exactly as the kernel embeds them, in
 //! `/bin`, and the console's device node, `/dev/console`. No LLVM needed.
 //!
+//! The image is bootable ([`build_bootable`]): Camelot's bootloader
+//! (`kernel/boot/boot.s`, built with merlin-as + merlin-ld) in the boot
+//! block and the committed `kernel/kernel.elf` after the filesystem, so
+//! Grail needs no program to run it.
+//!
 //! ```text
 //! cargo xtask fs
+//! cargo run --release -p grail -- --disk target/camelot-fs.img
 //! cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf
 //! ```
 
@@ -13,6 +19,8 @@ use crate::userprogs::{self, CCompiler};
 use camelot_fs::mkfs::{Mkfs, Options};
 use std::path::{Path, PathBuf};
 
+/// The kernel installed in a bootable image (under the repository root).
+pub const KERNEL: &str = "kernel/kernel.elf";
 /// The host directory copied to `/`.
 pub const ROOT_DIR: &str = "kernel/fs";
 /// Where the image goes by default (under the repository root).
@@ -48,4 +56,15 @@ pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>,
         fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;
     }
     Ok(fs.finish())
+}
+
+/// [`build`], made bootable: the bootloader from `kernel/boot/boot.s` in the
+/// boot block, [`KERNEL`] after the filesystem (`camelot_fs::boot::install`).
+pub fn build_bootable(root: &Path, opts: &Options) -> Result<Vec<u8>, String> {
+    let mut image = build(root, opts)?;
+    let kernel_path = root.join(KERNEL);
+    let kernel =
+        std::fs::read(&kernel_path).map_err(|e| format!("cannot read {}: {e}", kernel_path.display()))?;
+    camelot_fs::boot::install(&mut image, &crate::boot::bootloader(root)?, &kernel)?;
+    Ok(image)
 }

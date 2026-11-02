@@ -20,7 +20,7 @@ Camelot is a learning project: the Excalibur ISA (RV32IMA + Zicsr, M/S/U, Sv32, 
 ```
 crates/excalibur        encodings, decoder, disassembler (shared by every tool)
 crates/elf32            ELF32 reader (grail, merlin-objdump, merlin-ld)
-crates/grail            the emulator
+crates/grail            the emulator (rom/diskboot.s: the boot ROM's disk loader, which boots a machine started with no program from disk 0)
 crates/avalon-proto     Avalon protocol (framing, messages, Connection, Screen diffing), shared by the Avalon platform's programs; spec in docs/avalon-protocol.md
 crates/gateway          user-mode NAT gateway (DHCP, DNS, TCP/UDP NAT, hostfwd) with its own frame send/recv API; grail wraps it as a NetBackend for `--net user` (spec 9.8). Must not depend on grail
 crates/avalon           the Avalon hypervisor server: VM table, one thread per running VM (run_for slices), consoles, screen viewers and input, RAM budget, virtual Ethernet switches (src/switch.rs)
@@ -34,8 +34,8 @@ crates/merlin           the C-subset compiler, C to .s (src/codegen.rs explains 
 crates/merlin-as        the assembler
 crates/merlin-ld        the linker (src/reloc.rs explains every relocation it applies)
 crates/merlin-objdump   the disassembler; output matches llvm-objdump 21
-crates/xtask            build tasks (`cargo xtask examples` builds every example with merlin-as + merlin-ld, no LLVM; `cargo xtask kernel` builds kernel/kernel.elf with merlin + merlin-as + merlin-ld, no LLVM, after generating kernel/userprogs.s from kernel/user the same way, and `--cc clang` makes the clang -O2 + ld.lld reference build in target/kernel/clang; `cargo xtask fs` builds the root filesystem image target/camelot-fs.img from kernel/fs and the user programs, no LLVM; `cargo xtask hello` rebuilds merlin-as's ld.lld-linked hello reference; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
-kernel/                 the Camelot kernel (C + assembly); kernel.elf and the generated userprogs.s are committed, rebuild them with `cargo xtask kernel` after changing the kernel or merlin, merlin-as or merlin-ld (`cargo test` checks) (kernel/user: the user programs it embeds, C and assembly; system calls in docs/camelot-syscalls.md; kernel/fs: the root image's files)
+crates/xtask            build tasks (`cargo xtask examples` builds every example with merlin-as + merlin-ld, no LLVM; `cargo xtask kernel` builds kernel/kernel.elf with merlin + merlin-as + merlin-ld, no LLVM, after generating kernel/userprogs.s from kernel/user the same way, and `--cc clang` makes the clang -O2 + ld.lld reference build in target/kernel/clang; `cargo xtask fs` builds the root filesystem image target/camelot-fs.img from kernel/fs and the user programs, bootable (bootloader and kernel.elf installed), no LLVM; `cargo xtask boot` rebuilds the committed crates/grail/rom/diskboot.elf and kernel/boot/boot.elf with merlin-as + merlin-ld; `cargo xtask hello` rebuilds merlin-as's ld.lld-linked hello reference; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
+kernel/                 the Camelot kernel (C + assembly); kernel.elf and the generated userprogs.s are committed, rebuild them with `cargo xtask kernel` after changing the kernel or merlin, merlin-as or merlin-ld (`cargo test` checks) (kernel/user: the user programs it embeds, C and assembly; system calls in docs/camelot-syscalls.md; kernel/fs: the root image's files; kernel/boot: the bootloader of a bootable disk, which camelot-fs mkfs --boot installs)
 docs/                   ISA spec, Avalon protocol, Pendragon API, Camelot system calls, Camelot filesystem format (camelot-fs.md)
 examples/               bare-metal programs; their .elf files are committed, rebuild them with `cargo xtask examples` after changes (`cargo test` checks)
 tests/riscv-tests       prebuilt riscv-tests ELFs, and obj/ with their objects (merlin-ld relinks them)

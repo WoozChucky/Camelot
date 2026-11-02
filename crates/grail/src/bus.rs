@@ -1,6 +1,7 @@
 //! Physical address space. See spec section 7 for the memory map.
 
 use crate::block::{self, BlockDevice};
+use crate::boot;
 use crate::config::MachineConfig;
 use crate::cpu::Reservation;
 use crate::devices::{Clint, Plic, TestDevice, Uart, BLK_IRQ, KBD_IRQ, NET_IRQ, PTR_IRQ, UART_IRQ};
@@ -210,6 +211,15 @@ impl Bus {
         self.rom = words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect();
     }
 
+    /// Fills the boot ROM to boot from disk 0 (spec section 7, "Boot from disk"): the
+    /// stub and the park loop of [`Bus::set_boot_entry`], with the entry word pointing
+    /// at the disk loader ([`boot::DISK_BOOT_PC`]), which this adds to the ROM.
+    pub fn set_disk_boot(&mut self) {
+        self.set_boot_entry(boot::DISK_BOOT_PC);
+        self.rom.resize((boot::DISK_BOOT_PC - BOOT_ROM_BASE) as usize, 0);
+        self.rom.extend(boot::disk_loader());
+    }
+
     /// Hart `hart`'s LR/SC reservation.
     pub fn reservation(&self, hart: usize) -> Reservation {
         self.reservations[hart]
@@ -377,6 +387,16 @@ impl Bus {
             }
             return Ok(());
         }
+        if addr == boot::BOOT_ENTRY_ADDR && size == 4 {
+            // The ROM's entry word, its one writable word: a bootloader points the
+            // harts it has not started yet at its kernel.
+            let at = (addr - BOOT_ROM_BASE) as usize;
+            if self.rom.len() < at + 4 {
+                self.rom.resize(at + 4, 0);
+            }
+            self.rom[at..at + 4].copy_from_slice(&val.to_le_bytes());
+            return Ok(());
+        }
         if let Some((i, off)) = self.disk_at(addr) {
             if off == block::REG_CMD {
                 // The disk moves data between itself and RAM on its own (DMA), which
@@ -484,6 +504,67 @@ mod tests {
         assert_eq!(bus.ram[4094], 0xaa);
         bus.load(RAM_BASE + 4095, &[9]).unwrap();
         assert_eq!(bus.ram[4095], 9);
+    }
+
+    #[test]
+    fn the_rom_has_one_writable_word() {
+        for harts in [1, 2] {
+            let config = MachineConfig {
+                harts,
+                ..MachineConfig::with_ram(4096)
+            };
+            let mut bus = Bus::new(&config, Vec::new());
+            bus.set_boot_entry(RAM_BASE);
+            let stub = bus.peek(BOOT_ROM_BASE);
+            // The entry word takes 32-bit stores; nothing else in the ROM does.
+            assert_eq!(bus.write(BOOT_ROM_BASE + 16, 4, 0x8000_1234), Ok(()));
+            assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(0x8000_1234));
+            assert_eq!(bus.read(BOOT_ROM_BASE + 16, 4), Ok(0x8000_1234));
+            for (addr, size) in [
+                (BOOT_ROM_BASE + 16, 1),
+                (BOOT_ROM_BASE + 16, 2),
+                (BOOT_ROM_BASE, 4),
+            ] {
+                assert_eq!(bus.write(addr, size, 0), Err(BusFault), "{addr:#x}/{size}");
+            }
+            assert_eq!(bus.write(BOOT_ROM_BASE + 0x200, 4, 0), Err(BusFault));
+            assert_eq!(bus.peek(BOOT_ROM_BASE), stub);
+            assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(0x8000_1234));
+        }
+        // On an empty ROM too (no program yet): the word is there to write.
+        let mut bus = Bus::new(&MachineConfig::with_ram(4096), Vec::new());
+        assert_eq!(bus.write(BOOT_ROM_BASE + 16, 4, 7), Ok(()));
+        assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(7));
+    }
+
+    #[test]
+    fn disk_boot_fills_the_rom() {
+        let mut bus = Bus::new(&MachineConfig::with_ram(4096), Vec::new());
+        bus.set_disk_boot();
+        // The stub, its entry word pointing at the loader, and the loader.
+        assert_eq!(bus.peek(BOOT_ROM_BASE), Some(0x0000_0297), "auipc t0, 0");
+        assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(boot::DISK_BOOT_PC));
+        assert_eq!(
+            bus.peek(boot::DISK_BOOT_PC),
+            Some(0xf140_22f3),
+            "csrr t0, mhartid"
+        );
+        let loader = boot::disk_loader();
+        let at = (boot::DISK_BOOT_PC - BOOT_ROM_BASE) as usize;
+        assert_eq!(&bus.rom[at..], &loader[..]);
+        assert!(
+            bus.rom[20..at].iter().all(|&b| b == 0),
+            "no park loop on one hart"
+        );
+
+        let config = MachineConfig {
+            harts: 2,
+            ..MachineConfig::with_ram(4096)
+        };
+        let mut bus = Bus::new(&config, Vec::new());
+        bus.set_disk_boot();
+        assert_eq!(bus.peek(PARK_PC), Some(0xf140_2573), "the park loop");
+        assert_eq!(&bus.rom[at..], &loader[..]);
     }
 
     #[test]

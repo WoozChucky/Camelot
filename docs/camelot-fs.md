@@ -7,7 +7,8 @@ against each other:
 - the kernel's (`kernel/log.c`, `kernel/fs.c`), which mounts disk 0 as the
   root at boot (`docs/excalibur-spec.md` section 10, "Kernel filesystem");
 - the host's, the `camelot-fs` crate (`crates/camelot-fs`): `mkfs` builds
-  images from a host directory, `fsck` checks every rule below and replays a
+  images from a host directory (bootable ones too, see "Booting"), `fsck`
+  checks every rule below and replays a
   pending log and frees orphaned inodes as a mount does, and `ls`/`cat` read
   files back. `cargo xtask fs` uses it to
   build the root image with the user programs.
@@ -277,6 +278,62 @@ the orphans it found; `fsck --recover` replays the log and frees them, as a
 mount would. The
 kernel trusts a mounted disk and checks only the superblock and the log
 header; a broken disk may make it panic.
+
+## Booting
+
+The filesystem leaves the boot block (block 0) and the blocks past `size`
+alone, and a bootable disk uses both, so it is still a valid version 1
+filesystem. Grail's boot ROM, started with no program, reads the boot block
+into RAM, checks it and jumps to it (`docs/excalibur-spec.md` section 7,
+"Boot from disk"); Camelot's boot block loads the kernel from the blocks
+after the filesystem:
+
+```
+block 0            boot block: the bootloader and where the kernel is
+blocks 1 ... size - 1     the filesystem
+blocks size ...    the kernel ELF, as a file, padded with zeros to a whole block
+```
+
+The boot block:
+
+| Offset | Field | Meaning |
+|---|---|---|
+| 0 | code (1008 bytes) | the bootloader, entered at its first byte; zeros after its end |
+| 1008 | `kernel_sector` (u32) | the kernel ELF's first sector: 2 × `size` |
+| 1012 | `kernel_sectors` (u32) | its length in sectors, a whole number of blocks; 0: no kernel |
+| 1016 | `checksum` (u32) | makes the 256 words of the block add up to 0 (mod 2^32) |
+| 1020 | `magic` (u32) | 0x544f4f42, the bytes `B O O T` |
+
+The last two are the boot ROM's: it refuses a block without the magic or
+whose words do not add up to 0. `camelot-fs mkfs --boot BOOT --kernel
+KERNEL` (or `boot::install` in the crate) fills in all of it: the
+bootloader's code from the executable BOOT (`kernel/boot/boot.elf`, linked
+at 0 and position-independent, at most 1008 bytes, no `.bss`), the kernel
+ELF KERNEL after the filesystem. `cargo xtask fs` makes the root image this
+way, with `kernel/kernel.elf`.
+
+The kernel is not a file of the filesystem (`/boot/kernel`, say), for two
+reasons: it is bigger than the largest file (the kernel with its built-in
+programs is over 500 KiB, a file at most 268 KiB), and a bootloader that
+must fit in 1008 bytes reads a run of sectors far more simply than it could
+walk directories, inodes, indirect blocks and the log. The price is that the
+kernel cannot be replaced from inside Camelot; mkfs installs it.
+
+The bootloader (`kernel/boot/boot.s`) reads the kernel's first 1 KiB and
+loads every `PT_LOAD` segment of it to its physical address, as Grail's ELF
+loader would: the whole sectors of the segment's file bytes straight to the
+address with the disk's DMA, the last partial sector through a buffer, then
+zeros up to `p_memsz`. It refuses (printing `boot: <why>` and stopping with
+exit code 0xFC) a block with `kernel_sectors` 0, a read error, a kernel that
+is not an ELF32 little-endian RISC-V `ET_EXEC` with its program headers in
+its first 1 KiB, a segment with file bytes whose file offset is not a
+multiple of 512 (merlin-ld and ld.lld place segments at page offsets) or
+that runs past `kernel_sectors` (a `.bss`-only segment, `p_filesz` 0, reads
+nothing, so its offset is not checked), and a segment outside RAM or
+reaching into the 64 KiB the bootloader runs in. Then it writes the kernel's entry point to the boot
+ROM's entry word, so harts the kernel wakes go there too, and jumps to it
+with a0 = 0 and a1 = the sysinfo block. On success it prints one line,
+`boot: kernel at sector 0x...`.
 
 ## Changes
 

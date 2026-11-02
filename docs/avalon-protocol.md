@@ -1,4 +1,4 @@
-# Avalon Protocol v5
+# Avalon Protocol v6
 
 The wire protocol of the Avalon platform. Every program in it speaks this protocol:
 
@@ -16,7 +16,7 @@ The implementation is the `avalon-proto` crate (`crates/avalon-proto`): the mess
 
 - TCP, through `std::net`. One connection is one session; either side ends it by closing the socket.
 - Servers listen on loopback by default: Avalon on `127.0.0.1:7400`, Lake on `127.0.0.1:7401`. Listening on any other interface takes an explicit command-line flag.
-- **No authentication and no encryption** (versions 1 to 5). Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
+- **No authentication and no encryption** (versions 1 to 6). Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
 - A client and a server are both just byte streams to the protocol; tests run it over in-memory buffers as well as sockets.
 
 ## 2. Framing
@@ -326,18 +326,18 @@ Any request can also be answered by `Error`. A server answers requests from a gr
 | `Ping` | `token: u32` |
 | `Pong` | `token: u32` (the `Ping`'s) |
 
-Example, `Hello` version 5 from agent `"rt"`:
+Example, `Hello` version 6 from agent `"rt"`:
 
 ```
-0e 00 00 00  01 00  41 56 4c 4e  05 00  02 00 00 00  72 74
-length 14    Hello  "AVLN"       v5     agent "rt"
+0e 00 00 00  01 00  41 56 4c 4e  06 00  02 00 00 00  72 74
+length 14    Hello  "AVLN"       v6     agent "rt"
 ```
 
 ### 6.2 VM control
 
 | Message | Payload | Notes |
 |---|---|---|
-| `CreateVm` | `name: string`, `profile: HardwareProfile`, `program: bytes` | `program` is an Excalibur ELF executable. The VM is loaded and left in state created, its network cards plugged into the switches the profile names. Errors: `InvalidName`, `AlreadyExists`, `InvalidProfile` (also a disk that cannot be opened or attached, see below, and a bad network card), `NoSuchSwitch` (a card names a switch that does not exist), `AlreadyExists` (a card's address is on its switch already), `InvalidProgram`, `OverBudget`. A create that fails plugs in nothing |
+| `CreateVm` | `name: string`, `profile: HardwareProfile`, `program: bytes` | `program` is an Excalibur ELF executable, or empty: the VM then boots from its disk 0, as `grail --disk IMG` does (spec section 7, "Boot from disk"), and a profile without a disk is `InvalidProgram`. The VM is loaded and left in state created, its network cards plugged into the switches the profile names. Errors: `InvalidName`, `AlreadyExists`, `InvalidProfile` (also a disk that cannot be opened or attached, see below, and a bad network card), `NoSuchSwitch` (a card names a switch that does not exist), `AlreadyExists` (a card's address is on its switch already), `InvalidProgram`, `OverBudget`. A create that fails plugs in nothing |
 | `VmCreated` | `id: u32` | ids are never reused while the server runs |
 | `ListVms` | empty | |
 | `VmList` | `vms: list<VmSummary>` | in id order |
@@ -470,11 +470,11 @@ Avalon's VMs talk to each other over virtual Ethernet switches, kept by the serv
 
 ## 7. Versioning
 
-- The protocol version is a `u16`, currently **5** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
+- The protocol version is a `u16`, currently **6** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
 - Any change to the catalogue bumps the version: a new message type, a new field, a new enum variant or tag, a changed layout or a changed rule. (Unknown codes and tags are errors in the decoder, so an old peer could not read them anyway.)
 - Three things never change, in any version, so that peers of different versions can always tell each other so: the frame header (`u32` length, `u16` type), the `Hello` and `Welcome` messages (codes 0x0001 and 0x0002 and their layouts) and the `Error` message (code 0x0003 and its layout). Error codes are never reused or renumbered; new ones may be added with a version bump.
 - Things that are deliberately open-ended and need no new version: `DeviceEntry.kind` (sysinfo device type codes come from the Excalibur spec), `ScreenAttached.format` values a server chooses to send, free-text fields.
-- This document describes version 5. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
+- This document describes version 6. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
 
 History:
 
@@ -485,6 +485,7 @@ History:
 | 3 | the virtual network group 0x06xx (section 6.7: `CreateSwitch`, `DeleteSwitch`, `ListSwitches`, `SwitchList`, `AttachCard`, `DetachCard`, `CaptureSwitch`) with the `SwitchInfo`, `SwitchPort` and `PortOwner` structures and the `mac` field type; network cards in hardware profiles (`DeviceSpec` tag 2); error codes 19 `NoSuchSwitch` and 20 `NoSuchCard` |
 | 4 | `HardwareProfile.harts` (`u32`, after `nominal_hz`), for multi-hart machines |
 | 5 | NAT gateways on switches (section 6.7, **NAT**): `SetSwitchNat` (0x0608), `CreateSwitch`'s `nat` field, `SwitchInfo`'s `nat` field, `PortOwner` tag 2 (`Gateway`), the `NatConfig`, `NatInfo`, `PortForward` and `Lease` structures (at most `MAX_FORWARDS` 64 forwarded ports per gateway) and the `ipv4` field type |
+| 6 | `CreateVm` with an empty `program`: the VM boots from its disk 0 (spec section 7, "Boot from disk"), where version 5 servers answered `InvalidProgram` |
 
 ## 8. Limits
 

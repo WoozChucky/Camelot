@@ -174,14 +174,33 @@ pub fn object_name(source: &str) -> String {
 /// merlin-ld, all in memory. Errors look like the tools' own messages
 /// (`examples/hello/hello.S:12: error: ...`, `merlin-ld: error: ...`).
 pub fn build(root: &Path, ex: &Example) -> Result<Built, String> {
-    let dir = ex.dir(root);
+    assemble_and_link(
+        &ex.dir(root),
+        &format!("examples/{}", ex.dir),
+        ex.name,
+        ex.sources,
+        ex.script,
+    )
+}
+
+/// Assembles `sources` (in `dir`, which messages call `shown`) with merlin-as
+/// and links the objects with merlin-ld, with the linker script `script` in
+/// `dir` or the default layout, all in memory: how every program built with
+/// our own tools is made (the examples, the boot programs).
+pub fn assemble_and_link(
+    dir: &Path,
+    shown: &str,
+    name: &str,
+    sources: &[&str],
+    script: Option<&str>,
+) -> Result<Built, String> {
     let mut objects = Vec::new();
-    for src in ex.sources {
+    for src in sources {
         let path = dir.join(src);
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let data = merlin_as::assemble_to_elf(&text).map_err(|errors| {
-            let shown = format!("examples/{}/{src}", ex.dir);
+            let shown = format!("{shown}/{src}");
             let lines: Vec<String> = errors
                 .iter()
                 .map(|e| match e.line {
@@ -198,7 +217,7 @@ pub fn build(root: &Path, ex: &Example) -> Result<Built, String> {
     }
 
     let mut opts = merlin_ld::Options::default();
-    if let Some(script) = ex.script {
+    if let Some(script) = script {
         let path = dir.join(script);
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -216,7 +235,7 @@ pub fn build(root: &Path, ex: &Example) -> Result<Built, String> {
         .collect();
     let linked = merlin_ld::link(&inputs, &opts).map_err(|errors| {
         let lines: Vec<String> = errors.iter().map(|e| format!("merlin-ld: error: {e}")).collect();
-        format!("linking {}:\n{}", ex.name, lines.join("\n"))
+        format!("linking {name}:\n{}", lines.join("\n"))
     })?;
     Ok(Built {
         objects,
