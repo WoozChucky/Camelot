@@ -431,7 +431,7 @@ int main(int argc, char **argv) {
     long count = -1;
     long seconds = 30;
     int i = 1;
-    for (; i < argc && argv[i][0] == '-'; i++) {
+    for (; i < argc && argv[i][0] == '-'; i += 2) {
         if (i + 1 == argc) {
             return usage();
         }
@@ -449,7 +449,6 @@ int main(int argc, char **argv) {
         } else {
             return usage();
         }
-        i++;
     }
     if (argc - i > 1) {
         return usage();

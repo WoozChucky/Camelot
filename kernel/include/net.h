@@ -17,11 +17,11 @@
  *   net.c    the interface's configuration, boot, the counters, the timer
  *            and the system calls netinfo, netconf and ping
  *
- * Everything runs with interrupts off, as all kernel code does (proc.c), on
- * one hart: a frame is handled from start to end inside the card's
- * interrupt (an answer, such as an echo reply, is sent from there), and a
- * process that waits for the network sleeps on `netif` until a packet or a
- * timer tick wakes it. No locks.
+ * One spinlock, net_lock (below), covers the whole stack: a frame is
+ * handled from start to end inside the card's interrupt, under it (an
+ * answer, such as an echo reply, is sent from there), and a process that
+ * waits for the network sleeps on `netif` with it until a packet or a timer
+ * tick wakes it.
  *
  * Addresses are u32 in host order (10.0.2.15 is 0x0a00020f) and ports u16;
  * packets hold them big-endian, and get16/get32/put16/put32 convert. */

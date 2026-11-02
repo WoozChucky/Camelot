@@ -213,6 +213,7 @@ parts it uses) and `user/user.ld`. `user/README.md` has each program's usage:
 | `badptr` | hands the system calls bad pointers, which must all fail with `-EFAULT` |
 | `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |
 | `filetest` | checks the file system calls on a writable root filesystem (`filetest: N checks, 0 failed`) |
+| `stress` | many processes at once: pages, the console, a shared pipe and files under timer preemption (`stress: W workers, R rounds, N bytes: ok`) |
 | `libtest` | checks the C library (`libtest: N checks, 0 failed`) |
 | `nettest`, `socktest` | move known bytes through TCP, for the TCP tests; check the socket calls (`socktest: N checks, 0 failed`) |
 | `badload` | reads kernel memory: killed by a load page fault |
@@ -279,7 +280,38 @@ The PTE flags are printed bit 7 to bit 0 (`DAGUXWRV`), `-` where clear.
 
 Values 5 to 11 misuse the memory API instead (a remap, unmapping an
 unmapped page, a W-only mapping, a megapage, `kfree` of a bad page), so the
-tests see each of its checks panic, e.g. `panic: map_pages: remap`.
+tests see each of its checks panic, e.g. `panic: map_pages: remap`. Values
+12 and 13 misuse a spinlock: 12 acquires one twice, 13 releases one it
+doesn't hold, and each panics naming the lock and the hart, e.g.
+`panic: acquire: lock "boot_fault" already held by hart 0`.
+
+## Locking
+
+Every structure that more than one process, a process and an interrupt
+handler, or (from #63 on) more than one hart can reach is protected by a
+lock (spec section 10, "Kernel locking"). Spinlocks (`spinlock.s`,
+`include/spinlock.h`) are xv6's: `acquire()` turns interrupts off on the
+hart and spins on an `amoswap.w`; `release()` turns them back on once the
+last lock is gone. Code that must wait sleeps with `sleep(chan, lk)`, which
+lets go of the lock it holds while it sleeps; buffers and inodes, held
+across disk reads, have sleep locks (`sleeplock.c`). Per-hart state is
+`cpus[tp]`: `tp` holds the hart's id in the kernel, and `user_vec` puts it
+back after a trap from U-mode.
+
+Locks are always taken in this order, so no two holders can wait for each
+other:
+
+1. sleep locks: `begin_op()` (the log), then inode locks (a parent
+   directory before its child), then buffer locks;
+2. one of `net`, `console`, `pipe`, `disk`, `log`, `itable`, `ticks` (never
+   two of them at once);
+3. `ftable`, `bcache`, or a sleep lock's own spinlock;
+4. `proc` (taken by `sleep()`, `wakeup()` and the scheduler);
+5. `kmem` or `uart` (leaves: nothing is taken while they are held).
+
+A process may hold only the lock it passes to `sleep()` when it sleeps, and
+`sched()` panics if it holds any other. `stress` (`user/stress.c`) runs many
+processes through all of it at once under timer preemption.
 
 ## Files
 
@@ -293,6 +325,9 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `trap.c` | `kernel_trap()`: counts timer ticks (waking sleepers), claims/completes PLIC interrupts and runs the console's or a disk's handler, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `user_trap()`: a tick yields, an ecall goes to `syscall()`, a fault kills the process; `user_trap_return()`, `trap_init()`, `panic()` |
 | `proc.c` | processes: `proc_create()` (slot, kernel stack, page table, ELF, stack with the arguments, descriptors 0-2 and working directory inherited), `proc_exec()` (a new address space for the same process), `kproc_create()` (a kernel process running a C function), `proc_run_init()` (the shell, with the console as descriptors 0-2), the round-robin `scheduler()` (idling in `wfi` while everyone sleeps), `yield()`, `sleep()`/`wakeup()`, `proc_exit()`, `proc_kill()`, `proc_wait()`, `proc_sbrk()` |
 | `swtch.s` | `swtch()`: saves `ra`, `sp`, `s0`-`s11` and loads another thread's |
+| `spinlock.s` | `acquire()`/`release()` (an `amoswap.w` loop; panics on a lock acquired twice or released unheld), `holding()`, `push_off()`/`pop_off()` (nested interrupt disabling), `mycpu()` (`&cpus[tp]`) |
+| `spinlock.c` | `cpus[]`, the per-hart state; `initlock()`, `cpu_init()`, `cpuid()`, and the panic messages that name the lock and the hart |
+| `sleeplock.c` | sleep locks (xv6's), held across sleeps: `acquiresleep()`/`releasesleep()`, for the buffers and the inodes |
 | `elf.c` | `elf_load()`: checks an ELF32 executable, read from memory or from a file through a `struct elf_file`, and maps its `PT_LOAD` segments into user space |
 | `exec.c` | `exec_spawn()`, `exec_replace()`, `exec_init()`: find the program a path names (a file of the root filesystem, or an embedded program without one) and start it |
 | `syscall.c` | `syscall()`: the system calls (`docs/camelot-syscalls.md`), with `spawn`'s and `exec`'s argument copying; the file ones go to `sysfile.c` |
@@ -324,7 +359,7 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |
 | `kernel.ld` | layout: `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end` |
-| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct context`, `struct user_program`), `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
+| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct user_program`, sleep and wakeup), `context.h` (`struct context`, `swtch`), `spinlock.h` (`struct spinlock`, `struct cpu`, `NCPU`), `sleeplock.h`, `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
 | `kernel.elf` | the prebuilt image, committed so `cargo test` and Grail need no build |
 
 ## Building
@@ -356,7 +391,8 @@ merlin -I include net/arp.c -o net/arp.c.s   # the network stack's files too
 merlin-ld -T kernel.ld -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf.c.o entry.s.o \
        exec.c.o file.c.o fs.c.o fstest.c.o kalloc.c.o kernelvec.s.o kprintf.c.o log.c.o machine.s.o \
        main.c.o net/arp.c.o net/dhcp.c.o net/ether.c.o net/icmp.c.o net/ip.c.o net/net.c.o \
-       net/nic.c.o net/pbuf.c.o net/tcp.c.o net/udp.c.o pipe.c.o plic.c.o probe.s.o proc.c.o riscv.s.o start.c.o \
+       net/nic.c.o net/pbuf.c.o net/tcp.c.o net/udp.c.o pipe.c.o plic.c.o probe.s.o proc.c.o riscv.s.o \
+       sleeplock.c.o spinlock.c.o spinlock.s.o start.c.o \
        string.c.o swtch.s.o syscall.c.o sysfile.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
        userprogs.s.o uservec.s.o vm.c.o vmtest.c.o
 ```
@@ -379,12 +415,12 @@ source), which merlin-as and merlin-ld turn into the programs as above, and
 then the kernel:
 
 ```
-clang --target=riscv32-unknown-elf -march=rv32im_zicsr -mabi=ilp32 -mno-relax -mcmodel=medany \
+clang --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 -mno-relax -mcmodel=medany \
       -std=c11 -O2 -ffreestanding -fno-builtin -nostdinc -nostdlib -fno-pic -fno-common -fno-ident \
       -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
       -Wall -Wextra -Werror -S sh.c -o .../user/sh.s    # in user/, and each other .c
-clang --target=riscv32-unknown-elf -march=rv32im_zicsr -mabi=ilp32 -mno-relax -c entry.s -o entry.s.o   # and each other .s
-clang --target=riscv32-unknown-elf -march=rv32im_zicsr -mabi=ilp32 -mno-relax -mcmodel=medany \
+clang --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 -mno-relax -c entry.s -o entry.s.o   # and each other .s
+clang --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 -mno-relax -mcmodel=medany \
       -std=c11 -O2 -ffreestanding -fno-builtin -nostdinc -nostdlib -fno-pic -fno-common -fno-ident \
       -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
       -Wall -Wextra -Werror -Iinclude -c main.c -o main.c.o        # and each other .c

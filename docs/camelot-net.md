@@ -31,9 +31,10 @@ limit a constant in `net.h`.
 
 ## Execution model
 
-Kernel code runs with interrupts off and on one hart (`kernel/proc.c`), and
-the stack relies on it: there are no locks. A received frame is handled from
-start to end inside the card's interrupt: the driver passes it to
+One spinlock, `net_lock` (`kernel/include/net.h`; spec section 10, "Kernel
+locking"), covers the whole stack: the network system calls run under it, and
+so do the card's interrupt, the timer and reads and writes of a socket file.
+A received frame is handled from start to end inside the card's interrupt: the driver passes it to
 `ether_input()`, which passes it to `arp_input()` or `ip_input()`, and so on
 up; an answer (an ARP reply, an echo reply, a UDP echo) is sent from there
 too. Sending goes down the same way from whoever sends, a process in a

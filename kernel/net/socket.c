@@ -42,6 +42,7 @@ static struct socket *sock_alloc(u32 type) {
         }
     }
     panic("sock_alloc: no free socket");
+    return NULL; /* not reached */
 }
 
 /* The socket behind descriptor `fd` of the current process; NULL with *err
