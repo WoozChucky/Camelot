@@ -1,0 +1,46 @@
+
+crates/merlin-objdump/tests/fixtures/hello.o:	file format elf32-littleriscv
+architecture: riscv32
+start address: 0x00000000
+
+Program Header:
+
+Dynamic Section:
+
+Sections:
+Idx Name              Size     VMA      Type
+  0                   00000000 00000000 
+  1 .strtab           0000009c 00000000 
+  2 .text             00000000 00000000 TEXT
+  3 .text.start       00000050 00000000 TEXT
+  4 .rela.text.start  00000078 00000000 
+  5 .rodata           00000015 00000000 DATA
+  6 .riscv.attributes 0000003d 00000000 
+  7 .symtab           000000d0 00000000 
+
+SYMBOL TABLE:
+10000000 l       *ABS*	00000000 UART_BASE
+00000005 l       *ABS*	00000000 UART_LSR
+00000020 l       *ABS*	00000000 LSR_THRE
+00000000 l       .text.start	00000000 .Lpcrel_hi0
+00000000 l       .text.start	00000000 $x
+00000008 l       .text.start	00000000 .Lpcrel_hi1
+00000000 l       .rodata	00000000 message
+00000020 l       .text.start	00000000 puts
+00000000 l       .rodata	00000000 $d
+00000000 l       .riscv.attributes	00000000 $d
+00000000 g       .text.start	00000000 _start
+00000000         *UND*	00000000 __stack_top
+
+RELOCATION RECORDS FOR [.text.start]:
+OFFSET   TYPE                     VALUE
+00000000 R_RISCV_PCREL_HI20       __stack_top
+00000000 R_RISCV_RELAX            *ABS*
+00000004 R_RISCV_PCREL_LO12_I     .Lpcrel_hi0
+00000004 R_RISCV_RELAX            *ABS*
+00000008 R_RISCV_PCREL_HI20       message
+00000008 R_RISCV_RELAX            *ABS*
+0000000c R_RISCV_PCREL_LO12_I     .Lpcrel_hi1
+0000000c R_RISCV_RELAX            *ABS*
+00000010 R_RISCV_CALL_PLT         puts
+00000010 R_RISCV_RELAX            *ABS*

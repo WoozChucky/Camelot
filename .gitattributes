@@ -1,5 +1,6 @@
 # Test binaries and example ELFs are committed so no cross toolchain is needed.
 *.elf binary
+*.o binary
 tests/riscv-tests/rv32* binary
 *.S text eol=lf
 *.sh text eol=lf
@@ -9,3 +10,5 @@ tests/riscv-tests/rv32* binary
 *.ld text eol=lf
 *.ast text eol=lf
 kernel/kernel.elf.clang-version text eol=lf
+# llvm-objdump output, compared line by line (keep LF so it diffs cleanly).
+crates/merlin-objdump/tests/golden/*.txt text eol=lf

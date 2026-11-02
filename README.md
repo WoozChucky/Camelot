@@ -6,22 +6,24 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 |---|---|---|
 | **Excalibur** | The ISA: RV32IM + Zicsr, M/S/U privilege, Sv32 paging, plus the Xcal extensions | Spec v0 in [`docs/excalibur-spec.md`](docs/excalibur-spec.md) |
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps) |
-| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | merlin-as: everything but the encoder ([guide](crates/merlin-as/ENCODER.md)). merlin: v0 front end (int-only C subset) and test harness, codegen next |
+| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | merlin-as: everything but the encoder ([guide](crates/merlin-as/ENCODER.md)). merlin: v0 front end (int-only C subset) and test harness, codegen next. merlin-objdump: matches llvm-objdump |
 | **Camelot** | The kernel / OS | Boots on Grail: UART, `kprintf` ([kernel/](kernel/README.md)) |
 
 ## Layout
 
 ```
-crates/excalibur   instruction encodings, decoder, disassembler (shared by every tool)
-crates/grail       the emulator
-crates/merlin      the C-subset compiler (C → .s), with its test programs in tests/cases
-crates/merlin-as   the assembler (source → ELF32 .o)
-crates/xtask       build tasks: `cargo xtask kernel`
-kernel/            the Camelot kernel (C + assembly) and its prebuilt kernel.elf
-examples/          bare-metal programs
-tests/riscv-tests  prebuilt riscv-tests ELFs (rebuild with scripts/build-riscv-tests.sh)
-scripts/           test-data generators (riscv-tests, merlin-as golden encodings)
-docs/              the ISA spec
+crates/excalibur        instruction encodings, decoder, disassembler (shared by every tool)
+crates/elf32            ELF32 reader (shared by grail, merlin-objdump, merlin-ld)
+crates/grail            the emulator
+crates/merlin           the C-subset compiler (C → .s), with its test programs in tests/cases
+crates/merlin-as        the assembler (source → ELF32 .o)
+crates/merlin-objdump   the disassembler / object dumper (llvm-objdump compatible output)
+crates/xtask            build tasks: `cargo xtask kernel`
+kernel/                 the Camelot kernel (C + assembly) and its prebuilt kernel.elf
+examples/               bare-metal programs
+tests/riscv-tests       prebuilt riscv-tests ELFs (rebuild with scripts/build-riscv-tests.sh)
+scripts/                test-data generators (riscv-tests, merlin-as golden encodings, merlin-objdump goldens)
+docs/                   the ISA spec
 ```
 
 ## Running
@@ -47,6 +49,23 @@ printf 'hi\n\004' | cargo run --release -p grail -- examples/uart-echo/uart-echo
 
 Options: `--trace` prints every instruction with its disassembly, `--max-steps N` stops a runaway program, `--ram MiB` sets RAM size. Grail's exit code is the program's (`xcal.halt`, the test device, or riscv-tests' `tohost`).
 
+To look inside an object or executable:
+
+```
+cargo run --release -p merlin-objdump -- -d examples/hello/hello.elf
+```
+
+```
+80000000 <_start>:
+80000000: 00010117     	auipc	sp, 0x10
+80000004: 07010113     	addi	sp, sp, 0x70
+...
+80000010: 00c000ef     	jal	0x8000001c <puts>
+80000014: 0005000b     	xcal.dbg	a0
+```
+
+The options are llvm-objdump's: `-d` disassemble, `-r` relocations (under each instruction with `-dr`), `-t` symbols, `-h` sections, `-x` all headers, `-s` section contents, `-M no-aliases`, `--no-show-raw-insn`. The output is the same as llvm-objdump 21's apart from Xcal instructions and undecodable words (`.word`), so the two can be diffed.
+
 ### Framebuffer
 
 Programs can draw into a 640×480 framebuffer (spec section 9.3). Grail is headless by default; `--fb` opens a native window showing it (Windows only, plain Win32 GDI through hand-written FFI; elsewhere Grail warns and stays headless). `--fb-dump DIR` writes `DIR/frame-NNNN.ppm` on every `FB_PRESENT` and when the machine stops, with or without a window. `--headless` turns the window off even if `--fb` is given.
@@ -64,7 +83,7 @@ Closing the window stops the emulator. When the program stops first, the window 
 cargo test
 ```
 
-Runs the decoder and device unit tests, every riscv-tests suite (except `rv32ui-p-ma_data`, which assumes hardware misaligned access; Excalibur traps instead), the examples (the UART echo is fed both from an in-process channel and through the `grail` binary's stdin), the kernel, and the merlin front-end tests. The framebuffer test runs `examples/colorbars` headless and checks the dumped frames pixel by pixel and against a committed hash. The window itself needs a desktop, so its test is ignored by default: `cargo test --release -p grail -- --ignored window`.
+Runs the decoder and device unit tests, every riscv-tests suite (except `rv32ui-p-ma_data`, which assumes hardware misaligned access; Excalibur traps instead), the examples (the UART echo is fed both from an in-process channel and through the `grail` binary's stdin), the kernel, the merlin front-end tests, and merlin-objdump against committed llvm-objdump output (`crates/merlin-objdump/tests/golden`; regenerate the fixtures and goldens with `scripts/gen-objdump-golden.sh`, which needs clang and llvm-objdump). The framebuffer test runs `examples/colorbars` headless and checks the dumped frames pixel by pixel and against a committed hash. The window itself needs a desktop, so its test is ignored by default: `cargo test --release -p grail -- --ignored window`.
 
 `merlin --dump-ast file.c` prints the checked syntax tree. The compiler's end-to-end harness (`crates/merlin/tests/harness.rs`) runs every program in `crates/merlin/tests/cases/` through merlin, merlin-as and merlin-ld and checks its exit code in Grail; it is `#[ignore]`d until codegen and the linker exist. With clang and ld.lld installed, `cargo test -p merlin --test harness -- --ignored clang_reference` checks the same programs' expected exit codes against clang.
 

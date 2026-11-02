@@ -1,0 +1,361 @@
+//! merlin-objdump: prints what is inside our ELF32 `.o` files and
+//! executables, so merlin-as and merlin-ld output can be debugged without LLVM.
+//!
+//! The output follows llvm-objdump (LLVM 21) line for line, so the two can be
+//! diffed: the tests compare against llvm-objdump output committed under
+//! `tests/golden/`. Differences are deliberate and few:
+//!
+//! - Words that do not decode print as `.word 0x...` (one per 4 bytes) where
+//!   llvm-objdump prints `<unknown>`, and the Xcal instructions print as
+//!   `xcal.dbg` / `xcal.halt`.
+//! - Reserved fence encodings print as the `fence`/`fence.i` Grail executes
+//!   them as, and `dret` prints as `.word`.
+//! - Targets that wrap below the symbol they are named after get a 32-bit
+//!   displacement (`<f+0xffffff04>`); llvm-objdump prints a 64-bit one.
+//! - Only the CSR names in `excalibur::csr` are known; others print as numbers.
+
+pub mod cli;
+mod disasm;
+
+use elf32::{Elf, Error, Section, Symbol};
+use std::fmt::Write;
+
+/// What to print, mirroring llvm-objdump's options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Options {
+    /// `-f`: architecture and entry point.
+    pub file_headers: bool,
+    /// `-p`: program headers.
+    pub private_headers: bool,
+    /// `-h`: section headers.
+    pub section_headers: bool,
+    /// `-t`: symbol table.
+    pub symbols: bool,
+    /// `-r`: relocations. With `-d` they are shown under the instruction they patch.
+    pub relocs: bool,
+    /// `-s`: hex dump of every section.
+    pub contents: bool,
+    /// `-d`: disassemble executable sections.
+    pub disassemble: bool,
+    /// Print pseudo-instructions (`mv`, `ret`, ...); `-M no-aliases` clears it.
+    pub aliases: bool,
+    /// Show the instruction word next to each instruction; `--no-show-raw-insn` clears it.
+    pub raw_insn: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            file_headers: false,
+            private_headers: false,
+            section_headers: false,
+            symbols: false,
+            relocs: false,
+            contents: false,
+            disassemble: false,
+            aliases: true,
+            raw_insn: true,
+        }
+    }
+}
+
+impl Options {
+    /// `-x`: everything but the disassembly and the contents.
+    pub fn set_all_headers(&mut self) {
+        self.file_headers = true;
+        self.private_headers = true;
+        self.section_headers = true;
+        self.symbols = true;
+        self.relocs = true;
+    }
+
+    /// True if at least one thing to print is selected.
+    pub fn any(&self) -> bool {
+        self.file_headers
+            || self.private_headers
+            || self.section_headers
+            || self.symbols
+            || self.relocs
+            || self.contents
+            || self.disassemble
+    }
+}
+
+/// Dumps one file. `name` is printed in the header line, as given.
+pub fn dump(name: &str, data: &[u8], opts: &Options) -> Result<String, Error> {
+    let elf = Elf::parse(data)?;
+    let mut out = String::new();
+    let _ = writeln!(out, "\n{name}:\tfile format elf32-littleriscv");
+    if opts.file_headers {
+        file_headers(&mut out, &elf);
+    }
+    if opts.private_headers {
+        program_headers(&mut out, &elf);
+    }
+    if opts.section_headers {
+        section_headers(&mut out, &elf);
+    }
+    if opts.symbols {
+        symbol_table(&mut out, &elf)?;
+    }
+    if opts.relocs && !opts.disassemble {
+        relocations(&mut out, &elf)?;
+    }
+    if opts.contents {
+        contents(&mut out, &elf)?;
+    }
+    if opts.disassemble {
+        disasm::disassemble(&mut out, &elf, opts)?;
+    }
+    Ok(out)
+}
+
+fn file_headers(out: &mut String, elf: &Elf) {
+    let _ = writeln!(out, "architecture: riscv32");
+    let _ = writeln!(out, "start address: 0x{:08x}", elf.header.entry);
+}
+
+fn program_headers(out: &mut String, elf: &Elf) {
+    let _ = writeln!(out, "\nProgram Header:");
+    for p in &elf.segments {
+        let ty = match p.ty {
+            elf32::PT_DYNAMIC => " DYNAMIC",
+            elf32::PT_GNU_EH_FRAME => "EH_FRAME",
+            elf32::PT_GNU_RELRO => "   RELRO",
+            elf32::PT_GNU_STACK => "   STACK",
+            elf32::PT_INTERP => "  INTERP",
+            elf32::PT_LOAD => "    LOAD",
+            elf32::PT_NOTE => "    NOTE",
+            elf32::PT_PHDR => "    PHDR",
+            elf32::PT_TLS => "     TLS",
+            _ => " UNKNOWN",
+        };
+        // llvm-objdump prints log2 of the alignment; 0 has 64 trailing zero bits.
+        let align = (p.align as u64).trailing_zeros();
+        let flag = |bit, c| if p.flags & bit != 0 { c } else { '-' };
+        let _ = writeln!(
+            out,
+            "{ty} off    0x{:08x} vaddr 0x{:08x} paddr 0x{:08x} align 2**{align}",
+            p.offset, p.vaddr, p.paddr
+        );
+        let _ = writeln!(
+            out,
+            "         filesz 0x{:08x} memsz 0x{:08x} flags {}{}{}",
+            p.filesz,
+            p.memsz,
+            flag(elf32::PF_R, 'r'),
+            flag(elf32::PF_W, 'w'),
+            flag(elf32::PF_X, 'x')
+        );
+    }
+    let _ = writeln!(out, "\nDynamic Section:");
+}
+
+/// The section-type column of `-h`.
+fn section_kind(s: &Section) -> String {
+    let mut kinds = Vec::new();
+    if s.is_exec() {
+        kinds.push("TEXT");
+    }
+    // Like LLVM's isSectionData: also .init_array, alloc notes and so on.
+    if s.is_alloc() && !s.is_exec() && !s.is_nobits() {
+        kinds.push("DATA");
+    }
+    if s.is_nobits() && s.flags & (elf32::SHF_ALLOC | elf32::SHF_WRITE) != 0 {
+        kinds.push("BSS");
+    }
+    if s.name.starts_with(".debug") || s.name.starts_with(".zdebug") || s.name == ".gdb_index" {
+        kinds.push("DEBUG");
+    }
+    kinds.join(", ")
+}
+
+fn section_headers(out: &mut String, elf: &Elf) {
+    let width = elf
+        .sections
+        .iter()
+        .map(|s| s.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(13);
+    let _ = writeln!(out, "\nSections:");
+    let _ = writeln!(out, "Idx {:<width$} Size     VMA      Type", "Name");
+    for (i, s) in elf.sections.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "{i:3} {:<width$} {:08x} {:08x} {}",
+            s.name,
+            s.size,
+            s.addr,
+            section_kind(s)
+        );
+    }
+}
+
+/// Name of the section a symbol is defined in, or `*ABS*` / `*UND*` / `*COM*`.
+fn symbol_section<'a>(elf: &'a Elf, s: &Symbol) -> &'a str {
+    match s.shndx {
+        elf32::SHN_ABS => "*ABS*",
+        elf32::SHN_COMMON => "*COM*",
+        elf32::SHN_UNDEF => "*UND*",
+        i => elf.sections.get(i as usize).map_or("*UND*", |s| s.name.as_str()),
+    }
+}
+
+/// The name a symbol is shown with: section symbols take their section's name.
+fn symbol_name<'a>(elf: &'a Elf, s: &'a Symbol) -> &'a str {
+    match (s.ty(), s.section()) {
+        (elf32::STT_SECTION, Some(i)) => elf.sections.get(i).map_or("", |s| s.name.as_str()),
+        _ => &s.name,
+    }
+}
+
+fn symbol_table(out: &mut String, elf: &Elf) -> Result<(), Error> {
+    let _ = writeln!(out, "\nSYMBOL TABLE:");
+    for s in elf.symbols()?.iter().skip(1) {
+        let weak = s.bind() == elf32::STB_WEAK;
+        let common = s.shndx == elf32::SHN_COMMON;
+        let glob_loc = match s.bind() {
+            10 => 'u', // STB_GNU_UNIQUE
+            _ if weak || (s.section().is_none() && s.shndx != elf32::SHN_ABS) => ' ',
+            elf32::STB_LOCAL => 'l',
+            _ => 'g',
+        };
+        let ifunc = if s.ty() == 10 { 'i' } else { ' ' }; // STT_GNU_IFUNC
+        let debug = if matches!(s.ty(), elf32::STT_SECTION | elf32::STT_FILE) {
+            'd'
+        } else {
+            ' '
+        };
+        let kind = match s.ty() {
+            elf32::STT_FILE => 'f',
+            elf32::STT_FUNC => 'F',
+            elf32::STT_OBJECT | elf32::STT_COMMON | elf32::STT_TLS => 'O',
+            _ => ' ',
+        };
+        let weak = if weak { 'w' } else { ' ' };
+        let visibility = match s.other {
+            0 => String::new(),
+            1 => " .internal".to_string(),
+            2 => " .hidden".to_string(),
+            3 => " .protected".to_string(),
+            o => format!(" 0x{o:02x}"),
+        };
+        let _ = writeln!(
+            out,
+            "{:08x} {glob_loc}{weak}  {ifunc}{debug}{kind} {}\t{:08x}{visibility} {}",
+            // A common symbol's st_value is its alignment; llvm-objdump shows
+            // its size in the first column and the alignment in the second.
+            if common { s.size } else { s.value },
+            symbol_section(elf, s),
+            if common { s.value } else { s.size },
+            symbol_name(elf, s)
+        );
+    }
+    Ok(())
+}
+
+/// One `.rela.*` (or `.rel.*`) section, read.
+pub(crate) struct RelocSection {
+    /// Index of the section the relocations patch (`sh_info`).
+    pub target: usize,
+    /// The symbol table they refer to (`sh_link`).
+    pub symbols: Vec<Symbol>,
+    /// In file order, as `-r` prints them (`-dr` sorts its own copy).
+    pub relocs: Vec<elf32::Rela>,
+}
+
+/// Every relocation section in the file, in file order.
+pub(crate) fn relocation_sections(elf: &Elf) -> Result<Vec<RelocSection>, Error> {
+    let mut out = Vec::new();
+    for s in &elf.sections {
+        if s.ty == elf32::SHT_RELA || s.ty == elf32::SHT_REL {
+            let relocs = elf.relocations(s)?;
+            let symbols = match elf.sections.get(s.link as usize) {
+                Some(symtab) if symtab.ty == elf32::SHT_SYMTAB => elf.symbols_in(symtab)?,
+                _ => elf.symbols()?,
+            };
+            out.push(RelocSection {
+                target: s.info as usize,
+                symbols,
+                relocs,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// `R_RISCV_PCREL_HI20`, or `Unknown` for a type we have no name for.
+pub(crate) fn reloc_type(ty: u32) -> &'static str {
+    elf32::reloc_name(ty).unwrap_or("Unknown")
+}
+
+/// What a relocation points at: `symbol`, `symbol+0x8`, `.rodata-0x4`, or `*ABS*`.
+pub(crate) fn reloc_value(elf: &Elf, symbols: &[Symbol], r: &elf32::Rela) -> String {
+    let mut v = match symbols.get(r.sym as usize).filter(|_| r.sym != 0) {
+        Some(s) => symbol_name(elf, s).to_string(),
+        None => "*ABS*".to_string(),
+    };
+    if r.addend > 0 {
+        let _ = write!(v, "+{:#x}", r.addend);
+    } else if r.addend < 0 {
+        let _ = write!(v, "-{:#x}", r.addend.unsigned_abs());
+    }
+    v
+}
+
+fn relocations(out: &mut String, elf: &Elf) -> Result<(), Error> {
+    for rs in relocation_sections(elf)? {
+        let name = elf.sections.get(rs.target).map_or("", |s| s.name.as_str());
+        let _ = writeln!(out, "\nRELOCATION RECORDS FOR [{name}]:");
+        let _ = writeln!(out, "OFFSET   TYPE                     VALUE");
+        for r in &rs.relocs {
+            let _ = writeln!(
+                out,
+                "{:08x} {:<24} {}",
+                r.offset,
+                reloc_type(r.ty),
+                reloc_value(elf, &rs.symbols, r)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn contents(out: &mut String, elf: &Elf) -> Result<(), Error> {
+    for s in elf.sections.iter().filter(|s| s.size > 0) {
+        let _ = writeln!(out, "Contents of section {}:", s.name);
+        if s.is_nobits() && s.flags & (elf32::SHF_ALLOC | elf32::SHF_WRITE) != 0 {
+            let end = s.addr as u64 + s.size as u64;
+            let _ = writeln!(
+                out,
+                "<skipping contents of bss section at [{:04x}, {end:04x})>",
+                s.addr
+            );
+            continue;
+        }
+        let data = elf.section_data(s)?;
+        for (row, chunk) in data.chunks(16).enumerate() {
+            let _ = write!(out, " {:04x} ", s.addr as u64 + row as u64 * 16);
+            for i in 0..16 {
+                if i != 0 && i % 4 == 0 {
+                    out.push(' ');
+                }
+                match chunk.get(i) {
+                    Some(b) => {
+                        let _ = write!(out, "{b:02x}");
+                    }
+                    None => out.push_str("  "),
+                }
+            }
+            out.push_str("  ");
+            out.extend(
+                chunk
+                    .iter()
+                    .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }),
+            );
+            out.push('\n');
+        }
+    }
+    Ok(())
+}

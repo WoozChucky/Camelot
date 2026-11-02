@@ -1,0 +1,58 @@
+
+crates/merlin-objdump/tests/fixtures/misc.o:	file format elf32-littleriscv
+architecture: riscv32
+start address: 0x00000000
+
+Program Header:
+
+Dynamic Section:
+
+Sections:
+Idx Name                Size     VMA      Type
+  0                     00000000 00000000 
+  1 .strtab             0000009f 00000000 
+  2 .text               00000010 00000000 TEXT
+  3 .rela.text          00000018 00000000 
+  4 .data               00000004 00000000 DATA
+  5 .init_array         00000004 00000000 DATA
+  6 .rela.init_array    0000000c 00000000 
+  7 .preinit_array      00000004 00000000 DATA
+  8 .rela.preinit_array 0000000c 00000000 
+  9 .fini_array         00000004 00000000 DATA
+ 10 .rela.fini_array    0000000c 00000000 
+ 11 .note.x             00000004 00000000 DATA
+ 12 .debug_x            00000004 00000000 DEBUG
+ 13 .riscv.attributes   0000003d 00000000 
+ 14 .symtab             000000e0 00000000 
+
+SYMBOL TABLE:
+00000000 l       .text	00000000 $x
+00000000 l       .data	00000000 $d
+00000000 l       .init_array	00000000 $d
+00000000 l       .preinit_array	00000000 $d
+00000000 l       .fini_array	00000000 $d
+00000000 l       .note.x	00000000 $d
+00000000 l       .debug_x	00000000 $d
+00000000 l       .riscv.attributes	00000000 $d
+00000000 g     F .text	00000010 .hidden entry
+00000000         *UND*	00000000 bar
+00000000         *UND*	00000000 baz
+00000020       O *COM*	00000004 common_buf
+00000000 g       .data	00000000 .protected prot
+
+RELOCATION RECORDS FOR [.text]:
+OFFSET   TYPE                     VALUE
+00000004 R_RISCV_NONE             bar
+00000000 R_RISCV_NONE             baz
+
+RELOCATION RECORDS FOR [.init_array]:
+OFFSET   TYPE                     VALUE
+00000000 R_RISCV_32               entry
+
+RELOCATION RECORDS FOR [.preinit_array]:
+OFFSET   TYPE                     VALUE
+00000000 R_RISCV_32               entry
+
+RELOCATION RECORDS FOR [.fini_array]:
+OFFSET   TYPE                     VALUE
+00000000 R_RISCV_32               entry
