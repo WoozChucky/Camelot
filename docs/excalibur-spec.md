@@ -345,7 +345,8 @@ All reading goes through one crate, `elf32` (header, program headers, sections, 
 
 - **Single pass.** No instruction's size depends on a label's address; `.equ`/`.set` constants must be defined before use. Every label reference is first recorded as a fixup with its immediate left zero.
 - **Local labels are resolved by the assembler**, as clang does with `-mno-relax`. When the file has been read, a pc-relative reference to a label that is local (not `.globl`, also when `.globl` comes later in the file) and defined in the same section is patched in and gets no relocation: branches, `jal`/`j`, `call`/`tail` (both words), and `auipc` + `%pcrel_lo` pairs (`la`, `lla`, `lw rd, sym`, `sw rs, sym, rt`, explicit `%pcrel_hi`/`%pcrel_lo`). A branch or jump out of range is an error on its line. Everything else stays a relocation for the linker: references to global or undefined symbols, to labels in other sections, and absolute ones (`%hi`, `%lo`, `.word sym`).
-- **Symbols**: `.L` labels (numeric labels like `1:`, hidden `.Lpcrel_hiN` labels on `auipc`s) are written to `.symtab` only when a relocation refers to them, as in clang.
+- **`.`** is the location counter: the address of the instruction (its first word, for a pseudo-instruction) or data word it appears in. Each use becomes a hidden local label there, so `j .`, `beq a0, a1, .-8` and `la a0, .` resolve like any local label, and `.word .` gets an `R_RISCV_32` against that label (clang's `.L0`).
+- **Symbols**: `.L` labels (numeric labels like `1:`, hidden `.Lpcrel_hiN` labels on `auipc`s, `.Ldot$N` labels for `.`) are written to `.symtab` only when a relocation refers to them, as in clang.
 - **`.insn`** spells out an instruction by fields, with LLVM's forms and encodings: `.insn r opcode, funct3, funct7, rd, rs1, rs2`, `.insn i opcode, funct3, rd, rs1, imm` (or `rd, imm(rs1)`), `.insn s opcode, funct3, rs2, imm(rs1)`, `.insn b opcode, funct3, rs1, rs2, target`, `.insn u opcode, rd, imm20`, and `.insn value` / `.insn 4, value`. Opcodes must be 32-bit ones (low bits `11`). This lets sources that use Xcal instructions (`examples/hello/hello.S`) build with both assemblers.
 - **`.riscv.attributes`**: every object carries clang's `Tag_RISCV_arch` for `rv32im_zicsr_zifencei` (`rv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0`), so llvm-objdump decodes M instructions without `--mattr`.
 - **Differences from clang**, on purpose:
@@ -353,6 +354,7 @@ All reading goes through one crate, `elf32` (header, program headers, sections, 
   - A numeric label that a relocation refers to is named `.L<n>$<k>` (the k-th definition of `n:`); clang names it `.Ltmp<m>`. No `$x`/`$d` mapping symbols are written.
   - `.insn j` is not accepted: LLVM 21 packs its numeric offset without the J-type bit scrambling.
   - Register names are never symbols: `lw a0, a1` is an error, where LLVM reads `a1` as a symbol.
+  - Some operand forms LLVM accepts are not: `jalr rd, rs` and `jalr off(rs)` (write `jalr rd, 0(rs)`, `jalr ra, off(rs)`), `jr off(rs)` and `jr rs, off` (write `jalr zero, off(rs)`), `call rd, sym`, `jump sym, rt`, `%hi(sym)` in `.insn u`, named opcodes in `.insn` (`.insn r OP, ...`), upper-case CSR names (`MSTATUS`) and standard CSRs Excalibur doesn't have (`fflags`). The other way round, `call`/`tail` accept `sym+offset` and `.`, where clang wants a bare symbol name.
 
 ### Linker (`merlin-ld`)
 

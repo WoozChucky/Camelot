@@ -44,21 +44,13 @@ use crate::reloc::{Emit, Fixup, RelocKind, Target};
 use crate::Ctx;
 use excalibur::{csr, Reg};
 
-// ----- major opcodes, bits [6:0] (spec section 4) -----
-
-const LUI: u32 = 0b0110111;
-const AUIPC: u32 = 0b0010111;
-const JAL: u32 = 0b1101111;
-const JALR: u32 = 0b1100111;
-const BRANCH: u32 = 0b1100011;
-const LOAD: u32 = 0b0000011;
-const STORE: u32 = 0b0100011;
-const OP_IMM: u32 = 0b0010011;
-const OP: u32 = 0b0110011;
-const MISC_MEM: u32 = 0b0001111;
-const SYSTEM: u32 = 0b1110011;
-/// custom-0: the Xcal instructions (spec section 9).
-const CUSTOM_0: u32 = 0b0001011;
+// Major opcodes, bits [6:0] (spec section 4): the decoder's own constants.
+// custom-0 holds the Xcal instructions (spec section 9).
+use excalibur::opcode::{
+    OP_AUIPC as AUIPC, OP_BRANCH as BRANCH, OP_CUSTOM0 as CUSTOM_0, OP_IMM, OP_JAL as JAL, OP_JALR as JALR,
+    OP_LOAD as LOAD, OP_LUI as LUI, OP_MISC_MEM as MISC_MEM, OP_OP as OP, OP_STORE as STORE,
+    OP_SYSTEM as SYSTEM,
+};
 
 // funct3 values the pseudo-instructions need by name.
 const ADDI: u32 = 0b000;
@@ -348,8 +340,15 @@ fn imm12(e: &Expr, ctx: &Ctx, store: bool) -> Result<Field, String> {
             m.name(),
             if m == Modifier::Hi { "lui" } else { "auipc" }
         )),
+        Imm::Label(name, _) if ctx.undefined(&name) => Err(not_yet_constant(&name)),
         Imm::Label(..) => Err("a label can't be a 12-bit immediate: use %lo(sym) or %pcrel_lo(label)".into()),
     }
+}
+
+/// The error for a symbol where only a constant fits, when that symbol isn't
+/// defined yet: most likely a constant whose `.equ` comes later.
+fn not_yet_constant(name: &str) -> String {
+    format!("'{name}' is not a constant (yet): .equ/.set constants must be defined before use")
 }
 
 /// The 20-bit immediate of `lui` (a number or `%hi(sym)`) or `auipc` (a
@@ -737,6 +736,10 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
             let rd = reg(rd)?;
             match imm(expr(value)?, ctx)? {
                 Imm::Num(v) => li(rd, word(v, "li value")?),
+                Imm::Label(name, _) if ctx.undefined(&name) => Err(format!(
+                    "{} (li loads a number; la loads an address)",
+                    not_yet_constant(&name)
+                )),
                 _ => Err("li takes a constant (use la to load an address)".into()),
             }
         }

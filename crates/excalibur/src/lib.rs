@@ -2,8 +2,10 @@
 //!
 //! This crate is the single source of truth for instruction encodings. Grail
 //! (the emulator) uses [`decode`] to execute, disassemblers use [`Inst::format`]
-//! (or the plain [`std::fmt::Display`] impl on [`Inst`]), and merlin-as will use the same
-//! tables to encode.
+//! (or the plain [`std::fmt::Display`] impl on [`Inst`]), and merlin-as encodes
+//! with the same major opcodes ([`opcode`]), CSR numbers ([`csr`]) and register
+//! names ([`reg`]). Its funct3/funct7 tables are its own, kept honest by its
+//! round-trip tests through [`decode`].
 
 pub mod csr;
 mod decode;
@@ -11,6 +13,14 @@ mod disasm;
 pub mod reg;
 
 pub use decode::decode;
+
+/// Major opcodes, bits [6:0] of every instruction (spec section 4).
+pub mod opcode {
+    pub use crate::decode::{
+        OP_AUIPC, OP_BRANCH, OP_CUSTOM0, OP_IMM, OP_JAL, OP_JALR, OP_LOAD, OP_LUI, OP_MISC_MEM, OP_OP,
+        OP_STORE, OP_SYSTEM,
+    };
+}
 pub use disasm::{Disasm, Syntax};
 
 /// Register index, 0..=31.

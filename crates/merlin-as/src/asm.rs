@@ -6,6 +6,11 @@
 //! relocation, with its source line) and the immediate is left zero.
 //! `.equ`/`.set` constants must be defined before use.
 //!
+//! `.`, the location counter, is the address of the instruction (its first
+//! word, for a pseudo-instruction) or data word it appears in. Each use
+//! becomes a hidden local label there, so `j .` and `beq a0, a1, .-8`
+//! resolve like any local label.
+//!
 //! When the whole file has been read, `Assembler::finish` does what clang's
 //! assembler does with `-mno-relax`: a pc-relative fixup whose label is local
 //! (not `.globl`) and defined in the same section as the instruction is
@@ -101,6 +106,8 @@ pub struct Assembler {
     /// How many times each numeric label (`1:`) has been defined so far.
     local_counts: HashMap<u32, u32>,
     hidden_labels: u32,
+    /// How many `.Ldot` labels (see [`Assembler::dot_label`]) have been made.
+    dot_labels: u32,
     /// `%pcrel_lo(label)` relocations to check once every label is known:
     /// (section, label, source line). See [`Assembler::check_pcrel_lo`].
     pcrel_lo: Vec<(usize, String, usize)>,
@@ -141,6 +148,18 @@ impl Ctx<'_> {
         }
     }
 
+    /// True if `name` (as [`Ctx::symbol`] returns it) is neither defined yet
+    /// nor `.`: a label further down, a constant whose `.equ` comes later,
+    /// or an external symbol.
+    pub fn undefined(&self, name: &str) -> bool {
+        name != DOT
+            && !self
+                .asm
+                .by_name
+                .get(name)
+                .is_some_and(|&i| self.asm.symbols[i].defined)
+    }
+
     /// A CSR operand: a name like `mstatus` or a number like `0x300`.
     pub fn csr(&self, e: &Expr) -> Option<u16> {
         if let Expr::Sym(name) = e {
@@ -162,6 +181,7 @@ impl Assembler {
             by_name: HashMap::new(),
             local_counts: HashMap::new(),
             hidden_labels: 0,
+            dot_labels: 0,
             pcrel_lo: Vec::new(),
             errors: Vec::new(),
             line: 0,
@@ -400,6 +420,18 @@ impl Assembler {
         s.defined = true;
     }
 
+    /// Defines a hidden label at `offset` in the current section for a
+    /// reference to `.`, the location counter, and returns its name. Like
+    /// clang's `.L0` temporaries, it then resolves like any local label: a
+    /// `j .` is patched on the spot, a `.word .` keeps an `R_RISCV_32`
+    /// against it.
+    fn dot_label(&mut self, offset: u32) -> String {
+        let name = format!("{DOT_LABEL}{}", self.dot_labels);
+        self.dot_labels += 1;
+        self.define(&name, self.current, offset);
+        name
+    }
+
     fn label(&mut self, name: &str) {
         let name = match name.parse::<u32>() {
             Ok(n) => {
@@ -532,6 +564,8 @@ impl Assembler {
             return self.error("instruction is not 4-byte aligned (add .align 2)");
         }
         let base = self.sections[self.current].size;
+        // `.` in any operand is the address of the instruction's first word.
+        let mut dot = None;
         // Hidden labels on auipcs that a later %pcrel_lo in this expansion refers to.
         let mut auipc_labels: HashMap<usize, String> = HashMap::new();
         for (i, e) in emits.iter().enumerate() {
@@ -555,7 +589,10 @@ impl Assembler {
             let offset = base + 4 * i as u32;
             if let Some(f) = fixup {
                 let (symbol, addend) = match f.target {
-                    Target::Symbol { name, addend } => {
+                    Target::Symbol { mut name, addend } => {
+                        if name == DOT {
+                            name = dot.get_or_insert_with(|| self.dot_label(base)).clone();
+                        }
                         if matches!(f.kind, RelocKind::PcrelLo12I | RelocKind::PcrelLo12S) {
                             self.pcrel_lo.push((self.current, name.clone(), self.line));
                         }
@@ -611,8 +648,11 @@ impl Assembler {
             }
             let ctx = Ctx { asm: self };
             match (size, ctx.symbol(e)) {
-                (4, Some((name, addend))) => {
+                (4, Some((mut name, addend))) => {
                     let off = self.sections[self.current].size;
+                    if name == DOT {
+                        name = self.dot_label(off);
+                    }
                     self.add_reloc(off, RelocKind::Abs32, name, addend);
                     self.emit_bytes(&[0; 4]);
                 }
@@ -745,9 +785,17 @@ fn check_jump(distance: i64, bits: u32, what: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The location counter as the encoder sees it: a symbol named `.`.
+const DOT: &str = ".";
+/// Prefix of the hidden labels that stand for `.` (see [`Assembler::dot_label`]).
+const DOT_LABEL: &str = ".Ldot$";
+
 /// How a label is named in errors: `.L1$0` (the internal name of the numeric
-/// label `1:`) → `1`, `.Lfoo` → `foo`, other names unchanged.
+/// label `1:`) → `1`, `.Ldot$0` → `.`, `.Lfoo` → `foo`, other names unchanged.
 fn shown_name(name: &str) -> &str {
+    if name.starts_with(DOT_LABEL) {
+        return DOT;
+    }
     match name.strip_prefix(".L") {
         Some(rest) => rest.split('$').next().unwrap_or(rest),
         None => name,
@@ -938,6 +986,69 @@ data:   .word 0
                 0x0000_1097, // auipc ra, 1
                 0x7f80_80e7, // jalr 2040(ra)
             ]
+        );
+    }
+
+    #[test]
+    fn dot_is_the_current_address() {
+        // Words from clang -mno-relax for the same source (llvm-objdump -dr):
+        // every reference to `.` in code is resolved, no relocation.
+        let src = "
+        nop
+        j    .
+        beq  x0, x0, .
+        la   a0, .
+        j    .+8
+        bnez a0, .-8
+        nop
+";
+        assert_eq!(
+            text(src),
+            [
+                (0x0000_0013, ""),
+                (0x0000_006f, ""), // j 0x4
+                (0x0000_0063, ""), // beqz zero, 0x8
+                (0x0000_0517, ""), // auipc a0, 0
+                (0x0005_0513, ""), // addi a0, a0, 0
+                (0x0080_006f, ""), // j 0x1c
+                (0xfe05_1ce3, ""), // bnez a0, 0x10
+                (0x0000_0013, ""),
+            ]
+            .map(|(w, r)| (w, r.to_string()))
+        );
+        let obj = crate::assemble(src).unwrap();
+        assert!(obj
+            .symbols
+            .iter()
+            .all(|s| s.name != "." && !s.name.starts_with(".L")));
+
+        // In data, as in clang (`R_RISCV_32 .L0`, `.L0+0x4`): a relocation
+        // against a hidden label at that word.
+        let obj = crate::assemble(".data\n.word 0\n.word .\n.word . + 4\n").unwrap();
+        let relocs: Vec<_> = obj.sections[1]
+            .relocs
+            .iter()
+            .map(|r| {
+                let s = obj.symbols.iter().find(|s| s.name == r.symbol).unwrap();
+                (r.offset, r.kind, s.section, s.value, r.addend)
+            })
+            .collect();
+        assert_eq!(
+            relocs,
+            [
+                (4, RelocKind::Abs32, Some(1), 4, 0),
+                (8, RelocKind::Abs32, Some(1), 8, 4),
+            ]
+        );
+        assert!(obj.symbols.iter().all(|s| s.name != "."));
+
+        // Out of range: the error names `.`.
+        let errs = crate::assemble("nop\nbeqz a0, . + 8192\n").unwrap_err();
+        assert_eq!(errs[0].line, 2);
+        assert!(
+            errs[0].msg.starts_with("'.': branch target out of range"),
+            "{}",
+            errs[0].msg
         );
     }
 

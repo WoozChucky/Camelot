@@ -162,7 +162,11 @@ and no relocation is written; an out-of-range branch or jump is an error on
 its line. Everything else stays a relocation: global or undefined symbols, labels in other sections, and absolute references (`%hi`, `%lo`,
 `.word sym`).
 
-`.L` labels (numeric labels like `1:` and the hidden `.Lpcrel_hiN`) go into
+`.`, the location counter, is the address of the instruction (its first
+word) or data word it appears in: each use becomes a hidden `.Ldot$N` label
+there, so `j .` and `beq a0, a1, .-8` are resolved like any local label.
+
+`.L` labels (numeric labels like `1:`, the hidden `.Lpcrel_hiN` and `.Ldot$N`) go into
 the symbol table only when a relocation still uses them, and the object
 carries the same `.riscv.attributes` as clang's
 (`rv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0`), so llvm-objdump decodes the M
@@ -179,6 +183,11 @@ that remain on other input (spec section 10):
 - A numeric label a relocation refers to is called `.L1$0` (`1:`, first
   definition) where clang says `.Ltmp0`.
 - No `$x`/`$d` mapping symbols in the symbol table.
+- Operand forms LLVM accepts and merlin-as doesn't: `jalr rd, rs`,
+  `jalr off(rs)`, `jr off(rs)`, `jr rs, off`, `call rd, sym`, `jump sym, rt`,
+  `%hi(sym)` in `.insn u`, named `.insn` opcodes (`.insn r OP, ...`),
+  upper-case CSR names and CSRs Excalibur doesn't have (`fflags`). And
+  `call`/`tail` take `sym+offset` or `.`, where clang wants a bare symbol.
 
 ## Tests
 
