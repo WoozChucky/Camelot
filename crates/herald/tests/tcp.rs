@@ -173,6 +173,31 @@ fn ctrl_d_on_an_empty_line_ends_the_input_and_the_answer_still_comes() {
 }
 
 #[test]
+fn ctrl_close_bracket_still_leaves_after_ctrl_d() {
+    // A server that reads to the client's end and then keeps the connection open, until
+    // the client is gone: Ctrl-] must not wait for it.
+    let (ended_tx, ended) = mpsc::channel();
+    let (addr, server) = serve_once(move |mut stream: TcpStream| {
+        let mut got = Vec::new();
+        stream.read_to_end(&mut got).unwrap();
+        ended_tx.send(()).unwrap();
+        // Until the client closes or resets its side: a write then fails, or the
+        // test's wait runs out.
+        let start = Instant::now();
+        while start.elapsed() < SLOW && stream.write_all(b".").is_ok() {
+            thread::sleep(Duration::from_millis(20));
+        }
+        got
+    });
+    let (keys, _out, session) = start_session(addr, true);
+    type_keys(&keys, b"ls\r\x04");
+    ended.recv_timeout(SLOW).unwrap();
+    keys.send(DETACH_KEY).unwrap();
+    assert_eq!(join(session), TcpEnd::Left);
+    assert_eq!(join(server), b"ls\n");
+}
+
+#[test]
 fn piped_input_goes_as_it_is() {
     let (addr, server) = serve_once(count);
     let (keys, out, session) = start_session(addr, false);

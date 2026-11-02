@@ -466,7 +466,9 @@ depend on how fast the host runs Grail.
   (`procs`, then `wait`) and ends their connections with `shutdown`, and
   hangs up the sessions whose client left: `fstat` on a socket gives
   `nlink` 0 once its other end has hung up (its FIN came, or a reset), and
-  with nothing left unread shd kills what the session runs. There is no
+  with nothing left unread shd kills what the session runs (a shell that
+  reads the end of a connection kills its background programs itself
+  before it ends: once it has, nothing tells whose they were). There is no
   line discipline on a socket, so the client edits lines (`herald --tcp`,
   on Windows too) and the shell reads its input a byte at a time.
   `kernel/user/README.md` ("shd") has the details, and the security

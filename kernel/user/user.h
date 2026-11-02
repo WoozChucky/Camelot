@@ -425,6 +425,13 @@ const char *resolve_error(int err);
  * Returns 0 or the error (lib/stat.c). */
 int stat(const char *path, struct stat *st);
 
+/* Kills every process `pid` started that has not ended, and theirs, down
+ * to the last generation, from one procs() snapshot: the youngest first,
+ * so that none is left an orphan. Not `pid` itself (which may be the
+ * caller: kill_descendants(getpid()) ends what a program started). Returns
+ * how many it killed. One thread at a time (lib/proc.c). */
+int kill_descendants(int pid);
+
 /* Busy-waits for about `n` iterations of a short loop, a few instructions
  * each: CPU time, as opposed to sleep() (lib/spin.c). */
 void spin(uint n);

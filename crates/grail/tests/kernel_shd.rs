@@ -26,10 +26,18 @@ const GREETING: &str = "Type help for the list of commands.\n$ ";
 /// A machine on the user-mode gateway (DHCP gives it 10.0.2.15) with a host port
 /// forwarded to its port 23, booted to its prompt; and that host port.
 fn shd_vm() -> (Vm, SocketAddr) {
+    shd_vm_on(23, gateway::Limits::default().tcp_closing)
+}
+
+/// [`shd_vm`] with the host port forwarded to the machine's `port`, and the gateway
+/// resetting a connection closed on one side after `tcp_closing` with nothing moving
+/// (a minute by default).
+fn shd_vm_on(port: u16, tcp_closing: Duration) -> (Vm, SocketAddr) {
     let gw = gateway::Gateway::new(gateway::Config {
-        hostfwd: vec![gateway::HostFwd::tcp(0, 23)],
+        hostfwd: vec![gateway::HostFwd::tcp(0, port)],
         limits: gateway::Limits {
             service_interval: Duration::ZERO,
+            tcp_closing,
             ..gateway::Limits::default()
         },
         ..gateway::Config::default()
@@ -213,11 +221,17 @@ fn shd_log(out: &str) -> Vec<String> {
 /// Starts `shd -v ARGS` in the background on the console; returns its pid once it
 /// listens.
 fn start_shd(vm: &mut Vm, args: &str) -> u32 {
+    start_shd_on(vm, args, 23)
+}
+
+/// [`start_shd`], with ARGS making it listen on `port`.
+fn start_shd_on(vm: &mut Vm, args: &str, port: u16) -> u32 {
     let before = vm.out().len();
     let prompts = vm.prompts();
     vm.type_line(&format!("shd -v{args} &"));
+    let listening = format!("shd: listening on port {port}\n");
     run(vm, &mut [], |vm, _| {
-        vm.out()[before..].contains("shd: listening on port 23\n") && vm.prompts() > prompts
+        vm.out()[before..].contains(&listening) && vm.prompts() > prompts
     });
     job_pid(&vm.out()[before..])
 }
@@ -378,10 +392,12 @@ fn sessions_run_side_by_side_and_end_with_their_connections() {
         [
             "[] 10.0.2.2: connected",
             "[] 10.0.2.2: connected",
+            "[] 10.0.2.2: hung up",
             "[] 10.0.2.2: ended, exit -1",
             "[] 10.0.2.2: hung up",
             "[] 10.0.2.2: ended, exit -1",
             "[] 10.0.2.2: connected",
+            "[] 10.0.2.2: hung up",
             "[] 10.0.2.2: ended, exit 0",
             "[] 10.0.2.2: connected",
             "[] 10.0.2.2: ended, exit 3",
@@ -443,6 +459,81 @@ fn the_session_limit_turns_connections_away() {
     assert_eq!(
         console(&mut vm, "shd"),
         "shd: port 23: address in use\nshd: exit 1\n"
+    );
+    finish(vm, shd, pages);
+}
+
+/// Runs console `ps` until no process is named `name`; a few tries, each a command's
+/// worth of time, are plenty for a killed process to end.
+fn wait_gone(vm: &mut Vm, name: &str) {
+    for _ in 0..20 {
+        let ps = parse_ps(&console(vm, "ps"));
+        if !ps.iter().any(|p| p.name == name) {
+            return;
+        }
+    }
+    panic!("a {name} is still there:\n{}", vm.out());
+}
+
+#[test]
+fn a_hang_up_ends_background_jobs_and_typed_ahead_sessions() {
+    // shd on another port (-p), forwarded to. The gateway gives up on a half-closed
+    // connection where nothing moves after 3 seconds rather than a minute, to keep the
+    // test short.
+    let (mut vm, addr) = shd_vm_on(2323, Duration::from_secs(3));
+    let pages = warm_up(&mut vm);
+    let shd = start_shd_on(&mut vm, " -p 2323", 2323);
+
+    // A starts a background job and leaves between commands: its shell reads the end
+    // of its input at once and ends, too soon for shd to find the job by its parent,
+    // so the shell kills it itself. Nothing of the session is left.
+    let mut a = session(&mut vm, addr);
+    wait_console(&mut vm, &mut [], " connected\n", 1);
+    let job = command(&mut vm, &mut [&mut a], 0, "sleep 5000 &");
+    let sleep_pid = job_pid(&job);
+    let ps = parse_ps(&console(&mut vm, "ps"));
+    assert!(
+        ps.iter().any(|p| p.pid == sleep_pid && p.name == "sleep"),
+        "{ps:#?}"
+    );
+    a.close();
+    wait_console(&mut vm, &mut [], " ended, exit 0\n", 1);
+    wait_gone(&mut vm, "sleep");
+    let ps = parse_ps(&console(&mut vm, "ps"));
+    let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["sh", "shd", "ps"], "{ps:#?}");
+
+    // B types `ls` while `sleep 5000` runs, then leaves: the line waits unread, so
+    // after B's FIN the session looks like a script that still reads. Nothing moves on
+    // the connection, and after a while (here 3 s) the gateway resets it: that drops the unread
+    // line, shd hangs up and kills the sleep, and the shell, reading the reset, ends
+    // without running `ls` (its status is still the killed sleep's).
+    let mut b = session(&mut vm, addr);
+    wait_console(&mut vm, &mut [], " connected\n", 2);
+    b.send(b"sleep 5000\nls\n");
+    loop {
+        let ps = parse_ps(&console(&mut vm, "ps"));
+        if ps.iter().any(|p| p.name == "sleep") {
+            break;
+        }
+    }
+    b.close();
+    wait_console(&mut vm, &mut [], " ended, exit -1\n", 1);
+    wait_gone(&mut vm, "sleep");
+    let ps = parse_ps(&console(&mut vm, "ps"));
+    let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["sh", "shd", "ps"], "{ps:#?}");
+
+    assert_eq!(
+        shd_log(&vm.out()),
+        [
+            "[] 10.0.2.2: connected",
+            "[] 10.0.2.2: hung up",
+            "[] 10.0.2.2: ended, exit 0",
+            "[] 10.0.2.2: connected",
+            "[] 10.0.2.2: hung up",
+            "[] 10.0.2.2: ended, exit -1",
+        ]
     );
     finish(vm, shd, pages);
 }

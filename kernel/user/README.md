@@ -109,15 +109,26 @@ host, `herald --tcp 127.0.0.1:2323` gives a shell, once per window.
   Enter, as a telnet client does; the shell reads the connection a byte at
   a time up to each newline (a `\r` before it is dropped), so the rest is
   left for the programs it starts, which read the same connection.
-- **The session ends with the shell** (`exit`, or the end of its input:
-  Ctrl-D on an empty line in Herald, or closing the connection between
-  commands): shd collects it and ends the connection, even if a background
-  program still holds it.
-- **Closing the connection hangs up**, as with telnet: once the shell has
-  read all the client sent, shd kills every process the session started,
-  `sleep 5000` included, and the shell then ends (a shell still there a
-  second later is killed too). A script that sends commands and closes its
-  side should end with `exit`, so its last command is not cut short.
+- **The session ends with the shell**: shd collects it and ends the
+  connection, even if a background program still holds it. `exit` leaves
+  background programs running (`sleep 60 &`, then `exit`: the sleep goes
+  on, and ends by itself).
+- **Closing the connection hangs up**, as with telnet, and so does the end
+  of the input (Ctrl-D on an empty line in Herald, which closes Herald's
+  side). Between commands, the shell reads the end of its input, kills
+  every program it started, background ones included, and ends. In the
+  middle of a command, once the shell has read all the client sent, shd
+  kills every process the session started, `sleep 5000` included, and the
+  shell then ends (a shell still there a second later is killed too). A
+  script that sends commands and closes its side should end with `exit`,
+  so its last command is not cut short.
+- **Lines typed ahead keep a session going.** While a command runs, the
+  lines typed after it wait unread, and after the client's FIN nothing
+  tells a client that left from a script that only closed its sending side
+  and still reads the output: the session carries on. A reset ends it at
+  once, dropping what was unread, and the gateway (Grail's or a NAT
+  switch's) resets the connection soon after the session sends anything
+  to a client that is gone, or after a minute in which nothing moved.
 - **At most MAX sessions** (`-n`, 4 by default): one more is told
   `shd: too many sessions (MAX), try again later` and closed. Every program
   a session runs takes one of the kernel's 8 process slots too.

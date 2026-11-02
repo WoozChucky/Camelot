@@ -34,14 +34,22 @@
  *   still holding it does not keep the client waiting), and hangs up the
  *   sessions whose client went away.
  * - A client that closes its side of the connection hangs up, as a telnet
- *   client does. Once the shell has read everything the client sent
- *   (`fstat`: no byte waiting, and nlink 0, the other end gone), shd kills
- *   every process the shell started, and theirs, which would otherwise run
- *   on, `sleep 5000` say, with nobody to see it. The shell then reads the
- *   end of its input and ends by itself, as it does when the client leaves
- *   between commands; one that is still there a second later is killed too.
- *   A script that sends commands and then closes its side should end with
- *   `exit`, so that its last command is not cut short.
+ *   client does. Between commands, the shell reads the end of its input
+ *   and, on a connection, kills what it started (background programs) and
+ *   ends (sh.c). In the middle of one, once the shell has read everything
+ *   the client sent (`fstat`: no byte waiting, and nlink 0, the other end
+ *   gone), shd kills every process the shell started, and theirs, which
+ *   would otherwise run on, `sleep 5000` say, with nobody to see it; the
+ *   shell then reads the end of its input and ends. One still there a
+ *   second later is killed too. A script that sends commands and then
+ *   closes its side should end with `exit`, so that its last command is
+ *   not cut short.
+ * - While a command runs, lines the client typed ahead stay unread, and
+ *   after its FIN nothing tells a client that left from one that only
+ *   closed its sending side and still reads (a script): the session goes
+ *   on. A reset ends it, which drops what was unread: Grail's and Avalon's
+ *   gateway resets a connection whose client is gone soon after anything
+ *   is sent to it, and one where nothing moves for a minute after a FIN.
  *
  * Security: there are no users yet, so the shell runs as whoever started
  * shd, which is root, with no password asked. shd is for a machine whose
@@ -60,7 +68,7 @@
 /* Turns a shell may outlive its client by, alone, before it is killed. */
 #define LINGER_TURNS 2
 /* Processes procs() describes: more than the kernel has. */
-#define MAX_PROCS 32
+#define MAX_PROCS 16
 
 struct session {
     int pid; /* the shell; 0: a free entry */
@@ -134,36 +142,6 @@ static int state_of(int pid, int n) {
     return 0;
 }
 
-/* Kills every process the shell `pid` started, and theirs, from the
- * snapshot procs_now[0..n) (but those that have ended already). Returns
- * how many it killed. Pids only grow, and the snapshot is in pid order, so
- * a parent always comes before its children: one pass finds them all. */
-static int kill_descendants(int pid, int n) {
-    int tree[MAX_PROCS + 1];
-    int count = 1;
-    tree[0] = pid;
-    for (int i = 0; i < n; i++) {
-        int in = 0;
-        for (int j = 0; j < count; j++) {
-            if ((int)procs_now[i].ppid == tree[j]) {
-                in = 1;
-            }
-        }
-        if (in) {
-            tree[count] = (int)procs_now[i].pid;
-            count++;
-        }
-    }
-    /* The children first: a parent killed first would orphan them. */
-    int killed = 0;
-    for (int j = count - 1; j > 0; j--) {
-        if (state_of(tree[j], n) != PROC_ZOMBIE && kill(tree[j]) == 0) {
-            killed++;
-        }
-    }
-    return killed;
-}
-
 static void hung_up(struct session *s) {
     if (!s->said_hung_up) {
         say(s, "hung up");
@@ -184,9 +162,16 @@ static void tend(void) {
             continue;
         }
         int state = state_of(s->pid, n);
+        struct stat st;
+        int gone = fstat(s->fd, &st) == 0 && st.nlink == 0;
         if (state == PROC_ZOMBIE || state == 0) {
             int status = 0;
             wait(s->pid, &status);
+            if (gone) {
+                /* The client left, and the shell, reading the end of its
+                 * input, has ended what it ran, and itself. */
+                hung_up(s);
+            }
             /* Ended for everyone, background programs still holding it
              * included: the client sees the end. */
             shutdown(s->fd, SHUT_RDWR);
@@ -199,14 +184,13 @@ static void tend(void) {
             s->pid = 0;
             continue;
         }
-        struct stat st;
-        if (fstat(s->fd, &st) != 0 || st.nlink != 0 || st.size != 0) {
+        if (!gone || st.size != 0) {
             continue;
         }
         /* The client is gone and the shell has read all it sent: nobody is
          * left to see what runs. Again at every turn until the shell has
          * ended, for what it started meanwhile. */
-        if (kill_descendants(s->pid, n) > 0) {
+        if (kill_descendants(s->pid) > 0) {
             hung_up(s);
             s->lingering = 0;
         } else if (s->lingering < LINGER_TURNS) {

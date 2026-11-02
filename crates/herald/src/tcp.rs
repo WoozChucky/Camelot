@@ -174,8 +174,15 @@ impl LineEditor {
         out
     }
 
-    /// Moves through an escape sequence; true if `b` is part of one.
+    /// Moves through an escape sequence; true if `b` is part of one. A control
+    /// character (and the detach key) ends the sequence and counts as itself, as a
+    /// terminal executes one met in the middle of a sequence: a lone Esc never
+    /// swallows Enter or the detach key, and an ESC starts a new sequence.
     fn skip_escape(&mut self, b: u8) -> bool {
+        if self.escape != Escape::None && (b < 0x20 || Some(b) == self.detach_key) {
+            self.escape = Escape::None;
+            return false;
+        }
         match self.escape {
             Escape::None => return false,
             Escape::Start => {
@@ -302,7 +309,14 @@ impl TcpSession {
                 }
                 Event::Closed => return Ok(TcpEnd::Closed),
                 Event::Failed(e) => return Err(e),
-                Event::Input(_) | Event::InputEnded if input_done => {}
+                // The input has ended (Ctrl-D): the keys go nowhere, but the detach key
+                // still leaves, for a far end that does not close.
+                Event::Input(keys) if input_done => {
+                    if keys.iter().any(|&b| Some(b) == self.detach_key) {
+                        return Ok(TcpEnd::Left);
+                    }
+                }
+                Event::InputEnded if input_done => {}
                 Event::Input(keys) => {
                     let (send, stop) = if self.edit {
                         let edited = editor.feed(&keys);
@@ -435,6 +449,23 @@ mod tests {
         ed.feed(b";5");
         assert_eq!(ed.feed(b"Cy").echo, b"y");
         assert_eq!(ed.line(), b"xy");
+    }
+
+    #[test]
+    fn a_control_character_ends_an_escape_sequence() {
+        // Esc, then the detach key: it still leaves.
+        assert_eq!(feed(b"\x1b\x1d").1.stop, Some(Stop::Leave));
+        assert_eq!(feed(b"\x1b[1\x1d").1.stop, Some(Stop::Leave));
+        // An unfinished sequence does not swallow Enter, nor what follows it.
+        let (_, e) = feed(b"\x1b[\rls\r\x1d");
+        assert_eq!(e.send, b"\nls\n");
+        assert_eq!(e.stop, Some(Stop::Leave));
+        assert_eq!(feed(b"a\x1bO\rb\r").1.send, b"a\nb\n");
+        // Nor Ctrl-D on an empty line.
+        assert_eq!(feed(b"\x1b[\x04").1.stop, Some(Stop::EndOfInput));
+        // An ESC in a sequence starts another one.
+        let (ed, _) = feed(b"\x1b[1\x1b[Az");
+        assert_eq!(ed.line(), b"z");
     }
 
     #[test]

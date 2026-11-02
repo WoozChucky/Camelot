@@ -40,7 +40,14 @@
  * reads it a byte at a time up to each newline, so that nothing after the
  * line is taken from the programs it starts, which read the same input.
  * There the other end edits and echoes lines itself; a '\r' before the
- * newline (a telnet client's line end) is dropped. */
+ * newline (a telnet client's line end) is dropped.
+ *
+ * On a connection, the end of the input is a hang-up: the client is gone
+ * (or said it is done), and nobody is left to see what runs. So the shell
+ * kills every program it started, background ones included, and theirs,
+ * before it ends; `exit` leaves them running. shd, which started it, could
+ * not do it afterwards: once the shell has ended, its orphans have no
+ * parent, and nothing tells whose they were. */
 #include "user.h"
 
 #define PROMPT "$ "
@@ -495,12 +502,17 @@ static int read_line(char *buf) {
 int main(void) {
     char line[LINE_SIZE];
     struct stat st;
-    console_input = fstat(STDIN, &st) == 0 && st.type == T_DEVICE;
+    int got_stat = fstat(STDIN, &st) == 0;
+    console_input = got_stat && st.type == T_DEVICE;
+    int connection_input = got_stat && st.type == T_SOCKET;
     printf("Type help for the list of commands.\n");
     for (;;) {
         printf(PROMPT);
         int n = console_input ? getline(line, sizeof line) : read_line(line);
         if (n < 0) {
+            if (connection_input) {
+                kill_descendants(getpid()); /* the hang-up: see the top */
+            }
             return last_status;
         }
         int status;

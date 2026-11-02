@@ -466,8 +466,9 @@ screen: all of them see its output, and what any of them types reaches it.
 
 Exit status: 0 when detached or when the VM ended (with --tcp: when left, or
 when the far end closed), 1 on an error (no server, no such VM, connection lost,
-console output failed, --screen without a window), 2 for bad arguments; Ctrl-C gives the usual status of an interrupted program (130
-on Linux, STATUS_CONTROL_C_EXIT on Windows).";
+console output failed, --screen without a window), 2 for bad arguments; Ctrl-C
+gives the usual status of an interrupted program (130 on Linux,
+STATUS_CONTROL_C_EXIT on Windows).";
 
 /// What Herald's command line asks for ([`parse_args`]).
 #[derive(Debug, Clone, PartialEq, Eq)]

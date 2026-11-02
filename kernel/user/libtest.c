@@ -4,8 +4,10 @@
  * filesystem. Prints a line for each check that fails and, at the end,
  * "libtest: N checks, F failed"; exits with F.
  *
- * `libtest feed N` is the child it runs: writes N numbered lines to its
- * output, in writes that cut lines in two. */
+ * `libtest feed N` is a child it runs: writes N numbered lines to its
+ * output, in writes that cut lines in two. `libtest nap` sleeps for long,
+ * and `libtest family` starts a `libtest nap` and sleeps too: the
+ * processes kill_descendants ends. */
 #include "user.h"
 
 static int checks;
@@ -335,9 +337,83 @@ static void test_inet(void) {
     check_str(resolve_error(ETIMEDOUT), strerror(ETIMEDOUT), "resolve_error of anything else");
 }
 
+/* Sleeps for long: until it is killed. */
+static int nap(void) {
+    sleep(1000000);
+    return 0;
+}
+
+static int family(void) {
+    if (spawn("/bin/libtest", (char *[]){"libtest", "nap", NULL}) < 0) {
+        return 1;
+    }
+    return nap();
+}
+
+/* The pid of a process whose parent is `ppid` (the first), or 0. */
+static int child_of(int ppid) {
+    struct procinfo info[16];
+    int n = procs(info, 16);
+    for (int i = 0; i < n && i < 16; i++) {
+        if ((int)info[i].ppid == ppid) {
+            return (int)info[i].pid;
+        }
+    }
+    return 0;
+}
+
+/* Whether process `pid` is in the table. */
+static int exists(int pid) {
+    struct procinfo info[16];
+    int n = procs(info, 16);
+    for (int i = 0; i < n && i < 16; i++) {
+        if ((int)info[i].pid == pid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void test_kill_descendants(void) {
+    check_eq(kill_descendants(getpid()), 0, "kill_descendants with no children");
+    /* Two children, one with a child of its own. */
+    int fam = spawn("/bin/libtest", (char *[]){"libtest", "family", NULL});
+    int napper = spawn("/bin/libtest", (char *[]){"libtest", "nap", NULL});
+    check(fam > 0 && napper > 0, "spawn a family and a napper");
+    int grandchild = 0;
+    for (int tries = 0; tries < 1000 && grandchild == 0; tries++) {
+        grandchild = child_of(fam);
+        if (grandchild == 0) {
+            sleep(1);
+        }
+    }
+    check(grandchild > 0, "the family's own child starts");
+    check_eq(kill_descendants(getpid()), 3, "kill_descendants kills the children and the grandchild");
+    int status = 0;
+    check_eq(wait(fam, &status), fam, "the family ends");
+    check_eq(status, -1, "killed");
+    check_eq(wait(napper, &status), napper, "the napper ends");
+    check_eq(status, -1, "killed too");
+    /* The grandchild, an orphan once its parent ended, is freed when it
+     * ends: it was killed, so that is soon. */
+    int tries = 0;
+    while (exists(grandchild) && tries < 1000) {
+        sleep(1);
+        tries++;
+    }
+    check(!exists(grandchild), "the grandchild ends");
+    check_eq(kill_descendants(getpid()), 0, "nothing left to kill");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "feed") == 0) {
         return feed(atoi(argv[2]));
+    }
+    if (argc == 2 && strcmp(argv[1], "nap") == 0) {
+        return nap();
+    }
+    if (argc == 2 && strcmp(argv[1], "family") == 0) {
+        return family();
     }
     test_inet();
     test_strings();
@@ -347,6 +423,7 @@ int main(int argc, char **argv) {
     test_merge();
     test_malloc();
     test_reader();
+    test_kill_descendants();
     printf("libtest: %d checks, %d failed\n", checks, failures);
     return failures;
 }
