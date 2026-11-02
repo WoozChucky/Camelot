@@ -307,8 +307,10 @@ int getline(char *buf, int size) {
 
 const char *strerror(int err) {
     switch (err) {
+    case EPERM:
+        return "operation not permitted";
     case ENOENT:
-        return "no such program";
+        return "no such file or directory";
     case E2BIG:
         return "argument list too long";
     case ENOEXEC:
@@ -321,15 +323,53 @@ const char *strerror(int err) {
         return "no free process slot";
     case ENOMEM:
         return "out of memory";
+    case EACCES:
+        return "not a regular file";
     case EFAULT:
         return "bad address";
+    case EEXIST:
+        return "file exists";
+    case ENODEV:
+        return "no such device";
+    case ENOTDIR:
+        return "not a directory";
+    case EISDIR:
+        return "is a directory";
     case EINVAL:
         return "invalid argument";
+    case ENFILE:
+        return "too many open files in the system";
+    case EMFILE:
+        return "too many open files";
+    case EFBIG:
+        return "file too large";
+    case ENOSPC:
+        return "no space left on the disk";
+    case ESPIPE:
+        return "not seekable";
+    case EROFS:
+        return "read-only filesystem";
+    case EPIPE:
+        return "broken pipe";
+    case ENAMETOOLONG:
+        return "name too long";
     case ENOSYS:
         return "no such system call";
+    case ENOTEMPTY:
+        return "directory not empty";
     default:
         return "unknown error";
     }
+}
+
+int stat(const char *path, struct stat *st) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return fd;
+    }
+    int r = fstat(fd, st);
+    close(fd);
+    return r;
 }
 
 void spin(uint n) {

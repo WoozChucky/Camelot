@@ -1,10 +1,13 @@
-/* The ELF32 executables the kernel loads into user space (elf.c). Only what
- * the loader reads: the file header and the program headers. */
+/* The ELF32 executables the kernel loads into user space (elf.c), from a
+ * file or from the kernel image. Only what the loader reads: the file header
+ * and the program headers. */
 #ifndef CAMELOT_ELF_H
 #define CAMELOT_ELF_H
 
 #include "types.h"
 #include "vm.h"
+
+struct inode;
 
 #define ELF_MAGIC 0x464c457fu /* "\x7fELF", read as a little-endian word */
 #define ELFCLASS32 1
@@ -56,14 +59,28 @@ struct elf32_phdr {
  * something wrong with the image). */
 #define ELF_OUT_OF_MEMORY "out of memory"
 
-/* Loads the executable `image` (`size` bytes) into the user part of `pt`:
- * every PT_LOAD segment goes into fresh zeroed pages, mapped with U and the
- * segment's permissions. Returns NULL and sets *entry and *end (the page
- * boundary after the highest segment, where the heap can start), or returns
- * what is wrong with the image. Segments must lie in [USER_BASE,
- * USER_LOAD_TOP) and not share pages, and the entry point must be 4-byte
- * aligned and in an executable one. On an error, the pages mapped so far
- * stay in `pt` for uvm_free() to release. */
-const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry, u32 *end);
+/* An executable to load: `size` bytes that `read` copies out, from an image
+ * in memory (an embedded program) or a file (exec.c). */
+struct elf_file {
+    u32 size;
+    /* Copies the `n` bytes at `off` (off + n <= size) to `dst`; false if
+     * it can't. */
+    bool (*read)(const struct elf_file *f, void *dst, u32 off, u32 n);
+    const u8 *image;     /* an image in memory */
+    struct inode *inode; /* a file, locked */
+};
+
+/* Loads the executable `f` into the user part of `pt`: every PT_LOAD
+ * segment goes into fresh zeroed pages, mapped with U and the segment's
+ * permissions. Returns NULL and sets *entry and *end (the page boundary
+ * after the highest segment, where the heap can start), or returns what is
+ * wrong with the image. Segments must lie in [USER_BASE, USER_LOAD_TOP) and
+ * not share pages, and the entry point must be 4-byte aligned and in an
+ * executable one. On an error, the pages mapped so far stay in `pt` for
+ * uvm_free() to release. */
+const char *elf_load(pagetable_t pt, const struct elf_file *f, u32 *entry, u32 *end);
+
+/* An elf_file for the `size`-byte image at `image`. */
+void elf_from_memory(struct elf_file *f, const u8 *image, u32 size);
 
 #endif

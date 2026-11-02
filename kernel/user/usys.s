@@ -16,6 +16,17 @@
     .equ SYS_wait, 8
     .equ SYS_sbrk, 9
     .equ SYS_uptime, 10
+    .equ SYS_open, 11
+    .equ SYS_close, 12
+    .equ SYS_lseek, 13
+    .equ SYS_fstat, 14
+    .equ SYS_mkdir, 15
+    .equ SYS_unlink, 16
+    .equ SYS_link, 17
+    .equ SYS_chdir, 18
+    .equ SYS_dup, 19
+    .equ SYS_pipe, 20
+    .equ SYS_exec, 21
 
     .text
 
@@ -61,7 +72,7 @@ sleep:
     ecall
     ret
 
-# int spawn(const char *name, char *const argv[])
+# int spawn(const char *path, char *const argv[])
     .globl spawn
 spawn:
     li    a7, SYS_spawn
@@ -86,6 +97,83 @@ sbrk:
     .globl uptime
 uptime:
     li    a7, SYS_uptime
+    ecall
+    ret
+
+# int open(const char *path, int flags)
+    .globl open
+open:
+    li    a7, SYS_open
+    ecall
+    ret
+
+# int close(int fd)
+    .globl close
+close:
+    li    a7, SYS_close
+    ecall
+    ret
+
+# int lseek(int fd, int offset, int whence)
+    .globl lseek
+lseek:
+    li    a7, SYS_lseek
+    ecall
+    ret
+
+# int fstat(int fd, struct stat *st)
+    .globl fstat
+fstat:
+    li    a7, SYS_fstat
+    ecall
+    ret
+
+# int mkdir(const char *path)
+    .globl mkdir
+mkdir:
+    li    a7, SYS_mkdir
+    ecall
+    ret
+
+# int unlink(const char *path)
+    .globl unlink
+unlink:
+    li    a7, SYS_unlink
+    ecall
+    ret
+
+# int link(const char *old, const char *new)
+    .globl link
+link:
+    li    a7, SYS_link
+    ecall
+    ret
+
+# int chdir(const char *path)
+    .globl chdir
+chdir:
+    li    a7, SYS_chdir
+    ecall
+    ret
+
+# int dup(int fd)
+    .globl dup
+dup:
+    li    a7, SYS_dup
+    ecall
+    ret
+
+# int pipe(int *fds)
+    .globl pipe
+pipe:
+    li    a7, SYS_pipe
+    ecall
+    ret
+
+# int exec(const char *path, char *const argv[]): returns only on an error
+    .globl exec
+exec:
+    li    a7, SYS_exec
     ecall
     ret
 

@@ -1,7 +1,7 @@
 /* The filesystem (docs/camelot-fs.md; spec section 10, "Kernel
  * filesystem"), after xv6's fs.c: mounting, the block allocator, inodes,
- * file contents, directories and paths, and the create/unlink operations
- * the file system calls (#67) will use. The log is in log.c.
+ * file contents, directories and paths, and the create/unlink/link
+ * operations the file system calls (sysfile.c) use. The log is in log.c.
  *
  * Locking, as in xv6 but without spinlocks (kernel code is never
  * preempted, so code between two sleeps runs alone):
@@ -78,7 +78,8 @@ static const char *check_superblock(const struct superblock *sb, u32 disk_sector
 
 /* Frees the inodes a crash left allocated with no links. fs_unlink() takes
  * a file's last link in one transaction, and the last iput() frees it in
- * another, when whoever still used it (an open file, #67) lets go; a crash
+ * another, when whoever still used it (an open file, a working directory)
+ * lets go; a crash
  * in between leaves it on the disk, unnamed (docs/camelot-fs.md, "Link
  * count"). Each is freed in a transaction of its own, by iput() as it would
  * have been. The root is never one: if its count is 0 the disk is broken,
@@ -326,8 +327,7 @@ void iunlock(struct inode *ip) {
     wakeup(ip);
 }
 
-/* Frees every block of locked inode `ip` and makes it empty. */
-static void itrunc(struct inode *ip) {
+void itrunc(struct inode *ip) {
     for (u32 i = 0; i < NDIRECT; i++) {
         if (ip->addrs[i] != 0) {
             bfree(ip->dev, ip->addrs[i]);
@@ -575,10 +575,17 @@ static const char *skipelem(const char *path, char *name, bool *too_long) {
     return path;
 }
 
-/* namei() and nameiparent(): walks `path` from the root. With `parent`,
- * stops one name early and copies that name to `name`. */
+/* namei() and nameiparent(): walks `path` from the root, or from the
+ * working directory if it doesn't start with `/`. With `parent`, stops one
+ * name early and copies that name to `name`. */
 static struct inode *namex(const char *path, bool parent, char *name, int *err) {
-    struct inode *ip = iget(fs_dev, ROOTINO);
+    struct proc *p = myproc();
+    struct inode *ip;
+    if (*path != '/' && p != NULL && p->cwd != NULL) {
+        ip = idup(p->cwd);
+    } else {
+        ip = iget(fs_dev, ROOTINO);
+    }
     bool too_long;
     while ((path = skipelem(path, name, &too_long)) != NULL) {
         if (too_long) {
@@ -639,9 +646,20 @@ struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, int *e
     char name[DIRSIZ + 1];
     struct inode *dp = nameiparent(path, name, err);
     if (dp == NULL) {
+        /* A path with no last name is the root, which exists. */
+        if (*err == -EINVAL) {
+            *err = -EEXIST;
+        }
         return NULL;
     }
     ilock(dp);
+    if (dp->nlink == 0) {
+        /* Removed while still in use (as a working directory): an entry
+         * added now would be lost with it. */
+        iunlockput(dp);
+        *err = -ENOENT;
+        return NULL;
+    }
     struct inode *ip = dirlookup(dp, name, NULL);
     if (ip != NULL) {
         iunlockput(dp);
@@ -747,4 +765,54 @@ int fs_unlink(const char *path) {
     iupdate(ip);
     iunlockput(ip);
     return 0;
+}
+
+int fs_link(const char *old, const char *new) {
+    if (fs_readonly) {
+        return -EROFS;
+    }
+    int err;
+    struct inode *ip = namei(old, &err);
+    if (ip == NULL) {
+        return err;
+    }
+    ilock(ip);
+    if (ip->type == T_DIR) {
+        /* A directory has one name, in its parent: its `..` says which. */
+        iunlockput(ip);
+        return -EPERM;
+    }
+    /* The link first, then the entry, both in the caller's transaction; a
+     * failure below takes the link back. */
+    ip->nlink++;
+    iupdate(ip);
+    iunlock(ip);
+
+    char name[DIRSIZ + 1];
+    struct inode *dp = nameiparent(new, name, &err);
+    if (dp == NULL) {
+        if (err == -EINVAL) {
+            err = -EEXIST; /* `/`: the root */
+        }
+        goto undo;
+    }
+    ilock(dp);
+    if (dp->nlink == 0) {
+        err = -ENOENT;
+    } else {
+        err = dirlink(dp, name, ip->inum);
+    }
+    iunlockput(dp);
+    if (err < 0) {
+        goto undo;
+    }
+    iput(ip);
+    return 0;
+
+undo:
+    ilock(ip);
+    ip->nlink--;
+    iupdate(ip);
+    iunlockput(ip);
+    return err;
 }

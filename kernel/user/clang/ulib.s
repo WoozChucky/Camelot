@@ -552,7 +552,7 @@ vfprintf:                               # @vfprintf
 	bnez	a1, .LBB9_56
 # %bb.55:                               #   in Loop: Header=BB9_2 Depth=1
 .Lpcrel_hi2:
-	auipc	a0, %pcrel_hi(.L.str.12)
+	auipc	a0, %pcrel_hi(.L.str.27)
 	addi	a1, a0, %pcrel_lo(.Lpcrel_hi2)
 .LBB9_56:                               #   in Loop: Header=BB9_2 Depth=1
 	li	a2, 0
@@ -781,115 +781,55 @@ getline:                                # @getline
 	.type	strerror,@function
 strerror:                               # @strerror
 # %bb.0:
-	addi	a0, a0, -2
-	li	a1, 36
-	bltu	a1, a0, .LBB13_7
+	addi	a0, a0, -1
+	li	a1, 38
+	bltu	a1, a0, .LBB13_2
 # %bb.1:
 	slli	a0, a0, 2
 .Lpcrel_hi5:
-	auipc	a1, %pcrel_hi(.LJTI13_0)
+	auipc	a1, %pcrel_hi(.Lswitch.table.strerror)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi5)
 	add	a0, a1, a0
-	lw	a1, 0(a0)
-.Lpcrel_hi4:
-	auipc	a0, %pcrel_hi(.L.str.1)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi4)
-	jr	a1
+	lw	a0, 0(a0)
+	ret
 .LBB13_2:
-.Lpcrel_hi6:
-	auipc	a0, %pcrel_hi(.L.str.2)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi6)
-	ret
-.LBB13_3:
-.Lpcrel_hi7:
-	auipc	a0, %pcrel_hi(.L.str.3)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi7)
-	ret
-.LBB13_4:
-.Lpcrel_hi10:
-	auipc	a0, %pcrel_hi(.L.str.6)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi10)
-	ret
-.LBB13_5:
-.Lpcrel_hi11:
-	auipc	a0, %pcrel_hi(.L.str.7)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi11)
-	ret
-.LBB13_6:
-.Lpcrel_hi12:
-	auipc	a0, %pcrel_hi(.L.str.8)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi12)
-	ret
-.LBB13_7:
-.Lpcrel_hi15:
-	auipc	a0, %pcrel_hi(.L.str.11)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi15)
-.LBB13_8:
-	ret
-.LBB13_9:
-.Lpcrel_hi8:
-	auipc	a0, %pcrel_hi(.L.str.4)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi8)
-	ret
-.LBB13_10:
-.Lpcrel_hi9:
-	auipc	a0, %pcrel_hi(.L.str.5)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi9)
-	ret
-.LBB13_11:
-.Lpcrel_hi14:
-	auipc	a0, %pcrel_hi(.L.str.10)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi14)
-	ret
-.LBB13_12:
-.Lpcrel_hi13:
-	auipc	a0, %pcrel_hi(.L.str.9)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi13)
+.Lpcrel_hi4:
+	auipc	a0, %pcrel_hi(.L.str.26)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi4)
 	ret
 .Lfunc_end13:
 	.size	strerror, .Lfunc_end13-strerror
-	.section	.rodata,"a",@progbits
-	.p2align	2, 0x0
-.LJTI13_0:
-	.word	.LBB13_8
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_2
-	.word	.LBB13_3
-	.word	.LBB13_9
-	.word	.LBB13_10
-	.word	.LBB13_4
-	.word	.LBB13_5
-	.word	.LBB13_7
-	.word	.LBB13_6
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_12
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_7
-	.word	.LBB13_11
                                         # -- End function
-	.text
+	.globl	stat                            # -- Begin function stat
+	.p2align	2
+	.type	stat,@function
+stat:                                   # @stat
+# %bb.0:
+	addi	sp, sp, -16
+	sw	ra, 12(sp)                      # 4-byte Folded Spill
+	sw	s0, 8(sp)                       # 4-byte Folded Spill
+	sw	s1, 4(sp)                       # 4-byte Folded Spill
+	mv	s0, a1
+	li	a1, 0
+	call	open
+	bltz	a0, .LBB14_2
+# %bb.1:
+	mv	s1, a0
+	mv	a1, s0
+	call	fstat
+	mv	s0, a0
+	mv	a0, s1
+	call	close
+	mv	a0, s0
+.LBB14_2:
+	lw	ra, 12(sp)                      # 4-byte Folded Reload
+	lw	s0, 8(sp)                       # 4-byte Folded Reload
+	lw	s1, 4(sp)                       # 4-byte Folded Reload
+	addi	sp, sp, 16
+	ret
+.Lfunc_end14:
+	.size	stat, .Lfunc_end14-stat
+                                        # -- End function
 	.globl	spin                            # -- Begin function spin
 	.p2align	2
 	.type	spin,@function
@@ -898,18 +838,18 @@ spin:                                   # @spin
 	addi	sp, sp, -16
 	sw	zero, 12(sp)
 	lw	a1, 12(sp)
-	bgeu	a1, a0, .LBB14_2
-.LBB14_1:                               # =>This Inner Loop Header: Depth=1
+	bgeu	a1, a0, .LBB15_2
+.LBB15_1:                               # =>This Inner Loop Header: Depth=1
 	lw	a1, 12(sp)
 	addi	a1, a1, 1
 	sw	a1, 12(sp)
 	lw	a1, 12(sp)
-	bltu	a1, a0, .LBB14_1
-.LBB14_2:
+	bltu	a1, a0, .LBB15_1
+.LBB15_2:
 	addi	sp, sp, 16
 	ret
-.Lfunc_end14:
-	.size	spin, .Lfunc_end14-spin
+.Lfunc_end15:
+	.size	spin, .Lfunc_end15-spin
                                         # -- End function
 	.p2align	2                               # -- Begin function emit_number
 	.type	emit_number,@function
@@ -933,51 +873,51 @@ emit_number:                            # @emit_number
 	li	s4, 0
 	li	a0, 10
 	addi	a3, sp, 9
-	j	.LBB15_3
-.LBB15_1:                               #   in Loop: Header=BB15_3 Depth=1
+	j	.LBB16_3
+.LBB16_1:                               #   in Loop: Header=BB16_3 Depth=1
 	addi	a5, a5, 87
-.LBB15_2:                               #   in Loop: Header=BB15_3 Depth=1
+.LBB16_2:                               #   in Loop: Header=BB16_3 Depth=1
 	add	a6, a3, s4
 	sb	a5, 0(a6)
 	addi	s4, s4, 1
-	bltu	a4, a2, .LBB15_5
-.LBB15_3:                               # =>This Inner Loop Header: Depth=1
+	bltu	a4, a2, .LBB16_5
+.LBB16_3:                               # =>This Inner Loop Header: Depth=1
 	mv	a4, a1
 	divu	a1, a1, a2
 	mul	a5, a1, a2
 	sub	a5, a4, a5
-	bgeu	a5, a0, .LBB15_1
-# %bb.4:                                #   in Loop: Header=BB15_3 Depth=1
+	bgeu	a5, a0, .LBB16_1
+# %bb.4:                                #   in Loop: Header=BB16_3 Depth=1
 	addi	a5, a5, 48
-	j	.LBB15_2
-.LBB15_5:
+	j	.LBB16_2
+.LBB16_5:
 	lw	a1, 8(s3)
 	lw	a0, 4(s3)
 	addi	s1, s0, 16
-	beqz	a1, .LBB15_22
+	beqz	a1, .LBB16_22
 # %bb.6:
-	bnez	a0, .LBB15_23
+	bnez	a0, .LBB16_23
 # %bb.7:
-	beqz	s2, .LBB15_14
+	beqz	s2, .LBB16_14
 # %bb.8:
 	lw	a0, 4(s0)
 	li	a1, 64
-	bne	a0, a1, .LBB15_13
+	bne	a0, a1, .LBB16_13
 # %bb.9:
 	lw	a0, 12(s0)
-	bnez	a0, .LBB15_12
+	bnez	a0, .LBB16_12
 # %bb.10:
 	lw	a0, 0(s0)
 	li	a2, 64
 	mv	a1, s1
 	call	write
-	bgez	a0, .LBB15_12
+	bgez	a0, .LBB16_12
 # %bb.11:
 	sw	a0, 12(s0)
-.LBB15_12:
+.LBB16_12:
 	li	a0, 0
 	sw	zero, 4(s0)
-.LBB15_13:
+.LBB16_13:
 	add	a0, s0, a0
 	li	a1, 45
 	sb	a1, 16(a0)
@@ -987,22 +927,22 @@ emit_number:                            # @emit_number
 	addi	a1, a1, 1
 	sw	a0, 4(s0)
 	sw	a1, 8(s0)
-.LBB15_14:
+.LBB16_14:
 	lw	a0, 0(s3)
 	add	a1, s2, s4
 	sub	s5, a0, a1
-	blez	s5, .LBB15_30
+	blez	s5, .LBB16_30
 # %bb.15:
 	lw	a0, 4(s0)
 	addi	s5, s5, 1
 	li	s6, 64
 	li	s7, 48
 	li	s8, 1
-	j	.LBB15_18
-.LBB15_16:                              #   in Loop: Header=BB15_18 Depth=1
+	j	.LBB16_18
+.LBB16_16:                              #   in Loop: Header=BB16_18 Depth=1
 	li	a0, 0
 	sw	zero, 4(s0)
-.LBB15_17:                              #   in Loop: Header=BB15_18 Depth=1
+.LBB16_17:                              #   in Loop: Header=BB16_18 Depth=1
 	add	a0, s1, a0
 	sb	s7, 0(a0)
 	lw	a0, 4(s0)
@@ -1012,44 +952,44 @@ emit_number:                            # @emit_number
 	addi	a1, a1, 1
 	sw	a0, 4(s0)
 	sw	a1, 8(s0)
-	bge	s8, s5, .LBB15_30
-.LBB15_18:                              # =>This Inner Loop Header: Depth=1
-	bne	a0, s6, .LBB15_17
-# %bb.19:                               #   in Loop: Header=BB15_18 Depth=1
+	bge	s8, s5, .LBB16_30
+.LBB16_18:                              # =>This Inner Loop Header: Depth=1
+	bne	a0, s6, .LBB16_17
+# %bb.19:                               #   in Loop: Header=BB16_18 Depth=1
 	lw	a0, 12(s0)
-	bnez	a0, .LBB15_16
-# %bb.20:                               #   in Loop: Header=BB15_18 Depth=1
+	bnez	a0, .LBB16_16
+# %bb.20:                               #   in Loop: Header=BB16_18 Depth=1
 	lw	a0, 0(s0)
 	li	a2, 64
 	mv	a1, s1
 	call	write
-	bgez	a0, .LBB15_16
-# %bb.21:                               #   in Loop: Header=BB15_18 Depth=1
+	bgez	a0, .LBB16_16
+# %bb.21:                               #   in Loop: Header=BB16_18 Depth=1
 	sw	a0, 12(s0)
-	j	.LBB15_16
-.LBB15_22:
-	beqz	a0, .LBB15_47
-.LBB15_23:
-	beqz	s2, .LBB15_30
+	j	.LBB16_16
+.LBB16_22:
+	beqz	a0, .LBB16_47
+.LBB16_23:
+	beqz	s2, .LBB16_30
 # %bb.24:
 	lw	a0, 4(s0)
 	li	a1, 64
-	bne	a0, a1, .LBB15_29
+	bne	a0, a1, .LBB16_29
 # %bb.25:
 	lw	a0, 12(s0)
-	bnez	a0, .LBB15_28
+	bnez	a0, .LBB16_28
 # %bb.26:
 	lw	a0, 0(s0)
 	li	a2, 64
 	mv	a1, s1
 	call	write
-	bgez	a0, .LBB15_28
+	bgez	a0, .LBB16_28
 # %bb.27:
 	sw	a0, 12(s0)
-.LBB15_28:
+.LBB16_28:
 	li	a0, 0
 	sw	zero, 4(s0)
-.LBB15_29:
+.LBB16_29:
 	add	a0, s0, a0
 	li	a1, 45
 	sb	a1, 16(a0)
@@ -1059,17 +999,17 @@ emit_number:                            # @emit_number
 	addi	a1, a1, 1
 	sw	a0, 4(s0)
 	sw	a1, 8(s0)
-.LBB15_30:
+.LBB16_30:
 	addi	s8, s4, -1
 	lw	a0, 4(s0)
 	addi	s5, sp, 9
 	li	s6, 64
 	li	s7, 1
-	j	.LBB15_33
-.LBB15_31:                              #   in Loop: Header=BB15_33 Depth=1
+	j	.LBB16_33
+.LBB16_31:                              #   in Loop: Header=BB16_33 Depth=1
 	li	a0, 0
 	sw	zero, 4(s0)
-.LBB15_32:                              #   in Loop: Header=BB15_33 Depth=1
+.LBB16_32:                              #   in Loop: Header=BB16_33 Depth=1
 	add	a0, s1, a0
 	sb	s9, 0(a0)
 	lw	a0, 4(s0)
@@ -1080,41 +1020,41 @@ emit_number:                            # @emit_number
 	addi	a1, a1, 1
 	sw	a0, 4(s0)
 	sw	a1, 8(s0)
-	bge	s7, a2, .LBB15_37
-.LBB15_33:                              # =>This Inner Loop Header: Depth=1
+	bge	s7, a2, .LBB16_37
+.LBB16_33:                              # =>This Inner Loop Header: Depth=1
 	add	a1, s5, s8
 	lbu	s9, 0(a1)
-	bne	a0, s6, .LBB15_32
-# %bb.34:                               #   in Loop: Header=BB15_33 Depth=1
+	bne	a0, s6, .LBB16_32
+# %bb.34:                               #   in Loop: Header=BB16_33 Depth=1
 	lw	a0, 12(s0)
-	bnez	a0, .LBB15_31
-# %bb.35:                               #   in Loop: Header=BB15_33 Depth=1
+	bnez	a0, .LBB16_31
+# %bb.35:                               #   in Loop: Header=BB16_33 Depth=1
 	lw	a0, 0(s0)
 	li	a2, 64
 	mv	a1, s1
 	call	write
-	bgez	a0, .LBB15_31
-# %bb.36:                               #   in Loop: Header=BB15_33 Depth=1
+	bgez	a0, .LBB16_31
+# %bb.36:                               #   in Loop: Header=BB16_33 Depth=1
 	sw	a0, 12(s0)
-	j	.LBB15_31
-.LBB15_37:
+	j	.LBB16_31
+.LBB16_37:
 	lw	a1, 4(s3)
-	beqz	a1, .LBB15_46
+	beqz	a1, .LBB16_46
 # %bb.38:
 	lw	a1, 0(s3)
 	add	s2, s2, s4
 	sub	s2, a1, s2
-	blez	s2, .LBB15_46
+	blez	s2, .LBB16_46
 # %bb.39:
 	addi	s2, s2, 1
 	li	s3, 64
 	li	s4, 32
 	li	s5, 1
-	j	.LBB15_42
-.LBB15_40:                              #   in Loop: Header=BB15_42 Depth=1
+	j	.LBB16_42
+.LBB16_40:                              #   in Loop: Header=BB16_42 Depth=1
 	li	a0, 0
 	sw	zero, 4(s0)
-.LBB15_41:                              #   in Loop: Header=BB15_42 Depth=1
+.LBB16_41:                              #   in Loop: Header=BB16_42 Depth=1
 	add	a0, s1, a0
 	sb	s4, 0(a0)
 	lw	a0, 4(s0)
@@ -1124,22 +1064,22 @@ emit_number:                            # @emit_number
 	addi	a1, a1, 1
 	sw	a0, 4(s0)
 	sw	a1, 8(s0)
-	bge	s5, s2, .LBB15_46
-.LBB15_42:                              # =>This Inner Loop Header: Depth=1
-	bne	a0, s3, .LBB15_41
-# %bb.43:                               #   in Loop: Header=BB15_42 Depth=1
+	bge	s5, s2, .LBB16_46
+.LBB16_42:                              # =>This Inner Loop Header: Depth=1
+	bne	a0, s3, .LBB16_41
+# %bb.43:                               #   in Loop: Header=BB16_42 Depth=1
 	lw	a0, 12(s0)
-	bnez	a0, .LBB15_40
-# %bb.44:                               #   in Loop: Header=BB15_42 Depth=1
+	bnez	a0, .LBB16_40
+# %bb.44:                               #   in Loop: Header=BB16_42 Depth=1
 	lw	a0, 0(s0)
 	li	a2, 64
 	mv	a1, s1
 	call	write
-	bgez	a0, .LBB15_40
-# %bb.45:                               #   in Loop: Header=BB15_42 Depth=1
+	bgez	a0, .LBB16_40
+# %bb.45:                               #   in Loop: Header=BB16_42 Depth=1
 	sw	a0, 12(s0)
-	j	.LBB15_40
-.LBB15_46:
+	j	.LBB16_40
+.LBB16_46:
 	lw	ra, 60(sp)                      # 4-byte Folded Reload
 	lw	s0, 56(sp)                      # 4-byte Folded Reload
 	lw	s1, 52(sp)                      # 4-byte Folded Reload
@@ -1153,22 +1093,22 @@ emit_number:                            # @emit_number
 	lw	s9, 20(sp)                      # 4-byte Folded Reload
 	addi	sp, sp, 64
 	ret
-.LBB15_47:
+.LBB16_47:
 	lw	a0, 0(s3)
 	add	a1, s2, s4
 	sub	s5, a0, a1
-	blez	s5, .LBB15_23
+	blez	s5, .LBB16_23
 # %bb.48:
 	lw	a0, 4(s0)
 	addi	s5, s5, 1
 	li	s6, 64
 	li	s7, 32
 	li	s8, 1
-	j	.LBB15_51
-.LBB15_49:                              #   in Loop: Header=BB15_51 Depth=1
+	j	.LBB16_51
+.LBB16_49:                              #   in Loop: Header=BB16_51 Depth=1
 	li	a0, 0
 	sw	zero, 4(s0)
-.LBB15_50:                              #   in Loop: Header=BB15_51 Depth=1
+.LBB16_50:                              #   in Loop: Header=BB16_51 Depth=1
 	add	a0, s1, a0
 	sb	s7, 0(a0)
 	lw	a0, 4(s0)
@@ -1178,23 +1118,23 @@ emit_number:                            # @emit_number
 	addi	a1, a1, 1
 	sw	a0, 4(s0)
 	sw	a1, 8(s0)
-	bge	s8, s5, .LBB15_23
-.LBB15_51:                              # =>This Inner Loop Header: Depth=1
-	bne	a0, s6, .LBB15_50
-# %bb.52:                               #   in Loop: Header=BB15_51 Depth=1
+	bge	s8, s5, .LBB16_23
+.LBB16_51:                              # =>This Inner Loop Header: Depth=1
+	bne	a0, s6, .LBB16_50
+# %bb.52:                               #   in Loop: Header=BB16_51 Depth=1
 	lw	a0, 12(s0)
-	bnez	a0, .LBB15_49
-# %bb.53:                               #   in Loop: Header=BB15_51 Depth=1
+	bnez	a0, .LBB16_49
+# %bb.53:                               #   in Loop: Header=BB16_51 Depth=1
 	lw	a0, 0(s0)
 	li	a2, 64
 	mv	a1, s1
 	call	write
-	bgez	a0, .LBB15_49
-# %bb.54:                               #   in Loop: Header=BB15_51 Depth=1
+	bgez	a0, .LBB16_49
+# %bb.54:                               #   in Loop: Header=BB16_51 Depth=1
 	sw	a0, 12(s0)
-	j	.LBB15_49
-.Lfunc_end15:
-	.size	emit_number, .Lfunc_end15-emit_number
+	j	.LBB16_49
+.Lfunc_end16:
+	.size	emit_number, .Lfunc_end16-emit_number
                                         # -- End function
 	.p2align	2                               # -- Begin function emit_text
 	.type	emit_text,@function
@@ -1217,18 +1157,18 @@ emit_text:                              # @emit_text
 	lw	a1, 4(a3)
 	mv	s0, a0
 	addi	s1, a0, 16
-	beqz	a1, .LBB16_19
-.LBB16_1:
-	blez	s2, .LBB16_9
+	beqz	a1, .LBB17_19
+.LBB17_1:
+	blez	s2, .LBB17_9
 # %bb.2:
 	lw	a0, 4(s0)
 	add	s5, s4, s2
 	li	s6, 64
-	j	.LBB16_5
-.LBB16_3:                               #   in Loop: Header=BB16_5 Depth=1
+	j	.LBB17_5
+.LBB17_3:                               #   in Loop: Header=BB17_5 Depth=1
 	li	a0, 0
 	sw	zero, 4(s0)
-.LBB16_4:                               #   in Loop: Header=BB16_5 Depth=1
+.LBB17_4:                               #   in Loop: Header=BB17_5 Depth=1
 	add	a0, s1, a0
 	sb	s7, 0(a0)
 	lw	a0, 4(s0)
@@ -1238,40 +1178,40 @@ emit_text:                              # @emit_text
 	addi	a1, a1, 1
 	sw	a0, 4(s0)
 	sw	a1, 8(s0)
-	beq	s4, s5, .LBB16_9
-.LBB16_5:                               # =>This Inner Loop Header: Depth=1
+	beq	s4, s5, .LBB17_9
+.LBB17_5:                               # =>This Inner Loop Header: Depth=1
 	lbu	s7, 0(s4)
-	bne	a0, s6, .LBB16_4
-# %bb.6:                                #   in Loop: Header=BB16_5 Depth=1
+	bne	a0, s6, .LBB17_4
+# %bb.6:                                #   in Loop: Header=BB17_5 Depth=1
 	lw	a0, 12(s0)
-	bnez	a0, .LBB16_3
-# %bb.7:                                #   in Loop: Header=BB16_5 Depth=1
+	bnez	a0, .LBB17_3
+# %bb.7:                                #   in Loop: Header=BB17_5 Depth=1
 	lw	a0, 0(s0)
 	li	a2, 64
 	mv	a1, s1
 	call	write
-	bgez	a0, .LBB16_3
-# %bb.8:                                #   in Loop: Header=BB16_5 Depth=1
+	bgez	a0, .LBB17_3
+# %bb.8:                                #   in Loop: Header=BB17_5 Depth=1
 	sw	a0, 12(s0)
-	j	.LBB16_3
-.LBB16_9:
+	j	.LBB17_3
+.LBB17_9:
 	lw	a0, 4(s3)
-	beqz	a0, .LBB16_18
+	beqz	a0, .LBB17_18
 # %bb.10:
 	lw	a0, 0(s3)
 	sub	s2, a0, s2
-	blez	s2, .LBB16_18
+	blez	s2, .LBB17_18
 # %bb.11:
 	lw	a0, 4(s0)
 	addi	s2, s2, 1
 	li	s3, 64
 	li	s4, 32
 	li	s5, 1
-	j	.LBB16_14
-.LBB16_12:                              #   in Loop: Header=BB16_14 Depth=1
+	j	.LBB17_14
+.LBB17_12:                              #   in Loop: Header=BB17_14 Depth=1
 	li	a0, 0
 	sw	zero, 4(s0)
-.LBB16_13:                              #   in Loop: Header=BB16_14 Depth=1
+.LBB17_13:                              #   in Loop: Header=BB17_14 Depth=1
 	add	a0, s1, a0
 	sb	s4, 0(a0)
 	lw	a0, 4(s0)
@@ -1281,22 +1221,22 @@ emit_text:                              # @emit_text
 	addi	a1, a1, 1
 	sw	a0, 4(s0)
 	sw	a1, 8(s0)
-	bge	s5, s2, .LBB16_18
-.LBB16_14:                              # =>This Inner Loop Header: Depth=1
-	bne	a0, s3, .LBB16_13
-# %bb.15:                               #   in Loop: Header=BB16_14 Depth=1
+	bge	s5, s2, .LBB17_18
+.LBB17_14:                              # =>This Inner Loop Header: Depth=1
+	bne	a0, s3, .LBB17_13
+# %bb.15:                               #   in Loop: Header=BB17_14 Depth=1
 	lw	a0, 12(s0)
-	bnez	a0, .LBB16_12
-# %bb.16:                               #   in Loop: Header=BB16_14 Depth=1
+	bnez	a0, .LBB17_12
+# %bb.16:                               #   in Loop: Header=BB17_14 Depth=1
 	lw	a0, 0(s0)
 	li	a2, 64
 	mv	a1, s1
 	call	write
-	bgez	a0, .LBB16_12
-# %bb.17:                               #   in Loop: Header=BB16_14 Depth=1
+	bgez	a0, .LBB17_12
+# %bb.17:                               #   in Loop: Header=BB17_14 Depth=1
 	sw	a0, 12(s0)
-	j	.LBB16_12
-.LBB16_18:
+	j	.LBB17_12
+.LBB17_18:
 	lw	ra, 44(sp)                      # 4-byte Folded Reload
 	lw	s0, 40(sp)                      # 4-byte Folded Reload
 	lw	s1, 36(sp)                      # 4-byte Folded Reload
@@ -1309,21 +1249,21 @@ emit_text:                              # @emit_text
 	lw	s8, 8(sp)                       # 4-byte Folded Reload
 	addi	sp, sp, 48
 	ret
-.LBB16_19:
+.LBB17_19:
 	lw	a0, 0(s3)
 	sub	s5, a0, s2
-	blez	s5, .LBB16_1
+	blez	s5, .LBB17_1
 # %bb.20:
 	lw	a0, 4(s0)
 	addi	s5, s5, 1
 	li	s6, 64
 	li	s7, 32
 	li	s8, 1
-	j	.LBB16_23
-.LBB16_21:                              #   in Loop: Header=BB16_23 Depth=1
+	j	.LBB17_23
+.LBB17_21:                              #   in Loop: Header=BB17_23 Depth=1
 	li	a0, 0
 	sw	zero, 4(s0)
-.LBB16_22:                              #   in Loop: Header=BB16_23 Depth=1
+.LBB17_22:                              #   in Loop: Header=BB17_23 Depth=1
 	add	a0, s1, a0
 	sb	s7, 0(a0)
 	lw	a0, 4(s0)
@@ -1333,23 +1273,23 @@ emit_text:                              # @emit_text
 	addi	a1, a1, 1
 	sw	a0, 4(s0)
 	sw	a1, 8(s0)
-	bge	s8, s5, .LBB16_1
-.LBB16_23:                              # =>This Inner Loop Header: Depth=1
-	bne	a0, s6, .LBB16_22
-# %bb.24:                               #   in Loop: Header=BB16_23 Depth=1
+	bge	s8, s5, .LBB17_1
+.LBB17_23:                              # =>This Inner Loop Header: Depth=1
+	bne	a0, s6, .LBB17_22
+# %bb.24:                               #   in Loop: Header=BB17_23 Depth=1
 	lw	a0, 12(s0)
-	bnez	a0, .LBB16_21
-# %bb.25:                               #   in Loop: Header=BB16_23 Depth=1
+	bnez	a0, .LBB17_21
+# %bb.25:                               #   in Loop: Header=BB17_23 Depth=1
 	lw	a0, 0(s0)
 	li	a2, 64
 	mv	a1, s1
 	call	write
-	bgez	a0, .LBB16_21
-# %bb.26:                               #   in Loop: Header=BB16_23 Depth=1
+	bgez	a0, .LBB17_21
+# %bb.26:                               #   in Loop: Header=BB17_23 Depth=1
 	sw	a0, 12(s0)
-	j	.LBB16_21
-.Lfunc_end16:
-	.size	emit_text, .Lfunc_end16-emit_text
+	j	.LBB17_21
+.Lfunc_end17:
+	.size	emit_text, .Lfunc_end17-emit_text
                                         # -- End function
 	.type	.L.str,@object                  # @.str
 	.section	.rodata.str1.1,"aMS",@progbits,1
@@ -1359,58 +1299,133 @@ emit_text:                              # @emit_text
 
 	.type	.L.str.1,@object                # @.str.1
 .L.str.1:
-	.asciz	"no such program"
-	.size	.L.str.1, 16
+	.asciz	"operation not permitted"
+	.size	.L.str.1, 24
 
 	.type	.L.str.2,@object                # @.str.2
 .L.str.2:
-	.asciz	"argument list too long"
-	.size	.L.str.2, 23
+	.asciz	"no such file or directory"
+	.size	.L.str.2, 26
 
 	.type	.L.str.3,@object                # @.str.3
 .L.str.3:
-	.asciz	"not an executable"
-	.size	.L.str.3, 18
+	.asciz	"argument list too long"
+	.size	.L.str.3, 23
 
 	.type	.L.str.4,@object                # @.str.4
 .L.str.4:
-	.asciz	"bad file descriptor"
-	.size	.L.str.4, 20
+	.asciz	"not an executable"
+	.size	.L.str.4, 18
 
 	.type	.L.str.5,@object                # @.str.5
 .L.str.5:
-	.asciz	"no such child"
-	.size	.L.str.5, 14
+	.asciz	"bad file descriptor"
+	.size	.L.str.5, 20
 
 	.type	.L.str.6,@object                # @.str.6
 .L.str.6:
-	.asciz	"no free process slot"
-	.size	.L.str.6, 21
+	.asciz	"no such child"
+	.size	.L.str.6, 14
 
 	.type	.L.str.7,@object                # @.str.7
 .L.str.7:
-	.asciz	"out of memory"
-	.size	.L.str.7, 14
+	.asciz	"no free process slot"
+	.size	.L.str.7, 21
 
 	.type	.L.str.8,@object                # @.str.8
 .L.str.8:
-	.asciz	"bad address"
-	.size	.L.str.8, 12
+	.asciz	"out of memory"
+	.size	.L.str.8, 14
 
 	.type	.L.str.9,@object                # @.str.9
 .L.str.9:
-	.asciz	"invalid argument"
-	.size	.L.str.9, 17
+	.asciz	"not a regular file"
+	.size	.L.str.9, 19
 
 	.type	.L.str.10,@object               # @.str.10
 .L.str.10:
-	.asciz	"no such system call"
-	.size	.L.str.10, 20
+	.asciz	"bad address"
+	.size	.L.str.10, 12
 
 	.type	.L.str.11,@object               # @.str.11
 .L.str.11:
+	.asciz	"file exists"
+	.size	.L.str.11, 12
+
+	.type	.L.str.12,@object               # @.str.12
+.L.str.12:
+	.asciz	"no such device"
+	.size	.L.str.12, 15
+
+	.type	.L.str.13,@object               # @.str.13
+.L.str.13:
+	.asciz	"not a directory"
+	.size	.L.str.13, 16
+
+	.type	.L.str.14,@object               # @.str.14
+.L.str.14:
+	.asciz	"is a directory"
+	.size	.L.str.14, 15
+
+	.type	.L.str.15,@object               # @.str.15
+.L.str.15:
+	.asciz	"invalid argument"
+	.size	.L.str.15, 17
+
+	.type	.L.str.16,@object               # @.str.16
+.L.str.16:
+	.asciz	"too many open files in the system"
+	.size	.L.str.16, 34
+
+	.type	.L.str.17,@object               # @.str.17
+.L.str.17:
+	.asciz	"too many open files"
+	.size	.L.str.17, 20
+
+	.type	.L.str.18,@object               # @.str.18
+.L.str.18:
+	.asciz	"file too large"
+	.size	.L.str.18, 15
+
+	.type	.L.str.19,@object               # @.str.19
+.L.str.19:
+	.asciz	"no space left on the disk"
+	.size	.L.str.19, 26
+
+	.type	.L.str.20,@object               # @.str.20
+.L.str.20:
+	.asciz	"not seekable"
+	.size	.L.str.20, 13
+
+	.type	.L.str.21,@object               # @.str.21
+.L.str.21:
+	.asciz	"read-only filesystem"
+	.size	.L.str.21, 21
+
+	.type	.L.str.22,@object               # @.str.22
+.L.str.22:
+	.asciz	"broken pipe"
+	.size	.L.str.22, 12
+
+	.type	.L.str.23,@object               # @.str.23
+.L.str.23:
+	.asciz	"name too long"
+	.size	.L.str.23, 14
+
+	.type	.L.str.24,@object               # @.str.24
+.L.str.24:
+	.asciz	"no such system call"
+	.size	.L.str.24, 20
+
+	.type	.L.str.25,@object               # @.str.25
+.L.str.25:
+	.asciz	"directory not empty"
+	.size	.L.str.25, 20
+
+	.type	.L.str.26,@object               # @.str.26
+.L.str.26:
 	.asciz	"unknown error"
-	.size	.L.str.11, 14
+	.size	.L.str.26, 14
 
 	.type	.L__const.vfprintf.hex,@object  # @__const.vfprintf.hex
 	.section	.rodata,"a",@progbits
@@ -1421,11 +1436,56 @@ emit_text:                              # @emit_text
 	.word	1                               # 0x1
 	.size	.L__const.vfprintf.hex, 12
 
-	.type	.L.str.12,@object               # @.str.12
+	.type	.L.str.27,@object               # @.str.27
 	.section	.rodata.str1.1,"aMS",@progbits,1
-.L.str.12:
+.L.str.27:
 	.asciz	"(null)"
-	.size	.L.str.12, 7
+	.size	.L.str.27, 7
+
+	.type	.Lswitch.table.strerror,@object # @switch.table.strerror
+	.section	.rodata,"a",@progbits
+	.p2align	2, 0x0
+.Lswitch.table.strerror:
+	.word	.L.str.1
+	.word	.L.str.2
+	.word	.L.str.26
+	.word	.L.str.26
+	.word	.L.str.26
+	.word	.L.str.26
+	.word	.L.str.3
+	.word	.L.str.4
+	.word	.L.str.5
+	.word	.L.str.6
+	.word	.L.str.7
+	.word	.L.str.8
+	.word	.L.str.9
+	.word	.L.str.10
+	.word	.L.str.26
+	.word	.L.str.26
+	.word	.L.str.11
+	.word	.L.str.26
+	.word	.L.str.12
+	.word	.L.str.13
+	.word	.L.str.14
+	.word	.L.str.15
+	.word	.L.str.16
+	.word	.L.str.17
+	.word	.L.str.26
+	.word	.L.str.26
+	.word	.L.str.18
+	.word	.L.str.19
+	.word	.L.str.20
+	.word	.L.str.21
+	.word	.L.str.26
+	.word	.L.str.22
+	.word	.L.str.26
+	.word	.L.str.26
+	.word	.L.str.26
+	.word	.L.str.23
+	.word	.L.str.26
+	.word	.L.str.24
+	.word	.L.str.25
+	.size	.Lswitch.table.strerror, 156
 
 	.section	".note.GNU-stack","",@progbits
 	.addrsig

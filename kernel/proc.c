@@ -13,8 +13,11 @@
  * in sleep() when it has to wait, or in proc_exit(). */
 #include "proc.h"
 #include "elf.h"
+#include "exec.h"
+#include "file.h"
 #include "kalloc.h"
 #include "kprintf.h"
+#include "log.h"
 #include "memlayout.h"
 #include "riscv.h"
 #include "string.h"
@@ -33,8 +36,11 @@ static u32 next_pid = 1;
  * ran last. */
 static u32 next_slot;
 
-/* The first process (proc_run_init), and its exit status once it ended. */
+/* The first process (proc_run_init), the program it runs, and its exit
+ * status once it ended. */
 static struct proc *init_proc;
+static const char *init_path;
+static const char *init_name;
 static int init_status;
 
 struct proc *myproc(void) {
@@ -91,7 +97,7 @@ static void set_name(struct proc *p, const char *name) {
 }
 
 /* Puts `args` at the top of the stack page `stack` (mapped at USER_STACK) and
- * points the frame's sp, a0 and a1 at them:
+ * points frame `f`'s sp, a0 and a1 at them:
  *
  *   USER_TOP    the strings, argv[0]'s first, NUL-terminated
  *               padding to a multiple of 4
@@ -100,7 +106,7 @@ static void set_name(struct proc *p, const char *name) {
  *   sp          the program's first stack frame grows down from here
  *
  * ARG_MAX and MAXARG keep all of it well inside the page. */
-static void push_args(struct proc *p, u8 *stack, const struct proc_args *args) {
+static void push_args(struct trap_frame *f, u8 *stack, const struct proc_args *args) {
     u32 strings = USER_TOP - args->len;
     u32 argv = (strings & ~3u) - 4 * (args->argc + 1);
     memcpy(stack + (strings - USER_STACK), args->strings, args->len);
@@ -111,14 +117,15 @@ static void push_args(struct proc *p, u8 *stack, const struct proc_args *args) {
         at += strlen(args->strings + (at - strings)) + 1;
     }
     slots[args->argc] = 0;
-    p->frame->regs[REG_SP] = argv & ~15u;
-    p->frame->regs[REG_A0] = args->argc;
-    p->frame->regs[REG_A1] = argv;
+    f->regs[REG_SP] = argv & ~15u;
+    f->regs[REG_A0] = args->argc;
+    f->regs[REG_A1] = argv;
 }
 
 /* A free slot, cleared, with a kernel stack; NULL with *err set to -EAGAIN
- * (no free slot) or -ENOMEM if it can't. The slot stays PROC_UNUSED until
- * proc_ready(). */
+ * (no free slot) or -ENOMEM if it can't. The slot is PROC_NEW until
+ * proc_ready(), so that nobody else takes it while proc_create() sleeps
+ * reading the program from the disk. */
 static struct proc *proc_alloc(int *err) {
     struct proc *p = NULL;
     for (u32 i = 0; i < NPROC; i++) {
@@ -137,6 +144,7 @@ static struct proc *proc_alloc(int *err) {
         *err = -ENOMEM;
         return NULL;
     }
+    p->state = PROC_NEW;
     return p;
 }
 
@@ -149,55 +157,113 @@ static struct proc *proc_ready(struct proc *p, const char *name) {
     return p;
 }
 
-struct proc *proc_create(const struct user_program *prog, const struct proc_args *args, int *err) {
-    struct proc *p = proc_alloc(err);
-    if (p == NULL) {
-        return NULL;
-    }
-    p->pagetable = uvm_create();
-    if (p->pagetable == NULL) {
-        *err = -ENOMEM;
-        proc_free(p);
-        return NULL;
-    }
+/* The trap frame at the top of `p`'s kernel stack page. */
+static struct trap_frame *frame_of(struct proc *p) {
+    return (struct trap_frame *)((u8 *)p->kstack + PGSIZE - TRAP_FRAME_SIZE);
+}
 
+/* A new user address space for `prog`: its segments and a zeroed stack
+ * page with `args` at the top. Returns its page table and sets *heap (the
+ * page after the last segment) and frame `f`: all zero but sepc (the entry
+ * point), sp, a0 and a1. Or returns NULL with *err = -ENOMEM, or -ENOEXEC
+ * with "WHO: PATH: REASON" printed, leaving `f` alone and nothing
+ * allocated. */
+static pagetable_t build_space(const struct elf_file *prog, const char *who, const char *path,
+                               const struct proc_args *args, struct trap_frame *f, u32 *heap, int *err) {
+    pagetable_t pt = uvm_create();
+    if (pt == NULL) {
+        *err = -ENOMEM;
+        return NULL;
+    }
     u32 entry, end;
-    const char *load_err = elf_load(p->pagetable, prog->elf, prog->size, &entry, &end);
+    const char *load_err = elf_load(pt, prog, &entry, &end);
     if (load_err != NULL) {
         if (strcmp(load_err, ELF_OUT_OF_MEMORY) == 0) {
             *err = -ENOMEM;
         } else {
-            kprintf("spawn: %s: %s\n", prog->name, load_err);
+            kprintf("%s: %s: %s\n", who, path, load_err);
             *err = -ENOEXEC;
         }
-        proc_free(p);
+        uvm_free(pt);
         return NULL;
     }
     u8 *stack = kzalloc();
-    if (stack == NULL || map_pages(p->pagetable, USER_STACK, (u32)(uintptr)stack, USER_STACK_SIZE,
-                                   PTE_U | PTE_R | PTE_W) != 0) {
+    if (stack == NULL ||
+        map_pages(pt, USER_STACK, (u32)(uintptr)stack, USER_STACK_SIZE, PTE_U | PTE_R | PTE_W) != 0) {
         if (stack != NULL) {
             kfree(stack);
         }
         *err = -ENOMEM;
+        uvm_free(pt);
+        return NULL;
+    }
+    *heap = end;
+    /* The user registers: all zero but pc, sp and the arguments. */
+    memset(f, 0, sizeof *f);
+    f->sepc = entry;
+    push_args(f, stack, args);
+    return pt;
+}
+
+struct proc *proc_create(const struct elf_file *prog, const char *path, const char *name,
+                         const struct proc_args *args, int *err) {
+    struct proc *p = proc_alloc(err);
+    if (p == NULL) {
+        return NULL;
+    }
+    p->frame = frame_of(p);
+    u32 heap;
+    p->pagetable = build_space(prog, "spawn", path, args, p->frame, &heap, err);
+    if (p->pagetable == NULL) {
         proc_free(p);
         return NULL;
     }
-    p->heap_base = end;
-    p->brk = p->heap_base;
-
-    /* The user registers: all zero but pc, sp and the arguments. */
-    p->frame = (struct trap_frame *)((u8 *)p->kstack + PGSIZE - TRAP_FRAME_SIZE);
-    memset(p->frame, 0, sizeof *p->frame);
-    p->frame->sepc = entry;
-    push_args(p, stack, args);
+    p->heap_base = heap;
+    p->brk = heap;
 
     /* The kernel thread: its first swtch() lands in proc_start, on the empty
      * kernel stack below the frame. */
     p->context.ra = (u32)(uintptr)proc_start;
     p->context.sp = (u32)(uintptr)p->frame;
     p->parent = current;
-    return proc_ready(p, prog->name);
+    /* What the child inherits: the standard descriptors, sharing their open
+     * files (and offsets), and the working directory. A descriptor above 2
+     * stays the parent's own, so a pipe end the parent keeps for itself
+     * doesn't keep the pipe open in every child. */
+    if (current != NULL) {
+        for (u32 fd = 0; fd <= FD_STDERR; fd++) {
+            if (current->ofile[fd] != NULL) {
+                p->ofile[fd] = filedup(current->ofile[fd]);
+            }
+        }
+        if (current->cwd != NULL) {
+            p->cwd = idup(current->cwd);
+        }
+    }
+    return proc_ready(p, name);
+}
+
+int proc_exec(const struct elf_file *prog, const char *path, const char *name, const struct proc_args *args) {
+    struct proc *p = current;
+    pagetable_t old = p->pagetable;
+    u32 heap;
+    int err;
+    pagetable_t pt = build_space(prog, "exec", path, args, p->frame, &heap, &err);
+    if (pt == NULL) {
+        return err;
+    }
+    p->pagetable = pt;
+    p->heap_base = heap;
+    p->brk = heap;
+    set_name(p, name);
+    /* The new table holds the kernel's mappings too: switch to it before
+     * freeing the old one, which satp points at. */
+    w_satp(MAKE_SATP(pt));
+    sfence_vma();
+    if (old != NULL) {
+        uvm_free(old);
+    }
+    return (int)args->argc;
 }
 
 struct proc *kproc_create(const char *name, void (*fn)(void), const char **err) {
@@ -215,22 +281,42 @@ struct proc *kproc_create(const char *name, void (*fn)(void), const char **err) 
     return proc_ready(p, name);
 }
 
-bool proc_run_init(const struct user_program *prog, int *status) {
-    struct proc_args *args = kzalloc();
-    if (args == NULL) {
-        kprintf("cannot start %s: out of memory\n", prog->name);
-        return false;
+/* The first process's kernel thread starts here, from the scheduler: it
+ * gets the console as its descriptors and the root as its working
+ * directory, loads its program (which may sleep on the disk, so it has to
+ * be done by a process) and goes to U-mode. */
+static void init_start(void) {
+    struct proc *p = current;
+    p->ofile[FD_STDIN] = file_console(true, false);
+    p->ofile[FD_STDOUT] = file_console(false, true);
+    p->ofile[FD_STDERR] = file_console(false, true);
+    if (fs_mounted) {
+        p->cwd = iget(fs_dev, ROOTINO);
     }
-    args->argc = 1;
-    args->len = strlen(prog->name) + 1;
-    memcpy(args->strings, prog->name, args->len);
+    int err = exec_init(init_path, init_name);
+    if (err < 0) {
+        kprintf("cannot start %s: error %d\n", init_path, -err);
+        proc_exit(-1);
+    }
+    user_trap_return(p->frame);
+}
+
+bool proc_run_init(const char *path, const char *name, int *status) {
     int err;
-    init_proc = proc_create(prog, args, &err);
-    kfree(args);
-    if (init_proc == NULL) {
-        kprintf("cannot start %s: error %d\n", prog->name, -err);
+    struct proc *p = proc_alloc(&err);
+    if (p == NULL) {
+        kprintf("cannot start %s: error %d\n", path, -err);
         return false;
     }
+    /* No address space yet: until its exec, it runs on the kernel page
+     * table, like a kernel process. */
+    p->frame = frame_of(p);
+    memset(p->frame, 0, sizeof *p->frame);
+    p->context.ra = (u32)(uintptr)init_start;
+    p->context.sp = (u32)(uintptr)p->frame;
+    init_path = path;
+    init_name = name;
+    init_proc = proc_ready(p, name);
     scheduler();
     *status = init_status;
     return true;
@@ -259,7 +345,7 @@ static bool any_process(void) {
 }
 
 /* The page table to run `p` on: its own, or the kernel's for a kernel
- * process. */
+ * process (and for the first process until it has loaded its program). */
 static pagetable_t proc_pagetable(struct proc *p) {
     if (p->pagetable != NULL) {
         return p->pagetable;
@@ -338,6 +424,22 @@ void wakeup(const void *chan) {
 
 void proc_exit(int status) {
     struct proc *p = current;
+    /* Its files and working directory, while it can still sleep: closing a
+     * file or letting go of a directory may free an unlinked inode, a
+     * transaction. */
+    for (u32 fd = 0; fd < NOFILE; fd++) {
+        if (p->ofile[fd] != NULL) {
+            struct file *f = p->ofile[fd];
+            p->ofile[fd] = NULL;
+            fileclose(f);
+        }
+    }
+    if (p->cwd != NULL) {
+        begin_op();
+        iput(p->cwd);
+        end_op();
+        p->cwd = NULL;
+    }
     for (u32 i = 0; i < NPROC; i++) {
         struct proc *child = &procs[i];
         if (child->state == PROC_UNUSED || child->parent != p) {

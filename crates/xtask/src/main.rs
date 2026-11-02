@@ -16,7 +16,7 @@ tasks:
                after compiling kernel/user/*.c to kernel/user/clang/*.s (clang) and
                regenerating kernel/userprogs.s from kernel/user (merlin-as + merlin-ld)
   fs           build the root filesystem image (target/camelot-fs.img): kernel/fs/ at /,
-               the user programs in /bin (merlin-as + merlin-ld; no LLVM needed)
+               the user programs in /bin (merlin-as + merlin-ld; no LLVM needed), /dev/console
                -o PATH: output file; --size N: blocks (1 KiB each, default 2048)
   hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
                with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
