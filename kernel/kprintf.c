@@ -1,0 +1,182 @@
+/* kprintf: the kernel's printf. See kprintf.h for the supported formats. */
+#include "kprintf.h"
+#include "uart.h"
+
+/* Counts what it emits so every entry point can return a length. */
+struct out {
+    kputc_fn put;
+    void *ctx;
+    int count;
+};
+
+static void emit(struct out *o, char c) {
+    o->put(c, o->ctx);
+    o->count++;
+}
+
+static void emit_pad(struct out *o, char pad, int n) {
+    while (n > 0) {
+        emit(o, pad);
+        n--;
+    }
+}
+
+/* Prints `val` in `base` (10 or 16) with an optional minus sign, padded to
+ * `width` with spaces before the sign or zeros after it. */
+static void emit_number(struct out *o, u32 val, u32 base, bool negative, int width, bool zero_pad) {
+    char digits[10]; /* 4294967295 has 10 digits; 0xffffffff has 8 */
+    int n = 0;
+    do {
+        u32 d = val % base;
+        digits[n] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+        n++;
+        val /= base;
+    } while (val != 0);
+
+    int len = n + (negative ? 1 : 0);
+    if (!zero_pad) {
+        emit_pad(o, ' ', width - len);
+    }
+    if (negative) {
+        emit(o, '-');
+    }
+    if (zero_pad) {
+        emit_pad(o, '0', width - len);
+    }
+    while (n > 0) {
+        n--;
+        emit(o, digits[n]);
+    }
+}
+
+int kvformat(kputc_fn put, void *ctx, const char *fmt, va_list ap) {
+    struct out o;
+    o.put = put;
+    o.ctx = ctx;
+    o.count = 0;
+
+    while (*fmt) {
+        char c = *fmt++;
+        if (c != '%') {
+            emit(&o, c);
+            continue;
+        }
+
+        const char *spec = fmt; /* for echoing unknown conversions */
+        bool zero_pad = false;
+        int width = 0;
+        if (*fmt == '0') {
+            zero_pad = true;
+            fmt++;
+        }
+        while (*fmt >= '0' && *fmt <= '9') {
+            width = width * 10 + (*fmt - '0');
+            fmt++;
+        }
+        if (*fmt == 'l') {
+            fmt++;
+        }
+
+        char conv = *fmt;
+        if (conv == '\0') {
+            emit(&o, '%'); /* lone '%' at the end */
+            break;
+        }
+        fmt++;
+
+        switch (conv) {
+        case 'd': {
+            i32 v = va_arg(ap, i32);
+            /* Negate as unsigned so INT_MIN works. */
+            u32 mag = v < 0 ? 0u - (u32)v : (u32)v;
+            emit_number(&o, mag, 10, v < 0, width, zero_pad);
+            break;
+        }
+        case 'u':
+            emit_number(&o, va_arg(ap, u32), 10, false, width, zero_pad);
+            break;
+        case 'x':
+            emit_number(&o, va_arg(ap, u32), 16, false, width, zero_pad);
+            break;
+        case 'p':
+            emit(&o, '0');
+            emit(&o, 'x');
+            emit_number(&o, (u32)(uintptr)va_arg(ap, void *), 16, false, 8, true);
+            break;
+        case 's': {
+            const char *s = va_arg(ap, const char *);
+            if (s == NULL) {
+                s = "(null)";
+            }
+            int len = 0;
+            while (s[len]) {
+                len++;
+            }
+            emit_pad(&o, ' ', width - len);
+            while (*s) {
+                emit(&o, *s++);
+            }
+            break;
+        }
+        case 'c':
+            emit_pad(&o, ' ', width - 1);
+            emit(&o, (char)va_arg(ap, int));
+            break;
+        case '%':
+            emit(&o, '%');
+            break;
+        default:
+            /* Unknown conversion: print it as written. */
+            emit(&o, '%');
+            while (spec < fmt) {
+                emit(&o, *spec++);
+            }
+            break;
+        }
+    }
+    return o.count;
+}
+
+static void uart_sink(char c, void *ctx) {
+    (void)ctx;
+    uart_putc(c);
+}
+
+int kprintf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = kvformat(uart_sink, NULL, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+struct buf {
+    char *p;
+    usize size;
+    usize len;
+};
+
+static void buf_sink(char c, void *ctx) {
+    struct buf *b = (struct buf *)ctx;
+    if (b->len + 1 < b->size) {
+        b->p[b->len] = c;
+    }
+    b->len++;
+}
+
+int ksnprintf(char *buf, usize size, const char *fmt, ...) {
+    struct buf b;
+    b.p = buf;
+    b.size = size;
+    b.len = 0;
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = kvformat(buf_sink, &b, fmt, ap);
+    va_end(ap);
+
+    if (size > 0) {
+        buf[b.len < size ? b.len : size - 1] = '\0';
+    }
+    return n;
+}
