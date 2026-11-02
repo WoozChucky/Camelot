@@ -25,6 +25,7 @@ crates/avalon-proto     Avalon protocol (framing, messages, Connection), shared 
 crates/avalon           the Avalon hypervisor server: VM table, one thread per running VM (run_for slices), consoles, RAM budget
 crates/avalon-client    the client layer: VM control and disk management operations, parsers/formatters for addresses, sizes, clocks, disk sources (shared by Round Table and Pendragon; reuses grail::parse_ram_mib/parse_clock)
 crates/round-table      the Round Table control CLI: argument parsing and text output over avalon-client (src/lib.rs `run`, main.rs is a thin wrapper)
+crates/lake             the Lake storage server: a directory of disk images served over the protocol (one writer or many readers per image); Grail's client side is grail::lake::LakeDisk
 crates/merlin           the C-subset compiler, C to .s (src/codegen.rs explains the stack frames and calling convention)
 crates/merlin-as        the assembler
 crates/merlin-ld        the linker (src/reloc.rs explains every relocation it applies)

@@ -18,7 +18,9 @@ const USAGE: &str = "usage: grail [options] <program.elf>
                   a nominal 10 MHz clock to software
   --disk IMG      attach the image file IMG as the next disk (spec section 9.6),
                   read-write: the program's writes change the file. IMG must be a
-                  whole number of 512-byte sectors. Repeat for more disks (up to 8)
+                  whole number of 512-byte sectors. Repeat for more disks (up to 8).
+                  IMG may also be lake://host:port/name, image 'name' on a Lake
+                  storage server (port 7401 if left out)
   --disk-ro IMG   the same, read-only
   --fb            show the framebuffer in a window (Windows only)
   --headless      no window, even with --fb (the default)
@@ -61,7 +63,7 @@ fn main() -> ExitCode {
                 Some(hz) => config.clock_hz = Some(hz),
                 None => return ExitCode::from(2),
             },
-            "--disk" | "--disk-ro" => match value(&mut args, &a, |s| Ok(DiskConfig::file(s))) {
+            "--disk" | "--disk-ro" => match value(&mut args, &a, DiskConfig::parse) {
                 Some(disk) => config.disks.push(disk.with_read_only(a == "--disk-ro")),
                 None => return ExitCode::from(2),
             },

@@ -109,6 +109,11 @@ fn invalid_profiles() {
         })
     };
     let missing = examples_dir().join("disk/no-such-image.img");
+    // A port nobody listens on: a Lake disk there cannot be attached.
+    let no_lake = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    };
     let bad = [
         HardwareProfile::with_ram(0),
         HardwareProfile::with_ram(4095),
@@ -132,8 +137,15 @@ fn invalid_profiles() {
         },
         HardwareProfile {
             devices: vec![disk(DiskSource::Lake {
-                addr: "127.0.0.1:7401".into(),
+                addr: no_lake.clone(),
                 name: "root".into(),
+            })],
+            ..HardwareProfile::with_ram(MIB)
+        },
+        HardwareProfile {
+            devices: vec![disk(DiskSource::Lake {
+                addr: no_lake,
+                name: "not/a/name".into(),
             })],
             ..HardwareProfile::with_ram(MIB)
         },

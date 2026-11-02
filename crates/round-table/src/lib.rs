@@ -52,9 +52,8 @@ create options:
                   reports a nominal 10 MHz clock
   --disk SRC      attach a disk, read-write: the path of an image file on
                   Avalon's host (relative to Avalon's working directory), or
-                  lake://ADDR/NAME for the image NAME on a Lake server (not
-                  served by Avalon yet: Lake, #39). Repeat for more disks,
-                  in order
+                  lake://ADDR/NAME for the image NAME on a Lake server.
+                  Repeat for more disks, in order
   --disk-ro SRC   attach a disk read-only
   --start         start the VM as soon as it is created
 

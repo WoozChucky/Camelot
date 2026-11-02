@@ -11,12 +11,12 @@ use crate::outbox::Outbox;
 use crate::vm::Vm;
 use crate::{lock, machine_config, Fail};
 use avalon_proto::{
-    kind_of, type_name, validate_name, Connection, Error, ErrorCode, Frame, HardwareProfile, Message,
-    MessageKind, VmRef, VmSummary, DEFAULT_AVALON_ADDR,
+    default_port, kind_of, type_name, validate_name, Connection, Error, ErrorCode, Frame, HardwareProfile,
+    Message, MessageKind, VmRef, VmSummary, DEFAULT_AVALON_ADDR,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -70,29 +70,7 @@ impl Default for Config {
 /// Parses a `--listen` value: `host:port`, or just a host or IP address (the default
 /// port, 7400). IPv6 addresses with a port go in brackets: `[::1]:7400`.
 pub fn parse_listen(s: &str) -> Result<SocketAddr, String> {
-    let default_port = DEFAULT_AVALON_ADDR
-        .parse::<SocketAddr>()
-        .expect("the default address parses")
-        .port();
-    if let Ok(addr) = s.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    if let Ok(ip) = s.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, default_port));
-    }
-    let resolved = if s.is_empty() || s.contains(char::is_whitespace) {
-        Err(io::ErrorKind::InvalidInput.into())
-    } else if s.contains(':') {
-        s.to_socket_addrs()
-    } else {
-        (s, default_port).to_socket_addrs()
-    };
-    match resolved.map(|mut addrs| addrs.next()) {
-        Ok(Some(addr)) => Ok(addr),
-        _ => Err(format!(
-            "'{s}' is not an address to listen on (examples: 127.0.0.1:7400, 0.0.0.0, localhost:7500)"
-        )),
-    }
+    avalon_proto::parse_listen(s, default_port(DEFAULT_AVALON_ADDR))
 }
 
 /// Parses a `--max-ram` value, a whole number of MiB (at least 1). Returns bytes.

@@ -6,6 +6,7 @@
 
 use crate::block::{BlockBackend, FileDisk, MemDisk, MAX_SECTORS, SECTOR_SIZE};
 use crate::bus::{MAX_DISKS, RAM_BASE};
+use crate::lake::LakeDisk;
 use std::path::PathBuf;
 
 pub const MIB: usize = 1024 * 1024;
@@ -47,8 +48,8 @@ pub struct DiskConfig {
     pub read_only: bool,
 }
 
-/// Where a configured disk's sectors live. A host with a backend of its own (a network
-/// disk, say) passes it to [`crate::Machine::with_backends`] instead.
+/// Where a configured disk's sectors live. A host with a backend of its own passes it
+/// to [`crate::Machine::with_backends`] instead.
 #[derive(Clone, PartialEq, Eq)]
 pub enum DiskSource {
     /// An image file on the host, a whole number of 512-byte sectors. It is opened when
@@ -57,6 +58,10 @@ pub enum DiskSource {
     /// A disk in host memory that starts as a copy of these bytes (a whole number of
     /// sectors) and is gone when the machine is.
     Memory(Vec<u8>),
+    /// Image `name` on the Lake storage server at `addr` (`host:port`): a network disk
+    /// ([`LakeDisk`]), attached when the machine is built and detached when it is
+    /// dropped.
+    Lake { addr: String, name: String },
 }
 
 impl std::fmt::Debug for DiskSource {
@@ -65,6 +70,7 @@ impl std::fmt::Debug for DiskSource {
             DiskSource::File(path) => f.debug_tuple("File").field(path).finish(),
             // Not the bytes: an image can be megabytes long.
             DiskSource::Memory(image) => write!(f, "Memory({} bytes)", image.len()),
+            DiskSource::Lake { addr, name } => write!(f, "Lake({}{addr}/{name})", avalon_proto::LAKE_SCHEME),
         }
     }
 }
@@ -86,6 +92,27 @@ impl DiskConfig {
         }
     }
 
+    /// A read-write disk on a Lake server: image `name` at `addr` (`host:port`).
+    pub fn lake(addr: impl Into<String>, name: impl Into<String>) -> Self {
+        DiskConfig {
+            source: DiskSource::Lake {
+                addr: addr.into(),
+                name: name.into(),
+            },
+            read_only: false,
+        }
+    }
+
+    /// A read-write disk from a command-line argument: `lake://addr/name` is a disk on
+    /// a Lake server (`addr` is `host:port`, or a host alone for port 7401), anything
+    /// else the path of an image file.
+    pub fn parse(arg: &str) -> Result<Self, String> {
+        Ok(match avalon_proto::DiskSource::parse(arg)? {
+            avalon_proto::DiskSource::File(path) => DiskConfig::file(path),
+            avalon_proto::DiskSource::Lake { addr, name } => DiskConfig::lake(addr, name),
+        })
+    }
+
     pub fn with_read_only(self, read_only: bool) -> Self {
         DiskConfig { read_only, ..self }
     }
@@ -100,6 +127,10 @@ impl DiskConfig {
             DiskSource::Memory(image) => match MemDisk::from_image(image.clone()) {
                 Ok(disk) => Ok(Box::new(disk.with_read_only(self.read_only))),
                 Err(e) => Err(format!("memory image: {e}")),
+            },
+            DiskSource::Lake { addr, name } => match LakeDisk::open(addr, name, self.read_only) {
+                Ok(disk) => Ok(Box::new(disk)),
+                Err(e) => Err(e),
             },
         }
     }
@@ -144,15 +175,22 @@ impl MachineConfig {
         if self.disks.len() > MAX_DISKS {
             return Err(format!("{} disks, at most {MAX_DISKS}", self.disks.len()));
         }
-        // Image files are checked when they are opened (`Machine::new`).
+        // Image files and Lake disks are checked when they are opened (`Machine::new`).
         for disk in &self.disks {
-            if let DiskSource::Memory(image) = &disk.source {
-                let len = image.len();
-                if !len.is_multiple_of(SECTOR_SIZE) || (len / SECTOR_SIZE) as u64 > MAX_SECTORS {
-                    return Err(format!(
-                        "memory disk of {len} bytes must be a whole number of {SECTOR_SIZE}-byte sectors, at most {MAX_SECTORS}"
-                    ));
+            match &disk.source {
+                DiskSource::Memory(image) => {
+                    let len = image.len();
+                    if !len.is_multiple_of(SECTOR_SIZE) || (len / SECTOR_SIZE) as u64 > MAX_SECTORS {
+                        return Err(format!(
+                            "memory disk of {len} bytes must be a whole number of {SECTOR_SIZE}-byte sectors, at most {MAX_SECTORS}"
+                        ));
+                    }
                 }
+                DiskSource::Lake { addr, name } => {
+                    avalon_proto::validate_name(name)
+                        .map_err(|e| format!("disk {}{addr}/{name}: {e}", avalon_proto::LAKE_SCHEME))?;
+                }
+                DiskSource::File(_) => {}
             }
         }
         Ok(())
@@ -305,6 +343,44 @@ mod tests {
         assert!(ro.read_only());
         let debug = format!("{:?}", DiskConfig::memory(vec![0; 1024]).source);
         assert_eq!(debug, "Memory(1024 bytes)");
+    }
+
+    #[test]
+    fn lake_disks() {
+        assert_eq!(
+            DiskConfig::parse("lake://127.0.0.1:7401/root").unwrap(),
+            DiskConfig::lake("127.0.0.1:7401", "root")
+        );
+        assert_eq!(
+            DiskConfig::parse("lake://storage/root").unwrap(),
+            DiskConfig::lake("storage:7401", "root")
+        );
+        assert_eq!(
+            DiskConfig::parse("images/root.img").unwrap(),
+            DiskConfig::file("images/root.img")
+        );
+        assert!(DiskConfig::parse("lake://storage/Bad Name").is_err());
+        let debug = format!("{:?}", DiskConfig::lake("h:1", "root").source);
+        assert_eq!(debug, "Lake(lake://h:1/root)");
+
+        // A bad name fails validation, before anything connects.
+        let config = MachineConfig {
+            disks: vec![DiskConfig::lake("127.0.0.1:7401", "../etc")],
+            ..MachineConfig::default()
+        };
+        let e = config.validate().unwrap_err();
+        assert!(e.starts_with("disk lake://127.0.0.1:7401/../etc: "), "{e}");
+
+        // Nothing listening: opening fails, with the disk's address in the message.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let addr = format!("127.0.0.1:{port}");
+        let e = DiskConfig::lake(&addr, "root").open().err().unwrap();
+        assert!(e.starts_with(&format!("lake://{addr}/root: ")), "{e}");
+        let e = DiskConfig::lake("no such host:1", "root").open().err().unwrap();
+        assert!(e.starts_with("lake://no such host:1/root: "), "{e}");
     }
 
     #[test]

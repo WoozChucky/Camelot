@@ -8,3 +8,5 @@ license.workspace = true
 [dependencies]
 excalibur = { path = "../excalibur" }
 elf32 = { path = "../elf32" }
+# The Avalon protocol, for disks on a Lake server (src/lake.rs).
+avalon-proto = { path = "../avalon-proto" }

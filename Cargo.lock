@@ -40,8 +40,20 @@ version = "0.1.0"
 name = "grail"
 version = "0.1.0"
 dependencies = [
+ "avalon-proto",
  "elf32",
  "excalibur",
+]
+
+[[package]]
+name = "lake"
+version = "0.1.0"
+dependencies = [
+ "avalon",
+ "avalon-proto",
+ "grail",
+ "merlin-as",
+ "merlin-ld",
 ]
 
 [[package]]
@@ -90,6 +102,7 @@ dependencies = [
  "avalon",
  "avalon-client",
  "avalon-proto",
+ "lake",
 ]
 
 [[package]]

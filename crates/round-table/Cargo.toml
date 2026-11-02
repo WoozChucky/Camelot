@@ -10,5 +10,7 @@ avalon-client = { path = "../avalon-client" }
 avalon-proto = { path = "../avalon-proto" }
 
 [dev-dependencies]
-# The integration tests run an Avalon server in process and drive it through Round Table.
+# The integration tests run an Avalon server, and a Lake server (tests/lake.rs), in
+# process and drive them through Round Table.
 avalon = { path = "../avalon" }
+lake = { path = "../lake" }
