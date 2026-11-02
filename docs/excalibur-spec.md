@@ -60,7 +60,7 @@ Immediates are sign-extended from their top bit. B and J immediates are multiple
 | 0010011 OP-IMM | `addi slti sltiu xori ori andi slli srli srai` |
 | 0110011 OP | `add sub sll slt sltu xor srl sra or and` (+ M: `mul mulh mulhsu mulhu div divu rem remu`, funct7=0000001) |
 | 0101111 AMO | A, funct3=010 (word): `lr.w sc.w amoswap.w amoadd.w amoxor.w amoand.w amoor.w amomin.w amomax.w amominu.w amomaxu.w`, each with `.aq`/`.rl`/`.aqrl` (section 4.1) |
-| 0001111 MISC-MEM | `fence`, `fence.tso`, `fence.i` (reserved `fm`/rd/rs1 encodings execute as a plain `fence`; Grail is single-hart, so all are no-ops) |
+| 0001111 MISC-MEM | `fence`, `fence.tso`, `fence.i` (reserved `fm`/rd/rs1 encodings execute as a plain `fence`; Grail's harts take turns one instruction at a time on one shared memory, so every access is visible to the others at once and all are no-ops) |
 | 1110011 SYSTEM | `ecall ebreak mret sret wfi sfence.vma csrrw csrrs csrrc csrrwi csrrsi csrrci` |
 | 0001011 custom-0 | Xcal: `xcal.dbg`, `xcal.halt` (section 9) |
 | 0101011 custom-1 | reserved for future Xcal extensions |
@@ -87,7 +87,7 @@ funct5[31:27] aq[26] rl[25] rs2[24:20] rs1[19:15] 010 rd[11:7] 0101111
 | 10000 / 10100 | `amomin.w` / `amomax.w` | rd = M; M = signed min / max(M, rs2) |
 | 11000 / 11100 | `amominu.w` / `amomaxu.w` | rd = M; M = unsigned min / max(M, rs2) |
 
-Other funct5 values (`amocas.w` of Zacas, ...) are reserved and raise illegal-instruction. Assembly writes the ordering bits as a suffix: none, `.aq`, `.rl` or `.aqrl` (`amoadd.w.aqrl`). The address is written `(rs1)`, or `0(rs1)`; there is no offset field. Grail runs one hart, one instruction at a time, so an AMO is atomic by construction and `aq`/`rl` change nothing; they are still encoded, decoded and disassembled.
+Other funct5 values (`amocas.w` of Zacas, ...) are reserved and raise illegal-instruction. Assembly writes the ordering bits as a suffix: none, `.aq`, `.rl` or `.aqrl` (`amoadd.w.aqrl`). The address is written `(rs1)`, or `0(rs1)`; there is no offset field. Grail runs its harts one instruction at a time, in turn (section 7, "Harts"), so an AMO is atomic by construction and `aq`/`rl` change nothing; they are still encoded, decoded and disassembled.
 
 Addresses (checked in this order):
 
@@ -95,14 +95,14 @@ Addresses (checked in this order):
 - **Translation** (Sv32): `lr.w` is checked and sets A like a load (load page fault, 13); `sc.w` and the AMOs like a store: the page must be writable, A and D are set, and a fault is a store/AMO page fault (15).
 - **Memory only**: atomics work on RAM and VRAM. On any other physical address (device registers, the boot ROM, unmapped space) `lr.w` raises a load access fault (5), `sc.w` and the AMOs a store/AMO access fault (7). Device registers are not read or written.
 
-**Reservations.** Each hart has one reservation set: the naturally aligned word `lr.w` read, by physical address (so two virtual mappings of a word share it). A new `lr.w` replaces it. `sc.w` succeeds only if the hart holds a reservation on the word it writes. A `sc.w` with no reservation at all fails without accessing memory: no translation, no page fault, no A/D update (it still traps if misaligned). With a reservation, the address is translated and checked first (faults as above, A/D set), then compared. The reservation is lost when:
+**Reservations.** Each hart has one reservation set (Grail keeps them all on the bus, so every write can be checked against every hart's): the naturally aligned word `lr.w` read, by physical address (so two virtual mappings of a word share it). A new `lr.w` replaces it. `sc.w` succeeds only if the hart holds a reservation on the word it writes. A `sc.w` with no reservation at all fails without accessing memory: no translation, no page fault, no A/D update (it still traps if misaligned). With a reservation, the address is translated and checked first (faults as above, A/D set), then compared. The reservation is lost when:
 
 - the hart executes any `sc.w`;
 - the hart takes a trap (exception or interrupt);
 - any write touches a byte of the reserved word: a store, an AMO, a successful `sc.w`, a hardware A/D update of a PTE (so an LR/SC update of a PTE cannot overwrite a bit the page walker just set), or a network card's receive DMA (section 9.8), which copies a frame into a buffer and writes its descriptor's `len` and `status` between two instructions, on its own. On a multi-hart machine this includes writes by other harts;
-- the hart stores to a device register: the store may start a DMA (the block device's, section 9.6) that writes RAM without a hart storing there.
+- the hart stores to a device register: the store may start a DMA (the block device's, section 9.6) that writes RAM without a hart storing there. A command written to a block device's `BLK_CMD` clears every hart's reservation, since its DMA may write any of them.
 
-The constrained LR/SC loop (an `lr.w`, a few ALU instructions and a `sc.w` to the same word) always succeeds on Grail unless an interrupt arrives in between, or a network card writes that word, in which case the loop retries.
+The constrained LR/SC loop (an `lr.w`, a few ALU instructions and a `sc.w` to the same word) always succeeds on a one-hart Grail unless an interrupt arrives in between, or a network card writes that word, in which case the loop retries. With several harts, another hart's write to the word between the `lr.w` and the `sc.w` makes it retry too; a `sc.w` fails only because another hart's write got there first, so some hart always makes progress (`examples/smp` counts the retries).
 
 ## 5. Privilege and CSRs
 
@@ -122,7 +122,7 @@ Minimum CSR set:
 | sstatus, sie, sip | 0x100, 0x104, 0x144 | restricted views of the M versions |
 | stvec, sscratch, sepc, scause, stval | 0x105, 0x140, 0x141, 0x142, 0x143 | |
 | satp | 0x180 | Sv32 paging, hardware-managed A/D bits, no TLB |
-| mhartid | 0xF14 | always 0 (single hart for now) |
+| mhartid | 0xF14 | the hart's index, 0 to N - 1 on an N-hart machine (section 7, "Harts") |
 | cycle/time/instret (+h) | 0xC00-0xC02, 0xC80-0xC82 | read-only counters |
 
 Accessing a CSR above the current privilege level, or writing a read-only CSR, raises illegal-instruction.
@@ -147,7 +147,7 @@ Interrupts are checked between instructions, priority MEI > MSI > MTI > SEI > SS
 
 Delegation: a trap is taken in S-mode when its bit is set in `medeleg` (exceptions) or `mideleg` (interrupts) and the hart is in S- or U-mode; a trap in M-mode always stays in M-mode. The writable `medeleg` bits are those of every implemented exception except ecall from M (mask 0xB3FF: causes 0-9, 12, 13, 15); the writable `mideleg` bits are SSI, STI and SEI (mask 0x222). M-level interrupts (MSI, MTI, MEI) cannot be delegated. An interrupt is taken in M-mode when it is pending, enabled in `mie`, not delegated, and either the hart is below M-mode or `mstatus.MIE` is set; a delegated one when the hart is in U-mode, or in S-mode with `mstatus.SIE` set. So while S-mode runs, the machine timer interrupts it regardless of `mstatus.MIE`. There is no Sstc extension (`stimecmp`): an S-mode kernel gets timer ticks from M-mode software that takes MTI, rearms `mtimecmp` and raises SSIP or STIP in `mip` (the Camelot kernel does this, section 10).
 
-Pending bits in `mip` come from the devices: MSIP and MTIP from the CLINT, MEIP from PLIC context 0, SEIP from PLIC context 1 (section 7.1). MEIP, MSIP and MTIP are read-only. SEIP is also software-writable: the value read is the OR of the software bit and the PLIC's signal, and `csrrs`/`csrrc` on `mip` modify the software bit only, so a read-modify-write never latches the PLIC's signal into it (as in the RISC-V privileged spec). STIP and SSIP are software-written.
+Each hart has its own CSRs, `mip` included. Pending bits in `mip` come from the devices: MSIP from the hart's `msip` and MTIP from its `mtimecmp` in the CLINT, MEIP from PLIC context 2·hart, SEIP from PLIC context 2·hart + 1 (section 7.1); hart 0's are context 0 and 1. MEIP, MSIP and MTIP are read-only. SEIP is also software-writable: the value read is the OR of the software bit and the PLIC's signal, and `csrrs`/`csrrc` on `mip` modify the software bit only, so a read-modify-write never latches the PLIC's signal into it (as in the RISC-V privileged spec). STIP and SSIP are software-written.
 
 ## 7. Memory map
 
@@ -155,8 +155,8 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 
 | Range | Device |
 |---|---|
-| 0x0000_1000 - 0x0000_1FFF | Boot ROM (reset vector 0x1000, jumps to 0x8000_0000) |
-| 0x0200_0000 - 0x0200_FFFF | CLINT: msip @+0x0, mtimecmp @+0x4000, mtime @+0xBFF8 |
+| 0x0000_1000 - 0x0000_1FFF | Boot ROM (reset vector 0x1000, jumps to the program's entry point; the other harts park at 0x1020, see "Boot") |
+| 0x0200_0000 - 0x0200_FFFF | CLINT: hart `i`'s msip @+0x0 + 4·i, hart `i`'s mtimecmp @+0x4000 + 8·i, mtime @+0xBFF8 (shared) |
 | 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART, keyboard, disks, pointer and network cards (section 7.1) |
 | 0x1000_0000 - 0x1000_00FF | UART, 16550-compatible subset (THR/RBR @+0, IER @+1, IIR @+2, LSR @+5) |
 | 0x1000_1000 - 0x1000_8FFF | Block devices: disk `i` at 0x1000_1000 + 0x1000·i, up to 8 (`--disk`; Xcal, section 9.6). Only the pages of attached disks are mapped |
@@ -178,13 +178,38 @@ Clock: one instruction is one cycle is one `mtime` tick, so the CPU clock and th
 - **Default (no `--clock`)**: Grail runs as fast as it can and the run is deterministic and reproducible. It still reports a nominal clock of 10 MHz, so software computes intervals the same way in both modes.
 - **Real time (`--clock FREQ`)**: Grail paces execution to FREQ instructions per wall-clock second, and `SYS_FLAGS` bit 0 is set. FREQ is a number with an optional unit, case-insensitive: `Hz`, `kHz` or `MHz` (`--clock 10MHz`, `--clock 500kHz`, `--clock 5Hz`); a bare number is Hz. Fractions are allowed when the result is a whole number of Hz (`--clock 1.5MHz`, not `--clock 1.5Hz`); 0 and values above 2^32 - 1 Hz are rejected. Pacing works in batches of about 1 ms of guest time, sleeping whenever the machine is ahead of the wall clock, not per instruction. If the host falls more than ~100 ms behind (it is slower than FREQ, or the machine was paused), the lag is dropped rather than caught up at full speed.
 
-Timer: `mtime` increments once per step (an executed instruction, a taken interrupt, or a tick spent waiting in `wfi`). MTIP is pending while `mtime >= mtimecmp`. During `wfi` with nothing pending, the default mode jumps `mtime` forward to `mtimecmp` instead of spinning; in real-time mode the wait lasts the real time until `mtimecmp` (`mtime` keeps ticking at FREQ; Grail skips the idle ticks of each batch at once and sleeps), and device input such as a UART byte still wakes the hart within about one batch.
+Timer: `mtime` increments once per step (in which each hart executes an instruction, takes an interrupt, or spends a tick waiting in `wfi`). A hart's MTIP is pending while `mtime >=` its `mtimecmp`. When every hart waits in `wfi` with nothing pending, the default mode jumps `mtime` forward to the earliest `mtimecmp` of a hart whose `mie.MTIE` is set instead of spinning; in real-time mode the wait lasts the real time until then (`mtime` keeps ticking at FREQ; Grail skips the idle ticks of each batch at once and sleeps), and device input such as a UART byte still wakes the hart within about one batch. A hart in `wfi` never holds the others up: they keep running, and its ticks pass one per step.
+
+Harts: `--harts N` (1 to 8, default 1; `MachineConfig::harts` as a library) builds a machine of N harts on one bus: RAM, devices and `mtime` are shared, and each hart has its own registers, pc, privilege mode, CSRs (`mhartid` = its index), LR/SC reservation, Sv32 translation (its own `satp`), `msip` and `mtimecmp` in the CLINT, and pair of PLIC contexts (section 7.1). `SYS_HARTS` in sysinfo gives N (section 9.5). Scheduling is deterministic round robin: a step runs one instruction on hart 0, then one on hart 1, and so on up to hart N - 1 (a hart waiting in `wfi` spends its turn waiting), and `mtime` ticks once per step, before the instructions. So the clock is per hart: with `--clock FREQ`, each hart runs FREQ instructions per second, and the timebase stays FREQ. A run is reproducible like a one-hart run. An exit (`xcal.halt`, the test device) ends the step at once, before the remaining harts' turns. With `--trace`, each line starts with the hart (`h1 M 00001020: ...`) when N > 1. A one-hart machine behaves exactly as before harts existed, boot ROM included.
+
+Boot: hart 0 starts at 0x1000, a stub that loads the entry point (the word at 0x1010, set by the ELF loader) into t0 and jumps there with a0 = 0, its hart id. On a machine with more harts the others start at 0x1020, a park loop:
+
+```
+0x1020: csrr  a0, mhartid
+        slli  t1, a0, 2
+        lui   t0, 0x2000         CLINT
+        add   t1, t0, t1         t1 = &msip[hart]
+        li    t2, 8              mie.MSIE (mstatus.MIE is 0: the IPI wakes wfi, no trap)
+        csrw  mie, t2
+0x1038: wfi
+        lw    t2, 0(t1)
+        beqz  t2, 0x1038         not woken by an IPI: wait again
+        sw    zero, 0(t1)        acknowledge the IPI
+        csrw  mie, zero
+        lui   t0, 1
+        lw    t0, 16(t0)         the entry point at 0x1010
+        jr    t0
+```
+
+So every hart enters the program at the same entry point, in M-mode, with a0 = its hart id and every other register as the ROM left it (`mie` = 0, `msip` clear). The boot protocol is the entry point's: it reads `mhartid` (or a0), lets hart 0 set up memory, and starts each other hart with an IPI, writing 1 to its `msip` (0x0200_0000 + 4·i), when the hart can find what it needs (a stack, say); `examples/smp` does this. A hart that is never sent an IPI stays parked in `wfi`.
+
+Inter-processor interrupts: writing 1 to hart `i`'s `msip` sets its `mip.MSIP`; it stays pending until software writes 0 there (the hart that takes it, typically). Any hart may write any `msip`, its own included.
 
 UART: writing THR sends the byte to the machine's console, which for the `grail` command is the host terminal (stdout); RBR is fed from the console's input (host stdin). Each machine has its own console, so a host can run several machines in one process. LSR bit 5 (THRE) always 1, bit 0 (DR) set when input is available. IER bit 0 (ERBFI) enables the "received data available" interrupt: the UART holds PLIC source 1 high while IER bit 0 and LSR.DR are both set, so reading RBR until DR clears lowers it. IIR (@+2, read) reports 0x04 while that interrupt is asserted, else 0x01 (none). The other IER bits are stored but raise nothing (no transmit, line-status or modem interrupts).
 
 ### 7.1 PLIC
 
-A minimal RISC-V PLIC (riscv-plic-spec) with the QEMU `virt` register layout: one hart, two contexts, sources 1-31.
+A minimal RISC-V PLIC (riscv-plic-spec) with the QEMU `virt` register layout: two contexts per hart (so 2 to 16), sources 1-31.
 
 | Source | Device |
 |---|---|
@@ -206,7 +231,7 @@ QEMU `virt` puts UART0 on source 10; Excalibur numbers its few devices from 1 in
 | +0x20_0000 + 0x1000·ctx | Priority threshold of context `ctx`, 0-7 |
 | +0x20_0004 + 0x1000·ctx | Claim (read) / complete (write) of context `ctx` |
 
-Context 0 is hart 0 in M-mode and drives `mip.MEIP`; context 1 is hart 0 in S-mode and drives `mip.SEIP`. Registers are 32-bit: other access widths raise access faults. Every other offset in the range is reserved (reads 0, writes ignored).
+Context 2·i is hart `i` in M-mode and drives its `mip.MEIP`; context 2·i + 1 is hart `i` in S-mode and drives its `mip.SEIP`. So context 0 and 1 are hart 0's, as on a one-hart machine. Offsets of contexts past the last hart's are reserved. Priorities and pending bits are shared: each source has one gateway, so a pending source is claimed by one context only, whichever claims it first. Registers are 32-bit: other access widths raise access faults. Every other offset in the range is reserved (reads 0, writes ignored).
 
 Behavior:
 
@@ -312,7 +337,8 @@ Read-only registers that describe the machine, so software discovers its hardwar
 | 0x3000_2014 | `SYS_CPU_HZ` | CPU clock in Hz; equal to the timebase (one instruction per tick) |
 | 0x3000_2018 | `SYS_FLAGS` | bit 0 = the clock is real time (`--clock`); clear = nominal (default 10 MHz, runs at full speed). Other bits are reserved and read as 0 |
 | 0x3000_201C | `SYS_DEV_COUNT` | number of device table entries |
-| 0x3000_2020 - 0x3000_203F | reserved | read as 0 |
+| 0x3000_2020 | `SYS_HARTS` | number of harts, 1 to 8 (`--harts`, section 7); their `mhartid`s are 0 to `SYS_HARTS` - 1 |
+| 0x3000_2024 - 0x3000_203F | reserved | read as 0 |
 | 0x3000_2040 + 16·i | device table entry `i` | four words, below |
 
 Frequencies are plain 32-bit Hz values, like the device-tree `timebase-frequency` property, so a 10 ms tick is `SYS_TIMEBASE_HZ / 100` ticks.
@@ -625,7 +651,7 @@ Steps 1 and 2 together, our assembler and our linker with no LLVM at all, is how
 
 ### Examples
 
-The programs in `examples/` are built by `cargo xtask examples` (`crates/xtask/src/examples.rs`): each source is assembled by merlin-as and the objects are linked by merlin-ld, with the example's `link.ld` (or the default layout for `muldiv`). Both tools run as libraries inside xtask, the same code as their command lines, which the comment at the top of each source spells out. The linked `examples/<dir>/<name>.elf` files are committed so Grail can run them without building anything, and `cargo test` (`crates/xtask/tests/examples.rs`) rebuilds every example from source, requires the result to equal the committed file byte for byte, and runs it in Grail with its input (UART bytes, key events, pointer input, a disk image, another machine on a hub), checking the output and the exit code. Nothing in that needs LLVM. `examples/multiobj` exists to exercise multi-object linking: two sources with calls, pc-relative addresses and `.word` pointers between them, `.data` written at run time, `.bss` in the other object, and a non-zero exit code (42).
+The programs in `examples/` are built by `cargo xtask examples` (`crates/xtask/src/examples.rs`): each source is assembled by merlin-as and the objects are linked by merlin-ld, with the example's `link.ld` (or the default layout for `muldiv`). Both tools run as libraries inside xtask, the same code as their command lines, which the comment at the top of each source spells out. The linked `examples/<dir>/<name>.elf` files are committed so Grail can run them without building anything, and `cargo test` (`crates/xtask/tests/examples.rs`) rebuilds every example from source, requires the result to equal the committed file byte for byte, and runs it in Grail with its input (UART bytes, key events, pointer input, a disk image, another machine on a hub), checking the output and the exit code. Nothing in that needs LLVM. `examples/multiobj` exists to exercise multi-object linking: two sources with calls, pc-relative addresses and `.word` pointers between them, `.data` written at run time, `.bss` in the other object, and a non-zero exit code (42). `examples/smp` exercises a multi-hart machine (section 7, "Harts"): hart 0 wakes the others with an IPI, every hart adds 1000 to one counter with `amoadd.w` and to another with an LR/SC loop, counting its failed `sc.w`s, then hart 0 sends three rounds of IPIs; it prints the totals, which must be N x 1000 on N harts. The test runs it on 1 to 8 harts.
 
 clang and ld.lld are only the reference. Each source carries the command that builds the same program with them:
 

@@ -19,10 +19,13 @@ pub fn machine_config(profile: &HardwareProfile) -> Result<MachineConfig, String
         ram_size,
         clock_hz,
         nominal_hz,
+        harts,
         devices,
     } = profile;
     let ram_size = usize::try_from(*ram_size)
         .map_err(|_| format!("RAM size {ram_size:#x} is too large for this host"))?;
+    // Out of range on any host: Grail's validation below says so.
+    let harts = usize::try_from(*harts).unwrap_or(usize::MAX);
     let mut disks = Vec::new();
     for device in devices {
         let DeviceSpec::Disk(DiskSpec { source, read_only }) = device;
@@ -37,6 +40,7 @@ pub fn machine_config(profile: &HardwareProfile) -> Result<MachineConfig, String
         ram_size,
         clock_hz: *clock_hz,
         nominal_hz: *nominal_hz,
+        harts,
         disks,
         // Profiles have no network cards yet (issue #81).
         nets: Vec::new(),
@@ -56,6 +60,7 @@ mod tests {
             ram_size: 64 * MIB as u64,
             clock_hz: Some(2_000_000),
             nominal_hz: 5,
+            harts: 4,
             devices: vec![
                 DeviceSpec::Disk(DiskSpec {
                     source: DiskSource::File("a.img".into()),
@@ -80,6 +85,7 @@ mod tests {
                 ram_size: 64 * MIB,
                 clock_hz: Some(2_000_000),
                 nominal_hz: 5,
+                harts: 4,
                 disks: vec![
                     DiskConfig::file("a.img"),
                     DiskConfig::lake("127.0.0.1:7401", "root"),
@@ -120,6 +126,27 @@ mod tests {
                     ..HardwareProfile::default()
                 },
                 "0 Hz",
+            ),
+            (
+                HardwareProfile {
+                    harts: 0,
+                    ..HardwareProfile::default()
+                },
+                "0 harts, must be 1 to 8",
+            ),
+            (
+                HardwareProfile {
+                    harts: 9,
+                    ..HardwareProfile::default()
+                },
+                "9 harts, must be 1 to 8",
+            ),
+            (
+                HardwareProfile {
+                    harts: u32::MAX,
+                    ..HardwareProfile::default()
+                },
+                "harts, must be 1 to 8",
             ),
             (
                 HardwareProfile {

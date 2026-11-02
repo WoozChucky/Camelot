@@ -20,6 +20,10 @@ pub const MAX_RAM_SIZE: usize = (u32::MAX - RAM_BASE) as usize + 1;
 pub const RAM_GRANULE: usize = 4096;
 /// Clock frequency the machine reports when it is not paced to a real-time clock.
 pub const DEFAULT_NOMINAL_HZ: u32 = 10_000_000;
+/// Most harts a machine can have. Grail runs them one after the other on one host
+/// thread, so each one more slows the others down; the CLINT and PLIC layouts have
+/// room for many more.
+pub const MAX_HARTS: usize = 8;
 
 /// What a machine is built from. New hardware (disks, more devices) becomes new fields
 /// with a default value, so build configs as
@@ -35,6 +39,9 @@ pub struct MachineConfig {
     /// The CPU and timebase frequency reported to software when `clock_hz` is `None`,
     /// so it computes timer intervals the same way in both modes.
     pub nominal_hz: u32,
+    /// Harts (cores), 1 to [`MAX_HARTS`]. Each runs at the clock: with `clock_hz`, `n`
+    /// harts run `n * clock_hz` instructions per second in all.
+    pub harts: usize,
     /// Block devices (spec section 9.6): disk `i` is mapped at `BLK_BASE + i * BLK_SIZE`
     /// and interrupts on PLIC source `BLK_IRQ + i`. At most [`MAX_DISKS`], counting any
     /// backends handed to [`crate::Machine::with_backends`].
@@ -228,6 +235,7 @@ impl Default for MachineConfig {
             ram_size: DEFAULT_RAM_SIZE,
             clock_hz: None,
             nominal_hz: DEFAULT_NOMINAL_HZ,
+            harts: 1,
             disks: Vec::new(),
             nets: Vec::new(),
         }
@@ -258,6 +266,9 @@ impl MachineConfig {
         }
         if self.clock_hz == Some(0) || self.nominal_hz == 0 {
             return Err("clock frequency must not be 0 Hz".into());
+        }
+        if !(1..=MAX_HARTS).contains(&self.harts) {
+            return Err(format!("{} harts, must be 1 to {MAX_HARTS}", self.harts));
         }
         if self.disks.len() > MAX_DISKS {
             return Err(format!("{} disks, at most {MAX_DISKS}", self.disks.len()));
@@ -305,6 +316,19 @@ pub fn parse_ram_mib(s: &str) -> Result<usize, String> {
         return Err(format!("{mib} MiB is out of range (1 to {MAX_MIB} MiB)"));
     }
     Ok(mib * MIB)
+}
+
+/// Parses a `--harts` value: a whole number from 1 to [`MAX_HARTS`].
+pub fn parse_harts(s: &str) -> Result<usize, String> {
+    let s = s.trim();
+    let n: usize = match s.parse() {
+        Ok(n) if s.bytes().all(|b| b.is_ascii_digit()) => n,
+        _ => return Err(format!("'{s}' is not a whole number of harts")),
+    };
+    if !(1..=MAX_HARTS).contains(&n) {
+        return Err(format!("{n} harts is out of range (1 to {MAX_HARTS})"));
+    }
+    Ok(n)
 }
 
 /// Parses a `--clock` value: a number with an optional unit, case-insensitive: `Hz`,
@@ -365,6 +389,7 @@ mod tests {
         assert_eq!(c.ram_size, 128 * MIB);
         assert_eq!(c.clock_hz, None);
         assert_eq!(c.cpu_hz(), 10_000_000);
+        assert_eq!(c.harts, 1);
         assert_eq!(c.validate(), Ok(()));
         let paced = MachineConfig {
             clock_hz: Some(5),
@@ -545,6 +570,39 @@ mod tests {
             .unwrap();
         assert!(e.starts_with("no/such/dir/x.pcap: "), "{e}");
         assert_eq!(hub.ports(), 3, "and leaves no port behind");
+    }
+
+    #[test]
+    fn harts_1_to_max() {
+        for n in 1..=MAX_HARTS {
+            assert_eq!(parse_harts(&n.to_string()), Ok(n));
+            let config = MachineConfig {
+                harts: n,
+                ..MachineConfig::default()
+            };
+            assert_eq!(config.validate(), Ok(()));
+        }
+        assert_eq!(parse_harts(" 4 "), Ok(4));
+        for (bad, why) in [
+            ("0", "out of range (1 to 8)"),
+            ("9", "out of range"),
+            ("99999999999999999999999", "not a whole number"),
+            ("-1", "not a whole number"),
+            ("+2", "not a whole number"),
+            ("2.0", "not a whole number"),
+            ("", "not a whole number"),
+            ("two", "not a whole number"),
+        ] {
+            let e = parse_harts(bad).unwrap_err();
+            assert!(e.contains(why), "{bad:?}: {e}");
+        }
+        for harts in [0, MAX_HARTS + 1] {
+            let config = MachineConfig {
+                harts,
+                ..MachineConfig::default()
+            };
+            assert_eq!(config.validate(), Err(format!("{harts} harts, must be 1 to 8")));
+        }
     }
 
     #[test]

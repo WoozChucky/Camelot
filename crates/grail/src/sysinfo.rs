@@ -1,6 +1,6 @@
 //! Xcal sysinfo (spec section 9.5): read-only registers that tell software what machine
-//! it runs on (RAM, clock) and a table of the devices it has, so a kernel discovers
-//! its hardware instead of hard-coding it.
+//! it runs on (RAM, clock, harts) and a table of the devices it has, so a kernel
+//! discovers its hardware instead of hard-coding it.
 
 use crate::bus::{BusFault, RAM_BASE};
 use crate::config::MachineConfig;
@@ -20,6 +20,8 @@ pub const REG_TIMEBASE_HZ: u32 = 0x10;
 pub const REG_CPU_HZ: u32 = 0x14;
 pub const REG_FLAGS: u32 = 0x18;
 pub const REG_DEV_COUNT: u32 = 0x1c;
+/// Number of harts; their `mhartid`s are 0 to this minus 1.
+pub const REG_HARTS: u32 = 0x20;
 /// First device table entry.
 pub const DEV_TABLE: u32 = 0x40;
 /// Bytes per device table entry: type, base, size, irq.
@@ -72,6 +74,7 @@ pub struct Sysinfo {
     ram_size: u32,
     cpu_hz: u32,
     flags: u32,
+    harts: u32,
     devices: Vec<DeviceEntry>,
 }
 
@@ -87,6 +90,7 @@ impl Sysinfo {
             } else {
                 0
             },
+            harts: u32::try_from(config.harts).expect("a valid hart count fits in 32 bits"),
             devices,
         }
     }
@@ -109,6 +113,7 @@ impl Sysinfo {
             REG_TIMEBASE_HZ | REG_CPU_HZ => self.cpu_hz,
             REG_FLAGS => self.flags,
             REG_DEV_COUNT => self.devices.len() as u32,
+            REG_HARTS => self.harts,
             o if o >= DEV_TABLE => {
                 let index = ((o - DEV_TABLE) / DEV_ENTRY_SIZE) as usize;
                 match self.devices.get(index) {
@@ -168,9 +173,21 @@ mod tests {
         assert_eq!(s.read(REG_CPU_HZ, 4), Ok(10_000_000));
         assert_eq!(s.read(REG_FLAGS, 4), Ok(0), "nominal clock");
         assert_eq!(s.read(REG_DEV_COUNT, 4), Ok(2));
-        for reserved in [0x20, 0x24, 0x3c] {
+        assert_eq!(s.read(REG_HARTS, 4), Ok(1));
+        for reserved in [0x24, 0x28, 0x3c] {
             assert_eq!(s.read(reserved, 4), Ok(0));
         }
+    }
+
+    #[test]
+    fn hart_count() {
+        let config = MachineConfig {
+            harts: 4,
+            ..MachineConfig::default()
+        };
+        let s = Sysinfo::new(&config, Vec::new());
+        assert_eq!(s.read(REG_HARTS, 4), Ok(4));
+        assert_eq!(s.read(REG_HARTS, 2), Err(BusFault));
     }
 
     #[test]

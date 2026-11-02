@@ -244,6 +244,43 @@ fn received_frames_break_a_reservation() {
     }
 }
 
+/// On a machine of several harts a received frame breaks every hart's reservation on
+/// the words it writes, not only hart 0's.
+#[test]
+fn received_frames_break_every_harts_reservation() {
+    let hub = Hub::new();
+    let config = MachineConfig {
+        harts: 3,
+        ..on_hub(&hub)
+    };
+    let code = [lr_w(T0, A0), DEC_T1, BNEZ_T1_BACK, sc_w(T3, A1, A0), HALT];
+    let mut m = bare_machine(config, &code);
+    let mut peer = hub.attach();
+    peer.send(&[0xab; 60]).unwrap();
+    // Hart 1 reserves the frame's first word, hart 2 the word past it, hart 0 the
+    // descriptor's length and status.
+    for (id, addr) in [(0, RX_RING + 4), (1, RX_BUF), (2, RX_BUF + 60)] {
+        let hart = m.cpu.hart_mut(id);
+        hart.pc = RAM_BASE;
+        hart.waiting = false;
+        hart.x[A0] = addr;
+        hart.x[A1] = 0x1111_1111;
+        hart.x[T1] = net::POLL_STEPS;
+    }
+    for _ in 0..10_000 {
+        if m.cpu.harts().iter().all(|h| h.pc == RAM_BASE + 16) {
+            break;
+        }
+        m.cpu.step();
+    }
+    assert!(m.cpu.harts().iter().all(|h| h.pc == RAM_BASE + 16), "no trap");
+    assert_eq!(word(&mut m, NET_BASE + net::REG_RX_HEAD), 1, "the frame arrived");
+    let sc: Vec<u32> = m.cpu.harts().iter().map(|h| h.x[T3]).collect();
+    assert_eq!(sc, [1, 1, 0], "only hart 2's word was not written");
+    assert_eq!(word(&mut m, RX_BUF), 0xabab_abab);
+    assert_eq!(word(&mut m, RX_BUF + 60), 0x1111_1111);
+}
+
 /// With a real-time clock, a hart parked in `wfi` has its idle ticks skipped in bulk
 /// (`Cpu::idle`). Its card must still poll on time among them, not only every few
 /// hundred batches, and what it receives there breaks a reservation too.
@@ -261,7 +298,7 @@ fn paced_idle_cards_poll_and_break_reservations() {
     m.cpu.x[A0] = RX_BUF;
     m.cpu.x[A1] = 0x1111_1111;
     m.cpu.csr.mie = 1 << 7; // MTIE
-    m.cpu.bus.clint.mtimecmp = 3000;
+    m.cpu.bus.clint.mtimecmp[0] = 3000;
 
     // The first batch is 1000 ticks (1 ms): lr.w, wfi, then 997 skipped at once and one
     // more step. Only 3 ticks ran one by one, fewer than POLL_STEPS: the card polls only

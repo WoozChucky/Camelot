@@ -14,6 +14,11 @@ pub fn parse_ram(s: &str) -> Result<u64, String> {
     grail::parse_ram_mib(s).map(|bytes| bytes as u64)
 }
 
+/// Parses a `--harts` value, a whole number from 1 to 8 (Grail's `--harts`).
+pub fn parse_harts(s: &str) -> Result<u32, String> {
+    grail::parse_harts(s).map(|n| n as u32)
+}
+
 /// Parses a server address: `host:port`, or a host or IP address alone for
 /// `default_port`. IPv6 addresses with a port go in brackets (`[::1]:7400`). The host
 /// is not looked up here, only when connecting. Port 0 is refused: nothing can be
@@ -156,6 +161,9 @@ mod tests {
         assert_eq!(parse_clock("10MHz"), Ok(10_000_000));
         assert_eq!(parse_clock("1.5mhz"), Ok(1_500_000));
         assert!(parse_clock("0").is_err());
+        assert_eq!(parse_harts("4"), Ok(4));
+        assert!(parse_harts("0").is_err());
+        assert!(parse_harts("9").is_err());
     }
 
     #[test]

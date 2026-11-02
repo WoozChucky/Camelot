@@ -225,12 +225,12 @@ fn invalid_payloads() -> Vec<(&'static str, u16, Vec<u8>)> {
         (
             "device tag",
             ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[9]]),
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &le(1), &[9]]),
         ),
         (
             "disk source tag",
             ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[1, 7]]),
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &le(1), &[1, 7]]),
         ),
         ("key code 0", ty::KEY_INPUT, cat(&[&le(1), &[0, 0]])),
         ("key flags", ty::KEY_INPUT, cat(&[&le(1), &[b'a', 0x08]])),

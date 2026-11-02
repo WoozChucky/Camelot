@@ -1,4 +1,4 @@
-//! The hart: registers, the step loop, instruction execution and trap entry.
+//! The harts: registers, the step loop, instruction execution and trap entry.
 
 mod atomic;
 mod csr;
@@ -32,22 +32,46 @@ impl Mode {
     }
 }
 
-pub struct Cpu {
+/// One hart: its registers, CSRs, privilege mode and `wfi` state. Its LR/SC
+/// reservation is kept by the bus, which sees every store (see
+/// [`Bus::reservation`]); memory and devices are shared with the other harts.
+///
+/// A hart runs against the bus it is handed: [`Hart::step`] and everything under it
+/// take `bus: &mut Bus`, so several harts can take turns on one bus.
+pub struct Hart {
+    /// `mhartid`: the hart's index in its machine, from 0.
+    pub id: u32,
     pub x: [u32; 32],
     pub pc: u32,
     pub mode: Mode,
     pub csr: Csrs,
-    pub bus: Bus,
     /// Stalled in `wfi` until an interrupt becomes pending.
     pub waiting: bool,
-    /// While stalled in `wfi`, jump `mtime` straight to `mtimecmp` instead of letting it
-    /// tick (the default, full-speed mode). A real-time machine turns this off and lets
-    /// the wait take wall-clock time instead (see [`Cpu::idle`]).
-    pub wfi_skips_to_timer: bool,
-    /// The `lr.w`/`sc.w` reservation.
-    pub reservation: Reservation,
     /// Set when the current instruction wrote minstret, which suppresses its increment.
     instret_written: bool,
+}
+
+/// Every hart of a machine, and the bus they share. Grail runs the harts on one host
+/// thread, deterministically: each [`Cpu::step`] ticks `mtime` once, samples the
+/// devices' interrupt lines, then lets every hart in turn, from hart 0 up, run one
+/// instruction (or take an interrupt, or wait in `wfi`). One step is one cycle of every
+/// hart, so a hart's clock and the timebase stay the same number however many harts
+/// there are (spec section 7).
+///
+/// Between steps, a `Cpu` dereferences to hart 0, so a one-hart machine reads like a
+/// single CPU (`cpu.pc`, `cpu.x[10]`, `cpu.csr.mcause`); while a step runs (as the
+/// trace callback sees it), to the hart whose turn it is. [`Cpu::hart`] and
+/// [`Cpu::harts`] reach any hart.
+pub struct Cpu {
+    harts: Vec<Hart>,
+    /// The hart `Deref` shows: hart 0 between steps, the hart whose turn it is during one.
+    current: usize,
+    pub bus: Bus,
+    /// When every hart is stalled in `wfi`, jump `mtime` straight to the next
+    /// `mtimecmp` instead of letting it tick (the default, full-speed mode). A
+    /// real-time machine turns this off and lets the wait take wall-clock time instead
+    /// (see [`Cpu::idle`]).
+    pub wfi_skips_to_timer: bool,
 }
 
 /// Interrupts in priority order (highest first).
@@ -60,43 +84,152 @@ const IRQ_PRIORITY: [u32; 6] = [
     IRQ_S_TIMER,
 ];
 
+impl std::ops::Deref for Cpu {
+    type Target = Hart;
+
+    fn deref(&self) -> &Hart {
+        &self.harts[self.current]
+    }
+}
+
+impl std::ops::DerefMut for Cpu {
+    fn deref_mut(&mut self) -> &mut Hart {
+        &mut self.harts[self.current]
+    }
+}
+
 impl Cpu {
+    /// The harts of a machine on `bus`, as many as the bus was built for
+    /// ([`Bus::harts`]), at reset: in M-mode, hart 0 at the boot ROM's reset vector and
+    /// the others at its park loop ([`crate::bus::PARK_PC`]), where they wait for an IPI.
     pub fn new(bus: Bus) -> Self {
+        let harts = (0..bus.harts() as u32)
+            .map(|id| {
+                let pc = if id == 0 {
+                    crate::bus::BOOT_ROM_BASE
+                } else {
+                    crate::bus::PARK_PC
+                };
+                Hart::new(id, pc)
+            })
+            .collect();
         Cpu {
-            x: [0; 32],
-            pc: crate::bus::BOOT_ROM_BASE,
-            mode: Mode::M,
-            csr: Csrs::default(),
+            harts,
+            current: 0,
             bus,
-            waiting: false,
             wfi_skips_to_timer: true,
-            reservation: Reservation::default(),
-            instret_written: false,
         }
     }
 
-    /// While stalled in `wfi` with nothing pending, lets up to `max` ticks pass at once,
-    /// exactly as `max` idle steps would: `mtime` advances and nothing else changes. When
-    /// the timer can wake the hart (`mie.MTIE` set), it stops one tick short of
-    /// `mtimecmp`, so the next step raises the timer on time; a masked timer cannot end
-    /// the wait (and nothing reads `mip` meanwhile), so it does not limit the skip.
-    /// Returns the ticks skipped (0 when not stalled or an interrupt is pending).
+    /// Every hart, hart `i` at index `i`.
+    pub fn harts(&self) -> &[Hart] {
+        &self.harts
+    }
+
+    /// Hart `id`. Panics if the machine has no such hart.
+    pub fn hart(&self, id: usize) -> &Hart {
+        &self.harts[id]
+    }
+
+    pub fn hart_mut(&mut self, id: usize) -> &mut Hart {
+        &mut self.harts[id]
+    }
+
+    /// The current hart's `mip`, with the bits the devices drive (see [`Hart::mip`]).
+    pub fn mip(&self) -> u32 {
+        self.harts[self.current].mip(&self.bus)
+    }
+
+    /// The current hart's LR/SC reservation.
+    pub fn reservation(&self) -> Reservation {
+        self.bus.reservation(self.current)
+    }
+
+    /// Whether every hart is stalled in `wfi` with nothing pending that could wake it
+    /// (an interrupt pending and enabled in `mie`). Only the timer or a device can
+    /// then wake the machine.
+    pub fn all_idle(&self) -> bool {
+        self.harts
+            .iter()
+            .all(|h| h.waiting && h.mip(&self.bus) & h.csr.mie == 0)
+    }
+
+    /// While every hart is stalled in `wfi` with nothing pending, lets up to `max`
+    /// ticks pass at once, exactly as `max` idle steps would: `mtime` advances and
+    /// nothing else changes. When a timer can wake a hart (its `mie.MTIE` set), it stops
+    /// one tick short of that hart's `mtimecmp`, so the next step raises the timer on
+    /// time; a masked timer cannot end the wait (and nothing reads `mip` meanwhile), so
+    /// it does not limit the skip. Returns the ticks skipped (0 when some hart is not
+    /// stalled or has an interrupt pending).
     ///
     /// Device lines are not sampled during the skip, so host input that arrives in the
     /// meantime is seen at the next step: callers keep `max` small (a pacing batch).
     pub fn idle(&mut self, max: u64) -> u64 {
-        if !self.waiting || self.mip() & self.csr.mie != 0 {
+        if !self.all_idle() {
             return 0;
         }
         let clint = &mut self.bus.clint;
-        let to_timer = if self.csr.mie & (1 << IRQ_M_TIMER) != 0 {
-            clint.mtimecmp.saturating_sub(clint.mtime).saturating_sub(1)
-        } else {
-            u64::MAX
-        };
-        let ticks = max.min(to_timer);
+        let mut ticks = max;
+        for hart in &self.harts {
+            if hart.csr.mie & (1 << IRQ_M_TIMER) != 0 {
+                let to_timer = clint.mtimecmp[hart.id as usize]
+                    .saturating_sub(clint.mtime)
+                    .saturating_sub(1);
+                ticks = ticks.min(to_timer);
+            }
+        }
         clint.mtime = clint.mtime.wrapping_add(ticks);
         ticks
+    }
+
+    /// Runs one step: every hart one instruction (or one interrupt taken, or one tick
+    /// spent in `wfi`). Time advances by one tick per step.
+    pub fn step(&mut self) {
+        self.step_traced(&mut |_| {});
+    }
+
+    /// [`Cpu::step`], calling `trace` before each hart's turn, with the `Cpu`
+    /// dereferencing to that hart (hart 0's call comes first, before the tick). A
+    /// program that stops the machine (`xcal.halt`, the test device) ends the step
+    /// there: the harts after it do not run.
+    pub fn step_traced(&mut self, trace: &mut impl FnMut(&Cpu)) {
+        self.current = 0;
+        trace(self);
+        self.bus.tick();
+        let mut idle = true;
+        for i in 0..self.harts.len() {
+            if i > 0 {
+                if self.bus.exit.is_some() {
+                    break;
+                }
+                self.current = i;
+                trace(self);
+            }
+            idle &= self.harts[i].step(&mut self.bus);
+        }
+        self.current = 0;
+        if idle && self.wfi_skips_to_timer {
+            // Nothing to do until a timer fires or a device raises a line: skip straight
+            // to the next timer. Device lines are sampled again next step.
+            if let Some(deadline) = self.bus.clint.next_deadline() {
+                self.bus.clint.mtime = deadline;
+            }
+        }
+    }
+}
+
+impl Hart {
+    /// A hart at reset: M-mode, every register 0, about to fetch from `pc`.
+    pub fn new(id: u32, pc: u32) -> Self {
+        Hart {
+            id,
+            x: [0; 32],
+            pc,
+            mode: Mode::M,
+            csr: Csrs::default(),
+            waiting: false,
+            instret_written: false,
+        }
     }
 
     #[inline]
@@ -111,39 +244,28 @@ impl Cpu {
         }
     }
 
-    /// Runs one instruction (or takes one interrupt). Time advances by one tick per step.
-    pub fn step(&mut self) {
-        self.bus.clint.mtime = self.bus.clint.mtime.wrapping_add(1);
-        // A network card may write a received frame into RAM here: like a store, that
-        // breaks a reservation on the words it touches.
-        let reservation = &mut self.reservation;
-        self.bus
-            .update_interrupts(&mut |paddr, len| reservation.snoop(paddr, len));
-
-        if let Some(irq) = self.pending_interrupt() {
+    /// The hart's turn in a step ([`Cpu::step`]): takes an interrupt, or runs one
+    /// instruction, or waits in `wfi`. Returns true if it waited: stalled in `wfi` with
+    /// no interrupt pending and enabled to wake it.
+    pub fn step(&mut self, bus: &mut Bus) -> bool {
+        if let Some(irq) = self.pending_interrupt(bus) {
             self.waiting = false;
-            self.enter_trap(INTERRUPT_BIT | irq, 0, self.pc);
-            return;
+            self.enter_trap(bus, INTERRUPT_BIT | irq, 0, self.pc);
+            return false;
         }
 
         if self.waiting {
-            if self.mip() & self.csr.mie != 0 {
+            if self.mip(bus) & self.csr.mie != 0 {
                 self.waiting = false;
             } else {
-                // Nothing to do until the timer fires or a device raises a line: skip
-                // straight to the timer. Device lines are sampled again next step.
-                let clint = &mut self.bus.clint;
-                if self.wfi_skips_to_timer && clint.mtimecmp != u64::MAX && clint.mtimecmp > clint.mtime {
-                    clint.mtime = clint.mtimecmp;
-                }
-                return;
+                return true;
             }
         }
 
         let pc = self.pc;
         self.instret_written = false;
-        let result = self.fetch(pc).and_then(|word| {
-            self.execute(word, pc).map_err(|mut t| {
+        let result = self.fetch(bus, pc).and_then(|word| {
+            self.execute(bus, word, pc).map_err(|mut t| {
                 if t.cause == Exception::IllegalInstr {
                     t.tval = word;
                 }
@@ -157,16 +279,17 @@ impl Cpu {
                     self.csr.minstret = self.csr.minstret.wrapping_add(1);
                 }
             }
-            Err(t) => self.enter_trap(t.cause as u32, t.tval, pc),
+            Err(t) => self.enter_trap(bus, t.cause as u32, t.tval, pc),
         }
         if self.csr.mcountinhibit & 1 == 0 {
             self.csr.mcycle = self.csr.mcycle.wrapping_add(1);
         }
+        false
     }
 
     /// Highest-priority interrupt that is pending, enabled, and allowed in the current mode.
-    fn pending_interrupt(&self) -> Option<u32> {
-        let pending = self.mip() & self.csr.mie;
+    fn pending_interrupt(&self, bus: &Bus) -> Option<u32> {
+        let pending = self.mip(bus) & self.csr.mie;
         if pending == 0 {
             return None;
         }
@@ -182,7 +305,7 @@ impl Cpu {
     }
 
     /// Trap entry (spec section 6). `cause` includes the interrupt bit.
-    fn enter_trap(&mut self, cause: u32, tval: u32, epc: u32) {
+    fn enter_trap(&mut self, bus: &mut Bus, cause: u32, tval: u32, epc: u32) {
         let interrupt = cause & INTERRUPT_BIT != 0;
         let code = cause & !INTERRUPT_BIT;
         let deleg = if interrupt {
@@ -193,7 +316,7 @@ impl Cpu {
         let to_s = self.mode <= Mode::S && (deleg >> code) & 1 != 0;
         // A trap breaks any LR/SC sequence: the handler may run other code (or
         // switch threads) before the interrupted `sc.w` executes.
-        self.reservation.clear();
+        bus.reservation_mut(self.id as usize).clear();
         let s = &mut self.csr.mstatus;
 
         let tvec = if to_s {
@@ -246,7 +369,7 @@ impl Cpu {
     }
 
     /// Executes one instruction and returns the next pc.
-    fn execute(&mut self, word: u32, pc: u32) -> Result<u32, Trap> {
+    fn execute(&mut self, bus: &mut Bus, word: u32, pc: u32) -> Result<u32, Trap> {
         let next = pc.wrapping_add(4);
         match decode(word) {
             Inst::Lui { rd, imm } => self.set_reg(rd, imm),
@@ -277,7 +400,7 @@ impl Cpu {
             }
             Inst::Load { op, rd, rs1, imm } => {
                 let addr = self.reg(rs1).wrapping_add(imm as u32);
-                let v = self.load(addr, op.size())?;
+                let v = self.load(bus, addr, op.size())?;
                 let v = match op {
                     LoadOp::Lb => v as i8 as i32 as u32,
                     LoadOp::Lh => v as i16 as i32 as u32,
@@ -293,7 +416,7 @@ impl Cpu {
                     StoreOp::Sh => self.reg(rs2) & 0xffff,
                     StoreOp::Sw => self.reg(rs2),
                 };
-                self.store(addr, size, v)?;
+                self.store(bus, addr, size, v)?;
             }
             Inst::OpImm { op, rd, rs1, imm } => {
                 let v = alu(op, self.reg(rs1), imm as u32);
@@ -307,20 +430,21 @@ impl Cpu {
                 let v = muldiv(op, self.reg(rs1), self.reg(rs2));
                 self.set_reg(rd, v);
             }
-            // Single hart, in order: aq/rl need no work (see atomic.rs).
+            // One instruction at a time, in order: aq/rl need no work (see atomic.rs).
             Inst::Lr { rd, rs1, .. } => {
-                let v = self.load_reserved(self.reg(rs1))?;
+                let v = self.load_reserved(bus, self.reg(rs1))?;
                 self.set_reg(rd, v);
             }
             Inst::Sc { rd, rs1, rs2, .. } => {
-                let v = self.store_conditional(self.reg(rs1), self.reg(rs2))?;
+                let v = self.store_conditional(bus, self.reg(rs1), self.reg(rs2))?;
                 self.set_reg(rd, v);
             }
             Inst::Amo { op, rd, rs1, rs2, .. } => {
-                let old = self.amo(op, self.reg(rs1), self.reg(rs2))?;
+                let old = self.amo(bus, op, self.reg(rs1), self.reg(rs2))?;
                 self.set_reg(rd, old);
             }
-            // Single hart, no caches, no instruction cache: fences are no-ops.
+            // Harts take turns one instruction at a time on one memory, with no caches and no
+            // instruction cache: every hart sees every access in order, so fences are no-ops.
             Inst::Fence { .. } | Inst::FenceTso | Inst::FenceI => {}
             Inst::Ecall => {
                 let cause = match self.mode {
@@ -386,7 +510,7 @@ impl Cpu {
                     (_, CsrSrc::Reg(r)) => (self.reg(r), r != 0),
                     (_, CsrSrc::Imm(i)) => (i as u32, i != 0),
                 };
-                let old = self.csr_read(csr)?;
+                let old = self.csr_read(bus, csr)?;
                 if writes {
                     let base = self.csr_rmw_base(csr, old);
                     let new = match op {
@@ -402,13 +526,13 @@ impl Cpu {
                 let v = self.reg(rs1);
                 let name = excalibur::reg::abi_name(rs1);
                 let line = format!("[dbg] pc={pc:08x} {name} = {v:#010x} ({})\n", v as i32);
-                self.bus.debug_out(line.as_bytes());
+                bus.debug_out(line.as_bytes());
             }
             Inst::XcalHalt { rs1 } => {
                 if self.mode != Mode::M {
                     return Err(Self::illegal());
                 }
-                self.bus.exit = Some(crate::bus::Exit::Code(self.reg(rs1) & 0xff));
+                bus.exit = Some(crate::bus::Exit::Code(self.reg(rs1) & 0xff));
             }
             Inst::Illegal(_) => return Err(Self::illegal()),
         }

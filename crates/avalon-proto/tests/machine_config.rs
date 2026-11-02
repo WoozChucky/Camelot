@@ -7,7 +7,7 @@
 use avalon_proto::{
     DeviceEntry, DeviceSpec, DiskSpec, HardwareProfile, KeyEvent, Message, PIXEL_FORMAT_XRGB8888,
 };
-use grail::config::{DiskSource, DEFAULT_NOMINAL_HZ, MAX_RAM_SIZE, MIB};
+use grail::config::{DiskSource, DEFAULT_NOMINAL_HZ, MAX_HARTS, MAX_RAM_SIZE, MIB};
 use grail::{DiskConfig, MachineConfig};
 
 /// A Grail disk as a protocol device. Memory disks are local to the host that builds
@@ -30,6 +30,7 @@ fn profile_from(config: &MachineConfig) -> Result<HardwareProfile, String> {
         ram_size,
         clock_hz,
         nominal_hz,
+        harts,
         disks,
         nets,
     } = config.clone();
@@ -42,6 +43,7 @@ fn profile_from(config: &MachineConfig) -> Result<HardwareProfile, String> {
         ram_size: ram_size as u64,
         clock_hz,
         nominal_hz,
+        harts: harts as u32,
         devices: disks.iter().map(disk_spec_from).collect::<Result<_, _>>()?,
     })
 }
@@ -66,6 +68,7 @@ fn config_from(profile: &HardwareProfile) -> Result<MachineConfig, String> {
         ram_size,
         clock_hz: profile.clock_hz,
         nominal_hz: profile.nominal_hz,
+        harts: usize::try_from(profile.harts).map_err(|_| "too many harts".to_string())?,
         disks,
         nets: Vec::new(),
     };
@@ -97,6 +100,10 @@ fn defaults_match_grail() {
     assert_eq!(avalon_proto::DEFAULT_RAM_SIZE, grail::DEFAULT_RAM_SIZE as u64);
     assert_eq!(avalon_proto::DEFAULT_NOMINAL_HZ, DEFAULT_NOMINAL_HZ);
     assert_eq!(
+        avalon_proto::DEFAULT_HARTS as usize,
+        MachineConfig::default().harts
+    );
+    assert_eq!(
         HardwareProfile::with_ram(4096),
         profile_from(&MachineConfig::with_ram(4096)).unwrap()
     );
@@ -112,6 +119,7 @@ fn configs_survive_the_wire() {
             ram_size: 64 * MIB,
             clock_hz: Some(2_000_000),
             nominal_hz: DEFAULT_NOMINAL_HZ,
+            harts: 2,
             disks: Vec::new(),
             nets: Vec::new(),
         },
@@ -119,6 +127,7 @@ fn configs_survive_the_wire() {
             ram_size: 4096,
             clock_hz: Some(u32::MAX),
             nominal_hz: 1,
+            harts: MAX_HARTS,
             disks: Vec::new(),
             nets: Vec::new(),
         },
@@ -154,6 +163,14 @@ fn invalid_profiles_decode_and_are_left_to_the_server() {
         },
         HardwareProfile {
             nominal_hz: 0,
+            ..HardwareProfile::default()
+        },
+        HardwareProfile {
+            harts: 0,
+            ..HardwareProfile::default()
+        },
+        HardwareProfile {
+            harts: MAX_HARTS as u32 + 1,
             ..HardwareProfile::default()
         },
     ] {

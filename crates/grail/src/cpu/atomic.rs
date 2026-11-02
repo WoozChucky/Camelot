@@ -1,12 +1,13 @@
 //! The A extension: `lr.w`, `sc.w` and the `amo*.w` read-modify-write
 //! instructions (spec section 4.1).
 //!
-//! Grail runs one instruction at a time on one hart, so an AMO's read and
-//! write cannot be split by anything else and the `aq`/`rl` bits need no
-//! work. What remains is the address checks and the LR/SC reservation
+//! Grail runs one instruction at a time, its harts taking turns, so an AMO's
+//! read and write cannot be split by another hart's access, and the `aq`/`rl`
+//! bits need no work. What remains is the address checks and the LR/SC reservation
 //! ([`super::Reservation`]).
 
-use super::Cpu;
+use super::Hart;
+use crate::bus::Bus;
 use crate::trap::{Access, Trap};
 use excalibur::AmoOp;
 
@@ -25,30 +26,29 @@ fn amo_result(op: AmoOp, old: u32, src: u32) -> u32 {
     }
 }
 
-impl Cpu {
+impl Hart {
     /// The checks every A instruction makes on its address, in this order: it
     /// must be word-aligned (else address-misaligned), translate with `access`
     /// permissions (page faults, A/D bits), and land in memory, RAM or VRAM
     /// (else access fault: device registers do not support atomics).
-    fn atomic_paddr(&mut self, vaddr: u32, access: Access) -> Result<u32, Trap> {
+    fn atomic_paddr(&mut self, bus: &mut Bus, vaddr: u32, access: Access) -> Result<u32, Trap> {
         if vaddr & 3 != 0 {
             return Err(Trap::new(access.misaligned(), vaddr));
         }
-        let paddr = self.translate(vaddr, access)?;
-        if !self.bus.is_memory(paddr, 4) {
+        let paddr = self.translate(bus, vaddr, access)?;
+        if !bus.is_memory(paddr, 4) {
             return Err(Trap::new(access.access_fault(), vaddr));
         }
         Ok(paddr)
     }
 
     /// `lr.w`: loads the word and reserves it. Faults like a load.
-    pub(super) fn load_reserved(&mut self, vaddr: u32) -> Result<u32, Trap> {
-        let paddr = self.atomic_paddr(vaddr, Access::Load)?;
-        let v = self
-            .bus
+    pub(super) fn load_reserved(&mut self, bus: &mut Bus, vaddr: u32) -> Result<u32, Trap> {
+        let paddr = self.atomic_paddr(bus, vaddr, Access::Load)?;
+        let v = bus
             .read(paddr, 4)
             .map_err(|_| Trap::new(Access::Load.access_fault(), vaddr))?;
-        self.reservation.reserve(paddr);
+        bus.reservation_mut(self.id as usize).reserve(paddr);
         Ok(v)
     }
 
@@ -60,18 +60,18 @@ impl Cpu {
     /// fails before touching memory: no translation, so no page fault and no
     /// A/D update. With one, the address is checked like a store's (faults,
     /// A and D set) before it is compared with the reservation.
-    pub(super) fn store_conditional(&mut self, vaddr: u32, val: u32) -> Result<u32, Trap> {
+    pub(super) fn store_conditional(&mut self, bus: &mut Bus, vaddr: u32, val: u32) -> Result<u32, Trap> {
         if vaddr & 3 != 0 {
             return Err(Trap::new(Access::Store.misaligned(), vaddr));
         }
-        if self.reservation.held().is_none() {
+        if bus.reservation(self.id as usize).held().is_none() {
             return Ok(1);
         }
-        let paddr = self.atomic_paddr(vaddr, Access::Store)?;
-        if !self.reservation.take(paddr) {
+        let paddr = self.atomic_paddr(bus, vaddr, Access::Store)?;
+        if !bus.reservation_mut(self.id as usize).take(paddr) {
             return Ok(1);
         }
-        self.write_phys(paddr, 4, val)
+        self.write_phys(bus, paddr, 4, val)
             .map_err(|_| Trap::new(Access::Store.access_fault(), vaddr))?;
         Ok(0)
     }
@@ -79,11 +79,11 @@ impl Cpu {
     /// `amo<op>.w`: reads the word, writes `op(old, src)` back and returns the
     /// old value for rd. Faults like a store (the page must be writable, and A
     /// and D get set), with store/AMO causes.
-    pub(super) fn amo(&mut self, op: AmoOp, vaddr: u32, src: u32) -> Result<u32, Trap> {
-        let paddr = self.atomic_paddr(vaddr, Access::Store)?;
+    pub(super) fn amo(&mut self, bus: &mut Bus, op: AmoOp, vaddr: u32, src: u32) -> Result<u32, Trap> {
+        let paddr = self.atomic_paddr(bus, vaddr, Access::Store)?;
         let fault = |_| Trap::new(Access::Store.access_fault(), vaddr);
-        let old = self.bus.read(paddr, 4).map_err(fault)?;
-        self.write_phys(paddr, 4, amo_result(op, old, src))
+        let old = bus.read(paddr, 4).map_err(fault)?;
+        self.write_phys(bus, paddr, 4, amo_result(op, old, src))
             .map_err(fault)?;
         Ok(old)
     }

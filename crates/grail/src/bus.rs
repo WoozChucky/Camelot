@@ -1,7 +1,8 @@
 //! Physical address space. See spec section 7 for the memory map.
 
-use crate::block::BlockDevice;
+use crate::block::{self, BlockDevice};
 use crate::config::MachineConfig;
+use crate::cpu::Reservation;
 use crate::devices::{Clint, Plic, TestDevice, Uart, BLK_IRQ, KBD_IRQ, NET_IRQ, PTR_IRQ, UART_IRQ};
 use crate::framebuffer::{Framebuffer, VRAM_SIZE};
 use crate::keyboard::Keyboard;
@@ -11,6 +12,9 @@ use crate::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use std::io::Write;
 
 pub const BOOT_ROM_BASE: u32 = 0x0000_1000;
+/// Where harts other than hart 0 start: the boot ROM's park loop, which waits for an
+/// IPI and then jumps to the entry point (spec section 7, "Boot").
+pub const PARK_PC: u32 = BOOT_ROM_BASE + 0x20;
 pub const TEST_DEV_BASE: u32 = 0x0010_0000;
 pub const TEST_DEV_SIZE: u32 = 0x1000;
 pub const CLINT_BASE: u32 = 0x0200_0000;
@@ -96,6 +100,7 @@ pub enum Exit {
 
 pub struct Bus {
     pub ram: Vec<u8>,
+    /// The boot ROM's bytes, from `BOOT_ROM_BASE` (the rest of its page reads as 0).
     pub rom: Vec<u8>,
     pub clint: Clint,
     pub plic: Plic,
@@ -116,6 +121,11 @@ pub struct Bus {
     pub tohost: Option<u32>,
     /// Set when a device or `tohost` asks the machine to stop.
     pub exit: Option<Exit>,
+    /// Hart `i`'s LR/SC reservation. They live here, next to memory, because every
+    /// write to memory goes through the bus: a hart's store, an AMO or a `sc.w`
+    /// ([`Bus::snoop_store`]), and a device's DMA ([`Bus::tick`], [`Bus::write`]), so
+    /// each one breaks the reservations it touches whichever hart holds them.
+    reservations: Vec<Reservation>,
 }
 
 impl Bus {
@@ -132,11 +142,13 @@ impl Bus {
     pub fn with_nets(config: &MachineConfig, disks: Vec<BlockDevice>, nets: Vec<NetDevice>) -> Self {
         assert!(disks.len() <= MAX_DISKS, "at most {MAX_DISKS} disks");
         assert!(nets.len() <= MAX_NETS, "at most {MAX_NETS} network cards");
-        Bus {
+        let harts = config.harts;
+        assert!(harts >= 1, "a machine has at least one hart");
+        let mut bus = Bus {
             ram: vec![0; config.ram_size],
             rom: Vec::new(),
-            clint: Clint::default(),
-            plic: Plic::default(),
+            clint: Clint::new(harts),
+            plic: Plic::new(harts),
             uart: Uart::default(),
             fb: Framebuffer::default(),
             kbd: Keyboard::default(),
@@ -148,29 +160,113 @@ impl Bus {
             debug: None,
             tohost: None,
             exit: None,
+            reservations: vec![Reservation::default(); harts],
+        };
+        if harts > 1 {
+            // The park loop must be there before any program is loaded: the other harts
+            // run it from reset.
+            bus.set_boot_entry(0);
+        }
+        bus
+    }
+
+    /// How many harts share this bus.
+    pub fn harts(&self) -> usize {
+        self.reservations.len()
+    }
+
+    /// Fills the boot ROM (spec section 7, "Boot"). Hart 0 starts at `BOOT_ROM_BASE`, a
+    /// stub that jumps to `entry` with a0 = its hart id, 0. On a machine with more harts
+    /// the others start at [`PARK_PC`], a loop that waits in `wfi` until the hart's
+    /// `msip` is set (an IPI), clears it and jumps to `entry` too, with a0 = its hart id.
+    /// A one-hart machine's ROM has only the stub.
+    pub fn set_boot_entry(&mut self, entry: u32) {
+        let mut words = vec![
+            0x0000_0297, // 0x1000: auipc t0, 0
+            0x0102_a283, //         lw    t0, 16(t0)     the entry word
+            0x0000_0513, //         li    a0, 0
+            0x0002_8067, //         jr    t0
+            entry,       // 0x1010: the entry point
+        ];
+        if self.harts() > 1 {
+            words.resize(((PARK_PC - BOOT_ROM_BASE) / 4) as usize, 0);
+            words.extend([
+                0xf140_2573, // 0x1020: csrr  a0, mhartid
+                0x0025_1313, //         slli  t1, a0, 2
+                0x0200_02b7, //         lui   t0, 0x2000      CLINT_BASE
+                0x0062_8333, //         add   t1, t0, t1      t1 = &msip[hart]
+                0x0080_0393, //         li    t2, 8           mie.MSIE: msip ends wfi
+                0x3043_9073, //         csrw  mie, t2         (mstatus.MIE is 0: no trap)
+                0x1050_0073, // 0x1038: wfi
+                0x0003_2383, //         lw    t2, 0(t1)
+                0xfe03_8ce3, //         beqz  t2, 0x1038      not woken by an IPI: wait
+                0x0003_2023, //         sw    zero, 0(t1)     acknowledge the IPI
+                0x3040_1073, //         csrw  mie, zero
+                0x0000_12b7, //         lui   t0, 1           BOOT_ROM_BASE
+                0x0102_a283, //         lw    t0, 16(t0)      the entry word
+                0x0002_8067, //         jr    t0
+            ]);
+        }
+        self.rom = words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect();
+    }
+
+    /// Hart `hart`'s LR/SC reservation.
+    pub fn reservation(&self, hart: usize) -> Reservation {
+        self.reservations[hart]
+    }
+
+    pub fn reservation_mut(&mut self, hart: usize) -> &mut Reservation {
+        &mut self.reservations[hart]
+    }
+
+    /// Hart `hart` wrote `size` bytes at physical address `paddr` (a store, an AMO, a
+    /// successful `sc.w`, an A/D update): a write to memory breaks every reservation on
+    /// the words it touched, whichever hart holds it; a store to a device breaks the
+    /// storing hart's own reservation (the device may start a DMA into RAM).
+    pub fn snoop_store(&mut self, hart: usize, paddr: u32, size: u32) {
+        if self.reservations.iter().all(|r| r.held().is_none()) {
+            return;
+        }
+        if self.is_memory(paddr, size) {
+            for r in &mut self.reservations {
+                r.snoop(paddr, size);
+            }
+        } else {
+            self.reservations[hart].clear();
         }
     }
 
-    /// Fills the boot ROM with a stub that jumps to `entry` with a0 = hart id (0).
-    pub fn set_boot_entry(&mut self, entry: u32) {
-        let words: [u32; 5] = [
-            0x0000_0297, // auipc t0, 0
-            0x0102_a283, // lw    t0, 16(t0)
-            0x0000_0513, // li    a0, 0
-            0x0002_8067, // jr    t0
-            entry,
-        ];
-        self.rom = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    /// The start of a step ([`crate::cpu::Cpu::step`]): `mtime` ticks, then every
+    /// device's line is sampled ([`Bus::update_interrupts`]).
+    pub fn tick(&mut self) {
+        self.clint.mtime = self.clint.mtime.wrapping_add(1);
+        self.update_interrupts();
+    }
+
+    /// Lets `ticks` idle ticks pass at once for the devices that count steps (a paced
+    /// machine whose harts all wait in `wfi`, see [`crate::cpu::Cpu::idle`]): network
+    /// cards still poll their backends on time, and what they receive breaks
+    /// reservations as in [`Bus::update_interrupts`].
+    pub fn skip(&mut self, ticks: u64) {
+        let reservations = &mut self.reservations;
+        for nic in &mut self.nets {
+            nic.skip(ticks, &mut self.ram, &mut |paddr, len| {
+                reservations.iter_mut().for_each(|r| r.snoop(paddr, len))
+            });
+        }
     }
 
     /// Samples every device's interrupt line into the PLIC. Called once per step,
-    /// before the hart looks at `mip`. Network cards poll their backends from here
+    /// before the harts look at `mip`. Network cards poll their backends from here
     /// (every [`crate::net::POLL_STEPS`] steps), so received frames land in RAM between
-    /// two instructions; `dma` hears of each RAM range they write (physical address,
-    /// length), for the hart's LR/SC reservation.
-    pub fn update_interrupts(&mut self, dma: &mut dyn FnMut(u32, u32)) {
+    /// two instructions; each RAM range they write breaks the reservations on it, as a
+    /// store would.
+    pub fn update_interrupts(&mut self) {
+        let reservations = &mut self.reservations;
         for (i, nic) in self.nets.iter_mut().enumerate() {
-            nic.tick(&mut self.ram, dma);
+            nic.tick(&mut self.ram, &mut |paddr, len| {
+                reservations.iter_mut().for_each(|r| r.snoop(paddr, len))
+            });
             self.plic.set_level(NET_IRQ + i as u32, nic.irq());
         }
         let uart = self.uart.irq();
@@ -282,7 +378,11 @@ impl Bus {
             return Ok(());
         }
         if let Some((i, off)) = self.disk_at(addr) {
-            // The disk moves data between itself and RAM on its own (DMA).
+            if off == block::REG_CMD {
+                // The disk moves data between itself and RAM on its own (DMA), which
+                // may write any hart's reserved word: no reservation survives a command.
+                self.reservations.iter_mut().for_each(Reservation::clear);
+            }
             return self.disks[i].write(off, size, val, &mut self.ram);
         }
         if let Some((i, off)) = self.net_at(addr) {
@@ -379,6 +479,42 @@ mod tests {
         assert_eq!(bus.ram[4094], 0xaa);
         bus.load(RAM_BASE + 4095, &[9]).unwrap();
         assert_eq!(bus.ram[4095], 9);
+    }
+
+    #[test]
+    fn harts_share_the_bus() {
+        let config = MachineConfig {
+            harts: 3,
+            ..MachineConfig::with_ram(4096)
+        };
+        let mut bus = Bus::new(&config, Vec::new());
+        assert_eq!(bus.harts(), 3);
+        // The same devices as a one-hart machine: the CLINT and PLIC pages have room.
+        assert_eq!(bus.sysinfo.devices(), device_table(&MachineConfig::default(), 0));
+        assert_eq!(bus.read(SYSINFO_BASE + sysinfo::REG_HARTS, 4), Ok(3));
+        // The park loop is there from the start; set_boot_entry only sets the entry.
+        assert_eq!(bus.peek(PARK_PC), Some(0xf140_2573), "csrr a0, mhartid");
+        assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(0));
+        bus.set_boot_entry(RAM_BASE);
+        assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(RAM_BASE));
+        assert_eq!(bus.peek(PARK_PC), Some(0xf140_2573));
+
+        // A store to memory breaks every hart's reservation on the word; a store to a
+        // device only the storing hart's.
+        let reserve = |bus: &mut Bus| {
+            for hart in 0..3 {
+                bus.reservation_mut(hart).reserve(RAM_BASE + 4 * hart as u32);
+            }
+        };
+        let held = |bus: &Bus| -> Vec<bool> { (0..3).map(|h| bus.reservation(h).held().is_some()).collect() };
+        reserve(&mut bus);
+        bus.snoop_store(0, RAM_BASE + 4, 4);
+        assert_eq!(held(&bus), [true, false, true]);
+        bus.snoop_store(1, RAM_BASE, 8);
+        assert_eq!(held(&bus), [false, false, true]);
+        reserve(&mut bus);
+        bus.snoop_store(2, UART_BASE, 1);
+        assert_eq!(held(&bus), [true, true, false]);
     }
 
     #[test]
@@ -549,7 +685,7 @@ mod tests {
         assert_eq!(peer.recv(), Some(frame.clone()));
         // Card 0 is on the same hub, and gets it at its next poll: no ring, so dropped.
         for _ in 0..net::POLL_STEPS {
-            bus.update_interrupts(&mut |_, _| {});
+            bus.update_interrupts();
         }
         assert_eq!(bus.read(NET_BASE + net::REG_RX_DROPPED, 4), Ok(1));
         // Card 1's line reaches the PLIC as source NET_IRQ + 1.
@@ -613,7 +749,7 @@ mod tests {
         assert_eq!(bus.ram[8 + SECTOR_SIZE], 0);
 
         // Its line reaches the PLIC as source BLK_IRQ + 1.
-        bus.update_interrupts(&mut |_, _| {});
+        bus.update_interrupts();
         assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << (BLK_IRQ + 1)));
 
         // Words only; nothing past the last disk; not memory.
@@ -741,11 +877,11 @@ mod tests {
 
         // Its line reaches the PLIC as source PTR_IRQ once enabled.
         bus.ptr.push(PointerInput::move_to(1, 1));
-        bus.update_interrupts(&mut |_, _| {});
+        bus.update_interrupts();
         assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(0));
         bus.write(PTR_BASE + ptr::REG_CTRL, 4, ptr::CTRL_IRQ_ENABLE)
             .unwrap();
-        bus.update_interrupts(&mut |_, _| {});
+        bus.update_interrupts();
         assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << PTR_IRQ));
 
         // Words only, nothing popped by a faulting access; the page ends the range.

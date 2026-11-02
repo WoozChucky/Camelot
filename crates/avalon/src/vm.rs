@@ -775,12 +775,15 @@ fn pointer_input(change: PointerChange) -> PointerInput {
 }
 
 /// Whether a full-speed machine is stalled in `wfi` with only an external interrupt
-/// (input) left to wake it: no interrupt is pending, and the timer cannot fire (it is
-/// masked or not set; a set timer would end the wait at the next step).
+/// (input) left to wake it: every hart waits with no interrupt pending, and no hart's
+/// timer can fire (it is masked or not set; a set timer would end the wait at the next
+/// step).
 fn parked(machine: &Machine) -> bool {
     let cpu = &machine.cpu;
-    let timer_armed = cpu.csr.mie & (1 << IRQ_M_TIMER) != 0 && cpu.bus.clint.mtimecmp != u64::MAX;
-    cpu.waiting && !timer_armed
+    let timer_armed = |hart: &grail::cpu::Hart| {
+        hart.csr.mie & (1 << IRQ_M_TIMER) != 0 && cpu.bus.clint.mtimecmp[hart.id as usize] != u64::MAX
+    };
+    cpu.all_idle() && !cpu.harts().iter().any(timer_armed)
 }
 
 fn event_frame(msg: &Message) -> Frame {

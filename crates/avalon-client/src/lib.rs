@@ -26,7 +26,7 @@ use std::time::Duration;
 pub mod parse;
 pub mod show;
 
-pub use parse::{parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_ram};
+pub use parse::{parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_ram};
 pub use show::{device_name, disk_source_text, format_hz, format_size};
 
 /// How long [`Client::connect`] tries each address of the server before giving up.

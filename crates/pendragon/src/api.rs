@@ -12,7 +12,7 @@ use crate::http::{Request, Response};
 use crate::json::Json;
 use avalon_client::{
     format_hz, format_size, holds_disks, lake_disks, parse_clock, parse_disk_size, parse_disk_source,
-    parse_ram, Client, Timeouts, VmAction,
+    parse_harts, parse_ram, Client, Timeouts, VmAction,
 };
 use avalon_proto::{
     validate_name, DeviceSpec, DiskInfo, DiskSpec, ErrorCode, HardwareProfile, VmDetails, VmRef, VmState,
@@ -599,12 +599,16 @@ struct Create {
     start: bool,
 }
 
-/// `{"name", "ram", "clock", "disks": [{"source", "read_only"}], "program", "start"}`:
-/// `ram` and `clock` as Round Table's `--ram` and `--clock` take them (a number of MiB,
-/// a frequency with Hz/kHz/MHz; an empty clock is full speed), each disk source a path
+/// `{"name", "ram", "clock", "harts", "disks": [{"source", "read_only"}], "program",
+/// "start"}`: `ram`, `clock` and `harts` as Round Table's `--ram`, `--clock` and
+/// `--harts` take them (a number of MiB, a frequency with Hz/kHz/MHz, a number of harts;
+/// an empty clock is full speed, an empty hart count one hart), each disk source a path
 /// on Avalon's host or `lake://ADDR/NAME`, the program an ELF file in base64.
 fn parse_create(body: &Json) -> Result<Create, Fail> {
-    only_keys(body, &["name", "ram", "clock", "disks", "program", "start"])?;
+    only_keys(
+        body,
+        &["name", "ram", "clock", "harts", "disks", "program", "start"],
+    )?;
     let name = string(body, "name")?.ok_or_else(|| Fail::bad("name: a VM needs a name"))?;
     validate_name(name).map_err(|e| Fail::bad(format!("name: {e}")))?;
     let mut profile = HardwareProfile::default();
@@ -613,6 +617,9 @@ fn parse_create(body: &Json) -> Result<Create, Fail> {
     }
     if let Some(clock) = string(body, "clock")?.filter(|s| !s.trim().is_empty()) {
         profile.clock_hz = Some(parse_clock(clock.trim()).map_err(|e| Fail::bad(format!("clock: {e}")))?);
+    }
+    if let Some(harts) = string(body, "harts")?.filter(|s| !s.trim().is_empty()) {
+        profile.harts = parse_harts(harts.trim()).map_err(|e| Fail::bad(format!("harts: {e}")))?;
     }
     match body.get("disks") {
         None | Some(Json::Null) => {}
@@ -710,6 +717,7 @@ fn vm_json(vm: &VmSummary) -> Json {
         ),
         ("nominal_hz", profile.nominal_hz.into()),
         ("nominal_text", format_hz(profile.nominal_hz).into()),
+        ("harts", profile.harts.into()),
         ("disks", Json::Array(disks)),
         ("actions", actions.into()),
     ])
@@ -816,13 +824,14 @@ mod tests {
     #[test]
     fn create_requests() {
         let c = create(
-            r#"{"name": "web", "ram": "64", "clock": "1.5MHz", "start": true, "program": "AQID",
+            r#"{"name": "web", "ram": "64", "clock": "1.5MHz", "harts": "2", "start": true, "program": "AQID",
                 "disks": [{"source": "lake://127.0.0.1:7401/data"}, {"source": "boot.img", "read_only": true}]}"#,
         )
         .unwrap();
         assert_eq!(c.name, "web");
         assert_eq!(c.profile.ram_size, 64 << 20);
         assert_eq!(c.profile.clock_hz, Some(1_500_000));
+        assert_eq!(c.profile.harts, 2);
         assert_eq!(c.program, [1, 2, 3]);
         assert!(c.start);
         assert_eq!(c.profile.devices.len(), 2);
@@ -834,7 +843,9 @@ mod tests {
             })
         );
         // Defaults: Grail's machine, not started.
-        let c = create(r#"{"name": "a", "program": "AA==", "ram": "", "clock": " ", "disks": []}"#).unwrap();
+        let c =
+            create(r#"{"name": "a", "program": "AA==", "ram": "", "clock": " ", "harts": "", "disks": []}"#)
+                .unwrap();
         assert_eq!(c.profile, HardwareProfile::default());
         assert!(!c.start);
 
@@ -859,6 +870,14 @@ mod tests {
             (
                 r#"{"name": "a", "program": "AA==", "clock": "fast"}"#,
                 "clock: 'fast' is not a frequency",
+            ),
+            (
+                r#"{"name": "a", "program": "AA==", "harts": "0"}"#,
+                "harts: 0 harts is out of range (1 to 8)",
+            ),
+            (
+                r#"{"name": "a", "program": "AA==", "harts": 2}"#,
+                "harts: not a string",
             ),
             (
                 r#"{"name": "a", "program": "AA==", "disks": "x"}"#,
@@ -985,7 +1004,7 @@ mod tests {
         };
         assert_eq!(
             vm_json(&vm).encode(),
-            r#"{"id":3,"name":"web","state":"exited","state_text":"exited(2)","exit_code":2,"ram":67108864,"ram_text":"64 MiB","clock_hz":1500000,"clock_text":"1.5 MHz","nominal_hz":10000000,"nominal_text":"10 MHz","disks":[{"source":"lake://127.0.0.1:7401/data","read_only":true,"lake":{"addr":"127.0.0.1:7401","name":"data"},"held":false}],"actions":["destroy"]}"#
+            r#"{"id":3,"name":"web","state":"exited","state_text":"exited(2)","exit_code":2,"ram":67108864,"ram_text":"64 MiB","clock_hz":1500000,"clock_text":"1.5 MHz","nominal_hz":10000000,"nominal_text":"10 MHz","harts":1,"disks":[{"source":"lake://127.0.0.1:7401/data","read_only":true,"lake":{"addr":"127.0.0.1:7401","name":"data"},"held":false}],"actions":["destroy"]}"#
         );
     }
 }
