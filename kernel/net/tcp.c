@@ -731,21 +731,32 @@ static void sync_input(struct tcp_sock *s, struct seg *g) {
 
     /* 1. Is it within the window? A segment that is not gets an ACK saying
      * where we are (unless it is a reset), the answer to a duplicate. With
-     * the window closed, a segment at rcv_nxt (a probe) still has its ACK
-     * looked at, but its data is not taken. */
+     * the window closed, RFC 9293 asks for "special allowance" for valid
+     * ACKs: a segment at rcv_nxt (a probe), or a little past it (a peer that
+     * probed with new data counts those bytes as sent, so its next segments
+     * start past what this end took), still has its ACK and window looked
+     * at, but its data is not taken.
+     *
+     * An empty segment may also sit right at the window's edge (rcv_nxt +
+     * wnd, as Linux allows; RFC 9293 stops one short): a peer that filled
+     * the window sends its ACKs from there, and when a segment of its was
+     * lost, they would all be dropped, with the ACKs of what this end sent,
+     * until the peer resent the lost one. */
     u32 wnd = rcv_space(s);
     u32 len = seg_len(g);
     bool ok;
     if (len == 0) {
-        ok = wnd == 0 ? g->seq == s->rcv_nxt : in_window(s, g->seq, wnd);
+        ok = seq_le(s->rcv_nxt, g->seq) && seq_le(g->seq, s->rcv_nxt + wnd);
     } else {
         ok = wnd != 0 && (in_window(s, g->seq, wnd) || in_window(s, g->seq + len - 1, wnd));
     }
     if (!ok) {
-        if (wnd == 0 && g->seq == s->rcv_nxt && !(g->flags & (TH_RST | TH_SYN))) {
+        if (wnd == 0 && seq_le(s->rcv_nxt, g->seq) && seq_le(g->seq, s->rcv_adv + s->mss) &&
+            !(g->flags & (TH_RST | TH_SYN))) {
             g->len = 0;
             g->flags &= ~(u32)TH_FIN;
-            s->ack_now = true;
+            /* A probe gets an ACK saying the window is still closed. */
+            s->ack_now = s->ack_now || len > 0;
         } else {
             if (!(g->flags & TH_RST)) {
                 if (s->state == TCP_TIME_WAIT_STATE && (g->flags & TH_FIN)) {
@@ -1195,10 +1206,10 @@ int tcp_shutdown(struct tcp_sock *s) {
     } else if (s->state == TCP_CLOSE_WAIT) {
         queue_fin(s);
         s->state = TCP_LAST_ACK;
-    } else if (s->fin_queued) {
+    } else if (s->fin_queued && s->state != TCP_CLOSED) {
         return 0; /* done already */
     } else {
-        return -ENOTCONN;
+        return not_connected(s);
     }
     output(s, false);
     return 0;
