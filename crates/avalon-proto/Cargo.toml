@@ -1,0 +1,12 @@
+[package]
+name = "avalon-proto"
+description = "The Avalon protocol: framing, messages and a blocking connection shared by Avalon, Round Table, Herald and Lake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+# Only to check that the hardware profile mirrors grail::MachineConfig field for field.
+grail = { path = "../grail" }

@@ -11,8 +11,8 @@ static u32 timebase;
 u32 timebase_hz(void) {
     if (timebase == 0) {
         u32 hz = 0;
-        if (mmio_read32(SYS_MAGIC) == SYSINFO_MAGIC) {
-            hz = mmio_read32(SYS_TIMEBASE_HZ);
+        if (sysinfo_read(SYS_MAGIC) == SYSINFO_MAGIC) {
+            hz = sysinfo_read(SYS_TIMEBASE_HZ);
         }
         timebase = hz != 0 ? hz : TIMEBASE_HZ_NOMINAL;
     }
