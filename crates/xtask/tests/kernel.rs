@@ -98,6 +98,8 @@ const ECALL_FROM_S: u32 = grail::trap::Exception::EcallS as u32;
 /// scause of a page fault on a load and on a store.
 const LOAD_PAGE_FAULT: u32 = grail::trap::Exception::LoadPageFault as u32;
 const STORE_PAGE_FAULT: u32 = grail::trap::Exception::StorePageFault as u32;
+/// scause of an illegal instruction.
+const ILLEGAL_INSTRUCTION: u32 = grail::trap::Exception::IllegalInstr as u32;
 
 fn kernel_dir() -> PathBuf {
     repo_root().join("kernel")
@@ -1639,6 +1641,8 @@ fn kernel_asm_is_merlin_dialect() {
 /// The top of user space and the stack page under it (kernel/include/vm.h).
 const USER_TOP: u32 = 0x40_0000;
 const USER_STACK: u32 = USER_TOP - PAGE;
+/// Where program segments must end: below the guard page under the stack.
+const USER_LOAD_TOP: u32 = USER_STACK - PAGE;
 /// Where user programs start (kernel/user/user.ld).
 const USER_TEXT: u32 = 0x1000;
 /// `sizeof(struct trap_frame)` (kernel/include/trap.h).
@@ -1686,6 +1690,32 @@ fn kernel_satp(m: &Machine, elf: &grail::elf::Elf) -> u32 {
     let root = m.cpu.bus.peek(sym(elf, "kernel_pagetable")).unwrap();
     assert_ne!(root, 0, "no kernel page table yet");
     (1 << 31) | (root >> 12)
+}
+
+/// Steps `m` until the kernel has printed its `n`th prompt since boot, at
+/// most `RUN_MAX_STEPS` steps. Only the bytes printed since the last step are
+/// looked at, so a kernel that never gets there fails in seconds rather than
+/// rebuilding its whole output on every instruction.
+fn step_to_prompt(m: &mut Machine, n: usize) {
+    let prompt = PROMPT.as_bytes();
+    let (mut seen, mut count) = (0, 0);
+    for _ in 0..RUN_MAX_STEPS {
+        let out = &m.cpu.bus.uart.captured;
+        while seen < out.len() {
+            seen += 1;
+            if out[..seen].ends_with(prompt) {
+                count += 1;
+            }
+        }
+        if count >= n {
+            return;
+        }
+        m.cpu.step();
+    }
+    panic!(
+        "no prompt {n} after {RUN_MAX_STEPS} steps; output:\n{}",
+        printed(m)
+    );
 }
 
 /// Pages free in the allocator (`nfree` in kernel/kalloc.c).
@@ -1811,7 +1841,7 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
     // all with U; nothing at page 0 or in the guard page under the stack.
     // Everything above is the kernel's, none of it with U.
     let (leaves, tables) = page_table(&m, satp);
-    let (kleaves, _) = page_table(&m, ksatp);
+    let (kleaves, ktables) = page_table(&m, ksatp);
     let user: Vec<(u32, u32)> = leaves
         .iter()
         .filter(|(va, _)| *va < USER_TOP)
@@ -1842,8 +1872,71 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
         let pa = (pte >> 10) * PAGE;
         assert!(pa >= sym(&elf, "__kernel_end"), "{va:#x} at {pa:#x}");
     }
-    // One root, one table for user space, the kernel's tables shared.
-    assert!(tables > 2);
+    // Its own root, one table for user space where the kernel has its root[0]
+    // table, and the kernel's other second-level tables, shared: as many as
+    // the kernel's.
+    assert_eq!(tables, ktables);
+}
+
+#[test]
+fn programs_get_zeroed_memory_and_writable_data() {
+    // data checks that its stack page and its .bss (two pages, the second with
+    // no file bytes) read zero, that its .data word holds its initial value,
+    // and that .data and .bss take stores; then it dirties them. The pages it
+    // gives back are reused by the second run (the allocator doesn't clear
+    // freed pages), so that one passes only if the loader and the stack get
+    // zeroed pages.
+    let (mut m, _) = load_committed_on(
+        MachineConfig::default(),
+        Some(kernel::typed(b"run data\nrun data\nhalt\n")),
+    );
+    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
+    let (leaves, _) = page_table(&m, m.cpu.csr.satp);
+    let user: Vec<(u32, u32)> = leaves
+        .iter()
+        .filter(|(va, _)| *va < USER_TOP)
+        .map(|&(va, pte)| (va, pte & PTE_KERNEL_BITS))
+        .collect();
+    let (ur, urw) = (PTE_V | PTE_U | PTE_R, PTE_V | PTE_U | PTE_R | PTE_W);
+    // Text, then .data and .bss in one PF_R|PF_W segment, then the stack.
+    assert_eq!(
+        user,
+        [
+            (USER_TEXT, ur | PTE_X),
+            (USER_TEXT + PAGE, urw),
+            (USER_TEXT + 2 * PAGE, urw),
+            (USER_STACK, urw)
+        ],
+        "{user:x?}"
+    );
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
+    let out = printed(&m);
+    assert!(
+        out.ends_with(&format!(
+            "{PROMPT}run data\npid 1 (data) exited: 0\n\
+             {PROMPT}run data\npid 2 (data) exited: 0\n\
+             {PROMPT}halt\n"
+        )),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_store_to_read_only_data_is_killed() {
+    // .rodata is mapped without W: badstore's store to it faults.
+    let out = run_processes(b"run badstore\nhalt\n");
+    let lines = command_output(&out, "run badstore");
+    assert_eq!(lines.len(), 3, "{out}");
+    assert_eq!(lines[0], "pid 1 (badstore) killed: store page fault");
+    assert_eq!(
+        lines[1],
+        format!(
+            "  scause {STORE_PAGE_FAULT:#010x}  sepc {:#010x}  stval {:#010x}",
+            USER_TEXT + 8,
+            USER_TEXT + PAGE
+        )
+    );
+    assert!(lines[2].ends_with(" ---U--RV"), "{out}");
 }
 
 /// The registers `cpu` holds, and its pc.
@@ -1956,7 +2049,7 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
         faults,
         [
             (LOAD_PAGE_FAULT, USER_TEXT + 4, 0x8000_0000),
-            (2, USER_TEXT + 4, xcal_halt_a0)
+            (ILLEGAL_INSTRUCTION, USER_TEXT + 4, xcal_halt_a0)
         ]
     );
     let text = sym(&elf, "__text_start");
@@ -2026,26 +2119,23 @@ fn input_typed_while_processes_run_reaches_the_shell() {
 fn processes_give_back_every_page() {
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
-    let mut prompts = 0;
+    let mut prompts = 1;
     let mut command = |m: &mut Machine, line: &str| {
         for b in line.bytes() {
             tx.send(b).unwrap();
         }
         prompts += 1;
-        let want = prompts;
-        step_until(
-            m,
-            RUN_MAX_STEPS,
-            |_| {},
-            |m| printed(m).matches(PROMPT).count() > want,
-        );
+        step_to_prompt(m, prompts);
     };
-    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    step_to_prompt(&mut m, 1);
     let before = free_pages(&m, &elf);
 
-    // Every program: the ones that exit and the ones that are killed.
-    command(&mut m, "run badhalt badload badptr hello ping pong regs\n");
-    assert_eq!(free_pages(&m, &elf), before);
+    // Every program, the ones that exit and the ones that are killed, as many
+    // at a time as there are slots.
+    for some in program_names().chunks(NPROC) {
+        command(&mut m, &format!("run {}\n", some.join(" ")));
+        assert_eq!(free_pages(&m, &elf), before, "{some:?}");
+    }
     // More than there are slots: the ninth can't start.
     let hellos = ["hello"; NPROC + 1].join(" ");
     command(&mut m, &format!("run {hellos}\n"));
@@ -2070,11 +2160,13 @@ fn processes_give_back_every_page() {
 const E_TYPE: u32 = 16;
 const E_MACHINE: u32 = 18;
 const E_ENTRY: u32 = 24;
+const E_PHOFF: u32 = 28;
 const E_PHENTSIZE: u32 = 42;
 const E_PHNUM: u32 = 44;
 const P_OFFSET: u32 = 4;
 const P_VADDR: u32 = 8;
 const P_FILESZ: u32 = 16;
+const P_MEMSZ: u32 = 20;
 const P_FLAGS: u32 = 24;
 
 /// Bytes to write at an offset into an ELF image.
@@ -2083,18 +2175,40 @@ type Patch<'a> = (u32, &'a [u8]);
 #[test]
 fn the_elf_loader_refuses_bad_images() {
     // hello's image in the kernel, patched in memory one way at a time; each
-    // `run hello` must fail with the loader's reason, leak nothing, and leave
-    // the kernel running.
+    // `run hello` must fail with the loader's reason (or run, for the patch
+    // that keeps the image good), leak nothing, and leave the kernel running.
     let hello = xtask::userprogs::build_program(&xtask::userprogs::user_dir(&repo_root()), "hello").unwrap();
     let parsed = elf32::Elf::parse(&hello.elf).unwrap();
     let phoff = parsed.header.phoff;
+    let size = hello.elf.len() as u32;
     let loads: Vec<u32> = (0..u32::from(parsed.header.phnum))
         .filter(|&i| parsed.segments[i as usize].ty == elf32::PT_LOAD)
         .collect();
     assert_eq!(loads.len(), 2, "hello: text and rodata");
-    let ph = |i: u32, field: u32| phoff + 32 * loads[i as usize] + field;
+    let ph = |i: u32, field: u32| phoff + elf32::PHDR_SIZE as u32 * loads[i as usize] + field;
     let text = &parsed.segments[loads[0] as usize];
-    let rodata_va = parsed.segments[loads[1] as usize].vaddr;
+    let rodata = &parsed.segments[loads[1] as usize];
+    // The cases rely on this layout: text on the first page, then a few bytes
+    // of rodata on the next, less than a page before the end of the file.
+    assert_eq!((text.vaddr, rodata.vaddr), (USER_TEXT, USER_TEXT + PAGE));
+    assert!(text.memsz <= PAGE && rodata.memsz < PAGE);
+    assert_eq!(rodata.filesz, rodata.memsz);
+    assert!(rodata.offset + PAGE > size);
+    // hello reaches its rodata pc-relatively, so it still runs with both
+    // segments moved by the same amount: here, so that its rodata, given a
+    // whole page, ends right at USER_LOAD_TOP.
+    let (high_text, high_rodata) = (USER_LOAD_TOP - 2 * PAGE, USER_LOAD_TOP - PAGE);
+    let moved_high = |rodata_memsz: u32| -> Vec<(u32, [u8; 4])> {
+        vec![
+            (E_ENTRY, high_text.to_le_bytes()),
+            (ph(0, P_VADDR), high_text.to_le_bytes()),
+            (ph(1, P_VADDR), high_rodata.to_le_bytes()),
+            (ph(1, P_MEMSZ), rodata_memsz.to_le_bytes()),
+        ]
+    };
+    let (at_top, past_top) = (moved_high(PAGE), moved_high(PAGE + 1));
+    let at_top: Vec<Patch<'_>> = at_top.iter().map(|(o, b)| (*o, &b[..])).collect();
+    let past_top: Vec<Patch<'_>> = past_top.iter().map(|(o, b)| (*o, &b[..])).collect();
 
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
@@ -2104,68 +2218,129 @@ fn the_elf_loader_refuses_bad_images() {
         Some(u32::from_le_bytes(hello.elf[..4].try_into().unwrap())),
         "the kernel embeds what kernel/user builds"
     );
-    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    step_to_prompt(&mut m, 1);
     let before = free_pages(&m, &elf);
 
-    let cases: &[(&str, &[Patch<'_>])] = &[
-        ("not an ELF file", &[(0, b"\x7fELG")]),
-        ("not a 32-bit little-endian RISC-V file", &[(4, &[2])]),
-        ("not a 32-bit little-endian RISC-V file", &[(5, &[2])]),
-        ("not a 32-bit little-endian RISC-V file", &[(E_MACHINE, &[62, 0])]),
-        ("not an executable", &[(E_TYPE, &[1, 0])]),
-        ("bad program headers", &[(E_PHENTSIZE, &[40, 0])]),
-        ("bad program headers", &[(E_PHNUM, &[0xff, 0xff])]),
+    // What `run hello` must say: the loader's reason, or `None` if it runs.
+    let cases: &[(Option<&str>, &[Patch<'_>])] = &[
+        (Some("not an ELF file"), &[(0, b"\x7fELG")]),
+        (Some("not a 32-bit little-endian RISC-V file"), &[(4, &[2])]),
+        (Some("not a 32-bit little-endian RISC-V file"), &[(5, &[2])]),
         (
-            "segment outside user space",
+            Some("not a 32-bit little-endian RISC-V file"),
+            &[(E_MACHINE, &[62, 0])],
+        ),
+        (Some("not an executable"), &[(E_TYPE, &[1, 0])]),
+        (Some("bad program headers"), &[(E_PHENTSIZE, &[40, 0])]),
+        (Some("bad program headers"), &[(E_PHNUM, &[0xff, 0xff])]),
+        // Program headers past the end of the file, and partly outside it.
+        (
+            Some("bad program headers"),
+            &[(E_PHOFF, &(size + 4).to_le_bytes())],
+        ),
+        (
+            Some("bad program headers"),
+            &[(E_PHOFF, &(size - 10).to_le_bytes())],
+        ),
+        (
+            Some("segment outside user space"),
             &[(ph(0, P_VADDR), &0x8000_0000u32.to_le_bytes())],
         ),
         (
-            "segment outside user space",
+            Some("segment outside user space"),
             &[(ph(0, P_VADDR), &0u32.to_le_bytes())],
         ),
         // The guard page under the stack.
         (
-            "segment outside user space",
+            Some("segment outside user space"),
             &[(ph(1, P_VADDR), &(USER_STACK - PAGE).to_le_bytes())],
         ),
+        // Starting below USER_LOAD_TOP but ending above it.
         (
-            "segment outside the file",
+            Some("segment outside user space"),
+            &[(ph(1, P_VADDR), &(USER_LOAD_TOP - 0x10).to_le_bytes())],
+        ),
+        // A size that wraps around the address space.
+        (
+            Some("segment outside user space"),
+            &[(ph(1, P_MEMSZ), &0xffff_f000u32.to_le_bytes())],
+        ),
+        // Ending right at USER_LOAD_TOP is fine, one byte further is not.
+        (None, &at_top),
+        (Some("segment outside user space"), &past_top),
+        (
+            Some("segment outside the file"),
             &[(ph(0, P_OFFSET), &0xffff_f000u32.to_le_bytes())],
         ),
         (
-            "segment outside the file",
+            Some("segment outside the file"),
             &[(ph(0, P_FILESZ), &0x10_0000u32.to_le_bytes())],
         ),
-        ("segment not readable", &[(ph(0, P_FLAGS), &1u32.to_le_bytes())]),
+        // p_filesz <= p_memsz, but the file bytes run past its end.
         (
-            "segments share a page",
+            Some("segment outside the file"),
+            &[
+                (ph(1, P_FILESZ), &PAGE.to_le_bytes()),
+                (ph(1, P_MEMSZ), &PAGE.to_le_bytes()),
+            ],
+        ),
+        // p_filesz > p_memsz, with the file bytes inside it.
+        (
+            Some("segment outside the file"),
+            &[(ph(1, P_FILESZ), &(rodata.memsz + 1).to_le_bytes())],
+        ),
+        (
+            Some("segment not readable"),
+            &[(ph(0, P_FLAGS), &1u32.to_le_bytes())],
+        ),
+        (
+            Some("segments share a page"),
             &[(ph(1, P_VADDR), &text.vaddr.to_le_bytes())],
         ),
         (
-            "entry point not in an executable segment",
-            &[(E_ENTRY, &rodata_va.to_le_bytes())],
+            Some("entry point not in an executable segment"),
+            &[(E_ENTRY, &rodata.vaddr.to_le_bytes())],
         ),
         (
-            "entry point not in an executable segment",
+            Some("entry point not in an executable segment"),
             &[(E_ENTRY, &0x8000_0000u32.to_le_bytes())],
         ),
+        // An empty segment is skipped: here the text, so there's no code.
+        (
+            Some("entry point not in an executable segment"),
+            &[(ph(0, P_MEMSZ), &0u32.to_le_bytes())],
+        ),
+        // In the text, but not on an instruction.
+        (
+            Some("misaligned entry point"),
+            &[(E_ENTRY, &(text.vaddr + 2).to_le_bytes())],
+        ),
     ];
-    for (n, (reason, patches)) in cases.iter().enumerate() {
+    let echo = format!("{PROMPT}run hello\n");
+    let mut runs = 0;
+    for (n, (want, patches)) in cases.iter().enumerate() {
         for (off, bytes) in *patches {
             m.cpu.bus.load(image + off, bytes).unwrap();
         }
         for b in b"run hello\n" {
             tx.send(*b).unwrap();
         }
-        step_until(
-            &mut m,
-            RUN_MAX_STEPS,
-            |_| {},
-            |m| printed(m).matches(PROMPT).count() == n + 2,
-        );
+        step_to_prompt(&mut m, n + 2);
+        // What this `run hello` printed, up to the new prompt.
         let out = printed(&m);
-        let last = out[..out.len() - PROMPT.len()].lines().last().unwrap();
-        assert_eq!(last, format!("run: cannot start hello: {reason}"), "case {n}");
+        let out = &out[..out.len() - PROMPT.len()];
+        let lines: Vec<&str> = out[out.rfind(&echo).unwrap() + echo.len()..].lines().collect();
+        let expected = match want {
+            Some(reason) => vec![format!("run: cannot start hello: {reason}")],
+            None => {
+                runs += 1;
+                vec![
+                    "hello from user mode".to_string(),
+                    format!("pid {runs} (hello) exited: 0"),
+                ]
+            }
+        };
+        assert_eq!(lines, expected, "case {n}");
         assert_eq!(free_pages(&m, &elf), before, "case {n} leaked");
         // Put the image back.
         for (off, bytes) in *patches {
@@ -2181,8 +2356,9 @@ fn the_elf_loader_refuses_bad_images() {
         tx.send(*b).unwrap();
     }
     assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
+    let pid = runs + 1;
     assert!(printed(&m).ends_with(&format!(
-        "{PROMPT}run hello\nhello from user mode\npid 1 (hello) exited: 0\n{PROMPT}halt\n"
+        "{echo}hello from user mode\npid {pid} (hello) exited: 0\n{PROMPT}halt\n"
     )));
 }
 

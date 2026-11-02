@@ -56,7 +56,8 @@ struct elf32_phdr {
  * every PT_LOAD segment goes into fresh zeroed pages, mapped with U and the
  * segment's permissions. Returns NULL and sets *entry, or returns what is
  * wrong with the image. Segments must lie in [USER_BASE, USER_LOAD_TOP) and
- * not share pages, and the entry point must be in an executable one. On an
+ * not share pages, and the entry point must be 4-byte aligned and in an
+ * executable one. On an
  * error, the pages mapped so far stay in `pt` for uvm_free() to release. */
 const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry);
 

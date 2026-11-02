@@ -96,7 +96,12 @@ const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry) {
         }
     }
 
-    /* The entry point must be code the program can run. */
+    /* The entry point must be code the program can run, on an instruction
+     * boundary: sepc would quietly drop its low bits (IALIGN is 32), and the
+     * program start somewhere other than where its header says. */
+    if (eh.entry % 4 != 0) {
+        return "misaligned entry point";
+    }
     u32 want = PTE_V | PTE_U | PTE_X;
     pte_t *pte = eh.entry < USER_TOP ? walk(pt, eh.entry, false) : NULL;
     if (pte == NULL || (*pte & want) != want) {

@@ -77,8 +77,10 @@ The programs live in `user/`, one `.s` file each, all linked with `user/lib.s`
 | `hello` | prints a line and exits |
 | `ping`, `pong` | print four numbered lines half a tick apart: run together, they take turns |
 | `regs` | fills every register, spins for three ticks and exits with 0 only if none changed |
+| `data` | exits with 0 only if its stack and `.bss` start zeroed and its `.data` holds its initial value and takes stores |
 | `badptr` | hands the kernel bad buffers and an unknown call, which must all be refused |
 | `badload` | reads kernel memory: killed by a load page fault |
+| `badstore` | writes to its own read-only data: killed by a store page fault |
 | `badhalt` | executes `xcal.halt`, which is M-mode only: killed by an illegal instruction |
 
 They talk to the kernel through two provisional ecalls (`include/syscall.h`):
