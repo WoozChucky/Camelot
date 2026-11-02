@@ -13,7 +13,7 @@
  *   shd: [7] 10.0.2.2:49152 connected
  *   shd: [7] 10.0.2.2:49152 hung up
  *   shd: [7] 10.0.2.2:49152 ended, exit -1
- *   shd: 10.0.2.2:49153 turned away: 4 sessions already
+ *   shd: 10.0.2.2:49153 turned away: too many sessions
  *
  * How it goes:
  *
@@ -32,13 +32,16 @@
  *   between looks after its sessions (`procs`): it collects each shell that
  *   ended and ends its connection (shutdown, so that a background program
  *   still holding it does not keep the client waiting), and hangs up the
- *   sessions whose client went away. A client that closes its side of the
- *   connection hangs up, as a telnet client does: once the shell has read
- *   everything the client sent (`fstat`: no byte waiting, and nlink 0, the
- *   other end gone), shd kills the shell and every process it started,
- *   which would otherwise run on, `sleep 5000` say, with nobody to see it.
+ *   sessions whose client went away.
+ * - A client that closes its side of the connection hangs up, as a telnet
+ *   client does. Once the shell has read everything the client sent
+ *   (`fstat`: no byte waiting, and nlink 0, the other end gone), shd kills
+ *   every process the shell started, and theirs, which would otherwise run
+ *   on, `sleep 5000` say, with nobody to see it. The shell then reads the
+ *   end of its input and ends by itself, as it does when the client leaves
+ *   between commands; one that is still there a second later is killed too.
  *   A script that sends commands and then closes its side should end with
- *   `exit`, so its last command is not cut short.
+ *   `exit`, so that its last command is not cut short.
  *
  * Security: there are no users yet, so the shell runs as whoever started
  * shd, which is root, with no password asked. shd is for a machine whose
@@ -54,13 +57,17 @@
 #define MAX_SESSIONS 8
 /* How long accept() waits before shd looks after its sessions. */
 #define TEND_USEC 500000
+/* Turns a shell may outlive its client by, alone, before it is killed. */
+#define LINGER_TURNS 2
 /* Processes procs() describes: more than the kernel has. */
 #define MAX_PROCS 32
 
 struct session {
     int pid; /* the shell; 0: a free entry */
     int fd;  /* shd's descriptor for the connection */
-    int hung_up;
+    /* Turns since the client went away with the shell alone left. */
+    int lingering;
+    int said_hung_up;
     struct sockaddr_in peer;
 };
 
@@ -127,15 +134,14 @@ static int state_of(int pid, int n) {
     return 0;
 }
 
-/* Kills the shell `pid` and every process it started, and theirs, from the
- * snapshot procs_now[0..n). Pids only grow, and the snapshot is in pid
- * order, so a parent always comes before its children: one pass finds
- * them all. */
-static void kill_tree(int pid, int n) {
-    int tree[MAX_PROCS];
-    int count = 0;
-    tree[count] = pid;
-    count++;
+/* Kills every process the shell `pid` started, and theirs, from the
+ * snapshot procs_now[0..n) (but those that have ended already). Returns
+ * how many it killed. Pids only grow, and the snapshot is in pid order, so
+ * a parent always comes before its children: one pass finds them all. */
+static int kill_descendants(int pid, int n) {
+    int tree[MAX_PROCS + 1];
+    int count = 1;
+    tree[0] = pid;
     for (int i = 0; i < n; i++) {
         int in = 0;
         for (int j = 0; j < count; j++) {
@@ -143,14 +149,25 @@ static void kill_tree(int pid, int n) {
                 in = 1;
             }
         }
-        if (in && count < MAX_PROCS) {
+        if (in) {
             tree[count] = (int)procs_now[i].pid;
             count++;
         }
     }
-    /* The children first: a shell killed first would orphan them. */
-    for (int j = count - 1; j >= 0; j--) {
-        kill(tree[j]);
+    /* The children first: a parent killed first would orphan them. */
+    int killed = 0;
+    for (int j = count - 1; j > 0; j--) {
+        if (state_of(tree[j], n) != PROC_ZOMBIE && kill(tree[j]) == 0) {
+            killed++;
+        }
+    }
+    return killed;
+}
+
+static void hung_up(struct session *s) {
+    if (!s->said_hung_up) {
+        say(s, "hung up");
+        s->said_hung_up = 1;
     }
 }
 
@@ -183,15 +200,20 @@ static void tend(void) {
             continue;
         }
         struct stat st;
-        if (fstat(s->fd, &st) == 0 && st.nlink == 0 && st.size == 0) {
-            /* The client is gone and the shell has read all it sent:
-             * nobody is left to see what runs. Again at every turn until
-             * the shell has ended, for what it started meanwhile. */
-            if (!s->hung_up) {
-                say(s, "hung up");
-                s->hung_up = 1;
-            }
-            kill_tree(s->pid, n);
+        if (fstat(s->fd, &st) != 0 || st.nlink != 0 || st.size != 0) {
+            continue;
+        }
+        /* The client is gone and the shell has read all it sent: nobody is
+         * left to see what runs. Again at every turn until the shell has
+         * ended, for what it started meanwhile. */
+        if (kill_descendants(s->pid, n) > 0) {
+            hung_up(s);
+            s->lingering = 0;
+        } else if (s->lingering < LINGER_TURNS) {
+            s->lingering++;
+        } else {
+            hung_up(s);
+            kill(s->pid);
         }
     }
 }
@@ -216,7 +238,7 @@ static void start_session(int fd, const struct sockaddr_in *peer, int max) {
         if (verbose) {
             printf("shd: ");
             print_peer(peer);
-            printf(" turned away: %d sessions already\n", active);
+            printf(" turned away: too many sessions\n");
         }
         return;
     }
@@ -230,7 +252,8 @@ static void start_session(int fd, const struct sockaddr_in *peer, int max) {
     }
     free_slot->pid = pid;
     free_slot->fd = fd;
-    free_slot->hung_up = 0;
+    free_slot->lingering = 0;
+    free_slot->said_hung_up = 0;
     memcpy(&free_slot->peer, peer, sizeof *peer);
     say(free_slot, "connected");
 }
