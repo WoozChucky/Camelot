@@ -23,7 +23,7 @@ fn samples_cover_the_whole_catalogue() {
 fn catalogue_is_in_code_order_and_grouped() {
     let codes: Vec<u16> = CATALOGUE.iter().map(|(code, _, _)| *code).collect();
     assert!(codes.windows(2).all(|w| w[0] < w[1]), "{codes:x?}");
-    assert!(codes.iter().all(|c| c >> 8 <= 5));
+    assert!(codes.iter().all(|c| c >> 8 <= 6));
 }
 
 #[test]
@@ -134,21 +134,21 @@ fn error_codes_round_trip() {
         assert_eq!(ErrorCode::from_u16(n), code);
         assert_ne!(code.to_string(), format!("error {n}"));
     }
-    assert_eq!(seen, (1..=18).collect());
+    assert_eq!(seen, (1..=20).collect());
     assert_eq!(ErrorCode::from_u16(0), ErrorCode::Other(0));
     assert_eq!(ErrorCode::from_u16(500).to_u16(), 500);
     assert_eq!(ErrorCode::Other(500).to_string(), "error 500");
 
     // `Other` with a named code's number would come back as the named code, so the
     // encoder refuses it: every message that encodes decodes to itself.
-    for n in 1..=18 {
+    for n in 1..=20 {
         let msg = Message::Error {
             code: ErrorCode::Other(n),
             message: "x".into(),
         };
         assert!(matches!(encode(&msg), Err(Error::Invalid(_))), "{n}");
     }
-    for n in [0, 19, u16::MAX] {
+    for n in [0, 21, u16::MAX] {
         let msg = Message::Error {
             code: ErrorCode::Other(n),
             message: "x".into(),

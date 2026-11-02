@@ -72,9 +72,17 @@ fn forged_list_counts_do_not_reserve_more_than_the_frame() {
     // 0xff filler makes the first element fail (a huge string length or a bad tag),
     // except for VmInfo's device entries, which are plain integers: those decode for
     // real until the payload runs out, and the vector grows with them.
+    let mut switch_head = Vec::new();
+    switch_head.extend(1u32.to_le_bytes()); // one switch
+    switch_head.extend(1u32.to_le_bytes()); // name "a"
+    switch_head.push(b'a');
+    switch_head.push(0); // no capture
+
     let cases = [
         ("VmList", forged(ty::VM_LIST, &[], 0xff)),
         ("DiskList", forged(ty::DISK_LIST, &[], 0xff)),
+        ("SwitchList", forged(ty::SWITCH_LIST, &[], 0xff)),
+        ("SwitchList.ports", forged(ty::SWITCH_LIST, &switch_head, 0xff)),
         ("CreateVm.devices", forged(ty::CREATE_VM, &create_head, 0xff)),
         ("VmInfo.devices", forged(ty::VM_INFO, &summary_head(), 0xff)),
     ];

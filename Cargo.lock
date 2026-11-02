@@ -41,12 +41,17 @@ name = "excalibur"
 version = "0.1.0"
 
 [[package]]
+name = "gateway"
+version = "0.1.0"
+
+[[package]]
 name = "grail"
 version = "0.1.0"
 dependencies = [
  "avalon-proto",
  "elf32",
  "excalibur",
+ "gateway",
 ]
 
 [[package]]

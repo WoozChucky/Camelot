@@ -24,12 +24,13 @@
 //! a bad descriptor is an error status for the program, never a host panic.
 //!
 //! Where frames go is a [`NetBackend`], chosen per card by whoever builds the machine: a
-//! port of an in-process [`Hub`] (tests; two machines on one hub), wrapped or not in a
-//! [`Pcap`] capture, or a backend of the host's own handed to
-//! [`crate::Machine::with_devices`].
+//! port of an in-process [`Hub`] (tests; two machines on one hub), a NAT
+//! [`gateway::Gateway`] (user networking, `user.rs`), wrapped or not in a [`Pcap`]
+//! capture, or a backend of the host's own handed to [`crate::Machine::with_devices`].
 
 mod hub;
 mod pcap;
+mod user;
 
 pub use hub::{Hub, HubPort, HUB_QUEUE};
 pub use pcap::{
