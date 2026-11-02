@@ -1,0 +1,5 @@
+# Test binaries and example ELFs are committed so no cross toolchain is needed.
+*.elf binary
+tests/riscv-tests/rv32* binary
+*.S text eol=lf
+*.sh text eol=lf
