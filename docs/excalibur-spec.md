@@ -169,7 +169,7 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 | 0x3100_0000 - 0x3112_BFFF | Framebuffer VRAM |
 | 0x8000_0000 - 0x803F_FFFF | RAM, 4 MiB by default, up to 0xFFFF_FFFF with more (`--ram`, 1-2048 MiB; software reads the size from sysinfo) |
 
-Unmapped accesses raise access-fault exceptions. Instructions and page tables live only in RAM and the boot ROM: an instruction fetch from VRAM or from any other range raises an instruction access fault, and a Sv32 page-table walk that reads a PTE outside them raises an access fault of the original access type. So neither can trigger a device register's read side effect (such as a PLIC claim).
+Unmapped accesses raise access-fault exceptions. Instructions and page tables live only in RAM and the boot ROM: an instruction fetch from VRAM or from any other range raises an instruction access fault, and a Sv32 page-table walk that reads a PTE outside them raises an access fault of the original access type. Grail's ELF loader likewise loads `PT_LOAD` segments only into RAM: a segment anywhere else, VRAM included, is an error. So neither can trigger a device register's read side effect (such as a PLIC claim).
 
 RAM: `--ram MiB` takes a whole number from 1 to 2048, the most that fits between 0x8000_0000 and the top of the 32-bit address space; anything else is rejected with an error. Without it a machine has 4 MiB, as does a VM on Avalon whose profile leaves the size at its default (`avalon_proto::DEFAULT_RAM_SIZE`, Round Table's and Pendragon's `--ram`): enough for Camelot booted from its 2 MiB root image ("Kernel filesystem", "Root image"), and for every example. Programs that need more say so with `--ram`. (As a library, Grail accepts any non-zero multiple of 4 KiB up to 2 GiB.) Software must not assume a size: it reads `SYS_RAM_SIZE` (section 9.5).
 
@@ -303,11 +303,11 @@ Grail also redraws at ~60 Hz on its own, so `FB_PRESENT` is optional. Host side:
 Details:
 
 - The registers are 32-bit only: byte or halfword accesses in 0x3000_0000 - 0x3000_0FFF raise access faults. Unused offsets in that page read as 0 and ignore writes, as do writes to the read-only registers. `FB_PRESENT` reads as 0.
-- `FB_CTRL` bits other than bit 0 are reserved, read as 0. Both registers reset to 0, so the display starts disabled.
+- `FB_CTRL` bits other than bit 0 are reserved, read as 0. `FB_CTRL` resets to 0, so the display starts disabled, and no present is pending at reset.
 - While the display is disabled it shows black; VRAM keeps its contents and can be drawn into before enabling.
 - VRAM is plain memory: byte, halfword and word accesses, same alignment rules as RAM (section 4). It resets to 0. The top byte of each pixel is ignored. Byte order in memory is B, G, R, X, which is also a 32-bpp Windows DIB, so Grail blits it without conversion.
 - Grail runs a machine and its window on one thread: the CPU runs in slices that end early right after a `FB_PRESENT` write (or, with `--clock`, when it is ahead of the wall clock; Grail then sleeps at most ~10 ms at a time so the window stays responsive); between slices it pumps the window's messages and redraws on a present, when Windows asks for a repaint, or when ~16 ms of host time have passed. The window is opened only with `--fb` (Windows only; elsewhere Grail warns and runs headless, the default). The image is stretched to the window's client area. Closing the window stops the emulator (exit code 0); if the program stops first, the window stays open on the last frame until it is closed, and Grail then exits with the program's code.
-- `--fb-dump DIR` writes `DIR/frame-NNNN.ppm` (binary P6, 640×480, numbered from 0000) after every `FB_PRESENT` and once more when the machine stops. It works with or without the window.
+- `--fb-dump DIR` writes `DIR/frame-NNNN.ppm` (binary P6, 640×480, numbered from 0000) after every `FB_PRESENT` and once more when the machine stops. NNNN is at least four digits: frame 10000 is `frame-10000.ppm`, so past 9999 frames, sort the names by number rather than as text. Each file is 921,615 bytes and nothing limits the rate, so a program that presents in a tight loop fills the disk quickly: dumps are for tests and short runs. It works with or without the window.
 
 ### 9.4 Keyboard (MMIO)
 

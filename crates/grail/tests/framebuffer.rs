@@ -5,7 +5,7 @@ use grail::display::{self, DisplayOptions, Outcome};
 use grail::framebuffer::{FB_HEIGHT, FB_WIDTH};
 use grail::{Machine, MachineConfig, RunResult};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// FNV-1a 64 of the expected `frame-*.ppm` for `examples/colorbars`. If the pattern
@@ -29,11 +29,26 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// Runs the `grail` binary. A run that takes more than a minute is killed and
+/// fails the test, so a regression that opens a window (which waits for a
+/// person to close it) or never stops cannot hang the test run.
 fn grail(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_grail"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_grail"))
         .args(args)
-        .output()
-        .expect("cannot run grail")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("cannot run grail");
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            panic!("grail {args:?} still running after a minute");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
 }
 
 /// The pattern `colorbars.S` draws, as 0x00RRGGBB: an 8-pixel grey border around
@@ -151,8 +166,11 @@ fn run_for_stops_right_after_present() {
     let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.load_elf(&file).unwrap();
 
-    let steps = m.run_for(u64::MAX, &mut |_| {});
+    // Bounded budgets: a regression must fail, not hang.
+    const BUDGET: u64 = 10_000_000;
+    let steps = m.run_for(BUDGET, &mut |_| {});
     assert!(steps > 640 * 480, "drew the whole frame first ({steps} steps)");
+    assert!(steps < BUDGET, "stopped at the present");
     assert_eq!(m.exit_code(), None);
     let fb = &mut m.cpu.bus.fb;
     assert!(fb.enabled());
@@ -172,9 +190,88 @@ fn run_for_stops_right_after_present() {
     check_colorbars_ppm(&fb.to_ppm());
 
     // The next instruction is xcal.halt.
-    assert_eq!(m.run_for(u64::MAX, &mut |_| {}), 1);
+    assert_eq!(m.run_for(BUDGET, &mut |_| {}), 1);
     assert_eq!(m.exit_code(), Some(0));
     assert_eq!(m.run_for(10, &mut |_| {}), 0);
+}
+
+#[test]
+fn run_for_stops_only_at_a_present_of_its_own() {
+    // A present the host has not taken yet is not a reason to stop again: the
+    // next call runs its whole budget.
+    let file = std::fs::read(colorbars_elf()).unwrap();
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+    m.load_elf(&file).unwrap();
+    let present = grail::bus::FB_CTRL_BASE + grail::framebuffer::REG_PRESENT;
+    m.cpu.bus.write(present, 4, 1).unwrap();
+    assert!(m.cpu.bus.fb.present_pending());
+    assert_eq!(m.run_for(1000, &mut |_| {}), 1000);
+    assert_eq!(m.run_for(1000, &mut |_| {}), 1000);
+    assert!(m.cpu.bus.fb.take_present(), "still pending for the host");
+}
+
+/// Runs one load or store with `a0` = `addr` and `a1` = 0x0000_0101 at
+/// RAM_BASE; returns the machine and, if it trapped, (mcause, mtval).
+fn one_access(inst: u32, addr: u32) -> (Machine, Option<(u32, u32)>) {
+    const RAM_BASE: u32 = grail::bus::RAM_BASE;
+    let trap_vector = RAM_BASE + 0x4000;
+    let mut m = Machine::with_ram(1 << 20);
+    m.cpu.bus.load(RAM_BASE, &inst.to_le_bytes()).unwrap();
+    m.cpu.pc = RAM_BASE;
+    m.cpu.csr.mtvec = trap_vector;
+    m.cpu.x[10] = addr;
+    m.cpu.x[11] = 0x0000_0101;
+    m.cpu.step();
+    let trap = (m.cpu.pc == trap_vector).then_some((m.cpu.csr.mcause, m.cpu.csr.mtval));
+    (m, trap)
+}
+
+#[test]
+fn programs_see_the_register_rules_as_traps() {
+    // Spec 9.3 as a program sees it: the registers take 32-bit accesses
+    // only, VRAM is plain memory, with the alignment rules of RAM.
+    use grail::bus::{FB_CTRL_BASE, VRAM_BASE};
+    use grail::framebuffer::{REG_CTRL, REG_PRESENT, VRAM_SIZE};
+    // `lb/lh/lw a2, 0(a0)` and `sb/sh/sw a1, 0(a0)`.
+    let load = |funct3: u32| 10 << 15 | funct3 << 12 | 12 << 7 | 0x03;
+    let store = |funct3: u32| 11 << 20 | 10 << 15 | funct3 << 12 | 0x23;
+    let (lb, lh, lw, sb, sh, sw) = (load(0), load(1), load(2), store(0), store(1), store(2));
+    let ctrl = FB_CTRL_BASE + REG_CTRL;
+    let present = FB_CTRL_BASE + REG_PRESENT;
+    for (inst, addr, cause) in [
+        (lb, ctrl, 5),
+        (lh, ctrl, 5),
+        (sb, ctrl, 7),
+        (sh, ctrl, 7),
+        (sb, present, 7),
+        (lw, FB_CTRL_BASE + 2, 4), // misaligned
+        (sw, FB_CTRL_BASE + 2, 6),
+        (lw, VRAM_BASE + VRAM_SIZE, 5), // just past VRAM
+        (sb, VRAM_BASE + VRAM_SIZE, 7),
+        (lw, VRAM_BASE + 2, 4),
+    ] {
+        let (m, trap) = one_access(inst, addr);
+        assert_eq!(trap, Some((cause, addr)), "{inst:#010x} at {addr:#x}");
+        // No side effect: the display is still off and nothing was presented.
+        assert_eq!(
+            (m.cpu.bus.fb.ctrl, m.cpu.bus.fb.presents),
+            (0, 0),
+            "{inst:#010x} at {addr:#x}"
+        );
+    }
+    // The 32-bit forms work.
+    let (m, trap) = one_access(sw, ctrl);
+    assert_eq!((trap, m.cpu.bus.fb.ctrl), (None, 1));
+    let (m, trap) = one_access(sw, present);
+    assert_eq!((trap, m.cpu.bus.fb.presents), (None, 1));
+    // A byte of VRAM loads sign-extended, as from RAM.
+    let (mut m, _) = one_access(0x0000_0013, 0); // nop: just a machine
+    m.cpu.bus.write(VRAM_BASE + 5, 1, 0x80).unwrap();
+    m.cpu.bus.load(grail::bus::RAM_BASE, &lb.to_le_bytes()).unwrap();
+    m.cpu.pc = grail::bus::RAM_BASE;
+    m.cpu.x[10] = VRAM_BASE + 5;
+    m.cpu.step();
+    assert_eq!(m.cpu.x[12], 0xffff_ff80);
 }
 
 #[test]

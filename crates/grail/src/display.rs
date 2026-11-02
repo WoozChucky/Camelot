@@ -319,4 +319,60 @@ mod tests {
         assert_eq!(fb.pixel(0, 0), 0x203048, "background where it started");
         assert_eq!(m.cpu.bus.ptr.held(), crate::pointer::BUTTON_LEFT);
     }
+
+    /// Closing the window while the program still runs stops it: `run` returns
+    /// `Outcome::WindowClosed`. The program is an endless loop, so nothing else
+    /// would. Needs a desktop session: `cargo test -p grail --release -- --ignored window`.
+    #[test]
+    #[ignore]
+    fn closing_the_window_stops_the_emulator() {
+        let mut m = Machine::with_ram(1 << 20);
+        m.cpu
+            .bus
+            .load(crate::bus::RAM_BASE, &0x0000_006fu32.to_le_bytes())
+            .unwrap(); // j .
+        m.cpu.pc = crate::bus::RAM_BASE;
+        let title = format!("Grail display close test {}", std::process::id());
+        let user = std::thread::spawn({
+            let title = title.clone();
+            move || {
+                let hwnd = find_window(&title, Duration::from_secs(10)).expect("window") as HWND;
+                std::thread::sleep(Duration::from_millis(200));
+                // SAFETY: WM_CLOSE carries no pointers.
+                unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+            }
+        });
+        let opts = DisplayOptions {
+            window: true,
+            dump_dir: None,
+            title,
+        };
+        let outcome = run(&mut m, None, |_| {}, &opts).unwrap();
+        user.join().unwrap();
+        assert_eq!(outcome, Outcome::WindowClosed);
+        assert_eq!(m.exit_code(), None);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// A step limit bigger than a slice is still exact: `run` stops after exactly
+    /// that many steps, not at the next slice boundary.
+    #[test]
+    fn the_step_limit_is_exact() {
+        for limit in [1, SLICE - 1, SLICE, 25_000, 3 * SLICE + 7] {
+            let mut m = Machine::with_ram(1 << 20);
+            m.cpu
+                .bus
+                .load(crate::bus::RAM_BASE, &0x0000_006fu32.to_le_bytes())
+                .unwrap(); // j .
+            m.cpu.pc = crate::bus::RAM_BASE;
+            let mut steps = 0u64;
+            let outcome = run(&mut m, Some(limit), |_| steps += 1, &DisplayOptions::default()).unwrap();
+            assert_eq!(outcome, Outcome::Program(RunResult::StepLimit), "{limit}");
+            assert_eq!(steps, limit);
+        }
+    }
 }
