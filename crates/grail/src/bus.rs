@@ -1,8 +1,9 @@
 //! Physical address space. See spec section 7 for the memory map.
 
 use crate::config::MachineConfig;
-use crate::devices::{Clint, Plic, TestDevice, Uart, UART_IRQ};
+use crate::devices::{Clint, Plic, TestDevice, Uart, KBD_IRQ, UART_IRQ};
 use crate::framebuffer::{Framebuffer, VRAM_SIZE};
+use crate::keyboard::Keyboard;
 use crate::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use std::io::Write;
 
@@ -17,6 +18,8 @@ pub const UART_BASE: u32 = 0x1000_0000;
 pub const UART_SIZE: u32 = 0x100;
 pub const FB_CTRL_BASE: u32 = 0x3000_0000;
 pub const FB_CTRL_SIZE: u32 = 0x1000;
+pub const KBD_BASE: u32 = 0x3000_1000;
+pub const KBD_SIZE: u32 = 0x1000;
 pub const SYSINFO_BASE: u32 = 0x3000_2000;
 pub const SYSINFO_SIZE: u32 = 0x1000;
 pub const VRAM_BASE: u32 = 0x3100_0000;
@@ -39,6 +42,7 @@ pub fn device_table(_config: &MachineConfig) -> Vec<DeviceEntry> {
         dev(DeviceType::Plic, PLIC_BASE, PLIC_SIZE, 0),
         dev(DeviceType::Uart, UART_BASE, UART_SIZE, UART_IRQ),
         dev(DeviceType::FbCtrl, FB_CTRL_BASE, FB_CTRL_SIZE, 0),
+        dev(DeviceType::Keyboard, KBD_BASE, KBD_SIZE, KBD_IRQ),
         dev(DeviceType::Sysinfo, SYSINFO_BASE, SYSINFO_SIZE, 0),
         dev(DeviceType::FbVram, VRAM_BASE, VRAM_SIZE, 0),
     ]
@@ -62,6 +66,7 @@ pub struct Bus {
     pub plic: Plic,
     pub uart: Uart,
     pub fb: Framebuffer,
+    pub kbd: Keyboard,
     pub test: TestDevice,
     pub sysinfo: Sysinfo,
     /// Where `xcal.dbg` output goes (the CLI's stderr). `None` drops it. With
@@ -84,6 +89,7 @@ impl Bus {
             plic: Plic::default(),
             uart: Uart::default(),
             fb: Framebuffer::default(),
+            kbd: Keyboard::default(),
             test: TestDevice,
             sysinfo: Sysinfo::new(config, device_table(config)),
             debug: None,
@@ -109,6 +115,7 @@ impl Bus {
     pub fn update_interrupts(&mut self) {
         let uart = self.uart.irq();
         self.plic.set_level(UART_IRQ, uart);
+        self.plic.set_level(KBD_IRQ, self.kbd.irq());
     }
 
     fn ram_range(&self, addr: u32, size: u32) -> Option<usize> {
@@ -164,6 +171,7 @@ impl Bus {
             a if (FB_CTRL_BASE..FB_CTRL_BASE + FB_CTRL_SIZE).contains(&a) => {
                 self.fb.read(a - FB_CTRL_BASE, size)
             }
+            a if (KBD_BASE..KBD_BASE + KBD_SIZE).contains(&a) => self.kbd.read(a - KBD_BASE, size),
             a if (SYSINFO_BASE..SYSINFO_BASE + SYSINFO_SIZE).contains(&a) => {
                 self.sysinfo.read(a - SYSINFO_BASE, size)
             }
@@ -190,6 +198,7 @@ impl Bus {
             a if (FB_CTRL_BASE..FB_CTRL_BASE + FB_CTRL_SIZE).contains(&a) => {
                 self.fb.write(a - FB_CTRL_BASE, size, val)
             }
+            a if (KBD_BASE..KBD_BASE + KBD_SIZE).contains(&a) => self.kbd.write(a - KBD_BASE, size, val),
             a if (SYSINFO_BASE..SYSINFO_BASE + SYSINFO_SIZE).contains(&a) => {
                 self.sysinfo.write(a - SYSINFO_BASE, size, val)
             }
@@ -312,9 +321,11 @@ mod tests {
                 );
             }
         }
-        // The UART's PLIC source is the one the bus wires it to.
+        // The UART's and keyboard's PLIC sources are the ones the bus wires them to.
         let uart = table.iter().find(|d| d.kind == DeviceType::Uart).unwrap();
         assert_eq!(uart.irq, UART_IRQ);
+        let kbd = table.iter().find(|d| d.kind == DeviceType::Keyboard).unwrap();
+        assert_eq!(kbd.irq, KBD_IRQ);
     }
 
     /// A `Write` whose bytes the test can still read after handing it to the bus.
@@ -389,6 +400,27 @@ mod tests {
         bus.write(FB_CTRL_BASE + 0x14, 4, 1).unwrap();
         assert!(bus.fb.take_present());
         assert_eq!(bus.read(FB_CTRL_BASE, 1), Err(BusFault));
-        assert_eq!(bus.read(FB_CTRL_BASE + FB_CTRL_SIZE, 4), Err(BusFault));
+        assert_eq!(bus.read(FB_CTRL_BASE + 0xffc, 4), Ok(0));
+    }
+
+    #[test]
+    fn keyboard_registers_on_the_bus() {
+        use crate::keyboard::KeyEvent;
+        let mut bus = small_bus();
+        assert_eq!(bus.read(KBD_BASE, 4), Ok(0));
+        assert_eq!(bus.read(KBD_BASE + 4, 4), Ok(0));
+        bus.kbd.push(KeyEvent::press(b'k').with_shift(true));
+        assert_eq!(bus.read(KBD_BASE, 4), Ok(1));
+        assert_eq!(bus.read(KBD_BASE + 4, 4), Ok(0x26b));
+        assert_eq!(bus.read(KBD_BASE, 4), Ok(0));
+        bus.write(KBD_BASE + 8, 4, 1).unwrap();
+        assert_eq!(bus.read(KBD_BASE + 8, 4), Ok(1));
+        assert_eq!(bus.read(KBD_BASE + 0xffc, 4), Ok(0));
+        assert_eq!(bus.read(KBD_BASE, 1), Err(BusFault));
+        assert_eq!(bus.write(KBD_BASE + 8, 2, 0), Err(BusFault));
+        // The next page is sysinfo's, not the keyboard's.
+        assert_eq!(bus.read(KBD_BASE + KBD_SIZE, 4), Ok(sysinfo::SYSINFO_MAGIC));
+        // Data accesses only.
+        assert_eq!(bus.read_mem(KBD_BASE, 4), Err(BusFault));
     }
 }

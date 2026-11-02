@@ -1,4 +1,4 @@
-//! # Code generation: AST to Excalibur assembly (issue #14, Nuno's part)
+//! # Code generation: AST to Excalibur assembly (issue #14)
 //!
 //! Everything before this (lexing, parsing, name resolution, arity checks) is
 //! done; this module turns a checked [`Program`] into `.s` text for merlin-as.

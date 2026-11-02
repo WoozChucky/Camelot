@@ -11,6 +11,7 @@ pub mod devices;
 pub mod display;
 pub mod elf;
 pub mod framebuffer;
+pub mod keyboard;
 pub mod sysinfo;
 pub mod trap;
 #[cfg(windows)]
@@ -21,6 +22,7 @@ mod window;
 use bus::{Bus, Exit};
 pub use config::{parse_clock, parse_ram_mib, MachineConfig, DEFAULT_RAM_SIZE};
 use cpu::Cpu;
+use keyboard::KeyEvent;
 use std::io::Write;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -91,6 +93,14 @@ impl Machine {
         bus.tohost = elf.symbol("tohost");
         bus.set_boot_entry(elf.entry);
         Ok(())
+    }
+
+    /// Hands a key event to the keyboard device (spec section 9.4). This is the one way
+    /// in for every host-side producer: the framebuffer window, tests, or a remote
+    /// client. Returns false if the event was dropped: its code is not in the spec's key
+    /// code table (see [`keyboard::code::is_valid`]), or the keyboard FIFO is full.
+    pub fn key_event(&mut self, ev: KeyEvent) -> bool {
+        self.cpu.bus.kbd.push(ev)
     }
 
     /// Exit code, once the program has asked to stop.

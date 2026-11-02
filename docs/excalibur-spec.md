@@ -76,7 +76,7 @@ Minimum CSR set:
 |---|---|---|
 | mstatus | 0x300 | MIE, MPIE, MPP, SIE, SPIE, SPP, SUM, MXR |
 | misa | 0x301 | RV32, I, M, S, U, X (read-only) |
-| medeleg / mideleg | 0x302 / 0x303 | delegate traps to S-mode |
+| medeleg / mideleg | 0x302 / 0x303 | delegate traps to S-mode (section 6, "Delegation") |
 | mie / mip | 0x304 / 0x344 | MSIE/MTIE/MEIE, SSIE/STIE/SEIE |
 | mtvec | 0x305 | direct mode required, vectored optional |
 | mscratch | 0x340 | |
@@ -106,6 +106,8 @@ Exception causes implemented: 0 instr misaligned, 1 instr access fault, 2 illega
 Interrupt causes: 1 SSI, 3 MSI, 5 STI, 7 MTI, 9 SEI, 11 MEI.
 
 Interrupts are checked between instructions, priority MEI > MSI > MTI > SEI > SSI > STI.
+
+Delegation: a trap is taken in S-mode when its bit is set in `medeleg` (exceptions) or `mideleg` (interrupts) and the hart is in S- or U-mode; a trap in M-mode always stays in M-mode. The writable `medeleg` bits are those of every implemented exception except ecall from M (mask 0xB3FF: causes 0-9, 12, 13, 15); the writable `mideleg` bits are SSI, STI and SEI (mask 0x222). M-level interrupts (MSI, MTI, MEI) cannot be delegated. An interrupt is taken in M-mode when it is pending, enabled in `mie`, not delegated, and either the hart is below M-mode or `mstatus.MIE` is set; a delegated one when the hart is in U-mode, or in S-mode with `mstatus.SIE` set. So while S-mode runs, the machine timer interrupts it regardless of `mstatus.MIE`. There is no Sstc extension (`stimecmp`): an S-mode kernel gets timer ticks from M-mode software that takes MTI, rearms `mtimecmp` and raises SSIP or STIP in `mip` (the Camelot kernel does this, section 10).
 
 Pending bits in `mip` come from the devices: MSIP and MTIP from the CLINT, MEIP from PLIC context 0, SEIP from PLIC context 1 (section 7.1). MEIP, MSIP and MTIP are read-only. SEIP is also software-writable: the value read is the OR of the software bit and the PLIC's signal, and `csrrs`/`csrrc` on `mip` modify the software bit only, so a read-modify-write never latches the PLIC's signal into it (as in the RISC-V privileged spec). STIP and SSIP are software-written.
 
@@ -232,7 +234,26 @@ Details:
 | 0x3000_1004 | `KBD_DATA` (RO) | pops one event: bits [7:0] key code, bit 8 = 1 on release, bit 9 = shift, bit 10 = ctrl. 0 if empty |
 | 0x3000_1008 | `KBD_CTRL` | bit 0 = interrupt enable (PLIC source 2, section 7.1) |
 
-Key codes: printable ASCII for printable keys, then 0x80+ for Enter (0x0A uses ASCII), arrows (0x80-0x83 up/down/left/right), Esc (0x1B), Backspace (0x08), F1-F12 (0x90-0x9B). The key events come from the framebuffer window; without a window, the UART remains the text input.
+Key codes:
+
+| Key | Code |
+|---|---|
+| Printable keys | the ASCII character typed (0x20-0x7E) |
+| Backspace, Tab, Enter, Esc | 0x08, 0x09, 0x0A, 0x1B (ASCII) |
+| Up, Down, Left, Right | 0x80, 0x81, 0x82, 0x83 |
+| F1-F12 | 0x90-0x9B |
+
+Code 0 never occurs, so a `KBD_DATA` of 0 always means "empty". Bits 31:11 read as 0.
+
+Details:
+
+- The registers are 32-bit only: byte or halfword accesses in 0x3000_1000 - 0x3000_1FFF raise access faults (and pop nothing). Unused offsets read as 0 and ignore writes, as do writes to `KBD_STATUS` and `KBD_DATA`. `KBD_CTRL` bits other than bit 0 are reserved, read as 0; it resets to 0.
+- Events wait in a FIFO of 64. An event that arrives while it is full is dropped (the older ones are kept).
+- **Interrupt**: the keyboard holds PLIC source 2 high while `KBD_CTRL.0` and `KBD_STATUS.0` are both set, so reading `KBD_DATA` until `KBD_STATUS.0` clears lowers it. As with the UART, a handler may pop one event per interrupt and let the line raise the next one.
+- **Printable keys** report the character the host keyboard layout types with the current Shift and Caps Lock state, so Shift+a gives 'A' (0x41) with bit 9 set and Shift+1 gives '!' on a US layout. Ctrl does not change the code: Ctrl+C is 'c' with bit 10 set, not 0x03. Keys that type no ASCII character (dead keys, accented letters, Insert, Home, ...) send no events.
+- Shift and Ctrl (and Alt) send no events of their own; they only set bits 9 and 10 of other keys' events, as held at that moment. Ctrl+Alt is AltGr on Windows: it types the layout's AltGr character and does not set bit 10.
+- A release carries the same code as its press, even if Shift changed in between. A held key auto-repeats as more press events. When the window loses focus, every key it saw go down gets a release event, so none stays stuck.
+- Grail delivers the events typed into the framebuffer window between instruction slices (section 9.3). Without a window (headless) nothing produces events and the device stays empty; the UART remains the text input. Hosts that embed Grail as a library inject events with `Machine::key_event`, the same entry point the window uses.
 
 ### 9.5 Sysinfo (MMIO)
 
@@ -272,9 +293,9 @@ Device table entry `i` (for `i` < `SYS_DEV_COUNT`; at most 252 fit in the page):
 | 5 | Framebuffer control (section 9.3) |
 | 6 | Framebuffer VRAM (section 9.3) |
 | 7 | Sysinfo (this block) |
-| 8 | Keyboard (section 9.4), listed once Grail implements it |
+| 8 | Keyboard (section 9.4) |
 
-Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device (block storage, say) gets the next code and an entry, with no new registers and no change to this layout. Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), framebuffer control, sysinfo and VRAM; `examples/sysinfo` prints the table.
+Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device (block storage, say) gets the next code and an entry, with no new registers and no change to this layout. Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), framebuffer control, keyboard (irq 2), sysinfo and VRAM; `examples/sysinfo` prints the table.
 
 The registers are 32-bit only: byte or halfword accesses raise access faults. Word writes are ignored, as for the framebuffer's read-only registers. Offsets past the last entry read as 0.
 
@@ -362,7 +383,40 @@ Until our compiler can build the kernel, clang (`--target=riscv32-unknown-elf -m
 
 The kernel (`kernel/`) is built by `cargo xtask kernel`, a Rust build task (`crates/xtask`), not a Makefile or shell script: clang compiles each `.c`, clang or merlin-as (`--as merlin`, step 1 above) assembles each `.s`, and `ld.lld` links them with `kernel/kernel.ld`. The full command lines are in `kernel/README.md`. The linked `kernel/kernel.elf` is committed, so running and testing the kernel needs no LLVM; the build is reproducible, and when the installed clang matches the one recorded in `kernel/kernel.elf.clang-version`, `cargo test` checks the committed image is up to date.
 
-Boot contract: Grail's boot ROM jumps to `_start` at 0x8000_0000 in M-mode. `_start` points `mtvec` at an early trap handler, sets `sp` to the top of a 16 KiB stack, zeroes `.bss` (`__bss_start`..`__bss_end`, both 4-byte aligned), and calls `int kmain(void)`; when `kmain` returns, `xcal.halt` stops the machine with its return value as the exit code. Until the kernel installs its real trap handlers, any trap prints `mcause`, `mepc` and `mtval` with `xcal.dbg` and halts with exit code 0xFF. `__kernel_end` (page aligned) marks the first free byte of RAM after the image.
+Boot contract: Grail's boot ROM jumps to `_start` at 0x8000_0000 in M-mode. `_start` points `mtvec` at an early trap handler, sets `sp` to the top of a 16 KiB stack, zeroes `.bss` (`__bss_start`..`__bss_end`, both 4-byte aligned), and calls `start()`, the M-mode setup below, then executes `mret`, which enters S-mode at `supervisor_entry`. That calls `int kmain(void)` in S-mode; when `kmain` returns, the machine call `MCALL_HALT` stops the machine with its return value as the exit code. Until `start()` installs the M-mode trap handler, any trap prints `mcause`, `mepc` and `mtval` with `xcal.dbg` and halts with exit code 0xFF. `__kernel_end` (page aligned) marks the first free byte of RAM after the image.
+
+### Kernel traps
+
+The kernel runs in S-mode on top of a small M-mode layer (the xv6-riscv design).
+
+`start()` (M-mode, `kernel/start.c`):
+
+- `medeleg` = every exception except ecall from S-mode (0xB1FF), so all faults go to the kernel and ecall from S-mode is left for machine calls. `mideleg` = SSI, STI, SEI (0x222).
+- `stvec` = `kernel_vec`, set before S-mode starts, so a fault in the kernel's very first instruction is handled.
+- `mtvec` = `machine_vec`; `mscratch` points at `machine_scratch`, a few words of scratch space (the M-mode handler has no stack) plus the timer interval.
+- `mtimecmp` = `mtime` + interval; `mie` = MTIE only.
+- `mstatus.MPP` = S, `mepc` = `supervisor_entry`.
+
+`machine_vec` (M-mode, `kernel/machine.s`) handles the only traps left in M-mode:
+
+- Machine timer interrupt: `mtimecmp += interval` (so ticks don't drift), set `mip.SSIP`, `mret`. The kernel sees each tick as a supervisor software interrupt.
+- Machine call (ecall from S-mode): function number in a7, arguments in a0-a6, result in a0; `mepc` advances past the `ecall`. Function 0 (`MCALL_HALT`) stops the machine with exit code a0, since `xcal.halt` is M-mode only. Any other function returns -1.
+- Anything else is a kernel bug: print `mcause`/`mepc`/`mtval` and halt with 0xFF, like the early trap handler.
+
+Timer: the tick rate is 10 Hz, an interval of `timebase / 10` `mtime` ticks with the nominal 10 MHz timebase (section 7). The kernel takes the timebase from one function, `timebase_hz()`, so that it can later read it from hardware instead.
+
+`kernel_vec` (S-mode, `kernel/kernelvec.s`) saves x1-x31 and `sepc`, `scause`, `stval`, `sstatus` in a `struct trap_frame` on the current stack (`regs[32]` with x*n* at offset 4*n*, then the four CSRs at 128-140; 144 bytes), calls `kernel_trap(frame)`, restores `sepc`, `sstatus` and the registers from the frame, and returns with `sret`. Every trap comes from S-mode until there are user processes, so `sscratch` is unused for now.
+
+`kernel_trap` (`kernel/trap.c`): a supervisor software interrupt clears `sip.SSIP` and increments `ticks`. Any other trap is a panic: it prints
+
+```
+panic: <cause name>
+  scause 0x........  sepc 0x........  stval 0x........  sstatus 0x........
+```
+
+followed by x1-x31 four per line (`   ra 01010101   sp 80007400 ...`), and halts with exit code 0xFE. After its self-tests the kernel enables the tick (`sie.SSIE`, `sstatus.SIE`), idles in `wfi` printing `tick 1` ... `tick 10`, and returns.
+
+For testing the panic path, the image has a word `boot_fault` in `.data`, normally 1. Patching it to 2 makes the kernel execute an illegal instruction after the ticks (with every register but sp set to its number in each byte, x5 = 0x05050505); 3 makes it load from the unmapped address 0x100.
 
 Kernel C stays inside what Merlin will compile: no libc headers (`-nostdinc`), no floating point, no inline `asm()` (CSR access and Xcal instructions live in `.s` files, with Xcal instructions written as `.word`), and `.s` files use only merlin-as syntax. The one exception is varargs: `kprintf` uses `__builtin_va_list`/`__builtin_va_start`/`__builtin_va_arg`/`__builtin_va_end` (via `kernel/include/varargs.h`), so Merlin must provide those builtins with the ILP32 convention (variadic arguments travel in a0-a7 and then on the stack like named ones; the callee spills a0-a7 next to its stack arguments and `va_list` is a pointer walking that area).
 
