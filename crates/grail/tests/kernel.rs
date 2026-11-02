@@ -1,9 +1,10 @@
 //! The Camelot kernel (`kernel/kernel.elf`, committed) run through the `grail`
 //! binary, with `--max-steps` as a guard: booting with paging on (with several
 //! `--ram` sizes), the timer ticks, the shell driven through stdin, the panics
-//! from its deliberate faults, and user programs taking turns or getting
-//! killed. The kernel's own tests (traps, delegation, the register dump, the
-//! page table, the console, processes) are in `crates/xtask/tests/kernel.rs`.
+//! from its deliberate faults, user programs taking turns or getting killed,
+//! and image files attached with `--disk`. The kernel's own tests (traps,
+//! delegation, the register dump, the page table, the console, processes,
+//! disks) are in `crates/xtask/tests/kernel.rs`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -101,6 +102,10 @@ fn ticks() -> String {
     (1..=10).map(|n| format!("tick {n}\n")).collect()
 }
 
+/// What the kernel says after the timer line when no disk is attached
+/// (kernel/main.c).
+const NO_DISK: &str = "disk: none\n";
+
 /// What the shell prints before its first prompt, and the prompt
 /// (kernel/main.c).
 const SHELL_BANNER: &str = "Type help for the list of commands.\n";
@@ -121,7 +126,7 @@ fn kernel_ticks_ten_times_then_halts_from_the_shell() {
     assert!(out.starts_with("Camelot v0.1.0 booting...\n"), "{out}");
     assert!(
         out.ends_with(&format!(
-            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{}{SHELL_BANNER}{PROMPT}halt\n",
+            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{SHELL_BANNER}{PROMPT}halt\n",
             memory_lines(128),
             ticks()
         )),
@@ -173,7 +178,7 @@ fn kernel_boots_with_paging_on_any_ram_size() {
         let (code, out) = grail_with(&["--ram", mib], &kernel_elf(), b"halt\n");
         assert_eq!(code, Some(0), "--ram {mib}, output:\n{out}");
         let want = format!(
-            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{}{SHELL_BANNER}{PROMPT}halt\n",
+            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{SHELL_BANNER}{PROMPT}halt\n",
             memory_lines(mib.parse().unwrap()),
             ticks()
         );
@@ -213,8 +218,18 @@ fn store_to_kernel_text_panics() {
     assert_eq!(code, Some(PANIC_EXIT), "output:\n{out}");
     let report = format!("{}panic: store page fault\n  scause 0x0000000f  sepc 0x", ticks());
     assert!(out.contains(&report), "{out}");
-    // The page is mapped, read and execute only.
-    assert!(out.contains(" -A--X-RV\n"), "{out}");
+    // The page is mapped, read and execute only. (Whether A is set depends on
+    // whether code on that page ran with paging on, which is up to the
+    // layout; the store set neither A nor D, since it faulted.)
+    let flags = out
+        .lines()
+        .find(|l| l.contains(" maps to pa "))
+        .and_then(|l| l.rsplit(' ').next())
+        .unwrap_or_else(|| panic!("no mapping line:\n{out}"));
+    assert!(
+        flags.len() == 8 && flags.starts_with('-') && flags.ends_with("--X-RV"),
+        "{out}"
+    );
 }
 
 // ---- User processes (issue #20) ----
@@ -287,4 +302,77 @@ fn faulting_user_programs_are_killed_and_the_kernel_carries_on() {
     );
     assert!(out.contains(&format!("{PROMPT}ticks\nticks: ")), "{out}");
     assert!(out.ends_with(&format!("{PROMPT}halt\n")), "{out}");
+}
+
+// ---- Disks (issue #65) ----
+
+/// A scratch disk image of `sectors` sectors, every byte different from its
+/// neighbours, written next to the other scratch files. Returns its path and
+/// contents.
+fn disk_image(name: &str, sectors: usize) -> (PathBuf, Vec<u8>) {
+    let bytes: Vec<u8> = (0..sectors * 512).map(|i| (i * 13 + i / 512) as u8).collect();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("grail-kernel");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, &bytes).unwrap();
+    (path, bytes)
+}
+
+/// Checks `out` has `blk self-test: N/N passed` and returns N.
+fn blk_selftest_passed(out: &str) -> u32 {
+    let at = out
+        .find("blk self-test: ")
+        .unwrap_or_else(|| panic!("no disk self-test:\n{out}"));
+    let line = out[at..].lines().next().unwrap();
+    let (passed, total) = line
+        .strip_prefix("blk self-test: ")
+        .and_then(|r| r.strip_suffix(" passed"))
+        .and_then(|r| r.split_once('/'))
+        .unwrap_or_else(|| panic!("{line}"));
+    assert_eq!(passed, total, "{out}");
+    passed.parse().unwrap()
+}
+
+#[test]
+fn kernel_tests_an_image_file_disk_and_leaves_it_as_it_was() {
+    // The boot self-test writes a scratch block of the disk and puts it back.
+    let (path, bytes) = disk_image("rw.img", 128);
+    let (code, out) = grail_with(&["--disk", path.to_str().unwrap()], &kernel_elf(), b"halt\n");
+    assert_eq!(code, Some(0), "output:\n{out}");
+    assert!(
+        out.contains("timebase\ndisk 0: 128 sectors (64 KiB), irq 3\ntick 1\n"),
+        "{out}"
+    );
+    // After the ticks, before the shell.
+    assert!(out.contains("tick 10\nblk self-test: "), "{out}");
+    assert!(blk_selftest_passed(&out) > 10, "{out}");
+    assert!(
+        out.ends_with(&format!(" passed\n{SHELL_BANNER}{PROMPT}halt\n")),
+        "{out}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn kernel_lists_every_disk_and_leaves_a_read_only_one_alone() {
+    let (ro, bytes) = disk_image("ro.img", 64);
+    let (rw, _) = disk_image("second.img", 8);
+    let (code, out) = grail_with(
+        &["--disk-ro", ro.to_str().unwrap(), "--disk", rw.to_str().unwrap()],
+        &kernel_elf(),
+        b"halt\n",
+    );
+    assert_eq!(code, Some(0), "output:\n{out}");
+    assert!(
+        out.contains(
+            "timebase\n\
+             disk 0: 64 sectors (32 KiB), irq 3, read-only\n\
+             disk 1: 8 sectors (4 KiB), irq 4\n\
+             tick 1\n"
+        ),
+        "{out}"
+    );
+    // Disk 0 is the one tested: its write must fail with BLK_ERR_READ_ONLY.
+    blk_selftest_passed(&out);
+    assert_eq!(std::fs::read(&ro).unwrap(), bytes);
 }
