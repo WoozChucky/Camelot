@@ -233,8 +233,9 @@ int net_sys_ping(u32 addr, u32 seq, u32 ureply) {
         return -EINVAL;
     }
     struct ping_reply r;
-    /* The identifier is the pid, so two processes' pings never mix. */
-    int err = icmp_ping(addr, myproc()->pid, seq, PING_TIMEOUT, &r);
+    /* The identifier is the tid (a main thread's is its pid), so two
+     * threads' pings never mix. */
+    int err = icmp_ping(addr, mythread()->tid, seq, PING_TIMEOUT, &r);
     if (err != 0) {
         return err;
     }

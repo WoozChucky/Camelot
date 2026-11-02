@@ -77,11 +77,12 @@ static int returns_arg(void *arg) {
     return (int)(uint)arg;
 }
 
+/* thread_exit from a few calls down: the innermost call ends the thread. */
 static void deep_exit(int depth) {
-    if (depth == 0) {
-        thread_exit(7);
+    if (depth > 0) {
+        deep_exit(depth - 1);
     }
-    deep_exit(depth - 1);
+    thread_exit(7);
 }
 
 static int exits_deep(void *arg) {

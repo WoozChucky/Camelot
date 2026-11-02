@@ -44,12 +44,13 @@ void fs_init(void) {
 /* iget() panics when the cache is full, so it must hold every inode that
  * can be in use at once: one per open file (an FD_INODE file, or a device
  * opened by its path, keeps its inode until closed), one per process's
- * working directory, and the few each process holds for a moment inside a
+ * working directory, and the few each thread holds for a moment inside a
  * call, at most INODES_PER_CALL (link() keeps `old` while walking `new`'s
- * path, which holds a directory and the entry found in it). A user can then
- * run out of open files (-ENFILE), never out of inodes. */
+ * path, which holds a directory and the entry found in it); every thread of
+ * a process may be in a call at once. A user can then run out of open
+ * files (-ENFILE), never out of inodes. */
 #define INODES_PER_CALL 3
-_Static_assert(NINODE >= NFILE + NPROC * (1 + INODES_PER_CALL), "the inode cache holds every user");
+_Static_assert(NINODE >= NFILE + NPROC + NTHREAD * INODES_PER_CALL, "the inode cache holds every user");
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 

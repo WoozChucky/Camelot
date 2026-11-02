@@ -82,8 +82,11 @@ static struct spinlock proc_lock;
 static u32 next_pid = 1;
 
 /* Where the next round-robin search starts: the slot after the thread that
- * ran last. */
-static u32 next_slot;
+ * ran last (NULL: slot 0). A pointer rather than an index, like the loops
+ * that run on every tick (pick_next, wakeup_locked): merlin's unoptimized
+ * code would multiply and divide on every step of an indexed one, and
+ * with 16 slots that shows on a tick's cost. */
+static struct thread *next_thread;
 
 /* The first process (proc_run_init), the program it runs, and its exit
  * status once it ended. */
@@ -590,11 +593,16 @@ bool proc_run_init(const char *path, const char *name, int *status) {
 /* The next runnable thread after the last one that ran, or NULL. Called
  * with proc_lock held. */
 static struct thread *pick_next(void) {
+    struct thread *end = &threads[NTHREAD];
+    struct thread *t = next_thread == NULL ? threads : next_thread;
     for (u32 i = 0; i < NTHREAD; i++) {
-        u32 slot = (next_slot + i) % NTHREAD;
-        if (threads[slot].state == THREAD_RUNNABLE) {
-            next_slot = (slot + 1) % NTHREAD;
-            return &threads[slot];
+        if (t->state == THREAD_RUNNABLE) {
+            next_thread = t + 1 == end ? threads : t + 1;
+            return t;
+        }
+        t++;
+        if (t == end) {
+            t = threads;
         }
     }
     return NULL;
@@ -645,7 +653,7 @@ void scheduler(void) {
      * processes to run, kmain's; the others start it once, before any.) */
     if (c->hartid == 0) {
         acquire(&proc_lock);
-        next_slot = 0;
+        next_thread = threads;
         release(&proc_lock);
     }
     for (;;) {
@@ -766,9 +774,10 @@ void sleep(const void *chan, struct spinlock *lk) {
 /* wakeup(), with proc_lock held. */
 static void wakeup_locked(const void *chan) {
     u32 woken = 0;
-    for (u32 i = 0; i < NTHREAD; i++) {
-        if (threads[i].state == THREAD_SLEEPING && threads[i].chan == chan) {
-            threads[i].state = THREAD_RUNNABLE;
+    struct thread *end = &threads[NTHREAD];
+    for (struct thread *t = threads; t != end; t++) {
+        if (t->state == THREAD_SLEEPING && t->chan == chan) {
+            t->state = THREAD_RUNNABLE;
             woken++;
         }
     }

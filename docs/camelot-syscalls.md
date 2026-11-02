@@ -377,8 +377,8 @@ or is its subnet's network or broadcast address, or if `gateway` is not
 another such address on the subnet.
 
 **ping(addr, seq, reply)** sends an ICMP echo request with 56 bytes of data
-to `addr`, with the caller's pid as its identifier and `seq` (0 to 65535)
-as its sequence number, and waits up to one second (10 ticks) for the
+to `addr`, with the caller's tid as its identifier (its pid, in a
+single-threaded process) and `seq` (0 to 65535) as its sequence number, and waits up to one second (10 ticks) for the
 matching echo reply; then stores a `struct ping_reply` at `reply` (who
 answered, the reply's TTL, the ICMP message's length, 64, and the round
 trip in microseconds of `mtime`) and returns 0. 127.0.0.1 and the

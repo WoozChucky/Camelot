@@ -100,6 +100,11 @@ struct thread {
     bool killed;
 };
 
+/* The kernel tests walk threads[] by this size and read the fields up to
+ * `kstack` at their offsets (state 0, tid 4, proc 8, kstack 12). */
+#define THREAD_SIZE 96
+_Static_assert(sizeof(struct thread) == THREAD_SIZE, "the tests index threads[] by THREAD_SIZE");
+
 /* The fields up to `parent` are at fixed offsets (state 0, pid 4, name 8,
  * parent 24): the kernel tests read them.
  *
@@ -156,6 +161,10 @@ struct proc {
      * filesystem (and for kernel processes, which use the root). */
     struct inode *cwd;
 };
+
+/* The tests walk procs[] by this size (and read pagetable at 32). */
+#define PROC_SIZE 164
+_Static_assert(sizeof(struct proc) == PROC_SIZE, "the tests index procs[] by PROC_SIZE");
 
 /* A user program embedded in the kernel image as an ELF executable
  * (kernel/userprogs.s, generated from kernel/user/ by `cargo xtask kernel`):

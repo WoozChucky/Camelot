@@ -3491,7 +3491,15 @@ fn the_system_call_document_matches_the_code() {
             returns.contains("`-EFAULT`"),
             "{name}: {returns}"
         );
-        let infallible = ["exit", "getpid", "yield", "sleep", "uptime", "thread_exit", "gettid"];
+        let infallible = [
+            "exit",
+            "getpid",
+            "yield",
+            "sleep",
+            "uptime",
+            "thread_exit",
+            "gettid",
+        ];
         assert_eq!(
             listed == 0,
             infallible.contains(&name.as_str()),
