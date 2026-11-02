@@ -8,7 +8,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/ua/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps), keyboard and pointer (from the window, with PLIC interrupts), sysinfo and block devices (disk images or disks on a Lake server, `--disk`); configurable RAM, real-time clock, disks and number of harts (up to 8, with IPIs) |
 | **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | Builds every example on its own, no LLVM (`cargo xtask examples`). merlin-as: complete; its objects match clang's ([encoder notes](crates/merlin-as/ENCODER.md)). merlin-ld: links clang objects to the same bytes as ld.lld except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: a C99 subset (integer types, pointers, arrays, structs, globals, strings, the preprocessor, varargs, designated initializers; programs of several files) compiles to assembly that our own assembler and linker build into programs Grail runs, and every kernel C file compiles with it ([code generation notes](crates/merlin/src/codegen.rs)). merlin-objdump: matches llvm-objdump |
 | **Camelot** | The kernel / OS | Boots on Grail in S-mode: `kprintf`, trap handling, timer ticks, page allocator and Sv32 paging, interrupt-driven UART console, user programs in C in U-mode with their own page tables, switched round robin on timer ticks, system calls ([docs/camelot-syscalls.md](docs/camelot-syscalls.md)) and a user-space shell, an interrupt-driven disk driver with a buffer cache, a journaled filesystem mounted at boot ([docs/camelot-fs.md](docs/camelot-fs.md), with a host-side mkfs and fsck in `crates/camelot-fs`) ([kernel/](kernel/README.md)) |
-| **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Pendragon web console, the Herald VM client and the Lake storage server | Protocol v5 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget, attachable consoles and screens, and network cards on virtual Ethernet switches, which can have a NAT gateway to the host and the internet; the Round Table CLI creates and controls them, and manages Lake's disk images; Pendragon does the same from a browser, with live consoles; the Lake storage server serves disk images to them over the network; Herald attaches a terminal to a VM's console, or a window to its screen, keyboard and mouse |
+| **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Pendragon web console, the Herald VM client and the Lake storage server | Protocol v6 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget, attachable consoles and screens, and network cards on virtual Ethernet switches, which can have a NAT gateway to the host and the internet; the Round Table CLI creates and controls them, and manages Lake's disk images; Pendragon does the same from a browser, with live consoles; the Lake storage server serves disk images to them over the network; Herald attaches a terminal to a VM's console, or a window to its screen, keyboard and mouse |
 
 ## Layout
 
@@ -29,8 +29,8 @@ crates/merlin           the C-subset compiler (C → .s), with its test programs
 crates/merlin-as        the assembler (source → ELF32 .o)
 crates/merlin-ld        the linker (.o files → ELF32 executable)
 crates/merlin-objdump   the disassembler / object dumper (llvm-objdump compatible output)
-crates/xtask            build tasks: `cargo xtask examples`, `cargo xtask kernel`, `cargo xtask fs`, `cargo xtask hello`, `cargo xtask ld-fixtures`
-kernel/                 the Camelot kernel (C + assembly) and its prebuilt kernel.elf; kernel/user holds the user programs it embeds, kernel/fs the root image's files
+crates/xtask            build tasks: `cargo xtask examples`, `cargo xtask kernel`, `cargo xtask fs`, `cargo xtask boot`, `cargo xtask hello`, `cargo xtask ld-fixtures`
+kernel/                 the Camelot kernel (C + assembly) and its prebuilt kernel.elf; kernel/user holds the user programs it embeds, kernel/fs the root image's files, kernel/boot the bootloader of a bootable disk
 examples/               bare-metal programs, built with merlin-as + merlin-ld (the .elf files are committed)
 tests/riscv-tests       prebuilt riscv-tests ELFs and their objects for merlin-ld (rebuild with scripts/build-riscv-tests.sh)
 scripts/                test-data generators (riscv-tests, merlin-as golden encodings, merlin-objdump goldens)
@@ -172,12 +172,14 @@ write/read-back of sector 7: ok
 
 As a library, disks are `MachineConfig::disks` (image files or in-memory disks); a host with its own storage implements the `BlockBackend` trait (capacity, read, write, flush) and passes it to `Machine::with_backends`.
 
-The Camelot kernel mounts disk 0 as its root filesystem when it holds one (format in [docs/camelot-fs.md](docs/camelot-fs.md)). `cargo xtask fs` builds such an image, `target/camelot-fs.img`, with the user programs in `/bin`; the `camelot-fs` command builds, checks and reads images on the host:
+The Camelot kernel mounts disk 0 as its root filesystem when it holds one (format in [docs/camelot-fs.md](docs/camelot-fs.md)). `cargo xtask fs` builds such an image, `target/camelot-fs.img`, with the user programs in `/bin`, and makes it bootable: the image holds the whole system, so Grail needs no program to run it. Started with a disk and no ELF, Grail's boot ROM loads the disk's boot block (its first 1 KiB, checked by a signature and a checksum) into RAM and runs it, as a PC's BIOS runs the master boot record; Camelot's bootloader (`kernel/boot/boot.s`) then loads the kernel, stored after the filesystem (spec section 7, "Boot from disk"; docs/camelot-fs.md, "Booting"). A disk that is not bootable stops the machine with a message from the boot ROM (`boot ROM: disk 0 is not bootable (no boot signature)`, exit code 253). The `camelot-fs` command builds, checks and reads images on the host:
 
 ```
 cargo xtask fs
-cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf
+cargo run --release -p grail -- --disk target/camelot-fs.img                   # boots from the disk
+cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf # or runs the kernel given
 cargo run --release -p camelot-fs -- mkfs disk.img some/dir --size 4M   # a new image holding a copy of some/dir
+cargo run --release -p camelot-fs -- mkfs root.img --boot kernel/boot/boot.elf --kernel kernel/kernel.elf   # bootable
 cargo run --release -p camelot-fs -- fsck disk.img                      # every consistency rule (--recover replays the log)
 cargo run --release -p camelot-fs -- ls disk.img /bin
 cargo run --release -p camelot-fs -- cat disk.img /README

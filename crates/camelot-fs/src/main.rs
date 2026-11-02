@@ -1,6 +1,7 @@
 //! `camelot-fs`: builds, checks and reads Camelot filesystem images
 //! (docs/camelot-fs.md) on the host.
 
+use camelot_fs::boot;
 use camelot_fs::mkfs::{self, Options};
 use camelot_fs::read::Fs;
 use camelot_fs::{fsck, BSIZE};
@@ -11,13 +12,16 @@ use std::process::ExitCode;
 const USAGE: &str = "usage: camelot-fs <command> ...
 
 commands:
-  mkfs IMAGE [DIR] [--size N] [--inodes N] [--log N]
+  mkfs IMAGE [DIR] [--size N] [--inodes N] [--log N] [--boot BOOT --kernel KERNEL]
         write a new filesystem image, holding a copy of the host directory DIR
         (its files and subdirectories) if given. --size is in 1 KiB blocks, or
         with a K or M suffix in KiB or MiB (default 2048 blocks, 2 MiB);
         --inodes counts inode slots (default 256), --log the log's blocks with
         its header (default 21; the kernel mounts a log of fewer than 11
-        blocks read-only)
+        blocks read-only). --boot and --kernel make it bootable: the
+        bootloader BOOT (an ELF, kernel/boot/boot.elf) goes in the boot block
+        and the kernel ELF KERNEL after the filesystem, so `grail --disk
+        IMAGE` boots it
   fsck [--recover] IMAGE
         check every consistency rule; a committed transaction still in the log
         is checked as replayed, and --recover writes the replay to IMAGE, then
@@ -49,11 +53,14 @@ struct MkfsArgs {
     image: PathBuf,
     dir: Option<PathBuf>,
     opts: Options,
+    /// The bootloader and the kernel to install, if any.
+    boot: Option<(PathBuf, PathBuf)>,
 }
 
 fn parse_mkfs(args: &[String]) -> Result<MkfsArgs, String> {
     let mut opts = Options::default();
     let mut paths = Vec::new();
+    let (mut boot, mut kernel) = (None, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -67,6 +74,8 @@ fn parse_mkfs(args: &[String]) -> Result<MkfsArgs, String> {
                 let v = value("--log")?;
                 opts.nlog = v.parse().map_err(|_| format!("bad log size {v}"))?;
             }
+            "--boot" => boot = Some(PathBuf::from(value("--boot")?)),
+            "--kernel" => kernel = Some(PathBuf::from(value("--kernel")?)),
             other if other.starts_with('-') => return Err(format!("unknown option {other}")),
             path => paths.push(PathBuf::from(path)),
         }
@@ -77,11 +86,43 @@ fn parse_mkfs(args: &[String]) -> Result<MkfsArgs, String> {
     if paths.next().is_some() {
         return Err("mkfs takes an image and at most one directory".into());
     }
-    Ok(MkfsArgs { image, dir, opts })
+    let boot = match (boot, kernel) {
+        (Some(b), Some(k)) => Some((b, k)),
+        (None, None) => None,
+        _ => return Err("--boot and --kernel go together".into()),
+    };
+    Ok(MkfsArgs {
+        image,
+        dir,
+        opts,
+        boot,
+    })
 }
 
 fn read_image(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Says where a bootable image's kernel is; nothing for an image with no signed
+/// boot block. A signed boot block that is not a good one of Camelot's (a bad
+/// checksum, no kernel, a kernel past the image) gets a warning, not an error:
+/// the filesystem is fine all the same, and the block may be another author's
+/// bootloader, which the boot ROM boots as well (it only checks the signature
+/// and the checksum).
+fn print_boot(image: &[u8]) {
+    match boot::boot_info(image) {
+        Ok(None) => {}
+        Ok(Some(info)) if info.kernel_sectors == 0 => {
+            println!("not bootable: the boot block names no kernel")
+        }
+        Ok(Some(info)) => println!(
+            "bootable: kernel at sector {}, {} sectors ({} KiB)",
+            info.kernel_sector,
+            info.kernel_sectors,
+            info.kernel_sectors / 2
+        ),
+        Err(e) => println!("warning: {e}"),
+    }
 }
 
 fn run(args: &[String]) -> Result<ExitCode, String> {
@@ -89,7 +130,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     match words.as_slice() {
         ["mkfs", ..] => {
             let a = parse_mkfs(&args[1..])?;
-            let image = mkfs::mkfs(&a.opts, a.dir.as_deref())?;
+            let mut image = mkfs::mkfs(&a.opts, a.dir.as_deref())?;
+            if let Some((b, k)) = &a.boot {
+                boot::install(&mut image, &read_image(b)?, &read_image(k)?)?;
+            }
             std::fs::write(&a.image, &image).map_err(|e| format!("{}: {e}", a.image.display()))?;
             let r = fsck::check(&image).map_err(|p| p.join("\n"))?;
             println!(
@@ -102,6 +146,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 r.dirs,
                 r.files
             );
+            print_boot(&image);
             Ok(ExitCode::SUCCESS)
         }
         ["fsck", rest @ ..] => {
@@ -149,6 +194,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                         r.files,
                         r.devices
                     );
+                    print_boot(&image);
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(problems) => {
@@ -215,7 +261,8 @@ mod tests {
             MkfsArgs {
                 image: "disk.img".into(),
                 dir: None,
-                opts: Options::default()
+                opts: Options::default(),
+                boot: None,
             }
         );
         let a = args(&["--size", "1M", "d.img", "root", "--inodes", "64", "--log", "8"]).unwrap();
@@ -232,5 +279,13 @@ mod tests {
         assert!(args(&["a", "b", "c"]).unwrap_err().contains("at most one"));
         assert!(args(&["--size"]).unwrap_err().contains("needs a value"));
         assert!(args(&["--frob", "a"]).unwrap_err().contains("unknown option"));
+        let a = args(&["d.img", "--boot", "b.elf", "--kernel", "k.elf"]).unwrap();
+        assert_eq!(a.boot, Some(("b.elf".into(), "k.elf".into())));
+        assert!(args(&["d.img", "--boot", "b.elf"])
+            .unwrap_err()
+            .contains("go together"));
+        assert!(args(&["d.img", "--kernel", "k.elf"])
+            .unwrap_err()
+            .contains("go together"));
     }
 }

@@ -7,6 +7,7 @@
 //! * [`mkfs`]: builds an image, empty or filled from a host directory;
 //! * [`read`]: reads one back ([`read::Fs`]: paths, directories, files), seeing
 //!   a pending log as recovery would;
+//! * [`boot`]: makes an image bootable (a bootloader and a kernel);
 //! * [`fsck`]: checks every consistency rule of the document, replays the
 //!   log ([`fsck::recover`]) and frees orphaned inodes
 //!   ([`fsck::free_orphans`]), as the kernel's mount does.
@@ -15,6 +16,7 @@
 //! here works on images in memory; the `camelot-fs` binary reads and writes
 //! files.
 
+pub mod boot;
 pub mod fsck;
 pub mod mkfs;
 pub mod read;

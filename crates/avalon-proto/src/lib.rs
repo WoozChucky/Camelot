@@ -38,7 +38,7 @@ pub use screen::{Rect, Screen};
 
 /// Protocol version carried by the handshake. Both sides must speak the same one; any
 /// change to the message catalogue (a new message, field or enum value) bumps it.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// First four payload bytes of `Hello`, so a server can tell an Avalon client from a
 /// stray connection.

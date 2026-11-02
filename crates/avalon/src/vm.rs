@@ -196,9 +196,10 @@ fn wrong_state(vm: &Vm, state: VmState, want: &str) -> Fail {
 
 impl Vm {
     /// Builds the machine `config` describes, with `cards` as its network cards (still
-    /// unplugged), and loads `program` into it, as VM 0 until the server gives it an
-    /// id. Errors: `InvalidProfile` (a disk image that cannot be opened) and
-    /// `InvalidProgram`. This can take a while (it opens files on the host and
+    /// unplugged), and loads `program` into it (with an empty one, the machine boots
+    /// from its disk 0), as VM 0 until the server gives it an id. Errors:
+    /// `InvalidProfile` (a disk image that cannot be opened) and `InvalidProgram`
+    /// (also no disk to boot from). This can take a while (it opens files on the host and
     /// allocates the guest's RAM), so the server calls it without holding its table.
     pub fn new(
         name: String,
@@ -214,9 +215,13 @@ impl Vm {
             .collect();
         let mut machine = Machine::with_devices(config, Vec::new(), backends)
             .map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
-        machine
-            .load_elf(program)
-            .map_err(|e| Fail::new(ErrorCode::InvalidProgram, format!("program: {e}")))?;
+        // No program: the machine boots from its disk 0, as `grail --disk IMG` does.
+        let loaded = if program.is_empty() {
+            machine.boot_from_disk()
+        } else {
+            machine.load_elf(program)
+        };
+        loaded.map_err(|e| Fail::new(ErrorCode::InvalidProgram, format!("program: {e}")))?;
         let (input, rx) = mpsc::channel();
         machine.set_uart_input(rx);
         let output = OutputBuf::default();
