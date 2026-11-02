@@ -2,7 +2,9 @@
  *
  * The NBUF buffers live in .bss, on one doubly linked list ordered by when
  * they were last released, most recent first. A lookup scans from the front
- * for a cached copy; a miss takes the last buffer nobody uses. Each buffer
+ * for a cached copy; a miss takes the last buffer nobody uses. A buffer
+ * released without valid data (its read or write failed) holds nothing worth
+ * keeping, so it goes to the back instead, to be reused first. Each buffer
  * has a sleep lock: `locked` plus sleep()/wakeup() on the buffer, held from
  * bread() to brelse(), and kept across the sleep in the disk driver. As in
  * proc.c there are no spinlocks: a process's kernel code is never preempted
@@ -36,6 +38,14 @@ static void push_front(struct buf *b) {
     b->prev = &head;
     head.next->prev = b;
     head.next = b;
+}
+
+/* Puts `b` at the back of the list. */
+static void push_back(struct buf *b) {
+    b->prev = head.prev;
+    b->next = &head;
+    head.prev->next = b;
+    head.prev = b;
 }
 
 void binit(void) {
@@ -124,6 +134,12 @@ void brelse(struct buf *b) {
     b->refcnt--;
     if (b->refcnt == 0) {
         unlink(b);
-        push_front(b);
+        /* Just used, so it goes to the front; unless it holds nothing, which
+         * the next miss should take before evicting a cached block. */
+        if (b->valid) {
+            push_front(b);
+        } else {
+            push_back(b);
+        }
     }
 }

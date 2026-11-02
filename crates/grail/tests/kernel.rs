@@ -218,18 +218,43 @@ fn store_to_kernel_text_panics() {
     assert_eq!(code, Some(PANIC_EXIT), "output:\n{out}");
     let report = format!("{}panic: store page fault\n  scause 0x0000000f  sepc 0x", ticks());
     assert!(out.contains(&report), "{out}");
-    // The page is mapped, read and execute only. (Whether A is set depends on
-    // whether code on that page ran with paging on, which is up to the
-    // layout; the store set neither A nor D, since it faulted.)
-    let flags = out
+    // The page is mapped, read and execute only, and the line shows the PTE
+    // as the kernel page table held it when the store faulted. (Whether A is
+    // set depends on whether code on that page ran with paging on, which is
+    // up to the layout: the xtask test of the same name works it out. The
+    // store set neither A nor D, since it faulted.) The same kernel, run
+    // in-process, shows that PTE in RAM as the trap is taken.
+    let va = out
         .lines()
-        .find(|l| l.contains(" maps to pa "))
-        .and_then(|l| l.rsplit(' ').next())
+        .find_map(|l| l.strip_prefix("  va 0x")?.split_once(' ').map(|(va, _)| va))
+        .map(|va| u32::from_str_radix(va, 16).unwrap())
         .unwrap_or_else(|| panic!("no mapping line:\n{out}"));
-    assert!(
-        flags.len() == 8 && flags.starts_with('-') && flags.ends_with("--X-RV"),
-        "{out}"
-    );
+    let file = std::fs::read(kernel_with_fault(BOOT_FAULT_STORE_TEXT)).unwrap();
+    let mut m = grail::Machine::new(grail::MachineConfig::default()).unwrap();
+    m.cpu.bus.uart.capture = true;
+    m.load_elf(&file).unwrap();
+    const STORE_PAGE_FAULT: u32 = 15;
+    // (The vm self-test's probes make store page faults too, elsewhere.)
+    let mut at_fault = None;
+    let r = m.run(Some(MAX_STEPS.parse().unwrap()), |cpu| {
+        if at_fault.is_none() && cpu.csr.scause == STORE_PAGE_FAULT && cpu.csr.stval == va {
+            let peek = |addr: u32| cpu.bus.peek(addr).unwrap();
+            let root = (cpu.csr.satp & 0x3f_ffff) << 12;
+            let table = (peek(root + 4 * (va >> 22)) >> 10) << 12;
+            at_fault = Some(peek(table + 4 * (va >> 12 & 0x3ff)));
+        }
+    });
+    assert_eq!(r, grail::RunResult::Exited(PANIC_EXIT as u32));
+    let pte = at_fault.expect("no store page fault on that page in-process");
+    let flags: String = "DAGUXWRV"
+        .chars()
+        .enumerate()
+        .map(|(i, c)| if pte >> (7 - i) & 1 != 0 { c } else { '-' })
+        .collect();
+    assert_eq!(&flags[2..], "--X-RV", "pte {pte:#010x}");
+    assert!(!flags.starts_with('D'), "pte {pte:#010x}");
+    let line = format!("  va {va:#010x} maps to pa {va:#010x}, pte {pte:#010x} {flags}\n");
+    assert!(out.contains(&line), "want {line}in:\n{out}");
 }
 
 // ---- User processes (issue #20) ----

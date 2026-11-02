@@ -827,27 +827,52 @@ fn unmapped_load_panics() {
 fn store_to_kernel_text_panics() {
     // Outside the probes a store page fault is a kernel bug: the panic shows
     // the cause, stval and how the kernel page table maps stval.
-    let (m, elf, r, out) = run_with_fault(BOOT_FAULT_STORE_TEXT);
+    let (mut m, elf) = load_committed();
+    let kmain = sym(&elf, "kmain");
+    m.cpu
+        .bus
+        .load(sym(&elf, "boot_fault"), &BOOT_FAULT_STORE_TEXT.to_le_bytes())
+        .unwrap();
+    // Grail sets A when an access goes through the PTE: a fetch or a load on
+    // kmain's page with paging on, before the store that faults (which sets
+    // neither A nor D). Whether one happens depends on the layout (kmain may
+    // start near the end of a page whose code all runs before paging), so
+    // watch for one.
+    let page = kmain >> 12;
+    let (mut accessed, mut faulted) = (false, false);
+    let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
+        let access = mem_access(cpu);
+        if access
+            .as_ref()
+            .is_some_and(|a| a.load_rd.is_none() && a.addr == kmain)
+        {
+            faulted = true;
+        }
+        if faulted || cpu.mode == Mode::M || cpu.csr.satp >> 31 == 0 {
+            return;
+        }
+        let load = access.is_some_and(|a| a.load_rd.is_some() && a.addr >> 12 == page);
+        accessed |= cpu.pc >> 12 == page || load;
+    });
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
     assert_eq!(r, RunResult::Exited(PANIC_EXIT), "output:\n{out}");
+    assert!(faulted, "no store to kmain");
     let before = &out[..out.find("panic: ").unwrap()];
     assert_eq!(kernel::mask_dbg_pc(before), BOOT_OUTPUT);
 
-    let kmain = sym(&elf, "kmain");
     let (cause, v) = parse_panic(&out);
     assert_eq!(cause, "store page fault");
     assert_eq!(v["scause"], STORE_PAGE_FAULT);
     assert_eq!(v["stval"], kmain);
-    // Identity mapped, R+X, never dirty. Accessed only if some of the code
-    // on kmain's page ran with paging on, which depends on the layout (kmain
-    // may start near the end of a page whose code all runs before paging).
+    // Identity mapped, R+X, never dirty, accessed as watched above.
     let pte = (kmain >> 12) << 10 | PTE_V | PTE_R | PTE_X;
-    let line = |pte: u32, flags: &str| {
-        format!("\n  va {kmain:#010x} maps to pa {kmain:#010x}, pte {pte:#010x} {flags}\n")
+    let (pte, flags) = if accessed {
+        (pte | PTE_A, "-A--X-RV")
+    } else {
+        (pte, "----X-RV")
     };
-    assert!(
-        out.contains(&line(pte | PTE_A, "-A--X-RV")) || out.contains(&line(pte, "----X-RV")),
-        "{out}"
-    );
+    let line = format!("\n  va {kmain:#010x} maps to pa {kmain:#010x}, pte {pte:#010x} {flags}\n");
+    assert!(out.contains(&line), "want{line}in:\n{out}");
     let word = m.cpu.bus.peek(v["sepc"]).unwrap();
     assert!(
         matches!(excalibur::decode(word), excalibur::Inst::Store { .. }),
@@ -2512,6 +2537,8 @@ struct DiskTrace {
     stray_error_reads: usize,
     /// The channel (a0) of each call to `sleep`.
     sleeps: Vec<u32>,
+    /// Every load from or store to a disk register.
+    accesses: usize,
 }
 
 /// A disk register access by the instruction about to run: (disk, offset,
@@ -2558,6 +2585,7 @@ fn trace_disks(m: &mut Machine, elf: &grail::elf::Elf, max_steps: u64) -> (RunRe
         let Some((disk, off, store)) = disk_access(cpu) else {
             return;
         };
+        t.accesses += 1;
         match (off, store) {
             (BLK_REG_CMD, true) => {
                 if cpu.bus.disks[disk].done() {
@@ -2595,6 +2623,7 @@ fn kernel_boots_without_a_disk_and_says_so() {
     assert_eq!(out, halted_output());
     assert!(out.contains("timebase\ndisk: none\ntick 1\n"), "{out}");
     assert!(t.commands.is_empty() && t.sleeps.is_empty(), "{t:?}");
+    assert_eq!(t.accesses, 0, "{t:?}");
     assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(1 << UART_IRQ));
 }
 
@@ -2673,11 +2702,39 @@ fn disk_blocks_round_trip_through_the_cache_with_interrupts() {
         m.cpu.bus.peek(sym(&elf, "bio_misses")).unwrap(),
     );
     assert_eq!(misses, buffer_reads);
-    // Reader c, the scratch block read back and read again to restore it,
-    // and the LRU check's last block (blocks 0 and 1 also hit at the start of
-    // the LRU loop, left there by the readers).
-    assert_eq!(hits, 6);
+    // Reader c, the scratch block read back and read again to restore it;
+    // in the LRU check blocks 0 and 1 (left there by the readers) at the
+    // start of its loop, block 0 again after it, then blocks 0 and NBUF.
+    assert_eq!(hits, 8);
     assert!(bufs.len() >= NBUF as usize * BSIZE);
+
+    // Which buffer each miss took. A buffer whose read failed holds nothing,
+    // so the next miss reuses it before any cached block: the second read
+    // past the end, then block 2 in the LRU loop, take the buffer of the
+    // first.
+    let block_reads: Vec<(u32, u32)> = t
+        .commands
+        .iter()
+        .filter(|c| c.cmd == BLK_CMD_READ && bufs.contains(&c.dma))
+        .map(|c| (c.sector / BLOCK_SECTORS, c.dma))
+        .collect();
+    let read_at = |block: u32| {
+        block_reads
+            .iter()
+            .position(|&(b, _)| b == block)
+            .unwrap_or_else(|| panic!("block {block} never read: {block_reads:?}"))
+    };
+    let end = DISK_SECTORS as u32 / BLOCK_SECTORS;
+    let first_fail = read_at(end);
+    let failed_buf = block_reads[first_fail].1;
+    assert_eq!(block_reads[first_fail + 1], (end, failed_buf));
+    assert_eq!(block_reads[first_fail + 2], (2, failed_buf));
+    // LRU, not MRU: after blocks 0 to NBUF - 1, then block 0 again, block
+    // NBUF takes the buffer block 1 was read into (by reader b), and the
+    // last miss reads block 1 back.
+    let block1 = block_reads[read_at(1)].1;
+    assert_eq!(block_reads[read_at(NBUF)], (NBUF, block1));
+    assert_eq!(block_reads.last().unwrap().0, 1);
 
     // The requests slept: on the disk, once per request for its interrupt
     // and once more for reader b, which found reader a's request in flight;
@@ -2840,18 +2897,56 @@ fn a_disk_error_reaches_the_self_test_and_the_exit_code() {
 }
 
 #[test]
-fn a_disk_too_small_for_a_block_is_not_tested() {
-    // One sector is half a block: the disk is listed, but there is nothing
-    // to test on it.
-    let (mut m, _) = load_with_disks(vec![DiskConfig::memory(disk_bytes(3))]);
-    assert_eq!(m.run(Some(BOOT_MAX_STEPS), |_| {}), RunResult::Exited(0));
-    assert_eq!(
-        kernel::mask_dbg_pc(&printed(&m)),
-        boot_output_with(
-            "disk 0: 3 sectors (1 KiB), irq 3\n",
-            "blk self-test: disk 0 is too small, skipped\n"
-        )
-    );
+fn a_disk_smaller_than_two_blocks_is_not_tested() {
+    // The self-test needs two whole blocks: reader b reads block 1, and the
+    // scratch block (the last) must not be block 0. A disk of 1 sector has
+    // no whole block, one of 2 or 3 sectors only one: it is listed, but not
+    // tested, and left alone. 4 sectors are tested (see the next tests).
+    for sectors in [1, 2, 3] {
+        let image = disk_bytes(sectors);
+        let (mut m, elf) = load_with_disks(vec![DiskConfig::memory(image.clone())]);
+        let (r, t) = trace_disks(&mut m, &elf, BOOT_MAX_STEPS);
+        assert_eq!(r, RunResult::Exited(0), "{sectors} sectors");
+        let kib = sectors / 2;
+        assert_eq!(
+            kernel::mask_dbg_pc(&printed(&m)),
+            boot_output_with(
+                &format!("disk 0: {sectors} sectors ({kib} KiB), irq 3\n"),
+                "blk self-test: disk 0 is too small, skipped\n"
+            )
+        );
+        assert!(t.commands.is_empty(), "{sectors} sectors: {t:?}");
+        assert_eq!(disk_contents(&mut m, 0), image);
+    }
+}
+
+#[test]
+fn a_disk_entry_without_a_usable_interrupt_is_skipped() {
+    // The driver doesn't poll, so a disk whose sysinfo entry has no PLIC
+    // source (0), or one past the PLIC's 31, isn't used: the kernel boots as
+    // without a disk and never touches its registers.
+    for irq in [0, 32] {
+        let (mut m, elf) = load_with_disks(vec![DiskConfig::memory(disk_bytes(DISK_SECTORS))]);
+        let devices: Vec<DeviceEntry> = m
+            .cpu
+            .bus
+            .sysinfo
+            .devices()
+            .iter()
+            .map(|d| match d.kind {
+                DeviceType::Block => DeviceEntry { irq, ..*d },
+                _ => *d,
+            })
+            .collect();
+        assert!(devices.iter().any(|d| d.kind == DeviceType::Block));
+        m.cpu.bus.sysinfo = Sysinfo::new(m.config(), devices);
+        let (r, t) = trace_disks(&mut m, &elf, BOOT_MAX_STEPS);
+        assert_eq!(r, RunResult::Exited(0), "irq {irq}");
+        assert_eq!(kernel::mask_dbg_pc(&printed(&m)), halted_output(), "irq {irq}");
+        assert_eq!(t.accesses, 0, "irq {irq}: {t:?}");
+        assert_eq!(m.cpu.bus.disks[0].ctrl, 0);
+        assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(1 << UART_IRQ));
+    }
 }
 
 #[test]

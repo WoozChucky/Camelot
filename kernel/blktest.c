@@ -13,8 +13,9 @@
  *   and change nothing.
  * - errors: a block past the end is out of range and isn't cached; a buffer
  *   outside RAM is refused.
- * - LRU: after NBUF + 1 different blocks, the first one is gone from the
- *   cache and the last one is still there (when the disk is big enough). */
+ * - LRU (when the disk is big enough): after blocks 0 to NBUF - 1, then
+ *   block 0 again, block NBUF replaces block 1, the least recently used,
+ *   and blocks 0 and NBUF are both cached. */
 #include "blktest.h"
 #include "bio.h"
 #include "blk.h"
@@ -150,15 +151,21 @@ static void lru_test(void) {
     if (nblocks < NBUF + 1) {
         return;
     }
-    /* NBUF later blocks fill every buffer, so block 0 is gone. */
-    for (u32 i = 0; i <= NBUF; i++) {
+    /* Blocks 0 to NBUF - 1 fill every buffer, block 0 the least recently
+     * used. Reading block 0 again leaves block 1 the least recent, so block
+     * NBUF takes block 1's buffer. (Taking the most recent one instead would
+     * drop block 0.) */
+    for (u32 i = 0; i < NBUF; i++) {
         brelse(bread(0, i));
     }
+    brelse(bread(0, 0));
+    brelse(bread(0, NBUF));
     u32 hits = bio_hits;
     u32 misses = bio_misses;
-    brelse(bread(0, NBUF));
-    check(bio_hits == hits + 1, "the block read last is cached");
     brelse(bread(0, 0));
+    brelse(bread(0, NBUF));
+    check(bio_hits == hits + 2 && bio_misses == misses, "the blocks used last are cached");
+    brelse(bread(0, 1));
     check(bio_misses == misses + 1, "the least recently used block was reused");
 }
 
@@ -181,6 +188,8 @@ int blk_selftest(void) {
         return 0;
     }
     nblocks = blk_capacity(0) / BLOCK_SECTORS;
+    /* Reader b wants block 1, and the scratch block (the last) must not be
+     * block 0, which the readers check against. */
     if (nblocks < 2) {
         kprintf("blk self-test: disk 0 is too small, skipped\n");
         return 0;
