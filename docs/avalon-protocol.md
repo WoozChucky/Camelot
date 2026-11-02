@@ -358,6 +358,8 @@ Concurrency: an image has at most one writer at a time, and a writer excludes re
 | `DiskList` | `disks: list<DiskInfo>` | in name order |
 | `DiskDelete` | `name: string` | Errors: `NoSuchDisk`, `Busy` (attached) |
 
+There is no message to attach a disk to an existing VM or detach one from it: a VM's disks are part of its hardware profile (`DeviceSpec`), fixed when it is created, so a client attaches a Lake image by naming it in `CreateVm` (Round Table's `create --disk lake://ADDR/NAME`), and the VM's server holds the attachment (through `BlockOpen`) until the VM is destroyed. `DiskList` shows each image's attachments. Hot-plugging disks would be a new message group and a version bump.
+
 ## 7. Versioning
 
 - The protocol version is a `u16`, currently **1** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
