@@ -29,7 +29,9 @@ use xtask::{repo_root, tools};
 
 /// What the kernel prints before its shell starts, with `xcal.dbg`'s pc masked
 /// (see `mask_dbg_pc`).
-const BOOT_OUTPUT: &str = "\
+const BOOT_OUTPUT: &str = concat!(
+    xtask::banner!(),
+    "\
 Camelot v0.1.0 booting...
 kprintf: d=-42 u=4294967295 x=cafef00d p=0x80000000 s=excalibur c=K %=%
 kprintf self-test: 26/26 passed
@@ -49,7 +51,8 @@ tick 7
 tick 8
 tick 9
 tick 10
-";
+"
+);
 
 /// What the user-space shell, the first process, prints before its first
 /// prompt, and the prompt (kernel/user/sh.c).

@@ -67,6 +67,32 @@ pub const C_FLAGS: &[&str] = &[
 /// hundred thousand.
 pub const BOOT_MAX_STEPS: u64 = 200_000_000;
 
+/// The banner the kernel prints first at boot, before `Camelot vX booting...`
+/// (`banner` in kernel/main.c), as a string literal so tests can `concat!` it
+/// into their expected output.
+#[macro_export]
+macro_rules! banner {
+    () => {
+        concat!(
+            "\n",
+            r"    ____      _      __  __   _____   _        ___    _____",
+            "\n",
+            r"   / ___|    / \    |  \/  | | ____| | |      / _ \  |_   _|",
+            "\n",
+            r"  | |       / _ \   | |\/| | |  _|   | |     | | | |   | |",
+            "\n",
+            r"  | |___   / ___ \  | |  | | | |___  | |___  | |_| |   | |",
+            "\n",
+            r"   \____| /_/   \_\ |_|  |_| |_____| |_____|  \___/    |_|",
+            "\n",
+            "\n",
+        )
+    };
+}
+
+/// [`banner!`] as a constant.
+pub const BANNER: &str = banner!();
+
 /// The include directory of the kernel's C files, relative to the kernel
 /// directory.
 pub const INCLUDE_DIR: &str = "include";

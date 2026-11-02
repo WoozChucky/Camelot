@@ -71,7 +71,10 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
     assert_eq!(result, RunResult::Exited(0), "{out}");
     assert!(
-        out.starts_with("boot: kernel at sector 0x00001000\nCamelot v0.1.0 booting...\n"),
+        out.starts_with(&format!(
+            "boot: kernel at sector 0x00001000\n{}Camelot v0.1.0 booting...\n",
+            xtask::kernel::BANNER
+        )),
         "{out}"
     );
     assert!(out.contains("fs: /bin holds "), "{out}");
