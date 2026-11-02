@@ -179,8 +179,6 @@ fn shell_accepts_windows_line_ends() {
          exit [N]        leave the shell, with status N or the last program's\n\
          wait            wait for every background program\n\
          cd [DIR]        change the working directory, to / without DIR\n\
-         ifconfig        show the network interface; ifconfig ADDR [MASK [GATEWAY]] sets its address\n\
-         ping ADDR [N]   send N (4) echo requests to ADDR, a.b.c.d, and wait for the replies\n\
          PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /\n\
          CMD < FILE      read the input from FILE\n\
          CMD > FILE      write the output to FILE\n\
@@ -305,28 +303,28 @@ fn command_output<'a>(out: &'a str, command: &str) -> Vec<&'a str> {
 
 #[test]
 fn user_programs_run_interleaved() {
-    // ping and pong each print four lines about half a tick apart, from
+    // ding and dong each print four lines about half a tick apart, from
     // U-mode in their own address spaces. The scheduler switches on every
-    // timer tick, so their lines alternate in pairs. The shell runs ping in
-    // the background and waits for pong, then collects ping with `wait`.
-    let (code, out) = grail(&kernel_elf(), b"ping & pong\nwait\nexit\n");
+    // timer tick, so their lines alternate in pairs. The shell runs ding in
+    // the background and waits for dong, then collects ding with `wait`.
+    let (code, out) = grail(&kernel_elf(), b"ding & dong\nwait\nexit\n");
     assert_eq!(code, Some(0), "output:\n{out}");
-    // The shell's `[2]` comes first, or after ping's first line if a tick
+    // The shell's `[2]` comes first, or after ding's first line if a tick
     // lands in the shell's fork (likely with merlin's unoptimized kernel).
-    let lines = command_output(&out, "ping & pong");
+    let lines = command_output(&out, "ding & dong");
     assert_eq!(lines.iter().filter(|&&l| l == "[2]").count(), 1, "{out}");
     assert!(lines[..2].contains(&"[2]"), "{out}");
     let printed: Vec<&str> = lines.iter().copied().filter(|&l| l != "[2]").collect();
     assert_eq!(printed.len(), 8, "{out}");
     // Each in order, and they take turns more than once.
-    for name in ["ping", "pong"] {
+    for name in ["ding", "dong"] {
         let own: Vec<&str> = printed.iter().copied().filter(|l| l.starts_with(name)).collect();
         let want: Vec<String> = (1..=4).map(|i| format!("{name} {i}")).collect();
         assert_eq!(own, want, "{out}");
     }
     let turns = printed.windows(2).filter(|w| w[0][..4] != w[1][..4]).count();
     assert!(turns >= 3, "only {turns} switches:\n{out}");
-    assert_eq!(command_output(&out, "wait"), ["[2] ping: exit 0"], "{out}");
+    assert_eq!(command_output(&out, "wait"), ["[2] ding: exit 0"], "{out}");
 }
 
 #[test]

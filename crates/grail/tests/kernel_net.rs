@@ -1,5 +1,5 @@
 //! The Camelot kernel's network stack (`kernel/net/`, docs/camelot-net.md) on Grail's
-//! network cards, driven through the shell's `ifconfig` and `ping` built-ins:
+//! network cards, driven through the `ifconfig` and `ping` programs (kernel/user):
 //!
 //! - with user networking (`--net user`) it gets 10.0.2.15 from the gateway by DHCP and
 //!   pings 10.0.2.2, itself and 127.0.0.1; its UDP echo service answers a host program
@@ -295,11 +295,15 @@ fn two_kernels_on_a_hub_ping_each_other() {
     ] {
         assert_eq!(
             command(vms, 1, None, line),
-            format!("sh: ifconfig: {error}\n"),
+            format!("ifconfig: {error}\nifconfig: exit 1\n"),
             "{line}"
         );
     }
-    assert_eq!(command(vms, 1, None, "ping x"), "sh: ping: x: not an address\n");
+    // Not an address, so a name; with a static address there is no DNS server to ask.
+    assert_eq!(
+        command(vms, 1, None, "ping x"),
+        "ping: x: network unreachable\nping: exit 1\n"
+    );
     let ifconfig = command(vms, 1, None, "ifconfig");
     assert!(
         ifconfig.contains("\n  inet 192.168.7.2 netmask 255.255.255.0 (static)\n"),
@@ -317,7 +321,7 @@ fn two_kernels_on_a_hub_ping_each_other() {
     // Off the subnet with no gateway: no route.
     assert_eq!(
         command(vms, 0, None, "ping 10.1.2.3"),
-        "PING 10.1.2.3: 56 data bytes\nsh: ping: network unreachable\n"
+        "PING 10.1.2.3: 56 data bytes\nping: network unreachable\nping: exit 1\n"
     );
 
     for i in 0..2 {
@@ -667,7 +671,8 @@ fn arp_gives_up_on_an_address_nobody_has() {
     let out = command(&mut [&mut vm], 0, Some(&mut host), "ping 10.0.9.50 3");
     assert_eq!(
         out,
-        "PING 10.0.9.50: 56 data bytes\nseq=1: timed out\nseq=2: timed out\nseq=3: timed out\n3 sent, 0 received\n"
+        "PING 10.0.9.50: 56 data bytes\nseq=1: timed out\nseq=2: timed out\nseq=3: timed out\n\
+         3 sent, 0 received\nping: exit 1\n"
     );
     let request = ether(
         [0xff; 6],
@@ -684,7 +689,7 @@ fn arp_gives_up_on_an_address_nobody_has() {
     let out = command(&mut [&mut vm], 0, Some(&mut host), "ping 10.0.9.50 1");
     assert_eq!(
         out,
-        "PING 10.0.9.50: 56 data bytes\nseq=1: host unreachable\n1 sent, 0 received\n"
+        "PING 10.0.9.50: 56 data bytes\nseq=1: host unreachable\n1 sent, 0 received\nping: exit 1\n"
     );
     assert!(host.take().is_empty());
     let ifconfig = command(&mut [&mut vm], 0, Some(&mut host), "ifconfig");

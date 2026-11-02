@@ -1,5 +1,5 @@
 /* UDP (RFC 768; docs/camelot-net.md, "UDP"), and the kernel-internal
- * socket API that DHCP uses now and the socket system calls (#85) will put
+ * socket API that DHCP uses and the socket system calls (socket.c) put
  * behind file descriptors. A datagram is an 8-byte header and its data:
  *
  *   0  source port   2  destination port   4  length (header included)
@@ -11,15 +11,29 @@
  * socket bound to their destination port, which holds UDP_QUEUE_MAX at most;
  * a process reading the socket sleeps until one comes. Sent ones always
  * carry a checksum. A socket is bound to a port, not to an address: it
- * gets what comes to that port on any of the host's addresses. */
+ * gets what comes to that port on any of the host's addresses, or, once
+ * connected to a peer, only what that peer sends from its port. */
 #include "net.h"
 #include "proc.h"
 #include "string.h"
 #include "trap.h"
+#include "vm.h"
 
 static struct udp_sock socks[UDP_SOCKETS];
 /* Where udp_open(0) looks for a free port next. */
 static u32 next_ephemeral = UDP_EPHEMERAL_FIRST;
+
+/* Whether a datagram from `src`:`sport` comes from the peer a socket is
+ * connected to, `raddr`:`rport`. Every 127.0.0.0/8 address is this host,
+ * and what this host sends to one leaves from 127.0.0.1 (ip_source()), so
+ * a socket connected to 127.0.0.2 takes the replies from 127.0.0.1. */
+static bool from_peer(u32 raddr, u32 rport, u32 src, u32 sport) {
+    if (rport != sport) {
+        return false;
+    }
+    u32 lo = IP_LOOPBACK & IP_LOOPBACK_MASK;
+    return raddr == src || ((raddr & IP_LOOPBACK_MASK) == lo && (src & IP_LOOPBACK_MASK) == lo);
+}
 
 static struct udp_sock *find(u32 port) {
     for (u32 i = 0; i < UDP_SOCKETS; i++) {
@@ -51,6 +65,8 @@ struct udp_sock *udp_open(u32 port, int *err) {
         if (!s->used) {
             s->used = true;
             s->port = (u16)port;
+            s->raddr = 0;
+            s->rport = 0;
             s->queue.head = NULL;
             s->queue.tail = NULL;
             s->queue.len = 0;
@@ -91,7 +107,7 @@ static int output(struct pbuf *p, u32 src, u32 sport, u32 dst, u32 dport, u32 le
     return ip_output(p, src, dst, IP_PROTO_UDP, ulen);
 }
 
-int udp_sendto(struct udp_sock *s, u32 dst, u32 port, const void *buf, u32 len) {
+int udp_sendto(struct udp_sock *s, u32 dst, u32 port, pagetable_t pt, u32 src, u32 len) {
     if (len > UDP_MAX_DATA) {
         return -EMSGSIZE;
     }
@@ -99,18 +115,30 @@ int udp_sendto(struct udp_sock *s, u32 dst, u32 port, const void *buf, u32 len) 
     if (p == NULL) {
         return -ENOBUFS;
     }
-    memcpy(p->data + UDP_DATA, buf, len);
+    /* Straight into the frame, from wherever the data is. */
+    if (pt == NULL) {
+        memcpy(p->data + UDP_DATA, (const void *)(uintptr)src, len);
+    } else if (copyin(pt, p->data + UDP_DATA, src, len) < 0) {
+        pbuf_free(p);
+        return -EFAULT;
+    }
     int err = output(p, 0, s->port, dst, port, len);
     return err < 0 ? err : (int)len;
 }
 
-int udp_recvfrom(struct udp_sock *s, void *buf, u32 size, u32 *from, u32 *port, u32 timeout) {
+int udp_recvfrom(struct udp_sock *s, pagetable_t pt, u32 dst, u32 size, u32 *from, u32 *port, u32 timeout) {
     u32 start = ticks;
     for (;;) {
         struct pbuf *p = pbuf_pop(&s->queue);
         if (p != NULL) {
             u32 len = p->len - p->off;
-            memcpy(buf, p->data + p->off, len < size ? len : size);
+            u32 n = len < size ? len : size;
+            if (pt == NULL) {
+                memcpy((void *)(uintptr)dst, p->data + p->off, n);
+            } else if (copyout(pt, dst, p->data + p->off, n) < 0) {
+                pbuf_free(p);
+                return -EFAULT;
+            }
             if (from != NULL) {
                 *from = p->addr;
             }
@@ -122,7 +150,10 @@ int udp_recvfrom(struct udp_sock *s, void *buf, u32 size, u32 *from, u32 *port, 
         }
         /* A killed process gives up at once (it ends on its way out of the
          * call, never seeing the error); a kernel process is never killed. */
-        if ((timeout != 0 && ticks - start >= timeout) || proc_killed()) {
+        if (proc_killed()) {
+            return -EINTR;
+        }
+        if (timeout != 0 && ticks - start >= timeout) {
             return -ETIMEDOUT;
         }
         net_sleep();
@@ -155,6 +186,13 @@ void udp_input(struct pbuf *p, u32 src, u32 dst, const u8 *u, u32 len) {
     u32 sport = get16(u);
     u32 dport = get16(u + 2);
     struct udp_sock *s = find(dport);
+    if (s != NULL && s->raddr != 0 && !from_peer(s->raddr, s->rport, src, sport)) {
+        /* Connected to another peer: dropped. The port is the socket's
+         * all the same, so the echo service doesn't answer either. */
+        net_stats.rx_no_port++;
+        pbuf_free(p);
+        return;
+    }
     if (s != NULL) {
         if (s->queue.len >= UDP_QUEUE_MAX) {
             net_stats.rx_queue_full++;
@@ -177,4 +215,9 @@ void udp_input(struct pbuf *p, u32 src, u32 dst, const u8 *u, u32 len) {
         net_stats.rx_no_port++;
     }
     pbuf_free(p);
+}
+
+u32 udp_pending(const struct udp_sock *s) {
+    const struct pbuf *p = s->queue.head;
+    return p != NULL ? p->len - p->off : 0;
 }

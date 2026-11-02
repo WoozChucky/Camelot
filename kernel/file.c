@@ -8,6 +8,7 @@
 #include "kalloc.h"
 #include "log.h"
 #include "memlayout.h"
+#include "net.h"
 #include "pipe.h"
 #include "string.h"
 #include "trap.h"
@@ -85,6 +86,8 @@ void fileclose(struct file *f) {
     f->type = FD_NONE;
     if (closed.type == FD_PIPE) {
         pipeclose(closed.pipe, closed.writable);
+    } else if (closed.type == FD_SOCKET) {
+        socket_close(closed.sock);
     } else if (closed.ip != NULL) {
         /* The last reference to an unlinked file frees it: a transaction. */
         begin_op();
@@ -169,6 +172,11 @@ int fileread(struct file *f, pagetable_t pt, u32 dst, u32 n) {
     if (!uvm_range_ok(pt, dst, n, PTE_W)) {
         return -EFAULT;
     }
+    /* A socket's read is its recv, which for 0 bytes on UDP still takes
+     * the next datagram. */
+    if (f->type == FD_SOCKET) {
+        return socket_read(f->sock, pt, dst, n);
+    }
     if (n == 0) {
         return 0;
     }
@@ -187,6 +195,11 @@ int filewrite(struct file *f, pagetable_t pt, u32 src, u32 n) {
     }
     if (!uvm_range_ok(pt, src, n, PTE_R)) {
         return -EFAULT;
+    }
+    /* A socket's write is its send, which for 0 bytes on UDP is still a
+     * datagram (an empty one). */
+    if (f->type == FD_SOCKET) {
+        return socket_write(f->sock, pt, src, n);
     }
     if (n == 0) {
         return 0;
@@ -231,6 +244,11 @@ void filestat(struct file *f, struct stat *st) {
     if (f->type == FD_PIPE) {
         st->type = T_PIPE;
         st->size = pipe_bytes(f->pipe);
+        return;
+    }
+    if (f->type == FD_SOCKET) {
+        st->type = T_SOCKET;
+        st->size = socket_bytes(f->sock);
         return;
     }
     if (f->ip == NULL) {

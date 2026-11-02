@@ -2,8 +2,8 @@
 # as it was. Sets each register xN (but t6) to N in every byte, spins for
 # about three timer ticks with t6 as the counter, then compares. Exits with
 # status 0 if all of them still hold their value, else with the number of
-# the first one that changed. Run it beside other programs (`regs & ping &
-# pong`) so that their values pass through the same registers.
+# the first one that changed. Run it beside other programs (`regs & ding &
+# dong`) so that their values pass through the same registers.
 
     .equ SPIN, 1500000
 

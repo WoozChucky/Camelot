@@ -1,6 +1,7 @@
 /* TCP (RFC 9293; docs/camelot-net.md, "TCP"): connections, and the
- * kernel-internal socket API that #85's socket system calls put behind file
- * descriptors. A segment is a header of 20 bytes or more and its data:
+ * kernel-internal socket API that the socket system calls (socket.c) put
+ * behind file descriptors. A segment is a header of 20 bytes or more and
+ * its data:
  *
  *   0  source port        2  destination port
  *   4  sequence number    8  acknowledgment number
@@ -1163,11 +1164,12 @@ int tcp_connect(struct tcp_sock *s, u32 addr, u32 port) {
     return 0;
 }
 
-struct tcp_sock *tcp_accept(struct tcp_sock *l, int *err) {
+struct tcp_sock *tcp_accept(struct tcp_sock *l, u32 timeout, int *err) {
     if (l->state != TCP_LISTEN) {
         *err = -EINVAL;
         return NULL;
     }
+    u32 start = ticks;
     for (;;) {
         struct tcp_sock *best = NULL;
         for (u32 i = 0; i < TCP_SOCKETS; i++) {
@@ -1184,6 +1186,10 @@ struct tcp_sock *tcp_accept(struct tcp_sock *l, int *err) {
         }
         if (proc_killed()) {
             *err = -EINTR;
+            return NULL;
+        }
+        if (timeout != 0 && ticks - start >= timeout) {
+            *err = -EAGAIN;
             return NULL;
         }
         net_sleep();
@@ -1236,7 +1242,8 @@ static void window_update(struct tcp_sock *s) {
     }
 }
 
-int tcp_recv(struct tcp_sock *s, pagetable_t pt, u32 dst, u32 n) {
+int tcp_recv(struct tcp_sock *s, pagetable_t pt, u32 dst, u32 n, u32 timeout) {
+    u32 start = ticks;
     for (;;) {
         if (s->rlen > 0) {
             u32 m = MIN(n, s->rlen);
@@ -1256,6 +1263,9 @@ int tcp_recv(struct tcp_sock *s, pagetable_t pt, u32 dst, u32 n) {
         }
         if (proc_killed()) {
             return -EINTR;
+        }
+        if (timeout != 0 && ticks - start >= timeout) {
+            return -EAGAIN;
         }
         net_sleep();
     }

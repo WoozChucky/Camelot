@@ -15,6 +15,8 @@
  *              type T_DEVICE) gives one, through the driver `devsw` names
  *              by its major number
  *   FD_PIPE    one end of a pipe (pipe.h)
+ *   FD_SOCKET  a TCP or UDP socket (net.h, net/socket.c): reads and writes
+ *              are recv() and send()
  *
  * Every function here runs in a process's kernel thread (they may sleep,
  * for the disk or a pipe) and takes user addresses in that process's page
@@ -42,8 +44,10 @@
 #define FD_PIPE 1
 #define FD_INODE 2
 #define FD_DEVICE 3
+#define FD_SOCKET 4
 
 struct pipe;
+struct socket;
 
 struct file {
     u32 type;
@@ -51,6 +55,7 @@ struct file {
     bool readable;
     bool writable;
     struct pipe *pipe;  /* FD_PIPE */
+    struct socket *sock; /* FD_SOCKET */
     struct inode *ip;   /* FD_INODE, and FD_DEVICE opened by its path */
     u32 off;            /* FD_INODE */
     u16 major;          /* FD_DEVICE */
@@ -77,7 +82,7 @@ struct file *filealloc(void);
 struct file *filedup(struct file *f);
 
 /* Drops a reference; the last one closes the file: a pipe end is closed
- * (pipeclose), an inode let go (iput, in a transaction of its own, which
+ * (pipeclose), a socket closed (socket_close), an inode let go (iput, in a transaction of its own, which
  * frees it if it was unlinked meanwhile). */
 void fileclose(struct file *f);
 
@@ -100,7 +105,7 @@ int filewrite(struct file *f, pagetable_t pt, u32 src, u32 n);
 
 /* lseek(): sets an FD_INODE file's offset to `offset` from the start
  * (SEEK_SET), the current offset (SEEK_CUR) or the end (SEEK_END) and
- * returns it. -ESPIPE for a pipe or a device, -EINVAL for another `whence`
+ * returns it. -ESPIPE for a pipe, a socket or a device, -EINVAL for another `whence`
  * or an offset below 0 or past the end of the file (it has no holes). */
 int filelseek(struct file *f, i32 offset, u32 whence);
 

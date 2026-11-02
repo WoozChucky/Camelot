@@ -275,7 +275,7 @@ static void test_simple_calls(void) {
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(28, 0, 0, 0), -ENOSYS, "call 28");
+    check_eq(syscall(40, 0, 0, 0), -ENOSYS, "call 40");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
 }
 
@@ -794,7 +794,8 @@ static void test_procs_and_kill(void) {
 }
 
 /* The network's calls on a machine without a card (the tests run systest
- * on one): -ENODEV, after the pointer checks. kernel_net.rs in
+ * on one): -ENODEV, after the pointer checks; for socket(), after its
+ * arguments'. kernel_net.rs in
  * crates/grail tests them with cards. */
 static void test_network_without_a_card(void) {
     struct netinfo info;
@@ -804,10 +805,16 @@ static void test_network_without_a_card(void) {
     check_eq(netconf(0x0a00020f, 0xffffff00, 0), -ENODEV, "netconf without a card");
     check_eq(ping(0x7f000001, 1, &reply), -ENODEV, "ping without a card");
     check_eq(ping(0x7f000001, 1, (struct ping_reply *)0), -EFAULT, "ping to address 0");
-    struct tcptest_report report;
-    check_eq(tcptest(TCPTEST_CONNECT, 0x7f000001, 7, 1, &report), -ENODEV, "tcptest without a card");
-    check_eq(tcptest(TCPTEST_CONNECT, 0x7f000001, 7, 1, (struct tcptest_report *)0), -EFAULT,
-             "tcptest to address 0");
+    /* Without a card there are no sockets (socktest checks them with one),
+     * and the socket calls on other descriptors say so. */
+    check_eq(socket(AF_INET, SOCK_STREAM, 0), -ENODEV, "a TCP socket without a card");
+    check_eq(socket(AF_INET, SOCK_DGRAM, 0), -ENODEV, "a UDP socket without a card");
+    check_eq(socket(AF_INET + 1, SOCK_STREAM, 0), -EAFNOSUPPORT, "a socket of another family");
+    struct sockaddr_in a;
+    sockaddr_set(&a, INADDR_LOOPBACK, 7);
+    check_eq(connect(STDOUT, &a), -ENOTSOCK, "connect on the console");
+    check_eq(send(STDOUT, "x", 1), -ENOTSOCK, "send on the console");
+    check_eq(bind(NOFILE, &a), -EBADF, "bind on a bad descriptor");
 }
 
 int main(int argc, char **argv) {

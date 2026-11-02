@@ -5,7 +5,8 @@ starts, how it calls the kernel, what each call does and how it fails. The
 kernel side is `kernel/syscall.c` and `kernel/sysfile.c` (with
 `kernel/proc.c`, `kernel/exec.c`, `kernel/file.c`, `kernel/pipe.c`,
 `kernel/console.c`, `kernel/fs.c` and `kernel/vm.c`; the network's calls
-in `kernel/net/net.c`, `docs/camelot-net.md`), the numbers are in
+in `kernel/net/net.c` and the sockets' in `kernel/net/socket.c`,
+`docs/camelot-net.md`), the numbers are in
 `kernel/include/syscall.h`; the user side is `kernel/user/usys.s` (one stub
 per call), `kernel/user/user.h` (their C declarations, the error numbers,
 `open`'s flags and `struct stat`) and `kernel/user/crt0.s` (the start-up
@@ -24,7 +25,7 @@ The Linux RISC-V convention, which is also the C calling convention's, so a
 stub is two instructions:
 
 - The program executes `ecall` in U-mode with the call number in `a7` and
-  the arguments in `a0`-`a5` (no call takes more than three).
+  the arguments in `a0`-`a5` (`setsockopt` takes five, the most).
 - The result comes back in `a0`. A value from -4095 to -1 is an error: minus
   one of the error numbers below. Every other value is a success.
 - Every register but `a0` is preserved, `a1`-`a7` and the temporaries
@@ -86,7 +87,19 @@ there is a filesystem to look it up in.
 | 24 | `netinfo` | `struct netinfo *info` | 0; `-ENODEV`, `-EFAULT` |
 | 25 | `netconf` | `uint addr, uint mask, uint gateway` | 0; `-ENODEV`, `-EINVAL` |
 | 26 | `ping` | `uint addr, uint seq, struct ping_reply *reply` | 0; `-ETIMEDOUT`, `-EHOSTUNREACH`, `-ENETUNREACH`, `-ENOBUFS`, `-ENODEV`, `-EINVAL`, `-EFAULT` |
-| 27 | `tcptest` | `uint op, uint a, uint b, uint c, struct tcptest_report *report` | 0, or a listener's handle; `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT`, `-ENETUNREACH`, `-EADDRINUSE`, `-ENOBUFS`, `-EINTR`, `-ENODEV`, `-EINVAL`, `-EFAULT` |
+| 27 | `socket` | `int domain, int type, int protocol` | a new descriptor; `-EAFNOSUPPORT`, `-EPROTONOSUPPORT`, `-EINVAL`, `-ENODEV`, `-EMFILE`, `-ENFILE`, `-ENOBUFS` |
+| 28 | `bind` | `int fd, const struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EADDRNOTAVAIL`, `-EADDRINUSE`, `-EINVAL`, `-ENOBUFS` |
+| 29 | `listen` | `int fd, int backlog` | 0; `-EBADF`, `-ENOTSOCK`, `-EOPNOTSUPP`, `-EINVAL` |
+| 30 | `accept` | `int fd, struct sockaddr_in *addr` | a new descriptor; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EOPNOTSUPP`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EAGAIN`, `-EINTR` |
+| 31 | `connect` | `int fd, const struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EINVAL`, `-EISCONN`, `-ENETUNREACH`, `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT`, `-ENOBUFS`, `-EADDRINUSE`, `-EINTR` |
+| 32 | `send` | `int fd, const void *buf, uint len` | bytes sent; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EPIPE`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EDESTADDRREQ`, `-EMSGSIZE`, `-ENETUNREACH`, `-ENOBUFS`, `-EINTR` |
+| 33 | `recv` | `int fd, void *buf, uint len` | bytes received, 0 at the end; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EINVAL`, `-EAGAIN`, `-EINTR` |
+| 34 | `sendto` | `int fd, const void *buf, uint len, const struct sockaddr_in *to` | bytes sent; `send`'s errors, `-EFAULT` also for `to`, `-EAFNOSUPPORT`, `-EINVAL`, `-EADDRINUSE` |
+| 35 | `recvfrom` | `int fd, void *buf, uint len, struct sockaddr_in *from` | bytes received; `recv`'s errors (`-EFAULT` also for `from`) |
+| 36 | `shutdown` | `int fd, int how` | 0; `-EBADF`, `-ENOTSOCK`, `-EINVAL`, `-ENOTCONN`, `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT` |
+| 37 | `getsockname` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT` |
+| 38 | `getpeername` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN` |
+| 39 | `setsockopt` | `int fd, int level, int option, const void *value, uint len` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EINVAL`, `-ENOPROTOOPT` |
 
 **exit(status)** ends the caller. Its exit status is kept for its parent's
 `wait`; the slot and every page the process held are freed once the parent
@@ -113,7 +126,8 @@ behind `fd` ("File descriptors" below) and returns how many it wrote: `len`,
 unless the disk filled up or a pipe lost its readers part way, when it is
 the bytes written until then. `fd` must be open for writing, or it is
 `-EBADF`; all of `buf` must be readable, or nothing is written (`-EFAULT`).
-`len` = 0 writes nothing and returns 0. To a file on the disk, the bytes go
+`len` = 0 writes nothing and returns 0 (except to a socket, where `write`
+is `send`: on UDP that is an empty datagram). To a file on the disk, the bytes go
 at the descriptor's offset, which moves past them, and the file grows if they
 run past its end; a write that can write nothing fails with what stopped it:
 `-ENOSPC` (the disk is full), `-EFBIG` (the file would pass the largest a
@@ -127,7 +141,8 @@ open any more.
 `fd` into `buf` and returns how many it read; 0 means the end of the input.
 `fd` must be open for reading, or it is `-EBADF`; all of `buf` must be
 writable, or it is `-EFAULT` and nothing is read. `len` = 0 returns 0 without
-waiting. From a file on the disk, the bytes come from the descriptor's
+waiting (except from a socket, where `read` is `recv`: on UDP it takes the
+next datagram). From a file on the disk, the bytes come from the descriptor's
 offset, which moves past them: `len` of them, fewer at the end of the file,
 0 at or past it. A directory reads the same way, as its array of 16-byte
 entries (`struct dirent` in `user.h`, the format in `docs/camelot-fs.md`).
@@ -235,8 +250,9 @@ the console the kernel gave the shell), `type` (`T_DIR` 1, `T_FILE` 2,
 `T_DEVICE` 3, `T_PIPE` 4), `nlink` (the names it has; 0 for a file whose
 last name was removed while it is open), `size` (bytes; for a pipe, the
 bytes waiting in it; 0 for a device), `major` and `minor` (a device's
-numbers, 1 and 0 for the console). `-EBADF`, or `-EFAULT` if `st` is not
-writable.
+numbers, 1 and 0 for the console). A socket is `T_SOCKET` (5), with the
+bytes waiting to be received as its size (for UDP, the datagrams' bytes).
+`-EBADF`, or `-EFAULT` if `st` is not writable.
 
 **mkdir(path)** makes the directory `path`, with its `.` and `..`. Errors:
 `-EEXIST` (the name is taken, `/` included), the path's, `-ENOENT` also for
@@ -311,11 +327,10 @@ that `spawn` is still loading is not listed. All of `buf`, `max` entries,
 must be writable, however many are stored, or it is `-EFAULT` and nothing
 is.
 
-The network's calls are what the shell's `ifconfig` and `ping` built-ins
-use until #85 brings sockets and network programs; `docs/camelot-net.md`
-describes the stack behind them. Addresses are `uint`s in host order
-(10.0.2.15 is 0x0a00020f). Without a network card each fails with
-`-ENODEV` (after the pointer check).
+The network's calls are what the `ifconfig` and `ping` programs use;
+`docs/camelot-net.md` describes the stack behind them. Addresses are
+`uint`s in host order (10.0.2.15 is 0x0a00020f), unlike the sockets'.
+Without a network card each fails with `-ENODEV` (after the pointer check).
 
 **netinfo(info)** stores a `struct netinfo` (`user.h`, 132 bytes) at
 `info`: the interface's MAC address, `flags` (`NETINFO_LINK` the card's
@@ -348,30 +363,135 @@ the last three seconds), `-ENETUNREACH` (the interface has no address, or
 free), `-EINVAL` (`addr` 0, or `seq` over 65535) and `-EFAULT` (`reply` is
 not 16 writable bytes; checked before anything is sent).
 
-**tcptest(op, a, b, c, report)** is temporary: it drives the kernel's TCP
-from a process until #85's socket calls replace it (`docs/camelot-net.md`,
-"Testing TCP until #85"; the `tcptest` program is its user). `op` is one of:
+## Sockets
 
-- `TCPTEST_CONNECT` (`a` address, `b` port, `c` bytes): connects, sends `c`
-  bytes of a fixed pattern (byte `i` is `i ^ i >> 8 ^ i >> 16`), ends its
-  side and reads until the other side ends its own, then closes;
-- `TCPTEST_LISTEN` (`a` port, `b` backlog, taken as 1 to 8): a listener, held by the
-  caller until `TCPTEST_CLOSE` or its exit; returns its handle (0 to 3);
-- `TCPTEST_ACCEPT` (`a` handle): waits for a connection, sends back what it
-  sends until it ends its side, then closes it;
-- `TCPTEST_CLOSE` (`a` handle): closes the listener, resetting the
-  connections still waiting in its backlog.
+The socket calls are a subset of BSD's, with Linux's numbers and layouts:
+IPv4 only (`AF_INET`), TCP (`SOCK_STREAM`) and UDP (`SOCK_DGRAM`). A socket
+is an open file behind a descriptor, like a pipe end: `read` and `write`
+on it are `recv` and `send`, `dup` and `spawn` share it, `close` ends it
+with its last descriptor, `lseek` is `-ESPIPE` and `fstat` says `T_SOCKET`.
+So a program spawned with a socket as its output writes to the network
+without knowing it. `docs/camelot-net.md` ("Sockets") describes the stack
+behind them; the user library's `resolve` finds a name's address by DNS.
 
-`CONNECT` and `ACCEPT` store a `struct tcptest_report` (`user.h`, 28
-bytes) at `report`, even when they fail: the connection's two ends (all 0
-if it never had them), the bytes sent and received, and the FNV-1a hash of
-what was received. The other two ignore `report`. Errors: what ended the
-connection (`-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT`), `-ENETUNREACH`
-(no route), `-EADDRINUSE` (a port with a listener), `-ENOBUFS` (no socket,
-handle or memory left), `-EINTR` (the process was killed while it waited),
-`-EINVAL` (an unknown `op`, a handle the caller doesn't hold, a port of 0 or
-over 65535, an address no connection can go to) and `-EFAULT` (`report` is not 28
-writable bytes, for `CONNECT` and `ACCEPT`; checked first).
+Addresses are a `struct sockaddr_in` (16 bytes, `user.h`): `sin_family`
+(`AF_INET`, 2), then the port and the address in network byte order
+(big-endian, as on the wire: `htons`, `htonl`), then 8 bytes of zeros. A
+family other than `AF_INET` is `-EAFNOSUPPORT`. The address 0.0.0.0
+(`INADDR_ANY`) means any of this host's.
+
+The checks come in a fixed order, as for the other calls: the descriptor
+first (`-EBADF` if it is not open, `-ENOTSOCK` if it is not a socket),
+then the pointers (`-EFAULT`; an address must be 16 readable or writable
+bytes), then everything else. Without a network card, `socket` fails with
+`-ENODEV`, so no other call ever sees a socket.
+
+A call that waits (`accept` for a connection, `connect` for the handshake,
+`send` for room in a full buffer, `recv` for data) sleeps without using the
+CPU, and ends with `-EINTR` as soon as the process is killed; what the
+socket had done stays done. `recv` and `accept` wait for ever, unless the
+socket has a receive timeout (`setsockopt`): then they return `-EAGAIN`
+once it has run out.
+
+**socket(domain, type, protocol)** makes a socket and returns a new
+descriptor for it, the lowest one free. `domain` is `AF_INET`; `type` is
+`SOCK_STREAM` (1, TCP) or `SOCK_DGRAM` (2, UDP), anything else is
+`-EINVAL`; `protocol` is 0 or the type's own (`IPPROTO_TCP` 6, `IPPROTO_UDP`
+17), anything else `-EPROTONOSUPPORT`. Errors also: `-ENODEV` (no network
+card), `-EMFILE`, `-ENFILE`, `-ENOBUFS` (every one of the kernel's 16 TCP
+sockets is taken; UDP sockets are taken at `bind`, 8 of them).
+
+**bind(fd, addr)** gives the socket the port of `addr`, or the next free
+ephemeral one (49152 up) for port 0. The address must be 0.0.0.0, the
+interface's own or one of 127.0.0.0/8 (`-EADDRNOTAVAIL` otherwise), but the
+socket gets the port on every address of the host either way. Errors:
+`-EADDRINUSE` (a port another socket of the same kind has: a TCP listener,
+or a TCP socket bound and not connected yet, or any UDP socket), `-EINVAL`
+(the socket is bound or connected already), `-ENOBUFS` (no UDP socket
+left).
+
+**listen(fd, backlog)** makes a TCP socket a listener: the connections that
+come to its port wait for `accept`, at most `backlog` of them (taken as 1
+to 8) that are not accepted yet. One more is dropped: its SYN gets no
+answer, so the peer sends it again, and gets in once there is room. A socket that is not
+bound gets an ephemeral port first. `-EOPNOTSUPP` for a UDP socket,
+`-EINVAL` for one that is connected or listening already.
+
+**accept(fd, addr)** waits for a connection on the listener `fd` and returns
+a new descriptor for it, the oldest one first; unless `addr` is null, the
+other end's address is stored there. The descriptor and the open file are
+taken before the connection, so `-EMFILE` or `-ENFILE` leave it waiting.
+Errors: `-EOPNOTSUPP` (UDP), `-EINVAL` (not a listener), `-EAGAIN` (the
+receive timeout ran out), `-EINTR`.
+
+**connect(fd, addr)** connects a TCP socket to `addr` and waits until the
+connection is up, or not: `-ECONNREFUSED` (a reset: nothing listens there),
+`-ETIMEDOUT` (no answer to the SYN and its five retries), `-ECONNRESET`,
+`-ENETUNREACH` (no route), `-EINTR`. A socket that is not bound gets an
+ephemeral port. `-EINVAL` for port 0, address 0.0.0.0, a broadcast or
+multicast address, or a listener; `-EISCONN` if it has connected before
+(a socket connects once). For a UDP socket, it only sets the peer, at once:
+`send` goes there and only its datagrams are received; it may be changed by
+another `connect`. A UDP socket that is not bound gets an ephemeral port
+(`-EADDRINUSE` and `-ENOBUFS` come from that).
+
+**send(fd, buf, len)** sends the `len` bytes at `buf` and returns how many
+it sent. On TCP the bytes go into the connection's 4 KiB send buffer, waiting
+for room as the peer acknowledges; it returns `len`, unless the connection
+ended part way (then the bytes sent until then). Errors: `-EPIPE` (this side
+was shut down), `-ENOTCONN` (never connected), `-ECONNRESET` and
+`-ETIMEDOUT` (what ended the connection). On UDP each call is one datagram,
+to the socket's peer (`-EDESTADDRREQ` without one), of at most 1472 bytes
+(`-EMSGSIZE`); it does not wait, and the datagram may still be lost on the
+way. Errors also `-ENETUNREACH`, `-ENOBUFS`; `-EPIPE` after `shutdown`.
+
+**recv(fd, buf, len)** receives up to `len` bytes into `buf` and returns how
+many. On TCP it waits until there are some, then takes what is there, up
+to `len`; 0 once the peer has ended its side and everything before was
+read. Once a connection was reset or timed out, it returns that error
+(`-ECONNRESET`, `-ETIMEDOUT`); `-ENOTCONN` for a socket never connected. On UDP it takes the next datagram (from the peer only, on a
+connected socket): what does not fit in `len` is lost, and the call returns
+what it stored; an empty datagram returns 0. `len` = 0 still takes the next
+datagram (waiting for it), as on Linux; on TCP it returns 0 without
+waiting. `-EINVAL` for a UDP socket with no port, which nothing can ever
+reach. After `shutdown` for reading, it returns 0 at once. Errors also:
+`-EAGAIN` (the receive timeout ran out), `-EINTR`.
+
+**sendto(fd, buf, len, to)** is `send` to the address `to`; a null `to` is
+`send`. On UDP, `to` overrides the peer (`-EINVAL` for address 0.0.0.0 or
+port 0) and an unbound socket gets an ephemeral port. On TCP, `to` is
+ignored, its family too (the connection says where); only the pointer is
+checked.
+
+**recvfrom(fd, buf, len, from)** is `recv`, which also stores where the
+bytes came from at `from` unless it is null: the datagram's sender, or the
+connection's peer.
+
+**shutdown(fd, how)** ends one side or both of a connected socket:
+`SHUT_RD` (0) stops receiving (`recv` returns 0 from then on), `SHUT_WR`
+(1) sending (TCP sends its FIN once the buffer is out, and the peer's
+`recv` returns 0; `send` is `-EPIPE`), `SHUT_RDWR` (2) both. The
+descriptor stays open, for what the other direction still has to do.
+`-EINVAL` for another `how`, `-ENOTCONN` for a socket that is not
+connected (a listener, a UDP socket without a peer); for a TCP connection
+that is over, whatever `how` is, what ended it (`-ECONNREFUSED`,
+`-ECONNRESET`, `-ETIMEDOUT`), or `-ENOTCONN` once it closed normally.
+
+**getsockname(fd, addr)** stores the socket's own address at `addr`: its
+port (0 if it has none yet) and the address its packets leave from (0.0.0.0
+until it is connected).
+
+**getpeername(fd, addr)** stores the other end's address at `addr`; a TCP
+socket keeps it once the connection is over. `-ENOTCONN` for a socket never
+connected.
+
+**setsockopt(fd, level, option, value, len)** sets an option; the one there
+is is `SO_RCVTIMEO` (20) at level `SOL_SOCKET` (1), how long `recv`,
+`recvfrom` and `accept` wait: `value` is a `struct timeval` (`tv_sec`,
+`tv_usec`; 8 bytes, `len`), rounded up to whole timer ticks, 0 for no limit
+(the default). Errors: `-EINVAL` (`len` is not 8, or a negative time, or
+`tv_usec` of a second or more), `-EFAULT` (`value` is not readable),
+`-ENOPROTOOPT` (another level or option).
 
 ## Error numbers
 
@@ -387,12 +507,12 @@ Linux's values for the same conditions.
 | 8 | `ENOEXEC` | spawn, exec: the file is not a valid executable |
 | 9 | `EBADF` | not an open descriptor, or not open for that |
 | 10 | `ECHILD` | wait: no such child |
-| 11 | `EAGAIN` | spawn: every process slot is taken |
+| 11 | `EAGAIN` | spawn: every process slot is taken; a socket's receive timeout ran out |
 | 12 | `ENOMEM` | out of memory, or the heap would reach the stack |
 | 13 | `EACCES` | spawn, exec: not a regular file |
 | 14 | `EFAULT` | a pointer argument is not valid user memory |
 | 17 | `EEXIST` | the name is taken |
-| 19 | `ENODEV` | open: a device node with no driver |
+| 19 | `ENODEV` | open: a device node with no driver; the network: no network card |
 | 20 | `ENOTDIR` | a name on the way is not a directory |
 | 21 | `EISDIR` | open: a directory, for writing |
 | 22 | `EINVAL` | an argument is out of range |
@@ -406,13 +526,20 @@ Linux's values for the same conditions.
 | 36 | `ENAMETOOLONG` | a name longer than 14 bytes, or a path longer than `MAXPATH` |
 | 38 | `ENOSYS` | no such system call |
 | 39 | `ENOTEMPTY` | unlink: a directory with entries |
-| 90 | `EMSGSIZE` | a datagram too big for one packet (the kernel's UDP API) |
-| 98 | `EADDRINUSE` | a UDP port that is taken (the kernel's UDP API) |
+| 88 | `ENOTSOCK` | a socket call on a descriptor that is not a socket |
+| 89 | `EDESTADDRREQ` | send: a UDP socket with no peer, and no address given |
+| 90 | `EMSGSIZE` | a datagram too big for one packet |
+| 92 | `ENOPROTOOPT` | setsockopt: an option sockets don't have |
+| 93 | `EPROTONOSUPPORT` | socket: a protocol the type doesn't have |
+| 95 | `EOPNOTSUPP` | listen, accept: not on a UDP socket |
+| 97 | `EAFNOSUPPORT` | an address family other than `AF_INET` |
+| 98 | `EADDRINUSE` | a port that is taken |
+| 99 | `EADDRNOTAVAIL` | bind: an address that is not this host's |
 | 101 | `ENETUNREACH` | no route: the interface has no address, or no gateway |
 | 104 | `ECONNRESET` | TCP: the peer reset the connection |
 | 105 | `ENOBUFS` | the network's buffers or sockets are all in use |
-| 106 | `EISCONN` | TCP: the socket is connected already (the kernel's TCP API) |
-| 107 | `ENOTCONN` | TCP: the socket is not connected (the kernel's TCP API) |
+| 106 | `EISCONN` | connect: the socket has connected already |
+| 107 | `ENOTCONN` | the socket is not connected |
 | 110 | `ETIMEDOUT` | ping: no reply in time; TCP: the peer stopped answering |
 | 111 | `ECONNREFUSED` | TCP: nothing listens on that port |
 | 113 | `EHOSTUNREACH` | ARP got no answer from the address |
@@ -422,8 +549,8 @@ Linux's values for the same conditions.
 ## File descriptors
 
 A descriptor is a small number, 0 to 15, that stands for an open file: a
-file or directory of the filesystem, a device (the console), or one end of a
-pipe. Each process has its own 16; they point into the kernel's table of 64
+file or directory of the filesystem, a device (the console), one end of a
+pipe, or a socket. Each process has its own 16; they point into the kernel's table of 64
 open files, which is where the access mode (reading, writing or both) and,
 for a file on the disk, the offset live. `dup`, and `spawn` for descriptors
 0 to 2, make a second descriptor for the same open file, which then shares
@@ -557,7 +684,9 @@ calls above (the stubs in `usys.s`, which return the raw result, a negative
 error number included), their constants and structures (`O_*`, `SEEK_*`,
 `struct stat`, `struct dirent`, `T_*`, `struct procinfo`, `PROC_*`,
 `struct netinfo`, `struct net_stats`, `NETINFO_*`, `struct ping_reply`,
-`TCPTEST_*`, `struct tcptest_report`, `MAXPATH`, `DIRSIZ`) and the C library in `kernel/user/lib/`, described in
+`AF_INET`, `SOCK_*`, `IPPROTO_*`, `INADDR_*`, `SHUT_*`, `SOL_SOCKET`,
+`SO_RCVTIMEO`, `struct in_addr`, `struct sockaddr_in`, `struct timeval`,
+`MAXPATH`, `DIRSIZ`) and the C library in `kernel/user/lib/`, described in
 its `README.md`: strings and memory (`strlen`, `strcmp`, `strncmp`,
 `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`,
 `memmove`, `memcmp`), numbers (`atoi`, `strtol`), the heap (`malloc`,
@@ -565,7 +694,10 @@ its `README.md`: strings and memory (`strlen`, `strcmp`, `strncmp`,
 `fprintf` to a descriptor, `snprintf`; `%d %u %x %p %s %c %%` with `-`, `0`
 and a width), `puts`, line input (`getline`, one read of the console
 without the newline; readers, `reader_getline`, for files and pipes),
-`strerror`, `stat` (`open`, `fstat`, `close`) and `spin` (a busy loop).
+`strerror`, `stat` (`open`, `fstat`, `close`), `spin` (a busy loop), and
+addresses and names (`htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`,
+`inet_addr`, `inet_ntoa`, `sockaddr_set`; `resolve`, a DNS client, and
+`resolve_error`).
 `syscall(number, a0, a1, a2)` makes any call by number, for tests.
 
 ## Building programs

@@ -1,5 +1,5 @@
 //! What the tests of the Camelot kernel's network stack share (kernel_net.rs,
-//! kernel_tcp.rs): machines run in turns by step counts with the shell driven through
+//! kernel_tcp.rs, kernel_sockets.rs): machines run in turns by step counts with the shell driven through
 //! the UART, frames crafted and read back, a host played by the test on a hub port,
 //! and a gateway on a clock that follows the machine's steps.
 #![allow(dead_code)]
@@ -66,6 +66,16 @@ impl Vm {
             nets,
             ..MachineConfig::default()
         };
+        Vm::with_config(config, cards, patches)
+    }
+
+    /// The kernel on a machine built from `config` (its disks, say), with `cards`
+    /// and `patches` as for [`Vm::new`].
+    pub fn with_config(
+        config: MachineConfig,
+        cards: Vec<(MacAddr, Box<dyn NetBackend>)>,
+        patches: &[(&str, u32)],
+    ) -> Vm {
         let mut m = Machine::with_devices(config, Vec::new(), cards).unwrap();
         m.cpu.bus.uart.capture = true;
         let file = kernel_elf();
@@ -485,6 +495,15 @@ impl SteppedGateway {
     }
 }
 
+/// Whether `frame` is a DNS query: UDP to port 53.
+pub fn is_dns_query(frame: &[u8]) -> bool {
+    if frame.len() < 34 || frame[12..14] != IP_TYPE.to_be_bytes() || frame[23] != 17 {
+        return false;
+    }
+    let u = 14 + usize::from(frame[14] & 0xf) * 4;
+    frame.len() >= u + 8 && frame[u + 2..u + 4] == 53u16.to_be_bytes()
+}
+
 /// Whether `frame` is a TCP SYN opening a connection (no ACK).
 pub fn is_syn(frame: &[u8]) -> bool {
     if frame.len() < 34 || frame[12..14] != IP_TYPE.to_be_bytes() || frame[23] != 6 {
@@ -496,15 +515,16 @@ pub fn is_syn(frame: &[u8]) -> bool {
 
 impl NetBackend for SteppedGateway {
     /// A SYN from the machine makes the gateway connect a host socket on a thread of its
-    /// own; the machine waits here, stopped, until the answer (SYN-ACK or reset) is
-    /// ready, a bounded wait of the wall clock. Otherwise the machine, idle, would see
-    /// its clock race ahead (wfi skips to the next tick) and resend its SYN for nothing.
+    /// own, and a DNS query makes it ask its resolver on another; the machine waits
+    /// here, stopped, until the answer (SYN-ACK or reset, DNS answer) is ready, a
+    /// bounded wait of the wall clock. Otherwise the machine, idle, would see its clock
+    /// race ahead (wfi skips to the next tick) and send again, or give up, for nothing.
     fn send(&mut self, frame: &[u8]) -> std::io::Result<()> {
         let mut s = self.0.lock().unwrap();
         s.from_guest.push(frame.to_vec());
         let now = s.now;
         s.gw.send_at(frame, now);
-        if is_syn(frame) {
+        if is_syn(frame) || is_dns_query(frame) {
             let start = Instant::now();
             loop {
                 if let Some(answer) = s.gw.recv_at(now) {
@@ -513,7 +533,7 @@ impl NetBackend for SteppedGateway {
                 }
                 assert!(
                     start.elapsed() < Duration::from_secs(30),
-                    "the gateway never answered a SYN"
+                    "the gateway never answered a SYN or a DNS query"
                 );
                 drop(s);
                 std::thread::yield_now();

@@ -58,10 +58,24 @@ const char *strerror(int err) {
         return "no such system call";
     case ENOTEMPTY:
         return "directory not empty";
+    case ENOTSOCK:
+        return "not a socket";
+    case EDESTADDRREQ:
+        return "destination address required";
     case EMSGSIZE:
         return "message too long";
+    case ENOPROTOOPT:
+        return "protocol not available";
+    case EPROTONOSUPPORT:
+        return "protocol not supported";
+    case EOPNOTSUPP:
+        return "operation not supported";
+    case EAFNOSUPPORT:
+        return "address family not supported";
     case EADDRINUSE:
         return "address in use";
+    case EADDRNOTAVAIL:
+        return "address not available";
     case ENETUNREACH:
         return "network unreachable";
     case ECONNRESET:

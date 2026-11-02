@@ -5,7 +5,7 @@
  * copies through the physical pages (copyin, copyout, copyinstr in vm.c), so
  * a bad pointer is an -EFAULT, never a fault in the kernel. The calls on
  * files and paths are in sysfile.c; running programs in exec.c; the
- * network's in net/net.c. */
+ * network's in net/net.c, and the sockets' in net/socket.c. */
 #include "syscall.h"
 #include "exec.h"
 #include "kalloc.h"
@@ -195,8 +195,44 @@ void syscall(struct trap_frame *f) {
     case SYS_ping:
         ret = net_sys_ping(arg(f, 0), arg(f, 1), arg(f, 2));
         break;
-    case SYS_tcptest:
-        ret = net_sys_tcptest(arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3), arg(f, 4));
+    case SYS_socket:
+        ret = sock_sys_socket(arg(f, 0), arg(f, 1), arg(f, 2));
+        break;
+    case SYS_bind:
+        ret = sock_sys_bind(arg(f, 0), arg(f, 1));
+        break;
+    case SYS_listen:
+        ret = sock_sys_listen(arg(f, 0), arg(f, 1));
+        break;
+    case SYS_accept:
+        ret = sock_sys_accept(arg(f, 0), arg(f, 1));
+        break;
+    case SYS_connect:
+        ret = sock_sys_connect(arg(f, 0), arg(f, 1));
+        break;
+    case SYS_send:
+        ret = sock_sys_send(arg(f, 0), arg(f, 1), arg(f, 2));
+        break;
+    case SYS_recv:
+        ret = sock_sys_recv(arg(f, 0), arg(f, 1), arg(f, 2));
+        break;
+    case SYS_sendto:
+        ret = sock_sys_sendto(arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3));
+        break;
+    case SYS_recvfrom:
+        ret = sock_sys_recvfrom(arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3));
+        break;
+    case SYS_shutdown:
+        ret = sock_sys_shutdown(arg(f, 0), arg(f, 1));
+        break;
+    case SYS_getsockname:
+        ret = sock_sys_name(arg(f, 0), arg(f, 1), false);
+        break;
+    case SYS_getpeername:
+        ret = sock_sys_name(arg(f, 0), arg(f, 1), true);
+        break;
+    case SYS_setsockopt:
+        ret = sock_sys_setsockopt(arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3), arg(f, 4));
         break;
     default:
         ret = -ENOSYS;
