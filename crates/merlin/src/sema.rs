@@ -261,18 +261,14 @@ impl Checker {
             );
         }
         d.var = Some(VarRef::Global(d.name.clone()));
-        if let Some(init) = &mut d.init {
-            let mut fc = FnChecker::file_scope(&self.globals, &mut self.errors);
-            if fc.init(&mut d.ty, init, true).is_err() {
-                return;
-            }
-        }
+        // As in C, the name is in scope from the end of its declarator, so it
+        // is declared before its initializer is checked: `void *self = &self;`.
         let is_static = d.storage == Storage::Static;
         let tentative = (d.storage != Storage::Extern).then_some(at);
         let init = d.init.is_some().then_some(at);
         match self.globals.get_mut(&d.name) {
             Some(Global::Func(_)) => {
-                self.err(
+                return self.err(
                     d.pos,
                     format!("redefinition of '{}' as a different kind of symbol", d.name),
                 );
@@ -284,6 +280,10 @@ impl Checker {
                         d.name, d.ty, prev.ty, prev.pos
                     );
                     return self.err(d.pos, msg);
+                }
+                // `int a[3]; int a[] = {1};` declares an `int [3]`.
+                if d.ty.size().is_none() {
+                    d.ty = prev.ty.clone();
                 }
                 if prev.init.is_some() && init.is_some() {
                     return self.err(d.pos, format!("redefinition of '{}'", d.name));
@@ -324,6 +324,21 @@ impl Checker {
                     }),
                 );
             }
+        }
+        let Some(d_init) = &mut d.init else { return };
+        let mut fc = FnChecker::file_scope(&self.globals, &mut self.errors);
+        let checked = fc.init(&mut d.ty, d_init, true);
+        let Some(Global::Var(g)) = self.globals.get_mut(&d.name) else {
+            unreachable!("declared above")
+        };
+        if checked.is_err() {
+            // Still declared, so later uses don't report it as undeclared, but
+            // not defined here: there is nothing to emit.
+            g.init = g.init.filter(|&i| i != at);
+            g.tentative = g.tentative.filter(|&i| i != at);
+        } else if g.ty.size().is_none() {
+            // The initializer completed an array's size.
+            g.ty = d.ty.clone();
         }
     }
 
@@ -557,11 +572,17 @@ impl<'a> FnChecker<'a> {
                 label = format!("{}.{}.{n}", self.func, d.name);
             }
             self.static_labels.insert(label.clone());
+            // As in C, the name is in scope inside its own initializer, so
+            // `static struct node head = { &head }` means this `head`.
+            let var = VarRef::Global(label);
+            self.bind(&d.name, var.clone(), &d.ty, d.pos, "");
             if let Some(init) = &mut d.init {
                 let _ = self.init(&mut d.ty, init, true);
+                // The initializer may have completed an array's size.
+                let binding = (var.clone(), d.ty.clone(), d.pos);
+                self.scopes.last_mut().unwrap().insert(d.name.clone(), binding);
             }
-            self.bind(&d.name, VarRef::Global(label.clone()), &d.ty, d.pos, "");
-            d.var = Some(VarRef::Global(label));
+            d.var = Some(var);
             d.define = true;
         } else {
             // As in C, the name is in scope inside its own initializer.
@@ -629,6 +650,20 @@ impl<'a> FnChecker<'a> {
                 Err(self.err(e.pos, "array initializer must be an initializer list"))
             }
             (Type::Array(elem, n), Init::List(items, _)) => {
+                // C would spread `{1, 2, 3, 4}` over an `int [2][2]`; merlin
+                // wants each inner array in braces (or a string, for chars).
+                if elem.is_array() {
+                    let elided = items.iter().find(|item| match item {
+                        Init::Expr(e) => !(is_char_array(elem) && matches!(e.kind, ExprKind::Str(_))),
+                        Init::List(..) => false,
+                    });
+                    if let Some(item) = elided {
+                        let msg = format!(
+                            "brace elision is not supported: initialize each '{elem}' with its own braces"
+                        );
+                        return Err(self.err(item.pos(), msg));
+                    }
+                }
                 if let Some(n) = *n {
                     if items.len() > n as usize {
                         return Err(self.err(items[n as usize].pos(), "excess elements in array initializer"));
@@ -961,6 +996,10 @@ impl<'a> FnChecker<'a> {
         let ty = match (&at, &bt) {
             (Type::Int(x), Type::Int(y)) => Type::Int(common(*x, *y)),
             (Type::Void, Type::Void) => Type::Void,
+            // A null pointer constant takes the other pointer's type, even
+            // when it is `(void *)0` (C99 6.5.15p6).
+            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(a) => bt.clone(),
+            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(b) => at.clone(),
             (Type::Ptr(x), Type::Ptr(y)) if x == y => at.clone(),
             (Type::Ptr(x), Type::Ptr(_)) if **x == Type::Void => at.clone(),
             (Type::Ptr(_), Type::Ptr(y)) if **y == Type::Void => bt.clone(),
@@ -1172,6 +1211,34 @@ mod tests {
         // As in C: the scope of `x` starts at its declarator.
         let p = ok("int f(int x) { { int x = x + 1; return x; } }");
         assert_eq!(uses(func(&p, "f")), ["decl x#1", "x#1", "x#1"]);
+        // So does a static local's, not an outer `q`.
+        let p = ok("void *q; int f() { static void *q = &q; return q == &q; }");
+        assert_eq!(uses(func(&p, "f")), ["decl q@f.q", "q@f.q", "q@f.q", "q@f.q"]);
+        let p = ok("int f() { static void *head[2] = {head, head}; return head[0] == head; }");
+        assert_eq!(uses(func(&p, "f"))[..2], ["decl head@f.head", "head@f.head"]);
+        // `sizeof x` is the static `int`'s size, not the outer `char`'s.
+        let p = ok("char x; int f(void) { static int x = sizeof x; return x; }");
+        let StmtKind::Decl(ds) = &func(&p, "f").body.as_ref().unwrap()[0].kind else {
+            panic!()
+        };
+        let Some(Init::Expr(e)) = &ds[0].init else {
+            panic!()
+        };
+        assert_eq!(crate::consteval::int(e), Some(4));
+        // An array the initializer completes is incomplete inside it, as in C,
+        // and complete after it.
+        assert_eq!(
+            err("int f() { static int a[] = {1, 2, sizeof a}; return 0; }"),
+            "1:35: invalid application of 'sizeof' to an incomplete type 'int []'"
+        );
+        let p = ok("int f() { static int a[] = {1, 2, 3}; return sizeof a; }");
+        let StmtKind::Return(Some(e)) = &func(&p, "f").body.as_ref().unwrap()[1].kind else {
+            panic!()
+        };
+        assert_eq!(crate::consteval::int(e), Some(12));
+        // And a global's.
+        ok("void *self = &self; int f() { return self == &self; }");
+        ok("int *ring[2] = {(int *)&ring[1], (int *)&ring[0]};");
     }
 
     #[test]
@@ -1237,6 +1304,19 @@ mod tests {
         // A later declaration completes the array; the definition gets the size.
         assert_eq!(defined("int a[]; int a[3];"), ["int a[3] (def)", "int a[3]"]);
         assert_eq!(defined("int a[] = {1, 2};"), ["int a[2] (def)"]);
+        // An earlier size completes a later declaration (C's composite type).
+        assert_eq!(
+            defined("int a[3]; int a[] = {1};"),
+            ["int a[3]", "int a[3] (def)"]
+        );
+        assert_eq!(
+            defined("int a[] = {1, 2}; extern int a[];"),
+            ["int a[2] (def)", "extern int a[2]"]
+        );
+        assert_eq!(
+            err("int a[1]; int a[] = {1, 2};"),
+            "1:25: excess elements in array initializer"
+        );
         assert_eq!(
             defined("char s[] = \"abc\", t[2] = \"ab\";"),
             ["char s[4] (def)", "char t[2] (def)"]
@@ -1326,9 +1406,18 @@ mod tests {
             err("int a[2] = \"ab\";"),
             "1:12: array initializer must be an initializer list"
         );
+        // Brace elision: C would spread these over the inner arrays.
         assert_eq!(
             err("char a[2][2] = {\"ab\", 1};"),
-            "1:23: array initializer must be an initializer list or a string literal"
+            "1:23: brace elision is not supported: initialize each 'char [2]' with its own braces"
+        );
+        assert_eq!(
+            err("int m[2][2] = {1, 2, 3, 4};"),
+            "1:16: brace elision is not supported: initialize each 'int [2]' with its own braces"
+        );
+        assert_eq!(
+            err("int f() { int m[2][3] = {{1}, 2}; return 0; }"),
+            "1:31: brace elision is not supported: initialize each 'int [3]' with its own braces"
         );
         assert_eq!(
             err("int x = {1, 2};"),
@@ -1373,6 +1462,14 @@ mod tests {
         assert_eq!(ty("int x", "&buf"), "char (*)[8]");
         assert_eq!(ty("int x", "*buf"), "char");
         assert_eq!(ty("int x", "sizeof buf"), "unsigned int");
+        // A null pointer constant takes the other side's type, even as `(void *)0`.
+        assert_eq!(ty("int *p, int c", "c ? (void *)0 : p"), "int *");
+        assert_eq!(ty("int *p, int c", "c ? p : (void *)0"), "int *");
+        assert_eq!(ty("int *p, int c", "c ? 0 : p"), "int *");
+        assert_eq!(ty("int *p, int c", "(c ? (void *)0 : p) + 1"), "int *");
+        assert_eq!(ty("int *p, int c", "*(c ? p : (void *)0)"), "int");
+        assert_eq!(ty("int *p, void *v, int c", "c ? v : p"), "void *");
+        assert_eq!(ty("int c", "c ? (void *)0 : (void *)0"), "void *");
         assert_eq!(ty("int x", "\"abc\""), "char [4]");
         assert_eq!(ty("int x", "\"abc\"[1]"), "char");
         assert_eq!(ty("char c", "c = 300"), "char");
@@ -1544,6 +1641,11 @@ mod tests {
         e(
             "int *q = @s; return 0;",
             "incompatible pointer types initializing 'int *' with an expression of type 'char *'",
+        );
+        // `(void *)0` in a `?:` is a null pointer constant, not a `void *`.
+        e(
+            "s = 1 @? (void *)0 : p; return 0;",
+            "incompatible pointer types assigning to 'char *' from 'int *'",
         );
         e(
             "return f(@s);",
@@ -1774,6 +1876,14 @@ mod tests {
                 "1:20: use of undeclared identifier 'x'",
                 "1:29: use of undeclared identifier 'y'",
                 "1:37: use of undeclared identifier 'z'",
+            ]
+        );
+        // A global whose initializer is wrong is still declared.
+        assert_eq!(
+            errs("int m[2] = {1, 2, 3}; char s[] = 5; int f() { return m[0] + s[0]; }"),
+            [
+                "1:19: excess elements in array initializer",
+                "1:34: array initializer must be an initializer list or a string literal",
             ]
         );
     }

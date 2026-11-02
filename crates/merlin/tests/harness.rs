@@ -31,14 +31,16 @@
 //! Ignored, since they need LLVM:
 //!
 //! * `generated_assembly_assembles_like_clang`: clang's assembler (with
-//!   `-mno-relax`) turns merlin's output for every case into the same `.text`
-//!   bytes and relocations as merlin-as. Needs clang on `PATH`.
+//!   `-mno-relax`) turns merlin's output for every case into the same
+//!   `.text`, `.rodata`, `.data` and `.bss` contents and relocations as
+//!   merlin-as. Needs clang on `PATH`.
 //!
 //!       cargo test -p merlin --test harness -- --ignored generated_assembly
 //!
 //! * `clang_reference`: compiles every case with clang instead of merlin, links
 //!   with ld.lld and runs it in Grail. It checks the expectations and crt0
-//!   against a real C compiler. Needs clang and ld.lld on `PATH` (the official
+//!   against a real C compiler (crt0's `memset` is there for clang, which
+//!   calls it to clear large local arrays). Needs clang and ld.lld on `PATH` (the official
 //!   Windows LLVM installer is enough).
 //!
 //!       cargo test -p merlin --test harness -- --ignored clang_reference

@@ -1,4 +1,4 @@
-// expect: 55
+// expect: 57
 // Plain char is unsigned on RISC-V; signed char and short sign-extend; a
 // store keeps the low bytes; arithmetic happens in int (integer promotion).
 // Converting an out-of-range value to a signed type is implementation-
@@ -27,5 +27,10 @@ int main() {
     r += bytes[0] + bytes[1] - bytes[2] == 256;   // 53
     signed char *sp = (signed char *)bytes;
     r += sp[0] + sp[1];            // -1 + -128 -> -76
+    unsigned short one = 1;
+    r += -1 < one;                 // promoted to int, not unsigned: -75
+    unsigned char uc2 = 200;
+    signed char sc2 = -2;
+    r += uc2 / sc2 == -100;        // -74
     return r + 129 + sizeof(short);
 }

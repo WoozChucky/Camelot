@@ -1,4 +1,4 @@
-// expect: 158
+// expect: 160
 // Bitwise and shift operators, their compound assignments, and their
 // precedence (& binds looser than ==, << looser than +).
 int popcount(unsigned v) {
@@ -19,10 +19,13 @@ int main() {
     r += (~0u >> 31) == 1;               // 5
     r += (1 << 10) == 1024;              // 6
     r += (-16 >> 2) == -4;               // arithmetic shift: 7
-    r += popcount(0xdeadbeef);           // 24 -> 31
-    r += 6 & 3 == 3;                     // 6 & (3 == 3) is 0: 31
-    r += (6 & 3) == 2;                   // 32
-    r += 1 << 2 + 1;                     // 1 << 3 -> 40
+    int neg = -16;
+    r += (neg >> 2u) == -4;              // the left operand's type decides: 8
+    r += (-16 >> 2u) == -4;              // 9
+    r += popcount(0xdeadbeef);           // 24 -> 33
+    r += 6 & 3 == 3;                     // 6 & (3 == 3) is 0: 33
+    r += (6 & 3) == 2;                   // 34
+    r += 1 << 2 + 1;                     // 1 << 3 -> 42
     int x = 0x5a;
     x &= 0x0f;                           // 0x0a
     x |= 0x30;                           // 0x3a

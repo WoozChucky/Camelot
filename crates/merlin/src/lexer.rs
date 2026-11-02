@@ -1,7 +1,9 @@
 //! Turns C source text into tokens with line/column positions.
 //!
 //! Comments: `//` to end of line and `/* ... */`. No preprocessor yet: a `#`
-//! line is an error.
+//! line is an error. Trigraphs (`??=`...) and line splices (backslash-newline),
+//! which C99 rewrites before tokenizing, are errors wherever they would change
+//! what merlin reads.
 //!
 //! Integer literals get their C type here (C99 6.4.4.1, with `int` and `long`
 //! both 32 bits): a decimal literal is `int` if it fits, else it would be
@@ -187,6 +189,45 @@ impl Lexer {
         Some(c)
     }
 
+    /// Whether a trigraph (`??=` for `#`, `??/` for `\`, ...) starts here.
+    /// C99 replaces them before anything else, so merlin rejects them rather
+    /// than read `"??="` as three characters.
+    fn at_trigraph(&self) -> bool {
+        self.at("??") && self.peek(2).is_some_and(|c| "=(/)'<!>-".contains(c))
+    }
+
+    /// Whether a line splice starts here: `\` (or `??/`), optional blanks and a
+    /// newline, which C99 deletes before tokenizing (clang allows the blanks).
+    fn at_splice(&self) -> bool {
+        let mut k = match self.peek(0) {
+            Some('\\') => 1,
+            Some('?') if self.at("??/") => 3,
+            _ => return false,
+        };
+        while matches!(self.peek(k), Some(' ' | '\t' | '\r')) {
+            k += 1;
+        }
+        self.peek(k) == Some('\n')
+    }
+
+    /// Errors for what C99's translation phases 1 and 2 would rewrite here.
+    fn phase_1_2(&self) -> Result<(), Error> {
+        if self.at_splice() {
+            Err(Error::new(
+                self.pos(),
+                "line splices (backslash-newline) are not supported",
+            ))
+        } else if self.at_trigraph() {
+            let msg = format!(
+                "trigraphs are not supported ('{}'; write '\\?' for a '?' that starts one)",
+                self.chars[self.i..self.i + 3].iter().collect::<String>()
+            );
+            Err(Error::new(self.pos(), msg))
+        } else {
+            Ok(())
+        }
+    }
+
     fn take_while(&mut self, f: impl Fn(char) -> bool) -> String {
         let mut s = String::new();
         while let Some(c) = self.peek(0).filter(|&c| f(c)) {
@@ -205,6 +246,10 @@ impl Lexer {
                 }
                 (Some('/'), Some('/')) => {
                     while self.peek(0).is_some_and(|c| c != '\n') {
+                        // A splice would continue the comment on the next line.
+                        if self.at_splice() {
+                            return self.phase_1_2();
+                        }
                         self.bump();
                     }
                 }
@@ -219,8 +264,12 @@ impl Lexer {
                                 self.bump();
                                 break;
                             }
-                            (Some(_), _) => {
+                            (Some(c), _) => {
                                 self.bump();
+                                // `*`, a splice and `/` would end the comment.
+                                if c == '*' && self.at_splice() {
+                                    return self.phase_1_2();
+                                }
                             }
                             (None, _) => return Err(Error::new(start, "unterminated /* comment")),
                         }
@@ -297,12 +346,15 @@ impl Lexer {
             None | Some('\n') => return Err(unterminated()),
             Some(c) => c,
         };
+        self.phase_1_2()?;
         self.bump();
         if c != '\\' {
             let mut buf = [0; 4];
             out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             return Ok(());
         }
+        // `\??/` is `\\` to C, not `\?` and `?/`.
+        self.phase_1_2()?;
         let e = self.bump().ok_or_else(unterminated)?;
         let byte = match e {
             'n' => b'\n',
@@ -396,6 +448,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
             return Ok(out);
         };
         let start = lx.i;
+        lx.phase_1_2()?;
         let tok = if c.is_ascii_digit() {
             lx.number(pos)?
         } else if c == '\'' {
@@ -661,6 +714,32 @@ mod tests {
             "1:11: 'struct' is not supported yet"
         );
         assert_eq!(err("const int x;"), "1:1: 'const' is not supported yet");
+    }
+
+    #[test]
+    fn trigraphs_and_splices_are_errors() {
+        let trigraph =
+            |t: &str| format!("trigraphs are not supported ('{t}'; write '\\?' for a '?' that starts one)");
+        // C reads "??=" as "#": an error, never three characters.
+        assert_eq!(err(r#"char *s = "a??=";"#), format!("1:13: {}", trigraph("??=")));
+        assert_eq!(err("int c = '??'';"), format!("1:10: {}", trigraph("??'")));
+        assert_eq!(err(r#"int c = "\??/";"#), format!("1:11: {}", trigraph("??/")));
+        assert_eq!(err("x ??- y"), format!("1:3: {}", trigraph("??-")));
+        // A '?' that doesn't start a trigraph is fine, and so is '\?'.
+        assert_eq!(
+            toks(r#""???" "?\?=""#)[..2],
+            [Tok::Str(b"???".to_vec()), Tok::Str(b"??=".to_vec())]
+        );
+        let splice = "line splices (backslash-newline) are not supported";
+        assert_eq!(err("char *s = \"a\\\nb\";"), format!("1:13: {splice}"));
+        assert_eq!(err("char *s = \"a\\ \r\nb\";"), format!("1:13: {splice}"));
+        assert_eq!(err("in\\\nt x;"), format!("1:3: {splice}"));
+        // A splice would carry a // comment on to the next line.
+        assert_eq!(err("x; // note \\\ny = 2;"), format!("1:12: {splice}"));
+        assert_eq!(err("x; // note ??/  \r\ny = 2;"), format!("1:12: {splice}"));
+        assert_eq!(err("/* a *\\\n/ x"), format!("1:7: {splice}"));
+        // Elsewhere in comments, both mean nothing.
+        assert_eq!(toks("// a \\ b ??= ??/ c\n/* \\\n ??/\n **/ x").len(), 2);
     }
 
     #[test]

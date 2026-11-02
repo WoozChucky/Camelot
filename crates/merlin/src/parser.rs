@@ -350,11 +350,25 @@ impl Parser<'_> {
     }
 
     /// `'*'*`: pointers to `base`.
-    fn pointers(&mut self, mut ty: Type) -> Type {
-        while self.eat_punct("*") {
+    fn pointers(&mut self, mut ty: Type) -> Result<Type, Error> {
+        let mut n = 0;
+        while self.is_punct("*") {
+            self.too_deep(n, "'*'s")?;
+            self.advance();
             ty = Type::ptr(ty);
+            n += 1;
         }
-        ty
+        Ok(ty)
+    }
+
+    /// Types nest like expressions (and are as recursive to check), so a
+    /// declarator may have at most [`MAX_DEPTH`] `*`s and as many `[]`s.
+    fn too_deep(&self, n: usize, what: &str) -> Result<(), Error> {
+        if n == MAX_DEPTH {
+            let msg = format!("type nesting too deep: merlin allows at most {MAX_DEPTH} {what}");
+            return Err(Error::new(self.here(), msg));
+        }
+        Ok(())
     }
 
     /// `('[' constant? ']')*` after a name: the array dimensions, applied to
@@ -363,6 +377,7 @@ impl Parser<'_> {
     fn array_suffix(&mut self, elem: Type) -> Result<Type, Error> {
         let mut dims = Vec::new();
         while self.is_punct("[") {
+            self.too_deep(dims.len(), "array dimensions")?;
             let open = self.advance().pos;
             if self.eat_punct("]") {
                 if !dims.is_empty() {
@@ -387,16 +402,21 @@ impl Parser<'_> {
             dims.push(Some(n));
         }
         let mut ty = elem;
+        // The size of `ty`, kept as it grows: `Type::size` recurses, so asking
+        // it at every dimension would be quadratic in the number of dimensions.
+        let mut size = ty.size().map(u64::from);
         for n in dims.into_iter().rev() {
-            let Some(elem_size) = ty.size() else {
+            let Some(elem_size) = size else {
                 return Err(Error::new(
                     self.here(),
                     format!("array has incomplete element type '{ty}'"),
                 ));
             };
-            if elem_size as u64 * n.unwrap_or(1) as u64 > MAX_OBJECT_SIZE {
+            let total = elem_size * n.unwrap_or(1) as u64;
+            if total > MAX_OBJECT_SIZE {
                 return Err(Error::new(self.after_prev(), "array is too large"));
             }
+            size = n.map(|_| total);
             ty = Type::array(ty, n.map(|n| n as u32));
         }
         Ok(ty)
@@ -405,7 +425,7 @@ impl Parser<'_> {
     /// A declarator: pointers, the name and array dimensions. In a parameter
     /// list the name is optional.
     fn declarator(&mut self, base: &Type, ctx: Ctx) -> Result<Decl, Error> {
-        let ty = self.pointers(base.clone());
+        let ty = self.pointers(base.clone())?;
         let pos = self.here();
         let name =
             match self.peek().clone() {
@@ -498,7 +518,7 @@ impl Parser<'_> {
         let (base, storage) = self.specifiers(Ctx::File)?;
         // Look ahead past the pointers and the name: `(` means a function.
         let save = self.pos;
-        let ret = self.pointers(base.clone());
+        let ret = self.pointers(base.clone())?;
         if let (Tok::Ident(name), Tok::Punct("(")) = (self.peek().clone(), self.peek_at(1)) {
             let pos = self.advance().pos;
             self.advance(); // (
@@ -579,7 +599,7 @@ impl Parser<'_> {
     /// A type name, for casts and `sizeof`: specifiers, pointers, dimensions.
     fn type_name(&mut self) -> Result<Type, Error> {
         let (base, _) = self.specifiers(Ctx::TypeName)?;
-        let ty = self.pointers(base);
+        let ty = self.pointers(base)?;
         if matches!(self.peek(), Tok::Ident(_)) {
             return Err(self.unexpected("')' after the type name"));
         }
@@ -1522,6 +1542,21 @@ mod tests {
         limit(&ret(&nest(MAX_DEPTH - 1, "(", "1", ")")));
         limit(&ret(&nest(100_000, "(", "1", ")")));
         limit(&ret(&nest(100_000, "- ", "1", "")));
+        // Declarators: as many `*`s, or `[]`s, as the limit allows, and no more.
+        let stars = |n: usize| format!("int {}p;", "*".repeat(n));
+        let dims = |n: usize| format!("char a{};", "[1]".repeat(n));
+        assert!(parse(&lex(&stars(MAX_DEPTH)).unwrap()).is_ok());
+        assert!(parse(&lex(&dims(MAX_DEPTH)).unwrap()).is_ok());
+        assert_eq!(
+            err(&stars(MAX_DEPTH + 1)),
+            "1:261: type nesting too deep: merlin allows at most 256 '*'s"
+        );
+        assert_eq!(
+            err(&dims(100_000)),
+            "1:775: type nesting too deep: merlin allows at most 256 array dimensions"
+        );
+        let cast = format!("int f() {{ return sizeof(int {}); }}", "*".repeat(100_000));
+        assert!(err(&cast).ends_with("type nesting too deep: merlin allows at most 256 '*'s"));
         limit(&ret(&nest(100_000, "!", "1", "")));
         limit(&ret(&nest(100_000, "~", "1", "")));
         limit(&ret(&nest(100_000, "*", "1", "")));

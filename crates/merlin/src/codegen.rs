@@ -230,7 +230,10 @@ pub fn generate(prog: &Program) -> Result<String, Error> {
                 let Some(body) = &f.body else {
                     continue; // a prototype: the definition is elsewhere
                 };
-                let (offsets, frame) = layout(&f.locals);
+                let Some((offsets, frame)) = layout(&f.locals) else {
+                    let msg = format!("the locals of '{}' need a stack frame larger than 2 GiB", f.name);
+                    return Err(Error::new(f.pos, msg));
+                };
                 let mut g = FuncGen {
                     func: f,
                     offsets,
@@ -268,26 +271,32 @@ const SAVED_REGS: i32 = 8;
 /// multiple of 16 so that `sp` stays aligned at every step.
 const SAVE_AREA: i32 = 16;
 
+/// The largest frame: offsets from `s0` and the frame size must stay `i32`s.
+const MAX_FRAME: i64 = i32::MAX as i64 & !15;
+
 /// Places every local in the frame: its offset from `s0`, and the frame size
-/// (a multiple of 16, the convention's stack alignment).
-fn layout(locals: &[Local]) -> (Vec<i32>, i32) {
-    let mut off = -SAVED_REGS;
-    let offsets = locals
-        .iter()
-        .map(|l| {
-            let size = l.ty.size().expect("sema: locals have complete types") as i32;
-            // Arrays are word-aligned so that clearing them can use `sw`.
-            let align = if l.ty.is_array() {
-                l.ty.align().max(4)
-            } else {
-                l.ty.align()
-            } as i32;
-            // Round down to the alignment (two's complement: works below zero).
-            off = (off - size) & !(align - 1);
-            off
-        })
-        .collect();
-    (offsets, (-off + 15) & !15)
+/// (a multiple of 16, the convention's stack alignment). `None` if the frame
+/// would be larger than [`MAX_FRAME`].
+fn layout(locals: &[Local]) -> Option<(Vec<i32>, i32)> {
+    // In i64: each local is at most `i32::MAX` bytes, but their sum need not be.
+    let mut off = -i64::from(SAVED_REGS);
+    let mut offsets = Vec::with_capacity(locals.len());
+    for l in locals {
+        let size = l.ty.size().expect("sema: locals have complete types");
+        // Arrays are word-aligned so that clearing them can use `sw`.
+        let align = if l.ty.is_array() {
+            l.ty.align().max(4)
+        } else {
+            l.ty.align()
+        };
+        // Round down to the alignment (two's complement: works below zero).
+        off = (off - i64::from(size)) & !(i64::from(align) - 1);
+        if (-off + 15) & !15 > MAX_FRAME {
+            return None;
+        }
+        offsets.push(off as i32);
+    }
+    Some((offsets, ((-off + 15) & !15) as i32))
 }
 
 /// Does `v` fit a 12-bit signed immediate (`addi`, `lw`, `sw`)?
@@ -1409,7 +1418,7 @@ mod tests {
     fn locals(decls: &str) -> (Vec<i32>, i32) {
         let p = crate::parse(&format!("int f() {{ {decls} }}")).unwrap();
         let f = p.funcs().next().unwrap();
-        layout(&f.locals)
+        layout(&f.locals).unwrap()
     }
 
     #[test]
@@ -1426,6 +1435,18 @@ mod tests {
         // Arrays are word-aligned.
         assert_eq!(locals("char c; char buf[5]; char d;"), (vec![-9, -16, -17], 32));
         assert_eq!(locals("int a[10];"), (vec![-48], 48));
+    }
+
+    #[test]
+    fn frame_size_limit() {
+        // Each array fits, but not both: an error, not a frame that wrapped around.
+        let err = crate::compile("int main() { char a[2147483640]; char b[100]; return 0; }").unwrap_err();
+        assert_eq!(
+            err[0].to_string(),
+            "1:5: the locals of 'main' need a stack frame larger than 2 GiB"
+        );
+        let p = crate::parse("int f() { char a[2147483600]; }").unwrap();
+        assert_eq!(layout(&p.funcs().next().unwrap().locals).unwrap().1, 2147483616);
     }
 
     #[test]
