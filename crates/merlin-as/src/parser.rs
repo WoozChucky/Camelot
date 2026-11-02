@@ -3,9 +3,10 @@
 //! Grammar, one statement per line (labels can share a line with what follows):
 //!
 //! ```text
-//! line      := label* (directive | instruction)?
+//! line      := label* (directive | insn | instruction)?
 //! label     := IDENT ':' | INT ':'
 //! directive := '.'IDENT (dirarg (',' dirarg)*)?
+//! insn      := '.insn' IDENT? operand (',' operand)*   (an instruction named `.insn IDENT`)
 //! instr     := IDENT (operand (',' operand)*)?
 //! operand   := REG | expr '(' REG ')' | '(' REG ')' | expr
 //! expr      := standard C-like precedence: | ^ & << >> + - * / % unary(- ~) primary
@@ -104,6 +105,24 @@ impl Parser<'_> {
         }
         match self.next() {
             Tok::Newline => return Ok(()),
+            // `.insn i 0x0b, 0, x0, a0, 0` spells an instruction out field by
+            // field. Its operands are instruction operands (registers,
+            // `offset(reg)`), so it becomes an instruction named `.insn i`
+            // (`.insn` alone for the raw `.insn 0x0005000b` form).
+            Tok::Ident(name) if name == ".insn" => {
+                let mut mnemonic = name;
+                if let Tok::Ident(format) = self.peek().clone() {
+                    if !matches!(self.peek_at(1), Tok::Punct(',') | Tok::Newline) {
+                        self.pos += 1;
+                        mnemonic = format!(".insn {}", format.to_ascii_lowercase());
+                    }
+                }
+                let ops = self.operands()?;
+                out.push(Stmt {
+                    line,
+                    kind: StmtKind::Instruction(mnemonic, ops),
+                });
+            }
             Tok::Ident(name) if name.starts_with('.') => {
                 let args = self.dir_args()?;
                 out.push(Stmt {
@@ -337,6 +356,47 @@ mod tests {
                 "beqz".into(),
                 vec![Operand::Reg(5), Operand::Expr(Expr::Sym("1f".into()))]
             )
+        );
+    }
+
+    #[test]
+    fn insn_directive() {
+        assert_eq!(
+            one(".insn i 0x0b, 0, x0, a0, 0"),
+            StmtKind::Instruction(
+                ".insn i".into(),
+                vec![
+                    Operand::Expr(Expr::Num(0x0b)),
+                    Operand::Expr(Expr::Num(0)),
+                    Operand::Reg(0),
+                    Operand::Reg(10),
+                    Operand::Expr(Expr::Num(0)),
+                ]
+            )
+        );
+        assert_eq!(
+            one(".insn S 0x23, 2, a0, 8(sp)"),
+            StmtKind::Instruction(
+                ".insn s".into(),
+                vec![
+                    Operand::Expr(Expr::Num(0x23)),
+                    Operand::Expr(Expr::Num(2)),
+                    Operand::Reg(10),
+                    Operand::Mem {
+                        offset: Expr::Num(8),
+                        base: 2
+                    },
+                ]
+            )
+        );
+        assert_eq!(
+            one(".insn 0x0005000b"),
+            StmtKind::Instruction(".insn".into(), vec![Operand::Expr(Expr::Num(0x0005000b))])
+        );
+        // A constant named like a format is still a raw value when alone.
+        assert_eq!(
+            one(".insn WORD"),
+            StmtKind::Instruction(".insn".into(), vec![Operand::Expr(Expr::Sym("WORD".into()))])
         );
     }
 

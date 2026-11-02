@@ -38,14 +38,18 @@ name = "merlin-as"
 version = "0.1.0"
 dependencies = [
  "excalibur",
+ "merlin-objdump",
 ]
 
 [[package]]
 name = "merlin-ld"
 version = "0.1.0"
 dependencies = [
+ "elf32",
+ "excalibur",
  "grail",
  "merlin-as",
+ "merlin-objdump",
 ]
 
 [[package]]

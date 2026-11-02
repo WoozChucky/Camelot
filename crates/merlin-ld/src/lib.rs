@@ -5,10 +5,8 @@
 //! merging, addresses; driven by a [`script`]) → [`relocate`] (copies section
 //! contents and calls [`reloc::apply`] for every relocation) → [`write`].
 //!
-//! [`reloc::apply`] is the relocation hook; its body is issue #7. Until it is
-//! written, linking objects that carry relocations fails with an explicit
-//! "not implemented yet" error per relocation, while [`layout`] already gives
-//! their final addresses.
+//! [`reloc`] is where each relocation's formula and instruction field are
+//! explained; start there to see how addresses get into the code.
 
 pub mod layout;
 pub mod map;

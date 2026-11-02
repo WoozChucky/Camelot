@@ -119,9 +119,9 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 |---|---|
 | 0x0000_1000 - 0x0000_1FFF | Boot ROM (reset vector 0x1000, jumps to 0x8000_0000) |
 | 0x0200_0000 - 0x0200_FFFF | CLINT: msip @+0x0, mtimecmp @+0x4000, mtime @+0xBFF8 |
-| 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART and keyboard (section 7.1) |
+| 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART, keyboard and disks (section 7.1) |
 | 0x1000_0000 - 0x1000_00FF | UART, 16550-compatible subset (THR/RBR @+0, IER @+1, IIR @+2, LSR @+5) |
-| 0x1000_1000 - 0x1000_1FFF | Reserved: virtio block device (later, for a filesystem) |
+| 0x1000_1000 - 0x1000_8FFF | Block devices: disk `i` at 0x1000_1000 + 0x1000·i, up to 8 (`--disk`; Xcal, section 9.6). Only the pages of attached disks are mapped |
 | 0x0010_0000 | Test/exit device: write 0x5555 = pass/exit, 0x3333 = fail (used by riscv-tests) |
 | 0x3000_0000 - 0x3000_0FFF | Framebuffer control (Xcal, section 9.3) |
 | 0x3000_1000 - 0x3000_1FFF | Keyboard (Xcal, section 9.4) |
@@ -151,7 +151,8 @@ A minimal RISC-V PLIC (riscv-plic-spec) with the QEMU `virt` register layout: on
 | 0 | none ("no interrupt" when claimed) |
 | 1 | UART receive (section 7) |
 | 2 | Keyboard (section 9.4) |
-| 3-31 | unused, never asserted |
+| 3-10 | Disks 0-7: disk `i` is source 3 + `i` (section 9.6) |
+| 11-31 | unused, never asserted |
 
 QEMU `virt` puts UART0 on source 10; Excalibur numbers its few devices from 1 instead, so drivers must take the source numbers from this table rather than from `virt` device trees.
 
@@ -294,10 +295,49 @@ Device table entry `i` (for `i` < `SYS_DEV_COUNT`; at most 252 fit in the page):
 | 6 | Framebuffer VRAM (section 9.3) |
 | 7 | Sysinfo (this block) |
 | 8 | Keyboard (section 9.4) |
+| 9 | Block device, one entry per disk (section 9.6) |
 
-Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device (block storage, say) gets the next code and an entry, with no new registers and no change to this layout. Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), framebuffer control, keyboard (irq 2), sysinfo and VRAM; `examples/sysinfo` prints the table.
+Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device gets the next code and an entry, with no new registers and no change to this layout (the block device, type 9, was added this way). Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), one block device per disk (disk `i` at 0x1000_1000 + 0x1000·`i`, irq 3 + `i`; none without `--disk`), framebuffer control, keyboard (irq 2), sysinfo and VRAM; `examples/sysinfo` prints the table.
 
 The registers are 32-bit only: byte or halfword accesses raise access faults. Word writes are ignored, as for the framebuffer's read-only registers. Offsets past the last entry read as 0.
+
+### 9.6 Block device (MMIO)
+
+Disks of 512-byte sectors. A machine has 0 to 8 of them, in the order they are given (`grail --disk IMG`, repeatable; `MachineConfig::disks` for a host using Grail as a library). Disk `i` has a 4 KiB page of registers at 0x1000_1000 + 0x1000·`i` and interrupts on PLIC source 3 + `i`, and it has an entry of type 9 in the sysinfo device table (section 9.5), which is how software finds it. The pages of disks the machine does not have are unmapped.
+
+The interface is one command at a time with DMA: software writes the first sector, the buffer's address in RAM and the sector count, then a command; the device copies the sectors between the disk and RAM itself, sets `BLK_STATUS.DONE` and, if enabled, raises its interrupt. The memory map used to reserve this slot for a virtio-blk device. Virtio was set aside because a driver must negotiate features and build a virtqueue in guest memory (descriptor table, available ring, used ring) behind the virtio-mmio transport registers before the first sector moves, while a driver for this device is about twenty instructions (`examples/disk`) that a first kernel driver can copy. Having only one request in flight costs nothing in an emulator that finishes each request at once. A queued device can still be added later as a new type code.
+
+| Offset | Register | Notes |
+|---|---|---|
+| +0x00 | `BLK_CAPACITY` (RO) | disk size in sectors (at most 2^32 - 1, just under 2 TiB) |
+| +0x04 | `BLK_FLAGS` (RO) | bit 0 = the disk is read-only. Other bits read as 0 |
+| +0x08 | `BLK_SECTOR` | first sector of the transfer |
+| +0x0C | `BLK_DMA` | physical address of the buffer in RAM |
+| +0x10 | `BLK_COUNT` | number of sectors to transfer |
+| +0x14 | `BLK_CMD` (WO) | writing a command runs it: 1 = read (disk to RAM), 2 = write (RAM to disk), 3 = flush. Reads as 0 |
+| +0x18 | `BLK_STATUS` | bit 0 = BUSY (read-only); bit 1 = DONE: a command finished and has not been acknowledged. Writing 1 to bit 1 clears it; other bits ignore writes |
+| +0x1C | `BLK_ERROR` (RO) | outcome of the last command, below |
+| +0x20 | `BLK_CTRL` | bit 0 = completion interrupt enable. Other bits read as 0 |
+
+| `BLK_ERROR` | Meaning |
+|---|---|
+| 0 | none: the command worked |
+| 1 | unknown command |
+| 2 | out of range: `BLK_SECTOR + BLK_COUNT` is past `BLK_CAPACITY` |
+| 3 | bad buffer: the `BLK_COUNT` × 512 bytes at `BLK_DMA` are not all in RAM |
+| 4 | write to a read-only disk |
+| 5 | I/O error on the host side (the backend failed) |
+
+Details:
+
+- The registers are 32-bit only: byte or halfword accesses in a disk's page raise access faults and run nothing. Unused offsets read as 0 and ignore writes, as do writes to the read-only registers. Everything writable resets to 0. `BLK_SECTOR`, `BLK_DMA` and `BLK_COUNT` keep their values after a command.
+- **Commands complete at once.** Grail runs a command to completion during the store to `BLK_CMD`, so BUSY never reads 1 and DONE is already set when the next instruction runs. BUSY is defined anyway, so that a driver which waits for BUSY to clear or for DONE (by polling or by interrupt) also works with a disk that takes time. A command written while BUSY is set is ignored. Every command written sets DONE and `BLK_ERROR`, failed ones included.
+- **Checks come first**, in the order of the error codes (1 to 4), before any data moves: a command that fails one transfers nothing. The range check is done without overflow, so a huge `BLK_SECTOR` or `BLK_COUNT` fails with 2 instead of wrapping. The buffer must lie in RAM (not VRAM, the boot ROM or device registers); it may start at any byte address. `BLK_DMA` is a physical address: the device does not use the MMU. With `BLK_COUNT` 0 a read or write transfers nothing, and succeeds if the checks pass (`BLK_SECTOR` at most `BLK_CAPACITY`, `BLK_DMA` in RAM or just past its end). Only error 5 can leave a transfer half done. Nothing a program writes makes the host panic or touches memory outside the buffer.
+- **Flush** ignores `BLK_SECTOR`, `BLK_DMA` and `BLK_COUNT`, and completes once every earlier write is durable on the host (for an image file, the host OS has written it to its own disk). It succeeds on a read-only disk.
+- **Interrupt**: a disk holds its PLIC source high while `BLK_CTRL.0` and `BLK_STATUS.DONE` are both set. A handler claims the source, reads `BLK_ERROR`, writes 2 to `BLK_STATUS` (which lowers the line) and completes. If it completes without acknowledging, the source is pending again at once (section 7.1).
+- **Backends.** Where a disk's sectors live is up to the host: Grail gives each disk of each machine its own backend (`BlockBackend` in the grail library: capacity, read, write, flush). `--disk IMG` uses an image file on the host, `--disk-ro IMG` the same file opened read-only (`BLK_FLAGS.0` set); tests use in-memory disks, and a host can hand Grail backends of its own (`Machine::with_backends`; the Lake storage server will add a network one). An image is raw: sector `n` is bytes 512·`n` to 512·`n` + 511 of the file. Its size must be a whole number of sectors, or Grail refuses to start; it never grows. Writes go to the file as they happen. Grail does not lock images, so two machines must not attach the same image read-write.
+
+`examples/disk` finds the first disk in the device table, prints its sector 0 as text, checks that a read past the end fails with error 2, and runs a write/read-back test on the last sector (saving and restoring it), waiting for the completion interrupt after every command: `grail --disk examples/disk/disk.img examples/disk/disk.elf`.
 
 ## 10. Toolchain (all our own)
 
@@ -305,7 +345,7 @@ Everything that runs on the host is written by us, with no third-party libraries
 
 | Tool | Input → output | Notes |
 |---|---|---|
-| Assembler (`merlin-as`) | `.s` → `.o` | Full RV32I(+M) mnemonics, standard pseudo-instructions (`li`, `la`, `call`, `ret`, `mv`, `j`, `beqz`...), directives (`.text .data .bss .section .globl .word .byte .ascii .align .equ`), `%hi/%lo/%pcrel_hi/%pcrel_lo` |
+| Assembler (`merlin-as`) | `.s` → `.o` | Full RV32I(+M, Zicsr, Zifencei, privileged, Xcal) mnemonics, standard pseudo-instructions (`li`, `la`, `call`, `ret`, `mv`, `j`, `beqz`...), `.insn`, directives (`.text .data .bss .section .globl .word .byte .ascii .align .equ`), `%hi/%lo/%pcrel_hi/%pcrel_lo`. See "Assembler" below |
 | Linker (`merlin-ld`) | `.o` files → executable | Symbol resolution, relocation, section merging, simple linker script (or fixed layout: `.text` at 0x8000_0000) |
 | Emulator (`grail`) | executable → runs it | Loads ELF directly, no boot loader needed early on |
 | Disassembler (`merlin-objdump`) | `.o`/exe → text | Shares the decoder with the emulator; essential for debugging |
@@ -332,16 +372,33 @@ Test programs live in `crates/merlin/tests/cases/*.c`, each starting with `// ex
 **ELF32 (little-endian, EM_RISCV)**, a subset:
 
 - Relocatable `.o`: sections `.text .data .rodata .bss`, `.symtab`, `.strtab`, `.rela.*`.
-- Relocations needed: `R_RISCV_32`, `R_RISCV_BRANCH`, `R_RISCV_JAL`, `R_RISCV_HI20`, `R_RISCV_LO12_I`, `R_RISCV_LO12_S`, `R_RISCV_PCREL_HI20`, `R_RISCV_PCREL_LO12_I/S`, `R_RISCV_CALL`. No linker relaxation.
+- Relocations needed: `R_RISCV_32`, `R_RISCV_BRANCH`, `R_RISCV_JAL`, `R_RISCV_HI20`, `R_RISCV_LO12_I`, `R_RISCV_LO12_S`, `R_RISCV_PCREL_HI20`, `R_RISCV_PCREL_LO12_I/S`, `R_RISCV_CALL` and `R_RISCV_CALL_PLT` (what clang and merlin-as emit for `call`; without shared libraries it means the same). No linker relaxation: `R_RISCV_RELAX` hints are ignored, `R_RISCV_ALIGN` is an error (build with `-mno-relax`).
 - Executable: `ET_EXEC`, program headers only for `PT_LOAD`, entry point in `e_entry`.
 
 Why ELF rather than a custom format: it costs little more to write, and it means clang/lld, `llvm-objdump` and `llvm-readelf` can check our output and produce reference files, and riscv-tests ELFs load directly. A custom format can still be added later as an exercise.
 
 All reading goes through one crate, `elf32` (header, program headers, sections, symbols, `.rela`/`.rel` entries, RISC-V relocation names). Grail's loader and merlin-objdump use it; merlin-ld still reads its input objects with its own `src/object.rs` and should move to it. Writers stay in each tool.
 
+### Assembler (`merlin-as`)
+
+`merlin-as [-o out.o] input.s`. The reference is clang's integrated assembler with `-march=rv32im_zicsr_zifencei -mno-relax`: for the same source, `llvm-objdump -dr` must print the same text for both objects (checked for `examples/hello/hello.S` and `examples/muldiv/muldiv.S`), and every encoding matches llvm-mc (`crates/merlin-as/tests/golden/encode.golden`). The encoder, the pseudo-instruction expansions and `li`'s choice of sequence are documented in `crates/merlin-as/ENCODER.md`.
+
+- **Single pass.** No instruction's size depends on a label's address; `.equ`/`.set` constants must be defined before use. Every label reference is first recorded as a fixup with its immediate left zero.
+- **Local labels are resolved by the assembler**, as clang does with `-mno-relax`. When the file has been read, a pc-relative reference to a label that is local (not `.globl`, also when `.globl` comes later in the file) and defined in the same section is patched in and gets no relocation: branches, `jal`/`j`, `call`/`tail` (both words), and `auipc` + `%pcrel_lo` pairs (`la`, `lla`, `lw rd, sym`, `sw rs, sym, rt`, explicit `%pcrel_hi`/`%pcrel_lo`). A branch or jump out of range is an error on its line. Everything else stays a relocation for the linker: references to global or undefined symbols, to labels in other sections, and absolute ones (`%hi`, `%lo`, `.word sym`).
+- **`.`** is the location counter: the address of the instruction (its first word, for a pseudo-instruction) or data word it appears in. Each use becomes a hidden local label there, so `j .`, `beq a0, a1, .-8` and `la a0, .` resolve like any local label, and `.word .` gets an `R_RISCV_32` against that label (clang's `.L0`).
+- **Symbols**: `.L` labels (numeric labels like `1:`, hidden `.Lpcrel_hiN` labels on `auipc`s, `.Ldot$N` labels for `.`) are written to `.symtab` only when a relocation refers to them, as in clang.
+- **`.insn`** spells out an instruction by fields, with LLVM's forms and encodings: `.insn r opcode, funct3, funct7, rd, rs1, rs2`, `.insn i opcode, funct3, rd, rs1, imm` (or `rd, imm(rs1)`), `.insn s opcode, funct3, rs2, imm(rs1)`, `.insn b opcode, funct3, rs1, rs2, target`, `.insn u opcode, rd, imm20`, and `.insn value` / `.insn 4, value`. Opcodes must be 32-bit ones (low bits `11`). This lets sources that use Xcal instructions (`examples/hello/hello.S`) build with both assemblers.
+- **`.riscv.attributes`**: every object carries clang's `Tag_RISCV_arch` for `rv32im_zicsr_zifencei` (`rv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0`), so llvm-objdump decodes M instructions without `--mattr`.
+- **Differences from clang**, on purpose:
+  - No branch relaxation. clang rewrites a conditional branch it cannot resolve or reach (to a global or undefined symbol, another section, or beyond ±4 KiB) into the inverted branch over a `jal`, even with `-mno-relax`; merlin-as keeps one instruction with `R_RISCV_BRANCH`, or reports the branch out of range. (llvm-mc's `-riscv-asm-relax-branches=0` behaves like merlin-as; the golden encodings are made with it.)
+  - A numeric label that a relocation refers to is named `.L<n>$<k>` (the k-th definition of `n:`); clang names it `.Ltmp<m>`. No `$x`/`$d` mapping symbols are written.
+  - `.insn j` is not accepted: LLVM 21 packs its numeric offset without the J-type bit scrambling.
+  - Register names are never symbols: `lw a0, a1` is an error, where LLVM reads `a1` as a symbol.
+  - Some operand forms LLVM accepts are not: `jalr rd, rs` and `jalr off(rs)` (write `jalr rd, 0(rs)`, `jalr ra, off(rs)`), `jr off(rs)` and `jr rs, off` (write `jalr zero, off(rs)`), `call rd, sym`, `jump sym, rt`, `%hi(sym)` in `.insn u`, named opcodes in `.insn` (`.insn r OP, ...`), upper-case CSR names (`MSTATUS`) and standard CSRs Excalibur doesn't have (`fflags`). The other way round, `call`/`tail` accept `sym+offset` and `.`, where clang wants a bare symbol name.
+
 ### Linker (`merlin-ld`)
 
-`merlin-ld a.o b.o [-T link.ld] [-e entry] [-o out.elf] [--Map out.map]`. The reference is ld.lld: for the same objects and script, the allocated sections (names, types, addresses, sizes, alignments, A/W/X flags), `PT_LOAD`s and symbol values must match, except for the differences listed at the end of this subsection. This is checked against committed `llvm-readelf` output of ld.lld links (`crates/merlin-ld/tests/fixtures`, regenerated with `cargo xtask ld-fixtures`), including layout edge cases (empty and assignment-only output sections, gaps, `NOBITS` before `PROGBITS`).
+`merlin-ld a.o b.o [-T link.ld] [-e entry] [-o out.elf] [--Map out.map]`. The reference is ld.lld: for the same objects and script, the allocated sections (names, types, addresses, sizes, alignments, A/W/X flags), `PT_LOAD`s and symbol values must match, and so must every loaded byte, except for the differences listed at the end of this subsection. This is checked against ld.lld links committed with their `llvm-readelf` and `llvm-objdump -d` output (`crates/merlin-ld/tests/fixtures`, regenerated with `cargo xtask ld-fixtures`), including layout edge cases (empty and assignment-only output sections, gaps, `NOBITS` before `PROGBITS`) and every relocation type at the edges of its range, and by relinking every riscv-tests program from its object (`tests/riscv-tests/obj`) and comparing with the committed ld.lld executable.
 
 - **Inputs**: `ET_REL`, `EM_RISCV`, ELFCLASS32, little-endian, `e_flags` 0 (ilp32 soft-float, no RVC). Allocated sections must be `PROGBITS` or `NOBITS`. Rejected with an error: `SHT_REL`, section groups/COMDAT, TLS, common symbols (`-fno-common`), extended section indices. Non-allocated sections (`.riscv.attributes`, `.comment`, debug info) are dropped. Mergeable sections (`SHF_MERGE`, e.g. clang's `.rodata.str1.1` for C string literals) are placed like any other section: see the differences below. Build clang objects with `-mno-relax`: there is no linker relaxation.
 - **Symbols**: locals stay per object. Two strong definitions of a global are an error (`b.o: duplicate symbol 'foo' (first defined in a.o)`); a strong definition beats a weak one; an undefined weak symbol is 0. An undefined global nobody defines is an error (`a.o: undefined reference to 'foo'`). Symbols assigned in the linker script override object definitions (as in ld.lld).
@@ -350,14 +407,23 @@ All reading goes through one crate, `elf32` (header, program headers, sections, 
 - **Placement**: in script order, the first `*(pattern)` that matches an input section takes it; within one `*(...)`, inputs keep command-line order and file order. An allocated input section no rule matches is an error if it is non-empty or defines a global (an empty one is left out). Each input is aligned to its `sh_addralign`, also when it is empty; an output section starts aligned to its largest input alignment. As in ld.lld, an output section is dropped only when no input section matched it (not even an empty one) and it contains no assignments; one that holds only assignments (`. += n`, `sym = .`) is `PROGBITS` with the flags of the previous output section that had inputs, so `.stack : { . += 4K; }` takes file space (a top-level `. += 4K;` reserves memory without it). The location counter starts at 0, also with `MEMORY` (a symbol assigned before the first output section gets 0, as in ld.lld). With `MEMORY`, every output section goes at the region's next free address, as in ld.lld, which means a top-level `. = ...` before a section would be ignored: merlin-ld reports it as an error instead (put the `ALIGN` inside the section). Overflowing the region is an error.
 - **Entry**: `-e` (symbol or number), else `ENTRY(...)`, else `_start`. A missing `-e` symbol is an error; otherwise a warning, and the entry falls back to the first executable section.
 - **Output**: `ET_EXEC`, one `PT_LOAD` per run of consecutive output sections with the same permissions (R, RX, RW), as ld.lld does with a `SECTIONS` command: address gaps and `NOBITS` sections inside a run do not split it but are written as zeros, so only `NOBITS` sections at the end of a run (`.bss`) give `p_memsz > p_filesz`. A run of empty sections has no `PT_LOAD`. Segment file offsets are congruent to their addresses mod 4 KiB (`p_align` 0x1000). Section headers and a `.symtab` (locals, then globals) are included for merlin-objdump and for Grail's `tohost` lookup.
-- **Relocations**: after layout, every entry of every `.rela.*` section that patches a loaded section goes through one hook, `reloc::apply(type, P, S, A, bytes, ctx)`, where `bytes` starts at the patched place and `ctx` maps each `R_RISCV_PCREL_HI20` place to its S and A for the `PCREL_LO12` relocations. Implementing the hook is issue #7; until then it rejects every relocation with an explicit "not implemented yet" error, so only relocation-free objects link to an executable.
+- **Relocations**: after layout, every entry of every `.rela.*` section that patches a loaded section goes through one function, `reloc::apply(type, P, S, A, bytes, ctx)` (`crates/merlin-ld/src/reloc.rs`, which explains each formula and field), where `bytes` runs from the patched place to the end of its input section and `ctx` maps each `R_RISCV_PCREL_HI20` place to its S and A. The values follow the psABI:
+  - `R_RISCV_32`: S + A, which must fit 32 bits (signed or unsigned).
+  - `R_RISCV_BRANCH` / `R_RISCV_JAL`: S + A - P, even, within -4096..=4094 / -1 MiB..=1 MiB - 2.
+  - `R_RISCV_HI20` / `R_RISCV_LO12_I` / `R_RISCV_LO12_S`: S + A split into `hi = (v + 0x800) >> 12` (for `lui`) and the low 12 bits, which `addi`/loads/stores sign-extend: the `+ 0x800` rounds `hi` up when bit 11 is set so the pair adds back to `v`.
+  - `R_RISCV_PCREL_HI20`: S + A - P, split the same way (for `auipc`). `R_RISCV_PCREL_LO12_I/S`: its symbol is the label on the matching `auipc`, which must be in the same section; the low part is that of the `PCREL_HI20` found at the label's address (its S + A - P, not the low instruction's). Its own addend must be 0.
+  - `R_RISCV_CALL` / `R_RISCV_CALL_PLT`: S + A - P split over the `auipc` and the `jalr` after it.
+  - The `hi`/`lo` pairs are computed modulo 2^32, as RV32 executes them, so they reach every address and never overflow.
+  - A weak reference that another object defines is that definition. A branch, jump or call to an undefined weak symbol targets itself (as in ld.lld: address 0 is usually out of reach); every other reference to it sees 0.
+  - Errors name the file, section, offset and symbol: `a.o: relocation R_RISCV_JAL out of range for 'foo' at .text+0x10: 1048580 is not in [-1048576, 1048574]`. Misaligned targets, a field running past its section, a `PCREL_LO12` without its `PCREL_HI20`, `R_RISCV_ALIGN` and types outside this list (GOT, TLS, compressed, `ADD`/`SUB`) are errors too.
 - **Differences from ld.lld**, on purpose:
   - `SHF_MERGE` sections are not merged. ld.lld keeps one copy of identical strings and constants (two C files using the same string literal share it) and orders the pieces by hash; merlin-ld concatenates the input sections in order. When an output section holds duplicates it is larger than ld.lld's and every address after it differs, and merlin-ld warns (`.rodata: mergeable (SHF_MERGE) input sections hold N bytes of duplicate strings or constants; ...`). Without duplicates the sizes match, but a symbol inside a merged string section can still have a different address.
   - With `MEMORY`, a top-level `. = ...` that moves `.` before an output section is an error (ld.lld ignores it), see Placement.
   - Script-assigned symbols are `SHN_ABS` in `.symtab`; ld.lld makes them relative to a nearby output section. Their values are the same.
   - Output section flags are only `SHF_ALLOC`, `SHF_WRITE` and `SHF_EXECINSTR` (ld.lld also carries `SHF_MERGE`/`SHF_STRINGS` over from merged inputs).
   - Unmatched allocated sections are errors, not orphans placed by heuristics. `/DISCARD/`, `NOLOAD`, `AT`, and output section addresses or attributes (`.sec ALIGN(16) : { }`) are not supported.
-  - Only `PT_LOAD` program headers (no `PT_GNU_STACK` or `PT_RISCV_ATTRIBUTES`), and no `.riscv.attributes` or `.comment` in the output. File offsets of empty and `NOBITS` sections may differ.
+  - Only `PT_LOAD` program headers (no `PT_GNU_STACK` or `PT_RISCV_ATTRIBUTES`), and no `.riscv.attributes` or `.comment` in the output. Without `.riscv.attributes`, llvm-objdump does not know the target has the M extension and prints `mul`/`div`/... in a merlin-ld executable as `<unknown>`: compare the two disassemblies with `llvm-objdump -d --mattr=+m` (the bytes are the same). File offsets of empty and `NOBITS` sections may differ. Undefined weak symbols are left out of `.symtab`.
+  - A `PCREL_LO12` with a non-zero addend is an error (ld.lld warns and ignores the addend), and an `R_RISCV_32` value that does not fit 32 bits is an error (ld.lld truncates it).
 
 ### Disassembler output
 
@@ -428,7 +494,7 @@ Kernel C stays inside what Merlin will compile: no libc headers (`-nostdinc`), n
 4. **merlin-as** emitting ELF `.o`. Validate with `llvm-objdump` and ld.lld.
 5. **merlin-ld**. Validate against clang-produced objects.
 6. **Bare-metal hello world** written in our assembly, built entirely with our tools.
-7. **M extension** in merlin-as (Grail already passes rv32um). **Xcal devices** in Grail: framebuffer window and keyboard via Win32 FFI, sysinfo, and a configurable machine (RAM size, real-time clock) that a host can run several of.
+7. **M extension** in merlin-as (Grail already passes rv32um). **Xcal devices** in Grail: framebuffer window and keyboard via Win32 FFI, sysinfo, block devices with pluggable backends, and a configurable machine (RAM size, real-time clock, disks) that a host can run several of.
 8. **Merlin v0**: C subset → assembly. Grow it test by test.
 9. **Camelot kernel** in C (clang first, our compiler as it catches up): trap handling, timer, UART driver, then paging (Sv32), processes, syscalls.
 10. **Self-hosting stretch goal**: our tools running on our OS.
