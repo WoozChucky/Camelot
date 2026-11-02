@@ -1,12 +1,14 @@
 //! Physical address space. See spec section 7 for the memory map.
 
-use crate::devices::{Clint, TestDevice, Uart};
+use crate::devices::{Clint, Plic, TestDevice, Uart, UART_IRQ};
 use crate::framebuffer::{Framebuffer, VRAM_SIZE};
 
 pub const BOOT_ROM_BASE: u32 = 0x0000_1000;
 pub const TEST_DEV_BASE: u32 = 0x0010_0000;
 pub const CLINT_BASE: u32 = 0x0200_0000;
 pub const CLINT_SIZE: u32 = 0x1_0000;
+pub const PLIC_BASE: u32 = 0x0C00_0000;
+pub const PLIC_SIZE: u32 = 0x0400_0000;
 pub const UART_BASE: u32 = 0x1000_0000;
 pub const UART_SIZE: u32 = 0x100;
 pub const FB_CTRL_BASE: u32 = 0x3000_0000;
@@ -29,6 +31,7 @@ pub struct Bus {
     pub ram: Vec<u8>,
     pub rom: Vec<u8>,
     pub clint: Clint,
+    pub plic: Plic,
     pub uart: Uart,
     pub fb: Framebuffer,
     pub test: TestDevice,
@@ -44,6 +47,7 @@ impl Bus {
             ram: vec![0; ram_size],
             rom: Vec::new(),
             clint: Clint::default(),
+            plic: Plic::default(),
             uart: Uart::default(),
             fb: Framebuffer::default(),
             test: TestDevice,
@@ -64,6 +68,13 @@ impl Bus {
         self.rom = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     }
 
+    /// Samples every device's interrupt line into the PLIC. Called once per step,
+    /// before the hart looks at `mip`.
+    pub fn update_interrupts(&mut self) {
+        let uart = self.uart.irq();
+        self.plic.set_level(UART_IRQ, uart);
+    }
+
     fn ram_range(&self, addr: u32, size: u32) -> Option<usize> {
         let off = addr.wrapping_sub(RAM_BASE) as usize;
         (addr >= RAM_BASE && off + size as usize <= self.ram.len()).then_some(off)
@@ -82,21 +93,37 @@ impl Bus {
         Self::vram_range(addr, size).map(|off| &mut self.fb.vram[off..off + size as usize])
     }
 
+    /// Reads `size` (1, 2 or 4) bytes of RAM or boot ROM, little-endian, zero-extended.
+    /// Device registers fault here: instruction fetches and page-table walks use this, so
+    /// they can never trigger a device's read side effect (such as a PLIC claim).
+    pub fn read_mem(&self, addr: u32, size: u32) -> Result<u32, BusFault> {
+        let bytes = if let Some(off) = self.ram_range(addr, size) {
+            &self.ram[off..off + size as usize]
+        } else if (BOOT_ROM_BASE..BOOT_ROM_BASE + 0x1000).contains(&addr) {
+            // Past the end of the stub (but inside the ROM window) reads as 0.
+            let off = (addr - BOOT_ROM_BASE) as usize;
+            self.rom.get(off..).unwrap_or(&[])
+        } else {
+            return Err(BusFault);
+        };
+        let mut v = 0u32;
+        for i in (0..size as usize).rev() {
+            v = (v << 8) | *bytes.get(i).unwrap_or(&0) as u32;
+        }
+        Ok(v)
+    }
+
     /// Reads `size` (1, 2 or 4) bytes, little-endian, zero-extended.
     pub fn read(&mut self, addr: u32, size: u32) -> Result<u32, BusFault> {
         if let Some(mem) = self.memory(addr, size) {
             return Ok(mem.iter().rev().fold(0, |v, &b| (v << 8) | b as u32));
         }
+        if let Ok(v) = self.read_mem(addr, size) {
+            return Ok(v);
+        }
         match addr {
-            a if (BOOT_ROM_BASE..BOOT_ROM_BASE + 0x1000).contains(&a) => {
-                let off = (a - BOOT_ROM_BASE) as usize;
-                let mut v = 0u32;
-                for i in (0..size as usize).rev() {
-                    v = (v << 8) | *self.rom.get(off + i).unwrap_or(&0) as u32;
-                }
-                Ok(v)
-            }
             a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => self.clint.read(a - CLINT_BASE, size),
+            a if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&a) => self.plic.read(a - PLIC_BASE, size),
             a if (UART_BASE..UART_BASE + UART_SIZE).contains(&a) => self.uart.read(a - UART_BASE, size),
             a if (FB_CTRL_BASE..FB_CTRL_BASE + FB_CTRL_SIZE).contains(&a) => {
                 self.fb.read(a - FB_CTRL_BASE, size)
@@ -119,6 +146,7 @@ impl Bus {
             a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => {
                 self.clint.write(a - CLINT_BASE, size, val)
             }
+            a if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&a) => self.plic.write(a - PLIC_BASE, size, val),
             a if (UART_BASE..UART_BASE + UART_SIZE).contains(&a) => self.uart.write(a - UART_BASE, size, val),
             a if (FB_CTRL_BASE..FB_CTRL_BASE + FB_CTRL_SIZE).contains(&a) => {
                 self.fb.write(a - FB_CTRL_BASE, size, val)
@@ -179,6 +207,9 @@ mod tests {
         bus.write(VRAM_BASE + 5, 1, 0xabcd).unwrap();
         bus.write(VRAM_BASE + 6, 2, 0x1234_5678).unwrap();
         assert_eq!(bus.read(VRAM_BASE + 4, 4), Ok(0x5678_cd00));
+
+        // Data accesses only: no instruction fetches or page-table walks from VRAM.
+        assert_eq!(bus.read_mem(VRAM_BASE, 4), Err(BusFault));
     }
 
     #[test]
