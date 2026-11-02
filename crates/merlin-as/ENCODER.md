@@ -33,6 +33,18 @@ When everything is done:
 cargo test -p merlin-as --test encode_golden -- --ignored
 ```
 
+Two more suites follow the same rules (unimplemented lines are counted, not
+failed; `-- --ignored` requires everything):
+
+- `encode_roundtrip`: `excalibur::decode` of your words must give back the
+  operation and operands in a hand-written table (covers Xcal, CSRs by name,
+  the `li` hi20/lo12 split), and every golden line must survive
+  decode → disassemble → assemble unchanged.
+- `encode_errors`: out-of-range immediates, bad operands and unknown
+  mnemonics must be rejected on their own source line. Unknown mnemonics
+  currently land in the `UNIMPLEMENTED` arm; the complete run wants a real
+  error there that names the mnemonic.
+
 ## Suggested order
 
 1. **Field packers.** `r_type`, `i_type`, `s_type`, `b_type`, `u_type`, `j_type`.
