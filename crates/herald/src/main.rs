@@ -1,13 +1,17 @@
-//! `herald [--server ADDR] <vm>`
+//! `herald [--server ADDR] [--screen] <vm>`
 
+#[cfg(windows)]
+use avalon_proto::VmState;
 use avalon_proto::{Connection, VmRef, DEFAULT_AVALON_ADDR};
 use grail::console::{self, RawMode, RawOptions};
+#[cfg(windows)]
+use herald::End;
 use herald::{parse_server, Session, Utf8Lossy, AGENT, DETACH_KEY_NAME};
 use std::io::{self, IsTerminal, Write};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: herald [--server ADDR] <vm>
+const USAGE: &str = "usage: herald [--server ADDR] [--screen] <vm>
 
 Attaches to the serial console of a VM on an Avalon server: prints its recent
 output, then streams the output live and sends what you type to the VM. <vm> is a
@@ -15,28 +19,38 @@ VM id (all digits) or a VM name.
 
   --server ADDR   the Avalon server: host:port, or a host or IP address for port
                   7400 (default 127.0.0.1:7400)
+  --screen        show the VM's screen (its framebuffer) in a window instead, and
+                  send the keys typed and the mouse moved over it to the VM's
+                  keyboard and pointer devices. Closing the window detaches; when
+                  the VM ends, the window stays on its last frame until closed.
+                  Windows only
   -h, --help      show this text
 
-Ctrl-] detaches and leaves the VM running; so does the end of the input when it
-is not a terminal (where Ctrl-] still detaches). Herald also ends when the VM
-stops, exits or is destroyed. Ctrl-C leaves Herald at once, the VM running.
-Any number of Heralds may attach to one VM: all of them see its output, and what
-any of them types reaches it.
+On the console, Ctrl-] detaches and leaves the VM running; so does the end of
+the input when it is not a terminal (where Ctrl-] still detaches). Herald also
+ends when the VM stops, exits or is destroyed. Ctrl-C leaves Herald at once, the
+VM running. Any number of Heralds may attach to one VM, to its console or its
+screen: all of them see its output, and what any of them types reaches it.
 
 Exit status: 0 when detached or when the VM ended, 1 on an error (no server, no
-such VM, connection lost, console output failed), 2 for bad arguments; Ctrl-C
-gives the usual status of an interrupted program (130 on Linux,
-STATUS_CONTROL_C_EXIT on Windows).";
+such VM, connection lost, console output failed, --screen without a window), 2
+for bad arguments; Ctrl-C gives the usual status of an interrupted program (130
+on Linux, STATUS_CONTROL_C_EXIT on Windows).";
 
 fn main() -> ExitCode {
     let mut server = None;
     let mut vm = None;
+    let mut screen = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let parsed = match a.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
+            }
+            "--screen" => {
+                screen = true;
+                Ok(())
             }
             "--server" => match args.next() {
                 Some(s) => parse_server(&s).map(|addrs| server = Some((s, addrs))),
@@ -62,7 +76,12 @@ fn main() -> ExitCode {
         let default = DEFAULT_AVALON_ADDR.parse().expect("the default address parses");
         (DEFAULT_AVALON_ADDR.to_string(), vec![default])
     });
-    match attach(&server, &addrs, &vm) {
+    let result = if screen {
+        show_screen(&server, &addrs, &vm)
+    } else {
+        attach(&server, &addrs, &vm)
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("herald: {e}");
@@ -71,15 +90,64 @@ fn main() -> ExitCode {
     }
 }
 
-/// Attaches to `vm` on `server` (as the person wrote it), which is at `addrs`: each is
-/// tried in turn.
-fn attach(server: &str, addrs: &[SocketAddr], vm: &VmRef) -> Result<(), String> {
+/// Connects to `server` (as the person wrote it), which is at `addrs`: each is tried
+/// in turn. Returns the connection and the address that answered, for messages.
+fn connect(server: &str, addrs: &[SocketAddr]) -> Result<(Connection<TcpStream>, String), String> {
     let conn = Connection::connect(addrs, AGENT).map_err(|e| format!("cannot connect to {server}: {e}"))?;
-    // The address that answered, for the messages below.
     let server = conn
         .get_ref()
         .peer_addr()
         .map_or(server.to_string(), |a| a.to_string());
+    Ok((conn, server))
+}
+
+/// `--screen`: shows `vm`'s screen in a window until the window is closed.
+#[cfg(windows)]
+fn show_screen(server: &str, addrs: &[SocketAddr], vm: &VmRef) -> Result<(), String> {
+    use herald::screen::ScreenSession;
+    use herald::window::WindowView;
+
+    let (conn, server) = connect(server, addrs)?;
+    let mut session = ScreenSession::attach(conn, vm)
+        .map_err(|e| format!("cannot attach to the screen of VM {vm}: {e}"))?;
+    let (width, height) = (session.screen.width(), session.screen.height());
+    if !WindowView::fits(width, height) {
+        return Err(format!(
+            "VM {vm} has a {width}x{height} screen; Herald's window shows 640x480 ones"
+        ));
+    }
+    let summary = session.vm.clone();
+    let mut view = WindowView::open(&format!("Herald: VM {} '{}'", summary.id, summary.name))?;
+    eprintln!(
+        "herald: showing the screen of VM {} '{}' ({}) on {server}; closing the window detaches",
+        summary.id, summary.name, summary.state
+    );
+    match session.run(&mut view) {
+        Ok(end) => {
+            eprintln!("herald: {}", end.describe(&summary));
+            let status = match end {
+                End::Detached | End::InputEnded => return Ok(()),
+                End::VmEnded(VmState::Exited(code)) => format!("exited with code {code}"),
+                End::VmEnded(state) => state.to_string(),
+                End::Destroyed => "destroyed".to_string(),
+            };
+            view.hold(&session.screen, &status);
+            Ok(())
+        }
+        Err(e) => Err(format!("lost the connection to {server}: {e}")),
+    }
+}
+
+/// `--screen` needs a window, which this build does not have.
+#[cfg(not(windows))]
+fn show_screen(_server: &str, _addrs: &[SocketAddr], _vm: &VmRef) -> Result<(), String> {
+    Err("--screen shows the VM's screen in a window, which Herald only has on Windows".into())
+}
+
+/// Attaches to `vm`'s console on `server` (as the person wrote it), which is at
+/// `addrs`: each is tried in turn.
+fn attach(server: &str, addrs: &[SocketAddr], vm: &VmRef) -> Result<(), String> {
+    let (conn, server) = connect(server, addrs)?;
     let session = Session::attach(conn, vm).map_err(|e| format!("cannot attach to VM {vm}: {e}"))?;
     let summary = session.vm.clone();
     let terminal = io::stdin().is_terminal();

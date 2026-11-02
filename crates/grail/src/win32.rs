@@ -29,7 +29,6 @@ pub const IDC_ARROW: u16 = 32512;
 
 pub const WM_DESTROY: u32 = 0x0002;
 pub const WM_KILLFOCUS: u32 = 0x0008;
-#[cfg(test)]
 pub const WM_CLOSE: u32 = 0x0010;
 pub const WM_PAINT: u32 = 0x000f;
 pub const WM_NCCREATE: u32 = 0x0081;
@@ -252,11 +251,8 @@ extern "system" {
     pub fn EndPaint(hwnd: HWND, ps: *const PAINTSTRUCT) -> BOOL;
     #[cfg(test)]
     pub fn SendMessageW(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
-    #[cfg(test)]
     pub fn PostMessageW(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> BOOL;
-    #[cfg(test)]
     pub fn FindWindowW(class: *const u16, title: *const u16) -> HWND;
-    #[cfg(test)]
     pub fn SetKeyboardState(state: *const u8) -> BOOL;
     pub fn GetKeyState(vkey: i32) -> i16;
     pub fn GetKeyboardState(state: *mut u8) -> BOOL;

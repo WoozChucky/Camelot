@@ -234,6 +234,21 @@ fn invalid_payloads() -> Vec<(&'static str, u16, Vec<u8>)> {
         ),
         ("key code 0", ty::KEY_INPUT, cat(&[&le(1), &[0, 0]])),
         ("key flags", ty::KEY_INPUT, cat(&[&le(1), &[b'a', 0x08]])),
+        (
+            "pointer motion tag",
+            ty::POINTER_INPUT,
+            cat(&[&le(1), &[3, 0, 0]]),
+        ),
+        (
+            "pointer button 3",
+            ty::POINTER_INPUT,
+            cat(&[&le(1), &[0, 0x08, 0]]),
+        ),
+        (
+            "pointer buttons",
+            ty::POINTER_INPUT,
+            cat(&[&le(1), &[1], &le(5), &le(5), &[0xf9, 0]]),
+        ),
         ("read 0 sectors", ty::BLOCK_READ, cat(&[&le(1), &[0; 8], &le(0)])),
         (
             "read too many sectors",
@@ -331,6 +346,14 @@ fn encoder_refuses_what_the_decoder_would_reject() {
             width: 3,
             height: 3,
             pixels: vec![0; 35],
+        },
+        Message::PointerInput {
+            vm: 1,
+            pointer: PointerChange {
+                motion: PointerMotion::None,
+                buttons: 0x80,
+                wheel: 0,
+            },
         },
     ];
     for msg in bad {
