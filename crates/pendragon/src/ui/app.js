@@ -356,6 +356,27 @@ function newVmPage(main, ctx, disk) {
   const start = el("input", { type: "checkbox", checked: true });
   const submit = el("button", { type: "submit", class: "primary" }, "Create");
 
+  // What the VM boots: Camelot from a copy of Lake's Camelot image of its own (the
+  // choice when Lake has that image), or an uploaded program (an ELF), which may be
+  // left out when there is a disk to boot from instead.
+  const bootCamelot = el("input", { type: "radio", name: "boot", value: "camelot" });
+  const bootProgram = el("input", { type: "radio", name: "boot", value: "program", checked: true });
+  const camelotHint = el("span", { class: "muted" }, " Lake's image is copied to a disk of the VM's own, NAME-root");
+  const programField = field("Program", program, "an Excalibur ELF executable; without one the VM boots from its first disk");
+  const showBoot = () => {
+    programField.hidden = bootCamelot.checked;
+  };
+  bootCamelot.addEventListener("change", showBoot);
+  bootProgram.addEventListener("change", showBoot);
+  const boot = el(
+    "fieldset",
+    { class: "boot" },
+    el("legend", {}, "Boots"),
+    el("label", { class: "inline" }, bootCamelot, " Camelot (boot from disk)"),
+    camelotHint,
+    el("label", { class: "inline" }, bootProgram, " Program (ELF)"),
+  );
+
   const form = el(
     "form",
     { class: "panel" },
@@ -363,7 +384,8 @@ function newVmPage(main, ctx, disk) {
     field("RAM (MiB)", ram, "1 to 2048"),
     field("Clock", clock, "e.g. 10MHz, 500kHz, 5Hz; empty runs at full speed"),
     field("Harts", harts, "cores, 1 to 8; each runs at the clock"),
-    field("Program", program, "an Excalibur ELF executable"),
+    boot,
+    programField,
     el("h2", {}, "Disks"),
     disks,
     el("button", { type: "button", onclick: () => addDisk("") }, "Add a disk"),
@@ -379,16 +401,13 @@ function newVmPage(main, ctx, disk) {
     event.preventDefault();
     submit.disabled = true;
     try {
-      const file = program.files[0];
-      if (!file) throw new Error("Choose the program to run (an ELF file).");
-      const bytes = new Uint8Array(await file.arrayBuffer());
       const request = {
         name: name.value.trim(),
         ram: ram.value,
         clock: clock.value,
         harts: harts.value,
         start: start.checked,
-        program: toBase64(bytes),
+        camelot: bootCamelot.checked,
         disks: [...disks.querySelectorAll(".disk-row")]
           .map((row) => ({
             source: row.querySelector(".disk-source").value.trim(),
@@ -400,6 +419,12 @@ function newVmPage(main, ctx, disk) {
           mac: row.querySelector(".net-mac").value.trim() || null,
         })),
       };
+      const file = program.files[0];
+      if (!request.camelot && file) {
+        request.program = toBase64(new Uint8Array(await file.arrayBuffer()));
+      } else if (!request.camelot && request.disks.length === 0) {
+        throw new Error("Choose the program to run (an ELF file), or a disk to boot from.");
+      }
       const created = await api("POST", "vms", request);
       location.hash = "#/vms/" + created.id;
     } catch (e) {
@@ -410,12 +435,21 @@ function newVmPage(main, ctx, disk) {
   main.append(el("h1", {}, "New VM"), error, form);
 
   // Offer Lake's images as disk sources, and prefill the one asked for (Attach on
-  // the disks page).
+  // the disks page). Camelot is the first choice when Lake has its image and no disk
+  // was asked for.
+  showBoot();
   api("GET", "disks", undefined, ctx.abort.signal)
     .then((list) => {
       lake = list.lake;
       for (const d of list.disks) lakeImages.append(el("option", { value: "lake://" + lake + "/" + d.name }));
       if (disk) addDisk("lake://" + lake + "/" + disk);
+      const hasImage = list.disks.some((d) => d.name === list.camelot_image);
+      if (hasImage && !disk) {
+        bootCamelot.checked = true;
+      } else if (!hasImage) {
+        camelotHint.textContent = " Lake has no image named " + list.camelot_image + " to copy: start the platform with cargo xtask up";
+      }
+      showBoot();
     })
     .catch(() => {
       if (disk && ctx.alive) addDisk("");
