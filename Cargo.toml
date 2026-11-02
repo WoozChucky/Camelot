@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/excalibur", "crates/elf32", "crates/grail", "crates/avalon-proto", "crates/avalon", "crates/avalon-client", "crates/round-table", "crates/lake", "crates/merlin", "crates/merlin-as", "crates/merlin-ld", "crates/merlin-objdump", "crates/xtask"]
+members = ["crates/excalibur", "crates/elf32", "crates/grail", "crates/avalon-proto", "crates/avalon", "crates/avalon-client", "crates/round-table", "crates/herald", "crates/lake", "crates/merlin", "crates/merlin-as", "crates/merlin-ld", "crates/merlin-objdump", "crates/xtask"]
 
 [workspace.package]
 edition = "2021"

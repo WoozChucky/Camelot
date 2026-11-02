@@ -7,6 +7,8 @@
 //! console) needs each key as it is typed instead, and must do the echoing itself, or
 //! everything would appear twice. [`RawMode`] switches stdin to that while it lives.
 //! Ctrl-C still stops Grail, and the terminal is put back on drop and on Ctrl-C.
+//! Herald (`crates/herald`) uses the same guard for a VM's console on an Avalon
+//! server, with [`RawOptions::vt`] on.
 
 use std::io::Read;
 use std::sync::mpsc::{self, Receiver};
@@ -68,9 +70,29 @@ pub struct RawMode {
     saved: sys::Saved,
 }
 
+/// What [`RawMode::with`] switches on besides raw input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RawOptions {
+    /// Make a Windows console a VT terminal, as Unix terminals always are: keys with
+    /// no character of their own (arrows, Home, Delete, F1, ...) arrive as their
+    /// escape sequences (`ESC [ A` for Up) instead of not at all, and the escape
+    /// sequences written to stdout (colours, cursor moves) are carried out instead of
+    /// shown. Enter still arrives as CR, Ctrl-C still stops the process. Both modes
+    /// are put back with the rest. A console that cannot (before Windows 10) is
+    /// switched to plain raw mode. Nothing changes elsewhere.
+    pub vt: bool,
+}
+
 impl RawMode {
+    /// Raw mode with the default [`RawOptions`] (what Grail uses).
     pub fn enable() -> Option<RawMode> {
-        sys::enable().map(|saved| RawMode { saved })
+        RawMode::with(RawOptions::default())
+    }
+
+    /// Raw mode with `options`. `None` when stdin is not a terminal (or not one this
+    /// platform can switch); nothing has changed then.
+    pub fn with(options: RawOptions) -> Option<RawMode> {
+        sys::enable(options).map(|saved| RawMode { saved })
     }
 
     /// [`stdin_channel`] for the terminal in raw mode: every key, as typed, until the
@@ -91,14 +113,19 @@ impl Drop for RawMode {
 
 #[cfg(windows)]
 mod sys {
+    use super::RawOptions;
     use crate::win32::{
         GetConsoleMode, GetStdHandle, SetConsoleCtrlHandler, SetConsoleMode, BOOL, ENABLE_ECHO_INPUT,
-        ENABLE_LINE_INPUT, STD_INPUT_HANDLE,
+        ENABLE_LINE_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    /// The console's input mode before [`enable`].
-    pub type Saved = u32;
+    /// The console modes before [`enable`]: stdin's, and stdout's if it was changed.
+    pub struct Saved {
+        input: u32,
+        output: Option<u32>,
+    }
 
     /// What an empty read of the raw console means: a lone Ctrl-Z, removed by Rust's
     /// console stdin (see [`super::RawMode::stdin_channel`]).
@@ -107,16 +134,29 @@ mod sys {
     /// What the Ctrl-C handler restores. One console per process, so one copy.
     static SAVED_MODE: AtomicU32 = AtomicU32::new(0);
     static ACTIVE: AtomicBool = AtomicBool::new(false);
+    static SAVED_OUTPUT_MODE: AtomicU32 = AtomicU32::new(0);
+    static OUTPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-    /// The raw input mode: no line editing, no echo. `ENABLE_PROCESSED_INPUT` stays as it
-    /// was, so Ctrl-C still raises a Ctrl-C event instead of reaching the guest.
-    pub fn raw(mode: u32) -> u32 {
-        mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)
+    /// The raw input mode: no line editing, no echo, and with `vt` keys as VT
+    /// sequences. `ENABLE_PROCESSED_INPUT` stays as it was, so Ctrl-C still raises a
+    /// Ctrl-C event instead of reaching the guest.
+    pub fn raw(mode: u32, vt: bool) -> u32 {
+        let raw = mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+        if vt {
+            raw | ENABLE_VIRTUAL_TERMINAL_INPUT
+        } else {
+            raw
+        }
     }
 
-    pub fn enable() -> Option<Saved> {
-        // SAFETY: plain Win32 calls on this process's stdin handle. GetConsoleMode fails
-        // (returns 0) when stdin is not a console, e.g. a pipe.
+    /// The output mode with VT sequences carried out.
+    pub fn vt_output(mode: u32) -> u32 {
+        mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    }
+
+    pub fn enable(options: RawOptions) -> Option<Saved> {
+        // SAFETY: plain Win32 calls on this process's standard handles. GetConsoleMode
+        // fails (returns 0) when the handle is not a console, e.g. a pipe.
         unsafe {
             let h = GetStdHandle(STD_INPUT_HANDLE);
             let mut mode = 0;
@@ -126,8 +166,32 @@ mod sys {
             SAVED_MODE.store(mode, Ordering::SeqCst);
             ACTIVE.store(true, Ordering::SeqCst);
             SetConsoleCtrlHandler(Some(on_ctrl), 1);
-            if SetConsoleMode(h, raw(mode)) == 0 {
+            // VT input is refused by consoles that predate it: then plain raw mode.
+            let switched = (options.vt && SetConsoleMode(h, raw(mode, true)) != 0)
+                || SetConsoleMode(h, raw(mode, false)) != 0;
+            if !switched {
                 ACTIVE.store(false, Ordering::SeqCst);
+                return None;
+            }
+            let output = if options.vt { enable_vt_output() } else { None };
+            Some(Saved { input: mode, output })
+        }
+    }
+
+    /// Switches stdout to VT processing, if it is a console that can. Returns the mode
+    /// to restore.
+    fn enable_vt_output() -> Option<u32> {
+        // SAFETY: as in `enable`.
+        unsafe {
+            let h = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut mode = 0;
+            if h.is_null() || GetConsoleMode(h, &mut mode) == 0 {
+                return None;
+            }
+            SAVED_OUTPUT_MODE.store(mode, Ordering::SeqCst);
+            OUTPUT_ACTIVE.store(true, Ordering::SeqCst);
+            if SetConsoleMode(h, vt_output(mode)) == 0 {
+                OUTPUT_ACTIVE.store(false, Ordering::SeqCst);
                 return None;
             }
             Some(mode)
@@ -136,9 +200,13 @@ mod sys {
 
     pub fn restore(saved: &Saved) {
         ACTIVE.store(false, Ordering::SeqCst);
+        OUTPUT_ACTIVE.store(false, Ordering::SeqCst);
         // SAFETY: as in `enable`.
         unsafe {
-            SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), *saved);
+            SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), saved.input);
+            if let Some(mode) = saved.output {
+                SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode);
+            }
         }
     }
 
@@ -146,10 +214,16 @@ mod sys {
     /// FALSE so the default handler ends the process as usual. Runs on a thread the
     /// system creates for it.
     unsafe extern "system" fn on_ctrl(_event: u32) -> BOOL {
-        if ACTIVE.swap(false, Ordering::SeqCst) {
-            // SAFETY: as in `enable`.
-            unsafe {
+        // SAFETY: as in `enable`.
+        unsafe {
+            if ACTIVE.swap(false, Ordering::SeqCst) {
                 SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), SAVED_MODE.load(Ordering::SeqCst));
+            }
+            if OUTPUT_ACTIVE.swap(false, Ordering::SeqCst) {
+                SetConsoleMode(
+                    GetStdHandle(STD_OUTPUT_HANDLE),
+                    SAVED_OUTPUT_MODE.load(Ordering::SeqCst),
+                );
             }
         }
         0
@@ -216,7 +290,8 @@ mod sys {
         r
     }
 
-    pub fn enable() -> Option<Saved> {
+    /// Linux terminals already speak VT both ways, so the options change nothing.
+    pub fn enable(_: super::RawOptions) -> Option<Saved> {
         // SAFETY: libc calls on fd 0 with a properly sized termios.
         unsafe {
             if isatty(STDIN) == 0 {
@@ -265,7 +340,7 @@ mod sys {
 
     pub const EMPTY_READ: Option<u8> = None;
 
-    pub fn enable() -> Option<Saved> {
+    pub fn enable(_: super::RawOptions) -> Option<Saved> {
         None
     }
 
@@ -321,11 +396,28 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn raw_console_mode_drops_line_input_and_echo_only() {
-        use crate::win32::{ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT};
+        use crate::win32::{ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT};
         const ENABLE_PROCESSED_INPUT: u32 = 0x1;
         const ENABLE_QUICK_EDIT_MODE: u32 = 0x40;
         let cooked = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE;
-        assert_eq!(sys::raw(cooked), ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE);
+        assert_eq!(
+            sys::raw(cooked, false),
+            ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE
+        );
+        assert_eq!(
+            sys::raw(cooked, true),
+            ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE | ENABLE_VIRTUAL_TERMINAL_INPUT
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vt_output_mode_keeps_the_rest() {
+        const ENABLE_PROCESSED_OUTPUT: u32 = 0x1;
+        const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x2;
+        let cooked = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
+        assert_eq!(sys::vt_output(cooked), cooked | 0x4);
+        assert_eq!(sys::vt_output(cooked | 0x4), cooked | 0x4);
     }
 
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
