@@ -71,6 +71,11 @@ pub const IRQ_M_TIMER: u32 = 7;
 pub const IRQ_S_EXT: u32 = 9;
 pub const IRQ_M_EXT: u32 = 11;
 
+/// CSR address for a name (the inverse of [`name`]), for the assembler.
+pub fn parse(name: &str) -> Option<u16> {
+    (0..4096u16).find(|&a| self::name(a) == Some(name))
+}
+
 /// Human-readable name for disassembly.
 pub fn name(addr: u16) -> Option<&'static str> {
     Some(match addr {

@@ -6,7 +6,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 |---|---|---|
 | **Excalibur** | The ISA: RV32IM + Zicsr, M/S/U privilege, Sv32 paging, plus the Xcal extensions | Spec v0 in [`docs/excalibur-spec.md`](docs/excalibur-spec.md) |
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/mi/si |
-| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | Not started |
+| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | merlin-as: everything but the encoder ([guide](crates/merlin-as/ENCODER.md)) |
 | **Camelot** | The kernel / OS | Not started |
 
 ## Layout
@@ -14,8 +14,10 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 ```
 crates/excalibur   instruction encodings, decoder, disassembler (shared by every tool)
 crates/grail       the emulator
+crates/merlin-as   the assembler (source → ELF32 .o)
 examples/          bare-metal programs
 tests/riscv-tests  prebuilt riscv-tests ELFs (rebuild with scripts/build-riscv-tests.sh)
+scripts/           test-data generators (riscv-tests, merlin-as golden encodings)
 docs/              the ISA spec
 ```
 

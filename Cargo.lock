@@ -12,3 +12,10 @@ version = "0.1.0"
 dependencies = [
  "excalibur",
 ]
+
+[[package]]
+name = "merlin-as"
+version = "0.1.0"
+dependencies = [
+ "excalibur",
+]

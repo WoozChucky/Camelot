@@ -1,0 +1,118 @@
+lui a0, 0x12345 | 12345537 | 
+lui t0, 0xfffff | fffff2b7 | 
+auipc sp, 1 | 00001117 | 
+jal ra, 2048 | 001000ef | 
+jal zero, -4 | ffdff06f | 
+jalr ra, 0(t0) | 000280e7 | 
+jalr zero, -2048(a5) | 80078067 | 
+jalr s1, 2047(s2) | 7ff904e7 | 
+beq a0, a1, 8 | 00b50463 | 
+bne t0, t1, -8 | fe629ce3 | 
+blt s0, s1, 4094 | 7e944fe3 | 
+bge a2, a3, -4096 | 80d65063 | 
+bltu a4, a5, 16 | 00f76863 | 
+bgeu t3, t4, -16 | ffde78e3 | 
+lb a0, 0(a1) | 00058503 | 
+lh a0, -1(sp) | fff11503 | 
+lw ra, 2047(sp) | 7ff12083 | 
+lbu t0, -2048(t1) | 80034283 | 
+lhu s2, 12(s3) | 00c9d903 | 
+sb a0, 0(a1) | 00a58023 | 
+sh t5, -2(t6) | ffef9f23 | 
+sw ra, 2044(sp) | 7e112e23 | 
+addi a0, a1, -1 | fff58513 | 
+addi sp, sp, -2048 | 80010113 | 
+slti t0, t1, 5 | 00532293 | 
+sltiu t0, t1, -1 | fff33293 | 
+xori a0, a0, 0x7ff | 7ff54513 | 
+ori a0, a0, -2048 | 80056513 | 
+andi a0, a0, 255 | 0ff57513 | 
+slli a0, a0, 31 | 01f51513 | 
+srli a0, a0, 1 | 00155513 | 
+srai a0, a0, 17 | 41155513 | 
+add a0, a1, a2 | 00c58533 | 
+sub a0, a1, a2 | 40c58533 | 
+sll s0, s1, s2 | 01249433 | 
+slt t0, t1, t2 | 007322b3 | 
+sltu t3, t4, t5 | 01eebe33 | 
+xor a0, a0, a0 | 00a54533 | 
+srl a1, a2, a3 | 00d655b3 | 
+sra a1, a2, a3 | 40d655b3 | 
+or zero, ra, sp | 0020e033 | 
+and x31, x30, x29 | 01df7fb3 | 
+mul a0, a1, a2 | 02c58533 | 
+mulh a0, a1, a2 | 02c59533 | 
+mulhsu a0, a1, a2 | 02c5a533 | 
+mulhu a0, a1, a2 | 02c5b533 | 
+div a0, a1, a2 | 02c5c533 | 
+divu a0, a1, a2 | 02c5d533 | 
+rem a0, a1, a2 | 02c5e533 | 
+remu a0, a1, a2 | 02c5f533 | 
+fence | 0ff0000f | 
+fence.i | 0000100f | 
+ecall | 00000073 | 
+ebreak | 00100073 | 
+mret | 30200073 | 
+sret | 10200073 | 
+wfi | 10500073 | 
+sfence.vma | 12000073 | 
+sfence.vma a0, a1 | 12b50073 | 
+csrrw a0, mstatus, a1 | 30059573 | 
+csrrs t0, mepc, zero | 341022f3 | 
+csrrc a0, 0x7c0, a1 | 7c05b573 | 
+csrrwi zero, mtvec, 5 | 3052d073 | 
+csrrsi a0, sie, 31 | 104fe573 | 
+csrrci a0, mie, 1 | 3040f573 | 
+csrr a0, mcause | 34202573 | 
+csrw mscratch, sp | 34011073 | 
+csrs mie, t0 | 3042a073 | 
+csrc mstatus, t1 | 30033073 | 
+csrwi mstatus, 8 | 30045073 | 
+csrsi sstatus, 2 | 10016073 | 
+csrci sstatus, 2 | 10017073 | 
+nop | 00000013 | 
+li a0, 0 | 00000513 | 
+li a0, 2047 | 7ff00513 | 
+li a0, -2048 | 80000513 | 
+li a0, 2048 | 00100513 00b51513 | 
+li a0, 0x12345678 | 12345537 67850513 | 
+li a0, 0x80000000 | 80000537 | 
+li a0, -1 | fff00513 | 
+li t0, 0x10000000 | 100002b7 | 
+mv a0, a1 | 00058513 | 
+not a0, a1 | fff5c513 | 
+neg a0, a1 | 40b00533 | 
+seqz a0, a1 | 0015b513 | 
+snez a0, a1 | 00b03533 | 
+sltz a0, a1 | 0005a533 | 
+sgtz a0, a1 | 00b02533 | 
+j 16 | 0100006f | 
+jr ra | 00008067 | 
+jalr t0 | 000280e7 | 
+ret | 00008067 | 
+beqz a0, 8 | 00050463 | 
+bnez a0, -8 | fe051ce3 | 
+blez a0, 4 | 00a05263 | 
+bgez a0, 4 | 00055263 | 
+bltz a0, 4 | 00054263 | 
+bgtz a0, 4 | 00a04263 | 
+bgt a0, a1, 8 | 00a5c463 | 
+ble a0, a1, 8 | 00a5d463 | 
+bgtu a0, a1, 8 | 00a5e463 | 
+bleu a0, a1, 8 | 00a5f463 | 
+beq a0, a1, target | 00b50063 | 0:R_RISCV_BRANCH:target
+bnez a0, target | 00051063 | 0:R_RISCV_BRANCH:target
+jal ra, target | 000000ef | 0:R_RISCV_JAL:target
+jal target | 000000ef | 0:R_RISCV_JAL:target
+j target | 0000006f | 0:R_RISCV_JAL:target
+call target | 00000097 000080e7 | 0:R_RISCV_CALL_PLT:target
+tail target | 00000317 00030067 | 0:R_RISCV_CALL_PLT:target
+la a0, target | 00000517 00050513 | 0:R_RISCV_PCREL_HI20:target 4:R_RISCV_PCREL_LO12_I:<auipc>
+lla a0, target | 00000517 00050513 | 0:R_RISCV_PCREL_HI20:target 4:R_RISCV_PCREL_LO12_I:<auipc>
+lui a0, %hi(target) | 00000537 | 0:R_RISCV_HI20:target
+addi a0, a0, %lo(target) | 00050513 | 0:R_RISCV_LO12_I:target
+lw a0, %lo(target)(a0) | 00052503 | 0:R_RISCV_LO12_I:target
+sw a1, %lo(target)(a0) | 00b52023 | 0:R_RISCV_LO12_S:target
+lui a0, %hi(target+16) | 00000537 | 0:R_RISCV_HI20:target+10
+lw a0, target | 00000517 00052503 | 0:R_RISCV_PCREL_HI20:target 4:R_RISCV_PCREL_LO12_I:<auipc>
+sw a0, target, t0 | 00000297 00a2a023 | 0:R_RISCV_PCREL_HI20:target 4:R_RISCV_PCREL_LO12_S:<auipc>
