@@ -62,7 +62,7 @@ impl Clint {
 
 /// PLIC interrupt source of the UART's "received data available" line.
 pub const UART_IRQ: u32 = 1;
-/// PLIC interrupt source reserved for the keyboard (spec section 9.4).
+/// PLIC interrupt source of the keyboard's "event available" line (spec section 9.4).
 pub const KBD_IRQ: u32 = 2;
 
 /// Interrupt sources 1..=31 exist; source 0 means "no interrupt".
