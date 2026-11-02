@@ -99,10 +99,10 @@ Addresses (checked in this order):
 
 - the hart executes any `sc.w`;
 - the hart takes a trap (exception or interrupt);
-- any write touches a byte of the reserved word: a store, an AMO, a successful `sc.w`, or a hardware A/D update of a PTE (so an LR/SC update of a PTE cannot overwrite a bit the page walker just set). On a multi-hart machine this includes writes by other harts;
+- any write touches a byte of the reserved word: a store, an AMO, a successful `sc.w`, a hardware A/D update of a PTE (so an LR/SC update of a PTE cannot overwrite a bit the page walker just set), or a network card's receive DMA (section 9.8), which copies a frame into a buffer and writes its descriptor's `len` and `status` between two instructions, on its own. On a multi-hart machine this includes writes by other harts;
 - the hart stores to a device register: the store may start a DMA (the block device's, section 9.6) that writes RAM without a hart storing there.
 
-The constrained LR/SC loop (an `lr.w`, a few ALU instructions and a `sc.w` to the same word) always succeeds on Grail unless an interrupt arrives in between, in which case the loop retries.
+The constrained LR/SC loop (an `lr.w`, a few ALU instructions and a `sc.w` to the same word) always succeeds on Grail unless an interrupt arrives in between, or a network card writes that word, in which case the loop retries.
 
 ## 5. Privilege and CSRs
 
@@ -157,9 +157,10 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 |---|---|
 | 0x0000_1000 - 0x0000_1FFF | Boot ROM (reset vector 0x1000, jumps to 0x8000_0000) |
 | 0x0200_0000 - 0x0200_FFFF | CLINT: msip @+0x0, mtimecmp @+0x4000, mtime @+0xBFF8 |
-| 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART, keyboard, disks and pointer (section 7.1) |
+| 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART, keyboard, disks, pointer and network cards (section 7.1) |
 | 0x1000_0000 - 0x1000_00FF | UART, 16550-compatible subset (THR/RBR @+0, IER @+1, IIR @+2, LSR @+5) |
 | 0x1000_1000 - 0x1000_8FFF | Block devices: disk `i` at 0x1000_1000 + 0x1000·i, up to 8 (`--disk`; Xcal, section 9.6). Only the pages of attached disks are mapped |
+| 0x1000_9000 - 0x1000_CFFF | Network cards: card `i` at 0x1000_9000 + 0x1000·i, up to 4 (`--net`; Xcal, section 9.8). Only the pages of attached cards are mapped |
 | 0x0010_0000 | Test/exit device: write 0x5555 = pass/exit, 0x3333 = fail (used by riscv-tests) |
 | 0x3000_0000 - 0x3000_0FFF | Framebuffer control (Xcal, section 9.3) |
 | 0x3000_1000 - 0x3000_1FFF | Keyboard (Xcal, section 9.4) |
@@ -192,7 +193,8 @@ A minimal RISC-V PLIC (riscv-plic-spec) with the QEMU `virt` register layout: on
 | 2 | Keyboard (section 9.4) |
 | 3-10 | Disks 0-7: disk `i` is source 3 + `i` (section 9.6) |
 | 11 | Pointer (section 9.7) |
-| 12-31 | unused, never asserted |
+| 12-15 | Network cards 0-3: card `i` is source 12 + `i` (section 9.8) |
+| 16-31 | unused, never asserted |
 
 QEMU `virt` puts UART0 on source 10; Excalibur numbers its few devices from 1 instead, so drivers must take the source numbers from this table rather than from `virt` device trees.
 
@@ -337,8 +339,9 @@ Device table entry `i` (for `i` < `SYS_DEV_COUNT`; at most 252 fit in the page):
 | 8 | Keyboard (section 9.4) |
 | 9 | Block device, one entry per disk (section 9.6) |
 | 10 | Pointer (section 9.7) |
+| 11 | Network card, one entry per card (section 9.8) |
 
-Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device gets the next code and an entry, with no new registers and no change to this layout (the block device, type 9, and the pointer, type 10, were added this way). Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), one block device per disk (disk `i` at 0x1000_1000 + 0x1000·`i`, irq 3 + `i`; none without `--disk`), framebuffer control, keyboard (irq 2), sysinfo, pointer (irq 11) and VRAM; `examples/sysinfo` prints the table.
+Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device gets the next code and an entry, with no new registers and no change to this layout (the block device, type 9, the pointer, type 10, and the network card, type 11, were added this way). Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), one block device per disk (disk `i` at 0x1000_1000 + 0x1000·`i`, irq 3 + `i`; none without `--disk`), one network card per `--net` (card `i` at 0x1000_9000 + 0x1000·`i`, irq 12 + `i`; none without `--net`), framebuffer control, keyboard (irq 2), sysinfo, pointer (irq 11) and VRAM; `examples/sysinfo` prints the table.
 
 The registers are 32-bit only: byte or halfword accesses raise access faults. Word writes are ignored, as for the framebuffer's read-only registers. Offsets past the last entry read as 0.
 
@@ -422,6 +425,70 @@ Details:
 - **Host side**: Grail delivers the mouse over the framebuffer window between instruction slices, like keys (sections 9.3, 9.4): motion (`WM_MOUSEMOVE`), the left, right and middle buttons and the wheel (`WM_MOUSEWHEEL`; fractions of a notch from precise wheels add up until they make one). Window coordinates are mapped to framebuffer pixels through the stretch, so the mapping holds at any window size. While a button is held the window captures the mouse, so a drag keeps reporting (clamped) positions outside it and its release is not lost; if the window loses the mouse or the focus with buttons held, they are released. Without a window nothing produces events. Each machine has its own pointer, and hosts that embed Grail as a library (a remote viewer, a test) inject input with `Machine::pointer_event`: a new position (in framebuffer pixels) or a motion in pixels, the buttons held, and the wheel notches; the device turns it into an event in the guest's mode.
 
 `examples/pointer` draws an arrow cursor that follows the pointer and changes colour while buttons are held, reading the events on the pointer's interrupt; Esc on the keyboard ends it: `grail --fb examples/pointer/pointer.elf`.
+
+### 9.8 Network card (MMIO)
+
+An Ethernet card, so machines can network. It sends and receives raw Ethernet II frames (destination, source, EtherType, payload; no FCS, no padding required) of 14 to 1514 bytes, through two rings of descriptors in RAM, like a minimal virtio-net or e1000. A machine has 0 to 4 cards, in the order they are given (`grail --net hub`, repeatable; `MachineConfig::nets` for a host using Grail as a library). Card `i` has a 4 KiB page of registers at 0x1000_9000 + 0x1000·`i`, right after the disks' pages, interrupts on PLIC source 12 + `i`, and has an entry of type 11 in the sysinfo device table (section 9.5). The pages of cards the machine does not have are unmapped.
+
+| Offset | Register | Notes |
+|---|---|---|
+| +0x00 | `NET_MAC_LO` (RO) | bytes 0-3 of the card's MAC address, byte 0 (the first on the wire) in bits 7:0, so a word store of it puts the bytes in wire order |
+| +0x04 | `NET_MAC_HI` (RO) | bytes 4-5 in bits 15:0; bits 31:16 read 0 |
+| +0x08 | `NET_STATUS` (RO) | bit 0 = link up (the backend can carry frames). Other bits read 0 |
+| +0x0C | `NET_ERROR` | the latest ring error, below; 0 = none. Any write clears it |
+| +0x10 | `NET_IRQ_ENABLE` | bit 0 = RX, bit 1 = TX, bit 2 = ERROR, as in `NET_IRQ_STATUS`. Other bits read 0 |
+| +0x14 | `NET_IRQ_STATUS` | bit 0 = RX: the card handed back receive descriptors; bit 1 = TX: it handed back transmit descriptors; bit 2 = ERROR: it recorded a ring error. Writing 1 to a bit clears it |
+| +0x18 | `NET_RX_DROPPED` | frames lost on the way in (a 32-bit counter that wraps). Any write sets it to 0 |
+| +0x1C | reserved | reads 0 |
+| +0x20 | `NET_TX_BASE` | physical address of the transmit ring |
+| +0x24 | `NET_TX_SIZE` | its size in descriptors: 0 (no ring) or a power of two from 1 to 1024 |
+| +0x28 | `NET_TX_HEAD` (RO) | counter of the next descriptor the card will send |
+| +0x2C | `NET_TX_TAIL` | counter one past the last descriptor the driver has filled. Writing it sends |
+| +0x30 - +0x3C | `NET_RX_BASE`, `NET_RX_SIZE`, `NET_RX_HEAD` (RO), `NET_RX_TAIL` | the same for the receive ring |
+
+**Descriptors** are 8 bytes, little-endian like everything else:
+
+| Offset | Field | Notes |
+|---|---|---|
+| +0 | `addr` (u32) | physical address of the buffer, in RAM; any byte address |
+| +4 | `len` (u16) | transmit: the frame's length, set by the driver. Receive: the buffer's size, set by the driver; the card overwrites it with the length of the frame it received |
+| +6 | `status` (u16) | written by the card when it hands the descriptor back, below |
+
+**Rings.** A ring is `SIZE` descriptors at `BASE`, and two free-running 32-bit counters, `HEAD` and `TAIL`; counter `n` is slot `n % SIZE` (`SIZE` is a power of two, so this holds across the wrap at 2^32). The descriptors from `HEAD` up to, not including, `TAIL` belong to the card, the rest to the driver: the driver hands descriptors over by advancing `TAIL`, the card hands them back by advancing `HEAD`. The ring is empty when `TAIL == HEAD` and full when `TAIL - HEAD == SIZE` (mod 2^32), so every slot can be used, with no slot kept free to tell the two apart. Writing `BASE` or `SIZE` starts the ring over with `HEAD = TAIL = 0`, which is how a driver sets one up (and recovers from a ring error). A `TAIL` more than `SIZE` ahead of `HEAD` is refused: the write is ignored and `NET_ERROR` becomes 2.
+
+- **Transmit**: the driver fills the descriptor at slot `TX_TAIL % SIZE` (address and length of a frame in RAM), then writes `TX_TAIL + 1` (or several at once). Grail sends every descriptor from `TX_HEAD` to the new `TX_TAIL` during that store, in order, writing each one's status and advancing `TX_HEAD` past it, so `TX_HEAD == TX_TAIL` when the next instruction runs. A driver should still wait for `TX_HEAD` (or the TX interrupt) before reusing a descriptor or its buffer, so that it also works with a card that takes time. Then `NET_IRQ_STATUS.TX` is set.
+- **Receive**: the driver gives the card empty buffers by filling descriptors (address, size) and advancing `RX_TAIL`; at start, typically all `SIZE` of them. Each frame that arrives goes into the buffer of the descriptor at `RX_HEAD`: the card copies it, writes its length and status, advances `RX_HEAD` and sets `NET_IRQ_STATUS.RX`. The driver reads the descriptors from its own counter up to `RX_HEAD`, then gives each buffer back by writing its size into `len` again (the card overwrote it) and advancing `RX_TAIL`. The card does not filter by destination address: every frame its backend delivers goes into the ring (and a hub repeats every frame to every port, so a card also gets frames sent to other machines). The driver drops the frames not addressed to its MAC, the broadcast address or a group it wants. Receive DMA writes RAM between two instructions without a hart storing there, so it breaks an LR/SC reservation on a word it writes (section 4.1).
+- **Flow control**: a frame that arrives while the card owns no receive descriptor (`RX_HEAD == RX_TAIL`, a full ring or none set up) is dropped and counted in `NET_RX_DROPPED`. Frames never wait in the card: what the guest cannot take is lost, as on a real network, and nothing queues without bound. Frames shorter than 14 or longer than 1514 bytes from a backend are dropped and counted too. Grail takes received frames from the backend every 256 steps (instructions, or ticks spent in `wfi`, section 7; in real-time mode the idle ticks skipped in a batch count too), at most 64 at a time, so a frame lands in RAM between two instructions and wakes a hart waiting in `wfi` for the interrupt; a card the guest has not set up still drains its backend, dropping everything.
+
+| `status` | Meaning |
+|---|---|
+| 0 | ok: the frame was sent, or received into the buffer |
+| 1 | transmit: the length is not 14 to 1514; nothing was sent |
+| 2 | the buffer (`addr`, `len` bytes) is not entirely in RAM; nothing was sent or copied |
+| 3 | receive: the frame is longer than the buffer; nothing was copied, and `len` holds the frame's length |
+| 4 | transmit: the backend failed to send the frame |
+
+A received frame whose descriptor gets status 2 or 3 is lost, and counted in `NET_RX_DROPPED` as well.
+
+| `NET_ERROR` | Meaning |
+|---|---|
+| 0 | none |
+| 1 | a `SIZE` that is neither 0 nor a power of two up to 1024 was written; the ring's size became 0 |
+| 2 | a `TAIL` more than `SIZE` descriptors ahead of `HEAD` was written; it was ignored |
+| 3 | a descriptor the card needed is not in RAM (`BASE` is wrong): transmit stops there (`TX_HEAD` stays on it until the ring is set up again); a received frame is dropped and counted |
+
+Details:
+
+- The registers are 32-bit only: byte or halfword accesses in a card's page raise access faults and do nothing. Unused offsets read as 0 and ignore writes, as do writes to the read-only registers. Everything writable resets to 0: no rings, interrupts off.
+- **DMA rules** are the block device's (section 9.6): addresses are physical (the card does not use the MMU), descriptors and buffers must lie entirely in RAM (not VRAM, the boot ROM or device registers), checked without overflow, and they may start at any byte address. A bad descriptor gets an error status and the card moves on; a bad ring is a `NET_ERROR`. Nothing a program writes makes the host panic or touches memory outside the descriptors and buffers.
+- **Interrupt**: a card holds its PLIC source high while `NET_IRQ_STATUS & NET_IRQ_ENABLE` is non-zero. A handler claims the source, handles the receive ring up to `RX_HEAD` (and reclaims transmit descriptors up to `TX_HEAD`), writes the bits it saw to `NET_IRQ_STATUS` (which lowers the line) and completes. A frame dropped without a descriptor (none free, or a length outside 14 to 1514) does not interrupt; one handed back in a descriptor with status 2 or 3 sets RX like any other, and one dropped because the receive ring is not in RAM sets ERROR (`NET_ERROR` 3).
+- **MAC address**: set by the host, read-only for the guest, always an individual (not a group) and locally administered (bit 1 of the first byte set) address, so it never clashes with a manufacturer's; Grail refuses any other for a card, whether from a config, `--net hub,mac=` or `Machine::with_devices`. A configured card gets the one in its config (`--net hub,mac=02:00:00:00:00:42`); otherwise a hub port gives `02:ca:00:00:00:NN`, `NN` being the port's number on its hub in the order cards attach (from 1).
+- **Backends.** Where frames go is up to the host: Grail gives each card of each machine its own backend (`NetBackend` in the grail library: send a frame, poll for a received one). Both calls are made from the machine's run loop and never block, and backends are `Send`, so frames can cross to other threads: to another machine, a switch or a socket. `--net hub` puts the card on a port of an in-process **hub** (`grail::net::Hub`), shared by every `--net hub` of the process: a frame one port sends is queued for every other port (a repeater, not a switch: no address learning), up to 256 frames per port, beyond which that port's frames are dropped. Tests connect two machines in one process by giving their configs the same hub. A host can hand Grail backends of its own with their MAC addresses (`Machine::with_devices`), after the configured cards.
+- **Capture**: `--pcap FILE` (after a `--net`) writes every frame that card sends or receives to FILE, in the classic libpcap format: a 24-byte header (magic 0xa1b2c3d4 written little-endian, version 2.4, snap length 65535, link type 1, `LINKTYPE_ETHERNET`), then per frame a 16-byte record header (wall-clock time stamp in seconds and microseconds, captured and original length) and the frame. Wireshark and tcpdump read it. The capture wraps the backend (`grail::net::Pcap`), so it sees received frames as the card takes them, including ones the card then drops; it is flushed after every frame, so the file is complete whenever the machine stops.
+
+The card's design follows the block device's choice (section 9.6) of something a first driver can copy over a general queue interface: no feature negotiation, one descriptor format for both directions, and every slot of a ring usable thanks to free-running counters. A driver is about forty instructions (`examples/net/netlib.S`).
+
+`examples/net` is a pair of programs sharing that driver: `net-pong` waits for a frame on its receive interrupt (in `wfi`), prints it and answers its sender; `net-ping` broadcasts a frame (EtherType 0x88b5, "local experimental") and polls the receive ring for the answer. `crates/grail/tests/net.rs` runs them on two machines on one hub, and checks a capture of the exchange byte for byte against `crates/grail/tests/golden/net-ping.pcap`. One `grail` process runs one machine, so there `net-ping` gets no answer, but its frame is in the capture: `grail --net hub --pcap ping.pcap examples/net/net-ping.elf`.
 
 ## 10. Toolchain (all our own)
 
@@ -558,7 +625,7 @@ Steps 1 and 2 together, our assembler and our linker with no LLVM at all, is how
 
 ### Examples
 
-The programs in `examples/` are built by `cargo xtask examples` (`crates/xtask/src/examples.rs`): each source is assembled by merlin-as and the objects are linked by merlin-ld, with the example's `link.ld` (or the default layout for `muldiv`). Both tools run as libraries inside xtask, the same code as their command lines, which the comment at the top of each source spells out. The linked `examples/<dir>/<name>.elf` files are committed so Grail can run them without building anything, and `cargo test` (`crates/xtask/tests/examples.rs`) rebuilds every example from source, requires the result to equal the committed file byte for byte, and runs it in Grail with its input (UART bytes, key events, pointer input, a disk image), checking the output and the exit code. Nothing in that needs LLVM. `examples/multiobj` exists to exercise multi-object linking: two sources with calls, pc-relative addresses and `.word` pointers between them, `.data` written at run time, `.bss` in the other object, and a non-zero exit code (42).
+The programs in `examples/` are built by `cargo xtask examples` (`crates/xtask/src/examples.rs`): each source is assembled by merlin-as and the objects are linked by merlin-ld, with the example's `link.ld` (or the default layout for `muldiv`). Both tools run as libraries inside xtask, the same code as their command lines, which the comment at the top of each source spells out. The linked `examples/<dir>/<name>.elf` files are committed so Grail can run them without building anything, and `cargo test` (`crates/xtask/tests/examples.rs`) rebuilds every example from source, requires the result to equal the committed file byte for byte, and runs it in Grail with its input (UART bytes, key events, pointer input, a disk image, another machine on a hub), checking the output and the exit code. Nothing in that needs LLVM. `examples/multiobj` exists to exercise multi-object linking: two sources with calls, pc-relative addresses and `.word` pointers between them, `.data` written at run time, `.bss` in the other object, and a non-zero exit code (42).
 
 clang and ld.lld are only the reference. Each source carries the command that builds the same program with them:
 
@@ -780,7 +847,9 @@ On a 64 KiB read-write disk that is 16 checks (14 when it is read-only). `crates
 4. **merlin-as** emitting ELF `.o`. Validate with `llvm-objdump` and ld.lld.
 5. **merlin-ld**. Validate against clang-produced objects.
 6. **Bare-metal hello world** written in our assembly, built entirely with our tools.
-7. **M extension** in merlin-as (Grail already passes rv32um), then the **A extension** (LR/SC and AMOs, section 4.1) in Grail and the toolchain. **Xcal devices** in Grail: framebuffer window, keyboard and pointer via Win32 FFI, sysinfo, block devices with pluggable backends, and a configurable machine (RAM size, real-time clock, disks) that a host can run several of.
+7. **M extension** in merlin-as (Grail already passes rv32um), then the **A extension** (LR/SC and AMOs, section 4.1) in Grail and the toolchain. **Xcal devices** in Grail: framebuffer window, keyboard and pointer via Win32 FFI, sysinfo, block devices and network cards with pluggable backends, and a configurable machine (RAM size, real-time clock, disks, network cards) that a host can run several of.
 8. **Merlin v0**: C subset → assembly. Grow it test by test (integer types, pointers, arrays, globals and strings done; structs, preprocessor and the rest tracked in #15).
 9. **Camelot kernel** in C (clang first, our compiler as it catches up): trap handling, timer, UART driver, then paging (Sv32), processes, a disk driver and buffer cache, syscalls and a user-space shell.
+
+   **Phase 9c, networking** (Ethernet and IPv4; issues #80 to #85): the network card in Grail with pluggable backends (an in-process hub, pcap capture; section 9.8), virtual Ethernet switches in Avalon connecting its VMs, a user-mode NAT gateway (DHCP, DNS, internet access and host port forwarding, in std Rust with no host driver), and in the kernel a NIC driver, ARP, IPv4, ICMP, UDP, then TCP, then socket syscalls and network tools (`ping`, `ifconfig`, `nc`, `fetch`, `httpd`).
 10. **Self-hosting stretch goal**: our tools running on our OS.
