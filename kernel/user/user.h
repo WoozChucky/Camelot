@@ -95,8 +95,8 @@ typedef unsigned long size_t;
 
 struct stat {
     uint ino;     /* the inode; 0 for a pipe or the shell's console */
-    ushort type;  /* T_DIR, T_FILE, T_DEVICE or T_PIPE */
-    ushort nlink; /* directory entries naming it */
+    ushort type;  /* T_DIR, T_FILE, T_DEVICE, T_PIPE or T_SOCKET */
+    ushort nlink; /* directory entries naming it; a socket: 0 once its other end hung up */
     uint size;    /* bytes; for a pipe, those waiting to be read */
     ushort major; /* a device's numbers */
     ushort minor;

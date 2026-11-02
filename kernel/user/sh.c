@@ -31,8 +31,16 @@
  * Built-ins: help, exit [N], wait, cd [DIR]. They run in the shell itself,
  * with its redirections, but can't be part of a pipeline. The shell ends
  * with `exit`, or at the end of the input (Ctrl-D on an empty line), with
- * the status N or else the last foreground program's; the kernel then stops
- * the machine with it. */
+ * the status N or else the last foreground program's; when it is the first
+ * process, the kernel then stops the machine with it.
+ *
+ * Its input is usually the console, whose line discipline edits and echoes
+ * a line and hands it over whole, one per read. Any other input (a network
+ * connection from shd, a pipe, a file) has no line discipline: the shell
+ * reads it a byte at a time up to each newline, so that nothing after the
+ * line is taken from the programs it starts, which read the same input.
+ * There the other end edits and echoes lines itself; a '\r' before the
+ * newline (a telnet client's line end) is dropped. */
 #include "user.h"
 
 #define PROMPT "$ "
@@ -444,12 +452,55 @@ static int run_line(char *line, int *exit_status) {
     return 0;
 }
 
+/* Whether the input is the console (a device): see the top. */
+static int console_input;
+
+/* Reads a line of input that isn't the console's into `buf` (LINE_SIZE
+ * bytes), a byte at a time, without its newline (and a '\r' before it).
+ * A longer line is read to its end, said to be too long, and left out.
+ * Returns its length, or -1 at the end of the input (or an error, a reset
+ * connection) before any byte of a line. */
+static int read_line(char *buf) {
+    int n = 0;
+    int too_long = 0;
+    for (;;) {
+        char c;
+        if (read(STDIN, &c, 1) != 1) {
+            if (n == 0 && !too_long) {
+                return -1;
+            }
+            break; /* the last line, without its newline */
+        }
+        if (c == '\n') {
+            break;
+        }
+        if (n == LINE_SIZE - 1) {
+            too_long = 1;
+        } else {
+            buf[n] = c;
+            n++;
+        }
+    }
+    if (too_long) {
+        fprintf(STDERR, "sh: line too long\n");
+        n = 0;
+    }
+    if (n > 0 && buf[n - 1] == '\r') {
+        n--;
+    }
+    buf[n] = 0;
+    return n;
+}
+
 int main(void) {
     char line[LINE_SIZE];
+    struct stat st;
+    console_input = fstat(STDIN, &st) == 0 && st.type == T_DEVICE;
     printf("Type help for the list of commands.\n");
     for (;;) {
         printf(PROMPT);
-        if (getline(line, sizeof line) < 0) {
+        int n = console_input ? getline(line, sizeof line) : read_line(line);
+        if (n < 0) {
             return last_status;
         }
         int status;
