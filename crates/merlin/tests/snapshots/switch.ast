@@ -1,0 +1,435 @@
+Function int classify(int x) <5:5>
+  Param #0 int x <5:18>
+  Local #1 int y <15:13>
+  Switch <6:5>
+    Var x #0 : int <6:13>
+    Block <6:16>
+      Case 0 <7:5>
+        Return <8:9>
+          Num 10 : int <8:16>
+      Case 1 <9:5>
+        Case 2 <10:5>
+          Return <11:9>
+            Num 20 : int <11:16>
+      Case -5 <12:5>
+        Return <13:9>
+          Num 30 : int <13:16>
+      Case 100 <14:5>
+        Block <14:15>
+          Decl <15:9>
+            Var int y #1 <15:13>
+              Binary / : int <15:19>
+                Var x #0 : int <15:17>
+                Num 10 : int <15:21>
+          Return <16:9>
+            Var y #1 : int <16:16>
+      Default <18:5>
+        Return <19:9>
+          Unary - : int <19:16>
+            Num 1 : int <19:17>
+Function int fall(int x) <23:5>
+  Param #0 int x <23:14>
+  Local #1 int r <24:9>
+  Decl <24:5>
+    Var int r #1 <24:9>
+      Num 0 : int <24:13>
+  Switch <25:5>
+    Var x #0 : int <25:13>
+    Block <25:16>
+      Case 1 <26:5>
+        ExprStmt <27:9>
+          Assign += : int <27:11>
+            Var r #1 : int <27:9>
+            Num 1 : int <27:14>
+      Case 2 <28:5>
+        ExprStmt <29:9>
+          Assign += : int <29:11>
+            Var r #1 : int <29:9>
+            Num 2 : int <29:14>
+      Case 3 <30:5>
+        ExprStmt <31:9>
+          Assign += : int <31:11>
+            Var r #1 : int <31:9>
+            Num 3 : int <31:14>
+      Break <32:9>
+      Case 4 <33:5>
+        ExprStmt <34:9>
+          Assign += : int <34:11>
+            Var r #1 : int <34:9>
+            Num 4 : int <34:14>
+  Return <36:5>
+    Var r #1 : int <36:12>
+Function int nested(int a, int b) <39:5>
+  Param #0 int a <39:16>
+  Param #1 int b <39:23>
+  Switch <40:5>
+    Var a #0 : int <40:13>
+    Block <40:16>
+      Case 1 <41:5>
+        Switch <42:9>
+          Var b #1 : int <42:17>
+          Block <42:20>
+            Case 1 <43:9>
+              Return <44:13>
+                Num 11 : int <44:20>
+            Case 2 <45:9>
+              Break <46:13>
+            Default <47:9>
+              Return <48:13>
+                Num 19 : int <48:20>
+      Return <50:9>
+        Num 12 : int <50:16>
+      Case 2 <51:5>
+        While <52:9>
+          Binary < : int <52:18>
+            Var b #1 : int <52:16>
+            Num 10 : int <52:20>
+          Block <52:24>
+            ExprStmt <53:13>
+              Post++ : int <53:14>
+                Var b #1 : int <53:13>
+            If <54:13>
+              Binary == : int <54:19>
+                Var b #1 : int <54:17>
+                Num 5 : int <54:22>
+              Break <55:17>
+      Return <57:9>
+        Var b #1 : int <57:16>
+  Return <59:5>
+    Num 0 : int <59:12>
+Function int loop_continue(void) <62:5>
+  Local #0 int i <63:9>
+  Local #1 int s <63:12>
+  Decl <63:5>
+    Var int i #0 <63:9>
+    Var int s #1 <63:12>
+      Num 0 : int <63:16>
+  For <64:5>
+    ExprStmt <64:10>
+      Assign : int <64:12>
+        Var i #0 : int <64:10>
+        Num 0 : int <64:14>
+    Binary < : int <64:19>
+      Var i #0 : int <64:17>
+      Num 6 : int <64:21>
+    Post++ : int <64:25>
+      Var i #0 : int <64:24>
+    Block <64:29>
+      Switch <65:9>
+        Binary % : int <65:19>
+          Var i #0 : int <65:17>
+          Num 3 : int <65:21>
+        Block <65:24>
+          Case 0 <66:9>
+            Continue <67:13>
+          Case 1 <68:9>
+            ExprStmt <69:13>
+              Assign += : int <69:15>
+                Var s #1 : int <69:13>
+                Num 1 : int <69:18>
+          Break <70:13>
+          Default <71:9>
+            ExprStmt <72:13>
+              Assign += : int <72:15>
+                Var s #1 : int <72:13>
+                Num 10 : int <72:18>
+      ExprStmt <74:9>
+        Assign += : int <74:11>
+          Var s #1 : int <74:9>
+          Num 100 : int <74:14>
+  Return <76:5>
+    Var s #1 : int <76:12>
+Function void copy(char *to, const char *from, int count) <79:6>
+  Param #0 char *to <79:17>
+  Param #1 const char *from <79:33>
+  Param #2 int count <79:43>
+  Local #3 int n <80:9>
+  Decl <80:5>
+    Var int n #3 <80:9>
+      Binary / : int <80:25>
+        Binary + : int <80:20>
+          Var count #2 : int <80:14>
+          Num 3 : int <80:22>
+        Num 4 : int <80:27>
+  Switch <81:5>
+    Binary % : int <81:19>
+      Var count #2 : int <81:13>
+      Num 4 : int <81:21>
+    Block <81:24>
+      Case 0 <82:5>
+        DoWhile <83:9>
+          Block <83:12>
+            ExprStmt <84:13>
+              Assign : char <84:19>
+                Deref : char <84:13>
+                  Post++ : char * <84:16>
+                    Var to #0 : char * <84:14>
+                Deref : const char <84:21>
+                  Post++ : const char * <84:26>
+                    Var from #1 : const char * <84:22>
+            Case 3 <85:9>
+              ExprStmt <86:13>
+                Assign : char <86:19>
+                  Deref : char <86:13>
+                    Post++ : char * <86:16>
+                      Var to #0 : char * <86:14>
+                  Deref : const char <86:21>
+                    Post++ : const char * <86:26>
+                      Var from #1 : const char * <86:22>
+            Case 2 <87:9>
+              ExprStmt <88:13>
+                Assign : char <88:19>
+                  Deref : char <88:13>
+                    Post++ : char * <88:16>
+                      Var to #0 : char * <88:14>
+                  Deref : const char <88:21>
+                    Post++ : const char * <88:26>
+                      Var from #1 : const char * <88:22>
+            Case 1 <89:9>
+              ExprStmt <90:13>
+                Assign : char <90:19>
+                  Deref : char <90:13>
+                    Post++ : char * <90:16>
+                      Var to #0 : char * <90:14>
+                  Deref : const char <90:21>
+                    Post++ : const char * <90:26>
+                      Var from #1 : const char * <90:22>
+          Binary > : int <91:22>
+            Pre-- : int <91:18>
+              Var n #3 : int <91:20>
+            Num 0 : int <91:24>
+Function int kind(unsigned int u) <95:5>
+  Param #0 unsigned int u <95:19>
+  Switch <96:5>
+    Var u #0 : unsigned int <96:13>
+    Block <96:16>
+      Case 4294967295 <97:5>
+        Return <98:9>
+          Num 1 : int <98:16>
+      Case 7 <99:5>
+        Return <100:9>
+          Num 2 : int <100:16>
+  Return <102:5>
+    Num 3 : int <102:12>
+Function int letter(char c) <105:5>
+  Param #0 char c <105:17>
+  Switch <106:5>
+    ImplicitCast : int <106:13>
+      Var c #0 : char <106:13>
+    Block <106:16>
+      Case 97 <107:5>
+        Case 101 <108:5>
+          Return <109:9>
+            Num 1 : int <109:16>
+      Case 200 <110:5>
+        Return <111:9>
+          Num 2 : int <111:16>
+  Return <113:5>
+    Num 0 : int <113:12>
+Function int main(void) <116:5>
+  Local #0 int ok <117:9>
+  Local #1 char dst[8] <118:10>
+  Decl <117:5>
+    Var int ok #0 <117:9>
+      Num 0 : int <117:14>
+  Decl <118:5>
+    Var char dst[8] #1 <118:10>
+  ExprStmt <119:5>
+    Assign += : int <119:8>
+      Var ok #0 : int <119:5>
+      Binary && : int <119:50>
+        Binary && : int <119:29>
+          Binary == : int <119:23>
+            Call classify : int <119:11>
+              Num 0 : int <119:20>
+            Num 10 : int <119:26>
+          Binary == : int <119:44>
+            Call classify : int <119:32>
+              Num 2 : int <119:41>
+            Num 20 : int <119:47>
+        Binary == : int <119:66>
+          Call classify : int <119:53>
+            Unary - : int <119:62>
+              Num 5 : int <119:63>
+          Num 30 : int <119:69>
+  ExprStmt <120:5>
+    Assign += : int <120:8>
+      Var ok #0 : int <120:5>
+      Binary && : int <120:31>
+        Binary == : int <120:25>
+          Call classify : int <120:11>
+            Num 100 : int <120:20>
+          Num 10 : int <120:28>
+        Binary == : int <120:46>
+          Call classify : int <120:34>
+            Num 7 : int <120:43>
+          Unary - : int <120:49>
+            Num 1 : int <120:50>
+  ExprStmt <121:5>
+    Assign += : int <121:8>
+      Var ok #0 : int <121:5>
+      Binary == : int <121:19>
+        Call fall : int <121:11>
+          Num 1 : int <121:16>
+        Num 6 : int <121:22>
+  ExprStmt <122:5>
+    Assign += : int <122:8>
+      Var ok #0 : int <122:5>
+      Binary == : int <122:19>
+        Call fall : int <122:11>
+          Num 2 : int <122:16>
+        Num 5 : int <122:22>
+  ExprStmt <123:5>
+    Assign += : int <123:8>
+      Var ok #0 : int <123:5>
+      Binary && : int <123:24>
+        Binary == : int <123:19>
+          Call fall : int <123:11>
+            Num 4 : int <123:16>
+          Num 4 : int <123:22>
+        Binary == : int <123:35>
+          Call fall : int <123:27>
+            Num 9 : int <123:32>
+          Num 0 : int <123:38>
+  ExprStmt <124:5>
+    Assign += : int <124:8>
+      Var ok #0 : int <124:5>
+      Binary == : int <124:24>
+        Call nested : int <124:11>
+          Num 1 : int <124:18>
+          Num 1 : int <124:21>
+        Num 11 : int <124:27>
+  ExprStmt <125:5>
+    Assign += : int <125:8>
+      Var ok #0 : int <125:5>
+      Binary == : int <125:24>
+        Call nested : int <125:11>
+          Num 1 : int <125:18>
+          Num 2 : int <125:21>
+        Num 12 : int <125:27>
+  ExprStmt <126:5>
+    Assign += : int <126:8>
+      Var ok #0 : int <126:5>
+      Binary == : int <126:24>
+        Call nested : int <126:11>
+          Num 1 : int <126:18>
+          Num 3 : int <126:21>
+        Num 19 : int <126:27>
+  ExprStmt <127:5>
+    Assign += : int <127:8>
+      Var ok #0 : int <127:5>
+      Binary == : int <127:24>
+        Call nested : int <127:11>
+          Num 2 : int <127:18>
+          Num 0 : int <127:21>
+        Num 5 : int <127:27>
+  ExprStmt <128:5>
+    Assign += : int <128:8>
+      Var ok #0 : int <128:5>
+      Binary == : int <128:24>
+        Call nested : int <128:11>
+          Num 3 : int <128:18>
+          Num 0 : int <128:21>
+        Num 0 : int <128:27>
+  ExprStmt <129:5>
+    Assign += : int <129:8>
+      Var ok #0 : int <129:5>
+      Binary == : int <129:27>
+        Call loop_continue : int <129:11>
+        Num 422 : int <129:30>
+  ExprStmt <130:5>
+    Call copy : void <130:5>
+      ImplicitCast : char * <130:10>
+        Var dst #1 : char [8] <130:10>
+      ImplicitCast : const char * <130:15>
+        Str "abcdefg" : char [8] <130:15>
+      Num 7 : int <130:26>
+  ExprStmt <131:5>
+    Assign += : int <131:8>
+      Var ok #0 : int <131:5>
+      Binary && : int <131:25>
+        Binary == : int <131:18>
+          Deref : char <131:14>
+            Binary + : char * <131:14>
+              Var dst #1 : char [8] <131:11>
+              Num 0 : int <131:15>
+          Num 97 : int <131:21>
+        Binary == : int <131:35>
+          Deref : char <131:31>
+            Binary + : char * <131:31>
+              Var dst #1 : char [8] <131:28>
+              Num 6 : int <131:32>
+          Num 103 : int <131:38>
+  ExprStmt <132:5>
+    Call copy : void <132:5>
+      ImplicitCast : char * <132:10>
+        Var dst #1 : char [8] <132:10>
+      ImplicitCast : const char * <132:15>
+        Str "xyz" : char [4] <132:15>
+      Num 2 : int <132:22>
+  ExprStmt <133:5>
+    Assign += : int <133:8>
+      Var ok #0 : int <133:5>
+      Binary && : int <133:25>
+        Binary == : int <133:18>
+          Deref : char <133:14>
+            Binary + : char * <133:14>
+              Var dst #1 : char [8] <133:11>
+              Num 1 : int <133:15>
+          Num 121 : int <133:21>
+        Binary == : int <133:35>
+          Deref : char <133:31>
+            Binary + : char * <133:31>
+              Var dst #1 : char [8] <133:28>
+              Num 2 : int <133:32>
+          Num 99 : int <133:38>
+  ExprStmt <134:5>
+    Assign += : int <134:8>
+      Var ok #0 : int <134:5>
+      Binary && : int <134:41>
+        Binary && : int <134:25>
+          Binary == : int <134:20>
+            Call kind : int <134:11>
+              ImplicitCast : unsigned int <134:16>
+                Unary - : int <134:16>
+                  Num 1 : int <134:17>
+            Num 1 : int <134:23>
+          Binary == : int <134:36>
+            Call kind : int <134:28>
+              ImplicitCast : unsigned int <134:33>
+                Num 7 : int <134:33>
+            Num 2 : int <134:39>
+        Binary == : int <134:52>
+          Call kind : int <134:44>
+            ImplicitCast : unsigned int <134:49>
+              Num 8 : int <134:49>
+          Num 3 : int <134:55>
+  ExprStmt <135:5>
+    Assign += : int <135:8>
+      Var ok #0 : int <135:5>
+      Binary && : int <135:54>
+        Binary && : int <135:28>
+          Binary == : int <135:23>
+            Call letter : int <135:11>
+              ImplicitCast : char <135:18>
+                Num 101 : int <135:18>
+            Num 1 : int <135:26>
+          Binary == : int <135:49>
+            Call letter : int <135:31>
+              Cast : char <135:38>
+                Num 200 : int <135:44>
+            Num 2 : int <135:52>
+        Binary == : int <135:69>
+          Call letter : int <135:57>
+            ImplicitCast : char <135:64>
+              Num 122 : int <135:64>
+          Num 0 : int <135:72>
+  Switch <136:5>
+    Var ok #0 : int <136:13>
+    Block <136:17>
+      Default <137:5>
+        ExprStmt <138:9>
+          Post++ : int <138:11>
+            Var ok #0 : int <138:9>
+  Return <140:5>
+    Var ok #0 : int <140:12>
