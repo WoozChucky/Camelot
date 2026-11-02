@@ -196,10 +196,109 @@ fn skippable_zeros(bytes: &[u8]) -> usize {
     }
 }
 
+/// A line table sequence for `-l`: the section it is in (in an object), its
+/// start and end, and its rows (address, path, line).
+type Sequence = (Option<usize>, u32, u32, Vec<(u32, String, u32)>);
+
+/// `-l`: where each address comes from, as llvm-objdump prints it. Before an
+/// instruction, `; name():` when the function it is in is another than the
+/// last one's, and `; file:line` when its line (the line table row at or
+/// before it) is another, or the function is. The function is the symbol
+/// LLVM's symbolizer takes: the last function, object or untyped symbol at or
+/// before the address in its section (not a mapping symbol like `$x` or a
+/// fake label `.L0 `), if the
+/// address is inside it (a symbol of size 0 runs to the next one). Unlike
+/// llvm-objdump, the line table is read without a compile unit.
+struct SourceLines {
+    sequences: Vec<Sequence>,
+    /// The symbols a function name may come from, sorted: (section, address,
+    /// size, name).
+    functions: Vec<(usize, u32, u32, String)>,
+    relocatable: bool,
+    /// What the last instruction's lines said: its function and its line.
+    last: (Option<String>, Option<(String, u32)>),
+}
+
+impl SourceLines {
+    fn new(elf: &Elf) -> Result<SourceLines, Error> {
+        let mut sequences = Vec::new();
+        for t in elf.line_tables()? {
+            for seq in &t.sequences {
+                let (Some(first), Some(end)) = (seq.rows.first(), seq.rows.last()) else {
+                    continue;
+                };
+                let rows = seq
+                    .rows
+                    .iter()
+                    .filter(|r| !r.end_sequence)
+                    .map(|r| (r.addr, t.path(r.file).to_string(), r.line))
+                    .collect();
+                sequences.push((seq.section, first.addr, end.addr, rows));
+            }
+        }
+        let mut functions: Vec<(usize, u32, u32, String)> = elf
+            .symbols()?
+            .into_iter()
+            .filter(|s| matches!(s.ty(), elf32::STT_NOTYPE | elf32::STT_FUNC | elf32::STT_OBJECT))
+            // Not RISC-V's mapping symbols (`$x`, `$d`) and fake labels (`.L0 `).
+            .filter(|s| !s.name.is_empty() && !s.name.starts_with('$') && !s.name.starts_with(".L0 "))
+            .filter_map(|s| {
+                let sec = s.section()?;
+                elf.sections
+                    .get(sec)?
+                    .is_alloc()
+                    .then_some((sec, s.value, s.size, s.name))
+            })
+            .collect();
+        // By address, then size: of several at one address the biggest wins.
+        functions.sort_by_key(|f| (f.0, f.1, f.2));
+        Ok(SourceLines {
+            sequences,
+            functions,
+            relocatable: elf.header.ty == elf32::ET_REL,
+            last: (None, None),
+        })
+    }
+
+    /// The line table row for `addr` in section `sec`: path and line.
+    fn row(&self, sec: usize, addr: u32) -> Option<(String, u32)> {
+        let (_, _, _, rows) = self.sequences.iter().find(|(s, start, end, _)| {
+            (!self.relocatable || *s == Some(sec)) && (*start..*end).contains(&addr)
+        })?;
+        let i = rows.partition_point(|r| r.0 <= addr).checked_sub(1)?;
+        Some((rows[i].1.clone(), rows[i].2))
+    }
+
+    fn print(&mut self, out: &mut String, sec: usize, addr: u32) {
+        let i = self.functions.partition_point(|f| (f.0, f.1) <= (sec, addr));
+        let function = i
+            .checked_sub(1)
+            .map(|i| &self.functions[i])
+            .filter(|(s, start, size, _)| *s == sec && (*size == 0 || addr - start < *size))
+            .map(|f| f.3.clone());
+        let line = self.row(sec, addr).filter(|(_, l)| *l != 0);
+        let new_function = function.is_some() && function != self.last.0;
+        if let (true, Some(f)) = (new_function, &function) {
+            let _ = writeln!(out, "; {f}():");
+        }
+        if let Some((path, n)) = &line {
+            if new_function || self.last.1.as_ref() != Some(&(path.clone(), *n)) {
+                let _ = writeln!(out, "; {path}:{n}");
+            }
+        }
+        self.last = (function, line);
+    }
+}
+
 pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result<(), Error> {
     let syntax = Syntax {
         aliases: opts.aliases,
         hex: true,
+    };
+    let mut source = if opts.line_numbers {
+        Some(SourceLines::new(elf)?)
+    } else {
+        None
     };
     let mut labels = Labels::new(elf)?;
     let reloc_sections = if opts.relocs {
@@ -300,6 +399,9 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
                 };
                 let inst = if size == 4 { decode(w) } else { Inst::Illegal(w) };
                 let pc32 = pc as u32;
+                if let Some(s) = source.as_mut() {
+                    s.print(out, idx, pc32);
+                }
                 let d = inst.format(Some(pc32), syntax);
                 let (mnemonic, operands) = match size {
                     1 => (".byte", format!("{w:#04x}")),

@@ -24,12 +24,14 @@ pub mod abi;
 pub mod ast;
 pub mod codegen;
 pub mod consteval;
+pub mod debug;
 pub mod lexer;
 pub mod parser;
 pub mod preprocess;
 pub mod sema;
 pub mod types;
 
+pub use debug::DebugInfo;
 pub use preprocess::{CmdMacro, Loader, Options};
 use std::fmt;
 use std::path::Path;
@@ -144,8 +146,9 @@ pub fn parse_with(name: &str, src: &str, opts: &Options, load: Loader) -> Result
 /// Compiles one translation unit to assembly text for merlin-as.
 pub fn compile_with(name: &str, src: &str, opts: &Options, load: Loader) -> Result<String, Vec<Error>> {
     let pp = preprocess(name, src, opts, load)?;
+    let debug = opts.debug.as_ref().map(|d| (d, pp.files.as_slice()));
     check(&pp)
-        .and_then(|prog| codegen::generate(&prog).map_err(|e| vec![e]))
+        .and_then(|prog| codegen::generate_with(&prog, debug).map_err(|e| vec![e]))
         .map_err(|errors| pp.name_files(errors))
 }
 

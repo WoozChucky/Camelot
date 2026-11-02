@@ -1455,7 +1455,10 @@ impl Parser<'_> {
             self.scopes.push(scope);
             let body = self.block_body(false);
             self.scopes.pop();
-            return Ok(Some(Item::Func(function(d, params, &specs, Some(body?)))));
+            let body = body?;
+            // The `}` just read.
+            let end = self.toks[self.pos - 1].pos;
+            return Ok(Some(Item::Func(function(d, params, &specs, Some(body), end))));
         } else if self.is_punct(",") {
             return Err(Error::new(
                 d.pos,
@@ -1479,7 +1482,8 @@ impl Parser<'_> {
                 })
                 .unwrap_or_default()
         });
-        Ok(Some(Item::Func(function(d, params, &specs, body))))
+        let end = d.pos;
+        Ok(Some(Item::Func(function(d, params, &specs, body, end))))
     }
 
     /// `{ item* }`, returning the items; in a new scope unless `new_scope`
@@ -2072,7 +2076,7 @@ impl Parser<'_> {
 }
 
 /// A function declaration or definition from its declarator.
-fn function(d: Decl, params: Vec<Param>, specs: &Specs, body: Option<Vec<Stmt>>) -> Function {
+fn function(d: Decl, params: Vec<Param>, specs: &Specs, body: Option<Vec<Stmt>>, end: Pos) -> Function {
     let (ret, variadic) = match d.ty.func_type() {
         Some(f) => (f.ret.clone(), f.variadic),
         None => unreachable!("only function declarators get here"),
@@ -2090,6 +2094,7 @@ fn function(d: Decl, params: Vec<Param>, specs: &Specs, body: Option<Vec<Stmt>>)
         locals: Vec::new(),
         ret_ptr: None,
         pos: d.pos,
+        end,
     }
 }
 

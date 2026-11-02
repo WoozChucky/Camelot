@@ -28,6 +28,8 @@ const SHT_NOBITS: u32 = 8;
 const SHF_WRITE: u32 = 1;
 const SHF_ALLOC: u32 = 2;
 const SHF_EXECINSTR: u32 = 4;
+const SHF_MERGE: u32 = 0x10;
+const SHF_STRINGS: u32 = 0x20;
 const SHF_INFO_LINK: u32 = 0x40;
 const SHN_UNDEF: u16 = 0;
 const SHN_ABS: u16 = 0xfff1;
@@ -36,6 +38,7 @@ const STB_GLOBAL: u8 = 1;
 const STT_NOTYPE: u8 = 0;
 const STT_OBJECT: u8 = 1;
 const STT_FUNC: u8 = 2;
+const STT_SECTION: u8 = 3;
 const EM_RISCV: u16 = 243;
 
 /// A string table under construction.
@@ -100,6 +103,11 @@ pub fn riscv_attributes() -> Vec<u8> {
     out
 }
 
+/// Debug sections of strings (`SHF_MERGE | SHF_STRINGS`).
+fn is_string_section(name: &str) -> bool {
+    matches!(name, ".debug_str" | ".debug_line_str")
+}
+
 pub fn write(obj: &Object) -> Vec<u8> {
     let mut shstr = StrTab::new();
     let mut strtab = StrTab::new();
@@ -123,7 +131,11 @@ pub fn write(obj: &Object) -> Vec<u8> {
             SectionKind::Data => (SHT_PROGBITS, SHF_ALLOC | SHF_WRITE),
             SectionKind::Rodata => (SHT_PROGBITS, SHF_ALLOC),
             SectionKind::Bss => (SHT_NOBITS, SHF_ALLOC | SHF_WRITE),
+            // Strings a debugger reads by offset, which a linker may merge.
+            SectionKind::Debug if is_string_section(&s.name) => (SHT_PROGBITS, SHF_MERGE | SHF_STRINGS),
+            SectionKind::Debug => (SHT_PROGBITS, 0),
         };
+        let entsize = if flags & SHF_STRINGS != 0 { 1 } else { 0 };
         align(&mut out, s.align.max(1) as usize);
         let offset = out.len() as u32;
         out.extend_from_slice(&s.data);
@@ -136,7 +148,7 @@ pub fn write(obj: &Object) -> Vec<u8> {
             link: 0,
             info: 0,
             align: s.align.max(1),
-            entsize: 0,
+            entsize,
         });
     }
 
@@ -172,13 +184,20 @@ pub fn write(obj: &Object) -> Vec<u8> {
             SymType::Func => STT_FUNC,
             SymType::Object => STT_OBJECT,
             SymType::NoType => STT_NOTYPE,
+            SymType::Section => STT_SECTION,
         };
         let (value, shndx) = match (s.constant, s.section) {
             (Some(c), _) => (c as u32, SHN_ABS),
             (None, Some(sec)) => (s.value, sec as u16 + 1),
             (None, None) => (0, SHN_UNDEF),
         };
-        put32(&mut symtab, strtab.add(&s.name));
+        // A section symbol has no name: it stands for its section.
+        let name = if s.ty == SymType::Section {
+            0
+        } else {
+            strtab.add(&s.name)
+        };
+        put32(&mut symtab, name);
         put32(&mut symtab, value);
         put32(&mut symtab, s.size);
         symtab.push((bind << 4) | ty);

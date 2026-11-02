@@ -1,5 +1,6 @@
 //! ELF32 little-endian reader for RISC-V files: the ELF header, program
-//! headers, section headers, symbols and relocations.
+//! headers, section headers, symbols and relocations, and the DWARF line
+//! tables of `.debug_line` ([`lines`]).
 //!
 //! Shared by Grail (loads executables), merlin-objdump (prints everything)
 //! and merlin-ld (reads `.o` files). It only reads; merlin-as and merlin-ld
@@ -7,6 +8,8 @@
 //! checked, so a truncated or corrupt file gives an [`Error`], never a panic.
 
 use std::fmt;
+
+pub mod lines;
 
 // e_type
 pub const ET_NONE: u16 = 0;
@@ -84,7 +87,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-fn err<T>(msg: impl Into<String>) -> Result<T, Error> {
+pub(crate) fn err<T>(msg: impl Into<String>) -> Result<T, Error> {
     Err(Error(msg.into()))
 }
 

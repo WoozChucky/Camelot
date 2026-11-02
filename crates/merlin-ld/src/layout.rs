@@ -16,6 +16,12 @@
 //!    even an empty one) matched it and it has no assignments.
 //! 5. Report undefined globals (`a.o: undefined reference to 'foo'`).
 //! 6. Pick the entry point.
+//!
+//! Debug information is kept apart from all this: every `.debug_*` input
+//! section (not loaded, so no rule places it) goes into the output section of
+//! its name, the objects' in command-line order, as ld.lld does without a rule
+//! for them. Those sections have no address; a symbol in one is its offset
+//! there (see [`Layout::debug`]).
 
 use crate::object::{
     self, Object, SHF_ALLOC, SHF_EXECINSTR, SHF_MERGE, SHF_STRINGS, SHF_WRITE, SHN_ABS, SHN_LORESERVE,
@@ -74,10 +80,31 @@ struct Placed {
     out: Option<usize>,
 }
 
+/// A debug section of the executable (`.debug_line`, ...): not loaded, it
+/// goes after everything that is, and its input sections are concatenated,
+/// each at its alignment. [`InputRef::addr`] is an input's offset in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugSection {
+    pub name: String,
+    pub size: u32,
+    pub align: u32,
+    /// `SHF_MERGE | SHF_STRINGS` when every input has them (string tables).
+    pub flags: u32,
+    pub entsize: u32,
+    pub inputs: Vec<InputRef>,
+}
+
+/// Whether an input section is debug information merlin-ld keeps.
+pub fn is_debug(sec: &object::Section) -> bool {
+    !sec.is_alloc() && sec.ty == object::SHT_PROGBITS && sec.name.starts_with(".debug_")
+}
+
 #[derive(Debug)]
 pub struct Layout {
     pub objects: Vec<Object>,
     pub sections: Vec<OutputSection>,
+    /// The debug sections, by name in the order the inputs first have them.
+    pub debug: Vec<DebugSection>,
     /// Defined globals in first-definition order. Script assignments override
     /// object definitions of the same name.
     pub globals: Vec<(String, Def)>,
@@ -89,6 +116,9 @@ pub struct Layout {
     placement: Vec<Vec<Option<Placed>>>,
     /// The input sections `/DISCARD/` matched, as `(object, section)`.
     discarded: HashSet<(usize, usize)>,
+    /// `(object, section)` of a debug input section: its offset in its
+    /// output section.
+    debug_offsets: HashMap<(usize, usize), u32>,
     global_index: HashMap<String, usize>,
 }
 
@@ -126,9 +156,25 @@ impl Layout {
             SHN_UNDEF => None,
             SHN_ABS => Some(s.value),
             sec => self
-                .input_addr(obj, sec as usize)
+                .section_base(obj, sec as usize)
                 .map(|a| a.wrapping_add(s.value)),
         }
+    }
+
+    /// Where an input section starts: its address if it is loaded, its
+    /// offset in its output section if it is debug information.
+    fn section_base(&self, obj: usize, sec: usize) -> Option<u32> {
+        self.input_addr(obj, sec)
+            .or_else(|| self.debug_offsets.get(&(obj, sec)).copied())
+    }
+
+    /// Whether `sym` of `obj` is in a section that is neither loaded nor
+    /// debug information, or that `/DISCARD/` threw away. Debug information
+    /// may point at such places (the code of a discarded function); there
+    /// the linker writes 0, as ld.lld does.
+    pub fn in_dropped_section(&self, obj: usize, sym: usize) -> bool {
+        let s = &self.objects[obj].symbols[sym];
+        s.shndx != SHN_UNDEF && s.shndx < SHN_LORESERVE && self.section_base(obj, s.shndx as usize).is_none()
     }
 
     /// Address of an input section, if it was placed.
@@ -151,7 +197,7 @@ impl Layout {
         }
         if s.is_local() {
             if s.ty == STT_SECTION {
-                return self.input_addr(obj, s.shndx as usize).ok_or_else(|| {
+                return self.section_base(obj, s.shndx as usize).ok_or_else(|| {
                     let name = o.symbol_display_name(sym as u32);
                     format!(
                         "refers to section '{name}', which {}",
@@ -658,15 +704,55 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
     }
     errors.append(&mut w.errors);
 
+    // Debug information, after everything else.
+    let mut debug: Vec<DebugSection> = Vec::new();
+    let mut debug_offsets = HashMap::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sec) in obj.sections.iter().enumerate() {
+            if !is_debug(sec) {
+                continue;
+            }
+            let merge = SHF_MERGE | SHF_STRINGS;
+            let out = match debug.iter_mut().find(|d| d.name == sec.name) {
+                Some(d) => d,
+                None => {
+                    debug.push(DebugSection {
+                        name: sec.name.clone(),
+                        size: 0,
+                        align: 1,
+                        flags: sec.flags & merge,
+                        entsize: sec.entsize,
+                        inputs: Vec::new(),
+                    });
+                    debug.last_mut().unwrap()
+                }
+            };
+            if sec.flags & merge != out.flags || sec.entsize != out.entsize {
+                (out.flags, out.entsize) = (0, 0);
+            }
+            let at = align_up(out.size as u64, sec.align as u64) as u32;
+            out.align = out.align.max(sec.align);
+            out.inputs.push(InputRef {
+                object: oi,
+                section: si,
+                addr: at,
+            });
+            debug_offsets.insert((oi, si), at);
+            out.size = at + sec.size;
+        }
+    }
+
     let mut layout = Layout {
         objects: Vec::new(),
         sections: w.sections,
+        debug,
         globals: w.globals,
         entry: 0,
         entry_symbol: None,
         warnings: Vec::new(),
         placement: w.placement,
         discarded: w.discarded,
+        debug_offsets,
         global_index: w.global_index,
     };
     layout.objects = objects;

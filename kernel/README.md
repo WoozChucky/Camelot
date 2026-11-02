@@ -483,11 +483,11 @@ assembles every `*.s` in this directory, in name order, and links with
 (`cargo run -p merlin --`, and so on), the kernel build is:
 
 ```
-merlin -I include main.c -o main.c.s         # and each other .c
+merlin -g -fdebug-compilation-dir=kernel -I include main.c -o main.c.s   # and each other .c
 merlin-as main.c.s -o main.c.o
 merlin-as entry.s -o entry.s.o               # and each other .s
 merlin-as userprogs.s -o userprogs.s.o       # the generated one (in target/kernel/obj)
-merlin -I include net/arp.c -o net/arp.c.s   # the network stack's files too
+merlin -g -fdebug-compilation-dir=kernel -I include net/arp.c -o net/arp.c.s   # the network stack's too
 merlin-ld -T kernel.ld -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf.c.o entry.s.o \
        exec.c.o file.c.o fs.c.o fstest.c.o kalloc.c.o kernelvec.s.o kprintf.c.o log.c.o machine.s.o \
        main.c.o net/arp.c.o net/dhcp.c.o net/ether.c.o net/icmp.c.o net/ip.c.o net/net.c.o \
@@ -497,7 +497,9 @@ merlin-ld -T kernel.ld -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf
        userprogs.s.o uservec.s.o vm.c.o vmtest.c.o
 ```
 
-(`cargo xtask kernel` keeps the `.s` and `.o` files in `target/kernel/obj`,
+(`-g` writes line tables for merlin-dbg, which are not loaded; the
+compilation directory makes their paths `kernel/main.c`, relative to the
+repository root. `cargo xtask kernel` keeps the `.s` and `.o` files in `target/kernel/obj`,
 `net/`'s in `target/kernel/obj/net`.) The disk kernel is the same link with
 `userprogs.s.o` replaced by the object of a `userprogs.s` with no programs
 (`user_program_count` 0), written to `kernel-disk.elf`.

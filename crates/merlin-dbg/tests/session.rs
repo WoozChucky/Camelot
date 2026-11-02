@@ -5,8 +5,13 @@
 //!
 //! The stub runs in this process (`grail::gdb::serve`, what `grail --gdb` runs), on a
 //! machine whose console the test captures; merlin-dbg is the real binary, connected
-//! with `--connect`. `merlin-dbg -- ...` starts its own machine, tested last. Grail's own
-//! tests check `grail --gdb` itself (crates/grail/tests/gdb.rs).
+//! with `--connect`, run in the repository root (where the line tables' paths, like
+//! `kernel/main.c`, lead to the sources). `merlin-dbg -- ...` starts its own machine,
+//! tested last. Grail's own tests check `grail --gdb` itself
+//! (crates/grail/tests/gdb.rs).
+//!
+//! Source-level debugging: breaking on a line of the kernel and of a user program,
+//! stepping by line, `list`, and LLDB reading the same line tables (ignored).
 
 use grail::gdb::Outcome;
 use grail::{Machine, MachineConfig, RunResult};
@@ -81,6 +86,7 @@ fn stub(mut m: Machine) -> (SocketAddr, JoinHandle<Outcome>) {
 fn merlin_dbg(args: &[&str], commands: &str) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_merlin-dbg"))
         .args(args)
+        .current_dir(path("."))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -204,11 +210,17 @@ fn kernel() {
     assert_lines(
         &out,
         &[
-            &format!("breakpoint 1 at {kmain:#010x} <kmain>"),
+            &format!(
+                "breakpoint 1 at {kmain:#010x} <kmain>: kernel/main.c:{}",
+                line_of("kernel/main.c", "int kmain(void) {")
+            ),
             "breakpoint 1",
             &format!("=> {kmain:#010x} <kmain>:  addi sp, sp, -0x10"),
             &format!("=> {:#010x} <kmain+4>:  sw ra, 0xc(sp)", kmain + 4),
-            &format!("breakpoint 2 at {kvminit:#010x} <kvminit>"),
+            &format!(
+                "breakpoint 2 at {kvminit:#010x} <kvminit>: kernel/vm.c:{}",
+                line_of("kernel/vm.c", "void kvminit(void) {")
+            ),
             "breakpoint 2",
             &format!("=> {kvminit:#010x} <kvminit>:  addi sp, sp, -0x10"),
         ],
@@ -229,10 +241,17 @@ fn kernel() {
         .take_while(|l| l.starts_with('#'))
         .collect();
     assert_eq!(bt.len(), 3, "{out}");
-    assert_eq!(bt[0], format!("#0  {kvminit:#010x} <kvminit>"));
+    assert_eq!(
+        bt[0],
+        format!(
+            "#0  {kvminit:#010x} <kvminit> at kernel/vm.c:{}",
+            line_of("kernel/vm.c", "void kvminit(void) {")
+        )
+    );
     assert!(bt[1].starts_with("#1  0x") && bt[1].contains(" <kmain+"), "{out}");
+    assert!(bt[1].contains(" at kernel/main.c:"), "{out}");
     assert!(bt[2].contains(" <supervisor_entry+"), "{out}");
-    let back = bt[1].trim_start_matches("#1  ");
+    let back = bt[1].trim_start_matches("#1  ").split(" at ").next().unwrap();
     // finish comes back there, and says what kvminit returned.
     assert!(
         out.contains(&format!(
@@ -250,6 +269,201 @@ fn kernel() {
             &format!("2    breakpoint  {kvminit:#010x} <kvminit>"),
         ],
     );
+}
+
+/// The number of the first line of `file` (from the repository root) that starts
+/// with `start`.
+fn line_of(file: &str, start: &str) -> u32 {
+    let text = std::fs::read_to_string(path(file)).unwrap();
+    text.lines()
+        .position(|l| l.starts_with(start))
+        .unwrap_or_else(|| panic!("no line starting {start:?} in {file}")) as u32
+        + 1
+}
+
+/// The lines `file:N: text` in `out` for `file`, as (N, text), each checked against
+/// the source: the text must be line N's.
+fn source_lines(out: &str, file: &str) -> Vec<(u32, String)> {
+    let source = std::fs::read_to_string(path(file)).unwrap();
+    let source: Vec<&str> = source.lines().collect();
+    let prefix = format!("{file}:");
+    out.lines()
+        .filter_map(|l| {
+            let rest = l.strip_prefix(&prefix)?;
+            let (n, text) = rest.split_once(": ")?;
+            let n: u32 = n.parse().ok()?;
+            assert_eq!(text, source[n as usize - 1].trim_end(), "{file}:{n} in:\n{out}");
+            Some((n, text.to_string()))
+        })
+        .collect()
+}
+
+#[test]
+fn source_lines_of_the_kernel() {
+    // kmain's first line, then line by line with next (over the calls), into a
+    // call with step, past its prologue, a backtrace with lines, and the source.
+    let kmain = line_of("kernel/main.c", "int kmain(void) {");
+    let out = connected(
+        "kernel/kernel.elf",
+        1,
+        b"hello\nexit\n",
+        &format!(
+            "break kernel/main.c:{kmain}\n\
+             continue\n\
+             next\n\
+             next\n\
+             step\n\
+             bt\n\
+             list\n\
+             list main.c:{kmain}\n\
+             break main.c:{}\n\
+             delete\n\
+             continue\n",
+            kmain - 1
+        ),
+    );
+    let file = std::fs::read(path("kernel/kernel.elf")).unwrap();
+    let symbols = merlin_dbg::symbols::Symbols::from_elf(&file).unwrap();
+    let kmain_at = symbols.lookup("kmain").unwrap();
+    assert_lines(
+        &out,
+        &[
+            &format!("breakpoint 1 at {kmain_at:#010x} <kmain>: kernel/main.c:{kmain}"),
+            "breakpoint 1",
+            &format!("=> {kmain_at:#010x} <kmain>:  addi sp, sp, -0x10"),
+            &format!("kernel/main.c:{kmain}: int kmain(void) {{"),
+            "(merlin-dbg) next",
+            "(merlin-dbg) next",
+            "(merlin-dbg) step",
+        ],
+    );
+    // Each stop shows its line, with the source's text; next went down kmain.
+    let lines: Vec<u32> = source_lines(&out, "kernel/main.c")
+        .iter()
+        .map(|(n, _)| *n)
+        .collect();
+    assert!(lines.len() >= 3, "{out}");
+    assert_eq!(lines[0], kmain);
+    assert!(lines[0] < lines[1] && lines[1] < lines[2], "{lines:?}\n{out}");
+    // step went into the call on that line: the backtrace has the caller on it.
+    let bt: Vec<&str> = out
+        .lines()
+        .skip_while(|l| *l != "(merlin-dbg) bt")
+        .skip(1)
+        .take_while(|l| l.starts_with('#'))
+        .collect();
+    assert!(!bt[0].contains("<kmain"), "{out}");
+    assert!(bt[0].contains(" at kernel/"), "{out}");
+    assert!(
+        bt[1].contains(" <kmain+") && bt[1].ends_with(&format!(" at kernel/main.c:{}", lines[2])),
+        "{out}"
+    );
+    // list: ten numbered lines; list main.c:LINE centers on it.
+    let listed: Vec<&str> = out
+        .lines()
+        .skip_while(|l| !l.ends_with(&format!(") list main.c:{kmain}")))
+        .skip(1)
+        .take(10)
+        .collect();
+    assert_eq!(listed[0], format!("{}\t{}", kmain - 5, source_line(kmain - 5)));
+    assert_eq!(listed[5], format!("{kmain}\tint kmain(void) {{"));
+    // The line before kmain has no code: the breakpoint goes to the next that has.
+    assert_lines(
+        &out,
+        &[
+            &format!("line {} has no code: kernel/main.c:{kmain} instead", kmain - 1),
+            &format!("breakpoint 2 at {kmain_at:#010x} <kmain>: kernel/main.c:{kmain}"),
+        ],
+    );
+}
+
+fn source_line(n: u32) -> String {
+    let text = std::fs::read_to_string(path("kernel/main.c")).unwrap();
+    text.lines().nth(n as usize - 1).unwrap().to_string()
+}
+
+#[test]
+fn stepping_through_a_user_program() {
+    // The shell, built with its line tables as `cargo xtask kernel` writes it next to
+    // the objects; the kernel runs the same program without them. It is the first
+    // user program to run, so its main is where the breakpoint stops.
+    let sh = xtask::userprogs::build_named(&path("kernel/user"), "sh").unwrap();
+    let elf = std::env::temp_dir().join(format!("merlin-dbg-sh-{}.elf", std::process::id()));
+    std::fs::write(&elf, &sh.debug).unwrap();
+    let main = line_of("kernel/user/sh.c", "int main(void) {");
+    let out = connected(
+        "kernel/kernel.elf",
+        1,
+        b"hello\nexit\n",
+        &format!(
+            "add-symbol-file {}\n\
+             break kernel/user/sh.c:{main}\n\
+             continue\n\
+             next\n\
+             next\n\
+             step\n\
+             bt\n\
+             delete\n\
+             continue\n",
+            elf.display()
+        ),
+    );
+    let _ = std::fs::remove_file(&elf);
+    let symbols = merlin_dbg::symbols::Symbols::from_elf(&sh.debug).unwrap();
+    let main_at = symbols.lookup("main").unwrap();
+    assert_lines(
+        &out,
+        &[
+            &format!("breakpoint 1 at {main_at:#010x} <main>: kernel/user/sh.c:{main}"),
+            "breakpoint 1",
+            &format!("kernel/user/sh.c:{main}: int main(void) {{"),
+        ],
+    );
+    let lines: Vec<u32> = source_lines(&out, "kernel/user/sh.c")
+        .iter()
+        .map(|(n, _)| *n)
+        .collect();
+    assert!(lines.len() >= 4, "{out}");
+    assert!(lines.windows(2).all(|w| w[0] < w[1]), "{lines:?}\n{out}");
+    assert!(out.contains(" <_start+"), "{out}");
+}
+
+/// LLDB (from the LLVM installer) reads the kernel's line tables: an address's
+/// line, and a breakpoint on a line. Ignored: it needs LLDB, and a Python runtime
+/// on the PATH on Windows (see crates/grail/tests/gdb.rs). `LLDB` names the binary
+/// if it is not on the PATH.
+#[test]
+#[ignore]
+fn lldb_reads_the_line_tables() {
+    let lldb = std::env::var("LLDB").unwrap_or_else(|_| "lldb".into());
+    let file = std::fs::read(path("kernel/kernel.elf")).unwrap();
+    let kmain_at = merlin_dbg::symbols::Symbols::from_elf(&file)
+        .unwrap()
+        .lookup("kmain")
+        .unwrap();
+    let kmain = line_of("kernel/main.c", "int kmain(void) {");
+    let out = Command::new(&lldb)
+        .arg("-b")
+        .args([
+            "-o",
+            &format!("target create {}", path("kernel/kernel.elf").display()),
+        ])
+        .args(["-o", &format!("image lookup -a {kmain_at:#x}")])
+        .args(["-o", &format!("breakpoint set -f main.c -l {kmain}")])
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {lldb}: {e}"));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let checks: [&[&str]; 2] = [
+        &["Summary: kernel.elf`kmain at main.c:", &format!(":{kmain}")],
+        &["Breakpoint 1: where = kernel.elf`kmain", "at main.c:"],
+    ];
+    for parts in checks {
+        assert!(
+            text.lines().any(|l| parts.iter().all(|p| l.contains(p))),
+            "no line with {parts:?} in:\n{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]

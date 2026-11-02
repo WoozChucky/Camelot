@@ -31,10 +31,17 @@
 //! Also as in clang, `.L` labels (including numeric labels like `1:` and the
 //! hidden `.Lpcrel_hi` labels on `auipc`s) only go into the symbol table when
 //! a relocation still refers to them.
+//!
+//! Debug information: `.debug_*` sections are not loaded (no `SHF_ALLOC`) and
+//! hold data only. A `.word` there that names a `.L` label becomes a
+//! relocation against the label's section symbol, plus the label's offset, so
+//! that compiler-made labels (`.Lfunc_begin0`) stay out of the symbol table and
+//! out of the linked program's. `.file` and `.loc` become the `.debug_line`
+//! line table ([`crate::dwarf`]).
 
 use crate::ast::*;
 use crate::reloc::{Emit, RelocKind, Target};
-use crate::{encode, Error};
+use crate::{dwarf, encode, Error};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +54,8 @@ pub enum SectionKind {
     Rodata,
     /// Zero-initialised, no file contents.
     Bss,
+    /// Debug information (`.debug_*`): data that is not loaded.
+    Debug,
 }
 
 #[derive(Debug)]
@@ -75,6 +84,9 @@ pub enum SymType {
     NoType,
     Func,
     Object,
+    /// A section's own symbol (`STT_SECTION`), at its start, for relocations
+    /// from debug information. Named by [`section_symbol_name`].
+    Section,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +126,18 @@ pub struct Assembler {
     /// Names given to `.local`, so that a later `.comm` allocates them in
     /// `.bss` (see the `.comm` directive).
     locals: HashSet<String>,
+    /// Line information: `.file 0` (the compilation directory and the main
+    /// file) and the other `.file`s by number.
+    file0: Option<dwarf::File>,
+    files: Vec<Option<dwarf::File>>,
+    /// The last `.loc`, until an instruction (or data) takes it.
+    loc: Option<dwarf::Loc>,
+    /// `.loc`'s `is_stmt`, which carries over from one to the next.
+    is_stmt: bool,
+    /// Line table rows: (section, offset, where it comes from).
+    rows: Vec<(usize, u32, dwarf::Loc)>,
+    /// The source line of the first `.loc`, for an error about the line table.
+    first_loc_line: usize,
     errors: Vec<Error>,
     line: usize,
 }
@@ -187,6 +211,12 @@ impl Assembler {
             dot_labels: 0,
             pcrel_lo: Vec::new(),
             locals: HashSet::new(),
+            file0: None,
+            files: Vec::new(),
+            loc: None,
+            is_stmt: true,
+            rows: Vec::new(),
+            first_loc_line: 0,
             errors: Vec::new(),
             line: 0,
         };
@@ -220,6 +250,8 @@ impl Assembler {
             }
         }
         self.resolve_local_fixups();
+        self.line_table();
+        self.debug_relocs_to_sections();
         if !self.errors.is_empty() {
             self.errors.sort_by_key(|e| e.line);
             return Err(self.errors);
@@ -475,47 +507,52 @@ impl Assembler {
         })
     }
 
-    /// The value of a `.size` expression. Besides constants, `.` and labels
-    /// already defined in the current section count as their offsets in it,
-    /// so the difference of two of them (`. - f`, `.Lend - f`) is the
-    /// distance between them: merlin-as never moves code once it is placed
-    /// (no relaxation), so the distance is final. Only `+` and `-` combine
-    /// such terms; anything else must be constant.
+    /// The value of an expression that may hold labels (`.size f, . - f`,
+    /// `.word .Lfunc_end0 - .Lfunc_begin0`). Besides constants, `.` and the
+    /// labels defined so far count as their offsets in their sections, so
+    /// the difference of two in one section is the distance between them:
+    /// merlin-as never moves code once it is placed (no relaxation), so the
+    /// distance is final. Only `+`, `-` and negation combine such terms;
+    /// anything else must be constant.
     ///
-    /// An offset on its own is not a size: `.size f, f` or `.size f, . + f`
+    /// An offset on its own is not a number: `.size f, f` or `.size f, . + f`
     /// would depend on where the section ends up. Like LLVM ("Size
     /// expression must be absolute"), the result is accepted only when the
-    /// section-relative terms cancel out, each added one matched by a
-    /// subtracted one.
-    fn eval_size(&self, e: &Expr) -> Option<i64> {
-        match self.eval_size_terms(e)? {
-            (v, 0) => Some(v),
-            _ => None,
-        }
+    /// offsets cancel out, each added one matched by a subtracted one in the
+    /// same section.
+    fn eval_relative(&self, e: &Expr) -> Option<i64> {
+        let mut terms: HashMap<usize, i64> = HashMap::new();
+        let v = self.relative_terms(e, 1, &mut terms)?;
+        terms.values().all(|&n| n == 0).then_some(v)
     }
 
-    /// `eval_size`'s worker: the value and how many section-relative terms
-    /// it holds (+1 for each added offset, -1 for each subtracted one).
-    fn eval_size_terms(&self, e: &Expr) -> Option<(i64, i64)> {
+    /// `eval_relative`'s worker: the value of `e` times `sign`, counting in
+    /// `terms` how many times each section's offsets were added (+1) or
+    /// subtracted (-1).
+    fn relative_terms(&self, e: &Expr, sign: i64, terms: &mut HashMap<usize, i64>) -> Option<i64> {
         match e {
-            Expr::Sym(name) if name == DOT => Some((self.sections[self.current].size as i64, 1)),
+            Expr::Sym(name) if name == DOT => {
+                *terms.entry(self.current).or_default() += sign;
+                Some(sign.wrapping_mul(self.sections[self.current].size as i64))
+            }
             Expr::Sym(name) => {
-                let s = &self.symbols[*self.by_name.get(name)?];
-                match s.constant {
-                    Some(c) => Some((c, 0)),
-                    None if s.defined && s.section == Some(self.current) => Some((s.value as i64, 1)),
-                    None => None,
+                let s = &self.symbols[*self.by_name.get(&self.resolve_name(name))?];
+                match (s.constant, s.section) {
+                    (Some(c), _) => Some(sign.wrapping_mul(c)),
+                    (None, Some(sec)) if s.defined => {
+                        *terms.entry(sec).or_default() += sign;
+                        Some(sign.wrapping_mul(s.value as i64))
+                    }
+                    _ => None,
                 }
             }
             Expr::Bin(op @ (BinOp::Add | BinOp::Sub), a, b) => {
-                let (a, ta) = self.eval_size_terms(a)?;
-                let (b, tb) = self.eval_size_terms(b)?;
-                Some(match op {
-                    BinOp::Add => (a.wrapping_add(b), ta + tb),
-                    _ => (a.wrapping_sub(b), ta - tb),
-                })
+                let a = self.relative_terms(a, sign, terms)?;
+                let b_sign = if *op == BinOp::Add { sign } else { -sign };
+                Some(a.wrapping_add(self.relative_terms(b, b_sign, terms)?))
             }
-            _ => Some((self.eval(e)?, 0)),
+            Expr::Neg(a) => self.relative_terms(a, -sign, terms),
+            _ => Some(sign.wrapping_mul(self.eval(e)?)),
         }
     }
 
@@ -526,7 +563,9 @@ impl Assembler {
             self.current = i;
             return;
         }
-        let kind = if name == ".text" || name.starts_with(".text.") || name.starts_with(".init") {
+        let kind = if name.starts_with(".debug_") {
+            SectionKind::Debug
+        } else if name == ".text" || name.starts_with(".text.") || name.starts_with(".init") {
             SectionKind::Text
         } else if name == ".bss" || name.starts_with(".bss.") || name.starts_with(".sbss") {
             SectionKind::Bss
@@ -605,12 +644,18 @@ impl Assembler {
     /// Appends the encoder's words to the current section and turns their
     /// fixups into relocations.
     fn place(&mut self, mnemonic: &str, emits: Vec<Emit>) {
-        if self.sections[self.current].kind == SectionKind::Bss {
-            return self.error("instructions are not allowed in .bss");
+        match self.sections[self.current].kind {
+            SectionKind::Bss => return self.error("instructions are not allowed in .bss"),
+            SectionKind::Debug => {
+                let name = self.sections[self.current].name.clone();
+                return self.error(format!("instructions are not allowed in {name}"));
+            }
+            _ => {}
         }
         if !self.sections[self.current].size.is_multiple_of(4) {
             return self.error("instruction is not 4-byte aligned (add .align 2)");
         }
+        self.take_loc();
         let base = self.sections[self.current].size;
         // `.` in any operand is the address of the instruction's first word.
         let mut dot = None;
@@ -684,12 +729,15 @@ impl Assembler {
     }
 
     fn data(&mut self, args: &[DirArg], size: u32) {
+        if !args.is_empty() {
+            self.take_loc();
+        }
         for a in args {
             let DirArg::Expr(e) = a else {
                 self.error("expected a number, not a string");
                 continue;
             };
-            if let Some(v) = self.eval(e) {
+            if let Some(v) = self.eval(e).or_else(|| self.eval_relative(e)) {
                 let bytes = (v as u64).to_le_bytes();
                 self.emit_bytes(&bytes[..size as usize]);
                 continue;
@@ -831,6 +879,9 @@ impl Assembler {
             ".half" | ".short" | ".2byte" => self.data(args, 2),
             ".word" | ".long" | ".4byte" => self.data(args, 4),
             ".ascii" | ".asciz" | ".string" => {
+                if !args.is_empty() {
+                    self.take_loc();
+                }
                 for a in args {
                     match a {
                         DirArg::Str(s) => {
@@ -887,7 +938,7 @@ impl Assembler {
                 // (clang's) or a constant.
                 if let Some(n) = self.arg_name(args, 0, ".size") {
                     let v = match args.get(1) {
-                        Some(DirArg::Expr(e)) => self.eval_size(e),
+                        Some(DirArg::Expr(e)) => self.eval_relative(e),
                         _ => None,
                     };
                     match v {
@@ -902,10 +953,263 @@ impl Assembler {
                     }
                 }
             }
+            ".file" => self.file_directive(args),
+            ".loc" => self.loc_directive(args),
             // Accepted and ignored: metadata that does not change the output.
-            ".file" | ".ident" | ".option" | ".attribute" | ".addrsig" | ".addrsig_sym"
-            | ".cfi_startproc" | ".cfi_endproc" => {}
+            ".ident" | ".option" | ".attribute" | ".addrsig" | ".addrsig_sym" | ".cfi_startproc"
+            | ".cfi_endproc" => {}
             _ => self.error(format!("unknown directive '{name}'")),
+        }
+    }
+}
+
+impl Assembler {
+    // ----- line information -----
+
+    /// Gives the pending `.loc`, if any, a row at the current offset: the
+    /// instruction or data about to be emitted is where it points.
+    fn take_loc(&mut self) {
+        if let Some(loc) = self.loc.take() {
+            let at = self.sections[self.current].size;
+            self.rows.push((self.current, at, loc));
+        }
+    }
+
+    /// `.file "name"` (the file's name, which merlin-as has no use for) or
+    /// `.file N ["dir"] "name" [md5 0x...]`: file number N of the line table.
+    /// `.file 0` gives the compilation directory and the main file.
+    fn file_directive(&mut self, args: &[DirArg]) {
+        let n = match args.first() {
+            Some(DirArg::Str(_)) if args.len() == 1 => return,
+            Some(DirArg::Expr(e)) => match self.eval(e) {
+                Some(n) if (0..=u32::MAX as i64).contains(&n) => n as usize,
+                _ => return self.error(".file: expected a file number"),
+            },
+            _ => return self.error(".file: expected a file number or a name"),
+        };
+        let mut strings = Vec::new();
+        let mut i = 1;
+        while let Some(DirArg::Str(s)) = args.get(i) {
+            strings.push(String::from_utf8_lossy(s).into_owned());
+            i += 1;
+        }
+        let (dir, name) = match strings.as_slice() {
+            [name] => (String::new(), name.clone()),
+            [dir, name] => (dir.clone(), name.clone()),
+            _ => return self.error(".file: expected [\"directory\"] \"name\" after the number"),
+        };
+        let md5 = match &args[i..] {
+            [] => None,
+            [DirArg::Expr(Expr::Sym(m)), sum] if m == "md5" => match sum {
+                DirArg::Wide(v) => Some(v.to_be_bytes()),
+                DirArg::Expr(Expr::Num(v)) => Some((*v as u64 as u128).to_be_bytes()),
+                _ => return self.error(".file: md5 needs a 128-bit number"),
+            },
+            [DirArg::Expr(Expr::Sym(m)), ..] if m == "source" => {
+                return self.error(".file: embedded source is not supported")
+            }
+            _ => return self.error(".file: unexpected text after the name"),
+        };
+        let file = dwarf::File { dir, name, md5 };
+        if n == 0 {
+            self.file0 = Some(file);
+            return;
+        }
+        if self.files.len() <= n {
+            self.files.resize(n + 1, None);
+        }
+        match &self.files[n] {
+            Some(old) if *old != file => self.error(format!("file number {n} is already defined")),
+            _ => self.files[n] = Some(file),
+        }
+    }
+
+    /// `.loc FILE [LINE [COLUMN]] [basic_block] [prologue_end]
+    /// [epilogue_begin] [is_stmt 0|1] [isa N] [discriminator N]`: the next
+    /// instruction comes from this place in the source.
+    fn loc_directive(&mut self, args: &[DirArg]) {
+        // Two `.loc`s in a row: the first still gets a row, here (LLVM's rule).
+        self.take_loc();
+        let mut nums = Vec::new();
+        let mut i = 0;
+        while nums.len() < 3 {
+            match args.get(i) {
+                Some(DirArg::Expr(e)) if !matches!(e, Expr::Sym(_)) => match self.eval(e) {
+                    Some(v) if (0..=u32::MAX as i64).contains(&v) => nums.push(v as u32),
+                    _ => return self.error(".loc: expected a number"),
+                },
+                _ => break,
+            }
+            i += 1;
+        }
+        let Some(&file) = nums.first() else {
+            return self.error(".loc: expected a file number");
+        };
+        let defined = match file {
+            0 => self.file0.is_some(),
+            n => self.files.get(n as usize).is_some_and(Option::is_some),
+        };
+        if !defined {
+            return self.error(format!(".loc: file number {file} has no .file"));
+        }
+        let mut loc = dwarf::Loc {
+            file,
+            line: nums.get(1).copied().unwrap_or(0),
+            column: nums.get(2).copied().unwrap_or(0),
+            ..dwarf::Loc::default()
+        };
+        let mut is_stmt = self.is_stmt;
+        while i < args.len() {
+            let Some(DirArg::Expr(Expr::Sym(opt))) = args.get(i) else {
+                return self.error(".loc: expected an option such as prologue_end");
+            };
+            i += 1;
+            let flag = match opt.as_str() {
+                "basic_block" => dwarf::BASIC_BLOCK,
+                "prologue_end" => dwarf::PROLOGUE_END,
+                "epilogue_begin" => dwarf::EPILOGUE_BEGIN,
+                "is_stmt" | "isa" | "discriminator" => 0,
+                _ => return self.error(format!(".loc: unknown option '{opt}'")),
+            };
+            if flag != 0 {
+                loc.flags |= flag;
+                continue;
+            }
+            // An option with a number after it.
+            let value = match args.get(i) {
+                Some(DirArg::Expr(e)) => self.eval(e).filter(|v| (0..=u32::MAX as i64).contains(v)),
+                _ => None,
+            };
+            let Some(value) = value else {
+                return self.error(format!(".loc: {opt} needs a number"));
+            };
+            i += 1;
+            match opt.as_str() {
+                "is_stmt" if value > 1 => return self.error(".loc: is_stmt must be 0 or 1"),
+                "is_stmt" => is_stmt = value == 1,
+                "isa" => loc.isa = value as u32,
+                _ => loc.discriminator = value as u32,
+            }
+        }
+        self.is_stmt = is_stmt;
+        if is_stmt {
+            loc.flags |= dwarf::IS_STMT;
+        }
+        if self.first_loc_line == 0 {
+            self.first_loc_line = self.line;
+        }
+        self.loc = Some(loc);
+    }
+
+    /// The symbol of section `sec`, made the first time it is needed.
+    fn section_symbol(&mut self, sec: usize) -> String {
+        let name = section_symbol_name(sec);
+        let i = self.symbol_index(&name);
+        let s = &mut self.symbols[i];
+        s.section = Some(sec);
+        s.defined = true;
+        s.ty = SymType::Section;
+        name
+    }
+
+    /// Appends `bytes` to the section named `name` (made if there is none,
+    /// as debug sections are) and returns where they start.
+    fn append(&mut self, name: &str, bytes: &[u8]) -> (usize, u32) {
+        let back = self.current;
+        self.switch_section(name);
+        let sec = self.current;
+        let at = self.sections[sec].size;
+        self.sections[sec].data.extend_from_slice(bytes);
+        self.sections[sec].size += bytes.len() as u32;
+        self.current = back;
+        (sec, at)
+    }
+
+    /// Writes the rows as `.debug_line` (and its strings in
+    /// `.debug_line_str`), one sequence per section in the order their first
+    /// rows came, with relocations for the strings and the sections' addresses.
+    fn line_table(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let line = self.first_loc_line;
+        let Some(root) = self.file0.clone() else {
+            let msg = "line information (.loc) needs .file 0, the compilation directory and the main file";
+            return self.errors.push(Error::new(line, msg));
+        };
+        let mut files = Vec::new();
+        for (n, f) in self.files.iter().enumerate().skip(1) {
+            match f {
+                Some(f) => files.push(f.clone()),
+                None => {
+                    let msg = format!("the line table's files must be numbered 1, 2, ...: no .file {n}");
+                    return self.errors.push(Error::new(line, msg));
+                }
+            }
+        }
+        let mut sequences: Vec<dwarf::Sequence> = Vec::new();
+        for &(section, offset, loc) in &self.rows {
+            match sequences.iter_mut().find(|s| s.section == section) {
+                Some(seq) => seq.rows.push((offset, loc)),
+                None => sequences.push(dwarf::Sequence {
+                    section,
+                    rows: vec![(offset, loc)],
+                    end: self.sections[section].size,
+                }),
+            }
+        }
+        let base = self.section_size(".debug_line");
+        let str_base = self.section_size(".debug_line_str");
+        let table = dwarf::encode(&root.dir, &root, &files, &sequences, base, str_base);
+        let (line_sec, _) = self.append(".debug_line", &table.line);
+        let (str_sec, _) = self.append(".debug_line_str", &table.line_str);
+        for (at, target) in table.fixups {
+            let (sec, addend) = match target {
+                dwarf::Target::LineStr(off) => (str_sec, off),
+                dwarf::Target::Section(sec, off) => (sec, off),
+            };
+            let symbol = self.section_symbol(sec);
+            self.sections[line_sec].relocs.push(Reloc {
+                offset: at,
+                kind: RelocKind::Abs32,
+                symbol,
+                addend: addend.into(),
+                line,
+            });
+        }
+    }
+
+    fn section_size(&self, name: &str) -> u32 {
+        self.sections
+            .iter()
+            .find(|s| s.name == name)
+            .map_or(0, |s| s.size)
+    }
+
+    /// A relocation in debug information against a `.L` label becomes one
+    /// against the label's section, plus the label's offset (as GNU as and
+    /// LLVM do for local symbols they can drop), so that compiler-made labels
+    /// need no symbols.
+    fn debug_relocs_to_sections(&mut self) {
+        for sec in 0..self.sections.len() {
+            if self.sections[sec].kind != SectionKind::Debug {
+                continue;
+            }
+            for r in 0..self.sections[sec].relocs.len() {
+                let name = &self.sections[sec].relocs[r].symbol;
+                if !name.starts_with(".L") {
+                    continue;
+                }
+                let s = &self.symbols[self.by_name[name]];
+                let (Some(target), true, None) = (s.section, s.defined, s.constant) else {
+                    continue;
+                };
+                let value = s.value;
+                let symbol = self.section_symbol(target);
+                let r = &mut self.sections[sec].relocs[r];
+                r.symbol = symbol;
+                r.addend += i64::from(value);
+            }
         }
     }
 }
@@ -930,6 +1234,12 @@ fn check_jump(distance: i64, bits: u32, what: &str) -> Result<(), String> {
         return Err(format!("{what} target at an odd distance ({distance:+} bytes)"));
     }
     Ok(())
+}
+
+/// The name of section `sec`'s symbol ([`SymType::Section`]): no name a
+/// source can write.
+pub fn section_symbol_name(sec: usize) -> String {
+    format!("\0section{sec}")
 }
 
 /// The location counter as the encoder sees it: a symbol named `.`.
@@ -1349,6 +1659,88 @@ g:      nop
         ] {
             assert!(crate::assemble(bad).is_err(), "{bad}");
         }
+    }
+
+    // ----- debug information -----
+
+    #[test]
+    fn label_differences_are_data() {
+        // What merlin -g writes for a function's size in .debug_info, and
+        // clang's `.Ldebug_info_end0 - .Ldebug_info_start0`.
+        let src = "
+        .text
+f:      nop
+        nop
+.Lend:
+        .section .debug_info,\"\",@progbits
+.Ls:    .word .Lend - f
+        .half .Lend - f - 4
+        .byte -(f - .Lend)
+        .word . - .Ls
+        .word .Lend
+";
+        let obj = crate::assemble(src).unwrap();
+        let (i, info) = section(&obj, ".debug_info");
+        assert_eq!(info.data, [8, 0, 0, 0, 4, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(obj.sections[i].kind, SectionKind::Debug);
+        // The label's word: a relocation against .text's section symbol, the
+        // label's offset its addend; the label itself is no symbol.
+        let r = &info.relocs[0];
+        assert_eq!((r.offset, r.kind, r.addend), (11, RelocKind::Abs32, 8));
+        let s = sym(&obj, &r.symbol);
+        assert_eq!((s.ty, s.section), (SymType::Section, Some(0)));
+        assert!(obj.symbols.iter().all(|s| !s.name.starts_with(".L")));
+        // Differences across sections are not numbers.
+        let errs = crate::assemble(".text\nf: nop\n.data\ng: .word 0\n.word g - f\n").unwrap_err();
+        assert!(errs[0].msg.contains("expected a constant or symbol"), "{errs:?}");
+    }
+
+    #[test]
+    fn line_information_errors() {
+        for (src, want) in [
+            (".loc 0 1 0\nnop\n", "file number 0 has no .file"),
+            (".file 1 \"a.c\"\n.loc 1 1 0\nnop\n", "needs .file 0"),
+            (
+                ".file 0 \"d\" \"a.c\"\n.file 2 \"b.h\"\n.loc 2 1 0\nnop\n",
+                "no .file 1",
+            ),
+            (
+                ".file 0 \"d\" \"a.c\"\n.loc 0 1 0 frobnicate\nnop\n",
+                "unknown option 'frobnicate'",
+            ),
+            (
+                ".file 0 \"d\" \"a.c\"\n.loc 0 1 0 is_stmt 2\nnop\n",
+                "is_stmt must be 0 or 1",
+            ),
+            (
+                ".file 0 \"d\" \"a.c\"\n.loc 0 1 0 isa\nnop\n",
+                "isa needs a number",
+            ),
+            (
+                ".file 1 \"a.c\"\n.file 1 \"b.c\"\n",
+                "file number 1 is already defined",
+            ),
+            (
+                ".file 0 \"d\" \"a.c\" source \"int x;\"\n",
+                "embedded source is not supported",
+            ),
+            (".file 0 \"d\" \"a.c\" md5\n", "unexpected text after the name"),
+            (
+                ".section .debug_info\nnop\n",
+                "instructions are not allowed in .debug_info",
+            ),
+            (
+                ".word 0x0102030405060708090a0b0c0d0e0f10\n",
+                "number too large for 64 bits",
+            ),
+        ] {
+            let errs = crate::assemble(src).unwrap_err();
+            assert!(errs.iter().any(|e| e.msg.contains(want)), "{src:?}: {errs:?}");
+        }
+        // The same .file twice is fine; a .file and .loc with no code make no table.
+        let obj =
+            crate::assemble(".file 1 \"a.c\"\n.file 1 \"a.c\"\n.file 0 \"d\" \"a.c\"\n.loc 0 3\n").unwrap();
+        assert!(obj.sections.iter().all(|s| s.kind != SectionKind::Debug));
     }
 
     #[test]

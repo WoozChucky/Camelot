@@ -1846,3 +1846,140 @@ fn command_line() {
     assert_eq!(o.status.code(), Some(2));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Two objects with line tables (`.file`/`.loc`), as `merlin -g` makes them,
+/// and the same two without.
+fn with_and_without_lines() -> (Vec<Input>, Vec<Input>) {
+    let a = "\
+        .file 0 \"src\" \"a.c\"
+        .text
+        .globl _start
+_start:
+        .loc 0 3 0
+        call f
+        .loc 0 4 5 prologue_end
+        j _start
+        .data
+        .word 7
+";
+    let b = "\
+        .file 0 \"src\" \"b.c\"
+        .file 1 \"src\" \"include/b.h\"
+        .text
+        nop
+        .globl f
+f:
+        .loc 0 10 0
+        addi a0, a0, 1
+        .loc 1 2 0
+        ret
+";
+    let strip = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with(".file") && !l.trim_start().starts_with(".loc"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let objs = |srcs: [&str; 2]| -> Vec<Input> {
+        srcs.iter()
+            .zip(["a.o", "b.o"])
+            .map(|(s, n)| Input {
+                name: n.into(),
+                data: merlin_as::assemble_to_elf(s).unwrap(),
+            })
+            .collect()
+    };
+    (objs([a, b]), objs([&strip(a), &strip(b)]))
+}
+
+#[test]
+fn line_tables_are_kept_and_relocated() {
+    let (debug, plain) = with_and_without_lines();
+    let opts = Options::default();
+    let linked = merlin_ld::link(&debug, &opts).unwrap();
+    let without = merlin_ld::link(&plain, &opts).unwrap();
+    let elf = elf32::Elf::parse(&linked.elf).unwrap();
+    let names: Vec<&str> = elf.sections.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "",
+            ".text",
+            ".data",
+            ".symtab",
+            ".strtab",
+            ".debug_line",
+            ".debug_line_str",
+            ".shstrtab"
+        ]
+    );
+    // Not loaded: the segments are the same as without the line tables.
+    let segments = |file: &[u8]| -> Vec<(u32, Vec<u8>)> {
+        let e = elf32::Elf::parse(file).unwrap();
+        e.segments
+            .iter()
+            .map(|p| (p.vaddr, e.segment_data(p).unwrap().to_vec()))
+            .collect()
+    };
+    assert_eq!(segments(&linked.elf), segments(&without.elf));
+    // One table per object, at the code's final addresses; the files' paths
+    // made from each table's own strings (the line_strp offsets relocated).
+    let text = elf.sections.iter().find(|s| s.name == ".text").unwrap().addr;
+    let tables = elf.line_tables().unwrap();
+    let rows: Vec<Vec<(u32, &str, u32, bool)>> = tables
+        .iter()
+        .map(|t| {
+            assert_eq!(t.sequences.len(), 1);
+            t.sequences[0]
+                .rows
+                .iter()
+                .map(|r| (r.addr - text, t.path(r.file), r.line, r.end_sequence))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            vec![
+                (0, "src/a.c", 3, false),
+                (8, "src/a.c", 4, false),
+                (12, "src/a.c", 4, true)
+            ],
+            vec![
+                (16, "src/b.c", 10, false),
+                (20, "src/include/b.h", 2, false),
+                (24, "src/include/b.h", 2, true)
+            ],
+        ]
+    );
+    // Stripped, it is the link without them, byte for byte; stripping that
+    // changes nothing.
+    assert_eq!(merlin_ld::strip_debug(&linked.elf).unwrap(), without.elf);
+    assert_eq!(merlin_ld::strip_debug(&without.elf).unwrap(), without.elf);
+}
+
+#[test]
+fn debug_information_of_discarded_code_points_nowhere() {
+    // The code of `gone` is thrown away: its sequence's address becomes 0.
+    let src = "        .file 0 \"src\" \"a.c\"
+        .text
+        .globl _start
+_start:
+        .loc 0 1 0
+        nop
+        .section .text.gone
+gone:
+        .loc 0 7 0
+        nop
+";
+    let obj = Input {
+        name: "a.o".into(),
+        data: merlin_as::assemble_to_elf(src).unwrap(),
+    };
+    let opts = script("SECTIONS { . = 0x1000; .text : { *(.text) } /DISCARD/ : { *(.text.gone) } }");
+    let linked = merlin_ld::link(&[obj], &opts).unwrap();
+    let elf = elf32::Elf::parse(&linked.elf).unwrap();
+    let seqs = &elf.line_tables().unwrap()[0].sequences;
+    let starts: Vec<(u32, u32)> = seqs.iter().map(|s| (s.rows[0].addr, s.rows[0].line)).collect();
+    assert_eq!(starts, [(0x1000, 1), (0, 7)]);
+}

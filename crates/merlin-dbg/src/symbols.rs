@@ -24,6 +24,8 @@ pub struct Symbols {
     /// By address; of several symbols at one address only the best name is kept.
     sorted: Vec<Symbol>,
     by_name: HashMap<String, u32>,
+    /// Every symbol of every file added: (address, rank, name, size).
+    candidates: Vec<(u32, (bool, bool), String, u32)>,
 }
 
 impl Symbols {
@@ -31,8 +33,16 @@ impl Symbols {
     /// ones (`.equ` constants), not section or file symbols, not the assembler's local
     /// labels (`.L...`).
     pub fn from_elf(file: &[u8]) -> Result<Symbols, String> {
+        let mut out = Symbols::default();
+        out.add_elf(file)?;
+        Ok(out)
+    }
+
+    /// Adds the symbols of another ELF file (`add-symbol-file`): a user program
+    /// next to the kernel. Of a name defined in both, the first file's is kept.
+    pub fn add_elf(&mut self, file: &[u8]) -> Result<(), String> {
         let elf = elf32::Elf::parse(file).map_err(|e| e.to_string())?;
-        let mut candidates = Vec::new();
+        let mut found = Vec::new();
         for s in elf.symbols().map_err(|e| e.to_string())? {
             if s.name.is_empty()
                 || s.name.starts_with(".L")
@@ -44,17 +54,24 @@ impl Symbols {
             }
             // Of several at one address: a function first, then a global name.
             let rank = (s.ty() != STT_FUNC, s.bind() == STB_LOCAL);
-            candidates.push((s.value, rank, s.name.clone(), s.size));
+            found.push((s.value, rank, s.name.clone(), s.size));
         }
-        candidates.sort();
-        let mut out = Symbols::default();
-        for (addr, _, name, size) in candidates {
-            out.by_name.entry(name.clone()).or_insert(addr);
-            if out.sorted.last().is_none_or(|s| s.addr != addr) {
-                out.sorted.push(Symbol { name, addr, size });
+        // A name defined twice in the file (two files' `static` functions):
+        // the lowest address.
+        found.sort();
+        for (addr, _, name, _) in &found {
+            self.by_name.entry(name.clone()).or_insert(*addr);
+        }
+        self.candidates.extend(found);
+        let mut all = self.candidates.clone();
+        all.sort();
+        self.sorted.clear();
+        for (addr, _, name, size) in all {
+            if self.sorted.last().is_none_or(|s| s.addr != addr) {
+                self.sorted.push(Symbol { name, addr, size });
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -75,6 +92,18 @@ impl Symbols {
             return None;
         }
         Some((&s.name, s.addr))
+    }
+
+    /// The address range of the symbol holding `addr`: its size, or up to the
+    /// next symbol when it has none (or the end of the address space).
+    pub fn range(&self, addr: u32) -> Option<(u32, u32)> {
+        let i = self.sorted.partition_point(|s| s.addr <= addr).checked_sub(1)?;
+        let s = &self.sorted[i];
+        let end = match s.size {
+            0 => self.sorted.get(i + 1).map_or(u32::MAX, |n| n.addr),
+            size => s.addr.wrapping_add(size),
+        };
+        (addr < end).then_some((s.addr, end))
     }
 
     /// `name` or `name+off` for `addr`, if a symbol holds it.

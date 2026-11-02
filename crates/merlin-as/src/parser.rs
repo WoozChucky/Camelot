@@ -124,7 +124,10 @@ impl Parser<'_> {
                 });
             }
             Tok::Ident(name) if name.starts_with('.') => {
-                let args = self.dir_args()?;
+                let args = match name.as_str() {
+                    ".file" | ".loc" => self.spaced_args()?,
+                    _ => self.dir_args()?,
+                };
                 out.push(Stmt {
                     line,
                     kind: StmtKind::Directive(name, args),
@@ -174,6 +177,28 @@ impl Parser<'_> {
                 return Ok(args);
             }
             self.pos += 1;
+        }
+    }
+
+    /// The arguments of `.file` and `.loc`, separated by spaces as GNU as and
+    /// LLVM write them (`.loc 1 12 5 prologue_end`, `.file 1 "dir" "a.c" md5
+    /// 0x...`); commas are allowed too.
+    fn spaced_args(&mut self) -> Result<Vec<DirArg>, Error> {
+        let mut args = Vec::new();
+        loop {
+            match self.peek().clone() {
+                Tok::Newline => return Ok(args),
+                Tok::Punct(',') => self.pos += 1,
+                Tok::Str(s) => {
+                    self.pos += 1;
+                    args.push(DirArg::Str(s));
+                }
+                Tok::Wide(v) => {
+                    self.pos += 1;
+                    args.push(DirArg::Wide(v));
+                }
+                _ => args.push(DirArg::Expr(self.expr()?)),
+            }
         }
     }
 
@@ -289,6 +314,7 @@ impl Parser<'_> {
         }
         match self.next() {
             Tok::Int(n) => Ok(Expr::Num(n)),
+            Tok::Wide(_) => Err(self.err("number too large for 64 bits")),
             Tok::Ident(name) => Ok(Expr::Sym(name)),
             Tok::LocalRef(n, fwd) => Ok(Expr::Sym(local_ref_name(n, fwd))),
             Tok::Punct('(') => {

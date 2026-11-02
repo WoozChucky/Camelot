@@ -1,4 +1,4 @@
-//! `merlin-ld [-T script] [-e entry] [-o out.elf] [--Map out.map] input.o ... [--start-lib lib.o ... --end-lib]`
+//! `merlin-ld [-T script] [-e entry] [-o out.elf] [--Map out.map] [-S] input.o ... [--start-lib lib.o ... --end-lib]`
 
 use merlin_ld::{Input, Options, ScriptSource};
 use std::process::ExitCode;
@@ -9,6 +9,8 @@ const USAGE: &str = "usage: merlin-ld [options] input.o ...
   -T FILE        linker script (default: .text at 0x80000000, then .rodata, .data, .bss)
   -e SYMBOL      entry point symbol or address (overrides ENTRY in the script)
   --Map FILE     write a link map
+  -S, --strip-debug
+                 leave out the debug information (.debug_* sections)
   --start-lib    the objects up to --end-lib are a library: each is linked
                  only if it defines a symbol the others need (like ld.lld's)
   --end-lib      ends a library";
@@ -20,6 +22,7 @@ fn main() -> ExitCode {
     let mut output = "a.out".to_string();
     let mut script = None;
     let mut map = None;
+    let mut strip = false;
     let mut opts = Options::default();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -37,6 +40,10 @@ fn main() -> ExitCode {
             "-T" => value("-T").map(|v| script = Some(v)),
             "-e" | "--entry" => value("-e").map(|v| opts.entry = Some(v)),
             "--Map" | "-Map" => value("--Map").map(|v| map = Some(v)),
+            "-S" | "--strip-debug" => {
+                strip = true;
+                Ok(())
+            }
             "--start-lib" if in_lib => Err("nested --start-lib".to_string()),
             "--start-lib" => {
                 in_lib = true;
@@ -98,7 +105,18 @@ fn main() -> ExitCode {
             for w in &linked.layout.warnings {
                 eprintln!("merlin-ld: warning: {w}");
             }
-            if let Err(e) = std::fs::write(&output, &linked.elf) {
+            let elf = if strip {
+                match merlin_ld::strip_debug(&linked.elf) {
+                    Ok(elf) => elf,
+                    Err(e) => {
+                        eprintln!("merlin-ld: error: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                linked.elf
+            };
+            if let Err(e) = std::fs::write(&output, &elf) {
                 eprintln!("merlin-ld: cannot write {output}: {e}");
                 return ExitCode::from(2);
             }

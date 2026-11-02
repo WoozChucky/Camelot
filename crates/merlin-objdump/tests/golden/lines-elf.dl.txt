@@ -1,0 +1,130 @@
+
+crates/merlin-objdump/tests/fixtures/lines.elf:	file format elf32-littleriscv
+
+Disassembly of section .text:
+
+00010000 <twice>:
+; twice():
+; src/inc/h.h:1
+   10000: ff010113     	addi	sp, sp, -0x10
+   10004: 00112623     	sw	ra, 0xc(sp)
+   10008: 00812423     	sw	s0, 0x8(sp)
+   1000c: 01010413     	addi	s0, sp, 0x10
+   10010: fea42a23     	sw	a0, -0xc(s0)
+; src/inc/h.h:2
+   10014: ff442503     	lw	a0, -0xc(s0)
+   10018: ffc10113     	addi	sp, sp, -0x4
+   1001c: 00a12023     	sw	a0, 0x0(sp)
+   10020: 00200513     	li	a0, 0x2
+   10024: 00012583     	lw	a1, 0x0(sp)
+   10028: 00410113     	addi	sp, sp, 0x4
+   1002c: 02a58533     	mul	a0, a1, a0
+; src/inc/h.h:3
+   10030: ff040113     	addi	sp, s0, -0x10
+   10034: 00c12083     	lw	ra, 0xc(sp)
+   10038: 00812403     	lw	s0, 0x8(sp)
+   1003c: 01010113     	addi	sp, sp, 0x10
+   10040: 00008067     	ret
+
+00010044 <add>:
+; add():
+; src/m.c:3
+   10044: ff010113     	addi	sp, sp, -0x10
+   10048: 00112623     	sw	ra, 0xc(sp)
+   1004c: 00812423     	sw	s0, 0x8(sp)
+   10050: 01010413     	addi	s0, sp, 0x10
+   10054: ff010113     	addi	sp, sp, -0x10
+   10058: fea42a23     	sw	a0, -0xc(s0)
+   1005c: feb42823     	sw	a1, -0x10(s0)
+; src/m.c:4
+   10060: ff442503     	lw	a0, -0xc(s0)
+   10064: ffc10113     	addi	sp, sp, -0x4
+   10068: 00a12023     	sw	a0, 0x0(sp)
+   1006c: ff042503     	lw	a0, -0x10(s0)
+   10070: 00012583     	lw	a1, 0x0(sp)
+   10074: 00410113     	addi	sp, sp, 0x4
+   10078: 00a58533     	add	a0, a1, a0
+   1007c: fea42623     	sw	a0, -0x14(s0)
+; src/m.c:5
+   10080: 00000513     	li	a0, 0x0
+   10084: fea42423     	sw	a0, -0x18(s0)
+   10088: fe842503     	lw	a0, -0x18(s0)
+   1008c: ffc10113     	addi	sp, sp, -0x4
+   10090: 00a12023     	sw	a0, 0x0(sp)
+   10094: 00300513     	li	a0, 0x3
+   10098: 00012583     	lw	a1, 0x0(sp)
+   1009c: 00410113     	addi	sp, sp, 0x4
+   100a0: 00a5a533     	slt	a0, a1, a0
+   100a4: 04050463     	beqz	a0, 0x100ec <add+0xa8>
+; src/m.c:6
+   100a8: fec42503     	lw	a0, -0x14(s0)
+   100ac: ffc10113     	addi	sp, sp, -0x4
+   100b0: 00a12023     	sw	a0, 0x0(sp)
+   100b4: fe842503     	lw	a0, -0x18(s0)
+   100b8: ff410113     	addi	sp, sp, -0xc
+   100bc: 00000097     	auipc	ra, 0x0
+   100c0: f44080e7     	jalr	-0xbc(ra) <twice>
+   100c4: 00c10113     	addi	sp, sp, 0xc
+   100c8: 00012583     	lw	a1, 0x0(sp)
+   100cc: 00410113     	addi	sp, sp, 0x4
+   100d0: 00a58533     	add	a0, a1, a0
+   100d4: fea42623     	sw	a0, -0x14(s0)
+; src/m.c:5
+   100d8: fe842503     	lw	a0, -0x18(s0)
+   100dc: 00150513     	addi	a0, a0, 0x1
+   100e0: fea42423     	sw	a0, -0x18(s0)
+   100e4: fff50513     	addi	a0, a0, -0x1
+   100e8: fa1ff06f     	j	0x10088 <add+0x44>
+; src/m.c:7
+   100ec: fec42503     	lw	a0, -0x14(s0)
+   100f0: ffc10113     	addi	sp, sp, -0x4
+   100f4: 00a12023     	sw	a0, 0x0(sp)
+   100f8: 06400513     	li	a0, 0x64
+   100fc: 00012583     	lw	a1, 0x0(sp)
+   10100: 00410113     	addi	sp, sp, 0x4
+   10104: 00b52533     	slt	a0, a0, a1
+   10108: 00050c63     	beqz	a0, 0x10120 <add+0xdc>
+; src/m.c:8
+   1010c: fec42503     	lw	a0, -0x14(s0)
+   10110: fff50513     	addi	a0, a0, -0x1
+   10114: fea42623     	sw	a0, -0x14(s0)
+   10118: 00150513     	addi	a0, a0, 0x1
+   1011c: fd1ff06f     	j	0x100ec <add+0xa8>
+; src/m.c:9
+   10120: fec42503     	lw	a0, -0x14(s0)
+   10124: 02050263     	beqz	a0, 0x10148 <.Lpcrel_hi0+0x20>
+
+00010128 <.Lpcrel_hi0>:
+; .Lpcrel_hi0():
+; src/m.c:10
+   10128: 00001517     	auipc	a0, 0x1
+   1012c: 06050513     	addi	a0, a0, 0x60
+   10130: ffc10113     	addi	sp, sp, -0x4
+   10134: 00a12023     	sw	a0, 0x0(sp)
+   10138: fec42503     	lw	a0, -0x14(s0)
+   1013c: 00012583     	lw	a1, 0x0(sp)
+   10140: 00410113     	addi	sp, sp, 0x4
+   10144: 00a5a023     	sw	a0, 0x0(a1)
+; src/m.c:11
+   10148: fec42503     	lw	a0, -0x14(s0)
+; src/m.c:12
+   1014c: ff040113     	addi	sp, s0, -0x10
+   10150: 00c12083     	lw	ra, 0xc(sp)
+   10154: 00812403     	lw	s0, 0x8(sp)
+   10158: 01010113     	addi	sp, sp, 0x10
+   1015c: 00008067     	ret
+
+00010160 <nothing>:
+; nothing():
+; src/m.c:13
+   10160: ff010113     	addi	sp, sp, -0x10
+   10164: 00112623     	sw	ra, 0xc(sp)
+   10168: 00812423     	sw	s0, 0x8(sp)
+   1016c: 01010413     	addi	s0, sp, 0x10
+; src/m.c:14
+   10170: 00000513     	li	a0, 0x0
+   10174: ff040113     	addi	sp, s0, -0x10
+   10178: 00c12083     	lw	ra, 0xc(sp)
+   1017c: 00812403     	lw	s0, 0x8(sp)
+   10180: 01010113     	addi	sp, sp, 0x10
+   10184: 00008067     	ret

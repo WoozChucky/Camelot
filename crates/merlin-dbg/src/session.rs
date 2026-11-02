@@ -1,8 +1,13 @@
 //! merlin-dbg's commands: a debugging session over a [`Remote`], reading commands a
 //! line at a time and writing what they show (`docs/merlin-dbg.md`, "Commands").
+//!
+//! With line tables ([`Lines`]) the session works by source line too: `break
+//! FILE:LINE`, `step` and `next` by line, `list`, and every stop says the file,
+//! line and its text.
 
 use crate::frames::{self, Regs};
 use crate::remote::{self, Remote, StopEvent, Watch};
+use crate::source::{Lines, Place};
 use crate::symbols::Symbols;
 use excalibur::Syntax;
 use excalibur::{decode, Inst};
@@ -35,6 +40,12 @@ pub enum OnQuit {
 pub struct Session<'a, W: Write> {
     remote: Remote,
     symbols: Symbols,
+    lines: Lines,
+    /// The source line shown last: an instruction step on the same line does
+    /// not show it again.
+    shown: Option<Place>,
+    /// Where `list` goes on: a file and the next line to show.
+    listed: Option<(String, u32)>,
     out: W,
     points: Vec<(usize, Point)>,
     next_point: usize,
@@ -52,13 +63,19 @@ type Halt = (usize, Option<(Watch, u32)>, u8);
 
 const HELP: &str = "\
 break|b ADDR            set a breakpoint (ADDR: 0x80000000, 1234, main, main+8, $ra)
+break|b FILE:LINE       ... on a source line (kernel/main.c:42, or main.c:42)
 watch [-r|-a] ADDR [N]  stop after a write (-r read, -a either) of N bytes at ADDR (4)
 delete|d [N]            delete breakpoint or watchpoint N, or all of them
 info breakpoints|i b    list breakpoints and watchpoints
 continue|c              run until something stops the machine (Ctrl-C to interrupt)
-stepi|si|step|s [N]     run N instructions (1) of the selected hart
-nexti|ni|next|n [N]     the same, but run a call to its return
+step|s [N]              run N source lines (1) of the selected hart, into calls
+next|n [N]              the same, but run a call to its return
+stepi|si [N]            run N instructions (1); step and next do too without lines
+nexti|ni [N]            the same, but run a call to its return
 finish                  run until the current function returns
+list|l [FILE:]LINE|FUNC show ten source lines around LINE; list alone goes on
+directory DIR           look for source files in DIR first
+add-symbol-file FILE    add the symbols and lines of another program (a user one)
 regs|info registers     the selected hart's registers
 x/N[w|b] ADDR           N words (w) or bytes (b) of memory at ADDR
 disas [ADDR] [N]        disassemble N instructions (8) from ADDR (the pc)
@@ -67,10 +84,20 @@ hart [N]                list the harts, or select hart N
 quit|q                  leave (the machine is killed, or left running with --connect)";
 
 impl<'a, W: Write> Session<'a, W> {
-    pub fn new(remote: Remote, symbols: Symbols, out: W, on_quit: OnQuit, interrupt: &'a AtomicBool) -> Self {
+    pub fn new(
+        remote: Remote,
+        symbols: Symbols,
+        lines: Lines,
+        out: W,
+        on_quit: OnQuit,
+        interrupt: &'a AtomicBool,
+    ) -> Self {
         Session {
             remote,
             symbols,
+            lines,
+            shown: None,
+            listed: None,
             out,
             points: Vec::new(),
             next_point: 1,
@@ -157,20 +184,37 @@ impl<'a, W: Write> Session<'a, W> {
                 _ => return Err("info breakpoints, info registers or info harts".into()),
             },
             "continue" | "c" => self.continue_()?,
-            "stepi" | "si" | "step" | "s" => {
+            "stepi" | "si" => {
                 for _ in 0..count(&args)? {
                     if !self.step()? {
                         break;
                     }
                 }
             }
-            "nexti" | "ni" | "next" | "n" => {
+            "nexti" | "ni" => {
                 for _ in 0..count(&args)? {
                     if !self.next()? {
                         break;
                     }
                 }
             }
+            "step" | "s" | "next" | "n" => {
+                let over = matches!(cmd, "next" | "n");
+                for _ in 0..count(&args)? {
+                    if !self.step_line(over)? {
+                        break;
+                    }
+                }
+            }
+            "list" | "l" => self.list(rest)?,
+            "directory" | "dir" => {
+                if rest.is_empty() {
+                    return Err("directory needs a directory".into());
+                }
+                self.lines.add_dir(rest.into());
+                self.say(format!("source files are looked for in {rest} first"));
+            }
+            "add-symbol-file" => self.add_symbol_file(rest)?,
             "finish" => self.finish()?,
             "regs" | "registers" => self.regs()?,
             "disas" | "disassemble" => self.disas(&args)?,
@@ -225,13 +269,47 @@ impl<'a, W: Write> Session<'a, W> {
         if expr.is_empty() {
             return Err("break needs an address or a symbol".into());
         }
-        let addr = self.eval(expr)?;
-        if !self.has_breakpoint(addr) {
-            self.remote.set_breakpoint(addr)?;
+        let addrs = match source_line(expr) {
+            Some((file, line)) => {
+                let symbols = &self.symbols;
+                let (addrs, place) = self
+                    .lines
+                    .breakpoints(file, line, |a| symbols.containing(a).map(|(_, start)| start))?;
+                if place.line != line {
+                    self.say(format!("line {line} has no code: {place} instead"));
+                }
+                addrs
+            }
+            None => vec![self.eval(expr)?],
+        };
+        for addr in addrs {
+            if !self.has_breakpoint(addr) {
+                self.remote.set_breakpoint(addr)?;
+            }
+            let n = self.add_point(Point::Break(addr));
+            let at = self.where_(addr);
+            self.say(format!("breakpoint {n} at {at}"));
         }
-        let n = self.add_point(Point::Break(addr));
-        let at = self.symbols.show(addr);
-        self.say(format!("breakpoint {n} at {at}"));
+        Ok(())
+    }
+
+    /// `0x80000024 <puts+4>`, and `: file:line` where the line tables say.
+    fn where_(&self, addr: u32) -> String {
+        match self.lines.at(addr) {
+            Some(place) => format!("{}: {place}", self.symbols.show(addr)),
+            None => self.symbols.show(addr),
+        }
+    }
+
+    /// `add-symbol-file FILE`.
+    fn add_symbol_file(&mut self, path: &str) -> Result<()> {
+        if path.is_empty() {
+            return Err("add-symbol-file needs a file".into());
+        }
+        let file = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        self.symbols.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
+        self.lines.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
+        self.say(format!("added the symbols of {path}"));
         Ok(())
     }
 
@@ -309,6 +387,10 @@ impl<'a, W: Write> Session<'a, W> {
     /// Resumes (a step of `step`'s hart, or every hart) and reports the stop. Returns
     /// the stop, or `None` once the program has exited.
     fn resume(&mut self, step: Option<usize>) -> Result<Option<Halt>> {
+        if step.is_none() {
+            // After a run, the stop shows its source line whatever it is.
+            self.shown = None;
+        }
         match self.remote.resume(step, self.interrupt)? {
             StopEvent::Exited(code) => {
                 self.exited = true;
@@ -351,11 +433,23 @@ impl<'a, W: Write> Session<'a, W> {
         }
     }
 
-    /// `=> pc <sym+off>: instruction`.
+    /// `=> pc <sym+off>: instruction`, then the source line the pc is on
+    /// (`kernel/main.c:42:     text`), unless it is the one shown last.
     fn show_pc(&mut self) -> Result<()> {
         let pc = self.remote.register(remote::PC)?;
         let line = self.disas_line(pc, true);
         self.say(line);
+        let place = self.lines.at(pc);
+        if let Some(place) = place.clone().filter(|p| Some(p) != self.shown.as_ref()) {
+            let line = match self.lines.text(&place.file, place.line) {
+                Some(text) => format!("{place}: {text}"),
+                None => place.to_string(),
+            };
+            self.say(line);
+            // `list` then shows the lines around it.
+            self.listed = Some((place.file.clone(), place.line.saturating_sub(5).max(1)));
+        }
+        self.shown = place;
         Ok(())
     }
 
@@ -369,36 +463,122 @@ impl<'a, W: Write> Session<'a, W> {
     /// One instruction of the selected hart. False once the program has exited, or
     /// another stop got in the way (a breakpoint hit by a hart before it).
     fn step(&mut self) -> Result<bool> {
+        let stepped = self.step_quietly()?;
+        if stepped.is_some() {
+            self.show_pc()?;
+        }
+        Ok(stepped.is_some())
+    }
+
+    /// One instruction of the selected hart, shown only if something else stopped
+    /// the machine. The new pc, or `None` then (or once the program has exited).
+    fn step_quietly(&mut self) -> Result<Option<u32>> {
         let hart = self.remote.selected()?;
         let Some((stopped, watch, signal)) = self.resume(Some(hart))? else {
-            return Ok(false);
+            return Ok(None);
         };
         let pc = self.remote.register(remote::PC)?;
         if stopped != hart || watch.is_some() || signal != 5 || self.has_breakpoint(pc) {
             self.report(stopped, watch, signal)?;
-            return Ok(false);
+            return Ok(None);
         }
-        self.show_pc()?;
-        Ok(true)
+        Ok(Some(pc))
     }
 
-    /// One instruction, or a whole call: a `jal`/`jalr` that links (`call`, `jal f`),
-    /// or the `auipc ra` + `jalr ra` pair of a far call, runs until it returns.
-    fn next(&mut self) -> Result<bool> {
-        let pc = self.remote.register(remote::PC)?;
-        let word = self.remote.read_word(pc).map(decode);
-        let after = match word {
+    /// Where a call at `pc` returns to: after a `jal`/`jalr` that links (`call`,
+    /// `jal f`), or after the `auipc ra` + `jalr ra` pair of a far call. `None` if
+    /// the instruction there is no call.
+    fn call_at(&mut self, pc: u32) -> Option<u32> {
+        match self.remote.read_word(pc).map(decode) {
             Some(Inst::Jal { rd, .. } | Inst::Jalr { rd, .. }) if rd != 0 => Some(pc.wrapping_add(4)),
             Some(Inst::Auipc { rd: 1, .. }) => match self.remote.read_word(pc.wrapping_add(4)).map(decode) {
                 Some(Inst::Jalr { rd: 1, rs1: 1, .. }) => Some(pc.wrapping_add(8)),
                 _ => None,
             },
             _ => None,
-        };
-        match after {
-            None => self.step(),
-            Some(ret) => self.run_to(ret, |sp, sp0| sp >= sp0),
         }
+    }
+
+    /// One instruction, or a whole call, which runs until it returns.
+    fn next(&mut self) -> Result<bool> {
+        let pc = self.remote.register(remote::PC)?;
+        match self.call_at(pc) {
+            None => self.step(),
+            Some(ret) => self.run_to(ret, |sp, sp0| sp >= sp0, true),
+        }
+    }
+
+    /// `step` (`over` false) or `next`: runs the selected hart to the start of
+    /// another source line. A call is run to its return by `next`, and by `step`
+    /// too when the function has no line information; else `step` stops in the
+    /// function, past its prologue. A return stops in the caller, on the line of
+    /// the call. Without line information at the pc, one instruction (`stepi`,
+    /// `nexti`). False if something else stopped the machine.
+    fn step_line(&mut self, over: bool) -> Result<bool> {
+        let pc = self.remote.register(remote::PC)?;
+        let Some(start) = self.lines.at(pc) else {
+            return if over { self.next() } else { self.step() };
+        };
+        let mut pc = pc;
+        for _ in 0..STEP_LIMIT {
+            if self.interrupt.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.say("interrupted");
+                self.shown = None;
+                self.show_pc()?;
+                return Ok(false);
+            }
+            let returning = matches!(
+                self.remote.read_word(pc).map(decode),
+                Some(Inst::Jalr { rd: 0, rs1: 1, .. })
+            );
+            pc = match self.call_at(pc) {
+                Some(ret) if over => match self.run_to(ret, |sp, sp0| sp >= sp0, false)? {
+                    true => ret,
+                    false => return Ok(false),
+                },
+                Some(ret) => {
+                    // Into the call: one step for `jal`/`jalr`, two for `auipc` + `jalr`.
+                    let mut at = pc;
+                    for _ in 0..(ret - pc) / 4 {
+                        match self.step_quietly()? {
+                            Some(next) => at = next,
+                            None => return Ok(false),
+                        }
+                    }
+                    if self.lines.at(at).is_none() {
+                        // No lines in there: run it to its return, as gdb does.
+                        if !self.run_to(ret, |sp, sp0| sp >= sp0, false)? {
+                            return Ok(false);
+                        }
+                        ret
+                    } else {
+                        let (entry, end) = self.symbols.range(at).unwrap_or((at, at.wrapping_add(1)));
+                        let body = self.lines.after_prologue(entry, end);
+                        if body != at && !self.run_to(body, |_, _| true, false)? {
+                            return Ok(false);
+                        }
+                        self.shown = None;
+                        self.show_pc()?;
+                        return Ok(true);
+                    }
+                }
+                None => match self.step_quietly()? {
+                    Some(next) => next,
+                    None => return Ok(false),
+                },
+            };
+            let here = self.lines.at(pc);
+            let new_line = here.is_some() && here.as_ref() != Some(&start) && self.lines.starts_statement(pc);
+            if new_line || (returning && here.is_some()) {
+                self.shown = None;
+                self.show_pc()?;
+                return Ok(true);
+            }
+        }
+        self.say(format!("still on {start} after {STEP_LIMIT} instructions"));
+        self.shown = None;
+        self.show_pc()?;
+        Ok(false)
     }
 
     /// Runs until the function the selected hart is in returns to its caller.
@@ -410,7 +590,7 @@ impl<'a, W: Write> Session<'a, W> {
         let at = self.symbols.show(caller.pc);
         self.say(format!("run till exit, back to {at}"));
         // Back in the caller, sp is above where it is now (or the same, from a leaf).
-        if self.run_to(caller.pc, |sp, sp0| sp >= sp0)? {
+        if self.run_to(caller.pc, |sp, sp0| sp >= sp0, true)? {
             let a0 = self.remote.register(10)?;
             self.say(format!("returned: a0 = {a0:#010x} ({})", a0 as i32));
         }
@@ -420,8 +600,9 @@ impl<'a, W: Write> Session<'a, W> {
     /// Runs the selected hart until it reaches `target` with its stack pointer passing
     /// `stack_ok(sp, sp now)` (so a recursive call returning there does not count), with
     /// a temporary breakpoint. Another stop (a breakpoint, a watchpoint, an interrupt,
-    /// the end) is reported and ends the run. True if it got there.
-    fn run_to(&mut self, target: u32, stack_ok: impl Fn(u32, u32) -> bool) -> Result<bool> {
+    /// the end) is reported and ends the run. True if it got there, where the pc is
+    /// shown if `show` says so.
+    fn run_to(&mut self, target: u32, stack_ok: impl Fn(u32, u32) -> bool, show: bool) -> Result<bool> {
         let hart = self.remote.selected()?;
         let sp0 = self.remote.register(2)?;
         let temporary = !self.has_breakpoint(target);
@@ -440,7 +621,7 @@ impl<'a, W: Write> Session<'a, W> {
             if ours && stack_ok(self.remote.register(2)?, sp0) {
                 if !temporary {
                     self.report(stopped, watch, signal)?;
-                } else {
+                } else if show {
                     self.show_pc()?;
                 }
                 break Ok(true);
@@ -582,9 +763,70 @@ impl<'a, W: Write> Session<'a, W> {
         let lines: Vec<String> = frames
             .iter()
             .enumerate()
-            .map(|(i, f)| format!("#{i}  {}", self.symbols.show(f.pc)))
+            .map(|(i, f)| {
+                // A caller's pc is the return address: its call is the
+                // instruction before, on the line that made the call.
+                let looked_up = if i == 0 { f.pc } else { f.pc.wrapping_sub(4) };
+                match self.lines.at(looked_up) {
+                    Some(place) => format!("#{i}  {} at {place}", self.symbols.show(f.pc)),
+                    None => format!("#{i}  {}", self.symbols.show(f.pc)),
+                }
+            })
             .collect();
         self.say(lines.join("\n"));
+        Ok(())
+    }
+
+    /// `list`: ten lines of source around a line (`FILE:LINE`, `LINE` of the file
+    /// listed last, a function's first line), or the ten after those listed last,
+    /// or around the pc.
+    fn list(&mut self, arg: &str) -> Result<()> {
+        let (file, first) = if arg.is_empty() {
+            match self.listed.clone() {
+                Some(next) => next,
+                None => {
+                    let pc = self.remote.register(remote::PC)?;
+                    let place = self.lines.at(pc).ok_or("no line information here")?;
+                    (place.file, place.line.saturating_sub(5).max(1))
+                }
+            }
+        } else {
+            let place = if let Some((file, line)) = source_line(arg) {
+                Place {
+                    file: self.lines.file_named(file)?,
+                    line,
+                }
+            } else if let Some(line) = arg.parse::<u32>().ok().filter(|_| !arg.starts_with('0')) {
+                let file = match &self.listed {
+                    Some((file, _)) => file.clone(),
+                    None => {
+                        let pc = self.remote.register(remote::PC)?;
+                        self.lines.at(pc).ok_or("no line information here")?.file
+                    }
+                };
+                Place { file, line }
+            } else {
+                let addr = self.eval(arg)?;
+                self.lines
+                    .at(addr)
+                    .ok_or_else(|| format!("no line information for {arg}"))?
+            };
+            (place.file, place.line.saturating_sub(5).max(1))
+        };
+        let count = self
+            .lines
+            .line_count(&file)
+            .ok_or_else(|| format!("cannot find {file} (try directory DIR)"))?;
+        if first > count {
+            return Err(format!("{file} has {count} lines"));
+        }
+        let last = (first + 9).min(count);
+        let mut out = Vec::new();
+        for n in first..=last {
+            out.push(format!("{n}\t{}", self.lines.text(&file, n).unwrap_or_default()));
+        }
+        self.say(out.join("\n"));
+        self.listed = Some((file, last + 1));
         Ok(())
     }
 
@@ -613,6 +855,17 @@ impl<'a, W: Write> Session<'a, W> {
         self.say(format!("hart {h}"));
         self.show_pc()
     }
+}
+
+/// How many instructions `step` and `next` run at most looking for another line.
+const STEP_LIMIT: u32 = 1_000_000;
+
+/// `FILE:LINE` (a file name, a colon, a decimal line number), if `s` is one.
+fn source_line(s: &str) -> Option<(&str, u32)> {
+    let (file, line) = s.rsplit_once(':')?;
+    let line = line.trim().parse::<u32>().ok().filter(|&l| l > 0)?;
+    let file = file.trim();
+    (!file.is_empty()).then_some((file, line))
 }
 
 /// A count argument (1 if absent).
@@ -652,6 +905,18 @@ pub fn register_number(name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_lines() {
+        assert_eq!(source_line("kernel/main.c:42"), Some(("kernel/main.c", 42)));
+        assert_eq!(source_line("main.c:7"), Some(("main.c", 7)));
+        assert_eq!(source_line("C:/src/main.c:7"), Some(("C:/src/main.c", 7)));
+        assert_eq!(source_line("main"), None);
+        assert_eq!(source_line("main.c:"), None);
+        assert_eq!(source_line(":3"), None);
+        assert_eq!(source_line("main.c:0"), None);
+        assert_eq!(source_line("main.c:x"), None);
+    }
 
     #[test]
     fn numbers_and_registers() {

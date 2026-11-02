@@ -106,6 +106,16 @@ const CASES: &[(&str, &str, &[&str])] = &[
         &["-h"],
     ),
     (
+        "debug-o.dl",
+        "crates/merlin-objdump/tests/fixtures/debug.o",
+        &["-d", "-l"],
+    ),
+    (
+        "lines-elf.dl",
+        "crates/merlin-objdump/tests/fixtures/lines.elf",
+        &["-d", "-l"],
+    ),
+    (
         "linked-elf.d",
         "crates/merlin-objdump/tests/fixtures/linked.elf",
         &["-d"],
@@ -270,9 +280,9 @@ fn generator_script_builds_every_fixture() {
         }
         let consumer = format!("\"$FIX/{file}\"");
         assert!(
-            script
-                .lines()
-                .any(|l| l.starts_with(&format!("gen {name} ")) && l.contains(&consumer)),
+            script.lines().any(|l| (l.starts_with(&format!("gen {name} "))
+                || l.starts_with(&format!("gen_lines {name} ")))
+                && l.contains(&consumer)),
             "{name} is not generated from {file}"
         );
     }
