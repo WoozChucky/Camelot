@@ -25,7 +25,7 @@ crates/merlin           the C-subset compiler (front end + test harness; codegen
 crates/merlin-as        the assembler
 crates/merlin-ld        the linker (relocation hook in src/reloc.rs is issue #7)
 crates/merlin-objdump   the disassembler; output matches llvm-objdump 21
-crates/xtask            build tasks (`cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
+crates/xtask            build tasks (`cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld; `cargo xtask hello` rebuilds merlin-as's linked hello golden; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
 kernel/                 the Camelot kernel (C + assembly); kernel.elf is committed, rebuild it after changes
 docs/                   ISA spec
 examples/               bare-metal programs
