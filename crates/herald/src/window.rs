@@ -52,6 +52,10 @@ impl View for WindowView {
         self.window.pump()
     }
 
+    /// Keys first, then pointer changes: Grail's window keeps the two apart (they are
+    /// for two devices with a FIFO each), so their order within one poll is not known.
+    /// Each keeps its own order, which is all the server keeps too (protocol doc,
+    /// section 6.4).
     fn take_input(&mut self) -> Vec<Input> {
         let keys = self
             .window

@@ -249,10 +249,13 @@ impl ServerThread {
     #[doc(hidden)]
     pub fn debug_vm(&self, id: u32) -> Option<VmDebug> {
         let vm = lock(&self.handle.shared.table).vms.get(&id).cloned()?;
+        let (keys, pointer) = vm.queued_input();
         Some(VmDebug {
             slices: vm.slices(),
             consoles: vm.console_count(),
             viewers: vm.viewer_count(),
+            keys,
+            pointer,
         })
     }
 
@@ -281,6 +284,10 @@ pub struct VmDebug {
     pub consoles: usize,
     /// Clients attached to the screen.
     pub viewers: usize,
+    /// Keys waiting for the machine (at most [`crate::MAX_INPUT_QUEUE`]).
+    pub keys: usize,
+    /// Pointer changes waiting for the machine (at most [`crate::MAX_INPUT_QUEUE`]).
+    pub pointer: usize,
 }
 
 impl Shared {

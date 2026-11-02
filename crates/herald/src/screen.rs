@@ -72,6 +72,8 @@ pub struct ScreenSession {
     pub detach_timeout: Duration,
     /// Set once a detach is under way.
     detaching: bool,
+    /// The buttons of the last pointer change sent, for [`input_messages`].
+    held: Option<u8>,
     /// The screen changed since it was last drawn.
     dirty: bool,
 }
@@ -110,6 +112,7 @@ impl ScreenSession {
             frames: 0,
             detach_timeout: crate::DETACH_TIMEOUT,
             detaching: false,
+            held: None,
             dirty: true,
         })
     }
@@ -165,7 +168,7 @@ impl ScreenSession {
         loop {
             if deadline.is_none() {
                 if view.pump() {
-                    for msg in input_messages(self.vm.id, view.take_input()) {
+                    for msg in input_messages(self.vm.id, &mut self.held, view.take_input()) {
                         self.conn.send(&msg)?;
                     }
                 } else {
@@ -273,23 +276,38 @@ impl ScreenSession {
 /// buttons held and no wheel goes as its last move (a mouse reports far more moves
 /// than a guest's pointer FIFO holds; only where it ends up matters). Keys with code
 /// 0, which no key has, are dropped.
-pub fn input_messages(vm: u32, input: Vec<Input>) -> Vec<Message> {
+///
+/// A button change is not part of the run around it, though Grail's window reports a
+/// press or a release as a move to where it happened, with the new buttons: the moves
+/// after it start a run of their own, so the guest sees the press (or release) where
+/// it was, and a drag starts and ends where it did. `held` is the buttons in effect
+/// before `input` (the last pointer change sent), `None` while unknown; it is updated,
+/// for the next batch.
+pub fn input_messages(vm: u32, held: &mut Option<u8>, input: Vec<Input>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::new();
+    // Whether the last message in `out` is a move that changed no button, so a later
+    // move with the same buttons may take its place.
+    let mut last_is_run = false;
     for item in input {
         match item {
-            Input::Key(key) if key.code != 0 => out.push(Message::KeyInput { vm, key }),
+            Input::Key(key) if key.code != 0 => {
+                out.push(Message::KeyInput { vm, key });
+                last_is_run = false;
+            }
             Input::Key(_) => {}
             Input::Pointer(mut pointer) => {
                 pointer.buttons &= POINTER_BUTTONS;
-                let is_move =
-                    |p: &PointerChange| matches!(p.motion, PointerMotion::To { .. }) && p.wheel == 0;
+                let is_move = matches!(pointer.motion, PointerMotion::To { .. }) && pointer.wheel == 0;
+                let same_buttons = *held == Some(pointer.buttons);
                 if let Some(Message::PointerInput { pointer: last, .. }) = out.last_mut() {
-                    if is_move(last) && is_move(&pointer) && last.buttons == pointer.buttons {
+                    if last_is_run && is_move && same_buttons {
                         *last = pointer;
                         continue;
                     }
                 }
                 out.push(Message::PointerInput { vm, pointer });
+                last_is_run = is_move && same_buttons;
+                *held = Some(pointer.buttons);
             }
         }
     }
@@ -362,24 +380,27 @@ mod tests {
             buttons: POINTER_LEFT,
             wheel: -1,
         });
+        let mut held = Some(0);
         let msgs = input_messages(
             7,
+            &mut held,
             vec![
                 to(1, 1, 0),
                 to(2, 2, 0),
                 to(3, 3, 0),
                 to(3, 3, POINTER_LEFT),
                 to(4, 4, POINTER_LEFT),
-                wheel,
                 to(5, 5, POINTER_LEFT),
-                key(b'a'),
+                wheel,
                 to(6, 6, POINTER_LEFT),
+                key(b'a'),
+                to(7, 7, POINTER_LEFT),
                 key(0),
-                to(7, 7, POINTER_LEFT | 0xf8),
+                to(8, 8, POINTER_LEFT | 0xf8),
             ],
         );
         let pointer = |i: usize| pointer_of(&msgs[i]);
-        assert_eq!(msgs.len(), 6, "{msgs:#?}");
+        assert_eq!(msgs.len(), 7, "{msgs:#?}");
         assert_eq!(
             pointer(0),
             PointerChange {
@@ -387,19 +408,73 @@ mod tests {
                 ..Default::default()
             }
         );
-        // A button change is not merged into the moves before it, nor a wheel turn.
-        assert_eq!(pointer(1).motion, PointerMotion::To { x: 4, y: 4 });
+        // A press is kept where it happened: the moves after it are a run of their
+        // own, not merged into it; nor is a wheel turn.
+        assert_eq!(pointer(1).motion, PointerMotion::To { x: 3, y: 3 });
         assert_eq!(pointer(1).buttons, POINTER_LEFT);
-        assert_eq!(pointer(2).wheel, -1);
-        assert_eq!(pointer(3).motion, PointerMotion::To { x: 5, y: 5 });
+        assert_eq!(pointer(2).motion, PointerMotion::To { x: 5, y: 5 });
+        assert_eq!(pointer(2).buttons, POINTER_LEFT);
+        assert_eq!(pointer(3).wheel, -1);
+        assert_eq!(pointer(4).motion, PointerMotion::To { x: 6, y: 6 });
         // Keys keep their place among the moves; a key with code 0 is dropped.
-        assert!(matches!(msgs[4], Message::KeyInput { vm: 7, key } if key.code == b'a'));
+        assert!(matches!(msgs[5], Message::KeyInput { vm: 7, key } if key.code == b'a'));
         // Reserved button bits never reach the wire.
-        assert_eq!(pointer(5).motion, PointerMotion::To { x: 7, y: 7 });
-        assert_eq!(pointer(5).buttons, POINTER_LEFT);
+        assert_eq!(pointer(6).motion, PointerMotion::To { x: 8, y: 8 });
+        assert_eq!(pointer(6).buttons, POINTER_LEFT);
+        assert_eq!(held, Some(POINTER_LEFT));
         for msg in &msgs {
             msg.check().unwrap();
         }
+    }
+
+    /// A press and a release, each followed by moves in the same batch, reach the guest
+    /// where they happened, also when the batch before is not known.
+    #[test]
+    fn a_drag_starts_and_ends_where_it_did() {
+        let mut held = None;
+        let msgs = input_messages(
+            7,
+            &mut held,
+            vec![
+                to(10, 10, 0),
+                to(10, 10, POINTER_LEFT),
+                to(100, 80, POINTER_LEFT),
+                to(200, 150, POINTER_LEFT),
+                to(200, 150, 0),
+                to(250, 160, 0),
+                to(300, 300, 0),
+            ],
+        );
+        let got: Vec<(PointerMotion, u8)> = msgs
+            .iter()
+            .map(|m| (pointer_of(m).motion, pointer_of(m).buttons))
+            .collect();
+        let at = |x, y, b| (PointerMotion::To { x, y }, b);
+        assert_eq!(
+            got,
+            [
+                at(10, 10, 0),
+                at(10, 10, POINTER_LEFT),
+                at(200, 150, POINTER_LEFT),
+                at(200, 150, 0),
+                at(300, 300, 0)
+            ]
+        );
+
+        // `held` carries over: a press that opens the next batch is kept too.
+        let msgs = input_messages(7, &mut held, vec![to(5, 5, POINTER_LEFT), to(6, 6, POINTER_LEFT)]);
+        let got: Vec<(PointerMotion, u8)> = msgs
+            .iter()
+            .map(|m| (pointer_of(m).motion, pointer_of(m).buttons))
+            .collect();
+        assert_eq!(got, [at(5, 5, POINTER_LEFT), at(6, 6, POINTER_LEFT)]);
+        // Moves with the button held, from the start of a batch, are one run.
+        let msgs = input_messages(7, &mut held, vec![to(7, 7, POINTER_LEFT), to(8, 8, POINTER_LEFT)]);
+        let got: Vec<(PointerMotion, u8)> = msgs
+            .iter()
+            .map(|m| (pointer_of(m).motion, pointer_of(m).buttons))
+            .collect();
+        assert_eq!(got, [at(8, 8, POINTER_LEFT)]);
     }
 
     #[test]

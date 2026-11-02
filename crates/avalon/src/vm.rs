@@ -31,8 +31,9 @@
 //! machine ran since its last look. A viewer that attaches is sent the screen as it
 //! was last captured (with `ScreenAttached`, under the lock), and the thread's next
 //! look brings it, like everyone else, up to date. When the machine ends (stopped,
-//! exited) the thread captures the screen one last time, so later viewers see its last
-//! frame.
+//! exited) the thread captures the screen one last time, before the state change, so
+//! viewers have the last frame by the time they hear of it, and later viewers are sent
+//! it too.
 //!
 //! Keys and pointer changes from viewers queue here (at most [`MAX_INPUT_QUEUE`] of
 //! each) and the thread hands them to the machine's keyboard and pointer devices
@@ -120,6 +121,9 @@ struct Inner {
     busy: bool,
     /// Something the thread should look at before it sleeps again (input arrived).
     kick: bool,
+    /// A `StopVm` waits for the thread: it captures the screen one last time, then
+    /// moves the VM to stopped, so viewers get the last frame before the state change.
+    stopping: bool,
     /// The UART's receiver. Bytes sent before the VM starts wait for it.
     input: Option<Sender<u8>>,
     scrollback: VecDeque<u8>,
@@ -221,6 +225,7 @@ impl Vm {
                 machine: Some(machine),
                 busy: false,
                 kick: false,
+                stopping: false,
                 input: Some(input),
                 scrollback: VecDeque::new(),
                 consoles: Vec::new(),
@@ -266,6 +271,12 @@ impl Vm {
     /// How many clients are attached to the screen.
     pub fn viewer_count(&self) -> usize {
         self.lock().viewers.len()
+    }
+
+    /// How many keys, and how many pointer changes, wait for the machine.
+    pub fn queued_input(&self) -> (usize, usize) {
+        let inner = self.lock();
+        (inner.keys.len(), inner.pointer.len())
     }
 
     pub fn summary(&self) -> VmSummary {
@@ -360,13 +371,24 @@ impl Vm {
 
     /// created, running or paused → stopped. The machine is dropped (by the thread,
     /// which ends); the VM keeps its scrollback, step count and RAM budget until it is
-    /// destroyed.
+    /// destroyed. A machine that has run is stopped by its thread, between two slices:
+    /// it sends the viewers the last frame, then the state change, as an exit does.
     pub fn stop(&self) -> Result<(), Fail> {
         let mut inner = self.lock();
         match inner.state {
-            VmState::Created | VmState::Running | VmState::Paused => {
+            VmState::Created => {
                 inner.machine = None;
                 self.set_state(&mut inner, VmState::Stopped);
+                Ok(())
+            }
+            VmState::Running | VmState::Paused => {
+                inner.stopping = true;
+                self.wake.notify_all();
+                // Until the thread has stopped the VM (or the VM is being destroyed, or
+                // its thread crashed, which stops it too).
+                while matches!(inner.state, VmState::Running | VmState::Paused) && !inner.gone {
+                    inner = self.wait(inner);
+                }
                 drop(self.settle(inner));
                 Ok(())
             }
@@ -552,6 +574,12 @@ impl Vm {
                         self.last_look(&mut inner, &machine);
                         return;
                     }
+                    if inner.stopping {
+                        // `stop` waits for this: the last frame, then the state change.
+                        self.last_look(&mut inner, &machine);
+                        self.set_state(&mut inner, VmState::Stopped);
+                        return;
+                    }
                     if inner.state == VmState::Running {
                         break;
                     }
@@ -608,7 +636,14 @@ impl Vm {
                 // the time they hear the program has ended.
                 self.last_look(&mut inner, &machine);
                 if !inner.gone && matches!(inner.state, VmState::Running | VmState::Paused) {
-                    self.set_state(&mut inner, VmState::Exited(code));
+                    // A stop asked for during the slice wins, as it would have had it
+                    // come a step earlier.
+                    let end = if inner.stopping {
+                        VmState::Stopped
+                    } else {
+                        VmState::Exited(code)
+                    };
+                    self.set_state(&mut inner, end);
                 }
                 return;
             }
@@ -625,7 +660,7 @@ impl Vm {
                 if let Some(due) = self.screen_due(&inner) {
                     nap = nap.min(due.saturating_duration_since(Instant::now()));
                 }
-                if inner.state == VmState::Running && !inner.kick && !inner.gone {
+                if inner.state == VmState::Running && !inner.kick && !inner.gone && !inner.stopping {
                     drop(self.wake.wait_timeout(inner, nap));
                 }
             }

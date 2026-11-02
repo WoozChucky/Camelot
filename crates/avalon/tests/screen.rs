@@ -31,6 +31,22 @@ fn exited(vm: u32) -> Message {
     }
 }
 
+fn stopped(vm: u32) -> Message {
+    Message::VmStateChanged {
+        vm,
+        state: VmState::Stopped,
+    }
+}
+
+/// Waits until a request on the viewer's connection is answered: the server has
+/// handled everything the viewer sent before it.
+fn sync(viewer: &mut Viewer) {
+    assert_eq!(
+        viewer.request(&Message::Ping { token: 9 }),
+        Message::Pong { token: 9 }
+    );
+}
+
 /// Turns the display on, then counts into the first pixel forever: a screen that
 /// changes all the time, a little.
 fn pixel_counter() -> Vec<u8> {
@@ -165,6 +181,17 @@ fn a_busy_screen_is_rate_limited() {
     let paused = viewer.rects.len();
     viewer.idle(Duration::from_millis(300));
     assert_eq!(viewer.rects.len(), paused, "a paused VM's screen does not change");
+
+    // And it did come: stopping the VM, which captures its screen one last time,
+    // finds nothing the viewer has not been sent already.
+    rt.request_ok(&Message::StopVm { vm: VmRef::Id(id) }).unwrap();
+    viewer.wait_for_event(stopped(id));
+    viewer.idle(Duration::from_millis(100));
+    assert_eq!(
+        viewer.rects.len(),
+        paused,
+        "the paused VM's last pixels had reached the viewer"
+    );
     server.stop().unwrap();
 }
 
@@ -204,6 +231,161 @@ fn a_viewer_that_stops_reading_is_held_back_not_cut_off() {
     );
     let colour = screen.pixel(0, 0);
     assert_ne!(colour, 0);
+    server.stop().unwrap();
+}
+
+/// A viewer that fell behind is sent one full frame once it has caught up, which
+/// gives it the screen the other viewers have; here it catches up while the VM is
+/// paused, so after the pause nothing else could repaint what it missed.
+#[test]
+fn a_viewer_held_back_catches_up_with_a_full_frame() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "fill", profile(1, None), screen_filler());
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    let mut conn = connect(&server);
+    let Ok(Message::ScreenAttached { width, height, .. }) =
+        conn.request(&Message::ScreenAttach { vm: VmRef::Id(id) })
+    else {
+        panic!("attach")
+    };
+    // Not reading: held back.
+    std::thread::sleep(Duration::from_millis(1500));
+    rt.request_ok(&Message::PauseVm { vm: VmRef::Id(id) }).unwrap();
+    // The screen the paused VM shows, as a viewer that kept up has it.
+    let mut late = Viewer::attach(&server, VmRef::Id(id));
+    late.idle(Duration::from_millis(200));
+
+    let mut screen = Screen::new(width, height);
+    let mut paused = false;
+    let mut full_after_pause = false;
+    let start = Instant::now();
+    while !(full_after_pause && screen == late.screen) {
+        assert!(
+            start.elapsed() < SLOW,
+            "paused {paused}, full frame {full_after_pause}"
+        );
+        let msg = conn.recv().unwrap();
+        match msg {
+            Message::ScreenFrame { .. } => {
+                let rect = screen.apply_frame(&msg).unwrap();
+                full_after_pause |= paused && rect == screen.bounds();
+            }
+            Message::VmStateChanged {
+                state: VmState::Paused,
+                ..
+            } => paused = true,
+            _ => {}
+        }
+    }
+    server.stop().unwrap();
+}
+
+/// Stopping a VM sends its viewers its last frame before the state change, as an exit
+/// does: a viewer that ends when it hears the VM stopped holds its last screen.
+#[test]
+fn a_stopped_vm_sends_its_last_frame_first() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "fill", profile(1, None), screen_filler());
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    let mut viewer = Viewer::attach(&server, VmRef::Id(id));
+    viewer.idle(Duration::from_millis(150));
+    rt.request_ok(&Message::StopVm { vm: VmRef::Id(id) }).unwrap();
+    viewer.wait_for_event(stopped(id));
+    let frames = viewer.rects.len();
+    let late = Viewer::attach(&server, VmRef::Id(id));
+    assert!(
+        late.screen == viewer.screen,
+        "the last frame came before the state change"
+    );
+    viewer.idle(Duration::from_millis(100));
+    assert_eq!(viewer.rects.len(), frames, "and nothing after it");
+    server.stop().unwrap();
+}
+
+/// A display the guest has turned off streams as black, whatever its VRAM holds.
+#[test]
+fn a_display_that_is_off_is_black() {
+    // Draws white with the display off; turns it on, draws, turns it off again.
+    let program = guest(
+        "
+    .globl _start
+_start:
+    li    t0, 0x30000000
+    li    t2, 0x31000000
+    li    t3, 0xffffff
+    sw    t3, 0(t2)
+    li    t1, 1
+    sw    t1, 0x10(t0)
+    sw    t3, 4(t2)
+    sw    zero, 0x10(t0)
+    xcal.halt zero
+",
+    );
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "dark", profile(1, None), program);
+    let mut viewer = Viewer::attach(&server, VmRef::Id(id));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    viewer.wait_for_event(exited(id));
+    assert!(viewer.screen.pixels().iter().all(|&b| b == 0), "black");
+    let late = Viewer::attach(&server, VmRef::Id(id));
+    assert!(late.screen.pixels().iter().all(|&b| b == 0), "black");
+    server.stop().unwrap();
+}
+
+/// Input for a VM that is created or paused waits for it, up to `MAX_INPUT_QUEUE`
+/// keys and as many pointer changes; past that, and once the VM has ended, input is
+/// dropped.
+#[test]
+fn input_waits_up_to_a_limit_and_not_after_the_end() {
+    use avalon::MAX_INPUT_QUEUE;
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "kbd", profile(1, None), example("kbd-echo"));
+    let mut console = Console::attach(&server, VmRef::Id(id));
+    let mut viewer = Viewer::attach(&server, VmRef::Id(id));
+    let queued = || {
+        let debug = server.debug_vm(id).unwrap();
+        (debug.keys, debug.pointer)
+    };
+    let to = |x| PointerChange {
+        motion: PointerMotion::To { x, y: 0 },
+        buttons: 0,
+        wheel: 0,
+    };
+
+    // Before the start: waits for it.
+    viewer.key(key(b'a', false));
+    sync(&mut viewer);
+    assert_eq!(queued(), (1, 0));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    console.wait_for("a");
+
+    // Paused: waits, up to the limit.
+    rt.request_ok(&Message::PauseVm { vm: VmRef::Id(id) }).unwrap();
+    for i in 0..MAX_INPUT_QUEUE + 20 {
+        viewer.key(key(b'b', false));
+        viewer.pointer(to(i as u32));
+    }
+    sync(&mut viewer);
+    assert_eq!(queued(), (MAX_INPUT_QUEUE, MAX_INPUT_QUEUE));
+    rt.request_ok(&Message::ResumeVm { vm: VmRef::Id(id) }).unwrap();
+    wait_until("the machine to take the input", SLOW, || queued() == (0, 0));
+    // The keyboard's own FIFO keeps the first 64 of them.
+    let echoed = format!("a{}", "b".repeat(64));
+    assert_eq!(console.wait_for(&echoed), echoed);
+    console.idle(Duration::from_millis(100));
+    assert_eq!(String::from_utf8_lossy(&console.output), echoed);
+
+    // Ended: dropped.
+    viewer.key(key(0x1b, false));
+    viewer.wait_for_event(exited(id));
+    viewer.key(key(b'c', false));
+    viewer.pointer(to(1));
+    sync(&mut viewer);
+    assert_eq!(queued(), (0, 0), "nothing waits for a VM that has ended");
     server.stop().unwrap();
 }
 
