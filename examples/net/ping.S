@@ -13,7 +13,7 @@
 # The grail command runs one machine, so nobody answers there; with a capture of the
 # card, the frame it sent is in the file (Wireshark shows it as an "IEEE 802a" frame):
 #
-#   grail --net hub --pcap ping.pcap examples/net/ping.elf
+#   grail --net hub --pcap ping.pcap examples/net/net-ping.elf
 #
 # Exit code 0 when an answer came, 1 without a network card, 2 if sending failed or
 # the answer's descriptor has an error status, 3 if no answer came in time.

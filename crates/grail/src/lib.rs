@@ -83,8 +83,8 @@ impl Machine {
                 config.nets.len() + net_backends.len()
             ));
         }
-        if let Some((mac, _)) = net_backends.iter().find(|(mac, _)| mac.is_multicast()) {
-            return Err(format!("{mac} is a group address, not a card's"));
+        for (mac, _) in &net_backends {
+            mac.check_card()?;
         }
         if config.disks.len() + backends.len() > MAX_DISKS {
             return Err(format!(
@@ -244,9 +244,12 @@ impl Machine {
                 if skipped > 0 {
                     // Network cards poll by the step: the skipped ones count too, or a
                     // card would poll only every few hundred batches while the guest idles.
-                    let ram = &mut self.cpu.bus.ram;
-                    for nic in &mut self.cpu.bus.nets {
-                        nic.skip(skipped, ram);
+                    // What they receive breaks an LR/SC reservation, as in `Cpu::step`.
+                    let (bus, reservation) = (&mut self.cpu.bus, &mut self.cpu.reservation);
+                    for nic in &mut bus.nets {
+                        nic.skip(skipped, &mut bus.ram, &mut |paddr, len| {
+                            reservation.snoop(paddr, len)
+                        });
                     }
                 }
                 n += skipped;

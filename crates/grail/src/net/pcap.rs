@@ -200,6 +200,26 @@ mod tests {
         assert!(cap.link_up());
     }
 
+    /// The file is complete after every frame, while the capture is still open: a
+    /// machine that stops without dropping its cards (or a reader following the file)
+    /// loses nothing to the write buffer.
+    #[test]
+    fn a_capture_file_is_flushed_after_every_frame() {
+        let path = std::env::temp_dir().join(format!("grail-pcap-flush-{}.pcap", std::process::id()));
+        let hub = Hub::new();
+        let mut cap = Pcap::create(&path, Box::new(hub.attach())).unwrap();
+        let mut peer = hub.attach();
+        let on_disk = || std::fs::read(&path).unwrap().len();
+        assert_eq!(on_disk(), 24, "the header");
+        cap.send(&[1; 14]).unwrap();
+        assert_eq!(on_disk(), 24 + 16 + 14, "the frame sent");
+        peer.send(&[2; 20]).unwrap();
+        assert_eq!(cap.recv(), Some(vec![2; 20]));
+        assert_eq!(on_disk(), 24 + 16 + 14 + 16 + 20, "the frame received");
+        drop(cap);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn long_frames_are_cut_to_the_snap_length() {
         let frame = vec![7; PCAP_SNAPLEN as usize + 10];

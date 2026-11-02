@@ -166,10 +166,11 @@ impl Bus {
     /// Samples every device's interrupt line into the PLIC. Called once per step,
     /// before the hart looks at `mip`. Network cards poll their backends from here
     /// (every [`crate::net::POLL_STEPS`] steps), so received frames land in RAM between
-    /// two instructions.
-    pub fn update_interrupts(&mut self) {
+    /// two instructions; `dma` hears of each RAM range they write (physical address,
+    /// length), for the hart's LR/SC reservation.
+    pub fn update_interrupts(&mut self, dma: &mut dyn FnMut(u32, u32)) {
         for (i, nic) in self.nets.iter_mut().enumerate() {
-            nic.tick(&mut self.ram);
+            nic.tick(&mut self.ram, dma);
             self.plic.set_level(NET_IRQ + i as u32, nic.irq());
         }
         let uart = self.uart.irq();
@@ -548,7 +549,7 @@ mod tests {
         assert_eq!(peer.recv(), Some(frame.clone()));
         // Card 0 is on the same hub, and gets it at its next poll: no ring, so dropped.
         for _ in 0..net::POLL_STEPS {
-            bus.update_interrupts();
+            bus.update_interrupts(&mut |_, _| {});
         }
         assert_eq!(bus.read(NET_BASE + net::REG_RX_DROPPED, 4), Ok(1));
         // Card 1's line reaches the PLIC as source NET_IRQ + 1.
@@ -612,7 +613,7 @@ mod tests {
         assert_eq!(bus.ram[8 + SECTOR_SIZE], 0);
 
         // Its line reaches the PLIC as source BLK_IRQ + 1.
-        bus.update_interrupts();
+        bus.update_interrupts(&mut |_, _| {});
         assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << (BLK_IRQ + 1)));
 
         // Words only; nothing past the last disk; not memory.
@@ -740,11 +741,11 @@ mod tests {
 
         // Its line reaches the PLIC as source PTR_IRQ once enabled.
         bus.ptr.push(PointerInput::move_to(1, 1));
-        bus.update_interrupts();
+        bus.update_interrupts(&mut |_, _| {});
         assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(0));
         bus.write(PTR_BASE + ptr::REG_CTRL, 4, ptr::CTRL_IRQ_ENABLE)
             .unwrap();
-        bus.update_interrupts();
+        bus.update_interrupts(&mut |_, _| {});
         assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << PTR_IRQ));
 
         // Words only, nothing popped by a faulting access; the page ends the range.

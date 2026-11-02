@@ -3,6 +3,7 @@
 //! byte for byte against a committed golden file; cards in the sysinfo device table;
 //! frames dropped while no buffer is free; and the `--net` / `--pcap` flags.
 
+use grail::bus::{NET_BASE, RAM_BASE};
 use grail::net::{self, Hub, MacAddr, NetBackend, Pcap};
 use grail::{Machine, MachineConfig, NetConfig, RunResult};
 use std::io::{self, Write};
@@ -118,7 +119,9 @@ fn ping_and_pong_on_two_threads() {
 }
 
 /// With a real-time clock, an idle machine skips its `wfi` ticks in bulk; its card still
-/// polls on time, so pong (sleeping in `wfi`) answers a frame from the host promptly.
+/// polls on time, so pong (sleeping in `wfi`) answers a frame from the host. The 5 s
+/// bound only catches a lost frame; [`paced_idle_cards_poll_and_break_reservations`]
+/// checks the polling itself, deterministically.
 #[test]
 fn paced_pong_answers_a_host_frame() {
     let hub = Hub::new();
@@ -154,6 +157,131 @@ fn paced_pong_answers_a_host_frame() {
         out.contains("from 02:00:00:00:00:01, type 0x88b5: Hello from the host\n"),
         "{out}"
     );
+}
+
+// Hand-encoded instructions, for the tests below that drive the hart directly.
+const T0: usize = 5;
+const T1: usize = 6;
+const T3: usize = 28;
+const A0: usize = 10;
+const A1: usize = 11;
+
+/// `lr.w rd, (rs1)` / `sc.w rd, rs2, (rs1)`: funct5, aq/rl clear, funct3 = 010.
+fn lr_w(rd: usize, rs1: usize) -> u32 {
+    0b00010 << 27 | (rs1 as u32) << 15 | 2 << 12 | (rd as u32) << 7 | 0b0101111
+}
+fn sc_w(rd: usize, rs2: usize, rs1: usize) -> u32 {
+    0b00011 << 27 | (rs2 as u32) << 20 | (rs1 as u32) << 15 | 2 << 12 | (rd as u32) << 7 | 0b0101111
+}
+/// `addi t1, t1, -1`; `bnez t1, .-4`; `wfi`; `j .`.
+const DEC_T1: u32 = 0xfff3_0313;
+const BNEZ_T1_BACK: u32 = 0xfe03_1ee3;
+const WFI: u32 = 0x1050_0073;
+const HALT: u32 = 0x0000_006f;
+
+/// Where [`bare_machine`] keeps the receive ring (one descriptor) and its 2 KiB buffer.
+const RX_RING: u32 = RAM_BASE + 0x1000;
+const RX_BUF: u32 = RAM_BASE + 0x2000;
+
+/// A machine with `code` at `RAM_BASE` (in M-mode, no boot ROM) and its first card's
+/// receive ring set up with one buffer.
+fn bare_machine(config: MachineConfig, code: &[u32]) -> Machine {
+    let mut m = Machine::with_devices(config, Vec::new(), Vec::new()).unwrap();
+    let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let bus = &mut m.cpu.bus;
+    bus.load(RAM_BASE, &bytes).unwrap();
+    bus.write(RX_RING, 4, RX_BUF).unwrap();
+    bus.write(RX_RING + 4, 4, 0x800).unwrap();
+    bus.write(NET_BASE + net::REG_RX_BASE, 4, RX_RING).unwrap();
+    bus.write(NET_BASE + net::REG_RX_SIZE, 4, 1).unwrap();
+    bus.write(NET_BASE + net::REG_RX_TAIL, 4, 1).unwrap();
+    m.cpu.pc = RAM_BASE;
+    m
+}
+
+fn word(m: &mut Machine, addr: u32) -> u32 {
+    m.cpu.bus.read(addr, 4).unwrap()
+}
+
+/// A frame that lands in RAM between `lr.w` and `sc.w` is a write like a hart's store
+/// (spec section 4.1): if it touches the reserved word, the `sc.w` fails instead of
+/// overwriting what the card wrote. Elsewhere, it leaves the reservation alone.
+#[test]
+fn received_frames_break_a_reservation() {
+    // lr.w; a loop of 2 * POLL_STEPS steps, so the card polls in it; sc.w.
+    let code = [lr_w(T0, A0), DEC_T1, BNEZ_T1_BACK, sc_w(T3, A1, A0), HALT];
+    const SC: u32 = 0x1111_1111;
+    let cases = [
+        // (reserved word, a frame arrives, sc.w succeeds, the word afterwards)
+        (RX_BUF, true, false, 0xabab_abab),
+        (RX_BUF + 56, true, false, 0xabab_abab), // the frame's last word
+        (RX_RING + 4, true, false, 60),          // the descriptor's length and status
+        (RX_BUF + 60, true, true, SC),           // past the frame
+        (RX_RING, true, true, SC),               // the descriptor's address: only read
+        (RX_BUF, false, true, SC),
+    ];
+    for (addr, frame, stores, want) in cases {
+        let hub = Hub::new();
+        let mut m = bare_machine(on_hub(&hub), &code);
+        let mut peer = hub.attach();
+        if frame {
+            peer.send(&[0xab; 60]).unwrap();
+        }
+        m.cpu.x[A0] = addr;
+        m.cpu.x[A1] = SC;
+        m.cpu.x[T1] = net::POLL_STEPS;
+        for _ in 0..10_000 {
+            if m.cpu.pc == RAM_BASE + 16 {
+                break;
+            }
+            m.cpu.step();
+        }
+        assert_eq!(m.cpu.pc, RAM_BASE + 16, "{addr:#x}: no trap");
+        let head = word(&mut m, NET_BASE + net::REG_RX_HEAD);
+        assert_eq!(head, frame as u32, "{addr:#x}: the frame arrived in the loop");
+        assert_eq!(m.cpu.x[T3], !stores as u32, "{addr:#x}: sc.w result");
+        assert_eq!(word(&mut m, addr), want, "{addr:#x}: what the card wrote stays");
+    }
+}
+
+/// With a real-time clock, a hart parked in `wfi` has its idle ticks skipped in bulk
+/// (`Cpu::idle`). Its card must still poll on time among them, not only every few
+/// hundred batches, and what it receives there breaks a reservation too.
+#[test]
+fn paced_idle_cards_poll_and_break_reservations() {
+    let hub = Hub::new();
+    let config = MachineConfig {
+        clock_hz: Some(1_000_000),
+        ..on_hub(&hub)
+    };
+    // lr.w; wfi until the timer (tick 3000, interrupts off, so no trap); sc.w.
+    let mut m = bare_machine(config, &[lr_w(T0, A0), WFI, sc_w(T3, A1, A0), HALT]);
+    let mut peer = hub.attach();
+    peer.send(&[0xab; 60]).unwrap();
+    m.cpu.x[A0] = RX_BUF;
+    m.cpu.x[A1] = 0x1111_1111;
+    m.cpu.csr.mie = 1 << 7; // MTIE
+    m.cpu.bus.clint.mtimecmp = 3000;
+
+    // The first batch is 1000 ticks (1 ms): lr.w, wfi, then 997 skipped at once and one
+    // more step. Only 3 ticks ran one by one, fewer than POLL_STEPS: the card polls only
+    // because the skipped ticks count.
+    assert_eq!(m.run_for(u64::MAX, &mut |_| {}), 1000);
+    assert_eq!(m.cpu.pc, RAM_BASE + 8, "in wfi");
+    assert_eq!(word(&mut m, NET_BASE + net::REG_RX_HEAD), 1, "the card polled");
+
+    for _ in 0..1000 {
+        if m.cpu.pc == RAM_BASE + 12 {
+            break;
+        }
+        if let Some(d) = m.pace_delay() {
+            std::thread::sleep(d);
+        }
+        m.run_for(u64::MAX, &mut |_| {});
+    }
+    assert_eq!(m.cpu.pc, RAM_BASE + 12, "woke up at the timer and ran sc.w");
+    assert_eq!(m.cpu.x[T3], 1, "sc.w failed");
+    assert_eq!(word(&mut m, RX_BUF), 0xabab_abab);
 }
 
 /// A writer the test can still read after handing it over.
@@ -387,6 +515,14 @@ fn bad_cards_are_machine_errors() {
     .err()
     .unwrap();
     assert_eq!(e, "ff:ff:ff:ff:ff:ff is a group address, not a card's");
+    let e = Machine::with_devices(
+        MachineConfig::default(),
+        Vec::new(),
+        vec![(MacAddr([0, 0x1b, 0x21, 1, 2, 3]), card().1)],
+    )
+    .err()
+    .unwrap();
+    assert!(e.contains("00:1b:21:01:02:03 is not locally administered"), "{e}");
     let config = MachineConfig {
         nets: vec![
             NetConfig::hub(&hub),
@@ -469,6 +605,10 @@ fn cli_net_errors() {
         "is a group address",
     );
     fails(&["--net", "hub,mac=nope", &elf], "is not a MAC address");
+    fails(
+        &["--net", "hub,mac=00:11:22:33:44:55", &elf],
+        "is not locally administered",
+    );
     fails(&[&elf, "--net"], "--net needs a value");
     fails(
         &["--pcap", "x.pcap", "--net", "hub", &elf],

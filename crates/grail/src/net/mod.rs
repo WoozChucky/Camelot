@@ -143,6 +143,21 @@ impl MacAddr {
         self.0[0] & 2 != 0
     }
 
+    /// Whether a card may have this address: an individual one (not a group address), and
+    /// locally administered, so it never clashes with a real card's on a network the
+    /// machine reaches through the host. The error says what is wrong.
+    pub fn check_card(&self) -> Result<(), String> {
+        if self.is_multicast() {
+            Err(format!("{self} is a group address, not a card's"))
+        } else if !self.is_local() {
+            Err(format!(
+                "{self} is not locally administered (bit 1 of the first byte, as in 02:..)"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Parses `xx:xx:xx:xx:xx:xx` (or with `-`), hex digits in either case.
     pub fn parse(s: &str) -> Result<MacAddr, String> {
         let bad = || format!("'{s}' is not a MAC address (like 02:ca:00:00:00:01)");
@@ -267,16 +282,17 @@ impl NetDevice {
     }
 
     /// Called once per machine step: polls the backend every [`POLL_STEPS`] steps.
-    pub fn tick(&mut self, ram: &mut [u8]) {
-        self.skip(1, ram);
+    /// `dma` hears of every RAM write the card makes (see [`NetDevice::poll`]).
+    pub fn tick(&mut self, ram: &mut [u8], dma: &mut dyn FnMut(u32, u32)) {
+        self.skip(1, ram, dma);
     }
 
     /// Lets `steps` steps pass at once (a paced machine idling in `wfi` skips its idle
     /// ticks in bulk): polls once if a poll fell due among them.
-    pub fn skip(&mut self, steps: u64, ram: &mut [u8]) {
+    pub fn skip(&mut self, steps: u64, ram: &mut [u8], dma: &mut dyn FnMut(u32, u32)) {
         if steps >= self.countdown as u64 {
             self.countdown = POLL_STEPS;
-            self.poll(ram);
+            self.poll(ram, dma);
         } else {
             self.countdown -= steps as u32;
         }
@@ -284,22 +300,28 @@ impl NetDevice {
 
     /// Takes what the backend received (up to [`POLL_BUDGET`] frames) into the receive
     /// ring, dropping what does not fit.
-    pub fn poll(&mut self, ram: &mut [u8]) {
+    ///
+    /// No hart store causes these writes, so the hart's LR/SC reservation would not see
+    /// them: `dma` is called with the physical address and length of every range the
+    /// card writes (a frame into its buffer, a descriptor's length and status), and the
+    /// machine passes them on to [`crate::cpu::Reservation::snoop`] (spec section 4.1).
+    pub fn poll(&mut self, ram: &mut [u8], dma: &mut dyn FnMut(u32, u32)) {
         for _ in 0..POLL_BUDGET {
             match self.backend.recv() {
-                Some(frame) => self.receive(&frame, ram),
+                Some(frame) => self.receive(&frame, ram, dma),
                 None => break,
             }
         }
     }
 
     /// Delivers one frame into the descriptor at `RX_HEAD`.
-    fn receive(&mut self, frame: &[u8], ram: &mut [u8]) {
+    fn receive(&mut self, frame: &[u8], ram: &mut [u8], dma: &mut dyn FnMut(u32, u32)) {
         if !(MIN_FRAME..=MAX_FRAME).contains(&frame.len()) || self.rx.pending() == 0 {
             self.rx_dropped = self.rx_dropped.wrapping_add(1);
             return;
         }
-        let Some(desc) = ram_range(ram, self.rx.desc(self.rx.head), DESC_SIZE as u64) else {
+        let desc_addr = self.rx.desc(self.rx.head);
+        let Some(desc) = ram_range(ram, desc_addr, DESC_SIZE as u64) else {
             self.ring_error(error::BAD_RING);
             self.rx_dropped = self.rx_dropped.wrapping_add(1);
             return;
@@ -310,6 +332,7 @@ impl NetDevice {
             Some(_) if (cap as usize) < frame.len() => status::TOO_SMALL,
             Some(buf) => {
                 ram[buf.start..buf.start + frame.len()].copy_from_slice(frame);
+                dma(addr, frame.len() as u32);
                 status::OK
             }
         };
@@ -317,6 +340,8 @@ impl NetDevice {
             self.rx_dropped = self.rx_dropped.wrapping_add(1);
         }
         write_desc_result(&mut ram[desc], frame.len() as u16, st as u16);
+        // The length and status fields; the descriptor is in RAM, so below 2^32.
+        dma(desc_addr as u32 + 4, 4);
         self.rx.head = self.rx.head.wrapping_add(1);
         self.irq_status |= IRQ_RX;
     }

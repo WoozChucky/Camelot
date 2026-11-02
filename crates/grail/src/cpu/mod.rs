@@ -114,7 +114,11 @@ impl Cpu {
     /// Runs one instruction (or takes one interrupt). Time advances by one tick per step.
     pub fn step(&mut self) {
         self.bus.clint.mtime = self.bus.clint.mtime.wrapping_add(1);
-        self.bus.update_interrupts();
+        // A network card may write a received frame into RAM here: like a store, that
+        // breaks a reservation on the words it touches.
+        let reservation = &mut self.reservation;
+        self.bus
+            .update_interrupts(&mut |paddr, len| reservation.snoop(paddr, len));
 
         if let Some(irq) = self.pending_interrupt() {
             self.waiting = false;

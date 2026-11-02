@@ -284,10 +284,8 @@ impl MachineConfig {
             return Err(format!("{} network cards, at most {MAX_NETS}", self.nets.len()));
         }
         for (i, net) in self.nets.iter().enumerate() {
-            if let Some(mac) = net.mac.filter(MacAddr::is_multicast) {
-                return Err(format!(
-                    "network card {i}: {mac} is a group address, not a card's"
-                ));
+            if let Some(mac) = net.mac {
+                mac.check_card().map_err(|e| format!("network card {i}: {e}"))?;
             }
         }
         Ok(())
@@ -518,6 +516,12 @@ mod tests {
         assert_eq!(
             e,
             "network card 1: 01:00:5e:00:00:01 is a group address, not a card's"
+        );
+        let universal = NetConfig::hub(&hub).with_mac(MacAddr([0, 0x11, 0x22, 0x33, 0x44, 0x55]));
+        let e = nets(vec![universal]).validate().unwrap_err();
+        assert_eq!(
+            e,
+            "network card 0: 00:11:22:33:44:55 is not locally administered (bit 1 of the first byte, as in 02:..)"
         );
     }
 

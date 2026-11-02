@@ -396,7 +396,7 @@ fn receive_fills_the_buffer_at_head() {
     let f = frame(60, 0x77);
     wire.arrive(f.clone());
     assert_eq!(r(&d, REG_RX_HEAD), 0, "nothing until the card polls");
-    d.poll(&mut ram);
+    d.poll(&mut ram, &mut |_, _| {});
     assert_eq!(r(&d, REG_RX_HEAD), 1);
     assert_eq!(at(&mut ram, BUFS, 60), &f[..]);
     assert_eq!(at(&mut ram, BUFS + 60, 1), [0], "nothing past the frame");
@@ -410,9 +410,43 @@ fn receive_fills_the_buffer_at_head() {
     w(&mut d, &mut ram, REG_RX_TAIL, 2);
     let long = frame(MAX_FRAME, 3);
     wire.arrive(long.clone());
-    d.poll(&mut ram);
+    d.poll(&mut ram, &mut |_, _| {});
     assert_eq!(desc(&mut ram, RX_RING, 1), (MAX_FRAME as u16, 0));
     assert_eq!(at(&mut ram, end - MAX_FRAME as u32, MAX_FRAME), &long[..]);
+}
+
+/// Receive DMA is not a hart store, so the card reports every range it writes (for the
+/// LR/SC reservation): the frame in its buffer and the descriptor's length and status.
+#[test]
+fn receive_reports_the_ram_it_writes() {
+    let (mut d, wire, mut ram) = setup();
+    rings(&mut d, &mut ram, 4);
+    let tail = give_rx(&mut d, &mut ram, 0, 0);
+    // The second buffer is too small: only its descriptor is written.
+    set_desc(&mut ram, RX_RING, 1, BUFS + 0x800, 10);
+    w(&mut d, &mut ram, REG_RX_TAIL, tail + 1);
+    wire.arrive(frame(60, 1));
+    wire.arrive(frame(60, 2));
+    // No buffer left: dropped without a write.
+    wire.arrive(frame(60, 3));
+    let mut writes = Vec::new();
+    d.poll(&mut ram, &mut |addr, len| writes.push((addr, len)));
+    assert_eq!(
+        writes,
+        [(BUFS, 60), (RX_RING + 4, 4), (RX_RING + DESC_SIZE + 4, 4)]
+    );
+    // Nothing arrives, nothing is written; tick and skip poll the same way.
+    writes.clear();
+    d.skip(POLL_STEPS as u64, &mut ram, &mut |addr, len| {
+        writes.push((addr, len))
+    });
+    assert_eq!(writes, []);
+    give_rx(&mut d, &mut ram, tail + 1, 0);
+    wire.arrive(frame(20, 4));
+    for _ in 0..POLL_STEPS {
+        d.tick(&mut ram, &mut |addr, len| writes.push((addr, len)));
+    }
+    assert_eq!(writes, [(BUFS, 20), (RX_RING + 2 * DESC_SIZE + 4, 4)]);
 }
 
 #[test]
@@ -422,10 +456,14 @@ fn a_full_receive_ring_drops_and_counts() {
     for i in 0..3 {
         wire.arrive(frame(20, i));
     }
-    d.poll(&mut ram);
+    d.poll(&mut ram, &mut |_, _| {});
     assert_eq!(wire.waiting(), 0);
     assert_eq!(r(&d, REG_RX_DROPPED), 3);
-    assert_eq!(r(&d, REG_IRQ_STATUS), 0, "drops do not interrupt");
+    assert_eq!(
+        r(&d, REG_IRQ_STATUS),
+        0,
+        "drops without a descriptor do not interrupt"
+    );
 
     rings(&mut d, &mut ram, 2);
     let mut tail = 0;
@@ -434,7 +472,7 @@ fn a_full_receive_ring_drops_and_counts() {
     for i in 0..5 {
         wire.arrive(frame(20, 10 + i));
     }
-    d.poll(&mut ram);
+    d.poll(&mut ram, &mut |_, _| {});
     assert_eq!(r(&d, REG_RX_HEAD), 2, "two buffers, two frames");
     assert_eq!(r(&d, REG_RX_DROPPED), 6);
     assert_eq!(at(&mut ram, BUFS + 19, 1), [10]);
@@ -444,7 +482,7 @@ fn a_full_receive_ring_drops_and_counts() {
     for round in 0..3u8 {
         tail = give_rx(&mut d, &mut ram, tail, 0);
         wire.arrive(frame(20, 0x40 + round));
-        d.poll(&mut ram);
+        d.poll(&mut ram, &mut |_, _| {});
         assert_eq!(r(&d, REG_RX_HEAD), tail);
         assert_eq!(at(&mut ram, BUFS + 19, 1), [0x40 + round]);
         let slot = (tail - 1) % 2;
@@ -476,7 +514,7 @@ fn bad_receive_descriptors_are_errors_not_panics() {
         wire.arrive(frame(100, i as u8));
     }
     w(&mut d, &mut ram, REG_RX_TAIL, cases.len() as u32);
-    d.poll(&mut ram);
+    d.poll(&mut ram, &mut |_, _| {});
     for (i, &(addr, cap, st)) in cases.iter().enumerate() {
         assert_eq!(
             desc(&mut ram, RX_RING, i as u32),
@@ -507,7 +545,7 @@ fn bad_receive_descriptors_are_errors_not_panics() {
     for len in [0, 1, MIN_FRAME - 1, MAX_FRAME + 1, 9000] {
         wire.arrive(vec![0xee; len]);
     }
-    d.poll(&mut ram);
+    d.poll(&mut ram, &mut |_, _| {});
     assert_eq!(r(&d, REG_RX_HEAD), cases.len() as u32);
     assert_eq!(r(&d, REG_RX_DROPPED), cases.len() as u32 - 1 + 5);
 }
@@ -521,7 +559,7 @@ fn a_receive_ring_outside_ram_drops_frames() {
     w(&mut d, &mut ram, REG_IRQ_ENABLE, IRQ_ERROR);
     wire.arrive(frame(60, 1));
     wire.arrive(frame(60, 2));
-    d.poll(&mut ram);
+    d.poll(&mut ram, &mut |_, _| {});
     assert_eq!(r(&d, REG_ERROR), error::BAD_RING);
     assert_eq!(r(&d, REG_RX_DROPPED), 2);
     assert_eq!(r(&d, REG_RX_HEAD), 0);
@@ -536,10 +574,10 @@ fn polls_take_a_bounded_number_of_frames() {
     for i in 0..POLL_BUDGET + 10 {
         wire.arrive(frame(20, i as u8));
     }
-    d.poll(&mut ram);
+    d.poll(&mut ram, &mut |_, _| {});
     assert_eq!(wire.waiting(), 10, "the rest wait for the next poll");
     assert_eq!(r(&d, REG_RX_DROPPED), POLL_BUDGET as u32);
-    d.poll(&mut ram);
+    d.poll(&mut ram, &mut |_, _| {});
     assert_eq!(wire.waiting(), 0);
 }
 
@@ -550,31 +588,31 @@ fn ticks_poll_every_poll_steps() {
     give_rx(&mut d, &mut ram, 0, 0);
     wire.arrive(frame(20, 1));
     for _ in 0..POLL_STEPS - 1 {
-        d.tick(&mut ram);
+        d.tick(&mut ram, &mut |_, _| {});
     }
     assert_eq!(r(&d, REG_RX_HEAD), 0);
-    d.tick(&mut ram);
+    d.tick(&mut ram, &mut |_, _| {});
     assert_eq!(r(&d, REG_RX_HEAD), 1, "the {POLL_STEPS}th tick polled");
     wire.arrive(frame(20, 2));
     for _ in 0..POLL_STEPS {
-        d.tick(&mut ram);
+        d.tick(&mut ram, &mut |_, _| {});
     }
     assert_eq!(r(&d, REG_RX_DROPPED), 1, "and the next {POLL_STEPS} did again");
 
     // Steps skipped in bulk count like ticks: a poll falls due within them.
     wire.arrive(frame(20, 3));
-    d.skip(POLL_STEPS as u64 - 1, &mut ram);
+    d.skip(POLL_STEPS as u64 - 1, &mut ram, &mut |_, _| {});
     assert_eq!(wire.waiting(), 1);
-    d.skip(1, &mut ram);
+    d.skip(1, &mut ram, &mut |_, _| {});
     assert_eq!(wire.waiting(), 0);
     wire.arrive(frame(20, 4));
-    d.skip(1_000_000, &mut ram);
+    d.skip(1_000_000, &mut ram, &mut |_, _| {});
     assert_eq!(wire.waiting(), 0, "one poll for many steps");
-    d.tick(&mut ram);
+    d.tick(&mut ram, &mut |_, _| {});
     wire.arrive(frame(20, 5));
-    d.skip(POLL_STEPS as u64 - 2, &mut ram);
+    d.skip(POLL_STEPS as u64 - 2, &mut ram, &mut |_, _| {});
     assert_eq!(wire.waiting(), 1, "the count started over after that poll");
-    d.tick(&mut ram);
+    d.tick(&mut ram, &mut |_, _| {});
     assert_eq!(wire.waiting(), 0);
 }
 
@@ -584,7 +622,7 @@ fn interrupt_follows_enable_and_status() {
     rings(&mut d, &mut ram, 4);
     give_rx(&mut d, &mut ram, 0, 0);
     wire.arrive(frame(20, 1));
-    d.poll(&mut ram);
+    d.poll(&mut ram, &mut |_, _| {});
     let tail = queue_tx(&d, &mut ram, 0, 1, &frame(20, 2));
     w(&mut d, &mut ram, REG_TX_TAIL, tail);
     assert_eq!(r(&d, REG_IRQ_STATUS), IRQ_RX | IRQ_TX);
@@ -606,7 +644,7 @@ fn interrupt_follows_enable_and_status() {
     give_rx(&mut d, &mut ram, 1, 1);
     assert!(!d.irq());
     wire.arrive(frame(20, 3));
-    d.poll(&mut ram);
+    d.poll(&mut ram, &mut |_, _| {});
     assert!(d.irq());
     w(&mut d, &mut ram, REG_IRQ_ENABLE, 0);
     assert!(!d.irq());
@@ -637,6 +675,20 @@ fn mac_addresses() {
     assert!(mac.is_local() && !mac.is_multicast());
     assert!(MacAddr::BROADCAST.is_multicast());
     assert!(!MacAddr([0x00, 0x1b, 0x21, 1, 2, 3]).is_local());
+    // A card's address is individual and locally administered.
+    assert_eq!(mac.check_card(), Ok(()));
+    assert!(MacAddr::BROADCAST
+        .check_card()
+        .unwrap_err()
+        .contains("group address"));
+    assert!(MacAddr([0x03, 0, 0, 0, 0, 1])
+        .check_card()
+        .unwrap_err()
+        .contains("group address"));
+    assert!(MacAddr([0x00, 0x1b, 0x21, 1, 2, 3])
+        .check_card()
+        .unwrap_err()
+        .contains("not locally administered"));
     for bad in [
         "",
         "02:ca:00:0a:ff",
