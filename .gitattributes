@@ -9,3 +9,4 @@ tests/riscv-tests/rv32* binary
 *.ld text eol=lf
 *.ast text eol=lf
 kernel/kernel.elf.clang-version text eol=lf
+*.o binary
