@@ -4,7 +4,8 @@
 //! Everything happens on one thread. The CPU runs until the program writes
 //! `FB_PRESENT` or a slice of `SLICE` steps is done; then the window's messages are
 //! pumped and it is redrawn on a present, on a repaint request, or when ~16 ms of
-//! host time have passed since the last redraw (~60 Hz).
+//! host time have passed since the last redraw (~60 Hz). Keys typed into the window
+//! reach the keyboard device at the same points, between slices.
 
 use crate::cpu::Cpu;
 use crate::framebuffer::FrameDumper;
@@ -112,13 +113,17 @@ impl Screen {
         w.draw(fb.enabled().then_some(fb.vram.as_slice()));
     }
 
-    /// Returns false once the window has been closed.
-    fn update(&mut self, m: &Machine, presented: bool) -> bool {
+    /// Pumps the window, hands the keys typed into it to the machine's keyboard, and
+    /// redraws if due. Returns false once the window has been closed.
+    fn update(&mut self, m: &mut Machine, presented: bool) -> bool {
         let Some(w) = &mut self.window else {
             return true;
         };
         if !w.pump() {
             return false;
+        }
+        for key in w.take_keys() {
+            m.key_event(key);
         }
         if presented || w.take_repaint() || self.last_draw.elapsed() >= Self::REFRESH {
             Self::draw(w, m);
@@ -139,6 +144,7 @@ impl Screen {
         w.set_title(&format!("{} ({status}, close to quit)", self.title));
         Self::draw(w, m);
         while w.pump() {
+            w.take_keys(); // nothing runs any more to read them
             if w.take_repaint() {
                 Self::draw(w, m);
             }
@@ -157,7 +163,7 @@ impl Screen {
         Ok(Screen)
     }
 
-    fn update(&mut self, _m: &Machine, _presented: bool) -> bool {
+    fn update(&mut self, _m: &mut Machine, _presented: bool) -> bool {
         true
     }
 

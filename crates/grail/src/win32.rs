@@ -28,9 +28,41 @@ pub const CW_USEDEFAULT: i32 = 0x8000_0000_u32 as i32;
 pub const IDC_ARROW: u16 = 32512;
 
 pub const WM_DESTROY: u32 = 0x0002;
+pub const WM_KILLFOCUS: u32 = 0x0008;
 pub const WM_PAINT: u32 = 0x000f;
 pub const WM_QUIT: u32 = 0x0012;
+pub const WM_NCCREATE: u32 = 0x0081;
+pub const WM_NCDESTROY: u32 = 0x0082;
+pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_KEYUP: u32 = 0x0101;
+pub const WM_SYSKEYDOWN: u32 = 0x0104;
+pub const WM_SYSKEYUP: u32 = 0x0105;
 pub const PM_REMOVE: u32 = 0x0001;
+
+pub const GWLP_USERDATA: i32 = -21;
+
+// Virtual-key codes (winuser.h). Letters and digits are their ASCII uppercase codes.
+pub const VK_BACK: u32 = 0x08;
+pub const VK_TAB: u32 = 0x09;
+pub const VK_RETURN: u32 = 0x0d;
+pub const VK_SHIFT: u32 = 0x10;
+pub const VK_CONTROL: u32 = 0x11;
+pub const VK_MENU: u32 = 0x12;
+pub const VK_ESCAPE: u32 = 0x1b;
+#[cfg(test)]
+pub const VK_SPACE: u32 = 0x20;
+pub const VK_LEFT: u32 = 0x25;
+pub const VK_UP: u32 = 0x26;
+pub const VK_RIGHT: u32 = 0x27;
+pub const VK_DOWN: u32 = 0x28;
+pub const VK_F1: u32 = 0x70;
+pub const VK_F10: u32 = 0x79;
+pub const VK_F12: u32 = 0x7b;
+pub const VK_LCONTROL: u32 = 0xa2;
+pub const VK_RCONTROL: u32 = 0xa3;
+
+/// `ToUnicode` flag: do not change the keyboard state (dead keys), Windows 10 1607+.
+pub const TOUNICODE_KEEP_STATE: u32 = 1 << 2;
 
 pub const BI_RGB: u32 = 0;
 pub const DIB_RGB_COLORS: u32 = 0;
@@ -67,6 +99,22 @@ pub struct RECT {
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
+}
+
+#[repr(C)]
+pub struct CREATESTRUCTW {
+    pub lpCreateParams: *mut c_void,
+    pub hInstance: HINSTANCE,
+    pub hMenu: HMENU,
+    pub hwndParent: HWND,
+    pub cy: i32,
+    pub cx: i32,
+    pub y: i32,
+    pub x: i32,
+    pub style: i32,
+    pub lpszName: *const u16,
+    pub lpszClass: *const u16,
+    pub dwExStyle: u32,
 }
 
 #[repr(C)]
@@ -150,6 +198,21 @@ extern "system" {
     pub fn ReleaseDC(hwnd: HWND, hdc: HDC) -> i32;
     pub fn BeginPaint(hwnd: HWND, ps: *mut PAINTSTRUCT) -> HDC;
     pub fn EndPaint(hwnd: HWND, ps: *const PAINTSTRUCT) -> BOOL;
+    #[cfg(test)]
+    pub fn SendMessageW(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
+    pub fn GetKeyState(vkey: i32) -> i16;
+    pub fn GetKeyboardState(state: *mut u8) -> BOOL;
+    pub fn ToUnicode(vkey: u32, scan: u32, state: *const u8, buf: *mut u16, len: i32, flags: u32) -> i32;
+    #[cfg(target_pointer_width = "64")]
+    pub fn SetWindowLongPtrW(hwnd: HWND, index: i32, value: isize) -> isize;
+    #[cfg(target_pointer_width = "64")]
+    pub fn GetWindowLongPtrW(hwnd: HWND, index: i32) -> isize;
+    #[cfg(target_pointer_width = "32")]
+    #[link_name = "SetWindowLongW"]
+    pub fn SetWindowLongPtrW(hwnd: HWND, index: i32, value: isize) -> isize;
+    #[cfg(target_pointer_width = "32")]
+    #[link_name = "GetWindowLongW"]
+    pub fn GetWindowLongPtrW(hwnd: HWND, index: i32) -> isize;
 }
 
 #[link(name = "gdi32")]
@@ -190,12 +253,14 @@ mod tests {
             assert_eq!(size_of::<WNDCLASSEXW>(), 80);
             assert_eq!(size_of::<MSG>(), 48);
             assert_eq!(size_of::<PAINTSTRUCT>(), 72);
+            assert_eq!(size_of::<CREATESTRUCTW>(), 80);
         }
         #[cfg(target_pointer_width = "32")]
         {
             assert_eq!(size_of::<WNDCLASSEXW>(), 48);
             assert_eq!(size_of::<MSG>(), 32);
             assert_eq!(size_of::<PAINTSTRUCT>(), 64);
+            assert_eq!(size_of::<CREATESTRUCTW>(), 48);
         }
         assert_eq!(size_of::<RECT>(), 16);
         assert_eq!(size_of::<BITMAPINFOHEADER>(), 40);
