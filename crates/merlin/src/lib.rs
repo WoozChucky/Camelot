@@ -1,20 +1,24 @@
 //! merlin: compiles a subset of C into Excalibur assembly for merlin-as.
 //!
-//! Pipeline: [`lexer`] → [`parser`] → [`sema`] (name resolution, type
-//! checking) → [`codegen`]. [`parse`] runs the front end and returns a checked,
-//! typed AST; [`compile`] goes all the way to assembly text. [`types`] has the
-//! C types and their ILP32 layout, [`consteval`] evaluates constant
-//! expressions, and [`abi`] says how arguments and results travel (the RISC-V
-//! ILP32 calling convention).
+//! Pipeline: [`preprocess`] (on the [`lexer`]'s preprocessing tokens) →
+//! [`lexer::finish`] → [`parser`] → [`sema`] (name resolution, type checking)
+//! → [`codegen`]. [`parse_with`] runs the front end and returns a checked,
+//! typed AST; [`compile_with`] goes all the way to assembly text, one
+//! translation unit at a time ([`parse`] and [`compile`] for a source with no
+//! headers). [`types`] has the C types and their ILP32 layout, [`consteval`]
+//! evaluates constant expressions, and [`abi`] says how arguments and results
+//! travel (the RISC-V ILP32 calling convention).
 //!
-//! The language (spec section 10) is a subset of C99 without the preprocessor
-//! and floating point: the integer types (`_Bool`, `char`, `short`, `int`,
-//! `long`, signed and unsigned), `enum`, pointers (to functions too), arrays,
-//! structs and unions (passed and returned by value as clang does), `typedef`,
-//! the `const` and `volatile` qualifiers, global and `static` variables with
-//! initializers, string and character literals, functions with up to 8
-//! parameters (`inline` accepted), every statement (`switch`, `goto` and labels
-//! included), and every C operator.
+//! The language (spec section 10) is a subset of C99 without floating point
+//! and `long long`: the C99 preprocessor, the integer types (`_Bool`, `char`,
+//! `short`, `int`, `long`, signed and unsigned), `enum`, pointers (to
+//! functions too), arrays, structs and unions (passed and returned by value
+//! as clang does), `typedef`, the `const` and `volatile` qualifiers, global
+//! and `static` variables with initializers (designators included), compound
+//! literals, string and character literals, functions with up to 127
+//! parameters and variadic ones (with clang's `__builtin_va_*`; `inline`
+//! accepted), every statement (`switch`, `goto` and labels included), and
+//! every C operator.
 
 pub mod abi;
 pub mod ast;

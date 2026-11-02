@@ -246,6 +246,58 @@ fn compiles_to_assembly() {
 }
 
 #[test]
+fn preprocessor_options() {
+    let t = TempSrc::new(
+        "pp",
+        "main.c",
+        "#include \"defs.h\"\nint main() { return VALUE + TWICE(1); }\n",
+    );
+    let inc = t.dir.join("inc");
+    std::fs::create_dir_all(&inc).unwrap();
+    std::fs::write(
+        inc.join("defs.h"),
+        "#define TWICE(x) ((x) * 2)\n#ifndef VALUE\n#define VALUE 7\n#endif\n",
+    )
+    .unwrap();
+    std::fs::write(t.dir.join("second.c"), "int second(void) { return 2; }\n").unwrap();
+    let flag = |s: &'static str| PathBuf::from(s);
+    // -E prints the preprocessed tokens; -D defines, -U undefines, in order.
+    let out = merlin(&[&flag("-E"), &flag("-I"), &inc, &flag("-DVALUE=40"), &t.file]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert!(text.contains("int main() { return 40 + ((1) * 2); }"), "{text}");
+    let out = merlin(&[
+        &flag("-E"),
+        &flag("-DVALUE=40"),
+        &flag("-UVALUE"),
+        &flag("-I"),
+        &inc,
+        &t.file,
+    ]);
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert!(text.contains("return 7 + ((1) * 2);"), "{text}");
+    // Without -I the header is not found.
+    let out = merlin(&[&t.file]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("1:10: error: 'defs.h' file not found"),
+        "{}",
+        stderr(&out)
+    );
+    // Several inputs: each gets its own .s.
+    let second = t.dir.join("second.c");
+    let out = merlin(&[&flag("-I"), &inc, &t.file, &second]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(t.dir.join("main.s").exists() && t.dir.join("second.s").exists());
+    // An error in a header names the header.
+    std::fs::write(inc.join("defs.h"), "int broken(;\n").unwrap();
+    let out = merlin(&[&flag("-I"), &inc, &t.file]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(err.contains("defs.h:1:12: error:"), "{err}");
+}
+
+#[test]
 fn codegen_errors_use_file_line_col_format() {
     let t = TempSrc::new(
         "codegen-error",
