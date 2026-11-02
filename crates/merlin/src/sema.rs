@@ -1416,8 +1416,13 @@ impl<'a> FnChecker<'a> {
                 return self.sizeof(e, &t);
             }
             ExprKind::SizeofExpr(x) => {
-                // The operand is typed (and checked) but never evaluated.
-                self.expr(x)?;
+                // The operand is typed (and checked) but never evaluated,
+                // so a file-scope compound literal in it is no object:
+                // drop the static variable checking it made.
+                let mark = self.literals.len();
+                let r = self.expr(x);
+                self.literals.truncate(mark);
+                r?;
                 let t = x.ty.clone();
                 return self.sizeof(e, &t);
             }
@@ -3052,6 +3057,21 @@ mod tests {
         assert_eq!(
             err("int *p = (void){0};"),
             "1:10: compound literal has incomplete type 'void'"
+        );
+        // In the unevaluated operand of `sizeof` a literal is no object:
+        // nothing is emitted for it (as with clang), and the numbering
+        // carries on as if it were not there.
+        let p = ok("int n = sizeof (int[]){1, 2, 3}; int *a = (int[]){4}; int k = sizeof (int){5} + 1;");
+        let Some(Item::Decl(literals)) = p.items.last() else {
+            panic!("no literals")
+        };
+        let got: Vec<String> = literals.iter().map(|d| format!("{}: {}", d.name, d.ty)).collect();
+        assert_eq!(got, [".compoundliteral.0: int [1]"]);
+        // Only its address is constant: using its value to initialize a
+        // global (a GNU extension clang accepts) is not supported.
+        assert_eq!(
+            err("int m = (int){5};"),
+            "1:9: initializer element is not a compile-time constant"
         );
     }
 

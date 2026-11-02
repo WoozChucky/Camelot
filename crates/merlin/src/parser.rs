@@ -485,9 +485,12 @@ impl Parser<'_> {
     /// which leaves the `sizeof` for consteval to refuse.
     fn operand_type(&self, e: &Expr) -> Option<Type> {
         match &e.kind {
-            ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::Cast { .. } | ExprKind::CompoundLit { .. } => {
-                Some(e.ty.clone())
-            }
+            ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::Cast { .. } => Some(e.ty.clone()),
+            // `(int[]){1, 2, 3}`: the list completes the array's size.
+            ExprKind::CompoundLit { init, .. } => match &e.ty {
+                Type::Array(elem, None) => Some(Type::array((**elem).clone(), Some(init_len(elem, init)?))),
+                t => Some(t.clone()),
+            },
             ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => Some(Type::UINT),
             ExprKind::Var { name, .. } => match self.lookup_name(name)? {
                 Name::Object(t) => Some(t.clone()),
@@ -2750,6 +2753,15 @@ mod tests {
         assert_eq!(
             sized,
             ["char u[12]", "char v[6]", "char y[3]", "char q[16]", "char r[24]"]
+        );
+        // A compound literal of unknown size gets its size from its list,
+        // as clang does.
+        assert_eq!(
+            globals(
+                "char a[sizeof (int[]){1, 2, 3}]; char b[sizeof (char[]){\"hello\"}];
+                 char c[sizeof (short[2]){1}];"
+            ),
+            ["char a[12]", "char b[6]", "char c[4]"]
         );
 
         // What the parser can't type stays an error.
