@@ -8,8 +8,9 @@ runs the memory self-tests, lists the disks, takes ten timer ticks, tests the
 first disk if there is one and mounts the filesystem on it, and starts the
 shell, a user program, as the first process. User programs run in U-mode, each in its own page table, switching on
 every timer tick; they call the kernel through system calls
-(`docs/camelot-syscalls.md`): console input and output, starting and waiting
-for programs, sleeping, growing the heap. A program that faults is killed and
+(`docs/camelot-syscalls.md`): files, directories, the console and pipes
+through file descriptors, starting and waiting for programs (from `/bin` on
+the disk, or built into the kernel without one), sleeping, growing the heap. A program that faults is killed and
 the kernel says why; a bad pointer passed to a system call is an error, not a
 crash. Faults in the kernel itself panic with the cause, `sepc`, `stval` and a
 register dump.
@@ -75,28 +76,41 @@ cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf
 
 ```
 blk self-test: 16/16 passed
-fs: disk 0 mounted: 2048 blocks (1780 free), 256 inodes (238 free), 21 log blocks
+fs: disk 0 mounted: 2048 blocks (1571 free), 256 inodes (229 free), 21 log blocks
 fs: ls /
-d    1  2      64 .
-d    1  2      64 ..
-f    2  1     355 README
-d    3  1     256 bin
-fs: /bin holds 14 of the kernel's 14 programs
+d    1  3      80 .
+d    1  3      80 ..
+f    2  1     410 README
+d    3  1      48 dev
+d    5  1     368 bin
+fs: /bin holds 21 of the kernel's 21 programs
 fs self-test: 12/12 passed
 Type help for the list of commands.
+$ echo hello world > hello.txt
+$ cat hello.txt | wc
+1 2 12
+$ mkdir notes
+$ cd notes
+$ ls /bin | wc > count
+$ cat < count
+23 115 538
 ```
 
-`cargo run -p camelot-fs -- ls target/camelot-fs.img /bin` (and `cat`,
-`fsck`, `mkfs`) reads and builds images on the host. Running programs from
-`/bin` and the file system calls come with #67; until then the filesystem is
-the kernel-internal API in `include/fs.h` and `include/log.h`.
+The shell then runs its programs from `/bin`, and what they write stays on
+the image. `cargo run -p camelot-fs -- ls target/camelot-fs.img /bin` (and
+`cat`, `fsck`, `mkfs`) reads and builds images on the host. Without a disk,
+the same programs, built into the kernel, stand in for `/bin`, and there are
+no other files.
 
 The shell (`user/sh.c`) runs programs by name, with arguments: `PROG
-[ARG...]`. `CMD & CMD` runs the first in the background (the shell prints its
-pid) and the last in the foreground; `wait` collects the background ones,
-`help` lists the built-ins, and `exit [N]` (or Ctrl-D on an empty line) ends
-the shell, after which the kernel stops the machine with its status as the
-exit code. Lines are edited with backspace and end with Enter. In a terminal,
+[ARG...]` runs `/bin/PROG`, and a word with a `/` in it is a path to the
+program. `CMD < FILE` and `CMD > FILE` redirect its input and output, `CMD |
+CMD` sends the first one's output to the second, and `CMD & CMD` runs the
+first in the background (the shell prints its pid) and the last in the
+foreground; `wait` collects the background ones, `cd [DIR]` changes the
+working directory, `help` lists the built-ins, and `exit [N]` (or Ctrl-D on
+an empty line) ends the shell, after which the kernel stops the machine with
+its status as the exit code. Lines are edited with backspace and end with Enter. In a terminal,
 Grail passes each key to the kernel as it is typed and the kernel does the
 echoing; piped input works too:
 
@@ -141,6 +155,10 @@ system call stubs; `user/ulib.c`, a small C library with `printf`, declared in
 | `sh` | the shell |
 | `hello` | prints a line and exits |
 | `echo` | prints its arguments |
+| `ls` | lists directories (the working directory without arguments) |
+| `cat` | copies files, or its input, to its output |
+| `wc` | counts the lines, words and bytes of files, or of its input |
+| `mkdir`, `rm`, `ln` | make directories, remove names, link a second name to a file |
 | `ticks` | prints the timer ticks since boot |
 | `ping`, `pong` | print four numbered lines half a tick apart: run together, they take turns |
 | `regs` | fills every register, spins for three ticks and exits with 0 only if none changed |
@@ -148,6 +166,7 @@ system call stubs; `user/ulib.c`, a small C library with `printf`, declared in
 | `data` | exits with 0 only if its stack and `.bss` start zeroed and its `.data` holds its initial value and takes stores |
 | `badptr` | hands the system calls bad pointers, which must all fail with `-EFAULT` |
 | `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |
+| `filetest` | checks the file system calls on a writable root filesystem (`filetest: N checks, 0 failed`) |
 | `badload` | reads kernel memory: killed by a load page fault |
 | `badstore` | writes to its own read-only data: killed by a store page fault |
 | `badhalt` | executes `xcal.halt`, which is M-mode only: killed by an illegal instruction |
@@ -155,7 +174,8 @@ system call stubs; `user/ulib.c`, a small C library with `printf`, declared in
 The system calls, the error numbers and how a program starts are specified in
 `docs/camelot-syscalls.md`. The memory layout, the trap path, the scheduler
 and the ELF loader are described in `docs/excalibur-spec.md` section 10,
-"Kernel processes".
+"Kernel processes"; open files, pipes and running programs from the disk in
+"Kernel files".
 
 Without `--clock`, Grail runs at full speed and skips every `wfi` to the next
 timer tick, so while the shell waits for a key the tick count races ahead;
@@ -177,7 +197,8 @@ tables and the kernel address space in "Kernel memory"; the PLIC setup, the
 UART driver and the console in "Kernel console"; processes, the system calls,
 the user programs and the shell in "Kernel processes"; the disk driver and the
 buffer cache in "Kernel disks"; the log, the filesystem and mounting in
-"Kernel filesystem" (the on-disk format in `docs/camelot-fs.md`). A failed
+"Kernel filesystem" (the on-disk format in `docs/camelot-fs.md`); file
+descriptors, devices, pipes and the file system calls in "Kernel files". A failed
 disk or filesystem self-test check counts in the exit code like the others.
 
 A panic looks like this (from the deliberate illegal instruction the tests
@@ -221,10 +242,14 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `kernelvec.s` | `kernel_vec`, the trap vector for traps from S-mode: saves x1-x31 and the trap CSRs as a `struct trap_frame` on the stack, calls `kernel_trap`, restores, `sret`. Also `illegal_instruction()` for the panic tests |
 | `uservec.s` | `user_vec`, the trap vector for traps from U-mode: saves the user registers in the process's trap frame (`sscratch`), calls `user_trap` on the process's kernel stack; `user_return`: frame to registers, `sret` to U-mode |
 | `trap.c` | `kernel_trap()`: counts timer ticks (waking sleepers), claims/completes PLIC interrupts and runs the console's or a disk's handler, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `user_trap()`: a tick yields, an ecall goes to `syscall()`, a fault kills the process; `user_trap_return()`, `trap_init()`, `panic()` |
-| `proc.c` | processes: `proc_create()` (slot, kernel stack, page table, ELF, stack with the arguments), `kproc_create()` (a kernel process running a C function), `proc_run_init()` (the shell), the round-robin `scheduler()` (idling in `wfi` while everyone sleeps), `yield()`, `sleep()`/`wakeup()`, `proc_exit()`, `proc_kill()`, `proc_wait()`, `proc_sbrk()` |
+| `proc.c` | processes: `proc_create()` (slot, kernel stack, page table, ELF, stack with the arguments, descriptors 0-2 and working directory inherited), `proc_exec()` (a new address space for the same process), `kproc_create()` (a kernel process running a C function), `proc_run_init()` (the shell, with the console as descriptors 0-2), the round-robin `scheduler()` (idling in `wfi` while everyone sleeps), `yield()`, `sleep()`/`wakeup()`, `proc_exit()`, `proc_kill()`, `proc_wait()`, `proc_sbrk()` |
 | `swtch.s` | `swtch()`: saves `ra`, `sp`, `s0`-`s11` and loads another thread's |
-| `elf.c` | `elf_load()`: checks an ELF32 executable and maps its `PT_LOAD` segments into user space |
-| `syscall.c` | `syscall()`: the system calls (`docs/camelot-syscalls.md`), with `spawn`'s argument copying |
+| `elf.c` | `elf_load()`: checks an ELF32 executable, read from memory or from a file through a `struct elf_file`, and maps its `PT_LOAD` segments into user space |
+| `exec.c` | `exec_spawn()`, `exec_replace()`, `exec_init()`: find the program a path names (a file of the root filesystem, or an embedded program without one) and start it |
+| `syscall.c` | `syscall()`: the system calls (`docs/camelot-syscalls.md`), with `spawn`'s and `exec`'s argument copying; the file ones go to `sysfile.c` |
+| `sysfile.c` | the file system calls: `read`, `write`, `open`, `close`, `lseek`, `fstat`, `dup`, `pipe`, `mkdir`, `unlink`, `link`, `chdir`, each change to the disk in one transaction |
+| `file.c` | open files (xv6's): the table of 64, `filealloc()`/`filedup()`/`fileclose()`, reading and writing an inode (writes 3 KiB per transaction), a device (`devsw`: the console) or a pipe, `filelseek()`, `filestat()` |
+| `pipe.c` | pipes (xv6's): a 512-byte buffer in a page, readers and writers sleeping on each other, end of input when the writers are gone, `-EPIPE` when the readers are |
 | `userprogs.s` | generated by `cargo xtask kernel` from `user/`: the user programs' ELF images and the `user_programs` table (do not edit) |
 | `user/` | the user programs (`*.c`, `*.s`), their runtime (`crt0.s`, `usys.s`, `ulib.c`, `user.h`) and linker script `user.ld`, built with merlin-as and merlin-ld; `user/clang/` holds clang's assembly for each `.c` (generated, committed) |
 | `kalloc.c` | physical page allocator: `kinit()` reads RAM's base and size from sysinfo and frees every page from `__kernel_end` to the end of RAM; `kalloc()`, `kzalloc()`, `kfree()`, `kfree_pages()` |
@@ -238,17 +263,17 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `bio.c` | buffer cache (xv6's): 30 one-KiB block buffers in LRU order, `bread()`/`bwrite()`/`brelse()`, each buffer sleep-locked while in use |
 | `blktest.c` | the disk self-test, in kernel processes: three readers at once, write and read back a scratch block (restored afterwards), errors, LRU reuse |
 | `log.c` | the filesystem's write-ahead log (xv6's): `begin_op()`/`end_op()` around each operation, `log_write()` pinning changed buffers, group commit (slots, flush, header, flush, install, flush, empty header, flush), and the replay at mount |
-| `fs.c` | the filesystem (xv6's): `fs_mount()`, the bitmap allocator, the inode cache (`iget`/`ilock`/`iput`, `readi`/`writei`), directories, path lookup (`namei`/`nameiparent`), `fs_create()`/`fs_unlink()` |
+| `fs.c` | the filesystem (xv6's): `fs_mount()`, the bitmap allocator, the inode cache (`iget`/`ilock`/`iput`, `readi`/`writei`), directories, path lookup (`namei`/`nameiparent`, from the working directory for a relative path), `fs_create()`/`fs_unlink()`/`fs_link()`, `itrunc()` |
 | `fstest.c` | `fs_boot()`: mounts disk 0 in a kernel process, lists `/`, runs the filesystem self-test (and, with `fs_test` patched to 2, its transactions; to 3, filling the disk) |
-| `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin` |
+| `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin`, and `/dev/console` is made too |
 | `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()` and `wfi()` |
 | `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, the filesystem (`fs_boot`), then the user-space shell as the first process |
 | `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |
-| `console.c` | the `read` and `write` system calls: `console_read()` (line editing and echo: backspace, CR/LF/CR LF, Ctrl-D; sleeps until a line is complete), `console_write()`, `console_intr()` (the UART interrupt, waking readers) |
+| `console.c` | the console device (`read` and `write` on it): `console_read()` (line editing and echo: backspace, CR/LF/CR LF, Ctrl-D; sleeps until a line is complete), `console_write()`, `console_intr()` (the UART interrupt, waking readers) |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |
 | `kernel.ld` | layout: `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end` |
-| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct context`, `struct user_program`), `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API and error numbers), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `syscall.h` (the system call and error numbers), and the headers for the above |
+| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct context`, `struct user_program`), `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`), and the headers for the above |
 | `kernel.elf` | the prebuilt image, committed so `cargo test` and Grail need no LLVM |
 | `kernel.elf.clang-version` | the clang that built `kernel.elf` |
 
