@@ -25,9 +25,11 @@
 #include "vm.h"
 
 volatile u32 ticks;
+struct spinlock tickslock;
 
-/* Set while panicking, so a fault inside panic() doesn't recurse. */
-static bool panicking;
+/* Set while panicking, so a fault inside panic() doesn't recurse, and so
+ * kprintf() stops taking the UART's lock. */
+volatile bool panicking;
 
 static const char *const exception_names[16] = {
     "instruction address misaligned",
@@ -156,11 +158,14 @@ static bool probe_fixup(struct trap_frame *f) {
 
 /* A timer tick from machine_vec. Clear it first: a tick that arrives while
  * this runs sets SSIP again and is taken after sret. Processes in the sleep
- * system call wait on `ticks`. */
+ * system call wait on `ticks`, with tickslock. The network's timer comes
+ * after, without tickslock: it takes the network's lock. */
 static void clock_tick(void) {
     w_sip(r_sip() & ~SIP_SSIP);
+    acquire(&tickslock);
     ticks = ticks + 1;
     wakeup((const void *)&ticks);
+    release(&tickslock);
     net_timer();
 }
 
@@ -209,6 +214,8 @@ void user_trap_return(struct trap_frame *f) {
      * which only works for traps from U-mode. */
     intr_off();
     w_stvec((u32)(uintptr)user_vec);
+    /* user_vec's tp for the next trap: this hart's id. */
+    f->kernel_tp = cpuid();
     /* sret goes to U-mode (SPP = 0) and turns interrupts on there (SPIE). */
     f->sstatus = (r_sstatus() & ~SSTATUS_SPP) | SSTATUS_SPIE;
     user_return(f);
@@ -220,6 +227,7 @@ bool is_page_fault(u32 scause) {
 }
 
 void trap_init(void) {
+    initlock(&tickslock, "ticks");
     plic_init();
     /* Machine ticks that fired while the kernel set itself up left SSIP
      * pending: drop that one, so the first tick taken is a whole interval

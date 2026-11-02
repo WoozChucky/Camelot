@@ -4,15 +4,21 @@
  * they were last released, most recent first. A lookup scans from the front
  * for a cached copy; a miss takes the last buffer nobody uses. A buffer
  * released without valid data (its read or write failed) holds nothing worth
- * keeping, so it goes to the back instead, to be reused first. Each buffer
- * has a sleep lock: `locked` plus sleep()/wakeup() on the buffer, held from
- * bread() to brelse(), and kept across the sleep in the disk driver. As in
- * proc.c there are no spinlocks: a process's kernel code is never preempted
- * and runs with interrupts off, and interrupt handlers don't touch the
- * cache. */
+ * keeping, so it goes to the back instead, to be reused first.
+ *
+ * Locking, as in xv6: bcache_lock, a spinlock, protects the list, which
+ * block each buffer holds and how many use it (refcnt), and the hit and miss
+ * counters. Each buffer also has a sleep lock, held from bread() to
+ * brelse() and kept across the sleep in the disk driver, which protects its
+ * data. bget() takes a reference under bcache_lock, lets go of it, and only
+ * then waits for the sleep lock: a buffer with a reference is never handed
+ * to another block meanwhile. Interrupt handlers don't touch the cache. */
 #include "bio.h"
 #include "proc.h"
+#include "spinlock.h"
 #include "trap.h"
+
+static struct spinlock bcache_lock;
 
 static struct buf bufs[NBUF];
 
@@ -49,33 +55,31 @@ static void push_back(struct buf *b) {
 }
 
 void binit(void) {
+    initlock(&bcache_lock, "bcache");
     head.prev = &head;
     head.next = &head;
     for (u32 i = 0; i < NBUF; i++) {
         bufs[i].valid = false;
-        bufs[i].locked = false;
+        initsleeplock(&bufs[i].lock, "buffer");
         bufs[i].refcnt = 0;
         push_front(&bufs[i]);
     }
-}
-
-static void lock(struct buf *b) {
-    while (b->locked) {
-        sleep(b);
-    }
-    b->locked = true;
 }
 
 /* The buffer for block `blockno` of disk `dev`, locked: the cached one if
  * there is one, else the least recently released buffer nobody uses, taken
  * over for this block (its data not valid). */
 static struct buf *bget(u32 dev, u32 blockno) {
+    acquire(&bcache_lock);
     /* A buffer with users holds its block even before its data is valid (the
-     * read is under way); one with neither holds nothing. */
+     * read is under way); one with neither holds nothing. `valid` belongs to
+     * the sleep lock, but a buffer nobody uses has no holder to change it,
+     * and for one with users the test doesn't depend on it. */
     for (struct buf *b = head.next; b != &head; b = b->next) {
         if (b->dev == dev && b->blockno == blockno && (b->valid || b->refcnt > 0)) {
             b->refcnt++;
-            lock(b);
+            release(&bcache_lock);
+            acquiresleep(&b->lock);
             return b;
         }
     }
@@ -85,8 +89,9 @@ static struct buf *bget(u32 dev, u32 blockno) {
             b->blockno = blockno;
             b->valid = false;
             b->refcnt = 1;
+            release(&bcache_lock);
             /* Unused, so unlocked: this doesn't sleep. */
-            lock(b);
+            acquiresleep(&b->lock);
             return b;
         }
     }
@@ -94,14 +99,21 @@ static struct buf *bget(u32 dev, u32 blockno) {
     return NULL;
 }
 
+/* Counts a hit or a miss. */
+static void count(u32 *counter) {
+    acquire(&bcache_lock);
+    *counter = *counter + 1;
+    release(&bcache_lock);
+}
+
 struct buf *bread(u32 dev, u32 blockno) {
     struct buf *b = bget(dev, blockno);
     if (b->valid) {
-        bio_hits++;
+        count(&bio_hits);
         b->error = BLK_OK;
         return b;
     }
-    bio_misses++;
+    count(&bio_misses);
     if (blockno >= MAX_BLOCKS) {
         b->error = BLK_ERR_OUT_OF_RANGE;
     } else {
@@ -112,7 +124,7 @@ struct buf *bread(u32 dev, u32 blockno) {
 }
 
 u32 bwrite(struct buf *b) {
-    if (!b->locked) {
+    if (!holdingsleep(&b->lock)) {
         panic("bwrite: buffer not locked");
     }
     u32 err = BLK_ERR_OUT_OF_RANGE;
@@ -126,34 +138,46 @@ u32 bwrite(struct buf *b) {
 }
 
 void brelse(struct buf *b) {
-    if (!b->locked) {
+    if (!holdingsleep(&b->lock)) {
         panic("brelse: buffer not locked");
     }
-    b->locked = false;
-    wakeup(b);
+    /* Where it goes on the list depends on `valid`, which is ours to read
+     * until the sleep lock goes. */
+    bool valid = b->valid;
+    releasesleep(&b->lock);
+    acquire(&bcache_lock);
     b->refcnt--;
     if (b->refcnt == 0) {
         unlink(b);
         /* Just used, so it goes to the front; unless it holds nothing, which
          * the next miss should take before evicting a cached block. */
-        if (b->valid) {
+        if (valid) {
             push_front(b);
         } else {
             push_back(b);
         }
     }
+    release(&bcache_lock);
 }
 
 void bpin(struct buf *b) {
-    if (!b->locked) {
+    if (!holdingsleep(&b->lock)) {
         panic("bpin: buffer not locked");
     }
+    acquire(&bcache_lock);
     b->refcnt++;
+    release(&bcache_lock);
 }
 
 void bunpin(struct buf *b) {
-    if (!b->locked || b->refcnt < 2) {
+    if (!holdingsleep(&b->lock)) {
+        panic("bunpin: buffer not pinned");
+    }
+    acquire(&bcache_lock);
+    if (b->refcnt < 2) {
+        release(&bcache_lock);
         panic("bunpin: buffer not pinned");
     }
     b->refcnt--;
+    release(&bcache_lock);
 }

@@ -19,6 +19,7 @@
 #define CAMELOT_BIO_H
 
 #include "blk.h"
+#include "sleeplock.h"
 #include "types.h"
 
 #define BSIZE 1024
@@ -27,12 +28,16 @@
 /* Buffers in the cache, as in xv6. bread() panics if every one is in use. */
 #define NBUF 30
 
+/* Locking: `lock`, a sleep lock, is held by the process bread() returned
+ * the buffer to, until brelse(), and protects `valid`, `error` and `data`.
+ * The cache's spinlock (bio.c) protects `dev`, `blockno`, `refcnt` and the
+ * list. */
 struct buf {
     /* `data` holds the block as it is on the disk (or as a transaction
      * changed it, while the buffer is pinned). */
     bool valid;
     /* Held by the process bread() returned it to, until brelse(). */
-    bool locked;
+    struct sleeplock lock;
     /* After bread(): BLK_OK, or the BLK_ERR_ code of the failed read (the
      * data is then not valid). */
     u32 error;

@@ -15,6 +15,18 @@
 
 static struct file ftable[NFILE];
 
+/* Protects every entry's `ref`, and so which entries are free. The rest of
+ * an entry is set up by whoever took it before anyone else can reach it,
+ * and stays as it is until the last close; the offset of an inode's file
+ * changes under the inode's sleep lock (inode_read, inode_write). A leaf of
+ * the lock order, but for the allocator's lock: fileclose() lets go of it
+ * before closing what the file was open on. */
+static struct spinlock ftable_lock;
+
+void file_init(void) {
+    initlock(&ftable_lock, "ftable");
+}
+
 /* Major 0 has no driver: device_has_driver() says so before anything is
  * opened, and these fail just in case. */
 static int nodev_read(pagetable_t pt, u32 dst, u32 n) {
@@ -54,36 +66,45 @@ _Static_assert(MAXWRITE >= BSIZE && MAXWRITE <= PGSIZE, "a write's chunk fits th
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 struct file *filealloc(void) {
+    acquire(&ftable_lock);
     for (u32 i = 0; i < NFILE; i++) {
         struct file *f = &ftable[i];
         if (f->ref == 0) {
             memset(f, 0, sizeof *f);
             f->ref = 1;
+            release(&ftable_lock);
             return f;
         }
     }
+    release(&ftable_lock);
     return NULL;
 }
 
 struct file *filedup(struct file *f) {
+    acquire(&ftable_lock);
     if (f->ref < 1) {
         panic("filedup: a closed file");
     }
     f->ref++;
+    release(&ftable_lock);
     return f;
 }
 
 void fileclose(struct file *f) {
+    acquire(&ftable_lock);
     if (f->ref < 1) {
         panic("fileclose: a closed file");
     }
     f->ref--;
     if (f->ref > 0) {
+        release(&ftable_lock);
         return;
     }
-    /* The slot is free from here on, even while iput() below sleeps. */
+    /* The slot is free from here on, even while iput() below sleeps:
+     * what it was open on is closed from a copy, without the lock. */
     struct file closed = *f;
     f->type = FD_NONE;
+    release(&ftable_lock);
     if (closed.type == FD_PIPE) {
         pipeclose(closed.pipe, closed.writable);
     } else if (closed.type == FD_SOCKET) {

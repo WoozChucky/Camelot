@@ -5,6 +5,7 @@
 #ifndef CAMELOT_UART_H
 #define CAMELOT_UART_H
 
+#include "spinlock.h"
 #include "types.h"
 
 #define UART_BASE 0x10000000
@@ -29,6 +30,14 @@
  * the UART. */
 void uart_init(void);
 
+/* Held while writing to the UART, by the callers of uart_putc() and
+ * uart_puts(): kprintf() for a whole message, console_write() for each
+ * chunk, the console's echo for each edit. So what one hart prints comes out
+ * whole, not mixed with another's. A leaf of the lock order. */
+extern struct spinlock uart_tx_lock;
+
+/* Write a byte, or a string, polling LSR.THRE. The caller holds
+ * uart_tx_lock. */
 void uart_putc(char c);
 void uart_puts(const char *s);
 

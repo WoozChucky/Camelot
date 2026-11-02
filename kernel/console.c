@@ -4,9 +4,15 @@
  * buffer here, echoing as it goes, and sleeps while the line is incomplete.
  * Echoing at read time rather than in the interrupt handler means input
  * typed ahead is echoed when a program asks for it, so the echo lands after
- * the prompt and not in the middle of another program's output. */
+ * the prompt and not in the middle of another program's output.
+ *
+ * Locking: cons_lock protects the line and the UART's receive ring (the
+ * interrupt handler fills it, readers drain it); readers sleep on the line
+ * with it. Output takes the UART's own lock, uart_tx_lock, which comes
+ * after cons_lock in the lock order (the echo is printed under both). */
 #include "console.h"
 #include "proc.h"
+#include "spinlock.h"
 #include "syscall.h"
 #include "uart.h"
 
@@ -18,6 +24,8 @@
 
 /* Bytes copied out of user memory at a time by console_write(). */
 #define WRITE_CHUNK 64
+
+static struct spinlock cons_lock;
 
 /* The line being typed or read: `line_len` bytes, of which `line_taken` have
  * been returned by reads. Once `line_done`, nothing more is added until every
@@ -31,15 +39,31 @@ static bool line_done;
  * line end (CR LF). */
 static bool after_cr;
 
+void console_init(void) {
+    initlock(&cons_lock, "console");
+}
+
 void console_intr(void) {
+    acquire(&cons_lock);
     uart_intr();
     wakeup(line);
+    release(&cons_lock);
+}
+
+/* Echoes `s` for the line editor. */
+static void echo(const char *s) {
+    acquire(&uart_tx_lock);
+    uart_puts(s);
+    release(&uart_tx_lock);
 }
 
 /* Takes typed bytes from the UART's buffer into the line until the line is
- * complete or there are none left. Returns whether it is complete. */
+ * complete or there are none left. Returns whether it is complete. Called
+ * with cons_lock held. */
 static bool edit_line(void) {
     char c;
+    char out[2];
+    out[1] = 0;
     while (!line_done && uart_rx_pop(&c)) {
         if (c == CHAR_LF && after_cr) {
             after_cr = false;
@@ -51,18 +75,19 @@ static bool edit_line(void) {
             line[line_len] = '\n';
             line_len++;
             line_done = true;
-            uart_putc('\n');
+            echo("\n");
         } else if (c == CHAR_EOT) {
             line_done = true;
         } else if (c == CHAR_BS || c == CHAR_DEL) {
             if (line_len > 0) {
                 line_len--;
-                uart_puts("\b \b"); /* back, blank it out, back again */
+                echo("\b \b"); /* back, blank it out, back again */
             }
         } else if (c >= ' ' && c < CHAR_DEL && line_len < CONSOLE_LINE_MAX - 1) {
             line[line_len] = c;
             line_len++;
-            uart_putc(c);
+            out[0] = c;
+            echo(out);
         }
     }
     return line_done;
@@ -75,18 +100,22 @@ int console_read(pagetable_t pt, u32 dst, u32 n) {
     if (n == 0) {
         return 0;
     }
+    acquire(&cons_lock);
     while (!edit_line()) {
         if (proc_killed()) {
+            release(&cons_lock);
             return 0; /* never seen: the caller ends on its way out */
         }
-        sleep(line);
+        sleep(line, &cons_lock);
     }
     u32 count = line_len - line_taken;
     if (count > n) {
         count = n;
     }
-    /* Checked above, and nothing unmaps it while the process sleeps. */
+    /* Checked above, and nothing unmaps it while the process sleeps.
+     * copyout() never sleeps, so it may run under the lock. */
     if (copyout(pt, dst, line + line_taken, count) != 0) {
+        release(&cons_lock);
         return -EFAULT;
     }
     line_taken += count;
@@ -95,6 +124,7 @@ int console_read(pagetable_t pt, u32 dst, u32 n) {
         line_taken = 0;
         line_done = false;
     }
+    release(&cons_lock);
     return (int)count;
 }
 
@@ -106,9 +136,11 @@ int console_write(pagetable_t pt, u32 src, u32 n) {
     for (u32 done = 0; done < n;) {
         u32 count = n - done < WRITE_CHUNK ? n - done : WRITE_CHUNK;
         copyin(pt, chunk, src + done, count);
+        acquire(&uart_tx_lock);
         for (u32 i = 0; i < count; i++) {
             uart_putc(chunk[i]);
         }
+        release(&uart_tx_lock);
         done += count;
     }
     return (int)n;

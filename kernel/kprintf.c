@@ -1,5 +1,7 @@
 /* kprintf: the kernel's printf. See kprintf.h for the supported formats. */
 #include "kprintf.h"
+#include "spinlock.h"
+#include "trap.h"
 #include "uart.h"
 
 /* Counts what it emits so every entry point can return a length. */
@@ -142,11 +144,22 @@ static void uart_sink(char c, void *ctx) {
     uart_putc(c);
 }
 
+/* The whole message under the UART's lock, so messages from different
+ * harts don't mix. Not once the kernel panics: the code that panicked may
+ * hold the lock (a panic inside kprintf, say), and the report must get
+ * out. */
 int kprintf(const char *fmt, ...) {
+    bool locking = !panicking;
+    if (locking) {
+        acquire(&uart_tx_lock);
+    }
     va_list ap;
     va_start(ap, fmt);
     int n = kvformat(uart_sink, NULL, fmt, ap);
     va_end(ap);
+    if (locking) {
+        release(&uart_tx_lock);
+    }
     return n;
 }
 

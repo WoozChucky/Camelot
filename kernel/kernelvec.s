@@ -8,7 +8,7 @@
 # user_vec (uservec.s) instead, which finds the process's kernel stack
 # through sscratch.
 
-    .equ FRAME_SIZE, 144        # TRAP_FRAME_SIZE, a multiple of 16
+    .equ FRAME_SIZE, 160        # TRAP_FRAME_SIZE, a multiple of 16
     .equ FRAME_SEPC, 128
     .equ FRAME_SCAUSE, 132
     .equ FRAME_STVAL, 136
@@ -111,7 +111,6 @@ kernel_vec:
 illegal_instruction:
     li    ra, 0x01010101
     li    gp, 0x03030303
-    li    tp, 0x04040404
     li    t0, 0x05050505
     li    t1, 0x06060606
     li    t2, 0x07070707
@@ -139,5 +138,8 @@ illegal_instruction:
     li    t4, 0x1d1d1d1d
     li    t5, 0x1e1e1e1e
     li    t6, 0x1f1f1f1f
+    # tp last: the kernel's tp is the hart's id, which an interrupt handler
+    # taken in between (interrupts are on) would need for its locks.
+    li    tp, 0x04040404
     .word 0xc0001073            # unimp
 1:  j     1b

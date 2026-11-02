@@ -191,32 +191,49 @@ static int sock_recv(struct socket *s, u32 dst, u32 n, u32 *addr, u32 *port) {
     return len >= 0 && (u32)len > n ? (int)n : len;
 }
 
+/* The four calls file.c makes on a socket's file come in from outside the
+ * stack, so each takes net_lock (net.h); the system calls below have it
+ * already (syscall.c). */
+
 int socket_read(struct socket *s, pagetable_t pt, u32 dst, u32 n) {
     (void)pt; /* the current process's, as for every system call */
     u32 addr;
     u32 port;
-    return sock_recv(s, dst, n, &addr, &port);
+    acquire(&net_lock);
+    int r = sock_recv(s, dst, n, &addr, &port);
+    release(&net_lock);
+    return r;
 }
 
 int socket_write(struct socket *s, pagetable_t pt, u32 src, u32 n) {
     (void)pt;
-    return sock_send(s, src, n, false, 0, 0);
+    acquire(&net_lock);
+    int r = sock_send(s, src, n, false, 0, 0);
+    release(&net_lock);
+    return r;
 }
 
 u32 socket_bytes(struct socket *s) {
+    acquire(&net_lock);
+    u32 n;
     if (s->type == SOCK_STREAM) {
-        return s->tcp->rlen;
+        n = s->tcp->rlen;
+    } else {
+        n = s->udp != NULL ? udp_pending(s->udp) : 0;
     }
-    return s->udp != NULL ? udp_pending(s->udp) : 0;
+    release(&net_lock);
+    return n;
 }
 
 void socket_close(struct socket *s) {
+    acquire(&net_lock);
     if (s->type == SOCK_STREAM) {
         tcp_close(s->tcp);
     } else if (s->udp != NULL) {
         udp_close(s->udp);
     }
     s->type = 0;
+    release(&net_lock);
 }
 
 /* ---- the system calls ---- */
@@ -248,7 +265,7 @@ int sock_sys_socket(u32 domain, u32 type, u32 protocol) {
         s->tcp = tcp_socket(&err);
         if (s->tcp == NULL) {
             s->type = 0;
-            f->ref = 0; /* nothing else set: just give the slot back */
+            fileclose(f); /* nothing else set: just gives the slot back */
             return err;
         }
     }
@@ -330,7 +347,7 @@ int sock_sys_accept(u32 fd, u32 uaddr) {
     }
     struct tcp_sock *c = tcp_accept(s->tcp, s->rcvtimeo, &err);
     if (c == NULL) {
-        f->ref = 0;
+        fileclose(f);
         return err;
     }
     struct socket *ns = sock_alloc(SOCK_STREAM);

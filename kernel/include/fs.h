@@ -20,6 +20,7 @@
 #define CAMELOT_FS_H
 
 #include "bio.h"
+#include "sleeplock.h"
 #include "syscall.h"
 #include "types.h"
 
@@ -93,14 +94,15 @@ struct dirent {
 
 /* An inode in memory: the kernel's copy of a dinode, shared by everyone
  * using that file. `ref` counts the users (iget/idup to iput); the copy
- * stays in the cache while ref > 0. The fields from `type` on are valid
- * only while the inode is locked (ilock) and `valid`. */
+ * stays in the cache while ref > 0. The fields from `valid` on are valid
+ * only while the inode is locked (ilock) and `valid`. The cache's spinlock
+ * (fs.c) protects `dev`, `inum` and `ref`; the sleep lock the rest. */
 struct inode {
     u32 dev;
     u32 inum;
     u32 ref;
-    bool locked; /* a sleep lock, like a buffer's */
-    bool valid;  /* the fields below hold the dinode */
+    struct sleeplock lock; /* held from ilock() to iunlock() */
+    bool valid;            /* the fields below hold the dinode */
     u16 type;
     u16 major;
     u16 minor;
@@ -125,6 +127,10 @@ extern bool fs_log_too_small;
 extern u32 fs_orphans;
 extern u32 fs_dev;
 extern struct superblock fs_sb;
+
+/* Sets up the inode cache's locks. kmain calls it at boot, before any
+ * process can use a file. */
+void fs_init(void);
 
 /* Mounts disk `dev` as the root: reads and checks the superblock (every
  * rule of the format document's superblock section), replays a committed

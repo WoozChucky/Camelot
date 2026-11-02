@@ -34,6 +34,6 @@ int piperead(struct pipe *p, pagetable_t pt, u32 dst, u32 n);
 int pipewrite(struct pipe *p, pagetable_t pt, u32 src, u32 n);
 
 /* The bytes waiting in `p` (fstat's size). */
-u32 pipe_bytes(const struct pipe *p);
+u32 pipe_bytes(struct pipe *p);
 
 #endif

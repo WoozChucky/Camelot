@@ -207,7 +207,7 @@ int sys_open(struct trap_frame *f) {
     }
     int fd = fd_alloc(file);
     if (fd < 0) {
-        file->ref = 0; /* nothing set yet: just give the slot back */
+        fileclose(file); /* nothing set yet: just gives the slot back */
         return fd;
     }
     begin_op();
@@ -228,7 +228,7 @@ int sys_open(struct trap_frame *f) {
     if (err < 0) {
         end_op();
         myproc()->ofile[fd] = NULL;
-        file->ref = 0;
+        fileclose(file);
         return err;
     }
     file->type = ip->type == T_DEVICE ? FD_DEVICE : FD_INODE;

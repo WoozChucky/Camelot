@@ -14,6 +14,7 @@
 
 struct netif netif;
 struct net_stats net_stats;
+struct spinlock net_lock;
 
 /* The static configuration (docs/camelot-net.md, "Configuration"): DHCP
  * first, and if no server answers, 10.0.2.15/24 with gateway 10.0.2.2,
@@ -46,7 +47,10 @@ static u32 prefix_len(u32 mask) {
 }
 
 void net_init(void) {
+    initlock(&net_lock, "net");
+    acquire(&net_lock);
     if (!nic_init()) {
+        release(&net_lock);
         return;
     }
     const u8 *mac = nic_mac();
@@ -55,8 +59,9 @@ void net_init(void) {
     }
     netif.present = true;
     /* kmain runs with interrupts on: the card's come once the interface
-     * is all set up. */
+     * is all set up (and once the lock is let go). */
     nic_start();
+    release(&net_lock);
 }
 
 void net_configure(u32 addr, u32 mask, u32 gateway, u32 dns, u32 how) {
@@ -88,13 +93,17 @@ static void print_config(void) {
 static int dhcp_result;
 
 static void dhcp_main(void) {
+    acquire(&net_lock);
     dhcp_result = dhcp_configure();
+    release(&net_lock);
 }
 
 int net_boot(void) {
     if (!netif.present) {
         return 0;
     }
+    /* The DHCP client runs in its own process, which takes net_lock
+     * itself; the scheduler must not hold it. */
     if (net_dhcp != 0) {
         const char *why;
         dhcp_result = -ETIMEDOUT;
@@ -107,10 +116,12 @@ int net_boot(void) {
             kprintf("net: no answer from DHCP\n");
         }
     }
+    acquire(&net_lock);
     if (netif.how == NETIF_NONE) {
         net_configure(net_static_addr, net_static_mask, net_static_gateway, 0, NETIF_STATIC);
     }
     print_config();
+    release(&net_lock);
     return 0;
 }
 
@@ -118,15 +129,17 @@ void net_timer(void) {
     if (!netif.present) {
         return;
     }
+    acquire(&net_lock);
     arp_timer();
     tcp_timer();
     /* Let the waiting processes check their timeouts. */
     net_wakeup();
+    release(&net_lock);
 }
 
 void net_sleep(void) {
     sleepers++;
-    sleep(&netif);
+    sleep(&netif, &net_lock);
     sleepers--;
 }
 

@@ -17,6 +17,9 @@ _start:
     la    t0, early_trap
     csrw  mtvec, t0
     la    sp, __stack_top
+    # tp = the hart's id, for good: mycpu() is &cpus[tp] (spinlock.h). mret
+    # keeps it, and only user programs change it, which user_vec undoes.
+    csrr  tp, mhartid
 
     # Zero .bss. The linker script aligns both ends to 4 bytes.
     la    t0, __bss_start

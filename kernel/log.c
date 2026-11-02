@@ -24,13 +24,17 @@
  * the header, or the next transaction's slots before the empty header.
  * Grail's disks write in order anyway; flushing costs a request each.
  *
- * As in bio.c there are no spinlocks: kernel code is never preempted, so the
- * checks and changes of the log's fields between sleeps are atomic. A disk
- * error while committing panics: the log on the disk is then still good,
- * and the next mount replays or drops the transaction as a crash would. */
+ * Locking: log.lock, a spinlock, protects the fields; begin_op() sleeps on
+ * the log with it. The commit itself runs without it (it sleeps on the
+ * disk), with `committing` set so nobody else touches the transaction
+ * meanwhile: a new operation waits in begin_op(), and log_write() and
+ * end_op() can't happen, every operation having ended. A disk error while
+ * committing panics: the log on the disk is then still good, and the next
+ * mount replays or drops the transaction as a crash would. */
 #include "log.h"
 #include "kprintf.h"
 #include "proc.h"
+#include "spinlock.h"
 #include "string.h"
 #include "trap.h"
 
@@ -42,6 +46,7 @@ struct logheader {
 };
 
 static struct {
+    struct spinlock lock;
     u32 dev;
     u32 start; /* the header block; slot i is start + 1 + i */
     u32 slots; /* how many blocks a transaction may hold */
@@ -109,9 +114,10 @@ static void install(void) {
     }
 }
 
-static void commit(void) {
+/* Returns whether there was anything to commit. */
+static bool commit(void) {
     if (log.lh.n == 0) {
-        return;
+        return false;
     }
     write_slots();
     flush();
@@ -122,7 +128,7 @@ static void commit(void) {
     log.lh.n = 0;
     write_header(0, log.lh.block);
     flush();
-    log_commits++;
+    return true;
 }
 
 /* The mount's replay: installs `n` slots from the disk (nothing is in the
@@ -142,6 +148,8 @@ static void replay(u32 n) {
 }
 
 int log_init(u32 dev, const struct superblock *sb, const char **why) {
+    /* At the mount, before any operation: nothing else uses the log yet. */
+    initlock(&log.lock, "log");
     log.dev = dev;
     log.start = sb->logstart;
     log.slots = sb->nlog - 1 < LOGSIZE ? sb->nlog - 1 : LOGSIZE;
@@ -191,10 +199,11 @@ int log_init(u32 dev, const struct superblock *sb, const char **why) {
 }
 
 void begin_op(void) {
+    acquire(&log.lock);
     for (;;) {
         if (log.committing) {
             log_commit_waits++;
-            sleep(&log);
+            sleep(&log, &log.lock);
         } else if (log.lh.n + (log.outstanding + 1) * MAXOPBLOCKS > log.slots && log.outstanding > 0) {
             /* This operation might fill the log: wait for the transaction
              * to commit, or for an operation in it to end without having
@@ -202,19 +211,24 @@ void begin_op(void) {
              * writable mount has at least MAXOPBLOCKS slots, see
              * fs_mount(), and a read-only one writes nothing.) */
             log_room_waits++;
-            sleep(&log);
+            sleep(&log, &log.lock);
         } else {
             log.outstanding++;
+            release(&log.lock);
             return;
         }
     }
 }
 
 bool log_committing(void) {
-    return log.committing;
+    acquire(&log.lock);
+    bool committing = log.committing;
+    release(&log.lock);
+    return committing;
 }
 
 void end_op(void) {
+    acquire(&log.lock);
     if (log.outstanding == 0) {
         panic("end_op: no operation in progress");
     }
@@ -225,17 +239,26 @@ void end_op(void) {
     if (log.outstanding > 0) {
         /* begin_op() may be waiting for the room this one reserved. */
         wakeup(&log);
+        release(&log.lock);
         return;
     }
-    /* The last operation: commit, sleeping for the disk with `committing`
-     * set, so nobody starts an operation meanwhile. */
+    /* The last operation: commit, without the lock (the commit sleeps for
+     * the disk) but with `committing` set, so nobody starts an operation
+     * meanwhile. */
     log.committing = true;
-    commit();
+    release(&log.lock);
+    bool committed = commit();
+    acquire(&log.lock);
     log.committing = false;
+    if (committed) {
+        log_commits++;
+    }
     wakeup(&log);
+    release(&log.lock);
 }
 
 void log_write(struct buf *b) {
+    acquire(&log.lock);
     if (log.outstanding == 0) {
         panic("log_write outside a transaction");
     }
@@ -247,6 +270,7 @@ void log_write(struct buf *b) {
     }
     for (u32 i = 0; i < log.lh.n; i++) {
         if (log.lh.block[i] == b->blockno) {
+            release(&log.lock);
             return; /* absorbed: already in this transaction */
         }
     }
@@ -254,5 +278,7 @@ void log_write(struct buf *b) {
         panic("log_write: transaction too big");
     }
     log.lh.block[log.lh.n++] = b->blockno;
+    /* bcache_lock inside log.lock: the log comes first in the lock order. */
     bpin(b);
+    release(&log.lock);
 }

@@ -22,9 +22,9 @@
  * that.
  *
  * Interrupts are the only way in: nic_intr() runs from the trap code for
- * the card's PLIC source, with interrupts off like all kernel code, so it
- * never races with nic_transmit() (called by processes or by the stack
- * itself, inside the interrupt). */
+ * the card's PLIC source and takes net_lock (net.h), which every caller of
+ * nic_transmit() (processes, or the stack itself, inside the interrupt)
+ * holds too, so the two never race. */
 #include "nic.h"
 #include "kalloc.h"
 #include "kprintf.h"
@@ -251,6 +251,7 @@ bool nic_intr(u32 irq) {
     if (nic.rx_ring == NULL || irq != nic.irq) {
         return false;
     }
+    acquire(&net_lock);
     /* Acknowledge first: a frame that lands while the ring is being read
      * sets RX again, and so interrupts again, rather than being missed. */
     u32 status = reg(NET_IRQ_STATUS);
@@ -263,5 +264,6 @@ bool nic_intr(u32 irq) {
     }
     receive();
     reclaim_tx();
+    release(&net_lock);
     return true;
 }

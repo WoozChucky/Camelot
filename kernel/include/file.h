@@ -74,8 +74,11 @@ extern const struct devsw devsw[NDEV];
  * on a device node without one. */
 bool device_has_driver(u32 major);
 
+/* Sets up the table's lock. kmain calls it at boot. */
+void file_init(void);
+
 /* A free slot of the table, with one reference and nothing else set; NULL
- * if every slot is taken. */
+ * if every slot is taken. fileclose() gives it back. */
 struct file *filealloc(void);
 
 /* One more reference to `f`; returns it. */
