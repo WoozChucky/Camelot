@@ -5,40 +5,90 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::mpsc::Receiver;
 
-/// Core-local interruptor: software interrupt (msip) and timer (mtime/mtimecmp).
+/// CLINT offset of hart 0's `msip`; hart `i`'s is at `CLINT_MSIP + 4·i`.
+pub const CLINT_MSIP: u32 = 0x0;
+/// CLINT offset of hart 0's `mtimecmp`; hart `i`'s is at `CLINT_MTIMECMP + 8·i`.
+pub const CLINT_MTIMECMP: u32 = 0x4000;
+/// CLINT offset of `mtime`, shared by every hart.
+pub const CLINT_MTIME: u32 = 0xbff8;
+
+/// Core-local interruptor, with the standard (SiFive) layout: one software interrupt
+/// bit (`msip`) and one timer compare register (`mtimecmp`) per hart, and the `mtime`
+/// counter they all share. Hart `i`'s `msip` drives its `mip.MSIP`, so another hart
+/// writing it is an inter-processor interrupt; its `mtimecmp` drives its `mip.MTIP`.
 pub struct Clint {
-    pub msip: bool,
-    pub mtimecmp: u64,
+    /// Hart `i`'s software interrupt bit, at `CLINT_MSIP + 4·i`.
+    pub msip: Vec<bool>,
+    /// Hart `i`'s timer compare register, at `CLINT_MTIMECMP + 8·i`.
+    pub mtimecmp: Vec<u64>,
     pub mtime: u64,
 }
 
 impl Default for Clint {
+    /// The CLINT of a one-hart machine.
     fn default() -> Self {
-        // mtimecmp resets to "never" so the timer does not fire before software sets it.
-        Clint {
-            msip: false,
-            mtimecmp: u64::MAX,
-            mtime: 0,
-        }
+        Clint::new(1)
     }
 }
 
 impl Clint {
-    pub fn timer_pending(&self) -> bool {
-        self.mtime >= self.mtimecmp
+    /// The CLINT of a machine with `harts` harts.
+    pub fn new(harts: usize) -> Self {
+        // mtimecmp resets to "never" so the timer does not fire before software sets it.
+        Clint {
+            msip: vec![false; harts],
+            mtimecmp: vec![u64::MAX; harts],
+            mtime: 0,
+        }
+    }
+
+    /// Whether hart `hart`'s timer interrupt (MTIP) is pending.
+    pub fn timer_pending(&self, hart: usize) -> bool {
+        self.mtime >= self.mtimecmp[hart]
+    }
+
+    /// The earliest `mtimecmp` still ahead of `mtime`: where a machine whose harts all
+    /// wait in `wfi` can jump `mtime` to. `None` if no timer is set to fire.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.mtimecmp
+            .iter()
+            .copied()
+            .filter(|&cmp| cmp != u64::MAX && cmp > self.mtime)
+            .min()
+    }
+
+    /// Decodes a register offset: hart `i`'s `msip` or one half of its `mtimecmp`, or
+    /// one half of `mtime`. Offsets of harts the machine does not have are reserved.
+    fn reg(&self, off: u32) -> ClintReg {
+        let harts = self.msip.len() as u32;
+        match off {
+            o if o < CLINT_MTIMECMP => match (o - CLINT_MSIP) / 4 {
+                hart if hart < harts && o % 4 == 0 => ClintReg::Msip(hart as usize),
+                _ => ClintReg::Reserved,
+            },
+            CLINT_MTIME => ClintReg::Mtime { high: false },
+            o if o == CLINT_MTIME + 4 => ClintReg::Mtime { high: true },
+            o if o < CLINT_MTIME => match (o - CLINT_MTIMECMP) / 8 {
+                hart if hart < harts && o % 4 == 0 => ClintReg::Mtimecmp {
+                    hart: hart as usize,
+                    high: o % 8 == 4,
+                },
+                _ => ClintReg::Reserved,
+            },
+            _ => ClintReg::Reserved,
+        }
     }
 
     pub fn read(&mut self, off: u32, size: u32) -> Result<u32, BusFault> {
         if size != 4 {
             return Err(BusFault);
         }
-        Ok(match off {
-            0x0 => self.msip as u32,
-            0x4000 => self.mtimecmp as u32,
-            0x4004 => (self.mtimecmp >> 32) as u32,
-            0xbff8 => self.mtime as u32,
-            0xbffc => (self.mtime >> 32) as u32,
-            _ => 0,
+        let half = |v: u64, high: bool| if high { (v >> 32) as u32 } else { v as u32 };
+        Ok(match self.reg(off) {
+            ClintReg::Msip(hart) => self.msip[hart] as u32,
+            ClintReg::Mtimecmp { hart, high } => half(self.mtimecmp[hart], high),
+            ClintReg::Mtime { high } => half(self.mtime, high),
+            ClintReg::Reserved => 0,
         })
     }
 
@@ -46,18 +96,29 @@ impl Clint {
         if size != 4 {
             return Err(BusFault);
         }
-        let lo = |old: u64| (old & !0xffff_ffff) | val as u64;
-        let hi = |old: u64| (old & 0xffff_ffff) | ((val as u64) << 32);
-        match off {
-            0x0 => self.msip = val & 1 != 0,
-            0x4000 => self.mtimecmp = lo(self.mtimecmp),
-            0x4004 => self.mtimecmp = hi(self.mtimecmp),
-            0xbff8 => self.mtime = lo(self.mtime),
-            0xbffc => self.mtime = hi(self.mtime),
-            _ => {}
+        let set_half = |old: &mut u64, high: bool| {
+            *old = if high {
+                (*old & 0xffff_ffff) | ((val as u64) << 32)
+            } else {
+                (*old & !0xffff_ffff) | val as u64
+            }
+        };
+        match self.reg(off) {
+            ClintReg::Msip(hart) => self.msip[hart] = val & 1 != 0,
+            ClintReg::Mtimecmp { hart, high } => set_half(&mut self.mtimecmp[hart], high),
+            ClintReg::Mtime { high } => set_half(&mut self.mtime, high),
+            ClintReg::Reserved => {}
         }
         Ok(())
     }
+}
+
+/// A CLINT register, as decoded from its offset.
+enum ClintReg {
+    Msip(usize),
+    Mtimecmp { hart: usize, high: bool },
+    Mtime { high: bool },
+    Reserved,
 }
 
 /// PLIC interrupt source of the UART's "received data available" line.
@@ -76,38 +137,68 @@ pub const NET_IRQ: u32 = 12;
 
 /// Interrupt sources 1..=31 exist; source 0 means "no interrupt".
 pub const PLIC_SOURCES: u32 = 32;
-/// Context 0 is hart 0 in M-mode (drives MEIP), context 1 is hart 0 in S-mode (drives SEIP).
-pub const PLIC_CONTEXTS: usize = 2;
+/// Contexts per hart: context `2·i` is hart `i` in M-mode (drives its MEIP), context
+/// `2·i + 1` is hart `i` in S-mode (drives its SEIP).
+pub const PLIC_CONTEXTS_PER_HART: usize = 2;
 /// Priorities and thresholds are 3 bits wide (0..=7), as on QEMU `virt`.
 const PLIC_PRIO_MASK: u32 = 7;
 
-const PLIC_PENDING: u32 = 0x1000;
-const PLIC_ENABLE: u32 = 0x2000;
-const PLIC_ENABLE_STRIDE: u32 = 0x80;
-const PLIC_ENABLE_END: u32 = PLIC_ENABLE + PLIC_ENABLE_STRIDE * PLIC_CONTEXTS as u32;
-const PLIC_CONTEXT: u32 = 0x20_0000;
-const PLIC_CONTEXT_STRIDE: u32 = 0x1000;
+pub const PLIC_PENDING: u32 = 0x1000;
+/// Context 0's enable bits; context `ctx`'s are at `PLIC_ENABLE + PLIC_ENABLE_STRIDE·ctx`.
+pub const PLIC_ENABLE: u32 = 0x2000;
+pub const PLIC_ENABLE_STRIDE: u32 = 0x80;
+/// Context 0's threshold; context `ctx`'s is at `PLIC_CONTEXT + PLIC_CONTEXT_STRIDE·ctx`,
+/// and its claim/complete register 4 bytes after it.
+pub const PLIC_CONTEXT: u32 = 0x20_0000;
+pub const PLIC_CONTEXT_STRIDE: u32 = 0x1000;
 
 /// Platform-level interrupt controller, a minimal version of the RISC-V PLIC with
-/// the QEMU `virt` register layout (spec section 7.1). One hart, two contexts.
+/// the QEMU `virt` register layout (spec section 7.1): two contexts per hart, M and S.
 ///
 /// Every source has a level-triggered gateway. The bus samples each device's line once
 /// per step: a high line makes the source pending (and pending stays set until claimed,
 /// even if the line drops), a claim clears pending and marks the source in flight, and no
 /// new request is forwarded until software completes it. A line still high at the first
-/// sample after completion makes the source pending again.
-#[derive(Default)]
+/// sample after completion makes the source pending again. Pending and in-flight bits
+/// are shared by every context: of several harts enabled for a source, the first to
+/// claim it gets it, and the others' claims return 0.
 pub struct Plic {
     priority: [u32; PLIC_SOURCES as usize],
     /// Bit n: source n has a request waiting to be claimed.
     pending: u32,
     /// Bit n: source n was claimed and not completed yet.
     in_flight: u32,
-    enable: [u32; PLIC_CONTEXTS],
-    threshold: [u32; PLIC_CONTEXTS],
+    /// Per context.
+    enable: Vec<u32>,
+    /// Per context.
+    threshold: Vec<u32>,
+}
+
+impl Default for Plic {
+    /// The PLIC of a one-hart machine: two contexts.
+    fn default() -> Self {
+        Plic::new(1)
+    }
 }
 
 impl Plic {
+    /// The PLIC of a machine with `harts` harts: [`PLIC_CONTEXTS_PER_HART`] each.
+    pub fn new(harts: usize) -> Self {
+        let contexts = harts * PLIC_CONTEXTS_PER_HART;
+        Plic {
+            priority: [0; PLIC_SOURCES as usize],
+            pending: 0,
+            in_flight: 0,
+            enable: vec![0; contexts],
+            threshold: vec![0; contexts],
+        }
+    }
+
+    /// How many contexts there are.
+    pub fn contexts(&self) -> usize {
+        self.enable.len()
+    }
+
     /// Samples source `src`'s interrupt line (the bus calls this between instructions).
     /// The gateway forwards a request when the line is high and the source is not in flight.
     pub fn set_level(&mut self, src: u32, high: bool) {
@@ -133,7 +224,8 @@ impl Plic {
         best.0
     }
 
-    /// Whether context `ctx`'s external interrupt line (MEIP for 0, SEIP for 1) is high.
+    /// Whether context `ctx`'s external interrupt line (its hart's MEIP for an even `ctx`, SEIP
+    /// for an odd one) is high.
     pub fn irq(&self, ctx: usize) -> bool {
         self.best(ctx) != 0
     }
@@ -159,11 +251,13 @@ impl Plic {
 
     /// Decodes a register offset. Only the first word of each enable block exists
     /// (sources 0..=31); everything not listed is reserved: reads 0, writes ignored.
-    fn reg(off: u32) -> PlicReg {
+    fn reg(&self, off: u32) -> PlicReg {
+        let contexts = self.contexts();
+        let enable_end = PLIC_ENABLE + PLIC_ENABLE_STRIDE * contexts as u32;
         let (ctx, rel) = match off {
             o if o < 4 * PLIC_SOURCES => return PlicReg::Priority((o / 4) as usize),
             PLIC_PENDING => return PlicReg::Pending,
-            o if (PLIC_ENABLE..PLIC_ENABLE_END).contains(&o) => {
+            o if (PLIC_ENABLE..enable_end).contains(&o) => {
                 let rel = o - PLIC_ENABLE;
                 return match (rel / PLIC_ENABLE_STRIDE, rel % PLIC_ENABLE_STRIDE) {
                     (ctx, 0) => PlicReg::Enable(ctx as usize),
@@ -177,7 +271,7 @@ impl Plic {
             _ => return PlicReg::Reserved,
         };
         match rel {
-            _ if ctx >= PLIC_CONTEXTS => PlicReg::Reserved,
+            _ if ctx >= contexts => PlicReg::Reserved,
             0 => PlicReg::Threshold(ctx),
             4 => PlicReg::ClaimComplete(ctx),
             _ => PlicReg::Reserved,
@@ -188,7 +282,7 @@ impl Plic {
         if size != 4 || off & 3 != 0 {
             return Err(BusFault);
         }
-        Ok(match Self::reg(off) {
+        Ok(match self.reg(off) {
             PlicReg::Priority(src) => self.priority[src],
             PlicReg::Pending => self.pending,
             PlicReg::Enable(ctx) => self.enable[ctx],
@@ -202,7 +296,7 @@ impl Plic {
         if size != 4 || off & 3 != 0 {
             return Err(BusFault);
         }
-        match Self::reg(off) {
+        match self.reg(off) {
             // Source 0 does not exist: its priority stays 0 and it cannot be enabled.
             PlicReg::Priority(src) if src > 0 => self.priority[src] = val & PLIC_PRIO_MASK,
             PlicReg::Enable(ctx) => self.enable[ctx] = val & !1,
@@ -336,6 +430,57 @@ impl TestDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clint_layout_has_a_msip_and_a_mtimecmp_per_hart() {
+        let mut c = Clint::new(3);
+        let r = |c: &mut Clint, off| c.read(off, 4).unwrap();
+        c.write(8, 4, 0xffff_ffff).unwrap(); // msip[2]: bit 0 only
+        assert_eq!(c.msip, [false, false, true]);
+        assert_eq!(
+            [r(&mut c, 0), r(&mut c, 4), r(&mut c, 8), r(&mut c, 12)],
+            [0, 0, 1, 0]
+        );
+        c.write(0x4010, 4, 7).unwrap(); // mtimecmp[2], low half
+        assert_eq!(c.mtimecmp, [u64::MAX, u64::MAX, 0xffff_ffff_0000_0007]);
+        c.write(0x4014, 4, 0).unwrap();
+        assert_eq!(r(&mut c, 0x4010), 7);
+        assert_eq!(r(&mut c, 0x4018), 0, "no hart 3");
+        c.write(0x4018, 4, 1).unwrap();
+        // Misaligned and narrow accesses.
+        assert_eq!(r(&mut c, 2), 0);
+        assert_eq!(c.read(0, 2), Err(BusFault));
+        assert_eq!(c.write(0x4000, 1, 0), Err(BusFault));
+        c.write(CLINT_MTIME, 4, 7).unwrap();
+        assert!(c.timer_pending(2));
+        assert!(!c.timer_pending(0));
+        assert_eq!(
+            c.next_deadline(),
+            None,
+            "hart 2's is already due, the others unset"
+        );
+        c.mtimecmp[1] = 10;
+        c.mtimecmp[0] = 20;
+        assert_eq!(c.next_deadline(), Some(10));
+    }
+
+    #[test]
+    fn plic_contexts_follow_the_hart_count() {
+        let mut p = Plic::new(3);
+        assert_eq!(p.contexts(), 6);
+        w(&mut p, 4, 1);
+        p.set_level(1, true);
+        let last = PLIC_CONTEXTS_PER_HART as u32 * 3 - 1;
+        w(&mut p, PLIC_ENABLE + PLIC_ENABLE_STRIDE * last, 0b10);
+        assert_eq!(r(&mut p, PLIC_ENABLE + PLIC_ENABLE_STRIDE * last), 0b10);
+        assert!(p.irq(last as usize));
+        assert!((0..last as usize).all(|ctx| !p.irq(ctx)));
+        // Nothing past the last context.
+        w(&mut p, PLIC_ENABLE + PLIC_ENABLE_STRIDE * (last + 1), 0b10);
+        assert_eq!(r(&mut p, PLIC_ENABLE + PLIC_ENABLE_STRIDE * (last + 1)), 0);
+        assert_eq!(r(&mut p, PLIC_CONTEXT + PLIC_CONTEXT_STRIDE * (last + 1) + 4), 0);
+        assert_eq!(r(&mut p, PLIC_CONTEXT + PLIC_CONTEXT_STRIDE * last + 4), 1);
+    }
 
     const CLAIM0: u32 = PLIC_CONTEXT + 4;
     const CLAIM1: u32 = PLIC_CONTEXT + PLIC_CONTEXT_STRIDE + 4;
@@ -537,7 +682,7 @@ mod tests {
         // Only the first word of each enable block (sources 0..=31) exists. Drivers that
         // clear every enable word must not wipe the real one.
         w(&mut p, PLIC_ENABLE + PLIC_ENABLE_STRIDE, 0b0110);
-        for ctx in 0..PLIC_CONTEXTS as u32 {
+        for ctx in 0..PLIC_CONTEXTS_PER_HART as u32 {
             for word in [4, 8, PLIC_ENABLE_STRIDE - 4] {
                 let off = PLIC_ENABLE + ctx * PLIC_ENABLE_STRIDE + word;
                 w(&mut p, off, 0);
@@ -549,7 +694,7 @@ mod tests {
         assert_eq!(r(&mut p, PLIC_ENABLE + PLIC_ENABLE_STRIDE), 0b0110);
         // Same for the words after each context's threshold and claim/complete registers.
         w(&mut p, THRESHOLD1, 5);
-        for ctx in 0..PLIC_CONTEXTS as u32 {
+        for ctx in 0..PLIC_CONTEXTS_PER_HART as u32 {
             for word in [8, 12, PLIC_CONTEXT_STRIDE - 4] {
                 let off = PLIC_CONTEXT + ctx * PLIC_CONTEXT_STRIDE + word;
                 w(&mut p, off, 0xffff_ffff);

@@ -8,7 +8,8 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: grail [options] <program.elf>
 
-  --trace         print every instruction before it runs
+  --trace         print every instruction before it runs (with its hart's
+                  number, h0, h1, ..., on a machine of several harts)
   --max-steps N   stop after N steps (exit code 124)
   --ram MiB       RAM size in MiB, 1 to 2048 (default 128)
   --clock FREQ    real time: run FREQ instructions per second, and mtime ticks at FREQ.
@@ -17,6 +18,10 @@ const USAGE: &str = "usage: grail [options] <program.elf>
                   --clock 10MHz, --clock 500kHz, --clock 1.5MHz, --clock 5Hz.
                   Without it Grail runs at full speed, deterministically, and reports
                   a nominal 10 MHz clock to software
+  --harts N       N harts (cores), 1 to 8 (default 1). They share memory and
+                  devices and take turns, one instruction each per step, so
+                  with --clock each runs at FREQ. Hart 0 starts the program;
+                  the others wait in the boot ROM until an IPI (spec section 7)
   --disk IMG      attach the image file IMG as the next disk (spec section 9.6),
                   read-write: the program's writes change the file. IMG must be a
                   whole number of 512-byte sectors. Repeat for more disks (up to 8).
@@ -78,6 +83,10 @@ fn main() -> ExitCode {
             },
             "--clock" => match value(&mut args, "--clock", grail::parse_clock) {
                 Some(hz) => config.clock_hz = Some(hz),
+                None => return ExitCode::from(2),
+            },
+            "--harts" => match value(&mut args, "--harts", grail::parse_harts) {
+                Some(n) => config.harts = n,
                 None => return ExitCode::from(2),
             },
             "--disk" | "--disk-ro" => match value(&mut args, &a, DiskConfig::parse) {
@@ -151,6 +160,7 @@ fn main() -> ExitCode {
     if fb && !headless && !display::WINDOW_SUPPORTED {
         eprintln!("grail: no framebuffer window on this platform, running headless");
     }
+    let several_harts = m.config().harts > 1;
     let name = std::path::Path::new(&path)
         .file_name()
         .map_or(path.clone(), |n| n.to_string_lossy().into());
@@ -166,7 +176,11 @@ fn main() -> ExitCode {
             if trace {
                 let word = cpu.bus.peek(cpu.pc);
                 let text = word.map_or("<unmapped>".to_string(), |w| excalibur::decode(w).to_string());
-                eprintln!("{:?} {:08x}: {}", cpu.mode, cpu.pc, text);
+                if several_harts {
+                    eprintln!("h{} {:?} {:08x}: {}", cpu.id, cpu.mode, cpu.pc, text);
+                } else {
+                    eprintln!("{:?} {:08x}: {}", cpu.mode, cpu.pc, text);
+                }
             }
         },
         &opts,

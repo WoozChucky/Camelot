@@ -161,10 +161,10 @@ fn lr_sc_pair_succeeds_once() {
     set(&mut m, A1, 99);
     step(&mut m);
     assert_eq!(reg(&m, A2), 7);
-    assert_eq!(m.cpu.reservation.held(), Some(DATA));
+    assert_eq!(m.cpu.reservation().held(), Some(DATA));
     step(&mut m);
     assert_eq!((reg(&m, A2), word(&mut m, DATA)), (0, 99), "sc succeeds");
-    assert_eq!(m.cpu.reservation.held(), None);
+    assert_eq!(m.cpu.reservation().held(), None);
     poke(&mut m, DATA, 1);
     step(&mut m);
     assert_eq!((reg(&m, A2), word(&mut m, DATA)), (1, 1), "a second sc fails");
@@ -239,20 +239,20 @@ fn traps_break_the_reservation() {
     let mut m = machine(&[lr(A2, A0), ECALL]);
     set(&mut m, A0, DATA);
     step(&mut m);
-    assert_eq!(m.cpu.reservation.held(), Some(DATA));
+    assert_eq!(m.cpu.reservation().held(), Some(DATA));
     step_traps(&mut m, 11, 0);
-    assert_eq!(m.cpu.reservation.held(), None);
+    assert_eq!(m.cpu.reservation().held(), None);
 
     // An interrupt too: the machine timer, with mtimecmp already passed.
     let mut m = machine(&[lr(A2, A0)]);
     set(&mut m, A0, DATA);
     step(&mut m);
-    m.cpu.bus.clint.mtimecmp = 0;
+    m.cpu.bus.clint.mtimecmp[0] = 0;
     m.cpu.csr.mie = 1 << 7;
     m.cpu.csr.mstatus |= 1 << 3;
     m.cpu.step();
     assert_eq!(m.cpu.csr.mcause, 0x8000_0007);
-    assert_eq!(m.cpu.reservation.held(), None);
+    assert_eq!(m.cpu.reservation().held(), None);
 }
 
 #[test]
@@ -374,7 +374,7 @@ fn lr_faults_like_a_load_and_sc_like_a_store() {
     assert_eq!(word(&mut m, pte) & (PTE_A | PTE_D), PTE_A);
     // sc there, holding a reservation, is a store page fault.
     step_traps(&mut m, 15, VA);
-    assert_eq!(m.cpu.reservation.held(), None);
+    assert_eq!(m.cpu.reservation().held(), None);
 
     // lr on an unmapped page is a load page fault.
     let mut m = paged_machine(&[lr(A2, A0)]);
@@ -400,7 +400,7 @@ fn reservations_are_on_physical_addresses() {
     set(&mut m, A0, VA + 8);
     set(&mut m, A1, 77);
     step(&mut m);
-    assert_eq!(m.cpu.reservation.held(), Some(PAGE + 8));
+    assert_eq!(m.cpu.reservation().held(), Some(PAGE + 8));
     step(&mut m);
     assert_eq!((reg(&m, A2), word(&mut m, PAGE + 8)), (0, 77));
 }

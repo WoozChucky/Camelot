@@ -65,7 +65,7 @@ fn setup() -> (NetDevice, TestBackend, Vec<u8>) {
 }
 
 fn w(d: &mut NetDevice, ram: &mut [u8], off: u32, val: u32) {
-    d.write(off, 4, val, ram).unwrap();
+    d.write(off, 4, val, ram, &mut |_, _| {}).unwrap();
 }
 
 fn r(d: &NetDevice, off: u32) -> u32 {
@@ -449,6 +449,31 @@ fn receive_reports_the_ram_it_writes() {
     assert_eq!(writes, [(BUFS, 20), (RX_RING + 2 * DESC_SIZE + 4, 4)]);
 }
 
+/// Completing a transmit descriptor is a RAM write too: the card reports each
+/// descriptor's length and status, whether the frame went or not, and nothing else.
+#[test]
+fn transmit_reports_the_ram_it_writes() {
+    let (mut d, wire, mut ram) = setup();
+    rings(&mut d, &mut ram, 4);
+    let tail = queue_tx(&d, &mut ram, 0, 0, &frame(60, 1));
+    // A bad length: not sent, but its descriptor still gets a status.
+    set_desc(&mut ram, TX_RING, 1, BUFS, 3);
+    let mut writes = Vec::new();
+    d.write(REG_TX_TAIL, 4, tail + 1, &mut ram, &mut |addr, len| {
+        writes.push((addr, len))
+    })
+    .unwrap();
+    assert_eq!(wire.sent().len(), 1);
+    assert_eq!(writes, [(TX_RING + 4, 4), (TX_RING + DESC_SIZE + 4, 4)]);
+    // Other registers write no RAM.
+    writes.clear();
+    d.write(REG_IRQ_STATUS, 4, IRQ_ALL, &mut ram, &mut |addr, len| {
+        writes.push((addr, len))
+    })
+    .unwrap();
+    assert_eq!(writes, []);
+}
+
 #[test]
 fn a_full_receive_ring_drops_and_counts() {
     let (mut d, wire, mut ram) = setup();
@@ -658,8 +683,9 @@ fn registers_are_word_only() {
     queue_tx(&d, &mut ram, 0, 0, &frame(20, 0));
     for size in [1, 2] {
         assert_eq!(d.read(REG_MAC_LO, size), Err(BusFault));
-        assert_eq!(d.write(REG_TX_TAIL, size, 1, &mut ram), Err(BusFault));
-        assert_eq!(d.write(REG_TX_BASE, size, 0, &mut ram), Err(BusFault));
+        let no_dma = &mut |_, _| {};
+        assert_eq!(d.write(REG_TX_TAIL, size, 1, &mut ram, no_dma), Err(BusFault));
+        assert_eq!(d.write(REG_TX_BASE, size, 0, &mut ram, no_dma), Err(BusFault));
     }
     assert!(wire.sent().is_empty(), "a faulting write sends nothing");
     assert_eq!(r(&d, REG_TX_TAIL), 0);

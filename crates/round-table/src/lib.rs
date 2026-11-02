@@ -7,7 +7,7 @@
 
 use avalon_client::{
     device_name, disk_source_text, format_hz, format_size, mac_text, parse_addr, parse_clock,
-    parse_disk_size, parse_disk_source, parse_net, parse_ram, Client, VmAction,
+    parse_disk_size, parse_disk_source, parse_harts, parse_net, parse_ram, Client, VmAction,
 };
 use avalon_proto::{
     validate_name, DeviceSpec, DiskInfo, DiskSpec, HardwareProfile, NetSpec, PortOwner, SwitchInfo,
@@ -53,6 +53,7 @@ create options:
                   number with an optional unit, Hz, kHz or MHz: 10MHz, 500kHz,
                   1.5MHz, 5Hz. Without it the VM runs at full speed and
                   reports a nominal 10 MHz clock
+  --harts N       harts (cores), 1 to 8 (default 1); each runs at the clock
   --disk SRC      attach a disk, read-write: the path of an image file on
                   Avalon's host (relative to Avalon's working directory), or
                   lake://ADDR/NAME for the image NAME on a Lake server.
@@ -206,12 +207,13 @@ pub fn run(args: &[String], out: &mut dyn Write) -> Result<(), Failure> {
 // ---- Parsing ----
 
 /// Every option, and whether it takes a value.
-const OPTIONS: [(&str, bool); 12] = [
+const OPTIONS: [(&str, bool); 13] = [
     ("--server", true),
     ("--lake", true),
     ("--name", true),
     ("--ram", true),
     ("--clock", true),
+    ("--harts", true),
     ("--disk", true),
     ("--disk-ro", true),
     ("--start", false),
@@ -294,6 +296,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
                 "--name",
                 "--ram",
                 "--clock",
+                "--harts",
                 "--disk",
                 "--disk-ro",
                 "--net",
@@ -402,6 +405,7 @@ fn parse_create(rest: &[&str], options: &[(&'static str, String)]) -> Result<Cre
             }
             "--ram" => profile.ram_size = parse_ram(value).map_err(with)?,
             "--clock" => profile.clock_hz = Some(parse_clock(value).map_err(with)?),
+            "--harts" => profile.harts = parse_harts(value).map_err(with)?,
             "--disk" | "--disk-ro" => profile.devices.push(DeviceSpec::Disk(DiskSpec {
                 source: parse_disk_source(value).map_err(with)?,
                 read_only: *flag == "--disk-ro",
@@ -777,11 +781,12 @@ pub fn vm_details(details: &VmDetails) -> String {
         ),
     };
     let mut text = format!(
-        "id       {}\nname     {}\nstate    {}\nRAM      {}\nclock    {clock}\nsteps    {steps}\n",
+        "id       {}\nname     {}\nstate    {}\nRAM      {}\nclock    {clock}\nharts    {}\nsteps    {steps}\n",
         vm.id,
         vm.name,
         vm.state,
         format_size(vm.profile.ram_size),
+        vm.profile.harts,
     );
     let lines: Vec<String> = disks(&vm.profile)
         .map(|disk| {
@@ -978,7 +983,7 @@ mod tests {
     #[test]
     fn create() {
         let Command::Create(c) = command(
-            "create --name web --ram 64 --clock 10MHz --disk lake://lake:7401/data --disk-ro boot.img --start prog.elf",
+            "create --name web --ram 64 --clock 10MHz --harts 4 --disk lake://lake:7401/data --disk-ro boot.img --start prog.elf",
         ) else {
             panic!()
         };
@@ -988,6 +993,7 @@ mod tests {
         assert_eq!(c.profile.ram_size, 64 << 20);
         assert_eq!(c.profile.clock_hz, Some(10_000_000));
         assert_eq!(c.profile.nominal_hz, avalon_proto::DEFAULT_NOMINAL_HZ);
+        assert_eq!(c.profile.harts, 4);
         assert_eq!(
             c.profile.devices,
             vec![
@@ -1066,6 +1072,11 @@ mod tests {
                 "create a.elf --name a --clock fast",
                 "--clock: 'fast' is not a frequency",
             ),
+            (
+                "create a.elf --name a --harts 9",
+                "--harts: 9 harts is out of range (1 to 8)",
+            ),
+            ("list --harts 2", "'list' does not take --harts"),
             ("create a.elf --name a --disk lake://x/", "--disk: 'lake://x/'"),
             ("create a.elf --name a --disk", "--disk needs a value"),
             ("disk", "'disk' needs a command"),
@@ -1178,6 +1189,7 @@ mod tests {
             ram_size: 64 << 20,
             clock_hz: Some(1_500_000),
             nominal_hz: 10_000_000,
+            harts: 2,
             devices: vec![
                 disk("lake://10.0.0.9:7401/data", false),
                 DeviceSpec::Net(parse_net("lan,mac=02:ca:00:00:00:01").unwrap()),
@@ -1223,6 +1235,7 @@ name     web
 state    running
 RAM      64 MiB
 clock    1.5 MHz (real time)
+harts    2
 steps    12345
 disks    lake://10.0.0.9:7401/data (read-write)
          boot.img (read-only)
