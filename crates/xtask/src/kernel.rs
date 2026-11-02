@@ -691,9 +691,21 @@ mod tests {
         let elf = std::fs::read(&b.out).unwrap();
         let built = build_merlin(&b.kernel_dir, None).unwrap();
         assert_eq!(elf, built.elf);
-        // The disk kernel, next to it.
+        // The disk kernel, next to it: the same kernel with no built-in programs
+        // (`user_program_count` 0 where the full kernel has them all).
         let disk = std::fs::read(dir.join("out").join("kernel-disk.elf")).unwrap();
-        assert_eq!(disk, disk_kernel(&b.kernel_dir, &built).unwrap());
+        let programs = |elf: &[u8]| {
+            let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+            m.load_elf(elf).unwrap();
+            let at = grail::elf::parse(elf)
+                .unwrap()
+                .symbol("user_program_count")
+                .unwrap();
+            m.cpu.bus.peek(at).unwrap()
+        };
+        assert!(programs(&elf) > 0);
+        assert_eq!(programs(&disk), 0);
+        assert!(disk.len() < elf.len());
         for f in ["main.c.s", "main.c.o", "entry.s.o", "userprogs.s.o"] {
             assert!(b.obj_dir.join(f).is_file(), "{f}");
         }

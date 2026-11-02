@@ -732,7 +732,7 @@ mod tests {
             Some(Region {
                 name: "RAM".into(),
                 origin: 0x8000_0000,
-                length: 128 << 20
+                length: 4 << 20
             })
         );
         assert_eq!(s.commands.len(), 7);

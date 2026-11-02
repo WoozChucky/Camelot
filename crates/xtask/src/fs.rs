@@ -98,11 +98,18 @@ pub fn build_bootable(root: &Path, size: u32) -> Result<Vec<u8>, String> {
         std::fs::read(&kernel_path).map_err(|e| format!("cannot read {}: {e}", kernel_path.display()))?;
     let opts = bootable_layout(size, &kernel)?;
     let mut image = build(root, &opts).map_err(|e| {
-        format!(
-            "the root filesystem does not fit in a {size}-block image, where the kernel leaves it {} \
-             blocks ({e}): give a bigger --size",
-            opts.size
-        )
+        // Only running out of blocks or inodes is cured by a bigger image;
+        // anything else (a missing file, a program that does not compile, a
+        // size too big for a filesystem) is reported as it is.
+        if e.contains("no space left") || e.contains("no inode left") {
+            format!(
+                "the root filesystem does not fit in a {size}-block image, where the kernel leaves it \
+                 {} blocks ({e}): give a bigger --size",
+                opts.size
+            )
+        } else {
+            format!("cannot build a {size}-block root image: {e}")
+        }
     })?;
     camelot_fs::boot::install(&mut image, &crate::boot::bootloader(root)?, &kernel)?;
     debug_assert_eq!(image.len(), size as usize * BSIZE);
