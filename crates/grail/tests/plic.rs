@@ -57,7 +57,7 @@ fn store_insn(funct3: u32, rs2: u32, rs1: u32, imm: u32) -> u32 {
 /// A machine whose RAM starts with `program` (then nops), pc at RAM, mtvec at [`HANDLER`],
 /// a host input channel on the UART, and the UART's PLIC source at priority 1.
 fn machine(program: &[u32]) -> (Machine, Sender<u8>) {
-    let mut m = Machine::new(64 * 1024);
+    let mut m = Machine::with_ram(64 * 1024);
     let mut code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     code.extend(std::iter::repeat_n([0x13, 0, 0, 0], 64).flatten()); // nops
     m.cpu.bus.load(RAM_BASE, &code).unwrap();
@@ -283,7 +283,7 @@ fn page_table_walks_into_the_plic_are_access_faults_and_claim_nothing() {
 
 /// Runs the echo example with `input` already queued on the UART.
 fn run_echo(input: &[u8]) -> (RunResult, String) {
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.load_elf(&std::fs::read(echo_elf()).unwrap()).unwrap();
     let (tx, rx) = channel();
     m.cpu.bus.uart.input = Some(rx);
@@ -307,7 +307,7 @@ fn echo_example_takes_one_interrupt_per_byte() {
 
 #[test]
 fn echo_example_sleeps_until_input_arrives() {
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.load_elf(&std::fs::read(echo_elf()).unwrap()).unwrap();
     let (tx, rx) = channel();
     m.cpu.bus.uart.input = Some(rx);

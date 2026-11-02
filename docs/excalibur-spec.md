@@ -125,14 +125,22 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 | 0x0010_0000 | Test/exit device: write 0x5555 = pass/exit, 0x3333 = fail (used by riscv-tests) |
 | 0x3000_0000 - 0x3000_0FFF | Framebuffer control (Xcal, section 9.3) |
 | 0x3000_1000 - 0x3000_1FFF | Keyboard (Xcal, section 9.4) |
+| 0x3000_2000 - 0x3000_2FFF | Sysinfo: RAM size, clock, device table (Xcal, section 9.5) |
 | 0x3100_0000 - 0x3112_BFFF | Framebuffer VRAM |
-| 0x8000_0000 - 0x87FF_FFFF | RAM, 128 MiB default (configurable) |
+| 0x8000_0000 - 0x87FF_FFFF | RAM, 128 MiB default (`--ram`, 1-2048 MiB; software reads the size from sysinfo) |
 
 Unmapped accesses raise access-fault exceptions. Instructions and page tables live only in RAM and the boot ROM: an instruction fetch from VRAM or from any other range raises an instruction access fault, and a Sv32 page-table walk that reads a PTE outside them raises an access fault of the original access type. So neither can trigger a device register's read side effect (such as a PLIC claim).
 
-Timer: `mtime` increments once per executed instruction, so runs are deterministic and reproducible. During `wfi`, Grail jumps `mtime` forward to `mtimecmp` instead of spinning. (A real-time mode can be added later.) MTIP is pending while `mtime >= mtimecmp`. Software converts `mtime` to time with a nominal timebase of 10 MHz; without pacing this is a convention, not wall-clock time.
+RAM: `--ram MiB` takes a whole number from 1 to 2048, the most that fits between 0x8000_0000 and the top of the 32-bit address space; anything else is rejected with an error. (As a library, Grail accepts any non-zero multiple of 4 KiB up to 2 GiB.) Software must not assume a size: it reads `SYS_RAM_SIZE` (section 9.5).
 
-UART: writing THR prints the byte to the host terminal. RBR is fed from host stdin. LSR bit 5 (THRE) always 1, bit 0 (DR) set when input is available. IER bit 0 (ERBFI) enables the "received data available" interrupt: the UART holds PLIC source 1 high while IER bit 0 and LSR.DR are both set, so reading RBR until DR clears lowers it. IIR (@+2, read) reports 0x04 while that interrupt is asserted, else 0x01 (none). The other IER bits are stored but raise nothing (no transmit, line-status or modem interrupts).
+Clock: one instruction is one cycle is one `mtime` tick, so the CPU clock and the timebase frequency are the same number. Both are reported in Hz by sysinfo (`SYS_CPU_HZ`, `SYS_TIMEBASE_HZ`), so software computes timer intervals from them (a 10 ms tick is `hz / 100` ticks) instead of hard-coding a rate. Two modes:
+
+- **Default (no `--clock`)**: Grail runs as fast as it can and the run is deterministic and reproducible. It still reports a nominal clock of 10 MHz, so software computes intervals the same way in both modes.
+- **Real time (`--clock FREQ`)**: Grail paces execution to FREQ instructions per wall-clock second, and `SYS_FLAGS` bit 0 is set. FREQ is a number with an optional unit, case-insensitive: `Hz`, `kHz` or `MHz` (`--clock 10MHz`, `--clock 500kHz`, `--clock 5Hz`); a bare number is Hz. Fractions are allowed when the result is a whole number of Hz (`--clock 1.5MHz`, not `--clock 1.5Hz`); 0 and values above 2^32 - 1 Hz are rejected. Pacing works in batches of about 1 ms of guest time, sleeping whenever the machine is ahead of the wall clock, not per instruction. If the host falls more than ~100 ms behind (it is slower than FREQ, or the machine was paused), the lag is dropped rather than caught up at full speed.
+
+Timer: `mtime` increments once per step (an executed instruction, a taken interrupt, or a tick spent waiting in `wfi`). MTIP is pending while `mtime >= mtimecmp`. During `wfi` with nothing pending, the default mode jumps `mtime` forward to `mtimecmp` instead of spinning; in real-time mode the wait lasts the real time until `mtimecmp` (`mtime` keeps ticking at FREQ; Grail skips the idle ticks of each batch at once and sleeps), and device input such as a UART byte still wakes the hart within about one batch.
+
+UART: writing THR sends the byte to the machine's console, which for the `grail` command is the host terminal (stdout); RBR is fed from the console's input (host stdin). Each machine has its own console, so a host can run several machines in one process. LSR bit 5 (THRE) always 1, bit 0 (DR) set when input is available. IER bit 0 (ERBFI) enables the "received data available" interrupt: the UART holds PLIC source 1 high while IER bit 0 and LSR.DR are both set, so reading RBR until DR clears lowers it. IIR (@+2, read) reports 0x04 while that interrupt is asserted, else 0x01 (none). The other IER bits are stored but raise nothing (no transmit, line-status or modem interrupts).
 
 ### 7.1 PLIC
 
@@ -182,7 +190,7 @@ xcal.dbg rs1        custom-0 (0001011), funct3=000, rd=0, imm=0
 encoding: 0000_0000_0000 | rs1 | 000 | 00000 | 0001011
 ```
 
-Prints the register to the emulator's console (stderr), e.g. `[dbg] pc=80000010 a0 = 0x0000002a (42)`. No architectural side effects. Legal in every mode. Meant for the first days of the kernel, before the UART driver exists.
+Prints the register to the machine's debug console (stderr for the `grail` command), e.g. `[dbg] pc=80000010 a0 = 0x0000002a (42)`. No architectural side effects. Legal in every mode. Meant for the first days of the kernel, before the UART driver exists.
 
 ### 9.2 Xcalhalt: stop the machine
 
@@ -215,7 +223,7 @@ Details:
 - `FB_CTRL` bits other than bit 0 are reserved, read as 0. Both registers reset to 0, so the display starts disabled.
 - While the display is disabled it shows black; VRAM keeps its contents and can be drawn into before enabling.
 - VRAM is plain memory: byte, halfword and word accesses, same alignment rules as RAM (section 4). It resets to 0. The top byte of each pixel is ignored. Byte order in memory is B, G, R, X, which is also a 32-bpp Windows DIB, so Grail blits it without conversion.
-- Grail runs everything on one thread: the CPU runs in slices that end early right after a `FB_PRESENT` write; between slices it pumps the window's messages and redraws on a present, when Windows asks for a repaint, or when ~16 ms of host time have passed. The window is opened only with `--fb` (Windows only; elsewhere Grail warns and runs headless, the default). The image is stretched to the window's client area. Closing the window stops the emulator (exit code 0); if the program stops first, the window stays open on the last frame until it is closed, and Grail then exits with the program's code.
+- Grail runs a machine and its window on one thread: the CPU runs in slices that end early right after a `FB_PRESENT` write (or, with `--clock`, when it is ahead of the wall clock; Grail then sleeps at most ~10 ms at a time so the window stays responsive); between slices it pumps the window's messages and redraws on a present, when Windows asks for a repaint, or when ~16 ms of host time have passed. The window is opened only with `--fb` (Windows only; elsewhere Grail warns and runs headless, the default). The image is stretched to the window's client area. Closing the window stops the emulator (exit code 0); if the program stops first, the window stays open on the last frame until it is closed, and Grail then exits with the program's code.
 - `--fb-dump DIR` writes `DIR/frame-NNNN.ppm` (binary P6, 640×480, numbered from 0000) after every `FB_PRESENT` and once more when the machine stops. It works with or without the window.
 
 ### 9.4 Keyboard (MMIO)
@@ -246,6 +254,50 @@ Details:
 - Shift and Ctrl (and Alt) send no events of their own; they only set bits 9 and 10 of other keys' events, as held at that moment. Ctrl+Alt is AltGr on Windows: it types the layout's AltGr character and does not set bit 10.
 - A release carries the same code as its press, even if Shift changed in between. A held key auto-repeats as more press events. When the window loses focus, every key it saw go down gets a release event, so none stays stuck.
 - Grail delivers the events typed into the framebuffer window between instruction slices (section 9.3). Without a window (headless) nothing produces events and the device stays empty; the UART remains the text input. Hosts that embed Grail as a library inject events with `Machine::key_event`, the same entry point the window uses.
+
+### 9.5 Sysinfo (MMIO)
+
+Read-only registers that describe the machine, so software discovers its hardware instead of hard-coding it: the kernel takes the RAM size for its page allocator and the timebase for its timer tick from here. A hypervisor host running several Grail machines gives each its own values.
+
+| Address | Register | Notes |
+|---|---|---|
+| 0x3000_2000 | `SYS_MAGIC` | 0x5359_5349 ("SYSI"): the block is present |
+| 0x3000_2004 | `SYS_VERSION` | 1. Changes only if an existing register changes meaning; new registers and device types do not need a new version |
+| 0x3000_2008 | `SYS_RAM_BASE` | 0x8000_0000 |
+| 0x3000_200C | `SYS_RAM_SIZE` | RAM size in bytes (a multiple of 4 KiB; 0x0800_0000 by default, 0x8000_0000 at most) |
+| 0x3000_2010 | `SYS_TIMEBASE_HZ` | `mtime` frequency in Hz |
+| 0x3000_2014 | `SYS_CPU_HZ` | CPU clock in Hz; equal to the timebase (one instruction per tick) |
+| 0x3000_2018 | `SYS_FLAGS` | bit 0 = the clock is real time (`--clock`); clear = nominal (default 10 MHz, runs at full speed). Other bits are reserved and read as 0 |
+| 0x3000_201C | `SYS_DEV_COUNT` | number of device table entries |
+| 0x3000_2020 - 0x3000_203F | reserved | read as 0 |
+| 0x3000_2040 + 16·i | device table entry `i` | four words, below |
+
+Frequencies are plain 32-bit Hz values, like the device-tree `timebase-frequency` property, so a 10 ms tick is `SYS_TIMEBASE_HZ / 100` ticks.
+
+Device table entry `i` (for `i` < `SYS_DEV_COUNT`; at most 252 fit in the page):
+
+| Offset | Field | Notes |
+|---|---|---|
+| +0x0 | `DEV_TYPE` | device type code, below |
+| +0x4 | `DEV_BASE` | physical address of its MMIO range |
+| +0x8 | `DEV_SIZE` | size of that range in bytes |
+| +0xC | `DEV_IRQ` | its PLIC source (section 7.1), 0 = none |
+
+| Type | Device |
+|---|---|
+| 0 | none (never listed) |
+| 1 | CLINT (section 7) |
+| 2 | PLIC (section 7.1) |
+| 3 | UART, 16550 subset (section 7) |
+| 4 | Test/exit device (section 7) |
+| 5 | Framebuffer control (section 9.3) |
+| 6 | Framebuffer VRAM (section 9.3) |
+| 7 | Sysinfo (this block) |
+| 8 | Keyboard (section 9.4) |
+
+Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device (block storage, say) gets the next code and an entry, with no new registers and no change to this layout. Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), framebuffer control, keyboard (irq 2), sysinfo and VRAM; `examples/sysinfo` prints the table.
+
+The registers are 32-bit only: byte or halfword accesses raise access faults. Word writes are ignored, as for the framebuffer's read-only registers. Offsets past the last entry read as 0.
 
 ## 10. Toolchain (all our own)
 
@@ -376,7 +428,7 @@ Kernel C stays inside what Merlin will compile: no libc headers (`-nostdinc`), n
 4. **merlin-as** emitting ELF `.o`. Validate with `llvm-objdump` and ld.lld.
 5. **merlin-ld**. Validate against clang-produced objects.
 6. **Bare-metal hello world** written in our assembly, built entirely with our tools.
-7. **M extension** in merlin-as (Grail already passes rv32um). **Xcal devices** in Grail: framebuffer window and keyboard via Win32 FFI.
+7. **M extension** in merlin-as (Grail already passes rv32um). **Xcal devices** in Grail: framebuffer window and keyboard via Win32 FFI, sysinfo, and a configurable machine (RAM size, real-time clock) that a host can run several of.
 8. **Merlin v0**: C subset → assembly. Grow it test by test.
 9. **Camelot kernel** in C (clang first, our compiler as it catches up): trap handling, timer, UART driver, then paging (Sv32), processes, syscalls.
 10. **Self-hosting stretch goal**: our tools running on our OS.

@@ -26,7 +26,7 @@ fn example(name: &str) -> PathBuf {
 }
 
 fn load(name: &str) -> Machine {
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.load_elf(&std::fs::read(example(name)).unwrap()).unwrap();
     m.cpu.bus.uart.capture = true;
     m
@@ -51,7 +51,7 @@ fn type_text(m: &mut Machine, text: &str) {
 
 /// A machine with nops in RAM, pc at RAM, mtvec just past them.
 fn bare_machine(program: &[u32]) -> Machine {
-    let mut m = Machine::new(64 * 1024);
+    let mut m = Machine::with_ram(64 * 1024);
     let mut code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     code.extend(std::iter::repeat_n([0x13, 0, 0, 0], 64).flatten()); // nops
     m.cpu.bus.load(RAM_BASE, &code).unwrap();

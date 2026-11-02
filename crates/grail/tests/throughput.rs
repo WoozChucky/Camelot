@@ -14,7 +14,7 @@ const STEPS: u64 = 50_000_000;
 fn idle_plic_and_uart_do_not_slow_the_step_loop() {
     let mut best = f64::MAX;
     for _ in 0..3 {
-        let mut m = Machine::new(64 * 1024);
+        let mut m = Machine::with_ram(64 * 1024);
         m.cpu.bus.load(RAM_BASE, &0x0000_006fu32.to_le_bytes()).unwrap();
         m.cpu.pc = RAM_BASE;
         let (_tx, rx) = std::sync::mpsc::channel::<u8>();

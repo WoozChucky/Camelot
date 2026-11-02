@@ -10,7 +10,9 @@ use grail::cpu::Mode;
 use grail::trap::INTERRUPT_BIT;
 use grail::{Machine, RunResult};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use xtask::kernel::{self, Assembler, Build, Lang, BOOT_MAX_STEPS};
 use xtask::{repo_root, tools};
 
@@ -79,7 +81,7 @@ fn assert_boots(elf: &[u8]) {
 fn load_committed() -> (Machine, grail::elf::Elf) {
     let file = committed_elf();
     let elf = grail::elf::parse(&file).unwrap();
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.cpu.bus.uart.capture = true;
     m.load_elf(&file).unwrap();
     (m, elf)
@@ -121,6 +123,41 @@ fn m_trap_report(mcause: u32, mepc: u32, mtval: u32) -> Vec<String> {
 #[test]
 fn committed_kernel_boots() {
     assert_boots(&committed_elf());
+}
+
+/// A `Write` the test can read back after giving it to a machine.
+#[derive(Clone, Default)]
+struct Shared(Arc<Mutex<Vec<u8>>>);
+
+impl Shared {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl Write for Shared {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn run_sends_uart_and_debug_output_to_the_given_sinks() {
+    // What `cargo xtask kernel --run` uses (with stdout and stderr): the UART text and
+    // the xcal.dbg line must each reach their own sink.
+    let (uart, debug) = (Shared::default(), Shared::default());
+    let (r, _) =
+        kernel::run_with_output(&committed_elf(), BOOT_MAX_STEPS, uart.clone(), debug.clone()).unwrap();
+    assert_eq!(r, RunResult::Exited(0));
+    // The one xcal.dbg line goes to the debug sink; everything around it to the UART.
+    let (before, rest) = BOOT_OUTPUT.split_at(BOOT_OUTPUT.find("[dbg]").unwrap());
+    let (dbg, after) = rest.split_at(rest.find('\n').unwrap() + 1);
+    assert_eq!(uart.text(), format!("{before}{after}"));
+    assert_eq!(kernel::mask_dbg_pc(&debug.text()), dbg);
 }
 
 #[test]
