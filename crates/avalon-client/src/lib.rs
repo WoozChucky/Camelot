@@ -1,0 +1,301 @@
+//! The client side of the Avalon platform: the operations a person orders, over the
+//! Avalon protocol (`docs/avalon-protocol.md`).
+//!
+//! - [`Client`]: one session with a server. VM control (create, list, info, start,
+//!   pause, resume, stop, destroy) talks to Avalon; disk management (create, list,
+//!   delete) talks to Lake. Each operation is one request and its typed reply.
+//! - [`parse`]: the text people type for addresses, RAM sizes, clocks, disk sources and
+//!   disk sizes, so every front end accepts the same syntax (`--ram` and `--clock` are
+//!   Grail's own parsers).
+//! - [`show`]: the same values as text again (sizes, frequencies, device names).
+//!
+//! Round Table, the command-line client, is a thin layer over this crate, and so is
+//! Pendragon, the web console: the two cannot drift apart.
+
+use avalon_proto::{Connection, DiskInfo, ErrorCode, HardwareProfile, Message, VmDetails, VmRef, VmSummary};
+use std::fmt;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
+
+pub mod parse;
+pub mod show;
+
+pub use parse::{parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_ram};
+pub use show::{device_name, disk_source_text, format_hz, format_size};
+
+/// How long [`Client::connect`] tries each address of the server before giving up.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`Client::connect`]'s session waits for a reply. Creating a VM allocates
+/// its RAM and opens its disks, which can take a moment; anything longer means the
+/// server is stuck, and the client reports it rather than hang.
+pub const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What went wrong with an operation.
+#[derive(Debug)]
+pub enum Error {
+    /// The server could not be reached, or the handshake failed (a different protocol
+    /// version, something that is not an Avalon server).
+    Connect {
+        addr: String,
+        cause: avalon_proto::Error,
+    },
+    /// The request failed: the server answered with an `Error` (see [`Error::code`]),
+    /// or the connection broke.
+    Request(avalon_proto::Error),
+}
+
+impl Error {
+    /// The protocol error code, when the server refused the request.
+    pub fn code(&self) -> Option<ErrorCode> {
+        match self {
+            Error::Request(avalon_proto::Error::Remote { code, .. }) => Some(*code),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::Connect { addr, cause } => write!(f, "cannot connect to {addr}: {cause}"),
+            Error::Request(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<avalon_proto::Error> for Error {
+    fn from(e: avalon_proto::Error) -> Self {
+        Error::Request(e)
+    }
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// The life-cycle requests on one VM, each answered by `Ok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmAction {
+    /// created → running
+    Start,
+    /// running → paused
+    Pause,
+    /// paused → running
+    Resume,
+    /// created, running or paused → stopped
+    Stop,
+    /// any state → gone
+    Destroy,
+}
+
+impl VmAction {
+    pub const ALL: [VmAction; 5] = [
+        VmAction::Start,
+        VmAction::Pause,
+        VmAction::Resume,
+        VmAction::Stop,
+        VmAction::Destroy,
+    ];
+
+    /// The action a command word names: `start`, `pause`, `resume`, `stop`, `destroy`.
+    pub fn parse(word: &str) -> Option<VmAction> {
+        VmAction::ALL.into_iter().find(|a| a.name() == word)
+    }
+
+    /// The command word.
+    pub fn name(self) -> &'static str {
+        match self {
+            VmAction::Start => "start",
+            VmAction::Pause => "pause",
+            VmAction::Resume => "resume",
+            VmAction::Stop => "stop",
+            VmAction::Destroy => "destroy",
+        }
+    }
+
+    /// What happened, for telling a person: `started`, `paused`, ...
+    pub fn done(self) -> &'static str {
+        match self {
+            VmAction::Start => "started",
+            VmAction::Pause => "paused",
+            VmAction::Resume => "resumed",
+            VmAction::Stop => "stopped",
+            VmAction::Destroy => "destroyed",
+        }
+    }
+
+    /// The request for this action on `vm`.
+    pub fn request(self, vm: VmRef) -> Message {
+        match self {
+            VmAction::Start => Message::StartVm { vm },
+            VmAction::Pause => Message::PauseVm { vm },
+            VmAction::Resume => Message::ResumeVm { vm },
+            VmAction::Stop => Message::StopVm { vm },
+            VmAction::Destroy => Message::DestroyVm { vm },
+        }
+    }
+}
+
+/// One session with an Avalon or Lake server.
+///
+/// Every method sends one request and waits for its reply; a refusal comes back as an
+/// [`Error`] whose [`Error::code`] says why. A session that broke (the server went
+/// away) fails every later request too: connect again.
+pub struct Client<S = TcpStream> {
+    conn: Connection<S>,
+    server: String,
+}
+
+impl Client<TcpStream> {
+    /// Connects to the server at `addr` (`host:port`, see [`parse_addr`]) and does the
+    /// handshake as `agent` (`"round-table"`, `"pendragon"`, ...). The session gives up
+    /// on a reply after [`REPLY_TIMEOUT`].
+    pub fn connect(addr: &str, agent: &str) -> Result<Self> {
+        let fail = |cause: avalon_proto::Error| Error::Connect {
+            addr: addr.to_string(),
+            cause,
+        };
+        let stream = open(addr).map_err(|e| fail(e.into()))?;
+        // Requests are small frames; do not wait to batch them.
+        stream.set_nodelay(true).map_err(|e| fail(e.into()))?;
+        stream
+            .set_read_timeout(Some(REPLY_TIMEOUT))
+            .map_err(|e| fail(e.into()))?;
+        Client::handshake(stream, agent).map_err(|e| match e {
+            Error::Request(cause) | Error::Connect { cause, .. } => fail(cause),
+        })
+    }
+}
+
+/// A TCP connection to the first address `addr` resolves to that answers within
+/// [`CONNECT_TIMEOUT`].
+fn open(addr: &str) -> std::io::Result<TcpStream> {
+    let mut last = None;
+    for a in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&a, CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "the address resolves to nothing")
+    }))
+}
+
+impl<S: Read + Write> Client<S> {
+    /// Starts a session over `stream` (any byte stream: a socket, or a pipe in tests):
+    /// sends `Hello` as `agent` and reads the server's `Welcome`.
+    pub fn handshake(stream: S, agent: &str) -> Result<Self> {
+        let mut conn = Connection::new(stream);
+        let server = conn.client_handshake(agent)?;
+        Ok(Client { conn, server })
+    }
+
+    /// The name the server gave in its `Welcome` (`"avalon 0.1.0"`).
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    /// The underlying connection, for requests this crate has no method for.
+    pub fn connection(&mut self) -> &mut Connection<S> {
+        &mut self.conn
+    }
+
+    /// Checks that the server answers.
+    pub fn ping(&mut self) -> Result<()> {
+        let token = 0x5254_0001;
+        match self.conn.request(&Message::Ping { token })? {
+            Message::Pong { token: t } if t == token => Ok(()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    // ---- VM control (Avalon) ----
+
+    /// Creates a VM named `name` with `profile`, loaded with the ELF executable
+    /// `program` and left in state created. Returns its id.
+    pub fn create_vm(&mut self, name: &str, profile: HardwareProfile, program: Vec<u8>) -> Result<u32> {
+        let request = Message::CreateVm {
+            name: name.to_string(),
+            profile,
+            program,
+        };
+        match self.conn.request(&request)? {
+            Message::VmCreated { id } => Ok(id),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Every VM, in id order.
+    pub fn list_vms(&mut self) -> Result<Vec<VmSummary>> {
+        match self.conn.request(&Message::ListVms)? {
+            Message::VmList { vms } => Ok(vms),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Everything the server reports about one VM.
+    pub fn vm_info(&mut self, vm: &VmRef) -> Result<VmDetails> {
+        match self.conn.request(&Message::GetVmInfo { vm: vm.clone() })? {
+            Message::VmInfo(details) => Ok(details),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Starts, pauses, resumes, stops or destroys a VM.
+    pub fn vm_action(&mut self, action: VmAction, vm: &VmRef) -> Result<()> {
+        Ok(self.conn.request_ok(&action.request(vm.clone()))?)
+    }
+
+    pub fn start_vm(&mut self, vm: &VmRef) -> Result<()> {
+        self.vm_action(VmAction::Start, vm)
+    }
+
+    pub fn pause_vm(&mut self, vm: &VmRef) -> Result<()> {
+        self.vm_action(VmAction::Pause, vm)
+    }
+
+    pub fn resume_vm(&mut self, vm: &VmRef) -> Result<()> {
+        self.vm_action(VmAction::Resume, vm)
+    }
+
+    pub fn stop_vm(&mut self, vm: &VmRef) -> Result<()> {
+        self.vm_action(VmAction::Stop, vm)
+    }
+
+    pub fn destroy_vm(&mut self, vm: &VmRef) -> Result<()> {
+        self.vm_action(VmAction::Destroy, vm)
+    }
+
+    // ---- Disk management (Lake) ----
+
+    /// Creates a zero-filled image of `sectors` 512-byte sectors.
+    pub fn create_disk(&mut self, name: &str, sectors: u64) -> Result<()> {
+        Ok(self.conn.request_ok(&Message::DiskCreate {
+            name: name.to_string(),
+            sectors,
+        })?)
+    }
+
+    /// Every image, in name order, with who has it attached.
+    pub fn list_disks(&mut self) -> Result<Vec<DiskInfo>> {
+        match self.conn.request(&Message::ListDisks)? {
+            Message::DiskList { disks } => Ok(disks),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Deletes an image nobody has attached.
+    pub fn delete_disk(&mut self, name: &str) -> Result<()> {
+        Ok(self.conn.request_ok(&Message::DiskDelete {
+            name: name.to_string(),
+        })?)
+    }
+}
+
+/// A reply of the wrong type for the request.
+fn unexpected(reply: &Message) -> Error {
+    Error::Request(avalon_proto::Error::Unexpected(reply.type_code()))
+}

@@ -1,0 +1,232 @@
+//! What people type, as protocol values. Every front end (Round Table's flags,
+//! Pendragon's forms) parses with these, so they all accept the same syntax.
+
+use avalon_proto::{validate_name, DiskSource, SECTOR_SIZE};
+use std::net::{IpAddr, SocketAddr};
+
+/// Parses a `--clock` value: a number with an optional unit, `Hz`, `kHz` or `MHz` (any
+/// case; no unit = Hz), as Grail's `--clock` does: `10MHz`, `500kHz`, `1.5MHz`, `5Hz`.
+pub use grail::parse_clock;
+
+/// Parses a `--ram` value, a whole number of MiB from 1 to 2048 (Grail's `--ram`).
+/// Returns bytes.
+pub fn parse_ram(s: &str) -> Result<u64, String> {
+    grail::parse_ram_mib(s).map(|bytes| bytes as u64)
+}
+
+/// Parses a server address: `host:port`, or a host or IP address alone for
+/// `default_port`. IPv6 addresses with a port go in brackets (`[::1]:7400`). The host
+/// is not looked up here, only when connecting.
+pub fn parse_addr(s: &str, default_port: u16) -> Result<String, String> {
+    let bad = || {
+        format!("'{s}' is not a server address (examples: 127.0.0.1:7400, localhost, 192.168.1.5:7500, [::1]:7400)")
+    };
+    if s.is_empty() || s.contains(|c: char| c.is_whitespace() || c == '/') {
+        return Err(bad());
+    }
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Ok(addr.to_string());
+    }
+    let bare = s.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(s);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, default_port).to_string());
+    }
+    // A host name, with or without a port. Anything else with brackets or several
+    // colons is a broken IPv6 address.
+    if s.contains(['[', ']']) {
+        return Err(bad());
+    }
+    match s.split_once(':') {
+        None => Ok(format!("{s}:{default_port}")),
+        Some((host, port)) if !host.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            match port.parse::<u16>() {
+                Ok(_) => Ok(s.to_string()),
+                Err(_) => Err(bad()),
+            }
+        }
+        Some(_) => Err(bad()),
+    }
+}
+
+/// The port of one of the protocol's default addresses (`DEFAULT_AVALON_ADDR`,
+/// `DEFAULT_LAKE_ADDR`).
+pub fn default_port(default_addr: &str) -> u16 {
+    default_addr
+        .parse::<SocketAddr>()
+        .expect("the protocol's default addresses parse")
+        .port()
+}
+
+/// Parses a disk for a VM's hardware profile: `lake://ADDR/NAME` is the image `NAME`
+/// on the Lake server at `ADDR` (port 7401 when it has none), anything else the path of
+/// an image file on the Avalon host (relative to Avalon's working directory).
+pub fn parse_disk_source(s: &str) -> Result<DiskSource, String> {
+    if let Some(rest) = s.strip_prefix("lake://") {
+        let Some((addr, name)) = rest.rsplit_once('/') else {
+            return Err(format!("'{s}' is not a Lake disk (lake://ADDR/NAME)"));
+        };
+        let addr = parse_addr(addr, default_port(avalon_proto::DEFAULT_LAKE_ADDR))
+            .map_err(|e| format!("'{s}': {e}"))?;
+        validate_name(name).map_err(|e| format!("'{s}': {e}"))?;
+        return Ok(DiskSource::Lake {
+            addr,
+            name: name.to_string(),
+        });
+    }
+    if s.is_empty() {
+        return Err("the disk image path is empty".into());
+    }
+    Ok(DiskSource::File(s.to_string()))
+}
+
+/// Parses a disk size: a whole number with an optional unit, any case: none or `B`
+/// for bytes, `K`/`KiB`, `M`/`MiB`, `G`/`GiB` (powers of 1024), or `S`/`sectors` for
+/// 512-byte sectors (`64MiB`, `1G`, `2048s`). The size must be a non-zero whole number
+/// of sectors, at most what a Grail disk can have. Returns sectors.
+pub fn parse_disk_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let bad = || format!("'{s}' is not a disk size (examples: 64MiB, 512K, 1G, 2048s)");
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (number, unit) = s.split_at(split);
+    let unit = unit.trim_start();
+    let scale: u64 = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kib" => 1 << 10,
+        "m" | "mib" => 1 << 20,
+        "g" | "gib" => 1 << 30,
+        "s" | "sectors" => SECTOR_SIZE as u64,
+        _ => return Err(bad()),
+    };
+    let n: u64 = number.parse().map_err(|_| bad())?;
+    let too_big = || format!("{s} is too big (at most {} sectors)", grail::block::MAX_SECTORS);
+    let bytes = n.checked_mul(scale).ok_or_else(too_big)?;
+    if bytes == 0 || !bytes.is_multiple_of(SECTOR_SIZE as u64) {
+        return Err(format!(
+            "{s} is not a whole number of {SECTOR_SIZE}-byte sectors (at least one)"
+        ));
+    }
+    let sectors = bytes / SECTOR_SIZE as u64;
+    if sectors > grail::block::MAX_SECTORS {
+        return Err(too_big());
+    }
+    Ok(sectors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn addresses() {
+        let ok = |s: &str, want: &str| assert_eq!(parse_addr(s, 7400).as_deref(), Ok(want), "{s}");
+        ok("127.0.0.1:7500", "127.0.0.1:7500");
+        ok("127.0.0.1", "127.0.0.1:7400");
+        ok("localhost", "localhost:7400");
+        ok("localhost:9", "localhost:9");
+        ok("avalon.lan:7400", "avalon.lan:7400");
+        ok("::1", "[::1]:7400");
+        ok("[::1]", "[::1]:7400");
+        ok("[::1]:7500", "[::1]:7500");
+        for bad in [
+            "",
+            " ",
+            "a b",
+            ":7400",
+            "host:",
+            "host:port",
+            "host:70000",
+            "host:1:2",
+            "[::1",
+            "[host]:1",
+            "host/x",
+        ] {
+            assert!(parse_addr(bad, 7400).is_err(), "{bad:?}");
+        }
+        assert_eq!(default_port(avalon_proto::DEFAULT_AVALON_ADDR), 7400);
+        assert_eq!(default_port(avalon_proto::DEFAULT_LAKE_ADDR), 7401);
+    }
+
+    #[test]
+    fn ram_and_clock_are_grails() {
+        assert_eq!(parse_ram("64"), Ok(64 << 20));
+        assert_eq!(parse_ram("2048"), Ok(2048 << 20));
+        assert!(parse_ram("0").is_err());
+        assert!(parse_ram("2049").is_err());
+        assert!(parse_ram("64MiB").is_err());
+        assert_eq!(parse_clock("10MHz"), Ok(10_000_000));
+        assert_eq!(parse_clock("1.5mhz"), Ok(1_500_000));
+        assert!(parse_clock("0").is_err());
+    }
+
+    #[test]
+    fn disk_sources() {
+        assert_eq!(
+            parse_disk_source("disk.img"),
+            Ok(DiskSource::File("disk.img".into()))
+        );
+        assert_eq!(
+            parse_disk_source(r"C:\images\a b.img"),
+            Ok(DiskSource::File(r"C:\images\a b.img".into()))
+        );
+        assert_eq!(
+            parse_disk_source("lake://127.0.0.1:7401/data"),
+            Ok(DiskSource::Lake {
+                addr: "127.0.0.1:7401".into(),
+                name: "data".into()
+            })
+        );
+        assert_eq!(
+            parse_disk_source("lake://storage/boot.img"),
+            Ok(DiskSource::Lake {
+                addr: "storage:7401".into(),
+                name: "boot.img".into()
+            })
+        );
+        for bad in [
+            "",
+            "lake://",
+            "lake://host",
+            "lake:///data",
+            "lake://host/",
+            "lake://host/Data",
+            "lake://host/a/b",
+            "lake://host/nul",
+        ] {
+            assert!(parse_disk_source(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn disk_sizes() {
+        let ok = |s: &str, sectors: u64| assert_eq!(parse_disk_size(s), Ok(sectors), "{s}");
+        ok("512", 1);
+        ok("4096B", 8);
+        ok("1K", 2);
+        ok("1kib", 2);
+        ok("64MiB", 131_072);
+        ok("64 MiB", 131_072);
+        ok("1G", 2_097_152);
+        ok("2048s", 2048);
+        ok("3 sectors", 3);
+        ok("2047GiB", 2047 << 21);
+        ok("4294967295s", grail::block::MAX_SECTORS);
+        for bad in [
+            "",
+            "0",
+            "0s",
+            "100",
+            "1.5M",
+            "-1K",
+            "1T",
+            "M",
+            "1 M B",
+            "64MB",
+            "2048G",
+            "4294967296s",
+            "99999999999999999999",
+            "18446744073709551615G",
+        ] {
+            assert!(parse_disk_size(bad).is_err(), "{bad:?}");
+        }
+    }
+}
