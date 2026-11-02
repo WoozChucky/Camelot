@@ -535,7 +535,8 @@ fn many_clients_at_once() {
 /// rustfmt's line breaks do not count).
 #[test]
 fn the_readme_client_example_is_the_test() {
-    let readme = include_str!("../../../README.md");
+    // A Windows checkout may have CRLF line endings.
+    let readme = include_str!("../../../README.md").replace("\r\n", "\n");
     let section = &readme[readme.find("## The Avalon platform").unwrap()..];
     let start = section.find("```rust\n").unwrap() + "```rust\n".len();
     let block = &section[start..start + section[start..].find("```").unwrap()];
