@@ -13,9 +13,8 @@
 
 #define CAMELOT_VERSION "0.1.0"
 
-/* Timer ticks to wait for before halting, and how often to say so. */
+/* Timer ticks to wait for before halting. */
 #define BOOT_TICKS 10
-#define TICKS_PER_LINE 1
 
 /* Deliberate faults, to exercise the panic path. The image ships with
  * BOOT_FAULT_NONE; tests patch `boot_fault` in it to pick another one. The
@@ -83,16 +82,24 @@ static void kprintf_selftest(void) {
     }
 }
 
-/* Idles in wfi until `count` timer ticks have passed, printing "tick N" every
- * TICKS_PER_LINE ticks. Needs interrupts on (trap_init). */
+/* Idles in wfi until `count` timer ticks have passed, printing "tick N" for
+ * each one. The lines count the ticks rather than sample `ticks`, so none is
+ * skipped when several arrive while a line is printed. Needs interrupts on
+ * (trap_init). */
 static void wait_ticks(u32 count) {
     u32 printed = 0;
-    while (ticks < count) {
-        wfi();
-        u32 now = ticks;
-        if (now - printed >= TICKS_PER_LINE) {
-            kprintf("tick %u\n", now);
-            printed = now;
+    while (printed < count) {
+        /* Interrupts off from the check to wfi: a tick taken in between would
+         * leave wfi asleep for a whole interval. wfi still wakes on the
+         * pending tick, which is taken as soon as intr_on() runs. */
+        intr_off();
+        if (ticks == printed) {
+            wfi();
+        }
+        intr_on();
+        if (ticks != printed) {
+            printed++;
+            kprintf("tick %u\n", printed);
         }
     }
 }

@@ -10,6 +10,10 @@ use std::process::Command;
 /// skips ahead to the next tick), so hitting it means the kernel hung.
 const MAX_STEPS: &str = "2000000";
 
+// Kernel constants, from the kernel sources named in each comment. grail
+// can't depend on xtask, so crates/xtask/tests/kernel.rs has its own copies:
+// keep them in sync.
+
 /// Exit code of a kernel panic (`PANIC_EXIT_CODE` in kernel/include/trap.h).
 const PANIC_EXIT: i32 = 0xfe;
 

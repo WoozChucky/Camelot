@@ -74,4 +74,8 @@ void w_stvec(u32 v);
 /* Waits for an interrupt (wfi). Grail fast-forwards mtime to mtimecmp. */
 void wfi(void);
 
+/* Turn S-mode interrupts off / on (sstatus.SIE). */
+void intr_off(void);
+void intr_on(void);
+
 #endif

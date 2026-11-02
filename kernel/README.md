@@ -49,7 +49,7 @@ panic: illegal instruction
 | `kernelvec.s` | `kernel_vec`, the S-mode trap vector: saves x1-x31 and the trap CSRs as a `struct trap_frame`, calls `kernel_trap`, restores, `sret`. Also `illegal_instruction()` for the panic tests |
 | `trap.c` | `kernel_trap()`: counts timer ticks, panics on anything else (cause name, `sepc`, `stval`, register dump); `trap_init()`, `panic()` |
 | `timer.c` | `timebase_hz()` (nominal 10 MHz, the one place to change once Grail reports it), `timer_interval()`, `timer_init()` |
-| `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, ...) and `wfi()` |
+| `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, ...), `intr_off()`/`intr_on()` and `wfi()` |
 | `main.c` | `kmain()`: banner, `kprintf` self-test, ten ticks, the optional deliberate fault |
 | `uart.c` | polling 16550 driver: `uart_putc`/`uart_puts` |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
@@ -81,7 +81,7 @@ clang --target=riscv32-unknown-elf -march=rv32im_zicsr -mabi=ilp32 -mno-relax -m
       -std=c11 -O2 -ffreestanding -fno-builtin -nostdinc -nostdlib -fno-pic -fno-common -fno-ident \
       -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
       -Wall -Wextra -Werror -Iinclude -c main.c -o main.c.o        # and each other .c
-ld.lld -T kernel.ld -o kernel.elf entry.s.o kernelvec.s.o kprintf.c.o machine.s.o main.c.o \r
+ld.lld -T kernel.ld -o kernel.elf entry.s.o kernelvec.s.o kprintf.c.o machine.s.o main.c.o \
        riscv.s.o start.c.o string.c.o timer.c.o trap.c.o uart.c.o
 ```
 

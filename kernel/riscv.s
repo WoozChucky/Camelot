@@ -98,3 +98,14 @@ w_stvec:
 wfi:
     wfi
     ret
+
+# void intr_off(void), void intr_on(void): clear / set sstatus.SIE.
+    .globl intr_off
+intr_off:
+    csrci sstatus, 2
+    ret
+
+    .globl intr_on
+intr_on:
+    csrsi sstatus, 2
+    ret

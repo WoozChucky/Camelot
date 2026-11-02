@@ -5,6 +5,7 @@
 use excalibur::csr::{
     IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP,
 };
+use excalibur::reg;
 use grail::cpu::Mode;
 use grail::trap::INTERRUPT_BIT;
 use grail::{Machine, RunResult};
@@ -35,8 +36,19 @@ tick 10
 /// mtime ticks between timer interrupts: the nominal 10 MHz timebase / 10 Hz.
 const TICK_INTERVAL: u64 = 1_000_000;
 
+// Kernel constants, from the kernel sources named in each comment.
+// crates/grail/tests/kernel.rs has copies of some: keep them in sync.
+
 /// Exit code of a kernel panic (`PANIC_EXIT_CODE` in kernel/include/trap.h).
 const PANIC_EXIT: u32 = 0xfe;
+
+/// Exit code after an unexpected M-mode trap (`EXIT_UNEXPECTED_TRAP` in
+/// kernel/entry.s).
+const UNEXPECTED_TRAP_EXIT: u32 = 0xff;
+
+/// Byte offset of the timer interval in `machine_scratch`
+/// (`MSCRATCH_INTERVAL` words, kernel/include/machine.h).
+const SCRATCH_INTERVAL: u32 = 12;
 
 /// Values of the kernel's `boot_fault` (kernel/main.c).
 const BOOT_FAULT_NONE: u32 = 1;
@@ -75,6 +87,35 @@ fn load_committed() -> (Machine, grail::elf::Elf) {
 
 fn sym(elf: &grail::elf::Elf, name: &str) -> u32 {
     elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"))
+}
+
+/// Steps the machine until it is about to execute (or take a trap at) `pc`.
+fn step_to(m: &mut Machine, pc: u32) {
+    for _ in 0..100_000 {
+        if m.cpu.pc == pc {
+            return;
+        }
+        m.cpu.step();
+    }
+    panic!("never reached {pc:#x}");
+}
+
+/// Register number of an ABI name.
+fn x(name: &str) -> u32 {
+    u32::from(reg::parse(name).unwrap_or_else(|| panic!("no register {name}")))
+}
+
+/// What `xcal.dbg` printed, without the `[dbg] pc=... a0 = ` prefixes.
+fn dbg_values(out: &str) -> Vec<&str> {
+    out.lines().map(|l| l.split(" = ").nth(1).unwrap_or(l)).collect()
+}
+
+/// The `[dbg]` values an unexpected M-mode trap prints: mcause, mepc, mtval.
+fn m_trap_report(mcause: u32, mepc: u32, mtval: u32) -> Vec<String> {
+    [mcause, mepc, mtval]
+        .iter()
+        .map(|v| format!("{v:#010x} ({})", *v as i32))
+        .collect()
 }
 
 #[test]
@@ -146,17 +187,38 @@ fn early_trap_reports_and_halts() {
     m.cpu.bus.load(start, &[0, 0, 0, 0]).unwrap();
     let r = m.run(Some(BOOT_MAX_STEPS), |_| {});
     let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
-    let values: Vec<&str> = out.lines().map(|l| l.split(" = ").nth(1).unwrap_or(l)).collect();
-    assert_eq!(
-        values,
-        [
-            "0x00000002 (2)".to_string(),                // mcause: illegal instruction
-            format!("{start:#010x} ({})", start as i32), // mepc
-            "0x00000000 (0)".to_string(),                // mtval: the instruction bits
-        ],
-        "output:\n{out}"
-    );
-    assert_eq!(r, RunResult::Exited(0xff));
+    // mcause: illegal instruction; mtval: the instruction bits.
+    assert_eq!(dbg_values(&out), m_trap_report(2, start, 0), "output:\n{out}");
+    assert_eq!(r, RunResult::Exited(UNEXPECTED_TRAP_EXIT));
+}
+
+#[test]
+fn unexpected_machine_trap_reports_and_halts() {
+    // A trap in M-mode once start() has installed machine_vec, which handles
+    // only the timer and machine calls, falls through to early_trap. timer_init
+    // runs after w_mtvec(machine_vec): make it trap in three ways.
+    let (_, elf) = load_committed();
+    let (timer_init, machine_vec) = (sym(&elf, "timer_init"), sym(&elf, "machine_vec"));
+    for (word, mcause, mtval) in [
+        (0x0000_0000, 2, 0),          // illegal instruction: mtval = its bits
+        (0x0000_0073, 11, 0),         // ecall from M-mode
+        (0x0010_0073, 3, timer_init), // ebreak: mtval = its pc
+    ] {
+        let (mut m, _) = load_committed();
+        m.cpu.bus.load(timer_init, &u32::to_le_bytes(word)).unwrap();
+        let mut via_machine_vec = false;
+        let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
+            via_machine_vec |= cpu.pc == machine_vec;
+        });
+        let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+        assert!(via_machine_vec, "{word:#x}");
+        assert_eq!(
+            dbg_values(&out),
+            m_trap_report(mcause, timer_init, mtval),
+            "{word:#x}, output:\n{out}"
+        );
+        assert_eq!(r, RunResult::Exited(UNEXPECTED_TRAP_EXIT), "{word:#x}");
+    }
 }
 
 #[test]
@@ -184,7 +246,7 @@ fn unknown_machine_call_returns_minus_one() {
     // kmain: li a7, 99; li a1, 40; ecall; add a0, a0, a1; ret. machine_vec
     // returns -1 in a0 and leaves a1 alone, so kmain returns 39.
     let (mut m, elf) = load_committed();
-    let (a0, a1, a7) = (10, 11, 17);
+    let (a0, a1, a7) = (x("a0"), x("a1"), x("a7"));
     let code = [
         addi(a7, 0, 99),
         addi(a1, 0, 40),
@@ -221,7 +283,10 @@ fn kmain_runs_in_s_mode_with_traps_delegated() {
     assert_eq!(c.stvec, sym(&elf, "kernel_vec"));
     let scratch = sym(&elf, "machine_scratch");
     assert_eq!(c.mscratch, scratch);
-    assert_eq!(m.cpu.bus.peek(scratch + 12), Some(TICK_INTERVAL as u32));
+    assert_eq!(
+        m.cpu.bus.peek(scratch + SCRATCH_INTERVAL),
+        Some(TICK_INTERVAL as u32)
+    );
     // S-mode interrupts stay off until trap_init.
     assert_eq!(c.mstatus & MSTATUS_SIE, 0);
     // The first tick is armed one interval after start() ran.
@@ -274,6 +339,180 @@ fn ticks_are_one_interval_apart() {
     // instructions than one.
     assert!(m.cpu.bus.clint.mtime >= 10 * TICK_INTERVAL);
     assert!(steps < TICK_INTERVAL, "{steps} steps");
+}
+
+// ---- Interrupts in the middle of kernel code ----
+//
+// In a normal boot every tick lands in wfi(), where hardly any register is
+// live, so the boot tests can't tell whether the trap handlers give the
+// interrupted code its registers back. These tests interrupt code that has
+// live values everywhere.
+
+/// `j .`: an endless loop, standing in for busy kernel code.
+const J_SELF: u32 = 0x0000_006f;
+
+/// Byte offsets in `struct trap_frame` (kernel/include/trap.h).
+const FRAME_SEPC: u32 = 128;
+const FRAME_SCAUSE: u32 = 132;
+const FRAME_SSTATUS: u32 = 140;
+
+/// A distinct value for every register but x0 and sp: `tag` in the top byte,
+/// the register number in the others.
+fn reg_pattern(tag: u32, sp: u32) -> [u32; 32] {
+    let mut r: [u32; 32] = std::array::from_fn(|i| (tag << 24) | (i as u32 * 0x0001_0101));
+    r[0] = 0;
+    r[2] = sp;
+    r
+}
+
+/// Boots the committed kernel up to kmain, then turns kmain into `j .; j .`
+/// and fills every register but sp with `reg_pattern(0xa5, ..)`: busy code
+/// with every register live. S-mode interrupts are on, as after trap_init.
+/// Returns the machine, the ELF and the registers.
+fn busy_kmain() -> (Machine, grail::elf::Elf, [u32; 32]) {
+    let (mut m, elf) = load_committed();
+    let kmain = sym(&elf, "kmain");
+    step_to(&mut m, kmain);
+    let code: Vec<u8> = [J_SELF, J_SELF].iter().flat_map(|w| w.to_le_bytes()).collect();
+    m.cpu.bus.load(kmain, &code).unwrap();
+    let regs = reg_pattern(0xa5, m.cpu.x[2]);
+    m.cpu.x = regs;
+    m.cpu.csr.mie |= 1 << IRQ_S_SOFT;
+    m.cpu.csr.mstatus |= MSTATUS_SIE;
+    (m, elf, regs)
+}
+
+#[test]
+fn tick_preserves_every_register() {
+    // A tick goes through both handlers: machine_vec (rearm the timer, raise
+    // SSIP) and kernel_vec (count it). Neither may change a register.
+    let (mut m, elf, regs) = busy_kmain();
+    let kmain = sym(&elf, "kmain");
+    let clint = &mut m.cpu.bus.clint;
+    clint.mtimecmp = clint.mtime + 20;
+    let cmp = clint.mtimecmp;
+
+    step_to(&mut m, sym(&elf, "machine_vec"));
+    assert_eq!(m.cpu.csr.mcause, INTERRUPT_BIT | IRQ_M_TIMER);
+    assert_eq!(m.cpu.csr.mepc, kmain);
+    // machine_vec returns to the loop, which takes the forwarded tick at once.
+    step_to(&mut m, sym(&elf, "kernel_vec"));
+    assert_eq!(m.cpu.csr.scause, INTERRUPT_BIT | IRQ_S_SOFT);
+    assert_eq!(m.cpu.csr.sepc, kmain);
+    assert_eq!(m.cpu.x, regs, "machine_vec changed registers");
+    assert_eq!(m.cpu.bus.clint.mtimecmp, cmp + TICK_INTERVAL);
+
+    step_to(&mut m, kmain);
+    assert_eq!(m.cpu.mode, Mode::S);
+    assert_eq!(m.cpu.x, regs, "kernel_vec changed registers");
+    assert_ne!(m.cpu.csr.mstatus & MSTATUS_SIE, 0);
+    assert_eq!(m.cpu.csr.mip & (1 << IRQ_S_SOFT), 0);
+    assert_eq!(m.cpu.bus.peek(sym(&elf, "ticks")), Some(1));
+}
+
+#[test]
+fn kernel_vec_resumes_from_the_frame() {
+    // kernel_trap may change the trap frame, and kernel_vec must resume from
+    // it: every register, sepc and sstatus are loaded back from the frame.
+    let (mut m, elf, regs) = busy_kmain();
+    let kmain = sym(&elf, "kmain");
+    m.cpu.csr.mip |= 1 << IRQ_S_SOFT; // a tick, as machine_vec raises it
+    step_to(&mut m, sym(&elf, "kernel_trap"));
+    let frame = m.cpu.x[x("a0") as usize];
+    let peek = |m: &Machine, off: u32| m.cpu.bus.peek(frame + off).unwrap();
+    for (i, &v) in regs.iter().enumerate() {
+        assert_eq!(peek(&m, 4 * i as u32), v, "{}", reg::abi_name(i as u8));
+    }
+    assert_eq!(peek(&m, FRAME_SEPC), kmain);
+    assert_eq!(peek(&m, FRAME_SCAUSE), INTERRUPT_BIT | IRQ_S_SOFT);
+    let sstatus = peek(&m, FRAME_SSTATUS);
+    assert_ne!(sstatus & MSTATUS_SPIE, 0);
+    assert_ne!(sstatus & MSTATUS_SPP, 0);
+
+    // Other values for every register but sp, which kernel_vec recomputes by
+    // popping the frame; resume at kmain + 4 with interrupts off.
+    let new = reg_pattern(0x5a, regs[2]);
+    let mut put = |off: u32, v: u32| m.cpu.bus.load(frame + off, &v.to_le_bytes()).unwrap();
+    for (i, &v) in new.iter().enumerate() {
+        put(4 * i as u32, v);
+    }
+    put(FRAME_SEPC, kmain + 4);
+    put(FRAME_SSTATUS, sstatus & !MSTATUS_SPIE);
+
+    step_to(&mut m, kmain + 4);
+    assert_eq!(m.cpu.mode, Mode::S);
+    assert_eq!(m.cpu.x, new);
+    assert_eq!(m.cpu.csr.mstatus & MSTATUS_SIE, 0);
+    assert_eq!(m.cpu.bus.peek(sym(&elf, "ticks")), Some(1));
+}
+
+#[test]
+fn ticks_preempting_kernel_code_change_nothing() {
+    // Shorten the tick interval to a few hundred mtime ticks (a prime, so the
+    // ticks don't fall into step with a loop) right after start() armed the
+    // timer. Ticks then land all over kprintf and its self-test instead of
+    // only in wait_ticks' idle loop. A clobbered register would fail the
+    // self-test, garble the output or fault; and every tick still gets its
+    // own line.
+    const SHORT_INTERVAL: u32 = 211;
+    let (mut m, elf) = load_committed();
+    step_to(&mut m, sym(&elf, "supervisor_entry"));
+    let scratch = sym(&elf, "machine_scratch");
+    m.cpu
+        .bus
+        .load(scratch + SCRATCH_INTERVAL, &SHORT_INTERVAL.to_le_bytes())
+        .unwrap();
+    let clint = &mut m.cpu.bus.clint;
+    clint.mtimecmp = clint.mtime + u64::from(SHORT_INTERVAL);
+
+    // Where a tick interrupts wait_ticks' idle loop: after `wfi` in M-mode,
+    // and after intr_on's `csrsi` in S-mode.
+    let idle = [sym(&elf, "wfi") + 4, sym(&elf, "intr_on") + 4];
+    let (machine_vec, kernel_vec) = (sym(&elf, "machine_vec"), sym(&elf, "kernel_vec"));
+    let (mut machine_busy, mut kernel_busy) = (0, 0);
+    let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
+        if cpu.pc == machine_vec
+            && cpu.csr.mcause == INTERRUPT_BIT | IRQ_M_TIMER
+            && !idle.contains(&cpu.csr.mepc)
+        {
+            machine_busy += 1;
+        }
+        if cpu.pc == kernel_vec && !idle.contains(&cpu.csr.sepc) {
+            kernel_busy += 1;
+        }
+    });
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+    assert_eq!(kernel::mask_dbg_pc(&out), BOOT_OUTPUT, "raw output:\n{out}");
+    assert_eq!(r, RunResult::Exited(0));
+    // Fewer kernel ticks: until trap_init, the machine ticks only pile up in
+    // the one SSIP bit.
+    assert!(
+        machine_busy >= 100 && kernel_busy >= 30,
+        "only {machine_busy} machine and {kernel_busy} kernel ticks outside the idle loop"
+    );
+}
+
+#[test]
+fn timer_rearm_carries_into_the_high_word() {
+    // machine_vec adds the interval to mtimecmp as two 32-bit halves: a tick
+    // just below 2^32 must carry into the high word.
+    const CMP: u64 = 0xffff_ff00;
+    let (mut m, elf) = load_committed();
+    step_to(&mut m, sym(&elf, "kmain"));
+    let clint = &mut m.cpu.bus.clint;
+    clint.mtime = CMP - 0x100;
+    clint.mtimecmp = CMP;
+    step_to(&mut m, sym(&elf, "machine_vec"));
+    assert_eq!(m.cpu.csr.mcause, INTERRUPT_BIT | IRQ_M_TIMER);
+    for _ in 0..100 {
+        if m.cpu.mode != Mode::M {
+            break;
+        }
+        m.cpu.step();
+    }
+    assert_eq!(m.cpu.mode, Mode::S, "machine_vec never returned");
+    assert_eq!(m.cpu.bus.clint.mtimecmp, CMP + TICK_INTERVAL);
+    assert!(m.cpu.bus.clint.mtimecmp > 1 << 32);
 }
 
 /// Runs the committed kernel with `boot_fault` patched to `fault`. Returns the
