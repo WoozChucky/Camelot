@@ -12,3 +12,6 @@ tests/riscv-tests/rv32* binary
 kernel/kernel.elf.clang-version text eol=lf
 # llvm-objdump output, compared line by line (keep LF so it diffs cleanly).
 crates/merlin-objdump/tests/golden/*.txt text eol=lf
+crates/merlin-as/tests/golden/*.txt text eol=lf
+crates/merlin-as/tests/golden/*.ref text eol=lf
+crates/merlin-as/tests/golden/*.golden text eol=lf

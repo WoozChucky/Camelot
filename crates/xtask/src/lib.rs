@@ -4,10 +4,13 @@
 //!
 //! * [`kernel`]: builds `kernel/kernel.elf` with clang + ld.lld, or with
 //!   merlin-as for the assembly files.
+//! * [`hello`]: builds `examples/hello/hello.S` with merlin-as + ld.lld into a
+//!   committed golden image.
 //! * [`ld_fixtures`]: regenerates merlin-ld's test fixtures (clang, ld.lld,
 //!   llvm-readobj).
 //! * [`tools`]: finds the LLVM tools.
 
+pub mod hello;
 pub mod kernel;
 pub mod ld_fixtures;
 pub mod tools;

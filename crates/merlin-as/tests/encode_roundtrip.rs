@@ -8,21 +8,15 @@
 //!   This covers what the golden file can't (Xcal, CSRs by name, `li` splits,
 //!   explicit `%pcrel_hi`/`%pcrel_lo` pairs on user labels) and spells out the
 //!   operation and operands of every mnemonic in the golden file.
+//! * `CLANG_WORDS`: lines the golden file doesn't have (every `.insn` form,
+//!   counter reads, short forms, `li` edges) must give clang's exact words.
 //! * `disasm`: every word llvm-mc produced for the golden file (plus a few
 //!   more from clang), decoded and printed with the disassembler, must
 //!   assemble back to exactly that word. Proves the disassembler's syntax
 //!   reassembles, and catches bits `decode` ignores, like fence's pred/succ.
 //!   Words patched by a relocation are left out: their fields are zero.
-//!
-//! Same progress rules as `encode_golden`: mnemonics that still return
-//! "not implemented yet" are counted, not failed. The `_complete` variants
-//! (ignored by default) require everything:
-//!
-//!     cargo test -p merlin-as --test encode_roundtrip -- --nocapture
-//!     cargo test -p merlin-as --test encode_roundtrip -- --ignored
 
 use excalibur::{decode, AluOp, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, StoreOp};
-use merlin_as::encode::UNIMPLEMENTED;
 use merlin_as::reloc::RelocKind;
 
 /// One word of `.text` and the relocation that will patch it, if any.
@@ -48,20 +42,9 @@ enum To {
     Auipc(u32),
 }
 
-enum Assembled {
-    Words(Vec<Word>),
-    Unimplemented,
-    Error(String),
-}
-
-fn assemble(src: &str) -> Assembled {
-    let obj = match merlin_as::assemble(src) {
-        Ok(o) => o,
-        Err(errs) if errs.iter().all(|e| e.msg.starts_with(UNIMPLEMENTED)) => {
-            return Assembled::Unimplemented
-        }
-        Err(errs) => return Assembled::Error(errs[0].to_string()),
-    };
+/// The words of `.text`, or the first error.
+fn assemble(src: &str) -> Result<Vec<Word>, String> {
+    let obj = merlin_as::assemble(src).map_err(|errs| errs[0].to_string())?;
     let text = &obj.sections[0];
     let reloc_at = |offset: u32| {
         let r = text.relocs.iter().find(|r| r.offset == offset)?;
@@ -82,15 +65,13 @@ fn assemble(src: &str) -> Assembled {
             reloc: reloc_at(4 * i as u32),
         })
         .collect();
-    Assembled::Words(words)
+    Ok(words)
 }
 
-/// Collects outcomes and prints the same kind of report as `encode_golden`.
+/// Collects failures and reports them all at once.
 struct Report {
     name: &'static str,
     total: usize,
-    pass: usize,
-    todo: Vec<String>,
     fails: Vec<String>,
 }
 
@@ -99,44 +80,19 @@ impl Report {
         Report {
             name,
             total: 0,
-            pass: 0,
-            todo: Vec::new(),
             fails: Vec::new(),
         }
     }
 
-    fn finish(self, require_all: bool) {
-        println!(
-            "{}: {}/{} pass, {} not implemented yet",
-            self.name,
-            self.pass,
-            self.total,
-            self.todo.len()
-        );
-        if !self.todo.is_empty() {
-            let mut m: Vec<&str> = self
-                .todo
-                .iter()
-                .map(|s| s.split_whitespace().next().unwrap_or(""))
-                .collect();
-            m.sort();
-            m.dedup();
-            println!("still to do: {}", m.join(" "));
-        }
+    fn finish(self) {
         assert!(
             self.fails.is_empty(),
-            "{}: {} failures:\n{}",
+            "{}: {} of {} failed:\n{}",
             self.name,
             self.fails.len(),
+            self.total,
             self.fails.join("\n")
         );
-        if require_all {
-            assert!(
-                self.todo.is_empty(),
-                "{} lines not implemented yet",
-                self.todo.len()
-            );
-        }
     }
 }
 
@@ -391,6 +347,25 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
         ("wfi", vec![Wfi]),
         ("sfence.vma", vec![SfenceVma { rs1: ZERO, rs2: ZERO }]),
         ("sfence.vma a0, a1", vec![SfenceVma { rs1: A0, rs2: A1 }]),
+        ("sfence.vma a0", vec![SfenceVma { rs1: A0, rs2: ZERO }]),
+        (
+            "jalr ra, t0, 8",
+            vec![Jalr {
+                rd: RA,
+                rs1: T0,
+                imm: 8,
+            }],
+        ),
+        // Counter reads: csrrs rd, counter, zero.
+        ("rdcycle a0", vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc00)]),
+        ("rdtime a0", vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc01)]),
+        ("rdinstret a0", vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc02)]),
+        ("rdcycleh a0", vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc80)]),
+        ("rdtimeh a0", vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc81)]),
+        (
+            "rdinstreth a0",
+            vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc82)],
+        ),
         // CSRs, by name and by number
         (
             "csrrw a0, mstatus, a1",
@@ -433,6 +408,11 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
             "csrwi mstatus, 8",
             vec![csr(CsrOp::Rw, ZERO, CsrSrc::Imm(8), 0x300)],
         ),
+        // A number where the register goes: the immediate form, as in LLVM.
+        (
+            "csrw mstatus, 8",
+            vec![csr(CsrOp::Rw, ZERO, CsrSrc::Imm(8), 0x300)],
+        ),
         (
             "csrsi sstatus, 2",
             vec![csr(CsrOp::Rs, ZERO, CsrSrc::Imm(2), 0x100)],
@@ -455,6 +435,7 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
         ("snez a0, a1", vec![r(AluOp::Sltu, A0, ZERO, A1)]),
         ("sltz a0, a1", vec![r(AluOp::Slt, A0, A1, ZERO)]),
         ("sgtz a0, a1", vec![r(AluOp::Slt, A0, ZERO, A1)]),
+        ("zext.b a0, a1", vec![i(AluOp::And, A0, A1, 0xff)]),
         ("j -8", vec![Jal { rd: ZERO, imm: -8 }]),
         (
             "jr t0",
@@ -580,6 +561,17 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
         (
             "li a0, -6144",
             vec![i(AluOp::Add, A0, ZERO, -3), i(AluOp::Sll, A0, A0, 11)],
+        ),
+        // 33 << 11: c is just outside -32..=31, so lui + addi.
+        (
+            "li a0, 0x10800",
+            vec![
+                Lui {
+                    rd: A0,
+                    imm: 0x0001_1000,
+                },
+                i(AluOp::Add, A0, A0, -2048),
+            ],
         ),
         // 0x7ff << 11: c doesn't fit in 6 bits, so lui + addi.
         (
@@ -817,20 +809,16 @@ fn every_expected_reloc_row_is_in_the_table() {
     }
 }
 
-fn run_expected(require_all: bool) {
+#[test]
+fn roundtrip_expected() {
     let mut rep = Report::new("decode(encode(x)) == x");
     let relocs = expected_relocs();
     for (src, want) in expected() {
         rep.total += 1;
         let shown = src.replace('\n', "; ");
         let words = match assemble(src) {
-            Assembled::Words(w) => w,
-            Assembled::Unimplemented => {
-                // Report the mnemonic of the last line (the one under test).
-                rep.todo.push(src.lines().last().unwrap_or(src).to_string());
-                continue;
-            }
-            Assembled::Error(e) => {
+            Ok(w) => w,
+            Err(e) => {
                 rep.fails.push(format!("  {shown:<34} error: {e}"));
                 continue;
             }
@@ -853,12 +841,78 @@ fn run_expected(require_all: bool) {
             let got = w.reloc.as_ref().map(|r| (r.kind, &r.to));
             (got != want).then(|| format!("word {n}: relocation {got:?}, want {want:?}"))
         });
-        match mismatch {
-            None => rep.pass += 1,
-            Some(why) => rep.fails.push(format!("  {shown:<34} {why}")),
+        if let Some(why) = mismatch {
+            rep.fails.push(format!("  {shown:<34} {why}"));
         }
     }
-    rep.finish(require_all);
+    rep.finish();
+}
+
+// ----- exact words from clang -----
+
+/// Lines not in the golden file, with the words clang 21.1.5 gives for each
+/// (`clang --target=riscv32 -march=rv32im_zicsr_zifencei -mno-relax -c`,
+/// one line per file, read back with `llvm-objdump -d`). Pins the encodings
+/// that `expected()` can't tell apart through `decode` or doesn't list: every
+/// `.insn` form, the counter reads, `zext.b`, the `jalr`/`csrw`/`sfence.vma`
+/// short forms and the edges of `li`'s shift form.
+const CLANG_WORDS: &[(&str, &[u32])] = &[
+    (".insn r 0x33, 0, 0x20, a0, a1, a2", &[0x40c5_8533]),
+    (".insn r 0x0b, 7, 0x7f, t6, s0, a5", &[0xfef4_7f8b]),
+    (".insn i 0x13, 0, a0, a1, -5", &[0xffb5_8513]),
+    (".insn i 0x03, 2, a0, 8(a1)", &[0x0085_a503]),
+    (".insn i 0x67, 0, ra, -16(t0)", &[0xff02_80e7]),
+    (".insn s 0x23, 2, a1, 12(a0)", &[0x00b5_2623]),
+    (".insn s 0x23, 0, t1, -2048(sp)", &[0x8061_0023]),
+    (".insn b 0x63, 1, a0, a1, 16", &[0x00b5_1863]),
+    (".insn b 0x63, 4, t0, t1, -4096", &[0x8062_c063]),
+    (".insn u 0x37, a0, 0x12345", &[0x1234_5537]),
+    (".insn u 0x17, t0, 0xfffff", &[0xffff_f297]),
+    (".insn 0x00b50533", &[0x00b5_0533]),
+    (".insn 4, 0x40b50533", &[0x40b5_0533]),
+    ("zext.b a0, a1", &[0x0ff5_f513]),
+    ("rdcycle a0", &[0xc000_2573]),
+    ("rdtime a1", &[0xc010_25f3]),
+    ("rdinstret a2", &[0xc020_2673]),
+    ("rdcycleh a3", &[0xc800_26f3]),
+    ("rdtimeh a4", &[0xc810_2773]),
+    ("rdinstreth a5", &[0xc820_27f3]),
+    ("jalr ra, t0, 8", &[0x0082_80e7]),
+    ("jalr a0, a1, -2048", &[0x8005_8567]),
+    ("jalr t0", &[0x0002_80e7]),
+    // A number where a csrw/csrs/csrc wants a register: the immediate form.
+    ("csrw mstatus, 8", &[0x3004_5073]),
+    ("csrs sie, 31", &[0x104f_e073]),
+    ("csrc sstatus, 2", &[0x1001_7073]),
+    ("sfence.vma a0", &[0x1205_0073]),
+    // li's shift form takes c in -32..=31 only: 33 << 11 and -33 << 11 are
+    // lui + addi, 31 << 11 and -31 << 11 are addi + slli.
+    ("li a0, 0x10800", &[0x0001_1537, 0x8005_0513]),
+    ("li a0, -0x10800", &[0xffff_0537, 0x8005_0513]),
+    ("li a0, 0xf800", &[0x01f0_0513, 0x00b5_1513]),
+    ("li a0, -0xf800", &[0xfe10_0513, 0x00b5_1513]),
+    ("li a0, -3968", &[0xfe10_0513, 0x0075_1513]), // -31 << 7
+    ("li a0, -4224", &[0xffff_f537, 0xf805_0513]), // -33 << 7
+    ("li a0, 0x7ff800", &[0x0080_0537, 0x8005_0513]),
+];
+
+#[test]
+fn matches_clang_words() {
+    let mut rep = Report::new("words == clang's");
+    for &(src, want) in CLANG_WORDS {
+        rep.total += 1;
+        match assemble(src) {
+            Ok(words) => {
+                let got: Vec<u32> = words.iter().map(|w| w.word).collect();
+                if got != want || words.iter().any(|w| w.reloc.is_some()) {
+                    rep.fails
+                        .push(format!("  {src:<36} got {got:08x?}, want {want:08x?}"));
+                }
+            }
+            Err(e) => rep.fails.push(format!("  {src:<36} error: {e}")),
+        }
+    }
+    rep.finish();
 }
 
 // ----- decode → disassemble → assemble again -----
@@ -890,7 +944,25 @@ fn golden_words() -> Vec<(&'static str, Vec<u32>)> {
         .collect()
 }
 
-fn run_disasm(require_all: bool) {
+/// Re-assembles the plain disassembly of `w`. Err: why it doesn't round-trip.
+fn reassemble(w: u32) -> Result<u32, String> {
+    // `{inst}` is the disassembler's syntax, which merlin-as accepts.
+    let text = decode(w).to_string();
+    match assemble(&text) {
+        Ok(again) if again.len() == 1 => Ok(again[0].word),
+        Ok(again) => {
+            let again: Vec<String> = again.iter().map(|w| format!("{:08x}", w.word)).collect();
+            Err(format!(
+                "{w:08x} disassembles to '{text}', which assembles to [{}]",
+                again.join(" ")
+            ))
+        }
+        Err(e) => Err(format!("{w:08x} disassembles to '{text}': {e}")),
+    }
+}
+
+#[test]
+fn roundtrip_disasm() {
     let mut rep = Report::new("encode(disasm(decode(w))) == w");
     // Not in the golden file. Words from clang (Xcal written as `.insn i 0x0b, ...`).
     let extra = [
@@ -898,63 +970,68 @@ fn run_disasm(require_all: bool) {
         ("xcal.halt zero", vec![0x0000_100b]),
         ("csrrw a0, satp, a0", vec![0x1805_1573]),
         ("csrrs a0, 0x7c0, zero", vec![0x7c00_2573]),
+        ("fence rw, w", vec![0x0310_000f]),
+        ("fence.tso", vec![0x8330_000f]),
+        ("unimp", vec![0xc000_1073]),
     ];
-    for (src, words) in golden_words().into_iter().chain(extra) {
+    let clang = CLANG_WORDS.iter().map(|&(src, words)| (src, words.to_vec()));
+    for (src, words) in golden_words().into_iter().chain(extra).chain(clang) {
         rep.total += 1;
-        let mut outcome = Ok(());
+        // Words are compared, not decoded `Inst`s: `decode` ignores some bits
+        // (fence's pred/succ, for one) that must still come out right.
         for w in words {
-            // `{inst}` is the disassembler's syntax, which merlin-as accepts.
-            // Words are compared, not decoded `Inst`s: `decode` ignores some
-            // bits (fence's pred/succ, for one) that must still come out right.
-            let text = decode(w).to_string();
-            match assemble(&text) {
-                Assembled::Words(again) if again.len() == 1 && again[0].word == w => {}
-                Assembled::Words(again) => {
-                    let again: Vec<String> = again.iter().map(|w| format!("{:08x}", w.word)).collect();
-                    outcome = Err(Some(format!(
-                        "{w:08x} disassembles to '{text}', which assembles to [{}]",
-                        again.join(" ")
-                    )));
+            match reassemble(w) {
+                Ok(again) if again == w => {}
+                Ok(again) => {
+                    rep.fails
+                        .push(format!("  {src:<28} {w:08x} assembles back to {again:08x}"));
                     break;
                 }
-                // The disassembly uses a mnemonic not written yet.
-                Assembled::Unimplemented => {
-                    outcome = Err(None);
-                    break;
-                }
-                Assembled::Error(e) => {
-                    outcome = Err(Some(format!("{w:08x} disassembles to '{text}': {e}")));
+                Err(why) => {
+                    rep.fails.push(format!("  {src:<28} {why}"));
                     break;
                 }
             }
         }
-        match outcome {
-            Ok(()) => rep.pass += 1,
-            Err(None) => rep.todo.push(src.to_string()),
-            Err(Some(why)) => rep.fails.push(format!("  {src:<28} {why}")),
+    }
+    rep.finish();
+}
+
+/// The same round trip on a large pseudo-random sample of instruction words:
+/// every word the decoder accepts must disassemble to text that assembles to
+/// an instruction decoding the same way, and to the very same word unless it
+/// is a fence (whose reserved fields the decoder ignores).
+#[test]
+fn roundtrip_random_words() {
+    let mut rep = Report::new("random words");
+    let mut x: u32 = 0x1234_5678;
+    let mut valid = 0;
+    for _ in 0..400_000 {
+        // xorshift32
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        // Force a 32-bit instruction, and pick the major opcode from the low
+        // bits so every format gets a fair share.
+        let w = x | 3;
+        let inst = decode(w);
+        if matches!(inst, Inst::Illegal(_)) {
+            continue;
+        }
+        valid += 1;
+        rep.total += 1;
+        match reassemble(w) {
+            Ok(again) if again == w => {}
+            Ok(again) if w & 0x7f == 0b0001111 && decode(again) == inst => {}
+            Ok(again) => rep
+                .fails
+                .push(format!("  {w:08x} ({inst}) assembles back to {again:08x}")),
+            Err(why) => rep.fails.push(format!("  {why}")),
+        }
+        if rep.fails.len() > 20 {
+            break;
         }
     }
-    rep.finish(require_all);
-}
-
-#[test]
-fn roundtrip_expected_progress() {
-    run_expected(false);
-}
-
-#[test]
-#[ignore = "passes once the encoder is complete"]
-fn roundtrip_expected_complete() {
-    run_expected(true);
-}
-
-#[test]
-fn roundtrip_disasm_progress() {
-    run_disasm(false);
-}
-
-#[test]
-#[ignore = "passes once the encoder is complete"]
-fn roundtrip_disasm_complete() {
-    run_disasm(true);
+    assert!(valid > 20_000, "only {valid} valid words in the sample");
+    rep.finish();
 }
