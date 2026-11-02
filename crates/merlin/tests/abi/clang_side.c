@@ -10,6 +10,13 @@
  *   more            by reference to a copy  s12, big (results through a
  *                                            hidden pointer in a0)
  *
+ * and so do the narrow scalars (_Bool, signed char, short, unsigned short),
+ * which the caller extends to 32 bits as an argument and the callee as a
+ * result: clang -O1 relies on both.
+ *
+ * Each side numbers its checks from 1 and reports the first that fails (0
+ * when all pass); tests/abi.rs prints which one it was.
+ *
  * Regenerate after changing it (needs clang on PATH):
  *
  *   MERLIN_BLESS=1 cargo test -p merlin --test abi -- --ignored clang_side
@@ -73,6 +80,42 @@ struct s1 m_inc1(struct s1 s);
 struct mixed m_mixed(struct mixed m);
 union u8 m_union(union u8 u);
 int m_modify12(struct s12 v);
+int m_widen(signed char sc, short s, unsigned short us, _Bool b);
+signed char m_trunc_sc(int x);
+short m_trunc_s(int x);
+unsigned short m_trunc_us(int x);
+_Bool m_tobool(int x);
+
+static int checks, first_failure;
+
+/* Counts a check, and remembers the first that fails. */
+static void check(int ok) {
+    checks++;
+    if (!ok && !first_failure)
+        first_failure = checks;
+}
+
+/* clang adds the registers as they are: the caller must have extended them. */
+int c_widen(signed char sc, short s, unsigned short us, _Bool b) {
+    return sc + s + us + b;
+}
+
+/* The callee extends a narrow result: these hand back x converted. */
+signed char c_trunc_sc(int x) {
+    return x;
+}
+
+short c_trunc_s(int x) {
+    return x;
+}
+
+unsigned short c_trunc_us(int x) {
+    return x;
+}
+
+_Bool c_tobool(int x) {
+    return x;
+}
 
 struct s1 c_inc1(struct s1 s) {
     s.c++;
@@ -189,9 +232,10 @@ struct s6 c_apply6(struct s6 (*f)(struct s6), struct s6 v) {
     return f(v);
 }
 
-/* Calls every m_ function; returns how many of its 11 checks pass. */
+/* Calls every m_ function; returns 0 if all its checks pass, else the number
+ * of the first that fails. */
 int c_calls_merlin(void) {
-    int ok = 0;
+    int w = 0x1fffd; /* -3 as a signed char or short, 65533 as an unsigned short */
     struct s6 s6 = {1, 2, 3};
     struct s8 p = {5, 7};
     struct s5 s5 = {{1, 2, 3, 4, 5}};
@@ -202,21 +246,26 @@ int c_calls_merlin(void) {
     struct big b;
     un.i[0] = 41;
     un.i[1] = 0;
-    ok += m_sum6(s6) == 6;
-    ok += m_make12(4).c == 6;
+    check(m_sum6(s6) == 6);
+    check(m_make12(4).c == 6);
     p = m_swap8(p);
-    ok += p.x == 7 && p.y == 5;
+    check(p.x == 7 && p.y == 5);
     s5 = m_rev5(s5);
-    ok += s5.b[0] == 5 && s5.b[4] == 1;
-    ok += m_make3(1, 2, 3).b[2] == 3;
-    ok += m_many(1, p, s6, v, 2, 3) == 1 + 35 + 6 + 60 + 2 + 3;
+    check(s5.b[0] == 5 && s5.b[4] == 1);
+    check(m_make3(1, 2, 3).b[2] == 3);
+    check(m_many(1, p, s6, v, 2, 3) == 1 + 35 + 6 + 60 + 2 + 3);
     b = m_big(3);
-    ok += b.v[9] == 12 && m_sumbig(b) == 75;
-    ok += m_inc1(one).c == 'b';
+    check(b.v[9] == 12 && m_sumbig(b) == 75);
+    check(m_inc1(one).c == 'b');
     mx = m_mixed(mx);
-    ok += mx.c == 'y' && mx.i == 42;
+    check(mx.c == 'y' && mx.i == 42);
     un = m_union(un);
-    ok += un.i[1] == 42;
-    ok += m_modify12(v) == 1020 && v.a == 10;
-    return ok;
+    check(un.i[1] == 42);
+    check(m_modify12(v) == 1020 && v.a == 10);
+    check(m_widen(w, w, w, w) == -3 - 3 + 65533 + 1);
+    check(m_trunc_sc(w) == -3);
+    check(m_trunc_s(0x18000) == -32768);
+    check(m_trunc_us(w) == 65533);
+    check(m_tobool(256) == 1);
+    return first_failure;
 }

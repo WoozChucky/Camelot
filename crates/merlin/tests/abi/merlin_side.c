@@ -1,6 +1,7 @@
 /* The merlin side of the calling-convention round trip (tests/abi.rs): main
  * calls every c_ function of clang_side.c, which calls back every m_ function
- * here. Exits with the number of checks that pass: 30.
+ * here. Exits with 0 when every check passes, else with the number of the
+ * first that fails: main's checks count from 1, and c_calls_merlin's from 101.
  */
 
 struct s1 {
@@ -65,6 +66,42 @@ struct big c_big(int seed);
 int c_sumbig(struct big b);
 struct s6 c_apply6(struct s6 (*f)(struct s6), struct s6 v);
 int c_calls_merlin(void);
+int c_widen(signed char sc, short s, unsigned short us, _Bool b);
+signed char c_trunc_sc(int x);
+short c_trunc_s(int x);
+unsigned short c_trunc_us(int x);
+_Bool c_tobool(int x);
+
+static int checks, first_failure;
+
+/* Counts a check, and remembers the first that fails. */
+static void check(int ok) {
+    checks++;
+    if (!ok && !first_failure)
+        first_failure = checks;
+}
+
+/* clang passes these extended to 32 bits; the sum shows they arrived right. */
+int m_widen(signed char sc, short s, unsigned short us, _Bool b) {
+    return sc + s + us + b;
+}
+
+/* clang compares the results without extending them again. */
+signed char m_trunc_sc(int x) {
+    return x;
+}
+
+short m_trunc_s(int x) {
+    return x;
+}
+
+unsigned short m_trunc_us(int x) {
+    return x;
+}
+
+_Bool m_tobool(int x) {
+    return x;
+}
 
 int m_sum6(struct s6 s) {
     return s.a + s.b + s.c;
@@ -151,7 +188,8 @@ struct s6 m_negate6(struct s6 s) {
 }
 
 int main(void) {
-    int ok = 0;
+    int n = 0x1fffd; /* -3 as a signed char or short, 65533 as an unsigned short */
+    int inner;
     struct s1 one = {'a'};
     struct s4 w = {1, -2};
     struct s5 s5 = {{1, 2, 3, 4, 5}};
@@ -162,48 +200,57 @@ int main(void) {
     struct s12 v = {1, 2, 3}, sum;
     struct big b;
 
-    ok += c_inc1(one).c == 'b';
-    ok += one.c == 'a';
-    ok += c_make3(7, 8, 9).b[1] == 8;
-    ok += c_sum3(c_make3(1, 2, 3)) == 6;
+    check(c_inc1(one).c == 'b');
+    check(one.c == 'a');
+    check(c_make3(7, 8, 9).b[1] == 8);
+    check(c_sum3(c_make3(1, 2, 3)) == 6);
     w = c_swap4(w);
-    ok += w.lo == -2 && w.hi == 1;
+    check(w.lo == -2 && w.hi == 1);
     s5 = c_rev5(s5);
-    ok += s5.b[0] == 5 && s5.b[2] == 3 && s5.b[4] == 1;
+    check(s5.b[0] == 5 && s5.b[2] == 3 && s5.b[4] == 1);
     /* six[1] is at offset 6: not word-aligned. */
     six[1] = c_make6(10, -20, 30);
-    ok += six[1].a == 10 && six[1].b == -20 && six[1].c == 30;
-    ok += c_sum6(six[1]) == 20;
+    check(six[1].a == 10 && six[1].b == -20 && six[1].c == 30);
+    check(c_sum6(six[1]) == 20);
     six[0] = c_twice6(six[1]);
-    ok += six[0].c == 60;
+    check(six[0].c == 60);
     p = c_swap8(p);
-    ok += p.x == 4 && p.y == 3;
+    check(p.x == 4 && p.y == 3);
     mx = c_mixed(mx);
-    ok += mx.c == 'n' && mx.i == 100;
+    check(mx.c == 'n' && mx.i == 100);
     un.i[0] = 7;
     un.i[1] = 0;
     un = c_union(un);
-    ok += un.i[1] == 8;
+    check(un.i[1] == 8);
     sum = c_add12(v, v);
-    ok += sum.a == 2 && sum.b == 4 && sum.c == 6;
-    ok += c_add12(sum, v).c == 9;
-    ok += c_scaled(5, v).b == 10;
-    ok += c_modify12(v) == 1002;
-    ok += v.a == 1;
-    ok += c_many(1, p, six[1], v, 2, 3) == 1 + 12 + 20 + 6 + 2 + 3;
+    check(sum.a == 2 && sum.b == 4 && sum.c == 6);
+    check(c_add12(sum, v).c == 9);
+    check(c_scaled(5, v).b == 10);
+    check(c_modify12(v) == 1002);
+    check(v.a == 1);
+    check(c_many(1, p, six[1], v, 2, 3) == 1 + 12 + 20 + 6 + 2 + 3);
     b = c_big(3);
-    ok += b.v[9] == 27;
-    ok += c_sumbig(b) == 135;
-    ok += c_sumbig(c_big(1)) == 45;
-    ok += c_apply6(m_negate6, six[1]).b == 20;
-    ok += c_apply6(c_twice6, six[1]).a == 20;
-    ok += c_calls_merlin() == 11;
+    check(b.v[9] == 27);
+    check(c_sumbig(b) == 135);
+    check(c_sumbig(c_big(1)) == 45);
+    check(c_apply6(m_negate6, six[1]).b == 20);
+    check(c_apply6(c_twice6, six[1]).a == 20);
+    /* Narrow scalars: merlin converts the arguments, clang the results. */
+    check(c_widen(n, n, n, n) == -3 - 3 + 65533 + 1);
+    check(c_trunc_sc(n) == -3);
+    check(c_trunc_s(0x18000) == -32768);
+    check(c_trunc_us(n) == 65533);
+    check(c_tobool(256) == 1);
+    inner = c_calls_merlin();
     /* merlin calling itself, the same way. */
-    ok += m_sumbig(m_big(0)) == 45;
-    ok += m_swap8(p).x == 3;
-    ok += m_many(1, p, six[1], v, 2, 3) == 44;
-    ok += m_rev5(s5).b[0] == 1;
-    ok += m_make12(1).c == 3;
-    ok += m_union(un).i[1] == 8;
-    return ok;
+    check(m_sumbig(m_big(0)) == 45);
+    check(m_swap8(p).x == 3);
+    check(m_many(1, p, six[1], v, 2, 3) == 44);
+    check(m_rev5(s5).b[0] == 1);
+    check(m_make12(1).c == 3);
+    check(m_union(un).i[1] == 8);
+    check(m_widen(n, n, n, n) == 65528);
+    if (first_failure)
+        return first_failure;
+    return inner ? 100 + inner : 0;
 }

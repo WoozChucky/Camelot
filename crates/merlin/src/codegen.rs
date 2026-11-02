@@ -2536,6 +2536,67 @@ main:
         );
     }
 
+    /// Volatile objects are memory-mapped registers: every access in the
+    /// source must be exactly one load or store, in source order, even when
+    /// its value is discarded or it repeats the previous one. merlin has no
+    /// optimizer, so today this holds by construction; the test keeps it so.
+    #[test]
+    fn volatile_accesses_are_kept() {
+        // The loads and stores of `f` that do not go through sp or s0 (the
+        // frame and the expression stack): here, exactly the volatile ones.
+        let accesses = |src: &str, f: &str| -> Vec<String> {
+            body_of(&compile(src), f)
+                .into_iter()
+                .filter(|l| {
+                    let op = l.split(' ').next().unwrap();
+                    matches!(op, "lw" | "lh" | "lhu" | "lb" | "lbu" | "sw" | "sh" | "sb")
+                        && !l.ends_with("(sp)")
+                        && !l.ends_with("(s0)")
+                })
+                .collect()
+        };
+        // `v; v;` are two reads, `v = 1; v = 1;` two writes, `v + v` two
+        // more reads.
+        assert_eq!(
+            accesses(
+                "volatile int v; int main() { v; v; v = 1; v = 1; return v + v; }",
+                "main"
+            ),
+            [
+                "lw a0, 0(a0)",
+                "lw a0, 0(a0)",
+                "sw a0, 0(a1)",
+                "sw a0, 0(a1)",
+                "lw a0, 0(a0)",
+                "lw a0, 0(a0)"
+            ]
+        );
+        // Through a pointer to a volatile struct and a cast of an address,
+        // as a driver writes them.
+        let src = "struct regs { int status; short data; };
+             int g(volatile struct regs *r) {
+                 r->data; (void)r->status; r->data = 5; r->data = 5;
+                 *(volatile int *)0x10000000; *(volatile unsigned char *)0x10000000 |= 4;
+                 while (r->status & 1) {}
+                 return r->data + r->data;
+             }";
+        assert_eq!(
+            accesses(src, "g"),
+            [
+                "lh a0, 0(a0)",  // r->data;
+                "lw a0, 0(a0)",  // (void)r->status;
+                "sh a0, 0(a1)",  // r->data = 5;
+                "sh a0, 0(a1)",  // r->data = 5;
+                "lw a0, 0(a0)",  // *(volatile int *)0x10000000;
+                "lbu a0, 0(a0)", // ... |= 4 reads once
+                "sb a0, 0(a1)",  // and writes once
+                "lw a0, 0(a0)",  // r->status, in the loop condition
+                "lh a0, 0(a0)",  // r->data +
+                "lh a0, 0(a0)",  // r->data
+            ]
+        );
+    }
+
     #[test]
     fn struct_data() {
         let asm = compile(

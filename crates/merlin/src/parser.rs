@@ -217,8 +217,11 @@ struct Scope {
 enum Derive {
     /// Pointer to the type so far, with these qualifiers.
     Ptr(Quals),
-    /// Array of the type so far (`None`: of unknown size).
-    Array(Option<i64>, Pos),
+    /// Array of the type so far (`None`: of unknown size). The last field is
+    /// set when the brackets held qualifiers or `static` (`int a[const 3]`):
+    /// C99 6.7.5.3p7 allows them only on a parameter's outermost array, and
+    /// the qualifiers then apply to the pointer the array is adjusted to.
+    Array(Option<i64>, Pos, Option<Quals>),
     /// Function returning the type so far, with these parameters (and the
     /// scope holding their names).
     Func(Vec<Param>, Scope),
@@ -887,11 +890,31 @@ impl Parser<'_> {
             if self.is_punct("[") {
                 self.too_deep(dims, "array dimensions")?;
                 let open = self.advance().pos;
+                // `[const 3]`, `[static 3]`, `[restrict static 3]`: qualifiers
+                // and `static` before the size (`static` promises the caller
+                // passes at least that many elements; merlin does not use it).
+                // `declarator` checks they are on a parameter's outermost array.
+                let mut quals = None;
+                let mut is_static = false;
+                loop {
+                    if self.eat_kw(Kw::Static) {
+                        is_static = true;
+                        quals.get_or_insert(Quals::NONE);
+                    } else if matches!(self.peek(), Tok::Kw(Kw::Const | Kw::Volatile | Kw::Restrict)) {
+                        let q = self.qualifiers();
+                        quals = Some(quals.unwrap_or(Quals::NONE).union(q));
+                    } else {
+                        break;
+                    }
+                }
+                if is_static && self.is_punct("]") {
+                    return Err(self.unexpected("the array size after 'static'"));
+                }
                 if self.eat_punct("]") {
                     if dims > 0 {
                         return Err(Error::new(open, "only the first array dimension may be left out"));
                     }
-                    out.push(Derive::Array(None, open));
+                    out.push(Derive::Array(None, open, quals));
                     dims += 1;
                     continue;
                 }
@@ -908,7 +931,7 @@ impl Parser<'_> {
                 if n <= 0 {
                     return Err(Error::new(pos, format!("array size must be positive, not {n}")));
                 }
-                out.push(Derive::Array(Some(n), open));
+                out.push(Derive::Array(Some(n), open, quals));
                 dims += 1;
             } else if self.is_punct("(") {
                 self.advance();
@@ -938,7 +961,16 @@ impl Parser<'_> {
                     ty = Type::ptr(ty).qualified(q);
                     size = Some(4);
                 }
-                Derive::Array(n, open) => {
+                Derive::Array(n, open, quals) => {
+                    // Only a parameter's outermost array becomes a pointer,
+                    // the one thing the qualifiers in the brackets can apply to.
+                    if quals.is_some() && !(ctx == Ctx::Param && i + 1 == steps) {
+                        return Err(Error::new(
+                            open,
+                            "qualifiers and 'static' inside '[]' are only allowed in the \
+                             outermost array of a function parameter",
+                        ));
+                    }
                     if ty.is_func() {
                         let what = if name.is_empty() { "type name" } else { &name };
                         return Err(Error::new(
@@ -958,6 +990,13 @@ impl Parser<'_> {
                     }
                     size = n.map(|_| total);
                     ty = Type::array(ty, n.map(|n| n as u32));
+                    if let Some(q) = quals {
+                        // The parameter adjustment, done here so the
+                        // qualifiers land on the pointer: `int a[const 3]`
+                        // declares `int *const a`.
+                        ty = ty.decay().qualified(q);
+                        size = Some(4);
+                    }
                 }
                 Derive::Func(params, scope) => {
                     if ty.is_array() || ty.is_func() {
@@ -1006,6 +1045,12 @@ impl Parser<'_> {
             let start = self.here();
             let specs = self.specifiers(Ctx::Param)?;
             let d = self.declarator(&specs.ty, Ctx::Param)?;
+            // `(V)` with `typedef void V;` is `(void)` too: what C99 6.7.5.3p10
+            // asks for is one unnamed parameter of (unqualified) type void,
+            // however it is spelled.
+            if params.is_empty() && d.name.is_empty() && d.ty == Type::Void && self.eat_punct(")") {
+                return Ok(params);
+            }
             let pos = if d.name.is_empty() { start } else { d.pos };
             if params.len() == MAX_PARAMS {
                 return Err(Error::new(
@@ -1919,6 +1964,45 @@ mod tests {
         assert_eq!(funcs(&p)[0].pos, Pos::new(1, 5));
         assert_eq!(funcs(&p)[2].params[1].pos, Pos::new(3, 31));
         assert!(prog("").items.is_empty());
+    }
+
+    #[test]
+    fn void_parameter_list_through_a_typedef() {
+        let p = prog("typedef void V; int f(V); int g(V) { return 0; }");
+        assert!(funcs(&p).iter().all(|f| f.params.is_empty()));
+        assert_eq!(globals("typedef void V; int (*h)(V);")[0], "int (*h)(void)");
+        // Only a lone, unnamed, unqualified void is "no parameters".
+        prog("typedef void V; int f(V x); int g(const V); int h(V, int);");
+    }
+
+    #[test]
+    fn array_parameter_qualifiers() {
+        let params = |src: &str| -> Vec<String> {
+            let p = prog(src);
+            let f = funcs(&p)[0];
+            f.params.iter().map(|p| p.ty.declare(&p.name)).collect()
+        };
+        assert_eq!(params("int f(int a[const 3]);"), ["int *const a"]);
+        assert_eq!(params("int f(int a[static 3]);"), ["int *a"]);
+        assert_eq!(
+            params("int f(char a[const volatile static 4][2], int b[restrict], int [const]);"),
+            ["char (*const volatile a)[2]", "int *b", "int *const"]
+        );
+        assert_eq!(params("int f(int a[static const 3]);"), ["int *const a"]);
+        // Anywhere else they have no pointer to qualify.
+        let only = "qualifiers and 'static' inside '[]' are only allowed in the outermost array of a \
+                    function parameter";
+        assert_eq!(err("int a[const 3];"), format!("1:6: {only}"));
+        assert_eq!(err("int f(int a[3][const 2]);"), format!("1:15: {only}"));
+        assert_eq!(err("int f(int (*a)[const 2]);"), format!("1:15: {only}"));
+        assert_eq!(
+            err("int f() { return sizeof(int [const 2]); }"),
+            format!("1:29: {only}")
+        );
+        assert_eq!(
+            err("int f(int a[static]);"),
+            "1:19: expected the array size after 'static', found ']'"
+        );
     }
 
     #[test]

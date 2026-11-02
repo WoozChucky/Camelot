@@ -2156,6 +2156,18 @@ mod tests {
             err("void f(void x);"),
             "1:13: parameter has incomplete type 'void'"
         );
+        // A typedef for void spells `(void)` too, but only unqualified.
+        ok("typedef void V; int f(V); int main(V) { return f(); }");
+        assert_eq!(
+            err("typedef void V; void f(const V);"),
+            "1:24: parameter has incomplete type 'void'"
+        );
+        // `int a[const 3]` makes the pointer const, not the elements.
+        ok("int f(int a[const 3]) { a[0] = 1; return a[1]; }");
+        assert_eq!(
+            err("int f(int a[const 3]) { a = 0; return 0; }"),
+            "1:25: cannot assign to variable 'a' with const-qualified type 'int *const'"
+        );
     }
 
     #[test]

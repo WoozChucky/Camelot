@@ -1,21 +1,22 @@
-//! merlin's calling convention against clang's: structs of every size class
-//! passed and returned both ways between merlin-compiled and clang-compiled
-//! code (see `tests/abi/clang_side.c` for the cases).
+//! merlin's calling convention against clang's: structs of every size class,
+//! and the narrow scalars, passed and returned both ways between
+//! merlin-compiled and clang-compiled code (see `tests/abi/clang_side.c` for
+//! the cases).
 //!
 //! Run by `cargo test`, without LLVM: `tests/abi/clang_side.o` is committed.
 //!
 //! * `merlin_and_clang_call_each_other`: merlin compiles
 //!   `tests/abi/merlin_side.c`; merlin-ld links it with the committed clang
-//!   object and `tests/crt0.s`; Grail runs it. Exit code 30 means every
-//!   check passed.
+//!   object and `tests/crt0.s`; Grail runs it. Exit code 0 means every
+//!   check passed; otherwise the code numbers the first that failed.
 //! * `merlin_calls_merlin`: the same program with both sides compiled by
 //!   merlin.
 //!
 //! Ignored, since they need clang on `PATH`:
 //!
 //! * `clang_side`: compiles `clang_side.c` again and checks that the
-//!   committed `clang_side.s` matches; with `MERLIN_BLESS=1` it rewrites
-//!   `clang_side.s` and `clang_side.o` instead (after changing the source):
+//!   committed `clang_side.s` and `clang_side.o` match; with
+//!   `MERLIN_BLESS=1` it rewrites them instead (after changing the source):
 //!
 //!       MERLIN_BLESS=1 cargo test -p merlin --test abi -- --ignored clang_side
 //!
@@ -26,8 +27,16 @@ use grail::{Machine, RunResult};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The exit code when every check passes.
-const EXPECT: u8 = 30;
+/// Checks the exit code of the round-trip program: 0, or the number of the
+/// first check that failed.
+fn assert_passed(code: u8) {
+    let which = match code {
+        0 => return,
+        1..=100 => format!("check {code} of main in merlin_side.c"),
+        _ => format!("check {} of c_calls_merlin in clang_side.c", code - 100),
+    };
+    panic!("{which} failed (exit code {code})");
+}
 
 /// How the clang side is compiled (and the merlin side, for `clang_calls_clang`).
 const CLANG_FLAGS: &[&str] = &[
@@ -97,7 +106,7 @@ fn merlin_and_clang_call_each_other() {
         ("merlin_side.o", merlin_object("merlin_side.c")),
         ("clang_side.o", clang_side),
     ]);
-    assert_eq!(code, EXPECT, "{} checks failed", EXPECT as i32 - code as i32);
+    assert_passed(code);
 }
 
 #[test]
@@ -106,7 +115,7 @@ fn merlin_calls_merlin() {
         ("merlin_side.o", merlin_object("merlin_side.c")),
         ("clang_side.o", merlin_object("clang_side.c")),
     ]);
-    assert_eq!(code, EXPECT);
+    assert_passed(code);
 }
 
 /// Runs clang in `tests/abi` on `file` (a relative name, so no absolute path
@@ -162,6 +171,11 @@ fn clang_side() {
         asm.replace("\r\n", "\n"),
         "tests/abi/clang_side.s is out of date (MERLIN_BLESS=1 to regenerate)"
     );
+    // The object is what the round trip links, so it must match too.
+    assert!(
+        std::fs::read(&o).unwrap() == std::fs::read(abi_dir().join("clang_side.o")).unwrap(),
+        "tests/abi/clang_side.o is out of date (MERLIN_BLESS=1 to regenerate)"
+    );
 }
 
 #[test]
@@ -177,5 +191,5 @@ fn clang_calls_clang() {
         clang(c, &["-c", "-o", path.to_str().unwrap()]);
         objs.push((o, std::fs::read(&path).unwrap()));
     }
-    assert_eq!(link_and_run(objs), EXPECT);
+    assert_passed(link_and_run(objs));
 }
