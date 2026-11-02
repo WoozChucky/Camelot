@@ -88,19 +88,16 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     let report = fsck::check(&image).unwrap();
     assert_eq!(report.files, fsck::check(&plain).unwrap().files);
     // Room for the shell to write files: the free blocks are reported, and more
-    // than a fifth of the filesystem, which is also more than filetest's
-    // largest file (274 432 bytes, 269 blocks with its indirect block) needs.
+    // than filetest's largest file (274 432 bytes, 269 blocks with its indirect
+    // block) needs, with some to spare. (The programs in /bin grow: what is free
+    // was over a fifth of the filesystem before shd and the thread programs.)
     eprintln!(
         "the 2 MiB root image: a filesystem of {} blocks, {} free; a kernel of {} blocks",
         report.sb.size,
         report.free_blocks,
         loadable.len().div_ceil(BSIZE)
     );
-    assert!(
-        report.free_blocks > report.sb.size / 5 && report.free_blocks > 269,
-        "{} free",
-        report.free_blocks
-    );
+    assert!(report.free_blocks > 300, "{} free", report.free_blocks);
 
     // The default machine: 4 MiB of RAM.
     assert_eq!(MachineConfig::default().ram_size, 4 << 20);
