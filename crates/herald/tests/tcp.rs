@@ -282,8 +282,9 @@ fn the_binary_leaves_on_the_detach_key_in_piped_input() {
     let (code, out, err) = run_herald(&addr.to_string(), b"hello\n\x1d", true);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(join(server), b"hello\n");
-    // The echo may or may not have come back before Herald left.
-    assert!(out == b"hello\n" || out.is_empty(), "{out:?}");
+    // Herald may leave before any of the echo has come back, or some or all of it:
+    // what it printed is a part of it from the start.
+    assert!(b"hello\n".starts_with(&out), "{out:?}");
     assert_eq!(
         err,
         format!("herald: connected to {addr}; Ctrl-] leaves\nherald: left {addr}, closing the connection\n")
