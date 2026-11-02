@@ -1,6 +1,6 @@
 //! Field encoding inside a payload (protocol doc, "Field types"): little-endian
-//! integers, `bool` as one byte 0/1, length-prefixed bytes and strings, tagged options
-//! and counted lists.
+//! integers (signed ones in two's complement), `bool` as one byte 0/1,
+//! length-prefixed bytes and strings, tagged options and counted lists.
 //!
 //! The reader never trusts a length: every one is checked against the bytes actually
 //! left in the payload before anything is read, and a list count never decides how
@@ -26,6 +26,12 @@ impl Writer {
     }
     pub fn u64(&mut self, v: u64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    pub fn i8(&mut self, v: i8) {
+        self.u8(v as u8);
+    }
+    pub fn i32(&mut self, v: i32) {
+        self.u32(v as u32);
     }
     pub fn bool(&mut self, v: bool) {
         self.u8(v as u8);
@@ -101,6 +107,12 @@ impl<'a> Reader<'a> {
     }
     pub fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.array()?))
+    }
+    pub fn i8(&mut self) -> Result<i8> {
+        Ok(self.u8()? as i8)
+    }
+    pub fn i32(&mut self) -> Result<i32> {
+        Ok(self.u32()? as i32)
     }
     pub fn magic(&mut self) -> Result<[u8; 4]> {
         self.array()
@@ -179,6 +191,20 @@ mod tests {
         assert_eq!(r.u16().unwrap(), 0x0302);
         assert_eq!(r.u32().unwrap(), 0x0706_0504);
         assert_eq!(r.u64().unwrap(), 0x0f0e_0d0c_0b0a_0908);
+        r.finish().unwrap();
+    }
+
+    #[test]
+    fn signed_integers_are_twos_complement() {
+        let mut w = Writer::default();
+        w.i8(-2);
+        w.i32(-3);
+        w.i32(i32::MIN);
+        assert_eq!(w.buf, [0xfe, 0xfd, 0xff, 0xff, 0xff, 0, 0, 0, 0x80]);
+        let mut r = Reader::new(&w.buf);
+        assert_eq!(r.i8().unwrap(), -2);
+        assert_eq!(r.i32().unwrap(), -3);
+        assert_eq!(r.i32().unwrap(), i32::MIN);
         r.finish().unwrap();
     }
 

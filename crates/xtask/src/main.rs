@@ -15,6 +15,9 @@ tasks:
   kernel       build kernel/kernel.elf (clang + ld.lld from the official LLVM install),
                after compiling kernel/user/*.c to kernel/user/clang/*.s (clang) and
                regenerating kernel/userprogs.s from kernel/user (merlin-as + merlin-ld)
+  fs           build the root filesystem image (target/camelot-fs.img): kernel/fs/ at /,
+               the user programs in /bin (merlin-as + merlin-ld; no LLVM needed)
+               -o PATH: output file; --size N: blocks (1 KiB each, default 2048)
   hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
                with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
   ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj, llvm-objdump);
@@ -64,6 +67,29 @@ fn parse_kernel_args(args: &[String]) -> Result<KernelArgs, String> {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
+struct FsArgs {
+    out: Option<PathBuf>,
+    size: Option<u32>,
+}
+
+fn parse_fs_args(args: &[String]) -> Result<FsArgs, String> {
+    let mut f = FsArgs::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
+        match a.as_str() {
+            "-o" => f.out = Some(value("-o")?.into()),
+            "--size" => {
+                let v = value("--size")?;
+                f.size = Some(v.parse().map_err(|_| format!("bad size {v} (blocks)"))?);
+            }
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    Ok(f)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
 struct ExamplesArgs {
     /// Examples named on the command line; empty for all of them.
     names: Vec<String>,
@@ -100,6 +126,13 @@ fn main() -> ExitCode {
         },
         Some("kernel") => match parse_kernel_args(&args[1..]) {
             Ok(k) => kernel(k),
+            Err(e) => {
+                eprintln!("xtask: {e}\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        Some("fs") => match parse_fs_args(&args[1..]) {
+            Ok(f) => build_fs(f),
             Err(e) => {
                 eprintln!("xtask: {e}\n{USAGE}");
                 ExitCode::from(2)
@@ -203,6 +236,46 @@ fn build_examples(args: ExamplesArgs) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// `cargo xtask fs`: the root filesystem image, checked with fsck after it
+/// is built.
+fn build_fs(f: FsArgs) -> ExitCode {
+    let root = repo_root();
+    let mut opts = camelot_fs::mkfs::Options::default();
+    if let Some(size) = f.size {
+        opts.size = size;
+    }
+    let out = f.out.unwrap_or_else(|| xtask::fs::default_out(&root));
+    let image = match xtask::fs::build(&root, &opts) {
+        Ok(image) => image,
+        Err(e) => {
+            eprintln!("xtask: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match camelot_fs::fsck::check(&image) {
+        Ok(r) => r,
+        Err(problems) => {
+            eprintln!("xtask: the image fails fsck:\n{}", problems.join("\n"));
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(dir) = out.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&out, &image) {
+        eprintln!("xtask: cannot write {}: {e}", out.display());
+        return ExitCode::FAILURE;
+    }
+    eprintln!(
+        "built {}: {} blocks ({} free), {} files",
+        out.display(),
+        report.sb.size,
+        report.free_blocks,
+        report.files
+    );
+    ExitCode::SUCCESS
 }
 
 fn hello(k: KernelArgs) -> ExitCode {
@@ -434,6 +507,21 @@ mod tests {
         assert!(parse_examples(&["--run"])
             .unwrap_err()
             .contains("unknown option --run"));
+    }
+
+    #[test]
+    fn fs_args() {
+        let parse = |v: &[&str]| parse_fs_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(parse(&[]).unwrap(), FsArgs::default());
+        assert_eq!(
+            parse(&["-o", "d.img", "--size", "512"]).unwrap(),
+            FsArgs {
+                out: Some("d.img".into()),
+                size: Some(512)
+            }
+        );
+        assert!(parse(&["--size", "1M"]).unwrap_err().contains("bad size"));
+        assert!(parse(&["-v"]).unwrap_err().contains("unknown option"));
     }
 
     #[test]

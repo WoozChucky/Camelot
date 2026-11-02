@@ -5,6 +5,7 @@
 #include "bio.h"
 #include "blk.h"
 #include "blktest.h"
+#include "fstest.h"
 #include "kalloc.h"
 #include "kprintf.h"
 #include "memlayout.h"
@@ -234,6 +235,7 @@ int kmain(void) {
 
     deliberate_fault();
     failed += blk_selftest();
+    failed += fs_boot();
     int status = run_shell();
     /* Failed self-tests are what the exit code reports first. */
     return failed != 0 ? failed : status;

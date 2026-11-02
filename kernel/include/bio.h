@@ -12,7 +12,9 @@
  * there is only ever one copy of a block and one user changing it. Released
  * buffers stay cached, and when a block that isn't cached needs a buffer,
  * the least recently released one is reused. Writes go to the disk at once
- * (bwrite), so the cache never holds data the disk doesn't. */
+ * (bwrite). The filesystem's log changes buffers without writing them until
+ * its transaction commits (log.h): it pins them (bpin) so they stay cached
+ * until then, and only then does the cache hold data the disk doesn't. */
 #ifndef CAMELOT_BIO_H
 #define CAMELOT_BIO_H
 
@@ -26,7 +28,8 @@
 #define NBUF 30
 
 struct buf {
-    /* `data` holds the block as it is on the disk. */
+    /* `data` holds the block as it is on the disk (or as a transaction
+     * changed it, while the buffer is pinned). */
     bool valid;
     /* Held by the process bread() returned it to, until brelse(). */
     bool locked;
@@ -35,8 +38,9 @@ struct buf {
     u32 error;
     u32 dev;
     u32 blockno;
-    /* Users: the holder and the processes waiting for the lock. A buffer
-     * with users is never reused for another block. */
+    /* Users: the holder, the processes waiting for the lock, and one more
+     * while the log has it pinned. A buffer with users is never reused for
+     * another block. */
     u32 refcnt;
     /* The LRU list, most recently released first. */
     struct buf *prev;
@@ -64,5 +68,11 @@ u32 bwrite(struct buf *b);
 
 /* Unlocks `b`, which must be locked, and gives it back to the cache. */
 void brelse(struct buf *b);
+
+/* Pins `b` in the cache (an extra user, so it is never reused for another
+ * block), and unpins it. For the log, which holds a transaction's changed
+ * blocks in the cache until they are written. `b` must be locked. */
+void bpin(struct buf *b);
+void bunpin(struct buf *b);
 
 #endif

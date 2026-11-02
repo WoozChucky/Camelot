@@ -1,0 +1,194 @@
+/* Pendragon's pages: plain CSS, light and dark. */
+
+:root {
+  --bg: #f6f6f3;
+  --panel: #ffffff;
+  --text: #1d1f21;
+  --muted: #6b6f75;
+  --line: #d9dbd6;
+  --accent: #2f5d8a;
+  --good: #2e7d4f;
+  --warn: #9a6b00;
+  --bad: #b3261e;
+  --console-bg: #101214;
+  --console-text: #d7dad0;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17191b;
+    --panel: #1f2225;
+    --text: #e4e6e1;
+    --muted: #9aa0a6;
+    --line: #34383c;
+    --accent: #7fb0e0;
+    --good: #6cc48f;
+    --warn: #e0b04f;
+    --bad: #f08a80;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 10px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand { font-weight: 700; letter-spacing: 0.02em; }
+
+nav a {
+  margin-right: 16px;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+nav a.current { color: var(--text); font-weight: 600; }
+
+main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+
+h1 { font-size: 20px; margin: 4px 0 16px; }
+h2 { font-size: 16px; margin: 24px 0 8px; }
+
+a { color: var(--accent); }
+
+#notice {
+  margin: 12px 20px 0;
+  padding: 10px 14px;
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  color: var(--bad);
+  background: var(--panel);
+}
+
+.error { color: var(--bad); white-space: pre-wrap; }
+.muted { color: var(--muted); }
+
+.cards { display: flex; flex-wrap: wrap; gap: 16px; }
+
+.card {
+  flex: 1 1 300px;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.card h2 { margin-top: 0; }
+
+.bar {
+  height: 10px;
+  margin: 8px 0 4px;
+  background: var(--line);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.bar > div { height: 100%; background: var(--accent); }
+.bar.full > div { background: var(--bad); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+
+th, td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+th { font-size: 13px; color: var(--muted); font-weight: 600; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.state { font-weight: 600; }
+.state-running { color: var(--good); }
+.state-paused, .state-created { color: var(--warn); }
+.state-stopped, .state-exited { color: var(--muted); }
+.ok { color: var(--good); font-weight: 600; }
+.down { color: var(--bad); font-weight: 600; }
+
+button {
+  font: inherit;
+  font-size: 13px;
+  padding: 3px 10px;
+  margin: 0 4px 4px 0;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--bad); }
+
+form.panel, .panel {
+  padding: 14px 16px;
+  margin-bottom: 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+label { display: block; margin: 8px 0; }
+label > span { display: inline-block; min-width: 110px; color: var(--muted); }
+label.inline { display: inline-block; margin-right: 16px; }
+
+input[type=text], select {
+  font: inherit;
+  padding: 4px 6px;
+  min-width: 260px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.disk-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
+
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0; }
+dl.facts dt { color: var(--muted); }
+dl.facts dd { margin: 0; }
+
+pre.console {
+  height: 420px;
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  background: var(--console-bg);
+  color: var(--console-text);
+  border-radius: 6px 6px 0 0;
+  font: 13px/1.35 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+form.console-input {
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-top: 0;
+  border-radius: 0 0 6px 6px;
+}
+
+form.console-input input[type=text] { flex: 1; font-family: ui-monospace, Consolas, monospace; }

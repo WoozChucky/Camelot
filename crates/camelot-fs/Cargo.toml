@@ -1,0 +1,9 @@
+[package]
+name = "camelot-fs"
+description = "The Camelot filesystem on the host: mkfs, fsck and a reader for CMFS disk images (docs/camelot-fs.md)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "camelot_fs"

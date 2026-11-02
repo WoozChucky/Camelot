@@ -1,0 +1,655 @@
+// Pendragon's pages: overview, VMs (list, new, one VM with its console) and disks.
+//
+// Plain JavaScript, no build step. Every element is made with the DOM and every
+// piece of data goes in as text (textContent), never as markup, so nothing a VM
+// prints or a server says can become script. The pages talk to Pendragon's JSON API
+// (docs/pendragon.md) with this launch's token in the X-Pendragon-Token header.
+"use strict";
+
+// ---- Token ----
+
+const TOKEN_KEY = "pendragon-token";
+
+// The token arrives in the URL Pendragon printed (?token=...). Keep it for this tab
+// and take it out of the address bar, so it is not left in the history or shared by
+// copying the address.
+function loadToken() {
+  const fromUrl = new URLSearchParams(location.search).get("token");
+  if (fromUrl && /^[0-9a-f]{64}$/.test(fromUrl)) {
+    try {
+      sessionStorage.setItem(TOKEN_KEY, fromUrl);
+    } catch (e) {
+      // Storage blocked: the token lives as long as this page.
+    }
+    history.replaceState(null, "", location.pathname + location.hash);
+    return fromUrl;
+  }
+  try {
+    return sessionStorage.getItem(TOKEN_KEY);
+  } catch (e) {
+    return null;
+  }
+}
+
+const token = loadToken();
+
+// ---- Helpers ----
+
+// An element: el("td", {class: "num"}, "text", child, ...). Strings become text nodes.
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [name, value] of Object.entries(attrs || {})) {
+    if (value === false || value === null || value === undefined) continue;
+    if (name.startsWith("on")) node.addEventListener(name.slice(2), value);
+    else if (name === "class") node.className = value;
+    else node.setAttribute(name, value === true ? "" : String(value));
+  }
+  for (const child of children.flat(Infinity)) {
+    if (child === null || child === undefined || child === false) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function notice(text) {
+  const box = document.getElementById("notice");
+  box.textContent = text || "";
+  box.hidden = !text;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// A call to the API. Resolves to the reply's JSON; rejects with an Error whose
+// message is the server's (and .status, .code).
+async function api(method, path, body, signal) {
+  const headers = { "X-Pendragon-Token": token || "" };
+  const init = { method, headers, cache: "no-store", signal };
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  const reply = await fetch("/api/" + path, init);
+  let data = null;
+  try {
+    data = await reply.json();
+  } catch (e) {
+    // Not JSON: the status says it all.
+  }
+  if (!reply.ok) {
+    const error = new Error((data && data.error) || reply.status + " " + reply.statusText);
+    error.status = reply.status;
+    error.code = data && data.code;
+    if (reply.status === 403) notice(error.message);
+    throw error;
+  }
+  return data;
+}
+
+function toBase64(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function fromBase64(text) {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function stateCell(vm) {
+  return el("span", { class: "state state-" + vm.state }, vm.state_text);
+}
+
+function vmLink(id, name) {
+  return el("a", { href: "#/vms/" + id }, name);
+}
+
+function errorLine() {
+  return el("p", { class: "error", hidden: true });
+}
+
+function showError(line, error) {
+  line.textContent = error ? error.message || String(error) : "";
+  line.hidden = !error;
+}
+
+// ---- Pages ----
+
+// The page being shown. Each page gets a context; leaving it sets alive to false
+// and aborts what it was waiting for.
+let page = null;
+
+function leave() {
+  if (!page) return;
+  page.alive = false;
+  page.abort.abort();
+  for (const timer of page.timers) clearInterval(timer);
+  page = null;
+}
+
+function enter(render) {
+  leave();
+  const ctx = { alive: true, abort: new AbortController(), timers: [] };
+  page = ctx;
+  const main = document.getElementById("main");
+  main.replaceChildren();
+  render(main, ctx);
+}
+
+// Calls refresh now and every `ms` while the page is shown.
+function every(ctx, ms, refresh) {
+  refresh();
+  ctx.timers.push(setInterval(() => ctx.alive && refresh(), ms));
+}
+
+function route() {
+  const hash = location.hash.replace(/^#/, "") || "/";
+  const [path, query] = hash.split("?");
+  const params = new URLSearchParams(query || "");
+  const parts = path.split("/").filter(Boolean);
+  for (const link of document.querySelectorAll("nav a")) {
+    link.classList.toggle("current", link.dataset.page === (parts[0] || "overview"));
+  }
+  if (!token) {
+    notice("This page has no token. Open the URL pendragon printed when it started (it ends in ?token=...).");
+  }
+  if (parts.length === 0) enter(overviewPage);
+  else if (parts[0] === "vms" && parts.length === 1) enter(vmsPage);
+  else if (parts[0] === "vms" && parts[1] === "new") enter((m, c) => newVmPage(m, c, params.get("disk")));
+  else if (parts[0] === "vms" && /^\d+$/.test(parts[1] || "")) enter((m, c) => vmPage(m, c, parts[1]));
+  else if (parts[0] === "disks") enter(disksPage);
+  else enter((main) => main.append(el("h1", {}, "No such page"), el("a", { href: "#/" }, "Overview")));
+}
+
+// ---- Overview ----
+
+function overviewPage(main, ctx) {
+  const body = el("div");
+  const error = errorLine();
+  main.append(el("h1", {}, "Overview"), error, body);
+  every(ctx, 3000, async () => {
+    try {
+      const o = await api("GET", "overview", undefined, ctx.abort.signal);
+      if (!ctx.alive) return;
+      showError(error, null);
+      body.replaceChildren(
+        el("div", { class: "cards" }, serverCard(o.avalon, o.vms, o.ram), lakeCard(o.lake, o.disks)),
+        el("p", { class: "muted" }, o.pendragon),
+      );
+    } catch (e) {
+      if (ctx.alive) showError(error, e);
+    }
+  });
+}
+
+function health(server) {
+  return [
+    el("p", {}, el("span", { class: server.ok ? "ok" : "down" }, server.ok ? "up" : "down"), " at ", server.addr),
+    server.ok ? el("p", { class: "muted" }, server.server) : el("p", { class: "error" }, server.error),
+  ];
+}
+
+function serverCard(avalon, vms, ram) {
+  const card = el("div", { class: "card" }, el("h2", {}, "Avalon"), health(avalon));
+  if (ram) {
+    const share = ram.budget > 0 ? Math.min(1, ram.used / ram.budget) : 0;
+    const fill = el("div");
+    fill.style.width = (share * 100).toFixed(1) + "%";
+    card.append(
+      el("p", {}, "RAM in use: ", ram.used_text, " of ", ram.budget_text),
+      el("div", { class: share >= 0.9 ? "bar full" : "bar" }, fill),
+    );
+  }
+  if (vms) {
+    card.append(
+      el(
+        "p",
+        {},
+        el("a", { href: "#/vms" }, vms.total + " VMs"),
+        ": " + vms.running + " running, " + vms.paused + " paused, " + vms.created + " created, " + vms.ended + " ended",
+      ),
+    );
+  }
+  return card;
+}
+
+function lakeCard(lake, disks) {
+  const card = el("div", { class: "card" }, el("h2", {}, "Lake"), health(lake));
+  if (disks) {
+    card.append(
+      el("p", {}, el("a", { href: "#/disks" }, disks.total + " disks"), ", " + disks.attached + " attached"),
+      el("p", { class: "muted" }, disks.bytes_text + " in all"),
+    );
+  }
+  return card;
+}
+
+// ---- VMs ----
+
+const CONFIRM = {
+  stop: "Stop VM {vm}? A stopped VM cannot be started again, and it releases its disks.",
+  destroy: "Destroy VM {vm}? Its console and state are gone for good.",
+};
+
+// The buttons for a VM's allowed actions; `after` runs once one is done.
+function actionButtons(vm, error, after) {
+  return vm.actions.map((action) =>
+    el(
+      "button",
+      {
+        class: action === "destroy" || action === "stop" ? "danger" : "",
+        onclick: async (event) => {
+          const question = CONFIRM[action];
+          if (question && !confirm(question.replace("{vm}", vm.id + " (" + vm.name + ")"))) return;
+          event.target.disabled = true;
+          try {
+            await api("POST", "vms/" + vm.id + "/" + action);
+            showError(error, null);
+          } catch (e) {
+            showError(error, e);
+          }
+          after(action);
+        },
+      },
+      action,
+    ),
+  );
+}
+
+function diskList(vm) {
+  if (vm.disks.length === 0) return el("span", { class: "muted" }, "none");
+  return vm.disks.map((d) => el("div", {}, d.source, d.read_only ? " (read-only)" : ""));
+}
+
+function vmsPage(main, ctx) {
+  const error = errorLine();
+  const table = el("div");
+  main.append(
+    el("h1", {}, "VMs"),
+    el("p", {}, el("button", { class: "primary", onclick: () => (location.hash = "#/vms/new") }, "New VM")),
+    error,
+    table,
+  );
+  const refresh = async () => {
+    try {
+      const list = await api("GET", "vms", undefined, ctx.abort.signal);
+      if (!ctx.alive) return;
+      if (list.vms.length === 0) {
+        table.replaceChildren(el("p", { class: "muted" }, "No VMs on Avalon at " + list.avalon + "."));
+        return;
+      }
+      table.replaceChildren(
+        el(
+          "table",
+          {},
+          el("tr", {}, ["ID", "Name", "State", "RAM", "Clock", "Disks", ""].map((h) => el("th", {}, h))),
+          list.vms.map((vm) =>
+            el(
+              "tr",
+              {},
+              el("td", { class: "num" }, vm.id),
+              el("td", {}, vmLink(vm.id, vm.name)),
+              el("td", {}, stateCell(vm)),
+              el("td", { class: "num" }, vm.ram_text),
+              el("td", {}, vm.clock_text),
+              el("td", {}, diskList(vm)),
+              el("td", {}, actionButtons(vm, error, refresh)),
+            ),
+          ),
+        ),
+      );
+    } catch (e) {
+      if (ctx.alive) showError(error, e);
+    }
+  };
+  every(ctx, 2000, refresh);
+}
+
+function newVmPage(main, ctx, disk) {
+  const error = errorLine();
+  const lakeImages = el("datalist", { id: "lake-images" });
+  const disks = el("div");
+  let lake = null;
+
+  const addDisk = (source) => {
+    const row = el(
+      "div",
+      { class: "disk-row" },
+      el("input", {
+        type: "text",
+        class: "disk-source",
+        list: "lake-images",
+        placeholder: "lake://host:port/name, or a file on Avalon's host",
+        value: source || "",
+      }),
+      el("label", { class: "inline" }, el("input", { type: "checkbox", class: "disk-ro" }), " read-only"),
+      el("button", { type: "button", onclick: () => row.remove() }, "remove"),
+    );
+    disks.append(row);
+  };
+
+  const field = (label, input, hint) => el("label", {}, el("span", {}, label), input, hint ? el("span", { class: "muted" }, " " + hint) : null);
+  const name = el("input", { type: "text", required: true, placeholder: "web", autocomplete: "off" });
+  const ram = el("input", { type: "text", value: "128" });
+  const clock = el("input", { type: "text", placeholder: "full speed" });
+  const program = el("input", { type: "file", accept: ".elf,application/octet-stream" });
+  const start = el("input", { type: "checkbox", checked: true });
+  const submit = el("button", { type: "submit", class: "primary" }, "Create");
+
+  const form = el(
+    "form",
+    { class: "panel" },
+    field("Name", name, "lowercase letters, digits, '.', '_' and '-'"),
+    field("RAM (MiB)", ram, "1 to 2048"),
+    field("Clock", clock, "e.g. 10MHz, 500kHz, 5Hz; empty runs at full speed"),
+    field("Program", program, "an Excalibur ELF executable"),
+    el("h2", {}, "Disks"),
+    disks,
+    el("button", { type: "button", onclick: () => addDisk("") }, "Add a disk"),
+    lakeImages,
+    el("label", {}, start, " start it once created"),
+    submit,
+  );
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    try {
+      const file = program.files[0];
+      if (!file) throw new Error("Choose the program to run (an ELF file).");
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const request = {
+        name: name.value.trim(),
+        ram: ram.value,
+        clock: clock.value,
+        start: start.checked,
+        program: toBase64(bytes),
+        disks: [...disks.querySelectorAll(".disk-row")]
+          .map((row) => ({
+            source: row.querySelector(".disk-source").value.trim(),
+            read_only: row.querySelector(".disk-ro").checked,
+          }))
+          .filter((d) => d.source !== ""),
+      };
+      const created = await api("POST", "vms", request);
+      location.hash = "#/vms/" + created.id;
+    } catch (e) {
+      showError(error, e);
+      submit.disabled = false;
+    }
+  });
+  main.append(el("h1", {}, "New VM"), error, form);
+
+  // Offer Lake's images as disk sources, and prefill the one asked for (Attach on
+  // the disks page).
+  api("GET", "disks", undefined, ctx.abort.signal)
+    .then((list) => {
+      lake = list.lake;
+      for (const d of list.disks) lakeImages.append(el("option", { value: "lake://" + lake + "/" + d.name }));
+      if (disk) addDisk("lake://" + lake + "/" + disk);
+    })
+    .catch(() => {
+      if (disk && ctx.alive) addDisk("");
+    });
+}
+
+function vmPage(main, ctx, id) {
+  const error = errorLine();
+  const title = el("h1", {}, "VM " + id);
+  const facts = el("div", { class: "panel" });
+  const actions = el("p");
+  const screen = el("pre", { class: "console", tabindex: 0 });
+  const status = el("p", { class: "muted" });
+  main.append(title, error, actions, facts, el("h2", {}, "Console"), screen, consoleInput(ctx, id, error), status);
+
+  const refresh = async () => {
+    try {
+      const vm = await api("GET", "vms/" + id, undefined, ctx.abort.signal);
+      if (!ctx.alive) return;
+      title.textContent = "VM " + vm.id + " (" + vm.name + ")";
+      actions.replaceChildren(...actionButtons(vm, error, (action) => {
+        if (action === "destroy") location.hash = "#/vms";
+        else refresh();
+      }));
+      facts.replaceChildren(vmFacts(vm));
+    } catch (e) {
+      if (!ctx.alive) return;
+      showError(error, e);
+      if (e.status === 404) {
+        leave();
+        facts.replaceChildren(el("a", { href: "#/vms" }, "Back to the VMs"));
+      }
+    }
+  };
+  every(ctx, 2000, refresh);
+  consoleLoop(ctx, id, screen, status);
+}
+
+function vmFacts(vm) {
+  const rows = [
+    ["State", stateCell(vm)],
+    ["RAM", vm.ram_text],
+    ["Clock", vm.clock_hz === null ? "full speed (reports " + vm.nominal_text + " to the guest)" : vm.clock_text + " (real time)"],
+    ["Steps", String(vm.steps)],
+    ["Disks", el("div", {}, diskList(vm))],
+    ["Devices", el("div", {}, vm.devices.map((d) => el("div", {}, d.name + "  " + d.base + " + " + d.size + (d.irq ? "  irq " + d.irq : ""))))],
+  ];
+  return el("dl", { class: "facts" }, rows.map(([k, v]) => [el("dt", {}, k), el("dd", {}, v)]));
+}
+
+// What Enter adds to a line: the guest decides which it wants (Grail's terminal sends
+// CR for the key, a pipe LF).
+const ENDINGS = { lf: "\n", cr: "\r", none: "" };
+
+function consoleInput(ctx, id, error) {
+  const text = el("input", { type: "text", placeholder: "type here, Enter sends", autocomplete: "off", spellcheck: "false" });
+  const ending = el(
+    "select",
+    { title: "what Enter adds" },
+    el("option", { value: "lf" }, "LF"),
+    el("option", { value: "cr" }, "CR"),
+    el("option", { value: "none" }, "nothing"),
+  );
+  const send = async (data) => {
+    try {
+      await api("POST", "vms/" + id + "/console", { data });
+      showError(error, null);
+    } catch (e) {
+      if (ctx.alive) showError(error, e);
+    }
+  };
+  const form = el(
+    "form",
+    { class: "console-input" },
+    text,
+    ending,
+    el("button", { type: "submit" }, "Send"),
+    el("button", { type: "button", title: "end of transmission", onclick: () => send("\x04") }, "Ctrl-D"),
+  );
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = text.value + ENDINGS[ending.value];
+    text.value = "";
+    if (data !== "") send(data);
+  });
+  return form;
+}
+
+// The most console text kept on the page.
+const SCREEN_MAX = 256 * 1024;
+
+// Long-polls the console: each request waits on Pendragon until there is output.
+async function consoleLoop(ctx, id, screen, status) {
+  let tap = null;
+  let next = 0;
+  let text = "";
+  let decoder = new TextDecoder();
+  while (ctx.alive) {
+    let r;
+    try {
+      const query = "from=" + next + (tap === null ? "" : "&tap=" + tap) + "&wait=15000";
+      r = await api("GET", "vms/" + id + "/console?" + query, undefined, ctx.abort.signal);
+    } catch (e) {
+      if (!ctx.alive) return;
+      status.textContent = "console: " + e.message;
+      await sleep(e.status === 404 ? 10000 : 2000);
+      continue;
+    }
+    if (!ctx.alive) return;
+    if (r.reset) {
+      text = "";
+      decoder = new TextDecoder();
+    } else if (tap !== null && r.from > next) {
+      text += "\n[... earlier output skipped ...]\n";
+    }
+    tap = r.tap;
+    next = r.next;
+    const atBottom = screen.scrollTop + screen.clientHeight >= screen.scrollHeight - 4;
+    text = terminal(text, decoder.decode(fromBase64(r.data), { stream: true }));
+    if (text.length > SCREEN_MAX) text = text.slice(text.length - SCREEN_MAX);
+    screen.textContent = text;
+    if (atBottom) screen.scrollTop = screen.scrollHeight;
+    status.textContent = r.ended ? "console ended: " + r.ended : "";
+    if (r.ended) return;
+  }
+}
+
+// Characters that show: newline, tab, and anything from space up but DEL.
+const PRINTABLE = (c) => c === "\n" || c === "\t" || (c >= " " && c !== "\x7f");
+
+// A little of what a terminal does with output: backspace erases, escape sequences
+// (colours, cursor moves) and other control characters are dropped.
+function terminal(text, output) {
+  output = output.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, "").replace(/\x1b[@-_]?/g, "");
+  let out = text;
+  for (const c of output) {
+    if (c === "\b") {
+      if (out.length > 0 && !out.endsWith("\n")) out = out.slice(0, -1);
+    } else if (PRINTABLE(c)) {
+      out += c;
+    }
+  }
+  return out;
+}
+
+// ---- Disks ----
+
+function disksPage(main, ctx) {
+  const error = errorLine();
+  const table = el("div");
+  const name = el("input", { type: "text", required: true, placeholder: "data", autocomplete: "off" });
+  const size = el("input", { type: "text", required: true, placeholder: "64MiB" });
+  const create = el(
+    "form",
+    { class: "panel" },
+    el("label", {}, el("span", {}, "Name"), name),
+    el("label", {}, el("span", {}, "Size"), size, el("span", { class: "muted" }, " 64MiB, 512K, 1G, 2048s (sectors)")),
+    el("button", { type: "submit", class: "primary" }, "Create disk"),
+  );
+  main.append(el("h1", {}, "Disks"), create, error, table);
+
+  const refresh = async () => {
+    try {
+      const list = await api("GET", "disks", undefined, ctx.abort.signal);
+      if (!ctx.alive) return;
+      showError(error, list.vms_error ? new Error("Which VMs use each disk is unknown: " + list.vms_error) : null);
+      if (list.disks.length === 0) {
+        table.replaceChildren(el("p", { class: "muted" }, "No disks on Lake at " + list.lake + "."));
+        return;
+      }
+      table.replaceChildren(
+        el(
+          "table",
+          {},
+          el("tr", {}, ["Name", "Size", "Sectors", "Attached", ""].map((h) => el("th", {}, h))),
+          list.disks.map((d) => diskRow(d, error, refresh)),
+        ),
+      );
+    } catch (e) {
+      if (ctx.alive) showError(error, e);
+    }
+  };
+  create.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await api("POST", "disks", { name: name.value.trim(), size: size.value.trim() });
+      name.value = "";
+      size.value = "";
+      showError(error, null);
+    } catch (e) {
+      showError(error, e);
+    }
+    refresh();
+  });
+  every(ctx, 3000, refresh);
+}
+
+function attachedText(d) {
+  const parts = [];
+  if (d.writer) parts.push("read-write");
+  if (d.readers === 1) parts.push("1 reader");
+  if (d.readers > 1) parts.push(d.readers + " readers");
+  const cell = el("td", {}, parts.length ? parts.join(", ") : el("span", { class: "muted" }, "no"));
+  if (d.attached_to) {
+    for (const vm of d.attached_to) {
+      cell.append(el("div", {}, "VM ", vmLink(vm.id, vm.id + " (" + vm.name + ")"), vm.read_only ? ", read-only" : ", read-write"));
+    }
+    if (d.attached && d.attached_to.length === 0) {
+      cell.append(el("div", { class: "muted" }, "by a client of Lake that Pendragon does not manage"));
+    }
+  }
+  return cell;
+}
+
+function diskRow(d, error, refresh) {
+  const holders = d.attached_to || [];
+  const detach = async (button) => {
+    const names = holders.map((vm) => vm.id + " (" + vm.name + ")").join(", ");
+    const question =
+      "Detach disk " + d.name + "? A VM's disks are part of its hardware: detaching stops VM " + names +
+      ", which cannot be started again.";
+    if (!confirm(question)) return;
+    button.disabled = true;
+    try {
+      const r = await api("POST", "disks/" + encodeURIComponent(d.name) + "/detach");
+      showError(error, r.released ? null : new Error("The VMs stopped, but Lake does not show the disk released yet."));
+    } catch (e) {
+      showError(error, e);
+    }
+    refresh();
+  };
+  const remove = async (button) => {
+    if (!confirm("Delete disk " + d.name + " and everything on it?")) return;
+    button.disabled = true;
+    try {
+      await api("DELETE", "disks/" + encodeURIComponent(d.name));
+      showError(error, null);
+    } catch (e) {
+      showError(error, e);
+    }
+    refresh();
+  };
+  return el(
+    "tr",
+    {},
+    el("td", {}, d.name),
+    el("td", { class: "num" }, d.size_text),
+    el("td", { class: "num" }, d.sectors),
+    attachedText(d),
+    el(
+      "td",
+      {},
+      el("button", { title: "create a VM with this disk", onclick: () => (location.hash = "#/vms/new?disk=" + encodeURIComponent(d.name)) }, "attach"),
+      el("button", { disabled: holders.length === 0, title: "stop the VMs that hold it", onclick: (e) => detach(e.target) }, "detach"),
+      el("button", { class: "danger", disabled: d.attached, title: d.attached ? "detach it first" : "", onclick: (e) => remove(e.target) }, "delete"),
+    ),
+  );
+}
+
+// ---- Start ----
+
+window.addEventListener("hashchange", route);
+route();
