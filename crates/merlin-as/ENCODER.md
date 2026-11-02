@@ -124,9 +124,10 @@ and a label where only a number fits (`li a0, sym`) are errors.
 
 ### `.insn`
 
-For encodings without a mnemonic. hello.S writes the Xcal instructions as
-`.insn i 0x0b, 0, x0, a0, 0` so that clang can build it too. The parser turns
-`.insn i ...` into the mnemonic `.insn i`. Same forms and encodings as LLVM:
+For encodings without a mnemonic. `xcal.dbg a0` is `.insn i 0x0b, 0, x0, a0, 0`
+(that is how `examples/xcal.inc` teaches clang the Xcal mnemonics the examples
+use). The parser turns `.insn i ...` into the mnemonic `.insn i`. Same forms
+and encodings as LLVM:
 
 ```
 .insn r opcode, funct3, funct7, rd, rs1, rs2
@@ -172,8 +173,9 @@ carries the same `.riscv.attributes` as clang's
 (`rv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0`), so llvm-objdump decodes the M
 instructions without extra flags.
 
-For `examples/hello/hello.S` and `examples/muldiv/muldiv.S`, `llvm-objdump -dr`
-prints exactly the same text for our object as for clang's. The differences
+For every source in `examples/` (clang assembling it with
+`-include examples/xcal.inc`), `llvm-objdump -dr` prints exactly the same text
+for our object as for clang's. The differences
 that remain on other input (spec section 10):
 
 - clang rewrites a branch it can't resolve or reach (to a global, an
@@ -211,11 +213,15 @@ cargo test -p merlin-as
 - Unit tests in `encode.rs` (packers against the decoder, `hi_lo`, `li`),
   `asm.rs` (local resolution, against words from clang) and `elf.rs`.
 
-Elsewhere: `crates/merlin-ld/tests/merlin_as_programs.rs` builds
+Elsewhere: `crates/xtask/tests/examples.rs` builds every example with
+merlin-as and merlin-ld, runs it in Grail and compares `hello` and
+`multiobj` with ld.lld's link of clang's objects;
+`crates/merlin-ld/tests/merlin_as_programs.rs` builds
 `examples/muldiv/muldiv.S` with merlin-as and merlin-ld and runs it in Grail;
 `crates/xtask/tests/hello.rs` runs the committed merlin-as + ld.lld build of
 hello (`tests/golden/hello.elf`) in Grail and, when LLVM is installed,
-rebuilds it and compares `llvm-objdump -dr` with clang's;
+rebuilds it and compares `llvm-objdump -dr` of every example object with
+clang's;
 `crates/xtask/tests/kernel.rs` boots the kernel with `kernel/entry.s`
 assembled by merlin-as.
 

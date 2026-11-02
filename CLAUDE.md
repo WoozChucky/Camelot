@@ -25,10 +25,10 @@ crates/merlin           the C-subset compiler (front end + test harness; codegen
 crates/merlin-as        the assembler
 crates/merlin-ld        the linker (src/reloc.rs explains every relocation it applies)
 crates/merlin-objdump   the disassembler; output matches llvm-objdump 21
-crates/xtask            build tasks (`cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld; `cargo xtask hello` rebuilds merlin-as's linked hello golden; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
+crates/xtask            build tasks (`cargo xtask examples` builds every example with merlin-as + merlin-ld, no LLVM; `cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld; `cargo xtask hello` rebuilds merlin-as's ld.lld-linked hello reference; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
 kernel/                 the Camelot kernel (C + assembly); kernel.elf is committed, rebuild it after changes
 docs/                   ISA spec
-examples/               bare-metal programs
+examples/               bare-metal programs; their .elf files are committed, rebuild them with `cargo xtask examples` after changes (`cargo test` checks)
 tests/riscv-tests       prebuilt riscv-tests ELFs, and obj/ with their objects (merlin-ld relinks them)
 ```
 
