@@ -1,0 +1,108 @@
+# The user C library
+
+The C library of Camelot's user programs: what `kernel/user/user.h`
+declares besides the system calls. It is small, written in the C that
+merlin compiles (so the same sources can one day be compiled on Camelot
+itself), and has no `FILE`, no locale and no floating point. Every
+function's contract is in `user.h`; this file says how the library is put
+together.
+
+| File | What it has |
+|---|---|
+| `string.c` | `strlen`, `strcmp`, `strncmp`, `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`, `memmove`, `memcmp` |
+| `stdlib.c` | `atoi`, `strtol` (bases 2 to 36, or 0 for C's prefixes; out of range gives `LONG_MAX` or `LONG_MIN`) |
+| `malloc.c` | `malloc`, `free`, `calloc`, `realloc` on top of `sbrk` |
+| `printf.c` | `printf`, `fprintf` (to a descriptor), `snprintf`, `puts` |
+| `getline.c` | `getline` (a console line from stdin), `reader_init` and `reader_getline` (lines from any descriptor) |
+| `strerror.c` | `strerror`: a short message for each error number |
+| `stat.c` | `stat`: `fstat` of a path |
+| `spin.c` | `spin`: a busy loop, for tests that need CPU time |
+
+## How programs get it
+
+Every `kernel/user/X.c` (or `X.s`) is a program, linked with the runtime
+(`crt0.s`, which calls `main` and then `exit`, and `usys.s`, the system call
+stubs) and with the library (`crates/xtask/src/userprogs.rs`). The library
+is linked the way a C library is linked from an archive (`libc.a`): each
+file here is a *member*, compiled and assembled once for all the programs,
+and a member goes into a program only if it defines a symbol that the
+program, or a member already in, refers to and nothing else defines. So
+`hello`, which calls `printf`, gets `printf.c` and, through it, `string.c`
+(for `strlen`), but not `malloc.c`; `grep`, which calls `realloc`, gets
+`malloc.c` too. A program carries only the code and the static data it can
+use, and the members' `static` variables (malloc's free list) exist only in
+the programs that need them.
+
+merlin-ld does the choosing (`crates/merlin-ld/src/library.rs`): given the
+program's objects and the library's, it pulls in members until nothing
+undefined is left that a member defines, then links them after the
+program's objects, in file name order. On its command line the members go
+between `--start-lib` and `--end-lib`, as with ld.lld:
+
+```
+merlin-ld -T user.ld -o cat cat.c.o crt0.s.o usys.s.o \
+          --start-lib lib/getline.c.o lib/malloc.c.o lib/printf.c.o lib/spin.c.o \
+          lib/stat.c.o lib/stdlib.c.o lib/strerror.c.o lib/string.c.o --end-lib
+```
+
+The members include `../user.h`; merlin compiles them like the programs.
+After changing anything here, run `cargo xtask kernel` (the programs are
+embedded in the kernel) and commit `kernel/userprogs.s` and
+`kernel/kernel.elf`; `cargo test` checks both. Adding a function: declare it
+in `user.h`, define it in the member it belongs with (or a new `.c` file
+here, which is picked up by name), and check it in `libtest.c`.
+
+## Conventions
+
+- Errors come back as they come from the kernel: a negative error number
+  (`-ENOENT`), which `strerror` turns into words. There is no `errno`.
+  `getline` and `malloc` return -1 and `NULL`, as in C.
+- Programs report an error as `NAME: WHAT: REASON` on stderr and exit with a
+  non-zero status; the shell prints `NAME: exit STATUS` after them.
+- No output buffering survives a call: `printf` formats into a 64-byte
+  buffer on the caller's stack and writes it out before it returns (a line
+  is usually one `write`), so output from several processes, or from a
+  program and its children, never comes out of order.
+
+## Formatted output
+
+`printf.c` has one formatter, `vformat`, and a `struct out` that says
+where its characters go: to a descriptor, through the buffer, for `printf`
+and `fprintf`; into the caller's string for `snprintf`, which keeps
+counting past the end so that it can return the length the whole text
+needs. The conversions are `%d %u %x %p %s %c %%`, with the flags `-` (pad
+on the right) and `0` (pad with zeros, after a minus sign) and a width; an
+`l` before `d`, `u` or `x` is accepted and ignored, since `long` is `int`'s
+size. An unknown conversion is printed as written. It is the kernel's
+`kprintf` (`kernel/kprintf.c`) with the same formats.
+
+## Line input
+
+Two ways, for two kinds of input:
+
+- `getline(buf, size)` is for the console, which returns one line per
+  `read`: it makes exactly one `read` and so never takes anything that
+  follows the line. The shell reads its commands with it, and the programs
+  it starts read the same console after it, so read-ahead would steal their
+  input.
+- A `struct reader` (`reader_init(&r, fd)`, then `reader_getline(&r, line,
+  size)`) reads a file or a pipe `READER_SIZE` (512) bytes at a time and
+  hands out a line per call, with its newline. A line longer than the
+  buffer the caller gives comes back in pieces, each but the last without a
+  newline; `grep` grows its buffer with `realloc` until the whole line fits.
+  The reader lives in the caller's memory, so a program can read several
+  descriptors at once.
+
+## The heap
+
+`malloc.c` is the allocator of K&R's *The C Programming Language*, section
+8.7. Each block starts with an 8-byte header (its size in 8-byte units and,
+while free, the next free block), so every block is 8-byte aligned. The
+free blocks form a ring in address order, through a dummy block of size 0;
+`malloc` walks it from where the last search stopped and takes the first
+block big enough, cutting the request off its end. `free` puts a block back
+in its place in the ring and merges it with a free neighbour on either side,
+so freeing everything gives the heap back as one block. When no block is
+big enough, `malloc` grows the heap with `sbrk`, by at least a page, and
+frees the new memory into the ring. Nothing is ever given back to the
+kernel: the heap goes when the program exits.

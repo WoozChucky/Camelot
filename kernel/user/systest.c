@@ -23,7 +23,16 @@
  *                         exits 0 if its pid is PID and descriptor 3 is
  *                         still open
  *   systest execfail      execs paths that fail, then exits 0 if each failed
- *                         as it should and the program is still its own */
+ *                         as it should and the program is still its own
+ *   systest spin          spins until it is killed
+ *   systest waiter        spawns `systest sleep 1000` and waits for it
+ *   systest killreader    spawns `systest count` reading the console, kills
+ *                         it once it is asleep there, and exits 0 if it
+ *                         ended at once with status -1. Run it with nothing
+ *                         typed ahead, which the reader would take: the
+ *                         coreutils test does (crates/xtask/tests/
+ *                         coreutils.rs); systest itself can't, since its
+ *                         tests type the next commands ahead. */
 #include "user.h"
 
 /* Process slots (NPROC in kernel/include/proc.h). */
@@ -176,6 +185,8 @@ static int exec_fail(void) {
     return 0;
 }
 
+static int kill_reader(void);
+
 /* What a child run of systest does (see the top of the file). */
 static int child(int argc, char **argv) {
     if (strcmp(argv[1], "pipewrite") == 0 && argc == 3) {
@@ -208,6 +219,17 @@ static int child(int argc, char **argv) {
     if (strcmp(argv[1], "sleep") == 0 && argc == 3) {
         sleep((uint)atoi(argv[2]));
         return 0;
+    }
+    if (strcmp(argv[1], "spin") == 0) {
+        for (;;) {
+        }
+    }
+    if (strcmp(argv[1], "waiter") == 0) {
+        int pid = spawn("/bin/systest", (char *[]){"systest", "sleep", "1000", NULL});
+        return pid > 0 && wait(pid, NULL) == pid ? 0 : 1;
+    }
+    if (strcmp(argv[1], "killreader") == 0) {
+        return kill_reader();
     }
     if (strcmp(argv[1], "args") == 0) {
         const char *want[] = {"systest", "args", "", "two words", "x"};
@@ -253,7 +275,7 @@ static void test_simple_calls(void) {
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(22, 0, 0, 0), -ENOSYS, "call 22");
+    check_eq(syscall(24, 0, 0, 0), -ENOSYS, "call 24");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
 }
 
@@ -579,6 +601,198 @@ static void test_exec(void) {
              "a failed exec returns its error");
 }
 
+/* The entry procs() gives for `pid` in `info` (`n` entries), or NULL. */
+static struct procinfo *find_proc(struct procinfo *info, int n, int pid) {
+    for (int i = 0; i < n && i < NPROC; i++) {
+        if ((int)info[i].pid == pid) {
+            return &info[i];
+        }
+    }
+    return NULL;
+}
+
+/* The state procs() gives for `pid`, or -1 if it isn't there. */
+static int state_of(int pid) {
+    struct procinfo info[NPROC];
+    int n = procs(info, NPROC);
+    struct procinfo *p = find_proc(info, n, pid);
+    return p != NULL ? (int)p->state : -1;
+}
+
+/* The pid of a child of `pid`, or 0 if it has none. */
+static int child_of(int pid) {
+    struct procinfo info[NPROC];
+    int n = procs(info, NPROC);
+    for (int i = 0; i < n && i < NPROC; i++) {
+        if ((int)info[i].ppid == pid) {
+            return (int)info[i].pid;
+        }
+    }
+    return 0;
+}
+
+/* Gives up turns until `pid` is a zombie, at most 100; whether it got
+ * there. A killed process that is woken ends on its first turn, so one
+ * that is still around after that many went back to sleep instead. */
+static int ends_soon(int pid) {
+    for (int i = 0; i < 100; i++) {
+        if (state_of(pid) == PROC_ZOMBIE) {
+            return 1;
+        }
+        yield();
+    }
+    return state_of(pid) == PROC_ZOMBIE;
+}
+
+/* Gives up turns until `pid` has been asleep for three looks in a row: in
+ * the long wait it is there for, not in a short one on the way to it. */
+static void until_asleep(int pid) {
+    for (int asleep = 0; asleep < 3; yield()) {
+        asleep = state_of(pid) == PROC_SLEEPING ? asleep + 1 : 0;
+    }
+}
+
+static int kill_reader(void) {
+    int pid = spawn("/bin/systest", (char *[]){"systest", "count", NULL});
+    if (pid < 0) {
+        return 1;
+    }
+    until_asleep(pid);
+    if (kill(pid) != 0) {
+        return 2;
+    }
+    /* If it didn't end, it is left reading the console: waiting for it
+     * would wait for a line nobody types. */
+    if (!ends_soon(pid)) {
+        printf("systest: FAILED: a killed reader of the console went back to sleep\n");
+        return 3;
+    }
+    int status = 0;
+    return wait(pid, &status) == pid && status == -1 ? 0 : 4;
+}
+
+static void test_procs_and_kill(void) {
+    struct procinfo info[NPROC];
+    int me = getpid();
+    int child = spawn("/bin/systest", (char *[]){"systest", "sleep", "1000", NULL});
+    check(child > me, "a sleeper to look at");
+    /* Its turn comes and it goes to sleep. */
+    while (state_of(child) != PROC_SLEEPING) {
+        yield();
+    }
+    int n = procs(info, NPROC);
+    check(n >= 3, "procs: the shell, this and the sleeper");
+    check(strcmp(info[0].name, "sh") == 0 && info[0].ppid == 0, "the shell comes first");
+    for (int i = 1; i < n && i < NPROC; i++) {
+        check(info[i].pid > info[i - 1].pid, "in pid order");
+    }
+    struct procinfo *p = find_proc(info, n, me);
+    check(p != NULL && p->state == PROC_RUNNING && strcmp(p->name, "systest") == 0, "this one is running");
+    check(p != NULL && (int)p->size == sbrk(0), "its size is the end of its heap");
+    p = find_proc(info, n, child);
+    check(p != NULL && (int)p->ppid == me && p->state == PROC_SLEEPING, "the sleeper is this one's child");
+    check_eq(procs(NULL, 0), n, "procs counts with no room");
+    info[1].pid = 0;
+    check_eq(procs(info, 1), n, "procs with room for one");
+    check_eq((int)info[1].pid, 0, "fills in only the room it has");
+    check_eq(procs((struct procinfo *)0x10, 1), -EFAULT, "procs to unmapped memory");
+    check_eq(procs(info, 0x40000000u), -EFAULT, "procs to a buffer past user space");
+
+    check_eq(kill(0), -ESRCH, "kill pid 0");
+    check_eq(kill(-1), -ESRCH, "kill pid -1");
+    check_eq(kill(100000), -ESRCH, "kill a pid nobody has");
+    /* Killed in its sleep: it ends with -1 at once. */
+    check_eq(kill(child), 0, "kill the sleeper");
+    int status = 0;
+    check_eq(wait(child, &status), child, "the killed sleeper ends");
+    check_eq(status, -1, "killed: status -1");
+    check_eq(kill(child), -ESRCH, "kill a process that is gone");
+
+    /* A zombie has already ended: killing it changes nothing. */
+    child = spawn("/bin/systest", (char *[]){"systest", "exit", "3", NULL});
+    while (state_of(child) != PROC_ZOMBIE) {
+        yield();
+    }
+    check_eq(kill(child), 0, "kill a zombie");
+    check_eq(status_of(child), 3, "a killed zombie keeps its status");
+
+    /* A reader asleep on a pipe that still has a writer (this one). */
+    int pfd[2];
+    check_eq(pipe(pfd), 0, "a pipe for a reader to kill");
+    child = spawn_with(pfd[0], -1, (char *[]){"systest", "count", NULL});
+    while (state_of(child) != PROC_SLEEPING) {
+        yield();
+    }
+    check_eq(kill(child), 0, "kill the reader");
+    check_eq(status_of(child), -1, "the reader ends");
+    close(pfd[0]);
+    close(pfd[1]);
+
+    /* A runnable one, spinning in U-mode. */
+    child = spawn("/bin/systest", (char *[]){"systest", "spin", NULL});
+    yield();
+    check_eq(kill(child), 0, "kill a spinner");
+    check_eq(status_of(child), -1, "the spinner ends");
+
+    /* Killed before its first turn: spawn leaves the child runnable, and
+     * the kill comes before this one gives up the CPU, so the child runs
+     * none of its code. It would have written to the pipe. A timer tick
+     * in between would give the child its turn first, so this starts
+     * right after one (sleep returns on a tick), a whole interval ahead
+     * of the next. */
+    check_eq(pipe(pfd), 0, "a pipe for a child killed before it runs");
+    sleep(1);
+    int console_out = dup(STDOUT);
+    close(STDOUT);
+    dup(pfd[1]);
+    child = spawn("/bin/echo", (char *[]){"echo", "ran", NULL});
+    int killed = kill(child);
+    close(STDOUT);
+    dup(console_out);
+    close(console_out);
+    close(pfd[1]);
+    check(child > 0, "spawn a writer");
+    check_eq(killed, 0, "kill it at once");
+    check_eq(status_of(child), -1, "the writer killed before it ran ends");
+    char c;
+    check_eq(read(pfd[0], &c, 1), 0, "having written nothing");
+    close(pfd[0]);
+
+    /* A writer asleep on a full pipe that nobody reads. */
+    check_eq(pipe(pfd), 0, "a pipe for a writer to kill");
+    child = spawn_with(-1, pfd[1], (char *[]){"systest", "pipewrite", "3000", NULL});
+    struct stat st;
+    until_asleep(child);
+    check(fstat(pfd[0], &st) == 0 && st.size == PIPESIZE, "the writer filled the pipe");
+    check_eq(kill(child), 0, "kill the writer");
+    check(ends_soon(child), "the writer on a full pipe ends at once");
+    /* Closing the pipe wakes it in any case. */
+    close(pfd[0]);
+    close(pfd[1]);
+    check_eq(status_of(child), -1, "the writer's status");
+
+    /* A process asleep in wait, for a child of its own that sleeps. */
+    child = spawn("/bin/systest", (char *[]){"systest", "waiter", NULL});
+    int grandchild = 0;
+    while (grandchild == 0) {
+        yield();
+        grandchild = child_of(child);
+    }
+    until_asleep(grandchild);
+    until_asleep(child);
+    check_eq(kill(child), 0, "kill the waiter");
+    check(ends_soon(child), "the waiter ends at once");
+    /* Its child, an orphan now, ends too (and would end the wait in any
+     * case). */
+    check_eq(kill(grandchild), 0, "kill the waiter's child");
+    check_eq(status_of(child), -1, "the waiter's status");
+    /* The scheduler frees an orphan once it ends. */
+    for (int i = 0; i < 100 && state_of(grandchild) != -1; i++) {
+        yield();
+    }
+    check_eq(state_of(grandchild), -1, "the orphan ends");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) {
         return child(argc, argv);
@@ -590,6 +804,7 @@ int main(int argc, char **argv) {
     test_descriptors();
     test_pipes();
     test_exec();
+    test_procs_and_kill();
     printf("systest: %d checks, %d failed\n", checks, failures);
     return failures;
 }

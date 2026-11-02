@@ -1761,9 +1761,13 @@ impl<'a> FnChecker<'a> {
                 let ok = match (&lt, &rt) {
                     (Type::Int(_), Type::Int(_)) => true,
                     // Qualifiers of what the pointers point to don't matter.
+                    // Any pointer, to a function too, may be compared for
+                    // equality with a null pointer constant, `(void *)0`
+                    // (`NULL`) included (C99 6.5.9p2).
                     (Type::Ptr(a), Type::Ptr(b)) => {
                         a.unqual() == b.unqual()
                             || (equality && ((a.is_void() && !b.is_func()) || (b.is_void() && !a.is_func())))
+                            || (equality && (consteval::is_null_pointer(l) || consteval::is_null_pointer(r)))
                     }
                     // A pointer may be compared for equality with the null pointer constant.
                     (Type::Ptr(_), Type::Int(_)) => equality && consteval::is_null_pointer(r),
@@ -2599,6 +2603,17 @@ mod tests {
         ok("void *malloc(unsigned long n); int f(int *p, void *v, char c) { \
             p = v; v = p; p = 0; p = (int *)0; v = (void *)0; c = 1000; p = malloc(4); p += 1; p -= 2; \
             return p == 0 || 0 != p || p == v || v != p; }");
+        // A function pointer against NULL, `(void *)0`: allowed for == and
+        // != only; against any other `void *` it is not.
+        ok("void g(void); int f(void (*fp)(void)) {             return fp != (void *)0 || (void *)0 == fp || fp == 0 || g != (void *)0; }");
+        e(
+            "void (*fp)(void) = 0; void *v = 0; return fp @== v;",
+            "invalid comparison between 'void (*)(void)' and 'void *'",
+        );
+        e(
+            "void (*fp)(void) = 0; return fp @< (void *)0;",
+            "invalid comparison between 'void (*)(void)' and 'void *'",
+        );
     }
 
     #[test]

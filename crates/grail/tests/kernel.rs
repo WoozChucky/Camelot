@@ -195,8 +195,10 @@ fn shell_accepts_windows_line_ends() {
 fn kernel_boots_with_paging_on_any_ram_size() {
     // The page allocator takes the RAM size from sysinfo, so --ram changes
     // what the kernel manages; the self-tests and the ticks run with paging
-    // on either way, and so does the shell.
-    for mib in ["1", "16", "300"] {
+    // on either way, and so does the shell. 2 MiB is the smallest machine
+    // the kernel fits in: its image, with the user programs it embeds,
+    // takes most of a 1 MiB one.
+    for mib in ["2", "16", "300"] {
         let (code, out) = grail_with(&["--ram", mib], &kernel_elf(), b"exit\n");
         assert_eq!(code, Some(0), "--ram {mib}, output:\n{out}");
         let want = format!(

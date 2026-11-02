@@ -1,9 +1,17 @@
-/* wc [FILE...]: counts the lines, words and bytes of each file, or of its
- * input if there is none, and prints them: `LINES WORDS BYTES`, then the
- * file's name if it has one. Exits 1 if a file can't be read, else 0. */
+/* wc [-l] [-w] [-c] [FILE...]: counts the lines, words and bytes of each
+ * file, or of its input if there is none, and prints them: `LINES WORDS
+ * BYTES`, then the file's name if it has one. -l, -w and -c print only
+ * those counts (in that order), so `wc -l` is the number of lines. Exits 1
+ * if a file can't be read (a directory is refused, as cat and grep do) or
+ * an option is unknown, else 0. */
 #include "user.h"
 
 static char buf[512];
+
+/* Which counts to print. */
+static int show_lines;
+static int show_words;
+static int show_bytes;
 
 static int count(int fd, const char *name) {
     uint lines = 0;
@@ -31,24 +39,64 @@ static int count(int fd, const char *name) {
         }
         bytes += (uint)n;
     }
+    /* The counts asked for, a space between them: put together first, so
+     * the line is printed with one write. */
+    char counts[36];
+    int len = 0;
+    if (show_lines) {
+        len += snprintf(counts + len, sizeof counts - (size_t)len, " %u", lines);
+    }
+    if (show_words) {
+        len += snprintf(counts + len, sizeof counts - (size_t)len, " %u", words);
+    }
+    if (show_bytes) {
+        snprintf(counts + len, sizeof counts - (size_t)len, " %u", bytes);
+    }
     if (name != NULL) {
-        printf("%u %u %u %s\n", lines, words, bytes, name);
+        printf("%s %s\n", counts + 1, name);
     } else {
-        printf("%u %u %u\n", lines, words, bytes);
+        printf("%s\n", counts + 1);
     }
     return 0;
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] != 0; i++) {
+        for (const char *f = argv[i] + 1; *f; f++) {
+            if (*f == 'l') {
+                show_lines = 1;
+            } else if (*f == 'w') {
+                show_words = 1;
+            } else if (*f == 'c') {
+                show_bytes = 1;
+            } else {
+                fprintf(STDERR, "wc: unknown option -%c\nusage: wc [-l] [-w] [-c] [FILE...]\n", *f);
+                return 1;
+            }
+        }
+    }
+    if (!show_lines && !show_words && !show_bytes) {
+        show_lines = 1;
+        show_words = 1;
+        show_bytes = 1;
+    }
+    if (i == argc) {
         return count(STDIN, NULL);
     }
     int status = 0;
-    for (int i = 1; i < argc; i++) {
+    for (; i < argc; i++) {
         int fd = open(argv[i], O_RDONLY);
         if (fd < 0) {
             fprintf(STDERR, "wc: %s: %s\n", argv[i], strerror(-fd));
             status = 1;
+            continue;
+        }
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.type == T_DIR) {
+            fprintf(STDERR, "wc: %s: %s\n", argv[i], strerror(EISDIR));
+            status = 1;
+            close(fd);
             continue;
         }
         status |= count(fd, argv[i]);
