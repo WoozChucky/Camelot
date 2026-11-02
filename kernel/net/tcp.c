@@ -1,6 +1,7 @@
 /* TCP (RFC 9293; docs/camelot-net.md, "TCP"): connections, and the
- * kernel-internal socket API that #85's socket system calls put behind file
- * descriptors. A segment is a header of 20 bytes or more and its data:
+ * kernel-internal socket API that the socket system calls (socket.c) put
+ * behind file descriptors. A segment is a header of 20 bytes or more and
+ * its data:
  *
  *   0  source port        2  destination port
  *   4  sequence number    8  acknowledgment number

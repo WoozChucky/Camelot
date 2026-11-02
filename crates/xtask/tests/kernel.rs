@@ -1234,8 +1234,6 @@ help            this list
 exit [N]        leave the shell, with status N or the last program's
 wait            wait for every background program
 cd [DIR]        change the working directory, to / without DIR
-ifconfig        show the network interface; ifconfig ADDR [MASK [GATEWAY]] sets its address
-ping ADDR [N]   send N (4) echo requests to ADDR, a.b.c.d, and wait for the replies
 PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /
 CMD < FILE      read the input from FILE
 CMD > FILE      write the output to FILE
@@ -1842,7 +1840,7 @@ const PROC_NAME: u32 = 8;
 const ECALL_FROM_U: u32 = grail::trap::Exception::EcallU as u32;
 /// The exit system call's number (`SYS_exit`, kernel/include/syscall.h).
 const SYS_EXIT: u32 = 1;
-/// A boot plus a few programs: ping and pong run about two million
+/// A boot plus a few programs: ding and dong run about two million
 /// instructions each, regs three. merlin's kernel needs about 75 million for
 /// the longest run (systest), 6.6 times clang's.
 const RUN_MAX_STEPS: u64 = 150_000_000;
@@ -2078,8 +2076,8 @@ fn the_shell_is_the_first_process() {
 
 #[test]
 fn a_process_page_table_maps_its_program_and_the_kernel() {
-    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(kernel::typed(b"ping\nexit\n")));
-    step_to_user(&mut m, &elf, "ping");
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(kernel::typed(b"ding\nexit\n")));
+    step_to_user(&mut m, &elf, "ding");
     let c = &m.cpu;
     // Traps go to user_vec, which finds the process's trap frame in
     // sscratch: at the top of its kernel stack page, in free RAM.
@@ -2100,12 +2098,12 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
             "root[{i}]"
         );
     }
-    // User space: ping's segments, each page with U and the segment's
+    // User space: ding's segments, each page with U and the segment's
     // permissions, and the stack (R+W); nothing at page 0, in the guard page
     // under the stack or, with an empty heap, anywhere else. Everything above
     // is the kernel's, none of it with U.
-    let ping = user_program("ping");
-    let want = expected_user_pages(&ping.elf);
+    let ding = user_program("ding");
+    let want = expected_user_pages(&ding.elf);
     assert_eq!(want[0], (USER_TEXT, PTE_V | PTE_U | PTE_R | PTE_X));
     assert!(want
         .iter()
@@ -2135,14 +2133,14 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
 }
 
 #[test]
-fn ping_and_pong_take_turns_on_timer_ticks() {
+fn ding_and_dong_take_turns_on_timer_ticks() {
     // Issue #20's first criterion, watched from the hart: two processes in
     // U-mode, each in its own page table, and the CPU only moves between
     // them when a timer tick (or an exit) traps from U-mode. The shell runs
-    // too: it starts ping in the background and waits for pong.
+    // too: it starts ding in the background and waits for dong.
     let (mut m, elf) = load_committed_on(
         MachineConfig::default(),
-        Some(kernel::typed(b"ping & pong\nwait\nexit\n")),
+        Some(kernel::typed(b"ding & dong\nwait\nexit\n")),
     );
     let (user_vec, current) = (sym(&elf, "user_vec"), sym(&elf, "current"));
     // The process of each stretch in U-mode, and the last trap from it:
@@ -2161,7 +2159,7 @@ fn ping_and_pong_take_turns_on_timer_ticks() {
             if stretches.last().map(|s| &s.0) != Some(&name) {
                 if let Some((prev, _)) = stretches.last() {
                     if prev != "sh" {
-                        // ping and pong never wait for anything: they leave
+                        // ding and dong never wait for anything: they leave
                         // the CPU when a tick preempts them, or for good.
                         match last_trap {
                             Some((cause, false)) => {
@@ -2190,7 +2188,7 @@ fn ping_and_pong_take_turns_on_timer_ticks() {
     satps.sort();
     satps.dedup();
     let names: Vec<&str> = satps.iter().map(|s| s.0.as_str()).collect();
-    assert_eq!(names, ["ping", "pong", "sh"], "{stretches:?}");
+    assert_eq!(names, ["ding", "dong", "sh"], "{stretches:?}");
     let mut distinct: Vec<u32> = satps.iter().map(|s| s.1).collect();
     distinct.dedup();
     assert_eq!(distinct.len(), 3, "each its own page table: {satps:x?}");
@@ -2198,17 +2196,17 @@ fn ping_and_pong_take_turns_on_timer_ticks() {
     assert!(timer_switches >= 3, "{timer_switches} switches: {stretches:?}");
     // Each prints 4 lines with half a tick (500 000 instructions) between.
     assert!(user_steps > 3_000_000, "{user_steps}");
-    // The shell: ping in the background (its `[2]` before or after ping's
+    // The shell: ding in the background (its `[2]` before or after ding's
     // first line, depending on where a tick lands in the shell's fork),
-    // pong in the foreground.
+    // dong in the foreground.
     let out = printed(&m);
-    let started = command_output(&out, "ping & pong");
+    let started = command_output(&out, "ding & dong");
     assert!(
-        started.starts_with(&["[2]", "ping 1"]) || started.starts_with(&["ping 1", "[2]"]),
+        started.starts_with(&["[2]", "ding 1"]) || started.starts_with(&["ding 1", "[2]"]),
         "{out}"
     );
     assert!(
-        out.contains(&format!("{PROMPT}wait\n[2] ping: exit 0\n{PROMPT}exit\n")),
+        out.contains(&format!("{PROMPT}wait\n[2] ding: exit 0\n{PROMPT}exit\n")),
         "{out}"
     );
 }
@@ -2273,13 +2271,13 @@ fn user_state(cpu: &grail::cpu::Cpu) -> ([u32; 32], u32) {
 
 #[test]
 fn a_tick_in_user_mode_saves_every_register_and_switches_back_later() {
-    // regs fills every register and spins; ping runs beside it. Catch a tick
+    // regs fills every register and spins; ding runs beside it. Catch a tick
     // that interrupts regs, check user_vec saved the registers in its trap
-    // frame, then follow the switch to ping and back: regs must resume with
+    // frame, then follow the switch to ding and back: regs must resume with
     // every register and its pc as they were.
     let (mut m, elf) = load_committed_on(
         MachineConfig::default(),
-        Some(kernel::typed(b"regs & ping\nwait\nexit\n")),
+        Some(kernel::typed(b"regs & ding\nwait\nexit\n")),
     );
     let (user_vec, user_trap) = (sym(&elf, "user_vec"), sym(&elf, "user_trap"));
     // regs, in its spin loop: all its registers are set.
@@ -2349,13 +2347,13 @@ fn registers_survive_many_switches() {
     // regs checks its own registers after three ticks' worth of spinning
     // beside two programs that use the same registers: exit status 0, or the
     // number of the register that changed.
-    let out = run_processes(b"regs & ping & pong\nwait\nexit\n");
+    let out = run_processes(b"regs & ding & dong\nwait\nexit\n");
     let lines = command_output(&out, "wait");
     let mut collected = lines.clone();
     collected.sort();
-    assert_eq!(collected, ["[2] regs: exit 0", "[3] ping: exit 0"], "{out}");
-    // pong, in the foreground, exited 0: the shell said nothing about it.
-    assert!(!out.contains("pong: exit"), "{out}");
+    assert_eq!(collected, ["[2] regs: exit 0", "[3] ding: exit 0"], "{out}");
+    // dong, in the foreground, exited 0: the shell said nothing about it.
+    assert!(!out.contains("dong: exit"), "{out}");
 }
 
 #[test]
@@ -2366,11 +2364,11 @@ fn a_system_call_changes_a0_and_nothing_else() {
     // answer, switch away (yield, sleep), fail (a bad descriptor, an unknown
     // number) and write, and checks them all after each one; it exits with
     // 32 * case + register at the first that changed, which the shell would
-    // print. Run it beside ping, so other processes use the registers too.
-    let out = run_processes(b"ping & sysregs\nwait\nexit\n");
-    let lines: Vec<&str> = command_output(&out, "ping & sysregs")
+    // print. Run it beside ding, so other processes use the registers too.
+    let out = run_processes(b"ding & sysregs\nwait\nexit\n");
+    let lines: Vec<&str> = command_output(&out, "ding & sysregs")
         .into_iter()
-        .filter(|l| !l.starts_with("ping ") && !l.starts_with('['))
+        .filter(|l| !l.starts_with("ding ") && !l.starts_with('['))
         .collect();
     assert_eq!(
         lines,
@@ -2385,7 +2383,7 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
     // page (mapped, without U), badhalt executes xcal.halt (M-mode only).
     let (mut m, elf) = load_committed_on(
         MachineConfig::default(),
-        Some(kernel::typed(b"badload & ping & badhalt\nwait\nticks\nexit\n")),
+        Some(kernel::typed(b"badload & ding & badhalt\nwait\nticks\nexit\n")),
     );
     let user_vec = sym(&elf, "user_vec");
     let mut faults = Vec::new();
@@ -2409,7 +2407,7 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
     );
     let text = sym(&elf, "__text_start");
     let pte = (text >> 12) << 10 | PTE_V | PTE_R | PTE_X | PTE_A;
-    let lines = command_output(&out, "badload & ping & badhalt");
+    let lines = command_output(&out, "badload & ding & badhalt");
     // The shell's `[2]` and `[3]` for the background programs come in
     // order, but whether before or after badload's report depends on where
     // the ticks land in the shell's fork (with merlin's slow code, often
@@ -2427,18 +2425,18 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
     let kills: Vec<&str> = lines
         .iter()
         .copied()
-        .filter(|l| !l.starts_with("ping ") && !l.starts_with('['))
+        .filter(|l| !l.starts_with("ding ") && !l.starts_with('['))
         .collect();
     assert_eq!(kills, want, "{out}");
-    // ping wasn't disturbed, and the shell still works.
-    let pings: Vec<&str> = out.lines().filter(|l| l.starts_with("ping ")).collect();
-    assert_eq!(pings, ["ping 1", "ping 2", "ping 3", "ping 4"]);
+    // ding wasn't disturbed, and the shell still works.
+    let dings: Vec<&str> = out.lines().filter(|l| l.starts_with("ding ")).collect();
+    assert_eq!(dings, ["ding 1", "ding 2", "ding 3", "ding 4"]);
     let mut collected: Vec<&str> = command_output(&out, "wait")
         .into_iter()
-        .filter(|l| !l.starts_with("ping "))
+        .filter(|l| !l.starts_with("ding "))
         .collect();
     collected.sort();
-    assert_eq!(collected, ["[2] badload: exit -1", "[3] ping: exit 0"]);
+    assert_eq!(collected, ["[2] badload: exit -1", "[3] ding: exit 0"]);
     assert_eq!(command_output(&out, "ticks").len(), 1);
     // The kernel never panicked, and xcal.halt never reached M-mode.
     assert!(!out.contains("panic"), "{out}");
@@ -2486,8 +2484,8 @@ fn the_system_calls_do_what_the_document_says() {
 #[test]
 fn the_c_library_does_what_user_h_says() {
     // libtest checks the user C library (kernel/user/lib): strings, numbers,
-    // snprintf's formats, malloc and free, and readers on a pipe fed by a
-    // child of its own.
+    // snprintf's formats, malloc and free, readers on a pipe fed by a child
+    // of its own, and addresses (inet.c, and resolve.c on addresses).
     let out = run_processes(b"libtest\nexit\n");
     let lines = command_output(&out, "libtest");
     assert_eq!(lines.len(), 1, "{out}");
@@ -2622,13 +2620,13 @@ fn sleeping_processes_leave_the_cpu_idle() {
 fn input_typed_while_processes_run_reaches_the_shell() {
     // The UART interrupt arrives while a process is in U-mode: user_trap
     // services it and the process carries on; the shell reads the line once
-    // ping is over.
+    // ding is over.
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
-    for &b in b"ping\n" {
+    for &b in b"ding\n" {
         tx.send(b).unwrap();
     }
-    step_to_user(&mut m, &elf, "ping");
+    step_to_user(&mut m, &elf, "ding");
     for &b in b"ticks\nexit\n" {
         tx.send(b).unwrap();
     }
@@ -2642,7 +2640,7 @@ fn input_typed_while_processes_run_reaches_the_shell() {
     assert_eq!(r, RunResult::Exited(0));
     assert!(external >= 1);
     let out = printed(&m);
-    assert!(out.contains(&format!("ping 4\n{PROMPT}ticks\nticks: ")), "{out}");
+    assert!(out.contains(&format!("ding 4\n{PROMPT}ticks\nticks: ")), "{out}");
 }
 
 #[test]
@@ -2675,7 +2673,7 @@ fn processes_give_back_every_page() {
         assert_eq!(free_pages(&m, &elf), before, "{name}");
     }
     // Several side by side, then collected.
-    let some = ["hello", "badload", "ping", "data", "badstore", "echo"];
+    let some = ["hello", "badload", "ding", "data", "badstore", "echo"];
     command(&mut m, &format!("{} &\n", some.join(" & ")));
     command(&mut m, "wait\n");
     assert_eq!(free_pages(&m, &elf), before);
@@ -2701,11 +2699,11 @@ fn processes_give_back_every_page() {
     assert_eq!(free_pages(&m, &elf), before);
     // While a process runs, it holds its pages: a kernel stack, a root and a
     // user table, its segments and its stack.
-    for &b in b"ping\n" {
+    for &b in b"ding\n" {
         tx.send(b).unwrap();
     }
-    step_to_user(&mut m, &elf, "ping");
-    let pages = expected_user_pages(&user_program("ping").elf).len() as u32;
+    step_to_user(&mut m, &elf, "ding");
+    let pages = expected_user_pages(&user_program("ding").elf).len() as u32;
     assert_eq!(free_pages(&m, &elf), before - 3 - pages);
 }
 
@@ -3067,7 +3065,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 27, "{calls:?}");
+    assert_eq!(calls.len(), 39, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()
@@ -3093,7 +3091,7 @@ fn the_system_call_document_matches_the_code() {
     }
 
     let errors = doc_table(&doc, "## Error numbers");
-    assert_eq!(errors.len(), 37, "{errors:?}");
+    assert_eq!(errors.len(), 44, "{errors:?}");
     assert_eq!(defines(&header, "E"), errors, "syscall.h");
     assert_eq!(defines(&user_h, "E"), errors, "user.h");
 
@@ -3152,11 +3150,20 @@ fn the_system_call_document_matches_the_code() {
     };
     let filetest = read("kernel/user/filetest.c");
     let systest = read("kernel/user/systest.c");
+    let socktest = read("kernel/user/socktest.c");
     for (header, name, copies) in [
-        ("kernel/include/file.h", "NOFILE", vec![&filetest, &systest]),
+        (
+            "kernel/include/file.h",
+            "NOFILE",
+            vec![&filetest, &systest, &socktest],
+        ),
         ("kernel/include/file.h", "CONSOLE", vec![&filetest, &systest]),
         ("kernel/include/pipe.h", "PIPESIZE", vec![&systest]),
-        ("kernel/include/proc.h", "NPROC", vec![&systest]),
+        ("kernel/include/proc.h", "NPROC", vec![&systest, &socktest]),
+        ("kernel/include/net.h", "TCP_SOCKETS", vec![&socktest]),
+        ("kernel/include/net.h", "UDP_SOCKETS", vec![&socktest]),
+        ("kernel/include/net.h", "UDP_QUEUE_MAX", vec![&socktest]),
+        ("kernel/include/net.h", "TCP_EPHEMERAL_FIRST", vec![&socktest]),
         // The states procs reports.
         ("kernel/include/proc.h", "PROC_RUNNABLE", vec![&user_h]),
         ("kernel/include/proc.h", "PROC_RUNNING", vec![&user_h]),

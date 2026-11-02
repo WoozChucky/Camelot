@@ -275,7 +275,7 @@ static void test_simple_calls(void) {
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(28, 0, 0, 0), -ENOSYS, "call 28");
+    check_eq(syscall(40, 0, 0, 0), -ENOSYS, "call 40");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
 }
 

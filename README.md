@@ -7,7 +7,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 | **Excalibur** | The ISA: RV32IMA + Zicsr, M/S/U privilege, Sv32 paging, plus the Xcal extensions | Spec v0 in [`docs/excalibur-spec.md`](docs/excalibur-spec.md) |
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/ua/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps), keyboard and pointer (from the window, with PLIC interrupts), sysinfo and block devices (disk images or disks on a Lake server, `--disk`); configurable RAM, real-time clock, disks and number of harts (up to 8, with IPIs) |
 | **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | Builds every example and the whole Camelot kernel on its own, no LLVM (`cargo xtask examples`, `cargo xtask kernel`). merlin-as: complete; its objects match clang's ([encoder notes](crates/merlin-as/ENCODER.md)). merlin-ld: links clang objects to the same bytes as ld.lld except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: a C99 subset (integer types, pointers, arrays, structs, globals, strings, the preprocessor, varargs, designated initializers; programs of several files) compiles to assembly that our own assembler and linker build into programs Grail runs, the kernel and its user programs among them; unoptimized, so that kernel is about 40% bigger and 5 to 6 times slower than clang `-O2`'s ([code generation notes](crates/merlin/src/codegen.rs)). merlin-objdump: matches llvm-objdump |
-| **Camelot** | The kernel / OS | Boots on Grail in S-mode: `kprintf`, trap handling, timer ticks, page allocator and Sv32 paging, interrupt-driven UART console, user programs in C in U-mode with their own page tables, switched round robin on timer ticks, system calls ([docs/camelot-syscalls.md](docs/camelot-syscalls.md)) and a user-space shell, an interrupt-driven disk driver with a buffer cache, a journaled filesystem mounted at boot ([docs/camelot-fs.md](docs/camelot-fs.md), with a host-side mkfs and fsck in `crates/camelot-fs`), a network stack with a card driver, ARP, IPv4, ICMP, UDP, TCP and DHCP ([docs/camelot-net.md](docs/camelot-net.md)) ([kernel/](kernel/README.md)) |
+| **Camelot** | The kernel / OS | Boots on Grail in S-mode: `kprintf`, trap handling, timer ticks, page allocator and Sv32 paging, interrupt-driven UART console, user programs in C in U-mode with their own page tables, switched round robin on timer ticks, system calls ([docs/camelot-syscalls.md](docs/camelot-syscalls.md)) and a user-space shell, an interrupt-driven disk driver with a buffer cache, a journaled filesystem mounted at boot ([docs/camelot-fs.md](docs/camelot-fs.md), with a host-side mkfs and fsck in `crates/camelot-fs`), a network stack with a card driver, ARP, IPv4, ICMP, UDP, TCP and DHCP, sockets behind file descriptors and network programs (`ifconfig`, `ping`, `nc`, `fetch`, `httpd`) ([docs/camelot-net.md](docs/camelot-net.md)) ([kernel/](kernel/README.md)) |
 | **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Pendragon web console, the Herald VM client and the Lake storage server | Protocol v7 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget, attachable consoles and screens, and network cards on virtual Ethernet switches, which can have a NAT gateway to the host and the internet; the Round Table CLI creates and controls them, and manages Lake's disk images; Pendragon does the same from a browser, with live consoles; the Lake storage server serves disk images to them over the network; Herald attaches a terminal to a VM's console, or a window to its screen, keyboard and mouse. `cargo xtask up` runs it all with one command ([Quick start](#quick-start)) |
 
 ## Quick start
@@ -84,7 +84,7 @@ Hello from Camelot!
 [dbg] pc=80000018 a0 = 0x00000014 (20)
 ```
 
-The kernel runs the same way: `cargo run --release -p grail -- kernel/kernel.elf`. It boots into a user-space shell that runs programs by name (`hello`, `echo a b`, `ticks`; `ping & pong` runs two side by side; `exit` stops the machine); with `--disk IMG` it lists the disk and runs a read/write self-test on it at boot, leaving the image as it was; when stdin is a terminal, Grail switches it to raw mode so each key reaches the guest as it is typed and the guest does the echoing (Windows consoles and Linux terminals; restored on exit and on Ctrl-C).
+The kernel runs the same way: `cargo run --release -p grail -- kernel/kernel.elf`. It boots into a user-space shell that runs programs by name (`hello`, `echo a b`, `ticks`; `ding & dong` runs two side by side; `exit` stops the machine); with `--disk IMG` it lists the disk and runs a read/write self-test on it at boot, leaving the image as it was; when stdin is a terminal, Grail switches it to raw mode so each key reaches the guest as it is typed and the guest does the echoing (Windows consoles and Linux terminals; restored on exit and on Ctrl-C).
 
 ### Building the examples
 
@@ -247,6 +247,13 @@ cargo run --release -p grail -- --net user,hostfwd=tcp::8080-:80 my-server.elf
 
 ```
 printf 'c 8000\nq\n' | cargo run --release -p grail -- --net user examples/net/net-user.elf
+```
+
+Camelot itself has sockets and network programs ([docs/camelot-net.md](docs/camelot-net.md)): with the root image, `httpd &` serves its files on the host's port 8080, and `fetch http://10.0.2.2:8000/FILE > FILE` downloads from a server on the host (`crates/grail/tests/kernel_sockets.rs` tests both, and `crates/avalon/tests/sockets.rs` runs `nc` between two VMs on a switch):
+
+```
+cargo xtask fs
+cargo run --release -p grail -- --disk target/camelot-fs.img --net user,hostfwd=tcp::8080-:80 kernel/kernel.elf
 ```
 
 ## The Avalon platform

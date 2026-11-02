@@ -49,13 +49,45 @@ $ wait
 [12] sleep: exit -1
 ```
 
+## Network programs
+
+On the socket system calls (`docs/camelot-syscalls.md`, "Sockets") and
+the network's own (`netinfo`, `netconf`, `ping`); `docs/camelot-net.md`,
+"Network programs", says more. A HOST is an address or a name, which the
+library's resolver asks the DNS server for. Each reports a problem as
+`NAME: REASON` and exits with 1.
+
+| Program | Usage | What it does |
+|---|---|---|
+| `ifconfig` | `ifconfig [ADDR [MASK [GATEWAY]]]` | prints the interface, its configuration and its counters; with ADDR, gives it a static address (MASK 255.255.255.0 and no gateway if left out) |
+| `ping` | `ping HOST [N]` | sends N ICMP echo requests (4 if left out), a second apart, and prints each reply's round trip; exits 0 if one came |
+| `nc` | `nc [-u] [-v] HOST PORT`, `nc -l [-u] [-v] PORT` | netcat: connects to HOST, or listens for one connection (UDP: the first datagram), and copies its input to the other end and what comes back to its output, both at once; TCP by default, UDP with `-u`, saying what it does with `-v` |
+| `fetch` | `fetch http://HOST[:PORT][/PATH]` | downloads with HTTP/1.0 to its output; any status but 2xx is an error |
+| `httpd` | `httpd [-p PORT] [-n COUNT] [-t SECONDS] [DIR]` | serves DIR's files (index.html or a listing for a directory) over HTTP/1.0 on PORT (80), a log line per request, for COUNT connections or until killed |
+
+So, with `grail --disk target/camelot-fs.img --net user,hostfwd=tcp::8080-:80`:
+
+```
+$ ping 10.0.2.2 1
+PING 10.0.2.2: 56 data bytes
+64 bytes from 10.0.2.2: seq=1 ttl=64 time=1.211 ms
+1 sent, 1 received
+$ fetch http://10.0.2.2:8000/notes.txt > notes.txt
+$ httpd -n 1 &
+[9]
+httpd: serving / on port 80
+10.0.2.2:49153 GET /README 200 1325
+```
+
+the last line once `http://127.0.0.1:8080/README` was opened on the host.
+
 ## Tests and demonstrations
 
 | Program | What it does |
 |---|---|
 | `hello` | prints a line and exits |
 | `ticks` | prints the timer ticks since boot |
-| `ping`, `pong` | print four numbered lines half a tick apart: run together, they take turns |
+| `ding`, `dong` | print four numbered lines half a tick apart: run together, they take turns |
 | `regs` | fills every register, spins for three ticks and exits with 0 only if none changed |
 | `sysregs` | fills every register, makes system calls and exits with 0 only if none but a0 changed |
 | `data` | exits with 0 only if its stack and `.bss` start zeroed and its `.data` holds its initial value and takes stores |
@@ -63,11 +95,14 @@ $ wait
 | `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |
 | `filetest` | checks the file system calls on a writable root filesystem (`filetest: N checks, 0 failed`) |
 | `libtest` | checks the C library (`libtest: N checks, 0 failed`) |
-| `tcptest` | drives the kernel's TCP until #85 brings sockets: `tcptest connect ADDR PORT BYTES [TIMES]` sends a pattern and reads to the end, `tcptest serve PORT CONNECTIONS [BACKLOG]` echoes what each connection sends (`docs/camelot-net.md`, "Testing TCP until #85") |
+| `nettest` | moves known bytes through TCP: `nettest connect ADDR PORT BYTES [TIMES]` sends a pattern and reads to the end, `nettest serve PORT CONNECTIONS [BACKLOG]` echoes what each connection sends; each prints the bytes' counts and FNV-1a hash (the TCP tests' program) |
+| `socktest` | checks the socket calls, their results and their errors, over loopback (`socktest: N checks, 0 failed`; needs a network card) |
 | `badload` | reads kernel memory: killed by a load page fault |
 | `badstore` | writes to its own read-only data: killed by a store page fault |
 | `badhalt` | executes `xcal.halt`, which is M-mode only: killed by an illegal instruction |
 
 `crates/xtask/tests/coreutils.rs` boots Camelot with the root image and
 runs each basic program, its errors included, from the shell, and checks
-what it printed and what it left on the disk.
+what it printed and what it left on the disk. The network programs' tests
+are `crates/grail/tests/kernel_net.rs`, `kernel_tcp.rs` and
+`kernel_sockets.rs`, and `crates/avalon/tests/sockets.rs`.

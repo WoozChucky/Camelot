@@ -145,8 +145,7 @@ program. `CMD < FILE` and `CMD > FILE` redirect its input and output, `CMD |
 CMD` sends the first one's output to the second, and `CMD & CMD` runs the
 first in the background (the shell prints its pid) and the last in the
 foreground; `wait` collects the background ones, `cd [DIR]` changes the
-working directory, `ifconfig` and `ping ADDR [N]` show and use the network,
-`help` lists the built-ins, and `exit [N]` (or Ctrl-D on
+working directory, `help` lists the built-ins, and `exit [N]` (or Ctrl-D on
 an empty line) ends the shell, after which the kernel stops the machine with
 its status as the exit code. Lines are edited with backspace and end with Enter. In a terminal,
 Grail passes each key to the kernel as it is typed and the kernel does the
@@ -163,24 +162,24 @@ running.
 Programs side by side, and one the kernel kills:
 
 ```
-$ ping & pong & badload
+$ ding & dong & badload
 [2]
 [3]
-ping 1
-ping 2
-pong 1
-pong 2
+ding 1
+ding 2
+dong 1
+dong 2
 pid 4 (badload) killed: load page fault
   scause 0x0000000d  sepc 0x00001018  stval 0x80000000
   va 0x80000000 maps to pa 0x80000000, pte 0x2000004b -A--X-RV
 badload: exit -1
 $ wait
-ping 3
-ping 4
-pong 3
-pong 4
-[2] ping: exit 0
-[3] pong: exit 0
+ding 3
+ding 4
+dong 3
+dong 4
+[2] ding: exit 0
+[3] dong: exit 0
 ```
 
 The programs live in `user/`, one `.c` or `.s` file each, all linked with the
@@ -205,7 +204,9 @@ parts it uses) and `user/user.ld`. `user/README.md` has each program's usage:
 | `kill` | kills processes by pid |
 | `sleep` | waits for some seconds (`0.5` for half a second) |
 | `ticks` | prints the timer ticks since boot |
-| `ping`, `pong` | print four numbered lines half a tick apart: run together, they take turns |
+| `ifconfig`, `ping` | show and set the network interface; ICMP echo to a host (an address or a name) |
+| `nc`, `fetch`, `httpd` | netcat over TCP or UDP; an HTTP download; a web server for a directory |
+| `ding`, `dong` | print four numbered lines half a tick apart: run together, they take turns |
 | `regs` | fills every register, spins for three ticks and exits with 0 only if none changed |
 | `sysregs` | fills every register, makes system calls and exits with 0 only if none but a0 changed |
 | `data` | exits with 0 only if its stack and `.bss` start zeroed and its `.data` holds its initial value and takes stores |
@@ -213,6 +214,7 @@ parts it uses) and `user/user.ld`. `user/README.md` has each program's usage:
 | `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |
 | `filetest` | checks the file system calls on a writable root filesystem (`filetest: N checks, 0 failed`) |
 | `libtest` | checks the C library (`libtest: N checks, 0 failed`) |
+| `nettest`, `socktest` | move known bytes through TCP, for the TCP tests; check the socket calls (`socktest: N checks, 0 failed`) |
 | `badload` | reads kernel memory: killed by a load page fault |
 | `badstore` | writes to its own read-only data: killed by a store page fault |
 | `badhalt` | executes `xcal.halt`, which is M-mode only: killed by an illegal instruction |
@@ -312,7 +314,7 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `log.c` | the filesystem's write-ahead log (xv6's): `begin_op()`/`end_op()` around each operation, `log_write()` pinning changed buffers, group commit (slots, flush, header, flush, install, flush, empty header, flush), and the replay at mount |
 | `fs.c` | the filesystem (xv6's): `fs_mount()`, the bitmap allocator, the inode cache (`iget`/`ilock`/`iput`, `readi`/`writei`), directories, path lookup (`namei`/`nameiparent`, from the working directory for a relative path), `fs_create()`/`fs_unlink()`/`fs_link()`, `itrunc()` |
 | `fstest.c` | `fs_boot()`: mounts disk 0 in a kernel process, lists `/`, runs the filesystem self-test (and, with `fs_test` patched to 2, its transactions; to 3, filling the disk) |
-| `net/` | the network stack (`docs/camelot-net.md`), a file per layer: `nic.c` (the card driver: descriptor rings, `nic_intr()`, the transmit queue), `pbuf.c` (the buffer pool), `ether.c`, `arp.c` (the cache), `ip.c` (checks, routing, loopback), `icmp.c` (echo, `icmp_ping()`), `udp.c` (the kernel-internal socket API, the echo service), `tcp.c` (connections, retransmission, the kernel-internal socket API), `dhcp.c` (the client), `net.c` (configuration, `net_boot()`, the counters, `net_timer()`, the `netinfo`/`netconf`/`ping` system calls and the temporary `tcptest`) |
+| `net/` | the network stack (`docs/camelot-net.md`), a file per layer: `nic.c` (the card driver: descriptor rings, `nic_intr()`, the transmit queue), `pbuf.c` (the buffer pool), `ether.c`, `arp.c` (the cache), `ip.c` (checks, routing, loopback), `icmp.c` (echo, `icmp_ping()`), `udp.c` (the kernel-internal socket API, the echo service), `tcp.c` (connections, retransmission, the kernel-internal socket API), `dhcp.c` (the client), `net.c` (configuration, `net_boot()`, the counters, `net_timer()`, the `netinfo`/`netconf`/`ping` system calls), `socket.c` (the socket system calls: sockets behind file descriptors) |
 | `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin`, and `/dev/console` is made too |
 | `boot/` | the bootloader of a bootable disk (`boot.s`, linked by `link.ld` into the committed `boot.elf` with `cargo xtask boot`): the boot block, which loads the kernel ELF stored after the filesystem; `camelot-fs mkfs --boot` installs it |
 | `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()` and `wfi()` |

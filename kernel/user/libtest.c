@@ -298,10 +298,48 @@ static void test_reader(void) {
     check_eq(reader_getline(&r, small, sizeof small), -EBADF, "an error");
 }
 
+/* lib/inet.c and the part of lib/resolve.c that needs no network. */
+static void test_inet(void) {
+    check_eq(htons(0x1234), 0x3412, "htons");
+    check_eq(ntohs(htons(8080)), 8080, "ntohs undoes htons");
+    check(htonl(0x0a00020fu) == 0x0f02000au, "htonl");
+    check(ntohl(htonl(0xc0a80101u)) == 0xc0a80101u, "ntohl undoes htonl");
+    struct in_addr a;
+    check(inet_aton("10.0.2.15", &a) && a.s_addr == htonl(0x0a00020fu), "inet_aton");
+    check(inet_aton("0.0.0.0", &a) && a.s_addr == 0, "inet_aton of 0.0.0.0");
+    const char *bad[] = {"", "1.2.3", "1.2.3.4.5", "256.1.1.1", "1.2.3.4 ", "1..2.3", "0001.2.3.4", "a.b.c.d", "-1.2.3.4"};
+    for (uint i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        check(!inet_aton(bad[i], &a), bad[i]);
+    }
+    check(inet_addr("127.0.0.1") == htonl(0x7f000001u), "inet_addr");
+    check(inet_addr("x") == INADDR_NONE, "inet_addr of a name");
+    a.s_addr = htonl(0xc0a801ffu);
+    check_str(inet_ntoa(a), "192.168.1.255", "inet_ntoa");
+    struct sockaddr_in sa;
+    memset(&sa, 0xff, sizeof sa);
+    sockaddr_set(&sa, 0x0a000202u, 8080);
+    const uchar *b = (const uchar *)&sa;
+    check(sizeof sa == 16 && sa.sin_family == AF_INET, "sockaddr_set: 16 bytes, AF_INET");
+    check(b[2] == 0x1f && b[3] == 0x90 && b[4] == 10 && b[5] == 0 && b[6] == 2 && b[7] == 2,
+          "sockaddr_set: the port and the address big-endian");
+    int zeros = 1;
+    for (int i = 8; i < 16; i++) {
+        zeros = zeros && b[i] == 0;
+    }
+    check(zeros, "sockaddr_set: the rest zeroed");
+    check(resolve("10.1.2.3", &a) == 0 && a.s_addr == htonl(0x0a010203u), "resolve of an address");
+    check_eq(resolve("", &a), -EINVAL, "resolve of nothing");
+    check_eq(resolve("a..b", &a), -EINVAL, "resolve of an empty label");
+    check_eq(resolve("a b", &a), -EINVAL, "resolve of a name with a bad character");
+    check_str(resolve_error(ENOENT), "unknown host", "resolve_error of ENOENT");
+    check_str(resolve_error(ETIMEDOUT), strerror(ETIMEDOUT), "resolve_error of anything else");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "feed") == 0) {
         return feed(atoi(argv[2]));
     }
+    test_inet();
     test_strings();
     test_numbers();
     test_snprintf();

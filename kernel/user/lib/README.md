@@ -17,6 +17,8 @@ together.
 | `strerror.c` | `strerror`: a short message for each error number |
 | `stat.c` | `stat`: `fstat` of a path |
 | `spin.c` | `spin`: a busy loop, for tests that need CPU time |
+| `inet.c` | `htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`, `inet_addr`, `inet_ntoa`, `sockaddr_set`: addresses and byte order |
+| `resolve.c` | `resolve`: a host's address, from its text or by a DNS query (RFC 1035) to the server the network gave; `resolve_error` |
 
 ## How programs get it
 

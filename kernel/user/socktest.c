@@ -1,6 +1,7 @@
 /* socktest: checks the socket calls do what docs/camelot-syscalls.md says
  * ("Sockets"), from user space, over loopback (127.0.0.1) only, so it runs
- * on any machine with a network card, whatever its network: bad
+ * on any machine with a network card, whatever its network (without one,
+ * it says so and exits with 1): bad
  * descriptors, bad pointers, bad addresses, ports in use, TCP and UDP
  * between two sockets of its own, timeouts, shutdown, running out of
  * sockets, and a socket as another program's output. Prints a line for
@@ -23,10 +24,11 @@
 #define TCP_SOCKETS 16
 #define UDP_SOCKETS 8
 /* Datagrams a UDP socket holds (UDP_QUEUE_MAX), the most one carries
- * (UDP_MAX_DATA), the first ephemeral port. */
+ * (UDP_MAX_DATA), and the first ephemeral port (TCP_EPHEMERAL_FIRST, the
+ * same for UDP). */
 #define UDP_QUEUE_MAX 4
 #define UDP_MAX_DATA 1472
-#define EPHEMERAL_FIRST 49152
+#define TCP_EPHEMERAL_FIRST 49152
 /* The kernel's first page: mapped in every process, but without U. */
 #define KERNEL 0x80000000u
 
@@ -308,12 +310,12 @@ static void test_addresses_and_ports(void) {
     /* Ephemeral ports: a listener without bind, a UDP socket's first send. */
     t = socket(AF_INET, SOCK_STREAM, 0);
     check_eq(listen(t, 1), 0, "listen without bind");
-    check(port_of(t) >= EPHEMERAL_FIRST, "takes an ephemeral port");
+    check(port_of(t) >= TCP_EPHEMERAL_FIRST, "takes an ephemeral port");
     close(t);
     u = socket(AF_INET, SOCK_DGRAM, 0);
     a = addr_of(INADDR_LOOPBACK, 9);
     check_eq(sendto(u, "x", 1, &a), 1, "a UDP socket's first sendto");
-    check(port_of(u) >= EPHEMERAL_FIRST, "binds it to an ephemeral port");
+    check(port_of(u) >= TCP_EPHEMERAL_FIRST, "binds it to an ephemeral port");
     close(u);
 }
 
@@ -602,6 +604,12 @@ int main(int argc, char **argv) {
     if (argc > 1) {
         return child(argc, argv);
     }
+    int probe = socket(AF_INET, SOCK_DGRAM, 0);
+    if (probe == -ENODEV) {
+        fprintf(STDERR, "socktest: no network card\n");
+        return 1;
+    }
+    close(probe);
     test_sockets();
     test_bad_descriptors();
     test_bad_pointers();

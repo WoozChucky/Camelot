@@ -1,5 +1,5 @@
 //! The Camelot kernel's TCP (`kernel/net/tcp.c`, docs/camelot-net.md "TCP"), driven
-//! through `tcptest`, the temporary program and system call on its socket API:
+//! through `nettest` (kernel/user/nettest.c), a program on the socket system calls:
 //!
 //! - through the user-mode gateway (`--net user`): a guest client sends a large buffer
 //!   to a Rust server on the host (10.0.2.2) while that server sends one back; a guest
@@ -35,9 +35,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-// ---- what tcptest sends and reports ----
+// ---- what nettest sends and reports ----
 
-/// Byte `i` of what `tcptest connect` sends (`tcptest_pattern` in kernel/net/net.c).
+/// Byte `i` of what `nettest connect` sends (kernel/user/nettest.c).
 fn client_pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8).collect()
 }
@@ -49,7 +49,7 @@ fn host_pattern(len: usize, seed: usize) -> Vec<u8> {
         .collect()
 }
 
-/// FNV-1a, as tcptest reports what it received.
+/// FNV-1a, as nettest reports what it received.
 fn fnv1a(data: &[u8]) -> u32 {
     data.iter().fold(0x811c_9dc5u32, |h, &b| {
         (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
@@ -87,7 +87,7 @@ fn wait_for(vm: &mut Vm, host: Option<&mut Host>, text: &str, n: usize) {
 }
 
 /// Leaves the shell with status 0 (`exit` alone would return the last command's,
-/// and some tests end with a tcptest that failed on purpose).
+/// and some tests end with a nettest that failed on purpose).
 fn leave(vm: &mut Vm) {
     vm.type_line("exit 0");
     assert_eq!(
@@ -98,10 +98,14 @@ fn leave(vm: &mut Vm) {
     );
 }
 
-/// Starts `line` in the background and runs until it printed `ready`.
+/// Starts `line` in the background and runs until it printed `ready` and the shell its
+/// next prompt (which may come before or after).
 fn background(vm: &mut Vm, host: Option<&mut Host>, line: &str, ready: &str) {
+    let prompts = vm.prompts();
     vm.type_line(&format!("{line} &"));
-    wait_for(vm, host, ready, 1);
+    run_until(&mut [vm], host, |vms| {
+        vms[0].out().contains(ready) && vms[0].prompts() > prompts
+    });
 }
 
 /// Runs the machine idle until TIME-WAIT is over everywhere, and checks that every TCP
@@ -362,7 +366,7 @@ fn host_client(addr: SocketAddr, data: Vec<u8>) -> JoinHandle<Vec<u8>> {
     })
 }
 
-/// `tcptest connect`'s line for a connection that went through.
+/// `nettest connect`'s line for a connection that went through.
 fn connect_line(lport: u16, port: u16, sent: usize, reply: &[u8]) -> String {
     format!(
         "10.0.2.15:{lport} > 10.0.2.2:{port}: sent {sent}, received {}, hash {:08x}\n",
@@ -379,7 +383,7 @@ fn client_transfer(vm: &mut Vm, lport: u16, bytes: usize, reply_len: usize) {
         &mut [vm],
         0,
         None,
-        &format!("tcptest connect 10.0.2.2 {port} {bytes}"),
+        &format!("nettest connect 10.0.2.2 {port} {bytes}"),
     );
     assert_eq!(out, connect_line(lport, port, bytes, &reply));
     let got = join(vm, server);
@@ -390,7 +394,7 @@ fn client_transfer(vm: &mut Vm, lport: u16, bytes: usize, reply_len: usize) {
 /// two at once, the second waiting in the backlog while the first is served.
 fn echo_transfers(vm: &mut Vm, fwd: &gateway::HostFwd, big: usize) {
     let prompts = vm.prompts();
-    vm.type_line("tcptest serve 7000 3 2");
+    vm.type_line("nettest serve 7000 3 2");
     wait_for(vm, None, "listening on port 7000\n", 1);
     let addr = SocketAddr::V4(fwd.host);
     let datas = [host_pattern(big, 2), host_pattern(5000, 3), host_pattern(7000, 4)];
@@ -444,7 +448,7 @@ fn a_guest_client_moves_a_large_buffer_both_ways_through_the_gateway() {
 
 #[test]
 fn a_guest_echo_server_answers_host_clients_through_a_forwarded_port() {
-    // Issue #84's second criterion: `tcptest serve` listens on port 7000, forwarded
+    // Issue #84's second criterion: `nettest serve` listens on port 7000, forwarded
     // from a host port; host clients send to it and read back their bytes, one large,
     // then two at once (backlog 2).
     let (mut vm, fwd, _) = user_vm(vec![gateway::HostFwd::tcp(0, 7000)], false);
@@ -496,9 +500,9 @@ fn many_connections_leave_no_socket_page_or_buffer_behind() {
     let (mut vm, _, _) = user_vm(Vec::new(), false);
     // The program once, so what it costs to start one is the same before and after.
     assert_eq!(
-        command(&mut [&mut vm], 0, None, "tcptest"),
-        "usage: tcptest connect ADDR PORT BYTES [TIMES]\n       tcptest serve PORT CONNECTIONS [BACKLOG]\n\
-         tcptest: exit 1\n"
+        command(&mut [&mut vm], 0, None, "nettest"),
+        "usage: nettest connect ADDR PORT BYTES [TIMES]\n       nettest serve PORT CONNECTIONS [BACKLOG]\n\
+         nettest: exit 1\n"
     );
     let pages = vm.read_var("nfree");
     let reply = host_pattern(1500, 5);
@@ -507,7 +511,7 @@ fn many_connections_leave_no_socket_page_or_buffer_behind() {
         &mut [&mut vm],
         0,
         None,
-        &format!("tcptest connect 10.0.2.2 {port} 3000 40"),
+        &format!("nettest connect 10.0.2.2 {port} 3000 40"),
     );
     let want: String = (0..40)
         .map(|i| connect_line(49152 + i, port, 3000, &reply))
@@ -519,11 +523,11 @@ fn many_connections_leave_no_socket_page_or_buffer_behind() {
     // Loopback: the server and the client are both this machine. (Small transfers:
     // the client reads only once it has sent everything, so an echo bigger than the
     // buffers on the way, 16 KiB, would stop both.)
-    background(&mut vm, None, "tcptest serve 6000 20", "listening on port 6000\n");
+    background(&mut vm, None, "nettest serve 6000 20", "listening on port 6000\n");
     let echo = client_pattern(2000);
     let echoed = format!(": echoed 2000, hash {:08x}\n", fnv1a(&echo));
     let prompts = vm.prompts();
-    vm.type_line("tcptest connect 127.0.0.1 6000 2000 20");
+    vm.type_line("nettest connect 127.0.0.1 6000 2000 20");
     run_until(&mut [&mut vm], None, |vms| {
         vms[0].prompts() > prompts && vms[0].out().matches(&echoed).count() == 20
     });
@@ -543,7 +547,7 @@ fn many_connections_leave_no_socket_page_or_buffer_behind() {
     }
     let done = command(&mut [&mut vm], 0, None, "wait");
     assert!(
-        done.starts_with('[') && done.ends_with("] tcptest: exit 0\n"),
+        done.starts_with('[') && done.ends_with("] nettest: exit 0\n"),
         "{done}"
     );
     let ifconfig = command(&mut [&mut vm], 0, None, "ifconfig");
@@ -809,7 +813,7 @@ fn start(vm: &mut Vm, host: &mut Host, line: &str) -> u32 {
     pid_in(&vm.out()[before..]).unwrap()
 }
 
-/// Kills `pid`, a tcptest waiting in a call, and collects it; returns how many ticks that
+/// Kills `pid`, a nettest waiting in a call, and collects it; returns how many ticks that
 /// took, from typing `kill` to the end of `wait`.
 fn kill(vm: &mut Vm, host: &mut Host, pid: u32) -> u32 {
     let start = vm.read_var("ticks");
@@ -817,7 +821,7 @@ fn kill(vm: &mut Vm, host: &mut Host, pid: u32) -> u32 {
     assert_eq!(
         command(&mut [vm], 0, Some(host), "wait"),
         format!(
-            "[{pid}] tcptest: exit -1
+            "[{pid}] nettest: exit -1
 "
         )
     );
@@ -894,7 +898,7 @@ fn a_listener_handles_the_handshake_resets_syns_and_a_full_backlog() {
     background(
         &mut vm,
         Some(&mut host),
-        "tcptest serve 7000 2 1",
+        "nettest serve 7000 2 1",
         "listening on port 7000\n",
     );
 
@@ -994,9 +998,9 @@ fn a_listener_handles_the_handshake_resets_syns_and_a_full_backlog() {
     assert!(
         out.contains(&format!(
             "10.0.9.1:40001 > 10.0.9.2:7000: echoed 5, hash {:08x}\n\
-             tcptest: connection reset\n",
+             nettest: connection reset\n",
             fnv1a(b"hello")
-        )) && out.ends_with("] tcptest: exit 1\n$ "),
+        )) && out.ends_with("] nettest: exit 1\n$ "),
         "{out}"
     );
     // The connection is gone: a segment for it gets a reset, and so does a SYN now
@@ -1032,10 +1036,10 @@ fn segs_until_sent(vm: &mut Vm, host: &mut Host, s: &Seg, done: impl Fn(&[Seg]) 
     segs_until(vm, host, &format!("{s:?}"), done)
 }
 
-/// Starts `tcptest connect 10.0.9.1 PORT BYTES` and returns its SYN, checked.
+/// Starts `nettest connect 10.0.9.1 PORT BYTES` and returns its SYN, checked.
 fn connect(vm: &mut Vm, host: &mut Host, port: u16, bytes: usize, lport: u16) -> Seg {
     host.take();
-    vm.type_line(&format!("tcptest connect 10.0.9.1 {port} {bytes}"));
+    vm.type_line(&format!("nettest connect 10.0.9.1 {port} {bytes}"));
     let syn = segs_until(vm, host, "the SYN", |g| !g.is_empty()).remove(0);
     assert_eq!(
         syn,
@@ -1141,7 +1145,7 @@ fn connections_close_from_either_side_or_both_and_can_be_refused_or_reset() {
     assert!(
         out.ends_with(&format!(
             "10.0.9.2:49154 > 10.0.9.1:80: sent 0, received 0, hash {empty:08x}\n\
-             tcptest: connection refused\ntcptest: exit 1\n$ "
+             nettest: connection refused\nnettest: exit 1\n$ "
         )),
         "{out}"
     );
@@ -1156,7 +1160,7 @@ fn connections_close_from_either_side_or_both_and_can_be_refused_or_reset() {
     assert!(
         out.ends_with(&format!(
             "10.0.9.2:49155 > 10.0.9.1:80: sent 100, received 0, hash {empty:08x}\n\
-             tcptest: connection reset\ntcptest: exit 1\n$ "
+             nettest: connection reset\nnettest: exit 1\n$ "
         )),
         "{out}"
     );
@@ -1176,7 +1180,7 @@ fn unanswered_segments_are_sent_again_then_given_up() {
     // doubling from 1 s (10 ticks) each time, then connect() fails.
     let prompts = vm.prompts();
     host.take();
-    vm.type_line("tcptest connect 10.0.9.1 81 100");
+    vm.type_line("nettest connect 10.0.9.1 81 100");
     let got = timed_until(
         &mut vm,
         &mut host,
@@ -1197,7 +1201,7 @@ fn unanswered_segments_are_sent_again_then_given_up() {
     assert!(
         vm.out().ends_with(
             "10.0.9.2:49152 > 10.0.9.1:81: sent 0, received 0, hash 811c9dc5\n\
-             tcptest: timed out\ntcptest: exit 1\n$ "
+             nettest: timed out\nnettest: exit 1\n$ "
         ),
         "{}",
         vm.out()
@@ -1210,7 +1214,7 @@ fn unanswered_segments_are_sent_again_then_given_up() {
     // 60 s) is over.
     let prompts = vm.prompts();
     host.take();
-    vm.type_line("tcptest connect 10.0.9.1 80 100");
+    vm.type_line("nettest connect 10.0.9.1 80 100");
     let synack = |s: &Seg| {
         if s.flags & SYN != 0 {
             vec![seg(80, 49153, 5000, s.seq + 1, SYN | ACK, b"").with_mss(1460)]
@@ -1243,7 +1247,7 @@ fn unanswered_segments_are_sent_again_then_given_up() {
     assert!(
         vm.out().ends_with(
             "10.0.9.2:49153 > 10.0.9.1:80: sent 100, received 0, hash 811c9dc5\n\
-             tcptest: timed out\ntcptest: exit 1\n$ "
+             nettest: timed out\nnettest: exit 1\n$ "
         ),
         "{}",
         vm.out()
@@ -1328,7 +1332,7 @@ fn a_socket_closed_into_a_window_that_stays_shut_is_given_up() {
     // for as long as the peer answers: a_zero_window_is_probed_until_it_opens.)
     let (mut vm, mut host) = hub_vm();
     let prompts = vm.prompts();
-    vm.type_line("tcptest serve 7000 1");
+    vm.type_line("nettest serve 7000 1");
     wait_for(&mut vm, Some(&mut host), "listening on port 7000\n", 1);
     let syn = seg(40001, 7000, 1000, 0, SYN, b"").with_mss(1460).with_wnd(0);
     let iss = send(&mut vm, &mut host, &syn, 1)[0].seq;
@@ -1394,7 +1398,7 @@ fn sequence_numbers_wrap_around_both_ways() {
     let (mut vm, mut host) = hub_vm();
     vm.write_var("tcp_isn_next", guest_isn);
     let prompts = vm.prompts();
-    vm.type_line("tcptest serve 7000 1");
+    vm.type_line("nettest serve 7000 1");
     wait_for(&mut vm, Some(&mut host), "listening on port 7000\n", 1);
     let isn = 0xffff_f800u32;
     let sa = send(
@@ -1487,7 +1491,7 @@ fn blocked_calls_end_when_the_process_is_killed() {
     let (mut vm, mut host) = hub_vm();
 
     // accept(): nobody connects.
-    let pid = start(&mut vm, &mut host, "tcptest serve 7000 1");
+    let pid = start(&mut vm, &mut host, "nettest serve 7000 1");
     wait_for(&mut vm, Some(&mut host), "listening on port 7000\n", 1);
     let took = kill(&mut vm, &mut host, pid);
     assert!(took < 20, "{took} ticks");
@@ -1501,7 +1505,7 @@ fn blocked_calls_end_when_the_process_is_killed() {
     // connect(): nobody answers the SYN (the first time it would go again is in 10
     // ticks, the last wait would end in 310).
     host.take();
-    let pid = start(&mut vm, &mut host, "tcptest connect 10.0.9.1 81 100");
+    let pid = start(&mut vm, &mut host, "nettest connect 10.0.9.1 81 100");
     let iss = segs_until(&mut vm, &mut host, "the SYN", |g| !g.is_empty())[0].seq;
     let took = kill(&mut vm, &mut host, pid);
     assert!(took < 20, "{took} ticks");
@@ -1531,7 +1535,7 @@ fn closing_with_data_unread_resets_and_an_orphan_in_fin_wait_2_ends() {
     // close resets the connection, so the peer can't think that data was taken. The
     // host keeps its window shut, so the echo stays in the send buffer: 4 KiB fill it,
     // and of the 1000 bytes more, the server reads 512 and waits to send them.
-    let pid = start(&mut vm, &mut host, "tcptest serve 7000 1");
+    let pid = start(&mut vm, &mut host, "nettest serve 7000 1");
     wait_for(&mut vm, Some(&mut host), "listening on port 7000\n", 1);
     let syn = seg(40001, 7000, 1000, 0, SYN, b"").with_mss(1460).with_wnd(0);
     let iss = send(&mut vm, &mut host, &syn, 1)[0].seq;
@@ -1574,7 +1578,7 @@ fn closing_with_data_unread_resets_and_an_orphan_in_fin_wait_2_ends() {
     // gets a reset, since nobody will ever read it.
     let fin_wait_2 = |vm: &mut Vm, host: &mut Host, lport: u16| {
         host.take();
-        let pid = start(vm, host, "tcptest connect 10.0.9.1 80 100");
+        let pid = start(vm, host, "nettest connect 10.0.9.1 80 100");
         let iss = segs_until(vm, host, "the SYN", |g| !g.is_empty())[0].seq;
         let sa = seg(80, lport, 7000, iss + 1, SYN | ACK, b"").with_mss(1460);
         segs_until_sent(vm, host, &sa, |g| g.iter().any(|s| s.flags & FIN != 0));
@@ -1595,6 +1599,12 @@ fn closing_with_data_unread_resets_and_an_orphan_in_fin_wait_2_ends() {
         ),
         [seg(49152, 80, iss + 102, 0, RST, b"").with_wnd(0)]
     );
+    // The reset goes out before the slot is freed: let the kernel finish.
+    for _ in 0..4 {
+        vm.m.run_for(SLICE, &mut |_| {});
+        host.service();
+    }
+    assert!(host.take().is_empty());
     assert_eq!(vm.read_var("tcp_in_use"), 0);
 
     // Again, but nothing more comes: the stack waits TCP_FIN_TIMEOUT (600 ticks) from
@@ -1663,11 +1673,11 @@ fn silly_windows_are_avoided_both_ways() {
     host.send(frame(&seg(80, 49152, 5001, 0, RST, b"")));
     let out = finish(&mut vm, &mut host, prompts);
     assert!(
-        out.ends_with("tcptest: connection reset\ntcptest: exit 1\n$ "),
+        out.ends_with("nettest: connection reset\nnettest: exit 1\n$ "),
         "{out}"
     );
 
-    // Receiving: the host fills the 4 KiB window; as tcptest reads, the guest says the
+    // Receiving: the host fills the 4 KiB window; as nettest reads, the guest says the
     // window opened on its own (the host sends nothing more, and has nothing to probe
     // with), once it opened by the threshold, an MSS here.
     let prompts = vm.prompts();

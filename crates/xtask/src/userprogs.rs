@@ -561,7 +561,7 @@ mod tests {
     fn lists_the_programs_but_not_the_runtime() {
         let names = program_names(&user_dir(&crate::repo_root())).unwrap();
         for want in [
-            "sh", "echo", "hello", "ticks", "ping", "pong", "badload", "badhalt",
+            "sh", "echo", "hello", "ticks", "ding", "dong", "ping", "nc", "badload", "badhalt",
         ] {
             assert!(names.contains(&want.to_string()), "{want} missing from {names:?}");
         }

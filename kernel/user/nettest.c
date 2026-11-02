@@ -46,8 +46,14 @@ static long parse_num(const char *s) {
     return n;
 }
 
-static void print_end(struct sockaddr_in *a) {
-    printf("%s:%d", inet_ntoa(a->sin_addr), ntohs(a->sin_port));
+/* Prints "FROM > TO: " and then `rest`, as one write: a server and a
+ * client of its own may run at once on one console, and their lines must
+ * not mix. */
+static void print_line(struct sockaddr_in *from, struct sockaddr_in *to, const char *rest) {
+    char line[128];
+    int n = snprintf(line, sizeof line, "%s:%d > ", inet_ntoa(from->sin_addr), ntohs(from->sin_port));
+    n += snprintf(line + n, sizeof line - (uint)n, "%s:%d: %s", inet_ntoa(to->sin_addr), ntohs(to->sin_port), rest);
+    write(STDOUT, line, (uint)n);
 }
 
 static int usage(void) {
@@ -130,10 +136,9 @@ static int connect_cmd(int argc, char **argv) {
         r.hash = FNV_BASIS;
         int err = connect_once(ntohl(addr.s_addr), (uint)port, (uint)bytes, &r);
         if (r.here.sin_port != 0) {
-            print_end(&r.here);
-            printf(" > ");
-            print_end(&r.there);
-            printf(": sent %u, received %u, hash %08x\n", r.sent, r.received, r.hash);
+            char rest[64];
+            snprintf(rest, sizeof rest, "sent %u, received %u, hash %08x\n", r.sent, r.received, r.hash);
+            print_line(&r.here, &r.there, rest);
         }
         if (err < 0) {
             return fail(err);
@@ -198,10 +203,9 @@ static int serve_cmd(int argc, char **argv) {
         r.hash = FNV_BASIS;
         err = echo_once(fd, &r);
         if (r.here.sin_port != 0) {
-            print_end(&r.there);
-            printf(" > ");
-            print_end(&r.here);
-            printf(": echoed %u, hash %08x\n", r.sent, r.hash);
+            char rest[64];
+            snprintf(rest, sizeof rest, "echoed %u, hash %08x\n", r.sent, r.hash);
+            print_line(&r.there, &r.here, rest);
         }
         if (err < 0) {
             close(fd);
