@@ -35,7 +35,7 @@ pub use message::*;
 
 /// Protocol version carried by the handshake. Both sides must speak the same one; any
 /// change to the message catalogue (a new message, field or enum value) bumps it.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// First four payload bytes of `Hello`, so a server can tell an Avalon client from a
 /// stray connection.
@@ -59,7 +59,7 @@ pub const MAX_BLOCK_SECTORS: u32 = 2048;
 pub const MAX_NAME_LEN: usize = 64;
 
 /// Where Avalon listens by default. Listening on any other interface takes an explicit
-/// flag, since v1 has no authentication.
+/// flag, since the protocol has no authentication.
 pub const DEFAULT_AVALON_ADDR: &str = "127.0.0.1:7400";
 
 /// Where Lake listens by default.

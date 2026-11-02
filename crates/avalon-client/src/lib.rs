@@ -2,17 +2,21 @@
 //! Avalon protocol (`docs/avalon-protocol.md`).
 //!
 //! - [`Client`]: one session with a server. VM control (create, list, info, start,
-//!   pause, resume, stop, destroy) talks to Avalon; disk management (create, list,
-//!   delete) talks to Lake. Each operation is one request and its typed reply.
-//! - [`parse`]: the text people type for addresses, RAM sizes, clocks, disk sources and
-//!   disk sizes, so every front end accepts the same syntax (`--ram` and `--clock` are
-//!   Grail's own parsers).
-//! - [`show`]: the same values as text again (sizes, frequencies, device names).
+//!   pause, resume, stop, destroy) and the virtual network (switches, plugging cards
+//!   into them, captures) talk to Avalon; disk management (create, list, delete) talks
+//!   to Lake. Each operation is one request and its typed reply.
+//! - [`parse`]: the text people type for addresses, RAM sizes, clocks, disk sources,
+//!   disk sizes and network cards, so every front end accepts the same syntax (`--ram`
+//!   and `--clock` are Grail's own parsers).
+//! - [`show`]: the same values as text again (sizes, frequencies, device names, MAC
+//!   addresses).
 //!
 //! Round Table, the command-line client, is a thin layer over this crate, and so is
 //! Pendragon, the web console: the two cannot drift apart.
 
-use avalon_proto::{Connection, DiskInfo, ErrorCode, HardwareProfile, Message, VmDetails, VmRef, VmSummary};
+use avalon_proto::{
+    Connection, DiskInfo, ErrorCode, HardwareProfile, Message, SwitchInfo, VmDetails, VmRef, VmSummary,
+};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -21,8 +25,8 @@ use std::time::Duration;
 pub mod parse;
 pub mod show;
 
-pub use parse::{parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_ram};
-pub use show::{device_name, disk_source_text, format_hz, format_size};
+pub use parse::{parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_net, parse_ram};
+pub use show::{device_name, disk_source_text, format_hz, format_size, mac_text};
 
 /// How long [`Client::connect`] tries each address of the server before giving up.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -297,6 +301,55 @@ impl<S: Read + Write> Client<S> {
 
     pub fn destroy_vm(&mut self, vm: &VmRef) -> Result<()> {
         self.vm_action(VmAction::Destroy, vm)
+    }
+
+    // ---- Virtual network (Avalon) ----
+
+    /// Creates an empty virtual switch.
+    pub fn create_switch(&mut self, name: &str) -> Result<()> {
+        Ok(self.conn.request_ok(&Message::CreateSwitch {
+            name: name.to_string(),
+        })?)
+    }
+
+    /// Deletes a switch, unplugging every card from it.
+    pub fn delete_switch(&mut self, name: &str) -> Result<()> {
+        Ok(self.conn.request_ok(&Message::DeleteSwitch {
+            name: name.to_string(),
+        })?)
+    }
+
+    /// Every switch, in name order, with its ports and their counters.
+    pub fn list_switches(&mut self) -> Result<Vec<SwitchInfo>> {
+        match self.conn.request(&Message::ListSwitches)? {
+            Message::SwitchList { switches } => Ok(switches),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Plugs network card `card` of `vm` into `switch`.
+    pub fn attach_card(&mut self, vm: &VmRef, card: u8, switch: &str) -> Result<()> {
+        Ok(self.conn.request_ok(&Message::AttachCard {
+            vm: vm.clone(),
+            card,
+            switch: switch.to_string(),
+        })?)
+    }
+
+    /// Unplugs network card `card` of `vm` from its switch.
+    pub fn detach_card(&mut self, vm: &VmRef, card: u8) -> Result<()> {
+        Ok(self
+            .conn
+            .request_ok(&Message::DetachCard { vm: vm.clone(), card })?)
+    }
+
+    /// Starts capturing `switch` into the pcap file `path` on the server's host, or
+    /// stops (`None`).
+    pub fn capture_switch(&mut self, switch: &str, path: Option<&str>) -> Result<()> {
+        Ok(self.conn.request_ok(&Message::CaptureSwitch {
+            switch: switch.to_string(),
+            path: path.map(str::to_string),
+        })?)
     }
 
     // ---- Disk management (Lake) ----

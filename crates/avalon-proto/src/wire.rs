@@ -105,6 +105,10 @@ impl<'a> Reader<'a> {
     pub fn magic(&mut self) -> Result<[u8; 4]> {
         self.array()
     }
+    /// A MAC address: 6 bytes in wire order.
+    pub fn mac(&mut self) -> Result<[u8; 6]> {
+        self.array()
+    }
 
     pub fn bool(&mut self) -> Result<bool> {
         match self.u8()? {

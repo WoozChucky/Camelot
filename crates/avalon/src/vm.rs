@@ -13,16 +13,25 @@
 //! scrollback, and streams new output to the clients attached to its console. Their
 //! input goes to the UART's receiver, in the order the server receives it.
 //!
+//! A VM's network cards ([`Card`]) plug into Avalon's switches. A frame queued for
+//! one of them rings the VM's bell ([`Vm::kick`]), so a machine parked in `wfi`
+//! takes it at once instead of after its nap.
+//!
 //! Locking: everything that changes is in [`Inner`], behind one mutex per VM, which
 //! the VM thread takes only between slices. Events for attached clients are queued
-//! under that lock, so every client sees them in the order they happened.
+//! under that lock, so every client sees them in the order they happened. The lock is
+//! only ever held for a moment (a machine is dropped after it is let go, since that
+//! can close disks over the network): other VMs' threads take it to ring the bell.
 
 use crate::outbox::Outbox;
+use crate::switch::Card;
 use crate::{lock, Fail};
 use avalon_proto::{
-    AttachKind, DeviceEntry, ErrorCode, Frame, HardwareProfile, Message, VmDetails, VmState, VmSummary,
+    AttachKind, DeviceEntry, DeviceSpec, ErrorCode, Frame, HardwareProfile, Message, NetSpec, VmDetails,
+    VmState, VmSummary,
 };
 use excalibur::csr::IRQ_M_TIMER;
+use grail::net::NetBackend;
 use grail::{Machine, MachineConfig};
 use std::collections::VecDeque;
 use std::io::Write;
@@ -51,6 +60,8 @@ pub struct Vm {
     pub profile: HardwareProfile,
     /// The guest's sysinfo device table.
     pub devices: Vec<DeviceEntry>,
+    /// The network cards, in the profile's order.
+    cards: Vec<Arc<Card>>,
     /// Steps run so far (instructions, and idle ticks of a machine waiting in `wfi`).
     steps: AtomicU64,
     /// Slices run so far (calls of `run_for`, empty ones included): how tests see that
@@ -114,18 +125,25 @@ fn wrong_state(vm: &Vm, state: VmState, want: &str) -> Fail {
 }
 
 impl Vm {
-    /// Builds the machine `config` describes and loads `program` into it, as VM 0 until
-    /// the server gives it an id. Errors: `InvalidProfile` (a disk image that cannot be
-    /// opened) and `InvalidProgram`. This can take a while (it opens files on the host
-    /// and allocates the guest's RAM), so the server calls it without holding its table.
+    /// Builds the machine `config` describes, with `cards` as its network cards (still
+    /// unplugged), and loads `program` into it, as VM 0 until the server gives it an
+    /// id. Errors: `InvalidProfile` (a disk image that cannot be opened) and
+    /// `InvalidProgram`. This can take a while (it opens files on the host and
+    /// allocates the guest's RAM), so the server calls it without holding its table.
     pub fn new(
         name: String,
         profile: HardwareProfile,
         config: MachineConfig,
+        cards: Vec<Arc<Card>>,
         program: &[u8],
         log: bool,
     ) -> Result<Vm, Fail> {
-        let mut machine = Machine::new(config).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
+        let backends = cards
+            .iter()
+            .map(|card| (card.mac, Box::new(card.backend()) as Box<dyn NetBackend>))
+            .collect();
+        let mut machine = Machine::with_devices(config, Vec::new(), backends)
+            .map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
         machine
             .load_elf(program)
             .map_err(|e| Fail::new(ErrorCode::InvalidProgram, format!("program: {e}")))?;
@@ -151,6 +169,7 @@ impl Vm {
             name,
             profile,
             devices,
+            cards,
             steps: AtomicU64::new(0),
             slices: AtomicU64::new(0),
             inner: Mutex::new(Inner {
@@ -195,13 +214,54 @@ impl Vm {
         self.lock().consoles.len()
     }
 
+    /// The VM as `VmList` shows it. Its cards are as they are now: their addresses
+    /// (made up by the server if the profile set none), and the switches they are
+    /// plugged into.
     pub fn summary(&self) -> VmSummary {
+        let mut profile = self.profile.clone();
+        let mut cards = self.cards.iter();
+        for device in &mut profile.devices {
+            if let (DeviceSpec::Net(net), Some(card)) = (device, cards.next()) {
+                *net = NetSpec {
+                    switch: card.switch().map(|s| s.name().to_string()),
+                    mac: Some(card.mac.0),
+                };
+            }
+        }
         VmSummary {
             id: self.id,
             name: self.name.clone(),
             state: self.state(),
-            profile: self.profile.clone(),
+            profile,
         }
+    }
+
+    /// Network card `index`, if the VM has it.
+    pub fn card(&self, index: u8) -> Result<&Arc<Card>, Fail> {
+        self.cards.get(index as usize).ok_or_else(|| {
+            let has = match self.cards.len() {
+                0 => "no network cards".to_string(),
+                1 => "one network card, 0".to_string(),
+                n => format!("{n} network cards, 0 to {}", n - 1),
+            };
+            Fail::new(
+                ErrorCode::NoSuchCard,
+                format!("VM {} ('{}') has {has}", self.id, self.name),
+            )
+        })
+    }
+
+    pub fn cards(&self) -> &[Arc<Card>] {
+        &self.cards
+    }
+
+    /// Wakes the VM's thread if it is napping: a frame came in for one of its cards.
+    /// A frame that comes while a slice runs makes the thread run another slice at
+    /// once rather than nap.
+    pub fn kick(&self) {
+        let mut inner = self.lock();
+        inner.kick = true;
+        self.wake.notify_all();
     }
 
     pub fn details(&self) -> VmDetails {
@@ -289,9 +349,10 @@ impl Vm {
         let mut inner = self.lock();
         match inner.state {
             VmState::Created | VmState::Running | VmState::Paused => {
-                inner.machine = None;
+                let machine = inner.machine.take();
                 self.set_state(&mut inner, VmState::Stopped);
                 drop(self.settle(inner));
+                drop(machine);
                 Ok(())
             }
             state => Err(wrong_state(self, state, "created, running or paused")),
@@ -301,14 +362,14 @@ impl Vm {
     /// Ends the VM for good: its thread stops and is joined, its machine is dropped,
     /// and attached clients get `Detached`. The caller has taken it out of the table.
     pub fn destroy(&self) {
-        let consoles = {
+        let (consoles, machine) = {
             let mut inner = self.lock();
             inner.gone = true;
-            inner.machine = None;
             inner.input = None;
             self.wake.notify_all();
-            std::mem::take(&mut inner.consoles)
+            (std::mem::take(&mut inner.consoles), inner.machine.take())
         };
+        drop(machine);
         let detached = event_frame(&Message::Detached {
             vm: self.id,
             kind: AttachKind::Console,
@@ -325,15 +386,17 @@ impl Vm {
     /// Server shutdown: a VM that has not finished is stopped (attached clients see the
     /// state change), and its thread is joined.
     pub fn shut_down(&self) {
-        {
+        let machine = {
             let mut inner = self.lock();
+            let machine = inner.machine.take();
             if matches!(inner.state, VmState::Created | VmState::Running | VmState::Paused) {
-                inner.machine = None;
                 self.set_state(&mut inner, VmState::Stopped);
             }
             inner.gone = true;
             self.wake.notify_all();
-        }
+            machine
+        };
+        drop(machine);
         self.join();
     }
 
@@ -510,6 +573,7 @@ mod tests {
             "t".into(),
             HardwareProfile::with_ram(4096),
             MachineConfig::with_ram(4096),
+            Vec::new(),
             b"not an ELF file",
             false,
         );
@@ -525,6 +589,7 @@ mod tests {
             "t".into(),
             HardwareProfile::with_ram(1 << 20),
             MachineConfig::with_ram(1 << 20),
+            Vec::new(),
             &std::fs::read(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../examples/hello/hello.elf"

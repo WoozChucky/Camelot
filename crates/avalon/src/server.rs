@@ -6,13 +6,18 @@
 //! run on threads of their own ([`crate::vm`]). Nothing a client sends can stop the
 //! server: every frame that is not an event gets exactly one reply, an `Error` when the
 //! request fails (protocol doc, sections 4 and 5).
+//!
+//! The server also owns the virtual switches its VMs' network cards plug into
+//! ([`crate::switch`]), by name.
 
 use crate::outbox::Outbox;
+use crate::profile::{card_configs, CardConfig};
+use crate::switch::{Card, Switch, MAX_SWITCHES};
 use crate::vm::Vm;
 use crate::{lock, machine_config, Fail};
 use avalon_proto::{
     default_port, kind_of, type_name, validate_name, Connection, Error, ErrorCode, Frame, HardwareProfile,
-    Message, MessageKind, VmRef, VmSummary, DEFAULT_AVALON_ADDR,
+    Message, MessageKind, PortOwner, SwitchInfo, VmRef, VmSummary, DEFAULT_AVALON_ADDR,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
@@ -44,7 +49,7 @@ const POLL: Duration = Duration::from_millis(100);
 /// How the server runs.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Where to listen. Loopback by default: v1 of the protocol has no authentication.
+    /// Where to listen. Loopback by default: the protocol has no authentication.
     pub listen: SocketAddr,
     /// Total RAM of all VMs in bytes; creating a VM that would exceed it is refused
     /// with `OverBudget`. `None` is no limit.
@@ -110,6 +115,8 @@ struct Shared {
     addr: SocketAddr,
     stopping: AtomicBool,
     table: Mutex<Table>,
+    /// The virtual switches, by name. Taken after `table` when both are needed.
+    switches: Mutex<BTreeMap<String, Switch>>,
     clients: Mutex<Clients>,
 }
 
@@ -158,6 +165,7 @@ impl Server {
                     next_id: 1,
                     closed: false,
                 }),
+                switches: Mutex::default(),
                 clients: Mutex::default(),
             }),
         })
@@ -181,7 +189,7 @@ impl Server {
             eprintln!("avalon: listening on {}", shared.addr);
             if !shared.addr.ip().is_loopback() {
                 eprintln!(
-                    "avalon: warning: {} is not a loopback address, and protocol v1 has no \
+                    "avalon: warning: {} is not a loopback address, and the protocol has no \
                      authentication: anyone who can reach it can control the VMs",
                     shared.addr
                 );
@@ -429,6 +437,11 @@ impl Shared {
         for vm in vms.values() {
             vm.shut_down();
         }
+        // Ends the switches' captures, with every frame in the files.
+        let switches = std::mem::take(&mut *lock(&self.switches));
+        for switch in switches.values() {
+            switch.close();
+        }
         let (live, threads) = {
             let mut clients = lock(&self.clients);
             (
@@ -483,8 +496,9 @@ impl Shared {
         vms.iter().map(|vm| vm.summary()).collect()
     }
 
-    /// `CreateVm`: checks the name, the profile, the RAM budget and the program, in
-    /// that order, and adds the VM in state created.
+    /// `CreateVm`: checks the name, the profile (its cards' switches included), the RAM
+    /// budget and the program, in that order, and adds the VM in state created, its
+    /// cards plugged into their switches.
     ///
     /// The name and the RAM are reserved under the table's lock, so two creates cannot
     /// both take the last of the budget or the same name; the machine is built without
@@ -493,8 +507,16 @@ impl Shared {
     fn create(&self, name: String, profile: HardwareProfile, program: &[u8]) -> Result<u32, Fail> {
         validate_name(&name).map_err(|e| Fail::new(ErrorCode::InvalidName, e))?;
         let config = machine_config(&profile).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
+        let cards = card_configs(&name, &profile).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
+        // Checked again when the cards are plugged in, in case a switch is deleted
+        // meanwhile; this saves building a machine that cannot be plugged in.
+        for card in &cards {
+            if let Some(switch) = &card.switch {
+                self.switch(switch)?;
+            }
+        }
         self.reserve(&name, profile.ram_size)?;
-        let built = self.build(name.clone(), profile, config, program);
+        let built = self.build(name.clone(), profile, config, &cards, program);
         let mut table = lock(&self.table);
         if let Some(i) = table.pending.iter().position(|(n, _)| *n == name) {
             table.pending.swap_remove(i);
@@ -508,6 +530,27 @@ impl Shared {
             .checked_add(1)
             .ok_or_else(|| Fail::new(ErrorCode::Internal, "out of VM ids"))?;
         vm.id = id;
+        let vm = Arc::new(vm);
+        // A frame for one of the cards wakes the VM. Weak: the cards are the VM's.
+        for card in vm.cards() {
+            let weak = Arc::downgrade(&vm);
+            card.set_bell(Arc::new(move || {
+                if let Some(vm) = weak.upgrade() {
+                    vm.kick();
+                }
+            }));
+        }
+        // Plugged in under the table's lock, so the VM is never listed with its
+        // cards half plugged in. If one cannot be, the VM is not created.
+        if let Err(fail) = self.plug_cards(&vm, &cards) {
+            drop(table);
+            for card in vm.cards() {
+                card.unplug();
+            }
+            // Its machine (disks included) goes with it, outside the lock.
+            drop(vm);
+            return Err(fail);
+        }
         if self.log {
             eprintln!(
                 "avalon: VM {id} ('{}') created: {} RAM, {}",
@@ -520,8 +563,22 @@ impl Shared {
             );
         }
         table.next_id = next;
-        table.vms.insert(id, Arc::new(vm));
+        table.vms.insert(id, vm);
         Ok(id)
+    }
+
+    /// Plugs the cards of a new VM into the switches `cards` name.
+    fn plug_cards(&self, vm: &Arc<Vm>, cards: &[CardConfig]) -> Result<(), Fail> {
+        for (card, config) in vm.cards().iter().zip(cards) {
+            if let Some(switch) = &config.switch {
+                let owner = PortOwner::Card {
+                    vm: vm.id,
+                    card: card.index,
+                };
+                card.plug(owner, &self.switch(switch)?)?;
+            }
+        }
+        Ok(())
     }
 
     /// Takes `name` and `ram` bytes of the budget for a VM about to be built.
@@ -563,6 +620,7 @@ impl Shared {
         name: String,
         profile: HardwareProfile,
         config: grail::MachineConfig,
+        cards: &[CardConfig],
         program: &[u8],
     ) -> Result<Vm, Fail> {
         // Grail allocates RAM with no way to fail but aborting the process, so make
@@ -573,7 +631,12 @@ impl Shared {
                 format!("the host cannot allocate {} of RAM", show_size(profile.ram_size)),
             ));
         }
-        Vm::new(name, profile, config, program, self.log)
+        let cards = cards
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Card::new(i as u8, c.mac))
+            .collect();
+        Vm::new(name, profile, config, cards, program, self.log)
     }
 
     fn destroy(&self, vm: &VmRef) -> Result<(), Fail> {
@@ -590,6 +653,105 @@ impl Shared {
         };
         vm.destroy();
         Ok(())
+    }
+
+    // ---- Virtual network ----
+
+    /// The switch named `name`.
+    fn switch(&self, name: &str) -> Result<Switch, Fail> {
+        lock(&self.switches)
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Fail::new(ErrorCode::NoSuchSwitch, format!("no switch named '{name}'")))
+    }
+
+    /// `CreateSwitch`: a new switch with nothing plugged in.
+    fn create_switch(&self, name: String) -> Result<(), Fail> {
+        validate_name(&name).map_err(|e| Fail::new(ErrorCode::InvalidName, e))?;
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(shutting_down());
+        }
+        let mut switches = lock(&self.switches);
+        if switches.contains_key(&name) {
+            return Err(Fail::new(
+                ErrorCode::AlreadyExists,
+                format!("a switch named '{name}' already exists"),
+            ));
+        }
+        if switches.len() >= MAX_SWITCHES {
+            return Err(Fail::new(
+                ErrorCode::OverBudget,
+                format!("this server has {MAX_SWITCHES} switches, its most"),
+            ));
+        }
+        if self.log {
+            eprintln!("avalon: switch '{name}' created");
+        }
+        switches.insert(name.clone(), Switch::new(&name));
+        Ok(())
+    }
+
+    /// `DeleteSwitch`: unplugs every card from the switch (their links go down) and
+    /// ends its capture.
+    fn delete_switch(&self, name: &str) -> Result<(), Fail> {
+        let switch = lock(&self.switches).remove(name);
+        let Some(switch) = switch else {
+            return Err(Fail::new(
+                ErrorCode::NoSuchSwitch,
+                format!("no switch named '{name}'"),
+            ));
+        };
+        switch.close();
+        if self.log {
+            eprintln!("avalon: switch '{name}' deleted");
+        }
+        Ok(())
+    }
+
+    /// `ListSwitches`, in name order.
+    fn list_switches(&self) -> Vec<SwitchInfo> {
+        let switches: Vec<Switch> = lock(&self.switches).values().cloned().collect();
+        switches.iter().map(Switch::info).collect()
+    }
+
+    /// `AttachCard`.
+    fn attach_card(&self, vm: &VmRef, card: u8, switch: &str) -> Result<(), Fail> {
+        let vm = self.find(vm)?;
+        let card = vm.card(card)?;
+        let switch = self.switch(switch)?;
+        card.plug(
+            PortOwner::Card {
+                vm: vm.id,
+                card: card.index,
+            },
+            &switch,
+        )
+    }
+
+    /// `DetachCard`.
+    fn detach_card(&self, vm: &VmRef, card: u8) -> Result<(), Fail> {
+        let vm = self.find(vm)?;
+        let card = vm.card(card)?;
+        if card.unplug() {
+            Ok(())
+        } else {
+            Err(Fail::new(
+                ErrorCode::InvalidState,
+                format!(
+                    "card {} of VM {} ('{}') is not plugged into a switch",
+                    card.index, vm.id, vm.name
+                ),
+            ))
+        }
+    }
+
+    /// `CaptureSwitch`.
+    fn capture_switch(&self, switch: &str, path: Option<&str>) -> Result<(), Fail> {
+        let switch = self.switch(switch)?;
+        match path {
+            Some(path) => switch.start_capture(path),
+            None => switch.stop_capture(),
+        }
     }
 }
 
@@ -753,6 +915,29 @@ impl Session<'_> {
                         format!("not attached to the console of VM {vm}"),
                     ));
                 }
+                Message::Ok
+            }
+            Message::CreateSwitch { name } => {
+                server.create_switch(name)?;
+                Message::Ok
+            }
+            Message::DeleteSwitch { name } => {
+                server.delete_switch(&name)?;
+                Message::Ok
+            }
+            Message::ListSwitches => Message::SwitchList {
+                switches: server.list_switches(),
+            },
+            Message::AttachCard { vm, card, switch } => {
+                server.attach_card(&vm, card, &switch)?;
+                Message::Ok
+            }
+            Message::DetachCard { vm, card } => {
+                server.detach_card(&vm, card)?;
+                Message::Ok
+            }
+            Message::CaptureSwitch { switch, path } => {
+                server.capture_switch(&switch, path.as_deref())?;
                 Message::Ok
             }
             other => return Err(unsupported(&other)),

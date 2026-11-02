@@ -23,6 +23,14 @@ pub fn profile() -> HardwareProfile {
                 },
                 read_only: true,
             }),
+            DeviceSpec::Net(NetSpec {
+                switch: Some("lan".into()),
+                mac: Some([0x02, 0xca, 0, 0, 0, 1]),
+            }),
+            DeviceSpec::Net(NetSpec {
+                switch: None,
+                mac: None,
+            }),
         ],
     }
 }
@@ -235,6 +243,63 @@ pub fn samples() -> Vec<Message> {
         },
         DiskDelete {
             name: "old.img".into(),
+        },
+        CreateSwitch { name: "lan".into() },
+        DeleteSwitch { name: "dmz".into() },
+        ListSwitches,
+        SwitchList { switches: Vec::new() },
+        SwitchList {
+            switches: vec![
+                SwitchInfo {
+                    name: "lan".into(),
+                    capture: Some("C:\\captures\\lan.pcap".into()),
+                    ports: vec![
+                        SwitchPort {
+                            owner: PortOwner::Card { vm: 1, card: 0 },
+                            mac: [0x02, 0xca, 0, 0, 0, 1],
+                            in_frames: 10,
+                            in_bytes: 600,
+                            out_frames: 12,
+                            out_bytes: 720,
+                            dropped: 0,
+                        },
+                        SwitchPort {
+                            owner: PortOwner::Card {
+                                vm: u32::MAX,
+                                card: u8::MAX,
+                            },
+                            mac: [0xff; 6],
+                            in_frames: u64::MAX,
+                            in_bytes: u64::MAX,
+                            out_frames: 0,
+                            out_bytes: 0,
+                            dropped: u64::MAX,
+                        },
+                    ],
+                },
+                SwitchInfo {
+                    name: "empty".into(),
+                    capture: None,
+                    ports: Vec::new(),
+                },
+            ],
+        },
+        AttachCard {
+            vm: VmRef::Name("web-1".into()),
+            card: 0,
+            switch: "lan".into(),
+        },
+        DetachCard {
+            vm: VmRef::Id(2),
+            card: 3,
+        },
+        CaptureSwitch {
+            switch: "lan".into(),
+            path: Some("lan.pcap".into()),
+        },
+        CaptureSwitch {
+            switch: "lan".into(),
+            path: None,
         },
     ];
     for state in all_states {

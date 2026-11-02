@@ -1,11 +1,11 @@
-# Avalon Protocol v1
+# Avalon Protocol v2
 
 The wire protocol of the Avalon platform. Every program in it speaks this protocol:
 
 | Program | Role | Serves / uses |
 |---|---|---|
-| **Avalon** | hypervisor server: runs N Grail VMs | serves session, VM control, console, screen and input |
-| **Round Table** | control CLI | uses VM control (and disk management against Lake) |
+| **Avalon** | hypervisor server: runs N Grail VMs | serves session, VM control, console, screen and input, virtual network |
+| **Round Table** | control CLI | uses VM control and virtual network (and disk management against Lake) |
 | **Herald** | attaches to one VM | uses console, screen and input |
 | **Lake** | storage server: serves disk images | serves session, block I/O, disk management |
 
@@ -15,7 +15,7 @@ The implementation is the `avalon-proto` crate (`crates/avalon-proto`): the mess
 
 - TCP, through `std::net`. One connection is one session; either side ends it by closing the socket.
 - Servers listen on loopback by default: Avalon on `127.0.0.1:7400`, Lake on `127.0.0.1:7401`. Listening on any other interface takes an explicit command-line flag.
-- **No authentication and no encryption in v1.** Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
+- **No authentication and no encryption (v2 included).** Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
 - A client and a server are both just byte streams to the protocol; tests run it over in-memory buffers as well as sockets.
 
 ## 2. Framing
@@ -59,6 +59,7 @@ Payloads are sequences of fields, in the order the message tables list them, wit
 | `u8`, `u16`, `u32`, `u64` | little-endian |
 | `bool` | `u8`: 0 = false, 1 = true; anything else is invalid |
 | `bytes` | `u32` length, then that many bytes |
+| `mac` | 6 bytes, a MAC address in wire order (`02 ca 00 00 00 01` is `02:ca:00:00:00:01`) |
 | `string` | `bytes` holding UTF-8; invalid UTF-8 is invalid |
 | `option<T>` | `u8` tag: 0 = none, 1 = followed by a `T`; other tags are invalid |
 | `list<T>` | `u32` count, then that many `T`s |
@@ -118,6 +119,9 @@ The guest reads these values from its sysinfo block (Excalibur spec section 9.5)
 | Tag | Device | Fields |
 |---|---|---|
 | 1 | block storage disk | `source: DiskSource`, `read_only: bool` |
+| 2 | network card (Excalibur spec section 9.8) | `switch: option<string>`, `mac: option<mac>` |
+
+A network card's cable is plugged into one of the server's virtual switches (section 6.7). In `CreateVm`, `switch` is the switch to plug it into when the VM is created (none: unplugged, its link down) and `mac` its address (none: the server makes one up, section 6.7). In `VmList` and `VmInfo` both are what they are at that moment: the switch the card is plugged into now (none once it has been unplugged, or once its VM's machine has ended), and the address it has, made-up or not. A VM has at most 4 cards (Grail's `MAX_NETS`); they are numbered from 0 in the order the profile lists them, among its cards only (disks do not count). A card's address must be an individual (not group), locally administered one (bit 1 of the first byte set, as in `02:..`). More cards, or another address, get `InvalidProfile`.
 
 **DiskSource**:
 
@@ -136,7 +140,17 @@ On a command line a disk is one argument (the crate's `DiskSource::parse`): `lak
 
 **DiskInfo**: `name: string`, `sectors: u64` (512-byte sectors), `readers: u32` (read-only attachments now), `writer: bool` (a writer has it attached).
 
-**Names**: VM and disk names (`validate_name`) are 1 to 64 bytes of lowercase ASCII letters, digits, `.`, `_` and `-`, and
+**SwitchInfo**, one virtual switch: `name: string`, `capture: option<string>` (the file on the server's host it is being captured into, if it is), `ports: list<SwitchPort>` (in the order they were plugged in).
+
+**SwitchPort**, one port of a switch and its counters: `owner: PortOwner`, `mac: mac` (the address of what is plugged in), `in_frames: u64`, `in_bytes: u64` (what the switch received on the port: what the card sent), `out_frames: u64`, `out_bytes: u64` (what it queued for the port, for the card to receive), `dropped: u64` (frames for this port lost because its queue was full). Counters start at 0 when the card is plugged in.
+
+**PortOwner**, what is plugged into a port:
+
+| Tag | Owner | Fields |
+|---|---|---|
+| 1 | a VM's network card | `vm: u32` (id), `card: u8` (its number) |
+
+**Names**: VM, disk and switch names (`validate_name`) are 1 to 64 bytes of lowercase ASCII letters, digits, `.`, `_` and `-`, and
 
 - do not start with `.` or `-`, and do not end with `.`;
 - are not all digits (an all-digit argument is a VM id);
@@ -202,6 +216,8 @@ A failed request is answered by:
 | 16 | `OutOfRange` | a sector range past the end of the disk |
 | 17 | `Io` | the server's host I/O failed |
 | 18 | `Internal` | a server bug or unexpected condition |
+| 19 | `NoSuchSwitch` | no virtual switch with that name (v2) |
+| 20 | `NoSuchCard` | the VM has no network card with that number (v2) |
 
 Codes are never reused. A client shows an unknown code as `error N`. A server never crashes on a bad request: everything a client can send maps to one of these codes.
 
@@ -259,6 +275,14 @@ Codes are grouped by their high byte. Req = request, Rep = reply, Ev = event; C�
 | 0x0502 | `ListDisks` | Req | C→S | `DiskList` |
 | 0x0503 | `DiskList` | Rep | S→C | |
 | 0x0504 | `DiskDelete` | Req | C→S | `Ok` |
+| **0x06xx** | **virtual network** (Avalon) | | | |
+| 0x0601 | `CreateSwitch` | Req | C→S | `Ok` |
+| 0x0602 | `DeleteSwitch` | Req | C→S | `Ok` |
+| 0x0603 | `ListSwitches` | Req | C→S | `SwitchList` |
+| 0x0604 | `SwitchList` | Rep | S→C | |
+| 0x0605 | `AttachCard` | Req | C→S | `Ok` |
+| 0x0606 | `DetachCard` | Req | C→S | `Ok` |
+| 0x0607 | `CaptureSwitch` | Req | C→S | `Ok` |
 
 Any request can also be answered by `Error`. A server answers requests from a group it does not serve with `Error(Unsupported)`.
 
@@ -284,7 +308,7 @@ length 14    Hello  "AVLN"       v1     agent "rt"
 
 | Message | Payload | Notes |
 |---|---|---|
-| `CreateVm` | `name: string`, `profile: HardwareProfile`, `program: bytes` | `program` is an Excalibur ELF executable. The VM is loaded and left in state created. Errors: `InvalidName`, `AlreadyExists`, `InvalidProfile` (also a disk that cannot be opened or attached, see below), `InvalidProgram`, `OverBudget` |
+| `CreateVm` | `name: string`, `profile: HardwareProfile`, `program: bytes` | `program` is an Excalibur ELF executable. The VM is loaded and left in state created, its network cards plugged into the switches the profile names. Errors: `InvalidName`, `AlreadyExists`, `InvalidProfile` (also a disk that cannot be opened or attached, see below, and a bad network card), `NoSuchSwitch` (a card names a switch that does not exist), `AlreadyExists` (a card's address is on its switch already), `InvalidProgram`, `OverBudget`. A create that fails plugs in nothing |
 | `VmCreated` | `id: u32` | ids are never reused while the server runs |
 | `ListVms` | empty | |
 | `VmList` | `vms: list<VmSummary>` | in id order |
@@ -293,8 +317,8 @@ length 14    Hello  "AVLN"       v1     agent "rt"
 | `StartVm` | `vm: VmRef` | created → running |
 | `PauseVm` | `vm: VmRef` | running → paused |
 | `ResumeVm` | `vm: VmRef` | paused → running |
-| `StopVm` | `vm: VmRef` | created, running or paused → stopped. A stopped or exited VM cannot be restarted in v1; destroy it and create a new one |
-| `DestroyVm` | `vm: VmRef` | any state; frees the VM, detaches its clients (`Detached`), and its name can be reused |
+| `StopVm` | `vm: VmRef` | created, running or paused → stopped. A stopped or exited VM cannot be restarted (v2 included); destroy it and create a new one |
+| `DestroyVm` | `vm: VmRef` | any state; frees the VM, unplugs its network cards, detaches its clients (`Detached`), and its name can be reused |
 | `VmStateChanged` | `vm: u32`, `state: VmState` | sent to every client attached to the VM (console or screen) when its state changes, including when its program exits |
 | `Detached` | `vm: u32`, `kind: u8` (1 console, 2 screen) | the server ended an attachment, because the VM was destroyed. Not sent in answer to `ConsoleDetach`/`ScreenDetach` |
 
@@ -335,7 +359,7 @@ The screen is the VM's framebuffer (Excalibur spec section 9.3), the input its k
 | `KeyInput` | `vm: u32`, `key: KeyEvent` | delivered to the VM's keyboard device as if typed into Grail's window |
 | `ScreenDetach` | `vm: u32` | |
 
-Format 0 is XRGB8888: each pixel a little-endian word `0x00RRGGBB` (bytes B, G, R, X), the same as Grail's VRAM. An unchanged screen sends no frames. v1 servers may send only full frames; the rectangle fields let later ones send just what changed without a protocol change.
+Format 0 is XRGB8888: each pixel a little-endian word `0x00RRGGBB` (bytes B, G, R, X), the same as Grail's VRAM. An unchanged screen sends no frames. Servers may send only full frames for now; the rectangle fields let later ones send just what changed without a protocol change.
 
 ### 6.5 Block I/O
 
@@ -372,13 +396,43 @@ There is no message to attach a disk to an existing VM or detach one from it: a 
 
 The Avalon server does not open Lake disks yet: until Lake (#39) lands, a `CreateVm` whose profile names one is refused with `InvalidProfile`.
 
+### 6.7 Virtual network
+
+Avalon's VMs talk to each other over virtual Ethernet switches, kept by the server. A VM's network card (`DeviceSpec` tag 2, Excalibur spec section 9.8) is plugged into at most one switch at a time; frames its guest sends go into that switch, and the frames the switch passes to the card's port are what the guest receives. Switches on one server are separate networks: a frame never crosses from one switch to another.
+
+| Message | Payload | Notes |
+|---|---|---|
+| `CreateSwitch` | `name: string` | a new empty switch. Errors: `InvalidName` (switch names follow the rules for names, section 3), `AlreadyExists`, `OverBudget` (Avalon keeps at most 64 switches) |
+| `DeleteSwitch` | `name: string` | unplugs every card on it (their links go down: their guests see the link-up bit clear, and send into nothing), stops its capture and frees its name. Errors: `NoSuchSwitch` |
+| `ListSwitches` | empty | |
+| `SwitchList` | `switches: list<SwitchInfo>` | in name order, each with its ports and their counters |
+| `AttachCard` | `vm: VmRef`, `card: u8`, `switch: string` | plugs card `card` of the VM into the switch, link up. Errors: `NoSuchVm`, `NoSuchCard`, `NoSuchSwitch`, `Busy` (the card is plugged in already, into this switch or another: detach it first), `AlreadyExists` (a card with its address is on that switch), `InvalidState` (the VM's machine has ended) |
+| `DetachCard` | `vm: VmRef`, `card: u8` | unplugs the card, link down. Errors: `NoSuchVm`, `NoSuchCard`, `InvalidState` (it is not plugged in) |
+| `CaptureSwitch` | `switch: string`, `path: option<string>` | with a path, starts capturing every frame that enters the switch into a new pcap file at `path` on the server's host (replacing any file there); with none, stops and closes the file. Errors: `NoSuchSwitch`, `Busy` (it is being captured already), `Io` (the file cannot be created), `InvalidState` (stopping a switch that is not being captured) |
+
+**Forwarding.** A switch is a learning Ethernet switch. When a frame comes in on a port, the switch learns that its source address is reachable through that port, then sends it on: to the one port its destination address was learned on; to every other port (**flooding**) if the destination has not been learned, or is a broadcast or multicast (group) address; nowhere (**filtered**) if the destination was learned on the port the frame came in on. Group source addresses are never learned. A learned address is forgotten when no frame from it has come in for 300 seconds (**ageing**), so a card that moves to another port or switch is found again by flooding, and when its card is unplugged. A switch learns at most 4096 addresses: when its table is full of fresh entries, frames from new addresses are still forwarded, but their addresses are not learned. Frames shorter than an Ethernet header (14 bytes) are counted and captured, but not forwarded.
+
+**Queues and drops.** Each port has a queue of at most 256 frames waiting for its card. A frame for a full queue is dropped and counted in that port's `dropped`: a card that does not take its frames (its VM paused, stopped, slow, or never started) loses its own frames, never anybody else's, and the VM that sends is never held up by the one that does not receive. Frames still queued when a card is unplugged are lost. A card takes frames as its guest receives them; a VM idling in `wfi` is woken when a frame arrives for it.
+
+**Addresses.** A card whose profile gives no address gets `02` followed by five bytes of a hash of the VM's name and the card's number (64-bit FNV-1a over the name's bytes, a 0 byte and the card number; then the hash's five most significant bytes, most significant first: VM `web`'s card 0 is `02:66:b7:0f:2e:09`). The same VM name always gets the same addresses, across re-creations and server restarts, so guests' ARP caches stay valid. Two ports of one switch never have the same address: plugging in a card whose address is on the switch already is refused with `AlreadyExists`.
+
+**Life time.** A switch exists until `DeleteSwitch`, or until the server stops. A card stays plugged in while its VM's machine exists; when the machine ends (the VM is stopped, its program exits, or the VM is destroyed) the card is unplugged, its port disappears from `SwitchList`, and it cannot be plugged in again (`InvalidState`). The VM's profile in `VmList` and `VmInfo` keeps the card, with its address and no switch. A card that is unplugged sends into nothing: its guest's frames are counted nowhere and lost, as on a card with no cable.
+
+**Captures.** A capture writes the classic libpcap format that Wireshark and tcpdump read, exactly as Grail's `--pcap FILE` does (Excalibur spec section 9.8): one record per frame that enters the switch, from any port, before it is forwarded. Frames are written by a thread of the server's own; if it falls more than 1024 frames behind (a slow disk), the frames past that are left out of the capture, but still forwarded. Deleting the switch ends its capture.
+
 ## 7. Versioning
 
-- The protocol version is a `u16`, currently **1** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
+- The protocol version is a `u16`, currently **2** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
 - Any change to the catalogue bumps the version: a new message type, a new field, a new enum variant or tag, a changed layout or a changed rule. (Unknown codes and tags are errors in the decoder, so an old peer could not read them anyway.)
 - Three things never change, in any version, so that peers of different versions can always tell each other so: the frame header (`u32` length, `u16` type), the `Hello` and `Welcome` messages (codes 0x0001 and 0x0002 and their layouts) and the `Error` message (code 0x0003 and its layout). Error codes are never reused or renumbered; new ones may be added with a version bump.
 - Things that are deliberately open-ended and need no new version: `DeviceEntry.kind` (sysinfo device type codes come from the Excalibur spec), `ScreenAttached.format` values a server chooses to send, free-text fields.
-- This document describes version 1. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
+- This document describes version 2. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
+
+Changes from version 1 to 2:
+
+- The virtual network group 0x06xx (section 6.7): `CreateSwitch`, `DeleteSwitch`, `ListSwitches`, `SwitchList`, `AttachCard`, `DetachCard`, `CaptureSwitch`, with the structures `SwitchInfo`, `SwitchPort` and `PortOwner` and the field type `mac`.
+- `DeviceSpec` tag 2, a network card.
+- Error codes 19 `NoSuchSwitch` and 20 `NoSuchCard`.
 
 ## 8. Limits
 
@@ -387,7 +441,11 @@ The Avalon server does not open Lake disks yet: until Lake (#39) lands, a `Creat
 | `MAX_FRAME_LEN` | 16 MiB | largest `length` field |
 | `MAX_BLOCK_SECTORS` | 2048 (1 MiB) | per `BlockRead`/`BlockWrite` |
 | `SECTOR_SIZE` | 512 | block I/O |
-| `MAX_NAME_LEN` | 64 | VM and disk names |
+| `MAX_NAME_LEN` | 64 | VM, disk and switch names |
+| network cards | 4 per VM | `CreateVm` (`InvalidProfile`) |
+| switches | 64 per Avalon server | `CreateSwitch` (`OverBudget`) |
+| port queue | 256 frames | per switch port; more are dropped and counted |
+| learned addresses | 4096 per switch, forgotten after 300 s | |
 | default Avalon address | `127.0.0.1:7400` | |
 | default Lake address | `127.0.0.1:7401` | |
 

@@ -12,7 +12,7 @@ profile names lake://ADDR/NAME use them as disks.
   --dir DIR       the images directory (created if it does not exist). Each disk is
                   a raw image file there, named after the disk
   --listen ADDR   where to listen: host:port, or a host or IP address for port 7401
-                  (default 127.0.0.1:7401). Protocol v1 has no authentication, so
+                  (default 127.0.0.1:7401). The protocol has no authentication, so
                   anything but a loopback address lets anyone who can reach it read,
                   write and delete the disks
   -h, --help      show this text

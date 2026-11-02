@@ -69,8 +69,8 @@ fn against_avalon() {
     assert_eq!(
         stdout(&out),
         "\
-ID  NAME  STATE    RAM     CLOCK       DISKS
-1   cli   created  16 MiB  full speed  0
+ID  NAME  STATE    RAM     CLOCK       DISKS  NETS
+1   cli   created  16 MiB  full speed  0      0
 "
     );
     let out = round_table(&["--server", &addr, "start", "cli"]);

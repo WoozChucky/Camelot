@@ -51,9 +51,9 @@ fn life_cycle() {
     assert_eq!(
         ok(addr, &["list"]),
         "\
-ID  NAME  STATE      RAM     CLOCK       DISKS
-1   echo  created    64 MiB  1 MHz       0
-2   sys   exited(0)  32 MiB  full speed  0
+ID  NAME  STATE      RAM     CLOCK       DISKS  NETS
+1   echo  created    64 MiB  1 MHz       0      0
+2   sys   exited(0)  32 MiB  full speed  0      0
 "
     );
     assert_eq!(
@@ -67,6 +67,7 @@ RAM      64 MiB
 clock    1 MHz (real time)
 steps    0
 disks    none
+nets     none
 {DEVICES}"
         )
     );
@@ -106,15 +107,15 @@ disks    none
     assert_eq!(
         ok(addr, &["list"]),
         "\
-ID  NAME  STATE      RAM     CLOCK       DISKS
-2   sys   exited(0)  32 MiB  full speed  0
+ID  NAME  STATE      RAM     CLOCK       DISKS  NETS
+2   sys   exited(0)  32 MiB  full speed  0      0
 "
     );
     assert_eq!(
         ok(addr, &["create", "--name", "echo", &echo]),
         "created VM 3 (echo)\n"
     );
-    assert!(ok(addr, &["list"]).contains("\n3   echo  created    128 MiB  full speed  0\n"));
+    assert!(ok(addr, &["list"]).contains("\n3   echo  created    128 MiB  full speed  0      0\n"));
     assert_eq!(ok(addr, &["destroy", "2"]), "destroyed VM 2\n");
     assert_eq!(ok(addr, &["destroy", "3"]), "destroyed VM 3\n");
     assert_eq!(ok(addr, &["list"]), "no VMs\n");
@@ -155,11 +156,13 @@ fn disks_are_attached_at_create() {
     );
     let info = ok(addr, &["info", "disky"]);
     assert!(
-        info.contains(&format!("\ndisks    {image} (read-write)\ndevices  10\n")),
+        info.contains(&format!(
+            "\ndisks    {image} (read-write)\nnets     none\ndevices  10\n"
+        )),
         "{info}"
     );
     assert!(info.contains("\n  block     0x"), "{info}");
-    assert!(ok(addr, &["list"]).contains("\n1   disky  exited(0)  128 MiB  full speed  1\n"));
+    assert!(ok(addr, &["list"]).contains("\n1   disky  exited(0)  128 MiB  full speed  1      0\n"));
 
     // Two disks, in order, the second read-only.
     ok(
@@ -178,7 +181,7 @@ fn disks_are_attached_at_create() {
     let info = ok(addr, &["info", "two"]);
     assert!(
         info.contains(&format!(
-            "\ndisks    {image} (read-only)\n         {image} (read-only)\ndevices  11\n"
+            "\ndisks    {image} (read-only)\n         {image} (read-only)\nnets     none\ndevices  11\n"
         )),
         "{info}"
     );
@@ -253,7 +256,7 @@ fn disks_are_released_when_the_machine_ends() {
     wait_for_open(run, true);
     ok(addr, &["stop", "run"]);
     wait_for_open(run, false);
-    assert!(ok(addr, &["list"]).contains("\n1   run   stopped  128 MiB  full speed  1\n"));
+    assert!(ok(addr, &["list"]).contains("\n1   run   stopped  128 MiB  full speed  1      0\n"));
     let info = ok(addr, &["info", "run"]);
     assert!(
         info.contains(&format!("\ndisks    {} (read-write)\n", arg(run))),
