@@ -7,8 +7,8 @@ Status: draft. Base is stock RISC-V, plus the Xcal extensions in section 9.
 ## 1. Overview
 
 - 32-bit, little-endian, load/store architecture.
-- Base: **RV32I** (unprivileged spec 20191213), plus **Zicsr** and **Zifencei**.
-- Planned extensions, in order: **M** (mul/div), **A** (atomics, needed once the kernel has locks), **C** optional and late.
+- Base ISA: **RV32IMA + Zicsr + Zifencei**: RV32I (unprivileged spec 20191213), **M** (multiply/divide) and **A** (atomics: LR/SC and AMOs, section 4.1).
+- Planned extensions: **C** optional and late.
 - Privilege: **M-mode** and **S-mode**, plus **U-mode** for user programs. Follows the RISC-V privileged spec (20211203) subset described below.
 - Goal: a stock RV32I program built with `riscv32i-unknown-none-elf` runs unmodified. Custom features (Excalibur extensions, prefixed `xcal`, e.g. `Xcaldbg`) are additive and never change the meaning of standard encodings.
 
@@ -59,12 +59,50 @@ Immediates are sign-extended from their top bit. B and J immediates are multiple
 | 0100011 STORE | `sb sh sw` |
 | 0010011 OP-IMM | `addi slti sltiu xori ori andi slli srli srai` |
 | 0110011 OP | `add sub sll slt sltu xor srl sra or and` (+ M: `mul mulh mulhsu mulhu div divu rem remu`, funct7=0000001) |
+| 0101111 AMO | A, funct3=010 (word): `lr.w sc.w amoswap.w amoadd.w amoxor.w amoand.w amoor.w amomin.w amomax.w amominu.w amomaxu.w`, each with `.aq`/`.rl`/`.aqrl` (section 4.1) |
 | 0001111 MISC-MEM | `fence`, `fence.tso`, `fence.i` (reserved `fm`/rd/rs1 encodings execute as a plain `fence`; Grail is single-hart, so all are no-ops) |
 | 1110011 SYSTEM | `ecall ebreak mret sret wfi sfence.vma csrrw csrrs csrrc csrrwi csrrsi csrrci` |
 | 0001011 custom-0 | Xcal: `xcal.dbg`, `xcal.halt` (section 9) |
 | 0101011 custom-1 | reserved for future Xcal extensions |
 
 Misaligned loads/stores trap (address-misaligned exception) rather than being emulated. This keeps the emulator simple and is spec-legal. Consequence: riscv-tests `rv32ui-p-ma_data`, which assumes hardware misaligned support, is excluded.
+
+### 4.1 A extension (atomics)
+
+All A instructions are R-type on the AMO opcode with funct3 = 010 (32-bit word; the `.d` forms are RV64 only). funct7 is split: funct5 in bits [31:27] selects the instruction, bit 26 is `aq` and bit 25 is `rl`:
+
+```
+funct5[31:27] aq[26] rl[25] rs2[24:20] rs1[19:15] 010 rd[11:7] 0101111
+```
+
+| funct5 | Instruction | Effect (`M` = the word at address rs1) |
+|---|---|---|
+| 00010 | `lr.w rd, (rs1)` | rd = M; reserve M. rs2 must be 0 (else reserved: illegal instruction) |
+| 00011 | `sc.w rd, rs2, (rs1)` | if M is reserved: M = rs2, rd = 0; else rd = 1. The reservation is gone either way |
+| 00001 | `amoswap.w rd, rs2, (rs1)` | rd = M; M = rs2 |
+| 00000 | `amoadd.w` | rd = M; M = M + rs2 |
+| 00100 | `amoxor.w` | rd = M; M = M ^ rs2 |
+| 01100 | `amoand.w` | rd = M; M = M & rs2 |
+| 01000 | `amoor.w` | rd = M; M = M \| rs2 |
+| 10000 / 10100 | `amomin.w` / `amomax.w` | rd = M; M = signed min / max(M, rs2) |
+| 11000 / 11100 | `amominu.w` / `amomaxu.w` | rd = M; M = unsigned min / max(M, rs2) |
+
+Other funct5 values (`amocas.w` of Zacas, ...) are reserved and raise illegal-instruction. Assembly writes the ordering bits as a suffix: none, `.aq`, `.rl` or `.aqrl` (`amoadd.w.aqrl`). The address is written `(rs1)`, or `0(rs1)`; there is no offset field. Grail runs one hart, one instruction at a time, so an AMO is atomic by construction and `aq`/`rl` change nothing; they are still encoded, decoded and disassembled.
+
+Addresses (checked in this order):
+
+- **Alignment**: the address must be 4-byte aligned. A misaligned `lr.w` raises load address misaligned (4); a misaligned `sc.w` (even one that would fail) or AMO raises store/AMO address misaligned (6). `xtval` = the address.
+- **Translation** (Sv32): `lr.w` is checked and sets A like a load (load page fault, 13); `sc.w` and the AMOs like a store: the page must be writable, A and D are set, and a fault is a store/AMO page fault (15).
+- **Memory only**: atomics work on RAM and VRAM. On any other physical address (device registers, the boot ROM, unmapped space) `lr.w` raises a load access fault (5), `sc.w` and the AMOs a store/AMO access fault (7). Device registers are not read or written.
+
+**Reservations.** Each hart has one reservation set: the naturally aligned word `lr.w` read, by physical address (so two virtual mappings of a word share it). A new `lr.w` replaces it. `sc.w` succeeds only if the hart holds a reservation on the word it writes. A `sc.w` with no reservation at all fails without accessing memory: no translation, no page fault, no A/D update (it still traps if misaligned). With a reservation, the address is translated and checked first (faults as above, A/D set), then compared. The reservation is lost when:
+
+- the hart executes any `sc.w`;
+- the hart takes a trap (exception or interrupt);
+- any write touches a byte of the reserved word: a store, an AMO, a successful `sc.w`, or a hardware A/D update of a PTE (so an LR/SC update of a PTE cannot overwrite a bit the page walker just set). On a multi-hart machine this includes writes by other harts;
+- the hart stores to a device register: the store may start a DMA (the block device's, section 9.6) that writes RAM without a hart storing there.
+
+The constrained LR/SC loop (an `lr.w`, a few ALU instructions and a `sc.w` to the same word) always succeeds on Grail unless an interrupt arrives in between, in which case the loop retries.
 
 ## 5. Privilege and CSRs
 
@@ -75,7 +113,7 @@ Minimum CSR set:
 | CSR | Addr | Notes |
 |---|---|---|
 | mstatus | 0x300 | MIE, MPIE, MPP, SIE, SPIE, SPP, SUM, MXR |
-| misa | 0x301 | RV32, I, M, S, U, X (read-only) |
+| misa | 0x301 | RV32, A, I, M, S, U, X: 0x4094_1101 (read-only) |
 | medeleg / mideleg | 0x302 / 0x303 | delegate traps to S-mode (section 6, "Delegation") |
 | mie / mip | 0x304 / 0x344 | MSIE/MTIE/MEIE, SSIE/STIE/SEIE |
 | mtvec | 0x305 | direct mode required, vectored optional |
@@ -101,7 +139,7 @@ On a trap taken into mode X (M, or S if delegated and current mode is not M):
 
 `mret`/`sret` reverse this.
 
-Exception causes implemented: 0 instr misaligned, 1 instr access fault, 2 illegal instruction, 3 breakpoint, 4 load misaligned, 5 load access fault, 6 store misaligned, 7 store access fault, 8 ecall from U, 9 ecall from S, 11 ecall from M, 12/13/15 page faults (with Sv32).
+Exception causes implemented: 0 instr misaligned, 1 instr access fault, 2 illegal instruction, 3 breakpoint, 4 load misaligned, 5 load access fault, 6 store/AMO misaligned, 7 store/AMO access fault, 8 ecall from U, 9 ecall from S, 11 ecall from M, 12/13/15 instruction/load/store-AMO page faults (with Sv32).
 
 Interrupt causes: 1 SSI, 3 MSI, 5 STI, 7 MTI, 9 SEI, 11 MEI.
 
@@ -179,7 +217,7 @@ Typical handler: claim, service the device until it lowers its line (for the UAR
 
 ## 8. Emulator conformance
 
-- Pass `riscv-tests` rv32ui-p-*, rv32mi-p-*, rv32si-p-* (and rv32um-p-* once M is in). Tests are loaded as ELF and report via the test device (or `tohost` symbol).
+- Pass `riscv-tests` rv32ui-p-*, rv32um-p-*, rv32ua-p-*, rv32mi-p-* and rv32si-p-* (all but `rv32ui-p-ma_data`, section 4). Tests are loaded as ELF and report via the test device (or `tohost` symbol).
 - Prebuilt test ELFs are committed to the repo so no cross toolchain is needed on Windows.
 
 ## 9. Excalibur extensions (Xcal)
@@ -442,16 +480,16 @@ All reading goes through one crate, `elf32` (header, program headers, sections, 
 
 ### Assembler (`merlin-as`)
 
-`merlin-as [-o out.o] input.s`. The reference is clang's integrated assembler with `-march=rv32im_zicsr_zifencei -mno-relax`: for the same source, `llvm-objdump -dr` must print the same text for both objects (checked for every source in `examples/`, which clang assembles with `-include examples/xcal.inc`), and every encoding matches llvm-mc (`crates/merlin-as/tests/golden/encode.golden`). The encoder, the pseudo-instruction expansions and `li`'s choice of sequence are documented in `crates/merlin-as/ENCODER.md`.
+`merlin-as [-o out.o] input.s`. The reference is clang's integrated assembler with `-march=rv32ima_zicsr_zifencei -mno-relax` (the examples use no A instructions and are compared with `rv32im_zicsr_zifencei` builds): for the same source, `llvm-objdump -dr` must print the same text for both objects (checked for every source in `examples/`, which clang assembles with `-include examples/xcal.inc`), and every encoding matches LLVM's (`crates/merlin-as/tests/golden/encode.golden`). The encoder, the pseudo-instruction expansions and `li`'s choice of sequence are documented in `crates/merlin-as/ENCODER.md`.
 
 - **Single pass.** No instruction's size depends on a label's address; `.equ`/`.set` constants must be defined before use. Every label reference is first recorded as a fixup with its immediate left zero.
 - **Local labels are resolved by the assembler**, as clang does with `-mno-relax`. When the file has been read, a pc-relative reference to a label that is local (not `.globl`, also when `.globl` comes later in the file) and defined in the same section is patched in and gets no relocation: branches, `jal`/`j`, `call`/`tail` (both words), and `auipc` + `%pcrel_lo` pairs (`la`, `lla`, `lw rd, sym`, `sw rs, sym, rt`, explicit `%pcrel_hi`/`%pcrel_lo`). A branch or jump out of range is an error on its line. Everything else stays a relocation for the linker: references to global or undefined symbols, to labels in other sections, and absolute ones (`%hi`, `%lo`, `.word sym`).
 - **`.`** is the location counter: the address of the instruction (its first word, for a pseudo-instruction) or data word it appears in. Each use becomes a hidden local label there, so `j .`, `beq a0, a1, .-8` and `la a0, .` resolve like any local label, and `.word .` gets an `R_RISCV_32` against that label (clang's `.L0`).
 - **Symbols**: `.L` labels (numeric labels like `1:`, hidden `.Lpcrel_hiN` labels on `auipc`s, `.Ldot$N` labels for `.`) are written to `.symtab` only when a relocation refers to them, as in clang.
 - **`.insn`** spells out an instruction by fields, with LLVM's forms and encodings: `.insn r opcode, funct3, funct7, rd, rs1, rs2`, `.insn i opcode, funct3, rd, rs1, imm` (or `rd, imm(rs1)`), `.insn s opcode, funct3, rs2, imm(rs1)`, `.insn b opcode, funct3, rs1, rs2, target`, `.insn u opcode, rd, imm20`, and `.insn value` / `.insn 4, value`. Opcodes must be 32-bit ones (low bits `11`). The examples write the Xcal instructions as mnemonics (`xcal.dbg a0`); clang does not know them, so `examples/xcal.inc` defines them as assembler macros that expand to the `.insn` with the same encoding, and clang reference builds pass `-include examples/xcal.inc`.
-- **`.riscv.attributes`**: every object carries clang's `Tag_RISCV_arch` for `rv32im_zicsr_zifencei` (`rv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0`), so llvm-objdump decodes M instructions without `--mattr`.
+- **`.riscv.attributes`**: every object carries clang's `Tag_RISCV_arch` for `rv32ima_zicsr_zifencei` (`rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0`), so llvm-objdump decodes M and A instructions without `--mattr`.
 - **Differences from clang**, on purpose:
-  - No branch relaxation. clang rewrites a conditional branch it cannot resolve or reach (to a global or undefined symbol, another section, or beyond ±4 KiB) into the inverted branch over a `jal`, even with `-mno-relax`; merlin-as keeps one instruction with `R_RISCV_BRANCH`, or reports the branch out of range. (llvm-mc's `-riscv-asm-relax-branches=0` behaves like merlin-as; the golden encodings are made with it.)
+  - No branch relaxation. clang rewrites a conditional branch it cannot resolve or reach (to a global or undefined symbol, another section, or beyond ±4 KiB) into the inverted branch over a `jal`, even with `-mno-relax`; merlin-as keeps one instruction with `R_RISCV_BRANCH`, or reports the branch out of range. (llvm-mc 18's `-riscv-asm-relax-branches=0` behaves like merlin-as, and made the golden lines for such branches; LLVM 21 no longer has the option, so `scripts/gen-encode-golden.sh` keeps those lines and assembles the rest with clang.)
   - A numeric label that a relocation refers to is named `.L<n>$<k>` (the k-th definition of `n:`); clang names it `.Ltmp<m>`. No `$x`/`$d` mapping symbols are written.
   - `.insn j` is not accepted: LLVM 21 packs its numeric offset without the J-type bit scrambling.
   - Register names are never symbols: `lw a0, a1` is an error, where LLVM reads `a1` as a symbol.
@@ -693,7 +731,7 @@ camelot>
 4. **merlin-as** emitting ELF `.o`. Validate with `llvm-objdump` and ld.lld.
 5. **merlin-ld**. Validate against clang-produced objects.
 6. **Bare-metal hello world** written in our assembly, built entirely with our tools.
-7. **M extension** in merlin-as (Grail already passes rv32um). **Xcal devices** in Grail: framebuffer window, keyboard and pointer via Win32 FFI, sysinfo, block devices with pluggable backends, and a configurable machine (RAM size, real-time clock, disks) that a host can run several of.
+7. **M extension** in merlin-as (Grail already passes rv32um), then the **A extension** (LR/SC and AMOs, section 4.1) in Grail and the toolchain. **Xcal devices** in Grail: framebuffer window, keyboard and pointer via Win32 FFI, sysinfo, block devices with pluggable backends, and a configurable machine (RAM size, real-time clock, disks) that a host can run several of.
 8. **Merlin v0**: C subset → assembly. Grow it test by test (integer types, pointers, arrays, globals and strings done; structs, preprocessor and the rest tracked in #15).
 9. **Camelot kernel** in C (clang first, our compiler as it catches up): trap handling, timer, UART driver, then paging (Sv32), processes, syscalls.
 10. **Self-hosting stretch goal**: our tools running on our OS.

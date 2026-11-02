@@ -59,6 +59,11 @@ fn rv32um() {
 }
 
 #[test]
+fn rv32ua() {
+    run_suite("rv32ua-p-");
+}
+
+#[test]
 fn rv32mi() {
     run_suite("rv32mi-p-");
 }

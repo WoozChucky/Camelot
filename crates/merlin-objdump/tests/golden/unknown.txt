@@ -20,6 +20,8 @@ isa-o.d	     280: 00000000     	.word	0x00000000
 isa-o.d	     2b0: 0005000b     	xcal.dbg	a0
 isa-o.d	     2f4: 8ff0000f     	fence
 isa-o.d	     300: 0010100f     	fence.i
+isa-o.d	     358: 1015a52f     	.word	0x1015a52f
+isa-o.d	     35c: 2805a52f     	.word	0x2805a52f
 isa-o.d-no-aliases	     1f4:      	xcal.dbg	a0
 isa-o.d-no-aliases	     1f8:      	xcal.halt	zero
 isa-o.d-no-aliases	     1fc:      	.word	0x00000000
@@ -32,6 +34,8 @@ isa-o.d-no-aliases	     280:      	.word	0x00000000
 isa-o.d-no-aliases	     2b0:      	xcal.dbg	a0
 isa-o.d-no-aliases	     2f4:      	fence	iorw, iorw
 isa-o.d-no-aliases	     300:      	fence.i
+isa-o.d-no-aliases	     358:      	.word	0x1015a52f
+isa-o.d-no-aliases	     35c:      	.word	0x2805a52f
 linked-elf.d	80000022: 8067fe9f     	.word	0x8067fe9f
 linked-elf.d	80000026: 00           	.byte	0x00
 linked-elf.d	80000027: 00           	.byte	0x00
