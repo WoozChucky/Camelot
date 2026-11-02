@@ -9,6 +9,8 @@ const USAGE: &str = "usage: cargo xtask <task> [options]
 
 tasks:
   kernel       build kernel/kernel.elf (clang + ld.lld from the official LLVM install)
+  hello        assemble examples/hello/hello.S with merlin-as, link it with ld.lld
+               into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
   ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj, llvm-objdump);
                takes --clang, --lld and -v like kernel
 
@@ -64,6 +66,17 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("hello") => match parse_kernel_args(&args[1..]) {
+            Ok(k) if k.clang.is_none() && k.assembler.is_none() && k.out.is_none() && !k.run => hello(k),
+            Ok(_) => {
+                eprintln!("xtask: hello takes only --lld and -v\n{USAGE}");
+                ExitCode::from(2)
+            }
+            Err(e) => {
+                eprintln!("xtask: {e}\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
         Some("ld-fixtures") => match parse_kernel_args(&args[1..]) {
             Ok(k) if k.assembler.is_none() && k.out.is_none() && !k.run => ld_fixtures(k),
             Ok(_) => {
@@ -88,6 +101,29 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn hello(k: KernelArgs) -> ExitCode {
+    let Some(lld) = k.lld.or_else(|| tools::find("ld.lld")) else {
+        eprintln!("xtask: ld.lld not found; pass --lld PATH");
+        return ExitCode::FAILURE;
+    };
+    let root = repo_root();
+    let work = root.join("target").join("hello");
+    let elf = match xtask::hello::build(&root, &lld, &work, k.verbose) {
+        Ok(elf) => elf,
+        Err(e) => {
+            eprintln!("xtask: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let out = root.join(xtask::hello::GOLDEN);
+    if let Err(e) = std::fs::write(&out, elf) {
+        eprintln!("xtask: cannot write {}: {e}", out.display());
+        return ExitCode::FAILURE;
+    }
+    eprintln!("built {}", out.display());
+    ExitCode::SUCCESS
 }
 
 fn ld_fixtures(k: KernelArgs) -> ExitCode {

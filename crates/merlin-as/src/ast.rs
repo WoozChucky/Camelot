@@ -21,6 +21,16 @@ impl Modifier {
             _ => return None,
         })
     }
+
+    /// As written in source: `%hi`, `%lo`, `%pcrel_hi`, `%pcrel_lo`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Modifier::Hi => "%hi",
+            Modifier::Lo => "%lo",
+            Modifier::PcrelHi => "%pcrel_hi",
+            Modifier::PcrelLo => "%pcrel_lo",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

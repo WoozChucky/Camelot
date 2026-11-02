@@ -8,11 +8,18 @@
 //! section header table
 //! ```
 //!
-//! Section header order: null, user sections, one .rela.X per section that
-//! has relocations, .symtab, .strtab, .shstrtab.
+//! Section header order: null, user sections, .riscv.attributes, one .rela.X
+//! per section that has relocations, .symtab, .strtab, .shstrtab.
 
 use crate::asm::{Object, SectionKind, SymType};
 
+/// The ISA merlin-as assembles, in the psABI's `Tag_RISCV_arch` spelling:
+/// exactly what clang writes for `-march=rv32im_zicsr_zifencei` (M implies
+/// Zmmul). Without it llvm-objdump assumes plain RV32I and prints the M
+/// instructions as `<unknown>`.
+pub const ARCH: &str = "rv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0";
+
+const SHT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
@@ -74,6 +81,25 @@ fn align(b: &mut Vec<u8>, a: usize) {
     }
 }
 
+/// Contents of `.riscv.attributes` (psABI "Attributes"): format version `A`,
+/// then one vendor subsection `riscv` holding one `Tag_File` subsubsection
+/// with `Tag_RISCV_arch` = [`ARCH`]. Lengths count themselves.
+pub fn riscv_attributes() -> Vec<u8> {
+    const TAG_FILE: u8 = 1;
+    const TAG_RISCV_ARCH: u8 = 5;
+    let mut file = vec![TAG_FILE];
+    put32(&mut file, (1 + 4 + 1 + ARCH.len() + 1) as u32);
+    file.push(TAG_RISCV_ARCH);
+    file.extend_from_slice(ARCH.as_bytes());
+    file.push(0);
+
+    let mut out = vec![b'A'];
+    put32(&mut out, (4 + b"riscv\0".len() + file.len()) as u32);
+    out.extend_from_slice(b"riscv\0");
+    out.extend_from_slice(&file);
+    out
+}
+
 pub fn write(obj: &Object) -> Vec<u8> {
     let mut shstr = StrTab::new();
     let mut strtab = StrTab::new();
@@ -113,6 +139,20 @@ pub fn write(obj: &Object) -> Vec<u8> {
             entsize: 0,
         });
     }
+
+    let attributes = riscv_attributes();
+    shdrs.push(Shdr {
+        name: shstr.add(".riscv.attributes"),
+        ty: SHT_RISCV_ATTRIBUTES,
+        flags: 0,
+        offset: out.len() as u32,
+        size: attributes.len() as u32,
+        link: 0,
+        info: 0,
+        align: 1,
+        entsize: 0,
+    });
+    out.extend_from_slice(&attributes);
 
     // Symbol table: null, locals, then globals (ELF requires locals first).
     // Undefined symbols are always global.
@@ -250,4 +290,23 @@ pub fn write(obj: &Object) -> Vec<u8> {
     put16(&mut hdr, shdrs.len() as u16 - 1); // e_shstrndx
     out[..52].copy_from_slice(&hdr);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attributes_match_clang() {
+        // `llvm-objdump -s -j .riscv.attributes` of examples/hello/hello.S
+        // built by clang 21 with -march=rv32im_zicsr_zifencei.
+        let clang = "413c0000 00726973 63760001 32000000 05727633 32693270 315f6d32 70305f7a \
+                     69637372 3270305f 7a696665 6e636569 3270305f 7a6d6d75 6c317030 00";
+        let hex: String = clang.split_whitespace().collect();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(riscv_attributes(), bytes);
+    }
 }
