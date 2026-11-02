@@ -17,158 +17,14 @@
 //! deterministic: time is Grail's steps, the forwarded port's gateway included. Only
 //! that test goes through real host sockets, and its waits for them are bounded.
 
-use grail::net::{Hub, HubPort, MacAddr, NetBackend, POLL_STEPS};
-use grail::{Machine, MachineConfig, NetConfig, RunResult};
-use std::collections::{HashMap, VecDeque};
+mod common;
+
+use common::*;
+use grail::net::{Hub, MacAddr, NetBackend};
+use grail::NetConfig;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-/// 16 MiB boots faster than the default 128 (the kernel puts every page on its free
-/// list) and is plenty.
-const RAM: usize = 16 << 20;
-/// Steps a machine runs per turn.
-const SLICE: u64 = 2_000;
-/// More than any wait here needs: a boot is about 10 million steps with 16 MiB, a
-/// command a few million at most.
-const MAX_STEPS: u64 = 400_000_000;
-
-const SHELL_BANNER: &str = "Type help for the list of commands.\n";
-const PROMPT: &str = "$ ";
-
-fn kernel_elf() -> Vec<u8> {
-    std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel/kernel.elf")).unwrap()
-}
-
-/// Addresses as the kernel's variables hold them: in host order.
-fn ip(a: [u8; 4]) -> u32 {
-    u32::from_be_bytes(a)
-}
-
-/// The kernel's static network configuration (kernel/net/net.c), to patch into a
-/// machine's RAM before it boots: no DHCP, this address and mask, no gateway.
-fn static_config(addr: [u8; 4], mask: [u8; 4]) -> Vec<(&'static str, u32)> {
-    vec![
-        ("net_dhcp", 0),
-        ("net_static_addr", ip(addr)),
-        ("net_static_mask", ip(mask)),
-        ("net_static_gateway", 0),
-    ]
-}
-
-/// A Camelot machine: the kernel with its UART captured and fed through `input`.
-struct Vm {
-    m: Machine,
-    input: Sender<u8>,
-    /// The address of the packet buffer pool's free count (`free_count` in
-    /// kernel/net/pbuf.c).
-    free_count: u32,
-}
-
-impl Vm {
-    /// The kernel on a machine with `config`'s cards and `cards`, with the kernel
-    /// variables in `patches` set.
-    fn new(nets: Vec<NetConfig>, cards: Vec<(MacAddr, Box<dyn NetBackend>)>, patches: &[(&str, u32)]) -> Vm {
-        let config = MachineConfig {
-            ram_size: RAM,
-            nets,
-            ..MachineConfig::default()
-        };
-        let mut m = Machine::with_devices(config, Vec::new(), cards).unwrap();
-        m.cpu.bus.uart.capture = true;
-        let file = kernel_elf();
-        m.load_elf(&file).unwrap();
-        let elf = grail::elf::parse(&file).unwrap();
-        for (name, value) in patches {
-            let addr = elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"));
-            m.cpu.bus.load(addr, &value.to_le_bytes()).unwrap();
-        }
-        let free_count = elf.symbol("free_count").expect("no symbol free_count");
-        let (input, rx) = channel();
-        m.set_uart_input(rx);
-        Vm { m, input, free_count }
-    }
-
-    fn out(&self) -> String {
-        String::from_utf8_lossy(&self.m.cpu.bus.uart.captured).into_owned()
-    }
-
-    /// Prompts printed so far: one when the shell starts, one after each command.
-    fn prompts(&self) -> usize {
-        self.out().matches(&format!("\n{PROMPT}")).count()
-    }
-
-    fn type_line(&self, line: &str) {
-        for b in line.bytes().chain(std::iter::once(b'\n')) {
-            self.input.send(b).unwrap();
-        }
-    }
-}
-
-/// Runs the machines in turns, letting `host` (if any) see what they send between
-/// turns, until `done` holds. Panics if a machine stops or the steps run out.
-fn run_until(vms: &mut [&mut Vm], mut host: Option<&mut Host>, done: impl Fn(&[&mut Vm]) -> bool) {
-    let mut steps = 0;
-    while !done(vms) {
-        for vm in vms.iter_mut() {
-            vm.m.run_for(SLICE, &mut |_| {});
-            assert_eq!(vm.m.exit_code(), None, "a machine stopped:\n{}", vm.out());
-        }
-        if let Some(h) = host.as_deref_mut() {
-            h.service();
-        }
-        steps += SLICE;
-        assert!(steps < MAX_STEPS, "no end in sight:\n{}", vms[0].out());
-    }
-}
-
-/// Boots the machines until each shows its first prompt.
-fn boot(vms: &mut [&mut Vm], host: Option<&mut Host>) {
-    run_until(vms, host, |vms| vms.iter().all(|vm| vm.prompts() >= 1));
-}
-
-/// Types `line` into machine `i`'s shell and runs until its next prompt. Returns what
-/// the command printed (after the echoed line, up to the prompt).
-fn command(vms: &mut [&mut Vm], i: usize, host: Option<&mut Host>, line: &str) -> String {
-    let (before, prompts) = (vms[i].out().len(), vms[i].prompts());
-    vms[i].type_line(line);
-    run_until(vms, host, |vms| vms[i].prompts() > prompts);
-    let out = vms[i].out();
-    let text = &out[before..];
-    let text = text
-        .strip_prefix(&format!("{line}\n"))
-        .unwrap_or_else(|| panic!("{line:?} not echoed:\n{out}"));
-    text.strip_suffix(PROMPT).unwrap().to_string()
-}
-
-/// Buffers the kernel's pool holds (`NPBUF`, kernel/include/net.h) and the ones its
-/// card's receive ring always has (`NIC_RX_RING`, kernel/include/nic.h).
-const NPBUF: u32 = 64;
-const NIC_RX_RING: u32 = 16;
-
-/// Checks that every packet buffer is back in the pool but the receive ring's: a path
-/// that forgets to free one would drain the pool, slowly, until the network stops. The
-/// machine runs a little first, idle at its prompt, so the card's last interrupt has
-/// reclaimed what it sent.
-fn assert_buffers_back(vm: &mut Vm) {
-    for _ in 0..50 {
-        vm.m.run_for(SLICE, &mut |_| {});
-    }
-    let free = vm.m.cpu.bus.read_mem(vm.free_count, 4).unwrap();
-    assert_eq!(free, NPBUF - NIC_RX_RING, "packet buffers leaked:\n{}", vm.out());
-}
-
-/// Leaves the shell; the machine must stop with status 0.
-fn exit(vm: &mut Vm) {
-    vm.type_line("exit");
-    assert_eq!(
-        vm.m.run(Some(MAX_STEPS), |_| {}),
-        RunResult::Exited(0),
-        "{}",
-        vm.out()
-    );
-}
+use std::time::Duration;
 
 /// `time=1.234 ms` (which depends on how the machines take turns) as `time=T ms`.
 fn mask_times(s: &str) -> String {
@@ -187,251 +43,6 @@ fn ping_ok(addr: &str, n: u32) -> String {
         s += &format!("64 bytes from {addr}: seq={seq} ttl=64 time=T ms\n");
     }
     s + &format!("{n} sent, {n} received\n")
-}
-
-/// The counters `ifconfig` prints ("name N" after the colon of its counter lines).
-fn counters(ifconfig: &str) -> HashMap<String, u32> {
-    let mut map = HashMap::new();
-    for line in ifconfig.lines() {
-        let Some((head, list)) = line.split_once(": ") else {
-            continue;
-        };
-        if !(head.ends_with("rx dropped") || head.ends_with("other")) {
-            continue;
-        }
-        for item in list.split(", ") {
-            let (name, n) = item.rsplit_once(' ').unwrap();
-            map.insert(name.to_string(), n.parse().unwrap());
-        }
-    }
-    map
-}
-
-/// The frame and byte counts of `ifconfig`'s `rx ... ; tx ...` line.
-fn traffic(ifconfig: &str) -> (u32, u32) {
-    let line = ifconfig
-        .lines()
-        .find(|l| l.starts_with("  rx ") && l.contains("; tx "))
-        .unwrap();
-    let words: Vec<&str> = line.split_whitespace().collect();
-    (words[1].parse().unwrap(), words[6].parse().unwrap())
-}
-
-// ---- crafting frames ----
-//
-// gateway::wire has builders and parsers for all of these, but the test keeps its own,
-// written from the RFCs: the kernel's checksums and layouts are checked against a second,
-// independent implementation, so a mistake shared with the gateway's can't hide.
-
-const IP_TYPE: u16 = 0x0800;
-const ARP_TYPE: u16 = 0x0806;
-
-/// The Internet checksum of `data` (RFC 1071), starting from `sum`.
-fn checksum(data: &[u8], mut sum: u32) -> u16 {
-    for c in data.chunks(2) {
-        sum += (u32::from(c[0]) << 8) | u32::from(*c.get(1).unwrap_or(&0));
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-fn ether(dst: [u8; 6], src: [u8; 6], ty: u16, payload: &[u8]) -> Vec<u8> {
-    let mut f = Vec::new();
-    f.extend_from_slice(&dst);
-    f.extend_from_slice(&src);
-    f.extend_from_slice(&ty.to_be_bytes());
-    f.extend_from_slice(payload);
-    f
-}
-
-/// An IPv4 header without options and `payload`, with a right checksum.
-fn ipv4(src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec<u8> {
-    let mut p = vec![0x45, 0];
-    p.extend_from_slice(&(20 + payload.len() as u16).to_be_bytes());
-    p.extend_from_slice(&[0, 1, 0x40, 0, 64, proto, 0, 0]);
-    p.extend_from_slice(&src);
-    p.extend_from_slice(&dst);
-    let sum = checksum(&p, 0);
-    p[10..12].copy_from_slice(&sum.to_be_bytes());
-    p.extend_from_slice(payload);
-    p
-}
-
-/// Recomputes the header checksum of the IPv4 packet `p` after a change to its header.
-fn fix_ip_checksum(p: &mut [u8]) {
-    let hlen = usize::from(p[0] & 0xf) * 4;
-    p[10..12].fill(0);
-    let sum = checksum(&p[..hlen], 0);
-    p[10..12].copy_from_slice(&sum.to_be_bytes());
-}
-
-fn icmp_echo(ty: u8, id: u16, seq: u16, data: &[u8]) -> Vec<u8> {
-    let mut m = vec![ty, 0, 0, 0];
-    m.extend_from_slice(&id.to_be_bytes());
-    m.extend_from_slice(&seq.to_be_bytes());
-    m.extend_from_slice(data);
-    let sum = checksum(&m, 0);
-    m[2..4].copy_from_slice(&sum.to_be_bytes());
-    m
-}
-
-/// The sum of UDP's pseudo-header, for [`checksum`].
-fn pseudo(src: [u8; 4], dst: [u8; 4], len: usize) -> u32 {
-    let w = |a: [u8; 4]| {
-        u32::from(u16::from_be_bytes([a[0], a[1]])) + u32::from(u16::from_be_bytes([a[2], a[3]]))
-    };
-    w(src) + w(dst) + 17 + len as u32
-}
-
-fn udp(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, data: &[u8]) -> Vec<u8> {
-    let mut u = Vec::new();
-    u.extend_from_slice(&sport.to_be_bytes());
-    u.extend_from_slice(&dport.to_be_bytes());
-    u.extend_from_slice(&(8 + data.len() as u16).to_be_bytes());
-    u.extend_from_slice(&[0, 0]);
-    u.extend_from_slice(data);
-    let sum = checksum(&u, pseudo(src, dst, u.len()));
-    u[6..8].copy_from_slice(&sum.to_be_bytes());
-    u
-}
-
-fn arp(op: u16, sha: [u8; 6], spa: [u8; 4], tha: [u8; 6], tpa: [u8; 4]) -> Vec<u8> {
-    let mut a = vec![0, 1, 8, 0, 6, 4];
-    a.extend_from_slice(&op.to_be_bytes());
-    a.extend_from_slice(&sha);
-    a.extend_from_slice(&spa);
-    a.extend_from_slice(&tha);
-    a.extend_from_slice(&tpa);
-    a
-}
-
-/// An IPv4 packet read from a frame, its header checksum checked.
-struct Packet {
-    src: [u8; 4],
-    dst: [u8; 4],
-    proto: u8,
-    ttl: u8,
-    payload: Vec<u8>,
-}
-
-fn parse_ipv4(frame: &[u8]) -> Option<Packet> {
-    if frame.len() < 34 || frame[12..14] != IP_TYPE.to_be_bytes() {
-        return None;
-    }
-    let p = &frame[14..];
-    let hlen = usize::from(p[0] & 0xf) * 4;
-    let total = usize::from(u16::from_be_bytes([p[2], p[3]]));
-    assert_eq!(checksum(&p[..hlen], 0), 0, "bad IPv4 checksum from the kernel");
-    assert_eq!(p[6] & 0x20, 0, "the kernel never fragments");
-    Some(Packet {
-        src: p[12..16].try_into().unwrap(),
-        dst: p[16..20].try_into().unwrap(),
-        proto: p[9],
-        ttl: p[8],
-        payload: p[hlen..total].to_vec(),
-    })
-}
-
-// ---- the other host, played by this test on a hub port ----
-
-const HOST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x99];
-const HOST_IP: [u8; 4] = [10, 0, 9, 1];
-const VM_IP: [u8; 4] = [10, 0, 9, 2];
-/// The first card attached to a hub gets port 1's address.
-const VM_MAC: [u8; 6] = [0x02, 0xca, 0, 0, 0, 1];
-const MASK: [u8; 4] = [255, 255, 255, 0];
-
-struct Host {
-    port: HubPort,
-    /// Every frame the machine sent, in order, but its ARP requests for HOST_IP.
-    seen: Vec<Vec<u8>>,
-    /// Frames taken from `seen` by [`Host::take`] so far.
-    taken: usize,
-    /// The machine's ARP requests for HOST_IP, all answered. When they come depends on
-    /// how long its cache keeps an entry and how many ticks the test's turns take
-    /// (an idle machine skips to its next timer interrupt), so they are kept apart.
-    asked: Vec<Vec<u8>>,
-    /// Frames this host sent with a length the card takes (14 to 1514 bytes).
-    sent: u32,
-}
-
-impl Host {
-    /// A host on a new port of `hub`.
-    fn new(hub: &Hub) -> Host {
-        Host {
-            port: hub.attach(),
-            seen: Vec::new(),
-            taken: 0,
-            asked: Vec::new(),
-            sent: 0,
-        }
-    }
-
-    fn send(&mut self, frame: Vec<u8>) {
-        if (14..=1514).contains(&frame.len()) {
-            self.sent += 1;
-        }
-        self.port.send(&frame).unwrap();
-    }
-
-    /// Takes what arrived, answering ARP requests for HOST_IP and echo requests to it,
-    /// as a host would.
-    fn service(&mut self) {
-        while let Some(f) = self.port.recv() {
-            if f.len() >= 42
-                && f[12..14] == ARP_TYPE.to_be_bytes()
-                && f[20..22] == [0, 1]
-                && f[38..42] == HOST_IP
-            {
-                let (sha, spa) = (f[22..28].try_into().unwrap(), f[28..32].try_into().unwrap());
-                self.send(ether(
-                    sha,
-                    HOST_MAC,
-                    ARP_TYPE,
-                    &arp(2, HOST_MAC, HOST_IP, sha, spa),
-                ));
-                self.asked.push(f);
-                continue;
-            }
-            if let Some(p) = parse_ipv4(&f) {
-                if p.dst == HOST_IP && p.proto == 1 && p.payload[0] == 8 {
-                    let id = u16::from_be_bytes([p.payload[4], p.payload[5]]);
-                    let seq = u16::from_be_bytes([p.payload[6], p.payload[7]]);
-                    let reply = icmp_echo(0, id, seq, &p.payload[8..]);
-                    let src_mac = f[6..12].try_into().unwrap();
-                    self.send(ether(
-                        src_mac,
-                        HOST_MAC,
-                        IP_TYPE,
-                        &ipv4(HOST_IP, p.src, 1, &reply),
-                    ));
-                }
-            }
-            self.seen.push(f);
-        }
-    }
-
-    /// The frames that came since the last call.
-    fn take(&mut self) -> Vec<Vec<u8>> {
-        let new = self.seen[self.taken..].to_vec();
-        self.taken = self.seen.len();
-        new
-    }
-}
-
-/// Sends `frame` to the machine, lets it run for a while (time enough to answer)
-/// and returns what it sent back.
-fn exchange(vm: &mut Vm, host: &mut Host, frame: Vec<u8>) -> Vec<Vec<u8>> {
-    host.take();
-    host.send(frame);
-    for _ in 0..100 {
-        vm.m.run_for(SLICE, &mut |_| {});
-        host.service();
-    }
-    assert_eq!(vm.m.exit_code(), None, "the kernel stopped:\n{}", vm.out());
-    host.take()
 }
 
 /// Sends a frame the machine must drop without a word.
@@ -567,83 +178,6 @@ fn grail_net_user_boots_camelot_onto_the_network() {
             ping_ok("10.0.2.2", 2)
         )
     );
-}
-
-/// A [`gateway::Gateway`] on a clock of its own rather than the wall clock: each poll of
-/// the card moves it on by the time [`POLL_STEPS`] take at 10 MHz, so when it services
-/// its host sockets (and every timer it has) follows the machine's steps. The test keeps
-/// a handle to it to wait for the host's datagram and to see what the machine sends.
-#[derive(Clone)]
-struct SteppedGateway(Arc<Mutex<Stepped>>);
-
-struct Stepped {
-    gw: gateway::Gateway,
-    now: Instant,
-    /// Frames for the machine taken from the gateway by [`SteppedGateway::wait_for_host`].
-    early: VecDeque<Vec<u8>>,
-    /// Every frame the machine sent.
-    from_guest: Vec<Vec<u8>>,
-}
-
-/// The time one poll of the card stands for: [`POLL_STEPS`] steps at 10 MHz.
-const POLL_TIME: Duration = Duration::from_nanos(POLL_STEPS as u64 * 100);
-
-impl SteppedGateway {
-    fn new(gw: gateway::Gateway) -> SteppedGateway {
-        SteppedGateway(Arc::new(Mutex::new(Stepped {
-            gw,
-            now: Instant::now(),
-            early: VecDeque::new(),
-            from_guest: Vec::new(),
-        })))
-    }
-
-    /// Services the gateway's host sockets, with the machine stopped, until what a host
-    /// program sent has reached them and become a frame for the machine. The gateway's
-    /// clock stands still meanwhile (its service interval is 0, so each call reads the
-    /// sockets): only the host's own loopback delivery is left to the wall clock here,
-    /// and it is bounded.
-    fn wait_for_host(&self) {
-        let start = Instant::now();
-        loop {
-            let mut s = self.0.lock().unwrap();
-            let now = s.now;
-            if let Some(frame) = s.gw.recv_at(now) {
-                s.early.push_back(frame);
-                return;
-            }
-            drop(s);
-            assert!(
-                start.elapsed() < Duration::from_secs(30),
-                "the datagram never reached the gateway"
-            );
-            std::thread::yield_now();
-        }
-    }
-
-    fn guest_frames(&self) -> Vec<Vec<u8>> {
-        self.0.lock().unwrap().from_guest.clone()
-    }
-}
-
-impl NetBackend for SteppedGateway {
-    fn send(&mut self, frame: &[u8]) -> std::io::Result<()> {
-        let mut s = self.0.lock().unwrap();
-        s.from_guest.push(frame.to_vec());
-        let now = s.now;
-        s.gw.send_at(frame, now);
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Option<Vec<u8>> {
-        let mut s = self.0.lock().unwrap();
-        s.now += POLL_TIME;
-        let now = s.now;
-        match s.early.pop_front() {
-            Some(frame) => Some(frame),
-            None => s.gw.recv_at(now),
-        }
-    }
 }
 
 #[test]
@@ -953,7 +487,7 @@ fn malformed_frames_are_dropped_and_counted() {
     bad[6..8].copy_from_slice(&[0, 0x10]);
     fix_ip_checksum(&mut bad);
     drop(&mut vm, &mut host, "fragment", "last fragment", to_vm(&bad));
-    // For another address on the subnet; TCP.
+    // For another address on the subnet; GRE (47). (kernel_tcp.rs has TCP's own.)
     drop(
         &mut vm,
         &mut host,
@@ -965,8 +499,8 @@ fn malformed_frames_are_dropped_and_counted() {
         &mut vm,
         &mut host,
         "protocol",
-        "TCP",
-        to_vm(&ipv4(HOST_IP, VM_IP, 6, &[0; 20])),
+        "GRE",
+        to_vm(&ipv4(HOST_IP, VM_IP, 47, &[0; 20])),
     );
     // ICMP: a bad checksum, truncated.
     let mut bad = good_icmp.clone();
@@ -1104,7 +638,7 @@ fn malformed_frames_are_dropped_and_counted() {
             "{name}:\n{ifconfig}"
         );
     }
-    assert_eq!(got.len(), 16, "{ifconfig}");
+    assert_eq!(got.len(), 23, "{ifconfig}");
     assert!(want.keys().all(|name| got.contains_key(*name)), "{want:?}");
     // Every frame the card took counts as received; what it sent: the two echo requests
     // of its ping, the replies (ARP, two echoes, three UDP) and its ARP requests.

@@ -5,7 +5,7 @@
  *   1  type of service            2  total length, header included
  *   4  identification             6  flags (DF 0x4000, MF 0x2000) and
  *                                    fragment offset (low 13 bits)
- *   8  time to live               9  protocol (1 ICMP, 17 UDP)
+ *   8  time to live               9  protocol (1 ICMP, 6 TCP, 17 UDP)
  *  10  header checksum           12  source address   16  destination
  *
  * Input checks everything a packet says about itself before believing it:
@@ -132,6 +132,8 @@ void ip_input(struct pbuf *p, const u8 *ip, u32 len, bool loopback) {
         icmp_input(p, src, dst, ip[8], ip + hlen, total - hlen);
     } else if (proto == IP_PROTO_UDP) {
         udp_input(p, src, dst, ip + hlen, total - hlen);
+    } else if (proto == IP_PROTO_TCP) {
+        tcp_input(p, src, dst, ip + hlen, total - hlen);
     } else {
         net_stats.rx_bad_proto++;
         pbuf_free(p);

@@ -1,10 +1,12 @@
 # Camelot's network stack
 
-The Camelot kernel's networking, as far as issue #83 takes it: a driver for
-Grail's network card (`docs/excalibur-spec.md` section 9.8), Ethernet, ARP,
-IPv4, ICMP echo and UDP, an address from DHCP or a static configuration, and
-two shell commands, `ifconfig` and `ping`. TCP (#84) and the socket system
-calls and network tools (#85) build on it.
+The Camelot kernel's networking, as far as issues #83 and #84 take it: a
+driver for Grail's network card (`docs/excalibur-spec.md` section 9.8),
+Ethernet, ARP, IPv4, ICMP echo, UDP and TCP, an address from DHCP or a static
+configuration, and two shell commands, `ifconfig` and `ping`. The socket
+system calls and network tools (#85) build on it; until then a temporary
+system call, `tcptest`, drives TCP from a program
+([Testing TCP until #85](#testing-tcp-until-85)).
 
 The code is in `kernel/net/`, one file per layer, with the whole interface in
 `kernel/include/net.h` and the driver's in `kernel/include/nic.h`:
@@ -18,8 +20,9 @@ The code is in `kernel/net/`, one file per layer, with the whole interface in
 | `ip.c` | IPv4: header checks, checksums, routing, loopback |
 | `icmp.c` | echo requests and replies |
 | `udp.c` | UDP: ports, checksums, the kernel-internal socket API, the echo service |
+| `tcp.c` | TCP: the connection state machine, retransmission, the kernel-internal socket API |
 | `dhcp.c` | the DHCP client |
-| `net.c` | the interface's configuration, bringing it up at boot, the counters, the timer, waiting, the system calls |
+| `net.c` | the interface's configuration, bringing it up at boot, the counters, the timer, waiting, the system calls (and `tcptest`) |
 
 It is a small host stack in the spirit of xv6's lab network code and lwIP's
 raw API: one interface, no forwarding, no fragmentation, no options, and every
@@ -55,7 +58,8 @@ its length, and a link for the queues it waits in. The pool holds 64
 without one). A frame stays in its buffer from the card's DMA to whoever
 consumes it, a socket or the card that sends it, so nothing is copied between
 layers, and each layer that sends writes its header at a fixed offset (the
-shape is always Ethernet, an IPv4 header without options, then ICMP or UDP).
+shape is always Ethernet, an IPv4 header without options, then ICMP, UDP or
+TCP).
 
 The pool is fixed, so the network can never eat the rest of memory. When it
 is empty, a received frame is dropped (its buffer goes straight back to the
@@ -159,7 +163,7 @@ in this order:
    broadcast address; while the interface has no address, any UDP (a DHCP
    offer may come to the address offered). 127.0.0.0/8 never comes from the
    wire. Otherwise `filtered`;
-6. ICMP (1) or UDP (17): otherwise `protocol`.
+6. ICMP (1), TCP (6) or UDP (17): otherwise `protocol`.
 
 **Output** writes a 20-byte header: TTL 64 (`IP_TTL`), DF set, an
 identification counter, the checksum. A packet over 1500 bytes (`NET_MTU`)
@@ -219,6 +223,175 @@ except for the echo service (RFC 862): on port 7 with no socket bound, a
 datagram comes back to its sender, from the address it was sent to, unless
 it came from a port below 1024 (two echo services would bounce it forever)
 or to a broadcast address (everyone would answer).
+
+## TCP
+
+RFC 9293, in `tcp.c`, with RFC 5961's defenses, RFC 6298's retransmission
+timer and RFC 6528's initial sequence numbers. It is a small TCP: correct on
+a network that loses, duplicates and reorders segments, but with none of the
+machinery that only buys speed.
+
+**Connections.** 16 sockets (`TCP_SOCKETS`), each a listener or one
+connection, in a static table. A connection has two 4 KiB buffers
+(`TCP_BUF`, a page each from `kalloc`, taken when it starts and given back
+when it ends): what was sent stays in the send buffer until it is
+acknowledged, what arrived in order stays in the receive buffer until it is
+read, and the window offered is never more than the receive buffer's free
+room, so the peer can never send more than fits. The MSS option on the SYN asks for 1460 bytes
+(`TCP_MSS`: an Ethernet frame); a peer that sends none gets 536. Ephemeral
+ports go round from 49152.
+
+**Input.** A segment shorter than 20 bytes, or with a header length under 20
+or past the segment, counts in `tcp`; a wrong checksum (over the same
+pseudo-header as UDP's, protocol 6) in `tcp-checksum`; one to a broadcast
+address, or from 0.0.0.0, in `filtered` (TCP is between two hosts). Of the options, the MSS
+is read, NOP and the end of the list are understood and any other is
+stepped over by its length. A segment for no socket counts in `no-socket`
+and is answered with a reset (one that acknowledges it, if it had no ACK),
+never a reset for a reset. Then RFC 9293 3.10.7's steps, in order:
+
+1. **The sequence number.** A segment outside the window is answered with an
+   ACK (the answer to a duplicate) and dropped. With the window closed, a
+   segment at the next byte expected, or at most an MSS past the window's
+   edge (a peer that probed with new data counts those bytes as sent), still
+   has its ACK and window read, but not its data: RFC 9293's "special
+   allowance" for ACKs. An empty segment may sit right at the window's edge,
+   as Linux allows: that is where a peer that filled the window sends its
+   ACKs from, and dropping them when one of its segments was lost would drop
+   the acknowledgments of this end's data until the peer resent it.
+2. **A reset** is believed only at exactly the next sequence number expected;
+   elsewhere in the window it gets a "challenge" ACK (RFC 5961 3.2), which a
+   real peer answers with a reset at the right number and a blind attacker
+   cannot. It counts in `resets` and ends the connection: `-ECONNREFUSED` for
+   a connection being opened, `-ECONNRESET` for one established.
+3. **A SYN** on a synchronized connection gets a challenge ACK too (RFC 5961
+   4.2). A SYN that is the peer's first one again (in SYN-RECEIVED) gets the
+   SYN-ACK again: the first was lost.
+4. **The ACK** frees what it covers from the send buffer, takes a round-trip
+   sample, and updates the peer's window unless the segment is older than
+   the last one that did.
+5. **Data** is taken only in order: a segment past a gap is dropped
+   (`out-of-order`) and the ACK says what is missing; the peer sends it
+   again. There is no reassembly queue: with a 4 KiB window, at most two
+   segments are ever lost to one gap.
+6. **The FIN**, once everything before it is in: end of file for the reader.
+   A FIN past a gap is dropped like data (`out-of-order`, and an ACK).
+
+Every segment with data is acknowledged at once; there are no delayed ACKs.
+
+**Output** sends what the peer's window allows, in segments of at most the
+peer's MSS, then the FIN once the owner is done and everything before it is
+out. Silly window avoidance both ways (RFC 9293 3.8.6.2): a short segment
+goes only if it ends the data queued or is at least half the largest window
+the peer offered; and the window's right edge, as every segment offers it,
+moves on only once the free room reaches past it by an MSS or half the
+buffer, whichever is less, so the peer never hears of a few bytes freed at a
+time. When a read frees that much, an ACK says so at once: the peer, with
+nothing it may send, would otherwise only find out by probing. There is no
+slow start or congestion window: the send buffer is under three full
+segments, so what a congestion window would limit hardly exists here.
+
+**Timers**, in ticks, run from `net_timer()`:
+
+- **Retransmission** (RFC 6298): the timeout follows the measured round trip
+  (smoothed RTT plus four deviations, one tick at least), one segment timed
+  at a time and never one that was sent twice (Karn), within 200 ms and
+  60 s (`TCP_RTO_MIN`, `TCP_RTO_MAX`), 1 s before the first sample. When it
+  goes off, everything not acknowledged is sent again from the oldest byte
+  ("go back N", which a receiver that drops out-of-order data needs), the
+  timeout doubles and `retransmits` counts it. A SYN is sent 5 more times
+  (`TCP_SYN_RETRIES`), anything else 8 (`TCP_RETRIES`); then the connection
+  is given up with `-ETIMEDOUT` (an established one sends a reset first).
+- **Persist**: with data waiting and the peer's window closed, one byte is
+  sent past it on the same doubling timeout, until the window opens. An ACK
+  that leaves the probe's byte untaken, the window still closed, puts the
+  persist timer back on, so a probe is never a retransmission timeout too.
+  While a process holds the socket, probes are not retries: a peer whose
+  buffer stays full is never given up on. Once its owner closed it, they
+  are: after 8 (`TCP_RETRIES`) the connection is reset and given up, and
+  only an acknowledgment of new data starts the count over, so a peer that
+  keeps its window shut can't keep the slot (Linux bounds such orphans the
+  same way).
+- **TIME-WAIT** lasts 60 s (`TCP_TIME_WAIT`); the peer's FIN again in it is
+  acknowledged again and starts it over. A connection in FIN-WAIT-2 that
+  nobody holds waits 60 s (`TCP_FIN_TIMEOUT`) for the peer's FIN.
+
+**Closing.** `tcp_close()` hands the socket to the stack, which finishes the
+close on its own (FIN-WAIT, LAST-ACK, TIME-WAIT) and frees the slot at the
+end, or sooner: when the retries or the probes run out (above), or the
+peer's FIN does not come within `TCP_FIN_TIMEOUT`. A socket closed with data still unread is reset instead (RFC 9293
+3.10.4's ABORT, as RFC 1122 4.2.2.13 allows), and so is one that gets data
+after its owner closed it: nobody will ever read it. A connection in
+TIME-WAIT keeps its buffers only while its owner holds it, and when the
+table is full the one nearest its end gives up its slot to a new socket:
+TIME-WAIT only guards against old duplicates, and a slot is worth more.
+
+**Initial sequence numbers** follow RFC 6528: a clock ticking every 4 µs
+(from the CLINT's `mtime`) plus a keyed hash of the two addresses and ports,
+so they are neither guessable nor reused by a quick reconnection. The tests
+can set the next one (`tcp_isn_next`, written into the kernel's RAM) to see
+sequence numbers wrap.
+
+**The socket API** is kernel-internal until #85 puts it behind file
+descriptors (`kernel/include/net.h` says what each returns). Every call but
+`tcp_close()` is made by a process; those that wait sleep in `net_sleep()`
+and give up with `-EINTR` as soon as the process is killed. Data is copied
+from and to a process's memory through its page table, or kernel memory.
+
+| Function | |
+|---|---|
+| `tcp_socket(&err)` | a new socket; `-ENOBUFS` when all 16 are taken |
+| `tcp_bind(s, port)` | binds to `port` on every address (0: the next ephemeral port); `-EADDRINUSE`, `-EINVAL` |
+| `tcp_listen(s, backlog)` | makes a bound socket a listener; up to `backlog` (taken as 1 to 8) connections wait for `tcp_accept`, and a SYN past them is dropped (`backlog`): the peer sends it again |
+| `tcp_connect(s, addr, port)` | the handshake; `-ECONNREFUSED`, `-ETIMEDOUT`, `-ENETUNREACH`, `-EISCONN`, `-ENOBUFS`, `-EINVAL`, `-EINTR` |
+| `tcp_accept(l, &err)` | the oldest connection established on the listener, a socket of its own |
+| `tcp_send(s, pt, src, n)` | queues `n` bytes, waiting for room as it goes; `-EPIPE` after `tcp_shutdown`, `-ENOTCONN`, the error that ended the connection |
+| `tcp_recv(s, pt, dst, n)` | up to `n` bytes, waiting for some; 0 at the end of the peer's data |
+| `tcp_shutdown(s)` | no more sending: a FIN follows what is queued |
+| `tcp_close(s)` | lets go of the socket (above); a listener resets the connections still waiting for `tcp_accept` |
+| `tcp_ends(s, ...)` | the two ends' addresses and ports |
+
+**Loopback** works like UDP's: a segment to 127.0.0.1 or the interface's
+address is handled inside the `ip_output()` of the segment that caused it,
+so the code that sends checks its connection again after each segment.
+Like the rest of the stack, TCP needs a card to run (its timer runs only
+then), even for loopback.
+
+### Testing TCP until #85
+
+Programs get sockets with #85. Until then one temporary system call,
+`tcptest` (27, `docs/camelot-syscalls.md`), drives the socket API from a
+process, and a program of the same name runs it:
+
+```
+tcptest connect ADDR PORT BYTES [TIMES]
+tcptest serve PORT CONNECTIONS [BACKLOG]
+```
+
+- `connect` opens a connection, sends BYTES bytes of a fixed pattern (byte
+  `i` is `i ^ i >> 8 ^ i >> 16`, so a byte out of place shows) in 512-byte
+  calls, ends its side, reads until the other side ends its own, and prints
+  `10.0.2.15:49152 > 10.0.2.2:8000: sent N, received N, hash H`, H being the
+  FNV-1a hash of what it received; TIMES times.
+- `serve` listens on PORT (backlog 4 by default), prints `listening on port
+  PORT`, then accepts CONNECTIONS connections one after the other, sends
+  back what each sends until it ends its side, and prints
+  `10.0.2.2:49152 > 10.0.2.15:7000: echoed N, hash H` for each.
+
+A connection that fails prints what it did so far, then `tcptest: REASON`
+(`connection refused`, `connection reset`, `timed out`), and the program
+exits with 1. With `--net user,hostfwd=tcp::7000-:7000`, `tcptest serve 7000
+1` answers any TCP client on the host's port 7000; `tcptest connect 10.0.2.2
+PORT 1000` talks to a server on the host.
+
+The client reads only once it has sent everything, so an echo through
+loopback larger than the buffers on the way (about 16 KiB: the four 4 KiB
+buffers of the connection's two ends) stops both, each waiting for the other
+to read: the program's design, not the stack's. Through the gateway the
+host's buffers take up the difference.
+
+The call, the program and the listeners a process holds by handle (closed
+when it exits) all go when #85's socket calls replace them.
 
 ## DHCP
 
@@ -281,15 +454,25 @@ the configuration, and `ifconfig` prints them:
 | `ip` | `rx_bad_ip` | a malformed IPv4 header or length, or a source no host can have |
 | `ip-checksum` | `rx_bad_ip_sum` | a wrong header checksum |
 | `fragment` | `rx_fragment` | a fragment |
-| `protocol` | `rx_bad_proto` | neither ICMP nor UDP |
+| `protocol` | `rx_bad_proto` | not ICMP, TCP or UDP |
 | `icmp` | `rx_bad_icmp` | a short ICMP message or a wrong checksum |
 | `udp` | `rx_bad_udp` | a short datagram or a wrong length field |
 | `udp-checksum` | `rx_bad_udp_sum` | a wrong UDP checksum |
 | `no-port` | `rx_no_port` | UDP to a port with no socket (and not echoed) |
 | `queue-full` | `rx_queue_full` | UDP to a socket holding 4 datagrams |
+| `tcp` | `rx_bad_tcp` | a TCP segment shorter than its header, or a header length under 20 bytes or past the segment |
+| `tcp-checksum` | `rx_bad_tcp_sum` | a wrong TCP checksum |
 | `no-buffer` | `no_buffer` | the pool was empty |
 | `arp-failed` | `arp_failed` | packets dropped for want of an ARP answer |
 | `tx-error` | `tx_errors` | the transmit queue was full, or the card failed a send |
+| `no-socket` | `tcp_no_socket` | TCP for a port with no connection or listener (answered with a reset) |
+| `backlog` | `tcp_backlog` | a SYN dropped: its listener's backlog was full, or no slot or memory was left |
+| `out-of-order` | `tcp_out_of_order` | data (or a FIN) past a gap, dropped (the peer resends) |
+| `retransmits` | `tcp_retransmits` | retransmission timeouts (each sends everything not acknowledged again) |
+| `resets` | `tcp_resets` | connections ended by a reset from the peer |
+
+TCP's last five are not drops of malformed frames but what its connections
+went through; `ifconfig` prints them on a line of their own.
 
 ## Shell commands
 
@@ -307,8 +490,9 @@ net0: mac 52:54:00:12:34:56, link up
   inet 10.0.2.15 netmask 255.255.255.0 gateway 10.0.2.2 dns 10.0.2.3 (dhcp)
   rx 5 frames, 922 bytes; tx 5 frames, 922 bytes
   rx dropped: card 0, filtered 0, ether 0, arp 0, ip 0, ip-checksum 0, fragment 0, protocol 0
-  rx dropped: icmp 0, udp 0, udp-checksum 0, no-port 0, queue-full 0
+  rx dropped: icmp 0, udp 0, udp-checksum 0, no-port 0, queue-full 0, tcp 0, tcp-checksum 0
   other: no-buffer 0, arp-failed 0, tx-error 0
+  tcp: no-socket 0, backlog 0, out-of-order 0, retransmits 0, resets 0
 lo: inet 127.0.0.1 netmask 255.0.0.0
 ```
 
@@ -333,7 +517,7 @@ grail --net user kernel/kernel.elf
 gives the kernel user networking (spec section 9.8): DHCP from the gateway,
 `ping 10.0.2.2` (the host), and UDP to the echo service through a forwarded
 port (`--net user,hostfwd=udp::5555-:7`, then any UDP client to
-127.0.0.1:5555). Machines on one hub (in one process) or VMs on one Avalon
+127.0.0.1:5555), and TCP both ways with `tcptest` (above). Machines on one hub (in one process) or VMs on one Avalon
 switch are on one Ethernet: give them static addresses on one subnet with
 `ifconfig` and they ping each other.
 
@@ -370,6 +554,46 @@ Grail's cards, by step counts, so what the kernel does is deterministic:
 At the end of each, with the machine idle, every packet buffer but the
 receive ring's 16 is back in the pool (the test reads `free_count` from the
 kernel's RAM), so a drop path that forgets to free its buffer fails them.
+
+`crates/grail/tests/kernel_tcp.rs` tests TCP the same way, through
+`tcptest` (the helpers both files share are in `tests/common`):
+
+- through the gateway: the guest's client and a Rust server on the host
+  (10.0.2.2) send each other 192 KiB at once, byte for byte, with the
+  guest's window closing while it still sends; the guest's echo server
+  answers host clients through a forwarded port, one large, then two at once
+  with the second waiting in the backlog;
+- both again through a backend between the card and the gateway that drops,
+  duplicates and reorders TCP frames both ways by a fixed pattern over the
+  frames' count, with no randomness (which frames that hits still varies a
+  little from run to run, since the host's sockets follow the wall clock);
+  the transfers are still exact, and `retransmits` and `out-of-order` show
+  what it took;
+- 40 connections in a row through the gateway and 20 over loopback, more
+  than there are sockets; afterwards, once TIME-WAIT is over, every socket
+  is free (`tcp_in_use`), every page of their buffers is back (`nfree`) and
+  so is every packet buffer;
+- the test as the other host on a hub, segment by segment: resets for ports
+  nobody listens on, malformed segments counted; the handshake and its MSS
+  option, a lost SYN-ACK, challenge ACKs for resets and SYNs in the window,
+  duplicates, data past a gap, a full backlog, a reset ending a connection
+  and a listener's close resetting the one waiting; closing first, closing
+  at once (CLOSING), TIME-WAIT acknowledging a FIN again, a refused and a
+  reset connection; a SYN and data sent again until the connection is given
+  up, the timeout doubling each time (the test reads the kernel's `ticks`
+  at every step, as each segment comes); a zero window probed until it
+  opens, with an MSS of 1000 among options the stack skips, the probes
+  doubling too; a socket closed into a window that stays shut, given up
+  after its probes; sequence numbers wrapping past 2^32 both ways (8 KiB
+  echoed, both initial numbers just below it); silly window avoidance both
+  ways; closing with data unread, and data after closing, answered with a
+  reset, and a closed socket's FIN-WAIT-2 timing out; and processes killed
+  while they wait in `accept`, `connect`, `send` and `recv`, ending at once.
+
+The gateway runs on the machine's clock, but the host's sockets don't, so
+a SYN to the gateway waits (a bounded wait of the wall clock) for the host
+side to connect, and a host program is waited for with the machine running,
+since the kernel may still have something to send again.
 
 UDP's socket API is only exercised by DHCP and the echo service until #85
 gives programs sockets; its tests (a full queue counted in `queue-full`,

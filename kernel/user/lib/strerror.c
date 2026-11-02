@@ -10,6 +10,8 @@ const char *strerror(int err) {
         return "no such file or directory";
     case ESRCH:
         return "no such process";
+    case EINTR:
+        return "interrupted";
     case E2BIG:
         return "argument list too long";
     case ENOEXEC:
@@ -62,10 +64,18 @@ const char *strerror(int err) {
         return "address in use";
     case ENETUNREACH:
         return "network unreachable";
+    case ECONNRESET:
+        return "connection reset";
     case ENOBUFS:
         return "no buffer space";
+    case EISCONN:
+        return "already connected";
+    case ENOTCONN:
+        return "not connected";
     case ETIMEDOUT:
         return "timed out";
+    case ECONNREFUSED:
+        return "connection refused";
     case EHOSTUNREACH:
         return "host unreachable";
     default:

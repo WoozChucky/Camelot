@@ -16,6 +16,7 @@ typedef unsigned long size_t;
 #define EPERM 1         /* link: not for a directory; kill: a kernel process, or the shell */
 #define ENOENT 2        /* no such file or directory */
 #define ESRCH 3         /* kill: no such process */
+#define EINTR 4         /* a wait ended because the process was killed */
 #define E2BIG 7         /* spawn, exec: argument list too long */
 #define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */
 #define EBADF 9         /* not an open file descriptor, or not open for that */
@@ -42,8 +43,12 @@ typedef unsigned long size_t;
 #define EMSGSIZE 90     /* a datagram too big for one packet */
 #define EADDRINUSE 98   /* a UDP port that is taken */
 #define ENETUNREACH 101 /* no route: no address yet, or no gateway */
+#define ECONNRESET 104  /* TCP: the peer reset the connection */
 #define ENOBUFS 105     /* the network's buffers or sockets are all in use */
-#define ETIMEDOUT 110   /* ping: no reply in time */
+#define EISCONN 106     /* TCP: the socket is connected already */
+#define ENOTCONN 107    /* TCP: the socket is not connected */
+#define ETIMEDOUT 110   /* ping: no reply in time; TCP: the peer stopped answering */
+#define ECONNREFUSED 111 /* TCP: nothing listens on that port */
 #define EHOSTUNREACH 113 /* ARP got no answer from the address */
 
 /* The standard file descriptors: the console's in the shell, and what a
@@ -125,7 +130,7 @@ struct net_stats {
     uint rx_bad_ip;       /* a bad IPv4 header */
     uint rx_bad_ip_sum;   /* a wrong IPv4 header checksum */
     uint rx_fragment;     /* an IPv4 fragment */
-    uint rx_bad_proto;    /* an IPv4 protocol other than ICMP and UDP */
+    uint rx_bad_proto;    /* an IPv4 protocol other than ICMP, UDP and TCP */
     uint rx_bad_icmp;     /* a truncated ICMP message or a wrong checksum */
     uint rx_bad_udp;      /* a truncated UDP datagram or a wrong length */
     uint rx_bad_udp_sum;  /* a wrong UDP checksum */
@@ -134,6 +139,13 @@ struct net_stats {
     uint no_buffer;       /* a frame dropped or not sent for want of a buffer */
     uint arp_failed;      /* a packet whose next hop ARP could not find */
     uint tx_errors;       /* a frame the card refused or could not queue */
+    uint rx_bad_tcp;      /* a truncated TCP segment or a bad header length */
+    uint rx_bad_tcp_sum;  /* a wrong TCP checksum */
+    uint tcp_no_socket;   /* a segment for no connection or listener */
+    uint tcp_backlog;     /* a SYN dropped: backlog full, or no socket */
+    uint tcp_out_of_order; /* a segment past the next byte expected */
+    uint tcp_retransmits; /* segments sent again after a timeout */
+    uint tcp_resets;      /* connections the peer reset */
 };
 
 struct netinfo {
@@ -155,6 +167,23 @@ struct ping_reply {
     uint ttl;    /* the reply's time to live */
     uint len;    /* its ICMP message's length */
     uint rtt_us; /* the round trip, in microseconds */
+};
+
+/* tcptest, TCP's test hook until #85's sockets: its operations and what it
+ * reports (docs/camelot-net.md, "Testing TCP until #85"). */
+#define TCPTEST_CONNECT 1 /* (addr, port, bytes): send `bytes`, read until the end */
+#define TCPTEST_LISTEN 2  /* (port, backlog): a listener, returned as a handle */
+#define TCPTEST_ACCEPT 3  /* (handle): accept a connection and echo it to the end */
+#define TCPTEST_CLOSE 4   /* (handle): close the listener */
+
+struct tcptest_report {
+    uint laddr; /* this end */
+    uint lport;
+    uint raddr; /* the other end */
+    uint rport;
+    uint sent;     /* bytes sent */
+    uint received; /* bytes received */
+    uint hash;     /* FNV-1a of the bytes received */
 };
 
 /* The system calls. */
@@ -184,6 +213,7 @@ int procs(struct procinfo *buf, uint max);
 int netinfo(struct netinfo *info);
 int netconf(uint addr, uint mask, uint gateway);
 int ping(uint addr, uint seq, struct ping_reply *reply);
+int tcptest(uint op, uint a, uint b, uint c, struct tcptest_report *report);
 /* Any call by number (for tests). */
 int syscall(int number, uint a0, uint a1, uint a2);
 

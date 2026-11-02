@@ -195,6 +195,9 @@ void syscall(struct trap_frame *f) {
     case SYS_ping:
         ret = net_sys_ping(arg(f, 0), arg(f, 1), arg(f, 2));
         break;
+    case SYS_tcptest:
+        ret = net_sys_tcptest(arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3), arg(f, 4));
+        break;
     default:
         ret = -ENOSYS;
         break;

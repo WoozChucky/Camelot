@@ -32,6 +32,7 @@
     .equ SYS_netinfo, 24
     .equ SYS_netconf, 25
     .equ SYS_ping, 26
+    .equ SYS_tcptest, 27
 
     .text
 
@@ -214,6 +215,13 @@ netconf:
     .globl ping
 ping:
     li    a7, SYS_ping
+    ecall
+    ret
+
+# int tcptest(uint op, uint a, uint b, uint c, struct tcptest_report *report)
+    .globl tcptest
+tcptest:
+    li    a7, SYS_tcptest
     ecall
     ret
 

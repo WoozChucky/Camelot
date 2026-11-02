@@ -63,6 +63,7 @@ $ wait
 | `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |
 | `filetest` | checks the file system calls on a writable root filesystem (`filetest: N checks, 0 failed`) |
 | `libtest` | checks the C library (`libtest: N checks, 0 failed`) |
+| `tcptest` | drives the kernel's TCP until #85 brings sockets: `tcptest connect ADDR PORT BYTES [TIMES]` sends a pattern and reads to the end, `tcptest serve PORT CONNECTIONS [BACKLOG]` echoes what each connection sends (`docs/camelot-net.md`, "Testing TCP until #85") |
 | `badload` | reads kernel memory: killed by a load page fault |
 | `badstore` | writes to its own read-only data: killed by a store page fault |
 | `badhalt` | executes `xcal.halt`, which is M-mode only: killed by an illegal instruction |
