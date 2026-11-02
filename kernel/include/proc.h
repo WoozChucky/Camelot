@@ -155,9 +155,11 @@ struct proc *kproc_create(const char *name, void (*fn)(void), const char **err);
 bool proc_run_init(const char *path, const char *name, int *status);
 
 /* Runs the processes round robin, one timer tick each for user processes,
- * until none is left; then returns with interrupts on. While every process
- * left is asleep (or a zombie its parent will free) it idles in wfi. Called
- * by proc_run_init() and by the boot self-tests that use kernel processes. */
+ * taking them from the process table that every hart's scheduler shares.
+ * On hart 0, returns with interrupts on once no process is left; on the
+ * other harts it never returns. While no process is runnable it idles in
+ * wfi. Called by proc_run_init() and by the boot self-tests that use kernel
+ * processes, on hart 0, and by hart_main() on the others. */
 void scheduler(void);
 
 /* Puts the current process to sleep on `chan` and gives up the CPU; returns
@@ -203,6 +205,10 @@ bool proc_killed(void);
 /* procs(): describes up to `max` processes, in pid order, in `out` and
  * returns how many there are in all. */
 int proc_list(struct procinfo *out, int max);
+
+/* harts(): describes up to `max` of the harts running the kernel, in hart
+ * order, in `out` and returns how many there are in all. */
+int proc_harts(struct hartinfo *out, int max);
 
 /* wait(): waits for a child of the current process to end, any child if
  * `pid` is -1, frees it and returns its pid, storing its exit status at user

@@ -3,7 +3,8 @@
 //! also rebuilt from source and checked against the committed image.
 
 use excalibur::csr::{
-    IRQ_M_EXT, IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP,
+    IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPIE,
+    MSTATUS_SPP,
 };
 use excalibur::reg;
 use grail::block::{error as blk_error, BlockBackend, MemDisk};
@@ -86,9 +87,11 @@ const PANIC_EXIT: u32 = 0xfe;
 /// kernel/entry.s).
 const UNEXPECTED_TRAP_EXIT: u32 = 0xff;
 
-/// Byte offset of the timer interval in `machine_scratch`
-/// (`MSCRATCH_INTERVAL` words, kernel/include/machine.h).
+/// Byte offsets in hart 0's block of `machine_scratch` (`MSCRATCH_INTERVAL`
+/// and `MSCRATCH_TICK` words, kernel/include/machine.h): the timer interval,
+/// and the word machine_vec sets with each tick it forwards.
 const SCRATCH_INTERVAL: u32 = 12;
+const SCRATCH_TICK: u32 = 20;
 
 /// Values of the kernel's `boot_fault` (kernel/main.c).
 const BOOT_FAULT_NONE: u32 = 1;
@@ -581,7 +584,8 @@ fn kmain_runs_in_s_mode_with_traps_delegated() {
         c.mideleg,
         (1 << IRQ_S_SOFT) | (1 << IRQ_S_TIMER) | (1 << IRQ_S_EXT)
     );
-    assert_eq!(c.mie, 1 << IRQ_M_TIMER);
+    // The machine timer and the IPI (on one hart too) stay in M-mode.
+    assert_eq!(c.mie, (1 << IRQ_M_TIMER) | (1 << IRQ_M_SOFT));
     assert_eq!(c.mtvec, sym(&elf, "machine_vec"));
     assert_eq!(c.stvec, sym(&elf, "kernel_vec"));
     let scratch = sym(&elf, "machine_scratch");
@@ -786,7 +790,13 @@ fn kernel_vec_resumes_from_the_frame() {
     // it: every register, sepc and sstatus are loaded back from the frame.
     let (mut m, elf, regs) = busy_kmain();
     let kmain = sym(&elf, "kmain");
-    m.cpu.csr.mip |= 1 << IRQ_S_SOFT; // a tick, as machine_vec raises it
+    // A tick, as machine_vec raises it: SSIP, and the tick word that tells it
+    // from an IPI.
+    m.cpu.csr.mip |= 1 << IRQ_S_SOFT;
+    m.cpu
+        .bus
+        .load(sym(&elf, "machine_scratch") + SCRATCH_TICK, &1u32.to_le_bytes())
+        .unwrap();
     step_to(&mut m, sym(&elf, "kernel_trap"));
     let frame = m.cpu.x[x("a0") as usize];
     let peek = |m: &Machine, off: u32| m.cpu.bus.peek(frame + off).unwrap();
@@ -1394,9 +1404,10 @@ fn fault_with_interrupts_off_panics() {
     let (_, v) = parse_panic(&out);
     assert_eq!((v["scause"], v["sepc"], v["stval"]), (2, kmain, 0));
     assert_eq!(v["sstatus"] & MSTATUS_SPIE, 0);
-    // ra is where kmain would have returned to: supervisor_entry's next
-    // instruction.
-    assert_eq!(v["ra"], sym(&elf, "supervisor_entry") + 8);
+    // ra is where kmain would have returned to: supervisor_entry's
+    // instruction after the call (after the branch that sends the other
+    // harts to hart_main, and the call's two instructions).
+    assert_eq!(v["ra"], sym(&elf, "supervisor_entry") + 12);
 }
 
 // ---- The console and the shell ----
@@ -1678,11 +1689,12 @@ fn plic_routes_the_uart_to_the_kernel() {
     assert_eq!(reg(plic_enable(1)), 1 << UART_IRQ);
     assert_eq!(reg(plic_threshold(1)), 0);
     assert_eq!(reg(plic_enable(0)), 0);
-    // sie.SEIE on (with the tick's SSIE); M-mode external interrupts stay off.
+    // sie.SEIE on (with the tick's SSIE, and M-mode's timer and IPI); M-mode
+    // external interrupts stay off.
     let mie = m.cpu.csr.mie;
     assert_eq!(
         mie,
-        (1 << IRQ_M_TIMER) | (1 << IRQ_S_SOFT) | (1 << IRQ_S_EXT),
+        (1 << IRQ_M_TIMER) | (1 << IRQ_M_SOFT) | (1 << IRQ_S_SOFT) | (1 << IRQ_S_EXT),
         "mie {mie:#x}"
     );
     assert_eq!(mie & (1 << IRQ_M_EXT), 0);
@@ -3620,7 +3632,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 39, "{calls:?}");
+    assert_eq!(calls.len(), 40, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()

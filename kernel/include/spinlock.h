@@ -53,9 +53,23 @@ struct cpu {
     /* The scheduler loop's registers while a process runs on this hart:
      * sched() swtch()es here. */
     struct context context;
+    /* The page table in satp: the running process's, or the kernel's. The
+     * scheduler and exec set it, under proc_lock or for their own hart;
+     * tlb_shootdown() reads it (without a lock: smp.c says why that is
+     * enough) to find the harts that may hold stale translations. */
+    u32 *pagetable;
+    /* Timer ticks this hart has taken, and processes it has switched to,
+     * for the harts system call. Written only by the hart itself. */
+    u32 ticks;
+    u32 switches;
+    /* Set by the scheduler, under proc_lock, when it found nothing to run
+     * and is about to wait in wfi; cleared when it looks again, or by the
+     * hart that wakes it with an IPI because a process became runnable
+     * (proc.c). */
+    bool idle;
 };
 
-#define CPU_SIZE 72
+#define CPU_SIZE 88
 _Static_assert(sizeof(struct cpu) == CPU_SIZE, "spinlock.s indexes cpus[] by CPU_SIZE");
 
 extern struct cpu cpus[NCPU];

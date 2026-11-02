@@ -275,7 +275,7 @@ static void test_simple_calls(void) {
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(40, 0, 0, 0), -ENOSYS, "call 40");
+    check_eq(syscall(41, 0, 0, 0), -ENOSYS, "call 41");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
 }
 
@@ -739,7 +739,10 @@ static void test_procs_and_kill(void) {
      * none of its code. It would have written to the pipe. A timer tick
      * in between would give the child its turn first, so this starts
      * right after one (sleep returns on a tick), a whole interval ahead
-     * of the next. */
+     * of the next. On several harts, an idle one may give the child its
+     * turn at once: then it may have written its line before the kill
+     * caught it, or even ended (exit 0) before the kill, which then finds
+     * a zombie. */
     check_eq(pipe(pfd), 0, "a pipe for a child killed before it runs");
     sleep(1);
     int console_out = dup(STDOUT);
@@ -753,9 +756,16 @@ static void test_procs_and_kill(void) {
     close(pfd[1]);
     check(child > 0, "spawn a writer");
     check_eq(killed, 0, "kill it at once");
-    check_eq(status_of(child), -1, "the writer killed before it ran ends");
+    int writer_status = status_of(child);
     char c;
-    check_eq(read(pfd[0], &c, 1), 0, "having written nothing");
+    int written = read(pfd[0], &c, 1);
+    if (harts(NULL, 0) == 1) {
+        check_eq(writer_status, -1, "the writer killed before it ran ends");
+        check_eq(written, 0, "having written nothing");
+    } else {
+        check(writer_status == -1 || (writer_status == 0 && written == 1), "the writer ends, killed or not");
+        check(written == 0 || (written == 1 && c == 'r'), "having written its line or nothing");
+    }
     close(pfd[0]);
 
     /* A writer asleep on a full pipe that nobody reads. */
@@ -791,6 +801,29 @@ static void test_procs_and_kill(void) {
         yield();
     }
     check_eq(state_of(grandchild), -1, "the orphan ends");
+}
+
+/* harts: every hart that runs the kernel, from 0 up (the tests run systest
+ * on one hart and on several), this process on its own. */
+static void test_harts(void) {
+    struct hartinfo info[8];
+    int n = harts(info, 8);
+    check(n >= 1 && n <= 8, "harts: 1 to 8 of them");
+    int ids = 0;
+    int mine = 0;
+    for (int i = 0; i < n && i < 8; i++) {
+        ids += (int)info[i].hart == i;
+        mine += (int)info[i].pid == getpid();
+    }
+    check_eq(ids, n, "harts in order, from 0");
+    check_eq(mine, 1, "this process on one of them");
+    check(info[0].ticks > 0 && info[0].switches > 0, "hart 0 has ticked and run processes");
+    check_eq(harts(NULL, 0), n, "harts counts with no room");
+    info[0].pid = 12345;
+    check_eq(harts(info, 0), n, "harts with no room");
+    check_eq((int)info[0].pid, 12345, "fills in nothing then");
+    check_eq(harts((struct hartinfo *)0x10, 1), -EFAULT, "harts to unmapped memory");
+    check_eq(harts(info, 0x40000000u), -EFAULT, "harts to a buffer past user space");
 }
 
 /* The network's calls on a machine without a card (the tests run systest
@@ -829,6 +862,7 @@ int main(int argc, char **argv) {
     test_pipes();
     test_exec();
     test_procs_and_kill();
+    test_harts();
     test_network_without_a_card();
     printf("systest: %d checks, %d failed\n", checks, failures);
     return failures;

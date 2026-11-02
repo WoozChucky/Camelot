@@ -124,3 +124,34 @@ intr_off:
 intr_on:
     csrsi sstatus, 2
     ret
+
+# Atomic read-modify-write of one word, for the counters and flags harts
+# share outside any lock (smp.c, trap.c). Each is a single AMO, so nothing,
+# another hart or a trap on this one, can come between the read and the
+# write; .aqrl orders it against the loads and stores around it, as a
+# fence on each side would. Each returns the word as it was.
+
+# u32 atomic_swap(volatile u32 *p, u32 v): *p = v
+    .globl atomic_swap
+atomic_swap:
+    amoswap.w.aqrl a0, a1, (a0)
+    ret
+
+# u32 atomic_add(volatile u32 *p, u32 v): *p += v
+    .globl atomic_add
+atomic_add:
+    amoadd.w.aqrl a0, a1, (a0)
+    ret
+
+# u32 atomic_or(volatile u32 *p, u32 v): *p |= v
+    .globl atomic_or
+atomic_or:
+    amoor.w.aqrl a0, a1, (a0)
+    ret
+
+# void fence_rw(void): orders every load and store before it before every
+# load and store after it, as other harts see them.
+    .globl fence_rw
+fence_rw:
+    fence rw, rw
+    ret

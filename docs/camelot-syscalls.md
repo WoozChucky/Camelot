@@ -100,6 +100,7 @@ there is a filesystem to look it up in.
 | 37 | `getsockname` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT` |
 | 38 | `getpeername` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN` |
 | 39 | `setsockopt` | `int fd, int level, int option, const void *value, uint len` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EINVAL`, `-ENOPROTOOPT` |
+| 40 | `harts` | `struct hartinfo *buf, uint max` | the number of harts; `-EFAULT` |
 
 **exit(status)** ends the caller. Its exit status is kept for its parent's
 `wait`; the slot and every page the process held are freed once the parent
@@ -326,6 +327,19 @@ name of the path it was started from, at most 15 characters). A process
 that `spawn` is still loading is not listed. All of `buf`, `max` entries,
 must be writable, however many are stored, or it is `-EFAULT` and nothing
 is.
+
+**harts(buf, max)** describes the harts the kernel runs on, from hart 0
+up, in the array of `max` `struct hartinfo` (16 bytes each, `user.h`) at
+`buf`, and returns how many there are: 1 on a one-hart machine, else every
+hart Grail has (`--harts`; `docs/excalibur-spec.md` section 10, "Kernel
+SMP"). As for `procs`, only the first `max` are stored, `harts(NULL, 0)`
+just counts them, and all of `buf`, `max` entries, must be writable, or it
+is `-EFAULT`. Each entry holds `hart`, its id (0 to the count - 1); `pid`,
+the process it is running, which on the caller's own hart is the caller,
+or 0 while it idles; `ticks`, the timer ticks it has taken since it
+started (each hart has its own timer: hart 0's are `uptime`'s); and
+`switches`, the times it has switched to a process since it started. A
+process runs on one hart at a time, but not always the same one.
 
 The network's calls are what the `ifconfig` and `ping` programs use;
 `docs/camelot-net.md` describes the stack behind them. Addresses are
@@ -683,6 +697,7 @@ Programs are compiled freestanding with only `user.h`, which declares the
 calls above (the stubs in `usys.s`, which return the raw result, a negative
 error number included), their constants and structures (`O_*`, `SEEK_*`,
 `struct stat`, `struct dirent`, `T_*`, `struct procinfo`, `PROC_*`,
+`struct hartinfo`,
 `struct netinfo`, `struct net_stats`, `NETINFO_*`, `struct ping_reply`,
 `AF_INET`, `SOCK_*`, `IPPROTO_*`, `INADDR_*`, `SHUT_*`, `SOL_SOCKET`,
 `SO_RCVTIMEO`, `struct in_addr`, `struct sockaddr_in`, `struct timeval`,

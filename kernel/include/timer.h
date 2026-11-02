@@ -23,8 +23,9 @@ u32 timebase_hz(void);
  * least 1. */
 u32 timer_interval(void);
 
-/* M-mode: arms the first timer interrupt one interval from now and stores the
- * interval in machine_scratch, where machine_vec rearms from. */
+/* M-mode, on each hart: arms the hart's first timer interrupt one interval
+ * from now and stores the interval and the address of the hart's mtimecmp
+ * in its block of machine_scratch, where machine_vec rearms from. */
 void timer_init(void);
 
 #endif

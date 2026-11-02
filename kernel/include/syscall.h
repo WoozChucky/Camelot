@@ -52,6 +52,7 @@
 #define SYS_getsockname 37 /* getsockname(fd, addr): 0, this end's address in *addr */
 #define SYS_getpeername 38 /* getpeername(fd, addr): 0, the other end's address in *addr */
 #define SYS_setsockopt 39 /* setsockopt(fd, level, option, value, len): 0 */
+#define SYS_harts 40   /* harts(buf, max): the number of harts, up to max described in buf */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process */
@@ -148,6 +149,17 @@ struct procinfo {
     u32 state;
     u32 size;
     char name[16];
+};
+
+/* What harts stores for each hart running the kernel: 16 bytes. `pid` is
+ * the process running on it (the caller, on the caller's hart), 0 while the
+ * hart idles; `ticks` the timer ticks it has taken and `switches` the
+ * processes it has switched to, both since it started. */
+struct hartinfo {
+    u32 hart;
+    u32 pid;
+    u32 ticks;
+    u32 switches;
 };
 
 /* The network's counters, in netinfo's `stats` (docs/camelot-net.md,

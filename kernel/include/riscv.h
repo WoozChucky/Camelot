@@ -26,6 +26,7 @@
 #define IRQ_S_EXT 9
 #define IRQ_M_EXT 11
 
+#define MIE_MSIE (1u << IRQ_M_SOFT)
 #define MIE_MTIE (1u << IRQ_M_TIMER)
 #define SIE_SSIE (1u << IRQ_S_SOFT)
 #define SIE_SEIE (1u << IRQ_S_EXT)
@@ -90,5 +91,19 @@ void wfi(void);
 /* Turn S-mode interrupts off / on (sstatus.SIE). */
 void intr_off(void);
 void intr_on(void);
+
+/* One AMO each (amoswap.w, amoadd.w, amoor.w, with aq and rl): *p = v,
+ * *p += v, *p |= v, as one indivisible step that another hart's accesses
+ * can't come between. Each returns the old value. For words that harts
+ * share without a lock (smp.c). */
+u32 atomic_swap(volatile u32 *p, u32 v);
+u32 atomic_add(volatile u32 *p, u32 v);
+u32 atomic_or(volatile u32 *p, u32 v);
+
+/* fence rw, rw: every load and store before it is seen by other harts
+ * before any load or store after it. For the one place where two harts each
+ * store a word and then load the other's (cpus[i].pagetable against a PTE,
+ * smp.c), which locks and AMOs don't cover. */
+void fence_rw(void);
 
 #endif
