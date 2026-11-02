@@ -1,0 +1,30 @@
+
+link.lld.elf:	file format elf32-littleriscv
+
+Disassembly of section .text:
+
+80000000 <_start>:
+80000000: 00010117     	auipc	sp, 0x10
+80000004: 07010113     	addi	sp, sp, 0x70
+
+80000008 <.Lpcrel_hi1>:
+80000008: 00000517     	auipc	a0, 0x0
+8000000c: 04850513     	addi	a0, a0, 0x48
+80000010: 00000097     	auipc	ra, 0x0
+80000014: 010080e7     	jalr	0x10(ra) <puts>
+80000018: 0005000b     	<unknown>
+8000001c: 0000100b     	<unknown>
+
+80000020 <puts>:
+80000020: 100002b7     	lui	t0, 0x10000
+80000024: 00050313     	mv	t1, a0
+80000028: 00034383     	lbu	t2, 0x0(t1)
+8000002c: 00038e63     	beqz	t2, 0x80000048 <puts+0x28>
+80000030: 0052ce03     	lbu	t3, 0x5(t0)
+80000034: 020e7e13     	andi	t3, t3, 0x20
+80000038: fe0e0ce3     	beqz	t3, 0x80000030 <puts+0x10>
+8000003c: 00728023     	sb	t2, 0x0(t0)
+80000040: 00130313     	addi	t1, t1, 0x1
+80000044: fe5ff06f     	j	0x80000028 <puts+0x8>
+80000048: 40a30533     	sub	a0, t1, a0
+8000004c: 00008067     	ret
