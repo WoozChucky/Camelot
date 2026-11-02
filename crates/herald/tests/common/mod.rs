@@ -154,11 +154,16 @@ impl Herald {
         }
     }
 
-    /// Types `bytes`.
+    /// Types `bytes`. Like a real terminal, keys typed after the session has
+    /// ended (say, right after the detach key) go nowhere: the session drops
+    /// its end of the channel when it returns, which may happen before the
+    /// test has sent everything, so a failed send is not an error.
     pub fn type_keys(&self, bytes: &[u8]) {
         let keys = self.keys.as_ref().expect("the input is still open");
         for &b in bytes {
-            keys.send(b).unwrap();
+            if keys.send(b).is_err() {
+                return;
+            }
         }
     }
 
