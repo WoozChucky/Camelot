@@ -78,3 +78,45 @@ fn data_relocations_and_symbols() {
     let bss = out.lines().find(|l| l.contains(".bss ")).unwrap();
     assert!(bss.ends_with("00000010 00000000 BSS"), "{bss}");
 }
+
+/// Like llvm-objdump, a run of at least 8 zero bytes is printed as `...`,
+/// but never past a relocation shown with `-r` (clang's object for the same
+/// source gives the same lines, except that LLVM prints each zero halfword
+/// as `0000 <unknown>`).
+#[test]
+fn zero_runs() {
+    let src = "
+    .text
+    .word 0x13
+    .word 0, 0, 0
+    .word 0x13
+    .word 0
+    .word 0x13
+    .word 0, 0
+    .word ext
+    .word 0x13
+";
+    let opts = Options {
+        disassemble: true,
+        relocs: true,
+        ..Options::default()
+    };
+    let out = dump("z.o", &merlin_as::assemble_to_elf(src).unwrap(), &opts).unwrap();
+    let expected = "
+z.o:\tfile format elf32-littleriscv
+
+Disassembly of section .text:
+
+00000000 <.text>:
+       0: 00000013     \tnop
+\t\t...
+      10: 00000013     \tnop
+      14: 00000000     \t.word\t0x00000000
+      18: 00000013     \tnop
+\t\t...
+      24: 00000000     \t.word\t0x00000000
+\t\t\t00000024:  R_RISCV_32\text
+      28: 00000013     \tnop
+";
+    assert_eq!(out, expected);
+}
