@@ -19,3 +19,6 @@ crates/merlin-as/tests/golden/*.golden text eol=lf
 *.inc text eol=lf
 # Documents some tests read and compare against the code.
 *.md text eol=lf
+# The root filesystem's files are copied into disk images byte for byte:
+# the same bytes on every checkout.
+kernel/fs/** -text

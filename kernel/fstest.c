@@ -1,0 +1,543 @@
+/* Mounting the root filesystem at boot, and its self-test (spec section 10,
+ * "Kernel filesystem"). Disk requests sleep, so it all runs in a kernel
+ * process, on disk 0:
+ *
+ * - mount: the superblock is checked and a committed transaction left in
+ *   the log by a crash is replayed ("fs: replayed N blocks from the log");
+ *   then one line with the sizes and what is free, and a listing of `/`;
+ * - read checks, on any filesystem: the root is inode 1 and its own `.` and
+ *   `..`; spellings of `/` (`//`, `/.`, `/..`, ...) all find it; every entry
+ *   of `/` is found by its path; missing names, names that are too long and
+ *   paths through a file fail with the right error; nameiparent() splits off
+ *   the last name; the first file of `/` reads back whole in odd-sized
+ *   pieces; and each file in `/bin` named after one of the kernel's
+ *   embedded programs is byte for byte that program (`cargo xtask fs` puts
+ *   them there);
+ * - with `fs_test` = FS_TEST_WRITE (patched in by the tests) and a writable
+ *   disk, transactions: make /fstest and /fstest/a (2500 bytes) in one, then
+ *   /fstest/b (700 bytes), remove a, write /fstest/big (13 KiB + 100 bytes,
+ *   so past the direct blocks) 3 KiB per transaction, make and remove
+ *   /fstest/d, then have two kernel processes make /fstest/p1 and p2 at
+ *   once (their operations share one transaction: group commit); read
+ *   everything back, check the errors, the free counts and the number of
+ *   commits, and list /fstest. The tests stop the machine
+ *   after every disk write of this and check that the disk, replayed, holds
+ *   all of each transaction or none of it. */
+#include "fstest.h"
+#include "blk.h"
+#include "fs.h"
+#include "kprintf.h"
+#include "log.h"
+#include "proc.h"
+#include "string.h"
+
+volatile u32 fs_test = FS_TEST_READ;
+
+static int passed;
+static int failed;
+/* A filesystem was mounted and the checks ran. */
+static bool tested;
+
+static u8 data[4 * BSIZE];
+static char path[64];
+
+static void check(bool ok, const char *what) {
+    if (ok) {
+        passed++;
+    } else {
+        failed++;
+        kprintf("fs self-test FAILED: %s\n", what);
+    }
+}
+
+/* Inode `inum` as the disk (or the cache, if a transaction changed it)
+ * has it, without locking it. */
+static void dinode(u32 inum, struct dinode *out) {
+    struct buf *b = fs_bread(fs_dev, IBLOCK(inum, fs_sb));
+    memcpy(out, (const struct dinode *)b->data + inum % IPB, sizeof *out);
+    brelse(b);
+}
+
+/* `prefix` + `name` in `path`. */
+static const char *join(const char *prefix, const char *name) {
+    ksnprintf(path, sizeof path, "%s%s", prefix, name);
+    return path;
+}
+
+/* Calls `fn` for each used entry of the directory `dir`, with its name
+ * (NUL-terminated) and inode. */
+static void for_each_entry(const char *dir, void (*fn)(const char *name, u32 inum)) {
+    int err;
+    struct inode *dp = namei(dir, &err);
+    if (dp == NULL) {
+        return;
+    }
+    ilock(dp);
+    struct dirent de;
+    char name[DIRSIZ + 1];
+    for (u32 off = 0; off < dp->size; off += sizeof de) {
+        if (readi(dp, &de, off, sizeof de) != sizeof de) {
+            break;
+        }
+        if (de.inum == 0) {
+            continue;
+        }
+        memcpy(name, de.name, DIRSIZ);
+        name[DIRSIZ] = 0;
+        /* `fn` may look paths up, which locks directories: not this one. */
+        iunlock(dp);
+        fn(name, de.inum);
+        ilock(dp);
+    }
+    iunlock(dp);
+    iput(dp);
+}
+
+/* ---- Listing ---- */
+
+static void ls_entry(const char *name, u32 inum) {
+    struct dinode d;
+    dinode(inum, &d);
+    char type = d.type == T_DIR ? 'd' : d.type == T_FILE ? 'f' : d.type == T_DEVICE ? 'c' : '?';
+    kprintf("%c %4u %2u %7u %s\n", type, inum, d.nlink, d.size, name);
+}
+
+/* Lists directory `dir`: type (d, f, c), inode, links, size, name. */
+static void ls(const char *dir) {
+    kprintf("fs: ls %s\n", dir);
+    begin_op();
+    for_each_entry(dir, ls_entry);
+    end_op();
+}
+
+/* ---- Read checks ---- */
+
+/* The root's entries other than `.` and `..` that namei() didn't find as
+ * themselves, the first regular file there, and how many entries. */
+static u32 entries_wrong;
+static u32 entries_seen;
+static char first_file[DIRSIZ + 1];
+
+static void check_entry(const char *name, u32 inum) {
+    if (namecmp(name, ".") == 0 || namecmp(name, "..") == 0) {
+        return;
+    }
+    entries_seen++;
+    int err;
+    struct inode *ip = namei(join("/", name), &err);
+    if (ip == NULL || ip->inum != inum) {
+        entries_wrong++;
+    }
+    if (ip != NULL) {
+        iput(ip);
+    }
+    struct dinode d;
+    dinode(inum, &d);
+    if (d.type == T_FILE && first_file[0] == 0) {
+        memcpy(first_file, name, DIRSIZ + 1);
+    }
+}
+
+/* Reads all of file `name` in pieces of `piece` bytes; returns the bytes
+ * read and whether a read at the end returned 0. */
+static u32 read_in_pieces(struct inode *ip, u32 piece, bool *end_ok) {
+    u32 total = 0;
+    for (;;) {
+        int n = readi(ip, data, total, piece);
+        if (n <= 0) {
+            break;
+        }
+        total += (u32)n;
+    }
+    *end_ok = readi(ip, data, ip->size, 1) == 0 && readi(ip, data, ip->size + 5, 1) == 0;
+    return total;
+}
+
+/* Whether file `p` holds exactly `len` bytes equal to `want`. */
+static bool holds(const char *p, const u8 *want, u32 len) {
+    int err;
+    struct inode *ip = namei(p, &err);
+    if (ip == NULL) {
+        return false;
+    }
+    ilock(ip);
+    bool ok = ip->type == T_FILE && ip->size == len;
+    for (u32 off = 0; ok && off < len; off += sizeof data) {
+        u32 n = len - off < sizeof data ? len - off : sizeof data;
+        ok = readi(ip, data, off, n) == (int)n && memcmp(data, want + off, n) == 0;
+    }
+    iunlockput(ip);
+    return ok;
+}
+
+/* Each embedded program that /bin has. */
+static void check_programs(void) {
+    int err;
+    struct inode *bin = namei("/bin", &err);
+    if (bin == NULL) {
+        return;
+    }
+    iput(bin);
+    u32 found = 0;
+    u32 same = 0;
+    for (u32 i = 0; i < user_program_count; i++) {
+        const struct user_program *prog = &user_programs[i];
+        struct inode *ip = namei(join("/bin/", prog->name), &err);
+        if (ip == NULL) {
+            continue;
+        }
+        iput(ip);
+        found++;
+        same += holds(join("/bin/", prog->name), prog->elf, prog->size);
+    }
+    kprintf("fs: /bin holds %u of the kernel's %u programs\n", found, user_program_count);
+    check(same == found, "the programs in /bin are the kernel's");
+}
+
+static void read_checks(void) {
+    int err;
+    begin_op();
+    struct inode *root = namei("/", &err);
+    check(root != NULL && root->inum == ROOTINO, "/ is inode 1");
+    if (root == NULL) {
+        end_op();
+        return;
+    }
+    ilock(root);
+    check(root->type == T_DIR, "the root is a directory");
+    struct inode *dot = dirlookup(root, ".", NULL);
+    struct inode *dotdot = dirlookup(root, "..", NULL);
+    check(dot == root && dotdot == root, "the root's . and .. are itself");
+    iunlock(root);
+    if (dot != NULL) {
+        iput(dot);
+    }
+    if (dotdot != NULL) {
+        iput(dotdot);
+    }
+
+    static const char *const roots[] = {"", "/", "//", "/.", "/..", "/./../", ".", "/../.."};
+    bool all = true;
+    for (u32 i = 0; i < sizeof roots / sizeof roots[0]; i++) {
+        struct inode *ip = namei(roots[i], &err);
+        all = all && ip == root;
+        if (ip != NULL) {
+            iput(ip);
+        }
+    }
+    check(all, "every spelling of / finds the root");
+
+    entries_wrong = 0;
+    entries_seen = 0;
+    first_file[0] = 0;
+    for_each_entry("/", check_entry);
+    check(entries_wrong == 0, "every entry of / is found by its path");
+
+    struct inode *ip = namei("/no such file", &err);
+    check(ip == NULL && err == -ENOENT, "a missing name is not found");
+    ip = namei("/abcdefghijklmno", &err);
+    check(ip == NULL && err == -ENAMETOOLONG, "a name of 15 bytes is too long");
+    char name[DIRSIZ + 1];
+    ip = nameiparent("//new/", name, &err);
+    check(ip == root && strcmp(name, "new") == 0, "nameiparent splits off the last name");
+    if (ip != NULL) {
+        iput(ip);
+    }
+    ip = nameiparent("/", name, &err);
+    check(ip == NULL && err == -EINVAL, "/ has no parent");
+
+    if (first_file[0] != 0) {
+        char file[DIRSIZ + 2];
+        ksnprintf(file, sizeof file, "/%s", first_file);
+        ip = namei(join(file, "/x"), &err);
+        check(ip == NULL && err == -ENOTDIR, "a path through a file fails");
+        ip = namei(file, &err);
+        if (ip != NULL) {
+            ilock(ip);
+            bool end_small;
+            bool end_big;
+            u32 small = read_in_pieces(ip, 333, &end_small);
+            u32 big = read_in_pieces(ip, sizeof data, &end_big);
+            check(small == ip->size && big == ip->size && end_small && end_big,
+                  "a file reads back whole, and nothing past its end");
+            iunlockput(ip);
+        }
+    }
+    check_programs();
+    iput(root);
+    end_op();
+}
+
+/* ---- Transactions (FS_TEST_WRITE) ---- */
+
+#define A_LEN 2500
+#define B_LEN 700
+#define BIG_LEN (13 * BSIZE + 100)
+#define CHUNK (3 * BSIZE)
+#define BIG_CHUNKS ((BIG_LEN + CHUNK - 1) / CHUNK)
+#define P_LEN 1500
+/* /fstest, b, big (14 blocks and the indirect one), p1 and p2 (2 blocks
+ * each) are left. */
+#define BLOCKS_LEFT (1 + 1 + 14 + 1 + 2 + 2)
+#define INODES_LEFT 5
+/* T1 (/fstest and a), b, removing a, making big, its chunks, making d,
+ * removing d, the two writers' operations together. */
+#define COMMITS (3 + 1 + BIG_CHUNKS + 2 + 1)
+
+/* The contents of the test files: byte i of the file with `seed` is
+ * i * 7 + seed + i / 251 (so no two blocks are alike). */
+static u8 pattern_byte(u32 i, u32 seed) {
+    return (u8)(i * 7 + seed + i / 251);
+}
+
+static void fill(u8 *p, u32 off, u32 n, u32 seed) {
+    for (u32 i = 0; i < n; i++) {
+        p[i] = pattern_byte(off + i, seed);
+    }
+}
+
+/* Whether file `p` holds `len` bytes of the pattern with `seed`. Its own
+ * transaction (iput may write). */
+static bool holds_pattern(const char *p, u32 len, u32 seed) {
+    int err;
+    begin_op();
+    struct inode *ip = namei(p, &err);
+    if (ip == NULL) {
+        end_op();
+        return false;
+    }
+    ilock(ip);
+    bool ok = ip->type == T_FILE && ip->size == len;
+    for (u32 off = 0; ok && off < len; off += sizeof data) {
+        u32 n = len - off < sizeof data ? len - off : sizeof data;
+        ok = readi(ip, data, off, n) == (int)n;
+        for (u32 i = 0; ok && i < n; i++) {
+            ok = data[i] == pattern_byte(off + i, seed);
+        }
+    }
+    iunlockput(ip);
+    end_op();
+    return ok;
+}
+
+/* Makes file `p` holding `len` bytes of the pattern with `seed`, filled
+ * in `buf`, in the caller's operation. */
+static void make_file(const char *p, u32 len, u32 seed, u8 *buf) {
+    int err;
+    struct inode *ip = fs_create(p, T_FILE, 0, 0, &err);
+    check(ip != NULL, "create a file");
+    if (ip == NULL) {
+        return;
+    }
+    fill(buf, 0, len, seed);
+    check(writei(ip, buf, 0, len) == (int)len, "write a file");
+    iunlockput(ip);
+}
+
+/* Two kernel processes, each making a file in an operation of its own.
+ * Each starts its operation and yields, so both are in progress before
+ * either writes (once the transaction holds a block, begin_op() would hold
+ * a second operation back until the commit: the log must have room for
+ * MAXOPBLOCKS more per operation). Then the last to end commits both: one
+ * transaction. Each has its own buffer, since they run at the same time. */
+static u32 writers_done;
+static u8 writer_data[2][P_LEN];
+
+static void writer(u32 n) {
+    begin_op();
+    yield();
+    make_file(n == 0 ? "/fstest/p1" : "/fstest/p2", P_LEN, 4 + n, writer_data[n]);
+    end_op();
+    writers_done++;
+    wakeup(&writers_done);
+}
+
+static void writer1(void) {
+    writer(0);
+}
+
+static void writer2(void) {
+    writer(1);
+}
+
+/* The link count of the directory or file at `p`, in a transaction of its
+ * own. */
+static u32 nlink(const char *p) {
+    int err;
+    u32 n = 0;
+    begin_op();
+    struct inode *ip = namei(p, &err);
+    if (ip != NULL) {
+        ilock(ip);
+        n = ip->nlink;
+        iunlockput(ip);
+    }
+    end_op();
+    return n;
+}
+
+static void write_test(void) {
+    u32 blocks0;
+    u32 inodes0;
+    fs_count_free(&blocks0, &inodes0);
+    u32 commits0 = log_commits;
+    int err;
+
+    /* T1: a directory and a file in it. */
+    begin_op();
+    struct inode *ip = fs_create("/fstest", T_DIR, 0, 0, &err);
+    check(ip != NULL, "make /fstest");
+    if (ip != NULL) {
+        iunlockput(ip);
+    }
+    make_file("/fstest/a", A_LEN, 1, data);
+    end_op();
+
+    begin_op();
+    make_file("/fstest/b", B_LEN, 2, data);
+    end_op();
+
+    begin_op();
+    check(fs_unlink("/fstest/a") == 0, "remove /fstest/a");
+    end_op();
+
+    /* A file bigger than one transaction may write: made empty, then
+     * written CHUNK bytes at a time, each in its own transaction (as the
+     * write system call will). The reference outlives the transactions. */
+    begin_op();
+    struct inode *big = fs_create("/fstest/big", T_FILE, 0, 0, &err);
+    check(big != NULL, "make /fstest/big");
+    if (big != NULL) {
+        iunlock(big);
+    }
+    end_op();
+    bool wrote = big != NULL;
+    for (u32 off = 0; wrote && off < BIG_LEN; off += CHUNK) {
+        u32 n = BIG_LEN - off < CHUNK ? BIG_LEN - off : CHUNK;
+        begin_op();
+        ilock(big);
+        fill(data, off, n, 3);
+        wrote = writei(big, data, off, n) == (int)n;
+        iunlock(big);
+        end_op();
+    }
+    check(wrote, "write /fstest/big a piece per transaction");
+    if (big != NULL) {
+        begin_op();
+        iput(big);
+        end_op();
+    }
+
+    /* An empty directory, made and removed: /fstest's link count follows. */
+    begin_op();
+    ip = fs_create("/fstest/d", T_DIR, 0, 0, &err);
+    check(ip != NULL, "make /fstest/d");
+    if (ip != NULL) {
+        iunlockput(ip);
+    }
+    end_op();
+    check(nlink("/fstest") == 2 && nlink("/fstest/d") == 1, "a subdirectory links to its parent");
+    begin_op();
+    check(fs_unlink("/fstest/d") == 0, "remove the empty /fstest/d");
+    end_op();
+    check(nlink("/fstest") == 1, "and the link goes with it");
+
+    /* Group commit. */
+    u32 commits = log_commits;
+    writers_done = 0;
+    const char *why;
+    bool started = kproc_create("fswrite1", writer1, &why) != NULL;
+    started = started && kproc_create("fswrite2", writer2, &why) != NULL;
+    check(started, "start two writers");
+    while (started && writers_done < 2) {
+        sleep(&writers_done);
+    }
+    check(log_commits == commits + 1, "two writers' operations commit together");
+
+    /* Read it all back. */
+    check(holds_pattern("/fstest/b", B_LEN, 2), "/fstest/b reads back");
+    check(holds_pattern("/fstest/big", BIG_LEN, 3), "/fstest/big reads back, past its direct blocks");
+    check(holds_pattern("/fstest/p1", P_LEN, 4) && holds_pattern("/fstest/p2", P_LEN, 5),
+          "the two writers' files read back");
+
+    /* Errors, which change nothing. */
+    begin_op();
+    ip = namei("/fstest/a", &err);
+    check(ip == NULL && err == -ENOENT, "/fstest/a is gone");
+    check(fs_create("/fstest/b", T_FILE, 0, 0, &err) == NULL && err == -EEXIST, "create: the name is taken");
+    check(fs_create("/nowhere/x", T_FILE, 0, 0, &err) == NULL && err == -ENOENT, "create: no such directory");
+    check(fs_create("/fstest/b/x", T_FILE, 0, 0, &err) == NULL && err == -ENOTDIR,
+          "create: a file is not a directory");
+    check(fs_create("/fstest/abcdefghijklmno", T_FILE, 0, 0, &err) == NULL && err == -ENAMETOOLONG,
+          "create: a name too long");
+    check(fs_unlink("/fstest") == -ENOTEMPTY, "unlink: a directory with entries");
+    check(fs_unlink("/fstest/..") == -EINVAL && fs_unlink("/") == -EINVAL, "unlink: . and .. and /");
+    check(fs_unlink("/fstest/a") == -ENOENT, "unlink: no such file");
+    ip = namei("/fstest/b", &err);
+    if (ip != NULL) {
+        ilock(ip);
+        check(writei(ip, data, B_LEN + 1, 1) == -EINVAL, "write: no holes");
+        check(writei(ip, data, B_LEN, MAXFILE * BSIZE) == -EFBIG, "write: past the largest file");
+        check(ip->size == B_LEN, "and the size is unchanged");
+        iunlockput(ip);
+    }
+    end_op();
+
+    u32 blocks;
+    u32 inodes;
+    fs_count_free(&blocks, &inodes);
+    check(blocks == blocks0 - BLOCKS_LEFT && inodes == inodes0 - INODES_LEFT,
+          "what was removed gave its blocks and inode back");
+    check(log_commits - commits0 == COMMITS, "one commit per transaction that wrote");
+    ls("/fstest");
+}
+
+/* ---- Boot ---- */
+
+static void fs_main(void) {
+    const char *why = "";
+    int err = fs_mount(0, &why);
+    if (err == -ENOENT) {
+        kprintf("fs: no filesystem on disk 0\n");
+        return;
+    }
+    if (err < 0) {
+        kprintf("fs: disk 0 not mounted: %s\n", why);
+        return;
+    }
+    if (log_recovered > 0) {
+        kprintf("fs: replayed %u blocks from the log\n", log_recovered);
+    }
+    u32 blocks;
+    u32 inodes;
+    fs_count_free(&blocks, &inodes);
+    kprintf("fs: disk 0 mounted: %u blocks (%u free), %u inodes (%u free), %u log blocks%s\n", fs_sb.size,
+            blocks, fs_sb.ninodes, inodes, fs_sb.nlog, fs_readonly ? ", read-only" : "");
+    ls("/");
+    tested = true;
+    read_checks();
+    if (fs_test == FS_TEST_WRITE) {
+        if (fs_readonly) {
+            kprintf("fs: write test skipped: the disk is read-only\n");
+        } else {
+            write_test();
+        }
+    }
+}
+
+int fs_boot(void) {
+    if (blk_count() == 0) {
+        return 0;
+    }
+    const char *err;
+    if (kproc_create("fs", fs_main, &err) == NULL) {
+        kprintf("fs: cannot start: %s\n", err);
+        return 1;
+    }
+    scheduler();
+    if (!tested) {
+        return 0;
+    }
+    kprintf("fs self-test: %d/%d passed\n", passed, passed + failed);
+    return failed;
+}

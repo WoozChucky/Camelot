@@ -1,0 +1,10 @@
+Camelot root filesystem
+
+This disk was built on the host by `cargo xtask fs`, with the mkfs of the
+camelot-fs crate. Its format is in docs/camelot-fs.md.
+
+/README   this file
+/bin      the user programs, the same ones the kernel embeds
+
+The kernel mounts it at boot and lists /. Running programs from /bin and
+the file system calls come next (issue #67).

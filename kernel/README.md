@@ -5,8 +5,8 @@ up trap delegation and the timer, then the kernel runs in S-mode: it prints a
 banner and a `kprintf` self-test over the UART, puts every free page of RAM on
 the page allocator's free list, turns on Sv32 paging with a kernel page table,
 runs the memory self-tests, lists the disks, takes ten timer ticks, tests the
-first disk if there is one, and starts the shell, a user program, as the first
-process. User programs run in U-mode, each in its own page table, switching on
+first disk if there is one and mounts the filesystem on it, and starts the
+shell, a user program, as the first process. User programs run in U-mode, each in its own page table, switching on
 every timer tick; they call the kernel through system calls
 (`docs/camelot-syscalls.md`): console input and output, starting and waiting
 for programs, sleeping, growing the heap. A program that faults is killed and
@@ -58,8 +58,38 @@ tick 1
 ...
 tick 10
 blk self-test: 14/14 passed
+fs: no filesystem on disk 0
 Type help for the list of commands.
 ```
+
+Disk 0 holding a Camelot filesystem (`docs/camelot-fs.md`) is mounted as the
+root: the kernel replays its log if a crash left a transaction there, lists
+`/` and runs its filesystem self-test (spec section 10, "Kernel
+filesystem"). `cargo xtask fs` builds the root image with the user programs
+in `/bin` and the files of `fs/` at `/`, no LLVM needed:
+
+```
+cargo xtask fs
+cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf
+```
+
+```
+blk self-test: 16/16 passed
+fs: disk 0 mounted: 2048 blocks (1780 free), 256 inodes (238 free), 21 log blocks
+fs: ls /
+d    1  2      64 .
+d    1  2      64 ..
+f    2  1     355 README
+d    3  1     256 bin
+fs: /bin holds 14 of the kernel's 14 programs
+fs self-test: 12/12 passed
+Type help for the list of commands.
+```
+
+`cargo run -p camelot-fs -- ls target/camelot-fs.img /bin` (and `cat`,
+`fsck`, `mkfs`) reads and builds images on the host. Running programs from
+`/bin` and the file system calls come with #67; until then the filesystem is
+the kernel-internal API in `include/fs.h` and `include/log.h`.
 
 The shell (`user/sh.c`) runs programs by name, with arguments: `PROG
 [ARG...]`. `CMD & CMD` runs the first in the background (the shell prints its
@@ -146,8 +176,9 @@ The traps, the M-mode layer and the panic format are described in
 tables and the kernel address space in "Kernel memory"; the PLIC setup, the
 UART driver and the console in "Kernel console"; processes, the system calls,
 the user programs and the shell in "Kernel processes"; the disk driver and the
-buffer cache in "Kernel disks". A failed disk self-test check counts in the
-exit code like the others.
+buffer cache in "Kernel disks"; the log, the filesystem and mounting in
+"Kernel filesystem" (the on-disk format in `docs/camelot-fs.md`). A failed
+disk or filesystem self-test check counts in the exit code like the others.
 
 A panic looks like this (from the deliberate illegal instruction the tests
 trigger by patching `boot_fault` in the image to 2):
@@ -206,14 +237,18 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `blk.c` | disk driver: `blk_init()` finds the disks in the sysinfo device table and enables their completion interrupts; `blk_read()`/`blk_write()`/`blk_flush()` issue one DMA request at a time and sleep until `blk_intr()`, the interrupt handler, wakes them with the `BLK_ERROR` code |
 | `bio.c` | buffer cache (xv6's): 30 one-KiB block buffers in LRU order, `bread()`/`bwrite()`/`brelse()`, each buffer sleep-locked while in use |
 | `blktest.c` | the disk self-test, in kernel processes: three readers at once, write and read back a scratch block (restored afterwards), errors, LRU reuse |
+| `log.c` | the filesystem's write-ahead log (xv6's): `begin_op()`/`end_op()` around each operation, `log_write()` pinning changed buffers, group commit (slots, flush, header, flush, install, flush, empty header, flush), and the replay at mount |
+| `fs.c` | the filesystem (xv6's): `fs_mount()`, the bitmap allocator, the inode cache (`iget`/`ilock`/`iput`, `readi`/`writei`), directories, path lookup (`namei`/`nameiparent`), `fs_create()`/`fs_unlink()` |
+| `fstest.c` | `fs_boot()`: mounts disk 0 in a kernel process, lists `/`, runs the filesystem self-test (and, with `fs_test` patched to 2, its transactions) |
+| `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin` |
 | `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()` and `wfi()` |
-| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, then the user-space shell as the first process |
+| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, the filesystem (`fs_boot`), then the user-space shell as the first process |
 | `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |
 | `console.c` | the `read` and `write` system calls: `console_read()` (line editing and echo: backspace, CR/LF/CR LF, Ctrl-D; sleeps until a line is complete), `console_write()`, `console_intr()` (the UART interrupt, waking readers) |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |
 | `kernel.ld` | layout: `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end` |
-| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct context`, `struct user_program`), `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `syscall.h` (the system call and error numbers), and the headers for the above |
+| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct context`, `struct user_program`), `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API and error numbers), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `syscall.h` (the system call and error numbers), and the headers for the above |
 | `kernel.elf` | the prebuilt image, committed so `cargo test` and Grail need no LLVM |
 | `kernel.elf.clang-version` | the clang that built `kernel.elf` |
 
@@ -255,9 +290,9 @@ clang --target=riscv32-unknown-elf -march=rv32im_zicsr -mabi=ilp32 -mno-relax -m
       -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
       -Wall -Wextra -Werror -Iinclude -c main.c -o main.c.o        # and each other .c
 ld.lld -T kernel.ld -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf.c.o entry.s.o \
-       kalloc.c.o kernelvec.s.o kprintf.c.o machine.s.o main.c.o plic.c.o probe.s.o proc.c.o \
-       riscv.s.o start.c.o string.c.o swtch.s.o syscall.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
-       userprogs.s.o uservec.s.o vm.c.o vmtest.c.o
+       fs.c.o fstest.c.o kalloc.c.o kernelvec.s.o kprintf.c.o log.c.o machine.s.o main.c.o plic.c.o \
+       probe.s.o proc.c.o riscv.s.o start.c.o string.c.o swtch.s.o syscall.c.o sysinfo.c.o timer.c.o \
+       trap.c.o uart.c.o userprogs.s.o uservec.s.o vm.c.o vmtest.c.o
 ```
 
 The build is reproducible: the same clang gives byte-identical output wherever

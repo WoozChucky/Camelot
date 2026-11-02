@@ -396,11 +396,14 @@ fn kernel_tests_an_image_file_disk_and_leaves_it_as_it_was() {
         out.contains("timebase\ndisk 0: 128 sectors (64 KiB), irq 3\ntick 1\n"),
         "{out}"
     );
-    // After the ticks, before the shell.
+    // After the ticks, before the shell, and before the kernel looks for a
+    // filesystem on the disk (it holds none).
     assert!(out.contains("tick 10\nblk self-test: "), "{out}");
     assert!(blk_selftest_passed(&out) > 10, "{out}");
     assert!(
-        out.ends_with(&format!(" passed\n{SHELL_BANNER}{PROMPT}exit\n")),
+        out.ends_with(&format!(
+            " passed\nfs: no filesystem on disk 0\n{SHELL_BANNER}{PROMPT}exit\n"
+        )),
         "{out}"
     );
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
