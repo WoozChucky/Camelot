@@ -101,6 +101,12 @@ pub const SCRIPT: &str = "kernel.ld";
 /// The generated source that holds the user programs
 /// (`crate::userprogs::GENERATED`), in the kernel directory.
 pub const USERPROGS: &str = "userprogs.s";
+/// The kernel with its user programs built in, in the kernel directory: what
+/// Grail runs as a program (`grail kernel/kernel.elf`), with or without a disk.
+pub const KERNEL_ELF: &str = "kernel.elf";
+/// The kernel without them ([`disk_kernel`]), in the kernel directory: what a
+/// bootable root image holds (`cargo xtask fs`).
+pub const DISK_KERNEL: &str = "kernel-disk.elf";
 
 /// What assembles the `.s` files in the reference build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +262,48 @@ pub fn build_merlin(kernel_dir: &Path, userprogs: Option<&Path>) -> Result<Built
     Ok(Built { objects, elf })
 }
 
+/// The disk kernel (`kernel/kernel-disk.elf`, [`DISK_KERNEL`]): the objects of
+/// `built` linked again with `kernel_dir`'s linker script, but with a `userprogs.s`
+/// that has no programs ([`crate::userprogs::empty`]), so the kernel runs every
+/// program from `/bin` on its root filesystem.
+///
+/// This is the Linux split: `kernel/kernel.elf` carries its programs, about 1.1 MB
+/// of its 1.4 MB, the way an initramfs carries the programs of a machine with no
+/// root disk; the kernel a bootable image holds (`cargo xtask fs`) does not need
+/// them, since the same programs are in the image's `/bin`, and is a quarter the
+/// size. Booted with no shell in `/bin` (or with no root filesystem at all) it
+/// panics: there is nothing else to run.
+pub fn disk_kernel(kernel_dir: &Path, built: &Built) -> Result<Vec<u8>, String> {
+    let empty = toolchain::assemble(USERPROGS, &crate::userprogs::empty())?;
+    let inputs: Vec<merlin_ld::Input> = built
+        .objects
+        .iter()
+        .map(|o| merlin_ld::Input {
+            name: o.source.object_name(),
+            data: if o.source.name == USERPROGS {
+                empty.clone()
+            } else {
+                o.obj.clone()
+            },
+        })
+        .collect();
+    if !built.objects.iter().any(|o| o.source.name == USERPROGS) {
+        return Err(format!("the kernel has no {USERPROGS} to leave out"));
+    }
+    toolchain::link(kernel_dir, SCRIPT, &inputs, "the disk kernel")
+}
+
+/// The disk kernel's path for a kernel written to `out`: `kernel.elf` gives
+/// `kernel-disk.elf` next to it.
+pub fn disk_kernel_path(out: &Path) -> PathBuf {
+    let stem = out.file_stem().unwrap_or_default().to_string_lossy();
+    let name = match out.extension() {
+        Some(ext) => format!("{stem}-disk.{}", ext.to_string_lossy()),
+        None => format!("{stem}-disk"),
+    };
+    out.with_file_name(name)
+}
+
 /// Everything needed for one kernel build. The tools run with `kernel_dir` as
 /// their working directory, so relative `obj_dir`/`out` paths are taken
 /// relative to it; pass absolute ones.
@@ -374,7 +422,17 @@ impl Build {
             }
             write(obj_dir.join(o.source.object_name()), &o.obj)?;
         }
-        write(self.kernel_dir.join(&self.out), &built.elf)
+        let out = self.kernel_dir.join(&self.out);
+        write(out.clone(), &built.elf)?;
+        // The same kernel without its programs, for bootable images.
+        let disk = disk_kernel_path(&out);
+        if self.verbose {
+            eprintln!(
+                "merlin-ld (again, with no user programs) -o {}",
+                disk.display()
+            );
+        }
+        write(disk, &disk_kernel(&self.kernel_dir, &built)?)
     }
 
     fn merlin_as(&self, src: &Source) -> Result<(), String> {

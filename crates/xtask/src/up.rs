@@ -192,7 +192,7 @@ pub fn build(options: &Options, log: Log) -> Result<Vec<u8>, String> {
         "up: building the root image {}",
         options.image.display()
     ));
-    let image = crate::fs::build_bootable(&options.root, &camelot_fs::mkfs::Options::default())?;
+    let image = crate::fs::build_bootable(&options.root, crate::fs::IMAGE_SIZE)?;
     if let Some(dir) = options.image.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }

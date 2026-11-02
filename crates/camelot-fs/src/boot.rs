@@ -13,6 +13,11 @@
 //! `size` belong to the filesystem, so a bootable image is still a valid
 //! version 1 filesystem, and fsck, the reader and the kernel see no
 //! difference.
+//!
+//! Only what the bootloader loads is stored ([`loadable`]): the ELF header, the
+//! program headers and the bytes of the loadable segments, at their offsets. The
+//! section headers, the symbols and their names stay in the kernel's file on the
+//! host, for the disassembler and the tests.
 
 use crate::{Superblock, BSIZE, SECTOR_SIZE, SUPER_BLOCK};
 
@@ -113,14 +118,42 @@ pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// What of the kernel ELF `elf` a bootable image stores: the ELF header and the
+/// program headers, and each loadable segment's bytes at their offset in the file,
+/// up to the end of the last one; the gaps between them are zeros. The section
+/// headers (and with them the symbols) are gone: the header says there are none.
+/// The bootloader reads only these parts, and the result is still an ELF file that
+/// loads the same.
+pub fn loadable(elf: &[u8]) -> Result<Vec<u8>, String> {
+    let e = elf32::Elf::parse(elf).map_err(|e| format!("kernel: {e}"))?;
+    let h = &e.header;
+    let headers = h.phoff as usize + h.phnum as usize * elf32::PHDR_SIZE;
+    let mut out = elf
+        .get(..headers.max(elf32::EHDR_SIZE))
+        .ok_or("kernel: the program headers run past the file")?
+        .to_vec();
+    for p in e.segments.iter().filter(|p| p.ty == elf32::PT_LOAD && p.filesz != 0) {
+        let data = e.segment_data(p).map_err(|e| format!("kernel: {e}"))?;
+        let at = p.offset as usize;
+        out.resize(out.len().max(at + data.len()), 0);
+        out[at..at + data.len()].copy_from_slice(data);
+    }
+    // No section headers: e_shoff, then e_shentsize, e_shnum and e_shstrndx.
+    out[32..36].fill(0);
+    out[46..52].fill(0);
+    Ok(out)
+}
+
 /// Makes the filesystem `image` bootable: the bootloader's code (from its ELF,
-/// see [`boot_code`]) in the boot block, the kernel ELF (see [`check_kernel`])
-/// appended after the filesystem's last block and padded to a whole block, and
-/// the boot block's fields and checksum filled in. `image` must hold exactly
-/// the filesystem, as [`crate::mkfs`] makes it, with nothing in the boot block.
+/// see [`boot_code`]) in the boot block, the kernel ELF (see [`check_kernel`];
+/// only its [`loadable`] part) appended after the filesystem's last block and
+/// padded to a whole block, and the boot block's fields and checksum filled in.
+/// `image` must hold exactly the filesystem, as [`crate::mkfs`] makes it, with
+/// nothing in the boot block.
 pub fn install(image: &mut Vec<u8>, boot_elf: &[u8], kernel_elf: &[u8]) -> Result<BootInfo, String> {
     let code = boot_code(boot_elf)?;
     check_kernel(kernel_elf)?;
+    let kernel_elf = &loadable(kernel_elf)?;
     let sb = Superblock::decode(crate::block(image, SUPER_BLOCK));
     sb.validate((image.len() / BSIZE) as u64)?;
     if image.len() != sb.size as usize * BSIZE {

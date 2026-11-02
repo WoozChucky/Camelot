@@ -301,6 +301,13 @@ static void init_start(void) {
     int err = exec_init(init_path, init_name);
     if (err < 0) {
         kprintf("cannot start %s: error %d\n", init_path, -err);
+        if (user_program_count == 0) {
+            /* The disk kernel (kernel/kernel-disk.elf) has no programs of its
+             * own to fall back on, like Linux without an initramfs: without
+             * the shell on the root filesystem there is nothing to run. */
+            panic(fs_mounted ? "no shell in /bin, and no programs built into the kernel"
+                             : "no root filesystem, and no programs built into the kernel");
+        }
         proc_exit(-1);
     }
     user_trap_return(p->frame);

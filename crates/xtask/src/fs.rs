@@ -6,8 +6,12 @@
 //!
 //! The image is bootable ([`build_bootable`]): Camelot's bootloader
 //! (`kernel/boot/boot.s`, built with merlin-as + merlin-ld) in the boot
-//! block and the committed `kernel/kernel.elf` after the filesystem, so
-//! Grail needs no program to run it.
+//! block and the committed disk kernel, `kernel/kernel-disk.elf` ([`KERNEL`]),
+//! after the filesystem, so Grail needs no program to run it. The disk kernel
+//! has no programs built in (the Linux way: the programs are on the root
+//! filesystem, and only `kernel/kernel.elf`, run without a disk, carries its own,
+//! as an initramfs would), so the whole system fits in a 2 MiB image
+//! ([`IMAGE_SIZE`]): the filesystem gets the blocks the kernel leaves.
 //!
 //! ```text
 //! cargo xtask fs
@@ -17,10 +21,15 @@
 
 use crate::userprogs::{self, CCompiler};
 use camelot_fs::mkfs::{Mkfs, Options};
+use camelot_fs::BSIZE;
 use std::path::{Path, PathBuf};
 
-/// The kernel installed in a bootable image (under the repository root).
-pub const KERNEL: &str = "kernel/kernel.elf";
+/// The kernel installed in a bootable image (under the repository root): the one
+/// without built-in programs (`crate::kernel::disk_kernel`).
+pub const KERNEL: &str = "kernel/kernel-disk.elf";
+/// A bootable image's size by default, in 1 KiB blocks: 2 MiB, the boot block,
+/// the filesystem and the kernel together.
+pub const IMAGE_SIZE: u32 = 2048;
 /// The host directory copied to `/`.
 pub const ROOT_DIR: &str = "kernel/fs";
 /// Where the image goes by default (under the repository root).
@@ -58,13 +67,41 @@ pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>,
     Ok(fs.finish())
 }
 
-/// [`build`], made bootable: the bootloader from `kernel/boot/boot.s` in the
-/// boot block, [`KERNEL`] after the filesystem (`camelot_fs::boot::install`).
-pub fn build_bootable(root: &Path, opts: &Options) -> Result<Vec<u8>, String> {
-    let mut image = build(root, opts)?;
+/// The shape of the filesystem of a bootable image of `size` blocks whose kernel
+/// ELF is `kernel`: the default inodes and log, and every block the kernel leaves
+/// (it takes what `camelot_fs::boot::install` stores of it, in whole blocks).
+pub fn bootable_layout(size: u32, kernel: &[u8]) -> Result<Options, String> {
+    let kernel_blocks = camelot_fs::boot::loadable(kernel)?.len().div_ceil(BSIZE);
+    let kernel_blocks = u32::try_from(kernel_blocks).map_err(|_| "kernel: too big")?;
+    let fs = size.checked_sub(kernel_blocks).filter(|&b| b > 0).ok_or_else(|| {
+        format!(
+            "a {size}-block image has no room for a filesystem: the kernel alone takes {kernel_blocks} \
+             blocks"
+        )
+    })?;
+    Ok(Options {
+        size: fs,
+        ..Options::default()
+    })
+}
+
+/// [`build`], made bootable, `size` blocks in all ([`IMAGE_SIZE`] by default): the
+/// bootloader from `kernel/boot/boot.s` in the boot block, [`KERNEL`] after the
+/// filesystem (`camelot_fs::boot::install`), and the filesystem as big as the rest
+/// ([`bootable_layout`]). Fails, saying so, when the files do not fit.
+pub fn build_bootable(root: &Path, size: u32) -> Result<Vec<u8>, String> {
     let kernel_path = root.join(KERNEL);
     let kernel =
         std::fs::read(&kernel_path).map_err(|e| format!("cannot read {}: {e}", kernel_path.display()))?;
+    let opts = bootable_layout(size, &kernel)?;
+    let mut image = build(root, &opts).map_err(|e| {
+        format!(
+            "the root filesystem does not fit in a {size}-block image, where the kernel leaves it {} \
+             blocks ({e}): give a bigger --size",
+            opts.size
+        )
+    })?;
     camelot_fs::boot::install(&mut image, &crate::boot::bootloader(root)?, &kernel)?;
+    debug_assert_eq!(image.len(), size as usize * BSIZE);
     Ok(image)
 }
