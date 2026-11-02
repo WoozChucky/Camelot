@@ -1,36 +1,56 @@
 //! `cargo xtask ld-fixtures`: regenerates merlin-ld's test fixtures in
-//! `crates/merlin-ld/tests/fixtures` with clang, ld.lld and llvm-readobj.
+//! `crates/merlin-ld/tests/fixtures` with clang, ld.lld, llvm-readobj and
+//! llvm-objdump.
 //!
 //! In every fixture directory:
 //!
 //! * each `name.S` is assembled by clang into the committed `name.o`;
-//! * each `name.ld` is linked by ld.lld, and `llvm-readelf -S -l -s` of the
-//!   result is written to `name.expected.txt`. The objects are listed in the
-//!   script's first comment, `/* objects: norelocs/start.o layouts/edge.o */`
+//! * each `name.ld` is linked by ld.lld into the committed `name.lld.elf`,
+//!   with `llvm-readelf -S -l -s` of it in `name.expected.txt` and
+//!   `llvm-objdump -d` of it in `name.objdump.txt`. The objects are listed in
+//!   the script's first comment, `/* objects: norelocs/start.o layouts/edge.o */`
 //!   (paths relative to the fixtures directory); without one, every `.o` in
 //!   the script's directory is linked, in name order.
 //!
 //! merlin-ld's tests link the same objects with the same scripts and compare
-//! section addresses, `PT_LOAD`s and symbol values with `name.expected.txt`.
+//! section addresses, `PT_LOAD`s and symbol values with `name.expected.txt`,
+//! the loadable bytes with `name.lld.elf`, and merlin-objdump's disassembly of
+//! the result with `name.objdump.txt`.
 //!
 //! `hello/hello.S` and `hello/link.ld` are copied from `examples/hello` first,
 //! so the fixture always follows the example (a test checks the copies).
 //!
-//! Objects are built with `-mno-relax`: merlin-ld does no linker relaxation,
-//! and ld.lld must not shrink code either or the layouts would differ.
+//! Objects are built with `-mno-relax` and linked with `--no-relax`: merlin-ld
+//! does no linker relaxation, and ld.lld must not shrink code either or the
+//! outputs would differ. A source containing the line `# xtask: relax` is
+//! assembled with relaxation instead ([`RELAX_MARKER`]), to check that
+//! merlin-ld ignores the `R_RISCV_RELAX` hints that come with it.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// clang flags for every fixture object.
-pub const ASM_FLAGS: &[&str] = &[
-    "--target=riscv32",
-    "-march=rv32im_zicsr",
-    "-mabi=ilp32",
-    "-mno-relax",
-    "-c",
-];
+/// clang flags for every fixture object, followed by [`NO_RELAX`] unless the
+/// source asks for relaxation.
+pub const ASM_FLAGS: &[&str] = &["--target=riscv32", "-march=rv32im_zicsr", "-mabi=ilp32", "-c"];
+
+/// The default: no `R_RISCV_RELAX` or `R_RISCV_ALIGN` in the object.
+pub const NO_RELAX: &str = "-mno-relax";
+
+/// A line that makes a fixture source build with relaxation (`-mrelax`).
+pub const RELAX_MARKER: &str = "# xtask: relax";
+
+/// Whether a fixture source asks to be assembled with relaxation.
+pub fn wants_relax(source: &str) -> bool {
+    source.lines().any(|l| l.trim_end() == RELAX_MARKER)
+}
+
+/// The clang arguments that assemble a fixture source (before its file names).
+pub fn asm_flags(source: &str) -> Vec<&'static str> {
+    let mut flags = ASM_FLAGS.to_vec();
+    flags.push(if wants_relax(source) { "-mrelax" } else { NO_RELAX });
+    flags
+}
 
 /// The objects a fixture script lists in its `/* objects: ... */` comment.
 pub fn script_objects(script: &str) -> Option<Vec<String>> {
@@ -44,6 +64,7 @@ pub struct Tools {
     pub clang: PathBuf,
     pub lld: PathBuf,
     pub readobj: PathBuf,
+    pub objdump: PathBuf,
     pub verbose: bool,
 }
 
@@ -107,7 +128,8 @@ pub fn run(fixtures: &Path, examples: &Path, tools: &Tools) -> Result<Vec<PathBu
     for dir in &dirs {
         for src in files(dir, "S")? {
             let obj = src.with_extension("o");
-            let mut args: Vec<OsString> = ASM_FLAGS.iter().map(OsString::from).collect();
+            let source = std::fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+            let mut args: Vec<OsString> = asm_flags(&source).into_iter().map(OsString::from).collect();
             args.extend([file_name(&src), "-o".into(), file_name(&obj)]);
             tools.exec(&tools.clang, &args, dir)?;
             written.push(obj);
@@ -131,7 +153,8 @@ pub fn run(fixtures: &Path, examples: &Path, tools: &Tools) -> Result<Vec<PathBu
                     .to_string_lossy()
                     .into_owned();
                 let elf = tmp.join(format!("{stem}.elf"));
-                let mut args: Vec<OsString> = vec!["-T".into(), script.clone().into_os_string()];
+                let mut args: Vec<OsString> =
+                    vec!["--no-relax".into(), "-T".into(), script.clone().into_os_string()];
                 args.extend(objects.into_iter().map(PathBuf::into_os_string));
                 args.extend(["-o".into(), elf.clone().into_os_string()]);
                 tools.exec(&tools.lld, &args, fixtures)?;
@@ -142,6 +165,15 @@ pub fn run(fixtures: &Path, examples: &Path, tools: &Tools) -> Result<Vec<PathBu
                     .collect();
                 let listing = tools.exec(&tools.readobj, &args, &tmp)?;
                 let out = dir.join(format!("{stem}.expected.txt"));
+                std::fs::write(&out, listing).map_err(|e| format!("{}: {e}", out.display()))?;
+                written.push(out);
+
+                let copy = dir.join(format!("{stem}.lld.elf"));
+                std::fs::copy(&elf, &copy).map_err(|e| format!("{}: {e}", copy.display()))?;
+                written.push(copy.clone());
+                let args: Vec<OsString> = vec!["-d".into(), file_name(&copy)];
+                let listing = tools.exec(&tools.objdump, &args, dir)?;
+                let out = dir.join(format!("{stem}.objdump.txt"));
                 std::fs::write(&out, listing).map_err(|e| format!("{}: {e}", out.display()))?;
                 written.push(out);
             }
@@ -164,5 +196,17 @@ mod tests {
         );
         assert_eq!(script_objects("/* a comment */ /* objects: x.o */"), None);
         assert_eq!(script_objects("SECTIONS {}"), None);
+    }
+
+    #[test]
+    fn relax_marker() {
+        let plain = asm_flags("    .text\n    nop\n");
+        assert_eq!(plain.last(), Some(&"-mno-relax"));
+        assert_eq!(&plain[..plain.len() - 1], ASM_FLAGS);
+        let relax = asm_flags("# xtask: relax\r\n# built with relaxation\n    nop\n");
+        assert_eq!(relax.last(), Some(&"-mrelax"));
+        assert!(!relax.contains(&"-mno-relax"));
+        // Only as a line of its own.
+        assert!(!wants_relax("# see `# xtask: relax` in relax.S\n"));
     }
 }

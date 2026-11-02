@@ -1,18 +1,22 @@
 //! End-to-end tests against clang-built objects and ld.lld's output for the
 //! same inputs (`tests/fixtures`, regenerate with `cargo xtask ld-fixtures`).
-//! Each `name.ld` there lists its objects in its first comment, and
-//! `name.expected.txt` is `llvm-readelf -S -l -s` of ld.lld's link.
+//! Each `name.ld` there lists its objects in its first comment;
+//! `name.lld.elf` is ld.lld's link, `name.expected.txt` is
+//! `llvm-readelf -S -l -s` of it and `name.objdump.txt` is `llvm-objdump -d`
+//! of it.
 //!
-//! * `fixtures/norelocs`: three relocation-free objects. Linked by merlin-ld,
-//!   the PT_LOADs, section headers and symbols must equal ld.lld's, and Grail
-//!   must load and run the result.
+//! Linked by merlin-ld, the PT_LOAD contents must equal ld.lld's byte for
+//! byte, the section headers and symbols must match, merlin-objdump's
+//! disassembly must match llvm-objdump's, and the program must run in Grail:
+//!
+//! * `fixtures/norelocs`: three relocation-free objects.
 //! * `fixtures/layouts`: layout edge cases (empty and assignment-only output
-//!   sections, gaps, NOBITS before PROGBITS, `. +=` sections), compared the
-//!   same way.
+//!   sections, gaps, NOBITS before PROGBITS, `. +=` sections).
+//! * `fixtures/hello`: `examples/hello/hello.S` assembled by clang.
+//! * `fixtures/relocs`: every relocation type, across objects, at the edges
+//!   of their ranges; one object built with relaxation (`R_RISCV_RELAX`).
 //! * `fixtures/merge`: mergeable strings, where merlin-ld differs from ld.lld
 //!   on purpose (spec §10); the test pins down the difference.
-//! * `fixtures/hello`: `examples/hello/hello.S` assembled by clang. It has
-//!   relocations, so only the layout is compared until issue #7.
 //! * `fixtures/rejects`, `fixtures/symbols`: objects for error paths.
 
 use grail::{Machine, RunResult};
@@ -90,12 +94,25 @@ fn case(script: &str) -> (Vec<Input>, Options) {
         .split("*/")
         .next()
         .and_then(|c| c.trim().strip_prefix("/*"))
-        .and_then(|c| c.trim().strip_prefix("objects:"))
-        .unwrap_or_else(|| panic!("{script}: no /* objects: ... */ comment"));
-    let objs = list
-        .split_whitespace()
-        .map(|o| input(&fixtures().join(o)))
-        .collect();
+        .and_then(|c| c.trim().strip_prefix("objects:"));
+    let objs = match list {
+        Some(list) => list
+            .split_whitespace()
+            .map(|o| input(&fixtures().join(o)))
+            .collect(),
+        // Without the comment: every object in the script's directory, in
+        // name order (as `cargo xtask ld-fixtures` links them).
+        None => {
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.extension().is_some_and(|e| e == "o"))
+                .collect();
+            paths.sort();
+            assert!(!paths.is_empty(), "{script}: no objects");
+            paths.iter().map(|p| input(p)).collect()
+        }
+    };
     (objs, opts)
 }
 
@@ -168,7 +185,8 @@ fn parse_readelf(text: &str) -> Readelf {
                 flags: t[6..t.len() - 1].concat(),
                 align: hex(t[t.len() - 1]),
             });
-        } else if t.len() == 8 && (t[4] == "GLOBAL" || t[4] == "WEAK") {
+        } else if t.len() == 8 && (t[4] == "GLOBAL" || t[4] == "WEAK") && t[6] != "UND" {
+            // (ld.lld lists undefined weak symbols, merlin-ld leaves them out.)
             r.globals.insert(t[7].into(), hex(t[1]));
         }
     }
@@ -314,12 +332,85 @@ fn norelocs_matches_ld_lld() {
         3,
         "fixture sanity: RX, R and RW segments"
     );
-    assert_matches_ld_lld("norelocs/link");
+    assert_matches_ld_lld("norelocs/link", "OK\n");
+}
+
+/// `(vaddr, memsz, file bytes)` of every PT_LOAD of an executable.
+fn load_images(elf: &[u8]) -> Vec<(u32, u32, Vec<u8>)> {
+    let (phoff, phnum) = (u32_at(elf, 28) as usize, u16_at(elf, 44) as usize);
+    (0..phnum)
+        .map(|i| phoff + 32 * i)
+        .filter(|&p| u32_at(elf, p) == 1)
+        .map(|p| {
+            let (off, filesz) = (u32_at(elf, p + 4) as usize, u32_at(elf, p + 16) as usize);
+            (
+                u32_at(elf, p + 8),
+                u32_at(elf, p + 20),
+                elf[off..off + filesz].to_vec(),
+            )
+        })
+        .collect()
+}
+
+/// `llvm-objdump -d` text without its first line (which names the file),
+/// line endings normalized.
+fn disassembly_body(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .skip_while(|l| !l.contains("file format"))
+        .skip(1)
+        .collect()
+}
+
+/// merlin-objdump's `-d` of our link against llvm-objdump's of ld.lld's
+/// (`name.objdump.txt`). Two deliberate differences (spec §10) are allowed:
+///
+/// * where LLVM prints `<unknown>` (the Xcal instructions), merlin-objdump
+///   names the instruction; the address and the word must still agree;
+/// * a symbol assigned by the script is `SHN_ABS` in merlin-ld's output, so
+///   when it shares its address with a symbol of the section, a label line
+///   may name the other one.
+fn assert_same_disassembly(name: &str, linked: &merlin_ld::Linked) {
+    let elf = &linked.elf;
+    let script_symbol = |n: &str| {
+        linked
+            .layout
+            .globals
+            .iter()
+            .any(|(g, d)| g == n && matches!(d, merlin_ld::layout::Def::Script(_)))
+    };
+    let opts = merlin_objdump::Options {
+        disassemble: true,
+        ..Default::default()
+    };
+    let ours = disassembly_body(&merlin_objdump::dump("ours.elf", elf, &opts).unwrap());
+    let path = fixtures().join(format!("{name}.objdump.txt"));
+    let lld = disassembly_body(&std::fs::read_to_string(&path).unwrap());
+    assert!(lld.len() > 3, "{name}: empty llvm-objdump listing");
+    assert_eq!(ours.len(), lld.len(), "{name}: disassembly length");
+    // `80001040 <mid>:` -> ("80001040", "mid")
+    let label = |l: &str| {
+        let (addr, rest) = l.split_once(" <")?;
+        Some((addr.to_string(), rest.strip_suffix(">:")?.to_string()))
+    };
+    for (o, l) in ours.iter().zip(&lld) {
+        if let Some(word) = l.strip_suffix("<unknown>") {
+            assert!(o.starts_with(word), "{name}:\n ours: {o}\n llvm: {l}");
+        } else if let (Some((oa, _)), Some((la, ln))) = (label(o), label(l)) {
+            assert!(
+                o == l || (oa == la && script_symbol(&ln)),
+                "{name}:\n ours: {o}\n llvm: {l}"
+            );
+        } else {
+            assert_eq!(o, l, "{name}: disassembly");
+        }
+    }
 }
 
 /// Links fixture script `name.ld` with the objects it lists, checks the result
-/// against ld.lld's (`name.expected.txt`) and runs it in Grail.
-fn assert_matches_ld_lld(name: &str) {
+/// against ld.lld's (`name.expected.txt`, `name.lld.elf`, `name.objdump.txt`)
+/// and runs it in Grail, which must print `output` and exit with 0.
+fn assert_matches_ld_lld(name: &str, output: &str) -> merlin_ld::Linked {
     let (objs, opts) = case(&format!("{name}.ld"));
     let linked = merlin_ld::link(&objs, &opts).unwrap_or_else(|e| panic!("{name}: {e:?}"));
     assert!(
@@ -333,12 +424,35 @@ fn assert_matches_ld_lld(name: &str) {
     assert_eq!(ours.sections, lld.sections, "{name}: sections");
     assert_eq!(ours.loads, lld.loads, "{name}: PT_LOADs");
     assert_eq!(ours.globals, lld.globals, "{name}: global symbols");
+
+    // Byte for byte: every loaded byte, relocated code and data included.
+    let lld_elf = std::fs::read(fixtures().join(format!("{name}.lld.elf"))).unwrap();
+    let (ours_img, lld_img) = (load_images(&linked.elf), load_images(&lld_elf));
+    assert_eq!(ours_img.len(), lld_img.len(), "{name}: PT_LOAD count");
+    for ((va, msz, a), (vb, mszb, b)) in ours_img.iter().zip(&lld_img) {
+        assert_eq!(
+            (va, msz, a.len()),
+            (vb, mszb, b.len()),
+            "{name}: segment at {va:#x}"
+        );
+        if let Some(i) = (0..a.len()).find(|&i| a[i] != b[i]) {
+            panic!(
+                "{name}: first difference at {:#x}: ours {:02x?}, ld.lld {:02x?}",
+                va + i as u32,
+                &a[i..(i + 8).min(a.len())],
+                &b[i..(i + 8).min(b.len())]
+            );
+        }
+    }
+    assert_same_disassembly(name, &linked);
+
     let (_, r, out) = run(&linked.elf);
     assert_eq!(
         (r, out.as_str()),
-        (RunResult::Exited(0), "OK\n"),
+        (RunResult::Exited(0), output),
         "{name}: run in Grail"
     );
+    linked
 }
 
 /// Layout edge cases against ld.lld: output sections with only empty inputs
@@ -367,7 +481,7 @@ fn layout_edge_cases_match_ld_lld() {
         ]
     );
     for name in &names {
-        assert_matches_ld_lld(name);
+        assert_matches_ld_lld(name, "OK\n");
     }
     // Spot checks, so a broken fixture can't make both sides agree on nonsense.
     let lld = expected("layouts/empty");
@@ -567,7 +681,7 @@ fn hello_fixture_is_current() {
     }
 }
 
-/// The PCREL_HI20 sites handed to the relocation hook (issue #7) are keyed by
+/// The PCREL_HI20 sites handed to the relocation hook are keyed by
 /// each auipc's own address, with its symbol's final address.
 #[test]
 fn relocation_context() {
@@ -596,71 +710,409 @@ fn relocation_context() {
     assert_eq!(sites, [(text, site("__stack_top")), (text + 8, site("message"))]);
 }
 
-/// Until issue #7 the relocation hook refuses every relocation, loudly.
-/// (Issue #7 replaces this with a run of the linked hello example.)
-#[test]
-fn relocations_are_not_silently_skipped() {
-    let opts = Options {
+fn hello_opts() -> Options {
+    Options {
         script: script_file(&repo_root().join("examples/hello/link.ld")),
         entry: None,
-    };
-    let errs = errors(merlin_ld::link(&inputs("hello", &["hello.o"]), &opts));
-    assert_eq!(
-        errs,
-        [
-            "hello.o: cannot apply R_RISCV_PCREL_HI20 against '__stack_top' at .text.start+0x0: relocation \
-             processing is not implemented yet (issue #7)",
-            "hello.o: cannot apply R_RISCV_PCREL_LO12_I against '.Lpcrel_hi0' at .text.start+0x4: relocation \
-             processing is not implemented yet (issue #7)",
-            "hello.o: cannot apply R_RISCV_PCREL_HI20 against 'message' at .text.start+0x8: relocation \
-             processing is not implemented yet (issue #7)",
-            "hello.o: cannot apply R_RISCV_PCREL_LO12_I against '.Lpcrel_hi1' at .text.start+0xc: relocation \
-             processing is not implemented yet (issue #7)",
-        ]
+    }
+}
+
+/// Acceptance: examples/hello assembled by clang and linked by merlin-ld is
+/// ld.lld's executable byte for byte (llvm-objdump -d of both is identical),
+/// and runs in Grail.
+#[test]
+fn hello_matches_ld_lld_and_runs() {
+    // xcal.dbg shows its own pc: 0x80000018, after the 8-byte `call puts`.
+    // (examples/hello/hello.elf says 0x80000014: built with relaxation,
+    // ld.lld shrank that call to a single `jal`.)
+    assert_matches_ld_lld(
+        "hello/link",
+        "Hello from Camelot!\n[dbg] pc=80000018 a0 = 0x00000014 (20)\n",
     );
 }
 
-/// Relocations that can't be applied are reported before the hook sees them.
-#[test]
-fn relocation_guards() {
-    let opts = Options {
-        script: script_file(&repo_root().join("examples/hello/link.ld")),
-        entry: None,
-    };
-    let hello = std::fs::read(fixtures().join("hello/hello.o")).unwrap();
-    let link = |data: Vec<u8>| {
-        errors(merlin_ld::link(
-            &[Input {
-                name: "hello.o".into(),
-                data,
-            }],
-            &opts,
-        ))
-    };
+/// The relocation types each fixture object carries, by name.
+fn reloc_types(path: &str) -> HashMap<String, usize> {
+    let data = std::fs::read(fixtures().join(path)).unwrap();
+    let obj = merlin_ld::object::parse(path, &data).unwrap();
+    let mut n = HashMap::new();
+    for s in &obj.sections {
+        for r in &s.relocs {
+            *n.entry(merlin_ld::reloc::name(r.ty)).or_insert(0) += 1;
+        }
+    }
+    n
+}
 
-    // First relocation's r_offset moved past the end of .text.start (0x50 bytes).
-    let mut b = hello.clone();
+/// Acceptance: every relocation type, in both directions between objects,
+/// at the edges of the BRANCH and JAL ranges, at the %hi/%lo rounding edge,
+/// with addends and against an undefined weak symbol, gives ld.lld's bytes.
+/// The program also checks its own relocated values at run time.
+#[test]
+fn relocs_match_ld_lld() {
+    // Fixture sanity: the objects really carry what the test is about.
+    let main = reloc_types("relocs/main.o");
+    for ty in [
+        "R_RISCV_32",
+        "R_RISCV_BRANCH",
+        "R_RISCV_JAL",
+        "R_RISCV_CALL",
+        "R_RISCV_CALL_PLT",
+        "R_RISCV_PCREL_HI20",
+        "R_RISCV_PCREL_LO12_I",
+        "R_RISCV_PCREL_LO12_S",
+        "R_RISCV_HI20",
+        "R_RISCV_LO12_I",
+        "R_RISCV_LO12_S",
+    ] {
+        assert!(main.contains_key(ty), "main.o has no {ty}: {main:?}");
+    }
+    assert!(
+        !main.contains_key("R_RISCV_RELAX"),
+        "main.o is built with -mno-relax"
+    );
+    let relax = reloc_types("relocs/relax.o");
+    assert_eq!(relax.get("R_RISCV_RELAX"), Some(&5), "{relax:?}");
+    assert_eq!(reloc_types("rejects/align.o").get("R_RISCV_ALIGN"), Some(&1));
+
+    let linked = assert_matches_ld_lld("relocs/link", "OK\n");
+    let l = &linked.layout;
+    // The edges main.S aims at, so a changed fixture can't silently lose them.
+    let start = l.symbol("_start").unwrap();
+    assert_eq!(start, 0x8010_0000);
+    assert_eq!(l.symbol("high_target").unwrap() - (start + 4), 0xf_fffc);
+    assert_eq!((start + 8) - l.symbol("low_target").unwrap(), 0x10_0000);
+    let edges = l.symbol("branch_edges").unwrap();
+    assert_eq!(edges - l.symbol("branch_back").unwrap(), 4096);
+    assert_eq!(l.symbol("branch_fwd").unwrap() - (edges + 4), 4092);
+}
+
+/// A jump or call to an undefined weak symbol aims at itself (as in ld.lld):
+/// 0 is out of a branch's reach. Data references to it see 0.
+#[test]
+fn undefined_weak_jumps_target_themselves() {
+    let (objs, opts) = case("relocs/link.ld");
+    let linked = merlin_ld::link(&objs, &opts).unwrap();
+    let elf = grail::elf::parse(&linked.elf).unwrap();
+    let text = elf.segments.iter().find(|s| s.paddr == 0x8010_0000).unwrap();
+    let words: Vec<u32> = text
+        .data
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    // `call missing` (auipc ra, 0; jalr ra, 0(ra)), `jal missing`, `beq a0, a1, missing`.
+    let at = words
+        .windows(4)
+        .position(|w| w == [0x0000_0097, 0x0000_80e7, 0x0000_00ef, 0x00b5_0063])
+        .expect("the self-targeting jumps");
+    assert!(at > 0);
+}
+
+/// A weak reference that another object defines is that definition, not an
+/// undefined weak: main.o's `.weak lib_inc` call, jump and branch reach
+/// lib.o's `lib_inc` (an undefined weak would aim them at themselves).
+#[test]
+fn weak_reference_defined_elsewhere_reaches_the_definition() {
+    use excalibur::Inst;
+    let (objs, opts) = case("relocs/link.ld");
+    assert_eq!(objs[0].name, "main.o");
+    let linked = merlin_ld::link(&objs, &opts).unwrap();
+    let l = &linked.layout;
+    let main = &l.objects[0];
+    let weak = main.symbols.iter().position(|s| s.name == "lib_inc").unwrap();
+    assert!(main.symbols[weak].is_weak() && main.symbols[weak].is_undefined());
+    assert!(!l.is_undefined_weak(0, weak));
+    let target = l.symbol("lib_inc").unwrap();
+
+    let elf = grail::elf::parse(&linked.elf).unwrap();
+    let word = |addr: u32| {
+        let seg = elf
+            .segments
+            .iter()
+            .find(|s| addr >= s.paddr && addr < s.paddr + s.data.len() as u32)
+            .unwrap();
+        u32_at(&seg.data, (addr - seg.paddr) as usize)
+    };
+    let sec = main
+        .sections
+        .iter()
+        .position(|s| s.name == ".text.start")
+        .unwrap();
+    let base = l.input_addr(0, sec).unwrap();
+    let mut kinds = Vec::new();
+    for r in main.sections[sec]
+        .relocs
+        .iter()
+        .filter(|r| r.sym as usize == weak)
+    {
+        let p = base + r.offset;
+        let to = match excalibur::decode(word(p)) {
+            Inst::Jal { imm, .. } | Inst::Branch { imm, .. } => p.wrapping_add(imm as u32),
+            Inst::Auipc { imm: hi, .. } => match excalibur::decode(word(p + 4)) {
+                Inst::Jalr { imm: lo, .. } => p.wrapping_add(hi).wrapping_add(lo as u32),
+                other => panic!("no jalr after the auipc: {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        };
+        let ty = merlin_ld::reloc::name(r.ty);
+        assert_eq!(to, target, "{ty} at {p:#x} goes to {to:#x}, not lib_inc");
+        kinds.push(ty);
+    }
+    assert_eq!(kinds, ["R_RISCV_CALL_PLT", "R_RISCV_JAL", "R_RISCV_BRANCH"]);
+}
+
+fn patch_hello(edit: impl Fn(&mut Vec<u8>, usize)) -> Vec<String> {
+    let mut b = std::fs::read(fixtures().join("hello/hello.o")).unwrap();
     let rela = u32_at(&b, shdr(&b, ".rela.text.start") + 16) as usize;
-    b[rela..rela + 4].copy_from_slice(&0x1000u32.to_le_bytes());
-    let errs = link(b);
+    edit(&mut b, rela);
+    errors(merlin_ld::link(
+        &[Input {
+            name: "hello.o".into(),
+            data: b,
+        }],
+        &hello_opts(),
+    ))
+}
+
+/// The symbol table index of `name` in a fixture object.
+fn symbol_index(path: &str, name: &str) -> u32 {
+    let data = std::fs::read(fixtures().join(path)).unwrap();
+    let obj = merlin_ld::object::parse(path, &data).unwrap();
+    obj.symbols.iter().position(|s| s.name == name).unwrap() as u32
+}
+
+/// hello.o's relocations, in order: PCREL_HI20 __stack_top (+0x0),
+/// PCREL_LO12_I .Lpcrel_hi0 (+0x4), PCREL_HI20 message (+0x8),
+/// PCREL_LO12_I .Lpcrel_hi1 (+0xc). Each entry is 12 bytes: r_offset,
+/// r_info (symbol << 8 | type), r_addend.
+fn set_rela(b: &mut [u8], rela: usize, n: usize, field: usize, v: u32) {
+    let at = rela + 12 * n + field;
+    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Relocations that can't be applied are reported with the file, section,
+/// offset and symbol, all of them in one run.
+#[test]
+fn relocation_errors() {
+    // Sanity: unpatched, it links.
+    assert!(merlin_ld::link(&inputs("hello", &["hello.o"]), &hello_opts()).is_ok());
+
+    // The HI20 moved past the end of .text.start (0x50 bytes): its LO12 then
+    // has no HI20 at its auipc label.
+    let errs = patch_hello(|b, rela| set_rela(b, rela, 0, 0, 0x1000));
+    assert_eq!(
+        errs,
+        [
+            "hello.o: R_RISCV_PCREL_HI20 at .text.start+0x1000 is outside section .text.start (size 0x50)",
+            "hello.o: R_RISCV_PCREL_LO12_I at .text.start+0x4 refers to '.Lpcrel_hi0', which is not the \
+             place of an R_RISCV_PCREL_HI20",
+        ]
+    );
+
+    // A 4-byte field in the last 2 bytes of the section.
+    let errs = patch_hello(|b, rela| set_rela(b, rela, 2, 0, 0x4e));
     assert_eq!(
         errs[0],
-        "hello.o: R_RISCV_PCREL_HI20 at .text.start+0x1000 is outside section .text.start (size 0x50)"
+        "hello.o: relocation R_RISCV_PCREL_HI20 against 'message' at .text.start+0x4e patches 4 bytes, but \
+         section .text.start ends 2 bytes after it"
     );
-    assert_eq!(errs.len(), 4, "{errs:?}");
+
+    // A type merlin-ld doesn't handle (GOT_HI20, for -fPIC code).
+    let stack_top = symbol_index("hello/hello.o", "__stack_top");
+    let errs = patch_hello(|b, rela| set_rela(b, rela, 0, 4, (stack_top << 8) | 20));
+    assert_eq!(
+        errs,
+        [
+            "hello.o: unsupported relocation R_RISCV_GOT_HI20 against '__stack_top' at .text.start+0x0",
+            "hello.o: R_RISCV_PCREL_LO12_I at .text.start+0x4 refers to '.Lpcrel_hi0', which is not the \
+             place of an R_RISCV_PCREL_HI20",
+        ]
+    );
+
+    // A PCREL_LO12 pointing at the data symbol instead of the auipc label,
+    // at an undefined symbol, or with an addend of its own.
+    let message = symbol_index("hello/hello.o", "message");
+    let errs = patch_hello(|b, rela| set_rela(b, rela, 1, 4, (message << 8) | 24));
+    assert_eq!(
+        errs,
+        ["hello.o: R_RISCV_PCREL_LO12_I at .text.start+0x4 refers to 'message' in section .rodata, not to \
+          the label of an auipc in .text.start"]
+    );
+    let errs = patch_hello(|b, rela| set_rela(b, rela, 1, 4, (stack_top << 8) | 25));
+    assert_eq!(
+        errs,
+        ["hello.o: R_RISCV_PCREL_LO12_S at .text.start+0x4 refers to '__stack_top', not to the label of an \
+          auipc in .text.start"]
+    );
+    let errs = patch_hello(|b, rela| set_rela(b, rela, 3, 8, 4));
+    assert_eq!(
+        errs,
+        ["hello.o: R_RISCV_PCREL_LO12_I against '.Lpcrel_hi1' at .text.start+0xc has addend 4; a %pcrel_lo \
+          takes the offset of its R_RISCV_PCREL_HI20 and must not have its own"]
+    );
+    // A PCREL_LO12 whose label is an auipc without a PCREL_HI20 on it.
+    let errs = patch_hello(|b, rela| set_rela(b, rela, 2, 4, (message << 8) | 26));
+    assert_eq!(
+        errs,
+        ["hello.o: R_RISCV_PCREL_LO12_I at .text.start+0xc refers to '.Lpcrel_hi1', which is not the place \
+          of an R_RISCV_PCREL_HI20"]
+    );
 
     // The relocations retargeted at .rodata, which is made NOBITS.
-    let mut b = hello.clone();
-    let rodata = shdr(&b, ".rodata");
-    b[rodata + 4..rodata + 8].copy_from_slice(&8u32.to_le_bytes());
-    let index = section_index(&b, ".rodata");
-    let rela = shdr(&b, ".rela.text.start");
-    b[rela + 28..rela + 32].copy_from_slice(&index.to_le_bytes());
-    let errs = link(b);
+    let errs = patch_hello(|b, _| {
+        let rodata = shdr(b, ".rodata");
+        b[rodata + 4..rodata + 8].copy_from_slice(&8u32.to_le_bytes());
+        let index = section_index(b, ".rodata");
+        let rela = shdr(b, ".rela.text.start");
+        b[rela + 28..rela + 32].copy_from_slice(&index.to_le_bytes());
+    });
     assert_eq!(errs.len(), 4, "{errs:?}");
     assert_eq!(
         errs[0],
         "hello.o: R_RISCV_PCREL_HI20 at .rodata+0x0 patches a NOBITS section"
+    );
+}
+
+/// Out of range and misaligned branches and jumps, from the relocs fixture
+/// laid out differently.
+#[test]
+fn branch_and_jump_range_errors() {
+    let objs = inputs("relocs", &["main.o", "lib.o", "relax.o"]);
+    // .high 4 bytes too far, .low 4 bytes too low, and .text.branch (8 KiB)
+    // between main.o's checks and lib.o.
+    let errs = errors(merlin_ld::link(
+        &objs,
+        &script(
+            "ENTRY(_start) SECTIONS { . = 0x7ffffffc; .low : { *(.low) } . = 0x80100000; \
+             .text : { *(.text.start) *(.text.branch) *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } __stack_top = . + 4K; \
+             . = 0x80200004; .high : { *(.high) } }",
+        ),
+    ));
+    // lib_check's `bne a0, t0, fail` is 0x3c into lib.o's .text, 8280 bytes
+    // after `fail` once .text.branch is in between; main.o's branch to the
+    // weak (but defined) lib_inc is about as far the other way. Were it taken for
+    // an undefined weak, it would silently target itself instead.
+    assert_eq!(
+        errs,
+        [
+            "main.o: relocation R_RISCV_JAL out of range for 'high_target' at .text.start+0x4: 1048576 is not \
+             in [-1048576, 1048574]",
+            "main.o: relocation R_RISCV_JAL out of range for 'low_target' at .text.start+0x8: -1048580 is not \
+             in [-1048576, 1048574]",
+            "main.o: relocation R_RISCV_BRANCH out of range for 'lib_inc' at .text.start+0x268: 8444 is not \
+             in [-4096, 4094]",
+            "lib.o: relocation R_RISCV_BRANCH out of range for 'fail' at .text+0x3c: -8280 is not in [-4096, \
+             4094]",
+        ]
+    );
+
+    // A jump to an odd offset (the addend made odd by hand).
+    let mut main = std::fs::read(fixtures().join("relocs/main.o")).unwrap();
+    let rela = u32_at(&main, shdr(&main, ".rela.text.start") + 16) as usize;
+    // The first relocation of .text.start is `jal high_target` at +0x4.
+    assert_eq!(u32_at(&main, rela), 4);
+    main[rela + 8..rela + 12].copy_from_slice(&1u32.to_le_bytes());
+    let objs = [
+        Input {
+            name: "main.o".into(),
+            data: main,
+        },
+        input(&fixtures().join("relocs/lib.o")),
+        input(&fixtures().join("relocs/relax.o")),
+    ];
+    let (_, opts) = case("relocs/link.ld");
+    assert_eq!(
+        errors(merlin_ld::link(&objs, &opts)),
+        [
+            "main.o: relocation R_RISCV_JAL against 'high_target' at .text.start+0x4 is misaligned: offset \
+          1048573 is not a multiple of 2"
+        ]
+    );
+}
+
+/// A relocation patches only its own input section, even when another input
+/// section follows it in the same output section (link.ld puts main.o's
+/// .text right after its .text.start).
+#[test]
+fn relocation_stops_at_its_input_section() {
+    let mut main = std::fs::read(fixtures().join("relocs/main.o")).unwrap();
+    let size = u32_at(&main, shdr(&main, ".text.start") + 20);
+    let rela = u32_at(&main, shdr(&main, ".rela.text.start") + 16) as usize;
+    // `jal high_target` moved to the last 2 bytes of .text.start.
+    main[rela..rela + 4].copy_from_slice(&(size - 2).to_le_bytes());
+    let objs = [
+        Input {
+            name: "main.o".into(),
+            data: main,
+        },
+        input(&fixtures().join("relocs/lib.o")),
+        input(&fixtures().join("relocs/relax.o")),
+    ];
+    let (_, opts) = case("relocs/link.ld");
+    let layout = merlin_ld::layout(&objs, &opts).unwrap();
+    let text = layout.section(".text").unwrap();
+    let next = text.inputs.iter().position(|i| i.addr == text.addr + size);
+    assert!(next.is_some(), "another input section follows .text.start");
+    assert_eq!(
+        errors(merlin_ld::link(&objs, &opts)),
+        [format!(
+            "main.o: relocation R_RISCV_JAL against 'high_target' at .text.start+{:#x} patches 4 bytes, but \
+             section .text.start ends 2 bytes after it",
+            size - 2
+        )]
+    );
+}
+
+/// R_RISCV_32 must fit 32 bits; merlin-as objects carry it for `.word sym`.
+#[test]
+fn data_word_relocations() {
+    let obj = |src: &str| Input {
+        name: "w.o".into(),
+        data: merlin_as::assemble_to_elf(src).unwrap(),
+    };
+    let src = ".globl _start\n.text\n_start:\n.word 0x0000100b\n.data\n\
+               .word _start\n.word _start + 8\n.word _start - 0x80000000\n.word here\nhere:\n";
+    let linked = merlin_ld::link(&[obj(src)], &Options::default()).unwrap();
+    let data = linked.layout.section(".data").unwrap();
+    let elf = grail::elf::parse(&linked.elf).unwrap();
+    let seg = elf.segments.iter().find(|s| s.paddr == data.addr).unwrap();
+    let words: Vec<u32> = seg.data[..16]
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(words, [0x8000_0000, 0x8000_0008, 0, data.addr + 16]);
+
+    // _start is at 0x80000004: one more than 0xffffffff.
+    let errs = errors(merlin_ld::link(
+        &[obj(
+            ".globl _start\n.text\n.word 0\n_start:\n.word 0x0000100b\n.data\n.word 0\n.word _start + 0x7ffffffc\n",
+        )],
+        &Options::default(),
+    ));
+    assert_eq!(
+        errs,
+        [
+            "w.o: relocation R_RISCV_32 out of range for '_start' at .data+0x4: 4294967296 is not in \
+          [-2147483648, 4294967295]"
+        ]
+    );
+}
+
+/// R_RISCV_ALIGN only makes sense with relaxation; R_RISCV_RELAX is ignored
+/// (relocs/relax.o, above).
+#[test]
+fn align_needs_relaxation() {
+    let errs = errors(merlin_ld::link(
+        &inputs("rejects", &["align.o"]),
+        &Options::default(),
+    ));
+    assert_eq!(
+        errs,
+        [
+            "align.o: R_RISCV_ALIGN at .text+0x4 needs linker relaxation, which merlin-ld does not do; \
+          assemble with -mno-relax"
+        ]
     );
 }
 

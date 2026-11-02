@@ -168,6 +168,13 @@ impl Layout {
             None => Err(format!("undefined reference to '{}'", s.name)),
         }
     }
+
+    /// Whether symbol `sym` of `obj` is a weak reference nobody defines (its
+    /// [`Layout::reloc_symbol`] value is then 0).
+    pub fn is_undefined_weak(&self, obj: usize, sym: usize) -> bool {
+        let s = &self.objects[obj].symbols[sym];
+        sym != 0 && s.is_weak() && s.is_undefined() && !self.global_index.contains_key(&s.name)
+    }
 }
 
 /// Mutable state while walking `SECTIONS`.
