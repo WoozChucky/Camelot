@@ -8,7 +8,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps), keyboard and pointer (from the window, with PLIC interrupts), sysinfo and block devices (disk images, `--disk`); configurable RAM, real-time clock and disks |
 | **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | Builds every example on its own, no LLVM (`cargo xtask examples`). merlin-as: complete; its objects match clang's ([encoder notes](crates/merlin-as/ENCODER.md)). merlin-ld: links clang objects to the same bytes as ld.lld except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: v0 (int-only C subset) compiles to assembly that our own assembler and linker build into programs Grail runs ([code generation notes](crates/merlin/src/codegen.rs)). merlin-objdump: matches llvm-objdump |
 | **Camelot** | The kernel / OS | Boots on Grail in S-mode: `kprintf`, trap handling, timer ticks, page allocator and Sv32 paging, interrupt-driven UART console with a tiny shell, user programs in U-mode with their own page tables, switched round robin on timer ticks ([kernel/](kernel/README.md)) |
-| **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Herald VM client and the Lake storage server | Protocol v1 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget and attachable consoles; Round Table, Herald and Lake come next |
+| **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Herald VM client and the Lake storage server | Protocol v1 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget and attachable consoles; Herald attaches a terminal to a VM's console; Round Table and Lake come next |
 
 ## Layout
 
@@ -18,6 +18,7 @@ crates/elf32            ELF32 reader (shared by grail, merlin-objdump, merlin-ld
 crates/grail            the emulator
 crates/avalon-proto     the Avalon protocol: frames, messages, blocking connection (docs/avalon-protocol.md)
 crates/avalon           the Avalon hypervisor server: runs N Grail VMs, serves the protocol
+crates/herald           Herald, the Avalon client that attaches a terminal to one VM's console
 crates/merlin           the C-subset compiler (C → .s), with its test programs in tests/cases
 crates/merlin-as        the assembler (source → ELF32 .o)
 crates/merlin-ld        the linker (.o files → ELF32 executable)
@@ -173,7 +174,7 @@ Grail runs one machine for one terminal. The Avalon platform runs many, as long-
 |---|---|---|---|
 | **Avalon** | `crates/avalon` | the hypervisor server: creates and runs N Grail VMs, each with its own hardware profile (RAM, clock, disks), and keeps each VM's console | done |
 | **Round Table** | `crates/round-table` | the control CLI: create, list, start, pause, resume, stop and destroy VMs | next |
-| **Herald** | `crates/herald` | attaches to one VM: its console (and later its screen and keyboard) | next |
+| **Herald** | `crates/herald` | attaches to one VM: its console (and later its screen and keyboard) | console done |
 | **Lake** | `crates/lake` | the storage server: disk images served as block devices over the network | next |
 
 They talk the Avalon protocol ([`docs/avalon-protocol.md`](docs/avalon-protocol.md)): length-prefixed binary frames over TCP, implemented once in `crates/avalon-proto` and shared by every program.
@@ -204,7 +205,7 @@ Every VM's UART is its console. Avalon keeps the last 64 KiB of output; a client
 
 Every bad request gets a protocol error, never a crash: an unknown VM, a bad name, a profile Grail cannot build (bad RAM size, zero clock, a missing disk image), a program that is not a loadable ELF (checked before anything is allocated for it), a request in the wrong state, a create over the RAM budget, malformed or misdirected frames. Screen and keyboard streaming (Herald's `--screen`) and disks on a Lake server are not served yet: their requests get `Unsupported` and `InvalidProfile`.
 
-Until Round Table and Herald exist, a client is a few lines of Rust over `avalon-proto`:
+Round Table and Herald are built on `avalon-proto`, and so can any other client, in a few lines of Rust:
 
 ```rust
 use avalon_proto::{Connection, HardwareProfile, Message, VmRef};
@@ -220,6 +221,29 @@ print!("{}", String::from_utf8_lossy(&scrollback)); // then ConsoleOutput events
 
 As a library, `avalon::Server` binds an address (port 0 for an ephemeral one), runs on a thread of its own with `spawn`, and stops with `ServerThread::stop`; the tests run it that way.
 
+### Herald
+
+Herald attaches a terminal to a VM's serial console, like a cable to its UART. With a VM running on Avalon (the Camelot kernel, say):
+
+```
+cargo run --release -p herald -- [--server ADDR] <vm>
+```
+
+```
+herald: attached to VM 1 'camelot' (running) on 127.0.0.1:7400; Ctrl-] detaches
+...
+camelot> ticks
+ticks: 512
+camelot>
+herald: detached from VM 1 'camelot', which carries on
+```
+
+`<vm>` is a VM id (all digits) or name; `--server` defaults to `127.0.0.1:7400` (a host alone means port 7400). Herald prints the VM's scrollback (the last 64 KiB of its output), then its output live, and sends every key to the VM as it is typed: the terminal is in raw mode while Herald runs, so the guest does the echoing and line editing, as on a serial line (Windows consoles and Linux terminals; elsewhere input goes line by line). On Windows the console also gets VT input and output (arrows and other special keys reach the guest as the escape sequences a Unix terminal sends, and the guest's escape sequences are carried out), and output that is not UTF-8 is shown with U+FFFD rather than failing. The terminal's modes are put back however Herald ends: detaching, an error, a panic or Ctrl-C. The raw mode is Grail's own (`grail::console::RawMode`, with `RawOptions { vt: true }`), hand-written FFI to the Win32 console and to termios.
+
+**Ctrl-]** detaches: Herald exits and the VM carries on, whatever its state. Ctrl-C also leaves Herald (not the VM). Herald ends by itself, saying why on stderr, when the VM stops, exits or is destroyed, and says so when it is paused or resumed. When stdin is not a terminal, its bytes go to the VM as they are (Ctrl-] still detaches) and its end detaches, so `herald demo < NUL` (`< /dev/null`) just prints the scrollback. Any number of Heralds may attach to one VM: all of them see its output, and what any of them types reaches it. Exit codes: 0 when detached or when the VM ended, 1 on an error (no server, no such VM, connection lost), 2 for bad arguments.
+
+As a library, `herald::Session::attach(connection, &vm)` attaches and `Session::run(input, output, notices)` streams: keys from a channel of bytes, the console to any `Write`. It knows nothing of terminals, which is how it is tested; the screen and keyboard will join it on the same connection.
+
 ## Testing
 
 ```
@@ -229,6 +253,8 @@ cargo test
 Runs the decoder and device unit tests, every riscv-tests suite (except `rv32ui-p-ma_data`, which assumes hardware misaligned access; Excalibur traps instead), the examples (the UART echo is fed both from an in-process channel and through the `grail` binary's stdin), the kernel, the merlin compiler (every test program built with merlin, merlin-as and merlin-ld and run in Grail), merlin-ld against ld.lld (the loaded bytes of clang-built fixtures and of every riscv-tests program relinked from its object must be identical), and merlin-objdump against committed llvm-objdump output (`crates/merlin-objdump/tests/golden`; regenerate the fixtures and goldens with `scripts/gen-objdump-golden.sh`, which needs clang and llvm-objdump). The framebuffer test runs `examples/colorbars` headless and checks the dumped frames pixel by pixel and against a committed hash. The keyboard tests inject events through `Machine::key_event` and run both `examples/kbd-echo` programs; the pointer tests inject input through `Machine::pointer_event` and check `examples/pointer`'s cursor pixel by pixel. The window itself needs a desktop, so its tests (drawing, and key and mouse messages turned into events) are ignored by default: `cargo test --release -p grail -- --ignored window`. `crates/grail/tests/machine.rs` runs `examples/sysinfo` on machines with different RAM and clocks (two at once, on separate threads) and checks real-time pacing with lower bounds on elapsed time and generous upper ones. `crates/grail/tests/block.rs` runs `examples/disk` on in-memory disks, temporary copies of `examples/disk/disk.img`, host-made backends (one that fails every request) and through `grail --disk`, and checks the committed image against the bytes it builds (`GRAIL_WRITE_DISK_IMG=1` rewrites it). The kernel's shell is driven through the `grail` binary's stdin and in-process (line editing, more input than its ring buffer holds, no UART reads while it idles); its `run` command runs user programs that must take turns on timer ticks with every register intact, and faulting ones that must be killed while the kernel carries on; and on Windows `crates/grail/tests/console.rs` types into a real console (the one `cargo test` runs in, or a new one) to check raw mode end to end.
 
 `crates/avalon/tests` run an Avalon server in process on an ephemeral port and drive it through the protocol: two VMs with different RAM and clocks run `examples/sysinfo` and each prints its own profile (streamed live, and again from the scrollback), with their exit states and device tables; a looping guest (assembled in the test with merlin-as and merlin-ld) is paused (no more steps), resumed, stopped and destroyed, its clients get every state change and `Detached`, and its RAM and name are free again; `examples/uart-echo` takes input from several attached clients at full speed and in real time, and pauses with input waiting; a parked full-speed VM sleeps, and a real-time one keeps to its clock, its thread sleeping between batches (counted through a test-only hook on `ServerThread`); a guest that has presented a frame still runs full slices; a client that stops reading a chatty console is cut off while the VM and the other clients carry on; a client gets a limited time for its whole `Hello`, however slowly it trickles in; a create whose disk is slow to open (a FIFO, on Linux) holds up no other request; bad requests of every kind (unknown VMs, invalid names, profiles and programs, the RAM budget, wrong states, unserved groups, malformed and misdirected frames, oversize frames, bad handshakes) get the right error code and leave the server running; the client example above is checked against the test that runs it; and shutdown stops the VMs and closes every connection. `tests/cli.rs` runs the `avalon` binary and shuts it down with Ctrl-Break (Windows) or SIGTERM (Unix).
+
+`crates/herald/tests` drive Herald against an in-process Avalon server. `session.rs` runs the streaming layer with no terminal (keys from a channel, the console into a buffer): it attaches to `examples/uart-echo` and to the kernel's shell, types, detaches (the VM carries on), attaches again and finds the earlier session in the scrollback; several sessions share one console; a pause and a resume are reported; stopping, exiting and destroying the VM end the session, and a VM that has already exited shows its scrollback and ends it at once; a long paste arrives whole and in order. `fake_server.rs` scripts a server for the rest: output queued while attaching, events for other VMs and events that do not decode, a detach that is never confirmed, a reply out of turn, a lost connection. `cli.rs` runs the `herald` binary through pipes, and `terminal.rs` on a terminal of its own making, a pseudoconsole (ConPTY) on Windows and a pseudoterminal on Linux: raw mode is on while Herald is attached, keys typed on the terminal reach the VM, and the terminal's modes are back as they were after a detach, after an error (the server hanging up) and after Ctrl-C.
 
 `crates/avalon-proto` round-trips every Avalon protocol message through `encode`/`decode` and through a `Connection` over memory and TCP, checks a few layouts byte for byte against [`docs/avalon-protocol.md`](docs/avalon-protocol.md), rejects truncated, oversize and invalid frames, tests the version handshake, and feeds the decoder random and mutated bytes from a fixed-seed generator (anything that decodes must re-encode to the same bytes). It also checks that its hardware profile still mirrors Grail's `MachineConfig`.
 
