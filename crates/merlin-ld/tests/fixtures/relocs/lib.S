@@ -3,7 +3,7 @@
 # word). Built by `cargo xtask ld-fixtures` (with -mno-relax).
 
     .text
-    .globl lib_double, lib_calls_back, lib_check
+    .globl lib_double, lib_calls_back, lib_check, lib_inc
 lib_double:                         # a0 * 2
     slli  a0, a0, 1
     ret
@@ -25,6 +25,10 @@ lib_check:                          # a0 must still be 0x12345678
     .option exact
     bne   a0, t0, fail              # BRANCH, backward into main.o
     .option pop
+    ret
+
+lib_inc:                            # a0 + 1; main.o's reference to it is weak
+    addi  a0, a0, 1
     ret
 
     .data

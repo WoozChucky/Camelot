@@ -37,6 +37,7 @@ dependencies = [
 name = "merlin-ld"
 version = "0.1.0"
 dependencies = [
+ "elf32",
  "excalibur",
  "grail",
  "merlin-as",

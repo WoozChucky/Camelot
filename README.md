@@ -6,7 +6,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 |---|---|---|
 | **Excalibur** | The ISA: RV32IM + Zicsr, M/S/U privilege, Sv32 paging, plus the Xcal extensions | Spec v0 in [`docs/excalibur-spec.md`](docs/excalibur-spec.md) |
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps) and keyboard (from the window, with PLIC interrupts) |
-| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | merlin-as: everything but the encoder ([guide](crates/merlin-as/ENCODER.md)). merlin-ld: links clang objects to the same bytes as ld.lld, no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: v0 front end (int-only C subset) and test harness, codegen next. merlin-objdump: matches llvm-objdump |
+| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | merlin-as: everything but the encoder ([guide](crates/merlin-as/ENCODER.md)). merlin-ld: links clang objects to the same bytes as ld.lld except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: v0 front end (int-only C subset) and test harness, codegen next. merlin-objdump: matches llvm-objdump |
 | **Camelot** | The kernel / OS | Boots on Grail: UART, `kprintf` ([kernel/](kernel/README.md)) |
 
 ## Layout

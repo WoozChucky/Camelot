@@ -77,29 +77,10 @@ pub const R_RISCV_RVC_BRANCH: u32 = 44;
 pub const R_RISCV_RVC_JUMP: u32 = 45;
 pub const R_RISCV_RELAX: u32 = 51;
 
-/// The psABI name of a relocation type, for diagnostics.
+/// The psABI name of a relocation type, for diagnostics (from the table
+/// shared with merlin-objdump in [`elf32::reloc_name`]).
 pub fn name(ty: u32) -> String {
-    let n = match ty {
-        R_RISCV_NONE => "R_RISCV_NONE",
-        R_RISCV_32 => "R_RISCV_32",
-        R_RISCV_BRANCH => "R_RISCV_BRANCH",
-        R_RISCV_JAL => "R_RISCV_JAL",
-        R_RISCV_CALL => "R_RISCV_CALL",
-        R_RISCV_CALL_PLT => "R_RISCV_CALL_PLT",
-        R_RISCV_GOT_HI20 => "R_RISCV_GOT_HI20",
-        R_RISCV_PCREL_HI20 => "R_RISCV_PCREL_HI20",
-        R_RISCV_PCREL_LO12_I => "R_RISCV_PCREL_LO12_I",
-        R_RISCV_PCREL_LO12_S => "R_RISCV_PCREL_LO12_S",
-        R_RISCV_HI20 => "R_RISCV_HI20",
-        R_RISCV_LO12_I => "R_RISCV_LO12_I",
-        R_RISCV_LO12_S => "R_RISCV_LO12_S",
-        R_RISCV_ALIGN => "R_RISCV_ALIGN",
-        R_RISCV_RVC_BRANCH => "R_RISCV_RVC_BRANCH",
-        R_RISCV_RVC_JUMP => "R_RISCV_RVC_JUMP",
-        R_RISCV_RELAX => "R_RISCV_RELAX",
-        _ => return format!("relocation type {ty}"),
-    };
-    n.to_string()
+    elf32::reloc_name(ty).map_or_else(|| format!("relocation type {ty}"), str::to_string)
 }
 
 /// One `R_RISCV_PCREL_HI20` site, resolved: what a `PCREL_LO12` needs.
@@ -520,6 +501,14 @@ mod tests {
                 assert_eq!(w[0] & 0xfff, AUIPC_RA);
                 assert_eq!(w[1] & 0xf_ffff, JALR_RA);
                 assert_eq!(w[2], 0x1234_5678, "only two words");
+            }
+            // The call goes to S + A: addends that push the offset across
+            // the %hi rounding edge (low part 0x800) in either direction.
+            let (p, s) = (0x8000_0000u32, 0x8000_1004u32);
+            for a in [4, -4, 0x7fc, -0x804] {
+                let w = run(ty, p, s, a, &[AUIPC_RA, JALR_RA]).unwrap();
+                let to = p.wrapping_add(pair(w[0], w[1]));
+                assert_eq!(to, s.wrapping_add(a as u32), "{p:#x} -> {s:#x}{a:+}");
             }
         }
         let w = run(

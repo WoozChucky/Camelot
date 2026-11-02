@@ -303,7 +303,7 @@ All reading goes through one crate, `elf32` (header, program headers, sections, 
   - `R_RISCV_PCREL_HI20`: S + A - P, split the same way (for `auipc`). `R_RISCV_PCREL_LO12_I/S`: its symbol is the label on the matching `auipc`, which must be in the same section; the low part is that of the `PCREL_HI20` found at the label's address (its S + A - P, not the low instruction's). Its own addend must be 0.
   - `R_RISCV_CALL` / `R_RISCV_CALL_PLT`: S + A - P split over the `auipc` and the `jalr` after it.
   - The `hi`/`lo` pairs are computed modulo 2^32, as RV32 executes them, so they reach every address and never overflow.
-  - A branch, jump or call to an undefined weak symbol targets itself (as in ld.lld: address 0 is usually out of reach); every other reference to it sees 0.
+  - A weak reference that another object defines is that definition. A branch, jump or call to an undefined weak symbol targets itself (as in ld.lld: address 0 is usually out of reach); every other reference to it sees 0.
   - Errors name the file, section, offset and symbol: `a.o: relocation R_RISCV_JAL out of range for 'foo' at .text+0x10: 1048580 is not in [-1048576, 1048574]`. Misaligned targets, a field running past its section, a `PCREL_LO12` without its `PCREL_HI20`, `R_RISCV_ALIGN` and types outside this list (GOT, TLS, compressed, `ADD`/`SUB`) are errors too.
 - **Differences from ld.lld**, on purpose:
   - `SHF_MERGE` sections are not merged. ld.lld keeps one copy of identical strings and constants (two C files using the same string literal share it) and orders the pieces by hash; merlin-ld concatenates the input sections in order. When an output section holds duplicates it is larger than ld.lld's and every address after it differs, and merlin-ld warns (`.rodata: mergeable (SHF_MERGE) input sections hold N bytes of duplicate strings or constants; ...`). Without duplicates the sizes match, but a symbol inside a merged string section can still have a different address.
@@ -311,7 +311,7 @@ All reading goes through one crate, `elf32` (header, program headers, sections, 
   - Script-assigned symbols are `SHN_ABS` in `.symtab`; ld.lld makes them relative to a nearby output section. Their values are the same.
   - Output section flags are only `SHF_ALLOC`, `SHF_WRITE` and `SHF_EXECINSTR` (ld.lld also carries `SHF_MERGE`/`SHF_STRINGS` over from merged inputs).
   - Unmatched allocated sections are errors, not orphans placed by heuristics. `/DISCARD/`, `NOLOAD`, `AT`, and output section addresses or attributes (`.sec ALIGN(16) : { }`) are not supported.
-  - Only `PT_LOAD` program headers (no `PT_GNU_STACK` or `PT_RISCV_ATTRIBUTES`), and no `.riscv.attributes` or `.comment` in the output. File offsets of empty and `NOBITS` sections may differ. Undefined weak symbols are left out of `.symtab`.
+  - Only `PT_LOAD` program headers (no `PT_GNU_STACK` or `PT_RISCV_ATTRIBUTES`), and no `.riscv.attributes` or `.comment` in the output. Without `.riscv.attributes`, llvm-objdump does not know the target has the M extension and prints `mul`/`div`/... in a merlin-ld executable as `<unknown>`: compare the two disassemblies with `llvm-objdump -d --mattr=+m` (the bytes are the same). File offsets of empty and `NOBITS` sections may differ. Undefined weak symbols are left out of `.symtab`.
   - A `PCREL_LO12` with a non-zero addend is an error (ld.lld warns and ignores the addend), and an `R_RISCV_32` value that does not fit 32 bits is an error (ld.lld truncates it).
 
 ### Disassembler output

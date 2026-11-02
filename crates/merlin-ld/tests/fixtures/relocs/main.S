@@ -1,7 +1,8 @@
 # Every relocation type merlin-ld applies, linked with lib.o and relax.o
 # under link.ld: calls and data references in both directions between
 # objects, the exact edges of the BRANCH and JAL ranges, the %hi/%lo rounding
-# edge, positive and negative addends, an undefined weak symbol.
+# edge, positive and negative addends, an undefined weak symbol and a weak
+# reference that lib.o defines.
 #
 # The program checks its own relocations: each `check` puts its number in a7
 # and jumps to `fail` (which halts with that number) on a mismatch. When all
@@ -144,6 +145,21 @@ _start:                             # link.ld puts this at 0x80100000
     beq   a0, a1, missing
     .option pop
 2:
+
+    # A weak reference that another object defines is that definition, not
+    # an undefined weak: the call, the jump and the branch reach lib_inc.
+    .weak lib_inc
+    li    a0, 10
+    call  lib_inc                   # CALL_PLT
+    jal   lib_inc                   # JAL
+    auipc ra, 0                     # ra = the instruction after the beq
+    addi  ra, ra, 12
+    .option push
+    .option exact
+    beq   zero, zero, lib_inc       # BRANCH
+    .option pop
+    li    t0, 13
+    check_exact a0, t0, 27
 
     # The edges of the BRANCH range (in .text.branch), and code built with
     # relaxation enabled (relax.o).

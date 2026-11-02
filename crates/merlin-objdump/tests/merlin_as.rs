@@ -82,7 +82,10 @@ fn data_relocations_and_symbols() {
 /// Like llvm-objdump, a run of at least 8 zero bytes is printed as `...`,
 /// but never past a relocation shown with `-r` (clang's object for the same
 /// source gives the same lines, except that LLVM prints each zero halfword
-/// as `0000 <unknown>`).
+/// as `0000 <unknown>`). A run whose length is not a multiple of 4 is folded
+/// only up to the last whole word: 9 zero bytes, the 9th being the first byte
+/// of `0x00001300`, give `...` for 8 and that word at its own address (LLVM
+/// prints it as the halfwords `1300` and `0000`, from the same address).
 #[test]
 fn zero_runs() {
     let src = "
@@ -94,6 +97,9 @@ fn zero_runs() {
     .word 0x13
     .word 0, 0
     .word ext
+    .word 0x13
+    .word 0, 0
+    .word 0x00001300
     .word 0x13
 ";
     let opts = Options {
@@ -117,6 +123,9 @@ Disassembly of section .text:
       24: 00000000     \t.word\t0x00000000
 \t\t\t00000024:  R_RISCV_32\text
       28: 00000013     \tnop
+\t\t...
+      34: 00001300     \t.word\t0x00001300
+      38: 00000013     \tnop
 ";
     assert_eq!(out, expected);
 }

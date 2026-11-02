@@ -808,6 +808,59 @@ fn undefined_weak_jumps_target_themselves() {
     assert!(at > 0);
 }
 
+/// A weak reference that another object defines is that definition, not an
+/// undefined weak: main.o's `.weak lib_inc` call, jump and branch reach
+/// lib.o's `lib_inc` (an undefined weak would aim them at themselves).
+#[test]
+fn weak_reference_defined_elsewhere_reaches_the_definition() {
+    use excalibur::Inst;
+    let (objs, opts) = case("relocs/link.ld");
+    assert_eq!(objs[0].name, "main.o");
+    let linked = merlin_ld::link(&objs, &opts).unwrap();
+    let l = &linked.layout;
+    let main = &l.objects[0];
+    let weak = main.symbols.iter().position(|s| s.name == "lib_inc").unwrap();
+    assert!(main.symbols[weak].is_weak() && main.symbols[weak].is_undefined());
+    assert!(!l.is_undefined_weak(0, weak));
+    let target = l.symbol("lib_inc").unwrap();
+
+    let elf = grail::elf::parse(&linked.elf).unwrap();
+    let word = |addr: u32| {
+        let seg = elf
+            .segments
+            .iter()
+            .find(|s| addr >= s.paddr && addr < s.paddr + s.data.len() as u32)
+            .unwrap();
+        u32_at(&seg.data, (addr - seg.paddr) as usize)
+    };
+    let sec = main
+        .sections
+        .iter()
+        .position(|s| s.name == ".text.start")
+        .unwrap();
+    let base = l.input_addr(0, sec).unwrap();
+    let mut kinds = Vec::new();
+    for r in main.sections[sec]
+        .relocs
+        .iter()
+        .filter(|r| r.sym as usize == weak)
+    {
+        let p = base + r.offset;
+        let to = match excalibur::decode(word(p)) {
+            Inst::Jal { imm, .. } | Inst::Branch { imm, .. } => p.wrapping_add(imm as u32),
+            Inst::Auipc { imm: hi, .. } => match excalibur::decode(word(p + 4)) {
+                Inst::Jalr { imm: lo, .. } => p.wrapping_add(hi).wrapping_add(lo as u32),
+                other => panic!("no jalr after the auipc: {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        };
+        let ty = merlin_ld::reloc::name(r.ty);
+        assert_eq!(to, target, "{ty} at {p:#x} goes to {to:#x}, not lib_inc");
+        kinds.push(ty);
+    }
+    assert_eq!(kinds, ["R_RISCV_CALL_PLT", "R_RISCV_JAL", "R_RISCV_BRANCH"]);
+}
+
 fn patch_hello(edit: impl Fn(&mut Vec<u8>, usize)) -> Vec<String> {
     let mut b = std::fs::read(fixtures().join("hello/hello.o")).unwrap();
     let rela = u32_at(&b, shdr(&b, ".rela.text.start") + 16) as usize;
@@ -937,7 +990,9 @@ fn branch_and_jump_range_errors() {
         ),
     ));
     // lib_check's `bne a0, t0, fail` is 0x3c into lib.o's .text, 8280 bytes
-    // after `fail` once .text.branch is in between.
+    // after `fail` once .text.branch is in between; main.o's branch to the
+    // weak (but defined) lib_inc is about as far the other way. Were it taken for
+    // an undefined weak, it would silently target itself instead.
     assert_eq!(
         errs,
         [
@@ -945,6 +1000,8 @@ fn branch_and_jump_range_errors() {
              in [-1048576, 1048574]",
             "main.o: relocation R_RISCV_JAL out of range for 'low_target' at .text.start+0x8: -1048580 is not \
              in [-1048576, 1048574]",
+            "main.o: relocation R_RISCV_BRANCH out of range for 'lib_inc' at .text.start+0x268: 8444 is not \
+             in [-4096, 4094]",
             "lib.o: relocation R_RISCV_BRANCH out of range for 'fail' at .text+0x3c: -8280 is not in [-4096, \
              4094]",
         ]
@@ -971,6 +1028,39 @@ fn branch_and_jump_range_errors() {
             "main.o: relocation R_RISCV_JAL against 'high_target' at .text.start+0x4 is misaligned: offset \
           1048573 is not a multiple of 2"
         ]
+    );
+}
+
+/// A relocation patches only its own input section, even when another input
+/// section follows it in the same output section (link.ld puts main.o's
+/// .text right after its .text.start).
+#[test]
+fn relocation_stops_at_its_input_section() {
+    let mut main = std::fs::read(fixtures().join("relocs/main.o")).unwrap();
+    let size = u32_at(&main, shdr(&main, ".text.start") + 20);
+    let rela = u32_at(&main, shdr(&main, ".rela.text.start") + 16) as usize;
+    // `jal high_target` moved to the last 2 bytes of .text.start.
+    main[rela..rela + 4].copy_from_slice(&(size - 2).to_le_bytes());
+    let objs = [
+        Input {
+            name: "main.o".into(),
+            data: main,
+        },
+        input(&fixtures().join("relocs/lib.o")),
+        input(&fixtures().join("relocs/relax.o")),
+    ];
+    let (_, opts) = case("relocs/link.ld");
+    let layout = merlin_ld::layout(&objs, &opts).unwrap();
+    let text = layout.section(".text").unwrap();
+    let next = text.inputs.iter().position(|i| i.addr == text.addr + size);
+    assert!(next.is_some(), "another input section follows .text.start");
+    assert_eq!(
+        errors(merlin_ld::link(&objs, &opts)),
+        [format!(
+            "main.o: relocation R_RISCV_JAL against 'high_target' at .text.start+{:#x} patches 4 bytes, but \
+             section .text.start ends 2 bytes after it",
+            size - 2
+        )]
     );
 }
 
