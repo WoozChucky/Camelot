@@ -4,10 +4,11 @@
 
 #include "types.h"
 
-/* What kernel_vec (kernelvec.s) saves on the stack. The offsets are a contract
- * with kernelvec.s: regs[i] at 4*i, sepc at 128, scause at 132, stval at 136,
- * sstatus at 140. kernel_vec writes sepc and sstatus back before sret, so a
- * handler may change where execution resumes. */
+/* What kernel_vec (kernelvec.s) saves on the stack, and user_vec (uservec.s)
+ * in a process's trap frame. The offsets are a contract with both: regs[i]
+ * at 4*i, sepc at 128, scause at 132, stval at 136, sstatus at 140. Both
+ * write sepc and sstatus back before sret, so a handler may change where
+ * execution resumes. */
 struct trap_frame {
     u32 regs[32]; /* x0-x31 as they were at the trap; regs[0] is always 0 */
     u32 sepc;
@@ -29,6 +30,36 @@ void kernel_vec(void);
 
 /* Called by kernel_vec with the saved registers. */
 void kernel_trap(struct trap_frame *f);
+
+/* Register numbers in struct trap_frame's regs[]. */
+#define REG_SP 2
+#define REG_A0 10
+#define REG_A1 11
+#define REG_A7 17
+
+/* The U-mode trap vector (uservec.s): stvec points at it while a process
+ * runs in U-mode, and sscratch at the process's trap frame. Saves the user
+ * registers there, switches to the process's kernel stack (just below the
+ * frame) and calls user_trap(). */
+void user_vec(void);
+
+/* Called by user_vec, on the process's kernel stack: a timer tick yields the
+ * CPU, an external interrupt is serviced, an ecall goes to syscall(), and any
+ * other exception kills the process. Then returns to U-mode through
+ * user_trap_return(). Never returns. */
+void user_trap(struct trap_frame *f);
+
+/* Back to U-mode with the registers in `f`, the current process's frame:
+ * interrupts off, stvec = user_vec, sstatus.SPP = U and SPIE set, then
+ * user_return(). Never returns. */
+void user_trap_return(struct trap_frame *f);
+
+/* uservec.s: sscratch = f, sepc and sstatus from f, every register from f,
+ * sret. Never returns. */
+void user_return(struct trap_frame *f);
+
+/* Whether `scause` is a page fault (instruction, load or store). */
+bool is_page_fault(u32 scause);
 
 /* Sets up the PLIC and enables the interrupts the kernel handles (the
  * forwarded timer tick and external interrupts), then turns interrupts on in

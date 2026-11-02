@@ -251,6 +251,15 @@ fn committed_kernel_layout() {
         "probe_load",
         "probe_store",
         "probe_fault",
+        "user_vec",
+        "user_return",
+        "user_trap",
+        "swtch",
+        "scheduler",
+        "proc_create",
+        "elf_load",
+        "copyin",
+        "user_programs",
     ] {
         assert!(sym(&elf, s) > 0x8000_0000, "{s}");
     }
@@ -269,7 +278,7 @@ fn committed_kernel_layout() {
     }
     assert!((data..sym(&elf, "__bss_start")).contains(&sym(&elf, "boot_fault")));
     // Direct-mode trap vectors: the low two bits of xtvec are the mode.
-    for s in ["early_trap", "machine_vec", "kernel_vec"] {
+    for s in ["early_trap", "machine_vec", "kernel_vec", "user_vec"] {
         assert!(sym(&elf, s).is_multiple_of(4), "{s}");
     }
     let (bss, bss_end) = (sym(&elf, "__bss_start"), sym(&elf, "__bss_end"));
@@ -1144,6 +1153,7 @@ const UART_RX_SIZE: usize = 128;
 const HELP: &str = "\
 help    this list
 ticks   timer ticks since boot (10 per second)
+run     run user programs side by side (run PROG...; run alone lists them)
 halt    stop the machine
 ";
 
@@ -1621,6 +1631,614 @@ fn kernel_asm_is_merlin_dialect() {
             let errs: Vec<String> = errs.iter().map(|e| format!("{}: {e}", s.name)).collect();
             panic!("merlin-as rejects kernel assembly:\n{}", errs.join("\n"));
         }
+    }
+}
+
+// ---- Processes: U-mode, page tables, the scheduler ----
+
+/// The top of user space and the stack page under it (kernel/include/vm.h).
+const USER_TOP: u32 = 0x40_0000;
+const USER_STACK: u32 = USER_TOP - PAGE;
+/// Where user programs start (kernel/user/user.ld).
+const USER_TEXT: u32 = 0x1000;
+/// `sizeof(struct trap_frame)` (kernel/include/trap.h).
+const TRAP_FRAME_SIZE: u32 = 144;
+/// Process slots (`NPROC`, kernel/include/proc.h).
+const NPROC: usize = 8;
+/// scause of an ecall from U-mode.
+const ECALL_FROM_U: u32 = grail::trap::Exception::EcallU as u32;
+/// A boot plus a few programs: ping and pong run about two million
+/// instructions each, regs three.
+const RUN_MAX_STEPS: u64 = 60_000_000;
+
+/// The embedded programs, by name, as the kernel's `run` lists them.
+fn program_names() -> Vec<String> {
+    xtask::userprogs::program_names(&xtask::userprogs::user_dir(&repo_root())).unwrap()
+}
+
+/// Runs the committed kernel with `input` typed on the UART (ending in
+/// `halt`). Returns what was printed from the shell's banner on.
+fn run_processes(input: &[u8]) -> String {
+    let (mut m, _) = load_committed_on(MachineConfig::default(), Some(kernel::typed(input)));
+    let r = m.run(Some(RUN_MAX_STEPS), |_| {});
+    let out = printed(&m);
+    assert_eq!(r, RunResult::Exited(0), "output:\n{out}");
+    out[out.find(SHELL_BANNER).unwrap()..].to_string()
+}
+
+/// The lines between the echo of `command` and the next prompt.
+fn command_output<'a>(out: &'a str, command: &str) -> Vec<&'a str> {
+    let start = format!("{PROMPT}{command}\n");
+    let at = out
+        .find(&start)
+        .unwrap_or_else(|| panic!("no `{command}` in:\n{out}"))
+        + start.len();
+    let rest = &out[at..];
+    rest[..rest
+        .find(PROMPT)
+        .unwrap_or_else(|| panic!("`{command}` never ended:\n{out}"))]
+        .lines()
+        .collect()
+}
+
+/// The satp value of the kernel page table (`kernel_pagetable`).
+fn kernel_satp(m: &Machine, elf: &grail::elf::Elf) -> u32 {
+    let root = m.cpu.bus.peek(sym(elf, "kernel_pagetable")).unwrap();
+    assert_ne!(root, 0, "no kernel page table yet");
+    (1 << 31) | (root >> 12)
+}
+
+/// Pages free in the allocator (`nfree` in kernel/kalloc.c).
+fn free_pages(m: &Machine, elf: &grail::elf::Elf) -> u32 {
+    m.cpu.bus.peek(sym(elf, "nfree")).unwrap()
+}
+
+#[test]
+fn run_lists_the_programs_and_refuses_unknown_ones() {
+    let list = format!("programs: {}", program_names().join(" "));
+    for want in ["badhalt", "badload", "hello", "ping", "pong", "regs"] {
+        assert!(list.contains(want), "{list}");
+    }
+    let out = run_processes(b"run\nrun ping nope\n  run   \nrunning\nhalt\n");
+    let want = format!(
+        "{SHELL_BANNER}\
+         {PROMPT}run\n{list}\n\
+         {PROMPT}run ping nope\nrun: no program called nope\n\
+         {PROMPT}  run   \n{list}\n\
+         {PROMPT}running\nunknown command: running (try help)\n\
+         {PROMPT}halt\n"
+    );
+    // Nothing ran: ping never printed.
+    assert_eq!(out, want);
+}
+
+#[test]
+fn hello_prints_from_user_mode() {
+    let out = run_processes(b"run hello\nhalt\n");
+    assert_eq!(
+        command_output(&out, "run hello"),
+        ["hello from user mode", "pid 1 (hello) exited: 0"]
+    );
+}
+
+#[test]
+fn ping_and_pong_take_turns_on_timer_ticks() {
+    // Issue #20's first criterion, watched from the hart: two processes in
+    // U-mode, each in its own page table, and the CPU only moves from one to
+    // the other when a timer tick (or an exit) traps from U-mode.
+    let (mut m, elf) = load_committed_on(
+        MachineConfig::default(),
+        Some(kernel::typed(b"run ping pong\nhalt\n")),
+    );
+    let user_vec = sym(&elf, "user_vec");
+    // The page table of each stretch in U-mode, and the last trap from it:
+    // (scause, whether it was ECALL_EXIT).
+    let mut satps: Vec<u32> = Vec::new();
+    let mut last_trap: Option<(u32, bool)> = None;
+    let mut timer_switches = 0;
+    let mut user_steps = 0u64;
+    let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
+        if cpu.mode == Mode::U {
+            user_steps += 1;
+            assert!((USER_TEXT..USER_TOP).contains(&cpu.pc), "U-mode at {:#x}", cpu.pc);
+            if satps.last() != Some(&cpu.csr.satp) {
+                match last_trap {
+                    None => assert!(satps.is_empty(), "switched without a trap"),
+                    // The process before was preempted by a tick...
+                    Some((cause, false)) => {
+                        assert_eq!(cause, INTERRUPT_BIT | IRQ_S_SOFT, "switched after {cause:#x}");
+                        timer_switches += 1;
+                    }
+                    // ...or it exited.
+                    Some((_, true)) => {}
+                }
+                satps.push(cpu.csr.satp);
+            }
+            last_trap = None;
+        }
+        if cpu.pc == user_vec {
+            // Every trap from U-mode arrives here, in S-mode, with SPP = U.
+            assert_eq!(cpu.mode, Mode::S);
+            assert_eq!(cpu.csr.mstatus & MSTATUS_SPP, 0);
+            let exit = cpu.csr.scause == ECALL_FROM_U && cpu.x[x("a7") as usize] == 1;
+            last_trap = Some((cpu.csr.scause, exit));
+        }
+    });
+    assert_eq!(r, RunResult::Exited(0));
+    let mut distinct = satps.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 2, "{satps:x?}");
+    assert!(!distinct.contains(&kernel_satp(&m, &elf)));
+    assert!(timer_switches >= 3, "{timer_switches} switches: {satps:x?}");
+    // Each prints 4 lines with half a tick (500 000 instructions) between.
+    assert!(user_steps > 3_000_000, "{user_steps}");
+}
+
+#[test]
+fn a_process_page_table_maps_its_program_and_the_kernel() {
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(kernel::typed(b"run ping\nhalt\n")));
+    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
+    let c = &m.cpu;
+    // The first U-mode instruction: the program's entry point, with every
+    // register zero but sp at the top of the stack, and interrupts on.
+    assert_eq!(c.pc, USER_TEXT);
+    let mut regs = [0u32; 32];
+    regs[2] = USER_TOP;
+    assert_eq!(c.x, regs);
+    assert_ne!(c.csr.mstatus & MSTATUS_SIE, 0);
+    assert_eq!(c.csr.mstatus & excalibur::csr::MSTATUS_SUM, 0);
+    // Traps go to user_vec, which finds the process's trap frame in
+    // sscratch: at the top of its kernel stack page, in free RAM.
+    assert_eq!(c.csr.stvec, sym(&elf, "user_vec"));
+    let frame = c.csr.sscratch;
+    assert_eq!(frame % PAGE, PAGE - TRAP_FRAME_SIZE, "frame {frame:#x}");
+    assert!(frame > sym(&elf, "__kernel_end"));
+
+    let satp = c.csr.satp;
+    let ksatp = kernel_satp(&m, &elf);
+    assert_ne!(satp, ksatp);
+    // Root entries 1-1023 are the kernel's: the same second-level tables.
+    let (root, kroot) = ((satp & 0x3f_ffff) * PAGE, (ksatp & 0x3f_ffff) * PAGE);
+    for i in 1..1024 {
+        assert_eq!(
+            m.cpu.bus.peek(root + 4 * i),
+            m.cpu.bus.peek(kroot + 4 * i),
+            "root[{i}]"
+        );
+    }
+    // User space: ping's code (R+X), its read-only data and the stack (R+W),
+    // all with U; nothing at page 0 or in the guard page under the stack.
+    // Everything above is the kernel's, none of it with U.
+    let (leaves, tables) = page_table(&m, satp);
+    let (kleaves, _) = page_table(&m, ksatp);
+    let user: Vec<(u32, u32)> = leaves
+        .iter()
+        .filter(|(va, _)| *va < USER_TOP)
+        .map(|&(va, pte)| (va, pte & PTE_KERNEL_BITS))
+        .collect();
+    let urw = PTE_V | PTE_U | PTE_R;
+    assert_eq!(
+        user,
+        [
+            (USER_TEXT, urw | PTE_X),
+            (USER_TEXT + PAGE, urw),
+            (USER_STACK, urw | PTE_W)
+        ],
+        "{user:x?}"
+    );
+    let kernel_part: Vec<_> = leaves.iter().filter(|(va, _)| *va >= USER_TOP).copied().collect();
+    let kernel_all: Vec<_> = kleaves
+        .iter()
+        .filter(|(va, _)| *va >= USER_TOP)
+        .copied()
+        .collect();
+    assert_eq!(kernel_part, kernel_all);
+    assert!(kernel_part.iter().all(|(_, pte)| pte & PTE_U == 0));
+    // The kernel's own root[0] (the test device) is not in the process's.
+    assert!(kleaves.iter().any(|(va, _)| *va < USER_TOP));
+    // User pages are fresh pages in free RAM, the stack one zeroed.
+    for (va, pte) in leaves.iter().filter(|(va, _)| *va < USER_TOP) {
+        let pa = (pte >> 10) * PAGE;
+        assert!(pa >= sym(&elf, "__kernel_end"), "{va:#x} at {pa:#x}");
+    }
+    // One root, one table for user space, the kernel's tables shared.
+    assert!(tables > 2);
+}
+
+/// The registers `cpu` holds, and its pc.
+fn user_state(cpu: &grail::cpu::Cpu) -> ([u32; 32], u32) {
+    (cpu.x, cpu.pc)
+}
+
+#[test]
+fn a_tick_in_user_mode_saves_every_register_and_switches_back_later() {
+    // regs fills every register and spins; ping runs beside it. Catch a tick
+    // that interrupts regs, check user_vec saved the registers in its trap
+    // frame, then follow the switch to ping and back: regs must resume with
+    // every register and its pc as they were.
+    let (mut m, elf) = load_committed_on(
+        MachineConfig::default(),
+        Some(kernel::typed(b"run regs ping\nhalt\n")),
+    );
+    let (user_vec, user_trap) = (sym(&elf, "user_vec"), sym(&elf, "user_trap"));
+    // regs, in its spin loop: all its registers are set.
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| m.cpu.mode == Mode::U && m.cpu.x[x("t5") as usize] == 0x1e1e_1e1e,
+    );
+    let regs_satp = m.cpu.csr.satp;
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| {
+            m.cpu.pc == user_vec
+                && m.cpu.csr.scause == INTERRUPT_BIT | IRQ_S_SOFT
+                && m.cpu.csr.satp == regs_satp
+        },
+    );
+    let (saved, _) = user_state(&m.cpu);
+    let sepc = m.cpu.csr.sepc;
+    assert!((USER_TEXT..USER_TOP).contains(&sepc));
+    assert_eq!(saved[2], 0x0202_0202, "regs set sp to its pattern");
+    // In U-mode, sscratch points at the process's trap frame.
+    let frame = m.cpu.csr.sscratch;
+
+    step_to(&mut m, user_trap);
+    assert_eq!(m.cpu.x[x("a0") as usize], frame);
+    assert_eq!(m.cpu.x[2], frame, "the kernel stack starts below the frame");
+    // user_vec swapped the user's a0 in, to save it.
+    assert_eq!(m.cpu.csr.sscratch, saved[x("a0") as usize]);
+    let peek = |m: &Machine, off: u32| m.cpu.bus.peek(frame + off).unwrap();
+    for (i, &v) in saved.iter().enumerate() {
+        assert_eq!(peek(&m, 4 * i as u32), v, "{}", reg::abi_name(i as u8));
+    }
+    assert_eq!(peek(&m, FRAME_SEPC), sepc);
+    assert_eq!(peek(&m, FRAME_SCAUSE), INTERRUPT_BIT | IRQ_S_SOFT);
+    assert_eq!(peek(&m, FRAME_SSTATUS) & MSTATUS_SPP, 0);
+    // Traps in the kernel go to kernel_vec again.
+    step_until(
+        &mut m,
+        100,
+        |_| {},
+        |m| m.cpu.csr.stvec == sym(&elf, "kernel_vec"),
+    );
+
+    // Off to ping, then back to regs.
+    let mut ran_other = false;
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |cpu| ran_other |= cpu.mode == Mode::U && cpu.csr.satp != regs_satp,
+        |m| m.cpu.mode == Mode::U && m.cpu.csr.satp == regs_satp,
+    );
+    assert!(ran_other, "the tick didn't switch to ping");
+    assert_eq!(user_state(&m.cpu), (saved, sepc));
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
+    // And regs found every register intact at the end, after more switches.
+    let out = printed(&m);
+    assert!(out.contains("pid 1 (regs) exited: 0\n"), "{out}");
+}
+
+#[test]
+fn registers_survive_many_switches() {
+    // regs checks its own registers after three ticks' worth of spinning
+    // beside two programs that use the same registers: exit status 0, or the
+    // number of the register that changed.
+    let out = run_processes(b"run regs ping pong\nhalt\n");
+    let lines = command_output(&out, "run regs ping pong");
+    assert!(lines.contains(&"pid 1 (regs) exited: 0"), "{lines:#?}");
+    assert_eq!(lines.iter().filter(|l| l.contains("exited: 0")).count(), 3);
+}
+
+#[test]
+fn faulting_programs_are_killed_and_the_rest_carry_on() {
+    // Issue #20's second criterion. badload loads from the kernel's first
+    // page (mapped, without U), badhalt executes xcal.halt (M-mode only).
+    let (mut m, elf) = load_committed_on(
+        MachineConfig::default(),
+        Some(kernel::typed(b"run badload ping badhalt\nticks\nhalt\n")),
+    );
+    let user_vec = sym(&elf, "user_vec");
+    let mut faults = Vec::new();
+    let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
+        if cpu.pc == user_vec && cpu.csr.scause & INTERRUPT_BIT == 0 && cpu.csr.scause != ECALL_FROM_U {
+            faults.push((cpu.csr.scause, cpu.csr.sepc, cpu.csr.stval));
+        }
+    });
+    let out = printed(&m);
+    assert_eq!(r, RunResult::Exited(0), "{out}");
+    let xcal_halt_a0 = 0x0005_100b;
+    assert_eq!(
+        faults,
+        [
+            (LOAD_PAGE_FAULT, USER_TEXT + 4, 0x8000_0000),
+            (2, USER_TEXT + 4, xcal_halt_a0)
+        ]
+    );
+    let text = sym(&elf, "__text_start");
+    let pte = (text >> 12) << 10 | PTE_V | PTE_R | PTE_X | PTE_A;
+    let lines = command_output(&out, "run badload ping badhalt");
+    let want_kills = [
+        "pid 1 (badload) killed: load page fault".to_string(),
+        "  scause 0x0000000d  sepc 0x00001004  stval 0x80000000".to_string(),
+        format!("  va 0x80000000 maps to pa 0x80000000, pte {pte:#010x} -A--X-RV"),
+        "pid 3 (badhalt) killed: illegal instruction".to_string(),
+        "  scause 0x00000002  sepc 0x00001004  stval 0x0005100b".to_string(),
+    ];
+    let kills: Vec<&str> = lines.iter().copied().filter(|l| !l.contains("ping")).collect();
+    assert_eq!(kills, want_kills, "{out}");
+    // ping wasn't disturbed, and the shell still works.
+    let pings: Vec<&str> = lines.iter().copied().filter(|l| l.starts_with("ping ")).collect();
+    assert_eq!(pings, ["ping 1", "ping 2", "ping 3", "ping 4"]);
+    assert!(lines.contains(&"pid 2 (ping) exited: 0"));
+    assert_eq!(command_output(&out, "ticks").len(), 1);
+    // The kernel never panicked, and xcal.halt never reached M-mode.
+    assert!(!out.contains("panic"), "{out}");
+}
+
+#[test]
+fn bad_buffers_and_unknown_ecalls_are_refused() {
+    // badptr hands ECALL_DEBUG_WRITE kernel memory, page 0, a range past the
+    // end of user space, a length that wraps, the stack's guard page, then
+    // makes an unknown ecall: each must return -1 and print nothing.
+    let out = run_processes(b"run badptr\nhalt\n");
+    assert_eq!(
+        command_output(&out, "run badptr"),
+        ["badptr: every bad buffer refused", "pid 1 (badptr) exited: 0"]
+    );
+}
+
+#[test]
+fn input_typed_while_processes_run_reaches_the_shell() {
+    // The UART interrupt arrives while a process is in U-mode: user_trap
+    // services it and the process carries on; the shell reads the line once
+    // `run` is over.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
+    for &b in b"run ping\n" {
+        tx.send(b).unwrap();
+    }
+    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
+    for &b in b"ticks\nhalt\n" {
+        tx.send(b).unwrap();
+    }
+    let user_vec = sym(&elf, "user_vec");
+    let mut external = 0;
+    let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
+        if cpu.pc == user_vec && cpu.csr.scause == INTERRUPT_BIT | IRQ_S_EXT {
+            external += 1;
+        }
+    });
+    assert_eq!(r, RunResult::Exited(0));
+    assert!(external >= 1);
+    let out = printed(&m);
+    assert!(
+        out.contains("pid 1 (ping) exited: 0\ncamelot> ticks\nticks: "),
+        "{out}"
+    );
+}
+
+#[test]
+fn processes_give_back_every_page() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
+    let mut prompts = 0;
+    let mut command = |m: &mut Machine, line: &str| {
+        for b in line.bytes() {
+            tx.send(b).unwrap();
+        }
+        prompts += 1;
+        let want = prompts;
+        step_until(
+            m,
+            RUN_MAX_STEPS,
+            |_| {},
+            |m| printed(m).matches(PROMPT).count() > want,
+        );
+    };
+    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    let before = free_pages(&m, &elf);
+
+    // Every program: the ones that exit and the ones that are killed.
+    command(&mut m, "run badhalt badload badptr hello ping pong regs\n");
+    assert_eq!(free_pages(&m, &elf), before);
+    // More than there are slots: the ninth can't start.
+    let hellos = ["hello"; NPROC + 1].join(" ");
+    command(&mut m, &format!("run {hellos}\n"));
+    let out = printed(&m);
+    let lines = command_output(&out, &format!("run {hellos}"));
+    assert_eq!(lines[0], "run: cannot start hello: too many processes");
+    assert_eq!(
+        lines.iter().filter(|l| **l == "hello from user mode").count(),
+        NPROC
+    );
+    assert_eq!(free_pages(&m, &elf), before);
+    // While processes run, they hold pages.
+    for &b in b"run ping\n" {
+        tx.send(b).unwrap();
+    }
+    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
+    // Kernel stack, root, user table, text, rodata, stack.
+    assert_eq!(free_pages(&m, &elf), before - 6);
+}
+
+/// Byte offsets in an ELF32 header and program header.
+const E_TYPE: u32 = 16;
+const E_MACHINE: u32 = 18;
+const E_ENTRY: u32 = 24;
+const E_PHENTSIZE: u32 = 42;
+const E_PHNUM: u32 = 44;
+const P_OFFSET: u32 = 4;
+const P_VADDR: u32 = 8;
+const P_FILESZ: u32 = 16;
+const P_FLAGS: u32 = 24;
+
+/// Bytes to write at an offset into an ELF image.
+type Patch<'a> = (u32, &'a [u8]);
+
+#[test]
+fn the_elf_loader_refuses_bad_images() {
+    // hello's image in the kernel, patched in memory one way at a time; each
+    // `run hello` must fail with the loader's reason, leak nothing, and leave
+    // the kernel running.
+    let hello = xtask::userprogs::build_program(&xtask::userprogs::user_dir(&repo_root()), "hello").unwrap();
+    let parsed = elf32::Elf::parse(&hello.elf).unwrap();
+    let phoff = parsed.header.phoff;
+    let loads: Vec<u32> = (0..u32::from(parsed.header.phnum))
+        .filter(|&i| parsed.segments[i as usize].ty == elf32::PT_LOAD)
+        .collect();
+    assert_eq!(loads.len(), 2, "hello: text and rodata");
+    let ph = |i: u32, field: u32| phoff + 32 * loads[i as usize] + field;
+    let text = &parsed.segments[loads[0] as usize];
+    let rodata_va = parsed.segments[loads[1] as usize].vaddr;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
+    let image = sym(&elf, "user_elf_hello");
+    assert_eq!(
+        m.cpu.bus.peek(image),
+        Some(u32::from_le_bytes(hello.elf[..4].try_into().unwrap())),
+        "the kernel embeds what kernel/user builds"
+    );
+    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    let before = free_pages(&m, &elf);
+
+    let cases: &[(&str, &[Patch<'_>])] = &[
+        ("not an ELF file", &[(0, b"\x7fELG")]),
+        ("not a 32-bit little-endian RISC-V file", &[(4, &[2])]),
+        ("not a 32-bit little-endian RISC-V file", &[(5, &[2])]),
+        ("not a 32-bit little-endian RISC-V file", &[(E_MACHINE, &[62, 0])]),
+        ("not an executable", &[(E_TYPE, &[1, 0])]),
+        ("bad program headers", &[(E_PHENTSIZE, &[40, 0])]),
+        ("bad program headers", &[(E_PHNUM, &[0xff, 0xff])]),
+        (
+            "segment outside user space",
+            &[(ph(0, P_VADDR), &0x8000_0000u32.to_le_bytes())],
+        ),
+        (
+            "segment outside user space",
+            &[(ph(0, P_VADDR), &0u32.to_le_bytes())],
+        ),
+        // The guard page under the stack.
+        (
+            "segment outside user space",
+            &[(ph(1, P_VADDR), &(USER_STACK - PAGE).to_le_bytes())],
+        ),
+        (
+            "segment outside the file",
+            &[(ph(0, P_OFFSET), &0xffff_f000u32.to_le_bytes())],
+        ),
+        (
+            "segment outside the file",
+            &[(ph(0, P_FILESZ), &0x10_0000u32.to_le_bytes())],
+        ),
+        ("segment not readable", &[(ph(0, P_FLAGS), &1u32.to_le_bytes())]),
+        (
+            "segments share a page",
+            &[(ph(1, P_VADDR), &text.vaddr.to_le_bytes())],
+        ),
+        (
+            "entry point not in an executable segment",
+            &[(E_ENTRY, &rodata_va.to_le_bytes())],
+        ),
+        (
+            "entry point not in an executable segment",
+            &[(E_ENTRY, &0x8000_0000u32.to_le_bytes())],
+        ),
+    ];
+    for (n, (reason, patches)) in cases.iter().enumerate() {
+        for (off, bytes) in *patches {
+            m.cpu.bus.load(image + off, bytes).unwrap();
+        }
+        for b in b"run hello\n" {
+            tx.send(*b).unwrap();
+        }
+        step_until(
+            &mut m,
+            RUN_MAX_STEPS,
+            |_| {},
+            |m| printed(m).matches(PROMPT).count() == n + 2,
+        );
+        let out = printed(&m);
+        let last = out[..out.len() - PROMPT.len()].lines().last().unwrap();
+        assert_eq!(last, format!("run: cannot start hello: {reason}"), "case {n}");
+        assert_eq!(free_pages(&m, &elf), before, "case {n} leaked");
+        // Put the image back.
+        for (off, bytes) in *patches {
+            let o = *off as usize;
+            m.cpu
+                .bus
+                .load(image + off, &hello.elf[o..o + bytes.len()])
+                .unwrap();
+        }
+    }
+    // Restored, it runs.
+    for b in b"run hello\nhalt\n" {
+        tx.send(*b).unwrap();
+    }
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
+    assert!(printed(&m).ends_with(&format!(
+        "{PROMPT}run hello\nhello from user mode\npid 1 (hello) exited: 0\n{PROMPT}halt\n"
+    )));
+}
+
+#[test]
+fn userprogs_s_is_up_to_date() {
+    // kernel/userprogs.s is generated from kernel/user by merlin-as and
+    // merlin-ld (no LLVM): it must be what the current sources and tools
+    // give, or `cargo xtask kernel` wasn't run after a change.
+    let committed = std::fs::read_to_string(repo_root().join(xtask::userprogs::GENERATED)).unwrap();
+    let fresh = xtask::userprogs::generated(&repo_root()).unwrap();
+    assert!(
+        committed == fresh,
+        "kernel/userprogs.s is out of date: run `cargo xtask kernel` and commit it"
+    );
+}
+
+#[test]
+fn the_kernel_embeds_every_user_program() {
+    // The table in the image: names, sizes and bytes match a fresh build.
+    let (mut m, elf) = load_committed();
+    let dir = xtask::userprogs::user_dir(&repo_root());
+    let programs = xtask::userprogs::build_all(&dir).unwrap();
+    let table = sym(&elf, "user_programs");
+    assert_eq!(
+        m.cpu.bus.peek(sym(&elf, "user_program_count")),
+        Some(programs.len() as u32)
+    );
+    for (i, p) in programs.iter().enumerate() {
+        let entry = table + 12 * i as u32;
+        let (name, image, size) = (
+            m.cpu.bus.peek(entry).unwrap(),
+            m.cpu.bus.peek(entry + 4).unwrap(),
+            m.cpu.bus.peek(entry + 8).unwrap(),
+        );
+        assert_eq!(image, sym(&elf, &format!("user_elf_{}", p.name)));
+        assert_eq!(size as usize, p.elf.len());
+        let mut s = Vec::new();
+        for a in name.. {
+            match m.cpu.bus.read(a, 1).unwrap() {
+                0 => break,
+                c => s.push(c as u8),
+            }
+        }
+        assert_eq!(String::from_utf8(s).unwrap(), p.name);
+        for (off, chunk) in p.elf.chunks(4).enumerate() {
+            let word = m
+                .cpu
+                .bus
+                .read(image + 4 * off as u32, chunk.len() as u32)
+                .unwrap();
+            let mut want = [0u8; 4];
+            want[..chunk.len()].copy_from_slice(chunk);
+            assert_eq!(word, u32::from_le_bytes(want), "{} at {off}", p.name);
+        }
+        // Read-only data: the kernel maps it without W.
+        assert!((sym(&elf, "__rodata_start")..sym(&elf, "__data_start")).contains(&image));
     }
 }
 

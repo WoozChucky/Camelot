@@ -1,0 +1,107 @@
+/* The ELF loader: puts an executable's PT_LOAD segments into a process's user
+ * space. The images come from the kernel itself (kernel/userprogs.s), but they
+ * are checked as if they didn't: a bad image is an error, never a panic or a
+ * mapping outside user space. Headers are copied out with memcpy, so the
+ * image needs no particular alignment. */
+#include "elf.h"
+#include "kalloc.h"
+#include "memlayout.h"
+#include "string.h"
+
+/* What a segment's flags allow, as PTE permissions (always with U). Returns 0
+ * for flags the loader refuses: a segment must be readable. */
+static u32 segment_perm(u32 flags) {
+    if ((flags & PF_R) == 0) {
+        return 0;
+    }
+    u32 perm = PTE_U | PTE_R;
+    if (flags & PF_W) {
+        perm |= PTE_W;
+    }
+    if (flags & PF_X) {
+        perm |= PTE_X;
+    }
+    return perm;
+}
+
+/* Maps the pages of segment `ph` into `pt`, filled from `image`. */
+static const char *load_segment(pagetable_t pt, const u8 *image, const struct elf32_phdr *ph) {
+    u32 perm = segment_perm(ph->flags);
+    if (perm == 0) {
+        return "segment not readable";
+    }
+    /* In user space below the stack's guard page. The second test can't
+     * overflow once the first holds. */
+    if (ph->vaddr < USER_BASE || ph->vaddr >= USER_LOAD_TOP || ph->memsz > USER_LOAD_TOP - ph->vaddr) {
+        return "segment outside user space";
+    }
+    u32 end = ph->vaddr + ph->memsz;
+    for (u32 page = PGROUNDDOWN(ph->vaddr); page < end; page += PGSIZE) {
+        pte_t *pte = walk(pt, page, false);
+        if (pte != NULL && (*pte & PTE_V)) {
+            return "segments share a page";
+        }
+        u8 *mem = kzalloc();
+        if (mem == NULL) {
+            return "out of memory";
+        }
+        /* The part of the file's bytes [vaddr, vaddr + filesz) on this page;
+         * the rest of it stays zero (.bss, and the page around the segment). */
+        u32 from = page > ph->vaddr ? page : ph->vaddr;
+        u32 file_end = ph->vaddr + ph->filesz;
+        u32 to = page + PGSIZE < file_end ? page + PGSIZE : file_end;
+        if (from < to) {
+            memcpy(mem + (from - page), image + ph->offset + (from - ph->vaddr), to - from);
+        }
+        if (map_pages(pt, page, (u32)(uintptr)mem, PGSIZE, perm) != 0) {
+            kfree(mem);
+            return "out of memory";
+        }
+    }
+    return NULL;
+}
+
+const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry) {
+    struct elf32_ehdr eh;
+    if (size < sizeof eh) {
+        return "not an ELF file";
+    }
+    memcpy(&eh, image, sizeof eh);
+    if (eh.magic != ELF_MAGIC) {
+        return "not an ELF file";
+    }
+    if (eh.class != ELFCLASS32 || eh.data != ELFDATA2LSB || eh.machine != EM_RISCV) {
+        return "not a 32-bit little-endian RISC-V file";
+    }
+    if (eh.type != ET_EXEC) {
+        return "not an executable";
+    }
+    if (eh.phentsize != sizeof(struct elf32_phdr) || eh.phnum > ELF_MAX_PHNUM || eh.phoff > size ||
+        eh.phnum * sizeof(struct elf32_phdr) > size - eh.phoff) {
+        return "bad program headers";
+    }
+
+    for (u32 i = 0; i < eh.phnum; i++) {
+        struct elf32_phdr ph;
+        memcpy(&ph, image + eh.phoff + i * sizeof ph, sizeof ph);
+        if (ph.type != PT_LOAD || ph.memsz == 0) {
+            continue;
+        }
+        if (ph.filesz > ph.memsz || ph.offset > size || ph.filesz > size - ph.offset) {
+            return "segment outside the file";
+        }
+        const char *err = load_segment(pt, image, &ph);
+        if (err != NULL) {
+            return err;
+        }
+    }
+
+    /* The entry point must be code the program can run. */
+    u32 want = PTE_V | PTE_U | PTE_X;
+    pte_t *pte = eh.entry < USER_TOP ? walk(pt, eh.entry, false) : NULL;
+    if (pte == NULL || (*pte & want) != want) {
+        return "entry point not in an executable segment";
+    }
+    *entry = eh.entry;
+    return NULL;
+}

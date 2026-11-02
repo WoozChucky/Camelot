@@ -1,21 +1,24 @@
-/* S-mode trap handling: kernel_vec (kernelvec.s) saves the registers and calls
- * kernel_trap(). Two interrupts are handled: the timer tick, which arrives as
- * a supervisor software interrupt forwarded by machine_vec, and the supervisor
- * external interrupt from the PLIC, so far only the UART's receive line. An
- * exception is a kernel bug, so it panics, unless a memory probe (probe.s)
- * caused it. */
+/* S-mode trap handling. Traps from S-mode go to kernel_vec (kernelvec.s),
+ * which saves the registers on the kernel stack and calls kernel_trap();
+ * traps from U-mode go to user_vec (uservec.s), which saves them in the
+ * process's trap frame and calls user_trap().
+ *
+ * Two interrupts are handled: the timer tick, which arrives as a supervisor
+ * software interrupt forwarded by machine_vec, and the supervisor external
+ * interrupt from the PLIC, so far only the UART's receive line. In the kernel
+ * an exception is a bug, so it panics, unless a memory probe (probe.s) caused
+ * it. In U-mode, ecall is a call into the kernel (syscall.c) and any other
+ * exception kills the process. */
 #include "trap.h"
 #include "kprintf.h"
 #include "machine.h"
 #include "plic.h"
 #include "probe.h"
+#include "proc.h"
 #include "riscv.h"
+#include "syscall.h"
 #include "uart.h"
 #include "vm.h"
-
-/* Register numbers in struct trap_frame's regs[]. */
-#define REG_A0 10
-#define REG_A1 11
 
 volatile u32 ticks;
 
@@ -98,9 +101,11 @@ static void trap_panic(struct trap_frame *f) {
     kprintf("panic: %s\n", trap_cause_name(f->scause));
     kprintf("  scause 0x%08x  sepc 0x%08x  stval 0x%08x  sstatus 0x%08x\n", f->scause, f->sepc, f->stval,
             f->sstatus);
-    if (f->scause == CAUSE_INSTR_PAGE_FAULT || f->scause == CAUSE_LOAD_PAGE_FAULT ||
-        f->scause == CAUSE_STORE_PAGE_FAULT) {
-        vm_print_mapping(f->stval);
+    /* The kernel's mappings are the same in every page table, so the active
+     * one, a process's or the kernel's, shows how the kernel saw stval. */
+    pagetable_t pt = vm_active_pagetable();
+    if (is_page_fault(f->scause) && pt != NULL) {
+        vm_print_mapping(pt, f->stval);
     }
     for (int i = 1; i < 32; i++) {
         kprintf("  %3s %08x", reg_names[i], f->regs[i]);
@@ -143,12 +148,16 @@ static bool probe_fixup(struct trap_frame *f) {
     return true;
 }
 
+/* A timer tick from machine_vec. Clear it first: a tick that arrives while
+ * this runs sets SSIP again and is taken after sret. */
+static void clock_tick(void) {
+    w_sip(r_sip() & ~SIP_SSIP);
+    ticks = ticks + 1;
+}
+
 void kernel_trap(struct trap_frame *f) {
     if (f->scause == (CAUSE_INTERRUPT | IRQ_S_SOFT)) {
-        /* A timer tick from machine_vec. Clear it first: a tick that arrives
-         * while this runs sets SSIP again and is taken after sret. */
-        w_sip(r_sip() & ~SIP_SSIP);
-        ticks = ticks + 1;
+        clock_tick();
         return;
     }
     if (f->scause == (CAUSE_INTERRUPT | IRQ_S_EXT)) {
@@ -159,6 +168,42 @@ void kernel_trap(struct trap_frame *f) {
         return;
     }
     trap_panic(f);
+}
+
+void user_trap(struct trap_frame *f) {
+    /* From here on, a trap is the kernel's own. Interrupts stay off (the trap
+     * cleared sstatus.SIE) until the process is back in U-mode. */
+    w_stvec((u32)(uintptr)kernel_vec);
+    if (f->scause == (CAUSE_INTERRUPT | IRQ_S_SOFT)) {
+        /* The end of the process's time slice. */
+        clock_tick();
+        yield();
+    } else if (f->scause == (CAUSE_INTERRUPT | IRQ_S_EXT)) {
+        external_interrupt();
+    } else if (f->scause == CAUSE_ECALL_U) {
+        /* sepc is the ecall itself: resume after it. */
+        f->sepc += 4;
+        syscall(f);
+    } else {
+        /* A fault in U-mode is the program's, not the kernel's. */
+        proc_kill(f);
+    }
+    user_trap_return(f);
+}
+
+void user_trap_return(struct trap_frame *f) {
+    /* No interrupt from here to sret: stvec is about to point at user_vec,
+     * which only works for traps from U-mode. */
+    intr_off();
+    w_stvec((u32)(uintptr)user_vec);
+    /* sret goes to U-mode (SPP = 0) and turns interrupts on there (SPIE). */
+    f->sstatus = (r_sstatus() & ~SSTATUS_SPP) | SSTATUS_SPIE;
+    user_return(f);
+}
+
+bool is_page_fault(u32 scause) {
+    return scause == CAUSE_INSTR_PAGE_FAULT || scause == CAUSE_LOAD_PAGE_FAULT ||
+           scause == CAUSE_STORE_PAGE_FAULT;
 }
 
 void trap_init(void) {

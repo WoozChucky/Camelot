@@ -478,7 +478,7 @@ With relaxation on (clang's default, which is how the examples used to be built)
 
 ### Kernel build
 
-The kernel (`kernel/`) is built by `cargo xtask kernel`, a Rust build task (`crates/xtask`), not a Makefile or shell script: clang compiles each `.c`, clang or merlin-as (`--as merlin`, step 1 above) assembles each `.s`, and `ld.lld` links them with `kernel/kernel.ld`. The full command lines are in `kernel/README.md`. The linked `kernel/kernel.elf` is committed, so running and testing the kernel needs no LLVM; the build is reproducible, and when the installed clang matches the one recorded in `kernel/kernel.elf.clang-version`, `cargo test` checks the committed image is up to date.
+The kernel (`kernel/`) is built by `cargo xtask kernel`, a Rust build task (`crates/xtask`), not a Makefile or shell script: clang compiles each `.c`, clang or merlin-as (`--as merlin`, step 1 above) assembles each `.s`, and `ld.lld` links them with `kernel/kernel.ld`. The full command lines are in `kernel/README.md`. The linked `kernel/kernel.elf` is committed, so running and testing the kernel needs no LLVM; the build is reproducible, and when the installed clang matches the one recorded in `kernel/kernel.elf.clang-version`, `cargo test` checks the committed image is up to date. The user programs the kernel embeds (`kernel/user/`, see "Kernel processes") are built first, by our own tools: `cargo xtask kernel` assembles each with merlin-as, links it with merlin-ld and writes the executables as data into `kernel/userprogs.s`, a generated file that is committed like `kernel.elf` (and that `cargo test` checks is current, without LLVM).
 
 Boot contract: Grail's boot ROM jumps to `_start` at 0x8000_0000 in M-mode. `_start` points `mtvec` at an early trap handler, sets `sp` to the top of a 16 KiB stack, zeroes `.bss` (`__bss_start`..`__bss_end`, both 4-byte aligned), and calls `start()`, the M-mode setup below, then executes `mret`, which enters S-mode at `supervisor_entry`. That calls `int kmain(void)` in S-mode; when `kmain` returns, the machine call `MCALL_HALT` stops the machine with its return value as the exit code. Until `start()` installs the M-mode trap handler, any trap prints `mcause`, `mepc` and `mtval` with `xcal.dbg` and halts with exit code 0xFF. `.text` starts at `__text_start` (= `_start`), and `.rodata` (`__rodata_start`) and `.data` (`__data_start`) each start on a page boundary, so the kernel page table can map them with different permissions. `__kernel_end` (page aligned) marks the first free byte of RAM after the image.
 
@@ -502,7 +502,7 @@ The kernel runs in S-mode on top of a small M-mode layer (the xv6-riscv design).
 
 Timer: the tick rate is 10 Hz, an interval of `timebase / 10` `mtime` ticks (at least 1). The timebase comes from sysinfo's `SYS_TIMEBASE_HZ` (section 9.5) through one function, `timebase_hz()`, which reads it on its first call (`timer_init`, in M-mode) and keeps it, so S-mode code never touches the register again (it stays valid once the kernel turns paging on). If `SYS_MAGIC` does not read "SYSI", or `SYS_TIMEBASE_HZ` reads 0, it falls back to the nominal 10 MHz (section 7).
 
-`kernel_vec` (S-mode, `kernel/kernelvec.s`) saves x1-x31 and `sepc`, `scause`, `stval`, `sstatus` in a `struct trap_frame` on the current stack (`regs[32]` with x*n* at offset 4*n*, then the four CSRs at 128-140; 144 bytes), calls `kernel_trap(frame)`, restores `sepc`, `sstatus` and the registers from the frame, and returns with `sret`. Every trap comes from S-mode until there are user processes, so `sscratch` is unused for now.
+`kernel_vec` (S-mode, `kernel/kernelvec.s`) saves x1-x31 and `sepc`, `scause`, `stval`, `sstatus` in a `struct trap_frame` on the current stack (`regs[32]` with x*n* at offset 4*n*, then the four CSRs at 128-140; 144 bytes), calls `kernel_trap(frame)`, restores `sepc`, `sstatus` and the registers from the frame, and returns with `sret`. `stvec` points at `kernel_vec` only while the hart runs in S-mode; traps from U-mode go to `user_vec`, which uses `sscratch` to find the process's kernel stack ("Kernel processes").
 
 `kernel_trap` (`kernel/trap.c`): a supervisor software interrupt clears `sip.SSIP` and increments `ticks`. A supervisor external interrupt (cause 9) claims the source from PLIC context 1, services it (the UART's receive handler, see "Kernel console") and completes it; `sip.SEIP` follows the PLIC's line, so there is nothing to clear. An exception at one of the memory probes' load or store (see "Kernel memory") resumes the probe instead. Any other trap is a panic: it prints
 
@@ -511,7 +511,7 @@ panic: <cause name>
   scause 0x........  sepc 0x........  stval 0x........  sstatus 0x........
 ```
 
-then, for a page fault (cause 12, 13 or 15), how the kernel page table maps `stval`: `  va 0x........ is not mapped` or `  va 0x........ maps to pa 0x........, pte 0x........ DAGUXWRV`, the flags printed bit 7 to bit 0 with `-` for a clear bit. Then x1-x31 four per line (`   ra 01010101   sp 80007400 ...`), and it halts with exit code 0xFE. After its self-tests the kernel sets up the PLIC and enables its interrupts (`sie.SSIE`, `sie.SEIE`, `sstatus.SIE`), idles in `wfi` printing `tick 1` ... `tick 10`, then runs its shell ("Kernel console" below) and returns when told to `halt`.
+then, for a page fault (cause 12, 13 or 15) with paging on, how the active page table maps `stval` (the kernel's mappings are the same in the kernel page table and in every process's): `  va 0x........ is not mapped` or `  va 0x........ maps to pa 0x........, pte 0x........ DAGUXWRV`, the flags printed bit 7 to bit 0 with `-` for a clear bit. Then x1-x31 four per line (`   ra 01010101   sp 80007400 ...`), and it halts with exit code 0xFE. After its self-tests the kernel sets up the PLIC and enables its interrupts (`sie.SSIE`, `sie.SEIE`, `sstatus.SIE`), idles in `wfi` printing `tick 1` ... `tick 10`, then runs its shell ("Kernel console" below) and returns when told to `halt`.
 
 For testing the panic path, the image has a word `boot_fault` in `.data`, normally 1. Patching it to 2 makes the kernel execute an illegal instruction after the ticks (with every register but sp set to its number in each byte, x5 = 0x05050505); 3 makes it load from the unmapped address 0x100, a load page fault since paging is on; 4 makes it store to `kmain`'s first instruction, a store page fault since kernel text is read and execute only. Values 5 to 11 misuse the memory API after the ticks, and each must end in a plain `panic: <message>` from the check that catches it: 5 maps the first kernel text page again (`map_pages: remap`), 6 unmaps page 0 (`unmap_pages: not mapped`), 7 maps a page with W but not R (`map_pages: bad permissions`), 8 plants a 4 MiB leaf in the root table and walks it (`walk: unexpected megapage`), and 9, 10 and 11 `kfree` a page pointer plus 4, the kernel's first page and the page after the end of RAM (`kfree`, after a `kfree: bad page <pa>` line).
 
@@ -540,7 +540,7 @@ and nothing else: no U, no G, nothing executable outside the kernel text, and th
 
 Boot order in `kmain`: UART banner and `kprintf` self-test, `kinit()`, `kvminit()`, `kvminithart()`, then the memory self-tests, then `trap_init()`, the ticks and the shell, which run with paging on. Setting up 128 MiB takes about 4.5 million instructions, nearly all of them freeing, mapping and (in the self-test) allocating one page at a time; a few machine timer ticks fire meanwhile and pile up in `sip.SSIP`. `trap_init()` clears that bit before it enables the interrupt, so the first tick the kernel counts is a whole interval long, like the others.
 
-**Memory probes** (`kernel/probe.s`): `probe_load(addr, &val, &stval)` and `probe_store(addr, val, &stval)` make one word access and return 0, or the trap cause with `stval` when it faults. `kernel_trap` recognises an exception whose `sepc` is a probe's access instruction, sets a0 = `scause` and a1 = `stval` in the frame and resumes at `probe_fault`, which stores `stval` and returns (an exception table, as in Linux). The self-tests use them to expect faults; copying to and from user memory will too. Any other page fault panics until there are processes.
+**Memory probes** (`kernel/probe.s`): `probe_load(addr, &val, &stval)` and `probe_store(addr, val, &stval)` make one word access and return 0, or the trap cause with `stval` when it faults. `kernel_trap` recognises an exception whose `sepc` is a probe's access instruction, sets a0 = `scause` and a1 = `stval` in the frame and resumes at `probe_fault`, which stores `stval` and returns (an exception table, as in Linux). The self-tests use them to expect faults. Any other page fault in S-mode panics; a fault in U-mode kills the process instead ("Kernel processes"). The kernel reads user memory through the process's page table rather than through probes (`copyin`).
 
 **Self-tests** (`kernel/vmtest.c`), printed as `vm self-test: N/M passed` and counted in `kmain`'s exit code:
 
@@ -559,9 +559,76 @@ Console input is interrupt-driven; nothing in the kernel waits on RBR.
 - **PLIC** (`kernel/plic.c`): `plic_init()` gives the UART's source (1, section 7.1) priority 1, enables it for context 1 (hart 0, S-mode) and sets that context's threshold to 0. Context 0 (M-mode) is left alone and `mie.MEIE` stays clear: every device interrupt goes to the kernel.
 - **UART** (`kernel/uart.c`): `uart_init()` sets 8N1 and IER.ERBFI, so the UART holds its line high while a byte waits. `uart_intr()`, called for source 1, reads RBR until LSR.DR clears into a 128-byte ring buffer. The ring has one writer per index (the handler advances the head, the reader the tail), so it needs no lock. If it fills up, the handler leaves the remaining bytes in the UART and clears IER instead of dropping them (a byte left in RBR would keep the line high and the interrupt firing). `uart_rx_pop()` sets IER again once the ring is half empty. Transmit still polls LSR.THRE, which Grail always reports as set.
 - **Console** (`kernel/console.c`): `console_getc()` pops a byte, or sleeps in `wfi` with interrupts off from the check to the `wfi` (the interrupt that wakes it is taken right after). `console_readline(buf, size)` echoes printable characters (0x20-0x7E) and keeps at most `size - 1` of them. BS (0x08) and DEL (0x7F) erase one, echoing BS, space, BS. CR, LF or CR LF ends the line and echoes a LF; a LF right after a CR is skipped, so both raw consoles (CR) and piped text (LF, CR LF) work. Other control characters are ignored.
-- **Shell** (`kmain`, until there is a user-space one): prints `Type help for the list of commands.`, then reads lines after the prompt `camelot> `. It knows `help`, `ticks` (prints `ticks: N`, the timer ticks since boot) and `halt` (returns from `kmain`, so the exit code is the self-test failure count, 0 normally). Blank lines are skipped, surrounding blanks ignored, and anything else prints `unknown command: <line> (try help)`. Lines are up to 63 characters.
+- **Shell** (`kmain`, until there is a user-space one): prints `Type help for the list of commands.`, then reads lines after the prompt `camelot> `. It knows `help`, `ticks` (prints `ticks: N`, the timer ticks since boot), `run` (runs user programs, "Kernel processes" below) and `halt` (returns from `kmain`, so the exit code is the self-test failure count, 0 normally). Blank lines are skipped, surrounding blanks ignored, and anything else prints `unknown command: <line> (try help)`. Lines are up to 63 characters.
 
 Host side: the `grail` command feeds its stdin to the UART. When stdin is an interactive terminal (a Windows console, or a Linux terminal), Grail switches it to raw mode while it runs: each key is passed on as typed, the terminal does not echo it (the kernel does), and Ctrl-C still stops Grail. The terminal is restored at exit and on Ctrl-C. With a pipe or file nothing changes, so `printf 'ticks\nhalt\n' | grail kernel/kernel.elf` runs the shell non-interactively. Such input must end with `halt` (or the run needs `--max-steps`): when it runs out, the kernel just waits at the prompt for more, taking timer ticks, and Grail never exits. In a raw Windows console a lone Ctrl-Z is passed on as 0x1A like any other key (the shell ignores it), not taken as the end of the input. Without `--clock`, a kernel waiting for input still takes every timer tick (`wfi` skips to the next one), so the tick count grows by far more than 10 a second; `--clock 10MHz` makes it real time.
+
+### Kernel processes
+
+User programs run in U-mode, each in its own address space, and take turns on the CPU, one timer tick at a time (`kernel/proc.c`, `kernel/uservec.s`, `kernel/swtch.s`, `kernel/elf.c`, `kernel/syscall.c`). The design follows xv6-riscv for one hart, with one difference in the address space, below.
+
+**Address space.** User space is the low 4 MiB, `0` to `USER_TOP` = 0x0040_0000: exactly root entry 0 of an Sv32 page table. Page 0 is never mapped, so a null pointer faults; programs are linked at 0x1000 (`kernel/user/user.ld`); the stack is the last page, 0x003F_F000-0x003F_FFFF, with `sp` = `USER_TOP` at the start, and the page under it is an unmapped guard page, so program segments must end at or below 0x003F_E000. Every other root entry of a process's page table is a copy of the kernel page table's: the process shares the kernel's second-level tables, so the kernel's mappings (text, data, all of RAM and the devices, none with U) are present in every address space without being copied or freed per process. The kernel's own root entry 0 (only the test device lives there, which the kernel doesn't use) is replaced by the process's. This is why the kernel must not add root entries once processes exist.
+
+Why a shared kernel half rather than xv6's trampoline page: the kernel is identity mapped at 0x8000_0000 and up, far from user space, so the two never collide, and with the kernel mapped in every table a trap from U-mode needs no `satp` switch and no trampoline; the scheduler switches `satp` once per context switch. U-mode still can't touch the kernel, since no kernel PTE has U: a load from 0x8000_0000 in U-mode is a load page fault. `sstatus.SUM` stays clear, so S-mode can't touch user pages through user addresses either: the kernel reads user memory through the process's page table instead (`copyin(pt, dst, va, len)` walks it and copies from the physical pages, which the kernel's identity map makes reachable). `uvm_range_ok(pt, va, len, perm)` checks that every byte of a range is below `USER_TOP` and on a page mapped with V, U and `perm`; `copyin` copies only if the whole range passes, so a bad buffer copies nothing.
+
+**Processes** (`struct proc`, `kernel/include/proc.h`): a slot in a table of 8 with a state (unused, runnable, running, zombie), a pid (counting from 1), a name, the page table, a kernel stack (one page), a trap frame and a saved kernel context. The trap frame is the same `struct trap_frame` `kernel_vec` uses, at the top of the kernel stack page; the process's kernel code runs on the rest of the page, below it.
+
+**Trap entry and exit.** While a process runs in U-mode, `stvec` = `user_vec` and `sscratch` points at its trap frame. `user_vec` swaps `sscratch` into a0, saves every register (the user's a0 from `sscratch`) and `sepc`, `scause`, `stval`, `sstatus` in the frame, sets `sp` to the frame (so each trap from U-mode starts on an empty kernel stack) and calls `user_trap(frame)` in C. That first points `stvec` back at `kernel_vec`, and keeps interrupts off (the trap cleared `sstatus.SIE`) until the process is back in U-mode, so the kernel never takes an interrupt on a process's kernel stack. Then:
+
+- supervisor software interrupt (the tick): `ticks` + 1 and `yield()`, the end of the time slice;
+- supervisor external interrupt: serviced as in `kernel_trap`, and the process continues;
+- ecall from U-mode (cause 8): `sepc` + 4, then `syscall(frame)`;
+- any other exception: the process is killed (below).
+
+`user_trap_return(frame)` goes back: interrupts off, `stvec` = `user_vec`, the frame's `sstatus` gets `SPP` = U (0) and `SPIE` = 1, then `user_return(frame)` (assembly) sets `sscratch` = frame, `sepc` and `sstatus` from the frame, loads every register (a0 last) and executes `sret`, which enters U-mode with interrupts on.
+
+**Context switch.** `swtch(old, new)` (`kernel/swtch.s`) saves `ra`, `sp` and `s0`-`s11` in `*old` (`struct context`: ra at 0, sp at 4, s0-s11 from 8) and loads them from `*new`; the caller-saved registers are already assumed clobbered by any call. The scheduler runs on `kmain`'s boot stack. A new process's context has `ra` = `proc_start` and `sp` = its frame, so its first `swtch` lands in `proc_start`, which calls `user_trap_return` with a frame that holds only `sepc` = the ELF entry point and `sp` = `USER_TOP`.
+
+**Scheduler.** `scheduler()` loops: turn interrupts on and off again (pending interrupts are taken in between), pick the next runnable process round robin starting from the slot after the last one that ran (from slot 0 at each call, so processes start in the order they were created), mark it running, write its page table to `satp` (with `sfence.vma`), and `swtch` to it. When the process gives the CPU back, it restores the kernel page table, and frees the process if it became a zombie. It returns, with interrupts on, when no process is runnable. A process gives up the CPU only from its kernel thread: `yield()` on a tick (it stays runnable) or when it exits or is killed (it becomes a zombie).
+
+**Ending.** `exit` (the ecall) prints `pid N (name) exited: STATUS`. A fault in U-mode (any exception but ecall: a page fault, an illegal instruction such as `xcal.halt`, which is M-mode only, a misaligned access...) kills the process and prints
+
+```
+pid N (name) killed: <cause name>
+  scause 0x........  sepc 0x........  stval 0x........
+```
+
+and, for a page fault, how the process's page table maps `stval` (the same line as a panic's). The kernel is unaffected. Freeing a process (`uvm_free`) frees every page mapped in user space, the user-space second-level table and the root, clears the copied kernel entries first so their tables stay, and frees the kernel stack: after a `run`, every page is back on the free list.
+
+**Loading programs** (`elf_load`, `kernel/elf.c`). User programs are ELF32 executables embedded in the kernel's `.rodata` (`kernel/userprogs.s`, generated, see "Kernel build"); the table `user_programs` holds `{ name, image, size }` for each and `user_program_count` says how many. The loader treats an image as untrusted: it must be `\x7fELF`, 32-bit, little-endian, RISC-V, `ET_EXEC`, with 32-byte program headers (at most 16) inside the file; each `PT_LOAD` with a non-zero `p_memsz` must have `p_filesz <= p_memsz` and its file bytes inside the image, must be readable (`PF_R`), must lie in 0x1000..0x003F_E000, and must not share a page with another segment. Each page gets a fresh zeroed page from the allocator, the segment's file bytes copied in, mapped with U, R, plus W for `PF_W` and X for `PF_X`. The entry point must be on a page mapped with U and X. A failure gives a reason (`not an ELF file`, `not a 32-bit little-endian RISC-V file`, `not an executable`, `bad program headers`, `segment outside the file`, `segment not readable`, `segment outside user space`, `segments share a page`, `entry point not in an executable segment`, or `out of memory`), and whatever was allocated is freed. The stack page is mapped after the segments, R+W+U and zeroed.
+
+**Provisional ecalls** (`kernel/include/syscall.h`), until the system call ABI (#21): number in a7, arguments in a0-a1, result in a0. 1 = exit (status in a0; never returns). 2 = debug write: print the a1 bytes at user address a0 on the console and return a1, or return -1 without printing anything if any of them isn't readable user memory. Any other number returns -1. `xcal.dbg` works in U-mode too (section 9.1).
+
+**User programs** (`kernel/user/`, assembled by merlin-as and linked by merlin-ld with `user.ld`; `lib.s` is linked into each and has `exit`, `write`, `puts`, `strlen` and a delay loop):
+
+| Program | What it does |
+|---|---|
+| `hello` | prints `hello from user mode`, exits 0 |
+| `ping`, `pong` | print `ping 1` ... `ping 4` (`pong ...`), half a tick (500 000 instructions) apart, exit 0; run together they alternate |
+| `regs` | sets every register but t6 to its number in each byte, spins for about three ticks, exits 0 if all still hold their values, else with the first one's number: preemption must not change a register |
+| `badptr` | writes from kernel memory, page 0, across `USER_TOP`, with a length that wraps, from the guard page, and makes an unknown ecall: each must return -1; then a good write must return its length; exits 0 or the failing case's number |
+| `badload` | loads from 0x8000_0000: killed by a load page fault |
+| `badhalt` | executes `xcal.halt`: killed by an illegal instruction |
+
+**The `run` command.** `run PROG...` looks every name up (an unknown one prints `run: no program called NAME` and starts nothing), creates a process for each in order (one that can't be created prints `run: cannot start NAME: REASON`, e.g. `too many processes` for the ninth), and calls `scheduler()`; the prompt returns when all have exited or been killed. `run` alone prints `programs:` and the names. Typed input that arrives meanwhile is kept for the shell (the UART interrupt is serviced from `user_trap`). For example:
+
+```
+camelot> run ping pong badload
+ping 1
+ping 2
+pong 1
+pong 2
+pid 3 (badload) killed: load page fault
+  scause 0x0000000d  sepc 0x00001004  stval 0x80000000
+  va 0x80000000 maps to pa 0x80000000, pte 0x2000004b -A--X-RV
+ping 3
+ping 4
+pong 3
+pong 4
+pid 1 (ping) exited: 0
+pid 2 (pong) exited: 0
+camelot>
+```
 
 ## 11. Roadmap
 

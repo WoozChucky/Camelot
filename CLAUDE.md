@@ -26,8 +26,8 @@ crates/merlin           the C-subset compiler, C to .s (src/codegen.rs explains 
 crates/merlin-as        the assembler
 crates/merlin-ld        the linker (src/reloc.rs explains every relocation it applies)
 crates/merlin-objdump   the disassembler; output matches llvm-objdump 21
-crates/xtask            build tasks (`cargo xtask examples` builds every example with merlin-as + merlin-ld, no LLVM; `cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld; `cargo xtask hello` rebuilds merlin-as's ld.lld-linked hello reference; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
-kernel/                 the Camelot kernel (C + assembly); kernel.elf is committed, rebuild it after changes
+crates/xtask            build tasks (`cargo xtask examples` builds every example with merlin-as + merlin-ld, no LLVM; `cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld, after generating kernel/userprogs.s from kernel/user with merlin-as + merlin-ld; `cargo xtask hello` rebuilds merlin-as's ld.lld-linked hello reference; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
+kernel/                 the Camelot kernel (C + assembly); kernel.elf and the generated userprogs.s are committed, rebuild with `cargo xtask kernel` after changes (kernel/user: the user programs it embeds)
 docs/                   ISA spec, Avalon protocol
 examples/               bare-metal programs; their .elf files are committed, rebuild them with `cargo xtask examples` after changes (`cargo test` checks)
 tests/riscv-tests       prebuilt riscv-tests ELFs, and obj/ with their objects (merlin-ld relinks them)

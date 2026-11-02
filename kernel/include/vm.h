@@ -72,7 +72,46 @@ void kvminit(void);
 /* Turns paging on with kernel_pagetable (satp, then sfence.vma). */
 void kvminithart(void);
 
-/* For page fault reports: prints how kernel_pagetable maps `va`. */
-void vm_print_mapping(u32 va);
+/* For page fault reports: prints how `pt` maps `va`, as
+ * "  va 0x... is not mapped" or "  va 0x... maps to pa 0x..., pte 0x... DAGUXWRV". */
+void vm_print_mapping(pagetable_t pt, u32 va);
+
+/* The page table satp points at, or NULL while paging is off. */
+pagetable_t vm_active_pagetable(void);
+
+/* User address spaces (spec section 10, "Kernel processes"). User space is
+ * the low 4 MiB, root entry 0: the program from USER_BASE (page 0 stays
+ * unmapped, so a null pointer faults), the stack in the last page below
+ * USER_TOP, and an unmapped guard page under it. Every other root entry is a
+ * copy of the kernel's, so the kernel's mappings (none with U) are there in
+ * every process and a trap from U-mode needs no satp switch. */
+#define USER_BASE PGSIZE
+#define USER_TOP 0x00400000u
+#define USER_STACK_SIZE PGSIZE
+#define USER_STACK (USER_TOP - USER_STACK_SIZE)
+/* Program segments end at or below this: one guard page under the stack. */
+#define USER_LOAD_TOP (USER_STACK - PGSIZE)
+/* Root entries that belong to user space (VPN[1] of USER_TOP). */
+#define USER_ROOT_ENTRIES 1
+
+/* A page table for a new process: the kernel's root entries from
+ * USER_ROOT_ENTRIES on (sharing its second-level tables), nothing in user
+ * space. NULL if no page is free. Must be called after kvminit(), and the
+ * kernel must not add root entries afterwards. */
+pagetable_t uvm_create(void);
+
+/* Frees a table from uvm_create(): every page mapped in user space, the
+ * user-space second-level tables and the root. The kernel's tables stay. */
+void uvm_free(pagetable_t pt);
+
+/* Whether every byte of [va, va + len) is user memory in `pt` mapped with
+ * U and all of `perm` (PTE_R, PTE_W). len 0 is always fine. */
+bool uvm_range_ok(pagetable_t pt, u32 va, u32 len, u32 perm);
+
+/* Copies `len` bytes from user address `va` in `pt` to `dst`, through the
+ * physical pages: the kernel never dereferences a user address, so
+ * sstatus.SUM stays clear. All or nothing: returns -1, having copied
+ * nothing, unless uvm_range_ok(pt, va, len, PTE_R); else 0. */
+int copyin(pagetable_t pt, void *dst, u32 va, u32 len);
 
 #endif
