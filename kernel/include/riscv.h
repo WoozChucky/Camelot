@@ -49,6 +49,10 @@
 /* Top bit of xcause: the trap is an interrupt. */
 #define CAUSE_INTERRUPT 0x80000000u
 
+/* satp: MODE (bit 31) = 1 selects Sv32; PPN (bits 21:0) is the physical page
+ * number of the root page table. */
+#define SATP_SV32 (1u << 31)
+
 /* M-mode CSRs (only usable before start() drops to S-mode). */
 u32 r_mstatus(void);
 void w_mstatus(u32 v);
@@ -70,6 +74,13 @@ u32 r_sip(void);
 void w_sip(u32 v);
 u32 r_stvec(void);
 void w_stvec(u32 v);
+u32 r_satp(void);
+void w_satp(u32 v);
+
+/* sfence.vma zero, zero: orders earlier page-table writes before later
+ * translations, for every address. Grail has no TLB, so this costs nothing
+ * there, but the ISA requires it after changing a page table or satp. */
+void sfence_vma(void);
 
 /* Waits for an interrupt (wfi). Grail fast-forwards mtime to mtimecmp. */
 void wfi(void);

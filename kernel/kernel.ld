@@ -1,5 +1,9 @@
 /* Camelot kernel layout: everything in RAM from 0x8000_0000, where the boot
- * ROM jumps (spec section 7). Grail loads the ELF segments directly. */
+ * ROM jumps (spec section 7). Grail loads the ELF segments directly.
+ *
+ * Text, read-only data and the rest each start on a page boundary, so the
+ * kernel page table (vm.c) can map them with different permissions: text
+ * R+X, rodata R, everything from .data on R+W. */
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
@@ -8,15 +12,18 @@ MEMORY { RAM (rwx) : ORIGIN = 0x80000000, LENGTH = 128M }
 SECTIONS
 {
     .text : {
+        __text_start = .;
         *(.text.start)          /* _start must be first */
         *(.text .text.*)
     } > RAM
 
-    .rodata : ALIGN(16) {
+    .rodata : ALIGN(4096) {
+        __rodata_start = .;     /* also the end of the text pages */
         *(.rodata .rodata.* .srodata .srodata.*)
     } > RAM
 
-    .data : ALIGN(16) {
+    .data : ALIGN(4096) {
+        __data_start = .;       /* also the end of the rodata pages */
         *(.data .data.* .sdata .sdata.*)
     } > RAM
 

@@ -457,7 +457,7 @@ Until our compiler can build the kernel, clang (`--target=riscv32-unknown-elf -m
 
 The kernel (`kernel/`) is built by `cargo xtask kernel`, a Rust build task (`crates/xtask`), not a Makefile or shell script: clang compiles each `.c`, clang or merlin-as (`--as merlin`, step 1 above) assembles each `.s`, and `ld.lld` links them with `kernel/kernel.ld`. The full command lines are in `kernel/README.md`. The linked `kernel/kernel.elf` is committed, so running and testing the kernel needs no LLVM; the build is reproducible, and when the installed clang matches the one recorded in `kernel/kernel.elf.clang-version`, `cargo test` checks the committed image is up to date.
 
-Boot contract: Grail's boot ROM jumps to `_start` at 0x8000_0000 in M-mode. `_start` points `mtvec` at an early trap handler, sets `sp` to the top of a 16 KiB stack, zeroes `.bss` (`__bss_start`..`__bss_end`, both 4-byte aligned), and calls `start()`, the M-mode setup below, then executes `mret`, which enters S-mode at `supervisor_entry`. That calls `int kmain(void)` in S-mode; when `kmain` returns, the machine call `MCALL_HALT` stops the machine with its return value as the exit code. Until `start()` installs the M-mode trap handler, any trap prints `mcause`, `mepc` and `mtval` with `xcal.dbg` and halts with exit code 0xFF. `__kernel_end` (page aligned) marks the first free byte of RAM after the image.
+Boot contract: Grail's boot ROM jumps to `_start` at 0x8000_0000 in M-mode. `_start` points `mtvec` at an early trap handler, sets `sp` to the top of a 16 KiB stack, zeroes `.bss` (`__bss_start`..`__bss_end`, both 4-byte aligned), and calls `start()`, the M-mode setup below, then executes `mret`, which enters S-mode at `supervisor_entry`. That calls `int kmain(void)` in S-mode; when `kmain` returns, the machine call `MCALL_HALT` stops the machine with its return value as the exit code. Until `start()` installs the M-mode trap handler, any trap prints `mcause`, `mepc` and `mtval` with `xcal.dbg` and halts with exit code 0xFF. `.text` starts at `__text_start` (= `_start`), and `.rodata` (`__rodata_start`) and `.data` (`__data_start`) each start on a page boundary, so the kernel page table can map them with different permissions. `__kernel_end` (page aligned) marks the first free byte of RAM after the image.
 
 ### Kernel traps
 
@@ -481,18 +481,53 @@ Timer: the tick rate is 10 Hz, an interval of `timebase / 10` `mtime` ticks with
 
 `kernel_vec` (S-mode, `kernel/kernelvec.s`) saves x1-x31 and `sepc`, `scause`, `stval`, `sstatus` in a `struct trap_frame` on the current stack (`regs[32]` with x*n* at offset 4*n*, then the four CSRs at 128-140; 144 bytes), calls `kernel_trap(frame)`, restores `sepc`, `sstatus` and the registers from the frame, and returns with `sret`. Every trap comes from S-mode until there are user processes, so `sscratch` is unused for now.
 
-`kernel_trap` (`kernel/trap.c`): a supervisor software interrupt clears `sip.SSIP` and increments `ticks`. Any other trap is a panic: it prints
+`kernel_trap` (`kernel/trap.c`): a supervisor software interrupt clears `sip.SSIP` and increments `ticks`. An exception at one of the memory probes' load or store (see "Kernel memory") resumes the probe instead. Any other trap is a panic: it prints
 
 ```
 panic: <cause name>
   scause 0x........  sepc 0x........  stval 0x........  sstatus 0x........
 ```
 
-followed by x1-x31 four per line (`   ra 01010101   sp 80007400 ...`), and halts with exit code 0xFE. After its self-tests the kernel enables the tick (`sie.SSIE`, `sstatus.SIE`), idles in `wfi` printing `tick 1` ... `tick 10`, and returns.
+then, for a page fault (cause 12, 13 or 15), how the kernel page table maps `stval`: `  va 0x........ is not mapped` or `  va 0x........ maps to pa 0x........, pte 0x........ DAGUXWRV`, the flags printed bit 7 to bit 0 with `-` for a clear bit. Then x1-x31 four per line (`   ra 01010101   sp 80007400 ...`), and it halts with exit code 0xFE. After its self-tests the kernel enables the tick (`sie.SSIE`, `sstatus.SIE`), idles in `wfi` printing `tick 1` ... `tick 10`, and returns.
 
-For testing the panic path, the image has a word `boot_fault` in `.data`, normally 1. Patching it to 2 makes the kernel execute an illegal instruction after the ticks (with every register but sp set to its number in each byte, x5 = 0x05050505); 3 makes it load from the unmapped address 0x100.
+For testing the panic path, the image has a word `boot_fault` in `.data`, normally 1. Patching it to 2 makes the kernel execute an illegal instruction after the ticks (with every register but sp set to its number in each byte, x5 = 0x05050505); 3 makes it load from the unmapped address 0x100, a load page fault since paging is on; 4 makes it store to `kmain`'s first instruction, a store page fault since kernel text is read and execute only. Values 5 to 11 misuse the memory API after the ticks, and each must end in a plain `panic: <message>` from the check that catches it: 5 maps the first kernel text page again (`map_pages: remap`), 6 unmaps page 0 (`unmap_pages: not mapped`), 7 maps a page with W but not R (`map_pages: bad permissions`), 8 plants a 4 MiB leaf in the root table and walks it (`walk: unexpected megapage`), and 9, 10 and 11 `kfree` a page pointer plus 4, the kernel's first page and the page after the end of RAM (`kfree`, after a `kfree: bad page <pa>` line).
 
 Kernel C stays inside what Merlin will compile: no libc headers (`-nostdinc`), no floating point, no inline `asm()` (CSR access and Xcal instructions live in `.s` files, with Xcal instructions written as `.word`), and `.s` files use only merlin-as syntax. The one exception is varargs: `kprintf` uses `__builtin_va_list`/`__builtin_va_start`/`__builtin_va_arg`/`__builtin_va_end` (via `kernel/include/varargs.h`), so Merlin must provide those builtins with the ILP32 convention (variadic arguments travel in a0-a7 and then on the stack like named ones; the callee spills a0-a7 next to its stack arguments and `va_list` is a pointer walking that area).
+
+### Kernel memory
+
+The kernel manages physical memory in 4 KiB pages and runs with Sv32 paging on (`kernel/kalloc.c`, `kernel/vm.c`), the xv6-riscv design.
+
+**RAM** comes from sysinfo (section 9.5), not from a fixed size or a boot argument: `kinit()` checks `SYS_MAGIC` and `SYS_VERSION` (1), reads `SYS_RAM_BASE` and `SYS_RAM_SIZE`, and panics unless the image starts RAM (`__text_start` = `SYS_RAM_BASE`) and RAM is a whole number of pages. So the allocator follows `--ram`. With 2 GiB, RAM ends at 2^32, which wraps to 0 in 32 bits: the kernel counts pages and compares `pa - ram_base < ram_size` instead of computing an end address.
+
+**Page allocator**: one free list threaded through the free pages (each free page's first word points to the next), holding every page from `__kernel_end` to the end of RAM. `kalloc()` pops a page (NULL when none is left), `kfree(pa)` pushes one and panics unless `pa` is a page-aligned address in that range, `kzalloc()` is `kalloc()` plus zeroing, and `kfree_pages()` is the free count. Unlike xv6, pages are not filled with junk on free or alloc: at about a thousand stores a page it would dominate the boot.
+
+**Page tables**: `pagetable_t` is a page of 1024 PTEs. `walk(pt, va, alloc)` returns the level-0 PTE for `va`, creating the second-level table (a zeroed page) when `alloc` is set. `map_pages(pt, va, pa, size, perm)` maps a page-aligned range with permissions R/W/X/U (W without R and remapping a valid PTE panic), returning -1 if a table can't be allocated. `unmap_pages(pt, va, size, free)` clears mapped PTEs (panics on an unmapped page) and optionally frees the pages. `pagetable_free(pt)` frees the second-level tables and the root, and panics if a leaf is still mapped. The kernel only creates 4 KiB leaves: no megapages, so a 4 MiB leaf in a root table is treated as corruption. PTEs are created with A and D clear; Grail sets them (section 5), so the kernel never has to.
+
+**Kernel address space**: identity mapped (virtual = physical), so physical addresses (page tables, pages from `kalloc`) stay usable as pointers. `kvminit()` maps
+
+| Range | Permissions |
+|---|---|
+| `__text_start` .. `__rodata_start`: kernel text | R+X |
+| `__rodata_start` .. `__data_start`: read-only data | R |
+| `__data_start` .. end of RAM: data, `.bss`, boot stack, free pages | R+W |
+| every device in the sysinfo device table, rounded out to whole pages; a page that devices share is mapped once | R+W |
+
+and nothing else: no U, no G, nothing executable outside the kernel text, and the boot ROM, the gaps and address 0 unmapped, so a stray access is a page fault. The devices come from the table rather than from constants, so a new Grail device is mapped without a kernel change. `kvminithart()` then executes `sfence.vma`, writes `satp` (MODE = Sv32, PPN = root), and `sfence.vma` again. Grail has no TLB, so the fences cost nothing there, but the ISA requires them. M-mode code (`machine_vec`) ignores `satp` and keeps using physical addresses.
+
+Boot order in `kmain`: UART banner and `kprintf` self-test, `kinit()`, `kvminit()`, `kvminithart()`, then the memory self-tests, then `trap_init()` and the ticks, which run with paging on. Setting up 128 MiB takes about 4.5 million instructions, nearly all of them freeing, mapping and (in the self-test) allocating one page at a time; a few machine timer ticks fire meanwhile and pile up in `sip.SSIP`. `trap_init()` clears that bit before it enables the interrupt, so the first tick the kernel counts is a whole interval long, like the others.
+
+**Memory probes** (`kernel/probe.s`): `probe_load(addr, &val, &stval)` and `probe_store(addr, val, &stval)` make one word access and return 0, or the trap cause with `stval` when it faults. `kernel_trap` recognises an exception whose `sepc` is a probe's access instruction, sets a0 = `scause` and a1 = `stval` in the frame and resumes at `probe_fault`, which stores `stval` and returns (an exception table, as in Linux). The self-tests use them to expect faults; copying to and from user memory will too. Any other page fault panics until there are processes.
+
+**Self-tests** (`kernel/vmtest.c`), printed as `vm self-test: N/M passed` and counted in `kmain`'s exit code:
+
+- allocate every free page (each aligned and after the kernel) until `kalloc()` returns NULL, check the count, check that `pagetable_create()` and a `map_pages()` needing a new table fail while memory is exhausted, then free every page and check the count again;
+- fill a page with all ones (every word a valid-looking PTE) and free it, then check that `kzalloc()` hands it back zeroed; the same for `pagetable_create()`, which `walk()` also uses. RAM starts out zero on Grail, so only a reused page shows the zeroing;
+- map a page a second time at 0x4000_0000, write through each address and read through the other, check the hardware set A and D in the PTE, unmap it (freeing the page) and check a load and a store there are page faults 13 and 15 with `stval` = the address;
+- a store to the first word of the kernel text and one to `.rodata` are store page faults (cause 15) caught by the probe, the text is unchanged and readable, and a store to `.data` works;
+- build a separate page table, map two pages across a 4 MiB boundary and a three-page range, check the PTEs with `walk()`, unmap, free the table, and check every page came back.
+
+The alias test leaves its second-level table in the kernel page table; everything else ends as it started.
 
 ## 11. Roadmap
 
