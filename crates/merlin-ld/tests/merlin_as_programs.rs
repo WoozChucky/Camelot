@@ -24,7 +24,7 @@ fn build_and_run(src: &str) -> (RunResult, String) {
     };
     let linked =
         merlin_ld::link(&[input], &Options::default()).unwrap_or_else(|e| panic!("merlin-ld: {e:?}"));
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.cpu.bus.uart.capture = true;
     m.load_elf(&linked.elf).unwrap();
     let r = m.run(Some(100_000), |_| {});
