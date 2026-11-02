@@ -46,6 +46,12 @@ struct big {
     int v[10];
 };
 
+/* What <stdarg.h> is made of (clang's builtins, which merlin has too). */
+typedef __builtin_va_list va_list;
+#define va_start(ap, last) __builtin_va_start(ap, last)
+#define va_arg(ap, type) __builtin_va_arg(ap, type)
+#define va_end(ap) __builtin_va_end(ap)
+
 /* Defined by clang, in clang_side.c. */
 struct s1 c_inc1(struct s1 s);
 struct s3 c_make3(char a, char b, char c);
@@ -71,6 +77,12 @@ signed char c_trunc_sc(int x);
 short c_trunc_s(int x);
 unsigned short c_trunc_us(int x);
 _Bool c_tobool(int x);
+int c_vmix(const char *fmt, ...);
+int c_vsum(int n, ...);
+int c_vlate(int a, int b, int c, int d, int e, int f, int g, ...);
+int c_stack(int a, int b, int c, int d, int e, int f, int g, struct s8 h, struct s12 i, char j, short k,
+            struct s6 l);
+struct s12 c_stack_ret(int a, int b, int c, int d, int e, int f, int g, int h, int i);
 
 static int checks, first_failure;
 
@@ -187,6 +199,84 @@ struct s6 m_negate6(struct s6 s) {
     return s;
 }
 
+/* Variadic functions: `...` arguments travel like named ones, in a0-a7
+ * and then on the stack; va_list walks them. Letters of fmt: i an int, c a
+ * signed char (promoted to int), s a struct s6, p a struct s8 (a register
+ * pair), b a struct s12 and B a struct big (both by reference). */
+static int vmix(const char *fmt, va_list ap) {
+    int s = 0;
+    for (; *fmt; fmt++) {
+        if (*fmt == 'i') {
+            s += va_arg(ap, int);
+        } else if (*fmt == 'c') {
+            s += (signed char)va_arg(ap, int);
+        } else if (*fmt == 's') {
+            struct s6 v = va_arg(ap, struct s6);
+            s += v.a + v.b + v.c;
+        } else if (*fmt == 'p') {
+            struct s8 v = va_arg(ap, struct s8);
+            s += v.x * v.y;
+        } else if (*fmt == 'b') {
+            struct s12 v = va_arg(ap, struct s12);
+            s += v.a + v.b + v.c;
+        } else if (*fmt == 'B') {
+            struct big v = va_arg(ap, struct big);
+            int i;
+            for (i = 0; i < 10; i++)
+                s += v.v[i];
+        }
+    }
+    return s;
+}
+
+int m_vmix(const char *fmt, ...) {
+    va_list ap;
+    int s;
+    va_start(ap, fmt);
+    s = vmix(fmt, ap);
+    va_end(ap);
+    return s;
+}
+
+int m_vsum(int n, ...) {
+    va_list ap;
+    int s = 0;
+    va_start(ap, n);
+    while (n-- > 0)
+        s += va_arg(ap, int);
+    va_end(ap);
+    return s;
+}
+
+/* The first variadic argument, a pair, straddles a7 and the stack. */
+int m_vlate(int a, int b, int c, int d, int e, int f, int g, ...) {
+    va_list ap;
+    struct s8 p;
+    int x;
+    va_start(ap, g);
+    p = va_arg(ap, struct s8);
+    x = va_arg(ap, int);
+    va_end(ap);
+    return a + b + c + d + e + f + g + p.x * 10 + p.y + x;
+}
+
+/* Named arguments past a7: h straddles a7 and 0(sp), then i's copy's
+ * address, j, k and l are on the stack. */
+int m_stack(int a, int b, int c, int d, int e, int f, int g, struct s8 h, struct s12 i, char j, short k,
+            struct s6 l) {
+    i.a = 1000; /* the callee's copy */
+    return a + b + c + d + e + f + g + h.x * 10 + h.y + i.a / 100 + i.b + i.c + j + k + l.a + l.b + l.c;
+}
+
+/* A big result's address in a0 pushes the ninth argument to the stack. */
+struct s12 m_stack_ret(int a, int b, int c, int d, int e, int f, int g, int h, int i) {
+    struct s12 r;
+    r.a = a + b + c;
+    r.b = d + e + f;
+    r.c = g * h + i;
+    return r;
+}
+
 int main(void) {
     int n = 0x1fffd; /* -3 as a signed char or short, 65533 as an unsigned short */
     int inner;
@@ -199,6 +289,7 @@ int main(void) {
     union u8 un;
     struct s12 v = {1, 2, 3}, sum;
     struct big b;
+    signed char sc = -3;
 
     check(c_inc1(one).c == 'b');
     check(one.c == 'a');
@@ -241,6 +332,16 @@ int main(void) {
     check(c_trunc_s(0x18000) == -32768);
     check(c_trunc_us(n) == 65533);
     check(c_tobool(256) == 1);
+    /* Variadic functions and arguments on the stack. */
+    check(c_vsum(0) == 0);
+    check(c_vsum(10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10) == 55);
+    check(c_vmix("icspbB", 7, sc, six[1], p, v, b) == 7 - 3 + 20 + 12 + 6 + 135);
+    check(c_vmix("Bbpsci", b, v, p, six[1], sc, 7) == 177);
+    check(c_vlate(1, 2, 3, 4, 5, 6, 7, p, 100) == 28 + 43 + 100);
+    check(c_stack(1, 2, 3, 4, 5, 6, 7, p, v, 'a', -5, six[1]) == 28 + 43 + 5 + 10 + 97 - 5 + 20);
+    check(v.a == 1);
+    sum = c_stack_ret(1, 2, 3, 4, 5, 6, 7, 8, 9);
+    check(sum.a == 6 && sum.b == 15 && sum.c == 65);
     inner = c_calls_merlin();
     /* merlin calling itself, the same way. */
     check(m_sumbig(m_big(0)) == 45);
@@ -250,6 +351,9 @@ int main(void) {
     check(m_make12(1).c == 3);
     check(m_union(un).i[1] == 8);
     check(m_widen(n, n, n, n) == 65528);
+    check(m_vmix("pBi", p, b, 1) == 12 + 135 + 1);
+    check(m_vlate(0, 0, 0, 0, 0, 0, 0, p, 1) == 44);
+    check(m_stack_ret(0, 0, 0, 0, 0, 0, 2, 3, 4).c == 10);
     if (first_failure)
         return first_failure;
     return inner ? 100 + inner : 0;

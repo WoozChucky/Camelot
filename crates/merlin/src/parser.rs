@@ -17,8 +17,10 @@
 //! direct      := IDENT | '(' declarator ')' | ε                         ε only in parameters and type names
 //! suffix      := '[' constant? ']' | '(' params ')'
 //! init-decl   := declarator ('=' initializer)?
-//! initializer := assign | '{' initializer (',' initializer)* ','? '}'
-//! params      := ε | 'void' | param (',' param)*                        at most 8
+//! initializer := assign | '{' item (',' item)* ','? '}'
+//! item        := (designator+ '=')? initializer
+//! designator  := '.' IDENT | '[' constant ']'
+//! params      := ε | 'void' | param (',' param)* (',' '...')?          at most 127
 //! param       := specifiers declarator                                  the name is optional
 //!                                                                       in a prototype
 //! type-name   := specifiers declarator                                  with no name: casts, sizeof
@@ -39,10 +41,19 @@
 //! unary       := ('++' | '--') unary | ('-' | '+' | '!' | '~' | '&' | '*') unary
 //!              | '(' type-name ')' unary | 'sizeof' '(' type-name ')' | 'sizeof' unary
 //!              | postfix
-//! postfix     := primary ('[' expr ']' | '(' (assign (',' assign)*)? ')'
-//!                        | '.' IDENT | '->' IDENT | '++' | '--')*
-//! primary     := NUM | STR+ | IDENT | '(' expr ')'
+//! postfix     := (primary | '(' type-name ')' '{' ... '}') ops           a compound literal
+//! ops         := ('[' expr ']' | '(' (assign (',' assign)*)? ')'
+//!                 | '.' IDENT | '->' IDENT | '++' | '--')*
+//! primary     := NUM | STR+ | IDENT | '(' expr ')' | va-builtin
+//! va-builtin  := '__builtin_va_start' '(' assign ',' assign ')'
+//!              | '__builtin_va_arg' '(' assign ',' type-name ')'
+//!              | '__builtin_va_end' '(' assign ')'
+//!              | '__builtin_va_copy' '(' assign ',' assign ')'
 //! ```
+//!
+//! The parser sees tokens after preprocessing ([`crate::preprocess`]), so
+//! macros and `#include` are gone by then. `__builtin_va_list` is a typedef
+//! name from the start (for `void *`).
 //!
 //! Binary precedence (precedence climbing), loosest first: `||` 1, `&&` 2,
 //! `|` 3, `^` 4, `&` 5, `== !=` 6, `< <= > >=` 7, `<< >>` 8, `+ -` 9,
@@ -81,8 +92,10 @@ use crate::{Error, Pos};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Arguments travel in `a0-a7`; no stack-passed arguments yet.
-pub const MAX_PARAMS: usize = 8;
+/// At most this many parameters in a function, and arguments in a call:
+/// C99's translation limit (5.2.4.1), which keeps every argument within
+/// reach of a 12-bit offset from `sp`.
+pub const MAX_PARAMS: usize = 127;
 
 /// How deeply statements and expressions may nest. Each nested statement, `=`,
 /// unary operator, cast, parenthesized expression, `?:` or call argument is a
@@ -94,11 +107,18 @@ pub const MAX_PARAMS: usize = 8;
 pub const MAX_DEPTH: usize = 256;
 
 pub fn parse(toks: &[Token]) -> Result<Program, Error> {
+    // The type clang's `<stdarg.h>` builds `va_list` from: on RISC-V a plain
+    // pointer into the argument words (see `crate::codegen`).
+    let mut file = Scope::default();
+    file.names.insert(
+        "__builtin_va_list".to_string(),
+        (Name::Typedef(Type::ptr(Type::Void)), Pos::default()),
+    );
     let mut p = Parser {
         toks,
         pos: 0,
         depth: 0,
-        scopes: vec![Scope::default()],
+        scopes: vec![file],
     };
     let mut items = Vec::new();
     while *p.peek() != Tok::Eof {
@@ -223,8 +243,8 @@ enum Derive {
     /// the qualifiers then apply to the pointer the array is adjusted to.
     Array(Option<i64>, Pos, Option<Quals>),
     /// Function returning the type so far, with these parameters (and the
-    /// scope holding their names).
-    Func(Vec<Param>, Scope),
+    /// scope holding their names), variadic if `...` ends them.
+    Func(Vec<Param>, bool, Scope),
 }
 
 /// A parsed declarator: the name, the full type, and where the name is.
@@ -935,8 +955,8 @@ impl Parser<'_> {
                 dims += 1;
             } else if self.is_punct("(") {
                 self.advance();
-                let (params, scope) = self.params()?;
-                out.push(Derive::Func(params, scope));
+                let (params, variadic, scope) = self.params()?;
+                out.push(Derive::Func(params, variadic, scope));
                 dims = 0;
             } else {
                 return Ok(out);
@@ -998,7 +1018,7 @@ impl Parser<'_> {
                         size = Some(4);
                     }
                 }
-                Derive::Func(params, scope) => {
+                Derive::Func(params, variadic, scope) => {
                     if ty.is_array() || ty.is_func() {
                         let what = if ty.is_array() { "array" } else { "function" };
                         return Err(Error::new(
@@ -1008,7 +1028,12 @@ impl Parser<'_> {
                     }
                     // A qualified result means nothing: the value is a copy.
                     let ret = ty.unqual().clone();
-                    ty = Type::func(ret, params.iter().map(|p| p.ty.unqual().clone()).collect());
+                    let types = params.iter().map(|p| p.ty.unqual().clone()).collect();
+                    ty = if variadic {
+                        Type::variadic_func(ret, types)
+                    } else {
+                        Type::func(ret, types)
+                    };
                     size = None;
                     if i + 1 == steps {
                         func = Some((params, scope));
@@ -1020,25 +1045,40 @@ impl Parser<'_> {
     }
 
     /// After `(`, up to and including `)`: the parameters, in a scope of
-    /// their own.
-    fn params(&mut self) -> Result<(Vec<Param>, Scope), Error> {
+    /// their own, and whether `...` ends them.
+    fn params(&mut self) -> Result<(Vec<Param>, bool, Scope), Error> {
         self.scopes.push(Scope::default());
         let params = self.params_inner();
         let scope = self.scopes.pop().expect("pushed above");
-        Ok((params?, scope))
+        let (params, variadic) = params?;
+        Ok((params, variadic, scope))
     }
 
-    fn params_inner(&mut self) -> Result<Vec<Param>, Error> {
+    fn params_inner(&mut self) -> Result<(Vec<Param>, bool), Error> {
         let mut params = Vec::new();
         if self.eat_punct(")") {
-            return Ok(params);
+            return Ok((params, false));
         }
         if *self.peek() == Tok::Kw(Kw::Void) && matches!(self.peek_at(1), Tok::Punct(")")) {
             self.advance();
             self.advance();
-            return Ok(params);
+            return Ok((params, false));
         }
         loop {
+            if self.is_punct("...") {
+                // C99 wants a named parameter before `...` (C23 does not).
+                if params.is_empty() {
+                    return Err(Error::new(
+                        self.here(),
+                        "a named parameter must come before '...'",
+                    ));
+                }
+                self.advance();
+                if !self.eat_punct(")") {
+                    return Err(self.unexpected("')' after '...'"));
+                }
+                return Ok((params, true));
+            }
             if !self.at_decl() {
                 return Err(self.unexpected("a parameter type"));
             }
@@ -1049,13 +1089,13 @@ impl Parser<'_> {
             // asks for is one unnamed parameter of (unqualified) type void,
             // however it is spelled.
             if params.is_empty() && d.name.is_empty() && d.ty == Type::Void && self.eat_punct(")") {
-                return Ok(params);
+                return Ok((params, false));
             }
             let pos = if d.name.is_empty() { start } else { d.pos };
             if params.len() == MAX_PARAMS {
                 return Err(Error::new(
                     pos,
-                    format!("too many parameters: merlin supports at most {MAX_PARAMS} (a0-a7)"),
+                    format!("too many parameters: merlin supports at most {MAX_PARAMS}"),
                 ));
             }
             // C adjusts a parameter declared as an array or a function to a
@@ -1074,7 +1114,7 @@ impl Parser<'_> {
                 pos,
             });
             if self.eat_punct(")") {
-                return Ok(params);
+                return Ok((params, false));
             }
             if !self.eat_punct(",") {
                 return Err(self.unexpected("',' or ')' in the parameter list"));
@@ -1110,17 +1150,38 @@ impl Parser<'_> {
                     return Ok(Init::List(items, pos));
                 }
                 if p.is_punct(".") || p.is_punct("[") {
-                    return Err(Error::new(
-                        p.here(),
-                        "designated initializers are not supported yet",
-                    ));
+                    let designators = p.designation()?;
+                    let init = p.initializer()?;
+                    items.push(Init::Designated(designators, Box::new(init)));
+                } else {
+                    items.push(p.initializer()?);
                 }
-                items.push(p.initializer()?);
                 if !p.eat_punct(",") && !p.is_punct("}") {
                     return Err(p.unexpected("',' or '}' in the initializer list"));
                 }
             }
         })
+    }
+
+    /// `.member` and `[index]` designators, through the `=`.
+    fn designation(&mut self) -> Result<Vec<Designator>, Error> {
+        let mut out = Vec::new();
+        loop {
+            if self.is_punct(".") {
+                let pos = self.advance().pos;
+                let (name, _) = self.expect_ident("a member name")?;
+                out.push(Designator::Member(name, pos));
+            } else if self.is_punct("[") {
+                let pos = self.advance().pos;
+                let index = self.cond()?;
+                self.expect_punct("]")?;
+                out.push(Designator::Index(index, pos));
+            } else {
+                break;
+            }
+        }
+        self.expect_punct("=")?;
+        Ok(out)
     }
 
     /// The rest of a declaration after its specifiers (and its first
@@ -1208,6 +1269,10 @@ impl Parser<'_> {
     /// A top-level function or declaration; `None` for a declaration that
     /// only declares types (a typedef, a struct, an enum).
     fn item(&mut self) -> Result<Option<Item>, Error> {
+        if *self.peek() == Tok::Kw(Kw::StaticAssert) {
+            self.static_assert()?;
+            return Ok(None);
+        }
         if !self.at_decl() {
             return Err(self.unexpected("a declaration"));
         }
@@ -1299,13 +1364,47 @@ impl Parser<'_> {
             if *self.peek() == Tok::Eof {
                 return Err(self.unexpected("'}'"));
             }
-            if self.at_decl() {
+            if *self.peek() == Tok::Kw(Kw::StaticAssert) {
+                self.static_assert()?;
+            } else if self.at_decl() {
                 if let Some(s) = self.decl(Ctx::Block)? {
                     items.push(s);
                 }
             } else {
                 items.push(self.stmt()?);
             }
+        }
+    }
+
+    /// `_Static_assert(constant, "message");` (C11, which clang accepts in
+    /// C99 too), at file or block scope. The parser evaluates constants, so
+    /// it checks the assertion here; nothing is left of it.
+    fn static_assert(&mut self) -> Result<(), Error> {
+        let pos = self.advance().pos;
+        self.expect_punct("(")?;
+        let at = self.here();
+        let cond = self.cond()?;
+        self.expect_punct(",")?;
+        let mut msg = Vec::new();
+        if !matches!(self.peek(), Tok::Str(_)) {
+            return Err(self.unexpected("a string literal"));
+        }
+        while let Tok::Str(s) = self.peek() {
+            msg.extend_from_slice(s);
+            self.advance();
+        }
+        self.expect_punct(")")?;
+        self.expect_punct(";")?;
+        match consteval::int(&cond) {
+            None => Err(Error::new(
+                at,
+                "static assertion expression is not an integer constant expression",
+            )),
+            Some(0) => Err(Error::new(
+                pos,
+                format!("static assertion failed: {}", String::from_utf8_lossy(&msg)),
+            )),
+            Some(_) => Ok(()),
         }
     }
 
@@ -1610,6 +1709,10 @@ impl Parser<'_> {
                 self.advance();
                 let ty = self.type_name()?;
                 self.expect_punct(")")?;
+                if self.is_punct("{") {
+                    let e = self.compound_literal(ty, pos)?;
+                    return self.postfix_ops(e);
+                }
                 let x = self.nested(Self::unary)?;
                 return Ok(Expr {
                     kind: ExprKind::Cast {
@@ -1624,10 +1727,15 @@ impl Parser<'_> {
             Tok::Kw(Kw::Sizeof) => {
                 self.advance();
                 if self.is_punct("(") && self.type_name_follows() {
-                    self.advance();
+                    let at = self.advance().pos;
                     let ty = self.type_name()?;
                     self.expect_punct(")")?;
-                    ExprKind::SizeofType(ty)
+                    if self.is_punct("{") {
+                        let e = self.compound_literal(ty, at)?;
+                        ExprKind::SizeofExpr(Box::new(self.postfix_ops(e)?))
+                    } else {
+                        ExprKind::SizeofType(ty)
+                    }
                 } else {
                     ExprKind::SizeofExpr(Box::new(self.nested(Self::unary)?))
                 }
@@ -1637,8 +1745,26 @@ impl Parser<'_> {
         Ok(Expr::new(kind, pos))
     }
 
+    /// `(type){ ... }`, after the `)`.
+    fn compound_literal(&mut self, ty: Type, pos: Pos) -> Result<Expr, Error> {
+        let init = self.initializer()?;
+        Ok(Expr {
+            kind: ExprKind::CompoundLit {
+                init: Box::new(init),
+                local: None,
+            },
+            ty,
+            pos,
+        })
+    }
+
     fn postfix(&mut self) -> Result<Expr, Error> {
-        let mut e = self.primary()?;
+        let e = self.primary()?;
+        self.postfix_ops(e)
+    }
+
+    /// The postfix operators after `e`: `[i]`, calls, `.`, `->`, `++`, `--`.
+    fn postfix_ops(&mut self, mut e: Expr) -> Result<Expr, Error> {
         let outer = self.depth;
         loop {
             let kind = match self.peek() {
@@ -1658,6 +1784,12 @@ impl Parser<'_> {
                     let mut args = Vec::new();
                     if !self.eat_punct(")") {
                         loop {
+                            if args.len() == MAX_PARAMS {
+                                return Err(Error::new(
+                                    self.here(),
+                                    format!("too many arguments: merlin supports at most {MAX_PARAMS}"),
+                                ));
+                            }
                             args.push(self.assign()?);
                             if self.eat_punct(")") {
                                 break;
@@ -1728,6 +1860,11 @@ impl Parser<'_> {
                     pos,
                 });
             }
+            Tok::Ident(name)
+                if name.starts_with("__builtin_va_") && matches!(self.peek_at(1), Tok::Punct("(")) =>
+            {
+                return self.va_builtin(&name);
+            }
             Tok::Ident(name) => {
                 match self.lookup_name(&name) {
                     // An enumeration constant is just an `int`.
@@ -1755,18 +1892,58 @@ impl Parser<'_> {
         };
         Ok(Expr::new(kind, pos))
     }
+
+    /// `__builtin_va_start(ap, last)`, `__builtin_va_arg(ap, type)`,
+    /// `__builtin_va_end(ap)` and `__builtin_va_copy(dst, src)`: clang's
+    /// builtins behind `<stdarg.h>`'s macros. They look like calls, but
+    /// `va_arg` takes a type, so the parser knows them by name.
+    fn va_builtin(&mut self, name: &str) -> Result<Expr, Error> {
+        let pos = self.advance().pos;
+        self.expect_punct("(")?;
+        let first = Box::new(self.assign()?);
+        let kind = match name {
+            "__builtin_va_start" | "__builtin_va_copy" => {
+                self.expect_punct(",")?;
+                let second = Box::new(self.assign()?);
+                if name == "__builtin_va_start" {
+                    ExprKind::VaStart {
+                        ap: first,
+                        last: second,
+                    }
+                } else {
+                    ExprKind::VaCopy(first, second)
+                }
+            }
+            "__builtin_va_arg" => {
+                self.expect_punct(",")?;
+                let ty = self.type_name()?;
+                self.expect_punct(")")?;
+                return Ok(Expr {
+                    kind: ExprKind::VaArg(first),
+                    // The value is a copy: qualifiers mean nothing on it.
+                    ty: ty.unqual().clone(),
+                    pos,
+                });
+            }
+            "__builtin_va_end" => ExprKind::VaEnd(first),
+            _ => return Err(Error::new(pos, format!("unknown builtin '{name}'"))),
+        };
+        self.expect_punct(")")?;
+        Ok(Expr::new(kind, pos))
+    }
 }
 
 /// A function declaration or definition from its declarator.
 fn function(d: Decl, params: Vec<Param>, specs: &Specs, body: Option<Vec<Stmt>>) -> Function {
-    let ret = match d.ty.func_type() {
-        Some(f) => f.ret.clone(),
+    let (ret, variadic) = match d.ty.func_type() {
+        Some(f) => (f.ret.clone(), f.variadic),
         None => unreachable!("only function declarators get here"),
     };
     Function {
         name: d.name,
         ret,
         params,
+        variadic,
         is_static: specs.class == Class::Static,
         is_inline: specs.inline,
         is_extern: specs.class == Class::Extern,
@@ -1847,6 +2024,11 @@ mod tests {
                 }
                 s + ")"
             }
+            ExprKind::VaStart { ap, last } => format!("(va_start {} {})", sx(ap), sx(last)),
+            ExprKind::VaArg(ap) => format!("(va_arg {} {})", sx(ap), e.ty),
+            ExprKind::VaEnd(ap) => format!("(va_end {})", sx(ap)),
+            ExprKind::VaCopy(d, s) => format!("(va_copy {} {})", sx(d), sx(s)),
+            ExprKind::CompoundLit { init, .. } => format!("(literal {} {})", e.ty, si(init)),
         }
     }
 
@@ -1854,6 +2036,16 @@ mod tests {
         match i {
             Init::Expr(e) => sx(e),
             Init::List(items, _) => format!("{{{}}}", items.iter().map(si).collect::<Vec<_>>().join(" ")),
+            Init::Designated(ds, init) => {
+                let mut s = String::new();
+                for d in ds {
+                    match d {
+                        Designator::Member(name, _) => s += &format!(".{name}"),
+                        Designator::Index(e, _) => s += &format!("[{}]", sx(e)),
+                    }
+                }
+                format!("{s}={}", si(init))
+            }
         }
     }
 
@@ -2343,7 +2535,10 @@ mod tests {
         assert_eq!(ex("(*fp)(1)"), "(call (* fp) 1)");
         assert_eq!(ex("table[i](x)"), "(call (* (+ table i)) x)");
         assert_eq!(ex("s.f(1).g"), "(. (call (. s f) 1) g)");
-        assert_eq!(err("int f() { s.1; }"), "1:13: expected a member name, found '1'");
+        assert_eq!(
+            err("int f() { s.(1); }"),
+            "1:13: expected a member name, found '('"
+        );
     }
 
     #[test]
@@ -2417,10 +2612,8 @@ mod tests {
             err("int a[2](void);"),
             "1:6: 'a' declared as array of functions of type 'int (void)'"
         );
-        assert_eq!(
-            err("int a[1] = {[0] = 1};"),
-            "1:13: designated initializers are not supported yet"
-        );
+        assert_eq!(err("int a[1] = {[0] 1};"), "1:17: expected '=', found '1'");
+        assert_eq!(err("int a[1] = {.};"), "1:14: expected a member name, found '}'");
         assert_eq!(
             err("int x, f(int);"),
             "1:8: declare a function on its own, not in a list of variables"
@@ -2775,8 +2968,15 @@ mod tests {
         limit(&format!("int a[1] = {};", nest(100_000, "{", "1", "}")));
         // Long but shallow is fine: a block's statements and a call's arguments are lists.
         assert_eq!(body(&"x = 1; ".repeat(100_000)).len(), 100_000);
-        let args = vec!["1"; 100_000].join(", ");
+        let args = vec!["1"; MAX_PARAMS].join(", ");
         assert!(parse(&lex(&ret(&format!("f({args})"))).unwrap()).is_ok());
+        let args = vec!["1"; MAX_PARAMS + 1].join(", ");
+        let e = parse(&lex(&ret(&format!("f({args})"))).unwrap()).unwrap_err();
+        assert!(
+            e.msg.contains("too many arguments: merlin supports at most 127"),
+            "{}",
+            e.msg
+        );
     }
 
     #[test]
@@ -2894,9 +3094,84 @@ mod tests {
             err("int f() { int g(int a); }"),
             "1:15: function declarations inside a function are not supported"
         );
+        let params: Vec<String> = (0..128).map(|i| format!("int p{i}")).collect();
+        let e = err(&format!("int f({}) {{}}", params.join(", ")));
+        assert!(
+            e.ends_with("too many parameters: merlin supports at most 127"),
+            "{e}"
+        );
         assert_eq!(
-            err("int f(int a, int b, int c, int d, int e, int f, int g, int h, int i) {}"),
-            "1:67: too many parameters: merlin supports at most 8 (a0-a7)"
+            err("int f(...);"),
+            "1:7: a named parameter must come before '...'"
+        );
+        assert_eq!(
+            err("int f(int a, ..., int b);"),
+            "1:17: expected ')' after '...', found ','"
+        );
+    }
+
+    #[test]
+    fn static_assertions() {
+        assert!(
+            prog(
+                "_Static_assert(sizeof(int) == 4, \"ILP32\"); enum { N = 3 }; \
+                      int f() { _Static_assert(N * 2 == 6, \"in a \" \"block\"); return 0; }"
+            )
+            .items
+            .len()
+                == 1
+        );
+        assert_eq!(
+            err("_Static_assert(1 + 1 == 3, \"math\");"),
+            "1:1: static assertion failed: math"
+        );
+        assert_eq!(
+            err("int x; _Static_assert(x, \"x\");"),
+            "1:23: static assertion expression is not an integer constant expression"
+        );
+        assert_eq!(err("_Static_assert(1);"), "1:17: expected ',', found ')'");
+    }
+
+    #[test]
+    fn designators_and_compound_literals() {
+        let StmtKind::Decl(d) = stmt("struct s x = {.a = 1, [2].b.c = 3, 4};").kind else {
+            panic!()
+        };
+        assert_eq!(sd(&d[0]), "struct s x={.a=1 [2].b.c=3 4}");
+        let StmtKind::Expr(e) = stmt("p = (int[]){1, 2}[1] + sizeof (char[3]){0};").kind else {
+            panic!()
+        };
+        assert_eq!(
+            sx(&e),
+            "(= p (+ (* (+ (literal int [] {1 2}) 1)) (sizeof (literal char [3] {0}))))"
+        );
+    }
+
+    #[test]
+    fn variadic_functions() {
+        let p = prog("int f(int n, ...); int g(int n, ...) { return n; }");
+        let fs = funcs(&p);
+        assert!(fs[0].variadic && fs[1].variadic);
+        assert_eq!(fs[0].ty().to_string(), "int (int, ...)");
+        // The builtins behind <stdarg.h>; __builtin_va_list is a pointer.
+        let b = body(
+            "__builtin_va_list ap; __builtin_va_start(ap, n); x = __builtin_va_arg(ap, unsigned int); \
+                      __builtin_va_copy(aq, ap); __builtin_va_end(ap);",
+        );
+        let s: Vec<String> = b.iter().map(ss).collect();
+        assert_eq!(
+            s,
+            [
+                "(decl void *ap)",
+                "(va_start ap n);",
+                "(= x (va_arg ap unsigned int));",
+                "(va_copy aq ap);",
+                "(va_end ap);"
+            ]
+        );
+        assert_eq!(
+            err("int f() { __builtin_va_arg(ap); }"),
+            "1:30: expected ',', found ')'"
         );
     }
 }
