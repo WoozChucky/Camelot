@@ -277,9 +277,12 @@ static void ifconfig(struct cmd *c) {
     printf("  rx dropped: card %u, filtered %u, ether %u, arp %u, ip %u, ip-checksum %u, fragment %u, protocol %u\n",
            s->rx_card_dropped, s->rx_filtered, s->rx_bad_ether, s->rx_bad_arp, s->rx_bad_ip, s->rx_bad_ip_sum,
            s->rx_fragment, s->rx_bad_proto);
-    printf("  rx dropped: icmp %u, udp %u, udp-checksum %u, no-port %u, queue-full %u\n", s->rx_bad_icmp,
-           s->rx_bad_udp, s->rx_bad_udp_sum, s->rx_no_port, s->rx_queue_full);
+    printf("  rx dropped: icmp %u, udp %u, udp-checksum %u, no-port %u, queue-full %u, tcp %u, tcp-checksum %u\n",
+           s->rx_bad_icmp, s->rx_bad_udp, s->rx_bad_udp_sum, s->rx_no_port, s->rx_queue_full, s->rx_bad_tcp,
+           s->rx_bad_tcp_sum);
     printf("  other: no-buffer %u, arp-failed %u, tx-error %u\n", s->no_buffer, s->arp_failed, s->tx_errors);
+    printf("  tcp: no-socket %u, backlog %u, out-of-order %u, retransmits %u, resets %u\n", s->tcp_no_socket,
+           s->tcp_backlog, s->tcp_out_of_order, s->tcp_retransmits, s->tcp_resets);
     printf("lo: inet 127.0.0.1 netmask 255.0.0.0\n");
 }
 

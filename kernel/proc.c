@@ -19,6 +19,7 @@
 #include "kprintf.h"
 #include "log.h"
 #include "memlayout.h"
+#include "net.h"
 #include "riscv.h"
 #include "string.h"
 
@@ -445,6 +446,9 @@ void proc_exit(int status) {
         end_op();
         p->cwd = NULL;
     }
+    /* The TCP listeners of the tcptest hook it held (until #85 puts
+     * sockets behind its file descriptors). */
+    net_proc_exit(p->pid);
     for (u32 i = 0; i < NPROC; i++) {
         struct proc *child = &procs[i];
         if (child->state == PROC_UNUSED || child->parent != p) {

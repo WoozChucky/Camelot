@@ -39,11 +39,13 @@
 #define SYS_netinfo 24 /* netinfo(info): 0, with *info filled in */
 #define SYS_netconf 25 /* netconf(addr, mask, gateway): 0 */
 #define SYS_ping 26    /* ping(addr, seq, reply): 0, with *reply filled in */
+#define SYS_tcptest 27 /* tcptest(op, a, b, c, report): TCP's test hook, until #85's sockets */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process */
 #define ENOENT 2        /* no such file or directory */
 #define ESRCH 3         /* kill: no such process */
+#define EINTR 4         /* a wait ended because the process was killed */
 #define E2BIG 7         /* spawn, exec: argument list too long */
 #define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */
 #define EBADF 9         /* not an open file descriptor, or not open for that */
@@ -70,8 +72,12 @@
 #define EMSGSIZE 90     /* a datagram too big for one packet */
 #define EADDRINUSE 98   /* a UDP port that is taken */
 #define ENETUNREACH 101 /* no route: no address yet, or no gateway */
+#define ECONNRESET 104  /* TCP: the peer reset the connection */
 #define ENOBUFS 105     /* the network's buffers or sockets are all in use */
-#define ETIMEDOUT 110   /* ping: no reply in time */
+#define EISCONN 106     /* TCP: the socket is connected already */
+#define ENOTCONN 107    /* TCP: the socket is not connected */
+#define ETIMEDOUT 110   /* ping: no reply in time; TCP: the peer stopped answering */
+#define ECONNREFUSED 111 /* TCP: nothing listens on that port */
 #define EHOSTUNREACH 113 /* ARP got no answer from the address */
 
 /* The console's file descriptors, open in the first process (0 for
@@ -139,7 +145,7 @@ struct net_stats {
     u32 rx_bad_ip;       /* a bad IPv4 header: truncated, version, lengths */
     u32 rx_bad_ip_sum;   /* a wrong IPv4 header checksum */
     u32 rx_fragment;     /* an IPv4 fragment (not supported) */
-    u32 rx_bad_proto;    /* an IPv4 protocol other than ICMP and UDP */
+    u32 rx_bad_proto;    /* an IPv4 protocol other than ICMP, UDP and TCP */
     u32 rx_bad_icmp;     /* a truncated ICMP message or a wrong checksum */
     u32 rx_bad_udp;      /* a truncated UDP datagram or a wrong length */
     u32 rx_bad_udp_sum;  /* a wrong UDP checksum */
@@ -148,6 +154,13 @@ struct net_stats {
     u32 no_buffer;       /* a frame dropped, or not sent, for want of a buffer */
     u32 arp_failed;      /* a packet whose next hop ARP could not find */
     u32 tx_errors;       /* a frame the card refused, or the transmit queue was full */
+    u32 rx_bad_tcp;      /* a truncated TCP segment or a bad header length */
+    u32 rx_bad_tcp_sum;  /* a wrong TCP checksum */
+    u32 tcp_no_socket;   /* a segment for no connection or listener (answered by a reset) */
+    u32 tcp_backlog;     /* a SYN dropped: the listener's backlog was full, or no socket or memory */
+    u32 tcp_out_of_order; /* a segment past the next byte expected, dropped */
+    u32 tcp_retransmits; /* segments sent again after a timeout */
+    u32 tcp_resets;      /* connections the peer reset */
 };
 
 /* What netinfo stores: the interface and its counters. */
@@ -171,6 +184,24 @@ struct ping_reply {
     u32 ttl;    /* the reply's time to live */
     u32 len;    /* its ICMP message's length */
     u32 rtt_us; /* the round trip, in microseconds of mtime */
+};
+
+/* tcptest's operations and what it reports (docs/camelot-net.md, "Testing
+ * TCP until #85"): a temporary hook on the kernel's TCP API, which #85's
+ * socket calls replace. */
+#define TCPTEST_CONNECT 1 /* (addr, port, bytes): send `bytes`, read until the end */
+#define TCPTEST_LISTEN 2  /* (port, backlog): a listener, returned as a handle */
+#define TCPTEST_ACCEPT 3  /* (handle): accept a connection and echo it to the end */
+#define TCPTEST_CLOSE 4   /* (handle): close the listener */
+
+struct tcptest_report {
+    u32 laddr; /* this end */
+    u32 lport;
+    u32 raddr; /* the other end */
+    u32 rport;
+    u32 sent;     /* bytes sent */
+    u32 received; /* bytes received */
+    u32 hash;     /* FNV-1a of the bytes received */
 };
 
 /* spawn's and exec's limits: at most MAXARG arguments (argv[0] included), whose strings

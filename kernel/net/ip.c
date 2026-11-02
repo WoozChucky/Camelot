@@ -132,6 +132,8 @@ void ip_input(struct pbuf *p, const u8 *ip, u32 len, bool loopback) {
         icmp_input(p, src, dst, ip[8], ip + hlen, total - hlen);
     } else if (proto == IP_PROTO_UDP) {
         udp_input(p, src, dst, ip + hlen, total - hlen);
+    } else if (proto == IP_PROTO_TCP) {
+        tcp_input(p, src, dst, ip + hlen, total - hlen);
     } else {
         net_stats.rx_bad_proto++;
         pbuf_free(p);

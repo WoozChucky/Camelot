@@ -275,7 +275,7 @@ static void test_simple_calls(void) {
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(27, 0, 0, 0), -ENOSYS, "call 27");
+    check_eq(syscall(28, 0, 0, 0), -ENOSYS, "call 28");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
 }
 
@@ -804,6 +804,10 @@ static void test_network_without_a_card(void) {
     check_eq(netconf(0x0a00020f, 0xffffff00, 0), -ENODEV, "netconf without a card");
     check_eq(ping(0x7f000001, 1, &reply), -ENODEV, "ping without a card");
     check_eq(ping(0x7f000001, 1, (struct ping_reply *)0), -EFAULT, "ping to address 0");
+    struct tcptest_report report;
+    check_eq(tcptest(TCPTEST_CONNECT, 0x7f000001, 7, 1, &report), -ENODEV, "tcptest without a card");
+    check_eq(tcptest(TCPTEST_CONNECT, 0x7f000001, 7, 1, (struct tcptest_report *)0), -EFAULT,
+             "tcptest to address 0");
 }
 
 int main(int argc, char **argv) {

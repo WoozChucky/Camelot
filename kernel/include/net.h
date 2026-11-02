@@ -10,6 +10,7 @@
  *   ip.c     IPv4: header checks, checksums, routing, loopback
  *   icmp.c   echo requests and replies (ping)
  *   udp.c    UDP ports and checksums: the kernel-internal socket API
+ *   tcp.c    TCP connections, and their kernel-internal socket API
  *   dhcp.c   the DHCP client
  *   net.c    the interface's configuration, boot, the counters, the timer
  *            and the system calls
@@ -27,6 +28,7 @@
 
 #include "syscall.h"
 #include "types.h"
+#include "vm.h"
 
 /* ---- packet buffers (pbuf.c) ---- */
 
@@ -103,7 +105,7 @@ u32 inet_fold(u32 sum);
 
 /* ---- frame layout ----
  * What the stack sends always has the same shape: the Ethernet header, an
- * IPv4 header without options, then ICMP or UDP. So each layer writes its
+ * IPv4 header without options, then ICMP, UDP or TCP. So each layer writes its
  * header at a fixed offset of the buffer, from the top down. */
 #define ETH_ALEN 6
 #define ETH_HLEN 14
@@ -122,6 +124,7 @@ u32 inet_fold(u32 sum);
 #define UDP_MAX_DATA (NET_MTU - IP_HLEN - UDP_HLEN) /* 1472 */
 
 #define IP_PROTO_ICMP 1
+#define IP_PROTO_TCP 6
 #define IP_PROTO_UDP 17
 
 /* 255.255.255.255, 127.0.0.1, and the loopback network's mask. */
@@ -193,6 +196,12 @@ int net_sys_info(u32 uinfo);
 int net_sys_conf(u32 addr, u32 mask, u32 gateway);
 int net_sys_ping(u32 addr, u32 seq, u32 ureply);
 
+/* tcptest (docs/camelot-net.md, "Testing TCP until #85"): TCP's temporary
+ * test hook, which #85's socket calls replace. net_proc_exit() closes the
+ * listeners a process held when it ends. */
+int net_sys_tcptest(u32 op, u32 a, u32 b, u32 c, u32 ureport);
+void net_proc_exit(u32 pid);
+
 /* "a.b.c.d" of `addr` into `buf` (16 bytes). Returns buf. */
 char *ip_str(u32 addr, char *buf);
 
@@ -243,7 +252,7 @@ void arp_flush(void);
 
 /* A received IPv4 packet: `len` bytes at `ip` inside p's frame, from the
  * card or, when `loopback`, sent by this host to itself. Checks the
- * header, drops what is not for this host, passes ICMP and UDP on. Takes
+ * header, drops what is not for this host, passes ICMP, UDP and TCP on. Takes
  * `p`. */
 void ip_input(struct pbuf *p, const u8 *ip, u32 len, bool loopback);
 
@@ -328,6 +337,190 @@ int udp_recvfrom(struct udp_sock *s, void *buf, u32 size, u32 *from, u32 *port, 
 /* A UDP datagram (`len` bytes at `udp`) for this host from `src` to
  * `dst`. Takes `p`. */
 void udp_input(struct pbuf *p, u32 src, u32 dst, const u8 *udp, u32 len);
+
+/* ---- TCP (tcp.c): connections, and the kernel-internal socket API ---- */
+
+/* The segment header without options, the largest segment this host sends
+ * and the one it assumes of a peer that sends no MSS option (RFC 9293
+ * 3.7.1). */
+#define TCP_HLEN 20
+#define TCP_MSS (NET_MTU - IP_HLEN - TCP_HLEN) /* 1460 */
+#define TCP_DEFAULT_MSS 536
+
+/* Sockets: listeners and connections together, each connection with a
+ * send and a receive buffer of TCP_BUF bytes (a page each, from kalloc).
+ * The receive window is what is free of the receive buffer, so it is
+ * never more than TCP_BUF. */
+#define TCP_SOCKETS 16
+#define TCP_BUF 4096
+#define TCP_BACKLOG_MAX 8
+#define TCP_EPHEMERAL_FIRST 49152
+
+/* Timers, in ticks (10 a second). The retransmission timeout (RFC 6298)
+ * starts at TCP_RTO_INITIAL, follows the measured round trip within
+ * TCP_RTO_MIN and TCP_RTO_MAX and doubles at each timeout; a SYN is sent
+ * TCP_SYN_RETRIES more times, any other segment TCP_RETRIES more, before
+ * the connection is given up (-ETIMEDOUT). TIME-WAIT lasts TCP_TIME_WAIT
+ * (2 MSL), and a connection closed by its owner waits at most
+ * TCP_FIN_TIMEOUT in FIN-WAIT-2 for the peer's FIN. */
+#define TCP_RTO_INITIAL 10 /* 1 s */
+#define TCP_RTO_MIN 2      /* 200 ms */
+#define TCP_RTO_MAX 600    /* 60 s */
+#define TCP_SYN_RETRIES 5
+#define TCP_RETRIES 8
+#define TCP_TIME_WAIT 600   /* 60 s */
+#define TCP_FIN_TIMEOUT 600 /* 60 s */
+
+/* The connection states of RFC 9293 3.3.2, and CLOSED for a socket that
+ * has none: not connected yet, or over. */
+#define TCP_CLOSED 0
+#define TCP_LISTEN 1
+#define TCP_SYN_SENT 2
+#define TCP_SYN_RECEIVED 3
+#define TCP_ESTABLISHED 4
+#define TCP_FIN_WAIT_1 5
+#define TCP_FIN_WAIT_2 6
+#define TCP_CLOSE_WAIT 7
+#define TCP_CLOSING 8
+#define TCP_LAST_ACK 9
+#define TCP_TIME_WAIT_STATE 10
+
+/* A socket. Sequence numbers are u32 and wrap: they are only ever
+ * compared through their difference (tcp.c's seq_lt and friends).
+ *
+ * The send buffer holds the bytes the owner gave that the peer has not
+ * acknowledged: sent and in flight first, then not sent yet. The receive
+ * buffer holds what arrived in order and the owner has not read. Both are
+ * rings of TCP_BUF bytes. */
+struct tcp_sock {
+    bool used;  /* the slot is taken */
+    bool owned; /* a process holds it, until tcp_close() (then the stack
+                 * finishes the connection and frees the slot) */
+    u8 state;   /* TCP_ */
+    bool fin_queued; /* the owner is done sending: a FIN follows the data */
+    bool fin_rcvd;   /* the peer's FIN came: what is buffered is the last */
+    bool persist;    /* the timer probes a zero window, not retransmits */
+    bool timing;     /* a segment is being timed for a round-trip sample */
+    bool ack_now;    /* an acknowledgment is owed */
+    u32 laddr;       /* this end: 0 until bound to an address */
+    u32 raddr;       /* the other end */
+    u16 lport;
+    u16 rport;
+    /* A connection a listener took that has not been accepted yet: the
+     * listener. A listener: how many such connections it may have, how
+     * many it has. */
+    struct tcp_sock *listener;
+    u32 backlog;
+    u32 queued;
+    u32 born; /* creation order: accept() takes the oldest */
+    int err;  /* why it ended: -ECONNRESET, -ECONNREFUSED, -ETIMEDOUT; 0 */
+
+    /* Sending (RFC 9293 3.3.1's names). */
+    u32 iss;
+    u32 snd_una; /* the oldest byte not acknowledged */
+    u32 snd_nxt; /* the next to send */
+    u32 snd_max; /* the furthest ever sent (snd_nxt goes back on a timeout) */
+    u32 snd_wnd; /* the peer's window, from snd_una */
+    u32 snd_wl1; /* the segment that last updated it: its seq and ack */
+    u32 snd_wl2;
+    u32 max_wnd; /* the largest window the peer offered */
+    u32 mss;     /* the largest segment to send it */
+    u8 *sbuf;
+    u32 shead; /* where the byte numbered `sseq` is in sbuf */
+    u32 slen;  /* bytes in sbuf */
+    u32 sseq;
+    u32 fin_seq; /* the FIN's number, once queued */
+
+    /* Receiving. */
+    u32 irs;
+    u32 rcv_nxt; /* the next byte expected */
+    u32 rcv_adv; /* the right edge of the window last advertised */
+    u8 *rbuf;
+    u32 rhead;
+    u32 rlen;
+
+    /* Timers, in ticks: the retransmission (or persist) timer and the
+     * TIME-WAIT or FIN-WAIT-2 one count down to 0 (off). The round trip:
+     * srtt scaled by 8 and rttvar by 4, as in RFC 6298's appendix; the
+     * segment timed is the one ending at rtt_seq, sent at rtt_start. */
+    u32 rto;
+    bool rtt_valid; /* srtt and rttvar hold a measurement */
+    i32 srtt;
+    i32 rttvar;
+    u32 rtt_seq;
+    u32 rtt_start;
+    u32 retx;
+    u32 retries;
+    u32 linger;
+};
+
+/* The API #85's socket system calls put behind file descriptors. Every
+ * call but tcp_close() is made by a process, and those that wait (connect,
+ * accept, send, recv) sleep until they can go on, giving up with -EINTR as
+ * soon as the process is killed. Data is copied from and to `pt`'s user
+ * memory, or kernel memory when `pt` is NULL. */
+
+/* A new socket, not bound or connected; NULL with *err -ENOBUFS when
+ * every slot is taken. */
+struct tcp_sock *tcp_socket(int *err);
+
+/* Binds `s` to `port` on every address of the host (0: the next free
+ * ephemeral port). -EADDRINUSE if a listener or another bound socket has
+ * it, -EINVAL if `s` is bound already or `port` is over 65535. */
+int tcp_bind(struct tcp_sock *s, u32 port);
+
+/* Makes the bound socket `s` a listener: connections to its port wait for
+ * accept(), at most `backlog` (1 to TCP_BACKLOG_MAX) at once; a SYN past
+ * them is dropped, and the peer sends it again. -EINVAL unless `s` is
+ * bound and not connected. */
+int tcp_listen(struct tcp_sock *s, u32 backlog);
+
+/* Connects `s` (bound now to an ephemeral port if it isn't) to
+ * `addr`:`port` and waits for the handshake. 0, or -ECONNREFUSED (a
+ * reset), -ETIMEDOUT (no answer to TCP_SYN_RETRIES + 1 SYNs),
+ * -ENETUNREACH, -ENOBUFS (no memory for the buffers), -EISCONN, -EINVAL
+ * (a port or address no connection can go to), -EINTR. */
+int tcp_connect(struct tcp_sock *s, u32 addr, u32 port);
+
+/* Waits for a connection on the listener `l` and returns it, a socket of
+ * its own; NULL with *err set: -EINVAL (not a listener), -EINTR. */
+struct tcp_sock *tcp_accept(struct tcp_sock *l, int *err);
+
+/* Queues the `n` bytes at `src` for sending, waiting for room in the send
+ * buffer as it goes. Returns `n` (fewer if the process was killed after
+ * some), or -EPIPE (after tcp_shutdown), -ENOTCONN, the error that ended
+ * the connection, -EFAULT, -EINTR. */
+int tcp_send(struct tcp_sock *s, pagetable_t pt, u32 src, u32 n);
+
+/* Waits for data and copies up to `n` bytes of it to `dst`. Returns how
+ * many; 0 at the end (the peer's FIN, once everything before it was read);
+ * or -ENOTCONN, the error that ended the connection (a reset loses what
+ * was not read), -EFAULT, -EINTR. */
+int tcp_recv(struct tcp_sock *s, pagetable_t pt, u32 dst, u32 n);
+
+/* No more sending: a FIN follows what is queued. Receiving goes on. 0, or
+ * -ENOTCONN. */
+int tcp_shutdown(struct tcp_sock *s);
+
+/* The owner lets go of `s`. A listener resets the connections waiting for
+ * accept(); a connection with data not read is reset (RFC 9293 3.10.4's
+ * ABORT, as RFC 1122 4.2.2.13 allows); any other is closed as by
+ * tcp_shutdown(), and the stack finishes the close (FIN-WAIT, TIME-WAIT)
+ * on its own before the slot is free again. Never sleeps. */
+void tcp_close(struct tcp_sock *s);
+
+/* The two ends of `s`: addresses and ports, 0 where there is none. */
+void tcp_ends(const struct tcp_sock *s, u32 *laddr, u32 *lport, u32 *raddr, u32 *rport);
+
+/* A TCP segment (`len` bytes at `tcp`) for this host from `src` to
+ * `dst`. Takes `p`. */
+void tcp_input(struct pbuf *p, u32 src, u32 dst, const u8 *tcp, u32 len);
+
+/* Runs the timers: every tick, from net_timer(). */
+void tcp_timer(void);
+
+/* Sockets in use, for the tests (`tcp_in_use` in kernel.elf). */
+extern u32 tcp_in_use;
 
 /* ---- DHCP (dhcp.c) ---- */
 
