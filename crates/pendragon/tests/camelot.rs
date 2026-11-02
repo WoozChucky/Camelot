@@ -1,8 +1,8 @@
 //! Creating Camelot VMs from the page, over HTTP, against Avalon and Lake in process:
-//! no ELF to upload, each VM on a copy of Lake's `camelot` image of its own, two of
+//! no ELF to upload, each VM on a copy of Lake's `os-base` image of its own, two of
 //! them running at once; and the page's form that offers it.
 //!
-//! The `camelot` image here is a small bootable disk whose boot block spins forever,
+//! The `os-base` image here is a small bootable disk whose boot block spins forever,
 //! so a VM booted from it stays running and holds its disk; the real Camelot image is
 //! booted by `cargo xtask up --demo`'s test (crates/xtask/tests/up.rs).
 
@@ -38,19 +38,19 @@ fn camelot_vms_need_no_program() {
 
     // No image yet: the page is told its name, and a create says what to do.
     let disks = api.expect(200, api.get("disks"));
-    assert_eq!(s(&disks, "camelot_image"), "camelot");
+    assert_eq!(s(&disks, "camelot_image"), "os-base");
     let r = create(vec![("name", "early".into()), ("camelot", true.into())]);
     assert_eq!(r.status, 404, "{}", r.text());
     assert_eq!(
         r.error(),
         format!(
-            "the Lake at {lake} has no 'camelot' image to copy (start the platform with \
+            "the Lake at {lake} has no 'os-base' image to copy (start the platform with \
              'cargo xtask up', which puts it in Lake's images directory)"
         )
     );
     assert_eq!(r.json().get("code").and_then(Json::as_str), Some("no such disk"));
 
-    std::fs::write(platform.dir.path().join("camelot"), spinning_image(16)).unwrap();
+    std::fs::write(platform.dir.path().join("os-base"), spinning_image(16)).unwrap();
     // Two VMs, no ELF: each boots from a copy of its own, and both run at once.
     for name in ["one", "two"] {
         let r = api.expect(
@@ -62,7 +62,7 @@ fn camelot_vms_need_no_program() {
                 ("start", true.into()),
             ]),
         );
-        assert_eq!(s(&r, "disk"), format!("{name}-root"));
+        assert_eq!(s(&r, "disk"), format!("{name}-disk0"));
         assert_eq!(r.get("started"), Some(&Json::Bool(true)));
     }
     let vms = api.expect(200, api.get("vms"));
@@ -71,19 +71,22 @@ fn camelot_vms_need_no_program() {
         assert_eq!((s(vm, "name"), s(vm, "state")), (*name, "running"));
         let disks = list(vm, "disks");
         assert_eq!(disks.len(), 1);
-        assert_eq!(s(&disks[0], "source"), format!("lake://{lake}/{name}-root"));
+        assert_eq!(s(&disks[0], "source"), format!("lake://{lake}/{name}-disk0"));
         assert_eq!(disks[0].get("held"), Some(&Json::Bool(true)));
     }
     let disks = api.expect(200, api.get("disks"));
-    for name in ["one-root", "two-root"] {
+    for name in ["one-disk0", "two-disk0"] {
         let d = disk(&disks, name);
         assert_eq!(d.get("writer"), Some(&Json::Bool(true)), "{d}");
         assert_eq!(n(d, "sectors"), 16);
     }
-    assert_eq!(disk(&disks, "camelot").get("writer"), Some(&Json::Bool(false)));
+    assert_eq!(disk(&disks, "os-base").get("writer"), Some(&Json::Bool(false)));
     // Byte for byte the image they were copied from.
-    let base = std::fs::read(platform.dir.path().join("camelot")).unwrap();
-    assert_eq!(std::fs::read(platform.dir.path().join("one-root")).unwrap(), base);
+    let base = std::fs::read(platform.dir.path().join("os-base")).unwrap();
+    assert_eq!(
+        std::fs::read(platform.dir.path().join("one-disk0")).unwrap(),
+        base
+    );
 
     // With other disks and cards, the copy is disk 0.
     api.expect(
@@ -95,7 +98,7 @@ fn camelot_vms_need_no_program() {
             (
                 "disks",
                 Json::Array(vec![obj([
-                    ("source", format!("lake://{lake}/camelot").into()),
+                    ("source", format!("lake://{lake}/os-base").into()),
                     ("read_only", true.into()),
                 ])]),
             ),
@@ -106,8 +109,8 @@ fn camelot_vms_need_no_program() {
     assert_eq!(
         sources,
         [
-            format!("lake://{lake}/three-root"),
-            format!("lake://{lake}/camelot")
+            format!("lake://{lake}/three-disk0"),
+            format!("lake://{lake}/os-base")
         ]
     );
     assert_eq!(s(&three, "state"), "created");
@@ -136,12 +139,12 @@ fn camelot_vms_need_no_program() {
     assert_eq!(r.status, 409, "{}", r.text());
     assert_eq!(
         r.error(),
-        "cannot create disk one-root: already exists: a disk named 'one-root' already exists"
+        "cannot create disk one-disk0: already exists: a disk named 'one-disk0' already exists"
     );
     let r = create(vec![("name", "plain".into()), ("camelot", true.into())]);
     assert_eq!(r.status, 409, "{}", r.text());
     assert!(r.error().starts_with("already exists: "), "{}", r.error());
-    assert!(!platform.dir.path().join("plain-root").exists());
+    assert!(!platform.dir.path().join("plain-disk0").exists());
     let r = create(vec![
         ("name", "four".into()),
         ("camelot", true.into()),
@@ -158,15 +161,15 @@ fn camelot_vms_need_no_program() {
         r.error(),
         "program: choose an ELF file to run, or a disk to boot from"
     );
-    assert!(!platform.dir.path().join("four-root").exists());
+    assert!(!platform.dir.path().join("four-disk0").exists());
 
     // Destroying a VM lets go of its copy, which can then be deleted.
     api.expect(200, api.action("vms/one/destroy"));
-    wait_for("one-root released", || {
+    wait_for("one-disk0 released", || {
         let disks = api.expect(200, api.get("disks"));
-        (disk(&disks, "one-root").get("writer") == Some(&Json::Bool(false))).then_some(())
+        (disk(&disks, "one-disk0").get("writer") == Some(&Json::Bool(false))).then_some(())
     });
-    api.expect(200, api.delete("disks/one-root"));
+    api.expect(200, api.delete("disks/one-disk0"));
     platform.stop();
 }
 
@@ -200,6 +203,12 @@ fn the_new_vm_form_offers_camelot() {
         &"if (hasImage && !disk) {"
     );
     assert!(js.contains("const hasImage = list.disks.some((d) => d.name === list.camelot_image);"));
+    // The form's RAM is the platform's default, in MiB: 4.
+    let mib = avalon_proto::DEFAULT_RAM_SIZE >> 20;
+    assert_eq!(mib, 4);
+    assert!(js.contains(&format!(
+        "const ram = el(\"input\", {{ type: \"text\", value: \"{mib}\" }});"
+    )));
     let css = request(platform.pendragon.addr(), "GET", "/style.css", &[], b"").text();
     assert!(css.contains("fieldset.boot") && css.contains("label[hidden] { display: none; }"));
     platform.stop();
@@ -210,7 +219,7 @@ fn the_new_vm_form_offers_camelot() {
 #[test]
 fn camelot_creates_are_guarded() {
     let platform = Platform::start("camelot-guard", 64);
-    std::fs::write(platform.dir.path().join("camelot"), spinning_image(16)).unwrap();
+    std::fs::write(platform.dir.path().join("os-base"), spinning_image(16)).unwrap();
     let api = platform.api();
     let addr = api.addr;
     let token = ("X-Pendragon-Token", api.token.as_str());
@@ -248,7 +257,7 @@ fn camelot_creates_are_guarded() {
     let r = parse_reply(&raw(addr, &[head.as_bytes(), body].concat()));
     assert_eq!(r.status, 403, "{}", r.text());
     // Nothing was copied, and no VM made.
-    assert!(!platform.dir.path().join("web-root").exists());
+    assert!(!platform.dir.path().join("web-disk0").exists());
     assert!(list(&api.expect(200, api.get("vms")), "vms").is_empty());
     // From Pendragon's own page it goes through.
     let r = api.expect(
@@ -262,6 +271,6 @@ fn camelot_creates_are_guarded() {
             ]),
         ),
     );
-    assert_eq!(s(&r, "disk"), "web-root");
+    assert_eq!(s(&r, "disk"), "web-disk0");
     platform.stop();
 }

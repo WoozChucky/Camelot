@@ -4,7 +4,7 @@
     .text
     .globl _start
 _start:
-    li    sp, 0x88000000    # top of Grail's default 128 MiB of RAM (16-byte aligned)
+    li    sp, 0x80400000    # top of Grail's default 4 MiB of RAM (16-byte aligned)
     call  main
     xcal.halt a0            # exit code = low 8 bits of a0
 1:  j     1b

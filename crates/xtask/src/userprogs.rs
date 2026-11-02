@@ -464,6 +464,24 @@ pub fn generate(programs: &[Program], cc: CCompiler) -> String {
     s
 }
 
+/// The `userprogs.s` of the disk kernel (`crate::kernel::disk_kernel`): the same
+/// table and count as [`generate`]'s, with no programs, so the kernel's loader
+/// finds none and runs everything from `/bin`.
+pub fn empty() -> String {
+    "# The disk kernel's user programs: none (crates/xtask/src/userprogs.rs).\n\
+     # It runs every program from /bin on its root filesystem.\n\
+     \n\
+     \x20   .section .rodata\n\
+     \x20   .align 2\n\
+     \x20   .globl user_programs\n\
+     user_programs:\n\
+     \n\
+     \x20   .globl user_program_count\n\
+     user_program_count:\n\
+     \x20   .word 0\n"
+        .to_string()
+}
+
 /// Builds every program under `root` and returns the text of
 /// `kernel/userprogs.s`.
 pub fn generated(root: &Path) -> Result<String, String> {

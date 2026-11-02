@@ -226,9 +226,9 @@ pub fn samples() -> Vec<Message> {
             source: None,
         },
         DiskCreate {
-            name: "web-root".into(),
+            name: "web-disk0".into(),
             sectors: 0,
-            source: Some("camelot".into()),
+            source: Some("os-base".into()),
         },
         ListDisks,
         DiskList { disks: Vec::new() },

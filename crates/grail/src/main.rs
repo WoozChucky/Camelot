@@ -16,7 +16,7 @@ for the Camelot kernel (spec section 7, \"Boot from disk\").
   --trace         print every instruction before it runs (with its hart's
                   number, h0, h1, ..., on a machine of several harts)
   --max-steps N   stop after N steps (exit code 124)
-  --ram MiB       RAM size in MiB, 1 to 2048 (default 128)
+  --ram MiB       RAM size in MiB, 1 to 2048 (default 4)
   --clock FREQ    real time: run FREQ instructions per second, and mtime ticks at FREQ.
                   FREQ is a number with an optional unit, Hz, kHz or MHz (any case;
                   no unit = Hz); fractions are fine if the result is whole Hz:

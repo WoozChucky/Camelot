@@ -13,7 +13,7 @@ use crate::json::Json;
 use avalon_client::{
     create_camelot_vm, format_hz, format_size, holds_disks, lake_disks, mac_text, parse_clock,
     parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_ram, CamelotError,
-    Client, Timeouts, VmAction, CAMELOT_IMAGE,
+    Client, Timeouts, VmAction, BASE_IMAGE,
 };
 use avalon_proto::{
     validate_name, DeviceSpec, DiskInfo, DiskSpec, ErrorCode, HardwareProfile, NatConfig, PortOwner,
@@ -491,7 +491,7 @@ impl App {
                 ("lake", self.lake.as_str().into()),
                 // The image a Camelot VM's disk is a copy of: the new-VM form offers
                 // Camelot first when Lake has it.
-                ("camelot_image", CAMELOT_IMAGE.into()),
+                ("camelot_image", BASE_IMAGE.into()),
                 ("disks", Json::Array(disks)),
                 ("vms_error", vms.err().map(|f| f.message).into()),
             ]),
@@ -828,7 +828,7 @@ struct Create {
     profile: HardwareProfile,
     /// Empty: boot from disk 0.
     program: Vec<u8>,
-    /// Boot Camelot from a copy of Lake's image `camelot`, made first.
+    /// Boot Camelot from a copy of Lake's image `os-base`, made first.
     camelot: bool,
     start: bool,
 }
@@ -840,7 +840,7 @@ struct Create {
 /// one hart), each disk source a path on Avalon's host or `lake://ADDR/NAME`, each
 /// network card the switch to plug it into (empty or null: none) and its MAC address
 /// (empty or null: Avalon makes one up), the program an ELF file in base64. `camelot`
-/// true boots Camelot from `<name>-root`, a copy of Lake's image `camelot` that goes
+/// true boots Camelot from `<name>-disk0`, a copy of Lake's image `os-base` that goes
 /// before the other disks, as Round Table's `create --camelot`; it takes no program.
 /// Otherwise the program may be left out when there is a disk: the VM boots from the
 /// first.
@@ -932,10 +932,10 @@ fn parse_create(body: &Json) -> Result<Create, Fail> {
             "program: choose an ELF file to run, or a disk to boot from",
         ));
     }
-    if camelot && validate_name(&avalon_client::camelot_root(name)).is_err() {
+    if camelot && validate_name(&avalon_client::vm_disk(name)).is_err() {
         return Err(Fail::bad(format!(
             "name: '{name}' is too long for a Camelot VM, whose disk is named {}",
-            avalon_client::camelot_root(name)
+            avalon_client::vm_disk(name)
         )));
     }
     Ok(Create {

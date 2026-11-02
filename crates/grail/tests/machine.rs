@@ -78,7 +78,7 @@ fn sysinfo_example_on_the_default_machine() {
     m.load_elf(&sysinfo_elf()).unwrap();
     assert_eq!(m.run(Some(1_000_000), |_| {}), RunResult::Exited(0));
     let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
-    assert_eq!(out, sysinfo_output(128, 10_000_000, false));
+    assert_eq!(out, sysinfo_output(4, 10_000_000, false));
 }
 
 #[test]
@@ -522,4 +522,11 @@ fn usage_documents_clock_and_its_units() {
     ] {
         assert!(usage.contains(text), "usage lacks {text:?}:\n{usage}");
     }
+    // The default RAM, as the machine has it: 4 MiB.
+    assert_eq!(grail::DEFAULT_RAM_SIZE, 4 << 20);
+    assert_eq!(grail::MachineConfig::default().ram_size, grail::DEFAULT_RAM_SIZE);
+    assert!(
+        usage.contains("--ram MiB       RAM size in MiB, 1 to 2048 (default 4)\n"),
+        "{usage}"
+    );
 }

@@ -349,7 +349,7 @@ function newVmPage(main, ctx, disk) {
 
   const field = (label, input, hint) => el("label", {}, el("span", {}, label), input, hint ? el("span", { class: "muted" }, " " + hint) : null);
   const name = el("input", { type: "text", required: true, placeholder: "web", autocomplete: "off" });
-  const ram = el("input", { type: "text", value: "128" });
+  const ram = el("input", { type: "text", value: "4" });
   const clock = el("input", { type: "text", placeholder: "full speed" });
   const harts = el("input", { type: "text", value: "1" });
   const program = el("input", { type: "file", accept: ".elf,application/octet-stream" });
@@ -361,7 +361,7 @@ function newVmPage(main, ctx, disk) {
   // left out when there is a disk to boot from instead.
   const bootCamelot = el("input", { type: "radio", name: "boot", value: "camelot" });
   const bootProgram = el("input", { type: "radio", name: "boot", value: "program", checked: true });
-  const camelotHint = el("span", { class: "muted" }, " Lake's image is copied to a disk of the VM's own, NAME-root");
+  const camelotHint = el("span", { class: "muted" }, " Lake's image is copied to a disk of the VM's own, NAME-disk0");
   const programField = field("Program", program, "an Excalibur ELF executable; without one the VM boots from its first disk");
   const showBoot = () => {
     programField.hidden = bootCamelot.checked;

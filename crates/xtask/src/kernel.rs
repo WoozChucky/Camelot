@@ -58,13 +58,15 @@ pub const C_FLAGS: &[&str] = &[
 ];
 
 /// Generous step budget for running the kernel non-interactively. Booting
-/// the kernel with the default 128 MiB of RAM takes about 36 million steps
-/// (6 million for the clang `-O2` reference build: merlin does not
-/// optimize), nearly all of them spent putting every page on the free list,
-/// mapping RAM and MMIO page by page, and the allocator self-test that takes
-/// every page and gives it back; mounting the root filesystem and checking
-/// `/bin` takes about 30 million more, and a few shell commands a few
-/// hundred thousand.
+/// the kernel to its shell with the default 4 MiB of RAM takes about 16
+/// million steps (36 million with 128 MiB, where nearly all of them go to
+/// putting every page on the free list, mapping RAM page by page, and the
+/// allocator self-test that takes every page and gives it back; merlin does
+/// not optimize, and the clang `-O2` reference build needs far fewer);
+/// mounting the root filesystem and checking that `/bin` holds the kernel's
+/// own programs takes about 30 million more (the disk kernel, which has no
+/// copies to compare, boots from its image in about 18 million all told),
+/// and a few shell commands a few hundred thousand.
 pub const BOOT_MAX_STEPS: u64 = 200_000_000;
 
 /// The banner the kernel prints first at boot, before `Camelot vX booting...`
@@ -101,6 +103,12 @@ pub const SCRIPT: &str = "kernel.ld";
 /// The generated source that holds the user programs
 /// (`crate::userprogs::GENERATED`), in the kernel directory.
 pub const USERPROGS: &str = "userprogs.s";
+/// The kernel with its user programs built in, in the kernel directory: what
+/// Grail runs as a program (`grail kernel/kernel.elf`), with or without a disk.
+pub const KERNEL_ELF: &str = "kernel.elf";
+/// The kernel without them ([`disk_kernel`]), in the kernel directory: what a
+/// bootable root image holds (`cargo xtask fs`).
+pub const DISK_KERNEL: &str = "kernel-disk.elf";
 
 /// What assembles the `.s` files in the reference build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +264,50 @@ pub fn build_merlin(kernel_dir: &Path, userprogs: Option<&Path>) -> Result<Built
     Ok(Built { objects, elf })
 }
 
+/// The disk kernel (`kernel/kernel-disk.elf`, [`DISK_KERNEL`]): the objects of
+/// `built` linked again with `kernel_dir`'s linker script, but with a `userprogs.s`
+/// that has no programs ([`crate::userprogs::empty`]), so the kernel runs every
+/// program from `/bin` on its root filesystem.
+///
+/// This is the Linux split: `kernel/kernel.elf` carries its programs, about 1.1 MB
+/// of its 1.4 MB, the way an initramfs carries the programs of a machine with no
+/// root disk; the kernel a bootable image holds (`cargo xtask fs`) does not need
+/// them, since the same programs are in the image's `/bin`, and is a quarter the
+/// size. Booted with no shell in `/bin` (or with no root filesystem at all) it
+/// panics: there is nothing else to run.
+pub fn disk_kernel(kernel_dir: &Path, built: &Built) -> Result<Vec<u8>, String> {
+    if !built.objects.iter().any(|o| o.source.name == USERPROGS) {
+        return Err(format!("the kernel has no {USERPROGS} to leave out"));
+    }
+    // The same link, in the same order, with the empty table's object in place
+    // of the programs'.
+    let empty = toolchain::assemble(USERPROGS, &crate::userprogs::empty())?;
+    let inputs: Vec<merlin_ld::Input> = built
+        .objects
+        .iter()
+        .map(|o| merlin_ld::Input {
+            name: o.source.object_name(),
+            data: if o.source.name == USERPROGS {
+                empty.clone()
+            } else {
+                o.obj.clone()
+            },
+        })
+        .collect();
+    toolchain::link(kernel_dir, SCRIPT, &inputs, "the disk kernel")
+}
+
+/// The disk kernel's path for a kernel written to `out`: `kernel.elf` gives
+/// `kernel-disk.elf` next to it.
+pub fn disk_kernel_path(out: &Path) -> PathBuf {
+    let stem = out.file_stem().unwrap_or_default().to_string_lossy();
+    let name = match out.extension() {
+        Some(ext) => format!("{stem}-disk.{}", ext.to_string_lossy()),
+        None => format!("{stem}-disk"),
+    };
+    out.with_file_name(name)
+}
+
 /// Everything needed for one kernel build. The tools run with `kernel_dir` as
 /// their working directory, so relative `obj_dir`/`out` paths are taken
 /// relative to it; pass absolute ones.
@@ -374,7 +426,14 @@ impl Build {
             }
             write(obj_dir.join(o.source.object_name()), &o.obj)?;
         }
-        write(self.kernel_dir.join(&self.out), &built.elf)
+        let out = self.kernel_dir.join(&self.out);
+        write(out.clone(), &built.elf)?;
+        // The same kernel without its programs, for bootable images.
+        let disk = disk_kernel_path(&out);
+        if self.verbose {
+            eprintln!("merlin-ld (again, with no user programs) -o {}", disk.display());
+        }
+        write(disk, &disk_kernel(&self.kernel_dir, &built)?)
     }
 
     fn merlin_as(&self, src: &Source) -> Result<(), String> {
@@ -630,7 +689,11 @@ mod tests {
         };
         assert_eq!(b.run().unwrap(), b.out);
         let elf = std::fs::read(&b.out).unwrap();
-        assert_eq!(elf, build_merlin(&b.kernel_dir, None).unwrap().elf);
+        let built = build_merlin(&b.kernel_dir, None).unwrap();
+        assert_eq!(elf, built.elf);
+        // The disk kernel, next to it.
+        let disk = std::fs::read(dir.join("out").join("kernel-disk.elf")).unwrap();
+        assert_eq!(disk, disk_kernel(&b.kernel_dir, &built).unwrap());
         for f in ["main.c.s", "main.c.o", "entry.s.o", "userprogs.s.o"] {
             assert!(b.obj_dir.join(f).is_file(), "{f}");
         }
@@ -727,6 +790,23 @@ mod tests {
         assert_eq!(PathBuf::from(&args[4]), Path::new("obj").join("entry.s.o"));
         assert_eq!(PathBuf::from(&args[5]), Path::new("obj").join("main.c.o"));
         assert_eq!(args.len(), 6);
+    }
+
+    #[test]
+    fn the_disk_kernel_goes_next_to_the_kernel() {
+        assert_eq!(
+            disk_kernel_path(Path::new("kernel/kernel.elf")),
+            Path::new("kernel/kernel-disk.elf")
+        );
+        assert_eq!(disk_kernel_path(Path::new(KERNEL_ELF)), Path::new(DISK_KERNEL));
+        assert_eq!(disk_kernel_path(Path::new("out/k")), Path::new("out/k-disk"));
+        // Without a userprogs.s there is nothing to leave out.
+        let built = Built {
+            objects: Vec::new(),
+            elf: Vec::new(),
+        };
+        let err = disk_kernel(Path::new("kernel"), &built).unwrap_err();
+        assert!(err.contains("no userprogs.s"), "{err}");
     }
 
     #[test]

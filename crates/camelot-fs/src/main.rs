@@ -20,8 +20,9 @@ commands:
         its header (default 21; the kernel mounts a log of fewer than 11
         blocks read-only). --boot and --kernel make it bootable: the
         bootloader BOOT (an ELF, kernel/boot/boot.elf) goes in the boot block
-        and the kernel ELF KERNEL after the filesystem, so `grail --disk
-        IMAGE` boots it
+        and the kernel ELF KERNEL (kernel/kernel-disk.elf; only what the
+        bootloader loads of it) after the filesystem, so `grail --disk IMAGE`
+        boots it
   fsck [--recover] IMAGE
         check every consistency rule; a committed transaction still in the log
         is checked as replayed, and --recover writes the replay to IMAGE, then

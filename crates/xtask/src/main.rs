@@ -9,23 +9,26 @@ const USAGE: &str = "usage: cargo xtask <task> [options]
 
 tasks:
   up           bring the Avalon platform up: build it, put the Camelot root image in Lake's
-               images directory (target/platform/images) as the image camelot, and run Lake,
-               Avalon and Pendragon until Ctrl-C. --demo also starts a Camelot VM;
+               images directory (target/platform/images) as the image os-base, and run Lake,
+               Avalon and Pendragon until Ctrl-C. --demo also starts a Camelot VM, vm001;
                cargo xtask up --help lists the options
   examples     build every example (or the ones named) with merlin-as + merlin-ld into
                examples/<dir>/<name>.elf; no LLVM needed. Objects go to target/examples.
                --check: build in memory and report stale .elf files instead of writing
                -v: print the equivalent merlin-as/merlin-ld command lines
   kernel       build kernel/kernel.elf with our own toolchain (merlin, merlin-as, merlin-ld;
-               no LLVM), after regenerating kernel/userprogs.s from kernel/user the same way.
+               no LLVM), after regenerating kernel/userprogs.s from kernel/user the same way,
+               and kernel/kernel-disk.elf, the same kernel without the user programs built in
+               (it runs them from /bin: the kernel of a bootable root image).
                --cc clang: the reference build instead (clang -O2 + ld.lld from the official
                LLVM install, the user programs' C compiled by clang too), in target/kernel/clang
   fs           build the root filesystem image (target/camelot-fs.img): kernel/fs/ at /,
                the user programs in /bin (merlin, merlin-as, merlin-ld; no LLVM), /dev/console,
-               made bootable with kernel/boot/boot.s and kernel/kernel.elf
-               (grail --disk target/camelot-fs.img boots it)
-               -o PATH: output file; --size N: blocks (1 KiB each, default 2048);
-               --no-boot: the filesystem alone
+               made bootable with kernel/boot/boot.s and kernel/kernel-disk.elf
+               (grail --disk target/camelot-fs.img boots it, in the default 4 MiB of RAM)
+               -o PATH: output file; --size N: the image's size in blocks (1 KiB each, default
+               2048: 2 MiB), the filesystem filling what the kernel leaves;
+               --no-boot: the filesystem alone, N blocks
   boot         build the boot ROM's disk loader (crates/grail/rom/diskboot.elf) and
                Camelot's bootloader (kernel/boot/boot.elf) with merlin-as + merlin-ld
                --check: build in memory and report stale .elf files instead of writing
@@ -41,7 +44,8 @@ kernel options:
   --lld PATH         ld.lld to use (default: next to clang, then the same search)
   --as clang|merlin  assembler for the .s files with --cc clang (default: clang)
   -o PATH            output file (default: kernel/kernel.elf; with --cc clang,
-                     target/kernel/clang/kernel.elf)
+                     target/kernel/clang/kernel.elf). The merlin build writes the disk
+                     kernel next to it, named with -disk (kernel-disk.elf)
   --run              run the result on Grail afterwards, with this terminal as its
                      console (type exit to stop it); exit with its exit code
   -v, --verbose      print each command (for merlin, its command-line equivalent)";
@@ -388,15 +392,15 @@ fn build_boot(args: ExamplesArgs) -> ExitCode {
 /// checked with fsck after it is built.
 fn build_fs(f: FsArgs) -> ExitCode {
     let root = repo_root();
-    let mut opts = camelot_fs::mkfs::Options::default();
-    if let Some(size) = f.size {
-        opts.size = size;
-    }
     let out = f.out.unwrap_or_else(|| xtask::fs::default_out(&root));
     let built = if f.no_boot {
+        let mut opts = camelot_fs::mkfs::Options::default();
+        if let Some(size) = f.size {
+            opts.size = size;
+        }
         xtask::fs::build(&root, &opts)
     } else {
-        xtask::fs::build_bootable(&root, &opts)
+        xtask::fs::build_bootable(&root, f.size.unwrap_or(xtask::fs::IMAGE_SIZE))
     };
     let image = match built {
         Ok(image) => image,
@@ -419,13 +423,19 @@ fn build_fs(f: FsArgs) -> ExitCode {
         eprintln!("xtask: cannot write {}: {e}", out.display());
         return ExitCode::FAILURE;
     }
+    let (what, kernel) = match camelot_fs::boot::boot_info(&image) {
+        Ok(Some(info)) => (
+            format!(" (bootable, {} KiB)", image.len() / 1024),
+            format!(", then a {} KiB kernel", info.kernel_sectors / 2),
+        ),
+        _ => (String::new(), String::new()),
+    };
     eprintln!(
-        "built {}: {} blocks ({} free), {} files{}",
+        "built {}{what}: a filesystem of {} blocks ({} free) with {} files{kernel}",
         out.display(),
         report.sb.size,
         report.free_blocks,
         report.files,
-        if f.no_boot { "" } else { ", bootable" }
     );
     ExitCode::SUCCESS
 }
@@ -559,6 +569,9 @@ fn kernel(k: KernelArgs) -> ExitCode {
         }
     };
     eprintln!("built {}", out.display());
+    if k.cc.unwrap_or_default() == Cc::Merlin {
+        eprintln!("built {}", xtask::kernel::disk_kernel_path(&out).display());
+    }
     if !k.run {
         return ExitCode::SUCCESS;
     }
