@@ -242,7 +242,7 @@ pub fn typed(bytes: &[u8]) -> Receiver<u8> {
 }
 
 /// Runs a kernel image on Grail with `input` waiting on the UART (commands
-/// for the kernel's shell, which runs until it reads `halt`) and the UART
+/// for the shell, which runs until it reads `exit`) and the UART
 /// captured. Returns how it ended and everything it printed (UART and
 /// `xcal.dbg`).
 pub fn run_on_grail(elf: &[u8], input: &[u8], max_steps: u64) -> Result<(RunResult, String), String> {

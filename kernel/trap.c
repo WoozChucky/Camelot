@@ -6,11 +6,13 @@
  * Two interrupts are handled: the timer tick, which arrives as a supervisor
  * software interrupt forwarded by machine_vec, and the supervisor external
  * interrupt from the PLIC: the UART's receive line and the disks' completions.
- * In the kernel an exception is a bug, so it panics, unless a memory probe
- * (probe.s) caused it. In U-mode, ecall is a call into the kernel (syscall.c)
- * and any other exception kills the process. */
+ * Either may wake sleeping processes (wakeup only marks them runnable). In the
+ * kernel an exception is a bug, so it panics, unless a memory probe (probe.s)
+ * caused it. In U-mode, ecall is a call into the kernel (syscall.c) and any
+ * other exception kills the process. */
 #include "trap.h"
 #include "blk.h"
+#include "console.h"
 #include "kprintf.h"
 #include "machine.h"
 #include "plic.h"
@@ -18,7 +20,6 @@
 #include "proc.h"
 #include "riscv.h"
 #include "syscall.h"
-#include "uart.h"
 #include "vm.h"
 
 volatile u32 ticks;
@@ -124,7 +125,7 @@ static void trap_panic(struct trap_frame *f) {
 static void external_interrupt(void) {
     u32 irq = plic_claim();
     if (irq == PLIC_IRQ_UART) {
-        uart_intr();
+        console_intr();
     } else {
         blk_intr(irq);
     }
@@ -152,10 +153,12 @@ static bool probe_fixup(struct trap_frame *f) {
 }
 
 /* A timer tick from machine_vec. Clear it first: a tick that arrives while
- * this runs sets SSIP again and is taken after sret. */
+ * this runs sets SSIP again and is taken after sret. Processes in the sleep
+ * system call wait on `ticks`. */
 static void clock_tick(void) {
     w_sip(r_sip() & ~SIP_SSIP);
     ticks = ticks + 1;
+    wakeup((const void *)&ticks);
 }
 
 void kernel_trap(struct trap_frame *f) {

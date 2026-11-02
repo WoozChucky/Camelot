@@ -197,19 +197,19 @@ fn kernel_shell_in_a_raw_console() {
     // the console would hold the whole line back until Enter.)
     type_keys(&conin, "ticks");
     s.wait_for_output("the keys never reached the kernel before Enter", |out| {
-        out.contains("camelot> ticks")
+        out.contains("$ ticks")
     });
     // Enter is a lone CR in a raw console.
     type_keys(&conin, "\r");
     s.wait_for_output("no prompt after the first command", |out| {
-        out.matches("camelot> ").count() == 2
+        out.matches("$ ").count() == 2
     });
     // Ctrl-Z on its own is a key like any other, which the line editor
     // ignores, not the end of the input. Give grail time to read it alone.
     type_keys(&conin, "\x1a");
     std::thread::sleep(Duration::from_millis(500));
     // Backspace is BS.
-    type_keys(&conin, "halx\x08t\r");
+    type_keys(&conin, "exix\x08t\r");
     let deadline = Instant::now() + Duration::from_secs(TIMEOUT_SECS);
     let status = loop {
         if let Some(status) = s.child.try_wait().unwrap() {
@@ -217,7 +217,7 @@ fn kernel_shell_in_a_raw_console() {
         }
         assert!(
             Instant::now() < deadline,
-            "grail did not halt; stdout:\n{}",
+            "grail did not exit; stdout:\n{}",
             s.stdout()
         );
         std::thread::sleep(Duration::from_millis(10));
@@ -227,13 +227,13 @@ fn kernel_shell_in_a_raw_console() {
     let stdout = s.stdout();
 
     assert_eq!(status.code(), Some(0), "stdout:\n{stdout}");
-    let shell = &stdout[stdout.find("camelot> ").expect("no prompt")..];
+    let shell = &stdout[stdout.find("$ ").expect("no prompt")..];
     let rest = shell
-        .strip_prefix("camelot> ticks\nticks: ")
+        .strip_prefix("$ ticks\nticks: ")
         .unwrap_or_else(|| panic!("{stdout}"));
     let (n, rest) = rest.split_once('\n').unwrap();
     assert!(n.parse::<u32>().unwrap() >= 10, "{stdout}");
-    assert_eq!(rest, "camelot> halx\x08 \x08t\n");
+    assert_eq!(rest, "$ exix\x08 \x08t\n");
     // And the console is back to line editing.
     assert_eq!(restored, cooked);
 }

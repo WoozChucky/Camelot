@@ -72,13 +72,13 @@ fn keys_before_the_detach_key_are_sent() {
 }
 
 /// The Camelot kernel's shell, through Herald: a command, a detach, the scrollback on
-/// the way back, and `halt` ending the VM and the session with it.
+/// the way back, and `exit` ending the VM and the session with it.
 #[test]
 fn the_kernel_shell() {
     let server = server();
     let id = start_vm(&server, "camelot", 128, kernel());
     let mut herald = Herald::attach(&server, VmRef::Name("camelot".into()));
-    herald.wait_for("camelot> ");
+    herald.wait_for("Type help for the list of commands.\n$ ");
     herald.type_keys(b"ticks\r");
     herald.wait_for("ticks: ");
     herald.type_keys(&[DETACH_KEY]);
@@ -86,11 +86,11 @@ fn the_kernel_shell() {
 
     let mut again = Herald::attach(&server, VmRef::Id(id));
     let scrollback = String::from_utf8_lossy(&again.scrollback).into_owned();
-    assert!(scrollback.contains("camelot> ticks"), "{scrollback}");
+    assert!(scrollback.contains("$ ticks"), "{scrollback}");
     assert!(scrollback.contains("ticks: "), "{scrollback}");
     again.type_keys(b"help\r");
-    again.wait_for("timer ticks since boot");
-    again.type_keys(b"halt\r");
+    again.wait_for("leave the shell");
+    again.type_keys(b"exit\r");
     assert_eq!(again.end().unwrap(), End::VmEnded(VmState::Exited(0)));
     server.stop().unwrap();
 }
