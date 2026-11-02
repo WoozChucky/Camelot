@@ -593,7 +593,7 @@ impl SteppedGateway {
         }
     }
 
-    fn from_guest(&self) -> Vec<Vec<u8>> {
+    fn guest_frames(&self) -> Vec<Vec<u8>> {
         self.0.lock().unwrap().from_guest.clone()
     }
 }
@@ -650,9 +650,9 @@ fn the_udp_echo_service_answers_through_a_forwarded_port() {
     let is_echo = |f: &Vec<u8>| {
         parse_ipv4(f).is_some_and(|p| p.src == [10, 0, 2, 15] && p.proto == 17 && p.payload[..2] == [0, 7])
     };
-    let sent = gw.from_guest().len();
+    let sent = gw.guest_frames().len();
     let mut steps = 0;
-    while !gw.from_guest()[sent..].iter().any(is_echo) {
+    while !gw.guest_frames()[sent..].iter().any(is_echo) {
         vm.m.run_for(SLICE, &mut |_| {});
         assert_eq!(vm.m.exit_code(), None, "the kernel stopped:\n{}", vm.out());
         steps += SLICE;
