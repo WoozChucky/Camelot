@@ -289,6 +289,7 @@ fn dhcp_leases_over_frames() {
     gw.send(&dhcp_frame(dhcp::REQUEST, 77, Some(GUEST)));
     check(&mut gw, dhcp::ACK);
     assert_eq!(gw.lease_of(&GUEST_MAC), Some(GUEST));
+    assert_eq!(gw.leases(), [(GUEST_MAC, GUEST)]);
     assert_eq!(gw.recv(), None);
 }
 

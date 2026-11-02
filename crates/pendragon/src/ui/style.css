@@ -152,7 +152,7 @@ label { display: block; margin: 8px 0; }
 label > span { display: inline-block; min-width: 110px; color: var(--muted); }
 label.inline { display: inline-block; margin-right: 16px; }
 
-input[type=text], select {
+input[type=text], select, textarea {
   font: inherit;
   padding: 4px 6px;
   min-width: 260px;
@@ -163,6 +163,12 @@ input[type=text], select {
 }
 
 .disk-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
+
+textarea { font-family: ui-monospace, Consolas, monospace; vertical-align: top; }
+select { min-width: 160px; }
+.switch-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.switch-head h2 { margin: 0 12px 0 0; }
+.mono { font-family: ui-monospace, Consolas, monospace; }
 
 dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0; }
 dl.facts dt { color: var(--muted); }

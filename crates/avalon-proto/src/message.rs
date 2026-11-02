@@ -8,8 +8,9 @@
 //! [`MessageKind`].
 
 use crate::wire::{Reader, Writer};
-use crate::{Error, Result, MAGIC, MAX_BLOCK_SECTORS, SECTOR_SIZE};
+use crate::{Error, Result, MAGIC, MAX_BLOCK_SECTORS, MAX_FORWARDS, SECTOR_SIZE};
 use std::fmt;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 /// Message type codes.
 pub mod ty {
@@ -70,6 +71,7 @@ pub mod ty {
     pub const ATTACH_CARD: u16 = 0x0605;
     pub const DETACH_CARD: u16 = 0x0606;
     pub const CAPTURE_SWITCH: u16 = 0x0607;
+    pub const SET_SWITCH_NAT: u16 = 0x0608;
 }
 
 /// Every message type, with its name and kind, in code order. The protocol doc's
@@ -127,6 +129,7 @@ pub const CATALOGUE: &[(u16, &str, MessageKind)] = {
         (ty::ATTACH_CARD, "AttachCard", Request),
         (ty::DETACH_CARD, "DetachCard", Request),
         (ty::CAPTURE_SWITCH, "CaptureSwitch", Request),
+        (ty::SET_SWITCH_NAT, "SetSwitchNat", Request),
     ]
 };
 
@@ -415,8 +418,73 @@ pub struct SwitchInfo {
     pub name: String,
     /// The file on the server's host this switch is being captured into, if it is.
     pub capture: Option<String>,
-    /// Its ports, in the order they were plugged in.
+    /// Its NAT gateway, if it has one.
+    pub nat: Option<NatInfo>,
+    /// Its ports, in the order they were plugged in (the gateway's among them).
     pub ports: Vec<SwitchPort>,
+}
+
+/// A NAT gateway for a switch (protocol doc, section 6.7, "NAT"): what `CreateSwitch`
+/// and `SetSwitchNat` ask for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NatConfig {
+    /// Host ports forwarded to guests, in order.
+    pub hostfwd: Vec<PortForward>,
+}
+
+/// A switch's NAT gateway as it is now, in `SwitchInfo`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NatInfo {
+    /// The forwarding rules as bound: a host port 0 shows the port the system picked.
+    pub hostfwd: Vec<PortForward>,
+    /// The addresses the gateway's DHCP server has given out, in address order.
+    pub leases: Vec<Lease>,
+}
+
+/// One DHCP lease of a switch's gateway: a card's MAC address and its address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lease {
+    pub mac: [u8; 6],
+    pub addr: Ipv4Addr,
+}
+
+/// Which transport a forwarded port carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FwdProto {
+    Tcp,
+    Udp,
+}
+
+/// One host port forwarded to a guest by a switch's gateway: the gateway listens on
+/// `host` and passes each connection (TCP) or datagram (UDP) to `guest`, from
+/// 10.0.2.2. Shown as QEMU writes `hostfwd` rules (`tcp:127.0.0.1:8080-10.0.2.15:80`),
+/// which is also how Round Table and Pendragon read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PortForward {
+    pub proto: FwdProto,
+    /// Where the host side listens; port 0 lets the system pick.
+    pub host: SocketAddrV4,
+    /// A guest address (see [`is_guest_addr`]) and a port other than 0.
+    pub guest: SocketAddrV4,
+}
+
+impl fmt::Display for PortForward {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let proto = match self.proto {
+            FwdProto::Tcp => "tcp",
+            FwdProto::Udp => "udp",
+        };
+        write!(f, "{proto}:{}-{}", self.host, self.guest)
+    }
+}
+
+/// Whether a guest of a switch's gateway may have `ip`: in 10.0.2.0/24, and not the
+/// network (.0), the gateway (.2), the DNS server (.3) or the broadcast address (.255).
+/// The gateway crate's rule (`gateway::is_guest_addr`), which a test checks this
+/// against: the protocol crate depends on nothing.
+pub fn is_guest_addr(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[..3] == [10, 0, 2] && ![0, 2, 3, 255].contains(&o[3])
 }
 
 /// One port of a virtual switch and its counters. "In" is what the switch received on
@@ -440,6 +508,8 @@ pub struct SwitchPort {
 pub enum PortOwner {
     /// Network card number `card` (from 0, the order of the profile's cards) of VM `vm`.
     Card { vm: u32, card: u8 },
+    /// The switch's NAT gateway.
+    Gateway,
 }
 
 /// Error codes carried by the `Error` message. Codes are never reused. Unknown codes
@@ -752,9 +822,11 @@ pub enum Message {
     },
 
     // ---- Virtual network (Avalon) ----
-    /// Create an empty virtual switch. Answered by `Ok`.
+    /// Create a virtual switch with no cards plugged in, and a NAT gateway if `nat`
+    /// asks for one. Answered by `Ok`.
     CreateSwitch {
         name: String,
+        nat: Option<NatConfig>,
     },
     /// Delete a switch, unplugging every card from it. Answered by `Ok`.
     DeleteSwitch {
@@ -781,6 +853,12 @@ pub enum Message {
     CaptureSwitch {
         switch: String,
         path: Option<String>,
+    },
+    /// Give switch `switch` a NAT gateway, or take its gateway away (`None`). Answered
+    /// by `Ok`.
+    SetSwitchNat {
+        switch: String,
+        nat: Option<NatConfig>,
     },
 }
 
@@ -839,6 +917,7 @@ impl Message {
             AttachCard { .. } => ty::ATTACH_CARD,
             DetachCard { .. } => ty::DETACH_CARD,
             CaptureSwitch { .. } => ty::CAPTURE_SWITCH,
+            SetSwitchNat { .. } => ty::SET_SWITCH_NAT,
         }
     }
 
@@ -899,6 +978,14 @@ impl Message {
                 return invalid(format!(
                     "block read of {count} sectors (1 to {MAX_BLOCK_SECTORS})"
                 ));
+            }
+            Message::CreateSwitch { nat: Some(nat), .. } | Message::SetSwitchNat { nat: Some(nat), .. } => {
+                check_forwards(&nat.hostfwd)?
+            }
+            Message::SwitchList { switches } => {
+                for nat in switches.iter().filter_map(|s| s.nat.as_ref()) {
+                    check_forwards(&nat.hostfwd)?;
+                }
             }
             Message::BlockData { data, .. } | Message::BlockWrite { data, .. } => {
                 let max = MAX_BLOCK_SECTORS as usize * SECTOR_SIZE;
@@ -1081,10 +1168,19 @@ impl Message {
                 w.u32(d.readers);
                 w.bool(d.writer);
             }),
-            DiskDelete { name } | CreateSwitch { name } | DeleteSwitch { name } => w.str(name),
+            DiskDelete { name } | DeleteSwitch { name } => w.str(name),
+            CreateSwitch { name, nat } => {
+                w.str(name);
+                w.option(nat, put_nat_config);
+            }
+            SetSwitchNat { switch, nat } => {
+                w.str(switch);
+                w.option(nat, put_nat_config);
+            }
             SwitchList { switches } => w.list(switches, |w, s| {
                 w.str(&s.name);
                 w.option(&s.capture, |w, path| w.str(path));
+                w.option(&s.nat, put_nat_info);
                 w.list(&s.ports, put_port);
             }),
             AttachCard { vm, card, switch } => {
@@ -1284,7 +1380,10 @@ impl Message {
                 })?,
             },
             ty::DISK_DELETE => DiskDelete { name: r.string()? },
-            ty::CREATE_SWITCH => CreateSwitch { name: r.string()? },
+            ty::CREATE_SWITCH => CreateSwitch {
+                name: r.string()?,
+                nat: r.option(get_nat_config)?,
+            },
             ty::DELETE_SWITCH => DeleteSwitch { name: r.string()? },
             ty::LIST_SWITCHES => ListSwitches,
             ty::SWITCH_LIST => SwitchList {
@@ -1292,6 +1391,7 @@ impl Message {
                     Result::Ok(SwitchInfo {
                         name: r.string()?,
                         capture: r.option(|r| r.string())?,
+                        nat: r.option(get_nat_info)?,
                         ports: r.list(get_port)?,
                     })
                 })?,
@@ -1308,6 +1408,10 @@ impl Message {
             ty::CAPTURE_SWITCH => CaptureSwitch {
                 switch: r.string()?,
                 path: r.option(|r| r.string())?,
+            },
+            ty::SET_SWITCH_NAT => SetSwitchNat {
+                switch: r.string()?,
+                nat: r.option(get_nat_config)?,
             },
             _ => return Err(crate::Error::UnknownType(code)),
         };
@@ -1425,6 +1529,93 @@ fn get_profile(r: &mut Reader) -> Result<HardwareProfile> {
     })
 }
 
+/// Refuses forwarding rules no gateway can have: more than [`MAX_FORWARDS`] of them (each
+/// binds a host socket), a guest port 0, or a guest address outside the guest network.
+fn check_forwards(rules: &[PortForward]) -> Result<()> {
+    if rules.len() > MAX_FORWARDS {
+        return Err(Error::Invalid(format!(
+            "{} forwarding rules (at most {MAX_FORWARDS} per gateway)",
+            rules.len()
+        )));
+    }
+    for rule in rules {
+        if rule.guest.port() == 0 {
+            return Err(Error::Invalid(format!(
+                "forwarding rule {rule}: the guest port is 0"
+            )));
+        }
+        if !is_guest_addr(*rule.guest.ip()) {
+            return Err(Error::Invalid(format!(
+                "forwarding rule {rule}: {} is not a guest address in 10.0.2.0/24",
+                rule.guest.ip()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn put_endpoint(w: &mut Writer, addr: &SocketAddrV4) {
+    w.raw(&addr.ip().octets());
+    w.u16(addr.port());
+}
+
+fn get_endpoint(r: &mut Reader) -> Result<SocketAddrV4> {
+    let ip: [u8; 4] = r.array()?;
+    Ok(SocketAddrV4::new(Ipv4Addr::from(ip), r.u16()?))
+}
+
+fn put_forward(w: &mut Writer, rule: &PortForward) {
+    w.u8(match rule.proto {
+        FwdProto::Tcp => 1,
+        FwdProto::Udp => 2,
+    });
+    put_endpoint(w, &rule.host);
+    put_endpoint(w, &rule.guest);
+}
+
+fn get_forward(r: &mut Reader) -> Result<PortForward> {
+    let proto = match r.u8()? {
+        1 => FwdProto::Tcp,
+        2 => FwdProto::Udp,
+        t => return Err(bad_tag("forwarding protocol", t)),
+    };
+    Ok(PortForward {
+        proto,
+        host: get_endpoint(r)?,
+        guest: get_endpoint(r)?,
+    })
+}
+
+fn put_nat_config(w: &mut Writer, nat: &NatConfig) {
+    w.list(&nat.hostfwd, put_forward);
+}
+
+fn get_nat_config(r: &mut Reader) -> Result<NatConfig> {
+    Ok(NatConfig {
+        hostfwd: r.list(get_forward)?,
+    })
+}
+
+fn put_nat_info(w: &mut Writer, nat: &NatInfo) {
+    w.list(&nat.hostfwd, put_forward);
+    w.list(&nat.leases, |w, lease| {
+        w.raw(&lease.mac);
+        w.raw(&lease.addr.octets());
+    });
+}
+
+fn get_nat_info(r: &mut Reader) -> Result<NatInfo> {
+    Ok(NatInfo {
+        hostfwd: r.list(get_forward)?,
+        leases: r.list(|r| {
+            Ok(Lease {
+                mac: r.mac()?,
+                addr: Ipv4Addr::from(r.array::<4>()?),
+            })
+        })?,
+    })
+}
+
 fn put_port(w: &mut Writer, p: &SwitchPort) {
     match p.owner {
         PortOwner::Card { vm, card } => {
@@ -1432,6 +1623,7 @@ fn put_port(w: &mut Writer, p: &SwitchPort) {
             w.u32(vm);
             w.u8(card);
         }
+        PortOwner::Gateway => w.u8(2),
     }
     w.raw(&p.mac);
     for n in [p.in_frames, p.in_bytes, p.out_frames, p.out_bytes, p.dropped] {
@@ -1445,6 +1637,7 @@ fn get_port(r: &mut Reader) -> Result<SwitchPort> {
             vm: r.u32()?,
             card: r.u8()?,
         },
+        2 => PortOwner::Gateway,
         t => return Err(bad_tag("port owner", t)),
     };
     Ok(SwitchPort {

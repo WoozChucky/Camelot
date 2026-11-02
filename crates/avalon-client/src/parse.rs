@@ -1,7 +1,7 @@
 //! What people type, as protocol values. Every front end (Round Table's flags,
 //! Pendragon's forms) parses with these, so they all accept the same syntax.
 
-use avalon_proto::{validate_name, DiskSource, NetSpec, SECTOR_SIZE};
+use avalon_proto::{validate_name, DiskSource, FwdProto, NetSpec, PortForward, SECTOR_SIZE};
 use grail::net::MacAddr;
 use std::net::{IpAddr, SocketAddr};
 
@@ -142,9 +142,52 @@ pub fn parse_net(s: &str) -> Result<NetSpec, String> {
     Ok(NetSpec { switch, mac })
 }
 
+/// Parses a port forwarding rule for a switch's NAT gateway, QEMU's `hostfwd` syntax:
+/// `[tcp|udp]:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT`. The protocol is TCP if left
+/// out, HOSTADDR 127.0.0.1 (only programs on Avalon's host can connect), GUESTADDR
+/// 10.0.2.15 (the first DHCP lease); `tcp::8080-:80` forwards Avalon's host port 8080
+/// to port 80 of the guest at 10.0.2.15, `udp::5353-10.0.2.16:53` a UDP port to the
+/// guest at 10.0.2.16. The gateway's own parser, so `grail --net user,hostfwd=` takes
+/// the same rules.
+pub fn parse_hostfwd(s: &str) -> Result<PortForward, String> {
+    let rule = gateway::HostFwd::parse(s)?;
+    Ok(PortForward {
+        proto: match rule.proto {
+            gateway::Proto::Tcp => FwdProto::Tcp,
+            gateway::Proto::Udp => FwdProto::Udp,
+        },
+        host: rule.host,
+        guest: rule.guest,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarding_rules() {
+        for (text, shown) in [
+            ("tcp::8080-:80", "tcp:127.0.0.1:8080-10.0.2.15:80"),
+            ("8080-:80", "tcp:127.0.0.1:8080-10.0.2.15:80"),
+            ("udp:0.0.0.0:5353-10.0.2.16:53", "udp:0.0.0.0:5353-10.0.2.16:53"),
+            ("tcp::0-10.0.2.20:7", "tcp:127.0.0.1:0-10.0.2.20:7"),
+        ] {
+            let rule = parse_hostfwd(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(rule.to_string(), shown);
+            // What the protocol shows parses back to the same rule.
+            assert_eq!(parse_hostfwd(shown), Ok(rule));
+        }
+        for (bad, why) in [
+            ("tcp:8080", "no '-'"),
+            ("tcp::8080-:0", "the guest port cannot be 0"),
+            ("tcp::8080-10.0.2.2:80", "10.0.2.2 is not a guest address"),
+            ("tcp::99999-:80", "bad host port '99999'"),
+        ] {
+            let e = parse_hostfwd(bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+    }
 
     #[test]
     fn network_cards() {

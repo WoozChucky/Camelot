@@ -7,11 +7,11 @@
 
 use avalon_client::{
     device_name, disk_source_text, format_hz, format_size, mac_text, parse_addr, parse_clock,
-    parse_disk_size, parse_disk_source, parse_harts, parse_net, parse_ram, Client, VmAction,
+    parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_ram, Client, VmAction,
 };
 use avalon_proto::{
-    validate_name, DeviceSpec, DiskInfo, DiskSpec, HardwareProfile, NetSpec, PortOwner, SwitchInfo,
-    VmDetails, VmRef, VmSummary, DEFAULT_AVALON_ADDR, DEFAULT_LAKE_ADDR, SECTOR_SIZE,
+    validate_name, DeviceSpec, DiskInfo, DiskSpec, HardwareProfile, NatConfig, NetSpec, PortOwner,
+    SwitchInfo, VmDetails, VmRef, VmSummary, DEFAULT_AVALON_ADDR, DEFAULT_LAKE_ADDR, SECTOR_SIZE,
 };
 use std::fmt;
 use std::io::Write;
@@ -67,12 +67,25 @@ create options:
   --start         start the VM as soon as it is created
 
 Switch commands, sent to Avalon:
-  switch create NAME
-                  a new virtual Ethernet switch, with nothing plugged in
-  switch list     every switch: its ports and whether it is captured
+  switch create NAME [--nat [--hostfwd RULE]...]
+                  a new virtual Ethernet switch, with no cards plugged in.
+                  --nat gives it a NAT gateway: its VMs get addresses by DHCP
+                  on 10.0.2.0/24 and reach the internet and Avalon's host
+                  (10.0.2.2 is the host's 127.0.0.1). --hostfwd forwards a
+                  port of Avalon's host to a VM (repeatable). RULE is
+                  [tcp|udp]:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT, as
+                  QEMU's hostfwd: tcp::8080-:80 forwards 127.0.0.1:8080 to
+                  port 80 of 10.0.2.15, the first VM to ask for an address
+                  (the second gets 10.0.2.16: tcp::2222-10.0.2.16:22)
+  switch nat NAME [--hostfwd RULE]...
+                  give a switch a NAT gateway
+  switch nat NAME --off
+                  take a switch's NAT gateway away
+  switch list     every switch: its ports, NAT and capture
   switch show NAME
                   one switch's ports, with frames and bytes in and out and
-                  frames dropped for want of room
+                  frames dropped for want of room; its gateway's forwarded
+                  ports and addresses given out
   switch attach SWITCH VM [--card N]
                   plug network card N (default 0) of VM into SWITCH
   switch detach VM [--card N]
@@ -137,6 +150,12 @@ pub enum Command {
     },
     SwitchCreate {
         name: String,
+        nat: Option<NatConfig>,
+    },
+    /// Give a switch a NAT gateway, or take it away (`None`).
+    SwitchNat {
+        name: String,
+        nat: Option<NatConfig>,
     },
     SwitchList,
     SwitchShow {
@@ -207,7 +226,7 @@ pub fn run(args: &[String], out: &mut dyn Write) -> Result<(), Failure> {
 // ---- Parsing ----
 
 /// Every option, and whether it takes a value.
-const OPTIONS: [(&str, bool); 13] = [
+const OPTIONS: [(&str, bool); 16] = [
     ("--server", true),
     ("--lake", true),
     ("--name", true),
@@ -221,10 +240,13 @@ const OPTIONS: [(&str, bool); 13] = [
     ("--net", true),
     ("--card", true),
     ("--stop", false),
+    ("--nat", false),
+    ("--hostfwd", true),
+    ("--off", false),
 ];
 
 /// Options that may be given more than once.
-const REPEATABLE: [&str; 3] = ["--disk", "--disk-ro", "--net"];
+const REPEATABLE: [&str; 4] = ["--disk", "--disk-ro", "--net", "--hostfwd"];
 
 /// Parses a command line (without the program name). Options may come before or after
 /// the command, as `--opt value` or `--opt=value`; `--` ends the options.
@@ -320,6 +342,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         Command::DiskList => "disk list",
         Command::DiskDelete { .. } => "disk delete",
         Command::SwitchCreate { .. } => "switch create",
+        Command::SwitchNat { .. } => "switch nat",
         Command::SwitchList => "switch list",
         Command::SwitchShow { .. } => "switch show",
         Command::SwitchAttach { .. } => "switch attach",
@@ -474,7 +497,7 @@ fn parse_switch(
     rest: &[&str],
     options: &[(&'static str, String)],
 ) -> Result<(Command, &'static [&'static str]), String> {
-    const WORDS: &str = "create, list, show, attach, detach, capture or delete";
+    const WORDS: &str = "create, nat, list, show, attach, detach, capture or delete";
     let Some((&word, rest)) = rest.split_first() else {
         return Err(format!("'switch' needs a command: {WORDS}"));
     };
@@ -488,11 +511,47 @@ fn parse_switch(
             },
         }
     };
+    // The --hostfwd rules, in order, as a gateway's configuration.
+    let gateway = || -> Result<NatConfig, String> {
+        let hostfwd = options
+            .iter()
+            .filter(|(f, _)| *f == "--hostfwd")
+            .map(|(_, rule)| parse_hostfwd(rule).map_err(|e| format!("--hostfwd: {e}")))
+            .collect::<Result<_, _>>()?;
+        Ok(NatConfig { hostfwd })
+    };
+    let forwards = options.iter().any(|(f, _)| *f == "--hostfwd");
     match word {
         "create" => {
             let name = switch_argument(word, rest)?;
             validate_name(&name)?;
-            Ok((Command::SwitchCreate { name }, &["--server"]))
+            let nat = match (option("--nat").is_some(), forwards) {
+                (true, _) => Some(gateway()?),
+                (false, true) => {
+                    return Err("'switch create' takes --hostfwd only with --nat (ports are \
+                                forwarded by the switch's NAT gateway)"
+                        .into())
+                }
+                (false, false) => None,
+            };
+            Ok((
+                Command::SwitchCreate { name, nat },
+                &["--server", "--nat", "--hostfwd"],
+            ))
+        }
+        "nat" => {
+            let name = switch_argument(word, rest)?;
+            let nat = match (option("--off").is_some(), forwards) {
+                (false, _) => Some(gateway()?),
+                (true, false) => None,
+                (true, true) => {
+                    return Err("'switch nat' takes --hostfwd or --off, not both".into());
+                }
+            };
+            Ok((
+                Command::SwitchNat { name, nat },
+                &["--server", "--hostfwd", "--off"],
+            ))
         }
         "list" => {
             no_arguments("switch list", rest)?;
@@ -613,11 +672,27 @@ pub fn execute(invocation: &Invocation, out: &mut dyn Write) -> Result<(), Failu
                 .map_err(failed)?;
             format!("deleted disk {name}\n")
         }
-        Command::SwitchCreate { name } => {
-            connect("Avalon", &invocation.server)?
-                .create_switch(name)
-                .map_err(failed)?;
-            format!("created switch {name}\n")
+        Command::SwitchCreate { name, nat } => {
+            let mut avalon = connect("Avalon", &invocation.server)?;
+            avalon.create_switch_with(name, nat.clone()).map_err(failed)?;
+            match nat {
+                None => format!("created switch {name}\n"),
+                Some(_) => format!(
+                    "created switch {name} with a NAT gateway\n{}",
+                    forwarded(&mut avalon, name)?
+                ),
+            }
+        }
+        Command::SwitchNat { name, nat } => {
+            let mut avalon = connect("Avalon", &invocation.server)?;
+            avalon.set_switch_nat(name, nat.clone()).map_err(failed)?;
+            match nat {
+                None => format!("took the NAT gateway of switch {name} away\n"),
+                Some(_) => format!(
+                    "gave switch {name} a NAT gateway\n{}",
+                    forwarded(&mut avalon, name)?
+                ),
+            }
         }
         Command::SwitchList => switch_table(
             &connect("Avalon", &invocation.server)?
@@ -666,6 +741,19 @@ pub fn execute(invocation: &Invocation, out: &mut dyn Write) -> Result<(), Failu
         }
     };
     write_out(out, &text)
+}
+
+/// The ports the gateway of switch `name` forwards, one line each, as bound (a host
+/// port 0 is the one the system picked).
+fn forwarded(avalon: &mut Client, name: &str) -> Result<String, Failure> {
+    let switches = avalon.list_switches().map_err(failed)?;
+    let rules = switches
+        .iter()
+        .find(|s| s.name == name)
+        .and_then(|s| s.nat.as_ref())
+        .map(|nat| nat.hostfwd.as_slice())
+        .unwrap_or_default();
+    Ok(rules.iter().map(|r| format!("forwarding {r}\n")).collect())
 }
 
 fn connect(what: &str, addr: &str) -> Result<Client, Failure> {
@@ -869,20 +957,33 @@ pub fn switch_table(switches: &[SwitchInfo]) -> String {
             vec![
                 s.name.clone(),
                 s.ports.len().to_string(),
+                if s.nat.is_some() { "yes" } else { "no" }.into(),
                 s.capture.clone().unwrap_or_else(|| "no".into()),
             ]
         })
         .collect();
-    table(&["NAME", "PORTS", "CAPTURE"], &rows)
+    table(&["NAME", "PORTS", "NAT", "CAPTURE"], &rows)
 }
 
-/// `switch show`: a switch and its ports' counters.
+/// `switch show`: a switch, its gateway, and its ports' counters.
 pub fn switch_details(switch: &SwitchInfo) -> String {
     let mut text = format!(
         "switch   {}\ncapture  {}\n",
         switch.name,
         switch.capture.as_deref().unwrap_or("no")
     );
+    match &switch.nat {
+        None => text += "nat      no\n",
+        Some(nat) => {
+            text += "nat      10.0.2.0/24, gateway and host 10.0.2.2, DNS 10.0.2.3\n";
+            for rule in &nat.hostfwd {
+                text += &format!("forward  {rule}\n");
+            }
+            for lease in &nat.leases {
+                text += &format!("lease    {} {}\n", lease.addr, mac_text(lease.mac));
+            }
+        }
+    }
     if switch.ports.is_empty() {
         return text + "ports    none\n";
     }
@@ -891,10 +992,13 @@ pub fn switch_details(switch: &SwitchInfo) -> String {
         .ports
         .iter()
         .map(|p| {
-            let PortOwner::Card { vm, card } = p.owner;
+            let (vm, card) = match p.owner {
+                PortOwner::Card { vm, card } => (vm.to_string(), card.to_string()),
+                PortOwner::Gateway => ("gateway".into(), "-".into()),
+            };
             vec![
-                vm.to_string(),
-                card.to_string(),
+                vm,
+                card,
                 mac_text(p.mac),
                 p.in_frames.to_string(),
                 p.in_bytes.to_string(),
@@ -1267,7 +1371,50 @@ devices  2
         let name = |n: &str| n.to_string();
         assert_eq!(
             command("switch create lan"),
-            Command::SwitchCreate { name: name("lan") }
+            Command::SwitchCreate {
+                name: name("lan"),
+                nat: None
+            }
+        );
+        let rule = |text: &str| avalon_client::parse_hostfwd(text).unwrap();
+        assert_eq!(
+            command("switch create wan --nat"),
+            Command::SwitchCreate {
+                name: name("wan"),
+                nat: Some(NatConfig::default())
+            }
+        );
+        assert_eq!(
+            command("switch create wan --nat --hostfwd tcp::8080-:80 --hostfwd=udp::5353-10.0.2.16:53"),
+            Command::SwitchCreate {
+                name: name("wan"),
+                nat: Some(NatConfig {
+                    hostfwd: vec![rule("tcp::8080-:80"), rule("udp::5353-10.0.2.16:53")]
+                })
+            }
+        );
+        assert_eq!(
+            command("switch nat wan --hostfwd 2222-10.0.2.16:22"),
+            Command::SwitchNat {
+                name: name("wan"),
+                nat: Some(NatConfig {
+                    hostfwd: vec![rule("tcp:127.0.0.1:2222-10.0.2.16:22")]
+                })
+            }
+        );
+        assert_eq!(
+            command("switch nat wan"),
+            Command::SwitchNat {
+                name: name("wan"),
+                nat: Some(NatConfig::default())
+            }
+        );
+        assert_eq!(
+            command("switch nat wan --off"),
+            Command::SwitchNat {
+                name: name("wan"),
+                nat: None
+            }
         );
         assert_eq!(command("switch list"), Command::SwitchList);
         assert_eq!(
@@ -1338,7 +1485,7 @@ devices  2
             ]
         );
         for (args, why) in [
-            ("switch", "'switch' needs a command: create, list, show"),
+            ("switch", "'switch' needs a command: create, nat, list, show"),
             ("switch flip lan", "unknown switch command 'flip'"),
             ("switch create", "'switch create' needs a switch name"),
             ("switch create Lan", "'Lan' is not a valid name"),
@@ -1377,6 +1524,34 @@ devices  2
             ("switch list --lake x", "'switch list' does not take --lake"),
             ("switch show lan --card 1", "'switch show' does not take --card"),
             ("switch detach a --stop", "'switch detach' does not take --stop"),
+            (
+                "switch create wan --hostfwd tcp::1-:2",
+                "'switch create' takes --hostfwd only with --nat",
+            ),
+            (
+                "switch create wan --nat --hostfwd tcp::1-:0",
+                "--hostfwd: 'tcp::1-:0' is not a forwarding rule (the guest port cannot be 0",
+            ),
+            (
+                "switch create wan --nat --hostfwd 8080",
+                "--hostfwd: '8080' is not a forwarding rule (no '-'",
+            ),
+            ("switch create wan --off", "'switch create' does not take --off"),
+            ("switch create wan --nat --nat", "--nat is given twice"),
+            ("switch nat", "'switch nat' needs a switch name"),
+            (
+                "switch nat wan --off --hostfwd 1-:2",
+                "'switch nat' takes --hostfwd or --off, not both",
+            ),
+            ("switch nat wan --nat", "'switch nat' does not take --nat"),
+            (
+                "switch show wan --hostfwd 1-:2",
+                "'switch show' does not take --hostfwd",
+            ),
+            (
+                "create a.elf --name a --hostfwd 1-:2",
+                "'create' does not take --hostfwd",
+            ),
             ("list --card 1", "'list' does not take --card"),
             (
                 "create a.elf --name a --net LAN",
@@ -1409,19 +1584,47 @@ devices  2
         let lan = SwitchInfo {
             name: "lan".into(),
             capture: Some("lan.pcap".into()),
+            nat: None,
             ports: vec![port(1, 0, 1, 3), port(12, 1, 2, 1000)],
         };
         let dmz = SwitchInfo {
             name: "dmz".into(),
             capture: None,
+            nat: None,
             ports: Vec::new(),
         };
+        let wan = SwitchInfo {
+            name: "wan".into(),
+            capture: None,
+            nat: Some(avalon_proto::NatInfo {
+                hostfwd: vec![avalon_client::parse_hostfwd("tcp::5555-10.0.2.16:7").unwrap()],
+                leases: vec![
+                    avalon_proto::Lease {
+                        mac: [0x02, 0xca, 0, 0, 0, 1],
+                        addr: "10.0.2.15".parse().unwrap(),
+                    },
+                    avalon_proto::Lease {
+                        mac: [0x02, 0xca, 0, 0, 0, 2],
+                        addr: "10.0.2.16".parse().unwrap(),
+                    },
+                ],
+            }),
+            ports: vec![
+                SwitchPort {
+                    owner: PortOwner::Gateway,
+                    mac: [0x52, 0x55, 0x0a, 0, 2, 2],
+                    ..port(0, 0, 0, 7)
+                },
+                port(3, 0, 1, 5),
+            ],
+        };
         assert_eq!(
-            switch_table(&[dmz.clone(), lan.clone()]),
+            switch_table(&[dmz.clone(), lan.clone(), wan.clone()]),
             "\
-NAME  PORTS  CAPTURE
-dmz   0      no
-lan   2      lan.pcap
+NAME  PORTS  NAT  CAPTURE
+dmz   0      no   no
+lan   2      no   lan.pcap
+wan   2      yes  no
 "
         );
         assert_eq!(
@@ -1429,13 +1632,32 @@ lan   2      lan.pcap
             "\
 switch   lan
 capture  lan.pcap
+nat      no
 ports    2
 VM  CARD  MAC                IN    IN-BYTES  OUT   OUT-BYTES  DROPPED
 1   0     02:ca:00:00:00:01  3     180       4     240        1
 12  1     02:ca:00:00:00:02  1000  60000     1001  60060      500
 "
         );
-        assert_eq!(switch_details(&dmz), "switch   dmz\ncapture  no\nports    none\n");
+        assert_eq!(
+            switch_details(&dmz),
+            "switch   dmz\ncapture  no\nnat      no\nports    none\n"
+        );
+        assert_eq!(
+            switch_details(&wan),
+            "\
+switch   wan
+capture  no
+nat      10.0.2.0/24, gateway and host 10.0.2.2, DNS 10.0.2.3
+forward  tcp:127.0.0.1:5555-10.0.2.16:7
+lease    10.0.2.15 02:ca:00:00:00:01
+lease    10.0.2.16 02:ca:00:00:00:02
+ports    2
+VM       CARD  MAC                IN  IN-BYTES  OUT  OUT-BYTES  DROPPED
+gateway  -     52:55:0a:00:02:02  7   420       8    480        3
+3        0     02:ca:00:00:00:01  5   300       6    360        2
+"
+        );
     }
 
     #[test]

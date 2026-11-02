@@ -60,6 +60,7 @@ fn ping_and_pong_on_a_switch() {
         "\
 switch   lan
 capture  no
+nat      no
 ports    1
 VM  CARD  MAC                IN  IN-BYTES  OUT  OUT-BYTES  DROPPED
 1   0     02:ca:00:00:00:02  0   0         0    0          0
@@ -74,7 +75,7 @@ VM  CARD  MAC                IN  IN-BYTES  OUT  OUT-BYTES  DROPPED
     );
     assert_eq!(
         ok(addr, &["switch", "list"]),
-        format!("NAME  PORTS  CAPTURE\nlan   1      {capture}\n")
+        format!("NAME  PORTS  NAT  CAPTURE\nlan   1      no   {capture}\n")
     );
     // Ping at 1 MHz: its few million polls for the answer leave pong three seconds.
     assert_eq!(
@@ -110,7 +111,7 @@ VM  CARD  MAC                IN  IN-BYTES  OUT  OUT-BYTES  DROPPED
     // Both machines have ended: their cards are unplugged, but still listed.
     assert_eq!(
         ok(addr, &["switch", "list"]),
-        "NAME  PORTS  CAPTURE\nlan   0      no\n"
+        "NAME  PORTS  NAT  CAPTURE\nlan   0      no   no\n"
     );
     assert!(ok(addr, &["info", "ping"]).contains("\nnets     02:ca:00:00:00:01 unplugged\n"));
     let list = ok(addr, &["list"]);
@@ -161,7 +162,7 @@ fn cards_plug_in_and_out() {
         .contains("\nnets     02:00:00:00:00:0a on switch lan\n         02:00:00:00:00:0b on switch lan\n"));
     assert_eq!(
         ok(addr, &["switch", "list"]),
-        "NAME  PORTS  CAPTURE\ndmz   0      no\nlan   2      no\n"
+        "NAME  PORTS  NAT  CAPTURE\ndmz   0      no   no\nlan   2      no   no\n"
     );
 
     // What the server refuses.
@@ -210,7 +211,123 @@ fn cards_plug_in_and_out() {
         .contains("\nnets     02:00:00:00:00:0a unplugged\n         02:00:00:00:00:0b unplugged\n"));
     assert_eq!(
         ok(addr, &["switch", "list"]),
-        "NAME  PORTS  CAPTURE\ndmz   0      no\n"
+        "NAME  PORTS  NAT  CAPTURE\ndmz   0      no   no\n"
+    );
+    server.stop().unwrap();
+}
+
+/// The port `rule` (as Round Table prints it, `forwarding tcp:127.0.0.1:N-...`)
+/// forwards from.
+fn forwarded_port(line: &str) -> u16 {
+    let host = line
+        .strip_prefix("forwarding tcp:127.0.0.1:")
+        .unwrap_or_else(|| panic!("{line}"));
+    host.split('-').next().unwrap().parse().unwrap()
+}
+
+#[test]
+fn a_switch_with_a_nat_gateway() {
+    let server = avalon(512);
+    let addr = server.addr();
+    // Port 0: Avalon's host picks one, and Round Table says which.
+    let created = ok(
+        addr,
+        &["switch", "create", "wan", "--nat", "--hostfwd", "tcp::0-:7"],
+    );
+    let mut lines = created.lines();
+    assert_eq!(lines.next(), Some("created switch wan with a NAT gateway"));
+    let port = forwarded_port(lines.next().unwrap());
+    assert!(created.ends_with(&format!("{port}-10.0.2.15:7\n")), "{created}");
+    assert_eq!(
+        ok(addr, &["switch", "list"]),
+        "NAME  PORTS  NAT  CAPTURE\nwan   1      yes  no\n"
+    );
+
+    // A VM on it gets the first lease (its address is made up from its name: VM
+    // web's card 0 is 02:66:b7:0f:2e:09).
+    ok(
+        addr,
+        &[
+            "create",
+            "--name",
+            "web",
+            "--ram",
+            "16",
+            "--net",
+            "wan",
+            "--start",
+            &net_example("net-user"),
+        ],
+    );
+    let start = Instant::now();
+    let show = loop {
+        let show = ok(addr, &["switch", "show", "wan"]);
+        if show.contains("lease ") {
+            break show;
+        }
+        assert!(start.elapsed() < SLOW, "no lease: {show}");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let mut lines = show.lines();
+    assert_eq!(
+        lines.by_ref().take(6).collect::<Vec<_>>(),
+        [
+            "switch   wan",
+            "capture  no",
+            "nat      10.0.2.0/24, gateway and host 10.0.2.2, DNS 10.0.2.3",
+            &format!("forward  tcp:127.0.0.1:{port}-10.0.2.15:7"),
+            "lease    10.0.2.15 02:66:b7:0f:2e:09",
+            "ports    2",
+        ]
+    );
+    let rows: Vec<&str> = lines.skip(1).collect();
+    assert!(
+        rows[0].starts_with("gateway  -     52:55:0a:00:02:02  "),
+        "{show}"
+    );
+    assert!(
+        rows[1].starts_with("1        0     02:66:b7:0f:2e:09  "),
+        "{show}"
+    );
+
+    // One gateway per switch; the port is the gateway's while it lives.
+    assert_eq!(
+        refused(addr, &["switch", "nat", "wan"]),
+        "already exists: switch 'wan' has a NAT gateway already; take it away first"
+    );
+    let rule = format!("tcp::{port}-:22");
+    let taken = refused(addr, &["switch", "create", "lan", "--nat", "--hostfwd", &rule]);
+    assert!(
+        taken.starts_with(&format!(
+            "I/O error: switch 'lan': cannot forward the port: hostfwd tcp:127.0.0.1:{port}-10.0.2.15:22: "
+        )),
+        "{taken}"
+    );
+    assert_eq!(
+        refused(addr, &["switch", "nat", "lan", "--off"]),
+        "no such switch: no switch named 'lan'"
+    );
+
+    // Taken away, the gateway lets go of its port; given back, it binds it again.
+    assert_eq!(
+        ok(addr, &["switch", "nat", "wan", "--off"]),
+        "took the NAT gateway of switch wan away\n"
+    );
+    assert_eq!(
+        refused(addr, &["switch", "nat", "wan", "--off"]),
+        "invalid state: switch 'wan' has no NAT gateway"
+    );
+    assert!(ok(addr, &["switch", "show", "wan"]).contains("\nnat      no\nports    1\n"));
+    assert_eq!(
+        ok(addr, &["switch", "nat", "wan", "--hostfwd", &rule]),
+        format!("gave switch wan a NAT gateway\nforwarding tcp:127.0.0.1:{port}-10.0.2.15:22\n")
+    );
+
+    // Deleting the switch frees the port for a new one.
+    assert_eq!(ok(addr, &["switch", "delete", "wan"]), "deleted switch wan\n");
+    assert_eq!(
+        ok(addr, &["switch", "create", "lan", "--nat", "--hostfwd", &rule]),
+        format!("created switch lan with a NAT gateway\nforwarding tcp:127.0.0.1:{port}-10.0.2.15:22\n")
     );
     server.stop().unwrap();
 }

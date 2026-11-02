@@ -118,6 +118,13 @@ impl Server {
         self.leases.get(mac).copied()
     }
 
+    /// Every lease, in address order.
+    pub fn leases(&self) -> Vec<(Mac, Ipv4Addr)> {
+        let mut all: Vec<(Mac, Ipv4Addr)> = self.leases.iter().map(|(m, ip)| (*m, *ip)).collect();
+        all.sort_by_key(|(_, ip)| *ip);
+        all
+    }
+
     /// `mac`'s lease, or the address it would get. `None` when the pool is used up.
     fn lease_for(&self, mac: Mac) -> Option<Ipv4Addr> {
         if let Some(ip) = self.leases.get(&mac) {
@@ -294,6 +301,9 @@ mod tests {
         assert_eq!(s.handle(&req).unwrap().ip, Ipv4Addr::new(10, 0, 2, 16));
         let req = parse(&client_message(DISCOVER, 2, MAC1, None)).unwrap();
         assert_eq!(s.handle(&req).unwrap().ip, crate::FIRST_LEASE);
+        // An offer holds its address for the card, in address order.
+        let second = Ipv4Addr::new(10, 0, 2, 16);
+        assert_eq!(s.leases(), [(MAC1, crate::FIRST_LEASE), (MAC2, second)]);
     }
 
     #[test]

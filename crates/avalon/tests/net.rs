@@ -55,7 +55,13 @@ fn ok(conn: &mut Conn, msg: Message) {
 }
 
 fn create_switch(conn: &mut Conn, name: &str) {
-    ok(conn, Message::CreateSwitch { name: name.into() });
+    ok(
+        conn,
+        Message::CreateSwitch {
+            name: name.into(),
+            nat: None,
+        },
+    );
 }
 
 fn switches(conn: &mut Conn) -> Vec<SwitchInfo> {
@@ -215,19 +221,6 @@ fn two_vms_on_a_switch_exchange_frames_and_another_switch_sees_nothing() {
     };
     assert_eq!(text(&frames[0]), "Hello from ping!");
     assert_eq!(text(&frames[1]), "Hello back from pong!");
-}
-
-/// The frames of a pcap file, after its 24-byte header.
-fn pcap_frames(bytes: &[u8]) -> Vec<Vec<u8>> {
-    assert_eq!(bytes[..4], 0xa1b2_c3d4u32.to_le_bytes());
-    let mut rest = &bytes[24..];
-    let mut frames = Vec::new();
-    while !rest.is_empty() {
-        let len = u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize;
-        frames.push(rest[16..16 + len].to_vec());
-        rest = &rest[16 + len..];
-    }
-    frames
 }
 
 /// Sends 1000 broadcast frames as fast as its card takes them, then exits: card 0's
@@ -481,13 +474,25 @@ fn switch_requests_refuse_what_cannot_be_done() {
     // Names.
     for bad in ["", "LAN", "con", "42", "a/b"] {
         assert_eq!(
-            e(&mut rt, Message::CreateSwitch { name: bad.into() }),
+            e(
+                &mut rt,
+                Message::CreateSwitch {
+                    name: bad.into(),
+                    nat: None
+                }
+            ),
             ErrorCode::InvalidName,
             "{bad:?}"
         );
     }
     assert_eq!(
-        e(&mut rt, Message::CreateSwitch { name: "lan".into() }),
+        e(
+            &mut rt,
+            Message::CreateSwitch {
+                name: "lan".into(),
+                nat: None
+            }
+        ),
         ErrorCode::AlreadyExists
     );
     for missing in [
@@ -630,7 +635,8 @@ fn switch_requests_refuse_what_cannot_be_done() {
         e(
             &mut rt,
             Message::CreateSwitch {
-                name: "one-more".into()
+                name: "one-more".into(),
+                nat: None
             }
         ),
         ErrorCode::OverBudget

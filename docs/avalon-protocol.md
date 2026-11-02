@@ -1,4 +1,4 @@
-# Avalon Protocol v4
+# Avalon Protocol v5
 
 The wire protocol of the Avalon platform. Every program in it speaks this protocol:
 
@@ -6,7 +6,7 @@ The wire protocol of the Avalon platform. Every program in it speaks this protoc
 |---|---|---|
 | **Avalon** | hypervisor server: runs N Grail VMs | serves session, VM control, console, screen and input, virtual network |
 | **Round Table** | control CLI | uses VM control and virtual network (and disk management against Lake) |
-| **Pendragon** | web console ([`pendragon.md`](pendragon.md)) | uses VM control and console (Avalon), disk management (Lake) |
+| **Pendragon** | web console ([`pendragon.md`](pendragon.md)) | uses VM control, console and virtual network (Avalon), disk management (Lake) |
 | **Herald** | attaches to one VM | uses console, screen and input |
 | **Lake** | storage server: serves disk images | serves session, block I/O, disk management |
 
@@ -16,7 +16,7 @@ The implementation is the `avalon-proto` crate (`crates/avalon-proto`): the mess
 
 - TCP, through `std::net`. One connection is one session; either side ends it by closing the socket.
 - Servers listen on loopback by default: Avalon on `127.0.0.1:7400`, Lake on `127.0.0.1:7401`. Listening on any other interface takes an explicit command-line flag.
-- **No authentication and no encryption** (versions 1 to 4). Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
+- **No authentication and no encryption** (versions 1 to 5). Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
 - A client and a server are both just byte streams to the protocol; tests run it over in-memory buffers as well as sockets.
 
 ## 2. Framing
@@ -62,6 +62,7 @@ Payloads are sequences of fields, in the order the message tables list them, wit
 | `bool` | `u8`: 0 = false, 1 = true; anything else is invalid |
 | `bytes` | `u32` length, then that many bytes |
 | `mac` | 6 bytes, a MAC address in wire order (`02 ca 00 00 00 01` is `02:ca:00:00:00:01`) |
+| `ipv4` | 4 bytes, an IPv4 address in wire order (`0a 00 02 0f` is 10.0.2.15) |
 | `string` | `bytes` holding UTF-8; invalid UTF-8 is invalid |
 | `option<T>` | `u8` tag: 0 = none, 1 = followed by a `T`; other tags are invalid |
 | `list<T>` | `u32` count, then that many `T`s |
@@ -82,6 +83,7 @@ Rules beyond the field types, enforced by both the encoder and the decoder (`Mes
 - `BlockData`, `BlockWrite`: `data` a non-zero whole number of 512-byte sectors, at most 2048 sectors (1 MiB).
 - `Hello`: the payload starts with the magic `"AVLN"`.
 - `Error`: the crate's `ErrorCode::Other(n)` stands for a code this version has no name for, so it may not carry a named code's number (it would decode as the named code).
+- `PortForward` (in `CreateSwitch`, `SetSwitchNat` and `SwitchList`): `guest_port` not 0, and `guest_addr` a guest address: in 10.0.2.0/24, and not .0, .2 (the gateway), .3 (the DNS server) or .255.
 
 Other values (names, hardware profiles, ids, sector numbers) are checked by the server, which answers with a precise error code (section 5) rather than `Malformed`.
 
@@ -156,15 +158,24 @@ A position past the screen's edges is clamped to them by the server (the device 
 
 **DiskInfo**: `name: string`, `sectors: u64` (512-byte sectors), `readers: u32` (read-only attachments now), `writer: bool` (a writer has it attached).
 
-**SwitchInfo**, one virtual switch: `name: string`, `capture: option<string>` (the file on the server's host it is being captured into, if it is), `ports: list<SwitchPort>` (in the order they were plugged in).
+**SwitchInfo**, one virtual switch: `name: string`, `capture: option<string>` (the file on the server's host it is being captured into, if it is), `nat: option<NatInfo>` (its NAT gateway, if it has one), `ports: list<SwitchPort>` (in the order they were plugged in, the gateway's among them).
 
-**SwitchPort**, one port of a switch and its counters: `owner: PortOwner`, `mac: mac` (the address of what is plugged in), `in_frames: u64`, `in_bytes: u64` (what the switch received on the port: what the card sent), `out_frames: u64`, `out_bytes: u64` (what it queued for the port, for the card to receive), `dropped: u64` (frames for this port lost because its queue was full). Counters start at 0 when the card is plugged in.
+**SwitchPort**, one port of a switch and its counters: `owner: PortOwner`, `mac: mac` (the address of what is plugged in), `in_frames: u64`, `in_bytes: u64` (what the switch received on the port: what the card or gateway sent), `out_frames: u64`, `out_bytes: u64` (what it queued for the port, for the card or gateway to receive), `dropped: u64` (frames for this port lost because its queue was full). Counters start at 0 when the card or gateway is plugged in.
 
 **PortOwner**, what is plugged into a port:
 
 | Tag | Owner | Fields |
 |---|---|---|
 | 1 | a VM's network card | `vm: u32` (id), `card: u8` (its number) |
+| 2 | the switch's NAT gateway (section 6.7, **NAT**) | |
+
+**NatConfig**, the NAT gateway a request asks for: `hostfwd: list<PortForward>` (host ports to forward to guests, in order; may be empty; at most 64, `MAX_FORWARDS`: more is malformed).
+
+**NatInfo**, a switch's NAT gateway as it is: `hostfwd: list<PortForward>` (the rules as bound, in the order given: a host port 0 shows the port the system picked), `leases: list<Lease>` (the addresses its DHCP server has given, in address order).
+
+**PortForward**, one forwarded port: `proto: u8` (1 TCP, 2 UDP; other values are invalid), `host_addr: ipv4`, `host_port: u16` (where the gateway listens on the server's host; port 0 lets the system pick), `guest_addr: ipv4`, `guest_port: u16` (where it passes each connection or datagram, from 10.0.2.2). Round Table and Pendragon write it as QEMU's `hostfwd` rules: `tcp:127.0.0.1:8080-10.0.2.15:80`.
+
+**Lease**: `mac: mac` (a card's address), `addr: ipv4` (its address on the switch's network).
 
 **Names**: VM, disk and switch names (`validate_name`) are 1 to 64 bytes of lowercase ASCII letters, digits, `.`, `_` and `-`, and
 
@@ -300,6 +311,7 @@ Codes are grouped by their high byte. Req = request, Rep = reply, Ev = event; C�
 | 0x0605 | `AttachCard` | Req | C→S | `Ok` |
 | 0x0606 | `DetachCard` | Req | C→S | `Ok` |
 | 0x0607 | `CaptureSwitch` | Req | C→S | `Ok` |
+| 0x0608 | `SetSwitchNat` | Req | C→S | `Ok` |
 
 Any request can also be answered by `Error`. A server answers requests from a group it does not serve with `Error(Unsupported)`.
 
@@ -314,11 +326,11 @@ Any request can also be answered by `Error`. A server answers requests from a gr
 | `Ping` | `token: u32` |
 | `Pong` | `token: u32` (the `Ping`'s) |
 
-Example, `Hello` version 4 from agent `"rt"`:
+Example, `Hello` version 5 from agent `"rt"`:
 
 ```
-0e 00 00 00  01 00  41 56 4c 4e  04 00  02 00 00 00  72 74
-length 14    Hello  "AVLN"       v4     agent "rt"
+0e 00 00 00  01 00  41 56 4c 4e  05 00  02 00 00 00  72 74
+length 14    Hello  "AVLN"       v5     agent "rt"
 ```
 
 ### 6.2 VM control
@@ -430,15 +442,16 @@ Avalon's VMs talk to each other over virtual Ethernet switches, kept by the serv
 
 | Message | Payload | Notes |
 |---|---|---|
-| `CreateSwitch` | `name: string` | a new empty switch. Errors: `InvalidName` (switch names follow the rules for names, section 3), `AlreadyExists`, `OverBudget` (Avalon keeps at most 64 switches) |
-| `DeleteSwitch` | `name: string` | unplugs every card on it (their links go down: their guests see the link-up bit clear, and send into nothing), stops its capture and frees its name. Errors: `NoSuchSwitch` |
+| `CreateSwitch` | `name: string`, `nat: option<NatConfig>` | a new switch with no cards plugged in, and with a NAT gateway (below) if `nat` is given. Errors: `InvalidName` (switch names follow the rules for names, section 3), `AlreadyExists`, `OverBudget` (Avalon keeps at most 64 switches), `Io` (a forwarded host port cannot be bound: in use, or an address the host does not have; the message names the rule, and no switch is created) |
+| `DeleteSwitch` | `name: string` | unplugs every card on it (their links go down: their guests see the link-up bit clear, and send into nothing), stops its capture, ends its NAT gateway and frees its name. The gateway's host sockets are closed before the `Ok`, so its forwarded ports can be bound again at once. Errors: `NoSuchSwitch` |
 | `ListSwitches` | empty | |
 | `SwitchList` | `switches: list<SwitchInfo>` | in name order, each with its ports and their counters |
 | `AttachCard` | `vm: VmRef`, `card: u8`, `switch: string` | plugs card `card` of the VM into the switch, link up. Errors: `NoSuchVm`, `NoSuchCard`, `NoSuchSwitch`, `Busy` (the card is plugged in already, into this switch or another: detach it first), `AlreadyExists` (a card with its address is on that switch), `InvalidState` (the VM's machine has ended) |
 | `DetachCard` | `vm: VmRef`, `card: u8` | unplugs the card, link down. Errors: `NoSuchVm`, `NoSuchCard`, `InvalidState` (it is not plugged in) |
 | `CaptureSwitch` | `switch: string`, `path: option<string>` | with a path, starts capturing every frame that enters the switch into a new pcap file at `path` on the server's host (replacing any file there); with none, stops and closes the file. Errors: `NoSuchSwitch`, `Busy` (it is being captured already), `Io` (the file cannot be created; when stopping, writing it failed, see **Captures**), `InvalidState` (stopping a switch that is not being captured) |
+| `SetSwitchNat` | `switch: string`, `nat: option<NatConfig>` | with a `NatConfig`, gives the switch a NAT gateway (below); with none, takes its gateway away: its port disappears, its host sockets are closed before the `Ok` (the host ends of its flows see the connection closed), its guests' flows are dropped without a word (no reset is sent to them), and its leases are forgotten. Errors: `NoSuchSwitch`, `AlreadyExists` (it has a gateway already: take it away first; or a card with the gateway's address `52:55:0a:00:02:02` is plugged in), `Io` (as for `CreateSwitch`), `InvalidState` (taking away a gateway it does not have) |
 
-**Forwarding.** A switch is a learning Ethernet switch. When a frame comes in on a port, the switch learns that its source address is reachable through that port, then sends it on: to the one port its destination address was learned on; to every other port (**flooding**) if the destination has not been learned, or is a broadcast or multicast (group) address; nowhere (**filtered**) if the destination was learned on the port the frame came in on. Group source addresses are never learned. A learned address is forgotten when no frame from it has come in for 300 seconds (**ageing**), so a card that moves to another port or switch is found again by flooding, and when its card is unplugged. A switch learns at most 4096 addresses: when its table is full of fresh entries, frames from new addresses are still forwarded, but their addresses are not learned. Frames shorter than an Ethernet header (14 bytes) are counted and captured, but not forwarded.
+**Forwarding.** A switch is a learning Ethernet switch. When a frame comes in on a port, the switch learns that its source address is reachable through that port, then sends it on: to the one port its destination address was learned on; to every other port (**flooding**) if the destination has not been learned, or is a broadcast or multicast (group) address; nowhere (**filtered**) if the destination was learned on the port the frame came in on. Group source addresses are never learned. A learned address is forgotten when no frame from it has come in for 300 seconds (**ageing**), so a card that moves to another port or switch is found again by flooding, and when its card is unplugged. A switch learns at most 4096 addresses: when its table is full of fresh entries, frames from new addresses are still forwarded, but their addresses are not learned. Frames shorter than an Ethernet header (14 bytes) are counted and captured, but not forwarded; so are a card's frames whose source is the address of another port on the switch (another card's, or the NAT gateway's), which would otherwise move that address to the sender's port and bring it the frames meant for the other.
 
 **Queues and drops.** Each port has a queue of at most 256 frames waiting for its card. A frame for a full queue is dropped and counted in that port's `dropped`: a card that does not take its frames (its VM paused, stopped, slow, or never started) loses its own frames, never anybody else's, and the VM that sends is never held up by the one that does not receive. Frames still queued when a card is unplugged are lost. A card takes frames as its guest receives them; a VM idling in `wfi` is woken when a frame arrives for it.
 
@@ -446,15 +459,22 @@ Avalon's VMs talk to each other over virtual Ethernet switches, kept by the serv
 
 **Life time.** A switch exists until `DeleteSwitch`, or until the server stops. A card stays plugged in while its VM's machine exists; when the machine ends (the VM is stopped, its program exits, or the VM is destroyed) the card is unplugged, its port disappears from `SwitchList`, and it cannot be plugged in again (`InvalidState`). The card is unplugged before the VM's new state is told to anyone: once a client has `StopVm`'s `Ok`, a `VmStateChanged` to stopped or exited, or a `VmList` or `VmInfo` showing that state, the card is off its switch. The VM's profile in `VmList` and `VmInfo` keeps the card, with its address and no switch. A card that is unplugged sends into nothing: its guest's frames are counted nowhere and lost, as on a card with no cable.
 
+**NAT.** A switch can have one NAT gateway, given when it is created or later (`SetSwitchNat`): the user-mode gateway Grail's `--net user` uses (Excalibur spec section 9.8, "User networking"), which gives the VMs on the switch internet and host access with nothing installed on the host. It is plugged into a port of its own, owner `Gateway`, with the gateway's address `52:55:0a:00:02:02`, and that port behaves like any other: a queue of at most 256 frames (the frames past it dropped and counted), counters, its frames in the switch's capture; and a VM that sends to it is never held up by it, since the gateway runs on a thread of the server's own. The VMs on the switch see the network 10.0.2.0/24 with the gateway at 10.0.2.2 (router, DHCP server, and the host's 127.0.0.1: connecting to 10.0.2.2 reaches a service on the server's host) and a DNS server at 10.0.2.3. One gateway serves every card on the switch, each as a machine of its own:
+
+- **Leases**: its DHCP server gives each card (each MAC address) its own address, from 10.0.2.15 up in the order the cards first ask, and the card keeps it while the gateway lives, across the VM's restarts on the same switch (a VM's generated address follows its name, section 6.7 **Addresses**). `NatInfo.leases` lists them. The pool has 240 addresses; a gateway that has given them all gives no more until it is taken away (`SetSwitchNat` with none) or its switch deleted.
+- **Limits**: the gateway's limits on flows (TCP connections, UDP ports and forwarded UDP clients) count per MAC address: 256 per card, 1024 for the whole gateway. The switch passes the gateway only frames whose source address is the address of the card that sent them, so a guest that makes up source addresses cannot pose as more machines (or take more leases) than it has cards.
+- **Forwarded ports** (`hostfwd`): each `PortForward` binds a host port on the server's host when the gateway is made (by default on 127.0.0.1, so only programs on that host can connect; 0.0.0.0 opens it to the network), and passes each connection or datagram to `guest_addr:guest_port`, from 10.0.2.2. A rule that cannot be bound fails the request (`Io`), which then leaves the switch as it was. `guest_addr` is 10.0.2.15 by default, the first lease. To reach a particular VM, forward to the address its card leases: leases go from 10.0.2.15 up in the order the cards first ask, so the first VM started on a new switch gets 10.0.2.15 and the second 10.0.2.16, and `NatInfo.leases` shows which card has which. A rule may name an address nobody has yet; connections to it wait for a guest to take it (a forwarded TCP connection whose guest does not answer ARP within a second is closed). The rules are fixed while the gateway lives: changing them takes the gateway away and gives a new one, which starts with no leases.
+- Deleting the switch, or taking its gateway away, ends the gateway: its host sockets are closed (before the reply, so the same host ports can be bound again at once; the host ends of its TCP connections see an orderly close, not a reset), the guests' ends of its flows are abandoned (nothing is sent to them: a guest finds out when it next sends and nobody answers), and its leases are forgotten.
+
 **Captures.** A capture writes the classic libpcap format that Wireshark and tcpdump read, exactly as Grail's `--pcap FILE` does (Excalibur spec section 9.8): one record per frame that enters the switch, from any port, before it is forwarded. Frames are written by a thread of the server's own; if it falls more than 1024 frames behind (a slow disk), the frames past that are left out of the capture, but still forwarded. If writing the file fails (a full disk, say), the capture ends there: the file keeps the frames written before the failure, and later frames are not captured. Such a capture is still listed in `SwitchInfo` until it is stopped, and stopping it gets `Io` with the error (it is stopped all the same, so a new one can be started). Deleting the switch ends its capture.
 
 ## 7. Versioning
 
-- The protocol version is a `u16`, currently **4** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
+- The protocol version is a `u16`, currently **5** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
 - Any change to the catalogue bumps the version: a new message type, a new field, a new enum variant or tag, a changed layout or a changed rule. (Unknown codes and tags are errors in the decoder, so an old peer could not read them anyway.)
 - Three things never change, in any version, so that peers of different versions can always tell each other so: the frame header (`u32` length, `u16` type), the `Hello` and `Welcome` messages (codes 0x0001 and 0x0002 and their layouts) and the `Error` message (code 0x0003 and its layout). Error codes are never reused or renumbered; new ones may be added with a version bump.
 - Things that are deliberately open-ended and need no new version: `DeviceEntry.kind` (sysinfo device type codes come from the Excalibur spec), `ScreenAttached.format` values a server chooses to send, free-text fields.
-- This document describes version 4. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
+- This document describes version 5. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
 
 History:
 
@@ -464,6 +484,7 @@ History:
 | 2 | `PointerInput` (0x0306) with the `PointerChange` and `PointerMotion` structures, and the `i8` and `i32` field types, for the guest's pointer device; Avalon serves the screen and input group (section 6.4), which version 1 servers answered with `Unsupported` |
 | 3 | the virtual network group 0x06xx (section 6.7: `CreateSwitch`, `DeleteSwitch`, `ListSwitches`, `SwitchList`, `AttachCard`, `DetachCard`, `CaptureSwitch`) with the `SwitchInfo`, `SwitchPort` and `PortOwner` structures and the `mac` field type; network cards in hardware profiles (`DeviceSpec` tag 2); error codes 19 `NoSuchSwitch` and 20 `NoSuchCard` |
 | 4 | `HardwareProfile.harts` (`u32`, after `nominal_hz`), for multi-hart machines |
+| 5 | NAT gateways on switches (section 6.7, **NAT**): `SetSwitchNat` (0x0608), `CreateSwitch`'s `nat` field, `SwitchInfo`'s `nat` field, `PortOwner` tag 2 (`Gateway`), the `NatConfig`, `NatInfo`, `PortForward` and `Lease` structures (at most `MAX_FORWARDS` 64 forwarded ports per gateway) and the `ipv4` field type |
 
 ## 8. Limits
 
@@ -475,7 +496,11 @@ History:
 | `MAX_NAME_LEN` | 64 | VM, disk and switch names |
 | network cards | 4 per VM | `CreateVm` (`InvalidProfile`) |
 | switches | 64 per Avalon server | `CreateSwitch` (`OverBudget`) |
-| port queue | 256 frames | per switch port; more are dropped and counted |
+| port queue | 256 frames | per switch port (the gateway's too); more are dropped and counted |
+| NAT gateways | 1 per switch | `CreateSwitch`, `SetSwitchNat` (`AlreadyExists`) |
+| `MAX_FORWARDS` | 64 forwarded ports per gateway | `NatConfig` and `NatInfo` (more is malformed) |
+| gateway flows | 256 per card, 1024 per gateway | section 6.7, **NAT** |
+| DHCP leases | 240 per gateway (10.0.2.15 to 10.0.2.254) | |
 | learned addresses | 4096 per switch, forgotten after 300 s | |
 | screen updates | at most one look every 33 ms per VM | Avalon (`SCREEN_INTERVAL`) |
 | viewer backlog | 2 MiB queued, then no screen updates until it drains | Avalon (`SCREEN_BACKLOG`) |

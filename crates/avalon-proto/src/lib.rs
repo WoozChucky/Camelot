@@ -38,7 +38,7 @@ pub use screen::{Rect, Screen};
 
 /// Protocol version carried by the handshake. Both sides must speak the same one; any
 /// change to the message catalogue (a new message, field or enum value) bumps it.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// First four payload bytes of `Hello`, so a server can tell an Avalon client from a
 /// stray connection.
@@ -60,6 +60,10 @@ pub const MAX_BLOCK_SECTORS: u32 = 2048;
 
 /// Longest VM or disk name, in bytes. See [`validate_name`].
 pub const MAX_NAME_LEN: usize = 64;
+
+/// Most forwarded ports (`PortForward` rules) one NAT gateway may have. Each rule binds a
+/// socket on the server's host, so one request must not be able to ask for thousands.
+pub const MAX_FORWARDS: usize = 64;
 
 /// Where Avalon listens by default. Listening on any other interface takes an explicit
 /// flag, since the protocol has no authentication.

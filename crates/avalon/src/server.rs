@@ -17,7 +17,7 @@ use crate::vm::Vm;
 use crate::{lock, machine_config, Fail};
 use avalon_proto::{
     default_port, kind_of, type_name, validate_name, Connection, Error, ErrorCode, Frame, HardwareProfile,
-    Message, MessageKind, PortOwner, SwitchInfo, VmRef, VmSummary, DEFAULT_AVALON_ADDR,
+    Message, MessageKind, NatConfig, PortOwner, SwitchInfo, VmRef, VmSummary, DEFAULT_AVALON_ADDR,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
@@ -671,29 +671,77 @@ impl Shared {
             .ok_or_else(|| Fail::new(ErrorCode::NoSuchSwitch, format!("no switch named '{name}'")))
     }
 
-    /// `CreateSwitch`: a new switch with nothing plugged in.
-    fn create_switch(&self, name: String) -> Result<(), Fail> {
+    /// `CreateSwitch`: a new switch with no cards plugged in, and its NAT gateway if
+    /// `nat` asks for one.
+    fn create_switch(&self, name: String, nat: Option<NatConfig>) -> Result<(), Fail> {
         validate_name(&name).map_err(|e| Fail::new(ErrorCode::InvalidName, e))?;
         if self.stopping.load(Ordering::SeqCst) {
             return Err(shutting_down());
         }
-        let mut switches = lock(&self.switches);
-        if switches.contains_key(&name) {
-            return Err(Fail::new(
-                ErrorCode::AlreadyExists,
-                format!("a switch named '{name}' already exists"),
-            ));
+        let room = |switches: &BTreeMap<String, Switch>| {
+            if switches.contains_key(&name) {
+                return Err(Fail::new(
+                    ErrorCode::AlreadyExists,
+                    format!("a switch named '{name}' already exists"),
+                ));
+            }
+            if switches.len() >= MAX_SWITCHES {
+                return Err(Fail::new(
+                    ErrorCode::OverBudget,
+                    format!("this server has {MAX_SWITCHES} switches, its most"),
+                ));
+            }
+            Ok(())
+        };
+        // Checked before the gateway binds its ports, and again once it has (without
+        // the table's lock, so other requests do not wait for it).
+        room(&lock(&self.switches))?;
+        let switch = Switch::new(&name);
+        if let Some(nat) = &nat {
+            switch.set_nat(Some(nat))?;
         }
-        if switches.len() >= MAX_SWITCHES {
-            return Err(Fail::new(
-                ErrorCode::OverBudget,
-                format!("this server has {MAX_SWITCHES} switches, its most"),
-            ));
+        let mut switches = lock(&self.switches);
+        // A shutdown that began meanwhile has closed the switches it took from the
+        // table; this one, inserted after, would never be closed (its gateway's thread
+        // and host ports would outlive the server). `stopping` is set before the
+        // shutdown takes the table's lock, so seeing it false here, under that lock,
+        // means the shutdown will find this switch.
+        let refused = if self.stopping.load(Ordering::SeqCst) {
+            Err(shutting_down())
+        } else {
+            room(&switches)
+        };
+        if let Err(fail) = refused {
+            drop(switches);
+            switch.close();
+            return Err(fail);
         }
         if self.log {
-            eprintln!("avalon: switch '{name}' created");
+            match &nat {
+                None => eprintln!("avalon: switch '{name}' created"),
+                Some(_) => eprintln!(
+                    "avalon: switch '{name}' created with a NAT gateway{}",
+                    forwards_text(&switch)
+                ),
+            }
         }
-        switches.insert(name.clone(), Switch::new(&name));
+        switches.insert(name, switch);
+        Ok(())
+    }
+
+    /// `SetSwitchNat`.
+    fn set_switch_nat(&self, name: &str, nat: Option<NatConfig>) -> Result<(), Fail> {
+        let switch = self.switch(name)?;
+        switch.set_nat(nat.as_ref())?;
+        if self.log {
+            match nat {
+                Some(_) => eprintln!(
+                    "avalon: switch '{name}' has a NAT gateway{}",
+                    forwards_text(&switch)
+                ),
+                None => eprintln!("avalon: switch '{name}' has no NAT gateway any more"),
+            }
+        }
         Ok(())
     }
 
@@ -758,6 +806,20 @@ impl Shared {
             Some(path) => switch.start_capture(path),
             None => switch.stop_capture(),
         }
+    }
+}
+
+/// The ports a switch's gateway forwards, for the log: `, forwarding tcp:...-...`.
+fn forwards_text(switch: &Switch) -> String {
+    let rules: Vec<String> = switch
+        .info()
+        .nat
+        .map(|nat| nat.hostfwd.iter().map(|r| r.to_string()).collect())
+        .unwrap_or_default();
+    if rules.is_empty() {
+        String::new()
+    } else {
+        format!(", forwarding {}", rules.join(", "))
     }
 }
 
@@ -936,8 +998,12 @@ impl Session<'_> {
                 }
                 Message::Ok
             }
-            Message::CreateSwitch { name } => {
-                server.create_switch(name)?;
+            Message::CreateSwitch { name, nat } => {
+                server.create_switch(name, nat)?;
+                Message::Ok
+            }
+            Message::SetSwitchNat { switch, nat } => {
+                server.set_switch_nat(&switch, nat)?;
                 Message::Ok
             }
             Message::DeleteSwitch { name } => {

@@ -10,3 +10,5 @@ license.workspace = true
 [dev-dependencies]
 # Only to check that the protocol mirrors grail: MachineConfig field for field, the pointer buttons.
 grail = { path = "../grail" }
+# Only to check that forwarding rules and guest addresses are the NAT gateway's.
+gateway = { path = "../gateway" }

@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "avalon-proto",
  "excalibur",
+ "gateway",
  "grail",
  "merlin-as",
  "merlin-ld",
@@ -18,6 +19,7 @@ name = "avalon-client"
 version = "0.1.0"
 dependencies = [
  "avalon-proto",
+ "gateway",
  "grail",
 ]
 
@@ -25,6 +27,7 @@ dependencies = [
 name = "avalon-proto"
 version = "0.1.0"
 dependencies = [
+ "gateway",
  "grail",
 ]
 

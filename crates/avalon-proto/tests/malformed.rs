@@ -245,16 +245,74 @@ fn invalid_payloads() -> Vec<(&'static str, u16, Vec<u8>)> {
         (
             "port owner tag",
             ty::SWITCH_LIST,
+            cat(&[&le(1), &le(0), &[0], &[0], &le(1), &[3], &[0; 6], &[0; 40]]),
+        ),
+        ("NAT option tag", ty::CREATE_SWITCH, cat(&[&le(1), b"s", &[2]])),
+        (
+            "forwarding protocol tag",
+            ty::CREATE_SWITCH,
             cat(&[
                 &le(1),
-                &le(0),
+                b"s",
+                &[1],
+                &le(1),
+                &[3],
+                &[127, 0, 0, 1, 1, 0],
+                &[10, 0, 2, 15, 80, 0],
+            ]),
+        ),
+        (
+            "guest port 0",
+            ty::CREATE_SWITCH,
+            cat(&[
+                &le(1),
+                b"s",
+                &[1],
+                &le(1),
+                &[1],
+                &[127, 0, 0, 1, 1, 0],
+                &[10, 0, 2, 15, 0, 0],
+            ]),
+        ),
+        (
+            "guest address of the gateway",
+            ty::SET_SWITCH_NAT,
+            cat(&[
+                &le(1),
+                b"s",
+                &[1],
+                &le(1),
+                &[1],
+                &[127, 0, 0, 1, 1, 0],
+                &[10, 0, 2, 2, 80, 0],
+            ]),
+        ),
+        (
+            "guest address off the network",
+            ty::SWITCH_LIST,
+            cat(&[
+                &le(1),
+                &le(1),
+                b"s",
                 &[0],
+                &[1],
                 &le(1),
                 &[2],
+                &[127, 0, 0, 1, 1, 0],
+                &[192, 168, 0, 1, 80, 0],
+                &le(0),
+                &le(0),
+            ]),
+        ),
+        (
+            "more forwarding rules than MAX_FORWARDS",
+            ty::CREATE_SWITCH,
+            cat(&[
                 &le(1),
-                &[0],
-                &[0; 6],
-                &[0; 40],
+                b"s",
+                &[1],
+                &le(MAX_FORWARDS as u32 + 1),
+                &[1, 127, 0, 0, 1, 0, 0, 10, 0, 2, 15, 80, 0].repeat(MAX_FORWARDS + 1),
             ]),
         ),
         (
@@ -385,10 +443,74 @@ fn encoder_refuses_what_the_decoder_would_reject() {
                 wheel: 0,
             },
         },
+        Message::SetSwitchNat {
+            switch: "s".into(),
+            nat: Some(NatConfig {
+                hostfwd: vec![PortForward {
+                    proto: FwdProto::Tcp,
+                    host: "127.0.0.1:8080".parse().unwrap(),
+                    guest: "10.0.2.15:0".parse().unwrap(),
+                }],
+            }),
+        },
+        Message::CreateSwitch {
+            name: "s".into(),
+            nat: Some(NatConfig {
+                hostfwd: vec![PortForward {
+                    proto: FwdProto::Udp,
+                    host: "127.0.0.1:53".parse().unwrap(),
+                    guest: "10.0.3.15:53".parse().unwrap(),
+                }],
+            }),
+        },
     ];
     for msg in bad {
         assert!(matches!(encode(&msg), Err(Error::Invalid(_))), "{msg:?}");
         assert!(msg.check().is_err());
+    }
+}
+
+#[test]
+fn a_gateway_has_at_most_max_forwards_rules() {
+    // Each rule binds a socket on the server's host, so the count is bounded: the
+    // encoder refuses one rule too many, in a request or in a SwitchList, and
+    // MAX_FORWARDS rules go through.
+    let rules = |n: usize| -> Vec<PortForward> {
+        (0..n)
+            .map(|i| PortForward {
+                proto: FwdProto::Tcp,
+                host: format!("127.0.0.1:{}", 20000 + i).parse().unwrap(),
+                guest: "10.0.2.15:80".parse().unwrap(),
+            })
+            .collect()
+    };
+    let create = |n| Message::CreateSwitch {
+        name: "s".into(),
+        nat: Some(NatConfig { hostfwd: rules(n) }),
+    };
+    let set = |n| Message::SetSwitchNat {
+        switch: "s".into(),
+        nat: Some(NatConfig { hostfwd: rules(n) }),
+    };
+    let list = |n| Message::SwitchList {
+        switches: vec![SwitchInfo {
+            name: "s".into(),
+            capture: None,
+            nat: Some(NatInfo {
+                hostfwd: rules(n),
+                leases: Vec::new(),
+            }),
+            ports: Vec::new(),
+        }],
+    };
+    for make in [&create as &dyn Fn(usize) -> Message, &set, &list] {
+        let fine = make(MAX_FORWARDS);
+        let (back, _) = decode(&encode(&fine).unwrap()).unwrap();
+        assert_eq!(back, fine);
+        let over = make(MAX_FORWARDS + 1);
+        assert!(matches!(encode(&over), Err(Error::Invalid(_))), "{}", over.name());
+        // (invalid_payloads has the frame a peer could send anyway, which the decoder
+        // reports as Malformed.)
     }
 }
 

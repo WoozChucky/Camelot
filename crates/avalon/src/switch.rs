@@ -17,6 +17,21 @@
 //! is found again by flooding. The table holds at most [`MAC_TABLE_SIZE`] addresses,
 //! so a guest that makes up source addresses cannot make it grow without bound: when
 //! it is full of fresh entries, new addresses are not learned and their frames flood.
+//! Nor can it take another port's address: a card's frame whose source is the address
+//! of another port (another card, or the gateway) goes nowhere, so the frames meant for
+//! that port keep going to it.
+//!
+//! A switch may also have one port with a **NAT gateway** plugged in ([`Switch::set_nat`],
+//! protocol doc section 6.7, "NAT"): the user-mode gateway of `crates/gateway`, which
+//! gives the VMs on the switch DHCP leases, DNS, and TCP and UDP to the host and the
+//! internet through host sockets, and forwards host ports to them (`hostfwd`). Its
+//! port is like a card's (a bounded queue, counters, captured frames), but nothing
+//! polls it from a machine's run loop: the gateway runs on a thread of its own
+//! ([`run_gateway`]), woken when a frame is queued for it and every few milliseconds
+//! to service its host sockets. One gateway serves every card on the switch, each a
+//! machine of its own to it (a lease, and flow limits, per MAC address); the switch
+//! passes it only frames whose source address is the sending card's own, so a guest
+//! cannot pose as more machines than it has cards.
 //!
 //! **Nothing here blocks a VM.** A card's frames go through the switch on its VM's own
 //! thread, in the middle of a slice, so every step is short and bounded: the switch's
@@ -28,18 +43,23 @@
 //! that is idling in `wfi` so it takes the frame at once rather than at its next look.
 //!
 //! Locks are taken in this order, never the other way round: the server's VM table,
-//! the server's switch table, a VM's lock, a card's plug, a switch's state. A card's
-//! bell is rung (which takes its VM's lock) only after the plug and switch locks have
-//! been released.
+//! the server's switch table, a VM's lock, a card's plug, a switch's state, a
+//! gateway's leases. A card's bell is rung (which takes its VM's lock) only after the
+//! plug and switch locks have been released. The gateway's thread holds no lock while
+//! it runs the gateway, and none of the switch's while it rings bells.
 
 use crate::{lock, Fail};
-use avalon_proto::{ErrorCode, PortOwner, SwitchInfo, SwitchPort};
+use avalon_proto::{
+    ErrorCode, FwdProto, Lease, NatConfig, NatInfo, PortForward, PortOwner, SwitchInfo, SwitchPort,
+};
+use gateway::{Gateway, HostFwd, Proto, GATEWAY_MAC};
 use grail::net::{pcap_header, pcap_record, MacAddr, NetBackend, MIN_FRAME};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::net::Ipv4Addr;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -60,6 +80,18 @@ pub const CAPTURE_QUEUE: usize = 1024;
 
 /// Most switches one Avalon server has.
 pub const MAX_SWITCHES: usize = 64;
+
+/// How often a gateway with open flows services its host sockets when no frame wakes
+/// it: the gateway's own [`gateway::Limits::service_interval`].
+pub const GATEWAY_BUSY_POLL: Duration = Duration::from_millis(1);
+
+/// How often an idle gateway (no flows) looks at its sockets: for a host client of a
+/// forwarded port, or a DNS answer.
+pub const GATEWAY_IDLE_POLL: Duration = Duration::from_millis(10);
+
+/// Frames the gateway's thread takes from the gateway in one round before it looks at
+/// its port's queue again.
+const GATEWAY_BUDGET: usize = 64;
 
 /// The learning part of a switch: which port each source address was last seen on,
 /// and when.
@@ -184,22 +216,104 @@ struct State {
     ports: Vec<Port>,
     table: MacTable,
     capture: Option<Capture>,
+    /// The NAT gateway, while the switch has one.
+    nat: Option<Nat>,
 }
 
 struct Port {
     id: u32,
     owner: PortOwner,
     mac: MacAddr,
-    /// Frames for the card, oldest first.
+    /// Frames for what is plugged in, oldest first.
     queue: VecDeque<Vec<u8>>,
-    /// The card, to ring its VM's bell when a frame arrives, and to unplug it when the
-    /// switch is deleted. Weak: the VM owns its cards.
-    card: std::sync::Weak<Card>,
+    plugged: Plugged,
     in_frames: u64,
     in_bytes: u64,
     out_frames: u64,
     out_bytes: u64,
     dropped: u64,
+}
+
+/// What is plugged into a port, and so what to wake when a frame is queued for it.
+enum Plugged {
+    /// A VM's card: its bell wakes its VM, and the card is unplugged when the switch
+    /// is deleted. Weak: the VM owns its cards.
+    Card(Weak<Card>),
+    /// The switch's NAT gateway, whose thread waits on this.
+    Gateway(Arc<Wake>),
+}
+
+/// Something a frame was queued for, to wake once the switch's lock is released.
+enum Ring {
+    Card(Arc<Card>),
+    Gateway(Arc<Wake>),
+}
+
+impl Ring {
+    fn ring(&self) {
+        match self {
+            Ring::Card(card) => card.ring(),
+            Ring::Gateway(wake) => wake.notify(false),
+        }
+    }
+}
+
+/// A switch's NAT gateway: its port, the thread that runs it, and what `SwitchList`
+/// shows of it.
+struct Nat {
+    port: u32,
+    /// The forwarding rules as bound.
+    hostfwd: Vec<HostFwd>,
+    /// The gateway's leases, as its thread last saw them.
+    leases: Arc<Mutex<Vec<Lease>>>,
+    wake: Arc<Wake>,
+    thread: JoinHandle<()>,
+}
+
+impl Nat {
+    /// Ends the gateway's thread and waits for it: when this returns, the gateway is
+    /// gone and its host sockets are closed, so its ports can be bound again.
+    fn stop(self) {
+        self.wake.notify(true);
+        // A panic there ended the gateway all the same.
+        let _ = self.thread.join();
+    }
+}
+
+/// How a gateway's thread is woken: a frame was queued for it, or it must stop.
+#[derive(Default)]
+struct Wake {
+    state: Mutex<WakeState>,
+    cond: Condvar,
+}
+
+#[derive(Default)]
+struct WakeState {
+    pending: bool,
+    stop: bool,
+}
+
+impl Wake {
+    fn notify(&self, stop: bool) {
+        let mut st = lock(&self.state);
+        st.pending = true;
+        st.stop |= stop;
+        self.cond.notify_one();
+    }
+
+    /// Waits until notified or `timeout` has passed. True when the thread must stop.
+    fn wait(&self, timeout: Duration) -> bool {
+        let mut st = lock(&self.state);
+        if !st.pending {
+            st = self
+                .cond
+                .wait_timeout(st, timeout)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        st.pending = false;
+        st.stop
+    }
 }
 
 impl Switch {
@@ -218,6 +332,7 @@ impl Switch {
                     ports: Vec::new(),
                     table: MacTable::new(ageing, MAC_TABLE_SIZE),
                     capture: None,
+                    nat: None,
                 }),
             }),
         }
@@ -263,21 +378,7 @@ impl Switch {
                 ),
             ));
         }
-        let id = st.next_port;
-        st.next_port += 1;
-        st.ports.push(Port {
-            id,
-            owner,
-            mac: card.mac,
-            queue: VecDeque::new(),
-            card: Arc::downgrade(card),
-            in_frames: 0,
-            in_bytes: 0,
-            out_frames: 0,
-            out_bytes: 0,
-            dropped: 0,
-        });
-        Ok(id)
+        Ok(st.add_port(owner, card.mac, Plugged::Card(Arc::downgrade(card))))
     }
 
     /// Unplugs port `id`: its queued frames go with it, and so do the addresses
@@ -288,14 +389,14 @@ impl Switch {
         st.table.forget_port(id);
     }
 
-    /// A frame sent by the card on port `from`, now. Returns the cards it was queued
-    /// for, whose bells the caller rings once it has let go of its locks.
-    fn input(&self, from: u32, frame: &[u8]) -> Vec<Arc<Card>> {
+    /// A frame sent by what is plugged into port `from`, now. Returns what it was
+    /// queued for, which the caller wakes once it has let go of its locks.
+    fn input(&self, from: u32, frame: &[u8]) -> Vec<Ring> {
         self.input_at(from, frame, Instant::now())
     }
 
     /// [`Switch::input`] at time `now` (tests make time pass without waiting).
-    fn input_at(&self, from: u32, frame: &[u8], now: Instant) -> Vec<Arc<Card>> {
+    fn input_at(&self, from: u32, frame: &[u8], now: Instant) -> Vec<Ring> {
         let mut st = self.state();
         let st = &mut *st;
         if st.closed {
@@ -306,11 +407,21 @@ impl Switch {
         };
         port.in_frames += 1;
         port.in_bytes += frame.len() as u64;
+        // A card's frames reach the gateway only with the card's own source address
+        // (below).
+        let from_card = matches!(port.plugged, Plugged::Card(_)).then_some(port.mac);
         if let Some(capture) = &mut st.capture {
             capture.record(frame);
         }
         // Cards never send a frame shorter than its header; anything else might.
         if frame.len() < MIN_FRAME {
+            return Vec::new();
+        }
+        // A card that sends from the address of another port (the gateway's, or another
+        // card's) would move that address to its own port in the table, and receive
+        // the frames meant for it: such frames go nowhere.
+        let src = mac_at(frame, 6);
+        if from_card.is_some() && st.ports.iter().any(|p| p.id != from && p.mac == src) {
             return Vec::new();
         }
         let forward = st.table.forward(from, frame, now);
@@ -324,6 +435,12 @@ impl Switch {
             if !to_it {
                 continue;
             }
+            // The gateway counts flows and gives leases per MAC address: a card
+            // sending from addresses that are not its own could be many machines to
+            // it, and use up what is meant for the others.
+            if matches!(port.plugged, Plugged::Gateway(_)) && from_card.is_some_and(|mac| mac != src) {
+                continue;
+            }
             if port.queue.len() >= PORT_QUEUE {
                 port.dropped += 1;
                 continue;
@@ -331,14 +448,15 @@ impl Switch {
             port.queue.push_back(frame.to_vec());
             port.out_frames += 1;
             port.out_bytes += frame.len() as u64;
-            if let Some(card) = port.card.upgrade() {
-                rung.push(card);
+            match &port.plugged {
+                Plugged::Card(card) => rung.extend(card.upgrade().map(Ring::Card)),
+                Plugged::Gateway(wake) => rung.push(Ring::Gateway(Arc::clone(wake))),
             }
         }
         rung
     }
 
-    /// The next frame for the card on port `id`.
+    /// The next frame for what is plugged into port `id`.
     fn take(&self, id: u32) -> Option<Vec<u8>> {
         self.state()
             .ports
@@ -348,17 +466,36 @@ impl Switch {
             .pop_front()
     }
 
-    /// Deletes the switch: nothing flows through it any more, its capture stops, and
-    /// every card plugged into it is unplugged (link down).
+    /// Every frame waiting for port `id`.
+    fn take_all(&self, id: u32) -> Vec<Vec<u8>> {
+        match self.state().ports.iter_mut().find(|p| p.id == id) {
+            Some(port) => port.queue.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Deletes the switch: nothing flows through it any more, its capture stops, every
+    /// card plugged into it is unplugged (link down), and its gateway ends, its host
+    /// sockets closed by the time this returns.
     pub fn close(&self) {
-        let (cards, capture) = {
+        let (cards, capture, nat) = {
             let mut st = self.state();
             st.closed = true;
-            let cards: Vec<Arc<Card>> = st.ports.drain(..).filter_map(|p| p.card.upgrade()).collect();
-            (cards, st.capture.take())
+            let cards: Vec<Arc<Card>> = st
+                .ports
+                .drain(..)
+                .filter_map(|p| match p.plugged {
+                    Plugged::Card(card) => card.upgrade(),
+                    Plugged::Gateway(_) => None,
+                })
+                .collect();
+            (cards, st.capture.take(), st.nat.take())
         };
         for card in cards {
             card.unplug_from(self);
+        }
+        if let Some(nat) = nat {
+            nat.stop();
         }
         if let Some(capture) = capture {
             // The switch is gone, and its capture with it: nobody is left to tell of
@@ -367,12 +504,124 @@ impl Switch {
         }
     }
 
+    /// Gives the switch a NAT gateway (`Some`), or takes its gateway away (`None`).
+    ///
+    /// A new gateway binds its forwarded host ports here, on the requesting thread, so
+    /// a port that cannot be bound is the request's error (`Io`), then gets a port of
+    /// the switch with its address ([`GATEWAY_MAC`]) and a thread of its own. Errors:
+    /// `AlreadyExists` (the switch has a gateway already, or a card with the gateway's
+    /// address is plugged in), `InvalidState` (taking away a gateway it does not have),
+    /// `NoSuchSwitch` (it has been deleted). A gateway taken away is gone, its host
+    /// sockets closed, when this returns.
+    pub fn set_nat(&self, nat: Option<&NatConfig>) -> Result<(), Fail> {
+        let Some(config) = nat else {
+            let nat = {
+                let mut st = self.state();
+                let Some(nat) = st.nat.take() else {
+                    return Err(Fail::new(
+                        ErrorCode::InvalidState,
+                        format!("switch '{}' has no NAT gateway", self.name()),
+                    ));
+                };
+                st.ports.retain(|p| p.id != nat.port);
+                st.table.forget_port(nat.port);
+                nat
+            };
+            nat.stop();
+            return Ok(());
+        };
+        // Said before binding anything, so that asking twice is not an I/O error.
+        self.check_nat_free(&self.state())?;
+        let gateway = Gateway::new(gateway::Config {
+            hostfwd: config.hostfwd.iter().map(to_gateway_rule).collect(),
+            ..gateway::Config::default()
+        })
+        .map_err(|e| {
+            Fail::new(
+                ErrorCode::Io,
+                format!("switch '{}': cannot forward the port: {e}", self.name()),
+            )
+        })?;
+        let hostfwd = gateway.hostfwd();
+        let mut st = self.state();
+        // Checked again: the gateway was made without the lock. A gateway dropped here
+        // closes its sockets.
+        self.check_nat_free(&st)?;
+        let wake = Arc::new(Wake::default());
+        let port = st.add_port(
+            PortOwner::Gateway,
+            MacAddr(GATEWAY_MAC),
+            Plugged::Gateway(Arc::clone(&wake)),
+        );
+        let leases = Arc::new(Mutex::new(Vec::new()));
+        let thread = {
+            let (switch, wake, leases) = (
+                Arc::downgrade(&self.inner),
+                Arc::clone(&wake),
+                Arc::clone(&leases),
+            );
+            std::thread::Builder::new()
+                .name(format!("gateway {}", self.name()))
+                .spawn(move || run_gateway(switch, port, gateway, wake, leases))
+        };
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(e) => {
+                st.ports.retain(|p| p.id != port);
+                return Err(Fail::new(
+                    ErrorCode::Internal,
+                    format!("cannot start the gateway of switch '{}': {e}", self.name()),
+                ));
+            }
+        };
+        st.nat = Some(Nat {
+            port,
+            hostfwd,
+            leases,
+            wake,
+            thread,
+        });
+        Ok(())
+    }
+
+    /// Whether a gateway can be added to the switch as `st` is.
+    fn check_nat_free(&self, st: &State) -> Result<(), Fail> {
+        if st.closed {
+            return Err(self.no_such());
+        }
+        if st.nat.is_some() {
+            return Err(Fail::new(
+                ErrorCode::AlreadyExists,
+                format!(
+                    "switch '{}' has a NAT gateway already; take it away first",
+                    self.name()
+                ),
+            ));
+        }
+        if let Some(other) = st.ports.iter().find(|p| p.mac == MacAddr(GATEWAY_MAC)) {
+            return Err(Fail::new(
+                ErrorCode::AlreadyExists,
+                format!(
+                    "{} has the gateway's address {}: a gateway cannot share switch '{}' with it",
+                    owner_text(other.owner),
+                    MacAddr(GATEWAY_MAC),
+                    self.name()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// The switch, its ports and their counters, for `SwitchList`.
     pub fn info(&self) -> SwitchInfo {
         let st = self.state();
         SwitchInfo {
             name: self.name().to_string(),
             capture: st.capture.as_ref().map(|c| c.path.clone()),
+            nat: st.nat.as_ref().map(|nat| NatInfo {
+                hostfwd: nat.hostfwd.iter().map(from_gateway_rule).collect(),
+                leases: lock(&nat.leases).clone(),
+            }),
             ports: st
                 .ports
                 .iter()
@@ -462,9 +711,110 @@ impl Switch {
     }
 }
 
+impl State {
+    /// Plugs `plugged` into a new port, as `owner`, with address `mac`.
+    fn add_port(&mut self, owner: PortOwner, mac: MacAddr, plugged: Plugged) -> u32 {
+        let id = self.next_port;
+        self.next_port += 1;
+        self.ports.push(Port {
+            id,
+            owner,
+            mac,
+            queue: VecDeque::new(),
+            plugged,
+            in_frames: 0,
+            in_bytes: 0,
+            out_frames: 0,
+            out_bytes: 0,
+            dropped: 0,
+        });
+        id
+    }
+}
+
 fn owner_text(owner: PortOwner) -> String {
     match owner {
         PortOwner::Card { vm, card } => format!("card {card} of VM {vm}"),
+        PortOwner::Gateway => "the switch's NAT gateway".into(),
+    }
+}
+
+/// A forwarding rule as the gateway takes it.
+fn to_gateway_rule(rule: &PortForward) -> HostFwd {
+    HostFwd {
+        proto: match rule.proto {
+            FwdProto::Tcp => Proto::Tcp,
+            FwdProto::Udp => Proto::Udp,
+        },
+        host: rule.host,
+        guest: rule.guest,
+    }
+}
+
+/// A forwarding rule as the protocol carries it.
+fn from_gateway_rule(rule: &HostFwd) -> PortForward {
+    PortForward {
+        proto: match rule.proto {
+            Proto::Tcp => FwdProto::Tcp,
+            Proto::Udp => FwdProto::Udp,
+        },
+        host: rule.host,
+        guest: rule.guest,
+    }
+}
+
+/// A gateway's thread: passes the frames queued for its port `port` to the gateway,
+/// and the gateway's frames into the switch, until it is told to stop or the switch
+/// is gone. Between rounds it sleeps until a frame is queued for it, or for
+/// [`GATEWAY_BUSY_POLL`] while the gateway has flows open ([`GATEWAY_IDLE_POLL`]
+/// otherwise), when the gateway services its host sockets. The gateway is dropped,
+/// closing its sockets, when the thread ends.
+fn run_gateway(
+    switch: Weak<SwitchInner>,
+    port: u32,
+    mut gateway: Gateway,
+    wake: Arc<Wake>,
+    leases: Arc<Mutex<Vec<Lease>>>,
+) {
+    let mut stop = false;
+    while !stop {
+        let Some(inner) = switch.upgrade() else { return };
+        let switch = Switch { inner };
+        let incoming = switch.take_all(port);
+        for frame in &incoming {
+            gateway.send(frame);
+        }
+        if !incoming.is_empty() {
+            // Leases are only given in answer to a frame, and never change.
+            let now = gateway.leases();
+            let mut shown = lock(&leases);
+            if now.len() != shown.len() {
+                *shown = now
+                    .into_iter()
+                    .map(|(mac, addr): ([u8; 6], Ipv4Addr)| Lease { mac, addr })
+                    .collect();
+            }
+        }
+        let mut sent = 0;
+        while sent < GATEWAY_BUDGET {
+            let Some(frame) = gateway.recv() else { break };
+            sent += 1;
+            for ring in switch.input(port, &frame) {
+                ring.ring();
+            }
+        }
+        if sent == GATEWAY_BUDGET || !incoming.is_empty() {
+            // More may be waiting either way: look again at once.
+            stop = lock(&wake.state).stop;
+            continue;
+        }
+        let poll = if gateway.flows() > 0 {
+            GATEWAY_BUSY_POLL
+        } else {
+            GATEWAY_IDLE_POLL
+        };
+        drop(switch);
+        stop = wake.wait(poll);
     }
 }
 
@@ -656,8 +1006,8 @@ impl NetBackend for CardBackend {
             Some((switch, id)) => switch.input(*id, frame),
             None => Vec::new(),
         };
-        for card in rung {
-            card.ring();
+        for ring in rung {
+            ring.ring();
         }
         Ok(())
     }

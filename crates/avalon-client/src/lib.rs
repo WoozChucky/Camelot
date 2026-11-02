@@ -17,8 +17,8 @@
 //! Pendragon, the web console: the two cannot drift apart.
 
 use avalon_proto::{
-    Connection, DeviceSpec, DiskInfo, DiskSource, ErrorCode, HardwareProfile, Message, SwitchInfo, VmDetails,
-    VmRef, VmState, VmSummary,
+    Connection, DeviceSpec, DiskInfo, DiskSource, ErrorCode, HardwareProfile, Message, NatConfig, SwitchInfo,
+    VmDetails, VmRef, VmState, VmSummary,
 };
 use std::fmt;
 use std::io::{Read, Write};
@@ -29,7 +29,8 @@ pub mod parse;
 pub mod show;
 
 pub use parse::{
-    parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_net, parse_ram,
+    parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net,
+    parse_ram,
 };
 pub use show::{device_name, disk_source_text, format_hz, format_size, mac_text};
 
@@ -361,10 +362,25 @@ impl<S: Read + Write> Client<S> {
 
     // ---- Virtual network (Avalon) ----
 
-    /// Creates an empty virtual switch.
+    /// Creates a virtual switch with no cards plugged in.
     pub fn create_switch(&mut self, name: &str) -> Result<()> {
+        self.create_switch_with(name, None)
+    }
+
+    /// Creates a virtual switch with no cards plugged in, and a NAT gateway if `nat`
+    /// asks for one (which fails the request if a forwarded port cannot be bound).
+    pub fn create_switch_with(&mut self, name: &str, nat: Option<NatConfig>) -> Result<()> {
         Ok(self.conn.request_ok(&Message::CreateSwitch {
             name: name.to_string(),
+            nat,
+        })?)
+    }
+
+    /// Gives `switch` a NAT gateway (`Some`), or takes its gateway away (`None`).
+    pub fn set_switch_nat(&mut self, switch: &str, nat: Option<NatConfig>) -> Result<()> {
+        Ok(self.conn.request_ok(&Message::SetSwitchNat {
+            switch: switch.to_string(),
+            nat,
         })?)
     }
 

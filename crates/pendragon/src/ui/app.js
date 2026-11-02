@@ -1,4 +1,5 @@
-// Pendragon's pages: overview, VMs (list, new, one VM with its console) and disks.
+// Pendragon's pages: overview, VMs (list, new, one VM with its console), disks and
+// switches (the virtual network, with its NAT gateways).
 //
 // Plain JavaScript, no build step. Every element is made with the DOM and every
 // piece of data goes in as text (textContent), never as markup, so nothing a VM
@@ -162,6 +163,7 @@ function route() {
   else if (parts[0] === "vms" && parts[1] === "new") enter((m, c) => newVmPage(m, c, params.get("disk")));
   else if (parts[0] === "vms" && /^\d+$/.test(parts[1] || "")) enter((m, c) => vmPage(m, c, parts[1]));
   else if (parts[0] === "disks") enter(disksPage);
+  else if (parts[0] === "switches") enter(switchesPage);
   else enter((main) => main.append(el("h1", {}, "No such page"), el("a", { href: "#/" }, "Overview")));
 }
 
@@ -315,6 +317,19 @@ function newVmPage(main, ctx, disk) {
   const disks = el("div");
   let lake = null;
 
+  const nets = el("div");
+  const switchNames = el("datalist", { id: "switch-names" });
+  const addNet = () => {
+    const row = el(
+      "div",
+      { class: "disk-row net-row" },
+      el("input", { type: "text", class: "net-switch", list: "switch-names", placeholder: "switch (empty: unplugged)" }),
+      el("input", { type: "text", class: "net-mac", placeholder: "MAC (empty: one is made up)", autocomplete: "off" }),
+      el("button", { type: "button", onclick: () => row.remove() }, "remove"),
+    );
+    nets.append(row);
+  };
+
   const addDisk = (source) => {
     const row = el(
       "div",
@@ -353,6 +368,10 @@ function newVmPage(main, ctx, disk) {
     disks,
     el("button", { type: "button", onclick: () => addDisk("") }, "Add a disk"),
     lakeImages,
+    el("h2", {}, "Network cards"),
+    nets,
+    el("button", { type: "button", onclick: addNet }, "Add a network card"),
+    switchNames,
     el("label", {}, start, " start it once created"),
     submit,
   );
@@ -376,6 +395,10 @@ function newVmPage(main, ctx, disk) {
             read_only: row.querySelector(".disk-ro").checked,
           }))
           .filter((d) => d.source !== ""),
+        nets: [...nets.querySelectorAll(".net-row")].map((row) => ({
+          switch: row.querySelector(".net-switch").value.trim(),
+          mac: row.querySelector(".net-mac").value.trim() || null,
+        })),
       };
       const created = await api("POST", "vms", request);
       location.hash = "#/vms/" + created.id;
@@ -397,6 +420,12 @@ function newVmPage(main, ctx, disk) {
     .catch(() => {
       if (disk && ctx.alive) addDisk("");
     });
+  // And Avalon's switches as places to plug the cards in.
+  api("GET", "switches", undefined, ctx.abort.signal)
+    .then((list) => {
+      for (const s of list.switches) switchNames.append(el("option", { value: s.name }));
+    })
+    .catch(() => {});
 }
 
 function vmPage(main, ctx, id) {
@@ -651,6 +680,259 @@ function diskRow(d, error, refresh) {
       el("button", { class: "danger", disabled: d.attached, title: d.attached ? "detach it first" : "", onclick: (e) => remove(e.target) }, "delete"),
     ),
   );
+}
+
+// ---- Switches ----
+
+function switchesPage(main, ctx) {
+  const error = errorLine();
+  const list = el("div");
+
+  // Create a switch, with or without a NAT gateway and its forwarded ports.
+  const name = el("input", { type: "text", required: true, placeholder: "lan", autocomplete: "off" });
+  const nat = el("input", { type: "checkbox" });
+  const hostfwd = el("textarea", {
+    rows: 3,
+    cols: 40,
+    placeholder: "tcp::8080-:80\nudp:127.0.0.1:5353-10.0.2.16:53",
+    spellcheck: "false",
+  });
+  const create = el(
+    "form",
+    { class: "panel" },
+    el("label", {}, el("span", {}, "Name"), name, el("span", { class: "muted" }, " lowercase letters, digits, '.', '_' and '-'")),
+    el("label", {}, nat, " give it a NAT gateway (10.0.2.0/24: DHCP, DNS, and the host at 10.0.2.2)"),
+    el(
+      "label",
+      {},
+      el("span", {}, "Forwarded ports"),
+      hostfwd,
+      el("span", { class: "muted" }, " one per line, [tcp|udp]:[host addr]:port-[guest addr]:port; the guest is 10.0.2.15 unless named"),
+    ),
+    el("button", { type: "submit", class: "primary" }, "Create switch"),
+  );
+  create.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await api("POST", "switches", { name: name.value.trim(), nat: nat.checked, hostfwd: lines(hostfwd.value) });
+      name.value = "";
+      nat.checked = false;
+      hostfwd.value = "";
+      showError(error, null);
+    } catch (e) {
+      showError(error, e);
+    }
+    refresh();
+  });
+
+  // Plug a VM's card into a switch. The choices are rebuilt on each refresh, keeping
+  // what was picked.
+  const plugSwitch = el("select");
+  const plugVm = el("select");
+  const plugCard = el("select");
+  const plug = el(
+    "form",
+    { class: "panel console-input" },
+    el("span", {}, "Plug card "),
+    plugCard,
+    el("span", {}, " of VM "),
+    plugVm,
+    el("span", {}, " into "),
+    plugSwitch,
+    el("button", { type: "submit" }, "Plug in"),
+  );
+  let vms = [];
+  const fillCards = () => {
+    const vm = vms.find((v) => String(v.id) === plugVm.value);
+    options(
+      plugCard,
+      (vm ? vm.nets : []).map((n) => [String(n.card), n.card + " (" + n.mac + (n.switch ? ", on " + n.switch : "") + ")"]),
+    );
+  };
+  plugVm.addEventListener("change", fillCards);
+  plug.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      if (!plugSwitch.value || !plugVm.value || !plugCard.value) throw new Error("Choose a switch, a VM and one of its cards.");
+      await api("POST", "switches/" + encodeURIComponent(plugSwitch.value) + "/attach", {
+        vm: Number(plugVm.value),
+        card: Number(plugCard.value),
+      });
+      showError(error, null);
+    } catch (e) {
+      showError(error, e);
+    }
+    refresh();
+  });
+
+  main.append(el("h1", {}, "Switches"), create, plug, error, list);
+
+  const refresh = async () => {
+    try {
+      const [switches, vmList] = await Promise.all([
+        api("GET", "switches", undefined, ctx.abort.signal),
+        api("GET", "vms", undefined, ctx.abort.signal).catch(() => ({ vms: [] })),
+      ]);
+      if (!ctx.alive) return;
+      if (switches.vms_error) showError(error, new Error("Which VMs own each card is unknown: " + switches.vms_error));
+      vms = vmList.vms.filter((v) => v.nets.length > 0);
+      options(plugSwitch, switches.switches.map((s) => [s.name, s.name]));
+      options(plugVm, vms.map((v) => [String(v.id), v.id + " (" + v.name + ")"]));
+      fillCards();
+      if (switches.switches.length === 0) {
+        list.replaceChildren(el("p", { class: "muted" }, "No switches on Avalon at " + switches.avalon + "."));
+        return;
+      }
+      list.replaceChildren(...switches.switches.map((s) => switchPanel(s, error, refresh)));
+    } catch (e) {
+      if (ctx.alive) showError(error, e);
+    }
+  };
+  every(ctx, 2000, refresh);
+}
+
+// The non-empty lines of a text box.
+function lines(text) {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+}
+
+// Replaces a select's options with [value, label] pairs, keeping the chosen value if
+// it is still there.
+function options(select, pairs) {
+  const chosen = select.value;
+  select.replaceChildren(...pairs.map(([value, label]) => el("option", { value }, label)));
+  if (pairs.some(([value]) => value === chosen)) select.value = chosen;
+}
+
+function switchPanel(s, error, refresh) {
+  const path = "switches/" + encodeURIComponent(s.name);
+  const run = async (button, method, suffix, body, question) => {
+    if (question && !confirm(question)) return;
+    button.disabled = true;
+    try {
+      await api(method, path + suffix, body);
+      showError(error, null);
+    } catch (e) {
+      showError(error, e);
+    }
+    refresh();
+  };
+  const remove = el(
+    "button",
+    {
+      class: "danger",
+      onclick: (e) =>
+        run(e.target, "DELETE", "", undefined, "Delete switch " + s.name + "? Its cards are unplugged and its gateway's host ports closed."),
+    },
+    "delete",
+  );
+  const natButton = s.nat
+    ? el(
+        "button",
+        {
+          onclick: (e) =>
+            run(e.target, "DELETE", "/nat", undefined, "Take switch " + s.name + "'s NAT gateway away? Its connections and forwarded ports close."),
+        },
+        "remove NAT",
+      )
+    : el("button", { onclick: (e) => natForm(e.target) }, "add NAT");
+  const natArea = el("div");
+  // Adding a gateway asks for its forwarded ports first.
+  const natForm = (button) => {
+    button.disabled = true;
+    const rules = el("textarea", { rows: 2, cols: 40, placeholder: "tcp::8080-:80", spellcheck: "false" });
+    const form = el(
+      "form",
+      {},
+      el("label", {}, el("span", {}, "Forwarded ports"), rules, el("span", { class: "muted" }, " one per line, may be empty")),
+      el("button", { type: "submit", class: "primary" }, "Add NAT gateway"),
+    );
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      run(form.querySelector("button"), "POST", "/nat", { hostfwd: lines(rules.value) });
+    });
+    natArea.replaceChildren(form);
+  };
+
+  const panel = el(
+    "div",
+    { class: "panel" },
+    el("div", { class: "switch-head" }, el("h2", {}, s.name), natButton, remove),
+    s.capture ? el("p", { class: "muted" }, "capturing to " + s.capture) : null,
+    natArea,
+  );
+  if (s.nat) panel.append(natFacts(s.nat));
+  else natArea.append(el("p", { class: "muted" }, "No NAT gateway: the machines on it only reach each other."));
+
+  if (s.ports.length === 0) {
+    panel.append(el("p", { class: "muted" }, "Nothing is plugged in."));
+    return panel;
+  }
+  panel.append(
+    el(
+      "table",
+      {},
+      el("tr", {}, ["Port", "MAC", "In", "Out", "Dropped", ""].map((h) => el("th", {}, h))),
+      s.ports.map((p) =>
+        el(
+          "tr",
+          {},
+          el("td", {}, portOwner(p)),
+          el("td", { class: "mono" }, p.mac),
+          el("td", { class: "num" }, p.in_frames + " frames, " + p.in_bytes + " bytes"),
+          el("td", { class: "num" }, p.out_frames + " frames, " + p.out_bytes + " bytes"),
+          el("td", { class: "num" }, p.dropped),
+          el(
+            "td",
+            {},
+            p.kind === "card"
+              ? el(
+                  "button",
+                  {
+                    title: "unplug the card from this switch",
+                    onclick: (e) => run(e.target, "POST", "/detach", { vm: p.vm.id, card: p.card }),
+                  },
+                  "unplug",
+                )
+              : null,
+          ),
+        ),
+      ),
+    ),
+  );
+  return panel;
+}
+
+function portOwner(p) {
+  if (p.kind === "gateway") return "NAT gateway";
+  const who = p.vm.name === null ? "VM " + p.vm.id : vmLink(p.vm.id, "VM " + p.vm.id + " (" + p.vm.name + ")");
+  return el("span", {}, who, ", card " + p.card);
+}
+
+function natFacts(nat) {
+  const rows = [
+    ["Network", nat.network + ", gateway and host " + nat.gateway + ", DNS " + nat.dns],
+    [
+      "Forwarded",
+      nat.hostfwd.length === 0 ? el("span", { class: "muted" }, "none") : el("div", {}, nat.hostfwd.map((r) => el("div", { class: "mono" }, r))),
+    ],
+    [
+      "Leases",
+      nat.leases.length === 0
+        ? el("span", { class: "muted" }, "none yet")
+        : el(
+            "div",
+            {},
+            nat.leases.map((l) =>
+              el("div", {}, el("span", { class: "mono" }, l.addr + "  " + l.mac), l.vm ? [" ", vmLink(l.vm.id, "VM " + l.vm.id + " (" + l.vm.name + ")")] : null),
+            ),
+          ),
+    ],
+  ];
+  return el("dl", { class: "facts" }, rows.map(([k, v]) => [el("dt", {}, k), el("dd", {}, v)]));
 }
 
 // ---- Start ----
