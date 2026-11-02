@@ -10,8 +10,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Far more than a run needs (a boot is about 4.5 million steps with 128 MiB
-/// of RAM, nearly all of them setting up memory; `wfi` skips ahead to each
+/// Far more than a run needs (a boot is about 16 million steps with the default 4 MiB
+/// of RAM, 36 million with 128 MiB, most of them setting up memory; `wfi` skips ahead to each
 /// tick), so hitting it means the kernel hung. Generous because stdin reaches
 /// the machine through a thread: until the bytes arrive the kernel idles
 /// through timer ticks, which costs steps.

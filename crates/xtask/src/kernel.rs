@@ -276,6 +276,11 @@ pub fn build_merlin(kernel_dir: &Path, userprogs: Option<&Path>) -> Result<Built
 /// size. Booted with no shell in `/bin` (or with no root filesystem at all) it
 /// panics: there is nothing else to run.
 pub fn disk_kernel(kernel_dir: &Path, built: &Built) -> Result<Vec<u8>, String> {
+    if !built.objects.iter().any(|o| o.source.name == USERPROGS) {
+        return Err(format!("the kernel has no {USERPROGS} to leave out"));
+    }
+    // The same link, in the same order, with the empty table's object in place
+    // of the programs'.
     let empty = toolchain::assemble(USERPROGS, &crate::userprogs::empty())?;
     let inputs: Vec<merlin_ld::Input> = built
         .objects
@@ -289,9 +294,6 @@ pub fn disk_kernel(kernel_dir: &Path, built: &Built) -> Result<Vec<u8>, String> 
             },
         })
         .collect();
-    if !built.objects.iter().any(|o| o.source.name == USERPROGS) {
-        return Err(format!("the kernel has no {USERPROGS} to leave out"));
-    }
     toolchain::link(kernel_dir, SCRIPT, &inputs, "the disk kernel")
 }
 
@@ -687,7 +689,11 @@ mod tests {
         };
         assert_eq!(b.run().unwrap(), b.out);
         let elf = std::fs::read(&b.out).unwrap();
-        assert_eq!(elf, build_merlin(&b.kernel_dir, None).unwrap().elf);
+        let built = build_merlin(&b.kernel_dir, None).unwrap();
+        assert_eq!(elf, built.elf);
+        // The disk kernel, next to it.
+        let disk = std::fs::read(dir.join("out").join("kernel-disk.elf")).unwrap();
+        assert_eq!(disk, disk_kernel(&b.kernel_dir, &built).unwrap());
         for f in ["main.c.s", "main.c.o", "entry.s.o", "userprogs.s.o"] {
             assert!(b.obj_dir.join(f).is_file(), "{f}");
         }
@@ -784,6 +790,23 @@ mod tests {
         assert_eq!(PathBuf::from(&args[4]), Path::new("obj").join("entry.s.o"));
         assert_eq!(PathBuf::from(&args[5]), Path::new("obj").join("main.c.o"));
         assert_eq!(args.len(), 6);
+    }
+
+    #[test]
+    fn the_disk_kernel_goes_next_to_the_kernel() {
+        assert_eq!(
+            disk_kernel_path(Path::new("kernel/kernel.elf")),
+            Path::new("kernel/kernel-disk.elf")
+        );
+        assert_eq!(disk_kernel_path(Path::new(KERNEL_ELF)), Path::new(DISK_KERNEL));
+        assert_eq!(disk_kernel_path(Path::new("out/k")), Path::new("out/k-disk"));
+        // Without a userprogs.s there is nothing to leave out.
+        let built = Built {
+            objects: Vec::new(),
+            elf: Vec::new(),
+        };
+        let err = disk_kernel(Path::new("kernel"), &built).unwrap_err();
+        assert!(err.contains("no userprogs.s"), "{err}");
     }
 
     #[test]

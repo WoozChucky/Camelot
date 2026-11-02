@@ -522,4 +522,11 @@ fn usage_documents_clock_and_its_units() {
     ] {
         assert!(usage.contains(text), "usage lacks {text:?}:\n{usage}");
     }
+    // The default RAM, as the machine has it: 4 MiB.
+    assert_eq!(grail::DEFAULT_RAM_SIZE, 4 << 20);
+    assert_eq!(grail::MachineConfig::default().ram_size, grail::DEFAULT_RAM_SIZE);
+    assert!(
+        usage.contains("--ram MiB       RAM size in MiB, 1 to 2048 (default 4)\n"),
+        "{usage}"
+    );
 }

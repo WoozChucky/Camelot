@@ -278,7 +278,9 @@ pub fn prepare(options: &Options, log: Log) -> Result<(), String> {
             let demo_disk = options.images.join(vm_disk(DEMO_VM));
             if seeded == Seeded::Replaced && options.demo && demo_disk.is_file() {
                 log(&format!(
-                    "up: note: the demo VM's disk {} is a copy of the image {BASE_IMAGE} from                      before this build, and the demo boots it as it is; to boot the new build,                      delete {} while up is not running (what the VM wrote there goes with it)",
+                    "up: note: the demo VM's disk {} is a copy of the image {BASE_IMAGE} from \
+                     before this build, and the demo boots it as it is; to boot the new build, \
+                     delete {} while up is not running (what the VM wrote there goes with it)",
                     vm_disk(DEMO_VM),
                     demo_disk.display()
                 ));

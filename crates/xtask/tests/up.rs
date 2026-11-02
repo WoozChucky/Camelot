@@ -604,9 +604,14 @@ fn a_new_image_says_the_demo_disk_is_older() {
     up::prepare(&options, log).unwrap();
     assert!(note(&out), "{:#?}", out.lines());
     let last = out.lines().last().unwrap().clone();
-    assert!(
-        last.contains(&options.images.join("vm001-disk0").display().to_string()),
-        "{last}"
+    assert_eq!(
+        last,
+        format!(
+            "up: note: the demo VM's disk vm001-disk0 is a copy of the image os-base from before this \
+             build, and the demo boots it as it is; to boot the new build, delete {} while up is not \
+             running (what the VM wrote there goes with it)",
+            options.images.join("vm001-disk0").display()
+        )
     );
 }
 

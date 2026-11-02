@@ -302,6 +302,71 @@ mod tests {
         f
     }
 
+    /// A kernel with two segments, a gap between them, and after them what a
+    /// linker puts there: section headers (which the ELF header points to) and
+    /// symbols.
+    fn kernel_with_sections() -> Vec<u8> {
+        let mut f = elf(
+            RAM_BASE,
+            &[
+                (elf32::PT_LOAD, 0x200, RAM_BASE, 0x100, 0x100),
+                (elf32::PT_NULL, 0, 0, 0, 0),
+                (elf32::PT_LOAD, 0x600, RAM_BASE + 0x1000, 0x80, 0x400),
+            ],
+            0x900,
+        );
+        f[0x200..0x300].fill(0x11);
+        f[0x300..0x600].fill(0xee); // not part of any segment
+        f[0x600..0x680].fill(0x22);
+        f[0x680..].fill(0x33); // symbols, names, ...
+        f[32..36].copy_from_slice(&0x800u32.to_le_bytes()); // e_shoff
+        f[46..48].copy_from_slice(&40u16.to_le_bytes()); // e_shentsize
+        f[48..50].copy_from_slice(&0u16.to_le_bytes()); // e_shnum: none to parse
+        f[50..52].copy_from_slice(&7u16.to_le_bytes()); // e_shstrndx
+        f
+    }
+
+    #[test]
+    fn only_what_the_bootloader_loads_is_kept() {
+        let full = kernel_with_sections();
+        let kept = loadable(&full).unwrap();
+        // Up to the end of the last segment's bytes.
+        assert_eq!(kept.len(), 0x680);
+        // The headers, but no section headers.
+        assert_eq!(&kept[..32], &full[..32]);
+        assert_eq!(&kept[36..46], &full[36..46]);
+        assert!(kept[32..36].iter().chain(&kept[46..52]).all(|&b| b == 0));
+        assert_eq!(&kept[52..52 + 3 * 32], &full[52..52 + 3 * 32]);
+        // The segments where they were; nothing else.
+        assert!(kept[0x200..0x300].iter().all(|&b| b == 0x11));
+        assert!(kept[0x300..0x600].iter().all(|&b| b == 0));
+        assert!(kept[0x600..0x680].iter().all(|&b| b == 0x22));
+        // It loads the same.
+        let (a, b) = (
+            elf32::Elf::parse(&full).unwrap(),
+            elf32::Elf::parse(&kept).unwrap(),
+        );
+        assert_eq!(a.header.entry, b.header.entry);
+        assert_eq!(a.segments, b.segments);
+        for p in a.segments.iter().filter(|p| p.ty == elf32::PT_LOAD) {
+            assert_eq!(a.segment_data(p).unwrap(), b.segment_data(p).unwrap());
+        }
+        assert!(b.sections.is_empty());
+        assert_eq!(check_kernel(&kept), Ok(()));
+        // Twice is once.
+        assert_eq!(loadable(&kept).unwrap(), kept);
+
+        // install stores just that.
+        let mut image = mkfs::mkfs(&small(), None).unwrap();
+        let info = install(&mut image, &bootloader(100), &full).unwrap();
+        assert_eq!(
+            info.kernel_sectors, 4,
+            "0x680 bytes, two blocks (the whole file would take three)"
+        );
+        assert_eq!(&kernel_image(&image).unwrap()[..kept.len()], &kept[..]);
+        assert!(loadable(b"not an elf").unwrap_err().starts_with("kernel:"));
+    }
+
     #[test]
     fn installs_after_the_filesystem() {
         let mut image = mkfs::mkfs(&small(), None).unwrap();
