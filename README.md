@@ -7,7 +7,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 | **Excalibur** | The ISA: RV32IM + Zicsr, M/S/U privilege, Sv32 paging, plus the Xcal extensions | Spec v0 in [`docs/excalibur-spec.md`](docs/excalibur-spec.md) |
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps) |
 | **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | merlin-as: everything but the encoder ([guide](crates/merlin-as/ENCODER.md)). merlin-ld: everything but applying relocations ([src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: v0 front end (int-only C subset) and test harness, codegen next. merlin-objdump: matches llvm-objdump |
-| **Camelot** | The kernel / OS | Boots on Grail: UART, `kprintf` ([kernel/](kernel/README.md)) |
+| **Camelot** | The kernel / OS | Boots on Grail in S-mode: UART, `kprintf`, trap handling, timer ticks ([kernel/](kernel/README.md)) |
 
 ## Layout
 
