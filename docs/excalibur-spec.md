@@ -173,6 +173,15 @@ Any other custom-0 encoding raises illegal-instruction.
 
 Grail also redraws at ~60 Hz on its own, so `FB_PRESENT` is optional. Host side: a window opened through raw Win32 (GDI) calls via `extern "system"` FFI, no crates. Headless runs can dump frames as PPM files.
 
+Details:
+
+- The registers are 32-bit only: byte or halfword accesses in 0x3000_0000 - 0x3000_0FFF raise access faults. Unused offsets in that page read as 0 and ignore writes, as do writes to the read-only registers. `FB_PRESENT` reads as 0.
+- `FB_CTRL` bits other than bit 0 are reserved, read as 0. Both registers reset to 0, so the display starts disabled.
+- While the display is disabled it shows black; VRAM keeps its contents and can be drawn into before enabling.
+- VRAM is plain memory: byte, halfword and word accesses, same alignment rules as RAM (section 4). It resets to 0. The top byte of each pixel is ignored. Byte order in memory is B, G, R, X, which is also a 32-bpp Windows DIB, so Grail blits it without conversion.
+- Grail runs everything on one thread: the CPU runs in slices that end early right after a `FB_PRESENT` write; between slices it pumps the window's messages and redraws on a present, when Windows asks for a repaint, or when ~16 ms of host time have passed. The window is opened only with `--fb` (Windows only; elsewhere Grail warns and runs headless, the default). The image is stretched to the window's client area. Closing the window stops the emulator (exit code 0); if the program stops first, the window stays open on the last frame until it is closed, and Grail then exits with the program's code.
+- `--fb-dump DIR` writes `DIR/frame-NNNN.ppm` (binary P6, 640×480, numbered from 0000) after every `FB_PRESENT` and once more when the machine stops. It works with or without the window.
+
 ### 9.4 Keyboard (MMIO)
 
 | Address | Register | Notes |
