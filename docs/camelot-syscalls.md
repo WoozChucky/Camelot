@@ -45,7 +45,8 @@ against the process's page table (each page must be below `USER_TOP`,
 mapped, and mapped with U and the access the call needs: R to read from it,
 W to write to it) and then copies through the physical pages. A range that
 fails the check, such as a null pointer, a kernel address, the guard page
-under the stack, memory past the end of the heap, read-only memory for a
+under the stack, the stack below `sp` (not grown to yet: see "Starting a
+program"), memory past the end of the heap, read-only memory for a
 buffer the kernel writes, or a length that runs past `USER_TOP` or wraps
 around, makes the call return `-EFAULT` having done nothing: no bytes are
 written to the console, a file or a pipe, no input is consumed, no file is
@@ -210,8 +211,9 @@ starts empty, on the page after the program's last segment, and grows up
 towards the stack: new pages are mapped R+W and read zero, including bytes
 given back by an earlier shrink and grown again. A negative `increment`
 shrinks it, unmapping and freeing the pages no longer used. Errors:
-`-ENOMEM` when the heap would reach the guard page under the stack or memory
-runs out (nothing changes), `-EINVAL` when it would shrink below its start.
+`-ENOMEM` when the heap would reach the guard page under the stack's limit
+(`USER_LOAD_TOP`, 0x0B7F_F000) or memory runs out (nothing changes),
+`-EINVAL` when it would shrink below its start.
 
 **uptime()** returns the timer ticks since boot (10 a second at the nominal
 clock), as an unsigned number.
@@ -743,17 +745,26 @@ started as `/bin/sh`, from the filesystem when there is one and it has a
 A program is an ELF32 executable linked with `kernel/user/user.ld`: code from
 0x1000 (page 0 is never mapped, so a null pointer faults), each output
 section on a page boundary so the kernel can map each with its own
-permissions, and a heap after the last one. User space is the low 4 MiB:
+permissions, and a heap after the last one. User space is the low 192 MiB:
 
 ```
 0x0000_0000  unmapped
 0x0000_1000  .text (R+X), .rodata (R), .data and .bss (R+W)
              heap (R+W), grown by sbrk
              ...
-0x003F_E000  guard page, unmapped
-0x003F_F000  stack page (R+W)
-0x0040_0000  USER_TOP: nothing above is accessible from U-mode
+0x0B7F_F000  guard page, unmapped (USER_LOAD_TOP)
+0x0B80_0000  the stack's limit (USER_STACK_LIMIT): 8 MiB of stack at most
+             ...
+             the stack (R+W), grown down on demand
+0x0BFF_F000  the stack's first page, mapped from the start
+0x0C00_0000  USER_TOP: nothing above is accessible from U-mode
 ```
+
+The stack is mapped as it grows: a load or store just below it maps the
+pages down to there, and every system call first maps it down to the
+caller's `sp`, so a buffer in a stack frame the program hasn't touched yet
+is good for `read`. Past 8 MiB is the guard page: a fault, which kills the
+process. So is running out of RAM while it grows; the kernel says so first.
 
 Whether from `spawn` or `exec`, the kernel enters the program at its ELF
 entry point, crt0's `_start`, with every register zero except:
@@ -762,7 +773,7 @@ entry point, crt0's `_start`, with every register zero except:
 - `a1` = `argv`, the address of the argument array;
 - `sp`, 16-byte aligned, just below the arguments.
 
-The arguments sit at the top of the stack page:
+The arguments sit at the top of the stack's first page:
 
 ```
 USER_TOP     the strings, argv[0]'s first, each NUL-terminated

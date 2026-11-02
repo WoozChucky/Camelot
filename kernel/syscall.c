@@ -9,6 +9,7 @@
 #include "syscall.h"
 #include "exec.h"
 #include "kalloc.h"
+#include "kprintf.h"
 #include "net.h"
 #include "proc.h"
 #include "string.h"
@@ -141,6 +142,15 @@ void syscall(struct trap_frame *f) {
     struct proc *p = myproc();
     int ret;
     u32 num = f->regs[REG_A7];
+    /* Whatever the program has on its stack is at or above sp: map the stack
+     * down to it, so that a buffer there the program hasn't touched yet (a
+     * big local array passed to read()) is user memory like any other. A
+     * thread whose stack is on the heap has sp outside the stack's range. */
+    u32 sp = f->regs[REG_SP];
+    if (sp >= USER_STACK_LIMIT && sp < p->stack_low && proc_grow_stack(sp) == -ENOMEM) {
+        kprintf("pid %u (%s) killed: no memory to grow its stack to 0x%08x\n", p->pid, p->name, sp);
+        proc_exit(-1);
+    }
     bool net = is_net_call(num);
     if (net) {
         acquire(&net_lock);

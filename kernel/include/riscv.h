@@ -67,6 +67,9 @@ void w_medeleg(u32 v);
 u32 r_mideleg(void);
 void w_mideleg(u32 v);
 void w_mie(u32 v);
+/* Which counters S-mode may read: bit 1 (TM) is `time`. */
+void w_mcounteren(u32 v);
+#define MCOUNTEREN_TM (1u << 1)
 
 /* S-mode CSRs. */
 u32 r_sstatus(void);
@@ -79,6 +82,10 @@ u32 r_stvec(void);
 void w_stvec(u32 v);
 u32 r_satp(void);
 void w_satp(u32 v);
+
+/* The low word of `time` (rdtime), the CLINT's mtime: how S-mode reads the
+ * clock, with no CLINT mapping (start() lets it, through mcounteren). */
+u32 r_time(void);
 
 /* sfence.vma zero, zero: orders earlier page-table writes before later
  * translations, for every address. Grail has no TLB, so this costs nothing

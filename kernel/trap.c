@@ -237,6 +237,24 @@ void kernel_trap(struct trap_frame *f) {
     trap_panic(f);
 }
 
+/* Whether `f`, a fault in U-mode, is a load or a store to a stack page not
+ * mapped yet, now mapped (proc_grow_stack). Not when the page can't be had:
+ * that is said, and the fault kills the process. */
+static bool stack_fault(struct trap_frame *f) {
+    if (f->scause != CAUSE_LOAD_PAGE_FAULT && f->scause != CAUSE_STORE_PAGE_FAULT) {
+        return false;
+    }
+    struct proc *p = myproc();
+    if (f->stval < USER_STACK_LIMIT || f->stval >= p->stack_low) {
+        return false;
+    }
+    if (proc_grow_stack(f->stval) == 0) {
+        return true;
+    }
+    kprintf("pid %u (%s): no memory to grow its stack to 0x%08x\n", p->pid, p->name, f->stval);
+    return false;
+}
+
 void user_trap(struct trap_frame *f) {
     /* From here on, a trap is the kernel's own. Interrupts stay off (the trap
      * cleared sstatus.SIE) until the process is back in U-mode. */
@@ -252,6 +270,8 @@ void user_trap(struct trap_frame *f) {
         /* sepc is the ecall itself: resume after it. */
         f->sepc += 4;
         syscall(f);
+    } else if (stack_fault(f)) {
+        /* The stack grew to the faulting address: run the instruction again. */
     } else {
         /* A fault in U-mode is the program's, not the kernel's. */
         proc_kill(f);

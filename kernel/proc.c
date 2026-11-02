@@ -357,7 +357,7 @@ static pagetable_t build_space(const struct elf_file *prog, const char *who, con
     }
     u8 *stack = kzalloc();
     if (stack == NULL ||
-        map_pages(pt, USER_STACK, (u32)(uintptr)stack, USER_STACK_SIZE, PTE_U | PTE_R | PTE_W) != 0) {
+        map_pages(pt, USER_STACK, (u32)(uintptr)stack, PGSIZE, PTE_U | PTE_R | PTE_W) != 0) {
         if (stack != NULL) {
             kfree(stack);
         }
@@ -389,6 +389,7 @@ int proc_create(const struct elf_file *prog, const char *path, const char *name,
     }
     p->heap_base = heap;
     p->brk = heap;
+    p->stack_low = USER_STACK;
 
     /* The thread's kernel side: its first swtch() lands in thread_start, on
      * the empty kernel stack below the frame. */
@@ -507,6 +508,7 @@ int proc_exec_commit(struct exec_image *img, const char *name, const struct proc
     p->pagetable = img->pagetable;
     p->heap_base = img->heap;
     p->brk = img->heap;
+    p->stack_low = USER_STACK;
     *mythread()->frame = img->frame;
     /* The new table holds the kernel's mappings too: switch to it before
      * freeing the old one, which satp points at. No other hart uses either:
@@ -1040,6 +1042,39 @@ int proc_wait(int pid, u32 status) {
         /* proc_exit() wakes the parent. */
         sleep(p, &proc_lock);
     }
+}
+
+int proc_grow_stack(u32 va) {
+    struct proc *p = myproc();
+    if (va < USER_STACK_LIMIT || va >= USER_TOP) {
+        return -EFAULT;
+    }
+    u32 low = PGROUNDDOWN(va);
+    /* stack_low only moves down, so a stale look can only send us to the
+     * lock for nothing. */
+    if (low >= p->stack_low) {
+        return 0;
+    }
+    acquiresleep(&p->heap_lock);
+    int r = 0;
+    while (p->stack_low > low) {
+        u32 a = p->stack_low - PGSIZE;
+        void *mem = kzalloc();
+        if (mem == NULL || map_pages(p->pagetable, a, (u32)(uintptr)mem, PGSIZE, PTE_U | PTE_R | PTE_W) != 0) {
+            /* What was mapped stays: the stack is just shorter. */
+            if (mem != NULL) {
+                kfree(mem);
+            }
+            r = -ENOMEM;
+            break;
+        }
+        p->stack_low = a;
+    }
+    releasesleep(&p->heap_lock);
+    /* New mappings only, so no other hart has a stale one; this hart may have
+     * cached the fault's missing translation. */
+    sfence_vma();
+    return r;
 }
 
 int proc_sbrk(i32 increment) {

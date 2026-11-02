@@ -137,6 +137,12 @@ struct proc {
      * Every page from heap_base up to brk is mapped. */
     u32 heap_base;
     u32 brk;
+    /* The stack's lowest mapped address: every page from here up to
+     * USER_TOP is mapped. It starts at USER_STACK and only moves down
+     * (proc_grow_stack), never below USER_STACK_LIMIT. */
+    u32 stack_low;
+    /* sbrk() and stack growth one at a time: the heap's and the stack's
+     * bounds and the page table's user mappings. */
     struct sleeplock heap_lock;
     /* A kernel process's function (NULL for a user process). */
     void (*kfn)(void);
@@ -163,7 +169,7 @@ struct proc {
 };
 
 /* The tests walk procs[] by this size (and read pagetable at 32). */
-#define PROC_SIZE 164
+#define PROC_SIZE 168
 _Static_assert(sizeof(struct proc) == PROC_SIZE, "the tests index procs[] by PROC_SIZE");
 
 /* A user program embedded in the kernel image as an ELF executable
@@ -328,6 +334,17 @@ int proc_harts(struct hartinfo *out, int max);
  * address `status` unless that is 0. -ECHILD if there is no such child,
  * -EFAULT if `status` is not writable user memory. */
 int proc_wait(int pid, u32 status);
+
+/* Grows the current process's stack down to the page holding `va`, mapping
+ * zeroed pages from its lowest mapped one (stack_low) down: the stack is
+ * mapped on demand, as Linux's is, so a program pays in RAM only for the
+ * stack it uses. Called on a page fault in the stack's range (trap.c) and at
+ * every system call down to the caller's sp (syscall.c), since the kernel
+ * reads and writes user memory through the page table, never by faulting.
+ * 0 when the page is mapped (already, or now), -EFAULT if `va` is not in
+ * [USER_STACK_LIMIT, USER_TOP), -ENOMEM if a page can't be had (the pages
+ * mapped so far stay). */
+int proc_grow_stack(u32 va);
 
 /* sbrk(): moves the end of the current process's heap by `increment` bytes
  * and returns where it was. New heap pages read zero; pages wholly above the

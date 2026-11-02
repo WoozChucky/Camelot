@@ -199,7 +199,7 @@ thread waits in a slot (one per thread) for the reply with the same
 identifier and sequence number. The `ping` system call uses the caller's tid
 as the identifier (a single-threaded process's tid is its pid), so two
 threads' pings never mix, and a one-second
-timeout. The round-trip time comes from the CLINT's `mtime` and is reported
+timeout. The round-trip time comes from `mtime` (the `time` CSR) and is reported
 in microseconds.
 
 ## UDP
@@ -337,7 +337,7 @@ table is full the one nearest its end gives up its slot to a new socket:
 TIME-WAIT only guards against old duplicates, and a slot is worth more.
 
 **Initial sequence numbers** follow RFC 6528: a clock ticking every 4 µs
-(from the CLINT's `mtime`) plus a keyed hash of the two addresses and ports,
+(from `mtime`, through the `time` CSR) plus a keyed hash of the two addresses and ports,
 so they are neither guessable nor reused by a quick reconnection. The tests
 can set the next one (`tcp_isn_next`, written into the kernel's RAM) to see
 sequence numbers wrap.

@@ -50,7 +50,7 @@
 #define STACK_SIZE 1024
 #define PAGE 4096
 /* Where the heap may grow to (USER_LOAD_TOP in kernel/include/vm.h). */
-#define USER_LOAD_TOP 0x003fe000
+#define USER_LOAD_TOP 0x0b7ff000
 /* Process slots (NPROC in kernel/include/proc.h). */
 #define NPROC 8
 

@@ -7,7 +7,7 @@
 # it fills its stack and .bss with non-zero bytes, so that the pages it gives
 # back are dirty for whoever gets them next.
 
-    .equ USER_TOP, 0x00400000
+    .equ USER_TOP, 0x0c000000
     .equ STACK_SIZE, 0x1000
     .equ BSS_SIZE, 0x1800
     .equ INITIAL, 0x600df00d
