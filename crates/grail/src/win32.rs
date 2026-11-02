@@ -39,6 +39,21 @@ pub const WM_KEYUP: u32 = 0x0101;
 pub const WM_SYSKEYDOWN: u32 = 0x0104;
 pub const WM_SYSKEYUP: u32 = 0x0105;
 pub const WM_SYSCOMMAND: u32 = 0x0112;
+pub const WM_MOUSEMOVE: u32 = 0x0200;
+pub const WM_LBUTTONDOWN: u32 = 0x0201;
+pub const WM_LBUTTONUP: u32 = 0x0202;
+pub const WM_RBUTTONDOWN: u32 = 0x0204;
+pub const WM_RBUTTONUP: u32 = 0x0205;
+pub const WM_MBUTTONDOWN: u32 = 0x0207;
+pub const WM_MBUTTONUP: u32 = 0x0208;
+pub const WM_MOUSEWHEEL: u32 = 0x020a;
+pub const WM_CAPTURECHANGED: u32 = 0x0215;
+/// Mouse message `wParam` flags: the buttons held.
+pub const MK_LBUTTON: usize = 0x0001;
+pub const MK_RBUTTON: usize = 0x0002;
+pub const MK_MBUTTON: usize = 0x0010;
+/// `WM_MOUSEWHEEL` units in one notch of a wheel.
+pub const WHEEL_DELTA: i32 = 120;
 /// `WM_SYSCOMMAND` request to open the window menu from the keyboard. Its `lParam` is
 /// the character of an Alt chord (Alt+Space), or 0 for a lone Alt tap or F10.
 pub const SC_KEYMENU: usize = 0xf100;
@@ -215,6 +230,13 @@ extern "system" {
     pub fn WaitMessage() -> BOOL;
     pub fn AdjustWindowRect(rect: *mut RECT, style: u32, menu: BOOL) -> BOOL;
     pub fn GetClientRect(hwnd: HWND, rect: *mut RECT) -> BOOL;
+    pub fn SetCapture(hwnd: HWND) -> HWND;
+    pub fn ReleaseCapture() -> BOOL;
+    pub fn GetCapture() -> HWND;
+    #[cfg(test)]
+    pub fn MoveWindow(hwnd: HWND, x: i32, y: i32, width: i32, height: i32, repaint: BOOL) -> BOOL;
+    #[cfg(test)]
+    pub fn GetWindowRect(hwnd: HWND, rect: *mut RECT) -> BOOL;
     pub fn SetWindowTextW(hwnd: HWND, text: *const u16) -> BOOL;
     pub fn LoadCursorW(hinst: HINSTANCE, name: *const u16) -> HCURSOR;
     pub fn GetDC(hwnd: HWND) -> HDC;
@@ -246,6 +268,23 @@ extern "system" {
 
 #[link(name = "gdi32")]
 extern "system" {
+    #[cfg(test)]
+    pub fn CreateCompatibleDC(hdc: HDC) -> HDC;
+    #[cfg(test)]
+    pub fn DeleteDC(hdc: HDC) -> BOOL;
+    #[cfg(test)]
+    pub fn CreateDIBSection(
+        hdc: HDC,
+        pbmi: *const BITMAPINFO,
+        usage: u32,
+        ppvBits: *mut *mut c_void,
+        hSection: HANDLE,
+        offset: u32,
+    ) -> HANDLE;
+    #[cfg(test)]
+    pub fn SelectObject(hdc: HDC, h: HANDLE) -> HANDLE;
+    #[cfg(test)]
+    pub fn DeleteObject(h: HANDLE) -> BOOL;
     pub fn SetStretchBltMode(hdc: HDC, mode: i32) -> i32;
     pub fn StretchDIBits(
         hdc: HDC,

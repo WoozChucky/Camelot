@@ -35,7 +35,7 @@
     .equ DEV_ENTRY_SIZE,  16            # type, base, size, irq
     .equ SYSINFO_MAGIC,   0x53595349
     .equ FLAG_REAL_TIME,  1
-    .equ DEV_TYPES,       9             # highest type code with a name below
+    .equ DEV_TYPES,       10            # highest type code with a name below
 
     .section .text.start
     .globl _start
@@ -201,6 +201,7 @@ put_hex:
 # Device names by type code (spec section 9.5), padded to one column.
 dev_names:
     .word s_unknown, s_clint, s_plic, s_uart, s_test, s_fb_ctrl, s_fb_vram, s_sysinfo, s_keyboard, s_block
+    .word s_pointer
 s_unknown:      .asciz "  unknown   "
 s_clint:        .asciz "  CLINT     "
 s_plic:         .asciz "  PLIC      "
@@ -211,6 +212,7 @@ s_fb_vram:      .asciz "  fb-vram   "
 s_sysinfo:      .asciz "  sysinfo   "
 s_keyboard:     .asciz "  keyboard  "
 s_block:        .asciz "  block     "
+s_pointer:      .asciz "  pointer   "
 s_title:        .asciz "sysinfo v"
 s_ram:          .asciz "RAM      "
 s_mib_at:       .asciz " MiB at "
