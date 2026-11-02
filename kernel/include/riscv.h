@@ -53,6 +53,7 @@
 /* satp: MODE (bit 31) = 1 selects Sv32; PPN (bits 21:0) is the physical page
  * number of the root page table. */
 #define SATP_SV32 (1u << 31)
+#define SATP_PPN_MASK 0x003fffffu
 
 /* M-mode CSRs (only usable before start() drops to S-mode). */
 u32 r_mstatus(void);

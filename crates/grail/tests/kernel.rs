@@ -1,9 +1,9 @@
 //! The Camelot kernel (`kernel/kernel.elf`, committed) run through the `grail`
 //! binary, with `--max-steps` as a guard: booting with paging on (with several
-//! `--ram` sizes), the timer ticks, the shell driven through stdin, and the
-//! panics from its deliberate faults. The kernel's own tests (traps,
-//! delegation, the register dump, the page table, the console) are in
-//! `crates/xtask/tests/kernel.rs`.
+//! `--ram` sizes), the timer ticks, the shell driven through stdin, the panics
+//! from its deliberate faults, and user programs taking turns or getting
+//! killed. The kernel's own tests (traps, delegation, the register dump, the
+//! page table, the console, processes) are in `crates/xtask/tests/kernel.rs`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -155,6 +155,7 @@ fn shell_accepts_windows_line_ends() {
         "{SHELL_BANNER}{PROMPT}help\n\
          help    this list\n\
          ticks   timer ticks since boot (10 per second)\n\
+         run     run user programs side by side (run PROG...; run alone lists them)\n\
          halt    stop the machine\n\
          {PROMPT}nope\n\
          unknown command: nope (try help)\n\
@@ -214,4 +215,76 @@ fn store_to_kernel_text_panics() {
     assert!(out.contains(&report), "{out}");
     // The page is mapped, read and execute only.
     assert!(out.contains(" -A--X-RV\n"), "{out}");
+}
+
+// ---- User processes (issue #20) ----
+
+/// The lines `run` prints from its command to the next prompt: what the
+/// processes and the kernel printed about them.
+fn run_output<'a>(out: &'a str, command: &str) -> Vec<&'a str> {
+    let start = format!("{PROMPT}{command}\n");
+    let at = out
+        .find(&start)
+        .unwrap_or_else(|| panic!("no `{command}` in:\n{out}"))
+        + start.len();
+    let rest = &out[at..];
+    rest[..rest
+        .find(PROMPT)
+        .unwrap_or_else(|| panic!("`{command}` never ended:\n{out}"))]
+        .lines()
+        .collect()
+}
+
+#[test]
+fn user_programs_run_interleaved() {
+    // ping and pong each print four lines about half a tick apart, from
+    // U-mode in their own address spaces. The scheduler switches on every
+    // timer tick, so their lines alternate in pairs.
+    let (code, out) = grail(&kernel_elf(), b"run ping pong\nhalt\n");
+    assert_eq!(code, Some(0), "output:\n{out}");
+    let lines = run_output(&out, "run ping pong");
+    let printed: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with("ping ") || l.starts_with("pong "))
+        .collect();
+    assert_eq!(printed.len(), 8, "{out}");
+    // Each in order, and they take turns more than once.
+    for name in ["ping", "pong"] {
+        let own: Vec<&str> = printed.iter().copied().filter(|l| l.starts_with(name)).collect();
+        let want: Vec<String> = (1..=4).map(|i| format!("{name} {i}")).collect();
+        assert_eq!(own, want, "{out}");
+    }
+    let turns = printed.windows(2).filter(|w| w[0][..4] != w[1][..4]).count();
+    assert!(turns >= 3, "only {turns} switches:\n{out}");
+    // ping, created first, goes first; both exit normally.
+    assert_eq!(printed[0], "ping 1", "{out}");
+    for exit in ["pid 1 (ping) exited: 0", "pid 2 (pong) exited: 0"] {
+        assert!(lines.contains(&exit), "{exit} missing:\n{out}");
+    }
+}
+
+#[test]
+fn faulting_user_programs_are_killed_and_the_kernel_carries_on() {
+    // badload reads kernel memory (mapped in its page table, but without U),
+    // badhalt executes xcal.halt (M-mode only). Both die, the kernel says
+    // why, hello still runs, and so does the shell afterwards.
+    let (code, out) = grail(&kernel_elf(), b"run badload badhalt hello\nticks\nhalt\n");
+    assert_eq!(code, Some(0), "output:\n{out}");
+    let lines = run_output(&out, "run badload badhalt hello");
+    assert_eq!(
+        lines,
+        [
+            "pid 1 (badload) killed: load page fault",
+            "  scause 0x0000000d  sepc 0x00001004  stval 0x80000000",
+            "  va 0x80000000 maps to pa 0x80000000, pte 0x2000004b -A--X-RV",
+            "pid 2 (badhalt) killed: illegal instruction",
+            "  scause 0x00000002  sepc 0x00001004  stval 0x0005100b",
+            "hello from user mode",
+            "pid 3 (hello) exited: 0",
+        ],
+        "{out}"
+    );
+    assert!(out.contains(&format!("{PROMPT}ticks\nticks: ")), "{out}");
+    assert!(out.ends_with(&format!("{PROMPT}halt\n")), "{out}");
 }

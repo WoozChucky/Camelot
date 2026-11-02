@@ -1,0 +1,16 @@
+[package]
+name = "avalon"
+description = "Avalon, the hypervisor server: runs N Grail virtual machines and serves the Avalon protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+avalon-proto = { path = "../avalon-proto" }
+excalibur = { path = "../excalibur" }
+grail = { path = "../grail" }
+
+[dev-dependencies]
+# The tests build small guest programs from assembly with our own toolchain.
+merlin-as = { path = "../merlin-as" }
+merlin-ld = { path = "../merlin-ld" }

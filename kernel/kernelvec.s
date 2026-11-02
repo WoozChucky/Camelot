@@ -3,9 +3,10 @@
 # kernel_trap(frame), then restores everything and returns with sret. sepc and
 # sstatus are restored from the frame, so kernel_trap may change them.
 #
-# Every trap comes from S-mode for now (there are no user processes yet), so
-# the interrupted sp is a kernel stack and the frame goes just below it. User
-# traps will need sscratch to find one.
+# stvec points here only while the hart is in S-mode, so the interrupted sp
+# is a kernel stack and the frame goes just below it. Traps from U-mode go to
+# user_vec (uservec.s) instead, which finds the process's kernel stack
+# through sscratch.
 
     .equ FRAME_SIZE, 144        # TRAP_FRAME_SIZE, a multiple of 16
     .equ FRAME_SEPC, 128

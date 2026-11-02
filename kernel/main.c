@@ -6,6 +6,7 @@
 #include "kprintf.h"
 #include "memlayout.h"
 #include "mmio.h"
+#include "proc.h"
 #include "riscv.h"
 #include "string.h"
 #include "timer.h"
@@ -25,6 +26,10 @@
  * the NUL). */
 #define PROMPT "camelot> "
 #define LINE_MAX 64
+
+/* The most programs one `run` command starts. More than NPROC is allowed, so
+ * that running out of process slots can be seen (and tested). */
+#define RUN_MAX 16
 
 /* Deliberate faults, to exercise the panic path. The image ships with
  * BOOT_FAULT_NONE; tests patch `boot_fault` in it to pick another one. The
@@ -190,6 +195,79 @@ static char *trim(char *s) {
     return s;
 }
 
+/* If `cmd` starts with the word `word` (followed by a blank or the end),
+ * what comes after it; else NULL. */
+static char *after_word(char *cmd, const char *word) {
+    usize n = strlen(word);
+    for (usize i = 0; i < n; i++) {
+        if (cmd[i] != word[i]) {
+            return NULL;
+        }
+    }
+    if (cmd[n] != 0 && !is_blank(cmd[n])) {
+        return NULL;
+    }
+    return cmd + n;
+}
+
+/* Cuts the first blank-separated word off `*s`: returns it NUL-terminated
+ * (empty at the end of the line) and moves `*s` past it. */
+static char *next_word(char **s) {
+    char *p = *s;
+    while (is_blank(*p)) {
+        p++;
+    }
+    char *word = p;
+    while (*p != 0 && !is_blank(*p)) {
+        p++;
+    }
+    if (*p != 0) {
+        *p = 0;
+        p++;
+    }
+    *s = p;
+    return word;
+}
+
+/* `run PROG...`: starts a process for each program named, then schedules
+ * them until every one has exited or been killed. Nothing starts if a name
+ * is unknown. With no names, lists the programs. */
+static void run(char *args) {
+    const struct user_program *progs[RUN_MAX];
+    u32 n = 0;
+    for (;;) {
+        char *name = next_word(&args);
+        if (name[0] == 0) {
+            break;
+        }
+        if (n == RUN_MAX) {
+            kprintf("run: at most %u programs\n", RUN_MAX);
+            return;
+        }
+        progs[n] = user_program_find(name);
+        if (progs[n] == NULL) {
+            kprintf("run: no program called %s\n", name);
+            return;
+        }
+        n++;
+    }
+    if (n == 0) {
+        kprintf("programs:");
+        for (u32 i = 0; i < user_program_count; i++) {
+            kprintf(" %s", user_programs[i].name);
+        }
+        kprintf("\n");
+        return;
+    }
+    for (u32 i = 0; i < n; i++) {
+        const char *err;
+        if (proc_create(progs[i], &err) == NULL) {
+            kprintf("run: cannot start %s: %s\n", progs[i]->name, err);
+        }
+    }
+    scheduler();
+}
+
 /* A tiny built-in shell, until there is a user-space one: reads commands from
  * the console and returns on `halt`. */
 static void shell(void) {
@@ -202,9 +280,13 @@ static void shell(void) {
         if (cmd[0] == 0) {
             continue;
         }
-        if (strcmp(cmd, "help") == 0) {
+        char *args = after_word(cmd, "run");
+        if (args != NULL) {
+            run(args);
+        } else if (strcmp(cmd, "help") == 0) {
             kprintf("help    this list\n");
             kprintf("ticks   timer ticks since boot (%u per second)\n", TICK_HZ);
+            kprintf("run     run user programs side by side (run PROG...; run alone lists them)\n");
             kprintf("halt    stop the machine\n");
         } else if (strcmp(cmd, "ticks") == 0) {
             kprintf("ticks: %u\n", ticks);
