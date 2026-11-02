@@ -337,7 +337,7 @@ length 14    Hello  "AVLN"       v5     agent "rt"
 
 | Message | Payload | Notes |
 |---|---|---|
-| `CreateVm` | `name: string`, `profile: HardwareProfile`, `program: bytes` | `program` is an Excalibur ELF executable. The VM is loaded and left in state created, its network cards plugged into the switches the profile names. Errors: `InvalidName`, `AlreadyExists`, `InvalidProfile` (also a disk that cannot be opened or attached, see below, and a bad network card), `NoSuchSwitch` (a card names a switch that does not exist), `AlreadyExists` (a card's address is on its switch already), `InvalidProgram`, `OverBudget`. A create that fails plugs in nothing |
+| `CreateVm` | `name: string`, `profile: HardwareProfile`, `program: bytes` | `program` is an Excalibur ELF executable, or empty: the VM then boots from its disk 0, as `grail --disk IMG` does (spec section 7, "Boot from disk"), and a profile without a disk is `InvalidProgram`. The VM is loaded and left in state created, its network cards plugged into the switches the profile names. Errors: `InvalidName`, `AlreadyExists`, `InvalidProfile` (also a disk that cannot be opened or attached, see below, and a bad network card), `NoSuchSwitch` (a card names a switch that does not exist), `AlreadyExists` (a card's address is on its switch already), `InvalidProgram`, `OverBudget`. A create that fails plugs in nothing |
 | `VmCreated` | `id: u32` | ids are never reused while the server runs |
 | `ListVms` | empty | |
 | `VmList` | `vms: list<VmSummary>` | in id order |

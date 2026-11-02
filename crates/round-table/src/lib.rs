@@ -29,9 +29,11 @@ controls them, and the virtual switches their network cards plug into. The
 disk commands manage the disk images of a Lake server.
 
 VM commands, sent to Avalon:
-  create --name NAME [options] <program.elf>
+  create --name NAME [options] [program.elf]
                   create a VM that runs program.elf (an Excalibur ELF
-                  executable, read here and sent to Avalon), in state created
+                  executable, read here and sent to Avalon), in state created.
+                  Without a program the VM boots from its first --disk, as
+                  grail --disk IMG does
   list            every VM: id, name, state, RAM, clock, disks and cards
   info VM         one VM in detail: hardware, disks, network cards, steps
                   run, devices
@@ -185,7 +187,8 @@ pub enum Command {
 pub struct Create {
     pub name: String,
     pub profile: HardwareProfile,
-    pub program: PathBuf,
+    /// `None`: boot from the first disk.
+    pub program: Option<PathBuf>,
     pub start: bool,
 }
 
@@ -412,8 +415,8 @@ fn disk_argument(command: &str, rest: &[&str]) -> Result<String, String> {
 
 fn parse_create(rest: &[&str], options: &[(&'static str, String)]) -> Result<Create, String> {
     let program = match rest {
-        [program] => PathBuf::from(program),
-        [] => return Err("'create' needs the program to run (an ELF file)".into()),
+        [program] => Some(PathBuf::from(program)),
+        [] => None,
         [_, extra, ..] => return Err(format!("'create' takes one program (got '{extra}' as well)")),
     };
     let mut name = None;
@@ -441,6 +444,10 @@ fn parse_create(rest: &[&str], options: &[(&'static str, String)]) -> Result<Cre
         }
     }
     let name = name.ok_or("'create' needs --name NAME")?;
+    let has_disk = profile.devices.iter().any(|d| matches!(d, DeviceSpec::Disk(_)));
+    if program.is_none() && !has_disk {
+        return Err("'create' needs the program to run (an ELF file), or a --disk to boot from".into());
+    }
     Ok(Create {
         name,
         profile,
@@ -623,8 +630,12 @@ pub fn execute(invocation: &Invocation, out: &mut dyn Write) -> Result<(), Failu
     let text = match &invocation.command {
         Command::Help => format!("{USAGE}\n"),
         Command::Create(create) => {
-            let program = std::fs::read(&create.program)
-                .map_err(|e| Failure::Failed(format!("cannot read {}: {e}", create.program.display())))?;
+            // No program: an empty one, which Avalon boots from the VM's disk 0.
+            let program = match &create.program {
+                Some(path) => std::fs::read(path)
+                    .map_err(|e| Failure::Failed(format!("cannot read {}: {e}", path.display())))?,
+                None => Vec::new(),
+            };
             let mut avalon = connect("Avalon", &invocation.server)?;
             let id = avalon
                 .create_vm(&create.name, create.profile.clone(), program)
@@ -1092,7 +1103,7 @@ mod tests {
             panic!()
         };
         assert_eq!(c.name, "web");
-        assert_eq!(c.program, PathBuf::from("prog.elf"));
+        assert_eq!(c.program, Some(PathBuf::from("prog.elf")));
         assert!(c.start);
         assert_eq!(c.profile.ram_size, 64 << 20);
         assert_eq!(c.profile.clock_hz, Some(10_000_000));
@@ -1120,11 +1131,17 @@ mod tests {
         };
         assert_eq!(c.profile, HardwareProfile::default());
         assert!(!c.start);
+        // No program: the VM boots from its disk.
+        let Command::Create(c) = command("create --name os --disk root.img") else {
+            panic!()
+        };
+        assert_eq!(c.program, None);
+        assert_eq!(c.profile.devices.len(), 1);
         // A program whose name starts with '-', after '--'.
         let Command::Create(c) = command("create --name web -- -prog.elf") else {
             panic!()
         };
-        assert_eq!(c.program, PathBuf::from("-prog.elf"));
+        assert_eq!(c.program, Some(PathBuf::from("-prog.elf")));
     }
 
     #[test]
@@ -1155,7 +1172,7 @@ mod tests {
             ("info 1 2", "'info' takes one VM (got '2' as well)"),
             (
                 "create --name a",
-                "'create' needs the program to run (an ELF file)",
+                "'create' needs the program to run (an ELF file), or a --disk to boot from",
             ),
             (
                 "create a.elf b.elf --name a",
