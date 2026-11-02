@@ -28,7 +28,7 @@ tasks:
                made bootable with kernel/boot/boot.s and kernel/kernel-disk.elf
                (grail --disk target/camelot-fs.img boots it, in the default 4 MiB of RAM)
                -o PATH: output file; --size N: the image's size in blocks (1 KiB each, default
-               2048: 2 MiB), the filesystem filling what the kernel leaves;
+               4096: 4 MiB), the filesystem filling what the kernel leaves;
                --no-boot: the filesystem alone, N blocks
   boot         build the boot ROM's disk loader (crates/grail/rom/diskboot.elf) and
                Camelot's bootloader (kernel/boot/boot.elf) with merlin-as + merlin-ld

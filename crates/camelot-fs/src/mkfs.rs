@@ -364,6 +364,7 @@ pub fn mkfs(opts: &Options, root: Option<&Path>) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use crate::read::Fs;
+    use crate::BITS_PER_BLOCK;
 
     fn small() -> Options {
         Options {
@@ -491,6 +492,50 @@ mod tests {
             .unwrap_err()
             .contains("not a regular file"));
         assert!(r.read_file("/dev").unwrap_err().contains("is a directory"));
+    }
+
+    #[test]
+    fn big_filesystems_with_several_bitmap_blocks() {
+        // The 4 MiB root image's 4096 blocks (one bitmap block), and sizes
+        // whose bitmap takes two and three blocks, filled with files of the
+        // largest size until another does not fit, so their data runs through
+        // the blocks every bitmap block covers: every block is where the bitmap
+        // says, and fsck is clean.
+        for size in [4096, BITS_PER_BLOCK + 1, 2 * BITS_PER_BLOCK + 500] {
+            let opts = Options {
+                size,
+                ..Options::default()
+            };
+            let mut fs = Mkfs::new(&opts).unwrap();
+            let sb = *fs.superblock();
+            assert_eq!(
+                sb.datastart - sb.bmapstart,
+                size.div_ceil(BITS_PER_BLOCK),
+                "{size}"
+            );
+            let big = vec![0x5a; MAX_FILE_SIZE as usize];
+            let mut files = 0;
+            // A file of the largest size takes its blocks and an indirect one.
+            while fs.free_blocks() as usize > MAX_FILE_SIZE as usize / BSIZE + 1 {
+                fs.add_file(&format!("/f{files}"), &big).unwrap();
+                files += 1;
+            }
+            assert!(
+                sb.nblocks - fs.free_blocks() + sb.datastart > size - 300,
+                "{size}: not filled"
+            );
+            let used = sb.nblocks - fs.free_blocks();
+            let image = fs.finish();
+            assert_eq!(image.len(), size as usize * BSIZE);
+            let r = crate::fsck::check(&image).unwrap_or_else(|p| panic!("{size} blocks: {p:#?}"));
+            assert_eq!(
+                (r.files, r.used_blocks, r.free_blocks),
+                (files, used, sb.nblocks - used),
+                "{size}"
+            );
+            let read = Fs::open(&image).unwrap();
+            assert_eq!(read.read_file(&format!("/f{}", files - 1)).unwrap(), big);
+        }
     }
 
     #[test]

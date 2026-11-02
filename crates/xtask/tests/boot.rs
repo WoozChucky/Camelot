@@ -2,7 +2,7 @@
 //! the committed boot programs are what `cargo xtask boot` builds, and the root
 //! image of `cargo xtask fs`, made bootable, boots the kernel on Grail with no
 //! program, whose shell then runs programs from the disk's `/bin`. The image is
-//! 2 MiB and holds the disk kernel, which has no programs of its own (issue #108):
+//! 4 MiB and holds the disk kernel, which has no programs of its own (issue #108):
 //! it boots in a machine of the default 4 MiB, and panics when there is no shell
 //! to run.
 
@@ -72,12 +72,14 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
     let plain = xtask::fs::build(&root, &opts).unwrap();
 
-    // 2 MiB in all: the filesystem, the same as without booting, and the disk
+    // 4 MiB in all: the filesystem, the same as without booting, and the disk
     // kernel after it, as much of it as the bootloader loads (no symbols).
-    assert_eq!(image.len(), 2 << 20);
+    let size = xtask::fs::IMAGE_SIZE as usize;
+    assert_eq!(image.len(), size * BSIZE);
+    assert_eq!(image.len(), 4 << 20);
     let loadable = boot::loadable(&kernel).unwrap();
     assert!(loadable.len() < kernel.len());
-    assert_eq!(opts.size as usize, 2048 - loadable.len().div_ceil(BSIZE));
+    assert_eq!(opts.size as usize, size - loadable.len().div_ceil(BSIZE));
     let info = boot::boot_info(&image).unwrap().expect("bootable");
     assert_eq!(info.kernel_sector, 2 * opts.size);
     assert_eq!(&image[BSIZE..plain.len()], &plain[BSIZE..]);
@@ -87,17 +89,24 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     );
     let report = fsck::check(&image).unwrap();
     assert_eq!(report.files, fsck::check(&plain).unwrap().files);
-    // Room for the shell to write files: the free blocks are reported, and more
-    // than filetest's largest file (274 432 bytes, 269 blocks with its indirect
-    // block) needs, with some to spare. (The programs in /bin grow: what is free
-    // was over a fifth of the filesystem before shd and the thread programs.)
+    // Room for the shell to write files: at least a fifth of the filesystem free,
+    // whatever the image's size, which is also far more than filetest's largest
+    // file (274 432 bytes, 269 blocks with its indirect block) needs. The
+    // programs in /bin grow with every one added to kernel/user: when they take
+    // too much, this says so, and xtask::fs::IMAGE_SIZE must grow.
     eprintln!(
-        "the 2 MiB root image: a filesystem of {} blocks, {} free; a kernel of {} blocks",
+        "the {} KiB root image: a filesystem of {} blocks, {} free; a kernel of {} blocks",
+        image.len() / 1024,
         report.sb.size,
         report.free_blocks,
         loadable.len().div_ceil(BSIZE)
     );
-    assert!(report.free_blocks > 300, "{} free", report.free_blocks);
+    assert!(
+        report.free_blocks * 5 >= report.sb.size && report.free_blocks > 269,
+        "the programs in /bin leave {} of the root filesystem's {} blocks free, less than a fifth:          make the image bigger (xtask::fs::IMAGE_SIZE)",
+        report.free_blocks,
+        report.sb.size
+    );
 
     // The default machine: 4 MiB of RAM.
     assert_eq!(MachineConfig::default().ram_size, 4 << 20);
