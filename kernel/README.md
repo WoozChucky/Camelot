@@ -4,11 +4,12 @@ The Camelot OS kernel, in C with a little assembly. A small M-mode layer sets
 up trap delegation and the timer, then the kernel runs in S-mode: it prints a
 banner and a `kprintf` self-test over the UART, puts every free page of RAM on
 the page allocator's free list, turns on Sv32 paging with a kernel page table,
-runs the memory self-tests, takes ten timer ticks, and starts a tiny shell on
-the interrupt-driven UART console. The shell runs user programs in U-mode,
-each in its own page table, switching between them on every timer tick; a
-program that faults is killed and the kernel says why. Faults in the kernel
-itself panic with the cause, `sepc`, `stval` and a register dump.
+runs the memory self-tests, lists the disks, takes ten timer ticks, tests the
+first disk if there is one, and starts a tiny shell on the interrupt-driven
+UART console. The shell runs user programs in U-mode, each in its own page
+table, switching between them on every timer tick; a program that faults is
+killed and the kernel says why. Faults in the kernel itself panic with the
+cause, `sepc`, `stval` and a register dump.
 
 ```
 cargo run --release -p grail -- kernel/kernel.elf
@@ -24,6 +25,7 @@ ram: 128 MiB at 0x80000000
 paging: on (Sv32)
 vm self-test: 26/26 passed
 timer: 10 Hz tick, 10000000 Hz timebase
+disk: none
 tick 1
 tick 2
 ...
@@ -32,6 +34,26 @@ Type help for the list of commands.
 camelot> ticks
 ticks: 10
 camelot> halt
+```
+
+With disks attached (`--disk IMG`, `--disk-ro IMG`, spec section 9.6), the
+kernel lists each one and, after the ticks, runs its disk self-test on disk 0
+(read, write and read back a scratch block through the buffer cache, then put
+it back, so the image ends as it was; on a read-only disk the write must be
+refused):
+
+```
+cargo run --release -p grail -- --disk examples/disk/disk.img kernel/kernel.elf
+```
+
+```
+timer: 10 Hz tick, 10000000 Hz timebase
+disk 0: 8 sectors (4 KiB), irq 3
+tick 1
+...
+tick 10
+blk self-test: 14/14 passed
+Type help for the list of commands.
 ```
 
 The shell knows `help`, `ticks` (timer ticks since boot), `run` and `halt`.
@@ -104,7 +126,8 @@ The traps, the M-mode layer and the panic format are described in
 `docs/excalibur-spec.md` section 10, "Kernel traps"; the allocator, the page
 tables and the kernel address space in "Kernel memory"; the PLIC setup, the
 UART driver, the console and the shell in "Kernel console"; processes in
-"Kernel processes".
+"Kernel processes"; the disk driver and the buffer cache in "Kernel disks".
+A failed disk self-test check counts in the exit code like the others.
 
 A panic looks like this (from the deliberate illegal instruction the tests
 trigger by patching `boot_fault` in the image to 2):
@@ -146,8 +169,8 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `machine.s` | `machine_vec`, the M-mode trap handler: forwards the machine timer to S-mode as SSIP, serves machine calls (`MCALL_HALT`). `machine_halt()` makes that call from S-mode |
 | `kernelvec.s` | `kernel_vec`, the trap vector for traps from S-mode: saves x1-x31 and the trap CSRs as a `struct trap_frame` on the stack, calls `kernel_trap`, restores, `sret`. Also `illegal_instruction()` for the panic tests |
 | `uservec.s` | `user_vec`, the trap vector for traps from U-mode: saves the user registers in the process's trap frame (`sscratch`), calls `user_trap` on the process's kernel stack; `user_return`: frame to registers, `sret` to U-mode |
-| `trap.c` | `kernel_trap()`: counts timer ticks, claims/completes PLIC interrupts and runs the UART's handler, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `user_trap()`: a tick yields, an ecall goes to `syscall()`, a fault kills the process; `user_trap_return()`, `trap_init()`, `panic()` |
-| `proc.c` | processes: `proc_create()` (slot, kernel stack, page table, ELF, stack), the round-robin `scheduler()`, `yield()`, `proc_exit()`, `proc_kill()` |
+| `trap.c` | `kernel_trap()`: counts timer ticks, claims/completes PLIC interrupts and runs the UART's or a disk's handler, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `user_trap()`: a tick yields, an ecall goes to `syscall()`, a fault kills the process; `user_trap_return()`, `trap_init()`, `panic()` |
+| `proc.c` | processes: `proc_create()` (slot, kernel stack, page table, ELF, stack), `kproc_create()` (a kernel process running a C function), the round-robin `scheduler()` (idles in `wfi` while every process sleeps), `yield()`, `sleep()`/`wakeup()`, `proc_exit()`, `proc_kill()` |
 | `swtch.s` | `swtch()`: saves `ra`, `sp`, `s0`-`s11` and loads another thread's |
 | `elf.c` | `elf_load()`: checks an ELF32 executable and maps its `PT_LOAD` segments into user space |
 | `syscall.c` | `syscall()`: the provisional ecalls, exit and debug write |
@@ -159,15 +182,18 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `probe.s` | `probe_load()`/`probe_store()`: a word access that returns the trap cause instead of panicking (`kernel_trap` resumes them at `probe_fault`) |
 | `sysinfo.c` | reads Grail's sysinfo block: registers and the device table |
 | `timer.c` | `timebase_hz()` (sysinfo's `SYS_TIMEBASE_HZ`, read once), `timer_interval()`, `timer_init()` |
-| `plic.c` | `plic_init()` (UART source enabled for the S-mode context), `plic_claim()`, `plic_complete()` |
+| `plic.c` | `plic_init()` (UART source enabled for the S-mode context), `plic_enable()` (another source, such as a disk's), `plic_claim()`, `plic_complete()` |
+| `blk.c` | disk driver: `blk_init()` finds the disks in the sysinfo device table and enables their completion interrupts; `blk_read()`/`blk_write()`/`blk_flush()` issue one DMA request at a time and sleep until `blk_intr()`, the interrupt handler, wakes them with the `BLK_ERROR` code |
+| `bio.c` | buffer cache (xv6's): 30 one-KiB block buffers in LRU order, `bread()`/`bwrite()`/`brelse()`, each buffer sleep-locked while in use |
+| `blktest.c` | the disk self-test, in kernel processes: three readers at once, write and read back a scratch block (restored afterwards), errors, LRU reuse |
 | `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()` and `wfi()` |
-| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, ten ticks, the optional deliberate fault or memory API misuse, then the shell (`help`, `ticks`, `run`, `halt`) |
+| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, then the shell (`help`, `ticks`, `run`, `halt`) |
 | `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |
 | `console.c` | `console_getc()` (sleeps in `wfi` until a byte arrives), `console_readline()` (echo, backspace, CR/LF/CR LF) |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |
 | `kernel.ld` | layout: `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end` |
-| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct context`, `struct user_program`), `elf.h`, `syscall.h` (the ecall numbers), and the headers for the above |
+| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct context`, `struct user_program`), `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `syscall.h` (the ecall numbers), and the headers for the above |
 | `kernel.elf` | the prebuilt image, committed so `cargo test` and Grail need no LLVM |
 | `kernel.elf.clang-version` | the clang that built `kernel.elf` |
 
@@ -197,9 +223,9 @@ clang --target=riscv32-unknown-elf -march=rv32im_zicsr -mabi=ilp32 -mno-relax -m
       -std=c11 -O2 -ffreestanding -fno-builtin -nostdinc -nostdlib -fno-pic -fno-common -fno-ident \
       -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
       -Wall -Wextra -Werror -Iinclude -c main.c -o main.c.o        # and each other .c
-ld.lld -T kernel.ld -o kernel.elf console.c.o elf.c.o entry.s.o kalloc.c.o kernelvec.s.o \
-       kprintf.c.o machine.s.o main.c.o plic.c.o probe.s.o proc.c.o riscv.s.o start.c.o \
-       string.c.o swtch.s.o syscall.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
+ld.lld -T kernel.ld -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf.c.o entry.s.o \
+       kalloc.c.o kernelvec.s.o kprintf.c.o machine.s.o main.c.o plic.c.o probe.s.o proc.c.o \
+       riscv.s.o start.c.o string.c.o swtch.s.o syscall.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
        userprogs.s.o uservec.s.o vm.c.o vmtest.c.o
 ```
 

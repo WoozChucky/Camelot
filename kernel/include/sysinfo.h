@@ -39,6 +39,8 @@
 #define DEV_FB_VRAM 6
 #define DEV_SYSINFO 7
 #define DEV_KEYBOARD 8
+#define DEV_BLOCK 9 /* a disk, one entry each (spec section 9.6) */
+#define DEV_POINTER 10
 
 struct sysinfo_device {
     u32 type;
