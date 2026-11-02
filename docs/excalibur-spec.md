@@ -325,6 +325,14 @@ Everything that runs on the host is written by us, with no third-party libraries
 - Statements and expressions nest at most 256 levels deep (each nested statement, `=`, unary operator, parenthesis, call argument or chained binary operator is a level); deeper input is an error.
 - Where C leaves behavior undefined, merlin defines it the way the hardware does: arithmetic wraps, `/` and `%` round toward zero (`div`/`rem`, so `INT_MIN / -1` wraps and division by zero gives RISC-V's results), and falling off the end of a function returns 0. Argument evaluation order is unspecified; tests must not depend on it.
 
+Code generation (`crates/merlin/src/codegen.rs`, whose module docs walk through it) is a stack machine: every expression leaves its value in `a0`, operands waiting for the other side are pushed on the stack, every local lives in memory. The output is plain merlin-as source (`.text`, `.globl f`, `f:`, local labels `.L.<what>.<n>`) that clang assembles to the same code. Functions follow the ILP32 convention:
+
+- Frame: `s0` is the frame pointer, equal to `sp` on entry. `ra` is saved at `-4(s0)`, the caller's `s0` at `-8(s0)`, and local `#i` (parameters first, as numbered by `--dump-ast`) at `-(12 + 4*i)(s0)`. The frame is `8 + 4*locals` bytes rounded up to 16; prologue and epilogue use `t0` for frames or offsets beyond a 12-bit immediate.
+- Parameters arrive in `a0-a7` and are stored to their slots in the prologue; the result returns in `a0`. Arguments are evaluated left to right (C leaves the order unspecified) before any argument register is loaded, and `sp` is padded to a multiple of 16 around a `call` made while temporaries are pushed.
+- A local declared without an initializer is not cleared (C: indeterminate).
+- A function may not be named like a register (`sp`, `a0`, `x5`, `fp`...), since merlin-as never reads those as symbols: it is a compile error. Names of instructions, pseudo-instructions or CSRs (`add`, `call`, `mstatus`) are fine.
+- merlin-as does not relax branches, so codegen does: before printing a function it estimates every instruction's address (pseudo-instructions at their largest) and writes a conditional branch that may not reach its label (±4 KiB) as the opposite branch over a `j` (±1 MiB).
+
 Test programs live in `crates/merlin/tests/cases/*.c`, each starting with `// expect: N` (the exit code); the ones in `crates/merlin/tests/cases-merlin/` rely on the definitions above for what C leaves undefined, so they are not checked against clang. The harness links them with a small `crt0.s` (set `sp` to the top of RAM, `call main`, `xcal.halt a0`) and runs them in Grail, so the exit code is the low 8 bits of `main`'s return value.
 
 ### Object and executable format
