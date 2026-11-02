@@ -24,7 +24,15 @@
  * and hart i, when it serves them, reads tlb_asked[i] first, then flushes,
  * then stores what it read in tlb_done[i]. A requester that got ticket t
  * waits until tlb_done[i] reaches t: the flush that got it there began
- * after the requester's ticket, so after its change to the table. Until
+ * after the requester's ticket, so after its change to the table.
+ *
+ * Which harts may use the table is cpus[i].pagetable, read without a lock.
+ * The requester stores the PTEs and then loads cpus[i].pagetable; a hart
+ * switching to the table stores cpus[i].pagetable and then walks it. Each
+ * side's store must be seen before its own load, or both could read the old
+ * values (the requester skips the hart, which keeps the old PTE), so a full
+ * fence sits in between on both sides: here, and in the scheduler and exec
+ * (proc.c). Until
  * processes have threads (#64), a process's page table is in use on one
  * hart only, its own, so a user page table never needs another hart; the
  * kernel page table, in every hart's satp, always does. Grail has no TLB at
@@ -60,16 +68,25 @@ u32 harts_running(void) {
 }
 
 void tlb_serve(void) {
+    /* Interrupts off: a hart serving its own requests while it waits
+     * (tlb_shootdown) may be interrupted by an IPI, whose handler serves
+     * them too. If that one read a later count and stored it, this call
+     * would store its earlier one over it, and tlb_done[me] would go back. */
+    push_off();
     u32 me = cpuid();
     u32 asked = tlb_asked[me];
     if (asked != tlb_done[me]) {
         sfence_vma();
         tlb_done[me] = asked;
     }
+    pop_off();
 }
 
 void tlb_shootdown(pagetable_t pt) {
     sfence_vma();
+    /* The caller's PTE stores before our loads of cpus[i].pagetable (see
+     * the top of the file). */
+    fence_rw();
     u32 me = cpuid();
     u32 up = harts_up & ~(1u << me);
     if (up == 0) {
@@ -110,7 +127,7 @@ void tlb_shootdown(pagetable_t pt) {
 /* Maps a page in the kernel page table, which every hart uses, writes
  * through the mapping, and unmaps it: unmap_pages() shoots it down, so
  * every other hart in `others` must have flushed its TLB by the time it
- * returns. Returns the number of failed checks. */
+ * returns, before the page is freed. Returns the number of failed checks. */
 static int tlb_selftest(u32 others) {
     u32 before[NCPU];
     for (u32 i = 0; i < NCPU; i++) {
@@ -132,13 +149,16 @@ static int tlb_selftest(u32 others) {
         kprintf("smp: TLB self-test: the test page isn't mapped\n");
         failed++;
     }
-    unmap_pages(kernel_pagetable, SMP_TEST_VA, PGSIZE, true);
+    /* Not freed by unmap_pages(): the check comes first, as it would be
+     * too late once the page could be reused. */
+    unmap_pages(kernel_pagetable, SMP_TEST_VA, PGSIZE, false);
     for (u32 i = 0; i < NCPU; i++) {
         if ((others & (1u << i)) != 0 && tlb_done[i] == before[i]) {
             kprintf("smp: hart %u missed the TLB shootdown\n", i);
             failed++;
         }
     }
+    kfree(page);
     return failed;
 }
 

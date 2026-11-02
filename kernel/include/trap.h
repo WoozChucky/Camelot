@@ -36,13 +36,23 @@ extern volatile u32 ticks;
 extern struct spinlock tickslock;
 
 /* Set once the kernel panics: kprintf() stops taking the UART's lock, which
- * the code that panicked may hold. panic_hart is the hart that panicked. */
+ * the code that panicked may hold. panic_hart is the hart that panicked, or
+ * PANIC_NO_HART, no hart's id, until it has stored its own (just after
+ * setting `panicking`). */
 extern volatile bool panicking;
 extern volatile u32 panic_hart;
+#define PANIC_NO_HART 0xffffffffu
 
 /* Stops this hart for good, with interrupts off: what a hart does when
- * another one is panicking (kprintf calls it on the others). */
+ * another one is panicking. */
 void panic_freeze(void);
+
+/* panic_freeze() if another hart is panicking, else nothing. Every byte
+ * written to the UART goes through it (uart_putc), so once a hart starts a
+ * panic, whatever the others print, kprintf(), a process's write or the
+ * console's echo, stops them before it gets out, and the report comes out
+ * whole. */
+void panic_stop_others(void);
 
 /* S-mode trap vector; start() points stvec at it. */
 void kernel_vec(void);

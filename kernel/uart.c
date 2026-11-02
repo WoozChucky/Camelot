@@ -9,6 +9,7 @@
  * uart_rx_pop(). */
 #include "uart.h"
 #include "mmio.h"
+#include "trap.h"
 
 struct spinlock uart_tx_lock;
 
@@ -33,6 +34,10 @@ void uart_init(void) {
 }
 
 void uart_putc(char c) {
+    /* Whoever prints, once another hart panics, this hart stops here: the
+     * panicking one no longer takes uart_tx_lock, so nothing else would
+     * keep this byte out of its report. */
+    panic_stop_others();
     while ((mmio_read8(UART_BASE + UART_LSR) & UART_LSR_THRE) == 0) {
     }
     mmio_write8(UART_BASE + UART_THR, (u8)c);

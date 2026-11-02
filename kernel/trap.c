@@ -31,9 +31,10 @@ struct spinlock tickslock;
 
 /* Set while panicking, so a fault inside panic() doesn't recurse, and so
  * kprintf() stops taking the UART's lock; panic_hart is the hart that
- * panicked. */
+ * panicked, PANIC_NO_HART until it has said so. In .data, not .bss: no hart
+ * may ever read 0 there before one panics, as 0 is hart 0's id. */
 volatile bool panicking;
-volatile u32 panic_hart;
+volatile u32 panic_hart = PANIC_NO_HART;
 
 static const char *const exception_names[16] = {
     "instruction address misaligned",
@@ -95,9 +96,15 @@ static void halt_after_panic(void) {
 
 /* The start of a panic, on whichever hart: the first hart to get here
  * reports it; another that panics too meanwhile stops where it is, as do
- * the others the next time they print (kprintf), so the report comes out
- * whole; and a panic inside the report halts at once. */
+ * the others the next time they write to the UART (uart_putc), so the
+ * report comes out whole; and a panic inside the report halts at once.
+ *
+ * Between the swap and the store of panic_hart, `panicking` is set but
+ * panic_hart is still PANIC_NO_HART, which is no hart's id: a hart that
+ * looks then takes the panic for another's and stops, as it should. Hence
+ * interrupts off first, so that nothing runs on this hart in between. */
 static void panic_begin(void) {
+    intr_off();
     if (atomic_swap((volatile u32 *)&panicking, true)) {
         if (panic_hart == cpuid()) {
             halt_after_panic();
@@ -111,6 +118,12 @@ void panic_freeze(void) {
     intr_off();
     for (;;) {
         wfi();
+    }
+}
+
+void panic_stop_others(void) {
+    if (panicking && panic_hart != cpuid()) {
+        panic_freeze();
     }
 }
 

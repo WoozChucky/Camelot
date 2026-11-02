@@ -2,12 +2,16 @@
 //! SMP"): it boots on 1 to 8 harts, every hart runs processes, CPU-bound
 //! workers run side by side on different harts and get the right answers, and
 //! the lock stress test of #61 holds up with four harts going through the locks
-//! at once. These tests watch every hart's turn with `Cpu::step_traced`, whose
-//! callback sees the hart about to run.
+//! at once; TLB shootdowns wait for every hart they must reach, and a panic on
+//! one hart stops the others' output. These tests watch every hart's turn with
+//! `Cpu::step_traced`, whose callback sees the hart about to run, and some
+//! change a hart between steps (its pc, to make it fault, skip a call or make
+//! one).
 
 use camelot_fs::fsck;
 use grail::cpu::{Cpu, Mode};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::mpsc::Receiver;
@@ -232,28 +236,46 @@ fn check_harts(lines: &[HartLine], n: u32, mtime: u64) {
     assert!(lines.iter().any(|l| l.1.is_some()), "{lines:?}");
 }
 
+/// Whether the hart whose turn it is is about to flush its TLB for another
+/// hart's shootdown: at `sfence_vma`, called from tlb_serve().
+fn serving(cpu: &Cpu, sfence: u32, serve: &Range<u32>) -> bool {
+    cpu.pc == sfence && serve.contains(&cpu.x[1])
+}
+
 #[test]
 fn boots_on_every_hart_count() {
     // Each hart other than 0 flushes its TLB in tlb_serve() for the boot's
     // self-test, which unmaps a page of the kernel page table and so shoots
-    // it down on every hart (smp.c).
+    // it down on every hart (smp.c), and has done so by the time the
+    // self-test frees the page: the shootdown waits for every hart.
     let serve = function("tlb_serve");
+    let selftest = function("tlb_selftest");
     for harts in [1, 2, 4, 8] {
         let (mut m, elf) = load(harts, kernel::typed(b"harts\nexit\n"));
         let sfence = sym(&elf, "sfence_vma");
+        let kfree = sym(&elf, "kfree");
+        let ticks = sym(&elf, "ticks");
         let mut flushed = HashSet::new();
+        // The harts that had flushed when hart 0 freed the test page.
+        let mut flushed_at_free = None;
         // mtime at the first tick (the boot's `tick 1`) and at each
-        // prompt: the second comes right after harts's output.
-        let (mut seen, mut first_tick, mut prompts) = (0, None, Vec::new());
+        // prompt (the second comes right after harts's output), and the
+        // clock, `ticks`, at each prompt.
+        let (mut seen, mut first_tick, mut prompts, mut clock) = (0, None, Vec::new(), Vec::new());
         let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
-            if cpu.pc == sfence && serve.contains(&cpu.x[1]) {
+            if serving(cpu, sfence, &serve) {
                 flushed.insert(cpu.id);
+            }
+            if cpu.id == 0 && cpu.pc == kfree && selftest.contains(&cpu.x[1]) {
+                assert!(flushed_at_free.is_none(), "the self-test freed twice");
+                flushed_at_free = Some(flushed.clone());
             }
             let out = &cpu.bus.uart.captured;
             if out.len() != seen {
                 seen = out.len();
                 if out.ends_with(PROMPT.as_bytes()) {
                     prompts.push(cpu.bus.clint.mtime);
+                    clock.push(cpu.bus.peek(ticks).unwrap());
                 }
                 if first_tick.is_none() && out.ends_with(b"tick 1\n") {
                     first_tick = Some(cpu.bus.clint.mtime);
@@ -268,14 +290,343 @@ fn boots_on_every_hart_count() {
             boot += &format!("smp: {harts} harts running\n");
         }
         assert_eq!(kernel::mask_dbg_pc(&out[..at]), boot, "{harts} harts");
-        assert_eq!(
-            flushed,
-            (1..harts as u32).collect::<HashSet<_>>(),
-            "{harts} harts"
-        );
+        let others: HashSet<u32> = (1..harts as u32).collect();
+        assert_eq!(flushed, others, "{harts} harts");
+        if harts > 1 {
+            assert_eq!(flushed_at_free.as_ref(), Some(&others), "{harts} harts");
+        }
         let lines = parse_harts(&command_output(&out, "harts"));
         assert_eq!(prompts.len(), 2, "{harts} harts:\n{out}");
-        check_harts(&lines, harts as u32, prompts[1] - first_tick.unwrap());
+        let since_first = prompts[1] - first_tick.unwrap();
+        check_harts(&lines, harts as u32, since_first);
+        // The clock that sleep and uptime read counts hart 0's ticks alone:
+        // ten a second however many harts tick (a few fewer if some came
+        // while interrupts were off), not one per tick of every hart.
+        let expected = 1 + (since_first / TICK_INTERVAL) as u32;
+        assert!(
+            clock[1] <= expected && clock[1] + 3 >= expected,
+            "{harts} harts: the clock counted {} ticks in {since_first} after the first",
+            clock[1]
+        );
+    }
+}
+
+/// The value of the kernel's variable `name`.
+fn peek_sym(m: &Machine, elf: &grail::elf::Elf, name: &str) -> u32 {
+    m.cpu.bus.peek(sym(elf, name)).unwrap()
+}
+
+/// Steps `m` until `stop` says so, at most `max` steps; between steps, so
+/// `stop` may change any hart. Calls `each` before every hart's turn.
+fn step_until(
+    m: &mut Machine,
+    max: u64,
+    mut each: impl FnMut(&Cpu),
+    mut stop: impl FnMut(&mut Machine) -> bool,
+) -> bool {
+    for _ in 0..max {
+        if stop(m) {
+            return true;
+        }
+        if m.cpu.bus.exit.is_some() {
+            return false;
+        }
+        m.cpu.step_traced(&mut each);
+    }
+    false
+}
+
+#[test]
+fn a_shootdown_waits_for_a_hart_slow_to_flush() {
+    // The boot's self-test shoots a kernel mapping down on every hart. Hart
+    // 2 skips the IPI that asks it to flush (the test returns from
+    // tlb_serve() at its entry), so it flushes only at its next timer tick:
+    // hart 0 must still be waiting then, and free the page only after it,
+    // with no hart reported as missing the shootdown.
+    let (mut m, elf) = load(4, kernel::typed(b"exit\n"));
+    let serve = function("tlb_serve");
+    let selftest = function("tlb_selftest");
+    let sfence = sym(&elf, "sfence_vma");
+    let kfree = sym(&elf, "kfree");
+    // Hart 2's request counts.
+    let (asked, done) = (sym(&elf, "tlb_asked") + 8, sym(&elf, "tlb_done") + 8);
+    let mut skipped = false;
+    // The steps at which hart 2 flushed for the shootdown and hart 0 freed
+    // the page.
+    let (mut step, mut flushed) = (0u64, None);
+    let freed = Cell::new(None);
+    let ended = step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |cpu| {
+            if cpu.id == 0 {
+                step += 1;
+            }
+            if cpu.id == 2 && flushed.is_none() && serving(cpu, sfence, &serve) {
+                flushed = Some(step);
+            }
+            if cpu.id == 0 && cpu.pc == kfree && selftest.contains(&cpu.x[1]) {
+                freed.set(Some(step));
+            }
+        },
+        |m| {
+            let hart = m.cpu.hart(2);
+            if !skipped && hart.pc == serve.start && m.cpu.bus.peek(asked) != m.cpu.bus.peek(done) {
+                skipped = true;
+                let ra = hart.x[1];
+                m.cpu.hart_mut(2).pc = ra;
+            }
+            freed.get().is_some()
+        },
+    );
+    assert!(ended, "hart 0 never freed the page:\n{}", printed(&m));
+    assert!(skipped);
+    let (flushed, freed) = (flushed.unwrap(), freed.get().unwrap());
+    assert!(
+        freed > flushed,
+        "freed at step {freed}, hart 2 flushed at {flushed}"
+    );
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
+    let out = printed(&m);
+    assert!(out.contains("\nsmp: 4 harts running\n"), "{out}");
+    assert!(!out.contains("missed"), "{out}");
+}
+
+/// Offset of `pagetable` in `struct cpu` (kernel/include/spinlock.h).
+const CPU_PAGETABLE: u32 = 72;
+
+#[test]
+fn a_kernel_shootdown_reaches_harts_running_processes() {
+    // The kernel page table's second-level tables are in every process's
+    // page table, so a shootdown of the kernel table must reach every hart,
+    // whatever its satp. While `primes 4 40000` has workers in U-mode on
+    // harts 1-3, each with its process's page table in satp, the test has
+    // hart 0 call tlb_shootdown(kernel_pagetable) as it enters user_trap
+    // (where only a0 and ra are live, and interrupts are off): each of harts
+    // 1-3 must flush in tlb_serve() before the call returns. The workers'
+    // counts are still right afterwards.
+    const LINE: &str = "primes 4 40000";
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load(4, rx);
+    step_to_prompt(&mut m);
+    for b in format!("{LINE}\nexit\n").bytes() {
+        tx.send(b).unwrap();
+    }
+    let kernel_pt = peek_sym(&m, &elf, "kernel_pagetable");
+    let cpus = sym(&elf, "cpus");
+    let user_trap = sym(&elf, "user_trap");
+    let shootdown = sym(&elf, "tlb_shootdown");
+    let serve = function("tlb_serve");
+    let sfence = sym(&elf, "sfence_vma");
+    // Hart 0's registers to put back once the call returns, while it runs.
+    let mut saved: Option<[u32; 32]> = None;
+    let calling = Cell::new(false);
+    let mut flushed = HashSet::new();
+    let returned = step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |cpu| {
+            if calling.get() && cpu.id != 0 && serving(cpu, sfence, &serve) {
+                flushed.insert(cpu.id);
+            }
+        },
+        |m| {
+            let hart0 = m.cpu.hart(0);
+            if hart0.pc != user_trap {
+                return false;
+            }
+            match saved {
+                None => {
+                    let busy = (1..4).all(|h| {
+                        let satp = m.cpu.bus.peek(cpus + h * CPU_SIZE + CPU_PAGETABLE).unwrap();
+                        m.cpu.hart(h as usize).mode == Mode::U && satp != kernel_pt && satp != 0
+                    });
+                    if busy {
+                        saved = Some(hart0.x);
+                        let h = m.cpu.hart_mut(0);
+                        h.x[10] = kernel_pt;
+                        h.x[1] = user_trap;
+                        h.pc = shootdown;
+                        calling.set(true);
+                    }
+                    false
+                }
+                // Back from the call: user_trap goes on as if nothing had
+                // happened.
+                Some(regs) if hart0.x[2] == regs[2] => {
+                    m.cpu.hart_mut(0).x = regs;
+                    calling.set(false);
+                    true
+                }
+                Some(_) => false,
+            }
+        },
+    );
+    assert!(returned, "hart 0's call never returned:\n{}", printed(&m));
+    assert_eq!(flushed, HashSet::from([1, 2, 3]));
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
+    let out = printed(&m);
+    let lines = command_output(&out, LINE);
+    assert_eq!(
+        lines.last().copied(),
+        Some(format!("primes: {} below 40000, 4 workers", primes_in(0..40000)).as_str()),
+        "{lines:#?}"
+    );
+}
+
+/// sstatus bits (spec section 3): SIE, SPIE, SPP, and the mask of the
+/// mstatus bits sstatus shows (SIE, SPIE, SPP, SUM, MXR).
+const SSTATUS_SIE: u32 = 1 << 1;
+const SSTATUS_SPIE: u32 = 1 << 5;
+const SSTATUS_SPP: u32 = 1 << 8;
+const SSTATUS_MASK: u32 = SSTATUS_SIE | SSTATUS_SPIE | SSTATUS_SPP | (1 << 18) | (1 << 19);
+
+/// Exit code of a kernel panic (`PANIC_EXIT_CODE` in kernel/include/trap.h).
+const PANIC_EXIT: u32 = 0xfe;
+
+/// Where a hart stopped for good by panic_freeze() may be: in it, or in the
+/// wfi() it calls.
+struct Freeze {
+    body: Range<u32>,
+    wfi: Range<u32>,
+}
+
+impl Freeze {
+    fn new(elf: &grail::elf::Elf) -> Freeze {
+        // wfi() (riscv.s, no size) is `wfi` and `ret`.
+        let wfi = sym(elf, "wfi");
+        Freeze {
+            body: function("panic_freeze"),
+            wfi: wfi..wfi + 8,
+        }
+    }
+
+    /// Whether hart `h` of `m` is there.
+    fn holds(&self, m: &Machine, h: usize) -> bool {
+        let (pc, ra) = (m.cpu.hart(h).pc, m.cpu.hart(h).x[1]);
+        self.body.contains(&pc) || (self.wfi.contains(&pc) && self.body.contains(&ra))
+    }
+}
+
+#[test]
+fn a_panic_stops_the_harts_printing_meanwhile() {
+    // While `stress 6 20` has workers printing on 4 harts, one hart faults
+    // in the kernel (the test sets its pc to 0, unmapped, as it runs in
+    // S-mode with the kernel's trap vector) while another is writing a
+    // process's output to the UART (in uart_putc, holding uart_tx_lock).
+    // The panic report must come out whole, word for word, after which
+    // nothing else is printed; the printing hart stops in panic_freeze();
+    // and the machine stops with the panic's exit code.
+    const LINE: &str = "stress 6 20";
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load(4, rx);
+    step_to_prompt(&mut m);
+    for b in format!("{LINE}\n").bytes() {
+        tx.send(b).unwrap();
+    }
+    let putc = function("uart_putc");
+    let kernel_vec = sym(&elf, "kernel_vec");
+    let cpus = sym(&elf, "cpus");
+    let tx_lock = sym(&elf, "uart_tx_lock");
+    // The printing hart, the faulting one, and the latter's registers and
+    // sstatus as it faults.
+    let mut fault = None;
+    let found = step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| {
+            let holder = m.cpu.bus.peek(tx_lock + LOCK_CPU).unwrap();
+            let Some(printer) = (0..4).find(|&h| {
+                let hart = m.cpu.hart(h);
+                let p = m.cpu.bus.peek(cpus + h as u32 * CPU_SIZE + CPU_PROC).unwrap();
+                putc.contains(&hart.pc)
+                    && holder == cpus + h as u32 * CPU_SIZE
+                    && p != 0
+                    && proc_name(&m.cpu, p) == "stress"
+            }) else {
+                return false;
+            };
+            let Some(victim) = (0..4).find(|&h| {
+                let hart = m.cpu.hart(h);
+                h != printer && hart.mode == Mode::S && hart.csr.stvec == kernel_vec
+            }) else {
+                return false;
+            };
+            let hart = m.cpu.hart(victim);
+            fault = Some((printer, victim, hart.x, hart.csr.mstatus & SSTATUS_MASK));
+            m.cpu.hart_mut(victim).pc = 0;
+            true
+        },
+    );
+    assert!(
+        found,
+        "no hart printed while another was in the kernel:\n{}",
+        printed(&m)
+    );
+    let (printer, victim, regs, before) = fault.unwrap();
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(PANIC_EXIT));
+    let out = printed(&m);
+    let at = out.find("panic: ").unwrap_or_else(|| panic!("no panic:\n{out}"));
+    let report = &out[at..];
+    // The trap from S-mode: SPP set, SPIE what SIE was, SIE off.
+    let mut sstatus = (before & !(SSTATUS_SIE | SSTATUS_SPIE)) | SSTATUS_SPP;
+    if before & SSTATUS_SIE != 0 {
+        sstatus |= SSTATUS_SPIE;
+    }
+    let mut want = format!(
+        "panic: instruction page fault\n  scause 0x0000000c  sepc 0x00000000  stval 0x00000000  sstatus \
+         0x{sstatus:08x}\n"
+    );
+    // How the page table in satp maps 0: unmapped in the kernel's, a
+    // process's code (not executable in S-mode) in a process's.
+    let va = report.lines().nth(2).unwrap_or_default();
+    assert!(va.starts_with("  va 0x00000000 "), "report:\n{report}");
+    want += va;
+    want += "\n";
+    for (i, r) in regs.iter().enumerate().skip(1) {
+        want += &format!("  {:>3} {r:08x}", excalibur::reg::abi_name(i as u8));
+        if i % 4 == 0 || i == 31 {
+            want += "\n";
+        }
+    }
+    assert_eq!(
+        report, want,
+        "hart {victim} faulted while hart {printer} printed; output:\n{out}"
+    );
+    assert!(
+        Freeze::new(&elf).holds(&m, printer),
+        "hart {printer} at {:#x}",
+        m.cpu.hart(printer).pc
+    );
+}
+
+#[test]
+fn a_hart_stops_printing_while_a_panic_begins() {
+    // panic_begin() sets `panicking`, then stores its hart's id in
+    // panic_hart: a hart that prints in between must take the panic for
+    // another hart's and stop, hart 0 included, although its id is 0. The
+    // test sets `panicking` alone as hart 0 enters smp_boot(), on 1 hart
+    // and on 4: hart 0 stops in panic_freeze() at its next print (the shell's
+    // banner on 1 hart, `smp: 4 harts running` on 4), and nothing more is
+    // printed.
+    for harts in [1, 4] {
+        let (mut m, elf) = load(harts, kernel::typed(b""));
+        let smp_boot = sym(&elf, "smp_boot");
+        let panicking = sym(&elf, "panicking");
+        assert!(step_until(
+            &mut m,
+            RUN_MAX_STEPS,
+            |_| {},
+            |m| m.cpu.hart(0).pc == smp_boot
+        ));
+        m.cpu.bus.load(panicking, &[1]).unwrap();
+        let before = printed(&m);
+        let freeze = Freeze::new(&elf);
+        let stopped = step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| freeze.holds(m, 0));
+        assert!(stopped, "{harts} harts:\n{}", printed(&m));
+        assert_eq!(m.run(Some(1_000_000), |_| {}), RunResult::StepLimit);
+        assert_eq!(printed(&m), before, "{harts} harts");
     }
 }
 

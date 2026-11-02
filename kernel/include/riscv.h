@@ -100,4 +100,10 @@ u32 atomic_swap(volatile u32 *p, u32 v);
 u32 atomic_add(volatile u32 *p, u32 v);
 u32 atomic_or(volatile u32 *p, u32 v);
 
+/* fence rw, rw: every load and store before it is seen by other harts
+ * before any load or store after it. For the one place where two harts each
+ * store a word and then load the other's (cpus[i].pagetable against a PTE,
+ * smp.c), which locks and AMOs don't cover. */
+void fence_rw(void);
+
 #endif

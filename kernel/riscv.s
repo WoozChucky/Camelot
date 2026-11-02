@@ -148,3 +148,10 @@ atomic_add:
 atomic_or:
     amoor.w.aqrl a0, a1, (a0)
     ret
+
+# void fence_rw(void): orders every load and store before it before every
+# load and store after it, as other harts see them.
+    .globl fence_rw
+fence_rw:
+    fence rw, rw
+    ret

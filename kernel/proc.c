@@ -344,6 +344,7 @@ int proc_exec(const struct elf_file *prog, const char *path, const char *name, c
      * freeing the old one, which satp points at. No other hart uses either
      * (a process runs on one hart at a time). */
     mycpu()->pagetable = pt;
+    fence_rw(); /* as in the scheduler */
     w_satp(MAKE_SATP(pt));
     sfence_vma();
     if (old != NULL) {
@@ -509,6 +510,9 @@ void scheduler(void) {
          * carries on as before; from the next sret on, U-mode sees the
          * process's memory. */
         c->pagetable = proc_pagetable(p);
+        /* Seen by a hart shooting this table down before this hart walks
+         * it (smp.c). */
+        fence_rw();
         w_satp(MAKE_SATP(c->pagetable));
         sfence_vma();
         /* proc_lock stays held across the switch: the process lets go of

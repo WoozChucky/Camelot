@@ -150,10 +150,8 @@ static void uart_sink(char c, void *ctx) {
  * out. */
 int kprintf(const char *fmt, ...) {
     /* Another hart is printing a panic: this one stops here, so the report
-     * comes out whole. */
-    if (panicking && panic_hart != cpuid()) {
-        panic_freeze();
-    }
+     * comes out whole (and uart_putc() would stop it anyway). */
+    panic_stop_others();
     bool locking = !panicking;
     if (locking) {
         acquire(&uart_tx_lock);
