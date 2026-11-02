@@ -92,7 +92,7 @@ impl<'a> Reader<'a> {
         Ok(head)
     }
 
-    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+    pub fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
         Ok(self.take(N)?.try_into().expect("take returned N bytes"))
     }
 

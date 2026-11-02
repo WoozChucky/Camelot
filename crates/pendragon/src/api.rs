@@ -11,12 +11,12 @@ use crate::console::Hub;
 use crate::http::{Request, Response};
 use crate::json::Json;
 use avalon_client::{
-    format_hz, format_size, holds_disks, lake_disks, parse_clock, parse_disk_size, parse_disk_source,
-    parse_ram, Client, Timeouts, VmAction,
+    format_hz, format_size, holds_disks, lake_disks, mac_text, parse_clock, parse_disk_size,
+    parse_disk_source, parse_hostfwd, parse_net, parse_ram, Client, Timeouts, VmAction,
 };
 use avalon_proto::{
-    validate_name, DeviceSpec, DiskInfo, DiskSpec, ErrorCode, HardwareProfile, VmDetails, VmRef, VmState,
-    VmSummary, SECTOR_SIZE,
+    validate_name, DeviceSpec, DiskInfo, DiskSpec, ErrorCode, HardwareProfile, NatConfig, PortOwner,
+    SwitchInfo, VmDetails, VmRef, VmState, VmSummary, SECTOR_SIZE,
 };
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -102,7 +102,9 @@ pub fn error_response(status: u16, message: &str, code: Option<&str>) -> Respons
 /// What a server's refusal (or absence) is in HTTP.
 fn status_of(code: Option<ErrorCode>) -> u16 {
     match code {
-        Some(ErrorCode::NoSuchVm | ErrorCode::NoSuchDisk) => 404,
+        Some(
+            ErrorCode::NoSuchVm | ErrorCode::NoSuchDisk | ErrorCode::NoSuchSwitch | ErrorCode::NoSuchCard,
+        ) => 404,
         Some(
             ErrorCode::AlreadyExists | ErrorCode::Busy | ErrorCode::InvalidState | ErrorCode::OverBudget,
         ) => 409,
@@ -217,6 +219,17 @@ impl App {
             (["disks", _], _) => allow("DELETE"),
             (["disks", name, "detach"], "POST") => self.detach_disk(name),
             (["disks", _, "detach"], _) => allow("POST"),
+            (["switches"], "GET") => self.list_switches(),
+            (["switches"], "POST") => self.create_switch(req),
+            (["switches"], _) => allow("GET, POST"),
+            (["switches", name], "DELETE") => self.delete_switch(name),
+            (["switches", _], _) => allow("DELETE"),
+            (["switches", name, "nat"], "POST") => self.set_nat(name, Some(req)),
+            (["switches", name, "nat"], "DELETE") => self.set_nat(name, None),
+            (["switches", _, "nat"], _) => allow("POST, DELETE"),
+            (["switches", name, "attach"], "POST") => self.plug(name, req, true),
+            (["switches", name, "detach"], "POST") => self.plug(name, req, false),
+            (["switches", _, "attach" | "detach"], _) => allow("POST"),
             _ => Err(Fail::new(404, format!("no such API: {}", req.path))),
         }
     }
@@ -515,6 +528,150 @@ impl App {
         ))
     }
 
+    // ---- Switches ----
+
+    /// Every switch with its ports, their counters and its gateway, and which VMs the
+    /// cards and leases belong to (when Avalon can say; `vms_error` otherwise).
+    fn list_switches(&self) -> Reply {
+        let mut avalon = self.avalon()?;
+        let switches = avalon.list_switches().map_err(|e| client_fail("Avalon", e))?;
+        let vms = avalon.list_vms().map_err(|e| client_fail("Avalon", e));
+        let no_vms: &[VmSummary] = &[];
+        let known = vms.as_deref().unwrap_or(no_vms);
+        Ok(json(
+            200,
+            Json::object([
+                ("avalon", self.avalon.as_str().into()),
+                (
+                    "switches",
+                    Json::Array(switches.iter().map(|s| switch_json(s, known)).collect()),
+                ),
+                ("vms_error", vms.err().map(|f| f.message).into()),
+            ]),
+        ))
+    }
+
+    fn create_switch(&self, req: &Request) -> Reply {
+        let body = body_json(req)?;
+        only_keys(&body, &["name", "nat", "hostfwd"])?;
+        let name = string(&body, "name")?.ok_or_else(|| Fail::bad("name: a switch needs a name"))?;
+        validate_name(name).map_err(|e| Fail::bad(format!("name: {e}")))?;
+        let hostfwd = forwards(&body)?;
+        let nat = match (flag(&body, "nat")?, hostfwd.is_empty()) {
+            (true, _) => Some(NatConfig { hostfwd }),
+            (false, true) => None,
+            (false, false) => {
+                return Err(Fail::bad(
+                    "hostfwd: ports are forwarded by a NAT gateway: set nat too",
+                ))
+            }
+        };
+        let mut avalon = self.avalon()?;
+        avalon
+            .create_switch_with(name, nat)
+            .map_err(|e| client_fail("Avalon", e))?;
+        Ok(json(201, self.switch_reply(&mut avalon, name)))
+    }
+
+    fn delete_switch(&self, name: &str) -> Reply {
+        self.avalon()?
+            .delete_switch(name)
+            .map_err(|e| client_fail("Avalon", e))?;
+        Ok(json(200, Json::object([("deleted", name.into())])))
+    }
+
+    /// Gives a switch a NAT gateway (`{"hostfwd": [...]}`), or takes it away.
+    fn set_nat(&self, name: &str, req: Option<&Request>) -> Reply {
+        let nat = match req {
+            Some(req) => {
+                let body = body_json(req)?;
+                only_keys(&body, &["hostfwd"])?;
+                Some(NatConfig {
+                    hostfwd: forwards(&body)?,
+                })
+            }
+            None => None,
+        };
+        let mut avalon = self.avalon()?;
+        avalon
+            .set_switch_nat(name, nat)
+            .map_err(|e| client_fail("Avalon", e))?;
+        Ok(json(200, self.switch_reply(&mut avalon, name)))
+    }
+
+    /// `{"name", "nat"}` of a switch just changed: the gateway as it is now, its host
+    /// ports as bound.
+    fn switch_reply(&self, avalon: &mut Client, name: &str) -> Json {
+        let nat = avalon
+            .list_switches()
+            .ok()
+            .and_then(|all| all.into_iter().find(|s| s.name == name))
+            .and_then(|s| s.nat.map(|nat| nat_json(&nat, &[])));
+        Json::object([("name", name.into()), ("nat", nat.into())])
+    }
+
+    /// Plugs a VM's card into the switch, or unplugs it from it: `{"vm", "card"}`, the
+    /// VM by id (a number) or name, the card by number (0 if left out). An unplug must
+    /// name a card that is on this switch.
+    fn plug(&self, switch: &str, req: &Request, attach: bool) -> Reply {
+        let body = body_json(req)?;
+        only_keys(&body, &["vm", "card"])?;
+        let vm = match body.get("vm") {
+            Some(Json::String(s)) if !s.is_empty() => VmRef::parse(s),
+            Some(n) if n.as_u64().is_some() => VmRef::Id(
+                u32::try_from(n.as_u64().unwrap_or_default()).map_err(|_| Fail::bad("vm: not a VM id"))?,
+            ),
+            _ => return Err(Fail::bad("vm: which VM (its id or its name)")),
+        };
+        let card = match body.get("card") {
+            None | Some(Json::Null) => 0,
+            Some(n) => n
+                .as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or_else(|| Fail::bad("card: not a card number"))?,
+        };
+        let mut avalon = self.avalon()?;
+        if attach {
+            avalon
+                .attach_card(&vm, card, switch)
+                .map_err(|e| client_fail("Avalon", e))?;
+        } else {
+            // Unplugging takes no switch: make sure it is this one's card.
+            let details = avalon.vm_info(&vm).map_err(|e| client_fail("Avalon", e))?;
+            let on = details
+                .vm
+                .profile
+                .devices
+                .iter()
+                .filter_map(|d| match d {
+                    DeviceSpec::Net(net) => Some(net.switch.as_deref()),
+                    _ => None,
+                })
+                .nth(card as usize);
+            if on != Some(Some(switch)) {
+                return Err(Fail::new(
+                    409,
+                    format!(
+                        "card {card} of VM {} ({}) is not plugged into switch '{switch}'",
+                        details.vm.id, details.vm.name
+                    ),
+                ));
+            }
+            avalon
+                .detach_card(&VmRef::Id(details.vm.id), card)
+                .map_err(|e| client_fail("Avalon", e))?;
+        }
+        Ok(json(
+            200,
+            Json::object([
+                ("switch", switch.into()),
+                ("vm", vm.to_string().into()),
+                ("card", card.into()),
+                ("plugged", attach.into()),
+            ]),
+        ))
+    }
+
     fn wait_released(&self, name: &str) -> bool {
         let start = Instant::now();
         let Ok(mut lake) = self.lake() else { return false };
@@ -546,6 +703,23 @@ fn vm_ref(segment: &str) -> Result<VmRef, Fail> {
             code: Some(ErrorCode::NoSuchVm),
         }),
         vm => Ok(vm),
+    }
+}
+
+/// `hostfwd`: a list of forwarding rules as Round Table's `--hostfwd` takes them.
+fn forwards(body: &Json) -> Result<Vec<avalon_proto::PortForward>, Fail> {
+    match body.get("hostfwd") {
+        None | Some(Json::Null) => Ok(Vec::new()),
+        Some(Json::Array(rules)) => rules
+            .iter()
+            .enumerate()
+            .map(|(i, rule)| {
+                let at = |e: String| Fail::bad(format!("hostfwd {}: {e}", i + 1));
+                let text = rule.as_str().ok_or_else(|| at("not a string".into()))?;
+                parse_hostfwd(text.trim()).map_err(at)
+            })
+            .collect(),
+        Some(_) => Err(Fail::bad("hostfwd: not a list")),
     }
 }
 
@@ -599,12 +773,17 @@ struct Create {
     start: bool,
 }
 
-/// `{"name", "ram", "clock", "disks": [{"source", "read_only"}], "program", "start"}`:
-/// `ram` and `clock` as Round Table's `--ram` and `--clock` take them (a number of MiB,
-/// a frequency with Hz/kHz/MHz; an empty clock is full speed), each disk source a path
-/// on Avalon's host or `lake://ADDR/NAME`, the program an ELF file in base64.
+/// `{"name", "ram", "clock", "disks": [{"source", "read_only"}], "nets": [{"switch",
+/// "mac"}], "program", "start"}`: `ram` and `clock` as Round Table's `--ram` and
+/// `--clock` take them (a number of MiB, a frequency with Hz/kHz/MHz; an empty clock is
+/// full speed), each disk source a path on Avalon's host or `lake://ADDR/NAME`, each
+/// network card the switch to plug it into (empty or null: none) and its MAC address
+/// (empty or null: Avalon makes one up), the program an ELF file in base64.
 fn parse_create(body: &Json) -> Result<Create, Fail> {
-    only_keys(body, &["name", "ram", "clock", "disks", "program", "start"])?;
+    only_keys(
+        body,
+        &["name", "ram", "clock", "disks", "nets", "program", "start"],
+    )?;
     let name = string(body, "name")?.ok_or_else(|| Fail::bad("name: a VM needs a name"))?;
     validate_name(name).map_err(|e| Fail::bad(format!("name: {e}")))?;
     let mut profile = HardwareProfile::default();
@@ -633,6 +812,33 @@ fn parse_create(body: &Json) -> Result<Create, Fail> {
             }
         }
         Some(_) => return Err(Fail::bad("disks: not a list")),
+    }
+    match body.get("nets") {
+        None | Some(Json::Null) => {}
+        Some(Json::Array(nets)) => {
+            for (i, net) in nets.iter().enumerate() {
+                let at = |e: String| Fail::bad(format!("network card {}: {e}", i + 1));
+                if !matches!(net, Json::Object(_)) {
+                    return Err(at("not an object".into()));
+                }
+                only_keys(net, &["switch", "mac"]).map_err(|f| at(f.message))?;
+                let text = |key| -> Result<&str, Fail> {
+                    Ok(string(net, key).map_err(|f| at(f.message))?.unwrap_or("").trim())
+                };
+                // Round Table's --net syntax, so both take the same cards.
+                let mut spec = match text("switch")? {
+                    "" => "-".to_string(),
+                    switch => switch.to_string(),
+                };
+                if !text("mac")?.is_empty() {
+                    spec = format!("{spec},mac={}", text("mac")?);
+                }
+                profile
+                    .devices
+                    .push(DeviceSpec::Net(parse_net(&spec).map_err(at)?));
+            }
+        }
+        Some(_) => return Err(Fail::bad("nets: not a list")),
     }
     let program = string(body, "program")?.ok_or_else(|| Fail::bad("program: choose an ELF file to run"))?;
     let program = base64::decode(program).map_err(|e| Fail::bad(format!("program: {e}")))?;
@@ -665,7 +871,7 @@ fn vm_json(vm: &VmSummary) -> Json {
         .devices
         .iter()
         .filter_map(|device| {
-            // Network cards are not shown yet: the page lists the disks only.
+            // Network cards are listed apart (nets, below).
             let DeviceSpec::Disk(disk) = device else {
                 return None;
             };
@@ -687,6 +893,22 @@ fn vm_json(vm: &VmSummary) -> Json {
         .into_iter()
         .filter(|a| a.allowed_in(vm.state))
         .map(VmAction::name)
+        .collect();
+    let nets: Vec<Json> = profile
+        .devices
+        .iter()
+        .filter_map(|device| match device {
+            DeviceSpec::Net(net) => Some(net),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(card, net)| {
+            Json::object([
+                ("card", card.into()),
+                ("mac", net.mac.map(mac_text).into()),
+                ("switch", net.switch.clone().into()),
+            ])
+        })
         .collect();
     Json::object([
         ("id", vm.id.into()),
@@ -715,7 +937,86 @@ fn vm_json(vm: &VmSummary) -> Json {
         ("nominal_hz", profile.nominal_hz.into()),
         ("nominal_text", format_hz(profile.nominal_hz).into()),
         ("disks", Json::Array(disks)),
+        ("nets", Json::Array(nets)),
         ("actions", actions.into()),
+    ])
+}
+
+/// The VM, and its card number, whose card has address `mac`.
+fn card_owner(vms: &[VmSummary], mac: [u8; 6]) -> Option<(&VmSummary, usize)> {
+    vms.iter().find_map(|vm| {
+        vm.profile
+            .devices
+            .iter()
+            .filter_map(|d| match d {
+                DeviceSpec::Net(net) => Some(net.mac),
+                _ => None,
+            })
+            .position(|m| m == Some(mac))
+            .map(|card| (vm, card))
+    })
+}
+
+fn vm_ref_json(vm: Option<&VmSummary>) -> Json {
+    vm.map(|vm| Json::object([("id", vm.id.into()), ("name", vm.name.as_str().into())]))
+        .into()
+}
+
+fn nat_json(nat: &avalon_proto::NatInfo, vms: &[VmSummary]) -> Json {
+    let leases: Vec<Json> = nat
+        .leases
+        .iter()
+        .map(|lease| {
+            Json::object([
+                ("addr", lease.addr.to_string().into()),
+                ("mac", mac_text(lease.mac).into()),
+                ("vm", vm_ref_json(card_owner(vms, lease.mac).map(|(vm, _)| vm))),
+            ])
+        })
+        .collect();
+    let hostfwd: Vec<String> = nat.hostfwd.iter().map(|r| r.to_string()).collect();
+    Json::object([
+        ("network", "10.0.2.0/24".into()),
+        ("gateway", "10.0.2.2".into()),
+        ("dns", "10.0.2.3".into()),
+        ("hostfwd", hostfwd.into()),
+        ("leases", Json::Array(leases)),
+    ])
+}
+
+fn switch_json(switch: &SwitchInfo, vms: &[VmSummary]) -> Json {
+    let ports: Vec<Json> = switch
+        .ports
+        .iter()
+        .map(|p| {
+            let (kind, vm, card) = match p.owner {
+                PortOwner::Card { vm, card } => {
+                    let summary = vms.iter().find(|v| v.id == vm);
+                    let vm = summary
+                        .map(|v| vm_ref_json(Some(v)))
+                        .unwrap_or_else(|| Json::object([("id", vm.into()), ("name", Json::Null)]));
+                    ("card", vm, Json::from(card))
+                }
+                PortOwner::Gateway => ("gateway", Json::Null, Json::Null),
+            };
+            Json::object([
+                ("kind", kind.into()),
+                ("vm", vm),
+                ("card", card),
+                ("mac", mac_text(p.mac).into()),
+                ("in_frames", p.in_frames.into()),
+                ("in_bytes", p.in_bytes.into()),
+                ("out_frames", p.out_frames.into()),
+                ("out_bytes", p.out_bytes.into()),
+                ("dropped", p.dropped.into()),
+            ])
+        })
+        .collect();
+    Json::object([
+        ("name", switch.name.as_str().into()),
+        ("capture", switch.capture.clone().into()),
+        ("nat", switch.nat.as_ref().map(|nat| nat_json(nat, vms)).into()),
+        ("ports", Json::Array(ports)),
     ])
 }
 
@@ -838,9 +1139,31 @@ mod tests {
             })
         );
         // Defaults: Grail's machine, not started.
-        let c = create(r#"{"name": "a", "program": "AA==", "ram": "", "clock": " ", "disks": []}"#).unwrap();
+        let c =
+            create(r#"{"name": "a", "program": "AA==", "ram": "", "clock": " ", "disks": [], "nets": []}"#)
+                .unwrap();
         assert_eq!(c.profile, HardwareProfile::default());
         assert!(!c.start);
+        // Network cards, after the disks: on a switch or not, with an address or not.
+        let c = create(
+            r#"{"name": "a", "program": "AA==", "disks": [{"source": "d.img"}],
+                "nets": [{"switch": "wan"}, {"switch": "", "mac": "02:00:00:00:00:07"}, {"switch": null, "mac": null}]}"#,
+        )
+        .unwrap();
+        let net = |switch: Option<&str>, mac| {
+            DeviceSpec::Net(avalon_proto::NetSpec {
+                switch: switch.map(str::to_string),
+                mac,
+            })
+        };
+        assert_eq!(
+            c.profile.devices[1..],
+            [
+                net(Some("wan"), None),
+                net(None, Some([2, 0, 0, 0, 0, 7])),
+                net(None, None)
+            ]
+        );
 
         for (text, why) in [
             (r#"{"program": "AA=="}"#, "name: a VM needs a name"),
@@ -893,6 +1216,26 @@ mod tests {
                 "start: not true or false",
             ),
             (
+                r#"{"name": "a", "program": "AA==", "nets": {}}"#,
+                "nets: not a list",
+            ),
+            (
+                r#"{"name": "a", "program": "AA==", "nets": ["wan"]}"#,
+                "network card 1: not an object",
+            ),
+            (
+                r#"{"name": "a", "program": "AA==", "nets": [{"switch": "WAN"}]}"#,
+                "network card 1: 'WAN': switch 'WAN' is not a valid name",
+            ),
+            (
+                r#"{"name": "a", "program": "AA==", "nets": [{}, {"mac": "01:00:00:00:00:01"}]}"#,
+                "network card 2: 01:00:00:00:00:01 is a group address",
+            ),
+            (
+                r#"{"name": "a", "program": "AA==", "nets": [{"switch": "a", "speed": 1}]}"#,
+                "network card 1: unknown field 'speed'",
+            ),
+            (
                 r#"{"name": "a", "program": "AA==", "rma": "64"}"#,
                 "unknown field 'rma'",
             ),
@@ -908,6 +1251,8 @@ mod tests {
     fn statuses() {
         assert_eq!(status_of(Some(ErrorCode::NoSuchVm)), 404);
         assert_eq!(status_of(Some(ErrorCode::NoSuchDisk)), 404);
+        assert_eq!(status_of(Some(ErrorCode::NoSuchSwitch)), 404);
+        assert_eq!(status_of(Some(ErrorCode::NoSuchCard)), 404);
         assert_eq!(status_of(Some(ErrorCode::Busy)), 409);
         assert_eq!(status_of(Some(ErrorCode::InvalidState)), 409);
         assert_eq!(status_of(Some(ErrorCode::OverBudget)), 409);
@@ -980,16 +1325,79 @@ mod tests {
             state: VmState::Exited(2),
             profile: HardwareProfile {
                 clock_hz: Some(1_500_000),
-                devices: vec![DeviceSpec::Disk(DiskSpec {
-                    source: parse_disk_source("lake://127.0.0.1:7401/data").unwrap(),
-                    read_only: true,
-                })],
+                devices: vec![
+                    DeviceSpec::Net(parse_net("-,mac=02:00:00:00:00:01").unwrap()),
+                    DeviceSpec::Disk(DiskSpec {
+                        source: parse_disk_source("lake://127.0.0.1:7401/data").unwrap(),
+                        read_only: true,
+                    }),
+                    DeviceSpec::Net(parse_net("wan,mac=02:00:00:00:00:02").unwrap()),
+                ],
                 ..HardwareProfile::with_ram(64 << 20)
             },
         };
         assert_eq!(
             vm_json(&vm).encode(),
-            r#"{"id":3,"name":"web","state":"exited","state_text":"exited(2)","exit_code":2,"ram":67108864,"ram_text":"64 MiB","clock_hz":1500000,"clock_text":"1.5 MHz","nominal_hz":10000000,"nominal_text":"10 MHz","disks":[{"source":"lake://127.0.0.1:7401/data","read_only":true,"lake":{"addr":"127.0.0.1:7401","name":"data"},"held":false}],"actions":["destroy"]}"#
+            r#"{"id":3,"name":"web","state":"exited","state_text":"exited(2)","exit_code":2,"ram":67108864,"ram_text":"64 MiB","clock_hz":1500000,"clock_text":"1.5 MHz","nominal_hz":10000000,"nominal_text":"10 MHz","disks":[{"source":"lake://127.0.0.1:7401/data","read_only":true,"lake":{"addr":"127.0.0.1:7401","name":"data"},"held":false}],"nets":[{"card":0,"mac":"02:00:00:00:00:01","switch":null},{"card":1,"mac":"02:00:00:00:00:02","switch":"wan"}],"actions":["destroy"]}"#
+        );
+    }
+
+    #[test]
+    fn switch_output() {
+        let vm = VmSummary {
+            id: 4,
+            name: "web".into(),
+            state: VmState::Running,
+            profile: HardwareProfile {
+                devices: vec![
+                    DeviceSpec::Net(parse_net("-,mac=02:00:00:00:00:01").unwrap()),
+                    DeviceSpec::Net(parse_net("wan,mac=02:00:00:00:00:02").unwrap()),
+                ],
+                ..HardwareProfile::default()
+            },
+        };
+        let port = |owner, mac| avalon_proto::SwitchPort {
+            owner,
+            mac,
+            in_frames: 1,
+            in_bytes: 60,
+            out_frames: 2,
+            out_bytes: 120,
+            dropped: 0,
+        };
+        let switch = SwitchInfo {
+            name: "wan".into(),
+            capture: None,
+            nat: Some(avalon_proto::NatInfo {
+                hostfwd: vec![parse_hostfwd("tcp::8080-:80").unwrap()],
+                leases: vec![
+                    avalon_proto::Lease {
+                        mac: [2, 0, 0, 0, 0, 2],
+                        addr: "10.0.2.15".parse().unwrap(),
+                    },
+                    avalon_proto::Lease {
+                        mac: [2, 0, 0, 0, 0, 9],
+                        addr: "10.0.2.16".parse().unwrap(),
+                    },
+                ],
+            }),
+            ports: vec![
+                port(PortOwner::Gateway, [0x52, 0x55, 0x0a, 0, 2, 2]),
+                port(PortOwner::Card { vm: 4, card: 1 }, [2, 0, 0, 0, 0, 2]),
+                port(PortOwner::Card { vm: 7, card: 0 }, [2, 0, 0, 0, 0, 9]),
+            ],
+        };
+        assert_eq!(
+            switch_json(&switch, &[vm]).encode(),
+            concat!(
+                r#"{"name":"wan","capture":null,"nat":{"network":"10.0.2.0/24","gateway":"10.0.2.2","dns":"10.0.2.3","#,
+                r#""hostfwd":["tcp:127.0.0.1:8080-10.0.2.15:80"],"leases":["#,
+                r#"{"addr":"10.0.2.15","mac":"02:00:00:00:00:02","vm":{"id":4,"name":"web"}},"#,
+                r#"{"addr":"10.0.2.16","mac":"02:00:00:00:00:09","vm":null}]},"ports":["#,
+                r#"{"kind":"gateway","vm":null,"card":null,"mac":"52:55:0a:00:02:02","in_frames":1,"in_bytes":60,"out_frames":2,"out_bytes":120,"dropped":0},"#,
+                r#"{"kind":"card","vm":{"id":4,"name":"web"},"card":1,"mac":"02:00:00:00:00:02","in_frames":1,"in_bytes":60,"out_frames":2,"out_bytes":120,"dropped":0},"#,
+                r#"{"kind":"card","vm":{"id":7,"name":null},"card":0,"mac":"02:00:00:00:00:09","in_frames":1,"in_bytes":60,"out_frames":2,"out_bytes":120,"dropped":0}]}"#
+            )
         );
     }
 }

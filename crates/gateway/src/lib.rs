@@ -377,6 +377,11 @@ impl Gateway {
         self.dhcp.lease_of(mac)
     }
 
+    /// Every card that has a lease, and its address, in address order.
+    pub fn leases(&self) -> Vec<(Mac, Ipv4Addr)> {
+        self.dhcp.leases()
+    }
+
     pub fn stats(&self) -> Stats {
         self.stats
     }

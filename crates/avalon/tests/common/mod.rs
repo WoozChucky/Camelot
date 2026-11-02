@@ -52,6 +52,19 @@ pub fn examples_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples")
 }
 
+/// The frames of a pcap file, after its 24-byte header.
+pub fn pcap_frames(bytes: &[u8]) -> Vec<Vec<u8>> {
+    assert_eq!(bytes[..4], 0xa1b2_c3d4u32.to_le_bytes());
+    let mut rest = &bytes[24..];
+    let mut frames = Vec::new();
+    while !rest.is_empty() {
+        let len = u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize;
+        frames.push(rest[16..16 + len].to_vec());
+        rest = &rest[16 + len..];
+    }
+    frames
+}
+
 /// Assembles and links a guest with merlin-as and merlin-ld (`.text` at 0x80000000,
 /// entry `_start`).
 pub fn guest(asm: &str) -> Vec<u8> {

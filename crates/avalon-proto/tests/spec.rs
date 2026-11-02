@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use MessageKind::{Event, Reply, Request};
 
 /// Section 6, the message catalogue: (code, name, kind).
-const SPEC_CATALOGUE: [(u16, &str, MessageKind); 50] = [
+const SPEC_CATALOGUE: [(u16, &str, MessageKind); 51] = [
     (0x0001, "Hello", Request),
     (0x0002, "Welcome", Reply),
     (0x0003, "Error", Reply),
@@ -59,6 +59,7 @@ const SPEC_CATALOGUE: [(u16, &str, MessageKind); 50] = [
     (0x0605, "AttachCard", Request),
     (0x0606, "DetachCard", Request),
     (0x0607, "CaptureSwitch", Request),
+    (0x0608, "SetSwitchNat", Request),
 ];
 
 /// Section 5, the error codes.
@@ -508,8 +509,26 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
             P::default().str("d").frame(0x0504),
         ),
         (
-            CreateSwitch { name: "s".into() },
-            P::default().str("s").frame(0x0601),
+            CreateSwitch {
+                name: "s".into(),
+                nat: Some(NatConfig {
+                    hostfwd: vec![PortForward {
+                        proto: FwdProto::Udp,
+                        host: "127.0.0.1:8080".parse().unwrap(),
+                        guest: "10.0.2.16:80".parse().unwrap(),
+                    }],
+                }),
+            },
+            P::default()
+                .str("s")
+                .u8(1)
+                .u32(1)
+                .u8(2)
+                .raw(&[127, 0, 0, 1])
+                .u16(8080)
+                .raw(&[10, 0, 2, 16])
+                .u16(80)
+                .frame(0x0601),
         ),
         (
             DeleteSwitch { name: "t".into() },
@@ -521,15 +540,37 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                 switches: vec![SwitchInfo {
                     name: "s".into(),
                     capture: Some("c".into()),
-                    ports: vec![SwitchPort {
-                        owner: PortOwner::Card { vm: 3, card: 1 },
-                        mac: [2, 3, 4, 5, 6, 7],
-                        in_frames: 0x11,
-                        in_bytes: 0x22,
-                        out_frames: 0x33,
-                        out_bytes: 0x44,
-                        dropped: 0x55,
-                    }],
+                    nat: Some(NatInfo {
+                        hostfwd: vec![PortForward {
+                            proto: FwdProto::Tcp,
+                            host: "0.0.0.0:2222".parse().unwrap(),
+                            guest: "10.0.2.15:22".parse().unwrap(),
+                        }],
+                        leases: vec![Lease {
+                            mac: [2, 3, 4, 5, 6, 7],
+                            addr: "10.0.2.15".parse().unwrap(),
+                        }],
+                    }),
+                    ports: vec![
+                        SwitchPort {
+                            owner: PortOwner::Card { vm: 3, card: 1 },
+                            mac: [2, 3, 4, 5, 6, 7],
+                            in_frames: 0x11,
+                            in_bytes: 0x22,
+                            out_frames: 0x33,
+                            out_bytes: 0x44,
+                            dropped: 0x55,
+                        },
+                        SwitchPort {
+                            owner: PortOwner::Gateway,
+                            mac: [0x52, 0x55, 0x0a, 0, 2, 2],
+                            in_frames: 1,
+                            in_bytes: 2,
+                            out_frames: 3,
+                            out_bytes: 4,
+                            dropped: 5,
+                        },
+                    ],
                 }],
             },
             P::default()
@@ -537,7 +578,19 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                 .str("s")
                 .u8(1)
                 .str("c")
+                // nat: some, one rule, one lease
+                .u8(1)
                 .u32(1)
+                .u8(1)
+                .raw(&[0, 0, 0, 0])
+                .u16(2222)
+                .raw(&[10, 0, 2, 15])
+                .u16(22)
+                .u32(1)
+                .raw(&[2, 3, 4, 5, 6, 7])
+                .raw(&[10, 0, 2, 15])
+                // ports
+                .u32(2)
                 .u8(1)
                 .u32(3)
                 .u8(1)
@@ -547,6 +600,13 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                 .u64(0x33)
                 .u64(0x44)
                 .u64(0x55)
+                .u8(2)
+                .raw(&[0x52, 0x55, 0x0a, 0, 2, 2])
+                .u64(1)
+                .u64(2)
+                .u64(3)
+                .u64(4)
+                .u64(5)
                 .frame(0x0604),
         ),
         (
@@ -570,6 +630,13 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                 path: Some("p".into()),
             },
             P::default().str("s").u8(1).str("p").frame(0x0607),
+        ),
+        (
+            SetSwitchNat {
+                switch: "s".into(),
+                nat: Some(NatConfig::default()),
+            },
+            P::default().str("s").u8(1).u32(0).frame(0x0608),
         ),
     ]
 }
@@ -671,31 +738,69 @@ fn optional_fields_are_tagged() {
         switches: vec![SwitchInfo {
             name: "s".into(),
             capture: None,
+            nat: None,
             ports: Vec::new(),
         }],
     };
     assert_eq!(
         encode(&list).unwrap(),
-        P::default().u32(1).str("s").u8(0).u32(0).frame(0x0604)
+        P::default().u32(1).str("s").u8(0).u8(0).u32(0).frame(0x0604)
+    );
+    let plain = Message::CreateSwitch {
+        name: "s".into(),
+        nat: None,
+    };
+    assert_eq!(encode(&plain).unwrap(), P::default().str("s").u8(0).frame(0x0601));
+    let no_nat = Message::SetSwitchNat {
+        switch: "s".into(),
+        nat: None,
+    };
+    assert_eq!(
+        encode(&no_nat).unwrap(),
+        P::default().str("s").u8(0).frame(0x0608)
     );
 }
 
 #[test]
 fn doc_examples_are_exact() {
-    // Section 6.1: Hello version 3 from agent "rt".
+    // Section 6.1: Hello version 4 from agent "rt".
     assert_eq!(
         encode(&Message::Hello {
-            version: 3,
+            version: 4,
             agent: "rt".into()
         })
         .unwrap(),
-        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x03, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
+        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x04, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
     );
     // Section 7: the version this document describes.
-    assert_eq!(PROTOCOL_VERSION, 3);
+    assert_eq!(PROTOCOL_VERSION, 4);
     // Section 6.2: StartVm by id 5.
     assert_eq!(
         encode(&Message::StartVm { vm: VmRef::Id(5) }).unwrap(),
         [0x07, 0, 0, 0, 0x07, 0x01, 0x00, 0x05, 0, 0, 0]
     );
+}
+
+#[test]
+fn guest_addresses_are_the_gateways() {
+    // Section 3: the rule for a forwarded port's guest address is the one the NAT
+    // gateway applies (the protocol crate depends on nothing, so it has its own copy).
+    for last in 0..=255u8 {
+        for net in [[10, 0, 2], [10, 0, 3], [192, 168, 2]] {
+            let ip = std::net::Ipv4Addr::new(net[0], net[1], net[2], last);
+            assert_eq!(is_guest_addr(ip), gateway::is_guest_addr(ip), "{ip}");
+        }
+    }
+    // And a rule reads back as the gateway writes it.
+    let rule = PortForward {
+        proto: FwdProto::Udp,
+        host: "127.0.0.1:5353".parse().unwrap(),
+        guest: "10.0.2.16:53".parse().unwrap(),
+    };
+    let theirs = gateway::HostFwd::parse(&rule.to_string()).unwrap();
+    assert_eq!(
+        (theirs.proto, theirs.host, theirs.guest),
+        (gateway::Proto::Udp, rule.host, rule.guest)
+    );
+    assert_eq!(theirs.to_string(), rule.to_string());
 }

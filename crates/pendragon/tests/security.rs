@@ -104,7 +104,7 @@ fn hosts_are_checked() {
         "127.0.0.1".to_string(),
         format!("127.0.0.1:{port}.evil.example"),
     ] {
-        for path in ["/", "/app.js", "/api/overview", "/api/vms"] {
+        for path in ["/", "/app.js", "/api/overview", "/api/vms", "/api/switches"] {
             let r = get(path, &host);
             assert_eq!(r.status, 403, "{host} {path}");
             assert!(r.text().contains("is not this server"), "{}", r.text());
@@ -148,6 +148,17 @@ fn every_api_request_needs_the_token() {
         ("POST", "/api/disks/d/detach", ""),
         ("GET", "/api/vms/1/console", ""),
         ("POST", "/api/vms/1/console", "{\"data\": \"rm -rf /\\n\"}"),
+        ("GET", "/api/switches", ""),
+        ("POST", "/api/switches", "{\"name\": \"s\", \"nat\": true}"),
+        ("DELETE", "/api/switches/s", ""),
+        (
+            "POST",
+            "/api/switches/s/nat",
+            "{\"hostfwd\": [\"tcp::8080-:80\"]}",
+        ),
+        ("DELETE", "/api/switches/s/nat", ""),
+        ("POST", "/api/switches/s/attach", "{\"vm\": 1}"),
+        ("POST", "/api/switches/s/detach", "{\"vm\": 1}"),
         ("GET", "/api/nope", ""),
     ] {
         let missing = request(api.addr, method, path, &json, body.as_bytes());
@@ -215,6 +226,23 @@ fn changes_come_from_pendragons_own_page() {
             api.addr,
             "POST",
             "/api/vms/1/destroy",
+            &[token, ("Origin", origin)],
+            b"",
+        );
+        assert_eq!(r.status, 403, "{origin}");
+        // A gateway forwards host ports: another site must not be able to open one.
+        let r = request(
+            api.addr,
+            "POST",
+            "/api/switches",
+            &[token, json, ("Origin", origin)],
+            b"{\"name\": \"s\", \"nat\": true, \"hostfwd\": [\"tcp:0.0.0.0:8080-:80\"]}",
+        );
+        assert_eq!(r.status, 403, "{origin}");
+        let r = request(
+            api.addr,
+            "DELETE",
+            "/api/switches/s",
             &[token, ("Origin", origin)],
             b"",
         );

@@ -629,6 +629,260 @@ fn create_options_and_refusals() {
     platform.stop();
 }
 
+/// A switch's JSON in the list, by name.
+fn switch_in(list: &Json, name: &str) -> Json {
+    list_of(list, "switches")
+        .into_iter()
+        .find(|sw| s(sw, "name") == name)
+        .unwrap_or_else(|| panic!("no switch {name} in {list}"))
+}
+
+fn code(r: &Reply) -> Option<String> {
+    r.json().get("code").and_then(Json::as_str).map(str::to_string)
+}
+
+/// The host port of a forwarding rule as Pendragon shows it (`tcp:127.0.0.1:PORT-...`).
+fn host_port(rule: &str) -> u16 {
+    let host = rule.split('-').next().unwrap();
+    host.rsplit(':').next().unwrap().parse().unwrap()
+}
+
+#[test]
+fn switches_end_to_end() {
+    // The switches page's requests: create (with and without a NAT gateway), plug
+    // cards in and out, give a gateway and take it away, delete; a VM running
+    // examples/net/net-user gets a lease that names it, and deleting the switch frees
+    // the gateway's host ports.
+    let platform = Platform::start("switches", 64);
+    let api = platform.api();
+    let none = api.expect(200, api.get("switches"));
+    assert!(list_of(&none, "switches").is_empty(), "{none}");
+    assert_eq!(none.get("vms_error"), Some(&Json::Null));
+
+    // A plain switch, and one with a gateway forwarding a host port the system picks.
+    let r = api.expect(201, api.post("switches", &obj([("name", "lan".into())])));
+    assert_eq!(r.get("nat"), Some(&Json::Null), "{r}");
+    let r = api.expect(
+        201,
+        api.post(
+            "switches",
+            &obj([
+                ("name", "wan".into()),
+                ("nat", true.into()),
+                ("hostfwd", Json::Array(vec!["tcp::0-:7".into()])),
+            ]),
+        ),
+    );
+    let nat = r.get("nat").unwrap();
+    assert_eq!(s(nat, "gateway"), "10.0.2.2");
+    let rule = list(nat, "hostfwd")[0].as_str().unwrap().to_string();
+    assert!(
+        rule.starts_with("tcp:127.0.0.1:") && rule.ends_with("-10.0.2.15:7"),
+        "{rule}"
+    );
+    let port = host_port(&rule);
+    assert_ne!(port, 0);
+    // The port is the gateway's now.
+    assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
+
+    // A VM with two cards: one on lan, one on wan, running net-user (which asks the
+    // gateway for an address as it starts).
+    let net_user =
+        pendragon::base64::encode(&std::fs::read(example("net").with_file_name("net-user.elf")).unwrap());
+    let r = api.expect(
+        201,
+        api.post(
+            "vms",
+            &obj([
+                ("name", "user".into()),
+                ("ram", "8".into()),
+                ("program", net_user.into()),
+                (
+                    "nets",
+                    Json::Array(vec![
+                        obj([("switch", "wan".into()), ("mac", "02:ca:00:00:00:0a".into())]),
+                        obj([("switch", "lan".into())]),
+                    ]),
+                ),
+                ("start", true.into()),
+            ]),
+        ),
+    );
+    let id = n(&r, "id");
+    let vm = api.expect(200, api.get(&format!("vms/{id}")));
+    let nets = list(&vm, "nets");
+    assert_eq!(nets.len(), 2, "{vm}");
+    assert_eq!(
+        (n(&nets[0], "card"), s(&nets[0], "mac"), s(&nets[0], "switch")),
+        (0, "02:ca:00:00:00:0a", "wan")
+    );
+    assert_eq!((n(&nets[1], "card"), s(&nets[1], "switch")), (1, "lan"));
+
+    // The lease names the VM, and the gateway's port counts the DHCP exchange.
+    let wan = wait_for("net-user's lease", || {
+        let wan = switch_in(&api.expect(200, api.get("switches")), "wan");
+        let leases = list(wan.get("nat").unwrap(), "leases").to_vec();
+        (!leases.is_empty() && n(&list(&wan, "ports")[0], "in_frames") > 0).then_some(wan)
+    });
+    let lease = &list(wan.get("nat").unwrap(), "leases")[0];
+    assert_eq!(
+        (s(lease, "addr"), s(lease, "mac")),
+        ("10.0.2.15", "02:ca:00:00:00:0a")
+    );
+    let owner = lease.get("vm").unwrap();
+    assert_eq!((n(owner, "id"), s(owner, "name")), (id, "user"));
+    let ports = list(&wan, "ports");
+    assert_eq!(ports.len(), 2, "{wan}");
+    assert_eq!(s(&ports[0], "kind"), "gateway");
+    assert_eq!(ports[0].get("vm"), Some(&Json::Null));
+    assert_eq!((s(&ports[1], "kind"), n(&ports[1], "card")), ("card", 0));
+    assert_eq!(s(ports[1].get("vm").unwrap(), "name"), "user");
+    assert!(n(&ports[1], "out_frames") > 0, "{wan}");
+
+    // Unplugging names the switch the card is on.
+    let r = api.post(
+        "switches/lan/detach",
+        &obj([("vm", "user".into()), ("card", 0u8.into())]),
+    );
+    assert_eq!(r.status, 409, "{}", r.text());
+    assert!(
+        r.error().contains("is not plugged into switch 'lan'"),
+        "{}",
+        r.error()
+    );
+    api.expect(
+        200,
+        api.post(
+            "switches/lan/detach",
+            &obj([("vm", "user".into()), ("card", 1u8.into())]),
+        ),
+    );
+    let lan = switch_in(&api.expect(200, api.get("switches")), "lan");
+    assert!(list(&lan, "ports").is_empty(), "{lan}");
+    let r = api.expect(
+        200,
+        api.post(
+            "switches/lan/attach",
+            &obj([("vm", Json::from(id)), ("card", 1u8.into())]),
+        ),
+    );
+    assert_eq!(r.get("plugged"), Some(&Json::Bool(true)));
+    assert_eq!(
+        list(&switch_in(&api.expect(200, api.get("switches")), "lan"), "ports").len(),
+        1
+    );
+
+    // A gateway for lan, then taken away.
+    let r = api.expect(
+        200,
+        api.post("switches/lan/nat", &obj([("hostfwd", Json::Array(vec![]))])),
+    );
+    assert!(list(r.get("nat").unwrap(), "hostfwd").is_empty(), "{r}");
+    let r = api.post("switches/lan/nat", &obj([]));
+    assert_eq!(
+        (r.status, code(&r).as_deref()),
+        (409, Some("already exists")),
+        "{}",
+        r.text()
+    );
+    let r = api.expect(200, api.delete("switches/lan/nat"));
+    assert_eq!(r.get("nat"), Some(&Json::Null));
+    let r = api.delete("switches/lan/nat");
+    assert_eq!(
+        (r.status, code(&r).as_deref()),
+        (409, Some("invalid state")),
+        "{}",
+        r.text()
+    );
+
+    // A host port that is taken: a clear error, and no switch.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy = format!("tcp::{}-:80", taken.local_addr().unwrap().port());
+    let r = api.post(
+        "switches",
+        &obj([
+            ("name", "busy".into()),
+            ("nat", true.into()),
+            ("hostfwd", Json::Array(vec![busy.into()])),
+        ]),
+    );
+    assert_eq!(
+        (r.status, code(&r).as_deref()),
+        (502, Some("I/O error")),
+        "{}",
+        r.text()
+    );
+    assert!(r.error().contains("cannot forward the port"), "{}", r.error());
+    let names: Vec<String> = list_of(&api.expect(200, api.get("switches")), "switches")
+        .iter()
+        .map(|sw| s(sw, "name").to_string())
+        .collect();
+    assert_eq!(names, ["lan", "wan"]);
+    drop(taken);
+
+    // Refusals before Avalon is asked, and Avalon's own.
+    for (path, body, status, want) in [
+        ("switches", obj([("name", "Bad".into())]), 400, "name: "),
+        (
+            "switches",
+            obj([
+                ("name", "x".into()),
+                ("hostfwd", Json::Array(vec!["tcp::1-:2".into()])),
+            ]),
+            400,
+            "set nat too",
+        ),
+        (
+            "switches",
+            obj([
+                ("name", "x".into()),
+                ("nat", true.into()),
+                ("hostfwd", Json::Array(vec!["nope".into()])),
+            ]),
+            400,
+            "hostfwd",
+        ),
+        (
+            "switches",
+            obj([("name", "x".into()), ("speed", 1u8.into())]),
+            400,
+            "unknown field 'speed'",
+        ),
+        ("switches", obj([("name", "wan".into())]), 409, "already exists"),
+        ("switches/nope/nat", obj([]), 404, "nope"),
+        ("switches/nope/attach", obj([("vm", "user".into())]), 404, "nope"),
+        ("switches/wan/attach", obj([("vm", "ghost".into())]), 404, "ghost"),
+        (
+            "switches/wan/attach",
+            obj([("vm", "user".into()), ("card", 9u8.into())]),
+            404,
+            "has 2 network cards",
+        ),
+        ("switches/wan/attach", obj([]), 400, "vm: "),
+        (
+            "switches/wan/attach",
+            obj([("vm", "user".into()), ("card", "x".into())]),
+            400,
+            "card: ",
+        ),
+    ] {
+        let r = api.post(path, &body);
+        assert_eq!(r.status, status, "{path} {body}: {}", r.text());
+        assert!(r.error().contains(want), "{path} {body}: {}", r.error());
+    }
+    let r = api.delete("switches/nope");
+    assert_eq!((r.status, code(&r).as_deref()), (404, Some("no such switch")));
+
+    // Deleting wan unplugs the VM's card and frees the forwarded host port at once.
+    assert_eq!(s(&api.expect(200, api.delete("switches/wan")), "deleted"), "wan");
+    drop(std::net::TcpListener::bind(("127.0.0.1", port)).expect("the forwarded port is free again"));
+    let vm = api.expect(200, api.get(&format!("vms/{id}")));
+    assert_eq!(list(&vm, "nets")[0].get("switch"), Some(&Json::Null), "{vm}");
+    api.expect(200, api.delete("switches/lan"));
+    assert!(list_of(&api.expect(200, api.get("switches")), "switches").is_empty());
+    platform.stop();
+}
+
 #[test]
 fn servers_that_are_away() {
     // Pendragon starts and serves its pages whatever the servers do; each request
@@ -690,6 +944,12 @@ fn routes_and_methods() {
         ("GET", "disks/x", 405, None),
         ("POST", "overview", 405, None),
         ("GET", "disks/x/detach", 405, None),
+        ("PUT", "switches", 405, None),
+        ("GET", "switches/x", 405, None),
+        ("GET", "switches/x/nat", 405, None),
+        ("GET", "switches/x/attach", 405, None),
+        ("DELETE", "switches/x/detach", 405, None),
+        ("GET", "switches/x/y", 404, None),
         ("POST", "disks/Bad/detach", 404, None),
         ("POST", "", 404, None),
         (

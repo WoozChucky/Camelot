@@ -8,7 +8,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/ua/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps), keyboard and pointer (from the window, with PLIC interrupts), sysinfo and block devices (disk images or disks on a Lake server, `--disk`); configurable RAM, real-time clock and disks |
 | **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | Builds every example on its own, no LLVM (`cargo xtask examples`). merlin-as: complete; its objects match clang's ([encoder notes](crates/merlin-as/ENCODER.md)). merlin-ld: links clang objects to the same bytes as ld.lld except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: a C99 subset (integer types, pointers, arrays, globals, strings; structs and the preprocessor next) compiles to assembly that our own assembler and linker build into programs Grail runs ([code generation notes](crates/merlin/src/codegen.rs)). merlin-objdump: matches llvm-objdump |
 | **Camelot** | The kernel / OS | Boots on Grail in S-mode: `kprintf`, trap handling, timer ticks, page allocator and Sv32 paging, interrupt-driven UART console, user programs in C in U-mode with their own page tables, switched round robin on timer ticks, system calls ([docs/camelot-syscalls.md](docs/camelot-syscalls.md)) and a user-space shell, an interrupt-driven disk driver with a buffer cache, a journaled filesystem mounted at boot ([docs/camelot-fs.md](docs/camelot-fs.md), with a host-side mkfs and fsck in `crates/camelot-fs`) ([kernel/](kernel/README.md)) |
-| **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Pendragon web console, the Herald VM client and the Lake storage server | Protocol v3 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget, attachable consoles and screens, and network cards on virtual Ethernet switches; the Round Table CLI creates and controls them, and manages Lake's disk images; Pendragon does the same from a browser, with live consoles; the Lake storage server serves disk images to them over the network; Herald attaches a terminal to a VM's console, or a window to its screen, keyboard and mouse |
+| **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Pendragon web console, the Herald VM client and the Lake storage server | Protocol v4 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget, attachable consoles and screens, and network cards on virtual Ethernet switches, which can have a NAT gateway to the host and the internet; the Round Table CLI creates and controls them, and manages Lake's disk images; Pendragon does the same from a browser, with live consoles; the Lake storage server serves disk images to them over the network; Herald attaches a terminal to a VM's console, or a window to its screen, keyboard and mouse |
 
 ## Layout
 
@@ -17,11 +17,11 @@ crates/excalibur        instruction encodings, decoder, disassembler (shared by 
 crates/elf32            ELF32 reader (shared by grail, merlin-objdump, merlin-ld)
 crates/grail            the emulator
 crates/avalon-proto     the Avalon protocol: frames, messages, blocking connection, screen diffing (docs/avalon-protocol.md)
-crates/gateway          the user-mode NAT gateway behind `grail --net user`: DHCP, DNS, NAT and port forwarding over std::net
+crates/gateway          the user-mode NAT gateway behind `grail --net user` and Avalon's switches: DHCP, DNS, NAT and port forwarding over std::net
 crates/avalon           the Avalon hypervisor server: runs N Grail VMs and the virtual switches between them, serves the protocol
 crates/avalon-client    the client side of the platform: VM and disk operations, shared by Round Table and Pendragon
 crates/round-table      the Round Table control CLI (a thin layer over avalon-client)
-crates/pendragon        the Pendragon web console: a std-only HTTP server and a browser page for VMs and disks (docs/pendragon.md)
+crates/pendragon        the Pendragon web console: a std-only HTTP server and a browser page for VMs, disks and switches (docs/pendragon.md)
 crates/herald           Herald, the Avalon client that attaches a terminal to one VM's console, or a window to its screen
 crates/lake             the Lake storage server: a directory of disk images, served as block devices over the protocol
 crates/camelot-fs       the Camelot filesystem on the host (docs/camelot-fs.md): mkfs, fsck and a reader, the `camelot-fs` command
@@ -220,8 +220,8 @@ Grail runs one machine for one terminal. The Avalon platform runs many, as long-
 | Program | Crate | What it does | Status |
 |---|---|---|---|
 | **Avalon** | `crates/avalon` | the hypervisor server: creates and runs N Grail VMs, each with its own hardware profile (RAM, clock, disks, network cards), keeps each VM's console and screen, and connects their cards with virtual Ethernet switches | done |
-| **Round Table** | `crates/round-table` | the control CLI: create, list, start, pause, resume, stop and destroy VMs; create, list, capture and delete switches and plug cards in and out; create, list and delete Lake's disk images | done |
-| **Pendragon** | `crates/pendragon` | the web console: Round Table's VM and disk commands, from a browser, plus live consoles and an overview of both servers | done (the screen view and switches are still to come) |
+| **Round Table** | `crates/round-table` | the control CLI: create, list, start, pause, resume, stop and destroy VMs; create, list, capture and delete switches, give them NAT gateways and plug cards in and out; create, list and delete Lake's disk images | done |
+| **Pendragon** | `crates/pendragon` | the web console: Round Table's VM, switch and disk commands, from a browser, plus live consoles and an overview of both servers | done (the screen view is still to come) |
 | **Herald** | `crates/herald` | attaches to one VM: its console, or its screen, keyboard and mouse | done |
 | **Lake** | `crates/lake` | the storage server: disk images served as block devices over the network | done |
 
@@ -253,7 +253,7 @@ Every VM's UART is its console. Avalon keeps the last 64 KiB of output; a client
 
 A VM's disks are image files on Avalon's host or images on a Lake server (`lake://host:port/name`, see [Running Lake](#running-lake)), in the order its profile lists them.
 
-A VM's network cards (up to 4, Grail's card of section 9.8 of the spec) plug into Avalon's virtual Ethernet switches, which a client creates by name. A switch is a learning switch, like the box under a desk: it learns which port each source address is on, sends a frame to the one port its destination was seen on, and floods broadcasts and unknown destinations to every other port; learned addresses age out after 300 seconds. Switches are separate networks, so a VM on one never sees another's frames. A card's frames go through the switch on its own VM's thread without ever waiting: each port queues at most 256 frames, and the ones past that are dropped and counted on that port, so a paused or slow VM loses its own frames and holds up nobody. A card with no address in the profile gets one made from the VM's name (`02:..`, the same every time). Cards are plugged in and out while VMs run (the guest sees its link go up and down), a switch can be captured into a pcap file on Avalon's host, and a card is unplugged when its VM's machine ends. Section 6.7 of the protocol document has the details.
+A VM's network cards (up to 4, Grail's card of section 9.8 of the spec) plug into Avalon's virtual Ethernet switches, which a client creates by name. A switch is a learning switch, like the box under a desk: it learns which port each source address is on, sends a frame to the one port its destination was seen on, and floods broadcasts and unknown destinations to every other port; learned addresses age out after 300 seconds. Switches are separate networks, so a VM on one never sees another's frames. A card's frames go through the switch on its own VM's thread without ever waiting: each port queues at most 256 frames, and the ones past that are dropped and counted on that port, so a paused or slow VM loses its own frames and holds up nobody. A card with no address in the profile gets one made from the VM's name (`02:..`, the same every time). Cards are plugged in and out while VMs run (the guest sees its link go up and down), a switch can be captured into a pcap file on Avalon's host, and a card is unplugged when its VM's machine ends. A switch can also have a NAT gateway that gives its VMs addresses by DHCP, the host and the internet, and forwards host ports to them (see Round Table below). Section 6.7 of the protocol document has the details.
 
 Every bad request gets a protocol error, never a crash: an unknown VM, a bad name, a profile Grail cannot build (bad RAM size, zero clock, a missing disk image, a Lake disk that does not exist, is attached by another VM or is on a server that cannot be reached: `InvalidProfile`, with Lake's own error in the message), a program that is not a loadable ELF (checked before anything is allocated for it), a request in the wrong state, a create over the RAM budget, malformed or misdirected frames.
 
@@ -393,13 +393,31 @@ ports    none
 
 Once both programs have exited, `switch show` lists no ports, since a card is unplugged when its machine ends; while they run it lists one port per card, with frames and bytes in and out and frames dropped. `switch attach SWITCH VM [--card N]` plugs a card in, `switch detach VM [--card N]` unplugs it, `switch list` shows every switch, and `switch delete NAME` deletes one, unplugging what is left on it.
 
+A switch can have a NAT gateway: the same one as `grail --net user` (spec section 9.8), on a port of the switch, serving every VM plugged in. Each card gets its own DHCP lease (10.0.2.15, .16, ... in the order they ask), 10.0.2.2 is the host's 127.0.0.1, DNS is at 10.0.2.3, and TCP and UDP reach the internet through host sockets. `--hostfwd` forwards host ports to a guest, 10.0.2.15 unless the rule names another address; the host ports are bound on 127.0.0.1 unless the rule says otherwise, a port that is taken fails the command, and deleting the switch closes them:
+
+```
+round-table switch create wan --nat --hostfwd tcp::8080-:80 --hostfwd tcp::2222-10.0.2.16:22
+round-table create --name web --net wan --start my-server.elf
+round-table switch show wan
+```
+
+```
+created switch wan with a NAT gateway
+forwarding tcp:127.0.0.1:8080-10.0.2.15:80
+forwarding tcp:127.0.0.1:2222-10.0.2.16:22
+created VM 1 (web)
+started VM 1 (web)
+```
+
+`switch show` then lists the gateway (its network, forwarded ports and the lease of each card) and its port with the cards'. `switch nat NAME [--hostfwd RULE]...` gives an existing switch a gateway, and `switch nat NAME --off` takes it away, closing its connections and ports.
+
 Errors are the server's, on stderr, with exit status 1 (`round-table: invalid state: VM 1 ('demo') is exited(0), not created`); an unreachable server is also 1, and a mistake on the command line is 2.
 
-The commands themselves live in `crates/avalon-client` (`Client`: `create_vm`, `list_vms`, `vm_info`, `vm_action`, `create_switch`, `list_switches`, `attach_card`, `detach_card`, `capture_switch`, `delete_switch`, `create_disk`, `list_disks`, `delete_disk`, plus the parsers and formatters for addresses, sizes, clocks, disk sources, network cards and MAC addresses); Round Table is a thin command line over it, and the [Pendragon](#pendragon) web console is another.
+The commands themselves live in `crates/avalon-client` (`Client`: `create_vm`, `list_vms`, `vm_info`, `vm_action`, `create_switch`, `create_switch_with`, `set_switch_nat`, `list_switches`, `attach_card`, `detach_card`, `capture_switch`, `delete_switch`, `create_disk`, `list_disks`, `delete_disk`, plus the parsers and formatters for addresses, sizes, clocks, disk sources, network cards and MAC addresses); Round Table is a thin command line over it, and the [Pendragon](#pendragon) web console is another.
 
 ### Pendragon
 
-Pendragon is the platform's web console: one page in a browser for the VMs of an Avalon server and the disk images of a Lake server. It is a client of both, like Round Table, and goes through the same `avalon-client` layer for every operation; Avalon and Lake stay headless, and Lake can be on another machine. With both running:
+Pendragon is the platform's web console: one page in a browser for the VMs and switches of an Avalon server and the disk images of a Lake server. It is a client of both, like Round Table, and goes through the same `avalon-client` layer for every operation; Avalon and Lake stay headless, and Lake can be on another machine. With both running:
 
 ```
 cargo run --release -p pendragon
@@ -415,9 +433,10 @@ Open the URL it prints (the token in it changes at every launch). Options: `--li
 
 - **Overview** (`#/`): Avalon and Lake, each up or down with its version or the error that says why; the RAM all VMs hold against Avalon's budget, as a bar; how many VMs are running, paused, created and ended; how many disks there are, how many are attached, and their total size. It refreshes every few seconds, as the other pages do.
 - **VMs** (`#/vms`): a table of every VM with its id, name, state, RAM, clock and disks, and a button for each action its state allows (start for a created VM; pause, stop, destroy for a running one; resume for a paused one; destroy for a stopped or exited one). Stop and destroy ask first.
-- **New VM** (`#/vms/new`): name, RAM in MiB, clock (`10MHz`, `500kHz`, `5Hz`, or empty for full speed: the syntax of `--ram` and `--clock`), the program (an ELF file chosen in the browser and uploaded), any number of disks (each a `lake://ADDR/NAME` source, offered from Lake's list, or the path of an image file on Avalon's host, read-write or read-only), and whether to start it at once. Mistakes come back as Round Table would say them (`ram: 0 MiB is out of range`).
+- **New VM** (`#/vms/new`): name, RAM in MiB, clock (`10MHz`, `500kHz`, `5Hz`, or empty for full speed: the syntax of `--ram` and `--clock`), the program (an ELF file chosen in the browser and uploaded), any number of disks (each a `lake://ADDR/NAME` source, offered from Lake's list, or the path of an image file on Avalon's host, read-write or read-only), network cards (each on a switch, offered from Avalon's list, or unplugged, with an address or one Avalon makes up), and whether to start it at once. Mistakes come back as Round Table would say them (`ram: 0 MiB is out of range`).
 - **One VM** (`#/vms/ID`): its facts (state, RAM, clock, steps run, disks, the device table its guest sees), its action buttons, and its console: the scrollback, then the output live as the guest writes it, and an input line whose text goes to the VM's UART when you press Enter, followed by LF, CR or nothing as you choose (a Ctrl-D button sends EOT). Several pages, and Herald, can watch one console at once.
 - **Disks** (`#/disks`): a form to create an image (name and size: `64MiB`, `512K`, `1G`, `2048s`), and a table of Lake's images with their size, how they are attached (read-write, or how many readers) and which VMs hold them, with three buttons: *attach* opens the new-VM form with the image filled in (a VM's disks are part of its hardware, attached when it is created), *detach* stops the VMs that hold it (a VM lets go of its disks when it stops, and cannot be started again: the page says so first), and *delete*, for an image nobody holds.
+- **Switches** (`#/switches`): a form to create a switch (its name, whether it has a NAT gateway, and the ports it forwards, one rule per line as `--hostfwd` takes them), a form to plug a VM's card into a switch, and a panel per switch: its gateway (network, forwarded ports as bound, and each lease with the VM it belongs to) with a button to add or remove it, a delete button, and its ports with frames and bytes in and out, frames dropped, and an *unplug* button per card.
 
 Pendragon listens on loopback, but other web pages in the same browser could still send it requests, so it checks the `Host` of every request (which stops DNS rebinding), wants the launch's token on every API request and an `Origin` of its own on every change, and serves its page with a Content Security Policy that allows no inline script; the page sets all data as text, never as markup. `--allow-host NAME` adds a name to the accepted hosts, for `--listen` on another interface. Everything is std only: the HTTP server, the JSON, and the page (HTML, JavaScript and CSS built into the binary, no build step). [`docs/pendragon.md`](docs/pendragon.md) has the security model, the HTTP limits and the JSON API, which works with `curl` too:
 

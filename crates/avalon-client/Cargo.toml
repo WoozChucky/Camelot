@@ -10,3 +10,5 @@ avalon-proto = { path = "../avalon-proto" }
 # The --ram and --clock syntax (one parser for every front end), and the sysinfo
 # device type codes.
 grail = { path = "../grail" }
+# The hostfwd rules of a switch's NAT gateway, read by the gateway's own parser.
+gateway = { path = "../gateway" }

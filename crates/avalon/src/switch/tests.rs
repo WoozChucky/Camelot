@@ -618,3 +618,190 @@ fn generated_addresses_are_stable_cards_and_distinct() {
 
 /// `generated_mac("web", 0)`: FNV-1a 64 of "web", 0, 0.
 const GENERATED_WEB_0: &str = "02:66:b7:0f:2e:09";
+
+// ---- The NAT gateway ----
+
+use gateway::{dhcp, wire};
+
+const GW: MacAddr = MacAddr(GATEWAY_MAC);
+
+/// A DHCP DISCOVER for `chaddr`, broadcast from `src`.
+fn discover(src: MacAddr, chaddr: MacAddr) -> Vec<u8> {
+    let m = dhcp::client_message(dhcp::DISCOVER, 7, chaddr.0, None);
+    let udp = wire::udp_datagram(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, 68, 67, &m);
+    let ip = wire::ipv4_packet(
+        Ipv4Addr::UNSPECIFIED,
+        Ipv4Addr::BROADCAST,
+        wire::PROTO_UDP,
+        0,
+        &udp,
+    );
+    wire::eth_frame(wire::BROADCAST_MAC, src.0, wire::ETHERTYPE_IPV4, &ip)
+}
+
+/// An ARP request from `src` (at 10.0.2.`last`) for the gateway's address.
+fn who_has_the_gateway(src: MacAddr, last: u8) -> Vec<u8> {
+    let arp = wire::arp_packet(&wire::Arp {
+        op: wire::ARP_REQUEST,
+        sender_mac: src.0,
+        sender_ip: Ipv4Addr::new(10, 0, 2, last),
+        target_mac: [0; 6],
+        target_ip: gateway::GATEWAY_ADDR,
+    });
+    wire::eth_frame(wire::BROADCAST_MAC, src.0, wire::ETHERTYPE_ARP, &arp)
+}
+
+/// Waits for the gateway's thread to send `card` a frame, and returns it (frames
+/// from other cards are passed over).
+fn from_gateway(card: &mut TestCard) -> Vec<u8> {
+    let start = Instant::now();
+    loop {
+        if let Some(f) = card.recv_all().into_iter().find(|f| f[6..12] == GW.0) {
+            return f;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the gateway never answered"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn gateway_port(switch: &Switch) -> SwitchPort {
+    *switch
+        .info()
+        .ports
+        .iter()
+        .find(|p| p.owner == PortOwner::Gateway)
+        .expect("a gateway")
+}
+
+fn leases(switch: &Switch) -> Vec<(MacAddr, Ipv4Addr)> {
+    switch
+        .info()
+        .nat
+        .expect("a gateway")
+        .leases
+        .iter()
+        .map(|l| (MacAddr(l.mac), l.addr))
+        .collect()
+}
+
+#[test]
+fn one_gateway_gives_each_card_its_own_lease() {
+    let lan = Switch::new("lan");
+    lan.set_nat(Some(&NatConfig::default())).unwrap();
+    let mut a = TestCard::plugged(1, A, &lan);
+    let mut b = TestCard::plugged(2, B, &lan);
+    assert_eq!(lan.info().nat, Some(NatInfo::default()));
+    let port = gateway_port(&lan);
+    assert_eq!((port.mac, port.in_frames, port.out_frames), (GATEWAY_MAC, 0, 0));
+
+    a.send(&discover(A, A));
+    let offer = from_gateway(&mut a);
+    assert_eq!(offer[..6], A.0, "unicast to the card that asked");
+    assert!(a.rings() >= 1, "the gateway's frame rang the card's bell");
+    // B heard A's broadcast, but not the gateway's answer to A.
+    assert_eq!(b.recv_all(), [discover(A, A)]);
+    b.send(&discover(B, B));
+    let offer_b = from_gateway(&mut b);
+    assert_eq!(offer_b[..6], B.0);
+    assert_eq!(
+        wire::ipv4_at(&offer, 14 + 20 + 8 + 16),
+        Ipv4Addr::new(10, 0, 2, 15)
+    );
+    assert_eq!(
+        wire::ipv4_at(&offer_b, 14 + 20 + 8 + 16),
+        Ipv4Addr::new(10, 0, 2, 16)
+    );
+    assert_eq!(
+        leases(&lan),
+        [(A, Ipv4Addr::new(10, 0, 2, 15)), (B, Ipv4Addr::new(10, 0, 2, 16))]
+    );
+    // The gateway's port counts like a card's: the two DISCOVERs in, the two OFFERs
+    // out (A's DISCOVER also went to B's port).
+    let port = gateway_port(&lan);
+    assert_eq!((port.out_frames, port.in_frames, port.dropped), (2, 2, 0));
+    assert_eq!(port_of(&lan, 2).out_frames, 2);
+}
+
+#[test]
+fn a_card_cannot_pose_as_another_machine_to_the_gateway() {
+    let lan = Switch::new("lan");
+    lan.set_nat(Some(&NatConfig::default())).unwrap();
+    let mut a = TestCard::plugged(1, A, &lan);
+    let mut b = TestCard::plugged(2, B, &lan);
+    // A asks for a lease as C: the switch passes it to B (a card), not the gateway.
+    a.send(&discover(C, C));
+    a.send(&who_has_the_gateway(A, 15));
+    let reply = from_gateway(&mut a);
+    assert_eq!(wire::be16(&reply, 12), wire::ETHERTYPE_ARP);
+    assert_eq!(gateway_port(&lan).out_frames, 1, "the ARP request only");
+    assert_eq!(leases(&lan), []);
+    assert_eq!(b.recv_all(), [discover(C, C), who_has_the_gateway(A, 15)]);
+}
+
+#[test]
+fn a_gateway_taken_away_or_deleted_frees_its_host_ports() {
+    let lan = Switch::new("lan");
+    let fwd = |port| NatConfig {
+        hostfwd: vec![PortForward {
+            proto: FwdProto::Tcp,
+            host: std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+            guest: std::net::SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 80),
+        }],
+    };
+    lan.set_nat(Some(&fwd(0))).unwrap();
+    let bound = lan.info().nat.unwrap().hostfwd[0].host;
+    assert_ne!(bound.port(), 0);
+    assert!(std::net::TcpListener::bind(bound).is_err(), "the gateway has it");
+    let mut a = TestCard::plugged(1, A, &lan);
+    assert_eq!(lan.info().ports.len(), 2);
+
+    // Taken away: its port goes, the port is free at once, and nothing reaches it.
+    lan.set_nat(None).unwrap();
+    assert_eq!(lan.info().nat, None);
+    assert_eq!(lan.info().ports.len(), 1);
+    drop(std::net::TcpListener::bind(bound).unwrap());
+    a.send(&who_has_the_gateway(A, 15));
+    assert!(a.recv_all().is_empty());
+    assert_eq!(lan.set_nat(None).unwrap_err().code, ErrorCode::InvalidState);
+
+    // Back with the same port, and then the switch deleted.
+    lan.set_nat(Some(&fwd(bound.port()))).unwrap();
+    assert_eq!(lan.info().nat.unwrap().hostfwd[0].host, bound);
+    assert_eq!(
+        lan.set_nat(Some(&fwd(0))).unwrap_err().code,
+        ErrorCode::AlreadyExists
+    );
+    lan.close();
+    drop(std::net::TcpListener::bind(bound).unwrap());
+    assert_eq!(
+        lan.set_nat(Some(&fwd(0))).unwrap_err().code,
+        ErrorCode::NoSuchSwitch
+    );
+}
+
+#[test]
+fn a_port_that_cannot_be_bound_fails_and_changes_nothing() {
+    let lan = Switch::new("lan");
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let host = match taken.local_addr().unwrap() {
+        std::net::SocketAddr::V4(v4) => v4,
+        other => panic!("{other}"),
+    };
+    let rule = PortForward {
+        proto: FwdProto::Tcp,
+        host,
+        guest: std::net::SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 16), 22),
+    };
+    let fail = lan.set_nat(Some(&NatConfig { hostfwd: vec![rule] })).unwrap_err();
+    assert_eq!(fail.code, ErrorCode::Io);
+    assert!(
+        fail.message.contains(&format!("hostfwd {rule}")),
+        "{}",
+        fail.message
+    );
+    assert_eq!(lan.info().nat, None);
+    assert!(lan.info().ports.is_empty());
+}

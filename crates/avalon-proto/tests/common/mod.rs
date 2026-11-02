@@ -244,7 +244,39 @@ pub fn samples() -> Vec<Message> {
         DiskDelete {
             name: "old.img".into(),
         },
-        CreateSwitch { name: "lan".into() },
+        CreateSwitch {
+            name: "lan".into(),
+            nat: None,
+        },
+        CreateSwitch {
+            name: "wan".into(),
+            nat: Some(NatConfig::default()),
+        },
+        CreateSwitch {
+            name: "wan".into(),
+            nat: Some(NatConfig {
+                hostfwd: vec![
+                    PortForward {
+                        proto: FwdProto::Tcp,
+                        host: "127.0.0.1:8080".parse().unwrap(),
+                        guest: "10.0.2.15:80".parse().unwrap(),
+                    },
+                    PortForward {
+                        proto: FwdProto::Udp,
+                        host: "0.0.0.0:0".parse().unwrap(),
+                        guest: "10.0.2.254:65535".parse().unwrap(),
+                    },
+                ],
+            }),
+        },
+        SetSwitchNat {
+            switch: "lan".into(),
+            nat: Some(NatConfig::default()),
+        },
+        SetSwitchNat {
+            switch: "lan".into(),
+            nat: None,
+        },
         DeleteSwitch { name: "dmz".into() },
         ListSwitches,
         SwitchList { switches: Vec::new() },
@@ -253,7 +285,33 @@ pub fn samples() -> Vec<Message> {
                 SwitchInfo {
                     name: "lan".into(),
                     capture: Some("C:\\captures\\lan.pcap".into()),
+                    nat: Some(NatInfo {
+                        hostfwd: vec![PortForward {
+                            proto: FwdProto::Tcp,
+                            host: "127.0.0.1:49999".parse().unwrap(),
+                            guest: "10.0.2.16:22".parse().unwrap(),
+                        }],
+                        leases: vec![
+                            Lease {
+                                mac: [0x02, 0xca, 0, 0, 0, 1],
+                                addr: "10.0.2.15".parse().unwrap(),
+                            },
+                            Lease {
+                                mac: [0x02, 0xca, 0, 0, 0, 2],
+                                addr: "10.0.2.16".parse().unwrap(),
+                            },
+                        ],
+                    }),
                     ports: vec![
+                        SwitchPort {
+                            owner: PortOwner::Gateway,
+                            mac: [0x52, 0x55, 0x0a, 0, 2, 2],
+                            in_frames: 3,
+                            in_bytes: 1000,
+                            out_frames: 4,
+                            out_bytes: 1200,
+                            dropped: 1,
+                        },
                         SwitchPort {
                             owner: PortOwner::Card { vm: 1, card: 0 },
                             mac: [0x02, 0xca, 0, 0, 0, 1],
@@ -280,6 +338,7 @@ pub fn samples() -> Vec<Message> {
                 SwitchInfo {
                     name: "empty".into(),
                     capture: None,
+                    nat: None,
                     ports: Vec::new(),
                 },
             ],

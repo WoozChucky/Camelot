@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 avalon-proto = { path = "../avalon-proto" }
 excalibur = { path = "../excalibur" }
+# The NAT gateway a switch can have.
+gateway = { path = "../gateway" }
 grail = { path = "../grail" }
 
 [dev-dependencies]
