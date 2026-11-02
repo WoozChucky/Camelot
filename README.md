@@ -8,6 +8,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps), keyboard (from the window, with PLIC interrupts) and sysinfo; configurable RAM and real-time clock |
 | **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | merlin-as: everything but the encoder ([guide](crates/merlin-as/ENCODER.md)). merlin-ld: everything but applying relocations ([src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: v0 front end (int-only C subset) and test harness, codegen next. merlin-objdump: matches llvm-objdump |
 | **Camelot** | The kernel / OS | Boots on Grail in S-mode: UART, `kprintf`, trap handling, timer ticks ([kernel/](kernel/README.md)) |
+| **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Herald VM client and the Lake storage server | Protocol v1 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`; the programs come next |
 
 ## Layout
 
@@ -15,6 +16,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 crates/excalibur        instruction encodings, decoder, disassembler (shared by every tool)
 crates/elf32            ELF32 reader (shared by grail, merlin-objdump, merlin-ld)
 crates/grail            the emulator
+crates/avalon-proto     the Avalon protocol: frames, messages, blocking connection (docs/avalon-protocol.md)
 crates/merlin           the C-subset compiler (C → .s), with its test programs in tests/cases
 crates/merlin-as        the assembler (source → ELF32 .o)
 crates/merlin-ld        the linker (.o files → ELF32 executable)
@@ -24,7 +26,7 @@ kernel/                 the Camelot kernel (C + assembly) and its prebuilt kerne
 examples/               bare-metal programs
 tests/riscv-tests       prebuilt riscv-tests ELFs (rebuild with scripts/build-riscv-tests.sh)
 scripts/                test-data generators (riscv-tests, merlin-as golden encodings, merlin-objdump goldens)
-docs/                   the ISA spec
+docs/                   the ISA spec and the Avalon protocol
 ```
 
 ## Running
@@ -114,6 +116,8 @@ cargo test
 ```
 
 Runs the decoder and device unit tests, every riscv-tests suite (except `rv32ui-p-ma_data`, which assumes hardware misaligned access; Excalibur traps instead), the examples (the UART echo is fed both from an in-process channel and through the `grail` binary's stdin), the kernel, the merlin front-end tests, and merlin-objdump against committed llvm-objdump output (`crates/merlin-objdump/tests/golden`; regenerate the fixtures and goldens with `scripts/gen-objdump-golden.sh`, which needs clang and llvm-objdump). The framebuffer test runs `examples/colorbars` headless and checks the dumped frames pixel by pixel and against a committed hash. The keyboard tests inject events through `Machine::key_event` and run both `examples/kbd-echo` programs. The window itself needs a desktop, so its tests (drawing, and key messages turned into events) are ignored by default: `cargo test --release -p grail -- --ignored window`. `crates/grail/tests/machine.rs` runs `examples/sysinfo` on machines with different RAM and clocks (two at once, on separate threads) and checks real-time pacing with lower bounds on elapsed time and generous upper ones.
+
+`crates/avalon-proto` round-trips every Avalon protocol message through `encode`/`decode` and through a `Connection` over memory and TCP, checks a few layouts byte for byte against [`docs/avalon-protocol.md`](docs/avalon-protocol.md), rejects truncated, oversize and invalid frames, tests the version handshake, and feeds the decoder random and mutated bytes from a fixed-seed generator (anything that decodes must re-encode to the same bytes). It also checks that its hardware profile still mirrors Grail's `MachineConfig`.
 
 `merlin --dump-ast file.c` prints the checked syntax tree. The compiler's end-to-end harness (`crates/merlin/tests/harness.rs`) runs every program in `crates/merlin/tests/cases/` through merlin, merlin-as and merlin-ld and checks its exit code in Grail; it is `#[ignore]`d until codegen and the linker exist. With clang and ld.lld installed, `cargo test -p merlin --test harness -- --ignored clang_reference` checks the same programs' expected exit codes against clang.
 
