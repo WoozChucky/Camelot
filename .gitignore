@@ -1,5 +1,9 @@
 /target
 
+# Generated at build time by `cargo xtask kernel` (into target/kernel/obj); a
+# stale copy here is rejected by the kernel build.
+/kernel/userprogs.s
+
 # Claude Code: agent worktrees and personal settings (shared .claude/ files stay tracked)
 /.claude/worktrees/
 /.claude/settings.local.json

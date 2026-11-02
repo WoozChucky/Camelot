@@ -53,8 +53,8 @@ merlin-ld -T user.ld -o cat cat.c.o crt0.s.o usys.s.o \
 
 The members include `../user.h`; merlin compiles them like the programs.
 After changing anything here, run `cargo xtask kernel` (the programs are
-embedded in the kernel) and commit `kernel/userprogs.s` and
-`kernel/kernel.elf`; `cargo test` checks both. Adding a function: declare it
+embedded in the kernel) and commit `kernel/kernel.elf` and
+`kernel/kernel-disk.elf`; `cargo test` checks them. Adding a function: declare it
 in `user.h`, define it in the member it belongs with (or a new `.c` file
 here, which is picked up by name), and check it in `libtest.c`.
 

@@ -22,7 +22,8 @@
 //!   Camelot's root image as Lake's image `os-base`) until Ctrl-C.
 //! * [`userprogs`]: builds the user programs in `kernel/user/` with merlin,
 //!   merlin-as and merlin-ld (or clang's C output, for the reference build)
-//!   and embeds them in the kernel (`kernel/userprogs.s`).
+//!   and generates the assembly that embeds them in the kernel (`userprogs.s`,
+//!   made at build time, not committed).
 
 pub mod boot;
 pub mod examples;

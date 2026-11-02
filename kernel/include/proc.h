@@ -167,7 +167,7 @@ struct proc {
 _Static_assert(sizeof(struct proc) == PROC_SIZE, "the tests index procs[] by PROC_SIZE");
 
 /* A user program embedded in the kernel image as an ELF executable
- * (kernel/userprogs.s, generated from kernel/user/ by `cargo xtask kernel`):
+ * (userprogs.s, generated from kernel/user/ by `cargo xtask kernel`):
  * what spawn and exec run when there is no root filesystem (exec.c). */
 struct user_program {
     const char *name;

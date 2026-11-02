@@ -162,7 +162,8 @@ fn socktest_passes() {
 // ---- httpd ----
 
 /// The user programs the kernel embeds, as (name, ELF), read from the loaded kernel's
-/// `user_programs` table (kernel/userprogs.s): `{ name, elf, size }` words each.
+/// `user_programs` table (the userprogs.s `cargo xtask kernel` generates from kernel/user,
+/// crates/xtask/src/userprogs.rs): `{ name, elf, size }` words each.
 fn embedded_programs(vm: &Vm) -> Vec<(String, Vec<u8>)> {
     let mem = &vm.m.cpu.bus;
     let word = |a: u32| mem.read_mem(a, 4).unwrap();

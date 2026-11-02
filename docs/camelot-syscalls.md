@@ -838,8 +838,8 @@ LLVM: merlin compiles each C file (with `-Ikernel/user`), merlin-as
 assembles each source, merlin-ld links each program with `user.ld`, and the
 executables go to `/bin/X` on the root image (`cargo xtask fs`,
 `crates/xtask/src/fs.rs`) and are embedded in the kernel, for when there is
-no disk, through the generated `kernel/userprogs.s`
-(`crates/xtask/src/userprogs.rs`).
+no disk, through a `userprogs.s` the kernel build generates
+(`crates/xtask/src/userprogs.rs`; not committed).
 
 After changing anything in `kernel/user/`, run
 
@@ -847,9 +847,10 @@ After changing anything in `kernel/user/`, run
 cargo xtask kernel
 ```
 
-which regenerates `kernel/userprogs.s` and rebuilds `kernel/kernel.elf`;
-commit both (and run `cargo xtask fs` for a root image with the new
-programs). `cargo test` checks, without LLVM, that both are what the
-current sources and tools give. `cargo xtask kernel --cc clang` builds the
-reference kernel instead, with the programs' C compiled by clang `-O2`
-(`-S`, with the flags in `userprogs.rs`), in `target/kernel/clang`.
+which rebuilds the programs and `kernel/kernel.elf` (and
+`kernel/kernel-disk.elf`); commit them (and run `cargo xtask fs` for a root
+image with the new programs). `cargo test` checks, without LLVM, that the
+committed kernels are what the current sources and tools give. `cargo
+xtask kernel --cc clang` builds the reference kernel instead, with the
+programs' C compiled by clang `-O2` (`-S`, with the flags in
+`userprogs.rs`), in `target/kernel/clang`.
