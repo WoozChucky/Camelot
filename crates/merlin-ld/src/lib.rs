@@ -79,6 +79,13 @@ pub fn link(inputs: &[Input], opts: &Options) -> Result<Linked, Vec<Error>> {
     Ok(Linked { elf, layout })
 }
 
+/// `elf`, an executable merlin-ld wrote, without its debug information
+/// (`--strip-debug`): the same bytes as the link would give with no
+/// `.debug_*` sections in its inputs ([`write::strip_debug`]).
+pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, Error> {
+    write::strip_debug(elf).map_err(Error)
+}
+
 /// Links `inputs` with the members of `library` they need (objects linked
 /// only when they define something still undefined, like an archive's:
 /// [`library`]), after them in library order.

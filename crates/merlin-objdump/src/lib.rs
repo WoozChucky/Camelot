@@ -41,6 +41,9 @@ pub struct Options {
     pub aliases: bool,
     /// Show the instruction word next to each instruction; `--no-show-raw-insn` clears it.
     pub raw_insn: bool,
+    /// `-l`: with `-d`, the function and the source `file:line` each run of
+    /// instructions comes from (the `.debug_line` line tables).
+    pub line_numbers: bool,
 }
 
 impl Default for Options {
@@ -55,6 +58,7 @@ impl Default for Options {
             disassemble: false,
             aliases: true,
             raw_insn: true,
+            line_numbers: false,
         }
     }
 }

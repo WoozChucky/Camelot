@@ -46,9 +46,93 @@ pub fn context(layout: &Layout) -> (Context, HashSet<u32>) {
     (ctx, failed)
 }
 
+/// The contents of the executable's sections, relocated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Images {
+    /// One per [`Layout::sections`] (empty for NOBITS sections).
+    pub sections: Vec<Vec<u8>>,
+    /// One per [`Layout::debug`].
+    pub debug: Vec<Vec<u8>>,
+}
+
 /// Returns one byte image per output section (empty for NOBITS sections),
-/// with input contents copied in and relocations applied.
-pub fn relocate(layout: &Layout) -> Result<Vec<Vec<u8>>, Vec<Error>> {
+/// with input contents copied in and relocations applied, and the same for
+/// the debug sections.
+pub fn relocate(layout: &Layout) -> Result<Images, Vec<Error>> {
+    let mut errors = Vec::new();
+    let sections = match loaded(layout) {
+        Ok(s) => s,
+        Err(mut e) => {
+            errors.append(&mut e);
+            Vec::new()
+        }
+    };
+    let debug = debug(layout, &mut errors);
+    if errors.is_empty() {
+        Ok(Images { sections, debug })
+    } else {
+        Err(errors)
+    }
+}
+
+/// The debug sections: their inputs one after another, relocated. A
+/// relocation against a place that is not in the executable (a section
+/// `/DISCARD/` threw away, or one not loaded) writes 0, as ld.lld does: the
+/// debug information of code that is gone points nowhere.
+fn debug(layout: &Layout, errors: &mut Vec<Error>) -> Vec<Vec<u8>> {
+    let ctx = Context::default();
+    let mut images = Vec::new();
+    for ds in &layout.debug {
+        let mut img = vec![0; ds.size as usize];
+        for i in &ds.inputs {
+            let obj = &layout.objects[i.object];
+            let sec = &obj.sections[i.section];
+            let start = i.addr as usize;
+            img[start..start + sec.data.len()].copy_from_slice(&sec.data);
+            for r in &sec.relocs {
+                let ty = reloc::name(r.ty);
+                let at = format!("{}+{:#x}", sec.name, r.offset);
+                if r.ty == reloc::R_RISCV_NONE || r.ty == reloc::R_RISCV_RELAX {
+                    continue;
+                }
+                if r.offset >= sec.size {
+                    errors.push(Error(format!(
+                        "{}: {ty} at {at} is outside section {} (size {:#x})",
+                        obj.name, sec.name, sec.size
+                    )));
+                    continue;
+                }
+                let sym = if layout.in_dropped_section(i.object, r.sym as usize) {
+                    Ok(0u32.wrapping_sub(r.addend as u32))
+                } else {
+                    layout.reloc_symbol(i.object, r.sym as usize)
+                };
+                let sym = match sym {
+                    Ok(s) => s,
+                    Err(e) => {
+                        errors.push(Error(format!("{}: {ty} at {at} {e}", obj.name)));
+                        continue;
+                    }
+                };
+                let place = i.addr.wrapping_add(r.offset);
+                let bytes = &mut img[place as usize..start + sec.data.len()];
+                if let Err(e) = reloc::apply(r.ty, place, sym, r.addend, bytes, &ctx) {
+                    let sym_name = obj.symbol_display_name(r.sym);
+                    errors.push(Error(format!(
+                        "{}: {}",
+                        obj.name,
+                        describe(e, &ty, sym_name, &at, sec, r)
+                    )));
+                }
+            }
+        }
+        images.push(img);
+    }
+    images
+}
+
+/// [`relocate`] for the loaded sections.
+fn loaded(layout: &Layout) -> Result<Vec<Vec<u8>>, Vec<Error>> {
     let mut images: Vec<Vec<u8>> = layout
         .sections
         .iter()

@@ -41,11 +41,20 @@ $CC -O1 -g -fdebug-compilation-dir=. "$FIX/debug.c" -o "$FIX/debug.o"
 $CC -mno-relax "$FIX/linked.S" -o "$FIX/linked.o"
 ld.lld -T "$FIX/linked.ld" "$FIX/linked.o" -o "$FIX/linked.elf"
 rm "$FIX/linked.o"
+# lines.s is merlin -g output: its line table and compile unit, linked.
+clang --target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32 -c -mno-relax "$FIX/lines.s" -o "$FIX/lines.o"
+ld.lld -Ttext=0x10000 -e add "$FIX/lines.o" -o "$FIX/lines.elf"
+rm "$FIX/lines.o"
 
 gen() { # golden-name input llvm-objdump-args...
   local name=$1 input=$2
   shift 2
   llvm-objdump "$@" "$input" > "$OUT/$name.txt"
+}
+# -l: source paths with / (llvm-objdump joins them with \ on Windows).
+gen_lines() { # golden-name input llvm-objdump-args...
+  gen "$@"
+  tr '\134' '/' < "$OUT/$1.txt" > "$OUT/$1.tmp" && mv "$OUT/$1.tmp" "$OUT/$1.txt"
 }
 
 gen hello-elf.d                "$FIX/hello.elf" -d
@@ -68,6 +77,8 @@ gen misc-o.x                   "$FIX/misc.o" -x
 gen misc-o.dr                  "$FIX/misc.o" -dr
 gen debug-o.d                  "$FIX/debug.o" -d
 gen debug-o.h                  "$FIX/debug.o" -h
+gen_lines debug-o.dl           "$FIX/debug.o" -d -l
+gen_lines lines-elf.dl         "$FIX/lines.elf" -d -l
 gen linked-elf.d               "$FIX/linked.elf" -d
 gen linked-elf.x               "$FIX/linked.elf" -x
 gen rv32ui-p-add.d             tests/riscv-tests/rv32ui-p-add -d

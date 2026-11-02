@@ -4,9 +4,13 @@
 //! ELF header (52 bytes)
 //! program headers, one PT_LOAD per segment
 //! segment contents, each at a file offset congruent to its address mod 4 KiB
-//! .symtab, .strtab, .shstrtab
-//! section header table: null, output sections, .symtab, .strtab, .shstrtab
+//! .symtab, .strtab, the debug sections (.debug_line, ...), .shstrtab
+//! section header table: null, output sections, .symtab, .strtab, debug sections, .shstrtab
 //! ```
+//!
+//! The debug sections come after everything else but the section names, so
+//! that taking them out ([`strip_debug`]) leaves exactly the file a link
+//! without them writes: no loaded byte, file offset or section index moves.
 //!
 //! Segments group consecutive output sections with the same permissions (R,
 //! RX, RW), as ld.lld does when there is a `SECTIONS` command (merlin-ld
@@ -19,6 +23,7 @@ use crate::layout::{Def, Layout};
 use crate::object::{
     SHF_EXECINSTR, SHF_WRITE, SHN_ABS, STB_GLOBAL, STB_LOCAL, STT_FILE, STT_NOTYPE, STT_SECTION,
 };
+use crate::relocate::Images;
 
 pub const PAGE: u32 = 0x1000;
 const PT_LOAD: u32 = 1;
@@ -172,7 +177,9 @@ fn symtab(layout: &Layout, strtab: &mut StrTab) -> (Vec<u8>, u32) {
 }
 
 /// Serializes the executable. `images` comes from [`crate::relocate::relocate`].
-pub fn write(layout: &Layout, images: &[Vec<u8>]) -> Vec<u8> {
+pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
+    let debug = images.debug.as_slice();
+    let images = images.sections.as_slice();
     let segs = segments(layout);
     let phoff = 52usize;
     let mut out = vec![0u8; phoff + 32 * segs.len()];
@@ -223,6 +230,12 @@ pub fn write(layout: &Layout, images: &[Vec<u8>]) -> Vec<u8> {
     out.extend_from_slice(&syms);
     let strtab_off = out.len() as u32;
     out.extend_from_slice(&strtab.0);
+    let mut debug_off = Vec::new();
+    for (ds, img) in layout.debug.iter().zip(debug) {
+        out.resize(out.len().next_multiple_of(ds.align as usize), 0);
+        debug_off.push(out.len() as u32);
+        out.extend_from_slice(img);
+    }
 
     // Section headers.
     let mut shdrs: Vec<[u32; 10]> = vec![[0; 10]];
@@ -265,6 +278,20 @@ pub fn write(layout: &Layout, images: &[Vec<u8>]) -> Vec<u8> {
         1,
         0,
     ]);
+    for (ds, off) in layout.debug.iter().zip(debug_off) {
+        shdrs.push([
+            shstrtab.add(&ds.name),
+            SHT_PROGBITS,
+            ds.flags,
+            0,
+            off,
+            ds.size,
+            0,
+            0,
+            ds.align,
+            ds.entsize,
+        ]);
+    }
     let shstrtab_name = shstrtab.add(".shstrtab");
     shdrs.push([
         shstrtab_name,
@@ -307,4 +334,72 @@ pub fn write(layout: &Layout, images: &[Vec<u8>]) -> Vec<u8> {
     put16(&mut hdr, shdrs.len() as u16 - 1); // e_shstrndx
     out[..52].copy_from_slice(&hdr);
     out
+}
+
+/// A little-endian `u32` of `b` at `at` (a header field).
+fn get32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+/// The executable `elf` without its debug sections (`.debug_*`, not
+/// loaded), for a program that is installed rather than debugged. For a file
+/// [`write`] made, the result is what it writes for the same link without
+/// debug information: the bytes up to the debug sections stay as they are,
+/// then come the section names without theirs and the section headers
+/// without theirs. A file with no debug sections comes back unchanged.
+/// Anything laid out otherwise is an error.
+pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, String> {
+    let parsed = elf32::Elf::parse(elf).map_err(|e| e.to_string())?;
+    let is_debug = |s: &elf32::Section| !s.is_alloc() && s.name.starts_with(".debug_");
+    if !parsed.sections.iter().any(is_debug) {
+        return Ok(elf.to_vec());
+    }
+    let shstrndx = parsed.header.shstrndx as usize;
+    let n = parsed.sections.len();
+    // The layout write() makes: debug sections last but for the names, and
+    // their contents after every other section's but the names'.
+    let first = parsed.sections.iter().position(is_debug).unwrap();
+    let ordered = shstrndx == n - 1 && (first..n - 1).all(|i| is_debug(&parsed.sections[i]));
+    // Up to the end of the last kept section (not the padding that may align
+    // the first debug section).
+    let ends = parsed.sections[1..first]
+        .iter()
+        .filter(|s| !s.is_nobits())
+        .map(|s| (s.offset + s.size) as usize);
+    let headers_end = 52 + 32 * parsed.segments.len();
+    let cut = ends.max().unwrap_or(0).max(headers_end);
+    if !ordered || cut > parsed.sections[first].offset as usize {
+        return Err("the debug sections are not where merlin-ld puts them (last)".into());
+    }
+    let mut out = elf[..cut].to_vec();
+    // The kept sections' names, in their order (offsets as write() gives them).
+    let mut names = StrTab(vec![0]);
+    let mut headers: Vec<[u32; 10]> = Vec::new();
+    for (i, s) in parsed.sections[..first].iter().enumerate() {
+        let at = parsed.header.shoff as usize + 40 * i;
+        let mut h: [u32; 10] = std::array::from_fn(|k| get32(elf, at + 4 * k));
+        if i > 0 {
+            h[0] = names.add(&s.name);
+        }
+        headers.push(h);
+    }
+    let shstrtab = &parsed.sections[shstrndx];
+    let at = parsed.header.shoff as usize + 40 * shstrndx;
+    let mut h: [u32; 10] = std::array::from_fn(|k| get32(elf, at + 4 * k));
+    h[0] = names.add(&shstrtab.name);
+    h[4] = out.len() as u32;
+    h[5] = names.0.len() as u32;
+    headers.push(h);
+    out.extend_from_slice(&names.0);
+    out.resize(out.len().next_multiple_of(4), 0);
+    let shoff = out.len() as u32;
+    for h in &headers {
+        for v in h {
+            put32(&mut out, *v);
+        }
+    }
+    out[32..36].copy_from_slice(&shoff.to_le_bytes());
+    out[48..50].copy_from_slice(&(headers.len() as u16).to_le_bytes());
+    out[50..52].copy_from_slice(&(headers.len() as u16 - 1).to_le_bytes());
+    Ok(out)
 }

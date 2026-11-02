@@ -12,5 +12,7 @@ name = "merlin_as"
 excalibur = { path = "../excalibur" }
 
 [dev-dependencies]
-# encode_hello compares our disassembly with llvm-objdump's text.
+# encode_hello compares our disassembly with llvm-objdump's text; debug_line reads
+# the objects clang made.
+elf32 = { path = "../elf32" }
 merlin-objdump = { path = "../merlin-objdump" }

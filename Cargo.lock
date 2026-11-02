@@ -96,6 +96,7 @@ dependencies = [
 name = "merlin-as"
 version = "0.1.0"
 dependencies = [
+ "elf32",
  "excalibur",
  "merlin-objdump",
 ]
@@ -107,6 +108,7 @@ dependencies = [
  "elf32",
  "excalibur",
  "grail",
+ "xtask",
 ]
 
 [[package]]

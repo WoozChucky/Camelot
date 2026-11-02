@@ -10,6 +10,9 @@ pub enum Tok {
     /// Names, mnemonics, directives and registers: `[A-Za-z_.$@][A-Za-z0-9_.$]*`.
     Ident(String),
     Int(i64),
+    /// A hexadecimal number too wide for 64 bits: only `.file`'s `md5 0x...`
+    /// (128 bits) takes one.
+    Wide(u128),
     Str(Vec<u8>),
     /// Numeric local label reference: `1b` (backward) or `1f` (forward).
     LocalRef(u32, bool),
@@ -157,7 +160,10 @@ fn lex_number(text: &str, line: usize) -> Result<Tok, Error> {
     };
     match parsed {
         Ok(v) => Ok(Tok::Int(v as i64)),
-        Err(_) => Err(Error::new(line, format!("invalid number '{text}'"))),
+        Err(_) => match lower.strip_prefix("0x").map(|h| u128::from_str_radix(h, 16)) {
+            Some(Ok(v)) => Ok(Tok::Wide(v)),
+            _ => Err(Error::new(line, format!("invalid number '{text}'"))),
+        },
     }
 }
 

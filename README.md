@@ -6,7 +6,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 |---|---|---|
 | **Excalibur** | The ISA: RV32IMA + Zicsr, M/S/U privilege, Sv32 paging, plus the Xcal extensions | Spec v0 in [`docs/excalibur-spec.md`](docs/excalibur-spec.md) |
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/ua/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps), keyboard and pointer (from the window, with PLIC interrupts), sysinfo and block devices (disk images or disks on a Lake server, `--disk`); configurable RAM, real-time clock, disks and number of harts (up to 8, with IPIs) |
-| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, the `merlin` C-subset compiler and the `merlin-dbg` debugger | Builds every example and the whole Camelot kernel on its own, no LLVM (`cargo xtask examples`, `cargo xtask kernel`). merlin-as: complete; its objects match clang's ([encoder notes](crates/merlin-as/ENCODER.md)). merlin-ld: links clang objects to the same bytes as ld.lld except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: a C99 subset (integer types, pointers, arrays, structs, globals, strings, the preprocessor, varargs, designated initializers; programs of several files) compiles to assembly that our own assembler and linker build into programs Grail runs, the kernel and its user programs among them; unoptimized, so that kernel is about 40% bigger and 5 to 6 times slower than clang `-O2`'s ([code generation notes](crates/merlin/src/codegen.rs)). merlin-objdump: matches llvm-objdump. merlin-dbg: a machine-level debugger (breakpoints, watchpoints, steps, registers, memory, disassembly, backtraces, harts) over Grail's GDB remote stub, which GDB and LLDB can use too ([docs/merlin-dbg.md](docs/merlin-dbg.md)) |
+| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, the `merlin` C-subset compiler and the `merlin-dbg` debugger | Builds every example and the whole Camelot kernel on its own, no LLVM (`cargo xtask examples`, `cargo xtask kernel`). merlin-as: complete; its objects match clang's ([encoder notes](crates/merlin-as/ENCODER.md)). merlin-ld: links clang objects to the same bytes as ld.lld except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: a C99 subset (integer types, pointers, arrays, structs, globals, strings, the preprocessor, varargs, designated initializers; programs of several files) compiles to assembly that our own assembler and linker build into programs Grail runs, the kernel and its user programs among them; unoptimized, so that kernel is about 40% bigger and 5 to 6 times slower than clang `-O2`'s ([code generation notes](crates/merlin/src/codegen.rs)). merlin-objdump: matches llvm-objdump (`-l` too). merlin-dbg: a debugger over Grail's GDB remote stub, which GDB and LLDB can use too, at the machine level (breakpoints, watchpoints, steps, registers, memory, disassembly, backtraces, harts) and by source line, from the DWARF line tables `merlin -g` writes (merlin-as encodes them as clang does, byte for byte) ([docs/merlin-dbg.md](docs/merlin-dbg.md)) |
 | **Camelot** | The kernel / OS | Boots on Grail in S-mode: `kprintf`, trap handling, timer ticks, page allocator and Sv32 paging, interrupt-driven UART console, user programs in C in U-mode with their own page tables, switched round robin on timer ticks, system calls ([docs/camelot-syscalls.md](docs/camelot-syscalls.md)) and a user-space shell, an interrupt-driven disk driver with a buffer cache, a journaled filesystem mounted at boot ([docs/camelot-fs.md](docs/camelot-fs.md), with a host-side mkfs and fsck in `crates/camelot-fs`), a network stack with a card driver, ARP, IPv4, ICMP, UDP, TCP and DHCP, sockets behind file descriptors and network programs (`ifconfig`, `ping`, `nc`, `fetch`, `httpd`) ([docs/camelot-net.md](docs/camelot-net.md)) ([kernel/](kernel/README.md)) |
 | **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Pendragon web console, the Herald VM client and the Lake storage server | Protocol v7 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget, attachable consoles and screens, and network cards on virtual Ethernet switches, which can have a NAT gateway to the host and the internet; the Round Table CLI creates and controls them, and manages Lake's disk images; Pendragon does the same from a browser, with live consoles; the Lake storage server serves disk images to them over the network; Herald attaches a terminal to a VM's console, or a window to its screen, keyboard and mouse. `cargo xtask up` runs it all with one command ([Quick start](#quick-start)) |
 
@@ -49,7 +49,7 @@ Ctrl-] leaves Herald, and the VM carries on. The console is one for the whole VM
 
 ```
 crates/excalibur        instruction encodings, decoder, disassembler (shared by every tool)
-crates/elf32            ELF32 reader (shared by grail, merlin-objdump, merlin-ld)
+crates/elf32            ELF32 reader and DWARF line tables (shared by grail, merlin-objdump, merlin-ld, merlin-dbg)
 crates/grail            the emulator
 crates/avalon-proto     the Avalon protocol: frames, messages, blocking connection, screen diffing (docs/avalon-protocol.md)
 crates/gateway          the user-mode NAT gateway behind `grail --net user` and Avalon's switches: DHCP, DNS, NAT and port forwarding over std::net
@@ -64,7 +64,7 @@ crates/merlin           the C-subset compiler (C → .s), with its test programs
 crates/merlin-as        the assembler (source → ELF32 .o)
 crates/merlin-ld        the linker (.o files → ELF32 executable)
 crates/merlin-objdump   the disassembler / object dumper (llvm-objdump compatible output)
-crates/merlin-dbg       the debugger: a GDB remote protocol client for Grail's stub (`grail --gdb`), machine-level (docs/merlin-dbg.md)
+crates/merlin-dbg       the debugger: a GDB remote protocol client for Grail's stub (`grail --gdb`), machine-level and by source line (docs/merlin-dbg.md)
 crates/xtask            build tasks: `cargo xtask up` (the whole platform), `cargo xtask examples`, `cargo xtask kernel`, `cargo xtask fs`, `cargo xtask boot`, `cargo xtask hello`, `cargo xtask ld-fixtures`
 kernel/                 the Camelot kernel (C + assembly) and its prebuilt kernel.elf (and kernel-disk.elf, without the built-in programs, for bootable images); kernel/user holds the user programs it embeds (and kernel/user/lib their C library), kernel/net the network stack, kernel/fs the root image's files, kernel/boot the bootloader of a bootable disk
 examples/               bare-metal programs, built with merlin-as + merlin-ld (the .elf files are committed)
@@ -160,7 +160,7 @@ The options are llvm-objdump's: `-d` disassemble, `-r` relocations (under each i
 
 ### Debugging
 
-`merlin-dbg` debugs a program running in Grail at the machine level ([docs/merlin-dbg.md](docs/merlin-dbg.md)). Given `--` and Grail's arguments, it starts the machine itself, stopped at its first instruction:
+`merlin-dbg` debugs a program running in Grail at the machine level, and by source line where the program has line tables ([docs/merlin-dbg.md](docs/merlin-dbg.md)). Given `--` and Grail's arguments, it starts the machine itself, stopped at its first instruction:
 
 ```
 cargo run --release -p merlin-dbg -- -- examples/hello/hello.elf
@@ -177,7 +177,27 @@ breakpoint 1
 #1  0x80000018 <_start+24>
 ```
 
-It has breakpoints and watchpoints, `stepi`, `next` and `finish`, `regs`, `x/N`, `disas`, `bt` (by frame pointer) and `hart N`. Commands can also come from a file (`-x FILE`) or a pipe.
+It has breakpoints and watchpoints, `stepi`, `nexti` and `finish`, `regs`, `x/N`, `disas`, `bt` (by frame pointer) and `hart N`. Commands can also come from a file (`-x FILE`) or a pipe.
+
+The kernel and its user programs are built with `merlin -g`, so in them it works by source line too: `break FILE:LINE`, `step` and `next` by line, `list`, and every stop shows its line. Run it in the repository root, where the line tables' paths lead to the sources:
+
+```
+cargo run --release -p merlin-dbg -- -- kernel/kernel.elf
+```
+
+```
+(merlin-dbg) break kernel/main.c:273
+breakpoint 1 at 0x80017668 <kmain>: kernel/main.c:273
+(merlin-dbg) continue
+breakpoint 1
+=> 0x80017668 <kmain>:  addi sp, sp, -0x10
+kernel/main.c:273: int kmain(void) {
+(merlin-dbg) next
+=> 0x80017678 <kmain+16>:  auipc ra, 0x23
+kernel/main.c:275:     cpu_init();
+```
+
+A user program's line tables are in `target/kernel/obj/user/<name>.elf` after `cargo xtask kernel`: `add-symbol-file target/kernel/obj/user/sh.elf`, then `break kernel/user/sh.c:502`.
 
 Behind it is Grail's GDB remote stub, which `grail --gdb ADDR` runs over TCP. `--gdb-wait` starts the machine stopped, waiting for a client. merlin-dbg connects to it with `--connect`, and so can GDB (`target remote 127.0.0.1:1234`) and LLDB (`gdb-remote 127.0.0.1:1234`):
 
@@ -591,7 +611,8 @@ The debugger's tests:
 - `crates/grail/tests/debug.rs` checks Grail's debug interface on hello, smp and the kernel: breakpoints, steps and watchpoints stop where they should, and multi-hart machines stop between harts' turns. Every debugged run is compared turn by turn with the undebugged one.
 - The GDB stub's unit tests (`crates/grail/src/gdb`) cover packet framing, checksums and escapes, every supported command, and malformed or unsupported packets.
 - `crates/grail/tests/gdb.rs` talks to `grail --gdb` over TCP, interrupting and killing a running kernel.
-- `crates/merlin-dbg/tests/session.rs` drives the merlin-dbg binary on hello, smp (2 harts) and the kernel. It checks that each program's console output and exit code are those of an undebugged run.
+- `crates/merlin-dbg/tests/session.rs` drives the merlin-dbg binary on hello, smp (2 harts) and the kernel, by source line in the kernel and in the shell. It checks that each program's console output and exit code are those of an undebugged run. An ignored test has LLDB read the kernel's line tables.
+- The line tables: `crates/merlin-as/tests/debug_line.rs` compares merlin-as's debug sections with clang's on a corpus (`scripts/gen-debug-line-golden.sh`), `crates/merlin/tests/debug.rs` checks that `-g` changes no code, `crates/merlin-ld/tests/link.rs` that they are linked at the code's addresses and strip to the link without them, and `crates/xtask/tests/debug_info.rs` that the committed kernels and the root image load the same bytes with and without `-g`.
 - An ignored test runs LLDB against the stub: `cargo test --release -p grail --test gdb -- --ignored`. It needs LLDB and, on Windows, a Python runtime on the PATH (see docs/merlin-dbg.md).
 
 `crates/avalon/tests` run an Avalon server in process on an ephemeral port and drive it through the protocol: two VMs with different RAM and clocks run `examples/sysinfo` and each prints its own profile (streamed live, and again from the scrollback), with their exit states and device tables; a looping guest (assembled in the test with merlin-as and merlin-ld) is paused (no more steps), resumed, stopped and destroyed, its clients get every state change and `Detached`, and its RAM and name are free again; `examples/uart-echo` takes input from several attached clients at full speed and in real time, and pauses with input waiting; a parked full-speed VM sleeps, and a real-time one keeps to its clock, its thread sleeping between batches (counted through a test-only hook on `ServerThread`); a guest that has presented a frame still runs full slices; a client that stops reading a chatty console is cut off while the VM and the other clients carry on; a client gets a limited time for its whole `Hello`, however slowly it trickles in; a create whose disk is slow to open (a FIFO, on Linux) holds up no other request; bad requests of every kind (unknown VMs, invalid names, profiles and programs, the RAM budget, wrong states, unserved groups, malformed and misdirected frames, oversize frames, bad handshakes) get the right error code and leave the server running; screens are streamed (`tests/screen.rs`: `examples/colorbars` decoded from its frames pixel for pixel and compared with Grail's framebuffer, for a viewer from the start and one that attaches late; an unchanged screen sends no frames while keys and pointer moves reach `examples/pointer`; a screen that changes all the time is sent at most every 33 ms, and nothing while paused once the last pixels drawn have gone out; a viewer that stops reading is held back, not cut off, and once it reads again (here while the VM is paused) catches up with one full frame that gives it the screen of a viewer that kept up; a stopped VM sends its last frame before the state change; a display that is off streams as black; input from a client that is not a viewer is dropped, input waits for a created or paused VM up to 256 keys and 256 pointer changes, and none is taken once the VM has ended; one connection views and attaches to the console of the same VM); the client example above is checked against the test that runs it; and shutdown stops the VMs and closes every connection. `tests/cli.rs` runs the `avalon` binary and shuts it down with Ctrl-Break (Windows) or SIGTERM (Unix). `tests/net.rs` runs `examples/net`'s ping and pong on two VMs on one switch (with a third VM on another switch that must see nothing, and a capture of the exchange), floods a VM that never runs until its port drops frames while the sender carries on, plugs cards in and out of running VMs, keeps generated addresses stable across re-creation, and checks every error the switch messages can give. The switch's unit tests (`src/switch/tests.rs`) cover MAC learning, flooding, filtering, ageing (with time passed in, not waited for), the table's size limit, full queues, address clashes, deleted switches and captures that fall behind.

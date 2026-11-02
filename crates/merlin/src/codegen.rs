@@ -302,6 +302,7 @@
 use crate::abi::{self, Pass};
 use crate::ast::*;
 use crate::consteval::{self, Base, Const};
+use crate::debug::{DebugInfo, Lines};
 use crate::sema::arith_type;
 use crate::types::{FuncType, IntKind, Type};
 use crate::Error;
@@ -310,6 +311,12 @@ use std::fmt::Write;
 
 /// Generates assembly for a whole translation unit.
 pub fn generate(prog: &Program) -> Result<String, Error> {
+    generate_with(prog, None)
+}
+
+/// [`generate`], with debug information (`-g`) when `debug` gives it and
+/// the preprocessor's file names ([`crate::debug`]).
+pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> Result<String, Error> {
     // merlin-as reads a register name as a register, never as a symbol, so a
     // function or global called `sp` or `a0` could not be referenced or even
     // defined.
@@ -334,7 +341,11 @@ pub fn generate(prog: &Program) -> Result<String, Error> {
         section: "",
         labels: 0,
         strings: Vec::new(),
+        debug: debug.map(|(info, names)| Lines::new(info, names)),
     };
+    if let Some(d) = &file.debug {
+        let _ = writeln!(file.out, "    {}", d.file0());
+    }
     for item in &prog.items {
         match item {
             Item::Func(f) => {
@@ -369,6 +380,7 @@ pub fn generate(prog: &Program) -> Result<String, Error> {
                     file: &mut file,
                     ret_label: format!(".L.return.{}", f.name),
                     statics: Vec::new(),
+                    after_prologue: false,
                 };
                 g.function(body);
                 let (lines, statics) = (g.lines, g.statics);
@@ -389,6 +401,9 @@ pub fn generate(prog: &Program) -> Result<String, Error> {
         }
     }
     file.strings();
+    if let Some(d) = &file.debug {
+        file.out.push_str(&d.sections());
+    }
     Ok(file.out)
 }
 
@@ -511,6 +526,8 @@ struct FileGen {
     labels: usize,
     /// String literals, emitted at the end; literal `i` is `.L.str.<i>`.
     strings: Vec<Vec<u8>>,
+    /// With `-g`, the debug information ([`crate::debug`]).
+    debug: Option<Lines>,
 }
 
 impl FileGen {
@@ -786,6 +803,9 @@ struct FuncGen<'a, 'f> {
     ret_label: String,
     /// The function's `static` locals, emitted as data after it.
     statics: Vec<&'a Declarator>,
+    /// With `-g`: a `.loc` has been written since the function's first, so
+    /// the next is not the one that ends the prologue.
+    after_prologue: bool,
 }
 
 impl<'a> FuncGen<'a, '_> {
@@ -934,6 +954,12 @@ impl<'a> FuncGen<'a, '_> {
         self.lines
             .push(Line::Text(format!(".type {}, @function", f.name)));
         self.label(&f.name);
+        // `-g`: the prologue comes from the function's first line (column 0, as
+        // clang has it).
+        if let Some(d) = self.file.debug.as_mut() {
+            let lines = d.loc(f.pos, Some(0), false);
+            self.lines.extend(lines.into_iter().map(Line::Text));
+        }
 
         // Prologue: save ra and the caller's s0, set up s0, make room for locals.
         let (top, va_save) = (self.top(), self.va_save);
@@ -1006,10 +1032,14 @@ impl<'a> FuncGen<'a, '_> {
         }
 
         // Falling off the end returns 0. A final `return` needs no jump to the
-        // epilogue, which comes right after it.
-        if self.lines.last() == Some(&Line::Insn(insn_text("j", &self.ret_label), 4)) {
+        // epilogue, which comes right after it. Either way what follows comes
+        // from the closing brace.
+        let returned = self.lines.last() == Some(&Line::Insn(insn_text("j", &self.ret_label), 4));
+        if returned {
             self.lines.pop();
-        } else {
+        }
+        self.loc(f.end);
+        if !returned {
             self.li("a0", 0);
         }
 
@@ -1022,7 +1052,28 @@ impl<'a> FuncGen<'a, '_> {
         self.ins("lw", format!("s0, {}(sp)", top - va_save - 8));
         self.ins("addi", format!("sp, sp, {top}"));
         self.ins("ret", "");
+        if let Some(d) = self.file.debug.as_mut() {
+            let end = format!(".Lfunc_end.{}", f.name);
+            d.function(&f.name, &end, f.pos, !f.is_static && !f.inline_only);
+            self.lines.push(Line::Label(end));
+        }
         self.lines.push(Line::Text(format!(".size {0}, . - {0}", f.name)));
+    }
+
+    /// `-g`: the next instruction comes from `pos` (a `.loc`, see
+    /// [`crate::debug`]). The first one after the function's own says that
+    /// the prologue ends there.
+    fn loc(&mut self, pos: crate::Pos) {
+        let Some(d) = self.file.debug.as_mut() else {
+            return;
+        };
+        if pos.line == 0 {
+            return;
+        }
+        let first = !self.after_prologue;
+        self.after_prologue = true;
+        let lines = d.loc(pos, None, first);
+        self.lines.extend(lines.into_iter().map(Line::Text));
     }
 
     /// The top of the frame, which the prologue sets up first: `ra`, `s0`
@@ -1048,6 +1099,20 @@ impl<'a> FuncGen<'a, '_> {
 
     fn stmt(&mut self, s: &'a Stmt) {
         debug_assert_eq!(self.depth, 0, "temporaries left on the stack between statements");
+        // `-g`: a statement with code of its own starts a line. A loop's parts
+        // and a declaration's initializers get theirs where they are made.
+        match &s.kind {
+            StmtKind::Block(_)
+            | StmtKind::Decl(_)
+            | StmtKind::Empty
+            | StmtKind::While { .. }
+            | StmtKind::DoWhile { .. }
+            | StmtKind::For { .. }
+            | StmtKind::Case { .. }
+            | StmtKind::Default { .. }
+            | StmtKind::Label { .. } => {}
+            _ => self.loc(s.pos),
+        }
         match &s.kind {
             StmtKind::Block(body) => {
                 for s in body {
@@ -1056,6 +1121,9 @@ impl<'a> FuncGen<'a, '_> {
             }
             StmtKind::Decl(decls) => {
                 for d in decls {
+                    if d.init.is_some() && matches!(d.var, Some(VarRef::Local(_))) {
+                        self.loc(d.pos);
+                    }
                     self.local_decl(d);
                 }
             }
@@ -1099,6 +1167,7 @@ impl<'a> FuncGen<'a, '_> {
                 let cont = self.new_label("continue");
                 let brk = self.new_label("break");
                 self.label(&cont);
+                self.loc(cond.pos);
                 self.expr(cond);
                 self.branch_if_zero(&brk);
                 self.loop_body(body, &cont, &brk);
@@ -1118,6 +1187,7 @@ impl<'a> FuncGen<'a, '_> {
                 self.label(&top);
                 self.loop_body(body, &cont, &brk);
                 self.label(&cont);
+                self.loc(cond.pos);
                 self.expr(cond);
                 self.branch_if_nonzero(&top);
                 self.label(&brk);
@@ -1145,12 +1215,14 @@ impl<'a> FuncGen<'a, '_> {
                 let brk = self.new_label("break");
                 self.label(&top);
                 if let Some(cond) = cond {
+                    self.loc(cond.pos);
                     self.expr(cond);
                     self.branch_if_zero(&brk);
                 }
                 self.loop_body(body, &cont, &brk);
                 self.label(&cont);
                 if let Some(step) = step {
+                    self.loc(step.pos);
                     self.expr(step);
                 }
                 self.ins("j", &top);

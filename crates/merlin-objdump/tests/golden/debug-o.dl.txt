@@ -1,0 +1,26 @@
+
+crates/merlin-objdump/tests/fixtures/debug.o:	file format elf32-littleriscv
+
+Disassembly of section .text:
+
+00000000 <f>:
+; f():
+; ./crates/merlin-objdump/tests/fixtures/debug.c:11
+       0: ff010113     	addi	sp, sp, -0x10
+       4: 00112623     	sw	ra, 0xc(sp)
+       8: 00812423     	sw	s0, 0x8(sp)
+       c: 00912223     	sw	s1, 0x4(sp)
+      10: 00050413     	mv	s0, a0
+; ./crates/merlin-objdump/tests/fixtures/debug.c:12
+      14: 00000097     	auipc	ra, 0x0
+      18: 000080e7     	jalr	ra <f+0x14>
+      1c: 00050493     	mv	s1, a0
+      20: 00140513     	addi	a0, s0, 0x1
+      24: 00000097     	auipc	ra, 0x0
+      28: 000080e7     	jalr	ra <f+0x24>
+      2c: 00950533     	add	a0, a0, s1
+      30: 00c12083     	lw	ra, 0xc(sp)
+      34: 00812403     	lw	s0, 0x8(sp)
+      38: 00412483     	lw	s1, 0x4(sp)
+      3c: 01010113     	addi	sp, sp, 0x10
+      40: 00008067     	ret

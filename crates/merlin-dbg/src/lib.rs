@@ -3,6 +3,7 @@
 //!
 //! - [`remote`]: the protocol client, talking to Grail's stub (`grail --gdb`);
 //! - [`symbols`]: names from the program's ELF symbol table;
+//! - [`source`]: source lines, from the program's DWARF line tables;
 //! - [`frames`]: backtraces by frame pointer (the frame layout is explained there);
 //! - [`session`]: the commands;
 //! - [`run`]: the command line, which connects to a stub or starts a machine in this
@@ -11,10 +12,12 @@
 pub mod frames;
 pub mod remote;
 pub mod session;
+pub mod source;
 pub mod symbols;
 
 use remote::Remote;
 use session::{Flow, OnQuit, Session};
+use source::Lines;
 use std::io::{BufRead, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::AtomicBool;
@@ -24,7 +27,10 @@ pub const USAGE: &str = "usage: merlin-dbg [--connect ADDR] [-x FILE] [program.e
        merlin-dbg [-x FILE] -- [grail options] program.elf
 
 Debugs a program running in Grail, at the machine level: breakpoints,
-watchpoints, steps, registers, memory, disassembly and backtraces.
+watchpoints, steps, registers, memory, disassembly and backtraces; and by
+source line where the program has line tables (merlin -g): break FILE:LINE,
+step and next by line, list. Sources are found relative to the current
+directory (directory DIR adds others).
 
   --connect ADDR  the GDB stub of a running grail --gdb (default 127.0.0.1:1234):
                   HOST:PORT or a port on 127.0.0.1. program.elf gives the symbols.
@@ -116,15 +122,17 @@ fn start(
             OnQuit::Detach,
         ),
     };
+    let mut lines = Lines::default();
     let symbols = match &program {
         Some(path) => {
             let file = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+            lines.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
             Symbols::from_elf(&file).map_err(|e| format!("{path}: {e}"))?
         }
         None => Symbols::default(),
     };
     let remote = Remote::connect(addr)?;
-    let mut session = Session::new(remote, symbols, &mut *out, on_quit, interrupt);
+    let mut session = Session::new(remote, symbols, lines, &mut *out, on_quit, interrupt);
     session.start()?;
 
     // The script, then stdin. Commands that do not come from a terminal are echoed, so

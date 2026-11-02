@@ -88,6 +88,8 @@ pub enum StmtKind {
 pub enum DirArg {
     Expr(Expr),
     Str(Vec<u8>),
+    /// A number wider than 64 bits (`.file`'s MD5 checksum).
+    Wide(u128),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

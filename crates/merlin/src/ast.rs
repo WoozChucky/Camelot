@@ -98,6 +98,9 @@ pub struct Function {
     /// the memory the result goes to.
     pub ret_ptr: Option<LocalId>,
     pub pos: Pos,
+    /// The closing brace of a definition's body (the declaration's position
+    /// for a prototype): where `-g` says the epilogue comes from.
+    pub end: Pos,
 }
 
 impl Function {

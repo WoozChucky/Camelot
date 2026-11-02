@@ -1,9 +1,11 @@
 //! merlin-as: assembles Excalibur assembly into ELF32 relocatable objects.
 //!
-//! Pipeline: [`lexer`] → [`parser`] → [`asm`] (calls [`encode`] per instruction) → [`elf`].
+//! Pipeline: [`lexer`] → [`parser`] → [`asm`] (calls [`encode`] per instruction,
+//! and [`dwarf`] for the line table of `.file` and `.loc`) → [`elf`].
 
 pub mod asm;
 pub mod ast;
+pub mod dwarf;
 pub mod elf;
 pub mod encode;
 pub mod lexer;

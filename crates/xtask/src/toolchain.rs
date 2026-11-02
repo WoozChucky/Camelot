@@ -8,19 +8,48 @@
 //! output doesn't depend on where the repository is checked out: a C file is
 //! compiled as `main.c`, with `-I include`, and the files it includes are
 //! read from under that directory.
+//!
+//! C is compiled with `-g` (debug information: line tables for merlin-dbg),
+//! with a compilation directory relative to the repository root (`kernel`,
+//! `kernel/user`), for the same reason. The debug information is never
+//! loaded, so it changes no byte the machine runs ([`without_debug_info`]
+//! builds without it, for the test that checks this).
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
+thread_local! {
+    /// Whether [`compile_c`] passes `-g`: true but inside [`without_debug_info`].
+    static DEBUG_INFO: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Runs `f` with C compiled without `-g` on this thread: the build as it
+/// was before debug information, for comparing loaded bytes.
+pub fn without_debug_info<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DEBUG_INFO.set(self.0);
+        }
+    }
+    let _restore = Restore(DEBUG_INFO.replace(false));
+    f()
+}
+
 /// Compiles `file`, a C file in `dir`, with merlin, the way
-/// `merlin -I <inc>... file` run inside `dir` would. `include_dirs` are
-/// relative to `dir`. Returns the assembly; errors read
-/// `file.c:line:col: error: ...`, one per line.
-pub fn compile_c(dir: &Path, file: &str, include_dirs: &[&str]) -> Result<String, String> {
+/// `merlin -g -fdebug-compilation-dir=<comp_dir> -I <inc>... file` run
+/// inside `dir` would (`comp_dir` names `dir`, relative to the repository
+/// root). `include_dirs` are relative to `dir`. Returns the assembly; errors
+/// read `file.c:line:col: error: ...`, one per line.
+pub fn compile_c(dir: &Path, file: &str, include_dirs: &[&str], comp_dir: &str) -> Result<String, String> {
     let path = dir.join(file);
     let src = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let opts = merlin::Options {
         include_dirs: include_dirs.iter().map(PathBuf::from).collect(),
         macros: Vec::new(),
+        debug: DEBUG_INFO.get().then(|| merlin::DebugInfo {
+            comp_dir: comp_dir.into(),
+        }),
     };
     let load = |p: &Path| std::fs::read_to_string(dir.join(p)).ok();
     merlin::compile_with(file, &src, &opts, &load).map_err(|errors| {
@@ -88,14 +117,21 @@ mod tests {
             "#include \"k.h\"\n#include \"near.h\"\nint f(void) { return K + near(); }\n",
         )
         .unwrap();
-        let asm = compile_c(&dir, "a.c", &["include"]).unwrap();
+        let asm = compile_c(&dir, "a.c", &["include"], "x").unwrap();
         assert!(asm.contains("f:"), "{asm}");
         assert!(asm.contains("42"), "{asm}");
+        // With debug information, which can be turned off.
+        assert!(asm.starts_with("    .file 0 \"x\" \"a.c\"\n"), "{asm}");
+        let plain = without_debug_info(|| compile_c(&dir, "a.c", &["include"], "x").unwrap());
+        assert!(!plain.contains(".file") && !plain.contains(".loc"), "{plain}");
+        assert!(compile_c(&dir, "a.c", &["include"], "x")
+            .unwrap()
+            .contains(".loc"));
         // Without -I include, k.h is not found, and the error names the file.
-        let err = compile_c(&dir, "a.c", &[]).unwrap_err();
+        let err = compile_c(&dir, "a.c", &[], "x").unwrap_err();
         assert!(err.starts_with("a.c:1:"), "{err}");
         assert!(err.contains("'k.h' file not found"), "{err}");
-        assert!(compile_c(&dir, "missing.c", &[])
+        assert!(compile_c(&dir, "missing.c", &[], "x")
             .unwrap_err()
             .contains("cannot read"));
         // The result assembles and links.

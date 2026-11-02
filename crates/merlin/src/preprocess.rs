@@ -80,6 +80,8 @@ pub struct Options {
     pub include_dirs: Vec<PathBuf>,
     /// `-D` and `-U`, in command-line order.
     pub macros: Vec<CmdMacro>,
+    /// `-g`: debug information, for the code generator.
+    pub debug: Option<crate::DebugInfo>,
 }
 
 /// Reads the file at a path for `#include`, or `None` if there is none.
@@ -1829,6 +1831,7 @@ puts( "The first, second, and third items." );
         let opts = Options {
             include_dirs: vec![PathBuf::from("inc"), PathBuf::from("sub")],
             macros: Vec::new(),
+            debug: None,
         };
         let src = "#include <d.h>\n#include \"d.h\"\n#include <c.h>\n#define H <b.h>\n#include H";
         let out = run(&files, src, &opts).unwrap();
@@ -2144,12 +2147,14 @@ puts( "The first, second, and third items." );
                 CmdMacro::Define("TWO=22".into()),
                 CmdMacro::Undef("__merlin__".into()),
             ],
+            debug: None,
         };
         let out = run(&[], "ONE TWO F(3) GONE __merlin__ __STDC_VERSION__", &opts).unwrap();
         assert_eq!(words(&out.tokens), same("1 22 (3+1) GONE __merlin__ 199901L"));
         let opts = Options {
             include_dirs: Vec::new(),
             macros: vec![CmdMacro::Define("1X".into())],
+            debug: None,
         };
         assert_eq!(
             run(&[], "", &opts).unwrap_err().render("main.c"),

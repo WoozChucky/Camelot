@@ -125,8 +125,13 @@ pub enum CCompiler<'a> {
 pub struct Program {
     /// The source's stem: what the shell calls it.
     pub name: String,
-    /// The executable merlin-ld wrote.
+    /// The executable merlin-ld wrote, without its debug information: what
+    /// the kernel embeds and `/bin` holds.
     pub elf: Vec<u8>,
+    /// The same with its debug information (the line tables of `-g`), for
+    /// a debugger: `cargo xtask kernel` writes it to `user/<name>.elf` in the
+    /// object directory.
+    pub debug: Vec<u8>,
 }
 
 /// `kernel/user` under `root`.
@@ -224,7 +229,7 @@ fn asm_text(dir: &Path, src: &Source, cc: CCompiler) -> Result<(String, String),
         (Lang::Asm, _) => Ok((format!("{USER_DIR}/{}", src.file()), read(&dir.join(src.file()))?)),
         (Lang::C, CCompiler::Merlin) => {
             // Errors read `kernel/user/x.c:line:col: error: ...`.
-            let asm = toolchain::compile_c(dir, &src.file(), &[]).map_err(|e| {
+            let asm = toolchain::compile_c(dir, &src.file(), &[], USER_DIR).map_err(|e| {
                 e.lines()
                     .map(|l| format!("{USER_DIR}/{l}"))
                     .collect::<Vec<_>>()
@@ -285,9 +290,11 @@ pub fn link_program(dir: &Path, prog: &Source, cc: CCompiler, rt: &Runtime) -> R
         let lines: Vec<String> = errors.iter().map(|e| format!("merlin-ld: error: {e}")).collect();
         format!("linking {}:\n{}", prog.stem, lines.join("\n"))
     })?;
+    let debug = toolchain::link(dir, SCRIPT, &inputs, &prog.stem)?;
     Ok(Program {
         name: prog.stem.clone(),
-        elf: toolchain::link(dir, SCRIPT, &inputs, &prog.stem)?,
+        elf: merlin_ld::strip_debug(&debug).map_err(|e| format!("{}: {e}", prog.stem))?,
+        debug,
     })
 }
 
@@ -633,10 +640,12 @@ mod tests {
             Program {
                 name: "one".into(),
                 elf: (0..=255u8).chain([0; 64]).chain([9, 8, 7]).collect(),
+                debug: Vec::new(),
             },
             Program {
                 name: "two".into(),
                 elf: vec![0; 4096],
+                debug: Vec::new(),
             },
         ];
         let text = generate(&programs, CCompiler::Merlin);

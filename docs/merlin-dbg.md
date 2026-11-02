@@ -1,6 +1,9 @@
 # merlin-dbg and Grail's GDB stub
 
-merlin-dbg is the Camelot debugger. This document covers its first layer: machine-level debugging of any program running in Grail, with no help from the compiler. Breakpoints, watchpoints, single steps, registers, CSRs, memory, disassembly and backtraces by frame pointer, on one hart or several.
+merlin-dbg is the Camelot debugger. This document covers its first two layers:
+
+- **machine-level debugging** of any program running in Grail, with no help from the compiler: breakpoints, watchpoints, single steps, registers, CSRs, memory, disassembly and backtraces by frame pointer, on one hart or several;
+- **source-level debugging** of programs built with `merlin -g` (the kernel and its user programs are): breakpoints on a source line, stepping by line, the source shown at every stop, from the programs' DWARF line tables (see "Source lines" below).
 
 It has three parts:
 
@@ -211,17 +214,23 @@ Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 | Command | What it does |
 |---|---|
 | `break ADDR`, `b` | breakpoint at ADDR |
+| `break FILE:LINE` | breakpoint on a source line (`kernel/main.c:273`, or `main.c:273`): see "Source lines" |
 | `watch [-r\|-a] ADDR [LEN]` | watchpoint on LEN bytes (4) at ADDR: writes, `-r` reads, `-a` either |
 | `delete [N]`, `d` | deletes breakpoint or watchpoint N, or all of them |
 | `info breakpoints`, `i b` | lists them |
 | `continue`, `c` | runs every hart until something stops the machine |
-| `stepi [N]`, `si`, `step`, `s` | N instructions (1) of the selected hart. At the machine level `step` is `stepi`: stepping by source line needs debug information |
-| `nexti [N]`, `ni`, `next`, `n` | the same, but a call runs until it returns: a `jal`/`jalr` that links, or the `auipc ra` + `jalr ra` of a `call` |
+| `step [N]`, `s` | N source lines (1) of the selected hart, into calls. Without line information at the pc, `stepi` |
+| `next [N]`, `n` | the same, but a call runs until it returns. Without line information, `nexti` |
+| `stepi [N]`, `si` | N instructions (1) of the selected hart |
+| `nexti [N]`, `ni` | the same, but a call runs until it returns: a `jal`/`jalr` that links, or the `auipc ra` + `jalr ra` of a `call` |
 | `finish` | runs until the current function returns to its caller (the backtrace's frame 1), and shows `a0` |
 | `regs`, `info registers` | the selected hart's registers, pc and privilege mode |
 | `x/N[w\|b] ADDR` | N words (default) or bytes of memory |
 | `disas [ADDR] [N]` | N instructions (8) from ADDR (the pc), `=>` at the pc |
-| `bt`, `backtrace` | the call stack |
+| `bt`, `backtrace` | the call stack, with each frame's source line |
+| `list [FILE:]LINE`, `list FUNC`, `l` | ten source lines around LINE (of the file listed last) or a function's first line; `list` alone goes on after the lines listed last, or shows those around the stop |
+| `directory DIR` | looks for source files under DIR first |
+| `add-symbol-file FILE` | adds the symbols and line tables of another program: a user program next to the kernel |
 | `hart`, `info harts` | every hart, its mode and pc. `*` marks the selected one |
 | `hart N` | selects hart N |
 | `quit`, `q` | leaves |
@@ -234,12 +243,14 @@ An ADDR is any of these, optionally followed by `+N` or `-N`:
 
 Symbols come from the ELF symbol table (through `elf32`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one.
 
-Each stop shows its reason, then the instruction at the pc:
+Each stop shows its reason, then the instruction at the pc, then its source line if the line tables have one (`kernel/main.c:275:     cpu_init();`, the text left out when the file cannot be found):
 
 - `breakpoint N`;
 - `watchpoint N (write) hit at ADDR`;
 - `interrupted`;
 - `program exited with code N`.
+
+A `stepi` on the line shown last does not show it again.
 
 On a machine with several harts, the reason starts with `[hart N]`, and the stopping hart becomes the selected one.
 
@@ -284,6 +295,34 @@ In each case `ra` holds the return address and `s0` is still the caller's frame 
 
 `crates/merlin-dbg/src/frames.rs` has the unwinder and its unit tests.
 
+### Source lines
+
+The line tables (`.debug_line`, the spec's section 10, "Debug information") map each address to a file and a line. merlin-dbg reads them from the program and from each `add-symbol-file` (`crates/merlin-dbg/src/source.rs`, through `elf32::lines`). A row marked `is_stmt` starts a statement: merlin writes one before each statement, a function's first line before its prologue, a loop's condition and step, and the closing brace before the epilogue, and marks the first statement after the prologue `prologue_end`.
+
+- **`break FILE:LINE`**: FILE is the path the line table has (`kernel/main.c`) or its end after a `/` (`main.c`). The breakpoint goes at the lowest address of a statement on that line in each function that has one (a `for` line has several statements: its initialization first). A line with no code, such as a comment or a declaration without an initializer, means the next line that has some, as in gdb, and merlin-dbg says so. A function's first line is its first instruction, before the prologue; `break FUNC` is the same place.
+- **`step` and `next`** run instructions until the pc is at the start of a statement on another line. A call on the way runs to its return under `next`, a temporary breakpoint as `nexti` uses. `step` follows it into the function, and stops past its prologue, at its `prologue_end` row (or its second row). A function with no line information, an assembly one, is run to its return instead, as gdb does. A return stops in the caller, on the line of the call, wherever in it the pc is. Any other stop on the way (a breakpoint, a watchpoint, another hart's) ends the command, and Ctrl-C does too. A line that never ends (`for (;;);`) is given up after a million instructions.
+- **Sources** are found by their paths in the line tables, under a `directory` first, then relative to the current directory. The kernel's are relative to the repository root (`kernel/main.c`, `kernel/user/sh.c`), so run merlin-dbg there.
+- **User programs**: the kernel embeds its programs without their line tables, and `/bin` holds them the same way; `cargo xtask kernel` writes them with their line tables to `target/kernel/obj/user/<name>.elf`. Every program runs at the same virtual addresses, so a breakpoint in one stops whichever process runs that address; telling processes apart is #121.
+
+```
+$ cargo run -p merlin-dbg -- -- kernel/kernel.elf
+(merlin-dbg) break kernel/main.c:273
+breakpoint 1 at 0x80017668 <kmain>: kernel/main.c:273
+(merlin-dbg) continue
+breakpoint 1
+=> 0x80017668 <kmain>:  addi sp, sp, -0x10
+kernel/main.c:273: int kmain(void) {
+(merlin-dbg) next
+=> 0x80017678 <kmain+16>:  auipc ra, 0x23
+kernel/main.c:275:     cpu_init();
+(merlin-dbg) step
+...
+(merlin-dbg) add-symbol-file target/kernel/obj/user/sh.elf
+(merlin-dbg) break kernel/user/sh.c:502
+```
+
+LLDB reads the same tables: `image lookup -a ADDR` gives the line, `breakpoint set -f main.c -l LINE` the address (`cargo test -p merlin-dbg --test session -- --ignored`).
+
 ### Tests
 
 `crates/merlin-dbg/tests/session.rs` drives the merlin-dbg binary against the stub, on `examples/hello`, `examples/smp` with 2 harts, and the kernel booted to its shell. The stub is `grail::gdb::serve`, what `grail --gdb` runs, in the test's process, so the test can capture the machine's console. The test checks:
@@ -293,12 +332,12 @@ In each case `ra` holds the return address and `s0` is still the caller's frame 
 - errors that leave the session going;
 - that each run's console output and exit code are those of the same program run without a debugger;
 - `merlin-dbg -- ...` with a script (`-x`);
-- interrupting a running machine.
+- interrupting a running machine;
+- source lines: a breakpoint on `kmain`'s line of `kernel/main.c` and on a line with no code, `next` and `step` by line, `list`, the lines in a backtrace, and the same in the shell, a user program added with `add-symbol-file`; LLDB on the kernel's line tables (ignored).
 
 ## What's next
 
 The next layers of merlin-dbg build on this one:
 
-- source-level debugging with line tables (#119);
 - variables and types from DWARF (#120);
 - debugging Avalon VMs and individual Camelot processes (#121).

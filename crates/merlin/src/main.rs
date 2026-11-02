@@ -1,4 +1,4 @@
-//! `merlin [-o out.s] [-I dir] [-D name[=value]] [-U name] [-E | --dump-ast] input.c...`
+//! `merlin [-o out.s] [-I dir] [-D name[=value]] [-U name] [-g] [-E | --dump-ast] input.c...`
 
 use merlin::{CmdMacro, Options};
 use std::path::{Path, PathBuf};
@@ -13,6 +13,11 @@ const USAGE: &str = "usage: merlin [options] input.c...
   -D NAME[=VALUE]   define a macro, as #define NAME VALUE (VALUE is 1 if
                     left out); -D 'F(x)=VALUE' defines a function-like one
   -U NAME           undefine a macro (-D and -U apply in order)
+  -g                debug information: which source line each instruction
+                    comes from (.file, .loc), and a DWARF compile unit
+  -fdebug-compilation-dir=DIR
+                    the directory -g says file names are relative to
+                    (default: the current directory)
   -E                preprocess only: print the tokens after preprocessing
   --dump-ast        print the checked syntax tree to stdout instead of compiling
 
@@ -49,6 +54,8 @@ fn run() -> ExitCode {
     let mut output = None;
     let mut mode = Mode::Compile;
     let mut opts = Options::default();
+    let mut debug = false;
+    let mut comp_dir = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         // `-I dir` or `-Idir`, and the same for -D, -U and -o.
@@ -61,6 +68,19 @@ fn run() -> ExitCode {
         };
         match a.as_str() {
             "-E" => mode = Mode::Preprocess,
+            "-g" => debug = true,
+            _ if a.starts_with("-fdebug-compilation-dir") => {
+                match a.strip_prefix("-fdebug-compilation-dir").unwrap() {
+                    "" => match args.next() {
+                        Some(d) => comp_dir = Some(d),
+                        None => return usage_error("-fdebug-compilation-dir needs a directory"),
+                    },
+                    v => match v.strip_prefix('=') {
+                        Some(d) => comp_dir = Some(d.to_string()),
+                        None => return usage_error(&format!("unknown option {a}")),
+                    },
+                }
+            }
             "--dump-ast" => mode = Mode::DumpAst,
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -85,6 +105,14 @@ fn run() -> ExitCode {
             _ if a.starts_with('-') => return usage_error(&format!("unknown option {a}")),
             _ => inputs.push(a),
         }
+    }
+    if debug {
+        let comp_dir = comp_dir.unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|d| d.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| ".".into())
+        });
+        opts.debug = Some(merlin::DebugInfo { comp_dir });
     }
     if inputs.is_empty() {
         eprintln!("{USAGE}");

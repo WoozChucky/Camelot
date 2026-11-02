@@ -12,6 +12,8 @@ pub const USAGE: &str = "usage: merlin-objdump <options> file...
   -f, --file-headers      architecture and entry point
   -p, --private-headers   program headers
   -s, --full-contents     hex dump of every section
+  -l, --line-numbers      with -d, the source file:line of the instructions
+                          (from the .debug_line line tables)
   -M no-aliases           real instructions instead of pseudo-instructions
                           (also -Mno-aliases, --disassembler-options=no-aliases)
   --no-show-raw-insn      do not print instruction words
@@ -51,6 +53,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
             "--file-headers" => opts.file_headers = true,
             "--private-headers" => opts.private_headers = true,
             "--full-contents" => opts.contents = true,
+            "--line-numbers" => opts.line_numbers = true,
             "--no-show-raw-insn" => opts.raw_insn = false,
             "--show-raw-insn" => opts.raw_insn = true,
             "-M" => match args.next() {
@@ -73,6 +76,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
                         'f' => opts.file_headers = true,
                         'p' => opts.private_headers = true,
                         's' => opts.contents = true,
+                        'l' => opts.line_numbers = true,
                         _ => return Err(format!("unknown option -{c}")),
                     }
                 }
@@ -113,6 +117,7 @@ mod tests {
         assert!(!o.disassemble && !o.contents);
         let o = opts(&["-h", "-t", "-s", "a.o"]);
         assert!(o.section_headers && o.symbols && o.contents);
+        assert!(opts(&["-dl", "a.o"]).line_numbers && opts(&["-d", "--line-numbers", "a.o"]).line_numbers);
     }
 
     #[test]
