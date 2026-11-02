@@ -365,6 +365,8 @@ fn the_readme_lake_example() -> Result<(), Box<dyn std::error::Error>> {
     let avalon = avalon();
 
     let mut lake = Connection::connect(lake_addr.as_str(), "example")?;
+    // Not in the README: a broken server fails the test instead of hanging it.
+    lake.get_ref().set_read_timeout(Some(SLOW))?;
     lake.request_ok(&Message::DiskCreate {
         name: "root".into(),
         sectors: 2048,
@@ -386,8 +388,9 @@ fn the_readme_lake_example() -> Result<(), Box<dyn std::error::Error>> {
         Message::VmInfo(details) => details,
         other => panic!("{other:?}"),
     };
-    // The guest sees one disk (sysinfo device type 9).
-    assert_eq!(details.devices.iter().filter(|d| d.kind == 9).count(), 1);
+    // The guest sees one disk.
+    let disk = grail::sysinfo::DeviceType::Block as u32;
+    assert_eq!(details.devices.iter().filter(|d| d.kind == disk).count(), 1);
     destroy(&mut rt, vm);
     avalon.stop()?;
     server.stop()?;

@@ -99,6 +99,14 @@ impl LakeDisk {
         self.broken.as_deref()
     }
 
+    /// Changes how long each later request waits for Lake's answer ([`IO_TIMEOUT`] by
+    /// default). Tests use it to time a request out quickly.
+    pub fn set_io_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+        let stream = self.conn.get_ref();
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))
+    }
+
     /// Sends one request and returns its reply, as an `io::Error` if it failed.
     fn request(&mut self, msg: &Message) -> io::Result<Message> {
         if let Some(why) = &self.broken {
@@ -119,7 +127,9 @@ impl LakeDisk {
             )),
             Err(e) => {
                 // A reply that never came (a timeout), a closed socket, a reply out of
-                // step: the stream can no longer be trusted.
+                // step: the stream can no longer be trusted. After a timeout the reply
+                // may still arrive, and the next request would take it for its own
+                // (a late `Ok` for an earlier write would pass for a newer write's).
                 let why = e.to_string();
                 if e.is_fatal() || matches!(e, Error::Unexpected(_)) {
                     self.broken = Some(why.clone());

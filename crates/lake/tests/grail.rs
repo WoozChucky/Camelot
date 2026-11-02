@@ -1,7 +1,8 @@
 //! Grail's network disk (`grail::lake::LakeDisk`) against an in-process Lake:
 //! `examples/disk` runs on a Lake disk read-write and read-only, big transfers are
 //! split into requests, attachments follow the machines that hold them, and a server
-//! that goes away or answers nonsense is an I/O error for the guest, never a crash.
+//! that goes away, answers nonsense or answers too late is an I/O error for the guest,
+//! never a crash.
 
 mod common;
 
@@ -12,6 +13,9 @@ use grail::bus::RAM_BASE;
 use grail::lake::LakeDisk;
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// `examples/disk/disk.img`, uploaded to `lake` as disk `name`.
 fn upload_example_image(conn: &mut Connection<TcpStream>, name: &str) -> Vec<u8> {
@@ -307,4 +311,107 @@ fn a_server_that_answers_nonsense_is_an_io_error() {
     assert!(e.to_string().contains("I/O error: the host's disk failed"), "{e}");
     assert!(disk.broken().is_none());
     disk.write(0, &[0; SECTOR_SIZE]).unwrap();
+}
+
+/// Runs one guest command on `dev` for one sector at `sector` (RAM at its base) and
+/// returns `BLK_ERROR`.
+fn command(dev: &mut BlockDevice, ram: &mut [u8], sector: u32, cmd: u32) -> u32 {
+    for (reg, val) in [
+        (block::REG_SECTOR, sector),
+        (block::REG_COUNT, 1),
+        (block::REG_DMA, RAM_BASE),
+        (block::REG_CMD, cmd),
+    ] {
+        dev.write(reg, 4, val, ram).unwrap();
+    }
+    dev.read(block::REG_ERROR, 4).unwrap()
+}
+
+#[test]
+fn a_server_that_answers_too_late_fails_the_disk_for_good() {
+    const TIMEOUT: Duration = Duration::from_millis(200);
+    // Answers a write to sector 0 only after the disk has given up waiting for it, and
+    // everything else at once.
+    let late = Arc::new(AtomicU32::new(0));
+    let other_writes = Arc::new(AtomicU32::new(0));
+    let (l, o) = (Arc::clone(&late), Arc::clone(&other_writes));
+    let addr = fake_lake(move |msg| match msg {
+        Message::BlockOpen { .. } => Message::BlockOpened {
+            handle: 1,
+            sectors: 8,
+            read_only: false,
+        },
+        Message::BlockWrite { sector: 0, .. } => {
+            std::thread::sleep(TIMEOUT * 3);
+            l.fetch_add(1, Ordering::SeqCst);
+            Message::Ok
+        }
+        Message::BlockWrite { .. } => {
+            o.fetch_add(1, Ordering::SeqCst);
+            Message::Ok
+        }
+        _ => Message::Ok,
+    });
+    // Until the late answer has been sent, and has had time to arrive.
+    let wait_for_late = |n| {
+        wait_until("the late answer", || late.load(Ordering::SeqCst) == n);
+        std::thread::sleep(TIMEOUT / 2);
+    };
+
+    let mut disk = LakeDisk::open(&addr, "d", false).unwrap();
+    disk.set_io_timeout(TIMEOUT).unwrap();
+    disk.write(1, &[1; SECTOR_SIZE]).unwrap();
+    disk.write(0, &[0; SECTOR_SIZE]).unwrap_err();
+    assert!(disk.broken().is_some());
+    wait_for_late(1);
+    // The late `Ok` is waiting on the socket. It must not pass for the answer to the
+    // next write: that write fails without being sent.
+    let e = disk.write(1, &[1; SECTOR_SIZE]).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::NotConnected, "{e}");
+    assert!(disk.flush().is_err());
+    assert!(disk.read(1, &mut [0; SECTOR_SIZE]).is_err());
+    assert_eq!(other_writes.load(Ordering::SeqCst), 1);
+    drop(disk);
+
+    // What the guest sees: BLK_ERROR 5 for the write that timed out and every command
+    // after it.
+    let mut disk = LakeDisk::open(&addr, "d", false).unwrap();
+    disk.set_io_timeout(TIMEOUT).unwrap();
+    let mut dev = BlockDevice::new(Box::new(disk)).unwrap();
+    let mut ram = vec![0; SECTOR_SIZE];
+    assert_eq!(command(&mut dev, &mut ram, 0, block::CMD_WRITE), block::error::IO);
+    wait_for_late(2);
+    for c in [block::CMD_WRITE, block::CMD_READ, block::CMD_FLUSH] {
+        assert_eq!(command(&mut dev, &mut ram, 1, c), block::error::IO, "command {c}");
+    }
+    assert_eq!(other_writes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn dropping_a_disk_detaches_its_image_before_returning() {
+    // Records each request before answering it.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s = Arc::clone(&seen);
+    let addr = fake_lake(move |msg| {
+        s.lock().unwrap().push(msg.name());
+        match msg {
+            Message::BlockOpen { .. } => Message::BlockOpened {
+                handle: 3,
+                sectors: 8,
+                read_only: false,
+            },
+            _ => Message::Ok,
+        }
+    });
+    let mut disk = LakeDisk::open(&addr, "d", false).unwrap();
+    disk.write(0, &[0; SECTOR_SIZE]).unwrap();
+    drop(disk);
+    // Not merely the connection closing: an explicit BlockClose, answered before
+    // `drop` returned.
+    assert_eq!(*seen.lock().unwrap(), ["BlockOpen", "BlockWrite", "BlockClose"]);
+}
+
+#[test]
+fn lake_images_fit_a_grail_disk() {
+    assert_eq!(lake::MAX_IMAGE_SECTORS, block::MAX_SECTORS);
 }

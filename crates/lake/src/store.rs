@@ -5,7 +5,14 @@
 //! (`validate_name`: lowercase, no paths, no Windows devices) and whose size is a whole
 //! number of 512-byte sectors; the file holds the raw sectors, as Grail's image files
 //! do. Anything else in the directory is left alone: it is not listed, cannot be
-//! attached or deleted, and its name cannot be used for a new disk.
+//! attached or deleted, and its name cannot be used for a new disk. A disk is looked up
+//! by its exact directory entry, never just by opening `dir/name`: on a filesystem that
+//! ignores case (Windows, macOS), the path for disk `root` opens a file named `ROOT`,
+//! which is not a disk.
+//!
+//! New images are sparse: they take no space until written, and on Windows (NTFS)
+//! writing near the end of a fresh image does not first make the filesystem write zeros
+//! over everything before it (see [`Store::create`]).
 //!
 //! Concurrency rule: an image has at most one writer, and a writer excludes readers
 //! (exclusive attach); any number of read-only attachments may share an image that has
@@ -71,14 +78,29 @@ impl Store {
     }
 
     /// `DiskCreate`: a new zero-filled image of `sectors` sectors.
+    ///
+    /// The image is a sparse file of that length: it reads as zeros without any being
+    /// written. Unix filesystems make a file extended by `set_len` sparse by
+    /// themselves. NTFS does not: it keeps a "valid data length", and the first write
+    /// past it makes it write zeros up to that point, synchronously, inside that one
+    /// write. For a write near the end of a fresh 48 GiB image that takes longer than
+    /// Grail waits for an answer, so the guest's disk would fail. On Windows the file
+    /// is therefore marked sparse first ([`make_sparse`]); where the filesystem cannot
+    /// do that (FAT), the zeros are written here instead, so `DiskCreate` pays for
+    /// them and not a guest's write.
     pub fn create(&self, name: &str, sectors: u64) -> Result<(), Fail> {
         check_name(name)?;
-        if sectors == 0 || sectors > self.max_sectors {
-            return Err(Fail::new(
+        let too_big = || {
+            Fail::new(
                 ErrorCode::OverBudget,
                 format!("a disk is 1 to {} sectors, not {sectors}", self.max_sectors),
-            ));
+            )
+        };
+        if sectors == 0 || sectors > self.max_sectors {
+            return Err(too_big());
         }
+        // `max_sectors` is the server's to choose; no size may overflow a file length.
+        let len = sectors.checked_mul(SECTOR).ok_or_else(too_big)?;
         let _table = lock(&self.attached);
         let path = self.path(name);
         let exists = || {
@@ -97,8 +119,17 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(exists()),
             Err(e) => return Err(io_fail(&format!("cannot create disk '{name}'"), e)),
         };
-        // A new file of that length reads as zeros, without writing them.
-        if let Err(e) = file.set_len(sectors * SECTOR) {
+        // A new sparse file of that length reads as zeros, without writing them.
+        let sized = if make_sparse(&file).is_ok() {
+            file.set_len(len)
+        } else {
+            // Not sparse: write the last sector, so the filesystem fills the rest in
+            // now.
+            file.set_len(len)
+                .and_then(|_| (&file).seek(SeekFrom::Start(len - SECTOR)))
+                .and_then(|_| (&file).write_all(&[0; SECTOR_SIZE]))
+        };
+        if let Err(e) = sized {
             drop(file);
             let _ = fs::remove_file(&path);
             return Err(io_fail(
@@ -107,6 +138,19 @@ impl Store {
             ));
         }
         Ok(())
+    }
+
+    /// The size in sectors of disk `name`, if there is one: the directory has an entry
+    /// spelled exactly `name` (see the module comment), and it is an image.
+    fn disk_sectors(&self, name: &str) -> Result<Option<u64>, Fail> {
+        let entries = fs::read_dir(&self.dir).map_err(|e| io_fail("cannot read the images directory", e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| io_fail("cannot read the images directory", e))?;
+            if entry.file_name() == name {
+                return Ok(image_sectors(&entry.path()));
+            }
+        }
+        Ok(None)
     }
 
     /// `ListDisks`: every image, in name order, with its attachments.
@@ -142,14 +186,13 @@ impl Store {
     pub fn delete(&self, name: &str) -> Result<(), Fail> {
         check_name(name)?;
         let table = lock(&self.attached);
-        let path = self.path(name);
-        if image_sectors(&path).is_none() {
+        if self.disk_sectors(name)?.is_none() {
             return Err(no_such_disk(name));
         }
         if let Some(a) = table.get(name) {
             return Err(busy(name, a));
         }
-        fs::remove_file(&path).map_err(|e| io_fail(&format!("cannot delete disk '{name}'"), e))
+        fs::remove_file(self.path(name)).map_err(|e| io_fail(&format!("cannot delete disk '{name}'"), e))
     }
 
     /// `BlockOpen`: attaches image `name`, read-write (the only attachment it may
@@ -158,10 +201,10 @@ impl Store {
     pub fn attach(self: &Arc<Self>, name: &str, read_only: bool) -> Result<Image, Fail> {
         check_name(name)?;
         let mut table = lock(&self.attached);
-        let path = self.path(name);
-        let Some(sectors) = image_sectors(&path) else {
+        let Some(sectors) = self.disk_sectors(name)? else {
             return Err(no_such_disk(name));
         };
+        let path = self.path(name);
         if let Some(a) = table.get(name) {
             if a.writer || !read_only {
                 return Err(busy(name, a));
@@ -321,6 +364,61 @@ fn image_sectors(path: &Path) -> Option<u64> {
     (meta.is_file() && meta.len().is_multiple_of(SECTOR)).then_some(meta.len() / SECTOR)
 }
 
+/// Marks a new, empty file sparse, so that extending it ([`File::set_len`]) and then
+/// writing anywhere in it costs only what is written (see [`Store::create`]). Fails
+/// where the filesystem has no sparse files.
+#[cfg(windows)]
+fn make_sparse(file: &File) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+
+    /// `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 49, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)`.
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00c4;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn DeviceIoControl(
+            device: *mut c_void,
+            code: u32,
+            in_buffer: *const c_void,
+            in_size: u32,
+            out_buffer: *mut c_void,
+            out_size: u32,
+            returned: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+    }
+
+    let mut returned = 0;
+    // SAFETY: the handle is open for writing for the duration of the call (`file` is
+    // borrowed), and it is synchronous (no OVERLAPPED). With no input buffer,
+    // FSCTL_SET_SPARSE sets the attribute; it has no output.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Unix filesystems make an extended file sparse by themselves.
+#[cfg(not(windows))]
+fn make_sparse(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
 fn check_name(name: &str) -> Result<(), Fail> {
     validate_name(name).map_err(|e| Fail::new(ErrorCode::InvalidName, e))
 }
@@ -417,6 +515,67 @@ mod tests {
             assert_eq!(code(s.create(name, 1)), ErrorCode::AlreadyExists, "{name}");
         }
         assert!(dir.0.join("odd").exists() && dir.0.join("sub").is_dir());
+
+        // Where the filesystem ignores case, the path for disk "upper" opens "UPPER",
+        // and the one for "data.img" opens "Data.img": those files are still not
+        // disks.
+        fs::write(dir.0.join("Data.img"), [0xcd; 512]).unwrap();
+        assert_eq!(s.list().unwrap().len(), 1);
+        for name in ["upper", "data.img"] {
+            for read_only in [true, false] {
+                assert_eq!(code(s.attach(name, read_only)), ErrorCode::NoSuchDisk, "{name}");
+            }
+            assert_eq!(code(s.delete(name)), ErrorCode::NoSuchDisk, "{name}");
+        }
+        assert_eq!(fs::read(dir.0.join("UPPER")).unwrap(), [0; 512]);
+        assert_eq!(fs::read(dir.0.join("Data.img")).unwrap(), [0xcd; 512]);
+    }
+
+    #[test]
+    fn new_images_are_sparse() {
+        let dir = TempDir::new("sparse");
+        let s = Arc::new(Store::open(&dir.0, MAX_IMAGE_SECTORS).unwrap());
+        // 1 GiB: if it were not sparse, NTFS would write all of it in the write below
+        // (or the fallback in `create`, at create time).
+        let sectors = 1 << 21;
+        s.create("big", sectors).unwrap();
+        let mut w = s.attach("big", false).unwrap();
+        w.write(sectors - 1, &[0xab; 512]).unwrap();
+        w.flush().unwrap();
+        assert_eq!(w.read(sectors - 1, 1).unwrap(), [0xab; 512]);
+        assert_eq!(w.read(sectors / 2, 1).unwrap(), [0; 512]);
+        drop(w);
+        let meta = fs::metadata(dir.0.join("big")).unwrap();
+        assert_eq!(meta.len(), sectors * SECTOR);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+            assert_ne!(meta.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE, 0);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert!(
+                meta.blocks() * 512 < 1 << 20,
+                "{} blocks allocated",
+                meta.blocks()
+            );
+        }
+    }
+
+    #[test]
+    fn sizes_never_overflow() {
+        let dir = TempDir::new("overflow");
+        let s = Arc::new(Store::open(&dir.0, u64::MAX).unwrap());
+        for sectors in [u64::MAX, u64::MAX / SECTOR + 1, 1 << 63] {
+            assert_eq!(
+                code(s.create("huge", sectors)),
+                ErrorCode::OverBudget,
+                "{sectors}"
+            );
+        }
+        assert!(!dir.0.join("huge").exists());
     }
 
     #[test]
