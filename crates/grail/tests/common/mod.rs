@@ -9,7 +9,7 @@ use grail::{Machine, MachineConfig, NetConfig, RunResult};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// 16 MiB boots faster than the default 128 (the kernel puts every page on its free
@@ -98,11 +98,25 @@ impl Vm {
 
     /// The 32-bit kernel variable `name`, read from RAM.
     pub fn read_var(&self, name: &str) -> u32 {
+        self.m.cpu.bus.read_mem(var_addr(name), 4).unwrap()
+    }
+
+    /// Sets the 32-bit kernel variable `name` in RAM (one the kernel clears while it
+    /// boots, in .bss, once it has booted).
+    pub fn write_var(&mut self, name: &str, value: u32) {
+        self.m.cpu.bus.load(var_addr(name), &value.to_le_bytes()).unwrap();
+    }
+}
+
+/// The address of the kernel variable `name`, looked up in kernel.elf once.
+pub fn var_addr(name: &str) -> u32 {
+    static ADDRS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+    let mut addrs = ADDRS.get_or_init(Default::default).lock().unwrap();
+    *addrs.entry(name.to_string()).or_insert_with(|| {
         let file = kernel_elf();
         let elf = grail::elf::parse(&file).unwrap();
-        let addr = elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"));
-        self.m.cpu.bus.read_mem(addr, 4).unwrap()
-    }
+        elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"))
+    })
 }
 
 /// Runs the machines in turns, letting `host` (if any) see what they send between

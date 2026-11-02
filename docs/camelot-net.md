@@ -236,8 +236,8 @@ connection, in a static table. A connection has two 4 KiB buffers
 (`TCP_BUF`, a page each from `kalloc`, taken when it starts and given back
 when it ends): what was sent stays in the send buffer until it is
 acknowledged, what arrived in order stays in the receive buffer until it is
-read, and the window offered is the receive buffer's free room, so the peer
-can never send more than fits. The MSS option on the SYN asks for 1460 bytes
+read, and the window offered is never more than the receive buffer's free
+room, so the peer can never send more than fits. The MSS option on the SYN asks for 1460 bytes
 (`TCP_MSS`: an Ethernet frame); a peer that sends none gets 536. Ephemeral
 ports go round from 49152.
 
@@ -275,6 +275,7 @@ never a reset for a reset. Then RFC 9293 3.10.7's steps, in order:
    again. There is no reassembly queue: with a 4 KiB window, at most two
    segments are ever lost to one gap.
 6. **The FIN**, once everything before it is in: end of file for the reader.
+   A FIN past a gap is dropped like data (`out-of-order`, and an ACK).
 
 Every segment with data is acknowledged at once; there are no delayed ACKs.
 
@@ -282,10 +283,13 @@ Every segment with data is acknowledged at once; there are no delayed ACKs.
 peer's MSS, then the FIN once the owner is done and everything before it is
 out. Silly window avoidance both ways (RFC 9293 3.8.6.2): a short segment
 goes only if it ends the data queued or is at least half the largest window
-the peer offered, and after a read the receive window is announced again
-only once it has grown by an MSS or half the buffer, whichever is less. There is no slow start or congestion
-window: the send buffer is under three full segments, so what a congestion
-window would limit hardly exists here.
+the peer offered; and the window's right edge, as every segment offers it,
+moves on only once the free room reaches past it by an MSS or half the
+buffer, whichever is less, so the peer never hears of a few bytes freed at a
+time. When a read frees that much, an ACK says so at once: the peer, with
+nothing it may send, would otherwise only find out by probing. There is no
+slow start or congestion window: the send buffer is under three full
+segments, so what a congestion window would limit hardly exists here.
 
 **Timers**, in ticks, run from `net_timer()`:
 
@@ -299,15 +303,23 @@ window would limit hardly exists here.
   (`TCP_SYN_RETRIES`), anything else 8 (`TCP_RETRIES`); then the connection
   is given up with `-ETIMEDOUT` (an established one sends a reset first).
 - **Persist**: with data waiting and the peer's window closed, one byte is
-  sent past it on the same doubling timeout, until the window opens. Probes
-  are not retries: a peer whose buffer stays full is never given up on.
+  sent past it on the same doubling timeout, until the window opens. An ACK
+  that leaves the probe's byte untaken, the window still closed, puts the
+  persist timer back on, so a probe is never a retransmission timeout too.
+  While a process holds the socket, probes are not retries: a peer whose
+  buffer stays full is never given up on. Once its owner closed it, they
+  are: after 8 (`TCP_RETRIES`) the connection is reset and given up, and
+  only an acknowledgment of new data starts the count over, so a peer that
+  keeps its window shut can't keep the slot (Linux bounds such orphans the
+  same way).
 - **TIME-WAIT** lasts 60 s (`TCP_TIME_WAIT`); the peer's FIN again in it is
   acknowledged again and starts it over. A connection in FIN-WAIT-2 that
   nobody holds waits 60 s (`TCP_FIN_TIMEOUT`) for the peer's FIN.
 
 **Closing.** `tcp_close()` hands the socket to the stack, which finishes the
 close on its own (FIN-WAIT, LAST-ACK, TIME-WAIT) and frees the slot at the
-end. A socket closed with data still unread is reset instead (RFC 9293
+end, or sooner: when the retries or the probes run out (above), or the
+peer's FIN does not come within `TCP_FIN_TIMEOUT`. A socket closed with data still unread is reset instead (RFC 9293
 3.10.4's ABORT, as RFC 1122 4.2.2.13 allows), and so is one that gets data
 after its owner closed it: nobody will ever read it. A connection in
 TIME-WAIT keeps its buffers only while its owner holds it, and when the
@@ -316,7 +328,9 @@ TIME-WAIT only guards against old duplicates, and a slot is worth more.
 
 **Initial sequence numbers** follow RFC 6528: a clock ticking every 4 µs
 (from the CLINT's `mtime`) plus a keyed hash of the two addresses and ports,
-so they are neither guessable nor reused by a quick reconnection.
+so they are neither guessable nor reused by a quick reconnection. The tests
+can set the next one (`tcp_isn_next`, written into the kernel's RAM) to see
+sequence numbers wrap.
 
 **The socket API** is kernel-internal until #85 puts it behind file
 descriptors (`kernel/include/net.h` says what each returns). Every call but
@@ -453,7 +467,7 @@ the configuration, and `ifconfig` prints them:
 | `tx-error` | `tx_errors` | the transmit queue was full, or the card failed a send |
 | `no-socket` | `tcp_no_socket` | TCP for a port with no connection or listener (answered with a reset) |
 | `backlog` | `tcp_backlog` | a SYN dropped: its listener's backlog was full, or no slot or memory was left |
-| `out-of-order` | `tcp_out_of_order` | data past a gap, dropped (the peer resends) |
+| `out-of-order` | `tcp_out_of_order` | data (or a FIN) past a gap, dropped (the peer resends) |
 | `retransmits` | `tcp_retransmits` | retransmission timeouts (each sends everything not acknowledged again) |
 | `resets` | `tcp_resets` | connections ended by a reset from the peer |
 
@@ -550,9 +564,11 @@ kernel's RAM), so a drop path that forgets to free its buffer fails them.
   answers host clients through a forwarded port, one large, then two at once
   with the second waiting in the backlog;
 - both again through a backend between the card and the gateway that drops,
-  duplicates and reorders TCP frames both ways by a fixed pattern (no
-  randomness), so what goes missing is the same on every run; the transfers
-  are still exact, and `retransmits` and `out-of-order` show what it took;
+  duplicates and reorders TCP frames both ways by a fixed pattern over the
+  frames' count, with no randomness (which frames that hits still varies a
+  little from run to run, since the host's sockets follow the wall clock);
+  the transfers are still exact, and `retransmits` and `out-of-order` show
+  what it took;
 - 40 connections in a row through the gateway and 20 over loopback, more
   than there are sockets; afterwards, once TIME-WAIT is over, every socket
   is free (`tcp_in_use`), every page of their buffers is back (`nfree`) and
@@ -564,8 +580,15 @@ kernel's RAM), so a drop path that forgets to free its buffer fails them.
   and a listener's close resetting the one waiting; closing first, closing
   at once (CLOSING), TIME-WAIT acknowledging a FIN again, a refused and a
   reset connection; a SYN and data sent again until the connection is given
-  up; a zero window probed until it opens, with an MSS of 1000 among
-  options the stack skips.
+  up, the timeout doubling each time (the test reads the kernel's `ticks`
+  at every step, as each segment comes); a zero window probed until it
+  opens, with an MSS of 1000 among options the stack skips, the probes
+  doubling too; a socket closed into a window that stays shut, given up
+  after its probes; sequence numbers wrapping past 2^32 both ways (8 KiB
+  echoed, both initial numbers just below it); silly window avoidance both
+  ways; closing with data unread, and data after closing, answered with a
+  reset, and a closed socket's FIN-WAIT-2 timing out; and processes killed
+  while they wait in `accept`, `connect`, `send` and `recv`, ending at once.
 
 The gateway runs on the machine's clock, but the host's sockets don't, so
 a SYN to the gateway waits (a bounded wait of the wall clock) for the host

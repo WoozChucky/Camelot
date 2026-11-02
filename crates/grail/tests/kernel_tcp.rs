@@ -10,7 +10,11 @@
 //!   ports nobody listens on, malformed segments counted, the handshake and its MSS
 //!   option, RFC 5961's challenge ACKs, a full backlog, out-of-order and duplicate data,
 //!   closes from either side and at once, refused and reset connections, retries that
-//!   give up, and a zero window probed until it opens;
+//!   give up and probes of a zero window (their timeouts doubling, timed by the kernel's
+//!   `ticks` at every step), a socket closed into a window that stays shut given up,
+//!   sequence numbers wrapping past 2^32 both ways, silly window avoidance both ways,
+//!   resets for data unread at a close or arriving after it, FIN-WAIT-2's timeout, and
+//!   processes killed while they wait in a call;
 //! - loopback connections, and many connections in a row, after which every socket,
 //!   page and packet buffer is back (counted from the kernel's variables).
 //!
@@ -154,19 +158,30 @@ fn fate(n: u64) -> Fate {
 struct Way {
     count: u64,
     held: Option<Vec<u8>>,
+    /// Polls the frame held back going up has waited.
+    waited: u32,
     dropped: u32,
     duplicated: u32,
+    /// Frames held back that did go after a later one (not those let go because none
+    /// came).
     reordered: u32,
 }
+
+/// Polls a frame held back going up waits for the next frame up before it goes alone:
+/// 100 polls are 2.56 ms of the machine's time, far less than any timeout of the
+/// gateway's or the kernel's.
+const HOLD_POLLS: u32 = 100;
 
 /// Toward the gateway, toward the machine, and the frames due to the machine next
 /// (duplicates, and frames that were held back).
 type Ways = (Way, Way, VecDeque<Vec<u8>>);
 
 /// A backend between the card and the gateway that drops, duplicates and reorders TCP
-/// frames both ways, by [`fate`]: the same frames every run, no randomness. Other
-/// frames (ARP, DHCP) pass untouched. A frame held back goes after the next one that
-/// way, or at the next poll if none comes.
+/// frames both ways, by [`fate`]: a fixed pattern over the frames' count, no randomness
+/// (which frames it hits still varies a little between runs, since the host's sockets
+/// follow the wall clock). Other frames (ARP, DHCP) pass untouched. A frame held back
+/// goes after the next one that way, or alone if none comes: going down, when a poll
+/// finds no other; going up, after [`HOLD_POLLS`] polls.
 #[derive(Clone)]
 struct Lossy {
     inner: SteppedGateway,
@@ -205,8 +220,8 @@ impl NetBackend for Lossy {
                 return Ok(());
             }
             Fate::Hold if up.held.is_none() => {
-                up.reordered += 1;
                 up.held = Some(frame.to_vec());
+                up.waited = 0;
                 return Ok(());
             }
             Fate::Duplicate => {
@@ -217,6 +232,7 @@ impl NetBackend for Lossy {
         }
         self.inner.send(frame)?;
         if let Some(held) = up.held.take() {
+            up.reordered += 1;
             self.inner.send(&held)?;
         }
         Ok(())
@@ -225,9 +241,12 @@ impl NetBackend for Lossy {
     fn recv(&mut self) -> Option<Vec<u8>> {
         let mut guard = self.ways.lock().unwrap();
         let (up, down, queue) = &mut *guard;
-        // A frame held back going up has waited a whole poll: it goes now.
-        if let Some(held) = up.held.take() {
-            self.inner.send(&held).unwrap();
+        // A frame held back going up that waited long enough for another goes alone.
+        if up.held.is_some() {
+            up.waited += 1;
+            if up.waited >= HOLD_POLLS {
+                self.inner.send(&up.held.take().unwrap()).unwrap();
+            }
         }
         if let Some(next) = queue.pop_front() {
             return Some(next);
@@ -242,10 +261,7 @@ impl NetBackend for Lossy {
             down.count += 1;
             match fate(down.count) {
                 Fate::Drop => down.dropped += 1,
-                Fate::Hold if down.held.is_none() => {
-                    down.reordered += 1;
-                    down.held = Some(frame);
-                }
+                Fate::Hold if down.held.is_none() => down.held = Some(frame),
                 Fate::Duplicate => {
                     down.duplicated += 1;
                     queue.push_back(frame.clone());
@@ -253,6 +269,7 @@ impl NetBackend for Lossy {
                 }
                 _ => {
                     if let Some(held) = down.held.take() {
+                        down.reordered += 1;
                         queue.push_back(held);
                     }
                     return Some(frame);
@@ -448,9 +465,11 @@ fn transfers_survive_lost_duplicated_and_reordered_frames() {
     let lossy = lossy.unwrap();
     client_transfer(&mut vm, 49152, 64 * 1024, 48 * 1024);
     echo_transfers(&mut vm, &fwd[0], 48 * 1024);
+    // Most frames held back go alone (nothing else came that way in time); the few that
+    // went after a later one are the reordering each way.
     for (way, (dropped, duplicated, reordered)) in ["up", "down"].iter().zip(lossy.stats()) {
         assert!(
-            dropped > 10 && duplicated > 5 && reordered > 5,
+            dropped > 10 && duplicated > 5 && reordered >= 3,
             "{way}: {dropped} dropped, {duplicated} duplicated, {reordered} reordered"
         );
     }
@@ -713,6 +732,95 @@ fn finish(vm: &mut Vm, host: &mut Host, prompts: usize) -> String {
     vm.out()
 }
 
+/// A segment the machine sent, with the tick (the kernel's `ticks`) it was sent in.
+type Timed = (u32, Seg);
+
+/// Runs the machine until `done` holds for it and the segments it sent since the last
+/// call, and returns them, each with its tick. The host takes frames at every step, so
+/// the tick is exact, and `answer` replies to each segment as it comes (with the
+/// segments it returns).
+fn timed_until(
+    vm: &mut Vm,
+    host: &mut Host,
+    what: &str,
+    mut answer: impl FnMut(&Seg) -> Vec<Seg>,
+    done: impl Fn(&Vm, &[Timed]) -> bool,
+) -> Vec<Timed> {
+    let ticks = var_addr("ticks");
+    let mut got: Vec<Timed> = host
+        .take()
+        .iter()
+        .filter_map(|f| parse_seg(f))
+        .map(|s| (vm.read_var("ticks"), s))
+        .collect();
+    let mut steps = 0;
+    while !done(vm, &got) {
+        vm.m.run_for(SLICE, &mut |cpu| {
+            host.service();
+            for f in host.take() {
+                if let Some(s) = parse_seg(&f) {
+                    for a in answer(&s) {
+                        host.send(frame(&a));
+                    }
+                    got.push((cpu.bus.read_mem(ticks, 4).unwrap(), s));
+                }
+            }
+        });
+        assert_eq!(
+            vm.m.exit_code(),
+            None,
+            "the kernel stopped:
+{}",
+            vm.out()
+        );
+        steps += SLICE;
+        assert!(
+            steps < MAX_STEPS,
+            "{what}: only {got:?}
+{}",
+            vm.out()
+        );
+    }
+    got
+}
+
+/// The ticks between the segments of `timed` that satisfy `pick`.
+fn gaps(timed: &[Timed], pick: impl Fn(&Seg) -> bool) -> Vec<u32> {
+    let at: Vec<u32> = timed.iter().filter(|(_, s)| pick(s)).map(|&(t, _)| t).collect();
+    at.windows(2).map(|w| w[1] - w[0]).collect()
+}
+
+/// The process id in the shell's "[PID]" line for a background job, if `text` has one.
+fn pid_in(text: &str) -> Option<u32> {
+    text.lines()
+        .find_map(|l| l.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
+}
+
+/// Starts `line` in the background and returns its process id once the shell gave it.
+fn start(vm: &mut Vm, host: &mut Host, line: &str) -> u32 {
+    let before = vm.out().len();
+    vm.type_line(&format!("{line} &"));
+    run_until(&mut [vm], Some(host), |vms| {
+        pid_in(&vms[0].out()[before..]).is_some()
+    });
+    pid_in(&vm.out()[before..]).unwrap()
+}
+
+/// Kills `pid`, a tcptest waiting in a call, and collects it; returns how many ticks that
+/// took, from typing `kill` to the end of `wait`.
+fn kill(vm: &mut Vm, host: &mut Host, pid: u32) -> u32 {
+    let start = vm.read_var("ticks");
+    assert_eq!(command(&mut [vm], 0, Some(host), &format!("kill {pid}")), "");
+    assert_eq!(
+        command(&mut [vm], 0, Some(host), "wait"),
+        format!(
+            "[{pid}] tcptest: exit -1
+"
+        )
+    );
+    vm.read_var("ticks") - start
+}
+
 #[test]
 fn segments_for_no_socket_get_resets_and_malformed_ones_are_counted() {
     let (mut vm, mut host) = hub_vm();
@@ -808,16 +916,19 @@ fn a_listener_handles_the_handshake_resets_syns_and_a_full_backlog() {
         frame(&a(1001, ACK, b"")),
     );
 
-    // Data comes back: acknowledged at once, then echoed by the server.
+    // Data comes back: acknowledged at once, then echoed by the server. Once the
+    // server read the 5 bytes, the window's right edge stays where it was (4091 more
+    // bytes): 5 freed are less than the MSS that would move it (silly window
+    // avoidance).
     let got = segs_until_sent(&mut vm, &mut host, &a(1001, PSH | ACK, b"hello"), |g| {
         g.iter().any(|s| !s.data.is_empty())
     });
-    assert!(got.iter().all(|s| s.ack == 1006 && s.wnd > 0), "{got:?}");
+    assert!(got.iter().all(|s| s.ack == 1006 && s.wnd == 4091), "{got:?}");
     assert_eq!(
         got.last().unwrap(),
-        &seg(7000, 40001, iss + 1, 1006, PSH | ACK, b"hello").with_wnd(4096)
+        &seg(7000, 40001, iss + 1, 1006, PSH | ACK, b"hello").with_wnd(4091)
     );
-    let challenge = seg(7000, 40001, iss + 6, 1006, ACK, b"").with_wnd(4096);
+    let challenge = seg(7000, 40001, iss + 6, 1006, ACK, b"").with_wnd(4091);
     let b = |seq: u32, flags: u8, data: &[u8]| seg(40001, 7000, seq, iss + 6, flags, data);
     quiet(&mut vm, &mut host, "the echo's ACK", frame(&b(1006, ACK, b"")));
 
@@ -845,6 +956,11 @@ fn a_listener_handles_the_handshake_resets_syns_and_a_full_backlog() {
     );
     assert_eq!(
         send(&mut vm, &mut host, &b(1011, PSH | ACK, b"world"), 1),
+        vec![challenge.clone()]
+    );
+    // So is a FIN past a gap, with no data: dropped and counted like data.
+    assert_eq!(
+        send(&mut vm, &mut host, &b(1011, FIN | ACK, b""), 1),
         vec![challenge.clone()]
     );
 
@@ -896,7 +1012,7 @@ fn a_listener_handles_the_handshake_resets_syns_and_a_full_backlog() {
     for (name, n) in [
         ("backlog", 1),
         ("resets", 1),
-        ("out-of-order", 1),
+        ("out-of-order", 2),
         ("no-socket", 2),
     ] {
         assert_eq!(c.remove(name), Some(n), "{name}:\n{ifconfig}");
@@ -968,8 +1084,9 @@ fn connections_close_from_either_side_or_both_and_can_be_refused_or_reset() {
         "the ACK of its FIN",
         frame(&h(7001, ACK, b"")),
     );
-    // Acknowledged on arrival: the 3 bytes are still in the buffer.
-    let last_ack = seg(49152, 80, iss + 102, 7005, ACK, b"").with_wnd(4093);
+    // Acknowledged on arrival, the window's right edge where it was: the 3 bytes and
+    // the FIN took 4 of it.
+    let last_ack = seg(49152, 80, iss + 102, 7005, ACK, b"").with_wnd(4092);
     assert_eq!(
         send(&mut vm, &mut host, &h(7001, FIN | PSH | ACK, b"bye"), 1),
         vec![last_ack.clone()]
@@ -989,7 +1106,7 @@ fn connections_close_from_either_side_or_both_and_can_be_refused_or_reset() {
     );
 
     // Both close at once: the host's FIN comes before the ACK of the guest's, so the
-    // guest goes through CLOSING.
+    // guest goes through CLOSING. (The window's right edge stays put: the FIN took 1.)
     let prompts = vm.prompts();
     let iss = connect(&mut vm, &mut host, 80, 100, 49153).seq;
     let sa = seg(80, 49153, 9000, iss + 1, SYN | ACK, b"").with_mss(1460);
@@ -997,7 +1114,7 @@ fn connections_close_from_either_side_or_both_and_can_be_refused_or_reset() {
     let h = |seq: u32, ack: u32, flags: u8| seg(80, 49153, seq, ack, flags, b"");
     assert_eq!(
         send(&mut vm, &mut host, &h(9001, iss + 101, FIN | ACK), 1),
-        [seg(49153, 80, iss + 102, 9002, ACK, b"").with_wnd(4096)]
+        [seg(49153, 80, iss + 102, 9002, ACK, b"").with_wnd(4095)]
     );
     quiet(
         &mut vm,
@@ -1052,14 +1169,28 @@ fn connections_close_from_either_side_or_both_and_can_be_refused_or_reset() {
 #[test]
 fn unanswered_segments_are_sent_again_then_given_up() {
     let (mut vm, mut host) = hub_vm();
-    // Nobody answers the SYN: it goes 6 times (TCP_SYN_RETRIES more), at doubling
-    // intervals, then connect() fails.
+    // Nobody answers the SYN: it goes 6 times (TCP_SYN_RETRIES more), the timeout
+    // doubling from 1 s (10 ticks) each time, then connect() fails.
     let prompts = vm.prompts();
-    let syn = connect(&mut vm, &mut host, 81, 100, 49152);
-    run_until(&mut [&mut vm], Some(&mut host), |vms| vms[0].prompts() > prompts);
-    let mut got: Vec<Seg> = host.take().iter().filter_map(|f| parse_seg(f)).collect();
-    got.insert(0, syn.clone());
-    assert_eq!(got, vec![syn; 6]);
+    host.take();
+    vm.type_line("tcptest connect 10.0.9.1 81 100");
+    let got = timed_until(
+        &mut vm,
+        &mut host,
+        "the SYNs",
+        |_| vec![],
+        |vm, _| vm.prompts() > prompts,
+    );
+    let syn = got[0].1.clone();
+    assert_eq!(
+        syn,
+        Seg {
+            seq: syn.seq,
+            ..seg(49152, 81, 0, 0, SYN, b"").with_wnd(4096).with_mss(1460)
+        }
+    );
+    assert!(got.iter().all(|(_, s)| *s == syn), "{got:?}");
+    assert_eq!(gaps(&got, |_| true), [10, 20, 40, 80, 160], "{got:?}");
     assert!(
         vm.out().ends_with(
             "10.0.9.2:49152 > 10.0.9.1:81: sent 0, received 0, hash 811c9dc5\n\
@@ -1069,15 +1200,26 @@ fn unanswered_segments_are_sent_again_then_given_up() {
         vm.out()
     );
 
-    // The handshake completes, then the host goes silent: the data (and the FIN with
-    // it) goes 9 times (TCP_RETRIES more), then the connection is reset and given up.
+    // The handshake completes (the SYN-ACK at once, so the round trip measured is
+    // under a tick and the timeout 2 or 3 ticks), then the host goes silent: the data
+    // (and the FIN with it) goes 9 times (TCP_RETRIES more), the timeout doubling each
+    // time, then the connection is reset and given up once the last timeout (up to
+    // 60 s) is over.
     let prompts = vm.prompts();
-    let iss = connect(&mut vm, &mut host, 80, 100, 49153).seq;
-    host.send(frame(
-        &seg(80, 49153, 5000, iss + 1, SYN | ACK, b"").with_mss(1460),
-    ));
-    run_until(&mut [&mut vm], Some(&mut host), |vms| vms[0].prompts() > prompts);
-    let got: Vec<Seg> = host.take().iter().filter_map(|f| parse_seg(f)).collect();
+    host.take();
+    vm.type_line("tcptest connect 10.0.9.1 80 100");
+    let synack = |s: &Seg| {
+        if s.flags & SYN != 0 {
+            vec![seg(80, 49153, 5000, s.seq + 1, SYN | ACK, b"").with_mss(1460)]
+        } else {
+            vec![]
+        }
+    };
+    let timed = timed_until(&mut vm, &mut host, "the data", synack, |vm, _| {
+        vm.prompts() > prompts
+    });
+    let got: Vec<Seg> = timed.iter().map(|(_, s)| s.clone()).collect();
+    let iss = got[0].seq;
     let data: Vec<&Seg> = got.iter().filter(|s| !s.data.is_empty()).collect();
     assert_eq!(data.len(), 9, "{got:?}");
     assert!(
@@ -1085,6 +1227,11 @@ fn unanswered_segments_are_sent_again_then_given_up() {
             .all(|s| s.seq == iss + 1 && s.data == client_pattern(100)),
         "{got:?}"
     );
+    let gaps = gaps(&timed, |s| !s.data.is_empty() || s.flags & RST != 0);
+    let rto = gaps[0];
+    assert!(rto == 2 || rto == 3, "{gaps:?}");
+    let want: Vec<u32> = (0..9).map(|i| (rto << i).min(600)).collect();
+    assert_eq!(gaps, want, "{timed:?}");
     assert_eq!(
         got.last().unwrap(),
         &seg(49153, 80, iss + 102, 0, RST, b"").with_wnd(0),
@@ -1122,22 +1269,32 @@ fn a_zero_window_is_probed_until_it_opens() {
     host.send(raw_frame(&tcp_bytes(HOST_IP, VM_IP, &sa, &opts)));
     sa.mss = None;
     // The handshake's ACK, then probes: one byte past the window, again and again,
-    // each answered by an ACK that takes nothing.
+    // each answered at once by an ACK that takes nothing. They come on the persist
+    // timer, its timeout doubling each time: never a retransmission timeout in between
+    // (which would send nothing into the closed window, and double the timeout twice
+    // per probe).
     let zero = seg(80, 49152, 5001, iss + 1, ACK, b"").with_wnd(0);
-    let mut probes = 0;
-    let mut all = Vec::new();
-    while probes < 3 {
-        let got = segs_until(&mut vm, &mut host, "a probe", |g| {
-            g.iter().any(|s| !s.data.is_empty())
-        });
-        for s in got.iter().filter(|s| !s.data.is_empty()) {
-            assert_eq!((s.seq, s.data.len()), (iss + 1, 1), "{got:?}");
-            probes += 1;
+    let answer = |s: &Seg| {
+        if s.data.is_empty() {
+            vec![]
+        } else {
+            vec![zero.clone()]
         }
-        all.extend(got);
-        host.send(frame(&zero));
+    };
+    let all = timed_until(&mut vm, &mut host, "the probes", answer, |_, g| {
+        g.iter().filter(|(_, s)| !s.data.is_empty()).count() >= 6
+    });
+    for (_, s) in all.iter().filter(|(_, s)| !s.data.is_empty()) {
+        assert_eq!((s.seq, s.data.clone()), (iss + 1, client_pattern(1)), "{all:?}");
     }
-    assert_eq!(all[0], seg(49152, 80, iss + 1, 5001, ACK, b"").with_wnd(4096));
+    assert_eq!(all[0].1, seg(49152, 80, iss + 1, 5001, ACK, b"").with_wnd(4096));
+    // Each probe is answered within the tick it went in or the next, so the gaps are
+    // the doubling timeout, or a tick more.
+    let gaps = gaps(&all, |s| !s.data.is_empty());
+    for w in gaps.windows(2) {
+        assert!(w[1].abs_diff(2 * w[0]) <= 2, "{gaps:?}");
+    }
+    assert!(gaps[4] >= 32, "{gaps:?}");
     // The window opens: everything goes, in segments of the MSS asked for, the FIN
     // with the last.
     let got = segs_until_sent(&mut vm, &mut host, &zero.clone().with_wnd(8192), |g| {
@@ -1155,6 +1312,400 @@ fn a_zero_window_is_probed_until_it_opens() {
     );
     let ifconfig = command(&mut [&mut vm], 0, Some(&mut host), "ifconfig");
     assert_clean(&ifconfig);
+    assert_eq!(counters(&ifconfig)["retransmits"], 0, "{ifconfig}");
+    assert_all_free(&mut vm, Some(&mut host));
+    leave(&mut vm);
+}
+
+#[test]
+fn a_socket_closed_into_a_window_that_stays_shut_is_given_up() {
+    // A peer that offers no window and answers every probe can't keep a socket nobody
+    // holds: its probes count as retries, and after TCP_RETRIES of them the stack
+    // resets the connection and frees the slot. (A socket a process holds is probed
+    // for as long as the peer answers: a_zero_window_is_probed_until_it_opens.)
+    let (mut vm, mut host) = hub_vm();
+    let prompts = vm.prompts();
+    vm.type_line("tcptest serve 7000 1");
+    wait_for(&mut vm, Some(&mut host), "listening on port 7000\n", 1);
+    let syn = seg(40001, 7000, 1000, 0, SYN, b"").with_mss(1460).with_wnd(0);
+    let iss = send(&mut vm, &mut host, &syn, 1)[0].seq;
+    // "hello" and the FIN at once, the window shut: the server reads to the end, puts
+    // its echo in the send buffer (where it stays), closes and is gone.
+    host.take();
+    host.send(frame(
+        &seg(40001, 7000, 1001, iss + 1, PSH | FIN | ACK, b"hello").with_wnd(0),
+    ));
+    let zero = seg(40001, 7000, 1007, iss + 1, ACK, b"").with_wnd(0);
+    let answer = |s: &Seg| {
+        if s.data.is_empty() {
+            vec![]
+        } else {
+            vec![zero.clone()]
+        }
+    };
+    let got = timed_until(&mut vm, &mut host, "the reset", answer, |_, g| {
+        g.iter().any(|(_, s)| s.flags & RST != 0)
+    });
+    assert!(
+        vm.out().ends_with(&format!(
+            "10.0.9.1:40001 > 10.0.9.2:7000: echoed 5, hash {:08x}\n$ ",
+            fnv1a(b"hello")
+        )),
+        "{}",
+        vm.out()
+    );
+    assert!(vm.prompts() > prompts, "{}", vm.out());
+    let probes: Vec<&Seg> = got
+        .iter()
+        .map(|(_, s)| s)
+        .filter(|s| !s.data.is_empty())
+        .collect();
+    assert_eq!(probes.len(), 8, "{got:?}");
+    assert!(
+        probes.iter().all(|s| s.seq == iss + 1 && s.data == b"h"),
+        "{got:?}"
+    );
+    assert_eq!(
+        got.last().unwrap().1,
+        seg(7000, 40001, iss + 1, 0, RST, b"").with_wnd(0)
+    );
+    assert_eq!(vm.read_var("tcp_in_use"), 0);
+    // The probes came on the persist timer alone, doubling.
+    let gaps = gaps(&got, |s| !s.data.is_empty());
+    for w in gaps.windows(2) {
+        assert!(w[1].abs_diff(2 * w[0]) <= 2, "{gaps:?}");
+    }
+    let ifconfig = command(&mut [&mut vm], 0, Some(&mut host), "ifconfig");
+    assert_clean(&ifconfig);
+    assert_eq!(counters(&ifconfig)["retransmits"], 0, "{ifconfig}");
+    assert_all_free(&mut vm, Some(&mut host));
+    leave(&mut vm);
+}
+
+#[test]
+fn sequence_numbers_wrap_around_both_ways() {
+    // The guest's initial sequence number is put 4 KiB below 2^32 (tcp_isn_next) and
+    // the host's 2 KiB below: 8 KiB echoed each way crosses 0 in both directions,
+    // the host's data received across it and the guest's acknowledged across it.
+    let guest_isn = 0xffff_f000u32;
+    let (mut vm, mut host) = hub_vm();
+    vm.write_var("tcp_isn_next", guest_isn);
+    let prompts = vm.prompts();
+    vm.type_line("tcptest serve 7000 1");
+    wait_for(&mut vm, Some(&mut host), "listening on port 7000\n", 1);
+    let isn = 0xffff_f800u32;
+    let sa = send(
+        &mut vm,
+        &mut host,
+        &seg(40001, 7000, isn, 0, SYN, b"").with_mss(1460),
+        1,
+    )
+    .remove(0);
+    assert_eq!((sa.seq, sa.ack), (guest_isn, isn + 1));
+
+    // The host: sends what the guest's window lets it, acknowledges what comes back,
+    // sends its FIN once all its data is acknowledged, until the guest's FIN.
+    let data = host_pattern(8192, 9);
+    let end = isn.wrapping_add(1 + data.len() as u32);
+    assert!(end < isn, "the host's numbers wrap");
+    let (mut snd_una, mut snd_nxt, mut wnd) = (isn + 1, isn + 1, u32::from(sa.wnd));
+    let mut rcv_nxt = guest_isn + 1;
+    let mut echo = Vec::new();
+    let (mut fin_sent, mut guest_fin) = (false, false);
+    let mut steps = 0;
+    host.take();
+    while !(guest_fin && snd_una == end.wrapping_add(1)) {
+        while !fin_sent && snd_nxt != end && snd_nxt.wrapping_sub(snd_una) < wnd {
+            let off = snd_nxt.wrapping_sub(isn + 1) as usize;
+            let room = (wnd - snd_nxt.wrapping_sub(snd_una)) as usize;
+            let n = room.min(1000).min(data.len() - off);
+            let s = seg(40001, 7000, snd_nxt, rcv_nxt, PSH | ACK, &data[off..off + n]);
+            host.send(frame(&s));
+            snd_nxt = snd_nxt.wrapping_add(n as u32);
+        }
+        if snd_una == end && !fin_sent {
+            host.send(frame(&seg(40001, 7000, end, rcv_nxt, FIN | ACK, b"")));
+            snd_nxt = end.wrapping_add(1);
+            fin_sent = true;
+        }
+        vm.m.run_for(SLICE, &mut |_| {});
+        host.service();
+        let mut ack = false;
+        for s in host.take().iter().filter_map(|f| parse_seg(f)) {
+            let acked = s.ack.wrapping_sub(snd_una);
+            if s.flags & ACK != 0 && acked <= snd_nxt.wrapping_sub(snd_una) {
+                snd_una = s.ack;
+                wnd = u32::from(s.wnd);
+            }
+            if !s.data.is_empty() || s.flags & FIN != 0 {
+                if s.seq == rcv_nxt {
+                    echo.extend_from_slice(&s.data);
+                    rcv_nxt = rcv_nxt.wrapping_add(s.data.len() as u32);
+                    if s.flags & FIN != 0 {
+                        rcv_nxt = rcv_nxt.wrapping_add(1);
+                        guest_fin = true;
+                    }
+                }
+                ack = true;
+            }
+        }
+        if ack {
+            host.send(frame(&seg(40001, 7000, snd_nxt, rcv_nxt, ACK, b"")));
+        }
+        steps += SLICE;
+        assert!(
+            steps < MAX_STEPS,
+            "stuck at {snd_una:#x}/{rcv_nxt:#x}:\n{}",
+            vm.out()
+        );
+    }
+    assert_same(&echo, &data, "the echo");
+    assert_eq!(rcv_nxt, guest_isn.wrapping_add(8192 + 2));
+    let out = finish(&mut vm, &mut host, prompts);
+    assert!(
+        out.ends_with(&format!(
+            "10.0.9.1:40001 > 10.0.9.2:7000: echoed 8192, hash {:08x}\n$ ",
+            fnv1a(&data)
+        )),
+        "{out}"
+    );
+    let ifconfig = command(&mut [&mut vm], 0, Some(&mut host), "ifconfig");
+    assert_clean(&ifconfig);
+    assert_eq!(counters(&ifconfig)["retransmits"], 0, "{ifconfig}");
+    assert_all_free(&mut vm, Some(&mut host));
+    leave(&mut vm);
+}
+
+#[test]
+fn blocked_calls_end_when_the_process_is_killed() {
+    // accept(), connect(), send() and recv() wait in the kernel; a process killed
+    // while it waits ends at once (-EINTR), long before any TCP timer would have
+    // ended the wait, and leaves no socket behind.
+    let (mut vm, mut host) = hub_vm();
+
+    // accept(): nobody connects.
+    let pid = start(&mut vm, &mut host, "tcptest serve 7000 1");
+    wait_for(&mut vm, Some(&mut host), "listening on port 7000\n", 1);
+    let took = kill(&mut vm, &mut host, pid);
+    assert!(took < 20, "{took} ticks");
+    assert_eq!(vm.read_var("tcp_in_use"), 0);
+    // The listener went with it.
+    assert_eq!(
+        send(&mut vm, &mut host, &seg(40001, 7000, 1000, 0, SYN, b""), 1),
+        [seg(7000, 40001, 0, 1001, RST | ACK, b"").with_wnd(0)]
+    );
+
+    // connect(): nobody answers the SYN (the first time it would go again is in 10
+    // ticks, the last wait would end in 310).
+    host.take();
+    let pid = start(&mut vm, &mut host, "tcptest connect 10.0.9.1 81 100");
+    let iss = segs_until(&mut vm, &mut host, "the SYN", |g| !g.is_empty())[0].seq;
+    let took = kill(&mut vm, &mut host, pid);
+    assert!(took < 20, "{took} ticks");
+    assert_eq!(vm.read_var("tcp_in_use"), 0);
+    // The connection went with it: a late SYN-ACK finds none.
+    let sa = seg(81, 49152, 5000, iss + 1, SYN | ACK, b"");
+    assert_eq!(
+        send(&mut vm, &mut host, &sa, 1),
+        [seg(49152, 81, iss + 1, 0, RST, b"").with_wnd(0)]
+    );
+
+    // send() with the peer's window shut and the send buffer full, recv() with nothing
+    // to read: closing_with_data_unread_resets_and_an_orphan_in_fin_wait_2_ends.
+    let ifconfig = command(&mut [&mut vm], 0, Some(&mut host), "ifconfig");
+    let mut c = counters(&ifconfig);
+    assert_eq!(c.remove("no-socket"), Some(2), "{ifconfig}");
+    assert!(c.values().all(|&n| n == 0), "{ifconfig}");
+    assert_all_free(&mut vm, Some(&mut host));
+    leave(&mut vm);
+}
+
+#[test]
+fn closing_with_data_unread_resets_and_an_orphan_in_fin_wait_2_ends() {
+    let (mut vm, mut host) = hub_vm();
+
+    // The server, killed while it waits in send(), with data it has not read: its
+    // close resets the connection, so the peer can't think that data was taken. The
+    // host keeps its window shut, so the echo stays in the send buffer: 4 KiB fill it,
+    // and of the 1000 bytes more, the server reads 512 and waits to send them.
+    let pid = start(&mut vm, &mut host, "tcptest serve 7000 1");
+    wait_for(&mut vm, Some(&mut host), "listening on port 7000\n", 1);
+    let syn = seg(40001, 7000, 1000, 0, SYN, b"").with_mss(1460).with_wnd(0);
+    let iss = send(&mut vm, &mut host, &syn, 1)[0].seq;
+    let data = host_pattern(4096 + 1000, 6);
+    let h = |seq: u32, data: &[u8]| seg(40001, 7000, seq, iss + 1, PSH | ACK, data).with_wnd(0);
+    host.take();
+    for (off, n) in [(0, 1460), (1460, 1460), (2920, 1176)] {
+        host.send(frame(&h(1001 + off, &data[off as usize..(off + n) as usize])));
+    }
+    // Read, the window opens again (the threshold: an MSS).
+    segs_until(&mut vm, &mut host, "the window update", |g| {
+        g.iter().any(|s| s.ack == 1001 + 4096 && s.wnd >= 1460)
+    });
+    host.take();
+    host.send(frame(&h(1001 + 4096, &data[4096..])));
+    segs_until(&mut vm, &mut host, "the ACK", |g| {
+        g.iter().any(|s| s.ack == 1001 + 5096)
+    });
+    for _ in 0..20 {
+        vm.m.run_for(SLICE, &mut |_| {});
+        host.service();
+    }
+    host.take();
+    let took = kill(&mut vm, &mut host, pid);
+    assert!(took < 20, "{took} ticks");
+    let got: Vec<Seg> = host.take().iter().filter_map(|f| parse_seg(f)).collect();
+    let rst = got
+        .iter()
+        .find(|s| s.flags & RST != 0)
+        .unwrap_or_else(|| panic!("{got:?}"));
+    assert_eq!(
+        (rst.sport, rst.dport, rst.flags, rst.ack),
+        (7000, 40001, RST, 0),
+        "{got:?}"
+    );
+    assert_eq!(vm.read_var("tcp_in_use"), 0);
+
+    // The client, killed in recv() in FIN-WAIT-2 (its FIN acknowledged, the host's
+    // not sent): the stack finishes the close on its own, and data that comes now
+    // gets a reset, since nobody will ever read it.
+    let fin_wait_2 = |vm: &mut Vm, host: &mut Host, lport: u16| {
+        host.take();
+        let pid = start(vm, host, "tcptest connect 10.0.9.1 80 100");
+        let iss = segs_until(vm, host, "the SYN", |g| !g.is_empty())[0].seq;
+        let sa = seg(80, lport, 7000, iss + 1, SYN | ACK, b"").with_mss(1460);
+        segs_until_sent(vm, host, &sa, |g| g.iter().any(|s| s.flags & FIN != 0));
+        let ack = seg(80, lport, 7001, iss + 102, ACK, b"");
+        quiet(vm, host, "the ACK of its FIN", frame(&ack));
+        (pid, iss)
+    };
+    let (pid, iss) = fin_wait_2(&mut vm, &mut host, 49152);
+    let took = kill(&mut vm, &mut host, pid);
+    assert!(took < 20, "{took} ticks");
+    assert_eq!(vm.read_var("tcp_in_use"), 1);
+    assert_eq!(
+        send(
+            &mut vm,
+            &mut host,
+            &seg(80, 49152, 7001, iss + 102, PSH | ACK, b"late"),
+            1
+        ),
+        [seg(49152, 80, iss + 102, 0, RST, b"").with_wnd(0)]
+    );
+    assert_eq!(vm.read_var("tcp_in_use"), 0);
+
+    // Again, but nothing more comes: the stack waits TCP_FIN_TIMEOUT (600 ticks) from
+    // the close for the host's FIN, then frees the slot without a word.
+    let (pid, _) = fin_wait_2(&mut vm, &mut host, 49153);
+    let before = vm.read_var("ticks");
+    let took = kill(&mut vm, &mut host, pid);
+    let got = timed_until(
+        &mut vm,
+        &mut host,
+        "the end of FIN-WAIT-2",
+        |_| vec![],
+        |vm, _| vm.read_var("tcp_in_use") == 0,
+    );
+    assert!(got.is_empty(), "{got:?}");
+    let ended = vm.read_var("ticks") - before;
+    assert!(
+        (600..=602 + took).contains(&ended),
+        "{ended} ticks, the kill {took}"
+    );
+
+    let ifconfig = command(&mut [&mut vm], 0, Some(&mut host), "ifconfig");
+    let c = counters(&ifconfig);
+    for name in [
+        "tcp",
+        "tcp-checksum",
+        "no-socket",
+        "backlog",
+        "out-of-order",
+        "resets",
+    ] {
+        assert_eq!(c[name], 0, "{name}:\n{ifconfig}");
+    }
+    assert_all_free(&mut vm, Some(&mut host));
+    leave(&mut vm);
+}
+
+#[test]
+fn silly_windows_are_avoided_both_ways() {
+    let (mut vm, mut host) = hub_vm();
+
+    // Sending: once the host offered 4 KiB, a window of 300 bytes is too small for a
+    // segment that does not end the data queued (under half the largest window
+    // offered): nothing goes until the persist timer forces it.
+    let prompts = vm.prompts();
+    let iss = connect(&mut vm, &mut host, 80, 10_000, 49152).seq;
+    let sa = seg(80, 49152, 5000, iss + 1, SYN | ACK, b"")
+        .with_mss(1460)
+        .with_wnd(4096);
+    segs_until_sent(&mut vm, &mut host, &sa, |g| assemble(g, iss + 1).len() >= 4096);
+    let before = vm.read_var("ticks");
+    host.take();
+    host.send(frame(
+        &seg(80, 49152, 5001, iss + 1 + 4096, ACK, b"").with_wnd(300),
+    ));
+    let got = timed_until(
+        &mut vm,
+        &mut host,
+        "the forced segment",
+        |_| vec![],
+        |_, g| g.iter().any(|(_, s)| !s.data.is_empty()),
+    );
+    let (at, s) = got.iter().find(|(_, s)| !s.data.is_empty()).unwrap();
+    assert_eq!((s.seq, s.data.len()), (iss + 1 + 4096, 300), "{got:?}");
+    assert!(at - before >= 2, "{got:?} from tick {before}");
+    host.send(frame(&seg(80, 49152, 5001, 0, RST, b"")));
+    let out = finish(&mut vm, &mut host, prompts);
+    assert!(
+        out.ends_with("tcptest: connection reset\ntcptest: exit 1\n$ "),
+        "{out}"
+    );
+
+    // Receiving: the host fills the 4 KiB window; as tcptest reads, the guest says the
+    // window opened on its own (the host sends nothing more, and has nothing to probe
+    // with), once it opened by the threshold, an MSS here.
+    let prompts = vm.prompts();
+    let iss = connect(&mut vm, &mut host, 80, 0, 49153).seq;
+    let sa = seg(80, 49153, 7000, iss + 1, SYN | ACK, b"").with_mss(1460);
+    segs_until_sent(&mut vm, &mut host, &sa, |g| g.iter().any(|s| s.flags & FIN != 0));
+    let data = host_pattern(4096, 7);
+    host.take();
+    for (off, n) in [(0, 1460), (1460, 1460), (2920, 1176)] {
+        let s = seg(
+            80,
+            49153,
+            7001 + off,
+            iss + 2,
+            PSH | ACK,
+            &data[off as usize..(off + n) as usize],
+        );
+        host.send(frame(&s));
+    }
+    let end = 7001 + 4096;
+    let got = segs_until(&mut vm, &mut host, "the window update", |g| {
+        g.iter().any(|s| s.ack == end && s.wnd > 0)
+    });
+    let first = got.iter().find(|s| s.ack == end).unwrap();
+    assert_eq!(first.wnd, 0, "{got:?}");
+    let update = got.last().unwrap();
+    assert!(update.data.is_empty() && update.wnd >= 1460, "{got:?}");
+    send(
+        &mut vm,
+        &mut host,
+        &seg(80, 49153, end, iss + 2, FIN | ACK, b""),
+        1,
+    );
+    let out = finish(&mut vm, &mut host, prompts);
+    assert!(
+        out.ends_with(&format!(
+            "10.0.9.2:49153 > 10.0.9.1:80: sent 0, received 4096, hash {:08x}\n$ ",
+            fnv1a(&data)
+        )),
+        "{out}"
+    );
     assert_all_free(&mut vm, Some(&mut host));
     leave(&mut vm);
 }

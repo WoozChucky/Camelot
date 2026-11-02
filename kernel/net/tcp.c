@@ -22,8 +22,8 @@
  *   ACK), and a SYN on a synchronized connection gets one too.
  * - Fixed buffers: a page each way per connection. The send buffer keeps
  *   what was sent until it is acknowledged; the receive buffer keeps what
- *   came in order until it is read, and the window offered is its free
- *   room, so a peer can never send more than fits.
+ *   came in order until it is read, and the window offered is never more
+ *   than its free room, so a peer can never send more than fits.
  * - Segments that arrive out of order are dropped (the next one expected is
  *   acknowledged again, and the peer resends): no reassembly queue. No SACK,
  *   no window scaling, no urgent data, no delayed ACKs (every segment with
@@ -36,7 +36,8 @@
  *   given up. A timeout sends everything again from the oldest byte not
  *   acknowledged ("go back N"), which is what a receiver that drops what
  *   arrives out of order needs. A zero window is probed with one byte on
- *   the same timer.
+ *   the same timer; a socket nobody holds is given up after as many probes
+ *   as retries, so a peer that keeps its window closed can't keep the slot.
  * - Initial sequence numbers as RFC 6528 says: a clock that ticks every 4
  *   microseconds plus a keyed hash of the connection's addresses and ports.
  *
@@ -102,6 +103,7 @@ static bool seq_ge(u32 a, u32 b) {
  * finalizer: well spread, not cryptographic. */
 static u32 isn_key[4];
 static bool isn_keyed;
+u32 tcp_isn_next;
 
 static u32 mix32(u32 h) {
     h ^= h >> 16;
@@ -113,6 +115,11 @@ static u32 mix32(u32 h) {
 }
 
 static u32 isn(u32 laddr, u32 lport, u32 raddr, u32 rport) {
+    if (tcp_isn_next != 0) {
+        u32 n = tcp_isn_next; /* a test's (net.h) */
+        tcp_isn_next = 0;
+        return n;
+    }
     if (!isn_keyed) {
         u32 seed = net_now() ^ (ticks << 16);
         for (u32 i = 0; i < 4; i++) {
@@ -169,9 +176,30 @@ static int ring_out(const u8 *ring, u32 at, pagetable_t pt, u32 dst, u32 n) {
     return 0;
 }
 
-/* Room left in the receive buffer: the window to offer. */
+/* Room left in the receive buffer. */
 static u32 rcv_space(const struct tcp_sock *s) {
     return s->rbuf != NULL ? TCP_BUF - s->rlen : 0;
+}
+
+/* How much the receive window must grow before it is offered: a segment's
+ * worth or half the buffer, whichever is less (RFC 9293 3.8.6.2.2). */
+static u32 rcv_threshold(const struct tcp_sock *s) {
+    return MIN(TCP_BUF / 2, s->mss);
+}
+
+/* The window to offer (receiver-side silly window avoidance): the room in
+ * the buffer once it reaches past the right edge last advertised (rcv_adv)
+ * by the threshold; until then the edge stays where it was, so a peer is
+ * never told of a few bytes freed at a time. The edge never moves left: the
+ * room is at least what is left of the window last offered, since the peer
+ * sent no more than that. */
+static u32 rcv_wnd(const struct tcp_sock *s) {
+    u32 space = rcv_space(s);
+    u32 left = seq_gt(s->rcv_adv, s->rcv_nxt) ? s->rcv_adv - s->rcv_nxt : 0;
+    if (space >= left + rcv_threshold(s)) {
+        return space;
+    }
+    return MIN(left, space);
 }
 
 static bool get_buffers(struct tcp_sock *s) {
@@ -333,7 +361,7 @@ static int xmit(u32 src, u32 sport, u32 dst, u32 dport, u32 seq, u32 ack, u32 fl
  * of everything received), sequence number `seq`, and the `len` bytes of
  * the send buffer that start at `seq`. Every segment offers the window. */
 static int send_seg(struct tcp_sock *s, u32 flags, u32 seq, u32 len) {
-    u32 wnd = rcv_space(s);
+    u32 wnd = rcv_wnd(s);
     u32 ack = 0;
     if (flags & TH_ACK) {
         ack = s->rcv_nxt;
@@ -633,6 +661,7 @@ static void listen_input(struct tcp_sock *l, const struct seg *g) {
     l->queued++;
     c->irs = g->seq;
     c->rcv_nxt = g->seq + 1;
+    c->rcv_adv = c->rcv_nxt;
     c->mss = peer_mss(g);
     c->snd_wnd = g->wnd;
     c->max_wnd = g->wnd;
@@ -670,6 +699,7 @@ static void syn_sent_input(struct tcp_sock *s, const struct seg *g) {
     }
     s->irs = g->seq;
     s->rcv_nxt = g->seq + 1;
+    s->rcv_adv = s->rcv_nxt;
     s->mss = peer_mss(g);
     if (ack_ok) {
         acked(s, g->ack);
@@ -820,8 +850,22 @@ static void sync_input(struct tcp_sock *s, struct seg *g) {
     if (seq_le(s->snd_una, g->ack)) {
         update_window(s, g);
         if (g->ack == s->snd_una && g->wnd == 0) {
-            /* The peer is there, its buffer full: not a lost segment. */
-            s->retries = 0;
+            /* The peer is there, its buffer full: not a lost segment. (A
+             * socket nobody holds keeps counting: see timeout().) */
+            if (s->owned) {
+                s->retries = 0;
+            }
+            if (s->snd_wnd == 0 && seq_lt(s->snd_una, s->snd_nxt) && seq_lt(s->snd_una, s->sseq + s->slen)) {
+                /* Data went past the closed window (a probe's byte) and
+                 * was not taken: back to probing on the persist timer, at
+                 * the timeout the probe doubled. Left to the retransmission
+                 * timer, it would go off, send nothing into the zero
+                 * window, and only then start the persist timer. */
+                s->snd_nxt = s->snd_una;
+                s->timing = false;
+                s->persist = true;
+                s->retx = s->rto;
+            }
         }
     }
     if (seq_lt(s->snd_una, g->ack)) {
@@ -857,7 +901,13 @@ static void sync_input(struct tcp_sock *s, struct seg *g) {
         }
     }
 
-    /* 6. The FIN, once everything before it is in. */
+    /* 6. The FIN, once everything before it is in. One past a gap with no
+     * data is dropped like data past a gap (take_data()): counted, and the
+     * ACK says what is missing. */
+    if ((g->flags & TH_FIN) && g->len == 0 && seq_gt(g->seq, s->rcv_nxt)) {
+        net_stats.tcp_out_of_order++;
+        s->ack_now = true;
+    }
     if ((g->flags & TH_FIN) && all_taken && g->seq + g->len == s->rcv_nxt) {
         s->rcv_nxt++;
         s->fin_rcvd = true;
@@ -954,10 +1004,22 @@ void tcp_input(struct pbuf *p, u32 src, u32 dst, const u8 *t, u32 len) {
 
 /* The retransmission timer went off: send again everything from the
  * oldest byte not acknowledged (or the SYN), doubling the timeout; give up
- * after too many tries. The persist timer probes the window instead. */
+ * after too many tries. The persist timer probes the window instead, for
+ * as long as the peer answers, unless nobody holds the socket: then the
+ * probes count as retries (and only an acknowledgment of new data starts
+ * them over), so a peer that keeps its window closed for good can't keep
+ * the slot. */
 static void timeout(struct tcp_sock *s) {
     if (s->persist) {
         s->persist = false;
+        if (!s->owned) {
+            if (s->retries >= TCP_RETRIES) {
+                send_rst(s);
+                closed(s, -ETIMEDOUT);
+                return;
+            }
+            s->retries++;
+        }
         s->rto = MIN(s->rto * 2, TCP_RTO_MAX);
         output(s, true);
         return;
@@ -1169,7 +1231,7 @@ static void window_update(struct tcp_sock *s) {
         return;
     }
     u32 edge = s->rcv_nxt + rcv_space(s);
-    if (seq_ge(edge, s->rcv_adv + MIN(TCP_BUF / 2, s->mss))) {
+    if (seq_ge(edge, s->rcv_adv + rcv_threshold(s))) {
         send_ack(s);
     }
 }

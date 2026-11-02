@@ -360,7 +360,8 @@ void udp_input(struct pbuf *p, u32 src, u32 dst, const u8 *udp, u32 len);
  * starts at TCP_RTO_INITIAL, follows the measured round trip within
  * TCP_RTO_MIN and TCP_RTO_MAX and doubles at each timeout; a SYN is sent
  * TCP_SYN_RETRIES more times, any other segment TCP_RETRIES more, before
- * the connection is given up (-ETIMEDOUT). TIME-WAIT lasts TCP_TIME_WAIT
+ * the connection is given up (-ETIMEDOUT); a socket nobody holds is given
+ * up after TCP_RETRIES probes of a zero window too. TIME-WAIT lasts TCP_TIME_WAIT
  * (2 MSL), and a connection closed by its owner waits at most
  * TCP_FIN_TIMEOUT in FIN-WAIT-2 for the peer's FIN. */
 #define TCP_RTO_INITIAL 10 /* 1 s */
@@ -450,7 +451,8 @@ struct tcp_sock {
     u32 rtt_seq;
     u32 rtt_start;
     u32 retx;
-    u32 retries;
+    u32 retries; /* timeouts in a row; for a socket nobody holds, persist
+                  * probes too */
     u32 linger;
 };
 
@@ -521,6 +523,11 @@ void tcp_timer(void);
 
 /* Sockets in use, for the tests (`tcp_in_use` in kernel.elf). */
 extern u32 tcp_in_use;
+
+/* For the tests only: when not 0, the initial sequence number of the next
+ * connection, which then sets it back to 0 (kernel_tcp.rs puts one just
+ * below 2^32 to see the numbers wrap). */
+extern u32 tcp_isn_next;
 
 /* ---- DHCP (dhcp.c) ---- */
 
