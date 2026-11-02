@@ -86,19 +86,37 @@ void vm_print_mapping(pagetable_t pt, u32 va);
 pagetable_t vm_active_pagetable(void);
 
 /* User address spaces (spec section 10, "Kernel processes"). User space is
- * the low 4 MiB, root entry 0: the program from USER_BASE (page 0 stays
- * unmapped, so a null pointer faults), the stack in the last page below
- * USER_TOP, and an unmapped guard page under it. Every other root entry is a
- * copy of the kernel's, so the kernel's mappings (none with U) are there in
- * every process and a trap from U-mode needs no satp switch. */
+ * the low 192 MiB, root entries 0 to 47, up to the PLIC, the lowest device
+ * the kernel uses (the test device and the CLINT below it are M-mode's):
+ *
+ *   USER_TOP          0x0c000000
+ *                     the stack, grown down on demand (proc_grow_stack),
+ *                     at most USER_STACK_MAX
+ *   USER_STACK_LIMIT  0x0b800000
+ *                     an unmapped guard page
+ *   USER_LOAD_TOP     0x0b7ff000
+ *                     the heap (sbrk), up from the program
+ *                     the program's segments, from USER_BASE
+ *   USER_BASE         0x00001000
+ *                     page 0, never mapped, so a null pointer faults
+ *
+ * Every other root entry is a copy of the kernel's, so the kernel's mappings
+ * (none with U) are there in every process and a trap from U-mode needs no
+ * satp switch. */
 #define USER_BASE PGSIZE
-#define USER_TOP 0x00400000u
-#define USER_STACK_SIZE PGSIZE
-#define USER_STACK (USER_TOP - USER_STACK_SIZE)
-/* Program segments end at or below this: one guard page under the stack. */
-#define USER_LOAD_TOP (USER_STACK - PGSIZE)
+#define USER_TOP 0x0c000000u
+/* How far the stack may grow: Linux's default limit. */
+#define USER_STACK_MAX (8u << 20)
+/* The stack's lowest address: it never grows below this. */
+#define USER_STACK_LIMIT (USER_TOP - USER_STACK_MAX)
+/* The stack's first page, mapped when the program starts, with its
+ * arguments at the top. */
+#define USER_STACK (USER_TOP - PGSIZE)
+/* Program segments and the heap end at or below this: one guard page under
+ * the stack's limit. */
+#define USER_LOAD_TOP (USER_STACK_LIMIT - PGSIZE)
 /* Root entries that belong to user space (VPN[1] of USER_TOP). */
-#define USER_ROOT_ENTRIES 1
+#define USER_ROOT_ENTRIES (USER_TOP >> 22)
 
 /* A page table for a new process: the kernel's root entries from
  * USER_ROOT_ENTRIES on (sharing its second-level tables), nothing in user

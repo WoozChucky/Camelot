@@ -3,9 +3,8 @@
  * system calls the ifconfig and ping programs use (netinfo, netconf, ping;
  * docs/camelot-syscalls.md). The socket calls are in socket.c. */
 #include "net.h"
-#include "clint.h"
+#include "riscv.h"
 #include "kprintf.h"
-#include "mmio.h"
 #include "nic.h"
 #include "proc.h"
 #include "timer.h"
@@ -150,7 +149,7 @@ void net_wakeup(void) {
 }
 
 u32 net_now(void) {
-    return mmio_read32(CLINT_MTIME_LO);
+    return r_time();
 }
 
 u32 net_usec(u32 delta) {

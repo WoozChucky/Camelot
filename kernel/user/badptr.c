@@ -8,11 +8,12 @@
  * or without a filesystem. */
 #include "user.h"
 
-/* User space (kernel/include/vm.h): the stack is its last page, with an
- * unmapped guard page under it. */
-#define USER_TOP 0x00400000u
+/* User space (kernel/include/vm.h): the stack grows down from USER_TOP to
+ * at most USER_STACK_LIMIT, with an unmapped guard page under that. */
+#define USER_TOP 0x0c000000u
+#define USER_STACK_LIMIT 0x0b800000u
 #define PAGE 0x1000u
-#define GUARD (USER_TOP - 2 * PAGE)
+#define GUARD (USER_STACK_LIMIT - PAGE)
 /* The kernel's first page: mapped in every process, but without U. */
 #define KERNEL 0x80000000u
 
@@ -34,7 +35,7 @@ int main(void) {
         (char *)KERNEL,           /* kernel memory */
         (char *)0,                /* page 0: never mapped */
         (char *)(USER_TOP - 2),   /* the last two bytes of the stack, then past the end */
-        (char *)(GUARD + PAGE - 4), /* the guard page under the stack */
+        (char *)(GUARD + PAGE - 4), /* the guard page under the stack's limit */
     };
     for (int i = 0; i < 4; i++) {
         expect(write(STDOUT, bad[i], 4), -EFAULT);           /* cases 1, 3, 5, 7 */

@@ -2112,11 +2112,17 @@ fn kernel_asm_is_merlin_dialect() {
 
 // ---- Processes: U-mode, page tables, the scheduler, the system calls ----
 
-/// The top of user space and the stack page under it (kernel/include/vm.h).
-const USER_TOP: u32 = 0x40_0000;
+/// The top of user space and the stack's first page under it
+/// (kernel/include/vm.h).
+const USER_TOP: u32 = 0x0c00_0000;
 const USER_STACK: u32 = USER_TOP - PAGE;
-/// Where program segments must end: below the guard page under the stack.
-const USER_LOAD_TOP: u32 = USER_STACK - PAGE;
+/// The stack's lowest address: it grows down to here at most.
+const USER_STACK_LIMIT: u32 = USER_TOP - (8 << 20);
+/// Where program segments and the heap must end: below the guard page
+/// under the stack's limit.
+const USER_LOAD_TOP: u32 = USER_STACK_LIMIT - PAGE;
+/// The root entries of user space (`USER_ROOT_ENTRIES`).
+const USER_ROOT_ENTRIES: u32 = USER_TOP >> 22;
 /// Where user programs start (kernel/user/user.ld): crt0's `_start`.
 const USER_TEXT: u32 = 0x1000;
 /// `sizeof(struct trap_frame)` (kernel/include/trap.h).
@@ -2372,9 +2378,9 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
     let satp = c.csr.satp;
     let ksatp = kernel_satp(&m, &elf);
     assert_ne!(satp, ksatp);
-    // Root entries 1-1023 are the kernel's: the same second-level tables.
+    // Root entries 48-1023 are the kernel's: the same second-level tables.
     let (root, kroot) = ((satp & 0x3f_ffff) * PAGE, (ksatp & 0x3f_ffff) * PAGE);
-    for i in 1..1024 {
+    for i in USER_ROOT_ENTRIES..1024 {
         assert_eq!(
             m.cpu.bus.peek(root + 4 * i),
             m.cpu.bus.peek(kroot + 4 * i),
@@ -2382,15 +2388,14 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
         );
     }
     // User space: ding's segments, each page with U and the segment's
-    // permissions, and the stack (R+W); nothing at page 0, in the guard page
-    // under the stack or, with an empty heap, anywhere else. Everything above
-    // is the kernel's, none of it with U.
+    // permissions, and the stack's first page (R+W); nothing at page 0, in
+    // the guard page under the stack's limit or, with an empty heap and a
+    // stack that has not grown, anywhere else. Everything above is the
+    // kernel's, none of it with U.
     let ding = user_program("ding");
     let want = expected_user_pages(&ding.elf);
     assert_eq!(want[0], (USER_TEXT, PTE_V | PTE_U | PTE_R | PTE_X));
-    assert!(want
-        .iter()
-        .all(|&(va, _)| va >= USER_TEXT && va != USER_STACK - PAGE));
+    assert!(want.iter().all(|&(va, _)| va >= USER_TEXT && va != USER_LOAD_TOP));
     assert_eq!(user_pages(&m, satp), want);
     let (leaves, tables, megapages) = page_table(&m, satp);
     let (kleaves, ktables, kmegapages) = page_table(&m, ksatp);
@@ -2402,16 +2407,18 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
         .collect();
     assert_eq!(kernel_part, kernel_all);
     assert!(kernel_part.iter().all(|(_, pte)| pte & PTE_U == 0));
-    // The kernel's own root[0] (the test device) is not in the process's.
+    // The kernel's own root entries below USER_TOP (the test device and the
+    // CLINT, which only M-mode uses) are not in the process's.
     assert!(kleaves.iter().any(|(va, _)| *va < USER_TOP));
     // User pages are fresh pages in free RAM.
     for (va, pte) in leaves.iter().filter(|(va, _)| *va < USER_TOP) {
         let pa = (pte >> 10) * PAGE;
         assert!(pa >= sym(&elf, "__kernel_end"), "{va:#x} at {pa:#x}");
     }
-    // Its own root, one table for user space where the kernel has its root[0]
-    // table, and the kernel's other second-level tables and megapages, shared:
-    // as many as the kernel's.
+    // Its own root, two tables for user space (its segments' and its
+    // stack's) where the kernel has two for the test device and the CLINT,
+    // and the kernel's other second-level tables and megapages, shared: as
+    // many as the kernel's.
     assert_eq!((tables, megapages), (ktables, kmegapages));
 }
 
@@ -2751,6 +2758,73 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
     assert!(!out.contains("panic"), "{out}");
 }
 
+/// Runs `commands` (each a line) on the committed kernel booted on a machine
+/// with `ram_mib` MiB of RAM, checking after each that every page the
+/// command's process had is free again. Returns the output.
+fn run_counting_pages(ram_mib: usize, commands: &[&str]) -> String {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(MachineConfig::with_ram(ram_mib << 20), Some(rx));
+    step_to_prompt(&mut m, 1);
+    let before = free_pages(&m, &elf);
+    for (i, line) in commands.iter().enumerate() {
+        for b in line.bytes().chain(*b"\n") {
+            tx.send(b).unwrap();
+        }
+        step_to_prompt(&mut m, i + 2);
+        assert_eq!(
+            free_pages(&m, &elf),
+            before,
+            "{line} on {ram_mib} MiB:\n{}",
+            printed(&m)
+        );
+    }
+    printed(&m)
+}
+
+#[test]
+fn the_user_stack_grows_on_demand_and_the_heap_past_4_mib() {
+    // spacetest: a stack of 200 KiB, a system call into a stack frame not
+    // touched yet, and the pointer checks over the new layout (vm.h).
+    // On the default 4 MiB, a stack overflow runs out of RAM before it
+    // reaches the stack's limit: said, then killed, and the kernel carries on.
+    let out = run_counting_pages(4, &["spacetest", "spacetest overflow", "echo alive"]);
+    assert_eq!(
+        command_output(&out, "spacetest"),
+        ["spacetest: 14 checks, 0 failed"]
+    );
+    let overflow = command_output(&out, "spacetest overflow");
+    assert!(
+        overflow[0].starts_with("pid ")
+            && overflow[0].contains(" (spacetest): no memory to grow its stack to 0x0b"),
+        "{out}"
+    );
+    assert!(
+        overflow[1].ends_with("(spacetest) killed: store page fault"),
+        "{out}"
+    );
+    assert_eq!(command_output(&out, "echo alive"), ["alive"]);
+
+    // With 16 MiB: a 6 MiB heap, past the old 4 MiB of user space, every
+    // page written, then given back; and an overflow that reaches the guard
+    // page under the stack's 8 MiB. (Every new page is cleared byte by byte,
+    // so bigger ones cost the test hundreds of millions of steps.)
+    let out = run_counting_pages(16, &["spacetest heap 6", "spacetest overflow", "echo alive"]);
+    assert_eq!(
+        command_output(&out, "spacetest heap 6"),
+        ["spacetest: 7 checks, 0 failed"]
+    );
+    let overflow = command_output(&out, "spacetest overflow");
+    assert!(
+        overflow[0].ends_with("(spacetest) killed: store page fault"),
+        "{out}"
+    );
+    let stval = overflow[1].rsplit("stval 0x").next().unwrap();
+    let stval = u32::from_str_radix(stval.trim(), 16).unwrap();
+    // USER_STACK_LIMIT - PGSIZE .. USER_STACK_LIMIT.
+    assert!((0x0b7f_f000..0x0b80_0000).contains(&stval), "{out}");
+    assert_eq!(command_output(&out, "echo alive"), ["alive"]);
+}
+
 #[test]
 fn bad_pointers_are_refused() {
     // Issue #21's second criterion. badptr hands write and read kernel
@@ -3006,14 +3080,15 @@ fn processes_give_back_every_page() {
         .count();
     assert_eq!((collected, greetings), (NPROC - 1, NPROC - 1), "{out}");
     assert_eq!(free_pages(&m, &elf), before);
-    // While a process runs, it holds its pages: a kernel stack, a root and a
-    // user table, its segments and its stack.
+    // While a process runs, it holds its pages: a kernel stack, a root and
+    // two user tables (its segments' at the bottom of user space, its
+    // stack's at the top), its segments and its stack.
     for &b in b"ding\n" {
         tx.send(b).unwrap();
     }
     step_to_user(&mut m, &elf, "ding");
     let pages = expected_user_pages(&user_program("ding").elf).len() as u32;
-    assert_eq!(free_pages(&m, &elf), before - 3 - pages);
+    assert_eq!(free_pages(&m, &elf), before - 4 - pages);
 }
 
 /// Checks stress's console output for `workers` workers and `rounds` rounds
@@ -3222,7 +3297,7 @@ fn a_heap_that_runs_out_of_memory_gives_back_what_it_took() {
     let before = free_pages(&m, &elf);
     // systest's own pages (see processes_give_back_every_page), then a page
     // for the heap at least.
-    let pages = 3 + expected_user_pages(&user_program("systest").elf).len() as u32;
+    let pages = 4 + expected_user_pages(&user_program("systest").elf).len() as u32;
     assert!(
         before > pages + 1 && before < pages + 3_000_000 / PAGE,
         "{before} pages"
@@ -3348,7 +3423,11 @@ fn the_elf_loader_refuses_bad_images() {
             Some("segment outside user space"),
             &[(ph(0, P_VADDR), &0u32.to_le_bytes())],
         ),
-        // The guard page under the stack.
+        // The guard page under the stack's limit, and the stack itself.
+        (
+            Some("segment outside user space"),
+            &[(ph(1, P_VADDR), &USER_LOAD_TOP.to_le_bytes())],
+        ),
         (
             Some("segment outside user space"),
             &[(ph(1, P_VADDR), &(USER_STACK - PAGE).to_le_bytes())],

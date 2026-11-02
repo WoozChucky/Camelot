@@ -42,7 +42,7 @@ const THREAD_KSTACK: u32 = 12;
 const THREAD_UNUSED: u32 = 0;
 const THREAD_ZOMBIE: u32 = 3;
 /// `struct proc`: its size, state, name (16 bytes) and page table.
-const PROC_SIZE: u32 = 164;
+const PROC_SIZE: u32 = 168;
 const NPROC: u32 = 8;
 const PROC_STATE: u32 = 0;
 const PROC_PAGETABLE: u32 = 32;

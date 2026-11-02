@@ -41,6 +41,9 @@ void start(void) {
      * mstatus.MIE says. */
     timer_init();
     w_mie(MIE_MTIE | MIE_MSIE);
+    /* S-mode reads the clock through the time CSR, not the CLINT, which its
+     * page tables don't map (vm.h: it is below USER_TOP). */
+    w_mcounteren(MCOUNTEREN_TM);
 
     /* mret goes to supervisor_entry in S-mode. */
     w_mstatus((r_mstatus() & ~MSTATUS_MPP_MASK) | MSTATUS_MPP_S);

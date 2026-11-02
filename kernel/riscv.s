@@ -54,6 +54,16 @@ w_mie:
     csrw  mie, a0
     ret
 
+    .globl w_mcounteren
+w_mcounteren:
+    csrw  mcounteren, a0
+    ret
+
+    .globl r_time
+r_time:
+    csrr  a0, time
+    ret
+
     .globl r_sstatus
 r_sstatus:
     csrr  a0, sstatus

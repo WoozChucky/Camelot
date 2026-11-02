@@ -45,7 +45,7 @@
 #define CONSOLE 1
 #define PAGE 4096
 /* Where the heap may grow to (USER_LOAD_TOP in kernel/include/vm.h). */
-#define USER_LOAD_TOP 0x003fe000
+#define USER_LOAD_TOP 0x0b7ff000
 
 static int checks;
 static int failures;
