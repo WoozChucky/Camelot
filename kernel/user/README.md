@@ -17,17 +17,17 @@ for `grep`, whose 1 means "no line matched".
 |---|---|---|
 | `sh` | `sh` | the shell: commands, `<`, `>`, `\|`, `&`, and the built-ins `cd`, `wait`, `exit`, `help` |
 | `ls` | `ls [PATH...]` | lists directories (the working directory without arguments): type, inode, links, size, name |
-| `cat` | `cat [FILE...]` | copies files, or its input, to its output |
+| `cat` | `cat [FILE...]` | copies files, or its input, to its output; refuses a directory |
 | `echo` | `echo [-n] [ARG...]` | prints its arguments, with a newline unless `-n` |
 | `mkdir` | `mkdir DIR...` | makes directories |
 | `rm` | `rm PATH...` | removes names: files, and empty directories |
 | `ln` | `ln OLD NEW` | gives a file a second name |
 | `cp` | `cp SRC DST`, `cp SRC... DIR` | copies files (made or emptied first), or into a directory under their own names |
-| `mv` | `mv SRC DST`, `mv SRC... DIR` | renames files (`link`, then `unlink`; a file already called DST is replaced), or moves them into a directory; directories can't be moved |
-| `wc` | `wc [-l] [-w] [-c] [FILE...]` | counts lines, words and bytes, of files or its input; the flags pick the counts |
+| `mv` | `mv SRC DST`, `mv SRC... DIR` | renames files (`link`, then `unlink`; a file already called DST is replaced, and if DST is a hard link to SRC only SRC goes), or moves them into a directory; directories can't be moved |
+| `wc` | `wc [-l] [-w] [-c] [FILE...]` | counts lines, words and bytes, of files or its input; the flags pick the counts; refuses a directory |
 | `grep` | `grep [-v] [-c] [-n] PATTERN [FILE...]` | prints the lines that contain a fixed string; `-v` those that don't, `-c` how many, `-n` with their numbers |
 | `ps` | `ps` | lists the processes (`procs`): pid, parent, state, size, name |
-| `kill` | `kill PID...` | ends processes (`kill`): they exit with status -1 |
+| `kill` | `kill PID...` | ends processes (`kill`): they exit with status -1; not the shell, whose end is Camelot's |
 | `sleep` | `sleep SECONDS` | waits, `0.5` for half a second (the clock ticks 10 times a second) |
 
 So, on the root image:

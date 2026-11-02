@@ -31,6 +31,9 @@ const SLICE: u64 = 500_000;
 /// The most steps one command may take. merlin's code is several times
 /// slower than clang's; the slowest command here takes about 20 million.
 const COMMAND_MAX_STEPS: u64 = 200_000_000;
+/// The ticks that `ticks`, the shell and `sleep` itself may take besides
+/// the ones `sleep` waits for.
+const SLEEP_SLACK: u32 = 3;
 
 /// Camelot running on Grail, with its shell waiting for a command.
 struct Session {
@@ -93,6 +96,33 @@ impl Session {
         new[echoed.len()..new.len() - PROMPT.len()].to_string()
     }
 
+    /// Runs `line` between two `ticks`, all three typed at once, and returns
+    /// what `line` printed and the timer ticks from one `ticks` to the
+    /// other. Typed ahead, the commands follow each other with no wait for
+    /// the next line, during which the idle machine would skip ticks ahead.
+    fn ticks_around(&mut self, line: &str) -> (String, u32) {
+        let start = self.out().len();
+        for b in format!("ticks\n{line}\nticks\n").bytes() {
+            self.input.send(b).unwrap();
+        }
+        self.run_until(
+            |out| out[start..].matches(PROMPT).count() == 3 && out.ends_with(PROMPT),
+            COMMAND_MAX_STEPS,
+        );
+        let out = self.out()[start..].to_string();
+        let parts: Vec<&str> = out.split(PROMPT).collect();
+        let ticks = |part: &str| -> u32 {
+            part.strip_prefix("ticks\nticks: ")
+                .and_then(|n| n.strip_suffix('\n'))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("{out}"))
+        };
+        let printed = parts[1]
+            .strip_prefix(&format!("{line}\n"))
+            .unwrap_or_else(|| panic!("{out}"));
+        (printed.to_string(), ticks(parts[2]) - ticks(parts[0]))
+    }
+
     /// Types `exit` and returns how the machine stopped and the disk.
     fn exit(mut self) -> (RunResult, Vec<u8>) {
         for b in b"exit\n" {
@@ -140,7 +170,7 @@ fn size_of(fs: &Fs, prog: &str) -> u32 {
     let end = elf
         .segments
         .iter()
-        .filter(|p| p.ty == 1)
+        .filter(|p| p.ty == elf32::PT_LOAD)
         .map(|p| p.vaddr + p.memsz)
         .max()
         .unwrap();
@@ -185,6 +215,12 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool) {
         s.run("cat /README /nope"),
         format!("{readme}cat: /nope: {enoent}\n{}", exit_line("cat", 1))
     );
+    // A directory is not copied as if it were text (nor counted, nor
+    // searched: wc and grep below).
+    assert_eq!(
+        s.run("cat /bin"),
+        format!("cat: /bin: is a directory\n{}", exit_line("cat", 1))
+    );
 
     // echo.
     assert_eq!(s.run("echo a  b   c"), "a b c\n");
@@ -200,6 +236,13 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool) {
         s.run("wc /README /nope"),
         format!(
             "{lines} {words} {bytes} /README\nwc: /nope: {enoent}\n{}",
+            exit_line("wc", 1)
+        )
+    );
+    assert_eq!(
+        s.run("wc /bin /README"),
+        format!(
+            "wc: /bin: is a directory\n{lines} {words} {bytes} /README\n{}",
             exit_line("wc", 1)
         )
     );
@@ -330,6 +373,23 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool) {
         s.run("mv /t/u/b /t/u/echo /nope"),
         format!("mv: /nope: not a directory\n{}", exit_line("mv", 1))
     );
+    // However it is spelled, one name is still the same file...
+    assert_eq!(
+        s.run("mv /t/u/b /t/u/./b"),
+        format!(
+            "mv: /t/u/b and /t/u/./b are the same file\n{}",
+            exit_line("mv", 1)
+        )
+    );
+    // ...but a second name of the file (a hard link) is already what the
+    // first would become: only the first goes.
+    assert_eq!(s.run("ln /t/u/b /t/h"), "");
+    assert_eq!(s.run("mv /t/h /t/u/b"), "");
+    assert_eq!(
+        s.run("cat /t/h"),
+        format!("cat: /t/h: {enoent}\n{}", exit_line("cat", 1))
+    );
+    assert_eq!(s.run("cat /t/u/b"), readme);
     let usage = "usage: mv SRC DST, or mv SRC... DIR\n";
     assert_eq!(s.run("mv /t/u/b"), format!("{usage}{}", exit_line("mv", 1)));
 
@@ -346,9 +406,16 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool) {
     assert_eq!(s.run("rm"), format!("usage: rm PATH...\n{}", exit_line("rm", 1)));
     let listing = s.run("ls /t/u");
 
-    // sleep.
-    assert_eq!(s.run("sleep 0.3"), "");
-    assert_eq!(s.run("sleep 1"), "");
+    // sleep, for as many ticks as it was asked (10 a second), and not many
+    // more: the commands around it take a tick or two of their own.
+    for (time, want) in [("0.3", 3), ("1", 10)] {
+        let (printed, slept) = s.ticks_around(&format!("sleep {time}"));
+        assert_eq!(printed, "");
+        assert!(
+            (want..want + SLEEP_SLACK).contains(&slept),
+            "sleep {time}: {slept} ticks"
+        );
+    }
     assert_eq!(
         s.run("sleep 1x"),
         format!("sleep: 1x: invalid time\n{}", exit_line("sleep", 1))
@@ -396,15 +463,53 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool) {
         s.run("kill"),
         format!("usage: kill PID...\n{}", exit_line("kill", 1))
     );
+    // A number too big for a pid is not one, rather than wrapping around
+    // to some other process's (2^32 + the shell's pid would be the shell).
+    let wrapped = (1u64 << 32) + u64::from(shell_pid);
+    assert_eq!(
+        s.run(&format!("kill {wrapped}")),
+        format!("kill: {wrapped}: not a process id\n{}", exit_line("kill", 1))
+    );
+    // The shell can't be killed: its end would be Camelot's.
+    assert_eq!(
+        s.run(&format!("kill {shell_pid}")),
+        format!(
+            "kill: {shell_pid}: operation not permitted\n{}",
+            exit_line("kill", 1)
+        )
+    );
+    // A reader asleep on the console ends at once too. systest does it (it
+    // kills a child of its own), here where nothing is typed ahead for the
+    // reader to take.
+    assert_eq!(s.run("systest killreader"), "");
     // A pipeline in the background, its reader asleep on the pipe and its
-    // writer asleep in sleep: kill wakes both, and both end.
+    // writer asleep in sleep. Killing the reader alone ends it while the
+    // writer, which would end its input, still sleeps; then the writer.
     let started = s.run("sleep 50 | cat &");
     let pids: Vec<u32> = started
         .lines()
         .map(|l| l.trim_matches(['[', ']']).parse().unwrap())
         .collect();
     assert_eq!(pids.len(), 2, "{started}");
-    assert_eq!(s.run(&format!("kill {} {}", pids[1], pids[0])), "");
+    assert_eq!(s.run(&format!("kill {}", pids[1])), "");
+    let ps = s.run("ps");
+    let states: Vec<(&str, &str)> = ps
+        .lines()
+        .skip(1)
+        .map(|r| r.split_whitespace().collect::<Vec<_>>())
+        .map(|r| (r[2], r[4]))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("sleep", "sh"),
+            ("sleep", "sleep"),
+            ("zombie", "cat"),
+            ("run", "ps")
+        ],
+        "{ps}"
+    );
+    assert_eq!(s.run(&format!("kill {}", pids[0])), "");
     let waited = s.run("wait");
     assert!(
         waited.contains(&format!("[{}] sleep: exit -1\n", pids[0]))
@@ -426,6 +531,7 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool) {
     assert!(after.lookup("/t/u/README").is_err());
     assert!(after.lookup("/t/a").is_err());
     assert!(after.lookup("/t/c").is_err());
+    assert!(after.lookup("/t/h").is_err());
     let names: Vec<String> = after
         .ls("/t/u")
         .unwrap()

@@ -57,8 +57,13 @@ const struct user_program *user_program_find(const char *name) {
 }
 
 /* A new process's kernel thread starts here, from the scheduler's swtch(),
- * and goes straight to U-mode at the program's entry point. */
+ * and goes straight to U-mode at the program's entry point, unless it was
+ * killed before it got its first turn: then it ends before running any of
+ * its code, as user_trap() would end it on any later way back. */
 static void proc_start(void) {
+    if (current->killed) {
+        proc_exit(-1);
+    }
     user_trap_return(current->frame);
 }
 
@@ -481,7 +486,9 @@ int proc_kill_pid(int pid) {
         if (p->state == PROC_UNUSED || p->state == PROC_NEW || p->pid != (u32)pid) {
             continue;
         }
-        if (p->kfn != NULL) {
+        /* Neither the kernel's own processes nor the first one, the shell,
+         * whose end is Camelot's. */
+        if (p->kfn != NULL || p == init_proc) {
             return -EPERM;
         }
         if (p->state != PROC_ZOMBIE) {

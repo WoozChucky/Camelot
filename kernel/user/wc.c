@@ -2,7 +2,8 @@
  * file, or of its input if there is none, and prints them: `LINES WORDS
  * BYTES`, then the file's name if it has one. -l, -w and -c print only
  * those counts (in that order), so `wc -l` is the number of lines. Exits 1
- * if a file can't be read or an option is unknown, else 0. */
+ * if a file can't be read (a directory is refused, as cat and grep do) or
+ * an option is unknown, else 0. */
 #include "user.h"
 
 static char buf[512];
@@ -89,6 +90,13 @@ int main(int argc, char **argv) {
         if (fd < 0) {
             fprintf(STDERR, "wc: %s: %s\n", argv[i], strerror(-fd));
             status = 1;
+            continue;
+        }
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.type == T_DIR) {
+            fprintf(STDERR, "wc: %s: %s\n", argv[i], strerror(EISDIR));
+            status = 1;
+            close(fd);
             continue;
         }
         status |= count(fd, argv[i]);

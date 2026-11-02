@@ -278,7 +278,8 @@ but `-EAGAIN` (the kernel prints `exec: PATH: REASON` for `-ENOEXEC`).
 process killed for a fault does (its parent's `wait` gets -1), but
 silently, and not at once. The kernel marks it killed and, if it is asleep,
 wakes it; it ends when it would next go back to U-mode, before it runs any
-more of its own code. A system call it is in the middle of carries on to
+more of its own code (a process killed before its first turn runs none of
+it). A system call it is in the middle of carries on to
 its end, so a change to the disk is never left half done, except that the
 calls that may wait for long give up at once: `sleep`, `wait`, a `read` of
 the console or of a pipe, a `write` to a full pipe (what they return is
@@ -287,7 +288,8 @@ process may kill itself; `kill` then returns 0 and the process ends on its
 way back from the call. Killing a zombie, which has already ended, does
 nothing and returns 0. Errors: `-ESRCH` when no process has that pid (one
 whose parent has collected it is gone), `-EPERM` for one of the kernel's
-own processes.
+own processes or for the first process, the shell, whose end would be
+Camelot's (it ends only by its own `exit`).
 
 **procs(buf, max)** describes the processes, in pid order, in the array of
 `max` `struct procinfo` (32 bytes each, `user.h`) at `buf`, and returns how
@@ -310,7 +312,7 @@ Linux's values for the same conditions.
 
 | Number | Name | Meaning |
 |---|---|---|
-| 1 | `EPERM` | link: not for a directory; kill: a kernel process |
+| 1 | `EPERM` | link: not for a directory; kill: a kernel process, or the shell |
 | 2 | `ENOENT` | no such file or directory |
 | 3 | `ESRCH` | kill: no such process |
 | 7 | `E2BIG` | spawn, exec: argument list too long |

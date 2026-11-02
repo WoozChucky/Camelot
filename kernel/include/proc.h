@@ -185,7 +185,8 @@ void proc_kill(struct trap_frame *f);
 
 /* kill(): marks the process `pid` killed (see `killed` in struct proc) and
  * wakes it if it sleeps. 0 (also for a zombie, which has already ended),
- * -ESRCH if there is no such process, -EPERM for a kernel process. */
+ * -ESRCH if there is no such process, -EPERM for a kernel process or the
+ * first one (the shell). */
 int proc_kill_pid(int pid);
 
 /* Whether the current process has been killed. */

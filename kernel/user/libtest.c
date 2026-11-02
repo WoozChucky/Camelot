@@ -1,7 +1,8 @@
 /* libtest: checks the C library (lib/, lib/README.md) from a program:
- * strings and memory, numbers, snprintf's formats, malloc and free, and
- * the readers on a pipe. Needs no filesystem. Prints a line for each check
- * that fails and, at the end, "libtest: N checks, F failed"; exits with F.
+ * strings and memory, numbers, snprintf's formats, malloc and free (and
+ * how free merges neighbours), and the readers on a pipe. Needs no
+ * filesystem. Prints a line for each check that fails and, at the end,
+ * "libtest: N checks, F failed"; exits with F.
  *
  * `libtest feed N` is the child it runs: writes N numbered lines to its
  * output, in writes that cut lines in two. */
@@ -81,6 +82,14 @@ static void test_numbers(void) {
     check(end == bad, "no digits: end is the start");
     check_eq((int)strtol("0xg", &end, 16), 0, "strtol 0x without a hex digit");
     check(*end == 'x', "it stops at the x");
+    /* Out of range: the limit, as in C, not a wrapped-around value. */
+    check_eq((int)strtol("2147483647", NULL, 10), LONG_MAX, "strtol of LONG_MAX");
+    check_eq((int)strtol("-2147483648", NULL, 10), LONG_MIN, "strtol of LONG_MIN");
+    check_eq((int)strtol("2147483648", &end, 10), LONG_MAX, "strtol just past LONG_MAX");
+    check_eq((int)strtol("-2147483649", NULL, 10), LONG_MIN, "strtol just past LONG_MIN");
+    check_eq((int)strtol("4294967302x", &end, 10), LONG_MAX, "strtol of 2^32 + 6 does not wrap to 6");
+    check(*end == 'x', "and it ends after all the digits");
+    check_eq((int)strtol("0x100000000", NULL, 0), LONG_MAX, "strtol of a hex number out of range");
 }
 
 static void test_snprintf(void) {
@@ -106,6 +115,53 @@ static void test_snprintf(void) {
     check_eq(buf[0], 0, "writes the NUL");
 }
 
+/* A block of this many bytes is two pages with its 8-byte header: more
+ * than any free block before test_merge (it runs before anything else
+ * uses the heap) and at least the page malloc grows the heap by, so each
+ * comes from the top of the heap, sbrk asked for exactly it. */
+#define MERGE_BYTES (2 * 4096 - 8)
+
+/* Three neighbouring blocks of MERGE_BYTES, lowest first, from fresh heap
+ * at its top; 0 if they aren't that. */
+static int three_neighbours(char **blk) {
+    int top = sbrk(0);
+    for (int i = 0; i < 3; i++) {
+        blk[i] = malloc(MERGE_BYTES);
+    }
+    return blk[0] == (char *)top + 8 && blk[1] == blk[0] + MERGE_BYTES + 8 &&
+           blk[2] == blk[1] + MERGE_BYTES + 8 && sbrk(0) == top + 3 * (MERGE_BYTES + 8);
+}
+
+/* Frees three neighbours in the order `a`, `b`, `c` (0 the lowest), then
+ * asks for one block exactly as big as the three with their headers: it
+ * fits, without growing the heap, only if free merged all three into one,
+ * and then it is where they were. Returns it, to be freed at the end. */
+static char *merge_case(int a, int b, int c, const char *what) {
+    char *blk[3];
+    check(three_neighbours(blk), "three neighbouring blocks from the top of the heap");
+    free(blk[a]);
+    free(blk[b]);
+    free(blk[c]);
+    int top = sbrk(0);
+    char *p = malloc(3 * MERGE_BYTES + 16);
+    check(p == blk[0] && sbrk(0) == top, what);
+    return p;
+}
+
+/* free merges a block with the free one above it and with the one below:
+ * freeing three neighbours from the bottom up takes merges below, from the
+ * top down merges above, and the outer two first, then the middle one,
+ * both at once. The merged blocks stay taken until the end, so that each
+ * case starts from fresh heap. */
+static void test_merge(void) {
+    char *up = merge_case(0, 1, 2, "freed upwards, three neighbours merge into one");
+    char *down = merge_case(2, 1, 0, "freed downwards, three neighbours merge into one");
+    char *outer = merge_case(0, 2, 1, "the middle one freed last merges with both");
+    free(up);
+    free(down);
+    free(outer);
+}
+
 static void test_malloc(void) {
     check(malloc(0) == NULL, "malloc(0)");
     char *a = malloc(10);
@@ -125,16 +181,16 @@ static void test_malloc(void) {
     free(a);
     free(c);
     free(d);
-    /* Everything freed and merged: a big request fits where they were,
-     * without growing the heap. */
+    /* What was freed is used again, without growing the heap (test_merge
+     * checks that neighbours merge). */
     int top = sbrk(0);
     char *e = malloc(3000);
-    check(e != NULL && sbrk(0) == top, "freed neighbours are merged");
+    check(e != NULL && sbrk(0) == top, "freed blocks are used again");
     free(e);
     /* Grow past a page: sbrk is asked for more. */
-    char *big = malloc(20000);
+    char *big = malloc(100000);
     check(big != NULL && sbrk(0) > top, "a big block grows the heap");
-    big[19999] = 1;
+    big[99999] = 1;
     free(big);
     free(NULL);
     /* calloc zeroes, realloc keeps the bytes. */
@@ -167,7 +223,7 @@ static void test_malloc(void) {
     check(intact, "blocks survive their neighbours being freed");
     top = sbrk(0);
     char *all = malloc(3000);
-    check(all != NULL && sbrk(0) == top, "and merge again");
+    check(all != NULL && sbrk(0) == top, "and their room is used again");
     free(all);
 }
 
@@ -249,6 +305,8 @@ int main(int argc, char **argv) {
     test_strings();
     test_numbers();
     test_snprintf();
+    /* First, while the heap is still empty. */
+    test_merge();
     test_malloc();
     test_reader();
     printf("libtest: %d checks, %d failed\n", checks, failures);

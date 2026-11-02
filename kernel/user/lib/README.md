@@ -10,7 +10,7 @@ together.
 | File | What it has |
 |---|---|
 | `string.c` | `strlen`, `strcmp`, `strncmp`, `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`, `memmove`, `memcmp` |
-| `stdlib.c` | `atoi`, `strtol` (bases 2 to 36, or 0 for C's prefixes) |
+| `stdlib.c` | `atoi`, `strtol` (bases 2 to 36, or 0 for C's prefixes; out of range gives `LONG_MAX` or `LONG_MIN`) |
 | `malloc.c` | `malloc`, `free`, `calloc`, `realloc` on top of `sbrk` |
 | `printf.c` | `printf`, `fprintf` (to a descriptor), `snprintf`, `puts` |
 | `getline.c` | `getline` (a console line from stdin), `reader_init` and `reader_getline` (lines from any descriptor) |

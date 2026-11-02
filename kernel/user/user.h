@@ -13,7 +13,7 @@ typedef unsigned long size_t;
 
 /* Error numbers: a system call that fails returns minus one of them. They
  * are kernel/include/syscall.h's: a test checks they agree. */
-#define EPERM 1         /* link: not for a directory; kill: not a kernel process */
+#define EPERM 1         /* link: not for a directory; kill: a kernel process, or the shell */
 #define ENOENT 2        /* no such file or directory */
 #define ESRCH 3         /* kill: no such process */
 #define E2BIG 7         /* spawn, exec: argument list too long */
@@ -148,10 +148,13 @@ void *memmove(void *dst, const void *src, size_t n);
 int memcmp(const void *a, const void *b, size_t n);
 
 /* Numbers (lib/stdlib.c). atoi: a decimal number with an optional '-',
- * up to the first non-digit. strtol: an optional sign, then digits in
- * `base` (2 to 36; 0 means 10, or 16 after "0x", or 8 after "0"); *end (if
- * `end` isn't NULL) is where it stopped, `s` itself when there were no
- * digits. Overflow wraps around. */
+ * up to the first non-digit; overflow wraps around. strtol: an optional
+ * sign, then digits in `base` (2 to 36; 0 means 10, or 16 after "0x", or 8
+ * after "0"); *end (if `end` isn't NULL) is where it stopped, `s` itself
+ * when there were no digits. A number out of range gives LONG_MAX, or
+ * LONG_MIN with a '-', as in C (*end is still past all its digits). */
+#define LONG_MAX 2147483647
+#define LONG_MIN (-LONG_MAX - 1)
 int atoi(const char *s);
 long strtol(const char *s, char **end, int base);
 

@@ -110,27 +110,22 @@ pub fn with_needed(inputs: &[Input], library: &[Input]) -> Result<Vec<Input>, Ve
 mod tests {
     use super::*;
 
-    fn u32_at(b: &[u8], o: usize) -> usize {
-        u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize
-    }
-
     /// Makes global symbol `name` of the object `elf` weak (merlin-as has no
     /// `.weak`): its binding in `.symtab` becomes `STB_WEAK`.
     fn make_weak(elf: &mut [u8], name: &str) {
-        let shoff = u32_at(elf, 32);
-        let shnum = u16::from_le_bytes([elf[48], elf[49]]) as usize;
-        let shdr = |i: usize| shoff + 40 * i;
-        let symtab = (0..shnum).find(|&i| u32_at(elf, shdr(i) + 4) == 2).unwrap();
-        let (off, size) = (u32_at(elf, shdr(symtab) + 16), u32_at(elf, shdr(symtab) + 20));
-        let strtab = u32_at(elf, shdr(u32_at(elf, shdr(symtab) + 24)) + 16);
-        for e in (off..off + size).step_by(16) {
-            let n = strtab + u32_at(elf, e);
-            if elf[n..].starts_with(name.as_bytes()) && elf[n + name.len()] == 0 {
-                elf[e + 12] = (2 << 4) | (elf[e + 12] & 0xf);
-                return;
-            }
-        }
-        panic!("no symbol {name}");
+        let info_at = {
+            let parsed = elf32::Elf::parse(elf).unwrap();
+            let symtab = &parsed.sections[parsed.symtab_index().unwrap()];
+            let syms = parsed.symbols_in(symtab).unwrap();
+            let i = syms
+                .iter()
+                .position(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no symbol {name}"));
+            let entsize = (symtab.entsize as usize).max(elf32::SYM_SIZE);
+            // st_info is byte 12 of the entry.
+            symtab.offset as usize + i * entsize + 12
+        };
+        elf[info_at] = (elf32::STB_WEAK << 4) | (elf[info_at] & 0xf);
     }
 
     /// An object from merlin-as: `defs` defined as globals in `.text`,
