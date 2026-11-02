@@ -580,7 +580,7 @@ fn reg_pattern(tag: u32, sp: u32) -> [u32; 32] {
 }
 
 /// Boots the committed kernel up to kmain, then turns kmain into `j .; j .`
-/// and fills every register but sp with `reg_pattern(0xa5, ..)`: busy code
+/// and fills every register but sp and tp with `reg_pattern(0xa5, ..)`: busy code
 /// with every register live. S-mode interrupts are on, as after trap_init.
 /// Returns the machine, the ELF and the registers.
 fn busy_kmain() -> (Machine, grail::elf::Elf, [u32; 32]) {
@@ -589,7 +589,10 @@ fn busy_kmain() -> (Machine, grail::elf::Elf, [u32; 32]) {
     step_to(&mut m, kmain);
     let code: Vec<u8> = [J_SELF, J_SELF].iter().flat_map(|w| w.to_le_bytes()).collect();
     m.cpu.bus.load(kmain, &code).unwrap();
-    let regs = reg_pattern(0xa5, m.cpu.x[2]);
+    let mut regs = reg_pattern(0xa5, m.cpu.x[2]);
+    // tp keeps the hart's id: kernel code finds its `struct cpu` through it
+    // (spec section 10, "Kernel locking"), and the trap handlers take locks.
+    regs[x("tp") as usize] = m.cpu.x[x("tp") as usize];
     m.cpu.x = regs;
     m.cpu.csr.mie |= 1 << IRQ_S_SOFT;
     m.cpu.csr.mstatus |= MSTATUS_SIE;
