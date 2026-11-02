@@ -33,7 +33,7 @@ tasks:
                Camelot's bootloader (kernel/boot/boot.elf) with merlin-as + merlin-ld
                --check: build in memory and report stale .elf files instead of writing
                -v: print the equivalent merlin-as/merlin-ld command lines
-  hello       reference build: assemble examples/hello/hello.S with merlin-as, link it
+  hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
                with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
   ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj, llvm-objdump);
                takes --clang, --lld and -v like kernel
@@ -617,6 +617,28 @@ mod tests {
     #[test]
     fn defaults() {
         assert_eq!(parse(&[]).unwrap(), KernelArgs::default());
+    }
+
+    #[test]
+    fn usage_descriptions_line_up() {
+        // Every task's description, and every continuation line, starts in
+        // the same column.
+        let tasks = USAGE
+            .split("tasks:\n")
+            .nth(1)
+            .unwrap()
+            .split("\n\n")
+            .next()
+            .unwrap();
+        for line in tasks.lines() {
+            // A task's line: its name, then the description.
+            let rest = match line.strip_prefix("  ") {
+                Some(task) if !task.starts_with(' ') => task.trim_start_matches(|c: char| c != ' '),
+                _ => line,
+            };
+            let column = line.len() - rest.trim_start().len();
+            assert_eq!(column, 15, "{line:?}");
+        }
     }
 
     #[test]

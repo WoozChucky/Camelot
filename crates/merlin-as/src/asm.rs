@@ -481,20 +481,41 @@ impl Assembler {
     /// distance between them: merlin-as never moves code once it is placed
     /// (no relaxation), so the distance is final. Only `+` and `-` combine
     /// such terms; anything else must be constant.
+    ///
+    /// An offset on its own is not a size: `.size f, f` or `.size f, . + f`
+    /// would depend on where the section ends up. Like LLVM ("Size
+    /// expression must be absolute"), the result is accepted only when the
+    /// section-relative terms cancel out, each added one matched by a
+    /// subtracted one.
     fn eval_size(&self, e: &Expr) -> Option<i64> {
+        match self.eval_size_terms(e)? {
+            (v, 0) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// `eval_size`'s worker: the value and how many section-relative terms
+    /// it holds (+1 for each added offset, -1 for each subtracted one).
+    fn eval_size_terms(&self, e: &Expr) -> Option<(i64, i64)> {
         match e {
-            Expr::Sym(name) if name == DOT => Some(self.sections[self.current].size as i64),
+            Expr::Sym(name) if name == DOT => Some((self.sections[self.current].size as i64, 1)),
             Expr::Sym(name) => {
                 let s = &self.symbols[*self.by_name.get(name)?];
                 match s.constant {
-                    Some(c) => Some(c),
-                    None if s.defined && s.section == Some(self.current) => Some(s.value as i64),
+                    Some(c) => Some((c, 0)),
+                    None if s.defined && s.section == Some(self.current) => Some((s.value as i64, 1)),
                     None => None,
                 }
             }
-            Expr::Bin(BinOp::Add, a, b) => Some(self.eval_size(a)?.wrapping_add(self.eval_size(b)?)),
-            Expr::Bin(BinOp::Sub, a, b) => Some(self.eval_size(a)?.wrapping_sub(self.eval_size(b)?)),
-            _ => self.eval(e),
+            Expr::Bin(op @ (BinOp::Add | BinOp::Sub), a, b) => {
+                let (a, ta) = self.eval_size_terms(a)?;
+                let (b, tb) = self.eval_size_terms(b)?;
+                Some(match op {
+                    BinOp::Add => (a.wrapping_add(b), ta + tb),
+                    _ => (a.wrapping_sub(b), ta - tb),
+                })
+            }
+            _ => Some((self.eval(e)?, 0)),
         }
     }
 
@@ -1276,6 +1297,10 @@ w:      .word 0, 0, 0
             "    .text\nf: nop\n    .size f, . * f\n",
             "    .text\nf: nop\n    .size f\n",
             "    .text\nf: nop\n    .size f, -4\n",
+            // An offset that does not cancel out is not a size.
+            "    .text\n    nop\nf: nop\n    .size f, f\n",
+            "    .text\n    nop\nf: nop\n    .size f, . + f\n",
+            "    .text\n    nop\nf: nop\ng: nop\n    .size f, . - f + g\n",
         ] {
             let errs = crate::assemble(bad).unwrap_err();
             assert!(errs[0].msg.contains(".size: expected"), "{bad:?}: {errs:?}");

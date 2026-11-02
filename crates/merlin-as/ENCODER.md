@@ -111,8 +111,13 @@ The suffix sets the ordering bits: none = 00, `.aq` = 10, `.rl` = 01,
 `.aqrl` = 11 (`atomic()` strips it, `atomic_funct5()` maps the rest). `lr.w`
 has no rs2: its field is zero. The address is written `(rs1)`; as in LLVM,
 `0(rs1)` is accepted too, and any other offset is an error, since there is no
-offset field. The source register comes before the address, as for stores
-(`amoadd.w rd, rs2, (rs1)`), and rd gets the old memory word.
+offset field. Like LLVM, it must be the literal `0`, one integer token (`0`,
+`0x0`): an expression or a symbol that equals 0 (`-0(rs1)`, `+0(rs1)`,
+`(0)(rs1)`, `1-1(rs1)`) is an error too. The parser folds `+0` and `(0)` to
+the number 0, so it records in the operand (`int_token`) whether the offset
+was a single integer token, and `atomic_address()` checks that. The source
+register comes before the address, as for stores (`amoadd.w rd, rs2, (rs1)`),
+and rd gets the old memory word.
 
 ### `li`
 

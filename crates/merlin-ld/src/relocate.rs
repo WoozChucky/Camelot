@@ -10,29 +10,40 @@ use crate::layout::Layout;
 use crate::object::{Object, Rela, Section, SHN_LORESERVE, SHN_UNDEF};
 use crate::reloc::{self, Context, HiSite, RelocError};
 use crate::Error;
+use std::collections::HashSet;
 
 /// The [`Context`] of a link: every `R_RISCV_PCREL_HI20` site, keyed by its
-/// address, for the `PCREL_LO12` relocations that point at them.
-pub fn context(layout: &Layout) -> Context {
+/// address, for the `PCREL_LO12` relocations that point at them. Also the
+/// addresses of the sites whose symbol has no value (undefined, or in a
+/// section that is not loaded): that is reported once, at the `PCREL_HI20`,
+/// so the `PCREL_LO12` paired with it says nothing more.
+pub fn context(layout: &Layout) -> (Context, HashSet<u32>) {
     let mut ctx = Context::default();
+    let mut failed = HashSet::new();
     for os in &layout.sections {
         for i in &os.inputs {
             for r in &layout.objects[i.object].sections[i.section].relocs {
                 if r.ty == reloc::R_RISCV_PCREL_HI20 {
-                    if let Ok(sym) = layout.reloc_symbol(i.object, r.sym as usize) {
-                        ctx.pcrel_hi20.insert(
-                            i.addr.wrapping_add(r.offset),
-                            HiSite {
-                                sym,
-                                addend: r.addend,
-                            },
-                        );
+                    let place = i.addr.wrapping_add(r.offset);
+                    match layout.reloc_symbol(i.object, r.sym as usize) {
+                        Ok(sym) => {
+                            ctx.pcrel_hi20.insert(
+                                place,
+                                HiSite {
+                                    sym,
+                                    addend: r.addend,
+                                },
+                            );
+                        }
+                        Err(_) => {
+                            failed.insert(place);
+                        }
                     }
                 }
             }
         }
     }
-    ctx
+    (ctx, failed)
 }
 
 /// Returns one byte image per output section (empty for NOBITS sections),
@@ -60,7 +71,7 @@ pub fn relocate(layout: &Layout) -> Result<Vec<Vec<u8>>, Vec<Error>> {
         }
     }
 
-    let ctx = context(layout);
+    let (ctx, failed_hi20) = context(layout);
 
     let mut errors = Vec::new();
     for (oi, os) in layout.sections.iter().enumerate() {
@@ -102,6 +113,12 @@ pub fn relocate(layout: &Layout) -> Result<Vec<Vec<u8>>, Vec<Error>> {
                         continue;
                     }
                 };
+                if matches!(r.ty, reloc::R_RISCV_PCREL_LO12_I | reloc::R_RISCV_PCREL_LO12_S)
+                    && failed_hi20.contains(&sym)
+                {
+                    // Its PCREL_HI20 already reported the symbol.
+                    continue;
+                }
                 let place = i.addr.wrapping_add(r.offset);
                 let sym = if is_jump(r.ty) && layout.is_undefined_weak(i.object, r.sym as usize) {
                     // A jump to a weak function nobody defined (code guarded

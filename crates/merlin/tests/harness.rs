@@ -16,7 +16,10 @@
 //! * `cases_match_reference_interpreter`: an AST interpreter
 //!   (`tests/common/interp.rs`) agrees with every `// expect:`, so the
 //!   expectations and the parser check each other, and a pipeline failure
-//!   below can be told apart from a front-end bug.
+//!   below can be told apart from a front-end bug. A case must not read a
+//!   local it never assigned (C: indeterminate): the interpreter fills fresh
+//!   locals with 0xa5 bytes, so such a case fails here rather than pass on
+//!   zeros and depend on the stack's contents in Grail.
 //! * `cases_run_in_grail`: the whole toolchain. merlin compiles each case to
 //!   assembly, merlin-as assembles it and `tests/crt0.s`, merlin-ld links them
 //!   (default layout) and Grail runs the result, comparing exit codes. Set
@@ -25,8 +28,10 @@
 //!
 //!       MERLIN_HARNESS_LLVM=1 cargo test -p merlin --test harness run_in_grail
 //!
-//! * `far_branches_run_in_grail`, `deep_expressions_run_in_grail`: generated
-//!   programs too big to keep as files, through the same pipeline.
+//! * `far_branches_run_in_grail`, `deep_expressions_run_in_grail`,
+//!   `big_frames_run_in_grail`: generated programs too big to keep as files,
+//!   through the same pipeline (big frames also check that `sp` is 16-byte
+//!   aligned at calls, with a helper in assembly).
 //! * `multi_file_programs_run_in_grail`: programs of several files, each a
 //!   directory `tests/multi/<name>/`: merlin compiles every `.c` file (with
 //!   `include/` as `-I`, if there is one), merlin-as assembles every `.s`
@@ -40,9 +45,10 @@
 //! Ignored, since they need LLVM:
 //!
 //! * `generated_assembly_assembles_like_clang`: clang's assembler (with
-//!   `-mno-relax`) turns merlin's output for every case into the same
-//!   `.text`, `.rodata`, `.data` and `.bss` contents and relocations as
-//!   merlin-as. Needs clang on `PATH`.
+//!   `-mno-relax`) turns merlin's output for every case, and for the far
+//!   branch and big frame programs, into the same `.text`, `.rodata`,
+//!   `.data` and `.bss` contents and relocations as merlin-as. Needs clang
+//!   on `PATH`.
 //!
 //!       cargo test -p merlin --test harness -- --ignored generated_assembly
 //!
@@ -233,6 +239,16 @@ fn reference_interpreter_semantics() {
         .contains("outside every object"));
     let prog = merlin::parse("extern int e; int main() { return e; }").unwrap();
     assert!(interp::run(&prog, "main").unwrap_err().contains("never defined"));
+    // A local without an initializer is indeterminate, as in the generated
+    // code: not 0, so a case cannot come to rely on it. One with an
+    // initializer list is cleared first.
+    assert_eq!(eval("int x; return x;"), 0xa5a5_a5a5_u32 as i32);
+    assert_eq!(eval("int a[3]; a[0] = 1; return a[1];"), 0xa5a5_a5a5_u32 as i32);
+    assert_eq!(
+        eval("int a[3] = {1}; struct { int x, y; } s = {2}; return a[2] + s.y;"),
+        0
+    );
+    assert_eq!(eval("int x; x = 4; return x;"), 4);
 }
 
 /// Loads an executable into Grail and returns its exit code.
@@ -435,9 +451,50 @@ fn cases_run_in_grail() {
 #[test]
 fn far_branches_run_in_grail() {
     let pipeline = Pipeline::new("far");
+    let src = far_branches_src();
+    let asm = merlin::compile(&src).unwrap();
+    assert!(asm.contains("\n1:\n"), "expected long branches:\n{asm}");
+    // x = 500 (if) + 1500 (while) + 500 (for, first pass) = 2500.
+    assert_eq!(pipeline.run("far", &src), Ok(26));
+}
+
+/// Codegen picks the short or long form of a branch from estimated sizes,
+/// which must never be smaller than what merlin-as makes: a `li` of a big
+/// constant, a `call` and an `la` are two words each. For each kind of body,
+/// grow it a statement at a time to the last size whose branch is still
+/// short, which is where an underestimate would leave a branch merlin-as
+/// cannot encode, and assemble that.
+#[test]
+fn branch_size_estimates_are_never_too_small() {
+    for stmt in ["x = x + 100000;", "x = g(x);", "x = x + *&glob;"] {
+        let src = |n: usize| {
+            format!(
+                "int glob = 1; int g(int v) {{ return v + 1; }}
+                 int f(int x) {{ if (x) {{ {} }} return x; }}",
+                stmt.repeat(n)
+            )
+        };
+        let long = |asm: &str| asm.contains("\n1:\n");
+        let mut n = 1;
+        while !long(&merlin::compile(&src(n + 1)).unwrap()) {
+            n += 1;
+            assert!(n < 2000, "{stmt}: no long branch yet");
+        }
+        // `n` statements: the most that keep the branch short.
+        let asm = merlin::compile(&src(n)).unwrap();
+        assert!(!long(&asm));
+        if let Err(e) = merlin_as::assemble_to_elf(&asm) {
+            panic!("{stmt} x {n}: {e:?}");
+        }
+    }
+}
+
+/// `if`, `while` and `for` bodies of 16 KB each: branches over them need the
+/// long form.
+fn far_branches_src() -> String {
     // `x = x + 1;` is 8 instructions, so 500 of them take 16 KB.
     let body = "x = x + 1; ".repeat(500);
-    let src = format!(
+    format!(
         "int main() {{
             int x = 0;
             int i = 0;
@@ -448,11 +505,7 @@ fn far_branches_run_in_grail() {
             for (i = 0; i < 2; i = i + 1) {{ if (i) continue; {body} }}
             return x / 100 + y;
         }}"
-    );
-    let asm = merlin::compile(&src).unwrap();
-    assert!(asm.contains("\n1:\n"), "expected long branches:\n{asm}");
-    // x = 500 (if) + 1500 (while) + 500 (for, first pass) = 2500.
-    assert_eq!(pipeline.run("far", &src), Ok(26));
+    )
 }
 
 /// Deeply nested expressions keep many temporaries on the stack, around calls.
@@ -476,6 +529,49 @@ fn deep_expressions_run_in_grail() {
                }";
     // w(8, ..., 1) = 4; w(0, ..., 3) = -3; w(1, ..., 1, -3) = 4; w(4, 1, 4, 0, 0, 0, 0, 5) = 2.
     assert_eq!(pipeline.run("args", src), Ok(102));
+}
+
+/// Frames over 2 KiB: the prologue and epilogue move `sp` through `t0`, and
+/// locals past a 12-bit offset from `s0` are addressed through `t0`. A
+/// helper in assembly returns `sp & 15` from inside calls made with a big
+/// frame and with temporaries pushed: `sp` must be 16-byte aligned at every
+/// call. The caller's locals, `s0` and `sp` must survive the big frame.
+#[test]
+fn big_frames_run_in_grail() {
+    let pipeline = Pipeline::new("big-frames");
+    let asm = big_frames_asm();
+    for big_frame in ["add   sp, sp, t0", "add   t0, s0, t0"] {
+        assert!(asm.contains(big_frame), "expected '{big_frame}':\n{asm}");
+    }
+    let elf = pipeline.build("big-frames", &asm).unwrap();
+    assert_eq!(run_in_grail(&elf), Ok(18));
+}
+
+/// `big_frames_run_in_grail`'s program, compiled, with `sp_low` added.
+fn big_frames_asm() -> String {
+    // 600 ints and a 3000-byte array: about 5.4 KiB of locals.
+    let decls: String = (0..600).map(|i| format!("int v{i}; ")).collect();
+    let src = format!(
+        "int sp_low(void);
+         int big(int a, int b) {{
+             {decls}
+             char buf[3000];
+             v0 = a; v599 = b; v300 = sp_low();
+             buf[0] = 7; buf[2999] = 9;
+             v0 = v0 + 1; v599 = v599 * 2;
+             return v0 * 1000 + v599 * 10 + v300 + buf[0] + buf[2999] + (1 + (2 + sp_low()));
+         }}
+         int main() {{
+             int keep = 42;
+             int r = big(3, 4);
+             if (keep != 42) return 1;
+             if (r != 4000 + 80 + 7 + 9 + 3) return 2;
+             return 3 + (4 + (5 + (6 + sp_low())));
+         }}"
+    );
+    let mut asm = merlin::compile(&src).unwrap();
+    asm.push_str("\n    .text\n    .globl sp_low\nsp_low:\n    andi  a0, sp, 15\n    ret\n");
+    asm
 }
 
 /// A program of several files, in `tests/multi/<name>/`.
@@ -682,28 +778,42 @@ fn section_summary(obj: &[u8], name: &str) -> Result<(u32, Vec<u8>, Vec<String>)
 #[ignore = "needs clang on PATH"]
 fn generated_assembly_assembles_like_clang() {
     let scratch = Scratch::new("asm-vs-clang");
-    for_each_case("merlin-as vs clang", ALL_CASES, |c| {
-        let asm = merlin::compile(&c.src).map_err(|e| render(&e, c))?;
-        let ours = merlin_as::assemble_to_elf(&asm).map_err(|e| format!("merlin-as: {e:?}"))?;
-        let s = scratch.path(&format!("{}.s", c.name));
-        let o = scratch.path(&format!("{}.o", c.name));
-        std::fs::write(&s, &asm).map_err(|e| e.to_string())?;
+    let compare = |name: &str, asm: &str| -> Result<(), String> {
+        let ours = merlin_as::assemble_to_elf(asm).map_err(|e| format!("merlin-as: {e:?}"))?;
+        let s = scratch.path(&format!("{name}.s"));
+        let o = scratch.path(&format!("{name}.o"));
+        std::fs::write(&s, asm).map_err(|e| e.to_string())?;
         tool(clang().arg("-mno-relax").arg(&s).arg("-o").arg(&o))?;
         let theirs = std::fs::read(&o).map_err(|e| e.to_string())?;
-        for name in COMPARED_SECTIONS {
-            let (ours, theirs) = (section_summary(&ours, name)?, section_summary(&theirs, name)?);
+        for section in COMPARED_SECTIONS {
+            let (ours, theirs) = (
+                section_summary(&ours, section)?,
+                section_summary(&theirs, section)?,
+            );
             if ours.0 != theirs.0 || ours.1 != theirs.1 {
-                return Err(format!("merlin-as and clang assemble different {name} contents"));
+                return Err(format!(
+                    "merlin-as and clang assemble different {section} contents"
+                ));
             }
             if ours.2 != theirs.2 {
                 return Err(format!(
-                    "{name} relocations differ:\n{:?}\n{:?}",
+                    "{section} relocations differ:\n{:?}\n{:?}",
                     ours.2, theirs.2
                 ));
             }
         }
+        Ok(())
+    };
+    for_each_case("merlin-as vs clang", ALL_CASES, |c| {
+        let asm = merlin::compile(&c.src).map_err(|e| render(&e, c))?;
+        compare(&c.name, &asm)?;
         Ok(c.expect)
     });
+    // The generated programs: the long branch form (`bnez a0, 1f` / `j` /
+    // `1:`), and big frames reached through t0.
+    let far = merlin::compile(&far_branches_src()).unwrap();
+    assert_eq!(compare("far", &far), Ok(()));
+    assert_eq!(compare("big-frames", &big_frames_asm()), Ok(()));
 }
 
 #[test]

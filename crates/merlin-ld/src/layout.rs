@@ -87,6 +87,8 @@ pub struct Layout {
     pub warnings: Vec<String>,
     /// `[object][section]`.
     placement: Vec<Vec<Option<Placed>>>,
+    /// The input sections `/DISCARD/` matched, as `(object, section)`.
+    discarded: HashSet<(usize, usize)>,
     global_index: HashMap<String, usize>,
 }
 
@@ -150,22 +152,41 @@ impl Layout {
         if s.is_local() {
             if s.ty == STT_SECTION {
                 return self.input_addr(obj, s.shndx as usize).ok_or_else(|| {
+                    let name = o.symbol_display_name(sym as u32);
                     format!(
-                        "refers to section '{}', which is not loaded",
-                        o.symbol_display_name(sym as u32)
+                        "refers to section '{name}', which {}",
+                        self.unplaced(obj, s.shndx)
                     )
                 });
             }
-            return self
-                .object_symbol(obj, sym)
-                .ok_or_else(|| format!("refers to '{}', whose section is not loaded", s.name));
+            return self.object_symbol(obj, sym).ok_or_else(|| {
+                format!(
+                    "refers to '{}', whose section {}",
+                    s.name,
+                    self.unplaced(obj, s.shndx)
+                )
+            });
         }
         match self.global_index.get(&s.name) {
-            Some(&i) => self
-                .def_value(self.globals[i].1)
-                .ok_or_else(|| format!("refers to '{}', whose section is not loaded", s.name)),
+            Some(&i) => self.def_value(self.globals[i].1).ok_or_else(|| {
+                let why = match self.globals[i].1 {
+                    Def::Object { obj, sym } => self.unplaced(obj, self.objects[obj].symbols[sym].shndx),
+                    Def::Script(_) => "is not loaded",
+                };
+                format!("refers to '{}', whose section {why}", s.name)
+            }),
             None if s.is_weak() => Ok(0),
             None => Err(format!("undefined reference to '{}'", s.name)),
+        }
+    }
+
+    /// Why input section `sec` of `obj` has no address, for an error
+    /// message: `/DISCARD/` threw it away, or it is not loaded at all.
+    fn unplaced(&self, obj: usize, sec: u16) -> &'static str {
+        if self.discarded.contains(&(obj, sec as usize)) {
+            "was discarded by /DISCARD/"
+        } else {
+            "is not loaded"
         }
     }
 
@@ -183,6 +204,7 @@ struct Walker<'a> {
     script: &'a Script,
     objects: &'a [Object],
     placement: Vec<Vec<Option<Placed>>>,
+    discarded: HashSet<(usize, usize)>,
     globals: Vec<(String, Def)>,
     global_index: HashMap<String, usize>,
     sections: Vec<OutputSection>,
@@ -475,6 +497,7 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
         script: &script,
         objects: &objects,
         placement: objects.iter().map(|o| vec![None; o.sections.len()]).collect(),
+        discarded: HashSet::new(),
         globals,
         global_index,
         sections: Vec::new(),
@@ -502,7 +525,9 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
             // What `/DISCARD/` matched goes nowhere: those sections have no
             // address, so a reference to them is an error (see
             // `Layout::reloc_symbol`).
-            Command::Output(o) if o.is_discard() => {}
+            Command::Output(o) if o.is_discard() => {
+                w.discarded.extend(rules[ci].iter().flatten().copied());
+            }
             Command::Output(o) => {
                 let all_inputs = rules[ci].iter().flatten();
                 // ld.lld's rule: an output section is dropped only if no input
@@ -641,6 +666,7 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
         entry_symbol: None,
         warnings: Vec::new(),
         placement: w.placement,
+        discarded: w.discarded,
         global_index: w.global_index,
     };
     layout.objects = objects;

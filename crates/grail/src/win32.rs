@@ -149,7 +149,6 @@ pub struct MSG {
     pub lParam: LPARAM,
     pub time: u32,
     pub pt: POINT,
-    pub lPrivate: u32,
 }
 
 /// What `CreateWindowExW` was called with; `lParam` of `WM_NCCREATE` points at it.
@@ -329,7 +328,7 @@ mod tests {
         #[cfg(target_pointer_width = "32")]
         {
             assert_eq!(size_of::<WNDCLASSEXW>(), 48);
-            assert_eq!(size_of::<MSG>(), 32);
+            assert_eq!(size_of::<MSG>(), 28);
             assert_eq!(size_of::<PAINTSTRUCT>(), 64);
             assert_eq!(size_of::<CREATESTRUCTW>(), 48);
         }

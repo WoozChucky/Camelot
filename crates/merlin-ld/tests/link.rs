@@ -520,7 +520,9 @@ fn layout_edge_cases_match_ld_lld() {
 }
 
 /// What /DISCARD/ throws away cannot be referred to: ld.lld's "relocation
-/// refers to a discarded section" is merlin-ld's "not loaded".
+/// refers to a discarded section" is merlin-ld's "was discarded by
+/// /DISCARD/". Like ld.lld, an `la` reports it once, at its PCREL_HI20: the
+/// PCREL_LO12 paired with it adds no second error.
 #[test]
 fn a_reference_to_a_discarded_section_is_an_error() {
     let (mut inputs, opts) = case("layouts/attrs.ld");
@@ -531,7 +533,23 @@ fn a_reference_to_a_discarded_section_is_an_error() {
     let errs = errors(merlin_ld::link(&inputs, &opts));
     assert_eq!(errs.len(), 1, "{errs:?}");
     assert!(
-        errs[0].contains("use.o: R_RISCV_32 at .data+0x0 refers to 'dropped', whose section is not loaded"),
+        errs[0].contains(
+            "use.o: R_RISCV_32 at .data+0x0 refers to 'dropped', whose section was discarded by /DISCARD/"
+        ),
+        "{errs:?}"
+    );
+
+    let (mut inputs, opts) = case("layouts/attrs.ld");
+    inputs.push(merlin_ld::Input {
+        name: "la.o".into(),
+        data: merlin_as::assemble_to_elf("    .text\n    la a0, dropped\n").unwrap(),
+    });
+    let errs = errors(merlin_ld::link(&inputs, &opts));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains(
+            "la.o: R_RISCV_PCREL_HI20 at .text+0x0 refers to 'dropped', whose section was discarded"
+        ),
         "{errs:?}"
     );
 }
@@ -737,7 +755,8 @@ fn relocation_context() {
         entry: None,
     };
     let layout = merlin_ld::layout(&inputs("hello", &["hello.o"]), &opts).unwrap();
-    let ctx = merlin_ld::relocate::context(&layout);
+    let (ctx, failed) = merlin_ld::relocate::context(&layout);
+    assert!(failed.is_empty());
     let site = |name: &str| {
         let i = layout.objects[0]
             .symbols
