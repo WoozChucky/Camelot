@@ -581,6 +581,8 @@ pub fn number(text: &str, pos: Pos) -> Result<Tok, Error> {
         (false, true, false) => &[Long, ULong],
         (true, true, _) => &[ULong],
     };
+    // Past 64 bits it fits none of them either.
+    let value = value.unwrap_or(u64::MAX);
     match candidates.iter().find(|k| value <= k.range().1 as u64) {
         Some(&k) => Ok(Tok::Num(value as i64, k)),
         None => Err(Error::new(
@@ -595,8 +597,9 @@ pub fn number(text: &str, pos: Pos) -> Result<Tok, Error> {
 
 /// What an integer constant says, before C gives it a type.
 pub struct IntLit {
-    /// The value, saturated at `u64::MAX`.
-    pub value: u64,
+    /// The value; `None` when it does not fit in 64 bits (in C, too large
+    /// for any integer type).
+    pub value: Option<u64>,
     /// Written in decimal (not hex or octal).
     pub decimal: bool,
     /// The suffix has a `u`, an `l`.
@@ -639,9 +642,9 @@ pub fn integer(text: &str, pos: Pos) -> Result<IntLit, Error> {
         }
         _ => return Err(invalid()),
     };
-    // Saturate: anything past u32::MAX is too large for every type we have.
+    // The digits are valid, so the only way to fail is to overflow.
     Ok(IntLit {
-        value: u64::from_str_radix(digits, radix).unwrap_or(u64::MAX),
+        value: u64::from_str_radix(digits, radix).ok(),
         decimal: radix == 10,
         unsigned,
         long,
@@ -669,7 +672,14 @@ pub fn decode(text: &str, pos: Pos) -> Result<Vec<u8>, Error> {
             continue;
         }
         let start = k;
-        let e = body[k + 1];
+        // The lexer never ends a literal with a lone `\` (it would escape the
+        // quote), but a literal made some other way might.
+        let Some(&e) = body.get(k + 1) else {
+            return Err(Error::new(
+                at(start),
+                "'\\' at the end of a literal escapes nothing",
+            ));
+        };
         k += 2;
         let byte = match e {
             'n' => b'\n',
@@ -884,6 +894,10 @@ mod tests {
         assert_eq!(err("'\\x100'"), "1:2: hex escape sequence out of range");
         assert_eq!(err("'\\400'"), "1:2: octal escape sequence out of range");
         assert_eq!(err("'\\x'"), "1:2: \\x used with no following hex digits");
+        // The lexer cannot make a literal that ends in a lone backslash, but
+        // decode must not panic on one (the preprocessor's `#` once made it).
+        let e = decode(r#""a\""#, Pos::in_file(0, 1, 1)).unwrap_err();
+        assert_eq!(e.to_string(), "1:3: '\\' at the end of a literal escapes nothing");
     }
 
     #[test]

@@ -169,15 +169,19 @@ pub fn preprocess(name: &str, src: &str, opts: &Options, load: Loader) -> Result
 
 /// Writes tokens back as text (`merlin -E`): a line break where the source
 /// had one between them (a macro's expansion stays on the line it was
-/// used on), a space where it had whitespace or a comment.
+/// used on), a space where it had whitespace or a comment, and a space
+/// where two tokens that were not next to each other in the source would
+/// read as something else when written together (`-M` with `#define M -`
+/// is `- -`, not `--`), so that reading the output again gives the same
+/// tokens.
 pub fn spell(tokens: &[PpToken]) -> String {
     let mut out = String::new();
-    let mut last: Option<(u32, u32)> = None;
+    let mut last: Option<(u32, u32, &PpToken)> = None;
     for t in tokens {
         let here = (t.pos.file, t.pos.line);
         match last {
-            Some(l) if l == here => {
-                if t.space {
+            Some((file, line, prev)) if (file, line) == here => {
+                if t.space || merges(prev, t) {
                     out.push(' ');
                 }
             }
@@ -185,12 +189,23 @@ pub fn spell(tokens: &[PpToken]) -> String {
             None => {}
         }
         out.push_str(&t.text);
-        last = Some(here);
+        last = Some((here.0, here.1, t));
     }
     if !out.is_empty() {
         out.push('\n');
     }
     out
+}
+
+/// Whether `a` and `b`, written with nothing between them, would not read
+/// back as the same two tokens (`-` `-` is `--`, `1` `x` is `1x`, `/` `/`
+/// starts a comment).
+fn merges(a: &PpToken, b: &PpToken) -> bool {
+    let text = format!("{}{}", a.text, b.text);
+    match lexer::lex_pp(&text, a.pos.file) {
+        Ok((toks, _)) => !(toks.len() == 2 && toks[0].text == a.text && toks[1].text == b.text),
+        Err(_) => true,
+    }
 }
 
 /// A lexical form of a path for telling files apart: `.` dropped, `..`
@@ -693,7 +708,12 @@ impl Pp<'_> {
                 i += 1;
                 let mut s = here(t);
                 s.t.kind = PpKind::Str;
-                s.t.text = stringize(arg);
+                s.t.text = stringize(arg).ok_or_else(|| {
+                    Error::new(
+                        at.pos,
+                        "'#' produced an invalid string literal: it ends in a lone '\\'",
+                    )
+                })?;
                 vec![s]
             } else if let Some(p) = m.param(t) {
                 let arg = &args[p];
@@ -1237,8 +1257,10 @@ fn escape(s: &str) -> String {
 }
 
 /// `#arg`: the argument's spelling as a string literal, with the `\` and
-/// `"` of string literals and character constants in it escaped.
-fn stringize(arg: &[PTok]) -> String {
+/// `"` of string literals and character constants in it escaped. Other
+/// backslashes stay as they are, so an argument that ends in one (`s(\)`)
+/// has no valid literal (C leaves it undefined): `None`.
+fn stringize(arg: &[PTok]) -> Option<String> {
     let mut s = String::from("\"");
     for (k, t) in arg.iter().enumerate() {
         if k > 0 && t.t.space {
@@ -1250,8 +1272,13 @@ fn stringize(arg: &[PTok]) -> String {
             s.push_str(&t.t.text);
         }
     }
+    // An odd number of backslashes at the end would escape the closing quote.
+    let trailing = s.len() - s.trim_end_matches('\\').len();
+    if trailing % 2 == 1 {
+        return None;
+    }
     s.push('"');
-    s
+    Some(s)
 }
 
 /// `left ## right`: the two spellings joined, which must read as one token.
@@ -1417,9 +1444,15 @@ impl Eval<'_> {
             }
             PpKind::Number => {
                 let lit = lexer::integer(&t.text, t.pos)?;
+                let Some(bits) = lit.value else {
+                    return Err(Error::new(
+                        t.pos,
+                        "integer literal is too large to be represented in any integer type",
+                    ));
+                };
                 Ok(Val {
-                    bits: lit.value,
-                    unsigned: lit.unsigned || lit.value > i64::MAX as u64,
+                    bits,
+                    unsigned: lit.unsigned || bits > i64::MAX as u64,
                 })
             }
             PpKind::Char => match lexer::decode(&t.text, t.pos)?[..] {
@@ -1682,6 +1715,14 @@ puts( "The first, second, and third items." );
             same(r#""\"a\\n\" '\\''""#)
         );
         assert_eq!(pp("#define s(x) #x\n#define N 1\ns(N)"), same(r#""N""#));
+        // A backslash outside a literal stays as it is: one at the end would
+        // escape the closing quote, which C leaves undefined. Two are fine.
+        assert_eq!(
+            err("#define s(x) #x\nconst char *p = s(\\);"),
+            "main.c:2:17: error: '#' produced an invalid string literal: it ends in a lone '\\'"
+        );
+        assert!(err("#define s(x) #x\ns(a \\)").contains("lone '\\'"));
+        assert_eq!(pp("#define s(x) #x\ns(\\\\)"), same(r#""\\""#));
     }
 
     #[test]
@@ -1915,6 +1956,18 @@ puts( "The first, second, and third items." );
             err("#if 1 = 2\n#endif"),
             "main.c:1:7: error: unexpected '=' in preprocessor expression"
         );
+        // Past 64 bits a literal has no type at all: an error, not u64::MAX.
+        assert!(truth("18446744073709551615 == 0xffffffffffffffff"));
+        for big in [
+            "18446744073709551616",
+            "0x1ffffffffffffffff",
+            "99999999999999999999999",
+        ] {
+            assert_eq!(
+                err(&format!("#if {big} == 0\n#endif")),
+                "main.c:1:5: error: integer literal is too large to be represented in any integer type"
+            );
+        }
         assert_eq!(
             err("#if 1.0\n#endif"),
             "main.c:1:5: error: floating-point literals are not supported"
@@ -2121,5 +2174,19 @@ puts( "The first, second, and third items." );
         )
         .unwrap();
         assert_eq!(spell(&out.tokens), "int a=2 + 1;\nb ;\n");
+        // Tokens that meet only after expansion get a space where they
+        // would otherwise read as other tokens, so the output lexes back
+        // the same.
+        let src = "#define M -\n#define E\n#define f(a,b) a ## b\n#define g(x) x\n#define D /\n\
+                   int a = -M 1; int b = 1 -E- 1; int c = f(1, 2)3; int d = g(-)-1; int e = 1 D/ 2;\n\
+                   int h = g(x)+g(+)y;";
+        let out = run(&[], src, &Options::default()).unwrap();
+        let text = spell(&out.tokens);
+        assert_eq!(
+            text,
+            "int a = - - 1; int b = 1 - - 1; int c = 12 3; int d = - -1; int e = 1 / / 2;\n\
+             int h = x+ +y;\n"
+        );
+        assert_eq!(words(&lexer::lex_pp(&text, 0).unwrap().0), words(&out.tokens));
     }
 }

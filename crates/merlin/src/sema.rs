@@ -920,8 +920,42 @@ impl<'a> FnChecker<'a> {
         // The initializer of each subobject so far (`None`: zero). A
         // designation into a subobject changes what it had.
         let mut slots: Vec<Option<Init>> = match old {
+            None => Vec::new(),
             Some(Init::List(items, _)) => items.into_iter().map(Some).collect(),
-            _ => Vec::new(),
+            // `{ "ab", [0][3] = 'z' }`: the string becomes its characters,
+            // one item each, so the designation changes only the one it
+            // names (C99 6.7.8p19). Left-out ones, the NUL among them, are
+            // zero anyway.
+            Some(Init::Expr(Expr {
+                kind: ExprKind::Str(bytes),
+                pos: at,
+                ..
+            })) => {
+                let Type::Array(elem, _) = &*ty else {
+                    unreachable!("a string initializes a char array")
+                };
+                bytes
+                    .into_iter()
+                    .map(|b| {
+                        let mut c = Expr::new(ExprKind::Num(i64::from(b)), at);
+                        coerce(&mut c, elem);
+                        Some(Init::Expr(c))
+                    })
+                    .collect()
+            }
+            // `{ pv, .p.y = 9 }` keeps `pv`'s other members in C. That
+            // needs the value copied first and then changed, which merlin
+            // does not do: an error rather than a different meaning.
+            Some(Init::Expr(e)) => {
+                let msg = format!(
+                    "designator partially overrides an initializer of type '{}' given by an \
+                     expression; merlin does not support this",
+                    e.ty
+                );
+                let at = designators.first().map_or(pos, Designator::pos);
+                return Err(self.err(at, msg));
+            }
+            Some(Init::Designated(..)) => unreachable!("fill leaves no designations"),
         };
         let mut next = 0;
         loop {
@@ -2189,6 +2223,23 @@ mod tests {
         // A union keeps its last member.
         assert_eq!(braced("union u { char c; int i; } v = {.i = 7};"), "{{}, 7}");
         assert_eq!(braced("union u { char c; int i; } v = {.i = 7, .c = 1};"), "{1}");
+        // A designation into a string keeps its other characters.
+        assert_eq!(
+            braced("char s[2][4] = {\"ab\", [0][3] = 'z', [1] = \"c\", [1][0] = 'd'};"),
+            "{{97, 98, {}, 122}, {100}}"
+        );
+        // Into a struct given by an expression: C keeps the other members,
+        // which merlin cannot do, so it is an error.
+        assert_eq!(
+            err("struct p { int x, y; }; struct r { struct p p; int z; }; \
+                 int f(struct p v) { struct r r = {v, .p.y = 9}; return r.p.x; }"),
+            "1:97: designator partially overrides an initializer of type 'struct p' given by an \
+             expression; merlin does not support this"
+        );
+        assert_eq!(
+            err("int a[2] = {[2] = 1};"),
+            "1:14: array designator index (2) exceeds array bounds (2)"
+        );
         assert_eq!(
             err("int a[2] = {[2] = 1};"),
             "1:14: array designator index (2) exceeds array bounds (2)"

@@ -39,6 +39,9 @@ int sparse[] = {[5] = 50, [1] = 10, 20};
 struct shape global_shape = {.flags = 3, .at[1] = {7, 8}, .kind = 'g'};
 union value global_union = {.p = {4, 5}};
 
+/* A designator into a string changes one character and keeps the others. */
+char global_words[2][4] = {"ab", [0][3] = 'z', [1] = "cd", [1][0] = 'x'};
+
 int sum_points(const struct point *p, int n) {
     int s = 0;
     int i;
@@ -51,12 +54,28 @@ int len(struct point p) {
     return p.x + p.y;
 }
 
+/* Leaves non-zero words on the stack, where the next call's frame goes. */
+int dirty(void) {
+    volatile int junk[24];
+    int i;
+    for (i = 0; i < 24; i++)
+        junk[i] = -1;
+    return junk[5];
+}
+
+/* A compound literal's left-out parts are zero, whatever was on the stack. */
+int gaps(void) {
+    struct point *q = (struct point[]){[1].y = 5, [3].x = 6};
+    return q[0].x | q[0].y | q[1].x | q[2].x | q[2].y | q[3].y;
+}
+
 int main(void) {
     struct point p = {.y = 2, .x = 1};
     /* Going on after a designator: .at[0].y = 6, then .at[1] = {7, 8}. */
     struct shape s = {.at[0].y = 6, 7, 8, .kind = 's'};
     int m[3][3] = {[1] = {1, 2, 3}, [2][2] = 9, [0][1] = 4};
     union value u = {.i = 0x01020304};
+    char words[2][4] = {"ab", [0][3] = 'z', [1] = "cd", [1][1] = 'y'};
     int i;
     int total = 0;
 
@@ -79,6 +98,10 @@ int main(void) {
     /* Compound literals: unnamed objects, lvalues, made anew each time. */
     for (i = 0; i < 3; i++) {
         int *a = (int[]){i, i + 1, [3] = 10};
+        /* a[2] is not in the list: zero again on every pass. */
+        if (a[2] != 0)
+            return 13;
+        a[2] = 99;
         a[0] += 100;
         total += a[0] + a[1] + a[3];
     }
@@ -93,5 +116,14 @@ int main(void) {
         return 11;
     if (*&(int){12} != 12 || sizeof (char[]){"abc"} != 4)
         return 12;
+    if (words[0][0] != 'a' || words[0][1] != 'b' || words[0][2] || words[0][3] != 'z' ||
+        words[1][0] != 'c' || words[1][1] != 'y' || words[1][2])
+        return 14;
+    if (global_words[0][0] != 'a' || global_words[0][1] != 'b' || global_words[0][2] ||
+        global_words[0][3] != 'z' || global_words[1][0] != 'x' || global_words[1][1] != 'd')
+        return 15;
+    dirty();
+    if (gaps() != 0)
+        return 16;
     return sparse[5] + len(global_union.p) + (struct point){.y = 40}.y;
 }
