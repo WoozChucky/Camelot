@@ -1,4 +1,4 @@
-# Avalon Protocol v1
+# Avalon Protocol v2
 
 The wire protocol of the Avalon platform. Every program in it speaks this protocol:
 
@@ -15,7 +15,7 @@ The implementation is the `avalon-proto` crate (`crates/avalon-proto`): the mess
 
 - TCP, through `std::net`. One connection is one session; either side ends it by closing the socket.
 - Servers listen on loopback by default: Avalon on `127.0.0.1:7400`, Lake on `127.0.0.1:7401`. Listening on any other interface takes an explicit command-line flag.
-- **No authentication and no encryption in v1.** Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
+- **No authentication and no encryption** (versions 1 and 2). Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
 - A client and a server are both just byte streams to the protocol; tests run it over in-memory buffers as well as sockets.
 
 ## 2. Framing
@@ -57,6 +57,7 @@ Payloads are sequences of fields, in the order the message tables list them, wit
 | Type | Encoding |
 |---|---|
 | `u8`, `u16`, `u32`, `u64` | little-endian |
+| `i8`, `i32` | two's complement, little-endian |
 | `bool` | `u8`: 0 = false, 1 = true; anything else is invalid |
 | `bytes` | `u32` length, then that many bytes |
 | `string` | `bytes` holding UTF-8; invalid UTF-8 is invalid |
@@ -74,6 +75,7 @@ Rules beyond the field types, enforced by both the encoder and the decoder (`Mes
 
 - `ScreenFrame`: `width` and `height` non-zero, `pixels` exactly `width × height × 4` bytes.
 - `KeyInput`: key code not 0; flag bits other than 0-2 clear.
+- `PointerInput`: button bits other than 0-2 clear.
 - `BlockRead`: `count` from 1 to `MAX_BLOCK_SECTORS` (2048).
 - `BlockData`, `BlockWrite`: `data` a non-zero whole number of 512-byte sectors, at most 2048 sectors (1 MiB).
 - `Hello`: the payload starts with the magic `"AVLN"`.
@@ -134,6 +136,18 @@ On a command line a disk is one argument (the crate's `DiskSource::parse`): `lak
 
 **KeyEvent**, a key for the guest's keyboard device (Excalibur spec section 9.4): `code: u8` (a key code from the spec's table, never 0), `flags: u8` (bit 0 release, bit 1 Shift, bit 2 Ctrl; other bits must be 0).
 
+**PointerChange**, one change of a viewer's pointer for the guest's pointer device (Excalibur spec section 9.7): `motion: PointerMotion`, `buttons: u8` (the buttons held after the change: bit 0 left, bit 1 right, bit 2 middle, as in the device's `PTR_BUTTONS`; other bits must be 0), `wheel: i8` (notches turned, positive away from the user).
+
+**PointerMotion**:
+
+| Tag | Motion | Fields |
+|---|---|---|
+| 0 | none (a button or wheel change only) | |
+| 1 | to a pixel of the screen (absolute, like a tablet) | `x: u32`, `y: u32` |
+| 2 | by a distance (relative) | `dx: i32`, `dy: i32` |
+
+A position past the screen's edges is clamped to them by the server (the device clamps it), so a viewer may pass on where a drag that left its window went. The guest's device reports positions or distances, whichever mode it chose, from either kind of motion.
+
 **DiskInfo**: `name: string`, `sectors: u64` (512-byte sectors), `readers: u32` (read-only attachments now), `writer: bool` (a writer has it attached).
 
 **Names**: VM and disk names (`validate_name`) are 1 to 64 bytes of lowercase ASCII letters, digits, `.`, `_` and `-`, and
@@ -168,7 +182,7 @@ Every message type is one of three kinds (the catalogue in section 6 says which)
 
 - **Request**, client to server. The server answers every request with exactly one **reply**, in the order the requests arrived, so a client may send several requests before reading the replies.
 - **Reply**, server to client: `Ok` (success, nothing to return), `Error` (section 5), or a request-specific result (`VmCreated`, `VmList`, ...).
-- **Event**, never answered: console and screen streams (`ConsoleOutput`, `ScreenFrame`), client input (`ConsoleInput`, `KeyInput`), and notifications (`VmStateChanged`, `Detached`). Server events can arrive at any time between replies, so a client reading a reply sets aside the events it reads first (the crate's `Connection::request` queues them for `recv`).
+- **Event**, never answered: console and screen streams (`ConsoleOutput`, `ScreenFrame`), client input (`ConsoleInput`, `KeyInput`, `PointerInput`), and notifications (`VmStateChanged`, `Detached`). Server events can arrive at any time between replies, so a client reading a reply sets aside the events it reads first (the crate's `Connection::request` queues them for `recv`).
 
 There are no request ids: replies match requests by order. So that order is never lost, these rules hold even for bad frames:
 
@@ -244,6 +258,7 @@ Codes are grouped by their high byte. Req = request, Rep = reply, Ev = event; C�
 | 0x0303 | `ScreenFrame` | Ev | S→C | |
 | 0x0304 | `KeyInput` | Ev | C→S | |
 | 0x0305 | `ScreenDetach` | Req | C→S | `Ok` |
+| 0x0306 | `PointerInput` | Ev | C→S | |
 | **0x04xx** | **block I/O** (Lake) | | | |
 | 0x0401 | `BlockOpen` | Req | C→S | `BlockOpened` |
 | 0x0402 | `BlockOpened` | Rep | S→C | |
@@ -273,11 +288,11 @@ Any request can also be answered by `Error`. A server answers requests from a gr
 | `Ping` | `token: u32` |
 | `Pong` | `token: u32` (the `Ping`'s) |
 
-Example, `Hello` version 1 from agent `"rt"`:
+Example, `Hello` version 2 from agent `"rt"`:
 
 ```
-0e 00 00 00  01 00  41 56 4c 4e  01 00  02 00 00 00  72 74
-length 14    Hello  "AVLN"       v1     agent "rt"
+0e 00 00 00  01 00  41 56 4c 4e  02 00  02 00 00 00  72 74
+length 14    Hello  "AVLN"       v2     agent "rt"
 ```
 
 ### 6.2 VM control
@@ -293,9 +308,9 @@ length 14    Hello  "AVLN"       v1     agent "rt"
 | `StartVm` | `vm: VmRef` | created → running |
 | `PauseVm` | `vm: VmRef` | running → paused |
 | `ResumeVm` | `vm: VmRef` | paused → running |
-| `StopVm` | `vm: VmRef` | created, running or paused → stopped. A stopped or exited VM cannot be restarted in v1; destroy it and create a new one |
+| `StopVm` | `vm: VmRef` | created, running or paused → stopped. A stopped or exited VM cannot be restarted; destroy it and create a new one |
 | `DestroyVm` | `vm: VmRef` | any state; frees the VM, detaches its clients (`Detached`), and its name can be reused |
-| `VmStateChanged` | `vm: u32`, `state: VmState` | sent to every client attached to the VM (console or screen) when its state changes, including when its program exits |
+| `VmStateChanged` | `vm: u32`, `state: VmState` | sent to every client attached to the VM (console or screen; once to a client attached to both) when its state changes, including when its program exits |
 | `Detached` | `vm: u32`, `kind: u8` (1 console, 2 screen) | the server ended an attachment, because the VM was destroyed. Not sent in answer to `ConsoleDetach`/`ScreenDetach` |
 
 A request for a transition from the wrong state gets `InvalidState`.
@@ -325,17 +340,28 @@ Several clients may attach to one VM's console: all of them get the output, and 
 
 ### 6.4 Screen and input
 
-The screen is the VM's framebuffer (Excalibur spec section 9.3), the input its keyboard device (section 9.4).
+The screen is the VM's framebuffer (Excalibur spec section 9.3); the input goes to its keyboard (section 9.4) and pointer (section 9.7) devices. A client attached to a VM's screen is a **viewer** of it.
 
 | Message | Payload | Notes |
 |---|---|---|
-| `ScreenAttach` | `vm: VmRef` | |
-| `ScreenAttached` | `vm: u32`, `width: u32`, `height: u32`, `format: u32` | Grail: 640, 480, format 0. A full `ScreenFrame` follows, then a frame whenever the screen changes |
-| `ScreenFrame` | `vm: u32`, `x: u32`, `y: u32`, `width: u32`, `height: u32`, `pixels: bytes` | the rectangle at (`x`, `y`), rows top to bottom, `width × height × 4` bytes in the attachment's format |
-| `KeyInput` | `vm: u32`, `key: KeyEvent` | delivered to the VM's keyboard device as if typed into Grail's window |
-| `ScreenDetach` | `vm: u32` | |
+| `ScreenAttach` | `vm: VmRef` | Errors: `NoSuchVm` |
+| `ScreenAttached` | `vm: u32`, `width: u32`, `height: u32`, `format: u32` | the VM's id and its screen. Avalon: 640, 480, format 0. A full `ScreenFrame` follows, then frames whenever the screen changes. Attaching again resends the full frame; the stream is not doubled |
+| `ScreenFrame` | `vm: u32`, `x: u32`, `y: u32`, `width: u32`, `height: u32`, `pixels: bytes` | the rectangle at (`x`, `y`), rows top to bottom, `width × height × 4` bytes in the attachment's format. It lies inside the screen; a viewer treats one that does not as a broken server |
+| `KeyInput` | `vm: u32`, `key: KeyEvent` | for the VM's keyboard device, as if typed into Grail's window |
+| `ScreenDetach` | `vm: u32` | the VM keeps running. Errors: `NoSuchVm`, `InvalidState` (this connection is not attached to it) |
+| `PointerInput` | `vm: u32`, `pointer: PointerChange` | for the VM's pointer device, as if the mouse moved over Grail's window |
 
-Format 0 is XRGB8888: each pixel a little-endian word `0x00RRGGBB` (bytes B, G, R, X), the same as Grail's VRAM. An unchanged screen sends no frames. v1 servers may send only full frames; the rectangle fields let later ones send just what changed without a protocol change.
+Format 0 is XRGB8888: each pixel a little-endian word `0x00RRGGBB` (bytes B, G, R, X), the same as Grail's VRAM. A display the guest has turned off (`FB_CTRL.ENABLE` clear) is black, as in Grail's window.
+
+**What is sent.** After the full frame, a viewer gets only what changed: frames are rectangles, and applying them in order to the screen it has gives the VM's screen. An unchanged screen sends no frames at all. The crate's `Screen` is both ends of this: a server keeps one per VM, exactly what its viewers were last sent, and `Screen::update` compares the framebuffer with it in tiles of 32 × 32 pixels and returns the changed area as rectangles (consecutive changed tiles of a tile row make one, which grows downwards while the rows below change over the same columns, so a whole new screen is one rectangle); a viewer starts from black and applies each frame with `Screen::apply_frame`.
+
+**Rate.** However often the guest draws, Avalon looks at a VM's screen at most once every 33 ms (`SCREEN_INTERVAL`, about 30 updates a second), and only while someone is attached and the VM has run since the last look; what changed in between goes out together, as its latest pixels. A guest's `FB_PRESENT` does not send a frame by itself: viewers see the framebuffer, presented or not, as Grail's window does. When the program exits, or the VM is stopped, its last frame is sent before the `VmStateChanged` that says so, so a viewer that ends on that event has the VM's last screen; a viewer attaching to a stopped or exited VM gets that last frame.
+
+**Backlog.** Frames go through the client's queue like every event (section 8), so a viewer on a slow link must not fall behind without limit: one with more than 2 MiB queued and not yet written (`SCREEN_BACKLOG`, a little over one full frame) is sent no updates; once its queue has drained it is sent one full frame, which brings it level with the other viewers. A slow viewer sees fewer frames rather than older ones, and is not cut off for falling 8 MiB behind.
+
+**Input.** `KeyInput` and `PointerInput` are taken only from a viewer of the VM (they are events: from anyone else they are dropped, unanswered), and only while it can still run (created, running or paused). Keys reach the keyboard, and pointer changes the pointer, each in the order the server receives them, between two slices of the VM's run, as Grail's window hands over its input (the two are separate devices, with a FIFO each: the order between a key and a pointer change that arrive for the same slice is not kept, here or in Grail's window); input sent before the VM starts, or while it is paused, waits for it, up to 256 keys and 256 pointer changes per VM, past which more are dropped (as the devices' own FIFOs drop events when full). A viewer that reports a mouse's many moves may send only the last of a run of moves with the same buttons held: only where the pointer ends up matters. A button change (a press or a release, which Grail's window reports as a move to where it happened) is not part of the run before or after it: it is sent where it happened, so that a drag starts and ends where it did.
+
+Several clients may view one VM: all of them get its frames, and input from any of them reaches it. One connection may view several VMs, and view and attach to the console of the same VM; the `vm` field says which stream a frame belongs to.
 
 ### 6.5 Block I/O
 
@@ -374,11 +400,18 @@ The Avalon server does not open Lake disks yet: until Lake (#39) lands, a `Creat
 
 ## 7. Versioning
 
-- The protocol version is a `u16`, currently **1** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
+- The protocol version is a `u16`, currently **2** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
 - Any change to the catalogue bumps the version: a new message type, a new field, a new enum variant or tag, a changed layout or a changed rule. (Unknown codes and tags are errors in the decoder, so an old peer could not read them anyway.)
 - Three things never change, in any version, so that peers of different versions can always tell each other so: the frame header (`u32` length, `u16` type), the `Hello` and `Welcome` messages (codes 0x0001 and 0x0002 and their layouts) and the `Error` message (code 0x0003 and its layout). Error codes are never reused or renumbered; new ones may be added with a version bump.
 - Things that are deliberately open-ended and need no new version: `DeviceEntry.kind` (sysinfo device type codes come from the Excalibur spec), `ScreenAttached.format` values a server chooses to send, free-text fields.
-- This document describes version 1. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
+- This document describes version 2. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
+
+History:
+
+| Version | Change |
+|---|---|
+| 1 | the first version |
+| 2 | `PointerInput` (0x0306) with the `PointerChange` and `PointerMotion` structures, and the `i8` and `i32` field types, for the guest's pointer device; Avalon serves the screen and input group (section 6.4), which version 1 servers answered with `Unsupported` |
 
 ## 8. Limits
 
@@ -388,6 +421,9 @@ The Avalon server does not open Lake disks yet: until Lake (#39) lands, a `Creat
 | `MAX_BLOCK_SECTORS` | 2048 (1 MiB) | per `BlockRead`/`BlockWrite` |
 | `SECTOR_SIZE` | 512 | block I/O |
 | `MAX_NAME_LEN` | 64 | VM and disk names |
+| screen updates | at most one look every 33 ms per VM | Avalon (`SCREEN_INTERVAL`) |
+| viewer backlog | 2 MiB queued, then no screen updates until it drains | Avalon (`SCREEN_BACKLOG`) |
+| input waiting | 256 keys and 256 pointer changes per VM | Avalon (`MAX_INPUT_QUEUE`) |
 | default Avalon address | `127.0.0.1:7400` | |
 | default Lake address | `127.0.0.1:7401` | |
 

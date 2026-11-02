@@ -12,9 +12,10 @@
 //!   in-memory pipe in tests) that sends and receives messages, does the version
 //!   handshake and matches requests to replies.
 //!
-//! Plus what every program's command line shares: [`parse_listen`] for a server's
-//! `--listen`, and [`DiskSource::parse`] for a disk argument (a path or
-//! `lake://addr/name`).
+//! Plus [`Screen`], a VM's screen as a server and its viewers keep it, with the change
+//! detection that turns a framebuffer into `ScreenFrame` rectangles; and what every
+//! program's command line shares: [`parse_listen`] for a server's `--listen`, and
+//! [`DiskSource::parse`] for a disk argument (a path or `lake://addr/name`).
 //!
 //! Everything a peer sends is checked: a truncated, oversize or otherwise malformed
 //! frame is an [`Error`], never a panic or an unbounded allocation.
@@ -26,16 +27,18 @@ mod addr;
 pub mod conn;
 pub mod frame;
 pub mod message;
+pub mod screen;
 mod wire;
 
 pub use addr::{default_port, parse_listen, LAKE_SCHEME};
 pub use conn::Connection;
 pub use frame::{decode, encode, read_frame, write_frame, Frame};
 pub use message::*;
+pub use screen::{Rect, Screen};
 
 /// Protocol version carried by the handshake. Both sides must speak the same one; any
 /// change to the message catalogue (a new message, field or enum value) bumps it.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// First four payload bytes of `Hello`, so a server can tell an Avalon client from a
 /// stray connection.
@@ -59,7 +62,7 @@ pub const MAX_BLOCK_SECTORS: u32 = 2048;
 pub const MAX_NAME_LEN: usize = 64;
 
 /// Where Avalon listens by default. Listening on any other interface takes an explicit
-/// flag, since v1 has no authentication.
+/// flag, since the protocol has no authentication.
 pub const DEFAULT_AVALON_ADDR: &str = "127.0.0.1:7400";
 
 /// Where Lake listens by default.

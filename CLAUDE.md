@@ -21,11 +21,11 @@ Camelot is a learning project: the Excalibur ISA (RV32IMA + Zicsr, M/S/U, Sv32, 
 crates/excalibur        encodings, decoder, disassembler (shared by every tool)
 crates/elf32            ELF32 reader (grail, merlin-objdump, merlin-ld)
 crates/grail            the emulator
-crates/avalon-proto     Avalon protocol (framing, messages, Connection), shared by the Avalon platform's programs; spec in docs/avalon-protocol.md
-crates/avalon           the Avalon hypervisor server: VM table, one thread per running VM (run_for slices), consoles, RAM budget
+crates/avalon-proto     Avalon protocol (framing, messages, Connection, Screen diffing), shared by the Avalon platform's programs; spec in docs/avalon-protocol.md
+crates/avalon           the Avalon hypervisor server: VM table, one thread per running VM (run_for slices), consoles, screen viewers and input, RAM budget
 crates/avalon-client    the client layer: VM control and disk management operations, parsers/formatters for addresses, sizes, clocks, disk sources (shared by Round Table and Pendragon; reuses grail::parse_ram_mib/parse_clock)
 crates/round-table      the Round Table control CLI: argument parsing and text output over avalon-client (src/lib.rs `run`, main.rs is a thin wrapper)
-crates/herald           Herald, the client that attaches to one VM: Session (the streaming layer, terminal-free) and the CLI, which puts the terminal in raw mode with grail::console::RawMode
+crates/herald           Herald, the client that attaches to one VM: Session (the console streaming layer, terminal-free), screen::ScreenSession (the screen and input, window-free, drawing through a View) and the CLI, which puts the terminal in raw mode with grail::console::RawMode or shows the screen in grail::window (--screen)
 crates/lake             the Lake storage server: a directory of disk images served over the protocol (one writer or many readers per image); Grail's client side is grail::lake::LakeDisk
 crates/camelot-fs       the Camelot filesystem on the host (docs/camelot-fs.md): format structs, mkfs, fsck and log replay, a reader, the `camelot-fs` command; the kernel's side is kernel/log.c and kernel/fs.c
 crates/merlin           the C-subset compiler, C to .s (src/codegen.rs explains the stack frames and code generation, src/abi.rs the calling convention)

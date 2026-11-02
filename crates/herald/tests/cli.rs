@@ -25,7 +25,11 @@ fn help_and_bad_flags() {
     let out = run(&["--help"]);
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.starts_with("usage: herald [--server ADDR] <vm>"), "{text}");
+    assert!(
+        text.starts_with("usage: herald [--server ADDR] [--screen] <vm>"),
+        "{text}"
+    );
+    assert!(text.contains("--screen"), "{text}");
     assert!(text.contains("Ctrl-] detaches"), "{text}");
     for args in [
         &[][..],
@@ -58,6 +62,42 @@ fn nothing_to_connect_to() {
         err.starts_with(&format!("herald: cannot connect to 127.0.0.1:{port}: ")),
         "{err}"
     );
+}
+
+/// `--screen` with nothing to show it on: Herald has its window on Windows only, and
+/// says so elsewhere before it connects; on Windows, no server is an error as for the
+/// console.
+#[test]
+fn screen_without_a_window_or_a_server() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let out = run(&["--screen", "--server", &format!("127.0.0.1:{port}"), "vm"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    let expected = if cfg!(windows) {
+        format!("herald: cannot connect to 127.0.0.1:{port}: ")
+    } else {
+        "herald: --screen shows the VM's screen in a window, which Herald only has on Windows".to_string()
+    };
+    assert!(err.starts_with(&expected), "{err}");
+}
+
+/// `--screen` for a VM the server does not have fails before any window opens.
+#[cfg(windows)]
+#[test]
+fn no_such_vm_to_show() {
+    let server = server();
+    let out = run(&["--server", &server.addr().to_string(), "--screen", "ghost"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.starts_with("herald: cannot attach to the screen of VM ghost: no such VM"),
+        "{err}"
+    );
+    server.stop().unwrap();
 }
 
 #[test]
