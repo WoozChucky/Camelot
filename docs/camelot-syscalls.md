@@ -67,8 +67,12 @@ has collected it (or at once, if it has no parent any more). Its children
 are orphaned: they keep running, and nobody collects them. When the first
 process, the shell, exits, the kernel runs until every remaining process has
 ended and then stops the machine with the shell's status as the exit code
-(its low 8 bits, so `exit -2` gives 0xFE). Returning from `main` calls
-`exit` with the return value (`crt0.s`).
+(its low 8 bits, so `exit -2` gives 0xFE). That includes a process blocked
+reading the console, which keeps the machine running until it gets a line
+or the end of the input (`sh &`, then `exit` in the first shell, leaves the
+second one reading). Note that 0xFE is also the code of a kernel panic: the
+exit code alone can't tell `exit -2` from a panic, the console output can.
+Returning from `main` calls `exit` with the return value (`crt0.s`).
 
 A process that faults in U-mode (any exception but `ecall`: a page fault, an
 illegal instruction such as `xcal.halt`, a misaligned access) is killed
@@ -117,7 +121,8 @@ array can go as soon as `spawn` returns. Errors:
 - `-EAGAIN`: every one of the 8 process slots is taken (zombies count until
   they are collected);
 - `-ENOMEM`: not enough free memory;
-- `-EFAULT`: `name`, `argv` or one of the strings is not readable.
+- `-EFAULT`: `name`, `argv` or one of the strings is not readable (a name
+  longer than any program's is still read to its NUL).
 
 **wait(pid, status)** collects a child that has ended and returns its pid:
 the child `pid`, or any child if `pid` is -1. If none has ended yet, it

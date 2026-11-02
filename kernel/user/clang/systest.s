@@ -25,7 +25,7 @@ main:                                   # @main
 	sw	s10, 720(sp)                    # 4-byte Folded Spill
 	mv	s0, a1
 	li	a1, 2
-	blt	a0, a1, .LBB0_4
+	blt	a0, a1, .LBB0_6
 # %bb.1:
 	mv	s1, a0
 	lw	a0, 4(s0)
@@ -34,10 +34,610 @@ main:                                   # @main
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi0)
 	call	strcmp
 	li	s2, 3
-	bne	s1, s2, .LBB0_55
+	bne	s1, s2, .LBB0_57
 # %bb.2:
-	bnez	a0, .LBB0_55
+	bnez	a0, .LBB0_57
 # %bb.3:
+	lw	a0, 8(s0)
+	call	atoi
+	mv	s1, a0
+	li	a0, 0
+	call	sbrk
+	mv	s0, a0
+	mv	a0, s1
+	call	sbrk
+	mv	s2, a0
+	srai	a0, a0, 31
+	and	a2, a0, s2
+.Lpcrel_hi1:
+	auipc	a0, %pcrel_hi(.L.str.9)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi1)
+	mv	a1, s1
+	call	printf
+	bltz	s2, .LBB0_110
+# %bb.4:
+	bne	s2, s0, .LBB0_126
+# %bb.5:
+	li	a0, 0
+	call	sbrk
+	add	s0, s0, s1
+	xor	a0, a0, s0
+	snez	a0, a0
+	j	.LBB0_164
+.LBB0_6:
+	call	getpid
+	mv	s0, a0
+.Lpcrel_hi10:
+	auipc	a0, %pcrel_hi(.L_MergedGlobals)
+	addi	s7, a0, %pcrel_lo(.Lpcrel_hi10)
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	li	a1, 1
+	sw	a0, 0(s7)
+	blt	a1, s0, .LBB0_8
+# %bb.7:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi11:
+	auipc	a0, %pcrel_hi(.L.str.19)
+.Lpcrel_hi12:
+	auipc	a1, %pcrel_hi(.L.str.10)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi11)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi12)
+	call	printf
+.LBB0_8:
+	call	getpid
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beq	a2, s0, .LBB0_10
+# %bb.9:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi13:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi14:
+	auipc	a1, %pcrel_hi(.L.str.11)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi13)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi14)
+	mv	a3, s0
+	call	printf
+.LBB0_10:
+	call	uptime
+	lw	a1, 0(s7)
+	addi	a1, a1, 1
+	li	a2, 9
+	sw	a1, 0(s7)
+	bltu	a2, a0, .LBB0_12
+# %bb.11:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi15:
+	auipc	a0, %pcrel_hi(.L.str.19)
+.Lpcrel_hi16:
+	auipc	a1, %pcrel_hi(.L.str.12)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi15)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi16)
+	call	printf
+.LBB0_12:
+	call	yield
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beqz	a2, .LBB0_14
+# %bb.13:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi17:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi18:
+	auipc	a1, %pcrel_hi(.L.str.13)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi17)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi18)
+	li	a3, 0
+	call	printf
+.LBB0_14:
+	call	uptime
+	mv	s0, a0
+	li	a0, 3
+	call	sleep
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beqz	a2, .LBB0_16
+# %bb.15:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi19:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi20:
+	auipc	a1, %pcrel_hi(.L.str.3)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi19)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi20)
+	li	a3, 0
+	call	printf
+.LBB0_16:
+	call	uptime
+	lw	a1, 0(s7)
+	sub	a0, a0, s0
+	addi	a1, a1, 1
+	li	a2, 2
+	sw	a1, 0(s7)
+	bltu	a2, a0, .LBB0_18
+# %bb.17:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi21:
+	auipc	a0, %pcrel_hi(.L.str.19)
+.Lpcrel_hi22:
+	auipc	a1, %pcrel_hi(.L.str.14)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi21)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi22)
+	call	printf
+.LBB0_18:
+	li	a0, 0
+	call	sleep
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beqz	a2, .LBB0_20
+# %bb.19:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi23:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi24:
+	auipc	a1, %pcrel_hi(.L.str.15)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi23)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi24)
+	li	a3, 0
+	call	printf
+.LBB0_20:
+	li	a0, 0
+	li	a1, 0
+	li	a2, 0
+	li	a3, 0
+	call	syscall
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	li	s0, -38
+	sw	a0, 0(s7)
+	beq	a2, s0, .LBB0_22
+# %bb.21:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi25:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi26:
+	auipc	a1, %pcrel_hi(.L.str.16)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi25)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi26)
+	li	a3, -38
+	call	printf
+.LBB0_22:
+	li	a0, 11
+	li	a1, 0
+	li	a2, 0
+	li	a3, 0
+	call	syscall
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beq	a2, s0, .LBB0_24
+# %bb.23:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi27:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi28:
+	auipc	a1, %pcrel_hi(.L.str.17)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi27)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi28)
+	li	a3, -38
+	call	printf
+.LBB0_24:
+	li	a0, -1
+	li	a1, 0
+	li	a2, 0
+	li	a3, 0
+	call	syscall
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	li	a1, -38
+	sw	a0, 0(s7)
+	beq	a2, a1, .LBB0_26
+# %bb.25:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi29:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi30:
+	auipc	a1, %pcrel_hi(.L.str.18)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi29)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi30)
+	li	a3, -38
+	call	printf
+.LBB0_26:
+.Lpcrel_hi31:
+	auipc	a0, %pcrel_hi(.L.str.8)
+	addi	a1, a0, %pcrel_lo(.Lpcrel_hi31)
+	li	a2, 1
+	li	a0, 0
+	call	write
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	li	s0, -9
+	sw	a0, 0(s7)
+	beq	a2, s0, .LBB0_28
+# %bb.27:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi32:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi33:
+	auipc	a1, %pcrel_hi(.L.str.21)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi32)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi33)
+	li	a3, -9
+	call	printf
+.LBB0_28:
+.Lpcrel_hi34:
+	auipc	a1, %pcrel_hi(.L.str.8)
+	li	a0, 3
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi34)
+	li	a2, 1
+	call	write
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beq	a2, s0, .LBB0_30
+# %bb.29:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi35:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi36:
+	auipc	a1, %pcrel_hi(.L.str.22)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi35)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi36)
+	li	a3, -9
+	call	printf
+.LBB0_30:
+.Lpcrel_hi37:
+	auipc	a1, %pcrel_hi(.L.str.8)
+	li	a0, -1
+	addi	s0, a1, %pcrel_lo(.Lpcrel_hi37)
+	li	a2, 1
+	mv	a1, s0
+	call	write
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	li	s1, -9
+	sw	a0, 0(s7)
+	beq	a2, s1, .LBB0_32
+# %bb.31:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi38:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi39:
+	auipc	a1, %pcrel_hi(.L.str.23)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi38)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi39)
+	li	a3, -9
+	call	printf
+.LBB0_32:
+	li	a0, 1
+	addi	a1, sp, 12
+	li	a2, 1
+	call	read
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beq	a2, s1, .LBB0_34
+# %bb.33:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi40:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi41:
+	auipc	a1, %pcrel_hi(.L.str.24)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi40)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi41)
+	li	a3, -9
+	call	printf
+.LBB0_34:
+	li	a0, 7
+	addi	a1, sp, 12
+	li	a2, 1
+	call	read
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	li	a1, -9
+	sw	a0, 0(s7)
+	beq	a2, a1, .LBB0_36
+# %bb.35:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi42:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi43:
+	auipc	a1, %pcrel_hi(.L.str.25)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi42)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi43)
+	li	a3, -9
+	call	printf
+.LBB0_36:
+.Lpcrel_hi44:
+	auipc	a0, %pcrel_hi(.L.str.6)
+	addi	a1, a0, %pcrel_lo(.Lpcrel_hi44)
+	li	a0, 1
+	li	a2, 0
+	call	write
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beqz	a2, .LBB0_38
+# %bb.37:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi45:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi46:
+	auipc	a1, %pcrel_hi(.L.str.26)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi45)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi46)
+	li	a3, 0
+	call	printf
+.LBB0_38:
+	addi	a1, sp, 12
+	li	a0, 0
+	li	a2, 0
+	call	read
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beqz	a2, .LBB0_40
+# %bb.39:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi47:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi48:
+	auipc	a1, %pcrel_hi(.L.str.27)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi47)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi48)
+	li	a3, 0
+	call	printf
+.LBB0_40:
+.Lpcrel_hi49:
+	auipc	a0, %pcrel_hi(.L.str.6)
+	addi	a1, a0, %pcrel_lo(.Lpcrel_hi49)
+	li	a0, 2
+	li	a2, 0
+	call	write
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beqz	a2, .LBB0_42
+# %bb.41:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi50:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi51:
+	auipc	a1, %pcrel_hi(.L.str.28)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi50)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi51)
+	li	a3, 0
+	call	printf
+.LBB0_42:
+	li	s1, 7
+	sw	s1, 716(sp)
+	li	a0, -1
+	addi	a1, sp, 716
+	call	wait
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	li	a1, -10
+	sw	a0, 0(s7)
+	beq	a2, a1, .LBB0_44
+# %bb.43:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi52:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi53:
+	auipc	a1, %pcrel_hi(.L.str.29)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi52)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi53)
+	li	a3, -10
+	call	printf
+	lw	a0, 0(s7)
+.LBB0_44:
+	lw	a2, 716(sp)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beq	a2, s1, .LBB0_46
+# %bb.45:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi54:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi55:
+	auipc	a1, %pcrel_hi(.L.str.30)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi54)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi55)
+	li	a3, 7
+	call	printf
+.LBB0_46:
+	li	a0, 1
+	addi	a1, sp, 716
+	call	wait
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	li	a1, -10
+	sw	a0, 0(s7)
+	beq	a2, a1, .LBB0_48
+# %bb.47:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi56:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi57:
+	auipc	a1, %pcrel_hi(.L.str.31)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi56)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi57)
+	li	a3, -10
+	call	printf
+.LBB0_48:
+.Lpcrel_hi58:
+	auipc	a0, %pcrel_hi(.L.str.32)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi58)
+	li	a1, 0
+	call	spawn
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	li	s1, -2
+	sw	a0, 0(s7)
+	beq	a2, s1, .LBB0_50
+# %bb.49:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi59:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi60:
+	auipc	a1, %pcrel_hi(.L.str.33)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi59)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi60)
+	li	a3, -2
+	call	printf
+.LBB0_50:
+.Lpcrel_hi61:
+	auipc	a0, %pcrel_hi(.L.str.6)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi61)
+	li	a1, 0
+	call	spawn
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beq	a2, s1, .LBB0_52
+# %bb.51:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi62:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi63:
+	auipc	a1, %pcrel_hi(.L.str.34)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi62)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi63)
+	li	a3, -2
+	call	printf
+.LBB0_52:
+.Lpcrel_hi64:
+	auipc	a0, %pcrel_hi(.L.str.35)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi64)
+	li	a1, 0
+	call	spawn
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	li	a1, -2
+	sw	a0, 0(s7)
+	beq	a2, a1, .LBB0_54
+# %bb.53:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi65:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi66:
+	auipc	a1, %pcrel_hi(.L.str.36)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi65)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi66)
+	li	a3, -2
+	call	printf
+.LBB0_54:
+.Lpcrel_hi67:
+	auipc	a0, %pcrel_hi(.L.str.5)
+.Lpcrel_hi68:
+	auipc	a1, %pcrel_hi(.L.str.2)
+.Lpcrel_hi69:
+	auipc	a2, %pcrel_hi(.L.str.37)
+	addi	s1, a0, %pcrel_lo(.Lpcrel_hi67)
+	addi	s8, a1, %pcrel_lo(.Lpcrel_hi68)
+	addi	a0, a2, %pcrel_lo(.Lpcrel_hi69)
+	sw	s1, 12(sp)
+	sw	s8, 16(sp)
+	sw	a0, 20(sp)
+	sw	zero, 24(sp)
+	addi	a1, sp, 12
+	mv	a0, s1
+	call	spawn
+	mv	s2, a0
+	bltz	a0, .LBB0_60
+# %bb.55:
+	li	a0, -1000
+	sw	a0, 524(sp)
+	addi	a1, sp, 524
+	mv	a0, s2
+	call	wait
+	beq	a0, s2, .LBB0_61
+# %bb.56:
+	addi	s2, a0, -1000
+	j	.LBB0_62
+.LBB0_57:
+	lw	a0, 4(s0)
+.Lpcrel_hi2:
+	auipc	a1, %pcrel_hi(.L.str.2)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi2)
+	call	strcmp
+	bne	s1, s2, .LBB0_106
+# %bb.58:
+	bnez	a0, .LBB0_106
+# %bb.59:
 	lw	a0, 8(s0)
 	lw	ra, 764(sp)                     # 4-byte Folded Reload
 	lw	s0, 760(sp)                     # 4-byte Folded Reload
@@ -53,614 +653,35 @@ main:                                   # @main
 	lw	s10, 720(sp)                    # 4-byte Folded Reload
 	addi	sp, sp, 768
 	tail	atoi
-.LBB0_4:
-	call	getpid
-	mv	s0, a0
-.Lpcrel_hi8:
-	auipc	a0, %pcrel_hi(.L_MergedGlobals)
-	addi	s7, a0, %pcrel_lo(.Lpcrel_hi8)
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	li	a1, 1
-	sw	a0, 0(s7)
-	blt	a1, s0, .LBB0_6
-# %bb.5:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi9:
-	auipc	a0, %pcrel_hi(.L.str.17)
-.Lpcrel_hi10:
-	auipc	a1, %pcrel_hi(.L.str.8)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi9)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi10)
-	call	printf
-.LBB0_6:
-	call	getpid
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beq	a2, s0, .LBB0_8
-# %bb.7:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi11:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi12:
-	auipc	a1, %pcrel_hi(.L.str.9)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi11)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi12)
-	mv	a3, s0
-	call	printf
-.LBB0_8:
-	call	uptime
-	lw	a1, 0(s7)
-	addi	a1, a1, 1
-	li	a2, 9
-	sw	a1, 0(s7)
-	bltu	a2, a0, .LBB0_10
-# %bb.9:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi13:
-	auipc	a0, %pcrel_hi(.L.str.17)
-.Lpcrel_hi14:
-	auipc	a1, %pcrel_hi(.L.str.10)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi13)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi14)
-	call	printf
-.LBB0_10:
-	call	yield
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beqz	a2, .LBB0_12
-# %bb.11:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi15:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi16:
-	auipc	a1, %pcrel_hi(.L.str.11)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi15)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi16)
-	li	a3, 0
-	call	printf
-.LBB0_12:
-	call	uptime
-	mv	s0, a0
-	li	a0, 3
-	call	sleep
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beqz	a2, .LBB0_14
-# %bb.13:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi17:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi18:
-	auipc	a1, %pcrel_hi(.L.str.2)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi17)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi18)
-	li	a3, 0
-	call	printf
-.LBB0_14:
-	call	uptime
-	lw	a1, 0(s7)
-	sub	a0, a0, s0
-	addi	a1, a1, 1
-	li	a2, 2
-	sw	a1, 0(s7)
-	bltu	a2, a0, .LBB0_16
-# %bb.15:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi19:
-	auipc	a0, %pcrel_hi(.L.str.17)
-.Lpcrel_hi20:
-	auipc	a1, %pcrel_hi(.L.str.12)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi19)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi20)
-	call	printf
-.LBB0_16:
-	li	a0, 0
-	call	sleep
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beqz	a2, .LBB0_18
-# %bb.17:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi21:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi22:
-	auipc	a1, %pcrel_hi(.L.str.13)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi21)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi22)
-	li	a3, 0
-	call	printf
-.LBB0_18:
-	li	a0, 0
-	li	a1, 0
-	li	a2, 0
-	li	a3, 0
-	call	syscall
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	li	s0, -38
-	sw	a0, 0(s7)
-	beq	a2, s0, .LBB0_20
-# %bb.19:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi23:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi24:
-	auipc	a1, %pcrel_hi(.L.str.14)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi23)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi24)
-	li	a3, -38
-	call	printf
-.LBB0_20:
-	li	a0, 11
-	li	a1, 0
-	li	a2, 0
-	li	a3, 0
-	call	syscall
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beq	a2, s0, .LBB0_22
-# %bb.21:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi25:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi26:
-	auipc	a1, %pcrel_hi(.L.str.15)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi25)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi26)
-	li	a3, -38
-	call	printf
-.LBB0_22:
-	li	a0, -1
-	li	a1, 0
-	li	a2, 0
-	li	a3, 0
-	call	syscall
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	li	a1, -38
-	sw	a0, 0(s7)
-	beq	a2, a1, .LBB0_24
-# %bb.23:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi27:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi28:
-	auipc	a1, %pcrel_hi(.L.str.16)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi27)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi28)
-	li	a3, -38
-	call	printf
-.LBB0_24:
-.Lpcrel_hi29:
-	auipc	a0, %pcrel_hi(.L.str.7)
-	addi	a1, a0, %pcrel_lo(.Lpcrel_hi29)
-	li	a2, 1
-	li	a0, 0
-	call	write
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	li	s0, -9
-	sw	a0, 0(s7)
-	beq	a2, s0, .LBB0_26
-# %bb.25:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi30:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi31:
-	auipc	a1, %pcrel_hi(.L.str.19)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi30)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi31)
-	li	a3, -9
-	call	printf
-.LBB0_26:
-.Lpcrel_hi32:
-	auipc	a1, %pcrel_hi(.L.str.7)
-	li	a0, 3
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi32)
-	li	a2, 1
-	call	write
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beq	a2, s0, .LBB0_28
-# %bb.27:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi33:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi34:
-	auipc	a1, %pcrel_hi(.L.str.20)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi33)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi34)
-	li	a3, -9
-	call	printf
-.LBB0_28:
-.Lpcrel_hi35:
-	auipc	a1, %pcrel_hi(.L.str.7)
-	li	a0, -1
-	addi	s0, a1, %pcrel_lo(.Lpcrel_hi35)
-	li	a2, 1
-	mv	a1, s0
-	call	write
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	li	s1, -9
-	sw	a0, 0(s7)
-	beq	a2, s1, .LBB0_30
-# %bb.29:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi36:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi37:
-	auipc	a1, %pcrel_hi(.L.str.21)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi36)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi37)
-	li	a3, -9
-	call	printf
-.LBB0_30:
-	li	a0, 1
-	addi	a1, sp, 12
-	li	a2, 1
-	call	read
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beq	a2, s1, .LBB0_32
-# %bb.31:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi38:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi39:
-	auipc	a1, %pcrel_hi(.L.str.22)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi38)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi39)
-	li	a3, -9
-	call	printf
-.LBB0_32:
-	li	a0, 7
-	addi	a1, sp, 12
-	li	a2, 1
-	call	read
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	li	a1, -9
-	sw	a0, 0(s7)
-	beq	a2, a1, .LBB0_34
-# %bb.33:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi40:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi41:
-	auipc	a1, %pcrel_hi(.L.str.23)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi40)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi41)
-	li	a3, -9
-	call	printf
-.LBB0_34:
-.Lpcrel_hi42:
-	auipc	a0, %pcrel_hi(.L.str.5)
-	addi	a1, a0, %pcrel_lo(.Lpcrel_hi42)
-	li	a0, 1
-	li	a2, 0
-	call	write
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beqz	a2, .LBB0_36
-# %bb.35:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi43:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi44:
-	auipc	a1, %pcrel_hi(.L.str.24)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi43)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi44)
-	li	a3, 0
-	call	printf
-.LBB0_36:
-	addi	a1, sp, 12
-	li	a0, 0
-	li	a2, 0
-	call	read
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beqz	a2, .LBB0_38
-# %bb.37:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi45:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi46:
-	auipc	a1, %pcrel_hi(.L.str.25)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi45)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi46)
-	li	a3, 0
-	call	printf
-.LBB0_38:
-.Lpcrel_hi47:
-	auipc	a0, %pcrel_hi(.L.str.5)
-	addi	a1, a0, %pcrel_lo(.Lpcrel_hi47)
-	li	a0, 2
-	li	a2, 0
-	call	write
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beqz	a2, .LBB0_40
-# %bb.39:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi48:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi49:
-	auipc	a1, %pcrel_hi(.L.str.26)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi48)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi49)
-	li	a3, 0
-	call	printf
-.LBB0_40:
-	li	s1, 7
-	sw	s1, 716(sp)
-	li	a0, -1
-	addi	a1, sp, 716
-	call	wait
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	li	a1, -10
-	sw	a0, 0(s7)
-	beq	a2, a1, .LBB0_42
-# %bb.41:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi50:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi51:
-	auipc	a1, %pcrel_hi(.L.str.27)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi50)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi51)
-	li	a3, -10
-	call	printf
-	lw	a0, 0(s7)
-.LBB0_42:
-	lw	a2, 716(sp)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beq	a2, s1, .LBB0_44
-# %bb.43:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi52:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi53:
-	auipc	a1, %pcrel_hi(.L.str.28)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi52)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi53)
-	li	a3, 7
-	call	printf
-.LBB0_44:
-	li	a0, 1
-	addi	a1, sp, 716
-	call	wait
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	li	a1, -10
-	sw	a0, 0(s7)
-	beq	a2, a1, .LBB0_46
-# %bb.45:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi54:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi55:
-	auipc	a1, %pcrel_hi(.L.str.29)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi54)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi55)
-	li	a3, -10
-	call	printf
-.LBB0_46:
-.Lpcrel_hi56:
-	auipc	a0, %pcrel_hi(.L.str.30)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi56)
-	li	a1, 0
-	call	spawn
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	li	s1, -2
-	sw	a0, 0(s7)
-	beq	a2, s1, .LBB0_48
-# %bb.47:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi57:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi58:
-	auipc	a1, %pcrel_hi(.L.str.31)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi57)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi58)
-	li	a3, -2
-	call	printf
-.LBB0_48:
-.Lpcrel_hi59:
-	auipc	a0, %pcrel_hi(.L.str.5)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi59)
-	li	a1, 0
-	call	spawn
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beq	a2, s1, .LBB0_50
-# %bb.49:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi60:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi61:
-	auipc	a1, %pcrel_hi(.L.str.32)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi60)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi61)
-	li	a3, -2
-	call	printf
-.LBB0_50:
-.Lpcrel_hi62:
-	auipc	a0, %pcrel_hi(.L.str.33)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi62)
-	li	a1, 0
-	call	spawn
-	mv	a2, a0
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	li	a1, -2
-	sw	a0, 0(s7)
-	beq	a2, a1, .LBB0_52
-# %bb.51:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi63:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi64:
-	auipc	a1, %pcrel_hi(.L.str.34)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi63)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi64)
-	li	a3, -2
-	call	printf
-.LBB0_52:
-.Lpcrel_hi65:
-	auipc	a0, %pcrel_hi(.L.str.4)
-.Lpcrel_hi66:
-	auipc	a1, %pcrel_hi(.L.str.1)
-.Lpcrel_hi67:
-	auipc	a2, %pcrel_hi(.L.str.35)
-	addi	s1, a0, %pcrel_lo(.Lpcrel_hi65)
-	addi	s8, a1, %pcrel_lo(.Lpcrel_hi66)
-	addi	a0, a2, %pcrel_lo(.Lpcrel_hi67)
-	sw	s1, 12(sp)
-	sw	s8, 16(sp)
-	sw	a0, 20(sp)
-	sw	zero, 24(sp)
-	addi	a1, sp, 12
-	mv	a0, s1
-	call	spawn
-	mv	s2, a0
-	bltz	a0, .LBB0_58
-# %bb.53:
-	li	a0, -1000
-	sw	a0, 524(sp)
-	addi	a1, sp, 524
-	mv	a0, s2
-	call	wait
-	beq	a0, s2, .LBB0_59
-# %bb.54:
-	addi	s2, a0, -1000
-	j	.LBB0_60
-.LBB0_55:
-	lw	a0, 4(s0)
-.Lpcrel_hi1:
-	auipc	a1, %pcrel_hi(.L.str.2)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi1)
-	call	strcmp
-	bne	s1, s2, .LBB0_104
-# %bb.56:
-	bnez	a0, .LBB0_104
-# %bb.57:
-	lw	a0, 8(s0)
-	call	atoi
-	call	sleep
-	li	a0, 0
-	j	.LBB0_152
-.LBB0_58:
-	lw	a0, 0(s7)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	j	.LBB0_61
-.LBB0_59:
-	lw	s2, 524(sp)
 .LBB0_60:
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	beqz	s2, .LBB0_62
+	j	.LBB0_63
 .LBB0_61:
+	lw	s2, 524(sp)
+.LBB0_62:
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beqz	s2, .LBB0_64
+.LBB0_63:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi68:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi69:
-	auipc	a1, %pcrel_hi(.L.str.36)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi68)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi69)
+.Lpcrel_hi70:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi71:
+	auipc	a1, %pcrel_hi(.L.str.38)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi70)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi71)
 	mv	a2, s2
 	li	a3, 0
 	call	printf
-.LBB0_62:
-.Lpcrel_hi70:
-	auipc	a0, %pcrel_hi(.L.str.37)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi70)
+.LBB0_64:
+.Lpcrel_hi72:
+	auipc	a0, %pcrel_hi(.L.str.39)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi72)
 	sw	s1, 12(sp)
 	sw	s8, 16(sp)
 	sw	a0, 20(sp)
@@ -669,47 +690,47 @@ main:                                   # @main
 	mv	a0, s1
 	call	spawn
 	mv	s2, a0
-	bltz	a0, .LBB0_65
-# %bb.63:
+	bltz	a0, .LBB0_67
+# %bb.65:
 	li	a0, -1000
 	sw	a0, 524(sp)
 	addi	a1, sp, 524
 	mv	a0, s2
 	call	wait
-	beq	a0, s2, .LBB0_66
-# %bb.64:
+	beq	a0, s2, .LBB0_68
+# %bb.66:
 	addi	s2, a0, -1000
-	j	.LBB0_67
-.LBB0_65:
+	j	.LBB0_69
+.LBB0_67:
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	j	.LBB0_68
-.LBB0_66:
+	j	.LBB0_70
+.LBB0_68:
 	lw	s2, 524(sp)
-.LBB0_67:
+.LBB0_69:
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	li	a1, 42
 	sw	a0, 0(s7)
-	beq	s2, a1, .LBB0_69
-.LBB0_68:
+	beq	s2, a1, .LBB0_71
+.LBB0_70:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi71:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi72:
-	auipc	a1, %pcrel_hi(.L.str.38)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi71)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi72)
+.Lpcrel_hi73:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi74:
+	auipc	a1, %pcrel_hi(.L.str.40)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi73)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi74)
 	li	a3, 42
 	mv	a2, s2
 	call	printf
-.LBB0_69:
-.Lpcrel_hi73:
-	auipc	a0, %pcrel_hi(.L.str.39)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi73)
+.LBB0_71:
+.Lpcrel_hi75:
+	auipc	a0, %pcrel_hi(.L.str.41)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi75)
 	sw	s1, 12(sp)
 	sw	s8, 16(sp)
 	sw	a0, 20(sp)
@@ -718,42 +739,42 @@ main:                                   # @main
 	mv	a0, s1
 	call	spawn
 	mv	s1, a0
-	bltz	a0, .LBB0_73
-# %bb.70:
+	bltz	a0, .LBB0_75
+# %bb.72:
 	li	a0, -1000
 	sw	a0, 524(sp)
 	addi	a1, sp, 524
 	mv	a0, s1
 	call	wait
-	beq	a0, s1, .LBB0_72
-# %bb.71:
+	beq	a0, s1, .LBB0_74
+# %bb.73:
 	addi	s1, a0, -1000
-	j	.LBB0_73
-.LBB0_72:
+	j	.LBB0_75
+.LBB0_74:
 	lw	s1, 524(sp)
-.LBB0_73:
+.LBB0_75:
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	li	a1, -3
 	sw	a0, 0(s7)
-	beq	s1, a1, .LBB0_75
-# %bb.74:
+	beq	s1, a1, .LBB0_77
+# %bb.76:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi74:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi75:
-	auipc	a1, %pcrel_hi(.L.str.40)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi74)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi75)
+.Lpcrel_hi76:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi77:
+	auipc	a1, %pcrel_hi(.L.str.42)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi76)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi77)
 	li	a3, -3
 	mv	a2, s1
 	call	printf
-.LBB0_75:
-.Lpcrel_hi76:
+.LBB0_77:
+.Lpcrel_hi78:
 	auipc	a0, %pcrel_hi(.L__const.test_spawn_and_wait.args)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi76)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi78)
 	lw	a1, 16(a0)
 	lw	a2, 20(a0)
 	sw	a1, 708(sp)
@@ -766,9 +787,9 @@ main:                                   # @main
 	sw	a2, 696(sp)
 	sw	a3, 700(sp)
 	sw	a0, 704(sp)
-.Lpcrel_hi77:
-	auipc	a0, %pcrel_hi(.L.str.4)
-	addi	s1, a0, %pcrel_lo(.Lpcrel_hi77)
+.Lpcrel_hi79:
+	auipc	a0, %pcrel_hi(.L.str.5)
+	addi	s1, a0, %pcrel_lo(.Lpcrel_hi79)
 	addi	a1, sp, 692
 	mv	a0, s1
 	call	spawn
@@ -776,19 +797,19 @@ main:                                   # @main
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	bgtz	s2, .LBB0_77
-# %bb.76:
+	bgtz	s2, .LBB0_79
+# %bb.78:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi78:
-	auipc	a0, %pcrel_hi(.L.str.17)
-.Lpcrel_hi79:
-	auipc	a1, %pcrel_hi(.L.str.41)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi78)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi79)
+.Lpcrel_hi80:
+	auipc	a0, %pcrel_hi(.L.str.19)
+.Lpcrel_hi81:
+	auipc	a1, %pcrel_hi(.L.str.43)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi80)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi81)
 	call	printf
-.LBB0_77:
+.LBB0_79:
 	addi	a1, sp, 716
 	mv	a0, s2
 	call	wait
@@ -796,41 +817,41 @@ main:                                   # @main
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	beq	a2, s2, .LBB0_79
-# %bb.78:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi80:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi81:
-	auipc	a1, %pcrel_hi(.L.str.42)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi80)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi81)
-	mv	a3, s2
-	call	printf
-	lw	a0, 0(s7)
-.LBB0_79:
-	lw	a2, 716(sp)
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beqz	a2, .LBB0_81
+	beq	a2, s2, .LBB0_81
 # %bb.80:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
 .Lpcrel_hi82:
-	auipc	a0, %pcrel_hi(.L.str.18)
+	auipc	a0, %pcrel_hi(.L.str.20)
 .Lpcrel_hi83:
-	auipc	a1, %pcrel_hi(.L.str.43)
+	auipc	a1, %pcrel_hi(.L.str.44)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi82)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi83)
+	mv	a3, s2
+	call	printf
+	lw	a0, 0(s7)
+.LBB0_81:
+	lw	a2, 716(sp)
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beqz	a2, .LBB0_83
+# %bb.82:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi84:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi85:
+	auipc	a1, %pcrel_hi(.L.str.45)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi84)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi85)
 	li	a3, 0
 	call	printf
-.LBB0_81:
-.Lpcrel_hi84:
-	auipc	a0, %pcrel_hi(.L.str.44)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi84)
+.LBB0_83:
+.Lpcrel_hi86:
+	auipc	a0, %pcrel_hi(.L.str.46)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi86)
 	sw	s1, 676(sp)
 	sw	s8, 680(sp)
 	sw	a0, 684(sp)
@@ -839,9 +860,9 @@ main:                                   # @main
 	mv	a0, s1
 	call	spawn
 	mv	s2, a0
-.Lpcrel_hi85:
-	auipc	a0, %pcrel_hi(.L.str.45)
-	addi	s4, a0, %pcrel_lo(.Lpcrel_hi85)
+.Lpcrel_hi87:
+	auipc	a0, %pcrel_hi(.L.str.47)
+	addi	s4, a0, %pcrel_lo(.Lpcrel_hi87)
 	sw	s1, 660(sp)
 	sw	s8, 664(sp)
 	sw	s4, 668(sp)
@@ -853,21 +874,21 @@ main:                                   # @main
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	blez	s2, .LBB0_83
-# %bb.82:
-	blt	s2, s3, .LBB0_84
-.LBB0_83:
+	blez	s2, .LBB0_85
+# %bb.84:
+	blt	s2, s3, .LBB0_86
+.LBB0_85:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi86:
-	auipc	a0, %pcrel_hi(.L.str.17)
-.Lpcrel_hi87:
-	auipc	a1, %pcrel_hi(.L.str.46)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi86)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi87)
+.Lpcrel_hi88:
+	auipc	a0, %pcrel_hi(.L.str.19)
+.Lpcrel_hi89:
+	auipc	a1, %pcrel_hi(.L.str.48)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi88)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi89)
 	call	printf
-.LBB0_84:
+.LBB0_86:
 	addi	a1, sp, 716
 	mv	a0, s3
 	call	wait
@@ -875,46 +896,24 @@ main:                                   # @main
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	beq	a2, s3, .LBB0_86
-# %bb.85:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi88:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi89:
-	auipc	a1, %pcrel_hi(.L.str.47)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi88)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi89)
-	mv	a3, s3
-	call	printf
-	lw	a0, 0(s7)
-.LBB0_86:
-	lw	a2, 716(sp)
-	addi	a0, a0, 1
-	li	a1, 2
-	sw	a0, 0(s7)
-	beq	a2, a1, .LBB0_88
+	beq	a2, s3, .LBB0_88
 # %bb.87:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
 .Lpcrel_hi90:
-	auipc	a0, %pcrel_hi(.L.str.18)
+	auipc	a0, %pcrel_hi(.L.str.20)
 .Lpcrel_hi91:
-	auipc	a1, %pcrel_hi(.L.str.48)
+	auipc	a1, %pcrel_hi(.L.str.49)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi90)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi91)
-	li	a3, 2
+	mv	a3, s3
 	call	printf
-.LBB0_88:
-	addi	a1, sp, 716
-	mv	a0, s3
-	call	wait
-	mv	a2, a0
 	lw	a0, 0(s7)
+.LBB0_88:
+	lw	a2, 716(sp)
 	addi	a0, a0, 1
-	li	a1, -10
+	li	a1, 2
 	sw	a0, 0(s7)
 	beq	a2, a1, .LBB0_90
 # %bb.89:
@@ -922,14 +921,36 @@ main:                                   # @main
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
 .Lpcrel_hi92:
-	auipc	a0, %pcrel_hi(.L.str.18)
+	auipc	a0, %pcrel_hi(.L.str.20)
 .Lpcrel_hi93:
-	auipc	a1, %pcrel_hi(.L.str.49)
+	auipc	a1, %pcrel_hi(.L.str.50)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi92)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi93)
-	li	a3, -10
+	li	a3, 2
 	call	printf
 .LBB0_90:
+	addi	a1, sp, 716
+	mv	a0, s3
+	call	wait
+	mv	a2, a0
+	lw	a0, 0(s7)
+	addi	a0, a0, 1
+	li	a1, -10
+	sw	a0, 0(s7)
+	beq	a2, a1, .LBB0_92
+# %bb.91:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi94:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi95:
+	auipc	a1, %pcrel_hi(.L.str.51)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi94)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi95)
+	li	a3, -10
+	call	printf
+.LBB0_92:
 	li	a0, -1
 	li	a1, 0
 	call	wait
@@ -937,23 +958,23 @@ main:                                   # @main
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	beq	a2, s2, .LBB0_92
-# %bb.91:
+	beq	a2, s2, .LBB0_94
+# %bb.93:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi94:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi95:
-	auipc	a1, %pcrel_hi(.L.str.50)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi94)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi95)
+.Lpcrel_hi96:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi97:
+	auipc	a1, %pcrel_hi(.L.str.52)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi96)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi97)
 	mv	a3, s2
 	call	printf
-.LBB0_92:
-.Lpcrel_hi96:
-	auipc	a0, %pcrel_hi(.L.str.2)
-	addi	s2, a0, %pcrel_lo(.Lpcrel_hi96)
+.LBB0_94:
+.Lpcrel_hi98:
+	auipc	a0, %pcrel_hi(.L.str.3)
+	addi	s2, a0, %pcrel_lo(.Lpcrel_hi98)
 	li	a0, -1
 	addi	a1, sp, 716
 	call	wait
@@ -962,20 +983,20 @@ main:                                   # @main
 	addi	a0, a0, 1
 	li	a1, -10
 	sw	a0, 0(s7)
-	beq	a2, a1, .LBB0_94
-# %bb.93:
+	beq	a2, a1, .LBB0_96
+# %bb.95:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi97:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi98:
-	auipc	a1, %pcrel_hi(.L.str.51)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi97)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi98)
+.Lpcrel_hi99:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi100:
+	auipc	a1, %pcrel_hi(.L.str.53)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi99)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi100)
 	li	a3, -10
 	call	printf
-.LBB0_94:
+.LBB0_96:
 	sw	s1, 612(sp)
 	sw	s2, 616(sp)
 	sw	s4, 620(sp)
@@ -984,8 +1005,8 @@ main:                                   # @main
 	mv	a0, s1
 	call	spawn
 	mv	a2, a0
-	bltz	a0, .LBB0_103
-# %bb.95:
+	bltz	a0, .LBB0_105
+# %bb.97:
 	sw	a2, 628(sp)
 	sw	s1, 612(sp)
 	sw	s2, 616(sp)
@@ -995,8 +1016,8 @@ main:                                   # @main
 	mv	a0, s1
 	call	spawn
 	mv	a2, a0
-	bltz	a0, .LBB0_106
-# %bb.96:
+	bltz	a0, .LBB0_109
+# %bb.98:
 	sw	a2, 632(sp)
 	sw	s1, 612(sp)
 	sw	s2, 616(sp)
@@ -1006,8 +1027,8 @@ main:                                   # @main
 	mv	a0, s1
 	call	spawn
 	mv	a2, a0
-	bltz	a0, .LBB0_107
-# %bb.97:
+	bltz	a0, .LBB0_114
+# %bb.99:
 	sw	a2, 636(sp)
 	sw	s1, 612(sp)
 	sw	s2, 616(sp)
@@ -1017,8 +1038,8 @@ main:                                   # @main
 	mv	a0, s1
 	call	spawn
 	mv	a2, a0
-	bltz	a0, .LBB0_115
-# %bb.98:
+	bltz	a0, .LBB0_118
+# %bb.100:
 	sw	a2, 640(sp)
 	sw	s1, 612(sp)
 	sw	s2, 616(sp)
@@ -1028,8 +1049,8 @@ main:                                   # @main
 	mv	a0, s1
 	call	spawn
 	mv	a2, a0
-	bltz	a0, .LBB0_116
-# %bb.99:
+	bltz	a0, .LBB0_119
+# %bb.101:
 	sw	a2, 644(sp)
 	sw	s1, 612(sp)
 	sw	s2, 616(sp)
@@ -1039,8 +1060,8 @@ main:                                   # @main
 	mv	a0, s1
 	call	spawn
 	mv	a2, a0
-	bltz	a0, .LBB0_117
-# %bb.100:
+	bltz	a0, .LBB0_128
+# %bb.102:
 	sw	a2, 648(sp)
 	sw	s1, 612(sp)
 	sw	s2, 616(sp)
@@ -1050,8 +1071,8 @@ main:                                   # @main
 	mv	a0, s1
 	call	spawn
 	mv	a2, a0
-	bltz	a0, .LBB0_118
-# %bb.101:
+	bltz	a0, .LBB0_130
+# %bb.103:
 	sw	a2, 652(sp)
 	sw	s1, 612(sp)
 	sw	s2, 616(sp)
@@ -1061,166 +1082,210 @@ main:                                   # @main
 	mv	a0, s1
 	call	spawn
 	mv	a2, a0
-	bltz	a0, .LBB0_119
-# %bb.102:
+	bltz	a0, .LBB0_131
+# %bb.104:
 	lw	a0, 0(s7)
 	sw	a2, 656(sp)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
 	li	s2, 8
-	j	.LBB0_124
-.LBB0_103:
+	j	.LBB0_136
+.LBB0_105:
 	li	s3, 0
 	li	s2, 0
-	j	.LBB0_120
-.LBB0_104:
-	lw	a0, 4(s0)
-.Lpcrel_hi2:
-	auipc	a1, %pcrel_hi(.L.str.3)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi2)
-	call	strcmp
-	beqz	a0, .LBB0_108
-# %bb.105:
-	li	a0, 100
-	j	.LBB0_152
+	j	.LBB0_132
 .LBB0_106:
-	li	s3, 0
-	li	s2, 1
-	j	.LBB0_120
-.LBB0_107:
-	li	s3, 0
-	li	s2, 2
-	j	.LBB0_120
-.LBB0_108:
-	li	a1, 5
-	li	a0, 1
-	bne	s1, a1, .LBB0_152
-# %bb.109:
-	lw	a1, 20(s0)
-	bnez	a1, .LBB0_152
-# %bb.110:
-	lw	a0, 0(s0)
+	lw	a0, 4(s0)
 .Lpcrel_hi3:
-	auipc	a1, %pcrel_hi(.L.str.4)
+	auipc	a1, %pcrel_hi(.L.str.3)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi3)
 	call	strcmp
-	bnez	a0, .LBB0_114
+	li	a1, 3
+	bne	s1, a1, .LBB0_115
+# %bb.107:
+	bnez	a0, .LBB0_115
+# %bb.108:
+	lw	a0, 8(s0)
+	call	atoi
+	call	sleep
+	li	a0, 0
+	j	.LBB0_164
+.LBB0_109:
+	li	s3, 0
+	li	s2, 1
+	j	.LBB0_132
+.LBB0_110:
+	li	a0, 0
+	call	sbrk
+	bne	a0, s0, .LBB0_117
 # %bb.111:
+	li	a0, -1
+	mv	a1, s0
+	call	wait
+	li	a1, -14
+	bne	a0, a1, .LBB0_127
+# %bb.112:
+	lui	a0, 1
+	call	sbrk
+	bne	a0, s0, .LBB0_129
+# %bb.113:
+	li	a0, 0
+	li	a1, 1
+	sw	a1, 0(s0)
+	j	.LBB0_164
+.LBB0_114:
+	li	s3, 0
+	li	s2, 2
+	j	.LBB0_132
+.LBB0_115:
 	lw	a0, 4(s0)
 .Lpcrel_hi4:
-	auipc	a1, %pcrel_hi(.L.str.3)
+	auipc	a1, %pcrel_hi(.L.str.4)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi4)
 	call	strcmp
-	bnez	a0, .LBB0_114
-# %bb.112:
-	lw	a0, 8(s0)
+	beqz	a0, .LBB0_120
+# %bb.116:
+	li	a0, 100
+	j	.LBB0_164
+.LBB0_117:
+	li	a0, 2
+	j	.LBB0_164
+.LBB0_118:
+	li	s3, 0
+	li	s2, 3
+	j	.LBB0_132
+.LBB0_119:
+	li	s3, 0
+	li	s2, 4
+	j	.LBB0_132
+.LBB0_120:
+	li	a1, 5
+	li	a0, 1
+	bne	s1, a1, .LBB0_164
+# %bb.121:
+	lw	a1, 20(s0)
+	bnez	a1, .LBB0_164
+# %bb.122:
+	lw	a0, 0(s0)
 .Lpcrel_hi5:
 	auipc	a1, %pcrel_hi(.L.str.5)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi5)
 	call	strcmp
-	bnez	a0, .LBB0_114
-# %bb.113:
-	lw	a0, 12(s0)
+	bnez	a0, .LBB0_126
+# %bb.123:
+	lw	a0, 4(s0)
 .Lpcrel_hi6:
-	auipc	a1, %pcrel_hi(.L.str.6)
+	auipc	a1, %pcrel_hi(.L.str.4)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi6)
 	call	strcmp
-	beqz	a0, .LBB0_153
-.LBB0_114:
+	bnez	a0, .LBB0_126
+# %bb.124:
+	lw	a0, 8(s0)
+.Lpcrel_hi7:
+	auipc	a1, %pcrel_hi(.L.str.6)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi7)
+	call	strcmp
+	bnez	a0, .LBB0_126
+# %bb.125:
+	lw	a0, 12(s0)
+.Lpcrel_hi8:
+	auipc	a1, %pcrel_hi(.L.str.7)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi8)
+	call	strcmp
+	beqz	a0, .LBB0_165
+.LBB0_126:
 	li	a0, 1
-	j	.LBB0_152
-.LBB0_115:
-	li	s3, 0
-	li	s2, 3
-	j	.LBB0_120
-.LBB0_116:
-	li	s3, 0
-	li	s2, 4
-	j	.LBB0_120
-.LBB0_117:
+	j	.LBB0_164
+.LBB0_127:
+	li	a0, 3
+	j	.LBB0_164
+.LBB0_128:
 	li	s3, 0
 	li	s2, 5
-	j	.LBB0_120
-.LBB0_118:
+	j	.LBB0_132
+.LBB0_129:
+	li	a0, 4
+	j	.LBB0_164
+.LBB0_130:
 	li	s2, 6
 	li	s3, 1
-	j	.LBB0_120
-.LBB0_119:
+	j	.LBB0_132
+.LBB0_131:
 	li	s3, 0
 	li	s2, 7
-.LBB0_120:
+.LBB0_132:
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	li	a1, -11
 	sw	a0, 0(s7)
-	beq	a2, a1, .LBB0_122
-# %bb.121:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi99:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi100:
-	auipc	a1, %pcrel_hi(.L.str.52)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi99)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi100)
-	li	a3, -11
-	call	printf
-	lw	a0, 0(s7)
-.LBB0_122:
-	addi	a0, a0, 1
-	sw	a0, 0(s7)
-	beqz	s3, .LBB0_124
-# %bb.123:
-	li	s2, 6
-	j	.LBB0_125
-.LBB0_124:
+	beq	a2, a1, .LBB0_134
+# %bb.133:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
 .Lpcrel_hi101:
-	auipc	a0, %pcrel_hi(.L.str.18)
+	auipc	a0, %pcrel_hi(.L.str.20)
 .Lpcrel_hi102:
-	auipc	a1, %pcrel_hi(.L.str.53)
+	auipc	a1, %pcrel_hi(.L.str.54)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi101)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi102)
+	li	a3, -11
+	call	printf
+	lw	a0, 0(s7)
+.LBB0_134:
+	addi	a0, a0, 1
+	sw	a0, 0(s7)
+	beqz	s3, .LBB0_136
+# %bb.135:
+	li	s2, 6
+	j	.LBB0_137
+.LBB0_136:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi103:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi104:
+	auipc	a1, %pcrel_hi(.L.str.55)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi103)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi104)
 	li	a3, 6
 	mv	a2, s2
 	call	printf
-	beqz	s2, .LBB0_135
-.LBB0_125:
+	beqz	s2, .LBB0_147
+.LBB0_137:
 	li	s9, 0
 	slli	s10, s2, 2
 	addi	a0, sp, 628
-.Lpcrel_hi103:
-	auipc	a1, %pcrel_hi(.L.str.17)
-.Lpcrel_hi104:
-	auipc	a2, %pcrel_hi(.L.str.54)
 .Lpcrel_hi105:
-	auipc	a3, %pcrel_hi(.L.str.18)
-	add	s10, a0, s10
+	auipc	a1, %pcrel_hi(.L.str.19)
 .Lpcrel_hi106:
-	auipc	a0, %pcrel_hi(.L.str.55)
-	addi	s3, a1, %pcrel_lo(.Lpcrel_hi103)
-	addi	s4, a2, %pcrel_lo(.Lpcrel_hi104)
-	addi	s5, a3, %pcrel_lo(.Lpcrel_hi105)
-	addi	s6, a0, %pcrel_lo(.Lpcrel_hi106)
-	j	.LBB0_127
-.LBB0_126:                              #   in Loop: Header=BB0_127 Depth=1
+	auipc	a2, %pcrel_hi(.L.str.56)
+.Lpcrel_hi107:
+	auipc	a3, %pcrel_hi(.L.str.20)
+	add	s10, a0, s10
+.Lpcrel_hi108:
+	auipc	a0, %pcrel_hi(.L.str.57)
+	addi	s3, a1, %pcrel_lo(.Lpcrel_hi105)
+	addi	s4, a2, %pcrel_lo(.Lpcrel_hi106)
+	addi	s5, a3, %pcrel_lo(.Lpcrel_hi107)
+	addi	s6, a0, %pcrel_lo(.Lpcrel_hi108)
+	j	.LBB0_139
+.LBB0_138:                              #   in Loop: Header=BB0_139 Depth=1
 	addi	s9, s9, 1
-	beq	s9, s2, .LBB0_135
-.LBB0_127:                              # =>This Loop Header: Depth=1
-                                        #     Child Loop BB0_129 Depth 2
+	beq	s9, s2, .LBB0_147
+.LBB0_139:                              # =>This Loop Header: Depth=1
+                                        #     Child Loop BB0_141 Depth 2
 	li	a0, -1
 	addi	a1, sp, 716
 	call	wait
 	li	a1, 0
 	addi	a2, sp, 628
-	j	.LBB0_129
-.LBB0_128:                              #   in Loop: Header=BB0_129 Depth=2
+	j	.LBB0_141
+.LBB0_140:                              #   in Loop: Header=BB0_141 Depth=2
 	addi	a2, a2, 4
-	beq	a2, s10, .LBB0_131
-.LBB0_129:                              #   Parent Loop BB0_127 Depth=1
+	beq	a2, s10, .LBB0_143
+.LBB0_141:                              #   Parent Loop BB0_139 Depth=1
                                         # =>  This Inner Loop Header: Depth=2
 	lw	a3, 0(a2)
 	xor	a4, a3, a0
@@ -1228,16 +1293,16 @@ main:                                   # @main
 	addi	a4, a4, -1
 	and	a4, a4, a3
 	sw	a4, 0(a2)
-	bne	a3, a0, .LBB0_128
-# %bb.130:                              #   in Loop: Header=BB0_129 Depth=2
+	bne	a3, a0, .LBB0_140
+# %bb.142:                              #   in Loop: Header=BB0_141 Depth=2
 	li	a1, 1
-	j	.LBB0_128
-.LBB0_131:                              #   in Loop: Header=BB0_127 Depth=1
+	j	.LBB0_140
+.LBB0_143:                              #   in Loop: Header=BB0_139 Depth=1
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	bnez	a1, .LBB0_133
-# %bb.132:                              #   in Loop: Header=BB0_127 Depth=1
+	bnez	a1, .LBB0_145
+# %bb.144:                              #   in Loop: Header=BB0_139 Depth=1
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
@@ -1245,12 +1310,12 @@ main:                                   # @main
 	mv	a1, s4
 	call	printf
 	lw	a0, 0(s7)
-.LBB0_133:                              #   in Loop: Header=BB0_127 Depth=1
+.LBB0_145:                              #   in Loop: Header=BB0_139 Depth=1
 	lw	a2, 716(sp)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	beqz	a2, .LBB0_126
-# %bb.134:                              #   in Loop: Header=BB0_127 Depth=1
+	beqz	a2, .LBB0_138
+# %bb.146:                              #   in Loop: Header=BB0_139 Depth=1
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
@@ -1258,8 +1323,8 @@ main:                                   # @main
 	mv	a1, s6
 	li	a3, 0
 	call	printf
-	j	.LBB0_126
-.LBB0_135:
+	j	.LBB0_138
+.LBB0_147:
 	li	a0, -1
 	addi	a1, sp, 716
 	call	wait
@@ -1268,23 +1333,23 @@ main:                                   # @main
 	addi	a0, a0, 1
 	li	a1, -10
 	sw	a0, 0(s7)
-	beq	a2, a1, .LBB0_137
-# %bb.136:
+	beq	a2, a1, .LBB0_149
+# %bb.148:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi107:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi108:
-	auipc	a1, %pcrel_hi(.L.str.56)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi107)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi108)
+.Lpcrel_hi109:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi110:
+	auipc	a1, %pcrel_hi(.L.str.58)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi109)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi110)
 	li	a3, -10
 	call	printf
-.LBB0_137:
-.Lpcrel_hi109:
-	auipc	a0, %pcrel_hi(.L.str.57)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi109)
+.LBB0_149:
+.Lpcrel_hi111:
+	auipc	a0, %pcrel_hi(.L.str.59)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi111)
 	sw	s1, 596(sp)
 	sw	s8, 600(sp)
 	sw	a0, 604(sp)
@@ -1296,19 +1361,19 @@ main:                                   # @main
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	bgtz	s1, .LBB0_139
-# %bb.138:
+	bgtz	s1, .LBB0_151
+# %bb.150:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi110:
-	auipc	a0, %pcrel_hi(.L.str.17)
-.Lpcrel_hi111:
-	auipc	a1, %pcrel_hi(.L.str.58)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi110)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi111)
+.Lpcrel_hi112:
+	auipc	a0, %pcrel_hi(.L.str.19)
+.Lpcrel_hi113:
+	auipc	a1, %pcrel_hi(.L.str.60)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi112)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi113)
 	call	printf
-.LBB0_139:
+.LBB0_151:
 	addi	a1, sp, 716
 	mv	a0, s1
 	call	wait
@@ -1316,20 +1381,20 @@ main:                                   # @main
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	beq	a2, s1, .LBB0_141
-# %bb.140:
+	beq	a2, s1, .LBB0_153
+# %bb.152:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi112:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi113:
-	auipc	a1, %pcrel_hi(.L.str.59)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi112)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi113)
+.Lpcrel_hi114:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi115:
+	auipc	a1, %pcrel_hi(.L.str.61)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi114)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi115)
 	mv	a3, s1
 	call	printf
-.LBB0_141:
+.LBB0_153:
 	sw	s0, 524(sp)
 	sw	s0, 528(sp)
 	sw	s0, 532(sp)
@@ -1348,9 +1413,9 @@ main:                                   # @main
 	sw	s0, 584(sp)
 	sw	s0, 588(sp)
 	sw	zero, 592(sp)
-.Lpcrel_hi114:
-	auipc	a0, %pcrel_hi(.L.str.60)
-	addi	s0, a0, %pcrel_lo(.Lpcrel_hi114)
+.Lpcrel_hi116:
+	auipc	a0, %pcrel_hi(.L.str.62)
+	addi	s0, a0, %pcrel_lo(.Lpcrel_hi116)
 	addi	a1, sp, 524
 	mv	a0, s0
 	call	spawn
@@ -1359,43 +1424,43 @@ main:                                   # @main
 	addi	a0, a0, 1
 	li	a1, -7
 	sw	a0, 0(s7)
-	beq	a2, a1, .LBB0_143
-# %bb.142:
+	beq	a2, a1, .LBB0_155
+# %bb.154:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi115:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi116:
-	auipc	a1, %pcrel_hi(.L.str.61)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi115)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi116)
+.Lpcrel_hi117:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi118:
+	auipc	a1, %pcrel_hi(.L.str.63)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi117)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi118)
 	li	a3, -7
 	call	printf
-.LBB0_143:
+.LBB0_155:
 	sw	zero, 588(sp)
-.Lpcrel_hi117:
-	auipc	a0, %pcrel_hi(.L.str.4)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi117)
+.Lpcrel_hi119:
+	auipc	a0, %pcrel_hi(.L.str.5)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi119)
 	addi	a1, sp, 524
 	call	spawn
 	mv	s1, a0
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	bgtz	s1, .LBB0_145
-# %bb.144:
+	bgtz	s1, .LBB0_157
+# %bb.156:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi118:
-	auipc	a0, %pcrel_hi(.L.str.17)
-.Lpcrel_hi119:
-	auipc	a1, %pcrel_hi(.L.str.62)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi118)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi119)
+.Lpcrel_hi120:
+	auipc	a0, %pcrel_hi(.L.str.19)
+.Lpcrel_hi121:
+	auipc	a1, %pcrel_hi(.L.str.64)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi120)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi121)
 	call	printf
-.LBB0_145:
+.LBB0_157:
 	addi	a1, sp, 716
 	mv	a0, s1
 	call	wait
@@ -1403,39 +1468,39 @@ main:                                   # @main
 	lw	a0, 0(s7)
 	addi	a0, a0, 1
 	sw	a0, 0(s7)
-	beq	a2, s1, .LBB0_147
-# %bb.146:
-	lw	a0, 4(s7)
-	addi	a0, a0, 1
-	sw	a0, 4(s7)
-.Lpcrel_hi120:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi121:
-	auipc	a1, %pcrel_hi(.L.str.42)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi120)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi121)
-	mv	a3, s1
-	call	printf
-	lw	a0, 0(s7)
-.LBB0_147:
-	lw	a2, 716(sp)
-	addi	a0, a0, 1
-	li	a1, 100
-	sw	a0, 0(s7)
-	beq	a2, a1, .LBB0_149
-# %bb.148:
+	beq	a2, s1, .LBB0_159
+# %bb.158:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
 .Lpcrel_hi122:
-	auipc	a0, %pcrel_hi(.L.str.18)
+	auipc	a0, %pcrel_hi(.L.str.20)
 .Lpcrel_hi123:
-	auipc	a1, %pcrel_hi(.L.str.63)
+	auipc	a1, %pcrel_hi(.L.str.44)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi122)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi123)
+	mv	a3, s1
+	call	printf
+	lw	a0, 0(s7)
+.LBB0_159:
+	lw	a2, 716(sp)
+	addi	a0, a0, 1
+	li	a1, 100
+	sw	a0, 0(s7)
+	beq	a2, a1, .LBB0_161
+# %bb.160:
+	lw	a0, 4(s7)
+	addi	a0, a0, 1
+	sw	a0, 4(s7)
+.Lpcrel_hi124:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi125:
+	auipc	a1, %pcrel_hi(.L.str.65)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi124)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi125)
 	li	a3, 100
 	call	printf
-.LBB0_149:
+.LBB0_161:
 	addi	a0, sp, 12
 	li	a1, 121
 	li	a2, 511
@@ -1453,29 +1518,29 @@ main:                                   # @main
 	addi	a0, a0, 1
 	li	a1, -7
 	sw	a0, 0(s7)
-	beq	a2, a1, .LBB0_151
-# %bb.150:
+	beq	a2, a1, .LBB0_163
+# %bb.162:
 	lw	a0, 4(s7)
 	addi	a0, a0, 1
 	sw	a0, 4(s7)
-.Lpcrel_hi124:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi125:
-	auipc	a1, %pcrel_hi(.L.str.64)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi124)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi125)
+.Lpcrel_hi126:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi127:
+	auipc	a1, %pcrel_hi(.L.str.66)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi126)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi127)
 	li	a3, -7
 	call	printf
-.LBB0_151:
+.LBB0_163:
 	call	test_sbrk
 	lw	a1, 0(s7)
 	lw	a2, 4(s7)
-.Lpcrel_hi126:
+.Lpcrel_hi128:
 	auipc	a0, %pcrel_hi(.L.str)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi126)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi128)
 	call	printf
 	lw	a0, 4(s7)
-.LBB0_152:
+.LBB0_164:
 	lw	ra, 764(sp)                     # 4-byte Folded Reload
 	lw	s0, 760(sp)                     # 4-byte Folded Reload
 	lw	s1, 756(sp)                     # 4-byte Folded Reload
@@ -1490,22 +1555,22 @@ main:                                   # @main
 	lw	s10, 720(sp)                    # 4-byte Folded Reload
 	addi	sp, sp, 768
 	ret
-.LBB0_153:
+.LBB0_165:
 	lw	a0, 16(s0)
-.Lpcrel_hi7:
-	auipc	a1, %pcrel_hi(.L.str.7)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi7)
+.Lpcrel_hi9:
+	auipc	a1, %pcrel_hi(.L.str.8)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi9)
 	call	strcmp
 	mv	a1, a0
 	li	a0, 1
-	bnez	a1, .LBB0_152
-# %bb.154:
+	bnez	a1, .LBB0_164
+# %bb.166:
 	addi	a0, sp, 12
-	bltu	s0, a0, .LBB0_114
-# %bb.155:
+	bltu	s0, a0, .LBB0_126
+# %bb.167:
 	lw	a0, 0(s0)
 	sltu	a0, a0, s0
-	j	.LBB0_152
+	j	.LBB0_164
 .Lfunc_end0:
 	.size	main, .Lfunc_end0-main
                                         # -- End function
@@ -1524,9 +1589,9 @@ test_sbrk:                              # @test_sbrk
 	li	a0, 0
 	call	sbrk
 	mv	s0, a0
-.Lpcrel_hi127:
+.Lpcrel_hi129:
 	auipc	a0, %pcrel_hi(.L_MergedGlobals)
-	addi	s2, a0, %pcrel_lo(.Lpcrel_hi127)
+	addi	s2, a0, %pcrel_lo(.Lpcrel_hi129)
 	lw	a0, 0(s2)
 	addi	a0, a0, 1
 	sw	a0, 0(s2)
@@ -1539,18 +1604,18 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi128:
-	auipc	a0, %pcrel_hi(.L.str.17)
-.Lpcrel_hi129:
-	auipc	a1, %pcrel_hi(.L.str.65)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi128)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi129)
+.Lpcrel_hi130:
+	auipc	a0, %pcrel_hi(.L.str.19)
+.Lpcrel_hi131:
+	auipc	a1, %pcrel_hi(.L.str.67)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi130)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi131)
 	call	printf
 	lw	a0, 0(s2)
 .LBB1_3:
-.Lpcrel_hi130:
+.Lpcrel_hi132:
 	auipc	a1, %pcrel_hi(test_sbrk)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi130)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi132)
 	addi	a0, a0, 1
 	sw	a0, 0(s2)
 	blt	a1, s0, .LBB1_5
@@ -1558,12 +1623,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi131:
-	auipc	a0, %pcrel_hi(.L.str.17)
-.Lpcrel_hi132:
-	auipc	a1, %pcrel_hi(.L.str.66)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi131)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi132)
+.Lpcrel_hi133:
+	auipc	a0, %pcrel_hi(.L.str.19)
+.Lpcrel_hi134:
+	auipc	a1, %pcrel_hi(.L.str.68)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi133)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi134)
 	call	printf
 .LBB1_5:
 	lui	s1, 3
@@ -1579,12 +1644,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi133:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi134:
-	auipc	a1, %pcrel_hi(.L.str.67)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi133)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi134)
+.Lpcrel_hi135:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi136:
+	auipc	a1, %pcrel_hi(.L.str.69)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi135)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi136)
 	mv	a3, s0
 	call	printf
 .LBB1_7:
@@ -1600,12 +1665,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi135:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi136:
-	auipc	a1, %pcrel_hi(.L.str.68)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi135)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi136)
+.Lpcrel_hi137:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi138:
+	auipc	a1, %pcrel_hi(.L.str.70)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi137)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi138)
 	mv	a3, s1
 	call	printf
 .LBB1_9:
@@ -1631,12 +1696,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi137:
-	auipc	a0, %pcrel_hi(.L.str.17)
-.Lpcrel_hi138:
-	auipc	a1, %pcrel_hi(.L.str.69)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi137)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi138)
+.Lpcrel_hi139:
+	auipc	a0, %pcrel_hi(.L.str.19)
+.Lpcrel_hi140:
+	auipc	a1, %pcrel_hi(.L.str.71)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi139)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi140)
 	call	printf
 	lw	a1, 0(s2)
 .LBB1_13:
@@ -1651,12 +1716,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi139:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi140:
-	auipc	a1, %pcrel_hi(.L.str.70)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi139)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi140)
+.Lpcrel_hi141:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi142:
+	auipc	a1, %pcrel_hi(.L.str.72)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi141)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi142)
 	li	a3, 5
 	call	printf
 .LBB1_15:
@@ -1675,12 +1740,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi141:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi142:
-	auipc	a1, %pcrel_hi(.L.str.71)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi141)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi142)
+.Lpcrel_hi143:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi144:
+	auipc	a1, %pcrel_hi(.L.str.73)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi143)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi144)
 	li	a3, -14
 	call	printf
 .LBB1_17:
@@ -1696,12 +1761,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi143:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi144:
-	auipc	a1, %pcrel_hi(.L.str.72)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi143)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi144)
+.Lpcrel_hi145:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi146:
+	auipc	a1, %pcrel_hi(.L.str.74)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi145)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi146)
 	mv	a3, s1
 	call	printf
 .LBB1_19:
@@ -1720,12 +1785,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi145:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi146:
-	auipc	a1, %pcrel_hi(.L.str.73)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi145)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi146)
+.Lpcrel_hi147:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi148:
+	auipc	a1, %pcrel_hi(.L.str.75)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi147)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi148)
 	li	a3, -14
 	call	printf
 	lw	a0, 0(s2)
@@ -1740,12 +1805,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi147:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi148:
-	auipc	a1, %pcrel_hi(.L.str.74)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi147)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi148)
+.Lpcrel_hi149:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi150:
+	auipc	a1, %pcrel_hi(.L.str.76)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi149)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi150)
 	li	a3, 245
 	call	printf
 .LBB1_23:
@@ -1761,12 +1826,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi149:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi150:
-	auipc	a1, %pcrel_hi(.L.str.75)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi149)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi150)
+.Lpcrel_hi151:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi152:
+	auipc	a1, %pcrel_hi(.L.str.77)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi151)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi152)
 	call	printf
 .LBB1_25:
 	addi	a1, s1, 2039
@@ -1790,12 +1855,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi151:
-	auipc	a0, %pcrel_hi(.L.str.17)
-.Lpcrel_hi152:
-	auipc	a1, %pcrel_hi(.L.str.76)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi151)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi152)
+.Lpcrel_hi153:
+	auipc	a0, %pcrel_hi(.L.str.19)
+.Lpcrel_hi154:
+	auipc	a1, %pcrel_hi(.L.str.78)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi153)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi154)
 	call	printf
 	lw	a1, 0(s2)
 .LBB1_29:
@@ -1808,12 +1873,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi153:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi154:
-	auipc	a1, %pcrel_hi(.L.str.77)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi153)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi154)
+.Lpcrel_hi155:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi156:
+	auipc	a1, %pcrel_hi(.L.str.79)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi155)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi156)
 	li	a3, 100
 	call	printf
 .LBB1_31:
@@ -1829,12 +1894,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi155:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi156:
-	auipc	a1, %pcrel_hi(.L.str.78)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi155)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi156)
+.Lpcrel_hi157:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi158:
+	auipc	a1, %pcrel_hi(.L.str.80)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi157)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi158)
 	li	a3, -22
 	call	printf
 .LBB1_33:
@@ -1851,12 +1916,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi157:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi158:
-	auipc	a1, %pcrel_hi(.L.str.79)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi157)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi158)
+.Lpcrel_hi159:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi160:
+	auipc	a1, %pcrel_hi(.L.str.81)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi159)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi160)
 	li	a3, -22
 	call	printf
 .LBB1_35:
@@ -1875,12 +1940,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi159:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi160:
-	auipc	a1, %pcrel_hi(.L.str.80)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi159)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi160)
+.Lpcrel_hi161:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi162:
+	auipc	a1, %pcrel_hi(.L.str.82)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi161)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi162)
 	li	a3, -12
 	call	printf
 .LBB1_37:
@@ -1897,12 +1962,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi161:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi162:
-	auipc	a1, %pcrel_hi(.L.str.81)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi161)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi162)
+.Lpcrel_hi163:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi164:
+	auipc	a1, %pcrel_hi(.L.str.83)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi163)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi164)
 	li	a3, -12
 	call	printf
 .LBB1_39:
@@ -1917,12 +1982,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi163:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi164:
-	auipc	a1, %pcrel_hi(.L.str.82)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi163)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi164)
+.Lpcrel_hi165:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi166:
+	auipc	a1, %pcrel_hi(.L.str.84)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi165)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi166)
 	mv	a3, s1
 	call	printf
 .LBB1_41:
@@ -1938,12 +2003,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi165:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi166:
-	auipc	a1, %pcrel_hi(.L.str.83)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi165)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi166)
+.Lpcrel_hi167:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi168:
+	auipc	a1, %pcrel_hi(.L.str.85)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi167)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi168)
 	mv	a3, s1
 	call	printf
 .LBB1_43:
@@ -1958,12 +2023,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi167:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi168:
-	auipc	a1, %pcrel_hi(.L.str.84)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi167)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi168)
+.Lpcrel_hi169:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi170:
+	auipc	a1, %pcrel_hi(.L.str.86)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi169)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi170)
 	mv	a3, s0
 	call	printf
 .LBB1_45:
@@ -1987,12 +2052,12 @@ test_sbrk:                              # @test_sbrk
 	ret
 .LBB1_47:
 	lw	a3, 4(s2)
-.Lpcrel_hi169:
-	auipc	a0, %pcrel_hi(.L.str.18)
-.Lpcrel_hi170:
-	auipc	a1, %pcrel_hi(.L.str.85)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi169)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi170)
+.Lpcrel_hi171:
+	auipc	a0, %pcrel_hi(.L.str.20)
+.Lpcrel_hi172:
+	auipc	a1, %pcrel_hi(.L.str.87)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi171)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi172)
 	addi	a4, a3, 1
 	li	a3, -14
 	sw	a4, 4(s2)
@@ -2014,441 +2079,451 @@ test_sbrk:                              # @test_sbrk
 
 	.type	.L.str.1,@object                # @.str.1
 .L.str.1:
-	.asciz	"exit"
+	.asciz	"sbrk"
 	.size	.L.str.1, 5
 
 	.type	.L.str.2,@object                # @.str.2
 .L.str.2:
-	.asciz	"sleep"
-	.size	.L.str.2, 6
+	.asciz	"exit"
+	.size	.L.str.2, 5
 
 	.type	.L.str.3,@object                # @.str.3
 .L.str.3:
-	.asciz	"args"
-	.size	.L.str.3, 5
+	.asciz	"sleep"
+	.size	.L.str.3, 6
 
 	.type	.L.str.4,@object                # @.str.4
 .L.str.4:
-	.asciz	"systest"
-	.size	.L.str.4, 8
+	.asciz	"args"
+	.size	.L.str.4, 5
 
 	.type	.L.str.5,@object                # @.str.5
 .L.str.5:
-	.zero	1
-	.size	.L.str.5, 1
+	.asciz	"systest"
+	.size	.L.str.5, 8
 
 	.type	.L.str.6,@object                # @.str.6
 .L.str.6:
-	.asciz	"two words"
-	.size	.L.str.6, 10
+	.zero	1
+	.size	.L.str.6, 1
 
 	.type	.L.str.7,@object                # @.str.7
 .L.str.7:
-	.asciz	"x"
-	.size	.L.str.7, 2
+	.asciz	"two words"
+	.size	.L.str.7, 10
 
 	.type	.L.str.8,@object                # @.str.8
 .L.str.8:
-	.asciz	"getpid is above the shell's"
-	.size	.L.str.8, 28
+	.asciz	"x"
+	.size	.L.str.8, 2
 
 	.type	.L.str.9,@object                # @.str.9
 .L.str.9:
-	.asciz	"getpid again"
-	.size	.L.str.9, 13
+	.asciz	"systest: sbrk %d: %d\n"
+	.size	.L.str.9, 22
 
 	.type	.L.str.10,@object               # @.str.10
 .L.str.10:
-	.asciz	"uptime counts the boot ticks"
-	.size	.L.str.10, 29
+	.asciz	"getpid is above the shell's"
+	.size	.L.str.10, 28
 
 	.type	.L.str.11,@object               # @.str.11
 .L.str.11:
-	.asciz	"yield"
-	.size	.L.str.11, 6
+	.asciz	"getpid again"
+	.size	.L.str.11, 13
 
 	.type	.L.str.12,@object               # @.str.12
 .L.str.12:
-	.asciz	"sleep lasts its ticks"
-	.size	.L.str.12, 22
+	.asciz	"uptime counts the boot ticks"
+	.size	.L.str.12, 29
 
 	.type	.L.str.13,@object               # @.str.13
 .L.str.13:
-	.asciz	"sleep 0"
-	.size	.L.str.13, 8
+	.asciz	"yield"
+	.size	.L.str.13, 6
 
 	.type	.L.str.14,@object               # @.str.14
 .L.str.14:
-	.asciz	"call 0"
-	.size	.L.str.14, 7
+	.asciz	"sleep lasts its ticks"
+	.size	.L.str.14, 22
 
 	.type	.L.str.15,@object               # @.str.15
 .L.str.15:
-	.asciz	"call 11"
+	.asciz	"sleep 0"
 	.size	.L.str.15, 8
 
 	.type	.L.str.16,@object               # @.str.16
 .L.str.16:
-	.asciz	"call -1"
-	.size	.L.str.16, 8
+	.asciz	"call 0"
+	.size	.L.str.16, 7
 
 	.type	.L.str.17,@object               # @.str.17
 .L.str.17:
-	.asciz	"systest: FAILED: %s\n"
-	.size	.L.str.17, 21
+	.asciz	"call 11"
+	.size	.L.str.17, 8
 
 	.type	.L.str.18,@object               # @.str.18
 .L.str.18:
-	.asciz	"systest: FAILED: %s: got %d, want %d\n"
-	.size	.L.str.18, 38
+	.asciz	"call -1"
+	.size	.L.str.18, 8
 
 	.type	.L.str.19,@object               # @.str.19
 .L.str.19:
-	.asciz	"write to fd 0"
-	.size	.L.str.19, 14
+	.asciz	"systest: FAILED: %s\n"
+	.size	.L.str.19, 21
 
 	.type	.L.str.20,@object               # @.str.20
 .L.str.20:
-	.asciz	"write to fd 3"
-	.size	.L.str.20, 14
+	.asciz	"systest: FAILED: %s: got %d, want %d\n"
+	.size	.L.str.20, 38
 
 	.type	.L.str.21,@object               # @.str.21
 .L.str.21:
-	.asciz	"write to fd -1"
-	.size	.L.str.21, 15
+	.asciz	"write to fd 0"
+	.size	.L.str.21, 14
 
 	.type	.L.str.22,@object               # @.str.22
 .L.str.22:
-	.asciz	"read from fd 1"
-	.size	.L.str.22, 15
+	.asciz	"write to fd 3"
+	.size	.L.str.22, 14
 
 	.type	.L.str.23,@object               # @.str.23
 .L.str.23:
-	.asciz	"read from fd 7"
+	.asciz	"write to fd -1"
 	.size	.L.str.23, 15
 
 	.type	.L.str.24,@object               # @.str.24
 .L.str.24:
-	.asciz	"an empty write"
+	.asciz	"read from fd 1"
 	.size	.L.str.24, 15
 
 	.type	.L.str.25,@object               # @.str.25
 .L.str.25:
-	.asciz	"an empty read"
-	.size	.L.str.25, 14
+	.asciz	"read from fd 7"
+	.size	.L.str.25, 15
 
 	.type	.L.str.26,@object               # @.str.26
 .L.str.26:
-	.asciz	"an empty write to stderr"
-	.size	.L.str.26, 25
+	.asciz	"an empty write"
+	.size	.L.str.26, 15
 
 	.type	.L.str.27,@object               # @.str.27
 .L.str.27:
-	.asciz	"wait without children"
-	.size	.L.str.27, 22
+	.asciz	"an empty read"
+	.size	.L.str.27, 14
 
 	.type	.L.str.28,@object               # @.str.28
 .L.str.28:
-	.asciz	"a failed wait leaves the status alone"
-	.size	.L.str.28, 38
+	.asciz	"an empty write to stderr"
+	.size	.L.str.28, 25
 
 	.type	.L.str.29,@object               # @.str.29
 .L.str.29:
-	.asciz	"wait for the shell, not a child"
-	.size	.L.str.29, 32
+	.asciz	"wait without children"
+	.size	.L.str.29, 22
 
 	.type	.L.str.30,@object               # @.str.30
 .L.str.30:
-	.asciz	"nope"
-	.size	.L.str.30, 5
+	.asciz	"a failed wait leaves the status alone"
+	.size	.L.str.30, 38
 
 	.type	.L.str.31,@object               # @.str.31
 .L.str.31:
-	.asciz	"spawn of an unknown program"
-	.size	.L.str.31, 28
+	.asciz	"wait for the shell, not a child"
+	.size	.L.str.31, 32
 
 	.type	.L.str.32,@object               # @.str.32
 .L.str.32:
-	.asciz	"spawn of an empty name"
-	.size	.L.str.32, 23
+	.asciz	"nope"
+	.size	.L.str.32, 5
 
 	.type	.L.str.33,@object               # @.str.33
 .L.str.33:
-	.asciz	"a-name-far-too-long-for-any-program"
-	.size	.L.str.33, 36
+	.asciz	"spawn of an unknown program"
+	.size	.L.str.33, 28
 
 	.type	.L.str.34,@object               # @.str.34
 .L.str.34:
-	.asciz	"spawn of a long name"
-	.size	.L.str.34, 21
+	.asciz	"spawn of an empty name"
+	.size	.L.str.34, 23
 
 	.type	.L.str.35,@object               # @.str.35
 .L.str.35:
-	.asciz	"0"
-	.size	.L.str.35, 2
+	.asciz	"a-name-far-too-long-for-any-program"
+	.size	.L.str.35, 36
 
 	.type	.L.str.36,@object               # @.str.36
 .L.str.36:
-	.asciz	"exit status 0"
-	.size	.L.str.36, 14
+	.asciz	"spawn of a long name"
+	.size	.L.str.36, 21
 
 	.type	.L.str.37,@object               # @.str.37
 .L.str.37:
-	.asciz	"42"
-	.size	.L.str.37, 3
+	.asciz	"0"
+	.size	.L.str.37, 2
 
 	.type	.L.str.38,@object               # @.str.38
 .L.str.38:
-	.asciz	"exit status 42"
-	.size	.L.str.38, 15
+	.asciz	"exit status 0"
+	.size	.L.str.38, 14
 
 	.type	.L.str.39,@object               # @.str.39
 .L.str.39:
-	.asciz	"-3"
+	.asciz	"42"
 	.size	.L.str.39, 3
 
 	.type	.L.str.40,@object               # @.str.40
 .L.str.40:
-	.asciz	"exit status -3"
+	.asciz	"exit status 42"
 	.size	.L.str.40, 15
+
+	.type	.L.str.41,@object               # @.str.41
+.L.str.41:
+	.asciz	"-3"
+	.size	.L.str.41, 3
+
+	.type	.L.str.42,@object               # @.str.42
+.L.str.42:
+	.asciz	"exit status -3"
+	.size	.L.str.42, 15
 
 	.type	.L__const.test_spawn_and_wait.args,@object # @__const.test_spawn_and_wait.args
 	.section	.rodata,"a",@progbits
 	.p2align	2, 0x0
 .L__const.test_spawn_and_wait.args:
-	.word	.L.str.4
-	.word	.L.str.3
 	.word	.L.str.5
+	.word	.L.str.4
 	.word	.L.str.6
 	.word	.L.str.7
+	.word	.L.str.8
 	.word	0
 	.size	.L__const.test_spawn_and_wait.args, 24
 
-	.type	.L.str.41,@object               # @.str.41
-	.section	.rodata.str1.1,"aMS",@progbits,1
-.L.str.41:
-	.asciz	"spawn with arguments"
-	.size	.L.str.41, 21
-
-	.type	.L.str.42,@object               # @.str.42
-.L.str.42:
-	.asciz	"wait for it"
-	.size	.L.str.42, 12
-
 	.type	.L.str.43,@object               # @.str.43
+	.section	.rodata.str1.1,"aMS",@progbits,1
 .L.str.43:
-	.asciz	"the child got its arguments"
-	.size	.L.str.43, 28
+	.asciz	"spawn with arguments"
+	.size	.L.str.43, 21
 
 	.type	.L.str.44,@object               # @.str.44
 .L.str.44:
-	.asciz	"1"
-	.size	.L.str.44, 2
+	.asciz	"wait for it"
+	.size	.L.str.44, 12
 
 	.type	.L.str.45,@object               # @.str.45
 .L.str.45:
-	.asciz	"2"
-	.size	.L.str.45, 2
+	.asciz	"the child got its arguments"
+	.size	.L.str.45, 28
 
 	.type	.L.str.46,@object               # @.str.46
 .L.str.46:
-	.asciz	"two children"
-	.size	.L.str.46, 13
+	.asciz	"1"
+	.size	.L.str.46, 2
 
 	.type	.L.str.47,@object               # @.str.47
 .L.str.47:
-	.asciz	"wait for the second"
-	.size	.L.str.47, 20
+	.asciz	"2"
+	.size	.L.str.47, 2
 
 	.type	.L.str.48,@object               # @.str.48
 .L.str.48:
-	.asciz	"its status"
-	.size	.L.str.48, 11
+	.asciz	"two children"
+	.size	.L.str.48, 13
 
 	.type	.L.str.49,@object               # @.str.49
 .L.str.49:
-	.asciz	"it is gone"
-	.size	.L.str.49, 11
+	.asciz	"wait for the second"
+	.size	.L.str.49, 20
 
 	.type	.L.str.50,@object               # @.str.50
 .L.str.50:
-	.asciz	"wait for any, no status"
-	.size	.L.str.50, 24
+	.asciz	"its status"
+	.size	.L.str.50, 11
 
 	.type	.L.str.51,@object               # @.str.51
 .L.str.51:
-	.asciz	"none left"
-	.size	.L.str.51, 10
+	.asciz	"it is gone"
+	.size	.L.str.51, 11
 
 	.type	.L.str.52,@object               # @.str.52
 .L.str.52:
-	.asciz	"spawn with every slot taken"
-	.size	.L.str.52, 28
+	.asciz	"wait for any, no status"
+	.size	.L.str.52, 24
 
 	.type	.L.str.53,@object               # @.str.53
 .L.str.53:
-	.asciz	"children until the slots run out"
-	.size	.L.str.53, 33
+	.asciz	"none left"
+	.size	.L.str.53, 10
 
 	.type	.L.str.54,@object               # @.str.54
 .L.str.54:
-	.asciz	"collect a sleeper"
-	.size	.L.str.54, 18
+	.asciz	"spawn with every slot taken"
+	.size	.L.str.54, 28
 
 	.type	.L.str.55,@object               # @.str.55
 .L.str.55:
-	.asciz	"a sleeper's status"
-	.size	.L.str.55, 19
+	.asciz	"children until the slots run out"
+	.size	.L.str.55, 33
 
 	.type	.L.str.56,@object               # @.str.56
 .L.str.56:
-	.asciz	"every sleeper collected"
-	.size	.L.str.56, 24
+	.asciz	"collect a sleeper"
+	.size	.L.str.56, 18
 
 	.type	.L.str.57,@object               # @.str.57
 .L.str.57:
-	.asciz	"5"
-	.size	.L.str.57, 2
+	.asciz	"a sleeper's status"
+	.size	.L.str.57, 19
 
 	.type	.L.str.58,@object               # @.str.58
 .L.str.58:
-	.asciz	"a slot is free again"
-	.size	.L.str.58, 21
+	.asciz	"every sleeper collected"
+	.size	.L.str.58, 24
 
 	.type	.L.str.59,@object               # @.str.59
 .L.str.59:
-	.asciz	"and its child ends"
-	.size	.L.str.59, 19
+	.asciz	"5"
+	.size	.L.str.59, 2
 
 	.type	.L.str.60,@object               # @.str.60
 .L.str.60:
-	.asciz	"echo"
-	.size	.L.str.60, 5
+	.asciz	"a slot is free again"
+	.size	.L.str.60, 21
 
 	.type	.L.str.61,@object               # @.str.61
 .L.str.61:
-	.asciz	"too many arguments"
+	.asciz	"and its child ends"
 	.size	.L.str.61, 19
 
 	.type	.L.str.62,@object               # @.str.62
 .L.str.62:
-	.asciz	"MAXARG arguments"
-	.size	.L.str.62, 17
+	.asciz	"echo"
+	.size	.L.str.62, 5
 
 	.type	.L.str.63,@object               # @.str.63
 .L.str.63:
-	.asciz	"and it ran"
-	.size	.L.str.63, 11
+	.asciz	"too many arguments"
+	.size	.L.str.63, 19
 
 	.type	.L.str.64,@object               # @.str.64
 .L.str.64:
-	.asciz	"arguments over ARG_MAX bytes"
-	.size	.L.str.64, 29
+	.asciz	"MAXARG arguments"
+	.size	.L.str.64, 17
 
 	.type	.L.str.65,@object               # @.str.65
 .L.str.65:
-	.asciz	"the heap starts on a page boundary"
-	.size	.L.str.65, 35
+	.asciz	"and it ran"
+	.size	.L.str.65, 11
 
 	.type	.L.str.66,@object               # @.str.66
 .L.str.66:
-	.asciz	"above the program"
-	.size	.L.str.66, 18
+	.asciz	"arguments over ARG_MAX bytes"
+	.size	.L.str.66, 29
 
 	.type	.L.str.67,@object               # @.str.67
 .L.str.67:
-	.asciz	"grow by three pages and a bit"
-	.size	.L.str.67, 30
+	.asciz	"the heap starts on a page boundary"
+	.size	.L.str.67, 35
 
 	.type	.L.str.68,@object               # @.str.68
 .L.str.68:
-	.asciz	"the new end"
-	.size	.L.str.68, 12
+	.asciz	"above the program"
+	.size	.L.str.68, 18
 
 	.type	.L.str.69,@object               # @.str.69
 .L.str.69:
-	.asciz	"new heap memory reads zero"
-	.size	.L.str.69, 27
+	.asciz	"grow by three pages and a bit"
+	.size	.L.str.69, 30
 
 	.type	.L.str.70,@object               # @.str.70
 .L.str.70:
-	.asciz	"and takes stores"
-	.size	.L.str.70, 17
+	.asciz	"the new end"
+	.size	.L.str.70, 12
 
 	.type	.L.str.71,@object               # @.str.71
 .L.str.71:
-	.asciz	"nothing past the last page"
+	.asciz	"new heap memory reads zero"
 	.size	.L.str.71, 27
 
 	.type	.L.str.72,@object               # @.str.72
 .L.str.72:
-	.asciz	"shrink"
-	.size	.L.str.72, 7
+	.asciz	"and takes stores"
+	.size	.L.str.72, 17
 
 	.type	.L.str.73,@object               # @.str.73
 .L.str.73:
-	.asciz	"the freed page is gone"
-	.size	.L.str.73, 23
+	.asciz	"nothing past the last page"
+	.size	.L.str.73, 27
 
 	.type	.L.str.74,@object               # @.str.74
 .L.str.74:
-	.asciz	"the kept bytes are still there"
-	.size	.L.str.74, 31
+	.asciz	"shrink"
+	.size	.L.str.74, 7
 
 	.type	.L.str.75,@object               # @.str.75
 .L.str.75:
-	.asciz	"grow again"
-	.size	.L.str.75, 11
+	.asciz	"the freed page is gone"
+	.size	.L.str.75, 23
 
 	.type	.L.str.76,@object               # @.str.76
 .L.str.76:
-	.asciz	"regrown memory reads zero, the kept page's tail too"
-	.size	.L.str.76, 52
+	.asciz	"the kept bytes are still there"
+	.size	.L.str.76, 31
 
 	.type	.L.str.77,@object               # @.str.77
 .L.str.77:
-	.asciz	"and the rest is kept"
-	.size	.L.str.77, 21
+	.asciz	"grow again"
+	.size	.L.str.77, 11
 
 	.type	.L.str.78,@object               # @.str.78
 .L.str.78:
-	.asciz	"shrink below the start"
-	.size	.L.str.78, 23
+	.asciz	"regrown memory reads zero, the kept page's tail too"
+	.size	.L.str.78, 52
 
 	.type	.L.str.79,@object               # @.str.79
 .L.str.79:
-	.asciz	"shrink one byte below the start"
-	.size	.L.str.79, 32
+	.asciz	"and the rest is kept"
+	.size	.L.str.79, 21
 
 	.type	.L.str.80,@object               # @.str.80
 .L.str.80:
-	.asciz	"grow one byte into the guard page"
-	.size	.L.str.80, 34
+	.asciz	"shrink below the start"
+	.size	.L.str.80, 23
 
 	.type	.L.str.81,@object               # @.str.81
 .L.str.81:
-	.asciz	"grow past the end of user space"
+	.asciz	"shrink one byte below the start"
 	.size	.L.str.81, 32
 
 	.type	.L.str.82,@object               # @.str.82
 .L.str.82:
-	.asciz	"failed calls change nothing"
-	.size	.L.str.82, 28
+	.asciz	"grow one byte into the guard page"
+	.size	.L.str.82, 34
 
 	.type	.L.str.83,@object               # @.str.83
 .L.str.83:
-	.asciz	"back to empty"
-	.size	.L.str.83, 14
+	.asciz	"grow past the end of user space"
+	.size	.L.str.83, 32
 
 	.type	.L.str.84,@object               # @.str.84
 .L.str.84:
-	.asciz	"empty"
-	.size	.L.str.84, 6
+	.asciz	"failed calls change nothing"
+	.size	.L.str.84, 28
 
 	.type	.L.str.85,@object               # @.str.85
 .L.str.85:
+	.asciz	"back to empty"
+	.size	.L.str.85, 14
+
+	.type	.L.str.86,@object               # @.str.86
+.L.str.86:
+	.asciz	"empty"
+	.size	.L.str.86, 6
+
+	.type	.L.str.87,@object               # @.str.87
+.L.str.87:
 	.asciz	"with no page left"
-	.size	.L.str.85, 18
+	.size	.L.str.87, 18
 
 	.type	.L_MergedGlobals,@object        # @_MergedGlobals
 	.local	.L_MergedGlobals

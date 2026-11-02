@@ -92,6 +92,7 @@ system call stubs; `user/ulib.c`, a small C library with `printf`, declared in
 | `ticks` | prints the timer ticks since boot |
 | `ping`, `pong` | print four numbered lines half a tick apart: run together, they take turns |
 | `regs` | fills every register, spins for three ticks and exits with 0 only if none changed |
+| `sysregs` | fills every register, makes system calls and exits with 0 only if none but a0 changed |
 | `data` | exits with 0 only if its stack and `.bss` start zeroed and its `.data` holds its initial value and takes stores |
 | `badptr` | hands the system calls bad pointers, which must all fail with `-EFAULT` |
 | `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |

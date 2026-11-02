@@ -15,6 +15,7 @@ main:                                   # @main
 	sw	s0, 40(sp)                      # 4-byte Folded Spill
 	sw	s1, 36(sp)                      # 4-byte Folded Spill
 	sw	s2, 32(sp)                      # 4-byte Folded Spill
+	sw	s3, 28(sp)                      # 4-byte Folded Spill
 	li	a0, 1
 	lui	a1, 524288
 	li	a2, 4
@@ -138,10 +139,10 @@ main:                                   # @main
 # %bb.23:
 	sw	a1, 0(s2)
 .LBB0_24:
-.Lpcrel_hi8:
+.Lpcrel_hi7:
 	auipc	a1, %pcrel_hi(msg)
 	li	a0, 1
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi8)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi7)
 	li	a2, -1
 	call	write
 	lw	a1, 4(s2)
@@ -155,7 +156,7 @@ main:                                   # @main
 # %bb.26:
 	sw	a1, 0(s2)
 .LBB0_27:
-	addi	a1, sp, 24
+	addi	a1, sp, 20
 	li	a2, -1
 	li	a0, 0
 	call	read
@@ -283,13 +284,13 @@ main:                                   # @main
 	lw	a1, 0(a0)
 	lw	a2, 4(a0)
 	lw	a0, 8(a0)
-	sw	a1, 8(sp)
-	sw	a2, 12(sp)
-	sw	a0, 16(sp)
+	sw	a1, 4(sp)
+	sw	a2, 8(sp)
+	sw	a0, 12(sp)
 .Lpcrel_hi5:
 	auipc	a0, %pcrel_hi(.L.str)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi5)
-	addi	a1, sp, 8
+	addi	a1, sp, 4
 	call	spawn
 	lw	a1, 4(s2)
 	addi	a1, a1, 1
@@ -308,37 +309,42 @@ main:                                   # @main
 	call	spawn
 	lw	a1, 4(s2)
 	addi	a1, a1, 1
-	li	a2, -14
+	li	s1, -14
 	sw	a1, 4(s2)
-	beq	a0, a2, .LBB0_57
+	beq	a0, s1, .LBB0_57
 # %bb.55:
 	lw	a0, 0(s2)
 	bnez	a0, .LBB0_57
 # %bb.56:
 	sw	a1, 0(s2)
 .LBB0_57:
-	li	a0, -1
-	addi	a1, sp, 20
-	call	wait
+	lui	a0, 1
+	call	sbrk
+	addi	s3, a0, 2047
+	addi	s0, s3, 2019
+	li	a1, 97
+	li	a2, 30
+	mv	a0, s0
+	call	memset
+	addi	a0, s3, 2039
+	li	a1, 0
+	call	spawn
 	lw	a1, 4(s2)
 	addi	a1, a1, 1
-	li	a2, -10
 	sw	a1, 4(s2)
-	beq	a0, a2, .LBB0_60
+	beq	a0, s1, .LBB0_60
 # %bb.58:
 	lw	a0, 0(s2)
 	bnez	a0, .LBB0_60
 # %bb.59:
 	sw	a1, 0(s2)
 .LBB0_60:
-	li	a0, 99
+	mv	a0, s0
 	li	a1, 0
-	li	a2, 0
-	li	a3, 0
-	call	syscall
+	call	spawn
 	lw	a1, 4(s2)
 	addi	a1, a1, 1
-	li	a2, -38
+	li	a2, -14
 	sw	a1, 4(s2)
 	beq	a0, a2, .LBB0_63
 # %bb.61:
@@ -347,9 +353,49 @@ main:                                   # @main
 # %bb.62:
 	sw	a1, 0(s2)
 .LBB0_63:
-.Lpcrel_hi7:
+	li	a0, -1
+	addi	a1, sp, 16
+	call	wait
+	lw	a1, 4(s2)
+	addi	a1, a1, 1
+	li	a2, -10
+	sw	a1, 4(s2)
+	beq	a0, a2, .LBB0_66
+# %bb.64:
+	lw	a0, 0(s2)
+	bnez	a0, .LBB0_66
+# %bb.65:
+	sw	a1, 0(s2)
+.LBB0_66:
+	li	a0, 99
+	li	a1, 0
+	li	a2, 0
+	li	a3, 0
+	call	syscall
+	lw	a2, 4(s2)
+	lw	a1, 0(s2)
+	addi	a2, a2, 1
+	li	a3, -38
+	sw	a2, 4(s2)
+	beq	a0, a3, .LBB0_69
+# %bb.67:
+	bnez	a1, .LBB0_69
+# %bb.68:
+	sw	a2, 0(s2)
+	mv	a1, a2
+.LBB0_69:
+	beqz	a1, .LBB0_71
+# %bb.70:
+.Lpcrel_hi9:
+	auipc	a0, %pcrel_hi(.L.str.1)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi9)
+	call	printf
+	lw	a0, 0(s2)
+	j	.LBB0_74
+.LBB0_71:
+.Lpcrel_hi8:
 	auipc	a0, %pcrel_hi(msg)
-	addi	s0, a0, %pcrel_lo(.Lpcrel_hi7)
+	addi	s0, a0, %pcrel_lo(.Lpcrel_hi8)
 	mv	a0, s0
 	call	strlen
 	mv	s1, a0
@@ -362,17 +408,18 @@ main:                                   # @main
 	lw	a0, 0(s2)
 	addi	a2, a2, 1
 	sw	a2, 4(s2)
-	beq	a1, s1, .LBB0_66
-# %bb.64:
-	bnez	a0, .LBB0_66
-# %bb.65:
+	beq	a1, s1, .LBB0_74
+# %bb.72:
+	bnez	a0, .LBB0_74
+# %bb.73:
 	sw	a2, 0(s2)
 	mv	a0, a2
-.LBB0_66:
+.LBB0_74:
 	lw	ra, 44(sp)                      # 4-byte Folded Reload
 	lw	s0, 40(sp)                      # 4-byte Folded Reload
 	lw	s1, 36(sp)                      # 4-byte Folded Reload
 	lw	s2, 32(sp)                      # 4-byte Folded Reload
+	lw	s3, 28(sp)                      # 4-byte Folded Reload
 	addi	sp, sp, 48
 	ret
 .Lfunc_end0:
@@ -398,6 +445,12 @@ msg:
 	.word	2147483648
 	.word	0
 	.size	.L__const.main.argv, 12
+
+	.type	.L.str.1,@object                # @.str.1
+	.section	.rodata.str1.1,"aMS",@progbits,1
+.L.str.1:
+	.asciz	"badptr: case %d failed\n"
+	.size	.L.str.1, 24
 
 	.type	.L_MergedGlobals,@object        # @_MergedGlobals
 	.local	.L_MergedGlobals

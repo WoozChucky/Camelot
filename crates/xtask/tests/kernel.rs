@@ -2252,6 +2252,27 @@ fn registers_survive_many_switches() {
 }
 
 #[test]
+fn a_system_call_changes_a0_and_nothing_else() {
+    // docs/camelot-syscalls.md: every register but a0 is preserved, a1-a7
+    // and the temporaries included, which C programs can't check (they are
+    // caller-saved there). sysregs fills every register, makes calls that
+    // answer, switch away (yield, sleep), fail (a bad descriptor, an unknown
+    // number) and write, and checks them all after each one; it exits with
+    // 32 * case + register at the first that changed, which the shell would
+    // print. Run it beside ping, so other processes use the registers too.
+    let out = run_processes(b"ping & sysregs\nwait\nexit\n");
+    let lines: Vec<&str> = command_output(&out, "ping & sysregs")
+        .into_iter()
+        .filter(|l| !l.starts_with("ping ") && !l.starts_with('['))
+        .collect();
+    assert_eq!(
+        lines,
+        ["sysregs: write", "sysregs: every register but a0 kept"],
+        "{out}"
+    );
+}
+
+#[test]
 fn faulting_programs_are_killed_and_the_rest_carry_on() {
     // Issue #20's second criterion. badload loads from the kernel's first
     // page (mapped, without U), badhalt executes xcal.halt (M-mode only).
@@ -2317,9 +2338,11 @@ fn bad_pointers_are_refused() {
     // Issue #21's second criterion. badptr hands write and read kernel
     // memory, page 0, a range past the end of user space, the stack's guard
     // page, lengths that wrap, read-only memory and memory past the heap,
-    // and wait and spawn bad pointers too: each call must fail with -EFAULT,
-    // print nothing and leave the kernel running. Its failed reads take no
-    // input either: hello still gets its line.
+    // and wait and spawn bad pointers too (program names that run off the
+    // heap, among them one longer than any program's): each call must fail
+    // with -EFAULT, print nothing and leave the kernel running. Otherwise
+    // badptr prints `badptr: case N failed`. Its failed reads take no input
+    // either: hello still gets its line.
     let out = run_processes(b"badptr\nhello\nexit\n");
     assert_eq!(
         command_output(&out, "badptr"),
@@ -2476,6 +2499,55 @@ fn processes_give_back_every_page() {
     step_to_user(&mut m, &elf, "ping");
     let pages = expected_user_pages(&user_program("ping").elf).len() as u32;
     assert_eq!(free_pages(&m, &elf), before - 3 - pages);
+}
+
+#[test]
+fn a_heap_that_runs_out_of_memory_gives_back_what_it_took() {
+    // sbrk maps the new pages one at a time: when memory runs out partway,
+    // it must unmap and free the ones it had mapped and leave the heap as it
+    // was. 3 MB fits in user space, and a 128 MiB machine has the pages...
+    const LINE: &str = "systest sbrk 3000000";
+    let out = run_processes(format!("{LINE}\nexit\n").as_bytes());
+    assert_eq!(command_output(&out, LINE), ["systest: sbrk 3000000: 0"]);
+
+    // ...but a 1 MiB one runs out of them after mapping some.
+    let config = MachineConfig {
+        ram_size: 1 << 20,
+        ..MachineConfig::default()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(config, Some(rx));
+    step_to_prompt(&mut m, 1);
+    let before = free_pages(&m, &elf);
+    // systest's own pages (see processes_give_back_every_page), then a page
+    // for the heap at least.
+    let pages = 3 + expected_user_pages(&user_program("systest").elf).len() as u32;
+    assert!(
+        before > pages + 1 && before < pages + 3_000_000 / PAGE,
+        "{before} pages"
+    );
+    for b in format!("{LINE}\n").bytes() {
+        tx.send(b).unwrap();
+    }
+    // Right after the call, systest prints its result: it holds no page more
+    // than when it started.
+    let want = "systest: sbrk 3000000: -12\n";
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| m.cpu.bus.uart.captured.ends_with(want.as_bytes()),
+    );
+    assert_eq!(free_pages(&m, &elf), before - pages);
+    // And it found the heap as it was: no exit line from the shell.
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(command_output(&out, LINE), [want.trim_end()]);
+    assert_eq!(free_pages(&m, &elf), before);
+    for b in b"exit\n" {
+        tx.send(*b).unwrap();
+    }
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
 }
 
 /// Byte offsets in an ELF32 header and program header.
@@ -2724,8 +2796,9 @@ fn every_c_program_has_its_clang_output_committed() {
     );
 }
 
-/// The `| N | `name` | ...` rows of the table under `heading` in `doc`.
-fn doc_table(doc: &str, heading: &str) -> Vec<(u32, String)> {
+/// The `| N | `name` | ...` rows of the table under `heading` in `doc`, as
+/// (N, name, the cells after the name).
+fn doc_rows<'a>(doc: &'a str, heading: &str) -> Vec<(u32, String, Vec<&'a str>)> {
     let at = doc
         .find(&format!("\n{heading}\n"))
         .unwrap_or_else(|| panic!("no {heading}"));
@@ -2737,8 +2810,18 @@ fn doc_table(doc: &str, heading: &str) -> Vec<(u32, String)> {
             let cells: Vec<&str> = line.split('|').map(str::trim).collect();
             let n = cells.get(1)?.parse().ok()?;
             let name = cells.get(2)?.strip_prefix('`')?.strip_suffix('`')?;
-            Some((n, name.to_string()))
+            // The line ends with `|`: no cell after it.
+            let rest = cells[3..cells.len() - 1].to_vec();
+            Some((n, name.to_string(), rest))
         })
+        .collect()
+}
+
+/// The `| N | `name` | ...` rows of the table under `heading` in `doc`.
+fn doc_table(doc: &str, heading: &str) -> Vec<(u32, String)> {
+    doc_rows(doc, heading)
+        .into_iter()
+        .map(|(n, name, _)| (n, name))
         .collect()
 }
 
@@ -2766,7 +2849,13 @@ fn defines(text: &str, prefix: &str) -> Vec<(u32, String)> {
 fn the_system_call_document_matches_the_code() {
     // Issue #21's third criterion: docs/camelot-syscalls.md's tables are the
     // kernel's numbers, and the user side has the same ones.
-    let read = |path: &str| std::fs::read_to_string(repo_root().join(path)).unwrap();
+    // Git for Windows may check text out with CRLF line ends: compare with
+    // LF ones whatever it did.
+    let read = |path: &str| {
+        std::fs::read_to_string(repo_root().join(path))
+            .unwrap()
+            .replace("\r\n", "\n")
+    };
     let doc = read("docs/camelot-syscalls.md");
     let header = read("kernel/include/syscall.h");
     let usys = read("kernel/user/usys.s");
@@ -2802,6 +2891,45 @@ fn the_system_call_document_matches_the_code() {
     assert_eq!(errors.len(), 10, "{errors:?}");
     assert_eq!(defines(&header, "E"), errors, "syscall.h");
     assert_eq!(defines(&user_h, "E"), errors, "user.h");
+
+    // Each call's arguments are its user.h declaration's parameters, and
+    // what it may fail with are error numbers.
+    for (_, name, cells) in doc_rows(&doc, "## Calls") {
+        let [args, returns] = cells[..] else {
+            panic!("{name}: {cells:?}");
+        };
+        let decl = user_h
+            .lines()
+            .find(|l| l.contains(&format!(" {name}(")) && l.ends_with(");"))
+            .unwrap();
+        let params = &decl[decl.find('(').unwrap() + 1..decl.len() - 2];
+        let params = if params == "void" { "" } else { params };
+        assert_eq!(
+            args.trim_matches('`'),
+            params,
+            "{name}: the document, then user.h"
+        );
+        let mut listed = 0;
+        for word in returns.split(['`', ',', ';', ' ']) {
+            if let Some(e) = word.strip_prefix("-E") {
+                assert!(errors.iter().any(|(_, n)| n[1..] == *e), "{name}: no error E{e}");
+                listed += 1;
+            }
+        }
+        // A call that takes a pointer can fail with -EFAULT, and only those;
+        // only the calls that can't fail list no error.
+        assert_eq!(
+            args.contains('*'),
+            returns.contains("`-EFAULT`"),
+            "{name}: {returns}"
+        );
+        let infallible = ["exit", "getpid", "yield", "sleep", "uptime"];
+        assert_eq!(
+            listed == 0,
+            infallible.contains(&name.as_str()),
+            "{name}: {returns}"
+        );
+    }
     // And spawn's limits.
     for limit in ["MAXARG", "ARG_MAX"] {
         let want = defines(&header, limit);

@@ -76,12 +76,27 @@ static int copy_args(pagetable_t pt, u32 argv, const char *name, struct proc_arg
     }
 }
 
+/* Reads the rest of a user string, from `va` to its NUL, without keeping
+ * it. Returns 0, or -1 if it runs into memory the process can't read. */
+static int skip_string(pagetable_t pt, u32 va) {
+    char chunk[64];
+    int n;
+    /* -2: `sizeof chunk` bytes read, none of them a NUL. */
+    while ((n = copyinstr(pt, chunk, va, sizeof chunk)) == -2) {
+        va += sizeof chunk;
+    }
+    return n == -1 ? -1 : 0;
+}
+
 static int sys_spawn(struct trap_frame *f) {
     pagetable_t pt = myproc()->pagetable;
     /* A name longer than any program's can't be found, but is still read to
      * its end, so a bad pointer is reported as one. */
     char name[PROC_NAME_MAX + 2];
     int n = copyinstr(pt, name, arg(f, 0), sizeof name);
+    if (n == -2 && skip_string(pt, arg(f, 0) + sizeof name) != 0) {
+        n = -1;
+    }
     if (n == -1) {
         return -EFAULT;
     }

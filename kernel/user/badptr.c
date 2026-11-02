@@ -1,8 +1,9 @@
 /* badptr: hands the kernel pointers it must refuse. Every call below must
  * fail with -EFAULT (or -ENOSYS, for an unknown call number) without
- * printing, reading or changing anything; then a good write must return its
- * length. Exits with status 0 if all of that holds, else with the number of
- * the first case that didn't. */
+ * printing, reading or changing anything; then a good write, of "badptr:
+ * every bad pointer refused", must return its length. Exits with status 0 if
+ * all of that holds, else prints "badptr: case N failed" and exits with N,
+ * the number of the first case that didn't. */
 #include "user.h"
 
 /* User space (kernel/include/vm.h): the stack is its last page, with an
@@ -57,12 +58,22 @@ int main(void) {
     char *argv[] = {"echo", (char *)KERNEL, NULL};
     expect(spawn("echo", argv), -EFAULT);                    /* 18 */
     expect(spawn("echo", (char **)KERNEL), -EFAULT);         /* 19 */
+    /* Program names that run into the end of the heap: a short one, and
+     * one longer than any program's, which spawn still reads to its end. */
+    char *end = (char *)sbrk(PAGE) + PAGE;
+    memset(end - 30, 'a', 30);
+    expect(spawn(end - 10, NULL), -EFAULT);                  /* 20 */
+    expect(spawn(end - 30, NULL), -EFAULT);                  /* 21 */
     /* No child was started by any of that. */
-    expect(wait(-1, &status), -ECHILD);                      /* 20 */
+    expect(wait(-1, &status), -ECHILD);                      /* 22 */
     /* A call number nobody defined. */
-    expect(syscall(99, 0, 0, 0), -ENOSYS);                   /* 21 */
+    expect(syscall(99, 0, 0, 0), -ENOSYS);                   /* 23 */
     /* And a good buffer. */
-    uint len = strlen(msg);
-    expect(write(STDOUT, msg, len), (int)len);               /* 22 */
+    if (failed_case == 0) {
+        uint len = strlen(msg);
+        expect(write(STDOUT, msg, len), (int)len);           /* 24 */
+    } else {
+        printf("badptr: case %d failed\n", failed_case);
+    }
     return failed_case;
 }

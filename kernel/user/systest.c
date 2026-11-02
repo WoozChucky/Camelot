@@ -6,7 +6,8 @@
  *   systest exit N        exits with status N
  *   systest sleep N       sleeps N ticks, then exits with status 0
  *   systest args A B ...  exits 0 if its arguments are exactly "args A B ..."
- *                         (the parent passes them), else 1 */
+ *                         (the parent passes them), else 1
+ *   systest sbrk N        grows its heap by N bytes (see grow below) */
 #include "user.h"
 
 /* Process slots (NPROC in kernel/include/proc.h). */
@@ -34,8 +35,39 @@ static void check_eq(int got, int want, const char *what) {
     }
 }
 
+/* systest sbrk N: grows the heap by N bytes, and prints
+ * "systest: sbrk N: R", R being 0 or the error. A test runs it on a machine
+ * with too little memory, so that the kernel runs out of pages partway
+ * through: then the call must have changed nothing, the pages it had mapped
+ * already given back. Exits 0 if the heap is as it should be afterwards. */
+static int grow(int n) {
+    int base = sbrk(0);
+    int got = sbrk(n);
+    printf("systest: sbrk %d: %d\n", n, got < 0 ? got : 0);
+    if (got >= 0) {
+        return got == base && sbrk(0) == base + n ? 0 : 1;
+    }
+    if (sbrk(0) != base) {
+        return 2;
+    }
+    /* Nothing is mapped past the end: wait checks that it can store the
+     * status before anything else. */
+    if (wait(-1, (int *)base) != -EFAULT) {
+        return 3;
+    }
+    /* And the heap grows again from there. */
+    if (sbrk(PAGE) != base) {
+        return 4;
+    }
+    *(int *)base = 1;
+    return 0;
+}
+
 /* What a child run of systest does (see the top of the file). */
 static int child(int argc, char **argv) {
+    if (strcmp(argv[1], "sbrk") == 0 && argc == 3) {
+        return grow(atoi(argv[2]));
+    }
     if (strcmp(argv[1], "exit") == 0 && argc == 3) {
         return atoi(argv[2]);
     }
