@@ -1,8 +1,9 @@
 //! The listener: one thread per connection, one request per connection.
 
-use crate::api::{error_response, App};
-use crate::guard::{Guard, SECURITY_HEADERS};
-use crate::http::{read_request, Deadline, Limits, Request, Response};
+use crate::api::{error_response, App, RELEASE_WAIT};
+use crate::console::ConsoleLimits;
+use crate::guard::{Guard, Refusal, SECURITY_HEADERS};
+use crate::http::{read_request_head, Deadline, Limits, Request, Response};
 use crate::random;
 use avalon_client::Timeouts;
 use avalon_proto::{DEFAULT_AVALON_ADDR, DEFAULT_LAKE_ADDR};
@@ -24,8 +25,16 @@ pub const DEFAULT_AVALON_MAX_RAM: u64 = 4096 * 1024 * 1024;
 /// Most connections served at once; more are answered 503 at once.
 pub const MAX_CONNECTIONS: usize = 64;
 
+/// Most connections being turned away with a 503 at once; more are closed at once.
+const MAX_TURNING_AWAY: usize = 16;
+
 /// How long writing a response may take.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long, all told, a connection lingers after its response, reading what the
+/// client still sends ([`finish`]), and the most it reads meanwhile.
+const LINGER: Duration = Duration::from_secs(1);
+const LINGER_BYTES: usize = 4 * 1024 * 1024;
 
 /// How Pendragon runs.
 #[derive(Debug, Clone)]
@@ -44,6 +53,11 @@ pub struct Config {
     /// Time limits of Pendragon's sessions with Avalon and Lake: how long to try to
     /// connect, and to wait for a reply (a console waits for output without limit).
     pub timeouts: Timeouts,
+    /// How many consoles may be open, how much output each keeps, and when an
+    /// unused one is closed.
+    pub consoles: ConsoleLimits,
+    /// How long detaching a disk waits for Lake to see it released.
+    pub release_wait: Duration,
     /// Say where it listens on stderr.
     pub log: bool,
 }
@@ -58,6 +72,8 @@ impl Default for Config {
             allow_hosts: Vec::new(),
             limits: Limits::default(),
             timeouts: Timeouts::default(),
+            consoles: ConsoleLimits::default(),
+            release_wait: RELEASE_WAIT,
             log: true,
         }
     }
@@ -91,6 +107,8 @@ struct Shared {
     log: bool,
     stopping: AtomicBool,
     connections: AtomicUsize,
+    /// Connections being answered 503 ([`Shared::turn_away`]).
+    turning_away: AtomicUsize,
 }
 
 impl Server {
@@ -104,17 +122,13 @@ impl Server {
             listener,
             shared: Arc::new(Shared {
                 guard: Guard::new(addr, &config.allow_hosts, token),
-                app: App::new(
-                    &config.avalon,
-                    &config.lake,
-                    config.avalon_max_ram,
-                    config.timeouts,
-                ),
+                app: App::new(config),
                 limits: config.limits,
                 addr,
                 log: config.log,
                 stopping: AtomicBool::new(false),
                 connections: AtomicUsize::new(0),
+                turning_away: AtomicUsize::new(0),
             }),
         })
     }
@@ -156,6 +170,12 @@ impl Server {
                 );
             }
         }
+        // Closes unused consoles on time, whether or not anyone opens another. It
+        // ends when the accept loop does (close_all wakes it).
+        let sweeper = Arc::clone(shared);
+        std::thread::Builder::new()
+            .name("pendragon-consoles".into())
+            .spawn(move || sweeper.app.hub.sweep_until_closed())?;
         for stream in self.listener.incoming() {
             if shared.stopping.load(Ordering::SeqCst) {
                 break;
@@ -167,10 +187,7 @@ impl Server {
             };
             if shared.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
                 shared.connections.fetch_sub(1, Ordering::SeqCst);
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-                let busy = with_security_headers(Response::text(503, "too many connections; try again"));
-                let _ = busy.write_to(&mut &stream, false);
-                finish(&stream);
+                shared.turn_away(stream);
                 continue;
             }
             let shared = Arc::clone(shared);
@@ -265,14 +282,21 @@ impl Shared {
     fn serve(&self, stream: &TcpStream) {
         let _ = stream.set_nodelay(true);
         let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-        let request = {
-            let mut reader = Deadline::new(stream, self.limits.timeout);
-            read_request(&mut reader, &self.limits, |method, path| {
-                self.app.body_limit(method, path)
-            })
-        };
-        let (response, head_only) = match request {
-            Ok(req) => (self.respond(&req), req.method == "HEAD"),
+        let mut reader = Deadline::new(stream, self.limits.timeout);
+        // The guard judges the head before the body is read: a request it refuses
+        // costs its head, not the up to MAX_UPLOAD bytes it may say it will send.
+        let answer = read_request_head(&mut reader, &self.limits, |method, path| {
+            self.app.body_limit(method, path)
+        })
+        .and_then(|head| {
+            let head_only = head.request.method == "HEAD";
+            match self.refuse(&head.request) {
+                Some(refusal) => Ok((refusal, head_only)),
+                None => Ok((self.app.handle(&head.read_body(&mut reader)?), head_only)),
+            }
+        });
+        let (response, head_only) = match answer {
+            Ok(answer) => answer,
             Err(e) => match e.status() {
                 Some(status) => (Response::text(status, &e.to_string()), false),
                 None => return,
@@ -282,30 +306,50 @@ impl Shared {
         finish(stream);
     }
 
-    /// The guard's checks, then the page or the API.
-    fn respond(&self, req: &Request) -> Response {
+    /// The guard's checks, on the request's head: a 403, or `None` to go on to the
+    /// page or the API.
+    fn refuse(&self, req: &Request) -> Option<Response> {
         let api = req.segments.first().is_some_and(|s| s == "api");
-        let refuse = |why: String| {
+        let check = || {
+            self.guard.check_host(req)?;
+            if api {
+                self.guard.check_token(req)?;
+                if !matches!(req.method.as_str(), "GET" | "HEAD") {
+                    self.guard.check_origin(req)?;
+                }
+            }
+            Ok(())
+        };
+        check().err().map(|Refusal(why)| {
             if api {
                 error_response(403, &why, None)
             } else {
                 Response::text(403, &why)
             }
-        };
-        if let Err(r) = self.guard.check_host(req) {
-            return refuse(r.0);
+        })
+    }
+
+    /// Answers a connection over [`MAX_CONNECTIONS`] with a 503, on a thread of its
+    /// own so that a client that dawdles over it cannot hold up the accept loop. A few
+    /// at a time: past [`MAX_TURNING_AWAY`], connections are closed without a word.
+    fn turn_away(self: &Arc<Self>, stream: TcpStream) {
+        if self.turning_away.fetch_add(1, Ordering::SeqCst) >= MAX_TURNING_AWAY {
+            self.turning_away.fetch_sub(1, Ordering::SeqCst);
+            return;
         }
-        if api {
-            if let Err(r) = self.guard.check_token(req) {
-                return refuse(r.0);
-            }
-            if !matches!(req.method.as_str(), "GET" | "HEAD") {
-                if let Err(r) = self.guard.check_origin(req) {
-                    return refuse(r.0);
-                }
-            }
+        let shared = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("pendragon-busy".into())
+            .spawn(move || {
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                let busy = with_security_headers(Response::text(503, "too many connections; try again"));
+                let _ = busy.write_to(&mut &stream, false);
+                finish(&stream);
+                shared.turning_away.fetch_sub(1, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            self.turning_away.fetch_sub(1, Ordering::SeqCst);
         }
-        self.app.handle(req)
     }
 }
 
@@ -318,14 +362,16 @@ fn with_security_headers(mut response: Response) -> Response {
 
 /// Ends a connection gently: says no more is coming, then reads (and drops) what the
 /// client still sends for a moment, so that closing does not reset the connection
-/// before the client has read the response (which a reset can discard).
+/// before the client has read the response (which a reset can discard). The moment is
+/// [`LINGER`] all told, however the client spreads its bytes, and at most
+/// [`LINGER_BYTES`]: a client that keeps sending cannot keep the connection.
 fn finish(stream: &TcpStream) {
     let _ = stream.shutdown(Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut reader = Deadline::new(stream, LINGER);
     let mut sink = [0u8; 8192];
     let mut drained = 0;
-    while drained < 4 * 1024 * 1024 {
-        match (&mut &*stream).read(&mut sink) {
+    while drained < LINGER_BYTES {
+        match reader.read(&mut sink) {
             Ok(0) | Err(_) => break,
             Ok(n) => drained += n,
         }

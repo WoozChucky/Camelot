@@ -63,6 +63,120 @@ fn a_quiet_console_stays_attached() {
     platform.stop();
 }
 
+/// Replaces the platform's Pendragon with one configured by `change`.
+fn reconfigure(platform: &mut Platform, change: impl FnOnce(&mut pendragon::Config)) {
+    let mut config = pendragon::Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        avalon: platform.avalon.addr().to_string(),
+        lake: platform.lake_addr(),
+        log: false,
+        ..pendragon::Config::default()
+    };
+    change(&mut config);
+    let old = std::mem::replace(&mut platform.pendragon, pendragon_with(config));
+    old.stop().unwrap();
+}
+
+/// Creates and starts a VM running uart-echo; returns its id.
+fn echo_vm(api: &Api, name: &str, disks: Vec<Json>) -> u64 {
+    let r = api.expect(
+        201,
+        api.post(
+            "vms",
+            &obj([
+                ("name", name.into()),
+                ("ram", "8".into()),
+                ("program", program("uart-echo")),
+                ("disks", Json::Array(disks)),
+                ("start", true.into()),
+            ]),
+        ),
+    );
+    n(&r, "id")
+}
+
+#[test]
+fn consoles_are_limited_and_closed_when_unused() {
+    let mut platform = Platform::start("consoles", 64);
+    reconfigure(&mut platform, |c| {
+        c.consoles = pendragon::ConsoleLimits {
+            max_taps: 1,
+            idle: std::time::Duration::from_millis(300),
+            ..pendragon::ConsoleLimits::default()
+        }
+    });
+    let api = platform.api();
+    let one = echo_vm(&api, "one", vec![]);
+    let two = echo_vm(&api, "two", vec![]);
+    let consoles = |api: &Api| n(&api.expect(200, api.get("overview")), "consoles");
+    assert_eq!(consoles(&api), 0);
+    let tap = n(&api.expect(200, api.get(&format!("vms/{one}/console"))), "tap");
+    assert_eq!(consoles(&api), 1);
+    // A second console is over Pendragon's budget.
+    let r = api.get(&format!("vms/{two}/console"));
+    assert_eq!(r.status, 409);
+    assert_eq!(r.json().get("code").and_then(Json::as_str), Some("over budget"));
+    assert!(r.error().contains("1 consoles open already"), "{}", r.error());
+    // Nobody reads the first: it is closed on time, with no other console request
+    // to notice (the overview does not touch consoles).
+    wait_for("the unused console to close", || {
+        (consoles(&api) == 0).then_some(())
+    });
+    api.expect(200, api.get(&format!("vms/{two}/console")));
+    assert_eq!(consoles(&api), 1);
+    wait_for("the second console to close", || {
+        (consoles(&api) == 0).then_some(())
+    });
+    // The first VM's page comes back to a new tap, and starts over.
+    let r = api.expect(200, api.get(&format!("vms/{one}/console?tap={tap}&from=5")));
+    assert_ne!(n(&r, "tap"), tap);
+    assert_eq!((r.get("reset"), n(&r, "from")), (Some(&Json::Bool(true)), 0));
+    platform.stop();
+}
+
+#[test]
+fn a_detach_says_when_the_disk_is_still_held() {
+    // Two Avalons on one Lake, each with a VM reading the same image: detaching
+    // through Pendragon stops the VM on its own Avalon, but the image stays held.
+    let mut platform = Platform::start("held", 64);
+    reconfigure(&mut platform, |c| {
+        c.release_wait = std::time::Duration::from_millis(300)
+    });
+    let other_avalon = avalon::Server::bind(&avalon::Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        log: false,
+        max_ram: Some(64 * MIB),
+        ..avalon::Config::default()
+    })
+    .unwrap()
+    .spawn()
+    .unwrap();
+    let other = pendragon_for(&other_avalon.addr().to_string(), &platform.lake_addr(), 64 * MIB);
+    let api = platform.api();
+    let other_api = Api::new(&other);
+    api.expect(
+        201,
+        api.post("disks", &obj([("name", "shared".into()), ("size", "8s".into())])),
+    );
+    let disk = || {
+        vec![obj([
+            ("source", format!("lake://{}/shared", platform.lake_addr()).into()),
+            ("read_only", true.into()),
+        ])]
+    };
+    echo_vm(&api, "here", disk());
+    echo_vm(&other_api, "there", disk());
+    let r = api.expect(200, api.action("disks/shared/detach"));
+    assert_eq!(list(&r, "stopped").len(), 1);
+    assert_eq!(r.get("released"), Some(&Json::Bool(false)), "{r}");
+    // Once the other lets go too, it is released.
+    let r = other_api.expect(200, other_api.action("disks/shared/detach"));
+    assert_eq!(r.get("released"), Some(&Json::Bool(true)), "{r}");
+    other.stop().unwrap();
+    other_avalon.stop().unwrap();
+    platform.stop();
+}
+
 fn list_of(v: &Json, key: &str) -> Vec<Json> {
     list(v, key).to_vec()
 }
@@ -298,7 +412,7 @@ fn vms_and_disks_end_to_end() {
     api.expect(200, api.post("vms/echo/console", &obj([("data", "x".into())])));
     let r = reader.join().unwrap();
     assert!(start.elapsed() < std::time::Duration::from_secs(5));
-    assert_eq!(pendragon::base64::decode(s(&r, "data")).unwrap(), b"x");
+    assert_eq!(pendragon::base64::decode(s(&r, "data")).unwrap(), b"x", "{r}");
     for bad in ["from=-1", "from=x", "tap=1.5", "wait=lots"] {
         assert_eq!(api.get(&format!("vms/{echo}/console?{bad}")).status, 400, "{bad}");
     }

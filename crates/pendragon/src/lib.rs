@@ -31,7 +31,7 @@ mod console;
 mod server;
 
 pub use api::{MAX_BODY, MAX_UPLOAD, MAX_WAIT};
-pub use console::{IDLE as CONSOLE_IDLE, KEEP as CONSOLE_KEEP, MAX_TAPS};
+pub use console::{ConsoleLimits, IDLE as CONSOLE_IDLE, KEEP as CONSOLE_KEEP, MAX_TAPS};
 pub use guard::TOKEN_HEADER;
 pub use server::{
     Config, Server, ServerThread, ShutdownHandle, DEFAULT_AVALON_MAX_RAM, DEFAULT_LISTEN, MAX_CONNECTIONS,

@@ -138,6 +138,7 @@ impl Guard {
 
     /// A request that changes something comes from Pendragon's own page: its
     /// `Origin`, when the browser sent one, is ours, and its body, if any, is JSON.
+    /// Judged on the head alone: the server runs it before reading the body.
     pub fn check_origin(&self, req: &Request) -> Result<(), Refusal> {
         if let Some(origin) = req.header("origin") {
             let origin = origin.to_ascii_lowercase();
@@ -148,7 +149,7 @@ impl Guard {
                 return Err(Refusal(format!("requests from '{origin}' are not accepted")));
             }
         }
-        if !req.body.is_empty() {
+        if req.has_body() {
             let media = req.header("content-type").unwrap_or_default();
             let media = media.split(';').next().unwrap_or_default().trim();
             if !media.eq_ignore_ascii_case("application/json") {
@@ -323,6 +324,10 @@ mod tests {
             assert!(check(&[("Content-Type", media)], b"{}").is_err(), "{media}");
         }
         assert!(check(&[], b"{}").is_err());
+        // Judged from the head, before the body is read: Content-Length says one comes.
+        assert!(check(&[("Content-Type", "text/plain"), ("Content-Length", "5")], b"").is_err());
+        assert!(check(&[("Content-Length", "5"), json[0]], b"").is_ok());
+        assert!(check(&[("Content-Type", "text/plain"), ("Content-Length", "0")], b"").is_ok());
     }
 
     #[test]

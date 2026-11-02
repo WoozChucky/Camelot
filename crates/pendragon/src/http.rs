@@ -78,6 +78,15 @@ impl Request {
         self.headers.iter().filter(|(n, _)| n == name).count()
     }
 
+    /// Whether the request has a body, or (its head read, the body not yet) says it
+    /// will have one.
+    pub fn has_body(&self) -> bool {
+        !self.body.is_empty()
+            || self
+                .header("content-length")
+                .is_some_and(|l| l.parse::<u64>().map_or(true, |n| n > 0))
+    }
+
     /// The value of the first query parameter named `name`.
     pub fn query(&self, name: &str) -> Option<&str> {
         self.query
@@ -196,18 +205,69 @@ impl Write for Deadline<'_> {
     }
 }
 
-/// Reads one request from `stream` within `limits`. `body_limit(method, path)` is the
-/// most body bytes that request may carry (the path as sent, before decoding).
-///
-/// A request with `Expect: 100-continue` (curl sends it before large bodies) gets its
-/// `100 Continue` once the head is accepted, which is why `stream` is written to.
-pub fn read_request<S: Read + Write>(
+/// A request whose head has been read and accepted, its body still to come: what
+/// [`read_request_head`] returns. The server judges the head (its `Host`, its token)
+/// before [`Head::read_body`] reads or makes room for a byte of the body, so a request
+/// it refuses costs no more than its head.
+#[derive(Debug)]
+pub struct Head {
+    /// The request, with an empty body.
+    pub request: Request,
+    /// `Content-Length`, within the body limit.
+    length: usize,
+    /// What was read after the head: the start of the body.
+    rest: Vec<u8>,
+}
+
+impl Head {
+    /// The body's length, as `Content-Length` says.
+    pub fn body_length(&self) -> usize {
+        self.length
+    }
+
+    /// Reads the body. A request with `Expect: 100-continue` (curl sends it before
+    /// large bodies) gets its `100 Continue` first, which is why `stream` is written to.
+    pub fn read_body<S: Read + Write>(self, stream: &mut S) -> Result<Request, HttpError> {
+        let Head {
+            mut request,
+            length,
+            rest: mut body,
+        } = self;
+        // Only worth saying when the body is still to come (read_request_head refused
+        // every other Expect).
+        if body.len() < length && request.header("expect").is_some() {
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            stream.flush()?;
+        }
+        // Anything past the body (a pipelined request) is dropped with the connection.
+        body.truncate(length);
+        // The buffer grows as the bytes arrive rather than being made full size up
+        // front: a client that announces 24 MiB and sends nothing holds next to nothing.
+        let missing = (length - body.len()) as u64;
+        body.reserve(missing.min(64 * 1024) as usize);
+        (&mut *stream).take(missing).read_to_end(&mut body)?;
+        if body.len() < length {
+            return Err(malformed(format!(
+                "the body ended after {} of {length} bytes",
+                body.len()
+            )));
+        }
+        request.body = body;
+        Ok(request)
+    }
+}
+
+/// Reads one request's head from `stream` within `limits`, and checks what it says
+/// about the body: `body_limit(method, path)` is the most body bytes that request may
+/// carry (the path as sent, before decoding). The body is left for
+/// [`Head::read_body`].
+pub fn read_request_head<S: Read>(
     stream: &mut S,
     limits: &Limits,
     body_limit: impl Fn(&str, &str) -> usize,
-) -> Result<Request, HttpError> {
-    let (head, mut body) = read_head(stream, limits)?;
-    let mut request = parse_head(&head, limits)?;
+) -> Result<Head, HttpError> {
+    let (head, rest) = read_head(stream, limits)?;
+    let request = parse_head(&head, limits)?;
 
     if request.header("transfer-encoding").is_some() {
         return Err(HttpError::NotImplemented("Transfer-Encoding".into()));
@@ -221,37 +281,25 @@ pub fn read_request<S: Read + Write>(
     if length > limit as u64 {
         return Err(HttpError::BodyTooLarge { limit });
     }
-    let length = length as usize;
     match request.header("expect").map(str::to_ascii_lowercase).as_deref() {
-        None => {}
-        Some("100-continue") => {
-            // Only worth saying when the body is still to come.
-            if body.len() < length {
-                stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
-                stream.flush()?;
-            }
-        }
+        None | Some("100-continue") => {}
         Some(_) => return Err(HttpError::ExpectationFailed),
     }
+    Ok(Head {
+        request,
+        length: length as usize,
+        rest,
+    })
+}
 
-    // What came after the head in the last read is the start of the body; anything
-    // past the body (a pipelined request) is dropped with the connection.
-    body.truncate(length);
-    let start = body.len();
-    body.resize(length, 0);
-    let mut filled = start;
-    while filled < length {
-        match stream.read(&mut body[filled..])? {
-            0 => {
-                return Err(malformed(format!(
-                    "the body ended after {filled} of {length} bytes"
-                )))
-            }
-            n => filled += n,
-        }
-    }
-    request.body = body;
-    Ok(request)
+/// Reads one whole request: [`read_request_head`], then [`Head::read_body`] with
+/// nothing judged in between.
+pub fn read_request<S: Read + Write>(
+    stream: &mut S,
+    limits: &Limits,
+    body_limit: impl Fn(&str, &str) -> usize,
+) -> Result<Request, HttpError> {
+    read_request_head(stream, limits, body_limit)?.read_body(stream)
 }
 
 /// Reads up to the blank line that ends the head. Returns the head (without that blank
@@ -283,7 +331,8 @@ fn read_head<S: Read>(stream: &mut S, limits: &Limits) -> Result<(Vec<u8>, Vec<u
                 return Err(malformed("the request head has control or non-ASCII bytes"));
             }
             if buf[i..].starts_with(b"\r\n\r\n") {
-                if i > limits.max_head {
+                // The limit counts the blank line that ends the head too.
+                if i + 4 > limits.max_head {
                     return Err(HttpError::HeadTooLarge);
                 }
                 let rest = buf.split_off(i + 4);
@@ -292,7 +341,8 @@ fn read_head<S: Read>(stream: &mut S, limits: &Limits) -> Result<(Vec<u8>, Vec<u
             }
         }
         scanned = buf.len();
-        if buf.len() > limits.max_head + 4 {
+        // No CRLFCRLF starts before the last 3 bytes, so the head is longer than this.
+        if buf.len() >= limits.max_head {
             return Err(HttpError::HeadTooLarge);
         }
     }
@@ -304,6 +354,9 @@ fn is_tchar(b: u8) -> bool {
 }
 
 fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, HttpError> {
+    // One empty line before the request line is ignored, as RFC 9112 section 2.2
+    // asks (clients have sent a stray CRLF after a body).
+    let head = head.strip_prefix(b"\r\n").unwrap_or(head);
     // Every line ends in CRLF (read_head refused bare LFs), so a CR anywhere else is
     // a stray one.
     let mut lines = head
@@ -747,6 +800,52 @@ mod tests {
             parse(format!("{enough}\r\n").as_bytes()).unwrap().headers.len(),
             64
         );
+    }
+
+    #[test]
+    fn the_head_limit_counts_every_byte() {
+        let limits = Limits::default();
+        // A head of `extra` bytes over the limit, its final blank line included.
+        let head = |extra: usize| {
+            let (start, end) = ("GET / HTTP/1.1\r\nHost: h\r\nX: ", "\r\n\r\n");
+            let fill = "a".repeat(limits.max_head + extra - start.len() - end.len());
+            format!("{start}{fill}{end}").into_bytes()
+        };
+        assert_eq!(head(0).len(), limits.max_head);
+        assert!(parse(&head(0)).is_ok());
+        assert_eq!(status(&head(1)), Some(431));
+        assert_eq!(status(&head(4)), Some(431));
+        // However the bytes arrive.
+        let trickle = |bytes: Vec<u8>| read_request(&mut Trickle(bytes, 0), &limits, |_, _| 10);
+        assert!(trickle(head(0)).is_ok());
+        assert!(matches!(trickle(head(1)), Err(HttpError::HeadTooLarge)));
+    }
+
+    #[test]
+    fn one_empty_line_before_the_request_is_ignored() {
+        let r = parse(b"\r\nGET /x HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        assert_eq!(r.segments, ["x"]);
+        assert_eq!(status(b"\r\n\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n"), Some(400));
+    }
+
+    #[test]
+    fn the_head_comes_before_the_body() {
+        // The head is judged with nothing of the body read, nor a 100 Continue sent.
+        let text = b"POST /p HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n";
+        let mut p = pipe(text);
+        let head = read_request_head(&mut p, &Limits::default(), |_, _| 10).unwrap();
+        assert_eq!(head.body_length(), 5);
+        assert!(head.request.body.is_empty());
+        assert!(p.output.is_empty());
+        // The body, once asked for: the 100 goes out, then the bytes are read.
+        p.input.get_mut().extend_from_slice(b"hello");
+        let r = head.read_body(&mut p).unwrap();
+        assert_eq!(r.body, b"hello");
+        assert_eq!(p.output, b"HTTP/1.1 100 Continue\r\n\r\n");
+        // A body that says it is large and never comes is an error, not a hang.
+        let mut p = pipe(b"POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 1000000\r\n\r\nabc");
+        let head = read_request_head(&mut p, &Limits::default(), |_, _| 1 << 20).unwrap();
+        assert!(matches!(head.read_body(&mut p), Err(HttpError::Malformed(_))));
     }
 
     #[test]

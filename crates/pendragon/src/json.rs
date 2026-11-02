@@ -11,6 +11,7 @@
 //! exactly, with no trip through `f64`. The encoder escapes `<`, `>`, `&`, U+2028 and
 //! U+2029 as well as what JSON requires, so its output is inert even inside HTML.
 
+use std::collections::HashSet;
 use std::fmt::{self, Write as _};
 
 /// How deeply arrays and objects may nest.
@@ -258,6 +259,9 @@ impl Parser<'_> {
                 }
                 self.i += 1;
                 let mut members: Vec<(String, Json)> = Vec::new();
+                // The keys so far, to find a duplicate without going through every
+                // member each time (a large object would take quadratic time).
+                let mut keys = HashSet::new();
                 self.ws();
                 if self.eat(b'}') {
                     return Ok(Json::Object(members));
@@ -268,7 +272,7 @@ impl Parser<'_> {
                         return Err(self.err("expected a string key"));
                     }
                     let key = self.string()?;
-                    if members.iter().any(|(k, _)| *k == key) {
+                    if !keys.insert(key.clone()) {
                         return Err(self.err(&format!("duplicate key \"{key}\"")));
                     }
                     self.ws();
@@ -525,6 +529,15 @@ mod tests {
         assert!(Json::parse("{\"a\":1,\"a\":2}")
             .unwrap_err()
             .contains("duplicate key"));
+        // Many keys take linear time: 200,000 would take most of a minute compared one
+        // by one with every earlier key.
+        let many: Vec<String> = (0..200_000).map(|i| format!("\"k{i}\":{i}")).collect();
+        let start = std::time::Instant::now();
+        let text = format!("{{{}}}", many.join(","));
+        assert!(Json::parse(&text).is_ok());
+        let dup = format!("{{{},\"k7\":0}}", many.join(","));
+        assert!(Json::parse(&dup).unwrap_err().contains("duplicate key \"k7\""));
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]

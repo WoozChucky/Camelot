@@ -32,8 +32,9 @@ pub const MAX_UPLOAD: usize = 24 * 1024 * 1024;
 /// Longest a console read waits for output.
 pub const MAX_WAIT: Duration = Duration::from_secs(20);
 
-/// How long a detach waits for Lake to see the disk released.
-const RELEASE_WAIT: Duration = Duration::from_secs(5);
+/// How long a detach waits for Lake to see the disk released, by default
+/// ([`crate::Config::release_wait`]).
+pub(crate) const RELEASE_WAIT: Duration = Duration::from_secs(5);
 
 /// Time limits for the health checks of the overview and the attachment column of the
 /// disk list, which should not hold the page up for long when a server is away.
@@ -54,6 +55,8 @@ pub struct App {
     timeouts: Timeouts,
     /// Avalon's RAM budget, for the overview (the protocol does not report it).
     max_ram: u64,
+    /// How long a detach waits for Lake to see the disk released.
+    release_wait: Duration,
     pub(crate) hub: Hub,
 }
 
@@ -132,13 +135,14 @@ fn json(status: u16, value: Json) -> Response {
 type Reply = Result<Response, Fail>;
 
 impl App {
-    pub fn new(avalon: &str, lake: &str, max_ram: u64, timeouts: Timeouts) -> App {
+    pub fn new(config: &crate::Config) -> App {
         App {
-            avalon: avalon.to_string(),
-            lake: lake.to_string(),
-            timeouts,
-            max_ram,
-            hub: Hub::new(avalon, timeouts),
+            avalon: config.avalon.clone(),
+            lake: config.lake.clone(),
+            timeouts: config.timeouts,
+            max_ram: config.avalon_max_ram,
+            release_wait: config.release_wait,
+            hub: Hub::new(&config.avalon, config.timeouts, config.consoles),
         }
     }
 
@@ -307,6 +311,7 @@ impl App {
                 ("vms", vm_stats.into()),
                 ("ram", ram.into()),
                 ("disks", disk_stats.into()),
+                ("consoles", self.hub.open().into()),
             ]),
         )
     }
@@ -521,7 +526,7 @@ impl App {
                 },
                 Err(_) => return false,
             }
-            if start.elapsed() >= RELEASE_WAIT {
+            if start.elapsed() >= self.release_wait {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -749,14 +754,19 @@ fn disk_json(disk: &DiskInfo, attached_to: Option<Json>) -> Json {
 }
 
 /// The VMs whose machines hold Lake image `name` right now (with whether read-only):
-/// those still created, running or paused whose profile names it on our Lake.
+/// those still created, running or paused whose profile names it on our Lake. Each VM
+/// once, however many of its disks name the image: read-only if all of them are.
 fn holders<'a>(vms: &'a [VmSummary], name: &str, same: &mut SameServer) -> Vec<(&'a VmSummary, bool)> {
     let mut found = Vec::new();
     for vm in vms.iter().filter(|vm| holds_disks(vm.state)) {
+        let mut holds = None;
         for (addr, disk, read_only) in lake_disks(&vm.profile) {
             if disk == name && same.is_lake(addr) {
-                found.push((vm, read_only));
+                holds = Some(holds.unwrap_or(true) && read_only);
             }
+        }
+        if let Some(read_only) = holds {
+            found.push((vm, read_only));
         }
     }
     found
@@ -918,6 +928,44 @@ mod tests {
         assert!(same.is_lake("localhost:7401"));
         assert!(!same.is_lake("127.0.0.1:7402"));
         assert!(!same.is_lake("no-such-host.invalid:7401"));
+    }
+
+    #[test]
+    fn each_holder_once() {
+        let vm = |id: u32, state: VmState, disks: &[(&str, bool)]| VmSummary {
+            id,
+            name: format!("vm{id}"),
+            state,
+            profile: HardwareProfile {
+                devices: disks
+                    .iter()
+                    .map(|&(source, read_only)| {
+                        DeviceSpec::Disk(DiskSpec {
+                            source: parse_disk_source(source).unwrap(),
+                            read_only,
+                        })
+                    })
+                    .collect(),
+                ..HardwareProfile::with_ram(8 << 20)
+            },
+        };
+        let ours = "lake://127.0.0.1:7401/d";
+        let vms = [
+            // The same image twice, read-only: one holder.
+            vm(1, VmState::Running, &[(ours, true), (ours, true)]),
+            // Read-only and read-write: a writer.
+            vm(2, VmState::Paused, &[(ours, true), (ours, false)]),
+            // Another image, another Lake, a VM that let go.
+            vm(3, VmState::Running, &[("lake://127.0.0.1:7401/e", false)]),
+            vm(4, VmState::Running, &[("lake://127.0.0.1:7499/d", false)]),
+            vm(5, VmState::Stopped, &[(ours, false)]),
+        ];
+        let mut same = SameServer::new("127.0.0.1:7401");
+        let found: Vec<(u32, bool)> = holders(&vms, "d", &mut same)
+            .into_iter()
+            .map(|(vm, read_only)| (vm.id, read_only))
+            .collect();
+        assert_eq!(found, [(1, true), (2, false)]);
     }
 
     #[test]

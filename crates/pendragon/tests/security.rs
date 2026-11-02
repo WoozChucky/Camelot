@@ -282,6 +282,7 @@ fn malformed_requests_are_refused() {
     let server = server();
     let addr = server.addr();
     let host = format!("Host: {addr}\r\n");
+    let token = Api::new(&server).token;
     let status = |bytes: &[u8]| parse_reply(&raw(addr, bytes)).status;
     for (bytes, want) in [
         (b"GET / HTTP/1.1\nHost: x\n\n".to_vec(), 400),
@@ -313,7 +314,12 @@ fn malformed_requests_are_refused() {
             400,
         ),
         (
-            format!("POST /api/disks HTTP/1.1\r\n{host}Content-Length: 10\r\n\r\n{{}}").into_bytes(),
+            // A body shorter than it says (the guard passes it: it judges the head).
+            format!(
+                "POST /api/disks HTTP/1.1\r\n{host}X-Pendragon-Token: {token}\r\n\
+                 Content-Type: application/json\r\nContent-Length: 10\r\n\r\n{{}}"
+            )
+            .into_bytes(),
             400,
         ),
         (
@@ -389,6 +395,160 @@ fn oversize_bodies_are_refused_unread() {
 }
 
 #[test]
+fn refusals_come_before_the_body() {
+    // A request the guard refuses is answered from its head: Pendragon neither waits
+    // for nor makes room for the body it announces (up to MAX_UPLOAD, 24 MiB).
+    let server = server();
+    let addr = server.addr();
+    let token = Api::new(&server).token;
+    let token = token.as_str();
+    let host = addr.to_string();
+    let host = host.as_str();
+    let big = pendragon::MAX_UPLOAD.to_string();
+    for (why, headers) in [
+        (
+            "wrong host",
+            vec![("Host", "evil.example"), ("Content-Type", "text/plain")],
+        ),
+        (
+            "no token",
+            vec![("Host", host), ("Content-Type", "application/json")],
+        ),
+        (
+            "foreign origin",
+            vec![
+                ("Host", host),
+                ("X-Pendragon-Token", token),
+                ("Origin", "http://evil.example"),
+                ("Content-Type", "application/json"),
+            ],
+        ),
+        (
+            "form body",
+            vec![
+                ("Host", host),
+                ("X-Pendragon-Token", token),
+                ("Content-Type", "text/plain"),
+            ],
+        ),
+        (
+            // The 100 Continue goes only to requests that pass.
+            "no token, expecting a 100",
+            vec![
+                ("Host", host),
+                ("Expect", "100-continue"),
+                ("Content-Type", "application/json"),
+            ],
+        ),
+    ] {
+        let mut text = "POST /api/vms HTTP/1.1\r\n".to_string();
+        for (name, value) in headers {
+            text += &format!("{name}: {value}\r\n");
+        }
+        text += &format!("Content-Length: {big}\r\n\r\n");
+        let mut s = TcpStream::connect(addr).unwrap();
+        // Waiting for a body that never comes would run into this.
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(text.as_bytes()).unwrap();
+        let mut reply = Vec::new();
+        let read = s.read_to_end(&mut reply);
+        assert!(read.is_ok(), "{why}: {read:?}");
+        let reply = parse_reply(&reply);
+        assert_eq!(reply.status, 403, "{why}: {}", reply.text());
+    }
+    server.stop().unwrap();
+}
+
+#[test]
+fn clients_cannot_linger_after_the_response() {
+    // Every client on the connection limit has its answer, then keeps sending a byte
+    // now and then: Pendragon closes each connection after a moment all the same,
+    // and serves others.
+    let server = server();
+    let addr = server.addr();
+    let mut lingering: Vec<TcpStream> = (0..pendragon::MAX_CONNECTIONS)
+        .map(|_| {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(SLOW)).unwrap();
+            s.write_all(format!("GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
+                .unwrap();
+            s
+        })
+        .collect();
+    for s in &mut lingering {
+        // The response, up to where the server says it sends no more.
+        let mut reply = Vec::new();
+        let _ = s.read_to_end(&mut reply);
+        assert_eq!(parse_reply(&reply).status, 200);
+    }
+    let trickler = std::thread::spawn(move || {
+        let start = Instant::now();
+        let mut open = lingering.len();
+        while open > 0 && start.elapsed() < Duration::from_secs(8) {
+            open = 0;
+            for s in &mut lingering {
+                if s.write_all(b"x").is_ok() {
+                    open += 1;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        open
+    });
+    let start = Instant::now();
+    loop {
+        if request(addr, "GET", "/", &[], b"").status == 200 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the lingering clients still hold every connection"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The server closed them all: their writes fail.
+    assert_eq!(trickler.join().unwrap(), 0);
+    server.stop().unwrap();
+}
+
+#[test]
+fn a_client_turned_away_cannot_hold_up_the_others() {
+    let server = server();
+    let addr = server.addr();
+    let idle: Vec<TcpStream> = (0..pendragon::MAX_CONNECTIONS)
+        .map(|_| TcpStream::connect(addr).unwrap())
+        .collect();
+    // One over the limit: its 503, then a byte now and then, for a long while.
+    let mut dawdler = wait_for("a connection over the limit", || {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(SLOW)).unwrap();
+        let _ = s.write_all(format!("GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes());
+        let mut reply = Vec::new();
+        let _ = s.read_to_end(&mut reply);
+        (parse_reply(&reply).status == 503).then_some(s)
+    });
+    let dawdling = std::thread::spawn(move || {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(8) && dawdler.write_all(b"x").is_ok() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    // Room again: served at once, not once the dawdler stops.
+    drop(idle);
+    let start = Instant::now();
+    wait_for("connections to be served again", || {
+        (request(addr, "GET", "/", &[], b"").status == 200).then_some(())
+    });
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "served after {:?}",
+        start.elapsed()
+    );
+    dawdling.join().unwrap();
+    server.stop().unwrap();
+}
+
+#[test]
 fn slow_clients_time_out() {
     let server = pendragon_with(pendragon::Config {
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -423,6 +583,14 @@ fn slow_clients_time_out() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
+            // Stop once the answer is in, as a browser would: Pendragon lingers only a
+            // moment after answering, then closes, and a reset can lose the answer.
+            s.set_nonblocking(true).unwrap();
+            let answered = s.peek(&mut [0]).is_ok_and(|n| n > 0);
+            s.set_nonblocking(false).unwrap();
+            if answered {
+                break;
+            }
         }
         let mut reply = Vec::new();
         let _ = s.read_to_end(&mut reply);
