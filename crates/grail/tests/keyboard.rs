@@ -4,6 +4,7 @@
 
 use excalibur::csr::IRQ_M_EXT;
 use grail::bus::{KBD_BASE, PLIC_BASE, RAM_BASE};
+use grail::devices::KBD_IRQ;
 use grail::keyboard::{code, KeyEvent, FIFO_LEN};
 use grail::{Machine, RunResult};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,6 @@ const KBD_CTRL: u32 = KBD_BASE + 8;
 const PENDING: u32 = PLIC_BASE + 0x1000;
 const ENABLE0: u32 = PLIC_BASE + 0x2000;
 const CLAIM0: u32 = PLIC_BASE + 0x20_0004;
-const KBD_IRQ: u32 = 2;
 const LOAD_ACCESS_FAULT: u32 = 5;
 
 fn example(name: &str) -> PathBuf {

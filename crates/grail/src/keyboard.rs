@@ -41,6 +41,11 @@ pub mod code {
     /// F1; F2-F12 follow (`F1 + n - 1`, up to 0x9b).
     pub const F1: u8 = 0x90;
     pub const F12: u8 = 0x9b;
+
+    /// Whether `c` is in the spec's key code table, so a keyboard can produce it.
+    pub fn is_valid(c: u8) -> bool {
+        matches!(c, BACKSPACE | TAB | ENTER | ESC | 0x20..=0x7e | UP..=RIGHT | F1..=F12)
+    }
 }
 
 /// One key press or release, as the program sees it in `KBD_DATA`.
@@ -112,10 +117,11 @@ pub struct Keyboard {
 }
 
 impl Keyboard {
-    /// Queues an event for the program. Returns false (and drops it) if the FIFO is full,
-    /// or if its code is 0, which `KBD_DATA` reserves for "empty".
+    /// Queues an event for the program. Returns false and drops it if its code is not in
+    /// the spec's table ([`code::is_valid`]; this includes 0, which `KBD_DATA` reserves
+    /// for "empty"), or if the FIFO is full, which also counts it in `dropped`.
     pub fn push(&mut self, ev: KeyEvent) -> bool {
-        if ev.code == 0 {
+        if !code::is_valid(ev.code) {
             return false;
         }
         if self.fifo.len() >= FIFO_LEN {
@@ -259,6 +265,27 @@ mod tests {
         assert!(!k.push(KeyEvent::press(0)));
         assert!(k.is_empty());
         assert_eq!(k.dropped, 0);
+    }
+
+    #[test]
+    fn only_codes_from_the_table_are_queued() {
+        let valid: Vec<u8> = (0..=255).filter(|&c| code::is_valid(c)).collect();
+        let want: Vec<u8> = [0x08, 0x09, 0x0a, 0x1b]
+            .into_iter()
+            .chain(0x20..=0x7e)
+            .chain(0x80..=0x83)
+            .chain(0x90..=0x9b)
+            .collect();
+        assert_eq!(valid, want);
+        let mut k = Keyboard::default();
+        for c in 0..=255u8 {
+            let ev = KeyEvent::release(c).with_shift(true);
+            assert_eq!(k.push(ev), code::is_valid(c), "code {c:#x}");
+            if k.len() == FIFO_LEN {
+                while k.read(REG_DATA, 4).unwrap() != 0 {}
+            }
+        }
+        assert_eq!(k.dropped, 0, "an invalid code is not a FIFO overflow");
     }
 
     #[test]

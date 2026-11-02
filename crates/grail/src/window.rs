@@ -160,13 +160,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let ctrl = key_down(VK_CONTROL) && !key_down(VK_MENU);
             let scan = (lparam as u32 >> 16) & 0x1ff;
             st.key(vk, press, key_down(VK_SHIFT), ctrl, || printable(vk, scan));
-            // Alt chords still reach Windows (Alt+F4 closes the window), except F10,
-            // which would put the window into menu mode and swallow the next keys.
-            if matches!(msg, WM_SYSKEYDOWN | WM_SYSKEYUP) && vk != VK_F10 {
+            // Alt chords still reach Windows, so Alt+F4 closes the window (menu mode
+            // is stopped at WM_SYSCOMMAND below).
+            if matches!(msg, WM_SYSKEYDOWN | WM_SYSKEYUP) {
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
             }
             0
         }
+        // A lone Alt tap or F10 asks for keyboard menu mode, a modal loop inside
+        // DispatchMessageW: the emulator would stop until a key ends it, and that key
+        // would be swallowed. Refuse it; Alt+Space (lParam ' ') still opens the menu.
+        WM_SYSCOMMAND if wparam & 0xfff0 == SC_KEYMENU && lparam == 0 => 0,
         WM_KILLFOCUS => {
             st.release_all();
             0
@@ -492,6 +496,65 @@ mod tests {
         assert!(w.pump());
     }
 
+    /// Sets the calling thread's key state, which `GetKeyState` and `GetKeyboardState`
+    /// read, to exactly `held` down. Sent messages do not change it, so tests hold the
+    /// modifiers here, as real input would.
+    fn hold_keys(held: &[u32]) {
+        let mut state = [0u8; 256];
+        for &vk in held {
+            state[vk as usize] = 0x80;
+        }
+        // SAFETY: a 256-byte key state table.
+        assert!(unsafe { SetKeyboardState(state.as_ptr()) } != 0);
+    }
+
+    /// The thread's key state, put back when dropped.
+    struct SavedKeys([u8; 256]);
+
+    impl SavedKeys {
+        fn save() -> Self {
+            let mut state = [0u8; 256];
+            // SAFETY: a 256-byte key state table.
+            unsafe { GetKeyboardState(state.as_mut_ptr()) };
+            SavedKeys(state)
+        }
+    }
+
+    impl Drop for SavedKeys {
+        fn drop(&mut self) {
+            // SAFETY: a 256-byte key state table.
+            unsafe { SetKeyboardState(self.0.as_ptr()) };
+        }
+    }
+
+    /// lParam of a key message: repeat count 1, the scan code in bits 16-23, bit 24 for
+    /// the arrows (extended keys), bit 29 while Alt is down, bits 30-31 on key-up.
+    fn key_lparam(msg: u32, vk: u32, scan: u32) -> LPARAM {
+        let mut l = 1 | scan << 16;
+        if (VK_LEFT..=VK_DOWN).contains(&vk) {
+            l |= 1 << 24;
+        }
+        if vk == VK_MENU || key_down(VK_MENU) {
+            l |= 1 << 29;
+        }
+        if matches!(msg, WM_KEYUP | WM_SYSKEYUP) {
+            l |= 0xc000_0000;
+        }
+        l as i32 as LPARAM
+    }
+
+    /// Hands a key message to the window procedure at once.
+    fn send(w: &Window, msg: u32, vk: u32, scan: u32) {
+        // SAFETY: a valid window handle; key messages carry no pointers.
+        unsafe { SendMessageW(w.hwnd, msg, vk as WPARAM, key_lparam(msg, vk, scan)) };
+    }
+
+    /// Queues a key message for the window, for `pump` to pick up as it does typed keys.
+    fn post(w: &Window, msg: u32, vk: u32, scan: u32) {
+        // SAFETY: a valid window handle; key messages carry no pointers.
+        unsafe { PostMessageW(w.hwnd, msg, vk as WPARAM, key_lparam(msg, vk, scan)) };
+    }
+
     /// Key messages sent to a real window come out of `take_keys`, translated, and two
     /// windows keep their own keys. Needs a desktop session (and a keyboard layout that
     /// types 'a' for VK 'A', which every Latin layout does):
@@ -499,21 +562,13 @@ mod tests {
     #[test]
     #[ignore]
     fn window_turns_key_messages_into_events() {
+        let _saved = SavedKeys::save();
+        hold_keys(&[]);
         let mut a = Window::open("Grail key test A").unwrap();
         let mut b = Window::open("Grail key test B").unwrap();
         assert!(a.pump() && b.pump());
         a.take_keys();
         b.take_keys();
-        // lParam: repeat count 1, scan code in bits 16-23, bits 30-31 set on key-up.
-        let send = |w: &Window, msg: u32, vk: u32, scan: isize| {
-            let up = if msg == WM_KEYUP {
-                0xc000_0000u32 as i32 as isize
-            } else {
-                0
-            };
-            // SAFETY: a valid window handle; key messages carry no pointers.
-            unsafe { SendMessageW(w.hwnd, msg, vk as WPARAM, 1 | scan << 16 | up) };
-        };
         send(&a, WM_KEYDOWN, b'A' as u32, 0x1e);
         send(&a, WM_KEYUP, b'A' as u32, 0x1e);
         send(&b, WM_KEYDOWN, VK_F1 + 1, 0x3c);
@@ -521,7 +576,7 @@ mod tests {
         send(&a, WM_KEYDOWN, VK_SHIFT, 0x2a);
         send(&a, WM_KEYUP, VK_RETURN, 0x1c);
         send(&a, WM_KEYDOWN, VK_SPACE, 0x39);
-        // F10 arrives as a system key; the window must not enter menu mode.
+        // F10 arrives as a system key.
         send(&b, WM_SYSKEYDOWN, VK_F10, 0x44);
         assert!(a.pump() && b.pump());
         assert_eq!(
@@ -542,5 +597,103 @@ mod tests {
         // SAFETY: a valid window handle.
         unsafe { SendMessageW(a.hwnd, WM_KILLFOCUS, 0, 0) };
         assert_eq!(a.take_keys(), [KeyEvent::release(b' ')]);
+    }
+
+    /// Shift picks the character through the layout, Ctrl only sets its bit (Ctrl+C is
+    /// 'c', not 0x03), and Ctrl+Alt is AltGr, not a Ctrl chord. Needs a desktop session:
+    /// `cargo test -p grail --release -- --ignored window`.
+    #[test]
+    #[ignore]
+    fn window_reports_modifiers() {
+        let _saved = SavedKeys::save();
+        let mut w = Window::open("Grail modifier test").unwrap();
+        assert!(w.pump());
+        w.take_keys();
+        let tap = |held: &[u32], vk: u32, scan: u32| {
+            hold_keys(held);
+            send(&w, WM_KEYDOWN, vk, scan);
+            send(&w, WM_KEYUP, vk, scan);
+            hold_keys(&[]);
+        };
+        let shift = [VK_SHIFT, VK_LSHIFT];
+        let ctrl = [VK_CONTROL, VK_LCONTROL];
+        let altgr = [VK_CONTROL, VK_LCONTROL, VK_MENU, VK_LMENU];
+
+        tap(&shift, b'A' as u32, 0x1e);
+        tap(&ctrl, b'C' as u32, 0x2e);
+        tap(&[shift, ctrl].concat(), VK_LEFT, 0x4b);
+        tap(&altgr, VK_RIGHT, 0x4d);
+        assert_eq!(
+            w.take_keys(),
+            [
+                KeyEvent::press(b'A').with_shift(true),
+                KeyEvent::release(b'A').with_shift(true),
+                KeyEvent::press(b'c').with_ctrl(true),
+                KeyEvent::release(b'c').with_ctrl(true),
+                KeyEvent::press(code::LEFT).with_shift(true).with_ctrl(true),
+                KeyEvent::release(code::LEFT).with_shift(true).with_ctrl(true),
+                KeyEvent::press(code::RIGHT),
+                KeyEvent::release(code::RIGHT),
+            ]
+        );
+
+        // What Ctrl+Alt+Q types depends on the layout ('@' on German, nothing on US),
+        // but it is never a Ctrl chord.
+        tap(&altgr, b'Q' as u32, 0x10);
+        let keys = w.take_keys();
+        assert!(keys.iter().all(|k| !k.ctrl), "{keys:?}");
+    }
+
+    /// A lone Alt tap and F10 must not put the window into keyboard menu mode: that
+    /// modal loop would stop the emulator inside `pump` and swallow the next key. Needs
+    /// a desktop session: `cargo test -p grail --release -- --ignored window`.
+    #[test]
+    #[ignore]
+    fn menu_keys_do_not_stop_the_window() {
+        let _saved = SavedKeys::save();
+        hold_keys(&[]);
+        let mut w = Window::open("Grail menu key test").unwrap();
+        assert!(w.pump());
+        w.take_keys();
+
+        // Should menu mode start anyway, the Esc another thread posts every second
+        // until the test is over ends it, so the test fails instead of hanging.
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let hwnd = w.hwnd as usize;
+        let rescue = std::thread::spawn(move || {
+            use std::sync::mpsc::RecvTimeoutError::Timeout;
+            while let Err(Timeout) = wait.recv_timeout(std::time::Duration::from_secs(1)) {
+                for msg in [WM_KEYDOWN, WM_KEYUP] {
+                    // SAFETY: posting a key message carries no pointers.
+                    unsafe { PostMessageW(hwnd as HWND, msg, VK_ESCAPE as WPARAM, 1) };
+                }
+            }
+        });
+
+        let start = std::time::Instant::now();
+        for (vk, scan, letter, scan2) in [(VK_MENU, 0x38, b'A', 0x1e), (VK_F10, 0x44, b'B', 0x30)] {
+            if vk == VK_MENU {
+                hold_keys(&[VK_MENU, VK_LMENU]);
+            }
+            send(&w, WM_SYSKEYDOWN, vk, scan);
+            hold_keys(&[]);
+            send(&w, WM_SYSKEYUP, vk, scan);
+            post(&w, WM_KEYDOWN, letter as u32, scan2);
+            post(&w, WM_KEYUP, letter as u32, scan2);
+            assert!(w.pump());
+            let c = letter.to_ascii_lowercase();
+            let mut want = vec![KeyEvent::press(c), KeyEvent::release(c)];
+            if vk == VK_F10 {
+                want.splice(
+                    0..0,
+                    [KeyEvent::press(code::F1 + 9), KeyEvent::release(code::F1 + 9)],
+                );
+            }
+            assert_eq!(w.take_keys(), want, "the key after vk {vk:#x}");
+        }
+        let took = start.elapsed();
+        let _ = done.send(());
+        rescue.join().unwrap();
+        assert!(took < std::time::Duration::from_millis(500), "took {took:?}");
     }
 }
