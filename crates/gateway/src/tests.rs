@@ -63,18 +63,41 @@ fn ip_frame(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Vec<u8> 
 }
 
 fn udp_frame(src_port: u16, dst: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
-    let d = udp_datagram(GUEST, *dst.ip(), src_port, dst.port(), payload);
-    ip_frame(GUEST, *dst.ip(), PROTO_UDP, &d)
+    udp_frame_from(GUEST_MAC, SocketAddrV4::new(GUEST, src_port), dst, payload)
+}
+
+/// A datagram from any card and source address.
+fn udp_frame_from(mac: Mac, src: SocketAddrV4, dst: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
+    let d = udp_datagram(*src.ip(), *dst.ip(), src.port(), dst.port(), payload);
+    eth_frame(
+        GATEWAY_MAC,
+        mac,
+        ETHERTYPE_IPV4,
+        &ipv4_packet(*src.ip(), *dst.ip(), PROTO_UDP, 1, &d),
+    )
 }
 
 fn tcp_frame(src_port: u16, dst: SocketAddrV4, flags: u8, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
+    tcp_frame_win(src_port, dst, flags, seq, ack, 8192, payload)
+}
+
+/// A segment from the guest advertising `window`.
+fn tcp_frame_win(
+    src_port: u16,
+    dst: SocketAddrV4,
+    flags: u8,
+    seq: u32,
+    ack: u32,
+    window: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let h = TcpHeader {
         src_port,
         dst_port: dst.port(),
         seq,
         ack,
         flags,
-        window: 8192,
+        window,
         mss: (flags & SYN != 0).then_some(1000),
     };
     ip_frame(
@@ -572,32 +595,48 @@ fn tcp_retransmits_until_acknowledged() {
     host.write_all(b"lost?").unwrap();
     let (data, _) = wait(&mut gw, tcp_seg);
     assert_eq!(data.payload, b"lost?");
-    // The guest never saw it: after the timeout it comes again, then after twice that.
+    // The guest never saw it: after the timeout (200 ms) it comes again, then after
+    // twice that (400 ms), then after 800 ms. The first is forced at t1; without the
+    // doubling the second would come at t1 + 200 ms, and the third 200 ms later.
     let t0 = Instant::now();
     let rto = limits().tcp_rto;
-    let again = decode(&gw.recv_at(t0 + rto + Duration::from_millis(50)).unwrap());
+    let t1 = t0 + rto + Duration::from_millis(50);
+    let again = decode(&gw.recv_at(t1).unwrap());
     assert_eq!(again, Out::Tcp(data.clone()));
-    assert_eq!(gw.recv_at(t0 + rto * 2), None, "the timeout doubled");
-    let third = decode(&gw.recv_at(t0 + rto * 4).unwrap());
-    assert_eq!(third, Out::Tcp(data.clone()));
-    // Acknowledged: no more.
-    gw.send(&tcp_frame(40004, host_side(port), ACK, 1, syn_ack.seq + 6, b""));
-    assert_eq!(gw.recv_at(t0 + rto * 20), None);
+    let ms = Duration::from_millis;
+    assert_eq!(gw.recv_at(t1 + ms(350)), None, "the timeout doubled");
+    let t2 = t1 + ms(400);
+    assert_eq!(decode(&gw.recv_at(t2).unwrap()), Out::Tcp(data.clone()));
+    assert_eq!(gw.recv_at(t2 + ms(750)), None, "and doubled again");
+    let t3 = t2 + ms(800);
+    assert_eq!(decode(&gw.recv_at(t3).unwrap()), Out::Tcp(data.clone()));
+    // Acknowledged: no more, and the timeout is back to the first one.
+    gw.send_at(
+        &tcp_frame(40004, host_side(port), ACK, 1, syn_ack.seq + 6, b""),
+        t3,
+    );
+    assert_eq!(gw.recv_at(t3 + rto * 20), None);
     assert_eq!(gw.flows(), 1);
-    // Unacknowledged forever: the connection is reset after the retries.
+    // Unacknowledged forever: sent again exactly `tcp_retries` times, then the
+    // connection is reset.
     host.write_all(b"again").unwrap();
-    wait(&mut gw, tcp_seg);
+    let (first, _) = wait(&mut gw, tcp_seg);
+    assert_eq!(first.payload, b"again");
     let mut t = Instant::now();
-    let mut resets = 0;
+    let (mut resends, mut resets) = (0, 0);
     for _ in 0..40 {
         t += tcp::MAX_RTO;
         while let Some(f) = gw.recv_at(t) {
-            if let Out::Tcp(s) = decode(&f) {
-                resets += (s.flags & RST != 0) as u32;
+            let Out::Tcp(s) = decode(&f) else { continue };
+            if s.flags & RST != 0 {
+                resets += 1;
+            } else {
+                assert_eq!(s, first, "the same segment again");
+                resends += 1;
             }
         }
     }
-    assert_eq!((resets, gw.flows()), (1, 0));
+    assert_eq!((resends, resets, gw.flows()), (limits().tcp_retries, 1, 0));
 }
 
 #[test]
@@ -681,6 +720,267 @@ fn tcp_guest_window_limits_what_is_sent() {
         (more.iter().map(|s| s.payload.len()).sum::<usize>() >= 1500).then_some(())
     });
     assert_eq!(more[0].seq, ack + 1500);
+}
+
+/// Every TCP segment the gateway has for the guest at `t`.
+fn segs_at(gw: &mut Gateway, t: Instant) -> Vec<Seg> {
+    std::iter::from_fn(|| gw.recv_at(t))
+        .filter_map(|f| tcp_seg(&decode(&f)))
+        .collect()
+}
+
+#[test]
+fn tcp_zero_window_is_probed_then_reopened() {
+    let mut gw = gateway();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let to = host_side(port);
+    let syn_ack = connect(&mut gw, 40010, port, 0);
+    let ack = syn_ack.seq + 1;
+    let (mut host, _) = listener.accept().unwrap();
+    // The guest's buffer is full; the host has 3000 bytes for it.
+    let mut t = Instant::now();
+    gw.send_at(&tcp_frame_win(40010, to, ACK, 1, ack, 0, b""), t);
+    let bytes: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+    host.write_all(&bytes).unwrap();
+    // After a timeout, one byte goes through the closed window, at the first one
+    // not acknowledged; the guest drops it and says its window is still 0. Again,
+    // as long as the guest answers so (no reset: the guest is there).
+    let rto = limits().tcp_rto;
+    let first = until("a zero-window probe", || {
+        t += rto;
+        segs_at(&mut gw, t).into_iter().next()
+    });
+    let mut probes = vec![first];
+    for _ in 0..5 {
+        gw.send_at(&tcp_frame_win(40010, to, ACK, 1, ack, 0, b""), t);
+        t += tcp::MAX_RTO;
+        probes.extend(segs_at(&mut gw, t));
+    }
+    let probe = |s: &Seg| (s.flags & (RST | FIN), s.seq, s.payload.clone());
+    assert_eq!(
+        probes.iter().map(probe).collect::<Vec<_>>(),
+        vec![(0, ack, vec![0]); 6]
+    );
+    // The window opens: sending starts again at the probe's byte, at once.
+    gw.send_at(&tcp_frame_win(40010, to, ACK, 1, ack, 8192, b""), t);
+    let mut sent = Vec::new();
+    until("3000 bytes", || {
+        sent.extend(segs_at(&mut gw, t));
+        (sent.iter().map(|s| s.payload.len()).sum::<usize>() >= 3000).then_some(())
+    });
+    let mut next = ack;
+    for s in &sent {
+        assert_eq!(s.seq, next, "in order from the probe's byte: {sent:?}");
+        next += s.payload.len() as u32;
+    }
+    let got: Vec<u8> = sent.iter().flat_map(|s| s.payload.clone()).collect();
+    assert_eq!(got, bytes);
+}
+
+#[test]
+fn tcp_guest_reset_closes_the_host_stream() {
+    let mut gw = gateway();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let syn_ack = connect(&mut gw, 40011, port, 0);
+    let (mut host, _) = listener.accept().unwrap();
+    host.set_read_timeout(Some(DEADLINE)).unwrap();
+    gw.send(&tcp_frame(
+        40011,
+        host_side(port),
+        RST | ACK,
+        1,
+        syn_ack.seq + 1,
+        b"",
+    ));
+    assert_eq!((drain(&mut gw), gw.flows()), (vec![], 0));
+    // End of file or a reset, never a timeout.
+    let mut buf = [0; 8];
+    match host.read(&mut buf) {
+        Ok(0) => {}
+        Ok(n) => panic!("read {n} bytes"),
+        Err(e) => assert!(
+            !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+            "{e}"
+        ),
+    }
+}
+
+#[test]
+fn tcp_idle_and_closing_connections_are_reset() {
+    let mut gw = gateway();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let to = host_side(port);
+    let t = Instant::now();
+    // One connection stays open and quiet; the guest closes its side of the other.
+    let open = connect(&mut gw, 40012, port, 0);
+    let (_host_open, _) = listener.accept().unwrap();
+    let closing = connect(&mut gw, 40013, port, 0);
+    let (_host_closing, _) = listener.accept().unwrap();
+    gw.send_at(&tcp_frame(40013, to, FIN | ACK, 1, closing.seq + 1, b""), t);
+    drain(&mut gw);
+    let resets_at = |gw: &mut Gateway, at: Instant| -> Vec<(u16, u8)> {
+        segs_at(gw, at).iter().map(|s| (s.dst.port(), s.flags)).collect()
+    };
+    let l = limits();
+    let s = Duration::from_secs(1);
+    assert_eq!(
+        (resets_at(&mut gw, t + l.tcp_closing - s), gw.flows()),
+        (vec![], 2)
+    );
+    assert_eq!(
+        (resets_at(&mut gw, t + l.tcp_closing + s), gw.flows()),
+        (vec![(40013, RST | ACK)], 1),
+        "closing for too long"
+    );
+    assert_eq!((resets_at(&mut gw, t + l.tcp_idle - s), gw.flows()), (vec![], 1));
+    assert_eq!(
+        (resets_at(&mut gw, t + l.tcp_idle + s), gw.flows()),
+        (vec![(40012, RST | ACK)], 0),
+        "idle for too long"
+    );
+    let _ = open;
+}
+
+#[test]
+fn tcp_reads_no_more_from_the_host_than_the_buffer() {
+    let mut gw = gateway_with(Config {
+        limits: Limits {
+            tcp_buffer: 4096,
+            ..limits()
+        },
+        ..Config::default()
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // The guest's window (8192) is larger than the buffer, and it acknowledges nothing.
+    let syn_ack = connect(&mut gw, 40014, port, 0);
+    assert_eq!(syn_ack.window, 4096, "the window is the buffer");
+    let ack = syn_ack.seq + 1;
+    let (mut host, _) = listener.accept().unwrap();
+    let writer = std::thread::spawn(move || {
+        let _ = host.write_all(&[1; 20000]);
+        host
+    });
+    let mut sent = Vec::new();
+    until("4096 bytes", || {
+        while let Some(f) = gw.recv() {
+            sent.extend(tcp_seg(&decode(&f)));
+        }
+        let end = sent.iter().map(|s| s.seq + s.payload.len() as u32).max();
+        (end == Some(ack + 4096)).then_some(())
+    });
+    // Polling on for a while sends nothing past the buffer.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(100) {
+        while let Some(f) = gw.recv() {
+            sent.extend(tcp_seg(&decode(&f)));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let end = sent.iter().map(|s| s.seq + s.payload.len() as u32).max();
+    assert_eq!(end, Some(ack + 4096));
+    assert!(
+        sent.iter().all(|s| s.flags & (FIN | RST) == 0),
+        "the host did not close"
+    );
+    drop(gw);
+    drop(writer.join().unwrap());
+}
+
+#[test]
+fn dns_lookups_at_once_are_limited() {
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    let wait_release = std::sync::Mutex::new(wait_release);
+    let (asked_tx, asked) = std::sync::mpsc::channel::<String>();
+    let asked_tx = std::sync::Mutex::new(asked_tx);
+    let mut gw = gateway_with(Config {
+        limits: Limits {
+            dns_lookups: 1,
+            ..limits()
+        },
+        resolver: Arc::new(move |name: &str| {
+            asked_tx.lock().unwrap().send(name.to_string()).unwrap();
+            if name == "slow.test" {
+                let _ = wait_release.lock().unwrap().recv();
+            }
+            Ok(vec![Ipv4Addr::new(192, 0, 2, 1)])
+        }),
+        ..Config::default()
+    });
+    let dns_server = SocketAddrV4::new(DNS_ADDR, 53);
+    let query = |id, name| udp_frame(5353, dns_server, &dns::query(id, name, dns::TYPE_A));
+    let answer = |out: &Out| match out {
+        Out::Udp { payload, .. } => dns::read_answer(payload).map(|a| a.0),
+        _ => None,
+    };
+    // The first lookup takes the only slot; the second query is dropped.
+    gw.send(&query(1, "slow.test"));
+    assert_eq!(asked.recv_timeout(DEADLINE).unwrap(), "slow.test");
+    gw.send(&query(2, "fast.test"));
+    release.send(()).unwrap();
+    let (id, before) = wait(&mut gw, answer);
+    assert_eq!((id, before), (1, vec![]));
+    // The slot is free again.
+    gw.send(&query(3, "fast.test"));
+    assert_eq!(wait(&mut gw, answer), (3, vec![]));
+    assert_eq!(
+        asked.try_iter().collect::<Vec<_>>(),
+        ["fast.test"],
+        "query 2 was never looked up"
+    );
+}
+
+#[test]
+fn queue_half_full_holds_host_reads_back() {
+    let mut gw = gateway_with(Config {
+        limits: Limits { queue: 4, ..limits() },
+        ..Config::default()
+    });
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().unwrap().port();
+    gw.send(&udp_frame(4000, host_side(port), b"hi"));
+    let mut buf = [0; 16];
+    let (_, guest_end) = server.recv_from(&mut buf).unwrap();
+    // A TCP connection with bytes waiting on the host side too.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_port = listener.local_addr().unwrap().port();
+    connect(&mut gw, 40015, tcp_port, 0);
+    let (mut host, _) = listener.accept().unwrap();
+    assert_eq!(drain(&mut gw), []);
+    for i in 0..10u8 {
+        server.send_to(&[i], guest_end).unwrap();
+    }
+    host.write_all(b"tcp").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    // One service: two datagrams make the queue half full, so neither the other
+    // datagrams nor the stream are read; they wait in the host's sockets.
+    let first = gw.recv().map(|f| decode(&f));
+    assert!(matches!(first, Some(Out::Udp { .. })), "{first:?}");
+    assert_eq!(gw.out.len(), 1, "one more datagram waits, and nothing else");
+    // Everything comes in the end, and nothing was dropped.
+    let mut datagrams = vec![first.unwrap()];
+    let mut stream = Vec::new();
+    until("10 datagrams and the stream's bytes", || {
+        while let Some(f) = gw.recv() {
+            match decode(&f) {
+                Out::Tcp(s) => stream.extend(s.payload),
+                out => datagrams.push(out),
+            }
+        }
+        (datagrams.len() == 10 && stream == b"tcp").then_some(())
+    });
+    let payloads: Vec<Vec<u8>> = datagrams
+        .iter()
+        .map(|d| match d {
+            Out::Udp { payload, .. } => payload.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(payloads, (0..10u8).map(|i| vec![i]).collect::<Vec<_>>());
+    assert_eq!(gw.stats().queue_full, 0);
 }
 
 #[test]
@@ -817,6 +1117,162 @@ fn flows_per_guest_are_limited() {
         "{out:?}"
     );
     assert_eq!(gw.stats().refused, 2);
+}
+
+#[test]
+fn flows_count_per_card_whatever_the_source_address() {
+    let mut gw = gateway_with(Config {
+        limits: Limits {
+            flows_per_guest: 2,
+            flows: 5,
+            ..limits()
+        },
+        ..Config::default()
+    });
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let to = host_side(server.local_addr().unwrap().port());
+    // One card making up source addresses all over the network still has two flows.
+    for host in 4..=254 {
+        for port in 1..=3 {
+            let src = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, host), port);
+            gw.send(&udp_frame_from(GUEST_MAC, src, to, b"x"));
+        }
+    }
+    assert_eq!(gw.flows(), 2);
+    // A SYN from yet another made-up address is reset too.
+    let h = TcpHeader {
+        src_port: 9,
+        dst_port: to.port(),
+        seq: 0,
+        ack: 0,
+        flags: SYN,
+        window: 8192,
+        mss: None,
+    };
+    let src = Ipv4Addr::new(10, 0, 2, 99);
+    gw.send(&eth_frame(
+        GATEWAY_MAC,
+        GUEST_MAC,
+        ETHERTYPE_IPV4,
+        &ipv4_packet(
+            src,
+            GATEWAY_ADDR,
+            PROTO_TCP,
+            1,
+            &tcp_segment(src, GATEWAY_ADDR, &h, b""),
+        ),
+    ));
+    let out = drain(&mut gw);
+    assert!(
+        matches!(&out[..], [Out::Tcp(s)] if s.flags == RST | ACK),
+        "{out:?}"
+    );
+    assert_eq!(gw.flows(), 2);
+    // Other cards have their own, up to the gateway's total; a card that makes up
+    // MAC addresses too stops there.
+    for card in 1..=10u8 {
+        let mac = [2, 0, 0, 0, 0, card];
+        for port in 1..=2 {
+            let src = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 100 + card), port);
+            gw.send(&udp_frame_from(mac, src, to, b"x"));
+        }
+    }
+    assert_eq!(gw.flows(), 5);
+}
+
+#[test]
+fn flow_limit_closes_forwarded_connections() {
+    let mut gw = gateway_with(Config {
+        hostfwd: vec![HostFwd::tcp(0, 7)],
+        limits: Limits {
+            flows_per_guest: 1,
+            ..limits()
+        },
+        ..Config::default()
+    });
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    gw.send(&udp_frame(
+        4000,
+        host_side(server.local_addr().unwrap().port()),
+        b"x",
+    ));
+    assert_eq!(gw.flows(), 1);
+    // The guest has its one flow: a connection to the forwarded port is closed.
+    let mut host = TcpStream::connect(gw.hostfwd()[0].host).unwrap();
+    host.set_read_timeout(Some(DEADLINE)).unwrap();
+    until("the connection to be refused", || {
+        drain(&mut gw);
+        (gw.stats().refused == 1).then_some(())
+    });
+    let mut buf = [0; 8];
+    match host.read(&mut buf) {
+        Ok(0) => {}
+        Ok(n) => panic!("read {n} bytes"),
+        Err(e) => assert!(
+            !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+            "{e}"
+        ),
+    }
+    assert_eq!((drain(&mut gw), gw.flows()), (vec![], 1));
+}
+
+#[test]
+fn hostfwd_lists_rules_in_config_order() {
+    let rules = vec![HostFwd::udp(0, 53), HostFwd::tcp(0, 80), HostFwd::udp(0, 69)];
+    let gw = Gateway::new(Config {
+        hostfwd: rules.clone(),
+        ..Config::default()
+    })
+    .unwrap();
+    let bound = gw.hostfwd();
+    let what = |r: &HostFwd| (r.proto, r.guest);
+    assert_eq!(
+        bound.iter().map(what).collect::<Vec<_>>(),
+        rules.iter().map(what).collect::<Vec<_>>()
+    );
+    assert!(bound.iter().all(|r| r.host.port() != 0), "{bound:?}");
+}
+
+#[test]
+fn packets_waiting_for_arp_expire() {
+    let mut gw = Gateway::new(Config {
+        hostfwd: vec![HostFwd::udp(0, 53)],
+        limits: limits(),
+        ..Config::default()
+    })
+    .unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client.send_to(b"anyone?", gw.hostfwd()[0].host).unwrap();
+    // The guest has not spoken: the gateway asks who it is, and the datagram waits.
+    let (who, _) = wait(&mut gw, |o| match o {
+        Out::Arp(a) => Some(*a),
+        _ => None,
+    });
+    assert_eq!((who.op, who.target_ip), (ARP_REQUEST, GUEST));
+    // Nobody answers for longer than the wait: the datagram is dropped, and an
+    // answer that comes late finds nothing.
+    assert_eq!(
+        gw.recv_at(Instant::now() + ARP_WAIT + Duration::from_millis(100)),
+        None
+    );
+    gw.send(&arp_frame(ARP_REPLY, GATEWAY_ADDR));
+    assert_eq!(drain(&mut gw), []);
+}
+
+#[test]
+fn dhcp_for_another_card_is_ignored() {
+    let mut gw = Gateway::new(Config::default()).unwrap();
+    // A card asking for a lease for a MAC address that is not its own.
+    let m = dhcp::client_message(dhcp::DISCOVER, 1, [2, 0, 0, 0, 0, 9], None);
+    let d = udp_datagram(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, 68, 67, &m);
+    gw.send(&eth_frame(
+        BROADCAST_MAC,
+        GUEST_MAC,
+        ETHERTYPE_IPV4,
+        &ipv4_packet(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, PROTO_UDP, 0, &d),
+    ));
+    assert_eq!(gw.recv(), None);
+    assert_eq!(gw.lease_of(&[2, 0, 0, 0, 0, 9]), None);
 }
 
 #[test]

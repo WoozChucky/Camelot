@@ -18,7 +18,7 @@
 //! side is `rcv_nxt`, the next byte expected; data that arrives out of order is
 //! dropped and the guest's own retransmission fills the gap.
 
-use crate::wire::{seq_le, seq_lt, tcp_flags::*, Tcp, TCP_MSS};
+use crate::wire::{seq_le, seq_lt, tcp_flags::*, Mac, Tcp, TCP_MSS};
 use crate::Limits;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -62,6 +62,9 @@ pub struct Flow {
     /// Tells this flow from an earlier one with the same addresses, for the answer of
     /// a connect thread.
     pub id: u64,
+    /// The guest machine (MAC address) the flow counts against for the gateway's
+    /// limits; `None` for a forwarded connection to a guest not heard from yet.
+    pub owner: Option<Mac>,
     pub state: State,
     stream: Option<TcpStream>,
 
@@ -123,6 +126,7 @@ impl Flow {
             guest,
             peer,
             id,
+            owner: None,
             state: State::Connecting,
             stream: None,
             iss,
@@ -376,6 +380,18 @@ impl Flow {
         } else if ack == self.snd_una && window == 0 {
             // The guest is there but its buffer is full: not a lost segment.
             self.retries = 0;
+        } else if ack == self.snd_una && self.snd_wnd == 0 && self.snd_nxt != self.snd_una {
+            // The window opens while a zero-window probe is out. The guest did not take
+            // the probe's byte (a full receiver drops it), so sending must start again
+            // from `snd_una`: going on from `snd_nxt` would leave a hole that only the
+            // retransmission timer fills, at the backed-off timeout. The guest answers,
+            // so the timeout starts again from the first one.
+            self.snd_nxt = self.snd_una;
+            if !self.fin_acked {
+                self.fin_sent = false;
+            }
+            self.rto = self.rto_initial;
+            self.reset_timer(now);
         }
         if seq_le(self.snd_una, ack) && seq_le(ack, self.snd_max) {
             self.snd_wnd = window as u32;
@@ -563,5 +579,83 @@ impl Flow {
         if self.state == State::Established && self.guest_fin && self.host_shut && self.fin_acked {
             self.close();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// An established flow with no host stream, so nothing it takes from the guest
+    /// ever leaves its buffer: what the buffer and the window do is all there is.
+    fn established(buffer: usize) -> (Flow, Instant) {
+        let limits = Limits {
+            tcp_buffer: buffer,
+            ..Limits::default()
+        };
+        let now = Instant::now();
+        let guest = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 4000);
+        let peer = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 2), 80);
+        let syn = Tcp {
+            src_port: 4000,
+            dst_port: 80,
+            seq: 99,
+            ack: 0,
+            flags: SYN,
+            window: 8192,
+            mss: Some(1000),
+            payload: &[],
+        };
+        let mut f = Flow::from_guest(1, guest, peer, &syn, 5000, now, &limits);
+        f.state = State::Established;
+        f.snd_una = 5001;
+        f.snd_nxt = 5001;
+        f.snd_max = 5001;
+        (f, now)
+    }
+
+    fn data(seq: u32, payload: &[u8]) -> Tcp<'_> {
+        Tcp {
+            src_port: 4000,
+            dst_port: 80,
+            seq,
+            ack: 5001,
+            flags: ACK | PSH,
+            window: 8192,
+            mss: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn guest_bytes_stop_at_the_buffer_and_the_window_shrinks() {
+        let (mut f, now) = established(2500);
+        let bytes = [7u8; 1000];
+        let mut acks = Vec::new();
+        let mut seq = 100;
+        for _ in 0..4 {
+            let mut out = Vec::new();
+            f.on_segment(&data(seq, &bytes), now, &mut out);
+            let [s] = &out[..] else { panic!("{out:?}") };
+            acks.push((s.ack, s.window));
+            seq = s.ack;
+        }
+        // 1000, 1000, then the 500 bytes left of the buffer; then nothing.
+        assert_eq!(
+            acks,
+            [(1100, 1500), (2100, 500), (2600, 0), (2600, 0)],
+            "(ack, window) after each segment"
+        );
+        assert_eq!(f.to_host.len(), 2500);
+    }
+
+    #[test]
+    fn window_starts_as_the_buffer() {
+        let (mut f, now) = established(3000);
+        f.state = State::SynReceived;
+        let mut out = Vec::new();
+        f.send_syn(now, &mut out);
+        assert_eq!(out[0].window, 3000);
     }
 }

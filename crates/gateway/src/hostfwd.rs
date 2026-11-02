@@ -52,13 +52,14 @@ impl HostFwd {
     }
 
     /// Parses `[tcp|udp]:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT`; the protocol may be
-    /// left out (TCP), and so may the colon before a host port without an address.
+    /// left empty or out (TCP), and so may the colon before a host port without an
+    /// address.
     pub fn parse(s: &str) -> Result<HostFwd, String> {
         let bad = |why: &str| {
             format!("'{s}' is not a forwarding rule ({why}; like tcp::8080-:80 or udp:127.0.0.1:5353-:53)")
         };
         let (proto, rest) = match s.split_once(':') {
-            Some(("tcp", rest)) => (Proto::Tcp, rest),
+            Some(("tcp" | "", rest)) => (Proto::Tcp, rest),
             Some(("udp", rest)) => (Proto::Udp, rest),
             _ => (Proto::Tcp, s),
         };
@@ -119,6 +120,10 @@ mod tests {
             ),
             ("tcp::0-:7", rule(Proto::Tcp, lo, 0, g15, 7)),
             ("tcp::8080-80", rule(Proto::Tcp, lo, 8080, g15, 80)),
+            // An empty protocol is TCP, as in QEMU.
+            ("::8080-:80", rule(Proto::Tcp, lo, 8080, g15, 80)),
+            (":0.0.0.0:8080-:80", rule(Proto::Tcp, [0, 0, 0, 0], 8080, g15, 80)),
+            (":8080-:80", rule(Proto::Tcp, lo, 8080, g15, 80)),
         ] {
             assert_eq!(HostFwd::parse(text), Ok(want), "{text}");
         }

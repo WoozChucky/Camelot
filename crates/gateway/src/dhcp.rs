@@ -118,25 +118,28 @@ impl Server {
         self.leases.get(mac).copied()
     }
 
-    /// `mac`'s lease, made now if it has none. `None` when the pool is used up.
-    fn lease(&mut self, mac: Mac) -> Option<Ipv4Addr> {
+    /// `mac`'s lease, or the address it would get. `None` when the pool is used up.
+    fn lease_for(&self, mac: Mac) -> Option<Ipv4Addr> {
         if let Some(ip) = self.leases.get(&mac) {
             return Some(*ip);
         }
         let first = u32::from(crate::FIRST_LEASE);
         let last = u32::from(crate::LAST_LEASE);
-        let free = (first..=last)
+        (first..=last)
             .map(Ipv4Addr::from)
-            .find(|ip| !self.leases.values().any(|a| a == ip))?;
-        self.leases.insert(mac, free);
-        Some(free)
+            .find(|ip| !self.leases.values().any(|a| a == ip))
     }
 
-    /// The answer to a client's message, if it gets one.
+    /// The answer to a client's message, if it gets one. A group address (multicast or
+    /// broadcast) is no card's, so it gets nothing.
     pub fn handle(&mut self, req: &Request) -> Option<Reply> {
+        if req.chaddr[0] & 1 != 0 {
+            return None;
+        }
         match req.kind {
             DISCOVER => {
-                let ip = self.lease(req.chaddr)?;
+                let ip = self.lease_for(req.chaddr)?;
+                self.leases.insert(req.chaddr, ip);
                 Some(self.reply(req, OFFER, ip))
             }
             REQUEST => {
@@ -144,15 +147,16 @@ impl Server {
                 if req.server_id.is_some_and(|s| s != GATEWAY_ADDR) {
                     return None;
                 }
-                let Some(ip) = self.lease(req.chaddr) else {
+                let Some(ip) = self.lease_for(req.chaddr) else {
                     return Some(self.reply(req, NAK, Ipv4Addr::UNSPECIFIED));
                 };
                 // The address asked for: option 50 while selecting or rebooting,
-                // `ciaddr` while renewing.
+                // `ciaddr` while renewing. A NAK leaves the pool as it was.
                 let wanted = req.requested.unwrap_or(req.ciaddr);
                 if wanted != ip && wanted != Ipv4Addr::UNSPECIFIED {
                     return Some(self.reply(req, NAK, Ipv4Addr::UNSPECIFIED));
                 }
+                self.leases.insert(req.chaddr, ip);
                 Some(self.reply(req, ACK, ip))
             }
             // Configuration only, for a client that has its address already.
@@ -308,6 +312,7 @@ mod tests {
             (nak.mac, nak.ip),
             (crate::wire::BROADCAST_MAC, Ipv4Addr::BROADCAST)
         );
+        assert_eq!(s.lease_of(&MAC1), None, "a NAK takes no address from the pool");
 
         let mut m = client_message(REQUEST, 9, MAC1, Some(crate::FIRST_LEASE));
         m.pop();
@@ -344,6 +349,18 @@ mod tests {
         let mut long = good[..FIXED + 4].to_vec();
         long.extend_from_slice(&[OPT_MESSAGE_TYPE, 9, DISCOVER]);
         assert_eq!(parse(&long), None);
+    }
+
+    #[test]
+    fn group_addresses_get_no_lease() {
+        let mut s = Server::default();
+        for mac in [crate::wire::BROADCAST_MAC, [0x01, 0, 0x5e, 0, 0, 1]] {
+            for kind in [DISCOVER, REQUEST] {
+                let req = parse(&client_message(kind, 1, mac, None)).unwrap();
+                assert_eq!(s.handle(&req), None);
+            }
+            assert_eq!(s.lease_of(&mac), None);
+        }
     }
 
     #[test]

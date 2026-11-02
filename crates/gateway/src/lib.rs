@@ -36,10 +36,13 @@
 //! things `std::net` can only do blocking: connecting a `TcpStream` and resolving a
 //! name. Their answers come back over a channel.
 //!
-//! A guest cannot exhaust the host: it has at most [`Limits::flows_per_guest`] flows
-//! (TCP connections, UDP ports and forwarded UDP clients), each TCP flow buffers at
-//! most [`Limits::tcp_buffer`] bytes each way, the queue toward the guest holds at most
-//! [`Limits::queue`] frames, idle flows are closed, and no raw sockets are used.
+//! A guest cannot exhaust the host: a guest machine (a MAC address, whatever source
+//! addresses it makes up) has at most [`Limits::flows_per_guest`] flows (TCP
+//! connections, UDP ports and forwarded UDP clients) and the gateway at most
+//! [`Limits::flows`] in all, which also bounds the connect threads; each TCP flow
+//! buffers at most [`Limits::tcp_buffer`] bytes each way, the queue toward the guest
+//! holds at most [`Limits::queue`] frames, idle flows are closed, and no raw sockets
+//! are used.
 //!
 //! The crate depends on nothing but std, and not on Grail: Grail wraps a [`Gateway`]
 //! as a network card's backend (`grail --net user`), and anything else that moves
@@ -113,14 +116,22 @@ pub fn host_resolver() -> Resolver {
 /// What keeps one guest from using up the host, and the timeouts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
-    /// Flows one guest address may have at once: TCP connections (either way), UDP
-    /// ports it sends from, and host clients of forwarded UDP ports. A SYN past the
-    /// limit is reset, a datagram dropped, a forwarded connection closed.
+    /// Flows one guest machine may have at once: TCP connections (either way), UDP
+    /// ports it sends from, and host clients of forwarded UDP ports. A machine is a
+    /// MAC address: each flow counts against the MAC address that opened it (for a
+    /// forwarded port, the one its guest address was learned from), so a guest that
+    /// sends from made-up source addresses gains nothing. A SYN past the limit is
+    /// reset, a datagram dropped, a forwarded connection closed.
     pub flows_per_guest: usize,
+    /// Flows the gateway has at once, all guests together, refused the same way: the
+    /// bound for a guest that makes up MAC addresses too. Every host socket and every
+    /// connect thread belongs to a flow, so this bounds them as well.
+    pub flows: usize,
     /// Bytes a TCP flow holds each way (toward the host, and toward the guest).
     pub tcp_buffer: usize,
     /// Frames waiting for the guest; more are dropped. While it is half full no more is
-    /// read from host sockets.
+    /// read from host sockets (TCP streams and UDP sockets) and no forwarded connection
+    /// is accepted: what the host sends waits in the host's socket buffers.
     pub queue: usize,
     /// DNS lookups running at once; queries past it are dropped (the guest retries).
     pub dns_lookups: usize,
@@ -147,6 +158,7 @@ impl Default for Limits {
     fn default() -> Self {
         Limits {
             flows_per_guest: 256,
+            flows: 1024,
             tcp_buffer: 64 * 1024,
             queue: 512,
             dns_lookups: 8,
@@ -219,14 +231,23 @@ enum Event {
 struct UdpFlow {
     socket: UdpSocket,
     last_active: Instant,
+    /// The MAC address that opened it, for [`Limits::flows_per_guest`].
+    owner: Mac,
 }
 
 /// A forwarded UDP port: its socket, and the host clients using it, each seen by the
-/// guest as a port of 10.0.2.2.
+/// guest as a port of 10.0.2.2 (the key).
 struct UdpForward {
     rule: HostFwd,
     socket: UdpSocket,
-    clients: HashMap<u16, (SocketAddr, Instant)>,
+    clients: HashMap<u16, FwdClient>,
+}
+
+struct FwdClient {
+    addr: SocketAddr,
+    last_active: Instant,
+    /// The guest's MAC address when the client came, if it was known.
+    owner: Option<Mac>,
 }
 
 /// An IP packet waiting for the guest's MAC address (asked for with ARP).
@@ -259,6 +280,8 @@ pub struct Gateway {
     udp: HashMap<SocketAddrV4, UdpFlow>,
     tcp_fwd: Vec<(HostFwd, TcpListener)>,
     udp_fwd: Vec<UdpForward>,
+    /// The forwarding rules in the order given, with the host ports bound.
+    bound: Vec<HostFwd>,
     events: Receiver<Event>,
     events_tx: Sender<Event>,
     dns_running: usize,
@@ -286,17 +309,25 @@ impl Gateway {
     pub fn new(config: Config) -> io::Result<Gateway> {
         let mut tcp_fwd = Vec::new();
         let mut udp_fwd = Vec::new();
+        let mut bound = Vec::new();
         let context = |rule: &HostFwd, e: io::Error| io::Error::new(e.kind(), format!("hostfwd {rule}: {e}"));
+        // A host port 0 shows the port the system picked.
+        let bound_to = |rule: &HostFwd, addr: io::Result<SocketAddr>| match addr {
+            Ok(SocketAddr::V4(host)) => HostFwd { host, ..*rule },
+            _ => *rule,
+        };
         for rule in &config.hostfwd {
             match rule.proto {
                 Proto::Tcp => {
                     let l = TcpListener::bind(rule.host).map_err(|e| context(rule, e))?;
                     l.set_nonblocking(true)?;
+                    bound.push(bound_to(rule, l.local_addr()));
                     tcp_fwd.push((*rule, l));
                 }
                 Proto::Udp => {
                     let s = UdpSocket::bind(rule.host).map_err(|e| context(rule, e))?;
                     s.set_nonblocking(true)?;
+                    bound.push(bound_to(rule, s.local_addr()));
                     udp_fwd.push(UdpForward {
                         rule: *rule,
                         socket: s,
@@ -317,6 +348,7 @@ impl Gateway {
             udp: HashMap::new(),
             tcp_fwd,
             udp_fwd,
+            bound,
             events,
             events_tx,
             dns_running: 0,
@@ -329,15 +361,10 @@ impl Gateway {
         })
     }
 
-    /// The forwarding rules as bound: a host port 0 shows the port the system picked.
+    /// The forwarding rules as bound, in the order [`Config::hostfwd`] gave them: a
+    /// host port 0 shows the port the system picked.
     pub fn hostfwd(&self) -> Vec<HostFwd> {
-        let bound = |rule: &HostFwd, addr: io::Result<SocketAddr>| match addr {
-            Ok(SocketAddr::V4(host)) => HostFwd { host, ..*rule },
-            _ => *rule,
-        };
-        let tcp = self.tcp_fwd.iter().map(|(r, l)| bound(r, l.local_addr()));
-        let udp = self.udp_fwd.iter().map(|f| bound(&f.rule, f.socket.local_addr()));
-        tcp.chain(udp).collect()
+        self.bound.clone()
     }
 
     /// TCP and UDP flows open now.
@@ -447,7 +474,7 @@ impl Gateway {
         if ip.proto == wire::PROTO_UDP && (ip.dst == Ipv4Addr::BROADCAST || ip.dst == GATEWAY_ADDR) {
             if let Some(udp) = wire::parse_udp(&ip) {
                 if udp.dst_port == dhcp::SERVER_PORT {
-                    self.on_dhcp(udp.payload);
+                    self.on_dhcp(src_mac, udp.payload);
                     return;
                 }
             }
@@ -459,22 +486,27 @@ impl Gateway {
         match ip.proto {
             wire::PROTO_ICMP => self.on_icmp(&ip, now),
             wire::PROTO_UDP => match wire::parse_udp(&ip) {
-                Some(udp) => self.on_udp(&ip, &udp, now),
+                Some(udp) => self.on_udp(src_mac, &ip, &udp, now),
                 None => self.stats.malformed += 1,
             },
             wire::PROTO_TCP => match wire::parse_tcp(&ip) {
-                Some(seg) => self.on_tcp(&ip, &seg, now),
+                Some(seg) => self.on_tcp(src_mac, &ip, &seg, now),
                 None => self.stats.malformed += 1,
             },
             _ => {}
         }
     }
 
-    fn on_dhcp(&mut self, msg: &[u8]) {
+    fn on_dhcp(&mut self, src_mac: Mac, msg: &[u8]) {
         let Some(req) = dhcp::parse(msg) else {
             self.stats.malformed += 1;
             return;
         };
+        // A client asks for its own card's address (there are no relays on the guest
+        // network): a card cannot take leases for made-up addresses and drain the pool.
+        if req.chaddr != src_mac {
+            return;
+        }
         let Some(reply) = self.dhcp.handle(&req) else {
             return;
         };
@@ -512,7 +544,7 @@ impl Gateway {
         self.deliver(ip.src, packet, now);
     }
 
-    fn on_udp(&mut self, ip: &wire::Ipv4, udp: &wire::Udp, now: Instant) {
+    fn on_udp(&mut self, src_mac: Mac, ip: &wire::Ipv4, udp: &wire::Udp, now: Instant) {
         let guest = SocketAddrV4::new(ip.src, udp.src_port);
         if ip.dst == DNS_ADDR {
             if udp.dst_port == dns::PORT {
@@ -524,9 +556,9 @@ impl Gateway {
             // An answer to a host client of a forwarded port?
             for fwd in &mut self.udp_fwd {
                 if fwd.rule.guest == guest {
-                    if let Some((client, seen)) = fwd.clients.get_mut(&udp.dst_port) {
-                        *seen = now;
-                        let _ = fwd.socket.send_to(udp.payload, *client);
+                    if let Some(client) = fwd.clients.get_mut(&udp.dst_port) {
+                        client.last_active = now;
+                        let _ = fwd.socket.send_to(udp.payload, client.addr);
                         return;
                     }
                 }
@@ -536,8 +568,7 @@ impl Gateway {
             return;
         };
         if !self.udp.contains_key(&guest) {
-            if self.flows_of(ip.src) >= self.limits.flows_per_guest {
-                self.stats.refused += 1;
+            if !self.admit(Some(src_mac)) {
                 return;
             }
             let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
@@ -551,6 +582,7 @@ impl Gateway {
                 UdpFlow {
                     socket,
                     last_active: now,
+                    owner: src_mac,
                 },
             );
         }
@@ -592,7 +624,7 @@ impl Gateway {
         }
     }
 
-    fn on_tcp(&mut self, ip: &wire::Ipv4, seg: &Tcp, now: Instant) {
+    fn on_tcp(&mut self, src_mac: Mac, ip: &wire::Ipv4, seg: &Tcp, now: Instant) {
         let guest = SocketAddrV4::new(ip.src, seg.src_port);
         let peer = SocketAddrV4::new(ip.dst, seg.dst_port);
         let key = (guest, peer);
@@ -632,13 +664,13 @@ impl Gateway {
         let Some(host_ip) = host_addr(ip.dst) else {
             return refuse(self);
         };
-        if self.flows_of(ip.src) >= self.limits.flows_per_guest {
-            self.stats.refused += 1;
+        if !self.admit(Some(src_mac)) {
             return refuse(self);
         }
         let id = self.new_id();
         let iss = self.new_iss(guest, peer);
-        let flow = tcp::Flow::from_guest(id, guest, peer, seg, iss, now, &self.limits);
+        let mut flow = tcp::Flow::from_guest(id, guest, peer, seg, iss, now, &self.limits);
+        flow.owner = Some(src_mac);
         let tx = self.events_tx.clone();
         let target = SocketAddr::V4(SocketAddrV4::new(host_ip, seg.dst_port));
         let timeout = self.limits.connect_timeout;
@@ -668,12 +700,17 @@ impl Gateway {
         self.recv_forwarded_udp(now);
         self.recv_udp(now);
 
-        let may_read = self.out.len() < self.limits.queue / 2;
+        // Segments wait in `sends` until every flow had its turn; they count toward
+        // the queue already.
         let mut sends = Vec::new();
+        let mut pending = 0;
+        let half = self.half_queue();
         for (key, flow) in &mut self.tcp {
+            let may_read = self.out.len() + pending < half;
             let mut segs = Vec::new();
             flow.service(now, &self.limits, may_read, &mut segs);
             if !segs.is_empty() {
+                pending += segs.len();
                 sends.push((*key, segs));
             }
         }
@@ -687,7 +724,7 @@ impl Gateway {
             .retain(|_, f| now.saturating_duration_since(f.last_active) < idle);
         for fwd in &mut self.udp_fwd {
             fwd.clients
-                .retain(|_, (_, seen)| now.saturating_duration_since(*seen) < idle);
+                .retain(|_, c| now.saturating_duration_since(c.last_active) < idle);
         }
         self.unresolved
             .retain(|u| now.saturating_duration_since(u.since) < ARP_WAIT);
@@ -726,6 +763,9 @@ impl Gateway {
     fn accept_forwarded(&mut self, now: Instant) {
         for i in 0..self.tcp_fwd.len() {
             for _ in 0..SOCKET_BUDGET {
+                if !self.may_read() {
+                    return;
+                }
                 let (rule, listener) = &self.tcp_fwd[i];
                 let rule = *rule;
                 let stream = match listener.accept() {
@@ -734,8 +774,8 @@ impl Gateway {
                     Err(_) => break,
                 };
                 // Dropping the stream closes the host's connection at once.
-                if self.flows_of(*rule.guest.ip()) >= self.limits.flows_per_guest {
-                    self.stats.refused += 1;
+                let owner = self.neighbors.get(rule.guest.ip()).copied();
+                if !self.admit(owner) {
                     continue;
                 }
                 if stream.set_nonblocking(true).is_err() {
@@ -749,8 +789,9 @@ impl Gateway {
                 let id = self.new_id();
                 let iss = self.new_iss(rule.guest, peer);
                 let mut segs = Vec::new();
-                let flow =
+                let mut flow =
                     tcp::Flow::to_guest(id, rule.guest, peer, stream, iss, now, &self.limits, &mut segs);
+                flow.owner = owner;
                 self.tcp.insert((rule.guest, peer), flow);
                 self.tcp_to_guest(rule.guest, peer, segs, now);
             }
@@ -761,6 +802,9 @@ impl Gateway {
         let mut buf = vec![0u8; 64 * 1024];
         for i in 0..self.udp_fwd.len() {
             for _ in 0..SOCKET_BUDGET {
+                if !self.may_read() {
+                    return;
+                }
                 let (n, from) = match self.udp_fwd[i].socket.recv_from(&mut buf) {
                     Ok(r) => r,
                     Err(e) if retry_udp(&e) => continue,
@@ -770,25 +814,29 @@ impl Gateway {
                     continue;
                 }
                 let guest = self.udp_fwd[i].rule.guest;
-                let known = self.udp_fwd[i]
-                    .clients
-                    .iter()
-                    .find(|(_, (c, _))| *c == from)
-                    .map(|(p, _)| *p);
+                let known = self.udp_fwd[i].clients.iter_mut().find(|(_, c)| c.addr == from);
                 let port = match known {
-                    Some(p) => p,
+                    Some((p, client)) => {
+                        client.last_active = now;
+                        *p
+                    }
                     None => {
-                        if self.flows_of(*guest.ip()) >= self.limits.flows_per_guest {
-                            self.stats.refused += 1;
+                        let owner = self.neighbors.get(guest.ip()).copied();
+                        if !self.admit(owner) {
                             continue;
                         }
                         let Some(p) = self.new_port() else {
                             continue;
                         };
+                        let client = FwdClient {
+                            addr: from,
+                            last_active: now,
+                            owner,
+                        };
+                        self.udp_fwd[i].clients.insert(p, client);
                         p
                     }
                 };
-                self.udp_fwd[i].clients.insert(port, (from, now));
                 self.udp_to_guest(GATEWAY_ADDR, port, guest, &buf[..n], now);
             }
         }
@@ -797,8 +845,12 @@ impl Gateway {
     fn recv_udp(&mut self, now: Instant) {
         let mut buf = vec![0u8; 64 * 1024];
         let mut got = Vec::new();
+        let room = self.half_queue().saturating_sub(self.out.len());
         for (guest, flow) in &mut self.udp {
             for _ in 0..SOCKET_BUDGET {
+                if got.len() >= room {
+                    break;
+                }
                 match flow.socket.recv_from(&mut buf) {
                     Ok((n, SocketAddr::V4(from))) if n <= wire::UDP_MAX_PAYLOAD => {
                         flow.last_active = now;
@@ -894,17 +946,35 @@ impl Gateway {
 
     // ---- Bookkeeping ----
 
-    /// Flows guest address `ip` has.
-    fn flows_of(&self, ip: Ipv4Addr) -> usize {
-        let tcp = self.tcp.keys().filter(|(g, _)| *g.ip() == ip).count();
-        let udp = self.udp.keys().filter(|g| *g.ip() == ip).count();
-        let fwd: usize = self
-            .udp_fwd
-            .iter()
-            .filter(|f| *f.rule.guest.ip() == ip)
-            .map(|f| f.clients.len())
-            .sum();
-        tcp + udp + fwd
+    /// Flows the guest machine with MAC address `mac` has.
+    fn flows_of(&self, mac: Mac) -> usize {
+        let tcp = self.tcp.values().filter(|f| f.owner == Some(mac)).count();
+        let udp = self.udp.values().filter(|f| f.owner == mac).count();
+        let fwd = self.udp_fwd.iter().flat_map(|f| f.clients.values());
+        tcp + udp + fwd.filter(|c| c.owner == Some(mac)).count()
+    }
+
+    /// Whether a new flow of `owner` (a guest's MAC address; `None` for a forwarded
+    /// port's guest not heard from yet) fits the limits; counts the refusal if not.
+    fn admit(&mut self, owner: Option<Mac>) -> bool {
+        let full = self.flows() >= self.limits.flows
+            || owner.is_some_and(|mac| self.flows_of(mac) >= self.limits.flows_per_guest);
+        if full {
+            self.stats.refused += 1;
+        }
+        !full
+    }
+
+    /// Whether host sockets may be read: not while the queue toward the guest is half
+    /// full (what the host sends waits in its socket buffers meanwhile).
+    fn may_read(&self) -> bool {
+        self.out.len() < self.half_queue()
+    }
+
+    /// Frames queued for the guest past which host sockets are not read (at least one,
+    /// so even a queue of one frame lets something through).
+    fn half_queue(&self) -> usize {
+        (self.limits.queue / 2).max(1)
     }
 
     fn new_id(&mut self) -> u64 {
