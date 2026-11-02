@@ -2395,9 +2395,7 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
     let ding = user_program("ding");
     let want = expected_user_pages(&ding.elf);
     assert_eq!(want[0], (USER_TEXT, PTE_V | PTE_U | PTE_R | PTE_X));
-    assert!(want
-        .iter()
-        .all(|&(va, _)| va >= USER_TEXT && va != USER_LOAD_TOP));
+    assert!(want.iter().all(|&(va, _)| va >= USER_TEXT && va != USER_LOAD_TOP));
     assert_eq!(user_pages(&m, satp), want);
     let (leaves, tables, megapages) = page_table(&m, satp);
     let (kleaves, ktables, kmegapages) = page_table(&m, ksatp);
@@ -2769,7 +2767,7 @@ fn run_counting_pages(ram_mib: usize, commands: &[&str]) -> String {
     step_to_prompt(&mut m, 1);
     let before = free_pages(&m, &elf);
     for (i, line) in commands.iter().enumerate() {
-        for b in line.bytes().chain([b'\n']) {
+        for b in line.bytes().chain(*b"\n") {
             tx.send(b).unwrap();
         }
         step_to_prompt(&mut m, i + 2);
