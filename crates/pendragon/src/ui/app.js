@@ -351,6 +351,7 @@ function newVmPage(main, ctx, disk) {
   const name = el("input", { type: "text", required: true, placeholder: "web", autocomplete: "off" });
   const ram = el("input", { type: "text", value: "128" });
   const clock = el("input", { type: "text", placeholder: "full speed" });
+  const harts = el("input", { type: "text", value: "1" });
   const program = el("input", { type: "file", accept: ".elf,application/octet-stream" });
   const start = el("input", { type: "checkbox", checked: true });
   const submit = el("button", { type: "submit", class: "primary" }, "Create");
@@ -361,6 +362,7 @@ function newVmPage(main, ctx, disk) {
     field("Name", name, "lowercase letters, digits, '.', '_' and '-'"),
     field("RAM (MiB)", ram, "1 to 2048"),
     field("Clock", clock, "e.g. 10MHz, 500kHz, 5Hz; empty runs at full speed"),
+    field("Harts", harts, "cores, 1 to 8; each runs at the clock"),
     field("Program", program, "an Excalibur ELF executable"),
     el("h2", {}, "Disks"),
     disks,
@@ -384,6 +386,7 @@ function newVmPage(main, ctx, disk) {
         name: name.value.trim(),
         ram: ram.value,
         clock: clock.value,
+        harts: harts.value,
         start: start.checked,
         program: toBase64(bytes),
         disks: [...disks.querySelectorAll(".disk-row")]
@@ -462,6 +465,7 @@ function vmFacts(vm) {
     ["State", stateCell(vm)],
     ["RAM", vm.ram_text],
     ["Clock", vm.clock_hz === null ? "full speed (reports " + vm.nominal_text + " to the guest)" : vm.clock_text + " (real time)"],
+    ["Harts", String(vm.harts)],
     ["Steps", String(vm.steps)],
     ["Disks", el("div", {}, diskList(vm))],
     ["Devices", el("div", {}, vm.devices.map((d) => el("div", {}, d.name + "  " + d.base + " + " + d.size + (d.irq ? "  irq " + d.irq : ""))))],

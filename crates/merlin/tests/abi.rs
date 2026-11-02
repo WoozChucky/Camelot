@@ -1,7 +1,7 @@
 //! merlin's calling convention against clang's: structs of every size class,
-//! and the narrow scalars, passed and returned both ways between
-//! merlin-compiled and clang-compiled code (see `tests/abi/clang_side.c` for
-//! the cases).
+//! the narrow scalars, arguments on the stack and variadic arguments, passed
+//! and returned both ways between merlin-compiled and clang-compiled code
+//! (see `tests/abi/clang_side.c` for the cases).
 //!
 //! Run by `cargo test`, without LLVM: `tests/abi/clang_side.o` is committed.
 //!

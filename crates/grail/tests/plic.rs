@@ -232,7 +232,7 @@ fn machine_with_claimable_uart(program: &[u32]) -> Machine {
     m.cpu.bus.write(ENABLE0, 4, 1 << 1).unwrap();
     tx.send(b'c').unwrap();
     // Move the byte into the UART now: the sender is dropped on return.
-    m.cpu.bus.update_interrupts(&mut |_, _| {});
+    m.cpu.bus.update_interrupts();
     assert_eq!(m.cpu.bus.read(PENDING, 4).unwrap(), 1 << 1);
     m
 }

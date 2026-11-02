@@ -16,10 +16,17 @@
 //! shifts by the low 5 bits of the amount, comparisons and `! && ||` give 0 or
 //! 1, and falling off the end of a function returns 0.
 //!
+//! A variadic function's extra arguments are laid out as the calling
+//! convention has them in words (see `merlin::abi`), in an area of the
+//! callee's frame that `va_start` points at: a scalar takes a word, a small
+//! struct its bytes rounded up to words, a big one a word holding the
+//! address of a copy.
+//!
 //! `switch` and `goto` run by seeking: the statements are walked without
 //! being run until the `case`, `default` or label is found, and run normally
 //! from there (into and out of blocks and loops, as C's jumps go).
 
+use merlin::abi::{self, Pass};
 use merlin::ast::*;
 use merlin::consteval::{self, Base, Const};
 use merlin::types::Type;
@@ -257,6 +264,8 @@ impl<'a> Interp<'a> {
     /// Writes a global's or static's constant initializer.
     fn static_init(&mut self, ty: &Type, init: &Init, addr: u32) -> Result<(), String> {
         match (ty.unqual(), init) {
+            // Zero (a subobject a designator skipped): memory starts zeroed.
+            (_, Init::List(items, _)) if items.is_empty() => {}
             (Type::Array(elem, _), Init::List(items, _)) => {
                 for (i, item) in items.iter().enumerate() {
                     self.static_init(elem, item, addr + i as u32 * size_of(elem))?;
@@ -307,8 +316,9 @@ impl<'a> Interp<'a> {
     /// Calls the function at address `addr`. A struct argument is the
     /// address of its bytes; a struct result is copied to `result` (the
     /// caller's hidden local) before the callee's frame goes, and that
-    /// address is returned.
-    fn call(&mut self, addr: u32, args: Vec<u32>, result: Option<u32>) -> Result<u32, String> {
+    /// address is returned. In a variadic function, the frame's last entry
+    /// is the address of the extra arguments' words.
+    fn call(&mut self, addr: u32, args: Vec<(u32, Type)>, result: Option<u32>) -> Result<u32, String> {
         let (name, f) = *self
             .funcs
             .get(&addr)
@@ -319,9 +329,34 @@ impl<'a> Interp<'a> {
         }
         // A fresh frame: every local gets its own (zeroed) object.
         let saved_top = self.top;
-        let frame: Vec<u32> = f.locals.iter().map(|l| self.alloc_frame(&l.ty)).collect();
-        for (i, v) in args.into_iter().enumerate() {
-            self.put(frame[i], &f.locals[i].ty, v)?;
+        let mut frame: Vec<u32> = f.locals.iter().map(|l| self.alloc_frame(&l.ty)).collect();
+        let named = f.params.len();
+        if args.len() != named && !f.variadic {
+            return Err(format!("'{name}' called with {} arguments", args.len()));
+        }
+        for (i, (v, _)) in args.iter().enumerate().take(named) {
+            self.put(frame[i], &f.locals[i].ty, *v)?;
+        }
+        if f.variadic {
+            let extra = &args[named..];
+            let words: usize = extra.iter().map(|(_, t)| abi::classify(t).registers()).sum();
+            // At least a word, so that the area has an address of its own.
+            let area_ty = Type::array(Type::INT, Some(words.max(1) as u32));
+            let mut at = self.alloc_frame(&area_ty);
+            frame.push(at);
+            for (v, t) in extra {
+                let pass = abi::classify(t);
+                match pass {
+                    Pass::Scalar => self.store(at, &Type::INT, *v)?,
+                    Pass::Words(_) => self.copy(at, *v, t)?,
+                    Pass::Ref => {
+                        let copy = self.alloc_frame(t);
+                        self.copy(copy, *v, t)?;
+                        self.store(at, &Type::INT, copy)?;
+                    }
+                }
+                at += 4 * pass.registers() as u32;
+            }
         }
         self.depth += 1;
         let body = f.body.as_ref().unwrap();
@@ -515,6 +550,8 @@ impl<'a> Interp<'a> {
 
     fn local_init(&mut self, ty: &Type, init: &'a Init, addr: u32, frame: &[u32]) -> Result<(), String> {
         match (ty.unqual(), init) {
+            // Zero: the object was cleared first.
+            (_, Init::List(items, _)) if items.is_empty() => {}
             (Type::Array(elem, _), Init::List(items, _)) => {
                 for (i, item) in items.iter().enumerate() {
                     self.local_init(elem, item, addr + i as u32 * size_of(elem), frame)?;
@@ -559,6 +596,13 @@ impl<'a> Interp<'a> {
             },
             ExprKind::Deref(p) => self.expr(p, frame),
             ExprKind::Str(b) => Ok(self.string(e, b)),
+            ExprKind::CompoundLit { init, local } => {
+                let addr = frame[local.ok_or("compound literal without a local")?.0];
+                let size = size_of(&e.ty) as usize;
+                self.mem[addr as usize..addr as usize + size].fill(0);
+                self.local_init(&e.ty, init, addr, frame)?;
+                Ok(addr)
+            }
             // `s.m`: `s`'s value is its address; `p->m`: `p` is one.
             ExprKind::Member { base, offset, .. } => Ok(self.expr(base, frame)?.wrapping_add(*offset)),
             _ => Err(format!("{}: not an lvalue", e.pos)),
@@ -579,7 +623,11 @@ impl<'a> Interp<'a> {
         self.tick()?;
         Ok(match &e.kind {
             ExprKind::Num(v) => *v as u32,
-            ExprKind::Var { .. } | ExprKind::Str(_) | ExprKind::Deref(_) | ExprKind::Member { .. } => {
+            ExprKind::Var { .. }
+            | ExprKind::Str(_)
+            | ExprKind::Deref(_)
+            | ExprKind::Member { .. }
+            | ExprKind::CompoundLit { .. } => {
                 let a = self.addr(e, frame)?;
                 self.value_at(a, &e.ty)?
             }
@@ -669,10 +717,29 @@ impl<'a> Interp<'a> {
                 let f = self.expr(callee, frame)?;
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
-                    vals.push(self.expr(a, frame)?);
+                    vals.push((self.expr(a, frame)?, a.ty.decay()));
                 }
                 self.call(f, vals, result.map(|id| frame[id.0]))?
             }
+            ExprKind::VaStart { ap, .. } => {
+                let a = self.addr(ap, frame)?;
+                let area = *frame.last().ok_or("va_start without a frame")?;
+                self.store(a, &ap.ty, area)?;
+                0
+            }
+            ExprKind::VaArg(ap) => {
+                let a = self.addr(ap, frame)?;
+                let at = self.load(a, &ap.ty)?;
+                let pass = abi::classify(&e.ty);
+                self.store(a, &ap.ty, at.wrapping_add(4 * pass.registers() as u32))?;
+                match pass {
+                    Pass::Scalar => self.load(at, &e.ty)?,
+                    // The struct's bytes are right there.
+                    Pass::Words(_) => at,
+                    Pass::Ref => self.load(at, &Type::INT)?,
+                }
+            }
+            ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => return Err("va_end/va_copy survived sema".into()),
         })
     }
 }

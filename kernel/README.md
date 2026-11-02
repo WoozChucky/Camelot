@@ -311,8 +311,10 @@ encoder covers what the `.s` files use; a test runs it automatically from then o
 
 ## Rules for kernel code
 
-The kernel and the user programs will eventually be compiled by Merlin (#15),
-so they stick to plain C:
+The kernel and the user programs will eventually be built by Merlin (#15),
+so they stick to plain C. Every C file here and in `user/` already compiles
+with merlin (the merlin harness's `kernel_sources_compile` checks it); the
+build still uses clang:
 
 - No libc: headers come from `include/` (`-nostdinc`; `user/user.h` for the
   programs), no `<stdint.h>`/`<stdarg.h>`.
@@ -321,4 +323,4 @@ so they stick to plain C:
 - Assembly uses only what merlin-as understands (no `.insn`, no preprocessor);
   Xcal instructions are `.word` constants. A test checks this.
 - Varargs (`kprintf`) use clang's `__builtin_va_*` through `include/varargs.h`;
-  Merlin has to provide the same builtins.
+  Merlin provides the same builtins, with the same calling convention.

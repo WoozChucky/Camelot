@@ -308,10 +308,13 @@ impl fmt::Debug for Record {
 /// A function's type: what it returns and what it takes. Parameter types are
 /// as adjusted for the call (arrays and functions are pointers) and without
 /// top-level qualifiers, which do not change the type (C99 6.7.5.3p15).
+/// A variadic function (`int printf(const char *, ...)`) takes any number
+/// of arguments after those.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FuncType {
     pub ret: Type,
     pub params: Vec<Type>,
+    pub variadic: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -349,7 +352,20 @@ impl Type {
     }
 
     pub fn func(ret: Type, params: Vec<Type>) -> Type {
-        Type::Func(Box::new(FuncType { ret, params }))
+        Type::Func(Box::new(FuncType {
+            ret,
+            params,
+            variadic: false,
+        }))
+    }
+
+    /// A function taking `params` and then any number of arguments (`...`).
+    pub fn variadic_func(ret: Type, params: Vec<Type>) -> Type {
+        Type::Func(Box::new(FuncType {
+            ret,
+            params,
+            variadic: true,
+        }))
     }
 
     /// The type with qualifiers `q` added, kept in normal form: on an array
@@ -520,7 +536,10 @@ impl Type {
                     go(elem, format!("{}[{n}]", parenthesize(inner)))
                 }
                 Type::Func(f) => {
-                    let params: Vec<String> = f.params.iter().map(|p| p.declare("")).collect();
+                    let mut params: Vec<String> = f.params.iter().map(|p| p.declare("")).collect();
+                    if f.variadic {
+                        params.push("...".to_string());
+                    }
                     let params = if params.is_empty() {
                         "void".to_string()
                     } else {

@@ -3,8 +3,8 @@
 //! No TLB yet: every access in a paged mode walks the page table. That is slow
 //! but simple, and it means `sfence.vma` has nothing to flush.
 
-use super::{Cpu, Mode};
-use crate::bus::BusFault;
+use super::{Hart, Mode};
+use crate::bus::{Bus, BusFault};
 use crate::trap::{Access, Trap};
 use excalibur::csr::*;
 
@@ -18,7 +18,7 @@ const PTE_D: u32 = 1 << 7;
 
 const PAGE_SIZE: u32 = 4096;
 
-impl Cpu {
+impl Hart {
     /// Privilege used for data accesses: MPRV makes M-mode loads/stores act as MPP.
     fn data_mode(&self) -> Mode {
         let s = self.csr.mstatus;
@@ -30,7 +30,7 @@ impl Cpu {
     }
 
     /// Virtual to physical. Returns the physical address or the fault to raise.
-    pub fn translate(&mut self, vaddr: u32, access: Access) -> Result<u32, Trap> {
+    pub fn translate(&mut self, bus: &mut Bus, vaddr: u32, access: Access) -> Result<u32, Trap> {
         let mode = if access == Access::Fetch {
             self.mode
         } else {
@@ -50,7 +50,7 @@ impl Cpu {
         let (pte, pte_addr) = loop {
             let pte_addr = table.wrapping_add(vpn[level] * 4);
             // Page tables must live in memory: a PTE address on a device is an access fault.
-            let pte = self.bus.read_mem(pte_addr, 4).map_err(|_| access_fault)?;
+            let pte = bus.read_mem(pte_addr, 4).map_err(|_| access_fault)?;
             if pte & PTE_V == 0 || (pte & PTE_R == 0 && pte & PTE_W != 0) {
                 return Err(page_fault);
             }
@@ -94,7 +94,8 @@ impl Cpu {
             new_pte |= PTE_D;
         }
         if new_pte != pte {
-            self.write_phys(pte_addr, 4, new_pte).map_err(|_| access_fault)?;
+            self.write_phys(bus, pte_addr, 4, new_pte)
+                .map_err(|_| access_fault)?;
         }
 
         Ok(if level == 1 {
@@ -104,50 +105,48 @@ impl Cpu {
         })
     }
 
-    pub fn fetch(&mut self, pc: u32) -> Result<u32, Trap> {
-        let paddr = self.translate(pc, Access::Fetch)?;
+    pub fn fetch(&mut self, bus: &mut Bus, pc: u32) -> Result<u32, Trap> {
+        let paddr = self.translate(bus, pc, Access::Fetch)?;
         // Only memory is executable: fetching from a device is an access fault.
-        self.bus
-            .read_mem(paddr, 4)
+        bus.read_mem(paddr, 4)
             .map_err(|_| Trap::new(Access::Fetch.access_fault(), pc))
     }
 
     /// Loads `size` bytes. Misaligned accesses trap (spec section 4).
-    pub fn load(&mut self, vaddr: u32, size: u32) -> Result<u32, Trap> {
+    pub fn load(&mut self, bus: &mut Bus, vaddr: u32, size: u32) -> Result<u32, Trap> {
         if vaddr & (size - 1) != 0 {
             return Err(Trap::new(Access::Load.misaligned(), vaddr));
         }
-        let paddr = self.translate(vaddr, Access::Load)?;
-        self.bus
-            .read(paddr, size)
+        let paddr = self.translate(bus, vaddr, Access::Load)?;
+        bus.read(paddr, size)
             .map_err(|_| Trap::new(Access::Load.access_fault(), vaddr))
     }
 
-    pub fn store(&mut self, vaddr: u32, size: u32, val: u32) -> Result<(), Trap> {
+    pub fn store(&mut self, bus: &mut Bus, vaddr: u32, size: u32, val: u32) -> Result<(), Trap> {
         if vaddr & (size - 1) != 0 {
             return Err(Trap::new(Access::Store.misaligned(), vaddr));
         }
-        let paddr = self.translate(vaddr, Access::Store)?;
-        self.write_phys(paddr, size, val)
+        let paddr = self.translate(bus, vaddr, Access::Store)?;
+        self.write_phys(bus, paddr, size, val)
             .map_err(|_| Trap::new(Access::Store.access_fault(), vaddr))
     }
 
     /// Every write the hart makes goes through here (`sb`/`sh`/`sw`, `sc.w`,
-    /// AMOs, and the page walker's A/D updates), so the LR/SC reservation sees
-    /// it: a write to the reserved word breaks the reservation, and so does any
-    /// store to a device, which may start a DMA into RAM (see
-    /// [`super::Reservation`]). An A/D update counts because software may be
-    /// updating that PTE with `lr.w`/`sc.w`, and its `sc.w` must not overwrite
-    /// the bit the hardware just set.
-    pub(super) fn write_phys(&mut self, paddr: u32, size: u32, val: u32) -> Result<(), BusFault> {
-        self.bus.write(paddr, size, val)?;
-        if self.reservation.held().is_some() {
-            if self.bus.is_memory(paddr, size) {
-                self.reservation.snoop(paddr, size);
-            } else {
-                self.reservation.clear();
-            }
-        }
+    /// AMOs, and the page walker's A/D updates), so the bus can keep the LR/SC
+    /// reservations right ([`Bus::snoop_store`]): a write to a reserved word breaks
+    /// that reservation, whichever hart holds it, and a store to a device breaks this
+    /// hart's, since it may start a DMA into RAM (see [`super::Reservation`]). An A/D
+    /// update counts because software may be updating that PTE with `lr.w`/`sc.w`,
+    /// and its `sc.w` must not overwrite the bit the hardware just set.
+    pub(super) fn write_phys(
+        &mut self,
+        bus: &mut Bus,
+        paddr: u32,
+        size: u32,
+        val: u32,
+    ) -> Result<(), BusFault> {
+        bus.write(paddr, size, val)?;
+        bus.snoop_store(self.id as usize, paddr, size);
         Ok(())
     }
 }

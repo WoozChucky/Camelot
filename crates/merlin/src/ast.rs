@@ -74,6 +74,8 @@ pub struct Function {
     pub name: String,
     pub ret: Type,
     pub params: Vec<Param>,
+    /// `...` ends the parameter list.
+    pub variadic: bool,
     /// `static`: not visible to other files (no `.globl`).
     pub is_static: bool,
     /// Declared `inline`.
@@ -101,10 +103,12 @@ pub struct Function {
 impl Function {
     /// The function's type.
     pub fn ty(&self) -> Type {
-        Type::func(
-            self.ret.clone(),
-            self.params.iter().map(|p| p.ty.unqual().clone()).collect(),
-        )
+        let params = self.params.iter().map(|p| p.ty.unqual().clone()).collect();
+        if self.variadic {
+            Type::variadic_func(self.ret.clone(), params)
+        } else {
+            Type::func(self.ret.clone(), params)
+        }
     }
 }
 
@@ -154,12 +158,35 @@ pub enum Init {
     Expr(Expr),
     /// Elements in order; elements left out are zero. After sema the list is
     /// fully braced, with exactly the shape of the object: one item per
-    /// array element or struct member given (a union's list has one item, for
-    /// its first member), each a list itself if its subobject is an array or
-    /// a struct initialized element by element. A scalar's `{ x }` has become
-    /// `x`, and C's brace elision (`int m[2][2] = {1, 2, 3, 4}`) has been
-    /// made explicit.
+    /// array element or struct member, in order, up to the last one given,
+    /// each a list itself if its subobject is an array or a struct
+    /// initialized element by element. A subobject that a designator skips
+    /// has an empty list (zero, whatever its type). A union's list ends with
+    /// the member it initializes, the items before it empty. A scalar's
+    /// `{ x }` has become `x`, and C's brace elision (`int m[2][2] = {1, 2,
+    /// 3, 4}`) and designators (`{ .b = 1, [4] = 2 }`) have been made
+    /// explicit.
     List(Vec<Init>, Pos),
+    /// In a list, as parsed: designators, then the initializer they place
+    /// (`.next = 0`, `[2].x = 1`). Sema resolves them: none are left after it.
+    Designated(Vec<Designator>, Box<Init>),
+}
+
+/// One step of a designation: a member (`.name`) or an array element
+/// (`[index]`, a constant expression), each with the position of its `.` or
+/// `[`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Designator {
+    Member(String, Pos),
+    Index(Expr, Pos),
+}
+
+impl Designator {
+    pub fn pos(&self) -> Pos {
+        match self {
+            Designator::Member(_, pos) | Designator::Index(_, pos) => *pos,
+        }
+    }
 }
 
 impl Init {
@@ -168,6 +195,7 @@ impl Init {
         match self {
             Init::Expr(e) => e.pos,
             Init::List(_, pos) => *pos,
+            Init::Designated(d, _) => d[0].pos(),
         }
     }
 }
@@ -404,6 +432,30 @@ pub enum ExprKind {
         result: Option<LocalId>,
         arg_copies: Vec<Option<LocalId>>,
     },
+    /// `__builtin_va_start(ap, last)` (`va_start`, in a variadic function
+    /// whose last named parameter is `last`): points the `va_list` `ap` at
+    /// the first variadic argument. Its type is `void`.
+    VaStart {
+        ap: Box<Expr>,
+        last: Box<Expr>,
+    },
+    /// `__builtin_va_arg(ap, T)` (`va_arg`): the variadic argument `ap`
+    /// points at, of type `T` (the expression's type), and moves `ap` to
+    /// the next one.
+    VaArg(Box<Expr>),
+    /// `__builtin_va_end(ap)`: nothing to do. Sema checks it and turns it
+    /// into `(void)ap`.
+    VaEnd(Box<Expr>),
+    /// `__builtin_va_copy(dst, src)`: sema checks it and turns it into
+    /// `(void)(dst = src)`, since a `va_list` is a pointer.
+    VaCopy(Box<Expr>, Box<Expr>),
+    /// `(type){ ... }`: an unnamed object of the expression's type,
+    /// initialized by the list each time the expression is evaluated; an
+    /// lvalue. Sema gives it a hidden local (`local`).
+    CompoundLit {
+        init: Box<Init>,
+        local: Option<LocalId>,
+    },
 }
 
 impl ExprKind {
@@ -464,7 +516,10 @@ impl Dumper {
     }
 
     fn function(&mut self, f: &Function) {
-        let params: Vec<String> = f.params.iter().map(|p| p.ty.declare(&p.name)).collect();
+        let mut params: Vec<String> = f.params.iter().map(|p| p.ty.declare(&p.name)).collect();
+        if f.variadic {
+            params.push("...".to_string());
+        }
         let params = if params.is_empty() {
             "void".to_string()
         } else {
@@ -526,6 +581,19 @@ impl Dumper {
                 for i in items {
                     self.init(d + 1, i);
                 }
+            }
+            Init::Designated(designators, init) => {
+                let mut text = String::new();
+                for ds in designators {
+                    match ds {
+                        Designator::Member(name, _) => text += &format!(".{name}"),
+                        Designator::Index(e, _) => {
+                            text += &format!("[{}]", crate::consteval::int(e).unwrap_or(0))
+                        }
+                    }
+                }
+                self.line(d, init.pos(), &format!("Designated {text}"));
+                self.init(d + 1, init);
             }
         }
     }
@@ -710,6 +778,32 @@ impl Dumper {
                         _ => self.expr(d + 1, a),
                     }
                 }
+            }
+            ExprKind::VaStart { ap, last } => {
+                node(self, "VaStart".to_string());
+                self.expr(d + 1, ap);
+                self.expr(d + 1, last);
+            }
+            ExprKind::VaArg(ap) => {
+                node(self, "VaArg".to_string());
+                self.expr(d + 1, ap);
+            }
+            ExprKind::VaEnd(ap) => {
+                node(self, "VaEnd".to_string());
+                self.expr(d + 1, ap);
+            }
+            ExprKind::VaCopy(dst, src) => {
+                node(self, "VaCopy".to_string());
+                self.expr(d + 1, dst);
+                self.expr(d + 1, src);
+            }
+            ExprKind::CompoundLit { init, local } => {
+                let at = match local {
+                    Some(LocalId(id)) => format!(" (#{id})"),
+                    None => String::new(),
+                };
+                node(self, format!("CompoundLiteral{at}"));
+                self.init(d + 1, init);
             }
         }
     }

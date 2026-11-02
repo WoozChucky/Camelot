@@ -347,11 +347,14 @@ impl NetDevice {
         self.irq_status |= IRQ_RX;
     }
 
-    /// Sends every descriptor from `TX_HEAD` to `TX_TAIL`.
-    fn transmit(&mut self, ram: &mut [u8]) {
+    /// Sends every descriptor from `TX_HEAD` to `TX_TAIL`. Completing a descriptor
+    /// writes its length and status fields, a RAM write no hart made: `dma` hears of
+    /// each one, as in [`NetDevice::poll`].
+    fn transmit(&mut self, ram: &mut [u8], dma: &mut dyn FnMut(u32, u32)) {
         let mut done = false;
         while self.tx.pending() != 0 {
-            let Some(desc) = ram_range(ram, self.tx.desc(self.tx.head), DESC_SIZE as u64) else {
+            let desc_addr = self.tx.desc(self.tx.head);
+            let Some(desc) = ram_range(ram, desc_addr, DESC_SIZE as u64) else {
                 self.ring_error(error::BAD_RING);
                 break;
             };
@@ -368,6 +371,8 @@ impl NetDevice {
                 }
             };
             write_desc_result(&mut ram[desc], len, st as u16);
+            // The length and status fields; the descriptor is in RAM, so below 2^32.
+            dma(desc_addr as u32 + 4, 4);
             self.tx.head = self.tx.head.wrapping_add(1);
             done = true;
         }
@@ -444,8 +449,17 @@ impl NetDevice {
     }
 
     /// Writing `NET_TX_TAIL` sends frames from `ram` (the machine's RAM, mapped at
-    /// `RAM_BASE`). Writes to read-only registers and unknown offsets are ignored.
-    pub fn write(&mut self, off: u32, size: u32, val: u32, ram: &mut [u8]) -> Result<(), BusFault> {
+    /// `RAM_BASE`) and completes their descriptors there: `dma` hears of every RAM range
+    /// the card writes, as in [`NetDevice::poll`]. Writes to read-only registers and
+    /// unknown offsets are ignored.
+    pub fn write(
+        &mut self,
+        off: u32,
+        size: u32,
+        val: u32,
+        ram: &mut [u8],
+        dma: &mut dyn FnMut(u32, u32),
+    ) -> Result<(), BusFault> {
         if size != 4 {
             return Err(BusFault);
         }
@@ -458,7 +472,7 @@ impl NetDevice {
             REG_TX_SIZE => self.set_ring(false, None, Some(val)),
             REG_TX_TAIL => {
                 if self.set_tail(false, val) {
-                    self.transmit(ram);
+                    self.transmit(ram, dma);
                 }
             }
             REG_RX_BASE => self.set_ring(true, Some(val), None),

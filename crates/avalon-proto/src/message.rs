@@ -173,6 +173,8 @@ pub const PIXEL_FORMAT_XRGB8888: u32 = 0;
 pub const DEFAULT_RAM_SIZE: u64 = 128 * 1024 * 1024;
 /// Nominal clock of [`HardwareProfile::default`], as for Grail's default.
 pub const DEFAULT_NOMINAL_HZ: u32 = 10_000_000;
+/// Harts of [`HardwareProfile::default`], as for Grail's default.
+pub const DEFAULT_HARTS: u32 = 1;
 
 /// A VM's hardware, mirroring `grail::MachineConfig` field for field (a test in this
 /// crate fails to compile when `MachineConfig` gains a field this does not have).
@@ -185,6 +187,8 @@ pub struct HardwareProfile {
     pub clock_hz: Option<u32>,
     /// The clock reported to the guest when `clock_hz` is `None`.
     pub nominal_hz: u32,
+    /// Harts (cores), each running at the clock: 1 to `grail::MAX_HARTS` (8).
+    pub harts: u32,
     /// Optional hardware beyond the fixed machine (spec section 7), in the order the
     /// guest should see it.
     pub devices: Vec<DeviceSpec>,
@@ -196,6 +200,7 @@ impl Default for HardwareProfile {
             ram_size: DEFAULT_RAM_SIZE,
             clock_hz: None,
             nominal_hz: DEFAULT_NOMINAL_HZ,
+            harts: DEFAULT_HARTS,
             devices: Vec::new(),
         }
     }
@@ -1469,6 +1474,7 @@ fn put_profile(w: &mut Writer, p: &HardwareProfile) {
     w.u64(p.ram_size);
     w.option(&p.clock_hz, |w, hz| w.u32(*hz));
     w.u32(p.nominal_hz);
+    w.u32(p.harts);
     w.list(&p.devices, |w, d| match d {
         DeviceSpec::Disk(disk) => {
             w.u8(1);
@@ -1498,6 +1504,7 @@ fn get_profile(r: &mut Reader) -> Result<HardwareProfile> {
         ram_size: r.u64()?,
         clock_hz: r.option(|r| r.u32())?,
         nominal_hz: r.u32()?,
+        harts: r.u32()?,
         devices: r.list(|r| match r.u8()? {
             1 => {
                 let source = match r.u8()? {

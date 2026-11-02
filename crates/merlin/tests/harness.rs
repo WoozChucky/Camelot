@@ -27,6 +27,15 @@
 //!
 //! * `far_branches_run_in_grail`, `deep_expressions_run_in_grail`: generated
 //!   programs too big to keep as files, through the same pipeline.
+//! * `multi_file_programs_run_in_grail`: programs of several files, each a
+//!   directory `tests/multi/<name>/`: merlin compiles every `.c` file (with
+//!   `include/` as `-I`, if there is one), merlin-as assembles every `.s`
+//!   file, and merlin-ld links them all with crt0. The first line of
+//!   `main.c` is `// expect: N`.
+//! * `kernel_sources_compile`: merlin compiles every C file of the Camelot
+//!   kernel and its user programs (`kernel/*.c`, `kernel/user/*.c`), and
+//!   merlin-as assembles the result. Nothing runs: the kernel is still
+//!   built with clang (`cargo xtask kernel`).
 //!
 //! Ignored, since they need LLVM:
 //!
@@ -36,6 +45,11 @@
 //!   merlin-as. Needs clang on `PATH`.
 //!
 //!       cargo test -p merlin --test harness -- --ignored generated_assembly
+//!
+//! * `multi_file_clang_reference`: the multi-file programs, built with clang
+//!   and ld.lld instead.
+//!
+//!       cargo test -p merlin --test harness -- --ignored multi_file_clang
 //!
 //! * `clang_reference`: compiles every case with clang instead of merlin, links
 //!   with ld.lld and runs it in Grail. It checks the expectations and crt0
@@ -462,6 +476,167 @@ fn deep_expressions_run_in_grail() {
                }";
     // w(8, ..., 1) = 4; w(0, ..., 3) = -3; w(1, ..., 1, -3) = 4; w(4, 1, 4, 0, 0, 0, 0, 5) = 2.
     assert_eq!(pipeline.run("args", src), Ok(102));
+}
+
+/// A program of several files, in `tests/multi/<name>/`.
+struct MultiCase {
+    name: String,
+    /// `include/`, if the program has one: the `-I` directory.
+    include: Option<PathBuf>,
+    c_files: Vec<PathBuf>,
+    s_files: Vec<PathBuf>,
+    expect: u8,
+}
+
+fn multi_cases() -> Vec<MultiCase> {
+    let root = tests_dir().join("multi");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
+        .unwrap_or_else(|e| panic!("{}: {e}", root.display()))
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.into_iter()
+        .map(|dir| {
+            let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+            let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            files.sort();
+            let with = |ext: &str| -> Vec<PathBuf> {
+                files
+                    .iter()
+                    .filter(|p| p.extension().is_some_and(|x| x == ext))
+                    .cloned()
+                    .collect()
+            };
+            let main =
+                std::fs::read_to_string(dir.join("main.c")).unwrap_or_else(|e| panic!("{name}/main.c: {e}"));
+            let expect = main
+                .lines()
+                .next()
+                .and_then(|l| l.trim().strip_prefix("// expect:"))
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or_else(|| {
+                    panic!("{name}/main.c: first line must be `// expect: N` with N in 0..=255")
+                });
+            let include = Some(dir.join("include")).filter(|d| d.is_dir());
+            MultiCase {
+                name,
+                include,
+                c_files: with("c"),
+                s_files: with("s"),
+                expect,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn multi_file_programs_run_in_grail() {
+    let pipeline = Pipeline::new("multi");
+    let cases = multi_cases();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let opts = merlin::Options {
+            include_dirs: case.include.iter().cloned().collect(),
+            macros: Vec::new(),
+        };
+        let mut objs = vec![pipeline.crt0.clone()];
+        for c in &case.c_files {
+            let asm = merlin::compile_file(c, &opts).unwrap_or_else(|errs| {
+                let msgs: Vec<String> = errs.iter().map(|e| e.render(&c.to_string_lossy())).collect();
+                panic!("{}: {}", case.name, msgs.join("\n"))
+            });
+            let stem = c.file_stem().unwrap().to_string_lossy();
+            let obj = pipeline.scratch.path(&format!("{}-{stem}.o", case.name));
+            objs.push(pipeline.backend.assemble(&asm, &obj).unwrap());
+        }
+        for s in &case.s_files {
+            let stem = s.file_stem().unwrap().to_string_lossy();
+            let obj = pipeline.scratch.path(&format!("{}-{stem}-s.o", case.name));
+            let src = std::fs::read_to_string(s).unwrap();
+            objs.push(pipeline.backend.assemble(&src, &obj).unwrap());
+        }
+        let elf = pipeline.scratch.path(&format!("{}.elf", case.name));
+        let elf = pipeline
+            .backend
+            .link(&objs, &elf)
+            .unwrap_or_else(|e| panic!("{}: {e}", case.name));
+        assert_eq!(run_in_grail(&elf), Ok(case.expect), "{}", case.name);
+    }
+}
+
+#[test]
+#[ignore = "needs clang and ld.lld on PATH"]
+fn multi_file_clang_reference() {
+    let scratch = Scratch::new("multi-clang");
+    let crt0_s = scratch.path("crt0.s");
+    let crt0 = std::fs::read_to_string(tests_dir().join("crt0.s")).unwrap();
+    std::fs::write(&crt0_s, crt0_for_llvm(&crt0)).unwrap();
+    let crt0_o = scratch.path("crt0.o");
+    tool(clang().arg(&crt0_s).arg("-o").arg(&crt0_o)).expect("assembling crt0.s with clang");
+    for case in multi_cases() {
+        let mut objs = vec![crt0_o.clone()];
+        for f in case.c_files.iter().chain(&case.s_files) {
+            let stem = f.file_stem().unwrap().to_string_lossy();
+            let ext = f.extension().unwrap().to_string_lossy();
+            let obj = scratch.path(&format!("{}-{stem}-{ext}.o", case.name));
+            let mut cmd = clang();
+            cmd.args(["-std=c99", "-O1", "-ffreestanding", "-fno-builtin"]);
+            if let Some(dir) = &case.include {
+                cmd.arg("-I").arg(dir);
+            }
+            tool(cmd.arg(f).arg("-o").arg(&obj)).unwrap();
+            objs.push(obj);
+        }
+        let elf = ld_lld(&objs, &scratch.path(&format!("{}.elf", case.name))).unwrap();
+        assert_eq!(run_in_grail(&elf), Ok(case.expect), "{}", case.name);
+    }
+}
+
+/// Every C file of the kernel and its user programs compiles with merlin,
+/// with the include directories `cargo xtask kernel` gives clang, and the
+/// result assembles.
+#[test]
+fn kernel_sources_compile() {
+    let kernel = tests_dir().join("../../../kernel");
+    let mut failures = Vec::new();
+    let mut count = 0;
+    for (dir, includes) in [
+        (kernel.clone(), vec![kernel.join("include")]),
+        (kernel.join("user"), vec![kernel.join("user")]),
+    ] {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "c"))
+            .collect();
+        files.sort();
+        let opts = merlin::Options {
+            include_dirs: includes,
+            macros: Vec::new(),
+        };
+        for f in files {
+            count += 1;
+            let name = f.file_name().unwrap().to_string_lossy().into_owned();
+            match merlin::compile_file(&f, &opts) {
+                Ok(asm) => {
+                    if let Err(errs) = merlin_as::assemble_to_elf(&asm) {
+                        failures.push(format!("  {name}: merlin-as: {:?}", errs.first()));
+                    }
+                }
+                Err(errs) => failures.push(format!("  {name}: {}", errs[0].render(&name))),
+            }
+        }
+    }
+    assert!(count >= 20, "only {count} kernel C files");
+    assert!(
+        failures.is_empty(),
+        "kernel files merlin cannot compile:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// The sections `generated_assembly_assembles_like_clang` compares: code,

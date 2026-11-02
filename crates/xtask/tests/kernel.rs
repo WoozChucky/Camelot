@@ -435,8 +435,8 @@ fn kmain_runs_in_s_mode_with_traps_delegated() {
     assert_eq!(c.mstatus & MSTATUS_SIE, 0);
     // The first tick is armed one interval after start() ran.
     let clint = &m.cpu.bus.clint;
-    assert!(clint.mtimecmp > clint.mtime && clint.mtimecmp - clint.mtime < TICK_INTERVAL);
-    assert!(clint.mtimecmp <= TICK_INTERVAL + steps);
+    assert!(clint.mtimecmp[0] > clint.mtime && clint.mtimecmp[0] - clint.mtime < TICK_INTERVAL);
+    assert!(clint.mtimecmp[0] <= TICK_INTERVAL + steps);
 }
 
 #[test]
@@ -468,7 +468,7 @@ fn ticks_are_one_interval_apart() {
                 } else {
                     machine_ticks.push(cpu.bus.clint.mtime);
                 }
-                deadlines.push(cpu.bus.clint.mtimecmp);
+                deadlines.push(cpu.bus.clint.mtimecmp[0]);
             } else {
                 // The only other trap to M-mode: the final MCALL_HALT.
                 assert_eq!(cpu.csr.mcause, ECALL_FROM_S);
@@ -580,8 +580,8 @@ fn tick_preserves_every_register() {
     let (mut m, elf, regs) = busy_kmain();
     let kmain = sym(&elf, "kmain");
     let clint = &mut m.cpu.bus.clint;
-    clint.mtimecmp = clint.mtime + 20;
-    let cmp = clint.mtimecmp;
+    clint.mtimecmp[0] = clint.mtime + 20;
+    let cmp = clint.mtimecmp[0];
 
     step_to(&mut m, sym(&elf, "machine_vec"));
     assert_eq!(m.cpu.csr.mcause, INTERRUPT_BIT | IRQ_M_TIMER);
@@ -591,7 +591,7 @@ fn tick_preserves_every_register() {
     assert_eq!(m.cpu.csr.scause, INTERRUPT_BIT | IRQ_S_SOFT);
     assert_eq!(m.cpu.csr.sepc, kmain);
     assert_eq!(m.cpu.x, regs, "machine_vec changed registers");
-    assert_eq!(m.cpu.bus.clint.mtimecmp, cmp + TICK_INTERVAL);
+    assert_eq!(m.cpu.bus.clint.mtimecmp[0], cmp + TICK_INTERVAL);
 
     step_to(&mut m, kmain);
     assert_eq!(m.cpu.mode, Mode::S);
@@ -654,7 +654,7 @@ fn ticks_preempting_kernel_code_change_nothing() {
         .load(scratch + SCRATCH_INTERVAL, &SHORT_INTERVAL.to_le_bytes())
         .unwrap();
     let clint = &mut m.cpu.bus.clint;
-    clint.mtimecmp = clint.mtime + u64::from(SHORT_INTERVAL);
+    clint.mtimecmp[0] = clint.mtime + u64::from(SHORT_INTERVAL);
 
     // Where a tick interrupts wait_ticks' idle loop: after `wfi` in M-mode,
     // and after intr_on's `csrsi` in S-mode.
@@ -705,7 +705,7 @@ fn timer_rearm_carries_into_the_high_word() {
     step_to(&mut m, sym(&elf, "kmain"));
     let clint = &mut m.cpu.bus.clint;
     clint.mtime = CMP - 0x100;
-    clint.mtimecmp = CMP;
+    clint.mtimecmp[0] = CMP;
     step_to(&mut m, sym(&elf, "machine_vec"));
     assert_eq!(m.cpu.csr.mcause, INTERRUPT_BIT | IRQ_M_TIMER);
     for _ in 0..100 {
@@ -715,8 +715,8 @@ fn timer_rearm_carries_into_the_high_word() {
         m.cpu.step();
     }
     assert_eq!(m.cpu.mode, Mode::S, "machine_vec never returned");
-    assert_eq!(m.cpu.bus.clint.mtimecmp, CMP + TICK_INTERVAL);
-    assert!(m.cpu.bus.clint.mtimecmp > 1 << 32);
+    assert_eq!(m.cpu.bus.clint.mtimecmp[0], CMP + TICK_INTERVAL);
+    assert!(m.cpu.bus.clint.mtimecmp[0] > 1 << 32);
 }
 
 /// Runs the committed kernel with `boot_fault` patched to `fault`. Returns the

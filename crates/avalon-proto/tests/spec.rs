@@ -161,13 +161,14 @@ fn simple_profile() -> HardwareProfile {
         ram_size: 0x1000,
         clock_hz: None,
         nominal_hz: 10,
+        harts: 1,
         devices: Vec::new(),
     }
 }
 
 /// `simple_profile` per the HardwareProfile table.
 fn simple_profile_bytes(p: P) -> P {
-    p.u64(0x1000).u8(0).u32(10).u32(0)
+    p.u64(0x1000).u8(0).u32(10).u32(1).u32(0)
 }
 
 /// One message of every type, each field a different value, with its layout per the
@@ -218,6 +219,7 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                     ram_size: 0x2000,
                     clock_hz: Some(5),
                     nominal_hz: 7,
+                    harts: 3,
                     devices: vec![
                         DeviceSpec::Disk(DiskSpec {
                             source: DiskSource::File("f".into()),
@@ -248,6 +250,7 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                 .u8(1)
                 .u32(5)
                 .u32(7)
+                .u32(3)
                 .u32(4)
                 .u8(1)
                 .u8(1)
@@ -763,17 +766,17 @@ fn optional_fields_are_tagged() {
 
 #[test]
 fn doc_examples_are_exact() {
-    // Section 6.1: Hello version 4 from agent "rt".
+    // Section 6.1: Hello version 5 from agent "rt".
     assert_eq!(
         encode(&Message::Hello {
-            version: 4,
+            version: 5,
             agent: "rt".into()
         })
         .unwrap(),
-        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x04, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
+        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x05, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
     );
     // Section 7: the version this document describes.
-    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(PROTOCOL_VERSION, 5);
     // Section 6.2: StartVm by id 5.
     assert_eq!(
         encode(&Message::StartVm { vm: VmRef::Id(5) }).unwrap(),

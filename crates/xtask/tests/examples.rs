@@ -146,6 +146,15 @@ fn scenario(name: &str) -> Scenario {
                 0,
             )
         },
+        // One hart: every count is its own, and no store-conditional can fail.
+        // `smp_example_runs_on_every_hart_count` runs it on more.
+        "smp" => plain(
+            "harts: 1\n\
+             amoadd: 1000 = 1 x 1000\n\
+             lr/sc: 1000 = 1 x 1000, 0 retries\n\
+             ipi: 3 interrupts, 3 on each hart\n",
+            0,
+        ),
         // Alone, without a network card; `net_examples_talk_over_a_hub` connects them.
         "net-ping" | "net-pong" => plain("no network card (try grail --net hub)\n", 1),
         // Alone too; crates/grail/tests/net_user.rs runs it behind the NAT gateway.
@@ -342,6 +351,40 @@ fn net_examples_talk_over_a_hub() {
              sent 60 bytes to 02:ca:00:00:00:01\n"
         )
     );
+}
+
+/// `examples/smp`, freshly built, on 2 to 8 harts: hart 0 wakes the others with
+/// an IPI, the amoadd and lr/sc counters lose no increment although the harts
+/// race for them (so some store-conditionals fail), and each hart takes its
+/// share of the IPIs.
+#[test]
+fn smp_example_runs_on_every_hart_count() {
+    let elf = build(example("smp")).elf;
+    for harts in 2..=grail::MAX_HARTS {
+        let mut m = Machine::new(MachineConfig {
+            harts,
+            ..MachineConfig::default()
+        })
+        .unwrap();
+        m.cpu.bus.uart.capture = true;
+        m.load_elf(&elf).unwrap();
+        let r = m.run(Some(MAX_STEPS), |_| {});
+        let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
+        assert_eq!(r, RunResult::Exited(0), "{harts} harts:\n{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4, "{harts} harts:\n{out}");
+        assert_eq!(lines[0], format!("harts: {harts}"));
+        assert_eq!(lines[1], format!("amoadd: {} = {harts} x 1000", harts * 1000));
+        let lrsc = format!("lr/sc: {} = {harts} x 1000, ", harts * 1000);
+        let retries: u32 = lines[2]
+            .strip_prefix(&lrsc)
+            .and_then(|r| r.strip_suffix(" retries"))
+            .unwrap_or_else(|| panic!("{harts} harts: {:?}", lines[2]))
+            .parse()
+            .unwrap();
+        assert!(retries > 0, "{harts} harts: no lr/sc contention");
+        assert_eq!(lines[3], format!("ipi: {} interrupts, 3 on each hart", 3 * harts));
+    }
 }
 
 /// Without a disk, `examples/disk` says so and exits with 1: the scenario's

@@ -10,9 +10,17 @@
 //! * A bigger struct or union is passed by reference: the caller copies it
 //!   and passes the copy's address in one register. The callee may change
 //!   the copy.
-//! * Arguments take `a0`, `a1`, ... in order, and merlin passes nothing on
-//!   the stack, so they must fit in `a0-a7` (the psABI would put the rest,
-//!   or the second half of a pair that does not fit, on the stack).
+//! * Arguments take the words of a sequence in order: words 0 to 7 are `a0`
+//!   to `a7`, word 8 is at `0(sp)` when the call is made, word 9 at
+//!   `4(sp)`, and so on. A pair that starts in `a7` has its second word at
+//!   `0(sp)`. The caller makes room for the stack words; the callee finds
+//!   them at its `s0`, the `sp` it was called with.
+//! * The arguments a variadic function's `...` takes travel exactly like
+//!   named ones (each promoted first: `char` and `short` to `int`). The
+//!   callee stores the argument registers its named parameters leave free
+//!   right below its incoming `sp`, next to the words on the stack, so that
+//!   every variadic argument lies in one run of words that `va_arg` walks
+//!   (see [`crate::codegen`]).
 //! * A result comes back the way it would be passed as the first argument:
 //!   a scalar or a small struct in `a0` (and `a1`). A bigger struct is
 //!   returned through memory: the caller passes its address as a hidden
@@ -37,7 +45,7 @@ pub enum Pass {
 }
 
 impl Pass {
-    /// How many argument registers it takes.
+    /// How many argument words (registers, or stack words past `a7`) it takes.
     pub fn registers(self) -> usize {
         match self {
             Pass::Scalar | Pass::Ref => 1,
@@ -64,22 +72,34 @@ pub fn returns_in_memory(ret: &Type) -> bool {
     ret.is_record() && classify(ret) == Pass::Ref
 }
 
-/// Where each argument of a call goes: its first register number (`aN`) and
-/// how it is passed, plus the number of registers taken in all (counting the
-/// hidden result address). Every parameter type must be complete.
+/// Where each named parameter of a function goes: see [`call_arguments`].
 pub fn arguments(f: &FuncType) -> (Vec<(usize, Pass)>, usize) {
-    let mut next = usize::from(returns_in_memory(&f.ret));
-    let mut out = Vec::with_capacity(f.params.len());
-    for p in &f.params {
-        let pass = classify(p);
+    call_arguments(&f.ret, &f.params)
+}
+
+/// Where each argument of a call goes, given the function's result type and
+/// the arguments' types (a variadic call's after promotion): the number of
+/// its first word (words below [`ARG_REGS`] are registers, `aN` for word N)
+/// and how it is passed, plus the number of words taken in all (counting the
+/// hidden result address). Every type must be complete.
+pub fn call_arguments(ret: &Type, args: &[Type]) -> (Vec<(usize, Pass)>, usize) {
+    let mut next = usize::from(returns_in_memory(ret));
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        let pass = classify(a);
         out.push((next, pass));
         next += pass.registers();
     }
     (out, next)
 }
 
-/// Argument registers: `a0` to `a7`.
+/// Argument registers: `a0` to `a7`, the first words of the arguments.
 pub const ARG_REGS: usize = 8;
+
+/// How many words of `total` go on the stack.
+pub fn stack_words(total: usize) -> usize {
+    total.saturating_sub(ARG_REGS)
+}
 
 #[cfg(test)]
 mod tests {
@@ -115,6 +135,7 @@ mod tests {
         let f = FuncType {
             ret: Type::INT,
             params: vec![Type::INT, record(6), record(16), record(2)],
+            variadic: false,
         };
         let (regs, total) = arguments(&f);
         assert_eq!(
@@ -131,7 +152,24 @@ mod tests {
         let f = FuncType {
             ret: record(12),
             params: vec![Type::INT],
+            variadic: false,
         };
         assert_eq!(arguments(&f), (vec![(1, Pass::Scalar)], 2));
+        // Past a7, words go on the stack; a pair may straddle a7 and the stack.
+        let args = [
+            Type::INT,
+            Type::INT,
+            Type::INT,
+            Type::INT,
+            Type::INT,
+            Type::INT,
+            Type::INT,
+            record(8),
+            Type::INT,
+        ];
+        let (words, total) = call_arguments(&Type::INT, &args);
+        assert_eq!(words[7..], [(7, Pass::Words(2)), (9, Pass::Scalar)]);
+        assert_eq!((total, stack_words(total)), (10, 2));
+        assert_eq!(stack_words(3), 0);
     }
 }

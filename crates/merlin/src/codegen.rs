@@ -14,8 +14,9 @@
 //!   member access knows its offset, initializer lists are fully braced, and
 //!   every variable says where it lives: local `#i` of its function
 //!   (parameters first, then the declared locals and the hidden ones calls
-//!   need) or a global symbol. Every call has the right number of arguments,
-//!   and they fit `a0-a7`.
+//!   need) or a global symbol. Every call has the right number of arguments
+//!   (those `...` takes promoted), `va_end` and `va_copy` have become plain
+//!   expressions, and every compound literal has its hidden local.
 //! * Output: assembly merlin-as accepts (and so does clang): functions in
 //!   `.text`, initialized variables in `.data`, zero-initialized ones in
 //!   `.bss`, `const` ones and string literals in `.rodata`. Every function and
@@ -82,9 +83,10 @@
 //!
 //! ## Calling convention (RISC-V ILP32)
 //!
-//! * Arguments go in `a0-a7`, left to right; the result comes back in `a0`.
+//! * Arguments go in `a0-a7`, left to right, and the words past `a7` on the
+//!   stack, from `0(sp)` up at the call; the result comes back in `a0`.
 //!   Arguments and results narrower than 32 bits travel widened by their type
-//!   (sema's casts do that).
+//!   (sema's casts do that). The arguments `...` takes travel the same way.
 //! * A struct of up to 8 bytes travels in one or two registers, its bytes as
 //!   they lie in memory: it is loaded from its address word by word (put
 //!   together from smaller aligned pieces if it is not word-aligned). A
@@ -118,6 +120,9 @@
 //!          | temporaries      |  pushed and popped while evaluating expressions
 //! ```
 //!
+//! The caller's stack arguments, if any, are right above: word 8 of the
+//! arguments at `0(s0)`, word 9 at `4(s0)`, and so on.
+//!
 //! Locals are placed downwards from `-8(s0)` in order, each at the next
 //! offset aligned for its type (arrays at least to 4 bytes): an `int` takes the
 //! 4 bytes below the previous local, a `char` 1 byte, an `int a[3]` 12 bytes.
@@ -140,8 +145,36 @@
 //!
 //! A struct parameter that came in registers is stored word by word; one
 //! passed by reference is copied from the caller's copy into its slot. A
-//! function returning a big struct saves the result address (`a0`) in a
-//! hidden local.
+//! parameter on the stack is loaded from above `s0` (through `t1`) and
+//! stored into its slot like the others. A function returning a big struct
+//! saves the result address (`a0`) in a hidden local.
+//!
+//! ## Variadic functions
+//!
+//! A variadic function cannot know where its `...` arguments are until it
+//! reads them, so its prologue stores the argument registers its named
+//! parameters leave free (`a<n>` to `a7`) at the very top of its frame, right
+//! below `s0`, where the caller's stack words continue them. Every variadic
+//! argument then lies in one run of words from there up, as if all had been
+//! passed on the stack, and a `va_list` is a plain pointer that walks it (as
+//! clang does). `ra` and `s0` go below the saved registers, and the fixed
+//! part of the frame grows to a multiple of 16 that holds them all:
+//!
+//! ```text
+//!   int f(int n, ...)                    s0 ->  +-----------+
+//!     addi  sp, sp, -48                         | a7 .. a1  |  -4(s0) .. -28(s0)
+//!     sw    ra, 16(sp)    # -32(s0)             | saved ra  |  -32(s0)
+//!     sw    s0, 12(sp)    # -36(s0)             | caller s0 |  -36(s0)
+//!     addi  s0, sp, 48                          | n         |  -40(s0), locals...
+//!     sw    a1, -28(s0)   ... sw a7, -4(s0)
+//! ```
+//!
+//! `va_start(ap, n)` points `ap` at the first variadic word (`-28(s0)` here;
+//! `4*k(s0)` when the named parameters take `8 + k` words, all registers and
+//! some stack). `va_arg(ap, T)` takes the words of a `T` at `ap` and moves
+//! `ap` past them: a scalar is loaded, a small struct's value is its address
+//! right there, and a big struct's is the word there (the address of the
+//! caller's copy). `va_end` does nothing and `va_copy` copies the pointer.
 //!
 //! ## Expressions
 //!
@@ -202,13 +235,25 @@
 //! expression are still pushed (as in `x + f(y)`), `sp` is lowered to a
 //! multiple of 16 around the `call`, to keep the convention's alignment.
 //!
+//! When the arguments take more than `a0-a7`, every one of them is pushed;
+//! then `sp` goes down far enough for the stack words (keeping it aligned),
+//! each stack word is copied from its pushed argument to its place at
+//! `0(sp)`, `4(sp)`, ..., and the register words are loaded from theirs. One
+//! `addi` after the call frees the words and the pushed arguments together.
+//!
 //! ## Initializers
 //!
 //! A local scalar's initializer is an assignment. A local array or struct
 //! with an initializer list is first cleared (word by word, or with a loop
 //! when it is big), then each element or member given is stored; a struct
 //! initialized by another struct is copied. A local without an initializer is
-//! left as it is (C: indeterminate).
+//! left as it is (C: indeterminate). Sema has resolved designators already:
+//! a subobject one skips has an empty list, which stores nothing, and a
+//! union's list ends with the member it holds.
+//!
+//! A compound literal `(T){ ... }` is a hidden local initialized the same
+//! way each time the expression is evaluated; its value is the local's
+//! address (loaded for a scalar `T`).
 //!
 //! Globals and `static` locals are data: the initializer, a constant
 //! expression, is written out with `.byte`, `.half`, `.word` (`.word sym+off`
@@ -288,7 +333,18 @@ pub fn generate(prog: &Program) -> Result<String, Error> {
                 let Some(body) = &f.body else {
                     continue; // a prototype: the definition is elsewhere
                 };
-                let Some((offsets, frame)) = layout(&f.locals) else {
+                // A variadic function keeps the argument registers its named
+                // parameters leave free at the top of its frame.
+                let Type::Func(ft) = f.ty() else {
+                    unreachable!("a function's type")
+                };
+                let (_, named_words) = abi::arguments(&ft);
+                let va_save = if f.variadic {
+                    4 * (abi::ARG_REGS - named_words.min(abi::ARG_REGS)) as i32
+                } else {
+                    0
+                };
+                let Some((offsets, frame)) = layout(&f.locals, SAVED_REGS + va_save) else {
                     let msg = format!("the locals of '{}' need a stack frame larger than 2 GiB", f.name);
                     return Err(Error::new(f.pos, msg));
                 };
@@ -296,6 +352,8 @@ pub fn generate(prog: &Program) -> Result<String, Error> {
                     func: f,
                     offsets,
                     frame,
+                    named_words,
+                    va_save,
                     lines: Vec::new(),
                     depth: 0,
                     breaks: Vec::new(),
@@ -324,21 +382,20 @@ pub fn generate(prog: &Program) -> Result<String, Error> {
     Ok(file.out)
 }
 
-/// `ra` and the caller's `s0` take the top 8 bytes of every frame.
+/// `ra` and the caller's `s0` take the top 8 bytes of every frame (below the
+/// saved argument registers of a variadic function).
 const SAVED_REGS: i32 = 8;
-/// The prologue first lowers `sp` by this much, enough for `ra` and `s0` and a
-/// multiple of 16 so that `sp` stays aligned at every step.
-const SAVE_AREA: i32 = 16;
 
 /// The largest frame: offsets from `s0` and the frame size must stay `i32`s.
 const MAX_FRAME: i64 = i32::MAX as i64 & !15;
 
-/// Places every local in the frame: its offset from `s0`, and the frame size
-/// (a multiple of 16, the convention's stack alignment). `None` if the frame
-/// would be larger than [`MAX_FRAME`].
-fn layout(locals: &[Local]) -> Option<(Vec<i32>, i32)> {
+/// Places every local in the frame, below the `header` bytes at its top
+/// (`ra`, `s0` and a variadic function's saved registers): its offset from
+/// `s0`, and the frame size (a multiple of 16, the convention's stack
+/// alignment). `None` if the frame would be larger than [`MAX_FRAME`].
+fn layout(locals: &[Local], header: i32) -> Option<(Vec<i32>, i32)> {
     // In i64: each local is at most `i32::MAX` bytes, but their sum need not be.
-    let mut off = -i64::from(SAVED_REGS);
+    let mut off = -i64::from(header);
     let mut offsets = Vec::with_capacity(locals.len());
     for l in locals {
         let mut size = l.ty.size().expect("sema: locals have complete types");
@@ -361,6 +418,41 @@ fn layout(locals: &[Local]) -> Option<(Vec<i32>, i32)> {
         offsets.push(off as i32);
     }
     Some((offsets, ((-off + 15) & !15) as i32))
+}
+
+/// How a call's arguments travel.
+struct ArgLayout {
+    /// The arguments' types: the parameters', then for `...` the (promoted)
+    /// arguments' own.
+    types: Vec<Type>,
+    /// Each argument's first word and how it is passed (see [`abi`]).
+    words: Vec<(usize, Pass)>,
+    /// How many words they take in all, with a hidden result address.
+    used: usize,
+}
+
+impl ArgLayout {
+    fn new(ft: &FuncType, args: &[Expr]) -> ArgLayout {
+        let mut types = ft.params.clone();
+        types.extend(args[ft.params.len()..].iter().map(|a| a.ty.clone()));
+        let (words, used) = abi::call_arguments(&ft.ret, &types);
+        ArgLayout { types, words, used }
+    }
+}
+
+/// Where word `word` of a call's arguments is (see [`abi`]): a register, or
+/// an offset from the `sp` of the call (the callee's `s0`).
+enum ArgWord {
+    Reg(String),
+    Stack(i32),
+}
+
+fn arg_word(word: usize) -> ArgWord {
+    if word < abi::ARG_REGS {
+        ArgWord::Reg(format!("a{word}"))
+    } else {
+        ArgWord::Stack(4 * (word - abi::ARG_REGS) as i32)
+    }
 }
 
 /// Does `v` fit a 12-bit signed immediate (`addi`, `lw`, `sw`)?
@@ -484,6 +576,21 @@ impl FileGen {
     /// The directives for an object of type `ty` initialized by `init`.
     fn data(&mut self, ty: &Type, init: &Init, out: &mut Vec<String>) {
         match (ty.unqual(), init) {
+            // A subobject a designator skipped: zero.
+            (_, Init::List(items, _)) if items.is_empty() => {
+                out.push(format!(".zero {}", ty.size().expect("a complete type")));
+            }
+            (Type::Record(r), Init::List(items, _)) if r.union => {
+                // The member the union is initialized with is the last item.
+                let body = r.body().expect("sema: definitions have complete types");
+                let k = items.len() - 1;
+                let m = &body.members[k];
+                self.data(&m.ty, &items[k], out);
+                let size = m.ty.size().expect("complete member");
+                if body.size > size {
+                    out.push(format!(".zero {}", body.size - size));
+                }
+            }
             (Type::Record(r), Init::List(items, _)) => {
                 // Members in order (sema's list is fully braced; a union's has
                 // at most its first member), with the padding between them and
@@ -647,6 +754,11 @@ struct FuncGen<'a, 'f> {
     /// Offset from `s0` of each local.
     offsets: Vec<i32>,
     frame: i32,
+    /// How many argument words the named parameters take (see [`abi`]).
+    named_words: usize,
+    /// In a variadic function, the bytes of argument registers saved at the
+    /// top of the frame (those the named parameters leave free); else 0.
+    va_save: i32,
     lines: Vec<Line>,
     /// How many 4-byte temporaries expression evaluation has pushed right now.
     /// Always 0 between statements.
@@ -763,7 +875,10 @@ impl<'a> FuncGen<'a, '_> {
         let f = self.func;
 
         // A header that maps every local to its slot, for whoever reads the output.
-        let params: Vec<String> = f.params.iter().map(|p| p.ty.declare(&p.name)).collect();
+        let mut params: Vec<String> = f.params.iter().map(|p| p.ty.declare(&p.name)).collect();
+        if f.variadic {
+            params.push("...".to_string());
+        }
         let params = if params.is_empty() {
             "void".to_string()
         } else {
@@ -774,6 +889,13 @@ impl<'a> FuncGen<'a, '_> {
             "{}: frame {frame} bytes",
             f.ret.declare(&format!("{}({params})", f.name))
         ));
+        if self.va_save > 0 {
+            let regs = match self.named_words {
+                7 => "a7".to_string(),
+                n => format!("a{n}-a7"),
+            };
+            self.comment(format!("    {}(s0)  {regs}, saved for va_arg", -self.va_save));
+        }
         for (i, l) in f.locals.iter().enumerate() {
             let off = self.offsets[i];
             let what = if i < f.params.len() {
@@ -795,15 +917,28 @@ impl<'a> FuncGen<'a, '_> {
         self.label(&f.name);
 
         // Prologue: save ra and the caller's s0, set up s0, make room for locals.
-        self.add_imm("sp", "sp", -SAVE_AREA);
-        self.ins("sw", format!("ra, {}(sp)", SAVE_AREA - 4));
-        self.ins("sw", format!("s0, {}(sp)", SAVE_AREA - 8));
-        self.add_imm("s0", "sp", SAVE_AREA);
-        if frame > SAVE_AREA {
-            self.add_imm("sp", "sp", -(frame - SAVE_AREA));
+        let (top, va_save) = (self.top(), self.va_save);
+        self.add_imm("sp", "sp", -top);
+        self.ins("sw", format!("ra, {}(sp)", top - va_save - 4));
+        self.ins("sw", format!("s0, {}(sp)", top - va_save - 8));
+        self.add_imm("s0", "sp", top);
+        if frame > top {
+            self.add_imm("sp", "sp", -(frame - top));
         }
-        // Parameters arrive in a0-a7 (see [`abi`]); give them their slots like
-        // any local. A big struct result's address comes first, in a0.
+        // A variadic function stores the argument registers its named
+        // parameters leave free right below s0, where the caller's stack
+        // words continue them: every variadic argument is then in one run
+        // of words from there up, which `va_arg` walks.
+        if f.variadic && self.named_words < abi::ARG_REGS {
+            self.comment("the variadic arguments in registers, next to those on the stack");
+            for r in self.named_words..abi::ARG_REGS {
+                let off = -4 * (abi::ARG_REGS - r) as i32;
+                self.ins("sw", format!("a{r}, {off}(s0)"));
+            }
+        }
+        // Parameters arrive in a0-a7 and then on the stack, from 0(s0) up
+        // (see [`abi`]); give them their slots like any local. A big struct
+        // result's address comes first, in a0.
         let Type::Func(ft) = f.ty() else {
             unreachable!("a function's type")
         };
@@ -811,16 +946,20 @@ impl<'a> FuncGen<'a, '_> {
             let off = self.offset(ret_ptr);
             self.access_local("sw", "a0", off);
         }
-        let (regs, _) = abi::arguments(&ft);
-        for (i, (p, (reg, pass))) in f.params.iter().zip(regs).enumerate() {
+        let (words, _) = abi::arguments(&ft);
+        for (i, (p, (word, pass))) in f.params.iter().zip(words).enumerate() {
             let off = self.offsets[i];
             match pass {
-                Pass::Scalar => self.access_local(store_op(&p.ty), &format!("a{reg}"), off),
+                Pass::Scalar => {
+                    let reg = self.incoming(word);
+                    self.access_local(store_op(&p.ty), &reg, off);
+                }
                 // A small struct: its words, as they lie in memory (the slot is
                 // a whole number of words).
                 Pass::Words(n) => {
                     for w in 0..n {
-                        self.access_local("sw", &format!("a{}", reg + w as usize), off + 4 * w as i32);
+                        let reg = self.incoming(word + w as usize);
+                        self.access_local("sw", &reg, off + 4 * w as i32);
                     }
                 }
                 // A big struct: the caller's copy, at the address in the
@@ -828,8 +967,17 @@ impl<'a> FuncGen<'a, '_> {
                 // copy in place would do too; a copy keeps every parameter
                 // in the frame.)
                 Pass::Ref => {
+                    let src = match arg_word(word) {
+                        ArgWord::Reg(r) => r,
+                        // Every register argument is in its slot by now, so
+                        // a0 is free.
+                        ArgWord::Stack(at) => {
+                            self.ins("lw", format!("a0, {at}(s0)"));
+                            "a0".to_string()
+                        }
+                    };
                     self.add_imm("t4", "s0", off);
-                    self.copy("t4", &format!("a{reg}"), &p.ty);
+                    self.copy("t4", &src, &p.ty);
                 }
             }
         }
@@ -850,11 +998,30 @@ impl<'a> FuncGen<'a, '_> {
         // size), restore ra and s0, return.
         let ret = self.ret_label.clone();
         self.label(&ret);
-        self.ins("addi", format!("sp, s0, {}", -SAVE_AREA));
-        self.ins("lw", format!("ra, {}(sp)", SAVE_AREA - 4));
-        self.ins("lw", format!("s0, {}(sp)", SAVE_AREA - 8));
-        self.ins("addi", format!("sp, sp, {SAVE_AREA}"));
+        self.ins("addi", format!("sp, s0, {}", -top));
+        self.ins("lw", format!("ra, {}(sp)", top - va_save - 4));
+        self.ins("lw", format!("s0, {}(sp)", top - va_save - 8));
+        self.ins("addi", format!("sp, sp, {top}"));
         self.ins("ret", "");
+    }
+
+    /// The top of the frame, which the prologue sets up first: `ra`, `s0`
+    /// and a variadic function's saved registers, rounded up to 16 bytes so
+    /// that `sp` stays aligned at every step. 16 for most functions.
+    fn top(&self) -> i32 {
+        (SAVED_REGS + self.va_save + 15) & !15
+    }
+
+    /// In the prologue: the register holding argument word `word`. A word
+    /// on the stack is loaded into `t1` first.
+    fn incoming(&mut self, word: usize) -> String {
+        match arg_word(word) {
+            ArgWord::Reg(r) => r,
+            ArgWord::Stack(at) => {
+                self.ins("lw", format!("t1, {at}(s0)"));
+                "t1".to_string()
+            }
+        }
     }
 
     // ---- statements ----
@@ -1109,6 +1276,9 @@ impl<'a> FuncGen<'a, '_> {
     /// leaves out is zero already.
     fn init_local(&mut self, ty: &Type, init: &'a Init, off: i32) {
         match (ty.unqual(), init) {
+            // Zero: cleared already. (In a union, every item but the last
+            // is one of these.)
+            (_, Init::List(items, _)) if items.is_empty() => {}
             (Type::Array(elem, _), Init::List(items, _)) => {
                 let size = elem.size().unwrap() as i32;
                 for (i, item) in items.iter().enumerate() {
@@ -1355,6 +1525,57 @@ impl<'a> FuncGen<'a, '_> {
                 result,
                 arg_copies,
             } => self.call(callee, args, *result, arg_copies),
+            ExprKind::CompoundLit { init, local } => {
+                self.compound_literal(&e.ty, init, *local);
+                if !e.ty.is_addressed() {
+                    self.load(&e.ty);
+                }
+            }
+            ExprKind::VaStart { ap, .. } => self.va_start(ap),
+            ExprKind::VaArg(ap) => self.va_arg(ap, &e.ty),
+            ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => unreachable!("sema rewrites them"),
+        }
+    }
+
+    /// `(type){ ... }`: initializes its hidden local (cleared first, like a
+    /// local initialized by a list) and leaves its address in `a0`.
+    fn compound_literal(&mut self, ty: &Type, init: &'a Init, local: Option<LocalId>) {
+        let off = self.offset(local.expect("sema gives compound literals a local"));
+        self.comment(format!("compound literal ({ty})"));
+        if ty.is_array() || ty.is_record() {
+            self.clear_local(off, ty.size().expect("complete") as i32);
+        }
+        self.init_local(ty, init, off);
+        self.add_imm("a0", "s0", off);
+    }
+
+    /// `va_start(ap, last)`: ap = the address of the first variadic
+    /// argument, in the registers saved at the top of the frame, or else
+    /// among the caller's stack words, past the named ones.
+    fn va_start(&mut self, ap: &'a Expr) {
+        let place = self.place(ap);
+        let first = match arg_word(self.named_words) {
+            ArgWord::Reg(_) => -self.va_save,
+            ArgWord::Stack(at) => at,
+        };
+        self.add_imm("a0", "s0", first);
+        self.store_place(place, &ap.ty);
+    }
+
+    /// `va_arg(ap, ty)`: the argument is where ap points, and ap moves past
+    /// its words. A scalar is loaded from there; a small struct's value is
+    /// its address, there; a big one's address is the word there.
+    fn va_arg(&mut self, ap: &'a Expr, ty: &Type) {
+        let pass = abi::classify(ty);
+        let place = self.place(ap);
+        self.load_place(&place, &ap.ty);
+        self.ins("mv", "t1, a0");
+        self.add_imm("a0", "a0", 4 * pass.registers() as i32);
+        self.store_place(place, &ap.ty);
+        match pass {
+            Pass::Scalar => self.ins(load_op(ty), "a0, 0(t1)"),
+            Pass::Words(_) => self.ins("mv", "a0, t1"),
+            Pass::Ref => self.ins("lw", "a0, 0(t1)"),
         }
     }
 
@@ -1380,6 +1601,7 @@ impl<'a> FuncGen<'a, '_> {
             // The address of *p is p.
             ExprKind::Deref(p) => self.expr(p),
             ExprKind::Str(_) => self.expr(e),
+            ExprKind::CompoundLit { init, local } => self.compound_literal(&e.ty, init, *local),
             // A member is at its offset from the start of the struct. The
             // struct's value is its address (also when it is not an lvalue,
             // like a call's result, kept in a hidden local), and `p->m`'s `p`
@@ -1569,11 +1791,21 @@ impl<'a> FuncGen<'a, '_> {
             .and_then(Type::func_type)
             .expect("sema: the callee is a function")
             .clone();
-        let (regs, used) = abi::arguments(&ft);
-        assert!(used <= abi::ARG_REGS, "sema checks that the arguments fit a0-a7");
+        let layout = ArgLayout::new(&ft, args);
+        let (types, regs, used) = (&layout.types, &layout.words, layout.used);
+        let direct = callee.direct_callee();
+        if used > abi::ARG_REGS {
+            let hidden = if abi::returns_in_memory(&ft.ret) {
+                result
+            } else {
+                None
+            };
+            self.call_with_stack(callee, args, copies, hidden, &layout);
+            self.call_result(&ft, result);
+            return;
+        }
         // Through a pointer: the function's address is evaluated first and
         // waits on the stack, under the arguments, until they are loaded.
-        let direct = callee.direct_callee();
         if direct.is_none() {
             self.expr(callee);
             if args.is_empty() {
@@ -1598,7 +1830,7 @@ impl<'a> FuncGen<'a, '_> {
                 (r, Pass::Scalar | Pass::Ref) => self.ins("mv", format!("a{r}, a0")),
                 (r, Pass::Words(n)) => {
                     self.ins("mv", "t1, a0");
-                    self.load_words("t1", r, n, &ft.params[last]);
+                    self.load_words("t1", r, n, &types[last]);
                 }
             }
             for i in (0..last).rev() {
@@ -1606,7 +1838,7 @@ impl<'a> FuncGen<'a, '_> {
                     (r, Pass::Scalar | Pass::Ref) => self.pop(&format!("a{r}")),
                     (r, Pass::Words(n)) => {
                         self.pop("t1");
-                        self.load_words("t1", r, n, &ft.params[i]);
+                        self.load_words("t1", r, n, &types[i]);
                     }
                 }
             }
@@ -1626,16 +1858,26 @@ impl<'a> FuncGen<'a, '_> {
         if pad != 0 {
             self.ins("addi", format!("sp, sp, {}", -pad));
         }
+        self.jump_to(direct);
+        if pad != 0 {
+            self.ins("addi", format!("sp, sp, {pad}"));
+        }
+        self.call_result(&ft, result);
+    }
+
+    /// The call instruction: `call f`, or `jalr t1` through a pointer.
+    fn jump_to(&mut self, direct: Option<&str>) {
         match direct {
             // `call` is `auipc ra` + `jalr ra`: two words.
             Some(name) => self.ins_sized(8, "call", name),
             None => self.ins("jalr", "t1"),
         }
-        if pad != 0 {
-            self.ins("addi", format!("sp, sp, {pad}"));
-        }
-        // A struct result is kept in its hidden local (a small one arrives in
-        // a0/a1 and is stored there); the call's value is that address.
+    }
+
+    /// After a call: a struct result is kept in its hidden local (a small
+    /// one arrives in a0/a1 and is stored there); the call's value is that
+    /// address.
+    fn call_result(&mut self, ft: &FuncType, result: Option<LocalId>) {
         if let Some(result) = result {
             let off = self.offset(result);
             if let Pass::Words(n) = abi::classify(&ft.ret) {
@@ -1645,6 +1887,105 @@ impl<'a> FuncGen<'a, '_> {
             }
             self.add_imm("a0", "s0", off);
         }
+    }
+
+    /// A call whose arguments take more than `a0-a7` (`used` words, placed
+    /// as `words` says): every argument is evaluated and pushed, left to
+    /// right; then room is made below them for the stack words, keeping
+    /// `sp` 16-byte aligned at the call, and each word is copied to its
+    /// place, on the stack or in a register:
+    ///
+    /// ```text
+    ///     <arg 0>  push ... <arg n-1>  push
+    ///     addi sp, sp, -area           # the outgoing words: 0(sp), 4(sp), ...
+    ///     lw   t1, <arg 8>(sp)         # a stack word
+    ///     sw   t1, 0(sp)
+    ///     lw   a0, <arg 0>(sp)         # a register
+    ///     ...
+    ///     call f
+    ///     addi sp, sp, area + 4n       # the words and the pushed arguments
+    /// ```
+    fn call_with_stack(
+        &mut self,
+        callee: &'a Expr,
+        args: &'a [Expr],
+        copies: &[Option<LocalId>],
+        // The hidden local for a big struct result, if any.
+        result: Option<LocalId>,
+        layout: &ArgLayout,
+    ) {
+        let (types, words, used) = (&layout.types, &layout.words, layout.used);
+        let direct = callee.direct_callee();
+        if direct.is_none() {
+            self.expr(callee);
+            self.push();
+        }
+        for (i, a) in args.iter().enumerate() {
+            self.argument(a, copies[i]);
+            self.push();
+        }
+        let n = args.len() as i32;
+        let pushed = 4 * self.depth as i32;
+        let stack = 4 * abi::stack_words(used) as i32;
+        let area = (pushed + stack + 15) / 16 * 16 - pushed;
+        self.comment(match abi::stack_words(used) {
+            1 => "1 argument word goes on the stack".to_string(),
+            n => format!("{n} argument words go on the stack"),
+        });
+        self.add_imm("sp", "sp", -area);
+        // Where argument i was pushed: the last one is right above the area.
+        let temp = |i: usize| area + 4 * (n - 1 - i as i32);
+        // The stack words first (with t1, t2 and t0), then the registers.
+        for (i, &(word, pass)) in words.iter().enumerate() {
+            match pass {
+                Pass::Scalar | Pass::Ref => {
+                    if let ArgWord::Stack(at) = arg_word(word) {
+                        self.ins("lw", format!("t1, {}(sp)", temp(i)));
+                        self.ins("sw", format!("t1, {at}(sp)"));
+                    }
+                }
+                Pass::Words(nw) => {
+                    for w in 0..nw {
+                        if let ArgWord::Stack(at) = arg_word(word + w as usize) {
+                            self.ins("lw", format!("t1, {}(sp)", temp(i)));
+                            self.load_word("t2", "t1", w, &types[i]);
+                            self.ins("sw", format!("t2, {at}(sp)"));
+                        }
+                    }
+                }
+            }
+        }
+        for (i, &(word, pass)) in words.iter().enumerate() {
+            match pass {
+                Pass::Scalar | Pass::Ref => {
+                    if let ArgWord::Reg(r) = arg_word(word) {
+                        self.ins("lw", format!("{r}, {}(sp)", temp(i)));
+                    }
+                }
+                Pass::Words(nw) => {
+                    if word < abi::ARG_REGS {
+                        self.ins("lw", format!("t1, {}(sp)", temp(i)));
+                    }
+                    for w in 0..nw {
+                        if let ArgWord::Reg(r) = arg_word(word + w as usize) {
+                            self.load_word(&r, "t1", w, &types[i]);
+                        }
+                    }
+                }
+            }
+        }
+        // A big struct result goes to the hidden local: its address in a0.
+        if let Some(result) = result {
+            let off = self.offset(result);
+            self.add_imm("a0", "s0", off);
+        }
+        if direct.is_none() {
+            self.ins("lw", format!("t1, {}(sp)", area + 4 * n));
+        }
+        self.jump_to(direct);
+        let popped = n + i32::from(direct.is_none());
+        self.add_imm("sp", "sp", area + 4 * popped);
+        self.depth -= popped as u32;
     }
 
     /// Evaluates an argument into `a0`: a scalar's value, or a struct's
@@ -1848,7 +2189,7 @@ mod tests {
     fn locals(decls: &str) -> (Vec<i32>, i32) {
         let p = crate::parse(&format!("int f() {{ {decls} }}")).unwrap();
         let f = p.funcs().next().unwrap();
-        layout(&f.locals).unwrap()
+        layout(&f.locals, SAVED_REGS).unwrap()
     }
 
     #[test]
@@ -1876,7 +2217,10 @@ mod tests {
             "1:5: the locals of 'main' need a stack frame larger than 2 GiB"
         );
         let p = crate::parse("int f() { char a[2147483600]; }").unwrap();
-        assert_eq!(layout(&p.funcs().next().unwrap().locals).unwrap().1, 2147483616);
+        assert_eq!(
+            layout(&p.funcs().next().unwrap().locals, SAVED_REGS).unwrap().1,
+            2147483616
+        );
     }
 
     #[test]

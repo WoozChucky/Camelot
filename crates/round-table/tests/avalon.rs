@@ -37,7 +37,7 @@ fn life_cycle() {
     assert_eq!(
         ok(
             addr,
-            &["create", "--name", "echo", "--ram", "64", "--clock", "1MHz", &echo]
+            &["create", "--name", "echo", "--ram", "64", "--clock", "1MHz", "--harts", "2", &echo]
         ),
         "created VM 1 (echo)\n"
     );
@@ -65,6 +65,7 @@ name     echo
 state    created
 RAM      64 MiB
 clock    1 MHz (real time)
+harts    2
 steps    0
 disks    none
 nets     none

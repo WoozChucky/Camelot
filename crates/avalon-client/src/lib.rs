@@ -29,7 +29,8 @@ pub mod parse;
 pub mod show;
 
 pub use parse::{
-    parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_hostfwd, parse_net, parse_ram,
+    parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net,
+    parse_ram,
 };
 pub use show::{device_name, disk_source_text, format_hz, format_size, mac_text};
 

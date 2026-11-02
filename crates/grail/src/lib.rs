@@ -29,7 +29,10 @@ pub mod window;
 
 use block::{BlockBackend, BlockDevice};
 use bus::{Bus, Exit, MAX_DISKS, MAX_NETS};
-pub use config::{parse_clock, parse_ram_mib, DiskConfig, MachineConfig, NetConfig, DEFAULT_RAM_SIZE};
+pub use config::{
+    parse_clock, parse_harts, parse_ram_mib, DiskConfig, MachineConfig, NetConfig, DEFAULT_RAM_SIZE,
+    MAX_HARTS,
+};
 use cpu::Cpu;
 use keyboard::KeyEvent;
 use net::{MacAddr, NetBackend, NetDevice};
@@ -192,9 +195,10 @@ impl Machine {
     }
 
     /// Runs at most `steps` steps and returns how many ran, without ever sleeping: the
-    /// building block for a host that schedules machines itself. Stops early, right after
-    /// the instruction that did it, when the program exits or writes `FB_PRESENT`, so the
-    /// host can show or dump that exact frame.
+    /// building block for a host that schedules machines itself. A step runs one
+    /// instruction on every hart ([`Cpu::step`]). Stops early when the program exits, or
+    /// at the end of the step that wrote `FB_PRESENT` (right after the instruction that
+    /// did it, on a one-hart machine), so the host can show or dump that frame.
     ///
     /// With a real-time clock it also stops once the machine is ~1 ms ahead of the wall
     /// clock (it may then run 0 steps); [`Machine::pace_delay`] says how long to wait
@@ -241,24 +245,18 @@ impl Machine {
         let mut n = 0;
         while n < budget && self.cpu.bus.exit.is_none() {
             if paced {
-                // Parked in wfi: let the idle ticks of this batch pass at once, keeping one
-                // step for the wake-up check. The pacer then sleeps them off in real time.
+                // Every hart parked in wfi: let the idle ticks of this batch pass at once,
+                // keeping one step for the wake-up check. The pacer then sleeps them off
+                // in real time.
                 let skipped = self.cpu.idle(budget - n - 1);
                 if skipped > 0 {
                     // Network cards poll by the step: the skipped ones count too, or a
                     // card would poll only every few hundred batches while the guest idles.
-                    // What they receive breaks an LR/SC reservation, as in `Cpu::step`.
-                    let (bus, reservation) = (&mut self.cpu.bus, &mut self.cpu.reservation);
-                    for nic in &mut bus.nets {
-                        nic.skip(skipped, &mut bus.ram, &mut |paddr, len| {
-                            reservation.snoop(paddr, len)
-                        });
-                    }
+                    self.cpu.bus.skip(skipped);
                 }
                 n += skipped;
             }
-            trace(&self.cpu);
-            self.cpu.step();
+            self.cpu.step_traced(trace);
             n += 1;
             if STOP_ON_PRESENT && self.cpu.bus.fb.present_pending() {
                 break;
