@@ -224,7 +224,26 @@ Details:
 | 0x3000_1004 | `KBD_DATA` (RO) | pops one event: bits [7:0] key code, bit 8 = 1 on release, bit 9 = shift, bit 10 = ctrl. 0 if empty |
 | 0x3000_1008 | `KBD_CTRL` | bit 0 = interrupt enable (PLIC source 2, section 7.1) |
 
-Key codes: printable ASCII for printable keys, then 0x80+ for Enter (0x0A uses ASCII), arrows (0x80-0x83 up/down/left/right), Esc (0x1B), Backspace (0x08), F1-F12 (0x90-0x9B). The key events come from the framebuffer window; without a window, the UART remains the text input.
+Key codes:
+
+| Key | Code |
+|---|---|
+| Printable keys | the ASCII character typed (0x20-0x7E) |
+| Backspace, Tab, Enter, Esc | 0x08, 0x09, 0x0A, 0x1B (ASCII) |
+| Up, Down, Left, Right | 0x80, 0x81, 0x82, 0x83 |
+| F1-F12 | 0x90-0x9B |
+
+Code 0 never occurs, so a `KBD_DATA` of 0 always means "empty". Bits 31:11 read as 0.
+
+Details:
+
+- The registers are 32-bit only: byte or halfword accesses in 0x3000_1000 - 0x3000_1FFF raise access faults (and pop nothing). Unused offsets read as 0 and ignore writes, as do writes to `KBD_STATUS` and `KBD_DATA`. `KBD_CTRL` bits other than bit 0 are reserved, read as 0; it resets to 0.
+- Events wait in a FIFO of 64. An event that arrives while it is full is dropped (the older ones are kept).
+- **Interrupt**: the keyboard holds PLIC source 2 high while `KBD_CTRL.0` and `KBD_STATUS.0` are both set, so reading `KBD_DATA` until `KBD_STATUS.0` clears lowers it. As with the UART, a handler may pop one event per interrupt and let the line raise the next one.
+- **Printable keys** report the character the host keyboard layout types with the current Shift and Caps Lock state, so Shift+a gives 'A' (0x41) with bit 9 set and Shift+1 gives '!' on a US layout. Ctrl does not change the code: Ctrl+C is 'c' with bit 10 set, not 0x03. Keys that type no ASCII character (dead keys, accented letters, Insert, Home, ...) send no events.
+- Shift and Ctrl (and Alt) send no events of their own; they only set bits 9 and 10 of other keys' events, as held at that moment. Ctrl+Alt is AltGr on Windows: it types the layout's AltGr character and does not set bit 10.
+- A release carries the same code as its press, even if Shift changed in between. A held key auto-repeats as more press events. When the window loses focus, every key it saw go down gets a release event, so none stays stuck.
+- Grail delivers the events typed into the framebuffer window between instruction slices (section 9.3). Without a window (headless) nothing produces events and the device stays empty; the UART remains the text input. Hosts that embed Grail as a library inject events with `Machine::key_event`, the same entry point the window uses.
 
 ## 10. Toolchain (all our own)
 

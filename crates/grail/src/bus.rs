@@ -1,7 +1,8 @@
 //! Physical address space. See spec section 7 for the memory map.
 
-use crate::devices::{Clint, Plic, TestDevice, Uart, UART_IRQ};
+use crate::devices::{Clint, Plic, TestDevice, Uart, KBD_IRQ, UART_IRQ};
 use crate::framebuffer::{Framebuffer, VRAM_SIZE};
+use crate::keyboard::Keyboard;
 
 pub const BOOT_ROM_BASE: u32 = 0x0000_1000;
 pub const TEST_DEV_BASE: u32 = 0x0010_0000;
@@ -13,6 +14,8 @@ pub const UART_BASE: u32 = 0x1000_0000;
 pub const UART_SIZE: u32 = 0x100;
 pub const FB_CTRL_BASE: u32 = 0x3000_0000;
 pub const FB_CTRL_SIZE: u32 = 0x1000;
+pub const KBD_BASE: u32 = 0x3000_1000;
+pub const KBD_SIZE: u32 = 0x1000;
 pub const VRAM_BASE: u32 = 0x3100_0000;
 pub const RAM_BASE: u32 = 0x8000_0000;
 
@@ -34,6 +37,7 @@ pub struct Bus {
     pub plic: Plic,
     pub uart: Uart,
     pub fb: Framebuffer,
+    pub kbd: Keyboard,
     pub test: TestDevice,
     /// Address of the riscv-tests `tohost` symbol, if the loaded ELF has one.
     pub tohost: Option<u32>,
@@ -50,6 +54,7 @@ impl Bus {
             plic: Plic::default(),
             uart: Uart::default(),
             fb: Framebuffer::default(),
+            kbd: Keyboard::default(),
             test: TestDevice,
             tohost: None,
             exit: None,
@@ -73,6 +78,7 @@ impl Bus {
     pub fn update_interrupts(&mut self) {
         let uart = self.uart.irq();
         self.plic.set_level(UART_IRQ, uart);
+        self.plic.set_level(KBD_IRQ, self.kbd.irq());
     }
 
     fn ram_range(&self, addr: u32, size: u32) -> Option<usize> {
@@ -128,6 +134,7 @@ impl Bus {
             a if (FB_CTRL_BASE..FB_CTRL_BASE + FB_CTRL_SIZE).contains(&a) => {
                 self.fb.read(a - FB_CTRL_BASE, size)
             }
+            a if (KBD_BASE..KBD_BASE + KBD_SIZE).contains(&a) => self.kbd.read(a - KBD_BASE, size),
             a if (TEST_DEV_BASE..TEST_DEV_BASE + 0x1000).contains(&a) => Ok(0),
             _ => Err(BusFault),
         }
@@ -151,6 +158,7 @@ impl Bus {
             a if (FB_CTRL_BASE..FB_CTRL_BASE + FB_CTRL_SIZE).contains(&a) => {
                 self.fb.write(a - FB_CTRL_BASE, size, val)
             }
+            a if (KBD_BASE..KBD_BASE + KBD_SIZE).contains(&a) => self.kbd.write(a - KBD_BASE, size, val),
             a if (TEST_DEV_BASE..TEST_DEV_BASE + 0x1000).contains(&a) => {
                 if let Some(e) = self.test.write(a - TEST_DEV_BASE, val) {
                     self.exit = Some(e);
@@ -238,6 +246,26 @@ mod tests {
         bus.write(FB_CTRL_BASE + 0x14, 4, 1).unwrap();
         assert!(bus.fb.take_present());
         assert_eq!(bus.read(FB_CTRL_BASE, 1), Err(BusFault));
-        assert_eq!(bus.read(FB_CTRL_BASE + FB_CTRL_SIZE, 4), Err(BusFault));
+        assert_eq!(bus.read(FB_CTRL_BASE + 0xffc, 4), Ok(0));
+    }
+
+    #[test]
+    fn keyboard_registers_on_the_bus() {
+        use crate::keyboard::KeyEvent;
+        let mut bus = Bus::new(4096);
+        assert_eq!(bus.read(KBD_BASE, 4), Ok(0));
+        assert_eq!(bus.read(KBD_BASE + 4, 4), Ok(0));
+        bus.kbd.push(KeyEvent::press(b'k').with_shift(true));
+        assert_eq!(bus.read(KBD_BASE, 4), Ok(1));
+        assert_eq!(bus.read(KBD_BASE + 4, 4), Ok(0x26b));
+        assert_eq!(bus.read(KBD_BASE, 4), Ok(0));
+        bus.write(KBD_BASE + 8, 4, 1).unwrap();
+        assert_eq!(bus.read(KBD_BASE + 8, 4), Ok(1));
+        assert_eq!(bus.read(KBD_BASE + 0xffc, 4), Ok(0));
+        assert_eq!(bus.read(KBD_BASE, 1), Err(BusFault));
+        assert_eq!(bus.write(KBD_BASE + 8, 2, 0), Err(BusFault));
+        assert_eq!(bus.read(KBD_BASE + KBD_SIZE, 4), Err(BusFault));
+        // Data accesses only.
+        assert_eq!(bus.read_mem(KBD_BASE, 4), Err(BusFault));
     }
 }
