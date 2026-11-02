@@ -94,7 +94,7 @@ pub fn arith_type(op: BinOp, l: &Type, r: &Type) -> Option<Type> {
 /// designates the function, counts too, so that `&f` works).
 fn is_lvalue(e: &Expr) -> bool {
     match &e.kind {
-        ExprKind::Var { .. } | ExprKind::Deref(_) | ExprKind::Str(_) => true,
+        ExprKind::Var { .. } | ExprKind::Deref(_) | ExprKind::Str(_) | ExprKind::CompoundLit { .. } => true,
         ExprKind::Member { base, arrow, .. } => *arrow || is_lvalue(base),
         _ => false,
     }
@@ -264,8 +264,7 @@ impl Checker {
         if f.body.is_none() {
             return;
         }
-        // A definition needs complete parameter and result types, and its
-        // arguments must fit the argument registers.
+        // A definition needs complete parameter and result types.
         for p in &f.params {
             if p.ty.is_record() && p.ty.size().is_none() {
                 self.err(p.pos, format!("variable has incomplete type '{}'", p.ty));
@@ -278,15 +277,15 @@ impl Checker {
                 format!("incomplete result type '{}' in function definition", f.ret),
             );
         }
-        let Type::Func(ft) = f.ty() else { unreachable!() };
-        if ret_complete && ft.params.iter().all(|p| p.size().is_some()) {
-            self.check_registers(&ft, f.pos);
-        }
         let body = f.body.as_mut().expect("checked above");
         let mut c = FnChecker {
             globals: &self.globals,
             func: &f.name,
             ret: &f.ret,
+            last_param: f
+                .variadic
+                .then(|| f.params.last().map(|p| p.name.clone()))
+                .flatten(),
             scopes: vec![HashMap::new()],
             locals: Vec::new(),
             loop_depth: 0,
@@ -314,19 +313,6 @@ impl Checker {
             }
         }
         f.locals = c.locals;
-    }
-
-    /// Arguments travel only in `a0-a7`: a function whose arguments (a struct
-    /// may take two registers, a big struct result one more) need more is an
-    /// error.
-    fn check_registers(&mut self, f: &FuncType, pos: Pos) {
-        let (_, used) = abi::arguments(f);
-        if used > abi::ARG_REGS {
-            self.err(
-                pos,
-                format!("the arguments need {used} registers; merlin passes arguments only in a0-a7"),
-            );
-        }
     }
 
     fn global_var(&mut self, d: &mut Declarator, at: (usize, usize)) {
@@ -487,6 +473,23 @@ struct SwitchCtx {
 /// An element of an initializer list not yet matched to a subobject, and
 /// whether its expression has been checked already (to see if it
 /// initializes a struct as a whole).
+/// How [`FnChecker::fill`] fills an aggregate.
+enum Fill {
+    /// From its own braced list: designators in it are for it.
+    Braced,
+    /// By brace elision, from the enclosing list's items: a designator ends
+    /// it.
+    Elided,
+    /// From the rest of a designation that ran into it (`.a.b = 1` fills
+    /// `a` from `.b = 1`), changing what it had been initialized with, if
+    /// anything; then by brace elision.
+    Designated(Vec<Designator>, Option<Init>),
+}
+
+/// Array designators go up to this (exclusive): each element up to the
+/// designated one gets an item in the initializer.
+const MAX_DESIGNATED: i64 = 1 << 20;
+
 struct Pending {
     init: Init,
     checked: bool,
@@ -497,6 +500,9 @@ struct FnChecker<'a> {
     /// The function being checked (empty at file scope).
     func: &'a str,
     ret: &'a Type,
+    /// In a variadic function, its last named parameter (what `va_start`
+    /// names).
+    last_param: Option<String>,
     /// Block scopes, innermost last: names to where they live, their type and
     /// where they were declared.
     scopes: Vec<HashMap<String, (VarRef, Type, Pos)>>,
@@ -524,6 +530,7 @@ impl<'a> FnChecker<'a> {
             globals,
             func: "",
             ret: &VOID,
+            last_param: None,
             scopes: Vec::new(),
             locals: Vec::new(),
             loop_depth: 0,
@@ -858,6 +865,10 @@ impl<'a> FnChecker<'a> {
             return self.init_expr(ty, e, constant, false);
         }
         if !ty.is_array() && !ty.is_record() {
+            if let Init::Designated(d, _) = &mut items[0] {
+                let first = &mut d[0];
+                self.designator(ty, first)?;
+            }
             let what = if matches!(items[0], Init::List(..)) {
                 "too many braces around scalar initializer"
             } else {
@@ -869,7 +880,7 @@ impl<'a> FnChecker<'a> {
             .into_iter()
             .map(|init| Pending { init, checked: false })
             .collect();
-        let list = self.fill(ty, &mut queue, constant, pos)?;
+        let list = self.fill(ty, &mut queue, constant, pos, Fill::Braced)?;
         if let Some(extra) = queue.front() {
             let what = match ty.record() {
                 Some(r) => r.keyword(),
@@ -882,41 +893,209 @@ impl<'a> FnChecker<'a> {
     }
 
     /// Initializes the aggregate `ty` from the front of `queue`: subobject
-    /// after subobject (elements, or members; for a union only the first),
-    /// as long as there are items. Returns its fully braced list.
+    /// after subobject (elements, or members; for a union only one), as long
+    /// as there are items and subobjects. A designator moves to the
+    /// subobject it names, and initialization goes on from the one after
+    /// it. Returns the fully braced list (see [`Init::List`]).
     fn fill(
         &mut self,
         ty: &mut Type,
         queue: &mut VecDeque<Pending>,
         constant: bool,
         pos: Pos,
+        how: Fill,
     ) -> Result<Init, Reported> {
-        let mut out = Vec::new();
-        if let Type::Array(elem, n) = ty {
-            while !queue.is_empty() && n.is_none_or(|n| out.len() < n as usize) {
-                // Inner dimensions are always known: the parser requires them.
-                let mut elem_ty = (**elem).clone();
-                out.push(self.subobject(&mut elem_ty, queue, constant)?);
-            }
-            if n.is_none() {
-                *n = Some(out.len() as u32);
-            }
-        } else {
-            let record = ty.record().expect("an aggregate").clone();
-            let Some(body) = record.body() else {
+        let record = ty.record().cloned();
+        if let Some(r) = &record {
+            if r.body().is_none() {
                 let msg = format!("initializer for incomplete type '{ty}'");
                 return Err(self.err(pos, msg));
-            };
-            let count = if record.union { 1 } else { body.members.len() };
-            for m in &body.members[..count] {
-                if queue.is_empty() {
-                    break;
-                }
-                let mut member_ty = m.ty.clone();
-                out.push(self.subobject(&mut member_ty, queue, constant)?);
             }
         }
-        Ok(Init::List(out, pos))
+        let (braced, mut designators, old) = match how {
+            Fill::Braced => (true, Vec::new(), None),
+            Fill::Elided => (false, Vec::new(), None),
+            Fill::Designated(rest, old) => (false, rest, old),
+        };
+        // The initializer of each subobject so far (`None`: zero). A
+        // designation into a subobject changes what it had.
+        let mut slots: Vec<Option<Init>> = match old {
+            None => Vec::new(),
+            Some(Init::List(items, _)) => items.into_iter().map(Some).collect(),
+            // `{ "ab", [0][3] = 'z' }`: the string becomes its characters,
+            // one item each, so the designation changes only the one it
+            // names (C99 6.7.8p19). Left-out ones, the NUL among them, are
+            // zero anyway.
+            Some(Init::Expr(Expr {
+                kind: ExprKind::Str(bytes),
+                pos: at,
+                ..
+            })) => {
+                let Type::Array(elem, _) = &*ty else {
+                    unreachable!("a string initializes a char array")
+                };
+                bytes
+                    .into_iter()
+                    .map(|b| {
+                        let mut c = Expr::new(ExprKind::Num(i64::from(b)), at);
+                        coerce(&mut c, elem);
+                        Some(Init::Expr(c))
+                    })
+                    .collect()
+            }
+            // `{ pv, .p.y = 9 }` keeps `pv`'s other members in C. That
+            // needs the value copied first and then changed, which merlin
+            // does not do: an error rather than a different meaning.
+            Some(Init::Expr(e)) => {
+                let msg = format!(
+                    "designator partially overrides an initializer of type '{}' given by an \
+                     expression; merlin does not support this",
+                    e.ty
+                );
+                let at = designators.first().map_or(pos, Designator::pos);
+                return Err(self.err(at, msg));
+            }
+            Some(Init::Designated(..)) => unreachable!("fill leaves no designations"),
+        };
+        let mut next = 0;
+        loop {
+            if designators.is_empty() {
+                match queue.front() {
+                    None => break,
+                    // A designator belongs to the innermost braced list: an
+                    // aggregate filled by brace elision ends there.
+                    Some(Pending {
+                        init: Init::Designated(..),
+                        ..
+                    }) if !braced => break,
+                    Some(Pending {
+                        init: Init::Designated(..),
+                        ..
+                    }) => {
+                        let Some(Pending {
+                            init: Init::Designated(d, value),
+                            ..
+                        }) = queue.pop_front()
+                        else {
+                            unreachable!("just matched")
+                        };
+                        designators = d;
+                        queue.push_front(Pending {
+                            init: *value,
+                            checked: false,
+                        });
+                    }
+                    Some(_) => {}
+                }
+            }
+            let designated = !designators.is_empty();
+            if designated {
+                let mut first = designators.remove(0);
+                next = self.designator(ty, &mut first)?;
+            } else if match (&*ty, &record) {
+                (Type::Array(_, n), _) => n.is_some_and(|n| next >= n as usize),
+                (_, Some(r)) if r.union => next >= 1,
+                (_, Some(r)) => next >= r.body().expect("checked above").members.len(),
+                _ => unreachable!("an aggregate"),
+            } {
+                break;
+            }
+            let mut sub = match (&*ty, &record) {
+                // Inner dimensions are always known: the parser requires them.
+                (Type::Array(elem, _), _) => (**elem).clone(),
+                (_, Some(r)) => r.body().expect("checked above").members[next].ty.clone(),
+                _ => unreachable!("an aggregate"),
+            };
+            if slots.len() <= next {
+                slots.resize(next + 1, None);
+            }
+            let init = if designators.is_empty() {
+                self.subobject(&mut sub, queue, constant)?
+            } else {
+                // `.a.b = 1`: `a` from `.b = 1`, then what follows.
+                let rest = std::mem::take(&mut designators);
+                let old = slots[next].take();
+                let at = queue.front().expect("the designated value").init.pos();
+                self.fill(&mut sub, queue, constant, at, Fill::Designated(rest, old))?
+            };
+            // A union holds one member: the last one initialized.
+            if record.as_ref().is_some_and(|r| r.union) {
+                slots.iter_mut().for_each(|s| *s = None);
+            }
+            slots[next] = Some(init);
+            next += 1;
+        }
+        if let Type::Array(_, n @ None) = ty {
+            *n = Some(slots.len() as u32);
+        }
+        // A union's earlier member, dropped for a later one.
+        while slots.last().is_some_and(Option::is_none) {
+            slots.pop();
+        }
+        let items = slots
+            .into_iter()
+            .map(|s| s.unwrap_or_else(|| Init::List(Vec::new(), pos)))
+            .collect();
+        Ok(Init::List(items, pos))
+    }
+
+    /// Which subobject of `ty` a designator names: an element index, or a
+    /// member's.
+    fn designator(&mut self, ty: &Type, d: &mut Designator) -> Result<usize, Reported> {
+        match d {
+            Designator::Index(e, pos) => {
+                let pos = *pos;
+                let Type::Array(elem, n) = ty.unqual() else {
+                    return Err(self.err(
+                        pos,
+                        format!("array designator cannot initialize non-array type '{ty}'"),
+                    ));
+                };
+                self.expr(e)?;
+                let Some(i) = consteval::int(e).filter(|_| e.ty.is_integer()) else {
+                    return Err(self.err(e.pos, "expression is not an integer constant expression"));
+                };
+                if i < 0 {
+                    return Err(self.err(e.pos, format!("array designator value '{i}' is negative")));
+                }
+                if let Some(n) = n {
+                    if i >= i64::from(*n) {
+                        let msg = format!("array designator index ({i}) exceeds array bounds ({n})");
+                        return Err(self.err(e.pos, msg));
+                    }
+                }
+                // Each element up to the designated one gets an item, so the
+                // index must be reasonable even when the array is big.
+                let size = i64::from(elem.size().unwrap_or(1).max(1));
+                if i >= MAX_DESIGNATED || (i + 1) * size > i64::from(i32::MAX) {
+                    let msg = format!(
+                        "array designator index ({i}) is too large: merlin supports up to {}",
+                        MAX_DESIGNATED - 1
+                    );
+                    return Err(self.err(e.pos, msg));
+                }
+                Ok(i as usize)
+            }
+            Designator::Member(name, pos) => {
+                let pos = *pos;
+                let body = match ty.record() {
+                    Some(r) => r.body(),
+                    None => {
+                        let msg =
+                            format!("field designator cannot initialize a non-struct, non-union type '{ty}'");
+                        return Err(self.err(pos, msg));
+                    }
+                };
+                let body = body.expect("fill checks completeness first");
+                match body.members.iter().position(|m| m.name == *name) {
+                    Some(i) => Ok(i),
+                    None => Err(self.err(
+                        pos,
+                        format!("field designator '{name}' does not refer to any field in type '{ty}'"),
+                    )),
+                }
+            }
+        }
     }
 
     /// The initializer of one subobject of type `ty`, from the front of
@@ -932,7 +1111,7 @@ impl<'a> FnChecker<'a> {
     ) -> Result<Init, Reported> {
         let front = queue.front_mut().expect("not empty");
         let elide = match &mut front.init {
-            Init::List(..) => false,
+            Init::List(..) | Init::Designated(..) => false,
             Init::Expr(e) if ty.is_array() => !(is_char_array(ty) && matches!(e.kind, ExprKind::Str(_))),
             Init::Expr(e) if ty.is_record() => {
                 // A struct is initialized by a struct of its type, or member by member.
@@ -946,12 +1125,13 @@ impl<'a> FnChecker<'a> {
         };
         if elide {
             let pos = queue.front().expect("not empty").init.pos();
-            return self.fill(ty, queue, constant, pos);
+            return self.fill(ty, queue, constant, pos, Fill::Elided);
         }
         let Pending { mut init, checked } = queue.pop_front().expect("not empty");
         match &mut init {
             Init::Expr(e) => self.init_expr(ty, e, constant, checked)?,
             Init::List(..) => self.init(ty, &mut init, constant)?,
+            Init::Designated(..) => unreachable!("fill takes designators"),
         }
         Ok(init)
     }
@@ -1079,6 +1259,9 @@ impl<'a> FnChecker<'a> {
     /// Types `e` and everything in it.
     fn expr(&mut self, e: &mut Expr) -> Checked {
         let pos = e.pos;
+        if matches!(e.kind, ExprKind::VaEnd(_) | ExprKind::VaCopy(..)) {
+            return self.va_end_or_copy(e);
+        }
         let globals = self.globals;
         let ty = match &mut e.kind {
             ExprKind::Num(_) | ExprKind::Str(_) => return Ok(()),
@@ -1292,17 +1475,19 @@ impl<'a> FnChecker<'a> {
                         return Err(self.err(pos, msg));
                     }
                 };
-                if ft.params.len() != args.len() {
-                    let arity = ft.params.len();
+                let arity = ft.params.len();
+                if args.len() < arity || (args.len() > arity && !ft.variadic) {
                     let which = if args.len() > arity { "many" } else { "few" };
+                    let at_least = if ft.variadic { "at least " } else { "" };
                     let msg = match callee.direct_callee().map(|n| (n, globals.get(n))) {
                         Some((name, Some(Global::Func(sig)))) => format!(
-                            "too {which} arguments to '{name}': expected {arity}, have {} (declared at {})",
+                            "too {which} arguments to '{name}': expected {at_least}{arity}, have {} \
+                             (declared at {})",
                             args.len(),
                             sig.pos
                         ),
                         _ => format!(
-                            "too {which} arguments to function call: expected {arity}, have {}",
+                            "too {which} arguments to function call: expected {at_least}{arity}, have {}",
                             args.len()
                         ),
                     };
@@ -1324,6 +1509,7 @@ impl<'a> FnChecker<'a> {
                         arg_copies[i] = Some(self.temp(p, "argument copy", a.pos));
                     }
                 }
+                ok &= self.variadic_args(&mut args[arity..], &mut arg_copies[arity..]);
                 if !ok {
                     return Err(Reported);
                 }
@@ -1335,16 +1521,154 @@ impl<'a> FnChecker<'a> {
                     // A struct result is kept in a hidden local of the caller.
                     *result = Some(self.temp(&ft.ret, "call result", pos));
                 }
-                let (_, used) = abi::arguments(&ft);
-                if used > abi::ARG_REGS {
-                    let msg =
-                        format!("the arguments need {used} registers; merlin passes arguments only in a0-a7");
-                    return Err(self.err(pos, msg));
-                }
                 ft.ret
+            }
+            ExprKind::VaStart { ap, last } => {
+                self.va_start(ap, last, pos)?;
+                Type::Void
+            }
+            ExprKind::VaArg(ap) => {
+                let t = e.ty.clone();
+                self.va_arg(ap, &t, pos)?;
+                t
+            }
+            ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => unreachable!("rewritten above"),
+            ExprKind::CompoundLit { init, local } => {
+                let mut ty = e.ty.clone();
+                *local = Some(self.compound_literal(&mut ty, init, pos)?);
+                ty
             }
         };
         e.ty = ty;
+        Ok(())
+    }
+
+    /// `(type){ ... }`: checks the list against the type (completing an
+    /// array's size) and gives the object a hidden local.
+    fn compound_literal(&mut self, ty: &mut Type, init: &mut Init, pos: Pos) -> Result<LocalId, Reported> {
+        if self.func.is_empty() {
+            return Err(self.err(pos, "compound literals outside functions are not supported"));
+        }
+        if ty.is_func() || ty.is_void() || (ty.size().is_none() && !matches!(ty, Type::Array(_, None))) {
+            return Err(self.err(pos, format!("compound literal has incomplete type '{ty}'")));
+        }
+        self.init(ty, init, false)?;
+        Ok(self.temp(ty, "compound literal", pos))
+    }
+
+    // The varargs checks live in functions of their own: `expr` recurses
+    // once per nesting level, so its stack frame is kept small.
+
+    /// The arguments a call's `...` takes get the default argument
+    /// promotions: integers narrower than `int` become `int`, arrays and
+    /// functions pointers; structs go as they are (a big one as the address
+    /// of a copy, recorded in `copies`). False if one is incomplete.
+    fn variadic_args(&mut self, args: &mut [Expr], copies: &mut [Option<LocalId>]) -> bool {
+        let mut ok = true;
+        for (a, copy) in args.iter_mut().zip(copies) {
+            let t = a.ty.decay();
+            if t.is_void() || (t.is_record() && t.size().is_none()) {
+                self.err(a.pos, format!("argument type '{t}' is incomplete"));
+                ok = false;
+                continue;
+            }
+            let promoted = match t {
+                Type::Int(k) => Type::Int(k.promoted()),
+                t => t,
+            };
+            coerce(a, &promoted);
+            if promoted.is_record() && abi::classify(&promoted) == abi::Pass::Ref {
+                *copy = Some(self.temp(&promoted, "argument copy", a.pos));
+            }
+        }
+        ok
+    }
+
+    /// `va_start(ap, last)`: only in a variadic function, naming its last
+    /// named parameter (as C99 asks; merlin does not need it).
+    fn va_start(&mut self, ap: &mut Expr, last: &mut Expr, pos: Pos) -> Checked {
+        let Some(param) = self.last_param.clone() else {
+            return Err(self.err(pos, "'va_start' used in a function with fixed parameters"));
+        };
+        self.va_list(ap, "__builtin_va_start", true)?;
+        self.expr(last)?;
+        if !matches!(&last.kind, ExprKind::Var { name, .. } if *name == param) {
+            return Err(self.err(
+                last.pos,
+                format!("second argument to 'va_start' must be the last named parameter, '{param}'"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `va_arg(ap, t)`: `t` must be a complete object type that the default
+    /// argument promotions leave alone.
+    fn va_arg(&mut self, ap: &mut Expr, t: &Type, pos: Pos) -> Checked {
+        self.va_list(ap, "__builtin_va_arg", true)?;
+        let problem = if t.is_void() || t.is_func() || t.size().is_none() {
+            Some(format!("second argument to 'va_arg' is of incomplete type '{t}'"))
+        } else if t.is_array() {
+            Some(format!("second argument to 'va_arg' is of array type '{t}'"))
+        } else if t.int_kind().is_some_and(|k| k.promoted() != k) {
+            Some(format!(
+                "second argument to 'va_arg' is of promotable type '{t}': the argument was \
+                 promoted to 'int', so this would be undefined (write '({t})va_arg(ap, int)')"
+            ))
+        } else {
+            None
+        };
+        match problem {
+            Some(msg) => Err(self.err(pos, msg)),
+            None => Ok(()),
+        }
+    }
+
+    /// Checks that `ap`, the first argument of the builtin `what`, is a
+    /// `va_list` (an object, which the builtin changes, if `target`).
+    fn va_list(&mut self, ap: &mut Expr, what: &str, target: bool) -> Checked {
+        self.expr(ap)?;
+        if ap.ty.decay() != Type::ptr(Type::Void) {
+            let msg = format!("first argument to '{what}' must be a 'va_list', not '{}'", ap.ty);
+            return Err(self.err(ap.pos, msg));
+        }
+        if target {
+            self.assignable(ap)?;
+        }
+        Ok(())
+    }
+
+    /// `va_end(ap)` does nothing: it becomes `(void)ap`. `va_copy(dst,
+    /// src)` copies a pointer: `(void)(dst = src)`.
+    fn va_end_or_copy(&mut self, e: &mut Expr) -> Checked {
+        let pos = e.pos;
+        let x = match std::mem::replace(&mut e.kind, ExprKind::Num(0)) {
+            ExprKind::VaEnd(mut ap) => {
+                self.va_list(&mut ap, "__builtin_va_end", false)?;
+                ap
+            }
+            ExprKind::VaCopy(mut dst, mut src) => {
+                let (a, b) = (
+                    self.va_list(&mut dst, "__builtin_va_copy", true),
+                    self.va_list(&mut src, "__builtin_va_copy", false),
+                );
+                a?;
+                b?;
+                coerce(&mut src, &dst.ty);
+                let ty = dst.ty.unqual().clone();
+                Box::new(Expr {
+                    kind: ExprKind::Assign {
+                        op: None,
+                        target: dst,
+                        value: src,
+                    },
+                    ty,
+                    pos,
+                })
+            }
+            _ => unreachable!("only va_end and va_copy"),
+        };
+        e.kind = ExprKind::Cast { x, implicit: false };
+        e.ty = Type::Void;
         Ok(())
     }
 
@@ -1510,6 +1834,8 @@ mod tests {
                 | ExprKind::Deref(x)
                 | ExprKind::Cast { x, .. }
                 | ExprKind::SizeofExpr(x)
+                | ExprKind::VaArg(x)
+                | ExprKind::VaEnd(x)
                 | ExprKind::IncDec { target: x, .. } => expr(x, out),
                 ExprKind::Member { base, .. } => expr(base, out),
                 ExprKind::Call { callee, args, .. } => {
@@ -1518,6 +1844,11 @@ mod tests {
                     }
                     args.iter().for_each(|a| expr(a, out));
                 }
+                ExprKind::VaStart { ap: a, last: b } | ExprKind::VaCopy(a, b) => {
+                    expr(a, out);
+                    expr(b, out);
+                }
+                ExprKind::CompoundLit { .. } => {}
             }
         }
         fn stmt(s: &Stmt, out: &mut Vec<String>) {
@@ -1864,6 +2195,7 @@ mod tests {
                         Some(v) => v.to_string(),
                         None => "s".into(),
                     },
+                    Init::Designated(..) => panic!("a designator survived sema"),
                 }
             }
             show(d[0].init.as_ref().unwrap())
@@ -1872,6 +2204,82 @@ mod tests {
         assert_eq!(braced("int m[2][2] = {1, 2, 3, 4};"), "{{1, 2}, {3, 4}}");
         assert_eq!(braced("int m[][2] = {1, 2, 3};"), "{{1, 2}, {3}}");
         assert_eq!(braced("int m[2][3] = {{1}, 2};"), "{{1}, {2}}");
+        // Designators: gaps are empty lists, and filling goes on after the
+        // designated subobject, at its level.
+        assert_eq!(braced("int a[] = {[3] = 1, 2, [1] = 5};"), "{{}, 5, {}, 1, 2}");
+        assert_eq!(
+            braced("int m[2][2] = {[1] = 1, 2, [0][1] = 3};"),
+            "{{{}, 3}, {1, 2}}"
+        );
+        assert_eq!(braced("int m[2][2] = {[0][1] = 3, 4, 5};"), "{{{}, 3}, {4, 5}}");
+        assert_eq!(
+            braced("struct p { int x, y; } a[2] = {[1].y = 2, [0] = {1, 9}, [0].y = 3};"),
+            "{{1, 3}, {{}, 2}}"
+        );
+        assert_eq!(
+            braced("struct p { int x, y, z; } v = {.y = 2, 3, .x = 1};"),
+            "{1, 2, 3}"
+        );
+        // A union keeps its last member.
+        assert_eq!(braced("union u { char c; int i; } v = {.i = 7};"), "{{}, 7}");
+        assert_eq!(braced("union u { char c; int i; } v = {.i = 7, .c = 1};"), "{1}");
+        // A designation into a string keeps its other characters.
+        assert_eq!(
+            braced("char s[2][4] = {\"ab\", [0][3] = 'z', [1] = \"c\", [1][0] = 'd'};"),
+            "{{97, 98, {}, 122}, {100}}"
+        );
+        // Into a struct given by an expression: C keeps the other members,
+        // which merlin cannot do, so it is an error.
+        assert_eq!(
+            err("struct p { int x, y; }; struct r { struct p p; int z; }; \
+                 int f(struct p v) { struct r r = {v, .p.y = 9}; return r.p.x; }"),
+            "1:97: designator partially overrides an initializer of type 'struct p' given by an \
+             expression; merlin does not support this"
+        );
+        assert_eq!(
+            err("int a[2] = {[2] = 1};"),
+            "1:14: array designator index (2) exceeds array bounds (2)"
+        );
+        assert_eq!(
+            err("int a[2] = {[2] = 1};"),
+            "1:14: array designator index (2) exceeds array bounds (2)"
+        );
+        assert_eq!(
+            err("int a[2] = {[-1] = 1};"),
+            "1:14: array designator value '-1' is negative"
+        );
+        assert_eq!(
+            err("int n; int a[2] = {[n] = 1};"),
+            "1:21: expression is not an integer constant expression"
+        );
+        assert_eq!(
+            err("int a[] = {[1 << 20] = 1};"),
+            "1:15: array designator index (1048576) is too large: merlin supports up to 1048575"
+        );
+        assert_eq!(
+            err("struct p { int x; } v = {.y = 1};"),
+            "1:26: field designator 'y' does not refer to any field in type 'struct p'"
+        );
+        assert_eq!(
+            err("struct p { int x; } v = {[0] = 1};"),
+            "1:26: array designator cannot initialize non-array type 'struct p'"
+        );
+        assert_eq!(
+            err("int a[2] = {.x = 1};"),
+            "1:13: field designator cannot initialize a non-struct, non-union type 'int [2]'"
+        );
+        assert_eq!(
+            err("int x = {.x = 1};"),
+            "1:10: field designator cannot initialize a non-struct, non-union type 'int'"
+        );
+        assert_eq!(
+            err("struct p { int x; } v = {.x.y = 1};"),
+            "1:28: field designator cannot initialize a non-struct, non-union type 'int'"
+        );
+        assert_eq!(
+            err("union u { char c; int i; } v = {.i = 7, 8};"),
+            "1:41: excess elements in union initializer"
+        );
         assert_eq!(
             err("int m[2][2] = {1, 2, 3, 4, 5};"),
             "1:28: excess elements in array initializer"
@@ -2498,10 +2906,87 @@ mod tests {
         // Small structs travel in registers: no copies.
         let p = ok("struct s { int a, b; }; struct s g(struct s a); int f(struct s x) { return g(x).a; }");
         assert_eq!(func(&p, "f").locals.iter().filter(|l| l.temp).count(), 1);
-        // Every argument must fit a0-a7: a pair takes two.
+        // Past a0-a7 arguments go on the stack.
+        ok("struct s { int a, b; }; int g(struct s a, struct s b, struct s c, struct s d, int k) { return k; }");
+    }
+
+    #[test]
+    fn compound_literals() {
+        let p = ok("struct p { int x, y; }; int f() { int *a = (int[]){1, 2, 3}; \
+                    return a[2] + (struct p){.y = 4}.y + sizeof (char[]){\"abc\"}; }");
+        let f = func(&p, "f");
+        let temps: Vec<String> = f
+            .locals
+            .iter()
+            .filter(|l| l.temp)
+            .map(|l| l.ty.to_string())
+            .collect();
+        assert_eq!(temps, ["int [3]", "struct p", "char [4]"]);
+        // An lvalue.
+        ok("int f() { int *p = &(int){5}; (int){1} = 2; return *p; }");
         assert_eq!(
-            err("struct s { int a, b; }; int g(struct s a, struct s b, struct s c, struct s d, int k) { return 0; }"),
-            "1:29: the arguments need 9 registers; merlin passes arguments only in a0-a7"
+            err("int *p = (int[]){1};"),
+            "1:10: compound literals outside functions are not supported"
+        );
+        assert_eq!(
+            err("int f() { return (void){0}; }"),
+            "1:18: compound literal has incomplete type 'void'"
+        );
+    }
+
+    #[test]
+    fn variadic_calls() {
+        let p = ok("int f(int n, ...); struct s { int v[4]; } x; \
+                    int g(char c) { return f(1, c, \"s\", x, (short)2); }");
+        let Some(StmtKind::Return(Some(e))) = func(&p, "g").body.as_ref().unwrap().first().map(|s| &s.kind)
+        else {
+            panic!()
+        };
+        let ExprKind::Call { args, arg_copies, .. } = &e.kind else {
+            panic!()
+        };
+        // The default argument promotions: char and short become int, an
+        // array a pointer; a big struct goes as a copy's address.
+        let types: Vec<String> = args.iter().map(|a| a.ty.to_string()).collect();
+        assert_eq!(types, ["int", "int", "char *", "struct s", "int"]);
+        assert!(arg_copies[3].is_some());
+        assert_eq!(
+            err("int f(int n, ...); int g() { return f(); }"),
+            "1:37: too few arguments to 'f': expected at least 1, have 0 (declared at 1:5)"
+        );
+        assert_eq!(
+            err("void v(void); int f(int n, ...); int g() { return f(1, v()); }"),
+            "1:56: argument type 'void' is incomplete"
+        );
+    }
+
+    #[test]
+    fn va_builtins() {
+        ok(
+            "int f(int n, ...) { __builtin_va_list ap, aq; __builtin_va_start(ap, n); \
+            __builtin_va_copy(aq, ap); int k = __builtin_va_arg(aq, int); __builtin_va_end(aq); \
+            __builtin_va_end(ap); return k; }",
+        );
+        assert_eq!(
+            err("int f(int n) { __builtin_va_list ap; __builtin_va_start(ap, n); return 0; }"),
+            "1:38: 'va_start' used in a function with fixed parameters"
+        );
+        assert_eq!(
+            err("int f(int n, int m, ...) { __builtin_va_list ap; __builtin_va_start(ap, n); return 0; }"),
+            "1:73: second argument to 'va_start' must be the last named parameter, 'm'"
+        );
+        assert_eq!(
+            err("int f(int n, ...) { int ap; __builtin_va_start(ap, n); return 0; }"),
+            "1:48: first argument to '__builtin_va_start' must be a 'va_list', not 'int'"
+        );
+        assert_eq!(
+            err("int f(int n, ...) { __builtin_va_list ap; return __builtin_va_arg(ap, char); }"),
+            "1:50: second argument to 'va_arg' is of promotable type 'char': the argument was promoted \
+             to 'int', so this would be undefined (write '(char)va_arg(ap, int)')"
+        );
+        assert_eq!(
+            err("int f(int n, ...) { __builtin_va_list ap; return __builtin_va_arg(ap, int[2])[0]; }"),
+            "1:50: second argument to 'va_arg' is of array type 'int [2]'"
         );
     }
 

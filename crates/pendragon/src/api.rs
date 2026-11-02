@@ -664,19 +664,23 @@ fn vm_json(vm: &VmSummary) -> Json {
     let disks: Vec<Json> = profile
         .devices
         .iter()
-        .map(|DeviceSpec::Disk(disk)| {
+        .filter_map(|device| {
+            // Network cards are not shown yet: the page lists the disks only.
+            let DeviceSpec::Disk(disk) = device else {
+                return None;
+            };
             let lake = match &disk.source {
                 avalon_proto::DiskSource::Lake { addr, name } => {
                     Json::object([("addr", addr.as_str().into()), ("name", name.as_str().into())])
                 }
                 avalon_proto::DiskSource::File(_) => Json::Null,
             };
-            Json::object([
+            Some(Json::object([
                 ("source", disk.source.to_string().into()),
                 ("read_only", disk.read_only.into()),
                 ("lake", lake),
                 ("held", held.into()),
-            ])
+            ]))
         })
         .collect();
     let actions: Vec<&str> = VmAction::ALL

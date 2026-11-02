@@ -232,6 +232,36 @@ fn invalid_payloads() -> Vec<(&'static str, u16, Vec<u8>)> {
             ty::CREATE_VM,
             cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[1, 7]]),
         ),
+        (
+            "card switch option tag",
+            ty::CREATE_VM,
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[2, 7]]),
+        ),
+        (
+            "card MAC option tag",
+            ty::CREATE_VM,
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[2, 0, 3]]),
+        ),
+        (
+            "port owner tag",
+            ty::SWITCH_LIST,
+            cat(&[
+                &le(1),
+                &le(0),
+                &[0],
+                &le(1),
+                &[2],
+                &le(1),
+                &[0],
+                &[0; 6],
+                &[0; 40],
+            ]),
+        ),
+        (
+            "capture option tag",
+            ty::CAPTURE_SWITCH,
+            cat(&[&le(1), b"s", &[2]]),
+        ),
         ("key code 0", ty::KEY_INPUT, cat(&[&le(1), &[0, 0]])),
         ("key flags", ty::KEY_INPUT, cat(&[&le(1), &[b'a', 0x08]])),
         (

@@ -12,7 +12,9 @@
  *
  * and so do the narrow scalars (_Bool, signed char, short, unsigned short),
  * which the caller extends to 32 bits as an argument and the callee as a
- * result: clang -O1 relies on both.
+ * result: clang -O1 relies on both. So do arguments past a7, on the stack
+ * (a pair may straddle a7 and the stack), and the variadic arguments of
+ * functions with `...`, every kind of them.
  *
  * Each side numbers its checks from 1 and reports the first that fails (0
  * when all pass); tests/abi.rs prints which one it was.
@@ -67,6 +69,12 @@ struct big {
     int v[10];
 };
 
+/* What <stdarg.h> is made of (clang's builtins, which merlin has too). */
+typedef __builtin_va_list va_list;
+#define va_start(ap, last) __builtin_va_start(ap, last)
+#define va_arg(ap, type) __builtin_va_arg(ap, type)
+#define va_end(ap) __builtin_va_end(ap)
+
 /* Defined by merlin, in merlin_side.c. */
 int m_sum6(struct s6 s);
 struct s12 m_make12(int base);
@@ -85,6 +93,12 @@ signed char m_trunc_sc(int x);
 short m_trunc_s(int x);
 unsigned short m_trunc_us(int x);
 _Bool m_tobool(int x);
+int m_vmix(const char *fmt, ...);
+int m_vsum(int n, ...);
+int m_vlate(int a, int b, int c, int d, int e, int f, int g, ...);
+int m_stack(int a, int b, int c, int d, int e, int f, int g, struct s8 h, struct s12 i, char j, short k,
+            struct s6 l);
+struct s12 m_stack_ret(int a, int b, int c, int d, int e, int f, int g, int h, int i);
 
 static int checks, first_failure;
 
@@ -232,6 +246,84 @@ struct s6 c_apply6(struct s6 (*f)(struct s6), struct s6 v) {
     return f(v);
 }
 
+/* Variadic functions: `...` arguments travel like named ones, in a0-a7
+ * and then on the stack; va_list walks them. Letters of fmt: i an int, c a
+ * signed char (promoted to int), s a struct s6, p a struct s8 (a register
+ * pair), b a struct s12 and B a struct big (both by reference). */
+static int vmix(const char *fmt, va_list ap) {
+    int s = 0;
+    for (; *fmt; fmt++) {
+        if (*fmt == 'i') {
+            s += va_arg(ap, int);
+        } else if (*fmt == 'c') {
+            s += (signed char)va_arg(ap, int);
+        } else if (*fmt == 's') {
+            struct s6 v = va_arg(ap, struct s6);
+            s += v.a + v.b + v.c;
+        } else if (*fmt == 'p') {
+            struct s8 v = va_arg(ap, struct s8);
+            s += v.x * v.y;
+        } else if (*fmt == 'b') {
+            struct s12 v = va_arg(ap, struct s12);
+            s += v.a + v.b + v.c;
+        } else if (*fmt == 'B') {
+            struct big v = va_arg(ap, struct big);
+            int i;
+            for (i = 0; i < 10; i++)
+                s += v.v[i];
+        }
+    }
+    return s;
+}
+
+int c_vmix(const char *fmt, ...) {
+    va_list ap;
+    int s;
+    va_start(ap, fmt);
+    s = vmix(fmt, ap);
+    va_end(ap);
+    return s;
+}
+
+int c_vsum(int n, ...) {
+    va_list ap;
+    int s = 0;
+    va_start(ap, n);
+    while (n-- > 0)
+        s += va_arg(ap, int);
+    va_end(ap);
+    return s;
+}
+
+/* The first variadic argument, a pair, straddles a7 and the stack. */
+int c_vlate(int a, int b, int c, int d, int e, int f, int g, ...) {
+    va_list ap;
+    struct s8 p;
+    int x;
+    va_start(ap, g);
+    p = va_arg(ap, struct s8);
+    x = va_arg(ap, int);
+    va_end(ap);
+    return a + b + c + d + e + f + g + p.x * 10 + p.y + x;
+}
+
+/* Named arguments past a7: h straddles a7 and 0(sp), then i's copy's
+ * address, j, k and l are on the stack. */
+int c_stack(int a, int b, int c, int d, int e, int f, int g, struct s8 h, struct s12 i, char j, short k,
+            struct s6 l) {
+    i.a = 1000; /* the callee's copy */
+    return a + b + c + d + e + f + g + h.x * 10 + h.y + i.a / 100 + i.b + i.c + j + k + l.a + l.b + l.c;
+}
+
+/* A big result's address in a0 pushes the ninth argument to the stack. */
+struct s12 c_stack_ret(int a, int b, int c, int d, int e, int f, int g, int h, int i) {
+    struct s12 r;
+    r.a = a + b + c;
+    r.b = d + e + f;
+    r.c = g * h + i;
+    return r;
+}
+
 /* Calls every m_ function; returns 0 if all its checks pass, else the number
  * of the first that fails. */
 int c_calls_merlin(void) {
@@ -244,6 +336,7 @@ int c_calls_merlin(void) {
     struct mixed mx = {'x', 21};
     union u8 un;
     struct big b;
+    signed char sc = -3;
     un.i[0] = 41;
     un.i[1] = 0;
     check(m_sum6(s6) == 6);
@@ -267,5 +360,15 @@ int c_calls_merlin(void) {
     check(m_trunc_s(0x18000) == -32768);
     check(m_trunc_us(w) == 65533);
     check(m_tobool(256) == 1);
+    /* Variadic functions and arguments on the stack. */
+    check(m_vsum(0) == 0);
+    check(m_vsum(10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10) == 55);
+    check(m_vmix("icspbB", 7, sc, s6, p, v, b) == 7 - 3 + 6 + 35 + 60 + 75);
+    check(m_vmix("Bbpsci", b, v, p, s6, sc, 7) == 180);
+    check(m_vlate(1, 2, 3, 4, 5, 6, 7, p, 100) == 28 + 75 + 100);
+    check(m_stack(1, 2, 3, 4, 5, 6, 7, p, v, 'a', -5, s6) == 28 + 75 + 60 + 97 - 5 + 6);
+    check(v.a == 10);
+    v = m_stack_ret(1, 2, 3, 4, 5, 6, 7, 8, 9);
+    check(v.a == 6 && v.b == 15 && v.c == 65);
     return first_failure;
 }

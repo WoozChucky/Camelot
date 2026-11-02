@@ -1,0 +1,8 @@
+[package]
+name = "gateway"
+description = "A user-mode NAT gateway (like QEMU's slirp): DHCP, DNS, NAT and host port forwarding for emulated machines, over std::net sockets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
