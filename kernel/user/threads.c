@@ -31,11 +31,20 @@ static int rounds;
 static int done[MAX_THREADS];
 
 /* Some work between the read and the write: the window in which another
- * thread, without the lock, would read the same value. */
-static int work(int x) {
+ * thread, without the lock, would read the same value. Every YIELD_EVERY
+ * rounds the window holds a yield(), so that on one hart too, where the
+ * threads take turns on the timer tick and a tick seldom lands in a short
+ * window, the others run in the middle of it: without the lock, their
+ * additions in the meantime would be lost for certain. */
+#define YIELD_EVERY 32
+
+static int work(int x, int round) {
     volatile int v = x;
     for (int i = 0; i < 20; i++) {
         v = v + i - i;
+    }
+    if (round % YIELD_EVERY == 0) {
+        yield();
     }
     return v;
 }
@@ -45,12 +54,12 @@ static int worker(void *arg) {
     for (int r = 0; r < rounds; r++) {
         mutex_lock(&lock);
         int c = counter;
-        counter = work(c) + 1;
+        counter = work(c, r) + 1;
         mutex_unlock(&lock);
 
         spin_lock(&slock);
         int s = spun;
-        spun = work(s) + 1;
+        spun = work(s, r) + 1;
         spin_unlock(&slock);
 
         done[me] = done[me] + 1;

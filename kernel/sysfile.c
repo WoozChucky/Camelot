@@ -116,8 +116,8 @@ int sys_fstat(struct trap_frame *f) {
     }
     filestat(file, &st);
     fileclose(file);
-    copyout(pt, arg(f, 1), &st, sizeof st);
-    return 0;
+    /* Checked above, but another thread may have unmapped it since. */
+    return copyout(pt, arg(f, 1), &st, sizeof st) == 0 ? 0 : -EFAULT;
 }
 
 int sys_pipe(struct trap_frame *f) {
@@ -138,7 +138,18 @@ int sys_pipe(struct trap_frame *f) {
         fileclose(wf);
         return -EMFILE;
     }
-    copyout(pt, va, fds, sizeof fds);
+    /* Checked above, but another thread may have unmapped it since: then
+     * the caller never learns the descriptors, so they are taken back
+     * (those another thread hasn't closed or replaced meanwhile). */
+    if (copyout(pt, va, fds, sizeof fds) != 0) {
+        if (fd_take_if(fds[0], rf)) {
+            fileclose(rf);
+        }
+        if (fd_take_if(fds[1], wf)) {
+            fileclose(wf);
+        }
+        return -EFAULT;
+    }
     return 0;
 }
 

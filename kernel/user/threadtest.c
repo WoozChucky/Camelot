@@ -4,17 +4,25 @@
  * futexes (a value that differs returns at once, a bad pointer is an
  * error, a wake wakes no more than it is asked to), running out of thread
  * slots, the library's mutex and malloc from several threads, sbrk from
- * two threads at once, and processes with threads that end (exit from one
- * thread while others run, kill, the last thread's thread_exit, exec, a
- * fault). Prints a line for each check that fails and, at the end,
+ * three threads at once, a pipe write whose buffer another thread unmaps
+ * meanwhile, and processes with threads that end (exit from one thread
+ * while others run, kill, the last thread's thread_exit, exec, a fault).
+ * Prints a line for each check that fails and, at the end,
  * "threadtest: N checks, F failed"; exits with F.
+ *
+ *   threadtest fs         instead checks threads using the root filesystem
+ *                         while others exec, exit, are killed or close
+ *                         their descriptors, and prints "threadtest fs: N
+ *                         checks, F failed". It needs a disk, and leaves
+ *                         it as it found it.
  *
  * It runs as its own child for the checks on whole processes:
  *   threadtest live       starts threads that sleep, wait on a futex, join
  *                         another and spin, then exits with 7 from main
- *   threadtest hang       starts threads that sleep, wait on a futex and
- *                         join another, then waits on a futex itself, until
- *                         it is killed
+ *   threadtest hang       starts threads that wait on a futex and join
+ *                         another, then waits on a futex itself, until it is
+ *                         killed: no thread sleeps on a timer, so only
+ *                         kill's own wakeups can end it
  *   threadtest last       ends its main thread with thread_exit(0); its
  *                         other thread joins it and returns 9, which ends
  *                         the process with 9
@@ -23,7 +31,17 @@
  *                         its pid and tid are PID and none of the TIDs is
  *                         there to join any more
  *   threadtest fault      a thread stores to address 0, which kills the
- *                         whole process */
+ *                         whole process
+ * and, for `threadtest fs`:
+ *   threadtest execread   a thread opens, reads and closes /bin/threadtest
+ *                         over and over while main execs it (`alone PID`)
+ *   threadtest execwrite  a thread writes WRITE_SIZE bytes at a time, more
+ *                         than one transaction each, to TMP_WRITE, and main
+ *                         execs (`alone PID`) once it has a few times
+ *   threadtest ioexit     threads read the program and write TMP_WRITE
+ *                         over and over; main exits with 7
+ *   threadtest iokill     the same, main waiting on a futex until it is
+ *                         killed */
 #include "user.h"
 
 /* Thread slots, for every process together (NTHREAD in
@@ -220,6 +238,15 @@ static int waits_on_word2(void *arg) {
     return r == 0 || r == -EAGAIN ? 0 : r;
 }
 
+/* How many of the futex test's waiters have woken. */
+static int left_word2;
+
+static int counts_wake(void *arg) {
+    int r = waits_on_word2(arg);
+    atomic_add(&left_word2, 1);
+    return r;
+}
+
 static void test_futex(void) {
     word = 5;
     check_eq(futex_wait(&word, 4), -EAGAIN, "futex_wait on another value returns at once");
@@ -246,15 +273,19 @@ static void test_futex(void) {
     check_eq(joined(t), 0, "join the waiter");
     check_eq(woke_with, 0, "futex_wait returns 0 when woken");
 
-    /* Three waiters, woken at most two at a time. */
+    /* Four waiters, woken one, then two, at a time: once all four sleep,
+     * a wake of two leaves at least one asleep to show it woke no more.
+     * They sleep a few instructions after arriving; the two ticks give
+     * them those. */
     word2 = 0;
-    int tids[3];
-    for (int i = 0; i < 3; i++) {
-        tids[i] = start(waits_on_word2, NULL, i);
+    int tids[4];
+    for (int i = 0; i < 4; i++) {
+        tids[i] = start(counts_wake, NULL, i);
     }
-    while (atomic_load(&arrived) < 3) {
+    while (atomic_load(&arrived) < 4) {
         yield();
     }
+    sleep(2);
     int woken = 0;
     tries = 0;
     while (woken == 0 && tries < 10000) {
@@ -265,10 +296,15 @@ static void test_futex(void) {
     check_eq(woken, 1, "futex_wake(1) wakes one");
     check_eq(futex_wake(&word2, 0), 0, "futex_wake(0) wakes none");
     check_eq(futex_wake(&word2, -1), 0, "futex_wake(-1) wakes none");
+    int n = futex_wake(&word2, 2);
+    check_eq(n, 2, "futex_wake(2) with three asleep wakes two");
+    woken += n;
+    sleep(2);
+    check_eq(atomic_load(&left_word2), 3, "and only two more have woken");
     int most = 0;
     tries = 0;
-    while (woken < 3 && tries < 10000) {
-        int n = futex_wake(&word2, 2);
+    while (woken < 4 && tries < 10000) {
+        n = futex_wake(&word2, 2);
         if (n > most) {
             most = n;
         }
@@ -276,9 +312,9 @@ static void test_futex(void) {
         yield();
         tries++;
     }
-    check(most <= 2, "futex_wake(2) wakes at most two");
-    check_eq(woken, 3, "every waiter woken");
-    for (int i = 0; i < 3; i++) {
+    check(most <= 1, "the last one is woken alone");
+    check_eq(woken, 4, "every waiter woken");
+    for (int i = 0; i < 4; i++) {
         check_eq(joined(tids[i]), 0, "join a waiter");
     }
 }
@@ -342,14 +378,23 @@ static int mallocs(void *arg) {
     return 0;
 }
 
-/* Grows and shrinks the heap a page at a time, while another thread does
- * the same: each sbrk is one at a time in the kernel, so the end of the
- * heap is where it started once both are done. */
+/* Grows and shrinks the heap a page at a time, while other threads do the
+ * same: each sbrk is one at a time in the kernel, and each shrink follows
+ * its own growth, so the end of the heap is where it started once all are
+ * done. On several harts each shrink's shootdown reaches the harts the
+ * others run on. */
 static int sbrks(void *arg) {
     (void)arg;
     for (int i = 0; i < 20; i++) {
         if (sbrk(PAGE) < 0) {
             return 1;
+        }
+        /* Some time in U-mode, for the others' shootdowns to find this
+         * thread's hart on the page table rather than asleep on the heap's
+         * lock. Not in the new page: another thread's shrink may take it. */
+        volatile int x = 0;
+        for (int j = 0; j < 5000; j++) {
+            x = x + j;
         }
         if (sbrk(-PAGE) < 0) {
             return 2;
@@ -385,10 +430,12 @@ static void test_locks(void) {
     }
 
     int end = sbrk(0);
-    tids[0] = start(sbrks, NULL, 0);
-    tids[1] = start(sbrks, NULL, 1);
-    check_eq(joined(tids[0]), 0, "sbrk from two threads");
-    check_eq(joined(tids[1]), 0, "sbrk from two threads");
+    for (int i = 0; i < 3; i++) {
+        tids[i] = start(sbrks, NULL, i);
+    }
+    for (int i = 0; i < 3; i++) {
+        check_eq(joined(tids[i]), 0, "sbrk from three threads");
+    }
     check_eq(sbrk(0), end, "the heap is back where it was");
 
     /* Every free slot, until thread_start says there are none. */
@@ -461,18 +508,303 @@ static int ends_last(void *arg) {
     return status == 0 ? 9 : 100;
 }
 
+static int run(const char *mode) {
+    char *args[] = {"threadtest", (char *)mode, NULL};
+    return spawn("/bin/threadtest", args);
+}
+
+static int status_of(int pid) {
+    int status = -1000;
+    if (pid < 0 || wait(pid, &status) != pid) {
+        return -2000;
+    }
+    return status;
+}
+
+/* ---- A buffer unmapped while a call uses it ---- */
+
+static int pipe_fds[2];
+static uint pipe_src;
+static int pipe_started;
+
+/* Writes 1024 bytes from pipe_src: the first half in a page that stays,
+ * the second in the heap's last page, which the main thread unmaps while
+ * this one waits for room in the pipe. Returns what write returned. */
+static int writes_pipe(void *arg) {
+    (void)arg;
+    atomic_store(&pipe_started, 1);
+    return write(pipe_fds[1], (void *)pipe_src, 1024);
+}
+
+static void test_unmapped(void) {
+    /* The heap's end on a page boundary, then one more page, B. The 512
+     * bytes before B are 'A's, B's first 512 'B's: a write of 1024 fills the
+     * pipe (512 bytes) with the 'A's and waits. */
+    int end = sbrk(0);
+    int pad = (PAGE - end % PAGE) % PAGE;
+    if (pad > 0) {
+        sbrk(pad);
+    }
+    char *b = (char *)sbrk(PAGE);
+    check(b == (char *)(end + pad), "a page for the pipe's buffer");
+    /* The page before B, the heap's or the program's data, stays. */
+    pipe_src = (uint)b - 512;
+    memset(b - 512, 'A', 512);
+    memset(b, 'B', 512);
+    check_eq(pipe(pipe_fds), 0, "pipe");
+    int t = start(writes_pipe, NULL, 0);
+    while (atomic_load(&pipe_started) == 0) {
+        yield();
+    }
+    /* Two ticks: the writer has filled the pipe and sleeps in write. */
+    sleep(2);
+    check_eq(sbrk(-PAGE), (int)((uint)b + PAGE), "unmap the buffer's second half");
+    char got[1024];
+    int n = 0;
+    int r = read(pipe_fds[0], got, sizeof got);
+    if (r > 0) {
+        n = r;
+    }
+    /* The write fails where its buffer went: a short write of the half
+     * that was there, and nothing it couldn't copy reaches the pipe. */
+    check_eq(joined(t), 512, "a write whose buffer is unmapped stops short");
+    close(pipe_fds[1]);
+    while ((r = read(pipe_fds[0], got + n, sizeof got - (uint)n)) > 0) {
+        n += r;
+    }
+    close(pipe_fds[0]);
+    check_eq(n, 512, "the reader gets only what was copied");
+    int as = 0;
+    for (int i = 0; i < n; i++) {
+        if (got[i] == 'A') {
+            as++;
+        }
+    }
+    check_eq(as, 512, "all of it the first half");
+    /* A buffer that is unmapped from the start is an error, not 0. */
+    check_eq(pipe(pipe_fds), 0, "pipe");
+    check_eq(write(pipe_fds[1], b, 16), -EFAULT, "write from an unmapped buffer");
+    check_eq(write(pipe_fds[1], "x", 1), 1, "write a byte");
+    check_eq(read(pipe_fds[0], b, 16), -EFAULT, "read into an unmapped buffer");
+    check_eq(read(pipe_fds[0], got, 16), 1, "and the byte is still there");
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    check_eq(fstat(0, (struct stat *)b), -EFAULT, "fstat to an unmapped buffer");
+    sbrk(-pad);
+    check_eq(sbrk(0), end, "the heap is back where it was");
+}
+
+/* ---- Threads on the filesystem (threadtest fs) ---- */
+
+/* The program, which the root image has. */
+#define PROGRAM "/bin/threadtest"
+/* The scratch files, removed by the end. */
+#define TMP_WRITE "/threadtest.w"
+#define TMP_CLOSE "/threadtest.c"
+/* More than a transaction's worth (MAXWRITE in kernel/file.c, 3 KiB): each
+ * write is several, one after another. */
+#define WRITE_SIZE 8192
+
+static char wbuf[WRITE_SIZE];
+static int io_rounds;
+static int io_go;
+
+/* Opens, reads a little of and closes the program, over and over. */
+static int reads_program(void *arg) {
+    (void)arg;
+    char buf[16];
+    for (;;) {
+        int fd = open(PROGRAM, O_RDONLY);
+        if (fd >= 0) {
+            read(fd, buf, sizeof buf);
+            close(fd);
+        }
+        atomic_add(&io_rounds, 1);
+    }
+    return 0;
+}
+
+/* Once io_go is set, writes WRITE_SIZE bytes to TMP_WRITE over and over,
+ * from its start each time, yielding between writes: begin_op() is not
+ * fair, and a writer that never lets go of the hart on one hart could
+ * start every transaction before the main thread gets one. */
+static int writes_file(void *arg) {
+    (void)arg;
+    while (atomic_load(&io_go) == 0) {
+        yield();
+    }
+    int fd = open(TMP_WRITE, O_WRONLY | O_CREAT | O_TRUNC);
+    for (;;) {
+        lseek(fd, 0, SEEK_SET);
+        write(fd, wbuf, WRITE_SIZE);
+        atomic_add(&io_rounds, 1);
+        yield();
+    }
+    return 0;
+}
+
+/* exec of `alone` with only the pid: exits 0 if it is the same process,
+ * with one thread. */
+static int exec_alone(void) {
+    char pid[12];
+    snprintf(pid, sizeof pid, "%d", getpid());
+    char *args[] = {"threadtest", "alone", pid, NULL};
+    return exec(PROGRAM, args);
+}
+
+/* The filesystem child modes, or -1 for another. */
+static int fs_child(const char *mode) {
+    if (strcmp(mode, "execread") == 0) {
+        start(reads_program, NULL, 0);
+        while (atomic_load(&io_rounds) == 0) {
+            yield();
+        }
+        exec_alone();
+        return 70;
+    }
+    if (strcmp(mode, "execwrite") == 0) {
+        start(writes_file, NULL, 0);
+        atomic_store(&io_go, 1);
+        /* A few rounds first: the writer is in the middle of its writes
+         * when the exec starts, and they have pushed the program out of the
+         * buffer cache, so that loading it waits for the disk meanwhile. */
+        while (atomic_load(&io_rounds) < 4) {
+            yield();
+        }
+        exec_alone();
+        return 71;
+    }
+    if (strcmp(mode, "ioexit") == 0 || strcmp(mode, "iokill") == 0) {
+        start(reads_program, NULL, 0);
+        start(writes_file, NULL, 1);
+        atomic_store(&io_go, 1);
+        while (atomic_load(&io_rounds) < 4) {
+            yield();
+        }
+        if (strcmp(mode, "ioexit") == 0) {
+            exit(7);
+        }
+        for (;;) {
+            futex_wait(&forever, 0);
+        }
+    }
+    return -1;
+}
+
+/* For the close checks: a descriptor another thread closes while these
+ * use it. Each returns the error that stopped it. */
+static int shared_fd;
+static int used_fd;
+
+static int reads_fd(void *arg) {
+    (void)arg;
+    char buf[64];
+    for (;;) {
+        int r = read(shared_fd, buf, sizeof buf);
+        if (r < 0) {
+            return r;
+        }
+        if (r == 0) {
+            lseek(shared_fd, 0, SEEK_SET);
+        }
+        atomic_add(&used_fd, 1);
+    }
+    return 0;
+}
+
+static int writes_fd(void *arg) {
+    (void)arg;
+    for (;;) {
+        int r = write(shared_fd, wbuf, WRITE_SIZE);
+        if (r < 0) {
+            return r;
+        }
+        lseek(shared_fd, 0, SEEK_SET);
+        atomic_add(&used_fd, 1);
+    }
+    return 0;
+}
+
+static int chdirs(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 50; i++) {
+        if (chdir("/bin") != 0 || chdir("/") != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int opens(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 50; i++) {
+        int fd = open(PROGRAM, O_RDONLY);
+        if (fd < 0) {
+            return 1;
+        }
+        close(fd);
+    }
+    return 0;
+}
+
+static void test_fs(void) {
+    memset(wbuf, 'w', sizeof wbuf);
+    /* exec waits for its other threads only once it has closed the
+     * program: a thread reading the same file, or waiting for room in the
+     * log, finishes its call and ends. */
+    check_eq(status_of(run("execread")), 0, "exec while a thread reads the program");
+    check_eq(status_of(run("execwrite")), 0, "exec while a thread writes");
+    /* exit and kill while threads are in the middle of file calls. */
+    check_eq(status_of(run("ioexit")), 7, "exit while threads read and write");
+    int pid = run("iokill");
+    sleep(3);
+    check_eq(kill(pid), 0, "kill a process whose threads read and write");
+    check_eq(status_of(pid), -1, "it ends with -1");
+    check_eq(unlink(TMP_WRITE), 0, "remove the written file");
+
+    /* close of a descriptor other threads read and write: their calls
+     * under way finish on the file they hold; the next ones find no
+     * descriptor. */
+    shared_fd = open(TMP_CLOSE, O_RDWR | O_CREAT | O_TRUNC);
+    check(shared_fd >= 0, "open a file to share");
+    check_eq(write(shared_fd, wbuf, 100), 100, "write it");
+    int r = start(reads_fd, NULL, 0);
+    int w = start(writes_fd, NULL, 1);
+    while (atomic_load(&used_fd) < 8) {
+        yield();
+    }
+    check_eq(close(shared_fd), 0, "close it while two threads use it");
+    check_eq(joined(r), -EBADF, "the reader's next read finds it closed");
+    check_eq(joined(w), -EBADF, "the writer's next write finds it closed");
+    check_eq(unlink(TMP_CLOSE), 0, "remove it");
+
+    /* chdir in one thread while another opens. */
+    r = start(chdirs, NULL, 0);
+    w = start(opens, NULL, 1);
+    check_eq(joined(r), 0, "chdir from one thread");
+    check_eq(joined(w), 0, "while another opens");
+    check_eq(chdir("/"), 0, "back to the root");
+    int fd = open("bin/threadtest", O_RDONLY);
+    check(fd >= 0, "a relative path from there");
+    close(fd);
+}
+
 /* The child modes. */
 static int child(int argc, char **argv) {
     const char *mode = argv[1];
-    if (strcmp(mode, "live") == 0 || strcmp(mode, "hang") == 0) {
+    if (strcmp(mode, "live") == 0) {
         int a = start(waits_forever, NULL, 0);
         start(sleeps, NULL, 1);
         start(joins, (void *)(uint)a, 2);
-        if (strcmp(mode, "live") == 0) {
-            start(spins, NULL, 3);
-            sleep(2);
-            exit(7);
-        }
+        start(spins, NULL, 3);
+        sleep(2);
+        exit(7);
+    }
+    if (strcmp(mode, "hang") == 0) {
+        /* No thread in sleep(), which wakes on every tick and would see the
+         * kill by itself: kill must wake the futex and join waiters. */
+        int a = start(waits_forever, NULL, 0);
+        start(joins, (void *)(uint)a, 1);
         for (;;) {
             futex_wait(&forever, 0);
         }
@@ -511,20 +843,8 @@ static int child(int argc, char **argv) {
             futex_wait(&forever, 0);
         }
     }
-    return 60;
-}
-
-static int run(const char *mode) {
-    char *args[] = {"threadtest", (char *)mode, NULL};
-    return spawn("/bin/threadtest", args);
-}
-
-static int status_of(int pid) {
-    int status = -1000;
-    if (pid < 0 || wait(pid, &status) != pid) {
-        return -2000;
-    }
-    return status;
+    int r = fs_child(mode);
+    return r >= 0 ? r : 60;
 }
 
 /* The state procs() gives for `pid`, or -1 if it isn't there. */
@@ -558,12 +878,18 @@ static void test_processes(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "fs") == 0) {
+        test_fs();
+        printf("threadtest fs: %d checks, %d failed\n", checks, failures);
+        return failures;
+    }
     if (argc > 1) {
         return child(argc, argv);
     }
     test_threads();
     test_futex();
     test_locks();
+    test_unmapped();
     test_processes();
     printf("threadtest: %d checks, %d failed\n", checks, failures);
     return failures;

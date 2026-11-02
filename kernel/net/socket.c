@@ -117,14 +117,17 @@ static int get_addr(u32 uaddr, u32 *addr, u32 *port) {
 }
 
 /* Stores `addr`:`port` (host order) as a struct sockaddr_in at `uaddr`,
- * which the caller has checked. */
-static void put_addr(u32 uaddr, u32 addr, u32 port) {
+ * which the caller has checked. 0, or -EFAULT if another thread of the
+ * process has unmapped it since (sbrk). accept and recvfrom, which have
+ * taken a connection or a datagram by then, still return it: the address
+ * is lost, as it would be on a bad pointer the check missed. */
+static int put_addr(u32 uaddr, u32 addr, u32 port) {
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     put16((u8 *)&a.sin_port, port);
     put32((u8 *)&a.sin_addr, addr);
-    copyout(user_pt(), uaddr, &a, sizeof a);
+    return copyout(user_pt(), uaddr, &a, sizeof a) == 0 ? 0 : -EFAULT;
 }
 
 /* Whether `uaddr` can take a struct sockaddr_in (0, for the calls where it
@@ -379,7 +382,7 @@ int sock_sys_accept(u32 fd, u32 uaddr) {
         u32 raddr;
         u32 rport;
         tcp_ends(c, &laddr, &lport, &raddr, &rport);
-        put_addr(uaddr, raddr, rport);
+        (void)put_addr(uaddr, raddr, rport);
     }
     return nfd;
 }
@@ -458,7 +461,7 @@ int sock_sys_recvfrom(u32 fd, u32 ubuf, u32 len, u32 uaddr) {
     u32 port = 0;
     int n = sock_recv(s, ubuf, len, &addr, &port);
     if (n >= 0 && uaddr != 0) {
-        put_addr(uaddr, addr, port);
+        (void)put_addr(uaddr, addr, port);
     }
     return n;
 }
@@ -527,11 +530,9 @@ int sock_sys_name(u32 fd, u32 uaddr, bool peer) {
         if (raddr == 0) {
             return -ENOTCONN;
         }
-        put_addr(uaddr, raddr, rport);
-    } else {
-        put_addr(uaddr, laddr, lport);
+        return put_addr(uaddr, raddr, rport);
     }
-    return 0;
+    return put_addr(uaddr, laddr, lport);
 }
 
 int sock_sys_setsockopt(u32 fd, u32 level, u32 option, u32 uvalue, u32 len) {

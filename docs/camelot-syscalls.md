@@ -592,7 +592,18 @@ it first. The process ends, its descriptors closed and its memory freed,
 once all of them have. `exec` from one thread ends the others the same way
 before the new program starts, in the process's only thread, whose tid
 stays; if another thread is ending the process meanwhile, `exec` fails
-(the caller is about to end anyway).
+(the caller is about to end anyway). `exec` reads the whole new program
+before it waits for the others, so one of them reading the same file, or
+writing to any, still finishes its call.
+
+**Buffers another thread unmaps.** A pointer is checked when the call
+starts, but another thread's `sbrk` may unmap part of the buffer while
+the call is under way (a `write` to a full pipe, say). The call then
+stops where the copy fails: `read` and `write` return the bytes moved
+until then, or `-EFAULT` if none, and the bytes they couldn't copy are
+neither written nor taken from the pipe; the calls that fill in a struct
+(`fstat`, `procs`, `harts`, `pipe`, `getsockname`, `getpeername`) return
+`-EFAULT`, and `pipe` closes the descriptors it made.
 
 ## Error numbers
 

@@ -439,12 +439,14 @@ static void kill_threads(struct proc *p, struct thread *me) {
 }
 
 /* Has every other thread of the current process end, for proc_exit() and
- * proc_exec(): marks the process `exiting`, so no new thread starts, kills
- * them, waits until the caller is the only one left, and frees the slots of
- * the ended ones (those that ended earlier and were never joined too).
+ * proc_exec_commit(): marks the process `exiting`, so no new thread
+ * starts, kills them, waits until the caller is the only one left, and
+ * frees the slots of the ended ones (those that ended earlier and were
+ * never joined too).
  * Returns false at once if another thread is already doing this: the
  * caller is about to be killed by it. Called with proc_lock held, which
- * the wait lets go of meanwhile. */
+ * the wait lets go of meanwhile, and with no sleep lock or transaction:
+ * the other threads may need one to finish the calls they are in. */
 static bool end_other_threads(void) {
     struct thread *me = mythread();
     struct proc *p = me->proc;
@@ -469,20 +471,27 @@ static bool end_other_threads(void) {
     return true;
 }
 
-int proc_exec(const struct elf_file *prog, const char *path, const char *name, const struct proc_args *args) {
-    struct proc *p = myproc();
-    struct trap_frame *frame = mythread()->frame;
-    u32 heap;
+int proc_exec_load(const struct elf_file *prog, const char *path, const struct proc_args *args,
+                   struct exec_image *img) {
     int err;
-    /* The new registers go to a copy first: the old program's stay in the
+    /* The new registers go to the image: the old program's stay in the
      * frame until it is certain the new one replaces it. */
-    struct trap_frame next;
-    pagetable_t pt = build_space(prog, "exec", path, args, &next, &heap, &err);
-    if (pt == NULL) {
-        return err;
-    }
+    img->pagetable = build_space(prog, "exec", path, args, &img->frame, &img->heap, &err);
+    return img->pagetable == NULL ? err : 0;
+}
+
+void proc_exec_abandon(struct exec_image *img) {
+    uvm_free(img->pagetable);
+    img->pagetable = NULL;
+}
+
+int proc_exec_commit(struct exec_image *img, const char *name, const struct proc_args *args) {
+    struct proc *p = myproc();
     /* No other thread runs the new program, and none may be using the old
-     * address space when it goes. */
+     * address space when it goes. The others end on their way back to
+     * U-mode, which one in the middle of a call reaches once the call is
+     * done; a call may wait for a sleep lock or for room in the log, so the
+     * caller holds neither (exec.c has closed the executable). */
     acquire(&proc_lock);
     bool alone = end_other_threads();
     if (alone) {
@@ -491,21 +500,22 @@ int proc_exec(const struct elf_file *prog, const char *path, const char *name, c
     }
     release(&proc_lock);
     if (!alone) {
-        uvm_free(pt);
+        proc_exec_abandon(img);
         return -EINTR;
     }
     pagetable_t old = p->pagetable;
-    p->pagetable = pt;
-    p->heap_base = heap;
-    p->brk = heap;
-    *frame = next;
+    p->pagetable = img->pagetable;
+    p->heap_base = img->heap;
+    p->brk = img->heap;
+    *mythread()->frame = img->frame;
     /* The new table holds the kernel's mappings too: switch to it before
      * freeing the old one, which satp points at. No other hart uses either:
      * the process has one thread now, this one. */
-    mycpu()->pagetable = pt;
+    mycpu()->pagetable = img->pagetable;
     fence_rw(); /* as in the scheduler */
-    w_satp(MAKE_SATP(pt));
+    w_satp(MAKE_SATP(img->pagetable));
     sfence_vma();
+    img->pagetable = NULL;
     if (old != NULL) {
         uvm_free(old);
     }
@@ -1322,6 +1332,20 @@ struct file *fd_take(u32 fd) {
     p->ofile[fd] = NULL;
     release(&p->files_lock);
     return f;
+}
+
+bool fd_take_if(u32 fd, struct file *f) {
+    struct proc *p = myproc();
+    if (fd >= NOFILE) {
+        return false;
+    }
+    acquire(&p->files_lock);
+    bool took = p->ofile[fd] == f;
+    if (took) {
+        p->ofile[fd] = NULL;
+    }
+    release(&p->files_lock);
+    return took;
 }
 
 struct inode *proc_cwd(void) {

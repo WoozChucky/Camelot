@@ -2,6 +2,9 @@
 //! these pass without LLVM. When clang and ld.lld are installed, the kernel is
 //! also rebuilt from source and checked against the committed image.
 
+mod common;
+
+use common::{peek_byte, proc_name, LockWatch};
 use excalibur::csr::{
     IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPIE,
     MSTATUS_SPP,
@@ -2094,8 +2097,6 @@ const USER_TEXT: u32 = 0x1000;
 const TRAP_FRAME_SIZE: u32 = 160;
 /// Process slots (`NPROC`, kernel/include/proc.h).
 const NPROC: usize = 8;
-/// Offset of `name` in `struct proc` (kernel/include/proc.h).
-const PROC_NAME: u32 = 8;
 /// scause of an ecall from U-mode.
 const ECALL_FROM_U: u32 = grail::trap::Exception::EcallU as u32;
 /// The exit system call's number (`SYS_exit`, kernel/include/syscall.h).
@@ -2166,11 +2167,6 @@ fn user_pages(m: &Machine, satp: u32) -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// The byte at physical address `addr`, read without side effects.
-fn peek_byte(bus: &grail::bus::Bus, addr: u32) -> u8 {
-    (bus.peek(addr & !3).unwrap() >> (8 * (addr & 3))) as u8
-}
-
 /// Reads `len` bytes of user memory at `va` through page table `satp`.
 fn user_read(m: &Machine, satp: u32, va: u32, len: u32) -> Vec<u8> {
     let (leaves, _) = page_table(m, satp);
@@ -2205,74 +2201,6 @@ fn current_name(cpu: &grail::cpu::Cpu, current: u32) -> Option<String> {
         return None;
     }
     Some(proc_name(cpu, p))
-}
-
-/// The name of the process whose `struct proc` is at `p`.
-fn proc_name(cpu: &grail::cpu::Cpu, p: u32) -> String {
-    let bytes: Vec<u8> = (0..16)
-        .map(|i| peek_byte(&cpu.bus, p + PROC_NAME + i))
-        .take_while(|&b| b != 0)
-        .collect();
-    String::from_utf8(bytes).unwrap()
-}
-
-/// The kernel's spinlocks that are variables of their own (the per-pipe,
-/// per-disk and the log's live inside other structures).
-const NAMED_LOCKS: [&str; 10] = [
-    "kmem_lock",
-    "uvm_lock",
-    "proc_lock",
-    "tickslock",
-    "cons_lock",
-    "uart_tx_lock",
-    "ftable_lock",
-    "bcache_lock",
-    "itable_lock",
-    "net_lock",
-];
-/// Offsets in `struct cpu` and `struct spinlock` (kernel/include/spinlock.h).
-const CPU_NOFF: u32 = 4;
-const LOCK_CPU: u32 = 4;
-
-/// Watches hart 0's locking state: whenever a process runs in U-mode, the
-/// hart holds no spinlock and has no push_off() pending (a lock or a
-/// push_off leaked on some path would show up here long before the deadlock
-/// it leads to).
-struct LockWatch {
-    noff: u32,
-    locks: Vec<(&'static str, u32)>,
-    was_user: bool,
-}
-
-impl LockWatch {
-    fn new(elf: &grail::elf::Elf) -> LockWatch {
-        LockWatch {
-            noff: sym(elf, "cpus") + CPU_NOFF,
-            locks: NAMED_LOCKS.iter().map(|&n| (n, sym(elf, n))).collect(),
-            was_user: false,
-        }
-    }
-
-    /// Called before each step: checks the state on every entry to U-mode.
-    fn step(&mut self, cpu: &grail::cpu::Cpu) {
-        let is_user = cpu.mode == Mode::U;
-        if is_user && !self.was_user {
-            assert_eq!(
-                cpu.bus.peek(self.noff),
-                Some(0),
-                "push_off() depth in U-mode at {:#x}",
-                cpu.pc
-            );
-            for &(name, lock) in &self.locks {
-                let held = (
-                    cpu.bus.peek(lock).unwrap(),
-                    cpu.bus.peek(lock + LOCK_CPU).unwrap(),
-                );
-                assert_eq!(held, (0, 0), "{name} held in U-mode at {:#x}", cpu.pc);
-            }
-        }
-        self.was_user = is_user;
-    }
 }
 
 /// Steps `m` until program `name` runs in U-mode.

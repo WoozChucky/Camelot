@@ -9,37 +9,27 @@
 //! kernel stack leaks), no hart ever enters U-mode holding a lock, an ended
 //! thread waiting to be joined holds no kernel stack, and a TLB shootdown of
 //! a page table that threads run on several harts reaches every one of them
-//! before it returns.
+//! before it returns. `threadtest fs`, booted with the root image, checks
+//! threads using the filesystem while another of their process execs, exits,
+//! is killed or closes their descriptor: each ends, and the disk is left
+//! consistent and as it was.
 //!
 //! The tests watch every hart's turn with `Cpu::step_traced`, as smp.rs's
 //! do, and read the kernel's tables from memory (the layouts are in the
-//! constants below, with the headers they come from).
+//! constants below and in common/mod.rs, with the headers they come from).
 
+mod common;
+
+use camelot_fs::mkfs::Options;
+use camelot_fs::{fsck, SECTOR_SIZE};
+use common::*;
+use grail::block::MemDisk;
 use grail::cpu::{Cpu, Mode};
-use grail::{Machine, MachineConfig, RunResult};
+use grail::Machine;
 use std::collections::HashSet;
 use std::ops::Range;
-use std::sync::mpsc::{Receiver, Sender};
 use xtask::repo_root;
 
-const PROMPT: &str = "$ ";
-
-/// Enough steps for a boot and a program (smp.rs's budget). Each step runs
-/// every hart one instruction.
-const RUN_MAX_STEPS: u64 = 150_000_000;
-
-// Kernel layouts, from the headers named in each comment.
-
-/// `sizeof(struct cpu)` and its fields (kernel/include/spinlock.h): the
-/// running thread's process, the push_off() depth, the page table in satp
-/// and the running thread.
-const CPU_SIZE: u32 = 92;
-const CPU_PROC: u32 = 0;
-const CPU_NOFF: u32 = 4;
-const CPU_PAGETABLE: u32 = 72;
-const CPU_THREAD: u32 = 88;
-/// Offset of the holding cpu in `struct spinlock`.
-const LOCK_CPU: u32 = 4;
 /// `struct thread` (kernel/include/proc.h): its size, and its state, tid,
 /// process and kernel stack.
 const THREAD_SIZE: u32 = 96;
@@ -55,135 +45,7 @@ const THREAD_ZOMBIE: u32 = 3;
 const PROC_SIZE: u32 = 164;
 const NPROC: u32 = 8;
 const PROC_STATE: u32 = 0;
-const PROC_NAME: u32 = 8;
 const PROC_PAGETABLE: u32 = 32;
-
-/// The kernel's spinlocks that are variables of their own (kernel.rs's list).
-const NAMED_LOCKS: [&str; 10] = [
-    "kmem_lock",
-    "uvm_lock",
-    "proc_lock",
-    "tickslock",
-    "cons_lock",
-    "uart_tx_lock",
-    "ftable_lock",
-    "bcache_lock",
-    "itable_lock",
-    "net_lock",
-];
-
-fn committed_elf() -> Vec<u8> {
-    let path = repo_root().join("kernel/kernel.elf");
-    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
-
-/// Loads the committed kernel on a machine of `harts` harts, the UART reading
-/// `input`.
-fn load(harts: usize, input: Receiver<u8>) -> (Machine, grail::elf::Elf) {
-    let file = committed_elf();
-    let elf = grail::elf::parse(&file).unwrap();
-    let mut m = Machine::new(MachineConfig {
-        harts,
-        ..MachineConfig::default()
-    })
-    .unwrap();
-    m.cpu.bus.uart.capture = true;
-    m.load_elf(&file).unwrap();
-    m.set_uart_input(input);
-    (m, elf)
-}
-
-fn printed(m: &Machine) -> String {
-    String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned()
-}
-
-fn sym(elf: &grail::elf::Elf, name: &str) -> u32 {
-    elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"))
-}
-
-/// The addresses of function `name` in the committed kernel.
-fn function(name: &str) -> Range<u32> {
-    let file = committed_elf();
-    let s = elf32::Elf::parse(&file)
-        .unwrap()
-        .symbols()
-        .unwrap()
-        .into_iter()
-        .find(|s| s.name == name)
-        .unwrap_or_else(|| panic!("no symbol {name}"));
-    assert!(s.size > 0, "{name} has no size");
-    s.value..s.value + s.size
-}
-
-fn peek(cpu: &Cpu, addr: u32) -> u32 {
-    cpu.bus.peek(addr).unwrap()
-}
-
-fn proc_name(cpu: &Cpu, p: u32) -> String {
-    let bytes: Vec<u8> = (0..16)
-        .map(|i| (peek(cpu, (p + PROC_NAME + i) & !3) >> (8 * ((p + PROC_NAME + i) & 3))) as u8)
-        .take_while(|&b| b != 0)
-        .collect();
-    String::from_utf8(bytes).unwrap()
-}
-
-/// Steps `m` until the shell has printed its first prompt.
-fn step_to_prompt(m: &mut Machine) {
-    for _ in 0..RUN_MAX_STEPS {
-        if m.cpu.bus.uart.captured.ends_with(PROMPT.as_bytes()) {
-            return;
-        }
-        m.cpu.step();
-    }
-    panic!("no prompt:\n{}", printed(m));
-}
-
-/// Types `line` and steps `m`, calling `each` before every hart's turn,
-/// until the shell prompts again.
-fn run_command(m: &mut Machine, tx: &Sender<u8>, line: &str, mut each: impl FnMut(&Cpu)) {
-    for b in format!("{line}\n").bytes() {
-        tx.send(b).unwrap();
-    }
-    let from = m.cpu.bus.uart.captured.len();
-    let mut steps = 0;
-    while !m.cpu.bus.uart.captured[from..].ends_with(PROMPT.as_bytes()) {
-        assert!(steps < RUN_MAX_STEPS, "`{line}` never ended:\n{}", printed(m));
-        m.cpu.step_traced(&mut each);
-        steps += 1;
-    }
-}
-
-/// The lines between the last echo of `command` and the next prompt.
-fn command_output<'a>(out: &'a str, command: &str) -> Vec<&'a str> {
-    let start = format!("{PROMPT}{command}\n");
-    let at = out
-        .rfind(&start)
-        .unwrap_or_else(|| panic!("no `{command}` in:\n{out}"))
-        + start.len();
-    let rest = &out[at..];
-    rest[..rest
-        .find(PROMPT)
-        .unwrap_or_else(|| panic!("`{command}` never ended:\n{out}"))]
-        .lines()
-        .collect()
-}
-
-/// Ends the shell and checks the machine stops with its status, 0.
-fn exit_shell(m: &mut Machine, tx: &Sender<u8>) {
-    for b in b"exit\n" {
-        tx.send(*b).unwrap();
-    }
-    assert_eq!(
-        m.run(Some(RUN_MAX_STEPS), |_| {}),
-        RunResult::Exited(0),
-        "{}",
-        printed(m)
-    );
-}
-
-fn free_pages(m: &Machine, elf: &grail::elf::Elf) -> u32 {
-    m.cpu.bus.peek(sym(elf, "nfree")).unwrap()
-}
 
 /// The slots of the thread table in use, as (state, tid, process, kernel
 /// stack).
@@ -220,45 +82,6 @@ fn check_only_the_shell(m: &Machine, elf: &grail::elf::Elf) {
     let threads = threads_in_use(m, elf);
     assert_eq!(threads.len(), 1, "{threads:x?}");
     assert_ne!(threads[0].3, 0, "the shell's thread has no kernel stack");
-}
-
-/// Watches every hart's locking state (smp.rs's LockWatch): whenever a
-/// hart enters U-mode, it holds no spinlock and has no push_off() pending.
-struct LockWatch {
-    cpus: u32,
-    locks: Vec<(&'static str, u32)>,
-    was_user: [bool; grail::MAX_HARTS],
-}
-
-impl LockWatch {
-    fn new(elf: &grail::elf::Elf) -> LockWatch {
-        LockWatch {
-            cpus: sym(elf, "cpus"),
-            locks: NAMED_LOCKS.iter().map(|&n| (n, sym(elf, n))).collect(),
-            was_user: [false; grail::MAX_HARTS],
-        }
-    }
-
-    fn step(&mut self, cpu: &Cpu) {
-        let h = cpu.id as usize;
-        let is_user = cpu.mode == Mode::U;
-        if is_user && !self.was_user[h] {
-            let me = self.cpus + cpu.id * CPU_SIZE;
-            assert_eq!(
-                cpu.bus.peek(me + CPU_NOFF),
-                Some(0),
-                "push_off() depth on hart {h} in U-mode"
-            );
-            for &(name, lock) in &self.locks {
-                assert_ne!(
-                    cpu.bus.peek(lock + LOCK_CPU),
-                    Some(me),
-                    "{name} held by hart {h} in U-mode"
-                );
-            }
-        }
-        self.was_user[h] = is_user;
-    }
 }
 
 /// Watches every hart for threads of the process called `name` in U-mode:
@@ -313,11 +136,36 @@ impl SideBySide {
     }
 }
 
+/// One hart's call of tlb_shootdown() under way (see [`Shootdowns`]).
+#[derive(Clone, Copy)]
+struct Shootdown {
+    /// Where the call returns to, and its sp.
+    ra: u32,
+    sp: u32,
+    /// The page table shot down.
+    pt: u32,
+    /// The other harts that have had `pt` in satp (cpus[i].pagetable)
+    /// without a break from the call's start to its IPI (or its return, if
+    /// it sends none): the call must target each, as it looks at every
+    /// hart's in between.
+    running: u32,
+    /// Whether the IPI has gone out.
+    sent: bool,
+    /// The harts the IPI went to, and those that have flushed since the
+    /// call began.
+    targets: u32,
+    flushed: u32,
+}
+
 /// Watches the TLB shootdowns of user page tables (smp.c): for each call of
 /// tlb_shootdown() on a page table other than the kernel's, the harts its
 /// IPI asks to flush, and which of them did (in tlb_serve()) before the call
-/// returned. Every one of them must have; `shared` counts the calls that
-/// reached another hart.
+/// returned. Every one of them must have; and every other hart that ran the
+/// page table from the call's start until its IPI must have been one of
+/// them.
+/// `shared` counts the calls that reached another hart, `most` the most
+/// other harts that ran the table through one call's start and IPI (so
+/// that the check above had something to check).
 struct Shootdowns {
     entry: u32,
     body: Range<u32>,
@@ -325,14 +173,16 @@ struct Shootdowns {
     sfence: u32,
     serve: Range<u32>,
     kernel_pt: u32,
-    /// Per requesting hart: where the call returns to, its sp, the harts
-    /// the IPI went to and those that have flushed since.
-    active: [Option<(u32, u32, u32, u32)>; grail::MAX_HARTS],
+    cpus: u32,
+    harts: usize,
+    /// Per requesting hart.
+    active: [Option<Shootdown>; grail::MAX_HARTS],
     shared: u32,
+    most: u32,
 }
 
 impl Shootdowns {
-    fn new(elf: &grail::elf::Elf, m: &Machine) -> Shootdowns {
+    fn new(elf: &grail::elf::Elf, m: &Machine, harts: usize) -> Shootdowns {
         Shootdowns {
             entry: sym(elf, "tlb_shootdown"),
             body: function("tlb_shootdown"),
@@ -340,29 +190,68 @@ impl Shootdowns {
             sfence: sym(elf, "sfence_vma"),
             serve: function("tlb_serve"),
             kernel_pt: m.cpu.bus.peek(sym(elf, "kernel_pagetable")).unwrap(),
+            cpus: sym(elf, "cpus"),
+            harts,
             active: [None; grail::MAX_HARTS],
             shared: 0,
+            most: 0,
         }
+    }
+
+    /// The harts whose cpus[i].pagetable is `pt`.
+    fn running(&self, cpu: &Cpu, pt: u32) -> u32 {
+        (0..self.harts as u32)
+            .filter(|&i| peek(cpu, self.cpus + i * CPU_SIZE + CPU_PAGETABLE) == pt)
+            .fold(0, |set, i| set | 1 << i)
     }
 
     fn step(&mut self, cpu: &Cpu) {
         let h = cpu.id as usize;
         if cpu.pc == self.entry && cpu.x[10] != self.kernel_pt {
-            self.active[h] = Some((cpu.x[1], cpu.x[2], 0, 0));
+            let pt = cpu.x[10];
+            self.active[h] = Some(Shootdown {
+                ra: cpu.x[1],
+                sp: cpu.x[2],
+                pt,
+                running: self.running(cpu, pt) & !(1 << h),
+                sent: false,
+                targets: 0,
+                flushed: 0,
+            });
         }
-        if let Some((ra, sp, targets, flushed)) = self.active[h] {
+        // A hart that leaves the page table, even for a moment, need not be
+        // asked: it flushes as it comes back (the scheduler's sfence.vma).
+        for k in 0..self.harts {
+            if let Some(mut s) = self.active[k] {
+                if !s.sent {
+                    s.running &= self.running(cpu, s.pt);
+                    self.active[k] = Some(s);
+                }
+            }
+        }
+        if let Some(mut s) = self.active[h] {
             if cpu.pc == self.ipi && self.body.contains(&cpu.x[1]) {
-                self.active[h] = Some((ra, sp, cpu.x[10], flushed));
-            } else if cpu.pc == ra && cpu.x[2] == sp {
+                s.targets = cpu.x[10];
+                s.sent = true;
+                self.active[h] = Some(s);
+            } else if cpu.pc == s.ra && cpu.x[2] == s.sp {
                 assert_eq!(
-                    targets & flushed,
-                    targets,
-                    "hart {h}'s shootdown returned before harts {:#x} flushed",
-                    targets & !flushed
+                    s.running & s.targets,
+                    s.running,
+                    "hart {h}'s shootdown of {:#x} left out harts {:#x}, which ran it",
+                    s.pt,
+                    s.running & !s.targets
                 );
-                if targets != 0 {
+                assert_eq!(
+                    s.targets & s.flushed,
+                    s.targets,
+                    "hart {h}'s shootdown returned before harts {:#x} flushed",
+                    s.targets & !s.flushed
+                );
+                if s.targets != 0 {
                     self.shared += 1;
                 }
+                self.most = self.most.max(s.running.count_ones());
                 self.active[h] = None;
             }
         }
@@ -371,9 +260,9 @@ impl Shootdowns {
         // (another request's IPI woke it).
         if cpu.pc == self.sfence && self.serve.contains(&cpu.x[1]) {
             for (k, a) in self.active.iter_mut().enumerate() {
-                if let Some((_, _, _, flushed)) = a {
+                if let Some(s) = a {
                     if k != h {
-                        *flushed |= 1 << h;
+                        s.flushed |= 1 << h;
                     }
                 }
             }
@@ -459,15 +348,15 @@ fn threadtest_passes_on_one_and_four_harts() {
     // on 4. Its child that faults is reported as any killed process is.
     // Afterwards every page and thread slot is back; joining an ended
     // thread finds it without a kernel stack; and on 4 harts the shootdowns
-    // of sbrk() from two threads at once reach the other hart running the
-    // process before they return.
+    // of sbrk() from three threads at once reach every other hart running
+    // the process before they return, two of them at once at least once.
     for harts in [1, 4] {
         let (tx, rx) = std::sync::mpsc::channel();
         let (mut m, elf) = load(harts, rx);
         step_to_prompt(&mut m);
         let before = free_pages(&m, &elf);
         let mut locks = LockWatch::new(&elf);
-        let mut shootdowns = Shootdowns::new(&elf, &m);
+        let mut shootdowns = Shootdowns::new(&elf, &m, harts);
         let mut joins = Joins::new(&elf);
         run_command(&mut m, &tx, "threadtest", |cpu| {
             locks.step(cpu);
@@ -484,8 +373,9 @@ fn threadtest_passes_on_one_and_four_harts() {
         assert!(lines[1].starts_with("  scause 0x0000000f  sepc 0x"), "{lines:#?}");
         assert!(lines[1].ends_with("  stval 0x00000000"), "{lines:#?}");
         assert_eq!(lines[2], "  va 0x00000000 is not mapped");
-        assert!(
-            lines[3].starts_with("threadtest: ") && lines[3].ends_with(" checks, 0 failed"),
+        assert_eq!(
+            lines[3],
+            format!("threadtest: {THREADTEST_CHECKS} checks, 0 failed"),
             "{harts} harts: {lines:#?}"
         );
         assert_eq!(free_pages(&m, &elf), before, "{harts} harts: pages leaked");
@@ -496,7 +386,65 @@ fn threadtest_passes_on_one_and_four_harts() {
                 shootdowns.shared > 0,
                 "no shootdown reached another hart running the process"
             );
+            assert!(
+                shootdowns.most >= 2,
+                "no shootdown found two other harts running the process"
+            );
         }
         exit_shell(&mut m, &tx);
+    }
+}
+
+/// The checks `threadtest` and `threadtest fs` make: each must run every one.
+const THREADTEST_CHECKS: u32 = 96;
+const THREADTEST_FS_CHECKS: u32 = 16;
+
+#[test]
+fn threads_using_the_filesystem_end_with_their_process_on_one_and_four_harts() {
+    // threadtest fs, booted with the root image (so programs come from the
+    // disk): a process execs while another of its threads reads the same
+    // program, or writes more than a transaction's worth at a time; exits
+    // and is killed while its threads read and write; closes a descriptor
+    // two of its threads are reading and writing; changes directory while
+    // another opens. Every one ends (exec waits for the others only once it
+    // has let go of the program's inode and its transaction), every page
+    // and thread slot is back, and the disk is consistent and holds what it
+    // did, the scratch files gone.
+    let image = xtask::fs::build(
+        &repo_root(),
+        &Options {
+            size: 2048,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let before = fsck::check(&image).unwrap_or_else(|p| panic!("{p:#?}"));
+    for harts in [1, 4] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let disk = MemDisk::from_image(image.clone()).unwrap();
+        let (mut m, elf) = load_with(harts, rx, vec![Box::new(disk)]);
+        step_to_prompt(&mut m);
+        let pages = free_pages(&m, &elf);
+        let mut locks = LockWatch::new(&elf);
+        run_command(&mut m, &tx, "threadtest fs", |cpu| locks.step(cpu));
+        let out = printed(&m);
+        assert_eq!(
+            command_output(&out, "threadtest fs"),
+            [format!("threadtest fs: {THREADTEST_FS_CHECKS} checks, 0 failed")],
+            "{harts} harts"
+        );
+        assert_eq!(free_pages(&m, &elf), pages, "{harts} harts: pages leaked");
+        check_only_the_shell(&m, &elf);
+        exit_shell(&mut m, &tx);
+        let d = &mut m.cpu.bus.disks[0];
+        let mut disk = vec![0; d.capacity() as usize * SECTOR_SIZE];
+        d.backend().read(0, &mut disk).unwrap();
+        let after = fsck::check(&disk).unwrap_or_else(|p| panic!("{harts} harts: {p:#?}"));
+        assert_eq!((after.replayed, after.orphans), (0, 0), "{harts} harts");
+        assert_eq!(
+            (after.free_blocks, after.free_inodes),
+            (before.free_blocks, before.free_inodes),
+            "{harts} harts: the scratch files left something behind"
+        );
     }
 }

@@ -106,8 +106,10 @@ static int sys_procs(struct trap_frame *f) {
     struct procinfo info[NPROC];
     int n = proc_list(info, max < NPROC ? (int)max : NPROC);
     u32 filled = (u32)n < max ? (u32)n : max;
-    /* Checked above. */
-    copyout(pt, buf, info, filled * sizeof(struct procinfo));
+    /* Checked above, but another thread may have unmapped it since. */
+    if (copyout(pt, buf, info, filled * sizeof(struct procinfo)) != 0) {
+        return -EFAULT;
+    }
     return n;
 }
 
@@ -122,8 +124,10 @@ static int sys_harts(struct trap_frame *f) {
     struct hartinfo info[NCPU];
     int n = proc_harts(info, max < NCPU ? (int)max : NCPU);
     u32 filled = (u32)n < max ? (u32)n : max;
-    /* Checked above. */
-    copyout(pt, buf, info, filled * sizeof(struct hartinfo));
+    /* Checked above, but another thread may have unmapped it since. */
+    if (copyout(pt, buf, info, filled * sizeof(struct hartinfo)) != 0) {
+        return -EFAULT;
+    }
     return n;
 }
 

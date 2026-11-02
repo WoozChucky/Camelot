@@ -183,7 +183,7 @@ const struct user_program *user_program_find(const char *name);
 
 /* A new program's arguments, in kernel memory: `argc` NUL-terminated strings
  * one after another in `strings`, `len` bytes in all. proc_create() and
- * proc_exec() copy them to the top of the program's stack. */
+ * proc_exec_load() copy them to the top of the program's stack. */
 struct proc_args {
     u32 argc;
     u32 len;
@@ -213,14 +213,38 @@ struct thread *mythread(void);
  * Reading `prog` may sleep. */
 int proc_create(const struct elf_file *prog, const char *path, const char *name, const struct proc_args *args);
 
-/* Replaces the current process's program with `prog`, called `name`: a new
- * address space as proc_create() makes, registers all zero but pc, sp, a0
- * (argc) and a1 (argv). Every other thread of the process ends first; the
- * descriptors, the working directory, the pid and the parent stay. Returns
- * argc, which the system call leaves in a0; or, with the old program
- * untouched, -ENOMEM or -ENOEXEC ("exec: PATH: REASON"), or -EINTR if
- * another thread is ending the process meanwhile. */
-int proc_exec(const struct elf_file *prog, const char *path, const char *name, const struct proc_args *args);
+/* A program loaded for exec but not yet running: its address space, where
+ * its heap starts and its first registers. proc_exec_load() makes one and
+ * proc_exec_commit() puts it in place of the current program (or
+ * proc_exec_abandon() frees it). In two steps so that the caller can let go
+ * of the executable (its inode lock and transaction, exec.c) in between:
+ * the commit waits for the process's other threads to end, and one of them
+ * may be waiting for that inode, or for room in the log, meanwhile. */
+struct exec_image {
+    pagetable_t pagetable;
+    u32 heap;
+    struct trap_frame frame;
+};
+
+/* Loads `prog` into a new address space as proc_create() does, for the
+ * current process: registers all zero but pc, sp, a0 (argc) and a1
+ * (argv). Returns 0, or -ENOMEM or -ENOEXEC ("exec: PATH: REASON") with
+ * nothing allocated; the process is untouched either way. Reading `prog`
+ * may sleep. */
+int proc_exec_load(const struct elf_file *prog, const char *path, const struct proc_args *args,
+                   struct exec_image *img);
+
+/* Replaces the current process's program with `img`, called `name`. Every
+ * other thread of the process ends first; the descriptors, the working
+ * directory, the pid and the parent stay. Returns argc (the new program's
+ * a0, which the system call leaves there); or -EINTR, with the old program
+ * untouched and `img` freed, if another thread is ending the process
+ * meanwhile. Must be called holding no sleep lock and no transaction: it
+ * waits for threads that may need them to end. */
+int proc_exec_commit(struct exec_image *img, const char *name, const struct proc_args *args);
+
+/* Frees a loaded `img` that won't run. */
+void proc_exec_abandon(struct exec_image *img);
 
 /* Makes a runnable kernel process called `name` that runs `fn` in S-mode on
  * its own kernel stack, with the kernel page table and interrupts off (like
@@ -370,6 +394,11 @@ bool fd_available(void);
 /* Takes descriptor `fd` away and returns its file, whose reference passes
  * to the caller; NULL if `fd` is not open. */
 struct file *fd_take(u32 fd);
+
+/* fd_take() only if `fd` still holds `f`: true if it did, its reference
+ * now the caller's. For taking back a descriptor just installed, which
+ * another thread may have closed (or reused) meanwhile. */
+bool fd_take_if(u32 fd, struct file *f);
 
 /* The working directory, with a reference of the caller's own (idup), or
  * NULL if there is none. */

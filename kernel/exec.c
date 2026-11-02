@@ -1,6 +1,6 @@
 /* Running programs from a path (exec.h): the lookup, from the root
  * filesystem or among the embedded programs, then proc_create() for spawn
- * or proc_exec() for exec. */
+ * or proc_exec_load() and proc_exec_commit() for exec. */
 #include "exec.h"
 #include "elf.h"
 #include "fs.h"
@@ -95,15 +95,28 @@ int exec_spawn(const char *path, const struct proc_args *args) {
     return pid;
 }
 
+/* Loads the program `f` for exec, closes it, and runs it as `name`. The
+ * whole image is read before the file is closed, and only then does
+ * proc_exec_commit() wait for the process's other threads to end: one of
+ * them may be waiting for the program's inode lock (reading the same file),
+ * or for room in the log, which this transaction holds until it ends. */
+static int load_and_run(struct elf_file *f, const char *path, const char *name, const struct proc_args *args) {
+    struct exec_image img;
+    int err = proc_exec_load(f, path, args, &img);
+    prog_close(f);
+    if (err < 0) {
+        return err;
+    }
+    return proc_exec_commit(&img, name, args);
+}
+
 int exec_replace(const char *path, const struct proc_args *args) {
     struct elf_file f;
     int err = prog_open(path, !fs_mounted, &f);
     if (err < 0) {
         return err;
     }
-    err = proc_exec(&f, path, last_name(path), args);
-    prog_close(&f);
-    return err;
+    return load_and_run(&f, path, last_name(path), args);
 }
 
 int exec_init(const char *path, const char *name) {
@@ -124,8 +137,7 @@ int exec_init(const char *path, const char *name) {
     args->argc = 1;
     args->len = strlen(name) + 1;
     memcpy(args->strings, name, args->len);
-    err = proc_exec(&f, path, name, args);
+    err = load_and_run(&f, path, name, args);
     kfree(args);
-    prog_close(&f);
     return err;
 }
