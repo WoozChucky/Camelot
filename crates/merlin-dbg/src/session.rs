@@ -1,0 +1,671 @@
+//! merlin-dbg's commands: a debugging session over a [`Remote`], reading commands a
+//! line at a time and writing what they show (`docs/merlin-dbg.md`, "Commands").
+
+use crate::frames::{self, Regs};
+use crate::remote::{self, Remote, StopEvent, Watch};
+use crate::symbols::Symbols;
+use excalibur::Syntax;
+use excalibur::{decode, Inst};
+use std::io::Write;
+use std::sync::atomic::AtomicBool;
+
+/// A breakpoint or a watchpoint, numbered from 1 as they are set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Point {
+    Break(u32),
+    Watch(Watch, u32, u32),
+}
+
+/// Whether the session goes on after a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    Continue,
+    Quit,
+}
+
+/// What `quit` (or the end of the commands) does to the machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnQuit {
+    /// Stop it (`k`): merlin-dbg started it.
+    Kill,
+    /// Leave it running (`D`): it was there before merlin-dbg connected.
+    Detach,
+}
+
+pub struct Session<'a, W: Write> {
+    remote: Remote,
+    symbols: Symbols,
+    out: W,
+    points: Vec<(usize, Point)>,
+    next_point: usize,
+    /// The program has exited: no machine to talk to any more.
+    exited: bool,
+    on_quit: OnQuit,
+    interrupt: &'a AtomicBool,
+}
+
+type Result<T> = std::result::Result<T, String>;
+
+/// A stop as [`Session::resume`] gives it: the hart, the watchpoint hit (its kind and
+/// address), and the signal (5 for a trap, 2 for an interrupt).
+type Halt = (usize, Option<(Watch, u32)>, u8);
+
+const HELP: &str = "\
+break|b ADDR            set a breakpoint (ADDR: 0x80000000, 1234, main, main+8, $ra)
+watch [-r|-a] ADDR [N]  stop after a write (-r read, -a either) of N bytes at ADDR (4)
+delete|d [N]            delete breakpoint or watchpoint N, or all of them
+info breakpoints|i b    list breakpoints and watchpoints
+continue|c              run until something stops the machine (Ctrl-C to interrupt)
+stepi|si|step|s [N]     run N instructions (1) of the selected hart
+nexti|ni|next|n [N]     the same, but run a call to its return
+finish                  run until the current function returns
+regs|info registers     the selected hart's registers
+x/N[w|b] ADDR           N words (w) or bytes (b) of memory at ADDR
+disas [ADDR] [N]        disassemble N instructions (8) from ADDR (the pc)
+bt|backtrace            the call stack, by frame pointer
+hart [N]                list the harts, or select hart N
+quit|q                  leave (the machine is killed, or left running with --connect)";
+
+impl<'a, W: Write> Session<'a, W> {
+    pub fn new(remote: Remote, symbols: Symbols, out: W, on_quit: OnQuit, interrupt: &'a AtomicBool) -> Self {
+        Session {
+            remote,
+            symbols,
+            out,
+            points: Vec::new(),
+            next_point: 1,
+            exited: false,
+            on_quit,
+            interrupt,
+        }
+    }
+
+    /// Says where the machine is stopped, as the session starts.
+    pub fn start(&mut self) -> Result<()> {
+        let harts = self.remote.harts;
+        if harts > 1 {
+            self.say(format!("connected: {harts} harts"));
+        }
+        self.show_pc()
+    }
+
+    /// Runs one command line. Errors are printed, and the session goes on.
+    pub fn command(&mut self, line: &str) -> Flow {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return Flow::Continue;
+        }
+        match self.run(line) {
+            Ok(flow) => flow,
+            Err(e) => {
+                self.say(format!("error: {e}"));
+                Flow::Continue
+            }
+        }
+    }
+
+    /// The end of the session: the machine is killed or left running.
+    pub fn quit(&mut self) {
+        if self.exited {
+            return;
+        }
+        match self.on_quit {
+            OnQuit::Kill => self.remote.kill(),
+            OnQuit::Detach => {
+                let _ = self.remote.detach();
+            }
+        }
+        self.exited = true;
+    }
+
+    /// Writes `s` as it is (a prompt, an echoed command).
+    pub fn print(&mut self, s: &str) {
+        let _ = write!(self.out, "{s}");
+        let _ = self.out.flush();
+    }
+
+    fn say(&mut self, s: impl AsRef<str>) {
+        let _ = writeln!(self.out, "{}", s.as_ref());
+        let _ = self.out.flush();
+    }
+
+    fn run(&mut self, line: &str) -> Result<Flow> {
+        let (cmd, rest) = match line.find(char::is_whitespace) {
+            Some(i) => (&line[..i], line[i..].trim()),
+            None => (line, ""),
+        };
+        let args: Vec<&str> = rest.split_whitespace().collect();
+        if matches!(cmd, "quit" | "q" | "exit") {
+            self.quit();
+            return Ok(Flow::Quit);
+        }
+        if matches!(cmd, "help" | "h" | "?") {
+            self.say(HELP);
+            return Ok(Flow::Continue);
+        }
+        if self.exited {
+            return Err("the program is not running".into());
+        }
+        match cmd {
+            "break" | "b" | "br" => self.break_(rest)?,
+            "watch" => self.watch(&args)?,
+            "delete" | "d" => self.delete(&args)?,
+            "info" | "i" => match args.first().copied() {
+                Some("breakpoints" | "b" | "break" | "watchpoints") => self.info_breakpoints(),
+                Some("registers" | "r" | "reg") => self.regs()?,
+                Some("harts" | "threads") => self.harts()?,
+                _ => return Err("info breakpoints, info registers or info harts".into()),
+            },
+            "continue" | "c" => self.continue_()?,
+            "stepi" | "si" | "step" | "s" => {
+                for _ in 0..count(&args)? {
+                    if !self.step()? {
+                        break;
+                    }
+                }
+            }
+            "nexti" | "ni" | "next" | "n" => {
+                for _ in 0..count(&args)? {
+                    if !self.next()? {
+                        break;
+                    }
+                }
+            }
+            "finish" => self.finish()?,
+            "regs" | "registers" => self.regs()?,
+            "disas" | "disassemble" => self.disas(&args)?,
+            "bt" | "backtrace" | "where" => self.backtrace()?,
+            "hart" | "thread" => match args.first() {
+                None => self.harts()?,
+                Some(n) => self.select_hart(n)?,
+            },
+            _ if cmd.starts_with("x/") || cmd == "x" => self.examine(&cmd[1..], rest)?,
+            _ => return Err(format!("unknown command '{cmd}' (try help)")),
+        }
+        Ok(Flow::Continue)
+    }
+
+    // ---- Expressions ----
+
+    /// An address or a value: a number (`0x80000000`, `1234`), a symbol, a register
+    /// (`$sp`, `$a0`, `$x5`, `$pc`), each optionally `+N` or `-N`.
+    fn eval(&mut self, expr: &str) -> Result<u32> {
+        let expr = expr.trim();
+        if let Some(i) = expr.rfind(['+', '-']).filter(|&i| i > 0) {
+            let base = self.eval(&expr[..i])?;
+            let off = parse_number(expr[i + 1..].trim()).ok_or_else(|| format!("bad offset in '{expr}'"))?;
+            return Ok(if &expr[i..i + 1] == "+" {
+                base.wrapping_add(off)
+            } else {
+                base.wrapping_sub(off)
+            });
+        }
+        if let Some(reg) = expr.strip_prefix('$') {
+            let n = register_number(reg).ok_or_else(|| format!("no register ${reg}"))?;
+            return self.remote.register(n);
+        }
+        if let Some(n) = parse_number(expr) {
+            return Ok(n);
+        }
+        self.symbols
+            .lookup(expr)
+            .ok_or_else(|| format!("no symbol '{expr}'"))
+    }
+
+    // ---- Breakpoints and watchpoints ----
+
+    fn add_point(&mut self, p: Point) -> usize {
+        let n = self.next_point;
+        self.next_point += 1;
+        self.points.push((n, p));
+        n
+    }
+
+    fn break_(&mut self, expr: &str) -> Result<()> {
+        if expr.is_empty() {
+            return Err("break needs an address or a symbol".into());
+        }
+        let addr = self.eval(expr)?;
+        if !self.has_breakpoint(addr) {
+            self.remote.set_breakpoint(addr)?;
+        }
+        let n = self.add_point(Point::Break(addr));
+        let at = self.symbols.show(addr);
+        self.say(format!("breakpoint {n} at {at}"));
+        Ok(())
+    }
+
+    fn has_breakpoint(&self, addr: u32) -> bool {
+        self.points.iter().any(|(_, p)| *p == Point::Break(addr))
+    }
+
+    fn watch(&mut self, args: &[&str]) -> Result<()> {
+        let (kind, args) = match args.first() {
+            Some(&"-r") => (Watch::Read, &args[1..]),
+            Some(&"-a") => (Watch::Access, &args[1..]),
+            Some(&"-w") => (Watch::Write, &args[1..]),
+            _ => (Watch::Write, args),
+        };
+        let (addr, len) = match args {
+            [addr] => (self.eval(addr)?, 4),
+            [addr, len] => (self.eval(addr)?, parse_number(len).ok_or("bad length")?),
+            _ => return Err("watch [-r|-a] ADDR [LEN]".into()),
+        };
+        self.remote.set_watchpoint(kind, addr, len)?;
+        let n = self.add_point(Point::Watch(kind, addr, len));
+        let at = self.symbols.show(addr);
+        self.say(format!("watchpoint {n} ({}) at {at}, {len} bytes", kind.name()));
+        Ok(())
+    }
+
+    fn delete(&mut self, args: &[&str]) -> Result<()> {
+        let doomed: Vec<(usize, Point)> = match args {
+            [] => self.points.clone(),
+            [n] => {
+                let n: usize = n
+                    .parse()
+                    .map_err(|_| format!("'{n}' is not a breakpoint number"))?;
+                let p = self
+                    .points
+                    .iter()
+                    .find(|(m, _)| *m == n)
+                    .ok_or_else(|| format!("no breakpoint {n}"))?;
+                vec![*p]
+            }
+            _ => return Err("delete [N]".into()),
+        };
+        for (n, p) in doomed {
+            self.points.retain(|(m, _)| *m != n);
+            match p {
+                Point::Break(addr) if !self.has_breakpoint(addr) => self.remote.clear_breakpoint(addr)?,
+                Point::Break(_) => {}
+                Point::Watch(kind, addr, len) => self.remote.clear_watchpoint(kind, addr, len)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn info_breakpoints(&mut self) {
+        if self.points.is_empty() {
+            self.say("no breakpoints or watchpoints");
+            return;
+        }
+        let mut lines = vec!["Num  Type        Where".to_string()];
+        for (n, p) in &self.points {
+            lines.push(match *p {
+                Point::Break(addr) => format!("{n:<4} breakpoint  {}", self.symbols.show(addr)),
+                Point::Watch(kind, addr, len) => format!(
+                    "{n:<4} watchpoint  {}, {len} bytes, {}",
+                    self.symbols.show(addr),
+                    kind.name()
+                ),
+            });
+        }
+        self.say(lines.join("\n"));
+    }
+
+    // ---- Running ----
+
+    /// Resumes (a step of `step`'s hart, or every hart) and reports the stop. Returns
+    /// the stop, or `None` once the program has exited.
+    fn resume(&mut self, step: Option<usize>) -> Result<Option<Halt>> {
+        match self.remote.resume(step, self.interrupt)? {
+            StopEvent::Exited(code) => {
+                self.exited = true;
+                self.say(format!("program exited with code {code}"));
+                Ok(None)
+            }
+            StopEvent::Stopped { signal, hart, watch } => Ok(Some((hart, watch, signal))),
+        }
+    }
+
+    /// Reports why the machine stopped at the selected hart's pc.
+    fn report(&mut self, hart: usize, watch: Option<(Watch, u32)>, signal: u8) -> Result<()> {
+        let pc = self.remote.register(remote::PC)?;
+        let who = self.hart_prefix(hart);
+        if let Some((kind, addr)) = watch {
+            let n = self.points.iter().find_map(|(n, p)| match *p {
+                Point::Watch(k, a, l) if k == kind && addr.wrapping_sub(a) < l => Some(*n),
+                _ => None,
+            });
+            let n = n.map_or(String::new(), |n| format!(" {n}"));
+            let at = self.symbols.show(addr);
+            self.say(format!("{who}watchpoint{n} ({}) hit at {at}", kind.name()));
+        } else if signal == 2 {
+            self.say(format!("{who}interrupted"));
+        } else if let Some(n) = self
+            .points
+            .iter()
+            .find_map(|(n, p)| (*p == Point::Break(pc)).then_some(*n))
+        {
+            self.say(format!("{who}breakpoint {n}"));
+        }
+        self.show_pc()
+    }
+
+    fn hart_prefix(&self, hart: usize) -> String {
+        if self.remote.harts > 1 {
+            format!("[hart {hart}] ")
+        } else {
+            String::new()
+        }
+    }
+
+    /// `=> pc <sym+off>: instruction`.
+    fn show_pc(&mut self) -> Result<()> {
+        let pc = self.remote.register(remote::PC)?;
+        let line = self.disas_line(pc, true);
+        self.say(line);
+        Ok(())
+    }
+
+    fn continue_(&mut self) -> Result<()> {
+        if let Some((hart, watch, signal)) = self.resume(None)? {
+            self.report(hart, watch, signal)?;
+        }
+        Ok(())
+    }
+
+    /// One instruction of the selected hart. False once the program has exited, or
+    /// another stop got in the way (a breakpoint hit by a hart before it).
+    fn step(&mut self) -> Result<bool> {
+        let hart = self.remote.selected()?;
+        let Some((stopped, watch, signal)) = self.resume(Some(hart))? else {
+            return Ok(false);
+        };
+        let pc = self.remote.register(remote::PC)?;
+        if stopped != hart || watch.is_some() || signal != 5 || self.has_breakpoint(pc) {
+            self.report(stopped, watch, signal)?;
+            return Ok(false);
+        }
+        self.show_pc()?;
+        Ok(true)
+    }
+
+    /// One instruction, or a whole call: a `jal`/`jalr` that links (`call`, `jal f`),
+    /// or the `auipc ra` + `jalr ra` pair of a far call, runs until it returns.
+    fn next(&mut self) -> Result<bool> {
+        let pc = self.remote.register(remote::PC)?;
+        let word = self.remote.read_word(pc).map(decode);
+        let after = match word {
+            Some(Inst::Jal { rd, .. } | Inst::Jalr { rd, .. }) if rd != 0 => Some(pc.wrapping_add(4)),
+            Some(Inst::Auipc { rd: 1, .. }) => match self.remote.read_word(pc.wrapping_add(4)).map(decode) {
+                Some(Inst::Jalr { rd: 1, rs1: 1, .. }) => Some(pc.wrapping_add(8)),
+                _ => None,
+            },
+            _ => None,
+        };
+        match after {
+            None => self.step(),
+            Some(ret) => self.run_to(ret, |sp, sp0| sp >= sp0),
+        }
+    }
+
+    /// Runs until the function the selected hart is in returns to its caller.
+    fn finish(&mut self) -> Result<()> {
+        let frames = self.frames()?;
+        let Some(caller) = frames.get(1) else {
+            return Err("cannot find the caller (no frame above this one)".into());
+        };
+        let at = self.symbols.show(caller.pc);
+        self.say(format!("run till exit, back to {at}"));
+        // Back in the caller, sp is above where it is now (or the same, from a leaf).
+        if self.run_to(caller.pc, |sp, sp0| sp >= sp0)? {
+            let a0 = self.remote.register(10)?;
+            self.say(format!("returned: a0 = {a0:#010x} ({})", a0 as i32));
+        }
+        Ok(())
+    }
+
+    /// Runs the selected hart until it reaches `target` with its stack pointer passing
+    /// `stack_ok(sp, sp now)` (so a recursive call returning there does not count), with
+    /// a temporary breakpoint. Another stop (a breakpoint, a watchpoint, an interrupt,
+    /// the end) is reported and ends the run. True if it got there.
+    fn run_to(&mut self, target: u32, stack_ok: impl Fn(u32, u32) -> bool) -> Result<bool> {
+        let hart = self.remote.selected()?;
+        let sp0 = self.remote.register(2)?;
+        let temporary = !self.has_breakpoint(target);
+        if temporary {
+            self.remote.set_breakpoint(target)?;
+        }
+        let result = loop {
+            let stop = match self.resume(None) {
+                Ok(Some(stop)) => stop,
+                Ok(None) => break Ok(false),
+                Err(e) => break Err(e),
+            };
+            let (stopped, watch, signal) = stop;
+            let pc = self.remote.register(remote::PC)?;
+            let ours = stopped == hart && watch.is_none() && signal == 5 && pc == target;
+            if ours && stack_ok(self.remote.register(2)?, sp0) {
+                if !temporary {
+                    self.report(stopped, watch, signal)?;
+                } else {
+                    self.show_pc()?;
+                }
+                break Ok(true);
+            }
+            if !(ours && temporary) {
+                self.report(stopped, watch, signal)?;
+                break Ok(false);
+            }
+            // Our breakpoint, but another call deeper down: on with the run. The stop
+            // selected the hart that hit it, ours.
+        };
+        if temporary && !self.exited {
+            self.remote.clear_breakpoint(target)?;
+        }
+        if !self.exited {
+            self.remote.select(hart)?;
+        }
+        result
+    }
+
+    // ---- Looking ----
+
+    fn regs(&mut self) -> Result<()> {
+        let r = self.remote.registers()?;
+        let mut lines = Vec::new();
+        for row in 0..8 {
+            let line: Vec<String> = (0..4)
+                .map(|col| {
+                    let n = row * 4 + col;
+                    format!("{:<4} {:#010x}", excalibur::reg::abi_name(n as u8), r[n])
+                })
+                .collect();
+            lines.push(line.join("  "));
+        }
+        let mode = match self.remote.register(remote::PRIV) {
+            Ok(0) => "U",
+            Ok(1) => "S",
+            Ok(3) => "M",
+            _ => "?",
+        };
+        lines.push(format!("pc   {}  mode {mode}", self.symbols.show(r[32])));
+        self.say(lines.join("\n"));
+        Ok(())
+    }
+
+    /// `x/N[w|b] ADDR`.
+    fn examine(&mut self, format: &str, addr: &str) -> Result<()> {
+        let format = format.strip_prefix('/').unwrap_or(format);
+        let (count, unit) = match format.strip_suffix(['w', 'b', 'x']) {
+            Some(n) => (n, format.chars().last().unwrap()),
+            None => (format, 'w'),
+        };
+        let count = if count.is_empty() {
+            1
+        } else {
+            parse_number(count).ok_or_else(|| format!("bad count '{count}'"))? as usize
+        };
+        if addr.is_empty() {
+            return Err("x/N ADDR".into());
+        }
+        let addr = self.eval(addr)?;
+        let size = if unit == 'b' { 1 } else { 4 };
+        let per_line = if unit == 'b' { 8 } else { 4 };
+        let bytes = self.remote.read_memory(addr, count * size)?;
+        let mut lines = Vec::new();
+        for (i, chunk) in bytes.chunks(per_line * size).enumerate() {
+            let at = addr.wrapping_add((i * per_line * size) as u32);
+            let values: Vec<String> = chunk
+                .chunks(size)
+                .map(|v| match *v {
+                    [b] => format!("{b:#04x}"),
+                    [a, b, c, d] => format!("{:#010x}", u32::from_le_bytes([a, b, c, d])),
+                    _ => "?".into(),
+                })
+                .collect();
+            lines.push(format!("{}:  {}", self.symbols.show(at), values.join("  ")));
+        }
+        if bytes.len() < count * size {
+            lines.push(format!(
+                "(cannot read past {:#010x})",
+                addr.wrapping_add(bytes.len() as u32)
+            ));
+        }
+        self.say(lines.join("\n"));
+        Ok(())
+    }
+
+    fn disas_line(&mut self, pc: u32, here: bool) -> String {
+        let mark = if here { "=>" } else { "  " };
+        let at = self.symbols.show(pc);
+        match self.remote.read_word(pc) {
+            Some(word) => {
+                let d = decode(word).format(Some(pc), Syntax::OBJDUMP);
+                let target = d
+                    .target
+                    .and_then(|t| self.symbols.describe(t))
+                    .map_or(String::new(), |s| format!(" <{s}>"));
+                format!("{mark} {at}:  {d}{target}")
+            }
+            None => format!("{mark} {at}:  (cannot read memory)"),
+        }
+    }
+
+    fn disas(&mut self, args: &[&str]) -> Result<()> {
+        let pc = self.remote.register(remote::PC)?;
+        let start = match args.first() {
+            Some(a) => self.eval(a)?,
+            None => pc,
+        };
+        let count = match args.get(1) {
+            Some(n) => parse_number(n).ok_or("bad count")?,
+            None => 8,
+        };
+        let lines: Vec<String> = (0..count)
+            .map(|i| {
+                let at = start.wrapping_add(4 * i);
+                self.disas_line(at, at == pc)
+            })
+            .collect();
+        self.say(lines.join("\n"));
+        Ok(())
+    }
+
+    fn frames(&mut self) -> Result<Vec<frames::Frame>> {
+        let r = self.remote.registers()?;
+        let regs = Regs {
+            pc: r[32],
+            ra: r[1],
+            fp: r[8],
+        };
+        let symbols = &self.symbols;
+        Ok(frames::backtrace(&mut self.remote, regs, |pc| {
+            symbols.containing(pc).map(|(_, start)| start)
+        }))
+    }
+
+    fn backtrace(&mut self) -> Result<()> {
+        let frames = self.frames()?;
+        let lines: Vec<String> = frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| format!("#{i}  {}", self.symbols.show(f.pc)))
+            .collect();
+        self.say(lines.join("\n"));
+        Ok(())
+    }
+
+    /// Every hart: the stub's description and its pc. The selection stays.
+    fn harts(&mut self) -> Result<()> {
+        let selected = self.remote.selected()?;
+        let mut lines = Vec::new();
+        for h in 0..self.remote.harts {
+            self.remote.select(h)?;
+            let pc = self.remote.register(remote::PC)?;
+            let info = self.remote.hart_info(h).unwrap_or_else(|_| format!("hart {h}"));
+            let mark = if h == selected { "*" } else { " " };
+            lines.push(format!("{mark} {info}, at {}", self.symbols.show(pc)));
+        }
+        self.remote.select(selected)?;
+        self.say(lines.join("\n"));
+        Ok(())
+    }
+
+    fn select_hart(&mut self, n: &str) -> Result<()> {
+        let h: usize = n.parse().map_err(|_| format!("'{n}' is not a hart number"))?;
+        if h >= self.remote.harts {
+            return Err(format!("no hart {h}: the machine has {}", self.remote.harts));
+        }
+        self.remote.select(h)?;
+        self.say(format!("hart {h}"));
+        self.show_pc()
+    }
+}
+
+/// A count argument (1 if absent).
+fn count(args: &[&str]) -> Result<u32> {
+    match args.first() {
+        None => Ok(1),
+        Some(n) => parse_number(n).ok_or_else(|| format!("bad count '{n}'")),
+    }
+}
+
+/// `0x...` hex or decimal.
+pub fn parse_number(s: &str) -> Option<u32> {
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => s.parse().ok(),
+    }
+}
+
+/// GDB's number for a register name: `pc`, `x0`-`x31`, an ABI name (`fp` too), a CSR
+/// name, or `priv`.
+pub fn register_number(name: &str) -> Option<usize> {
+    match name {
+        "pc" => return Some(remote::PC),
+        "fp" => return Some(8),
+        "priv" => return Some(remote::PRIV),
+        _ => {}
+    }
+    if let Some(n) = name.strip_prefix('x').and_then(|n| n.parse::<usize>().ok()) {
+        return (n < 32).then_some(n);
+    }
+    if let Some(r) = excalibur::reg::parse(name) {
+        return Some(r as usize);
+    }
+    excalibur::csr::parse(name).map(remote::csr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numbers_and_registers() {
+        assert_eq!(parse_number("0x80000000"), Some(0x8000_0000));
+        assert_eq!(parse_number("42"), Some(42));
+        assert_eq!(parse_number("main"), None);
+        assert_eq!(register_number("sp"), Some(2));
+        assert_eq!(register_number("x31"), Some(31));
+        assert_eq!(register_number("x32"), None);
+        assert_eq!(register_number("fp"), Some(8));
+        assert_eq!(register_number("s0"), Some(8));
+        assert_eq!(register_number("pc"), Some(32));
+        assert_eq!(register_number("mstatus"), Some(65 + 0x300));
+        assert_eq!(register_number("priv"), Some(4161));
+        assert_eq!(register_number("nope"), None);
+    }
+}

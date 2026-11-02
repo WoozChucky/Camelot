@@ -49,6 +49,7 @@ impl Hart {
             .read(paddr, 4)
             .map_err(|_| Trap::new(Access::Load.access_fault(), vaddr))?;
         bus.reservation_mut(self.id as usize).reserve(paddr);
+        bus.watches.note(self.id, vaddr, 4, true, false);
         Ok(v)
     }
 
@@ -73,6 +74,7 @@ impl Hart {
         }
         self.write_phys(bus, paddr, 4, val)
             .map_err(|_| Trap::new(Access::Store.access_fault(), vaddr))?;
+        bus.watches.note(self.id, vaddr, 4, false, true);
         Ok(0)
     }
 
@@ -85,6 +87,7 @@ impl Hart {
         let old = bus.read(paddr, 4).map_err(fault)?;
         self.write_phys(bus, paddr, 4, amo_result(op, old, src))
             .map_err(fault)?;
+        bus.watches.note(self.id, vaddr, 4, true, true);
         Ok(old)
     }
 }

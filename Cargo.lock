@@ -101,6 +101,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "merlin-dbg"
+version = "0.1.0"
+dependencies = [
+ "elf32",
+ "excalibur",
+ "grail",
+]
+
+[[package]]
 name = "merlin-ld"
 version = "0.1.0"
 dependencies = [
