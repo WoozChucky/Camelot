@@ -1599,13 +1599,12 @@ fn closing_with_data_unread_resets_and_an_orphan_in_fin_wait_2_ends() {
         ),
         [seg(49152, 80, iss + 102, 0, RST, b"").with_wnd(0)]
     );
-    // The reset goes out before the slot is freed: let the kernel finish.
-    for _ in 0..4 {
-        vm.m.run_for(SLICE, &mut |_| {});
-        host.service();
-    }
+    // The reset goes out before the slot is freed: let the kernel finish, and say
+    // nothing more.
+    run_until(&mut [&mut vm], Some(&mut host), |vms| {
+        vms[0].read_var("tcp_in_use") == 0
+    });
     assert!(host.take().is_empty());
-    assert_eq!(vm.read_var("tcp_in_use"), 0);
 
     // Again, but nothing more comes: the stack waits TCP_FIN_TIMEOUT (600 ticks) from
     // the close for the host's FIN, then frees the slot without a word.

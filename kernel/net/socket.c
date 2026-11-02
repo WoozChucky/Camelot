@@ -394,7 +394,13 @@ int sock_sys_sendto(u32 fd, u32 ubuf, u32 len, u32 uaddr) {
     }
     u32 addr = 0;
     u32 port = 0;
-    if (uaddr != 0) {
+    if (uaddr != 0 && s->type == SOCK_STREAM) {
+        /* Ignored, as the connection says where: only the pointer is
+         * checked, as for every call. */
+        if (!uvm_range_ok(user_pt(), uaddr, sizeof(struct sockaddr_in), PTE_R)) {
+            return -EFAULT;
+        }
+    } else if (uaddr != 0) {
         err = get_addr(uaddr, &addr, &port);
         if (err < 0) {
             return err;
@@ -433,6 +439,11 @@ int sock_sys_shutdown(u32 fd, u32 how) {
     if (s->type == SOCK_STREAM) {
         if (s->tcp->raddr == 0) {
             return -ENOTCONN; /* never connected, or a listener */
+        }
+        if (s->tcp->state == TCP_CLOSED) {
+            /* Over: what ended it (refused, reset, timed out), whichever
+             * side `how` names; -ENOTCONN once it closed normally. */
+            return s->tcp->err != 0 ? s->tcp->err : -ENOTCONN;
         }
         if (how != SHUT_RD) {
             err = tcp_shutdown(s->tcp);

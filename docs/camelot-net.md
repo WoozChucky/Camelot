@@ -222,8 +222,11 @@ page table, or kernel memory (a null page table):
 A socket is bound to a port on every address of the host. Datagrams wait on
 it in their buffers, at most 4 (`UDP_QUEUE_MAX`); more are dropped
 (`queue-full`). A socket with a peer (`raddr` and `rport`, set by the
-`connect` system call) takes datagrams from that peer only; the others count
-in `no-port`, as if it weren't there. A datagram to a port with no socket counts in `no-port`,
+`connect` system call) takes datagrams from that peer only (any
+127.0.0.0/8 address stands for 127.0.0.1, which loopback replies come
+from); the others are dropped and count in `no-port`, and the echo service
+does not answer them either, since the port is the socket's. A datagram to a
+port with no socket counts in `no-port`,
 except for the echo service (RFC 862): on port 7 with no socket bound, a
 datagram comes back to its sender, from the address it was sent to, unless
 it came from a port below 1024 (two echo services would bounce it forever)

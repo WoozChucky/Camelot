@@ -172,14 +172,16 @@ int fileread(struct file *f, pagetable_t pt, u32 dst, u32 n) {
     if (!uvm_range_ok(pt, dst, n, PTE_W)) {
         return -EFAULT;
     }
+    /* A socket's read is its recv, which for 0 bytes on UDP still takes
+     * the next datagram. */
+    if (f->type == FD_SOCKET) {
+        return socket_read(f->sock, pt, dst, n);
+    }
     if (n == 0) {
         return 0;
     }
     if (f->type == FD_PIPE) {
         return piperead(f->pipe, pt, dst, n);
-    }
-    if (f->type == FD_SOCKET) {
-        return socket_read(f->sock, pt, dst, n);
     }
     if (f->type == FD_DEVICE) {
         return devsw[f->major].read(pt, dst, n);
@@ -194,14 +196,16 @@ int filewrite(struct file *f, pagetable_t pt, u32 src, u32 n) {
     if (!uvm_range_ok(pt, src, n, PTE_R)) {
         return -EFAULT;
     }
+    /* A socket's write is its send, which for 0 bytes on UDP is still a
+     * datagram (an empty one). */
+    if (f->type == FD_SOCKET) {
+        return socket_write(f->sock, pt, src, n);
+    }
     if (n == 0) {
         return 0;
     }
     if (f->type == FD_PIPE) {
         return pipewrite(f->pipe, pt, src, n);
-    }
-    if (f->type == FD_SOCKET) {
-        return socket_write(f->sock, pt, src, n);
     }
     if (f->type == FD_DEVICE) {
         return devsw[f->major].write(pt, src, n);

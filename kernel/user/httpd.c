@@ -32,6 +32,8 @@ static char chunk[CHUNK];
 static char path[MAXPATH + 2];
 static char header[256];
 static char root[MAXPATH + 1];
+/* How much of `path` is the root's: the rest is the request's path. */
+static int root_len;
 
 static int usage(void) {
     fprintf(STDERR, "usage: httpd [-p PORT] [-n COUNT] [-t SECONDS] [DIR]\n");
@@ -160,8 +162,8 @@ static int hex(char c) {
 }
 
 /* Turns the request's target (`target`, NUL-terminated) into a path under
- * the root in `path`: the query cut off, %XX decoded. Returns 200, or the
- * status that says why not. */
+ * the root in `path`: the query cut off, %XX decoded; path + root_len is
+ * then the request's path. Returns 200, or the status that says why not. */
 static int map_path(const char *target) {
     if (target[0] != '/') {
         return 400;
@@ -171,6 +173,7 @@ static int map_path(const char *target) {
         n--; /* the target brings its own */
     }
     memcpy(path, root, (size_t)n);
+    root_len = n;
     for (const char *p = target; *p != 0 && *p != '?' && *p != '#'; p++) {
         char c = *p;
         if (c == '%') {
@@ -222,16 +225,90 @@ static int send_file(int fd, int file, const char *name, int size, int head_only
     return size;
 }
 
-/* Sends a list of the directory `dir` (open), its entries as links. */
-static int send_listing(int fd, int dir, const char *target, int head_only) {
-    /* Built in the heap: its size is only known at the end. */
-    int cap = 1024;
-    int len = 0;
-    char *page = malloc((size_t)cap);
-    if (page == NULL) {
-        return send_error(fd, 500, head_only);
+/* A page built in the heap, as it grows: a listing's size is only known at
+ * the end. Every append makes room for what it adds first, so nothing is
+ * written past the end and every byte of `data` up to `len` was written.
+ * If the heap runs out, `failed` is set and the rest is not added. */
+struct page {
+    char *data;
+    int len;
+    int cap;
+    int failed;
+};
+
+/* Appends the `n` bytes at `s`, doubling the room until they fit. */
+static void put(struct page *pg, const char *s, int n) {
+    if (pg->failed) {
+        return;
     }
-    len += snprintf(page, (size_t)cap, "<html><body><h1>%s</h1><ul>\n", target);
+    if (pg->len + n > pg->cap) {
+        int cap = pg->cap > 0 ? pg->cap : 1024;
+        while (pg->len + n > cap) {
+            cap *= 2;
+        }
+        char *bigger = realloc(pg->data, (size_t)cap);
+        if (bigger == NULL) {
+            pg->failed = 1;
+            return;
+        }
+        pg->data = bigger;
+        pg->cap = cap;
+    }
+    memcpy(pg->data + pg->len, s, (size_t)n);
+    pg->len += n;
+}
+
+static void put_str(struct page *pg, const char *s) {
+    put(pg, s, (int)strlen(s));
+}
+
+/* Appends `s` as HTML text: the characters that mean something in HTML
+ * (& < > ") as entities. */
+static void put_html(struct page *pg, const char *s) {
+    for (; *s != 0; s++) {
+        if (*s == '&') {
+            put_str(pg, "&amp;");
+        } else if (*s == '<') {
+            put_str(pg, "&lt;");
+        } else if (*s == '>') {
+            put_str(pg, "&gt;");
+        } else if (*s == '"') {
+            put_str(pg, "&quot;");
+        } else {
+            put(pg, s, 1);
+        }
+    }
+}
+
+/* Appends the first `n` bytes of the path `s` as a URL path: letters,
+ * digits, '/' and - . _ ~ as they are, every other byte as %XX (which
+ * map_path decodes), so the result is also safe in an HTML attribute. */
+static void put_url(struct page *pg, const char *s, int n) {
+    static const char digits[] = "0123456789ABCDEF";
+    for (int i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/' ||
+            c == '-' || c == '.' || c == '_' || c == '~') {
+            put(pg, s + i, 1);
+        } else {
+            char esc[3] = {'%', digits[c >> 4], digits[c & 15]};
+            put(pg, esc, 3);
+        }
+    }
+}
+
+/* Sends a list of the directory `dir` (open), its entries as links. `url`
+ * is the directory's path as the client sees it: the request's path,
+ * decoded, without the query, starting with '/'. */
+static int send_listing(int fd, int dir, const char *url, int head_only) {
+    struct page pg = {NULL, 0, 0, 0};
+    int ulen = (int)strlen(url);
+    if (ulen > 1 && url[ulen - 1] == '/') {
+        ulen--; /* the links bring their own */
+    }
+    put_str(&pg, "<html><body><h1>");
+    put_html(&pg, url);
+    put_str(&pg, "</h1><ul>\n");
     struct dirent de;
     while (read(dir, &de, sizeof de) == (int)sizeof de) {
         if (de.inum == 0) {
@@ -243,33 +320,40 @@ static int send_listing(int fd, int dir, const char *target, int head_only) {
         if (strcmp(name, ".") == 0) {
             continue;
         }
-        if (len + 2 * DIRSIZ + 64 > cap) {
-            cap *= 2;
-            char *bigger = realloc(page, (size_t)cap);
-            if (bigger == NULL) {
-                break;
+        int parent = strcmp(name, "..") == 0;
+        if (parent && ulen <= 1) {
+            continue; /* the root has none */
+        }
+        put_str(&pg, "<li><a href=\"");
+        if (parent) {
+            /* The path up to its last '/' (map_path would refuse "/dir/.."). */
+            int up = ulen;
+            while (up > 1 && url[up - 1] != '/') {
+                up--;
             }
-            page = bigger;
+            put_url(&pg, url, up);
+        } else {
+            put_url(&pg, url, ulen);
+            if (ulen > 1) {
+                put_str(&pg, "/");
+            }
+            put_url(&pg, name, (int)strlen(name));
         }
-        const char *slash = target[strlen(target) - 1] == '/' ? "" : "/";
-        len += snprintf(page + len, (size_t)(cap - len), "<li><a href=\"%s%s%s\">%s</a></li>\n", target, slash,
-                        name, name);
+        put_str(&pg, "\">");
+        put_html(&pg, name);
+        put_str(&pg, "</a></li>\n");
     }
-    if (len + 32 > cap) {
-        char *bigger = realloc(page, (size_t)(len + 32));
-        if (bigger != NULL) {
-            page = bigger;
-            cap = len + 32;
+    put_str(&pg, "</ul></body></html>\n");
+    int len = pg.len;
+    if (pg.failed) {
+        len = send_error(fd, 500, head_only);
+    } else {
+        send_head(fd, 200, "text/html", len);
+        if (!head_only) {
+            send_all(fd, pg.data, len);
         }
     }
-    if (len + 32 <= cap) {
-        len += snprintf(page + len, (size_t)(cap - len), "</ul></body></html>\n");
-    }
-    send_head(fd, 200, "text/html", len);
-    if (!head_only) {
-        send_all(fd, page, len);
-    }
-    free(page);
+    free(pg.data);
     return len;
 }
 
@@ -315,7 +399,8 @@ static void serve(int fd, struct sockaddr_in *peer) {
                 if (index >= 0 && fstat(index, &ist) == 0 && ist.type == T_FILE) {
                     bytes = send_file(fd, index, path, (int)ist.size, head_only);
                 } else {
-                    bytes = send_listing(fd, file, target, head_only);
+                    path[n] = 0; /* the directory again */
+                    bytes = send_listing(fd, file, path + root_len, head_only);
                 }
                 if (index >= 0) {
                     close(index);

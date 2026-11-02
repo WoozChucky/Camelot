@@ -96,7 +96,7 @@ there is a filesystem to look it up in.
 | 33 | `recv` | `int fd, void *buf, uint len` | bytes received, 0 at the end; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EINVAL`, `-EAGAIN`, `-EINTR` |
 | 34 | `sendto` | `int fd, const void *buf, uint len, const struct sockaddr_in *to` | bytes sent; `send`'s errors, `-EFAULT` also for `to`, `-EAFNOSUPPORT`, `-EINVAL`, `-EADDRINUSE` |
 | 35 | `recvfrom` | `int fd, void *buf, uint len, struct sockaddr_in *from` | bytes received; `recv`'s errors (`-EFAULT` also for `from`) |
-| 36 | `shutdown` | `int fd, int how` | 0; `-EBADF`, `-ENOTSOCK`, `-EINVAL`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT` |
+| 36 | `shutdown` | `int fd, int how` | 0; `-EBADF`, `-ENOTSOCK`, `-EINVAL`, `-ENOTCONN`, `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT` |
 | 37 | `getsockname` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT` |
 | 38 | `getpeername` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN` |
 | 39 | `setsockopt` | `int fd, int level, int option, const void *value, uint len` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EINVAL`, `-ENOPROTOOPT` |
@@ -126,7 +126,8 @@ behind `fd` ("File descriptors" below) and returns how many it wrote: `len`,
 unless the disk filled up or a pipe lost its readers part way, when it is
 the bytes written until then. `fd` must be open for writing, or it is
 `-EBADF`; all of `buf` must be readable, or nothing is written (`-EFAULT`).
-`len` = 0 writes nothing and returns 0. To a file on the disk, the bytes go
+`len` = 0 writes nothing and returns 0 (except to a socket, where `write`
+is `send`: on UDP that is an empty datagram). To a file on the disk, the bytes go
 at the descriptor's offset, which moves past them, and the file grows if they
 run past its end; a write that can write nothing fails with what stopped it:
 `-ENOSPC` (the disk is full), `-EFBIG` (the file would pass the largest a
@@ -140,7 +141,8 @@ open any more.
 `fd` into `buf` and returns how many it read; 0 means the end of the input.
 `fd` must be open for reading, or it is `-EBADF`; all of `buf` must be
 writable, or it is `-EFAULT` and nothing is read. `len` = 0 returns 0 without
-waiting. From a file on the disk, the bytes come from the descriptor's
+waiting (except from a socket, where `read` is `recv`: on UDP it takes the
+next datagram). From a file on the disk, the bytes come from the descriptor's
 offset, which moves past them: `len` of them, fewer at the end of the file,
 0 at or past it. A directory reads the same way, as its array of 16-byte
 entries (`struct dirent` in `user.h`, the format in `docs/camelot-fs.md`).
@@ -410,7 +412,8 @@ left).
 
 **listen(fd, backlog)** makes a TCP socket a listener: the connections that
 come to its port wait for `accept`, at most `backlog` of them (taken as 1
-to 8) that are not accepted yet; one more is refused. A socket that is not
+to 8) that are not accepted yet. One more is dropped: its SYN gets no
+answer, so the peer sends it again, and gets in once there is room. A socket that is not
 bound gets an ephemeral port first. `-EOPNOTSUPP` for a UDP socket,
 `-EINVAL` for one that is connected or listening already.
 
@@ -448,15 +451,17 @@ to `len`; 0 once the peer has ended its side and everything before was
 read. Once a connection was reset or timed out, it returns that error
 (`-ECONNRESET`, `-ETIMEDOUT`); `-ENOTCONN` for a socket never connected. On UDP it takes the next datagram (from the peer only, on a
 connected socket): what does not fit in `len` is lost, and the call returns
-what it stored; an empty datagram returns 0. `-EINVAL` for a UDP socket
-with no port, which nothing can ever reach. After `shutdown` for reading,
-it returns 0 at once. `len` = 0 returns 0 without waiting. Errors also:
+what it stored; an empty datagram returns 0. `len` = 0 still takes the next
+datagram (waiting for it), as on Linux; on TCP it returns 0 without
+waiting. `-EINVAL` for a UDP socket with no port, which nothing can ever
+reach. After `shutdown` for reading, it returns 0 at once. Errors also:
 `-EAGAIN` (the receive timeout ran out), `-EINTR`.
 
 **sendto(fd, buf, len, to)** is `send` to the address `to`; a null `to` is
 `send`. On UDP, `to` overrides the peer (`-EINVAL` for address 0.0.0.0 or
 port 0) and an unbound socket gets an ephemeral port. On TCP, `to` is
-ignored: the connection says where.
+ignored, its family too (the connection says where); only the pointer is
+checked.
 
 **recvfrom(fd, buf, len, from)** is `recv`, which also stores where the
 bytes came from at `from` unless it is null: the datagram's sender, or the
@@ -469,7 +474,8 @@ connection's peer.
 descriptor stays open, for what the other direction still has to do.
 `-EINVAL` for another `how`, `-ENOTCONN` for a socket that is not
 connected (a listener, a UDP socket without a peer); for a TCP connection
-that is over, what ended it (`-ECONNRESET`, `-ETIMEDOUT`).
+that is over, whatever `how` is, what ended it (`-ECONNREFUSED`,
+`-ECONNRESET`, `-ETIMEDOUT`), or `-ENOTCONN` once it closed normally.
 
 **getsockname(fd, addr)** stores the socket's own address at `addr`: its
 port (0 if it has none yet) and the address its packets leave from (0.0.0.0

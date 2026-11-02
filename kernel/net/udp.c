@@ -23,6 +23,18 @@ static struct udp_sock socks[UDP_SOCKETS];
 /* Where udp_open(0) looks for a free port next. */
 static u32 next_ephemeral = UDP_EPHEMERAL_FIRST;
 
+/* Whether a datagram from `src`:`sport` comes from the peer a socket is
+ * connected to, `raddr`:`rport`. Every 127.0.0.0/8 address is this host,
+ * and what this host sends to one leaves from 127.0.0.1 (ip_source()), so
+ * a socket connected to 127.0.0.2 takes the replies from 127.0.0.1. */
+static bool from_peer(u32 raddr, u32 rport, u32 src, u32 sport) {
+    if (rport != sport) {
+        return false;
+    }
+    u32 lo = IP_LOOPBACK & IP_LOOPBACK_MASK;
+    return raddr == src || ((raddr & IP_LOOPBACK_MASK) == lo && (src & IP_LOOPBACK_MASK) == lo);
+}
+
 static struct udp_sock *find(u32 port) {
     for (u32 i = 0; i < UDP_SOCKETS; i++) {
         if (socks[i].used && socks[i].port == port) {
@@ -174,9 +186,12 @@ void udp_input(struct pbuf *p, u32 src, u32 dst, const u8 *u, u32 len) {
     u32 sport = get16(u);
     u32 dport = get16(u + 2);
     struct udp_sock *s = find(dport);
-    if (s != NULL && s->raddr != 0 && (s->raddr != src || s->rport != sport)) {
-        /* Connected to another peer: as if nobody had the port. */
-        s = NULL;
+    if (s != NULL && s->raddr != 0 && !from_peer(s->raddr, s->rport, src, sport)) {
+        /* Connected to another peer: dropped. The port is the socket's
+         * all the same, so the echo service doesn't answer either. */
+        net_stats.rx_no_port++;
+        pbuf_free(p);
+        return;
     }
     if (s != NULL) {
         if (s->queue.len >= UDP_QUEUE_MAX) {

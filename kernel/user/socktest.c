@@ -357,6 +357,12 @@ static void test_tcp(void) {
     check_eq(recvfrom(s, buf, 1, &there), 1, "recvfrom on a connection");
     check(there.sin_port == peer.sin_port && ntohl(there.sin_addr.s_addr) == INADDR_LOOPBACK,
           "recvfrom says the peer");
+    struct sockaddr_in other = a;
+    other.sin_family = 1;
+    check_eq(sendto(c, "?", 1, &other), 1, "even an address of family 1");
+    check(recv(s, buf, sizeof buf) == 1 && buf[0] == '?', "it went through the connection");
+    check_eq(sendto(c, "?", 1, (struct sockaddr_in *)KERNEL), -EFAULT, "but the pointer is checked");
+    check_eq(write(c, "", 0), 0, "write of 0 bytes on a connection");
 
     /* A receive timeout: nothing comes. */
     struct timeval tv;
@@ -410,6 +416,9 @@ static void test_tcp(void) {
     c = socket(AF_INET, SOCK_STREAM, 0);
     a = addr_of(INADDR_LOOPBACK, 7010);
     check_eq(connect(c, &a), -ECONNREFUSED, "connect to a port nobody listens on");
+    check_eq(shutdown(c, SHUT_RD), -ECONNREFUSED, "shutdown for reading says what ended it");
+    check_eq(shutdown(c, SHUT_WR), -ECONNREFUSED, "for writing too");
+    check_eq(shutdown(c, SHUT_RDWR), -ECONNREFUSED, "and both");
     close(c);
     l = listener(7010);
     check(l >= 0, "listen on the port again");
@@ -508,6 +517,52 @@ static void test_udp(void) {
     close(b);
     close(c);
 
+    /* read and write are recv and send, for 0 bytes too: an empty
+     * datagram goes, and a read of 0 bytes takes the next one. */
+    a = socket(AF_INET, SOCK_DGRAM, 0);
+    b = socket(AF_INET, SOCK_DGRAM, 0);
+    to = addr_of(INADDR_LOOPBACK, 7031);
+    tv.tv_sec = 0;
+    tv.tv_usec = 300000;
+    check_eq(bind(a, &to), 0, "bind a UDP socket to 7031");
+    check_eq(setsockopt(a, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv), 0, "a receive timeout");
+    check_eq(connect(b, &to), 0, "connect another to it");
+    check_eq(write(b, "", 0), 0, "write of 0 bytes on a connected UDP socket");
+    check_eq(recv(a, buf, sizeof buf), 0, "sends an empty datagram");
+    check_eq(send(b, "r", 1), 1, "a datagram");
+    check_eq(read(a, buf, 0), 0, "read of 0 bytes");
+    check_eq(recv(a, buf, sizeof buf), -EAGAIN, "took it");
+
+    /* Port 7 held by a socket connected to someone else: what others send
+     * to it is dropped, and the echo service, which answers only while no
+     * socket has the port, stays quiet. */
+    struct sockaddr_in seven = addr_of(INADDR_LOOPBACK, 7);
+    c = socket(AF_INET, SOCK_DGRAM, 0);
+    check_eq(setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv), 0, "a receive timeout");
+    int e = socket(AF_INET, SOCK_DGRAM, 0);
+    check_eq(bind(e, &seven), 0, "bind a UDP socket to port 7");
+    check_eq(setsockopt(e, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv), 0, "a receive timeout");
+    struct sockaddr_in elsewhere = addr_of(INADDR_LOOPBACK, 9000);
+    check_eq(connect(e, &elsewhere), 0, "connect it elsewhere");
+    check_eq(sendto(c, "hi", 2, &seven), 2, "send to port 7");
+    check_eq(recv(c, buf, sizeof buf), -EAGAIN, "no echo while a socket has the port");
+    check_eq(recv(e, buf, sizeof buf), -EAGAIN, "nor does the socket get it");
+    close(e);
+    check_eq(sendto(c, "hi", 2, &seven), 2, "send to port 7 once it's free");
+    check(recv(c, buf, sizeof buf) == 2 && memcmp(buf, "hi", 2) == 0, "the echo answers again");
+
+    /* Connected to 127.0.0.2: this host too, and the replies, from
+     * 127.0.0.1, are the peer's. */
+    struct sockaddr_in two = addr_of(INADDR_LOOPBACK + 1, 7031);
+    check_eq(connect(c, &two), 0, "connect to 127.0.0.2");
+    check_eq(send(c, "q", 1), 1, "send to it");
+    check_eq(recvfrom(a, buf, sizeof buf, &from), 1, "it comes");
+    check_eq(sendto(a, "r", 1, &from), 1, "a reply");
+    check(recv(c, buf, sizeof buf) == 1 && buf[0] == 'r', "the reply comes from the peer");
+    close(a);
+    close(b);
+    close(c);
+
     /* Running out: 8 UDP sockets with ports. (DHCP's is closed by now.) */
     int fds[UDP_SOCKETS + 1];
     int made = 0;
@@ -576,6 +631,48 @@ static void test_running_out(void) {
     }
 }
 
+/* accept with no descriptor free: -EMFILE, and the connection stays on
+ * the listener for the next accept, which a descriptor freed lets through. */
+static void test_accept_without_a_descriptor(void) {
+    int l = listener(7050);
+    int c = connected(7050);
+    check(l >= 0 && c >= 0, "a connection waits on a listener");
+    /* A connection lost would make the next accept wait: not for ever. */
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    check_eq(setsockopt(l, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv), 0, "a timeout on the listener");
+    int fds[NOFILE];
+    int n = 0;
+    for (;;) {
+        int fd = dup(c);
+        if (fd < 0) {
+            check_eq(fd, -EMFILE, "dup until no descriptor is left");
+            break;
+        }
+        fds[n] = fd;
+        n++;
+    }
+    struct sockaddr_in peer;
+    check_eq(accept(l, &peer), -EMFILE, "accept with no descriptor free");
+    check_eq(accept(l, &peer), -EMFILE, "again");
+    close(fds[n - 1]);
+    int s = accept(l, &peer);
+    check_eq(s, fds[n - 1], "accept takes the descriptor freed");
+    struct sockaddr_in here;
+    check(s >= 0 && getsockname(c, &here) == 0 && peer.sin_port == here.sin_port,
+          "and the connection that waited");
+    char b = 0;
+    check_eq(send(c, "z", 1), 1, "send on it");
+    check(recv(s, &b, 1) == 1 && b == 'z', "it arrives");
+    for (int i = 0; i < n - 1; i++) {
+        close(fds[i]);
+    }
+    close(s);
+    close(c);
+    close(l);
+}
+
 static int child(int argc, char **argv) {
     if (strcmp(argv[1], "tcpfill") == 0) {
         int made = 0;
@@ -619,6 +716,7 @@ int main(int argc, char **argv) {
     test_udp();
     test_killed_waits();
     test_running_out();
+    test_accept_without_a_descriptor();
     printf("socktest: %d checks, %d failed\n", checks, failures);
     return failures;
 }

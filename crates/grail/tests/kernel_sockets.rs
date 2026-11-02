@@ -25,6 +25,7 @@ use grail::net::{MacAddr, NetBackend};
 use grail::{DiskConfig, MachineConfig};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -47,6 +48,41 @@ fn test_resolver() -> gateway::Resolver {
 /// A machine on the user-mode gateway (DHCP gives it 10.0.2.15), with `hostfwd`'s rules,
 /// the test resolver, and `disks`. Returns it and the forwarding rules as bound.
 fn user_vm(hostfwd: Vec<gateway::HostFwd>, disks: Vec<DiskConfig>) -> (Vm, Vec<gateway::HostFwd>) {
+    let (vm, fwd, _) = user_vm_losing_dns(hostfwd, disks);
+    (vm, fwd)
+}
+
+/// The gateway, but DNS queries from the machine are lost while the budget (the
+/// second counter) lasts; the first counts every query the machine sent.
+struct LosingDns {
+    inner: SteppedGateway,
+    dns: Arc<(AtomicUsize, AtomicUsize)>,
+}
+
+impl NetBackend for LosingDns {
+    fn send(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        if is_dns_query(frame) {
+            self.dns.0.fetch_add(1, Ordering::SeqCst);
+            let left = self.dns.1.load(Ordering::SeqCst);
+            if left > 0 {
+                self.dns.1.store(left - 1, Ordering::SeqCst);
+                return Ok(());
+            }
+        }
+        self.inner.send(frame)
+    }
+
+    fn recv(&mut self) -> Option<Vec<u8>> {
+        self.inner.recv()
+    }
+}
+
+/// [`user_vm`], on [`LosingDns`]: also returns its counters (queries sent, queries left
+/// to lose; none at first).
+fn user_vm_losing_dns(
+    hostfwd: Vec<gateway::HostFwd>,
+    disks: Vec<DiskConfig>,
+) -> (Vm, Vec<gateway::HostFwd>, Arc<(AtomicUsize, AtomicUsize)>) {
     let gw = gateway::Gateway::new(gateway::Config {
         hostfwd,
         limits: gateway::Limits {
@@ -57,7 +93,11 @@ fn user_vm(hostfwd: Vec<gateway::HostFwd>, disks: Vec<DiskConfig>) -> (Vm, Vec<g
     })
     .unwrap();
     let fwd = gw.hostfwd();
-    let backend: Box<dyn NetBackend> = Box::new(SteppedGateway::new(gw));
+    let dns = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+    let backend: Box<dyn NetBackend> = Box::new(LosingDns {
+        inner: SteppedGateway::new(gw),
+        dns: dns.clone(),
+    });
     let config = MachineConfig {
         ram_size: RAM,
         disks,
@@ -66,7 +106,7 @@ fn user_vm(hostfwd: Vec<gateway::HostFwd>, disks: Vec<DiskConfig>) -> (Vm, Vec<g
     let mut vm = Vm::with_config(config, vec![(MacAddr(gateway::DEFAULT_GUEST_MAC), backend)], &[]);
     boot(&mut [&mut vm], None);
     assert!(vm.out().contains("net: 10.0.2.15/24"), "{}", vm.out());
-    (vm, fwd)
+    (vm, fwd, dns)
 }
 
 /// What the host thread `h` returns, the machine running meanwhile.
@@ -145,7 +185,8 @@ fn embedded_programs(vm: &Vm) -> Vec<(String, Vec<u8>)> {
 }
 
 /// A root filesystem with `/dev/console`, the programs `programs` in `/bin` (taken from
-/// the kernel, as `cargo xtask fs` would build them) and `files` under `/www`.
+/// the kernel, as `cargo xtask fs` would build them) and `files` under `/www` (a name
+/// with a `/` in its own directory, made first).
 fn root_image(programs: &[&str], files: &[(&str, &[u8])]) -> Vec<u8> {
     // A machine only to read the kernel's programs from: loaded, never run.
     let vm = Vm::new(Vec::new(), Vec::new(), &[]);
@@ -159,7 +200,14 @@ fn root_image(programs: &[&str], files: &[(&str, &[u8])]) -> Vec<u8> {
         fs.add_file(&format!("/bin/{name}"), elf).unwrap();
     }
     fs.mkdir("/www").unwrap();
+    let mut dirs = Vec::new();
     for (name, data) in files {
+        if let Some((dir, _)) = name.rsplit_once('/') {
+            if !dirs.contains(&dir) {
+                fs.mkdir(&format!("/www/{dir}")).unwrap();
+                dirs.push(dir);
+            }
+        }
         fs.add_file(&format!("/www/{name}"), data).unwrap();
     }
     fs.finish()
@@ -175,6 +223,19 @@ fn http_client(addr: SocketAddr, request: String) -> JoinHandle<Vec<u8>> {
         stream.read_to_end(&mut answer).unwrap();
         answer
     })
+}
+
+/// httpd's log in `out`: its lines (`CLIENT:PORT METHOD TARGET STATUS BYTES`), as
+/// `CLIENT METHOD TARGET STATUS BYTES`, since the gateway's port varies.
+fn httpd_log(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|l| {
+            let at = l.find("10.0.2.2:").or_else(|| l.find("127.0.0.1:"))?;
+            let (client, rest) = l[at..].split_once(' ')?;
+            let host = client.split(':').next().unwrap();
+            Some(format!("{host} {rest}"))
+        })
+        .collect()
 }
 
 /// An answer split into its status line, its headers and its body.
@@ -197,7 +258,12 @@ fn httpd_serves_files_from_the_disk_through_a_forwarded_port() {
     let index = b"<html><body>Camelot</body></html>\n".to_vec();
     let image = root_image(
         &["sh", "httpd", "fetch", "cat"],
-        &[("big.txt", &big), ("index.html", &index)],
+        &[
+            ("big.txt", &big),
+            ("index.html", &index),
+            ("sub/a.txt", b"a\n"),
+            ("sub/x y&z.txt", b"xyz\n"),
+        ],
     );
     let (mut vm, fwd) = user_vm(
         vec![gateway::HostFwd::tcp(0, 80)],
@@ -205,17 +271,14 @@ fn httpd_serves_files_from_the_disk_through_a_forwarded_port() {
     );
     let addr = SocketAddr::V4(fwd[0].host);
     let prompts = vm.prompts();
-    vm.type_line("httpd -n 4 /www &");
+    vm.type_line("httpd -n 12 /www &");
     run_until(&mut [&mut vm], None, |vms| {
         vms[0].out().contains("httpd: serving /www on port 80\n") && vms[0].prompts() > prompts
     });
+    let mut ask = |request: &str| parse_answer(&join(&mut vm, http_client(addr, request.to_string())));
 
     // A file, byte for byte, with its length.
-    let answer = join(
-        &mut vm,
-        http_client(addr, "GET /big.txt HTTP/1.0\r\nHost: localhost\r\n\r\n".into()),
-    );
-    let (status, headers, body) = parse_answer(&answer);
+    let (status, headers, body) = ask("GET /big.txt HTTP/1.0\r\nHost: localhost\r\n\r\n");
     assert_eq!(status, "HTTP/1.0 200 OK");
     assert!(
         headers.contains(&"Content-Length: 20000".to_string()),
@@ -227,8 +290,7 @@ fn httpd_serves_files_from_the_disk_through_a_forwarded_port() {
     );
     assert!(body == big, "the body differs ({} bytes)", body.len());
     // A directory: its index.html.
-    let answer = join(&mut vm, http_client(addr, "GET / HTTP/1.0\r\n\r\n".into()));
-    let (status, headers, body) = parse_answer(&answer);
+    let (status, headers, body) = ask("GET / HTTP/1.0\r\n\r\n");
     assert_eq!(status, "HTTP/1.0 200 OK");
     assert!(
         headers.contains(&"Content-Type: text/html".to_string()),
@@ -236,21 +298,71 @@ fn httpd_serves_files_from_the_disk_through_a_forwarded_port() {
     );
     assert_eq!(body, index);
     // A name that isn't there.
-    let answer = join(&mut vm, http_client(addr, "GET /nothing HTTP/1.0\r\n\r\n".into()));
-    let (status, _, body) = parse_answer(&answer);
+    let (status, _, body) = ask("GET /nothing HTTP/1.0\r\n\r\n");
     assert_eq!(status, "HTTP/1.0 404 Not Found");
     assert_eq!(body, b"404 Not Found\n");
+    // Nothing above the served directory, spelled out or %-encoded.
+    for target in ["/../bin/sh", "/%2e%2e/bin/sh"] {
+        let (status, _, body) = ask(&format!("GET {target} HTTP/1.0\r\n\r\n"));
+        assert_eq!(status, "HTTP/1.0 403 Forbidden", "{target}");
+        assert_eq!(body, b"403 Forbidden\n", "{target}");
+    }
+    // HEAD: the headers of GET, no body.
+    let (status, headers, body) = ask("HEAD /big.txt HTTP/1.0\r\n\r\n");
+    assert_eq!(status, "HTTP/1.0 200 OK");
+    assert!(
+        headers.contains(&"Content-Length: 20000".to_string()),
+        "{headers:?}"
+    );
+    assert!(body.is_empty(), "{} bytes", body.len());
+    // Another method; a request that isn't one.
+    let (status, _, body) = ask("POST / HTTP/1.0\r\n\r\n");
+    assert_eq!(status, "HTTP/1.0 405 Method Not Allowed");
+    assert_eq!(body, b"405 Method Not Allowed\n");
+    let (status, _, body) = ask("garbage\r\n\r\n");
+    assert_eq!(status, "HTTP/1.0 400 Bad Request");
+    assert_eq!(body, b"400 Bad Request\n");
+    // A directory without index.html: a list of its entries, links to them (%-encoded,
+    // the names themselves as HTML), the parent's too.
+    let listing = "<html><body><h1>/sub</h1><ul>\n\
+                   <li><a href=\"/\">..</a></li>\n\
+                   <li><a href=\"/sub/a.txt\">a.txt</a></li>\n\
+                   <li><a href=\"/sub/x%20y%26z.txt\">x y&amp;z.txt</a></li>\n\
+                   </ul></body></html>\n";
+    let (status, headers, body) = ask("GET /sub HTTP/1.0\r\n\r\n");
+    assert_eq!(status, "HTTP/1.0 200 OK");
+    assert!(
+        headers.contains(&format!("Content-Length: {}", listing.len())),
+        "{headers:?}"
+    );
+    assert_eq!(String::from_utf8_lossy(&body), listing);
+    // The same with a long query, which is not part of the path: the page is built in
+    // the heap, as long as it needs, and the links leave the query out.
+    let query = "A".repeat(2000);
+    let long_listing = listing.replace("<h1>/sub</h1>", "<h1>/sub/</h1>");
+    let (status, headers, body) = ask(&format!("GET /sub/?{query} HTTP/1.0\r\n\r\n"));
+    assert_eq!(status, "HTTP/1.0 200 OK");
+    assert!(
+        headers.contains(&format!("Content-Length: {}", long_listing.len())),
+        "{headers:?}"
+    );
+    assert_eq!(String::from_utf8_lossy(&body), long_listing);
+    // A path longer than the filesystem's.
+    let long_path = format!("/{}", "a".repeat(200));
+    let (status, _, body) = ask(&format!("GET {long_path} HTTP/1.0\r\n\r\n"));
+    assert_eq!(status, "HTTP/1.0 414 Request-URI Too Long");
+    assert_eq!(body, b"414 Request-URI Too Long\n");
     // httpd logs a request once the client is done with the connection, which may be
     // after the client has all it wanted.
-    let logged = |n: usize| move |vms: &[&mut Vm]| vms[0].out().matches(" GET /").count() == n;
-    run_until(&mut [&mut vm], None, logged(3));
+    let logged = |n: usize| move |vms: &[&mut Vm]| httpd_log(&vms[0].out()).len() == n;
+    run_until(&mut [&mut vm], None, logged(11));
 
     // fetch in the machine, over loopback, into a file on the disk; httpd logs it too,
     // before or after the shell's next prompt.
     let (before, prompts) = (vm.out().len(), vm.prompts());
     vm.type_line("fetch http://127.0.0.1/index.html > copy.html");
     run_until(&mut [&mut vm], None, |vms| {
-        logged(4)(vms) && vms[0].prompts() > prompts
+        logged(12)(vms) && vms[0].prompts() > prompts
     });
     let out = &vm.out()[before..];
     assert!(!out.contains("fetch:"), "{out}");
@@ -260,23 +372,22 @@ fn httpd_serves_files_from_the_disk_through_a_forwarded_port() {
     );
 
     // httpd's log: one line per request, from the gateway (its port varies) or from
-    // loopback; then, after its fourth, it exits.
+    // loopback; then, after its twelfth, it exits.
     let out = vm.out();
-    let log: Vec<String> = out
-        .lines()
-        .filter(|l| l.contains(" GET /"))
-        .map(|l| {
-            let (client, rest) = l.split_once(' ').unwrap();
-            let host = client.split(':').next().unwrap();
-            format!("{host} {rest}")
-        })
-        .collect();
     assert_eq!(
-        log,
+        httpd_log(&out),
         [
             "10.0.2.2 GET /big.txt 200 20000".to_string(),
             format!("10.0.2.2 GET / 200 {}", index.len()),
             "10.0.2.2 GET /nothing 404 14".to_string(),
+            "10.0.2.2 GET /../bin/sh 403 14".to_string(),
+            "10.0.2.2 GET /%2e%2e/bin/sh 403 14".to_string(),
+            "10.0.2.2 HEAD /big.txt 200 20000".to_string(),
+            "10.0.2.2 POST / 405 23".to_string(),
+            "10.0.2.2 - - 400 16".to_string(),
+            format!("10.0.2.2 GET /sub 200 {}", listing.len()),
+            format!("10.0.2.2 GET /sub/?{query} 200 {}", long_listing.len()),
+            format!("10.0.2.2 GET {long_path} 414 25"),
             format!("127.0.0.1 GET /index.html 200 {}", index.len()),
         ],
         "{out}"
@@ -385,6 +496,34 @@ fn fetch_downloads_from_a_host_server_by_address_and_by_name() {
              1 sent, 1 received\n"
         )
     );
+    leave(&mut vm);
+}
+
+#[test]
+fn the_resolver_asks_again_when_a_query_is_lost() {
+    // resolve() sends a query up to three times, a second apart: two lost, the third
+    // is answered; three lost, the name is not found in time.
+    let (mut vm, _, dns) = user_vm_losing_dns(Vec::new(), Vec::new());
+    let vms = &mut [&mut vm];
+    dns.1.store(2, Ordering::SeqCst);
+    let start = vms[0].read_var("ticks");
+    assert_eq!(
+        mask_times(&command(vms, 0, None, &format!("ping {WEB_NAME} 1"))),
+        format!(
+            "PING {WEB_NAME} (10.0.2.2): 56 data bytes\n64 bytes from 10.0.2.2: seq=1 ttl=64 time=T ms\n\
+             1 sent, 1 received\n"
+        )
+    );
+    assert_eq!(dns.0.load(Ordering::SeqCst), 3);
+    let took = vms[0].read_var("ticks") - start;
+    assert!((20..30).contains(&took), "{took} ticks");
+    dns.0.store(0, Ordering::SeqCst);
+    dns.1.store(3, Ordering::SeqCst);
+    assert_eq!(
+        command(vms, 0, None, &format!("ping {WEB_NAME} 1")),
+        format!("ping: {WEB_NAME}: timed out\nping: exit 1\n")
+    );
+    assert_eq!(dns.0.load(Ordering::SeqCst), 3);
     leave(&mut vm);
 }
 
