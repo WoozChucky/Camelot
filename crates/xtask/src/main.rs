@@ -12,7 +12,8 @@ tasks:
                examples/<dir>/<name>.elf; no LLVM needed. Objects go to target/examples.
                --check: build in memory and report stale .elf files instead of writing
                -v: print the equivalent merlin-as/merlin-ld command lines
-  kernel       build kernel/kernel.elf (clang + ld.lld from the official LLVM install)
+  kernel       build kernel/kernel.elf (clang + ld.lld from the official LLVM install),
+               after regenerating kernel/userprogs.s from kernel/user (merlin-as + merlin-ld)
   hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
                with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
   ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj, llvm-objdump);
@@ -280,6 +281,16 @@ fn kernel(k: KernelArgs) -> ExitCode {
     };
     let root = repo_root();
     let kernel_dir = root.join("kernel");
+    // The user programs first (merlin-as + merlin-ld): their images are part
+    // of the kernel's sources.
+    match xtask::userprogs::write(&root) {
+        Ok(true) => eprintln!("regenerated {}", xtask::userprogs::GENERATED),
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("xtask: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     let default_out = k.out.is_none();
     // The tools run inside kernel/, so a relative -o must be made absolute here.
     let out = match k.out.map(std::path::absolute).transpose() {
