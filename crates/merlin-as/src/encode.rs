@@ -704,7 +704,7 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
             (_, [rd, rs2, addr]) => (rd, reg(rs2)?, addr),
             _ => return usage("rd, rs2, (rs1)"),
         };
-        let rs1 = atomic_address(m, addr, ctx)?;
+        let rs1 = atomic_address(m, addr)?;
         return one(r_type(AMO, 0b010, funct5 << 2 | aqrl, reg(rd)?, rs1, rs2));
     }
 
@@ -989,12 +989,14 @@ fn store(m: &str, funct3: u32, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, 
 }
 
 /// The address operand of an A instruction: `(rs1)`. An A instruction has no
-/// offset field, so `0(rs1)` is accepted (as LLVM does) and any other offset
-/// is an error.
-fn atomic_address(m: &str, addr: &Operand, ctx: &Ctx) -> Result<Reg, String> {
+/// offset field, so, as in LLVM, the only offset accepted is a literal `0`
+/// (`0(rs1)`). LLVM takes an integer token there, not an expression, so
+/// `-0(rs1)`, `1-1(rs1)` or a symbol equal to 0 are errors even though
+/// their value is 0.
+fn atomic_address(m: &str, addr: &Operand) -> Result<Reg, String> {
     let (offset, base) = mem(addr).map_err(|e| format!("{e}: {m} takes its address as (rs1)"))?;
-    match ctx.constant(offset) {
-        Some(0) => Ok(base),
+    match offset {
+        Expr::Num(0) => Ok(base),
         _ => Err(format!("{m} has no offset field: write the address as (rs1)")),
     }
 }

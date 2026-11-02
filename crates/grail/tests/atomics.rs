@@ -5,8 +5,9 @@
 //! Each test puts a few hand-encoded instructions at `RAM_BASE`, sets registers
 //! and steps the hart one instruction at a time.
 
-use grail::bus::{CLINT_BASE, RAM_BASE, UART_BASE};
+use grail::bus::{CLINT_BASE, KBD_BASE, RAM_BASE, UART_BASE};
 use grail::cpu::Mode;
+use grail::keyboard::KeyEvent;
 use grail::Machine;
 
 const A0: u32 = 10;
@@ -274,21 +275,46 @@ fn misaligned_addresses_trap() {
 #[test]
 fn atomics_on_devices_and_unmapped_addresses_are_access_faults() {
     let mtimecmp = CLINT_BASE + 0x4000;
+    // A value of mtimecmp's that any access would show: an AMO that read
+    // and wrote the register before trapping would change it.
+    const CMP: u64 = 0x1234_5678_9abc_def0;
     for addr in [mtimecmp, 0x2000_0000] {
         let mut m = machine(&[lr(A2, A0)]);
         set(&mut m, A0, addr);
         step_traps(&mut m, 5, addr);
+        assert_eq!(reg(&m, A2), 0, "lr.w wrote rd");
 
         let mut m = machine(&[amoadd(A2, A1, A0)]);
+        m.cpu.bus.clint.mtimecmp[0] = CMP;
         set(&mut m, A0, addr);
+        set(&mut m, A1, 1);
         step_traps(&mut m, 7, addr);
+        assert_eq!(reg(&m, A2), 0, "amoadd.w wrote rd");
+        assert_eq!(m.cpu.bus.clint.mtimecmp[0], CMP, "amoadd.w wrote the device");
 
         // sc only looks at the address when it holds a reservation.
         let mut m = machine(&[lr(A2, A1), sc(A2, A1, A0)]);
+        m.cpu.bus.clint.mtimecmp[0] = CMP;
         set(&mut m, A0, addr);
         set(&mut m, A1, DATA);
         step(&mut m);
         step_traps(&mut m, 7, addr);
+        assert_eq!(m.cpu.bus.clint.mtimecmp[0], CMP, "sc.w wrote the device");
+    }
+}
+
+#[test]
+fn atomics_do_not_read_device_registers() {
+    // Spec 4.1: "Device registers are not read or written". Reading the
+    // keyboard's 32-bit KBD_DATA takes the oldest event; an lr.w or AMO on
+    // it traps and leaves the event for the next lw.
+    let data = KBD_BASE + grail::keyboard::REG_DATA;
+    for (inst, cause) in [(lr(A2, A0), 5), (amoadd(A2, A1, A0), 7)] {
+        let mut m = machine(&[inst]);
+        assert!(m.key_event(KeyEvent::press(b'x')));
+        set(&mut m, A0, data);
+        step_traps(&mut m, cause, data);
+        assert_eq!(m.cpu.bus.kbd.len(), 1, "the event is still waiting");
     }
 }
 

@@ -87,7 +87,7 @@ funct5[31:27] aq[26] rl[25] rs2[24:20] rs1[19:15] 010 rd[11:7] 0101111
 | 10000 / 10100 | `amomin.w` / `amomax.w` | rd = M; M = signed min / max(M, rs2) |
 | 11000 / 11100 | `amominu.w` / `amomaxu.w` | rd = M; M = unsigned min / max(M, rs2) |
 
-Other funct5 values (`amocas.w` of Zacas, ...) are reserved and raise illegal-instruction. Assembly writes the ordering bits as a suffix: none, `.aq`, `.rl` or `.aqrl` (`amoadd.w.aqrl`). The address is written `(rs1)`, or `0(rs1)`; there is no offset field. Grail runs its harts one instruction at a time, in turn (section 7, "Harts"), so an AMO is atomic by construction and `aq`/`rl` change nothing; they are still encoded, decoded and disassembled.
+Other funct5 values (`amocas.w` of Zacas, ...) are reserved and raise illegal-instruction. Assembly writes the ordering bits as a suffix: none, `.aq`, `.rl` or `.aqrl` (`amoadd.w.aqrl`). The address is written `(rs1)`, or `0(rs1)` with a literal `0` (as in LLVM, an expression equal to 0 such as `1-1` is an error); there is no offset field. Grail runs its harts one instruction at a time, in turn (section 7, "Harts"), so an AMO is atomic by construction and `aq`/`rl` change nothing; they are still encoded, decoded and disassembled.
 
 Addresses (checked in this order):
 

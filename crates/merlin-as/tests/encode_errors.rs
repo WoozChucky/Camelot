@@ -390,6 +390,22 @@ const CASES: &[(&str, &str, &str)] = &[
         "A instructions have no offset field",
         "amoadd.w.aqrl has no offset field",
     ),
+    // Only a literal 0, as in LLVM (an integer token, not an expression).
+    (
+        "lr.w a0, -0(a1)",
+        "an offset expression equal to 0",
+        "lr.w has no offset field",
+    ),
+    (
+        "lr.w a0, 1-1(a1)",
+        "an offset expression equal to 0",
+        "lr.w has no offset field",
+    ),
+    (
+        "sc.w a0, a1, 0+0(a2)",
+        "an offset expression equal to 0",
+        "sc.w has no offset field",
+    ),
     (
         "sc.w a0, a1, a2",
         "address given as a plain register",
@@ -456,6 +472,23 @@ fn constants_used_before_their_equ_are_named() {
     assert_eq!(got[1], (2, says));
     // Defined first, it is a plain number.
     assert!(merlin_as::assemble(".equ LATER, 8\n    li a0, LATER\n    addi a0, a0, LATER\n").is_ok());
+}
+
+/// An A instruction's offset is a literal 0 or nothing, as in LLVM: a
+/// constant symbol equal to 0 is refused like any other expression.
+#[test]
+fn atomic_offsets_are_a_literal_zero() {
+    let errs = merlin_as::assemble(".equ Z, 0\n    amoadd.w a0, a1, Z(a2)\n").unwrap_err();
+    assert_eq!(
+        (errs[0].line, errs[0].msg.as_str()),
+        (2, "amoadd.w has no offset field: write the address as (rs1)")
+    );
+    let same = |src: &str| merlin_as::assemble(src).unwrap().sections[0].data.clone();
+    let want = same("    lr.w a0, (a1)\n");
+    assert_eq!(want, 0x1005_a52fu32.to_le_bytes());
+    for src in ["    lr.w a0, 0(a1)\n", "    lr.w a0, 0x0(a1)\n"] {
+        assert_eq!(same(src), want, "{src:?}");
+    }
 }
 
 /// An unknown mnemonic is named in the error.
