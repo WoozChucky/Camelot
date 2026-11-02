@@ -20,6 +20,7 @@ fn disk_spec_from(disk: &DiskConfig) -> Result<DeviceSpec, String> {
             None => return Err(format!("{} is not UTF-8", path.display())),
         },
         DiskSource::Memory(_) => return Err("memory disks have no wire form".to_string()),
+        DiskSource::Lake { addr, name } => avalon_proto::DiskSource::Lake { addr, name },
     };
     Ok(DeviceSpec::Disk(DiskSpec { source, read_only }))
 }
@@ -39,9 +40,8 @@ fn profile_from(config: &MachineConfig) -> Result<HardwareProfile, String> {
     })
 }
 
-/// What Avalon does with a profile from the wire. Disks on a Lake server become
-/// network backends handed to `Machine::with_backends`, not config disks, so this
-/// mirror of the config refuses them.
+/// What Avalon does with a profile from the wire: every disk, an image file or an image
+/// on a Lake server, becomes a config disk, in order.
 fn config_from(profile: &HardwareProfile) -> Result<MachineConfig, String> {
     let ram_size = usize::try_from(profile.ram_size).map_err(|_| "RAM size too large".to_string())?;
     let mut disks = Vec::new();
@@ -51,8 +51,8 @@ fn config_from(profile: &HardwareProfile) -> Result<MachineConfig, String> {
             avalon_proto::DiskSource::File(path) => {
                 disks.push(DiskConfig::file(path.as_str()).with_read_only(*read_only))
             }
-            avalon_proto::DiskSource::Lake { .. } => {
-                return Err("Lake disks are network backends, not config disks".to_string())
+            avalon_proto::DiskSource::Lake { addr, name } => {
+                disks.push(DiskConfig::lake(addr.as_str(), name.as_str()).with_read_only(*read_only))
             }
         }
     }
@@ -116,7 +116,9 @@ fn configs_survive_the_wire() {
         MachineConfig {
             disks: vec![
                 DiskConfig::file("disks/root.img"),
+                DiskConfig::lake("127.0.0.1:7401", "shared"),
                 DiskConfig::file("scratch.img").with_read_only(true),
+                DiskConfig::lake("[::1]:7500", "base.img").with_read_only(true),
             ],
             ..MachineConfig::with_ram(MIB)
         },

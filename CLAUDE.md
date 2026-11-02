@@ -23,13 +23,17 @@ crates/elf32            ELF32 reader (grail, merlin-objdump, merlin-ld)
 crates/grail            the emulator
 crates/avalon-proto     Avalon protocol (framing, messages, Connection), shared by the Avalon platform's programs; spec in docs/avalon-protocol.md
 crates/avalon           the Avalon hypervisor server: VM table, one thread per running VM (run_for slices), consoles, RAM budget
+crates/avalon-client    the client layer: VM control and disk management operations, parsers/formatters for addresses, sizes, clocks, disk sources (shared by Round Table and Pendragon; reuses grail::parse_ram_mib/parse_clock)
+crates/round-table      the Round Table control CLI: argument parsing and text output over avalon-client (src/lib.rs `run`, main.rs is a thin wrapper)
+crates/herald           Herald, the client that attaches to one VM: Session (the streaming layer, terminal-free) and the CLI, which puts the terminal in raw mode with grail::console::RawMode
+crates/lake             the Lake storage server: a directory of disk images served over the protocol (one writer or many readers per image); Grail's client side is grail::lake::LakeDisk
 crates/merlin           the C-subset compiler, C to .s (src/codegen.rs explains the stack frames and code generation, src/abi.rs the calling convention)
 crates/merlin-as        the assembler
 crates/merlin-ld        the linker (src/reloc.rs explains every relocation it applies)
 crates/merlin-objdump   the disassembler; output matches llvm-objdump 21
-crates/xtask            build tasks (`cargo xtask examples` builds every example with merlin-as + merlin-ld, no LLVM; `cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld, after generating kernel/userprogs.s from kernel/user with merlin-as + merlin-ld; `cargo xtask hello` rebuilds merlin-as's ld.lld-linked hello reference; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
-kernel/                 the Camelot kernel (C + assembly); kernel.elf and the generated userprogs.s are committed, rebuild with `cargo xtask kernel` after changes (kernel/user: the user programs it embeds)
-docs/                   ISA spec, Avalon protocol
+crates/xtask            build tasks (`cargo xtask examples` builds every example with merlin-as + merlin-ld, no LLVM; `cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld, after compiling kernel/user/*.c to kernel/user/clang/*.s with clang and generating kernel/userprogs.s from kernel/user with merlin-as + merlin-ld; `cargo xtask hello` rebuilds merlin-as's ld.lld-linked hello reference; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
+kernel/                 the Camelot kernel (C + assembly); kernel.elf, the generated userprogs.s and kernel/user/clang are committed, rebuild with `cargo xtask kernel` after changes (kernel/user: the user programs it embeds, C and assembly; system calls in docs/camelot-syscalls.md)
+docs/                   ISA spec, Avalon protocol, Camelot system calls
 examples/               bare-metal programs; their .elf files are committed, rebuild them with `cargo xtask examples` after changes (`cargo test` checks)
 tests/riscv-tests       prebuilt riscv-tests ELFs, and obj/ with their objects (merlin-ld relinks them)
 ```

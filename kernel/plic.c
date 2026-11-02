@@ -3,10 +3,15 @@
 #include "mmio.h"
 
 void plic_init(void) {
-    /* Any non-zero priority beats threshold 0; 0 would mean "never". */
-    mmio_write32(PLIC_PRIORITY(PLIC_IRQ_UART), 1);
-    mmio_write32(PLIC_ENABLE(PLIC_CTX_S), 1u << PLIC_IRQ_UART);
     mmio_write32(PLIC_THRESHOLD(PLIC_CTX_S), 0);
+    plic_enable(PLIC_IRQ_UART);
+}
+
+void plic_enable(u32 irq) {
+    /* Any non-zero priority beats threshold 0; 0 would mean "never". */
+    mmio_write32(PLIC_PRIORITY(irq), 1);
+    u32 enabled = mmio_read32(PLIC_ENABLE(PLIC_CTX_S));
+    mmio_write32(PLIC_ENABLE(PLIC_CTX_S), enabled | (1u << irq));
 }
 
 u32 plic_claim(void) {

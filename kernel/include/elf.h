@@ -52,13 +52,18 @@ struct elf32_phdr {
     u32 align;
 };
 
+/* What elf_load() returns when it runs out of pages (any other reason is
+ * something wrong with the image). */
+#define ELF_OUT_OF_MEMORY "out of memory"
+
 /* Loads the executable `image` (`size` bytes) into the user part of `pt`:
  * every PT_LOAD segment goes into fresh zeroed pages, mapped with U and the
- * segment's permissions. Returns NULL and sets *entry, or returns what is
- * wrong with the image. Segments must lie in [USER_BASE, USER_LOAD_TOP) and
- * not share pages, and the entry point must be 4-byte aligned and in an
- * executable one. On an
- * error, the pages mapped so far stay in `pt` for uvm_free() to release. */
-const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry);
+ * segment's permissions. Returns NULL and sets *entry and *end (the page
+ * boundary after the highest segment, where the heap can start), or returns
+ * what is wrong with the image. Segments must lie in [USER_BASE,
+ * USER_LOAD_TOP) and not share pages, and the entry point must be 4-byte
+ * aligned and in an executable one. On an error, the pages mapped so far
+ * stay in `pt` for uvm_free() to release. */
+const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry, u32 *end);
 
 #endif

@@ -17,3 +17,5 @@ crates/merlin-as/tests/golden/*.txt text eol=lf
 crates/merlin-as/tests/golden/*.ref text eol=lf
 crates/merlin-as/tests/golden/*.golden text eol=lf
 *.inc text eol=lf
+# Documents some tests read and compare against the code.
+*.md text eol=lf

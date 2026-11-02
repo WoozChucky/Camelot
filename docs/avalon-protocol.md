@@ -126,6 +126,8 @@ The guest reads these values from its sysinfo block (Excalibur spec section 9.5)
 | 1 | image file on the Avalon host | `path: string` |
 | 2 | image on a Lake server (`lake://addr/name` on the command line) | `addr: string` (`host:port`), `name: string` |
 
+On a command line a disk is one argument (the crate's `DiskSource::parse`): `lake://addr/name` is image `name` on the Lake server at `addr`, which is `host:port`, or a host alone for Lake's default port 7401 (IPv6 addresses in brackets: `lake://[::1]:7401/root`); `name` must be a valid disk name (see **Names**). Anything else is the path of an image file.
+
 **VmSummary**: `id: u32`, `name: string`, `state: VmState`, `profile: HardwareProfile`.
 
 **DeviceEntry**, one entry of the guest's sysinfo device table (Excalibur spec section 9.5): `kind: u32` (the device type code), `base: u32`, `size: u32`, `irq: u32` (PLIC source, 0 = none). The type code is passed through raw, so new device types need no protocol change.
@@ -282,7 +284,7 @@ length 14    Hello  "AVLN"       v1     agent "rt"
 
 | Message | Payload | Notes |
 |---|---|---|
-| `CreateVm` | `name: string`, `profile: HardwareProfile`, `program: bytes` | `program` is an Excalibur ELF executable. The VM is loaded and left in state created. Errors: `InvalidName`, `AlreadyExists`, `InvalidProfile`, `InvalidProgram`, `OverBudget` |
+| `CreateVm` | `name: string`, `profile: HardwareProfile`, `program: bytes` | `program` is an Excalibur ELF executable. The VM is loaded and left in state created. Errors: `InvalidName`, `AlreadyExists`, `InvalidProfile` (also a disk that cannot be opened or attached, see below), `InvalidProgram`, `OverBudget` |
 | `VmCreated` | `id: u32` | ids are never reused while the server runs |
 | `ListVms` | empty | |
 | `VmList` | `vms: list<VmSummary>` | in id order |
@@ -296,7 +298,11 @@ length 14    Hello  "AVLN"       v1     agent "rt"
 | `VmStateChanged` | `vm: u32`, `state: VmState` | sent to every client attached to the VM (console or screen) when its state changes, including when its program exits |
 | `Detached` | `vm: u32`, `kind: u8` (1 console, 2 screen) | the server ended an attachment, because the VM was destroyed. Not sent in answer to `ConsoleDetach`/`ScreenDetach` |
 
-A request for a transition from the wrong state gets `InvalidState`. Example, `StartVm` by id 5:
+A request for a transition from the wrong state gets `InvalidState`.
+
+**Disks on a Lake server.** Avalon builds a VM's machine when the VM is created, and attaches each Lake disk of its profile then: it connects to the Lake server (an Avalon protocol client like any other, agent `grail <version>`) and sends `BlockOpen`, read-only if the profile says so (section 6.5). A disk Lake will not attach (no such disk, `Busy` because another VM writes it, a server that cannot be reached) fails the create with `InvalidProfile`, whose message carries Lake's error. The VM keeps its attachment as long as its machine exists, and releases it (`BlockClose`) when the machine goes: when the VM is destroyed (the image is free once `DestroyVm` is answered), and also when it is stopped or its program exits (shortly after the state change). The guest's reads, writes and flushes become `BlockRead`, `BlockWrite` and `BlockFlush` requests, answered before the guest runs on; any failure, Lake's error replies included, is `BLK_ERROR` 5 (I/O) for the guest. A Lake server that closes the connection or does not answer within 10 seconds fails that request and every later one on that disk.
+
+Example, `StartVm` by id 5:
 
 ```
 07 00 00 00  07 01  00  05 00 00 00
@@ -337,26 +343,34 @@ Block I/O gives a client (Grail's network disk backend, through Avalon) sector a
 
 | Message | Payload | Notes |
 |---|---|---|
-| `BlockOpen` | `name: string`, `read_only: bool` | attach an image. Errors: `NoSuchDisk`, `Busy` |
-| `BlockOpened` | `handle: u32`, `sectors: u64`, `read_only: bool` | the handle names this attachment in the requests below, on this connection only |
+| `BlockOpen` | `name: string`, `read_only: bool` | attach an image. Errors: `InvalidName`, `NoSuchDisk`, `Busy`, `OverBudget` (Lake: more than 64 attachments on one connection) |
+| `BlockOpened` | `handle: u32`, `sectors: u64`, `read_only: bool` | the handle names this attachment in the requests below, on this connection only. Handles are never reused on a connection; `read_only` is the request's |
 | `BlockRead` | `handle: u32`, `sector: u64`, `count: u32` | `count` 1 to 2048 sectors. Errors: `NoSuchHandle`, `OutOfRange` |
 | `BlockData` | `handle: u32`, `sector: u64`, `data: bytes` | `count × 512` bytes |
 | `BlockWrite` | `handle: u32`, `sector: u64`, `data: bytes` | whole sectors, 1 to 2048 of them. Errors: `NoSuchHandle`, `ReadOnly`, `OutOfRange` |
-| `BlockFlush` | `handle: u32` | answered once earlier writes are durable on the server's host |
+| `BlockFlush` | `handle: u32` | answered once earlier writes are durable on the server's host. Succeeds on a read-only attachment |
 | `BlockSize` | `handle: u32` | |
 | `BlockCapacity` | `handle: u32`, `sectors: u64` | the image's size |
 | `BlockClose` | `handle: u32` | detach. Closing the connection closes all its handles |
 
-Concurrency: an image has at most one writer at a time, and a writer excludes readers (exclusive attach); any number of read-only attachments may share an image that has no writer. An attach that breaks this gets `Busy`. A range that runs past the end of the image (`sector + count > sectors`, computed without overflow) gets `OutOfRange` and changes nothing.
+Concurrency: an image has at most one writer at a time, and a writer excludes readers (exclusive attach); any number of read-only attachments may share an image that has no writer. An attach that breaks this gets `Busy`, and so does a second attach of an image by the connection that writes it. A range that runs past the end of the image (`sector + count > sectors`, computed without overflow) gets `OutOfRange` and changes nothing. Checks come in the order handle, read-only, range. A write is visible to every later attachment once it is answered (a later reader, the next VM); `BlockFlush` is only about surviving a crash of the server's host.
 
 ### 6.6 Disk management
 
 | Message | Payload | Notes |
 |---|---|---|
-| `DiskCreate` | `name: string`, `sectors: u64` | a new zero-filled image. Errors: `InvalidName`, `AlreadyExists`, `Io` |
+| `DiskCreate` | `name: string`, `sectors: u64` | a new zero-filled image of 1 to the server's maximum sectors (Lake: 2^32 - 1, the most a Grail disk can address). Errors: `InvalidName`, `AlreadyExists`, `OverBudget` (0 sectors, or too many), `Io` |
 | `ListDisks` | empty | |
 | `DiskList` | `disks: list<DiskInfo>` | in name order |
-| `DiskDelete` | `name: string` | Errors: `NoSuchDisk`, `Busy` (attached) |
+| `DiskDelete` | `name: string` | Errors: `InvalidName`, `NoSuchDisk`, `Busy` (attached) |
+
+Lake keeps each disk as a raw image file named after the disk, in the directory it serves (`lake --dir`): sector `n` is bytes 512·`n` to 512·`n` + 511, as in Grail's image files, so an image can be copied in and out of Lake's directory. A file there whose name is not a valid disk name, or whose size is not a whole number of sectors, is not a disk: it is not listed and cannot be attached or deleted, and its name cannot be used for a new disk (`AlreadyExists`). Disks are matched by their exact file name: where the filesystem ignores case (Windows, macOS), a file `ROOT` is not disk `root` (`NoSuchDisk`), though it still keeps the name `root` from being used for a new disk. Images never change size through the protocol.
+
+A new image is a sparse file: it takes no space on the host until it is written. On Windows Lake marks it sparse explicitly (NTFS does not otherwise, and the first write near the end of a large non-sparse file would make the filesystem write zeros over everything before it, inside that one write, for longer than a Grail disk waits for an answer). On a filesystem without sparse files (FAT, exFAT), `DiskCreate` writes the zeros itself, so creating a large image there takes a while, but no later write does.
+
+There is no message to attach a disk to an existing VM or detach one from it: a VM's disks are part of its hardware profile (`DeviceSpec`), fixed when it is created, so a client attaches a Lake image by naming it in `CreateVm` (Round Table's `create --disk lake://ADDR/NAME`). The VM's server opens the image (through `BlockOpen`) when it builds the VM's machine, as part of `CreateVm`, and holds the attachment as long as that machine exists. The machine ends, and the server closes the attachment (`BlockClose`), when the VM is stopped (`StopVm`), when its program exits, or when it is destroyed, whichever comes first; a stopped or exited VM cannot run again (section 6.2), so it has no use for its disks. Such a VM still names the disks in its profile (`VmList`, `VmInfo`), since that is the hardware it was created with, but no longer holds them: the images can be attached by another VM or deleted. Image files on the server's own host (`DiskSource::File`) follow the same lifetime. `DiskList` shows each image's current attachments. Hot-plugging disks would be a new message group and a version bump.
+
+The Avalon server does not open Lake disks yet: until Lake (#39) lands, a `CreateVm` whose profile names one is refused with `InvalidProfile`.
 
 ## 7. Versioning
 

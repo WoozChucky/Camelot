@@ -1,7 +1,10 @@
 /* Camelot kernel: C entry point. entry.s sets up the stack and clears .bss,
  * start() drops to S-mode, then supervisor_entry calls kmain(); its return
- * value becomes the exit code. */
-#include "console.h"
+ * value becomes the exit code. After booting, kmain runs the user-space shell
+ * as the first process, and returns when it exits. */
+#include "bio.h"
+#include "blk.h"
+#include "blktest.h"
 #include "kalloc.h"
 #include "kprintf.h"
 #include "memlayout.h"
@@ -22,14 +25,8 @@
 /* Timer ticks to wait for before starting the shell. */
 #define BOOT_TICKS 10
 
-/* The shell's prompt and the longest command line it reads (one byte goes to
- * the NUL). */
-#define PROMPT "camelot> "
-#define LINE_MAX 64
-
-/* The most programs one `run` command starts. More than NPROC is allowed, so
- * that running out of process slots can be seen (and tested). */
-#define RUN_MAX 16
+/* The first process: the user-space shell. */
+#define SHELL "sh"
 
 /* Deliberate faults, to exercise the panic path. The image ships with
  * BOOT_FAULT_NONE; tests patch `boot_fault` in it to pick another one. The
@@ -177,124 +174,33 @@ static void deliberate_fault(void) {
     }
 }
 
-static bool is_blank(char c) {
-    return c == ' ' || c == '\t';
+/* Starts the user-space shell (kernel/user/sh.c) as the first process and
+ * runs processes until it and everything it left running have ended.
+ * Returns its exit status, or -1 if it couldn't start. */
+static int run_shell(void) {
+    const struct user_program *sh = user_program_find(SHELL);
+    if (sh == NULL) {
+        kprintf("no program called %s\n", SHELL);
+        return -1;
+    }
+    int status;
+    if (!proc_run_init(sh, &status)) {
+        return -1;
+    }
+    return status;
 }
 
-/* `s` without leading and trailing blanks (the trailing ones are cut off in
- * place). */
-static char *trim(char *s) {
-    while (is_blank(*s)) {
-        s++;
-    }
-    usize n = strlen(s);
-    while (n > 0 && is_blank(s[n - 1])) {
-        n--;
-    }
-    s[n] = 0;
-    return s;
-}
-
-/* If `cmd` starts with the word `word` (followed by a blank or the end),
- * what comes after it; else NULL. */
-static char *after_word(char *cmd, const char *word) {
-    usize n = strlen(word);
-    for (usize i = 0; i < n; i++) {
-        if (cmd[i] != word[i]) {
-            return NULL;
-        }
-    }
-    if (cmd[n] != 0 && !is_blank(cmd[n])) {
-        return NULL;
-    }
-    return cmd + n;
-}
-
-/* Cuts the first blank-separated word off `*s`: returns it NUL-terminated
- * (empty at the end of the line) and moves `*s` past it. */
-static char *next_word(char **s) {
-    char *p = *s;
-    while (is_blank(*p)) {
-        p++;
-    }
-    char *word = p;
-    while (*p != 0 && !is_blank(*p)) {
-        p++;
-    }
-    if (*p != 0) {
-        *p = 0;
-        p++;
-    }
-    *s = p;
-    return word;
-}
-
-/* `run PROG...`: starts a process for each program named, then schedules
- * them until every one has exited or been killed. Nothing starts if a name
- * is unknown. With no names, lists the programs. */
-static void run(char *args) {
-    const struct user_program *progs[RUN_MAX];
-    u32 n = 0;
-    for (;;) {
-        char *name = next_word(&args);
-        if (name[0] == 0) {
-            break;
-        }
-        if (n == RUN_MAX) {
-            kprintf("run: at most %u programs\n", RUN_MAX);
-            return;
-        }
-        progs[n] = user_program_find(name);
-        if (progs[n] == NULL) {
-            kprintf("run: no program called %s\n", name);
-            return;
-        }
-        n++;
-    }
+/* One line per disk blk_init() found, or says there is none. */
+static void print_disks(void) {
+    u32 n = blk_count();
     if (n == 0) {
-        kprintf("programs:");
-        for (u32 i = 0; i < user_program_count; i++) {
-            kprintf(" %s", user_programs[i].name);
-        }
-        kprintf("\n");
+        kprintf("disk: none\n");
         return;
     }
     for (u32 i = 0; i < n; i++) {
-        const char *err;
-        if (proc_create(progs[i], &err) == NULL) {
-            kprintf("run: cannot start %s: %s\n", progs[i]->name, err);
-        }
-    }
-    scheduler();
-}
-
-/* A tiny built-in shell, until there is a user-space one: reads commands from
- * the console and returns on `halt`. */
-static void shell(void) {
-    char line[LINE_MAX];
-    kprintf("Type help for the list of commands.\n");
-    for (;;) {
-        kprintf(PROMPT);
-        console_readline(line, sizeof line);
-        char *cmd = trim(line);
-        if (cmd[0] == 0) {
-            continue;
-        }
-        char *args = after_word(cmd, "run");
-        if (args != NULL) {
-            run(args);
-        } else if (strcmp(cmd, "help") == 0) {
-            kprintf("help    this list\n");
-            kprintf("ticks   timer ticks since boot (%u per second)\n", TICK_HZ);
-            kprintf("run     run user programs side by side (run PROG...; run alone lists them)\n");
-            kprintf("halt    stop the machine\n");
-        } else if (strcmp(cmd, "ticks") == 0) {
-            kprintf("ticks: %u\n", ticks);
-        } else if (strcmp(cmd, "halt") == 0) {
-            return;
-        } else {
-            kprintf("unknown command: %s (try help)\n", cmd);
-        }
+        u32 sectors = blk_capacity(i);
+        kprintf("disk %u: %u sectors (%u KiB), irq %u%s\n", i, sectors, sectors / 2, blk_irq(i),
+                blk_read_only(i) ? ", read-only" : "");
     }
 }
 
@@ -321,9 +227,14 @@ int kmain(void) {
 
     trap_init();
     kprintf("timer: %u Hz tick, %u Hz timebase\n", TICK_HZ, timebase_hz());
+    blk_init();
+    binit();
+    print_disks();
     wait_ticks(BOOT_TICKS);
 
     deliberate_fault();
-    shell();
-    return failed;
+    failed += blk_selftest();
+    int status = run_shell();
+    /* Failed self-tests are what the exit code reports first. */
+    return failed != 0 ? failed : status;
 }

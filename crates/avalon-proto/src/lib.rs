@@ -12,17 +12,23 @@
 //!   in-memory pipe in tests) that sends and receives messages, does the version
 //!   handshake and matches requests to replies.
 //!
+//! Plus what every program's command line shares: [`parse_listen`] for a server's
+//! `--listen`, and [`DiskSource::parse`] for a disk argument (a path or
+//! `lake://addr/name`).
+//!
 //! Everything a peer sends is checked: a truncated, oversize or otherwise malformed
 //! frame is an [`Error`], never a panic or an unbounded allocation.
 
 use std::fmt;
 use std::io;
 
+mod addr;
 pub mod conn;
 pub mod frame;
 pub mod message;
 mod wire;
 
+pub use addr::{default_port, parse_listen, LAKE_SCHEME};
 pub use conn::Connection;
 pub use frame::{decode, encode, read_frame, write_frame, Frame};
 pub use message::*;

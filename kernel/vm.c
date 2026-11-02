@@ -246,24 +246,69 @@ bool uvm_range_ok(pagetable_t pt, u32 va, u32 len, u32 perm) {
     return true;
 }
 
+/* The kernel's pointer to user address `va` in `pt`, which must be mapped:
+ * RAM is identity mapped in the kernel's half, so the user page's physical
+ * address is a usable pointer. */
+static u8 *user_ptr(pagetable_t pt, u32 va) {
+    return (u8 *)(uintptr)(PTE2PA(*walk(pt, va, false)) + va % PGSIZE);
+}
+
+/* The bytes from `va` to the end of its page, at most `len`. */
+static u32 page_chunk(u32 va, u32 len) {
+    u32 n = PGSIZE - va % PGSIZE;
+    return n < len ? n : len;
+}
+
 int copyin(pagetable_t pt, void *dst, u32 va, u32 len) {
     if (!uvm_range_ok(pt, va, len, PTE_R)) {
         return -1;
     }
     u8 *out = dst;
     while (len > 0) {
-        u32 off = va % PGSIZE;
-        u32 n = PGSIZE - off;
-        if (n > len) {
-            n = len;
-        }
-        /* RAM is identity mapped in the kernel's half, so the user page's
-         * physical address is a usable pointer. */
-        const u8 *src = (const u8 *)(uintptr)(PTE2PA(*walk(pt, va, false)) + off);
-        memcpy(out, src, n);
+        u32 n = page_chunk(va, len);
+        memcpy(out, user_ptr(pt, va), n);
         out += n;
         va += n;
         len -= n;
     }
     return 0;
+}
+
+int copyout(pagetable_t pt, u32 va, const void *src, u32 len) {
+    if (!uvm_range_ok(pt, va, len, PTE_W)) {
+        return -1;
+    }
+    const u8 *in = src;
+    while (len > 0) {
+        u32 n = page_chunk(va, len);
+        memcpy(user_ptr(pt, va), in, n);
+        in += n;
+        va += n;
+        len -= n;
+    }
+    return 0;
+}
+
+int copyinstr(pagetable_t pt, char *dst, u32 va, u32 max) {
+    /* Page by page: the string's length isn't known up front, and the page
+     * after its NUL needn't be mapped. */
+    u32 len = 0;
+    while (len < max) {
+        u32 n = page_chunk(va, max - len);
+        if (!uvm_range_ok(pt, va, n, PTE_R)) {
+            dst[len] = 0;
+            return -1;
+        }
+        const u8 *src = user_ptr(pt, va);
+        for (u32 i = 0; i < n; i++) {
+            dst[len] = (char)src[i];
+            if (src[i] == 0) {
+                return (int)len;
+            }
+            len++;
+        }
+        va += n;
+    }
+    dst[max - 1] = 0;
+    return -2;
 }
