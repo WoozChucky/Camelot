@@ -3032,6 +3032,30 @@ fn the_system_call_document_matches_the_code() {
         assert_eq!(defines(&user_h, limit), want);
         assert!(doc.contains(&format!("`{limit}` ({})", want[0].0)), "{limit}");
     }
+    // Constants the test programs copy from the kernel's headers, and the
+    // console's major number mkfs gives /dev/console.
+    let exactly = |text: &str, name: &str| -> Vec<(u32, String)> {
+        defines(text, name)
+            .into_iter()
+            .filter(|(_, n)| n == name)
+            .collect()
+    };
+    let filetest = read("kernel/user/filetest.c");
+    let systest = read("kernel/user/systest.c");
+    for (header, name, copies) in [
+        ("kernel/include/file.h", "NOFILE", vec![&filetest, &systest]),
+        ("kernel/include/file.h", "CONSOLE", vec![&filetest, &systest]),
+        ("kernel/include/pipe.h", "PIPESIZE", vec![&systest]),
+        ("kernel/include/proc.h", "NPROC", vec![&systest]),
+    ] {
+        let want = exactly(&read(header), name);
+        assert_eq!(want.len(), 1, "{header}: {name}");
+        for copy in copies {
+            assert_eq!(exactly(copy, name), want, "a user program's copy of {name}");
+        }
+    }
+    let console = exactly(&read("kernel/include/file.h"), "CONSOLE");
+    assert_eq!(console[0].0, u32::from(xtask::fs::CONSOLE_MAJOR));
 }
 
 #[test]

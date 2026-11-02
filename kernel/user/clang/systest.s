@@ -87,7 +87,7 @@ main:                                   # @main
 	beq	a0, s1, .LBB0_4
 .LBB0_12:
 	slt	s0, s4, s0
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_13:
 	call	getpid
 	mv	s0, a0
@@ -710,7 +710,7 @@ main:                                   # @main
 	or	a0, a0, a1
 	snez	s0, a0
 	slli	s0, s0, 1
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_72:
 	lw	a0, 0(s6)
 	addi	a0, a0, 1
@@ -1196,7 +1196,7 @@ main:                                   # @main
 	snez	a0, a0
 	sltiu	s0, a1, -1999
 	or	s0, a0, s0
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_120:
 	li	s2, 0
 	li	s1, 2
@@ -1213,10 +1213,10 @@ main:                                   # @main
 	bgtz	a0, .LBB0_122
 # %bb.123:
 	bnez	a0, .LBB0_124
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_124:
 	li	s0, 100
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_125:
 	li	s2, 0
 	li	s1, 3
@@ -1227,7 +1227,7 @@ main:                                   # @main
 	beqz	a0, .LBB0_138
 .LBB0_127:
 	li	s0, 1
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_128:
 	li	s2, 0
 	li	s1, 4
@@ -1238,7 +1238,7 @@ main:                                   # @main
 	call	dup
 	li	a1, 3
 	beq	a0, a1, .LBB0_130
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_130:
 .Lpcrel_hi6:
 	auipc	a0, %pcrel_hi(.L.str.12)
@@ -1281,7 +1281,7 @@ main:                                   # @main
 	addi	a1, sp, 348
 	call	exec
 	li	s0, 2
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_133:
 	lw	a0, 4(s1)
 .Lpcrel_hi10:
@@ -1297,10 +1297,10 @@ main:                                   # @main
 	call	strcmp
 	li	s0, 3
 	beq	s2, s0, .LBB0_135
-	j	.LBB0_349
+	j	.LBB0_375
 .LBB0_135:
 	beqz	a0, .LBB0_136
-	j	.LBB0_349
+	j	.LBB0_375
 .LBB0_136:
 	lw	a0, 8(s1)
 	call	atoi
@@ -1328,91 +1328,91 @@ main:                                   # @main
 	li	s0, 1
 	call	fstat
 	beqz	a0, .LBB0_139
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_139:
 	li	a0, 2
 	addi	a1, sp, 348
 	call	fstat
 	beqz	a0, .LBB0_140
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_140:
 	li	a0, 3
 	addi	a1, sp, 348
 	call	fstat
 	bnez	a0, .LBB0_141
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_141:
 	li	a0, 4
 	addi	a1, sp, 348
 	call	fstat
 	bnez	a0, .LBB0_142
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_142:
 	li	a0, 5
 	addi	a1, sp, 348
 	call	fstat
 	bnez	a0, .LBB0_143
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_143:
 	li	a0, 6
 	addi	a1, sp, 348
 	call	fstat
 	bnez	a0, .LBB0_144
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_144:
 	li	a0, 7
 	addi	a1, sp, 348
 	call	fstat
 	bnez	a0, .LBB0_145
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_145:
 	li	a0, 8
 	addi	a1, sp, 348
 	call	fstat
 	bnez	a0, .LBB0_146
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_146:
 	li	a0, 9
 	addi	a1, sp, 348
 	call	fstat
 	bnez	a0, .LBB0_147
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_147:
 	li	a0, 10
 	addi	a1, sp, 348
 	call	fstat
 	bnez	a0, .LBB0_148
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_148:
 	li	a0, 11
 	addi	a1, sp, 348
 	call	fstat
 	bnez	a0, .LBB0_149
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_149:
 	li	a0, 12
 	addi	a1, sp, 348
 	call	fstat
 	bnez	a0, .LBB0_150
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_150:
 	li	a0, 13
 	addi	a1, sp, 348
 	call	fstat
 	bnez	a0, .LBB0_151
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_151:
 	li	a0, 14
 	addi	a1, sp, 348
 	call	fstat
 	bnez	a0, .LBB0_152
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_152:
 	li	a0, 15
 	addi	a1, sp, 348
 	call	fstat
 	seqz	s0, a0
-	j	.LBB0_348
+	j	.LBB0_374
 .LBB0_153:
 	li	s1, 6
 	li	s2, 1
@@ -2332,7 +2332,7 @@ main:                                   # @main
 	li	a0, 3
 	li	s0, 3
 	call	close
-	addi	a0, sp, 288
+	addi	a0, sp, 224
 	call	pipe
 	mv	a2, a0
 	lw	a0, 0(s6)
@@ -2353,8 +2353,8 @@ main:                                   # @main
 	call	printf
 	lw	a0, 0(s6)
 .LBB0_243:
-	lw	a2, 288(sp)
-	lw	a1, 292(sp)
+	lw	a2, 224(sp)
+	lw	a1, 228(sp)
 	addi	a0, a0, 1
 	sw	a0, 0(s6)
 	bne	a2, s0, .LBB0_246
@@ -2375,7 +2375,7 @@ main:                                   # @main
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi207)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi208)
 	call	printf
-	lw	a0, 292(sp)
+	lw	a0, 228(sp)
 .LBB0_247:
 .Lpcrel_hi209:
 	auipc	a1, %pcrel_hi(.L.str.124)
@@ -2401,7 +2401,7 @@ main:                                   # @main
 	li	a3, 5
 	call	printf
 .LBB0_249:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	addi	a1, sp, 8
 	call	fstat
 	lw	a1, 0(s6)
@@ -2447,7 +2447,7 @@ main:                                   # @main
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi215)
 	call	printf
 .LBB0_255:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	addi	a1, sp, 348
 	li	a2, 3
 	li	s0, 3
@@ -2470,7 +2470,7 @@ main:                                   # @main
 	li	a3, 3
 	call	printf
 .LBB0_257:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	addi	a1, sp, 351
 	li	a2, 510
 	call	read
@@ -2515,7 +2515,7 @@ main:                                   # @main
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi222)
 	call	printf
 .LBB0_261:
-	lw	a0, 292(sp)
+	lw	a0, 228(sp)
 	addi	a1, sp, 348
 	li	a2, 1
 	call	read
@@ -2538,7 +2538,7 @@ main:                                   # @main
 	li	a3, -9
 	call	printf
 .LBB0_263:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 .Lpcrel_hi225:
 	auipc	a1, %pcrel_hi(.L.str.15)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi225)
@@ -2562,7 +2562,7 @@ main:                                   # @main
 	li	a3, -9
 	call	printf
 .LBB0_265:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	li	a1, 0
 	li	a2, 0
 	call	lseek
@@ -2585,7 +2585,7 @@ main:                                   # @main
 	li	a3, -29
 	call	printf
 .LBB0_267:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	addi	a1, sp, 348
 	li	a2, 0
 	call	read
@@ -2611,7 +2611,7 @@ main:                                   # @main
 	li	a1, 122
 	li	a2, 513
 	call	memset
-	lw	a0, 292(sp)
+	lw	a0, 228(sp)
 	addi	a1, sp, 348
 	li	a2, 512
 	li	s0, 512
@@ -2634,7 +2634,7 @@ main:                                   # @main
 	li	a3, 512
 	call	printf
 .LBB0_271:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	addi	a1, sp, 348
 	li	a2, 513
 	call	read
@@ -2656,7 +2656,7 @@ main:                                   # @main
 	li	a3, 512
 	call	printf
 .LBB0_273:
-	lw	a0, 292(sp)
+	lw	a0, 228(sp)
 .Lpcrel_hi236:
 	auipc	a1, %pcrel_hi(.L.str.137)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi236)
@@ -2681,7 +2681,7 @@ main:                                   # @main
 	li	a3, 3
 	call	printf
 .LBB0_275:
-	lw	a0, 292(sp)
+	lw	a0, 228(sp)
 	call	close
 	mv	a2, a0
 	lw	a0, 0(s6)
@@ -2701,7 +2701,7 @@ main:                                   # @main
 	li	a3, 0
 	call	printf
 .LBB0_277:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	addi	a1, sp, 348
 	li	a2, 513
 	call	read
@@ -2724,7 +2724,7 @@ main:                                   # @main
 	li	a3, 3
 	call	printf
 .LBB0_279:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	addi	a1, sp, 348
 	li	a2, 513
 	call	read
@@ -2746,7 +2746,7 @@ main:                                   # @main
 	li	a3, 0
 	call	printf
 .LBB0_281:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	call	close
 	mv	a2, a0
 	lw	a0, 0(s6)
@@ -2766,7 +2766,7 @@ main:                                   # @main
 	li	a3, 0
 	call	printf
 .LBB0_283:
-	addi	a0, sp, 288
+	addi	a0, sp, 224
 	call	pipe
 	mv	a2, a0
 	lw	a0, 0(s6)
@@ -2786,9 +2786,9 @@ main:                                   # @main
 	li	a3, 0
 	call	printf
 .LBB0_285:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	call	close
-	lw	a0, 292(sp)
+	lw	a0, 228(sp)
 .Lpcrel_hi249:
 	auipc	a1, %pcrel_hi(.L.str.15)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi249)
@@ -2813,7 +2813,7 @@ main:                                   # @main
 	li	a3, -32
 	call	printf
 .LBB0_287:
-	lw	a0, 292(sp)
+	lw	a0, 228(sp)
 .Lpcrel_hi252:
 	auipc	a1, %pcrel_hi(.L.str.13)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi252)
@@ -2837,9 +2837,9 @@ main:                                   # @main
 	li	a3, 0
 	call	printf
 .LBB0_289:
-	lw	a0, 292(sp)
+	lw	a0, 228(sp)
 	call	close
-	addi	a0, sp, 288
+	addi	a0, sp, 224
 	call	pipe
 	mv	a2, a0
 	lw	a0, 0(s6)
@@ -2859,7 +2859,7 @@ main:                                   # @main
 	li	a3, 0
 	call	printf
 .LBB0_291:
-	lw	a1, 292(sp)
+	lw	a1, 228(sp)
 .Lpcrel_hi257:
 	auipc	a0, %pcrel_hi(.L.str.1)
 .Lpcrel_hi258:
@@ -2890,9 +2890,9 @@ main:                                   # @main
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi260)
 	call	printf
 .LBB0_293:
-	lw	a0, 292(sp)
+	lw	a0, 228(sp)
 	call	close
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	addi	a1, sp, 348
 	li	a2, 77
 	call	read
@@ -2926,7 +2926,7 @@ main:                                   # @main
 	addi	a3, a3, 1
 	bne	a1, a0, .LBB0_296
 # %bb.297:                              #   in Loop: Header=BB0_295 Depth=1
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	add	s1, s1, a2
 	addi	a1, sp, 348
 	li	a2, 77
@@ -3023,9 +3023,9 @@ main:                                   # @main
 	li	a3, 0
 	call	printf
 .LBB0_312:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	call	close
-	addi	a0, sp, 288
+	addi	a0, sp, 224
 	call	pipe
 	mv	a2, a0
 	lw	a0, 0(s6)
@@ -3045,21 +3045,21 @@ main:                                   # @main
 	li	a3, 0
 	call	printf
 .LBB0_314:
-	lw	a1, 292(sp)
+	lw	a1, 228(sp)
 .Lpcrel_hi271:
 	auipc	a0, %pcrel_hi(.L.str.2)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi271)
+	addi	s2, a0, %pcrel_lo(.Lpcrel_hi271)
 	sw	s7, 256(sp)
-	sw	a0, 260(sp)
+	sw	s2, 260(sp)
 	sw	zero, 264(sp)
 	li	a0, -1
 	addi	a2, sp, 256
 	call	spawn_with
-	lw	a1, 292(sp)
+	lw	a1, 228(sp)
 	mv	s0, a0
 	mv	a0, a1
 	call	close
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	addi	a1, sp, 348
 	li	a2, 10
 	li	s1, 10
@@ -3082,7 +3082,7 @@ main:                                   # @main
 	li	a3, 10
 	call	printf
 .LBB0_316:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 	call	close
 	blez	s0, .LBB0_319
 # %bb.317:
@@ -3115,7 +3115,7 @@ main:                                   # @main
 	li	a3, 0
 	call	printf
 .LBB0_321:
-	addi	a0, sp, 288
+	addi	a0, sp, 224
 	call	pipe
 	mv	a2, a0
 	lw	a0, 0(s6)
@@ -3135,32 +3135,32 @@ main:                                   # @main
 	li	a3, 0
 	call	printf
 .LBB0_323:
-	lw	a0, 288(sp)
+	lw	a0, 224(sp)
 .Lpcrel_hi278:
 	auipc	a1, %pcrel_hi(.L.str.3)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi278)
+	addi	s1, a1, %pcrel_lo(.Lpcrel_hi278)
 	sw	s7, 320(sp)
-	sw	a1, 324(sp)
+	sw	s1, 324(sp)
 	sw	zero, 328(sp)
 	li	a1, -1
 	addi	a2, sp, 320
 	call	spawn_with
-	lw	a1, 288(sp)
+	lw	a1, 224(sp)
 	mv	s0, a0
 	mv	a0, a1
 	call	close
-	lw	a0, 292(sp)
+	lw	a0, 228(sp)
 .Lpcrel_hi279:
 	auipc	a1, %pcrel_hi(.L.str.157)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi279)
 	li	a2, 7
-	li	s1, 7
+	li	s3, 7
 	call	write
 	mv	a2, a0
 	lw	a0, 0(s6)
 	addi	a0, a0, 1
 	sw	a0, 0(s6)
-	beq	a2, s1, .LBB0_325
+	beq	a2, s3, .LBB0_325
 # %bb.324:
 	lw	a0, 4(s6)
 	addi	a0, a0, 1
@@ -3174,7 +3174,7 @@ main:                                   # @main
 	li	a3, 7
 	call	printf
 .LBB0_325:
-	lw	a0, 292(sp)
+	lw	a0, 228(sp)
 	call	close
 	blez	s0, .LBB0_328
 # %bb.326:
@@ -3208,7 +3208,7 @@ main:                                   # @main
 	li	a3, 7
 	call	printf
 .LBB0_330:
-	addi	a0, sp, 288
+	addi	a0, sp, 224
 	call	pipe
 	mv	a2, a0
 	lw	a0, 0(s6)
@@ -3228,163 +3228,370 @@ main:                                   # @main
 	li	a3, 0
 	call	printf
 .LBB0_332:
-.Lpcrel_hi286:
-	auipc	a0, %pcrel_hi(.L.str.4)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi286)
+	lw	a1, 228(sp)
 	sw	s7, 304(sp)
-	sw	a0, 308(sp)
+	sw	s2, 308(sp)
 	sw	zero, 312(sp)
-	li	a0, 0
-	call	dup
-	mv	s1, a0
-	li	a0, 1
-	call	dup
-	mv	s2, a0
-.Lpcrel_hi287:
-	auipc	a0, %pcrel_hi(.L.str.16)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi287)
-	addi	a1, sp, 304
-	call	spawn
+	li	a0, -1
+	addi	a2, sp, 304
+	call	spawn_with
+	lw	a1, 228(sp)
 	mv	s0, a0
-	li	a0, 0
+	mv	a0, a1
 	call	close
-	mv	a0, s1
-	call	dup
-	li	a0, 1
-	call	close
-	mv	a0, s2
-	call	dup
-	mv	a0, s1
-	call	close
-	mv	a0, s2
-	call	close
-	blez	s0, .LBB0_335
+	lw	a0, 224(sp)
+	addi	a1, sp, 8
+	call	fstat
+	lw	a2, 16(sp)
+	bnez	a0, .LBB0_337
 # %bb.333:
-	addi	a1, sp, 240
+	li	a0, 511
+	bltu	a0, a2, .LBB0_337
+# %bb.334:
+	li	s2, 512
+.LBB0_335:                              # =>This Inner Loop Header: Depth=1
+	call	yield
+	lw	a0, 224(sp)
+	addi	a1, sp, 8
+	call	fstat
+	lw	a2, 16(sp)
+	bnez	a0, .LBB0_337
+# %bb.336:                              #   in Loop: Header=BB0_335 Depth=1
+	bltu	a2, s2, .LBB0_335
+.LBB0_337:
+	lw	a0, 0(s6)
+	addi	a0, a0, 1
+	li	a1, 512
+	sw	a0, 0(s6)
+	beq	a2, a1, .LBB0_339
+# %bb.338:
+	lw	a0, 4(s6)
+	addi	a0, a0, 1
+	sw	a0, 4(s6)
+.Lpcrel_hi286:
+	auipc	a0, %pcrel_hi(.L.str.29)
+.Lpcrel_hi287:
+	auipc	a1, %pcrel_hi(.L.str.161)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi286)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi287)
+	li	a3, 512
+	call	printf
+.LBB0_339:
+	lw	a0, 224(sp)
+	call	close
+	blez	s0, .LBB0_342
+# %bb.340:
+	addi	a1, sp, 288
 	mv	a0, s0
 	call	wait
-	bne	a0, s0, .LBB0_335
-# %bb.334:
+	bne	a0, s0, .LBB0_342
+# %bb.341:
 	lw	a0, 0(s6)
-	lw	a2, 240(sp)
+	lw	a2, 288(sp)
 	addi	a0, a0, 1
 	sw	a0, 0(s6)
-	bnez	a2, .LBB0_336
-	j	.LBB0_337
-.LBB0_335:
+	bnez	a2, .LBB0_343
+	j	.LBB0_344
+.LBB0_342:
 	lw	a0, 0(s6)
 	addi	a0, a0, 1
 	sw	a0, 0(s6)
 	li	a2, -1000
-.LBB0_336:
+.LBB0_343:
 	lw	a0, 4(s6)
 	addi	a0, a0, 1
 	sw	a0, 4(s6)
 .Lpcrel_hi288:
 	auipc	a0, %pcrel_hi(.L.str.29)
 .Lpcrel_hi289:
-	auipc	a1, %pcrel_hi(.L.str.161)
+	auipc	a1, %pcrel_hi(.L.str.162)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi288)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi289)
 	li	a3, 0
 	call	printf
-.LBB0_337:
-	lw	a0, 288(sp)
-	call	close
-	lw	a0, 292(sp)
-	call	close
+.LBB0_344:
+	addi	a0, sp, 224
+	call	pipe
+	mv	a2, a0
+	lw	a0, 0(s6)
+	addi	a0, a0, 1
+	sw	a0, 0(s6)
+	beqz	a2, .LBB0_346
+# %bb.345:
+	lw	a0, 4(s6)
+	addi	a0, a0, 1
+	sw	a0, 4(s6)
 .Lpcrel_hi290:
-	auipc	a0, %pcrel_hi(.L.str.5)
+	auipc	a0, %pcrel_hi(.L.str.29)
+.Lpcrel_hi291:
+	auipc	a1, %pcrel_hi(.L.str.163)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi290)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi291)
+	li	a3, 0
+	call	printf
+.LBB0_346:
+	lw	a0, 224(sp)
+	sw	s7, 288(sp)
+	sw	s1, 292(sp)
+	sw	zero, 296(sp)
+	li	a1, -1
+	addi	a2, sp, 288
+	call	spawn_with
+	lw	a1, 224(sp)
+	mv	s0, a0
+	mv	a0, a1
+	call	close
+	lw	a0, 228(sp)
+.Lpcrel_hi292:
+	auipc	a1, %pcrel_hi(.L.str.15)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi292)
+	li	a2, 1
+	li	s1, 1
+	call	write
+	mv	a2, a0
+	lw	a0, 0(s6)
+	addi	a0, a0, 1
+	sw	a0, 0(s6)
+	beq	a2, s1, .LBB0_350
+# %bb.347:
+	lw	a0, 4(s6)
+	addi	a0, a0, 1
+	sw	a0, 4(s6)
+.Lpcrel_hi293:
+	auipc	a0, %pcrel_hi(.L.str.29)
+.Lpcrel_hi294:
+	auipc	a1, %pcrel_hi(.L.str.164)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi293)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi294)
+	li	a3, 1
+	call	printf
+	j	.LBB0_350
+.LBB0_348:                              #   in Loop: Header=BB0_350 Depth=1
+	lw	a0, 16(sp)
+	beqz	a0, .LBB0_351
+# %bb.349:                              #   in Loop: Header=BB0_350 Depth=1
+	call	yield
+.LBB0_350:                              # =>This Inner Loop Header: Depth=1
+	lw	a0, 228(sp)
+	addi	a1, sp, 8
+	call	fstat
+	beqz	a0, .LBB0_348
+.LBB0_351:
+	call	yield
+	call	yield
+	call	yield
+	call	yield
+	lw	a0, 228(sp)
+	call	close
+	blez	s0, .LBB0_354
+# %bb.352:
+	addi	a1, sp, 240
+	mv	a0, s0
+	call	wait
+	bne	a0, s0, .LBB0_354
+# %bb.353:
+	lw	a0, 0(s6)
+	lw	a2, 240(sp)
+	addi	a0, a0, 1
+	li	a1, 1
+	sw	a0, 0(s6)
+	bne	a2, a1, .LBB0_355
+	j	.LBB0_356
+.LBB0_354:
+	lw	a0, 0(s6)
+	addi	a0, a0, 1
+	sw	a0, 0(s6)
+	li	a2, -1000
+.LBB0_355:
+	lw	a0, 4(s6)
+	addi	a0, a0, 1
+	sw	a0, 4(s6)
+.Lpcrel_hi295:
+	auipc	a0, %pcrel_hi(.L.str.29)
+.Lpcrel_hi296:
+	auipc	a1, %pcrel_hi(.L.str.165)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi295)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi296)
+	li	a3, 1
+	call	printf
+.LBB0_356:
+	addi	a0, sp, 224
+	call	pipe
+	mv	a2, a0
+	lw	a0, 0(s6)
+	addi	a0, a0, 1
+	sw	a0, 0(s6)
+	beqz	a2, .LBB0_358
+# %bb.357:
+	lw	a0, 4(s6)
+	addi	a0, a0, 1
+	sw	a0, 4(s6)
+.Lpcrel_hi297:
+	auipc	a0, %pcrel_hi(.L.str.29)
+.Lpcrel_hi298:
+	auipc	a1, %pcrel_hi(.L.str.166)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi297)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi298)
+	li	a3, 0
+	call	printf
+.LBB0_358:
+.Lpcrel_hi299:
+	auipc	a0, %pcrel_hi(.L.str.4)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi299)
+	sw	s7, 240(sp)
+	sw	a0, 244(sp)
+	sw	zero, 248(sp)
+	li	a0, 0
+	call	dup
+	mv	s1, a0
+	li	a0, 1
+	call	dup
+	mv	s2, a0
+.Lpcrel_hi300:
+	auipc	a0, %pcrel_hi(.L.str.16)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi300)
+	addi	a1, sp, 240
+	call	spawn
+	mv	s0, a0
+	li	a0, 0
+	call	close
+	mv	a0, s1
+	call	dup
+	li	a0, 1
+	call	close
+	mv	a0, s2
+	call	dup
+	mv	a0, s1
+	call	close
+	mv	a0, s2
+	call	close
+	blez	s0, .LBB0_361
+# %bb.359:
+	addi	a1, sp, 140
+	mv	a0, s0
+	call	wait
+	bne	a0, s0, .LBB0_361
+# %bb.360:
+	lw	a0, 0(s6)
+	lw	a2, 140(sp)
+	addi	a0, a0, 1
+	sw	a0, 0(s6)
+	bnez	a2, .LBB0_362
+	j	.LBB0_363
+.LBB0_361:
+	lw	a0, 0(s6)
+	addi	a0, a0, 1
+	sw	a0, 0(s6)
+	li	a2, -1000
+.LBB0_362:
+	lw	a0, 4(s6)
+	addi	a0, a0, 1
+	sw	a0, 4(s6)
+.Lpcrel_hi301:
+	auipc	a0, %pcrel_hi(.L.str.29)
+.Lpcrel_hi302:
+	auipc	a1, %pcrel_hi(.L.str.167)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi301)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi302)
+	li	a3, 0
+	call	printf
+.LBB0_363:
+	lw	a0, 224(sp)
+	call	close
+	lw	a0, 228(sp)
+	call	close
+.Lpcrel_hi303:
+	auipc	a0, %pcrel_hi(.L.str.5)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi303)
 	sw	s7, 348(sp)
 	sw	a0, 352(sp)
 	sw	zero, 356(sp)
-.Lpcrel_hi291:
+.Lpcrel_hi304:
 	auipc	a0, %pcrel_hi(.L.str.16)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi291)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi304)
 	addi	a1, sp, 348
 	call	spawn
-	blez	a0, .LBB0_340
-# %bb.338:
+	blez	a0, .LBB0_366
+# %bb.364:
 	addi	a1, sp, 8
 	mv	s0, a0
 	call	wait
-	bne	a0, s0, .LBB0_340
-# %bb.339:
+	bne	a0, s0, .LBB0_366
+# %bb.365:
 	lw	a0, 0(s6)
 	lw	a2, 8(sp)
 	addi	a0, a0, 1
 	sw	a0, 0(s6)
-	bnez	a2, .LBB0_341
-	j	.LBB0_342
-.LBB0_340:
+	bnez	a2, .LBB0_367
+	j	.LBB0_368
+.LBB0_366:
 	lw	a0, 0(s6)
 	addi	a0, a0, 1
 	sw	a0, 0(s6)
 	li	a2, -1000
-.LBB0_341:
+.LBB0_367:
 	lw	a0, 4(s6)
 	addi	a0, a0, 1
 	sw	a0, 4(s6)
-.Lpcrel_hi292:
+.Lpcrel_hi305:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi293:
-	auipc	a1, %pcrel_hi(.L.str.162)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi292)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi293)
+.Lpcrel_hi306:
+	auipc	a1, %pcrel_hi(.L.str.168)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi305)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi306)
 	li	a3, 0
 	call	printf
-.LBB0_342:
-.Lpcrel_hi294:
+.LBB0_368:
+.Lpcrel_hi307:
 	auipc	a0, %pcrel_hi(.L.str.7)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi294)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi307)
 	sw	s7, 8(sp)
 	sw	a0, 12(sp)
 	sw	zero, 16(sp)
-.Lpcrel_hi295:
+.Lpcrel_hi308:
 	auipc	a0, %pcrel_hi(.L.str.16)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi295)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi308)
 	addi	a1, sp, 8
 	call	spawn
-	blez	a0, .LBB0_345
-# %bb.343:
+	blez	a0, .LBB0_371
+# %bb.369:
 	addi	a1, sp, 152
 	mv	s0, a0
 	call	wait
-	bne	a0, s0, .LBB0_345
-# %bb.344:
+	bne	a0, s0, .LBB0_371
+# %bb.370:
 	lw	a1, 0(s6)
 	lw	a2, 152(sp)
 	addi	a1, a1, 1
 	sw	a1, 0(s6)
-	bnez	a2, .LBB0_346
-	j	.LBB0_347
-.LBB0_345:
+	bnez	a2, .LBB0_372
+	j	.LBB0_373
+.LBB0_371:
 	lw	a0, 0(s6)
 	addi	a0, a0, 1
 	sw	a0, 0(s6)
 	li	a2, -1000
-.LBB0_346:
+.LBB0_372:
 	lw	a0, 4(s6)
 	addi	a0, a0, 1
 	sw	a0, 4(s6)
-.Lpcrel_hi296:
+.Lpcrel_hi309:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi297:
-	auipc	a1, %pcrel_hi(.L.str.163)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi296)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi297)
+.Lpcrel_hi310:
+	auipc	a1, %pcrel_hi(.L.str.169)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi309)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi310)
 	li	a3, 0
 	call	printf
 	lw	a1, 0(s6)
-.LBB0_347:
+.LBB0_373:
 	lw	a2, 4(s6)
-.Lpcrel_hi298:
+.Lpcrel_hi311:
 	auipc	a0, %pcrel_hi(.L.str)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi298)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi311)
 	call	printf
 	lw	s0, 4(s6)
-.LBB0_348:
+.LBB0_374:
 	mv	a0, s0
 	lw	ra, 908(sp)                     # 4-byte Folded Reload
 	lw	s0, 904(sp)                     # 4-byte Folded Reload
@@ -3400,16 +3607,16 @@ main:                                   # @main
 	lw	s10, 864(sp)                    # 4-byte Folded Reload
 	addi	sp, sp, 912
 	ret
-.LBB0_349:
+.LBB0_375:
 	lw	a0, 4(s1)
 .Lpcrel_hi12:
 	auipc	a1, %pcrel_hi(.L.str.9)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi12)
 	call	strcmp
-	bne	s2, s0, .LBB0_352
-# %bb.350:
-	bnez	a0, .LBB0_352
-# %bb.351:
+	bne	s2, s0, .LBB0_378
+# %bb.376:
+	bnez	a0, .LBB0_378
+# %bb.377:
 	lw	a0, 8(s1)
 	lw	ra, 908(sp)                     # 4-byte Folded Reload
 	lw	s0, 904(sp)                     # 4-byte Folded Reload
@@ -3425,80 +3632,80 @@ main:                                   # @main
 	lw	s10, 864(sp)                    # 4-byte Folded Reload
 	addi	sp, sp, 912
 	tail	atoi
-.LBB0_352:
+.LBB0_378:
 	lw	a0, 4(s1)
 .Lpcrel_hi13:
 	auipc	a1, %pcrel_hi(.L.str.10)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi13)
 	call	strcmp
 	li	a1, 3
-	bne	s2, a1, .LBB0_355
-# %bb.353:
-	bnez	a0, .LBB0_355
-# %bb.354:
+	bne	s2, a1, .LBB0_381
+# %bb.379:
+	bnez	a0, .LBB0_381
+# %bb.380:
 	lw	a0, 8(s1)
 	call	atoi
 	call	sleep
 	li	s0, 0
-	j	.LBB0_348
-.LBB0_355:
+	j	.LBB0_374
+.LBB0_381:
 	lw	a0, 4(s1)
 .Lpcrel_hi14:
 	auipc	a1, %pcrel_hi(.L.str.11)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi14)
 	call	strcmp
-	beqz	a0, .LBB0_356
+	beqz	a0, .LBB0_382
 	j	.LBB0_124
-.LBB0_356:
+.LBB0_382:
 	li	a0, 5
 	li	s0, 1
-	bne	s2, a0, .LBB0_348
-# %bb.357:
+	bne	s2, a0, .LBB0_374
+# %bb.383:
 	lw	a0, 20(s1)
-	bnez	a0, .LBB0_348
-# %bb.358:
+	bnez	a0, .LBB0_374
+# %bb.384:
 	lw	a0, 0(s1)
 .Lpcrel_hi15:
 	auipc	a1, %pcrel_hi(.L.str.12)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi15)
 	call	strcmp
-	bnez	a0, .LBB0_348
-# %bb.359:
+	bnez	a0, .LBB0_374
+# %bb.385:
 	lw	a0, 4(s1)
 .Lpcrel_hi16:
 	auipc	a1, %pcrel_hi(.L.str.11)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi16)
 	call	strcmp
-	bnez	a0, .LBB0_348
-# %bb.360:
+	bnez	a0, .LBB0_374
+# %bb.386:
 	lw	a0, 8(s1)
 .Lpcrel_hi17:
 	auipc	a1, %pcrel_hi(.L.str.13)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi17)
 	call	strcmp
-	bnez	a0, .LBB0_348
-# %bb.361:
+	bnez	a0, .LBB0_374
+# %bb.387:
 	lw	a0, 12(s1)
 .Lpcrel_hi18:
 	auipc	a1, %pcrel_hi(.L.str.14)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi18)
 	call	strcmp
-	bnez	a0, .LBB0_348
-# %bb.362:
+	bnez	a0, .LBB0_374
+# %bb.388:
 	lw	a0, 16(s1)
 .Lpcrel_hi19:
 	auipc	a1, %pcrel_hi(.L.str.15)
 	addi	a1, a1, %pcrel_lo(.Lpcrel_hi19)
 	call	strcmp
-	bnez	a0, .LBB0_348
-# %bb.363:
+	bnez	a0, .LBB0_374
+# %bb.389:
 	addi	a0, sp, 348
-	bgeu	s1, a0, .LBB0_364
+	bgeu	s1, a0, .LBB0_390
 	j	.LBB0_127
-.LBB0_364:
+.LBB0_390:
 	lw	a0, 0(s1)
 	sltu	s0, a0, s1
-	j	.LBB0_348
+	j	.LBB0_374
 .Lfunc_end0:
 	.size	main, .Lfunc_end0-main
                                         # -- End function
@@ -3517,9 +3724,9 @@ test_sbrk:                              # @test_sbrk
 	li	a0, 0
 	call	sbrk
 	mv	s0, a0
-.Lpcrel_hi299:
+.Lpcrel_hi312:
 	auipc	a0, %pcrel_hi(.L_MergedGlobals)
-	addi	s2, a0, %pcrel_lo(.Lpcrel_hi299)
+	addi	s2, a0, %pcrel_lo(.Lpcrel_hi312)
 	lw	a0, 0(s2)
 	addi	a0, a0, 1
 	sw	a0, 0(s2)
@@ -3532,18 +3739,18 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi300:
+.Lpcrel_hi313:
 	auipc	a0, %pcrel_hi(.L.str.28)
-.Lpcrel_hi301:
+.Lpcrel_hi314:
 	auipc	a1, %pcrel_hi(.L.str.77)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi300)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi301)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi313)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi314)
 	call	printf
 	lw	a0, 0(s2)
 .LBB1_3:
-.Lpcrel_hi302:
+.Lpcrel_hi315:
 	auipc	a1, %pcrel_hi(test_sbrk)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi302)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi315)
 	addi	a0, a0, 1
 	sw	a0, 0(s2)
 	blt	a1, s0, .LBB1_5
@@ -3551,12 +3758,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi303:
+.Lpcrel_hi316:
 	auipc	a0, %pcrel_hi(.L.str.28)
-.Lpcrel_hi304:
+.Lpcrel_hi317:
 	auipc	a1, %pcrel_hi(.L.str.78)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi303)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi304)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi316)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi317)
 	call	printf
 .LBB1_5:
 	lui	s1, 3
@@ -3572,12 +3779,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi305:
+.Lpcrel_hi318:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi306:
+.Lpcrel_hi319:
 	auipc	a1, %pcrel_hi(.L.str.79)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi305)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi306)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi318)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi319)
 	mv	a3, s0
 	call	printf
 .LBB1_7:
@@ -3593,12 +3800,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi307:
+.Lpcrel_hi320:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi308:
+.Lpcrel_hi321:
 	auipc	a1, %pcrel_hi(.L.str.80)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi307)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi308)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi320)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi321)
 	mv	a3, s1
 	call	printf
 .LBB1_9:
@@ -3624,12 +3831,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi309:
+.Lpcrel_hi322:
 	auipc	a0, %pcrel_hi(.L.str.28)
-.Lpcrel_hi310:
+.Lpcrel_hi323:
 	auipc	a1, %pcrel_hi(.L.str.81)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi309)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi310)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi322)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi323)
 	call	printf
 	lw	a1, 0(s2)
 .LBB1_13:
@@ -3644,12 +3851,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi311:
+.Lpcrel_hi324:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi312:
+.Lpcrel_hi325:
 	auipc	a1, %pcrel_hi(.L.str.82)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi311)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi312)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi324)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi325)
 	li	a3, 5
 	call	printf
 .LBB1_15:
@@ -3668,12 +3875,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi313:
+.Lpcrel_hi326:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi314:
+.Lpcrel_hi327:
 	auipc	a1, %pcrel_hi(.L.str.83)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi313)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi314)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi326)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi327)
 	li	a3, -14
 	call	printf
 .LBB1_17:
@@ -3689,12 +3896,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi315:
+.Lpcrel_hi328:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi316:
+.Lpcrel_hi329:
 	auipc	a1, %pcrel_hi(.L.str.84)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi315)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi316)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi328)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi329)
 	mv	a3, s1
 	call	printf
 .LBB1_19:
@@ -3713,12 +3920,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi317:
+.Lpcrel_hi330:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi318:
+.Lpcrel_hi331:
 	auipc	a1, %pcrel_hi(.L.str.85)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi317)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi318)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi330)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi331)
 	li	a3, -14
 	call	printf
 	lw	a0, 0(s2)
@@ -3733,12 +3940,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi319:
+.Lpcrel_hi332:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi320:
+.Lpcrel_hi333:
 	auipc	a1, %pcrel_hi(.L.str.86)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi319)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi320)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi332)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi333)
 	li	a3, 245
 	call	printf
 .LBB1_23:
@@ -3754,12 +3961,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi321:
+.Lpcrel_hi334:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi322:
+.Lpcrel_hi335:
 	auipc	a1, %pcrel_hi(.L.str.87)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi321)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi322)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi334)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi335)
 	call	printf
 .LBB1_25:
 	addi	a1, s1, 2039
@@ -3783,12 +3990,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi323:
+.Lpcrel_hi336:
 	auipc	a0, %pcrel_hi(.L.str.28)
-.Lpcrel_hi324:
+.Lpcrel_hi337:
 	auipc	a1, %pcrel_hi(.L.str.88)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi323)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi324)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi336)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi337)
 	call	printf
 	lw	a1, 0(s2)
 .LBB1_29:
@@ -3801,12 +4008,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi325:
+.Lpcrel_hi338:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi326:
+.Lpcrel_hi339:
 	auipc	a1, %pcrel_hi(.L.str.89)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi325)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi326)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi338)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi339)
 	li	a3, 100
 	call	printf
 .LBB1_31:
@@ -3822,12 +4029,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi327:
+.Lpcrel_hi340:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi328:
+.Lpcrel_hi341:
 	auipc	a1, %pcrel_hi(.L.str.90)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi327)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi328)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi340)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi341)
 	li	a3, -22
 	call	printf
 .LBB1_33:
@@ -3844,12 +4051,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi329:
+.Lpcrel_hi342:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi330:
+.Lpcrel_hi343:
 	auipc	a1, %pcrel_hi(.L.str.91)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi329)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi330)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi342)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi343)
 	li	a3, -22
 	call	printf
 .LBB1_35:
@@ -3868,12 +4075,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi331:
+.Lpcrel_hi344:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi332:
+.Lpcrel_hi345:
 	auipc	a1, %pcrel_hi(.L.str.92)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi331)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi332)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi344)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi345)
 	li	a3, -12
 	call	printf
 .LBB1_37:
@@ -3890,12 +4097,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi333:
+.Lpcrel_hi346:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi334:
+.Lpcrel_hi347:
 	auipc	a1, %pcrel_hi(.L.str.93)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi333)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi334)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi346)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi347)
 	li	a3, -12
 	call	printf
 .LBB1_39:
@@ -3910,12 +4117,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi335:
+.Lpcrel_hi348:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi336:
+.Lpcrel_hi349:
 	auipc	a1, %pcrel_hi(.L.str.94)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi335)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi336)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi348)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi349)
 	mv	a3, s1
 	call	printf
 .LBB1_41:
@@ -3931,12 +4138,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi337:
+.Lpcrel_hi350:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi338:
+.Lpcrel_hi351:
 	auipc	a1, %pcrel_hi(.L.str.95)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi337)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi338)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi350)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi351)
 	mv	a3, s1
 	call	printf
 .LBB1_43:
@@ -3951,12 +4158,12 @@ test_sbrk:                              # @test_sbrk
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-.Lpcrel_hi339:
+.Lpcrel_hi352:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi340:
+.Lpcrel_hi353:
 	auipc	a1, %pcrel_hi(.L.str.96)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi339)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi340)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi352)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi353)
 	mv	a3, s0
 	call	printf
 .LBB1_45:
@@ -3980,12 +4187,12 @@ test_sbrk:                              # @test_sbrk
 	ret
 .LBB1_47:
 	lw	a3, 4(s2)
-.Lpcrel_hi341:
+.Lpcrel_hi354:
 	auipc	a0, %pcrel_hi(.L.str.29)
-.Lpcrel_hi342:
+.Lpcrel_hi355:
 	auipc	a1, %pcrel_hi(.L.str.97)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi341)
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi342)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi354)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi355)
 	addi	a4, a3, 1
 	li	a3, -14
 	sw	a4, 4(s2)
@@ -4007,9 +4214,9 @@ exec_fail:                              # @exec_fail
 	sw	ra, 92(sp)                      # 4-byte Folded Spill
 	sw	s0, 88(sp)                      # 4-byte Folded Spill
 	sw	s1, 84(sp)                      # 4-byte Folded Spill
-.Lpcrel_hi343:
+.Lpcrel_hi356:
 	auipc	a0, %pcrel_hi(.L.str.15)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi343)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi356)
 	sw	a0, 12(sp)
 	sw	a0, 16(sp)
 	sw	a0, 20(sp)
@@ -4028,33 +4235,33 @@ exec_fail:                              # @exec_fail
 	sw	a0, 72(sp)
 	sw	a0, 76(sp)
 	sw	zero, 80(sp)
-.Lpcrel_hi344:
+.Lpcrel_hi357:
 	auipc	a0, %pcrel_hi(.L.str.17)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi344)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi357)
 	li	a1, 0
 	call	exec
 	li	s1, -2
 	li	s0, 1
 	bne	a0, s1, .LBB2_4
 # %bb.1:
-.Lpcrel_hi345:
+.Lpcrel_hi358:
 	auipc	a0, %pcrel_hi(.L.str.13)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi345)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi358)
 	li	a1, 0
 	call	exec
 	bne	a0, s1, .LBB2_4
 # %bb.2:
-.Lpcrel_hi346:
+.Lpcrel_hi359:
 	auipc	a0, %pcrel_hi(.L.str.16)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi346)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi359)
 	addi	a1, sp, 12
 	call	exec
 	li	a1, -7
 	bne	a0, a1, .LBB2_4
 # %bb.3:
-.Lpcrel_hi347:
+.Lpcrel_hi360:
 	auipc	a0, %pcrel_hi(.L.str.16)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi347)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi360)
 	lui	a1, 524288
 	call	exec
 	addi	a0, a0, 14
@@ -4087,9 +4294,9 @@ grow:                                   # @grow
 	mv	s2, a0
 	srai	a0, a0, 31
 	and	a2, a0, s2
-.Lpcrel_hi348:
+.Lpcrel_hi361:
 	auipc	a0, %pcrel_hi(.L.str.18)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi348)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi361)
 	mv	a1, s1
 	call	printf
 	bltz	s2, .LBB3_3
@@ -4176,9 +4383,9 @@ spawn_with:                             # @spawn_with
 	mv	a0, s3
 	call	dup
 .LBB4_4:
-.Lpcrel_hi349:
+.Lpcrel_hi362:
 	auipc	a0, %pcrel_hi(.L.str.16)
-	addi	a0, a0, %pcrel_lo(.Lpcrel_hi349)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi362)
 	mv	a1, s2
 	call	spawn
 	mv	s2, a0
@@ -5022,23 +5229,53 @@ spawn_with:                             # @spawn_with
 
 	.type	.L.str.160,@object              # @.str.160
 .L.str.160:
-	.asciz	"a pipe the child must not get"
-	.size	.L.str.160, 30
+	.asciz	"a pipe for a writer asleep when its reader goes"
+	.size	.L.str.160, 48
 
 	.type	.L.str.161,@object              # @.str.161
 .L.str.161:
-	.asciz	"a child gets descriptors 0, 1 and 2 only"
-	.size	.L.str.161, 41
+	.asciz	"the writer filled the pipe"
+	.size	.L.str.161, 27
 
 	.type	.L.str.162,@object              # @.str.162
 .L.str.162:
-	.asciz	"exec keeps the pid and the descriptors"
-	.size	.L.str.162, 39
+	.asciz	"closing the read end wakes the writer: cut short, then -EPIPE"
+	.size	.L.str.162, 62
 
 	.type	.L.str.163,@object              # @.str.163
 .L.str.163:
+	.asciz	"a pipe for a reader asleep when its writer goes"
+	.size	.L.str.163, 48
+
+	.type	.L.str.164,@object              # @.str.164
+.L.str.164:
+	.asciz	"write a byte to the reader"
+	.size	.L.str.164, 27
+
+	.type	.L.str.165,@object              # @.str.165
+.L.str.165:
+	.asciz	"closing the write end wakes the reader: the end of the input"
+	.size	.L.str.165, 61
+
+	.type	.L.str.166,@object              # @.str.166
+.L.str.166:
+	.asciz	"a pipe the child must not get"
+	.size	.L.str.166, 30
+
+	.type	.L.str.167,@object              # @.str.167
+.L.str.167:
+	.asciz	"a child gets descriptors 0, 1 and 2 only"
+	.size	.L.str.167, 41
+
+	.type	.L.str.168,@object              # @.str.168
+.L.str.168:
+	.asciz	"exec keeps the pid and the descriptors"
+	.size	.L.str.168, 39
+
+	.type	.L.str.169,@object              # @.str.169
+.L.str.169:
 	.asciz	"a failed exec returns its error"
-	.size	.L.str.163, 32
+	.size	.L.str.169, 32
 
 	.type	.L_MergedGlobals,@object        # @_MergedGlobals
 	.local	.L_MergedGlobals

@@ -33,6 +33,16 @@ struct superblock fs_sb;
 
 static struct inode itable[NINODE];
 
+/* iget() panics when the cache is full, so it must hold every inode that
+ * can be in use at once: one per open file (an FD_INODE file, or a device
+ * opened by its path, keeps its inode until closed), one per process's
+ * working directory, and the few each process holds for a moment inside a
+ * call, at most INODES_PER_CALL (link() keeps `old` while walking `new`'s
+ * path, which holds a directory and the entry found in it). A user can then
+ * run out of open files (-ENFILE), never out of inodes. */
+#define INODES_PER_CALL 3
+_Static_assert(NINODE >= NFILE + NPROC * (1 + INODES_PER_CALL), "the inode cache holds every user");
+
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 struct buf *fs_bread(u32 dev, u32 blockno) {
@@ -603,6 +613,15 @@ static struct inode *namex(const char *path, bool parent, char *name, int *err) 
             /* The last name: stop here. */
             iunlock(ip);
             return ip;
+        }
+        if (ip->nlink == 0 && namecmp(name, ".") != 0) {
+            /* A removed directory (still some process's working directory):
+             * it is empty, so only its `..` is left, and that may name a
+             * parent removed and freed since, or an inode reused for
+             * something else. Nothing is found in it, as on Linux. */
+            iunlockput(ip);
+            *err = -ENOENT;
+            return NULL;
         }
         struct inode *next = dirlookup(ip, name, NULL);
         /* Unlock before taking `next` (which may be `ip` itself, for `.`,

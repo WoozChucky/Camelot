@@ -94,22 +94,35 @@ int main(void) {
     /* None of that opened a descriptor: 3 is the lowest free one. */
     expect(dup(STDOUT), 3);                                  /* 41 */
     expect(close(3), 0);                                     /* 42 */
+    /* A bad pointer comes before a path that is empty or too long, in
+     * whichever argument it is. */
+    char long_path[MAXPATH + 2];
+    memset(long_path, 'a', sizeof long_path - 1);
+    long_path[sizeof long_path - 1] = 0;
+    char **bad_argv = (char **)4;
+    expect(link("", (char *)KERNEL), -EFAULT);               /* 43 */
+    expect(link(long_path, (char *)0), -EFAULT);             /* 44 */
+    expect(spawn("", bad_argv), -EFAULT);                    /* 45 */
+    expect(spawn(long_path, argv), -EFAULT);                 /* 46 */
+    expect(exec("", bad_argv), -EFAULT);                     /* 47 */
+    expect(exec(long_path, argv), -EFAULT);                  /* 48 */
+    expect(wait(-1, &status), -ECHILD);                      /* 49 */
     /* A pipe's buffers: the failed calls move nothing. */
     int p[2];
-    expect(pipe(p), 0);                                      /* 43 */
-    expect(write(p[1], (char *)KERNEL, 4), -EFAULT);         /* 44 */
-    expect(write(p[1], "ok", 2), 2);                         /* 45 */
-    expect(read(p[0], (char *)msg, 2), -EFAULT);             /* 46 */
-    expect(read(p[0], end - 1, 2), -EFAULT);                 /* 47 */
-    expect(fstat(p[0], &st) == 0 && st.size == 2, 1);        /* 48 */
-    expect(read(p[0], buf, sizeof buf), 2);                  /* 49 */
-    expect(buf[0] == 'o' && buf[1] == 'k', 1);               /* 50 */
+    expect(pipe(p), 0);                                      /* 50 */
+    expect(write(p[1], (char *)KERNEL, 4), -EFAULT);         /* 51 */
+    expect(write(p[1], "ok", 2), 2);                         /* 52 */
+    expect(read(p[0], (char *)msg, 2), -EFAULT);             /* 53 */
+    expect(read(p[0], end - 1, 2), -EFAULT);                 /* 54 */
+    expect(fstat(p[0], &st) == 0 && st.size == 2, 1);        /* 55 */
+    expect(read(p[0], buf, sizeof buf), 2);                  /* 56 */
+    expect(buf[0] == 'o' && buf[1] == 'k', 1);               /* 57 */
     close(p[0]);
     close(p[1]);
     /* And a good buffer. */
     if (failed_case == 0) {
         uint len = strlen(msg);
-        expect(write(STDOUT, msg, len), (int)len);           /* 24 */
+        expect(write(STDOUT, msg, len), (int)len);           /* 58 */
     } else {
         printf("badptr: case %d failed\n", failed_case);
     }

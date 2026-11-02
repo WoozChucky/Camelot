@@ -48,27 +48,30 @@ main:                                   # @main
 	.type	ls,@function
 ls:                                     # @ls
 # %bb.0:
-	addi	sp, sp, -208
-	sw	ra, 204(sp)                     # 4-byte Folded Spill
-	sw	s0, 200(sp)                     # 4-byte Folded Spill
-	sw	s1, 196(sp)                     # 4-byte Folded Spill
-	sw	s2, 192(sp)                     # 4-byte Folded Spill
-	sw	s3, 188(sp)                     # 4-byte Folded Spill
-	sw	s4, 184(sp)                     # 4-byte Folded Spill
-	sw	s5, 180(sp)                     # 4-byte Folded Spill
-	sw	s6, 176(sp)                     # 4-byte Folded Spill
-	sw	s7, 172(sp)                     # 4-byte Folded Spill
-	sw	s8, 168(sp)                     # 4-byte Folded Spill
+	addi	sp, sp, -224
+	sw	ra, 220(sp)                     # 4-byte Folded Spill
+	sw	s0, 216(sp)                     # 4-byte Folded Spill
+	sw	s1, 212(sp)                     # 4-byte Folded Spill
+	sw	s2, 208(sp)                     # 4-byte Folded Spill
+	sw	s3, 204(sp)                     # 4-byte Folded Spill
+	sw	s4, 200(sp)                     # 4-byte Folded Spill
+	sw	s5, 196(sp)                     # 4-byte Folded Spill
+	sw	s6, 192(sp)                     # 4-byte Folded Spill
+	sw	s7, 188(sp)                     # 4-byte Folded Spill
+	sw	s8, 184(sp)                     # 4-byte Folded Spill
+	sw	s9, 180(sp)                     # 4-byte Folded Spill
+	sw	s10, 176(sp)                    # 4-byte Folded Spill
+	sw	s11, 172(sp)                    # 4-byte Folded Spill
 	mv	s1, a0
 	li	a1, 0
 	call	open
 	mv	s0, a0
 	bltz	a0, .LBB1_4
 # %bb.1:
-	addi	a1, sp, 152
+	addi	a1, sp, 156
 	mv	a0, s0
 	call	fstat
-	lhu	a0, 156(sp)
+	lhu	a0, 160(sp)
 	li	a1, 1
 	beq	a0, a1, .LBB1_5
 # %bb.2:
@@ -76,7 +79,7 @@ ls:                                     # @ls
 	bne	a0, a1, .LBB1_7
 # %bb.3:
 	li	a1, 102
-	j	.LBB1_23
+	j	.LBB1_25
 .LBB1_4:
 	neg	a0, s0
 	call	strerror
@@ -88,7 +91,7 @@ ls:                                     # @ls
 	mv	a2, s1
 	call	fprintf
 	li	a0, 1
-	j	.LBB1_25
+	j	.LBB1_26
 .LBB1_5:
 	mv	a0, s1
 	call	strlen
@@ -109,110 +112,128 @@ ls:                                     # @ls
 	mv	a0, s0
 	call	close
 	li	a0, 1
-	j	.LBB1_25
+	j	.LBB1_26
 .LBB1_7:
 	li	a1, 3
-	beq	a0, a1, .LBB1_22
+	beq	a0, a1, .LBB1_24
 # %bb.8:
 	li	a1, 63
-	j	.LBB1_23
+	j	.LBB1_25
 .LBB1_9:
-	addi	a0, sp, 24
-	addi	s3, sp, 24
+	addi	a0, sp, 28
+	addi	s3, sp, 28
 	mv	a1, s1
 	mv	a2, s2
 	call	memcpy
-	add	s1, s3, s2
+	li	s6, 0
+	add	s2, s3, s2
 	li	a0, 47
-	sb	a0, 0(s1)
-	addi	a1, sp, 8
-	li	a2, 16
-	li	s4, 16
-	mv	a0, s0
-	call	read
-	bne	a0, s4, .LBB1_24
-# %bb.10:
-	addi	s1, s1, 1
-	addi	s2, sp, 10
+	addi	s1, sp, 14
 	add	s5, s3, s5
-	li	s6, 1
+	li	s7, 16
+	li	s8, -2
 .Lpcrel_hi4:
-	auipc	a0, %pcrel_hi(.L.str.2)
-	li	s7, 2
-	addi	s3, a0, %pcrel_lo(.Lpcrel_hi4)
-	li	s8, 3
-	j	.LBB1_14
-.LBB1_11:                               #   in Loop: Header=BB1_14 Depth=1
-	li	a1, 100
-.LBB1_12:                               #   in Loop: Header=BB1_14 Depth=1
-	lw	a2, 152(sp)
-	lhu	a3, 158(sp)
-	lw	a4, 160(sp)
-	mv	a0, s3
-	mv	a5, s1
-	call	printf
-.LBB1_13:                               #   in Loop: Header=BB1_14 Depth=1
-	addi	a1, sp, 8
+	auipc	a1, %pcrel_hi(.L.str.1)
+	li	s9, 2
+	li	s10, 1
+.Lpcrel_hi5:
+	auipc	a2, %pcrel_hi(.L.str.2)
+	sb	a0, 0(s2)
+	addi	s2, s2, 1
+	addi	s3, a1, %pcrel_lo(.Lpcrel_hi4)
+	addi	s4, a2, %pcrel_lo(.Lpcrel_hi5)
+	li	s11, 3
+.LBB1_10:                               # =>This Inner Loop Header: Depth=1
+	addi	a1, sp, 12
 	li	a2, 16
 	mv	a0, s0
 	call	read
-	bne	a0, s4, .LBB1_24
-.LBB1_14:                               # =>This Inner Loop Header: Depth=1
-	lhu	a0, 8(sp)
-	beqz	a0, .LBB1_13
-# %bb.15:                               #   in Loop: Header=BB1_14 Depth=1
+	bne	a0, s7, .LBB1_23
+# %bb.11:                               #   in Loop: Header=BB1_10 Depth=1
+	lhu	a0, 12(sp)
+	beqz	a0, .LBB1_10
+# %bb.12:                               #   in Loop: Header=BB1_10 Depth=1
 	li	a2, 14
-	mv	a0, s1
-	mv	a1, s2
+	mv	a0, s2
+	mv	a1, s1
 	call	memcpy
 	sb	zero, 0(s5)
-	addi	a0, sp, 24
-	addi	a1, sp, 152
+	addi	a0, sp, 28
+	addi	a1, sp, 156
 	call	stat
-	bltz	a0, .LBB1_13
-# %bb.16:                               #   in Loop: Header=BB1_14 Depth=1
-	lhu	a0, 156(sp)
-	beq	a0, s6, .LBB1_11
-# %bb.17:                               #   in Loop: Header=BB1_14 Depth=1
-	bne	a0, s7, .LBB1_19
-# %bb.18:                               #   in Loop: Header=BB1_14 Depth=1
+	beq	a0, s8, .LBB1_10
+# %bb.13:                               #   in Loop: Header=BB1_10 Depth=1
+	bltz	a0, .LBB1_22
+# %bb.14:                               #   in Loop: Header=BB1_10 Depth=1
+	lhu	a0, 160(sp)
+	beq	a0, s10, .LBB1_17
+# %bb.15:                               #   in Loop: Header=BB1_10 Depth=1
+	bne	a0, s9, .LBB1_18
+# %bb.16:                               #   in Loop: Header=BB1_10 Depth=1
 	li	a1, 102
-	j	.LBB1_12
-.LBB1_19:                               #   in Loop: Header=BB1_14 Depth=1
-	beq	a0, s8, .LBB1_21
-# %bb.20:                               #   in Loop: Header=BB1_14 Depth=1
+	j	.LBB1_21
+.LBB1_17:                               #   in Loop: Header=BB1_10 Depth=1
+	li	a1, 100
+	j	.LBB1_21
+.LBB1_18:                               #   in Loop: Header=BB1_10 Depth=1
+	beq	a0, s11, .LBB1_20
+# %bb.19:                               #   in Loop: Header=BB1_10 Depth=1
 	li	a1, 63
-	j	.LBB1_12
-.LBB1_21:                               #   in Loop: Header=BB1_14 Depth=1
+	j	.LBB1_21
+.LBB1_20:                               #   in Loop: Header=BB1_10 Depth=1
 	li	a1, 99
-	j	.LBB1_12
-.LBB1_22:
-	li	a1, 99
+.LBB1_21:                               #   in Loop: Header=BB1_10 Depth=1
+	lw	a2, 156(sp)
+	lhu	a3, 162(sp)
+	lw	a4, 164(sp)
+	mv	a0, s4
+	mv	a5, s2
+	call	printf
+	j	.LBB1_10
+.LBB1_22:                               #   in Loop: Header=BB1_10 Depth=1
+	neg	a0, a0
+	call	strerror
+	mv	a3, a0
+	li	a0, 2
+	addi	a2, sp, 28
+	mv	a1, s3
+	call	fprintf
+	li	s6, 1
+	j	.LBB1_10
 .LBB1_23:
-	lw	a2, 152(sp)
-	lhu	a3, 158(sp)
-	lw	a4, 160(sp)
+	mv	a0, s0
+	call	close
+	mv	a0, s6
+	j	.LBB1_26
+.LBB1_24:
+	li	a1, 99
+.LBB1_25:
+	lw	a2, 156(sp)
+	lhu	a3, 162(sp)
+	lw	a4, 164(sp)
 .Lpcrel_hi2:
 	auipc	a0, %pcrel_hi(.L.str.2)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi2)
 	mv	a5, s1
 	call	printf
-.LBB1_24:
 	mv	a0, s0
 	call	close
 	li	a0, 0
-.LBB1_25:
-	lw	ra, 204(sp)                     # 4-byte Folded Reload
-	lw	s0, 200(sp)                     # 4-byte Folded Reload
-	lw	s1, 196(sp)                     # 4-byte Folded Reload
-	lw	s2, 192(sp)                     # 4-byte Folded Reload
-	lw	s3, 188(sp)                     # 4-byte Folded Reload
-	lw	s4, 184(sp)                     # 4-byte Folded Reload
-	lw	s5, 180(sp)                     # 4-byte Folded Reload
-	lw	s6, 176(sp)                     # 4-byte Folded Reload
-	lw	s7, 172(sp)                     # 4-byte Folded Reload
-	lw	s8, 168(sp)                     # 4-byte Folded Reload
-	addi	sp, sp, 208
+.LBB1_26:
+	lw	ra, 220(sp)                     # 4-byte Folded Reload
+	lw	s0, 216(sp)                     # 4-byte Folded Reload
+	lw	s1, 212(sp)                     # 4-byte Folded Reload
+	lw	s2, 208(sp)                     # 4-byte Folded Reload
+	lw	s3, 204(sp)                     # 4-byte Folded Reload
+	lw	s4, 200(sp)                     # 4-byte Folded Reload
+	lw	s5, 196(sp)                     # 4-byte Folded Reload
+	lw	s6, 192(sp)                     # 4-byte Folded Reload
+	lw	s7, 188(sp)                     # 4-byte Folded Reload
+	lw	s8, 184(sp)                     # 4-byte Folded Reload
+	lw	s9, 180(sp)                     # 4-byte Folded Reload
+	lw	s10, 176(sp)                    # 4-byte Folded Reload
+	lw	s11, 172(sp)                    # 4-byte Folded Reload
+	addi	sp, sp, 224
 	ret
 .Lfunc_end1:
 	.size	ls, .Lfunc_end1-ls

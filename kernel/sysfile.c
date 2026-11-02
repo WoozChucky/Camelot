@@ -169,6 +169,12 @@ static struct inode *open_inode(const char *path, u32 flags, int *err) {
         if (*err != -ENOENT || (flags & O_CREAT) == 0) {
             return NULL;
         }
+        if (path[strlen(path) - 1] == '/') {
+            /* "name/" says a directory, and open() makes only files (as on
+             * Linux). The path isn't empty: fetch_path() refused that. */
+            *err = -EISDIR;
+            return NULL;
+        }
         ip = fs_create(path, T_FILE, 0, 0, err);
         /* -EEXIST: made by another process while namei() slept on the
          * disk. Look it up again. */
@@ -275,9 +281,15 @@ int sys_link(struct trap_frame *f) {
     char old[MAXPATH + 1];
     char new[MAXPATH + 1];
     pagetable_t pt = myproc()->pagetable;
+    /* Both paths are read before either's error is returned: a bad pointer
+     * in `new` comes before `old` being too long or empty. */
     int err = fetch_path(pt, arg(f, 0), old);
+    int err_new = fetch_path(pt, arg(f, 1), new);
+    if (err == -EFAULT || err_new == -EFAULT) {
+        return -EFAULT;
+    }
     if (err == 0) {
-        err = fetch_path(pt, arg(f, 1), new);
+        err = err_new;
     }
     if (err < 0) {
         return err;

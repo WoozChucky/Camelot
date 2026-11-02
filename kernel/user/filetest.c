@@ -16,7 +16,8 @@
  *                     fails with -EROFS and reading still works; prints
  *                     "filetest: N checks, F failed" too
  *   filetest incwd    a child: exits 0 if its working directory holds a
- *                     file `c` (its parent's working directory: inherited) */
+ *                     file `c` (its parent's working directory: inherited)
+ *   filetest hold T   a child: holds files open (see hold()) */
 #include "user.h"
 
 /* Descriptors per process (NOFILE in kernel/include/file.h). */
@@ -124,6 +125,8 @@ static void test_open_errors(void) {
     check_eq(open("/ft", O_WRONLY), -EISDIR, "a directory for writing");
     check_eq(open("/ft", O_RDWR | O_CREAT), -EISDIR, "a directory for reading and writing");
     check_eq(open(".", O_RDWR | O_TRUNC), -EISDIR, "a directory to empty");
+    check_eq(open("newf/", O_WRONLY | O_CREAT), -EISDIR, "create a name ending in /: a directory's");
+    check_eq(unlink("newf"), -ENOENT, "which makes nothing");
 }
 
 static void test_read_write_seek(void) {
@@ -321,6 +324,24 @@ static void test_working_directory(void) {
     check_eq(stat(".", &st), 0, "it can still be looked at");
     check(st.nlink == 0 && st.type == T_DIR, "with no links");
     check_eq(chdir("/ft"), 0, "chdir away: it goes");
+
+    /* Its .. leads nowhere, even once the parent is gone too: the parent's
+     * inode is freed (and may be reused), so following it would panic or
+     * land in some other directory. */
+    check_eq(mkdir("pa"), 0, "mkdir pa");
+    check_eq(mkdir("pa/b"), 0, "mkdir pa/b");
+    check_eq(chdir("pa/b"), 0, "chdir pa/b");
+    check_eq(unlink("/ft/pa/b"), 0, "remove the working directory");
+    check_eq(chdir(".."), -ENOENT, "its .. is not found while the parent is there");
+    check_eq(unlink("/ft/pa"), 0, "remove its parent: it goes");
+    check_eq(chdir(".."), -ENOENT, "chdir .. after that");
+    check_eq(open("..", O_RDONLY), -ENOENT, "open .. after that");
+    check_eq(mkdir("/ft/pc"), 0, "a new directory, maybe in the parent's old inode");
+    check_eq(chdir("../pc"), -ENOENT, "still not reached through ..");
+    check_eq(stat(".", &st), 0, "the working directory is unchanged");
+    check(st.nlink == 0 && st.type == T_DIR, "still the removed one");
+    check_eq(chdir("/ft"), 0, "chdir away");
+    check_eq(unlink("pc"), 0, "remove pc");
 }
 
 /* Copies the file at `from` to a new file at `to`. Returns 0 or an error. */
@@ -388,6 +409,12 @@ static void test_programs(void) {
     close(fd);
     /* The kernel prints why: "spawn: /ft/notelf: not an ELF file". */
     check_eq(spawn("/ft/notelf", NULL), -ENOEXEC, "a file that isn't a program");
+    /* exec fails as late as it can, reading the file: this program carries
+     * on, the same process, its memory as it was. */
+    int pid = getpid();
+    char mark[] = "still here";
+    check_eq(exec("/ft/notelf", (char *[]){"notelf", NULL}), -ENOEXEC, "exec a file that isn't a program");
+    check(getpid() == pid && strcmp(mark, "still here") == 0, "and the old program carries on");
     check_eq(spawn("/ft", NULL), -EACCES, "a directory isn't a program");
     check_eq(spawn("/dev/console", NULL), -EACCES, "nor is a device");
     check_eq(exec("/ft", NULL), -EACCES, "exec a directory");
@@ -406,6 +433,96 @@ static void test_devices(void) {
     check_eq(lseek(fd, 0, SEEK_SET), -ESPIPE, "no seeking on a device");
     check_eq(read(fd, buf, 1), -EBADF, "opened for writing only");
     close(fd);
+}
+
+/* `filetest hold T`, a child of test_open_file_table(), in /ft with a pipe
+ * at 0 and 1: opens new files hT00, hT01... until open fails, writes 'M' to
+ * 1 if that was -EMFILE (its descriptors ran out), 'N' if -ENFILE (the
+ * kernel's open files did) and the file was not made, 'X' otherwise; then
+ * holds them until 0 reaches its end, removes them, and exits with how many
+ * it opened. */
+static int hold(char tag) {
+    char name[] = "hT00";
+    name[1] = tag;
+    int opened = 0;
+    int r;
+    for (;;) {
+        name[2] = (char)('0' + opened / 10);
+        name[3] = (char)('0' + opened % 10);
+        r = open(name, O_RDWR | O_CREAT);
+        if (r < 0) {
+            break;
+        }
+        opened++;
+    }
+    char c = r == -EMFILE ? 'M' : r == -ENFILE && unlink(name) == -ENOENT ? 'N' : 'X';
+    write(STDOUT, &c, 1);
+    while (read(STDIN, &c, 1) > 0) {
+    }
+    for (int i = 0; i < opened; i++) {
+        name[2] = (char)('0' + i / 10);
+        name[3] = (char)('0' + i % 10);
+        unlink(name);
+    }
+    return opened;
+}
+
+/* Children hold files open until the kernel's table of open files is full:
+ * open and pipe then fail with -ENFILE, having made nothing (not a panic:
+ * the inode cache has room for every open file). */
+static void test_open_file_table(void) {
+    int hold_pipe[2], ready[2];
+    check_eq(pipe(hold_pipe), 0, "a pipe to hold the children");
+    check_eq(pipe(ready), 0, "a pipe they say they are ready on");
+    int in = dup(STDIN);
+    int out = dup(STDOUT);
+    close(STDIN);
+    dup(hold_pipe[0]);
+    close(STDOUT);
+    dup(ready[1]);
+    /* At most 6: with the shell and filetest, NPROC (8) processes. */
+    int pids[6];
+    int children = 0;
+    char c = 'M';
+    char tag[2] = "a";
+    while (c == 'M' && children < 6) {
+        tag[0] = (char)('a' + children);
+        int pid = spawn("/bin/filetest", (char *[]){"filetest", "hold", tag, NULL});
+        if (pid < 0) {
+            break;
+        }
+        pids[children++] = pid;
+        if (read(ready[0], &c, 1) != 1) {
+            c = '?';
+        }
+    }
+    close(STDIN);
+    dup(in);
+    close(in);
+    close(STDOUT);
+    dup(out);
+    close(out);
+    check(c == 'N', "a child's open fails with -ENFILE, making nothing");
+    check_eq(open("full", O_WRONLY | O_CREAT), -ENFILE, "so does the parent's");
+    check_eq(unlink("full"), -ENOENT, "which makes nothing either");
+    int p[2];
+    check_eq(pipe(p), -ENFILE, "and pipe");
+    close(hold_pipe[1]);
+    for (int i = 0; i < children; i++) {
+        int status = status_of(pids[i]);
+        if (i < children - 1) {
+            check_eq(status, NOFILE - 3, "a child opens a file for each of its free descriptors");
+        } else {
+            check(status >= 0 && status < NOFILE - 3, "the last child opens fewer");
+        }
+    }
+    close(hold_pipe[0]);
+    close(ready[0]);
+    close(ready[1]);
+    int fd = open("full", O_WRONLY | O_CREAT);
+    check(fd >= 0, "once they are closed, open works again");
+    close(fd);
+    check_eq(unlink("full"), 0, "remove it");
 }
 
 static void test_largest_file(void) {
@@ -502,6 +619,9 @@ int main(int argc, char **argv) {
         struct stat st;
         return stat("c", &st) == 0 ? 0 : 1;
     }
+    if (argc > 2 && strcmp(argv[1], "hold") == 0) {
+        return hold(argv[2][0]);
+    }
     int r = mkdir("/ft");
     if (r < 0 || chdir("/ft") < 0) {
         printf("filetest: cannot make /ft: %s\n", strerror(-r));
@@ -513,6 +633,7 @@ int main(int argc, char **argv) {
     test_working_directory();
     test_programs();
     test_devices();
+    test_open_file_table();
     test_largest_file();
     check_eq(chdir("/"), 0, "chdir /");
     check_eq(unlink("/ft"), 0, "remove /ft: it is empty");

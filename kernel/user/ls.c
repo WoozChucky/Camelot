@@ -1,8 +1,8 @@
 /* ls [PATH...]: lists each directory, or describes each file, named (the
  * working directory without one). A line per entry, as the kernel's boot
  * listing and `camelot-fs ls` print them: the type (d directory, f file, c
- * device), the inode, the links, the size and the name. Exits 1 if a path
- * can't be opened, else 0. */
+ * device), the inode, the links, the size and the name. Exits 1 if a path,
+ * or an entry of a directory, can't be opened (it says why), else 0. */
 #include "user.h"
 
 static char type_letter(int type) {
@@ -37,6 +37,7 @@ static int ls(const char *path) {
     }
     memcpy(entry, path, len);
     entry[len] = '/';
+    int status = 0;
     struct dirent de;
     while (read(fd, &de, sizeof de) == sizeof de) {
         if (de.inum == 0) {
@@ -44,14 +45,22 @@ static int ls(const char *path) {
         }
         memcpy(entry + len + 1, de.name, DIRSIZ);
         entry[len + 1 + DIRSIZ] = 0;
-        if (stat(entry, &st) < 0) {
+        /* stat() opens the entry: a device node with no driver, or no open
+         * file to spare, is an error to report, not an entry to leave out. */
+        int r = stat(entry, &st);
+        if (r == -ENOENT) {
             /* Gone since it was read. */
+            continue;
+        }
+        if (r < 0) {
+            fprintf(STDERR, "ls: %s: %s\n", entry, strerror(-r));
+            status = 1;
             continue;
         }
         line(&st, entry + len + 1);
     }
     close(fd);
-    return 0;
+    return status;
 }
 
 int main(int argc, char **argv) {

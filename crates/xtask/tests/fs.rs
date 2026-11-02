@@ -936,12 +936,9 @@ const SHELL_MAX_STEPS: u64 = 400_000_000;
 /// The shell's prompt.
 const PROMPT: &str = "$ ";
 
-/// The console's device number (`CONSOLE` in kernel/include/file.h).
-const CONSOLE_MAJOR: u16 = 1;
-
 /// Checks `filetest` makes on the root image, and `filetest ro` on a
 /// read-only one (kernel/user/filetest.c).
-const FILETEST_CHECKS: u32 = 137;
+const FILETEST_CHECKS: u32 = 168;
 const FILETEST_RO_CHECKS: u32 = 14;
 
 /// What the shell printed after reading `command`, up to its next prompt.
@@ -968,7 +965,8 @@ fn small_image_with_programs(programs: &[&str]) -> Vec<u8> {
     let mut fs = Mkfs::new(&Options { size: 320, ..SMALL }).unwrap();
     fs.add_file("/README", b"a small disk\n").unwrap();
     fs.mkdir("/dev").unwrap();
-    fs.add_device("/dev/console", CONSOLE_MAJOR, 0).unwrap();
+    fs.add_device("/dev/console", xtask::fs::CONSOLE_MAJOR, 0)
+        .unwrap();
     fs.add_device("/dev/nodriver", 7, 0).unwrap();
     fs.mkdir("/bin").unwrap();
     for name in programs {
@@ -1056,6 +1054,7 @@ fn the_shell_runs_programs_from_bin_and_redirects_through_files_and_pipes() {
                 ln /bin/echo /greet\n\
                 /greet from the root\n\
                 cat /missing | wc\n\
+                echo hi > /hello.txt\n\
                 exit\n",
             max_steps: SHELL_MAX_STEPS,
             ..READ
@@ -1081,7 +1080,9 @@ fn the_shell_runs_programs_from_bin_and_redirects_through_files_and_pipes() {
     assert_eq!((after.replayed, after.orphans), (0, 0));
     assert_eq!((after.dirs, after.files), (before.dirs, before.files + 2));
     let fs = Fs::open(&run.disk).unwrap();
-    assert_eq!(fs.read_file("/hello.txt").unwrap(), b"hello world\n");
+    // `>` empties the file it writes: nothing of the longer line is left.
+    assert_eq!(shell_output(out, "echo hi > /hello.txt"), "");
+    assert_eq!(fs.read_file("/hello.txt").unwrap(), b"hi\n");
     assert_eq!(fs.read_file("/count").unwrap(), b"1 2 12\n");
     let echo = fs.lookup("/bin/echo").unwrap();
     assert_eq!(fs.lookup("/greet").unwrap(), echo);
@@ -1112,6 +1113,7 @@ fn filetest_passes_on_the_root_image_and_leaves_it_as_it_was() {
     );
     // The kernel says why a file it was asked to run is not a program.
     assert!(out.contains("spawn: /ft/notelf: not an ELF file\n"), "{out}");
+    assert!(out.contains("exec: /ft/notelf: not an ELF file\n"), "{out}");
     let after = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
     assert_eq!((after.replayed, after.orphans), (0, 0));
     assert_eq!(state(&run.disk), state(&image));
@@ -1216,4 +1218,34 @@ fn on_a_read_only_root_every_change_fails_and_reading_works() {
     );
     assert!(run.disk == image);
     assert_eq!(run.record.ops, []);
+}
+
+#[test]
+fn ls_reports_an_entry_it_cannot_open_rather_than_leaving_it_out() {
+    // ls looks each entry up by opening it: a device node with no driver
+    // can't be, and ls says so where the host lists it, and fails.
+    let image = small_image_with_programs(&["sh", "ls"]);
+    let host = Fs::open(&image).unwrap().ls("/dev").unwrap();
+    let run = boot(
+        image,
+        Boot {
+            input: b"ls /dev\nexit\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(1), "{}", run.out);
+    let mut want: String = host
+        .lines()
+        .map(|l| {
+            if l.ends_with(" nodriver") {
+                "ls: /dev/nodriver: no such device\n".to_string()
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    assert!(want.contains("nodriver"), "{host}");
+    want.push_str("ls: exit 1\n");
+    assert_eq!(shell_output(&run.out, "ls /dev"), want);
 }

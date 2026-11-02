@@ -195,7 +195,9 @@ opens:
 
 - a file, in the access mode asked for; on a read-only filesystem, writing
   (or creating) is `-EROFS`;
-- a directory, for reading only: anything else is `-EISDIR`;
+- a directory, for reading only: anything else is `-EISDIR`, and so is
+  `O_CREAT` on a missing name with a trailing slash (`newf/` names a
+  directory, and `open` makes only files);
 - a device node (`/dev/console`), which gives the device itself: the
   console's reads and writes, in the access mode asked for, also on a
   read-only filesystem; a node whose major number has no driver is
@@ -238,7 +240,9 @@ a directory to make it in that has been removed (a working directory, say),
 none, it is freed as soon as no descriptor has it open (until then it can
 still be read and written through them). A directory must be empty (but for
 `.` and `..`), or it is `-ENOTEMPTY`; one that is some process's working
-directory is removed even so, and nothing can be made in it any more.
+directory is removed even so: nothing can be made in it any more, and
+nothing but `.` is found in it (looking up its `..` is `-ENOENT`: the parent
+may be gone too, its inode freed or reused).
 `-EINVAL` for `.`, `..` and `/`; the path's errors; `-EROFS`; `-EFAULT`.
 
 **link(old, new)** gives the file `old` another name, `new`: a hard link,

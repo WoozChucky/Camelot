@@ -71,9 +71,14 @@ static int sys_run(struct trap_frame *f, bool replace) {
     int err = fetch_path(pt, arg(f, 0), path);
     /* Too big for the kernel stack: a page of its own while it's needed. */
     struct proc_args *args = NULL;
-    if (err == 0) {
+    if (err != -EFAULT) {
+        /* argv is checked even when the path is too long or empty, which
+         * comes after a bad pointer among argv's. */
         args = kalloc();
-        err = args == NULL ? -ENOMEM : copy_args(pt, arg(f, 1), path, args);
+        int arg_err = args == NULL ? -ENOMEM : copy_args(pt, arg(f, 1), err == 0 ? path : "", args);
+        if (err == 0 || arg_err == -EFAULT) {
+            err = arg_err;
+        }
     }
     if (err == 0) {
         err = replace ? exec_replace(path, args) : exec_spawn(path, args);

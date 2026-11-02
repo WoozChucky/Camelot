@@ -534,6 +534,36 @@ static void test_pipes(void) {
     close(p[1]);
     check_eq(status_of(pid), 7, "the reader read it all, then the end");
 
+    /* The reader goes away while the writer is already asleep on a full
+     * pipe: closing the read end wakes it. The kernel is never preempted,
+     * so once the pipe is seen full the writer is asleep (it fills it and
+     * sleeps in one go). */
+    check_eq(pipe(p), 0, "a pipe for a writer asleep when its reader goes");
+    pid = spawn_with(-1, p[1], (char *[]){"systest", "pipefill", NULL});
+    close(p[1]);
+    while (fstat(p[0], &st) == 0 && st.size < PIPESIZE) {
+        yield();
+    }
+    check_eq(st.size, PIPESIZE, "the writer filled the pipe");
+    close(p[0]);
+    check_eq(status_of(pid), 0, "closing the read end wakes the writer: cut short, then -EPIPE");
+
+    /* The last writer goes away while the reader is asleep on an empty
+     * pipe: closing the write end wakes it with the end of the input. */
+    check_eq(pipe(p), 0, "a pipe for a reader asleep when its writer goes");
+    pid = spawn_with(p[0], -1, (char *[]){"systest", "count", NULL});
+    close(p[0]);
+    check_eq(write(p[1], "x", 1), 1, "write a byte to the reader");
+    while (fstat(p[1], &st) == 0 && st.size > 0) {
+        yield();
+    }
+    /* A few more turns, for the reader to go back to sleep on the pipe. */
+    for (int i = 0; i < 4; i++) {
+        yield();
+    }
+    close(p[1]);
+    check_eq(status_of(pid), 1, "closing the write end wakes the reader: the end of the input");
+
     /* Only descriptors 0, 1 and 2 are inherited. */
     check_eq(pipe(p), 0, "a pipe the child must not get");
     check_eq(status_of(spawn_with(-1, -1, (char *[]){"systest", "fds", NULL})), 0,
