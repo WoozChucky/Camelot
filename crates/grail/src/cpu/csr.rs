@@ -27,8 +27,8 @@ const MIP_WMASK: u32 = S_INTERRUPTS;
 /// Every exception can be delegated except ecall-from-M.
 const MEDELEG_MASK: u32 = 0xb3ff;
 
-/// misa: MXL=1 (32-bit), extensions I, M, S, U, and X (non-standard: Xcal).
-pub const MISA_VALUE: u32 = (1 << 30) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20) | (1 << 23);
+/// misa: MXL=1 (32-bit), extensions A, I, M, S, U, and X (non-standard: Xcal).
+pub const MISA_VALUE: u32 = (1 << 30) | (1 << 0) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20) | (1 << 23);
 
 #[derive(Default)]
 pub struct Csrs {
