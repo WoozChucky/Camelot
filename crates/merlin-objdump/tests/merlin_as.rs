@@ -1,6 +1,4 @@
 //! merlin-objdump on objects made by merlin-as, the files it exists to debug.
-//! Only directives and `add` (the encoder's worked example) are used, so this
-//! keeps working while the encoder is being written.
 
 use merlin_objdump::{dump, Options};
 
