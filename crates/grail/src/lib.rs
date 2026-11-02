@@ -18,10 +18,13 @@ pub mod lake;
 pub mod pointer;
 pub mod sysinfo;
 pub mod trap;
+/// Hand-written Win32 declarations, shared with the other Windows programs of the
+/// workspace (Herald's screen window and its tests) rather than written twice.
 #[cfg(windows)]
-mod win32;
+pub mod win32;
+/// The framebuffer window, also Herald's window onto a remote VM's screen.
 #[cfg(windows)]
-mod window;
+pub mod window;
 
 use block::{BlockBackend, BlockDevice};
 use bus::{Bus, Exit, MAX_DISKS};

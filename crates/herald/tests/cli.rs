@@ -25,7 +25,11 @@ fn help_and_bad_flags() {
     let out = run(&["--help"]);
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.starts_with("usage: herald [--server ADDR] <vm>"), "{text}");
+    assert!(
+        text.starts_with("usage: herald [--server ADDR] [--screen] <vm>"),
+        "{text}"
+    );
+    assert!(text.contains("--screen"), "{text}");
     assert!(text.contains("Ctrl-] detaches"), "{text}");
     for args in [
         &[][..],
