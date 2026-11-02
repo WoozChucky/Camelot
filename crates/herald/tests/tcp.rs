@@ -214,7 +214,12 @@ fn piped_input_goes_as_it_is() {
     let (keys, out, session) = start_session(addr, false);
     type_keys(&keys, b"one\n");
     out.wait_for_end(b"one\n");
-    type_keys(&keys, b"two\x1dthree");
+    type_keys(&keys, b"two\x1d");
+    // The session may already be gone, its end of the channel with it: what comes after
+    // the key is then refused, and either way never sent.
+    for &b in b"three" {
+        let _ = keys.send(b);
+    }
     assert_eq!(join(session), TcpEnd::Left);
     assert_eq!(join(server), b"one\ntwo");
 }
