@@ -23,6 +23,10 @@
 //!   and calls that pass or return structs by value get the hidden locals the
 //!   calling convention needs ([`crate::abi`]).
 //! * `sizeof` is replaced by its value.
+//! * A compound literal at file scope (in a global's initializer) is an
+//!   object with static storage, as C99 says: it becomes a hidden `static`
+//!   variable, `.compoundliteral.<n>`, which the expression then names. Those
+//!   variables are added to the program as a last declaration.
 //!
 //! Reports all errors, in source order. An expression with an error doesn't
 //! produce more errors about the expressions around it.
@@ -38,6 +42,7 @@ pub fn check(prog: &mut Program) -> Result<(), Vec<Error>> {
     let mut c = Checker {
         globals: HashMap::new(),
         errors: Vec::new(),
+        literals: Vec::new(),
     };
     for (i, item) in prog.items.iter_mut().enumerate() {
         match item {
@@ -50,6 +55,11 @@ pub fn check(prog: &mut Program) -> Result<(), Vec<Error>> {
         }
     }
     c.mark_definitions(prog);
+    // File-scope compound literals: the objects their expressions name.
+    let literals = std::mem::take(&mut c.literals);
+    if !literals.is_empty() {
+        prog.items.push(Item::Decl(literals));
+    }
     // Whether a definition is an inline definition depends on every
     // declaration of the function, so it is decided at the end.
     for item in &mut prog.items {
@@ -186,6 +196,8 @@ enum Global {
 struct Checker {
     globals: HashMap<String, Global>,
     errors: Vec<Error>,
+    /// The objects of file-scope compound literals so far, defined.
+    literals: Vec<Declarator>,
 }
 
 impl Checker {
@@ -295,6 +307,8 @@ impl Checker {
             labels: HashMap::new(),
             gotos: Vec::new(),
             static_labels: HashSet::new(),
+            literals: Vec::new(),
+            literal_base: 0,
             errors: &mut self.errors,
         };
         for p in &f.params {
@@ -391,8 +405,9 @@ impl Checker {
             }
         }
         let Some(d_init) = &mut d.init else { return };
-        let mut fc = FnChecker::file_scope(&self.globals, &mut self.errors);
+        let mut fc = FnChecker::file_scope(&self.globals, &mut self.errors, self.literals.len());
         let checked = fc.init(&mut d.ty, d_init, true);
+        self.literals.extend(fc.literals);
         let Some(Global::Var(g)) = self.globals.get_mut(&d.name) else {
             unreachable!("declared above")
         };
@@ -520,12 +535,20 @@ struct FnChecker<'a> {
     gotos: Vec<(String, Pos)>,
     /// Symbols given to `static` locals so far.
     static_labels: HashSet<String>,
+    /// At file scope: the objects of the compound literals checked, numbered
+    /// from `literal_base` (those of earlier initializers come first).
+    literals: Vec<Declarator>,
+    literal_base: usize,
     errors: &'a mut Vec<Error>,
 }
 
 impl<'a> FnChecker<'a> {
     /// A checker for global initializers, outside any function.
-    fn file_scope(globals: &'a HashMap<String, Global>, errors: &'a mut Vec<Error>) -> Self {
+    fn file_scope(
+        globals: &'a HashMap<String, Global>,
+        errors: &'a mut Vec<Error>,
+        literal_base: usize,
+    ) -> Self {
         FnChecker {
             globals,
             func: "",
@@ -540,6 +563,8 @@ impl<'a> FnChecker<'a> {
             labels: HashMap::new(),
             gotos: Vec::new(),
             static_labels: HashSet::new(),
+            literals: Vec::new(),
+            literal_base,
             errors,
         }
     }
@@ -1535,7 +1560,14 @@ impl<'a> FnChecker<'a> {
             ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => unreachable!("rewritten above"),
             ExprKind::CompoundLit { init, local } => {
                 let mut ty = e.ty.clone();
-                *local = Some(self.compound_literal(&mut ty, init, pos)?);
+                if self.func.is_empty() {
+                    let init = std::mem::replace(init.as_mut(), Init::List(Vec::new(), pos));
+                    let name = self.static_literal(&mut ty, init, pos)?;
+                    let var = Some(VarRef::Global(name.clone()));
+                    e.kind = ExprKind::Var { name, var };
+                } else {
+                    *local = Some(self.compound_literal(&mut ty, init, pos)?);
+                }
                 ty
             }
         };
@@ -1543,17 +1575,41 @@ impl<'a> FnChecker<'a> {
         Ok(())
     }
 
-    /// `(type){ ... }`: checks the list against the type (completing an
-    /// array's size) and gives the object a hidden local.
-    fn compound_literal(&mut self, ty: &mut Type, init: &mut Init, pos: Pos) -> Result<LocalId, Reported> {
-        if self.func.is_empty() {
-            return Err(self.err(pos, "compound literals outside functions are not supported"));
-        }
+    /// Checks a compound literal's type: any complete object type, or an
+    /// array of unknown size (which the list completes).
+    fn literal_type(&mut self, ty: &Type, pos: Pos) -> Checked {
         if ty.is_func() || ty.is_void() || (ty.size().is_none() && !matches!(ty, Type::Array(_, None))) {
             return Err(self.err(pos, format!("compound literal has incomplete type '{ty}'")));
         }
+        Ok(())
+    }
+
+    /// `(type){ ... }` in a function: checks the list against the type
+    /// (completing an array's size) and gives the object a hidden local.
+    fn compound_literal(&mut self, ty: &mut Type, init: &mut Init, pos: Pos) -> Result<LocalId, Reported> {
+        self.literal_type(ty, pos)?;
         self.init(ty, init, false)?;
         Ok(self.temp(ty, "compound literal", pos))
+    }
+
+    /// `(type){ ... }` at file scope: an object with static storage, so its
+    /// list must be constant, like a global's. It becomes a `static`
+    /// variable of its own, whose name this returns.
+    fn static_literal(&mut self, ty: &mut Type, mut init: Init, pos: Pos) -> Result<String, Reported> {
+        self.literal_type(ty, pos)?;
+        self.init(ty, &mut init, true)?;
+        // Numbered after any literal nested in this one's list.
+        let name = format!(".compoundliteral.{}", self.literal_base + self.literals.len());
+        self.literals.push(Declarator {
+            name: name.clone(),
+            ty: ty.clone(),
+            storage: Storage::Static,
+            init: Some(init),
+            var: Some(VarRef::Global(name.clone())),
+            define: true,
+            pos,
+        });
+        Ok(name)
     }
 
     // The varargs checks live in functions of their own: `expr` recurses
@@ -2925,12 +2981,62 @@ mod tests {
         // An lvalue.
         ok("int f() { int *p = &(int){5}; (int){1} = 2; return *p; }");
         assert_eq!(
-            err("int *p = (int[]){1};"),
-            "1:10: compound literals outside functions are not supported"
-        );
-        assert_eq!(
             err("int f() { return (void){0}; }"),
             "1:18: compound literal has incomplete type 'void'"
+        );
+    }
+
+    #[test]
+    fn file_scope_compound_literals_are_static_objects() {
+        let p = ok(
+            "struct p { int x, y; }; int *a = (int[]){1, 2, 3}; struct p *q = &(struct p){.y = 4};
+                    const char *const *names = (const char *const[]){\"a\", \"b\"};
+                    struct p **pp = (struct p *[]){&(struct p){5, 6}, 0};",
+        );
+        // Each became a static variable the initializer names, numbered in
+        // order (a nested literal before the list it is in), declared last.
+        let Some(Item::Decl(literals)) = p.items.last() else {
+            panic!("no literals")
+        };
+        let got: Vec<String> = literals.iter().map(|d| format!("{}: {}", d.name, d.ty)).collect();
+        assert_eq!(
+            got,
+            [
+                ".compoundliteral.0: int [3]",
+                ".compoundliteral.1: struct p",
+                ".compoundliteral.2: const char *const [2]",
+                ".compoundliteral.3: struct p",
+                ".compoundliteral.4: struct p *[2]",
+            ]
+        );
+        assert!(literals.iter().all(|d| d.define && d.storage == Storage::Static));
+        // `a` and `q` hold their addresses: constants.
+        for (i, name) in ["a", "q"].iter().enumerate() {
+            let d = p
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Decl(ds) => ds.iter().find(|d| d.name == *name),
+                    Item::Func(_) => None,
+                })
+                .unwrap();
+            let Some(Init::Expr(e)) = &d.init else { panic!() };
+            assert_eq!(
+                crate::consteval::eval(e),
+                Some(crate::consteval::Const::Addr {
+                    base: Some(crate::consteval::Base::Sym(format!(".compoundliteral.{i}"))),
+                    offset: 0
+                })
+            );
+        }
+        // The list must be constant, as a global's.
+        assert_eq!(
+            err("int n; int *p = (int[]){n};"),
+            "1:25: initializer element is not a compile-time constant"
+        );
+        assert_eq!(
+            err("int *p = (void){0};"),
+            "1:10: compound literal has incomplete type 'void'"
         );
     }
 

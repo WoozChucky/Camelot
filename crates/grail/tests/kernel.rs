@@ -305,9 +305,12 @@ fn user_programs_run_interleaved() {
     // the background and waits for pong, then collects ping with `wait`.
     let (code, out) = grail(&kernel_elf(), b"ping & pong\nwait\nexit\n");
     assert_eq!(code, Some(0), "output:\n{out}");
+    // The shell's `[2]` comes first, or after ping's first line if a tick
+    // lands in the shell's fork (likely with merlin's unoptimized kernel).
     let lines = command_output(&out, "ping & pong");
-    assert_eq!(lines[0], "[2]", "{out}");
-    let printed: Vec<&str> = lines[1..].to_vec();
+    assert_eq!(lines.iter().filter(|&&l| l == "[2]").count(), 1, "{out}");
+    assert!(lines[..2].contains(&"[2]"), "{out}");
+    let printed: Vec<&str> = lines.iter().copied().filter(|&l| l != "[2]").collect();
     assert_eq!(printed.len(), 8, "{out}");
     // Each in order, and they take turns more than once.
     for name in ["ping", "pong"] {

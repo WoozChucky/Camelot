@@ -13,6 +13,7 @@ pub struct Segment {
 pub struct Elf {
     pub entry: u32,
     pub segments: Vec<Segment>,
+    /// Defined symbols: the global and weak ones, then the locals.
     pub symbols: Vec<(String, u32)>,
 }
 
@@ -26,12 +27,16 @@ pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
             mem_size: p.memsz,
         });
     }
-    let symbols = elf
+    // Global and weak symbols first, then the locals: a name defined by
+    // both (a `static` function in one file named like a global one in
+    // another) means the global one, as in `elf32::find_symbol`.
+    let mut defined: Vec<elf32::Symbol> = elf
         .symbols()?
         .into_iter()
-        .filter(|s| !s.name.is_empty())
-        .map(|s| (s.name, s.value))
+        .filter(|s| !s.name.is_empty() && !s.is_undefined())
         .collect();
+    defined.sort_by_key(|s| s.bind() == elf32::STB_LOCAL);
+    let symbols = defined.into_iter().map(|s| (s.name, s.value)).collect();
     Ok(Elf {
         entry: elf.header.entry,
         segments,

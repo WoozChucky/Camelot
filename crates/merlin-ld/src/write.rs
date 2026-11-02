@@ -158,7 +158,11 @@ fn symtab(layout: &Layout, strtab: &mut StrTab) -> (Vec<u8>, u32) {
             Def::Script(v) => entry(&mut out, name, v, 0, (STB_GLOBAL << 4) | STT_NOTYPE, SHN_ABS),
             Def::Object { obj, sym } => {
                 let s = &layout.objects[obj].symbols[sym];
-                let value = layout.object_symbol(obj, sym).unwrap_or(0);
+                // A global whose section /DISCARD/ threw away has no address
+                // and is left out, as ld.lld does.
+                let Some(value) = layout.object_symbol(obj, sym) else {
+                    continue;
+                };
                 let shndx = shndx_of(obj, s.shndx).unwrap_or(SHN_ABS);
                 entry(&mut out, name, value, s.size, (s.bind << 4) | s.ty, shndx);
             }

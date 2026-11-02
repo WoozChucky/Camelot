@@ -23,7 +23,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
-use xtask::kernel::{self, Assembler, Build, Lang, BOOT_MAX_STEPS};
+use xtask::kernel::{self, Assembler, Lang, BOOT_MAX_STEPS};
+use xtask::userprogs::CCompiler;
 use xtask::{repo_root, tools};
 
 /// What the kernel prints before its shell starts, with `xcal.dbg`'s pc masked
@@ -444,6 +445,12 @@ fn ticks_are_one_interval_apart() {
     let (mut m, elf) = load_committed();
     let (machine_vec, kernel_vec) = (sym(&elf, "machine_vec"), sym(&elf, "kernel_vec"));
     let trap_init = sym(&elf, "trap_init");
+    // The boot's ticks are the ones before the shell starts: starting it
+    // may take more than an interval (merlin's code is slow), and those
+    // later ticks land wherever the kernel is.
+    let (run_shell, ticks) = (sym(&elf, "proc_run_init"), sym(&elf, "ticks"));
+    let mut shell_started = false;
+    let mut ticks_at_shell = None;
     // Machine ticks before trap_init enables the kernel's tick, and after.
     let mut early_ticks = 0;
     let mut machine_ticks = Vec::new();
@@ -455,11 +462,22 @@ fn ticks_are_one_interval_apart() {
     let probes = [sym(&elf, "probe_load_insn"), sym(&elf, "probe_store_insn")];
     let mut probe_faults = 0;
     let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
+        if cpu.pc == run_shell && !shell_started {
+            shell_started = true;
+            ticks_at_shell = cpu.bus.peek(ticks);
+        }
         if cpu.pc == trap_init {
             steps_after_trap_init = Some(0u64);
         }
-        if let Some(steps) = &mut steps_after_trap_init {
+        if let (Some(steps), false) = (&mut steps_after_trap_init, shell_started) {
             *steps += 1;
+        }
+        if shell_started {
+            // Only the final MCALL_HALT may reach M-mode other than a tick.
+            if cpu.pc == machine_vec && cpu.csr.mcause == ECALL_FROM_S {
+                halts += 1;
+            }
+            return;
         }
         if cpu.pc == machine_vec {
             if cpu.csr.mcause == INTERRUPT_BIT | IRQ_M_TIMER {
@@ -524,7 +542,7 @@ fn ticks_are_one_interval_apart() {
         .map(|(s, m)| s - m)
         .collect();
     assert!(delays.iter().all(|&d| d == delays[0] && d < 100), "{delays:?}");
-    assert_eq!(m.cpu.bus.peek(sym(&elf, "ticks")), Some(10));
+    assert_eq!(ticks_at_shell, Some(10));
     // wfi skips to the next tick: ten intervals of mtime pass in far fewer
     // instructions than one.
     assert!(m.cpu.bus.clint.mtime >= 10 * TICK_INTERVAL);
@@ -639,13 +657,15 @@ fn kernel_vec_resumes_from_the_frame() {
 
 #[test]
 fn ticks_preempting_kernel_code_change_nothing() {
-    // Shorten the tick interval to a few hundred mtime ticks (a prime, so the
-    // ticks don't fall into step with a loop) right after start() armed the
+    // Shorten the tick interval to about a thousand mtime ticks (a prime, so
+    // the ticks don't fall into step with a loop; any shorter and merlin's
+    // tick handler would leave the kernel no time between ticks, where
+    // clang's managed with 211) right after start() armed the
     // timer. Ticks then land all over kprintf and its self-test instead of
     // only in wait_ticks' idle loop. A clobbered register would fail the
     // self-test, garble the output or fault; and every tick still gets its
     // own line.
-    const SHORT_INTERVAL: u32 = 211;
+    const SHORT_INTERVAL: u32 = 1009;
     let (mut m, elf) = load_committed();
     step_to(&mut m, sym(&elf, "supervisor_entry"));
     let scratch = sym(&elf, "machine_scratch");
@@ -662,7 +682,7 @@ fn ticks_preempting_kernel_code_change_nothing() {
     let (machine_vec, kernel_vec) = (sym(&elf, "machine_vec"), sym(&elf, "kernel_vec"));
     let (mut machine_busy, mut kernel_busy) = (0, 0);
     // Up to the first process. A tick that short leaves a process no time to
-    // run (taking one and switching back costs more than 211 instructions),
+    // run (taking one and switching back costs more than 1009 instructions),
     // so the normal interval is back for the shell.
     step_until(
         &mut m,
@@ -1285,6 +1305,14 @@ fn function(name: &str) -> std::ops::Range<u32> {
     s.value..s.value + s.size
 }
 
+/// Whether the instruction about to run is in `f`, or in a leaf helper `f`
+/// called. merlin doesn't inline `static inline` functions such as
+/// mmio_read32, so a register access is in the file's own copy of the
+/// helper, with `ra` still pointing back into `f`.
+fn in_function(cpu: &grail::cpu::Cpu, f: &std::ops::Range<u32>) -> bool {
+    f.contains(&cpu.pc) || f.contains(&cpu.x[x("ra") as usize])
+}
+
 /// Runs the committed kernel with `input` typed on the UART. Returns how the
 /// run ended and what was printed from the shell's banner on.
 fn run_shell(input: &[u8]) -> (RunResult, String) {
@@ -1500,7 +1528,8 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
     );
     assert_eq!(uart_reads, 0, "the kernel polls the UART while idle");
     assert!((50..=51).contains(&wfis), "{wfis} wfi for 50 ticks");
-    assert!(steps < 50 * 500, "{steps} steps for 50 idle ticks");
+    // About a thousand each with merlin's unoptimized code.
+    assert!(steps < 50 * 2000, "{steps} steps for 50 idle ticks");
 
     // Type a command: the UART interrupt wakes the hart at once and the
     // console wakes the shell (no tick passes before the ticks program
@@ -1517,7 +1546,7 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
         BOOT_MAX_STEPS,
         |cpu| {
             match uart_access(cpu) {
-                Some((UART_RBR, false, _)) => rbr_reads.push(cpu.pc),
+                Some((UART_RBR, false, _)) => rbr_reads.push((cpu.pc, in_function(cpu, &uart_intr))),
                 Some((UART_LSR, false, _)) => lsr_reads += 1,
                 _ => {}
             }
@@ -1531,7 +1560,7 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
     assert_eq!(tick_count(&m), 60);
     assert_eq!(rbr_reads.len(), 6, "one read per byte");
     assert!(
-        rbr_reads.iter().all(|pc| uart_intr.contains(pc)),
+        rbr_reads.iter().all(|&(_, inside)| inside),
         "RBR read outside uart_intr ({uart_intr:x?}): {rbr_reads:x?}"
     );
     // The handler checks LSR.DR once per byte and once more to see it clear,
@@ -1561,18 +1590,21 @@ fn kernel_reads_the_timebase_from_sysinfo() {
         m.cpu.bus.peek(sym(&elf, "machine_scratch") + SCRATCH_INTERVAL),
         Some(interval)
     );
-    let kernel_vec = sym(&elf, "kernel_vec");
+    let (kernel_vec, run_shell) = (sym(&elf, "kernel_vec"), sym(&elf, "proc_run_init"));
     let mut kernel_ticks = Vec::new();
+    let mut shell_started = false;
     let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
-        if cpu.pc == kernel_vec && cpu.csr.scause == INTERRUPT_BIT | IRQ_S_SOFT {
+        shell_started |= cpu.pc == run_shell;
+        if !shell_started && cpu.pc == kernel_vec && cpu.csr.scause == INTERRUPT_BIT | IRQ_S_SOFT {
             kernel_ticks.push(cpu.bus.clint.mtime);
         }
     });
     assert_eq!(r, RunResult::Exited(0));
     let want = halted_output().replace("10000000 Hz timebase", "2000000 Hz timebase");
     assert_eq!(kernel::mask_dbg_pc(&printed(&m)), want);
-    // Ten ticks, each a 200 000-tick interval. (Setting up memory takes a
-    // few intervals before them, so the total mtime says little.)
+    // Ten ticks before the shell starts, each a 200 000-tick interval.
+    // (Setting up memory takes a few intervals before them, so the total
+    // mtime says little; starting the shell may take more than one.)
     assert_eq!(kernel_ticks.len(), 10, "{kernel_ticks:?}");
     for w in kernel_ticks.windows(2) {
         assert_eq!(w[1] - w[0], u64::from(interval), "{kernel_ticks:?}");
@@ -1686,9 +1718,15 @@ fn input_arriving_just_before_wfi_wakes_the_console() {
     // when wfi runs, so wfi returns at once, the console wakes the shell and
     // the answer comes within the same tick. With interrupts on, the byte's
     // interrupt would be taken before wfi, which would then sleep until the
-    // next tick.
+    // next tick. A 100 MHz timebase makes the interval ten million steps,
+    // so that starting and running `ticks` (merlin's code is unoptimized)
+    // surely fits in what is left of the tick.
     let (tx, rx) = std::sync::mpsc::channel();
-    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
+    let config = MachineConfig {
+        nominal_hz: 100_000_000,
+        ..MachineConfig::default()
+    };
+    let (mut m, elf) = load_committed_on(config, Some(rx));
     let ticks = sym(&elf, "ticks");
     let tick_count = |m: &Machine| m.cpu.bus.peek(ticks).unwrap();
     let wfi = sym(&elf, "wfi");
@@ -1736,8 +1774,8 @@ fn kernel_c_sources() -> Vec<(String, String)> {
 #[test]
 fn kernel_c_stays_freestanding() {
     // No libc headers (everything is #include "...") and no floating point,
-    // so Merlin's C subset (#15) can compile it later: the kernel and the
-    // user programs alike.
+    // so Merlin's C subset compiles it: the kernel and the user programs
+    // alike.
     for (name, text) in kernel_c_sources() {
         for (i, line) in text.lines().enumerate() {
             let code = line.split("/*").next().unwrap();
@@ -1788,8 +1826,9 @@ const ECALL_FROM_U: u32 = grail::trap::Exception::EcallU as u32;
 /// The exit system call's number (`SYS_exit`, kernel/include/syscall.h).
 const SYS_EXIT: u32 = 1;
 /// A boot plus a few programs: ping and pong run about two million
-/// instructions each, regs three.
-const RUN_MAX_STEPS: u64 = 60_000_000;
+/// instructions each, regs three. merlin's kernel needs about 75 million for
+/// the longest run (systest), 6.6 times clang's.
+const RUN_MAX_STEPS: u64 = 150_000_000;
 
 /// The embedded programs, by name.
 fn program_names() -> Vec<String> {
@@ -2142,10 +2181,13 @@ fn ping_and_pong_take_turns_on_timer_ticks() {
     assert!(timer_switches >= 3, "{timer_switches} switches: {stretches:?}");
     // Each prints 4 lines with half a tick (500 000 instructions) between.
     assert!(user_steps > 3_000_000, "{user_steps}");
-    // The shell: ping in the background, pong in the foreground.
+    // The shell: ping in the background (its `[2]` before or after ping's
+    // first line, depending on where a tick lands in the shell's fork),
+    // pong in the foreground.
     let out = printed(&m);
+    let started = command_output(&out, "ping & pong");
     assert!(
-        out.contains(&format!("{PROMPT}ping & pong\n[2]\nping 1\n")),
+        started.starts_with(&["[2]", "ping 1"]) || started.starts_with(&["ping 1", "[2]"]),
         "{out}"
     );
     assert!(
@@ -2351,9 +2393,13 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
     let text = sym(&elf, "__text_start");
     let pte = (text >> 12) << 10 | PTE_V | PTE_R | PTE_X | PTE_A;
     let lines = command_output(&out, "badload & ping & badhalt");
+    // The shell's `[2]` and `[3]` for the background programs come in
+    // order, but whether before or after badload's report depends on where
+    // the ticks land in the shell's fork (with merlin's slow code, often
+    // before it prints).
+    let jobs: Vec<&str> = lines.iter().copied().filter(|l| l.starts_with('[')).collect();
+    assert_eq!(jobs, ["[2]", "[3]"], "{out}");
     let want = [
-        "[2]".to_string(),
-        "[3]".to_string(),
         "pid 2 (badload) killed: load page fault".to_string(),
         format!("  scause 0x0000000d  sepc {badload:#010x}  stval 0x80000000"),
         format!("  va 0x80000000 maps to pa 0x80000000, pte {pte:#010x} -A--X-RV"),
@@ -2364,7 +2410,7 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
     let kills: Vec<&str> = lines
         .iter()
         .copied()
-        .filter(|l| !l.starts_with("ping "))
+        .filter(|l| !l.starts_with("ping ") && !l.starts_with('['))
         .collect();
     assert_eq!(kills, want, "{out}");
     // ping wasn't disturbed, and the shell still works.
@@ -2483,7 +2529,9 @@ fn a_shell_runs_inside_the_shell() {
 #[test]
 fn sleeping_processes_leave_the_cpu_idle() {
     // While everyone sleeps (sh in wait, systest's child in sleep), the
-    // scheduler idles in wfi: each tick costs a few hundred instructions.
+    // scheduler idles in wfi: each tick costs a few thousand instructions
+    // (merlin's code; a few hundred with clang -O2), where polling would
+    // run the whole interval, a million.
     let (mut m, elf) = load_committed_on(
         MachineConfig::default(),
         Some(kernel::typed(b"systest sleep 50\nexit\n")),
@@ -2500,7 +2548,7 @@ fn sleeping_processes_leave_the_cpu_idle() {
     );
     let slept = m.cpu.bus.peek(ticks).unwrap() - start;
     assert!((50..=51).contains(&slept), "{slept} ticks");
-    assert!(steps < 50 * 1000, "{steps} steps for {slept} ticks");
+    assert!(steps < 50 * 10_000, "{steps} steps for {slept} ticks");
     assert!(user_steps < 10_000, "{user_steps} steps in U-mode");
     assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
 }
@@ -2852,43 +2900,42 @@ fn the_elf_loader_refuses_bad_images() {
 
 #[test]
 fn userprogs_s_is_up_to_date() {
-    // kernel/userprogs.s is generated from kernel/user by merlin-as and
-    // merlin-ld (no LLVM): it must be what the current sources and tools
-    // give, or `cargo xtask kernel` wasn't run after a change.
+    // kernel/userprogs.s is generated from kernel/user by merlin, merlin-as
+    // and merlin-ld (no LLVM): it must be what the current sources and
+    // tools give, or `cargo xtask kernel` wasn't run after a change.
     let committed = std::fs::read_to_string(repo_root().join(xtask::userprogs::GENERATED)).unwrap();
     let fresh = xtask::userprogs::generated(&repo_root()).unwrap();
     assert!(
         committed == fresh,
         "kernel/userprogs.s is out of date: run `cargo xtask kernel` and commit it"
     );
-}
-
-#[test]
-fn every_c_program_has_its_clang_output_committed() {
-    // C programs are assembled from clang's output in kernel/user/clang, so
-    // building them needs no LLVM: every C file has its file there, and
-    // nothing else is.
+    // Most programs are C, compiled by merlin.
     let dir = xtask::userprogs::user_dir(&repo_root());
-    let c: Vec<_> = xtask::userprogs::sources(&dir)
+    let c = xtask::userprogs::sources(&dir)
         .unwrap()
         .into_iter()
         .filter(|s| s.lang == xtask::userprogs::Lang::C)
-        .collect();
-    assert!(c.len() >= 8, "{c:?}");
-    for src in &c {
-        let path = dir.join(src.asm_file());
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        assert!(
-            text.starts_with("# Generated by `cargo xtask kernel` with clang: do not edit.\n"),
-            "{}",
-            path.display()
-        );
-        assert!(text.contains(&format!("# Source: kernel/user/{}", src.file())));
-    }
-    assert_eq!(
-        xtask::userprogs::stale_clang_files(&dir).unwrap(),
-        Vec::<String>::new()
+        .count();
+    assert!(c >= 8, "{c} C files");
+    assert!(committed.contains("compiled by merlin,"));
+}
+
+#[test]
+fn committed_kernel_is_what_our_toolchain_builds() {
+    // The whole kernel, its C included, is built by merlin, merlin-as and
+    // merlin-ld (no LLVM), so this always runs: kernel/kernel.elf must be
+    // byte for byte what the current sources and tools give.
+    let built = kernel::build_merlin(&kernel_dir(), None).unwrap();
+    assert!(
+        built.elf == committed_elf(),
+        "kernel/kernel.elf is out of date: run `cargo xtask kernel` and commit it"
     );
+    let c = built.objects.iter().filter(|o| o.source.lang == Lang::C).count();
+    assert!(c >= 20, "{c} C files");
+    assert!(built
+        .objects
+        .iter()
+        .all(|o| o.asm.is_some() == (o.source.lang == Lang::C)));
 }
 
 /// The `| N | `name` | ...` rows of the table under `heading` in `doc`, as
@@ -3231,6 +3278,7 @@ fn trace_disks(m: &mut Machine, elf: &grail::elf::Elf, max_steps: u64) -> (RunRe
             return;
         };
         t.accesses += 1;
+        let in_blk_intr = in_function(cpu, &blk_intr);
         match (off, store) {
             (BLK_REG_CMD, true) => {
                 if cpu.bus.disks[disk].done() {
@@ -3239,8 +3287,8 @@ fn trace_disks(m: &mut Machine, elf: &grail::elf::Elf, max_steps: u64) -> (RunRe
                 pending_cmd = Some((disk, mem_access(cpu).unwrap().value));
             }
             (BLK_REG_STATUS, false) => t.status_reads += 1,
-            (BLK_REG_ERROR, false) if !blk_intr.contains(&cpu.pc) => t.stray_error_reads += 1,
-            (BLK_REG_STATUS, true) if blk_intr.contains(&cpu.pc) => {
+            (BLK_REG_ERROR, false) if !in_blk_intr => t.stray_error_reads += 1,
+            (BLK_REG_STATUS, true) if in_blk_intr => {
                 t.results.push(cpu.bus.disks[disk].error());
             }
             _ => {}
@@ -3449,8 +3497,9 @@ fn a_slow_disk_leaves_the_kernel_asleep_in_wfi() {
         },
         |m| tick_count(m) == start + 5,
     );
-    // Polling would spend a whole tick interval (1 000 000 steps) per tick.
-    assert!(steps < 5 * 1000, "{steps} steps for 5 ticks");
+    // Polling would spend a whole tick interval (1 000 000 steps) per tick;
+    // waking for one takes a couple of thousand with merlin's code.
+    assert!(steps < 5 * 4000, "{steps} steps for 5 ticks");
     assert!(wfis >= 5, "{wfis} wfi");
     assert!(
         m.cpu.bus.disks[0].done(),
@@ -3623,7 +3672,7 @@ fn every_disk_is_found_and_disk_0_is_tested() {
     assert_eq!(disk_contents(&mut m, 1), second);
 }
 
-// ---- Rebuilding from source (skipped without LLVM) ----
+// ---- The clang reference build (ignored: needs LLVM) ----
 
 fn llvm() -> Option<(PathBuf, PathBuf)> {
     let clang = tools::find("clang")?;
@@ -3637,78 +3686,192 @@ fn scratch(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn fresh_build(clang: PathBuf, lld: PathBuf, assembler: Assembler, name: &str) -> Result<Vec<u8>, String> {
+/// The reference build (`cargo xtask kernel --cc clang`) into a scratch
+/// directory, with `assembler` for the `.s` files. Returns the kernel and
+/// the directory, which also holds the objects (`obj/`).
+fn reference_build(assembler: Assembler, name: &str) -> (Vec<u8>, PathBuf) {
+    let (clang, lld) = llvm().expect("clang and ld.lld (the official LLVM install, or on PATH)");
     let dir = scratch(name);
     let _ = std::fs::remove_dir_all(&dir);
-    let build = Build {
-        kernel_dir: kernel_dir(),
-        obj_dir: dir.join("obj"),
-        out: dir.join("kernel.elf"),
-        clang,
-        lld,
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = kernel::build_reference(
+        &repo_root(),
+        &clang,
+        &lld,
         assembler,
-        verbose: true,
-    };
-    let out = build.run()?;
-    Ok(std::fs::read(out).unwrap())
+        &dir,
+        &dir.join("kernel.elf"),
+        false,
+    )
+    .unwrap();
+    (std::fs::read(out).unwrap(), dir)
 }
 
-#[test]
-fn clang_build_boots_and_matches_committed() {
-    let Some((clang, lld)) = llvm() else {
-        eprintln!("skipped: clang/ld.lld not found");
-        return;
-    };
-    let elf = fresh_build(clang.clone(), lld, Assembler::Clang, "clang").unwrap();
-    assert_boots(&elf);
-
-    // With the clang that built the committed image the bytes must match, or
-    // kernel.elf is stale: rebuild it with `cargo xtask kernel`.
-    let probe = Build {
-        kernel_dir: kernel_dir(),
-        obj_dir: PathBuf::new(),
-        out: PathBuf::new(),
-        clang,
-        lld: PathBuf::new(),
-        assembler: Assembler::Clang,
-        verbose: false,
-    };
-    let recorded = std::fs::read_to_string(kernel_dir().join(kernel::VERSION_FILE)).unwrap();
-    match probe.clang_version() {
-        Ok(v) if v == recorded.trim() => {
-            assert!(
-                elf == committed_elf(),
-                "kernel/kernel.elf is out of date: run `cargo xtask kernel` and commit it"
-            );
-            // And the user programs' C, compiled by the same clang, is the
-            // committed assembly.
-            let dir = xtask::userprogs::user_dir(&repo_root());
-            let compiled =
-                xtask::userprogs::compile_c(&probe.clang, &dir, &scratch("userprogs"), true).unwrap();
-            assert!(!compiled.is_empty());
-            for (rel, text) in compiled {
-                let committed = std::fs::read_to_string(dir.join(&rel)).unwrap_or_default();
-                assert!(
-                    committed == text,
-                    "kernel/user/{rel} is out of date: run `cargo xtask kernel` and commit it"
-                );
-            }
+/// `out` with what may differ between two builds of the same kernel masked:
+/// `xcal.dbg`'s pc, the tick counts the `ticks` program prints (slower code
+/// sees more ticks go by), every hexadecimal number (code and stack
+/// addresses in a killed program's report) and the free blocks the mounted
+/// disk reports.
+fn mask_build(out: &str) -> String {
+    let out = kernel::mask_dbg_pc(out);
+    let mut masked = String::new();
+    let mut rest = out.as_str();
+    while let Some(at) = rest.find("0x") {
+        masked.push_str(&rest[..at + 2]);
+        let after = &rest[at + 2..];
+        let digits = after.bytes().take_while(u8::is_ascii_hexdigit).count();
+        masked.push_str(if digits > 0 { "?" } else { "" });
+        rest = &after[digits..];
+    }
+    masked.push_str(rest);
+    let mut lines = String::new();
+    for line in masked.split_inclusive('\n') {
+        if line.starts_with("ticks: ") {
+            lines.push_str("ticks: N\n");
+        } else if let (true, Some(at)) = (line.starts_with("fs: disk "), line.find(" blocks (")) {
+            // The free blocks: clang's programs in /bin are smaller.
+            let rest = &line[at + " blocks (".len()..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            lines.push_str(&line[..at]);
+            lines.push_str(" blocks (N");
+            lines.push_str(&rest[digits..]);
+        } else {
+            lines.push_str(line);
         }
-        Ok(v) => eprintln!(
-            "byte comparison skipped: built with `{}`, have `{v}`",
-            recorded.trim()
+    }
+    lines
+}
+
+/// Boots `elf` on a default machine with `disks`, `input` typed on the
+/// UART, for at most `max_steps`. Returns how it ended, what it printed and
+/// the steps it ran.
+fn run_build(elf: &[u8], disks: Vec<DiskConfig>, input: &[u8], max_steps: u64) -> (RunResult, String, u64) {
+    let config = MachineConfig {
+        disks,
+        ..MachineConfig::default()
+    };
+    let mut m = Machine::new(config).unwrap();
+    m.cpu.bus.uart.capture = true;
+    m.load_elf(elf).unwrap();
+    m.set_uart_input(kernel::typed(input));
+    let mut steps = 0u64;
+    let r = m.run(Some(max_steps), |_| steps += 1);
+    (r, printed(&m), steps)
+}
+
+/// The sessions the two builds must agree on: booting and leaving the
+/// shell; the built-in programs, system calls and faults without a disk;
+/// and the root filesystem, its programs and files. Nothing runs in the
+/// background: how programs interleave depends on where the ticks land,
+/// which differs between the builds. The disk's `/bin` holds the programs
+/// compiled by `cc`, as the kernel embeds them.
+fn sessions(cc: CCompiler) -> Vec<(&'static str, Vec<DiskConfig>, &'static [u8])> {
+    let image = xtask::fs::build_with(&repo_root(), &camelot_fs::mkfs::Options::default(), cc).unwrap();
+    vec![
+        ("boot", Vec::new(), EXIT),
+        (
+            "programs",
+            Vec::new(),
+            b"help\nhello\necho a  b   c\nticks\nsystest\nbadptr\nbadload\nbadstore\nregs\nping\npong\nexit 3\n",
         ),
-        Err(e) => panic!("{e}"),
+        (
+            "filesystem",
+            vec![DiskConfig::memory(image)],
+            b"ls /\ncat /README | wc\necho hi > f\ncat f\nls /bin | wc\nmkdir d\ncd d\nfiletest\nexit\n",
+        ),
+    ]
+}
+
+/// Bootstrapping step 3 for the whole kernel (spec section 10): the
+/// committed kernel, built entirely by merlin, merlin-as and merlin-ld,
+/// behaves like the reference build, where clang -O2 compiles every C file
+/// (the user programs' too) and ld.lld links. Also prints how much bigger
+/// and slower merlin's unoptimized code is (spec section 10, "Kernel build").
+#[test]
+#[ignore = "needs clang and ld.lld"]
+fn clang_reference_build_behaves_like_merlins() {
+    let (clang_elf, dir) = reference_build(Assembler::Clang, "clang");
+    let clang_user = dir.join("user");
+    let merlin_elf = committed_elf();
+    for (name, elf) in [("merlin", &merlin_elf), ("clang", &clang_elf)] {
+        let e = elf32::Elf::parse(elf).unwrap();
+        let size = |s: &str| e.sections.iter().find(|x| x.name == s).map_or(0, |x| x.size);
+        eprintln!(
+            "{name}: .text {} bytes, .rodata {} bytes, .data {} bytes, .bss {} bytes",
+            size(".text"),
+            size(".rodata"),
+            size(".data"),
+            size(".bss")
+        );
+    }
+    // The filesystem session runs about 265 million steps on merlin's build.
+    const MAX_STEPS: u64 = 1_000_000_000;
+    let clang_sessions = sessions(CCompiler::Clang(&clang_user));
+    for ((name, disks, input), (_, clang_disks, _)) in
+        sessions(CCompiler::Merlin).into_iter().zip(clang_sessions)
+    {
+        let (r_merlin, out_merlin, steps_merlin) = run_build(&merlin_elf, disks, input, MAX_STEPS);
+        let (r_clang, out_clang, steps_clang) = run_build(&clang_elf, clang_disks, input, MAX_STEPS);
+        eprintln!(
+            "{name}: merlin {steps_merlin} steps, clang {steps_clang} steps ({:.2}x)",
+            steps_merlin as f64 / steps_clang as f64
+        );
+        assert_eq!(r_merlin, r_clang, "{name}:\n{out_merlin}\n----\n{out_clang}");
+        assert!(matches!(r_merlin, RunResult::Exited(_)), "{name}: {r_merlin:?}");
+        assert_eq!(mask_build(&out_merlin), mask_build(&out_clang), "{name}");
     }
 }
 
+/// Bootstrapping steps 1 and 2 for the kernel: clang's C objects with the
+/// `.s` files assembled by merlin-as and linked by ld.lld, and the
+/// reference build's objects linked by merlin-ld (`kernel.ld` uses
+/// `ALIGN(n)` output section attributes, `NOLOAD` and `/DISCARD/`), both
+/// boot like the reference build.
 #[test]
-fn merlin_as_build_boots() {
-    // Bootstrapping step 1 (spec section 10): kernel .s files assembled by
-    // merlin-as, C by clang, linked by ld.lld.
-    let Some((clang, lld)) = llvm() else {
-        eprintln!("skipped: clang/ld.lld not found");
-        return;
+#[ignore = "needs clang and ld.lld"]
+fn merlin_as_and_merlin_ld_take_the_reference_builds_place() {
+    let (elf, _) = reference_build(Assembler::Merlin, "merlin-as");
+    assert_boots(&elf);
+
+    let (lld_elf, dir) = reference_build(Assembler::Clang, "merlin-ld");
+    let inputs: Vec<merlin_ld::Input> = kernel::sources(&kernel_dir())
+        .unwrap()
+        .iter()
+        .map(|s| merlin_ld::Input {
+            name: s.object_name(),
+            data: std::fs::read(dir.join("obj").join(s.object_name())).unwrap(),
+        })
+        .collect();
+    let opts = merlin_ld::Options {
+        script: Some(merlin_ld::ScriptSource {
+            name: kernel::SCRIPT.into(),
+            text: std::fs::read_to_string(kernel_dir().join(kernel::SCRIPT)).unwrap(),
+        }),
+        entry: None,
     };
-    assert_boots(&fresh_build(clang, lld, Assembler::Merlin, "merlin").unwrap());
+    // merlin-ld does not merge clang's string literals (spec section 10),
+    // so it may warn and lay .rodata out bigger; it still runs the same.
+    let linked = merlin_ld::link(&inputs, &opts).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_boots(&linked.elf);
+    // The layout follows kernel.ld like ld.lld's: same sections, .text
+    // where ld.lld put it, page-aligned .rodata and .data, NOBITS .bss and
+    // .stack, nothing from /DISCARD/.
+    let ours = elf32::Elf::parse(&linked.elf).unwrap();
+    let theirs = elf32::Elf::parse(&lld_elf).unwrap();
+    let alloc = |e: &elf32::Elf| -> Vec<(String, u32, bool)> {
+        e.sections
+            .iter()
+            .filter(|s| s.flags & 2 != 0)
+            .map(|s| (s.name.clone(), s.addr, s.ty == 8))
+            .collect()
+    };
+    let (a, b) = (alloc(&ours), alloc(&theirs));
+    let names = |v: &[(String, u32, bool)]| v.iter().map(|x| (x.0.clone(), x.2)).collect::<Vec<_>>();
+    assert_eq!(names(&a), names(&b));
+    assert_eq!(a[0], b[0], ".text");
+    for (name, addr, _) in &a {
+        if name == ".rodata" || name == ".data" {
+            assert_eq!(addr % 4096, 0, "{name}");
+        }
+    }
 }

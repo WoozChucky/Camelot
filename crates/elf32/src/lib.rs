@@ -399,13 +399,21 @@ impl<'a> Elf<'a> {
         Ok(out)
     }
 
-    /// Looks up a defined symbol's value by name.
+    /// Looks up a defined symbol's value by name (see [`find_symbol`]).
     pub fn symbol(&self, name: &str) -> Option<u32> {
         let syms = self.symbols().ok()?;
-        syms.iter()
-            .find(|s| s.name == name && !s.is_undefined())
-            .map(|s| s.value)
+        find_symbol(&syms, name).map(|s| s.value)
     }
+}
+
+/// The definition of `name` among `syms`: the global (or weak) one if there
+/// is one, which is what the name means to the whole program, else the first
+/// local one. Several files may each have a local (`static`) symbol of the
+/// same name, and an executable lists locals first.
+pub fn find_symbol<'a>(syms: &'a [Symbol], name: &str) -> Option<&'a Symbol> {
+    let mut defs = syms.iter().filter(|s| s.name == name && !s.is_undefined());
+    let first = defs.clone().next()?;
+    Some(defs.find(|s| s.bind() != STB_LOCAL).unwrap_or(first))
 }
 
 /// Name of a RISC-V relocation type (psABI numbering), as llvm-objdump and

@@ -3,6 +3,7 @@
     # int fib(int n): frame 16 bytes
     #     -12(s0)  param int n
     .globl fib
+    .type fib, @function
 fib:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -49,9 +50,11 @@ fib:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size fib, . - fib
 
     # int main(void): frame 16 bytes
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -65,3 +68,4 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main

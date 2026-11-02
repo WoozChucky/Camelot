@@ -3,6 +3,8 @@
     # int g[5]: 20 bytes
     .globl g
     .balign 4
+    .type g, @object
+    .size g, 20
 g:
     .word 10
     .word 20
@@ -11,6 +13,8 @@ g:
     # int inferred[4]: 16 bytes
     .globl inferred
     .balign 4
+    .type inferred, @object
+    .size inferred, 16
 inferred:
     .word 1
     .word 2
@@ -20,6 +24,8 @@ inferred:
     # int grid[2][3]: 24 bytes
     .globl grid
     .balign 4
+    .type grid, @object
+    .size grid, 24
 grid:
     .word 1
     .word 2
@@ -29,6 +35,8 @@ grid:
 
     # char word[8]: 8 bytes
     .globl word
+    .type word, @object
+    .size word, 8
 word:
     .ascii "hey"
     .zero 5
@@ -43,6 +51,7 @@ word:
     #     -52(s0)  local int total
     #     -56(s0)  local int k
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -496,3 +505,4 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main

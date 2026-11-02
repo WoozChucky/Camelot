@@ -40,7 +40,7 @@ pub struct OutputSection {
     /// without inputs, the flags of the previous section that had some.
     pub flags: u32,
     /// Occupies no file space (`.bss`): every input is `SHT_NOBITS`
-    /// (and there is at least one).
+    /// (and there is at least one), or the script says `(NOLOAD)`.
     pub nobits: bool,
     /// Input sections in address order.
     pub inputs: Vec<InputRef>,
@@ -499,6 +499,10 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                     dot_moved = Some(a.line);
                 }
             }
+            // What `/DISCARD/` matched goes nowhere: those sections have no
+            // address, so a reference to them is an error (see
+            // `Layout::reloc_symbol`).
+            Command::Output(o) if o.is_discard() => {}
             Command::Output(o) => {
                 let all_inputs = rules[ci].iter().flatten();
                 // ld.lld's rule: an output section is dropped only if no input
@@ -508,11 +512,28 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                 if all_inputs.clone().next().is_none() && !has_assign {
                     continue;
                 }
-                let align = all_inputs
+                let mut align = all_inputs
                     .clone()
                     .map(|&(oi, si)| objects[oi].sections[si].align)
                     .max()
                     .unwrap_or(1);
+                // `.name : ALIGN(n) { ... }`: at least n, like an input that
+                // aligned (ld.lld's sh_addralign is the larger of the two).
+                if let Some(e) = &o.align {
+                    match w.eval(e, dot) {
+                        Ok(n) if n > 0 && (n as u64).is_power_of_two() && n <= 1 << 31 => {
+                            align = align.max(n as u32)
+                        }
+                        Ok(n) => w.script_err(
+                            o.line,
+                            format!(
+                                "ALIGN({n}) of section {}: alignment must be a power of two",
+                                o.name
+                            ),
+                        ),
+                        Err(e) => w.script_err(o.line, e),
+                    }
+                }
                 let base = cursor.unwrap_or(dot);
                 let start = align_up(base, align as u64);
                 let mut d = start;
@@ -561,6 +582,11 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                     nobits = false;
                 } else {
                     prev_flags = flags;
+                }
+                // NOLOAD: memory only, whatever the inputs hold (as in ld.lld,
+                // which gives the section SHT_NOBITS).
+                if o.noload {
+                    nobits = true;
                 }
                 if let (Some(r), Some(c)) = (region, cursor) {
                     if let (Some(line), true) = (dot_moved, dot != c) {

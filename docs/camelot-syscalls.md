@@ -453,14 +453,12 @@ loop). `syscall(number, a0, a1, a2)` makes any call by number, for tests.
 
 Each `kernel/user/X.c` or `X.s` is a program called `X`, linked with the
 runtime: `crt0.s`, `usys.s` and `ulib.c`. Our own tools build them, with no
-LLVM: merlin-as assembles each source, merlin-ld links each program with
-`user.ld`, and the executables go to `/bin/X` on the root image (`cargo
-xtask fs`, `crates/xtask/src/fs.rs`) and are embedded in the kernel, for
-when there is no disk, through the generated `kernel/userprogs.s`
-(`crates/xtask/src/userprogs.rs`). Until
-Merlin (#15) compiles this much C, the assembly for each C file comes from
-clang, `-S` with the flags in `userprogs.rs`, and is committed in
-`kernel/user/clang/`.
+LLVM: merlin compiles each C file (with `-Ikernel/user`), merlin-as
+assembles each source, merlin-ld links each program with `user.ld`, and the
+executables go to `/bin/X` on the root image (`cargo xtask fs`,
+`crates/xtask/src/fs.rs`) and are embedded in the kernel, for when there is
+no disk, through the generated `kernel/userprogs.s`
+(`crates/xtask/src/userprogs.rs`).
 
 After changing anything in `kernel/user/`, run
 
@@ -468,12 +466,9 @@ After changing anything in `kernel/user/`, run
 cargo xtask kernel
 ```
 
-which recompiles the C files with clang into `kernel/user/clang/`
-(rewriting only the files that changed, deleting any whose C file is gone),
-regenerates `kernel/userprogs.s` with merlin-as and merlin-ld, and rebuilds
-`kernel/kernel.elf`; commit all three (and run `cargo xtask fs` for a root
-image with the new programs). `cargo test` checks, without LLVM,
-that every C file has its committed assembly and that `userprogs.s` is what
-the current sources and tools give; with the clang recorded in
-`kernel/kernel.elf.clang-version` installed, it also checks that the
-committed assembly is what that clang makes of the C files.
+which regenerates `kernel/userprogs.s` and rebuilds `kernel/kernel.elf`;
+commit both (and run `cargo xtask fs` for a root image with the new
+programs). `cargo test` checks, without LLVM, that both are what the
+current sources and tools give. `cargo xtask kernel --cc clang` builds the
+reference kernel instead, with the programs' C compiled by clang `-O2`
+(`-S`, with the flags in `userprogs.rs`), in `target/kernel/clang`.

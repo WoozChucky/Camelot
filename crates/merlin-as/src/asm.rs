@@ -475,6 +475,29 @@ impl Assembler {
         })
     }
 
+    /// The value of a `.size` expression. Besides constants, `.` and labels
+    /// already defined in the current section count as their offsets in it,
+    /// so the difference of two of them (`. - f`, `.Lend - f`) is the
+    /// distance between them: merlin-as never moves code once it is placed
+    /// (no relaxation), so the distance is final. Only `+` and `-` combine
+    /// such terms; anything else must be constant.
+    fn eval_size(&self, e: &Expr) -> Option<i64> {
+        match e {
+            Expr::Sym(name) if name == DOT => Some(self.sections[self.current].size as i64),
+            Expr::Sym(name) => {
+                let s = &self.symbols[*self.by_name.get(name)?];
+                match s.constant {
+                    Some(c) => Some(c),
+                    None if s.defined && s.section == Some(self.current) => Some(s.value as i64),
+                    None => None,
+                }
+            }
+            Expr::Bin(BinOp::Add, a, b) => Some(self.eval_size(a)?.wrapping_add(self.eval_size(b)?)),
+            Expr::Bin(BinOp::Sub, a, b) => Some(self.eval_size(a)?.wrapping_sub(self.eval_size(b)?)),
+            _ => self.eval(e),
+        }
+    }
+
     // ----- sections and emission -----
 
     fn switch_section(&mut self, name: &str) {
@@ -839,11 +862,22 @@ impl Assembler {
                 }
             }
             ".size" => {
-                // `.size sym, . - sym` needs `.`; accept a constant only for now.
-                if let (Some(n), Some(DirArg::Expr(e))) = (self.arg_name(args, 0, ".size"), args.get(1)) {
-                    if let Some(v) = self.eval(e) {
-                        let s = self.symbol_index(&n);
-                        self.symbols[s].size = v as u32;
+                // `.size f, . - f` (merlin's), `.size f, .Lfunc_end0 - f`
+                // (clang's) or a constant.
+                if let Some(n) = self.arg_name(args, 0, ".size") {
+                    let v = match args.get(1) {
+                        Some(DirArg::Expr(e)) => self.eval_size(e),
+                        _ => None,
+                    };
+                    match v {
+                        Some(v) if (0..=u32::MAX as i64).contains(&v) => {
+                            let s = self.symbol_index(&n);
+                            self.symbols[s].size = v as u32;
+                        }
+                        _ => self.error(
+                            ".size: expected a constant, or a difference of '.' and labels \
+                             defined earlier in this section",
+                        ),
                     }
                 }
             }
@@ -1198,6 +1232,54 @@ other:  j local
             .enumerate()
             .find(|(_, s)| s.name == name)
             .unwrap_or_else(|| panic!("no section {name}"))
+    }
+
+    #[test]
+    fn size_of_a_function_from_labels_or_dot() {
+        // merlin writes `.size f, . - f`; clang `.size g, .Lfunc_end1 - g`.
+        let src = "
+        .text
+        nop
+        .type f, @function
+f:      nop
+        nop
+        .size f, . - f
+        .type g, @function
+g:      addi a0, a0, 1
+        ret
+.Lfunc_end1:
+        nop
+        .size g, .Lfunc_end1 - g
+        .data
+        .type v, @object
+v:      .word 1, 2, 3
+        .size v, 12
+        .equ N, 3
+w:      .word 0, 0, 0
+        .size w, N * 4
+";
+        let obj = crate::assemble(src).unwrap();
+        for (name, size, ty) in [
+            ("f", 8, SymType::Func),
+            ("g", 8, SymType::Func),
+            ("v", 12, SymType::Object),
+            ("w", 12, SymType::NoType),
+        ] {
+            let s = sym(&obj, name);
+            assert_eq!((s.size, s.ty), (size, ty), "{name}");
+        }
+        // A label in another section, or one not defined yet, has no
+        // distance from `.`: an error, not a silently wrong size.
+        for bad in [
+            "    .text\nf: nop\n    .data\n    .size f, . - f\n",
+            "    .text\n    .size f, . - f\nf: nop\n",
+            "    .text\nf: nop\n    .size f, . * f\n",
+            "    .text\nf: nop\n    .size f\n",
+            "    .text\nf: nop\n    .size f, -4\n",
+        ] {
+            let errs = crate::assemble(bad).unwrap_err();
+            assert!(errs[0].msg.contains(".size: expected"), "{bad:?}: {errs:?}");
+        }
     }
 
     #[test]

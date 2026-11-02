@@ -87,7 +87,7 @@
 use crate::ast::*;
 use crate::consteval;
 use crate::lexer::{Kw, Tok, Token};
-use crate::types::{align_up, IntKind, Quals, Record, Type, MAX_OBJECT_SIZE};
+use crate::types::{align_up, common, IntKind, Quals, Record, Type, MAX_OBJECT_SIZE};
 use crate::{Error, Pos};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -173,6 +173,28 @@ fn assign_op(t: &Tok) -> Option<Option<BinOp>> {
     })
 }
 
+/// The length an initializer gives an array of unknown size with elements
+/// of type `elem`, when it is a plain one: a string literal (or one in
+/// braces) for a character array, or a list of scalars without designators.
+/// `None` for the rest (brace elision, designators), which sema works out.
+fn init_len(elem: &Type, init: &Init) -> Option<u32> {
+    let is_char = elem.int_kind().is_some_and(|k| k.size() == 1);
+    let string = |i: &Init| match i {
+        Init::Expr(Expr {
+            kind: ExprKind::Str(b),
+            ..
+        }) if is_char => u32::try_from(b.len() + 1).ok(),
+        _ => None,
+    };
+    match init {
+        Init::List(items, _) if items.len() == 1 && string(&items[0]).is_some() => string(&items[0]),
+        Init::List(items, _) if elem.is_scalar() && items.iter().all(|i| matches!(i, Init::Expr(_))) => {
+            u32::try_from(items.len()).ok()
+        }
+        _ => string(init),
+    }
+}
+
 /// Where a declaration appears: what storage classes and declarators it may have.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ctx {
@@ -213,8 +235,9 @@ enum Name {
     Typedef(Type),
     /// An enumeration constant and its value (an `int`).
     EnumConst(i64),
-    /// A variable or function: resolved by sema.
-    Object,
+    /// A variable or function, and its declared type: resolved by sema, but
+    /// the type lets `sizeof x` size an array ([`Parser::operand_type`]).
+    Object(Type),
 }
 
 /// What a struct, union or enum tag names.
@@ -377,10 +400,27 @@ impl Parser<'_> {
     /// error here.
     fn bind_name(&mut self, name: &str, what: Name, pos: Pos) -> Result<(), Error> {
         let scope = self.scopes.last_mut().expect("the file scope");
-        match scope.names.get(name) {
+        match scope.names.get_mut(name) {
             None => {
                 scope.names.insert(name.to_string(), (what, pos));
                 Ok(())
+            }
+            // A variable declared again (`extern int a[]; int a[3];`): keep
+            // the type that says the most. Whether the types agree is sema's
+            // to judge.
+            Some((Name::Object(prev), prev_pos)) => {
+                if let Name::Object(new) = what {
+                    if new.size().is_some() || prev.size().is_none() {
+                        *prev = new;
+                    }
+                    return Ok(());
+                }
+                Err(Error::new(
+                    pos,
+                    format!(
+                        "redefinition of '{name}' as a different kind of symbol (first declared at {prev_pos})"
+                    ),
+                ))
             }
             Some((prev, _)) if *prev == what && !matches!(what, Name::EnumConst(_)) => Ok(()),
             Some((Name::Typedef(prev), _)) if matches!(what, Name::Typedef(_)) => {
@@ -401,6 +441,89 @@ impl Parser<'_> {
                 ),
             )),
         }
+    }
+
+    // ---- constant expressions ----
+
+    /// The value of an integer constant expression the parser needs now: an
+    /// array size, an enumerator's value or a `_Static_assert`. Each
+    /// `sizeof expr` in it whose operand's type the parser can work out
+    /// becomes `sizeof (type)` first, so `char buf[sizeof x]` and
+    /// `int b[sizeof a / sizeof a[0]]` work before sema has typed anything.
+    fn const_int(&self, e: &mut Expr) -> Option<i64> {
+        self.resolve_sizeof(e);
+        consteval::int(e)
+    }
+
+    /// Rewrites `sizeof expr` into `sizeof (type)` throughout the operators
+    /// [`consteval`] evaluates, where [`Self::operand_type`] knows the type.
+    fn resolve_sizeof(&self, e: &mut Expr) {
+        match &mut e.kind {
+            ExprKind::SizeofExpr(x) => {
+                if let Some(t) = self.operand_type(x) {
+                    e.kind = ExprKind::SizeofType(t);
+                }
+            }
+            ExprKind::Unary(_, x) | ExprKind::Cast { x, .. } => self.resolve_sizeof(x),
+            ExprKind::Binary(_, l, r) => {
+                self.resolve_sizeof(l);
+                self.resolve_sizeof(r);
+            }
+            ExprKind::Cond(c, a, b) => {
+                self.resolve_sizeof(c);
+                self.resolve_sizeof(a);
+                self.resolve_sizeof(b);
+            }
+            _ => {}
+        }
+    }
+
+    /// The type of `sizeof`'s operand, as far as the parser can tell before
+    /// sema: variables by their declared types, literals, casts and compound
+    /// literals by theirs, and `*`, `&`, `[]`, `.`, `->`, `+` and `-` from
+    /// their operands'. `None` for anything else (calls, assignments, ...),
+    /// which leaves the `sizeof` for consteval to refuse.
+    fn operand_type(&self, e: &Expr) -> Option<Type> {
+        match &e.kind {
+            ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::Cast { .. } | ExprKind::CompoundLit { .. } => {
+                Some(e.ty.clone())
+            }
+            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => Some(Type::UINT),
+            ExprKind::Var { name, .. } => match self.lookup_name(name)? {
+                Name::Object(t) => Some(t.clone()),
+                _ => None,
+            },
+            // `a[i]` is `*(a + i)`.
+            ExprKind::Deref(p) => Some(self.value_type(p)?.pointee()?.clone()),
+            ExprKind::Addr(x) => Some(Type::ptr(self.operand_type(x)?)),
+            ExprKind::Member {
+                base, name, arrow, ..
+            } => {
+                let record = if *arrow {
+                    self.value_type(base)?.pointee()?.clone()
+                } else {
+                    self.operand_type(base)?
+                };
+                Some(record.record()?.body()?.member(name)?.ty.clone())
+            }
+            ExprKind::Binary(op @ (BinOp::Add | BinOp::Sub), l, r) => {
+                let (lt, rt) = (self.value_type(l)?, self.value_type(r)?);
+                match (lt.is_ptr(), rt.is_ptr()) {
+                    // The difference of two pointers is a `ptrdiff_t`.
+                    (true, true) if *op == BinOp::Sub => Some(Type::INT),
+                    (true, false) => Some(lt),
+                    (false, true) if *op == BinOp::Add => Some(rt),
+                    (false, false) => Some(Type::Int(common(lt.int_kind()?, rt.int_kind()?))),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The type of `e`'s value: [`Self::operand_type`] after decay.
+    fn value_type(&self, e: &Expr) -> Option<Type> {
+        Some(self.operand_type(e)?.decay())
     }
 
     fn lookup_tag(&self, name: &str) -> Option<&Tag> {
@@ -805,8 +928,8 @@ impl Parser<'_> {
             let (name, pos) = self.expect_ident("an enumerator name")?;
             let value = if self.eat_punct("=") {
                 let at = self.here();
-                let e = self.cond()?;
-                consteval::int(&e)
+                let mut e = self.cond()?;
+                self.const_int(&mut e)
                     .ok_or_else(|| Error::new(at, "enumerator value is not an integer constant expression"))?
             } else {
                 next
@@ -939,13 +1062,13 @@ impl Parser<'_> {
                     continue;
                 }
                 let pos = self.here();
-                let e = self.cond()?;
+                let mut e = self.cond()?;
                 self.expect_punct("]")?;
-                let n = consteval::int(&e).ok_or_else(|| {
+                let n = self.const_int(&mut e).ok_or_else(|| {
                     Error::new(
                         pos,
                         "array size must be an integer constant expression \
-                         (literals, enum constants, operators, casts and sizeof(type))",
+                         (literals, enum constants, operators, casts and sizeof)",
                     )
                 })?;
                 if n <= 0 {
@@ -1106,7 +1229,7 @@ impl Parser<'_> {
                 d.ty
             };
             if !d.name.is_empty() {
-                self.bind_name(&d.name, Name::Object, pos)?;
+                self.bind_name(&d.name, Name::Object(ty.clone()), pos)?;
             }
             params.push(Param {
                 name: d.name,
@@ -1212,12 +1335,24 @@ impl Parser<'_> {
                 };
                 return Err(Error::new(d.pos, msg));
             }
-            self.bind_name(&d.name, Name::Object, d.pos)?;
+            self.bind_name(&d.name, Name::Object(d.ty.clone()), d.pos)?;
             let init = if self.eat_punct("=") {
                 Some(self.initializer()?)
             } else {
                 None
             };
+            // `int a[] = {1, 2, 3};`: the size the initializer gives, for a
+            // later `sizeof a` in an array size. (The declaration keeps its
+            // incomplete type: sema completes it, the same way.) Unless an
+            // earlier declaration gave the size: `int a[3]; int a[] = {1};`.
+            let bound = self.scopes.last().and_then(|s| s.names.get(&d.name));
+            let incomplete = matches!(bound, Some((Name::Object(t), _)) if t.size().is_none());
+            if let (Type::Array(elem, None), Some(init), true) = (&d.ty, &init, incomplete) {
+                if let Some(n) = init_len(elem, init) {
+                    let full = Type::array((**elem).clone(), Some(n));
+                    self.bind_name(&d.name, Name::Object(full), d.pos)?;
+                }
+            }
             decls.push(Declarator {
                 name: d.name,
                 ty: d.ty,
@@ -1296,7 +1431,7 @@ impl Parser<'_> {
                 Ctx::File,
             )?)));
         }
-        self.bind_name(&d.name, Name::Object, d.pos)?;
+        self.bind_name(&d.name, Name::Object(d.ty.clone()), d.pos)?;
         let mut d = d;
         let body = if self.eat_punct(";") {
             None
@@ -1383,7 +1518,7 @@ impl Parser<'_> {
         let pos = self.advance().pos;
         self.expect_punct("(")?;
         let at = self.here();
-        let cond = self.cond()?;
+        let mut cond = self.cond()?;
         self.expect_punct(",")?;
         let mut msg = Vec::new();
         if !matches!(self.peek(), Tok::Str(_)) {
@@ -1395,7 +1530,7 @@ impl Parser<'_> {
         }
         self.expect_punct(")")?;
         self.expect_punct(";")?;
-        match consteval::int(&cond) {
+        match self.const_int(&mut cond) {
             None => Err(Error::new(
                 at,
                 "static assertion expression is not an integer constant expression",
@@ -2571,6 +2706,64 @@ mod tests {
     }
 
     #[test]
+    fn sizeof_an_expression_sizes_an_array() {
+        // The parser works out the operand's type from declarations.
+        assert_eq!(
+            globals(
+                "int a[5]; char b[sizeof a]; char c[sizeof a / sizeof a[0]]; char d[sizeof a[1] + sizeof *a];
+                 struct s { char x[3]; int y; } s, *p; char e[sizeof s.x]; char f[sizeof p->y]; char g[sizeof p];
+                 char h[sizeof \"abc\"]; char i[sizeof(&a)]; char j[sizeof ((short)1) + sizeof (a + 1)];
+                 char k[sizeof (&a[4] - &a[0])]; char l[sizeof sizeof a]; enum { N = sizeof s }; char m[N];"
+            ),
+            [
+                "int a[5]",
+                "char b[20]",
+                "char c[5]",
+                "char d[8]",
+                "struct s s, struct s *p",
+                "char e[3]",
+                "char f[4]",
+                "char g[4]",
+                "char h[4]",
+                "char i[4]",
+                "char j[6]",
+                "char k[4]",
+                "char l[4]",
+                "char m[8]",
+            ]
+        );
+        // Innermost declaration wins; parameters are pointers; an array
+        // sized by its initializer, or by an earlier declaration.
+        let p = prog("int x; int f(char x, int v[10]) { char a[sizeof x]; char b[sizeof v]; return 0; }");
+        let body = format!("{:?}", funcs(&p)[0].body);
+        assert!(body.contains("Array(Int(Char), Some(1))"), "{body}");
+        assert!(body.contains("Array(Int(Char), Some(4))"), "{body}");
+        let g: Vec<String> = globals(
+            "int t[] = {1, 2, 3}; char u[sizeof t]; char s[] = \"hello\"; char v[sizeof s];
+             char w[] = {\"hi\"}; char y[sizeof w]; int z[4]; int z[] = {1}; char q[sizeof z];
+             extern int e[]; int e[6]; char r[sizeof e];",
+        );
+        let sized: Vec<&String> = g
+            .iter()
+            .filter(|d| d.starts_with("char ") && !d.contains('='))
+            .collect();
+        assert_eq!(
+            sized,
+            ["char u[12]", "char v[6]", "char y[3]", "char q[16]", "char r[24]"]
+        );
+
+        // What the parser can't type stays an error.
+        let msg = "array size must be an integer constant expression \
+                   (literals, enum constants, operators, casts and sizeof)";
+        assert_eq!(err("int f(void); char a[sizeof f()];"), format!("1:21: {msg}"));
+        assert_eq!(err("char a[sizeof nothing];"), format!("1:8: {msg}"));
+        assert_eq!(
+            err("int t[] = {[3] = 1}; char a[sizeof t];"),
+            format!("1:29: {msg}")
+        );
+    }
+
+    #[test]
     fn declarators() {
         assert_eq!(
             globals("int *p, **pp, a[3], m[2][4], *ap[5];"),
@@ -2589,7 +2782,7 @@ mod tests {
         assert_eq!(
             err("int n; int a[n];"),
             "1:14: array size must be an integer constant expression \
-             (literals, enum constants, operators, casts and sizeof(type))"
+             (literals, enum constants, operators, casts and sizeof)"
         );
         assert_eq!(
             err("int a[2][];"),

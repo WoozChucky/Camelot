@@ -480,6 +480,7 @@ fn layout_edge_cases_match_ld_lld() {
     assert_eq!(
         names,
         [
+            "layouts/attrs",
             "layouts/empty",
             "layouts/gap",
             "layouts/inside",
@@ -501,6 +502,38 @@ fn layout_edge_cases_match_ld_lld() {
     assert_eq!((stack.ty.as_str(), stack.flags.as_str()), ("PROGBITS", "WA"));
     assert_eq!(expected("layouts/gap").loads.len(), 2);
     assert_eq!(expected("layouts/nobits-first").loads.len(), 3);
+    // Output section attributes (kernel/kernel.ld's): ALIGN(n) raises the
+    // alignment and never lowers it, NOLOAD makes even PROGBITS input and
+    // an assignment-only section NOBITS, /DISCARD/ drops a section and its
+    // global.
+    let attrs = expected("layouts/attrs");
+    let sec = |name: &str| attrs.sections.iter().find(|s| s.name == name).unwrap();
+    assert_eq!((sec(".rodata").addr, sec(".rodata").align), (0x8000_1000, 4096));
+    assert_eq!(sec(".data").align, 16);
+    assert_eq!((sec(".bss").ty.as_str(), sec(".bss").align), ("NOBITS", 64));
+    assert_eq!(sec(".noload").ty, "NOBITS");
+    assert_eq!(sec(".stack").ty, "NOBITS");
+    assert!(attrs.sections.iter().all(|s| !s.name.starts_with(".discard")));
+    assert!(!attrs.globals.contains_key("dropped"));
+    assert_eq!(attrs.globals["__end"], 0x8000_2000);
+    assert_eq!(attrs.loads.len(), 3);
+}
+
+/// What /DISCARD/ throws away cannot be referred to: ld.lld's "relocation
+/// refers to a discarded section" is merlin-ld's "not loaded".
+#[test]
+fn a_reference_to_a_discarded_section_is_an_error() {
+    let (mut inputs, opts) = case("layouts/attrs.ld");
+    inputs.push(merlin_ld::Input {
+        name: "use.o".into(),
+        data: merlin_as::assemble_to_elf("    .data\n    .word dropped\n").unwrap(),
+    });
+    let errs = errors(merlin_ld::link(&inputs, &opts));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("use.o: R_RISCV_32 at .data+0x0 refers to 'dropped', whose section is not loaded"),
+        "{errs:?}"
+    );
 }
 
 /// Spec §10: merlin-ld does not merge SHF_MERGE strings. clang puts every C

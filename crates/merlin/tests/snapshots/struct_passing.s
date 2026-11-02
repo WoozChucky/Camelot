@@ -4,6 +4,7 @@
     #      -9(s0)  param char c
     #     -16(s0)  local struct one o
     .globl mk_one
+    .type mk_one, @function
 mk_one:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -26,6 +27,7 @@ mk_one:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size mk_one, . - mk_one
 
     # struct six mk_six(short a, short b, short c): frame 32 bytes
     #     -10(s0)  param short a
@@ -33,6 +35,7 @@ mk_one:
     #     -14(s0)  param short c
     #     -24(s0)  local struct six s
     .globl mk_six
+    .type mk_six, @function
 mk_six:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -78,11 +81,13 @@ mk_six:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size mk_six, . - mk_six
 
     # struct pair swap(struct pair p): frame 32 bytes
     #     -16(s0)  param struct pair p
     #     -20(s0)  local int t
     .globl swap
+    .type swap, @function
 swap:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -121,6 +126,7 @@ swap:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size swap, . - swap
 
     # struct big add_big(struct big l, struct big r): frame 48 bytes
     #     -20(s0)  param struct big l
@@ -128,6 +134,7 @@ swap:
     #     -36(s0)  temp struct big * (result address)
     #     -48(s0)  local struct big s
     .globl add_big
+    .type add_big, @function
 add_big:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -214,10 +221,12 @@ add_big:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size add_big, . - add_big
 
     # int sum_six(struct six s): frame 16 bytes
     #     -16(s0)  param struct six s
     .globl sum_six
+    .type sum_six, @function
 sum_six:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -249,10 +258,12 @@ sum_six:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size sum_six, . - sum_six
 
     # void clobber(struct big b): frame 32 bytes
     #     -20(s0)  param struct big b
     .globl clobber
+    .type clobber, @function
 clobber:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -288,12 +299,14 @@ clobber:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size clobber, . - clobber
 
     # int sum_huge(struct huge h): frame 96 bytes
     #     -88(s0)  param struct huge h
     #     -92(s0)  local int i
     #     -96(s0)  local int s
     .globl sum_huge
+    .type sum_huge, @function
 sum_huge:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -368,6 +381,7 @@ sum_huge:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size sum_huge, . - sum_huge
 
     # struct huge make_huge(int base): frame 112 bytes
     #     -12(s0)  param int base
@@ -375,6 +389,7 @@ sum_huge:
     #     -96(s0)  local struct huge h
     #    -100(s0)  local int i
     .globl make_huge
+    .type make_huge, @function
 make_huge:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -439,6 +454,7 @@ make_huge:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size make_huge, . - make_huge
 
     # int mixed(int a, struct six s, int b, struct big c, char d): frame 48 bytes
     #     -12(s0)  param int a
@@ -447,6 +463,7 @@ make_huge:
     #     -36(s0)  param struct big c
     #     -37(s0)  param char d
     .globl mixed
+    .type mixed, @function
 mixed:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -522,10 +539,12 @@ mixed:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size mixed, . - mixed
 
     # struct word id_word(struct word w): frame 16 bytes
     #     -12(s0)  param struct word w
     .globl id_word
+    .type id_word, @function
 id_word:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -544,6 +563,7 @@ id_word:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size id_word, . - id_word
 
     # int full(struct six s, struct pair p, struct big b, int x, int y, int z): frame 48 bytes
     #     -16(s0)  param struct six s
@@ -553,6 +573,7 @@ id_word:
     #     -44(s0)  param int y
     #     -48(s0)  param int z
     .globl full
+    .type full, @function
 full:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -616,12 +637,14 @@ full:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size full, . - full
 
     # struct big scaled(int k, struct big b): frame 32 bytes
     #     -12(s0)  param int k
     #     -24(s0)  param struct big b
     #     -28(s0)  temp struct big * (result address)
     .globl scaled
+    .type scaled, @function
 scaled:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -695,6 +718,7 @@ scaled:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size scaled, . - scaled
 
     # int main(void): frame 752 bytes
     #     -12(s0)  local int ok
@@ -742,6 +766,7 @@ scaled:
     #    -728(s0)  temp struct big (argument copy)
     #    -740(s0)  temp struct big (call result)
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -1788,3 +1813,4 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main

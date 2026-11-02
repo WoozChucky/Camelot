@@ -7,6 +7,7 @@
     #     -24(s0)  local int k
     #     -28(s0)  local int m
     .globl main
+    .type main, @function
 main:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -171,3 +172,4 @@ main:
     lw    s0, 8(sp)
     addi  sp, sp, 16
     ret
+    .size main, . - main
