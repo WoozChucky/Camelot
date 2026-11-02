@@ -14,11 +14,31 @@
 
 static struct file ftable[NFILE];
 
+/* Major 0 has no driver: device_has_driver() says so before anything is
+ * opened, and these fail just in case. */
+static int nodev_read(pagetable_t pt, u32 dst, u32 n) {
+    (void)pt;
+    (void)dst;
+    (void)n;
+    return -ENODEV;
+}
+
+static int nodev_write(pagetable_t pt, u32 src, u32 n) {
+    (void)pt;
+    (void)src;
+    (void)n;
+    return -ENODEV;
+}
+
 /* The drivers, by major number: 0 is none, CONSOLE the console. */
 const struct devsw devsw[NDEV] = {
-    {NULL, NULL},
+    {nodev_read, nodev_write},
     {console_read, console_write},
 };
+
+bool device_has_driver(u32 major) {
+    return major != 0 && major < NDEV;
+}
 
 /* The most a write puts in one transaction: an operation may change
  * MAXOPBLOCKS blocks, and a write of this many bytes changes at most the

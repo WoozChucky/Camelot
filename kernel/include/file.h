@@ -65,6 +65,10 @@ struct devsw {
 
 extern const struct devsw devsw[NDEV];
 
+/* Whether `devsw` has a driver for `major`: open() fails with -ENODEV
+ * on a device node without one. */
+bool device_has_driver(u32 major);
+
 /* A free slot of the table, with one reference and nothing else set; NULL
  * if every slot is taken. */
 struct file *filealloc(void);

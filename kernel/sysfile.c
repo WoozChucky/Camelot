@@ -210,7 +210,7 @@ int sys_open(struct trap_frame *f) {
         err = 0; /* namei()'s -ENOENT, if fs_create() made it */
         if (ip->type == T_DIR && writable) {
             err = -EISDIR;
-        } else if (ip->type == T_DEVICE && (ip->major >= NDEV || devsw[ip->major].read == NULL)) {
+        } else if (ip->type == T_DEVICE && !device_has_driver(ip->major)) {
             err = -ENODEV;
         } else if (ip->type == T_FILE && writable && fs_readonly) {
             err = -EROFS;
