@@ -540,7 +540,62 @@ fn a_capture_that_falls_behind_drops_rather_than_waits() {
     }
     *gate.0.lock().unwrap() = true;
     gate.1.notify_all();
-    capture.finish();
+    capture.finish().unwrap();
+}
+
+#[test]
+fn a_capture_whose_file_fails_says_so_when_stopped() {
+    /// A file that takes its header, then fails every write (a full disk).
+    struct Full(bool);
+    impl Write for Full {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if std::mem::replace(&mut self.0, false) {
+                Ok(buf.len())
+            } else {
+                Err(io::Error::other("disk full"))
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let lan = Switch::new("lan");
+    let mut a = TestCard::plugged(1, A, &lan);
+    let _b = TestCard::plugged(2, B, &lan);
+    lan.capture_into("full.pcap", Full(true)).unwrap();
+    for i in 0..10 {
+        a.send(&frame(B, A, i));
+    }
+    // The frames still flow; the capture's error comes with its stop.
+    assert_eq!(port_of(&lan, 2).out_frames, 10);
+    let e = lan.stop_capture().unwrap_err();
+    assert_eq!(e.code, ErrorCode::Io);
+    assert!(
+        e.message
+            .starts_with("full.pcap: disk full; the capture stopped there"),
+        "{}",
+        e.message
+    );
+    // And it is stopped: another can start.
+    assert_eq!(lan.info().capture, None);
+    lan.capture_into("again.pcap", io::sink()).unwrap();
+    lan.stop_capture().unwrap();
+}
+
+#[test]
+fn an_ended_card_is_unplugged_for_good() {
+    let lan = Switch::new("lan");
+    let a = TestCard::plugged(1, A, &lan);
+    a.card.end();
+    assert!(lan.info().ports.is_empty());
+    assert!(a.card.switch().is_none());
+    assert_eq!(
+        a.card.plug(owner(1), &lan).unwrap_err().code,
+        ErrorCode::InvalidState
+    );
+    // Its machine letting go of the backend later changes nothing.
+    drop(a);
+    assert!(lan.info().ports.is_empty());
 }
 
 // ---- Addresses ----

@@ -76,7 +76,7 @@ VM  CARD  MAC                IN  IN-BYTES  OUT  OUT-BYTES  DROPPED
         ok(addr, &["switch", "list"]),
         format!("NAME  PORTS  CAPTURE\nlan   1      {capture}\n")
     );
-    // Ping at 10 MHz: its few million polls for the answer leave pong a while.
+    // Ping at 1 MHz: its few million polls for the answer leave pong three seconds.
     assert_eq!(
         ok(
             addr,
@@ -85,7 +85,7 @@ VM  CARD  MAC                IN  IN-BYTES  OUT  OUT-BYTES  DROPPED
                 &net_example("net-ping"),
                 "--name=ping",
                 "--ram=16",
-                "--clock=10MHz",
+                "--clock=1MHz",
                 "--net=lan,mac=02:ca:00:00:00:01",
                 "--start"
             ]
@@ -113,7 +113,11 @@ VM  CARD  MAC                IN  IN-BYTES  OUT  OUT-BYTES  DROPPED
         "NAME  PORTS  CAPTURE\nlan   0      no\n"
     );
     assert!(ok(addr, &["info", "ping"]).contains("\nnets     02:ca:00:00:00:01 unplugged\n"));
-    assert!(ok(addr, &["list"]).contains("\n2   ping  exited(0)  16 MiB  10 MHz      0      1\n"));
+    let list = ok(addr, &["list"]);
+    assert!(
+        list.contains("\n2   ping  exited(0)  16 MiB  1 MHz       0      1\n"),
+        "{list}"
+    );
     server.stop().unwrap();
 }
 

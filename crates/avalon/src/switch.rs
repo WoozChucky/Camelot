@@ -28,8 +28,9 @@
 //! that is idling in `wfi` so it takes the frame at once rather than at its next look.
 //!
 //! Locks are taken in this order, never the other way round: the server's VM table,
-//! the server's switch table, a card's plug, a switch's state. A card's bell is rung
-//! (which takes its VM's lock) only after all of them have been released.
+//! the server's switch table, a VM's lock, a card's plug, a switch's state. A card's
+//! bell is rung (which takes its VM's lock) only after the plug and switch locks have
+//! been released.
 
 use crate::{lock, Fail};
 use avalon_proto::{ErrorCode, PortOwner, SwitchInfo, SwitchPort};
@@ -360,7 +361,9 @@ impl Switch {
             card.unplug_from(self);
         }
         if let Some(capture) = capture {
-            capture.finish();
+            // The switch is gone, and its capture with it: nobody is left to tell of
+            // a write that failed.
+            let _ = capture.finish();
         }
     }
 
@@ -409,18 +412,23 @@ impl Switch {
         // Opened here, on the requesting thread, so that a bad path is the request's
         // error; the frames are written on the capture's own thread.
         let file = File::create(path).map_err(|e| Fail::new(ErrorCode::Io, format!("{path}: {e}")))?;
-        let capture = Capture::start(path, BufWriter::new(file))
-            .map_err(|e| Fail::new(ErrorCode::Io, format!("{path}: {e}")))?;
+        self.capture_into(path, BufWriter::new(file))
+    }
+
+    /// Starts capturing into `out`, which [`Switch::start_capture`] opened as `path`.
+    fn capture_into(&self, path: &str, out: impl Write + Send + 'static) -> Result<(), Fail> {
+        let capture =
+            Capture::start(path, out).map_err(|e| Fail::new(ErrorCode::Io, format!("{path}: {e}")))?;
         let mut st = self.state();
         if st.closed {
             drop(st);
-            capture.finish();
+            let _ = capture.finish();
             return Err(self.no_such());
         }
         if st.capture.is_some() {
             // Another request started one meanwhile.
             drop(st);
-            capture.finish();
+            let _ = capture.finish();
             return Err(Fail::new(
                 ErrorCode::Busy,
                 format!("switch '{}' is being captured already", self.name()),
@@ -430,14 +438,21 @@ impl Switch {
         Ok(())
     }
 
-    /// Stops the capture, once every frame captured so far is in the file. Error:
-    /// `InvalidState` (no capture is running).
+    /// Stops the capture, once every frame captured so far is in the file. Errors:
+    /// `InvalidState` (no capture is running), `Io` (writing the file failed, which
+    /// ended the capture there: the frames after that are not in it). The capture is
+    /// stopped either way.
     pub fn stop_capture(&self) -> Result<(), Fail> {
         let capture = self.state().capture.take();
         match capture {
             Some(capture) => {
-                capture.finish();
-                Ok(())
+                let path = capture.path.clone();
+                capture.finish().map_err(|e| {
+                    Fail::new(
+                        ErrorCode::Io,
+                        format!("{path}: {e}; the capture stopped there, and the frames after it are not in the file"),
+                    )
+                })
             }
             None => Err(Fail::new(
                 ErrorCode::InvalidState,
@@ -458,7 +473,8 @@ fn owner_text(owner: PortOwner) -> String {
 struct Capture {
     path: String,
     tx: SyncSender<Vec<u8>>,
-    thread: JoinHandle<()>,
+    /// Ends with the first write error, which [`Capture::finish`] hands back.
+    thread: JoinHandle<io::Result<()>>,
 }
 
 impl Capture {
@@ -486,27 +502,30 @@ impl Capture {
         }
     }
 
-    /// Ends the capture: the writer writes what is queued, flushes, and ends.
-    fn finish(self) {
+    /// Ends the capture: the writer writes what is queued, flushes, and ends. An
+    /// error is the one that ended the writer early.
+    fn finish(self) -> io::Result<()> {
         drop(self.tx);
-        let _ = self.thread.join();
+        self.thread
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("the capture thread panicked")))
     }
 }
 
 /// The capture thread: writes records until the channel closes. A write error ends
-/// the capture (the frames keep flowing through the switch).
-fn write_records(rx: Receiver<Vec<u8>>, mut out: impl Write) {
+/// the capture there (the frames keep flowing through the switch) and is returned;
+/// the records queued after it are dropped.
+fn write_records(rx: Receiver<Vec<u8>>, mut out: impl Write) -> io::Result<()> {
     while let Ok(record) = rx.recv() {
-        let mut result = out.write_all(&record);
+        out.write_all(&record)?;
         // Write what else is waiting, then flush once: the file is complete whenever
         // the switch is idle, without a flush per frame under load.
-        while let (Ok(()), Ok(more)) = (&result, rx.try_recv()) {
-            result = out.write_all(&more);
+        while let Ok(more) = rx.try_recv() {
+            out.write_all(&more)?;
         }
-        if result.and_then(|()| out.flush()).is_err() {
-            return;
-        }
+        out.flush()?;
     }
+    Ok(())
 }
 
 /// What rings when a card's switch queues a frame for it: wakes the card's VM.
@@ -597,6 +616,21 @@ impl Card {
         }
     }
 
+    /// Ends the card for good, as its machine ends: it is unplugged, and cannot be
+    /// plugged in again. The VM calls this before it tells anyone that its machine has
+    /// ended (stopped or exited), so a client that has heard that never sees the card
+    /// on a switch, nor plugs it in. Dropping the card's backend does it too.
+    pub fn end(&self) {
+        let port = {
+            let mut plug = lock(&self.plug);
+            plug.ended = true;
+            plug.port.take()
+        };
+        if let Some((switch, id)) = port {
+            switch.detach(id);
+        }
+    }
+
     /// Unplugs the card if it is plugged into `switch` (which is being deleted).
     fn unplug_from(&self, switch: &Switch) {
         let mut plug = lock(&self.plug);
@@ -641,14 +675,7 @@ impl NetBackend for CardBackend {
 
 impl Drop for CardBackend {
     fn drop(&mut self) {
-        let port = {
-            let mut plug = lock(&self.0.plug);
-            plug.ended = true;
-            plug.port.take()
-        };
-        if let Some((switch, id)) = port {
-            switch.detach(id);
-        }
+        self.0.end();
     }
 }
 

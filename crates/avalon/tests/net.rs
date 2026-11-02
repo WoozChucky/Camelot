@@ -111,7 +111,8 @@ fn two_vms_on_a_switch_exchange_frames_and_another_switch_sees_nothing() {
     create_switch(&mut rt, "lan");
     create_switch(&mut rt, "dmz");
 
-    // Pong and the spy wait in wfi for a frame, at full speed: a frame must wake them.
+    // Pong and the spy wait in wfi for a frame, at full speed: a frame rings pong's
+    // bell, which wakes it (the bell count below shows it rang).
     let pong = create(
         &mut rt,
         "pong",
@@ -124,12 +125,12 @@ fn two_vms_on_a_switch_exchange_frames_and_another_switch_sees_nothing() {
         with_cards(None, &[(Some("dmz"), Some(SPY_MAC))]),
         net_example("net-pong"),
     );
-    // Ping polls for its answer a few million instructions, then gives up. At 10 MHz
-    // that leaves pong a third of a second to answer, however loaded the host is.
+    // Ping polls for its answer a few million instructions, then gives up. At 1 MHz
+    // that leaves pong three seconds to answer, however loaded the host is.
     let ping = create(
         &mut rt,
         "ping",
-        with_cards(Some(10_000_000), &[(Some("lan"), Some(PING_MAC))]),
+        with_cards(Some(1_000_000), &[(Some("lan"), Some(PING_MAC))]),
         net_example("net-ping"),
     );
     let capture = std::env::temp_dir().join(format!("avalon-net-{}-lan.pcap", std::process::id()));
@@ -157,6 +158,10 @@ fn two_vms_on_a_switch_exchange_frames_and_another_switch_sees_nothing() {
     });
     assert_eq!(String::from_utf8_lossy(&ping_console.output), PING_OUT);
     assert_eq!(String::from_utf8_lossy(&pong_console.output), PONG_OUT);
+    // Ping's frame rang pong's bell (and the reply ping's, if it was waiting); the spy
+    // got nothing to ring for.
+    assert!(server.debug_vm(pong).unwrap().bells >= 1);
+    assert_eq!(server.debug_vm(spy).unwrap().bells, 0);
 
     // The spy, on the other switch, heard nothing and still waits.
     ok(&mut rt, Message::PauseVm { vm: VmRef::Id(spy) });
@@ -289,6 +294,59 @@ fn a_vm_that_takes_nothing_holds_nobody_up() {
     assert_eq!(port.out_frames, avalon::switch::PORT_QUEUE as u64);
     assert_eq!(port.out_bytes, 60 * avalon::switch::PORT_QUEUE as u64);
     assert_eq!(port.dropped, 1000 - avalon::switch::PORT_QUEUE as u64);
+}
+
+/// Once a client has heard that a VM's machine has ended (its `StopVm` was answered, or
+/// it saw the exit), the cards are unplugged: no port on the switch, no switch in
+/// `VmInfo`, and plugging one in is refused. The machine itself goes a moment later, on
+/// the VM's thread; the requests come at once, and the VMs are big (freeing their RAM
+/// takes a while), so that a card left to go with its machine would be seen.
+#[test]
+fn a_vm_whose_machine_ended_has_unplugged_its_cards_already() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    create_switch(&mut rt, "lan");
+    create_switch(&mut rt, "dmz");
+    let attach = |vm, switch: &str| Message::AttachCard {
+        vm: VmRef::Id(vm),
+        card: 0,
+        switch: switch.into(),
+    };
+    let big = |switch| HardwareProfile {
+        ram_size: 256 * MIB,
+        ..with_cards(None, &[(switch, None)])
+    };
+    for i in 0..10 {
+        // Stopped while running.
+        let vm = create(&mut rt, &format!("stopped-{i}"), big(None), spinner());
+        ok(&mut rt, Message::StartVm { vm: VmRef::Id(vm) });
+        ok(&mut rt, attach(vm, "dmz"));
+        ok(&mut rt, Message::StopVm { vm: VmRef::Id(vm) });
+        assert_eq!(error_of(&mut rt, &attach(vm, "lan")), ErrorCode::InvalidState);
+        assert!(switch(&mut rt, "dmz").ports.is_empty(), "{i}");
+        assert_eq!(cards(&mut rt, vm)[0].switch, None);
+        ok(&mut rt, Message::DestroyVm { vm: VmRef::Id(vm) });
+
+        // Exited: the first `VmInfo` that says so has the card off its switch.
+        let vm = create(&mut rt, &format!("exits-{i}"), big(Some("lan")), exits_with(0));
+        ok(&mut rt, Message::StartVm { vm: VmRef::Id(vm) });
+        let start = Instant::now();
+        let details = loop {
+            let details = info(&mut rt, vm);
+            if details.vm.state != VmState::Running {
+                break details;
+            }
+            assert!(start.elapsed() < SLOW, "VM {vm} does not exit");
+        };
+        assert_eq!(details.vm.state, VmState::Exited(0));
+        let DeviceSpec::Net(card) = &details.vm.profile.devices[0] else {
+            panic!("{details:?}")
+        };
+        assert_eq!(card.switch, None, "{i}");
+        assert!(switch(&mut rt, "lan").ports.is_empty(), "{i}");
+        assert_eq!(error_of(&mut rt, &attach(vm, "lan")), ErrorCode::InvalidState);
+        ok(&mut rt, Message::DestroyVm { vm: VmRef::Id(vm) });
+    }
 }
 
 #[test]

@@ -260,6 +260,7 @@ impl ServerThread {
         let (keys, pointer) = vm.queued_input();
         Some(VmDebug {
             slices: vm.slices(),
+            bells: vm.bells(),
             consoles: vm.console_count(),
             viewers: vm.viewer_count(),
             keys,
@@ -288,6 +289,8 @@ impl ServerThread {
 pub struct VmDebug {
     /// Calls of Grail's `run_for` so far, empty ones included.
     pub slices: u64,
+    /// Times a frame for one of its network cards rang its bell (woke it).
+    pub bells: u64,
     /// Clients attached to the console.
     pub consoles: usize,
     /// Clients attached to the screen.
@@ -541,15 +544,8 @@ impl Shared {
             .ok_or_else(|| Fail::new(ErrorCode::Internal, "out of VM ids"))?;
         vm.id = id;
         let vm = Arc::new(vm);
-        // A frame for one of the cards wakes the VM. Weak: the cards are the VM's.
-        for card in vm.cards() {
-            let weak = Arc::downgrade(&vm);
-            card.set_bell(Arc::new(move || {
-                if let Some(vm) = weak.upgrade() {
-                    vm.kick();
-                }
-            }));
-        }
+        // A frame for one of the cards wakes the VM.
+        vm.ring_on_frames();
         // Plugged in under the table's lock, so the VM is never listed with its
         // cards half plugged in. If one cannot be, the VM is not created.
         if let Err(fail) = self.plug_cards(&vm, &cards) {
