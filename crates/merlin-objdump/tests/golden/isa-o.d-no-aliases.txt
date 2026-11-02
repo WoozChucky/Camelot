@@ -164,7 +164,7 @@ Disassembly of section .text:
      258:      	auipc	t0, 0x0
      25c:      	jalr	ra, 0x8(t0) <calls+0x8>
      260:      	auipc	t1, 0x1
-     264:      	jalr	zero, -0x4(t1) <second+0xf94>
+     264:      	jalr	zero, -0x4(t1) <regs+0xf90>
      268:      	lui	a0, 0x0
      26c:      	jalr	ra, 0x10(a0)
      270:      	auipc	a1, 0x0
@@ -193,3 +193,23 @@ Disassembly of section .text:
 
 000002c8 <second>:
      2c8:      	jalr	ra, 0x0(a3)
+
+000002cc <regs>:
+     2cc:      	auipc	a3, 0x0
+     2d0:      	lui	a3, 0x0
+     2d4:      	jalr	ra, 0x0(a3)
+     2d8:      	auipc	a3, 0x0
+     2dc:      	csrrs	a3, mstatus, zero
+     2e0:      	jalr	ra, 0x0(a3)
+     2e4:      	auipc	a3, 0x0
+     2e8:      	jalr	ra, 0x0(t0)
+     2ec:      	jalr	ra, 0x0(a3)
+     2f0:      	auipc	a3, 0x0
+     2f4:      	<unknown>
+     2f8:      	jalr	ra, 0x0(a3)
+     2fc:      	auipc	a3, 0x0
+     300:      	<unknown>
+     304:      	jalr	ra, 0x0(a3)
+     308:      	auipc	a3, 0x0
+     30c:      	fence	iorw, iorw
+     310:      	jalr	ra, 0x0(a3) <regs+0x3c>

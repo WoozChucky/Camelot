@@ -1,7 +1,7 @@
 # merlin-objdump fixture: every RV32IM/Zicsr/Zifencei/privileged encoding,
 # the operand forms where llvm-objdump picks a pseudo-instruction (and the
 # tie-breaks when both registers are zero), Xcal words, data words in code,
-# and auipc+jalr pairs whose targets the disassembler resolves.
+# and auipc+jalr pairs whose targets the disassembler resolves (or must not).
 # Built by scripts/gen-objdump-golden.sh:
 #   clang --target=riscv32 -march=rv32im_zicsr_zifencei -mabi=ilp32 -c -mno-relax isa.S -o isa.o
 
@@ -189,4 +189,26 @@ calls:
 1:  jalr ra, 0(a3)
     auipc a3, 0
 second:
+    jalr ra, 0(a3)
+regs:
+    # Writing the tracked register forgets it (lui, csr), as does any jalr
+    # and any word llvm does not decode, reserved fences included; a plain
+    # fence keeps it.
+    auipc a3, 0
+    lui a3, 0
+    jalr ra, 0(a3)
+    auipc a3, 0
+    csrr a3, mstatus
+    jalr ra, 0(a3)
+    auipc a3, 0
+    jalr t0
+    jalr ra, 0(a3)
+    auipc a3, 0
+    .word 0x8ff0000f
+    jalr ra, 0(a3)
+    auipc a3, 0
+    .word 0x0010100f
+    jalr ra, 0(a3)
+    auipc a3, 0
+    fence
     jalr ra, 0(a3)

@@ -2,6 +2,15 @@ use super::*;
 
 /// Builds a small ET_REL by hand: null, .text, .rela.text, .symtab, .strtab, .shstrtab.
 fn tiny_object() -> Vec<u8> {
+    build_object(false)
+}
+
+/// The same object with its relocations in a `.rel.text` (SHT_REL, no addends).
+fn tiny_rel_object() -> Vec<u8> {
+    build_object(true)
+}
+
+fn build_object(rel: bool) -> Vec<u8> {
     fn p16(b: &mut Vec<u8>, v: u16) {
         b.extend_from_slice(&v.to_le_bytes());
     }
@@ -15,7 +24,14 @@ fn tiny_object() -> Vec<u8> {
     let mut rela = Vec::new();
     p32(&mut rela, 0);
     p32(&mut rela, (2 << 8) | 19); // sym 2 (ext), R_RISCV_CALL_PLT
-    p32(&mut rela, -4i32 as u32);
+    if rel {
+        // A second entry, so reading an addend from a REL entry would pick
+        // up this one's offset.
+        p32(&mut rela, 4);
+        p32(&mut rela, 51); // R_RISCV_RELAX
+    } else {
+        p32(&mut rela, -4i32 as u32);
+    }
     let strtab = b"\0start\0ext\0".to_vec();
     let mut symtab = vec![0u8; 16];
     for (name, value, info, shndx) in [
@@ -29,7 +45,8 @@ fn tiny_object() -> Vec<u8> {
         symtab.push(0);
         p16(&mut symtab, shndx);
     }
-    let shstrtab = b"\0.text\0.rela.text\0.symtab\0.strtab\0.shstrtab\0".to_vec();
+    let shstrtab = b"\0.text\0.rela.text\0.symtab\0.strtab\0.shstrtab\0.rel.text\0".to_vec();
+    let (rel_name, rel_ty, rel_entsize) = if rel { (44, SHT_REL, 8) } else { (7, SHT_RELA, 12) };
 
     let mut out = vec![0u8; EHDR_SIZE];
     let mut place = |data: &[u8]| {
@@ -49,7 +66,16 @@ fn tiny_object() -> Vec<u8> {
     let shdrs = [
         (0, SHT_NULL, 0, 0, 0, 0, 0, 0),
         (1, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, offs[0], 8, 0, 0, 0),
-        (7, SHT_RELA, SHF_INFO_LINK, offs[1], 12, 3, 1, 12),
+        (
+            rel_name,
+            rel_ty,
+            SHF_INFO_LINK,
+            offs[1],
+            rela.len() as u32,
+            3,
+            1,
+            rel_entsize,
+        ),
         (18, SHT_SYMTAB, 0, offs[2], 48, 4, 1, 16),
         (26, SHT_STRTAB, 0, offs[3], strtab.len() as u32, 0, 0, 0),
         (34, SHT_STRTAB, 0, offs[4], shstrtab.len() as u32, 0, 0, 0),
@@ -117,6 +143,32 @@ fn parses_hand_built_object() {
         }]
     );
     assert!(elf.relocations(&elf.sections[1]).is_err());
+}
+
+#[test]
+fn reads_rel_entries_without_addends() {
+    let bytes = tiny_rel_object();
+    let elf = Elf::parse(&bytes).unwrap();
+    assert_eq!(elf.sections[2].name, ".rel.text");
+    assert_eq!(elf.sections[2].ty, SHT_REL);
+    let relocs = elf.relocations(&elf.sections[2]).unwrap();
+    assert_eq!(
+        relocs,
+        [
+            Rela {
+                offset: 0,
+                sym: 2,
+                ty: 19,
+                addend: 0
+            },
+            Rela {
+                offset: 4,
+                sym: 0,
+                ty: 51,
+                addend: 0
+            }
+        ]
+    );
 }
 
 #[test]

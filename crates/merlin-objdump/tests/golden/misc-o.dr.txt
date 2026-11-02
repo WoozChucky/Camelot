@@ -1,0 +1,12 @@
+
+crates/merlin-objdump/tests/fixtures/misc.o:	file format elf32-littleriscv
+
+Disassembly of section .text:
+
+00000000 <entry>:
+       0: 00000013     	nop
+			00000000:  R_RISCV_NONE	baz
+       4: 00000013     	nop
+			00000004:  R_RISCV_NONE	bar
+       8: 00000013     	nop
+       c: 00008067     	ret

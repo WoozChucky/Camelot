@@ -2,9 +2,10 @@
 //! tests/golden/ (regenerate with scripts/gen-objdump-golden.sh; the fixture
 //! sources and the commands are documented there).
 //!
-//! Lines must match exactly, with one allowance: where llvm-objdump prints
-//! `<unknown>` (Xcal instructions, data words, reserved fence encodings),
-//! merlin-objdump prints `xcal.*`, `.word`, `.byte` or `fence` instead.
+//! Lines must match exactly. Where llvm-objdump prints `<unknown>` (Xcal
+//! instructions, data words, reserved fence encodings), our lines (`xcal.*`,
+//! `.word`, `.byte`, `fence`, ...) must match the ones listed for that golden
+//! file in tests/golden/unknown.txt, which is kept by hand.
 
 use merlin_objdump::cli::{parse_args, Command};
 use std::path::Path;
@@ -76,6 +77,32 @@ const CASES: &[(&str, &str, &[&str])] = &[
         "crates/merlin-objdump/tests/fixtures/relocs.o",
         &["-s"],
     ),
+    ("misc-o.x", "crates/merlin-objdump/tests/fixtures/misc.o", &["-x"]),
+    (
+        "misc-o.dr",
+        "crates/merlin-objdump/tests/fixtures/misc.o",
+        &["-dr"],
+    ),
+    (
+        "debug-o.d",
+        "crates/merlin-objdump/tests/fixtures/debug.o",
+        &["-d"],
+    ),
+    (
+        "debug-o.h",
+        "crates/merlin-objdump/tests/fixtures/debug.o",
+        &["-h"],
+    ),
+    (
+        "linked-elf.d",
+        "crates/merlin-objdump/tests/fixtures/linked.elf",
+        &["-d"],
+    ),
+    (
+        "linked-elf.x",
+        "crates/merlin-objdump/tests/fixtures/linked.elf",
+        &["-x"],
+    ),
     ("rv32ui-p-add.d", "tests/riscv-tests/rv32ui-p-add", &["-d"]),
     ("rv32mi-p-csr.d", "tests/riscv-tests/rv32mi-p-csr", &["-d"]),
     (
@@ -108,46 +135,52 @@ fn insn_addr(line: &str) -> Option<u32> {
     u32::from_str_radix(addr, 16).ok()
 }
 
-/// The mnemonic of a disassembly line: the text after its first tab.
-fn mnemonic(line: &str) -> &str {
-    line.split('\t').nth(1).unwrap_or("")
-}
-
 /// The address of a label line (`80000000 <_start>:`).
 fn label_addr(line: &str) -> Option<u32> {
     let (addr, rest) = line.split_once(" <")?;
     rest.ends_with(">:").then(|| u32::from_str_radix(addr, 16).ok())?
 }
 
+/// Our exact lines for the instructions llvm-objdump prints as `<unknown>`,
+/// for one golden file, in order (from golden/unknown.txt).
+fn expected_unknown(name: &str) -> Vec<String> {
+    let path = root().join("crates/merlin-objdump/tests/golden/unknown.txt");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|&(n, _)| n == name)
+        .map(|(_, line)| line.to_string())
+        .collect()
+}
+
 /// Compares our output with llvm's; returns a description of every difference.
-fn compare(ours: &str, llvm: &str) -> Vec<String> {
+/// `unknown` lists, in order, our exact lines where llvm prints `<unknown>`.
+fn compare(ours: &str, llvm: &str, unknown: &[String]) -> Vec<String> {
     // Byte ranges llvm could not decode: from an `<unknown>` line to the next
     // address llvm prints. llvm steps through them in 1, 2, 4 or more bytes
-    // (it guesses the length from the low bits), we step in words.
+    // (it guesses the length from the low bits), we step in words, so our
+    // lines there are checked against `unknown` instead.
     let mut addrs: Vec<u32> = llvm
         .lines()
         .filter_map(|l| insn_addr(l).or_else(|| label_addr(l)))
         .collect();
     addrs.sort();
     addrs.dedup();
-    let unknown: Vec<(u32, u32)> = llvm
+    let ranges: Vec<(u32, u32)> = llvm
         .lines()
         .filter(|l| l.ends_with("<unknown>"))
         .filter_map(insn_addr)
         .map(|a| (a, addrs.iter().copied().find(|&b| b > a).unwrap_or(u32::MAX)))
         .collect();
-    let is_unknown = |a: u32| unknown.iter().any(|&(start, end)| (start..end).contains(&a));
+    let is_unknown = |a: u32| ranges.iter().any(|&(start, end)| (start..end).contains(&a));
     let mut problems = Vec::new();
     let llvm_lines: Vec<&str> = llvm.lines().filter(|l| !l.ends_with("<unknown>")).collect();
     let mut our_lines = Vec::new();
+    let mut our_unknown = Vec::new();
     for l in ours.lines() {
         match insn_addr(l) {
-            Some(a) if is_unknown(a) => {
-                let m = mnemonic(l);
-                if ![".word", ".byte", "xcal.dbg", "xcal.halt", "fence"].contains(&m) {
-                    problems.push(format!("llvm has <unknown> at {a:x}, we print: {l}"));
-                }
-            }
+            Some(a) if is_unknown(a) => our_unknown.push(l),
             _ => our_lines.push(l),
         }
     }
@@ -163,6 +196,21 @@ fn compare(ours: &str, llvm: &str) -> Vec<String> {
             llvm_lines.len()
         ));
     }
+    for (o, e) in our_unknown.iter().zip(unknown) {
+        if o != e {
+            problems.push(format!(
+                "where llvm has <unknown>:\n  ours:     {o:?}\n  expected: {e:?}"
+            ));
+        }
+    }
+    if our_unknown.len() != unknown.len() {
+        problems.push(format!(
+            "where llvm has <unknown>: we print {} lines, unknown.txt lists {}:\n{}",
+            our_unknown.len(),
+            unknown.len(),
+            our_unknown.join("\n")
+        ));
+    }
     problems
 }
 
@@ -175,7 +223,7 @@ fn matches_llvm_objdump() {
             .join(format!("{name}.txt"));
         let llvm = std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
         let ours = run(input, args);
-        let problems = compare(&ours, &llvm);
+        let problems = compare(&ours, &llvm, &expected_unknown(name));
         if !problems.is_empty() {
             let shown: Vec<String> = problems.iter().take(8).cloned().collect();
             failures.push(format!(
@@ -250,10 +298,12 @@ fn object_relocations_by_name() {
 fn compare_detects_differences() {
     let llvm = "\n00000000 <f>:\n       0: 00000013     \tnop\n       4: 0005000b     \t<unknown>\n";
     let same = "\n00000000 <f>:\n       0: 00000013     \tnop\n       4: 0005000b     \txcal.dbg\ta0\n";
-    assert!(compare(same, llvm).is_empty());
+    let unknown = ["       4: 0005000b     \txcal.dbg\ta0".to_string()];
+    assert!(compare(same, llvm, &unknown).is_empty());
     let wrong = same.replace("nop", "addi\tzero, zero, 0x0");
-    assert_eq!(compare(&wrong, llvm).len(), 1);
-    let bad_unknown = same.replace("xcal.dbg\ta0", "addi\ta0, a0, 0x1");
-    assert_eq!(compare(&bad_unknown, llvm).len(), 1);
-    assert_eq!(compare(&format!("{same}extra\n"), llvm).len(), 1);
+    assert_eq!(compare(&wrong, llvm, &unknown).len(), 1);
+    let bad_unknown = same.replace("xcal.dbg\ta0", "xcal.dbg\ta1");
+    assert_eq!(compare(&bad_unknown, llvm, &unknown).len(), 1);
+    assert_eq!(compare(same, llvm, &[]).len(), 1);
+    assert_eq!(compare(&format!("{same}extra\n"), llvm, &unknown).len(), 1);
 }

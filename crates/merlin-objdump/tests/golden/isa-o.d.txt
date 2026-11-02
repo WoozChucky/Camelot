@@ -164,7 +164,7 @@ Disassembly of section .text:
      258: 00000297     	auipc	t0, 0x0
      25c: 008280e7     	jalr	0x8(t0) <calls+0x8>
      260: 00001317     	auipc	t1, 0x1
-     264: ffc30067     	jr	-0x4(t1) <second+0xf94>
+     264: ffc30067     	jr	-0x4(t1) <regs+0xf90>
      268: 00000537     	lui	a0, 0x0
      26c: 010500e7     	jalr	0x10(a0)
      270: 00000597     	auipc	a1, 0x0
@@ -193,3 +193,23 @@ Disassembly of section .text:
 
 000002c8 <second>:
      2c8: 000680e7     	jalr	a3
+
+000002cc <regs>:
+     2cc: 00000697     	auipc	a3, 0x0
+     2d0: 000006b7     	lui	a3, 0x0
+     2d4: 000680e7     	jalr	a3
+     2d8: 00000697     	auipc	a3, 0x0
+     2dc: 300026f3     	csrr	a3, mstatus
+     2e0: 000680e7     	jalr	a3
+     2e4: 00000697     	auipc	a3, 0x0
+     2e8: 000280e7     	jalr	t0
+     2ec: 000680e7     	jalr	a3
+     2f0: 00000697     	auipc	a3, 0x0
+     2f4: 8ff0000f     	<unknown>
+     2f8: 000680e7     	jalr	a3
+     2fc: 00000697     	auipc	a3, 0x0
+     300: 0010100f     	<unknown>
+     304: 000680e7     	jalr	a3
+     308: 00000697     	auipc	a3, 0x0
+     30c: 0ff0000f     	fence
+     310: 000680e7     	jalr	a3 <regs+0x3c>

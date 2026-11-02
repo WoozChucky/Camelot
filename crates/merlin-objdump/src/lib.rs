@@ -8,7 +8,10 @@
 //! - Words that do not decode print as `.word 0x...` (one per 4 bytes) where
 //!   llvm-objdump prints `<unknown>`, and the Xcal instructions print as
 //!   `xcal.dbg` / `xcal.halt`.
-//! - Reserved fence encodings print as the `fence` Grail executes them as.
+//! - Reserved fence encodings print as the `fence`/`fence.i` Grail executes
+//!   them as, and `dret` prints as `.word`.
+//! - Targets that wrap below the symbol they are named after get a 32-bit
+//!   displacement (`<f+0xffffff04>`); llvm-objdump prints a 64-bit one.
 //! - Only the CSR names in `excalibur::csr` are known; others print as numbers.
 
 pub mod cli;
@@ -154,7 +157,8 @@ fn section_kind(s: &Section) -> String {
     if s.is_exec() {
         kinds.push("TEXT");
     }
-    if s.ty == elf32::SHT_PROGBITS && s.is_alloc() && !s.is_exec() {
+    // Like LLVM's isSectionData: also .init_array, alloc notes and so on.
+    if s.is_alloc() && !s.is_exec() && !s.is_nobits() {
         kinds.push("DATA");
     }
     if s.is_nobits() && s.flags & (elf32::SHF_ALLOC | elf32::SHF_WRITE) != 0 {
@@ -240,7 +244,9 @@ fn symbol_table(out: &mut String, elf: &Elf) -> Result<(), Error> {
         let _ = writeln!(
             out,
             "{:08x} {glob_loc}{weak}  {ifunc}{debug}{kind} {}\t{:08x}{visibility} {}",
-            s.value,
+            // A common symbol's st_value is its alignment; llvm-objdump shows
+            // its size in the first column and the alignment in the second.
+            if common { s.size } else { s.value },
             symbol_section(elf, s),
             if common { s.value } else { s.size },
             symbol_name(elf, s)
@@ -255,7 +261,7 @@ pub(crate) struct RelocSection {
     pub target: usize,
     /// The symbol table they refer to (`sh_link`).
     pub symbols: Vec<Symbol>,
-    /// Sorted by offset; entries at the same offset keep their file order.
+    /// In file order, as `-r` prints them (`-dr` sorts its own copy).
     pub relocs: Vec<elf32::Rela>,
 }
 
@@ -264,8 +270,7 @@ pub(crate) fn relocation_sections(elf: &Elf) -> Result<Vec<RelocSection>, Error>
     let mut out = Vec::new();
     for s in &elf.sections {
         if s.ty == elf32::SHT_RELA || s.ty == elf32::SHT_REL {
-            let mut relocs = elf.relocations(s)?;
-            relocs.sort_by_key(|r| r.offset);
+            let relocs = elf.relocations(s)?;
             let symbols = match elf.sections.get(s.link as usize) {
                 Some(symtab) if symtab.ty == elf32::SHT_SYMTAB => elf.symbols_in(symtab)?,
                 _ => elf.symbols()?,

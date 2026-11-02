@@ -5,7 +5,8 @@
 #   scripts/gen-objdump-golden.sh
 #
 # 1. Assembles the fixture sources in crates/merlin-objdump/tests/fixtures/
-#    into .o files with clang (hello.o is examples/hello/hello.S).
+#    into .o files with clang (hello.o is examples/hello/hello.S), and links
+#    linked.elf with ld.lld and linked.ld.
 # 2. Runs llvm-objdump over those objects, examples/hello/hello.elf and a few
 #    riscv-tests ELFs, writing tests/golden/<name>.txt.
 #
@@ -24,6 +25,12 @@ CC="clang --target=riscv32 -march=rv32im_zicsr_zifencei -mabi=ilp32 -c"
 $CC -mno-relax "$FIX/isa.S" -o "$FIX/isa.o"
 $CC "$FIX/relocs.S" -o "$FIX/relocs.o"
 $CC examples/hello/hello.S -o "$FIX/hello.o"
+$CC -mno-relax "$FIX/misc.S" -o "$FIX/misc.o"
+# -fdebug-compilation-dir keeps the build directory out of the debug info.
+$CC -O1 -g -fdebug-compilation-dir=. "$FIX/debug.c" -o "$FIX/debug.o"
+$CC -mno-relax "$FIX/linked.S" -o "$FIX/linked.o"
+ld.lld -T "$FIX/linked.ld" "$FIX/linked.o" -o "$FIX/linked.elf"
+rm "$FIX/linked.o"
 
 gen() { # golden-name input llvm-objdump-args...
   local name=$1 input=$2
@@ -47,6 +54,12 @@ gen relocs-o.t                 "$FIX/relocs.o" -t
 gen relocs-o.h                 "$FIX/relocs.o" -h
 gen relocs-o.x                 "$FIX/relocs.o" -x
 gen relocs-o.s                 "$FIX/relocs.o" -s
+gen misc-o.x                   "$FIX/misc.o" -x
+gen misc-o.dr                  "$FIX/misc.o" -dr
+gen debug-o.d                  "$FIX/debug.o" -d
+gen debug-o.h                  "$FIX/debug.o" -h
+gen linked-elf.d               "$FIX/linked.elf" -d
+gen linked-elf.x               "$FIX/linked.elf" -x
 gen rv32ui-p-add.d             tests/riscv-tests/rv32ui-p-add -d
 gen rv32mi-p-csr.d             tests/riscv-tests/rv32mi-p-csr -d
 gen rv32si-p-dirty.dx          tests/riscv-tests/rv32si-p-dirty -d -x

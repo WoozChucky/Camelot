@@ -212,7 +212,9 @@ All reading goes through one crate, `elf32` (header, program headers, sections, 
 `merlin-objdump` takes llvm-objdump's options (`-d -r -t -h -x -f -p -s`, `-M no-aliases`, `--no-show-raw-insn`) and prints the same text as llvm-objdump 21, so the two can be diffed: same layout, pseudo-instructions where LLVM prints them (`mv`, `ret`, `beqz`, `csrr`, ...), hex immediates, branch targets as `0x80000044 <puts+0x28>`, `jalr` after `auipc` resolved to `<symbol>`, and relocations under their instruction with `-dr`. The deliberate differences:
 
 - Xcal instructions print as `xcal.dbg`/`xcal.halt` and undecodable words as `.word 0x...` (trailing odd bytes as `.byte`), where LLVM prints `<unknown>`.
-- Reserved fence encodings print as the plain `fence` Grail executes.
+- Reserved fence encodings (non-zero `fm`, `rs1` or `rd`, and `fence.i` with operand bits set) print as the `fence`/`fence.i` Grail executes. Like LLVM, the disassembler still forgets the `auipc` values it tracks at them.
+- `dret` (debug mode, which Excalibur does not have) prints as `.word 0x7b200073`.
+- A branch or jump target below the symbol it is named after (a negative target that wraps around in a `.o`) gets a 32-bit displacement, `<f+0xffffff04>`, where LLVM prints a 64-bit one, `<f+0xffffffffffffff04>`.
 - CSR names come from `excalibur::csr`; CSRs not listed there print as numbers.
 
 The instruction formatting itself (`Inst::format` in `excalibur`) is shared with Grail's `--trace`, which uses the plain form: no pseudo-instructions, decimal immediates, relative branch offsets.

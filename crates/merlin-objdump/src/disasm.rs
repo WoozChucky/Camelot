@@ -129,9 +129,14 @@ impl RegState {
         }
     }
 
-    /// Updates the state after `inst` at `pc`. Control flow and anything
-    /// llvm cannot decode forget everything; other writes forget `rd`.
-    fn update(&mut self, inst: &Inst, pc: u32) {
+    /// Updates the state after `inst` (decoded from `w`) at `pc`. Control
+    /// flow and anything llvm cannot decode forget everything; other writes
+    /// forget `rd`.
+    fn update(&mut self, inst: &Inst, w: u32, pc: u32) {
+        if llvm_rejects_fence(w) {
+            self.reset();
+            return;
+        }
         match *inst {
             Inst::Branch { .. }
             | Inst::Jal { .. }
@@ -150,6 +155,22 @@ impl RegState {
             | Inst::Csr { rd, .. } => self.set(rd, None),
             _ => {}
         }
+    }
+}
+
+/// True for the reserved MISC-MEM encodings that excalibur decodes as a
+/// fence (Grail executes them as one) but llvm-objdump prints as `<unknown>`:
+/// `fence` with non-zero fm, rs1 or rd (other than `fence.tso`), and
+/// `fence.i` with any immediate, rs1 or rd bits set.
+fn llvm_rejects_fence(w: u32) -> bool {
+    const RS1_RD: u32 = 0x000f_8f80;
+    if w & 0x7f != 0x0f {
+        return false;
+    }
+    match (w >> 12) & 7 {
+        0 => w & RS1_RD != 0 || (w >> 28 != 0 && w >> 20 != 0x833),
+        1 => w & (0xfff0_0000 | RS1_RD) != 0,
+        _ => false,
     }
 }
 
@@ -177,18 +198,23 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
             continue;
         }
         let data = elf.section_data(sec)?;
-        let end = sec.addr.wrapping_add(sec.size);
+        // Addresses are u64 here so a section ending at 2^32 does not wrap.
+        let sec_start = sec.addr as u64;
+        let end = sec_start + sec.size as u64;
         let _ = writeln!(out, "\nDisassembly of section {}:", sec.name);
 
-        // A section with no symbol at its start gets one named after it.
+        // A section with no symbol at its start gets one named after it. A
+        // linker script can define symbols below the section start, so the
+        // label goes where it keeps the list sorted, not necessarily first.
         let syms = &mut labels.per_section[idx];
-        if syms.first().is_none_or(|s| s.addr != sec.addr) {
+        if !syms.iter().any(|s| s.addr == sec.addr) {
             let label = Label {
                 addr: sec.addr,
                 name: sec.name.clone(),
                 ty: elf32::STT_FUNC,
             };
-            syms.insert(0, label);
+            let at = syms.partition_point(|s| s.addr < sec.addr);
+            syms.insert(at, label);
         }
         let syms = syms.clone();
 
@@ -216,15 +242,15 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
         // One region per distinct symbol address, labelled with the last symbol there.
         let mut i = 0;
         while i < syms.len() {
-            let start = syms[i].addr;
+            let start = syms[i].addr as u64;
             let mut j = i;
-            while j < syms.len() && syms[j].addr == start {
+            while j < syms.len() && syms[j].addr as u64 == start {
                 j += 1;
             }
             let label = &syms[j - 1];
-            let region_end = syms.get(j).map_or(end, |s| s.addr.min(end));
+            let region_end = syms.get(j).map_or(end, |s| (s.addr as u64).min(end));
             i = j;
-            if start < sec.addr || start >= region_end {
+            if start < sec_start || start >= region_end {
                 continue;
             }
             let _ = writeln!(out, "\n{start:08x} <{}>:", label.name);
@@ -232,19 +258,23 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
             let mut regs = RegState::new();
             let mut pc = start;
             while pc < region_end {
-                let off = (pc - sec.addr) as usize;
-                let size = if region_end - pc >= 4 { 4 } else { 1 };
-                let (raw, inst) = match data.get(off..off + size) {
+                let off = (pc - sec_start) as usize;
+                // Like llvm-objdump, a word is decoded whenever the section
+                // has 4 bytes left, even if it runs past the next label.
+                let size = if end - pc >= 4 { 4 } else { 1 };
+                let (raw, w) = match data.get(off..off + size) {
                     Some(&[a, b, c, d]) => {
                         let w = u32::from_le_bytes([a, b, c, d]);
-                        (format!("{w:08x}"), decode(w))
+                        (format!("{w:08x}"), w)
                     }
-                    Some(&[b]) => (format!("{b:02x}"), Inst::Illegal(b as u32)),
+                    Some(&[b]) => (format!("{b:02x}"), b as u32),
                     _ => break,
                 };
-                let d = inst.format(Some(pc), syntax);
-                let (mnemonic, operands) = match inst {
-                    Inst::Illegal(b) if size == 1 => (".byte", format!("{b:#04x}")),
+                let inst = if size == 4 { decode(w) } else { Inst::Illegal(w) };
+                let pc32 = pc as u32;
+                let d = inst.format(Some(pc32), syntax);
+                let (mnemonic, operands) = match size {
+                    1 => (".byte", format!("{w:#04x}")),
                     _ => (d.mnemonic, d.operands),
                 };
                 let _ = write!(out, "{pc:8x}:");
@@ -272,13 +302,13 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
                     }
                 }
                 out.push('\n');
-                regs.update(&inst, pc);
+                regs.update(&inst, w, pc32);
 
                 let next = (off + size) as u32;
                 while let Some(r) = relocs.next_if(|r| r.offset < next) {
                     let _ = writeln!(out, "{}", r.text);
                 }
-                pc += size as u32;
+                pc += size as u64;
             }
         }
     }
