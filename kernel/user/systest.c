@@ -275,7 +275,7 @@ static void test_simple_calls(void) {
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(24, 0, 0, 0), -ENOSYS, "call 24");
+    check_eq(syscall(27, 0, 0, 0), -ENOSYS, "call 27");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
 }
 
@@ -793,6 +793,19 @@ static void test_procs_and_kill(void) {
     check_eq(state_of(grandchild), -1, "the orphan ends");
 }
 
+/* The network's calls on a machine without a card (the tests run systest
+ * on one): -ENODEV, after the pointer checks. kernel_net.rs in
+ * crates/grail tests them with cards. */
+static void test_network_without_a_card(void) {
+    struct netinfo info;
+    struct ping_reply reply;
+    check_eq(netinfo(&info), -ENODEV, "netinfo without a card");
+    check_eq(netinfo((struct netinfo *)0), -EFAULT, "netinfo at address 0");
+    check_eq(netconf(0x0a00020f, 0xffffff00, 0), -ENODEV, "netconf without a card");
+    check_eq(ping(0x7f000001, 1, &reply), -ENODEV, "ping without a card");
+    check_eq(ping(0x7f000001, 1, (struct ping_reply *)0), -EFAULT, "ping to address 0");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) {
         return child(argc, argv);
@@ -805,6 +818,7 @@ int main(int argc, char **argv) {
     test_pipes();
     test_exec();
     test_procs_and_kill();
+    test_network_without_a_card();
     printf("systest: %d checks, %d failed\n", checks, failures);
     return failures;
 }

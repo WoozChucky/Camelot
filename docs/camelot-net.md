@@ -331,15 +331,17 @@ switch are on one Ethernet: give them static addresses on one subnet with
 ## Tests
 
 `crates/grail/tests/kernel_net.rs` runs the committed kernel in-process on
-Grail's cards, by step counts, so everything but the forwarded port is
-deterministic:
+Grail's cards, by step counts, so what the kernel does is deterministic:
 
 - `--net user`: the boot lines, the DHCP lease (10.0.2.15), `ping 10.0.2.2`,
   loopback (127.0.0.1 and 10.0.2.15) and no counter but traffic; the same
   through `grail --net user` on the command line;
 - UDP end to end: a host socket sends to a forwarded port, the gateway (which
   checks every checksum) passes it to the echo service, and the echo comes
-  back;
+  back. The gateway runs on a clock driven by the machine's steps, not the
+  wall clock; the two hops through host sockets are bounded waits (the
+  datagram is in the gateway's queue before the machine runs on, and the
+  echo has been handed to the host before the test reads it), never sleeps;
 - two kernels on a hub: one with a patched static configuration, the other
   falling back from DHCP and then given its address with `ifconfig`; they
   ping each other, and a ping off the subnet has no route;

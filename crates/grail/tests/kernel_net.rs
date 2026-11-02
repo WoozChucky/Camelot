@@ -11,14 +11,16 @@
 //!   counted, never a panic, and the stack still answers afterwards; ARP gives up on an
 //!   address nobody has.
 //!
-//! The machines run in this thread, in turns of a few thousand steps, so everything but
-//! the forwarded port (real host sockets) is deterministic: time is Grail's steps.
+//! The machines run in this thread, in turns of a few thousand steps, so what they do is
+//! deterministic: time is Grail's steps, the forwarded port's gateway included. Only
+//! that test goes through real host sockets, and its waits for them are bounded.
 
-use grail::net::{Hub, HubPort, MacAddr, NetBackend};
+use grail::net::{Hub, HubPort, MacAddr, NetBackend, POLL_STEPS};
 use grail::{Machine, MachineConfig, NetConfig, RunResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// 16 MiB boots faster than the default 128 (the kernel puts every page on its free
@@ -539,45 +541,131 @@ fn grail_net_user_boots_camelot_onto_the_network() {
     );
 }
 
+/// A [`gateway::Gateway`] on a clock of its own rather than the wall clock: each poll of
+/// the card moves it on by the time [`POLL_STEPS`] take at 10 MHz, so when it services
+/// its host sockets (and every timer it has) follows the machine's steps. The test keeps
+/// a handle to it to wait for the host's datagram and to see what the machine sends.
+#[derive(Clone)]
+struct SteppedGateway(Arc<Mutex<Stepped>>);
+
+struct Stepped {
+    gw: gateway::Gateway,
+    now: Instant,
+    /// Frames for the machine taken from the gateway by [`SteppedGateway::wait_for_host`].
+    early: VecDeque<Vec<u8>>,
+    /// Every frame the machine sent.
+    from_guest: Vec<Vec<u8>>,
+}
+
+/// The time one poll of the card stands for: [`POLL_STEPS`] steps at 10 MHz.
+const POLL_TIME: Duration = Duration::from_nanos(POLL_STEPS as u64 * 100);
+
+impl SteppedGateway {
+    fn new(gw: gateway::Gateway) -> SteppedGateway {
+        SteppedGateway(Arc::new(Mutex::new(Stepped {
+            gw,
+            now: Instant::now(),
+            early: VecDeque::new(),
+            from_guest: Vec::new(),
+        })))
+    }
+
+    /// Services the gateway's host sockets, with the machine stopped, until what a host
+    /// program sent has reached them and become a frame for the machine. Only the
+    /// host's own loopback delivery is left to the wall clock here, and it is bounded.
+    fn wait_for_host(&self) {
+        let start = Instant::now();
+        loop {
+            let mut s = self.0.lock().unwrap();
+            // Past the service interval, so each call reads the sockets.
+            s.now += Duration::from_millis(1);
+            let now = s.now;
+            if let Some(frame) = s.gw.recv_at(now) {
+                s.early.push_back(frame);
+                return;
+            }
+            drop(s);
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "the datagram never reached the gateway"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn from_guest(&self) -> Vec<Vec<u8>> {
+        self.0.lock().unwrap().from_guest.clone()
+    }
+}
+
+impl NetBackend for SteppedGateway {
+    fn send(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        let mut s = self.0.lock().unwrap();
+        s.from_guest.push(frame.to_vec());
+        let now = s.now;
+        s.gw.send_at(frame, now);
+        Ok(())
+    }
+
+    fn recv(&mut self) -> Option<Vec<u8>> {
+        let mut s = self.0.lock().unwrap();
+        s.now += POLL_TIME;
+        let now = s.now;
+        match s.early.pop_front() {
+            Some(frame) => Some(frame),
+            None => s.gw.recv_at(now),
+        }
+    }
+}
+
 #[test]
 fn the_udp_echo_service_answers_through_a_forwarded_port() {
     // UDP end to end through the gateway, which checks every checksum: a host program
     // sends to a forwarded port, the gateway passes the datagram to the kernel's echo
     // service on port 7, and the answer comes back the same way.
+    //
+    // The gateway runs on the machine's steps (SteppedGateway), so the machine's side
+    // is deterministic. The two hops through host sockets are bounded instead: the
+    // datagram is in the gateway's frame queue before the machine runs again, and the
+    // machine's answer is handed to the host (a synchronous send) before this waits
+    // for it, with a read timeout.
     let gw = gateway::Gateway::new(gateway::Config {
         hostfwd: vec![gateway::HostFwd::udp(0, 7)],
         ..gateway::Config::default()
     })
     .unwrap();
     let forwarded = gw.hostfwd()[0].host;
+    let gw = SteppedGateway::new(gw);
     let cards: Vec<(MacAddr, Box<dyn NetBackend>)> =
-        vec![(MacAddr(gateway::DEFAULT_GUEST_MAC), Box::new(gw))];
+        vec![(MacAddr(gateway::DEFAULT_GUEST_MAC), Box::new(gw.clone()))];
     let mut vm = Vm::new(Vec::new(), cards, &[]);
     boot(&mut [&mut vm], None);
     assert!(vm.out().contains("net: 10.0.2.15/24"), "{}", vm.out());
 
     let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    sock.set_nonblocking(true).unwrap();
     sock.send_to(b"Hello, echo service!", forwarded).unwrap();
-    // The gateway services host sockets on the wall clock, so this waits by it, with a
-    // deadline rather than a sleep.
-    let start = Instant::now();
-    let mut buf = [0u8; 64];
-    let n = loop {
-        vm.m.run_for(100_000, &mut |_| {});
-        match sock.recv(&mut buf) {
-            Ok(n) => break n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(
-                    start.elapsed() < Duration::from_secs(30),
-                    "no echo:\n{}",
-                    vm.out()
-                );
-            }
-            Err(e) => panic!("{e}"),
-        }
+    gw.wait_for_host();
+
+    // The echo, from 10.0.2.15 port 7, is what the machine sends next.
+    let is_echo = |f: &Vec<u8>| {
+        parse_ipv4(f).is_some_and(|p| p.src == [10, 0, 2, 15] && p.proto == 17 && p.payload[..2] == [0, 7])
     };
-    assert_eq!(&buf[..n], b"Hello, echo service!");
+    let sent = gw.from_guest().len();
+    let mut steps = 0;
+    while !gw.from_guest()[sent..].iter().any(is_echo) {
+        vm.m.run_for(SLICE, &mut |_| {});
+        assert_eq!(vm.m.exit_code(), None, "the kernel stopped:\n{}", vm.out());
+        steps += SLICE;
+        assert!(steps < 10_000_000, "no echo from the kernel:\n{}", vm.out());
+    }
+    sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut buf = [0u8; 64];
+    let (n, from) = sock.recv_from(&mut buf).unwrap();
+    assert_eq!(
+        (&buf[..n], from),
+        (&b"Hello, echo service!"[..], forwarded.into())
+    );
+
     let ifconfig = command(&mut [&mut vm], 0, None, "ifconfig");
     assert!(counters(&ifconfig).values().all(|&n| n == 0), "{ifconfig}");
     exit(&mut vm);
