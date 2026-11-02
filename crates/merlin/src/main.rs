@@ -7,7 +7,21 @@ const USAGE: &str = "usage: merlin [-o output.s] [--dump-ast] input.c
   -o FILE     output assembly (default: input with .s extension)
   --dump-ast  print the checked syntax tree to stdout instead of compiling";
 
+/// The compiler recurses once per nesting level (at most
+/// [`merlin::parser::MAX_DEPTH`]). Unoptimized builds use several KiB per level,
+/// more than the main thread's 1 MiB on Windows, so run on a thread with room.
+const STACK_SIZE: usize = 64 << 20;
+
 fn main() -> ExitCode {
+    std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(run)
+        .expect("cannot start the compiler thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+fn run() -> ExitCode {
     let mut input = None;
     let mut output = None;
     let mut dump_ast = false;

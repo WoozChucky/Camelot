@@ -438,6 +438,11 @@ mod tests {
             err("int f() { return 0; }\nint f() { return 1; }"),
             "2:5: redefinition of 'f'"
         );
+        // A prototype first: the first definition must still count.
+        assert_eq!(
+            err("int f();\nint f() { return 0; }\nint f() { return 1; }"),
+            "3:5: redefinition of 'f'"
+        );
         assert_eq!(
             err("int f(int a);\nint f(int a, int b) { return a; }"),
             "2:5: conflicting types for 'f': declared at 1:5 with 1 parameter, here with 2"

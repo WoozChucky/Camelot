@@ -4,6 +4,11 @@
 //! `// expect: N`: the exit code it must produce (main's return value, low 8
 //! bits). To add a test, drop a new `.c` file in `tests/cases/`.
 //!
+//! `tests/cases-merlin/*.c` are the same kind of program, but they rely on how
+//! merlin defines what C leaves undefined (spec section 10: wrapping overflow,
+//! division by zero, `INT_MIN / -1`, falling off the end of a function). Every
+//! test below runs them except `clang_reference`, since clang may disagree.
+//!
 //! Run now, without any external tools:
 //!
 //! * `cases_are_well_formed`: every case has an expectation and passes the
@@ -48,14 +53,26 @@ fn tests_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")
 }
 
-fn cases() -> Vec<Case> {
-    let dir = tests_dir().join("cases");
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|x| x == "c"))
-        .collect();
-    paths.sort();
+/// Plain C99 programs: clang must agree with their expectations.
+const C99_CASES: &str = "cases";
+/// Programs relying on how merlin defines what C leaves undefined (spec section
+/// 10): wrapping overflow, division by zero, falling off the end of a function.
+/// clang_reference skips them.
+const MERLIN_CASES: &str = "cases-merlin";
+const ALL_CASES: &[&str] = &[C99_CASES, MERLIN_CASES];
+
+fn cases(dirs: &[&str]) -> Vec<Case> {
+    let mut paths = Vec::new();
+    for dir in dirs {
+        let dir = tests_dir().join(dir);
+        let mut in_dir: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "c"))
+            .collect();
+        in_dir.sort();
+        paths.extend(in_dir);
+    }
     paths
         .into_iter()
         .map(|path| {
@@ -78,8 +95,8 @@ fn cases() -> Vec<Case> {
 }
 
 /// Runs `check` on every case, prints a summary, and fails listing every mismatch.
-fn for_each_case(what: &str, mut check: impl FnMut(&Case) -> Result<u8, String>) {
-    let cases = cases();
+fn for_each_case(what: &str, dirs: &[&str], mut check: impl FnMut(&Case) -> Result<u8, String>) {
+    let cases = cases(dirs);
     let mut failures = Vec::new();
     for c in &cases {
         match check(c) {
@@ -113,9 +130,11 @@ fn render(errors: &[merlin::Error], case: &Case) -> String {
 
 #[test]
 fn cases_are_well_formed() {
-    let cases = cases();
-    assert!(cases.len() >= 20, "only {} cases", cases.len());
-    for_each_case("front end", |c| {
+    let n = cases(&[C99_CASES]).len();
+    assert!(n >= 20, "only {n} C99 cases");
+    let n = cases(&[MERLIN_CASES]).len();
+    assert!(n >= 4, "only {n} cases for merlin's defined behavior");
+    for_each_case("front end", ALL_CASES, |c| {
         let prog = merlin::parse(&c.src).map_err(|e| render(&e, c))?;
         if !prog.funcs.iter().any(|f| f.name == "main" && f.body.is_some()) {
             return Err("no main".into());
@@ -126,7 +145,7 @@ fn cases_are_well_formed() {
 
 #[test]
 fn cases_match_reference_interpreter() {
-    for_each_case("reference interpreter", |c| {
+    for_each_case("reference interpreter", ALL_CASES, |c| {
         let prog = merlin::parse(&c.src).map_err(|e| render(&e, c))?;
         interp::run(&prog, "main").map(|v| v as u8)
     });
@@ -144,7 +163,10 @@ fn reference_interpreter_semantics() {
     assert_eq!(eval("return (-2147483647 - 1) % -1;"), 0);
     assert_eq!(eval("return 7 / id(0);"), -1);
     assert_eq!(eval("return 7 % id(0);"), 7);
-    assert_eq!(eval("return 0xffffffff;"), -1);
+    assert_eq!(eval("return 0x7fffffff + 1;"), i32::MIN);
+    // Literals that would be `unsigned int` or `long long` in C are rejected.
+    assert!(merlin::parse("int main() { return 0xffffffff; }").is_err());
+    assert!(merlin::parse("int main() { return 2147483648; }").is_err());
     assert_eq!(eval("return 3 == 3;"), 1);
     assert_eq!(eval("return !7 || 5 && 9;"), 1);
     assert_eq!(eval("int x = 1; x = 5;"), 0, "falling off the end returns 0");
@@ -315,7 +337,7 @@ fn cases_run_in_grail() {
     let crt0 = backend
         .assemble(&backend.crt0(), &scratch.path("crt0.o"))
         .expect("assembling crt0.s");
-    for_each_case("merlin pipeline", |c| {
+    for_each_case("merlin pipeline", ALL_CASES, |c| {
         let asm = merlin::compile(&c.src).map_err(|e| render(&e, c))?;
         let obj = backend.assemble(&asm, &scratch.path(&format!("{}.o", c.name)))?;
         let elf = backend.link(&[crt0.clone(), obj], &scratch.path(&format!("{}.elf", c.name)))?;
@@ -332,7 +354,7 @@ fn clang_reference() {
     std::fs::write(&crt0_s, crt0_for_llvm(&crt0)).unwrap();
     let crt0_o = scratch.path("crt0.o");
     tool(clang().arg(&crt0_s).arg("-o").arg(&crt0_o)).expect("assembling crt0.s with clang");
-    for_each_case("clang reference", |c| {
+    for_each_case("clang reference", &[C99_CASES], |c| {
         let obj = scratch.path(&format!("{}.o", c.name));
         tool(
             clang()

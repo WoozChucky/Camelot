@@ -131,6 +131,47 @@ fn errors_use_file_line_col_format() {
 }
 
 #[test]
+fn deep_nesting_is_an_error_not_a_crash() {
+    let limit = merlin::parser::MAX_DEPTH;
+    // `return` and its expression take two levels, each `(` one more, so the
+    // error points just past the 255th `(` (the first is at column 21).
+    let parens = |n: usize| format!("int main() {{ return {}1{}; }}\n", "(".repeat(n), ")".repeat(n));
+    let blocks = |n: usize| format!("int main() {{ {}{} return 0; }}\n", "{".repeat(n), "}".repeat(n));
+    // At the limit, the whole pipeline (parser, sema, AST printer) still copes.
+    for (name, src) in [("parens.c", parens(limit - 2)), ("blocks.c", blocks(limit))] {
+        let t = TempSrc::new("deep-ok", name, &src);
+        let out = merlin(&[Path::new("--dump-ast"), &t.file]);
+        assert!(out.status.success(), "{name}: {}", stderr(&out));
+    }
+    for (name, src, col) in [
+        ("parens.c", parens(100_000), 21 + limit - 1),
+        ("blocks.c", blocks(100_000), 14 + limit),
+        (
+            "minus.c",
+            format!("int main() {{ return {}1; }}\n", "- ".repeat(100_000)),
+            0,
+        ),
+    ] {
+        let t = TempSrc::new("deep", name, &src);
+        for args in [vec![Path::new("--dump-ast"), &t.file], vec![&*t.file]] {
+            let out = merlin(&args);
+            assert_eq!(out.status.code(), Some(1), "{name}: {}", stderr(&out));
+            let err = stderr(&out);
+            let file = t.file.display().to_string();
+            let msg = format!("error: nesting too deep: merlin allows at most {limit} levels\n");
+            if col > 0 {
+                assert_eq!(err, format!("{file}:1:{col}: {msg}"));
+            } else {
+                assert!(
+                    err.starts_with(&format!("{file}:1:")) && err.ends_with(&msg),
+                    "{err}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn every_semantic_error_is_reported() {
     let t = TempSrc::new(
         "sema",

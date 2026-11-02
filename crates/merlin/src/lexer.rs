@@ -4,6 +4,7 @@
 //! line is an error.
 
 use crate::{Error, Pos};
+use std::num::IntErrorKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kw {
@@ -63,10 +64,21 @@ const PUNCTS: &[&str] = &[
     "!",
 ];
 
+/// C punctuators merlin doesn't handle yet that start with a supported one. They
+/// are matched first, as C's longest-match rule demands: otherwise `--x` would
+/// lex as `- -x` and mean something else than in C, and `a--b` would be accepted.
+const UNSUPPORTED_PUNCTS: &[&str] = &[
+    "++", "--", "+=", "-=", "*=", "/=", "%=", "->", "<<", ">>", "&=", "|=", "^=",
+];
+
+/// The largest literal merlin accepts. C gives bigger literals type `unsigned
+/// int` or `long long`, which merlin doesn't have yet.
+pub const MAX_LITERAL: u64 = i32::MAX as u64;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Tok {
     Ident(String),
-    /// An integer literal. Its `int` value is the low 32 bits.
+    /// An integer literal, at most [`MAX_LITERAL`], so it is an `int` as in C.
     Int(i64),
     Kw(Kw),
     Punct(&'static str),
@@ -93,6 +105,18 @@ pub struct Token {
     pub pos: Pos,
     /// Position just past the last character (where a missing `;` belongs).
     pub end: Pos,
+    /// The token as written in the source.
+    pub text: String,
+}
+
+impl Token {
+    /// How the token reads in an error message: as written, so `0x7f` stays `0x7f`.
+    pub fn describe(&self) -> String {
+        match self.tok {
+            Tok::Int(_) => format!("'{}'", self.text),
+            _ => self.tok.describe(),
+        }
+    }
 }
 
 struct Lexer {
@@ -105,6 +129,11 @@ struct Lexer {
 impl Lexer {
     fn peek(&self, n: usize) -> Option<char> {
         self.chars.get(self.i + n).copied()
+    }
+
+    /// Whether the input continues with `s`.
+    fn at(&self, s: &str) -> bool {
+        s.chars().enumerate().all(|(k, c)| self.peek(k) == Some(c))
     }
 
     fn pos(&self) -> Pos {
@@ -177,12 +206,18 @@ impl Lexer {
         } else {
             lower.parse::<u64>()
         };
-        match parsed {
-            Ok(v) if v <= u32::MAX as u64 => Ok(Tok::Int(v as i64)),
-            Ok(_) => Err(Error::new(
+        let too_large = || {
+            Error::new(
                 pos,
-                format!("integer literal '{text}' is too large for int"),
-            )),
+                format!(
+                    "integer literal '{text}' is too large for int (unsigned and long are not supported yet)"
+                ),
+            )
+        };
+        match parsed {
+            Ok(v) if v <= MAX_LITERAL => Ok(Tok::Int(v as i64)),
+            Ok(_) => Err(too_large()),
+            Err(e) if *e.kind() == IntErrorKind::PosOverflow => Err(too_large()),
             Err(_) if lower.ends_with(['u', 'l']) && text.starts_with(|c: char| c.is_ascii_digit()) => Err(
                 Error::new(pos, format!("integer suffixes are not supported yet: '{text}'")),
             ),
@@ -207,9 +242,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 tok: Tok::Eof,
                 pos,
                 end: pos,
+                text: String::new(),
             });
             return Ok(out);
         };
+        let start = lx.i;
         let tok = if c.is_ascii_digit() {
             lx.number(pos)?
         } else if c.is_ascii_alphabetic() || c == '_' {
@@ -221,10 +258,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
             } else {
                 Tok::Ident(word)
             }
-        } else if let Some(p) = PUNCTS
-            .iter()
-            .find(|p| p.chars().enumerate().all(|(k, pc)| lx.peek(k) == Some(pc)))
-        {
+        } else if let Some(p) = UNSUPPORTED_PUNCTS.iter().find(|p| lx.at(p)) {
+            return Err(Error::new(pos, format!("'{p}' is not supported yet")));
+        } else if let Some(p) = PUNCTS.iter().find(|p| lx.at(p)) {
             for _ in 0..p.len() {
                 lx.bump();
             }
@@ -238,6 +274,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
             tok,
             pos,
             end: lx.pos(),
+            text: lx.chars[start..lx.i].iter().collect(),
         });
     }
 }
@@ -323,24 +360,81 @@ mod tests {
     #[test]
     fn numbers() {
         assert_eq!(
-            toks("0 42 0x2A 0X2a 052 4294967295"),
+            toks("0 42 0x2A 0X2a 052 2147483647 0x7FFFFFFF 017777777777"),
             vec![
                 Tok::Int(0),
                 Tok::Int(42),
                 Tok::Int(42),
                 Tok::Int(42),
                 Tok::Int(42),
-                Tok::Int(0xffff_ffff),
+                Tok::Int(0x7fff_ffff),
+                Tok::Int(0x7fff_ffff),
+                Tok::Int(0x7fff_ffff),
                 Tok::Eof
             ]
         );
-        assert_eq!(
-            err("4294967296"),
-            "1:1: integer literal '4294967296' is too large for int"
-        );
+        // In C these are `long long` (decimal) or `unsigned int` (hex, octal), not
+        // `int`, so they would compare and divide differently.
+        let too_large = |lit: &str| {
+            format!(
+                "1:1: integer literal '{lit}' is too large for int (unsigned and long are not supported yet)"
+            )
+        };
+        for lit in [
+            "2147483648",
+            "0x80000000",
+            "020000000000",
+            "4294967295",
+            "0xFFFFFFFF",
+            "4294967296",
+            "99999999999999999999",
+            "0x10000000000000000",
+        ] {
+            assert_eq!(err(lit), too_large(lit));
+        }
         assert_eq!(err("x = 09;"), "1:5: invalid integer literal '09'");
         assert_eq!(err("12abc"), "1:1: invalid integer literal '12abc'");
         assert_eq!(err("10u"), "1:1: integer suffixes are not supported yet: '10u'");
+    }
+
+    #[test]
+    fn unsupported_punctuators_are_not_split() {
+        // C lexes the longest punctuator, so `--x` is a decrement, not `-(-x)`, and
+        // `a--b` is a syntax error. Splitting them would change what a program means.
+        assert_eq!(err("--x"), "1:1: '--' is not supported yet");
+        assert_eq!(err("x--;"), "1:2: '--' is not supported yet");
+        assert_eq!(err("a--b"), "1:2: '--' is not supported yet");
+        assert_eq!(err("a ++b"), "1:3: '++' is not supported yet");
+        for p in UNSUPPORTED_PUNCTS {
+            assert_eq!(
+                err(&format!("a {p} b")),
+                format!("1:3: '{p}' is not supported yet")
+            );
+        }
+        // With a space they are two tokens, in C too.
+        assert_eq!(
+            toks("- -x"),
+            vec![Tok::Punct("-"), Tok::Punct("-"), Tok::Ident("x".into()), Tok::Eof]
+        );
+        assert_eq!(
+            toks("a=-b"),
+            vec![
+                Tok::Ident("a".into()),
+                Tok::Punct("="),
+                Tok::Punct("-"),
+                Tok::Ident("b".into()),
+                Tok::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn tokens_keep_their_source_text() {
+        let t = lex("0x7f 017 x1 <=").unwrap();
+        let text: Vec<&str> = t.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(text, ["0x7f", "017", "x1", "<=", ""]);
+        assert_eq!(t[0].describe(), "'0x7f'");
+        assert_eq!(t[2].describe(), "identifier 'x1'");
     }
 
     #[test]

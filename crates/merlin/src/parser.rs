@@ -30,8 +30,21 @@ use crate::{Error, Pos};
 /// Arguments travel in `a0-a7`; no stack-passed arguments in v0.
 pub const MAX_PARAMS: usize = 8;
 
+/// How deeply statements and expressions may nest. Each nested statement, `=`,
+/// unary operator, parenthesized expression or call argument is a level, and so
+/// is each operator in a chain like `a + b + c` (the tree leans left). The parser,
+/// sema and the AST printer recurse once per level, so the limit turns runaway
+/// input into an error instead of a stack overflow (given a few MiB of stack in
+/// unoptimized builds: the merlin binary runs on a 64 MiB thread). clang's
+/// bracket limit is also 256.
+pub const MAX_DEPTH: usize = 256;
+
 pub fn parse(toks: &[Token]) -> Result<Program, Error> {
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        depth: 0,
+    };
     let mut funcs = Vec::new();
     while *p.peek() != Tok::Eof {
         funcs.push(p.function()?);
@@ -62,9 +75,31 @@ fn binop(t: &Tok) -> Option<(BinOp, u8)> {
 struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
+    /// Current nesting level; see [`MAX_DEPTH`].
+    depth: usize,
 }
 
 impl Parser<'_> {
+    /// Goes one nesting level deeper, or fails at the current token.
+    fn enter(&mut self) -> Result<(), Error> {
+        if self.depth == MAX_DEPTH {
+            return Err(Error::new(
+                self.here(),
+                format!("nesting too deep: merlin allows at most {MAX_DEPTH} levels"),
+            ));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    /// Runs `f` one nesting level deeper.
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        self.enter()?;
+        let r = f(self);
+        self.depth -= 1;
+        r
+    }
+
     fn tok(&self) -> &Token {
         &self.toks[self.pos.min(self.toks.len() - 1)]
     }
@@ -121,7 +156,7 @@ impl Parser<'_> {
     fn unexpected(&self, what: &str) -> Error {
         Error::new(
             self.here(),
-            format!("expected {what}, found {}", self.peek().describe()),
+            format!("expected {what}, found {}", self.tok().describe()),
         )
     }
 
@@ -272,6 +307,10 @@ impl Parser<'_> {
     }
 
     fn stmt(&mut self) -> Result<Stmt, Error> {
+        self.nested(Self::stmt_inner)
+    }
+
+    fn stmt_inner(&mut self) -> Result<Stmt, Error> {
         let pos = self.here();
         let kind = match self.peek().clone() {
             Tok::Punct("{") => StmtKind::Block(self.block_body()?),
@@ -377,6 +416,10 @@ impl Parser<'_> {
     }
 
     fn assign(&mut self) -> Result<Expr, Error> {
+        self.nested(Self::assign_inner)
+    }
+
+    fn assign_inner(&mut self) -> Result<Expr, Error> {
         let lhs = self.binary(1)?;
         if self.is_punct("=") {
             let pos = self.advance().pos;
@@ -392,10 +435,13 @@ impl Parser<'_> {
     /// Precedence climbing: parses operators binding at least as tightly as `min`.
     fn binary(&mut self, min: u8) -> Result<Expr, Error> {
         let mut lhs = self.unary()?;
+        let outer = self.depth;
         while let Some((op, prec)) = binop(self.peek()) {
             if prec < min {
                 break;
             }
+            // Each operator puts everything parsed so far one level deeper.
+            self.enter()?;
             let pos = self.advance().pos;
             let rhs = self.binary(prec + 1)?;
             lhs = Expr {
@@ -403,6 +449,7 @@ impl Parser<'_> {
                 pos,
             };
         }
+        self.depth = outer;
         Ok(lhs)
     }
 
@@ -413,7 +460,7 @@ impl Parser<'_> {
             _ => return self.primary(),
         };
         let pos = self.advance().pos;
-        let x = self.unary()?;
+        let x = self.nested(Self::unary)?;
         Ok(Expr {
             kind: ExprKind::Unary(op, Box::new(x)),
             pos,
@@ -723,6 +770,74 @@ mod tests {
     }
 
     #[test]
+    fn decrement_is_not_double_negation() {
+        // In C `--x` decrements and `a--b` doesn't parse; neither may become `- -`.
+        let front = |s: &str| {
+            crate::parse(&format!("int f(int a, int b, int x) {{ {s} }}")).unwrap_err()[0].to_string()
+        };
+        assert_eq!(front("--x; return x;"), "1:30: '--' is not supported yet");
+        assert_eq!(front("x--; return x;"), "1:31: '--' is not supported yet");
+        assert_eq!(front("return a--b;"), "1:38: '--' is not supported yet");
+        assert_eq!(front("return ++x;"), "1:37: '++' is not supported yet");
+        assert_eq!(front("x -= 1; return x;"), "1:32: '-=' is not supported yet");
+    }
+
+    /// `n` copies of `open`, then `inner`, then `n` copies of `close`.
+    fn nest(n: usize, open: &str, inner: &str, close: &str) -> String {
+        format!("{}{inner}{}", open.repeat(n), close.repeat(n))
+    }
+
+    #[test]
+    fn nesting_limit() {
+        // Unoptimized, 256 levels need more than a test thread's 2 MiB of stack (the
+        // merlin binary runs on a big stack for the same reason).
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(nesting_limit_checks)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn nesting_limit_checks() {
+        let deep = |n: usize| format!("int f() {{ {} }}", nest(n, "{", "", "}"));
+        // `int f() { ` is 10 characters, so the 257th `{` is at column 267.
+        assert!(parse(&lex(&deep(MAX_DEPTH)).unwrap()).is_ok());
+        assert_eq!(
+            err(&deep(MAX_DEPTH + 1)),
+            "1:267: nesting too deep: merlin allows at most 256 levels"
+        );
+        let limit = |src: &str| {
+            let e = err(src);
+            assert!(
+                e.ends_with("nesting too deep: merlin allows at most 256 levels"),
+                "{e}"
+            );
+        };
+        // A return statement and its expression take two levels.
+        let ret = |e: &str| format!("int f(int x) {{ return {e}; }}");
+        assert!(parse(&lex(&ret(&nest(MAX_DEPTH - 2, "(", "1", ")"))).unwrap()).is_ok());
+        limit(&ret(&nest(MAX_DEPTH - 1, "(", "1", ")")));
+        limit(&ret(&nest(100_000, "(", "1", ")")));
+        limit(&ret(&nest(100_000, "- ", "1", "")));
+        limit(&ret(&nest(100_000, "!", "1", "")));
+        limit(&ret(&nest(100_000, "x = ", "1", "")));
+        limit(&ret(&nest(100_000, "f(", "1", ")")));
+        limit(&ret(&nest(100_000, "1 + ", "1", "")));
+        limit(&ret(&nest(100_000, "", "1", " * 1")));
+        limit(&format!("int f() {{ {} }}", nest(100_000, "if (1) ", ";", "")));
+        limit(&format!("int f() {{ {} }}", nest(100_000, "while (1) ", ";", "")));
+        limit(&format!(
+            "int f() {{ {} return 0; }}",
+            nest(100_000, "if (1) ; else ", ";", "")
+        ));
+        // Long but shallow is fine: a block's statements and a call's arguments are lists.
+        assert_eq!(body(&"x = 1; ".repeat(100_000)).len(), 100_000);
+        let args = vec!["1"; 100_000].join(", ");
+        assert!(parse(&lex(&ret(&format!("f({args})"))).unwrap()).is_ok());
+    }
+
+    #[test]
     fn expression_positions() {
         let StmtKind::Expr(e) = stmt("x = a + -b;").kind else {
             panic!()
@@ -786,6 +901,11 @@ mod tests {
         assert_eq!(
             err("int f() { f(1 2); }"),
             "1:15: expected ',' or ')' in the argument list, found '2'"
+        );
+        // Literals are quoted as written.
+        assert_eq!(
+            err("int f() { f(1 0x7f); }"),
+            "1:15: expected ',' or ')' in the argument list, found '0x7f'"
         );
         assert_eq!(
             err("int f(int a b) {}"),

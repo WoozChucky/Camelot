@@ -153,7 +153,7 @@ pub struct Expr {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExprKind {
-    /// Integer literal; the `int` value is the low 32 bits.
+    /// Integer literal, 0 to `i32::MAX` (the lexer rejects larger ones).
     Num(i64),
     Var {
         name: String,
