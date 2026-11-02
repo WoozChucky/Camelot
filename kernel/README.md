@@ -22,6 +22,13 @@ cargo run --release -p grail -- --clock 10MHz kernel/kernel.elf    # ticks in re
 ```
 
 ```
+
+    ____      _      __  __   _____   _        ___    _____
+   / ___|    / \    |  \/  | | ____| | |      / _ \  |_   _|
+  | |       / _ \   | |\/| | |  _|   | |     | | | |   | |
+  | |___   / ___ \  | |  | | | |___  | |___  | |_| |   | |
+   \____| /_/   \_\ |_|  |_| |_____| |_____|  \___/    |_|
+
 Camelot v0.1.0 booting...
 kprintf: d=-42 u=4294967295 x=cafef00d p=0x80000000 s=excalibur c=K %=%
 kprintf self-test: 26/26 passed
