@@ -623,7 +623,13 @@ mod tests {
     fn usage_descriptions_line_up() {
         // Every task's description, and every continuation line, starts in
         // the same column.
-        let tasks = USAGE.split("tasks:\n").nth(1).unwrap().split("\n\n").next().unwrap();
+        let tasks = USAGE
+            .split("tasks:\n")
+            .nth(1)
+            .unwrap()
+            .split("\n\n")
+            .next()
+            .unwrap();
         for line in tasks.lines() {
             // A task's line: its name, then the description.
             let rest = match line.strip_prefix("  ") {

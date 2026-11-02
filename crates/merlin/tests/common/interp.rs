@@ -182,6 +182,9 @@ enum Target {
     Label(String),
 }
 
+/// What every byte of a fresh local holds (see `Interp::alloc_frame`).
+pub const POISON: u8 = 0xa5;
+
 impl<'a> Interp<'a> {
     /// Reserves memory for an object of type `ty` at `*top`, zeroed.
     fn alloc_at(mem: &mut [u8], top: &mut u32, limit: u32, ty: &Type) -> u32 {
@@ -199,9 +202,15 @@ impl<'a> Interp<'a> {
         Self::alloc_at(&mut self.mem, &mut self.data_top, FRAMES_START, ty)
     }
 
-    /// Memory for a local, until its call returns.
+    /// Memory for a local, until its call returns. A local declared without
+    /// an initializer is indeterminate in C, and the generated code leaves
+    /// whatever the stack held, so it starts filled with [`POISON`] rather
+    /// than zeros: a case that reads one gets a value no expectation is
+    /// likely to match, rather than a 0 that passes here and not in Grail.
     fn alloc_frame(&mut self, ty: &Type) -> u32 {
-        Self::alloc_at(&mut self.mem, &mut self.top, MEMORY as u32, ty)
+        let addr = Self::alloc_at(&mut self.mem, &mut self.top, MEMORY as u32, ty);
+        self.mem[addr as usize..(addr + size_of(ty)) as usize].fill(POISON);
+        addr
     }
 
     fn check(&self, addr: u32, size: u32) -> Result<usize, String> {
@@ -327,7 +336,7 @@ impl<'a> Interp<'a> {
         if self.depth == MAX_DEPTH {
             return Err(format!("recursion deeper than {MAX_DEPTH} calls"));
         }
-        // A fresh frame: every local gets its own (zeroed) object.
+        // A fresh frame: every local gets its own (poisoned) object.
         let saved_top = self.top;
         let mut frame: Vec<u32> = f.locals.iter().map(|l| self.alloc_frame(&l.ty)).collect();
         let named = f.params.len();
