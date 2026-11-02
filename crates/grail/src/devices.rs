@@ -67,6 +67,9 @@ pub const KBD_IRQ: u32 = 2;
 /// PLIC interrupt source of disk 0's completion line; disk `i` uses `BLK_IRQ + i`
 /// (spec section 9.6).
 pub const BLK_IRQ: u32 = 3;
+/// PLIC interrupt source of the pointer's "event available" line (spec section 9.7):
+/// the first one after the disks' (3 to 10).
+pub const PTR_IRQ: u32 = 11;
 
 /// Interrupt sources 1..=31 exist; source 0 means "no interrupt".
 pub const PLIC_SOURCES: u32 = 32;

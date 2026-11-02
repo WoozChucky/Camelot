@@ -11,12 +11,15 @@
 //! * [`ld_fixtures`]: regenerates merlin-ld's test fixtures (clang, ld.lld,
 //!   llvm-readobj).
 //! * [`tools`]: finds the LLVM tools.
+//! * [`userprogs`]: builds the user programs in `kernel/user/` with merlin-as +
+//!   merlin-ld and embeds them in the kernel (`kernel/userprogs.s`).
 
 pub mod examples;
 pub mod hello;
 pub mod kernel;
 pub mod ld_fixtures;
 pub mod tools;
+pub mod userprogs;
 
 use std::path::{Path, PathBuf};
 

@@ -4,7 +4,7 @@
 //! * the committed `examples/<dir>/<name>.elf` files are exactly what the
 //!   current tools build from the sources;
 //! * each freshly built program runs in Grail, with input where it reads some
-//!   (UART bytes, key events, a disk), and prints what it should and exits
+//!   (UART bytes, key events, pointer input, a disk), and prints what it should and exits
 //!   with the right code;
 //! * `hello` and `multiobj` load byte for byte like ld.lld's link of clang's
 //!   objects (the references in `crates/merlin-ld/tests/fixtures`, made by
@@ -15,6 +15,7 @@
 use elf32::{Elf, PT_GNU_STACK, PT_LOAD, PT_RISCV_ATTRIBUTES, SHF_ALLOC, SHT_SYMTAB};
 use grail::block::SECTOR_SIZE;
 use grail::keyboard::{code, KeyEvent};
+use grail::pointer::{PointerInput, BUTTON_LEFT};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,8 @@ struct Scenario {
     stdin: &'static [u8],
     /// Key events waiting in the keyboard FIFO.
     keys: Vec<KeyEvent>,
+    /// Pointer input, given to the pointer device before the keys.
+    pointer: Vec<PointerInput>,
     /// A disk image (relative to the repository root) attached as disk 0, in
     /// memory so the committed file is never written.
     disk: Option<&'static str>,
@@ -62,6 +65,7 @@ fn scenario(name: &str) -> Scenario {
     let plain = |output, exit| Scenario {
         stdin: b"",
         keys: Vec::new(),
+        pointer: Vec::new(),
         disk: None,
         output,
         exit,
@@ -81,7 +85,7 @@ fn scenario(name: &str) -> Scenario {
              RAM      128 MiB at 0x80000000\n\
              CPU      10000000 Hz (nominal)\n\
              timebase 10000000 Hz\n\
-             8 devices:\n  \
+             9 devices:\n  \
              test      0x00100000 + 0x00001000\n  \
              CLINT     0x02000000 + 0x00010000\n  \
              PLIC      0x0c000000 + 0x04000000\n  \
@@ -89,6 +93,7 @@ fn scenario(name: &str) -> Scenario {
              fb-ctrl   0x30000000 + 0x00001000\n  \
              keyboard  0x30001000 + 0x00001000  irq 2\n  \
              sysinfo   0x30002000 + 0x00001000\n  \
+             pointer   0x30003000 + 0x00001000  irq 11\n  \
              fb-vram   0x31000000 + 0x0012c000\n",
             0,
         ),
@@ -123,6 +128,22 @@ fn scenario(name: &str) -> Scenario {
             keys: typed("ok"),
             ..plain("ok[dbg] pc=800000b0 s0 = 0x00000005 (5)\n", 0)
         },
+        // Three pointer events, read in one interrupt (the pointer's priority is
+        // above the keyboard's), then Esc. The cursor is checked in
+        // `examples_run_in_grail`.
+        "pointer" => Scenario {
+            pointer: vec![
+                PointerInput::move_to(50, 60),
+                PointerInput::buttons(BUTTON_LEFT),
+                PointerInput::move_to(120, 90).with_buttons(BUTTON_LEFT),
+            ],
+            keys: vec![KeyEvent::press(code::ESC)],
+            ..plain(
+                "[dbg] pc=8000017c s4 = 0x00000003 (3)
+",
+                0,
+            )
+        },
         other => panic!("no scenario for example {other}: add one"),
     }
 }
@@ -149,6 +170,9 @@ fn run(elf: &[u8], s: &Scenario) -> (RunResult, String, Machine) {
     m.cpu.bus.uart.input = Some(rx);
     for &b in s.stdin {
         tx.send(b).unwrap();
+    }
+    for &p in &s.pointer {
+        assert!(m.pointer_event(p), "pointer FIFO full, or {p:?} changes nothing");
     }
     for &k in &s.keys {
         assert!(m.key_event(k), "keyboard FIFO full");
@@ -227,6 +251,18 @@ fn examples_run_in_grail() {
             assert_eq!(fb.pixel(8, 8), 0xffffff);
             assert_eq!(fb.pixel(631, 471), 0x000000);
         }
+        if ex.name == "pointer" {
+            // The red arrow (left button held) at the last position, on the
+            // background; the first position was erased.
+            let fb = &m.cpu.bus.fb;
+            assert!(fb.enabled());
+            assert_eq!(fb.presents, 2, "the first frame, then one per interrupt");
+            assert_eq!(fb.pixel(120, 90), 0xff0000);
+            assert_eq!(fb.pixel(127, 97), 0xff0000);
+            assert_eq!(fb.pixel(121, 90), 0x203048);
+            assert_eq!(fb.pixel(50, 60), 0x203048);
+            assert_eq!(fb.pixel(0, 0), 0x203048);
+        }
         if let Some(img) = s.disk {
             // The write test put the last sector back as it was.
             let backend = m.cpu.bus.disks[0].backend();
@@ -245,10 +281,11 @@ fn examples_run_in_grail() {
 /// the interactive examples wait forever.
 #[test]
 fn interactive_examples_wait_for_input() {
-    for name in ["uart-echo", "kbd-echo", "kbd-echo-irq"] {
+    for name in ["uart-echo", "kbd-echo", "kbd-echo-irq", "pointer"] {
         let idle = Scenario {
             stdin: b"",
             keys: Vec::new(),
+            pointer: Vec::new(),
             disk: None,
             output: "",
             exit: 0,
@@ -265,6 +302,7 @@ fn disk_example_needs_its_disk() {
     let no_disk = Scenario {
         stdin: b"",
         keys: Vec::new(),
+        pointer: Vec::new(),
         disk: None,
         output: "",
         exit: 1,

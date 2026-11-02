@@ -439,7 +439,7 @@ fn sysinfo_lists_the_disks() {
         .unwrap();
     assert_eq!(m.run(Some(1_000_000), |_| {}), RunResult::Exited(0));
     let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
-    let devices = out.split_once("10 devices:\n").expect(&out).1;
+    let devices = out.split_once("11 devices:\n").expect(&out).1;
     assert_eq!(
         devices,
         "  test      0x00100000 + 0x00001000
@@ -451,6 +451,7 @@ fn sysinfo_lists_the_disks() {
   fb-ctrl   0x30000000 + 0x00001000
   keyboard  0x30001000 + 0x00001000  irq 2
   sysinfo   0x30002000 + 0x00001000
+  pointer   0x30003000 + 0x00001000  irq 11
   fb-vram   0x31000000 + 0x0012c000
 "
     );
@@ -502,7 +503,7 @@ fn cli_disk_flags() {
     ]);
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains("10 devices:\n"), "{stdout}");
+    assert!(stdout.contains("11 devices:\n"), "{stdout}");
     assert!(
         stdout.contains("  block     0x10002000 + 0x00001000  irq 4\n"),
         "{stdout}"
