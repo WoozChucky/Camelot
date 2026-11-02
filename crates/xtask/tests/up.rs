@@ -110,7 +110,7 @@ fn all_answer(platform: &Platform) {
     let mut lake = Client::connect(&platform.lake.to_string(), "test").unwrap();
     assert!(lake.server().starts_with("lake "), "{}", lake.server());
     let disks = lake.list_disks().unwrap();
-    assert!(disks.iter().any(|d| d.name == "camelot"), "{disks:?}");
+    assert!(disks.iter().any(|d| d.name == "os-base"), "{disks:?}");
     let mut avalon = Client::connect(&platform.avalon.to_string(), "test").unwrap();
     assert!(avalon.server().starts_with("avalon "), "{}", avalon.server());
     avalon.list_vms().unwrap();
@@ -227,7 +227,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
 
     up::prepare(&options, log).unwrap();
     assert_eq!(
-        std::fs::read(options.images.join("camelot")).unwrap(),
+        std::fs::read(options.images.join("os-base")).unwrap(),
         root_image()
     );
     let mut platform = Platform::start(&options, &RUNNING, log).unwrap();
@@ -236,10 +236,23 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     }
     all_answer(&platform);
 
-    // The demo: a NAT switch and a VM that boots Camelot from its own copy of the
-    // image, to the shell.
+    // The demo: a NAT switch and a VM, vm001, that boots Camelot from its own copy
+    // of the 2 MiB image, to the shell, with the default hardware: 4 MiB of RAM.
+    assert_eq!(root_image().len(), 2 << 20);
     let id = platform.demo(log).unwrap();
     let mut avalon = Client::connect(&platform.avalon.to_string(), "test").unwrap();
+    let vm = avalon.vm_info(&VmRef::Id(id)).unwrap();
+    assert_eq!(vm.vm.name, "vm001");
+    assert_eq!(vm.vm.profile.ram_size, 4 << 20);
+    // The defaults, but for its disk and its card.
+    assert_eq!(vm.vm.profile.devices.len(), 2);
+    assert_eq!(
+        avalon_proto::HardwareProfile {
+            devices: Vec::new(),
+            ..vm.vm.profile.clone()
+        },
+        avalon_proto::HardwareProfile::default()
+    );
     let switches = avalon.list_switches().unwrap();
     assert_eq!(switches.len(), 1);
     assert_eq!(switches[0].name, "nat");
@@ -247,6 +260,12 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     let mut one = Console::attach(platform.avalon, id);
     one.wait_for_end(PROMPT);
     assert!(one.output.contains("Camelot v"), "{}", one.output);
+    assert!(
+        one.output.contains("\nram: 4 MiB at 0x80000000\n"),
+        "{}",
+        one.output
+    );
+    assert!(one.output.contains(", the kernel none\n"), "{}", one.output);
     one.type_line("echo up from its own disk");
     one.wait_for_end("up from its own disk\n$ ");
     // Something for the next run to find on the disk.
@@ -263,7 +282,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         avalon_proto::HardwareProfile::default(),
     )
     .unwrap();
-    assert_eq!(disk, "second-root");
+    assert_eq!(disk, "second-disk0");
     avalon.start_vm(&VmRef::Id(two_id)).unwrap();
     let mut two = Console::attach(platform.avalon, two_id);
     two.wait_for_end(PROMPT);
@@ -274,15 +293,22 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     assert!(vms.iter().all(|vm| vm.state == VmState::Running), "{vms:?}");
     let disks = lake.list_disks().unwrap();
     let writer = |name: &str| disks.iter().find(|d| d.name == name).map(|d| d.writer);
-    assert_eq!(writer("camelot-root"), Some(true));
-    assert_eq!(writer("second-root"), Some(true));
-    assert_eq!(writer("camelot"), Some(false));
+    assert_eq!(writer("vm001-disk0"), Some(true));
+    assert_eq!(writer("second-disk0"), Some(true));
+    assert_eq!(writer("os-base"), Some(false));
+    // Nothing is named after the OS.
+    let mut names: Vec<&str> = disks.iter().map(|d| d.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["os-base", "second-disk0", "vm001-disk0"]);
+    let mut names: Vec<String> = vms.iter().map(|vm| vm.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, ["second", "vm001"]);
     drop((avalon, lake, one, two));
 
     let summary = platform.summary(true);
     assert!(summary.contains(&platform.url), "{summary}");
     assert!(summary.contains(&format!(
-        "cargo run --release -p herald -- --server {} camelot",
+        "cargo run --release -p herald -- --server {} vm001",
         platform.avalon
     )));
     check_summary(&summary);
@@ -332,7 +358,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     let id = platform.demo(log).unwrap();
     assert!(
         out.lines()
-            .contains(&"up: demo: using disk camelot-root from an earlier run".to_string()),
+            .contains(&"up: demo: using disk vm001-disk0 from an earlier run".to_string()),
         "{:#?}",
         out.lines()
     );
@@ -393,7 +419,7 @@ fn run_comes_up_and_stops_on_ctrl_c() {
     assert!(
         lines
             .iter()
-            .any(|l| l.starts_with("up: image camelot in ") && l.ends_with(": created")),
+            .any(|l| l.starts_with("up: image os-base in ") && l.ends_with(": created")),
         "{lines:#?}"
     );
 }
@@ -570,7 +596,7 @@ fn a_new_image_says_the_demo_disk_is_older() {
     up::prepare(&options, log).unwrap();
     assert!(!note(&out));
     // Unchanged image, old demo disk: nothing to say either.
-    std::fs::write(options.images.join("camelot-root"), [0; 512]).unwrap();
+    std::fs::write(options.images.join("vm001-disk0"), [0; 512]).unwrap();
     up::prepare(&options, log).unwrap();
     assert!(!note(&out));
     // A new image and the old demo disk.
@@ -579,7 +605,7 @@ fn a_new_image_says_the_demo_disk_is_older() {
     assert!(note(&out), "{:#?}", out.lines());
     let last = out.lines().last().unwrap().clone();
     assert!(
-        last.contains(&options.images.join("camelot-root").display().to_string()),
+        last.contains(&options.images.join("vm001-disk0").display().to_string()),
         "{last}"
     );
 }

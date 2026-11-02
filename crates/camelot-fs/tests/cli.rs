@@ -236,13 +236,13 @@ fn usage_and_errors() {
 }
 
 /// `mkfs --boot --kernel` with Camelot's committed bootloader and kernel: the
-/// boot block, then the kernel after the filesystem, which fsck still finds
-/// clean and says is bootable.
+/// boot block, then the kernel after the filesystem (what the bootloader loads
+/// of it), which fsck still finds clean and says is bootable.
 #[test]
 fn mkfs_makes_a_bootable_image() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let boot = repo.join("kernel/boot/boot.elf");
-    let kernel = repo.join("kernel/kernel.elf");
+    let kernel = repo.join("kernel/kernel-disk.elf");
     let dir = scratch("bootable");
     let img = dir.join("root.img");
     let img_s = img.to_str().unwrap();
@@ -258,7 +258,7 @@ fn mkfs_makes_a_bootable_image() {
     ]);
     assert!(o.status.success(), "{o:?}");
     let image = std::fs::read(&img).unwrap();
-    let kernel = std::fs::read(&kernel).unwrap();
+    let kernel = camelot_fs::boot::loadable(&std::fs::read(&kernel).unwrap()).unwrap();
     let info = camelot_fs::boot::boot_info(&image).unwrap().expect("bootable");
     assert_eq!(info.kernel_sector, 2048, "right after the 1 MiB filesystem");
     assert_eq!(image.len(), 1024 * BSIZE + kernel.len().div_ceil(BSIZE) * BSIZE);

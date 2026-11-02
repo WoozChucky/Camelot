@@ -73,12 +73,15 @@ pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>,
 pub fn bootable_layout(size: u32, kernel: &[u8]) -> Result<Options, String> {
     let kernel_blocks = camelot_fs::boot::loadable(kernel)?.len().div_ceil(BSIZE);
     let kernel_blocks = u32::try_from(kernel_blocks).map_err(|_| "kernel: too big")?;
-    let fs = size.checked_sub(kernel_blocks).filter(|&b| b > 0).ok_or_else(|| {
-        format!(
-            "a {size}-block image has no room for a filesystem: the kernel alone takes {kernel_blocks} \
+    let fs = size
+        .checked_sub(kernel_blocks)
+        .filter(|&b| b > 0)
+        .ok_or_else(|| {
+            format!(
+                "a {size}-block image has no room for a filesystem: the kernel alone takes {kernel_blocks} \
              blocks"
-        )
-    })?;
+            )
+        })?;
     Ok(Options {
         size: fs,
         ..Options::default()

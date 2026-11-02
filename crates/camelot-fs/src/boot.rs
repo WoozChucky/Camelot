@@ -132,7 +132,11 @@ pub fn loadable(elf: &[u8]) -> Result<Vec<u8>, String> {
         .get(..headers.max(elf32::EHDR_SIZE))
         .ok_or("kernel: the program headers run past the file")?
         .to_vec();
-    for p in e.segments.iter().filter(|p| p.ty == elf32::PT_LOAD && p.filesz != 0) {
+    for p in e
+        .segments
+        .iter()
+        .filter(|p| p.ty == elf32::PT_LOAD && p.filesz != 0)
+    {
         let data = e.segment_data(p).map_err(|e| format!("kernel: {e}"))?;
         let at = p.offset as usize;
         out.resize(out.len().max(at + data.len()), 0);

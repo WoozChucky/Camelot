@@ -36,7 +36,7 @@ Camelot v0.1.0 booting...
 kprintf: d=-42 u=4294967295 x=cafef00d p=0x80000000 s=excalibur c=K %=%
 kprintf self-test: 26/26 passed
 [dbg] pc=........ a0 = 0x00000000 (0)
-ram: 128 MiB at 0x80000000
+ram: 4 MiB at 0x80000000
 paging: on (Sv32)
 vm self-test: 26/26 passed
 timer: 10 Hz tick, 10000000 Hz timebase
@@ -1965,7 +1965,12 @@ fn step_to_user(m: &mut Machine, elf: &grail::elf::Elf, name: &str) {
 /// Runs the committed kernel with `input` typed on the UART (ending in
 /// `exit`). Returns what was printed from the shell's banner on.
 fn run_processes(input: &[u8]) -> String {
-    let (mut m, _) = load_committed_on(MachineConfig::default(), Some(kernel::typed(input)));
+    run_processes_on(MachineConfig::default(), input)
+}
+
+/// [`run_processes`] on a machine of `config`.
+fn run_processes_on(config: MachineConfig, input: &[u8]) -> String {
+    let (mut m, _) = load_committed_on(config, Some(kernel::typed(input)));
     let r = m.run(Some(RUN_MAX_STEPS), |_| {});
     let out = printed(&m);
     assert_eq!(r, RunResult::Exited(0), "output:\n{out}");
@@ -2711,9 +2716,14 @@ fn processes_give_back_every_page() {
 fn a_heap_that_runs_out_of_memory_gives_back_what_it_took() {
     // sbrk maps the new pages one at a time: when memory runs out partway,
     // it must unmap and free the ones it had mapped and leave the heap as it
-    // was. 3 MB fits in user space, and a 128 MiB machine has the pages...
+    // was. 3 MB fits in user space, and a 16 MiB machine has the pages (the
+    // default 4 MiB, with the kernel's 1.4 MB, has not)...
     const LINE: &str = "systest sbrk 3000000";
-    let out = run_processes(format!("{LINE}\nexit\n").as_bytes());
+    let config = MachineConfig {
+        ram_size: 16 << 20,
+        ..MachineConfig::default()
+    };
+    let out = run_processes_on(config, format!("{LINE}\nexit\n").as_bytes());
     assert_eq!(command_output(&out, LINE), ["systest: sbrk 3000000: 0"]);
 
     // ...but a 2 MiB one runs out of them after mapping some.
@@ -2990,6 +3000,34 @@ fn committed_kernel_is_what_our_toolchain_builds() {
     assert!(
         built.elf == committed_elf(),
         "kernel/kernel.elf is out of date: run `cargo xtask kernel` and commit it"
+    );
+    // And kernel/kernel-disk.elf is the same objects linked without the user
+    // programs: the kernel a bootable root image holds.
+    let disk = kernel::disk_kernel(&kernel_dir(), &built).unwrap();
+    let path = kernel_dir().join(kernel::DISK_KERNEL);
+    assert!(
+        disk == std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+        "kernel/kernel-disk.elf is out of date: run `cargo xtask kernel` and commit it"
+    );
+    // `user_program_count` as each kernel has it, loaded in the default machine.
+    let programs = |elf: &[u8]| {
+        let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+        m.load_elf(elf).unwrap();
+        let at = grail::elf::parse(elf)
+            .unwrap()
+            .symbol("user_program_count")
+            .unwrap();
+        m.cpu.bus.peek(at).unwrap()
+    };
+    let names = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&repo_root())).unwrap();
+    assert_eq!(programs(&built.elf) as usize, names.len());
+    assert_eq!(programs(&disk), 0);
+    // Under a quarter of the size: the programs were most of it.
+    assert!(
+        disk.len() * 4 < built.elf.len(),
+        "{} of {}",
+        disk.len(),
+        built.elf.len()
     );
     let c = built.objects.iter().filter(|o| o.source.lang == Lang::C).count();
     assert!(c >= 20, "{c} C files");

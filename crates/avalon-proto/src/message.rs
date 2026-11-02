@@ -170,7 +170,7 @@ pub enum MessageKind {
 pub const PIXEL_FORMAT_XRGB8888: u32 = 0;
 
 /// RAM size of [`HardwareProfile::default`], as for `grail::DEFAULT_RAM_SIZE`.
-pub const DEFAULT_RAM_SIZE: u64 = 128 * 1024 * 1024;
+pub const DEFAULT_RAM_SIZE: u64 = 4 * 1024 * 1024;
 /// Nominal clock of [`HardwareProfile::default`], as for Grail's default.
 pub const DEFAULT_NOMINAL_HZ: u32 = 10_000_000;
 /// Harts of [`HardwareProfile::default`], as for Grail's default.

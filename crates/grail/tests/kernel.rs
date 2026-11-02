@@ -129,7 +129,7 @@ fn kernel_ticks_ten_times_then_starts_the_shell() {
     assert!(
         out.ends_with(&format!(
             "{}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{SHELL_BANNER}{PROMPT}exit\n",
-            memory_lines(128),
+            memory_lines(4),
             ticks()
         )),
         "{out}"

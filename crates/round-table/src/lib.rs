@@ -6,9 +6,9 @@
 //! tests call [`run`] the same way against servers running in process.
 
 use avalon_client::{
-    camelot_root, create_camelot_vm, device_name, disk_source_text, format_hz, format_size, mac_text,
-    parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net,
-    parse_ram, Client, VmAction, CAMELOT_IMAGE,
+    create_camelot_vm, device_name, disk_source_text, format_hz, format_size, mac_text, parse_addr,
+    parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_ram,
+    vm_disk, Client, VmAction, BASE_IMAGE,
 };
 use avalon_proto::{
     validate_name, DeviceSpec, DiskInfo, DiskSpec, HardwareProfile, NatConfig, NetSpec, PortOwner,
@@ -37,8 +37,8 @@ VM commands, sent to Avalon:
                   grail --disk IMG does
   create --name NAME --camelot [--lake ADDR] [options]
                   create a VM that boots Camelot from a disk of its own:
-                  Lake's image camelot (cargo xtask up puts it there) is
-                  copied to NAME-root, which becomes the VM's first disk
+                  Lake's image os-base (cargo xtask up puts it there) is
+                  copied to NAME-disk0, which becomes the VM's first disk
   list            every VM: id, name, state, RAM, clock, disks and cards
   info VM         one VM in detail: hardware, disks, network cards, steps
                   run, devices
@@ -55,7 +55,7 @@ VM commands, sent to Avalon:
 create options:
   --name NAME     the VM's name (required): 1 to 64 lowercase letters,
                   digits, '.', '_' and '-', not all digits
-  --ram MiB       RAM size in MiB, 1 to 2048 (default 128)
+  --ram MiB       RAM size in MiB, 1 to 2048 (default 4)
   --clock FREQ    real time: run FREQ instructions per second. FREQ is a
                   number with an optional unit, Hz, kHz or MHz: 10MHz, 500kHz,
                   1.5MHz, 5Hz. Without it the VM runs at full speed and
@@ -72,7 +72,7 @@ create options:
                   address ADDR (02:00:00:00:00:01; without one Avalon makes
                   one up from the VM's name). Repeat for more cards, up to 4
   --start         start the VM as soon as it is created
-  --camelot       boot Camelot from NAME-root, a copy of Lake's image camelot
+  --camelot       boot Camelot from NAME-disk0, a copy of Lake's image os-base
                   made on the Lake at --lake ADDR (no program); Avalon reaches
                   the disk at that address too
 
@@ -208,7 +208,7 @@ pub struct Create {
     pub profile: HardwareProfile,
     /// `None`: boot from the first disk.
     pub program: Option<PathBuf>,
-    /// Boot Camelot from a copy of Lake's image `camelot`, made first (`--camelot`).
+    /// Boot Camelot from a copy of Lake's image `os-base`, made first (`--camelot`).
     pub camelot: bool,
     pub start: bool,
 }
@@ -473,10 +473,10 @@ fn parse_create(rest: &[&str], options: &[(&'static str, String)]) -> Result<Cre
     if camelot && program.is_some() {
         return Err("'create --camelot' boots Camelot from its disk, and takes no program".into());
     }
-    if camelot && validate_name(&camelot_root(&name)).is_err() {
+    if camelot && validate_name(&vm_disk(&name)).is_err() {
         return Err(format!(
             "--name: '{name}' is too long for a Camelot VM, whose disk is named {}",
-            camelot_root(&name)
+            vm_disk(&name)
         ));
     }
     if !camelot && options.iter().any(|(f, _)| *f == "--lake") {
@@ -702,7 +702,7 @@ pub fn execute(invocation: &Invocation, out: &mut dyn Write) -> Result<(), Failu
                     create.profile.clone(),
                 )
                 .map_err(|e| Failure::Failed(e.to_string()))?;
-                (id, format!("created disk {disk} (a copy of {CAMELOT_IMAGE})\n"))
+                (id, format!("created disk {disk} (a copy of {BASE_IMAGE})\n"))
             } else {
                 let id = avalon
                     .create_vm(&create.name, create.profile.clone(), program)
@@ -1214,6 +1214,13 @@ mod tests {
             panic!()
         };
         assert_eq!(c.profile, HardwareProfile::default());
+        // 4 MiB of RAM, as the usage says.
+        assert_eq!(c.profile.ram_size, 4 << 20);
+        assert_eq!(avalon_proto::DEFAULT_RAM_SIZE, 4 << 20);
+        let mib = avalon_proto::DEFAULT_RAM_SIZE >> 20;
+        assert!(USAGE.contains(&format!(
+            "--ram MiB       RAM size in MiB, 1 to 2048 (default {mib})\n"
+        )));
         assert!(!c.start);
         // No program: the VM boots from its disk.
         let Command::Create(c) = command("create --name os --disk root.img") else {
@@ -1252,18 +1259,18 @@ mod tests {
             }
         );
         assert_eq!(
-            command("disk create web-root --from camelot"),
+            command("disk create web-disk0 --from os-base"),
             Command::DiskClone {
-                name: "web-root".into(),
-                source: "camelot".into(),
+                name: "web-disk0".into(),
+                source: "os-base".into(),
                 sectors: None
             }
         );
         assert_eq!(
-            command("disk create big --size 1G --from=camelot"),
+            command("disk create big --size 1G --from=os-base"),
             Command::DiskClone {
                 name: "big".into(),
-                source: "camelot".into(),
+                source: "os-base".into(),
                 sectors: Some(2_097_152)
             }
         );
@@ -1462,9 +1469,9 @@ mod tests {
         assert_eq!(
             vm_table(&vms),
             "\
-ID  NAME       STATE      RAM      CLOCK       DISKS  NETS
-1   web        running    64 MiB   1.5 MHz     2      2
-12  batch-job  exited(3)  128 MiB  full speed  0      0
+ID  NAME       STATE      RAM     CLOCK       DISKS  NETS
+1   web        running    64 MiB  1.5 MHz     2      2
+12  batch-job  exited(3)  4 MiB   full speed  0      0
 "
         );
         let details = VmDetails {

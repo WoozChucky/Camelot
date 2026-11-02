@@ -78,7 +78,7 @@ fn sysinfo_example_on_the_default_machine() {
     m.load_elf(&sysinfo_elf()).unwrap();
     assert_eq!(m.run(Some(1_000_000), |_| {}), RunResult::Exited(0));
     let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
-    assert_eq!(out, sysinfo_output(128, 10_000_000, false));
+    assert_eq!(out, sysinfo_output(4, 10_000_000, false));
 }
 
 #[test]

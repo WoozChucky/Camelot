@@ -58,13 +58,15 @@ pub const C_FLAGS: &[&str] = &[
 ];
 
 /// Generous step budget for running the kernel non-interactively. Booting
-/// the kernel with the default 128 MiB of RAM takes about 36 million steps
-/// (6 million for the clang `-O2` reference build: merlin does not
-/// optimize), nearly all of them spent putting every page on the free list,
-/// mapping RAM and MMIO page by page, and the allocator self-test that takes
-/// every page and gives it back; mounting the root filesystem and checking
-/// `/bin` takes about 30 million more, and a few shell commands a few
-/// hundred thousand.
+/// the kernel to its shell with the default 4 MiB of RAM takes about 16
+/// million steps (36 million with 128 MiB, where nearly all of them go to
+/// putting every page on the free list, mapping RAM page by page, and the
+/// allocator self-test that takes every page and gives it back; merlin does
+/// not optimize, and the clang `-O2` reference build needs far fewer);
+/// mounting the root filesystem and checking that `/bin` holds the kernel's
+/// own programs takes about 30 million more (the disk kernel, which has no
+/// copies to compare, boots from its image in about 18 million all told),
+/// and a few shell commands a few hundred thousand.
 pub const BOOT_MAX_STEPS: u64 = 200_000_000;
 
 /// The banner the kernel prints first at boot, before `Camelot vX booting...`
@@ -427,10 +429,7 @@ impl Build {
         // The same kernel without its programs, for bootable images.
         let disk = disk_kernel_path(&out);
         if self.verbose {
-            eprintln!(
-                "merlin-ld (again, with no user programs) -o {}",
-                disk.display()
-            );
+            eprintln!("merlin-ld (again, with no user programs) -o {}", disk.display());
         }
         write(disk, &disk_kernel(&self.kernel_dir, &built)?)
     }

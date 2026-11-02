@@ -5,8 +5,8 @@
 //!    and the bootable Camelot root image, as `cargo xtask fs` builds it
 //!    (`target/camelot-fs.img`). `--no-build` skips both and uses what is there.
 //! 2. **Seed** ([`seed`]): Lake's images directory (`target/platform/images` by
-//!    default) gets the root image as the disk `camelot`, the image a Camelot VM's disk
-//!    is a copy of (`avalon_client::CAMELOT_IMAGE`). It is written when it is missing
+//!    default) gets the root image (2 MiB) as the disk `os-base`, the image a Camelot
+//!    VM's disk is a copy of (`avalon_client::BASE_IMAGE`). It is written when it is missing
 //!    and replaced when it differs from the one just built; nothing else in the
 //!    directory is touched.
 //! 3. **Start** ([`Platform::start`]): Lake, Avalon and Pendragon, as child processes
@@ -18,8 +18,8 @@
 //!    ([`reachable`]): that is the address Pendragon, the demo and the summary use,
 //!    since Windows refuses to connect to an unspecified address.
 //! 4. **Demo** (`--demo`, [`Platform::demo`]): a switch `nat` with a NAT gateway, and a
-//!    VM `camelot` that boots from `camelot-root`, its own copy of the image, plugged
-//!    into it and started.
+//!    VM `vm001` with the default hardware (4 MiB of RAM) that boots from `vm001-disk0`,
+//!    its own copy of the image, plugged into it and started.
 //! 5. **Wait** ([`Platform::wait`]) until Ctrl-C, or until one of the servers ends;
 //!    then **stop** ([`Platform::stop`]) the others, Pendragon first and Lake last.
 //!
@@ -30,7 +30,7 @@
 //! already, and a VM keeps nothing that is not on its disks, so stopping a server
 //! loses nothing.
 
-use avalon_client::{camelot_root, create_camelot_vm, CamelotError, Client, CAMELOT_IMAGE};
+use avalon_client::{create_camelot_vm, vm_disk, CamelotError, Client, BASE_IMAGE};
 use avalon_proto::{DeviceSpec, DiskSource, DiskSpec, ErrorCode, HardwareProfile, NatConfig, NetSpec, VmRef};
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -57,7 +57,7 @@ pub const DEFAULT_PENDRAGON: &str = "127.0.0.1:7402";
 
 /// The demo's switch and VM.
 pub const DEMO_SWITCH: &str = "nat";
-pub const DEMO_VM: &str = "camelot";
+pub const DEMO_VM: &str = "vm001";
 
 /// How long a server may take to say it is listening.
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -72,20 +72,20 @@ pub const INTERRUPTED: &str = "interrupted";
 pub const USAGE: &str = "usage: cargo xtask up [options]
 
 Brings the Avalon platform up: builds it, puts the Camelot root image in Lake's
-images directory as the image camelot, and runs Lake, Avalon and Pendragon until
+images directory as the image os-base, and runs Lake, Avalon and Pendragon until
 Ctrl-C (or until one of them ends), their output prefixed by server.
 
   --images DIR       Lake's images directory (default target/platform/images).
-                     Only the image camelot is written there: created when it is
+                     Only the image os-base is written there: created when it is
                      missing, replaced when the build has changed it
   --lake ADDR        where Lake listens (default 127.0.0.1:7401)
   --avalon ADDR      where Avalon listens (default 127.0.0.1:7400)
   --pendragon ADDR   where Pendragon serves its page (default 127.0.0.1:7402)
                      ADDR is host:port, or a host alone for the default port
   --no-build         use the binaries and target/camelot-fs.img already built
-  --demo             also create a switch nat with a NAT gateway and a VM camelot
-                     that boots from its own copy of the image, plugged into it,
-                     and start it
+  --demo             also create a switch nat with a NAT gateway and a VM vm001
+                     that boots from its own copy of the image, vm001-disk0,
+                     plugged into it, and start it
   -h, --help         show this text";
 
 /// What `up` does, from its command line.
@@ -201,7 +201,7 @@ pub fn build(options: &Options, log: Log) -> Result<Vec<u8>, String> {
     Ok(image)
 }
 
-/// What [`seed`] did with the image `camelot`.
+/// What [`seed`] did with the image `os-base`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Seeded {
     Created,
@@ -211,19 +211,19 @@ pub enum Seeded {
 }
 
 /// Puts `image` in the images directory `dir` (created if needed) as the disk
-/// [`CAMELOT_IMAGE`], unless it is there already. The new contents go to a file whose
+/// [`BASE_IMAGE`], unless it is there already. The new contents go to a file whose
 /// name is not a disk name and are renamed into place, so Lake never sees half an
 /// image. Nothing else in the directory is touched.
 pub fn seed(dir: &Path, image: &[u8]) -> io::Result<Seeded> {
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(CAMELOT_IMAGE);
+    let path = dir.join(BASE_IMAGE);
     let seeded = match std::fs::read(&path) {
         Ok(old) if old == image => return Ok(Seeded::UpToDate),
         Ok(_) => Seeded::Replaced,
         Err(e) if e.kind() == io::ErrorKind::NotFound => Seeded::Created,
         Err(e) => return Err(e),
     };
-    let temp = dir.join(format!(".{CAMELOT_IMAGE}.up"));
+    let temp = dir.join(format!(".{BASE_IMAGE}.up"));
     std::fs::write(&temp, image)?;
     std::fs::rename(&temp, &path).inspect_err(|_| {
         let _ = std::fs::remove_file(&temp);
@@ -261,7 +261,7 @@ pub fn prepare(options: &Options, log: Log) -> Result<(), String> {
             ));
         }
     }
-    let base = options.images.join(CAMELOT_IMAGE);
+    let base = options.images.join(BASE_IMAGE);
     match image {
         Some(image) => {
             let seeded =
@@ -272,14 +272,14 @@ pub fn prepare(options: &Options, log: Log) -> Result<(), String> {
                 Seeded::UpToDate => "up to date",
             };
             log(&format!(
-                "up: image {CAMELOT_IMAGE} in {}: {what}",
+                "up: image {BASE_IMAGE} in {}: {what}",
                 options.images.display()
             ));
-            let demo_disk = options.images.join(camelot_root(DEMO_VM));
+            let demo_disk = options.images.join(vm_disk(DEMO_VM));
             if seeded == Seeded::Replaced && options.demo && demo_disk.is_file() {
                 log(&format!(
-                    "up: note: the demo VM's disk {} is a copy of the image {CAMELOT_IMAGE} from                      before this build, and the demo boots it as it is; to boot the new build,                      delete {} while up is not running (what the VM wrote there goes with it)",
-                    camelot_root(DEMO_VM),
+                    "up: note: the demo VM's disk {} is a copy of the image {BASE_IMAGE} from                      before this build, and the demo boots it as it is; to boot the new build,                      delete {} while up is not running (what the VM wrote there goes with it)",
+                    vm_disk(DEMO_VM),
                     demo_disk.display()
                 ));
             }
@@ -287,7 +287,7 @@ pub fn prepare(options: &Options, log: Log) -> Result<(), String> {
         None if base.is_file() => {}
         None => {
             return Err(format!(
-                "there is no {} to put in {} as the image {CAMELOT_IMAGE}: run cargo xtask up \
+                "there is no {} to put in {} as the image {BASE_IMAGE}: run cargo xtask up \
                  without --no-build",
                 options.image.display(),
                 options.images.display()
@@ -577,12 +577,10 @@ impl Platform {
             })],
             ..HardwareProfile::default()
         };
-        let disk = camelot_root(DEMO_VM);
+        let disk = vm_disk(DEMO_VM);
         let id = match create_camelot_vm(&mut avalon, &mut lake, &lake_addr, DEMO_VM, profile.clone()) {
             Ok((id, _)) => {
-                log(&format!(
-                    "up: demo: created disk {disk}, a copy of {CAMELOT_IMAGE}"
-                ));
+                log(&format!("up: demo: created disk {disk}, a copy of {BASE_IMAGE}"));
                 id
             }
             Err(CamelotError::Lake { cause, .. }) if cause.code() == Some(ErrorCode::AlreadyExists) => {
@@ -1056,7 +1054,7 @@ mod tests {
         std::fs::write(images.join("mine"), [7; 512]).unwrap();
         assert_eq!(seed(&images, &[1; 1024]).unwrap(), Seeded::UpToDate);
         assert_eq!(seed(&images, &[2; 2048]).unwrap(), Seeded::Replaced);
-        assert_eq!(std::fs::read(images.join("camelot")).unwrap(), [2; 2048]);
+        assert_eq!(std::fs::read(images.join("os-base")).unwrap(), [2; 2048]);
         // Nothing else was touched, and nothing was left behind.
         assert_eq!(std::fs::read(images.join("mine")).unwrap(), [7; 512]);
         assert_eq!(std::fs::read_dir(&images).unwrap().count(), 2);
