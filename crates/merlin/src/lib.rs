@@ -1,19 +1,24 @@
 //! merlin: compiles a subset of C into Excalibur assembly for merlin-as.
 //!
-//! Pipeline: [`lexer`] → [`parser`] → [`sema`] (name resolution, arity checks)
-//! → [`codegen`]. [`parse`] runs the front end and returns a checked AST;
-//! [`compile`] goes all the way to assembly text.
+//! Pipeline: [`lexer`] → [`parser`] → [`sema`] (name resolution, type
+//! checking) → [`codegen`]. [`parse`] runs the front end and returns a checked,
+//! typed AST; [`compile`] goes all the way to assembly text. [`types`] has the
+//! C types and their ILP32 sizes, [`consteval`] evaluates constant expressions.
 //!
-//! The v0 language (spec section 10) is `int` only: functions with up to 8 `int`
-//! parameters, blocks, local declarations, `if`/`else`, `while`, `for`, `return`,
-//! `break`, `continue`, and the expressions `= + - * / % == != < <= > >= && || !`,
-//! unary `-`, parentheses and calls.
+//! The language (spec section 10) is a subset of C99: the integer types
+//! (`char`, `short`, `int`, `long`, signed and unsigned), pointers, arrays,
+//! global and `static` variables with initializers, string and character
+//! literals, functions with up to 8 parameters, the statements `if`/`else`,
+//! `while`, `do`/`while`, `for`, `return`, `break`, `continue`, and every C
+//! operator except `->` and `.` (no structs yet).
 
 pub mod ast;
 pub mod codegen;
+pub mod consteval;
 pub mod lexer;
 pub mod parser;
 pub mod sema;
+pub mod types;
 
 use std::fmt;
 
