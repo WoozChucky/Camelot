@@ -92,14 +92,20 @@ pub trait BlockBackend: Send {
 
 /// The byte range `[sector * 512, + len)` of a disk with `capacity` sectors, if `len`
 /// is whole sectors and the range is on the disk. Backends use it to validate requests.
+/// Never overflows: a range whose byte offsets do not fit in a `u64` (a backend with a
+/// capacity above 2^55 sectors) is an error, like one past the end.
 pub fn byte_range(capacity: u64, sector: u64, len: usize) -> io::Result<std::ops::Range<u64>> {
     let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidInput, msg.to_string());
     if !len.is_multiple_of(SECTOR_SIZE) {
         return Err(invalid("not a whole number of sectors"));
     }
     let count = (len / SECTOR_SIZE) as u64;
+    let bytes = |sectors: u64| sectors.checked_mul(SECTOR_SIZE as u64);
     match sector.checked_add(count) {
-        Some(end) if end <= capacity => Ok(sector * SECTOR_SIZE as u64..end * SECTOR_SIZE as u64),
+        Some(end) if end <= capacity => match (bytes(sector), bytes(end)) {
+            (Some(start), Some(end)) => Ok(start..end),
+            _ => Err(invalid("sector out of range")),
+        },
         _ => Err(invalid("sector out of range")),
     }
 }
@@ -114,9 +120,22 @@ pub struct MemDisk {
 
 impl MemDisk {
     /// A zero-filled disk of `sectors` sectors.
+    ///
+    /// # Panics
+    ///
+    /// If `sectors` is more than the device can address ([`MAX_SECTORS`]), or its size
+    /// in bytes does not fit in a `usize`: a host's mistake, like asking `vec!` for too
+    /// much. [`MemDisk::from_image`] returns an error instead.
     pub fn new(sectors: usize) -> Self {
+        assert!(
+            sectors as u64 <= MAX_SECTORS,
+            "MemDisk of {sectors} sectors: at most {MAX_SECTORS}"
+        );
+        let size = sectors
+            .checked_mul(SECTOR_SIZE)
+            .unwrap_or_else(|| panic!("MemDisk of {sectors} sectors does not fit in memory"));
         MemDisk {
-            data: vec![0; sectors * SECTOR_SIZE],
+            data: vec![0; size],
             read_only: false,
         }
     }
@@ -737,6 +756,22 @@ mod tests {
         assert!(byte_range(4, 4, 512).is_err());
         assert!(byte_range(4, 0, 511).is_err());
         assert!(byte_range(u64::MAX, u64::MAX, 512).is_err());
+        // In range, but the byte offsets would overflow: an error, not a panic or a
+        // wrapped range.
+        let huge = u64::MAX / SECTOR_SIZE as u64;
+        let err = byte_range(u64::MAX, huge, 512).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(byte_range(u64::MAX, huge + 1, 0).is_err());
+        assert_eq!(
+            byte_range(u64::MAX, huge - 1, 512).unwrap(),
+            (huge - 1) * 512..huge * 512
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "at most 4294967295")]
+    fn a_mem_disk_bigger_than_the_device_can_address_panics() {
+        MemDisk::new(MAX_SECTORS as usize + 1);
     }
 
     #[test]
