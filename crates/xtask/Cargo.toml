@@ -11,6 +11,8 @@ publish = false
 avalon-client = { path = "../avalon-client" }
 avalon-proto = { path = "../avalon-proto" }
 camelot-fs = { path = "../camelot-fs" }
+# The C assembler's tables (as_tables.rs): opcodes, register and CSR names.
+excalibur = { path = "../excalibur" }
 grail = { path = "../grail" }
 merlin = { path = "../merlin" }
 merlin-as = { path = "../merlin-as" }
@@ -18,7 +20,6 @@ merlin-ld = { path = "../merlin-ld" }
 
 [dev-dependencies]
 elf32 = { path = "../elf32" }
-excalibur = { path = "../excalibur" }
 # tests/examples.rs compares our executables with ld.lld's and our disassembly with
 # llvm-objdump's committed text.
 merlin-objdump = { path = "../merlin-objdump" }

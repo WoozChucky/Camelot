@@ -3,7 +3,9 @@
 //!
 //! Every `kernel/user/*.c` and `*.s` is one program, but for the runtime
 //! linked into each of them ([`RUNTIME`]: `crt0.s` and the system call stubs
-//! `usys.s`). The C library, `kernel/user/lib/` ([`LIB_DIR`]), is linked as
+//! `usys.s`), and so is every subdirectory but `lib/`: a program of several
+//! files (`kernel/user/as/*.c` is `as`), each compiled and assembled on its
+//! own and linked together, in name order. The C library, `kernel/user/lib/` ([`LIB_DIR`]), is linked as
 //! a library: each of its files is a member that goes into a program only
 //! if the program needs something it defines (`merlin_ld::library`, like
 //! an archive's members), so a program that never calls malloc carries
@@ -41,6 +43,28 @@ pub const RUNTIME: &[&str] = &["crt0.s", "usys.s"];
 pub const LIB_DIR: &str = "lib";
 /// The linker script every program is linked with.
 pub const SCRIPT: &str = "user.ld";
+/// Programs the root image's `/bin` holds but the kernel does not build in:
+/// they read and write files, which a machine without a disk has none of,
+/// and their copies would not fit in the 2 MiB the kernel boots in (`as` is
+/// over 100 KB).
+pub const DISK_ONLY: &[&str] = &["as"];
+
+/// The programs the kernel builds in: all but [`DISK_ONLY`], by name.
+pub fn embedded(programs: Vec<Program>) -> Vec<Program> {
+    programs
+        .into_iter()
+        .filter(|p| !DISK_ONLY.contains(&p.name.as_str()))
+        .collect()
+}
+
+/// The names of the programs the kernel builds in.
+pub fn embedded_names(dir: &Path) -> Result<Vec<String>, String> {
+    Ok(program_names(dir)?
+        .into_iter()
+        .filter(|n| !DISK_ONLY.contains(&n.as_str()))
+        .collect())
+}
+
 /// The longest program name: the kernel keeps 15 characters and a NUL
 /// (`struct proc`'s `name`, kernel/include/proc.h).
 pub const MAX_NAME: usize = 15;
@@ -69,11 +93,14 @@ pub const C_FLAGS: &[&str] = &[
     "-S",
 ];
 
-/// The language of a source file in [`USER_DIR`].
+/// The language of a source file in [`USER_DIR`], or a program's directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     C,
     Asm,
+    /// A program of several files, in the subdirectory of its name: the
+    /// `.c` and `.s` files there are its parts ([`Source::parts`]).
+    Dir,
 }
 
 /// A source file in [`USER_DIR`]: a program's, the runtime's or the
@@ -92,7 +119,28 @@ impl Source {
         match self.lang {
             Lang::C => format!("{}.c", self.stem),
             Lang::Asm => format!("{}.s", self.stem),
+            Lang::Dir => format!("{}/", self.stem),
         }
+    }
+
+    /// The files a program is built from: itself, or, for a [`Lang::Dir`]
+    /// program, the `.c` and `.s` files of its directory under `dir`, by
+    /// name, their stems starting with the directory's (`as/lexer`).
+    pub fn parts(&self, dir: &Path) -> Result<Vec<Source>, String> {
+        if self.lang != Lang::Dir {
+            return Ok(vec![self.clone()]);
+        }
+        let parts: Vec<Source> = sources(&dir.join(&self.stem))?
+            .into_iter()
+            .map(|s| Source {
+                stem: format!("{}/{}", self.stem, s.stem),
+                lang: s.lang,
+            })
+            .collect();
+        if parts.is_empty() {
+            return Err(format!("{}: no .c or .s files", dir.join(&self.stem).display()));
+        }
+        Ok(parts)
     }
 
     fn from_file(file: &str) -> Option<Source> {
@@ -183,13 +231,30 @@ pub fn library(dir: &Path) -> Result<Vec<Source>, String> {
         .collect())
 }
 
-/// The programs in `dir`: every source but the [`RUNTIME`]'s, by name. A
+/// The programs in `dir`: every source but the [`RUNTIME`]'s, and every
+/// subdirectory but [`LIB_DIR`] that holds `.c` or `.s` files, by name. A
 /// name must be [`valid_name`] and belong to one source only.
 pub fn programs(dir: &Path) -> Result<Vec<Source>, String> {
     let mut progs: Vec<Source> = sources(dir)?
         .into_iter()
         .filter(|s| !RUNTIME.contains(&s.file().as_str()))
         .collect();
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    for e in entries {
+        let e = e.map_err(|e| e.to_string())?;
+        let Ok(name) = e.file_name().into_string() else {
+            continue;
+        };
+        if name == LIB_DIR || !e.file_type().map_err(|e| e.to_string())?.is_dir() {
+            continue;
+        }
+        if !sources(&e.path())?.is_empty() {
+            progs.push(Source {
+                stem: name,
+                lang: Lang::Dir,
+            });
+        }
+    }
     for s in &progs {
         if !valid_name(&s.stem) {
             return Err(format!(
@@ -237,6 +302,7 @@ fn asm_text(dir: &Path, src: &Source, cc: CCompiler) -> Result<(String, String),
             })?;
             Ok((format!("{USER_DIR}/{}.s (merlin's assembly)", src.file()), asm))
         }
+        (Lang::Dir, _) => unreachable!("a program's parts are files"),
         (Lang::C, CCompiler::Clang(asm_dir)) => {
             let path = asm_dir.join(format!("{}.s", src.stem));
             Ok((path.display().to_string(), read(&path)?))
@@ -284,7 +350,10 @@ pub fn build_runtime(dir: &Path, cc: CCompiler) -> Result<Runtime, String> {
 /// with [`SCRIPT`], the program first. merlin-ld's warnings are errors
 /// here.
 pub fn link_program(dir: &Path, prog: &Source, cc: CCompiler, rt: &Runtime) -> Result<Program, String> {
-    let mut inputs = vec![object(dir, prog, cc)?];
+    let mut inputs = Vec::new();
+    for part in prog.parts(dir)? {
+        inputs.push(object(dir, &part, cc)?);
+    }
     inputs.extend(rt.objects.iter().cloned());
     let inputs = merlin_ld::library::with_needed(&inputs, &rt.library).map_err(|errors| {
         let lines: Vec<String> = errors.iter().map(|e| format!("merlin-ld: error: {e}")).collect();
@@ -356,8 +425,14 @@ pub fn compile_clang(clang: &Path, dir: &Path, out: &Path, verbose: bool) -> Res
     std::fs::create_dir_all(out.join(LIB_DIR))
         .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
     let out = std::path::absolute(out).map_err(|e| format!("bad path {}: {e}", out.display()))?;
-    let all = sources(dir)?.into_iter().chain(library(dir)?);
-    for src in all.filter(|s| s.lang == Lang::C) {
+    let mut all: Vec<Source> = sources(dir)?.into_iter().chain(library(dir)?).collect();
+    for prog in programs(dir)?.iter().filter(|p| p.lang == Lang::Dir) {
+        std::fs::create_dir_all(out.join(&prog.stem))
+            .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+        all.extend(prog.parts(dir)?);
+    }
+    for src in all.iter().filter(|s| s.lang == Lang::C) {
+        let src = src.clone();
         let args = clang_args(&src, &out.join(format!("{}.s", src.stem)));
         if verbose {
             eprintln!("{} {}", clang.display(), args.join(" "));
@@ -489,9 +564,10 @@ pub fn empty() -> String {
 }
 
 /// Builds every program in `dir` (`kernel/user`) with our own tools and
-/// returns the text of the kernel's `userprogs.s` ([`generate`]).
+/// returns the text of the kernel's `userprogs.s` ([`generate`]): all but
+/// the [`DISK_ONLY`] ones.
 pub fn generated(dir: &Path) -> Result<String, String> {
-    Ok(generate(&build_all(dir)?, CCompiler::Merlin))
+    Ok(generate(&embedded(build_all(dir)?), CCompiler::Merlin))
 }
 
 #[cfg(test)]
@@ -591,11 +667,22 @@ mod tests {
         assert!(program_names(&dir).unwrap_err().contains("no programs"));
         std::fs::write(dir.join("b.c"), "").unwrap();
         std::fs::write(dir.join("a.s"), "").unwrap();
-        // Files in subdirectories are not programs.
+        // A subdirectory with no sources is no program; one with some is a
+        // program of several files.
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("sub").join("c.s"), "").unwrap();
+        std::fs::write(dir.join("sub").join("notes.txt"), "").unwrap();
         assert_eq!(program_names(&dir).unwrap(), ["a", "b"]);
         assert_eq!(programs(&dir).unwrap(), [src("a", Lang::Asm), src("b", Lang::C)]);
+        std::fs::write(dir.join("sub").join("y.s"), "").unwrap();
+        std::fs::write(dir.join("sub").join("x.c"), "").unwrap();
+        assert_eq!(program_names(&dir).unwrap(), ["a", "b", "sub"]);
+        let sub = programs(&dir).unwrap().pop().unwrap();
+        assert_eq!(sub, src("sub", Lang::Dir));
+        assert_eq!(
+            sub.parts(&dir).unwrap(),
+            [src("sub/x", Lang::C), src("sub/y", Lang::Asm)]
+        );
+        std::fs::remove_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a.c"), "").unwrap();
         let err = program_names(&dir).unwrap_err();
         assert!(err.contains("both a.c and a.s define program a"), "{err}");

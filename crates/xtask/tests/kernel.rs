@@ -2139,8 +2139,9 @@ const SYS_EXIT: u32 = 1;
 const RUN_MAX_STEPS: u64 = 150_000_000;
 
 /// The embedded programs, by name.
+/// The programs the kernel builds in (all but the disk-only ones).
 fn program_names() -> Vec<String> {
-    xtask::userprogs::program_names(&xtask::userprogs::user_dir(&repo_root())).unwrap()
+    xtask::userprogs::embedded_names(&xtask::userprogs::user_dir(&repo_root())).unwrap()
 }
 
 /// A fresh build of user program `name`, as the kernel embeds it.
@@ -3584,7 +3585,7 @@ fn committed_kernel_is_what_our_toolchain_builds() {
             .unwrap();
         m.cpu.bus.peek(at).unwrap()
     };
-    let names = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&repo_root())).unwrap();
+    let names = program_names();
     assert_eq!(programs(&built.elf) as usize, names.len());
     assert_eq!(programs(&disk), 0);
     // Under a quarter of the size: the programs were most of it.
@@ -3793,10 +3794,18 @@ fn the_system_call_document_matches_the_code() {
 
 #[test]
 fn the_kernel_embeds_every_user_program() {
-    // The table in the image: names, sizes and bytes match a fresh build.
+    // The table in the image: names, sizes and bytes match a fresh build of
+    // every program but the disk-only ones (the assembler: no files without
+    // a disk), which are not there at all.
     let (mut m, elf) = load_committed();
     let dir = xtask::userprogs::user_dir(&repo_root());
-    let programs = xtask::userprogs::build_all(&dir).unwrap();
+    let programs = xtask::userprogs::embedded(xtask::userprogs::build_all(&dir).unwrap());
+    for name in xtask::userprogs::DISK_ONLY {
+        assert!(
+            elf.symbol(&format!("user_elf_{name}")).is_none(),
+            "{name} is built in"
+        );
+    }
     let table = sym(&elf, "user_programs");
     assert_eq!(
         m.cpu.bus.peek(sym(&elf, "user_program_count")),

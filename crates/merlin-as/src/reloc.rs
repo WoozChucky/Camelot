@@ -27,6 +27,20 @@ pub enum RelocKind {
 }
 
 impl RelocKind {
+    /// Every kind, for tables generated from this one (the C assembler's).
+    pub const ALL: [RelocKind; 10] = [
+        RelocKind::Abs32,
+        RelocKind::Branch,
+        RelocKind::Jal,
+        RelocKind::CallPlt,
+        RelocKind::PcrelHi20,
+        RelocKind::PcrelLo12I,
+        RelocKind::PcrelLo12S,
+        RelocKind::Hi20,
+        RelocKind::Lo12I,
+        RelocKind::Lo12S,
+    ];
+
     pub fn elf_type(self) -> u32 {
         match self {
             RelocKind::Abs32 => 1,
