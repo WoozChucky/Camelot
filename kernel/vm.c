@@ -6,6 +6,7 @@
 #include "kprintf.h"
 #include "memlayout.h"
 #include "riscv.h"
+#include "string.h"
 #include "sysinfo.h"
 #include "trap.h"
 
@@ -168,11 +169,16 @@ void kvminithart(void) {
     sfence_vma();
 }
 
-void vm_print_mapping(u32 va) {
-    if (kernel_pagetable == NULL) {
-        return;
+pagetable_t vm_active_pagetable(void) {
+    u32 satp = r_satp();
+    if ((satp & SATP_SV32) == 0) {
+        return NULL;
     }
-    pte_t *pte = walk(kernel_pagetable, va, false);
+    return (pagetable_t)(uintptr)((satp & SATP_PPN_MASK) << PGSHIFT);
+}
+
+void vm_print_mapping(pagetable_t pt, u32 va) {
+    pte_t *pte = walk(pt, va, false);
     if (pte == NULL || (*pte & PTE_V) == 0) {
         kprintf("  va 0x%08x is not mapped\n", va);
         return;
@@ -186,4 +192,78 @@ void vm_print_mapping(u32 va) {
     flags[8] = '\0';
     kprintf("  va 0x%08x maps to pa 0x%08x, pte 0x%08x %s\n", va, PTE2PA(*pte) | (va & (PGSIZE - 1)), *pte,
             flags);
+}
+
+pagetable_t uvm_create(void) {
+    pagetable_t pt = pagetable_create();
+    if (pt == NULL) {
+        return NULL;
+    }
+    /* The root entries, not the tables they point to: a process shares the
+     * kernel's second-level tables, so it never copies or frees them. */
+    for (u32 i = USER_ROOT_ENTRIES; i < PTES_PER_TABLE; i++) {
+        pt[i] = kernel_pagetable[i];
+    }
+    return pt;
+}
+
+void uvm_free(pagetable_t pt) {
+    for (u32 i = 0; i < USER_ROOT_ENTRIES; i++) {
+        if ((pt[i] & PTE_V) == 0) {
+            continue;
+        }
+        pagetable_t table = (pagetable_t)(uintptr)PTE2PA(pt[i]);
+        for (u32 j = 0; j < PTES_PER_TABLE; j++) {
+            if (table[j] & PTE_V) {
+                kfree((void *)(uintptr)PTE2PA(table[j]));
+                table[j] = 0;
+            }
+        }
+    }
+    /* Forget the kernel's tables, so that pagetable_free() frees only the
+     * root and the user-space tables. */
+    for (u32 i = USER_ROOT_ENTRIES; i < PTES_PER_TABLE; i++) {
+        pt[i] = 0;
+    }
+    pagetable_free(pt);
+}
+
+bool uvm_range_ok(pagetable_t pt, u32 va, u32 len, u32 perm) {
+    if (len == 0) {
+        return true;
+    }
+    /* Inside user space, so va + len can't wrap around either. */
+    if (va >= USER_TOP || len > USER_TOP - va) {
+        return false;
+    }
+    u32 want = perm | PTE_U | PTE_V;
+    for (u32 a = PGROUNDDOWN(va); a < va + len; a += PGSIZE) {
+        pte_t *pte = walk(pt, a, false);
+        if (pte == NULL || (*pte & want) != want) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int copyin(pagetable_t pt, void *dst, u32 va, u32 len) {
+    if (!uvm_range_ok(pt, va, len, PTE_R)) {
+        return -1;
+    }
+    u8 *out = dst;
+    while (len > 0) {
+        u32 off = va % PGSIZE;
+        u32 n = PGSIZE - off;
+        if (n > len) {
+            n = len;
+        }
+        /* RAM is identity mapped in the kernel's half, so the user page's
+         * physical address is a usable pointer. */
+        const u8 *src = (const u8 *)(uintptr)(PTE2PA(*walk(pt, va, false)) + off);
+        memcpy(out, src, n);
+        out += n;
+        va += n;
+        len -= n;
+    }
+    return 0;
 }
