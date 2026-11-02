@@ -1,0 +1,37 @@
+
+crates/merlin-objdump/tests/fixtures/relocs.o:	file format elf32-littleriscv
+
+Disassembly of section .text:
+
+00000000 <func>:
+       0: 00000097     	auipc	ra, 0x0
+       4: 000080e7     	jalr	ra <func>
+       8: 00000317     	auipc	t1, 0x0
+       c: 00030067     	jr	t1 <func+0x8>
+
+00000010 <.Lpcrel_hi0>:
+      10: 00000517     	auipc	a0, 0x0
+      14: 00050513     	mv	a0, a0
+
+00000018 <.Lpcrel_hi1>:
+      18: 00000597     	auipc	a1, 0x0
+      1c: 00058593     	mv	a1, a1
+
+00000020 <.Lpcrel_hi2>:
+      20: 00000617     	auipc	a2, 0x0
+      24: 00062603     	lw	a2, 0x0(a2)
+
+00000028 <.Lpcrel_hi3>:
+      28: 00000297     	auipc	t0, 0x0
+      2c: 00c2a023     	sw	a2, 0x0(t0)
+      30: 000006b7     	lui	a3, 0x0
+      34: 00068693     	mv	a3, a3
+      38: 0006a703     	lw	a4, 0x0(a3)
+      3c: 00e6a023     	sw	a4, 0x0(a3)
+      40: 00b50063     	beq	a0, a1, 0x40 <.Lpcrel_hi3+0x18>
+      44: 000000ef     	jal	0x44 <.Lpcrel_hi3+0x1c>
+      48: 0080006f     	j	0x50 <local_label>
+      4c: 00051263     	bnez	a0, 0x50 <local_label>
+
+00000050 <local_label>:
+      50: 00008067     	ret

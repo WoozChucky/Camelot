@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 excalibur = { path = "../excalibur" }
+elf32 = { path = "../elf32" }

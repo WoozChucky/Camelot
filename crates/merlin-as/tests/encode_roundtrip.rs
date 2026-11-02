@@ -382,7 +382,7 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
         ("rem s2, s3, a0", vec![m(MulOp::Rem, S2, S3, A0)]),
         ("remu t0, t1, t2", vec![m(MulOp::Remu, T0, T1, T2)]),
         // System
-        ("fence", vec![Fence]),
+        ("fence", vec![Fence { pred: 0xf, succ: 0xf }]),
         ("fence.i", vec![FenceI]),
         ("ecall", vec![Ecall]),
         ("ebreak", vec![Ebreak]),

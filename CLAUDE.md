@@ -19,19 +19,21 @@ Camelot is Nuno's learning project: the Excalibur ISA (RV32IM + Zicsr, M/S/U, Sv
 ## Layout
 
 ```
-crates/excalibur   encodings, decoder, disassembler (shared by every tool)
-crates/grail       the emulator
-crates/merlin      the C-subset compiler (front end + test harness; codegen is #14)
-crates/merlin-as   the assembler
-crates/merlin-ld   the linker (relocation hook in src/reloc.rs is issue #7)
-crates/xtask       build tasks (`cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
-kernel/            the Camelot kernel (C + assembly); kernel.elf is committed, rebuild it after changes
-docs/              ISA spec
-examples/          bare-metal programs
-tests/riscv-tests  prebuilt riscv-tests ELFs
+crates/excalibur        encodings, decoder, disassembler (shared by every tool)
+crates/elf32            ELF32 reader (grail, merlin-objdump, merlin-ld)
+crates/grail            the emulator
+crates/merlin           the C-subset compiler (front end + test harness; codegen is #14)
+crates/merlin-as        the assembler
+crates/merlin-ld        the linker (relocation hook in src/reloc.rs is issue #7)
+crates/merlin-objdump   the disassembler; output matches llvm-objdump 21
+crates/xtask            build tasks (`cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
+kernel/                 the Camelot kernel (C + assembly); kernel.elf is committed, rebuild it after changes
+docs/                   ISA spec
+examples/               bare-metal programs
+tests/riscv-tests       prebuilt riscv-tests ELFs
 ```
 
-Reuse `excalibur` (register names, CSR names, decoder) instead of duplicating tables.
+Reuse `excalibur` (register names, CSR names, decoder, `Inst::format`) and `elf32` (reading ELF files, relocation names) instead of duplicating tables.
 
 ## Before pushing
 

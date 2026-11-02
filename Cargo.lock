@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "elf32"
+version = "0.1.0"
+
+[[package]]
 name = "excalibur"
 version = "0.1.0"
 
@@ -10,6 +14,7 @@ version = "0.1.0"
 name = "grail"
 version = "0.1.0"
 dependencies = [
+ "elf32",
  "excalibur",
 ]
 
@@ -33,6 +38,15 @@ name = "merlin-ld"
 version = "0.1.0"
 dependencies = [
  "grail",
+ "merlin-as",
+]
+
+[[package]]
+name = "merlin-objdump"
+version = "0.1.0"
+dependencies = [
+ "elf32",
+ "excalibur",
  "merlin-as",
 ]
 

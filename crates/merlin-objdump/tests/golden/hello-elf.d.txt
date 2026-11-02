@@ -1,0 +1,27 @@
+
+examples/hello/hello.elf:	file format elf32-littleriscv
+
+Disassembly of section .text:
+
+80000000 <_start>:
+80000000: 00010117     	auipc	sp, 0x10
+80000004: 07010113     	addi	sp, sp, 0x70
+80000008: 00000517     	auipc	a0, 0x0
+8000000c: 04450513     	addi	a0, a0, 0x44
+80000010: 00c000ef     	jal	0x8000001c <puts>
+80000014: 0005000b     	<unknown>
+80000018: 0000100b     	<unknown>
+
+8000001c <puts>:
+8000001c: 100002b7     	lui	t0, 0x10000
+80000020: 00050313     	mv	t1, a0
+80000024: 00034383     	lbu	t2, 0x0(t1)
+80000028: 00038e63     	beqz	t2, 0x80000044 <puts+0x28>
+8000002c: 0052ce03     	lbu	t3, 0x5(t0)
+80000030: 020e7e13     	andi	t3, t3, 0x20
+80000034: fe0e0ce3     	beqz	t3, 0x8000002c <puts+0x10>
+80000038: 00728023     	sb	t2, 0x0(t0)
+8000003c: 00130313     	addi	t1, t1, 0x1
+80000040: fe5ff06f     	j	0x80000024 <puts+0x8>
+80000044: 40a30533     	sub	a0, t1, a0
+80000048: 00008067     	ret

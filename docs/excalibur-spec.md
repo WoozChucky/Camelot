@@ -59,7 +59,7 @@ Immediates are sign-extended from their top bit. B and J immediates are multiple
 | 0100011 STORE | `sb sh sw` |
 | 0010011 OP-IMM | `addi slti sltiu xori ori andi slli srli srai` |
 | 0110011 OP | `add sub sll slt sltu xor srl sra or and` (+ M: `mul mulh mulhsu mulhu div divu rem remu`, funct7=0000001) |
-| 0001111 MISC-MEM | `fence`, `fence.i` |
+| 0001111 MISC-MEM | `fence`, `fence.tso`, `fence.i` (reserved `fm`/rd/rs1 encodings execute as a plain `fence`; Grail is single-hart, so all are no-ops) |
 | 1110011 SYSTEM | `ecall ebreak mret sret wfi sfence.vma csrrw csrrs csrrc csrrwi csrrsi csrrci` |
 | 0001011 custom-0 | Xcal: `xcal.dbg`, `xcal.halt` (section 9) |
 | 0101011 custom-1 | reserved for future Xcal extensions |
@@ -264,6 +264,8 @@ Test programs live in `crates/merlin/tests/cases/*.c`, each starting with `// ex
 
 Why ELF rather than a custom format: it costs little more to write, and it means clang/lld, `llvm-objdump` and `llvm-readelf` can check our output and produce reference files, and riscv-tests ELFs load directly. A custom format can still be added later as an exercise.
 
+All reading goes through one crate, `elf32` (header, program headers, sections, symbols, `.rela`/`.rel` entries, RISC-V relocation names). Grail's loader and merlin-objdump use it; merlin-ld still reads its input objects with its own `src/object.rs` and should move to it. Writers stay in each tool.
+
 ### Linker (`merlin-ld`)
 
 `merlin-ld a.o b.o [-T link.ld] [-e entry] [-o out.elf] [--Map out.map]`. The reference is ld.lld: for the same objects and script, the allocated sections (names, types, addresses, sizes, alignments, A/W/X flags), `PT_LOAD`s and symbol values must match, except for the differences listed at the end of this subsection. This is checked against committed `llvm-readelf` output of ld.lld links (`crates/merlin-ld/tests/fixtures`, regenerated with `cargo xtask ld-fixtures`), including layout edge cases (empty and assignment-only output sections, gaps, `NOBITS` before `PROGBITS`).
@@ -283,6 +285,18 @@ Why ELF rather than a custom format: it costs little more to write, and it means
   - Output section flags are only `SHF_ALLOC`, `SHF_WRITE` and `SHF_EXECINSTR` (ld.lld also carries `SHF_MERGE`/`SHF_STRINGS` over from merged inputs).
   - Unmatched allocated sections are errors, not orphans placed by heuristics. `/DISCARD/`, `NOLOAD`, `AT`, and output section addresses or attributes (`.sec ALIGN(16) : { }`) are not supported.
   - Only `PT_LOAD` program headers (no `PT_GNU_STACK` or `PT_RISCV_ATTRIBUTES`), and no `.riscv.attributes` or `.comment` in the output. File offsets of empty and `NOBITS` sections may differ.
+
+### Disassembler output
+
+`merlin-objdump` takes llvm-objdump's options (`-d -r -t -h -x -f -p -s`, `-M no-aliases`, `--no-show-raw-insn`) and prints the same text as llvm-objdump 21, so the two can be diffed: same layout, pseudo-instructions where LLVM prints them (`mv`, `ret`, `beqz`, `csrr`, ...), hex immediates, branch targets as `0x80000044 <puts+0x28>`, `jalr` after `auipc` resolved to `<symbol>`, and relocations under their instruction with `-dr`. The deliberate differences:
+
+- Xcal instructions print as `xcal.dbg`/`xcal.halt` and undecodable words as `.word 0x...` (trailing odd bytes as `.byte`), where LLVM prints `<unknown>`.
+- Reserved fence encodings (non-zero `fm`, `rs1` or `rd`, and `fence.i` with operand bits set) print as the `fence`/`fence.i` Grail executes. Like LLVM, the disassembler still forgets the `auipc` values it tracks at them.
+- `dret` (debug mode, which Excalibur does not have) prints as `.word 0x7b200073`.
+- A branch or jump target below the symbol it is named after (a negative target that wraps around in a `.o`) gets a 32-bit displacement, `<f+0xffffff04>`, where LLVM prints a 64-bit one, `<f+0xffffffffffffff04>`.
+- CSR names come from `excalibur::csr`; CSRs not listed there print as numbers.
+
+The instruction formatting itself (`Inst::format` in `excalibur`) is shared with Grail's `--trace`, which uses the plain form: no pseudo-instructions, decimal immediates, relative branch offsets.
 
 ### Bootstrapping
 

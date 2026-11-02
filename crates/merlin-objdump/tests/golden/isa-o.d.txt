@@ -1,0 +1,215 @@
+
+crates/merlin-objdump/tests/fixtures/isa.o:	file format elf32-littleriscv
+
+Disassembly of section .text:
+
+00000000 <isa_start>:
+       0: 12345537     	lui	a0, 0x12345
+       4: ffffffb7     	lui	t6, 0xfffff
+       8: 00001597     	auipc	a1, 0x1
+       c: 00000417     	auipc	s0, 0x0
+      10: 004000ef     	jal	0x14 <isa_start+0x14>
+      14: 0000006f     	j	0x14 <isa_start+0x14>
+      18: ffdff2ef     	jal	t0, 0x14 <isa_start+0x14>
+      1c: 000500e7     	jalr	a0
+      20: 00008067     	ret
+      24: 00078067     	jr	a5
+      28: 004500e7     	jalr	0x4(a0)
+      2c: ff858067     	jr	-0x8(a1)
+      30: 00060367     	jalr	t1, a2
+      34: 00c60367     	jalr	t1, 0xc(a2)
+      38: 04b50063     	beq	a0, a1, 0x78 <isa_start+0x78>
+      3c: 02050e63     	beqz	a0, 0x78 <isa_start+0x78>
+      40: 02a00c63     	beq	zero, a0, 0x78 <isa_start+0x78>
+      44: 02b51a63     	bne	a0, a1, 0x78 <isa_start+0x78>
+      48: 02051863     	bnez	a0, 0x78 <isa_start+0x78>
+      4c: 02a01663     	bne	zero, a0, 0x78 <isa_start+0x78>
+      50: 02b54463     	blt	a0, a1, 0x78 <isa_start+0x78>
+      54: 02054263     	bltz	a0, 0x78 <isa_start+0x78>
+      58: 02a04063     	bgtz	a0, 0x78 <isa_start+0x78>
+      5c: 00b55e63     	bge	a0, a1, 0x78 <isa_start+0x78>
+      60: 00055c63     	bgez	a0, 0x78 <isa_start+0x78>
+      64: 00a05a63     	blez	a0, 0x78 <isa_start+0x78>
+      68: 00b56863     	bltu	a0, a1, 0x78 <isa_start+0x78>
+      6c: 00a06663     	bltu	zero, a0, 0x78 <isa_start+0x78>
+      70: 00b57463     	bgeu	a0, a1, 0x78 <isa_start+0x78>
+      74: 00057263     	bgeu	a0, zero, 0x78 <isa_start+0x78>
+      78: f8b50ee3     	beq	a0, a1, 0x14 <isa_start+0x14>
+      7c: 00058503     	lb	a0, 0x0(a1)
+      80: fff11503     	lh	a0, -0x1(sp)
+      84: 7ff12503     	lw	a0, 0x7ff(sp)
+      88: 80044503     	lbu	a0, -0x800(s0)
+      8c: 010f5f83     	lhu	t6, 0x10(t5)
+      90: 00a58023     	sb	a0, 0x0(a1)
+      94: fea11f23     	sh	a0, -0x2(sp)
+      98: 7e112e23     	sw	ra, 0x7fc(sp)
+      9c: 00000013     	nop
+      a0: 00150013     	addi	zero, a0, 0x1
+      a4: 00500513     	li	a0, 0x5
+      a8: 80000513     	li	a0, -0x800
+      ac: 00050593     	mv	a1, a0
+      b0: fff50593     	addi	a1, a0, -0x1
+      b4: 7ff10113     	addi	sp, sp, 0x7ff
+      b8: ffb5a513     	slti	a0, a1, -0x5
+      bc: 0005a513     	slti	a0, a1, 0x0
+      c0: 0015b513     	seqz	a0, a1
+      c4: fff5b513     	sltiu	a0, a1, -0x1
+      c8: fff5c513     	not	a0, a1
+      cc: 0555c513     	xori	a0, a1, 0x55
+      d0: 0005e513     	ori	a0, a1, 0x0
+      d4: 0ff5f513     	zext.b	a0, a1
+      d8: ff05f513     	andi	a0, a1, -0x10
+      dc: 00059513     	slli	a0, a1, 0x0
+      e0: 01f59513     	slli	a0, a1, 0x1f
+      e4: 0075d513     	srli	a0, a1, 0x7
+      e8: 41f5d513     	srai	a0, a1, 0x1f
+      ec: 00c58533     	add	a0, a1, a2
+      f0: 00c00533     	add	a0, zero, a2
+      f4: 40c58533     	sub	a0, a1, a2
+      f8: 40c00533     	neg	a0, a2
+      fc: 00c59533     	sll	a0, a1, a2
+     100: 00c5a533     	slt	a0, a1, a2
+     104: 0005a533     	sltz	a0, a1
+     108: 00b02533     	sgtz	a0, a1
+     10c: 00c5b533     	sltu	a0, a1, a2
+     110: 00c03533     	snez	a0, a2
+     114: 00063533     	sltu	a0, a2, zero
+     118: 00c5c533     	xor	a0, a1, a2
+     11c: 00c5d533     	srl	a0, a1, a2
+     120: 40c5d533     	sra	a0, a1, a2
+     124: 00c5e533     	or	a0, a1, a2
+     128: 00c5f533     	and	a0, a1, a2
+     12c: 02c58533     	mul	a0, a1, a2
+     130: 02c59533     	mulh	a0, a1, a2
+     134: 02c5a533     	mulhsu	a0, a1, a2
+     138: 02c5b533     	mulhu	a0, a1, a2
+     13c: 02c5c533     	div	a0, a1, a2
+     140: 02c5d533     	divu	a0, a1, a2
+     144: 02c5e533     	rem	a0, a1, a2
+     148: 023ffdb3     	remu	s11, t6, gp
+     14c: 0ff0000f     	fence
+     150: 0330000f     	fence	rw, rw
+     154: 0210000f     	fence	r, w
+     158: 0840000f     	fence	i, o
+     15c: 0f20000f     	fence	iorw, r
+     160: 8330000f     	fence.tso
+     164: 0000100f     	fence.i
+     168: 00000073     	ecall
+     16c: 00100073     	ebreak
+     170: 30200073     	mret
+     174: 10200073     	sret
+     178: 10500073     	wfi
+     17c: 12000073     	sfence.vma
+     180: 12050073     	sfence.vma	a0
+     184: 12b50073     	sfence.vma	a0, a1
+     188: 12b00073     	sfence.vma	zero, a1
+     18c: 34051573     	csrrw	a0, mscratch, a0
+     190: 30529073     	csrw	mtvec, t0
+     194: 30002573     	csrr	a0, mstatus
+     198: 3045a573     	csrrs	a0, mie, a1
+     19c: 3045a073     	csrs	mie, a1
+     1a0: 3445b573     	csrrc	a0, mip, a1
+     1a4: 1005b073     	csrc	sstatus, a1
+     1a8: 3002d573     	csrrwi	a0, mstatus, 0x5
+     1ac: 300fd073     	csrwi	mstatus, 0x1f
+     1b0: 30046073     	csrsi	mstatus, 0x8
+     1b4: 10417073     	csrci	sie, 0x2
+     1b8: 30006573     	csrrsi	a0, mstatus, 0x0
+     1bc: 3000f573     	csrrci	a0, mstatus, 0x1
+     1c0: c0002573     	rdcycle	a0
+     1c4: c01025f3     	rdtime	a1
+     1c8: c0202673     	rdinstret	a2
+     1cc: c80026f3     	rdcycleh	a3
+     1d0: c8102773     	rdtimeh	a4
+     1d4: c82027f3     	rdinstreth	a5
+     1d8: f1402573     	csrr	a0, mhartid
+     1dc: 18002573     	csrr	a0, satp
+     1e0: 7c002573     	csrr	a0, 0x7c0
+     1e4: 3a102573     	csrr	a0, pmpcfg1
+     1e8: 80051073     	csrw	0x800, a0
+     1ec: b00022f3     	csrr	t0, mcycle
+     1f0: c0001073     	unimp
+     1f4: 0005000b     	<unknown>
+     1f8: 0000100b     	<unknown>
+     1fc: 0000         	<unknown>
+     1fe: 0000         	<unknown>
+     200: ff           	<unknown>
+     201: ff           	<unknown>
+     202: ff           	<unknown>
+     203: 0bff 0520 1300 0005 1300     	<unknown>
+
+00000208 <edge>:
+     208: 00000513     	li	a0, 0x0
+     20c: 00500013     	li	zero, 0x5
+     210: 00050013     	mv	zero, a0
+     214: 00002533     	sltz	a0, zero
+     218: 00003533     	snez	a0, zero
+     21c: 40000533     	neg	a0, zero
+     220: fe0044e3     	bltz	zero, 0x208 <edge>
+     224: fe0052e3     	blez	zero, 0x208 <edge>
+     228: fe0000e3     	beqz	zero, 0x208 <edge>
+     22c: c0002073     	rdcycle	zero
+     230: 30002073     	csrr	zero, mstatus
+     234: 30001073     	csrw	mstatus, zero
+     238: 00200033     	add	zero, zero, sp
+     23c: 02056013     	ori	zero, a0, 0x20
+     240: 0100000f     	fence	w, 0
+     244: 8ff0000f     	<unknown>
+     248: 0ff5000f     	<unknown>
+     24c: 0ff0008f     	<unknown>
+     250: 0015c513     	xori	a0, a1, 0x1
+     254: 10000067     	jr	0x100(zero) <isa_start+0x100>
+
+00000258 <calls>:
+     258: 00000297     	auipc	t0, 0x0
+     25c: 008280e7     	jalr	0x8(t0) <calls+0x8>
+     260: 00001317     	auipc	t1, 0x1
+     264: ffc30067     	jr	-0x4(t1) <regs+0xf90>
+     268: 00000537     	lui	a0, 0x0
+     26c: 010500e7     	jalr	0x10(a0)
+     270: 00000597     	auipc	a1, 0x0
+     274: 00458593     	addi	a1, a1, 0x4
+     278: 000580e7     	jalr	a1
+     27c: 00000617     	auipc	a2, 0x0
+     280: 0000         	<unknown>
+     282: 0000         	<unknown>
+     284: 000600e7     	jalr	a2
+     288: 00000697     	auipc	a3, 0x0
+     28c: 0006a703     	lw	a4, 0x0(a3)
+     290: 000680e7     	jalr	a3 <calls+0x30>
+     294: 00000697     	auipc	a3, 0x0
+     298: 30200073     	mret
+     29c: 000680e7     	jalr	a3
+     2a0: 00000697     	auipc	a3, 0x0
+     2a4: 00000073     	ecall
+     2a8: 000680e7     	jalr	a3 <calls+0x48>
+     2ac: 00000697     	auipc	a3, 0x0
+     2b0: 0005000b     	<unknown>
+     2b4: 000680e7     	jalr	a3
+     2b8: 00000697     	auipc	a3, 0x0
+     2bc: 00051263     	bnez	a0, 0x2c0 <calls+0x68>
+     2c0: 000680e7     	jalr	a3
+     2c4: 00000697     	auipc	a3, 0x0
+
+000002c8 <second>:
+     2c8: 000680e7     	jalr	a3
+
+000002cc <regs>:
+     2cc: 00000697     	auipc	a3, 0x0
+     2d0: 000006b7     	lui	a3, 0x0
+     2d4: 000680e7     	jalr	a3
+     2d8: 00000697     	auipc	a3, 0x0
+     2dc: 300026f3     	csrr	a3, mstatus
+     2e0: 000680e7     	jalr	a3
+     2e4: 00000697     	auipc	a3, 0x0
+     2e8: 000280e7     	jalr	t0
+     2ec: 000680e7     	jalr	a3
+     2f0: 00000697     	auipc	a3, 0x0
+     2f4: 8ff0000f     	<unknown>
+     2f8: 000680e7     	jalr	a3
+     2fc: 00000697     	auipc	a3, 0x0
+     300: 0010100f     	<unknown>
+     304: 000680e7     	jalr	a3
+     308: 00000697     	auipc	a3, 0x0
+     30c: 0ff0000f     	fence
+     310: 000680e7     	jalr	a3 <regs+0x3c>

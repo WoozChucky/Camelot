@@ -191,7 +191,11 @@ pub fn decode(w: u32) -> Inst {
             Inst::Op { op, rd, rs1, rs2 }
         }
         OP_MISC_MEM => match funct3(w) {
-            0 => Inst::Fence,
+            0 if w >> 20 == 0x833 => Inst::FenceTso,
+            0 => Inst::Fence {
+                pred: ((w >> 24) & 0xf) as u8,
+                succ: ((w >> 20) & 0xf) as u8,
+            },
             1 => Inst::FenceI,
             _ => illegal,
         },
@@ -313,6 +317,17 @@ mod tests {
             }
         );
         assert!(matches!(decode(0), Inst::Illegal(0)));
+    }
+
+    #[test]
+    fn fences() {
+        assert_eq!(decode(0x0ff0000f), Inst::Fence { pred: 0xf, succ: 0xf });
+        assert_eq!(decode(0x0210000f), Inst::Fence { pred: 0x2, succ: 0x1 });
+        assert_eq!(decode(0x8330000f), Inst::FenceTso);
+        assert_eq!(decode(0x0000100f), Inst::FenceI);
+        // Reserved fm / rd / rs1 values execute as a normal fence.
+        assert_eq!(decode(0x8ff0000f), Inst::Fence { pred: 0xf, succ: 0xf });
+        assert_eq!(decode(0x0ff5008f), Inst::Fence { pred: 0xf, succ: 0xf });
     }
 
     #[test]

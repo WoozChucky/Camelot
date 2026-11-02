@@ -1,0 +1,39 @@
+
+examples/hello/hello.elf:	file format elf32-littleriscv
+architecture: riscv32
+start address: 0x80000000
+
+Program Header:
+    LOAD off    0x00001000 vaddr 0x80000000 paddr 0x80000000 align 2**12
+         filesz 0x0000004c memsz 0x0000004c flags r-x
+    LOAD off    0x0000104c vaddr 0x8000004c paddr 0x8000004c align 2**12
+         filesz 0x00000015 memsz 0x00000015 flags r--
+   STACK off    0x00000000 vaddr 0x00000000 paddr 0x00000000 align 2**64
+         filesz 0x00000000 memsz 0x00000000 flags rw-
+ UNKNOWN off    0x00001061 vaddr 0x00000000 paddr 0x00000000 align 2**0
+         filesz 0x00000028 memsz 0x00000028 flags r--
+
+Dynamic Section:
+
+Sections:
+Idx Name              Size     VMA      Type
+  0                   00000000 00000000 
+  1 .text             0000004c 80000000 TEXT
+  2 .rodata           00000015 8000004c DATA
+  3 .riscv.attributes 00000028 00000000 
+  4 .comment          0000001a 00000000 
+  5 .symtab           000000b0 00000000 
+  6 .shstrtab         00000044 00000000 
+  7 .strtab           0000004c 00000000 
+
+SYMBOL TABLE:
+10000000 l       *ABS*	00000000 UART_BASE
+00000005 l       *ABS*	00000000 UART_LSR
+00000020 l       *ABS*	00000000 LSR_THRE
+80000000 l       .text	00000000 $x.0
+8000004c l       .rodata	00000000 message
+8000001c l       .text	00000000 puts
+8000004c l       .rodata	00000000 $d.1
+00000000 l       *ABS*	00000000 $d.2
+80000000 g       .text	00000000 _start
+80010070 g       .rodata	00000000 __stack_top

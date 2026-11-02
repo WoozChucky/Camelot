@@ -1,0 +1,215 @@
+
+crates/merlin-objdump/tests/fixtures/isa.o:	file format elf32-littleriscv
+
+Disassembly of section .text:
+
+00000000 <isa_start>:
+       0:      	lui	a0, 0x12345
+       4:      	lui	t6, 0xfffff
+       8:      	auipc	a1, 0x1
+       c:      	auipc	s0, 0x0
+      10:      	jal	ra, 0x14 <isa_start+0x14>
+      14:      	jal	zero, 0x14 <isa_start+0x14>
+      18:      	jal	t0, 0x14 <isa_start+0x14>
+      1c:      	jalr	ra, 0x0(a0)
+      20:      	jalr	zero, 0x0(ra)
+      24:      	jalr	zero, 0x0(a5)
+      28:      	jalr	ra, 0x4(a0)
+      2c:      	jalr	zero, -0x8(a1)
+      30:      	jalr	t1, 0x0(a2)
+      34:      	jalr	t1, 0xc(a2)
+      38:      	beq	a0, a1, 0x78 <isa_start+0x78>
+      3c:      	beq	a0, zero, 0x78 <isa_start+0x78>
+      40:      	beq	zero, a0, 0x78 <isa_start+0x78>
+      44:      	bne	a0, a1, 0x78 <isa_start+0x78>
+      48:      	bne	a0, zero, 0x78 <isa_start+0x78>
+      4c:      	bne	zero, a0, 0x78 <isa_start+0x78>
+      50:      	blt	a0, a1, 0x78 <isa_start+0x78>
+      54:      	blt	a0, zero, 0x78 <isa_start+0x78>
+      58:      	blt	zero, a0, 0x78 <isa_start+0x78>
+      5c:      	bge	a0, a1, 0x78 <isa_start+0x78>
+      60:      	bge	a0, zero, 0x78 <isa_start+0x78>
+      64:      	bge	zero, a0, 0x78 <isa_start+0x78>
+      68:      	bltu	a0, a1, 0x78 <isa_start+0x78>
+      6c:      	bltu	zero, a0, 0x78 <isa_start+0x78>
+      70:      	bgeu	a0, a1, 0x78 <isa_start+0x78>
+      74:      	bgeu	a0, zero, 0x78 <isa_start+0x78>
+      78:      	beq	a0, a1, 0x14 <isa_start+0x14>
+      7c:      	lb	a0, 0x0(a1)
+      80:      	lh	a0, -0x1(sp)
+      84:      	lw	a0, 0x7ff(sp)
+      88:      	lbu	a0, -0x800(s0)
+      8c:      	lhu	t6, 0x10(t5)
+      90:      	sb	a0, 0x0(a1)
+      94:      	sh	a0, -0x2(sp)
+      98:      	sw	ra, 0x7fc(sp)
+      9c:      	addi	zero, zero, 0x0
+      a0:      	addi	zero, a0, 0x1
+      a4:      	addi	a0, zero, 0x5
+      a8:      	addi	a0, zero, -0x800
+      ac:      	addi	a1, a0, 0x0
+      b0:      	addi	a1, a0, -0x1
+      b4:      	addi	sp, sp, 0x7ff
+      b8:      	slti	a0, a1, -0x5
+      bc:      	slti	a0, a1, 0x0
+      c0:      	sltiu	a0, a1, 0x1
+      c4:      	sltiu	a0, a1, -0x1
+      c8:      	xori	a0, a1, -0x1
+      cc:      	xori	a0, a1, 0x55
+      d0:      	ori	a0, a1, 0x0
+      d4:      	andi	a0, a1, 0xff
+      d8:      	andi	a0, a1, -0x10
+      dc:      	slli	a0, a1, 0x0
+      e0:      	slli	a0, a1, 0x1f
+      e4:      	srli	a0, a1, 0x7
+      e8:      	srai	a0, a1, 0x1f
+      ec:      	add	a0, a1, a2
+      f0:      	add	a0, zero, a2
+      f4:      	sub	a0, a1, a2
+      f8:      	sub	a0, zero, a2
+      fc:      	sll	a0, a1, a2
+     100:      	slt	a0, a1, a2
+     104:      	slt	a0, a1, zero
+     108:      	slt	a0, zero, a1
+     10c:      	sltu	a0, a1, a2
+     110:      	sltu	a0, zero, a2
+     114:      	sltu	a0, a2, zero
+     118:      	xor	a0, a1, a2
+     11c:      	srl	a0, a1, a2
+     120:      	sra	a0, a1, a2
+     124:      	or	a0, a1, a2
+     128:      	and	a0, a1, a2
+     12c:      	mul	a0, a1, a2
+     130:      	mulh	a0, a1, a2
+     134:      	mulhsu	a0, a1, a2
+     138:      	mulhu	a0, a1, a2
+     13c:      	div	a0, a1, a2
+     140:      	divu	a0, a1, a2
+     144:      	rem	a0, a1, a2
+     148:      	remu	s11, t6, gp
+     14c:      	fence	iorw, iorw
+     150:      	fence	rw, rw
+     154:      	fence	r, w
+     158:      	fence	i, o
+     15c:      	fence	iorw, r
+     160:      	fence.tso
+     164:      	fence.i
+     168:      	ecall
+     16c:      	ebreak
+     170:      	mret
+     174:      	sret
+     178:      	wfi
+     17c:      	sfence.vma	zero, zero
+     180:      	sfence.vma	a0, zero
+     184:      	sfence.vma	a0, a1
+     188:      	sfence.vma	zero, a1
+     18c:      	csrrw	a0, mscratch, a0
+     190:      	csrrw	zero, mtvec, t0
+     194:      	csrrs	a0, mstatus, zero
+     198:      	csrrs	a0, mie, a1
+     19c:      	csrrs	zero, mie, a1
+     1a0:      	csrrc	a0, mip, a1
+     1a4:      	csrrc	zero, sstatus, a1
+     1a8:      	csrrwi	a0, mstatus, 0x5
+     1ac:      	csrrwi	zero, mstatus, 0x1f
+     1b0:      	csrrsi	zero, mstatus, 0x8
+     1b4:      	csrrci	zero, sie, 0x2
+     1b8:      	csrrsi	a0, mstatus, 0x0
+     1bc:      	csrrci	a0, mstatus, 0x1
+     1c0:      	csrrs	a0, cycle, zero
+     1c4:      	csrrs	a1, time, zero
+     1c8:      	csrrs	a2, instret, zero
+     1cc:      	csrrs	a3, cycleh, zero
+     1d0:      	csrrs	a4, timeh, zero
+     1d4:      	csrrs	a5, instreth, zero
+     1d8:      	csrrs	a0, mhartid, zero
+     1dc:      	csrrs	a0, satp, zero
+     1e0:      	csrrs	a0, 0x7c0, zero
+     1e4:      	csrrs	a0, pmpcfg1, zero
+     1e8:      	csrrw	zero, 0x800, a0
+     1ec:      	csrrs	t0, mcycle, zero
+     1f0:      	unimp
+     1f4:      	<unknown>
+     1f8:      	<unknown>
+     1fc:      	<unknown>
+     1fe:      	<unknown>
+     200:      	<unknown>
+     201:      	<unknown>
+     202:      	<unknown>
+     203:      	<unknown>
+
+00000208 <edge>:
+     208:      	addi	a0, zero, 0x0
+     20c:      	addi	zero, zero, 0x5
+     210:      	addi	zero, a0, 0x0
+     214:      	slt	a0, zero, zero
+     218:      	sltu	a0, zero, zero
+     21c:      	sub	a0, zero, zero
+     220:      	blt	zero, zero, 0x208 <edge>
+     224:      	bge	zero, zero, 0x208 <edge>
+     228:      	beq	zero, zero, 0x208 <edge>
+     22c:      	csrrs	zero, cycle, zero
+     230:      	csrrs	zero, mstatus, zero
+     234:      	csrrw	zero, mstatus, zero
+     238:      	add	zero, zero, sp
+     23c:      	ori	zero, a0, 0x20
+     240:      	fence	w, 0
+     244:      	<unknown>
+     248:      	<unknown>
+     24c:      	<unknown>
+     250:      	xori	a0, a1, 0x1
+     254:      	jalr	zero, 0x100(zero) <isa_start+0x100>
+
+00000258 <calls>:
+     258:      	auipc	t0, 0x0
+     25c:      	jalr	ra, 0x8(t0) <calls+0x8>
+     260:      	auipc	t1, 0x1
+     264:      	jalr	zero, -0x4(t1) <regs+0xf90>
+     268:      	lui	a0, 0x0
+     26c:      	jalr	ra, 0x10(a0)
+     270:      	auipc	a1, 0x0
+     274:      	addi	a1, a1, 0x4
+     278:      	jalr	ra, 0x0(a1)
+     27c:      	auipc	a2, 0x0
+     280:      	<unknown>
+     282:      	<unknown>
+     284:      	jalr	ra, 0x0(a2)
+     288:      	auipc	a3, 0x0
+     28c:      	lw	a4, 0x0(a3)
+     290:      	jalr	ra, 0x0(a3) <calls+0x30>
+     294:      	auipc	a3, 0x0
+     298:      	mret
+     29c:      	jalr	ra, 0x0(a3)
+     2a0:      	auipc	a3, 0x0
+     2a4:      	ecall
+     2a8:      	jalr	ra, 0x0(a3) <calls+0x48>
+     2ac:      	auipc	a3, 0x0
+     2b0:      	<unknown>
+     2b4:      	jalr	ra, 0x0(a3)
+     2b8:      	auipc	a3, 0x0
+     2bc:      	bne	a0, zero, 0x2c0 <calls+0x68>
+     2c0:      	jalr	ra, 0x0(a3)
+     2c4:      	auipc	a3, 0x0
+
+000002c8 <second>:
+     2c8:      	jalr	ra, 0x0(a3)
+
+000002cc <regs>:
+     2cc:      	auipc	a3, 0x0
+     2d0:      	lui	a3, 0x0
+     2d4:      	jalr	ra, 0x0(a3)
+     2d8:      	auipc	a3, 0x0
+     2dc:      	csrrs	a3, mstatus, zero
+     2e0:      	jalr	ra, 0x0(a3)
+     2e4:      	auipc	a3, 0x0
+     2e8:      	jalr	ra, 0x0(t0)
+     2ec:      	jalr	ra, 0x0(a3)
+     2f0:      	auipc	a3, 0x0
+     2f4:      	<unknown>
+     2f8:      	jalr	ra, 0x0(a3)
+     2fc:      	auipc	a3, 0x0
+     300:      	<unknown>
+     304:      	jalr	ra, 0x0(a3)
+     308:      	auipc	a3, 0x0
+     30c:      	fence	iorw, iorw
+     310:      	jalr	ra, 0x0(a3) <regs+0x3c>
