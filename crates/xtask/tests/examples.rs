@@ -4,7 +4,8 @@
 //! * the committed `examples/<dir>/<name>.elf` files are exactly what the
 //!   current tools build from the sources;
 //! * each freshly built program runs in Grail, with input where it reads some
-//!   (UART bytes, key events, pointer input, a disk), and prints what it should and exits
+//!   (UART bytes, key events, pointer input, a disk, another machine on a
+//!   network), and prints what it should and exits
 //!   with the right code;
 //! * `hello` and `multiobj` load byte for byte like ld.lld's link of clang's
 //!   objects (the references in `crates/merlin-ld/tests/fixtures`, made by
@@ -15,8 +16,9 @@
 use elf32::{Elf, PT_GNU_STACK, PT_LOAD, PT_RISCV_ATTRIBUTES, SHF_ALLOC, SHT_SYMTAB};
 use grail::block::SECTOR_SIZE;
 use grail::keyboard::{code, KeyEvent};
+use grail::net::Hub;
 use grail::pointer::{PointerInput, BUTTON_LEFT};
-use grail::{DiskConfig, Machine, MachineConfig, RunResult};
+use grail::{DiskConfig, Machine, MachineConfig, NetConfig, RunResult};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
@@ -144,6 +146,8 @@ fn scenario(name: &str) -> Scenario {
                 0,
             )
         },
+        // Alone, without a network card; `net_examples_talk_over_a_hub` connects them.
+        "net-ping" | "net-pong" => plain("no network card (try grail --net hub)\n", 1),
         other => panic!("no scenario for example {other}: add one"),
     }
 }
@@ -293,6 +297,49 @@ fn interactive_examples_wait_for_input() {
         let (r, out, _) = run(&build(example(name)).elf, &idle);
         assert_eq!((r, out.as_str()), (RunResult::StepLimit, ""), "{name}");
     }
+}
+
+/// `examples/net`: ping and pong, freshly built, on two machines connected by a
+/// hub. Pong starts first, so its card has buffers when ping's frame comes.
+#[test]
+fn net_examples_talk_over_a_hub() {
+    let hub = Hub::new();
+    let boot = |name: &str| {
+        let config = MachineConfig {
+            nets: vec![NetConfig::hub(&hub)],
+            ..MachineConfig::default()
+        };
+        let mut m = Machine::new(config).unwrap();
+        m.cpu.bus.uart.capture = true;
+        m.load_elf(&build(example(name)).elf).unwrap();
+        m
+    };
+    let mut ping = boot("net-ping");
+    let mut pong = boot("net-pong");
+    pong.run_for(20_000, &mut |_| {});
+    for _ in 0..1000 {
+        ping.run_for(1000, &mut |_| {});
+        pong.run_for(1000, &mut |_| {});
+    }
+    let out = |m: &mut Machine| String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
+    assert_eq!(
+        (ping.exit_code(), out(&mut ping).as_str()),
+        (
+            Some(0),
+            "net 0x10009000, irq 12, mac 02:ca:00:00:00:01, link up\n\
+             sent 60 bytes to ff:ff:ff:ff:ff:ff\n\
+             received 60 bytes from 02:ca:00:00:00:02, type 0x88b5: Hello back from pong!\n"
+        )
+    );
+    assert_eq!(
+        (pong.exit_code(), out(&mut pong).as_str()),
+        (
+            Some(0),
+            "net 0x10009000, irq 12, mac 02:ca:00:00:00:02, link up\n\
+             received 60 bytes from 02:ca:00:00:00:01, type 0x88b5: Hello from ping!\n\
+             sent 60 bytes to 02:ca:00:00:00:01\n"
+        )
+    );
 }
 
 /// Without a disk, `examples/disk` says so and exits with 1: the scenario's
