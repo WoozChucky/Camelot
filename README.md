@@ -18,7 +18,7 @@ You need [Rust](https://rustup.rs) and nothing else: no crates to download, no L
 cargo xtask up --demo
 ```
 
-This builds the platform in release mode (a few minutes the first time), builds the Camelot root image (`target/camelot-fs.img`, the kernel and its programs on a bootable disk of 2 MiB) and puts it in Lake's images directory, `target/platform/images`, as the image `os-base`. Then it runs Lake, Avalon and Pendragon, with their output in this terminal, each line prefixed by its server. `--demo` also creates a switch `nat` with a NAT gateway, and a VM `vm001` with the default hardware (4 MiB of RAM) that boots Camelot from `vm001-disk0`, its own copy of the image, plugged into the switch. Once everything is up, `up` says where it is:
+This builds the platform in release mode (a few minutes the first time), builds the Camelot root image (`target/camelot-fs.img`, the kernel and its programs on a bootable disk of 2 MiB) and puts it in Lake's images directory, `target/platform/images`, as the image `os-base`. Then it runs Lake, Avalon and Pendragon, with their output in this terminal, each line prefixed by its server. `--demo` also creates a switch `nat` with a NAT gateway, and a VM `vm001` with the default hardware (4 MiB of RAM) that boots Camelot from `vm001-disk0`, its own copy of the image, plugged into the switch. The gateway forwards 127.0.0.1:2323 to the VM's port 23, and once the VM is at its prompt `up` starts `shd` there, Camelot's shell server (it types `shd &` on the console). Once everything is up, `up` says where it is:
 
 ```
 The Avalon platform is up.
@@ -38,11 +38,12 @@ cargo run --release -p round-table -- create --name web --camelot --start
 cargo run --release -p round-table -- list
 cargo run --release -p herald -- web
 cargo run --release -p herald -- vm001
+cargo run --release -p herald -- --tcp 127.0.0.1:2323
 ```
 
-Ctrl-] leaves Herald, and the VM carries on. **Ctrl-C** in the first terminal stops Pendragon, Avalon and Lake. The images stay in `target/platform/images`, so a VM's disk keeps what it wrote: the next `cargo xtask up` serves them again (the VMs themselves end with Avalon; `--demo` creates its VM again on its old disk). `up` replaces the image `os-base` when a build has changed it, and leaves every other image alone, so a disk copied from it before keeps the old build: `--demo` still boots `vm001-disk0` as it is (and says so). Delete `target/platform/images/vm001-disk0` while `up` is not running to have the demo copy the new image.
+Ctrl-] leaves Herald, and the VM carries on. The console is one for the whole VM: every Herald attached to it shares its input and output, so while the shell there runs `sleep 5000`, nobody gets a prompt. The last command is different: `herald --tcp` connects straight to the demo VM's `shd` (not through Avalon), and each connection is a shell of its own, beside the console's and the other connections', so one busy session never holds up another. There Herald edits the line (Backspace, Ctrl-U, Ctrl-W) and sends it with Enter; Ctrl-D on an empty line ends the session, and so does `exit`. **`shd` is for local use only:** until Camelot has users, its shells run as root with no password, so keep the forward on 127.0.0.1 (`--shd ADDR` picks another address). Without `--demo`, a VM plugged into a NAT switch with a forward to its port 23 (`round-table switch create nat --nat --hostfwd tcp::2323-:23`) gets one by typing `shd &` on its console. **Ctrl-C** in the first terminal stops Pendragon, Avalon and Lake. The images stay in `target/platform/images`, so a VM's disk keeps what it wrote: the next `cargo xtask up` serves them again (the VMs themselves end with Avalon; `--demo` creates its VM again on its old disk). `up` replaces the image `os-base` when a build has changed it, and leaves every other image alone, so a disk copied from it before keeps the old build: `--demo` still boots `vm001-disk0` as it is (and says so). Delete `target/platform/images/vm001-disk0` while `up` is not running to have the demo copy the new image.
 
-`cargo xtask up --help` lists the options: `--images DIR` for another images directory, `--lake ADDR`, `--avalon ADDR` and `--pendragon ADDR` for other addresses, `--no-build` to start what is already built. To run the servers one by one instead, see [The Avalon platform](#the-avalon-platform); for Grail on its own, [Running](#running).
+`cargo xtask up --help` lists the options: `--images DIR` for another images directory, `--lake ADDR`, `--avalon ADDR`, `--pendragon ADDR` and `--shd ADDR` for other addresses, `--no-build` to start what is already built. To run the servers one by one instead, see [The Avalon platform](#the-avalon-platform); for Grail on its own, [Running](#running).
 
 ## Layout
 
@@ -56,7 +57,7 @@ crates/avalon           the Avalon hypervisor server: runs N Grail VMs and the v
 crates/avalon-client    the client side of the platform: VM and disk operations, shared by Round Table and Pendragon
 crates/round-table      the Round Table control CLI (a thin layer over avalon-client)
 crates/pendragon        the Pendragon web console: a std-only HTTP server and a browser page for VMs, disks and switches (docs/pendragon.md)
-crates/herald           Herald, the Avalon client that attaches a terminal to one VM's console, or a window to its screen
+crates/herald           Herald, the Avalon client that attaches a terminal to one VM's console, or a window to its screen; `--tcp` connects to a TCP port instead (a shell from shd)
 crates/lake             the Lake storage server: a directory of disk images, served as block devices over the protocol
 crates/camelot-fs       the Camelot filesystem on the host (docs/camelot-fs.md): mkfs, fsck and a reader, the `camelot-fs` command
 crates/merlin           the C-subset compiler (C → .s), with its test programs in tests/cases
@@ -265,7 +266,7 @@ Grail runs one machine for one terminal. The Avalon platform runs many, as long-
 | **Avalon** | `crates/avalon` | the hypervisor server: creates and runs N Grail VMs, each with its own hardware profile (RAM, clock, disks, network cards), keeps each VM's console and screen, and connects their cards with virtual Ethernet switches | done |
 | **Round Table** | `crates/round-table` | the control CLI: create, list, start, pause, resume, stop and destroy VMs; create, list, capture and delete switches, give them NAT gateways and plug cards in and out; create, list and delete Lake's disk images | done |
 | **Pendragon** | `crates/pendragon` | the web console: Round Table's VM, switch and disk commands, from a browser, plus live consoles and an overview of both servers | done (the screen view is still to come) |
-| **Herald** | `crates/herald` | attaches to one VM: its console, or its screen, keyboard and mouse | done |
+| **Herald** | `crates/herald` | attaches to one VM: its console, or its screen, keyboard and mouse; or connects to a TCP port (`--tcp`), a shell of its own from `shd` | done |
 | **Lake** | `crates/lake` | the storage server: disk images served as block devices over the network | done |
 
 They talk the Avalon protocol ([`docs/avalon-protocol.md`](docs/avalon-protocol.md)): length-prefixed binary frames over TCP, implemented once in `crates/avalon-proto` and shared by every program.
@@ -541,6 +542,8 @@ cargo run --release -p herald -- --screen bars
 ```
 
 The window is Grail's own (`grail::window`), titled `Herald: VM 1 'bars'`, at the screen's size. The keys typed and the mouse moved, clicked or wheeled over it go to the VM's keyboard and pointer devices, as in Grail's window (the pointer's position in the screen's pixels; runs of moves are sent as the last one, a press or release where it happened). Closing the window detaches, the VM carrying on. When the VM stops, exits or is destroyed, the window stays on its last frame, its title saying why, until it is closed; a pause and a resume show in the title too.
+
+**`--tcp HOST:PORT`** connects straight to a TCP port instead, not through Avalon: Windows has no `telnet` or `nc` by default, and a Camelot shell from `shd` (kernel/user/README.md) is one, each connection a shell of its own (`cargo xtask up --demo` forwards 127.0.0.1:2323 to its VM's). A socket has no line discipline at the far end, so on a terminal Herald edits and echoes the line itself, as a telnet client in line mode does: printable characters go into the line, Backspace erases one, Ctrl-U the line, Ctrl-W a word, arrow keys and other escape sequences are ignored, and Enter sends the line with a newline. Ctrl-D on an empty line ends the input (Herald shuts down its sending side, which `shd` takes as a hang-up), and Ctrl-] leaves, closing the connection; Herald also ends when the far end closes. Piped input goes as it is, a Ctrl-] in it still leaving, and its end shuts the sending side down, Herald staying until the far end closes, so `herald --tcp 127.0.0.1:2323 < script` prints all the script's output (end the script with `exit`). `herald::tcp::TcpSession` is the streaming layer and `herald::tcp::LineEditor` the editor, both without a terminal; `crates/herald/tests/tcp.rs` runs them against small servers on loopback, and the binary through pipes.
 
 As a library, `herald::Session::attach(connection, &vm)` attaches and `Session::run(input, output, notices)` streams: keys from a channel of bytes, the console to any `Write`. `herald::screen::ScreenSession::attach(connection, &vm)` and `ScreenSession::run(view)` do the same for the screen, with any `View`: something that can draw an `avalon_proto::Screen` and hand over input (`herald::window::WindowView` is the window). Neither knows of terminals or windows, which is how they are tested.
 

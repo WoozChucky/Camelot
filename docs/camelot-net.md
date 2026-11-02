@@ -195,9 +195,10 @@ checksum, or fewer than 8 bytes, counts in `icmp`.
 
 The sending side is `icmp_ping(dst, id, seq, timeout, reply)`: an echo
 request with 56 bytes of data (`PING_DATA`, 64 bytes of ICMP) and the
-process waits in a slot (one per process) for the reply with the same
-identifier and sequence number. The `ping` system call uses the caller's pid
-as the identifier, so two processes' pings never mix, and a one-second
+thread waits in a slot (one per thread) for the reply with the same
+identifier and sequence number. The `ping` system call uses the caller's tid
+as the identifier (a single-threaded process's tid is its pid), so two
+threads' pings never mix, and a one-second
 timeout. The round-trip time comes from the CLINT's `mtime` and is reported
 in microseconds.
 
@@ -456,6 +457,24 @@ depend on how fast the host runs Grail.
   (index.html for a directory, else a listing) over HTTP/1.0 to one client
   at a time, with a log line per request, for COUNT connections or until it
   is killed.
+- **`shd [-p PORT] [-n MAX] [-v]`** is the shell server: each TCP
+  connection to PORT (23) gets a shell of its own, `/bin/sh` spawned with
+  the connection as its descriptors 0, 1 and 2, so several people (or
+  windows) each have one, and a busy one holds up nobody. shd keeps a
+  descriptor for each connection and waits for the next one half a second
+  at a time (`SO_RCVTIMEO`); in between it collects the shells that ended
+  (`procs`, then `wait`) and ends their connections with `shutdown`, and
+  hangs up the sessions whose client left: `fstat` on a socket gives
+  `nlink` 0 once its other end has hung up (its FIN came, or a reset), and
+  with nothing left unread shd kills what the session runs (a shell that
+  reads the end of a connection kills its background programs itself
+  before it ends: once it has, nothing tells whose they were). There is no
+  line discipline on a socket, so the client edits lines (`herald --tcp`,
+  on Windows too) and the shell reads its input a byte at a time.
+  `kernel/user/README.md` ("shd") has the details, and the security
+  caveat: no users yet, so its shells run as root; forward its port from
+  127.0.0.1 only. `cargo xtask up --demo` starts it in its VM, with
+  127.0.0.1:2323 forwarded to port 23.
 - **`nettest`** moves known bytes through TCP (`nettest connect ADDR PORT
   BYTES [TIMES]` sends a pattern and reads to the end, `nettest serve PORT
   CONNECTIONS [BACKLOG]` echoes each connection, each printing the bytes'

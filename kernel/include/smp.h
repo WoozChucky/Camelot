@@ -37,7 +37,9 @@ u32 harts_running(void);
 /* After a change to page table `pt` that takes a mapping away or makes it
  * weaker: flushes this hart's TLB, then has every other hart that may hold
  * translations from `pt` flush its own (an IPI each), and waits until they
- * all have. Those are the harts whose satp is `pt` (cpus[i].pagetable), or
+ * all have. Those are the harts whose satp is `pt` (cpus[i].pagetable: the
+ * harts running a thread of the process that owns it, which may be
+ * several), or
  * every hart for the kernel page table, whose second-level tables every
  * process's page table shares. Must be called holding no spinlock unless no
  * other hart can be using `pt`: a hart that spins on a lock with

@@ -572,6 +572,13 @@ int socket_write(struct socket *s, pagetable_t pt, u32 src, u32 n);
 /* fstat()'s size: the bytes a read would get now (a stream's), or the
  * length of the next datagram. */
 u32 socket_bytes(struct socket *s);
+/* fstat()'s nlink of 0: nothing more will ever arrive. The peer ended its
+ * side (its FIN came), the connection was reset or timed out, or the socket
+ * was shut down for reading. Once what is buffered is read, a read returns
+ * at once: the end, or the error. So a program that holds a connection
+ * without reading it (shd, for its sessions) can tell the other end hung
+ * up. */
+bool socket_hung_up(struct socket *s);
 /* The last descriptor for the socket was closed: tcp_close() or
  * udp_close(), and the slot is free. */
 void socket_close(struct socket *s);

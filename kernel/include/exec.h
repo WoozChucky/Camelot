@@ -1,6 +1,6 @@
 /* Running programs (spec section 10, "Kernel files"): spawn and exec find
  * the executable a path names and hand it to the ELF loader (elf.c) through
- * proc_create() or proc_exec() (proc.c).
+ * proc_create() or proc_exec_load() (proc.c).
  *
  * With a root filesystem, a path is looked up like any other (from the
  * working directory unless it starts with `/`) and must name a regular
