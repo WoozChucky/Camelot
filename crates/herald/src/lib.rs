@@ -1,19 +1,29 @@
 //! Herald: the client of the Avalon platform that attaches to one VM to interact with
-//! it directly. This version does the VM's serial console (its UART): the recent output
-//! first, then the output live, and what is typed goes to the VM. The screen and the
-//! keyboard device come later, over the same connection.
+//! it directly: its serial console (its UART) in the terminal, the recent output first,
+//! then the output live, with what is typed going to the VM; or its screen (the
+//! framebuffer) in a window, with the window's keys and mouse going to the VM's keyboard
+//! and pointer devices.
 //!
-//! - [`Session`] is the streaming layer, and knows nothing of terminals: it attaches
-//!   over an Avalon [`Connection`], then runs one loop over everything that can happen
-//!   (output and events from the server, input bytes from a channel) until the detach
-//!   key, the end of the input, or the end of the VM. Output goes to any `Write`. The
-//!   tests drive it that way, with no terminal.
+//! - [`Session`] is the console's streaming layer, and knows nothing of terminals: it
+//!   attaches over an Avalon [`Connection`], then runs one loop over everything that
+//!   can happen (output and events from the server, input bytes from a channel) until
+//!   the detach key, the end of the input, or the end of the VM. Output goes to any
+//!   `Write`. The tests drive it that way, with no terminal.
+//! - [`screen::ScreenSession`] is the screen's, and knows nothing of windows: it
+//!   rebuilds the VM's screen from the server's frames and shows it in any
+//!   [`screen::View`]. The tests drive it with a view made of vectors; on Windows the
+//!   view is [`window::WindowView`], Grail's own framebuffer window.
 //! - [`Utf8Lossy`] keeps a Windows console fed with valid UTF-8, which Rust's console
 //!   stdout insists on.
 //! - [`parse_server`] reads `--server` values.
 //!
-//! The `herald` binary wires a session to the terminal: stdin in raw mode (Grail's
-//! [`grail::console::RawMode`], shared with Grail's own console) and stdout.
+//! The `herald` binary wires a console session to the terminal: stdin in raw mode
+//! (Grail's [`grail::console::RawMode`], shared with Grail's own console) and stdout;
+//! and with `--screen`, a screen session to a window.
+
+pub mod screen;
+#[cfg(windows)]
+pub mod window;
 
 use avalon_proto::{
     kind_of, AttachKind, Connection, Error, Frame, Message, MessageKind, VmRef, VmState, VmSummary,
@@ -40,11 +50,11 @@ pub const DETACH_TIMEOUT: Duration = Duration::from_secs(5);
 /// this only bounds a burst (a paste, or input piped in).
 const MAX_INPUT_BATCH: usize = 4096;
 
-/// Why a session ended. Every one of them leaves the VM as it is: detaching never
-/// pauses or stops it.
+/// Why a session (console or screen) ended. Every one of them leaves the VM as it is:
+/// detaching never pauses or stops it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum End {
-    /// The detach key was pressed.
+    /// The detach key was pressed (the console), or the window closed (the screen).
     Detached,
     /// The input ended (stdin closed, or not a terminal and read to its end), which
     /// detaches as well.
@@ -71,7 +81,7 @@ impl End {
 }
 
 /// Whether a VM in `state` can still run: stopped and exited are final.
-fn ended(state: VmState) -> bool {
+pub(crate) fn ended(state: VmState) -> bool {
     matches!(state, VmState::Stopped | VmState::Exited(_))
 }
 
@@ -329,7 +339,7 @@ impl Session {
 
 /// The error for a frame that cannot be placed while the answer to a request is due
 /// (as `Connection::request` reports it).
-fn out_of_step(cause: Error) -> Error {
+pub(crate) fn out_of_step(cause: Error) -> Error {
     Error::OutOfStep(format!("waiting for a reply, got: {cause}"))
 }
 

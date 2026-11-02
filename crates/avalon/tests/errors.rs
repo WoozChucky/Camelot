@@ -50,19 +50,18 @@ fn unknown_vms() {
             Message::StopVm { vm: vm.clone() },
             Message::DestroyVm { vm: vm.clone() },
             Message::ConsoleAttach { vm: vm.clone() },
+            Message::ScreenAttach { vm: vm.clone() },
         ] {
             assert_eq!(error_of(&mut rt, &msg), ErrorCode::NoSuchVm, "{msg:?}");
         }
     }
-    assert_eq!(
-        error_of(&mut rt, &Message::ConsoleDetach { vm: 9 }),
-        ErrorCode::NoSuchVm
-    );
+    for msg in [Message::ConsoleDetach { vm: 9 }, Message::ScreenDetach { vm: 9 }] {
+        assert_eq!(error_of(&mut rt, &msg), ErrorCode::NoSuchVm, "{msg:?}");
+    }
     // Attached nowhere.
-    assert_eq!(
-        error_of(&mut rt, &Message::ConsoleDetach { vm: 1 }),
-        ErrorCode::InvalidState
-    );
+    for msg in [Message::ConsoleDetach { vm: 1 }, Message::ScreenDetach { vm: 1 }] {
+        assert_eq!(error_of(&mut rt, &msg), ErrorCode::InvalidState, "{msg:?}");
+    }
     server.stop().unwrap();
 }
 
@@ -255,8 +254,6 @@ fn groups_avalon_does_not_serve() {
     let mut rt = connect(&server);
     create(&mut rt, "vm", profile(1, None), spinner());
     for msg in [
-        Message::ScreenAttach { vm: VmRef::Id(1) },
-        Message::ScreenDetach { vm: 1 },
         Message::BlockOpen {
             name: "disk".into(),
             read_only: true,
@@ -370,6 +367,13 @@ fn misdirected_and_malformed_frames() {
     })
     .unwrap();
     expect_reply(&mut conn, key, None);
+    let pointer = Frame::from_message(&Message::PointerInput {
+        vm: 1,
+        pointer: avalon_proto::PointerChange::default(),
+    })
+    .unwrap();
+    expect_reply(&mut conn, pointer, None);
+    expect_reply(&mut conn, frame(ty::POINTER_INPUT, &[1, 0, 0, 0, 7]), None);
     // A frame too short to have a type is consumed and answered.
     conn.get_mut().write_all(&[1, 0, 0, 0, 0xee]).unwrap();
     match conn.recv().unwrap() {
@@ -491,9 +495,13 @@ fn a_client_that_leaves_is_detached() {
         console.wait_for("x");
         drop(console);
     }
+    for _ in 0..2 {
+        drop(Viewer::attach(&server, VmRef::Id(id)));
+    }
     // Detached as they left, not only once the VM next writes to them.
     wait_until("the clients to be detached", SLOW, || {
-        server.debug_vm(id).unwrap().consoles == 0
+        let vm = server.debug_vm(id).unwrap();
+        vm.consoles == 0 && vm.viewers == 0
     });
     let mut last = Console::attach(&server, VmRef::Id(id));
     assert_eq!(last.scrollback, b"xxx");
