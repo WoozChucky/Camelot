@@ -36,7 +36,7 @@ Reuse `excalibur` (register names, CSR names, decoder, `Inst::format`) and `elf3
 
 ## Before pushing
 
-CI runs on Windows and Linux; run the same checks locally:
+CI runs on Linux only (Windows runners are expensive), so Windows is covered by running these checks locally on Windows before every push. Code behind `cfg(windows)`, such as the Win32 window, is only checked here:
 
 ```
 cargo fmt --check
