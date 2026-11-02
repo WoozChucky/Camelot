@@ -3,3 +3,6 @@
 tests/riscv-tests/rv32* binary
 *.S text eol=lf
 *.sh text eol=lf
+*.c text eol=lf
+*.s text eol=lf
+*.ast text eol=lf

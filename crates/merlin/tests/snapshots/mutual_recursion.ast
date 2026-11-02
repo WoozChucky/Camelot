@@ -1,0 +1,36 @@
+Prototype is_odd(n) <3:5>
+Function is_even(n) <4:5>
+  Param #0 n <4:17>
+  If <5:5>
+    Binary == <5:11>
+      Var n #0 <5:9>
+      Num 0 <5:14>
+    Return <6:9>
+      Num 1 <6:16>
+  Return <7:5>
+    Call is_odd <7:12>
+      Binary - <7:21>
+        Var n #0 <7:19>
+        Num 1 <7:23>
+Function is_odd(n) <9:5>
+  Param #0 n <9:16>
+  If <10:5>
+    Binary == <10:11>
+      Var n #0 <10:9>
+      Num 0 <10:14>
+    Return <11:9>
+      Num 0 <11:16>
+  Return <12:5>
+    Call is_even <12:12>
+      Binary - <12:22>
+        Var n #0 <12:20>
+        Num 1 <12:24>
+Function main() <14:5>
+  Return <15:5>
+    Binary + <15:29>
+      Binary * <15:24>
+        Call is_even <15:12>
+          Num 10 <15:20>
+        Num 10 <15:26>
+      Call is_odd <15:31>
+        Num 10 <15:38>
