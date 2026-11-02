@@ -114,4 +114,15 @@ bool uvm_range_ok(pagetable_t pt, u32 va, u32 len, u32 perm);
  * nothing, unless uvm_range_ok(pt, va, len, PTE_R); else 0. */
 int copyin(pagetable_t pt, void *dst, u32 va, u32 len);
 
+/* Copies `len` bytes from `src` to user address `va` in `pt`, through the
+ * physical pages, like copyin(). All or nothing: returns -1, having written
+ * nothing, unless uvm_range_ok(pt, va, len, PTE_W); else 0. */
+int copyout(pagetable_t pt, u32 va, const void *src, u32 len);
+
+/* Copies the NUL-terminated string at user address `va` in `pt` to `dst`,
+ * which holds `max` bytes (at least 1), NUL included. Returns its length; -1
+ * if a byte up to its NUL is not readable user memory; -2 if it has no NUL in
+ * its first `max` bytes. `dst` holds a string (maybe cut short) either way. */
+int copyinstr(pagetable_t pt, char *dst, u32 va, u32 max);
+
 #endif

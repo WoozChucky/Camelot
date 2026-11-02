@@ -5,11 +5,14 @@ up trap delegation and the timer, then the kernel runs in S-mode: it prints a
 banner and a `kprintf` self-test over the UART, puts every free page of RAM on
 the page allocator's free list, turns on Sv32 paging with a kernel page table,
 runs the memory self-tests, lists the disks, takes ten timer ticks, tests the
-first disk if there is one, and starts a tiny shell on the interrupt-driven
-UART console. The shell runs user programs in U-mode, each in its own page
-table, switching between them on every timer tick; a program that faults is
-killed and the kernel says why. Faults in the kernel itself panic with the
-cause, `sepc`, `stval` and a register dump.
+first disk if there is one, and starts the shell, a user program, as the first
+process. User programs run in U-mode, each in its own page table, switching on
+every timer tick; they call the kernel through system calls
+(`docs/camelot-syscalls.md`): console input and output, starting and waiting
+for programs, sleeping, growing the heap. A program that faults is killed and
+the kernel says why; a bad pointer passed to a system call is an error, not a
+crash. Faults in the kernel itself panic with the cause, `sepc`, `stval` and a
+register dump.
 
 ```
 cargo run --release -p grail -- kernel/kernel.elf
@@ -31,9 +34,11 @@ tick 2
 ...
 tick 10
 Type help for the list of commands.
-camelot> ticks
-ticks: 10
-camelot> halt
+$ hello
+hello from user mode
+$ echo a  b   c
+a b c
+$ exit
 ```
 
 With disks attached (`--disk IMG`, `--disk-ro IMG`, spec section 9.6), the
@@ -56,57 +61,69 @@ blk self-test: 14/14 passed
 Type help for the list of commands.
 ```
 
-The shell knows `help`, `ticks` (timer ticks since boot), `run` and `halt`.
-Lines are edited with backspace and end with Enter. In a terminal, Grail passes each
-key to the kernel as it is typed and the kernel does the echoing; piped input
-works too:
+The shell (`user/sh.c`) runs programs by name, with arguments: `PROG
+[ARG...]`. `CMD & CMD` runs the first in the background (the shell prints its
+pid) and the last in the foreground; `wait` collects the background ones,
+`help` lists the built-ins, and `exit [N]` (or Ctrl-D on an empty line) ends
+the shell, after which the kernel stops the machine with its status as the
+exit code. Lines are edited with backspace and end with Enter. In a terminal,
+Grail passes each key to the kernel as it is typed and the kernel does the
+echoing; piped input works too:
 
 ```
-printf 'ticks\nhalt\n' | cargo run --release -p grail -- kernel/kernel.elf
+printf 'ticks\nexit\n' | cargo run --release -p grail -- kernel/kernel.elf
 ```
 
-Piped or redirected input must end with `halt`, or give Grail `--max-steps`:
-when the input runs out the kernel keeps waiting at the prompt, and Grail
-keeps running.
+Piped or redirected input must end with `exit`, or give Grail `--max-steps`:
+when the input runs out the shell keeps waiting for a line, and Grail keeps
+running.
 
-`run PROG...` starts the named user programs side by side and returns to the
-prompt when they have all exited or been killed (`run` alone lists them):
+Programs side by side, and one the kernel kills:
 
 ```
-camelot> run ping pong badload
+$ ping & pong & badload
+[2]
+[3]
 ping 1
 ping 2
 pong 1
 pong 2
-pid 3 (badload) killed: load page fault
-  scause 0x0000000d  sepc 0x00001004  stval 0x80000000
+pid 4 (badload) killed: load page fault
+  scause 0x0000000d  sepc 0x00001018  stval 0x80000000
   va 0x80000000 maps to pa 0x80000000, pte 0x2000004b -A--X-RV
+badload: exit -1
+$ wait
 ping 3
 ping 4
 pong 3
 pong 4
-pid 1 (ping) exited: 0
-pid 2 (pong) exited: 0
-camelot>
+[2] ping: exit 0
+[3] pong: exit 0
 ```
 
-The programs live in `user/`, one `.s` file each, all linked with `user/lib.s`
-(the runtime: `exit`, `write`, `puts`, `strlen`, a delay loop) and
-`user/user.ld`:
+The programs live in `user/`, one `.c` or `.s` file each, all linked with the
+runtime (`user/crt0.s`, which calls `main` and then `exit`; `user/usys.s`, the
+system call stubs; `user/ulib.c`, a small C library with `printf`, declared in
+`user/user.h`) and `user/user.ld`:
 
 | Program | What it does |
 |---|---|
+| `sh` | the shell |
 | `hello` | prints a line and exits |
+| `echo` | prints its arguments |
+| `ticks` | prints the timer ticks since boot |
 | `ping`, `pong` | print four numbered lines half a tick apart: run together, they take turns |
 | `regs` | fills every register, spins for three ticks and exits with 0 only if none changed |
+| `sysregs` | fills every register, makes system calls and exits with 0 only if none but a0 changed |
 | `data` | exits with 0 only if its stack and `.bss` start zeroed and its `.data` holds its initial value and takes stores |
-| `badptr` | hands the kernel bad buffers and an unknown call, which must all be refused |
+| `badptr` | hands the system calls bad pointers, which must all fail with `-EFAULT` |
+| `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |
 | `badload` | reads kernel memory: killed by a load page fault |
 | `badstore` | writes to its own read-only data: killed by a store page fault |
 | `badhalt` | executes `xcal.halt`, which is M-mode only: killed by an illegal instruction |
 
-They talk to the kernel through two provisional ecalls (`include/syscall.h`):
-1 exits, 2 prints a buffer. The memory layout, the trap path, the scheduler
+The system calls, the error numbers and how a program starts are specified in
+`docs/camelot-syscalls.md`. The memory layout, the trap path, the scheduler
 and the ELF loader are described in `docs/excalibur-spec.md` section 10,
 "Kernel processes".
 
@@ -120,14 +137,17 @@ prints `ram: 16 MiB at 0x80000000`). Booting takes about 4.5 million
 instructions with 128 MiB, nearly all of them spent setting up memory one page
 at a time.
 
-The exit code is `kmain()`'s return value after `halt` (0 = all self-tests
-passed), 0xfe after a kernel panic, or 0xff after an unexpected M-mode trap.
+The exit code is `kmain()`'s return value: the shell's exit status once it
+and every program it left running have ended (the self-test failure count
+instead, if any failed), 0xfe after a kernel panic, or 0xff after an
+unexpected M-mode trap.
 The traps, the M-mode layer and the panic format are described in
 `docs/excalibur-spec.md` section 10, "Kernel traps"; the allocator, the page
 tables and the kernel address space in "Kernel memory"; the PLIC setup, the
-UART driver, the console and the shell in "Kernel console"; processes in
-"Kernel processes"; the disk driver and the buffer cache in "Kernel disks".
-A failed disk self-test check counts in the exit code like the others.
+UART driver and the console in "Kernel console"; processes, the system calls,
+the user programs and the shell in "Kernel processes"; the disk driver and the
+buffer cache in "Kernel disks". A failed disk self-test check counts in the
+exit code like the others.
 
 A panic looks like this (from the deliberate illegal instruction the tests
 trigger by patching `boot_fault` in the image to 2):
@@ -169,15 +189,15 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `machine.s` | `machine_vec`, the M-mode trap handler: forwards the machine timer to S-mode as SSIP, serves machine calls (`MCALL_HALT`). `machine_halt()` makes that call from S-mode |
 | `kernelvec.s` | `kernel_vec`, the trap vector for traps from S-mode: saves x1-x31 and the trap CSRs as a `struct trap_frame` on the stack, calls `kernel_trap`, restores, `sret`. Also `illegal_instruction()` for the panic tests |
 | `uservec.s` | `user_vec`, the trap vector for traps from U-mode: saves the user registers in the process's trap frame (`sscratch`), calls `user_trap` on the process's kernel stack; `user_return`: frame to registers, `sret` to U-mode |
-| `trap.c` | `kernel_trap()`: counts timer ticks, claims/completes PLIC interrupts and runs the UART's or a disk's handler, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `user_trap()`: a tick yields, an ecall goes to `syscall()`, a fault kills the process; `user_trap_return()`, `trap_init()`, `panic()` |
-| `proc.c` | processes: `proc_create()` (slot, kernel stack, page table, ELF, stack), `kproc_create()` (a kernel process running a C function), the round-robin `scheduler()` (idles in `wfi` while every process sleeps), `yield()`, `sleep()`/`wakeup()`, `proc_exit()`, `proc_kill()` |
+| `trap.c` | `kernel_trap()`: counts timer ticks (waking sleepers), claims/completes PLIC interrupts and runs the console's or a disk's handler, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `user_trap()`: a tick yields, an ecall goes to `syscall()`, a fault kills the process; `user_trap_return()`, `trap_init()`, `panic()` |
+| `proc.c` | processes: `proc_create()` (slot, kernel stack, page table, ELF, stack with the arguments), `kproc_create()` (a kernel process running a C function), `proc_run_init()` (the shell), the round-robin `scheduler()` (idling in `wfi` while everyone sleeps), `yield()`, `sleep()`/`wakeup()`, `proc_exit()`, `proc_kill()`, `proc_wait()`, `proc_sbrk()` |
 | `swtch.s` | `swtch()`: saves `ra`, `sp`, `s0`-`s11` and loads another thread's |
 | `elf.c` | `elf_load()`: checks an ELF32 executable and maps its `PT_LOAD` segments into user space |
-| `syscall.c` | `syscall()`: the provisional ecalls, exit and debug write |
+| `syscall.c` | `syscall()`: the system calls (`docs/camelot-syscalls.md`), with `spawn`'s argument copying |
 | `userprogs.s` | generated by `cargo xtask kernel` from `user/`: the user programs' ELF images and the `user_programs` table (do not edit) |
-| `user/` | the user programs (`*.s`), their runtime `lib.s` and linker script `user.ld`, built with merlin-as and merlin-ld |
+| `user/` | the user programs (`*.c`, `*.s`), their runtime (`crt0.s`, `usys.s`, `ulib.c`, `user.h`) and linker script `user.ld`, built with merlin-as and merlin-ld; `user/clang/` holds clang's assembly for each `.c` (generated, committed) |
 | `kalloc.c` | physical page allocator: `kinit()` reads RAM's base and size from sysinfo and frees every page from `__kernel_end` to the end of RAM; `kalloc()`, `kzalloc()`, `kfree()`, `kfree_pages()` |
-| `vm.c` | Sv32 page tables: `walk()`, `map_pages()`, `unmap_pages()`, `pagetable_create()`/`pagetable_free()`; `kvminit()` builds the kernel page table, `kvminithart()` turns paging on; user address spaces: `uvm_create()`/`uvm_free()`, `uvm_range_ok()`, `copyin()` |
+| `vm.c` | Sv32 page tables: `walk()`, `map_pages()`, `unmap_pages()`, `pagetable_create()`/`pagetable_free()`; `kvminit()` builds the kernel page table, `kvminithart()` turns paging on; user address spaces: `uvm_create()`/`uvm_free()`, `uvm_range_ok()`, `copyin()`, `copyout()`, `copyinstr()` |
 | `vmtest.c` | the memory self-tests: allocate and free every page, `kzalloc()` and `pagetable_create()` clear a reused dirty page, a second mapping of one page, store page faults on text and rodata, building and freeing a page table |
 | `probe.s` | `probe_load()`/`probe_store()`: a word access that returns the trap cause instead of panicking (`kernel_trap` resumes them at `probe_fault`) |
 | `sysinfo.c` | reads Grail's sysinfo block: registers and the device table |
@@ -187,13 +207,13 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `bio.c` | buffer cache (xv6's): 30 one-KiB block buffers in LRU order, `bread()`/`bwrite()`/`brelse()`, each buffer sleep-locked while in use |
 | `blktest.c` | the disk self-test, in kernel processes: three readers at once, write and read back a scratch block (restored afterwards), errors, LRU reuse |
 | `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()` and `wfi()` |
-| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, then the shell (`help`, `ticks`, `run`, `halt`) |
+| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, then the user-space shell as the first process |
 | `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |
-| `console.c` | `console_getc()` (sleeps in `wfi` until a byte arrives), `console_readline()` (echo, backspace, CR/LF/CR LF) |
+| `console.c` | the `read` and `write` system calls: `console_read()` (line editing and echo: backspace, CR/LF/CR LF, Ctrl-D; sleeps until a line is complete), `console_write()`, `console_intr()` (the UART interrupt, waking readers) |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |
 | `kernel.ld` | layout: `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end` |
-| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct context`, `struct user_program`), `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `syscall.h` (the ecall numbers), and the headers for the above |
+| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct context`, `struct user_program`), `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `syscall.h` (the system call and error numbers), and the headers for the above |
 | `kernel.elf` | the prebuilt image, committed so `cargo test` and Grail need no LLVM |
 | `kernel.elf.clang-version` | the clang that built `kernel.elf` |
 
@@ -209,10 +229,21 @@ cargo xtask kernel -v       # shows the clang/ld.lld command lines
 ```
 
 `cargo xtask` is a Rust program (`crates/xtask`), so there is no Makefile or
-shell script. It first builds the user programs: each `user/*.s` but `lib.s`
-is assembled by merlin-as, together with `user/lib.s`, and linked by merlin-ld
-with `user/user.ld`, all in memory (our own tools, no LLVM); the executables
-go into `userprogs.s` as data, rewritten only when they changed. Then it
+shell script. It first builds the user programs. clang compiles each
+`user/*.c` to assembly in `user/clang/` (until Merlin, #15, can), with the
+kernel's target and freestanding flags plus `-O2 -S`:
+
+```
+clang --target=riscv32-unknown-elf -march=rv32im_zicsr -mabi=ilp32 -mno-relax -mcmodel=medany \
+      -std=c11 -O2 -ffreestanding -fno-builtin -nostdinc -nostdlib -fno-pic -fno-common -fno-ident \
+      -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
+      -Wall -Wextra -Werror -S sh.c -o clang/sh.s    # in user/, and each other .c
+```
+
+(each output gets a two-line header naming its source). Then merlin-as
+assembles every program with the runtime and merlin-ld links each with
+`user/user.ld`, all in memory (our own tools, no LLVM); the executables go
+into `userprogs.s` as data. Files are rewritten only when they changed. Then it
 compiles every `*.c` and assembles every `*.s` in this directory, in name
 order, and links with `kernel.ld`. By hand, from this directory, the kernel
 build is:
@@ -231,11 +262,12 @@ ld.lld -T kernel.ld -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf.c.
 
 The build is reproducible: the same clang gives byte-identical output wherever
 the repository is checked out. **After changing anything here, run `cargo xtask
-kernel` and commit `kernel.elf` (and `userprogs.s`, if `user/` changed) with
-the sources.** `cargo test` checks that `userprogs.s` is what the current
-`user/` and tools build, without LLVM. When the installed clang matches
-`kernel.elf.clang-version`, it also rebuilds the kernel and fails if the
-committed image is stale. With any clang it checks that a fresh build boots
+kernel` and commit `kernel.elf` (and `userprogs.s` and `user/clang/`, if
+`user/` changed) with the sources.** `cargo test` checks, without LLVM, that
+every `user/*.c` has its committed assembly and that `userprogs.s` is what the
+current `user/` and tools build. When the installed clang matches
+`kernel.elf.clang-version`, it also rebuilds the kernel and the user
+programs' assembly and fails if anything committed is stale. With any clang it checks that a fresh build boots
 with the same output.
 
 `cargo xtask kernel --as merlin` assembles the `.s` files with merlin-as
@@ -244,9 +276,11 @@ encoder covers what the `.s` files use; a test runs it automatically from then o
 
 ## Rules for kernel code
 
-The kernel will eventually be compiled by Merlin (#15), so it sticks to plain C:
+The kernel and the user programs will eventually be compiled by Merlin (#15),
+so they stick to plain C:
 
-- No libc: headers come from `include/` (`-nostdinc`), no `<stdint.h>`/`<stdarg.h>`.
+- No libc: headers come from `include/` (`-nostdinc`; `user/user.h` for the
+  programs), no `<stdint.h>`/`<stdarg.h>`.
 - No floating point.
 - No inline `asm()`: CSR access and custom instructions live in `.s` files.
 - Assembly uses only what merlin-as understands (no `.insn`, no preprocessor);

@@ -43,7 +43,7 @@ static const char *load_segment(pagetable_t pt, const u8 *image, const struct el
         }
         u8 *mem = kzalloc();
         if (mem == NULL) {
-            return "out of memory";
+            return ELF_OUT_OF_MEMORY;
         }
         /* The part of the file's bytes [vaddr, vaddr + filesz) on this page;
          * the rest of it stays zero (.bss, and the page around the segment). */
@@ -55,13 +55,13 @@ static const char *load_segment(pagetable_t pt, const u8 *image, const struct el
         }
         if (map_pages(pt, page, (u32)(uintptr)mem, PGSIZE, perm) != 0) {
             kfree(mem);
-            return "out of memory";
+            return ELF_OUT_OF_MEMORY;
         }
     }
     return NULL;
 }
 
-const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry) {
+const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry, u32 *end) {
     struct elf32_ehdr eh;
     if (size < sizeof eh) {
         return "not an ELF file";
@@ -81,6 +81,7 @@ const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry) {
         return "bad program headers";
     }
 
+    u32 top = USER_BASE;
     for (u32 i = 0; i < eh.phnum; i++) {
         struct elf32_phdr ph;
         memcpy(&ph, image + eh.phoff + i * sizeof ph, sizeof ph);
@@ -93,6 +94,9 @@ const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry) {
         const char *err = load_segment(pt, image, &ph);
         if (err != NULL) {
             return err;
+        }
+        if (PGROUNDUP(ph.vaddr + ph.memsz) > top) {
+            top = PGROUNDUP(ph.vaddr + ph.memsz);
         }
     }
 
@@ -108,5 +112,6 @@ const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry) {
         return "entry point not in an executable segment";
     }
     *entry = eh.entry;
+    *end = top;
     return NULL;
 }

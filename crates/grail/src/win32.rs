@@ -97,8 +97,15 @@ pub const COLORONCOLOR: i32 = 3;
 // Console input (consoleapi.h, processenv.h).
 /// `GetStdHandle` argument: `(DWORD)-10`.
 pub const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+/// `GetStdHandle` argument: `(DWORD)-11`.
+pub const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
 pub const ENABLE_LINE_INPUT: u32 = 0x0002;
 pub const ENABLE_ECHO_INPUT: u32 = 0x0004;
+/// Input mode: keys arrive as the VT sequences a Unix terminal sends (Windows 10+).
+pub const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+/// Output mode (same bit as `ENABLE_ECHO_INPUT`, on the other buffer): VT escape
+/// sequences written to the console are carried out (Windows 10+).
+pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
 /// A `SetConsoleCtrlHandler` routine: gets the event, returns TRUE if it handled it.
 #[allow(non_camel_case_types)]
 pub type PHANDLER_ROUTINE = Option<unsafe extern "system" fn(u32) -> BOOL>;

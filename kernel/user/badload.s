@@ -2,9 +2,9 @@
 # maps the kernel, but without U, so the load is a page fault in U-mode and
 # the kernel kills the process.
 
-    .section .text.start
-    .globl _start
-_start:
+    .text
+    .globl main
+main:
     li    t0, 0x80000000
     lw    t1, 0(t0)
     li    a0, 0                 # not reached

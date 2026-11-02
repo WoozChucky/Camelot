@@ -13,7 +13,8 @@ tasks:
                --check: build in memory and report stale .elf files instead of writing
                -v: print the equivalent merlin-as/merlin-ld command lines
   kernel       build kernel/kernel.elf (clang + ld.lld from the official LLVM install),
-               after regenerating kernel/userprogs.s from kernel/user (merlin-as + merlin-ld)
+               after compiling kernel/user/*.c to kernel/user/clang/*.s (clang) and
+               regenerating kernel/userprogs.s from kernel/user (merlin-as + merlin-ld)
   hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
                with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
   ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj, llvm-objdump);
@@ -25,7 +26,7 @@ kernel options:
   --as clang|merlin  assembler for the .s files (default: clang)
   -o PATH            output file (default: kernel/kernel.elf)
   --run              run the result on Grail afterwards, with this terminal as its
-                     console (type halt to stop it); exit with its exit code
+                     console (type exit to stop it); exit with its exit code
   -v, --verbose      print each command";
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -281,8 +282,20 @@ fn kernel(k: KernelArgs) -> ExitCode {
     };
     let root = repo_root();
     let kernel_dir = root.join("kernel");
-    // The user programs first (merlin-as + merlin-ld): their images are part
-    // of the kernel's sources.
+    // The user programs first: clang turns their C into assembly, then
+    // merlin-as + merlin-ld build them. Their images are part of the
+    // kernel's sources.
+    match xtask::userprogs::write_clang(&root, &clang, k.verbose) {
+        Ok(changed) => {
+            for f in changed {
+                eprintln!("regenerated {f}");
+            }
+        }
+        Err(e) => {
+            eprintln!("xtask: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     match xtask::userprogs::write(&root) {
         Ok(true) => eprintln!("regenerated {}", xtask::userprogs::GENERATED),
         Ok(false) => {}
@@ -343,7 +356,7 @@ fn kernel(k: KernelArgs) -> ExitCode {
         }
     };
     // Interactive: the kernel's shell reads this terminal, in raw mode like the
-    // grail command's, and runs until `halt` (or Ctrl-C).
+    // grail command's, and runs until the shell exits (or Ctrl-C).
     let _raw = grail::console::RawMode::enable();
     let run = xtask::kernel::run_with_output(
         &file,
