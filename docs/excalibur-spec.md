@@ -107,6 +107,8 @@ Interrupt causes: 1 SSI, 3 MSI, 5 STI, 7 MTI, 9 SEI, 11 MEI.
 
 Interrupts are checked between instructions, priority MEI > MSI > MTI > SEI > SSI > STI.
 
+Pending bits in `mip` come from the devices: MSIP and MTIP from the CLINT, MEIP from PLIC context 0, SEIP from PLIC context 1 (section 7.1). MEIP, MSIP and MTIP are read-only. SEIP is also software-writable: the value read is the OR of the software bit and the PLIC's signal, and `csrrs`/`csrrc` on `mip` modify the software bit only, so a read-modify-write never latches the PLIC's signal into it (as in the RISC-V privileged spec). STIP and SSIP are software-written.
+
 ## 7. Memory map
 
 Layout follows the QEMU `virt` board's conventions so existing docs and examples apply, without needing QEMU.
@@ -115,7 +117,7 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 |---|---|
 | 0x0000_1000 - 0x0000_1FFF | Boot ROM (reset vector 0x1000, jumps to 0x8000_0000) |
 | 0x0200_0000 - 0x0200_FFFF | CLINT: msip @+0x0, mtimecmp @+0x4000, mtime @+0xBFF8 |
-| 0x0C00_0000 - 0x0FFF_FFFF | PLIC (phase 2, for UART interrupts) |
+| 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART and keyboard (section 7.1) |
 | 0x1000_0000 - 0x1000_00FF | UART, 16550-compatible subset (THR/RBR @+0, IER @+1, LSR @+5) |
 | 0x1000_1000 - 0x1000_1FFF | Reserved: virtio block device (later, for a filesystem) |
 | 0x0010_0000 | Test/exit device: write 0x5555 = pass/exit, 0x3333 = fail (used by riscv-tests) |
@@ -128,7 +130,39 @@ Unmapped accesses raise access-fault exceptions.
 
 Timer: `mtime` increments once per executed instruction, so runs are deterministic and reproducible. During `wfi`, Grail jumps `mtime` forward to `mtimecmp` instead of spinning. (A real-time mode can be added later.) MTIP is pending while `mtime >= mtimecmp`.
 
-UART: writing THR prints the byte to the host terminal. RBR is fed from host stdin. LSR bit 5 (THRE) always 1, bit 0 (DR) set when input is available.
+UART: writing THR prints the byte to the host terminal. RBR is fed from host stdin. LSR bit 5 (THRE) always 1, bit 0 (DR) set when input is available. IER bit 0 (ERBFI) enables the "received data available" interrupt: the UART holds PLIC source 1 high while IER bit 0 and LSR.DR are both set, so reading RBR until DR clears lowers it. IIR (@+2, read) reports 0x04 while that interrupt is asserted, else 0x01 (none). The other IER bits are stored but raise nothing (no transmit, line-status or modem interrupts).
+
+### 7.1 PLIC
+
+A minimal RISC-V PLIC (riscv-plic-spec) with the QEMU `virt` register layout: one hart, two contexts, sources 1-31.
+
+| Source | Device |
+|---|---|
+| 0 | none ("no interrupt" when claimed) |
+| 1 | UART receive (section 7) |
+| 2 | Keyboard (section 9.4) |
+| 3-31 | unused, never asserted |
+
+QEMU `virt` puts UART0 on source 10; Excalibur numbers its few devices from 1 instead, so drivers must take the source numbers from this table rather than from `virt` device trees.
+
+| Offset | Register |
+|---|---|
+| +0x00_0000 + 4·src | Priority of source `src`, 0-7 (3 bits, WARL). 0 = never interrupts. Source 0's is hard-wired to 0 |
+| +0x00_1000 | Pending bits, sources 0-31 (read-only) |
+| +0x00_2000 + 0x80·ctx | Enable bits of context `ctx`, sources 0-31 (bit 0 hard-wired to 0) |
+| +0x20_0000 + 0x1000·ctx | Priority threshold of context `ctx`, 0-7 |
+| +0x20_0004 + 0x1000·ctx | Claim (read) / complete (write) of context `ctx` |
+
+Context 0 is hart 0 in M-mode and drives `mip.MEIP`; context 1 is hart 0 in S-mode and drives `mip.SEIP`. Registers are 32-bit: other access widths raise access faults. Every other offset in the range is reserved (reads 0, writes ignored).
+
+Behavior:
+
+- **Gateways** are level-triggered. Grail samples every device's line once per instruction, before checking for interrupts. A high line makes its source pending unless the source is in flight (claimed, not completed). Pending stays set until claimed, even if the line drops first.
+- **Notification**: a context's interrupt line is high while some source is pending, enabled for it, and has priority strictly above its threshold.
+- **Claim** returns the highest-priority such source (ties go to the lowest source number), clears its pending bit and marks it in flight. With nothing to claim it returns 0.
+- **Complete** (write the source number) ends the claim. Writes naming a source that is not enabled for that context are ignored. If the device still holds its line high at the next sample, the source is pending again, so a driver may handle one event per interrupt.
+
+Typical handler: claim, service the device until it lowers its line (for the UART, read RBR until LSR.DR is clear, or read one byte and let it re-raise), complete, return.
 
 ## 8. Emulator conformance
 
@@ -179,7 +213,7 @@ Grail also redraws at ~60 Hz on its own, so `FB_PRESENT` is optional. Host side:
 |---|---|---|
 | 0x3000_1000 | `KBD_STATUS` (RO) | bit 0 = event available |
 | 0x3000_1004 | `KBD_DATA` (RO) | pops one event: bits [7:0] key code, bit 8 = 1 on release, bit 9 = shift, bit 10 = ctrl. 0 if empty |
-| 0x3000_1008 | `KBD_CTRL` | bit 0 = interrupt enable (PLIC source 2, once the PLIC exists) |
+| 0x3000_1008 | `KBD_CTRL` | bit 0 = interrupt enable (PLIC source 2, section 7.1) |
 
 Key codes: printable ASCII for printable keys, then 0x80+ for Enter (0x0A uses ASCII), arrows (0x80-0x83 up/down/left/right), Esc (0x1B), Backspace (0x08), F1-F12 (0x90-0x9B). The key events come from the framebuffer window; without a window, the UART remains the text input.
 

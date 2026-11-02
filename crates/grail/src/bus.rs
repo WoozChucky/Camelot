@@ -1,11 +1,13 @@
 //! Physical address space. See spec section 7 for the memory map.
 
-use crate::devices::{Clint, TestDevice, Uart};
+use crate::devices::{Clint, Plic, TestDevice, Uart, UART_IRQ};
 
 pub const BOOT_ROM_BASE: u32 = 0x0000_1000;
 pub const TEST_DEV_BASE: u32 = 0x0010_0000;
 pub const CLINT_BASE: u32 = 0x0200_0000;
 pub const CLINT_SIZE: u32 = 0x1_0000;
+pub const PLIC_BASE: u32 = 0x0C00_0000;
+pub const PLIC_SIZE: u32 = 0x0400_0000;
 pub const UART_BASE: u32 = 0x1000_0000;
 pub const UART_SIZE: u32 = 0x100;
 pub const RAM_BASE: u32 = 0x8000_0000;
@@ -25,6 +27,7 @@ pub struct Bus {
     pub ram: Vec<u8>,
     pub rom: Vec<u8>,
     pub clint: Clint,
+    pub plic: Plic,
     pub uart: Uart,
     pub test: TestDevice,
     /// Address of the riscv-tests `tohost` symbol, if the loaded ELF has one.
@@ -39,6 +42,7 @@ impl Bus {
             ram: vec![0; ram_size],
             rom: Vec::new(),
             clint: Clint::default(),
+            plic: Plic::default(),
             uart: Uart::default(),
             test: TestDevice,
             tohost: None,
@@ -56,6 +60,13 @@ impl Bus {
             entry,
         ];
         self.rom = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    }
+
+    /// Samples every device's interrupt line into the PLIC. Called once per step,
+    /// before the hart looks at `mip`.
+    pub fn update_interrupts(&mut self) {
+        let uart = self.uart.irq();
+        self.plic.set_level(UART_IRQ, uart);
     }
 
     fn ram_range(&self, addr: u32, size: u32) -> Option<usize> {
@@ -82,6 +93,7 @@ impl Bus {
                 Ok(v)
             }
             a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => self.clint.read(a - CLINT_BASE, size),
+            a if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&a) => self.plic.read(a - PLIC_BASE, size),
             a if (UART_BASE..UART_BASE + UART_SIZE).contains(&a) => self.uart.read(a - UART_BASE, size),
             a if (TEST_DEV_BASE..TEST_DEV_BASE + 0x1000).contains(&a) => Ok(0),
             _ => Err(BusFault),
@@ -103,6 +115,7 @@ impl Bus {
             a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => {
                 self.clint.write(a - CLINT_BASE, size, val)
             }
+            a if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&a) => self.plic.write(a - PLIC_BASE, size, val),
             a if (UART_BASE..UART_BASE + UART_SIZE).contains(&a) => self.uart.write(a - UART_BASE, size, val),
             a if (TEST_DEV_BASE..TEST_DEV_BASE + 0x1000).contains(&a) => {
                 if let Some(e) = self.test.write(a - TEST_DEV_BASE, val) {

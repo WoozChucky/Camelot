@@ -79,6 +79,7 @@ impl Cpu {
     /// Runs one instruction (or takes one interrupt). Time advances by one tick per step.
     pub fn step(&mut self) {
         self.bus.clint.mtime = self.bus.clint.mtime.wrapping_add(1);
+        self.bus.update_interrupts();
 
         if let Some(irq) = self.pending_interrupt() {
             self.waiting = false;
@@ -90,7 +91,8 @@ impl Cpu {
             if self.mip() & self.csr.mie != 0 {
                 self.waiting = false;
             } else {
-                // Nothing to do until the timer fires: skip straight to it.
+                // Nothing to do until the timer fires or a device raises a line: skip
+                // straight to the timer. Device lines are sampled again next step.
                 let clint = &mut self.bus.clint;
                 if clint.mtimecmp != u64::MAX && clint.mtimecmp > clint.mtime {
                     clint.mtime = clint.mtimecmp;
@@ -331,10 +333,11 @@ impl Cpu {
                 };
                 let old = self.csr_read(csr)?;
                 if writes {
+                    let base = self.csr_rmw_base(csr, old);
                     let new = match op {
                         CsrOp::Rw => operand,
-                        CsrOp::Rs => old | operand,
-                        CsrOp::Rc => old & !operand,
+                        CsrOp::Rs => base | operand,
+                        CsrOp::Rc => base & !operand,
                     };
                     self.csr_write(csr, new)?;
                 }
