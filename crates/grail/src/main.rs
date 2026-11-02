@@ -1,5 +1,6 @@
 //! `grail [options] <program.elf>`
 
+use grail::console;
 use grail::display::{self, DisplayOptions, Outcome};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::process::ExitCode;
@@ -98,8 +99,14 @@ fn main() -> ExitCode {
         eprintln!("grail: {path}: {e}");
         return ExitCode::from(2);
     }
-    // The machine's console is this process's terminal.
-    m.set_uart_input(spawn_stdin_reader());
+    // The machine's console is this process's terminal. An interactive one is switched
+    // to raw mode (each key goes to the UART as typed, unechoed) until Grail exits:
+    // before the reader thread starts, so its first read is already a raw one.
+    let raw = console::RawMode::enable();
+    m.set_uart_input(match &raw {
+        Some(raw) => raw.stdin_channel(),
+        None => console::stdin_channel(),
+    });
     m.set_uart_output(std::io::stdout());
     m.set_debug_output(std::io::stderr());
 
@@ -152,25 +159,4 @@ fn value<T>(
         return None;
     };
     parse(&v).map_err(|e| eprintln!("grail: {name}: {e}")).ok()
-}
-
-/// Feeds host stdin to the UART from a background thread.
-fn spawn_stdin_reader() -> std::sync::mpsc::Receiver<u8> {
-    use std::io::Read;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 256];
-        let mut stdin = std::io::stdin();
-        while let Ok(n) = stdin.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            for &b in &buf[..n] {
-                if tx.send(b).is_err() {
-                    return;
-                }
-            }
-        }
-    });
-    rx
 }

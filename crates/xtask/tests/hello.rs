@@ -17,7 +17,8 @@ use xtask::{kernel, repo_root, tools};
 const MAX_STEPS: u64 = 100_000;
 
 fn assert_prints_hello(elf: &[u8]) {
-    let (r, out) = kernel::run_on_grail(elf, MAX_STEPS).unwrap();
+    // hello reads nothing from the UART.
+    let (r, out) = kernel::run_on_grail(elf, b"", MAX_STEPS).unwrap();
     assert_eq!(out, OUTPUT);
     assert_eq!(r, RunResult::Exited(0));
 }

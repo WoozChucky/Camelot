@@ -7,6 +7,7 @@
 pub mod block;
 pub mod bus;
 pub mod config;
+pub mod console;
 pub mod cpu;
 pub mod devices;
 pub mod display;

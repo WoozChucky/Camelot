@@ -4,11 +4,13 @@ The Camelot OS kernel, in C with a little assembly. A small M-mode layer sets
 up trap delegation and the timer, then the kernel runs in S-mode: it prints a
 banner and a `kprintf` self-test over the UART, puts every free page of RAM on
 the page allocator's free list, turns on Sv32 paging with a kernel page table,
-runs the memory self-tests, takes ten timer ticks, and halts. Faults panic with
-the cause, `sepc`, `stval` and a register dump.
+runs the memory self-tests, takes ten timer ticks, and starts a tiny shell on
+the interrupt-driven UART console. Faults panic with the cause, `sepc`,
+`stval` and a register dump.
 
 ```
 cargo run --release -p grail -- kernel/kernel.elf
+cargo run --release -p grail -- --clock 10MHz kernel/kernel.elf    # ticks in real time
 ```
 
 ```
@@ -24,7 +26,28 @@ tick 1
 tick 2
 ...
 tick 10
+Type help for the list of commands.
+camelot> ticks
+ticks: 10
+camelot> halt
 ```
+
+The shell knows `help`, `ticks` (timer ticks since boot) and `halt`. Lines
+are edited with backspace and end with Enter. In a terminal, Grail passes each
+key to the kernel as it is typed and the kernel does the echoing; piped input
+works too:
+
+```
+printf 'ticks\nhalt\n' | cargo run --release -p grail -- kernel/kernel.elf
+```
+
+Piped or redirected input must end with `halt`, or give Grail `--max-steps`:
+when the input runs out the kernel keeps waiting at the prompt, and Grail
+keeps running.
+
+Without `--clock`, Grail runs at full speed and skips every `wfi` to the next
+timer tick, so while the shell waits for a key the tick count races ahead;
+with `--clock 10MHz` it counts ten a second.
 
 The RAM size comes from Grail's sysinfo device, so `--ram` changes what the
 allocator manages (`cargo run --release -p grail -- --ram 16 kernel/kernel.elf`
@@ -32,11 +55,12 @@ prints `ram: 16 MiB at 0x80000000`). Booting takes about 4.5 million
 instructions with 128 MiB, nearly all of them spent setting up memory one page
 at a time.
 
-The exit code is `kmain()`'s return value (0 = all self-tests passed), 0xfe
-after a kernel panic, or 0xff after an unexpected M-mode trap. The traps,
-the M-mode layer and the panic format are described in
+The exit code is `kmain()`'s return value after `halt` (0 = all self-tests
+passed), 0xfe after a kernel panic, or 0xff after an unexpected M-mode trap.
+The traps, the M-mode layer and the panic format are described in
 `docs/excalibur-spec.md` section 10, "Kernel traps"; the allocator, the page
-tables and the kernel address space in "Kernel memory".
+tables and the kernel address space in "Kernel memory"; the PLIC setup, the
+UART driver, the console and the shell in "Kernel console".
 
 A panic looks like this (from the deliberate illegal instruction the tests
 trigger by patching `boot_fault` in the image to 2):
@@ -77,20 +101,22 @@ tests see each of its checks panic, e.g. `panic: map_pages: remap`.
 | `start.c` | `start()`: M-mode setup: `medeleg`/`mideleg`, `stvec`, `mtvec`, `mscratch`, the first timer interrupt, `mstatus.MPP = S`, `mepc` |
 | `machine.s` | `machine_vec`, the M-mode trap handler: forwards the machine timer to S-mode as SSIP, serves machine calls (`MCALL_HALT`). `machine_halt()` makes that call from S-mode |
 | `kernelvec.s` | `kernel_vec`, the S-mode trap vector: saves x1-x31 and the trap CSRs as a `struct trap_frame`, calls `kernel_trap`, restores, `sret`. Also `illegal_instruction()` for the panic tests |
-| `trap.c` | `kernel_trap()`: counts timer ticks, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `trap_init()`, `panic()` |
+| `trap.c` | `kernel_trap()`: counts timer ticks, claims/completes PLIC interrupts and runs the UART's handler, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `trap_init()`, `panic()` |
 | `kalloc.c` | physical page allocator: `kinit()` reads RAM's base and size from sysinfo and frees every page from `__kernel_end` to the end of RAM; `kalloc()`, `kzalloc()`, `kfree()`, `kfree_pages()` |
 | `vm.c` | Sv32 page tables: `walk()`, `map_pages()`, `unmap_pages()`, `pagetable_create()`/`pagetable_free()`; `kvminit()` builds the kernel page table, `kvminithart()` turns paging on |
 | `vmtest.c` | the memory self-tests: allocate and free every page, `kzalloc()` and `pagetable_create()` clear a reused dirty page, a second mapping of one page, store page faults on text and rodata, building and freeing a page table |
 | `probe.s` | `probe_load()`/`probe_store()`: a word access that returns the trap cause instead of panicking (`kernel_trap` resumes them at `probe_fault`) |
 | `sysinfo.c` | reads Grail's sysinfo block: registers and the device table |
-| `timer.c` | `timebase_hz()` (nominal 10 MHz, the one place to change once Grail reports it), `timer_interval()`, `timer_init()` |
+| `timer.c` | `timebase_hz()` (sysinfo's `SYS_TIMEBASE_HZ`, read once), `timer_interval()`, `timer_init()` |
+| `plic.c` | `plic_init()` (UART source enabled for the S-mode context), `plic_claim()`, `plic_complete()` |
 | `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()` and `wfi()` |
-| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, ten ticks, the optional deliberate fault or memory API misuse |
-| `uart.c` | polling 16550 driver: `uart_putc`/`uart_puts` |
+| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, ten ticks, the optional deliberate fault or memory API misuse, then the shell (`help`, `ticks`, `halt`) |
+| `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |
+| `console.c` | `console_getc()` (sleeps in `wfi` until a byte arrives), `console_readline()` (echo, backspace, CR/LF/CR LF) |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |
 | `kernel.ld` | layout: `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end` |
-| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), and the headers for the above |
+| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, and the headers for the above |
 | `kernel.elf` | the prebuilt image, committed so `cargo test` and Grail need no LLVM |
 | `kernel.elf.clang-version` | the clang that built `kernel.elf` |
 
@@ -101,7 +127,7 @@ Needs clang and ld.lld, e.g. from the official Windows LLVM installer (found on
 
 ```
 cargo xtask kernel          # builds kernel/kernel.elf
-cargo xtask kernel --run    # ... and runs it on Grail
+cargo xtask kernel --run    # ... and runs it on Grail, with this terminal as its console
 cargo xtask kernel -v       # shows the clang/ld.lld command lines
 ```
 
@@ -116,9 +142,9 @@ clang --target=riscv32-unknown-elf -march=rv32im_zicsr -mabi=ilp32 -mno-relax -m
       -std=c11 -O2 -ffreestanding -fno-builtin -nostdinc -nostdlib -fno-pic -fno-common -fno-ident \
       -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
       -Wall -Wextra -Werror -Iinclude -c main.c -o main.c.o        # and each other .c
-ld.lld -T kernel.ld -o kernel.elf entry.s.o kalloc.c.o kernelvec.s.o kprintf.c.o machine.s.o \
-       main.c.o probe.s.o riscv.s.o start.c.o string.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
-       vm.c.o vmtest.c.o
+ld.lld -T kernel.ld -o kernel.elf console.c.o entry.s.o kalloc.c.o kernelvec.s.o kprintf.c.o \
+       machine.s.o main.c.o plic.c.o probe.s.o riscv.s.o start.c.o string.c.o sysinfo.c.o \
+       timer.c.o trap.c.o uart.c.o vm.c.o vmtest.c.o
 ```
 
 The build is reproducible: the same clang gives byte-identical output wherever

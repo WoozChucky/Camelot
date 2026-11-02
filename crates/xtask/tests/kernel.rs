@@ -3,21 +3,26 @@
 //! also rebuilt from source and checked against the committed image.
 
 use excalibur::csr::{
-    IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP,
+    IRQ_M_EXT, IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP,
 };
 use excalibur::reg;
+use grail::bus::{PLIC_BASE, SYSINFO_BASE, SYSINFO_SIZE, UART_BASE};
 use grail::cpu::Mode;
+use grail::devices::UART_IRQ;
 use grail::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
+use grail::sysinfo::{REG_MAGIC, REG_TIMEBASE_HZ};
 use grail::trap::INTERRUPT_BIT;
-use grail::{Machine, RunResult};
+use grail::{Machine, MachineConfig, RunResult};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use xtask::kernel::{self, Assembler, Build, Lang, BOOT_MAX_STEPS};
 use xtask::{repo_root, tools};
 
-/// What the kernel prints, with `xcal.dbg`'s pc masked (see `mask_dbg_pc`).
+/// What the kernel prints before its shell starts, with `xcal.dbg`'s pc masked
+/// (see `mask_dbg_pc`).
 const BOOT_OUTPUT: &str = "\
 Camelot v0.1.0 booting...
 kprintf: d=-42 u=4294967295 x=cafef00d p=0x80000000 s=excalibur c=K %=%
@@ -38,6 +43,19 @@ tick 8
 tick 9
 tick 10
 ";
+
+/// What the shell prints before its first prompt, and the prompt
+/// (kernel/main.c).
+const SHELL_BANNER: &str = "Type help for the list of commands.\n";
+const PROMPT: &str = "camelot> ";
+
+/// The input most runs get: the shell's command to stop the machine.
+const HALT: &[u8] = b"halt\n";
+
+/// The whole output of a run whose shell is given `HALT`.
+fn halted_output() -> String {
+    format!("{BOOT_OUTPUT}{SHELL_BANNER}{PROMPT}halt\n")
+}
 
 /// mtime ticks between timer interrupts: the nominal 10 MHz timebase / 10 Hz.
 const TICK_INTERVAL: u64 = 1_000_000;
@@ -91,19 +109,34 @@ fn committed_elf() -> Vec<u8> {
 }
 
 fn assert_boots(elf: &[u8]) {
-    let (r, out) = kernel::run_on_grail(elf, BOOT_MAX_STEPS).unwrap();
-    assert_eq!(kernel::mask_dbg_pc(&out), BOOT_OUTPUT, "raw output:\n{out}");
+    let (r, out) = kernel::run_on_grail(elf, HALT, BOOT_MAX_STEPS).unwrap();
+    assert_eq!(kernel::mask_dbg_pc(&out), halted_output(), "raw output:\n{out}");
     assert_eq!(r, RunResult::Exited(0));
 }
 
-/// Loads the committed kernel without running it.
+/// Loads the committed kernel without running it, with `HALT` typed on the
+/// UART so that a full run ends.
 fn load_committed() -> (Machine, grail::elf::Elf) {
+    load_committed_on(MachineConfig::default(), Some(kernel::typed(HALT)))
+}
+
+/// Loads the committed kernel into a machine built from `config`, with the
+/// UART reading `input` (nothing at all if `None`).
+fn load_committed_on(config: MachineConfig, input: Option<Receiver<u8>>) -> (Machine, grail::elf::Elf) {
     let file = committed_elf();
     let elf = grail::elf::parse(&file).unwrap();
-    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::new(config).unwrap();
     m.cpu.bus.uart.capture = true;
     m.load_elf(&file).unwrap();
+    if let Some(input) = input {
+        m.set_uart_input(input);
+    }
     (m, elf)
+}
+
+/// What the kernel has printed so far.
+fn printed(m: &Machine) -> String {
+    String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned()
 }
 
 fn sym(elf: &grail::elf::Elf, name: &str) -> u32 {
@@ -169,11 +202,18 @@ fn run_sends_uart_and_debug_output_to_the_given_sinks() {
     // What `cargo xtask kernel --run` uses (with stdout and stderr): the UART text and
     // the xcal.dbg line must each reach their own sink.
     let (uart, debug) = (Shared::default(), Shared::default());
-    let (r, _) =
-        kernel::run_with_output(&committed_elf(), BOOT_MAX_STEPS, uart.clone(), debug.clone()).unwrap();
+    let (r, _) = kernel::run_with_output(
+        &committed_elf(),
+        Some(BOOT_MAX_STEPS),
+        kernel::typed(HALT),
+        uart.clone(),
+        debug.clone(),
+    )
+    .unwrap();
     assert_eq!(r, RunResult::Exited(0));
     // The one xcal.dbg line goes to the debug sink; everything around it to the UART.
-    let (before, rest) = BOOT_OUTPUT.split_at(BOOT_OUTPUT.find("[dbg]").unwrap());
+    let all = halted_output();
+    let (before, rest) = all.split_at(all.find("[dbg]").unwrap());
     let (dbg, after) = rest.split_at(rest.find('\n').unwrap() + 1);
     assert_eq!(uart.text(), format!("{before}{after}"));
     assert_eq!(kernel::mask_dbg_pc(&debug.text()), dbg);
@@ -253,8 +293,8 @@ fn entry_clears_bss() {
         .load(start, &vec![0xa5; (end - start) as usize])
         .unwrap();
     let r = m.run(Some(BOOT_MAX_STEPS), |_| {});
-    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
-    assert_eq!(kernel::mask_dbg_pc(&out), BOOT_OUTPUT);
+    let out = printed(&m);
+    assert_eq!(kernel::mask_dbg_pc(&out), halted_output());
     assert_eq!(r, RunResult::Exited(0));
 }
 
@@ -386,6 +426,7 @@ fn ticks_are_one_interval_apart() {
     let mut machine_ticks = Vec::new();
     let mut deadlines = Vec::new();
     let mut kernel_ticks = Vec::new();
+    let mut external = 0;
     let mut steps_after_trap_init = None;
     let mut halts = 0;
     let probes = [sym(&elf, "probe_load_insn"), sym(&elf, "probe_store_insn")];
@@ -420,6 +461,9 @@ fn ticks_are_one_interval_apart() {
                 cpu.csr.scause
             );
             probe_faults += 1;
+        } else if cpu.pc == kernel_vec && cpu.csr.scause == INTERRUPT_BIT | IRQ_S_EXT {
+            // The UART receiving the shell's `halt`.
+            external += 1;
         } else if cpu.pc == kernel_vec {
             assert_eq!(cpu.csr.scause, INTERRUPT_BIT | IRQ_S_SOFT);
             // Ticks arrive with paging on.
@@ -429,6 +473,9 @@ fn ticks_are_one_interval_apart() {
     });
     assert_eq!(r, RunResult::Exited(0));
     assert_eq!(halts, 1);
+    // All of `halt\n` was waiting before interrupts were on: one interrupt
+    // drains it.
+    assert_eq!(external, 1);
     // Unmapped load and store, stores to text and rodata.
     assert_eq!(probe_faults, 4);
     // Setting up memory takes a few intervals, so machine ticks fire before
@@ -602,8 +649,8 @@ fn ticks_preempting_kernel_code_change_nothing() {
             kernel_busy += 1;
         }
     });
-    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
-    assert_eq!(kernel::mask_dbg_pc(&out), BOOT_OUTPUT, "raw output:\n{out}");
+    let out = printed(&m);
+    assert_eq!(kernel::mask_dbg_pc(&out), halted_output(), "raw output:\n{out}");
     assert_eq!(r, RunResult::Exited(0));
     // Fewer kernel ticks: until trap_init, the machine ticks only pile up in
     // the one SSIP bit, which trap_init then drops.
@@ -882,6 +929,7 @@ fn boot_with_ram(ram_mib: usize, extra_devices: &[DeviceEntry]) -> (Machine, gra
     }
     m.cpu.bus.uart.capture = true;
     m.load_elf(&file).unwrap();
+    m.set_uart_input(kernel::typed(HALT));
     let r = m.run(Some(BOOT_MAX_STEPS * 4), |_| {});
     let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
     assert_eq!(r, RunResult::Exited(0), "{ram_mib} MiB, output:\n{out}");
@@ -1066,6 +1114,464 @@ fn fault_with_interrupts_off_panics() {
     // ra is where kmain would have returned to: supervisor_entry's next
     // instruction.
     assert_eq!(v["ra"], sym(&elf, "supervisor_entry") + 8);
+}
+
+// ---- The console and the shell ----
+
+/// The UART registers the tests look for (spec section 7).
+const UART_RBR: u32 = 0;
+const UART_IER: u32 = 1;
+const UART_LSR: u32 = 5;
+/// IER bit 0: interrupt while received data is available.
+const UART_IER_ERBFI: u32 = 1;
+
+/// PLIC registers (spec section 7.1) for source `src` / context `ctx`.
+fn plic_priority(src: u32) -> u32 {
+    PLIC_BASE + 4 * src
+}
+fn plic_enable(ctx: u32) -> u32 {
+    PLIC_BASE + 0x2000 + 0x80 * ctx
+}
+fn plic_threshold(ctx: u32) -> u32 {
+    PLIC_BASE + 0x20_0000 + 0x1000 * ctx
+}
+
+/// The size of the kernel's receive ring buffer (`UART_RX_SIZE` in
+/// kernel/include/uart.h).
+const UART_RX_SIZE: usize = 128;
+
+/// What `help` prints (kernel/main.c).
+const HELP: &str = "\
+help    this list
+ticks   timer ticks since boot (10 per second)
+halt    stop the machine
+";
+
+/// A memory access by the instruction about to run.
+struct Access {
+    addr: u32,
+    /// The register a load writes; `None` for a store.
+    load_rd: Option<u8>,
+    /// The value a store writes.
+    value: u32,
+}
+
+/// The load or store the instruction about to run makes, if it is one. Paging
+/// is off, so the address is physical.
+fn mem_access(cpu: &grail::cpu::Cpu) -> Option<Access> {
+    let word = cpu.bus.peek(cpu.pc)?;
+    let (base, imm, load_rd, value) = match excalibur::decode(word) {
+        excalibur::Inst::Load { rd, rs1, imm, .. } => (rs1, imm, Some(rd), 0),
+        excalibur::Inst::Store { rs1, rs2, imm, .. } => (rs1, imm, None, cpu.x[rs2 as usize]),
+        _ => return None,
+    };
+    let addr = cpu.x[base as usize].wrapping_add(imm as u32);
+    Some(Access { addr, load_rd, value })
+}
+
+/// A UART register access by the instruction about to run: (offset, store?,
+/// stored value).
+fn uart_access(cpu: &grail::cpu::Cpu) -> Option<(u32, bool, u32)> {
+    let a = mem_access(cpu)?;
+    (UART_BASE..UART_BASE + 8)
+        .contains(&a.addr)
+        .then_some((a.addr - UART_BASE, a.load_rd.is_none(), a.value))
+}
+
+/// The addresses of function `name` in the committed kernel, from its symbol's
+/// value and size.
+fn function(name: &str) -> std::ops::Range<u32> {
+    let file = committed_elf();
+    let s = elf32::Elf::parse(&file)
+        .unwrap()
+        .symbols()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("no symbol {name}"));
+    assert!(s.size > 0, "{name} has no size");
+    s.value..s.value + s.size
+}
+
+/// Runs the committed kernel with `input` typed on the UART. Returns how the
+/// run ended and what was printed from the shell's banner on.
+fn run_shell(input: &[u8]) -> (RunResult, String) {
+    let (mut m, _) = load_committed_on(MachineConfig::default(), Some(kernel::typed(input)));
+    let r = m.run(Some(BOOT_MAX_STEPS), |_| {});
+    let out = printed(&m);
+    // Everything before the shell is the usual boot.
+    let at = out
+        .find(SHELL_BANNER)
+        .unwrap_or_else(|| panic!("the shell never started:\n{out}"));
+    assert_eq!(kernel::mask_dbg_pc(&out[..at]), BOOT_OUTPUT);
+    (r, out[at..].to_string())
+}
+
+/// Steps `m` until `done` holds, at most `max` steps. Calls `each` before
+/// every step. Returns the steps taken.
+fn step_until(
+    m: &mut Machine,
+    max: u64,
+    mut each: impl FnMut(&grail::cpu::Cpu),
+    done: impl Fn(&Machine) -> bool,
+) -> u64 {
+    for n in 0..max {
+        if done(m) {
+            return n;
+        }
+        each(&m.cpu);
+        m.cpu.step();
+    }
+    panic!("gave up after {max} steps; output:\n{}", printed(m));
+}
+
+#[test]
+fn shell_runs_its_commands() {
+    let (r, out) = run_shell(b"help\nticks\nfrobnicate\n\n   \n  ticks \t\nhalt\n");
+    assert_eq!(r, RunResult::Exited(0));
+    // The console echoes each line, then the shell answers. All the input was
+    // there before the shell started, so no tick passes in between.
+    let want = format!(
+        "{SHELL_BANNER}\
+         {PROMPT}help\n{HELP}\
+         {PROMPT}ticks\nticks: 10\n\
+         {PROMPT}frobnicate\nunknown command: frobnicate (try help)\n\
+         {PROMPT}\n\
+         {PROMPT}   \n\
+         {PROMPT}  ticks \nticks: 10\n\
+         {PROMPT}halt\n"
+    );
+    assert_eq!(out, want);
+}
+
+#[test]
+fn console_edits_lines() {
+    let long = "x".repeat(100);
+    let input = format!(
+        // Backspace and DEL on an empty line do nothing; then both erase.
+        "\x08\x7fticky\x7fs\x08\x08ks\n\
+         {long}\n\
+         ticks\r\n\r\r\
+         \x01ha\tl\x1bt\n"
+    );
+    let (r, out) = run_shell(input.as_bytes());
+    assert_eq!(r, RunResult::Exited(0));
+    // Lines hold at most 63 characters (LINE_MAX in kernel/main.c); the rest
+    // is neither echoed nor kept.
+    let kept = "x".repeat(63);
+    let want = format!(
+        "{SHELL_BANNER}\
+         {PROMPT}ticky\x08 \x08s\x08 \x08\x08 \x08ks\nticks: 10\n\
+         {PROMPT}{kept}\nunknown command: {kept} (try help)\n\
+         {PROMPT}ticks\nticks: 10\n\
+         {PROMPT}\n\
+         {PROMPT}\n\
+         {PROMPT}halt\n"
+    );
+    assert_eq!(out, want);
+}
+
+#[test]
+fn shell_takes_more_input_than_the_ring_buffer_holds() {
+    // 40 commands, typed all at once: 245 bytes for a 128-byte buffer. When it
+    // is full the driver turns the receive interrupt off rather than drop
+    // bytes, and turns it back on once the console has emptied half of it.
+    let input = format!("{}halt\n", "ticks\n".repeat(40));
+    assert!(input.len() > UART_RX_SIZE + UART_RX_SIZE / 2);
+    assert!(input.len() < 2 * UART_RX_SIZE);
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(kernel::typed(input.as_bytes())));
+    let trap_init = sym(&elf, "trap_init");
+    let mut booted = false;
+    let mut ier_writes = Vec::new();
+    let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
+        booted |= cpu.pc == trap_init;
+        if let Some((UART_IER, true, v)) = uart_access(cpu) {
+            if booted {
+                ier_writes.push(v);
+            }
+        }
+    });
+    assert_eq!(r, RunResult::Exited(0));
+    let out = printed(&m);
+    let shell = &out[out.find(SHELL_BANNER).unwrap()..];
+    let want = format!(
+        "{SHELL_BANNER}{}{PROMPT}halt\n",
+        format!("{PROMPT}ticks\nticks: 10\n").repeat(40)
+    );
+    assert_eq!(shell, want);
+    // Off when the buffer filled (128 bytes in), on again at half (64 taken),
+    // off when 64 more filled it (192 in), on again at half: the last 53
+    // bytes fit.
+    assert_eq!(
+        ier_writes,
+        [0, UART_IER_ERBFI, 0, UART_IER_ERBFI],
+        "{ier_writes:?}"
+    );
+}
+
+#[test]
+fn plic_routes_the_uart_to_the_kernel() {
+    // No input: the kernel waits at the prompt.
+    let (mut m, _) = load_committed_on(MachineConfig::default(), None);
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    let mut reg = |addr| m.cpu.bus.read(addr, 4).unwrap();
+    // Source 1 (the UART) at priority 1, enabled for context 1 (S-mode) only,
+    // whose threshold of 0 lets it through.
+    assert_eq!(reg(plic_priority(UART_IRQ)), 1);
+    assert_eq!(reg(plic_enable(1)), 1 << UART_IRQ);
+    assert_eq!(reg(plic_threshold(1)), 0);
+    assert_eq!(reg(plic_enable(0)), 0);
+    // sie.SEIE on (with the tick's SSIE); M-mode external interrupts stay off.
+    let mie = m.cpu.csr.mie;
+    assert_eq!(
+        mie,
+        (1 << IRQ_M_TIMER) | (1 << IRQ_S_SOFT) | (1 << IRQ_S_EXT),
+        "mie {mie:#x}"
+    );
+    assert_eq!(mie & (1 << IRQ_M_EXT), 0);
+    // The UART's receive interrupt is on.
+    assert_eq!(m.cpu.bus.read(UART_BASE + UART_IER, 1), Ok(UART_IER_ERBFI));
+}
+
+#[test]
+fn console_sleeps_until_input_and_never_polls_rbr() {
+    // The kernel reaches the prompt with nothing typed, idles, then gets a
+    // command while it sleeps. Input only arrives through the interrupt: no
+    // UART register is read while the kernel waits, and RBR only ever by the
+    // interrupt handler.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
+    let ticks = sym(&elf, "ticks");
+    let tick_count = |m: &Machine| m.cpu.bus.peek(ticks).unwrap();
+    let uart_intr = function("uart_intr");
+    let kernel_vec = sym(&elf, "kernel_vec");
+    let wfi = sym(&elf, "wfi");
+
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    assert_eq!(tick_count(&m), 10);
+
+    // Fifty idle ticks: the hart spends them in wfi (Grail skips the wait to
+    // the next tick), waking only for the tick itself, a couple of hundred
+    // instructions each. Polling would run all the 1 000 000 steps between.
+    let mut uart_reads = 0;
+    let mut wfis = 0;
+    let steps = step_until(
+        &mut m,
+        BOOT_MAX_STEPS,
+        |cpu| {
+            if matches!(uart_access(cpu), Some((_, false, _))) {
+                uart_reads += 1;
+            }
+            if cpu.pc == wfi {
+                wfis += 1;
+            }
+        },
+        |m| tick_count(m) == 60,
+    );
+    assert_eq!(uart_reads, 0, "the kernel polls the UART while idle");
+    assert!((50..=51).contains(&wfis), "{wfis} wfi for 50 ticks");
+    assert!(steps < 50 * 500, "{steps} steps for 50 idle ticks");
+
+    // Type a command: the UART interrupt wakes the hart at once (no tick passes
+    // before the shell answers), and only uart_intr reads RBR.
+    let before = printed(&m).len();
+    for &b in b"ticks\n" {
+        tx.send(b).unwrap();
+    }
+    let mut rbr_reads = Vec::new();
+    let mut lsr_reads = 0;
+    let mut external = 0;
+    step_until(
+        &mut m,
+        BOOT_MAX_STEPS,
+        |cpu| {
+            match uart_access(cpu) {
+                Some((UART_RBR, false, _)) => rbr_reads.push(cpu.pc),
+                Some((UART_LSR, false, _)) => lsr_reads += 1,
+                _ => {}
+            }
+            if cpu.pc == kernel_vec && cpu.csr.scause == INTERRUPT_BIT | IRQ_S_EXT {
+                external += 1;
+            }
+        },
+        |m| printed(m).ends_with(PROMPT) && printed(m).len() > before,
+    );
+    assert_eq!(&printed(&m)[before..], format!("ticks\nticks: 60\n{PROMPT}"));
+    assert_eq!(tick_count(&m), 60);
+    assert_eq!(rbr_reads.len(), 6, "one read per byte");
+    assert!(
+        rbr_reads.iter().all(|pc| uart_intr.contains(pc)),
+        "RBR read outside uart_intr ({uart_intr:x?}): {rbr_reads:x?}"
+    );
+    // The handler checks LSR.DR once per byte and once more to see it clear,
+    // and uart_putc checks THRE once per character printed.
+    assert!(lsr_reads > 6, "{lsr_reads}");
+    assert!(external >= 1);
+
+    for &b in HALT {
+        tx.send(b).unwrap();
+    }
+    assert_eq!(m.run(Some(BOOT_MAX_STEPS), |_| {}), RunResult::Exited(0));
+    assert!(printed(&m).ends_with(&format!("{PROMPT}halt\n")));
+}
+
+#[test]
+fn kernel_reads_the_timebase_from_sysinfo() {
+    // A machine reporting a 2 MHz clock: the 10 Hz tick is 200 000 mtime ticks.
+    const HZ: u32 = 2_000_000;
+    let config = MachineConfig {
+        nominal_hz: HZ,
+        ..MachineConfig::default()
+    };
+    let (mut m, elf) = load_committed_on(config, Some(kernel::typed(HALT)));
+    step_to(&mut m, sym(&elf, "kmain"));
+    let interval = HZ / 10;
+    assert_eq!(
+        m.cpu.bus.peek(sym(&elf, "machine_scratch") + SCRATCH_INTERVAL),
+        Some(interval)
+    );
+    let kernel_vec = sym(&elf, "kernel_vec");
+    let mut kernel_ticks = Vec::new();
+    let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
+        if cpu.pc == kernel_vec && cpu.csr.scause == INTERRUPT_BIT | IRQ_S_SOFT {
+            kernel_ticks.push(cpu.bus.clint.mtime);
+        }
+    });
+    assert_eq!(r, RunResult::Exited(0));
+    let want = halted_output().replace("10000000 Hz timebase", "2000000 Hz timebase");
+    assert_eq!(kernel::mask_dbg_pc(&printed(&m)), want);
+    // Ten ticks, each a 200 000-tick interval. (Setting up memory takes a
+    // few intervals before them, so the total mtime says little.)
+    assert_eq!(kernel_ticks.len(), 10, "{kernel_ticks:?}");
+    for w in kernel_ticks.windows(2) {
+        assert_eq!(w[1] - w[0], u64::from(interval), "{kernel_ticks:?}");
+    }
+}
+
+#[test]
+fn timer_interval_is_never_zero() {
+    // A timebase below the tick rate would give an interval of 0, which
+    // would never move mtimecmp; the kernel uses 1 instead. (A machine that
+    // slow can't run the kernel anyway: the timer fires faster than
+    // machine_vec handles it. So only timer_init is checked.)
+    let config = MachineConfig {
+        nominal_hz: 5,
+        ..MachineConfig::default()
+    };
+    let (mut m, elf) = load_committed_on(config, None);
+    let interval = sym(&elf, "machine_scratch") + SCRATCH_INTERVAL;
+    step_until(&mut m, 10_000, |_| {}, |m| m.cpu.bus.peek(interval) != Some(0));
+    assert_eq!(m.cpu.bus.peek(interval), Some(1));
+}
+
+#[test]
+fn timebase_is_read_once_in_m_mode() {
+    // timebase_hz() reads sysinfo on its first call, from timer_init in
+    // M-mode, and keeps the value: S-mode code (kmain prints the timebase)
+    // never reads the timebase again. The S-mode reads are kinit's (magic,
+    // version, RAM base and size) and kvminit's (the device table).
+    let (mut m, _) = load_committed();
+    let mut reads = Vec::new();
+    let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
+        if let Some(a) = mem_access(cpu) {
+            if (SYSINFO_BASE..SYSINFO_BASE + SYSINFO_SIZE).contains(&a.addr) {
+                assert!(a.load_rd.is_some(), "store to sysinfo at {:#x}", cpu.pc);
+                reads.push((a.addr - SYSINFO_BASE, cpu.mode));
+            }
+        }
+    });
+    assert_eq!(r, RunResult::Exited(0));
+    let m_mode: Vec<_> = reads.iter().filter(|r| r.1 == Mode::M).copied().collect();
+    assert_eq!(m_mode, [(REG_MAGIC, Mode::M), (REG_TIMEBASE_HZ, Mode::M)]);
+    assert!(
+        !reads.contains(&(REG_TIMEBASE_HZ, Mode::S)),
+        "timebase read again in S-mode: {reads:?}"
+    );
+}
+
+/// Boots the committed kernel on a machine reporting a 2 MHz clock, but with
+/// sysinfo register `reg` reading as 0. Returns the sysinfo registers read
+/// before kmain, the timer interval timer_init stored and the whole output.
+fn boot_with_sysinfo_reg_zero(reg: u32) -> (Vec<u32>, u32, String) {
+    let config = MachineConfig {
+        nominal_hz: 2_000_000,
+        ..MachineConfig::default()
+    };
+    let (mut m, elf) = load_committed_on(config, Some(kernel::typed(HALT)));
+    let kmain = sym(&elf, "kmain");
+    let mut reads = Vec::new();
+    for _ in 0..10_000 {
+        if m.cpu.pc == kmain {
+            break;
+        }
+        let read = mem_access(&m.cpu)
+            .filter(|a| (SYSINFO_BASE..SYSINFO_BASE + SYSINFO_SIZE).contains(&a.addr))
+            .and_then(|a| Some((a.addr - SYSINFO_BASE, a.load_rd?)));
+        m.cpu.step();
+        if let Some((offset, rd)) = read {
+            reads.push(offset);
+            if offset == reg {
+                m.cpu.x[rd as usize] = 0;
+            }
+        }
+    }
+    assert_eq!(m.cpu.pc, kmain, "never reached kmain");
+    let interval = m
+        .cpu
+        .bus
+        .peek(sym(&elf, "machine_scratch") + SCRATCH_INTERVAL)
+        .unwrap();
+    assert_eq!(m.run(Some(BOOT_MAX_STEPS), |_| {}), RunResult::Exited(0));
+    (reads, interval, kernel::mask_dbg_pc(&printed(&m)))
+}
+
+#[test]
+fn timebase_falls_back_to_nominal_without_sysinfo() {
+    // SYS_MAGIC is wrong: no sysinfo, so SYS_TIMEBASE_HZ is not read and the
+    // timebase is the nominal 10 MHz, not the machine's 2 MHz.
+    let (reads, interval, out) = boot_with_sysinfo_reg_zero(REG_MAGIC);
+    assert_eq!(reads, [REG_MAGIC]);
+    assert_eq!(u64::from(interval), TICK_INTERVAL);
+    assert_eq!(out, halted_output());
+}
+
+#[test]
+fn timebase_falls_back_to_nominal_when_sysinfo_reports_zero() {
+    let (reads, interval, out) = boot_with_sysinfo_reg_zero(REG_TIMEBASE_HZ);
+    assert_eq!(reads, [REG_MAGIC, REG_TIMEBASE_HZ]);
+    assert_eq!(u64::from(interval), TICK_INTERVAL);
+    assert_eq!(out, halted_output());
+}
+
+#[test]
+fn input_arriving_just_before_wfi_wakes_the_console() {
+    // console_getc turns interrupts off from its check of the ring buffer
+    // until wfi. A byte that arrives in between is then still pending when
+    // wfi runs, so wfi returns at once and the shell answers within the same
+    // tick. With interrupts on, the byte's interrupt would be taken before
+    // wfi, which would then sleep until the next tick.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
+    let ticks = sym(&elf, "ticks");
+    let tick_count = |m: &Machine| m.cpu.bus.peek(ticks).unwrap();
+    let wfi = sym(&elf, "wfi");
+
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    // console_getc found nothing and is about to sleep.
+    step_until(&mut m, 10_000, |_| {}, |m| m.cpu.pc == wfi);
+    let n = tick_count(&m);
+    let before = printed(&m).len();
+    for &b in b"ticks\n" {
+        tx.send(b).unwrap();
+    }
+    step_until(
+        &mut m,
+        BOOT_MAX_STEPS,
+        |_| {},
+        |m| printed(m).ends_with(PROMPT) && printed(m).len() > before,
+    );
+    assert_eq!(&printed(&m)[before..], format!("ticks\nticks: {n}\n{PROMPT}"));
+    assert_eq!(tick_count(&m), n);
 }
 
 /// Every C file and header in the kernel, with its name.

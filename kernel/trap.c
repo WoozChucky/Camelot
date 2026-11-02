@@ -1,12 +1,16 @@
 /* S-mode trap handling: kernel_vec (kernelvec.s) saves the registers and calls
- * kernel_trap(). The only interrupt so far is the timer tick, which arrives as
- * a supervisor software interrupt forwarded by machine_vec. An exception is a
- * kernel bug, so it panics, unless a memory probe (probe.s) caused it. */
+ * kernel_trap(). Two interrupts are handled: the timer tick, which arrives as
+ * a supervisor software interrupt forwarded by machine_vec, and the supervisor
+ * external interrupt from the PLIC, so far only the UART's receive line. An
+ * exception is a kernel bug, so it panics, unless a memory probe (probe.s)
+ * caused it. */
 #include "trap.h"
 #include "kprintf.h"
 #include "machine.h"
+#include "plic.h"
 #include "probe.h"
 #include "riscv.h"
+#include "uart.h"
 #include "vm.h"
 
 /* Register numbers in struct trap_frame's regs[]. */
@@ -107,6 +111,22 @@ static void trap_panic(struct trap_frame *f) {
     halt_after_panic();
 }
 
+/* A supervisor external interrupt: claim the source from the PLIC, service
+ * the device, complete. sip.SEIP follows the PLIC's line, so there is nothing
+ * to clear: once the claim is taken the line drops (unless another source is
+ * waiting, which then traps again after sret). */
+static void external_interrupt(void) {
+    u32 irq = plic_claim();
+    if (irq == PLIC_IRQ_UART) {
+        uart_intr();
+    }
+    /* 0: nothing left to claim. Only enabled sources can be claimed, so any
+     * other number is one the kernel set up. */
+    if (irq != 0) {
+        plic_complete(irq);
+    }
+}
+
 /* An exception at one of the probes' memory accesses: resume at probe_fault,
  * which returns scause to the probe's caller. Returns false for any other
  * trap. */
@@ -131,6 +151,10 @@ void kernel_trap(struct trap_frame *f) {
         ticks = ticks + 1;
         return;
     }
+    if (f->scause == (CAUSE_INTERRUPT | IRQ_S_EXT)) {
+        external_interrupt();
+        return;
+    }
     if (probe_fixup(f)) {
         return;
     }
@@ -138,10 +162,11 @@ void kernel_trap(struct trap_frame *f) {
 }
 
 void trap_init(void) {
+    plic_init();
     /* Machine ticks that fired while the kernel set itself up left SSIP
      * pending: drop that one, so the first tick taken is a whole interval
      * after it arrives rather than straight away. */
     w_sip(r_sip() & ~SIP_SSIP);
-    w_sie(r_sie() | SIE_SSIE);
+    w_sie(r_sie() | SIE_SSIE | SIE_SEIE);
     w_sstatus(r_sstatus() | SSTATUS_SIE);
 }

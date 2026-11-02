@@ -19,7 +19,8 @@ kernel options:
   --lld PATH         ld.lld to use (default: next to clang, then the same search)
   --as clang|merlin  assembler for the .s files (default: clang)
   -o PATH            output file (default: kernel/kernel.elf)
-  --run              run the result on Grail afterwards; exit with its exit code
+  --run              run the result on Grail afterwards, with this terminal as its
+                     console (type halt to stop it); exit with its exit code
   -v, --verbose      print each command";
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -231,9 +232,13 @@ fn kernel(k: KernelArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Interactive: the kernel's shell reads this terminal, in raw mode like the
+    // grail command's, and runs until `halt` (or Ctrl-C).
+    let _raw = grail::console::RawMode::enable();
     let run = xtask::kernel::run_with_output(
         &file,
-        xtask::kernel::BOOT_MAX_STEPS,
+        None,
+        grail::console::stdin_channel(),
         std::io::stdout(),
         std::io::stderr(),
     );
