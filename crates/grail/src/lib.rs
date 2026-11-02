@@ -6,6 +6,7 @@ pub mod devices;
 pub mod display;
 pub mod elf;
 pub mod framebuffer;
+pub mod keyboard;
 pub mod trap;
 #[cfg(windows)]
 mod win32;
@@ -14,6 +15,7 @@ mod window;
 
 use bus::{Bus, Exit};
 use cpu::Cpu;
+use keyboard::KeyEvent;
 
 pub const DEFAULT_RAM_SIZE: usize = 128 * 1024 * 1024;
 
@@ -48,6 +50,13 @@ impl Machine {
         bus.tohost = elf.symbol("tohost");
         bus.set_boot_entry(elf.entry);
         Ok(())
+    }
+
+    /// Hands a key event to the keyboard device (spec section 9.4). This is the one way
+    /// in for every host-side producer: the framebuffer window, tests, or a remote
+    /// client. Returns false if the event was dropped because the keyboard FIFO is full.
+    pub fn key_event(&mut self, ev: KeyEvent) -> bool {
+        self.cpu.bus.kbd.push(ev)
     }
 
     /// Exit code, once the program has asked to stop.
