@@ -48,6 +48,54 @@ div a0, a1, a2 | 02c5c533 |
 divu a0, a1, a2 | 02c5d533 | 
 rem a0, a1, a2 | 02c5e533 | 
 remu a0, a1, a2 | 02c5f533 | 
+lr.w a0, (a1) | 1005a52f | 
+lr.w.aq t0, (s1) | 1404a2af | 
+lr.w.rl s1, (t6) | 120fa4af | 
+lr.w.aqrl a5, (sp) | 160127af | 
+sc.w a0, a1, (a2) | 18b6252f | 
+sc.w.aq t0, t1, (t2) | 1c63a2af | 
+sc.w.rl s1, s2, (s3) | 1b29a4af | 
+sc.w.aqrl a5, a6, (a7) | 1f08a7af | 
+amoswap.w a0, a1, (a2) | 08b6252f | 
+amoswap.w.aq t3, t4, (t5) | 0ddf2e2f | 
+amoswap.w.rl ra, sp, (gp) | 0a21a0af | 
+amoswap.w.aqrl s10, s11, (tp) | 0fb22d2f | 
+amoadd.w a0, a1, (a2) | 00b6252f | 
+amoadd.w.aq a3, a4, (a5) | 04e7a6af | 
+amoadd.w.rl t0, t1, (t2) | 0263a2af | 
+amoadd.w.aqrl s0, s1, (s2) | 0699242f | 
+amoxor.w a0, a1, (a2) | 20b6252f | 
+amoxor.w.aq s3, s4, (s5) | 254aa9af | 
+amoxor.w.rl s6, s7, (s8) | 237c2b2f | 
+amoxor.w.aqrl s9, t3, (t6) | 27cfacaf | 
+amoand.w a0, a1, (a2) | 60b6252f | 
+amoand.w.aq a6, a7, (ra) | 6510a82f | 
+amoand.w.rl t0, a0, (sp) | 62a122af | 
+amoand.w.aqrl t1, a1, (gp) | 66b1a32f | 
+amoor.w a0, a1, (a2) | 40b6252f | 
+amoor.w.aq t2, a2, (tp) | 44c223af | 
+amoor.w.rl s0, a3, (t0) | 42d2a42f | 
+amoor.w.aqrl s1, a4, (t1) | 46e324af | 
+amomin.w a0, a1, (a2) | 80b6252f | 
+amomin.w.aq a5, s2, (t2) | 8523a7af | 
+amomin.w.rl a6, s3, (s0) | 8334282f | 
+amomin.w.aqrl a7, s4, (s1) | 8744a8af | 
+amomax.w a0, a1, (a2) | a0b6252f | 
+amomax.w.aq s5, t3, (a0) | a5c52aaf | 
+amomax.w.rl s6, t4, (a1) | a3d5ab2f | 
+amomax.w.aqrl s7, t5, (a2) | a7e62baf | 
+amominu.w a0, a1, (a2) | c0b6252f | 
+amominu.w.aq s8, t6, (a3) | c5f6ac2f | 
+amominu.w.rl s9, ra, (a4) | c2172caf | 
+amominu.w.aqrl s10, sp, (a5) | c627ad2f | 
+amomaxu.w a0, a1, (a2) | e0b6252f | 
+amomaxu.w.aq s11, gp, (a6) | e4382daf | 
+amomaxu.w.rl t3, tp, (a7) | e248ae2f | 
+amomaxu.w.aqrl t4, t0, (s2) | e6592eaf | 
+lr.w zero, 0(x31) | 100fa02f | 
+sc.w x0, x31, 0(a0) | 19f5202f | 
+amoadd.w zero, a1, 0(a2) | 00b6202f | 
+amoswap.w.aqrl x31, x0, (x0) | 0e002faf | 
 fence | 0ff0000f | 
 fence.i | 0000100f | 
 ecall | 00000073 | 

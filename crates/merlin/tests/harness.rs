@@ -31,14 +31,16 @@
 //! Ignored, since they need LLVM:
 //!
 //! * `generated_assembly_assembles_like_clang`: clang's assembler (with
-//!   `-mno-relax`) turns merlin's output for every case into the same `.text`
-//!   bytes and relocations as merlin-as. Needs clang on `PATH`.
+//!   `-mno-relax`) turns merlin's output for every case into the same
+//!   `.text`, `.rodata`, `.data` and `.bss` contents and relocations as
+//!   merlin-as. Needs clang on `PATH`.
 //!
 //!       cargo test -p merlin --test harness -- --ignored generated_assembly
 //!
 //! * `clang_reference`: compiles every case with clang instead of merlin, links
 //!   with ld.lld and runs it in Grail. It checks the expectations and crt0
-//!   against a real C compiler. Needs clang and ld.lld on `PATH` (the official
+//!   against a real C compiler (crt0's `memset` is there for clang, which
+//!   calls it to clear large local arrays). Needs clang and ld.lld on `PATH` (the official
 //!   Windows LLVM installer is enough).
 //!
 //!       cargo test -p merlin --test harness -- --ignored clang_reference
@@ -144,7 +146,7 @@ fn cases_are_well_formed() {
     assert!(n >= 4, "only {n} cases for merlin's defined behavior");
     for_each_case("front end", ALL_CASES, |c| {
         let prog = merlin::parse(&c.src).map_err(|e| render(&e, c))?;
-        if !prog.funcs.iter().any(|f| f.name == "main" && f.body.is_some()) {
+        if !prog.funcs().any(|f| f.name == "main" && f.body.is_some()) {
             return Err("no main".into());
         }
         Ok(c.expect)
@@ -172,8 +174,32 @@ fn reference_interpreter_semantics() {
     assert_eq!(eval("return 7 / id(0);"), -1);
     assert_eq!(eval("return 7 % id(0);"), 7);
     assert_eq!(eval("return 0x7fffffff + 1;"), i32::MIN);
-    // Literals that would be `unsigned int` or `long long` in C are rejected.
-    assert!(merlin::parse("int main() { return 0xffffffff; }").is_err());
+    // 0xffffffff is an `unsigned int`; a decimal literal that big would be
+    // `long long`, which merlin rejects.
+    assert_eq!(eval("return 0xffffffff;"), -1);
+    assert_eq!(
+        eval("return 0xffffffff / 2 == 0x7fffffff;"),
+        1,
+        "unsigned division"
+    );
+    assert_eq!(eval("return -1 < 0u;"), 0, "-1 converts to UINT_MAX");
+    assert_eq!(eval("return 7u / id(0) == 0xffffffff;"), 1, "divu by zero");
+    assert_eq!(eval("return -8 >> 1;"), -4);
+    assert_eq!(eval("return 0x80000000 >> 31;"), 1);
+    assert_eq!(
+        eval("return 1 << id(33);"),
+        2,
+        "the low 5 bits of the shift amount"
+    );
+    assert_eq!(
+        eval("return (char)300 + (signed char)200 + (unsigned short)-1;"),
+        44 - 56 + 65535
+    );
+    assert_eq!(eval("char c = 255; c++; return c;"), 0);
+    assert_eq!(
+        eval("int a[3] = {1, 2}; int *p = a + 2; return p - a + *(p - 1) * 10 + a[2];"),
+        22
+    );
     assert!(merlin::parse("int main() { return 2147483648; }").is_err());
     assert_eq!(eval("return 3 == 3;"), 1);
     assert_eq!(eval("return !7 || 5 && 9;"), 1);
@@ -186,6 +212,12 @@ fn reference_interpreter_semantics() {
     assert!(interp::run(&prog, "main").unwrap_err().contains("recursion"));
     let prog = merlin::parse("int g(); int main() { return g(); }").unwrap();
     assert!(interp::run(&prog, "main").unwrap_err().contains("no definition"));
+    let prog = merlin::parse("int main() { int *p = 0; return *p; }").unwrap();
+    assert!(interp::run(&prog, "main")
+        .unwrap_err()
+        .contains("outside every object"));
+    let prog = merlin::parse("extern int e; int main() { return e; }").unwrap();
+    assert!(interp::run(&prog, "main").unwrap_err().contains("never defined"));
 }
 
 /// Loads an executable into Grail and returns its exit code.
@@ -431,29 +463,44 @@ fn deep_expressions_run_in_grail() {
     assert_eq!(pipeline.run("args", src), Ok(102));
 }
 
-/// The code and relocations of an object's `.text`, as text for comparing.
-fn text_section(obj: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
+/// The sections `generated_assembly_assembles_like_clang` compares: code,
+/// string literals, initialized and zero-initialized globals.
+const COMPARED_SECTIONS: [&str; 4] = [".text", ".rodata", ".data", ".bss"];
+
+/// One section of an object, as text for comparing: its size, its bytes and
+/// its relocations. A section the object lacks reads as empty, so leaving out
+/// an empty section and emitting one compare equal.
+fn section_summary(obj: &[u8], name: &str) -> Result<(u32, Vec<u8>, Vec<String>), String> {
     let elf = elf32::Elf::parse(obj).map_err(|e| e.to_string())?;
-    let text = elf
-        .sections
-        .iter()
-        .find(|s| s.name == ".text")
-        .ok_or("no .text")?;
-    let code = elf.section_data(text).map_err(|e| e.to_string())?.to_vec();
+    let Some(section) = elf.sections.iter().find(|s| s.name == name) else {
+        return Ok((0, Vec::new(), Vec::new()));
+    };
+    let bytes = elf.section_data(section).map_err(|e| e.to_string())?.to_vec();
     let mut relocs = Vec::new();
-    if let Some(rela) = elf.sections.iter().find(|s| s.name == ".rela.text") {
+    let rela_name = format!(".rela{name}");
+    if let Some(rela) = elf.sections.iter().find(|s| s.name == rela_name) {
         let syms = elf.symbols().map_err(|e| e.to_string())?;
         for r in elf.relocations(rela).map_err(|e| e.to_string())? {
             let ty = elf32::reloc_name(r.ty).unwrap_or("?");
-            let sym = &syms[r.sym as usize].name;
+            let sym = &syms[r.sym as usize];
+            // A relocation against a section symbol has no name of its own;
+            // name it after the section, as both assemblers mean the same.
+            let sym = if sym.name.is_empty() {
+                elf.sections
+                    .get(sym.shndx as usize)
+                    .map_or("?", |s| s.name.as_str())
+            } else {
+                sym.name.as_str()
+            };
             relocs.push(format!("{:#x} {ty} {sym}{:+}", r.offset, r.addend));
         }
     }
-    Ok((code, relocs))
+    Ok((section.size, bytes, relocs))
 }
 
 /// merlin's output means the same to clang's assembler as to merlin-as: for
-/// every case, both give the same `.text` bytes and relocations. Needs clang.
+/// every case, both give the same bytes and relocations in `.text`, `.rodata`,
+/// `.data` and the same `.bss` size. Needs clang.
 #[test]
 #[ignore = "needs clang on PATH"]
 fn generated_assembly_assembles_like_clang() {
@@ -466,12 +513,17 @@ fn generated_assembly_assembles_like_clang() {
         std::fs::write(&s, &asm).map_err(|e| e.to_string())?;
         tool(clang().arg("-mno-relax").arg(&s).arg("-o").arg(&o))?;
         let theirs = std::fs::read(&o).map_err(|e| e.to_string())?;
-        let (ours, theirs) = (text_section(&ours)?, text_section(&theirs)?);
-        if ours.0 != theirs.0 {
-            return Err("merlin-as and clang assemble different .text bytes".into());
-        }
-        if ours.1 != theirs.1 {
-            return Err(format!("relocations differ:\n{:?}\n{:?}", ours.1, theirs.1));
+        for name in COMPARED_SECTIONS {
+            let (ours, theirs) = (section_summary(&ours, name)?, section_summary(&theirs, name)?);
+            if ours.0 != theirs.0 || ours.1 != theirs.1 {
+                return Err(format!("merlin-as and clang assemble different {name} contents"));
+            }
+            if ours.2 != theirs.2 {
+                return Err(format!(
+                    "{name} relocations differ:\n{:?}\n{:?}",
+                    ours.2, theirs.2
+                ));
+            }
         }
         Ok(c.expect)
     });

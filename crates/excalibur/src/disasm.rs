@@ -74,6 +74,17 @@ fn counter_alias(csr: u16) -> Option<&'static str> {
     })
 }
 
+/// An A-extension mnemonic with its ordering suffix. Mnemonics are
+/// `&'static str`, so each one is spelled out four times: none, `.rl`, `.aq`,
+/// `.aqrl` (indexed by the aq and rl bits).
+macro_rules! ordered {
+    ($m:literal, $order:expr) => {{
+        let order: Ordering = $order;
+        [$m, concat!($m, ".rl"), concat!($m, ".aq"), concat!($m, ".aqrl")]
+            [order.aq as usize * 2 + order.rl as usize]
+    }};
+}
+
 /// A fence's I/O/R/W set, `0` when empty.
 fn fence_set(bits: u8) -> String {
     if bits & 0xf == 0 {
@@ -248,6 +259,31 @@ impl Inst {
                 };
                 (m, format!("{}, {}, {}", r(rd), r(rs1), r(rs2)))
             }
+            Inst::Lr { rd, rs1, order } => (ordered!("lr.w", order), format!("{}, ({})", r(rd), r(rs1))),
+            Inst::Sc { rd, rs1, rs2, order } => (
+                ordered!("sc.w", order),
+                format!("{}, {}, ({})", r(rd), r(rs2), r(rs1)),
+            ),
+            Inst::Amo {
+                op,
+                rd,
+                rs1,
+                rs2,
+                order,
+            } => {
+                let m = match op {
+                    AmoOp::Swap => ordered!("amoswap.w", order),
+                    AmoOp::Add => ordered!("amoadd.w", order),
+                    AmoOp::Xor => ordered!("amoxor.w", order),
+                    AmoOp::And => ordered!("amoand.w", order),
+                    AmoOp::Or => ordered!("amoor.w", order),
+                    AmoOp::Min => ordered!("amomin.w", order),
+                    AmoOp::Max => ordered!("amomax.w", order),
+                    AmoOp::Minu => ordered!("amominu.w", order),
+                    AmoOp::Maxu => ordered!("amomaxu.w", order),
+                };
+                (m, format!("{}, {}, ({})", r(rd), r(rs2), r(rs1)))
+            }
             Inst::Fence { pred: 0xf, succ: 0xf } if a => ("fence", String::new()),
             Inst::Fence { pred, succ } => ("fence", format!("{}, {}", fence_set(pred), fence_set(succ))),
             Inst::FenceTso => ("fence.tso", String::new()),
@@ -366,6 +402,57 @@ mod tests {
         assert_eq!(objdump(0x0100000f, 0), "fence w, 0");
         assert_eq!(objdump(0x8330000f, 0), "fence.tso");
         assert_eq!(objdump(0xffffffff, 0), ".word 0xffffffff");
+    }
+
+    /// What llvm-objdump 21 prints for clang's `-march=rv32ima` encodings.
+    #[test]
+    fn atomics() {
+        let cases = [
+            (0x1005a52f, "lr.w a0, (a1)"),
+            (0x1405a52f, "lr.w.aq a0, (a1)"),
+            (0x1205a52f, "lr.w.rl a0, (a1)"),
+            (0x1605a52f, "lr.w.aqrl a0, (a1)"),
+            (0x18b6252f, "sc.w a0, a1, (a2)"),
+            (0x1e63a2af, "sc.w.aqrl t0, t1, (t2)"),
+            (0x08b6252f, "amoswap.w a0, a1, (a2)"),
+            (0x04b6252f, "amoadd.w.aq a0, a1, (a2)"),
+            (0x62b6252f, "amoand.w.rl a0, a1, (a2)"),
+            (0x40b6252f, "amoor.w a0, a1, (a2)"),
+            (0x20b6252f, "amoxor.w a0, a1, (a2)"),
+            (0x80b6252f, "amomin.w a0, a1, (a2)"),
+            (0xa0b6252f, "amomax.w a0, a1, (a2)"),
+            (0xc0b6252f, "amominu.w a0, a1, (a2)"),
+            (0xe0b6202f, "amomaxu.w zero, a1, (a2)"),
+            (0x0805a5af, "amoswap.w a1, zero, (a1)"),
+            (0x1805a52f, "sc.w a0, zero, (a1)"),
+            (0x1015a52f, ".word 0x1015a52f"),
+        ];
+        for (w, want) in cases {
+            assert_eq!(objdump(w, 0), want);
+            assert_eq!(no_aliases(w), want);
+            assert_eq!(decode(w).to_string(), want);
+        }
+        // Every operation and ordering: the suffix is Ordering::suffix.
+        for op in crate::AmoOp::ALL {
+            for bits in 0..4 {
+                let order = crate::Ordering {
+                    aq: bits & 2 != 0,
+                    rl: bits & 1 != 0,
+                };
+                let amo = |order| crate::Inst::Amo {
+                    op,
+                    rd: 1,
+                    rs1: 2,
+                    rs2: 3,
+                    order,
+                };
+                let base = amo(crate::Ordering::NONE).format(None, Syntax::PLAIN).mnemonic;
+                assert_eq!(
+                    amo(order).format(None, Syntax::PLAIN).mnemonic,
+                    format!("{base}{}", order.suffix())
+                );
+            }
+        }
     }
 
     #[test]

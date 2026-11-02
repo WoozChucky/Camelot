@@ -1,24 +1,24 @@
-Function main() <3:5>
-  Local #0 i <4:9>
+Function int main(void) <3:5>
+  Local #0 int i <4:9>
   Decl <4:5>
-    Var i #0 <4:9>
+    Var int i #0 <4:9>
   For <5:5>
     ExprStmt <5:10>
-      Assign <5:12>
-        Var i #0 <5:10>
-        Num 0 <5:14>
-    Binary < <5:19>
-      Var i #0 <5:17>
-      Num 5 <5:21>
-    Assign <5:26>
-      Var i #0 <5:24>
-      Binary + <5:30>
-        Var i #0 <5:28>
-        Num 1 <5:32>
+      Assign : int <5:12>
+        Var i #0 : int <5:10>
+        Num 0 : int <5:14>
+    Binary < : int <5:19>
+      Var i #0 : int <5:17>
+      Num 5 : int <5:21>
+    Assign : int <5:26>
+      Var i #0 : int <5:24>
+      Binary + : int <5:30>
+        Var i #0 : int <5:28>
+        Num 1 : int <5:32>
     Empty <6:9>
   Empty <7:5>
   While <8:5>
-    Num 0 <8:12>
+    Num 0 : int <8:12>
     Block <8:15>
   Return <9:5>
-    Var i #0 <9:12>
+    Var i #0 : int <9:12>

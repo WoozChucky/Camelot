@@ -1,4 +1,4 @@
-//! Compares the encoder against llvm-mc, line by line (tests/golden/encode.golden,
+//! Compares the encoder against LLVM, line by line (tests/golden/encode.golden,
 //! regenerate with scripts/gen-encode-golden.sh). Each line is assembled on
 //! its own, so every label is an undefined symbol and stays a relocation.
 
@@ -32,7 +32,7 @@ fn cases() -> Vec<Case> {
         .collect()
 }
 
-/// Why a line differs from llvm-mc, if it does.
+/// Why a line differs from LLVM, if it does.
 fn check(case: &Case) -> Result<(), String> {
     let obj = merlin_as::assemble(&case.src).map_err(|errs| format!("error: {}", errs[0].msg))?;
     let text = &obj.sections[0];
@@ -75,14 +75,14 @@ fn check(case: &Case) -> Result<(), String> {
 #[test]
 fn encode_golden() {
     let cases = cases();
-    assert_eq!(cases.len(), 118);
+    assert_eq!(cases.len(), 166);
     let fails: Vec<String> = cases
         .iter()
         .filter_map(|c| check(c).err().map(|why| format!("  {:<28} {why}", c.src)))
         .collect();
     assert!(
         fails.is_empty(),
-        "{} of {} lines encode differently from llvm-mc:\n{}",
+        "{} of {} lines encode differently from LLVM:\n{}",
         fails.len(),
         cases.len(),
         fails.join("\n")
