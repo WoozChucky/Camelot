@@ -292,6 +292,12 @@
 //! ```
 //!
 //! (and `beq a0, t0, ...` becomes `bne a0, t0, 1f` over a `j`).
+//!
+//! Every `j` codegen writes (that long form, loop back-edges, `break`,
+//! `continue`, `goto`, `j .L.return.f`) goes somewhere in the same function,
+//! so they all reach as long as the function's code is under 1 MiB. A bigger
+//! function is an error ([`check_size`]), reported by merlin on the function
+//! rather than by merlin-as on an internal label.
 
 use crate::abi::{self, Pass};
 use crate::ast::*;
@@ -368,7 +374,9 @@ pub fn generate(prog: &Program) -> Result<String, Error> {
                 let (lines, statics) = (g.lines, g.statics);
                 file.switch(".text");
                 file.out.push('\n');
-                render(&lines, &relax_branches(&lines), &mut file.out);
+                let long = relax_branches(&lines);
+                check_size(f, &lines, &long)?;
+                render(&lines, &long, &mut file.out);
                 for d in statics {
                     file.variable(d);
                 }
@@ -2138,6 +2146,40 @@ fn relax_branches(lines: &[Line]) -> Vec<bool> {
     }
 }
 
+/// The most bytes `lines` can assemble to, with the branches `long` marks
+/// in their long form: the same estimate as [`relax_branches`].
+fn code_size(lines: &[Line], long: &[bool]) -> i64 {
+    lines
+        .iter()
+        .zip(long)
+        .map(|(line, &long)| match line {
+            Line::Insn(_, size) => i64::from(*size),
+            Line::Branch { .. } if long => 8,
+            Line::Branch { .. } => 4,
+            Line::Label(_) | Line::Text(_) => 0,
+        })
+        .sum()
+}
+
+/// A `j` reaches -1 MiB..=+1 MiB - 2 bytes from itself.
+const JUMP_REACH: i64 = (1 << 20) - 2;
+
+/// Every `j` in a function goes to a label in it, so none is out of reach
+/// when the whole function fits in a jump's reach. Sizes are estimated at
+/// their largest, so a function just under the limit may be refused too.
+fn check_size(f: &Function, lines: &[Line], long: &[bool]) -> Result<(), Error> {
+    let size = code_size(lines, long);
+    if size > JUMP_REACH {
+        let msg = format!(
+            "function '{}' is too big: up to {size} bytes of code, and the jumps inside a function \
+             reach only 1 MiB",
+            f.name
+        );
+        return Err(Error::new(f.pos, msg));
+    }
+    Ok(())
+}
+
 /// Writes a function's lines as assembly text.
 fn render(lines: &[Line], long: &[bool], out: &mut String) {
     for (line, &long) in lines.iter().zip(long) {
@@ -2697,6 +2739,38 @@ main:
         v.extend((0..2000).map(|_| Line::Insn("nop".into(), 4)));
         v.push(Line::Label("b".into()));
         assert_eq!(&relax_branches(&v)[..2], [true, true]);
+    }
+
+    #[test]
+    fn a_function_must_fit_in_a_jumps_reach() {
+        // Each statement is about 56 bytes of code: 18000 of them stay under
+        // 1 MiB, 19000 do not, and the error names the function, not one of
+        // the internal labels merlin-as would complain about.
+        let src = |n| format!("int f(int x) {{ {} return x; }}", "x = x * 3 + 1; ".repeat(n));
+        assert!(crate::compile(&src(18_000)).is_ok());
+        let e = crate::compile(&src(19_000)).unwrap_err();
+        assert_eq!((e[0].pos.line, e[0].pos.col), (1, 5));
+        assert!(
+            e[0].msg.starts_with("function 'f' is too big: up to ")
+                && e[0]
+                    .msg
+                    .ends_with(" bytes of code, and the jumps inside a function reach only 1 MiB"),
+            "{}",
+            e[0].msg
+        );
+        // The estimate counts long branches at 8 bytes.
+        let v = vec![
+            Line::Branch {
+                op: "beqz",
+                regs: "a0",
+                target: "end".into(),
+            },
+            Line::Insn("li a0, 0x12345".into(), 8),
+            Line::Label("end".into()),
+            Line::Text(".size f, . - f".into()),
+        ];
+        assert_eq!(code_size(&v, &[false; 4]), 12);
+        assert_eq!(code_size(&v, &[true, false, false, false]), 16);
     }
 
     #[test]

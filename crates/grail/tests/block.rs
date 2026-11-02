@@ -472,6 +472,57 @@ fn elf_path(name: &str) -> String {
         .to_string()
 }
 
+/// Makes a file read-only (the Windows attribute, or no write permission on
+/// Linux) and puts its permissions back when dropped, so the `TempFile` can
+/// remove it.
+struct ReadOnly<'a> {
+    file: &'a TempFile,
+    original: std::fs::Permissions,
+}
+
+impl<'a> ReadOnly<'a> {
+    fn new(file: &'a TempFile) -> Self {
+        let original = std::fs::metadata(&file.0).unwrap().permissions();
+        let mut ro = original.clone();
+        ro.set_readonly(true);
+        std::fs::set_permissions(&file.0, ro).unwrap();
+        ReadOnly { file, original }
+    }
+}
+
+impl Drop for ReadOnly<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.file.0, self.original.clone());
+    }
+}
+
+#[test]
+fn a_read_only_file_is_opened_without_write_access() {
+    // --disk-ro must work on media the host cannot write: FileDisk opens the file for
+    // reading only. --disk asks for write access, which the host refuses.
+    let file = TempFile::new("ro-attr.img", &disk_image());
+    let _ro = ReadOnly::new(&file);
+    // Someone allowed to write anyway (root on Linux) cannot check the refusal.
+    let writable = std::fs::OpenOptions::new().write(true).open(&file.0).is_ok();
+
+    let disk = FileDisk::open(file.path(), true).unwrap();
+    assert!(disk.read_only());
+    assert_eq!(disk.capacity(), 8);
+    let out = grail(&["--disk-ro", file.path(), &elf_path("disk")]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8(out.stdout)
+        .unwrap()
+        .ends_with("read-only disk: write test skipped\n"));
+    if !writable {
+        assert!(FileDisk::open(file.path(), false).is_err());
+        let out = grail(&["--disk", file.path(), &elf_path("disk")]);
+        assert_eq!(out.status.code(), Some(2));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("grail: disk 0: "), "{stderr}");
+    }
+    assert_eq!(file.read(), disk_image());
+}
+
 #[test]
 fn cli_disk_flags() {
     let file = TempFile::new("cli.img", &disk_image());

@@ -67,6 +67,11 @@ pub enum Operand {
     Mem {
         offset: Expr,
         base: Reg,
+        /// The offset was left out or written as one integer token (`0`,
+        /// `0x0`), not as an expression. The expression is folded while
+        /// parsing (`+0` and `(0)` both become `Num(0)`), so this keeps what
+        /// was written: an A instruction takes only a literal 0, as in LLVM.
+        int_token: bool,
     },
 }
 

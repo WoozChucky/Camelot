@@ -498,6 +498,9 @@ mod tests {
         // Past the end of RAM, by data or by size: refused, nothing written.
         assert_eq!(bus.load_zeroed(RAM_BASE + 4094, &[3, 3, 3], 0), Err(BusFault));
         assert_eq!(bus.load_zeroed(RAM_BASE, &[3], u32::MAX), Err(BusFault));
+        // VRAM is memory, but programs are loaded into RAM only (spec section 7).
+        assert_eq!(bus.load(VRAM_BASE, &[3]), Err(BusFault));
+        assert_eq!(bus.fb.vram[0], 0);
         assert_eq!(bus.load_zeroed(RAM_BASE + 4000, &[], 0x8000_0000), Err(BusFault));
         assert_eq!(bus.load_zeroed(RAM_BASE - 4, &[3], 8), Err(BusFault));
         assert_eq!(bus.ram[0], 0xaa);
