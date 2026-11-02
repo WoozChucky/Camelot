@@ -1,12 +1,11 @@
 # Camelot: notes for Claude Code sessions
 
-Camelot is Nuno's learning project: the Excalibur ISA (RV32IM + Zicsr, M/S/U, Sv32, Xcal extensions), the Grail emulator, the Merlin toolchain (merlin-as, merlin-ld, merlin-objdump, merlin C-subset compiler) and the Camelot OS. The spec is `docs/excalibur-spec.md`; the roadmap is its §11 and the tracking issue on GitHub (label `roadmap`).
+Camelot is a learning project: the Excalibur ISA (RV32IM + Zicsr, M/S/U, Sv32, Xcal extensions), the Grail emulator, the Merlin toolchain (merlin-as, merlin-ld, merlin-objdump, merlin C-subset compiler) and the Camelot OS. The spec is `docs/excalibur-spec.md`; the roadmap is its §11 and the tracking issue on GitHub (label `roadmap`).
 
 ## Picking up work
 
 - Work comes from GitHub issues. Each one has a goal, spec references, acceptance criteria and dependencies. Check that its dependencies are merged before starting.
-- Issues labeled **`nuno-writes`** are the parts Nuno writes to learn from (e.g. the merlin-as encoder, linker relocations, compiler codegen). On those, explain, review, write tests and answer questions, but do not write the implementation unless Nuno explicitly asks you to in the session.
-- Issues labeled `scaffold` are plumbing you can implement.
+- Any open issue can be implemented. Code in the core pieces (encoder, linker relocations, compiler codegen) should stay readable and well commented, since it doubles as study material.
 - If the spec is ambiguous or you change a design decision, update `docs/excalibur-spec.md` in the same PR.
 
 ## Hard rules
@@ -37,7 +36,7 @@ Reuse `excalibur` (register names, CSR names, decoder, `Inst::format`) and `elf3
 
 ## Before pushing
 
-CI runs on Windows and Linux; run the same checks locally:
+CI runs on Linux only (Windows runners are expensive), so Windows is covered by running these checks locally on Windows before every push. Code behind `cfg(windows)`, such as the Win32 window, is only checked here:
 
 ```
 cargo fmt --check
