@@ -105,6 +105,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pendragon"
+version = "0.1.0"
+dependencies = [
+ "avalon",
+ "avalon-client",
+ "avalon-proto",
+ "lake",
+]
+
+[[package]]
 name = "round-table"
 version = "0.1.0"
 dependencies = [

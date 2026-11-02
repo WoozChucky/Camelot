@@ -1,0 +1,17 @@
+[package]
+name = "pendragon"
+description = "Pendragon, the web console of the Avalon platform: VMs on Avalon and disk images on Lake, from a browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Every VM and disk operation goes through the client layer Round Table uses too.
+avalon-client = { path = "../avalon-client" }
+avalon-proto = { path = "../avalon-proto" }
+
+[dev-dependencies]
+# The integration tests run Avalon and Lake in process and drive them through
+# Pendragon over HTTP.
+avalon = { path = "../avalon" }
+lake = { path = "../lake" }
