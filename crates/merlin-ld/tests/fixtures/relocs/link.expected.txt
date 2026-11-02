@@ -1,0 +1,103 @@
+There are 11 section headers, starting at offset 0x65e0:
+
+Section Headers:
+  [Nr] Name              Type            Address  Off    Size   ES Flg Lk Inf Al
+  [ 0]                   NULL            00000000 000000 000000 00      0   0  0
+  [ 1] .low              PROGBITS        80000000 001000 000010 00 WAX  0   0  1
+  [ 2] .text             PROGBITS        80100000 002000 0023ac 00  AX  0   0  4
+  [ 3] .rodata           PROGBITS        801023ac 0043ac 00001c 00   A  0   0  4
+  [ 4] .data             PROGBITS        80103000 005000 000814 00  WA  0   0 4096
+  [ 5] .high             PROGBITS        80200000 006000 000008 00  AX  0   0  1
+  [ 6] .riscv.attributes RISCV_ATTRIBUTES 00000000 006008 000031 00      0   0  1
+  [ 7] .comment          PROGBITS        00000000 006039 000013 01  MS  0   0  1
+  [ 8] .symtab           SYMTAB          00000000 00604c 000370 10     10  36  4
+  [ 9] .shstrtab         STRTAB          00000000 0063bc 000055 00      0   0  1
+  [10] .strtab           STRTAB          00000000 006411 0001cd 00      0   0  1
+Key to Flags:
+  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
+  L (link order), O (extra OS processing required), G (group), T (TLS),
+  C (compressed), x (unknown), o (OS specific), E (exclude),
+  R (retain), p (processor specific)
+
+Elf file type is EXEC (Executable file)
+Entry point 0x80100000
+There are 7 program headers, starting at offset 52
+
+Program Headers:
+  Type           Offset   VirtAddr   PhysAddr   FileSiz MemSiz  Flg Align
+  LOAD           0x001000 0x80000000 0x80000000 0x00010 0x00010 RWE 0x1000
+  LOAD           0x002000 0x80100000 0x80100000 0x023ac 0x023ac R E 0x1000
+  LOAD           0x0043ac 0x801023ac 0x801023ac 0x0001c 0x0001c R   0x1000
+  LOAD           0x005000 0x80103000 0x80103000 0x00814 0x00814 RW  0x1000
+  LOAD           0x006000 0x80200000 0x80200000 0x00008 0x00008 R E 0x1000
+  GNU_STACK      0x000000 0x00000000 0x00000000 0x00000 0x00000 RW  0x0
+  ATTRIBUTES     0x006008 0x00000000 0x00000000 0x00031 0x00031 R   0x1
+
+ Section to Segment mapping:
+  Segment Sections...
+   00     .low 
+   01     .text 
+   02     .rodata 
+   03     .data 
+   04     .high 
+   05     
+   06     .riscv.attributes 
+   None   .comment .symtab .shstrtab .strtab 
+
+Symbol table '.symtab' contains 55 entries:
+   Num:    Value  Size Type    Bind   Vis       Ndx Name
+     0: 00000000     0 NOTYPE  LOCAL  DEFAULT   UND 
+     1: 10000000     0 NOTYPE  LOCAL  DEFAULT   ABS UART
+     2: 80100000     0 NOTYPE  LOCAL  DEFAULT     2 $x
+     3: 8010001c     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi0
+     4: 8010006c     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi1
+     5: 80100078     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi2
+     6: 801000ac     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi3
+     7: 80103000     0 NOTYPE  LOCAL  DEFAULT     4 counter
+     8: 801000b4     0 NOTYPE  LOCAL  DEFAULT     2 .Ltmp0
+     9: 801000c4     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi4
+    10: 80103800     0 NOTYPE  LOCAL  DEFAULT     4 edge
+    11: 801037fc     0 NOTYPE  LOCAL  DEFAULT     4 below_edge
+    12: 80103804     0 NOTYPE  LOCAL  DEFAULT     4 edge_copy
+    13: 8010011c     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi5
+    14: 80100138     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi6
+    15: 80100150     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi7
+    16: 80100164     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi8
+    17: 801023ac     0 NOTYPE  LOCAL  DEFAULT     3 table
+    18: 80100170     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi9
+    19: 801001f4     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi10
+    20: 80100214     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi11
+    21: 801002d0     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi12
+    22: 80100308     0 NOTYPE  LOCAL  DEFAULT     2 $x
+    23: 801003a4     0 NOTYPE  LOCAL  DEFAULT     2 $x
+    24: 80000000     0 NOTYPE  LOCAL  DEFAULT     1 $x
+    25: 80200000     0 NOTYPE  LOCAL  DEFAULT     5 $x
+    26: 801023ac     0 NOTYPE  LOCAL  DEFAULT     3 $d
+    27: 80103000     0 NOTYPE  LOCAL  DEFAULT     4 $d
+    28: 00000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
+    29: 80100318     0 NOTYPE  LOCAL  DEFAULT     2 $x
+    30: 80103808     0 NOTYPE  LOCAL  DEFAULT     4 $d
+    31: 00000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
+    32: 80100364     0 NOTYPE  LOCAL  DEFAULT     2 $x
+    33: 80100374     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi0
+    34: 80103810     0 NOTYPE  LOCAL  DEFAULT     4 $d
+    35: 00000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
+    36: 80100000     0 NOTYPE  GLOBAL DEFAULT     2 _start
+    37: 80200000     0 NOTYPE  GLOBAL DEFAULT     5 high_target
+    38: 80000008     0 NOTYPE  GLOBAL DEFAULT     1 low_target
+    39: 80100304     0 NOTYPE  GLOBAL DEFAULT     2 fail
+    40: 80104820     0 NOTYPE  GLOBAL DEFAULT     4 __stack_top
+    41: 80100318     0 NOTYPE  GLOBAL DEFAULT     2 lib_double
+    42: 80100320     0 NOTYPE  GLOBAL DEFAULT     2 lib_calls_back
+    43: 80103808     0 NOTYPE  GLOBAL DEFAULT     4 lib_value
+    44: 80100348     0 NOTYPE  GLOBAL DEFAULT     2 lib_check
+    45: 8010380c     0 NOTYPE  GLOBAL DEFAULT     4 lib_ptr
+    46: 00000000     0 NOTYPE  WEAK   DEFAULT   UND missing
+    47: 8010035c     0 NOTYPE  GLOBAL DEFAULT     2 lib_inc
+    48: 801013a4     0 NOTYPE  GLOBAL DEFAULT     2 branch_edges
+    49: 80100364     0 NOTYPE  GLOBAL DEFAULT     2 relax_fn
+    50: 80103810     0 NOTYPE  GLOBAL DEFAULT     4 relax_word
+    51: 80100308     0 NOTYPE  GLOBAL DEFAULT     2 main_helper
+    52: 80100310     0 NOTYPE  GLOBAL DEFAULT     2 main_tail
+    53: 801003a4     0 NOTYPE  GLOBAL DEFAULT     2 branch_back
+    54: 801023a4     0 NOTYPE  GLOBAL DEFAULT     2 branch_fwd

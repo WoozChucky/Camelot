@@ -11,7 +11,7 @@ tasks:
   kernel       build kernel/kernel.elf (clang + ld.lld from the official LLVM install)
   hello        assemble examples/hello/hello.S with merlin-as, link it with ld.lld
                into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
-  ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj);
+  ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj, llvm-objdump);
                takes --clang, --lld and -v like kernel
 
 kernel options:
@@ -131,12 +131,13 @@ fn ld_fixtures(k: KernelArgs) -> ExitCode {
         eprintln!("xtask: clang not found; pass --clang PATH");
         return ExitCode::FAILURE;
     };
-    let (Some(lld), Some(readobj)) = (
+    let (Some(lld), Some(readobj), Some(objdump)) = (
         k.lld.or_else(|| tools::find_beside("ld.lld", &clang)),
         tools::find_beside("llvm-readobj", &clang),
+        tools::find_beside("llvm-objdump", &clang),
     ) else {
         eprintln!(
-            "xtask: ld.lld and llvm-readobj must be next to {} or on PATH",
+            "xtask: ld.lld, llvm-readobj and llvm-objdump must be next to {} or on PATH",
             clang.display()
         );
         return ExitCode::FAILURE;
@@ -146,6 +147,7 @@ fn ld_fixtures(k: KernelArgs) -> ExitCode {
         clang,
         lld,
         readobj,
+        objdump,
         verbose: k.verbose,
     };
     let fixtures = root.join("crates/merlin-ld/tests/fixtures");
