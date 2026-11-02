@@ -10,7 +10,10 @@
  *   a pattern, read it again (a hit), check the disk itself holds the
  *   pattern by reading past the cache, then write the old contents back and
  *   flush. On a read-only disk the write must fail with BLK_ERR_READ_ONLY
- *   and change nothing.
+ *   and change nothing. On a disk holding a filesystem (disk 0 is the
+ *   root), the last block may be one of its files', and the machine may
+ *   stop between the two writes: there the "pattern" is the block's own
+ *   contents, so the disk never holds anything else in it.
  * - errors: a block past the end is out of range and isn't cached; a buffer
  *   outside RAM is refused.
  * - LRU (when the disk is big enough): after blocks 0 to NBUF - 1, then
@@ -19,6 +22,7 @@
 #include "blktest.h"
 #include "bio.h"
 #include "blk.h"
+#include "fs.h"
 #include "kprintf.h"
 #include "proc.h"
 #include "string.h"
@@ -54,13 +58,19 @@ static void fill(u8 *p, u32 seed) {
     }
 }
 
-static bool filled(const u8 *p, u32 seed) {
-    for (u32 i = 0; i < BSIZE; i++) {
-        if (p[i] != (u8)(i * 7 + seed)) {
-            return false;
-        }
+/* What the scratch block is written with: the pattern, or on a disk with
+ * a filesystem the block's own contents (`saved`). */
+static u8 pattern[BSIZE];
+
+/* Whether disk 0 holds a Camelot filesystem: its magic at the start of
+ * block 1 (docs/camelot-fs.md), read past the cache. */
+static bool holds_filesystem(void) {
+    u32 magic;
+    if (blk_read(0, SUPERBLOCK_NO * BLOCK_SECTORS, raw, BLOCK_SECTORS) != BLK_OK) {
+        return false;
     }
-    return true;
+    memcpy(&magic, raw, sizeof magic);
+    return magic == FS_MAGIC;
 }
 
 /* ---- Three readers at once ---- */
@@ -92,6 +102,8 @@ static void scratch_test(void) {
     u32 sector = scratch * BLOCK_SECTORS;
     bool read_only = blk_read_only(0);
 
+    bool fs = holds_filesystem();
+
     /* Block 0 came from the disk as it is. */
     check(blk_read(0, 0, raw, BLOCK_SECTORS) == BLK_OK && memcmp(raw, first, BSIZE) == 0,
           "block 0 in the cache matches the disk");
@@ -102,7 +114,12 @@ static void scratch_test(void) {
     u32 hits = bio_hits;
     u32 misses = bio_misses;
     memcpy(saved, b->data, BSIZE);
-    fill(b->data, 3);
+    if (fs) {
+        memcpy(pattern, saved, BSIZE);
+    } else {
+        fill(pattern, 3);
+    }
+    memcpy(b->data, pattern, BSIZE);
     u32 err = bwrite(b);
     brelse(b);
 
@@ -114,7 +131,8 @@ static void scratch_test(void) {
               "after a refused write, the block is read again");
     } else {
         check(err == BLK_OK, "write the scratch block");
-        check(b->valid && bio_hits == hits + 1 && filled(b->data, 3), "read it back from the cache");
+        check(b->valid && bio_hits == hits + 1 && memcmp(b->data, pattern, BSIZE) == 0,
+              "read it back from the cache");
     }
     brelse(b);
 
@@ -124,7 +142,7 @@ static void scratch_test(void) {
         check(err == BLK_OK && memcmp(raw, saved, BSIZE) == 0, "the read-only disk is unchanged");
         return;
     }
-    check(err == BLK_OK && filled(raw, 3), "the disk holds the written block");
+    check(err == BLK_OK && memcmp(raw, pattern, BSIZE) == 0, "the disk holds the written block");
 
     /* Put the old contents back. */
     b = bread(0, scratch);
