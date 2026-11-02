@@ -1,8 +1,9 @@
 //! `cargo xtask up` end to end: the real Lake, Avalon and Pendragon binaries started
 //! as `up` starts them, on ephemeral ports, with a temporary images directory; each
 //! one asked whether it answers; the demo's Camelot VM booted to its shell, with a
-//! second one beside it; and everything stopped again. Nothing waits a fixed time:
-//! every wait is for something to happen, with a generous limit.
+//! second one beside it; everything stopped, and started again on every address with
+//! the demo VM on its old disk; and `xtask up` itself ended from outside. Nothing
+//! waits a fixed time: every wait is for something to happen, with a generous limit.
 //!
 //! The binaries are built once, by `up`'s own build step (`cargo build --release -p
 //! ...`, a no-op after `cargo test --release` has built the workspace), and so is the
@@ -10,11 +11,11 @@
 
 use avalon_client::Client;
 use avalon_proto::{Connection, Message, VmRef, VmState};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use xtask::up::{self, Ending, Options, Platform};
 
@@ -183,6 +184,39 @@ impl Console {
 /// Camelot's shell prompt.
 const PROMPT: &str = "$ ";
 
+/// Never set: no Ctrl-C.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Checks the Herald command in `line` (its arguments `args`) with Herald's own parser.
+fn check_herald(line: &str, args: &str) {
+    let args: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+    let parsed = herald::parse_args(&args).unwrap_or_else(|e| panic!("{line}: {e}"));
+    assert!(parsed.is_some(), "{line}");
+}
+
+/// Checks that every Round Table and Herald command in `up`'s summary is one they
+/// take, and that none names an unspecified address.
+fn check_summary(summary: &str) {
+    let mut commands = 0;
+    for line in summary.lines() {
+        let line = line.trim();
+        if let Some(args) = line.strip_prefix("cargo run --release -p round-table -- ") {
+            let args: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+            round_table::parse_args(&args).unwrap_or_else(|e| panic!("{line}: {e}"));
+            commands += 1;
+        } else if let Some(args) = line.strip_prefix("cargo run --release -p herald -- ") {
+            // The command, without the "(Ctrl-] detaches)" after it.
+            check_herald(line, args.split("  ").next().unwrap());
+            commands += 1;
+        }
+    }
+    assert_eq!(commands, 3, "{summary}");
+    assert!(
+        !summary.contains("0.0.0.0") && !summary.contains("[::]"),
+        "{summary}"
+    );
+}
+
 #[test]
 fn the_platform_comes_up_boots_camelot_and_stops() {
     let dir = TempDir::new("demo");
@@ -196,7 +230,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         std::fs::read(options.images.join("camelot")).unwrap(),
         root_image()
     );
-    let mut platform = Platform::start(&options, log).unwrap();
+    let mut platform = Platform::start(&options, &RUNNING, log).unwrap();
     for addr in [platform.lake, platform.avalon, platform.pendragon] {
         assert!(addr.ip().is_loopback() && addr.port() != 0, "{addr}");
     }
@@ -215,6 +249,9 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     assert!(one.output.contains("Camelot v"), "{}", one.output);
     one.type_line("echo up from its own disk");
     one.wait_for_end("up from its own disk\n$ ");
+    // Something for the next run to find on the disk.
+    one.type_line("echo kept > /kept");
+    one.wait_for_end(PROMPT);
 
     // A second Camelot VM beside it, on a copy of its own.
     let mut lake = Client::connect(&platform.lake.to_string(), "test").unwrap();
@@ -248,16 +285,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         "cargo run --release -p herald -- --server {} camelot",
         platform.avalon
     )));
-    // The Round Table commands it shows are ones Round Table takes.
-    let mut commands = 0;
-    for line in summary.lines() {
-        if let Some(args) = line.trim().strip_prefix("cargo run --release -p round-table -- ") {
-            let args: Vec<String> = args.split_whitespace().map(str::to_string).collect();
-            round_table::parse_args(&args).unwrap_or_else(|e| panic!("{line}: {e}"));
-            commands += 1;
-        }
-    }
-    assert_eq!(commands, 2, "{summary}");
+    check_summary(&summary);
 
     // Ctrl-C: the flag `up`'s handler sets.
     let stop = AtomicBool::new(true);
@@ -284,6 +312,37 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
             "no {prefix:?} in {lines:#?}"
         );
     }
+
+    // `cargo xtask up --demo` again on the same images directory, this time with
+    // every server listening on every address (0.0.0.0). `up` reaches them on
+    // loopback (connecting to 0.0.0.0 fails on Windows): Pendragon reaches Lake and
+    // Avalon, the demo VM's disk is on a Lake Avalon can reach, and the summary's
+    // commands work. The demo VM is made again on its disk from the first run, with
+    // what it wrote there.
+    let mut again = options.clone();
+    let every = "0.0.0.0:0".parse().unwrap();
+    (again.lake, again.avalon, again.pendragon) = (every, every, every);
+    up::prepare(&again, log).unwrap();
+    let platform = Platform::start(&again, &RUNNING, log).unwrap();
+    for addr in [platform.lake, platform.avalon, platform.pendragon] {
+        assert!(addr.ip().is_loopback() && addr.port() != 0, "{addr}");
+    }
+    assert!(platform.url.starts_with("http://127.0.0.1:"), "{}", platform.url);
+    all_answer(&platform);
+    let id = platform.demo(log).unwrap();
+    assert!(
+        out.lines()
+            .contains(&"up: demo: using disk camelot-root from an earlier run".to_string()),
+        "{:#?}",
+        out.lines()
+    );
+    let mut one = Console::attach(platform.avalon, id);
+    one.wait_for_end(PROMPT);
+    one.type_line("cat /kept");
+    one.wait_for_end("kept\n$ ");
+    drop(one);
+    check_summary(&platform.summary(true));
+    platform.stop(log);
 }
 
 /// `up::run`, the command itself: it comes up, prints its summary, and stops when the
@@ -347,7 +406,7 @@ fn one_server_ending_stops_the_others() {
     let log = &mut |line: &str| out.push(line);
     let options = options(&dir);
     up::prepare(&options, log).unwrap();
-    let mut platform = Platform::start(&options, log).unwrap();
+    let mut platform = Platform::start(&options, &RUNNING, log).unwrap();
     platform.kill("avalon");
     let never = AtomicBool::new(false);
     assert!(matches!(platform.wait(&never, log), Ending::Exited("avalon", _)));
@@ -372,7 +431,7 @@ fn a_taken_port_fails_the_start() {
     let out = Output::default();
     let log = &mut |line: &str| out.push(line);
     up::prepare(&options, log).unwrap();
-    let e = Platform::start(&options, log).err().unwrap();
+    let e = Platform::start(&options, &RUNNING, log).err().unwrap();
     assert!(e.starts_with("avalon ended before it was ready"), "{e}");
     // Lake, which had started, was stopped: its port is free again.
     let lake = out
@@ -384,6 +443,145 @@ fn a_taken_port_fails_the_start() {
     while TcpStream::connect_timeout(&lake.parse().unwrap(), Duration::from_secs(1)).is_ok() {
         assert!(start.elapsed() < SLOW, "lake still answers on {lake}");
     }
+}
+
+/// Ctrl-C while the servers start: `start` stops at once, and what it started ends.
+#[test]
+fn ctrl_c_while_starting_stops_what_started() {
+    let dir = TempDir::new("interrupted");
+    let options = options(&dir);
+    let out = Output::default();
+    let log = &mut |line: &str| out.push(line);
+    up::prepare(&options, log).unwrap();
+    let stop = AtomicBool::new(true);
+    let e = Platform::start(&options, &stop, log).err().unwrap();
+    assert_eq!(e, up::INTERRUPTED);
+    // `run` says so, and succeeds (Ctrl-C is how `up` is meant to end).
+    let out = Output::default();
+    up::run(&options, &stop, &mut |line: &str| out.push(line)).unwrap();
+    let lines = out.lines();
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("up: interrupted while starting; stopped"),
+        "{lines:#?}"
+    );
+    assert!(!lines.iter().any(|l| l.contains("The Avalon platform is up.")));
+}
+
+/// `xtask up` ended from outside once it is up: on Windows killed outright, and the
+/// job object ends the servers with it; on Unix with SIGTERM, which it handles by
+/// stopping them in order. Either way no server is left holding its port.
+#[test]
+fn ending_xtask_up_ends_the_servers() {
+    let dir = TempDir::new("process");
+    let options = options(&dir);
+    // `--no-build` seeds target/camelot-fs.img when there is one; without it, an image
+    // already in the directory does.
+    up::seed(&options.images, root_image()).unwrap();
+    let any = "127.0.0.1:0";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args([
+            "up",
+            "--no-build",
+            "--lake",
+            any,
+            "--avalon",
+            any,
+            "--pendragon",
+            any,
+        ])
+        .arg("--images")
+        .arg(&options.images)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stdout.lines().map_while(Result::ok) {
+            eprintln!("{line}");
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    // The summary's addresses: "  Avalon     ADDR", "  Lake       ADDR, images in ...",
+    // "  Pendragon  http://ADDR/?token=...".
+    let mut servers: Vec<SocketAddr> = Vec::new();
+    while servers.len() < 3 {
+        let line = rx
+            .recv_timeout(SLOW)
+            .expect("xtask up says where its servers are");
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            ["Avalon" | "Lake", addr, ..] => servers.push(addr.trim_end_matches(',').parse().unwrap()),
+            ["Pendragon", url] => {
+                let addr = url.strip_prefix("http://").unwrap().split('/').next().unwrap();
+                servers.push(addr.parse().unwrap());
+            }
+            _ => {}
+        }
+    }
+    for addr in &servers {
+        TcpStream::connect_timeout(addr, Duration::from_secs(5)).unwrap();
+    }
+    #[cfg(windows)]
+    child.kill().unwrap();
+    #[cfg(unix)]
+    assert!(std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let status = child.wait().unwrap();
+    // On Unix, SIGTERM is handled as Ctrl-C: an orderly stop, and success.
+    #[cfg(unix)]
+    assert!(status.success(), "{status}");
+    #[cfg(not(unix))]
+    let _ = status;
+    let start = Instant::now();
+    for addr in &servers {
+        while TcpStream::connect_timeout(addr, Duration::from_secs(1)).is_ok() {
+            assert!(
+                start.elapsed() < SLOW,
+                "{addr} still answers after xtask up ended"
+            );
+        }
+    }
+}
+
+/// `--demo` after a build changed the image: the demo VM's disk from an earlier run is
+/// a copy of the old one, and `up` says so (and how to get a fresh copy).
+#[test]
+fn a_new_image_says_the_demo_disk_is_older() {
+    let dir = TempDir::new("stale");
+    let mut options = options(&dir);
+    options.demo = true;
+    let out = Output::default();
+    let log = &mut |line: &str| out.push(line);
+    let note = |out: &Output| {
+        out.lines()
+            .iter()
+            .any(|l| l.starts_with("up: note: the demo VM's disk"))
+    };
+    // The image changed, but there is no demo disk yet: nothing to say.
+    up::seed(&options.images, &[0; 512]).unwrap();
+    up::prepare(&options, log).unwrap();
+    assert!(!note(&out));
+    // Unchanged image, old demo disk: nothing to say either.
+    std::fs::write(options.images.join("camelot-root"), [0; 512]).unwrap();
+    up::prepare(&options, log).unwrap();
+    assert!(!note(&out));
+    // A new image and the old demo disk.
+    up::seed(&options.images, &[0; 512]).unwrap();
+    up::prepare(&options, log).unwrap();
+    assert!(note(&out), "{:#?}", out.lines());
+    let last = out.lines().last().unwrap().clone();
+    assert!(
+        last.contains(&options.images.join("camelot-root").display().to_string()),
+        "{last}"
+    );
 }
 
 /// With `--no-build`, `up` needs the binaries and an image to put in Lake's directory.
@@ -452,9 +650,7 @@ fn the_readme_quick_start_is_right() {
                 round_table::parse_args(&args).unwrap_or_else(|e| panic!("{line}: {e}"));
             }
             ["cargo", "run", "--release", "-p", "herald", "--", args @ ..] => {
-                // herald [--server ADDR] [--screen] <vm>: one VM, as its --help says.
-                let vms: Vec<&&str> = args.iter().filter(|a| !a.starts_with('-')).collect();
-                assert_eq!(vms.len(), 1, "{line}");
+                check_herald(line, &args.join(" "))
             }
             _ => continue,
         }

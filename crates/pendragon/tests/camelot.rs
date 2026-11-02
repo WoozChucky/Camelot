@@ -192,6 +192,14 @@ fn the_new_vm_form_offers_camelot() {
         &js[js[..send].rfind("if (").unwrap()..send].trim(),
         &"if (!request.camelot && file) {"
     );
+    // Camelot is the default when Lake has the image (and the form was not opened
+    // for a disk of the VM's own): the statement that chooses it, whole.
+    let choose = js.find("bootCamelot.checked = true;").unwrap();
+    assert_eq!(
+        &js[js[..choose].rfind("if (").unwrap()..choose].trim(),
+        &"if (hasImage && !disk) {"
+    );
+    assert!(js.contains("const hasImage = list.disks.some((d) => d.name === list.camelot_image);"));
     let css = request(platform.pendragon.addr(), "GET", "/style.css", &[], b"").text();
     assert!(css.contains("fieldset.boot") && css.contains("label[hidden] { display: none; }"));
     platform.stop();

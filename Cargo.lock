@@ -152,6 +152,7 @@ dependencies = [
  "elf32",
  "excalibur",
  "grail",
+ "herald",
  "merlin",
  "merlin-as",
  "merlin-ld",

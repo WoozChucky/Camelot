@@ -24,7 +24,8 @@
 //! A clone ([`Store::clone_from`]) copies without the lock too: it attaches its source
 //! read-only for the copy, reserves the new name in the table (so nothing else can
 //! create it meanwhile), copies into a file whose name is not a disk name, and renames
-//! that into place when it is complete.
+//! that into place when it is complete. A copy that never completed (Lake ended
+//! during it) is removed when the directory is next opened ([`Store::open`]).
 
 use crate::{lock, Fail};
 use avalon_proto::{validate_name, DiskInfo, ErrorCode, MAX_BLOCK_SECTORS, SECTOR_SIZE};
@@ -71,6 +72,10 @@ const CLONE_CHUNK: u64 = MAX_BLOCK_SECTORS as u64;
 impl Store {
     /// Serves the images in `dir`, creating the directory if it does not exist. New
     /// images may be up to `max_sectors` sectors.
+    ///
+    /// A clone's temporary file (`.NAME.clone`, [`Store::clone_from`]) still in the
+    /// directory is from a Lake that ended while it copied: no copy can be running
+    /// before the store is open, so it is removed.
     pub fn open(dir: impl Into<PathBuf>, max_sectors: u64) -> io::Result<Store> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
@@ -79,6 +84,13 @@ impl Store {
                 io::ErrorKind::InvalidInput,
                 format!("{} is not a directory", dir.display()),
             ));
+        }
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let stale = entry.file_name().to_str().and_then(clone_target).is_some();
+            if stale && entry.file_type()?.is_file() {
+                fs::remove_file(entry.path())?;
+            }
         }
         Ok(Store {
             dir,
@@ -202,8 +214,10 @@ impl Store {
             table.entry(name.to_string()).or_default().creating = true;
         }
         let _reservation = Reservation { store: self, name };
+        #[cfg(test)]
+        tests::while_cloning(self, name);
 
-        let temp = self.dir.join(format!(".{name}.clone"));
+        let temp = self.dir.join(clone_temp(name));
         let copied = copy_image(&mut src, &temp, len);
         drop(src);
         let placed = copied.and_then(|()| {
@@ -344,6 +358,18 @@ impl Drop for Reservation<'_> {
             }
         }
     }
+}
+
+/// The file a clone to disk `name` is copied into until it is complete: not a disk
+/// name (it starts with a dot), so it is never listed, attached or deleted.
+fn clone_temp(name: &str) -> String {
+    format!(".{name}.clone")
+}
+
+/// The disk a clone's temporary file is for, if `file` is one ([`clone_temp`]).
+fn clone_target(file: &str) -> Option<&str> {
+    let name = file.strip_prefix('.')?.strip_suffix(".clone")?;
+    validate_name(name).is_ok().then_some(name)
 }
 
 /// Copies the image attached as `src` into a new file at `path`, `len` bytes long
@@ -579,6 +605,23 @@ fn io_fail(what: &str, e: io::Error) -> Fail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// A test's code for [`while_cloning`] to run.
+    type Hook = Box<dyn FnOnce(&Store, &str)>;
+
+    thread_local! {
+        /// What [`while_cloning`] runs, once, on this thread.
+        static WHILE_CLONING: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Called by [`Store::clone_from`] once it has reserved the new name, before it
+    /// copies: runs the function a test put there, if any.
+    pub(super) fn while_cloning(store: &Store, name: &str) {
+        if let Some(f) = WHILE_CLONING.with(|hook| hook.borrow_mut().take()) {
+            f(store, name);
+        }
+    }
 
     /// A fresh images directory, removed when dropped.
     struct TempDir(PathBuf);
@@ -844,6 +887,66 @@ mod tests {
         });
         assert!(lock(&s.attached).is_empty());
         s.clone_from("new", "base", 0).unwrap();
+    }
+
+    /// While a clone copies, its name is taken: as `clone_from` itself reserves it.
+    #[test]
+    fn a_clone_reserves_its_name_while_it_copies() {
+        let dir = TempDir::new("reserving");
+        let s = store(&dir);
+        s.create("base", 4).unwrap();
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = ran.clone();
+        let hook: Hook = Box::new(move |s, name| {
+            assert_eq!(name, "new");
+            assert_eq!(code(s.create("new", 1)), ErrorCode::AlreadyExists);
+            assert!(!s.dir().join("new").exists());
+            assert_eq!(code(s.delete("new")), ErrorCode::NoSuchDisk);
+            assert!(s.list().unwrap().iter().all(|d| d.name != "new"));
+            seen.set(true);
+        });
+        WHILE_CLONING.with(|h| *h.borrow_mut() = Some(hook));
+        assert_eq!(s.clone_from("new", "base", 0).unwrap(), 4);
+        assert!(ran.get(), "clone_from did not run the hook");
+        // The copy, not an empty disk a create made meanwhile.
+        assert_eq!(fs::read(dir.0.join("new")).unwrap().len(), 4 * 512);
+        assert!(lock(&s.attached).is_empty());
+    }
+
+    /// A copy a Lake left half done (it ended while it copied) is removed when the
+    /// directory is opened again; nothing else is.
+    #[test]
+    fn a_half_done_clone_is_removed_on_open() {
+        let dir = TempDir::new("stale-clone");
+        let s = store(&dir);
+        s.create("base", 1).unwrap();
+        drop(s);
+        fs::write(dir.0.join(".copy.clone"), [1; 512]).unwrap();
+        // Not a clone's temporary files: kept.
+        for other in [".Other.clone", ".notes", "copy.clone.txt", ".clone"] {
+            fs::write(dir.0.join(other), [2; 512]).unwrap();
+        }
+        fs::create_dir(dir.0.join(".dir.clone")).unwrap();
+        let s = store(&dir);
+        assert!(!dir.0.join(".copy.clone").exists());
+        let mut left: Vec<String> = fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                ".Other.clone",
+                ".clone",
+                ".dir.clone",
+                ".notes",
+                "base",
+                "copy.clone.txt"
+            ]
+        );
+        assert_eq!(clone_target(&clone_temp("copy")), Some("copy"));
+        s.clone_from("copy", "base", 0).unwrap();
     }
 
     #[test]

@@ -15,7 +15,8 @@
 //!   view is [`window::WindowView`], Grail's own framebuffer window.
 //! - [`Utf8Lossy`] keeps a Windows console fed with valid UTF-8, which Rust's console
 //!   stdout insists on.
-//! - [`parse_server`] reads `--server` values.
+//! - [`parse_args`] reads Herald's command line, and [`parse_server`] its `--server`
+//!   values.
 //!
 //! The `herald` binary wires a console session to the terminal: stdin in raw mode
 //! (Grail's [`grail::console::RawMode`], shared with Grail's own console) and stdout;
@@ -426,6 +427,86 @@ impl<W: Write> Write for Utf8Lossy<W> {
     }
 }
 
+/// Herald's command line, as `herald --help` prints it.
+pub const USAGE: &str = "usage: herald [--server ADDR] [--screen] <vm>
+
+Attaches to the serial console of a VM on an Avalon server: prints its recent
+output, then streams the output live and sends what you type to the VM. <vm> is a
+VM id (all digits) or a VM name.
+
+  --server ADDR   the Avalon server: host:port, or a host or IP address for port
+                  7400 (default 127.0.0.1:7400)
+  --screen        show the VM's screen (its framebuffer) in a window instead, and
+                  send the keys typed and the mouse moved over it to the VM's
+                  keyboard and pointer devices. Closing the window detaches; when
+                  the VM ends, the window stays on its last frame until closed.
+                  Windows only
+  -h, --help      show this text
+
+On the console, Ctrl-] detaches and leaves the VM running; so does the end of
+the input when it is not a terminal (where Ctrl-] still detaches). Herald also
+ends when the VM stops, exits or is destroyed. Ctrl-C leaves Herald at once, the
+VM running. Any number of Heralds may attach to one VM, to its console or its
+screen: all of them see its output, and what any of them types reaches it.
+
+Exit status: 0 when detached or when the VM ended, 1 on an error (no server, no
+such VM, connection lost, console output failed, --screen without a window), 2
+for bad arguments; Ctrl-C gives the usual status of an interrupted program (130
+on Linux, STATUS_CONTROL_C_EXIT on Windows).";
+
+/// What Herald's command line asks for ([`parse_args`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Args {
+    /// `--server`: the value as written (for messages) and the addresses it names.
+    pub server: Option<(String, Vec<SocketAddr>)>,
+    /// `--screen`: the VM's screen in a window instead of its console.
+    pub screen: bool,
+    pub vm: VmRef,
+}
+
+/// Parses Herald's arguments (without the program name): `[--server ADDR] [--screen]
+/// <vm>`. `Ok(None)` asks for the help text ([`USAGE`]); an error is a bad command
+/// line (exit status 2).
+pub fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
+    let mut server = None;
+    let mut vm = None;
+    let mut screen = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-h" | "--help" => return Ok(None),
+            "--screen" => screen = true,
+            "--server" => match it.next() {
+                Some(s) => server = Some((s.clone(), parse_server(s)?)),
+                None => return Err("--server needs a value".to_string()),
+            },
+            _ if a.starts_with('-') && a.len() > 1 => {
+                return Err(format!(
+                    "unknown option '{a}'
+
+{USAGE}"
+                ))
+            }
+            _ if vm.is_some() => {
+                return Err(format!(
+                    "one VM at a time ('{a}' is one too many)
+
+{USAGE}"
+                ))
+            }
+            _ => vm = Some(VmRef::parse(a)),
+        }
+    }
+    match vm {
+        Some(vm) => Ok(Some(Args { server, screen, vm })),
+        None => Err(format!(
+            "which VM? (a VM id or name)
+
+{USAGE}"
+        )),
+    }
+}
+
 /// Parses a `--server` value: `host:port`, or just a host or IP address (Avalon's
 /// default port, 7400). IPv6 addresses with a port go in brackets: `[::1]:7400`.
 ///
@@ -528,6 +609,40 @@ mod tests {
         }
         for bad in ["", "two words", "127.0.0.1:port", "host:99999"] {
             assert!(parse_server(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn command_lines() {
+        let parse = |s: &str| parse_args(&s.split_whitespace().map(str::to_string).collect::<Vec<_>>());
+        let args = parse("web").unwrap().unwrap();
+        assert_eq!(
+            (args.server, args.screen, args.vm),
+            (None, false, VmRef::Name("web".into()))
+        );
+        let args = parse("--screen --server 127.0.0.1:7500 7").unwrap().unwrap();
+        assert_eq!(
+            (args.server, args.screen, args.vm),
+            (
+                Some((
+                    "127.0.0.1:7500".to_string(),
+                    vec!["127.0.0.1:7500".parse().unwrap()]
+                )),
+                true,
+                VmRef::Id(7)
+            )
+        );
+        assert_eq!(parse("web --help"), Ok(None));
+        for (bad, why) in [
+            ("", "which VM?"),
+            ("--screen", "which VM?"),
+            ("--bogus web", "unknown option '--bogus'"),
+            ("web --server", "--server needs a value"),
+            ("--server 127.0.0.1:port web", "is not a server address"),
+            ("one two", "one VM at a time"),
+        ] {
+            let e = parse(bad).unwrap_err();
+            assert!(e.contains(why), "{bad:?}: {e}");
         }
     }
 

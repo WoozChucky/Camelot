@@ -22,5 +22,7 @@ excalibur = { path = "../excalibur" }
 # tests/examples.rs compares our executables with ld.lld's and our disassembly with
 # llvm-objdump's committed text.
 merlin-objdump = { path = "../merlin-objdump" }
-# tests/up.rs checks the README's quick start commands against Round Table's parser.
+# tests/up.rs checks the README's quick start commands, and the ones `up` prints,
+# against Herald's and Round Table's parsers.
+herald = { path = "../herald" }
 round-table = { path = "../round-table" }

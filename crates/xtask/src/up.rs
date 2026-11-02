@@ -14,6 +14,9 @@
 //!    listening. Their output is read by a thread per pipe and printed with the name of
 //!    the server in front. Lake and Avalon say where they listen (`listening on ADDR`)
 //!    and Pendragon prints its URL, so port 0 works too: the tests use ephemeral ports.
+//!    A server listening on every address (`0.0.0.0` or `::`) is reached on loopback
+//!    ([`reachable`]): that is the address Pendragon, the demo and the summary use,
+//!    since Windows refuses to connect to an unspecified address.
 //! 4. **Demo** (`--demo`, [`Platform::demo`]): a switch `nat` with a NAT gateway, and a
 //!    VM `camelot` that boots from `camelot-root`, its own copy of the image, plugged
 //!    into it and started.
@@ -30,7 +33,7 @@
 use avalon_client::{camelot_root, create_camelot_vm, CamelotError, Client, CAMELOT_IMAGE};
 use avalon_proto::{DeviceSpec, DiskSource, DiskSpec, ErrorCode, HardwareProfile, NatConfig, NetSpec, VmRef};
 use std::io::{self, BufRead, BufReader, Read};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,8 +62,12 @@ pub const DEMO_VM: &str = "camelot";
 /// How long a server may take to say it is listening.
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How often [`Platform::wait`] looks at the stop flag between lines of output.
+/// How often [`Platform::start`] and [`Platform::wait`] look at the stop flag between
+/// lines of output.
 const POLL: Duration = Duration::from_millis(100);
+
+/// The error of a [`Platform::start`] that Ctrl-C ended.
+pub const INTERRUPTED: &str = "interrupted";
 
 pub const USAGE: &str = "usage: cargo xtask up [options]
 
@@ -239,6 +246,10 @@ fn image_to_seed(options: &Options, log: Log) -> Result<Option<Vec<u8>>, String>
 
 /// Builds (unless `--no-build`) and seeds the images directory; with `--no-build`,
 /// checks that the binaries are there and that Lake will have an image to copy.
+///
+/// With `--demo`, when the image has just been replaced and the demo VM's disk is
+/// there from an earlier run, says that the disk is a copy of the old image: the demo
+/// boots from it as it is (with what the VM wrote to it), not from the new build.
 pub fn prepare(options: &Options, log: Log) -> Result<(), String> {
     let image = image_to_seed(options, log)?;
     for name in SERVERS {
@@ -264,6 +275,14 @@ pub fn prepare(options: &Options, log: Log) -> Result<(), String> {
                 "up: image {CAMELOT_IMAGE} in {}: {what}",
                 options.images.display()
             ));
+            let demo_disk = options.images.join(camelot_root(DEMO_VM));
+            if seeded == Seeded::Replaced && options.demo && demo_disk.is_file() {
+                log(&format!(
+                    "up: note: the demo VM's disk {} is a copy of the image {CAMELOT_IMAGE} from                      before this build, and the demo boots it as it is; to boot the new build,                      delete {} while up is not running (what the VM wrote there goes with it)",
+                    camelot_root(DEMO_VM),
+                    demo_disk.display()
+                ));
+            }
         }
         None if base.is_file() => {}
         None => {
@@ -322,8 +341,12 @@ impl Platform {
     /// Starts Lake on `options.images`, then Avalon, then Pendragon in front of both,
     /// each once the one before is listening; returns when all three are. Their output
     /// goes to `log`. Fails (stopping what it started) when a server ends or says
-    /// nothing for [`STARTUP_TIMEOUT`].
-    pub fn start(options: &Options, log: Log) -> Result<Platform, String> {
+    /// nothing for [`STARTUP_TIMEOUT`], or with [`INTERRUPTED`] as soon as `stop` is
+    /// set (Ctrl-C).
+    ///
+    /// The addresses it keeps are where the servers can be reached: a server that
+    /// listens on every address is reached on loopback ([`reachable`]).
+    pub fn start(options: &Options, stop: &AtomicBool, log: Log) -> Result<Platform, String> {
         let images =
             std::path::absolute(&options.images).map_err(|e| format!("{}: {e}", options.images.display()))?;
         let (sender, events) = mpsc::channel();
@@ -344,9 +367,9 @@ impl Platform {
             "lake",
             &["--listen", &options.lake.to_string(), "--dir", &images],
         )?;
-        platform.lake = platform.wait_for(lake, log, listening)?;
+        platform.lake = reachable(platform.wait_for(lake, stop, log, listening)?);
         let avalon = platform.spawn(options, "avalon", &["--listen", &options.avalon.to_string()])?;
-        platform.avalon = platform.wait_for(avalon, log, listening)?;
+        platform.avalon = reachable(platform.wait_for(avalon, stop, log, listening)?);
         let args = [
             "--listen".to_string(),
             options.pendragon.to_string(),
@@ -357,8 +380,9 @@ impl Platform {
         ];
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let pendragon = platform.spawn(options, "pendragon", &args)?;
-        let (addr, url) = platform.wait_for(pendragon, log, pendragon_url)?;
-        platform.pendragon = addr;
+        // Pendragon's URL has a loopback address already when it listens on every one.
+        let (addr, url) = platform.wait_for(pendragon, stop, log, pendragon_url)?;
+        platform.pendragon = reachable(addr);
         platform.url = url;
         Ok(platform)
     }
@@ -394,14 +418,24 @@ impl Platform {
     }
 
     /// Passes the servers' output to `log` until server `index` prints a line `ready`
-    /// takes; returns what it made of it.
-    fn wait_for<T>(&mut self, index: usize, log: Log, ready: fn(&str) -> Option<T>) -> Result<T, String> {
+    /// takes; returns what it made of it. Fails with [`INTERRUPTED`] once `stop` is
+    /// set.
+    fn wait_for<T>(
+        &mut self,
+        index: usize,
+        stop: &AtomicBool,
+        log: Log,
+        ready: fn(&str) -> Option<T>,
+    ) -> Result<T, String> {
         let name = self.servers[index].name;
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         let mut last = String::new();
         loop {
+            if stop.load(Ordering::SeqCst) {
+                return Err(INTERRUPTED.into());
+            }
             let left = deadline.saturating_duration_since(Instant::now());
-            match self.events.recv_timeout(left) {
+            match self.events.recv_timeout(left.min(POLL)) {
                 Ok(Event::Line(i, line)) => {
                     log(&self.prefixed(i, &line));
                     if i == index {
@@ -418,11 +452,12 @@ impl Platform {
                         return Err(format!("{name} ended before it was ready ({status}): {last}"));
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {
+                Err(RecvTimeoutError::Timeout) if left.is_zero() => {
                     return Err(format!(
                         "{name} did not say it was ready within {STARTUP_TIMEOUT:?}"
                     ))
                 }
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => unreachable!("the platform holds a sender"),
             }
         }
@@ -655,19 +690,47 @@ fn pendragon_url(line: &str) -> Option<(SocketAddr, String)> {
     Some((addr, line.trim().to_string()))
 }
 
+/// Where a server listening at `addr` is reached: `addr` itself, or loopback (of the
+/// same family, on the same port) when `addr` is unspecified (`0.0.0.0`, `::`). A
+/// server bound there accepts connections on every address, but connecting to the
+/// unspecified address fails on Windows (WSAEADDRNOTAVAIL).
+pub fn reachable(addr: SocketAddr) -> SocketAddr {
+    let mut addr = addr;
+    if addr.ip().is_unspecified() {
+        addr.set_ip(match addr {
+            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        });
+    }
+    addr
+}
+
 // ---- The command ----
 
 /// `cargo xtask up`: [`prepare`], [`Platform::start`], the demo, the summary, then
 /// [`Platform::wait`] until `stop` is set (Ctrl-C) or a server ends, and
 /// [`Platform::stop`]. Everything it says goes to `log`.
+///
+/// Ctrl-C while the servers start or the demo is made stops what has started, and
+/// `run` returns `Ok`.
 pub fn run(options: &Options, stop: &AtomicBool, log: Log) -> Result<(), String> {
     prepare(options, log)?;
-    let mut platform = Platform::start(options, log)?;
-    if options.demo {
+    let mut platform = match Platform::start(options, stop, log) {
+        Ok(platform) => platform,
+        Err(e) if e == INTERRUPTED => {
+            // `start` has stopped what it started.
+            log("up: interrupted while starting; stopped");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    if options.demo && !stop.load(Ordering::SeqCst) {
         platform.demo(log)?;
     }
     platform.drain(log);
-    log(&platform.summary(options.demo));
+    if !stop.load(Ordering::SeqCst) {
+        log(&platform.summary(options.demo));
+    }
     let ending = platform.wait(stop, log);
     let result = match &ending {
         Ending::Stopped => Ok(()),
@@ -947,6 +1010,23 @@ mod tests {
             assert!(e.starts_with(why), "{bad}: {e}");
         }
         assert!(parse_args(&["--images".into(), String::new()], root).is_err());
+    }
+
+    #[test]
+    fn unspecified_addresses_are_reached_on_loopback() {
+        for (listen, reached) in [
+            ("0.0.0.0:7401", "127.0.0.1:7401"),
+            ("[::]:7400", "[::1]:7400"),
+            ("127.0.0.1:7402", "127.0.0.1:7402"),
+            ("192.168.1.5:80", "192.168.1.5:80"),
+            ("[::1]:9", "[::1]:9"),
+        ] {
+            assert_eq!(
+                reachable(listen.parse().unwrap()).to_string(),
+                reached,
+                "{listen}"
+            );
+        }
     }
 
     #[test]
