@@ -32,7 +32,19 @@
     .equ SYS_netinfo, 24
     .equ SYS_netconf, 25
     .equ SYS_ping, 26
-    .equ SYS_tcptest, 27
+    .equ SYS_socket, 27
+    .equ SYS_bind, 28
+    .equ SYS_listen, 29
+    .equ SYS_accept, 30
+    .equ SYS_connect, 31
+    .equ SYS_send, 32
+    .equ SYS_recv, 33
+    .equ SYS_sendto, 34
+    .equ SYS_recvfrom, 35
+    .equ SYS_shutdown, 36
+    .equ SYS_getsockname, 37
+    .equ SYS_getpeername, 38
+    .equ SYS_setsockopt, 39
 
     .text
 
@@ -218,10 +230,94 @@ ping:
     ecall
     ret
 
-# int tcptest(uint op, uint a, uint b, uint c, struct tcptest_report *report)
-    .globl tcptest
-tcptest:
-    li    a7, SYS_tcptest
+# int socket(int domain, int type, int protocol)
+    .globl socket
+socket:
+    li    a7, SYS_socket
+    ecall
+    ret
+
+# int bind(int fd, const struct sockaddr_in *addr)
+    .globl bind
+bind:
+    li    a7, SYS_bind
+    ecall
+    ret
+
+# int listen(int fd, int backlog)
+    .globl listen
+listen:
+    li    a7, SYS_listen
+    ecall
+    ret
+
+# int accept(int fd, struct sockaddr_in *addr)
+    .globl accept
+accept:
+    li    a7, SYS_accept
+    ecall
+    ret
+
+# int connect(int fd, const struct sockaddr_in *addr)
+    .globl connect
+connect:
+    li    a7, SYS_connect
+    ecall
+    ret
+
+# int send(int fd, const void *buf, uint len)
+    .globl send
+send:
+    li    a7, SYS_send
+    ecall
+    ret
+
+# int recv(int fd, void *buf, uint len)
+    .globl recv
+recv:
+    li    a7, SYS_recv
+    ecall
+    ret
+
+# int sendto(int fd, const void *buf, uint len, const struct sockaddr_in *to)
+    .globl sendto
+sendto:
+    li    a7, SYS_sendto
+    ecall
+    ret
+
+# int recvfrom(int fd, void *buf, uint len, struct sockaddr_in *from)
+    .globl recvfrom
+recvfrom:
+    li    a7, SYS_recvfrom
+    ecall
+    ret
+
+# int shutdown(int fd, int how)
+    .globl shutdown
+shutdown:
+    li    a7, SYS_shutdown
+    ecall
+    ret
+
+# int getsockname(int fd, struct sockaddr_in *addr)
+    .globl getsockname
+getsockname:
+    li    a7, SYS_getsockname
+    ecall
+    ret
+
+# int getpeername(int fd, struct sockaddr_in *addr)
+    .globl getpeername
+getpeername:
+    li    a7, SYS_getpeername
+    ecall
+    ret
+
+# int setsockopt(int fd, int level, int option, const void *value, uint len)
+    .globl setsockopt
+setsockopt:
+    li    a7, SYS_setsockopt
     ecall
     ret
 

@@ -21,7 +21,7 @@ typedef unsigned long size_t;
 #define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */
 #define EBADF 9         /* not an open file descriptor, or not open for that */
 #define ECHILD 10       /* wait: no such child */
-#define EAGAIN 11       /* spawn: every process slot is taken */
+#define EAGAIN 11       /* spawn: every process slot is taken; a socket's receive timeout ran out */
 #define ENOMEM 12       /* out of memory, or the heap would reach the stack */
 #define EACCES 13       /* spawn, exec: not a regular file */
 #define EFAULT 14       /* a pointer argument is not valid user memory */
@@ -40,8 +40,15 @@ typedef unsigned long size_t;
 #define ENAMETOOLONG 36 /* a name longer than DIRSIZ, or a path longer than MAXPATH */
 #define ENOSYS 38       /* no such system call */
 #define ENOTEMPTY 39    /* unlink: a directory with entries */
+#define ENOTSOCK 88     /* a socket call on a descriptor that is not a socket */
+#define EDESTADDRREQ 89 /* send: a UDP socket with no peer, and no address given */
 #define EMSGSIZE 90     /* a datagram too big for one packet */
-#define EADDRINUSE 98   /* a UDP port that is taken */
+#define ENOPROTOOPT 92  /* setsockopt: an option sockets don't have */
+#define EPROTONOSUPPORT 93 /* socket: a protocol the type doesn't have */
+#define EOPNOTSUPP 95   /* listen, accept: not on a UDP socket */
+#define EAFNOSUPPORT 97 /* an address family other than AF_INET */
+#define EADDRINUSE 98   /* a port that is taken */
+#define EADDRNOTAVAIL 99 /* bind: an address that is not this host's */
 #define ENETUNREACH 101 /* no route: no address yet, or no gateway */
 #define ECONNRESET 104  /* TCP: the peer reset the connection */
 #define ENOBUFS 105     /* the network's buffers or sockets are all in use */
@@ -84,6 +91,7 @@ typedef unsigned long size_t;
 #define T_FILE 2
 #define T_DEVICE 3
 #define T_PIPE 4
+#define T_SOCKET 5
 
 struct stat {
     uint ino;     /* the inode; 0 for a pipe or the shell's console */
@@ -169,21 +177,40 @@ struct ping_reply {
     uint rtt_us; /* the round trip, in microseconds */
 };
 
-/* tcptest, TCP's test hook until #85's sockets: its operations and what it
- * reports (docs/camelot-net.md, "Testing TCP until #85"). */
-#define TCPTEST_CONNECT 1 /* (addr, port, bytes): send `bytes`, read until the end */
-#define TCPTEST_LISTEN 2  /* (port, backlog): a listener, returned as a handle */
-#define TCPTEST_ACCEPT 3  /* (handle): accept a connection and echo it to the end */
-#define TCPTEST_CLOSE 4   /* (handle): close the listener */
+/* Sockets (docs/camelot-syscalls.md, "Sockets"): IPv4 only, TCP
+ * (SOCK_STREAM) and UDP (SOCK_DGRAM). Linux's values and layout. */
+#define AF_INET 2
+#define SOCK_STREAM 1
+#define SOCK_DGRAM 2
+#define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
+#define SHUT_RD 0   /* shutdown: no more reading */
+#define SHUT_WR 1   /* no more sending: TCP sends its FIN */
+#define SHUT_RDWR 2 /* neither */
+#define SOL_SOCKET 1   /* setsockopt: the socket's own options */
+#define SO_RCVTIMEO 20 /* how long recv and accept wait (a struct timeval) */
 
-struct tcptest_report {
-    uint laddr; /* this end */
-    uint lport;
-    uint raddr; /* the other end */
-    uint rport;
-    uint sent;     /* bytes sent */
-    uint received; /* bytes received */
-    uint hash;     /* FNV-1a of the bytes received */
+/* A time: seconds and microseconds. */
+struct timeval {
+    int tv_sec;
+    int tv_usec;
+};
+
+/* An address in network byte order (big-endian): use htonl and ntohl. */
+struct in_addr {
+    uint s_addr;
+};
+
+#define INADDR_ANY 0u                /* bind: every address of the host */
+#define INADDR_NONE 0xffffffffu      /* inet_addr: not an address */
+#define INADDR_LOOPBACK 0x7f000001u  /* 127.0.0.1, in host order */
+
+/* An IPv4 address and port: 16 bytes, the port in network byte order too. */
+struct sockaddr_in {
+    ushort sin_family; /* AF_INET */
+    ushort sin_port;
+    struct in_addr sin_addr;
+    uchar sin_zero[8];
 };
 
 /* The system calls. */
@@ -213,7 +240,19 @@ int procs(struct procinfo *buf, uint max);
 int netinfo(struct netinfo *info);
 int netconf(uint addr, uint mask, uint gateway);
 int ping(uint addr, uint seq, struct ping_reply *reply);
-int tcptest(uint op, uint a, uint b, uint c, struct tcptest_report *report);
+int socket(int domain, int type, int protocol);
+int bind(int fd, const struct sockaddr_in *addr);
+int listen(int fd, int backlog);
+int accept(int fd, struct sockaddr_in *addr);
+int connect(int fd, const struct sockaddr_in *addr);
+int send(int fd, const void *buf, uint len);
+int recv(int fd, void *buf, uint len);
+int sendto(int fd, const void *buf, uint len, const struct sockaddr_in *to);
+int recvfrom(int fd, void *buf, uint len, struct sockaddr_in *from);
+int shutdown(int fd, int how);
+int getsockname(int fd, struct sockaddr_in *addr);
+int getpeername(int fd, struct sockaddr_in *addr);
+int setsockopt(int fd, int level, int option, const void *value, uint len);
 /* Any call by number (for tests). */
 int syscall(int number, uint a0, uint a1, uint a2);
 
@@ -299,6 +338,34 @@ int reader_getline(struct reader *r, char *line, int size);
 /* What error number `err` (positive) means, e.g. "no such file or
  * directory" (lib/strerror.c). */
 const char *strerror(int err);
+
+/* Addresses and names (lib/inet.c, lib/resolve.c).
+ *
+ * htons, ntohs, htonl, ntohl convert between host and network byte order.
+ * inet_aton reads "a.b.c.d" (four decimal numbers up to 255) into *a and
+ * returns 1, or 0 if `s` is not one; inet_addr returns it, or INADDR_NONE.
+ * inet_ntoa writes one as "a.b.c.d" in a buffer of its own, overwritten by
+ * the next call. sockaddr_set fills in *sa with AF_INET and `addr` and
+ * `port` given in host order.
+ *
+ * resolve finds the address of `host`: "a.b.c.d" as it is, any other name
+ * by asking the DNS server the network gave (netinfo's `dns`: 10.0.2.3
+ * behind Grail's user-mode gateway) for its A record, over UDP, three
+ * times at most, a second each. Stores it in *addr (network byte order) and
+ * returns 0; or -ENOENT (no such host: the server said so, or had no
+ * address for it), -ETIMEDOUT (no answer), -ENETUNREACH (no DNS server),
+ * -EINVAL (not a name), or a socket call's error. resolve_error says what
+ * its error means ("unknown host" for -ENOENT, else strerror). */
+ushort htons(ushort x);
+ushort ntohs(ushort x);
+uint htonl(uint x);
+uint ntohl(uint x);
+int inet_aton(const char *s, struct in_addr *a);
+uint inet_addr(const char *s);
+char *inet_ntoa(struct in_addr a);
+void sockaddr_set(struct sockaddr_in *sa, uint addr, uint port);
+int resolve(const char *host, struct in_addr *addr);
+const char *resolve_error(int err);
 
 /* fstat() on the file at `path`: opens it for reading, then closes it.
  * Returns 0 or the error (lib/stat.c). */

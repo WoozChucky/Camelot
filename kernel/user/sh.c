@@ -28,9 +28,7 @@
  *   sh: NAME: REASON     when a program can't be started, a file can't be
  *                        opened, or a line makes no sense
  *
- * Built-ins: help, exit [N], wait, cd [DIR], and for the network (until
- * #85 makes them programs) ifconfig [ADDR [MASK [GATEWAY]]] and ping ADDR
- * [N]: `ping` with no address runs /bin/ping. They run in the shell itself,
+ * Built-ins: help, exit [N], wait, cd [DIR]. They run in the shell itself,
  * with its redirections, but can't be part of a pipeline. The shell ends
  * with `exit`, or at the end of the input (Ctrl-D on an empty line), with
  * the status N or else the last foreground program's; the kernel then stops
@@ -163,8 +161,6 @@ static void help(void) {
     printf("exit [N]        leave the shell, with status N or the last program's\n");
     printf("wait            wait for every background program\n");
     printf("cd [DIR]        change the working directory, to / without DIR\n");
-    printf("ifconfig        show the network interface; ifconfig ADDR [MASK [GATEWAY]] sets its address\n");
-    printf("ping ADDR [N]   send N (4) echo requests to ADDR, a.b.c.d, and wait for the replies\n");
     printf("PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /\n");
     printf("CMD < FILE      read the input from FILE\n");
     printf("CMD > FILE      write the output to FILE\n");
@@ -172,157 +168,11 @@ static void help(void) {
     printf("CMD & CMD       run the first command in the background\n");
 }
 
-/* Whether command `c` is a built-in. `ping` is one only with an address:
- * alone, it is still /bin/ping, the program that takes turns with pong. */
+/* Whether command `c` is a built-in. */
 static int is_builtin(const struct cmd *c) {
     const char *name = c->argv[0];
     return strcmp(name, "exit") == 0 || strcmp(name, "help") == 0 || strcmp(name, "wait") == 0 ||
-           strcmp(name, "cd") == 0 || strcmp(name, "ifconfig") == 0 ||
-           (strcmp(name, "ping") == 0 && c->argc > 1);
-}
-
-/* ---- the network built-ins, until #85 makes them programs ---- */
-
-/* Reads "a.b.c.d" into *addr. Returns 0, or -1 if `s` is not an address. */
-static int parse_addr(const char *s, uint *addr) {
-    uint a = 0;
-    for (int part = 0; part < 4; part++) {
-        uint n = 0;
-        int digits = 0;
-        while (*s >= '0' && *s <= '9' && digits < 4) {
-            n = n * 10 + (uint)(*s - '0');
-            s++;
-            digits++;
-        }
-        if (digits == 0 || digits > 3 || n > 255) {
-            return -1;
-        }
-        a = (a << 8) | n;
-        if (part < 3) {
-            if (*s != '.') {
-                return -1;
-            }
-            s++;
-        }
-    }
-    if (*s != 0) {
-        return -1;
-    }
-    *addr = a;
-    return 0;
-}
-
-static void print_addr(uint a) {
-    printf("%u.%u.%u.%u", a >> 24, (a >> 16) & 255, (a >> 8) & 255, a & 255);
-}
-
-/* What a network call's error means to the user. */
-static const char *net_error(int err) {
-    return err == ENODEV ? "no network card" : strerror(err);
-}
-
-/* `ifconfig ADDR [MASK [GATEWAY]]`: a static address (MASK 255.255.255.0
- * and no gateway if left out). */
-static void ifconfig_set(struct cmd *c) {
-    uint addr = 0;
-    uint mask = 0xffffff00;
-    uint gateway = 0;
-    for (int i = 1; i < c->argc && i <= 3; i++) {
-        uint *dst = i == 1 ? &addr : i == 2 ? &mask : &gateway;
-        if (parse_addr(c->argv[i], dst) < 0) {
-            fprintf(STDERR, "sh: ifconfig: %s: not an address\n", c->argv[i]);
-            return;
-        }
-    }
-    int r = netconf(addr, mask, gateway);
-    if (r < 0) {
-        fprintf(STDERR, "sh: ifconfig: %s\n", net_error(-r));
-    }
-}
-
-/* `ifconfig`: the interface, its counters, and loopback. */
-static void ifconfig(struct cmd *c) {
-    if (c->argc > 1) {
-        ifconfig_set(c);
-        return;
-    }
-    struct netinfo n;
-    int r = netinfo(&n);
-    if (r < 0) {
-        fprintf(STDERR, "sh: ifconfig: %s\n", net_error(-r));
-        return;
-    }
-    printf("net0: mac %02x:%02x:%02x:%02x:%02x:%02x, link %s\n", n.mac[0], n.mac[1], n.mac[2], n.mac[3], n.mac[4],
-           n.mac[5], (n.flags & NETINFO_LINK) ? "up" : "down");
-    if (n.flags & NETINFO_UP) {
-        printf("  inet ");
-        print_addr(n.addr);
-        printf(" netmask ");
-        print_addr(n.mask);
-        if (n.gateway != 0) {
-            printf(" gateway ");
-            print_addr(n.gateway);
-        }
-        if (n.dns != 0) {
-            printf(" dns ");
-            print_addr(n.dns);
-        }
-        printf(" (%s)\n", (n.flags & NETINFO_DHCP) ? "dhcp" : "static");
-    } else {
-        printf("  no address\n");
-    }
-    struct net_stats *s = &n.stats;
-    printf("  rx %u frames, %u bytes; tx %u frames, %u bytes\n", s->rx_frames, s->rx_bytes, s->tx_frames,
-           s->tx_bytes);
-    printf("  rx dropped: card %u, filtered %u, ether %u, arp %u, ip %u, ip-checksum %u, fragment %u, protocol %u\n",
-           s->rx_card_dropped, s->rx_filtered, s->rx_bad_ether, s->rx_bad_arp, s->rx_bad_ip, s->rx_bad_ip_sum,
-           s->rx_fragment, s->rx_bad_proto);
-    printf("  rx dropped: icmp %u, udp %u, udp-checksum %u, no-port %u, queue-full %u, tcp %u, tcp-checksum %u\n",
-           s->rx_bad_icmp, s->rx_bad_udp, s->rx_bad_udp_sum, s->rx_no_port, s->rx_queue_full, s->rx_bad_tcp,
-           s->rx_bad_tcp_sum);
-    printf("  other: no-buffer %u, arp-failed %u, tx-error %u\n", s->no_buffer, s->arp_failed, s->tx_errors);
-    printf("  tcp: no-socket %u, backlog %u, out-of-order %u, retransmits %u, resets %u\n", s->tcp_no_socket,
-           s->tcp_backlog, s->tcp_out_of_order, s->tcp_retransmits, s->tcp_resets);
-    printf("lo: inet 127.0.0.1 netmask 255.0.0.0\n");
-}
-
-/* `ping ADDR [N]`: N echo requests a second apart (4 if N is left out),
- * each waiting a second for its reply, then a summary. */
-static void ping_cmd(struct cmd *c) {
-    uint addr;
-    if (parse_addr(c->argv[1], &addr) < 0) {
-        fprintf(STDERR, "sh: ping: %s: not an address\n", c->argv[1]);
-        return;
-    }
-    int count = c->argc > 2 ? atoi(c->argv[2]) : 4;
-    if (count < 1) {
-        count = 1;
-    }
-    printf("PING %s: 56 data bytes\n", c->argv[1]);
-    int received = 0;
-    for (int seq = 1; seq <= count; seq++) {
-        struct ping_reply r;
-        /* The sequence number is 16 bits on the wire: it wraps. */
-        int e = ping(addr, (uint)seq & 0xffff, &r);
-        if (e == 0) {
-            received++;
-            printf("%u bytes from ", r.len);
-            print_addr(r.from);
-            printf(": seq=%d ttl=%u time=%u.%03u ms\n", seq, r.ttl, r.rtt_us / 1000, r.rtt_us % 1000);
-        } else if (e == -ENODEV || e == -ENETUNREACH || e == -EINVAL) {
-            /* Nothing will change by trying again. */
-            fprintf(STDERR, "sh: ping: %s\n", net_error(-e));
-            return;
-        } else {
-            printf("seq=%d: %s\n", seq, strerror(-e));
-        }
-        /* A second between requests: after a reply or an error that came
-         * at once; a timeout has already waited it. */
-        if (seq < count && e != -ETIMEDOUT) {
-            sleep(10);
-        }
-    }
-    printf("%d sent, %d received\n", count, received);
+           strcmp(name, "cd") == 0;
 }
 
 /* Runs built-in `c`. Returns 1 if the shell should exit, with the status in
@@ -337,10 +187,6 @@ static int builtin(struct cmd *c, int *exit_status) {
         help();
     } else if (strcmp(name, "wait") == 0) {
         wait_all();
-    } else if (strcmp(name, "ifconfig") == 0) {
-        ifconfig(c);
-    } else if (strcmp(name, "ping") == 0) {
-        ping_cmd(c);
     } else {
         const char *dir = c->argv[1] != NULL ? c->argv[1] : "/";
         int r = chdir(dir);

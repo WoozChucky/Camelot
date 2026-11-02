@@ -39,7 +39,19 @@
 #define SYS_netinfo 24 /* netinfo(info): 0, with *info filled in */
 #define SYS_netconf 25 /* netconf(addr, mask, gateway): 0 */
 #define SYS_ping 26    /* ping(addr, seq, reply): 0, with *reply filled in */
-#define SYS_tcptest 27 /* tcptest(op, a, b, c, report): TCP's test hook, until #85's sockets */
+#define SYS_socket 27  /* socket(domain, type, protocol): a new socket's descriptor */
+#define SYS_bind 28    /* bind(fd, addr): 0, the socket has its port */
+#define SYS_listen 29  /* listen(fd, backlog): 0, the TCP socket takes connections */
+#define SYS_accept 30  /* accept(fd, addr): a descriptor for the next connection */
+#define SYS_connect 31 /* connect(fd, addr): 0, connected (TCP) or given its peer (UDP) */
+#define SYS_send 32    /* send(fd, buf, len): bytes sent */
+#define SYS_recv 33    /* recv(fd, buf, len): bytes received, 0 at the end */
+#define SYS_sendto 34  /* sendto(fd, buf, len, addr): bytes sent, to addr */
+#define SYS_recvfrom 35 /* recvfrom(fd, buf, len, addr): bytes received, with the sender in *addr */
+#define SYS_shutdown 36 /* shutdown(fd, how): 0, no more reading or sending */
+#define SYS_getsockname 37 /* getsockname(fd, addr): 0, this end's address in *addr */
+#define SYS_getpeername 38 /* getpeername(fd, addr): 0, the other end's address in *addr */
+#define SYS_setsockopt 39 /* setsockopt(fd, level, option, value, len): 0 */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process */
@@ -50,7 +62,7 @@
 #define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */
 #define EBADF 9         /* not an open file descriptor, or not open for that */
 #define ECHILD 10       /* wait: no such child */
-#define EAGAIN 11       /* spawn: every process slot is taken */
+#define EAGAIN 11       /* spawn: every process slot is taken; a socket's receive timeout ran out */
 #define ENOMEM 12       /* out of memory, or the heap would reach the stack */
 #define EACCES 13       /* spawn, exec: not a regular file */
 #define EFAULT 14       /* a pointer argument is not valid user memory */
@@ -69,8 +81,15 @@
 #define ENAMETOOLONG 36 /* a name longer than DIRSIZ, or a path longer than MAXPATH */
 #define ENOSYS 38       /* no such system call */
 #define ENOTEMPTY 39    /* unlink: a directory with entries */
+#define ENOTSOCK 88     /* a socket call on a descriptor that is not a socket */
+#define EDESTADDRREQ 89 /* send: a UDP socket with no peer, and no address given */
 #define EMSGSIZE 90     /* a datagram too big for one packet */
-#define EADDRINUSE 98   /* a UDP port that is taken */
+#define ENOPROTOOPT 92  /* setsockopt: an option sockets don't have */
+#define EPROTONOSUPPORT 93 /* socket: a protocol the type doesn't have */
+#define EOPNOTSUPP 95   /* listen, accept: not on a UDP socket */
+#define EAFNOSUPPORT 97 /* an address family other than AF_INET */
+#define EADDRINUSE 98   /* a port that is taken */
+#define EADDRNOTAVAIL 99 /* bind: an address that is not this host's */
 #define ENETUNREACH 101 /* no route: no address yet, or no gateway */
 #define ECONNRESET 104  /* TCP: the peer reset the connection */
 #define ENOBUFS 105     /* the network's buffers or sockets are all in use */
@@ -117,6 +136,7 @@ struct stat {
 };
 
 #define T_PIPE 4
+#define T_SOCKET 5
 
 /* What procs stores for each process: 32 bytes. `state` is one of the
  * PROC_ values (proc.h), `ppid` 0 for a process without a parent, `size`
@@ -186,22 +206,33 @@ struct ping_reply {
     u32 rtt_us; /* the round trip, in microseconds of mtime */
 };
 
-/* tcptest's operations and what it reports (docs/camelot-net.md, "Testing
- * TCP until #85"): a temporary hook on the kernel's TCP API, which #85's
- * socket calls replace. */
-#define TCPTEST_CONNECT 1 /* (addr, port, bytes): send `bytes`, read until the end */
-#define TCPTEST_LISTEN 2  /* (port, backlog): a listener, returned as a handle */
-#define TCPTEST_ACCEPT 3  /* (handle): accept a connection and echo it to the end */
-#define TCPTEST_CLOSE 4   /* (handle): close the listener */
+/* Sockets (docs/camelot-syscalls.md, "Sockets"): Linux's values. */
+#define AF_INET 2     /* IPv4: the only address family */
+#define SOCK_STREAM 1 /* TCP */
+#define SOCK_DGRAM 2  /* UDP */
+#define SHUT_RD 0     /* shutdown: no more reading */
+#define SHUT_WR 1     /* no more sending */
+#define SHUT_RDWR 2   /* neither */
+#define SOL_SOCKET 1  /* setsockopt: the socket's own options */
+#define SO_RCVTIMEO 20 /* how long recv and accept wait: a struct timeval */
 
-struct tcptest_report {
-    u32 laddr; /* this end */
-    u32 lport;
-    u32 raddr; /* the other end */
-    u32 rport;
-    u32 sent;     /* bytes sent */
-    u32 received; /* bytes received */
-    u32 hash;     /* FNV-1a of the bytes received */
+/* A time: seconds and microseconds (Linux's 32-bit layout). */
+struct timeval {
+    i32 tv_sec;
+    i32 tv_usec;
+};
+
+/* An IPv4 address and port, as Linux lays it out (16 bytes): the port and
+ * the address in network byte order (big-endian), as on the wire. */
+struct in_addr {
+    u32 s_addr;
+};
+
+struct sockaddr_in {
+    u16 sin_family; /* AF_INET */
+    u16 sin_port;
+    struct in_addr sin_addr;
+    u8 sin_zero[8];
 };
 
 /* spawn's and exec's limits: at most MAXARG arguments (argv[0] included), whose strings

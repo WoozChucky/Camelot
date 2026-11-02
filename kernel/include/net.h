@@ -1,7 +1,8 @@
 /* Camelot's network stack (docs/camelot-net.md): one Ethernet interface
- * (the card driver, nic.h), ARP, IPv4, ICMP echo and UDP, configured by
- * DHCP or statically, plus the loopback address 127.0.0.1. The code is in
- * kernel/net/, one file per layer:
+ * (the card driver, nic.h), ARP, IPv4, ICMP echo, UDP and TCP, configured
+ * by DHCP or statically, plus the loopback address 127.0.0.1, and the
+ * sockets that give programs UDP and TCP. The code is in kernel/net/, one
+ * file per layer:
  *
  *   nic.c    the card: rings, interrupts, the transmit queue
  *   pbuf.c   the packet buffer pool
@@ -12,8 +13,9 @@
  *   udp.c    UDP ports and checksums: the kernel-internal socket API
  *   tcp.c    TCP connections, and their kernel-internal socket API
  *   dhcp.c   the DHCP client
+ *   socket.c sockets: the socket system calls, behind file descriptors
  *   net.c    the interface's configuration, boot, the counters, the timer
- *            and the system calls
+ *            and the system calls netinfo, netconf and ping
  *
  * Everything runs with interrupts off, as all kernel code does (proc.c), on
  * one hart: a frame is handled from start to end inside the card's
@@ -145,7 +147,7 @@ struct netif {
     u32 addr;        /* 0 until configured */
     u32 mask;
     u32 gateway;     /* the default route; 0 for none */
-    u32 dns;         /* what DHCP said, for #85's resolver; 0 for none */
+    u32 dns;         /* what DHCP said, for the user library's resolver; 0 for none */
     u32 how;         /* NETIF_ */
 };
 
@@ -195,12 +197,6 @@ u32 net_now(void);
 int net_sys_info(u32 uinfo);
 int net_sys_conf(u32 addr, u32 mask, u32 gateway);
 int net_sys_ping(u32 addr, u32 seq, u32 ureply);
-
-/* tcptest (docs/camelot-net.md, "Testing TCP until #85"): TCP's temporary
- * test hook, which #85's socket calls replace. net_proc_exit() closes the
- * listeners a process held when it ends. */
-int net_sys_tcptest(u32 op, u32 a, u32 b, u32 c, u32 ureport);
-void net_proc_exit(u32 pid);
 
 /* "a.b.c.d" of `addr` into `buf` (16 bytes). Returns buf. */
 char *ip_str(u32 addr, char *buf);
@@ -310,6 +306,10 @@ int icmp_ping(u32 dst, u32 id, u32 seq, u32 timeout, struct ping_reply *r);
 struct udp_sock {
     bool used;
     u16 port;
+    /* Connected (connect() on the socket): the only peer it takes
+     * datagrams from, and where send() goes; raddr 0 when not. */
+    u32 raddr;
+    u16 rport;
     struct pbuf_queue queue; /* received datagrams, oldest first */
 };
 
@@ -321,18 +321,22 @@ struct udp_sock *udp_open(u32 port, int *err);
 /* Unbinds `s`, dropping what it has not read. */
 void udp_close(struct udp_sock *s);
 
-/* Sends `len` bytes from `buf` (kernel memory) to `dst`:`port`, from s's
- * port. Returns `len`, or -EMSGSIZE (over UDP_MAX_DATA), or ip_output()'s
- * error. */
-int udp_sendto(struct udp_sock *s, u32 dst, u32 port, const void *buf, u32 len);
+/* Sends the `len` bytes at `src` (in `pt`'s user memory, or kernel memory
+ * when `pt` is NULL) to `dst`:`port`, from s's port. Returns `len`, or
+ * -EMSGSIZE (over UDP_MAX_DATA), -EFAULT, or ip_output()'s error. */
+int udp_sendto(struct udp_sock *s, u32 dst, u32 port, pagetable_t pt, u32 src, u32 len);
 
 /* Takes the oldest datagram that came to `s`: copies up to `size` bytes
- * of it to `buf` (the rest is lost, as with any datagram socket), stores
- * its sender in *from and *port (unless NULL) and returns its length.
- * Sleeps while there is none, for at most `timeout` ticks (0: no limit),
- * then -ETIMEDOUT (at once if the process is killed). Must be called by a
+ * of it to `dst` (in `pt`'s user memory, or kernel memory when `pt` is
+ * NULL; the rest is lost, as with any datagram socket), stores its sender
+ * in *from and *port (unless NULL) and returns its length. Sleeps while
+ * there is none, for at most `timeout` ticks (0: no limit), then
+ * -ETIMEDOUT; -EINTR at once if the process is killed. Must be called by a
  * process. */
-int udp_recvfrom(struct udp_sock *s, void *buf, u32 size, u32 *from, u32 *port, u32 timeout);
+int udp_recvfrom(struct udp_sock *s, pagetable_t pt, u32 dst, u32 size, u32 *from, u32 *port, u32 timeout);
+
+/* The length of the oldest datagram waiting in `s`, 0 if none. */
+u32 udp_pending(const struct udp_sock *s);
 
 /* A UDP datagram (`len` bytes at `udp`) for this host from `src` to
  * `dst`. Takes `p`. */
@@ -456,8 +460,8 @@ struct tcp_sock {
     u32 linger;
 };
 
-/* The API #85's socket system calls put behind file descriptors. Every
- * call but tcp_close() is made by a process, and those that wait (connect,
+/* The API the socket system calls (socket.c) put behind file descriptors.
+ * Every call but tcp_close() is made by a process, and those that wait (connect,
  * accept, send, recv) sleep until they can go on, giving up with -EINTR as
  * soon as the process is killed. Data is copied from and to `pt`'s user
  * memory, or kernel memory when `pt` is NULL. */
@@ -484,9 +488,10 @@ int tcp_listen(struct tcp_sock *s, u32 backlog);
  * (a port or address no connection can go to), -EINTR. */
 int tcp_connect(struct tcp_sock *s, u32 addr, u32 port);
 
-/* Waits for a connection on the listener `l` and returns it, a socket of
- * its own; NULL with *err set: -EINVAL (not a listener), -EINTR. */
-struct tcp_sock *tcp_accept(struct tcp_sock *l, int *err);
+/* Waits for a connection on the listener `l`, at most `timeout` ticks (0:
+ * no limit), and returns it, a socket of its own; NULL with *err set:
+ * -EINVAL (not a listener), -EAGAIN (the time ran out), -EINTR. */
+struct tcp_sock *tcp_accept(struct tcp_sock *l, u32 timeout, int *err);
 
 /* Queues the `n` bytes at `src` for sending, waiting for room in the send
  * buffer as it goes. Returns `n` (fewer if the process was killed after
@@ -494,11 +499,12 @@ struct tcp_sock *tcp_accept(struct tcp_sock *l, int *err);
  * the connection, -EFAULT, -EINTR. */
 int tcp_send(struct tcp_sock *s, pagetable_t pt, u32 src, u32 n);
 
-/* Waits for data and copies up to `n` bytes of it to `dst`. Returns how
- * many; 0 at the end (the peer's FIN, once everything before it was read);
- * or -ENOTCONN, the error that ended the connection (a reset loses what
- * was not read), -EFAULT, -EINTR. */
-int tcp_recv(struct tcp_sock *s, pagetable_t pt, u32 dst, u32 n);
+/* Waits for data, at most `timeout` ticks (0: no limit), and copies up to
+ * `n` bytes of it to `dst`. Returns how many; 0 at the end (the peer's
+ * FIN, once everything before it was read); or -ENOTCONN, the error that
+ * ended the connection (a reset loses what was not read), -EFAULT,
+ * -EAGAIN (the time ran out), -EINTR. */
+int tcp_recv(struct tcp_sock *s, pagetable_t pt, u32 dst, u32 n, u32 timeout);
 
 /* No more sending: a FIN follows what is queued. Receiving goes on. 0, or
  * -ENOTCONN. */
@@ -528,6 +534,46 @@ extern u32 tcp_in_use;
  * connection, which then sets it back to 0 (kernel_tcp.rs puts one just
  * below 2^32 to see the numbers wrap). */
 extern u32 tcp_isn_next;
+
+/* ---- sockets (socket.c): the socket system calls ---- */
+
+/* What a socket descriptor's open file (FD_SOCKET, file.h) points at: a
+ * TCP socket of tcp.c, or a UDP one of udp.c. A UDP socket gets its port
+ * (its udp_sock) when it is bound, or on the first send or connect, which
+ * bind it to the next ephemeral port. */
+struct socket {
+    u32 type;     /* SOCK_STREAM or SOCK_DGRAM; 0: a free slot */
+    bool rd_shut; /* shutdown(SHUT_RD): reading gives 0, the end */
+    bool wr_shut; /* shutdown(SHUT_WR) of a UDP socket: sending fails with -EPIPE */
+    u32 rcvtimeo; /* SO_RCVTIMEO: how long recv and accept wait, in ticks; 0: no limit */
+    struct tcp_sock *tcp; /* SOCK_STREAM */
+    struct udp_sock *udp; /* SOCK_DGRAM, once it has a port */
+};
+
+/* read() and write() on a socket: recv() and send(). The user range has
+ * been checked (fileread, filewrite). */
+int socket_read(struct socket *s, pagetable_t pt, u32 dst, u32 n);
+int socket_write(struct socket *s, pagetable_t pt, u32 src, u32 n);
+/* fstat()'s size: the bytes a read would get now (a stream's), or the
+ * length of the next datagram. */
+u32 socket_bytes(struct socket *s);
+/* The last descriptor for the socket was closed: tcp_close() or
+ * udp_close(), and the slot is free. */
+void socket_close(struct socket *s);
+
+/* The system calls (docs/camelot-syscalls.md, "Sockets"). */
+int sock_sys_socket(u32 domain, u32 type, u32 protocol);
+int sock_sys_bind(u32 fd, u32 uaddr);
+int sock_sys_listen(u32 fd, u32 backlog);
+int sock_sys_accept(u32 fd, u32 uaddr);
+int sock_sys_connect(u32 fd, u32 uaddr);
+int sock_sys_send(u32 fd, u32 ubuf, u32 len);
+int sock_sys_recv(u32 fd, u32 ubuf, u32 len);
+int sock_sys_sendto(u32 fd, u32 ubuf, u32 len, u32 uaddr);
+int sock_sys_recvfrom(u32 fd, u32 ubuf, u32 len, u32 uaddr);
+int sock_sys_shutdown(u32 fd, u32 how);
+int sock_sys_name(u32 fd, u32 uaddr, bool peer);
+int sock_sys_setsockopt(u32 fd, u32 level, u32 option, u32 uvalue, u32 len);
 
 /* ---- DHCP (dhcp.c) ---- */
 
