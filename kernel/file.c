@@ -282,6 +282,8 @@ void filestat(struct file *f, struct stat *st) {
     if (f->type == FD_SOCKET) {
         st->type = T_SOCKET;
         st->size = socket_bytes(f->sock);
+        /* Like a file's names: 0 once the other end is gone. */
+        st->nlink = socket_hung_up(f->sock) ? 0 : 1;
         return;
     }
     if (f->ip == NULL) {

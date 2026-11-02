@@ -138,7 +138,8 @@ static void test_sockets(void) {
     int u = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     check_eq(u, 4, "a UDP socket too");
     struct stat st;
-    check(fstat(t, &st) == 0 && st.type == T_SOCKET && st.size == 0, "fstat: a socket, nothing to read");
+    check(fstat(t, &st) == 0 && st.type == T_SOCKET && st.size == 0 && st.nlink == 1,
+          "fstat: a socket, nothing to read, nlink 1");
     check_eq(lseek(u, 0, SEEK_SET), -ESPIPE, "lseek on a socket");
     struct sockaddr_in a;
     check(getsockname(t, &a) == 0 && a.sin_family == AF_INET && a.sin_port == 0 && a.sin_addr.s_addr == 0,
@@ -346,6 +347,7 @@ static void test_tcp(void) {
     check_eq(send(c, "hello", 5), 5, "send");
     struct stat st;
     check(fstat(s, &st) == 0 && st.size == 5, "fstat says 5 bytes wait");
+    check_eq(st.nlink, 1, "and nlink 1: more can come");
     check_eq(recv(s, buf, 2), 2, "recv part of it");
     check_eq(recv(s, buf + 2, sizeof buf), 3, "recv the rest");
     check(memcmp(buf, "hello", 5) == 0, "the bytes");
@@ -392,11 +394,14 @@ static void test_tcp(void) {
     check_eq(send(c, "x", 1), -EPIPE, "send after shutdown");
     check_eq(recv(s, buf, sizeof buf), 0, "the other side reads the end");
     check_eq(recv(s, buf, sizeof buf), 0, "and again");
+    check(fstat(s, &st) == 0 && st.nlink == 0 && st.size == 0, "fstat: nlink 0, the other end hung up");
+    check(fstat(c, &st) == 0 && st.nlink == 1, "fstat: the half-closed side can still receive");
     check_eq(send(s, "late", 4), 4, "it can still send");
     check_eq(recv(c, buf, sizeof buf), 4, "and the half-closed side read");
     check_eq(shutdown(c, SHUT_RD), 0, "shutdown for reading");
     check_eq(send(s, "more", 4), 4, "send to it");
     check_eq(recv(c, buf, sizeof buf), 0, "a socket shut for reading reads the end");
+    check(fstat(c, &st) == 0 && st.nlink == 0, "fstat: nlink 0 once shut for reading");
     close(s);
     close(c);
 
@@ -409,6 +414,7 @@ static void test_tcp(void) {
     check_eq(close(c), 0, "close it");
     check_eq(recv(s, buf, sizeof buf), 3, "the bytes sent before the close");
     check_eq(recv(s, buf, sizeof buf), 0, "then the end");
+    check(fstat(s, &st) == 0 && st.nlink == 0, "fstat: nlink 0 after the other end closed");
     close(s);
     close(l);
 
@@ -419,6 +425,7 @@ static void test_tcp(void) {
     check_eq(shutdown(c, SHUT_RD), -ECONNREFUSED, "shutdown for reading says what ended it");
     check_eq(shutdown(c, SHUT_WR), -ECONNREFUSED, "for writing too");
     check_eq(shutdown(c, SHUT_RDWR), -ECONNREFUSED, "and both");
+    check(fstat(c, &st) == 0 && st.nlink == 0, "fstat: nlink 0 for a refused connection");
     close(c);
     l = listener(7010);
     check(l >= 0, "listen on the port again");

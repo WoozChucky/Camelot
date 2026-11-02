@@ -130,9 +130,11 @@
 #define MAXPATH 127
 
 /* What fstat stores: 16 bytes. `type` is the inode's (T_DIR, T_FILE or
- * T_DEVICE, fs.h) or T_PIPE; `ino` and `nlink` are 0 for a pipe and for the
- * console the first process got without opening a path, and a pipe's size
- * is the bytes waiting in it. */
+ * T_DEVICE, fs.h), T_PIPE or T_SOCKET; `ino` and `nlink` are 0 for a pipe
+ * and for the console the first process got without opening a path, and a
+ * pipe's size is the bytes waiting in it. A socket's size is the bytes a
+ * read would get now, and its nlink 1, or 0 once nothing more will arrive
+ * (socket_hung_up(), net.h). */
 struct stat {
     u32 ino;
     u16 type;

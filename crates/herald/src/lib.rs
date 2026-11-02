@@ -15,14 +15,19 @@
 //!   view is [`window::WindowView`], Grail's own framebuffer window.
 //! - [`Utf8Lossy`] keeps a Windows console fed with valid UTF-8, which Rust's console
 //!   stdout insists on.
-//! - [`parse_args`] reads Herald's command line, and [`parse_server`] its `--server`
-//!   values.
+//! - [`tcp::TcpSession`] is `--tcp`'s: a raw TCP connection straight to a port (a
+//!   Camelot shell from `shd`), not through Avalon, with the lines typed edited and
+//!   echoed locally by [`tcp::LineEditor`], since a socket has no line discipline.
+//! - [`parse_args`] reads Herald's command line, [`parse_server`] its `--server`
+//!   values and [`parse_tcp`] its `--tcp` ones.
 //!
 //! The `herald` binary wires a console session to the terminal: stdin in raw mode
 //! (Grail's [`grail::console::RawMode`], shared with Grail's own console) and stdout;
-//! and with `--screen`, a screen session to a window.
+//! with `--screen`, a screen session to a window; with `--tcp`, a TCP session to the
+//! terminal in raw mode.
 
 pub mod screen;
+pub mod tcp;
 #[cfg(windows)]
 pub mod window;
 
@@ -429,6 +434,7 @@ impl<W: Write> Write for Utf8Lossy<W> {
 
 /// Herald's command line, as `herald --help` prints it.
 pub const USAGE: &str = "usage: herald [--server ADDR] [--screen] <vm>
+       herald --tcp HOST:PORT
 
 Attaches to the serial console of a VM on an Avalon server: prints its recent
 output, then streams the output live and sends what you type to the VM. <vm> is a
@@ -441,6 +447,15 @@ VM id (all digits) or a VM name.
                   keyboard and pointer devices. Closing the window detaches; when
                   the VM ends, the window stays on its last frame until closed.
                   Windows only
+  --tcp HOST:PORT connect straight to a TCP port instead, not through Avalon:
+                  a Camelot shell from shd, for one (cargo xtask up --demo
+                  forwards 127.0.0.1:2323 to its VM's shd). Each connection is a
+                  shell of its own, so a busy one never holds up the others.
+                  The far end has no line editing, so Herald edits the line
+                  here: Backspace, Ctrl-U (the line), Ctrl-W (a word), Enter
+                  sends it; Ctrl-D on an empty line ends the input (shd then
+                  hangs up), Ctrl-] leaves and closes the connection. Piped
+                  input goes as it is, Herald staying until the far end closes
   -h, --help      show this text
 
 On the console, Ctrl-] detaches and leaves the VM running; so does the end of
@@ -449,12 +464,23 @@ ends when the VM stops, exits or is destroyed. Ctrl-C leaves Herald at once, the
 VM running. Any number of Heralds may attach to one VM, to its console or its
 screen: all of them see its output, and what any of them types reaches it.
 
-Exit status: 0 when detached or when the VM ended, 1 on an error (no server, no
-such VM, connection lost, console output failed, --screen without a window), 2
-for bad arguments; Ctrl-C gives the usual status of an interrupted program (130
-on Linux, STATUS_CONTROL_C_EXIT on Windows).";
+Exit status: 0 when detached or when the VM ended (with --tcp: when left, or
+when the far end closed), 1 on an error (no server, no such VM, connection lost,
+console output failed, --screen without a window), 2 for bad arguments; Ctrl-C
+gives the usual status of an interrupted program (130 on Linux,
+STATUS_CONTROL_C_EXIT on Windows).";
 
 /// What Herald's command line asks for ([`parse_args`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// A VM's console or screen, through Avalon.
+    Attach(Args),
+    /// `--tcp`: a TCP port, straight: the value as written (for messages) and the
+    /// addresses it names, to try in turn.
+    Tcp(String, Vec<SocketAddr>),
+}
+
+/// `herald [--server ADDR] [--screen] <vm>`: what to attach to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
     /// `--server`: the value as written (for messages) and the addresses it names.
@@ -465,12 +491,13 @@ pub struct Args {
 }
 
 /// Parses Herald's arguments (without the program name): `[--server ADDR] [--screen]
-/// <vm>`. `Ok(None)` asks for the help text ([`USAGE`]); an error is a bad command
-/// line (exit status 2).
-pub fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
+/// <vm>`, or `--tcp HOST:PORT`. `Ok(None)` asks for the help text ([`USAGE`]); an
+/// error is a bad command line (exit status 2).
+pub fn parse_args(args: &[String]) -> Result<Option<Command>, String> {
     let mut server = None;
     let mut vm = None;
     let mut screen = false;
+    let mut tcp = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -479,6 +506,10 @@ pub fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--server" => match it.next() {
                 Some(s) => server = Some((s.clone(), parse_server(s)?)),
                 None => return Err("--server needs a value".to_string()),
+            },
+            "--tcp" => match it.next() {
+                Some(s) => tcp = Some((s.clone(), parse_tcp(s)?)),
+                None => return Err("--tcp needs a value (HOST:PORT)".to_string()),
             },
             _ if a.starts_with('-') && a.len() > 1 => {
                 return Err(format!(
@@ -497,8 +528,18 @@ pub fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             _ => vm = Some(VmRef::parse(a)),
         }
     }
+    if let Some((addr, addrs)) = tcp {
+        if server.is_some() || screen || vm.is_some() {
+            return Err(format!(
+                "--tcp connects straight to a TCP port: no --server, --screen or VM with it
+
+{USAGE}"
+            ));
+        }
+        return Ok(Some(Command::Tcp(addr, addrs)));
+    }
     match vm {
-        Some(vm) => Ok(Some(Args { server, screen, vm })),
+        Some(vm) => Ok(Some(Command::Attach(Args { server, screen, vm }))),
         None => Err(format!(
             "which VM? (a VM id or name)
 
@@ -542,6 +583,27 @@ pub fn parse_server(s: &str) -> Result<Vec<SocketAddr>, String> {
             "'{s}' is not a server address (examples: 127.0.0.1:7400, localhost, 10.0.0.5:7500)"
         )),
     }
+}
+
+/// Parses a `--tcp` value: `host:port` (the port is needed: there is no default),
+/// IPv6 addresses in brackets (`[::1]:2323`). Returns every address a host name
+/// resolves to, IPv4 first, as [`parse_server`] does.
+pub fn parse_tcp(s: &str) -> Result<Vec<SocketAddr>, String> {
+    let bad = || format!("'{s}' is not HOST:PORT (examples: 127.0.0.1:2323, localhost:2323)");
+    let addrs = match s.parse::<SocketAddr>() {
+        Ok(addr) => vec![addr],
+        Err(_) if s.contains(char::is_whitespace) || !s.contains(':') => return Err(bad()),
+        Err(_) => {
+            let mut addrs: Vec<SocketAddr> = s.to_socket_addrs().map_err(|_| bad())?.collect();
+            // A stable sort: false (IPv4) before true.
+            addrs.sort_by_key(SocketAddr::is_ipv6);
+            addrs
+        }
+    };
+    if addrs.is_empty() || addrs.iter().any(|a| a.port() == 0) {
+        return Err(bad());
+    }
+    Ok(addrs)
 }
 
 #[cfg(test)]
@@ -615,12 +677,16 @@ mod tests {
     #[test]
     fn command_lines() {
         let parse = |s: &str| parse_args(&s.split_whitespace().map(str::to_string).collect::<Vec<_>>());
-        let args = parse("web").unwrap().unwrap();
+        let attach = |s: &str| match parse(s) {
+            Ok(Some(Command::Attach(args))) => args,
+            other => panic!("{s}: {other:?}"),
+        };
+        let args = attach("web");
         assert_eq!(
             (args.server, args.screen, args.vm),
             (None, false, VmRef::Name("web".into()))
         );
-        let args = parse("--screen --server 127.0.0.1:7500 7").unwrap().unwrap();
+        let args = attach("--screen --server 127.0.0.1:7500 7");
         assert_eq!(
             (args.server, args.screen, args.vm),
             (
@@ -633,6 +699,13 @@ mod tests {
             )
         );
         assert_eq!(parse("web --help"), Ok(None));
+        assert_eq!(
+            parse("--tcp 127.0.0.1:2323"),
+            Ok(Some(Command::Tcp(
+                "127.0.0.1:2323".into(),
+                vec!["127.0.0.1:2323".parse().unwrap()]
+            )))
+        );
         for (bad, why) in [
             ("", "which VM?"),
             ("--screen", "which VM?"),
@@ -640,9 +713,38 @@ mod tests {
             ("web --server", "--server needs a value"),
             ("--server 127.0.0.1:port web", "is not a server address"),
             ("one two", "one VM at a time"),
+            ("--tcp", "--tcp needs a value"),
+            ("--tcp 127.0.0.1", "is not HOST:PORT"),
+            ("--tcp 127.0.0.1:2323 web", "no --server, --screen or VM"),
+            ("--screen --tcp 127.0.0.1:2323", "no --server, --screen or VM"),
+            (
+                "--tcp 127.0.0.1:2323 --server 127.0.0.1",
+                "no --server, --screen or VM",
+            ),
         ] {
             let e = parse(bad).unwrap_err();
             assert!(e.contains(why), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn tcp_addresses() {
+        let one = |s: &str| vec![s.parse::<SocketAddr>().unwrap()];
+        assert_eq!(parse_tcp("127.0.0.1:2323").unwrap(), one("127.0.0.1:2323"));
+        assert_eq!(parse_tcp("[::1]:23").unwrap(), one("[::1]:23"));
+        let addrs = parse_tcp("localhost:2323").unwrap();
+        assert_eq!(addrs[0], "127.0.0.1:2323".parse().unwrap(), "{addrs:?}");
+        assert!(addrs.iter().all(|a| a.port() == 2323), "{addrs:?}");
+        for bad in [
+            "",
+            "127.0.0.1",
+            "localhost",
+            "::1",
+            "127.0.0.1:0",
+            "127.0.0.1:port",
+            "a b:23",
+        ] {
+            assert!(parse_tcp(bad).is_err(), "{bad}");
         }
     }
 

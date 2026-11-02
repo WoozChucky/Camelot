@@ -92,7 +92,7 @@ filesystem's `/bin`, and with no `/bin/sh` (or no filesystem) it panics
 `kernel.elf` is the same kernel with a copy of every program built in (1.7
 MB), which play the part of an initramfs: they are what it runs without a
 disk. So the whole system fits in a 2 MiB image (the kernel about 300
-blocks, the filesystem the rest, a fifth of it free); `cargo xtask fs --size
+blocks, the filesystem the rest, over 300 blocks of it free); `cargo xtask fs --size
 N` makes an image of N blocks.
 
 ```

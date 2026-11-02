@@ -247,6 +247,16 @@ u32 socket_bytes(struct socket *s) {
     return n;
 }
 
+bool socket_hung_up(struct socket *s) {
+    acquire(&net_lock);
+    bool ended = s->rd_shut;
+    if (s->type == SOCK_STREAM) {
+        ended = ended || s->tcp->fin_rcvd || s->tcp->err != 0;
+    }
+    release(&net_lock);
+    return ended;
+}
+
 void socket_close(struct socket *s) {
     acquire(&net_lock);
     if (s->type == SOCK_STREAM) {

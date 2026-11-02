@@ -1,7 +1,8 @@
 //! `cargo xtask up` end to end: the real Lake, Avalon and Pendragon binaries started
 //! as `up` starts them, on ephemeral ports, with a temporary images directory; each
 //! one asked whether it answers; the demo's Camelot VM booted to its shell, with a
-//! second one beside it; everything stopped, and started again on every address with
+//! shell of its own reached through the port its switch forwards to its `shd`, and a
+//! second VM beside it; everything stopped, and started again on every address with
 //! the demo VM on its old disk; and `xtask up` itself ended from outside. Nothing
 //! waits a fixed time: every wait is for something to happen, with a generous limit.
 //!
@@ -80,6 +81,7 @@ fn options(dir: &TempDir) -> Options {
     o.build = false;
     let any = "127.0.0.1:0".parse().unwrap();
     (o.lake, o.avalon, o.pendragon) = (any, any, any);
+    o.shd = "127.0.0.1:0".parse().unwrap();
     o
 }
 
@@ -184,6 +186,55 @@ impl Console {
 /// Camelot's shell prompt.
 const PROMPT: &str = "$ ";
 
+/// A shell from the demo VM's `shd`, over a TCP connection to the forwarded port.
+struct Shell {
+    stream: TcpStream,
+    output: Vec<u8>,
+}
+
+impl Shell {
+    /// Connects and reads until the shell's greeting and prompt.
+    fn connect(addr: SocketAddr) -> Shell {
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(SLOW)).unwrap();
+        let mut shell = Shell {
+            stream,
+            output: Vec::new(),
+        };
+        shell.read_until(b"Type help for the list of commands.\n$ ");
+        shell
+    }
+
+    fn read_until(&mut self, end: &[u8]) {
+        let mut buf = [0u8; 512];
+        while !self.output.ends_with(end) {
+            let n = self.stream.read(&mut buf).unwrap();
+            assert!(
+                n > 0,
+                "the shell ended: {:?}",
+                String::from_utf8_lossy(&self.output)
+            );
+            self.output.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// Runs `line` and checks that it prints `want`.
+    fn command(&mut self, line: &str, want: &str) {
+        self.output.clear();
+        self.stream.write_all(format!("{line}\n").as_bytes()).unwrap();
+        self.read_until(PROMPT.as_bytes());
+        assert_eq!(String::from_utf8_lossy(&self.output), format!("{want}{PROMPT}"));
+    }
+
+    /// `exit`: the shell ends, and so does the connection.
+    fn leave(mut self) {
+        self.stream.write_all(b"exit\n").unwrap();
+        let mut rest = Vec::new();
+        self.stream.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "{rest:?}");
+    }
+}
+
 /// Never set: no Ctrl-C.
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -195,8 +246,8 @@ fn check_herald(line: &str, args: &str) {
 }
 
 /// Checks that every Round Table and Herald command in `up`'s summary is one they
-/// take, and that none names an unspecified address.
-fn check_summary(summary: &str) {
+/// take (`commands` of them), and that none names an unspecified address.
+fn check_summary(summary: &str, want: usize) {
     let mut commands = 0;
     for line in summary.lines() {
         let line = line.trim();
@@ -210,7 +261,7 @@ fn check_summary(summary: &str) {
             commands += 1;
         }
     }
-    assert_eq!(commands, 3, "{summary}");
+    assert_eq!(commands, want, "{summary}");
     assert!(
         !summary.contains("0.0.0.0") && !summary.contains("[::]"),
         "{summary}"
@@ -240,6 +291,13 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     // of the 2 MiB image, to the shell, with the default hardware: 4 MiB of RAM.
     assert_eq!(root_image().len(), 2 << 20);
     let id = platform.demo(log).unwrap();
+    let shd = platform.shd.expect("the demo forwards a port to its VM's shd");
+    assert!(shd.ip().is_loopback() && shd.port() != 0, "{shd}");
+    assert!(
+        out.lines().iter().any(|l| l.starts_with("up: demo: started shd")),
+        "{:#?}",
+        out.lines()
+    );
     let mut avalon = Client::connect(&platform.avalon.to_string(), "test").unwrap();
     let vm = avalon.vm_info(&VmRef::Id(id)).unwrap();
     assert_eq!(vm.vm.name, "vm001");
@@ -268,6 +326,13 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     assert!(one.output.contains(", the kernel none\n"), "{}", one.output);
     one.type_line("echo up from its own disk");
     one.wait_for_end("up from its own disk\n$ ");
+    // A shell of its own through the forwarded port, beside the console's.
+    let mut shell = Shell::connect(shd);
+    shell.command("echo through shd", "through shd\n");
+    one.type_line("echo the console still");
+    one.wait_for_end("the console still\n$ ");
+    shell.command("ps | grep -c shd", "1\n");
+    shell.leave();
     // Something for the next run to find on the disk.
     one.type_line("echo kept > /kept");
     one.wait_for_end(PROMPT);
@@ -311,7 +376,8 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         "cargo run --release -p herald -- --server {} vm001",
         platform.avalon
     )));
-    check_summary(&summary);
+    assert!(summary.contains(&format!("cargo run --release -p herald -- --tcp {shd}")));
+    check_summary(&summary, 4);
 
     // Ctrl-C: the flag `up`'s handler sets.
     let stop = AtomicBool::new(true);
@@ -349,7 +415,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     let every = "0.0.0.0:0".parse().unwrap();
     (again.lake, again.avalon, again.pendragon) = (every, every, every);
     up::prepare(&again, log).unwrap();
-    let platform = Platform::start(&again, &RUNNING, log).unwrap();
+    let mut platform = Platform::start(&again, &RUNNING, log).unwrap();
     for addr in [platform.lake, platform.avalon, platform.pendragon] {
         assert!(addr.ip().is_loopback() && addr.port() != 0, "{addr}");
     }
@@ -367,7 +433,8 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     one.type_line("cat /kept");
     one.wait_for_end("kept\n$ ");
     drop(one);
-    check_summary(&platform.summary(true));
+    check_summary(&platform.summary(true), 4);
+    check_summary(&platform.summary(false), 3);
     platform.stop(log);
 }
 

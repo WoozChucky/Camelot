@@ -95,8 +95,8 @@ typedef unsigned long size_t;
 
 struct stat {
     uint ino;     /* the inode; 0 for a pipe or the shell's console */
-    ushort type;  /* T_DIR, T_FILE, T_DEVICE or T_PIPE */
-    ushort nlink; /* directory entries naming it */
+    ushort type;  /* T_DIR, T_FILE, T_DEVICE, T_PIPE or T_SOCKET */
+    ushort nlink; /* directory entries naming it; a socket: 0 once its other end hung up */
     uint size;    /* bytes; for a pipe, those waiting to be read */
     ushort major; /* a device's numbers */
     ushort minor;
@@ -424,6 +424,13 @@ const char *resolve_error(int err);
 /* fstat() on the file at `path`: opens it for reading, then closes it.
  * Returns 0 or the error (lib/stat.c). */
 int stat(const char *path, struct stat *st);
+
+/* Kills every process `pid` started that has not ended, and theirs, down
+ * to the last generation, from one procs() snapshot: the youngest first,
+ * so that none is left an orphan. Not `pid` itself (which may be the
+ * caller: kill_descendants(getpid()) ends what a program started). Returns
+ * how many it killed. One thread at a time (lib/proc.c). */
+int kill_descendants(int pid);
 
 /* Busy-waits for about `n` iterations of a short loop, a few instructions
  * each: CPU time, as opposed to sleep() (lib/spin.c). */

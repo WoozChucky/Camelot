@@ -1,20 +1,32 @@
-//! `herald [--server ADDR] [--screen] <vm>`
+//! `herald [--server ADDR] [--screen] <vm>`, `herald --tcp HOST:PORT`
 
 #[cfg(windows)]
 use avalon_proto::VmState;
 use avalon_proto::{Connection, VmRef, DEFAULT_AVALON_ADDR};
 use grail::console::{self, RawMode, RawOptions};
+use herald::tcp::{TcpEnd, TcpSession};
 #[cfg(windows)]
 use herald::End;
-use herald::{parse_args, Args, Session, Utf8Lossy, AGENT, DETACH_KEY_NAME, USAGE};
+use herald::{parse_args, Args, Command, Session, Utf8Lossy, AGENT, DETACH_KEY_NAME, USAGE};
 use std::io::{self, IsTerminal, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let Args { server, screen, vm } = match parse_args(&args) {
-        Ok(Some(args)) => args,
+    let result = match parse_args(&args) {
+        Ok(Some(Command::Attach(Args { server, screen, vm }))) => {
+            let (server, addrs) = server.unwrap_or_else(|| {
+                let default = DEFAULT_AVALON_ADDR.parse().expect("the default address parses");
+                (DEFAULT_AVALON_ADDR.to_string(), vec![default])
+            });
+            if screen {
+                show_screen(&server, &addrs, &vm)
+            } else {
+                attach(&server, &addrs, &vm)
+            }
+        }
+        Ok(Some(Command::Tcp(addr, addrs))) => tcp(&addr, &addrs),
         Ok(None) => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -23,15 +35,6 @@ fn main() -> ExitCode {
             eprintln!("herald: {e}");
             return ExitCode::from(2);
         }
-    };
-    let (server, addrs) = server.unwrap_or_else(|| {
-        let default = DEFAULT_AVALON_ADDR.parse().expect("the default address parses");
-        (DEFAULT_AVALON_ADDR.to_string(), vec![default])
-    });
-    let result = if screen {
-        show_screen(&server, &addrs, &vm)
-    } else {
-        attach(&server, &addrs, &vm)
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -149,6 +152,58 @@ fn attach(server: &str, addrs: &[SocketAddr], vm: &VmRef) -> Result<(), String> 
         // is what failed.
         Err(e) if out.failed => Err(format!("cannot write the console output: {e}")),
         Err(e) => Err(format!("lost the connection to {server}: {e}")),
+    }
+}
+
+/// `--tcp`: a raw TCP connection to `addr` (as the person wrote it), which is at
+/// `addrs`: each is tried in turn. On a terminal, lines are edited and echoed here.
+fn tcp(addr: &str, addrs: &[SocketAddr]) -> Result<(), String> {
+    let stream = TcpStream::connect(addrs).map_err(|e| format!("cannot connect to {addr}: {e}"))?;
+    let peer = stream.peer_addr().map_or(addr.to_string(), |a| a.to_string());
+    // Raw mode before the reading thread starts, as for a console (see `attach`).
+    let raw = RawMode::with(RawOptions { vt: true });
+    let input = match &raw {
+        Some(raw) => raw.stdin_channel(),
+        None => console::stdin_channel(),
+    };
+    eprintln!(
+        "herald: connected to {peer}; {}",
+        if raw.is_some() {
+            format!(
+                "lines are edited here and sent with Enter, Ctrl-D on an empty line ends the \
+                 input, {DETACH_KEY_NAME} leaves"
+            )
+        } else {
+            format!("{DETACH_KEY_NAME} leaves")
+        }
+    );
+    let mut session = TcpSession::new(stream);
+    // A terminal the raw mode could not be set on edits lines itself.
+    session.edit = raw.is_some();
+    let stdout = io::stdout();
+    let console: Box<dyn Write> = if cfg!(windows) && stdout.is_terminal() {
+        Box::new(Utf8Lossy::new(stdout.lock()))
+    } else {
+        Box::new(stdout.lock())
+    };
+    let mut out = LineEnd::new(console);
+    let result = session.run(input, &mut out);
+    drop(raw);
+    if !out.at_start && !out.failed && io::stdout().is_terminal() {
+        let _ = out.write_all(b"\r\n");
+        let _ = out.flush();
+    }
+    match result {
+        Ok(TcpEnd::Left) => {
+            eprintln!("herald: left {peer}, closing the connection");
+            Ok(())
+        }
+        Ok(TcpEnd::Closed) => {
+            eprintln!("herald: {peer} closed the connection");
+            Ok(())
+        }
+        Err(e) if out.failed => Err(format!("cannot write the output: {e}")),
+        Err(e) => Err(format!("lost the connection to {peer}: {e}")),
     }
 }
 

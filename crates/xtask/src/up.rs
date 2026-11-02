@@ -19,7 +19,12 @@
 //!    since Windows refuses to connect to an unspecified address.
 //! 4. **Demo** (`--demo`, [`Platform::demo`]): a switch `nat` with a NAT gateway, and a
 //!    VM `vm001` with the default hardware (4 MiB of RAM) that boots from `vm001-disk0`,
-//!    its own copy of the image, plugged into it and started.
+//!    its own copy of the image, plugged into it and started. The gateway forwards
+//!    127.0.0.1:2323 (`--shd`) to the VM's port 23, and once the VM is at its prompt,
+//!    `up` types `shd &` on its console: the shell server, which gives each connection
+//!    (`herald --tcp 127.0.0.1:2323`) a shell of its own, beside the console's. `up`
+//!    checks that a shell answers through the forward; if none does (an old disk
+//!    without `/bin/shd`, say), it says so and how to start it, and goes on.
 //! 5. **Wait** ([`Platform::wait`]) until Ctrl-C, or until one of the servers ends;
 //!    then **stop** ([`Platform::stop`]) the others, Pendragon first and Lake last.
 //!
@@ -31,9 +36,12 @@
 //! loses nothing.
 
 use avalon_client::{create_camelot_vm, vm_disk, CamelotError, Client, BASE_IMAGE};
-use avalon_proto::{DeviceSpec, DiskSource, DiskSpec, ErrorCode, HardwareProfile, NatConfig, NetSpec, VmRef};
-use std::io::{self, BufRead, BufReader, Read};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use avalon_proto::{
+    DeviceSpec, DiskSource, DiskSpec, ErrorCode, FwdProto, HardwareProfile, Message, NatConfig, NetSpec,
+    PortForward, VmRef,
+};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,6 +62,15 @@ pub const BINARIES: [&str; 5] = ["lake", "avalon", "pendragon", "round-table", "
 pub const DEFAULT_LAKE: &str = avalon_proto::DEFAULT_LAKE_ADDR;
 pub const DEFAULT_AVALON: &str = avalon_proto::DEFAULT_AVALON_ADDR;
 pub const DEFAULT_PENDRAGON: &str = "127.0.0.1:7402";
+/// Where the demo's gateway forwards to the demo VM's shell server by default.
+pub const DEFAULT_SHD: &str = "127.0.0.1:2323";
+
+/// The demo VM's address on its switch (the first a NAT gateway's DHCP server gives)
+/// and the port `shd` listens on.
+pub const DEMO_GUEST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 23);
+
+/// The first line of a Camelot shell's greeting.
+const SHELL_BANNER: &str = "Type help for the list of commands.\n";
 
 /// The demo's switch and VM.
 pub const DEMO_SWITCH: &str = "nat";
@@ -85,7 +102,11 @@ Ctrl-C (or until one of them ends), their output prefixed by server.
   --no-build         use the binaries and target/camelot-fs.img already built
   --demo             also create a switch nat with a NAT gateway and a VM vm001
                      that boots from its own copy of the image, vm001-disk0,
-                     plugged into it, and start it
+                     plugged into it, and start it, with shd, its shell server,
+                     running: herald --tcp 127.0.0.1:2323 gives a shell of its own
+  --shd ADDR         where the demo's gateway forwards to the VM's shd (port 23;
+                     default 127.0.0.1:2323). IPv4 only. shd's shells run as
+                     root with no password: keep it on loopback
   -h, --help         show this text";
 
 /// What `up` does, from its command line.
@@ -102,6 +123,8 @@ pub struct Options {
     pub lake: SocketAddr,
     pub avalon: SocketAddr,
     pub pendragon: SocketAddr,
+    /// Where the demo's gateway forwards to the demo VM's `shd`.
+    pub shd: SocketAddrV4,
     /// Build the binaries and the root image first.
     pub build: bool,
     pub demo: bool,
@@ -124,6 +147,7 @@ impl Options {
             lake: DEFAULT_LAKE.parse().expect("the default address parses"),
             avalon: DEFAULT_AVALON.parse().expect("the default address parses"),
             pendragon: DEFAULT_PENDRAGON.parse().expect("the default address parses"),
+            shd: DEFAULT_SHD.parse().expect("the default address parses"),
             build: true,
             demo: false,
         }
@@ -155,6 +179,10 @@ pub fn parse_args(args: &[String], root: &Path) -> Result<Option<Options>, Strin
             "--lake" => o.lake = addr("--lake", value("--lake")?, DEFAULT_LAKE)?,
             "--avalon" => o.avalon = addr("--avalon", value("--avalon")?, DEFAULT_AVALON)?,
             "--pendragon" => o.pendragon = addr("--pendragon", value("--pendragon")?, DEFAULT_PENDRAGON)?,
+            "--shd" => match addr("--shd", value("--shd")?, DEFAULT_SHD)? {
+                SocketAddr::V4(v4) => o.shd = v4,
+                SocketAddr::V6(_) => return Err("--shd: the gateway forwards IPv4 addresses only".into()),
+            },
             "--no-build" => o.build = false,
             "--demo" => o.demo = true,
             other => return Err(format!("unknown option {other}")),
@@ -337,6 +365,11 @@ pub struct Platform {
     /// Pendragon's URL, with this launch's token.
     pub url: String,
     images: PathBuf,
+    /// Where the demo's gateway is asked to forward to the demo VM's `shd`.
+    shd_listen: SocketAddrV4,
+    /// Where the demo's gateway forwards to its VM's `shd`, as bound and reachable,
+    /// once [`Platform::demo`] has set the forward up.
+    pub shd: Option<SocketAddr>,
 }
 
 impl Platform {
@@ -362,6 +395,8 @@ impl Platform {
             pendragon: options.pendragon,
             url: String::new(),
             images,
+            shd_listen: options.shd,
+            shd: None,
         };
         let images = platform.images.to_string_lossy().into_owned();
         let lake = platform.spawn(
@@ -558,20 +593,58 @@ impl Platform {
     /// that boots from its own copy of the image, plugged into the switch and started.
     /// An existing copy (from an earlier run on the same images directory) is used
     /// again, with what the VM wrote to it. Returns the VM's id.
-    pub fn demo(&self, log: Log) -> Result<u32, String> {
+    ///
+    /// The gateway forwards `--shd`'s address to the VM's port 23 ([`Platform::shd`]
+    /// is where, as bound), and `shd` is started in the VM ([`start_shd`]). Neither
+    /// failing fails the demo: `up` says so, and what to do.
+    pub fn demo(&mut self, log: Log) -> Result<u32, String> {
         let lake_addr = self.lake.to_string();
         let connect = |what: &str, addr: &str| {
             Client::connect(addr, "xtask-up").map_err(|e| format!("demo: cannot reach {what}: {e}"))
         };
         let mut avalon = connect("Avalon", &self.avalon.to_string())?;
         let mut lake = connect("Lake", &lake_addr)?;
-        match avalon.create_switch_with(DEMO_SWITCH, Some(NatConfig::default())) {
+        let forward = PortForward {
+            proto: FwdProto::Tcp,
+            host: self.shd_listen,
+            guest: DEMO_GUEST,
+        };
+        let nat = NatConfig {
+            hostfwd: vec![forward],
+        };
+        match avalon.create_switch_with(DEMO_SWITCH, Some(nat)) {
             Ok(()) => log(&format!(
-                "up: demo: created switch {DEMO_SWITCH} with a NAT gateway"
+                "up: demo: created switch {DEMO_SWITCH} with a NAT gateway, forwarding {} to {DEMO_GUEST}",
+                self.shd_listen
             )),
             Err(e) if e.code() == Some(ErrorCode::AlreadyExists) => {}
-            Err(e) => return Err(format!("demo: cannot create switch {DEMO_SWITCH}: {e}")),
+            // The address is taken, most likely: the demo goes on without the forward.
+            Err(e) => {
+                log(&format!(
+                    "up: demo: cannot forward {} to the VM's shell server ({e}); no shd \
+                     (--shd picks another address)",
+                    self.shd_listen
+                ));
+                match avalon.create_switch_with(DEMO_SWITCH, Some(NatConfig::default())) {
+                    Ok(()) => log(&format!(
+                        "up: demo: created switch {DEMO_SWITCH} with a NAT gateway"
+                    )),
+                    Err(e) if e.code() == Some(ErrorCode::AlreadyExists) => {}
+                    Err(e) => return Err(format!("demo: cannot create switch {DEMO_SWITCH}: {e}")),
+                }
+            }
         }
+        // The forward as bound (port 0 picks one), if the switch has it.
+        let switches = avalon
+            .list_switches()
+            .map_err(|e| format!("demo: cannot list the switches: {e}"))?;
+        self.shd = switches
+            .iter()
+            .filter(|s| s.name == DEMO_SWITCH)
+            .filter_map(|s| s.nat.as_ref())
+            .flat_map(|nat| &nat.hostfwd)
+            .find(|f| f.proto == FwdProto::Tcp && f.guest == DEMO_GUEST)
+            .map(|f| reachable(SocketAddr::V4(f.host)));
         let profile = HardwareProfile {
             devices: vec![DeviceSpec::Net(NetSpec {
                 switch: Some(DEMO_SWITCH.into()),
@@ -610,6 +683,17 @@ impl Platform {
         log(&format!(
             "up: demo: started VM {id} ({DEMO_VM}) on switch {DEMO_SWITCH}"
         ));
+        if let Some(shd) = self.shd {
+            match start_shd(self.avalon, id, shd) {
+                Ok(()) => log(&format!(
+                    "up: demo: started shd, the shell server, in VM {id}: each connection to {shd} \
+                     is a shell of its own"
+                )),
+                Err(e) => log(&format!(
+                    "up: demo: could not start shd in VM {id} ({e}); type shd & on its console"
+                )),
+            }
+        }
         Ok(id)
     }
 
@@ -628,6 +712,12 @@ impl Platform {
         };
         // The VM to attach to: the demo's, or the one the create command makes.
         let vm = if demo { DEMO_VM } else { "web" };
+        let shell = match self.shd {
+            Some(shd) if demo => {
+                format!("\x20 cargo run --release -p herald -- --tcp {shd}      (a shell of its own: shd)\n")
+            }
+            _ => String::new(),
+        };
         format!(
             "\nThe Avalon platform is up.\n\
              \n  Pendragon  {}\n             open it in a browser (the token changes at every launch)\
@@ -636,6 +726,7 @@ impl Platform {
              \x20 cargo run --release -p round-table -- {server}{lake}create --name web --camelot --start\n\
              \x20 cargo run --release -p round-table -- {server}list\n\
              \x20 cargo run --release -p herald -- {server}{vm}      (Ctrl-] detaches)\n\
+             {shell}\
              \nCtrl-C stops Pendragon, Avalon and Lake.\n",
             self.url,
             self.avalon,
@@ -655,6 +746,82 @@ impl Drop for Platform {
             }
         }
     }
+}
+
+/// How long [`start_shd`] waits for the demo VM's prompt, and then for a shell through
+/// the forward.
+pub const SHD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Starts `shd` in VM `vm` on the Avalon server at `avalon`: waits for the shell's
+/// prompt on its console, types `shd &`, and waits until a shell answers at `shd`,
+/// the forwarded port (then leaves it with `exit`). Fails if any of it does not
+/// happen within [`SHD_TIMEOUT`].
+pub fn start_shd(avalon: SocketAddr, vm: u32, shd: SocketAddr) -> Result<(), String> {
+    let deadline = Instant::now() + SHD_TIMEOUT;
+    let mut client =
+        Client::connect(&avalon.to_string(), "xtask-up").map_err(|e| format!("cannot reach Avalon: {e}"))?;
+    let (id, scrollback) = client
+        .attach_console(&VmRef::Id(vm))
+        .map_err(|e| format!("cannot attach to its console: {e}"))?;
+    let conn = client.connection();
+    conn.get_ref()
+        .set_read_timeout(Some(POLL))
+        .map_err(|e| e.to_string())?;
+    let mut output = String::from_utf8_lossy(&scrollback).into_owned();
+    while !output.ends_with("\n$ ") {
+        if Instant::now() > deadline {
+            return Err("its shell never showed a prompt".into());
+        }
+        match conn.recv() {
+            Ok(Message::ConsoleOutput { data, .. }) => output += &String::from_utf8_lossy(&data),
+            Ok(_) => {}
+            Err(avalon_proto::Error::Io(e))
+                if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+            Err(e) => return Err(format!("its console: {e}")),
+        }
+    }
+    conn.send(&Message::ConsoleInput {
+        vm: id,
+        data: b"shd &\n".to_vec(),
+    })
+    .map_err(|e| format!("its console: {e}"))?;
+    // Until shd listens, the gateway's connection to the VM is refused, and so the
+    // host's ends at once: try again a little later.
+    loop {
+        if shell_answers(shd, deadline) {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err(format!("no shell answered at {shd}"));
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Whether a Camelot shell greets a connection to `addr` before `deadline`; if one
+/// does, it is left with `exit`.
+fn shell_answers(addr: SocketAddr, deadline: Instant) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, POLL * 10) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(POLL));
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    while Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => return false,
+            Ok(n) => {
+                got.extend_from_slice(&buf[..n]);
+                if String::from_utf8_lossy(&got).starts_with(SHELL_BANNER) && got.ends_with(b"$ ") {
+                    let _ = stream.write_all(b"exit\n");
+                    return true;
+                }
+            }
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Reads one pipe of server `index` line by line into `sender`, then says it ended.
@@ -986,6 +1153,7 @@ mod tests {
             )
         );
         assert!(o.build && !o.demo);
+        assert_eq!(o.shd.to_string(), "127.0.0.1:2323");
         assert_eq!(o.image, root.join("target/camelot-fs.img"));
         let o = parse_args(
             &args("--images imgs --lake 127.0.0.1:0 --avalon 0.0.0.0 --pendragon localhost:9000 --no-build --demo"),
@@ -998,11 +1166,16 @@ mod tests {
         assert_eq!(o.avalon.to_string(), "0.0.0.0:7400");
         assert_eq!(o.pendragon.port(), 9000);
         assert!(!o.build && o.demo);
+        let shd = |a: &str| parse_args(&args(&format!("--shd {a}")), root).map(|o| o.unwrap().shd);
+        assert_eq!(shd("127.0.0.1:0").unwrap().to_string(), "127.0.0.1:0");
+        assert_eq!(shd("0.0.0.0").unwrap().to_string(), "0.0.0.0:2323");
+        assert!(shd("[::1]:23").unwrap_err().contains("IPv4 addresses only"));
         assert_eq!(parse_args(&args("--demo -h"), root), Ok(None));
         for (bad, why) in [
             ("--lake", "--lake needs a value"),
             ("--avalon x:y", "--avalon: "),
             ("--images", "--images needs a value"),
+            ("--shd", "--shd needs a value"),
             ("--bogus", "unknown option --bogus"),
             ("up", "unknown option up"),
         ] {

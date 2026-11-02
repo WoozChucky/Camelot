@@ -260,7 +260,13 @@ the console the kernel gave the shell), `type` (`T_DIR` 1, `T_FILE` 2,
 last name was removed while it is open), `size` (bytes; for a pipe, the
 bytes waiting in it; 0 for a device), `major` and `minor` (a device's
 numbers, 1 and 0 for the console). A socket is `T_SOCKET` (5), with the
-bytes waiting to be received as its size (for UDP, the datagrams' bytes).
+bytes waiting to be received as its size (for UDP, the datagrams' bytes),
+and an `nlink` of 1, or 0 once nothing more will arrive: the other end
+ended its side (its FIN came), the connection was reset or timed out, or
+the socket was shut down for reading. With a size of 0 too, a read
+returns at once, the end or the error; so a program that holds a
+connection without reading it can tell the other end hung up (`shd`
+does, for its sessions).
 `-EBADF`, or `-EFAULT` if `st` is not writable.
 
 **mkdir(path)** makes the directory `path`, with its `.` and `..`. Errors:
