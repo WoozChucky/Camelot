@@ -320,9 +320,10 @@ left out (the header says there are no sections), which saves about 60 KiB.
 `kernel/kernel.elf` carries for running without a disk, since the image has
 them in `/bin`. It is Linux's split: a kernel image and the programs on the
 root filesystem, with `kernel.elf` playing the part of an initramfs for a
-machine with no disk. The image is 4 MiB in all by default (`--size N` for N
-blocks): the kernel takes about 300 blocks and the filesystem every block it
-leaves, so `size` is 4096 minus the kernel's blocks. A disk kernel that finds
+machine with no disk. The image's size is the one the spec gives (section 10,
+"Root image"; `--size N` for N blocks): the kernel takes about 300 blocks and
+the filesystem every block it leaves, so `size` is the image's blocks minus the
+kernel's. A disk kernel that finds
 no `/bin/sh` panics, having no programs of its own to fall back on.
 
 The kernel is not a file of the filesystem (`/boot/kernel`, say), for two

@@ -1,8 +1,8 @@
 //! Booting Camelot from its disk (issue #69, spec section 7, "Boot from disk"):
 //! the committed boot programs are what `cargo xtask boot` builds, and the root
 //! image of `cargo xtask fs`, made bootable, boots the kernel on Grail with no
-//! program, whose shell then runs programs from the disk's `/bin`. The image is
-//! 4 MiB and holds the disk kernel, which has no programs of its own (issue #108):
+//! program, whose shell then runs programs from the disk's `/bin`. The image
+//! (`xtask::fs::IMAGE_SIZE` blocks, the size the spec gives) holds the disk kernel, which has no programs of its own (issue #108):
 //! it boots in a machine of the default 4 MiB, and panics when there is no shell
 //! to run.
 
@@ -72,11 +72,10 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
     let plain = xtask::fs::build(&root, &opts).unwrap();
 
-    // 4 MiB in all: the filesystem, the same as without booting, and the disk
-    // kernel after it, as much of it as the bootloader loads (no symbols).
+    // IMAGE_SIZE blocks in all: the filesystem, the same as without booting, and
+    // the disk kernel after it, as much of it as the bootloader loads (no symbols).
     let size = xtask::fs::IMAGE_SIZE as usize;
     assert_eq!(image.len(), size * BSIZE);
-    assert_eq!(image.len(), 4 << 20);
     let loadable = boot::loadable(&kernel).unwrap();
     assert!(loadable.len() < kernel.len());
     assert_eq!(opts.size as usize, size - loadable.len().div_ceil(BSIZE));
@@ -313,4 +312,24 @@ fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     assert!(fs_doc.contains(&format!("| 0 | code ({} bytes) |", boot::MAX_BOOT_CODE)));
     assert_eq!(equ(&loader, "EXIT_BOOT_FAILED"), 0xfc);
     assert!(fs_doc.contains("exit code 0xFC"));
+}
+
+#[test]
+fn the_spec_gives_the_root_images_size() {
+    // The root image's size is xtask::fs::IMAGE_SIZE, and the spec says it in
+    // prose, once ("Root image"): every other document points there. The two
+    // must agree.
+    let spec = std::fs::read_to_string(repo_root().join("docs/excalibur-spec.md")).unwrap();
+    let mib = spec
+        .split("The image is **")
+        .nth(1)
+        .and_then(|rest| rest.split(" MiB in all**").next())
+        .expect("the spec's \"Root image\" says: The image is **N MiB in all**");
+    let blocks = xtask::fs::IMAGE_SIZE;
+    assert_eq!(
+        mib,
+        format!("{}", blocks / 1024),
+        "the spec says {mib} MiB, xtask::fs::IMAGE_SIZE is {blocks} blocks"
+    );
+    assert_eq!(blocks % 1024, 0, "a whole number of MiB");
 }

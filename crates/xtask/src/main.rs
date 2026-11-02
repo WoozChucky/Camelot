@@ -5,6 +5,8 @@ use std::process::ExitCode;
 use xtask::kernel::{Assembler, Build, Toolchain};
 use xtask::{examples, repo_root, tools};
 
+/// The usage text, with `{image_size}` where [`usage`] puts the root image's default
+/// size, from `xtask::fs::IMAGE_SIZE`, so the text cannot go stale.
 const USAGE: &str = "usage: cargo xtask <task> [options]
 
 tasks:
@@ -28,7 +30,7 @@ tasks:
                made bootable with kernel/boot/boot.s and kernel/kernel-disk.elf
                (grail --disk target/camelot-fs.img boots it, in the default 4 MiB of RAM)
                -o PATH: output file; --size N: the image's size in blocks (1 KiB each, default
-               4096: 4 MiB), the filesystem filling what the kernel leaves;
+               {image_size}), the filesystem filling what the kernel leaves;
                --no-boot: the filesystem alone, N blocks
   boot         build the boot ROM's disk loader (crates/grail/rom/diskboot.elf) and
                Camelot's bootloader (kernel/boot/boot.elf) with merlin-as + merlin-ld
@@ -50,6 +52,12 @@ kernel options:
   --run              run the result on Grail afterwards, with this terminal as its
                      console (type exit to stop it); exit with its exit code
   -v, --verbose      print each command (for merlin, its command-line equivalent)";
+
+/// [`USAGE`] with the default root image size filled in.
+fn usage() -> String {
+    let blocks = xtask::fs::IMAGE_SIZE;
+    USAGE.replace("{image_size}", &format!("{blocks}: {} MiB", blocks / 1024))
+}
 
 /// `--cc`: which C compiler builds the kernel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -178,7 +186,7 @@ fn main() -> ExitCode {
         Some("examples") => match parse_examples_args(&args[1..]) {
             Ok(e) => build_examples(e),
             Err(e) => {
-                eprintln!("xtask: {e}\n{USAGE}");
+                eprintln!("xtask: {e}\n{}", usage());
                 ExitCode::from(2)
             }
         },
@@ -186,21 +194,21 @@ fn main() -> ExitCode {
         {
             Ok(k) => kernel(k),
             Err(e) => {
-                eprintln!("xtask: {e}\n{USAGE}");
+                eprintln!("xtask: {e}\n{}", usage());
                 ExitCode::from(2)
             }
         },
         Some("fs") => match parse_fs_args(&args[1..]) {
             Ok(f) => build_fs(f),
             Err(e) => {
-                eprintln!("xtask: {e}\n{USAGE}");
+                eprintln!("xtask: {e}\n{}", usage());
                 ExitCode::from(2)
             }
         },
         Some("boot") => match parse_examples_args(&args[1..]) {
             Ok(e) if e.names.is_empty() => build_boot(e),
             Ok(_) | Err(_) => {
-                eprintln!("xtask: boot takes only --check and -v\n{USAGE}");
+                eprintln!("xtask: boot takes only --check and -v\n{}", usage());
                 ExitCode::from(2)
             }
         },
@@ -215,22 +223,22 @@ fn main() -> ExitCode {
                 hello(k)
             }
             Ok(_) => {
-                eprintln!("xtask: hello takes only --lld and -v\n{USAGE}");
+                eprintln!("xtask: hello takes only --lld and -v\n{}", usage());
                 ExitCode::from(2)
             }
             Err(e) => {
-                eprintln!("xtask: {e}\n{USAGE}");
+                eprintln!("xtask: {e}\n{}", usage());
                 ExitCode::from(2)
             }
         },
         Some("ld-fixtures") => match parse_kernel_args(&args[1..]) {
             Ok(k) if k.assembler.is_none() && k.cc.is_none() && k.out.is_none() && !k.run => ld_fixtures(k),
             Ok(_) => {
-                eprintln!("xtask: ld-fixtures takes only --clang, --lld and -v\n{USAGE}");
+                eprintln!("xtask: ld-fixtures takes only --clang, --lld and -v\n{}", usage());
                 ExitCode::from(2)
             }
             Err(e) => {
-                eprintln!("xtask: {e}\n{USAGE}");
+                eprintln!("xtask: {e}\n{}", usage());
                 ExitCode::from(2)
             }
         },
@@ -246,15 +254,15 @@ fn main() -> ExitCode {
             }
         },
         Some("-h" | "--help" | "help") => {
-            println!("{USAGE}");
+            println!("{}", usage());
             ExitCode::SUCCESS
         }
         Some(other) => {
-            eprintln!("xtask: unknown task {other}\n{USAGE}");
+            eprintln!("xtask: unknown task {other}\n{}", usage());
             ExitCode::from(2)
         }
         None => {
-            eprintln!("{USAGE}");
+            eprintln!("{}", usage());
             ExitCode::from(2)
         }
     }
@@ -616,7 +624,8 @@ mod tests {
     fn usage_descriptions_line_up() {
         // Every task's description, and every continuation line, starts in
         // the same column.
-        let tasks = USAGE
+        let usage = usage();
+        let tasks = usage
             .split("tasks:\n")
             .nth(1)
             .unwrap()

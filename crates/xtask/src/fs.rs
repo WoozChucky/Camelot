@@ -10,8 +10,8 @@
 //! after the filesystem, so Grail needs no program to run it. The disk kernel
 //! has no programs built in (the Linux way: the programs are on the root
 //! filesystem, and only `kernel/kernel.elf`, run without a disk, carries its own,
-//! as an initramfs would), so the whole system fits in a 4 MiB image
-//! ([`IMAGE_SIZE`]): the filesystem gets the blocks the kernel leaves.
+//! as an initramfs would), so the whole system fits in one image of
+//! [`IMAGE_SIZE`] blocks: the filesystem gets the blocks the kernel leaves.
 //!
 //! ```text
 //! cargo xtask fs
