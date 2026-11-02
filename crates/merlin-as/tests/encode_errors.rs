@@ -360,9 +360,51 @@ const CASES: &[(&str, &str, &str)] = &[
         "unknown instruction 'c.addi'",
     ),
     (
-        "lr.w a0, (a1)",
-        "A extension mnemonic (not in Excalibur)",
-        "unknown instruction 'lr.w'",
+        "amoadd.d a0, a1, (a2)",
+        "RV64-only A mnemonic",
+        "unknown instruction 'amoadd.d'",
+    ),
+    (
+        "amocas.w a0, a1, (a2)",
+        "Zacas mnemonic (not in Excalibur)",
+        "unknown instruction 'amocas.w'",
+    ),
+    (
+        "amoswap.w.rlaq a0, a1, (a2)",
+        "ordering suffix out of order",
+        "unknown instruction 'amoswap.w.rlaq'",
+    ),
+    (
+        "lr.w.aq.rl a0, (a1)",
+        "ordering suffix split in two",
+        "unknown instruction 'lr.w.aq.rl'",
+    ),
+    // A extension operands
+    (
+        "lr.w a0, 4(a1)",
+        "A instructions have no offset field",
+        "lr.w has no offset field: write the address as (rs1)",
+    ),
+    (
+        "amoadd.w.aqrl a0, a1, -4(a2)",
+        "A instructions have no offset field",
+        "amoadd.w.aqrl has no offset field",
+    ),
+    (
+        "sc.w a0, a1, a2",
+        "address given as a plain register",
+        "expected offset(register), found a register: sc.w takes its address as (rs1)",
+    ),
+    ("lr.w a0, a1, (a2)", "lr.w has no rs2", "usage: lr.w rd, (rs1)"),
+    (
+        "sc.w a0, (a1)",
+        "sc.w without its source register",
+        "usage: sc.w rd, rs2, (rs1)",
+    ),
+    (
+        "amoor.w.rl a0, 5, (a2)",
+        "rs2 must be a register",
+        "expected a register, found an immediate",
     ),
 ];
 
@@ -419,7 +461,7 @@ fn constants_used_before_their_equ_are_named() {
 /// An unknown mnemonic is named in the error.
 #[test]
 fn unknown_mnemonics_are_named() {
-    for m in ["frobnicate", "mulw", "c.addi", "lr.w"] {
+    for m in ["frobnicate", "mulw", "c.addi", "amoadd.d"] {
         let errs = merlin_as::assemble(&format!("    {m} a0, a1, a2\n")).unwrap_err();
         assert_eq!(errs[0].msg, format!("unknown instruction '{m}'"));
     }

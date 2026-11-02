@@ -1,7 +1,7 @@
     .text
 
-    # int fib(n): frame 16 bytes
-    #     -12(s0)  param n
+    # int fib(int n): frame 16 bytes
+    #     -12(s0)  param int n
     .globl fib
 fib:
     addi  sp, sp, -16
@@ -50,7 +50,7 @@ fib:
     addi  sp, sp, 16
     ret
 
-    # int main(): frame 16 bytes
+    # int main(void): frame 16 bytes
     .globl main
 main:
     addi  sp, sp, -16

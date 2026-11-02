@@ -1,6 +1,6 @@
 //! Checks the encoder against the shared decoder in `excalibur`, which Grail
 //! already runs riscv-tests with. Two independent checks, both independent of
-//! llvm-mc:
+//! LLVM:
 //!
 //! * `expected`: a hand-written table of source lines and the [`Inst`] values
 //!   `excalibur::decode` must give back for each word, plus the relocation
@@ -10,13 +10,13 @@
 //!   operation and operands of every mnemonic in the golden file.
 //! * `CLANG_WORDS`: lines the golden file doesn't have (every `.insn` form,
 //!   counter reads, short forms, `li` edges) must give clang's exact words.
-//! * `disasm`: every word llvm-mc produced for the golden file (plus a few
+//! * `disasm`: every word LLVM produced for the golden file (plus a few
 //!   more from clang), decoded and printed with the disassembler, must
 //!   assemble back to exactly that word. Proves the disassembler's syntax
 //!   reassembles, and catches bits `decode` ignores, like fence's pred/succ.
 //!   Words patched by a relocation are left out: their fields are zero.
 
-use excalibur::{decode, AluOp, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, StoreOp};
+use excalibur::{decode, AluOp, AmoOp, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, Ordering, StoreOp};
 use merlin_as::reloc::RelocKind;
 
 /// One word of `.text` and the relocation that will patch it, if any.
@@ -337,6 +337,35 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
         ("divu a0, a1, a2", vec![m(MulOp::Divu, A0, A1, A2)]),
         ("rem s2, s3, a0", vec![m(MulOp::Rem, S2, S3, A0)]),
         ("remu t0, t1, t2", vec![m(MulOp::Remu, T0, T1, T2)]),
+        // A: the address register is rs1, the source (sc.w and AMOs) rs2.
+        // Every mnemonic and suffix is in `roundtrip_atomics`.
+        (
+            "lr.w a0, (a1)",
+            vec![Lr {
+                rd: A0,
+                rs1: A1,
+                order: Ordering::NONE,
+            }],
+        ),
+        (
+            "sc.w.rl t0, t1, 0(t2)",
+            vec![Sc {
+                rd: T0,
+                rs1: T2,
+                rs2: T1,
+                order: Ordering { aq: false, rl: true },
+            }],
+        ),
+        (
+            "amomaxu.w.aq zero, a5, (sp)",
+            vec![Amo {
+                op: AmoOp::Maxu,
+                rd: ZERO,
+                rs1: SP,
+                rs2: A5,
+                order: Ordering { aq: true, rl: false },
+            }],
+        ),
         // System
         ("fence", vec![Fence { pred: 0xf, succ: 0xf }]),
         ("fence.i", vec![FenceI]),
@@ -421,7 +450,7 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
             "csrci sstatus, 2",
             vec![csr(CsrOp::Rc, ZERO, CsrSrc::Imm(2), 0x100)],
         ),
-        // Xcal (spec section 9), not in the llvm-mc golden file
+        // Xcal (spec section 9), not in the LLVM golden file
         ("xcal.dbg a0", vec![XcalDbg { rs1: A0 }]),
         ("xcal.dbg zero", vec![XcalDbg { rs1: ZERO }]),
         ("xcal.halt zero", vec![XcalHalt { rs1: ZERO }]),
@@ -848,6 +877,81 @@ fn roundtrip_expected() {
     rep.finish();
 }
 
+/// Every A mnemonic with every ordering suffix, with registers that vary per
+/// line, decodes to the instruction it names. The mnemonic-to-operation table
+/// here is the test's own.
+#[test]
+fn roundtrip_atomics() {
+    let mut rep = Report::new("A extension: decode(encode(x)) == x");
+    let amos = [
+        ("amoswap.w", AmoOp::Swap),
+        ("amoadd.w", AmoOp::Add),
+        ("amoxor.w", AmoOp::Xor),
+        ("amoand.w", AmoOp::And),
+        ("amoor.w", AmoOp::Or),
+        ("amomin.w", AmoOp::Min),
+        ("amomax.w", AmoOp::Max),
+        ("amominu.w", AmoOp::Minu),
+        ("amomaxu.w", AmoOp::Maxu),
+    ];
+    let orders = [
+        ("", false, false),
+        (".aq", true, false),
+        (".rl", false, true),
+        (".aqrl", true, true),
+    ];
+    let name = |r: u8| excalibur::reg::abi_name(r);
+    let mut n = 0u8;
+    for base in ["lr.w", "sc.w"].into_iter().chain(amos.iter().map(|a| a.0)) {
+        for (suffix, aq, rl) in orders {
+            // Spread the registers over all 32 (rd, rs1 and rs2 differ).
+            let (rd, rs1, rs2) = (n % 32, (n + 11) % 32, (n + 23) % 32);
+            n += 5;
+            let order = Ordering { aq, rl };
+            let (src, want) = match base {
+                "lr.w" => (
+                    format!("lr.w{suffix} {}, ({})", name(rd), name(rs1)),
+                    Inst::Lr { rd, rs1, order },
+                ),
+                "sc.w" => (
+                    format!("sc.w{suffix} {}, {}, ({})", name(rd), name(rs2), name(rs1)),
+                    Inst::Sc { rd, rs1, rs2, order },
+                ),
+                _ => {
+                    let op = amos.iter().find(|a| a.0 == base).unwrap().1;
+                    (
+                        format!("{base}{suffix} {}, {}, ({})", name(rd), name(rs2), name(rs1)),
+                        Inst::Amo {
+                            op,
+                            rd,
+                            rs1,
+                            rs2,
+                            order,
+                        },
+                    )
+                }
+            };
+            rep.total += 1;
+            match assemble(&src) {
+                Ok(words) if words.len() == 1 && decode(words[0].word) == want => {
+                    // And the disassembly is the source back.
+                    let text = decode(words[0].word).to_string();
+                    if text != src {
+                        rep.fails.push(format!("  {src:<36} disassembles to '{text}'"));
+                    }
+                }
+                Ok(words) => {
+                    let got: Vec<Inst> = words.iter().map(|w| decode(w.word)).collect();
+                    rep.fails.push(format!("  {src:<36} got {got:?}, want {want:?}"));
+                }
+                Err(e) => rep.fails.push(format!("  {src:<36} error: {e}")),
+            }
+        }
+    }
+    assert_eq!(rep.total, 44);
+    rep.finish();
+}
+
 // ----- exact words from clang -----
 
 /// Lines not in the golden file, with the words clang 21.1.5 gives for each
@@ -917,7 +1021,7 @@ fn matches_clang_words() {
 
 // ----- decode → disassemble → assemble again -----
 
-/// Each golden line with llvm-mc's words for it, leaving out the words a
+/// Each golden line with LLVM's words for it, leaving out the words a
 /// relocation patches (their fields are zero, so they don't disassemble back
 /// to the source). Lines left with no words are dropped.
 fn golden_words() -> Vec<(&'static str, Vec<u32>)> {

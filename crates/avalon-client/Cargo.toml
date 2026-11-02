@@ -1,0 +1,12 @@
+[package]
+name = "avalon-client"
+description = "The client side of the Avalon platform: VM control (Avalon) and disk management (Lake), shared by Round Table and Pendragon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+avalon-proto = { path = "../avalon-proto" }
+# The --ram and --clock syntax (one parser for every front end), and the sysinfo
+# device type codes.
+grail = { path = "../grail" }

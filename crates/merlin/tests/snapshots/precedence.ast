@@ -1,85 +1,85 @@
-Function main() <4:5>
-  Local #0 r <5:9>
+Function int main(void) <4:5>
+  Local #0 int r <5:9>
   Decl <5:5>
-    Var r #0 <5:9>
-      Num 0 <5:13>
+    Var int r #0 <5:9>
+      Num 0 : int <5:13>
   ExprStmt <6:5>
-    Assign <6:7>
-      Var r #0 <6:5>
-      Binary + <6:11>
-        Var r #0 <6:9>
-        Binary == <6:24>
-          Binary + <6:16>
-            Num 2 <6:14>
-            Binary * <6:20>
-              Num 3 <6:18>
-              Num 4 <6:22>
-          Num 14 <6:27>
+    Assign : int <6:7>
+      Var r #0 : int <6:5>
+      Binary + : int <6:11>
+        Var r #0 : int <6:9>
+        Binary == : int <6:24>
+          Binary + : int <6:16>
+            Num 2 : int <6:14>
+            Binary * : int <6:20>
+              Num 3 : int <6:18>
+              Num 4 : int <6:22>
+          Num 14 : int <6:27>
   ExprStmt <7:5>
-    Assign <7:7>
-      Var r #0 <7:5>
-      Binary + <7:11>
-        Var r #0 <7:9>
-        Binary * <7:15>
-          Num 2 <7:13>
-          Binary == <7:29>
-            Binary - <7:25>
-              Binary - <7:21>
-                Num 10 <7:18>
-                Num 4 <7:23>
-              Num 3 <7:27>
-            Num 3 <7:32>
+    Assign : int <7:7>
+      Var r #0 : int <7:5>
+      Binary + : int <7:11>
+        Var r #0 : int <7:9>
+        Binary * : int <7:15>
+          Num 2 : int <7:13>
+          Binary == : int <7:29>
+            Binary - : int <7:25>
+              Binary - : int <7:21>
+                Num 10 : int <7:18>
+                Num 4 : int <7:23>
+              Num 3 : int <7:27>
+            Num 3 : int <7:32>
   ExprStmt <8:5>
-    Assign <8:7>
-      Var r #0 <8:5>
-      Binary + <8:11>
-        Var r #0 <8:9>
-        Binary * <8:15>
-          Num 4 <8:13>
-          Binary == <8:29>
-            Binary / <8:25>
-              Binary / <8:21>
-                Num 64 <8:18>
-                Num 4 <8:23>
-              Num 2 <8:27>
-            Num 8 <8:32>
+    Assign : int <8:7>
+      Var r #0 : int <8:5>
+      Binary + : int <8:11>
+        Var r #0 : int <8:9>
+        Binary * : int <8:15>
+          Num 4 : int <8:13>
+          Binary == : int <8:29>
+            Binary / : int <8:25>
+              Binary / : int <8:21>
+                Num 64 : int <8:18>
+                Num 4 : int <8:23>
+              Num 2 : int <8:27>
+            Num 8 : int <8:32>
   ExprStmt <9:5>
-    Assign <9:7>
-      Var r #0 <9:5>
-      Binary + <9:11>
-        Var r #0 <9:9>
-        Binary * <9:15>
-          Num 8 <9:13>
-          Binary == <9:24>
-            Binary < <9:20>
-              Num 1 <9:18>
-              Num 2 <9:22>
-            Num 1 <9:27>
+    Assign : int <9:7>
+      Var r #0 : int <9:5>
+      Binary + : int <9:11>
+        Var r #0 : int <9:9>
+        Binary * : int <9:15>
+          Num 8 : int <9:13>
+          Binary == : int <9:24>
+            Binary < : int <9:20>
+              Num 1 : int <9:18>
+              Num 2 : int <9:22>
+            Num 1 : int <9:27>
   ExprStmt <10:5>
-    Assign <10:7>
-      Var r #0 <10:5>
-      Binary + <10:11>
-        Var r #0 <10:9>
-        Binary * <10:16>
-          Num 16 <10:13>
-          Binary || <10:21>
-            Num 1 <10:19>
-            Binary && <10:26>
-              Num 0 <10:24>
-              Num 0 <10:29>
+    Assign : int <10:7>
+      Var r #0 : int <10:5>
+      Binary + : int <10:11>
+        Var r #0 : int <10:9>
+        Binary * : int <10:16>
+          Num 16 : int <10:13>
+          Binary || : int <10:21>
+            Num 1 : int <10:19>
+            Binary && : int <10:26>
+              Num 0 : int <10:24>
+              Num 0 : int <10:29>
   ExprStmt <11:5>
-    Assign <11:7>
-      Var r #0 <11:5>
-      Binary + <11:11>
-        Var r #0 <11:9>
-        Binary * <11:16>
-          Num 32 <11:13>
-          Binary < <11:29>
-            Binary - <11:21>
-              Num 7 <11:19>
-              Binary * <11:25>
-                Num 2 <11:23>
-                Num 3 <11:27>
-            Num 0 <11:31>
+    Assign : int <11:7>
+      Var r #0 : int <11:5>
+      Binary + : int <11:11>
+        Var r #0 : int <11:9>
+        Binary * : int <11:16>
+          Num 32 : int <11:13>
+          Binary < : int <11:29>
+            Binary - : int <11:21>
+              Num 7 : int <11:19>
+              Binary * : int <11:25>
+                Num 2 : int <11:23>
+                Num 3 : int <11:27>
+            Num 0 : int <11:31>
   Return <12:5>
-    Var r #0 <12:12>
+    Var r #0 : int <12:12>

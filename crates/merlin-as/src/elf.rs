@@ -14,10 +14,10 @@
 use crate::asm::{Object, SectionKind, SymType};
 
 /// The ISA merlin-as assembles, in the psABI's `Tag_RISCV_arch` spelling:
-/// exactly what clang writes for `-march=rv32im_zicsr_zifencei` (M implies
-/// Zmmul). Without it llvm-objdump assumes plain RV32I and prints the M
-/// instructions as `<unknown>`.
-pub const ARCH: &str = "rv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0";
+/// exactly what clang writes for `-march=rv32ima_zicsr_zifencei` (M implies
+/// Zmmul, A implies Zaamo and Zalrsc). Without it llvm-objdump assumes plain
+/// RV32I and prints the M and A instructions as `<unknown>`.
+pub const ARCH: &str = "rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0";
 
 const SHT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 const SHT_PROGBITS: u32 = 1;
@@ -299,9 +299,10 @@ mod tests {
     #[test]
     fn attributes_match_clang() {
         // `llvm-objdump -s -j .riscv.attributes` of examples/hello/hello.S
-        // built by clang 21 with -march=rv32im_zicsr_zifencei.
-        let clang = "413c0000 00726973 63760001 32000000 05727633 32693270 315f6d32 70305f7a \
-                     69637372 3270305f 7a696665 6e636569 3270305f 7a6d6d75 6c317030 00";
+        // built by clang 21 with -march=rv32ima_zicsr_zifencei.
+        let clang = "41540000 00726973 63760001 4a000000 05727633 32693270 315f6d32 70305f61 \
+                     3270315f 7a696373 72327030 5f7a6966 656e6365 69327030 5f7a6d6d 756c3170 \
+                     305f7a61 616d6f31 70305f7a 616c7273 63317030 00";
         let hex: String = clang.split_whitespace().collect();
         let bytes: Vec<u8> = (0..hex.len())
             .step_by(2)

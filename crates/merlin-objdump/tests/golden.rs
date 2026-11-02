@@ -122,6 +122,7 @@ const CASES: &[(&str, &str, &[&str])] = &[
         "tests/riscv-tests/rv32si-p-dirty",
         &["-d", "-x"],
     ),
+    ("rv32ua-p-lrsc.d", "tests/riscv-tests/rv32ua-p-lrsc", &["-d"]),
 ];
 
 fn root() -> &'static Path {

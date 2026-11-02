@@ -152,6 +152,9 @@ impl RegState {
             | Inst::OpImm { rd, .. }
             | Inst::Op { rd, .. }
             | Inst::Mul { rd, .. }
+            | Inst::Lr { rd, .. }
+            | Inst::Sc { rd, .. }
+            | Inst::Amo { rd, .. }
             | Inst::Csr { rd, .. } => self.set(rd, None),
             _ => {}
         }

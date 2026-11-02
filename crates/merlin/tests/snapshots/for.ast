@@ -1,75 +1,75 @@
-Function main() <3:5>
-  Local #0 sum <4:9>
-  Local #1 i <5:14>
-  Local #2 j <7:9>
+Function int main(void) <3:5>
+  Local #0 int sum <4:9>
+  Local #1 int i <5:14>
+  Local #2 int j <7:9>
   Decl <4:5>
-    Var sum #0 <4:9>
-      Num 0 <4:15>
+    Var int sum #0 <4:9>
+      Num 0 : int <4:15>
   For <5:5>
     Decl <5:10>
-      Var i #1 <5:14>
-        Num 0 <5:18>
-    Binary < <5:23>
-      Var i #1 <5:21>
-      Num 10 <5:25>
-    Assign <5:31>
-      Var i #1 <5:29>
-      Binary + <5:35>
-        Var i #1 <5:33>
-        Num 1 <5:37>
+      Var int i #1 <5:14>
+        Num 0 : int <5:18>
+    Binary < : int <5:23>
+      Var i #1 : int <5:21>
+      Num 10 : int <5:25>
+    Assign : int <5:31>
+      Var i #1 : int <5:29>
+      Binary + : int <5:35>
+        Var i #1 : int <5:33>
+        Num 1 : int <5:37>
     ExprStmt <6:9>
-      Assign <6:13>
-        Var sum #0 <6:9>
-        Binary + <6:19>
-          Var sum #0 <6:15>
-          Var i #1 <6:21>
+      Assign : int <6:13>
+        Var sum #0 : int <6:9>
+        Binary + : int <6:19>
+          Var sum #0 : int <6:15>
+          Var i #1 : int <6:21>
   Decl <7:5>
-    Var j #2 <7:9>
+    Var int j #2 <7:9>
   For <8:5>
     ExprStmt <8:10>
-      Assign <8:12>
-        Var j #2 <8:10>
-        Num 0 <8:14>
-    Binary < <8:19>
-      Var j #2 <8:17>
-      Num 5 <8:21>
-    Assign <8:26>
-      Var j #2 <8:24>
-      Binary + <8:30>
-        Var j #2 <8:28>
-        Num 1 <8:32>
+      Assign : int <8:12>
+        Var j #2 : int <8:10>
+        Num 0 : int <8:14>
+    Binary < : int <8:19>
+      Var j #2 : int <8:17>
+      Num 5 : int <8:21>
+    Assign : int <8:26>
+      Var j #2 : int <8:24>
+      Binary + : int <8:30>
+        Var j #2 : int <8:28>
+        Num 1 : int <8:32>
     Block <8:35>
       ExprStmt <9:9>
-        Assign <9:13>
-          Var sum #0 <9:9>
-          Binary + <9:19>
-            Var sum #0 <9:15>
-            Binary * <9:23>
-              Var j #2 <9:21>
-              Num 2 <9:25>
+        Assign : int <9:13>
+          Var sum #0 : int <9:9>
+          Binary + : int <9:19>
+            Var sum #0 : int <9:15>
+            Binary * : int <9:23>
+              Var j #2 : int <9:21>
+              Num 2 : int <9:25>
   For <11:5>
     NoInit <11:5>
     NoCond <11:5>
     NoStep <11:5>
     Block <11:14>
       ExprStmt <12:9>
-        Assign <12:13>
-          Var sum #0 <12:9>
-          Binary + <12:19>
-            Var sum #0 <12:15>
-            Var j #2 <12:21>
+        Assign : int <12:13>
+          Var sum #0 : int <12:9>
+          Binary + : int <12:19>
+            Var sum #0 : int <12:15>
+            Var j #2 : int <12:21>
       ExprStmt <13:9>
-        Assign <13:11>
-          Var j #2 <13:9>
-          Binary + <13:15>
-            Var j #2 <13:13>
-            Num 1 <13:17>
+        Assign : int <13:11>
+          Var j #2 : int <13:9>
+          Binary + : int <13:15>
+            Var j #2 : int <13:13>
+            Num 1 : int <13:17>
       If <14:9>
-        Binary == <14:15>
-          Var j #2 <14:13>
-          Num 10 <14:18>
+        Binary == : int <14:15>
+          Var j #2 : int <14:13>
+          Num 10 : int <14:18>
         Break <15:13>
   Return <17:5>
-    Binary - <17:16>
-      Var sum #0 <17:12>
-      Num 0 <17:18>
+    Binary - : int <17:16>
+      Var sum #0 : int <17:12>
+      Num 0 : int <17:18>
