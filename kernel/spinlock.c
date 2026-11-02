@@ -20,6 +20,7 @@ u32 cpuid(void) {
 void cpu_init(void) {
     struct cpu *c = mycpu();
     c->proc = NULL;
+    c->thread = NULL;
     c->noff = 0;
     c->intena = 0;
     c->hartid = cpuid();

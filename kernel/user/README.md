@@ -155,6 +155,8 @@ shd: [7] 10.0.2.2:49152 ended, exit 0
 | `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |
 | `filetest` | checks the file system calls on a writable root filesystem (`filetest: N checks, 0 failed`) |
 | `stress` | many processes at once: pages, the console, a shared pipe and files under timer preemption (`stress: W workers, R rounds, N bytes: ok`) |
+| `threads` | `threads [THREADS [ROUNDS]]`: THREADS threads (4, at most 8) of one process each add 1 to a counter ROUNDS (500) times under a mutex, and to another under a spinlock, by reading, working and writing back, which loses updates without the lock; then joins them and checks both totals (`threads: T threads, R rounds: counter N, spun N: ok`) |
+| `threadtest` | checks the thread and futex calls, their results and their errors, the library's locks and `malloc` from several threads, and processes with threads that `exit`, `exec`, fault or are killed (`threadtest: N checks, 0 failed`); `threadtest fs`, on the root filesystem, the same while threads are in file calls (`threadtest fs: N checks, 0 failed`) |
 | `primes` | `primes [WORKERS [LIMIT]]`: counts the primes below LIMIT (20000) with WORKERS (4, at most 6) processes at once, one slice of the range each, to keep several harts busy (`primes: N below LIMIT, W workers`) |
 | `libtest` | checks the C library (`libtest: N checks, 0 failed`) |
 | `nettest` | moves known bytes through TCP: `nettest connect ADDR PORT BYTES [TIMES]` sends a pattern and reads to the end, `nettest serve PORT CONNECTIONS [BACKLOG]` echoes what each connection sends; each prints the bytes' counts and FNV-1a hash (the TCP tests' program) |
@@ -169,4 +171,5 @@ what it printed and what it left on the disk. The network programs' tests
 are `crates/grail/tests/kernel_net.rs`, `kernel_tcp.rs`,
 `kernel_sockets.rs` and `kernel_shd.rs` (shd: sessions side by side, one
 asleep while the others and the console work, hang-ups, the limit, nothing
-left behind), and `crates/avalon/tests/sockets.rs`.
+left behind), and `crates/avalon/tests/sockets.rs`; the threads' are
+`crates/xtask/tests/threads.rs`.

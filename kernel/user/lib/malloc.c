@@ -8,7 +8,11 @@
  * malloc takes the first free block that is big enough (first fit), cutting
  * what it needs off its end; when none is, it asks sbrk for more, at least
  * a page at a time, and frees that into the list. Memory never goes back to
- * the kernel. */
+ * the kernel.
+ *
+ * The threads of a process share the heap, so malloc and free hold a mutex
+ * (mutex.c) while they walk and change the list. It costs one atomic
+ * instruction each way when there is only one thread. */
 #include "../user.h"
 
 /* 8 bytes: a pointer and a size, which is also the alignment every block
@@ -27,11 +31,10 @@ struct header {
  * stopped, the next one starts there. */
 static struct header base;
 static struct header *freep;
+static struct mutex heap_lock;
 
-void free(void *p) {
-    if (p == NULL) {
-        return;
-    }
+/* free(), with heap_lock held. */
+static void free_locked(void *p) {
     struct header *b = (struct header *)p - 1;
     /* The free block f with f < b < f->next, or at an end of the ring. */
     struct header *f = freep;
@@ -57,6 +60,15 @@ void free(void *p) {
     freep = f;
 }
 
+void free(void *p) {
+    if (p == NULL) {
+        return;
+    }
+    mutex_lock(&heap_lock);
+    free_locked(p);
+    mutex_unlock(&heap_lock);
+}
+
 /* Grows the heap by at least `units` and puts the new block on the free
  * list. Returns the list, or NULL when sbrk fails. */
 static struct header *more(uint units) {
@@ -72,7 +84,7 @@ static struct header *more(uint units) {
     }
     struct header *b = (struct header *)got;
     b->units = units;
-    free(b + 1);
+    free_locked(b + 1);
     return freep;
 }
 
@@ -82,6 +94,7 @@ void *malloc(size_t n) {
     }
     /* The header, and n bytes rounded up to whole units. */
     uint units = (uint)((n + UNIT - 1) / UNIT) + 1;
+    mutex_lock(&heap_lock);
     if (freep == NULL) {
         base.next = &base;
         base.units = 0;
@@ -99,12 +112,14 @@ void *malloc(size_t n) {
                 b->units = units;
             }
             freep = prev;
+            mutex_unlock(&heap_lock);
             return b + 1;
         }
         if (b == freep) {
             /* Round the whole list: nothing big enough. */
             b = more(units);
             if (b == NULL) {
+                mutex_unlock(&heap_lock);
                 return NULL;
             }
         }

@@ -17,7 +17,12 @@
  * -ENOTSOCK for one that is not a socket), then the pointers (-EFAULT),
  * then everything else. A call that waits (accept, connect, send and recv
  * on a full or empty buffer) sleeps in net_sleep() and gives up with
- * -EINTR as soon as the process is killed. */
+ * -EINTR as soon as the process is killed.
+ *
+ * Another thread of the process may close the descriptor while a call
+ * sleeps: fd_sock() takes a reference to the open file, so that the socket
+ * stays, and leaves it in the thread's `net_file` for syscall() to let go
+ * of once net_lock is free (the last close takes net_lock). */
 #include "file.h"
 #include "net.h"
 #include "proc.h"
@@ -48,11 +53,17 @@ static struct socket *sock_alloc(u32 type) {
 /* The socket behind descriptor `fd` of the current process; NULL with *err
  * -EBADF (not an open descriptor) or -ENOTSOCK (not a socket). */
 static struct socket *fd_sock(u32 fd, int *err) {
-    struct file *f = fd < NOFILE ? myproc()->ofile[fd] : NULL;
+    struct file *f = fd_get(fd);
     if (f == NULL) {
         *err = -EBADF;
         return NULL;
     }
+    /* One per call: syscall() closes it. */
+    struct thread *t = mythread();
+    if (t->net_file != NULL) {
+        panic("fd_sock: twice in one call");
+    }
+    t->net_file = f;
     if (f->type != FD_SOCKET) {
         *err = -ENOTSOCK;
         return NULL;
@@ -60,16 +71,23 @@ static struct socket *fd_sock(u32 fd, int *err) {
     return f->sock;
 }
 
-/* The lowest free descriptor of the current process, or -EMFILE. Nothing
- * else can take it before the caller does: a process is one thread. */
-static int fd_free(void) {
-    struct proc *p = myproc();
-    for (u32 fd = 0; fd < NOFILE; fd++) {
-        if (p->ofile[fd] == NULL) {
-            return (int)fd;
+/* Gives socket file `f` (all set up, with socket `s`) a descriptor: the
+ * descriptor, or -EMFILE if another thread took the last free one since
+ * the caller checked (fd_available()); then the socket is closed again,
+ * here, since net_lock is held, and the file goes. */
+static int sock_install(struct file *f, struct socket *s) {
+    int fd = fd_install(f);
+    if (fd < 0) {
+        if (s->type == SOCK_STREAM) {
+            tcp_close(s->tcp);
+        } else if (s->udp != NULL) {
+            udp_close(s->udp);
         }
+        s->type = 0;
+        f->type = FD_NONE; /* so fileclose() just gives the slot back */
+        fileclose(f);
     }
-    return -EMFILE;
+    return fd;
 }
 
 /* Makes `f` the socket file of `s`, readable and writable. */
@@ -99,14 +117,17 @@ static int get_addr(u32 uaddr, u32 *addr, u32 *port) {
 }
 
 /* Stores `addr`:`port` (host order) as a struct sockaddr_in at `uaddr`,
- * which the caller has checked. */
-static void put_addr(u32 uaddr, u32 addr, u32 port) {
+ * which the caller has checked. 0, or -EFAULT if another thread of the
+ * process has unmapped it since (sbrk). accept and recvfrom, which have
+ * taken a connection or a datagram by then, still return it: the address
+ * is lost, as it would be on a bad pointer the check missed. */
+static int put_addr(u32 uaddr, u32 addr, u32 port) {
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     put16((u8 *)&a.sin_port, port);
     put32((u8 *)&a.sin_addr, addr);
-    copyout(user_pt(), uaddr, &a, sizeof a);
+    return copyout(user_pt(), uaddr, &a, sizeof a) == 0 ? 0 : -EFAULT;
 }
 
 /* Whether `uaddr` can take a struct sockaddr_in (0, for the calls where it
@@ -262,9 +283,8 @@ int sock_sys_socket(u32 domain, u32 type, u32 protocol) {
     if (!netif.present) {
         return -ENODEV;
     }
-    int fd = fd_free();
-    if (fd < 0) {
-        return fd;
+    if (!fd_available()) {
+        return -EMFILE;
     }
     struct file *f = filealloc();
     if (f == NULL) {
@@ -281,8 +301,7 @@ int sock_sys_socket(u32 domain, u32 type, u32 protocol) {
         }
     }
     sock_file(f, s);
-    myproc()->ofile[fd] = f;
-    return fd;
+    return sock_install(f, s);
 }
 
 int sock_sys_bind(u32 fd, u32 uaddr) {
@@ -348,9 +367,8 @@ int sock_sys_accept(u32 fd, u32 uaddr) {
     }
     /* The descriptor and the open file first, so a connection is never
      * taken off the backlog only to be dropped for want of them. */
-    int nfd = fd_free();
-    if (nfd < 0) {
-        return nfd;
+    if (!fd_available()) {
+        return -EMFILE;
     }
     struct file *f = filealloc();
     if (f == NULL) {
@@ -364,14 +382,17 @@ int sock_sys_accept(u32 fd, u32 uaddr) {
     struct socket *ns = sock_alloc(SOCK_STREAM);
     ns->tcp = c;
     sock_file(f, ns);
-    myproc()->ofile[nfd] = f;
+    int nfd = sock_install(f, ns);
+    if (nfd < 0) {
+        return nfd;
+    }
     if (uaddr != 0) {
         u32 laddr;
         u32 lport;
         u32 raddr;
         u32 rport;
         tcp_ends(c, &laddr, &lport, &raddr, &rport);
-        put_addr(uaddr, raddr, rport);
+        (void)put_addr(uaddr, raddr, rport);
     }
     return nfd;
 }
@@ -450,7 +471,7 @@ int sock_sys_recvfrom(u32 fd, u32 ubuf, u32 len, u32 uaddr) {
     u32 port = 0;
     int n = sock_recv(s, ubuf, len, &addr, &port);
     if (n >= 0 && uaddr != 0) {
-        put_addr(uaddr, addr, port);
+        (void)put_addr(uaddr, addr, port);
     }
     return n;
 }
@@ -519,11 +540,9 @@ int sock_sys_name(u32 fd, u32 uaddr, bool peer) {
         if (raddr == 0) {
             return -ENOTCONN;
         }
-        put_addr(uaddr, raddr, rport);
-    } else {
-        put_addr(uaddr, laddr, lport);
+        return put_addr(uaddr, raddr, rport);
     }
-    return 0;
+    return put_addr(uaddr, laddr, lport);
 }
 
 int sock_sys_setsockopt(u32 fd, u32 level, u32 option, u32 uvalue, u32 len) {

@@ -106,8 +106,10 @@ static int sys_procs(struct trap_frame *f) {
     struct procinfo info[NPROC];
     int n = proc_list(info, max < NPROC ? (int)max : NPROC);
     u32 filled = (u32)n < max ? (u32)n : max;
-    /* Checked above. */
-    copyout(pt, buf, info, filled * sizeof(struct procinfo));
+    /* Checked above, but another thread may have unmapped it since. */
+    if (copyout(pt, buf, info, filled * sizeof(struct procinfo)) != 0) {
+        return -EFAULT;
+    }
     return n;
 }
 
@@ -122,8 +124,10 @@ static int sys_harts(struct trap_frame *f) {
     struct hartinfo info[NCPU];
     int n = proc_harts(info, max < NCPU ? (int)max : NCPU);
     u32 filled = (u32)n < max ? (u32)n : max;
-    /* Checked above. */
-    copyout(pt, buf, info, filled * sizeof(struct hartinfo));
+    /* Checked above, but another thread may have unmapped it since. */
+    if (copyout(pt, buf, info, filled * sizeof(struct hartinfo)) != 0) {
+        return -EFAULT;
+    }
     return n;
 }
 
@@ -266,12 +270,39 @@ void syscall(struct trap_frame *f) {
     case SYS_harts:
         ret = sys_harts(f);
         break;
+    case SYS_thread_create:
+        ret = thread_create(arg(f, 0), arg(f, 1), arg(f, 2));
+        break;
+    case SYS_thread_exit:
+        thread_exit((int)arg(f, 0));
+        ret = 0; /* not reached */
+        break;
+    case SYS_thread_join:
+        ret = thread_join((int)arg(f, 0), arg(f, 1));
+        break;
+    case SYS_gettid:
+        ret = (int)mythread()->tid;
+        break;
+    case SYS_futex_wait:
+        ret = futex_wait(arg(f, 0), arg(f, 1));
+        break;
+    case SYS_futex_wake:
+        ret = futex_wake(arg(f, 0), (i32)arg(f, 1));
+        break;
     default:
         ret = -ENOSYS;
         break;
     }
     if (net) {
         release(&net_lock);
+        /* Closing the socket's file takes net_lock, if this was its last
+         * reference (another thread closed the descriptor meanwhile). */
+        struct thread *t = mythread();
+        if (t->net_file != NULL) {
+            struct file *file = t->net_file;
+            t->net_file = NULL;
+            fileclose(file);
+        }
     }
     f->regs[REG_A0] = (u32)ret;
 }

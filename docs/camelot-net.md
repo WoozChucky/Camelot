@@ -195,9 +195,10 @@ checksum, or fewer than 8 bytes, counts in `icmp`.
 
 The sending side is `icmp_ping(dst, id, seq, timeout, reply)`: an echo
 request with 56 bytes of data (`PING_DATA`, 64 bytes of ICMP) and the
-process waits in a slot (one per process) for the reply with the same
-identifier and sequence number. The `ping` system call uses the caller's pid
-as the identifier, so two processes' pings never mix, and a one-second
+thread waits in a slot (one per thread) for the reply with the same
+identifier and sequence number. The `ping` system call uses the caller's tid
+as the identifier (a single-threaded process's tid is its pid), so two
+threads' pings never mix, and a one-second
 timeout. The round-trip time comes from the CLINT's `mtime` and is reported
 in microseconds.
 

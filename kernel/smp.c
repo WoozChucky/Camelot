@@ -32,12 +32,14 @@
  * side's store must be seen before its own load, or both could read the old
  * values (the requester skips the hart, which keeps the old PTE), so a full
  * fence sits in between on both sides: here, and in the scheduler and exec
- * (proc.c). Until
- * processes have threads (#64), a process's page table is in use on one
- * hart only, its own, so a user page table never needs another hart; the
- * kernel page table, in every hart's satp, always does. Grail has no TLB at
- * all, so on it every sfence.vma is free, but the protocol is what real
- * hardware needs. */
+ * (proc.c). A process's threads share its page table, and run on any hart,
+ * several at once (spec section 10, "Kernel threads"): so a user page table
+ * may be in the satp of several harts, and a shootdown of it (sbrk freeing
+ * heap pages) reaches each of them, while the harts running other
+ * processes are left alone. The kernel page table, in every hart's satp
+ * (its second-level tables are in every process's), always reaches every
+ * hart. Grail has no TLB at all, so on it every sfence.vma is free, but the
+ * protocol is what real hardware needs. */
 #include "smp.h"
 #include "kalloc.h"
 #include "kprintf.h"

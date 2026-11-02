@@ -11,7 +11,7 @@ together.
 |---|---|
 | `string.c` | `strlen`, `strcmp`, `strncmp`, `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`, `memmove`, `memcmp` |
 | `stdlib.c` | `atoi`, `strtol` (bases 2 to 36, or 0 for C's prefixes; out of range gives `LONG_MAX` or `LONG_MIN`) |
-| `malloc.c` | `malloc`, `free`, `calloc`, `realloc` on top of `sbrk` |
+| `malloc.c` | `malloc`, `free`, `calloc`, `realloc` on top of `sbrk`, under a mutex |
 | `printf.c` | `printf`, `fprintf` (to a descriptor), `snprintf`, `puts` |
 | `getline.c` | `getline` (a console line from stdin), `reader_init` and `reader_getline` (lines from any descriptor) |
 | `strerror.c` | `strerror`: a short message for each error number |
@@ -19,6 +19,9 @@ together.
 | `spin.c` | `spin`: a busy loop, for tests that need CPU time |
 | `inet.c` | `htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`, `inet_addr`, `inet_ntoa`, `sockaddr_set`: addresses and byte order |
 | `resolve.c` | `resolve`: a host's address, from its text or by a DNS query (RFC 1035) to the server the network gave; `resolve_error` |
+| `atomic.s` | `atomic_swap`, `atomic_add`, `atomic_cas`, `atomic_load`, `atomic_store`; `spin_lock`, `spin_unlock` |
+| `mutex.c` | `mutex_lock`, `mutex_trylock`, `mutex_unlock`: a mutex that sleeps on a futex |
+| `thread.s` | `thread_start`: a C function in a new thread |
 
 ## How programs get it
 
@@ -102,9 +105,55 @@ Two ways, for two kinds of input:
 while free, the next free block), so every block is 8-byte aligned. The
 free blocks form a ring in address order, through a dummy block of size 0;
 `malloc` walks it from where the last search stopped and takes the first
-block big enough, cutting the request off its end. `free` puts a block back
+block big enough, cutting the request off its end. The threads of a
+process share the heap, so `malloc` and `free` hold a mutex while they walk
+and change the ring (`realloc` and `calloc` go through them), which costs
+one atomic instruction each way when no other thread wants it. `free` puts a block back
 in its place in the ring and merges it with a free neighbour on either side,
 so freeing everything gives the heap back as one block. When no block is
 big enough, `malloc` grows the heap with `sbrk`, by at least a page, and
 frees the new memory into the ring. Nothing is ever given back to the
 kernel: the heap goes when the program exits.
+
+## Threads
+
+A program starts more threads with `thread_start(fn, arg, stack, size)`
+(`thread.s`): `fn(arg)` runs in a new thread on the `size` bytes at
+`stack`, which the caller provides (static, or from `malloc`) and must keep
+until the thread has ended, and what `fn` returns is the status
+`thread_join` collects. The `thread_create` system call itself starts a
+thread at an address with every register but `sp` and `a0` zero, `ra`
+included, so the code it starts must never return; `thread_start` writes
+`fn` and `arg` at the top of the new stack and starts the thread at
+`thread_entry`, which loads them, calls `fn` and passes its result to
+`thread_exit`.
+
+Threads that share data need the atomics of `atomic.s`. Each is one
+indivisible step on an aligned word (`amoswap.w`, `amoadd.w`, or an
+`lr.w`/`sc.w` loop for the compare-and-swap) with both `aq` and `rl` set,
+or fences around a plain load, so they are also ordered against the
+caller's other loads and stores: what a thread wrote before an atomic is
+seen by a thread that sees the atomic's effect (RVWMO, the ISA's memory
+model, would otherwise let another hart see them in a different order).
+merlin has no inline assembly, so they are functions.
+
+Two locks are built on them:
+
+- `struct spinlock` (`spin_lock`, `spin_unlock`): `amoswap.w.aq` of a 1
+  until a 0 comes back, reading the word in between so that waiting
+  threads don't keep writing it; `amoswap.w.rl` of 0 to unlock. A thread
+  waiting for a spinlock uses its whole time slice, so it suits only
+  stretches of a few instructions.
+- `struct mutex` (`mutex.c`): Ulrich Drepper's mutex from "Futexes Are
+  Tricky", with three states, 0 (free), 1 (taken) and 2 (taken, and someone
+  may be waiting). Taking a free mutex is one compare-and-swap and freeing
+  one nobody waits for is one atomic add, with no system call; a thread
+  that finds it taken sets 2 and sleeps in `futex_wait` while it stays 2,
+  and the unlock that sees 2 wakes one sleeper with `futex_wake`. The
+  kernel checks the word and goes to sleep as one step against
+  `futex_wake`, so an unlock between the thread's check and its sleep is
+  never lost.
+
+Both start unlocked when zeroed, so a static one needs no setting up, and
+neither may be taken twice by the same thread. `threads` (in `kernel/user`)
+uses both, and `threadtest` checks them along with the calls.

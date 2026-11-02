@@ -46,6 +46,12 @@
     .equ SYS_getpeername, 38
     .equ SYS_setsockopt, 39
     .equ SYS_harts, 40
+    .equ SYS_thread_create, 41
+    .equ SYS_thread_exit, 42
+    .equ SYS_thread_join, 43
+    .equ SYS_gettid, 44
+    .equ SYS_futex_wait, 45
+    .equ SYS_futex_wake, 46
 
     .text
 
@@ -326,6 +332,51 @@ setsockopt:
     .globl harts
 harts:
     li    a7, SYS_harts
+    ecall
+    ret
+
+# int thread_create(void (*entry)(void *), void *arg, void *stack): the raw
+# call; the new thread starts at entry with a0 = arg, sp = stack and every
+# other register zero, ra included, so entry must end with thread_exit.
+# The library's thread_start (lib/thread.s) wraps it for C functions.
+    .globl thread_create
+thread_create:
+    li    a7, SYS_thread_create
+    ecall
+    ret
+
+# void thread_exit(int status)
+    .globl thread_exit
+thread_exit:
+    li    a7, SYS_thread_exit
+    ecall
+    ret
+
+# int thread_join(int tid, int *status)
+    .globl thread_join
+thread_join:
+    li    a7, SYS_thread_join
+    ecall
+    ret
+
+# int gettid(void)
+    .globl gettid
+gettid:
+    li    a7, SYS_gettid
+    ecall
+    ret
+
+# int futex_wait(int *addr, int val)
+    .globl futex_wait
+futex_wait:
+    li    a7, SYS_futex_wait
+    ecall
+    ret
+
+# int futex_wake(int *addr, int n)
+    .globl futex_wake
+futex_wake:
+    li    a7, SYS_futex_wake
     ecall
     ret
 

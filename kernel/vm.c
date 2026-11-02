@@ -1,12 +1,25 @@
 /* Sv32 page tables and the kernel address space. Physical memory is identity
  * mapped in the kernel page table, so a physical address (a page table, a page
- * from kalloc) is also a usable pointer with paging on. */
+ * from kalloc) is also a usable pointer with paging on.
+ *
+ * User copies and threads. copyin() and friends find a user page through
+ * the page table and then copy through its physical address. A process's
+ * threads share its page table, so one thread's sbrk() may unmap and free a
+ * page that another, on another hart, is copying to or from: once freed and
+ * reused, the copy would write someone else's memory. uvm_lock closes that
+ * gap: every user copy checks the range and copies under it, and
+ * unmap_pages() takes it once, after clearing the PTEs and before freeing
+ * anything, so a copy that saw the old PTEs has finished by then and every
+ * later one sees them gone. It is one lock for every process, held for at
+ * most a page or so of memcpy, and a leaf of the lock order: nothing else
+ * is taken under it. */
 #include "vm.h"
 #include "kalloc.h"
 #include "kprintf.h"
 #include "memlayout.h"
 #include "riscv.h"
 #include "smp.h"
+#include "spinlock.h"
 #include "string.h"
 #include "sysinfo.h"
 #include "trap.h"
@@ -15,6 +28,9 @@
 #define PTES_PER_TABLE 1024
 
 pagetable_t kernel_pagetable;
+
+/* Every user copy, against unmap_pages() (above). */
+static struct spinlock uvm_lock;
 
 pagetable_t pagetable_create(void) {
     return kzalloc();
@@ -93,8 +109,11 @@ void unmap_pages(pagetable_t pt, u32 va, u32 size, bool free_pages) {
         }
     }
     /* Then no hart may still hold a translation to one of the pages in its
-     * TLB (smp.h), before they can be reused. */
+     * TLB (smp.h), nor be copying through one of them for a system call
+     * (uvm_lock, above), before they can be reused. */
     tlb_shootdown(pt);
+    acquire(&uvm_lock);
+    release(&uvm_lock);
     for (u32 a = va;; a += PGSIZE) {
         pte_t *pte = walk(pt, a, false);
         if (free_pages) {
@@ -135,6 +154,7 @@ static void kvmmap(u32 start, u32 size, u32 perm) {
 }
 
 void kvminit(void) {
+    initlock(&uvm_lock, "uvm");
     kernel_pagetable = pagetable_create();
     if (kernel_pagetable == NULL) {
         panic("kvminit: out of memory");
@@ -274,7 +294,9 @@ static u32 page_chunk(u32 va, u32 len) {
 }
 
 int copyin(pagetable_t pt, void *dst, u32 va, u32 len) {
+    acquire(&uvm_lock);
     if (!uvm_range_ok(pt, va, len, PTE_R)) {
+        release(&uvm_lock);
         return -1;
     }
     u8 *out = dst;
@@ -285,11 +307,14 @@ int copyin(pagetable_t pt, void *dst, u32 va, u32 len) {
         va += n;
         len -= n;
     }
+    release(&uvm_lock);
     return 0;
 }
 
 int copyout(pagetable_t pt, u32 va, const void *src, u32 len) {
+    acquire(&uvm_lock);
     if (!uvm_range_ok(pt, va, len, PTE_W)) {
+        release(&uvm_lock);
         return -1;
     }
     const u8 *in = src;
@@ -300,6 +325,7 @@ int copyout(pagetable_t pt, u32 va, const void *src, u32 len) {
         va += n;
         len -= n;
     }
+    release(&uvm_lock);
     return 0;
 }
 
@@ -307,22 +333,26 @@ int copyinstr(pagetable_t pt, char *dst, u32 va, u32 max) {
     /* Page by page: the string's length isn't known up front, and the page
      * after its NUL needn't be mapped. */
     u32 len = 0;
+    acquire(&uvm_lock);
     while (len < max) {
         u32 n = page_chunk(va, max - len);
         if (!uvm_range_ok(pt, va, n, PTE_R)) {
             dst[len] = 0;
+            release(&uvm_lock);
             return -1;
         }
         const u8 *src = user_ptr(pt, va);
         for (u32 i = 0; i < n; i++) {
             dst[len] = (char)src[i];
             if (src[i] == 0) {
+                release(&uvm_lock);
                 return (int)len;
             }
             len++;
         }
         va += n;
     }
+    release(&uvm_lock);
     dst[max - 1] = 0;
     return -2;
 }

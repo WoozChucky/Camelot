@@ -31,6 +31,7 @@
 #define NCPU 8
 
 struct proc;
+struct thread;
 
 /* What the kernel keeps per hart. `tp` holds the hart's id (its mhartid,
  * set by _start in M-mode and never changed by the kernel; user_vec puts it
@@ -39,8 +40,8 @@ struct proc;
  * (noff at 4, intena at 8) and the entries at CPU_SIZE apart: keep them in
  * sync. */
 struct cpu {
-    /* The process running on this hart, or NULL while the hart runs the
-     * scheduler loop or kmain. */
+    /* The process of the thread running on this hart (thread->proc), or
+     * NULL while the hart runs the scheduler loop or kmain. */
     struct proc *proc;
     /* How deep push_off() calls nest: the number of spinlocks held, plus
      * any push_off() without a lock. */
@@ -67,16 +68,18 @@ struct cpu {
      * hart that wakes it with an IPI because a process became runnable
      * (proc.c). */
     bool idle;
+    /* The thread running on this hart, or NULL with `proc`. */
+    struct thread *thread;
 };
 
-#define CPU_SIZE 88
+#define CPU_SIZE 92
 _Static_assert(sizeof(struct cpu) == CPU_SIZE, "spinlock.s indexes cpus[] by CPU_SIZE");
 
 extern struct cpu cpus[NCPU];
 
 /* This hart's entry of cpus[]. Only meaningful while the code can't move
  * to another hart, which in this kernel is always: kernel threads are never
- * preempted, and a process changes harts only through the scheduler. */
+ * preempted, and a thread changes harts only through the scheduler. */
 struct cpu *mycpu(void);
 
 /* This hart's id (tp). */
