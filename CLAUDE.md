@@ -22,6 +22,7 @@ Camelot is Nuno's learning project: the Excalibur ISA (RV32IM + Zicsr, M/S/U, Sv
 crates/excalibur        encodings, decoder, disassembler (shared by every tool)
 crates/elf32            ELF32 reader (grail, merlin-objdump, merlin-ld)
 crates/grail            the emulator
+crates/merlin           the C-subset compiler (front end + test harness; codegen is #14)
 crates/merlin-as        the assembler
 crates/merlin-objdump   the disassembler; output matches llvm-objdump 21
 crates/xtask            build tasks (`cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld)

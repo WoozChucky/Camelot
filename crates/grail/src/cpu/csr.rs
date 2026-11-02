@@ -36,7 +36,8 @@ pub struct Csrs {
     pub medeleg: u32,
     pub mideleg: u32,
     pub mie: u32,
-    /// Software-writable pending bits. MTIP and MSIP are added from the CLINT on read.
+    /// Software-writable pending bits. MTIP and MSIP are added from the CLINT on read,
+    /// MEIP and SEIP from the PLIC (SEIP is the OR of this bit and PLIC context 1).
     pub mip: u32,
     pub mtvec: u32,
     pub mcounteren: u32,
@@ -82,7 +83,25 @@ impl Cpu {
         if self.bus.clint.msip {
             mip |= 1 << IRQ_M_SOFT;
         }
+        if self.bus.plic.irq(0) {
+            mip |= 1 << IRQ_M_EXT;
+        }
+        if self.bus.plic.irq(1) {
+            mip |= 1 << IRQ_S_EXT;
+        }
         mip
+    }
+
+    /// The value csrrs/csrrc modify. Same as a read, except that in `mip` the SEIP bit is the
+    /// software-writable one only, so a read-modify-write cannot latch the PLIC's SEIP into it
+    /// (privileged spec, section 3.1.9).
+    pub(super) fn csr_rmw_base(&self, addr: u16, read: u32) -> u32 {
+        if addr == MIP {
+            let seip = 1 << IRQ_S_EXT;
+            (read & !seip) | (self.csr.mip & seip)
+        } else {
+            read
+        }
     }
 
     /// S/U counter access is gated by mcounteren (and scounteren for U).

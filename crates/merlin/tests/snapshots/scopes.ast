@@ -1,0 +1,43 @@
+Function main() <3:5>
+  Local #0 x <4:9>
+  Local #1 r <5:9>
+  Local #2 x <7:13>
+  Local #3 x <9:17>
+  Decl <4:5>
+    Var x #0 <4:9>
+      Num 1 <4:13>
+  Decl <5:5>
+    Var r #1 <5:9>
+      Num 0 <5:13>
+  Block <6:5>
+    Decl <7:9>
+      Var x #2 <7:13>
+        Num 2 <7:17>
+    Block <8:9>
+      Decl <9:13>
+        Var x #3 <9:17>
+          Num 3 <9:21>
+      ExprStmt <10:13>
+        Assign <10:15>
+          Var r #1 <10:13>
+          Binary + <10:19>
+            Var r #1 <10:17>
+            Var x #3 <10:21>
+      ExprStmt <11:13>
+        Assign <11:15>
+          Var x #3 <11:13>
+          Num 9 <11:17>
+    ExprStmt <13:9>
+      Assign <13:11>
+        Var r #1 <13:9>
+        Binary + <13:15>
+          Var r #1 <13:13>
+          Binary * <13:19>
+            Var x #2 <13:17>
+            Num 10 <13:21>
+  Return <15:5>
+    Binary + <15:14>
+      Var r #1 <15:12>
+      Binary * <15:18>
+        Var x #0 <15:16>
+        Num 100 <15:20>

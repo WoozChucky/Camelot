@@ -1,0 +1,10 @@
+// expect: 109
+// Recursive fib(20) = 6765. Exit codes keep the low 8 bits: 6765 & 0xff = 109.
+int fib(int n) {
+    if (n < 2)
+        return n;
+    return fib(n - 1) + fib(n - 2);
+}
+int main() {
+    return fib(20);
+}

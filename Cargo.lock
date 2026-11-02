@@ -19,6 +19,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "merlin"
+version = "0.1.0"
+dependencies = [
+ "grail",
+ "merlin-as",
+]
+
+[[package]]
 name = "merlin-as"
 version = "0.1.0"
 dependencies = [
