@@ -1,8 +1,11 @@
-//! Runs the `merlin` binary: `--dump-ast` snapshots, error format, exit codes.
+//! Runs the `merlin` binary: snapshots, error format, exit codes.
 //!
-//! Snapshots live in `tests/snapshots/<case>.ast` and are compared against
-//! `merlin --dump-ast tests/cases/<case>.c`. After an intended change to the
-//! tree or its printer, regenerate them with
+//! Snapshots live in `tests/snapshots/`: `<case>.ast` is compared against
+//! `merlin --dump-ast tests/cases/<case>.c`, and `<case>.s` against the
+//! assembly `merlin tests/cases/<case>.c` writes. To snapshot another case,
+//! create an empty `<case>.ast` or `<case>.s` there and bless. After an
+//! intended change to the tree, its printer or code generation, regenerate
+//! them (merlin itself produces them, no external tools) with
 //!
 //!     MERLIN_BLESS=1 cargo test -p merlin --test cli
 
@@ -46,35 +49,69 @@ impl Drop for TempSrc {
     }
 }
 
-#[test]
-fn dump_ast_snapshots() {
-    let bless = std::env::var_os("MERLIN_BLESS").is_some();
+/// Every `tests/snapshots/*.<ext>`, sorted.
+fn snapshots(ext: &str) -> Vec<PathBuf> {
     let snap_dir = tests_dir().join("snapshots");
     let mut snaps: Vec<PathBuf> = std::fs::read_dir(&snap_dir)
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|x| x == "ast"))
+        .filter(|p| p.extension().is_some_and(|x| x == ext))
         .collect();
     snaps.sort();
-    assert!(snaps.len() >= 3, "expected snapshots in {}", snap_dir.display());
+    snaps
+}
+
+/// Compares `got` with the snapshot file, or rewrites it under `MERLIN_BLESS`.
+fn check_snapshot(snap: &Path, what: &str, got: &str) {
+    if std::env::var_os("MERLIN_BLESS").is_some() {
+        std::fs::write(snap, got).unwrap();
+        return;
+    }
+    // Checkouts with autocrlf may turn the snapshot's line endings into CRLF.
+    let want = std::fs::read_to_string(snap).unwrap().replace('\r', "");
+    assert!(
+        got == want,
+        "{what} differs from {} (MERLIN_BLESS=1 to update)\n--- got ---\n{got}",
+        snap.display()
+    );
+}
+
+fn case_for(snap: &Path) -> (String, PathBuf) {
+    let name = snap.file_stem().unwrap().to_string_lossy().into_owned();
+    let case = tests_dir().join("cases").join(format!("{name}.c"));
+    (name, case)
+}
+
+#[test]
+fn dump_ast_snapshots() {
+    let snaps = snapshots("ast");
+    assert!(snaps.len() >= 3, "expected .ast snapshots");
     for snap in snaps {
-        let name = snap.file_stem().unwrap().to_string_lossy().into_owned();
-        let case = tests_dir().join("cases").join(format!("{name}.c"));
+        let (name, case) = case_for(&snap);
         let out = merlin(&[Path::new("--dump-ast"), &case]);
         assert!(out.status.success(), "{name}: {}", stderr(&out));
         let got = String::from_utf8(out.stdout).unwrap().replace('\r', "");
-        if bless {
-            std::fs::write(&snap, &got).unwrap();
-            continue;
-        }
-        // Checkouts with autocrlf may turn the snapshot's line endings into CRLF.
-        let want = std::fs::read_to_string(&snap).unwrap().replace('\r', "");
-        assert!(
-            got == want,
-            "{name}: --dump-ast differs from {} (MERLIN_BLESS=1 to update)\n--- got ---\n{got}",
-            snap.display()
-        );
+        check_snapshot(&snap, &format!("{name}: --dump-ast"), &got);
     }
+}
+
+/// The generated assembly for a few cases is committed, so that every change
+/// to code generation shows up in the diff of `tests/snapshots/*.s`.
+#[test]
+fn assembly_snapshots() {
+    let snaps = snapshots("s");
+    assert!(snaps.len() >= 2, "expected .s snapshots");
+    let dir = std::env::temp_dir().join(format!("merlin-cli-asm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for snap in snaps {
+        let (name, case) = case_for(&snap);
+        let out_s = dir.join(format!("{name}.s"));
+        let out = merlin(&[&case, Path::new("-o"), &out_s]);
+        assert!(out.status.success(), "{name}: {}", stderr(&out));
+        let got = std::fs::read_to_string(&out_s).unwrap();
+        check_snapshot(&snap, &format!("{name}: generated assembly"), &got);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -137,10 +174,12 @@ fn deep_nesting_is_an_error_not_a_crash() {
     // error points just past the 255th `(` (the first is at column 21).
     let parens = |n: usize| format!("int main() {{ return {}1{}; }}\n", "(".repeat(n), ")".repeat(n));
     let blocks = |n: usize| format!("int main() {{ {}{} return 0; }}\n", "{".repeat(n), "}".repeat(n));
-    // At the limit, the whole pipeline (parser, sema, AST printer) still copes.
+    // At the limit, the whole pipeline (parser, sema, AST printer, codegen) still copes.
     for (name, src) in [("parens.c", parens(limit - 2)), ("blocks.c", blocks(limit))] {
         let t = TempSrc::new("deep-ok", name, &src);
         let out = merlin(&[Path::new("--dump-ast"), &t.file]);
+        assert!(out.status.success(), "{name}: {}", stderr(&out));
+        let out = merlin(&[&*t.file]);
         assert!(out.status.success(), "{name}: {}", stderr(&out));
     }
     for (name, src, col) in [
@@ -192,22 +231,35 @@ fn every_semantic_error_is_reported() {
 }
 
 #[test]
-fn compiles_or_reports_missing_codegen() {
+fn compiles_to_assembly() {
     let t = TempSrc::new("compile", "ok.c", "int main() { return 0; }\n");
+    // -o names the output.
     let out_s = t.dir.join("custom.s");
     let out = merlin(&[&t.file, Path::new("-o"), &out_s]);
-    if out.status.success() {
-        let asm = std::fs::read_to_string(&out_s).unwrap();
-        assert!(asm.contains("main:"), "{asm}");
-    } else {
-        // Until #14 lands.
-        assert_eq!(out.status.code(), Some(1));
-        let file = t.file.display().to_string();
-        assert_eq!(
-            stderr(&out),
-            format!("{file}: error: not implemented yet: code generation (#14)\n")
-        );
-    }
+    assert!(out.status.success(), "{}", stderr(&out));
+    let asm = std::fs::read_to_string(&out_s).unwrap();
+    assert!(asm.contains(".globl main\nmain:\n"), "{asm}");
+    // Without it, the output goes next to the input, with a .s extension.
+    let out = merlin(&[&t.file]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(t.dir.join("ok.s")).unwrap(), asm);
+}
+
+#[test]
+fn codegen_errors_use_file_line_col_format() {
+    let t = TempSrc::new(
+        "codegen-error",
+        "reg.c",
+        "int main() { return 0; }\nint ra() { return 1; }\n",
+    );
+    let out = merlin(&[&t.file]);
+    assert_eq!(out.status.code(), Some(1));
+    let file = t.file.display().to_string();
+    assert_eq!(
+        stderr(&out),
+        format!("{file}:2:5: error: 'ra' is a register name, which cannot be used as a function name\n")
+    );
+    assert!(!t.dir.join("reg.s").exists(), "no output on error");
 }
 
 #[test]

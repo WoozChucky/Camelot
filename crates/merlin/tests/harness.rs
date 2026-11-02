@@ -9,24 +9,32 @@
 //! division by zero, `INT_MIN / -1`, falling off the end of a function). Every
 //! test below runs them except `clang_reference`, since clang may disagree.
 //!
-//! Run now, without any external tools:
+//! Run by `cargo test`, without any external tools:
 //!
 //! * `cases_are_well_formed`: every case has an expectation and passes the
 //!   front end (lexer, parser, name resolution, arity checks).
 //! * `cases_match_reference_interpreter`: an AST interpreter
 //!   (`tests/common/interp.rs`) agrees with every `// expect:`, so the
-//!   expectations and the parser check each other before codegen exists.
+//!   expectations and the parser check each other, and a pipeline failure
+//!   below can be told apart from a front-end bug.
+//! * `cases_run_in_grail`: the whole toolchain. merlin compiles each case to
+//!   assembly, merlin-as assembles it and `tests/crt0.s`, merlin-ld links them
+//!   (default layout) and Grail runs the result, comparing exit codes. Set
+//!   `MERLIN_HARNESS_LLVM=1` to assemble merlin's output with clang and link
+//!   with ld.lld instead, which checks the generated assembly against LLVM:
 //!
-//! Ignored until the pipeline exists:
+//!       MERLIN_HARNESS_LLVM=1 cargo test -p merlin --test harness run_in_grail
 //!
-//! * `cases_run_in_grail`: merlin → merlin-as → merlin-ld (with `tests/crt0.s`)
-//!   → Grail, comparing exit codes. Needs codegen (#14) and merlin-ld's
-//!   relocations (#7); #14 un-ignores it. merlin-ld is the binary named
-//!   by `MERLIN_LD`, or `merlin-ld` next to this test in `target/<profile>/`,
-//!   invoked as `merlin-ld -o out.elf crt0.o case.o`. Until #8 lands, set
-//!   `MERLIN_HARNESS_LLVM=1` to assemble and link with clang and ld.lld instead.
+//! * `far_branches_run_in_grail`, `deep_expressions_run_in_grail`: generated
+//!   programs too big to keep as files, through the same pipeline.
 //!
-//!       cargo test -p merlin --test harness -- --ignored cases_run_in_grail
+//! Ignored, since they need LLVM:
+//!
+//! * `generated_assembly_assembles_like_clang`: clang's assembler (with
+//!   `-mno-relax`) turns merlin's output for every case into the same `.text`
+//!   bytes and relocations as merlin-as. Needs clang on `PATH`.
+//!
+//!       cargo test -p merlin --test harness -- --ignored generated_assembly
 //!
 //! * `clang_reference`: compiles every case with clang instead of merlin, links
 //!   with ld.lld and runs it in Grail. It checks the expectations and crt0
@@ -262,33 +270,26 @@ fn ld_lld(objs: &[PathBuf], out: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(out).map_err(|e| e.to_string())
 }
 
-/// Assembling and linking for `cases_run_in_grail`.
+/// Assembling and linking for the pipeline tests.
 enum Backend {
-    /// merlin-as (as a library) and the merlin-ld binary.
-    Merlin { ld: PathBuf },
-    /// clang and ld.lld, until merlin-as and merlin-ld can do the job (#8).
+    /// merlin-as and merlin-ld, as libraries.
+    Merlin,
+    /// clang and ld.lld (`MERLIN_HARNESS_LLVM=1`), to cross-check merlin's output.
     Llvm,
 }
 
 impl Backend {
     fn from_env() -> Backend {
         if std::env::var_os("MERLIN_HARNESS_LLVM").is_some_and(|v| v != "0") {
-            return Backend::Llvm;
+            Backend::Llvm
+        } else {
+            Backend::Merlin
         }
-        let ld = std::env::var_os("MERLIN_LD")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                // This test runs from target/<profile>/deps/; workspace binaries live one up.
-                let exe = std::env::current_exe().unwrap();
-                let profile_dir = exe.parent().and_then(Path::parent).unwrap();
-                profile_dir.join(format!("merlin-ld{}", std::env::consts::EXE_SUFFIX))
-            });
-        Backend::Merlin { ld }
     }
 
     fn assemble(&self, src: &str, out: &Path) -> Result<PathBuf, String> {
         match self {
-            Backend::Merlin { .. } => {
+            Backend::Merlin => {
                 let obj = merlin_as::assemble_to_elf(src).map_err(|errs| {
                     let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
                     format!("merlin-as: {}", msgs.join("; "))
@@ -298,7 +299,7 @@ impl Backend {
             Backend::Llvm => {
                 let s = out.with_extension("s");
                 std::fs::write(&s, src).map_err(|e| e.to_string())?;
-                tool(clang().arg(&s).arg("-o").arg(out))?;
+                tool(clang().arg("-mno-relax").arg(&s).arg("-o").arg(out))?;
             }
         }
         Ok(out.to_path_buf())
@@ -307,41 +308,172 @@ impl Backend {
     fn crt0(&self) -> String {
         let crt0 = std::fs::read_to_string(tests_dir().join("crt0.s")).unwrap();
         match self {
-            Backend::Merlin { .. } => crt0,
+            Backend::Merlin => crt0,
             Backend::Llvm => crt0_for_llvm(&crt0),
         }
     }
 
     fn link(&self, objs: &[PathBuf], out: &Path) -> Result<Vec<u8>, String> {
         match self {
-            Backend::Merlin { ld } => {
-                if !ld.exists() {
-                    return Err(format!(
-                        "no linker at {} (build merlin-ld, set MERLIN_LD, or set MERLIN_HARNESS_LLVM=1)",
-                        ld.display()
-                    ));
+            Backend::Merlin => {
+                let mut inputs = Vec::new();
+                for p in objs {
+                    inputs.push(merlin_ld::Input {
+                        name: p.file_name().unwrap().to_string_lossy().into_owned(),
+                        data: std::fs::read(p).map_err(|e| e.to_string())?,
+                    });
                 }
-                tool(Command::new(ld).arg("-o").arg(out).args(objs))?;
-                std::fs::read(out).map_err(|e| e.to_string())
+                let linked = merlin_ld::link(&inputs, &merlin_ld::Options::default()).map_err(|errs| {
+                    let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
+                    format!("merlin-ld: {}", msgs.join("; "))
+                })?;
+                Ok(linked.elf)
             }
             Backend::Llvm => ld_lld(objs, out),
         }
     }
 }
 
+/// Builds C programs with crt0 into executables, and runs them in Grail.
+struct Pipeline {
+    backend: Backend,
+    scratch: Scratch,
+    crt0: PathBuf,
+}
+
+impl Pipeline {
+    fn new(test: &str) -> Pipeline {
+        let backend = Backend::from_env();
+        let scratch = Scratch::new(test);
+        let crt0 = backend
+            .assemble(&backend.crt0(), &scratch.path("crt0.o"))
+            .expect("assembling crt0.s");
+        Pipeline {
+            backend,
+            scratch,
+            crt0,
+        }
+    }
+
+    /// Assembles merlin's output and links it with crt0.
+    fn build(&self, name: &str, asm: &str) -> Result<Vec<u8>, String> {
+        let obj = self
+            .backend
+            .assemble(asm, &self.scratch.path(&format!("{name}.o")))?;
+        let elf = self.scratch.path(&format!("{name}.elf"));
+        self.backend.link(&[self.crt0.clone(), obj], &elf)
+    }
+
+    /// Compiles `src`, builds it and returns its exit code.
+    fn run(&self, name: &str, src: &str) -> Result<u8, String> {
+        let asm = merlin::compile(src).map_err(|errs| {
+            let file = format!("{name}.c");
+            errs.iter()
+                .map(|e| e.render(&file))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })?;
+        run_in_grail(&self.build(name, &asm)?)
+    }
+}
+
 #[test]
-#[ignore = "needs merlin codegen (#14) and merlin-ld relocations (#7); see the module docs"]
 fn cases_run_in_grail() {
-    let backend = Backend::from_env();
-    let scratch = Scratch::new("pipeline");
-    let crt0 = backend
-        .assemble(&backend.crt0(), &scratch.path("crt0.o"))
-        .expect("assembling crt0.s");
-    for_each_case("merlin pipeline", ALL_CASES, |c| {
+    let pipeline = Pipeline::new("pipeline");
+    for_each_case("merlin pipeline", ALL_CASES, |c| pipeline.run(&c.name, &c.src));
+}
+
+/// A conditional branch reaches only 4 KiB, so codegen must rewrite the ones
+/// that span bigger `if` and loop bodies (merlin-as rejects them otherwise).
+#[test]
+fn far_branches_run_in_grail() {
+    let pipeline = Pipeline::new("far");
+    // `x = x + 1;` is 8 instructions, so 500 of them take 16 KB.
+    let body = "x = x + 1; ".repeat(500);
+    let src = format!(
+        "int main() {{
+            int x = 0;
+            int i = 0;
+            int y = 1;
+            if (y) {{ {body} }} else {{ {body} }}
+            while (i < 3) {{ {body} i = i + 1; if (i == 99) break; }}
+            if (y == 0 && x == 0) {{ {body} }}
+            for (i = 0; i < 2; i = i + 1) {{ if (i) continue; {body} }}
+            return x / 100 + y;
+        }}"
+    );
+    let asm = merlin::compile(&src).unwrap();
+    assert!(asm.contains("\n1:\n"), "expected long branches:\n{asm}");
+    // x = 500 (if) + 1500 (while) + 500 (for, first pass) = 2500.
+    assert_eq!(pipeline.run("far", &src), Ok(26));
+}
+
+/// Deeply nested expressions keep many temporaries on the stack, around calls.
+#[test]
+fn deep_expressions_run_in_grail() {
+    let pipeline = Pipeline::new("deep");
+    // 1 + (2 + (... + (99 + id(100)))): the call happens with 99 values pushed.
+    let mut e = "id(100)".to_string();
+    for i in (1..100).rev() {
+        e = format!("{i} + ({e})");
+    }
+    let src = format!("int id(int x) {{ return x; }}\nint main() {{ return ({e}) - 5000; }}");
+    assert_eq!(pipeline.run("deep", &src), Ok(50)); // 5050 - 5000
+
+    // Calls as arguments of calls, eight arguments each, inside an expression.
+    let src = "int w(int a, int b, int c, int d, int e, int f, int g, int h) {
+                   return a - b + c - d + e - f + g - h;
+               }
+               int main() {
+                   return 100 + w(w(8, 7, 6, 5, 4, 3, 2, 1), 1, w(1, 1, 1, 1, 1, 1, 1, w(0, 0, 0, 0, 0, 0, 0, 3)), 0, 0, 0, 0, 5);
+               }";
+    // w(8, ..., 1) = 4; w(0, ..., 3) = -3; w(1, ..., 1, -3) = 4; w(4, 1, 4, 0, 0, 0, 0, 5) = 2.
+    assert_eq!(pipeline.run("args", src), Ok(102));
+}
+
+/// The code and relocations of an object's `.text`, as text for comparing.
+fn text_section(obj: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
+    let elf = elf32::Elf::parse(obj).map_err(|e| e.to_string())?;
+    let text = elf
+        .sections
+        .iter()
+        .find(|s| s.name == ".text")
+        .ok_or("no .text")?;
+    let code = elf.section_data(text).map_err(|e| e.to_string())?.to_vec();
+    let mut relocs = Vec::new();
+    if let Some(rela) = elf.sections.iter().find(|s| s.name == ".rela.text") {
+        let syms = elf.symbols().map_err(|e| e.to_string())?;
+        for r in elf.relocations(rela).map_err(|e| e.to_string())? {
+            let ty = elf32::reloc_name(r.ty).unwrap_or("?");
+            let sym = &syms[r.sym as usize].name;
+            relocs.push(format!("{:#x} {ty} {sym}{:+}", r.offset, r.addend));
+        }
+    }
+    Ok((code, relocs))
+}
+
+/// merlin's output means the same to clang's assembler as to merlin-as: for
+/// every case, both give the same `.text` bytes and relocations. Needs clang.
+#[test]
+#[ignore = "needs clang on PATH"]
+fn generated_assembly_assembles_like_clang() {
+    let scratch = Scratch::new("asm-vs-clang");
+    for_each_case("merlin-as vs clang", ALL_CASES, |c| {
         let asm = merlin::compile(&c.src).map_err(|e| render(&e, c))?;
-        let obj = backend.assemble(&asm, &scratch.path(&format!("{}.o", c.name)))?;
-        let elf = backend.link(&[crt0.clone(), obj], &scratch.path(&format!("{}.elf", c.name)))?;
-        run_in_grail(&elf)
+        let ours = merlin_as::assemble_to_elf(&asm).map_err(|e| format!("merlin-as: {e:?}"))?;
+        let s = scratch.path(&format!("{}.s", c.name));
+        let o = scratch.path(&format!("{}.o", c.name));
+        std::fs::write(&s, &asm).map_err(|e| e.to_string())?;
+        tool(clang().arg("-mno-relax").arg(&s).arg("-o").arg(&o))?;
+        let theirs = std::fs::read(&o).map_err(|e| e.to_string())?;
+        let (ours, theirs) = (text_section(&ours)?, text_section(&theirs)?);
+        if ours.0 != theirs.0 {
+            return Err("merlin-as and clang assemble different .text bytes".into());
+        }
+        if ours.1 != theirs.1 {
+            return Err(format!("relocations differ:\n{:?}\n{:?}", ours.1, theirs.1));
+        }
+        Ok(c.expect)
     });
 }
 

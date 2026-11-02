@@ -22,7 +22,7 @@ crates/excalibur        encodings, decoder, disassembler (shared by every tool)
 crates/elf32            ELF32 reader (grail, merlin-objdump, merlin-ld)
 crates/grail            the emulator
 crates/avalon-proto     Avalon protocol (framing, messages, Connection), shared by the Avalon platform's programs; spec in docs/avalon-protocol.md
-crates/merlin           the C-subset compiler (front end + test harness; codegen is #14)
+crates/merlin           the C-subset compiler, C to .s (src/codegen.rs explains the stack frames and calling convention)
 crates/merlin-as        the assembler
 crates/merlin-ld        the linker (src/reloc.rs explains every relocation it applies)
 crates/merlin-objdump   the disassembler; output matches llvm-objdump 21

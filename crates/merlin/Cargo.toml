@@ -8,7 +8,12 @@ license.workspace = true
 [lib]
 name = "merlin"
 
+[dependencies]
+excalibur = { path = "../excalibur" }
+
 [dev-dependencies]
 # The test harness runs compiled programs end to end: merlin -> merlin-as -> link -> Grail.
 grail = { path = "../grail" }
 merlin-as = { path = "../merlin-as" }
+merlin-ld = { path = "../merlin-ld" }
+elf32 = { path = "../elf32" }
