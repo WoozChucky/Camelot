@@ -127,6 +127,7 @@ dependencies = [
  "avalon",
  "avalon-client",
  "avalon-proto",
+ "grail",
  "lake",
 ]
 
@@ -137,6 +138,7 @@ dependencies = [
  "avalon",
  "avalon-client",
  "avalon-proto",
+ "grail",
  "lake",
 ]
 
