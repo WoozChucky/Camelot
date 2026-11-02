@@ -126,8 +126,8 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
         "{out}"
     );
     assert!(out.contains("fs self-test: 12/12 passed\n"), "{out}");
-    // `ls /bin` lists `.`, `..` and the programs; its count went to a new file.
-    // and is on the disk.
+    // `ls /bin` lists `.`, `..` and the programs; its count went to a new file,
+    // which is on the disk.
     let written = Fs::open(&disk).unwrap().read_file("/count").unwrap();
     let written = String::from_utf8(written).unwrap();
     assert!(
@@ -172,6 +172,14 @@ fn the_image_size_is_the_whole_image_and_too_small_is_refused() {
              {kernel_blocks} blocks"
         )
     );
+    // Too big is not cured by a bigger --size: the error says what is wrong
+    // and does not suggest one.
+    let err = xtask::fs::build_bootable(&root, u32::MAX).unwrap_err();
+    assert!(
+        err.starts_with(&format!("cannot build a {}-block root image: ", u32::MAX))
+            && !err.contains("--size"),
+        "{err}"
+    );
 }
 
 /// The disk kernel has no programs of its own: with no shell in `/bin`, or no
@@ -203,6 +211,27 @@ fn the_disk_kernel_panics_without_a_shell() {
     assert!(
         out.ends_with(
             "cannot start /bin/sh: error 2\npanic: no shell in /bin, and no programs built into the kernel\n"
+        ),
+        "{out}"
+    );
+
+    // A /bin/sh that is there but is no program: the panic does not claim the
+    // shell is missing, and the line before it gives exec's error.
+    let mut fs = Mkfs::new(&Options {
+        size: 200,
+        ..Options::default()
+    })
+    .unwrap();
+    fs.mkdir("/bin").unwrap();
+    fs.add_file("/bin/sh", b"#!/not/an/elf\n").unwrap();
+    let mut image = fs.finish();
+    boot::install(&mut image, &boot, &kernel).unwrap();
+    let (result, out, _, _) = boot_image(image, b"exit\n");
+    assert_eq!(result, RunResult::Exited(0xfe), "a panic:\n{out}");
+    assert!(
+        out.ends_with(
+            "cannot start /bin/sh: error 8\npanic: the shell in /bin cannot start, and no programs built into \
+             the kernel\n"
         ),
         "{out}"
     );

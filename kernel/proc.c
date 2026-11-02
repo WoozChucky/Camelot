@@ -344,8 +344,13 @@ static void init_start(void) {
             /* The disk kernel (kernel/kernel-disk.elf) has no programs of its
              * own to fall back on, like Linux without an initramfs: without
              * the shell on the root filesystem there is nothing to run. */
-            panic(fs_mounted ? "no shell in /bin, and no programs built into the kernel"
-                             : "no root filesystem, and no programs built into the kernel");
+            if (!fs_mounted)
+                panic("no root filesystem, and no programs built into the kernel");
+            if (err == -ENOENT)
+                panic("no shell in /bin, and no programs built into the kernel");
+            /* The shell is there but did not start (not an ELF, out of
+             * memory, ...): the line above gave the error. */
+            panic("the shell in /bin cannot start, and no programs built into the kernel");
         }
         proc_exit(-1);
     }
