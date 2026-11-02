@@ -97,7 +97,7 @@ fn objdump_of_merlin_as_objects_matches_clang() {
         std::fs::create_dir_all(&theirs).unwrap();
         let status = Command::new(&clang)
             .args(kernel::TARGET_FLAGS)
-            .arg("-march=rv32im_zicsr_zifencei")
+            .arg("-march=rv32ima_zicsr_zifencei")
             .arg("-c")
             .arg("-include")
             .arg(repo_root().join(examples::XCAL_INCLUDE))

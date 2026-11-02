@@ -11,6 +11,7 @@ pub fn profile() -> HardwareProfile {
         ram_size: 64 * 1024 * 1024,
         clock_hz: Some(2_000_000),
         nominal_hz: 10_000_000,
+        harts: 4,
         devices: vec![
             DeviceSpec::Disk(DiskSpec {
                 source: DiskSource::File("C:\\vms\\root.img".into()),

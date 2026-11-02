@@ -1,6 +1,7 @@
 //! The control and status register file, with privilege checks and WARL rules.
 
-use super::{Cpu, Mode};
+use super::{Hart, Mode};
+use crate::bus::Bus;
 use crate::trap::{Exception, Trap};
 use excalibur::csr::*;
 
@@ -73,20 +74,22 @@ fn warl_tvec(v: u32) -> u32 {
     }
 }
 
-impl Cpu {
-    /// Current value of mip, including the device-driven bits.
-    pub fn mip(&self) -> u32 {
+impl Hart {
+    /// Current value of mip, including the device-driven bits: MTIP and MSIP from the
+    /// hart's CLINT registers, MEIP and SEIP from its two PLIC contexts.
+    pub fn mip(&self, bus: &Bus) -> u32 {
+        let hart = self.id as usize;
         let mut mip = self.csr.mip;
-        if self.bus.clint.timer_pending() {
+        if bus.clint.timer_pending(hart) {
             mip |= 1 << IRQ_M_TIMER;
         }
-        if self.bus.clint.msip {
+        if bus.clint.msip[hart] {
             mip |= 1 << IRQ_M_SOFT;
         }
-        if self.bus.plic.irq(0) {
+        if bus.plic.irq(2 * hart) {
             mip |= 1 << IRQ_M_EXT;
         }
-        if self.bus.plic.irq(1) {
+        if bus.plic.irq(2 * hart + 1) {
             mip |= 1 << IRQ_S_EXT;
         }
         mip
@@ -128,7 +131,7 @@ impl Cpu {
         Ok(())
     }
 
-    pub fn csr_read(&mut self, addr: u16) -> Result<u32, Trap> {
+    pub fn csr_read(&mut self, bus: &Bus, addr: u16) -> Result<u32, Trap> {
         self.check_access(addr, false)?;
         let c = &self.csr;
         Ok(match addr {
@@ -141,7 +144,7 @@ impl Cpu {
             SEPC => c.sepc,
             SCAUSE => c.scause,
             STVAL => c.stval,
-            SIP => self.mip() & c.mideleg,
+            SIP => self.mip(bus) & c.mideleg,
             SATP => c.satp,
 
             MSTATUS => c.mstatus,
@@ -157,7 +160,7 @@ impl Cpu {
             MEPC => c.mepc,
             MCAUSE => c.mcause,
             MTVAL => c.mtval,
-            MIP => self.mip(),
+            MIP => self.mip(bus),
             a if (PMPCFG0..PMPCFG0 + 4).contains(&a) => c.pmpcfg[(a - PMPCFG0) as usize],
             a if (PMPADDR0..PMPADDR0 + 16).contains(&a) => c.pmpaddr[(a - PMPADDR0) as usize],
             0x323..=0x33f => 0, // mhpmevent3..31
@@ -172,7 +175,7 @@ impl Cpu {
                 if !self.counter_allowed(addr) {
                     return Err(illegal());
                 }
-                let time = self.bus.clint.mtime;
+                let time = bus.clint.mtime;
                 match addr {
                     CYCLE => c.mcycle as u32,
                     CYCLEH => (c.mcycle >> 32) as u32,
@@ -188,7 +191,8 @@ impl Cpu {
             0x7a0 => 1,
             0x7a1..=0x7a5 => 0,
 
-            MVENDORID | MARCHID | MIMPID | MHARTID | MCONFIGPTR => 0,
+            MHARTID => self.id,
+            MVENDORID | MARCHID | MIMPID | MCONFIGPTR => 0,
             _ => return Err(illegal()),
         })
     }

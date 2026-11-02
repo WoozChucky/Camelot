@@ -108,6 +108,12 @@ pub const EXAMPLES: &[Example] = &[
         sources: &["user.S", "netlib.S"],
         script: Some("link.ld"),
     },
+    Example {
+        name: "smp",
+        dir: "smp",
+        sources: &["smp.S"],
+        script: Some("link.ld"),
+    },
 ];
 
 /// The clang-only macros that let clang assemble `xcal.dbg`/`xcal.halt`

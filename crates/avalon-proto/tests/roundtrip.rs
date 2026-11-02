@@ -91,6 +91,7 @@ fn field_layouts_match_the_protocol_doc() {
             ram_size: 0x1000,
             clock_hz: Some(5),
             nominal_hz: 7,
+            harts: 2,
             devices: vec![DeviceSpec::Disk(DiskSpec {
                 source: DiskSource::File("d".into()),
                 read_only: true,
@@ -101,11 +102,12 @@ fn field_layouts_match_the_protocol_doc() {
     .unwrap();
     #[rustfmt::skip]
     let want = [
-        41, 0, 0, 0, 0x01, 0x01,
+        45, 0, 0, 0, 0x01, 0x01,
         1, 0, 0, 0, b'a',                       // name
         0, 0x10, 0, 0, 0, 0, 0, 0,              // ram_size u64
         1, 5, 0, 0, 0,                          // clock_hz Some(5)
         7, 0, 0, 0,                             // nominal_hz
+        2, 0, 0, 0,                             // harts
         1, 0, 0, 0,                             // 1 device
         1, 1, 1, 0, 0, 0, b'd', 1,              // disk, file "d", read-only
         1, 0, 0, 0, 0xee,                       // program

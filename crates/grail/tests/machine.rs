@@ -457,6 +457,56 @@ fn cli_rejects_bad_ram_and_clock_values() {
     }
 }
 
+/// `--harts N` builds a machine of N harts: `examples/smp` runs on all of them, and
+/// the trace names the hart of each instruction.
+#[test]
+fn cli_harts_flag() {
+    let elf = example("smp");
+    let elf = elf.to_str().unwrap();
+    let out = grail(&["--harts", "4", elf]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.starts_with("harts: 4\namoadd: 4000 = 4 x 1000\n"),
+        "{stdout}"
+    );
+
+    let out = grail(&["--harts", "2", "--trace", "--max-steps", "3", elf]);
+    assert_eq!(out.status.code(), Some(124));
+    let trace = String::from_utf8(out.stderr).unwrap();
+    let lines: Vec<&str> = trace.lines().take(4).collect();
+    assert_eq!(
+        lines,
+        [
+            "h0 M 00001000: auipc t0, 0x0",
+            "h1 M 00001020: csrrs a0, mhartid, zero",
+            "h0 M 00001004: lw t0, 16(t0)",
+            "h1 M 00001024: slli t1, a0, 2",
+        ]
+    );
+
+    for (args, message) in [
+        (
+            &["--harts", "0", elf][..],
+            "--harts: 0 harts is out of range (1 to 8)",
+        ),
+        (
+            &["--harts", "9", elf],
+            "--harts: 9 harts is out of range (1 to 8)",
+        ),
+        (
+            &["--harts", "two", elf],
+            "--harts: 'two' is not a whole number of harts",
+        ),
+        (&[elf, "--harts"], "--harts needs a value"),
+    ] {
+        let out = grail(args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains(message), "{args:?}: {err}");
+    }
+}
+
 #[test]
 fn usage_documents_clock_and_its_units() {
     let out = grail(&["--help"]);
@@ -468,6 +518,7 @@ fn usage_documents_clock_and_its_units() {
         "--clock 1.5MHz",
         "--ram MiB",
         "1 to 2048",
+        "--harts N",
     ] {
         assert!(usage.contains(text), "usage lacks {text:?}:\n{usage}");
     }

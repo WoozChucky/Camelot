@@ -244,6 +244,43 @@ fn received_frames_break_a_reservation() {
     }
 }
 
+/// On a machine of several harts a received frame breaks every hart's reservation on
+/// the words it writes, not only hart 0's.
+#[test]
+fn received_frames_break_every_harts_reservation() {
+    let hub = Hub::new();
+    let config = MachineConfig {
+        harts: 3,
+        ..on_hub(&hub)
+    };
+    let code = [lr_w(T0, A0), DEC_T1, BNEZ_T1_BACK, sc_w(T3, A1, A0), HALT];
+    let mut m = bare_machine(config, &code);
+    let mut peer = hub.attach();
+    peer.send(&[0xab; 60]).unwrap();
+    // Hart 1 reserves the frame's first word, hart 2 the word past it, hart 0 the
+    // descriptor's length and status.
+    for (id, addr) in [(0, RX_RING + 4), (1, RX_BUF), (2, RX_BUF + 60)] {
+        let hart = m.cpu.hart_mut(id);
+        hart.pc = RAM_BASE;
+        hart.waiting = false;
+        hart.x[A0] = addr;
+        hart.x[A1] = 0x1111_1111;
+        hart.x[T1] = net::POLL_STEPS;
+    }
+    for _ in 0..10_000 {
+        if m.cpu.harts().iter().all(|h| h.pc == RAM_BASE + 16) {
+            break;
+        }
+        m.cpu.step();
+    }
+    assert!(m.cpu.harts().iter().all(|h| h.pc == RAM_BASE + 16), "no trap");
+    assert_eq!(word(&mut m, NET_BASE + net::REG_RX_HEAD), 1, "the frame arrived");
+    let sc: Vec<u32> = m.cpu.harts().iter().map(|h| h.x[T3]).collect();
+    assert_eq!(sc, [1, 1, 0], "only hart 2's word was not written");
+    assert_eq!(word(&mut m, RX_BUF), 0xabab_abab);
+    assert_eq!(word(&mut m, RX_BUF + 60), 0x1111_1111);
+}
+
 /// With a real-time clock, a hart parked in `wfi` has its idle ticks skipped in bulk
 /// (`Cpu::idle`). Its card must still poll on time among them, not only every few
 /// hundred batches, and what it receives there breaks a reservation too.
@@ -261,7 +298,7 @@ fn paced_idle_cards_poll_and_break_reservations() {
     m.cpu.x[A0] = RX_BUF;
     m.cpu.x[A1] = 0x1111_1111;
     m.cpu.csr.mie = 1 << 7; // MTIE
-    m.cpu.bus.clint.mtimecmp = 3000;
+    m.cpu.bus.clint.mtimecmp[0] = 3000;
 
     // The first batch is 1000 ticks (1 ms): lr.w, wfi, then 997 skipped at once and one
     // more step. Only 3 ticks ran one by one, fewer than POLL_STEPS: the card polls only
@@ -282,6 +319,116 @@ fn paced_idle_cards_poll_and_break_reservations() {
     assert_eq!(m.cpu.pc, RAM_BASE + 12, "woke up at the timer and ran sc.w");
     assert_eq!(m.cpu.x[T3], 1, "sc.w failed");
     assert_eq!(word(&mut m, RX_BUF), 0xabab_abab);
+}
+
+/// The paced skip polls the cards too ([`grail::bus::Bus::skip`]): a frame received
+/// while every hart waits breaks every hart's reservation on what it writes.
+#[test]
+fn paced_idle_cards_break_every_harts_reservation() {
+    let hub = Hub::new();
+    let config = MachineConfig {
+        harts: 2,
+        clock_hz: Some(1_000_000),
+        ..on_hub(&hub)
+    };
+    let mut m = bare_machine(config, &[lr_w(T0, A0), WFI, sc_w(T3, A1, A0), HALT]);
+    let mut peer = hub.attach();
+    peer.send(&[0xab; 60]).unwrap();
+    // Hart 0 reserves the frame's first word, hart 1 a later one; both wait for the
+    // timer at tick 3000 (interrupts off, so no trap).
+    for (id, addr) in [(0, RX_BUF), (1, RX_BUF + 32)] {
+        let hart = m.cpu.hart_mut(id);
+        hart.pc = RAM_BASE;
+        hart.waiting = false;
+        hart.x[A0] = addr;
+        hart.x[A1] = 0x1111_1111;
+        hart.csr.mie = 1 << 7; // MTIE
+        m.cpu.bus.clint.mtimecmp[id] = 3000;
+    }
+    // Only a few ticks of the first batch run one by one: the card polls in the skip.
+    assert_eq!(m.run_for(u64::MAX, &mut |_| {}), 1000);
+    assert!(m.cpu.all_idle());
+    assert_eq!(word(&mut m, NET_BASE + net::REG_RX_HEAD), 1, "the card polled");
+    for _ in 0..1000 {
+        if m.cpu.harts().iter().all(|h| h.pc == RAM_BASE + 12) {
+            break;
+        }
+        if let Some(d) = m.pace_delay() {
+            std::thread::sleep(d);
+        }
+        m.run_for(u64::MAX, &mut |_| {});
+    }
+    assert!(
+        m.cpu.harts().iter().all(|h| h.pc == RAM_BASE + 12),
+        "both ran sc.w"
+    );
+    let sc: Vec<u32> = m.cpu.harts().iter().map(|h| h.x[T3]).collect();
+    assert_eq!(sc, [1, 1], "both sc.w failed");
+    assert_eq!(word(&mut m, RX_BUF), 0xabab_abab);
+    assert_eq!(word(&mut m, RX_BUF + 32), 0xabab_abab);
+}
+
+/// Where [`transmit_completions_break_every_harts_reservation`] keeps its transmit
+/// ring (one descriptor) and the frame.
+const TX_RING: u32 = RAM_BASE + 0x3000;
+const TX_BUF: u32 = RAM_BASE + 0x3100;
+/// `sw t2, 0(t4)`.
+const SW_T2_T4: u32 = 0x007e_a023;
+const NOP: u32 = 0x0000_0013;
+
+/// Ringing the transmit doorbell sends at once, and the card writes each descriptor's
+/// length and status back into RAM: a write like a hart's store (spec section 4.1), so
+/// it breaks the reservation of any hart on that word, not only the one that rang.
+#[test]
+fn transmit_completions_break_every_harts_reservation() {
+    let hub = Hub::new();
+    let _peer = hub.attach();
+    let config = MachineConfig {
+        harts: 3,
+        ..on_hub(&hub)
+    };
+    // Harts 1 and 2: lr.w, a loop, sc.w. Hart 0 (at RAM_BASE + 0x100): a few nops, then
+    // the doorbell, while the others are in their loops.
+    let mut m = bare_machine(
+        config,
+        &[lr_w(T0, A0), DEC_T1, BNEZ_T1_BACK, sc_w(T3, A1, A0), HALT],
+    );
+    let ringer: Vec<u8> = [NOP, NOP, NOP, SW_T2_T4, HALT]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let bus = &mut m.cpu.bus;
+    bus.load(RAM_BASE + 0x100, &ringer).unwrap();
+    bus.write(TX_RING, 4, TX_BUF).unwrap();
+    bus.write(TX_RING + 4, 4, 0xffff_0000 | 60).unwrap(); // length 60, status not yet set
+    bus.write(NET_BASE + net::REG_TX_BASE, 4, TX_RING).unwrap();
+    bus.write(NET_BASE + net::REG_TX_SIZE, 4, 1).unwrap();
+    let h0 = m.cpu.hart_mut(0);
+    h0.pc = RAM_BASE + 0x100;
+    h0.x[7] = 1; // t2: the new TX_TAIL
+    h0.x[29] = NET_BASE + net::REG_TX_TAIL; // t4
+                                            // Hart 1 reserves the descriptor's length and status, hart 2 its address (only read).
+    for (id, addr) in [(1, TX_RING + 4), (2, TX_RING)] {
+        let hart = m.cpu.hart_mut(id);
+        hart.pc = RAM_BASE;
+        hart.waiting = false;
+        hart.x[A0] = addr;
+        hart.x[A1] = 0x1111_1111;
+        hart.x[T1] = 10;
+    }
+    for _ in 0..200 {
+        m.cpu.step();
+    }
+    assert_eq!(m.cpu.hart(0).pc, RAM_BASE + 0x110, "hart 0 rang the doorbell");
+    assert!(
+        m.cpu.harts()[1..].iter().all(|h| h.pc == RAM_BASE + 16),
+        "no trap"
+    );
+    assert_eq!(word(&mut m, NET_BASE + net::REG_TX_HEAD), 1, "the frame went");
+    let sc: Vec<u32> = m.cpu.harts()[1..].iter().map(|h| h.x[T3]).collect();
+    assert_eq!(sc, [1, 0], "only hart 2's word was not written");
+    assert_eq!(word(&mut m, TX_RING + 4), 60, "the card's length and status stay");
+    assert_eq!(word(&mut m, TX_RING), 0x1111_1111);
 }
 
 /// A writer the test can still read after handing it over.

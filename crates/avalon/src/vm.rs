@@ -883,12 +883,15 @@ fn pointer_input(change: PointerChange) -> PointerInput {
 }
 
 /// Whether a full-speed machine is stalled in `wfi` with only an external interrupt
-/// (input) left to wake it: no interrupt is pending, and the timer cannot fire (it is
-/// masked or not set; a set timer would end the wait at the next step).
+/// (input) left to wake it: every hart waits with no interrupt pending, and no hart's
+/// timer can fire (it is masked or not set; a set timer would end the wait at the next
+/// step).
 fn parked(machine: &Machine) -> bool {
     let cpu = &machine.cpu;
-    let timer_armed = cpu.csr.mie & (1 << IRQ_M_TIMER) != 0 && cpu.bus.clint.mtimecmp != u64::MAX;
-    cpu.waiting && !timer_armed
+    let timer_armed = |hart: &grail::cpu::Hart| {
+        hart.csr.mie & (1 << IRQ_M_TIMER) != 0 && cpu.bus.clint.mtimecmp[hart.id as usize] != u64::MAX
+    };
+    cpu.all_idle() && !cpu.harts().iter().any(timer_armed)
 }
 
 fn event_frame(msg: &Message) -> Frame {
@@ -970,6 +973,30 @@ mod tests {
         vm.console_output(&mut inner, (0..=255).cycle().take(SCROLLBACK + 7).collect());
         assert_eq!(inner.scrollback.len(), SCROLLBACK);
         assert_eq!(inner.scrollback[0], 7);
+    }
+
+    /// A full-speed VM naps between slices only when every hart is parked: one hart in
+    /// `wfi` while another runs must not slow the machine down, nor may another hart's
+    /// armed timer be missed.
+    #[test]
+    fn parked_looks_at_every_hart() {
+        let mut m = Machine::new(MachineConfig {
+            harts: 2,
+            ..MachineConfig::with_ram(1 << 20)
+        })
+        .unwrap();
+        m.cpu.hart_mut(0).waiting = true;
+        m.cpu.hart_mut(1).waiting = false;
+        assert!(!parked(&m), "hart 1 runs");
+        m.cpu.hart_mut(1).waiting = true;
+        assert!(parked(&m), "both wait, no timer");
+        // A timer set but masked does not wake hart 1; armed (MTIE set too), it does.
+        m.cpu.bus.clint.mtimecmp[1] = 1_000_000;
+        assert!(parked(&m));
+        m.cpu.hart_mut(1).csr.mie = 1 << IRQ_M_TIMER;
+        assert!(!parked(&m), "hart 1's timer is armed");
+        m.cpu.bus.clint.mtimecmp[1] = u64::MAX;
+        assert!(parked(&m), "MTIE without a deadline");
     }
 
     /// A VM with one network card, in state created.
