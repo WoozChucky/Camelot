@@ -16,7 +16,8 @@
 //! [`grail::console::RawMode`], shared with Grail's own console) and stdout.
 
 use avalon_proto::{
-    AttachKind, Connection, Error, Message, MessageKind, VmRef, VmState, VmSummary, DEFAULT_AVALON_ADDR,
+    kind_of, AttachKind, Connection, Error, Frame, Message, MessageKind, VmRef, VmState, VmSummary,
+    DEFAULT_AVALON_ADDR,
 };
 use std::io::{self, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
@@ -77,7 +78,9 @@ fn ended(state: VmState) -> bool {
 /// What the session loop waits for: the server and the input, on one channel, so a
 /// single thread handles both in the order they happen.
 enum Event {
-    Server(Result<Message, Error>),
+    /// A frame, still undecoded so that its type is known even when it does not
+    /// decode, or the error that ended the reading.
+    Server(Result<Frame, Error>),
     Input(Vec<u8>),
     InputEnded,
 }
@@ -148,11 +151,13 @@ impl Session {
         out.write_all(&self.scrollback)?;
         out.flush()?;
 
-        // Events read while attaching come first.
+        // Events read while attaching come first. `request` queued only events, and
+        // the ones that failed to decode as their errors: those are passed over.
         while self.conn.queued_events() > 0 {
-            let event = self.conn.recv();
-            if let Some(end) = self.on_server(event, out, notices)? {
-                return Ok(end);
+            if let Ok(event) = self.conn.recv() {
+                if let Some(end) = self.on_server(event.type_code(), Ok(event), out, notices)? {
+                    return Ok(end);
+                }
             }
         }
         if ended(self.vm.state) {
@@ -164,10 +169,12 @@ impl Session {
         // The reading thread waits for as long as the session lasts.
         reader.get_ref().set_read_timeout(None)?;
         let server_tx = tx.clone();
+        // Whole frames, not messages: a frame that fails to decode must still be placed
+        // by its type (a reply that fails to decode is still the reply).
         let reading = std::thread::spawn(move || loop {
-            let msg = reader.recv();
-            let fatal = matches!(&msg, Err(e) if e.is_fatal());
-            if server_tx.send(Event::Server(msg)).is_err() || fatal {
+            let frame = reader.recv_frame();
+            let fatal = matches!(&frame, Err(e) if e.is_fatal());
+            if server_tx.send(Event::Server(frame)).is_err() || fatal {
                 break;
             }
         });
@@ -205,11 +212,13 @@ impl Session {
                 }
             };
             match event {
-                Event::Server(msg) => {
-                    if let Some(end) = self.on_server(msg, out, notices)? {
+                Event::Server(frame) => {
+                    if let Some(end) = self.on_frame(frame, out, notices)? {
                         return Ok(end);
                     }
                 }
+                // Keys typed while a detach waits for its answer go nowhere: the
+                // session is ending, and one ConsoleDetach is enough.
                 Event::Input(_) | Event::InputEnded if self.detaching.is_some() => {}
                 Event::Input(bytes) => {
                     let key = self.detach_key;
@@ -240,20 +249,50 @@ impl Session {
         Ok(Instant::now() + self.detach_timeout)
     }
 
-    /// Handles what the server sent. Returns the end of the session, if it is one.
+    /// Handles a frame the reading thread got, or the error that ended its reading.
+    /// Returns the end of the session, if it is one.
+    fn on_frame(
+        &mut self,
+        frame: Result<Frame, Error>,
+        out: &mut dyn Write,
+        notices: &mut dyn Write,
+    ) -> Result<Option<End>, Error> {
+        match frame {
+            Ok(frame) => self.on_server(frame.ty, frame.message(), out, notices),
+            // The server hanging up on a detach: the detach is done all the same.
+            Err(Error::Closed) if self.detaching.is_some() => Ok(self.detaching),
+            Err(e) if e.is_fatal() => Err(e),
+            // A frame too short to hold a type (consumed whole). It is no event, so it
+            // cannot be placed while an answer is due; otherwise it is set aside.
+            Err(e) => match self.detaching {
+                Some(_) => Err(out_of_step(e)),
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// Handles a frame of type `ty` from the server, decoded as `msg`. Returns the end
+    /// of the session, if it is one.
+    ///
+    /// The only request a running session sends is `ConsoleDetach`. While its answer
+    /// is due, frames are placed as `Connection::request` places them (protocol
+    /// section 4): events are handled, a reply-type frame is the answer even when it
+    /// fails to decode, and anything else (a request, a type not in the catalogue)
+    /// means the two sides are out of step.
     fn on_server(
         &mut self,
+        ty: u16,
         msg: Result<Message, Error>,
         out: &mut dyn Write,
         notices: &mut dyn Write,
     ) -> Result<Option<End>, Error> {
         let id = self.vm.id;
-        match msg {
-            Ok(Message::ConsoleOutput { vm, data }) if vm == id => {
+        match (kind_of(ty), msg) {
+            (Some(MessageKind::Event), Ok(Message::ConsoleOutput { vm, data })) if vm == id => {
                 out.write_all(&data)?;
                 out.flush()?;
             }
-            Ok(Message::VmStateChanged { vm, state }) if vm == id => {
+            (Some(MessageKind::Event), Ok(Message::VmStateChanged { vm, state })) if vm == id => {
                 self.vm.state = state;
                 if ended(state) {
                     return Ok(Some(End::VmEnded(state)));
@@ -261,24 +300,37 @@ impl Session {
                 // Not fatal if stderr is gone: the console is what matters.
                 let _ = writeln!(notices, "herald: VM {id} is {state}");
             }
-            Ok(Message::Detached {
-                vm,
-                kind: AttachKind::Console,
-            }) if vm == id => return Ok(Some(End::Destroyed)),
-            // The only request a running session sends is ConsoleDetach, so a reply
-            // (Ok, or an Error if the server had already let go) is its answer.
-            Ok(reply) if reply.kind() == MessageKind::Reply => match self.detaching {
+            (
+                Some(MessageKind::Event),
+                Ok(Message::Detached {
+                    vm,
+                    kind: AttachKind::Console,
+                }),
+            ) if vm == id => return Ok(Some(End::Destroyed)),
+            // Other events (other VMs', the screen's) and events that do not decode:
+            // set aside, never answered.
+            (Some(MessageKind::Event), _) => {}
+            // A reply (Ok, or an Error if the server had already let go) is the answer
+            // to the ConsoleDetach, whatever it holds.
+            (Some(MessageKind::Reply), _) => match self.detaching {
                 Some(end) => return Ok(Some(end)),
-                None => return Err(Error::Unexpected(reply.type_code())),
+                None => return Err(Error::Unexpected(ty)),
             },
-            Ok(_) => {}
-            Err(Error::Closed) if self.detaching.is_some() => return Ok(self.detaching),
-            Err(e) if e.is_fatal() => return Err(e),
-            // An event that does not decode: set aside, never answered.
-            Err(_) => {}
+            // A request, or a type this client does not know.
+            (Some(MessageKind::Request) | None, msg) => {
+                if self.detaching.is_some() {
+                    return Err(out_of_step(msg.err().unwrap_or(Error::Unexpected(ty))));
+                }
+            }
         }
         Ok(None)
     }
+}
+
+/// The error for a frame that cannot be placed while the answer to a request is due
+/// (as `Connection::request` reports it).
+fn out_of_step(cause: Error) -> Error {
+    Error::OutOfStep(format!("waiting for a reply, got: {cause}"))
 }
 
 /// Passes input bytes on to the session loop, a burst at a time, then its end.
@@ -366,16 +418,21 @@ impl<W: Write> Write for Utf8Lossy<W> {
 
 /// Parses a `--server` value: `host:port`, or just a host or IP address (Avalon's
 /// default port, 7400). IPv6 addresses with a port go in brackets: `[::1]:7400`.
-pub fn parse_server(s: &str) -> Result<SocketAddr, String> {
+///
+/// Returns every address a host name resolves to, for `Connection::connect` to try in
+/// turn: `localhost` is often `[::1]` first, while Avalon listens on `127.0.0.1` by
+/// default. IPv4 addresses go first for that reason (Windows takes about two seconds
+/// to give up on a refused `[::1]`); the resolver's order is kept otherwise.
+pub fn parse_server(s: &str) -> Result<Vec<SocketAddr>, String> {
     let default_port = DEFAULT_AVALON_ADDR
         .parse::<SocketAddr>()
         .expect("the default address parses")
         .port();
     if let Ok(addr) = s.parse::<SocketAddr>() {
-        return Ok(addr);
+        return Ok(vec![addr]);
     }
     if let Ok(ip) = s.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, default_port));
+        return Ok(vec![SocketAddr::new(ip, default_port)]);
     }
     let resolved = if s.is_empty() || s.contains(char::is_whitespace) {
         Err(io::ErrorKind::InvalidInput.into())
@@ -384,8 +441,12 @@ pub fn parse_server(s: &str) -> Result<SocketAddr, String> {
     } else {
         (s, default_port).to_socket_addrs()
     };
-    match resolved.map(|mut addrs| addrs.next()) {
-        Ok(Some(addr)) => Ok(addr),
+    match resolved.map(|addrs| addrs.collect::<Vec<_>>()) {
+        Ok(mut addrs) if !addrs.is_empty() => {
+            // A stable sort: false (IPv4) before true.
+            addrs.sort_by_key(SocketAddr::is_ipv6);
+            Ok(addrs)
+        }
         _ => Err(format!(
             "'{s}' is not a server address (examples: 127.0.0.1:7400, localhost, 10.0.0.5:7500)"
         )),
@@ -435,21 +496,40 @@ mod tests {
 
     #[test]
     fn server_addresses() {
-        assert_eq!(
-            parse_server("127.0.0.1:7500").unwrap(),
-            "127.0.0.1:7500".parse().unwrap()
-        );
-        assert_eq!(
-            parse_server("10.1.2.3").unwrap(),
-            "10.1.2.3:7400".parse().unwrap()
-        );
-        assert_eq!(parse_server("::1").unwrap(), "[::1]:7400".parse().unwrap());
-        assert_eq!(parse_server("[::1]:9").unwrap(), "[::1]:9".parse().unwrap());
-        assert_eq!(parse_server("localhost").unwrap().port(), 7400);
-        assert_eq!(parse_server("localhost:7600").unwrap().port(), 7600);
+        let one = |s: &str| vec![s.parse::<SocketAddr>().unwrap()];
+        assert_eq!(parse_server("127.0.0.1:7500").unwrap(), one("127.0.0.1:7500"));
+        assert_eq!(parse_server("10.1.2.3").unwrap(), one("10.1.2.3:7400"));
+        assert_eq!(parse_server("::1").unwrap(), one("[::1]:7400"));
+        assert_eq!(parse_server("[::1]:9").unwrap(), one("[::1]:9"));
+        // A host name keeps every address it resolves to, IPv4 first: IPv4 loopback
+        // leads, whatever the resolver put first.
+        for (s, port) in [("localhost", 7400), ("localhost:7600", 7600)] {
+            let addrs = parse_server(s).unwrap();
+            assert!(addrs.iter().all(|a| a.port() == port), "{s}: {addrs:?}");
+            assert_eq!(
+                addrs.len(),
+                ("localhost", port).to_socket_addrs().unwrap().count()
+            );
+            assert_eq!(
+                addrs[0],
+                format!("127.0.0.1:{port}").parse().unwrap(),
+                "{s}: {addrs:?}"
+            );
+        }
         for bad in ["", "two words", "127.0.0.1:port", "host:99999"] {
             assert!(parse_server(bad).is_err(), "{bad}");
         }
+    }
+
+    /// `localhost` reaches a server listening on 127.0.0.1 only (Avalon's default),
+    /// even where it resolves to `[::1]` first.
+    #[test]
+    fn localhost_reaches_an_ipv4_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addrs = parse_server(&format!("localhost:{port}")).unwrap();
+        let stream = TcpStream::connect(&addrs[..]).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
     }
 
     #[test]

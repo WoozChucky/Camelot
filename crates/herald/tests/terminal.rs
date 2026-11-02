@@ -695,6 +695,7 @@ mod pty {
         pub rest: [u8; 44],
     }
 
+    pub const ISIG: u32 = 0o1;
     pub const ICANON: u32 = 0o2;
     pub const ECHO: u32 = 0o10;
     const O_RDWR: c_int = 2;
@@ -778,6 +779,10 @@ fn pty_session(leave: Leave) {
     wait_until("raw mode", || attrs(&slave).lflag & ICANON == 0);
     let during = attrs(&slave);
     assert_eq!(during.lflag & (ICANON | ECHO), 0, "{during:?}");
+    // Signals stay on: Ctrl-C typed on a real terminal still interrupts Herald rather
+    // than reach the VM. (Herald has no controlling terminal here, so the Ctrl-C case
+    // below sends the signal itself.)
+    assert_ne!(during.lflag & ISIG, 0, "{during:?}");
 
     let code = match leave {
         Leave::Detach | Leave::Interrupt => {

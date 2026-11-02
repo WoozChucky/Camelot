@@ -8,9 +8,9 @@ use avalon_proto::VmState;
 use common::*;
 use herald::DETACH_KEY;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn herald() -> Command {
     Command::new(env!("CARGO_BIN_EXE_herald"))
@@ -22,7 +22,7 @@ fn stderr(out: &Output) -> String {
 
 #[test]
 fn help_and_bad_flags() {
-    let out = herald().arg("--help").output().unwrap();
+    let out = run(&["--help"]);
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.starts_with("usage: herald [--server ADDR] <vm>"), "{text}");
@@ -34,7 +34,7 @@ fn help_and_bad_flags() {
         &["--server", "not an address", "vm"],
         &["one", "two"],
     ] {
-        let out = herald().args(args).stdin(Stdio::null()).output().unwrap();
+        let out = run(args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         let err = stderr(&out);
         assert!(
@@ -51,11 +51,7 @@ fn nothing_to_connect_to() {
         .local_addr()
         .unwrap()
         .port();
-    let out = herald()
-        .args(["--server", &format!("127.0.0.1:{port}"), "vm"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let out = run(&["--server", &format!("127.0.0.1:{port}"), "vm"]);
     assert_eq!(out.status.code(), Some(1));
     let err = stderr(&out);
     assert!(
@@ -67,11 +63,7 @@ fn nothing_to_connect_to() {
 #[test]
 fn no_such_vm() {
     let server = server();
-    let out = herald()
-        .args(["--server", &server.addr().to_string(), "ghost"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let out = run(&["--server", &server.addr().to_string(), "ghost"]);
     assert_eq!(out.status.code(), Some(1));
     let err = stderr(&out);
     assert!(
@@ -79,6 +71,33 @@ fn no_such_vm() {
         "{err}"
     );
     server.stop().unwrap();
+}
+
+/// A host name is tried at every address it resolves to: `localhost` reaches a
+/// server on 127.0.0.1 (Avalon's default) where it resolves to `[::1]` first.
+#[test]
+fn localhost_reaches_an_ipv4_server() {
+    let server = server();
+    let port = server.addr().port();
+    let id = start_vm(&server, "echo", 1, example("uart-echo"));
+    let out = run(&["--server", &format!("localhost:{port}"), "echo"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.starts_with(&format!(
+            "herald: attached to VM {id} 'echo' (running) on 127.0.0.1:{port};"
+        )),
+        "{err}"
+    );
+    // A server that is not there is named as it was given.
+    server.stop().unwrap();
+    let out = run(&["--server", &format!("localhost:{port}"), "echo"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).starts_with(&format!("herald: cannot connect to localhost:{port}: ")),
+        "{}",
+        stderr(&out)
+    );
 }
 
 /// Spawns `herald <vm>` against `server` with all three streams piped, and waits for
@@ -114,6 +133,57 @@ fn rest_of_stderr() -> String {
     REST.with(|r| r.borrow_mut().take().unwrap().recv_timeout(SLOW).unwrap())
 }
 
+/// Waits for the child to exit, for at most `SLOW`: a Herald that does not end is
+/// killed and fails the test rather than hang it.
+fn wait(child: &mut Child) -> ExitStatus {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if start.elapsed() > SLOW {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("herald is still running after {SLOW:?}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Like `Child::wait_with_output` (stdin, if still held, stays open), with `wait`'s
+/// deadline. A stream already taken comes back empty.
+fn wait_with_output(mut child: Child) -> Output {
+    fn drain(stream: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut seen);
+            }
+            seen
+        })
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let status = wait(&mut child);
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    }
+}
+
+/// Runs `herald args` with stdin at its end, and collects its output.
+fn run(args: &[&str]) -> Output {
+    let child = herald()
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_with_output(child)
+}
+
 /// Reads the child's stdout until it holds `needle`.
 fn read_until(stdout: &mut impl Read, seen: &mut Vec<u8>, needle: &str) {
     let start = Instant::now();
@@ -136,7 +206,7 @@ fn a_session_through_pipes() {
     assert_eq!(
         line.trim_end(),
         format!(
-            "herald: attached to VM {id} 'echo' (running) on {}; the end of the input detaches",
+            "herald: attached to VM {id} 'echo' (running) on {}; Ctrl-] or the end of the input detaches",
             server.addr()
         )
     );
@@ -149,7 +219,7 @@ fn a_session_through_pipes() {
     read_until(&mut stdout, &mut seen, "!");
     // The detach key works through a pipe too.
     stdin.write_all(&[DETACH_KEY]).unwrap();
-    let status = child.wait().unwrap();
+    let status = wait(&mut child);
     assert!(status.success());
     stdout.read_to_end(&mut seen).unwrap();
     assert_eq!(seen, b"hi there\n!");
@@ -161,11 +231,7 @@ fn a_session_through_pipes() {
     assert_eq!(state(&server, id), VmState::Running);
 
     // With stdin at its end at once: the scrollback, and out.
-    let out = herald()
-        .args(["--server", &server.addr().to_string(), &id.to_string()])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let out = run(&["--server", &server.addr().to_string(), &id.to_string()]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(out.stdout, b"hi there\n!");
     assert!(
@@ -188,7 +254,7 @@ fn the_vm_exiting_ends_herald() {
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(b"bye").unwrap();
     stdin.write_all(&[4]).unwrap(); // EOT halts uart-echo
-    let out = child.wait_with_output().unwrap();
+    let out = wait_with_output(child);
     assert!(out.status.success());
     assert_eq!(out.stdout, b"bye");
     assert_eq!(
@@ -201,7 +267,7 @@ fn the_vm_exiting_ends_herald() {
     assert!(line.contains("(exited(0))"), "{line}");
     // Held open: Herald ends because of the VM, not the input.
     let _stdin = child.stdin.take().unwrap();
-    let out = child.wait_with_output().unwrap();
+    let out = wait_with_output(child);
     assert!(out.status.success());
     assert_eq!(out.stdout, b"bye");
     assert_eq!(

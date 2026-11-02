@@ -1,13 +1,16 @@
 //! The streaming layer against a scripted fake server, for what a real Avalon does
-//! not do on demand: events queued while attaching, events for other VMs and events
-//! that do not decode, a server that never confirms a detach, one that answers out of
-//! turn, and one that goes away.
+//! not do on demand: events queued while attaching, events for other VMs, events
+//! that do not decode and frames of unknown types, a server that never confirms a
+//! detach, one whose answer does not decode, one that sends a frame out of place or
+//! hangs up while a detach is due, input while detaching, a server that answers out
+//! of turn, and one that goes away.
 
 mod common;
 
 use avalon_proto::{AttachKind, Error, Frame, Message, VmState};
 use common::*;
 use herald::{End, DETACH_KEY};
+use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
 const VM: u32 = 7;
@@ -40,6 +43,12 @@ fn output_in_order_and_a_lost_connection() {
         conn.send(&Message::Detached {
             vm: VM,
             kind: AttachKind::Screen,
+        })
+        .unwrap();
+        // A frame of a type Herald does not know, with no answer due: passed over.
+        conn.send_frame(&Frame {
+            ty: 0x7777,
+            payload: vec![1, 2, 3],
         })
         .unwrap();
         conn.send(&output(b"live")).unwrap();
@@ -103,6 +112,116 @@ fn output_before_the_detach_reply_is_shown() {
     herald.close_input();
     assert_eq!(herald.end().unwrap(), End::InputEnded);
     assert_eq!(herald.output.text(), "last words");
+    server.join().unwrap();
+}
+
+/// A reply-type frame that fails to decode is still the answer to the detach (the
+/// protocol, section 4): the session ends then, not after its timeout.
+#[test]
+fn a_detach_reply_that_does_not_decode_still_answers() {
+    let (addr, server) = fake_server(|mut conn| {
+        fake_attach(&mut conn, VM, VmState::Running, b"", &[]);
+        assert_eq!(conn.recv().unwrap(), Message::ConsoleDetach { vm: VM });
+        // An Ok with a byte too many.
+        conn.send_frame(&Frame {
+            ty: Message::Ok.type_code(),
+            payload: vec![0],
+        })
+        .unwrap();
+        assert!(conn.recv().is_err());
+    });
+    let mut herald = Herald::attach_at(&addr, avalon_proto::VmRef::Id(VM), |s| {
+        // Far beyond `end`'s own wait, so only the reply can end the session in time.
+        s.detach_timeout = Duration::from_secs(3600)
+    });
+    herald.type_keys(&[DETACH_KEY]);
+    assert_eq!(herald.end().unwrap(), End::Detached);
+    server.join().unwrap();
+}
+
+/// While the detach waits for its answer, a frame that is neither an event nor a
+/// reply (a request, or a type not in the catalogue) cannot be placed: the session
+/// ends with `OutOfStep`, rather than take a later reply for the answer.
+#[test]
+fn a_frame_out_of_place_while_detaching_is_out_of_step() {
+    let request = Frame::from_message(&Message::GetVmInfo {
+        vm: avalon_proto::VmRef::Id(VM),
+    })
+    .unwrap();
+    let unknown = Frame {
+        ty: 0x7777,
+        payload: Vec::new(),
+    };
+    for frame in [request, unknown] {
+        let (addr, server) = fake_server(move |mut conn| {
+            fake_attach(&mut conn, VM, VmState::Running, b"", &[]);
+            assert_eq!(conn.recv().unwrap(), Message::ConsoleDetach { vm: VM });
+            conn.send_frame(&frame).unwrap();
+            // Herald may have hung up already.
+            let _ = conn.send(&Message::Ok);
+            let _ = conn.recv();
+        });
+        let mut herald = Herald::attach_at(&addr, avalon_proto::VmRef::Id(VM), |s| {
+            s.detach_timeout = Duration::from_secs(3600)
+        });
+        herald.type_keys(&[DETACH_KEY]);
+        match herald.end() {
+            Err(Error::OutOfStep(_)) => {}
+            other => panic!("{other:?}"),
+        }
+        server.join().unwrap();
+    }
+}
+
+/// Keys typed, and the end of the input, while the detach waits for its answer go
+/// nowhere: no ConsoleInput, no second ConsoleDetach.
+#[test]
+fn input_while_detaching_is_dropped() {
+    let (typed_tx, typed) = std::sync::mpsc::channel::<()>();
+    let (detach_tx, detach_seen) = std::sync::mpsc::channel::<()>();
+    let (addr, server) = fake_server(move |mut conn| {
+        fake_attach(&mut conn, VM, VmState::Running, b"", &[]);
+        assert_eq!(conn.recv().unwrap(), Message::ConsoleDetach { vm: VM });
+        detach_tx.send(()).unwrap();
+        typed.recv_timeout(SLOW).unwrap();
+        // Herald would send at once what it was going to send.
+        conn.get_ref()
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        match conn.recv() {
+            Err(Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            other => panic!("sent while detaching: {other:?}"),
+        }
+        conn.get_ref().set_read_timeout(Some(SLOW)).unwrap();
+        conn.send(&Message::Ok).unwrap();
+        assert!(conn.recv().is_err());
+    });
+    let mut herald = Herald::attach_at(&addr, avalon_proto::VmRef::Id(VM), |s| {
+        s.detach_timeout = Duration::from_secs(3600)
+    });
+    herald.type_keys(&[DETACH_KEY]);
+    detach_seen.recv_timeout(SLOW).unwrap();
+    herald.type_keys(b"more");
+    herald.close_input();
+    typed_tx.send(()).unwrap();
+    assert_eq!(herald.end().unwrap(), End::Detached);
+    server.join().unwrap();
+}
+
+/// A server that hangs up on the detach instead of answering it: the detach is done
+/// all the same, not an error.
+#[test]
+fn a_hang_up_on_the_detach_is_a_detach() {
+    let (addr, server) = fake_server(|mut conn| {
+        fake_attach(&mut conn, VM, VmState::Running, b"", &[]);
+        assert_eq!(conn.recv().unwrap(), Message::ConsoleDetach { vm: VM });
+        // Dropping the connection closes it.
+    });
+    let mut herald = Herald::attach_at(&addr, avalon_proto::VmRef::Id(VM), |s| {
+        s.detach_timeout = Duration::from_secs(3600)
+    });
+    herald.type_keys(&[DETACH_KEY]);
+    assert_eq!(herald.end().unwrap(), End::Detached);
     server.join().unwrap();
 }
 
