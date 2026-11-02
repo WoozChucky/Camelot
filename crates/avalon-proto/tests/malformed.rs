@@ -305,6 +305,17 @@ fn invalid_payloads() -> Vec<(&'static str, u16, Vec<u8>)> {
             ]),
         ),
         (
+            "more forwarding rules than MAX_FORWARDS",
+            ty::CREATE_SWITCH,
+            cat(&[
+                &le(1),
+                b"s",
+                &[1],
+                &le(MAX_FORWARDS as u32 + 1),
+                &[1, 127, 0, 0, 1, 0, 0, 10, 0, 2, 15, 80, 0].repeat(MAX_FORWARDS + 1),
+            ]),
+        ),
+        (
             "capture option tag",
             ty::CAPTURE_SWITCH,
             cat(&[&le(1), b"s", &[2]]),
@@ -456,6 +467,50 @@ fn encoder_refuses_what_the_decoder_would_reject() {
     for msg in bad {
         assert!(matches!(encode(&msg), Err(Error::Invalid(_))), "{msg:?}");
         assert!(msg.check().is_err());
+    }
+}
+
+#[test]
+fn a_gateway_has_at_most_max_forwards_rules() {
+    // Each rule binds a socket on the server's host, so the count is bounded: the
+    // encoder refuses one rule too many, in a request or in a SwitchList, and
+    // MAX_FORWARDS rules go through.
+    let rules = |n: usize| -> Vec<PortForward> {
+        (0..n)
+            .map(|i| PortForward {
+                proto: FwdProto::Tcp,
+                host: format!("127.0.0.1:{}", 20000 + i).parse().unwrap(),
+                guest: "10.0.2.15:80".parse().unwrap(),
+            })
+            .collect()
+    };
+    let create = |n| Message::CreateSwitch {
+        name: "s".into(),
+        nat: Some(NatConfig { hostfwd: rules(n) }),
+    };
+    let set = |n| Message::SetSwitchNat {
+        switch: "s".into(),
+        nat: Some(NatConfig { hostfwd: rules(n) }),
+    };
+    let list = |n| Message::SwitchList {
+        switches: vec![SwitchInfo {
+            name: "s".into(),
+            capture: None,
+            nat: Some(NatInfo {
+                hostfwd: rules(n),
+                leases: Vec::new(),
+            }),
+            ports: Vec::new(),
+        }],
+    };
+    for make in [&create as &dyn Fn(usize) -> Message, &set, &list] {
+        let fine = make(MAX_FORWARDS);
+        let (back, _) = decode(&encode(&fine).unwrap()).unwrap();
+        assert_eq!(back, fine);
+        let over = make(MAX_FORWARDS + 1);
+        assert!(matches!(encode(&over), Err(Error::Invalid(_))), "{}", over.name());
+        // (invalid_payloads has the frame a peer could send anyway, which the decoder
+        // reports as Malformed.)
     }
 }
 

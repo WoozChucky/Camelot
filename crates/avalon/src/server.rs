@@ -701,7 +701,17 @@ impl Shared {
             switch.set_nat(Some(nat))?;
         }
         let mut switches = lock(&self.switches);
-        if let Err(fail) = room(&switches) {
+        // A shutdown that began meanwhile has closed the switches it took from the
+        // table; this one, inserted after, would never be closed (its gateway's thread
+        // and host ports would outlive the server). `stopping` is set before the
+        // shutdown takes the table's lock, so seeing it false here, under that lock,
+        // means the shutdown will find this switch.
+        let refused = if self.stopping.load(Ordering::SeqCst) {
+            Err(shutting_down())
+        } else {
+            room(&switches)
+        };
+        if let Err(fail) = refused {
             drop(switches);
             switch.close();
             return Err(fail);

@@ -858,6 +858,20 @@ fn switches_end_to_end() {
             404,
             "has 2 network cards",
         ),
+        // Unplugging says so the same way: 404 for a card or a switch that is not there.
+        (
+            "switches/wan/detach",
+            obj([("vm", "user".into()), ("card", 9u8.into())]),
+            404,
+            "has 2 network cards",
+        ),
+        (
+            "switches/nope/detach",
+            obj([("vm", "user".into())]),
+            404,
+            "no switch named 'nope'",
+        ),
+        ("switches/wan/detach", obj([("vm", "ghost".into())]), 404, "ghost"),
         ("switches/wan/attach", obj([]), 400, "vm: "),
         (
             "switches/wan/attach",

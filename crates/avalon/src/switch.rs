@@ -17,6 +17,9 @@
 //! is found again by flooding. The table holds at most [`MAC_TABLE_SIZE`] addresses,
 //! so a guest that makes up source addresses cannot make it grow without bound: when
 //! it is full of fresh entries, new addresses are not learned and their frames flood.
+//! Nor can it take another port's address: a card's frame whose source is the address
+//! of another port (another card, or the gateway) goes nowhere, so the frames meant for
+//! that port keep going to it.
 //!
 //! A switch may also have one port with a **NAT gateway** plugged in ([`Switch::set_nat`],
 //! protocol doc section 6.7, "NAT"): the user-mode gateway of `crates/gateway`, which
@@ -414,6 +417,13 @@ impl Switch {
         if frame.len() < MIN_FRAME {
             return Vec::new();
         }
+        // A card that sends from the address of another port (the gateway's, or another
+        // card's) would move that address to its own port in the table, and receive
+        // the frames meant for it: such frames go nowhere.
+        let src = mac_at(frame, 6);
+        if from_card.is_some() && st.ports.iter().any(|p| p.id != from && p.mac == src) {
+            return Vec::new();
+        }
         let forward = st.table.forward(from, frame, now);
         let mut rung = Vec::new();
         for port in &mut st.ports {
@@ -428,9 +438,7 @@ impl Switch {
             // The gateway counts flows and gives leases per MAC address: a card
             // sending from addresses that are not its own could be many machines to
             // it, and use up what is meant for the others.
-            if matches!(port.plugged, Plugged::Gateway(_))
-                && from_card.is_some_and(|mac| mac != mac_at(frame, 6))
-            {
+            if matches!(port.plugged, Plugged::Gateway(_)) && from_card.is_some_and(|mac| mac != src) {
                 continue;
             }
             if port.queue.len() >= PORT_QUEUE {

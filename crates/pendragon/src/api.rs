@@ -636,9 +636,19 @@ impl App {
                 .attach_card(&vm, card, switch)
                 .map_err(|e| client_fail("Avalon", e))?;
         } else {
-            // Unplugging takes no switch: make sure it is this one's card.
+            // Unplugging takes no switch: make sure it is this one's card. (The card
+            // could still move between this look and the detach, as with any two
+            // requests; the protocol's DetachCard names no switch to check against.)
+            let switches = avalon.list_switches().map_err(|e| client_fail("Avalon", e))?;
+            if !switches.iter().any(|s| s.name == switch) {
+                return Err(Fail {
+                    status: 404,
+                    message: format!("no switch named '{switch}'"),
+                    code: Some(ErrorCode::NoSuchSwitch),
+                });
+            }
             let details = avalon.vm_info(&vm).map_err(|e| client_fail("Avalon", e))?;
-            let on = details
+            let cards: Vec<Option<&str>> = details
                 .vm
                 .profile
                 .devices
@@ -647,8 +657,21 @@ impl App {
                     DeviceSpec::Net(net) => Some(net.switch.as_deref()),
                     _ => None,
                 })
-                .nth(card as usize);
-            if on != Some(Some(switch)) {
+                .collect();
+            let Some(&on) = cards.get(card as usize) else {
+                // As Avalon says it to an attach.
+                let has = match cards.len() {
+                    0 => "no network cards".to_string(),
+                    1 => "one network card, 0".to_string(),
+                    n => format!("{n} network cards, 0 to {}", n - 1),
+                };
+                return Err(Fail {
+                    status: 404,
+                    message: format!("VM {} ('{}') has {has}", details.vm.id, details.vm.name),
+                    code: Some(ErrorCode::NoSuchCard),
+                });
+            };
+            if on != Some(switch) {
                 return Err(Fail::new(
                     409,
                     format!(

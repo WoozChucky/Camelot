@@ -8,7 +8,7 @@
 //! [`MessageKind`].
 
 use crate::wire::{Reader, Writer};
-use crate::{Error, Result, MAGIC, MAX_BLOCK_SECTORS, SECTOR_SIZE};
+use crate::{Error, Result, MAGIC, MAX_BLOCK_SECTORS, MAX_FORWARDS, SECTOR_SIZE};
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -1529,9 +1529,15 @@ fn get_profile(r: &mut Reader) -> Result<HardwareProfile> {
     })
 }
 
-/// Refuses forwarding rules no gateway can have: a guest port 0, or a guest address
-/// outside the guest network.
+/// Refuses forwarding rules no gateway can have: more than [`MAX_FORWARDS`] of them (each
+/// binds a host socket), a guest port 0, or a guest address outside the guest network.
 fn check_forwards(rules: &[PortForward]) -> Result<()> {
+    if rules.len() > MAX_FORWARDS {
+        return Err(Error::Invalid(format!(
+            "{} forwarding rules (at most {MAX_FORWARDS} per gateway)",
+            rules.len()
+        )));
+    }
     for rule in rules {
         if rule.guest.port() == 0 {
             return Err(Error::Invalid(format!(

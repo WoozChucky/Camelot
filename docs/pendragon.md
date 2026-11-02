@@ -87,7 +87,7 @@ A VM in a path (`{vm}`) is its id (all digits) or its name, as on Round Table's 
 | `POST /api/switches/{name}/nat` | give the switch a NAT gateway: `{"hostfwd": [...]}`; 409 `already exists` if it has one. `{"name", "nat"}` |
 | `DELETE /api/switches/{name}/nat` | take its gateway away (409 `invalid state` if it has none), closing its connections and host ports |
 | `POST /api/switches/{name}/attach` | plug a VM's card in: `{"vm": id or name, "card": N}` (card 0 if left out); a card on another switch moves |
-| `POST /api/switches/{name}/detach` | unplug it: the same body; 409 unless the card is on this switch |
+| `POST /api/switches/{name}/detach` | unplug it: the same body; 404 for a switch or a card that does not exist, 409 for a card on another switch or none |
 
 **Attaching and detaching disks.** A VM's disks are part of its hardware profile, fixed when it is created; the protocol has no hot-plug (protocol doc, section 6.6). So attaching a disk is creating a VM with it (the disk page's *attach* opens the new-VM form with the image filled in), and a VM lets go of its disks when its machine ends: detaching stops the VMs that hold the image, then waits up to 5 seconds for Lake to show it released (`released`). A stopped VM cannot be started again, which the page says before it detaches. A VM holds a Lake image when it is created, running or paused and its profile names the image on a server that is Pendragon's Lake: the same address, or one that resolves to the same socket address (`localhost:7401` and `127.0.0.1:7401`). An image attached by a client Pendragon does not manage (another Avalon) shows as attached with no VM, and cannot be detached here.
 

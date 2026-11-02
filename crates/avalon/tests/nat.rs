@@ -376,7 +376,12 @@ fn gateway_requests_and_their_errors() {
         ),
         ErrorCode::Io
     );
-    // Two rules for one port: the second cannot bind, and the first is let go.
+    // Two rules for one port: the second cannot bind, and the first is let go. The
+    // port is one the system just picked and let go of: another test running at the
+    // same time could take it in between, but only by being handed this very port
+    // within microseconds, which systems rarely do (and the test would then fail, not
+    // pass wrongly). Holding it instead would defeat the check: that the gateway
+    // binds it, then lets go.
     let free = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()

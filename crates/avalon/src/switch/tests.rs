@@ -742,6 +742,58 @@ fn a_card_cannot_pose_as_another_machine_to_the_gateway() {
 }
 
 #[test]
+fn a_card_cannot_take_another_ports_address() {
+    let lan = Switch::new("lan");
+    lan.set_nat(Some(&NatConfig::default())).unwrap();
+    let mut a = TestCard::plugged(1, A, &lan);
+    let mut b = TestCard::plugged(2, B, &lan);
+    let mut c = TestCard::plugged(3, C, &lan);
+    // B asks for the gateway and is answered: the switch has learned the gateway's
+    // address on the gateway's port.
+    b.send(&who_has_the_gateway(B, 16));
+    from_gateway(&mut b);
+    drop((a.recv_all(), c.recv_all()));
+    let to_gateway = gateway_port(&lan).out_frames;
+
+    // A sends as the gateway, then as B: both frames go nowhere, and are counted.
+    a.send(&frame(B, GW, 1));
+    a.send(&frame(MacAddr::BROADCAST, B, 2));
+    assert!(b.recv_all().is_empty() && c.recv_all().is_empty());
+    assert_eq!(port_of(&lan, 1).in_frames, 2);
+
+    // So the frames for the gateway and for B still reach them, not A.
+    b.send(&frame(GW, B, 3));
+    assert_eq!(gateway_port(&lan).out_frames, to_gateway + 1);
+    c.send(&frame(B, C, 4));
+    assert_eq!(b.recv_all(), [frame(B, C, 4)]);
+    assert!(a.recv_all().is_empty());
+}
+
+#[test]
+fn the_gateways_queue_is_bounded_and_counts_its_drops() {
+    let lan = Switch::new("lan");
+    let mut a = TestCard::plugged(1, A, &lan);
+    let mut c = TestCard::plugged(3, C, &lan);
+    // A gateway's port with no thread to drain it (a gateway that has fallen behind).
+    let wake = Arc::new(Wake::default());
+    let port = lan
+        .state()
+        .add_port(PortOwner::Gateway, GW, Plugged::Gateway(Arc::clone(&wake)));
+    for i in 0..PORT_QUEUE + 5 {
+        a.send(&frame(MacAddr::BROADCAST, A, i as u8));
+        // C keeps up.
+        assert_eq!(c.recv_all().len(), 1);
+    }
+    let gw = gateway_port(&lan);
+    assert_eq!((gw.out_frames, gw.dropped), (PORT_QUEUE as u64, 5));
+    assert_eq!(lan.take_all(port).len(), PORT_QUEUE);
+    assert_eq!(port_of(&lan, 3).dropped, 0);
+    assert_eq!(port_of(&lan, 1).in_frames, PORT_QUEUE as u64 + 5);
+    // The frames were queued without waiting for the gateway; it was only woken.
+    assert!(lock(&wake.state).pending);
+}
+
+#[test]
 fn a_gateway_taken_away_or_deleted_frees_its_host_ports() {
     let lan = Switch::new("lan");
     let fwd = |port| NatConfig {
@@ -757,19 +809,27 @@ fn a_gateway_taken_away_or_deleted_frees_its_host_ports() {
     assert!(std::net::TcpListener::bind(bound).is_err(), "the gateway has it");
     let mut a = TestCard::plugged(1, A, &lan);
     assert_eq!(lan.info().ports.len(), 2);
+    // The gateway answers A, so the switch learns its address on the gateway's port.
+    a.send(&who_has_the_gateway(A, 15));
+    from_gateway(&mut a);
+    assert_eq!(lan.learned(), 2);
 
-    // Taken away: its port goes, the port is free at once, and nothing reaches it.
+    // Taken away: its port goes, with the address learned on it, and its host port is
+    // free at once.
     lan.set_nat(None).unwrap();
     assert_eq!(lan.info().nat, None);
     assert_eq!(lan.info().ports.len(), 1);
+    assert_eq!(lan.learned(), 1, "only A");
     drop(std::net::TcpListener::bind(bound).unwrap());
-    a.send(&who_has_the_gateway(A, 15));
-    assert!(a.recv_all().is_empty());
     assert_eq!(lan.set_nat(None).unwrap_err().code, ErrorCode::InvalidState);
 
-    // Back with the same port, and then the switch deleted.
+    // Back with the same port, and then the switch deleted. A frame for the gateway's
+    // address floods to the new gateway's port (it is not sent to the old port, which
+    // is gone).
     lan.set_nat(Some(&fwd(bound.port()))).unwrap();
-    assert_eq!(lan.info().nat.unwrap().hostfwd[0].host, bound);
+    assert_eq!(lan.info().nat.as_ref().unwrap().hostfwd[0].host, bound);
+    a.send(&frame(GW, A, 1));
+    assert_eq!(gateway_port(&lan).out_frames, 1);
     assert_eq!(
         lan.set_nat(Some(&fwd(0))).unwrap_err().code,
         ErrorCode::AlreadyExists
