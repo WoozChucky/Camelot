@@ -555,7 +555,7 @@ fn unsupported(msg: &Message) -> Fail {
     Fail::new(
         ErrorCode::Unsupported,
         format!(
-            "{}: Lake serves disks; VMs, consoles and screens are Avalon's",
+            "{}: Lake serves disks; VMs, consoles, screens and switches are Avalon's",
             msg.name()
         ),
     )

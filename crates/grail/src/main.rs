@@ -33,6 +33,13 @@ const USAGE: &str = "usage: grail [options] <program.elf>
                   Ethernet hub; every card on the hub sees the frames the others send.
                   Repeat for more cards (up to 4). The MAC address is
                   02:ca:00:00:00:NN for port NN unless mac= sets one
+  --net user[,hostfwd=RULE...][,mac=ADDR]
+                  add a network card with user networking: a NAT gateway in Grail
+                  gives it 10.0.2.15 by DHCP, DNS at 10.0.2.3, and TCP and UDP to the
+                  internet; 10.0.2.2 is the host's 127.0.0.1. Each hostfwd forwards a
+                  host port to the guest: [tcp|udp]:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT,
+                  e.g. hostfwd=tcp::8080-:80 (HOSTADDR 127.0.0.1, GUESTADDR 10.0.2.15
+                  unless given). MAC 52:54:00:12:34:56 unless mac= sets one
   --pcap FILE     write every frame the card of the last --net sends or receives to
                   FILE, a pcap capture (Wireshark, tcpdump)
   --fb            show the framebuffer in a window (Windows only)

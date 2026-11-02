@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use MessageKind::{Event, Reply, Request};
 
 /// Section 6, the message catalogue: (code, name, kind).
-const SPEC_CATALOGUE: [(u16, &str, MessageKind); 43] = [
+const SPEC_CATALOGUE: [(u16, &str, MessageKind); 50] = [
     (0x0001, "Hello", Request),
     (0x0002, "Welcome", Reply),
     (0x0003, "Error", Reply),
@@ -52,10 +52,17 @@ const SPEC_CATALOGUE: [(u16, &str, MessageKind); 43] = [
     (0x0502, "ListDisks", Request),
     (0x0503, "DiskList", Reply),
     (0x0504, "DiskDelete", Request),
+    (0x0601, "CreateSwitch", Request),
+    (0x0602, "DeleteSwitch", Request),
+    (0x0603, "ListSwitches", Request),
+    (0x0604, "SwitchList", Reply),
+    (0x0605, "AttachCard", Request),
+    (0x0606, "DetachCard", Request),
+    (0x0607, "CaptureSwitch", Request),
 ];
 
 /// Section 5, the error codes.
-const SPEC_ERROR_CODES: [(ErrorCode, u16); 18] = [
+const SPEC_ERROR_CODES: [(ErrorCode, u16); 20] = [
     (ErrorCode::Malformed, 1),
     (ErrorCode::UnknownMessage, 2),
     (ErrorCode::Unexpected, 3),
@@ -74,6 +81,8 @@ const SPEC_ERROR_CODES: [(ErrorCode, u16); 18] = [
     (ErrorCode::OutOfRange, 16),
     (ErrorCode::Io, 17),
     (ErrorCode::Internal, 18),
+    (ErrorCode::NoSuchSwitch, 19),
+    (ErrorCode::NoSuchCard, 20),
 ];
 
 #[test]
@@ -222,6 +231,14 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                             },
                             read_only: false,
                         }),
+                        DeviceSpec::Net(NetSpec {
+                            switch: Some("s".into()),
+                            mac: Some([2, 3, 4, 5, 6, 7]),
+                        }),
+                        DeviceSpec::Net(NetSpec {
+                            switch: None,
+                            mac: None,
+                        }),
                     ],
                 },
                 program: vec![0xee],
@@ -233,7 +250,7 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                 .u32(5)
                 .u32(7)
                 .u32(3)
-                .u32(2)
+                .u32(4)
                 .u8(1)
                 .u8(1)
                 .str("f")
@@ -242,6 +259,14 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                 .u8(2)
                 .str("h:1")
                 .str("d")
+                .u8(0)
+                .u8(2)
+                .u8(1)
+                .str("s")
+                .u8(1)
+                .raw(&[2, 3, 4, 5, 6, 7])
+                .u8(2)
+                .u8(0)
                 .u8(0)
                 .bytes(&[0xee])
                 .frame(0x0101),
@@ -485,6 +510,70 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
             DiskDelete { name: "d".into() },
             P::default().str("d").frame(0x0504),
         ),
+        (
+            CreateSwitch { name: "s".into() },
+            P::default().str("s").frame(0x0601),
+        ),
+        (
+            DeleteSwitch { name: "t".into() },
+            P::default().str("t").frame(0x0602),
+        ),
+        (ListSwitches, P::default().frame(0x0603)),
+        (
+            SwitchList {
+                switches: vec![SwitchInfo {
+                    name: "s".into(),
+                    capture: Some("c".into()),
+                    ports: vec![SwitchPort {
+                        owner: PortOwner::Card { vm: 3, card: 1 },
+                        mac: [2, 3, 4, 5, 6, 7],
+                        in_frames: 0x11,
+                        in_bytes: 0x22,
+                        out_frames: 0x33,
+                        out_bytes: 0x44,
+                        dropped: 0x55,
+                    }],
+                }],
+            },
+            P::default()
+                .u32(1)
+                .str("s")
+                .u8(1)
+                .str("c")
+                .u32(1)
+                .u8(1)
+                .u32(3)
+                .u8(1)
+                .raw(&[2, 3, 4, 5, 6, 7])
+                .u64(0x11)
+                .u64(0x22)
+                .u64(0x33)
+                .u64(0x44)
+                .u64(0x55)
+                .frame(0x0604),
+        ),
+        (
+            AttachCard {
+                vm: VmRef::Id(4),
+                card: 2,
+                switch: "s".into(),
+            },
+            P::default().u8(0).u32(4).u8(2).str("s").frame(0x0605),
+        ),
+        (
+            DetachCard {
+                vm: VmRef::Name("v".into()),
+                card: 3,
+            },
+            P::default().u8(1).str("v").u8(3).frame(0x0606),
+        ),
+        (
+            CaptureSwitch {
+                switch: "s".into(),
+                path: Some("p".into()),
+            },
+            P::default().str("s").u8(1).str("p").frame(0x0607),
+        ),
     ]
 }
 
@@ -575,18 +664,38 @@ fn every_enum_tag_is_the_documented_one() {
 }
 
 #[test]
+fn optional_fields_are_tagged() {
+    let stop = Message::CaptureSwitch {
+        switch: "s".into(),
+        path: None,
+    };
+    assert_eq!(encode(&stop).unwrap(), P::default().str("s").u8(0).frame(0x0607));
+    let list = Message::SwitchList {
+        switches: vec![SwitchInfo {
+            name: "s".into(),
+            capture: None,
+            ports: Vec::new(),
+        }],
+    };
+    assert_eq!(
+        encode(&list).unwrap(),
+        P::default().u32(1).str("s").u8(0).u32(0).frame(0x0604)
+    );
+}
+
+#[test]
 fn doc_examples_are_exact() {
-    // Section 6.1: Hello version 3 from agent "rt".
+    // Section 6.1: Hello version 4 from agent "rt".
     assert_eq!(
         encode(&Message::Hello {
-            version: 3,
+            version: 4,
             agent: "rt".into()
         })
         .unwrap(),
-        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x03, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
+        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x04, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
     );
     // Section 7: the version this document describes.
-    assert_eq!(PROTOCOL_VERSION, 3);
+    assert_eq!(PROTOCOL_VERSION, 4);
     // Section 6.2: StartVm by id 5.
     assert_eq!(
         encode(&Message::StartVm { vm: VmRef::Id(5) }).unwrap(),

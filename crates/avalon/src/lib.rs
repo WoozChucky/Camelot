@@ -8,6 +8,7 @@
 //!   keyboard and pointer input of the clients that view it).
 //! - `outbox.rs`: a client's outgoing queue (replies and events).
 //! - [`machine_config`]: a hardware profile from the wire as a Grail `MachineConfig`.
+//! - [`switch`]: the virtual Ethernet switches the VMs' network cards plug into.
 //!
 //! The `avalon` binary is a thin command line over [`Server`]; tests run a server in
 //! process on an ephemeral port.
@@ -18,10 +19,11 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 mod outbox;
 mod profile;
 mod server;
+pub mod switch;
 mod vm;
 
 pub use outbox::MAX_QUEUED;
-pub use profile::machine_config;
+pub use profile::{card_configs, machine_config, CardConfig};
 pub use server::{
     parse_listen, parse_max_ram, Config, Server, ServerThread, ShutdownHandle, VmDebug, DEFAULT_MAX_RAM,
     HANDSHAKE_TIMEOUT,

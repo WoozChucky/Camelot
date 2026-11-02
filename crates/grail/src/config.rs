@@ -8,6 +8,7 @@ use crate::block::{BlockBackend, FileDisk, MemDisk, MAX_SECTORS, SECTOR_SIZE};
 use crate::bus::{MAX_DISKS, MAX_NETS, RAM_BASE};
 use crate::lake::LakeDisk;
 use crate::net::{Hub, MacAddr, NetBackend, Pcap};
+use gateway::{Gateway, HostFwd};
 use std::path::PathBuf;
 
 pub const MIB: usize = 1024 * 1024;
@@ -58,7 +59,8 @@ pub struct MachineConfig {
 pub struct NetConfig {
     pub source: NetSource,
     /// The card's MAC address (`NET_MAC`). `None` lets the backend pick one: a hub port
-    /// gives `02:ca:00:00:00:NN`, with `NN` the port's number on the hub.
+    /// gives `02:ca:00:00:00:NN`, with `NN` the port's number on the hub; user
+    /// networking gives `52:54:00:12:34:56`.
     pub mac: Option<MacAddr>,
     /// Write every frame the card sends or receives to this file, in pcap format.
     pub pcap: Option<PathBuf>,
@@ -71,6 +73,11 @@ pub enum NetSource {
     /// A port of this in-process hub: the card sees every frame the other ports send.
     /// Machines whose configs name the same hub are on one network.
     Hub(Hub),
+    /// User networking: a NAT gateway of its own (the `gateway` crate) that gives the
+    /// card an address by DHCP, answers DNS, and reaches the internet and the host
+    /// (10.0.2.2 is the host's 127.0.0.1) through ordinary sockets. Each host port in
+    /// `hostfwd` is forwarded to a port of the guest.
+    User { hostfwd: Vec<HostFwd> },
 }
 
 impl NetConfig {
@@ -83,18 +90,38 @@ impl NetConfig {
         }
     }
 
+    /// A card with user networking, forwarding these host ports to the guest.
+    pub fn user(hostfwd: Vec<HostFwd>) -> Self {
+        NetConfig {
+            source: NetSource::User { hostfwd },
+            mac: None,
+            pcap: None,
+        }
+    }
+
     /// A card from a `--net` argument: a kind, then options after commas. The kind is
-    /// `hub` (a port of `hub`, the process's hub); the option is `mac=ADDR`.
+    /// `hub` (a port of `hub`, the process's hub) or `user` (user networking); the
+    /// options are `mac=ADDR` and, for `user`, any number of
+    /// `hostfwd=[tcp|udp]:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT`.
     pub fn parse(arg: &str, hub: &Hub) -> Result<Self, String> {
         let mut parts = arg.split(',');
         let mut config = match parts.next() {
             Some("hub") => NetConfig::hub(hub),
-            _ => return Err(format!("'{arg}' is not a network: the kind is hub")),
+            Some("user") => NetConfig::user(Vec::new()),
+            _ => return Err(format!("'{arg}' is not a network: the kind is hub or user")),
         };
         for option in parts {
-            match option.split_once('=') {
-                Some(("mac", mac)) => config.mac = Some(MacAddr::parse(mac)?),
-                _ => return Err(format!("unknown network option '{option}' (there is mac=ADDR)")),
+            match (option.split_once('='), &mut config.source) {
+                (Some(("mac", mac)), _) => config.mac = Some(MacAddr::parse(mac)?),
+                (Some(("hostfwd", rule)), NetSource::User { hostfwd }) => hostfwd.push(HostFwd::parse(rule)?),
+                (_, NetSource::Hub(_)) => {
+                    return Err(format!("unknown network option '{option}' (there is mac=ADDR)"))
+                }
+                (_, NetSource::User { .. }) => {
+                    return Err(format!(
+                        "unknown network option '{option}' (there are mac=ADDR and hostfwd=RULE)"
+                    ))
+                }
             }
         }
         Ok(config)
@@ -120,6 +147,14 @@ impl NetConfig {
             NetSource::Hub(hub) => {
                 let port = hub.attach();
                 (port.default_mac(), Box::new(port))
+            }
+            NetSource::User { hostfwd } => {
+                let config = gateway::Config {
+                    hostfwd: hostfwd.clone(),
+                    ..gateway::Config::default()
+                };
+                let gw = Gateway::new(config).map_err(|e| e.to_string())?;
+                (MacAddr(gateway::DEFAULT_GUEST_MAC), Box::new(gw))
             }
         };
         let backend = match &self.pcap {
@@ -513,13 +548,30 @@ mod tests {
             NetConfig::parse("hub,mac=02:00:00:00:00:09", &hub),
             Ok(NetConfig::hub(&hub).with_mac(mac))
         );
+        assert_eq!(NetConfig::parse("user", &hub), Ok(NetConfig::user(Vec::new())));
+        assert_eq!(
+            NetConfig::parse(
+                "user,hostfwd=tcp::8080-:80,mac=02:00:00:00:00:09,hostfwd=udp::5353-:53",
+                &hub
+            ),
+            Ok(NetConfig::user(vec![HostFwd::tcp(8080, 80), HostFwd::udp(5353, 53)]).with_mac(mac))
+        );
         for (bad, why) in [
             ("", "not a network"),
-            ("user", "not a network"),
+            ("users", "not a network"),
             ("Hub", "not a network"),
             ("hub,", "unknown network option ''"),
             ("hub,mtu=1500", "unknown network option 'mtu=1500'"),
             ("hub,mac=02:00", "not a MAC address"),
+            (
+                "hub,hostfwd=tcp::1-:2",
+                "unknown network option 'hostfwd=tcp::1-:2' (there is mac=ADDR)",
+            ),
+            (
+                "user,mtu=1500",
+                "unknown network option 'mtu=1500' (there are mac=ADDR and hostfwd=RULE)",
+            ),
+            ("user,hostfwd=tcp::80", "not a forwarding rule"),
         ] {
             let e = NetConfig::parse(bad, &hub).unwrap_err();
             assert!(e.contains(why), "{bad:?}: {e}");
@@ -603,6 +655,37 @@ mod tests {
             };
             assert_eq!(config.validate(), Err(format!("{harts} harts, must be 1 to 8")));
         }
+    }
+
+    #[test]
+    fn user_net_configs_open_a_gateway() {
+        let (mac, mut card) = NetConfig::user(vec![HostFwd::tcp(0, 80)]).open().unwrap();
+        assert_eq!(mac, MacAddr([0x52, 0x54, 0, 0x12, 0x34, 0x56]));
+        assert!(card.link_up());
+        // An ARP request for the gateway gets its answer.
+        let mut arp = vec![0xff; 6];
+        arp.extend_from_slice(&mac.0);
+        arp.extend_from_slice(&[0x08, 0x06, 0, 1, 0x08, 0, 6, 4, 0, 1]);
+        arp.extend_from_slice(&mac.0);
+        arp.extend_from_slice(&[10, 0, 2, 15, 0, 0, 0, 0, 0, 0, 10, 0, 2, 2]);
+        card.send(&arp).unwrap();
+        let reply = card.recv().unwrap();
+        assert_eq!(
+            (&reply[..6], &reply[6..12]),
+            (&mac.0[..], &gateway::GATEWAY_MAC[..])
+        );
+
+        // A forwarded port that is taken fails the card, naming the rule.
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let e = NetConfig::user(vec![HostFwd::tcp(port, 80)])
+            .open()
+            .err()
+            .unwrap();
+        assert!(
+            e.starts_with(&format!("hostfwd tcp:127.0.0.1:{port}-10.0.2.15:80: ")),
+            "{e}"
+        );
     }
 
     #[test]

@@ -508,7 +508,7 @@ fn paced_harts_idle_until_the_earliest_timer() {
     .unwrap();
     start(&mut m, 0, &[WFI, STOP]);
     start(&mut m, 1, &[WFI, STOP]);
-    for (i, cmp) in [(0, 2500), (1, 1500)] {
+    for (i, cmp) in [(0, 10_000_000), (1, 1500)] {
         m.cpu.hart_mut(i).csr.mie = 1 << IRQ_M_TIMER;
         m.cpu.bus.clint.mtimecmp[i] = cmp;
     }

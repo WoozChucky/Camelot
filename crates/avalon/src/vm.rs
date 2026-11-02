@@ -39,18 +39,28 @@
 //! each) and the thread hands them to the machine's keyboard and pointer devices
 //! before its next slice, as Grail's own window does between slices.
 //!
+//! A VM's network cards ([`Card`]) plug into Avalon's switches. A frame queued for
+//! one of them rings the VM's bell ([`Vm::kick`]), so a machine parked in `wfi`
+//! takes it at once instead of after its nap.
+//!
 //! Locking: everything that changes is in [`Inner`], behind one mutex per VM, which
 //! the VM thread takes only between slices. Events for attached clients are queued
-//! under that lock, so every client sees them in the order they happened.
+//! under that lock, so every client sees them in the order they happened. The lock is
+//! only ever held for a moment (a machine is dropped after it is let go, since that
+//! can close disks over the network): other VMs' threads take it to ring the bell.
+//! Ending the cards as the machine ends takes their plug and switch locks under it,
+//! which is the order [`crate::switch`] sets.
 
 use crate::outbox::Outbox;
+use crate::switch::Card;
 use crate::{lock, Fail};
 use avalon_proto::{
-    AttachKind, DeviceEntry, ErrorCode, Frame, HardwareProfile, KeyEvent, Message, PointerChange,
-    PointerMotion, Screen, VmDetails, VmState, VmSummary, PIXEL_FORMAT_XRGB8888,
+    AttachKind, DeviceEntry, DeviceSpec, ErrorCode, Frame, HardwareProfile, KeyEvent, Message, NetSpec,
+    PointerChange, PointerMotion, Screen, VmDetails, VmState, VmSummary, PIXEL_FORMAT_XRGB8888,
 };
 use excalibur::csr::IRQ_M_TIMER;
 use grail::framebuffer::{FB_HEIGHT, FB_WIDTH};
+use grail::net::NetBackend;
 use grail::pointer::{Motion, PointerInput};
 use grail::{keyboard, Machine, MachineConfig};
 use std::collections::VecDeque;
@@ -95,11 +105,16 @@ pub struct Vm {
     pub profile: HardwareProfile,
     /// The guest's sysinfo device table.
     pub devices: Vec<DeviceEntry>,
+    /// The network cards, in the profile's order.
+    cards: Vec<Arc<Card>>,
     /// Steps run so far (instructions, and idle ticks of a machine waiting in `wfi`).
     steps: AtomicU64,
     /// Slices run so far (calls of `run_for`, empty ones included): how tests see that
     /// the thread sleeps when it has nothing to run.
     slices: AtomicU64,
+    /// Times a frame for one of the cards rang the VM's bell ([`Vm::kick`]): how tests
+    /// see that frames wake the VM.
+    bells: AtomicU64,
     inner: Mutex<Inner>,
     /// Signalled whenever `inner` changes in a way the thread or a waiting request
     /// cares about.
@@ -180,18 +195,25 @@ fn wrong_state(vm: &Vm, state: VmState, want: &str) -> Fail {
 }
 
 impl Vm {
-    /// Builds the machine `config` describes and loads `program` into it, as VM 0 until
-    /// the server gives it an id. Errors: `InvalidProfile` (a disk image that cannot be
-    /// opened) and `InvalidProgram`. This can take a while (it opens files on the host
-    /// and allocates the guest's RAM), so the server calls it without holding its table.
+    /// Builds the machine `config` describes, with `cards` as its network cards (still
+    /// unplugged), and loads `program` into it, as VM 0 until the server gives it an
+    /// id. Errors: `InvalidProfile` (a disk image that cannot be opened) and
+    /// `InvalidProgram`. This can take a while (it opens files on the host and
+    /// allocates the guest's RAM), so the server calls it without holding its table.
     pub fn new(
         name: String,
         profile: HardwareProfile,
         config: MachineConfig,
+        cards: Vec<Arc<Card>>,
         program: &[u8],
         log: bool,
     ) -> Result<Vm, Fail> {
-        let mut machine = Machine::new(config).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
+        let backends = cards
+            .iter()
+            .map(|card| (card.mac, Box::new(card.backend()) as Box<dyn NetBackend>))
+            .collect();
+        let mut machine = Machine::with_devices(config, Vec::new(), backends)
+            .map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
         machine
             .load_elf(program)
             .map_err(|e| Fail::new(ErrorCode::InvalidProgram, format!("program: {e}")))?;
@@ -217,8 +239,10 @@ impl Vm {
             name,
             profile,
             devices,
+            cards,
             steps: AtomicU64::new(0),
             slices: AtomicU64::new(0),
+            bells: AtomicU64::new(0),
             inner: Mutex::new(Inner {
                 state: VmState::Created,
                 gone: false,
@@ -279,13 +303,77 @@ impl Vm {
         (inner.keys.len(), inner.pointer.len())
     }
 
+    /// The VM as `VmList` shows it. Its cards are as they are now: their addresses
+    /// (made up by the server if the profile set none), and the switches they are
+    /// plugged into.
     pub fn summary(&self) -> VmSummary {
+        // The state first, then the cards: a machine's cards are unplugged before its
+        // state says it has ended, so a summary that says so never shows them plugged.
+        let state = self.state();
+        let mut profile = self.profile.clone();
+        let mut cards = self.cards.iter();
+        for device in &mut profile.devices {
+            if let (DeviceSpec::Net(net), Some(card)) = (device, cards.next()) {
+                *net = NetSpec {
+                    switch: card.switch().map(|s| s.name().to_string()),
+                    mac: Some(card.mac.0),
+                };
+            }
+        }
         VmSummary {
             id: self.id,
             name: self.name.clone(),
-            state: self.state(),
-            profile: self.profile.clone(),
+            state,
+            profile,
         }
+    }
+
+    /// Network card `index`, if the VM has it.
+    pub fn card(&self, index: u8) -> Result<&Arc<Card>, Fail> {
+        self.cards.get(index as usize).ok_or_else(|| {
+            let has = match self.cards.len() {
+                0 => "no network cards".to_string(),
+                1 => "one network card, 0".to_string(),
+                n => format!("{n} network cards, 0 to {}", n - 1),
+            };
+            Fail::new(
+                ErrorCode::NoSuchCard,
+                format!("VM {} ('{}') has {has}", self.id, self.name),
+            )
+        })
+    }
+
+    pub fn cards(&self) -> &[Arc<Card>] {
+        &self.cards
+    }
+
+    /// Makes a frame queued for any of the VM's cards ring its bell, which wakes the
+    /// VM ([`Vm::kick`]). The server does this once the VM is in its `Arc`. The bells
+    /// hold the VM weakly: the cards are the VM's, and must not keep it alive.
+    pub fn ring_on_frames(self: &Arc<Self>) {
+        for card in &self.cards {
+            let weak = Arc::downgrade(self);
+            card.set_bell(Arc::new(move || {
+                if let Some(vm) = weak.upgrade() {
+                    vm.kick();
+                }
+            }));
+        }
+    }
+
+    /// Times a frame for one of the cards rang the bell.
+    pub fn bells(&self) -> u64 {
+        self.bells.load(Ordering::Relaxed)
+    }
+
+    /// Wakes the VM's thread if it is napping: a frame came in for one of its cards.
+    /// A frame that comes while a slice runs makes the thread run another slice at
+    /// once rather than nap.
+    pub fn kick(&self) {
+        self.bells.fetch_add(1, Ordering::Relaxed);
+        let mut inner = self.lock();
+        inner.kick = true;
+        self.wake.notify_all();
     }
 
     pub fn details(&self) -> VmDetails {
@@ -297,7 +385,18 @@ impl Vm {
     }
 
     /// Sets the state and tells every attached client.
+    ///
+    /// A machine that has ended (stopped or exited) ends its network cards first: they
+    /// are unplugged for good before anyone can hear of the new state, so a client told
+    /// the VM has stopped (by this event, a `StopVm` reply or a `VmInfo`) never sees
+    /// its cards on a switch, nor plugs one in (protocol doc, section 6.7). The machine
+    /// itself may be dropped a moment later, by whichever thread holds it.
     fn set_state(&self, inner: &mut Inner, state: VmState) {
+        if matches!(state, VmState::Stopped | VmState::Exited(_)) {
+            for card in &self.cards {
+                card.end();
+            }
+        }
         inner.state = state;
         if self.log {
             eprintln!("avalon: VM {} ('{}') {state}", self.id, self.name);
@@ -377,8 +476,10 @@ impl Vm {
         let mut inner = self.lock();
         match inner.state {
             VmState::Created => {
-                inner.machine = None;
+                let machine = inner.machine.take();
                 self.set_state(&mut inner, VmState::Stopped);
+                drop(inner);
+                drop(machine);
                 Ok(())
             }
             VmState::Running | VmState::Paused => {
@@ -399,17 +500,22 @@ impl Vm {
     /// Ends the VM for good: its thread stops and is joined, its machine is dropped,
     /// and attached clients get `Detached`. The caller has taken it out of the table.
     pub fn destroy(&self) {
-        let (consoles, viewers) = {
+        let (consoles, viewers, machine) = {
             let mut inner = self.lock();
             inner.gone = true;
-            inner.machine = None;
+            // Its machine is ending: its cards go now, not when the thread lets go.
+            for card in &self.cards {
+                card.end();
+            }
             inner.input = None;
             self.wake.notify_all();
             (
                 std::mem::take(&mut inner.consoles),
                 std::mem::take(&mut inner.viewers),
+                inner.machine.take(),
             )
         };
+        drop(machine);
         let viewers = viewers.into_iter().map(|v| v.outbox).collect();
         for (clients, kind) in [(consoles, AttachKind::Console), (viewers, AttachKind::Screen)] {
             let detached = event_frame(&Message::Detached { vm: self.id, kind });
@@ -426,15 +532,17 @@ impl Vm {
     /// Server shutdown: a VM that has not finished is stopped (attached clients see the
     /// state change), and its thread is joined.
     pub fn shut_down(&self) {
-        {
+        let machine = {
             let mut inner = self.lock();
+            let machine = inner.machine.take();
             if matches!(inner.state, VmState::Created | VmState::Running | VmState::Paused) {
-                inner.machine = None;
                 self.set_state(&mut inner, VmState::Stopped);
             }
             inner.gone = true;
             self.wake.notify_all();
-        }
+            machine
+        };
+        drop(machine);
         self.join();
     }
 
@@ -822,6 +930,8 @@ impl Drop for ThreadGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::switch::Switch;
+    use grail::net::MacAddr;
 
     #[test]
     fn scrollback_keeps_the_latest_bytes() {
@@ -829,6 +939,7 @@ mod tests {
             "t".into(),
             HardwareProfile::with_ram(4096),
             MachineConfig::with_ram(4096),
+            Vec::new(),
             b"not an ELF file",
             false,
         );
@@ -844,6 +955,7 @@ mod tests {
             "t".into(),
             HardwareProfile::with_ram(1 << 20),
             MachineConfig::with_ram(1 << 20),
+            Vec::new(),
             &std::fs::read(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../examples/hello/hello.elf"
@@ -861,5 +973,85 @@ mod tests {
         vm.console_output(&mut inner, (0..=255).cycle().take(SCROLLBACK + 7).collect());
         assert_eq!(inner.scrollback.len(), SCROLLBACK);
         assert_eq!(inner.scrollback[0], 7);
+    }
+
+    /// A VM with one network card, in state created.
+    fn vm_with_a_card(mac: MacAddr) -> Arc<Vm> {
+        let vm = Vm::new(
+            "t".into(),
+            HardwareProfile::with_ram(1 << 20),
+            MachineConfig::with_ram(1 << 20),
+            vec![Card::new(0, mac)],
+            &std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../examples/hello/hello.elf"
+            ))
+            .unwrap(),
+            false,
+        )
+        .unwrap();
+        Arc::new(vm)
+    }
+
+    #[test]
+    fn a_frame_for_a_card_wakes_its_vm() {
+        let vm = vm_with_a_card(MacAddr([2, 0, 0, 0, 0, 1]));
+        vm.ring_on_frames();
+        let lan = Switch::new("lan");
+        let owner = |vm| avalon_proto::PortOwner::Card { vm, card: 0 };
+        vm.card(0).unwrap().plug(owner(1), &lan).unwrap();
+        let other = Card::new(0, MacAddr([2, 0, 0, 0, 0, 2]));
+        other.plug(owner(2), &lan).unwrap();
+
+        // Something waits on the VM's condition variable for a kick, as its thread
+        // naps. `busy` (otherwise unused before the VM starts) says it is waiting: it
+        // is set under the lock, which `wait` lets go of only once it waits.
+        let waiter = {
+            let vm = Arc::clone(&vm);
+            std::thread::spawn(move || {
+                let mut inner = vm.lock();
+                inner.busy = true;
+                let (inner, timeout) = vm
+                    .wake
+                    .wait_timeout_while(inner, Duration::from_secs(10), |i| !i.kick)
+                    .unwrap();
+                (inner.kick, timeout.timed_out())
+            })
+        };
+        while !vm.lock().busy {
+            std::thread::yield_now();
+        }
+        assert_eq!(vm.bells(), 0);
+        let mut frame = vec![0xff; 6];
+        frame.extend([2, 0, 0, 0, 0, 2, 0x88, 0xb5]);
+        frame.resize(60, 0);
+        other.backend().send(&frame).unwrap();
+        // Woken by the frame, not by the 10 s timeout.
+        assert_eq!(waiter.join().unwrap(), (true, false));
+        assert_eq!(vm.bells(), 1);
+    }
+
+    #[test]
+    fn a_stopped_vm_has_unplugged_its_cards_by_the_time_anyone_hears_of_it() {
+        let vm = vm_with_a_card(MacAddr([2, 0, 0, 0, 0, 1]));
+        let lan = Switch::new("lan");
+        let card = Arc::clone(vm.card(0).unwrap());
+        card.plug(avalon_proto::PortOwner::Card { vm: 1, card: 0 }, &lan)
+            .unwrap();
+        // Holding the machine as the VM thread does past the state change.
+        let machine = vm.lock().machine.take();
+        {
+            let mut inner = vm.lock();
+            vm.set_state(&mut inner, VmState::Stopped);
+        }
+        assert!(lan.info().ports.is_empty());
+        assert!(card.switch().is_none());
+        assert_eq!(
+            card.plug(avalon_proto::PortOwner::Card { vm: 1, card: 0 }, &lan)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidState
+        );
+        drop(machine);
     }
 }

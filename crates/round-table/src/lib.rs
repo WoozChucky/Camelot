@@ -1,17 +1,17 @@
 //! Round Table, the control CLI of the Avalon platform: the commands (`create`, `list`,
-//! `info`, `start`, ..., `disk create`, ...) parsed from the command line and carried
-//! out through [`avalon_client`], with their output as text.
+//! `info`, `start`, ..., `switch create`, ..., `disk create`, ...) parsed from the
+//! command line and carried out through [`avalon_client`], with their output as text.
 //!
 //! The `round-table` binary is [`run`] with the process's arguments and stdout; the
 //! tests call [`run`] the same way against servers running in process.
 
 use avalon_client::{
-    device_name, disk_source_text, format_hz, format_size, parse_addr, parse_clock, parse_disk_size,
-    parse_disk_source, parse_harts, parse_ram, Client, VmAction,
+    device_name, disk_source_text, format_hz, format_size, mac_text, parse_addr, parse_clock,
+    parse_disk_size, parse_disk_source, parse_harts, parse_net, parse_ram, Client, VmAction,
 };
 use avalon_proto::{
-    validate_name, DeviceSpec, DiskInfo, DiskSpec, HardwareProfile, VmDetails, VmRef, VmSummary,
-    DEFAULT_AVALON_ADDR, DEFAULT_LAKE_ADDR, SECTOR_SIZE,
+    validate_name, DeviceSpec, DiskInfo, DiskSpec, HardwareProfile, NetSpec, PortOwner, SwitchInfo,
+    VmDetails, VmRef, VmSummary, DEFAULT_AVALON_ADDR, DEFAULT_LAKE_ADDR, SECTOR_SIZE,
 };
 use std::fmt;
 use std::io::Write;
@@ -21,17 +21,20 @@ use std::path::PathBuf;
 pub const AGENT: &str = "round-table";
 
 pub const USAGE: &str = "usage: round-table [--server ADDR] <command> [arguments]
+       round-table [--server ADDR] switch <command> [arguments]
        round-table [--lake ADDR] disk <command> [arguments]
 
 Gives orders to an Avalon hypervisor server: creates virtual machines and
-controls them. The disk commands manage the disk images of a Lake server.
+controls them, and the virtual switches their network cards plug into. The
+disk commands manage the disk images of a Lake server.
 
 VM commands, sent to Avalon:
   create --name NAME [options] <program.elf>
                   create a VM that runs program.elf (an Excalibur ELF
                   executable, read here and sent to Avalon), in state created
-  list            every VM: id, name, state, RAM, clock and disks
-  info VM         one VM in detail: hardware, disks, steps run, devices
+  list            every VM: id, name, state, RAM, clock, disks and cards
+  info VM         one VM in detail: hardware, disks, network cards, steps
+                  run, devices
   start VM        start a created VM
   pause VM        pause a running VM; it keeps its state
   resume VM       go on running a paused VM
@@ -56,7 +59,31 @@ create options:
                   lake://ADDR/NAME for the image NAME on a Lake server.
                   Repeat for more disks, in order
   --disk-ro SRC   attach a disk read-only
+  --net SWITCH[,mac=ADDR]
+                  a network card plugged into the switch SWITCH on Avalon
+                  ('-' for none: the card starts unplugged), with the MAC
+                  address ADDR (02:00:00:00:00:01; without one Avalon makes
+                  one up from the VM's name). Repeat for more cards, up to 4
   --start         start the VM as soon as it is created
+
+Switch commands, sent to Avalon:
+  switch create NAME
+                  a new virtual Ethernet switch, with nothing plugged in
+  switch list     every switch: its ports and whether it is captured
+  switch show NAME
+                  one switch's ports, with frames and bytes in and out and
+                  frames dropped for want of room
+  switch attach SWITCH VM [--card N]
+                  plug network card N (default 0) of VM into SWITCH
+  switch detach VM [--card N]
+                  unplug network card N (default 0) of VM
+  switch capture SWITCH FILE
+                  write every frame that enters SWITCH to FILE, a pcap file
+                  on Avalon's host (Wireshark reads it)
+  switch capture SWITCH --stop
+                  stop the capture
+  switch delete NAME
+                  delete a switch, unplugging every card from it
 
 Disk commands, sent to Lake:
   disk create NAME --size SIZE
@@ -70,7 +97,8 @@ A disk is attached to a VM when the VM is created (--disk, --disk-ro), and
 detached when the VM's machine ends: when the VM is stopped, its program
 exits, or it is destroyed. A stopped or exited VM still lists its disks
 (list, info) but no longer holds them. Lake allows one writer per image, or
-any number of readers.
+any number of readers. A VM's network cards are unplugged when its machine
+ends, too.
 
 Options:
   --server ADDR   Avalon's address, for the VM commands: host:port, or a
@@ -99,9 +127,38 @@ pub enum Command {
     List,
     Info(VmRef),
     Action(VmAction, VmRef),
-    DiskCreate { name: String, sectors: u64 },
+    DiskCreate {
+        name: String,
+        sectors: u64,
+    },
     DiskList,
-    DiskDelete { name: String },
+    DiskDelete {
+        name: String,
+    },
+    SwitchCreate {
+        name: String,
+    },
+    SwitchList,
+    SwitchShow {
+        name: String,
+    },
+    SwitchAttach {
+        switch: String,
+        vm: VmRef,
+        card: u8,
+    },
+    SwitchDetach {
+        vm: VmRef,
+        card: u8,
+    },
+    /// Start capturing into a file on Avalon's host, or stop (`None`).
+    SwitchCapture {
+        switch: String,
+        path: Option<String>,
+    },
+    SwitchDelete {
+        name: String,
+    },
 }
 
 /// `create`'s arguments.
@@ -150,7 +207,7 @@ pub fn run(args: &[String], out: &mut dyn Write) -> Result<(), Failure> {
 // ---- Parsing ----
 
 /// Every option, and whether it takes a value.
-const OPTIONS: [(&str, bool); 10] = [
+const OPTIONS: [(&str, bool); 13] = [
     ("--server", true),
     ("--lake", true),
     ("--name", true),
@@ -161,10 +218,13 @@ const OPTIONS: [(&str, bool); 10] = [
     ("--disk-ro", true),
     ("--start", false),
     ("--size", true),
+    ("--net", true),
+    ("--card", true),
+    ("--stop", false),
 ];
 
 /// Options that may be given more than once.
-const REPEATABLE: [&str; 2] = ["--disk", "--disk-ro"];
+const REPEATABLE: [&str; 3] = ["--disk", "--disk-ro", "--net"];
 
 /// Parses a command line (without the program name). Options may come before or after
 /// the command, as `--opt value` or `--opt=value`; `--` ends the options.
@@ -239,6 +299,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
                 "--harts",
                 "--disk",
                 "--disk-ro",
+                "--net",
                 "--start",
             ],
         ),
@@ -248,6 +309,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         }
         "info" => (Command::Info(vm_argument(word, rest)?), &["--server"]),
         "disk" => parse_disk(rest, &options)?,
+        "switch" => parse_switch(rest, &options)?,
         _ => match VmAction::parse(word) {
             Some(action) => (Command::Action(action, vm_argument(word, rest)?), &["--server"]),
             None => return Err(format!("unknown command '{word}'")),
@@ -257,6 +319,13 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         Command::DiskCreate { .. } => "disk create",
         Command::DiskList => "disk list",
         Command::DiskDelete { .. } => "disk delete",
+        Command::SwitchCreate { .. } => "switch create",
+        Command::SwitchList => "switch list",
+        Command::SwitchShow { .. } => "switch show",
+        Command::SwitchAttach { .. } => "switch attach",
+        Command::SwitchDetach { .. } => "switch detach",
+        Command::SwitchCapture { .. } => "switch capture",
+        Command::SwitchDelete { .. } => "switch delete",
         _ => word,
     };
     for (flag, _) in &options {
@@ -290,15 +359,20 @@ fn no_arguments(command: &str, rest: &[&str]) -> Result<(), String> {
 /// The single VM argument of `info`, `start`, ...: an id (all digits) or a name.
 fn vm_argument(command: &str, rest: &[&str]) -> Result<VmRef, String> {
     match rest {
-        [vm] if !vm.is_empty() => match VmRef::parse(vm) {
-            // No name is all digits, so an id too big for a u32 can never match a VM.
-            VmRef::Name(_) if vm.bytes().all(|b| b.is_ascii_digit()) => {
-                Err(format!("'{vm}' is not a VM id (ids are at most {})", u32::MAX))
-            }
-            vm => Ok(vm),
-        },
+        [vm] if !vm.is_empty() => parse_vm(vm),
         [] | [_] => Err(format!("'{command}' needs a VM (its id or its name)")),
         [_, extra, ..] => Err(format!("'{command}' takes one VM (got '{extra}' as well)")),
+    }
+}
+
+/// A VM argument: an id (all digits) or a name.
+fn parse_vm(vm: &str) -> Result<VmRef, String> {
+    match VmRef::parse(vm) {
+        // No name is all digits, so an id too big for a u32 can never match a VM.
+        VmRef::Name(_) if vm.bytes().all(|b| b.is_ascii_digit()) => {
+            Err(format!("'{vm}' is not a VM id (ids are at most {})", u32::MAX))
+        }
+        vm => Ok(vm),
     }
 }
 
@@ -336,6 +410,9 @@ fn parse_create(rest: &[&str], options: &[(&'static str, String)]) -> Result<Cre
                 source: parse_disk_source(value).map_err(with)?,
                 read_only: *flag == "--disk-ro",
             })),
+            "--net" => profile
+                .devices
+                .push(DeviceSpec::Net(parse_net(value).map_err(with)?)),
             "--start" => start = true,
             _ => {}
         }
@@ -379,6 +456,104 @@ fn parse_disk(
             &["--lake"],
         )),
         _ => Err(format!("unknown disk command '{word}' (create, list or delete)")),
+    }
+}
+
+/// The single switch name of `switch create`, `show` and `delete`.
+fn switch_argument(command: &str, rest: &[&str]) -> Result<String, String> {
+    match rest {
+        [name] => Ok(name.to_string()),
+        [] => Err(format!("'switch {command}' needs a switch name")),
+        [_, extra, ..] => Err(format!(
+            "'switch {command}' takes one switch name (got '{extra}' as well)"
+        )),
+    }
+}
+
+fn parse_switch(
+    rest: &[&str],
+    options: &[(&'static str, String)],
+) -> Result<(Command, &'static [&'static str]), String> {
+    const WORDS: &str = "create, list, show, attach, detach, capture or delete";
+    let Some((&word, rest)) = rest.split_first() else {
+        return Err(format!("'switch' needs a command: {WORDS}"));
+    };
+    let option = |flag: &str| options.iter().find(|(f, _)| *f == flag).map(|(_, v)| v.as_str());
+    let card = || -> Result<u8, String> {
+        match option("--card") {
+            None => Ok(0),
+            Some(n) => match n.parse::<u8>() {
+                Ok(card) if n.bytes().all(|b| b.is_ascii_digit()) => Ok(card),
+                _ => Err(format!("--card: '{n}' is not a card number (0, 1, 2 or 3)")),
+            },
+        }
+    };
+    match word {
+        "create" => {
+            let name = switch_argument(word, rest)?;
+            validate_name(&name)?;
+            Ok((Command::SwitchCreate { name }, &["--server"]))
+        }
+        "list" => {
+            no_arguments("switch list", rest)?;
+            Ok((Command::SwitchList, &["--server"]))
+        }
+        "show" => Ok((
+            Command::SwitchShow {
+                name: switch_argument(word, rest)?,
+            },
+            &["--server"],
+        )),
+        "delete" => Ok((
+            Command::SwitchDelete {
+                name: switch_argument(word, rest)?,
+            },
+            &["--server"],
+        )),
+        "attach" => match rest {
+            [switch, vm] if !vm.is_empty() => Ok((
+                Command::SwitchAttach {
+                    switch: switch.to_string(),
+                    vm: parse_vm(vm)?,
+                    card: card()?,
+                },
+                &["--server", "--card"],
+            )),
+            [_, _, extra, ..] => Err(format!(
+                "'switch attach' takes a switch and a VM (got '{extra}' as well)"
+            )),
+            _ => Err("'switch attach' needs a switch and a VM".into()),
+        },
+        "detach" => Ok((
+            Command::SwitchDetach {
+                vm: vm_argument("switch detach", rest)?,
+                card: card()?,
+            },
+            &["--server", "--card"],
+        )),
+        "capture" => {
+            let stop = option("--stop").is_some();
+            let (switch, path) = match (rest, stop) {
+                ([switch, path], false) => (switch, Some(path.to_string())),
+                ([switch], true) => (switch, None),
+                ([], _) => return Err("'switch capture' needs a switch".into()),
+                ([_], false) => return Err("'switch capture' needs a file, or --stop".into()),
+                ([_, _], true) => return Err("'switch capture' takes a file or --stop, not both".into()),
+                ([_, _, extra, ..], _) => {
+                    return Err(format!(
+                        "'switch capture' takes a switch and a file (got '{extra}' as well)"
+                    ))
+                }
+            };
+            Ok((
+                Command::SwitchCapture {
+                    switch: switch.to_string(),
+                    path,
+                },
+                &["--server", "--stop"],
+            ))
+        }
+        _ => Err(format!("unknown switch command '{word}' ({WORDS})")),
     }
 }
 
@@ -438,6 +613,57 @@ pub fn execute(invocation: &Invocation, out: &mut dyn Write) -> Result<(), Failu
                 .map_err(failed)?;
             format!("deleted disk {name}\n")
         }
+        Command::SwitchCreate { name } => {
+            connect("Avalon", &invocation.server)?
+                .create_switch(name)
+                .map_err(failed)?;
+            format!("created switch {name}\n")
+        }
+        Command::SwitchList => switch_table(
+            &connect("Avalon", &invocation.server)?
+                .list_switches()
+                .map_err(failed)?,
+        ),
+        Command::SwitchShow { name } => {
+            let switches = connect("Avalon", &invocation.server)?
+                .list_switches()
+                .map_err(failed)?;
+            match switches.iter().find(|s| s.name == *name) {
+                Some(switch) => switch_details(switch),
+                None => {
+                    return Err(Failure::Failed(format!(
+                        "no such switch: no switch named '{name}'"
+                    )))
+                }
+            }
+        }
+        Command::SwitchAttach { switch, vm, card } => {
+            connect("Avalon", &invocation.server)?
+                .attach_card(vm, *card, switch)
+                .map_err(failed)?;
+            format!("plugged card {card} of VM {vm} into switch {switch}\n")
+        }
+        Command::SwitchDetach { vm, card } => {
+            connect("Avalon", &invocation.server)?
+                .detach_card(vm, *card)
+                .map_err(failed)?;
+            format!("unplugged card {card} of VM {vm}\n")
+        }
+        Command::SwitchCapture { switch, path } => {
+            connect("Avalon", &invocation.server)?
+                .capture_switch(switch, path.as_deref())
+                .map_err(failed)?;
+            match path {
+                Some(path) => format!("capturing switch {switch} into {path}\n"),
+                None => format!("stopped capturing switch {switch}\n"),
+            }
+        }
+        Command::SwitchDelete { name } => {
+            connect("Avalon", &invocation.server)?
+                .delete_switch(name)
+                .map_err(failed)?;
+            format!("deleted switch {name}\n")
+        }
     };
     write_out(out, &text)
 }
@@ -496,7 +722,17 @@ fn clock_text(profile: &HardwareProfile) -> String {
 }
 
 fn disks(profile: &HardwareProfile) -> impl Iterator<Item = &DiskSpec> {
-    profile.devices.iter().map(|DeviceSpec::Disk(disk)| disk)
+    profile.devices.iter().filter_map(|d| match d {
+        DeviceSpec::Disk(disk) => Some(disk),
+        _ => None,
+    })
+}
+
+fn nets(profile: &HardwareProfile) -> impl Iterator<Item = &NetSpec> {
+    profile.devices.iter().filter_map(|d| match d {
+        DeviceSpec::Net(net) => Some(net),
+        _ => None,
+    })
 }
 
 /// `list`: one row per VM.
@@ -514,10 +750,24 @@ pub fn vm_table(vms: &[VmSummary]) -> String {
                 format_size(vm.profile.ram_size),
                 clock_text(&vm.profile),
                 disks(&vm.profile).count().to_string(),
+                nets(&vm.profile).count().to_string(),
             ]
         })
         .collect();
-    table(&["ID", "NAME", "STATE", "RAM", "CLOCK", "DISKS"], &rows)
+    table(&["ID", "NAME", "STATE", "RAM", "CLOCK", "DISKS", "NETS"], &rows)
+}
+
+/// A field of `info` that lists several values: one per line, the label on the first,
+/// `none` for none.
+fn field_lines(label: &str, lines: &[String]) -> String {
+    if lines.is_empty() {
+        return format!("{label:<9}none\n");
+    }
+    let mut text = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        text += &format!("{:<9}{line}\n", if i == 0 { label } else { "" });
+    }
+    text
 }
 
 /// `info`: one VM, a field per line.
@@ -538,21 +788,24 @@ pub fn vm_details(details: &VmDetails) -> String {
         format_size(vm.profile.ram_size),
         vm.profile.harts,
     );
-    // One line per disk, the label on the first.
     let lines: Vec<String> = disks(&vm.profile)
         .map(|disk| {
             let mode = if disk.read_only { "read-only" } else { "read-write" };
             format!("{} ({mode})", disk_source_text(&disk.source))
         })
         .collect();
-    if lines.is_empty() {
-        text += "disks    none\n";
-    }
-    for (i, line) in lines.iter().enumerate() {
-        text += if i == 0 { "disks    " } else { "         " };
-        text += line;
-        text += "\n";
-    }
+    text += &field_lines("disks", &lines);
+    // A server always says each card's address; a missing one shows as such.
+    let lines: Vec<String> = nets(&vm.profile)
+        .map(|net| {
+            let mac = net.mac.map_or_else(|| "no address".into(), mac_text);
+            match &net.switch {
+                Some(switch) => format!("{mac} on switch {switch}"),
+                None => format!("{mac} unplugged"),
+            }
+        })
+        .collect();
+    text += &field_lines("nets", &lines);
     text += &format!("devices  {}\n", devices.len());
     for d in devices {
         let name = device_name(d.kind).map_or_else(|| format!("type {}", d.kind), str::to_string);
@@ -605,10 +858,71 @@ pub fn disk_table(disks: &[DiskInfo]) -> String {
     table(&["NAME", "SIZE", "SECTORS", "ATTACHED"], &rows)
 }
 
+/// `switch list`: one row per switch.
+pub fn switch_table(switches: &[SwitchInfo]) -> String {
+    if switches.is_empty() {
+        return "no switches\n".into();
+    }
+    let rows: Vec<Vec<String>> = switches
+        .iter()
+        .map(|s| {
+            vec![
+                s.name.clone(),
+                s.ports.len().to_string(),
+                s.capture.clone().unwrap_or_else(|| "no".into()),
+            ]
+        })
+        .collect();
+    table(&["NAME", "PORTS", "CAPTURE"], &rows)
+}
+
+/// `switch show`: a switch and its ports' counters.
+pub fn switch_details(switch: &SwitchInfo) -> String {
+    let mut text = format!(
+        "switch   {}\ncapture  {}\n",
+        switch.name,
+        switch.capture.as_deref().unwrap_or("no")
+    );
+    if switch.ports.is_empty() {
+        return text + "ports    none\n";
+    }
+    text += &format!("ports    {}\n", switch.ports.len());
+    let rows: Vec<Vec<String>> = switch
+        .ports
+        .iter()
+        .map(|p| {
+            let PortOwner::Card { vm, card } = p.owner;
+            vec![
+                vm.to_string(),
+                card.to_string(),
+                mac_text(p.mac),
+                p.in_frames.to_string(),
+                p.in_bytes.to_string(),
+                p.out_frames.to_string(),
+                p.out_bytes.to_string(),
+                p.dropped.to_string(),
+            ]
+        })
+        .collect();
+    text + &table(
+        &[
+            "VM",
+            "CARD",
+            "MAC",
+            "IN",
+            "IN-BYTES",
+            "OUT",
+            "OUT-BYTES",
+            "DROPPED",
+        ],
+        &rows,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use avalon_proto::{DeviceEntry, DiskSource, VmState};
+    use avalon_proto::{DeviceEntry, DiskSource, SwitchPort, VmState};
 
     fn parse(args: &str) -> Result<Invocation, String> {
         let args: Vec<String> = args.split_whitespace().map(str::to_string).collect();
@@ -876,7 +1190,12 @@ mod tests {
             clock_hz: Some(1_500_000),
             nominal_hz: 10_000_000,
             harts: 2,
-            devices: vec![disk("lake://10.0.0.9:7401/data", false), disk("boot.img", true)],
+            devices: vec![
+                disk("lake://10.0.0.9:7401/data", false),
+                DeviceSpec::Net(parse_net("lan,mac=02:ca:00:00:00:01").unwrap()),
+                disk("boot.img", true),
+                DeviceSpec::Net(parse_net("-,mac=02:ca:00:00:00:02").unwrap()),
+            ],
         };
         let vms = [
             summary(1, "web", VmState::Running, web.clone()),
@@ -885,9 +1204,9 @@ mod tests {
         assert_eq!(
             vm_table(&vms),
             "\
-ID  NAME       STATE      RAM      CLOCK       DISKS
-1   web        running    64 MiB   1.5 MHz     2
-12  batch-job  exited(3)  128 MiB  full speed  0
+ID  NAME       STATE      RAM      CLOCK       DISKS  NETS
+1   web        running    64 MiB   1.5 MHz     2      2
+12  batch-job  exited(3)  128 MiB  full speed  0      0
 "
         );
         let details = VmDetails {
@@ -920,6 +1239,8 @@ harts    2
 steps    12345
 disks    lake://10.0.0.9:7401/data (read-write)
          boot.img (read-only)
+nets     02:ca:00:00:00:01 on switch lan
+         02:ca:00:00:00:02 unplugged
 devices  2
   UART      0x10000000 + 0x00000100  irq 1
   type 99   0x40000000 + 0x00001000
@@ -935,7 +1256,186 @@ devices  2
             text.contains("\nclock    full speed (reports 10 MHz to the guest)\n"),
             "{text}"
         );
-        assert!(text.contains("\ndisks    none\ndevices  0\n"), "{text}");
+        assert!(
+            text.contains("\ndisks    none\nnets     none\ndevices  0\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn switch_commands() {
+        let name = |n: &str| n.to_string();
+        assert_eq!(
+            command("switch create lan"),
+            Command::SwitchCreate { name: name("lan") }
+        );
+        assert_eq!(command("switch list"), Command::SwitchList);
+        assert_eq!(
+            command("switch show lan"),
+            Command::SwitchShow { name: name("lan") }
+        );
+        assert_eq!(
+            command("switch delete lan"),
+            Command::SwitchDelete { name: name("lan") }
+        );
+        assert_eq!(
+            command("switch attach lan web"),
+            Command::SwitchAttach {
+                switch: name("lan"),
+                vm: VmRef::Name(name("web")),
+                card: 0
+            }
+        );
+        assert_eq!(
+            command("switch attach lan 3 --card 2"),
+            Command::SwitchAttach {
+                switch: name("lan"),
+                vm: VmRef::Id(3),
+                card: 2
+            }
+        );
+        assert_eq!(
+            command("switch detach --card=1 web"),
+            Command::SwitchDetach {
+                vm: VmRef::Name(name("web")),
+                card: 1
+            }
+        );
+        assert_eq!(
+            command("switch capture lan lan.pcap"),
+            Command::SwitchCapture {
+                switch: name("lan"),
+                path: Some(name("lan.pcap"))
+            }
+        );
+        assert_eq!(
+            command("switch capture lan --stop"),
+            Command::SwitchCapture {
+                switch: name("lan"),
+                path: None
+            }
+        );
+        assert_eq!(
+            parse("--server 10.0.0.2 switch list").unwrap().server,
+            "10.0.0.2:7400"
+        );
+        // Cards for create.
+        let Command::Create(c) = command("create p.elf --name web --net lan --net -,mac=02:00:00:00:00:07")
+        else {
+            panic!()
+        };
+        assert_eq!(
+            c.profile.devices,
+            [
+                DeviceSpec::Net(NetSpec {
+                    switch: Some(name("lan")),
+                    mac: None
+                }),
+                DeviceSpec::Net(NetSpec {
+                    switch: None,
+                    mac: Some([2, 0, 0, 0, 0, 7])
+                }),
+            ]
+        );
+        for (args, why) in [
+            ("switch", "'switch' needs a command: create, list, show"),
+            ("switch flip lan", "unknown switch command 'flip'"),
+            ("switch create", "'switch create' needs a switch name"),
+            ("switch create Lan", "'Lan' is not a valid name"),
+            (
+                "switch create a b",
+                "'switch create' takes one switch name (got 'b' as well)",
+            ),
+            ("switch list x", "'switch list' takes no arguments (got 'x')"),
+            ("switch show", "'switch show' needs a switch name"),
+            ("switch attach lan", "'switch attach' needs a switch and a VM"),
+            (
+                "switch attach lan a b",
+                "'switch attach' takes a switch and a VM (got 'b' as well)",
+            ),
+            ("switch attach lan 99999999999", "'99999999999' is not a VM id"),
+            ("switch attach lan a --card x", "--card: 'x' is not a card number"),
+            (
+                "switch attach lan a --card 256",
+                "--card: '256' is not a card number",
+            ),
+            (
+                "switch attach lan a --card +1",
+                "--card: '+1' is not a card number",
+            ),
+            ("switch detach", "'switch detach' needs a VM"),
+            ("switch capture", "'switch capture' needs a switch"),
+            ("switch capture lan", "'switch capture' needs a file, or --stop"),
+            (
+                "switch capture lan f --stop",
+                "'switch capture' takes a file or --stop, not both",
+            ),
+            (
+                "switch capture lan f g",
+                "'switch capture' takes a switch and a file (got 'g' as well)",
+            ),
+            ("switch list --lake x", "'switch list' does not take --lake"),
+            ("switch show lan --card 1", "'switch show' does not take --card"),
+            ("switch detach a --stop", "'switch detach' does not take --stop"),
+            ("list --card 1", "'list' does not take --card"),
+            (
+                "create a.elf --name a --net LAN",
+                "--net: 'LAN': switch 'LAN' is not a valid name",
+            ),
+            (
+                "create a.elf --name a --net lan,mac=01:00:00:00:00:01",
+                "--net: 01:00:00:00:00:01 is a group",
+            ),
+        ] {
+            match parse(args) {
+                Err(e) => assert!(e.starts_with(why), "{args}: {e}"),
+                Ok(inv) => panic!("{args}: parsed as {inv:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn switch_output() {
+        assert_eq!(switch_table(&[]), "no switches\n");
+        let port = |vm, card, last, n: u64| SwitchPort {
+            owner: PortOwner::Card { vm, card },
+            mac: [0x02, 0xca, 0, 0, 0, last],
+            in_frames: n,
+            in_bytes: 60 * n,
+            out_frames: n + 1,
+            out_bytes: 60 * (n + 1),
+            dropped: n / 2,
+        };
+        let lan = SwitchInfo {
+            name: "lan".into(),
+            capture: Some("lan.pcap".into()),
+            ports: vec![port(1, 0, 1, 3), port(12, 1, 2, 1000)],
+        };
+        let dmz = SwitchInfo {
+            name: "dmz".into(),
+            capture: None,
+            ports: Vec::new(),
+        };
+        assert_eq!(
+            switch_table(&[dmz.clone(), lan.clone()]),
+            "\
+NAME  PORTS  CAPTURE
+dmz   0      no
+lan   2      lan.pcap
+"
+        );
+        assert_eq!(
+            switch_details(&lan),
+            "\
+switch   lan
+capture  lan.pcap
+ports    2
+VM  CARD  MAC                IN    IN-BYTES  OUT   OUT-BYTES  DROPPED
+1   0     02:ca:00:00:00:01  3     180       4     240        1
+12  1     02:ca:00:00:00:02  1000  60000     1001  60060      500
+"
+        );
+        assert_eq!(switch_details(&dmz), "switch   dmz\ncapture  no\nports    none\n");
     }
 
     #[test]

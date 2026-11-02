@@ -3,12 +3,20 @@
 //! Grail's keyboard events, pointer buttons and VRAM format. The conversions below
 //! destructure Grail's structs without `..`, so adding a field there stops this test
 //! compiling until the protocol (and `docs/avalon-protocol.md`) carry it too.
+//!
+//! Network cards: a Grail config plugs a card into an in-process hub, a profile into
+//! one of the server's switches, by name. The two are the same idea (a network the
+//! card is on), so here a hub stands for the switch of the same name.
 
 use avalon_proto::{
-    DeviceEntry, DeviceSpec, DiskSpec, HardwareProfile, KeyEvent, Message, PIXEL_FORMAT_XRGB8888,
+    DeviceEntry, DeviceSpec, DiskSpec, HardwareProfile, KeyEvent, Message, NetSpec, PIXEL_FORMAT_XRGB8888,
 };
-use grail::config::{DiskSource, DEFAULT_NOMINAL_HZ, MAX_HARTS, MAX_RAM_SIZE, MIB};
-use grail::{DiskConfig, MachineConfig};
+use grail::config::{DiskSource, NetSource, DEFAULT_NOMINAL_HZ, MAX_HARTS, MAX_RAM_SIZE, MIB};
+use grail::net::{Hub, MacAddr};
+use grail::{DiskConfig, MachineConfig, NetConfig};
+
+/// The switches of these tests: hubs with names.
+type Switches<'a> = &'a [(&'a str, Hub)];
 
 /// A Grail disk as a protocol device. Memory disks are local to the host that builds
 /// the machine and have no wire form.
@@ -25,7 +33,31 @@ fn disk_spec_from(disk: &DiskConfig) -> Result<DeviceSpec, String> {
     Ok(DeviceSpec::Disk(DiskSpec { source, read_only }))
 }
 
-fn profile_from(config: &MachineConfig) -> Result<HardwareProfile, String> {
+/// A Grail card as a protocol card: on the switch its hub stands for. A capture of one
+/// card has no wire form: Avalon captures whole switches (`CaptureSwitch`).
+fn net_spec_from(net: &NetConfig, switches: Switches) -> Result<DeviceSpec, String> {
+    let NetConfig { source, mac, pcap } = net.clone();
+    if pcap.is_some() {
+        return Err("a card's capture has no wire form: capture its switch".to_string());
+    }
+    let hub = match source {
+        NetSource::Hub(hub) => hub,
+        // User networking is a NAT gateway local to the host that runs the machine,
+        // like a memory disk: Avalon's cards are on its switches.
+        NetSource::User { .. } => return Err("user networking has no wire form".to_string()),
+    };
+    let switch = switches
+        .iter()
+        .find(|(_, h)| *h == hub)
+        .map(|(name, _)| name.to_string())
+        .ok_or("a hub with no switch name")?;
+    Ok(DeviceSpec::Net(NetSpec {
+        switch: Some(switch),
+        mac: mac.map(|m| m.0),
+    }))
+}
+
+fn profile_from(config: &MachineConfig, switches: Switches) -> Result<HardwareProfile, String> {
     let MachineConfig {
         ram_size,
         clock_hz,
@@ -34,33 +66,47 @@ fn profile_from(config: &MachineConfig) -> Result<HardwareProfile, String> {
         disks,
         nets,
     } = config.clone();
-    // Network cards (Excalibur spec section 9.8) are not in the protocol yet: issue #81
-    // adds them, with the virtual switches they plug into.
-    if !nets.is_empty() {
-        return Err("network cards have no wire form yet".to_string());
+    let mut devices: Vec<DeviceSpec> = disks.iter().map(disk_spec_from).collect::<Result<_, _>>()?;
+    for net in &nets {
+        devices.push(net_spec_from(net, switches)?);
     }
     Ok(HardwareProfile {
         ram_size: ram_size as u64,
         clock_hz,
         nominal_hz,
         harts: harts as u32,
-        devices: disks.iter().map(disk_spec_from).collect::<Result<_, _>>()?,
+        devices,
     })
 }
 
 /// What Avalon does with a profile from the wire: every disk, an image file or an image
-/// on a Lake server, becomes a config disk, in order.
-fn config_from(profile: &HardwareProfile) -> Result<MachineConfig, String> {
+/// on a Lake server, becomes a config disk, in order; every card a card on its switch
+/// (here, the hub of that name).
+fn config_from(profile: &HardwareProfile, switches: Switches) -> Result<MachineConfig, String> {
     let ram_size = usize::try_from(profile.ram_size).map_err(|_| "RAM size too large".to_string())?;
     let mut disks = Vec::new();
+    let mut nets = Vec::new();
     for device in &profile.devices {
-        let DeviceSpec::Disk(DiskSpec { source, read_only }) = device;
-        match source {
-            avalon_proto::DiskSource::File(path) => {
-                disks.push(DiskConfig::file(path.as_str()).with_read_only(*read_only))
-            }
-            avalon_proto::DiskSource::Lake { addr, name } => {
-                disks.push(DiskConfig::lake(addr.as_str(), name.as_str()).with_read_only(*read_only))
+        match device {
+            DeviceSpec::Disk(DiskSpec { source, read_only }) => match source {
+                avalon_proto::DiskSource::File(path) => {
+                    disks.push(DiskConfig::file(path.as_str()).with_read_only(*read_only))
+                }
+                avalon_proto::DiskSource::Lake { addr, name } => {
+                    disks.push(DiskConfig::lake(addr.as_str(), name.as_str()).with_read_only(*read_only))
+                }
+            },
+            DeviceSpec::Net(NetSpec { switch, mac }) => {
+                let switch = switch.as_deref().ok_or("Grail has no unplugged cards")?;
+                let (_, hub) = switches
+                    .iter()
+                    .find(|(name, _)| *name == switch)
+                    .ok_or_else(|| format!("no switch named '{switch}'"))?;
+                let card = NetConfig::hub(hub);
+                nets.push(match mac {
+                    Some(mac) => card.with_mac(MacAddr(*mac)),
+                    None => card,
+                });
             }
         }
     }
@@ -70,7 +116,7 @@ fn config_from(profile: &HardwareProfile) -> Result<MachineConfig, String> {
         nominal_hz: profile.nominal_hz,
         harts: usize::try_from(profile.harts).map_err(|_| "too many harts".to_string())?,
         disks,
-        nets: Vec::new(),
+        nets,
     };
     config.validate()?;
     Ok(config)
@@ -94,7 +140,7 @@ fn through_the_wire(profile: HardwareProfile) -> HardwareProfile {
 #[test]
 fn defaults_match_grail() {
     assert_eq!(
-        profile_from(&MachineConfig::default()).unwrap(),
+        profile_from(&MachineConfig::default(), &[]).unwrap(),
         HardwareProfile::default()
     );
     assert_eq!(avalon_proto::DEFAULT_RAM_SIZE, grail::DEFAULT_RAM_SIZE as u64);
@@ -105,12 +151,14 @@ fn defaults_match_grail() {
     );
     assert_eq!(
         HardwareProfile::with_ram(4096),
-        profile_from(&MachineConfig::with_ram(4096)).unwrap()
+        profile_from(&MachineConfig::with_ram(4096), &[]).unwrap()
     );
 }
 
 #[test]
 fn configs_survive_the_wire() {
+    let switches = [("lan", Hub::new()), ("dmz", Hub::new())];
+    let card = |i: usize| NetConfig::hub(&switches[i].1);
     let configs = [
         MachineConfig::default(),
         MachineConfig::with_ram(MIB),
@@ -140,12 +188,42 @@ fn configs_survive_the_wire() {
             ],
             ..MachineConfig::with_ram(MIB)
         },
+        MachineConfig {
+            disks: vec![DiskConfig::file("root.img")],
+            nets: vec![
+                card(0),
+                card(1).with_mac(MacAddr([0x02, 0, 0, 0, 0, 0x42])),
+                card(0).with_mac(MacAddr([0x0a, 0xbc, 0xde, 0xf0, 0x12, 0x34])),
+                card(1),
+            ],
+            ..MachineConfig::with_ram(MIB)
+        },
     ];
     for config in configs {
-        let profile = through_the_wire(profile_from(&config).unwrap());
+        let profile = through_the_wire(profile_from(&config, &switches).unwrap());
         assert_eq!(profile.cpu_hz(), config.cpu_hz());
-        assert_eq!(config_from(&profile).unwrap(), config);
+        assert_eq!(config_from(&profile, &switches).unwrap(), config);
     }
+    // What has no wire form.
+    let captured = MachineConfig {
+        nets: vec![card(0).with_pcap("a.pcap")],
+        ..MachineConfig::default()
+    };
+    assert!(profile_from(&captured, &switches).is_err());
+    let user = MachineConfig {
+        nets: vec![NetConfig::user(Vec::new())],
+        ..MachineConfig::default()
+    };
+    assert!(profile_from(&user, &switches).is_err());
+    let unplugged = HardwareProfile {
+        devices: vec![DeviceSpec::Net(NetSpec {
+            switch: None,
+            mac: None,
+        })],
+        ..HardwareProfile::default()
+    };
+    assert_eq!(through_the_wire(unplugged.clone()), unplugged);
+    assert!(config_from(&unplugged, &switches).is_err());
 }
 
 #[test]
@@ -176,7 +254,7 @@ fn invalid_profiles_decode_and_are_left_to_the_server() {
     ] {
         let back = through_the_wire(bad.clone());
         assert_eq!(back, bad);
-        assert!(config_from(&back).is_err(), "{bad:?}");
+        assert!(config_from(&back, &[]).is_err(), "{bad:?}");
     }
 }
 

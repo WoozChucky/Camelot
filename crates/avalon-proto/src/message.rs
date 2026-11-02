@@ -3,8 +3,9 @@
 //!
 //! Type codes are grouped by their high byte: `0x00` session, `0x01` VM control, `0x02`
 //! console, `0x03` screen and input (keyboard and pointer), `0x04` block I/O, `0x05`
-//! disk management. Every message is a request (answered by exactly one reply), a
-//! reply, or an event (never answered); see [`MessageKind`].
+//! disk management, `0x06` virtual network (Avalon's switches). Every message is a
+//! request (answered by exactly one reply), a reply, or an event (never answered); see
+//! [`MessageKind`].
 
 use crate::wire::{Reader, Writer};
 use crate::{Error, Result, MAGIC, MAX_BLOCK_SECTORS, SECTOR_SIZE};
@@ -61,6 +62,14 @@ pub mod ty {
     pub const LIST_DISKS: u16 = 0x0502;
     pub const DISK_LIST: u16 = 0x0503;
     pub const DISK_DELETE: u16 = 0x0504;
+    // Virtual network.
+    pub const CREATE_SWITCH: u16 = 0x0601;
+    pub const DELETE_SWITCH: u16 = 0x0602;
+    pub const LIST_SWITCHES: u16 = 0x0603;
+    pub const SWITCH_LIST: u16 = 0x0604;
+    pub const ATTACH_CARD: u16 = 0x0605;
+    pub const DETACH_CARD: u16 = 0x0606;
+    pub const CAPTURE_SWITCH: u16 = 0x0607;
 }
 
 /// Every message type, with its name and kind, in code order. The protocol doc's
@@ -111,6 +120,13 @@ pub const CATALOGUE: &[(u16, &str, MessageKind)] = {
         (ty::LIST_DISKS, "ListDisks", Request),
         (ty::DISK_LIST, "DiskList", Reply),
         (ty::DISK_DELETE, "DiskDelete", Request),
+        (ty::CREATE_SWITCH, "CreateSwitch", Request),
+        (ty::DELETE_SWITCH, "DeleteSwitch", Request),
+        (ty::LIST_SWITCHES, "ListSwitches", Request),
+        (ty::SWITCH_LIST, "SwitchList", Reply),
+        (ty::ATTACH_CARD, "AttachCard", Request),
+        (ty::DETACH_CARD, "DetachCard", Request),
+        (ty::CAPTURE_SWITCH, "CaptureSwitch", Request),
     ]
 };
 
@@ -207,6 +223,8 @@ impl HardwareProfile {
 pub enum DeviceSpec {
     /// A block storage device.
     Disk(DiskSpec),
+    /// A network card (Excalibur spec section 9.8).
+    Net(NetSpec),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,6 +232,21 @@ pub struct DiskSpec {
     pub source: DiskSource,
     /// Attach read-only: the guest's writes fail, and Lake allows other readers.
     pub read_only: bool,
+}
+
+/// A network card in a hardware profile: the virtual switch its cable is plugged into
+/// on the server, and its MAC address.
+///
+/// In `CreateVm`, `switch` is the switch to plug the card into when the VM is created
+/// (`None`: unplugged, link down) and `mac` the card's address (`None`: the server
+/// makes one up). In `VmList` and `VmInfo` both are what they are now: the switch the
+/// card is plugged into at the moment, and the address it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetSpec {
+    pub switch: Option<String>,
+    /// In wire order. A card's address must be an individual, locally administered
+    /// one (`02:..`); the server checks.
+    pub mac: Option<[u8; 6]>,
 }
 
 /// Where a disk's blocks live.
@@ -376,6 +409,39 @@ pub struct DiskInfo {
     pub writer: bool,
 }
 
+/// One virtual switch in a `SwitchList`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchInfo {
+    pub name: String,
+    /// The file on the server's host this switch is being captured into, if it is.
+    pub capture: Option<String>,
+    /// Its ports, in the order they were plugged in.
+    pub ports: Vec<SwitchPort>,
+}
+
+/// One port of a virtual switch and its counters. "In" is what the switch received on
+/// the port (what the card sent), "out" what it passed on to the port (for the card to
+/// receive); `dropped` counts frames for this port that were lost because its queue
+/// was full (the card did not take them fast enough).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwitchPort {
+    pub owner: PortOwner,
+    /// The MAC address of what is plugged in.
+    pub mac: [u8; 6],
+    pub in_frames: u64,
+    pub in_bytes: u64,
+    pub out_frames: u64,
+    pub out_bytes: u64,
+    pub dropped: u64,
+}
+
+/// What is plugged into a switch port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortOwner {
+    /// Network card number `card` (from 0, the order of the profile's cards) of VM `vm`.
+    Card { vm: u32, card: u8 },
+}
+
 /// Error codes carried by the `Error` message. Codes are never reused. Unknown codes
 /// decode as [`ErrorCode::Other`] so a client can still show them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,13 +482,17 @@ pub enum ErrorCode {
     Io,
     /// A bug or unexpected condition in the server.
     Internal,
+    /// No virtual switch with that name.
+    NoSuchSwitch,
+    /// The VM has no network card with that number.
+    NoSuchCard,
     /// A code this version does not know. Never the number of a named code:
     /// [`Message::check`] refuses `Other(5)`, which would decode as `NoSuchVm`.
     Other(u16),
 }
 
 impl ErrorCode {
-    const TABLE: [(ErrorCode, u16, &'static str); 18] = [
+    const TABLE: [(ErrorCode, u16, &'static str); 20] = [
         (ErrorCode::Malformed, 1, "malformed"),
         (ErrorCode::UnknownMessage, 2, "unknown message"),
         (ErrorCode::Unexpected, 3, "unexpected message"),
@@ -441,6 +511,8 @@ impl ErrorCode {
         (ErrorCode::OutOfRange, 16, "out of range"),
         (ErrorCode::Io, 17, "I/O error"),
         (ErrorCode::Internal, 18, "internal error"),
+        (ErrorCode::NoSuchSwitch, 19, "no such switch"),
+        (ErrorCode::NoSuchCard, 20, "no such network card"),
     ];
 
     /// Every named code, for tests and documentation.
@@ -678,6 +750,38 @@ pub enum Message {
     DiskDelete {
         name: String,
     },
+
+    // ---- Virtual network (Avalon) ----
+    /// Create an empty virtual switch. Answered by `Ok`.
+    CreateSwitch {
+        name: String,
+    },
+    /// Delete a switch, unplugging every card from it. Answered by `Ok`.
+    DeleteSwitch {
+        name: String,
+    },
+    /// Answered by `SwitchList`.
+    ListSwitches,
+    SwitchList {
+        switches: Vec<SwitchInfo>,
+    },
+    /// Plug card `card` of VM `vm` into switch `switch`. Answered by `Ok`.
+    AttachCard {
+        vm: VmRef,
+        card: u8,
+        switch: String,
+    },
+    /// Unplug card `card` of VM `vm` from its switch. Answered by `Ok`.
+    DetachCard {
+        vm: VmRef,
+        card: u8,
+    },
+    /// Start capturing every frame that enters switch `switch` into the pcap file
+    /// `path` on the server's host, or stop (`None`). Answered by `Ok`.
+    CaptureSwitch {
+        switch: String,
+        path: Option<String>,
+    },
 }
 
 impl Message {
@@ -728,6 +832,13 @@ impl Message {
             ListDisks => ty::LIST_DISKS,
             DiskList { .. } => ty::DISK_LIST,
             DiskDelete { .. } => ty::DISK_DELETE,
+            CreateSwitch { .. } => ty::CREATE_SWITCH,
+            DeleteSwitch { .. } => ty::DELETE_SWITCH,
+            ListSwitches => ty::LIST_SWITCHES,
+            SwitchList { .. } => ty::SWITCH_LIST,
+            AttachCard { .. } => ty::ATTACH_CARD,
+            DetachCard { .. } => ty::DETACH_CARD,
+            CaptureSwitch { .. } => ty::CAPTURE_SWITCH,
         }
     }
 
@@ -820,7 +931,7 @@ impl Message {
                 w.u16(code.to_u16());
                 w.str(message);
             }
-            Ok | ListVms | ListDisks => {}
+            Ok | ListVms | ListDisks | ListSwitches => {}
             Ping { token } | Pong { token } => w.u32(*token),
             CreateVm {
                 name,
@@ -970,7 +1081,25 @@ impl Message {
                 w.u32(d.readers);
                 w.bool(d.writer);
             }),
-            DiskDelete { name } => w.str(name),
+            DiskDelete { name } | CreateSwitch { name } | DeleteSwitch { name } => w.str(name),
+            SwitchList { switches } => w.list(switches, |w, s| {
+                w.str(&s.name);
+                w.option(&s.capture, |w, path| w.str(path));
+                w.list(&s.ports, put_port);
+            }),
+            AttachCard { vm, card, switch } => {
+                put_vm_ref(w, vm);
+                w.u8(*card);
+                w.str(switch);
+            }
+            DetachCard { vm, card } => {
+                put_vm_ref(w, vm);
+                w.u8(*card);
+            }
+            CaptureSwitch { switch, path } => {
+                w.str(switch);
+                w.option(path, |w, path| w.str(path));
+            }
         }
     }
 
@@ -1155,6 +1284,31 @@ impl Message {
                 })?,
             },
             ty::DISK_DELETE => DiskDelete { name: r.string()? },
+            ty::CREATE_SWITCH => CreateSwitch { name: r.string()? },
+            ty::DELETE_SWITCH => DeleteSwitch { name: r.string()? },
+            ty::LIST_SWITCHES => ListSwitches,
+            ty::SWITCH_LIST => SwitchList {
+                switches: r.list(|r| {
+                    Result::Ok(SwitchInfo {
+                        name: r.string()?,
+                        capture: r.option(|r| r.string())?,
+                        ports: r.list(get_port)?,
+                    })
+                })?,
+            },
+            ty::ATTACH_CARD => AttachCard {
+                vm: get_vm_ref(r)?,
+                card: r.u8()?,
+                switch: r.string()?,
+            },
+            ty::DETACH_CARD => DetachCard {
+                vm: get_vm_ref(r)?,
+                card: r.u8()?,
+            },
+            ty::CAPTURE_SWITCH => CaptureSwitch {
+                switch: r.string()?,
+                path: r.option(|r| r.string())?,
+            },
             _ => return Err(crate::Error::UnknownType(code)),
         };
         reader.finish()?;
@@ -1233,6 +1387,11 @@ fn put_profile(w: &mut Writer, p: &HardwareProfile) {
             }
             w.bool(disk.read_only);
         }
+        DeviceSpec::Net(net) => {
+            w.u8(2);
+            w.option(&net.switch, |w, switch| w.str(switch));
+            w.option(&net.mac, |w, mac| w.raw(mac));
+        }
     });
 }
 
@@ -1257,8 +1416,45 @@ fn get_profile(r: &mut Reader) -> Result<HardwareProfile> {
                     read_only: r.bool()?,
                 }))
             }
+            2 => Ok(DeviceSpec::Net(NetSpec {
+                switch: r.option(|r| r.string())?,
+                mac: r.option(|r| r.mac())?,
+            })),
             t => Err(bad_tag("device", t)),
         })?,
+    })
+}
+
+fn put_port(w: &mut Writer, p: &SwitchPort) {
+    match p.owner {
+        PortOwner::Card { vm, card } => {
+            w.u8(1);
+            w.u32(vm);
+            w.u8(card);
+        }
+    }
+    w.raw(&p.mac);
+    for n in [p.in_frames, p.in_bytes, p.out_frames, p.out_bytes, p.dropped] {
+        w.u64(n);
+    }
+}
+
+fn get_port(r: &mut Reader) -> Result<SwitchPort> {
+    let owner = match r.u8()? {
+        1 => PortOwner::Card {
+            vm: r.u32()?,
+            card: r.u8()?,
+        },
+        t => return Err(bad_tag("port owner", t)),
+    };
+    Ok(SwitchPort {
+        owner,
+        mac: r.mac()?,
+        in_frames: r.u64()?,
+        in_bytes: r.u64()?,
+        out_frames: r.u64()?,
+        out_bytes: r.u64()?,
+        dropped: r.u64()?,
     })
 }
 

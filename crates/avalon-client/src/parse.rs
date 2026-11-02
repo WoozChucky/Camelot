@@ -1,7 +1,8 @@
 //! What people type, as protocol values. Every front end (Round Table's flags,
 //! Pendragon's forms) parses with these, so they all accept the same syntax.
 
-use avalon_proto::{DiskSource, SECTOR_SIZE};
+use avalon_proto::{validate_name, DiskSource, NetSpec, SECTOR_SIZE};
+use grail::net::MacAddr;
 use std::net::{IpAddr, SocketAddr};
 
 /// Parses a `--clock` value: a number with an optional unit, `Hz`, `kHz` or `MHz` (any
@@ -112,9 +113,78 @@ pub fn parse_disk_size(s: &str) -> Result<u64, String> {
     Ok(sectors)
 }
 
+/// Parses a network card for a VM's hardware profile: `SWITCH[,mac=ADDR]`, the switch
+/// on Avalon to plug it into (`-` for none: the card starts unplugged) and optionally
+/// its MAC address (`02:00:00:00:00:01`, or with `-`; without one Avalon makes one up
+/// from the VM's name). The address must be one a card may have: individual and
+/// locally administered, as Grail requires.
+pub fn parse_net(s: &str) -> Result<NetSpec, String> {
+    let mut parts = s.split(',');
+    let switch = match parts.next().unwrap_or_default() {
+        "-" => None,
+        name => {
+            validate_name(name).map_err(|e| format!("'{s}': switch {e}"))?;
+            Some(name.to_string())
+        }
+    };
+    let mut mac = None;
+    for option in parts {
+        match option.split_once('=') {
+            Some(("mac", text)) if mac.is_none() => {
+                let addr = MacAddr::parse(text)?;
+                addr.check_card()?;
+                mac = Some(addr.0);
+            }
+            Some(("mac", _)) => return Err(format!("'{s}': mac= is given twice")),
+            _ => return Err(format!("'{s}': unknown option '{option}' (there is mac=ADDR)")),
+        }
+    }
+    Ok(NetSpec { switch, mac })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_cards() {
+        let net = |switch: Option<&str>, mac: Option<[u8; 6]>| NetSpec {
+            switch: switch.map(str::to_string),
+            mac,
+        };
+        assert_eq!(parse_net("lan"), Ok(net(Some("lan"), None)));
+        assert_eq!(parse_net("-"), Ok(net(None, None)));
+        assert_eq!(
+            parse_net("lan,mac=02:00:00:00:00:2a"),
+            Ok(net(Some("lan"), Some([2, 0, 0, 0, 0, 0x2a])))
+        );
+        assert_eq!(
+            parse_net("-,mac=0A-BC-00-00-00-01"),
+            Ok(net(None, Some([0x0a, 0xbc, 0, 0, 0, 1])))
+        );
+        for (bad, why) in [
+            ("", "'': switch name must be"),
+            ("LAN", "'LAN': switch 'LAN' is not a valid name"),
+            ("lan,", "'lan,': unknown option ''"),
+            ("lan,mtu=1500", "'lan,mtu=1500': unknown option 'mtu=1500'"),
+            ("lan,mac=x", "'x' is not a MAC address"),
+            (
+                "lan,mac=01:00:5e:00:00:01",
+                "01:00:5e:00:00:01 is a group address",
+            ),
+            (
+                "lan,mac=00:11:22:33:44:55",
+                "00:11:22:33:44:55 is not locally administered",
+            ),
+            (
+                "lan,mac=02:00:00:00:00:01,mac=02:00:00:00:00:02",
+                "'lan,mac=02:00:00:00:00:01,mac=02:00:00:00:00:02': mac= is given twice",
+            ),
+        ] {
+            let e = parse_net(bad).unwrap_err();
+            assert!(e.starts_with(why), "{bad}: {e}");
+        }
+    }
 
     #[test]
     fn addresses() {
