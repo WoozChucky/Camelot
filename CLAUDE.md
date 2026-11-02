@@ -28,7 +28,7 @@ crates/round-table      the Round Table control CLI: argument parsing and text o
 crates/herald           Herald, the client that attaches to one VM: Session (the streaming layer, terminal-free) and the CLI, which puts the terminal in raw mode with grail::console::RawMode
 crates/lake             the Lake storage server: a directory of disk images served over the protocol (one writer or many readers per image); Grail's client side is grail::lake::LakeDisk
 crates/pendragon        the Pendragon web console: std-only HTTP/1.1 server, JSON API and an embedded page over avalon-client; API and security model in docs/pendragon.md
-crates/merlin           the C-subset compiler, C to .s (src/codegen.rs explains the stack frames and calling convention)
+crates/merlin           the C-subset compiler, C to .s (src/codegen.rs explains the stack frames and code generation, src/abi.rs the calling convention)
 crates/merlin-as        the assembler
 crates/merlin-ld        the linker (src/reloc.rs explains every relocation it applies)
 crates/merlin-objdump   the disassembler; output matches llvm-objdump 21

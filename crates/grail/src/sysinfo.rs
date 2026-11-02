@@ -55,6 +55,8 @@ pub enum DeviceType {
     Block = 9,
     /// Xcal pointer (mouse/tablet, spec section 9.7).
     Pointer = 10,
+    /// Xcal network card, one entry per card (spec section 9.8).
+    Net = 11,
 }
 
 /// One device table entry. `irq` is the device's PLIC source, 0 if it has none.

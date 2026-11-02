@@ -31,7 +31,13 @@ fn profile_from(config: &MachineConfig) -> Result<HardwareProfile, String> {
         clock_hz,
         nominal_hz,
         disks,
+        nets,
     } = config.clone();
+    // Network cards (Excalibur spec section 9.8) are not in the protocol yet: issue #81
+    // adds them, with the virtual switches they plug into.
+    if !nets.is_empty() {
+        return Err("network cards have no wire form yet".to_string());
+    }
     Ok(HardwareProfile {
         ram_size: ram_size as u64,
         clock_hz,
@@ -61,6 +67,7 @@ fn config_from(profile: &HardwareProfile) -> Result<MachineConfig, String> {
         clock_hz: profile.clock_hz,
         nominal_hz: profile.nominal_hz,
         disks,
+        nets: Vec::new(),
     };
     config.validate()?;
     Ok(config)
@@ -106,12 +113,14 @@ fn configs_survive_the_wire() {
             clock_hz: Some(2_000_000),
             nominal_hz: DEFAULT_NOMINAL_HZ,
             disks: Vec::new(),
+            nets: Vec::new(),
         },
         MachineConfig {
             ram_size: 4096,
             clock_hz: Some(u32::MAX),
             nominal_hz: 1,
             disks: Vec::new(),
+            nets: Vec::new(),
         },
         MachineConfig {
             disks: vec![
