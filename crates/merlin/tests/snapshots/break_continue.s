@@ -1,11 +1,11 @@
     .text
 
-    # int main(): frame 32 bytes
-    #     -12(s0)  local sum
-    #     -16(s0)  local i
-    #     -20(s0)  local n
-    #     -24(s0)  local k
-    #     -28(s0)  local m
+    # int main(void): frame 32 bytes
+    #     -12(s0)  local int sum
+    #     -16(s0)  local int i
+    #     -20(s0)  local int n
+    #     -24(s0)  local int k
+    #     -28(s0)  local int m
     .globl main
 main:
     addi  sp, sp, -16

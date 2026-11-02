@@ -1,0 +1,82 @@
+Var extern int later @later <4:12>
+Var int counter @counter (definition) <5:5>
+Var int counter @counter <6:5>
+Var int base @base (definition) <7:5>
+  Num 40 : int <7:12>
+Var int *pbase @pbase (definition) <8:6>
+  Addr : int * <8:14>
+    Var base @base : int <8:15>
+Var static int hidden @hidden (definition) <9:12>
+  Num 5 : int <9:21>
+Var int table[4] @table (definition) <10:5>
+  InitList <10:16>
+    Num 1 : int <10:17>
+    Num 2 : int <10:20>
+    Num 3 : int <10:23>
+    Num 4 : int <10:26>
+Var int *third @third (definition) <11:6>
+  Addr : int * <11:14>
+    Deref : int <11:20>
+      Binary + : int * <11:20>
+        Var table @table : int [4] <11:15>
+        Num 2 : int <11:21>
+Var int *past @past (definition) <12:6>
+  Binary + : int * <12:19>
+    Var table @table : int [4] <12:13>
+    Num 4 : int <12:21>
+Function void bump(void) <14:6>
+  ExprStmt <15:5>
+    Post++ : int <15:12>
+      Var counter @counter : int <15:5>
+  ExprStmt <16:5>
+    Assign += : int <16:11>
+      Var later @later : int <16:5>
+      Num 2 : int <16:14>
+Var int later @later (definition) <19:5>
+  Num 10 : int <19:13>
+Function int main(void) <21:5>
+  Local #0 int r <25:9>
+  ExprStmt <22:5>
+    Call bump : void <22:5>
+  ExprStmt <23:5>
+    Call bump : void <23:5>
+  ExprStmt <24:5>
+    Assign += : int <24:12>
+      Deref : int <24:5>
+        Var pbase @pbase : int * <24:6>
+      Num 1 : int <24:15>
+  Decl <25:5>
+    Var int r #0 <25:9>
+      Binary + : int <25:36>
+        Binary + : int <25:29>
+          Binary + : int <25:21>
+            Var counter @counter : int <25:13>
+            Var later @later : int <25:23>
+          Var base @base : int <25:31>
+        Var hidden @hidden : int <25:38>
+  ExprStmt <26:5>
+    Assign += : int <26:7>
+      Var r #0 : int <26:5>
+      Binary + : int <26:17>
+        Deref : int <26:10>
+          Var third @third : int * <26:11>
+        Binary - : int <26:25>
+          Var past @past : int * <26:20>
+          Var third @third : int * <26:27>
+  ExprStmt <27:5>
+    Assign += : int <27:7>
+      Var r #0 : int <27:5>
+      Deref : int <27:14>
+        Binary + : int * <27:14>
+          Var past @past : int * <27:10>
+          Unary - : int <27:15>
+            Num 1 : int <27:16>
+  Return <28:5>
+    Binary + : int <28:33>
+      Binary + : int <28:14>
+        Var r #0 : int <28:12>
+        Binary == : int <28:23>
+          Var pbase @pbase : int * <28:17>
+          Addr : int * <28:26>
+            Var base @base : int <28:27>
+      Num 2 : int <28:35>
