@@ -29,8 +29,10 @@ pub const IDC_ARROW: u16 = 32512;
 
 pub const WM_DESTROY: u32 = 0x0002;
 pub const WM_PAINT: u32 = 0x000f;
-pub const WM_QUIT: u32 = 0x0012;
+pub const WM_NCCREATE: u32 = 0x0081;
+pub const WM_NCDESTROY: u32 = 0x0082;
 pub const PM_REMOVE: u32 = 0x0001;
+pub const GWLP_USERDATA: i32 = -21;
 
 pub const BI_RGB: u32 = 0;
 pub const DIB_RGB_COLORS: u32 = 0;
@@ -78,6 +80,23 @@ pub struct MSG {
     pub time: u32,
     pub pt: POINT,
     pub lPrivate: u32,
+}
+
+/// What `CreateWindowExW` was called with; `lParam` of `WM_NCCREATE` points at it.
+#[repr(C)]
+pub struct CREATESTRUCTW {
+    pub lpCreateParams: *mut c_void,
+    pub hInstance: HINSTANCE,
+    pub hMenu: HMENU,
+    pub hwndParent: HWND,
+    pub cy: i32,
+    pub cx: i32,
+    pub y: i32,
+    pub x: i32,
+    pub style: i32,
+    pub lpszName: *const u16,
+    pub lpszClass: *const u16,
+    pub dwExStyle: u32,
 }
 
 #[repr(C)]
@@ -141,7 +160,6 @@ extern "system" {
     pub fn TranslateMessage(msg: *const MSG) -> BOOL;
     pub fn DispatchMessageW(msg: *const MSG) -> LRESULT;
     pub fn WaitMessage() -> BOOL;
-    pub fn PostQuitMessage(exit_code: i32);
     pub fn AdjustWindowRect(rect: *mut RECT, style: u32, menu: BOOL) -> BOOL;
     pub fn GetClientRect(hwnd: HWND, rect: *mut RECT) -> BOOL;
     pub fn SetWindowTextW(hwnd: HWND, text: *const u16) -> BOOL;
@@ -150,6 +168,24 @@ extern "system" {
     pub fn ReleaseDC(hwnd: HWND, hdc: HDC) -> i32;
     pub fn BeginPaint(hwnd: HWND, ps: *mut PAINTSTRUCT) -> HDC;
     pub fn EndPaint(hwnd: HWND, ps: *const PAINTSTRUCT) -> BOOL;
+}
+
+// The `...LongPtrW` functions exist only in 64-bit user32; in 32-bit builds the SDK
+// headers map them to the plain `...LongW` ones, which take a LONG.
+#[cfg(target_pointer_width = "64")]
+#[link(name = "user32")]
+extern "system" {
+    pub fn GetWindowLongPtrW(hwnd: HWND, index: i32) -> isize;
+    pub fn SetWindowLongPtrW(hwnd: HWND, index: i32, value: isize) -> isize;
+}
+
+#[cfg(target_pointer_width = "32")]
+#[link(name = "user32")]
+extern "system" {
+    #[link_name = "GetWindowLongW"]
+    pub fn GetWindowLongPtrW(hwnd: HWND, index: i32) -> isize;
+    #[link_name = "SetWindowLongW"]
+    pub fn SetWindowLongPtrW(hwnd: HWND, index: i32, value: isize) -> isize;
 }
 
 #[link(name = "gdi32")]
@@ -190,12 +226,14 @@ mod tests {
             assert_eq!(size_of::<WNDCLASSEXW>(), 80);
             assert_eq!(size_of::<MSG>(), 48);
             assert_eq!(size_of::<PAINTSTRUCT>(), 72);
+            assert_eq!(size_of::<CREATESTRUCTW>(), 80);
         }
         #[cfg(target_pointer_width = "32")]
         {
             assert_eq!(size_of::<WNDCLASSEXW>(), 48);
             assert_eq!(size_of::<MSG>(), 32);
             assert_eq!(size_of::<PAINTSTRUCT>(), 64);
+            assert_eq!(size_of::<CREATESTRUCTW>(), 48);
         }
         assert_eq!(size_of::<RECT>(), 16);
         assert_eq!(size_of::<BITMAPINFOHEADER>(), 40);

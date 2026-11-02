@@ -1,10 +1,14 @@
 //! Physical address space. See spec section 7 for the memory map.
 
+use crate::config::MachineConfig;
 use crate::devices::{Clint, Plic, TestDevice, Uart, UART_IRQ};
 use crate::framebuffer::{Framebuffer, VRAM_SIZE};
+use crate::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
+use std::io::Write;
 
 pub const BOOT_ROM_BASE: u32 = 0x0000_1000;
 pub const TEST_DEV_BASE: u32 = 0x0010_0000;
+pub const TEST_DEV_SIZE: u32 = 0x1000;
 pub const CLINT_BASE: u32 = 0x0200_0000;
 pub const CLINT_SIZE: u32 = 0x1_0000;
 pub const PLIC_BASE: u32 = 0x0C00_0000;
@@ -13,8 +17,32 @@ pub const UART_BASE: u32 = 0x1000_0000;
 pub const UART_SIZE: u32 = 0x100;
 pub const FB_CTRL_BASE: u32 = 0x3000_0000;
 pub const FB_CTRL_SIZE: u32 = 0x1000;
+pub const SYSINFO_BASE: u32 = 0x3000_2000;
+pub const SYSINFO_SIZE: u32 = 0x1000;
 pub const VRAM_BASE: u32 = 0x3100_0000;
 pub const RAM_BASE: u32 = 0x8000_0000;
+
+/// The devices a machine built from `_config` has, as the sysinfo device table lists
+/// them: in address order. A new device is one more entry here (plus its decoding in
+/// [`Bus::read`] and [`Bus::write`]); devices that only some machines have can look at
+/// the config.
+pub fn device_table(_config: &MachineConfig) -> Vec<DeviceEntry> {
+    let dev = |kind, base, size, irq| DeviceEntry {
+        kind,
+        base,
+        size,
+        irq,
+    };
+    vec![
+        dev(DeviceType::TestFinisher, TEST_DEV_BASE, TEST_DEV_SIZE, 0),
+        dev(DeviceType::Clint, CLINT_BASE, CLINT_SIZE, 0),
+        dev(DeviceType::Plic, PLIC_BASE, PLIC_SIZE, 0),
+        dev(DeviceType::Uart, UART_BASE, UART_SIZE, UART_IRQ),
+        dev(DeviceType::FbCtrl, FB_CTRL_BASE, FB_CTRL_SIZE, 0),
+        dev(DeviceType::Sysinfo, SYSINFO_BASE, SYSINFO_SIZE, 0),
+        dev(DeviceType::FbVram, VRAM_BASE, VRAM_SIZE, 0),
+    ]
+}
 
 /// Physical access failed: nothing mapped there, or the device refused the width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +63,10 @@ pub struct Bus {
     pub uart: Uart,
     pub fb: Framebuffer,
     pub test: TestDevice,
+    pub sysinfo: Sysinfo,
+    /// Where `xcal.dbg` output goes (the CLI's stderr). `None` drops it. With
+    /// `uart.capture` on, it goes into the UART capture buffer instead.
+    pub debug: Option<Box<dyn Write + Send>>,
     /// Address of the riscv-tests `tohost` symbol, if the loaded ELF has one.
     pub tohost: Option<u32>,
     /// Set when a device or `tohost` asks the machine to stop.
@@ -42,15 +74,19 @@ pub struct Bus {
 }
 
 impl Bus {
-    pub fn new(ram_size: usize) -> Self {
+    /// The bus of a machine built from `config`, which must be valid
+    /// ([`MachineConfig::validate`]).
+    pub fn new(config: &MachineConfig) -> Self {
         Bus {
-            ram: vec![0; ram_size],
+            ram: vec![0; config.ram_size],
             rom: Vec::new(),
             clint: Clint::default(),
             plic: Plic::default(),
             uart: Uart::default(),
             fb: Framebuffer::default(),
             test: TestDevice,
+            sysinfo: Sysinfo::new(config, device_table(config)),
+            debug: None,
             tohost: None,
             exit: None,
         }
@@ -128,7 +164,10 @@ impl Bus {
             a if (FB_CTRL_BASE..FB_CTRL_BASE + FB_CTRL_SIZE).contains(&a) => {
                 self.fb.read(a - FB_CTRL_BASE, size)
             }
-            a if (TEST_DEV_BASE..TEST_DEV_BASE + 0x1000).contains(&a) => Ok(0),
+            a if (SYSINFO_BASE..SYSINFO_BASE + SYSINFO_SIZE).contains(&a) => {
+                self.sysinfo.read(a - SYSINFO_BASE, size)
+            }
+            a if (TEST_DEV_BASE..TEST_DEV_BASE + TEST_DEV_SIZE).contains(&a) => Ok(0),
             _ => Err(BusFault),
         }
     }
@@ -151,7 +190,10 @@ impl Bus {
             a if (FB_CTRL_BASE..FB_CTRL_BASE + FB_CTRL_SIZE).contains(&a) => {
                 self.fb.write(a - FB_CTRL_BASE, size, val)
             }
-            a if (TEST_DEV_BASE..TEST_DEV_BASE + 0x1000).contains(&a) => {
+            a if (SYSINFO_BASE..SYSINFO_BASE + SYSINFO_SIZE).contains(&a) => {
+                self.sysinfo.write(a - SYSINFO_BASE, size, val)
+            }
+            a if (TEST_DEV_BASE..TEST_DEV_BASE + TEST_DEV_SIZE).contains(&a) => {
                 if let Some(e) = self.test.write(a - TEST_DEV_BASE, val) {
                     self.exit = Some(e);
                 }
@@ -161,13 +203,13 @@ impl Bus {
         }
     }
 
-    /// Debug console (xcal.dbg). Goes to stderr, or into the UART capture buffer in tests.
+    /// Debug console (xcal.dbg): the `debug` sink, or the UART capture buffer in tests.
     pub fn debug_out(&mut self, bytes: &[u8]) {
         if self.uart.capture {
             self.uart.captured.extend_from_slice(bytes);
-        } else {
-            use std::io::Write;
-            let _ = std::io::stderr().write_all(bytes);
+        } else if let Some(out) = &mut self.debug {
+            let _ = out.write_all(bytes);
+            let _ = out.flush();
         }
     }
 
@@ -193,10 +235,119 @@ impl Bus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sysinfo::{self, DEV_ENTRY_SIZE, DEV_TABLE};
+    use std::sync::{Arc, Mutex};
+
+    fn small_bus() -> Bus {
+        Bus::new(&MachineConfig::with_ram(4096))
+    }
+
+    #[test]
+    fn sysinfo_on_the_bus() {
+        let config = MachineConfig {
+            ram_size: 32 * 1024 * 1024,
+            clock_hz: Some(250_000),
+            ..MachineConfig::default()
+        };
+        let mut bus = Bus::new(&config);
+        let reg = |bus: &mut Bus, off| bus.read(SYSINFO_BASE + off, 4).unwrap();
+        assert_eq!(reg(&mut bus, sysinfo::REG_MAGIC), sysinfo::SYSINFO_MAGIC);
+        assert_eq!(reg(&mut bus, sysinfo::REG_RAM_BASE), RAM_BASE);
+        assert_eq!(reg(&mut bus, sysinfo::REG_RAM_SIZE), 32 * 1024 * 1024);
+        assert_eq!(reg(&mut bus, sysinfo::REG_TIMEBASE_HZ), 250_000);
+        assert_eq!(reg(&mut bus, sysinfo::REG_CPU_HZ), 250_000);
+        assert_eq!(reg(&mut bus, sysinfo::REG_FLAGS), sysinfo::FLAG_REAL_TIME);
+        bus.write(SYSINFO_BASE + sysinfo::REG_RAM_SIZE, 4, 1).unwrap();
+        assert_eq!(
+            reg(&mut bus, sysinfo::REG_RAM_SIZE),
+            32 * 1024 * 1024,
+            "read-only"
+        );
+        assert_eq!(bus.read(SYSINFO_BASE, 1), Err(BusFault));
+        assert_eq!(bus.write(SYSINFO_BASE, 2, 0), Err(BusFault));
+        assert_eq!(bus.read(SYSINFO_BASE + SYSINFO_SIZE, 4), Err(BusFault));
+        // Not memory: no instruction fetches from it.
+        assert_eq!(bus.read_mem(SYSINFO_BASE, 4), Err(BusFault));
+    }
+
+    #[test]
+    fn device_table_matches_the_bus() {
+        let mut bus = small_bus();
+        let count = bus.read(SYSINFO_BASE + sysinfo::REG_DEV_COUNT, 4).unwrap();
+        let table = bus.sysinfo.devices().to_vec();
+        assert_eq!(count as usize, table.len());
+        assert_eq!(table, device_table(&MachineConfig::default()));
+        let ram = RAM_BASE as u64..1 << 32;
+        let rom = BOOT_ROM_BASE as u64..BOOT_ROM_BASE as u64 + 0x1000;
+        assert!(table.is_sorted_by_key(|d| d.base), "address order");
+        for (i, d) in table.iter().enumerate() {
+            // The entry as software reads it.
+            let at = |field: u32| SYSINFO_BASE + DEV_TABLE + i as u32 * DEV_ENTRY_SIZE + field;
+            assert_eq!(bus.read(at(0), 4), Ok(d.kind as u32));
+            assert_eq!(bus.read(at(4), 4), Ok(d.base));
+            assert_eq!(bus.read(at(8), 4), Ok(d.size));
+            assert_eq!(bus.read(at(12), 4), Ok(d.irq));
+
+            // Both ends of the range are decoded (UART registers are bytes, the rest words),
+            // and the byte past it is not this device.
+            let width = if d.kind == DeviceType::Uart { 1 } else { 4 };
+            let last = d.base + d.size - width;
+            assert!(bus.read(d.base, width).is_ok(), "{:?} base", d.kind);
+            assert!(bus.read(last, width).is_ok(), "{:?} last", d.kind);
+            assert!(d.size > 0 && d.base.checked_add(d.size).is_some());
+            let range = d.base as u64..(d.base + d.size) as u64;
+            for other in &table[i + 1..] {
+                let o = other.base as u64..(other.base + other.size) as u64;
+                assert!(
+                    range.end <= o.start || o.end <= range.start,
+                    "{:?} overlaps {:?}",
+                    d,
+                    other
+                );
+            }
+            for mem in [&ram, &rom] {
+                assert!(
+                    range.end <= mem.start || mem.end <= range.start,
+                    "{d:?} overlaps memory"
+                );
+            }
+        }
+        // The UART's PLIC source is the one the bus wires it to.
+        let uart = table.iter().find(|d| d.kind == DeviceType::Uart).unwrap();
+        assert_eq!(uart.irq, UART_IRQ);
+    }
+
+    /// A `Write` whose bytes the test can still read after handing it to the bus.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn debug_output_goes_to_the_machine_sink() {
+        let mut bus = small_bus();
+        bus.debug_out(b"dropped\n"); // no sink: discarded, not printed
+        let sink = Shared::default();
+        bus.debug = Some(Box::new(sink.clone()));
+        bus.debug_out(b"[dbg] one\n");
+        assert_eq!(&*sink.0.lock().unwrap(), b"[dbg] one\n");
+        bus.uart.capture = true;
+        bus.debug_out(b"[dbg] two\n");
+        assert_eq!(bus.uart.captured, b"[dbg] two\n");
+        assert_eq!(&*sink.0.lock().unwrap(), b"[dbg] one\n");
+    }
 
     #[test]
     fn vram_is_plain_memory() {
-        let mut bus = Bus::new(4096);
+        let mut bus = small_bus();
         bus.write(VRAM_BASE, 4, 0x00ff_8040).unwrap();
         assert_eq!(bus.read(VRAM_BASE, 4), Ok(0x00ff_8040));
         assert_eq!(bus.read(VRAM_BASE, 1), Ok(0x40));
@@ -214,7 +365,7 @@ mod tests {
 
     #[test]
     fn vram_bounds() {
-        let mut bus = Bus::new(4096);
+        let mut bus = small_bus();
         let last = VRAM_BASE + VRAM_SIZE - 4;
         assert_eq!(last, 0x3112_bffc);
         bus.write(last, 4, 0x0011_2233).unwrap();
@@ -228,7 +379,7 @@ mod tests {
 
     #[test]
     fn framebuffer_registers_on_the_bus() {
-        let mut bus = Bus::new(4096);
+        let mut bus = small_bus();
         assert_eq!(bus.read(FB_CTRL_BASE, 4), Ok(640));
         assert_eq!(bus.read(FB_CTRL_BASE + 4, 4), Ok(480));
         assert_eq!(bus.read(FB_CTRL_BASE + 8, 4), Ok(2560));

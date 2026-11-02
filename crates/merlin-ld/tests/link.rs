@@ -433,7 +433,7 @@ fn norelocs_segment_contents() {
 }
 
 fn run(elf: &[u8]) -> (Machine, RunResult, String) {
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     // Garbage in RAM, so .bss zeroing by the loader is actually checked.
     m.cpu.bus.ram.fill(0xa5);
     m.cpu.bus.uart.capture = true;

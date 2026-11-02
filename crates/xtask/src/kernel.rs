@@ -228,7 +228,7 @@ impl Build {
 /// Runs a kernel image on Grail with the UART captured. Returns how it ended
 /// and everything it printed (UART and `xcal.dbg`).
 pub fn run_on_grail(elf: &[u8], max_steps: u64) -> Result<(RunResult, String), String> {
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.cpu.bus.uart.capture = true;
     m.load_elf(elf)?;
     let r = m.run(Some(max_steps), |_| {});

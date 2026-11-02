@@ -14,7 +14,7 @@ fn repo_root() -> PathBuf {
 
 fn run(path: &Path) -> (RunResult, Vec<u8>) {
     let file = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.cpu.bus.uart.capture = true;
     m.load_elf(&file).unwrap();
     let r = m.run(Some(5_000_000), |_| {});

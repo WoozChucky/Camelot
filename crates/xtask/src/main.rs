@@ -193,11 +193,13 @@ fn kernel(k: KernelArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut m = grail::Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = grail::Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     if let Err(e) = m.load_elf(&file) {
         eprintln!("xtask: {e}");
         return ExitCode::FAILURE;
     }
+    m.set_uart_output(std::io::stdout());
+    m.set_debug_output(std::io::stderr());
     match m.run(Some(xtask::kernel::BOOT_MAX_STEPS), |_| {}) {
         grail::RunResult::Exited(code) => ExitCode::from(code.min(255) as u8),
         grail::RunResult::StepLimit => {

@@ -34,7 +34,7 @@ fn assert_boots(elf: &[u8]) {
 fn load_committed() -> (Machine, grail::elf::Elf) {
     let file = committed_elf();
     let elf = grail::elf::parse(&file).unwrap();
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.cpu.bus.uart.capture = true;
     m.load_elf(&file).unwrap();
     (m, elf)

@@ -3,7 +3,12 @@
 //! Single-threaded: the emulator runs on the thread that owns the window and calls
 //! `pump` between slices of instructions. The window procedure cannot reach the
 //! framebuffer, so it only records what happened (repaint needed, window destroyed)
-//! in thread-locals and the owner redraws.
+//! in the window's own `WindowState` and the owner redraws.
+//!
+//! Nothing here is shared between windows: each one finds its state through its
+//! `GWLP_USERDATA` slot, and closing one does not post a thread-wide `WM_QUIT`, so a
+//! host can show several machines' framebuffers at once. The only process-wide thing
+//! is the window class, which Windows registers once per process anyway.
 
 use crate::framebuffer::{FB_HEIGHT, FB_WIDTH};
 use crate::win32::*;
@@ -14,24 +19,43 @@ use std::sync::OnceLock;
 
 const CLASS_NAME: &str = "GrailFramebuffer";
 
-thread_local! {
-    static REPAINT: Cell<bool> = const { Cell::new(false) };
-    static DESTROYED: Cell<bool> = const { Cell::new(false) };
+/// What the window procedure tells the window's owner.
+#[derive(Default)]
+struct WindowState {
+    repaint: Cell<bool>,
+    destroyed: Cell<bool>,
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_NCCREATE {
+        // The first message: remember the state `Window::open` passed to CreateWindowExW.
+        let cs = &*(lparam as *const CREATESTRUCTW);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowState;
+    if state.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    // SAFETY: the pointer was set at WM_NCCREATE from the `Box<WindowState>` the `Window`
+    // owns, and is cleared at WM_NCDESTROY, before that box can be dropped.
+    let state = &*state;
     match msg {
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             BeginPaint(hwnd, &mut ps);
             EndPaint(hwnd, &ps);
-            REPAINT.with(|r| r.set(true));
+            state.repaint.set(true);
             0
         }
         WM_DESTROY => {
-            DESTROYED.with(|d| d.set(true));
-            PostQuitMessage(0);
+            state.destroyed.set(true);
             0
+        }
+        WM_NCDESTROY => {
+            // The last message this window gets.
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -39,13 +63,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 pub struct Window {
     hwnd: HWND,
-    open: bool,
+    /// Boxed so its address, stored in the window, stays put when the `Window` moves.
+    state: Box<WindowState>,
 }
 
 impl Window {
     /// Opens a window whose client area is the framebuffer's size.
     pub fn open(title: &str) -> Result<Window, String> {
         let class = wide(CLASS_NAME);
+        let state = Box::<WindowState>::default();
         // SAFETY: plain Win32 calls with valid, NUL-terminated strings and zeroed structs.
         unsafe {
             let hinst = GetModuleHandleW(std::ptr::null());
@@ -79,7 +105,6 @@ impl Window {
                 bottom: FB_HEIGHT as i32,
             };
             AdjustWindowRect(&mut r, style, 0);
-            DESTROYED.with(|d| d.set(false));
             let title = wide(title);
             let hwnd = CreateWindowExW(
                 0,
@@ -93,34 +118,32 @@ impl Window {
                 null_mut(),
                 null_mut(),
                 hinst,
-                null_mut(),
+                (&*state as *const WindowState).cast_mut().cast(),
             );
             if hwnd.is_null() {
                 return Err("CreateWindowExW failed".into());
             }
-            Ok(Window { hwnd, open: true })
+            Ok(Window { hwnd, state })
         }
     }
 
-    /// Handles pending window messages without blocking. Returns false once the
+    fn is_open(&self) -> bool {
+        !self.state.destroyed.get()
+    }
+
+    /// Handles pending window messages without blocking (for every window of this
+    /// thread: each one's procedure updates its own state). Returns false once this
     /// window has been closed.
     pub fn pump(&mut self) -> bool {
         // SAFETY: MSG is plain data; the calls follow the usual message-loop pattern.
         unsafe {
             let mut msg: MSG = std::mem::zeroed();
             while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
-                if msg.message == WM_QUIT {
-                    self.open = false;
-                    break;
-                }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
-        if DESTROYED.with(|d| d.get()) {
-            self.open = false;
-        }
-        self.open
+        self.is_open()
     }
 
     /// Blocks until a message arrives (or returns at once if one is queued).
@@ -133,7 +156,7 @@ impl Window {
 
     /// Returns whether Windows asked for a repaint since the last call.
     pub fn take_repaint(&self) -> bool {
-        REPAINT.with(|r| r.replace(false))
+        self.state.repaint.replace(false)
     }
 
     pub fn set_title(&self, title: &str) {
@@ -147,7 +170,7 @@ impl Window {
     /// Stretches the frame over the client area. `pixels` is top-down XRGB8888 rows of
     /// `FB_WIDTH` pixels (the VRAM layout); `None` paints the display black.
     pub fn draw(&self, pixels: Option<&[u8]>) {
-        if !self.open {
+        if !self.is_open() {
             return;
         }
         const BLACK: [u8; 4] = [0; 4];
@@ -206,14 +229,13 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        if self.open {
-            // SAFETY: the handle is still valid while the window is open.
+        if self.is_open() {
+            // SAFETY: the handle is still valid while the window is open. DestroyWindow
+            // sends WM_DESTROY and WM_NCDESTROY before returning, so the procedure has
+            // let go of `state` by the time the box is dropped.
             unsafe {
                 DestroyWindow(self.hwnd);
             }
-            // Drain the WM_DESTROY / WM_QUIT this produces so they do not leak into a
-            // later window on this thread.
-            self.pump();
         }
     }
 }
@@ -245,5 +267,31 @@ mod tests {
         // A second window on the same thread still works after the first was destroyed.
         let mut w = Window::open("Grail window test 2").unwrap();
         assert!(w.pump());
+    }
+
+    /// Two machines' windows on one thread: each has its own state, and closing one
+    /// leaves the other open. Needs a desktop session, like the test above.
+    #[test]
+    #[ignore]
+    fn windows_are_independent() {
+        let mut a = Window::open("Grail window A").unwrap();
+        let mut b = Window::open("Grail window B").unwrap();
+        assert!(a.pump() && b.pump());
+        // Both got their first WM_PAINT, each in its own state.
+        assert!(a.take_repaint());
+        assert!(!a.take_repaint());
+        assert!(b.take_repaint());
+
+        // The user closes A (WM_CLOSE -> DestroyWindow, as the close button does).
+        // SAFETY: A's handle is valid until it is destroyed.
+        unsafe {
+            DestroyWindow(a.hwnd);
+        }
+        assert!(!a.pump(), "A is closed");
+        assert!(b.pump(), "B is still open");
+        b.draw(None);
+        drop(a);
+        assert!(b.pump());
+        drop(b);
     }
 }

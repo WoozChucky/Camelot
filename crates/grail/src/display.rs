@@ -1,10 +1,12 @@
 //! Host side of the framebuffer: runs the machine in slices and, between slices,
 //! shows the frame in a window (Windows only) and/or dumps it as PPM files.
 //!
-//! Everything happens on one thread. The CPU runs until the program writes
-//! `FB_PRESENT` or a slice of `SLICE` steps is done; then the window's messages are
-//! pumped and it is redrawn on a present, on a repaint request, or when ~16 ms of
-//! host time have passed since the last redraw (~60 Hz).
+//! Everything happens on the calling thread, and the window belongs to this call, not to
+//! a process-wide singleton: each machine can have its own. The CPU runs until the
+//! program writes `FB_PRESENT` or a slice of `SLICE` steps is done (or, with a real-time
+//! clock, until it is ahead of the wall clock); then the window's messages are pumped
+//! and it is redrawn on a present, on a repaint request, or when ~16 ms of host time
+//! have passed since the last redraw (~60 Hz).
 
 use crate::cpu::Cpu;
 use crate::framebuffer::FrameDumper;
@@ -13,6 +15,9 @@ use std::path::PathBuf;
 
 /// Steps between two looks at the host side (window messages, redraw timer).
 const SLICE: u64 = 20_000;
+/// Longest sleep between two looks at the host side when a real-time clock is pacing
+/// the machine.
+const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Default)]
 pub struct DisplayOptions {
@@ -67,13 +72,18 @@ pub fn run(
         if budget == 0 {
             break Outcome::Program(RunResult::StepLimit);
         }
-        steps += m.run_slice(budget, &mut trace);
+        steps += m.run_for(budget, &mut trace);
         let presented = m.cpu.bus.fb.take_present();
         if presented {
             dump(m)?;
         }
         if !screen.update(m, presented) {
             break Outcome::WindowClosed;
+        }
+        // Real-time clock: wait for the wall clock to catch up, but keep pumping the
+        // window at least every `MAX_WAIT`.
+        if let Some(d) = m.pace_delay() {
+            std::thread::sleep(d.min(MAX_WAIT));
         }
     };
     dump(m)?;

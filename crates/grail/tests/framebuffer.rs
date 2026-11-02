@@ -144,12 +144,12 @@ fn fb_dump_needs_a_directory() {
 }
 
 #[test]
-fn run_slice_stops_right_after_present() {
+fn run_for_stops_right_after_present() {
     let file = std::fs::read(colorbars_elf()).unwrap();
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.load_elf(&file).unwrap();
 
-    let steps = m.run_slice(u64::MAX, &mut |_| {});
+    let steps = m.run_for(u64::MAX, &mut |_| {});
     assert!(steps > 640 * 480, "drew the whole frame first ({steps} steps)");
     assert_eq!(m.exit_code(), None);
     let fb = &mut m.cpu.bus.fb;
@@ -170,16 +170,16 @@ fn run_slice_stops_right_after_present() {
     check_colorbars_ppm(&fb.to_ppm());
 
     // The next instruction is xcal.halt.
-    assert_eq!(m.run_slice(u64::MAX, &mut |_| {}), 1);
+    assert_eq!(m.run_for(u64::MAX, &mut |_| {}), 1);
     assert_eq!(m.exit_code(), Some(0));
-    assert_eq!(m.run_slice(10, &mut |_| {}), 0);
+    assert_eq!(m.run_for(10, &mut |_| {}), 0);
 }
 
 #[test]
 fn colorbars_runs_under_plain_run() {
     // Machine::run ignores FB_PRESENT and just runs to the end.
     let file = std::fs::read(colorbars_elf()).unwrap();
-    let mut m = Machine::new(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.load_elf(&file).unwrap();
     assert_eq!(m.run(Some(10_000_000), |_| {}), RunResult::Exited(0));
     assert_eq!(m.cpu.bus.fb.presents, 1);
