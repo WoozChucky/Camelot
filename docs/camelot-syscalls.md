@@ -101,8 +101,16 @@ there is a filesystem to look it up in.
 | 38 | `getpeername` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN` |
 | 39 | `setsockopt` | `int fd, int level, int option, const void *value, uint len` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EINVAL`, `-ENOPROTOOPT` |
 | 40 | `harts` | `struct hartinfo *buf, uint max` | the number of harts; `-EFAULT` |
+| 41 | `thread_create` | `void (*entry)(void *), void *arg, void *stack` | the new thread's tid; `-EFAULT`, `-EINVAL`, `-EAGAIN`, `-ENOMEM` |
+| 42 | `thread_exit` | `int status` | does not return |
+| 43 | `thread_join` | `int tid, int *status` | 0; `-ESRCH`, `-EINVAL`, `-EINTR`, `-EFAULT` |
+| 44 | `gettid` | | the caller's thread id |
+| 45 | `futex_wait` | `int *addr, int val` | 0; `-EAGAIN`, `-EINVAL`, `-EINTR`, `-EFAULT` |
+| 46 | `futex_wake` | `int *addr, int n` | the number of threads woken; `-EINVAL`, `-EFAULT` |
 
-**exit(status)** ends the caller. Its exit status is kept for its parent's
+**exit(status)** ends the caller, every one of its threads ("Threads"
+below): the others are stopped wherever they are, as by `kill`, and the
+process ends once they have. Its exit status is kept for its parent's
 `wait`; the slot and every page the process held are freed once the parent
 has collected it (or at once, if it has no parent any more). Its descriptors
 are closed and its working directory let go of first, as `close` would
@@ -182,7 +190,7 @@ array can go as soon as `spawn` returns. Errors:
 - `-ENOEXEC`: the file is not a valid executable (the kernel also prints why
   on the console: `spawn: PATH: REASON`);
 - `-EAGAIN`: every one of the 8 process slots is taken (zombies count until
-  they are collected);
+  they are collected), or every one of the 16 thread slots;
 - `-ENOMEM`: not enough free memory;
 - `-EFAULT`: `path`, `argv` or one of the strings is not readable (a path
   longer than `MAXPATH` is still read to its NUL).
@@ -292,11 +300,13 @@ Errors: `-EMFILE`, `-ENFILE`, `-ENOMEM` (no page for its buffer), or
 its address space goes, and the new program starts as one started by
 `spawn` does ("Starting a program"), with `argv`, in the same process. Its
 pid, parent, descriptors (all of them) and working directory stay; its name
-becomes the last name of `path`. On success it doesn't return; on an error,
+becomes the last name of `path`. Its other threads, if it has any, end
+first ("Threads" below): the new program runs in the caller's thread
+alone. On success it doesn't return; on an error,
 nothing changed and the old program carries on with the error, `spawn`'s
 but `-EAGAIN` (the kernel prints `exec: PATH: REASON` for `-ENOEXEC`).
 
-**kill(pid)** ends the process `pid`: it exits with status -1, as a
+**kill(pid)** ends the process `pid`, every one of its threads: it exits with status -1, as a
 process killed for a fault does (its parent's `wait` gets -1), but
 silently, and not at once. The kernel marks it killed and, if it is asleep,
 wakes it; it ends when it would next go back to U-mode, before it runs any
@@ -304,8 +314,8 @@ more of its own code (a process killed before its first turn runs none of
 it). A system call it is in the middle of carries on to
 its end, so a change to the disk is never left half done, except that the
 calls that may wait for long give up at once: `sleep`, `wait`, a `read` of
-the console or of a pipe, a `write` to a full pipe (what they return is
-never seen). A process spinning in U-mode ends at the next timer tick. A
+the console or of a pipe, a `write` to a full pipe, `thread_join`,
+`futex_wait` (what they return is never seen). A process spinning in U-mode ends at the next timer tick. A
 process may kill itself; `kill` then returns 0 and the process ends on its
 way back from the call. Killing a zombie, which has already ended, does
 nothing and returns 0. Errors: `-ESRCH` when no process has that pid (one
@@ -320,7 +330,9 @@ many processes there are, which may be more than `max`: only the first
 holds `pid`; `ppid`, its parent's pid, or 0 for a process without one (the
 shell, an orphan, a kernel process); `state`: `PROC_RUNNABLE` (1, waiting
 for its turn), `PROC_RUNNING` (2, the caller itself), `PROC_ZOMBIE` (3,
-ended, its status not collected yet) or `PROC_SLEEPING` (4); `size`, the
+ended, its status not collected yet) or `PROC_SLEEPING` (4); for a process
+of several threads, running if one of them is, else runnable if one is,
+else sleeping; `size`, the
 end of its heap (its program, data and heap, from address 0, without the
 stack page), 0 for a kernel process; and `name`, NUL-terminated (the last
 name of the path it was started from, at most 15 characters). A process
@@ -507,6 +519,81 @@ is is `SO_RCVTIMEO` (20) at level `SOL_SOCKET` (1), how long `recv`,
 `tv_usec` of a second or more), `-EFAULT` (`value` is not readable),
 `-ENOPROTOOPT` (another level or option).
 
+## Threads
+
+A process starts with one thread, its main thread, and `thread_create`
+adds more. The threads of a process share everything it has: its memory,
+its descriptors, its working directory, its children; each has its own
+registers and stack, and the scheduler runs each on its own, on any hart,
+several of them at once on a machine of several harts
+(`docs/excalibur-spec.md` section 10, "Kernel threads"). A thread has an
+id, its tid, from the same count as the pids, so no thread has the pid of
+another process as its id; the main thread's tid is the process's pid.
+There are 16 thread slots for all processes together, each process's
+main thread included.
+
+**thread_create(entry, arg, stack)** starts a thread in the caller's
+process at `entry`, with `a0` = `arg`, `sp` = `stack` and every other
+register zero, `ra` included: the code at `entry` must end the thread
+with `thread_exit` rather than return. `stack` is the top of its stack,
+16-byte aligned, as the calling convention wants `sp`; the memory is the
+caller's to give (static, or from `malloc`), and must stay until the
+thread has ended. Returns the new thread's tid. Errors: `-EFAULT` if
+`entry` is not executable user memory or the 16 bytes below `stack` are
+not writable; `-EINVAL` if `stack` is not 16-byte aligned or `entry` not
+4-byte aligned; `-EAGAIN` if every thread slot is taken, or the process is
+ending; `-ENOMEM`. The library's `thread_start` (`kernel/user/lib/`)
+starts a C function in a thread, on a stack it is given, and ends the
+thread with what the function returns.
+
+**thread_exit(status)** ends the calling thread with `status`, which
+`thread_join` collects. Until then the ended thread keeps its slot (but
+none of its memory). The last thread of a process to end ends the
+process, with `status` as its exit status, as `exit(status)` would:
+that may be the main thread or any other. `exit` and returning from
+`main` end the whole process, every thread with it.
+
+**thread_join(tid, status)** waits until thread `tid` of the caller's
+process has ended (at once if it has), stores its status at `status`
+unless that is null, frees its slot and returns 0. Any thread may join
+any other of its process, the main thread included; each ended thread is
+joined at most once. Errors: `-ESRCH` if the process has no thread `tid`
+(never had, or it was joined already: a thread of another process counts
+as none); `-EINVAL` for the caller's own tid; `-EFAULT` if `status` is not
+writable, checked first; `-EINTR` if the caller is killed while it waits.
+
+**gettid()** returns the caller's thread id.
+
+**futex_wait(addr, val)** and **futex_wake(addr, n)** are what locks are
+built on in user space (the library's mutex, `kernel/user/lib/mutex.c`):
+a thread waits in the kernel on the word at `addr` until another thread
+wakes it, with no busy loop. `futex_wait` compares the word with `val`
+and returns `-EAGAIN` at once if they differ; if they are equal it sleeps
+until a `futex_wake` on the same address, then returns 0. The comparison
+and the sleep are one step as far as `futex_wake` is concerned, so a
+thread that changes the word and then calls `futex_wake` either changed it
+before the comparison (and the waiter returns `-EAGAIN`) or wakes the
+waiter: no wakeup is lost between them. `futex_wake` wakes up to `n` of
+the threads of the caller's process that wait on `addr` (none for `n` of 0
+or less), the ones that waited first not necessarily first, and returns
+how many it woke. A futex belongs to a process: it never wakes another
+process's threads, as no memory is shared between processes. Errors, for
+both: `-EINVAL` if `addr` is not 4-byte aligned, `-EFAULT` if it is not
+readable user memory; and `-EINTR` if the waiter is killed.
+
+**Ending a process with threads.** `exit`, a fault in any of its threads
+(which prints the report of "exit" above and ends the process with -1) and
+`kill` end every thread of the process. The threads other than the one
+ending it are stopped as `kill` stops a process: a thread in U-mode ends
+at its next trap (a tick at the latest), one waiting in a long wait
+(`sleep`, `wait`, `thread_join`, `futex_wait`, the console, a pipe, a
+socket) gives up at once, and one in the middle of another call finishes
+it first. The process ends, its descriptors closed and its memory freed,
+once all of them have. `exec` from one thread ends the others the same way
+before the new program starts, in the process's only thread, whose tid
+stays; if another thread is ending the process meanwhile, `exec` fails
+(the caller is about to end anyway).
+
 ## Error numbers
 
 Linux's values for the same conditions.
@@ -515,13 +602,13 @@ Linux's values for the same conditions.
 |---|---|---|
 | 1 | `EPERM` | link: not for a directory; kill: a kernel process, or the shell |
 | 2 | `ENOENT` | no such file or directory |
-| 3 | `ESRCH` | kill: no such process |
+| 3 | `ESRCH` | kill: no such process; thread_join: no such thread |
 | 4 | `EINTR` | a wait ended because the process was killed |
 | 7 | `E2BIG` | spawn, exec: argument list too long |
 | 8 | `ENOEXEC` | spawn, exec: the file is not a valid executable |
 | 9 | `EBADF` | not an open descriptor, or not open for that |
 | 10 | `ECHILD` | wait: no such child |
-| 11 | `EAGAIN` | spawn: every process slot is taken; a socket's receive timeout ran out |
+| 11 | `EAGAIN` | spawn, thread_create: every slot is taken; futex_wait: the word is not the value; a socket's receive timeout ran out |
 | 12 | `ENOMEM` | out of memory, or the heap would reach the stack |
 | 13 | `EACCES` | spawn, exec: not a regular file |
 | 14 | `EFAULT` | a pointer argument is not valid user memory |
@@ -564,7 +651,7 @@ Linux's values for the same conditions.
 
 A descriptor is a small number, 0 to 15, that stands for an open file: a
 file or directory of the filesystem, a device (the console), one end of a
-pipe, or a socket. Each process has its own 16; they point into the kernel's table of 64
+pipe, or a socket. Each process has its own 16, which all its threads share; they point into the kernel's table of 64
 open files, which is where the access mode (reading, writing or both) and,
 for a file on the disk, the offset live. `dup`, and `spawn` for descriptors
 0 to 2, make a second descriptor for the same open file, which then shares
@@ -709,10 +796,17 @@ its `README.md`: strings and memory (`strlen`, `strcmp`, `strncmp`,
 `fprintf` to a descriptor, `snprintf`; `%d %u %x %p %s %c %%` with `-`, `0`
 and a width), `puts`, line input (`getline`, one read of the console
 without the newline; readers, `reader_getline`, for files and pipes),
-`strerror`, `stat` (`open`, `fstat`, `close`), `spin` (a busy loop), and
+`strerror`, `stat` (`open`, `fstat`, `close`), `spin` (a busy loop),
 addresses and names (`htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`,
 `inet_addr`, `inet_ntoa`, `sockaddr_set`; `resolve`, a DNS client, and
-`resolve_error`).
+`resolve_error`), and threads (`thread_start`; the atomics `atomic_swap`,
+`atomic_add`, `atomic_cas`, `atomic_load`, `atomic_store`; `struct
+spinlock` with `spin_lock` and `spin_unlock`; `struct mutex` with
+`mutex_lock`, `mutex_trylock` and `mutex_unlock`, on the futex calls).
+`malloc` and its kin may be called from several threads at once; so may
+the rest, but `resolve` (which keeps its DNS messages in static buffers)
+and `inet_ntoa` (which returns one), and a `struct reader` must not be
+shared without a lock.
 `syscall(number, a0, a1, a2)` makes any call by number, for tests.
 
 ## Building programs

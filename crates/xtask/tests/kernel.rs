@@ -2015,8 +2015,9 @@ fn proc_name(cpu: &grail::cpu::Cpu, p: u32) -> String {
 
 /// The kernel's spinlocks that are variables of their own (the per-pipe,
 /// per-disk and the log's live inside other structures).
-const NAMED_LOCKS: [&str; 9] = [
+const NAMED_LOCKS: [&str; 10] = [
     "kmem_lock",
+    "uvm_lock",
     "proc_lock",
     "tickslock",
     "cons_lock",
@@ -3429,7 +3430,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 40, "{calls:?}");
+    assert_eq!(calls.len(), 46, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()
@@ -3490,7 +3491,7 @@ fn the_system_call_document_matches_the_code() {
             returns.contains("`-EFAULT`"),
             "{name}: {returns}"
         );
-        let infallible = ["exit", "getpid", "yield", "sleep", "uptime"];
+        let infallible = ["exit", "getpid", "yield", "sleep", "uptime", "thread_exit", "gettid"];
         assert_eq!(
             listed == 0,
             infallible.contains(&name.as_str()),

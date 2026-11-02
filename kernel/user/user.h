@@ -15,7 +15,7 @@ typedef unsigned long size_t;
  * are kernel/include/syscall.h's: a test checks they agree. */
 #define EPERM 1         /* link: not for a directory; kill: a kernel process, or the shell */
 #define ENOENT 2        /* no such file or directory */
-#define ESRCH 3         /* kill: no such process */
+#define ESRCH 3         /* kill: no such process; thread_join: no such thread */
 #define EINTR 4         /* a wait ended because the process was killed */
 #define E2BIG 7         /* spawn, exec: argument list too long */
 #define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */

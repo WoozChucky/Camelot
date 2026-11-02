@@ -59,8 +59,9 @@ const RUN_MAX_STEPS: u64 = 150_000_000;
 
 /// `sizeof(struct cpu)` (`CPU_SIZE` in kernel/include/spinlock.h): hart `h`'s
 /// entry is at `cpus + h * CPU_SIZE`.
-const CPU_SIZE: u32 = 88;
-/// Offsets in `struct cpu`: the running process and the push_off() depth.
+const CPU_SIZE: u32 = 92;
+/// Offsets in `struct cpu`: the running thread's process and the push_off()
+/// depth.
 const CPU_PROC: u32 = 0;
 const CPU_NOFF: u32 = 4;
 /// Offset of the holding cpu in `struct spinlock`.
@@ -71,8 +72,9 @@ const PROC_NAME: u32 = 8;
 const PROC_PARENT: u32 = 24;
 
 /// The kernel's spinlocks that are variables of their own (kernel.rs's list).
-const NAMED_LOCKS: [&str; 9] = [
+const NAMED_LOCKS: [&str; 10] = [
     "kmem_lock",
+    "uvm_lock",
     "proc_lock",
     "tickslock",
     "cons_lock",
