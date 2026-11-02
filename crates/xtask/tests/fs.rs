@@ -9,6 +9,11 @@
 //! consistent and holds all of each transaction or none of it, then reboot
 //! the kernel on it and check it replays the log (and frees the inodes left
 //! with no links) exactly as the host does.
+//!
+//! The file system calls (issue #67, docs/camelot-syscalls.md) are tested
+//! the same way, from the shell: programs run from /bin on the disk, files
+//! written and read through redirections and pipes, filetest's checks, and
+//! a crash at every point of a sequence of calls that change the disk.
 
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::read::Fs;
@@ -130,6 +135,9 @@ struct Boot {
     snapshots: bool,
     /// Stop the machine once this many sectors have been written.
     stop_after: Option<usize>,
+    /// What is typed for the shell, which runs until it reads `exit`.
+    input: &'static [u8],
+    max_steps: u64,
 }
 
 const READ: Boot = Boot {
@@ -137,6 +145,8 @@ const READ: Boot = Boot {
     fs_test: FS_TEST_READ,
     snapshots: false,
     stop_after: None,
+    input: b"exit\n",
+    max_steps: BOOT_MAX_STEPS,
 };
 
 const WRITE: Boot = Boot {
@@ -149,8 +159,8 @@ fn committed_elf() -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// Boots the committed kernel with `image` as disk 0 and `exit` typed for
-/// the shell.
+/// Boots the committed kernel with `image` as disk 0 and `how.input` typed
+/// for the shell.
 fn boot(image: Vec<u8>, how: Boot) -> Run {
     let record = Arc::new(Mutex::new(Record::default()));
     let disk = Recorder {
@@ -170,15 +180,15 @@ fn boot(image: Vec<u8>, how: Boot) -> Run {
     m.load_elf(&file).unwrap();
     let fs_test = elf.symbol("fs_test").expect("no fs_test in the kernel");
     m.cpu.bus.load(fs_test, &how.fs_test.to_le_bytes()).unwrap();
-    m.set_uart_input(kernel::typed(b"exit\n"));
+    m.set_uart_input(kernel::typed(how.input));
     let result = match how.stop_after {
-        None => m.run(Some(BOOT_MAX_STEPS), |_| {}),
+        None => m.run(Some(how.max_steps), |_| {}),
         Some(n) => {
             let written = || {
                 let r = record.lock().unwrap();
                 r.ops.iter().filter(|o| matches!(o, Op::Write { .. })).count()
             };
-            for _ in 0..BOOT_MAX_STEPS {
+            for _ in 0..how.max_steps {
                 if written() >= n {
                     break;
                 }
@@ -566,59 +576,7 @@ fn a_crash_after_any_write_leaves_whole_transactions() {
         .any(|(files, _, _)| files.iter().any(|f| f.0 == "/fstest/big" && f.4 == big)));
     assert_eq!(states.last().unwrap(), &state(&run.disk));
 
-    // Reboot on every one, several machines at a time.
-    let threads = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(16);
-    let chunk = snapshots.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        for (c, part) in snapshots.chunks(chunk).enumerate() {
-            scope.spawn(move || {
-                for (j, snap) in part.iter().enumerate() {
-                    let i = c * chunk + j;
-                    let replayed = fsck::check(snap).unwrap().replayed;
-                    let mut want = snap.clone();
-                    fsck::recover(&mut want).unwrap();
-                    let orphans = fsck::free_orphans(&mut want).unwrap();
-                    let again = boot(snap.clone(), READ);
-                    assert_eq!(
-                        again.result,
-                        RunResult::Exited(0),
-                        "after write {i}:\n{}",
-                        again.out
-                    );
-                    let lines = fs_lines(&again.out);
-                    assert_eq!(
-                        lines.starts_with(&format!("fs: replayed {replayed} blocks from the log\n")),
-                        replayed > 0,
-                        "after write {i}:\n{lines}"
-                    );
-                    assert_eq!(
-                        lines.contains(&format!("fs: freed {orphans} inodes that no directory named\n")),
-                        orphans > 0,
-                        "after write {i}:\n{lines}"
-                    );
-                    assert!(
-                        lines.ends_with(&passed(READ_CHECKS_NO_BIN)),
-                        "after write {i}:\n{lines}"
-                    );
-                    if orphans == 0 {
-                        assert!(
-                            again.disk == want,
-                            "after write {i}: the kernel's replay is not the host's"
-                        );
-                    } else {
-                        assert!(
-                            without_log_slots(&again.disk) == without_log_slots(&want),
-                            "after write {i}: the kernel's recovery is not the host's"
-                        );
-                    }
-                    let r = fsck::check(&again.disk).unwrap();
-                    assert_eq!((r.replayed, r.orphans), (0, 0), "after write {i}");
-                }
-            });
-        }
-    });
+    reboot_each(&snapshots, READ_CHECKS_NO_BIN);
 }
 
 #[test]
@@ -968,4 +926,294 @@ fn the_format_document_matches_the_kernel_and_the_host() {
     // The largest file, in the document's words.
     assert_eq!(camelot_fs::MAX_FILE_SIZE, 274_432);
     assert!(doc.contains("268\n  blocks, 274 432 bytes") || doc.contains("268 blocks, 274 432 bytes"));
+}
+
+// ---- The file system calls (issue #67) ----
+
+/// Steps for a boot whose shell runs programs from the disk.
+const SHELL_MAX_STEPS: u64 = 400_000_000;
+
+/// The shell's prompt.
+const PROMPT: &str = "$ ";
+
+/// The console's device number (`CONSOLE` in kernel/include/file.h).
+const CONSOLE_MAJOR: u16 = 1;
+
+/// Checks `filetest` makes on the root image, and `filetest ro` on a
+/// read-only one (kernel/user/filetest.c).
+const FILETEST_CHECKS: u32 = 137;
+const FILETEST_RO_CHECKS: u32 = 14;
+
+/// What the shell printed after reading `command`, up to its next prompt.
+fn shell_output<'a>(out: &'a str, command: &str) -> &'a str {
+    let typed = format!("{PROMPT}{command}\n");
+    let start = out
+        .find(&typed)
+        .unwrap_or_else(|| panic!("no `{command}` in:\n{out}"))
+        + typed.len();
+    let end = out[start..].find(PROMPT).map_or(out.len(), |e| start + e);
+    &out[start..end]
+}
+
+/// A program of kernel/user, as `cargo xtask fs` puts it in /bin.
+fn user_program(name: &str) -> Vec<u8> {
+    xtask::userprogs::build_named(&xtask::userprogs::user_dir(&repo_root()), name)
+        .unwrap()
+        .elf
+}
+
+/// A small image with /README, /dev/console, a device node with no driver,
+/// and `programs` in /bin.
+fn small_image_with_programs(programs: &[&str]) -> Vec<u8> {
+    let mut fs = Mkfs::new(&Options { size: 320, ..SMALL }).unwrap();
+    fs.add_file("/README", b"a small disk\n").unwrap();
+    fs.mkdir("/dev").unwrap();
+    fs.add_device("/dev/console", CONSOLE_MAJOR, 0).unwrap();
+    fs.add_device("/dev/nodriver", 7, 0).unwrap();
+    fs.mkdir("/bin").unwrap();
+    for name in programs {
+        fs.add_file(&format!("/bin/{name}"), &user_program(name)).unwrap();
+    }
+    fs.finish()
+}
+
+/// Boots the kernel on each of `snapshots` (disks a machine stopped
+/// writing to), several machines at a time, and checks each one: the kernel
+/// replays the log and frees the inodes no directory names as the host
+/// does (byte for byte, but for the log slots that freeing went through),
+/// passes its read checks (`read_checks` of them), and leaves nothing to
+/// recover.
+fn reboot_each(snapshots: &[Vec<u8>], read_checks: u32) {
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(16);
+    let chunk = snapshots.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (c, part) in snapshots.chunks(chunk).enumerate() {
+            scope.spawn(move || {
+                for (j, snap) in part.iter().enumerate() {
+                    let i = c * chunk + j;
+                    let replayed = fsck::check(snap).unwrap().replayed;
+                    let mut want = snap.clone();
+                    fsck::recover(&mut want).unwrap();
+                    let orphans = fsck::free_orphans(&mut want).unwrap();
+                    let again = boot(snap.clone(), READ);
+                    assert_eq!(
+                        again.result,
+                        RunResult::Exited(0),
+                        "after write {i}:\n{}",
+                        again.out
+                    );
+                    let lines = fs_lines(&again.out);
+                    assert_eq!(
+                        lines.starts_with(&format!("fs: replayed {replayed} blocks from the log\n")),
+                        replayed > 0,
+                        "after write {i}:\n{lines}"
+                    );
+                    assert_eq!(
+                        lines.contains(&format!("fs: freed {orphans} inodes that no directory named\n")),
+                        orphans > 0,
+                        "after write {i}:\n{lines}"
+                    );
+                    assert!(lines.ends_with(&passed(read_checks)), "after write {i}:\n{lines}");
+                    if orphans == 0 {
+                        assert!(
+                            again.disk == want,
+                            "after write {i}: the kernel's replay is not the host's"
+                        );
+                    } else {
+                        assert!(
+                            without_log_slots(&again.disk) == without_log_slots(&want),
+                            "after write {i}: the kernel's recovery is not the host's"
+                        );
+                    }
+                    let r = fsck::check(&again.disk).unwrap();
+                    assert_eq!((r.replayed, r.orphans), (0, 0), "after write {i}");
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn the_shell_runs_programs_from_bin_and_redirects_through_files_and_pipes() {
+    // Issue #67's acceptance test: on the root image, the shell runs ls from
+    // /bin, writes a file with `>`, reads it back through a pipe and with
+    // `<`, and runs a program by a path of its own (a link to /bin/echo,
+    // which only the disk has). The host reads what the kernel wrote, fsck
+    // finds the disk consistent, and every change was a whole transaction.
+    let image = root_image(2048);
+    let before = fsck::check(&image).unwrap();
+    let bin = Fs::open(&image).unwrap().ls("/bin").unwrap();
+    let run = boot(
+        image,
+        Boot {
+            input: b"ls /bin\n\
+                echo hello world > /hello.txt\n\
+                cat /hello.txt | wc\n\
+                cat < /hello.txt | cat\n\
+                wc < /hello.txt > /count\n\
+                ln /bin/echo /greet\n\
+                /greet from the root\n\
+                cat /missing | wc\n\
+                exit\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    let out = &run.out;
+    assert_eq!(shell_output(out, "ls /bin"), bin);
+    assert_eq!(shell_output(out, "echo hello world > /hello.txt"), "");
+    assert_eq!(shell_output(out, "cat /hello.txt | wc"), "1 2 12\n");
+    assert_eq!(shell_output(out, "cat < /hello.txt | cat"), "hello world\n");
+    assert_eq!(shell_output(out, "wc < /hello.txt > /count"), "");
+    assert_eq!(shell_output(out, "ln /bin/echo /greet"), "");
+    assert_eq!(shell_output(out, "/greet from the root"), "from the root\n");
+    // cat's error goes to the console; wc reads nothing.
+    let missing = shell_output(out, "cat /missing | wc");
+    assert!(
+        missing.contains("cat: /missing: no such file or directory\n") && missing.contains("0 0 0\n"),
+        "{missing}"
+    );
+
+    let after = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    assert_eq!((after.replayed, after.orphans), (0, 0));
+    assert_eq!((after.dirs, after.files), (before.dirs, before.files + 2));
+    let fs = Fs::open(&run.disk).unwrap();
+    assert_eq!(fs.read_file("/hello.txt").unwrap(), b"hello world\n");
+    assert_eq!(fs.read_file("/count").unwrap(), b"1 2 12\n");
+    let echo = fs.lookup("/bin/echo").unwrap();
+    assert_eq!(fs.lookup("/greet").unwrap(), echo);
+    assert_eq!(fs.inode(echo).unwrap().nlink, 2);
+    let disk_blocks = (run.disk.len() / BSIZE) as u32;
+    assert!(check_commits(&run.record.ops, &after.sb, disk_blocks) > 0);
+}
+
+#[test]
+fn filetest_passes_on_the_root_image_and_leaves_it_as_it_was() {
+    // Every file system call and its errors (kernel/user/filetest.c), on
+    // the root image. filetest removes what it made: the disk ends as it
+    // began, consistent, with every block and inode back.
+    let image = root_image(2048);
+    let run = boot(
+        image.clone(),
+        Boot {
+            input: b"filetest\nexit\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    let out = shell_output(&run.out, "filetest");
+    assert!(
+        out.ends_with(&format!("filetest: {FILETEST_CHECKS} checks, 0 failed\n")),
+        "{out}"
+    );
+    // The kernel says why a file it was asked to run is not a program.
+    assert!(out.contains("spawn: /ft/notelf: not an ELF file\n"), "{out}");
+    let after = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    assert_eq!((after.replayed, after.orphans), (0, 0));
+    assert_eq!(state(&run.disk), state(&image));
+    let disk_blocks = (run.disk.len() / BSIZE) as u32;
+    assert!(check_commits(&run.record.ops, &after.sb, disk_blocks) > 0);
+}
+
+#[test]
+fn a_crash_during_the_file_system_calls_leaves_whole_transactions() {
+    // The crash test of issue #66, for the calls that change the disk:
+    // `filetest ops` makes directories and files, links, truncates and
+    // removes them (one while it is open, which leaves an orphan until it
+    // is closed), from the shell. The machine is stopped after each sector
+    // written; every disk replayed is consistent and holds the state before
+    // or after each commit, never one in between; and the kernel, rebooted
+    // on each one, recovers it as the host does.
+    let image = small_image_with_programs(&["filetest"]);
+    let before = fsck::check(&image).unwrap();
+    let run = boot(
+        image.clone(),
+        Boot {
+            snapshots: true,
+            input: b"filetest ops\nexit\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    assert_eq!(shell_output(&run.out, "filetest ops"), "filetest: ops done\n");
+    let after = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    let disk_blocks = (run.disk.len() / BSIZE) as u32;
+    let commits_made = check_commits(&run.record.ops, &after.sb, disk_blocks);
+    let snapshots = run.record.snapshots;
+    assert_eq!(snapshots.last(), Some(&run.disk));
+
+    let mut states = vec![state(&image)];
+    let mut commits = Vec::new();
+    for (i, snap) in snapshots.iter().enumerate() {
+        let r = fsck::check(snap).unwrap_or_else(|p| panic!("stopped after sector write {i}: {p:#?}"));
+        let s = state(snap);
+        if r.replayed > 0 && commits.last() != Some(&s) {
+            commits.push(s.clone());
+        }
+        if states.last() != Some(&s) {
+            states.push(s);
+        }
+    }
+    assert_eq!(commits.len(), commits_made);
+    assert_eq!(states[1..], commits[..]);
+    assert!(
+        snapshots.iter().any(|s| fsck::check(s).unwrap().orphans == 1),
+        "no disk with an orphan"
+    );
+    // What each step leaves, as the host reads it.
+    let holds = |path: &str, nlink: u16, contents: &[u8]| {
+        states.iter().any(|(files, _, _)| {
+            files
+                .iter()
+                .any(|f| f.0 == path && f.3 == nlink && f.4 == contents)
+        })
+    };
+    assert!(holds("/ops/a", 1, &pattern(5000, 11)), "/ops/a");
+    assert!(holds("/ops/b", 2, &pattern(5000, 11)), "/ops/b, a link to a");
+    assert!(holds("/ops/d/c", 1, &pattern(100, 12)), "/ops/d/c");
+    assert!(holds("/ops/b", 2, &[]), "/ops/b emptied");
+    assert!(holds("/ops/a", 2, &pattern(10, 13)), "/ops/a written through b");
+    // In the end, /ops and an empty /ops/e: everything else came back.
+    let (files, free_blocks, free_inodes) = states.last().unwrap();
+    let ops: Vec<&str> = files
+        .iter()
+        .map(|f| f.0.as_str())
+        .filter(|p| p.starts_with("/ops"))
+        .collect();
+    assert_eq!(ops, ["/ops", "/ops/e"]);
+    assert_eq!(
+        (*free_blocks, *free_inodes),
+        (before.free_blocks - 1, before.free_inodes - 2)
+    );
+
+    reboot_each(&snapshots, READ_CHECKS);
+}
+
+#[test]
+fn on_a_read_only_root_every_change_fails_and_reading_works() {
+    // `filetest ro`: every call that would write the disk fails with
+    // EROFS, reading, running programs and changing directory work, and
+    // nothing reaches the disk.
+    let image = small_image_with_programs(&["sh", "filetest"]);
+    let run = boot(
+        image.clone(),
+        Boot {
+            read_only: true,
+            input: b"filetest ro\nexit\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    assert_eq!(
+        shell_output(&run.out, "filetest ro"),
+        format!("filetest: {FILETEST_RO_CHECKS} checks, 0 failed\n")
+    );
+    assert!(run.disk == image);
+    assert_eq!(run.record.ops, []);
 }

@@ -2421,6 +2421,44 @@ fn the_system_calls_do_what_the_document_says() {
 }
 
 #[test]
+fn without_a_disk_the_shell_still_pipes_and_finds_the_programs_in_bin() {
+    // Pipes need no disk, and the kernel's own programs stand in for /bin:
+    // by name, by /bin/NAME and by bin/NAME from the root. Any other path,
+    // and a file to redirect to, doesn't exist.
+    let out = run_processes(
+        b"echo one two three | wc\n\
+          echo a b | cat | cat | wc\n\
+          /bin/echo by path\n\
+          bin/echo from the root\n\
+          /echo\n\
+          echo x > /file\n\
+          wc < /file\n\
+          ls\n\
+          exit 0\n",
+    );
+    assert_eq!(command_output(&out, "echo one two three | wc"), ["1 3 14"]);
+    assert_eq!(command_output(&out, "echo a b | cat | cat | wc"), ["1 2 4"]);
+    assert_eq!(command_output(&out, "/bin/echo by path"), ["by path"]);
+    assert_eq!(command_output(&out, "bin/echo from the root"), ["from the root"]);
+    assert_eq!(
+        command_output(&out, "/echo"),
+        ["sh: /echo: no such file or directory"]
+    );
+    assert_eq!(
+        command_output(&out, "echo x > /file"),
+        ["sh: /file: no such file or directory"]
+    );
+    assert_eq!(
+        command_output(&out, "wc < /file"),
+        ["sh: /file: no such file or directory"]
+    );
+    assert_eq!(
+        command_output(&out, "ls"),
+        ["ls: .: no such file or directory", "ls: exit 1"]
+    );
+}
+
+#[test]
 fn programs_get_their_arguments() {
     let out = run_processes(b"echo\necho one\necho  a   b\tc  d \nexit\n");
     assert_eq!(command_output(&out, "echo"), [""]);
@@ -2541,7 +2579,11 @@ fn processes_give_back_every_page() {
     // next line; wait collects them.
     let waited = command_output(&out, "wait");
     let collected = waited.iter().filter(|l| l.ends_with("] hello: exit 0")).count();
-    let greetings = lines.iter().chain(&waited).filter(|l| **l == "hello from user mode").count();
+    let greetings = lines
+        .iter()
+        .chain(&waited)
+        .filter(|l| **l == "hello from user mode")
+        .count();
     assert_eq!((collected, greetings), (NPROC - 1, NPROC - 1), "{out}");
     assert_eq!(free_pages(&m, &elf), before);
     // While a process runs, it holds its pages: a kernel stack, a root and a
