@@ -9,7 +9,8 @@ use grail::devices::PTR_IRQ;
 use grail::framebuffer::{Framebuffer, FB_HEIGHT, FB_WIDTH};
 use grail::keyboard::{code, KeyEvent};
 use grail::pointer::{
-    PointerInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, CTRL_IRQ_ENABLE, CTRL_RELATIVE, FIFO_LEN,
+    PointerInput, BUTTONS_MASK, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, CTRL_IRQ_ENABLE, CTRL_RELATIVE,
+    FIFO_LEN,
 };
 use grail::{Machine, RunResult};
 use std::path::Path;
@@ -138,6 +139,10 @@ const WHITE: u32 = 0x00ff_ffff;
 const RED: u32 = 0x00ff_0000;
 const GREEN: u32 = 0x0000_ff00;
 const MAGENTA: u32 = 0x00ff_00ff;
+const YELLOW: u32 = 0x00ff_ff00;
+const BLUE: u32 = 0x0000_00ff;
+const CYAN: u32 = 0x0000_ffff;
+const ORANGE: u32 = 0x00ff_8000;
 
 /// The example's cursor: one byte per row, bit 7 = leftmost pixel, tip at the top left.
 const ARROW: [u8; 12] = [
@@ -209,6 +214,15 @@ fn example_cursor_follows_the_mouse() {
         300,
         MAGENTA,
     );
+    // Every other mix of buttons has its own colour too.
+    for (buttons, colour) in [
+        (BUTTON_LEFT | BUTTON_RIGHT, YELLOW),
+        (BUTTON_MIDDLE, BLUE),
+        (BUTTON_RIGHT | BUTTON_MIDDLE, CYAN),
+        (BUTTONS_MASK, ORANGE),
+    ] {
+        step(&mut m, PointerInput::buttons(buttons), 200, 300, colour);
+    }
     // The wheel is an event too, but changes nothing on screen.
     step(&mut m, PointerInput::buttons(0).with_wheel(3), 200, 300, WHITE);
     // At the corners the arrow is clipped, not wrapped to the next row or the top.

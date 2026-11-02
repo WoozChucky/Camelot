@@ -93,7 +93,15 @@ impl State {
     /// buttons held are now `buttons`, and the wheel turned `wheel` Windows units
     /// (`WHEEL_DELTA` per notch, positive away from the user).
     fn mouse(&self, pos: Option<(i32, i32)>, buttons: u8, wheel: i32) {
-        let total = self.wheel.get().saturating_add(wheel);
+        // A turn the other way starts afresh: what was left of the last direction
+        // must not eat into a notch of the new one.
+        let rest = self.wheel.get();
+        let rest = if wheel != 0 && (rest < 0) != (wheel < 0) {
+            0
+        } else {
+            rest
+        };
+        let total = rest.saturating_add(wheel);
         let notches = total / WHEEL_DELTA;
         self.wheel.set(total - notches * WHEEL_DELTA);
         if wheel != 0 && notches == 0 && pos.is_none() && buttons == self.buttons.get() {
@@ -118,6 +126,51 @@ impl State {
             self.mouse(None, 0, 0);
         }
     }
+
+    /// Records what a mouse message, or the window losing the mouse capture or the
+    /// focus, means for the program, with the client area `width` x `height` pixels.
+    /// For a move or a button message, returns whether the window should hold the
+    /// mouse capture now (while a button is held, so a drag follows the mouse out of
+    /// the window and its release is not lost); `None` for the others.
+    fn mouse_message(
+        &self,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        width: i32,
+        height: i32,
+    ) -> Option<bool> {
+        match msg {
+            WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+            | WM_MBUTTONUP => {
+                // Client coordinates, signed (negative left of or above the client
+                // area while the mouse is captured).
+                let (x, y) = (lparam as u16 as i16 as i32, (lparam >> 16) as u16 as i16 as i32);
+                let pos = client_to_fb(x, y, width, height);
+                let buttons = mk_buttons(wparam);
+                if pos.is_some() || buttons != self.buttons.get() {
+                    self.mouse(pos, buttons, 0);
+                }
+                Some(buttons != 0)
+            }
+            WM_MOUSEWHEEL => {
+                // The position in lParam is in screen coordinates, and the pointer has
+                // not moved: report the buttons and the wheel only.
+                self.mouse(None, mk_buttons(wparam), (wparam >> 16) as u16 as i16 as i32);
+                None
+            }
+            WM_CAPTURECHANGED => {
+                self.release_buttons();
+                None
+            }
+            WM_KILLFOCUS => {
+                self.release_all();
+                self.release_buttons();
+                None
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The pointer buttons held, from a mouse message's `wParam` (`MK_*` flags).
@@ -134,9 +187,10 @@ fn client_to_fb(x: i32, y: i32, width: i32, height: i32) -> Option<(i32, i32)> {
     if width <= 0 || height <= 0 {
         return None;
     }
-    // Rounded down, as the stretch maps whole pixels: client pixel `x` shows frame
-    // pixel floor(x * FB_WIDTH / width).
-    let scale = |v: i32, fb: u32, client: i32| (v as i64 * fb as i64).div_euclid(client as i64) as i32;
+    // The stretch (COLORONCOLOR) gives each client pixel the frame pixel under its
+    // centre: client pixel `x` shows frame pixel floor((x + 1/2) * FB_WIDTH / width).
+    let scale =
+        |v: i32, fb: u32, client: i32| ((2 * v as i64 + 1) * fb as i64).div_euclid(2 * client as i64) as i32;
     Some((scale(x, FB_WIDTH, width), scale(y, FB_HEIGHT, height)))
 }
 
@@ -238,41 +292,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // would be swallowed. Refuse it; Alt+Space (lParam ' ') still opens the menu.
         WM_SYSCOMMAND if wparam & 0xfff0 == SC_KEYMENU && lparam == 0 => 0,
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
-        | WM_MBUTTONUP => {
-            // Client coordinates, signed (negative left of or above the client area
-            // while the mouse is captured).
-            let (x, y) = (lparam as u16 as i16 as i32, (lparam >> 16) as u16 as i16 as i32);
+        | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_CAPTURECHANGED | WM_KILLFOCUS => {
             let mut client = RECT::default();
             GetClientRect(hwnd, &mut client);
-            let pos = client_to_fb(x, y, client.right - client.left, client.bottom - client.top);
-            let buttons = mk_buttons(wparam);
-            if pos.is_some() || buttons != st.buttons.get() {
-                st.mouse(pos, buttons, 0);
-            }
-            // While a button is held, keep getting the mouse outside the window too, so
-            // a drag follows it to the edge and its release is not lost.
-            if buttons != 0 {
-                if GetCapture() != hwnd {
+            let (width, height) = (client.right - client.left, client.bottom - client.top);
+            // Taken or let go after the state is updated: ReleaseCapture sends
+            // WM_CAPTURECHANGED back here before it returns.
+            match st.mouse_message(msg, wparam, lparam, width, height) {
+                Some(true) if GetCapture() != hwnd => {
                     SetCapture(hwnd);
                 }
-            } else if GetCapture() == hwnd {
-                ReleaseCapture();
+                Some(false) if GetCapture() == hwnd => {
+                    ReleaseCapture();
+                }
+                _ => {}
             }
-            0
-        }
-        WM_MOUSEWHEEL => {
-            // The position in lParam is in screen coordinates, and the pointer has not
-            // moved: report the buttons and the wheel only.
-            st.mouse(None, mk_buttons(wparam), (wparam >> 16) as u16 as i16 as i32);
-            0
-        }
-        WM_CAPTURECHANGED => {
-            st.release_buttons();
-            0
-        }
-        WM_KILLFOCUS => {
-            st.release_all();
-            st.release_buttons();
             0
         }
         WM_DESTROY => {
@@ -412,32 +446,7 @@ impl Window {
         if !self.is_open() {
             return;
         }
-        const BLACK: [u8; 4] = [0; 4];
-        let (bits, w, h): (*const c_void, i32, i32) = match pixels {
-            Some(p) => {
-                assert_eq!(p.len(), (FB_WIDTH * FB_HEIGHT * 4) as usize);
-                (p.as_ptr().cast(), FB_WIDTH as i32, FB_HEIGHT as i32)
-            }
-            None => (BLACK.as_ptr().cast(), 1, 1),
-        };
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB,
-                biSizeImage: 0,
-                biXPelsPerMeter: 0,
-                biYPelsPerMeter: 0,
-                biClrUsed: 0,
-                biClrImportant: 0,
-            },
-            bmiColors: [0],
-        };
-        // SAFETY: `bits` points at w*h 32-bit pixels described by `bmi`; the DC is
-        // released before returning.
+        // SAFETY: a valid window handle; the DC is released before returning.
         unsafe {
             let mut client = RECT::default();
             GetClientRect(self.hwnd, &mut client);
@@ -445,25 +454,64 @@ impl Window {
             if hdc.is_null() {
                 return;
             }
-            SetStretchBltMode(hdc, COLORONCOLOR);
-            StretchDIBits(
+            stretch(
                 hdc,
-                0,
-                0,
                 client.right - client.left,
                 client.bottom - client.top,
-                0,
-                0,
-                w,
-                h,
-                bits,
-                &bmi,
-                DIB_RGB_COLORS,
-                SRCCOPY,
+                pixels,
             );
             ReleaseDC(self.hwnd, hdc);
         }
     }
+}
+
+/// Stretches the frame (`Window::draw`'s `pixels`) over `width` x `height` pixels at
+/// the top left of `hdc`. `client_to_fb` inverts this mapping.
+///
+/// # Safety
+/// `hdc` must be a valid device context.
+unsafe fn stretch(hdc: HDC, width: i32, height: i32, pixels: Option<&[u8]>) {
+    const BLACK: [u8; 4] = [0; 4];
+    let (bits, w, h): (*const c_void, i32, i32) = match pixels {
+        Some(p) => {
+            assert_eq!(p.len(), (FB_WIDTH * FB_HEIGHT * 4) as usize);
+            (p.as_ptr().cast(), FB_WIDTH as i32, FB_HEIGHT as i32)
+        }
+        None => (BLACK.as_ptr().cast(), 1, 1),
+    };
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [0],
+    };
+    // SAFETY: `bits` points at w*h 32-bit pixels described by `bmi`.
+    SetStretchBltMode(hdc, COLORONCOLOR);
+    StretchDIBits(
+        hdc,
+        0,
+        0,
+        width,
+        height,
+        0,
+        0,
+        w,
+        h,
+        bits,
+        &bmi,
+        DIB_RGB_COLORS,
+        SRCCOPY,
+    );
 }
 
 impl Drop for Window {
@@ -579,9 +627,12 @@ mod tests {
         assert_eq!(client_to_fb(1, 1, 1280, 960), Some((0, 0)));
         assert_eq!(client_to_fb(2, 3, 1280, 960), Some((1, 1)));
         assert_eq!(client_to_fb(1279, 959, 1280, 960), Some((639, 479)));
-        // Shrunk, and stretched unevenly.
-        assert_eq!(client_to_fb(319, 239, 320, 240), Some((638, 478)));
-        assert_eq!(client_to_fb(100, 100, 1000, 200), Some((64, 240)));
+        // Shrunk, and stretched unevenly: the frame pixel under each client pixel's
+        // centre.
+        assert_eq!(client_to_fb(0, 0, 320, 240), Some((1, 1)));
+        assert_eq!(client_to_fb(319, 239, 320, 240), Some((639, 479)));
+        assert_eq!(client_to_fb(100, 100, 1000, 200), Some((64, 241)));
+        assert_eq!(client_to_fb(1, 0, 960, 720), Some((1, 0)));
         // Outside the client area (a captured drag): outside the frame, rounded down,
         // for the device to clamp.
         assert_eq!(client_to_fb(-1, -3, 1280, 960), Some((-1, -2)));
@@ -589,6 +640,76 @@ mod tests {
         // Minimized.
         assert_eq!(client_to_fb(5, 5, 0, 0), None);
         assert_eq!(client_to_fb(5, 5, 640, 0), None);
+    }
+
+    /// `client_to_fb` is what `stretch` (the drawing) shows: a frame whose pixels hold
+    /// their own coordinates is stretched into a memory bitmap of each size, and every
+    /// pixel of it must be the frame pixel `client_to_fb` names. Needs no desktop.
+    #[test]
+    fn client_to_fb_matches_the_stretch() {
+        let mut frame = Vec::with_capacity((FB_WIDTH * FB_HEIGHT * 4) as usize);
+        for y in 0..FB_HEIGHT {
+            for x in 0..FB_WIDTH {
+                frame.extend_from_slice(&(x | y << 12).to_le_bytes());
+            }
+        }
+        for (width, height) in [
+            (640, 480),
+            (1280, 960),
+            (960, 720),
+            (320, 240),
+            (1000, 200),
+            (700, 500),
+            (641, 481),
+            (1366, 705),
+            (213, 1001),
+        ] {
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height, // top-down, like the frame
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    biSizeImage: 0,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                },
+                bmiColors: [0],
+            };
+            // SAFETY: a memory DC and a DIB section of the size `bmi` gives, both freed
+            // before the next size; `bits` is read only while the section exists.
+            unsafe {
+                let dc = CreateCompatibleDC(null_mut());
+                assert!(!dc.is_null());
+                let mut bits: *mut c_void = null_mut();
+                let bitmap = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+                assert!(!bitmap.is_null() && !bits.is_null());
+                let old = SelectObject(dc, bitmap);
+                stretch(dc, width, height, Some(&frame));
+                let shown = std::slice::from_raw_parts(bits as *const u32, (width * height) as usize);
+                let mut wrong = 0;
+                let mut first = None;
+                for (i, &px) in shown.iter().enumerate() {
+                    let (x, y) = (i as i32 % width, i as i32 / width);
+                    let at = (px as i32 & 0xfff, px as i32 >> 12);
+                    if client_to_fb(x, y, width, height) != Some(at) {
+                        wrong += 1;
+                        first.get_or_insert((x, y, at));
+                    }
+                }
+                SelectObject(dc, old);
+                DeleteObject(bitmap);
+                DeleteDC(dc);
+                assert_eq!(
+                    wrong, 0,
+                    "{width}x{height}: first (client x, client y, frame pixel shown) {first:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -613,6 +734,7 @@ mod tests {
         st.mouse(None, BUTTON_LEFT, 40);
         st.mouse(None, BUTTON_LEFT, 40);
         st.mouse(None, BUTTON_LEFT, 50);
+        // A turn the other way drops what was left of the last direction (10).
         st.mouse(None, BUTTON_LEFT, -10);
         st.mouse(None, BUTTON_LEFT, -100);
         // A fraction with a button change still reports the button.
@@ -628,7 +750,95 @@ mod tests {
                 PointerInput::buttons(0).with_wheel(-1),
             ]
         );
-        assert_eq!(st.wheel.get(), -10, "the rest waits for the next notch");
+        assert_eq!(st.wheel.get(), -20, "the rest waits for the next notch");
+    }
+
+    #[test]
+    fn turning_the_wheel_back_is_never_swallowed() {
+        let st = State::new();
+        // Most of a notch up on a precise touchpad, then one standard notch down.
+        st.mouse(None, 0, 100);
+        st.mouse(None, 0, -WHEEL_DELTA);
+        assert_eq!(st.pointer.take(), [PointerInput::default().with_wheel(-1)]);
+        st.mouse(None, 0, -100);
+        st.mouse(None, 0, WHEEL_DELTA);
+        assert_eq!(st.pointer.take(), [PointerInput::default().with_wheel(1)]);
+        assert_eq!(st.wheel.get(), 0);
+    }
+
+    /// lParam of a client-area mouse message: x in the low word, y in the high word.
+    fn mouse_lparam(x: i32, y: i32) -> LPARAM {
+        (x as u16 as u32 | (y as u16 as u32) << 16) as i32 as LPARAM
+    }
+
+    /// The window procedure's mouse arm, without a window: which messages become which
+    /// pointer input, and when the window wants the mouse captured.
+    #[test]
+    fn mouse_messages_become_pointer_input() {
+        let st = State::new();
+        let msg = |m: u32, wparam: usize, lparam: LPARAM| st.mouse_message(m, wparam, lparam, 1280, 960);
+        assert_eq!(msg(WM_MOUSEMOVE, 0, mouse_lparam(201, 101)), Some(false));
+        assert_eq!(
+            msg(WM_LBUTTONDOWN, MK_LBUTTON, mouse_lparam(201, 101)),
+            Some(true)
+        );
+        // Dragged out of the window: negative client coordinates.
+        assert_eq!(msg(WM_MOUSEMOVE, MK_LBUTTON, mouse_lparam(-3, 2000)), Some(true));
+        assert_eq!(
+            msg(WM_RBUTTONDOWN, MK_LBUTTON | MK_RBUTTON, mouse_lparam(-3, 2000)),
+            Some(true)
+        );
+        assert_eq!(msg(WM_LBUTTONUP, MK_RBUTTON, mouse_lparam(-3, 2000)), Some(true));
+        assert_eq!(msg(WM_RBUTTONUP, 0, mouse_lparam(-3, 2000)), Some(false));
+        let wheel_up = (2 * WHEEL_DELTA as usize) << 16 | MK_MBUTTON;
+        assert_eq!(msg(WM_MOUSEWHEEL, wheel_up, mouse_lparam(9999, 9999)), None);
+        assert_eq!(msg(WM_MBUTTONDOWN, MK_MBUTTON, mouse_lparam(0, 0)), Some(true));
+        // Other messages are not pointer input.
+        assert_eq!(msg(WM_PAINT, MK_LBUTTON, mouse_lparam(7, 7)), None);
+        assert_eq!(
+            st.pointer.take(),
+            [
+                PointerInput::move_to(100, 50),
+                PointerInput::move_to(100, 50).with_buttons(BUTTON_LEFT),
+                PointerInput::move_to(-2, 1000).with_buttons(BUTTON_LEFT),
+                PointerInput::move_to(-2, 1000).with_buttons(BUTTON_LEFT | BUTTON_RIGHT),
+                PointerInput::move_to(-2, 1000).with_buttons(BUTTON_RIGHT),
+                PointerInput::move_to(-2, 1000),
+                PointerInput::buttons(BUTTON_MIDDLE).with_wheel(2),
+                PointerInput::move_to(0, 0).with_buttons(BUTTON_MIDDLE),
+            ]
+        );
+
+        // Minimized: no position, but a button change still counts.
+        let min = |m: u32, wparam: usize| st.mouse_message(m, wparam, mouse_lparam(3, 3), 0, 0);
+        assert_eq!(min(WM_MOUSEMOVE, MK_MBUTTON), Some(true));
+        assert!(st.pointer.take().is_empty(), "nothing changed");
+        assert_eq!(min(WM_RBUTTONDOWN, MK_MBUTTON | MK_RBUTTON), Some(true));
+        assert_eq!(
+            st.pointer.take(),
+            [PointerInput::buttons(BUTTON_MIDDLE | BUTTON_RIGHT)]
+        );
+    }
+
+    #[test]
+    fn losing_the_capture_or_the_focus_releases_buttons() {
+        let st = State::new();
+        let msg = |m: u32, wparam: usize| st.mouse_message(m, wparam, mouse_lparam(10, 10), 640, 480);
+        msg(WM_LBUTTONDOWN, MK_LBUTTON);
+        st.pointer.take();
+        assert_eq!(msg(WM_CAPTURECHANGED, 0), None);
+        assert_eq!(st.pointer.take(), [PointerInput::buttons(0)]);
+
+        msg(WM_RBUTTONDOWN, MK_RBUTTON);
+        st.key(VK_UP, true, false, false, || None);
+        st.pointer.take();
+        st.keys.take();
+        assert_eq!(msg(WM_KILLFOCUS, 0), None);
+        assert_eq!(st.pointer.take(), [PointerInput::buttons(0)]);
+        assert_eq!(st.keys.take(), [KeyEvent::release(code::UP)], "keys go too");
+        msg(WM_KILLFOCUS, 0);
+        msg(WM_CAPTURECHANGED, 0);
+        assert!(st.pointer.take().is_empty(), "nothing held, nothing to release");
     }
 
     #[test]
@@ -894,11 +1104,6 @@ mod tests {
         assert!(took < std::time::Duration::from_millis(500), "took {took:?}");
     }
 
-    /// lParam of a client-area mouse message: x in the low word, y in the high word.
-    fn mouse_lparam(x: i32, y: i32) -> LPARAM {
-        (x as u16 as u32 | (y as u16 as u32) << 16) as i32 as LPARAM
-    }
-
     /// Resizes `w` so that its client area is `width` x `height`.
     fn set_client_size(w: &Window, width: i32, height: i32) {
         // SAFETY: a valid window handle and RECTs it fills in.
@@ -974,6 +1179,14 @@ mod tests {
         // SAFETY: no arguments.
         unsafe { ReleaseCapture() };
         assert_eq!(w.take_pointer(), [PointerInput::buttons(0)]);
+        // Losing the focus in the middle of a click releases the button too.
+        send(&w, WM_RBUTTONDOWN, MK_RBUTTON, mouse_lparam(5, 6));
+        w.take_pointer();
+        send(&w, WM_KILLFOCUS, 0, 0);
+        assert_eq!(w.take_pointer(), [PointerInput::buttons(0)]);
+        send(&w, WM_RBUTTONUP, 0, mouse_lparam(5, 6));
+        assert!(!captured(&w));
+        w.take_pointer();
 
         // Stretched to 1.5 times the size (small enough for any screen): three client
         // pixels show two frame pixels.
@@ -988,11 +1201,16 @@ mod tests {
             "the screen is too small"
         );
         w.take_pointer();
+        send(&w, WM_MOUSEMOVE, 0, mouse_lparam(1, 1));
         send(&w, WM_MOUSEMOVE, 0, mouse_lparam(201, 101));
         send(&w, WM_MOUSEMOVE, 0, mouse_lparam(959, 719));
         assert_eq!(
             w.take_pointer(),
-            [PointerInput::move_to(134, 67), PointerInput::move_to(639, 479)]
+            [
+                PointerInput::move_to(1, 1),
+                PointerInput::move_to(134, 67),
+                PointerInput::move_to(639, 479)
+            ]
         );
     }
 }

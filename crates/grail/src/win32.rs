@@ -268,6 +268,23 @@ extern "system" {
 
 #[link(name = "gdi32")]
 extern "system" {
+    #[cfg(test)]
+    pub fn CreateCompatibleDC(hdc: HDC) -> HDC;
+    #[cfg(test)]
+    pub fn DeleteDC(hdc: HDC) -> BOOL;
+    #[cfg(test)]
+    pub fn CreateDIBSection(
+        hdc: HDC,
+        pbmi: *const BITMAPINFO,
+        usage: u32,
+        ppvBits: *mut *mut c_void,
+        hSection: HANDLE,
+        offset: u32,
+    ) -> HANDLE;
+    #[cfg(test)]
+    pub fn SelectObject(hdc: HDC, h: HANDLE) -> HANDLE;
+    #[cfg(test)]
+    pub fn DeleteObject(h: HANDLE) -> BOOL;
     pub fn SetStretchBltMode(hdc: HDC, mode: i32) -> i32;
     pub fn StretchDIBits(
         hdc: HDC,
