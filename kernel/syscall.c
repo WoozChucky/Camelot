@@ -25,7 +25,7 @@ static int sys_sleep(struct trap_frame *f) {
     u32 start = ticks;
     /* Unsigned differences, so the count may wrap. Every tick wakes the
      * sleepers (clock_tick in trap.c), which check again. */
-    while (ticks - start < n) {
+    while (ticks - start < n && !proc_killed()) {
         sleep((const void *)&ticks);
     }
     return 0;
@@ -89,6 +89,24 @@ static int sys_run(struct trap_frame *f, bool replace) {
         kfree(args);
     }
     return err;
+}
+
+/* procs(buf, max): all of `buf`, `max` entries, must be writable, however
+ * many are filled in. The table is built on the kernel stack (NPROC
+ * entries, 256 bytes) and copied out. */
+static int sys_procs(struct trap_frame *f) {
+    pagetable_t pt = myproc()->pagetable;
+    u32 buf = arg(f, 0);
+    u32 max = arg(f, 1);
+    if (max > USER_TOP / sizeof(struct procinfo) || !uvm_range_ok(pt, buf, max * sizeof(struct procinfo), PTE_W)) {
+        return -EFAULT;
+    }
+    struct procinfo info[NPROC];
+    int n = proc_list(info, max < NPROC ? (int)max : NPROC);
+    u32 filled = (u32)n < max ? (u32)n : max;
+    /* Checked above. */
+    copyout(pt, buf, info, filled * sizeof(struct procinfo));
+    return n;
 }
 
 void syscall(struct trap_frame *f) {
@@ -161,6 +179,12 @@ void syscall(struct trap_frame *f) {
         /* On success the frame is the new program's, and the result its
          * argc, which belongs in its a0. */
         ret = sys_run(f, true);
+        break;
+    case SYS_kill:
+        ret = proc_kill_pid((int)arg(f, 0));
+        break;
+    case SYS_procs:
+        ret = sys_procs(f);
         break;
     case SYS_netinfo:
         ret = net_sys_info(arg(f, 0));

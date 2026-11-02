@@ -27,9 +27,11 @@
     .equ SYS_dup, 19
     .equ SYS_pipe, 20
     .equ SYS_exec, 21
-    .equ SYS_netinfo, 40
-    .equ SYS_netconf, 41
-    .equ SYS_ping, 42
+    .equ SYS_kill, 22
+    .equ SYS_procs, 23
+    .equ SYS_netinfo, 24
+    .equ SYS_netconf, 25
+    .equ SYS_ping, 26
 
     .text
 
@@ -177,6 +179,20 @@ pipe:
     .globl exec
 exec:
     li    a7, SYS_exec
+    ecall
+    ret
+
+# int kill(int pid)
+    .globl kill
+kill:
+    li    a7, SYS_kill
+    ecall
+    ret
+
+# int procs(struct procinfo *buf, uint max)
+    .globl procs
+procs:
+    li    a7, SYS_procs
     ecall
     ret
 

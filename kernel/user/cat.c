@@ -1,6 +1,6 @@
 /* cat [FILE...]: copies each file, or its input if there is none, to its
- * output. Exits 1 if a file can't be opened or read or the output written
- * (a pipe whose reader went away), else 0. */
+ * output. Exits 1 if a file can't be opened or read (a directory is
+ * refused) or the output written (a pipe whose reader went away), else 0. */
 #include "user.h"
 
 static char buf[512];
@@ -32,6 +32,13 @@ int main(int argc, char **argv) {
         int fd = open(argv[i], O_RDONLY);
         if (fd < 0) {
             fprintf(STDERR, "cat: %s: %s\n", argv[i], strerror(-fd));
+            return 1;
+        }
+        /* A directory's entries are not text to copy. */
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.type == T_DIR) {
+            fprintf(STDERR, "cat: %s: %s\n", argv[i], strerror(EISDIR));
+            close(fd);
             return 1;
         }
         int r = copy(fd, argv[i]);

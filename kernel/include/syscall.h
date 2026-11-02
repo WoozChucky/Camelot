@@ -34,14 +34,16 @@
 #define SYS_dup 19    /* dup(fd): a new descriptor for the same open file */
 #define SYS_pipe 20   /* pipe(fds): 0, with fds[0] the read end and fds[1] the write end */
 #define SYS_exec 21   /* exec(path, argv): does not return */
-/* The network's calls start at 40 (docs/camelot-net.md). */
-#define SYS_netinfo 40 /* netinfo(info): 0, with *info filled in */
-#define SYS_netconf 41 /* netconf(addr, mask, gateway): 0 */
-#define SYS_ping 42    /* ping(addr, seq, reply): 0, with *reply filled in */
+#define SYS_kill 22   /* kill(pid): 0, the process ends before it runs U-mode code again */
+#define SYS_procs 23  /* procs(buf, max): the number of processes, up to max described in buf */
+#define SYS_netinfo 24 /* netinfo(info): 0, with *info filled in */
+#define SYS_netconf 25 /* netconf(addr, mask, gateway): 0 */
+#define SYS_ping 26    /* ping(addr, seq, reply): 0, with *reply filled in */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
-#define EPERM 1         /* link: not for a directory */
+#define EPERM 1         /* link: not for a directory; kill: not a kernel process */
 #define ENOENT 2        /* no such file or directory */
+#define ESRCH 3         /* kill: no such process */
 #define E2BIG 7         /* spawn, exec: argument list too long */
 #define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */
 #define EBADF 9         /* not an open file descriptor, or not open for that */
@@ -109,6 +111,18 @@ struct stat {
 };
 
 #define T_PIPE 4
+
+/* What procs stores for each process: 32 bytes. `state` is one of the
+ * PROC_ values (proc.h), `ppid` 0 for a process without a parent, `size`
+ * the end of its heap (its program, data and heap, from address 0), 0 for
+ * a kernel process. */
+struct procinfo {
+    u32 pid;
+    u32 ppid;
+    u32 state;
+    u32 size;
+    char name[16];
+};
 
 /* The network's counters, in netinfo's `stats` (docs/camelot-net.md,
  * "Counters"): frames and bytes through the card, then everything

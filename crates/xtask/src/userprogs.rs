@@ -2,11 +2,17 @@
 //! "Kernel processes").
 //!
 //! Every `kernel/user/*.c` and `*.s` is one program, but for the runtime
-//! linked into each of them ([`RUNTIME`]: `crt0.s`, the system call stubs
-//! `usys.s` and the C library `ulib.c`). Our own tools build them, in
-//! memory, with no LLVM: merlin compiles each C file to assembly, merlin-as
-//! assembles that and the `.s` files, and merlin-ld links each program with
-//! the runtime and `kernel/user/user.ld`. The executables then go into
+//! linked into each of them ([`RUNTIME`]: `crt0.s` and the system call stubs
+//! `usys.s`). The C library, `kernel/user/lib/` ([`LIB_DIR`]), is linked as
+//! a library: each of its files is a member that goes into a program only
+//! if the program needs something it defines (`merlin_ld::library`, like
+//! an archive's members), so a program that never calls malloc carries
+//! neither its code nor its data. Our own tools build them, in memory, with
+//! no LLVM: merlin compiles each C file to assembly, merlin-as assembles
+//! that and the `.s` files, and merlin-ld links each program with the
+//! runtime, the library members it needs and `kernel/user/user.ld`. The
+//! runtime and the library are built once for all the programs. The
+//! executables then go into
 //! `kernel/userprogs.s` as ELF images in `.rodata`, with a table the
 //! kernel's loader looks programs up in. That file is generated, but
 //! committed with the kernel sources, so building the kernel needs nothing
@@ -28,7 +34,10 @@ use std::process::Command;
 /// The user programs' directory, relative to the repository root.
 pub const USER_DIR: &str = "kernel/user";
 /// The runtime linked into every program (none of them is a program).
-pub const RUNTIME: &[&str] = &["crt0.s", "usys.s", "ulib.c"];
+pub const RUNTIME: &[&str] = &["crt0.s", "usys.s"];
+/// The C library's directory, under [`USER_DIR`]: every `.c` and `.s` file
+/// in it is a library member.
+pub const LIB_DIR: &str = "lib";
 /// The linker script every program is linked with.
 pub const SCRIPT: &str = "user.ld";
 /// The generated assembly file, relative to the repository root.
@@ -68,10 +77,12 @@ pub enum Lang {
     Asm,
 }
 
-/// A source file in [`USER_DIR`]: a program's or the runtime's.
+/// A source file in [`USER_DIR`]: a program's, the runtime's or the
+/// library's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source {
-    /// The file's stem: for a program, its name.
+    /// The file's stem, relative to [`USER_DIR`]: for a program, its name;
+    /// for a library member, `lib/` and its name.
     pub stem: String,
     pub lang: Lang,
 }
@@ -152,6 +163,22 @@ pub fn sources(dir: &Path) -> Result<Vec<Source>, String> {
     Ok(out)
 }
 
+/// The library's members in `dir` (`dir/lib`), by file name, their stems
+/// starting with `lib/`. There may be none.
+pub fn library(dir: &Path) -> Result<Vec<Source>, String> {
+    let lib = dir.join(LIB_DIR);
+    if !lib.is_dir() {
+        return Ok(Vec::new());
+    }
+    Ok(sources(&lib)?
+        .into_iter()
+        .map(|s| Source {
+            stem: format!("{LIB_DIR}/{}", s.stem),
+            lang: s.lang,
+        })
+        .collect())
+}
+
 /// The programs in `dir`: every source but the [`RUNTIME`]'s, by name. A
 /// name must be [`valid_name`] and belong to one source only.
 pub fn programs(dir: &Path) -> Result<Vec<Source>, String> {
@@ -218,22 +245,57 @@ fn runtime() -> Vec<Source> {
     RUNTIME.iter().filter_map(|f| Source::from_file(f)).collect()
 }
 
-/// Builds program `prog` from `dir`: it and the [`RUNTIME`] compiled by `cc`
-/// (C) and assembled, then linked with [`SCRIPT`], the program first.
-/// merlin-ld's warnings are errors here.
-pub fn build_program_with(dir: &Path, prog: &Source, cc: CCompiler) -> Result<Program, String> {
-    let mut inputs = Vec::new();
-    for src in std::iter::once(prog.clone()).chain(runtime()) {
-        let (shown, text) = asm_text(dir, &src, cc)?;
-        inputs.push(merlin_ld::Input {
-            name: format!("{}.o", src.file()),
-            data: toolchain::assemble(&shown, &text)?,
-        });
-    }
+/// `src` (in `dir`) compiled by `cc` if it is C, and assembled.
+fn object(dir: &Path, src: &Source, cc: CCompiler) -> Result<merlin_ld::Input, String> {
+    let (shown, text) = asm_text(dir, src, cc)?;
+    Ok(merlin_ld::Input {
+        name: format!("{}.o", src.file()),
+        data: toolchain::assemble(&shown, &text)?,
+    })
+}
+
+/// What every program is linked with: the runtime's objects, and the
+/// library's, of which each program takes the ones it needs.
+pub struct Runtime {
+    pub objects: Vec<merlin_ld::Input>,
+    pub library: Vec<merlin_ld::Input>,
+}
+
+/// Builds the [`RUNTIME`] and the library in `dir`, their C compiled by
+/// `cc`.
+pub fn build_runtime(dir: &Path, cc: CCompiler) -> Result<Runtime, String> {
+    let objects = runtime()
+        .iter()
+        .map(|s| object(dir, s, cc))
+        .collect::<Result<_, _>>()?;
+    let library = library(dir)?
+        .iter()
+        .map(|s| object(dir, s, cc))
+        .collect::<Result<_, _>>()?;
+    Ok(Runtime { objects, library })
+}
+
+/// Links program `prog` from `dir`: it compiled by `cc` (C) and assembled,
+/// then the runtime's objects and the library members it needs, linked
+/// with [`SCRIPT`], the program first. merlin-ld's warnings are errors
+/// here.
+pub fn link_program(dir: &Path, prog: &Source, cc: CCompiler, rt: &Runtime) -> Result<Program, String> {
+    let mut inputs = vec![object(dir, prog, cc)?];
+    inputs.extend(rt.objects.iter().cloned());
+    let inputs = merlin_ld::library::with_needed(&inputs, &rt.library).map_err(|errors| {
+        let lines: Vec<String> = errors.iter().map(|e| format!("merlin-ld: error: {e}")).collect();
+        format!("linking {}:\n{}", prog.stem, lines.join("\n"))
+    })?;
     Ok(Program {
         name: prog.stem.clone(),
         elf: toolchain::link(dir, SCRIPT, &inputs, &prog.stem)?,
     })
+}
+
+/// Builds program `prog` from `dir`, its C and the runtime's compiled by
+/// `cc` ([`link_program`]).
+pub fn build_program_with(dir: &Path, prog: &Source, cc: CCompiler) -> Result<Program, String> {
+    link_program(dir, prog, cc, &build_runtime(dir, cc)?)
 }
 
 /// Builds program `prog` from `dir` with our own tools.
@@ -250,11 +312,14 @@ pub fn build_named(dir: &Path, name: &str) -> Result<Program, String> {
     build_program(dir, &prog)
 }
 
-/// Builds every program in `dir`, by name, its C compiled by `cc`.
+/// Builds every program in `dir`, by name, its C compiled by `cc`; the
+/// runtime and the library once for all of them.
 pub fn build_all_with(dir: &Path, cc: CCompiler) -> Result<Vec<Program>, String> {
-    programs(dir)?
+    let progs = programs(dir)?;
+    let rt = build_runtime(dir, cc)?;
+    progs
         .iter()
-        .map(|prog| build_program_with(dir, prog, cc))
+        .map(|prog| link_program(dir, prog, cc, &rt))
         .collect()
 }
 
@@ -276,14 +341,17 @@ pub fn clang_args(src: &Source, out: &Path) -> Vec<String> {
     args
 }
 
-/// The reference build's first step: compiles every C file in `dir` with
-/// `clang` to assembly, `X.c` to `out/X.s`, for [`CCompiler::Clang`]. clang
-/// runs inside `dir` with relative names, so the output doesn't depend on
-/// where the repository is.
+/// The reference build's first step: compiles every C file in `dir` and
+/// its library with `clang` to assembly, `X.c` to `out/X.s` and `lib/Y.c`
+/// to `out/lib/Y.s`, for [`CCompiler::Clang`]. clang runs inside `dir` with
+/// relative names, so the output doesn't depend on where the repository
+/// is.
 pub fn compile_clang(clang: &Path, dir: &Path, out: &Path, verbose: bool) -> Result<(), String> {
-    std::fs::create_dir_all(out).map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+    std::fs::create_dir_all(out.join(LIB_DIR))
+        .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
     let out = std::path::absolute(out).map_err(|e| format!("bad path {}: {e}", out.display()))?;
-    for src in sources(dir)?.into_iter().filter(|s| s.lang == Lang::C) {
+    let all = sources(dir)?.into_iter().chain(library(dir)?);
+    for src in all.filter(|s| s.lang == Lang::C) {
         let args = clang_args(&src, &out.join(format!("{}.s", src.stem)));
         if verbose {
             eprintln!("{} {}", clang.display(), args.join(" "));
@@ -357,9 +425,10 @@ pub fn generate(programs: &[Program], cc: CCompiler) -> String {
         "# Generated by `cargo xtask kernel` from kernel/user/: do not edit.\n\
          #\n\
          # The user programs as ELF images for the kernel's loader: each one's C\n\
-         # compiled by {cc}, assembled by merlin-as with the runtime (crt0.s,\n\
-         # usys.s, ulib.c) and linked by merlin-ld with kernel/user/user.ld\n\
-         # (crates/xtask/src/userprogs.rs). The table is the array\n\
+         # compiled by {cc}, assembled by merlin-as and linked by merlin-ld with\n\
+         # the runtime (crt0.s, usys.s), the members of the C library (lib/) it\n\
+         # needs and kernel/user/user.ld (crates/xtask/src/userprogs.rs). The\n\
+         # table is the array\n\
          # kernel/include/proc.h declares:\n\
          #   struct user_program {{ const char *name; const u8 *elf; u32 size; }};\n\
          \n\
@@ -425,7 +494,7 @@ mod tests {
     }
 
     /// A minimal runtime in `dir`: `_start` calls main and exit, `exit` is
-    /// an ecall, and ulib.c has one function.
+    /// an ecall, and the library has one function.
     fn write_runtime(dir: &Path) {
         std::fs::write(
             dir.join("crt0.s"),
@@ -437,7 +506,23 @@ mod tests {
             "    .globl exit\nexit:\n    li a7, 1\n    ecall\n",
         )
         .unwrap();
-        std::fs::write(dir.join("ulib.c"), "int nothing(void) { return 0; }\n").unwrap();
+        std::fs::create_dir_all(dir.join(LIB_DIR)).unwrap();
+        std::fs::write(
+            dir.join(LIB_DIR).join("nothing.c"),
+            "int nothing(void) { return 0; }\n",
+        )
+        .unwrap();
+        // A member that needs another, and one nobody needs.
+        std::fs::write(
+            dir.join(LIB_DIR).join("twice.c"),
+            "int nothing(void);\nint twice(void) { return 2 * nothing(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(LIB_DIR).join("unused.s"),
+            "    .globl unused\nunused:\n    ret\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.join(SCRIPT),
             "ENTRY(_start)\nSECTIONS { . = 0x1000; .text : { *(.text.start) *(.text*) } }\n",
@@ -466,7 +551,7 @@ mod tests {
     fn source_files() {
         assert_eq!(src("sh", Lang::C).file(), "sh.c");
         assert_eq!(src("regs", Lang::Asm).file(), "regs.s");
-        assert_eq!(Source::from_file("ulib.c"), Some(src("ulib", Lang::C)));
+        assert_eq!(Source::from_file("printf.c"), Some(src("printf", Lang::C)));
         assert_eq!(Source::from_file("user.h"), None);
         assert_eq!(Source::from_file("user.ld"), None);
         assert_eq!(runtime().len(), RUNTIME.len());
@@ -480,7 +565,7 @@ mod tests {
         ] {
             assert!(names.contains(&want.to_string()), "{want} missing from {names:?}");
         }
-        for runtime in ["crt0", "usys", "ulib", "user"] {
+        for runtime in ["crt0", "usys", "user", "lib", "printf", "string", "malloc"] {
             assert!(!names.iter().any(|n| n == runtime), "{runtime} in {names:?}");
         }
         let mut sorted = names.clone();
@@ -607,7 +692,28 @@ mod tests {
         for want in ["_start", "main", "exit", "nothing"] {
             assert!(syms.iter().any(|s| s.name == want), "{want} missing");
         }
+        // Only the library members it needs.
+        for unwanted in ["twice", "unused"] {
+            assert!(!syms.iter().any(|s| s.name == unwanted), "{unwanted} linked");
+        }
         assert_eq!(build_all(&dir).unwrap(), std::slice::from_ref(&p));
+        // A member pulls in the members it needs.
+        std::fs::write(
+            dir.join("ok.s"),
+            "    .globl main\nmain:\n    call twice\n    ret\n",
+        )
+        .unwrap();
+        let twice = build_named(&dir, "ok").unwrap();
+        let syms = elf32::Elf::parse(&twice.elf).unwrap().symbols().unwrap();
+        for want in ["twice", "nothing"] {
+            assert!(syms.iter().any(|s| s.name == want), "{want} missing");
+        }
+        assert!(!syms.iter().any(|s| s.name == "unused"));
+        std::fs::write(
+            dir.join("ok.s"),
+            "    .globl main\nmain:\n    call nothing\n    ret\n",
+        )
+        .unwrap();
 
         // A C program, compiled by merlin with user.h from its directory.
         std::fs::write(dir.join("user.h"), "#define ZERO 0\nint nothing(void);\n").unwrap();
@@ -635,16 +741,25 @@ mod tests {
             .into_iter()
             .find(|p| p.stem == "cprog")
             .unwrap();
+        // The library's assembly is in lib/ there.
+        let err = build_program_with(&dir, &cprog, CCompiler::Clang(&asm)).unwrap_err();
+        assert!(err.contains("cannot read") && err.contains("nothing.s"), "{err}");
+        std::fs::create_dir_all(asm.join(LIB_DIR)).unwrap();
+        std::fs::write(
+            asm.join(LIB_DIR).join("nothing.s"),
+            "    .globl nothing\nnothing:\n    li a0, 0\n    ret\n",
+        )
+        .unwrap();
+        std::fs::write(
+            asm.join(LIB_DIR).join("twice.s"),
+            "    .globl twice\ntwice:\n    li a0, 0\n    ret\n",
+        )
+        .unwrap();
         let err = build_program_with(&dir, &cprog, CCompiler::Clang(&asm)).unwrap_err();
         assert!(err.contains("cannot read") && err.contains("cprog.s"), "{err}");
         std::fs::write(
             asm.join("cprog.s"),
             "    .globl main\nmain:\n    li a0, 0\n    ret\n",
-        )
-        .unwrap();
-        std::fs::write(
-            asm.join("ulib.s"),
-            "    .globl nothing\nnothing:\n    li a0, 0\n    ret\n",
         )
         .unwrap();
         let p = build_program_with(&dir, &cprog, CCompiler::Clang(&asm)).unwrap();

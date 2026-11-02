@@ -7,8 +7,11 @@
 //!
 //! [`reloc`] is where each relocation's formula and instruction field are
 //! explained; start there to see how addresses get into the code.
+//! [`library`] picks the members of a library a program needs, as ld does
+//! with an archive ([`link_with_library`]).
 
 pub mod layout;
+pub mod library;
 pub mod map;
 pub mod object;
 pub mod reloc;
@@ -74,4 +77,11 @@ pub fn link(inputs: &[Input], opts: &Options) -> Result<Linked, Vec<Error>> {
     let images = relocate::relocate(&layout)?;
     let elf = write::write(&layout, &images);
     Ok(Linked { elf, layout })
+}
+
+/// Links `inputs` with the members of `library` they need (objects linked
+/// only when they define something still undefined, like an archive's:
+/// [`library`]), after them in library order.
+pub fn link_with_library(inputs: &[Input], library: &[Input], opts: &Options) -> Result<Linked, Vec<Error>> {
+    link(&library::with_needed(inputs, library)?, opts)
 }

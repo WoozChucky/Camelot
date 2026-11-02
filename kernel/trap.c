@@ -197,6 +197,10 @@ void user_trap(struct trap_frame *f) {
         /* A fault in U-mode is the program's, not the kernel's. */
         proc_kill(f);
     }
+    /* kill() takes effect here, on the way back to U-mode. */
+    if (proc_killed()) {
+        proc_exit(-1);
+    }
     user_trap_return(f);
 }
 

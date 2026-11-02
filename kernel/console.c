@@ -76,6 +76,9 @@ int console_read(pagetable_t pt, u32 dst, u32 n) {
         return 0;
     }
     while (!edit_line()) {
+        if (proc_killed()) {
+            return 0; /* never seen: the caller ends on its way out */
+        }
         sleep(line);
     }
     u32 count = line_len - line_taken;

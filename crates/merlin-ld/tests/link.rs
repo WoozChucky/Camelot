@@ -1717,6 +1717,36 @@ fn segments_group_by_permissions() {
     check_norelocs_memory(&m, &linked.layout);
 }
 
+#[test]
+fn library_members_are_linked_only_when_needed() {
+    // multiobj's main.o is the program; its library holds a second main.o
+    // (whose _start would be a duplicate), norelocs' more.o (which nothing
+    // needs) and print.o (which main.o calls): only print.o is linked, and
+    // the result is the plain link of main.o and print.o.
+    let main = input(&fixtures().join("multiobj/main.o"));
+    let print = input(&fixtures().join("multiobj/print.o"));
+    let library = [
+        Input {
+            name: "again.o".into(),
+            data: main.data.clone(),
+        },
+        input(&fixtures().join("norelocs/more.o")),
+        print.clone(),
+    ];
+    let program = [main.clone()];
+    assert_eq!(merlin_ld::library::needed(&program, &library).unwrap(), [2]);
+    let opts = script(&std::fs::read_to_string(fixtures().join("multiobj/link.ld")).unwrap());
+    let linked = merlin_ld::link_with_library(&program, &library, &opts).unwrap();
+    let plain = merlin_ld::link(&[main, print], &opts).unwrap();
+    assert_eq!(linked.elf, plain.elf);
+    // Without the member, the reference is undefined.
+    let errs = errors(merlin_ld::link_with_library(&program, &library[..2], &opts));
+    assert!(
+        errs.iter().any(|e| e.contains("undefined reference to 'puts'")),
+        "{errs:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Command line.
 
@@ -1759,6 +1789,37 @@ fn command_line() {
             && stderr.contains("hello.o: undefined reference to '__stack_top'"),
         "{stderr}"
     );
+
+    // A library member nobody needs is left out: a second start.o would be
+    // a duplicate _start, but between --start-lib and --end-lib it is only
+    // linked if something needs a symbol it defines.
+    let status = std::process::Command::new(exe)
+        .arg(fx.join("start.o"))
+        .arg("--start-lib")
+        .arg(fx.join("start.o"))
+        .arg("--end-lib")
+        .arg(fx.join("data.o"))
+        .arg(fx.join("more.o"))
+        .arg("-T")
+        .arg(fx.join("link.ld"))
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        read_ours(&std::fs::read(&out).unwrap()).loads,
+        expected("norelocs/link").loads
+    );
+    for bad in [
+        &["--end-lib"][..],
+        &["--start-lib", "--start-lib"],
+        &["--start-lib", "x.o"],
+        &["--start-lib", "x.o", "--end-lib"],
+    ] {
+        let o = std::process::Command::new(exe).args(bad).output().unwrap();
+        assert_eq!(o.status.code(), Some(2), "{bad:?}");
+    }
 
     let o = std::process::Command::new(exe).arg("--bogus").output().unwrap();
     assert_eq!(o.status.code(), Some(2));
