@@ -20,8 +20,8 @@
 //! Ignored until the pipeline exists:
 //!
 //! * `cases_run_in_grail`: merlin → merlin-as → merlin-ld (with `tests/crt0.s`)
-//!   → Grail, comparing exit codes. Needs codegen (#14), the merlin-as encoder
-//!   (#4) and merlin-ld (#5); #14 un-ignores it. merlin-ld is the binary named
+//!   → Grail, comparing exit codes. Needs codegen (#14) and merlin-ld's
+//!   relocations (#7); #14 un-ignores it. merlin-ld is the binary named
 //!   by `MERLIN_LD`, or `merlin-ld` next to this test in `target/<profile>/`,
 //!   invoked as `merlin-ld -o out.elf crt0.o case.o`. Until #8 lands, set
 //!   `MERLIN_HARNESS_LLVM=1` to assemble and link with clang and ld.lld instead.
@@ -330,7 +330,7 @@ impl Backend {
 }
 
 #[test]
-#[ignore = "needs merlin codegen (#14), the merlin-as encoder (#4) and merlin-ld (#5); see the module docs"]
+#[ignore = "needs merlin codegen (#14) and merlin-ld relocations (#7); see the module docs"]
 fn cases_run_in_grail() {
     let backend = Backend::from_env();
     let scratch = Scratch::new("pipeline");

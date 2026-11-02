@@ -1,125 +1,219 @@
-# Writing the merlin-as encoder
+# The merlin-as encoder
 
-Everything in merlin-as is in place except the encoder: `encode()` in
-[`src/encode.rs`](src/encode.rs). It receives one instruction and returns its
-machine words. `add` is done as a worked example.
+How merlin-as turns one line of assembly into machine words, and how the
+driver finishes the job once the whole file is read. The code is meant to be
+read alongside this page:
+
+- [`src/encode.rs`](src/encode.rs): the whole ISA. One function, `encode()`,
+  plus the field packers it is built from.
+- [`src/asm.rs`](src/asm.rs): the driver. Places the words in sections, turns
+  fixups into relocations, and at the end resolves the ones clang resolves.
+- [`src/parser.rs`](src/parser.rs): operands are already parsed when the
+  encoder sees them (`Operand::Reg`, `Operand::Expr`, `Operand::Mem`).
 
 ```rust
 pub fn encode(mnemonic: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String>
 ```
 
-- `mnemonic` is lower-case (`"addi"`, `"fence.i"`, `"xcal.dbg"`).
-- `ops` are already parsed: `Operand::Reg(n)`, `Operand::Expr(e)`, `Operand::Mem { offset, base }`.
-- `ctx.constant(e)` evaluates numbers and `.equ` constants. `ctx.symbol(e)` gives
-  `(name, addend)` for `label`, `label+4`, `1f`... `ctx.csr(e)` resolves `mstatus` or `0x300`.
-- Return `Emit::word(w)` for plain words, or `Emit::with_fixup(w, kind, target)`
-  when a field refers to a label (leave that field zero; the linker fills it).
+It returns one `Emit` per 32-bit word. An operand that names a label leaves
+its immediate bits zero and the `Emit` carries a fixup (`RelocKind` +
+target). The number of words never depends on a label's address, so the
+assembler can stay single pass; it may depend on a constant (`li`).
 
-The contract is in the doc comment at the top of `encode.rs`, and the
-expected output for every case is in `tests/golden/encode.golden`.
+## Formats and field packers
 
-## Checking progress
-
-```
-cargo test -p merlin-as --test encode_golden -- --nocapture
-```
-
-prints `encoder: N/118 lines match llvm-mc` and the mnemonics still missing.
-Lines you haven't implemented are counted, never failed; a line you *have*
-implemented that differs from llvm-mc fails with the expected and actual words.
-When everything is done:
+Every instruction is one of six formats. They keep `opcode`, `rd`, `rs1`,
+`rs2` and `funct3` in the same places, so the immediates get scattered
+instead:
 
 ```
-cargo test -p merlin-as --test encode_golden -- --ignored
+R: funct7[31:25] rs2[24:20] rs1[19:15] funct3[14:12] rd[11:7]  opcode
+I: imm[11:0][31:20]         rs1        funct3        rd        opcode
+S: imm[11:5]     rs2        rs1        funct3        imm[4:0]  opcode
+B: imm[12|10:5]  rs2        rs1        funct3        imm[4:1|11] opcode
+U: imm[31:12]                                        rd        opcode
+J: imm[20|10:1|11|19:12]                             rd        opcode
 ```
 
-Two more suites follow the same rules (unimplemented lines are counted, not
-failed; `-- --ignored` requires everything):
+`r_type`, `i_type`, `s_type`, `b_type`, `u_type` and `j_type` pack the fields.
+Each uses an `x_imm` function (`i_imm`, `s_imm`, `b_imm`, `u_imm`, `j_imm`)
+that returns only the bits the immediate occupies; they are the inverse of
+`imm_i`/`imm_s`/`imm_b`/`imm_j` in `crates/excalibur/src/decode.rs`, and the
+driver reuses them to patch resolved labels into words. Branch and jump
+offsets are even, so bit 0 is never stored, and the sign is always bit 31.
 
-- `encode_roundtrip`: `excalibur::decode` of your words must give back the
-  operation and operands in a hand-written table that has every golden
-  mnemonic plus Xcal, CSRs by name, `li` splits and explicit
-  `%pcrel_hi`/`%pcrel_lo` pairs. Each word must carry exactly the relocation
-  the table lists, or none. Every llvm-mc word in the golden file, decoded and
-  printed by the disassembler, must also assemble back to that exact word.
-- `encode_errors`: out-of-range immediates, bad operands, misplaced
-  `%hi`/`%lo`/`%pcrel_*` modifiers and unknown mnemonics must be rejected on
-  their own source line. Unknown mnemonics currently land in the
-  `UNIMPLEMENTED` arm; the complete run wants a real error there that names
-  the mnemonic.
+### The hi/lo split
 
-`encode_hello` has a single ignored test that assembles
-`examples/hello/hello.S` and compares `.text.start` with clang
-(`tests/golden/hello.ref`). It needs more than the encoder; see below.
+A 32-bit value is built in two instructions: `lui`/`auipc` supplies the upper
+20 bits, and `addi`/a load/a store/`jalr` adds a 12-bit immediate. That
+immediate is sign-extended, so when bit 11 of the value is set the low part is
+negative and the upper part must be one more:
 
-## hello.S (acceptance criteria 3 and 4)
+```
+hi = (value + 0x800) >> 12      lo = value - (hi << 12)    (lo in -2048..=2047)
+0x12345fff → hi = 0x12346, lo = -1
+```
 
-A finished encoder is not enough to assemble `examples/hello/hello.S`:
+`hi_lo()` does this; `li`, `%hi`/`%lo` of a constant, and the resolution of
+pc-relative pairs all use it (ld.lld does the same for `R_RISCV_HI20` and
+friends).
 
-- **`.insn`.** hello.S writes the two Xcal instructions as
-  `.insn i 0x0b, 0, x0, a0, 0` so that clang can build it. The merlin-as
-  parser rejects that line (`unexpected text at end of line`) before
-  `encode()` is ever called. Writing `xcal.dbg a0` instead fixes merlin-as but
-  breaks the clang build, which is the reference. So either merlin-as learns
-  `.insn i opcode, funct3, rd, rs1, imm` (parser plus an I-type encode), or
-  the clang build stops using hello.S as is. That needs a decision.
-- **Same-section labels.** merlin-as is single pass and turns every label
-  reference into a relocation. clang resolves branches, jumps and `call` to
-  labels in the same section, so `llvm-objdump -d -r` of the two objects
-  differs even with a correct encoder. (With relaxation on, clang also adds
-  `R_RISCV_RELAX` to every relocation.) `encode_hello` compares against
-  clang with `-mno-relax` and accepts the extra relocations, as long as the
-  bits outside the immediate match and the label is where clang's resolved
-  offset points. Resolving same-section fixups in `asm.rs` is the other
-  option.
+## What it accepts
 
-Running the result in Grail still needs `ld.lld -T examples/hello/link.ld`
-and is checked by hand.
+Mnemonics are lower case; registers by ABI name or `xN`; CSRs by name
+(`excalibur::csr`) or number.
 
-## Suggested order
+| Group | Mnemonics |
+|---|---|
+| RV32I | `lui auipc jal jalr beq bne blt bge bltu bgeu lb lh lw lbu lhu sb sh sw addi slti sltiu xori ori andi slli srli srai add sub sll slt sltu xor srl sra or and` |
+| M | `mul mulh mulhsu mulhu div divu rem remu` (OP with funct7 = 1) |
+| Zifencei, fences | `fence` (no operands = `iorw, iorw`, or two sets like `rw, w`), `fence.tso`, `fence.i` |
+| Privileged | `ecall ebreak mret sret wfi sfence.vma [rs1[, rs2]]` |
+| Zicsr | `csrrw csrrs csrrc csrrwi csrrsi csrrci` |
+| Xcal (spec §9) | `xcal.dbg rs1`, `xcal.halt rs1` (custom-0, funct3 0 / 1) |
 
-1. **Field packers.** `r_type`, `i_type`, `s_type`, `b_type`, `u_type`, `j_type`.
-   They are the mirror image of `imm_i`/`imm_s`/`imm_b`/`imm_j` in
-   `crates/excalibur/src/decode.rs`. A round-trip unit test
-   (`decode(i_type(...))`) catches bit-scrambling mistakes fast.
-2. **OP and OP-IMM** (`add sub sll ... and`, `addi slti ... srai`), with range
-   checks: 12-bit signed immediates, 5-bit shift amounts.
-3. **M extension** (`mul ... remu`): same as OP with funct7 = 1.
-4. **Loads and stores** (`lw a0, 8(sp)`: `Operand::Mem`).
-5. **`lui`/`auipc`, `jal`/`jalr`, branches** with numeric offsets (check
-   alignment and range).
-6. **System**: `ecall ebreak mret sret wfi fence fence.i sfence.vma`, the six
-   `csrr*` forms, and the `csrr csrw csrs csrc csrwi csrsi csrci` aliases.
-7. **Simple pseudo-instructions**: `nop mv not neg seqz snez sltz sgtz j jr ret`,
-   the `beqz`-style branches and the swapped ones (`bgt a, b` = `blt b, a`).
-8. **`li`**, following LLVM (which the golden file comes from):
-   - fits in 12 signed bits: `addi rd, zero, v`;
-   - low 12 bits zero: `lui`;
-   - `v` is `c << s` with `c` in -32..=31: `addi rd, zero, c` + `slli rd, rd, s`
-     (`li a0, 2048` is `addi a0, zero, 1; slli a0, a0, 11`);
-   - anything else: `lui` + `addi`. Remember `addi` sign-extends, so the upper
-     part is `(v + 0x800) >> 12`.
-9. **Symbols and relocations**: branches/jal to labels (`Branch`, `Jal`),
-   `call`/`tail` (auipc + jalr, one `CallPlt` fixup on the auipc), `la`/`lla`
-   (auipc `PcrelHi20` + addi `PcrelLo12I` targeting `Target::Auipc(0)`),
-   `%hi`/`%lo` operands (`Hi20`, `Lo12I`, `Lo12S`), `lw a0, sym` /
-   `sw a0, sym, t0`, and explicit pairs: `1: auipc a0, %pcrel_hi(sym)`
-   (`PcrelHi20`) with `addi a0, a0, %pcrel_lo(1b)` (`PcrelLo12I`, or
-   `PcrelLo12S` in a store), whose target is the label `ctx.symbol` gives for
-   `1b`. The driver checks that the label really is on an auipc with
-   `%pcrel_hi`. Reject a modifier in the wrong place (`addi` with `%hi`, `lui`
-   with `%lo`, `auipc` with `%hi`, any modifier on a branch, jump or shift
-   amount) and a label where only a constant fits (`li a0, sym`).
-10. **Xcal** (not in the golden file because llvm-mc doesn't know them; spec
-    section 9): `xcal.dbg rs1` = custom-0 funct3 0, `xcal.halt rs1` = funct3 1.
-    For hello.S, see the `.insn` note above.
+Pseudo-instructions, as in the RISC-V Assembly Programmer's Manual and LLVM:
 
-## Regenerating the golden files
+| Pseudo | Expands to |
+|---|---|
+| `nop` | `addi zero, zero, 0` |
+| `li rd, imm` | see below |
+| `mv`, `not`, `neg`, `seqz`, `snez`, `sltz`, `sgtz`, `zext.b` | `addi rd, rs, 0`, `xori rd, rs, -1`, `sub rd, zero, rs`, `sltiu rd, rs, 1`, `sltu rd, zero, rs`, `slt rd, rs, zero`, `slt rd, zero, rs`, `andi rd, rs, 255` |
+| `beqz bnez bltz bgez` / `blez bgtz` | the branch with `zero` as rs2 / as rs1 |
+| `bgt ble bgtu bleu a, b, t` | `blt bge bltu bgeu b, a, t` (operands swapped) |
+| `j t`, `jal t` | `jal zero, t`, `jal ra, t` |
+| `jr rs`, `jalr rs`, `ret` | `jalr zero, 0(rs)`, `jalr ra, 0(rs)`, `jalr zero, 0(ra)` |
+| `la rd, sym`, `lla rd, sym` | `auipc rd, %pcrel_hi(sym)` + `addi rd, rd, %pcrel_lo(.)` |
+| `lw rd, sym` (any load) | `auipc rd, %pcrel_hi(sym)` + `lw rd, %pcrel_lo(.)(rd)` |
+| `sw rs, sym, rt` (any store) | `auipc rt, %pcrel_hi(sym)` + `sw rs, %pcrel_lo(.)(rt)` |
+| `call sym` / `tail sym` | `auipc ra/t1, 0` + `jalr ra/zero, 0(ra/t1)`, one `R_RISCV_CALL_PLT` on the auipc |
+| `csrr rd, c` | `csrrs rd, c, zero` |
+| `csrw csrs csrc c, rs` | `csrrw csrrs csrrc zero, c, rs` (with an immediate: the `i` form) |
+| `csrwi csrsi csrci c, imm` | `csrrwi csrrsi csrrci zero, c, imm` |
+| `rdcycle rdtime rdinstret` (and `h`) | `csrrs rd, cycle/time/instret, zero` |
+| `unimp` | `csrrw zero, cycle, zero` |
 
-Add lines to `tests/golden/encode.s` and run `scripts/gen-encode-golden.sh`
-(needs llvm-mc, llvm-objcopy and llvm-readelf from any LLVM install, plus bash,
-for example Git Bash on Windows). Addends in the relocation column are hex, as
-llvm-readelf prints them.
+`%pcrel_lo(.)` above stands for the hidden `.Lpcrel_hiN` label the driver puts
+on the `auipc` (`Target::Auipc(0)`), as the psABI requires.
 
-`tests/golden/hello.ref` comes from `scripts/gen-hello-ref.sh` (clang and
-llvm-objdump). Rerun it whenever `examples/hello/hello.S` changes.
+### `li`
+
+`li rd, value` takes a 32-bit constant (signed or unsigned) and picks the same
+sequence as LLVM, which the golden file comes from:
+
+1. fits in 12 signed bits: `addi rd, zero, value`;
+2. low 12 bits zero: `lui rd, value >> 12`;
+3. even and `c << s` with `c` in -32..=31: `addi rd, zero, c` + `slli rd, rd, s`
+   (LLVM prefers it because with the C extension both halves compress;
+   `li a0, 2048` is `addi a0, zero, 1; slli a0, a0, 11`);
+4. otherwise `lui rd, hi` + `addi rd, rd, lo`, split by `hi_lo()`.
+
+### Relocation modifiers
+
+| Operand | Allowed in | Relocation |
+|---|---|---|
+| `%hi(sym)` | `lui` | `R_RISCV_HI20` |
+| `%lo(sym)` | I-type immediates (`addi`..., loads, `jalr`) / stores | `R_RISCV_LO12_I` / `_S` |
+| `%pcrel_hi(sym)` | `auipc` | `R_RISCV_PCREL_HI20` |
+| `%pcrel_lo(label)` | I-type immediates / stores; `label` is on the `auipc` | `R_RISCV_PCREL_LO12_I` / `_S` |
+| a label | branches, `jal`, `j`, `la`, `call`, ... | `R_RISCV_BRANCH`, `R_RISCV_JAL`, ... |
+
+`%hi`/`%lo` of a plain number are computed on the spot. A modifier anywhere
+else (on a branch, a shift amount, `%hi` in an `addi`, `%pcrel_hi` in a `lui`)
+and a label where only a number fits (`li a0, sym`) are errors.
+
+### `.insn`
+
+For encodings without a mnemonic. hello.S writes the Xcal instructions as
+`.insn i 0x0b, 0, x0, a0, 0` so that clang can build it too. The parser turns
+`.insn i ...` into the mnemonic `.insn i`. Same forms and encodings as LLVM:
+
+```
+.insn r opcode, funct3, funct7, rd, rs1, rs2
+.insn i opcode, funct3, rd, rs1, simm12      .insn i opcode, funct3, rd, simm12(rs1)
+.insn s opcode, funct3, rs2, simm12(rs1)
+.insn b opcode, funct3, rs1, rs2, offset
+.insn u opcode, rd, imm20
+.insn value                                  .insn 4, value
+```
+
+`.insn j` is not supported: LLVM 21 packs its numeric offset without the
+J-type scrambling, and matching that would be matching a bug.
+
+## Errors
+
+Everything is range checked and reported on the instruction's line:
+immediates (`immediate 2048 out of range (-2048..=2047)`), shift amounts,
+even branch/jump offsets, CSR numbers and 5-bit CSR immediates, `.insn`
+fields, operand kinds (`expected a register, found an immediate`), operand
+counts (`usage: add rd, rs1, rs2`) and unknown mnemonics
+(`unknown instruction 'mulw'`). The CLI prints `file:line: error: message`.
+
+## After the last line: resolving local labels
+
+Like clang with `-mno-relax`, `asm.rs` resolves pc-relative references to
+labels that are local (not `.globl`) and defined in the same section as the
+instruction, once the whole file is read: the distance can't change at link
+time. That covers branches, `jal`/`j`, `call`/`tail` (both words of the pair)
+and `auipc` + `%pcrel_lo` pairs (`la`, `lw rd, sym`, `sw rs, sym, rt`, explicit
+`%pcrel_hi`/`%pcrel_lo`, whose low half gets the low 12 bits of its own
+auipc's distance). The immediate is patched with the same `x_imm` functions
+and no relocation is written; an out-of-range branch or jump is an error on
+its line. Everything else stays a relocation: global or undefined symbols, labels in other sections, and absolute references (`%hi`, `%lo`,
+`.word sym`).
+
+`.L` labels (numeric labels like `1:` and the hidden `.Lpcrel_hiN`) go into
+the symbol table only when a relocation still uses them, and the object
+carries the same `.riscv.attributes` as clang's
+(`rv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0`), so llvm-objdump decodes the M
+instructions without extra flags.
+
+For `examples/hello/hello.S` and `examples/muldiv/muldiv.S`, `llvm-objdump -dr`
+prints exactly the same text for our object as for clang's. The differences
+that remain on other input (spec section 10):
+
+- clang rewrites a branch it can't resolve or reach (to a global, an
+  undefined symbol, another section, or too far) into an inverted branch over
+  a `jal`. merlin-as keeps it one instruction with `R_RISCV_BRANCH`, or
+  reports it out of range.
+- A numeric label a relocation refers to is called `.L1$0` (`1:`, first
+  definition) where clang says `.Ltmp0`.
+- No `$x`/`$d` mapping symbols in the symbol table.
+
+## Tests
+
+```
+cargo test -p merlin-as
+```
+
+- `encode_golden`: 118 lines assembled by llvm-mc (`tests/golden/encode.s` →
+  `encode.golden`: RV32I, M, CSRs, pseudo-instructions, relocations). Words and
+  relocations must be identical.
+- `encode_roundtrip`: `excalibur::decode` of our words gives back the
+  operation and operands of a hand-written table (Xcal, CSRs by name, `li`
+  splits, explicit `%pcrel` pairs, and the relocation on each word);
+  every llvm-mc word, disassembled by `excalibur`, assembles back to itself;
+  and so does every decodable word of a 400 000-word pseudo-random sample.
+- `encode_errors`: bad lines are rejected on their own line, with the
+  wording checked for unknown mnemonics and out-of-range local branches.
+- `encode_hello`: hello.S against clang's object (`tests/golden/hello.ref`,
+  `tests/golden/hello.dr.txt`), word for word and as `llvm-objdump -dr` text
+  (printed by merlin-objdump).
+- Unit tests in `encode.rs` (packers against the decoder, `hi_lo`, `li`),
+  `asm.rs` (local resolution, against words from clang) and `elf.rs`.
+
+Elsewhere: `crates/merlin-ld/tests/merlin_as_programs.rs` builds
+`examples/muldiv/muldiv.S` with merlin-as and merlin-ld and runs it in Grail;
+`crates/xtask/tests/hello.rs` runs the committed merlin-as + ld.lld build of
+hello (`tests/golden/hello.elf`) in Grail and, when LLVM is installed,
+rebuilds it and compares `llvm-objdump -dr` with clang's;
+`crates/xtask/tests/kernel.rs` boots the kernel with `kernel/entry.s`
+assembled by merlin-as.
+
+### Regenerating the references
+
+- `tests/golden/encode.golden`: add lines to `encode.s` and run
+  `scripts/gen-encode-golden.sh` (llvm-mc, llvm-objcopy, llvm-readelf, bash).
+- `tests/golden/hello.ref` and `hello.dr.txt`: `scripts/gen-hello-ref.sh`
+  (clang and llvm-objdump 21). Rerun when `examples/hello/hello.S` changes.
+- `tests/golden/hello.elf`: `cargo xtask hello` (merlin-as and ld.lld).

@@ -165,24 +165,15 @@ fn kernel_c_stays_freestanding() {
 
 #[test]
 fn kernel_asm_is_merlin_dialect() {
-    // The .s files must use only what merlin-as understands. Until its encoder
-    // is complete, "not implemented yet" is the only acceptable error.
+    // The .s files must use only what merlin-as understands.
     let sources = kernel::sources(&kernel_dir()).unwrap();
     let asm: Vec<_> = sources.iter().filter(|s| s.lang == Lang::Asm).collect();
     assert!(!asm.is_empty());
     for s in asm {
         let text = std::fs::read_to_string(kernel_dir().join(&s.name)).unwrap();
         if let Err(errs) = merlin_as::assemble(&text) {
-            let other: Vec<String> = errs
-                .iter()
-                .filter(|e| !e.msg.starts_with(merlin_as::encode::UNIMPLEMENTED))
-                .map(|e| format!("{}: {e}", s.name))
-                .collect();
-            assert!(
-                other.is_empty(),
-                "merlin-as rejects kernel assembly:\n{}",
-                other.join("\n")
-            );
+            let errs: Vec<String> = errs.iter().map(|e| format!("{}: {e}", s.name)).collect();
+            panic!("merlin-as rejects kernel assembly:\n{}", errs.join("\n"));
         }
     }
 }
@@ -254,17 +245,10 @@ fn clang_build_boots_and_matches_committed() {
 #[test]
 fn merlin_as_build_boots() {
     // Bootstrapping step 1 (spec section 10): kernel .s files assembled by
-    // merlin-as, C by clang, linked by ld.lld. Runs once the encoder handles
-    // everything entry.s uses.
+    // merlin-as, C by clang, linked by ld.lld.
     let Some((clang, lld)) = llvm() else {
         eprintln!("skipped: clang/ld.lld not found");
         return;
     };
-    match fresh_build(clang, lld, Assembler::Merlin, "merlin") {
-        Ok(elf) => assert_boots(&elf),
-        Err(e) if e.contains(merlin_as::encode::UNIMPLEMENTED) => {
-            eprintln!("skipped: merlin-as encoder incomplete");
-        }
-        Err(e) => panic!("{e}"),
-    }
+    assert_boots(&fresh_build(clang, lld, Assembler::Merlin, "merlin").unwrap());
 }

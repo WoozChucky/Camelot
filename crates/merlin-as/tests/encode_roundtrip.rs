@@ -13,16 +13,8 @@
 //!   assemble back to exactly that word. Proves the disassembler's syntax
 //!   reassembles, and catches bits `decode` ignores, like fence's pred/succ.
 //!   Words patched by a relocation are left out: their fields are zero.
-//!
-//! Same progress rules as `encode_golden`: mnemonics that still return
-//! "not implemented yet" are counted, not failed. The `_complete` variants
-//! (ignored by default) require everything:
-//!
-//!     cargo test -p merlin-as --test encode_roundtrip -- --nocapture
-//!     cargo test -p merlin-as --test encode_roundtrip -- --ignored
 
 use excalibur::{decode, AluOp, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, StoreOp};
-use merlin_as::encode::UNIMPLEMENTED;
 use merlin_as::reloc::RelocKind;
 
 /// One word of `.text` and the relocation that will patch it, if any.
@@ -48,20 +40,9 @@ enum To {
     Auipc(u32),
 }
 
-enum Assembled {
-    Words(Vec<Word>),
-    Unimplemented,
-    Error(String),
-}
-
-fn assemble(src: &str) -> Assembled {
-    let obj = match merlin_as::assemble(src) {
-        Ok(o) => o,
-        Err(errs) if errs.iter().all(|e| e.msg.starts_with(UNIMPLEMENTED)) => {
-            return Assembled::Unimplemented
-        }
-        Err(errs) => return Assembled::Error(errs[0].to_string()),
-    };
+/// The words of `.text`, or the first error.
+fn assemble(src: &str) -> Result<Vec<Word>, String> {
+    let obj = merlin_as::assemble(src).map_err(|errs| errs[0].to_string())?;
     let text = &obj.sections[0];
     let reloc_at = |offset: u32| {
         let r = text.relocs.iter().find(|r| r.offset == offset)?;
@@ -82,15 +63,13 @@ fn assemble(src: &str) -> Assembled {
             reloc: reloc_at(4 * i as u32),
         })
         .collect();
-    Assembled::Words(words)
+    Ok(words)
 }
 
-/// Collects outcomes and prints the same kind of report as `encode_golden`.
+/// Collects failures and reports them all at once.
 struct Report {
     name: &'static str,
     total: usize,
-    pass: usize,
-    todo: Vec<String>,
     fails: Vec<String>,
 }
 
@@ -99,44 +78,19 @@ impl Report {
         Report {
             name,
             total: 0,
-            pass: 0,
-            todo: Vec::new(),
             fails: Vec::new(),
         }
     }
 
-    fn finish(self, require_all: bool) {
-        println!(
-            "{}: {}/{} pass, {} not implemented yet",
-            self.name,
-            self.pass,
-            self.total,
-            self.todo.len()
-        );
-        if !self.todo.is_empty() {
-            let mut m: Vec<&str> = self
-                .todo
-                .iter()
-                .map(|s| s.split_whitespace().next().unwrap_or(""))
-                .collect();
-            m.sort();
-            m.dedup();
-            println!("still to do: {}", m.join(" "));
-        }
+    fn finish(self) {
         assert!(
             self.fails.is_empty(),
-            "{}: {} failures:\n{}",
+            "{}: {} of {} failed:\n{}",
             self.name,
             self.fails.len(),
+            self.total,
             self.fails.join("\n")
         );
-        if require_all {
-            assert!(
-                self.todo.is_empty(),
-                "{} lines not implemented yet",
-                self.todo.len()
-            );
-        }
     }
 }
 
@@ -817,20 +771,16 @@ fn every_expected_reloc_row_is_in_the_table() {
     }
 }
 
-fn run_expected(require_all: bool) {
+#[test]
+fn roundtrip_expected() {
     let mut rep = Report::new("decode(encode(x)) == x");
     let relocs = expected_relocs();
     for (src, want) in expected() {
         rep.total += 1;
         let shown = src.replace('\n', "; ");
         let words = match assemble(src) {
-            Assembled::Words(w) => w,
-            Assembled::Unimplemented => {
-                // Report the mnemonic of the last line (the one under test).
-                rep.todo.push(src.lines().last().unwrap_or(src).to_string());
-                continue;
-            }
-            Assembled::Error(e) => {
+            Ok(w) => w,
+            Err(e) => {
                 rep.fails.push(format!("  {shown:<34} error: {e}"));
                 continue;
             }
@@ -853,12 +803,11 @@ fn run_expected(require_all: bool) {
             let got = w.reloc.as_ref().map(|r| (r.kind, &r.to));
             (got != want).then(|| format!("word {n}: relocation {got:?}, want {want:?}"))
         });
-        match mismatch {
-            None => rep.pass += 1,
-            Some(why) => rep.fails.push(format!("  {shown:<34} {why}")),
+        if let Some(why) = mismatch {
+            rep.fails.push(format!("  {shown:<34} {why}"));
         }
     }
-    rep.finish(require_all);
+    rep.finish();
 }
 
 // ----- decode → disassemble → assemble again -----
@@ -890,7 +839,25 @@ fn golden_words() -> Vec<(&'static str, Vec<u32>)> {
         .collect()
 }
 
-fn run_disasm(require_all: bool) {
+/// Re-assembles the plain disassembly of `w`. Err: why it doesn't round-trip.
+fn reassemble(w: u32) -> Result<u32, String> {
+    // `{inst}` is the disassembler's syntax, which merlin-as accepts.
+    let text = decode(w).to_string();
+    match assemble(&text) {
+        Ok(again) if again.len() == 1 => Ok(again[0].word),
+        Ok(again) => {
+            let again: Vec<String> = again.iter().map(|w| format!("{:08x}", w.word)).collect();
+            Err(format!(
+                "{w:08x} disassembles to '{text}', which assembles to [{}]",
+                again.join(" ")
+            ))
+        }
+        Err(e) => Err(format!("{w:08x} disassembles to '{text}': {e}")),
+    }
+}
+
+#[test]
+fn roundtrip_disasm() {
     let mut rep = Report::new("encode(disasm(decode(w))) == w");
     // Not in the golden file. Words from clang (Xcal written as `.insn i 0x0b, ...`).
     let extra = [
@@ -898,63 +865,67 @@ fn run_disasm(require_all: bool) {
         ("xcal.halt zero", vec![0x0000_100b]),
         ("csrrw a0, satp, a0", vec![0x1805_1573]),
         ("csrrs a0, 0x7c0, zero", vec![0x7c00_2573]),
+        ("fence rw, w", vec![0x0310_000f]),
+        ("fence.tso", vec![0x8330_000f]),
+        ("unimp", vec![0xc000_1073]),
     ];
     for (src, words) in golden_words().into_iter().chain(extra) {
         rep.total += 1;
-        let mut outcome = Ok(());
+        // Words are compared, not decoded `Inst`s: `decode` ignores some bits
+        // (fence's pred/succ, for one) that must still come out right.
         for w in words {
-            // `{inst}` is the disassembler's syntax, which merlin-as accepts.
-            // Words are compared, not decoded `Inst`s: `decode` ignores some
-            // bits (fence's pred/succ, for one) that must still come out right.
-            let text = decode(w).to_string();
-            match assemble(&text) {
-                Assembled::Words(again) if again.len() == 1 && again[0].word == w => {}
-                Assembled::Words(again) => {
-                    let again: Vec<String> = again.iter().map(|w| format!("{:08x}", w.word)).collect();
-                    outcome = Err(Some(format!(
-                        "{w:08x} disassembles to '{text}', which assembles to [{}]",
-                        again.join(" ")
-                    )));
+            match reassemble(w) {
+                Ok(again) if again == w => {}
+                Ok(again) => {
+                    rep.fails
+                        .push(format!("  {src:<28} {w:08x} assembles back to {again:08x}"));
                     break;
                 }
-                // The disassembly uses a mnemonic not written yet.
-                Assembled::Unimplemented => {
-                    outcome = Err(None);
-                    break;
-                }
-                Assembled::Error(e) => {
-                    outcome = Err(Some(format!("{w:08x} disassembles to '{text}': {e}")));
+                Err(why) => {
+                    rep.fails.push(format!("  {src:<28} {why}"));
                     break;
                 }
             }
         }
-        match outcome {
-            Ok(()) => rep.pass += 1,
-            Err(None) => rep.todo.push(src.to_string()),
-            Err(Some(why)) => rep.fails.push(format!("  {src:<28} {why}")),
+    }
+    rep.finish();
+}
+
+/// The same round trip on a large pseudo-random sample of instruction words:
+/// every word the decoder accepts must disassemble to text that assembles to
+/// an instruction decoding the same way, and to the very same word unless it
+/// is a fence (whose reserved fields the decoder ignores).
+#[test]
+fn roundtrip_random_words() {
+    let mut rep = Report::new("random words");
+    let mut x: u32 = 0x1234_5678;
+    let mut valid = 0;
+    for _ in 0..400_000 {
+        // xorshift32
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        // Force a 32-bit instruction, and pick the major opcode from the low
+        // bits so every format gets a fair share.
+        let w = x | 3;
+        let inst = decode(w);
+        if matches!(inst, Inst::Illegal(_)) {
+            continue;
+        }
+        valid += 1;
+        rep.total += 1;
+        match reassemble(w) {
+            Ok(again) if again == w => {}
+            Ok(again) if w & 0x7f == 0b0001111 && decode(again) == inst => {}
+            Ok(again) => rep
+                .fails
+                .push(format!("  {w:08x} ({inst}) assembles back to {again:08x}")),
+            Err(why) => rep.fails.push(format!("  {why}")),
+        }
+        if rep.fails.len() > 20 {
+            break;
         }
     }
-    rep.finish(require_all);
-}
-
-#[test]
-fn roundtrip_expected_progress() {
-    run_expected(false);
-}
-
-#[test]
-#[ignore = "passes once the encoder is complete"]
-fn roundtrip_expected_complete() {
-    run_expected(true);
-}
-
-#[test]
-fn roundtrip_disasm_progress() {
-    run_disasm(false);
-}
-
-#[test]
-#[ignore = "passes once the encoder is complete"]
-fn roundtrip_disasm_complete() {
-    run_disasm(true);
+    assert!(valid > 20_000, "only {valid} valid words in the sample");
+    rep.finish();
 }

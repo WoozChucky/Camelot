@@ -1,15 +1,36 @@
 //! The assembler driver: walks statements, keeps sections and symbols, runs
 //! directives, and asks the encoder for instruction bytes.
 //!
-//! It is single pass. Every reference to a label becomes a relocation (the
-//! linker resolves them, even within one section), so no instruction's size
-//! ever depends on a label's address. `.equ`/`.set` constants must be defined
-//! before use.
+//! It is single pass: no instruction's size ever depends on a label's address,
+//! so every label reference is first recorded as a fixup (a would-be
+//! relocation, with its source line) and the immediate is left zero.
+//! `.equ`/`.set` constants must be defined before use.
+//!
+//! When the whole file has been read, `Assembler::finish` does what clang's
+//! assembler does with `-mno-relax`: a pc-relative fixup whose label is local
+//! (not `.globl`) and defined in the same section as the instruction is
+//! resolved on the spot, since the distance can't change at link time. That
+//! covers branches (`R_RISCV_BRANCH`), `jal`/`j` (`R_RISCV_JAL`), `call`/`tail`
+//! (`R_RISCV_CALL_PLT`, both words of the pair) and `auipc` + `%pcrel_lo`
+//! pairs (`la`, `lla`, `lw rd, sym`, `sw rs, sym, rt`, explicit
+//! `%pcrel_hi`/`%pcrel_lo`); the immediate is patched and no relocation is
+//! written. An out-of-range result is an error on the instruction's line.
+//! Everything else stays a relocation for the linker: references to global or
+//! undefined symbols or to labels in other sections, and absolute ones
+//! (`%hi`, `%lo`, `.word sym`), which depend on where the section is loaded.
+//!
+//! Unlike clang, merlin-as never rewrites a branch it cannot resolve (to a
+//! global, or out of range) into an inverted branch over a `jal`: the branch
+//! keeps its `R_RISCV_BRANCH`, or is an error when out of range (spec section 10).
+//!
+//! Also as in clang, `.L` labels (including numeric labels like `1:` and the
+//! hidden `.Lpcrel_hi` labels on `auipc`s) only go into the symbol table when
+//! a relocation still refers to them.
 
 use crate::ast::*;
 use crate::reloc::{Emit, RelocKind, Target};
 use crate::{encode, Error};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SectionKind {
@@ -40,6 +61,8 @@ pub struct Reloc {
     pub kind: RelocKind,
     pub symbol: String,
     pub addend: i64,
+    /// Source line of the instruction or directive, for errors found later.
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,14 +195,136 @@ impl Assembler {
                     .push(Error::new(0, format!("undefined local label '{shown}'")));
             }
         }
+        self.resolve_local_fixups();
         if !self.errors.is_empty() {
             self.errors.sort_by_key(|e| e.line);
             return Err(self.errors);
         }
+        // `.L` labels are assembler-internal: keep only those a relocation needs.
+        let referenced: HashSet<&str> = self
+            .sections
+            .iter()
+            .flat_map(|s| &s.relocs)
+            .map(|r| r.symbol.as_str())
+            .collect();
+        let symbols = self
+            .symbols
+            .iter()
+            .filter(|s| !s.name.starts_with(".L") || referenced.contains(s.name.as_str()))
+            .cloned()
+            .collect();
         Ok(Object {
             sections: self.sections,
-            symbols: self.symbols,
+            symbols,
         })
+    }
+
+    /// The pc-relative distance from `offset` in `section` to a fixup's
+    /// target, if the target is a local label defined in that same section
+    /// (the case clang resolves at assembly time).
+    fn local_distance(&self, section: usize, offset: u32, symbol: &str, addend: i64) -> Option<i64> {
+        let s = &self.symbols[*self.by_name.get(symbol)?];
+        let local = s.defined && !s.global && s.constant.is_none() && s.section == Some(section);
+        local.then(|| s.value as i64 + addend - offset as i64)
+    }
+
+    /// Resolves the fixups clang resolves with `-mno-relax` (see the module
+    /// docs) and removes their relocations.
+    ///
+    /// Two passes, because the low half of a pc-relative pair does not name
+    /// the symbol: its relocation points at the label on its `auipc`. So the
+    /// first pass resolves branches, jumps, calls and `auipc`s, remembering the
+    /// distance each resolved `auipc` got; the second gives each `%pcrel_lo`
+    /// the low 12 bits of its own `auipc`'s distance.
+    fn resolve_local_fixups(&mut self) {
+        use RelocKind::*;
+        // (section, offset of a resolved auipc) -> distance from it to its target.
+        let mut auipc_distance: HashMap<(usize, u32), i64> = HashMap::new();
+        for sec in 0..self.sections.len() {
+            let relocs = std::mem::take(&mut self.sections[sec].relocs);
+            let mut kept = Vec::new();
+            for r in relocs {
+                let distance = match r.kind {
+                    Branch | Jal | CallPlt | PcrelHi20 => {
+                        self.local_distance(sec, r.offset, &r.symbol, r.addend)
+                    }
+                    _ => None,
+                };
+                let Some(distance) = distance else {
+                    kept.push(r);
+                    continue;
+                };
+                if r.kind == PcrelHi20 {
+                    auipc_distance.insert((sec, r.offset), distance);
+                }
+                if let Err(msg) = self.patch(sec, r.offset, r.kind, distance) {
+                    let shown = shown_name(&r.symbol);
+                    self.errors.push(Error::new(r.line, format!("'{shown}': {msg}")));
+                }
+            }
+            self.sections[sec].relocs = kept;
+        }
+        for sec in 0..self.sections.len() {
+            let relocs = std::mem::take(&mut self.sections[sec].relocs);
+            let mut kept = Vec::new();
+            for r in relocs {
+                // The label of a %pcrel_lo is on its auipc, in this section
+                // (check_pcrel_lo made sure of that).
+                let auipc = match r.kind {
+                    PcrelLo12I | PcrelLo12S => self
+                        .by_name
+                        .get(&r.symbol)
+                        .map(|&i| &self.symbols[i])
+                        .filter(|s| s.defined && s.section == Some(sec))
+                        .map(|s| s.value),
+                    _ => None,
+                };
+                match auipc.and_then(|a| auipc_distance.get(&(sec, a))) {
+                    Some(&distance) => {
+                        // Can't fail: the distance fit in its auipc.
+                        let _ = self.patch(sec, r.offset, r.kind, distance);
+                    }
+                    None => kept.push(r),
+                }
+            }
+            self.sections[sec].relocs = kept;
+        }
+    }
+
+    /// Writes a resolved pc-relative `distance` into the instruction(s) at
+    /// `offset`, as the linker would for a relocation of this kind. The
+    /// encoder left those immediate bits zero, so they are simply OR-ed in.
+    fn patch(&mut self, section: usize, offset: u32, kind: RelocKind, distance: i64) -> Result<(), String> {
+        use RelocKind::*;
+        let (bits, next) = match kind {
+            Branch => {
+                check_jump(distance, 13, "branch")?;
+                (encode::b_imm(distance as i32), None)
+            }
+            Jal => {
+                check_jump(distance, 21, "jump")?;
+                (encode::j_imm(distance as i32), None)
+            }
+            // A distance within a section always fits auipc's ±2 GiB reach.
+            PcrelHi20 => (encode::u_imm(encode::hi_lo(distance as i32).0), None),
+            PcrelLo12I => (encode::i_imm(encode::hi_lo(distance as i32).1), None),
+            PcrelLo12S => (encode::s_imm(encode::hi_lo(distance as i32).1), None),
+            // auipc + jalr: the jalr's 12 bits complete the auipc's 20.
+            CallPlt => {
+                let (hi, lo) = encode::hi_lo(distance as i32);
+                (encode::u_imm(hi), Some(encode::i_imm(lo)))
+            }
+            Abs32 | Hi20 | Lo12I | Lo12S => unreachable!("absolute relocations are never resolved"),
+        };
+        let data = &mut self.sections[section].data;
+        let at = offset as usize;
+        for (at, bits) in [(at, Some(bits)), (at + 4, next)] {
+            if let Some(bits) = bits {
+                let w = u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) | bits;
+                data[at..at + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        }
+        Ok(())
     }
 
     /// The low half of an explicit pc-relative pair (`addi a0, a0, %pcrel_lo(1b)`)
@@ -350,6 +495,7 @@ impl Assembler {
             kind,
             symbol,
             addend,
+            line: self.line,
         });
     }
 
@@ -583,6 +729,22 @@ impl Default for Assembler {
     }
 }
 
+/// A branch (`bits` = 13) or `jal` (21) distance: even and in range.
+fn check_jump(distance: i64, bits: u32, what: &str) -> Result<(), String> {
+    let half = 1i64 << (bits - 1);
+    if !(-half..half).contains(&distance) {
+        return Err(format!(
+            "{what} target out of range: {distance:+} bytes (limit {}..=+{})",
+            -half,
+            half - 2
+        ));
+    }
+    if distance % 2 != 0 {
+        return Err(format!("{what} target at an odd distance ({distance:+} bytes)"));
+    }
+    Ok(())
+}
+
 /// How a label is named in errors: `.L1$0` (the internal name of the numeric
 /// label `1:`) → `1`, `.Lfoo` → `foo`, other names unchanged.
 fn shown_name(name: &str) -> &str {
@@ -671,5 +833,150 @@ mod tests {
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].line, 2);
         assert!(errs[0].msg.contains("%pcrel_lo(1)"), "{}", errs[0].msg);
+    }
+
+    // ----- same-section label resolution (compare clang -mno-relax) -----
+
+    /// `.text` of `src` as (word, relocation "KIND symbol+addend" or "").
+    fn text(src: &str) -> Vec<(u32, String)> {
+        let obj = crate::assemble(src).unwrap();
+        let sec = &obj.sections[0];
+        sec.data
+            .chunks(4)
+            .enumerate()
+            .map(|(i, c)| {
+                let off = 4 * i as u32;
+                let r = sec.relocs.iter().find(|r| r.offset == off);
+                let r = r.map_or(String::new(), |r| {
+                    format!("{} {}+{}", r.kind.name(), r.symbol, r.addend)
+                });
+                (u32::from_le_bytes(c.try_into().unwrap()), r)
+            })
+            .collect()
+    }
+
+    fn words(src: &str) -> Vec<u32> {
+        text(src).into_iter().map(|(w, _)| w).collect()
+    }
+
+    #[test]
+    fn local_labels_in_the_same_section_are_resolved() {
+        // Words from clang -mno-relax for the same source (llvm-objdump -d).
+        let src = "
+back:   nop
+        beq  a0, a1, back
+        beq  a0, a1, fwd
+        bnez a0, 1f
+        jal  back
+        j    fwd
+        call back
+        tail fwd
+1:      nop
+fwd:    nop
+";
+        assert_eq!(
+            text(src),
+            [
+                (0x0000_0013, ""),
+                (0xfeb5_0ee3, ""), // beq a0, a1, back (-4)
+                (0x02b5_0263, ""), // beq a0, a1, fwd (+36)
+                (0x0005_1e63, ""), // bnez a0, 1f (+28)
+                (0xff1f_f0ef, ""), // jal back (-16)
+                (0x0180_006f, ""), // j fwd (+24)
+                (0x0000_0097, ""), // auipc ra, 0
+                (0xfe80_80e7, ""), // jalr -24(ra)
+                (0x0000_0317, ""), // auipc t1, 0
+                (0x00c3_0067, ""), // jr 12(t1)
+                (0x0000_0013, ""),
+                (0x0000_0013, ""),
+            ]
+            .map(|(w, r)| (w, r.to_string()))
+        );
+    }
+
+    #[test]
+    fn pcrel_pairs_to_local_labels_are_resolved() {
+        // la, a load and a store to `data`, then an explicit pair with an
+        // addend, all resolved; the hidden .Lpcrel_hi labels disappear.
+        let src = "
+        la   a0, data
+        lw   a1, data
+        sw   a1, data, t0
+2:      auipc a2, %pcrel_hi(data + 4)
+        lw   a3, %pcrel_lo(2b)(a2)
+data:   .word 0
+";
+        assert_eq!(
+            words(src),
+            [
+                0x0000_0517, // auipc a0, 0
+                0x0205_0513, // addi a0, a0, 32
+                0x0000_0597, // auipc a1, 0
+                0x0185_a583, // lw a1, 24(a1)
+                0x0000_0297, // auipc t0, 0
+                0x00b2_a823, // sw a1, 16(t0)
+                0x0000_0617, // auipc a2, 0
+                0x00c6_2683, // lw a3, 12(a2)
+                0,
+            ]
+        );
+        let obj = crate::assemble(src).unwrap();
+        assert!(obj.sections[0].relocs.is_empty());
+        assert!(obj.symbols.iter().all(|s| !s.name.starts_with(".L")));
+    }
+
+    #[test]
+    fn far_pcrel_pairs_round_the_upper_part() {
+        // `la` 0x1800 bytes ahead: the low 12 bits are 0x800, so lo12 is
+        // -2048 and hi20 rounds up to 2. The call is 0x17f8 ahead: no rounding.
+        let src = "    la a0, data\n    call far\n    .space 0x17f0\ndata:\nfar:\n";
+        assert_eq!(
+            words(src)[..4],
+            [
+                0x0000_2517, // auipc a0, 2
+                0x8005_0513, // addi a0, a0, -2048
+                0x0000_1097, // auipc ra, 1
+                0x7f80_80e7, // jalr 2040(ra)
+            ]
+        );
+    }
+
+    #[test]
+    fn other_references_stay_relocations() {
+        let src = "
+        .globl gfn
+gfn:    nop
+        beq  a0, a1, gfn
+        jal  later_global
+        call ext
+        la   a0, other
+        lui  a0, %hi(local)
+        .globl later_global
+later_global:
+local:  nop
+        .section .text.other
+other:  j local
+";
+        let got: Vec<String> = text(src).into_iter().map(|(_, r)| r).collect();
+        assert_eq!(
+            got,
+            [
+                "",
+                "R_RISCV_BRANCH gfn+0",
+                "R_RISCV_JAL later_global+0",
+                "R_RISCV_CALL_PLT ext+0",
+                "",
+                "R_RISCV_PCREL_HI20 other+0",
+                "R_RISCV_PCREL_LO12_I .Lpcrel_hi0+0",
+                "R_RISCV_HI20 local+0",
+                "",
+            ]
+        );
+        // Referenced by a relocation, so the hidden label stays in the symbol table.
+        let obj = crate::assemble(src).unwrap();
+        assert!(obj.symbols.iter().any(|s| s.name == ".Lpcrel_hi0"));
+        // A label in the other section: a relocation there too.
+        assert_eq!(obj.sections[1].relocs[0].kind, RelocKind::Jal);
+        assert_eq!(obj.sections[1].relocs[0].symbol, "local");
     }
 }
