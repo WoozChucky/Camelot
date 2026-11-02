@@ -876,7 +876,7 @@ fn boot_with_ram(ram_mib: usize, extra_devices: &[DeviceEntry]) -> (Machine, gra
     let elf = grail::elf::parse(&file).unwrap();
     let mut m = Machine::with_ram(ram_mib << 20);
     if !extra_devices.is_empty() {
-        let mut devices = grail::bus::device_table(m.config());
+        let mut devices = m.cpu.bus.sysinfo.devices().to_vec();
         devices.extend_from_slice(extra_devices);
         m.cpu.bus.sysinfo = Sysinfo::new(m.config(), devices);
     }
@@ -1026,10 +1026,10 @@ fn devices_may_share_a_page() {
             ),
             // Straddling the keyboard's page and the sysinfo block's.
             dev(DeviceType::Keyboard, grail::bus::SYSINFO_BASE - 0x80, 0x100),
-            // Straddling two pages nothing else uses (the reserved virtio
-            // range), one of them a page a later entry shares.
-            dev(DeviceType::TestFinisher, 0x1000_1800, 0x1000),
-            dev(DeviceType::TestFinisher, 0x1000_2400, 0x10),
+            // Straddling two pages in a gap of the memory map, the second
+            // of them shared with a later entry.
+            dev(DeviceType::TestFinisher, 0x2000_0800, 0x1000),
+            dev(DeviceType::TestFinisher, 0x2000_1400, 0x10),
         ],
     );
 }
