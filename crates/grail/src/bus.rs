@@ -2,9 +2,10 @@
 
 use crate::block::BlockDevice;
 use crate::config::MachineConfig;
-use crate::devices::{Clint, Plic, TestDevice, Uart, BLK_IRQ, KBD_IRQ, PTR_IRQ, UART_IRQ};
+use crate::devices::{Clint, Plic, TestDevice, Uart, BLK_IRQ, KBD_IRQ, NET_IRQ, PTR_IRQ, UART_IRQ};
 use crate::framebuffer::{Framebuffer, VRAM_SIZE};
 use crate::keyboard::Keyboard;
+use crate::net::NetDevice;
 use crate::pointer::Pointer;
 use crate::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use std::io::Write;
@@ -24,6 +25,13 @@ pub const BLK_SIZE: u32 = 0x1000;
 /// Disks a machine can have: one page each in 0x1000_1000 - 0x1000_8FFF, PLIC sources
 /// `BLK_IRQ` (3) to 10.
 pub const MAX_DISKS: usize = 8;
+/// Network card 0's registers (spec section 9.8), right after the disks' pages; card
+/// `i` is at `NET_BASE + i * NET_SIZE`.
+pub const NET_BASE: u32 = 0x1000_9000;
+pub const NET_SIZE: u32 = 0x1000;
+/// Network cards a machine can have: one page each in 0x1000_9000 - 0x1000_CFFF, PLIC
+/// sources `NET_IRQ` (12) to 15.
+pub const MAX_NETS: usize = 4;
 pub const FB_CTRL_BASE: u32 = 0x3000_0000;
 pub const FB_CTRL_SIZE: u32 = 0x1000;
 pub const KBD_BASE: u32 = 0x3000_1000;
@@ -35,11 +43,18 @@ pub const PTR_SIZE: u32 = 0x1000;
 pub const VRAM_BASE: u32 = 0x3100_0000;
 pub const RAM_BASE: u32 = 0x8000_0000;
 
-/// The devices a machine built from `_config` with `disks` disks has, as the sysinfo
-/// device table lists them: in address order. A new device is one more entry here (plus
-/// its decoding in [`Bus::read`] and [`Bus::write`]); devices that only some machines
-/// have can look at the config.
-pub fn device_table(_config: &MachineConfig, disks: usize) -> Vec<DeviceEntry> {
+/// The devices a machine built from `config` with `disks` disks has, as the sysinfo
+/// device table lists them: in address order. Its network cards are the ones
+/// `config.nets` describes; [`device_table_with`] counts host-made ones too.
+pub fn device_table(config: &MachineConfig, disks: usize) -> Vec<DeviceEntry> {
+    device_table_with(config, disks, config.nets.len())
+}
+
+/// The device table of a machine built from `_config` with `disks` disks and `nets`
+/// network cards. A new device is one more entry here (plus its decoding in
+/// [`Bus::read`] and [`Bus::write`]); devices that only some machines have can look at
+/// the config.
+pub fn device_table_with(_config: &MachineConfig, disks: usize, nets: usize) -> Vec<DeviceEntry> {
     let dev = |kind, base, size, irq| DeviceEntry {
         kind,
         base,
@@ -54,6 +69,9 @@ pub fn device_table(_config: &MachineConfig, disks: usize) -> Vec<DeviceEntry> {
     ];
     table.extend(
         (0..disks as u32).map(|i| dev(DeviceType::Block, BLK_BASE + i * BLK_SIZE, BLK_SIZE, BLK_IRQ + i)),
+    );
+    table.extend(
+        (0..nets as u32).map(|i| dev(DeviceType::Net, NET_BASE + i * NET_SIZE, NET_SIZE, NET_IRQ + i)),
     );
     table.extend([
         dev(DeviceType::FbCtrl, FB_CTRL_BASE, FB_CTRL_SIZE, 0),
@@ -87,6 +105,8 @@ pub struct Bus {
     pub ptr: Pointer,
     /// Disk `i` is at `BLK_BASE + i * BLK_SIZE`, on PLIC source `BLK_IRQ + i`.
     pub disks: Vec<BlockDevice>,
+    /// Network card `i` is at `NET_BASE + i * NET_SIZE`, on PLIC source `NET_IRQ + i`.
+    pub nets: Vec<NetDevice>,
     pub test: TestDevice,
     pub sysinfo: Sysinfo,
     /// Where `xcal.dbg` output goes (the CLI's stderr). `None` drops it. With
@@ -100,10 +120,18 @@ pub struct Bus {
 
 impl Bus {
     /// The bus of a machine built from `config`, which must be valid
-    /// ([`MachineConfig::validate`]), with these disks (at most [`MAX_DISKS`]). The
-    /// disks are not opened from `config.disks` here: [`crate::Machine::new`] does that.
+    /// ([`MachineConfig::validate`]), with these disks (at most [`MAX_DISKS`]) and no
+    /// network cards. The disks are not opened from `config.disks` here:
+    /// [`crate::Machine::new`] does that.
     pub fn new(config: &MachineConfig, disks: Vec<BlockDevice>) -> Self {
+        Bus::with_nets(config, disks, Vec::new())
+    }
+
+    /// [`Bus::new`] with these network cards too (at most [`MAX_NETS`]). They are not
+    /// opened from `config.nets` here: [`crate::Machine::new`] does that.
+    pub fn with_nets(config: &MachineConfig, disks: Vec<BlockDevice>, nets: Vec<NetDevice>) -> Self {
         assert!(disks.len() <= MAX_DISKS, "at most {MAX_DISKS} disks");
+        assert!(nets.len() <= MAX_NETS, "at most {MAX_NETS} network cards");
         Bus {
             ram: vec![0; config.ram_size],
             rom: Vec::new(),
@@ -113,8 +141,9 @@ impl Bus {
             fb: Framebuffer::default(),
             kbd: Keyboard::default(),
             ptr: Pointer::default(),
-            sysinfo: Sysinfo::new(config, device_table(config, disks.len())),
+            sysinfo: Sysinfo::new(config, device_table_with(config, disks.len(), nets.len())),
             disks,
+            nets,
             test: TestDevice,
             debug: None,
             tohost: None,
@@ -135,8 +164,15 @@ impl Bus {
     }
 
     /// Samples every device's interrupt line into the PLIC. Called once per step,
-    /// before the hart looks at `mip`.
-    pub fn update_interrupts(&mut self) {
+    /// before the hart looks at `mip`. Network cards poll their backends from here
+    /// (every [`crate::net::POLL_STEPS`] steps), so received frames land in RAM between
+    /// two instructions; `dma` hears of each RAM range they write (physical address,
+    /// length), for the hart's LR/SC reservation.
+    pub fn update_interrupts(&mut self, dma: &mut dyn FnMut(u32, u32)) {
+        for (i, nic) in self.nets.iter_mut().enumerate() {
+            nic.tick(&mut self.ram, dma);
+            self.plic.set_level(NET_IRQ + i as u32, nic.irq());
+        }
         let uart = self.uart.irq();
         self.plic.set_level(UART_IRQ, uart);
         self.plic.set_level(KBD_IRQ, self.kbd.irq());
@@ -151,6 +187,13 @@ impl Bus {
         let off = addr.wrapping_sub(BLK_BASE);
         let i = (off / BLK_SIZE) as usize;
         (addr >= BLK_BASE && i < self.disks.len()).then_some((i, off % BLK_SIZE))
+    }
+
+    /// The network card whose register page holds `addr`, and the offset in it.
+    fn net_at(&self, addr: u32) -> Option<(usize, u32)> {
+        let off = addr.wrapping_sub(NET_BASE);
+        let i = (off / NET_SIZE) as usize;
+        (addr >= NET_BASE && i < self.nets.len()).then_some((i, off % NET_SIZE))
     }
 
     fn ram_range(&self, addr: u32, size: u32) -> Option<usize> {
@@ -209,6 +252,9 @@ impl Bus {
         if let Some((i, off)) = self.disk_at(addr) {
             return self.disks[i].read(off, size);
         }
+        if let Some((i, off)) = self.net_at(addr) {
+            return self.nets[i].read(off, size);
+        }
         match addr {
             a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => self.clint.read(a - CLINT_BASE, size),
             a if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&a) => self.plic.read(a - PLIC_BASE, size),
@@ -238,6 +284,10 @@ impl Bus {
         if let Some((i, off)) = self.disk_at(addr) {
             // The disk moves data between itself and RAM on its own (DMA).
             return self.disks[i].write(off, size, val, &mut self.ram);
+        }
+        if let Some((i, off)) = self.net_at(addr) {
+            // Transmitting reads the frames from RAM (DMA).
+            return self.nets[i].write(off, size, val, &mut self.ram);
         }
         match addr {
             a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => {
@@ -306,6 +356,7 @@ impl Bus {
 mod tests {
     use super::*;
     use crate::block::{self, MemDisk, SECTOR_SIZE};
+    use crate::net::{Hub, MacAddr, NetBackend};
     use crate::sysinfo::{self, DEV_ENTRY_SIZE, DEV_TABLE};
     use std::sync::{Arc, Mutex};
 
@@ -424,12 +475,97 @@ mod tests {
                 (BLK_BASE + i as u32 * BLK_SIZE, BLK_IRQ + i as u32)
             );
         }
+        // So are network cards.
+        let nets: Vec<_> = table.iter().filter(|d| d.kind == DeviceType::Net).collect();
+        assert_eq!(nets.len(), bus.nets.len());
+        for (i, d) in nets.iter().enumerate() {
+            assert_eq!(
+                (d.base, d.irq),
+                (NET_BASE + i as u32 * NET_SIZE, NET_IRQ + i as u32)
+            );
+        }
         // All the sources are different and exist on the PLIC.
         let mut irqs: Vec<u32> = table.iter().map(|d| d.irq).filter(|&irq| irq != 0).collect();
         irqs.sort();
         irqs.dedup();
-        assert_eq!(irqs.len(), 3 + bus.disks.len());
+        assert_eq!(irqs.len(), 3 + bus.disks.len() + bus.nets.len());
         assert!(irqs.iter().all(|&irq| irq < crate::devices::PLIC_SOURCES));
+    }
+
+    /// A bus with `disks` disks of one sector and `nets` network cards, each on its own
+    /// hub port; card `i` has MAC address `MacAddr::local(i + 1)`.
+    fn bus_with_nets(disks: usize, nets: usize, hub: &Hub) -> Bus {
+        let disks = (0..disks)
+            .map(|_| BlockDevice::new(Box::new(MemDisk::new(1))).unwrap())
+            .collect();
+        let nets = (0..nets)
+            .map(|i| NetDevice::new(MacAddr::local(i as u32 + 1), Box::new(hub.attach())))
+            .collect();
+        Bus::with_nets(&MachineConfig::with_ram(4096), disks, nets)
+    }
+
+    #[test]
+    fn device_table_lists_every_network_card() {
+        let hub = Hub::new();
+        for (disks, nets) in [(0, 1), (2, 1), (0, MAX_NETS), (MAX_DISKS, MAX_NETS)] {
+            let bus = bus_with_nets(disks, nets, &hub);
+            let table = bus.sysinfo.devices();
+            assert_eq!(table, device_table_with(&MachineConfig::default(), disks, nets));
+            assert_eq!(table.len(), 9 + disks + nets);
+            device_table_matches(bus);
+        }
+        // The highest PLIC source in use.
+        assert_eq!(NET_IRQ + MAX_NETS as u32 - 1, 15);
+        // device_table counts the config's cards.
+        let config = MachineConfig {
+            nets: vec![crate::NetConfig::hub(&hub); 2],
+            ..MachineConfig::default()
+        };
+        assert_eq!(device_table(&config, 1), device_table_with(&config, 1, 2));
+    }
+
+    #[test]
+    fn network_card_registers_on_the_bus() {
+        use crate::net::{self, IRQ_TX};
+        let hub = Hub::new();
+        let mut bus = bus_with_nets(0, 2, &hub);
+        let mut peer = hub.attach();
+        let card1 = NET_BASE + NET_SIZE;
+        assert_eq!(bus.read(NET_BASE + net::REG_MAC_LO, 4), Ok(0x0000_ca02));
+        assert_eq!(bus.read(NET_BASE + net::REG_MAC_HI, 4), Ok(0x0100));
+        assert_eq!(bus.read(card1 + net::REG_MAC_HI, 4), Ok(0x0200));
+
+        // Card 1 sends a frame from RAM: a one-descriptor ring at RAM_BASE, the frame
+        // at RAM_BASE + 64.
+        let frame: Vec<u8> = (0..20).collect();
+        bus.ram[64..84].copy_from_slice(&frame);
+        bus.ram[..4].copy_from_slice(&(RAM_BASE + 64).to_le_bytes());
+        bus.ram[4..6].copy_from_slice(&20u16.to_le_bytes());
+        bus.write(card1 + net::REG_TX_BASE, 4, RAM_BASE).unwrap();
+        bus.write(card1 + net::REG_TX_SIZE, 4, 1).unwrap();
+        bus.write(card1 + net::REG_IRQ_ENABLE, 4, IRQ_TX).unwrap();
+        bus.write(card1 + net::REG_TX_TAIL, 4, 1).unwrap();
+        assert_eq!(bus.read(card1 + net::REG_TX_HEAD, 4), Ok(1));
+        assert_eq!(peer.recv(), Some(frame.clone()));
+        // Card 0 is on the same hub, and gets it at its next poll: no ring, so dropped.
+        for _ in 0..net::POLL_STEPS {
+            bus.update_interrupts(&mut |_, _| {});
+        }
+        assert_eq!(bus.read(NET_BASE + net::REG_RX_DROPPED, 4), Ok(1));
+        // Card 1's line reaches the PLIC as source NET_IRQ + 1.
+        assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << (NET_IRQ + 1)));
+
+        // Words only; nothing past the last card; not memory.
+        assert_eq!(bus.read(NET_BASE, 1), Err(BusFault));
+        assert_eq!(bus.write(NET_BASE + net::REG_TX_TAIL, 2, 1), Err(BusFault));
+        assert_eq!(bus.read(NET_BASE + 2 * NET_SIZE, 4), Err(BusFault));
+        assert_eq!(bus.write(NET_BASE + 2 * NET_SIZE, 4, 0), Err(BusFault));
+        assert_eq!(bus.read_mem(NET_BASE, 4), Err(BusFault));
+        // Without cards the range is unmapped, even with every disk.
+        let mut bus = bus_with_nets(MAX_DISKS, 0, &hub);
+        assert_eq!(bus.read(NET_BASE, 4), Err(BusFault));
+        assert_eq!(bus.write(NET_BASE + net::REG_TX_TAIL, 4, 1), Err(BusFault));
+        assert!(bus.read(NET_BASE - 4, 4).is_ok(), "the last disk's page");
     }
 
     /// A bus with `n` disks of one sector each, disk `i` filled with byte `i`.
@@ -477,7 +613,7 @@ mod tests {
         assert_eq!(bus.ram[8 + SECTOR_SIZE], 0);
 
         // Its line reaches the PLIC as source BLK_IRQ + 1.
-        bus.update_interrupts();
+        bus.update_interrupts(&mut |_, _| {});
         assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << (BLK_IRQ + 1)));
 
         // Words only; nothing past the last disk; not memory.
@@ -605,11 +741,11 @@ mod tests {
 
         // Its line reaches the PLIC as source PTR_IRQ once enabled.
         bus.ptr.push(PointerInput::move_to(1, 1));
-        bus.update_interrupts();
+        bus.update_interrupts(&mut |_, _| {});
         assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(0));
         bus.write(PTR_BASE + ptr::REG_CTRL, 4, ptr::CTRL_IRQ_ENABLE)
             .unwrap();
-        bus.update_interrupts();
+        bus.update_interrupts(&mut |_, _| {});
         assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << PTR_IRQ));
 
         // Words only, nothing popped by a faulting access; the page ends the range.

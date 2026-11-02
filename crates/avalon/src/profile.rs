@@ -38,6 +38,8 @@ pub fn machine_config(profile: &HardwareProfile) -> Result<MachineConfig, String
         clock_hz: *clock_hz,
         nominal_hz: *nominal_hz,
         disks,
+        // Profiles have no network cards yet (issue #81).
+        nets: Vec::new(),
     };
     config.validate()?;
     Ok(config)
@@ -83,6 +85,7 @@ mod tests {
                     DiskConfig::lake("127.0.0.1:7401", "root"),
                     DiskConfig::file("b.img").with_read_only(true)
                 ],
+                nets: Vec::new(),
             }
         );
         assert_eq!(
