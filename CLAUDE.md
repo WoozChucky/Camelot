@@ -21,7 +21,8 @@ Camelot is Nuno's learning project: the Excalibur ISA (RV32IM + Zicsr, M/S/U, Sv
 ```
 crates/excalibur   encodings, decoder, disassembler (shared by every tool)
 crates/grail       the emulator
-crates/merlin-as   the assembler (once merged)
+crates/merlin      the C-subset compiler (front end + test harness; codegen is #14)
+crates/merlin-as   the assembler
 docs/              ISA spec
 examples/          bare-metal programs
 tests/riscv-tests  prebuilt riscv-tests ELFs

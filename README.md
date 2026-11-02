@@ -6,7 +6,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 |---|---|---|
 | **Excalibur** | The ISA: RV32IM + Zicsr, M/S/U privilege, Sv32 paging, plus the Xcal extensions | Spec v0 in [`docs/excalibur-spec.md`](docs/excalibur-spec.md) |
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/mi/si |
-| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | merlin-as: everything but the encoder ([guide](crates/merlin-as/ENCODER.md)) |
+| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | merlin-as: everything but the encoder ([guide](crates/merlin-as/ENCODER.md)). merlin: v0 front end (int-only C subset) and test harness, codegen next |
 | **Camelot** | The kernel / OS | Not started |
 
 ## Layout
@@ -14,6 +14,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 ```
 crates/excalibur   instruction encodings, decoder, disassembler (shared by every tool)
 crates/grail       the emulator
+crates/merlin      the C-subset compiler (C → .s), with its test programs in tests/cases
 crates/merlin-as   the assembler (source → ELF32 .o)
 examples/          bare-metal programs
 tests/riscv-tests  prebuilt riscv-tests ELFs (rebuild with scripts/build-riscv-tests.sh)
@@ -42,6 +43,8 @@ Options: `--trace` prints every instruction with its disassembly, `--max-steps N
 cargo test
 ```
 
-Runs the decoder unit tests, every riscv-tests suite (except `rv32ui-p-ma_data`, which assumes hardware misaligned access; Excalibur traps instead), and the examples.
+Runs the decoder unit tests, every riscv-tests suite (except `rv32ui-p-ma_data`, which assumes hardware misaligned access; Excalibur traps instead), the examples, and the merlin front-end tests.
+
+`merlin --dump-ast file.c` prints the checked syntax tree. The compiler's end-to-end harness (`crates/merlin/tests/harness.rs`) runs every program in `crates/merlin/tests/cases/` through merlin, merlin-as and merlin-ld and checks its exit code in Grail; it is `#[ignore]`d until codegen and the linker exist. With clang and ld.lld installed, `cargo test -p merlin --test harness -- --ignored clang_reference` checks the same programs' expected exit codes against clang.
 
 The test ELFs are committed. To rebuild them you need clang + lld (the official Windows LLVM installer works) and a riscv-tests checkout: `scripts/build-riscv-tests.sh path/to/riscv-tests tests/riscv-tests`. Until merlin-as and merlin-ld exist, examples are built with clang too; the command is at the top of each `.S` file.
