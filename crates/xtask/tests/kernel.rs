@@ -1209,7 +1209,11 @@ const HELP: &str = "\
 help            this list
 exit [N]        leave the shell, with status N or the last program's
 wait            wait for every background program
-PROG [ARG...]   run a program, e.g. hello, echo, ticks, ping, pong, sh
+cd [DIR]        change the working directory, to / without DIR
+PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /
+CMD < FILE      read the input from FILE
+CMD > FILE      write the output to FILE
+CMD | CMD       send the first command's output to the second one
 CMD & CMD       run the first command in the background
 ";
 
@@ -2417,6 +2421,44 @@ fn the_system_calls_do_what_the_document_says() {
 }
 
 #[test]
+fn without_a_disk_the_shell_still_pipes_and_finds_the_programs_in_bin() {
+    // Pipes need no disk, and the kernel's own programs stand in for /bin:
+    // by name, by /bin/NAME and by bin/NAME from the root. Any other path,
+    // and a file to redirect to, doesn't exist.
+    let out = run_processes(
+        b"echo one two three | wc\n\
+          echo a b | cat | cat | wc\n\
+          /bin/echo by path\n\
+          bin/echo from the root\n\
+          /echo\n\
+          echo x > /file\n\
+          wc < /file\n\
+          ls\n\
+          exit 0\n",
+    );
+    assert_eq!(command_output(&out, "echo one two three | wc"), ["1 3 14"]);
+    assert_eq!(command_output(&out, "echo a b | cat | cat | wc"), ["1 2 4"]);
+    assert_eq!(command_output(&out, "/bin/echo by path"), ["by path"]);
+    assert_eq!(command_output(&out, "bin/echo from the root"), ["from the root"]);
+    assert_eq!(
+        command_output(&out, "/echo"),
+        ["sh: /echo: no such file or directory"]
+    );
+    assert_eq!(
+        command_output(&out, "echo x > /file"),
+        ["sh: /file: no such file or directory"]
+    );
+    assert_eq!(
+        command_output(&out, "wc < /file"),
+        ["sh: /file: no such file or directory"]
+    );
+    assert_eq!(
+        command_output(&out, "ls"),
+        ["ls: .: no such file or directory", "ls: exit 1"]
+    );
+}
+
+#[test]
 fn programs_get_their_arguments() {
     let out = run_processes(b"echo\necho one\necho  a   b\tc  d \nexit\n");
     assert_eq!(command_output(&out, "echo"), [""]);
@@ -2507,9 +2549,14 @@ fn processes_give_back_every_page() {
     let before = free_pages(&m, &elf);
 
     // Every program on its own: the ones that exit, the ones that are
-    // killed, and systest, which spawns children and grows its heap. (sh
-    // would read the next lines itself: see a_shell_runs_inside_the_shell.)
-    let names: Vec<String> = program_names().into_iter().filter(|n| n != "sh").collect();
+    // killed, and systest, which spawns children, makes pipes and grows its
+    // heap. (sh, cat and wc would read the next lines themselves: see
+    // a_shell_runs_inside_the_shell. Without a disk, the file programs only
+    // fail.)
+    let names: Vec<String> = program_names()
+        .into_iter()
+        .filter(|n| !["sh", "cat", "wc"].contains(&n.as_str()))
+        .collect();
     for name in &names {
         command(&mut m, &format!("{name}\n"));
         assert_eq!(free_pages(&m, &elf), before, "{name}");
@@ -2528,11 +2575,15 @@ fn processes_give_back_every_page() {
     assert!(lines.contains(&"sh: hello: no free process slot"), "{out}");
     command(&mut m, "wait\n");
     let out = printed(&m);
-    // The hellos run while the shell waits for its next line; wait collects
-    // them.
+    // The hellos run while the shell starts the others and waits for its
+    // next line; wait collects them.
     let waited = command_output(&out, "wait");
     let collected = waited.iter().filter(|l| l.ends_with("] hello: exit 0")).count();
-    let greetings = waited.iter().filter(|l| **l == "hello from user mode").count();
+    let greetings = lines
+        .iter()
+        .chain(&waited)
+        .filter(|l| **l == "hello from user mode")
+        .count();
     assert_eq!((collected, greetings), (NPROC - 1, NPROC - 1), "{out}");
     assert_eq!(free_pages(&m, &elf), before);
     // While a process runs, it holds its pages: a kernel stack, a root and a
@@ -2775,7 +2826,7 @@ fn the_elf_loader_refuses_bad_images() {
         let lines: Vec<&str> = out[out.rfind(&echo).unwrap() + echo.len()..].lines().collect();
         let expected = match want {
             Some(reason) => vec![
-                format!("spawn: hello: {reason}"),
+                format!("spawn: /bin/hello: {reason}"),
                 "sh: hello: not an executable".to_string(),
             ],
             None => vec!["hello from user mode".to_string()],
@@ -2906,7 +2957,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 10, "{calls:?}");
+    assert_eq!(calls.len(), 21, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()
@@ -2932,7 +2983,7 @@ fn the_system_call_document_matches_the_code() {
     }
 
     let errors = doc_table(&doc, "## Error numbers");
-    assert_eq!(errors.len(), 10, "{errors:?}");
+    assert_eq!(errors.len(), 25, "{errors:?}");
     assert_eq!(defines(&header, "E"), errors, "syscall.h");
     assert_eq!(defines(&user_h, "E"), errors, "user.h");
 
@@ -2974,13 +3025,37 @@ fn the_system_call_document_matches_the_code() {
             "{name}: {returns}"
         );
     }
-    // And spawn's limits.
-    for limit in ["MAXARG", "ARG_MAX"] {
+    // And the limits.
+    for limit in ["MAXARG", "ARG_MAX", "MAXPATH"] {
         let want = defines(&header, limit);
         assert_eq!(want.len(), 1);
         assert_eq!(defines(&user_h, limit), want);
         assert!(doc.contains(&format!("`{limit}` ({})", want[0].0)), "{limit}");
     }
+    // Constants the test programs copy from the kernel's headers, and the
+    // console's major number mkfs gives /dev/console.
+    let exactly = |text: &str, name: &str| -> Vec<(u32, String)> {
+        defines(text, name)
+            .into_iter()
+            .filter(|(_, n)| n == name)
+            .collect()
+    };
+    let filetest = read("kernel/user/filetest.c");
+    let systest = read("kernel/user/systest.c");
+    for (header, name, copies) in [
+        ("kernel/include/file.h", "NOFILE", vec![&filetest, &systest]),
+        ("kernel/include/file.h", "CONSOLE", vec![&filetest, &systest]),
+        ("kernel/include/pipe.h", "PIPESIZE", vec![&systest]),
+        ("kernel/include/proc.h", "NPROC", vec![&systest]),
+    ] {
+        let want = exactly(&read(header), name);
+        assert_eq!(want.len(), 1, "{header}: {name}");
+        for copy in copies {
+            assert_eq!(exactly(copy, name), want, "a user program's copy of {name}");
+        }
+    }
+    let console = exactly(&read("kernel/include/file.h"), "CONSOLE");
+    assert_eq!(console[0].0, u32::from(xtask::fs::CONSOLE_MAJOR));
 }
 
 #[test]

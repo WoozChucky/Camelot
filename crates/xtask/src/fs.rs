@@ -1,8 +1,8 @@
 //! `cargo xtask fs`: the root filesystem image the kernel mounts at boot
 //! (docs/camelot-fs.md), built with the `camelot-fs` crate's mkfs: the files
-//! in `kernel/fs/` (a README) at `/`, and the user programs of `kernel/user`,
+//! in `kernel/fs/` (a README) at `/`, the user programs of `kernel/user`,
 //! built with merlin-as + merlin-ld exactly as the kernel embeds them, in
-//! `/bin`. No LLVM needed.
+//! `/bin`, and the console's device node, `/dev/console`. No LLVM needed.
 //!
 //! ```text
 //! cargo xtask fs
@@ -19,6 +19,10 @@ pub const ROOT_DIR: &str = "kernel/fs";
 pub const DEFAULT_OUT: &str = "target/camelot-fs.img";
 /// Where the user programs go.
 pub const BIN: &str = "/bin";
+/// The device nodes' directory.
+pub const DEV: &str = "/dev";
+/// The console's device number (`CONSOLE` in kernel/include/file.h).
+pub const CONSOLE_MAJOR: u16 = 1;
 
 /// The default output path.
 pub fn default_out(root: &Path) -> PathBuf {
@@ -26,10 +30,12 @@ pub fn default_out(root: &Path) -> PathBuf {
 }
 
 /// Builds the root image: `opts`' shape, `kernel/fs/` at `/`, the programs
-/// in `/bin`.
+/// in `/bin`, `/dev/console`.
 pub fn build(root: &Path, opts: &Options) -> Result<Vec<u8>, String> {
     let mut fs = Mkfs::new(opts)?;
     fs.add_host_dir(&root.join(ROOT_DIR), "/")?;
+    fs.mkdir(DEV)?;
+    fs.add_device(&format!("{DEV}/console"), CONSOLE_MAJOR, 0)?;
     fs.mkdir(BIN)?;
     for prog in userprogs::build_all(&userprogs::user_dir(root))? {
         fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;

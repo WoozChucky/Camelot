@@ -7,6 +7,8 @@
 #ifndef CAMELOT_PROC_H
 #define CAMELOT_PROC_H
 
+#include "elf.h"
+#include "file.h"
 #include "syscall.h"
 #include "trap.h"
 #include "types.h"
@@ -24,6 +26,7 @@
 #define PROC_RUNNING 2  /* on the CPU */
 #define PROC_ZOMBIE 3   /* exited or killed; its parent (or the scheduler) frees it */
 #define PROC_SLEEPING 4 /* waiting in sleep() for a wakeup() on its channel */
+#define PROC_NEW 5      /* taken by proc_create(), which may sleep reading the program */
 
 /* What swtch() saves of a kernel thread: the return address, the stack
  * pointer and the callee-saved registers, which is all a function call has
@@ -71,10 +74,17 @@ struct proc {
     const void *chan;
     /* A kernel process's function (NULL for a user process). */
     void (*kfn)(void);
+    /* Its file descriptors: ofile[fd] is the open file, or NULL (file.h). */
+    struct file *ofile[NOFILE];
+    /* Its working directory, where paths that don't start with `/` are
+     * looked up from: an inode with a reference, or NULL when there is no
+     * filesystem (and for kernel processes, which use the root). */
+    struct inode *cwd;
 };
 
 /* A user program embedded in the kernel image as an ELF executable
- * (kernel/userprogs.s, generated from kernel/user/ by `cargo xtask kernel`). */
+ * (kernel/userprogs.s, generated from kernel/user/ by `cargo xtask kernel`):
+ * what spawn and exec run when there is no root filesystem (exec.c). */
 struct user_program {
     const char *name;
     const u8 *elf;
@@ -87,9 +97,9 @@ extern const u32 user_program_count;
 /* The embedded program called `name`, or NULL. */
 const struct user_program *user_program_find(const char *name);
 
-/* A new process's arguments, in kernel memory: `argc` NUL-terminated strings
- * one after another in `strings`, `len` bytes in all. proc_create() copies
- * them to the top of the new process's stack. */
+/* A new program's arguments, in kernel memory: `argc` NUL-terminated strings
+ * one after another in `strings`, `len` bytes in all. proc_create() and
+ * proc_exec() copy them to the top of the program's stack. */
 struct proc_args {
     u32 argc;
     u32 len;
@@ -100,14 +110,25 @@ struct proc_args {
  * the scheduler loop). */
 struct proc *myproc(void);
 
-/* Makes a runnable process from `prog`, a child of the current process (of
- * no one, from kmain): a page table with the program loaded, a stack holding
- * `args` with sp below them, a kernel stack, a pid. It starts at the
- * program's entry point with a0 = argc, a1 = argv. Returns NULL with *err set
- * to -EAGAIN (no free slot), -ENOMEM or -ENOEXEC (a bad ELF image: the
- * loader's reason is printed as "spawn: NAME: REASON") when it can't; nothing
- * is left allocated then. */
-struct proc *proc_create(const struct user_program *prog, const struct proc_args *args, int *err);
+/* Makes a runnable process called `name` from the executable `prog`, a
+ * child of the current process: a page table with the program loaded, a
+ * stack holding `args` with sp below them, a kernel stack, a pid, copies of
+ * the parent's descriptors 0, 1 and 2 (the others are not passed on) and
+ * its working directory. It starts at the program's entry point with a0 =
+ * argc, a1 = argv. Returns NULL with *err set to -EAGAIN (no free slot),
+ * -ENOMEM or -ENOEXEC (a bad ELF image: the loader's reason is printed as
+ * "spawn: PATH: REASON", `path` being what the caller asked for) when it
+ * can't; nothing is left allocated then. Reading `prog` may sleep. */
+struct proc *proc_create(const struct elf_file *prog, const char *path, const char *name,
+                         const struct proc_args *args, int *err);
+
+/* Replaces the current process's program with `prog`, called `name`: a new
+ * address space as proc_create() makes, registers all zero but pc, sp, a0
+ * (argc) and a1 (argv). The descriptors, the working directory, the pid and
+ * the parent stay. Returns argc, which the system call leaves in a0; or,
+ * with the old program untouched, -ENOMEM or -ENOEXEC ("exec: PATH:
+ * REASON"). */
+int proc_exec(const struct elf_file *prog, const char *path, const char *name, const struct proc_args *args);
 
 /* Makes a runnable kernel process called `name` that runs `fn` in S-mode on
  * its own kernel stack, with the kernel page table and interrupts off (like
@@ -116,11 +137,15 @@ struct proc *proc_create(const struct user_program *prog, const struct proc_args
  * can't (no free slot, no memory). */
 struct proc *kproc_create(const char *name, void (*fn)(void), const char **err);
 
-/* Starts `prog` as the first process, with argv = { its name }, and runs the
- * scheduler until no process is left: the first process has exited and so has
- * everything still running when it did. Returns the first process's exit
- * status in *status, or false if it couldn't be started (having said why). */
-bool proc_run_init(const struct user_program *prog, int *status);
+/* Starts the program at `path` (the shell) as the first process, with argv
+ * = { name } and the console as its descriptors 0 (for reading), 1 and 2
+ * (for writing), in the root directory if there is a filesystem, and runs
+ * the scheduler until no process is left: the first process has exited and
+ * so has everything still running when it did. The process loads its
+ * program itself (exec.c's exec_init(), which may sleep on the disk).
+ * Returns the first process's exit status in *status, or false if it
+ * couldn't be started (having said why). */
+bool proc_run_init(const char *path, const char *name, int *status);
 
 /* Runs the processes round robin, one timer tick each for user processes,
  * until none is left; then returns with interrupts on. While every process
@@ -143,10 +168,10 @@ void wakeup(const void *chan);
 /* Gives the CPU back to the scheduler; the process stays runnable. */
 void yield(void);
 
-/* Ends the current process with `status`: it becomes a zombie until its
- * parent waits for it (the scheduler frees it if it has none), its parent is
- * woken, and its own children are orphaned (zombies among them freed). Never
- * returns. */
+/* Ends the current process with `status`: it closes its files and lets go
+ * of its working directory, becomes a zombie until its parent waits for it
+ * (the scheduler frees it if it has none), its parent is woken, and its own
+ * children are orphaned (zombies among them freed). Never returns. */
 void proc_exit(int status);
 
 /* Kills the current process for the trap in `f`, a fault in U-mode: prints

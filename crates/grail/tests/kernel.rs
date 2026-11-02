@@ -176,7 +176,11 @@ fn shell_accepts_windows_line_ends() {
          help            this list\n\
          exit [N]        leave the shell, with status N or the last program's\n\
          wait            wait for every background program\n\
-         PROG [ARG...]   run a program, e.g. hello, echo, ticks, ping, pong, sh\n\
+         cd [DIR]        change the working directory, to / without DIR\n\
+         PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /\n\
+         CMD < FILE      read the input from FILE\n\
+         CMD > FILE      write the output to FILE\n\
+         CMD | CMD       send the first command's output to the second one\n\
          CMD & CMD       run the first command in the background\n\
          {PROMPT}nope\n\
          sh: nope: no such program\n\

@@ -10,72 +10,74 @@
 	.type	main,@function
 main:                                   # @main
 # %bb.0:
-	addi	sp, sp, -48
-	sw	ra, 44(sp)                      # 4-byte Folded Spill
-	sw	s0, 40(sp)                      # 4-byte Folded Spill
-	sw	s1, 36(sp)                      # 4-byte Folded Spill
-	sw	s2, 32(sp)                      # 4-byte Folded Spill
-	sw	s3, 28(sp)                      # 4-byte Folded Spill
+	addi	sp, sp, -208
+	sw	ra, 204(sp)                     # 4-byte Folded Spill
+	sw	s0, 200(sp)                     # 4-byte Folded Spill
+	sw	s1, 196(sp)                     # 4-byte Folded Spill
+	sw	s2, 192(sp)                     # 4-byte Folded Spill
+	sw	s3, 188(sp)                     # 4-byte Folded Spill
+	sw	s4, 184(sp)                     # 4-byte Folded Spill
+	sw	s5, 180(sp)                     # 4-byte Folded Spill
 	li	a0, 1
 	lui	a1, 524288
 	li	a2, 4
 	call	write
 .Lpcrel_hi0:
 	auipc	a1, %pcrel_hi(.L_MergedGlobals)
-	addi	s2, a1, %pcrel_lo(.Lpcrel_hi0)
-	lw	a1, 4(s2)
+	addi	s3, a1, %pcrel_lo(.Lpcrel_hi0)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	li	s0, -14
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s0, .LBB0_3
 # %bb.1:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_3
 # %bb.2:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_3:
 	lui	a1, 524288
 	li	a2, 4
 	li	a0, 0
 	call	read
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s0, .LBB0_6
 # %bb.4:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_6
 # %bb.5:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_6:
 	li	a0, 1
 	li	a2, 4
 	li	a1, 0
 	call	write
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	li	s0, -14
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s0, .LBB0_9
 # %bb.7:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_9
 # %bb.8:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_9:
 	li	a2, 4
 	li	a0, 0
 	li	a1, 0
 	call	read
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s0, .LBB0_12
 # %bb.10:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_12
 # %bb.11:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_12:
 	lui	s0, 1024
 	li	a0, 1
@@ -83,30 +85,30 @@ main:                                   # @main
 	li	a2, 4
 	mv	a1, s0
 	call	write
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	li	s1, -14
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s1, .LBB0_15
 # %bb.13:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_15
 # %bb.14:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_15:
 	li	a2, 4
 	li	a0, 0
 	mv	a1, s0
 	call	read
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s1, .LBB0_18
 # %bb.16:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_18
 # %bb.17:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_18:
 	lui	s0, 1023
 	li	a0, 1
@@ -114,61 +116,61 @@ main:                                   # @main
 	li	a2, 4
 	mv	a1, s0
 	call	write
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	li	s1, -14
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s1, .LBB0_21
 # %bb.19:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_21
 # %bb.20:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_21:
 	li	a2, 4
 	li	a0, 0
 	mv	a1, s0
 	call	read
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s1, .LBB0_24
 # %bb.22:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_24
 # %bb.23:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_24:
-.Lpcrel_hi7:
+.Lpcrel_hi18:
 	auipc	a1, %pcrel_hi(msg)
 	li	a0, 1
-	addi	a1, a1, %pcrel_lo(.Lpcrel_hi7)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi18)
 	li	a2, -1
 	call	write
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	li	s0, -14
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s0, .LBB0_27
 # %bb.25:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_27
 # %bb.26:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_27:
-	addi	a1, sp, 20
+	addi	a1, sp, 172
 	li	a2, -1
 	li	a0, 0
 	call	read
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s0, .LBB0_30
 # %bb.28:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_30
 # %bb.29:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_30:
 .Lpcrel_hi1:
 	auipc	a0, %pcrel_hi(msg)
@@ -176,16 +178,16 @@ main:                                   # @main
 	li	a2, 4
 	li	a0, 0
 	call	read
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	li	s0, -14
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s0, .LBB0_33
 # %bb.31:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_33
 # %bb.32:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_33:
 .Lpcrel_hi2:
 	auipc	a0, %pcrel_hi(main)
@@ -193,15 +195,15 @@ main:                                   # @main
 	li	a2, 4
 	li	a0, 0
 	call	read
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s0, .LBB0_36
 # %bb.34:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_36
 # %bb.35:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_36:
 	li	a0, 0
 	call	sbrk
@@ -210,73 +212,73 @@ main:                                   # @main
 	li	a2, 1
 	mv	a1, s0
 	call	write
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	li	s1, -14
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s1, .LBB0_39
 # %bb.37:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_39
 # %bb.38:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_39:
 	li	a2, 1
 	li	a0, 0
 	mv	a1, s0
 	call	read
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s1, .LBB0_42
 # %bb.40:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_42
 # %bb.41:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_42:
 	li	a0, -1
 	lui	a1, 524288
 	call	wait
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	li	s0, -14
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s0, .LBB0_45
 # %bb.43:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_45
 # %bb.44:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_45:
 .Lpcrel_hi3:
 	auipc	a0, %pcrel_hi(msg)
 	addi	a1, a0, %pcrel_lo(.Lpcrel_hi3)
 	li	a0, -1
 	call	wait
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s0, .LBB0_48
 # %bb.46:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_48
 # %bb.47:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_48:
 	lui	a0, 524288
 	li	a1, 0
 	call	spawn
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	li	s0, -14
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s0, .LBB0_51
 # %bb.49:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_51
 # %bb.50:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_51:
 .Lpcrel_hi4:
 	auipc	a0, %pcrel_hi(.L__const.main.argv)
@@ -284,118 +286,612 @@ main:                                   # @main
 	lw	a1, 0(a0)
 	lw	a2, 4(a0)
 	lw	a0, 8(a0)
-	sw	a1, 4(sp)
-	sw	a2, 8(sp)
-	sw	a0, 12(sp)
+	sw	a1, 156(sp)
+	sw	a2, 160(sp)
+	sw	a0, 164(sp)
 .Lpcrel_hi5:
-	auipc	a0, %pcrel_hi(.L.str)
+	auipc	a0, %pcrel_hi(.L.str.1)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi5)
-	addi	a1, sp, 4
+	addi	a1, sp, 156
 	call	spawn
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, s0, .LBB0_54
 # %bb.52:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_54
 # %bb.53:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_54:
 .Lpcrel_hi6:
-	auipc	a0, %pcrel_hi(.L.str)
+	auipc	a0, %pcrel_hi(.L.str.1)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi6)
 	lui	a1, 524288
 	call	spawn
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
-	li	s1, -14
-	sw	a1, 4(s2)
-	beq	a0, s1, .LBB0_57
+	li	s5, -14
+	sw	a1, 4(s3)
+	beq	a0, s5, .LBB0_57
 # %bb.55:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_57
 # %bb.56:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_57:
 	lui	a0, 1
 	call	sbrk
-	addi	s3, a0, 2047
-	addi	s0, s3, 2019
+	mv	s0, a0
+	addi	s4, a0, 2047
+	addi	s2, s4, 1849
 	li	a1, 97
-	li	a2, 30
-	mv	a0, s0
+	li	a2, 200
+	mv	a0, s2
 	call	memset
-	addi	a0, s3, 2039
+	addi	s1, s4, 2039
+	mv	a0, s1
 	li	a1, 0
 	call	spawn
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
-	beq	a0, s1, .LBB0_60
+	sw	a1, 4(s3)
+	beq	a0, s5, .LBB0_60
 # %bb.58:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_60
 # %bb.59:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_60:
-	mv	a0, s0
+	addi	a0, s4, 2019
 	li	a1, 0
 	call	spawn
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	li	a2, -14
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, a2, .LBB0_63
 # %bb.61:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_63
 # %bb.62:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_63:
 	li	a0, -1
-	addi	a1, sp, 16
+	addi	a1, sp, 168
 	call	wait
-	lw	a1, 4(s2)
+	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	li	a2, -10
-	sw	a1, 4(s2)
+	sw	a1, 4(s3)
 	beq	a0, a2, .LBB0_66
 # %bb.64:
-	lw	a0, 0(s2)
+	lw	a0, 0(s3)
 	bnez	a0, .LBB0_66
 # %bb.65:
-	sw	a1, 0(s2)
+	sw	a1, 0(s3)
 .LBB0_66:
 	li	a0, 99
 	li	a1, 0
 	li	a2, 0
 	li	a3, 0
 	call	syscall
-	lw	a2, 4(s2)
-	lw	a1, 0(s2)
-	addi	a2, a2, 1
-	li	a3, -38
-	sw	a2, 4(s2)
-	beq	a0, a3, .LBB0_69
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	a2, -38
+	sw	a1, 4(s3)
+	beq	a0, a2, .LBB0_69
 # %bb.67:
-	bnez	a1, .LBB0_69
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_69
 # %bb.68:
-	sw	a2, 0(s2)
-	mv	a1, a2
+	sw	a1, 0(s3)
 .LBB0_69:
-	beqz	a1, .LBB0_71
+	lui	a0, 524288
+	li	a1, 0
+	call	open
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	s5, -14
+	sw	a1, 4(s3)
+	beq	a0, s5, .LBB0_72
 # %bb.70:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_72
+# %bb.71:
+	sw	a1, 0(s3)
+.LBB0_72:
+	mv	a0, s1
+	li	a1, 0
+	call	open
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s5, .LBB0_75
+# %bb.73:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_75
+# %bb.74:
+	sw	a1, 0(s3)
+.LBB0_75:
+	li	a1, 64
+	mv	a0, s2
+	call	open
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	s2, -14
+	sw	a1, 4(s3)
+	beq	a0, s2, .LBB0_78
+# %bb.76:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_78
+# %bb.77:
+	sw	a1, 0(s3)
+.LBB0_78:
+	lui	a0, 524288
+	call	mkdir
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s2, .LBB0_81
+# %bb.79:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_81
+# %bb.80:
+	sw	a1, 0(s3)
+.LBB0_81:
+	li	a0, 0
+	call	unlink
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	s2, -14
+	sw	a1, 4(s3)
+	beq	a0, s2, .LBB0_84
+# %bb.82:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_84
+# %bb.83:
+	sw	a1, 0(s3)
+.LBB0_84:
+	lui	a0, 524288
+	call	chdir
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s2, .LBB0_87
+# %bb.85:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_87
+# %bb.86:
+	sw	a1, 0(s3)
+.LBB0_87:
+.Lpcrel_hi7:
+	auipc	a0, %pcrel_hi(.L.str.2)
+	addi	a1, a0, %pcrel_lo(.Lpcrel_hi7)
+	lui	a0, 524288
+	call	link
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	s2, -14
+	sw	a1, 4(s3)
+	beq	a0, s2, .LBB0_90
+# %bb.88:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_90
+# %bb.89:
+	sw	a1, 0(s3)
+.LBB0_90:
+.Lpcrel_hi8:
+	auipc	a0, %pcrel_hi(.L.str.2)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi8)
+	mv	a1, s1
+	call	link
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s2, .LBB0_93
+# %bb.91:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_93
+# %bb.92:
+	sw	a1, 0(s3)
+.LBB0_93:
+	lui	a0, 524288
+	li	a1, 0
+	call	exec
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	s1, -14
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_96
+# %bb.94:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_96
+# %bb.95:
+	sw	a1, 0(s3)
+.LBB0_96:
 .Lpcrel_hi9:
 	auipc	a0, %pcrel_hi(.L.str.1)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi9)
-	call	printf
-	lw	a0, 0(s2)
-	j	.LBB0_74
-.LBB0_71:
-.Lpcrel_hi8:
+	addi	a1, sp, 156
+	call	exec
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_99
+# %bb.97:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_99
+# %bb.98:
+	sw	a1, 0(s3)
+.LBB0_99:
+.Lpcrel_hi10:
+	auipc	a0, %pcrel_hi(.L.str.1)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi10)
+	lui	a1, 524288
+	call	exec
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	s1, -14
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_102
+# %bb.100:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_102
+# %bb.101:
+	sw	a1, 0(s3)
+.LBB0_102:
+	li	a0, 1
+	lui	a1, 524288
+	call	fstat
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_105
+# %bb.103:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_105
+# %bb.104:
+	sw	a1, 0(s3)
+.LBB0_105:
+.Lpcrel_hi11:
 	auipc	a0, %pcrel_hi(msg)
-	addi	s0, a0, %pcrel_lo(.Lpcrel_hi8)
+	addi	a1, a0, %pcrel_lo(.Lpcrel_hi11)
+	li	a0, 1
+	call	fstat
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	s1, -14
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_108
+# %bb.106:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_108
+# %bb.107:
+	sw	a1, 0(s3)
+.LBB0_108:
+	addi	a1, s4, 2041
+	li	a0, 1
+	call	fstat
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_111
+# %bb.109:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_111
+# %bb.110:
+	sw	a1, 0(s3)
+.LBB0_111:
+	lui	a0, 524288
+	call	pipe
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	s1, -14
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_114
+# %bb.112:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_114
+# %bb.113:
+	sw	a1, 0(s3)
+.LBB0_114:
+.Lpcrel_hi12:
+	auipc	a0, %pcrel_hi(msg)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi12)
+	call	pipe
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_117
+# %bb.115:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_117
+# %bb.116:
+	sw	a1, 0(s3)
+.LBB0_117:
+	addi	a0, s4, 2045
+	call	pipe
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	a2, -14
+	sw	a1, 4(s3)
+	beq	a0, a2, .LBB0_120
+# %bb.118:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_120
+# %bb.119:
+	sw	a1, 0(s3)
+.LBB0_120:
+	li	a0, 1
+	call	dup
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	a2, 3
+	sw	a1, 4(s3)
+	beq	a0, a2, .LBB0_123
+# %bb.121:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_123
+# %bb.122:
+	sw	a1, 0(s3)
+.LBB0_123:
+	li	a0, 3
+	call	close
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beqz	a0, .LBB0_126
+# %bb.124:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_126
+# %bb.125:
+	sw	a1, 0(s3)
+.LBB0_126:
+	addi	a0, sp, 11
+	li	a1, 97
+	li	a2, 128
+	call	memset
+	sb	zero, 139(sp)
+.Lpcrel_hi13:
+	auipc	a0, %pcrel_hi(.L.str.3)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi13)
+	lui	a1, 524288
+	call	link
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	s1, -14
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_129
+# %bb.127:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_129
+# %bb.128:
+	sw	a1, 0(s3)
+.LBB0_129:
+	addi	a0, sp, 11
+	li	a1, 0
+	call	link
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_132
+# %bb.130:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_132
+# %bb.131:
+	sw	a1, 0(s3)
+.LBB0_132:
+.Lpcrel_hi14:
+	auipc	a0, %pcrel_hi(.L.str.3)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi14)
+	li	a1, 4
+	call	spawn
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	s1, -14
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_135
+# %bb.133:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_135
+# %bb.134:
+	sw	a1, 0(s3)
+.LBB0_135:
+	addi	a0, sp, 11
+	addi	a1, sp, 156
+	call	spawn
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_138
+# %bb.136:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_138
+# %bb.137:
+	sw	a1, 0(s3)
+.LBB0_138:
+.Lpcrel_hi15:
+	auipc	a0, %pcrel_hi(.L.str.3)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi15)
+	li	a1, 4
+	call	exec
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	s1, -14
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_141
+# %bb.139:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_141
+# %bb.140:
+	sw	a1, 0(s3)
+.LBB0_141:
+	addi	a0, sp, 11
+	addi	a1, sp, 156
+	call	exec
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_144
+# %bb.142:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_144
+# %bb.143:
+	sw	a1, 0(s3)
+.LBB0_144:
+	li	a0, -1
+	addi	a1, sp, 168
+	call	wait
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	a2, -10
+	sw	a1, 4(s3)
+	beq	a0, a2, .LBB0_147
+# %bb.145:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_147
+# %bb.146:
+	sw	a1, 0(s3)
+.LBB0_147:
+	mv	a0, sp
+	call	pipe
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beqz	a0, .LBB0_150
+# %bb.148:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_150
+# %bb.149:
+	sw	a1, 0(s3)
+.LBB0_150:
+	lw	a0, 4(sp)
+	lui	a1, 524288
+	li	a2, 4
+	call	write
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	a2, -14
+	sw	a1, 4(s3)
+	beq	a0, a2, .LBB0_153
+# %bb.151:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_153
+# %bb.152:
+	sw	a1, 0(s3)
+.LBB0_153:
+	lw	a0, 4(sp)
+.Lpcrel_hi16:
+	auipc	a1, %pcrel_hi(.L.str.4)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi16)
+	li	a2, 2
+	li	s1, 2
+	call	write
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_156
+# %bb.154:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_156
+# %bb.155:
+	sw	a1, 0(s3)
+.LBB0_156:
+	lw	a0, 0(sp)
+.Lpcrel_hi17:
+	auipc	a1, %pcrel_hi(msg)
+	addi	a1, a1, %pcrel_lo(.Lpcrel_hi17)
+	li	a2, 2
+	call	read
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	li	s1, -14
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_159
+# %bb.157:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_159
+# %bb.158:
+	sw	a1, 0(s3)
+.LBB0_159:
+	lw	a0, 0(sp)
+	lui	a1, 1
+	addi	a1, a1, -1
+	add	a1, s0, a1
+	li	a2, 2
+	call	read
+	lw	a1, 4(s3)
+	addi	a1, a1, 1
+	sw	a1, 4(s3)
+	beq	a0, s1, .LBB0_162
+# %bb.160:
+	lw	a0, 0(s3)
+	bnez	a0, .LBB0_162
+# %bb.161:
+	sw	a1, 0(s3)
+.LBB0_162:
+	lw	a0, 0(sp)
+	addi	a1, sp, 140
+	call	fstat
+	lw	a1, 148(sp)
+	lw	a2, 4(s3)
+	xori	a1, a1, 2
+	or	a1, a0, a1
+	addi	a0, a2, 1
+	sw	a0, 4(s3)
+	beqz	a1, .LBB0_165
+# %bb.163:
+	lw	a1, 0(s3)
+	bnez	a1, .LBB0_165
+# %bb.164:
+	sw	a0, 0(s3)
+.LBB0_165:
+	lw	a0, 0(sp)
+	addi	a1, sp, 172
+	li	a2, 8
+	call	read
+	lw	a1, 0(s3)
+	lw	a2, 4(s3)
+	li	a3, 2
+	beq	a0, a3, .LBB0_168
+# %bb.166:
+	bnez	a1, .LBB0_168
+# %bb.167:
+	addi	a1, a2, 1
+	sw	a1, 0(s3)
+.LBB0_168:
+	lbu	a0, 172(sp)
+	lbu	a3, 173(sp)
+	xori	a0, a0, 111
+	zext.b	a3, a3
+	xori	a3, a3, 107
+	or	a0, a0, a3
+	addi	a2, a2, 2
+	sw	a2, 4(s3)
+	beqz	a0, .LBB0_171
+# %bb.169:
+	bnez	a1, .LBB0_171
+# %bb.170:
+	sw	a2, 0(s3)
+.LBB0_171:
+	lw	a0, 0(sp)
+	call	close
+	lw	a0, 4(sp)
+	call	close
+	lw	a1, 0(s3)
+	beqz	a1, .LBB0_173
+# %bb.172:
+.Lpcrel_hi20:
+	auipc	a0, %pcrel_hi(.L.str.5)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi20)
+	call	printf
+	lw	a0, 0(s3)
+	j	.LBB0_176
+.LBB0_173:
+.Lpcrel_hi19:
+	auipc	a0, %pcrel_hi(msg)
+	addi	s0, a0, %pcrel_lo(.Lpcrel_hi19)
 	mv	a0, s0
 	call	strlen
 	mv	s1, a0
@@ -404,23 +900,25 @@ main:                                   # @main
 	mv	a2, s1
 	call	write
 	mv	a1, a0
-	lw	a2, 4(s2)
-	lw	a0, 0(s2)
+	lw	a2, 4(s3)
+	lw	a0, 0(s3)
 	addi	a2, a2, 1
-	sw	a2, 4(s2)
-	beq	a1, s1, .LBB0_74
-# %bb.72:
-	bnez	a0, .LBB0_74
-# %bb.73:
-	sw	a2, 0(s2)
+	sw	a2, 4(s3)
+	beq	a1, s1, .LBB0_176
+# %bb.174:
+	bnez	a0, .LBB0_176
+# %bb.175:
+	sw	a2, 0(s3)
 	mv	a0, a2
-.LBB0_74:
-	lw	ra, 44(sp)                      # 4-byte Folded Reload
-	lw	s0, 40(sp)                      # 4-byte Folded Reload
-	lw	s1, 36(sp)                      # 4-byte Folded Reload
-	lw	s2, 32(sp)                      # 4-byte Folded Reload
-	lw	s3, 28(sp)                      # 4-byte Folded Reload
-	addi	sp, sp, 48
+.LBB0_176:
+	lw	ra, 204(sp)                     # 4-byte Folded Reload
+	lw	s0, 200(sp)                     # 4-byte Folded Reload
+	lw	s1, 196(sp)                     # 4-byte Folded Reload
+	lw	s2, 192(sp)                     # 4-byte Folded Reload
+	lw	s3, 188(sp)                     # 4-byte Folded Reload
+	lw	s4, 184(sp)                     # 4-byte Folded Reload
+	lw	s5, 180(sp)                     # 4-byte Folded Reload
+	addi	sp, sp, 208
 	ret
 .Lfunc_end0:
 	.size	main, .Lfunc_end0-main
@@ -449,8 +947,28 @@ msg:
 	.type	.L.str.1,@object                # @.str.1
 	.section	.rodata.str1.1,"aMS",@progbits,1
 .L.str.1:
+	.asciz	"/bin/echo"
+	.size	.L.str.1, 10
+
+	.type	.L.str.2,@object                # @.str.2
+.L.str.2:
+	.asciz	"/x"
+	.size	.L.str.2, 3
+
+	.type	.L.str.3,@object                # @.str.3
+.L.str.3:
+	.zero	1
+	.size	.L.str.3, 1
+
+	.type	.L.str.4,@object                # @.str.4
+.L.str.4:
+	.asciz	"ok"
+	.size	.L.str.4, 3
+
+	.type	.L.str.5,@object                # @.str.5
+.L.str.5:
 	.asciz	"badptr: case %d failed\n"
-	.size	.L.str.1, 24
+	.size	.L.str.5, 24
 
 	.type	.L_MergedGlobals,@object        # @_MergedGlobals
 	.local	.L_MergedGlobals

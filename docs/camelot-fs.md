@@ -114,8 +114,9 @@ the table's last block past inode `ninodes` - 1 are unused.
   data region, `datastart` to `size` - 1, and no block belongs to two inodes
   or twice to one (the indirect block itself counts as the inode's).
 - A **device** inode has `size` 0 and no blocks; `major` and `minor` say which
-  device (assigned by the system calls that open devices, #67). A directory's
-  or file's `major` and `minor` are 0.
+  device: the kernel opens major 1 as the console (`/dev/console` on the root
+  image) and has no driver for any other (docs/camelot-syscalls.md). A
+  directory's or file's `major` and `minor` are 0.
 
 **Link count.** `nlink` is the number of directory entries that name the
 inode, not counting any `.` entry. A file in one directory has 1. A
@@ -124,8 +125,8 @@ own `..`, which names itself) plus 1 for the `..` of each subdirectory: 1 +
 the number of its subdirectories.
 **Orphans.** Removing an inode's last entry and freeing the inode are two
 transactions: the kernel's unlink writes `nlink` = 0, and the inode is freed
-when its last user lets go, which may be much later (a file still open,
-#67). A crash in between leaves an **orphan** on the disk: an allocated
+when its last user lets go, which may be much later (a file still open, or
+a directory still some process's working directory). A crash in between leaves an **orphan** on the disk: an allocated
 inode with `nlink` 0, named by no entry, its blocks still marked in use.
 That is allowed (see "Consistency rules"): nothing can reach it, and the
 next writable mount frees it, after the log's recovery and as the last
@@ -162,9 +163,9 @@ entries:
 - Every allocated inode is reachable from the root.
 
 **Paths** are names separated by `/`. Repeated slashes count as one, and a
-trailing slash is ignored. Lookup starts at the root (a path without a
-leading `/` is also looked up from the root until processes have a working
-directory, #67) and goes through each name in turn with the directory's own
+trailing slash is ignored. Lookup starts at the root (the kernel looks a
+path without a leading `/` up from the process's working directory instead)
+and goes through each name in turn with the directory's own
 entries, so `.` and `..` need no special case: `/..` is `/`. Every name but
 the last must be a directory. A name longer than 14 bytes names nothing (the
 kernel's lookups fail with `ENAMETOOLONG` rather than cut it short).

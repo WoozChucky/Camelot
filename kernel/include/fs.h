@@ -10,7 +10,8 @@
  *   fs.c    the block allocator (bitmap), inodes (an in-memory cache of
  *           them, each with a sleep lock), file contents (readi/writei),
  *           directories (dirlookup/dirlink), paths (namei/nameiparent), and
- *           fs_create()/fs_unlink() for the system calls of #67
+ *           fs_create()/fs_unlink()/fs_link() for the file system calls
+ *           (sysfile.c)
  *
  * Anything that changes the disk runs between begin_op() and end_op(), so
  * that a crash leaves either all of it or none of it. That includes iput(),
@@ -46,17 +47,10 @@
 #define INODES_MIN 2
 #define INODES_MAX 65536
 
-/* Error numbers the filesystem returns (minus them), Linux's like the ones
- * in syscall.h; they move there with the file system calls (#67). */
-#define EIO 5           /* the disk failed */
-#define EEXIST 17       /* the name is taken */
-#define ENOTDIR 20      /* a name on the way is not a directory */
-#define EISDIR 21       /* not for a directory */
-#define EFBIG 27        /* past the largest file */
-#define ENOSPC 28       /* no free block or inode */
-#define EROFS 30        /* the disk is read-only */
-#define ENAMETOOLONG 36 /* a name longer than DIRSIZ */
-#define ENOTEMPTY 39    /* a directory with entries */
+/* The filesystem's failures are minus the error numbers of syscall.h
+ * (ENOENT, EEXIST, ENOTDIR, ENOSPC, ...), which the file system calls pass
+ * on. EIO is only fs_mount()'s: once mounted, a disk error panics. */
+#define EIO 5 /* the disk failed */
 
 /* Block 1. */
 struct superblock {
@@ -115,8 +109,10 @@ struct inode {
     u32 addrs[NDIRECT + 1];
 };
 
-/* Inodes in the cache, as in xv6. iget() panics if every one is in use. */
-#define NINODE 50
+/* Inodes in the cache. iget() panics if every one is in use, so there are
+ * enough for every open file, working directory and call in progress at
+ * once (fs.c checks: NFILE + NPROC * 4). */
+#define NINODE 96
 
 /* The mounted filesystem: its disk, superblock, and whether it is
  * read-only (then nothing writes to it): because the disk is, or because
@@ -175,6 +171,10 @@ void iunlockput(struct inode *ip);
 /* Writes a locked inode's fields to its dinode. In a transaction. */
 void iupdate(struct inode *ip);
 
+/* Frees every block of locked inode `ip` and sets its size to 0 (open's
+ * O_TRUNC). In a transaction. */
+void itrunc(struct inode *ip);
+
 /* Reads up to `n` bytes at `off` of locked inode `ip` into kernel memory
  * `dst`. Returns the bytes read: fewer at the end of the file, 0 at or past
  * it. */
@@ -202,8 +202,9 @@ struct inode *dirlookup(struct inode *dp, const char *name, u32 *poff);
 int dirlink(struct inode *dp, const char *name, u32 inum);
 
 /* The inode `path` names (unlocked, with a reference), looked up from the
- * root (there is no working directory yet: #67); NULL with *err = -ENOENT,
- * -ENOTDIR or -ENAMETOOLONG. */
+ * root if it starts with `/`, else from the current process's working
+ * directory (the root for a kernel process, which has none); NULL with
+ * *err = -ENOENT, -ENOTDIR or -ENAMETOOLONG. */
 struct inode *namei(const char *path, int *err);
 
 /* The directory `path`'s last name is in, and that name (copied to `name`,
@@ -213,8 +214,9 @@ struct inode *nameiparent(const char *path, char *name, int *err);
 
 /* Makes `path` a new inode of `type` (T_FILE, T_DIR with its `.` and `..`,
  * or T_DEVICE with `major`/`minor`) and returns it locked, with a reference;
- * NULL with *err: -EEXIST, -ENOENT/-ENOTDIR/-ENAMETOOLONG (the path),
- * -ENOSPC, -EROFS. In a transaction. */
+ * NULL with *err: -EEXIST (`/` included), -ENOENT/-ENOTDIR/-ENAMETOOLONG
+ * (the path; -ENOENT also for a directory that has been removed while still
+ * in use, as a working directory), -ENOSPC, -EROFS. In a transaction. */
 struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, int *err);
 
 /* Removes the entry `path`: a file loses a link (and is freed once it has
@@ -222,5 +224,11 @@ struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, int *e
  * -ENOTDIR, -ENAMETOOLONG, -EINVAL (`.`, `..` or `/`), -ENOTEMPTY or
  * -EROFS. In a transaction. */
 int fs_unlink(const char *path);
+
+/* Adds the entry `new` for the file `old` names, which gains a link. 0,
+ * -ENOENT/-ENOTDIR/-ENAMETOOLONG (either path; -ENOENT for a directory to
+ * put `new` in that has been removed), -EPERM (`old` is a directory),
+ * -EEXIST, -ENOSPC, -EROFS. In a transaction. */
+int fs_link(const char *old, const char *new);
 
 #endif

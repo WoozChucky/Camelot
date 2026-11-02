@@ -1,8 +1,10 @@
 /* The ELF loader: puts an executable's PT_LOAD segments into a process's user
- * space. The images come from the kernel itself (kernel/userprogs.s), but they
- * are checked as if they didn't: a bad image is an error, never a panic or a
- * mapping outside user space. Headers are copied out with memcpy, so the
- * image needs no particular alignment. */
+ * space. The executables come from the filesystem, or from the kernel itself
+ * (kernel/userprogs.s) when there is none, and are checked as untrusted
+ * either way: a bad image is an error, never a panic or a mapping outside
+ * user space. Everything is copied out through the elf_file's read(), so
+ * an image in memory needs no particular alignment, and a file is read
+ * piece by piece rather than whole. */
 #include "elf.h"
 #include "kalloc.h"
 #include "memlayout.h"
@@ -24,8 +26,20 @@ static u32 segment_perm(u32 flags) {
     return perm;
 }
 
-/* Maps the pages of segment `ph` into `pt`, filled from `image`. */
-static const char *load_segment(pagetable_t pt, const u8 *image, const struct elf32_phdr *ph) {
+static bool read_memory(const struct elf_file *f, void *dst, u32 off, u32 n) {
+    memcpy(dst, f->image + off, n);
+    return true;
+}
+
+void elf_from_memory(struct elf_file *f, const u8 *image, u32 size) {
+    f->size = size;
+    f->read = read_memory;
+    f->image = image;
+    f->inode = NULL;
+}
+
+/* Maps the pages of segment `ph` into `pt`, filled from `f`. */
+static const char *load_segment(pagetable_t pt, const struct elf_file *f, const struct elf32_phdr *ph) {
     u32 perm = segment_perm(ph->flags);
     if (perm == 0) {
         return "segment not readable";
@@ -50,8 +64,9 @@ static const char *load_segment(pagetable_t pt, const u8 *image, const struct el
         u32 from = page > ph->vaddr ? page : ph->vaddr;
         u32 file_end = ph->vaddr + ph->filesz;
         u32 to = page + PGSIZE < file_end ? page + PGSIZE : file_end;
-        if (from < to) {
-            memcpy(mem + (from - page), image + ph->offset + (from - ph->vaddr), to - from);
+        if (from < to && !f->read(f, mem + (from - page), ph->offset + (from - ph->vaddr), to - from)) {
+            kfree(mem);
+            return "segment outside the file";
         }
         if (map_pages(pt, page, (u32)(uintptr)mem, PGSIZE, perm) != 0) {
             kfree(mem);
@@ -61,12 +76,12 @@ static const char *load_segment(pagetable_t pt, const u8 *image, const struct el
     return NULL;
 }
 
-const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry, u32 *end) {
+const char *elf_load(pagetable_t pt, const struct elf_file *f, u32 *entry, u32 *end) {
+    u32 size = f->size;
     struct elf32_ehdr eh;
-    if (size < sizeof eh) {
+    if (size < sizeof eh || !f->read(f, &eh, 0, sizeof eh)) {
         return "not an ELF file";
     }
-    memcpy(&eh, image, sizeof eh);
     if (eh.magic != ELF_MAGIC) {
         return "not an ELF file";
     }
@@ -84,14 +99,16 @@ const char *elf_load(pagetable_t pt, const u8 *image, u32 size, u32 *entry, u32 
     u32 top = USER_BASE;
     for (u32 i = 0; i < eh.phnum; i++) {
         struct elf32_phdr ph;
-        memcpy(&ph, image + eh.phoff + i * sizeof ph, sizeof ph);
+        if (!f->read(f, &ph, eh.phoff + i * sizeof ph, sizeof ph)) {
+            return "bad program headers";
+        }
         if (ph.type != PT_LOAD || ph.memsz == 0) {
             continue;
         }
         if (ph.filesz > ph.memsz || ph.offset > size || ph.filesz > size - ph.offset) {
             return "segment outside the file";
         }
-        const char *err = load_segment(pt, image, &ph);
+        const char *err = load_segment(pt, f, &ph);
         if (err != NULL) {
             return err;
         }

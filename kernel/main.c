@@ -26,7 +26,8 @@
 /* Timer ticks to wait for before starting the shell. */
 #define BOOT_TICKS 10
 
-/* The first process: the user-space shell. */
+/* The first process: the user-space shell, its path and its name. */
+#define SHELL_PATH "/bin/sh"
 #define SHELL "sh"
 
 /* Deliberate faults, to exercise the panic path. The image ships with
@@ -176,16 +177,12 @@ static void deliberate_fault(void) {
 }
 
 /* Starts the user-space shell (kernel/user/sh.c) as the first process and
- * runs processes until it and everything it left running have ended.
- * Returns its exit status, or -1 if it couldn't start. */
+ * runs processes until it and everything it left running have ended: from
+ * the root filesystem's /bin, or the kernel's own copy (exec.h). Returns its
+ * exit status, or -1 if it couldn't start. */
 static int run_shell(void) {
-    const struct user_program *sh = user_program_find(SHELL);
-    if (sh == NULL) {
-        kprintf("no program called %s\n", SHELL);
-        return -1;
-    }
     int status;
-    if (!proc_run_init(sh, &status)) {
+    if (!proc_run_init(SHELL_PATH, SHELL, &status)) {
         return -1;
     }
     return status;

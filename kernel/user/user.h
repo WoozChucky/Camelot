@@ -5,6 +5,7 @@
 #define CAMELOT_USER_H
 
 typedef unsigned char uchar;
+typedef unsigned short ushort;
 typedef unsigned int uint;
 typedef unsigned long size_t;
 
@@ -12,26 +13,81 @@ typedef unsigned long size_t;
 
 /* Error numbers: a system call that fails returns minus one of them. They
  * are kernel/include/syscall.h's: a test checks they agree. */
-#define ENOENT 2   /* spawn: no program by that name */
-#define E2BIG 7    /* spawn: argument list too long */
-#define ENOEXEC 8  /* spawn: the program's image is not a valid executable */
-#define EBADF 9    /* read, write: not an open file descriptor */
-#define ECHILD 10  /* wait: no such child */
-#define EAGAIN 11  /* spawn: every process slot is taken */
-#define ENOMEM 12  /* spawn, sbrk: out of memory, or the heap would reach the stack */
-#define EFAULT 14  /* a pointer argument is not valid user memory */
-#define EINVAL 22  /* an argument is out of range */
-#define ENOSYS 38  /* no such system call */
+#define EPERM 1         /* link: not for a directory */
+#define ENOENT 2        /* no such file or directory */
+#define E2BIG 7         /* spawn, exec: argument list too long */
+#define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */
+#define EBADF 9         /* not an open file descriptor, or not open for that */
+#define ECHILD 10       /* wait: no such child */
+#define EAGAIN 11       /* spawn: every process slot is taken */
+#define ENOMEM 12       /* out of memory, or the heap would reach the stack */
+#define EACCES 13       /* spawn, exec: not a regular file */
+#define EFAULT 14       /* a pointer argument is not valid user memory */
+#define EEXIST 17       /* the name is taken */
+#define ENODEV 19       /* open: a device node with no driver */
+#define ENOTDIR 20      /* a name on the way is not a directory */
+#define EISDIR 21       /* open: a directory, for writing */
+#define EINVAL 22       /* an argument is out of range */
+#define ENFILE 23       /* every slot of the kernel's open file table is taken */
+#define EMFILE 24       /* every descriptor of the process is taken */
+#define EFBIG 27        /* write: past the largest file */
+#define ENOSPC 28       /* no free block or inode on the disk */
+#define ESPIPE 29       /* lseek: not on a pipe or a device */
+#define EROFS 30        /* the filesystem is read-only */
+#define EPIPE 32        /* write: a pipe nobody reads any more */
+#define ENAMETOOLONG 36 /* a name longer than DIRSIZ, or a path longer than MAXPATH */
+#define ENOSYS 38       /* no such system call */
+#define ENOTEMPTY 39    /* unlink: a directory with entries */
 
-/* The console's file descriptors. */
+/* The standard file descriptors: the console's in the shell, and what a
+ * child inherits from its parent. */
 #define STDIN 0
 #define STDOUT 1
 #define STDERR 2
 
-/* spawn's limits: arguments, argv[0] included, and the bytes their strings
- * take with their NULs. */
+/* spawn's and exec's limits: arguments, argv[0] included, and the bytes
+ * their strings take with their NULs. */
 #define MAXARG 16
 #define ARG_MAX 512
+
+/* open's flags: one access mode, plus O_CREAT (make the file if it is
+ * missing) and O_TRUNC (empty it, when opened for writing). */
+#define O_RDONLY 0x000
+#define O_WRONLY 0x001
+#define O_RDWR 0x002
+#define O_CREAT 0x040
+#define O_TRUNC 0x200
+
+/* lseek's `whence`. */
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
+/* The longest path, without its NUL, and the longest name in a directory. */
+#define MAXPATH 127
+#define DIRSIZ 14
+
+/* What fstat stores. */
+#define T_DIR 1
+#define T_FILE 2
+#define T_DEVICE 3
+#define T_PIPE 4
+
+struct stat {
+    uint ino;     /* the inode; 0 for a pipe or the shell's console */
+    ushort type;  /* T_DIR, T_FILE, T_DEVICE or T_PIPE */
+    ushort nlink; /* directory entries naming it */
+    uint size;    /* bytes; for a pipe, those waiting to be read */
+    ushort major; /* a device's numbers */
+    ushort minor;
+};
+
+/* What reading a directory returns: one of these per slot, inum 0 for a
+ * free one. A name of DIRSIZ bytes has no NUL. */
+struct dirent {
+    ushort inum;
+    char name[DIRSIZ];
+};
 
 /* The system calls. */
 void exit(int status);
@@ -40,10 +96,21 @@ int read(int fd, void *buf, uint len);
 int getpid(void);
 int yield(void);
 int sleep(uint ticks);
-int spawn(const char *name, char *const argv[]);
+int spawn(const char *path, char *const argv[]);
 int wait(int pid, int *status);
 int sbrk(int increment);
 uint uptime(void);
+int open(const char *path, int flags);
+int close(int fd);
+int lseek(int fd, int offset, int whence);
+int fstat(int fd, struct stat *st);
+int mkdir(const char *path);
+int unlink(const char *path);
+int link(const char *old, const char *new);
+int chdir(const char *path);
+int dup(int fd);
+int pipe(int *fds);
+int exec(const char *path, char *const argv[]);
 /* Any call by number (for tests). */
 int syscall(int number, uint a0, uint a1, uint a2);
 
@@ -74,8 +141,13 @@ int puts(const char *s);
  * at the end of the input or on an error. */
 int getline(char *buf, int size);
 
-/* What error number `err` (positive) means, e.g. "no such program". */
+/* What error number `err` (positive) means, e.g. "no such file or
+ * directory". */
 const char *strerror(int err);
+
+/* fstat() on the file at `path`: opens it for reading, then closes it.
+ * Returns 0 or the error. */
+int stat(const char *path, struct stat *st);
 
 /* Busy-waits for about `n` iterations of a short loop, a few instructions
  * each: CPU time, as opposed to sleep(). */

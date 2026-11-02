@@ -609,7 +609,7 @@ static void write_test(void) {
         wrote = write_chunk(big, off, CHUNK, 3) == CHUNK;
     }
 
-    /* x removed while still in use (as an open file will be, #67): the
+    /* x removed while still in use (as an open file can be): the
      * unlink commits its last link, and the inode stays allocated until the
      * last iput(), in the next transaction. A crash in between leaves it
      * for the next mount to free. */

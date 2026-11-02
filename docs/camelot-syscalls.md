@@ -2,12 +2,16 @@
 
 The interface between Camelot's user programs and its kernel: how a program
 starts, how it calls the kernel, what each call does and how it fails. The
-kernel side is `kernel/syscall.c` (with `kernel/proc.c`, `kernel/console.c`
-and `kernel/vm.c`), the numbers are in `kernel/include/syscall.h`; the user
-side is `kernel/user/usys.s` (one stub per call), `kernel/user/user.h` (their
-C declarations and the error numbers) and `kernel/user/crt0.s` (the start-up
-code). How processes, address spaces and the scheduler work inside the kernel
-is in `docs/excalibur-spec.md`, section 10, "Kernel processes".
+kernel side is `kernel/syscall.c` and `kernel/sysfile.c` (with
+`kernel/proc.c`, `kernel/exec.c`, `kernel/file.c`, `kernel/pipe.c`,
+`kernel/console.c`, `kernel/fs.c` and `kernel/vm.c`), the numbers are in
+`kernel/include/syscall.h`; the user side is `kernel/user/usys.s` (one stub
+per call), `kernel/user/user.h` (their C declarations, the error numbers,
+`open`'s flags and `struct stat`) and `kernel/user/crt0.s` (the start-up
+code). How processes, address spaces, the scheduler and open files work
+inside the kernel is in `docs/excalibur-spec.md`, section 10, "Kernel
+processes" and "Kernel files"; the filesystem's format is in
+`docs/camelot-fs.md`.
 
 The numbers in the tables below are checked against `syscall.h`, `usys.s`
 and `user.h` by `cargo test` (`crates/xtask/tests/kernel.rs`): change all of
@@ -42,56 +46,88 @@ fails the check, such as a null pointer, a kernel address, the guard page
 under the stack, memory past the end of the heap, read-only memory for a
 buffer the kernel writes, or a length that runs past `USER_TOP` or wraps
 around, makes the call return `-EFAULT` having done nothing: no bytes are
-written to the console, no input is consumed, no process is started. A bad
-pointer never faults the kernel or kills the caller. An empty range (a
-length of 0) is never a fault, whatever the pointer.
+written to the console, a file or a pipe, no input is consumed, no file is
+made or opened, no process is started. A bad pointer never faults the
+kernel or kills the caller. An empty range (a length of 0) is never a
+fault, whatever the pointer. A string (a path, an argument) must be readable
+up to its NUL. The checks come in a fixed order: a bad descriptor
+(`-EBADF`) first, then a bad pointer (`-EFAULT`), then everything else, so
+a call that takes a path fails with `-EFAULT` for a bad one whether or not
+there is a filesystem to look it up in.
 
 ## Calls
 
 | Number | Name | Arguments | Returns |
 |---|---|---|---|
 | 1 | `exit` | `int status` | does not return |
-| 2 | `write` | `int fd, const void *buf, uint len` | `len`; `-EBADF`, `-EFAULT` |
-| 3 | `read` | `int fd, void *buf, uint len` | bytes read, 0 at the end of the input; `-EBADF`, `-EFAULT` |
+| 2 | `write` | `int fd, const void *buf, uint len` | bytes written; `-EBADF`, `-EFAULT`, `-EPIPE`, `-ENOSPC`, `-EFBIG`, `-EINVAL`, `-ENOMEM` |
+| 3 | `read` | `int fd, void *buf, uint len` | bytes read, 0 at the end of the input; `-EBADF`, `-EFAULT`, `-ENOMEM` |
 | 4 | `getpid` | | the caller's pid |
 | 5 | `yield` | | 0 |
 | 6 | `sleep` | `uint ticks` | 0 |
-| 7 | `spawn` | `const char *name, char *const argv[]` | the child's pid; `-ENOENT`, `-E2BIG`, `-ENOEXEC`, `-EAGAIN`, `-ENOMEM`, `-EFAULT` |
+| 7 | `spawn` | `const char *path, char *const argv[]` | the child's pid; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-EAGAIN`, `-ENOMEM`, `-EFAULT` |
 | 8 | `wait` | `int pid, int *status` | the pid of the child collected; `-ECHILD`, `-EFAULT` |
 | 9 | `sbrk` | `int increment` | the old end of the heap; `-ENOMEM`, `-EINVAL` |
 | 10 | `uptime` | | timer ticks since boot |
+| 11 | `open` | `const char *path, int flags` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EISDIR`, `-ENODEV`, `-EROFS`, `-ENOSPC`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
+| 12 | `close` | `int fd` | 0; `-EBADF` |
+| 13 | `lseek` | `int fd, int offset, int whence` | the new offset; `-EBADF`, `-ESPIPE`, `-EINVAL` |
+| 14 | `fstat` | `int fd, struct stat *st` | 0; `-EBADF`, `-EFAULT` |
+| 15 | `mkdir` | `const char *path` | 0; `-EEXIST`, `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-ENOSPC`, `-EROFS`, `-EFAULT` |
+| 16 | `unlink` | `const char *path` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EINVAL`, `-ENOTEMPTY`, `-EROFS`, `-EFAULT` |
+| 17 | `link` | `const char *old, const char *new` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EPERM`, `-EEXIST`, `-ENOSPC`, `-EROFS`, `-EFAULT` |
+| 18 | `chdir` | `const char *path` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EFAULT` |
+| 19 | `dup` | `int fd` | the new descriptor; `-EBADF`, `-EMFILE` |
+| 20 | `pipe` | `int *fds` | 0; `-EMFILE`, `-ENFILE`, `-ENOMEM`, `-EFAULT` |
+| 21 | `exec` | `const char *path, char *const argv[]` | does not return; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-ENOMEM`, `-EFAULT` |
 
 **exit(status)** ends the caller. Its exit status is kept for its parent's
 `wait`; the slot and every page the process held are freed once the parent
-has collected it (or at once, if it has no parent any more). Its children
-are orphaned: they keep running, and nobody collects them. When the first
-process, the shell, exits, the kernel runs until every remaining process has
-ended and then stops the machine with the shell's status as the exit code
-(its low 8 bits, so `exit -2` gives 0xFE). That includes a process blocked
-reading the console, which keeps the machine running until it gets a line
-or the end of the input (`sh &`, then `exit` in the first shell, leaves the
-second one reading). Note that 0xFE is also the code of a kernel panic: the
-exit code alone can't tell `exit -2` from a panic, the console output can.
-Returning from `main` calls `exit` with the return value (`crt0.s`).
+has collected it (or at once, if it has no parent any more). Its descriptors
+are closed and its working directory let go of first, as `close` would
+(which may free a file it held open after its last name was removed). Its
+children are orphaned: they keep running, and nobody collects them. When the
+first process, the shell, exits, the kernel runs until every remaining
+process has ended and then stops the machine with the shell's status as the
+exit code (its low 8 bits, so `exit -2` gives 0xFE). That includes a process
+blocked reading the console, which keeps the machine running until it gets a
+line or the end of the input (`sh &`, then `exit` in the first shell, leaves
+the second one reading). Note that 0xFE is also the code of a kernel panic:
+the exit code alone can't tell `exit -2` from a panic, the console output
+can. Returning from `main` calls `exit` with the return value (`crt0.s`).
 
 A process that faults in U-mode (any exception but `ecall`: a page fault, an
 illegal instruction such as `xcal.halt`, a misaligned access) is killed
 instead: the kernel prints a report on the console (section 10, "Kernel
 processes") and the process ends as if it had called `exit(-1)`.
 
-**write(fd, buf, len)** prints the `len` bytes at `buf` on the console and
-returns `len`. `fd` must be 1 (stdout) or 2 (stderr), which both go to the
-console; anything else is `-EBADF`. All of `buf` must be readable, or
-nothing is printed (`-EFAULT`). `len` = 0 prints nothing and returns 0.
+**write(fd, buf, len)** writes the `len` bytes at `buf` to the open file
+behind `fd` ("File descriptors" below) and returns how many it wrote: `len`,
+unless the disk filled up or a pipe lost its readers part way, when it is
+the bytes written until then. `fd` must be open for writing, or it is
+`-EBADF`; all of `buf` must be readable, or nothing is written (`-EFAULT`).
+`len` = 0 writes nothing and returns 0. To a file on the disk, the bytes go
+at the descriptor's offset, which moves past them, and the file grows if they
+run past its end; a write that can write nothing fails with what stopped it:
+`-ENOSPC` (the disk is full), `-EFBIG` (the file would pass the largest a
+file can be, 274 432 bytes), `-EINVAL` (the offset is past the end of the
+file, which another descriptor has emptied meanwhile), `-ENOMEM` (no page
+free for copying through). To the console, the bytes are printed. To a
+pipe, they wait in it for a reader ("Pipes"); `-EPIPE` if no read end is
+open any more.
 
-**read(fd, buf, len)** reads console input into `buf`. `fd` must be 0
-(stdin), or it is `-EBADF`; all of `buf` must be writable, or it is
-`-EFAULT` and no input is taken. Input is line-buffered and edited by the
-kernel ("Console input" below): a read waits, sleeping, until a whole line
-has been typed, then returns up to `len` bytes of it. What it leaves of the
-line goes to the next read, so a line longer than `len` takes several reads,
-and a read never returns bytes from two lines. 0 means the end of the input
-(Ctrl-D on an empty line). `len` = 0 returns 0 without waiting.
+**read(fd, buf, len)** reads up to `len` bytes from the open file behind
+`fd` into `buf` and returns how many it read; 0 means the end of the input.
+`fd` must be open for reading, or it is `-EBADF`; all of `buf` must be
+writable, or it is `-EFAULT` and nothing is read. `len` = 0 returns 0 without
+waiting. From a file on the disk, the bytes come from the descriptor's
+offset, which moves past them: `len` of them, fewer at the end of the file,
+0 at or past it. A directory reads the same way, as its array of 16-byte
+entries (`struct dirent` in `user.h`, the format in `docs/camelot-fs.md`).
+From the console, a read waits for a whole line ("Console input"). From a
+pipe, it waits while the pipe is empty and a write end is open, then returns
+what is there, up to `len` bytes; 0 once it is empty and no write end is
+left.
 
 **getpid()** returns the caller's pid. Pids count from 1 (the shell) and are
 never reused.
@@ -104,25 +140,29 @@ every timer tick (10 Hz), so yielding is only ever a courtesy.
 the nominal clock) have passed, without using the CPU meanwhile. `sleep(0)`
 returns at once.
 
-**spawn(name, argv)** starts the program called `name` (one of those built
-into the kernel, `kernel/user/`) as a new process, a child of the caller,
-and returns its pid. From then on both take turns on the CPU with the other
-runnable processes. `argv` is the child's argument list, an array of string
+**spawn(path, argv)** starts the program at `path` ("Running programs"
+below) as a new process, a child of the caller, and returns its pid. From
+then on both take turns on the CPU with the other runnable processes. The
+child gets copies of the caller's descriptors 0, 1 and 2 (sharing their
+open files, offsets included; a closed one stays closed) and no other, and
+the caller's working directory. Its name, in the kernel's messages, is the
+last name of `path`. `argv` is the child's argument list, an array of string
 pointers ending with a null pointer, `argv[0]` conventionally the program's
-name; a null `argv` stands for `{ name, NULL }`. The kernel copies the
+name; a null `argv` stands for `{ path, NULL }`. The kernel copies the
 strings onto the child's stack ("Starting a program" below), so the caller's
 array can go as soon as `spawn` returns. Errors:
 
-- `-ENOENT`: no program is called `name`;
+- `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`: the path names nothing ("Paths");
+- `-EACCES`: it names a directory or a device;
 - `-E2BIG`: more than `MAXARG` (16) arguments, or their strings, with their
   NULs, take more than `ARG_MAX` (512) bytes;
-- `-ENOEXEC`: the program's image is not a valid executable (the kernel also
-  prints why on the console: `spawn: NAME: REASON`);
+- `-ENOEXEC`: the file is not a valid executable (the kernel also prints why
+  on the console: `spawn: PATH: REASON`);
 - `-EAGAIN`: every one of the 8 process slots is taken (zombies count until
   they are collected);
 - `-ENOMEM`: not enough free memory;
-- `-EFAULT`: `name`, `argv` or one of the strings is not readable (a name
-  longer than any program's is still read to its NUL).
+- `-EFAULT`: `path`, `argv` or one of the strings is not readable (a path
+  longer than `MAXPATH` is still read to its NUL).
 
 **wait(pid, status)** collects a child that has ended and returns its pid:
 the child `pid`, or any child if `pid` is -1. If none has ended yet, it
@@ -145,31 +185,200 @@ runs out (nothing changes), `-EINVAL` when it would shrink below its start.
 **uptime()** returns the timer ticks since boot (10 a second at the nominal
 clock), as an unsigned number.
 
+**open(path, flags)** opens the file at `path` and returns a new descriptor
+for it, the lowest one free. `flags` is one access mode, `O_RDONLY` (0),
+`O_WRONLY` (1) or `O_RDWR` (2), plus any of `O_CREAT` (0x40: make the file,
+empty, if `path` names nothing; open it as it is if it exists) and
+`O_TRUNC` (0x200: empty a file opened for writing; ignored for reading and
+for devices); anything else is `-EINVAL`. The offset starts at 0. What it
+opens:
+
+- a file, in the access mode asked for; on a read-only filesystem, writing
+  (or creating) is `-EROFS`;
+- a directory, for reading only: anything else is `-EISDIR`, and so is
+  `O_CREAT` on a missing name with a trailing slash (`newf/` names a
+  directory, and `open` makes only files);
+- a device node (`/dev/console`), which gives the device itself: the
+  console's reads and writes, in the access mode asked for, also on a
+  read-only filesystem; a node whose major number has no driver is
+  `-ENODEV`.
+
+Errors: the path's (`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`), those above,
+`-ENOSPC` (no free inode or block to make the file with), `-EMFILE` (all 16
+of the caller's descriptors are taken), `-ENFILE` (all 64 of the kernel's
+open files are), `-EFAULT`. Without a free descriptor and open file nothing
+is made. Making the file, or emptying it, is one transaction: a crash leaves
+it done or not.
+
+**close(fd)** closes descriptor `fd`, which is free again. The open file
+behind it goes with the last descriptor that shares it: a pipe end is closed
+then ("Pipes"), and a file whose last name was removed meanwhile is freed.
+`-EBADF` if `fd` isn't open.
+
+**lseek(fd, offset, whence)** moves the offset of the file behind `fd` to
+`offset` bytes from the start (`whence` = `SEEK_SET`, 0), from the current
+offset (`SEEK_CUR`, 1) or from the end (`SEEK_END`, 2), and returns it.
+Errors: `-EBADF`; `-ESPIPE` for a pipe or a device, which have no offset;
+`-EINVAL` for another `whence`, or a new offset below 0 or past the end of
+the file (files have no holes: they only grow by writing at their end).
+
+**fstat(fd, st)** stores what the open file behind `fd` is in the `struct
+stat` at `st` (16 bytes, `user.h`): `ino` (its inode, 0 for a pipe and for
+the console the kernel gave the shell), `type` (`T_DIR` 1, `T_FILE` 2,
+`T_DEVICE` 3, `T_PIPE` 4), `nlink` (the names it has; 0 for a file whose
+last name was removed while it is open), `size` (bytes; for a pipe, the
+bytes waiting in it; 0 for a device), `major` and `minor` (a device's
+numbers, 1 and 0 for the console). `-EBADF`, or `-EFAULT` if `st` is not
+writable.
+
+**mkdir(path)** makes the directory `path`, with its `.` and `..`. Errors:
+`-EEXIST` (the name is taken, `/` included), the path's, `-ENOENT` also for
+a directory to make it in that has been removed (a working directory, say),
+`-ENOSPC`, `-EROFS`, `-EFAULT`.
+
+**unlink(path)** removes the name `path`. A file loses a link; once it has
+none, it is freed as soon as no descriptor has it open (until then it can
+still be read and written through them). A directory must be empty (but for
+`.` and `..`), or it is `-ENOTEMPTY`; one that is some process's working
+directory is removed even so: nothing can be made in it any more, and
+nothing but `.` is found in it (looking up its `..` is `-ENOENT`: the parent
+may be gone too, its inode freed or reused).
+`-EINVAL` for `.`, `..` and `/`; the path's errors; `-EROFS`; `-EFAULT`.
+
+**link(old, new)** gives the file `old` another name, `new`: a hard link,
+the same file under both, with one more link. Errors: the paths'
+(`-ENOENT` also for a removed directory to put `new` in), `-EPERM` if `old`
+is a directory (a directory has one name, in its parent), `-EEXIST` if
+`new` is taken (`/` included), `-ENOSPC`, `-EROFS`, `-EFAULT`.
+
+**chdir(path)** makes the directory `path` the caller's working directory,
+where every path that doesn't start with `/` is looked up from. `-ENOTDIR`
+if it is not a directory; the path's errors; `-EFAULT`.
+
+**dup(fd)** returns a new descriptor, the lowest one free, for the open file
+behind `fd`: both share it, offset included, and it stays open until both
+are closed. `-EBADF`, or `-EMFILE` if every descriptor is taken.
+
+**pipe(fds)** makes a pipe and stores two new descriptors in `fds[0]` (the
+read end) and `fds[1]` (the write end), the lowest two free ("Pipes").
+Errors: `-EMFILE`, `-ENFILE`, `-ENOMEM` (no page for its buffer), or
+`-EFAULT` if `fds` is not 8 writable bytes; nothing is opened then.
+
+**exec(path, argv)** replaces the caller's program with the one at `path`:
+its address space goes, and the new program starts as one started by
+`spawn` does ("Starting a program"), with `argv`, in the same process. Its
+pid, parent, descriptors (all of them) and working directory stay; its name
+becomes the last name of `path`. On success it doesn't return; on an error,
+nothing changed and the old program carries on with the error, `spawn`'s
+but `-EAGAIN` (the kernel prints `exec: PATH: REASON` for `-ENOEXEC`).
+
 ## Error numbers
 
 Linux's values for the same conditions.
 
 | Number | Name | Meaning |
 |---|---|---|
-| 2 | `ENOENT` | spawn: no program by that name |
-| 7 | `E2BIG` | spawn: argument list too long |
-| 8 | `ENOEXEC` | spawn: the program's image is not a valid executable |
-| 9 | `EBADF` | read, write: not an open file descriptor |
+| 1 | `EPERM` | link: not for a directory |
+| 2 | `ENOENT` | no such file or directory |
+| 7 | `E2BIG` | spawn, exec: argument list too long |
+| 8 | `ENOEXEC` | spawn, exec: the file is not a valid executable |
+| 9 | `EBADF` | not an open descriptor, or not open for that |
 | 10 | `ECHILD` | wait: no such child |
 | 11 | `EAGAIN` | spawn: every process slot is taken |
-| 12 | `ENOMEM` | spawn, sbrk: out of memory, or the heap would reach the stack |
+| 12 | `ENOMEM` | out of memory, or the heap would reach the stack |
+| 13 | `EACCES` | spawn, exec: not a regular file |
 | 14 | `EFAULT` | a pointer argument is not valid user memory |
+| 17 | `EEXIST` | the name is taken |
+| 19 | `ENODEV` | open: a device node with no driver |
+| 20 | `ENOTDIR` | a name on the way is not a directory |
+| 21 | `EISDIR` | open: a directory, for writing |
 | 22 | `EINVAL` | an argument is out of range |
+| 23 | `ENFILE` | every one of the kernel's open files is taken |
+| 24 | `EMFILE` | every descriptor of the process is taken |
+| 27 | `EFBIG` | write: past the largest file |
+| 28 | `ENOSPC` | no free block or inode on the disk |
+| 29 | `ESPIPE` | lseek: a pipe or a device |
+| 30 | `EROFS` | the filesystem is read-only |
+| 32 | `EPIPE` | write: a pipe nobody reads any more |
+| 36 | `ENAMETOOLONG` | a name longer than 14 bytes, or a path longer than `MAXPATH` |
 | 38 | `ENOSYS` | no such system call |
+| 39 | `ENOTEMPTY` | unlink: a directory with entries |
 
 `strerror` in `kernel/user/ulib.c` has a short message for each.
 
 ## File descriptors
 
-There is no file system yet, only the console, and every process has the
-same three descriptors, which can't be closed or duplicated: 0 (stdin) for
-`read`, 1 (stdout) and 2 (stderr) for `write`. Using one for the other
-direction is `-EBADF`.
+A descriptor is a small number, 0 to 15, that stands for an open file: a
+file or directory of the filesystem, a device (the console), or one end of a
+pipe. Each process has its own 16; they point into the kernel's table of 64
+open files, which is where the access mode (reading, writing or both) and,
+for a file on the disk, the offset live. `dup`, and `spawn` for descriptors
+0 to 2, make a second descriptor for the same open file, which then shares
+its offset; `open` makes a new open file every time, with its own. The open
+file goes once the last descriptor for it is closed.
+
+The first process, the shell, starts with the console as 0 (stdin, for
+reading), 1 (stdout) and 2 (stderr), both for writing. Every other process
+gets 0, 1 and 2 from its parent at `spawn`, whatever they are by then: the
+shell redirects a program's input or output by putting a file or a pipe at
+0 or 1 (`close`, then `dup` or `open`, which take the lowest free number),
+spawning it, and putting its own back from copies it keeps above 2, which
+no child inherits. So does `exec`, which keeps every descriptor.
+
+## Paths
+
+A path names a file, a directory or a device node in the root filesystem
+(`docs/camelot-fs.md`, the disk the kernel mounts at boot): names separated
+by `/`, looked up from the root if it starts with `/`, else from the
+caller's working directory (`chdir`; the root for the shell, and inherited
+at `spawn`). Repeated slashes count as one and a trailing one is ignored;
+`.` and `..` are ordinary entries of every directory (the root's `..` is
+itself). Every name but the last must be a directory (`-ENOTDIR`), and each
+must exist (`-ENOENT`). A name is at most 14 bytes, a path at most
+`MAXPATH` (127) bytes without its NUL (`-ENAMETOOLONG` for either). The
+empty path names nothing (`-ENOENT`).
+
+Without a root filesystem (no disk, or none the kernel could mount), every
+call that takes a path fails with `-ENOENT`, but `spawn` and `exec`: the
+programs built into the kernel stand in for `/bin` ("Running programs").
+
+Every change a call makes to the disk is a transaction of the filesystem's
+log: `open` making or emptying a file, `mkdir`, `unlink`, `link`, and
+closing (or `chdir`ing away from) something removed while in use, which
+frees it. A crash, or the machine stopping, leaves all of each or none of
+it. A `write` is the one exception: it goes to the disk 3 KiB per
+transaction, so a crash part way through a bigger one leaves the file with
+some of the bytes, a whole number of those pieces, never a torn block.
+
+## Pipes
+
+A pipe is a buffer of 512 bytes between its two ends, each an open file
+(`pipe`). A write waits, sleeping, while the pipe is full, and returns once
+all its bytes are in; a read waits while it is empty and returns what is
+there. Each wakes the other as it makes room or data. When the last
+descriptor for the write end is closed, a reader gets what is left, then 0,
+the end of the input; when the last one for the read end is, a writer gets
+`-EPIPE` (or, for a write that had put some bytes in before, their count).
+`lseek` on a pipe is `-ESPIPE`, and `fstat` gives `T_PIPE` and the bytes
+waiting. A pipe's buffer is a page, freed with its last end.
+
+So the shell runs `a | b`: it makes a pipe, puts its write end at 1 and
+spawns `a`, puts the read end at 0 and spawns `b`, and closes its own
+copies, so that `a`'s exit closes the last write end and `b` sees the end of
+its input.
+
+## Running programs
+
+`spawn` and `exec` take the path of an executable: a regular file of the
+root filesystem (a directory or a device is `-EACCES`), which the kernel
+reads as it loads it. The shell runs `NAME` as `/bin/NAME`, where `cargo
+xtask fs` puts the programs of `kernel/user/`.
+
+Without a root filesystem, the same programs are built into the kernel, and
+the kernel finds them as `/bin/NAME` (or `bin/NAME`, from the root, which is
+then everyone's working directory): nothing else exists. The shell itself is
+started as `/bin/sh`, from the filesystem when there is one and it has a
+`/bin/sh`, else the kernel's own.
 
 ## Starting a program
 
@@ -188,8 +397,8 @@ permissions, and a heap after the last one. User space is the low 4 MiB:
 0x0040_0000  USER_TOP: nothing above is accessible from U-mode
 ```
 
-The kernel enters the program at its ELF entry point, crt0's `_start`, with
-every register zero except:
+Whether from `spawn` or `exec`, the kernel enters the program at its ELF
+entry point, crt0's `_start`, with every register zero except:
 
 - `a0` = `argc`, the number of arguments;
 - `a1` = `argv`, the address of the argument array;
@@ -232,10 +441,12 @@ line and its NUL.
 
 Programs are compiled freestanding with only `user.h`, which declares the
 calls above (the stubs in `usys.s`, which return the raw result, a negative
-error number included) and a small C library (`ulib.c`): `strlen`, `strcmp`,
-`strchr`, `memset`, `memcpy`, `memmove`, `memcmp`, `atoi`, `printf` and
-`fprintf` (`%d %u %x %p %s %c %%` with `-`, `0` and a width), `puts`,
-`getline` (one read, without the newline), `strerror` and `spin` (a busy
+error number included), their constants and structures (`O_*`, `SEEK_*`,
+`struct stat`, `struct dirent`, `T_*`, `MAXPATH`, `DIRSIZ`) and a small C
+library (`ulib.c`): `strlen`, `strcmp`, `strchr`, `memset`, `memcpy`,
+`memmove`, `memcmp`, `atoi`, `printf` and `fprintf` (`%d %u %x %p %s %c %%`
+with `-`, `0` and a width), `puts`, `getline` (one read, without the
+newline), `strerror`, `stat` (`open`, `fstat`, `close`) and `spin` (a busy
 loop). `syscall(number, a0, a1, a2)` makes any call by number, for tests.
 
 ## Building programs
@@ -243,8 +454,10 @@ loop). `syscall(number, a0, a1, a2)` makes any call by number, for tests.
 Each `kernel/user/X.c` or `X.s` is a program called `X`, linked with the
 runtime: `crt0.s`, `usys.s` and `ulib.c`. Our own tools build them, with no
 LLVM: merlin-as assembles each source, merlin-ld links each program with
-`user.ld`, and the executables are embedded in the kernel through the
-generated `kernel/userprogs.s` (`crates/xtask/src/userprogs.rs`). Until
+`user.ld`, and the executables go to `/bin/X` on the root image (`cargo
+xtask fs`, `crates/xtask/src/fs.rs`) and are embedded in the kernel, for
+when there is no disk, through the generated `kernel/userprogs.s`
+(`crates/xtask/src/userprogs.rs`). Until
 Merlin (#15) compiles this much C, the assembly for each C file comes from
 clang, `-S` with the flags in `userprogs.rs`, and is committed in
 `kernel/user/clang/`.
@@ -258,7 +471,8 @@ cargo xtask kernel
 which recompiles the C files with clang into `kernel/user/clang/`
 (rewriting only the files that changed, deleting any whose C file is gone),
 regenerates `kernel/userprogs.s` with merlin-as and merlin-ld, and rebuilds
-`kernel/kernel.elf`; commit all three. `cargo test` checks, without LLVM,
+`kernel/kernel.elf`; commit all three (and run `cargo xtask fs` for a root
+image with the new programs). `cargo test` checks, without LLVM,
 that every C file has its committed assembly and that `userprogs.s` is what
 the current sources and tools give; with the clang recorded in
 `kernel/kernel.elf.clang-version` installed, it also checks that the
