@@ -118,6 +118,14 @@ struct procinfo {
     char name[16];
 };
 
+/* What harts stores for each hart: 16 bytes. */
+struct hartinfo {
+    uint hart;     /* its id, 0 to the number of harts - 1 */
+    uint pid;      /* the process it runs (the caller, on the caller's hart), 0 while idle */
+    uint ticks;    /* timer ticks it has taken */
+    uint switches; /* processes it has switched to */
+};
+
 #define PROC_RUNNABLE 1 /* waiting for its turn */
 #define PROC_RUNNING 2  /* on the CPU: the caller */
 #define PROC_ZOMBIE 3   /* ended, not collected by its parent yet */
@@ -237,6 +245,7 @@ int pipe(int *fds);
 int exec(const char *path, char *const argv[]);
 int kill(int pid);
 int procs(struct procinfo *buf, uint max);
+int harts(struct hartinfo *buf, uint max);
 int netinfo(struct netinfo *info);
 int netconf(uint addr, uint mask, uint gateway);
 int ping(uint addr, uint seq, struct ping_reply *reply);

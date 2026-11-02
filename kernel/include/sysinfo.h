@@ -17,6 +17,7 @@
 #define SYS_CPU_HZ 0x14
 #define SYS_FLAGS 0x18
 #define SYS_DEV_COUNT 0x1c
+#define SYS_HARTS 0x20 /* number of harts, 1 to 8 (spec section 7, "Harts") */
 #define SYS_DEV_TABLE 0x40
 
 #define SYSINFO_MAGIC 0x53595349 /* "SYSI" */

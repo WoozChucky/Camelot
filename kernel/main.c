@@ -1,7 +1,8 @@
 /* Camelot kernel: C entry point. entry.s sets up the stack and clears .bss,
- * start() drops to S-mode, then supervisor_entry calls kmain(); its return
- * value becomes the exit code. After booting, kmain runs the user-space shell
- * as the first process, and returns when it exits. */
+ * start() drops to S-mode, then supervisor_entry calls kmain() on hart 0;
+ * its return value becomes the exit code. After booting, kmain starts the
+ * other harts, if the machine has any (smp.c), runs the user-space shell as
+ * the first process, and returns when it exits. */
 #include "bio.h"
 #include "blk.h"
 #include "blktest.h"
@@ -15,6 +16,7 @@
 #include "mmio.h"
 #include "proc.h"
 #include "riscv.h"
+#include "smp.h"
 #include "spinlock.h"
 #include "string.h"
 #include "timer.h"
@@ -311,6 +313,9 @@ int kmain(void) {
     failed += blk_selftest();
     failed += fs_boot();
     failed += net_boot();
+    /* The other harts, last: the self-tests above run their kernel
+     * processes on hart 0 alone. */
+    failed += smp_boot();
     int status = run_shell();
     /* Failed self-tests are what the exit code reports first. */
     return failed != 0 ? failed : status;

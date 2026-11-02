@@ -6,6 +6,7 @@
 #include "kprintf.h"
 #include "memlayout.h"
 #include "riscv.h"
+#include "smp.h"
 #include "string.h"
 #include "sysinfo.h"
 #include "trap.h"
@@ -78,12 +79,24 @@ void unmap_pages(pagetable_t pt, u32 va, u32 size, bool free_pages) {
     if (last < va) {
         panic("unmap_pages: range wraps around");
     }
+    /* Two passes. First the mappings go: a PTE without V translates
+     * nothing, but keeps the page's address for the second pass. */
     for (u32 a = va;; a += PGSIZE) {
         pte_t *pte = walk(pt, a, false);
         if (pte == NULL || (*pte & PTE_V) == 0) {
             kprintf("unmap_pages: %p is not mapped\n", (void *)(uintptr)a);
             panic("unmap_pages: not mapped");
         }
+        *pte = *pte & ~PTE_V;
+        if (a == last) {
+            break;
+        }
+    }
+    /* Then no hart may still hold a translation to one of the pages in its
+     * TLB (smp.h), before they can be reused. */
+    tlb_shootdown(pt);
+    for (u32 a = va;; a += PGSIZE) {
+        pte_t *pte = walk(pt, a, false);
         if (free_pages) {
             kfree((void *)(uintptr)PTE2PA(*pte));
         }
@@ -165,6 +178,7 @@ void kvminit(void) {
 void kvminithart(void) {
     /* Finish the page-table stores before the first translation uses them. */
     sfence_vma();
+    mycpu()->pagetable = kernel_pagetable;
     w_satp(MAKE_SATP(kernel_pagetable));
     sfence_vma();
 }

@@ -1,4 +1,5 @@
-/* PLIC setup and the claim/complete handshake for the S-mode context. */
+/* PLIC setup and the claim/complete handshake for hart 0's S-mode context,
+ * which takes every device interrupt (plic.h). */
 #include "plic.h"
 #include "mmio.h"
 

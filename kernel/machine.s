@@ -1,39 +1,56 @@
-# The M-mode trap handler. start() points mtvec here and mscratch at
-# machine_scratch. Every exception except ecall-from-S and every S-level
-# interrupt is delegated to S-mode, so only these get here:
+# The M-mode trap handler, the same on every hart. start() points mtvec here
+# and mscratch at the hart's block of machine_scratch. Every exception except
+# ecall-from-S and every S-level interrupt is delegated to S-mode, so only
+# these get here:
 #
-# * The machine timer (mcause 0x8000_0007). Rearm mtimecmp one interval later
-#   and raise the S-mode software interrupt (mip.SSIP), which the kernel
-#   counts as a tick. Excalibur has no Sstc, so S-mode can't program the timer
-#   itself; this is the usual forwarding trampoline.
+# * The machine timer (mcause 0x8000_0007). Rearm the hart's mtimecmp one
+#   interval later, note the tick in the scratch block and raise the S-mode
+#   software interrupt (mip.SSIP), which the kernel counts as a tick.
+#   Excalibur has no Sstc, so S-mode can't program the timer itself; this is
+#   the usual forwarding trampoline.
+# * A machine software interrupt (mcause 0x8000_0003): an IPI, which another
+#   hart sent with MCALL_IPI. Acknowledge it (msip = 0) and raise SSIP too,
+#   without the tick: the kernel looks at what the other hart asked for
+#   (spec section 10, "Kernel SMP"). SSIP is the kernel's one doorbell, so
+#   the tick word says whether a timer tick rang it.
 # * A machine call: ecall from S-mode (mcause 9), function number in a7.
 #     a7 = 0 (MCALL_HALT): stop the machine with exit code a0.
+#     a7 = 1 (MCALL_IPI): set msip of every hart whose bit is set in a0;
+#                         returns 0.
 #   Unknown functions return -1 in a0.
 # * Anything else is a kernel bug and goes to early_trap (exit code 0xff).
 #
-# Runs with no stack: a1-a3 are saved in machine_scratch, a0 in mscratch.
-# machine_scratch layout (include/machine.h):
+# Runs with no stack: a1-a3 are saved in the scratch block, a0 in mscratch.
+# The scratch block's layout (include/machine.h):
 #   0, 4, 8   saved a1, a2, a3
 #   12        timer interval in mtime ticks
+#   16        the address of this hart's mtimecmp
+#   20        1 when the last SSIP came with a timer tick
 
-    .equ CLINT_MTIMECMP, 0x02004000
+    .equ CLINT_MSIP, 0x02000000
+    .equ MCAUSE_MSI, 0x80000003
     .equ MCAUSE_MTI, 0x80000007
     .equ MCAUSE_ECALL_S, 9
     .equ MCALL_HALT, 0
+    .equ MCALL_IPI, 1
     .equ SCRATCH_INTERVAL, 12
+    .equ SCRATCH_MTIMECMP, 16
+    .equ SCRATCH_TICK, 20
     .equ MIP_SSIP, 2
 
     .text
     .align 2
     .globl machine_vec
 machine_vec:
-    csrrw a0, mscratch, a0      # a0 = scratch area, mscratch = caller's a0
+    csrrw a0, mscratch, a0      # a0 = scratch block, mscratch = caller's a0
     sw    a1, 0(a0)
     sw    a2, 4(a0)
     sw    a3, 8(a0)
     csrr  a1, mcause
     li    a2, MCAUSE_MTI
     beq   a1, a2, machine_timer
+    li    a2, MCAUSE_MSI
+    beq   a1, a2, machine_soft
     li    a2, MCAUSE_ECALL_S
     beq   a1, a2, machine_call
     j     early_trap
@@ -41,7 +58,7 @@ machine_vec:
 # mtimecmp += interval, a 64-bit add done in two halves. M-mode runs with
 # mstatus.MIE = 0, so the half-written compare value can't fire.
 machine_timer:
-    li    a1, CLINT_MTIMECMP
+    lw    a1, SCRATCH_MTIMECMP(a0)
     lw    a2, 0(a1)             # low word
     lw    a3, SCRATCH_INTERVAL(a0)
     add   a3, a2, a3
@@ -50,7 +67,19 @@ machine_timer:
     lw    a3, 4(a1)
     add   a3, a3, a2
     sw    a3, 4(a1)
+    li    a1, 1
+    sw    a1, SCRATCH_TICK(a0)  # this SSIP is a tick (trap.c swaps it back to 0)
     csrsi mip, MIP_SSIP         # forward the tick to S-mode
+    j     machine_vec_return
+
+# msip[mhartid] = 0, then pass the IPI on to S-mode.
+machine_soft:
+    csrr  a1, mhartid
+    slli  a1, a1, 2
+    li    a2, CLINT_MSIP
+    add   a1, a1, a2
+    sw    zero, 0(a1)
+    csrsi mip, MIP_SSIP
     j     machine_vec_return
 
 machine_call:
@@ -58,7 +87,27 @@ machine_call:
     addi  a1, a1, 4             # resume after the ecall
     csrw  mepc, a1
     li    a2, MCALL_HALT
+    beq   a7, a2, machine_call_halt
+    li    a2, MCALL_IPI
     bne   a7, a2, machine_call_unknown
+    # msip[i] = 1 for every bit i of the caller's a0, from bit 0 up.
+    csrr  a1, mscratch          # the caller's a0: the harts
+    li    a2, CLINT_MSIP
+1:  beqz  a1, 3f
+    andi  a3, a1, 1
+    beqz  a3, 2f
+    sw    a3, 0(a2)             # a3 = 1
+2:  srli  a1, a1, 1
+    addi  a2, a2, 4
+    j     1b
+3:  lw    a1, 0(a0)
+    lw    a2, 4(a0)
+    lw    a3, 8(a0)
+    csrrw a0, mscratch, a0
+    li    a0, 0
+    mret
+
+machine_call_halt:
     csrr  a0, mscratch          # the caller's a0: the exit code
     .word 0x0005100b            # xcal.halt a0
 1:  j     1b
@@ -84,3 +133,11 @@ machine_halt:
     li    a7, MCALL_HALT
     ecall
 1:  j     1b
+
+# void machine_ipi(u32 harts): MCALL_IPI from S-mode. The ecall changes a0
+# (the result, 0) and nothing else.
+    .globl machine_ipi
+machine_ipi:
+    li    a7, MCALL_IPI
+    ecall
+    ret
