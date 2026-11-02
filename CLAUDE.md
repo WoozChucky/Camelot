@@ -22,8 +22,8 @@ crates/excalibur        encodings, decoder, disassembler (shared by every tool)
 crates/elf32            ELF32 reader (grail, merlin-objdump, merlin-ld)
 crates/grail            the emulator
 crates/avalon-proto     Avalon protocol (framing, messages, Connection, Screen diffing), shared by the Avalon platform's programs; spec in docs/avalon-protocol.md
-crates/avalon           the Avalon hypervisor server: VM table, one thread per running VM (run_for slices), consoles, screen viewers and input, RAM budget
-crates/avalon-client    the client layer: VM control and disk management operations, parsers/formatters for addresses, sizes, clocks, disk sources (shared by Round Table and Pendragon; reuses grail::parse_ram_mib/parse_clock)
+crates/avalon           the Avalon hypervisor server: VM table, one thread per running VM (run_for slices), consoles, screen viewers and input, RAM budget, virtual Ethernet switches (src/switch.rs)
+crates/avalon-client    the client layer: VM control, virtual network and disk management operations, parsers/formatters for addresses, sizes, clocks, disk sources, network cards (shared by Round Table and Pendragon; reuses grail::parse_ram_mib/parse_clock)
 crates/round-table      the Round Table control CLI: argument parsing and text output over avalon-client (src/lib.rs `run`, main.rs is a thin wrapper)
 crates/herald           Herald, the client that attaches to one VM: Session (the console streaming layer, terminal-free), screen::ScreenSession (the screen and input, window-free, drawing through a View) and the CLI, which puts the terminal in raw mode with grail::console::RawMode or shows the screen in grail::window (--screen)
 crates/lake             the Lake storage server: a directory of disk images served over the protocol (one writer or many readers per image); Grail's client side is grail::lake::LakeDisk
