@@ -16,7 +16,8 @@ pub fn parse_ram(s: &str) -> Result<u64, String> {
 
 /// Parses a server address: `host:port`, or a host or IP address alone for
 /// `default_port`. IPv6 addresses with a port go in brackets (`[::1]:7400`). The host
-/// is not looked up here, only when connecting.
+/// is not looked up here, only when connecting. Port 0 is refused: nothing can be
+/// reached there.
 pub fn parse_addr(s: &str, default_port: u16) -> Result<String, String> {
     let bad = || {
         format!("'{s}' is not a server address (examples: 127.0.0.1:7400, localhost, 192.168.1.5:7500, [::1]:7400)")
@@ -25,6 +26,9 @@ pub fn parse_addr(s: &str, default_port: u16) -> Result<String, String> {
         return Err(bad());
     }
     if let Ok(addr) = s.parse::<SocketAddr>() {
+        if addr.port() == 0 {
+            return Err(bad());
+        }
         return Ok(addr.to_string());
     }
     let bare = s.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(s);
@@ -40,8 +44,8 @@ pub fn parse_addr(s: &str, default_port: u16) -> Result<String, String> {
         None => Ok(format!("{s}:{default_port}")),
         Some((host, port)) if !host.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
             match port.parse::<u16>() {
-                Ok(_) => Ok(s.to_string()),
-                Err(_) => Err(bad()),
+                Ok(1..) => Ok(s.to_string()),
+                Ok(0) | Err(_) => Err(bad()),
             }
         }
         Some(_) => Err(bad()),
@@ -80,7 +84,7 @@ pub fn parse_disk_source(s: &str) -> Result<DiskSource, String> {
 }
 
 /// Parses a disk size: a whole number with an optional unit, any case: none or `B`
-/// for bytes, `K`/`KiB`, `M`/`MiB`, `G`/`GiB` (powers of 1024), or `S`/`sectors` for
+/// for bytes, `K`/`KiB`, `M`/`MiB`, `G`/`GiB` (powers of 1024), or `S`/`sector(s)` for
 /// 512-byte sectors (`64MiB`, `1G`, `2048s`). The size must be a non-zero whole number
 /// of sectors, at most what a Grail disk can have. Returns sectors.
 pub fn parse_disk_size(s: &str) -> Result<u64, String> {
@@ -94,7 +98,7 @@ pub fn parse_disk_size(s: &str) -> Result<u64, String> {
         "k" | "kib" => 1 << 10,
         "m" | "mib" => 1 << 20,
         "g" | "gib" => 1 << 30,
-        "s" | "sectors" => SECTOR_SIZE as u64,
+        "s" | "sector" | "sectors" => SECTOR_SIZE as u64,
         _ => return Err(bad()),
     };
     let n: u64 = number.parse().map_err(|_| bad())?;
@@ -139,6 +143,11 @@ mod tests {
             "[::1",
             "[host]:1",
             "host/x",
+            // Port 0 cannot be connected to.
+            "host:0",
+            "host:00",
+            "127.0.0.1:0",
+            "[::1]:0",
         ] {
             assert!(parse_addr(bad, 7400).is_err(), "{bad:?}");
         }
@@ -191,6 +200,7 @@ mod tests {
             "lake://host/Data",
             "lake://host/a/b",
             "lake://host/nul",
+            "lake://h:0/x",
         ] {
             assert!(parse_disk_source(bad).is_err(), "{bad:?}");
         }
@@ -208,6 +218,8 @@ mod tests {
         ok("1G", 2_097_152);
         ok("2048s", 2048);
         ok("3 sectors", 3);
+        ok("1 sector", 1);
+        ok("1Sector", 1);
         ok("2047GiB", 2047 << 21);
         ok("4294967295s", grail::block::MAX_SECTORS);
         for bad in [

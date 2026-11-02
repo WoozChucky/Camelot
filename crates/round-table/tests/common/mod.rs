@@ -107,6 +107,74 @@ pub fn dead_addr() -> SocketAddr {
     listener.local_addr().unwrap()
 }
 
+/// A stand-in server named `name` on an ephemeral port: does the handshake, then
+/// answers every request with `answer(request)`.
+pub fn fake_server(name: &'static str, answer: fn(Message) -> Message) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            std::thread::spawn(move || {
+                let mut conn = Connection::new(stream);
+                if conn.server_handshake(name).is_err() {
+                    return;
+                }
+                while let Ok(request) = conn.recv() {
+                    if conn.send(&answer(request)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Whether this process has the file at `path` open, as a VM's disk; `None` where
+/// the test cannot tell.
+pub fn file_is_open(path: &Path) -> Option<bool> {
+    #[cfg(windows)]
+    {
+        // An open that shares nothing fails while any other handle is open.
+        use std::os::windows::fs::OpenOptionsExt;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        match std::fs::OpenOptions::new().read(true).share_mode(0).open(path) {
+            Ok(_) => Some(false),
+            Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Some(true),
+            Err(e) => panic!("{}: {e}", path.display()),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let path = path.canonicalize().unwrap();
+        let fds = std::fs::read_dir("/proc/self/fd").unwrap();
+        Some(
+            fds.flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == path)),
+        )
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Waits until [`file_is_open`] says `open` (or cannot tell).
+pub fn wait_for_open(path: &Path, open: bool) {
+    let start = Instant::now();
+    while file_is_open(path).is_some_and(|o| o != open) {
+        assert!(
+            start.elapsed() < SLOW,
+            "{} is still {}",
+            path.display(),
+            if open { "closed" } else { "open" }
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// A stand-in for Lake: serves the handshake and the disk-management messages
 /// (`DiskCreate`, `ListDisks`, `DiskDelete`) from a table in memory, with Lake's
 /// rules (names, one image per name, no deleting an attached image), and answers

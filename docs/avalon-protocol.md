@@ -358,7 +358,9 @@ Concurrency: an image has at most one writer at a time, and a writer excludes re
 | `DiskList` | `disks: list<DiskInfo>` | in name order |
 | `DiskDelete` | `name: string` | Errors: `NoSuchDisk`, `Busy` (attached) |
 
-There is no message to attach a disk to an existing VM or detach one from it: a VM's disks are part of its hardware profile (`DeviceSpec`), fixed when it is created, so a client attaches a Lake image by naming it in `CreateVm` (Round Table's `create --disk lake://ADDR/NAME`), and the VM's server holds the attachment (through `BlockOpen`) until the VM is destroyed. `DiskList` shows each image's attachments. Hot-plugging disks would be a new message group and a version bump.
+There is no message to attach a disk to an existing VM or detach one from it: a VM's disks are part of its hardware profile (`DeviceSpec`), fixed when it is created, so a client attaches a Lake image by naming it in `CreateVm` (Round Table's `create --disk lake://ADDR/NAME`). The VM's server opens the image (through `BlockOpen`) when it builds the VM's machine, as part of `CreateVm`, and holds the attachment as long as that machine exists. The machine ends, and the server closes the attachment (`BlockClose`), when the VM is stopped (`StopVm`), when its program exits, or when it is destroyed, whichever comes first; a stopped or exited VM cannot run again (section 6.2), so it has no use for its disks. Such a VM still names the disks in its profile (`VmList`, `VmInfo`), since that is the hardware it was created with, but no longer holds them: the images can be attached by another VM or deleted. Image files on the server's own host (`DiskSource::File`) follow the same lifetime. `DiskList` shows each image's current attachments. Hot-plugging disks would be a new message group and a version bump.
+
+The Avalon server does not open Lake disks yet: until Lake (#39) lands, a `CreateVm` whose profile names one is refused with `InvalidProfile`.
 
 ## 7. Versioning
 

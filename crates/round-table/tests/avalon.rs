@@ -197,8 +197,134 @@ fn disks_are_attached_at_create() {
         ],
     );
     assert!(why.starts_with("invalid hardware profile: "), "{why}");
+
+    // Lake disks are not served by this Avalon yet (Lake, #39).
+    let why = refused(
+        addr,
+        &[
+            "create",
+            "--name",
+            "lakey",
+            "--disk",
+            "lake://127.0.0.1:7401/data",
+            &example_str("disk"),
+        ],
+    );
+    assert!(why.starts_with("invalid hardware profile: "), "{why}");
+    assert!(why.contains("Lake disks are not supported"), "{why}");
+    assert!(refused(addr, &["info", "lakey"]).starts_with("no such VM: "));
     server.stop().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A VM holds its disks while its machine exists: from create until it is stopped,
+/// its program exits, or it is destroyed (docs/avalon-protocol.md, 6.6). A stopped or
+/// exited VM still lists them.
+#[test]
+fn disks_are_released_when_the_machine_ends() {
+    let server = avalon(512);
+    let addr = server.addr();
+    let dir = std::env::temp_dir().join(format!("round-table-release-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = example("disk").parent().unwrap().join("disk.img");
+    let images: Vec<_> = ["run.img", "idle.img", "exit.img", "gone.img"]
+        .iter()
+        .map(|name| {
+            let image = dir.join(name);
+            std::fs::copy(&source, &image).unwrap();
+            image
+        })
+        .collect();
+    let [run, idle, exit, gone] = &images[..] else {
+        unreachable!()
+    };
+    let arg = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let echo = example_str("uart-echo");
+
+    // Stopped while running.
+    ok(addr, &["create", "--name", "run", "--disk", &arg(run), &echo]);
+    wait_for_open(run, true);
+    ok(addr, &["start", "run"]);
+    wait_for_open(run, true);
+    ok(addr, &["stop", "run"]);
+    wait_for_open(run, false);
+    assert!(ok(addr, &["list"]).contains("\n1   run   stopped  128 MiB  full speed  1\n"));
+    let info = ok(addr, &["info", "run"]);
+    assert!(
+        info.contains(&format!("\ndisks    {} (read-write)\n", arg(run))),
+        "{info}"
+    );
+
+    // Stopped before it ever ran.
+    ok(
+        addr,
+        &["create", "--name", "idle", "--disk-ro", &arg(idle), &echo],
+    );
+    wait_for_open(idle, true);
+    ok(addr, &["stop", "idle"]);
+    wait_for_open(idle, false);
+
+    // Its program exited.
+    ok(
+        addr,
+        &[
+            "create",
+            "--name",
+            "exit",
+            "--disk",
+            &arg(exit),
+            "--start",
+            &example_str("disk"),
+        ],
+    );
+    wait_for_state(addr, "exit", |s| s == VmState::Exited(0));
+    wait_for_open(exit, false);
+    let info = ok(addr, &["info", "exit"]);
+    assert!(
+        info.contains(&format!("\ndisks    {} (read-write)\n", arg(exit))),
+        "{info}"
+    );
+
+    // Destroyed while running.
+    ok(
+        addr,
+        &["create", "--name", "gone", "--disk", &arg(gone), "--start", &echo],
+    );
+    wait_for_open(gone, true);
+    ok(addr, &["destroy", "gone"]);
+    wait_for_open(gone, false);
+
+    server.stop().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `create --start` when the VM is created but does not start: what did happen is
+/// printed, then the failure. The real Avalon cannot be made to do this on demand, so
+/// a stand-in answers.
+#[test]
+fn created_but_not_started() {
+    use avalon_proto::Message;
+    let addr = fake_server("fake avalon", |request| match request {
+        Message::CreateVm { .. } => Message::VmCreated { id: 7 },
+        other => Message::Error {
+            code: ErrorCode::InvalidState,
+            message: format!("{} refused", other.name()),
+        },
+    });
+    let server = addr.to_string();
+    let echo = example_str("uart-echo");
+    let args: Vec<String> = ["--server", &server, "create", "--name", "web", "--start", &echo]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    let mut out = Vec::new();
+    let failure = round_table::run(&args, &mut out).unwrap_err();
+    assert_eq!(String::from_utf8(out).unwrap(), "created VM 7 (web)\n");
+    assert_eq!(
+        failure,
+        Failure::Failed("VM 7 (web) was created, but did not start: invalid state: StartVm refused".into())
+    );
+    assert_eq!(failure.exit_code(), 1);
 }
 
 #[test]

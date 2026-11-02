@@ -35,8 +35,10 @@ VM commands, sent to Avalon:
   start VM        start a created VM
   pause VM        pause a running VM; it keeps its state
   resume VM       go on running a paused VM
-  stop VM         stop a VM for good; a stopped VM cannot be started again
-  destroy VM      remove a VM in any state, freeing its RAM, disks and name
+  stop VM         stop a VM for good, releasing its disks; a stopped VM
+                  cannot be started again
+  destroy VM      remove a VM in any state, freeing its RAM and its name
+                  (and its disks, if it still holds them)
 
   VM is a VM's id (all digits) or its name.
 
@@ -48,10 +50,11 @@ create options:
                   number with an optional unit, Hz, kHz or MHz: 10MHz, 500kHz,
                   1.5MHz, 5Hz. Without it the VM runs at full speed and
                   reports a nominal 10 MHz clock
-  --disk SRC      attach a disk, read-write. lake://ADDR/NAME is the image
-                  NAME on a Lake server, anything else the path of an image
-                  file on Avalon's host (relative to Avalon's working
-                  directory). Repeat for more disks, in order
+  --disk SRC      attach a disk, read-write: the path of an image file on
+                  Avalon's host (relative to Avalon's working directory), or
+                  lake://ADDR/NAME for the image NAME on a Lake server (not
+                  served by Avalon yet: Lake, #39). Repeat for more disks,
+                  in order
   --disk-ro SRC   attach a disk read-only
   --start         start the VM as soon as it is created
 
@@ -63,15 +66,17 @@ Disk commands, sent to Lake:
   disk delete NAME
                   delete an image nobody has attached
 
-A disk is attached to a VM when the VM is created (--disk, --disk-ro) and
-detached when the VM is destroyed. Lake allows one writer per image, or any
-number of readers.
+A disk is attached to a VM when the VM is created (--disk, --disk-ro), and
+detached when the VM's machine ends: when the VM is stopped, its program
+exits, or it is destroyed. A stopped or exited VM still lists its disks
+(list, info) but no longer holds them. Lake allows one writer per image, or
+any number of readers.
 
 Options:
-  --server ADDR   Avalon's address: host:port, or a host alone for port 7400
-                  (default 127.0.0.1:7400)
-  --lake ADDR     Lake's address: host:port, or a host alone for port 7401
-                  (default 127.0.0.1:7401)
+  --server ADDR   Avalon's address, for the VM commands: host:port, or a
+                  host alone for port 7400 (default 127.0.0.1:7400)
+  --lake ADDR     Lake's address, for the disk commands: host:port, or a
+                  host alone for port 7401 (default 127.0.0.1:7401)
   -h, --help      show this text
 
 Exit status: 0 on success, 1 when a server refuses the request or cannot be
@@ -157,9 +162,6 @@ const OPTIONS: [(&str, bool); 9] = [
     ("--size", true),
 ];
 
-/// Options any command accepts.
-const GLOBAL: [&str; 2] = ["--server", "--lake"];
-
 /// Options that may be given more than once.
 const REPEATABLE: [&str; 2] = ["--disk", "--disk-ro"];
 
@@ -189,6 +191,9 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             Some((flag, value)) => (flag, Some(value.to_string())),
             None => (arg.as_str(), None),
         };
+        if flag == "-h" || flag == "--help" {
+            return Err(format!("{flag} takes no value"));
+        }
         let Some(&(flag, takes_value)) = OPTIONS.iter().find(|(name, _)| *name == flag) else {
             return Err(format!("unknown option '{flag}'"));
         };
@@ -220,20 +225,29 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
     let Some((&word, rest)) = words.split_first() else {
         return Err("no command given".into());
     };
-    // The options this command takes, besides the global ones.
+    // The options this command takes: --server for the VM commands (they talk to
+    // Avalon), --lake for the disk commands (they talk to Lake), and their own.
     let (command, allowed): (Command, &[&str]) = match word {
         "create" => (
             Command::Create(parse_create(rest, &options)?),
-            &["--name", "--ram", "--clock", "--disk", "--disk-ro", "--start"],
+            &[
+                "--server",
+                "--name",
+                "--ram",
+                "--clock",
+                "--disk",
+                "--disk-ro",
+                "--start",
+            ],
         ),
         "list" => {
             no_arguments(word, rest)?;
-            (Command::List, &[])
+            (Command::List, &["--server"])
         }
-        "info" => (Command::Info(vm_argument(word, rest)?), &[]),
+        "info" => (Command::Info(vm_argument(word, rest)?), &["--server"]),
         "disk" => parse_disk(rest, &options)?,
         _ => match VmAction::parse(word) {
-            Some(action) => (Command::Action(action, vm_argument(word, rest)?), &[]),
+            Some(action) => (Command::Action(action, vm_argument(word, rest)?), &["--server"]),
             None => return Err(format!("unknown command '{word}'")),
         },
     };
@@ -244,8 +258,13 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         _ => word,
     };
     for (flag, _) in &options {
-        if !GLOBAL.contains(flag) && !allowed.contains(flag) {
-            return Err(format!("'{command_name}' does not take {flag}"));
+        if !allowed.contains(flag) {
+            let why = match *flag {
+                "--server" => " (the disk commands talk to Lake: --lake ADDR)",
+                "--lake" => " (the VM commands talk to Avalon: --server ADDR)",
+                _ => "",
+            };
+            return Err(format!("'{command_name}' does not take {flag}{why}"));
         }
     }
     Ok(Invocation {
@@ -266,10 +285,16 @@ fn no_arguments(command: &str, rest: &[&str]) -> Result<(), String> {
     }
 }
 
-/// The single VM argument of `info`, `start`, ...
+/// The single VM argument of `info`, `start`, ...: an id (all digits) or a name.
 fn vm_argument(command: &str, rest: &[&str]) -> Result<VmRef, String> {
     match rest {
-        [vm] if !vm.is_empty() => Ok(VmRef::parse(vm)),
+        [vm] if !vm.is_empty() => match VmRef::parse(vm) {
+            // No name is all digits, so an id too big for a u32 can never match a VM.
+            VmRef::Name(_) if vm.bytes().all(|b| b.is_ascii_digit()) => {
+                Err(format!("'{vm}' is not a VM id (ids are at most {})", u32::MAX))
+            }
+            vm => Ok(vm),
+        },
         [] | [_] => Err(format!("'{command}' needs a VM (its id or its name)")),
         [_, extra, ..] => Err(format!("'{command}' takes one VM (got '{extra}' as well)")),
     }
@@ -338,17 +363,17 @@ fn parse_disk(
                 .map(|(_, v)| v)
                 .ok_or("'disk create' needs --size SIZE")?;
             let sectors = parse_disk_size(size).map_err(|e| format!("--size: {e}"))?;
-            Ok((Command::DiskCreate { name, sectors }, &["--size"]))
+            Ok((Command::DiskCreate { name, sectors }, &["--lake", "--size"]))
         }
         "list" => {
             no_arguments("disk list", rest)?;
-            Ok((Command::DiskList, &[]))
+            Ok((Command::DiskList, &["--lake"]))
         }
         "delete" => Ok((
             Command::DiskDelete {
                 name: disk_argument(word, rest)?,
             },
-            &[],
+            &["--lake"],
         )),
         _ => Err(format!("unknown disk command '{word}' (create, list or delete)")),
     }
@@ -595,8 +620,9 @@ mod tests {
         let inv = parse("list").unwrap();
         assert_eq!(inv.server, "127.0.0.1:7400");
         assert_eq!(inv.lake, "127.0.0.1:7401");
-        let inv = parse("--server 10.0.0.2 --lake=storage list").unwrap();
+        let inv = parse("--server 10.0.0.2 list").unwrap();
         assert_eq!(inv.server, "10.0.0.2:7400");
+        let inv = parse("--lake=storage disk list").unwrap();
         assert_eq!(inv.lake, "storage:7401");
         // Options may come after the command too.
         let inv = parse("disk list --lake 127.0.0.1:9000").unwrap();
@@ -606,6 +632,9 @@ mod tests {
             .unwrap_err()
             .starts_with("--server: "));
         assert!(parse("--lake").unwrap_err().contains("needs a value"));
+        assert!(parse("--server 127.0.0.1:0 list")
+            .unwrap_err()
+            .starts_with("--server: "));
     }
 
     #[test]
@@ -629,6 +658,8 @@ mod tests {
         );
         assert_eq!(command("--help"), Command::Help);
         assert_eq!(command("start 1 -h"), Command::Help);
+        assert_eq!(command("info 007"), Command::Info(VmRef::Id(7)));
+        assert_eq!(command("info 4294967295"), Command::Info(VmRef::Id(u32::MAX)));
     }
 
     #[test]
@@ -740,11 +771,46 @@ mod tests {
             ("disk list --size 1M", "'disk list' does not take --size"),
             ("disk delete", "'disk delete' needs a disk name"),
             ("disk delete a --start", "'disk delete' does not take --start"),
+            (
+                "info 4294967296",
+                "'4294967296' is not a VM id (ids are at most 4294967295)",
+            ),
+            (
+                "stop 99999999999",
+                "'99999999999' is not a VM id (ids are at most 4294967295)",
+            ),
+            ("--help=x", "--help takes no value"),
+            ("-h=", "-h takes no value"),
+            // Each address goes with the commands that talk to its server.
+            (
+                "--server 10.0.0.2 disk list",
+                "'disk list' does not take --server (the disk commands talk to Lake: --lake ADDR)",
+            ),
+            (
+                "disk create a --size 1M --server x",
+                "'disk create' does not take --server",
+            ),
+            (
+                "list --lake x",
+                "'list' does not take --lake (the VM commands talk to Avalon: --server ADDR)",
+            ),
+            ("create a.elf --name a --lake x", "'create' does not take --lake"),
+            ("start 1 --lake x", "'start' does not take --lake"),
         ] {
             match parse(args) {
                 Err(e) => assert!(e.starts_with(why), "{args}: {e}"),
                 Ok(inv) => panic!("{args}: parsed as {inv:?}"),
             }
+        }
+        // An empty VM argument (split_whitespace cannot make one).
+        for action in ["info", "start", "destroy"] {
+            let args = [action.to_string(), String::new()];
+            assert_eq!(
+                parse_args(&args),
+                Err(format!("'{action}' needs a VM (its id or its name)"))
+            );
+            let failure = run(&args, &mut Vec::new()).unwrap_err();
+            assert_eq!(failure.exit_code(), 2, "{failure}");
         }
         let usage = run(&[], &mut Vec::new()).unwrap_err();
         assert_eq!(usage.exit_code(), 2);

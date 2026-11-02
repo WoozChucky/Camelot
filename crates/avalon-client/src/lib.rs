@@ -32,6 +32,25 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// server is stuck, and the client reports it rather than hang.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The time limits of a session ([`Client::connect_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    /// How long to try each address of the server.
+    pub connect: Duration,
+    /// How long to wait for any reply, the server's `Welcome` included.
+    pub reply: Duration,
+}
+
+impl Default for Timeouts {
+    /// [`CONNECT_TIMEOUT`] and [`REPLY_TIMEOUT`].
+    fn default() -> Self {
+        Timeouts {
+            connect: CONNECT_TIMEOUT,
+            reply: REPLY_TIMEOUT,
+        }
+    }
+}
+
 /// What went wrong with an operation.
 #[derive(Debug)]
 pub enum Error {
@@ -47,10 +66,16 @@ pub enum Error {
 }
 
 impl Error {
-    /// The protocol error code, when the server refused the request.
+    /// The protocol error code, when the server refused the request, or refused the
+    /// session itself during the handshake (a server that answers `Hello` with an
+    /// `Error`, such as `Busy`).
     pub fn code(&self) -> Option<ErrorCode> {
         match self {
-            Error::Request(avalon_proto::Error::Remote { code, .. }) => Some(*code),
+            Error::Request(avalon_proto::Error::Remote { code, .. })
+            | Error::Connect {
+                cause: avalon_proto::Error::Remote { code, .. },
+                ..
+            } => Some(*code),
             _ => None,
         }
     }
@@ -150,18 +175,23 @@ pub struct Client<S = TcpStream> {
 
 impl Client<TcpStream> {
     /// Connects to the server at `addr` (`host:port`, see [`parse_addr`]) and does the
-    /// handshake as `agent` (`"round-table"`, `"pendragon"`, ...). The session gives up
-    /// on a reply after [`REPLY_TIMEOUT`].
+    /// handshake as `agent` (`"round-table"`, `"pendragon"`, ...), with the default
+    /// [`Timeouts`]: the session gives up on a reply after [`REPLY_TIMEOUT`].
     pub fn connect(addr: &str, agent: &str) -> Result<Self> {
+        Client::connect_with(addr, agent, Timeouts::default())
+    }
+
+    /// [`Client::connect`] with other time limits.
+    pub fn connect_with(addr: &str, agent: &str, timeouts: Timeouts) -> Result<Self> {
         let fail = |cause: avalon_proto::Error| Error::Connect {
             addr: addr.to_string(),
             cause,
         };
-        let stream = open(addr).map_err(|e| fail(e.into()))?;
+        let stream = open(addr, timeouts.connect).map_err(|e| fail(e.into()))?;
         // Requests are small frames; do not wait to batch them.
         stream.set_nodelay(true).map_err(|e| fail(e.into()))?;
         stream
-            .set_read_timeout(Some(REPLY_TIMEOUT))
+            .set_read_timeout(Some(timeouts.reply))
             .map_err(|e| fail(e.into()))?;
         Client::handshake(stream, agent).map_err(|e| match e {
             Error::Request(cause) | Error::Connect { cause, .. } => fail(cause),
@@ -170,11 +200,11 @@ impl Client<TcpStream> {
 }
 
 /// A TCP connection to the first address `addr` resolves to that answers within
-/// [`CONNECT_TIMEOUT`].
-fn open(addr: &str) -> std::io::Result<TcpStream> {
+/// `timeout`.
+fn open(addr: &str, timeout: Duration) -> std::io::Result<TcpStream> {
     let mut last = None;
     for a in addr.to_socket_addrs()? {
-        match TcpStream::connect_timeout(&a, CONNECT_TIMEOUT) {
+        match TcpStream::connect_timeout(&a, timeout) {
             Ok(stream) => return Ok(stream),
             Err(e) => last = Some(e),
         }
@@ -298,4 +328,81 @@ impl<S: Read + Write> Client<S> {
 /// A reply of the wrong type for the request.
 fn unexpected(reply: &Message) -> Error {
     Error::Request(avalon_proto::Error::Unexpected(reply.type_code()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::time::Instant;
+
+    /// A one-connection server on an ephemeral port: reads the client's `Hello`, then
+    /// answers with `answer` (nothing at all when it is `None`) and holds the
+    /// connection open until the client goes away.
+    fn server(answer: Option<Message>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut conn = Connection::new(stream);
+            assert!(matches!(conn.recv(), Ok(Message::Hello { .. })));
+            if let Some(answer) = answer {
+                conn.send(&answer).unwrap();
+            }
+            // Until the client closes.
+            while conn.recv().is_ok() {}
+        });
+        addr
+    }
+
+    #[test]
+    fn a_refused_handshake_keeps_its_code() {
+        let addr = server(Some(Message::Error {
+            code: ErrorCode::Busy,
+            message: "full".into(),
+        }));
+        let err = Client::connect(&addr, "test").err().unwrap();
+        assert!(matches!(err, Error::Connect { .. }), "{err:?}");
+        assert_eq!(err.code(), Some(ErrorCode::Busy));
+        assert_eq!(err.to_string(), format!("cannot connect to {addr}: busy: full"));
+    }
+
+    #[test]
+    fn sessions_time_out() {
+        // The default session waits REPLY_TIMEOUT for a reply.
+        let addr = server(Some(Message::Welcome {
+            version: avalon_proto::PROTOCOL_VERSION,
+            server: "fake".into(),
+        }));
+        let mut client = Client::connect(&addr, "test").unwrap();
+        assert_eq!(client.server(), "fake");
+        assert_eq!(
+            client.connection().get_ref().read_timeout().unwrap(),
+            Some(REPLY_TIMEOUT)
+        );
+
+        // A server that accepts but never says Welcome is given up on.
+        let addr = server(None);
+        let timeouts = Timeouts {
+            reply: Duration::from_millis(200),
+            ..Timeouts::default()
+        };
+        let start = Instant::now();
+        let err = Client::connect_with(&addr, "test", timeouts).err().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+        match &err {
+            Error::Connect {
+                cause: avalon_proto::Error::Io(e),
+                ..
+            } => assert!(
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ),
+                "{e:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(err.code(), None);
+    }
 }
