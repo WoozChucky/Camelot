@@ -3,17 +3,19 @@
 # INT_MIN / -1). Prints the number of cases with xcal.dbg and exits with 0
 # when every result is right, or with the number of the first wrong case.
 #
-# Built with our own tools (crates/merlin-ld/tests/merlin_as_programs.rs):
+# Built with our own tools by `cargo xtask examples muldiv`, which does the same as
 #
 #   merlin-as examples/muldiv/muldiv.S -o muldiv.o
-#   merlin-ld muldiv.o -o muldiv.elf
-#   grail muldiv.elf
+#   merlin-ld muldiv.o -o examples/muldiv/muldiv.elf
+#   grail examples/muldiv/muldiv.elf
 #
-# Every label is local and in .text, so merlin-as resolves all of them and
-# the object has no relocations. clang builds it too:
+# (merlin-ld's default layout: no linker script.) Every label is local and in
+# .text, so merlin-as resolves all of them and the object has no relocations.
+# Reference build with LLVM, only for comparison:
 #
 #   clang --target=riscv32 -march=rv32im -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,-T,examples/hello/link.ld examples/muldiv/muldiv.S -o muldiv.elf
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -T examples/hello/link.ld examples/muldiv/muldiv.S -o muldiv.elf
 
     .equ INT_MIN, 0x80000000
 
@@ -109,9 +111,9 @@ _start:
 
     # All passed: show how many, exit 0.
     mv    a0, s0
-    .insn i 0x0b, 0, x0, a0, 0  # xcal.dbg a0
+    xcal.dbg a0
     li    a0, 0
-    .insn i 0x0b, 1, x0, a0, 0  # xcal.halt a0
+    xcal.halt a0
 
 # check(a0 = result, t0 = expected): counts the case; on a mismatch, stops
 # the machine with the case number as the exit code.
@@ -120,4 +122,4 @@ check:
     bne   a0, t0, 1f
     ret
 1:  mv    a0, s0
-    .insn i 0x0b, 1, x0, a0, 0  # xcal.halt a0
+    xcal.halt a0

@@ -1,8 +1,19 @@
-# Bare-metal hello world for Grail. Built with clang for now; merlin-as will
-# assemble this same file once it exists.
+# Bare-metal hello world for Grail, built with our own tools:
 #
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -nostdlib -static \
-#         -fuse-ld=lld -T examples/hello/link.ld examples/hello/hello.S -o hello.elf
+#   cargo xtask examples hello
+#
+# which does the same as
+#
+#   merlin-as examples/hello/hello.S -o hello.o
+#   merlin-ld -T examples/hello/link.ld hello.o -o examples/hello/hello.elf
+#
+# Reference build with LLVM, only for comparison (same loaded bytes; the
+# differences elsewhere in the file are listed in docs/excalibur-spec.md
+# section 10, "Examples"):
+#
+#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -T examples/hello/link.ld examples/hello/hello.S -o hello.elf
 
     .equ UART_BASE, 0x10000000
     .equ UART_LSR,  5
@@ -15,11 +26,11 @@ _start:
     la    a0, message
     call  puts
 
-    # xcal.dbg a0: show how many bytes we printed (a0 holds the count).
-    .insn i 0x0b, 0, x0, a0, 0
+    # Show how many bytes we printed (a0 holds the count).
+    xcal.dbg a0
 
-    # xcal.halt zero: stop the machine with exit code 0.
-    .insn i 0x0b, 1, x0, zero, 0
+    # Stop the machine with exit code 0.
+    xcal.halt zero
 
 # puts(a0 = NUL-terminated string) -> a0 = bytes written
 puts:

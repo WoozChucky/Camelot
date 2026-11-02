@@ -259,7 +259,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Program(RunResult::Exited(0)));
         assert_eq!(
             String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap(),
-            "hi\n[dbg] pc=80000054 s1 = 0x00000004 (4)\n"
+            "hi\n[dbg] pc=8000005c s1 = 0x00000004 (4)\n"
         );
     }
 }

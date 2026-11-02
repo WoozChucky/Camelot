@@ -19,11 +19,16 @@
 # and of sector 7. crates/grail/tests/block.rs builds the same bytes and checks the
 # committed file against them (set GRAIL_WRITE_DISK_IMG=1 to rewrite it from there).
 #
-# Built with clang for now; merlin-as will assemble this same file once it exists:
+# Built with our own tools by `cargo xtask examples disk`, which does the same as
 #
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -nostdlib -static \
-#         -fuse-ld=lld -T examples/disk/link.ld examples/disk/disk.S \
-#         -o examples/disk/disk.elf
+#   merlin-as examples/disk/disk.S -o disk.o
+#   merlin-ld -T examples/disk/link.ld disk.o -o examples/disk/disk.elf
+#
+# Reference build with LLVM, only for comparison:
+#
+#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -T examples/disk/link.ld examples/disk/disk.S -o disk.elf
 
     .equ UART_BASE,       0x10000000
     .equ UART_LSR,        5
@@ -234,9 +239,9 @@ disk_error:                         # a0 = BLK_ERROR
 failed:
     li    a0, 3
 
-    # xcal.halt a0: stop the machine with exit code a0.
+    # Stop the machine with exit code a0.
 halt:
-    .insn i 0x0b, 1, x0, a0, 0
+    xcal.halt a0
 
 # disk_io(a0 = command, a1 = sector, a2 = buffer): runs the command on one sector and
 # waits for its completion interrupt. Returns BLK_ERROR in a0. Clobbers t0-t2.

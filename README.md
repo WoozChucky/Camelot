@@ -6,7 +6,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 |---|---|---|
 | **Excalibur** | The ISA: RV32IM + Zicsr, M/S/U privilege, Sv32 paging, plus the Xcal extensions | Spec v0 in [`docs/excalibur-spec.md`](docs/excalibur-spec.md) |
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps), keyboard (from the window, with PLIC interrupts), sysinfo and block devices (disk images, `--disk`); configurable RAM, real-time clock and disks |
-| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | merlin-as: complete; its objects match clang's ([encoder notes](crates/merlin-as/ENCODER.md)). merlin-ld: links clang objects to the same bytes as ld.lld except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: v0 (int-only C subset) compiles to assembly that our own assembler and linker build into programs Grail runs ([code generation notes](crates/merlin/src/codegen.rs)). merlin-objdump: matches llvm-objdump |
+| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | Builds every example on its own, no LLVM (`cargo xtask examples`). merlin-as: complete; its objects match clang's ([encoder notes](crates/merlin-as/ENCODER.md)). merlin-ld: links clang objects to the same bytes as ld.lld except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: v0 (int-only C subset) compiles to assembly that our own assembler and linker build into programs Grail runs ([code generation notes](crates/merlin/src/codegen.rs)). merlin-objdump: matches llvm-objdump |
 | **Camelot** | The kernel / OS | Boots on Grail in S-mode: `kprintf`, trap handling, timer ticks, page allocator and Sv32 paging, interrupt-driven UART console with a tiny shell ([kernel/](kernel/README.md)) |
 | **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Herald VM client and the Lake storage server | Protocol v1 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`; the programs come next |
 
@@ -21,9 +21,9 @@ crates/merlin           the C-subset compiler (C → .s), with its test programs
 crates/merlin-as        the assembler (source → ELF32 .o)
 crates/merlin-ld        the linker (.o files → ELF32 executable)
 crates/merlin-objdump   the disassembler / object dumper (llvm-objdump compatible output)
-crates/xtask            build tasks: `cargo xtask kernel`, `cargo xtask hello`, `cargo xtask ld-fixtures`
+crates/xtask            build tasks: `cargo xtask examples`, `cargo xtask kernel`, `cargo xtask hello`, `cargo xtask ld-fixtures`
 kernel/                 the Camelot kernel (C + assembly) and its prebuilt kernel.elf
-examples/               bare-metal programs
+examples/               bare-metal programs, built with merlin-as + merlin-ld (the .elf files are committed)
 tests/riscv-tests       prebuilt riscv-tests ELFs and their objects for merlin-ld (rebuild with scripts/build-riscv-tests.sh)
 scripts/                test-data generators (riscv-tests, merlin-as golden encodings, merlin-objdump goldens)
 docs/                   the ISA spec and the Avalon protocol
@@ -39,10 +39,35 @@ cargo run --release -p grail -- examples/hello/hello.elf
 
 ```
 Hello from Camelot!
-[dbg] pc=80000014 a0 = 0x00000014 (20)
+[dbg] pc=80000018 a0 = 0x00000014 (20)
 ```
 
 The kernel runs the same way: `cargo run --release -p grail -- kernel/kernel.elf`. It boots into a small shell (`help`, `ticks`, `halt`); when stdin is a terminal, Grail switches it to raw mode so each key reaches the guest as it is typed and the guest does the echoing (Windows consoles and Linux terminals; restored on exit and on Ctrl-C).
+
+### Building the examples
+
+The examples are built with our own assembler and linker, nothing else:
+
+```
+cargo xtask examples            # every example
+cargo xtask examples hello -v   # one, printing the equivalent commands
+```
+
+```
+merlin-as examples/hello/hello.S -o target/examples/hello/hello.o
+merlin-ld -T examples/hello/link.ld target/examples/hello/hello.o -o examples/hello/hello.elf
+built examples/hello/hello.elf
+```
+
+Each `examples/<dir>/<name>.elf` is rewritten (they are committed, so running them needs no build) and the objects land in `target/examples/`. `cargo xtask examples --check` builds in memory and reports any committed executable that is out of date; `cargo test` does the same check. The tools also work by hand: `cargo run --release -p merlin-as -- examples/hello/hello.S -o hello.o`, then `cargo run --release -p merlin-ld -- -T examples/hello/link.ld hello.o -o hello.elf`.
+
+`examples/multiobj` links two objects (`main.S` calls `puts` in `print.S`, which counts bytes in its `.bss`; `main.S` keeps a string table and a counter in `.data`) and exits with code 42:
+
+```
+cargo run --release -p grail -- examples/multiobj/multiobj.elf
+```
+
+The top of each source also has the clang + ld.lld command that builds the same program, for comparison only; [spec section 10](docs/excalibur-spec.md) ("Examples") lists how the two executables differ (the loaded bytes don't).
 
 `examples/uart-echo` is interrupt-driven: it sleeps in `wfi`, and every byte on stdin raises a machine external interrupt through the PLIC. It echoes until it receives EOT (0x04):
 
@@ -82,8 +107,9 @@ cargo run --release -p merlin-objdump -- -d examples/hello/hello.elf
 80000000: 00010117     	auipc	sp, 0x10
 80000004: 07010113     	addi	sp, sp, 0x70
 ...
-80000010: 00c000ef     	jal	0x8000001c <puts>
-80000014: 0005000b     	xcal.dbg	a0
+80000010: 00000097     	auipc	ra, 0x0
+80000014: 010080e7     	jalr	0x10(ra) <puts>
+80000018: 0005000b     	xcal.dbg	a0
 ```
 
 The options are llvm-objdump's: `-d` disassemble, `-r` relocations (under each instruction with `-dr`), `-t` symbols, `-h` sections, `-x` all headers, `-s` section contents, `-M no-aliases`, `--no-show-raw-insn`. The output is the same as llvm-objdump 21's apart from Xcal instructions and undecodable words (`.word`), so the two can be diffed.
@@ -140,4 +166,6 @@ Runs the decoder and device unit tests, every riscv-tests suite (except `rv32ui-
 
 `merlin file.c -o file.s` compiles a C-subset program; `merlin --dump-ast file.c` prints the checked syntax tree. The compiler's end-to-end harness (`crates/merlin/tests/harness.rs`) runs every program in `crates/merlin/tests/cases/` through merlin, merlin-as and merlin-ld and checks its exit code in Grail. The generated assembly of a few cases is committed in `crates/merlin/tests/snapshots/*.s` (`MERLIN_BLESS=1 cargo test -p merlin --test cli` regenerates them after an intended codegen change). With clang and ld.lld installed, `cargo test -p merlin --test harness -- --ignored` also checks the programs' expected exit codes against clang and that clang assembles merlin's output to the same code as merlin-as; `MERLIN_HARNESS_LLVM=1` builds merlin's output with clang and ld.lld instead of our tools.
 
-The test ELFs are committed. To rebuild them you need clang + lld (the official Windows LLVM installer works) and a riscv-tests checkout: `scripts/build-riscv-tests.sh path/to/riscv-tests tests/riscv-tests`. Examples are built with clang; the command is at the top of each `.S` file. `examples/muldiv` (an M extension self-check) is also built by its test with merlin-as and merlin-ld. `cargo xtask hello` assembles `examples/hello/hello.S` with merlin-as and links it with ld.lld into `crates/merlin-as/tests/golden/hello.elf`, which `cargo test` runs in Grail (and, with ld.lld installed, checks is current). The kernel is rebuilt with `cargo xtask kernel` (clang + ld.lld, see [kernel/README.md](kernel/README.md)); `cargo test` also rebuilds it when clang is installed and checks the committed `kernel.elf` is current. merlin-ld's test fixtures (clang-built objects, plus ld.lld's link of them with its `llvm-readelf` and `llvm-objdump -d` listings as the expected output) are rebuilt with `cargo xtask ld-fixtures`; the riscv-tests objects merlin-ld relinks come from `scripts/build-riscv-tests.sh`.
+`crates/xtask/tests/examples.rs` builds every example from source with merlin-as and merlin-ld, checks the committed `.elf` is exactly what comes out, and runs each in Grail with its input (UART bytes for `uart-echo`, key events for `kbd-echo`, `examples/disk/disk.img` for `disk`), checking the output and the exit code. It also compares `hello` and `multiobj` with clang + ld.lld's build of the same sources (committed in `crates/merlin-ld/tests/fixtures`): same loaded bytes, sections, symbols and disassembly. None of this needs LLVM.
+
+The test ELFs are committed. To rebuild them you need clang + lld (the official Windows LLVM installer works) and a riscv-tests checkout: `scripts/build-riscv-tests.sh path/to/riscv-tests tests/riscv-tests`. The examples are rebuilt with `cargo xtask examples` (our tools only); clang is just a reference for them, with the command at the top of each source (`-include examples/xcal.inc` teaches clang the Xcal mnemonics). `cargo xtask hello` assembles `examples/hello/hello.S` with merlin-as and links it with ld.lld into `crates/merlin-as/tests/golden/hello.elf`, which `cargo test` runs in Grail (and, with ld.lld installed, checks is current). The kernel is rebuilt with `cargo xtask kernel` (clang + ld.lld, see [kernel/README.md](kernel/README.md)); `cargo test` also rebuilds it when clang is installed and checks the committed `kernel.elf` is current. merlin-ld's test fixtures (clang-built objects, among them `examples/hello` and `examples/multiobj`, plus ld.lld's link of them with its `llvm-readelf` and `llvm-objdump -d` listings as the expected output) are rebuilt with `cargo xtask ld-fixtures`; the riscv-tests objects merlin-ld relinks come from `scripts/build-riscv-tests.sh`.

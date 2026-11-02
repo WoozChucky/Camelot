@@ -7,11 +7,16 @@
 #
 # Halts with exit code 0, or 1 if there is no sysinfo block (bad magic).
 #
-# Built with clang for now; merlin-as will assemble this same file once it exists:
+# Built with our own tools by `cargo xtask examples sysinfo`, which does the same as
 #
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -nostdlib -static \
-#         -fuse-ld=lld -T examples/sysinfo/link.ld examples/sysinfo/sysinfo.S \
-#         -o examples/sysinfo/sysinfo.elf
+#   merlin-as examples/sysinfo/sysinfo.S -o sysinfo.o
+#   merlin-ld -T examples/sysinfo/link.ld sysinfo.o -o examples/sysinfo/sysinfo.elf
+#
+# Reference build with LLVM, only for comparison:
+#
+#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -T examples/sysinfo/link.ld examples/sysinfo/sysinfo.S -o sysinfo.elf
 
     .equ UART_BASE,       0x10000000
     .equ UART_LSR,        5
@@ -111,14 +116,14 @@ _start:
     addi  s1, s1, -1
     j     2b
 
-    # xcal.halt zero: stop the machine with exit code 0.
-4:  .insn i 0x0b, 1, x0, zero, 0
+    # Stop the machine with exit code 0.
+4:  xcal.halt zero
 
 no_sysinfo:
     la    a0, s_no_sysinfo
     call  puts
     li    a0, 1
-    .insn i 0x0b, 1, x0, a0, 0
+    xcal.halt a0
 
 # putc(a0 = byte). Clobbers t0, t1 only.
 putc:

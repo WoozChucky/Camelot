@@ -13,6 +13,8 @@
 //! * `fixtures/layouts`: layout edge cases (empty and assignment-only output
 //!   sections, gaps, NOBITS before PROGBITS, `. +=` sections).
 //! * `fixtures/hello`: `examples/hello/hello.S` assembled by clang.
+//! * `fixtures/multiobj`: `examples/multiobj`, two objects that call and
+//!   point into each other.
 //! * `fixtures/relocs`: every relocation type, across objects, at the edges
 //!   of their ranges; one object built with relaxation (`R_RISCV_RELAX`).
 //! * `fixtures/merge`: mergeable strings, where merlin-ld differs from ld.lld
@@ -411,6 +413,11 @@ fn assert_same_disassembly(name: &str, linked: &merlin_ld::Linked) {
 /// against ld.lld's (`name.expected.txt`, `name.lld.elf`, `name.objdump.txt`)
 /// and runs it in Grail, which must print `output` and exit with 0.
 fn assert_matches_ld_lld(name: &str, output: &str) -> merlin_ld::Linked {
+    assert_matches_ld_lld_exit(name, output, 0)
+}
+
+/// [`assert_matches_ld_lld`] for a program that exits with `exit`.
+fn assert_matches_ld_lld_exit(name: &str, output: &str, exit: u32) -> merlin_ld::Linked {
     let (objs, opts) = case(&format!("{name}.ld"));
     let linked = merlin_ld::link(&objs, &opts).unwrap_or_else(|e| panic!("{name}: {e:?}"));
     assert!(
@@ -449,7 +456,7 @@ fn assert_matches_ld_lld(name: &str, output: &str) -> merlin_ld::Linked {
     let (_, r, out) = run(&linked.elf);
     assert_eq!(
         (r, out.as_str()),
-        (RunResult::Exited(0), output),
+        (RunResult::Exited(exit), output),
         "{name}: run in Grail"
     );
     linked
@@ -667,17 +674,24 @@ fn hello_layout_matches_ld_lld() {
     assert_eq!(layout.symbol("__stack_top"), Some(0x8001_0070));
 }
 
-/// `fixtures/hello` is built from copies of examples/hello's source and
-/// script; if the example changes, the fixture (hello.o and its ld.lld
-/// listing) is stale until `cargo xtask ld-fixtures` runs again.
+/// `fixtures/hello` and `fixtures/multiobj` are built from copies of the
+/// examples' sources and scripts; if an example changes, its fixture (the
+/// objects and their ld.lld listings) is stale until `cargo xtask ld-fixtures`
+/// runs again.
 #[test]
-fn hello_fixture_is_current() {
-    for f in ["hello.S", "link.ld"] {
-        let read = |p: PathBuf| std::fs::read_to_string(&p).unwrap().replace("\r\n", "\n");
-        assert!(
-            read(repo_root().join("examples/hello").join(f)) == read(fixtures().join("hello").join(f)),
-            "examples/hello/{f} changed: run `cargo xtask ld-fixtures`"
-        );
+fn example_fixtures_are_current() {
+    let copies = [
+        ("hello", &["hello.S", "link.ld"][..]),
+        ("multiobj", &["main.S", "print.S", "link.ld"]),
+    ];
+    for (dir, files) in copies {
+        for f in files {
+            let read = |p: PathBuf| std::fs::read_to_string(&p).unwrap().replace("\r\n", "\n");
+            assert!(
+                read(repo_root().join("examples").join(dir).join(f)) == read(fixtures().join(dir).join(f)),
+                "examples/{dir}/{f} changed: run `cargo xtask ld-fixtures`"
+            );
+        }
     }
 }
 
@@ -723,12 +737,36 @@ fn hello_opts() -> Options {
 #[test]
 fn hello_matches_ld_lld_and_runs() {
     // xcal.dbg shows its own pc: 0x80000018, after the 8-byte `call puts`.
-    // (examples/hello/hello.elf says 0x80000014: built with relaxation,
-    // ld.lld shrank that call to a single `jal`.)
+    // (Built with linker relaxation, ld.lld would shrink that call to a
+    // single `jal` and print 0x80000014.)
     assert_matches_ld_lld(
         "hello/link",
         "Hello from Camelot!\n[dbg] pc=80000018 a0 = 0x00000014 (20)\n",
     );
+}
+
+/// examples/multiobj, two clang objects: calls, pc-relative addresses and
+/// `.word` pointers from one into the other, `.data` written at run time and
+/// `.bss` (which `run` checks is zeroed: RAM starts as garbage).
+#[test]
+fn multiobj_matches_ld_lld_and_runs() {
+    for (obj, ty) in [
+        ("multiobj/main.o", "R_RISCV_CALL_PLT"),
+        ("multiobj/main.o", "R_RISCV_32"),
+        ("multiobj/main.o", "R_RISCV_PCREL_HI20"),
+        ("multiobj/print.o", "R_RISCV_PCREL_LO12_I"),
+    ] {
+        assert!(reloc_types(obj).contains_key(ty), "{obj} has no {ty}");
+    }
+    let linked = assert_matches_ld_lld_exit(
+        "multiobj/link",
+        "Hello from two objects!\nputs lives in print.S.\n[dbg] pc=80000034 a0 = 0x0000002f (47)\n",
+        42,
+    );
+    let l = &linked.layout;
+    let bss = l.section(".bss").unwrap();
+    assert_eq!(l.symbol("bytes_written"), Some(bss.addr));
+    assert!(l.symbol("puts").unwrap() > l.symbol("_start").unwrap());
 }
 
 /// The relocation types each fixture object carries, by name.

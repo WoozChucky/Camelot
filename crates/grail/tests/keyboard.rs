@@ -137,7 +137,7 @@ fn polling_example_echoes_presses() {
     assert_eq!(m.run(Some(1_000_000), |_| {}), RunResult::Exited(0));
     assert_eq!(
         output(&mut m),
-        "Hi^c!\x08 \x08[80][83][90][9b]\t\n[dbg] pc=80000054 s1 = 0x0000000c (12)\n"
+        "Hi^c!\x08 \x08[80][83][90][9b]\t\n[dbg] pc=8000005c s1 = 0x0000000c (12)\n"
     );
     assert_eq!(m.cpu.bus.kbd.len(), 1, "only the release of Esc is left");
 }
@@ -192,7 +192,7 @@ fn interrupt_example_takes_one_interrupt_per_event() {
     // 7 taps (14 events) plus the Esc press.
     assert_eq!(
         output(&mut m),
-        "Hello[81]\n[dbg] pc=800000ac s0 = 0x0000000f (15)\n"
+        "Hello[81]\n[dbg] pc=800000b0 s0 = 0x0000000f (15)\n"
     );
 }
 

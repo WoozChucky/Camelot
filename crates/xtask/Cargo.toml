@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Build tasks for Camelot (cargo xtask ...): building the kernel, regenerating merlin-ld fixtures"
+description = "Build tasks for Camelot (cargo xtask ...): building the examples and the kernel, regenerating reference files"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,11 @@ publish = false
 [dependencies]
 grail = { path = "../grail" }
 merlin-as = { path = "../merlin-as" }
+merlin-ld = { path = "../merlin-ld" }
 
 [dev-dependencies]
 elf32 = { path = "../elf32" }
 excalibur = { path = "../excalibur" }
+# tests/examples.rs compares our executables with ld.lld's and our disassembly with
+# llvm-objdump's committed text.
+merlin-objdump = { path = "../merlin-objdump" }

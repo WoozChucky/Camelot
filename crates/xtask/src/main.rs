@@ -3,14 +3,18 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use xtask::kernel::{Assembler, Build};
-use xtask::{repo_root, tools};
+use xtask::{examples, repo_root, tools};
 
 const USAGE: &str = "usage: cargo xtask <task> [options]
 
 tasks:
+  examples     build every example (or the ones named) with merlin-as + merlin-ld into
+               examples/<dir>/<name>.elf; no LLVM needed. Objects go to target/examples.
+               --check: build in memory and report stale .elf files instead of writing
+               -v: print the equivalent merlin-as/merlin-ld command lines
   kernel       build kernel/kernel.elf (clang + ld.lld from the official LLVM install)
-  hello        assemble examples/hello/hello.S with merlin-as, link it with ld.lld
-               into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
+  hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
+               with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
   ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj, llvm-objdump);
                takes --clang, --lld and -v like kernel
 
@@ -57,9 +61,41 @@ fn parse_kernel_args(args: &[String]) -> Result<KernelArgs, String> {
     Ok(k)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ExamplesArgs {
+    /// Examples named on the command line; empty for all of them.
+    names: Vec<String>,
+    check: bool,
+    verbose: bool,
+}
+
+fn parse_examples_args(args: &[String]) -> Result<ExamplesArgs, String> {
+    let mut e = ExamplesArgs::default();
+    for a in args {
+        match a.as_str() {
+            "--check" => e.check = true,
+            "-v" | "--verbose" => e.verbose = true,
+            other if other.starts_with('-') => return Err(format!("unknown option {other}")),
+            name if examples::find(name).is_some() => e.names.push(name.to_string()),
+            name => {
+                let known: Vec<&str> = examples::EXAMPLES.iter().map(|e| e.name).collect();
+                return Err(format!("unknown example {name} (one of: {})", known.join(", ")));
+            }
+        }
+    }
+    Ok(e)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("examples") => match parse_examples_args(&args[1..]) {
+            Ok(e) => build_examples(e),
+            Err(e) => {
+                eprintln!("xtask: {e}\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
         Some("kernel") => match parse_kernel_args(&args[1..]) {
             Ok(k) => kernel(k),
             Err(e) => {
@@ -101,6 +137,69 @@ fn main() -> ExitCode {
             eprintln!("{USAGE}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// `cargo xtask examples`: merlin-as + merlin-ld for every example (or the
+/// named ones). Writes each object to `target/examples/<dir>/` and each
+/// executable over the committed `examples/<dir>/<name>.elf`; with `--check`,
+/// writes nothing and fails if a committed executable is not what the current
+/// tools build.
+fn build_examples(args: ExamplesArgs) -> ExitCode {
+    let root = repo_root();
+    let selected: Vec<&examples::Example> = if args.names.is_empty() {
+        examples::EXAMPLES.iter().collect()
+    } else {
+        args.names.iter().filter_map(|n| examples::find(n)).collect()
+    };
+    let mut failed = false;
+    for ex in selected {
+        if args.verbose {
+            for cmd in examples::commands(ex, &format!("target/examples/{}", ex.dir)) {
+                eprintln!("{cmd}");
+            }
+        }
+        let built = match examples::build(&root, ex) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("{e}");
+                failed = true;
+                continue;
+            }
+        };
+        for w in &built.warnings {
+            eprintln!("merlin-ld: warning: {w}");
+        }
+        if args.check {
+            match examples::check(&root, ex, &built) {
+                examples::Status::UpToDate => eprintln!("{} is up to date", ex.elf_name()),
+                examples::Status::Stale => {
+                    eprintln!(
+                        "{} is out of date: run `cargo xtask examples {}`",
+                        ex.elf_name(),
+                        ex.name
+                    );
+                    failed = true;
+                }
+                examples::Status::Unreadable(e) => {
+                    eprintln!("{e}");
+                    failed = true;
+                }
+            }
+            continue;
+        }
+        match examples::write(&root, ex, &built) {
+            Ok(()) => eprintln!("built {}", ex.elf_name()),
+            Err(e) => {
+                eprintln!("xtask: cannot write {}: {e}", ex.name);
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -289,6 +388,28 @@ mod tests {
             parse(&["--as", "clang"]).unwrap().assembler,
             Some(Assembler::Clang)
         );
+    }
+
+    fn parse_examples(args: &[&str]) -> Result<ExamplesArgs, String> {
+        parse_examples_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn examples_args() {
+        assert_eq!(parse_examples(&[]).unwrap(), ExamplesArgs::default());
+        assert_eq!(
+            parse_examples(&["hello", "--check", "multiobj", "-v"]).unwrap(),
+            ExamplesArgs {
+                names: vec!["hello".into(), "multiobj".into()],
+                check: true,
+                verbose: true,
+            }
+        );
+        let err = parse_examples(&["helo"]).unwrap_err();
+        assert!(err.starts_with("unknown example helo (one of: hello, "), "{err}");
+        assert!(parse_examples(&["--run"])
+            .unwrap_err()
+            .contains("unknown option --run"));
     }
 
     #[test]

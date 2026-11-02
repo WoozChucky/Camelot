@@ -389,13 +389,13 @@ All reading goes through one crate, `elf32` (header, program headers, sections, 
 
 ### Assembler (`merlin-as`)
 
-`merlin-as [-o out.o] input.s`. The reference is clang's integrated assembler with `-march=rv32im_zicsr_zifencei -mno-relax`: for the same source, `llvm-objdump -dr` must print the same text for both objects (checked for `examples/hello/hello.S` and `examples/muldiv/muldiv.S`), and every encoding matches llvm-mc (`crates/merlin-as/tests/golden/encode.golden`). The encoder, the pseudo-instruction expansions and `li`'s choice of sequence are documented in `crates/merlin-as/ENCODER.md`.
+`merlin-as [-o out.o] input.s`. The reference is clang's integrated assembler with `-march=rv32im_zicsr_zifencei -mno-relax`: for the same source, `llvm-objdump -dr` must print the same text for both objects (checked for every source in `examples/`, which clang assembles with `-include examples/xcal.inc`), and every encoding matches llvm-mc (`crates/merlin-as/tests/golden/encode.golden`). The encoder, the pseudo-instruction expansions and `li`'s choice of sequence are documented in `crates/merlin-as/ENCODER.md`.
 
 - **Single pass.** No instruction's size depends on a label's address; `.equ`/`.set` constants must be defined before use. Every label reference is first recorded as a fixup with its immediate left zero.
 - **Local labels are resolved by the assembler**, as clang does with `-mno-relax`. When the file has been read, a pc-relative reference to a label that is local (not `.globl`, also when `.globl` comes later in the file) and defined in the same section is patched in and gets no relocation: branches, `jal`/`j`, `call`/`tail` (both words), and `auipc` + `%pcrel_lo` pairs (`la`, `lla`, `lw rd, sym`, `sw rs, sym, rt`, explicit `%pcrel_hi`/`%pcrel_lo`). A branch or jump out of range is an error on its line. Everything else stays a relocation for the linker: references to global or undefined symbols, to labels in other sections, and absolute ones (`%hi`, `%lo`, `.word sym`).
 - **`.`** is the location counter: the address of the instruction (its first word, for a pseudo-instruction) or data word it appears in. Each use becomes a hidden local label there, so `j .`, `beq a0, a1, .-8` and `la a0, .` resolve like any local label, and `.word .` gets an `R_RISCV_32` against that label (clang's `.L0`).
 - **Symbols**: `.L` labels (numeric labels like `1:`, hidden `.Lpcrel_hiN` labels on `auipc`s, `.Ldot$N` labels for `.`) are written to `.symtab` only when a relocation refers to them, as in clang.
-- **`.insn`** spells out an instruction by fields, with LLVM's forms and encodings: `.insn r opcode, funct3, funct7, rd, rs1, rs2`, `.insn i opcode, funct3, rd, rs1, imm` (or `rd, imm(rs1)`), `.insn s opcode, funct3, rs2, imm(rs1)`, `.insn b opcode, funct3, rs1, rs2, target`, `.insn u opcode, rd, imm20`, and `.insn value` / `.insn 4, value`. Opcodes must be 32-bit ones (low bits `11`). This lets sources that use Xcal instructions (`examples/hello/hello.S`) build with both assemblers.
+- **`.insn`** spells out an instruction by fields, with LLVM's forms and encodings: `.insn r opcode, funct3, funct7, rd, rs1, rs2`, `.insn i opcode, funct3, rd, rs1, imm` (or `rd, imm(rs1)`), `.insn s opcode, funct3, rs2, imm(rs1)`, `.insn b opcode, funct3, rs1, rs2, target`, `.insn u opcode, rd, imm20`, and `.insn value` / `.insn 4, value`. Opcodes must be 32-bit ones (low bits `11`). The examples write the Xcal instructions as mnemonics (`xcal.dbg a0`); clang does not know them, so `examples/xcal.inc` defines them as assembler macros that expand to the `.insn` with the same encoding, and clang reference builds pass `-include examples/xcal.inc`.
 - **`.riscv.attributes`**: every object carries clang's `Tag_RISCV_arch` for `rv32im_zicsr_zifencei` (`rv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0`), so llvm-objdump decodes M instructions without `--mattr`.
 - **Differences from clang**, on purpose:
   - No branch relaxation. clang rewrites a conditional branch it cannot resolve or reach (to a global or undefined symbol, another section, or beyond ±4 KiB) into the inverted branch over a `jal`, even with `-mno-relax`; merlin-as keeps one instruction with `R_RISCV_BRANCH`, or reports the branch out of range. (llvm-mc's `-riscv-asm-relax-branches=0` behaves like merlin-as; the golden encodings are made with it.)
@@ -452,6 +452,29 @@ Until our compiler can build the kernel, clang (`--target=riscv32-unknown-elf -m
 1. Our assembler output linked by `ld.lld` → must run the same.
 2. clang `.o` files linked by our linker → must run the same.
 3. Our compiler's `.s` → our assembler → our linker → emulator.
+
+Steps 1 and 2 together, our assembler and our linker with no LLVM at all, is how every example is built (below).
+
+### Examples
+
+The programs in `examples/` are built by `cargo xtask examples` (`crates/xtask/src/examples.rs`): each source is assembled by merlin-as and the objects are linked by merlin-ld, with the example's `link.ld` (or the default layout for `muldiv`). Both tools run as libraries inside xtask, the same code as their command lines, which the comment at the top of each source spells out. The linked `examples/<dir>/<name>.elf` files are committed so Grail can run them without building anything, and `cargo test` (`crates/xtask/tests/examples.rs`) rebuilds every example from source, requires the result to equal the committed file byte for byte, and runs it in Grail with its input (UART bytes, key events, a disk image), checking the output and the exit code. Nothing in that needs LLVM. `examples/multiobj` exists to exercise multi-object linking: two sources with calls, pc-relative addresses and `.word` pointers between them, `.data` written at run time, `.bss` in the other object, and a non-zero exit code (42).
+
+clang and ld.lld are only the reference. Each source carries the command that builds the same program with them:
+
+```
+clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
+      -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+      -T examples/hello/link.ld examples/hello/hello.S -o hello.elf
+```
+
+`-mno-relax` and `--no-relax` because our tools do no relaxation; `--discard-none` because the clang driver passes `-X` to ld.lld, which drops the `.L` labels (`.Lpcrel_hi1`) that merlin-ld keeps; `-include examples/xcal.inc` for the Xcal mnemonics (see `.insn` above). For `hello` and `multiobj` this link is committed (`crates/merlin-ld/tests/fixtures/{hello,multiobj}`, from `cargo xtask ld-fixtures`), and the merlin-built executables are compared with it: the entry point, every `PT_LOAD` (addresses, sizes, every byte), the allocated section headers and the symbols (names and values) are identical, and merlin-objdump's disassembly is llvm-objdump's text for ld.lld's file. The rest of the file differs, as listed under "Differences from ld.lld" above:
+
+- ld.lld writes `.riscv.attributes` and `.comment` sections and `PT_GNU_STACK` and `PT_RISCV_ATTRIBUTES` program headers; merlin-ld writes only `PT_LOAD`s and no non-allocated sections besides `.symtab`, `.strtab` and `.shstrtab`.
+- clang's objects carry `$x`/`$d` mapping symbols, which ld.lld copies to the executable; merlin-as writes none.
+- `__stack_top` (assigned by the script) is `SHN_ABS` in merlin-ld's `.symtab` and relative to an output section in ld.lld's. The value is the same.
+- The non-allocated sections come in another order (`.symtab .strtab .shstrtab` against ld.lld's `.symtab .shstrtab .strtab`), so the section header table and those sections sit at other file offsets and the file sizes differ.
+
+With relaxation on (clang's default, which is how the examples used to be built), ld.lld also shrinks every `call` whose target is in reach of a single `jal` from 8 bytes to 4, so everything after the first call moves: in `hello`, `puts` is at 0x8000001c instead of 0x80000020 and `xcal.dbg` reports pc 0x80000014 instead of 0x80000018. That build is kept as a merlin-objdump test fixture (`crates/merlin-objdump/tests/fixtures/hello.elf`).
 
 ### Kernel build
 

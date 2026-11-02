@@ -1,5 +1,5 @@
 
-examples/hello/hello.elf:	file format elf32-littleriscv
+crates/merlin-objdump/tests/fixtures/hello.elf:	file format elf32-littleriscv
 
 Disassembly of section .text:
 

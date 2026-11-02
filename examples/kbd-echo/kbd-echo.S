@@ -14,11 +14,16 @@
 #
 #   cargo run --release -p grail -- --fb examples/kbd-echo/kbd-echo.elf
 #
-# Built with clang for now; merlin-as will assemble this same file once it exists:
+# Built with our own tools by `cargo xtask examples kbd-echo`, which does the same as
 #
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -nostdlib -static \
-#         -fuse-ld=lld -T examples/kbd-echo/link.ld examples/kbd-echo/kbd-echo.S \
-#         -o examples/kbd-echo/kbd-echo.elf
+#   merlin-as examples/kbd-echo/kbd-echo.S -o kbd-echo.o
+#   merlin-ld -T examples/kbd-echo/link.ld kbd-echo.o -o examples/kbd-echo/kbd-echo.elf
+#
+# Reference build with LLVM, only for comparison:
+#
+#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -T examples/kbd-echo/link.ld examples/kbd-echo/kbd-echo.S -o kbd-echo.elf
 
     .equ KBD_BASE,      0x30001000
     .equ KBD_STATUS,    0               # bit 0: event available
@@ -60,9 +65,9 @@ poll:
     j     poll
 
 done:
-    # xcal.dbg s1, then xcal.halt zero.
-    .insn i 0x0b, 0, x0, s1, 0
-    .insn i 0x0b, 1, x0, zero, 0
+    # Show the number of presses, then halt with exit code 0.
+    xcal.dbg s1
+    xcal.halt zero
 
 # putkey(a0 = key code): echoes one key as described at the top.
 putkey:

@@ -1,6 +1,7 @@
-//! The hello example built with our assembler: `examples/hello/hello.S`
+//! A reference build of the hello example: `examples/hello/hello.S`
 //! assembled by merlin-as and linked by ld.lld with `examples/hello/link.ld`
-//! (bootstrapping step 1, spec section 10).
+//! (bootstrapping step 1, spec section 10). The example itself is built with
+//! merlin-ld instead ([`crate::examples`]); both load the same image.
 //!
 //! `cargo xtask hello` writes the result to [`GOLDEN`], which is committed so
 //! that tests can run it in Grail without LLVM; with ld.lld installed, the
@@ -13,8 +14,8 @@ use std::process::Command;
 pub const GOLDEN: &str = "crates/merlin-as/tests/golden/hello.elf";
 
 /// What the image prints in Grail: the UART text, then `xcal.dbg a0` with the
-/// byte count. (The pc differs from `examples/hello/hello.elf`, which clang
-/// built with linker relaxation: there `call puts` became a single `jal`.)
+/// byte count, at the same pc as in `examples/hello/hello.elf` (neither link
+/// relaxes `call puts` into a single `jal`).
 pub const OUTPUT: &str = "Hello from Camelot!\n[dbg] pc=80000018 a0 = 0x00000014 (20)\n";
 
 /// Assembles hello.S with merlin-as into `work_dir/hello.o`, links it into

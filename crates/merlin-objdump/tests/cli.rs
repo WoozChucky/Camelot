@@ -28,7 +28,9 @@ fn disassembles_hello() {
     assert_eq!((code, err.as_str()), (0, ""));
     assert!(out.starts_with("\nexamples/hello/hello.elf:\tfile format elf32-littleriscv\n"));
     assert!(out.contains("\n80000000 <_start>:\n"));
-    assert!(out.contains("80000010: 00c000ef     \tjal\t0x8000001c <puts>\n"));
+    // Built by merlin-ld, which keeps `call` as auipc + jalr (no relaxation).
+    assert!(out.contains("80000010: 00000097     \tauipc\tra, 0x0\n"));
+    assert!(out.contains("80000014: 010080e7     \tjalr\t0x10(ra) <puts>\n"));
     assert!(out.contains("\tret\n"));
 }
 
@@ -78,7 +80,7 @@ fn errors_and_exit_codes() {
 
 fn fixtures() -> Vec<PathBuf> {
     let mut files = vec![root().join("examples/hello/hello.elf")];
-    for f in ["hello.o", "isa.o", "relocs.o"] {
+    for f in ["hello.elf", "hello.o", "isa.o", "relocs.o"] {
         files.push(root().join("crates/merlin-objdump/tests/fixtures").join(f));
     }
     files

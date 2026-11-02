@@ -1,0 +1,443 @@
+//! Every example built with our own tools, merlin-as + merlin-ld, as
+//! `cargo xtask examples` builds it (roadmap step 6, issue #8). No LLVM:
+//!
+//! * the committed `examples/<dir>/<name>.elf` files are exactly what the
+//!   current tools build from the sources;
+//! * each freshly built program runs in Grail, with input where it reads some
+//!   (UART bytes, key events, a disk), and prints what it should and exits
+//!   with the right code;
+//! * `hello` and `multiobj` load byte for byte like ld.lld's link of clang's
+//!   objects (the references in `crates/merlin-ld/tests/fixtures`, made by
+//!   `cargo xtask ld-fixtures`), and merlin-objdump's disassembly of them is
+//!   llvm-objdump's of ld.lld's. What differs outside the loaded bytes is
+//!   pinned down here and listed in docs/excalibur-spec.md section 10.
+
+use elf32::{Elf, PT_GNU_STACK, PT_LOAD, PT_RISCV_ATTRIBUTES, SHF_ALLOC, SHT_SYMTAB};
+use grail::block::SECTOR_SIZE;
+use grail::keyboard::{code, KeyEvent};
+use grail::{DiskConfig, Machine, MachineConfig, RunResult};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::channel;
+use xtask::examples::{self, Example, EXAMPLES};
+use xtask::repo_root;
+
+/// Enough for colorbars, which writes every pixel of the 640x480 framebuffer.
+const MAX_STEPS: u64 = 20_000_000;
+
+fn build(ex: &Example) -> examples::Built {
+    examples::build(&repo_root(), ex).unwrap_or_else(|e| panic!("{}: {e}", ex.name))
+}
+
+fn example(name: &str) -> &'static Example {
+    examples::find(name).unwrap_or_else(|| panic!("no example {name}"))
+}
+
+/// What a program gets and must do.
+struct Scenario {
+    /// Bytes waiting on the UART's receiver.
+    stdin: &'static [u8],
+    /// Key events waiting in the keyboard FIFO.
+    keys: Vec<KeyEvent>,
+    /// A disk image (relative to the repository root) attached as disk 0, in
+    /// memory so the committed file is never written.
+    disk: Option<&'static str>,
+    /// Everything the UART and `xcal.dbg` print.
+    output: &'static str,
+    exit: u32,
+}
+
+/// Press and release of each key, then a press of Esc (what ends both
+/// keyboard examples).
+fn typed(text: &str) -> Vec<KeyEvent> {
+    let mut keys: Vec<KeyEvent> = text
+        .bytes()
+        .flat_map(|c| [KeyEvent::press(c), KeyEvent::release(c)])
+        .collect();
+    keys.push(KeyEvent::press(code::ESC));
+    keys
+}
+
+fn scenario(name: &str) -> Scenario {
+    let plain = |output, exit| Scenario {
+        stdin: b"",
+        keys: Vec::new(),
+        disk: None,
+        output,
+        exit,
+    };
+    match name {
+        "hello" => plain("Hello from Camelot!\n[dbg] pc=80000018 a0 = 0x00000014 (20)\n", 0),
+        // Both strings (47 bytes, counted in print.S's .bss), then exit code
+        // 42 from main.S's .data.
+        "multiobj" => plain(
+            "Hello from two objects!\nputs lives in print.S.\n[dbg] pc=80000034 a0 = 0x0000002f (47)\n",
+            42,
+        ),
+        // All 17 cases passed.
+        "muldiv" => plain("[dbg] pc=80000168 a0 = 0x00000011 (17)\n", 0),
+        "sysinfo" => plain(
+            "sysinfo v1\n\
+             RAM      128 MiB at 0x80000000\n\
+             CPU      10000000 Hz (nominal)\n\
+             timebase 10000000 Hz\n\
+             8 devices:\n  \
+             test      0x00100000 + 0x00001000\n  \
+             CLINT     0x02000000 + 0x00010000\n  \
+             PLIC      0x0c000000 + 0x04000000\n  \
+             UART      0x10000000 + 0x00000100  irq 1\n  \
+             fb-ctrl   0x30000000 + 0x00001000\n  \
+             keyboard  0x30001000 + 0x00001000  irq 2\n  \
+             sysinfo   0x30002000 + 0x00001000\n  \
+             fb-vram   0x31000000 + 0x0012c000\n",
+            0,
+        ),
+        // Sector 0's text, the failed read past the end, and the write test on
+        // the last sector.
+        "disk" => Scenario {
+            disk: Some(DISK_IMG),
+            ..plain(
+                "disk 0x10001000, irq 3: 8 sectors\n\
+                 sector 0:\n\
+                 Hello from sector 0 of disk.img!\n\
+                 This text is on the disk image, not in the program.\n\
+                 read past the end: error 2\n\
+                 write/read-back of sector 7: ok\n",
+                0,
+            )
+        },
+        // One interrupt per byte, EOT included (and not echoed).
+        "uart-echo" => Scenario {
+            stdin: b"hi\n\x04",
+            ..plain("hi\n[dbg] pc=800000ac s0 = 0x00000004 (4)\n", 0)
+        },
+        // Draws into the framebuffer; checked in `examples_run_in_grail`.
+        "colorbars" => plain("", 0),
+        // Presses seen, Esc included.
+        "kbd-echo" => Scenario {
+            keys: typed("ok"),
+            ..plain("ok[dbg] pc=8000005c s1 = 0x00000003 (3)\n", 0)
+        },
+        // One interrupt per event: two taps and the Esc press.
+        "kbd-echo-irq" => Scenario {
+            keys: typed("ok"),
+            ..plain("ok[dbg] pc=800000b0 s0 = 0x00000005 (5)\n", 0)
+        },
+        other => panic!("no scenario for example {other}: add one"),
+    }
+}
+
+/// The image `examples/disk` reads, relative to the repository root.
+const DISK_IMG: &str = "examples/disk/disk.img";
+
+/// Runs `elf` on a default machine whose RAM starts as garbage (so `.bss`
+/// must really be zeroed by the loader) with the scenario's input.
+fn run(elf: &[u8], s: &Scenario) -> (RunResult, String, Machine) {
+    let disks = match s.disk {
+        Some(img) => vec![DiskConfig::memory(std::fs::read(repo_root().join(img)).unwrap())],
+        None => Vec::new(),
+    };
+    let mut m = Machine::new(MachineConfig {
+        disks,
+        ..MachineConfig::default()
+    })
+    .unwrap();
+    m.cpu.bus.ram.fill(0xa5);
+    m.cpu.bus.uart.capture = true;
+    m.load_elf(elf).unwrap();
+    let (tx, rx) = channel();
+    m.cpu.bus.uart.input = Some(rx);
+    for &b in s.stdin {
+        tx.send(b).unwrap();
+    }
+    for &k in &s.keys {
+        assert!(m.key_event(k), "keyboard FIFO full");
+    }
+    let r = m.run(Some(MAX_STEPS), |_| {});
+    let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
+    (r, out, m)
+}
+
+/// Assembly sources (`.S`/`.s`) directly inside each `examples/` directory.
+fn sources_on_disk() -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for dir in std::fs::read_dir(repo_root().join("examples")).unwrap() {
+        let dir = dir.unwrap().path();
+        if !dir.is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(&dir).unwrap() {
+            let f = f.unwrap().path();
+            if f.extension().is_some_and(|e| e == "S" || e == "s") {
+                let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+                found.insert(format!("{}/{}", name(&dir), name(&f)));
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn every_example_source_is_built() {
+    let listed: BTreeSet<String> = EXAMPLES
+        .iter()
+        .flat_map(|e| e.sources.iter().map(move |s| format!("{}/{s}", e.dir)))
+        .collect();
+    assert_eq!(
+        listed,
+        sources_on_disk(),
+        "examples/ and xtask::examples::EXAMPLES disagree"
+    );
+}
+
+#[test]
+fn committed_examples_are_current() {
+    for ex in EXAMPLES {
+        let built = build(ex);
+        assert!(built.warnings.is_empty(), "{}: {:?}", ex.name, built.warnings);
+        let path = ex.elf_path(&repo_root());
+        let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(
+            committed == built.elf,
+            "{} is not what merlin-as + merlin-ld build: run `cargo xtask examples {}` and commit it",
+            ex.elf_name(),
+            ex.name
+        );
+    }
+}
+
+/// Acceptance of #8: every example, built from source with our tools, runs.
+#[test]
+fn examples_run_in_grail() {
+    for ex in EXAMPLES {
+        let s = scenario(ex.name);
+        let (r, out, mut m) = run(&build(ex).elf, &s);
+        assert_eq!(
+            (r, out.as_str()),
+            (RunResult::Exited(s.exit), s.output),
+            "{}",
+            ex.name
+        );
+        if ex.name == "colorbars" {
+            let fb = &m.cpu.bus.fb;
+            assert!(fb.enabled());
+            assert_eq!(fb.presents, 1);
+            // The grey border, then the first and last of the eight bars.
+            assert_eq!(fb.pixel(0, 0), 0x808080);
+            assert_eq!(fb.pixel(8, 8), 0xffffff);
+            assert_eq!(fb.pixel(631, 471), 0x000000);
+        }
+        if let Some(img) = s.disk {
+            // The write test put the last sector back as it was.
+            let backend = m.cpu.bus.disks[0].backend();
+            let mut data = vec![0; backend.capacity() as usize * SECTOR_SIZE];
+            backend.read(0, &mut data).unwrap();
+            assert!(
+                data == std::fs::read(repo_root().join(img)).unwrap(),
+                "{}: disk changed",
+                ex.name
+            );
+        }
+    }
+}
+
+/// The scenarios really depend on the input: without the keys or the bytes,
+/// the interactive examples wait forever.
+#[test]
+fn interactive_examples_wait_for_input() {
+    for name in ["uart-echo", "kbd-echo", "kbd-echo-irq"] {
+        let idle = Scenario {
+            stdin: b"",
+            keys: Vec::new(),
+            disk: None,
+            output: "",
+            exit: 0,
+        };
+        let (r, out, _) = run(&build(example(name)).elf, &idle);
+        assert_eq!((r, out.as_str()), (RunResult::StepLimit, ""), "{name}");
+    }
+}
+
+/// Without a disk, `examples/disk` says so and exits with 1: the scenario's
+/// disk is what it reads.
+#[test]
+fn disk_example_needs_its_disk() {
+    let no_disk = Scenario {
+        stdin: b"",
+        keys: Vec::new(),
+        disk: None,
+        output: "",
+        exit: 1,
+    };
+    let (r, _, _) = run(&build(example("disk")).elf, &no_disk);
+    assert_eq!(r, RunResult::Exited(1));
+}
+
+/// The multi-object example breaks if a cross-object reference is wrong: the
+/// strings, the counter in the other object's .bss and the .data word.
+#[test]
+fn multiobj_needs_both_objects() {
+    let ex = example("multiobj");
+    let built = build(ex);
+    assert_eq!(
+        built.objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
+        ["main.o", "print.o"]
+    );
+    // main.o alone: puts, the strings and the counter are print.S's.
+    let main = merlin_ld::Input {
+        name: "main.o".into(),
+        data: built.objects[0].data.clone(),
+    };
+    let script = std::fs::read_to_string(ex.dir(&repo_root()).join("link.ld")).unwrap();
+    let opts = merlin_ld::Options {
+        script: Some(merlin_ld::ScriptSource {
+            name: "link.ld".into(),
+            text: script,
+        }),
+        entry: None,
+    };
+    let errors: Vec<String> = merlin_ld::link(&[main], &opts)
+        .expect_err("main.o alone must not link")
+        .into_iter()
+        .map(|e| e.0)
+        .collect();
+    for sym in ["puts", "greeting", "farewell", "bytes_written"] {
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains(&format!("undefined reference to '{sym}'"))),
+            "{sym}: {errors:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Against ld.lld.
+
+fn fixture(dir: &str, file: &str) -> PathBuf {
+    repo_root()
+        .join("crates/merlin-ld/tests/fixtures")
+        .join(dir)
+        .join(file)
+}
+
+/// `PT_LOAD`s as (vaddr, memsz, file bytes).
+fn loads(elf: &Elf) -> Vec<(u32, u32, Vec<u8>)> {
+    elf.segments
+        .iter()
+        .filter(|p| p.ty == PT_LOAD)
+        .map(|p| {
+            let bytes = elf.data[p.offset as usize..(p.offset + p.filesz) as usize].to_vec();
+            (p.vaddr, p.memsz, bytes)
+        })
+        .collect()
+}
+
+/// Allocated sections as (name, type, address, size, alignment, flags).
+fn alloc_sections(elf: &Elf) -> Vec<(String, u32, u32, u32, u32, u32)> {
+    elf.sections
+        .iter()
+        .filter(|s| s.flags & SHF_ALLOC != 0)
+        .map(|s| (s.name.clone(), s.ty, s.addr, s.size, s.align, s.flags))
+        .collect()
+}
+
+/// Symbols as (name, value), leaving out the `$x`/`$d` mapping symbols that
+/// clang writes and merlin-as does not.
+fn symbols(elf: &Elf) -> BTreeSet<(String, u32)> {
+    let symtab = elf.sections.iter().find(|s| s.ty == SHT_SYMTAB).unwrap();
+    elf.symbols_in(symtab)
+        .unwrap()
+        .into_iter()
+        .filter(|s| !s.name.is_empty() && !s.name.starts_with('$'))
+        .map(|s| (s.name, s.value))
+        .collect()
+}
+
+fn section_names<'a>(elf: &'a Elf) -> Vec<&'a str> {
+    elf.sections
+        .iter()
+        .map(|s| s.name.as_str())
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// merlin-objdump -d of `elf` as llvm-objdump prints it: llvm-objdump doesn't
+/// know the Xcal instructions (spec section 10, "Disassembler output").
+fn llvm_style_disassembly(name: &str, elf: &[u8]) -> String {
+    let opts = merlin_objdump::Options {
+        disassemble: true,
+        ..merlin_objdump::Options::default()
+    };
+    let text = merlin_objdump::dump(name, elf, &opts).unwrap();
+    text.lines()
+        .map(|l| match l.split_once("\txcal.") {
+            Some((head, _)) => format!("{head}\t<unknown>\n"),
+            None => format!("{l}\n"),
+        })
+        .collect()
+}
+
+/// Acceptance of #8: the merlin-built example against clang + ld.lld (both
+/// with relaxation off; see the reference command at the top of each source).
+fn assert_like_ld_lld(name: &str) {
+    let ex = example(name);
+    let ours_bytes = build(ex).elf;
+    let lld_bytes = std::fs::read(fixture(ex.dir, "link.lld.elf")).unwrap();
+    let (ours, lld) = (Elf::parse(&ours_bytes).unwrap(), Elf::parse(&lld_bytes).unwrap());
+
+    // Everything Grail loads is the same.
+    assert_eq!(ours.header.entry, lld.header.entry, "{name}: entry");
+    assert_eq!(loads(&ours), loads(&lld), "{name}: PT_LOAD segments");
+    assert_eq!(alloc_sections(&ours), alloc_sections(&lld), "{name}: sections");
+
+    // The disassembly is the same text (llvm-objdump -d of ld.lld's output).
+    let want = std::fs::read_to_string(fixture(ex.dir, "link.objdump.txt"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert_eq!(
+        llvm_style_disassembly("link.lld.elf", &ours_bytes),
+        want,
+        "{name}: disassembly"
+    );
+
+    // Symbols: the same names and values, except the mapping symbols.
+    let (ours_syms, lld_syms) = (symbols(&ours), symbols(&lld));
+    assert_eq!(ours_syms, lld_syms, "{name}: symbols");
+
+    // What only ld.lld writes (spec section 10, "Differences from ld.lld"):
+    // the attributes and .comment sections and their program headers.
+    let phdr_types = |e: &Elf| e.segments.iter().map(|p| p.ty).collect::<Vec<_>>();
+    assert!(phdr_types(&ours).iter().all(|&t| t == PT_LOAD), "{name}");
+    for t in [PT_GNU_STACK, PT_RISCV_ATTRIBUTES] {
+        assert!(phdr_types(&lld).contains(&t), "{name}: ld.lld wrote no {t:#x}");
+    }
+    let mut ours_names = section_names(&ours);
+    let mut lld_names = section_names(&lld);
+    ours_names.sort_unstable();
+    lld_names.retain(|n| ![".riscv.attributes", ".comment"].contains(n));
+    lld_names.sort_unstable();
+    assert_eq!(ours_names, lld_names, "{name}: section names");
+}
+
+#[test]
+fn hello_is_like_ld_lld() {
+    assert_like_ld_lld("hello");
+}
+
+#[test]
+fn multiobj_is_like_ld_lld() {
+    assert_like_ld_lld("multiobj");
+}
+
+/// Bootstrapping step 1 (merlin-as output linked by ld.lld, the committed
+/// `cargo xtask hello` image) and the full chain load the same image.
+#[test]
+fn hello_linked_by_ld_lld_or_merlin_ld_loads_the_same() {
+    let ours = build(example("hello")).elf;
+    let lld = std::fs::read(repo_root().join(xtask::hello::GOLDEN)).unwrap();
+    assert_eq!(
+        xtask::hello::loaded_image(&ours).unwrap(),
+        xtask::hello::loaded_image(&lld).unwrap()
+    );
+}

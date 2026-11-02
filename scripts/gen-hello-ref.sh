@@ -10,6 +10,8 @@
 #
 # Relaxation is off: with it on, clang adds R_RISCV_RELAX next to every
 # relocation and leaves calls to the linker, which merlin-as never does.
+# hello.S writes the Xcal instructions as mnemonics; clang learns them from
+# examples/xcal.inc (-include).
 #
 # hello.ref format, one line per word of .text.start:
 #   <hex offset> <word> [<R_RISCV_TYPE> <symbol>[+hexaddend]]
@@ -24,9 +26,10 @@ DR="$ROOT/crates/merlin-as/tests/golden/hello.dr.txt"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 clang --target=riscv32 -march=rv32im_zicsr_zifencei -mabi=ilp32 -mno-relax \
-  -c "$ROOT/examples/hello/hello.S" -o "$TMP/hello.o"
+  -include "$ROOT/examples/xcal.inc" -c "$ROOT/examples/hello/hello.S" -o "$TMP/hello.o"
 {
-  echo "# clang --target=riscv32 -march=rv32im_zicsr_zifencei -mabi=ilp32 -mno-relax -c examples/hello/hello.S"
+  echo "# clang --target=riscv32 -march=rv32im_zicsr_zifencei -mabi=ilp32 -mno-relax"
+  echo "#   -include examples/xcal.inc -c examples/hello/hello.S"
   echo "# regenerate with scripts/gen-hello-ref.sh"
   llvm-objdump -d -r --section=.text.start "$TMP/hello.o" | tr -d '\r' | awk '
     function flush() { if (word != "") print off " " word (rel == "" ? "" : " " rel); word = ""; rel = "" }

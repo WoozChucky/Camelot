@@ -12,7 +12,7 @@ use grail::RunResult;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use xtask::hello::{self, GOLDEN, OUTPUT};
-use xtask::{kernel, repo_root, tools};
+use xtask::{examples, kernel, repo_root, tools};
 
 const MAX_STEPS: u64 = 100_000;
 
@@ -68,7 +68,8 @@ fn objdump(objdump: &Path, obj: &Path) -> String {
     String::from_utf8(out.stdout).unwrap().replace('\r', "")
 }
 
-/// For the examples written in merlin-as syntax that clang also accepts.
+/// Every example source: clang assembles them too, with the Xcal mnemonics
+/// from `examples/xcal.inc`.
 #[test]
 fn objdump_of_merlin_as_objects_matches_clang() {
     let tools = tools::find("clang").and_then(|clang| {
@@ -79,9 +80,12 @@ fn objdump_of_merlin_as_objects_matches_clang() {
         eprintln!("skipped: clang or llvm-objdump not found");
         return;
     };
-    for example in ["hello/hello.S", "muldiv/muldiv.S"] {
-        let src = repo_root().join("examples").join(example);
-        let name = Path::new(example).file_stem().unwrap().to_str().unwrap();
+    let sources = examples::EXAMPLES
+        .iter()
+        .flat_map(|e| e.sources.iter().map(move |s| format!("{}/{s}", e.dir)));
+    for example in sources {
+        let src = repo_root().join("examples").join(&example);
+        let name = example.replace(['/', '.'], "-");
         let obj = format!("{name}.o");
 
         let ours = scratch(&format!("objdump-merlin-{name}"));
@@ -95,6 +99,8 @@ fn objdump_of_merlin_as_objects_matches_clang() {
             .args(kernel::TARGET_FLAGS)
             .arg("-march=rv32im_zicsr_zifencei")
             .arg("-c")
+            .arg("-include")
+            .arg(repo_root().join(examples::XCAL_INCLUDE))
             .arg(&src)
             .arg("-o")
             .arg(theirs.join(&obj))

@@ -75,6 +75,6 @@ fn hello_example() {
     let out = String::from_utf8(out).unwrap();
     assert_eq!(
         out,
-        "Hello from Camelot!\n[dbg] pc=80000014 a0 = 0x00000014 (20)\n"
+        "Hello from Camelot!\n[dbg] pc=80000018 a0 = 0x00000014 (20)\n"
     );
 }
