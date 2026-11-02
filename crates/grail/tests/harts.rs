@@ -362,6 +362,27 @@ fn when_every_hart_waits_mtime_jumps_to_the_earliest_timer() {
     assert_eq!(m.cpu.bus.clint.mtime, 3011, "ticking again: hart 1 runs");
 }
 
+/// At full speed the jump goes to the earliest armed `mtimecmp` whatever the hart's
+/// `mie.MTIE`, as on a one-hart machine: a masked timer only ends the jump early, it
+/// wakes nobody, and the next step jumps on.
+#[test]
+fn a_masked_timer_ends_the_full_speed_jump_early() {
+    let mut m = machine(2);
+    for (i, mie, cmp) in [(0, 1 << IRQ_M_TIMER, 5000), (1, 0, 3000)] {
+        start(&mut m, i, &[WFI, STOP]);
+        m.cpu.hart_mut(i).csr.mie = mie;
+        m.cpu.bus.clint.mtimecmp[i] = cmp;
+    }
+    steps(&mut m, 2);
+    assert_eq!(m.cpu.bus.clint.mtime, 3000, "hart 1's masked timer");
+    assert!(m.cpu.all_idle(), "which wakes nobody");
+    m.cpu.step();
+    assert_eq!(m.cpu.bus.clint.mtime, 5000, "hart 0's timer");
+    m.cpu.step();
+    assert!(!m.cpu.hart(0).waiting);
+    assert!(m.cpu.hart(1).waiting);
+}
+
 #[test]
 fn idle_skips_only_while_every_hart_waits() {
     let mut m = machine(2);
@@ -417,15 +438,16 @@ fn race(other: &[u32]) -> (u32, Machine) {
 #[test]
 fn stores_from_another_hart_break_a_reservation() {
     for (what, other, sc) in [
-        ("sw to the word", vec![sw(A5, A0, 0)], 1),
-        ("sb to its last byte", vec![sb(A5, A0, 3)], 1),
-        ("amoadd on it", vec![amoadd(ZERO, A5, A0)], 1),
-        ("sw to the next word", vec![sw(A5, A0, 4)], 0),
-        ("lw of the word", vec![lw(A7, A0)], 0),
-        ("nothing", vec![NOP], 0),
+        ("sw to the word", vec![sw(A5, A0, 0), STOP], 1),
+        ("sb to its last byte", vec![sb(A5, A0, 3), STOP], 1),
+        ("amoadd on it", vec![amoadd(ZERO, A5, A0), STOP], 1),
+        ("sw to the next word", vec![sw(A5, A0, 4), STOP], 0),
+        ("lw of the word", vec![lw(A7, A0), STOP], 0),
+        ("nothing", vec![NOP, STOP], 0),
     ] {
-        let (got, _) = race(&other);
+        let (got, m) = race(&other);
         assert_eq!(got, sc, "{what}");
+        assert_eq!(m.cpu.hart(1).csr.mcause, 0, "{what}: hart 1 took no trap");
     }
     // Both harts in an LR/SC sequence on the word: the first sc.w wins, and its store
     // breaks the other hart's reservation.
@@ -442,6 +464,46 @@ fn a_device_store_breaks_only_the_storing_harts_reservation() {
     assert_eq!(got, 0, "hart 0's reservation survives");
     assert_eq!(m.cpu.hart(1).x[T1 as usize], 1, "hart 1's does not");
     assert_eq!(m.cpu.bus.uart.captured, [0x55]);
+}
+
+/// A trap breaks the reservation of the hart that takes it (spec section 4.1), and only
+/// that one: here hart 1 takes an IPI between its `lr.w` and `sc.w` while hart 0 is in
+/// an LR/SC sequence of its own.
+#[test]
+fn an_interrupt_breaks_only_its_own_harts_reservation() {
+    let mut m = machine(2);
+    // Hart 0: lr.w on DATA, a few nops, sc.w. Hart 1: lr.w on DATA + 8 and a loop; its
+    // trap handler (at code(1) + 0x40) tries the sc.w.
+    start(&mut m, 0, &[lr(A2, A0), NOP, NOP, NOP, sc(A3, A4, A0), STOP]);
+    start(&mut m, 1, &[lr(T0, A1), STOP]);
+    let handler: Vec<u8> = [sc(T1, A5, A1), STOP]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    m.cpu.bus.load(code(1) + 0x40, &handler).unwrap();
+    for h in 0..2 {
+        let hart = m.cpu.hart_mut(h);
+        hart.x[A0 as usize] = DATA;
+        hart.x[A1 as usize] = DATA + 8;
+        hart.x[A4 as usize] = 0x44;
+        hart.x[A5 as usize] = 0x55;
+    }
+    let h1 = m.cpu.hart_mut(1);
+    h1.csr.mtvec = code(1) + 0x40;
+    h1.csr.mie = 1 << IRQ_M_SOFT;
+    h1.csr.mstatus |= excalibur::csr::MSTATUS_MIE;
+    m.cpu.step(); // both lr.w
+                  // An IPI to hart 1 (msip[1]), as a third party would send it: no hart's store.
+    m.cpu.bus.write(CLINT_BASE + 4, 4, 1).unwrap();
+    steps(&mut m, 5);
+    let h1 = m.cpu.hart(1);
+    assert_eq!(h1.csr.mcause, 1 << 31 | IRQ_M_SOFT, "hart 1 took the IPI");
+    assert_eq!(h1.pc, code(1) + 0x44, "and ran its handler's sc.w");
+    assert_eq!(h1.x[T1 as usize], 1, "hart 1's sc.w fails");
+    assert_eq!(m.cpu.bus.read(DATA + 8, 4), Ok(0));
+    assert_eq!(m.cpu.hart(0).pc, code(0) + 20);
+    assert_eq!(m.cpu.hart(0).x[A3 as usize], 0, "hart 0's sc.w succeeds");
+    assert_eq!(m.cpu.bus.read(DATA, 4), Ok(0x44));
 }
 
 #[test]

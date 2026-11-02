@@ -386,8 +386,13 @@ impl Bus {
             return self.disks[i].write(off, size, val, &mut self.ram);
         }
         if let Some((i, off)) = self.net_at(addr) {
-            // Transmitting reads the frames from RAM (DMA).
-            return self.nets[i].write(off, size, val, &mut self.ram);
+            // Writing `NET_TX_TAIL` sends frames at once: the card reads them from RAM
+            // and writes each descriptor's length and status back (DMA), which breaks
+            // the reservations on those words, whichever hart holds them.
+            let reservations = &mut self.reservations;
+            return self.nets[i].write(off, size, val, &mut self.ram, &mut |paddr, len| {
+                reservations.iter_mut().for_each(|r| r.snoop(paddr, len))
+            });
         }
         match addr {
             a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => {

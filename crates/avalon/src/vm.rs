@@ -975,6 +975,30 @@ mod tests {
         assert_eq!(inner.scrollback[0], 7);
     }
 
+    /// A full-speed VM naps between slices only when every hart is parked: one hart in
+    /// `wfi` while another runs must not slow the machine down, nor may another hart's
+    /// armed timer be missed.
+    #[test]
+    fn parked_looks_at_every_hart() {
+        let mut m = Machine::new(MachineConfig {
+            harts: 2,
+            ..MachineConfig::with_ram(1 << 20)
+        })
+        .unwrap();
+        m.cpu.hart_mut(0).waiting = true;
+        m.cpu.hart_mut(1).waiting = false;
+        assert!(!parked(&m), "hart 1 runs");
+        m.cpu.hart_mut(1).waiting = true;
+        assert!(parked(&m), "both wait, no timer");
+        // A timer set but masked does not wake hart 1; armed (MTIE set too), it does.
+        m.cpu.bus.clint.mtimecmp[1] = 1_000_000;
+        assert!(parked(&m));
+        m.cpu.hart_mut(1).csr.mie = 1 << IRQ_M_TIMER;
+        assert!(!parked(&m), "hart 1's timer is armed");
+        m.cpu.bus.clint.mtimecmp[1] = u64::MAX;
+        assert!(parked(&m), "MTIE without a deadline");
+    }
+
     /// A VM with one network card, in state created.
     fn vm_with_a_card(mac: MacAddr) -> Arc<Vm> {
         let vm = Vm::new(
