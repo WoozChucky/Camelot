@@ -1,11 +1,17 @@
 /* S-mode trap handling: kernel_vec (kernelvec.s) saves the registers and calls
  * kernel_trap(). The only interrupt so far is the timer tick, which arrives as
- * a supervisor software interrupt forwarded by machine_vec. Any exception is a
- * kernel bug: print what happened and stop. */
+ * a supervisor software interrupt forwarded by machine_vec. An exception is a
+ * kernel bug, so it panics, unless a memory probe (probe.s) caused it. */
 #include "trap.h"
 #include "kprintf.h"
 #include "machine.h"
+#include "probe.h"
 #include "riscv.h"
+#include "vm.h"
+
+/* Register numbers in struct trap_frame's regs[]. */
+#define REG_A0 10
+#define REG_A1 11
 
 volatile u32 ticks;
 
@@ -88,6 +94,10 @@ static void trap_panic(struct trap_frame *f) {
     kprintf("panic: %s\n", trap_cause_name(f->scause));
     kprintf("  scause 0x%08x  sepc 0x%08x  stval 0x%08x  sstatus 0x%08x\n", f->scause, f->sepc, f->stval,
             f->sstatus);
+    if (f->scause == CAUSE_INSTR_PAGE_FAULT || f->scause == CAUSE_LOAD_PAGE_FAULT ||
+        f->scause == CAUSE_STORE_PAGE_FAULT) {
+        vm_print_mapping(f->stval);
+    }
     for (int i = 1; i < 32; i++) {
         kprintf("  %3s %08x", reg_names[i], f->regs[i]);
         if (i % 4 == 0 || i == 31) {
@@ -97,12 +107,31 @@ static void trap_panic(struct trap_frame *f) {
     halt_after_panic();
 }
 
+/* An exception at one of the probes' memory accesses: resume at probe_fault,
+ * which returns scause to the probe's caller. Returns false for any other
+ * trap. */
+static bool probe_fixup(struct trap_frame *f) {
+    if (f->scause & CAUSE_INTERRUPT) {
+        return false;
+    }
+    if (f->sepc != (u32)(uintptr)probe_load_insn && f->sepc != (u32)(uintptr)probe_store_insn) {
+        return false;
+    }
+    f->regs[REG_A0] = f->scause;
+    f->regs[REG_A1] = f->stval;
+    f->sepc = (u32)(uintptr)probe_fault;
+    return true;
+}
+
 void kernel_trap(struct trap_frame *f) {
     if (f->scause == (CAUSE_INTERRUPT | IRQ_S_SOFT)) {
         /* A timer tick from machine_vec. Clear it first: a tick that arrives
          * while this runs sets SSIP again and is taken after sret. */
         w_sip(r_sip() & ~SIP_SSIP);
         ticks = ticks + 1;
+        return;
+    }
+    if (probe_fixup(f)) {
         return;
     }
     trap_panic(f);

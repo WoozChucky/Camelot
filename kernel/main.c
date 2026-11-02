@@ -1,6 +1,7 @@
 /* Camelot kernel: C entry point. entry.s sets up the stack and clears .bss,
  * start() drops to S-mode, then supervisor_entry calls kmain(); its return
  * value becomes the exit code. */
+#include "kalloc.h"
 #include "kprintf.h"
 #include "mmio.h"
 #include "riscv.h"
@@ -9,6 +10,8 @@
 #include "trap.h"
 #include "types.h"
 #include "uart.h"
+#include "vm.h"
+#include "vmtest.h"
 #include "xcal.h"
 
 #define CAMELOT_VERSION "0.1.0"
@@ -22,12 +25,16 @@
  * image, rather than in .bss, which entry.s clears. */
 #define BOOT_FAULT_NONE 1
 #define BOOT_FAULT_ILLEGAL 2 /* illegal_instruction(): unimp, registers marked */
-#define BOOT_FAULT_LOAD 3    /* a load from UNMAPPED_ADDR */
+#define BOOT_FAULT_LOAD 3        /* a load from UNMAPPED_ADDR: load page fault */
+#define BOOT_FAULT_STORE_TEXT 4  /* a store to kmain's code: store page fault */
 
-/* Nothing is mapped below the boot ROM (spec section 7). */
+/* Nothing is mapped below the boot ROM (spec section 7), so the kernel page
+ * table doesn't map it either. */
 #define UNMAPPED_ADDR 0x00000100
 
 volatile u32 boot_fault = BOOT_FAULT_NONE;
+
+int kmain(void);
 
 static char buf[64];
 static int passed;
@@ -111,6 +118,10 @@ static void deliberate_fault(void) {
         u32 v = mmio_read32(UNMAPPED_ADDR);
         kprintf("load from %p returned %x instead of faulting\n", (void *)UNMAPPED_ADDR, v);
         failed++;
+    } else if (boot_fault == BOOT_FAULT_STORE_TEXT) {
+        mmio_write32((uintptr)kmain, 0);
+        kprintf("store to kernel text at %p didn't fault\n", (void *)(uintptr)kmain);
+        failed++;
     }
 }
 
@@ -125,6 +136,15 @@ int kmain(void) {
 
     /* The debug console works without any driver: show the failure count. */
     xcal_dbg((u32)failed);
+
+    /* Memory: every free page goes on the free list, then paging goes on.
+     * Everything from here runs with Sv32 translation. */
+    kinit();
+    kprintf("ram: %u MiB at %p\n", ram_size >> 20, (void *)(uintptr)ram_base);
+    kvminit();
+    kvminithart();
+    kprintf("paging: on (Sv32)\n");
+    failed += vm_selftest();
 
     trap_init();
     kprintf("timer: %u Hz tick, %u Hz timebase\n", TICK_HZ, timebase_hz());

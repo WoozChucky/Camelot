@@ -1,14 +1,16 @@
 //! The Camelot kernel (`kernel/kernel.elf`, committed) run through the `grail`
-//! binary, with `--max-steps` as a guard: the timer ticks, and the panics from
-//! its deliberate faults. The kernel's own tests (traps, delegation, the
-//! register dump) are in `crates/xtask/tests/kernel.rs`.
+//! binary, with `--max-steps` as a guard: booting with paging on (with several
+//! `--ram` sizes), the timer ticks, and the panics from its deliberate faults.
+//! The kernel's own tests (traps, delegation, the register dump, the page
+//! table) are in `crates/xtask/tests/kernel.rs`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Far more than a boot needs (a few tens of thousands of steps, since `wfi`
-/// skips ahead to the next tick), so hitting it means the kernel hung.
-const MAX_STEPS: &str = "2000000";
+/// Far more than a boot needs (about 4.5 million steps with 128 MiB of RAM,
+/// nearly all of them setting up memory; `wfi` skips ahead to each tick), so
+/// hitting it means the kernel hung.
+const MAX_STEPS: &str = "20000000";
 
 // Kernel constants, from the kernel sources named in each comment. grail
 // can't depend on xtask, so crates/xtask/tests/kernel.rs has its own copies:
@@ -20,14 +22,25 @@ const PANIC_EXIT: i32 = 0xfe;
 /// Values of the kernel's `boot_fault` (kernel/main.c).
 const BOOT_FAULT_ILLEGAL: u32 = 2;
 const BOOT_FAULT_LOAD: u32 = 3;
+const BOOT_FAULT_STORE_TEXT: u32 = 4;
+
+/// What the kernel prints once paging is on (kernel/main.c, kernel/vmtest.c).
+fn memory_lines(ram_mib: u32) -> String {
+    format!("ram: {ram_mib} MiB at 0x80000000\npaging: on (Sv32)\nvm self-test: 24/24 passed\n")
+}
 
 fn kernel_elf() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel/kernel.elf")
 }
 
 fn grail(elf: &Path) -> (Option<i32>, String) {
+    grail_with(&[], elf)
+}
+
+fn grail_with(args: &[&str], elf: &Path) -> (Option<i32>, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_grail"))
         .args(["--max-steps", MAX_STEPS])
+        .args(args)
         .arg(elf)
         .output()
         .expect("cannot run grail");
@@ -81,9 +94,30 @@ fn kernel_ticks_ten_times_and_exits_0() {
     assert_eq!(code, Some(0), "output:\n{out}");
     assert!(out.starts_with("Camelot v0.1.0 booting...\n"), "{out}");
     assert!(
-        out.ends_with(&format!("timer: 10 Hz tick, 10000000 Hz timebase\n{}", ticks())),
+        out.ends_with(&format!(
+            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{}",
+            memory_lines(128),
+            ticks()
+        )),
         "{out}"
     );
+}
+
+#[test]
+fn kernel_boots_with_paging_on_any_ram_size() {
+    // The page allocator takes the RAM size from sysinfo, so --ram changes
+    // what the kernel manages; the self-tests and the ticks run with paging
+    // on either way.
+    for mib in ["1", "16", "300"] {
+        let (code, out) = grail_with(&["--ram", mib], &kernel_elf());
+        assert_eq!(code, Some(0), "--ram {mib}, output:\n{out}");
+        let want = format!(
+            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{}",
+            memory_lines(mib.parse().unwrap()),
+            ticks()
+        );
+        assert!(out.ends_with(&want), "--ram {mib}:\n{out}");
+    }
 }
 
 #[test]
@@ -105,10 +139,19 @@ fn illegal_instruction_panics() {
 fn unmapped_load_panics() {
     let (code, out) = grail(&kernel_with_fault(BOOT_FAULT_LOAD));
     assert_eq!(code, Some(PANIC_EXIT), "output:\n{out}");
-    let report = format!(
-        "{}panic: load access fault\n  scause 0x00000005  sepc 0x",
-        ticks()
-    );
+    // Paging is on: an address the page table doesn't map is a page fault.
+    let report = format!("{}panic: load page fault\n  scause 0x0000000d  sepc 0x", ticks());
     assert!(out.contains(&report), "{out}");
     assert!(out.contains("  stval 0x00000100  "), "{out}");
+    assert!(out.contains("\n  va 0x00000100 is not mapped\n"), "{out}");
+}
+
+#[test]
+fn store_to_kernel_text_panics() {
+    let (code, out) = grail(&kernel_with_fault(BOOT_FAULT_STORE_TEXT));
+    assert_eq!(code, Some(PANIC_EXIT), "output:\n{out}");
+    let report = format!("{}panic: store page fault\n  scause 0x0000000f  sepc 0x", ticks());
+    assert!(out.contains(&report), "{out}");
+    // The page is mapped, read and execute only.
+    assert!(out.contains(" -A--X-RV\n"), "{out}");
 }

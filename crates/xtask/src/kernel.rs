@@ -45,8 +45,11 @@ pub const C_FLAGS: &[&str] = &[
     "-Iinclude",
 ];
 
-/// Generous step budget for running the kernel (booting takes ~20k steps).
-pub const BOOT_MAX_STEPS: u64 = 2_000_000;
+/// Generous step budget for running the kernel. Booting with the default 128 MiB
+/// of RAM takes about 4.5 million steps, nearly all of them spent putting every
+/// page on the free list, mapping RAM and MMIO page by page, and the allocator
+/// self-test that takes every page and gives it back.
+pub const BOOT_MAX_STEPS: u64 = 20_000_000;
 
 /// Next to the committed `kernel/kernel.elf`: the `clang --version` line it
 /// was built with. Tests rebuild and compare bytes only with that same clang.

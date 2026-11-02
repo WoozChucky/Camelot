@@ -94,6 +94,21 @@ w_stvec:
     csrw  stvec, a0
     ret
 
+    .globl r_satp
+r_satp:
+    csrr  a0, satp
+    ret
+
+    .globl w_satp
+w_satp:
+    csrw  satp, a0
+    ret
+
+    .globl sfence_vma
+sfence_vma:
+    sfence.vma zero, zero
+    ret
+
     .globl wfi
 wfi:
     wfi
