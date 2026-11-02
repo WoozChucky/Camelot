@@ -1,6 +1,8 @@
 /* Platform-level interrupt controller (spec section 7.1): the QEMU `virt`
- * register layout, one hart, two contexts. The kernel uses context 1 (hart 0
- * in S-mode), which drives sip.SEIP. Registers are 32 bits wide. */
+ * register layout, two contexts per hart. The kernel uses context 1 (hart 0
+ * in S-mode), which drives hart 0's sip.SEIP: every device interrupt goes to
+ * hart 0, and the other harts enable none (spec section 10, "Kernel SMP").
+ * Registers are 32 bits wide. */
 #ifndef CAMELOT_PLIC_H
 #define CAMELOT_PLIC_H
 

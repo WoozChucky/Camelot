@@ -172,9 +172,11 @@ struct Way {
 }
 
 /// Polls a frame held back going up waits for the next frame up before it goes alone:
-/// 100 polls are 2.56 ms of the machine's time, far less than any timeout of the
-/// gateway's or the kernel's.
-const HOLD_POLLS: u32 = 100;
+/// 400 polls are 10.24 ms of the machine's time, far less than any timeout of the
+/// gateway's or the kernel's (a tick is 100 ms), and long enough that the kernel,
+/// whose segments up are often more than a few ms apart, usually sends another
+/// before the held one goes alone.
+const HOLD_POLLS: u32 = 400;
 
 /// Toward the gateway, toward the machine, and the frames due to the machine next
 /// (duplicates, and frames that were held back).

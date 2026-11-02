@@ -6,9 +6,10 @@ banner and a `kprintf` self-test over the UART, puts every free page of RAM on
 the page allocator's free list, turns on Sv32 paging with a kernel page table,
 runs the memory self-tests, lists the disks, takes ten timer ticks, tests the
 first disk if there is one and mounts the filesystem on it, gives the first
-network card an address (DHCP, or a static one), and starts the shell, a
-user program, as the first process. User programs run in U-mode, each in its own page table, switching on
-every timer tick; they call the kernel through system calls
+network card an address (DHCP, or a static one), wakes the other harts if
+the machine has several, and starts the shell, a user program, as the first
+process. User programs run in U-mode, each in its own page table, switching on
+every timer tick, on every hart at once; they call the kernel through system calls
 (`docs/camelot-syscalls.md`): files, directories, the console and pipes
 through file descriptors, starting and waiting for programs (from `/bin` on
 the disk, or built into the kernel without one), sleeping, growing the heap. A program that faults is killed and
@@ -101,14 +102,14 @@ cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf
 
 ```
 blk self-test: 16/16 passed
-fs: disk 0 mounted: 1775 blocks (587 free), 256 inodes (215 free), 21 log blocks
+fs: disk 0 mounted: 1763 blocks (482 free), 256 inodes (212 free), 21 log blocks
 fs: ls /
 d    1  3      80 .
 d    1  3      80 ..
 f    2  1     410 README
 d    3  1      48 dev
-d    5  1     592 bin
-fs: /bin holds 35 programs, the kernel none
+d    5  1     640 bin
+fs: /bin holds 38 programs, the kernel none
 fs self-test: 12/12 passed
 Type help for the list of commands.
 $ echo hello world > hello.txt
@@ -118,12 +119,12 @@ $ mkdir notes
 $ cd notes
 $ ls /bin | wc > count
 $ cat < count
-37 185 869
+40 200 943
 ```
 
 With `kernel.elf` given as the program instead, the kernel checks that each
-program in `/bin` is byte for byte its own copy (`fs: /bin holds 35 of the
-kernel's 35 programs`).
+program in `/bin` is byte for byte its own copy (`fs: /bin holds 38 of the
+kernel's 38 programs`).
 
 The shell then runs its programs from `/bin`, and what they write stays on
 the image. `cargo run -p camelot-fs -- ls target/camelot-fs.img /bin` (and
@@ -153,6 +154,39 @@ PING 10.0.2.2: 56 data bytes
 64 bytes from 10.0.2.2: seq=1 ttl=64 time=1.211 ms
 1 sent, 1 received
 ```
+
+On a machine of several harts (`--harts N`, up to 8; spec section 10,
+"Kernel SMP"), hart 0 boots the kernel alone, then wakes the others, which
+join the scheduler: any hart runs any runnable process, so up to N programs
+run at the same time. `harts` shows what each one is doing, and `primes`
+keeps them all busy:
+
+```
+cargo run --release -p grail -- --harts 4 kernel/kernel.elf
+```
+
+```
+tick 10
+smp: 4 harts running
+Type help for the list of commands.
+$ primes 4 40000
+primes [0, 10000): 1229
+primes [10000, 20000): 1033
+primes [20000, 30000): 983
+primes [30000, 40000): 958
+primes: 4203 below 40000, 4 workers
+$ harts
+HART   PID    TICKS SWITCHES
+   0     1       20        9
+   1     7       10       14
+   2     -       10        6
+   3     -       10        5
+```
+
+The workers' lines come in whatever order they finish. Each hart has its own
+timer, and takes its ticks from when it started; a process runs on one hart
+at a time, but may move from one to another between its turns (here the
+shell, pid 1, is still on hart 0 on its way to wait for `harts`).
 
 The shell (`user/sh.c`) runs programs by name, with arguments: `PROG
 [ARG...]` runs `/bin/PROG`, and a word with a `/` in it is a path to the
@@ -306,7 +340,7 @@ turns interrupts on under a `push_off()` before its `pop_off()`.
 ## Locking
 
 Every structure that more than one process, a process and an interrupt
-handler, or (from #63 on) more than one hart can reach is protected by a
+handler, or more than one hart can reach is protected by a
 lock (spec section 10, "Kernel locking"). Spinlocks (`spinlock.s`,
 `include/spinlock.h`) are xv6's: `acquire()` turns interrupts off on the
 hart and spins on an `amoswap.w`; `release()` turns them back on once the
@@ -315,6 +349,21 @@ lets go of the lock it holds while it sleeps; buffers and inodes, held
 across disk reads, have sleep locks (`sleeplock.c`). Per-hart state is
 `cpus[tp]`: `tp` holds the hart's id in the kernel, and `user_vec` puts it
 back after a trap from U-mode.
+
+## Several harts
+
+`smp.c` says how the kernel runs on several harts (spec section 10, "Kernel
+SMP"). Hart 0 boots alone; `smp_boot()` gives each other hart a stack and
+wakes them with an IPI, and each goes through `_start` and `start()` (its
+own M-mode trap vector, `mscratch` block and timer) into `hart_main()`,
+which runs the scheduler. The process table is shared: any hart runs any
+runnable process, under `proc_lock`, and a hart with nothing to run waits in
+`wfi` until its next tick, or until another hart makes a process runnable
+and wakes it with an IPI. Only hart 0 counts the clock (`ticks`, `sleep`,
+the network's timer) and takes the devices' interrupts. Taking away a
+mapping (`unmap_pages()`) shoots it down on the harts that may hold it
+(`tlb_shootdown()`) before the page is reused. A panic on one hart stops
+the others before it prints.
 
 Locks are always taken in this order, so no two holders can wait for each
 other:
@@ -335,16 +384,17 @@ processes through all of it at once under timer preemption.
 
 | File | What it does |
 |---|---|
-| `entry.s` | `_start` (M-mode): early trap vector, stack, zero `.bss`, `call start`, `mret` to S-mode. `supervisor_entry`: `call kmain`, then `machine_halt` with its return value. Also `xcal_dbg`/`xcal_halt` for C and the early trap handler (prints `mcause`, `mepc`, `mtval`, exits 0xff) |
-| `start.c` | `start()`: M-mode setup: `medeleg`/`mideleg`, `stvec`, `mtvec`, `mscratch`, the first timer interrupt, `mstatus.MPP = S`, `mepc` |
-| `machine.s` | `machine_vec`, the M-mode trap handler: forwards the machine timer to S-mode as SSIP, serves machine calls (`MCALL_HALT`). `machine_halt()` makes that call from S-mode |
+| `entry.s` | `_start` (M-mode): early trap vector, stack (hart 0's, or the one `smp_boot()` gave another hart), zero `.bss` (hart 0 only), `call start`, `mret` to S-mode. `supervisor_entry`: hart 0 calls `kmain`, then `machine_halt` with its return value; the others call `hart_main`. Also `xcal_dbg`/`xcal_halt` for C and the early trap handler (prints `mcause`, `mepc`, `mtval`, exits 0xff) |
+| `start.c` | `start()`, on each hart: M-mode setup: `medeleg`/`mideleg`, `stvec`, `mtvec`, the hart's `mscratch` block, its first timer interrupt, `mstatus.MPP = S`, `mepc` |
+| `machine.s` | `machine_vec`, the M-mode trap handler: forwards the machine timer (marking a tick) and IPIs (the machine software interrupt) to S-mode as SSIP, serves machine calls (`MCALL_HALT`, `MCALL_IPI`). `machine_halt()` and `machine_ipi()` make them from S-mode |
 | `kernelvec.s` | `kernel_vec`, the trap vector for traps from S-mode: saves x1-x31 and the trap CSRs as a `struct trap_frame` on the stack, calls `kernel_trap`, restores, `sret`. Also `illegal_instruction()` for the panic tests |
 | `uservec.s` | `user_vec`, the trap vector for traps from U-mode: saves the user registers in the process's trap frame (`sscratch`), calls `user_trap` on the process's kernel stack; `user_return`: frame to registers, `sret` to U-mode |
-| `trap.c` | `kernel_trap()`: counts timer ticks (waking sleepers), claims/completes PLIC interrupts and runs the console's or a disk's handler, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `user_trap()`: a tick yields, an ecall goes to `syscall()`, a fault kills the process; `user_trap_return()`, `trap_init()`, `panic()` |
-| `proc.c` | processes: `proc_create()` (slot, kernel stack, page table, ELF, stack with the arguments, descriptors 0-2 and working directory inherited), `proc_exec()` (a new address space for the same process), `kproc_create()` (a kernel process running a C function), `proc_run_init()` (the shell, with the console as descriptors 0-2), the round-robin `scheduler()` (idling in `wfi` while everyone sleeps), `yield()`, `sleep()`/`wakeup()`, `proc_exit()`, `proc_kill()`, `proc_wait()`, `proc_sbrk()` |
+| `trap.c` | `kernel_trap()`: counts timer ticks (hart 0's wake sleepers), serves TLB shootdowns, claims/completes PLIC interrupts and runs the console's or a disk's handler, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `user_trap()`: a tick yields, an ecall goes to `syscall()`, a fault kills the process; `user_trap_return()`, `trap_init()`, `panic()` |
+| `proc.c` | processes: `proc_create()` (slot, kernel stack, page table, ELF, stack with the arguments, descriptors 0-2 and working directory inherited), `proc_exec()` (a new address space for the same process), `kproc_create()` (a kernel process running a C function), `proc_run_init()` (the shell, with the console as descriptors 0-2), the round-robin `scheduler()` on every hart (idling in `wfi` while nothing is runnable, woken by an IPI when something is), `yield()`, `sleep()`/`wakeup()`, `proc_exit()`, `proc_kill()`, `proc_wait()`, `proc_sbrk()` |
 | `swtch.s` | `swtch()`: saves `ra`, `sp`, `s0`-`s11` and loads another thread's |
 | `spinlock.s` | `acquire()`/`release()` (an `amoswap.w` loop; panics on a lock acquired twice or released unheld), `holding()`, `push_off()`/`pop_off()` (nested interrupt disabling), `mycpu()` (`&cpus[tp]`) |
 | `spinlock.c` | `cpus[]`, the per-hart state; `initlock()`, `cpu_init()`, `cpuid()`, and the panic messages that name the lock and the hart |
+| `smp.c` | the other harts: `smp_boot()` (stacks, the IPI that wakes them, the TLB shootdown self-test), `hart_main()`, `tlb_shootdown()`/`tlb_serve()` |
 | `sleeplock.c` | sleep locks (xv6's), held across sleeps: `acquiresleep()`/`releasesleep()`, for the buffers and the inodes |
 | `elf.c` | `elf_load()`: checks an ELF32 executable, read from memory or from a file through a `struct elf_file`, and maps its `PT_LOAD` segments into user space |
 | `exec.c` | `exec_spawn()`, `exec_replace()`, `exec_init()`: find the program a path names (a file of the root filesystem, or an embedded program without one) and start it |
@@ -360,7 +410,7 @@ processes through all of it at once under timer preemption.
 | `probe.s` | `probe_load()`/`probe_store()`: a word access that returns the trap cause instead of panicking (`kernel_trap` resumes them at `probe_fault`) |
 | `sysinfo.c` | reads Grail's sysinfo block: registers and the device table |
 | `timer.c` | `timebase_hz()` (sysinfo's `SYS_TIMEBASE_HZ`, read once), `timer_interval()`, `timer_init()` |
-| `plic.c` | `plic_init()` (UART source enabled for the S-mode context), `plic_enable()` (another source, such as a disk's), `plic_claim()`, `plic_complete()` |
+| `plic.c` | `plic_init()` (UART source enabled for hart 0's S-mode context, which takes every device interrupt), `plic_enable()` (another source, such as a disk's), `plic_claim()`, `plic_complete()` |
 | `blk.c` | disk driver: `blk_init()` finds the disks in the sysinfo device table and enables their completion interrupts; `blk_read()`/`blk_write()`/`blk_flush()` issue one DMA request at a time and sleep until `blk_intr()`, the interrupt handler, wakes them with the `BLK_ERROR` code |
 | `bio.c` | buffer cache (xv6's): 30 one-KiB block buffers in LRU order, `bread()`/`bwrite()`/`brelse()`, each buffer sleep-locked while in use |
 | `blktest.c` | the disk self-test, in kernel processes: three readers at once, write and read back a scratch block (restored afterwards), errors, LRU reuse |
@@ -370,14 +420,14 @@ processes through all of it at once under timer preemption.
 | `net/` | the network stack (`docs/camelot-net.md`), a file per layer: `nic.c` (the card driver: descriptor rings, `nic_intr()`, the transmit queue), `pbuf.c` (the buffer pool), `ether.c`, `arp.c` (the cache), `ip.c` (checks, routing, loopback), `icmp.c` (echo, `icmp_ping()`), `udp.c` (the kernel-internal socket API, the echo service), `tcp.c` (connections, retransmission, the kernel-internal socket API), `dhcp.c` (the client), `net.c` (configuration, `net_boot()`, the counters, `net_timer()`, the `netinfo`/`netconf`/`ping` system calls), `socket.c` (the socket system calls: sockets behind file descriptors) |
 | `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin`, and `/dev/console` is made too |
 | `boot/` | the bootloader of a bootable disk (`boot.s`, linked by `link.ld` into the committed `boot.elf` with `cargo xtask boot`): the boot block, which loads the kernel ELF stored after the filesystem; `camelot-fs mkfs --boot` installs it |
-| `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()` and `wfi()` |
-| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, the network cards (`net_init`), ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, the filesystem (`fs_boot`), the network's address (`net_boot`), then the user-space shell as the first process |
+| `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()`, `wfi()`, and the atomics `atomic_swap()`/`atomic_add()`/`atomic_or()` |
+| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, the network cards (`net_init`), ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, the filesystem (`fs_boot`), the network's address (`net_boot`), the other harts (`smp_boot`), then the user-space shell as the first process |
 | `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |
 | `console.c` | the console device (`read` and `write` on it): `console_read()` (line editing and echo: backspace, CR/LF/CR LF, Ctrl-D; sleeps until a line is complete), `console_write()`, `console_intr()` (the UART interrupt, waking readers) |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |
 | `kernel.ld` | layout: `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end` |
-| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct user_program`, sleep and wakeup), `context.h` (`struct context`, `swtch`), `spinlock.h` (`struct spinlock`, `struct cpu`, `NCPU`), `sleeplock.h`, `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
+| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct user_program`, sleep and wakeup), `context.h` (`struct context`, `swtch`), `spinlock.h` (`struct spinlock`, `struct cpu`, `NCPU`), `smp.h`, `sleeplock.h`, `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
 | `kernel.elf` | the prebuilt image, with the user programs built in, committed so `cargo test` and Grail need no build |
 | `kernel-disk.elf` | the prebuilt disk kernel: the same objects without the user programs, which a bootable root image holds (`cargo xtask fs`) |
 
@@ -411,7 +461,7 @@ merlin-ld -T kernel.ld -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf
        exec.c.o file.c.o fs.c.o fstest.c.o kalloc.c.o kernelvec.s.o kprintf.c.o log.c.o machine.s.o \
        main.c.o net/arp.c.o net/dhcp.c.o net/ether.c.o net/icmp.c.o net/ip.c.o net/net.c.o \
        net/nic.c.o net/pbuf.c.o net/tcp.c.o net/udp.c.o pipe.c.o plic.c.o probe.s.o proc.c.o riscv.s.o \
-       sleeplock.c.o spinlock.c.o spinlock.s.o start.c.o \
+       sleeplock.c.o smp.c.o spinlock.c.o spinlock.s.o start.c.o \
        string.c.o swtch.s.o syscall.c.o sysfile.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
        userprogs.s.o uservec.s.o vm.c.o vmtest.c.o
 ```

@@ -71,11 +71,14 @@ void tlb_serve(void) {
 void tlb_shootdown(pagetable_t pt) {
     sfence_vma();
     u32 me = cpuid();
-    u32 up = harts_up;
+    u32 up = harts_up & ~(1u << me);
+    if (up == 0) {
+        return;
+    }
     u32 targets = 0;
     u32 ticket[NCPU];
     for (u32 i = 0; i < NCPU; i++) {
-        if (i == me || (up & (1u << i)) == 0) {
+        if ((up & (1u << i)) == 0) {
             continue;
         }
         /* cpus[i].pagetable may change as we look: a hart that switches to

@@ -205,11 +205,15 @@ static struct proc *proc_alloc(int *err) {
  * look again itself), with an IPI each. A hart woken for nothing (another
  * got there first) just waits again. Called with proc_lock held. */
 static void kick_idle(u32 n) {
-    u32 up = harts_running();
     u32 me = cpuid();
+    u32 up = harts_running() & ~(1u << me);
+    /* No other hart: the usual case on a one-hart machine, made cheap. */
+    if (up == 0) {
+        return;
+    }
     u32 kick = 0;
     for (u32 i = 0; i < NCPU && n > 0; i++) {
-        if (i != me && (up & (1u << i)) != 0 && cpus[i].idle) {
+        if ((up & (1u << i)) != 0 && cpus[i].idle) {
             /* Woken once: the next process doesn't count on it too. */
             cpus[i].idle = false;
             kick |= 1u << i;

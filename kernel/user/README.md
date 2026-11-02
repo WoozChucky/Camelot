@@ -27,6 +27,7 @@ for `grep`, whose 1 means "no line matched".
 | `wc` | `wc [-l] [-w] [-c] [FILE...]` | counts lines, words and bytes, of files or its input; the flags pick the counts; refuses a directory |
 | `grep` | `grep [-v] [-c] [-n] PATTERN [FILE...]` | prints the lines that contain a fixed string; `-v` those that don't, `-c` how many, `-n` with their numbers |
 | `ps` | `ps` | lists the processes (`procs`): pid, parent, state, size, name |
+| `harts` | `harts` | lists the harts (`harts`): id, the process running on it (`-` while idle), the ticks it has taken and the processes it has switched to |
 | `kill` | `kill PID...` | ends processes (`kill`): they exit with status -1; not the shell, whose end is Camelot's |
 | `sleep` | `sleep SECONDS` | waits, `0.5` for half a second (the clock ticks 10 times a second) |
 
@@ -95,6 +96,7 @@ the last line once `http://127.0.0.1:8080/README` was opened on the host.
 | `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |
 | `filetest` | checks the file system calls on a writable root filesystem (`filetest: N checks, 0 failed`) |
 | `stress` | many processes at once: pages, the console, a shared pipe and files under timer preemption (`stress: W workers, R rounds, N bytes: ok`) |
+| `primes` | `primes [WORKERS [LIMIT]]`: counts the primes below LIMIT (20000) with WORKERS (4, at most 6) processes at once, one slice of the range each, to keep several harts busy (`primes: N below LIMIT, W workers`) |
 | `libtest` | checks the C library (`libtest: N checks, 0 failed`) |
 | `nettest` | moves known bytes through TCP: `nettest connect ADDR PORT BYTES [TIMES]` sends a pattern and reads to the end, `nettest serve PORT CONNECTIONS [BACKLOG]` echoes what each connection sends; each prints the bytes' counts and FNV-1a hash (the TCP tests' program) |
 | `socktest` | checks the socket calls, their results and their errors, over loopback (`socktest: N checks, 0 failed`; needs a network card) |
