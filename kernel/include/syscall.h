@@ -53,6 +53,12 @@
 #define SYS_getpeername 38 /* getpeername(fd, addr): 0, the other end's address in *addr */
 #define SYS_setsockopt 39 /* setsockopt(fd, level, option, value, len): 0 */
 #define SYS_harts 40   /* harts(buf, max): the number of harts, up to max described in buf */
+#define SYS_thread_create 41 /* thread_create(entry, arg, stack): the new thread's tid */
+#define SYS_thread_exit 42   /* thread_exit(status): never returns */
+#define SYS_thread_join 43   /* thread_join(tid, status): 0, once thread tid has ended */
+#define SYS_gettid 44        /* gettid(): the caller's thread id */
+#define SYS_futex_wait 45    /* futex_wait(addr, val): 0 once woken, if *addr was val */
+#define SYS_futex_wake 46    /* futex_wake(addr, n): the number of threads woken */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process */
@@ -63,7 +69,7 @@
 #define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */
 #define EBADF 9         /* not an open file descriptor, or not open for that */
 #define ECHILD 10       /* wait: no such child */
-#define EAGAIN 11       /* spawn: every process slot is taken; a socket's receive timeout ran out */
+#define EAGAIN 11       /* spawn, thread_create: every slot is taken; futex_wait: not the value; a socket's receive timeout ran out */
 #define ENOMEM 12       /* out of memory, or the heap would reach the stack */
 #define EACCES 13       /* spawn, exec: not a regular file */
 #define EFAULT 14       /* a pointer argument is not valid user memory */

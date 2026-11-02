@@ -11,10 +11,10 @@
 #include "types.h"
 
 struct sleeplock {
-    /* Held, by the process `pid`. */
+    /* Held, by the thread `tid` (proc.h). */
     bool locked;
-    u32 pid;
-    /* Protects `locked` and `pid`; the waiters sleep on the sleep lock with
+    u32 tid;
+    /* Protects `locked` and `tid`; the waiters sleep on the sleep lock with
      * it. */
     struct spinlock lk;
     const char *name;
@@ -22,13 +22,13 @@ struct sleeplock {
 
 void initsleeplock(struct sleeplock *lk, const char *name);
 
-/* Takes `lk`, sleeping while another process holds it. */
+/* Takes `lk`, sleeping while another thread holds it. */
 void acquiresleep(struct sleeplock *lk);
 
-/* Lets go of `lk` and wakes the processes waiting for it. */
+/* Lets go of `lk` and wakes the threads waiting for it. */
 void releasesleep(struct sleeplock *lk);
 
-/* Whether the current process holds `lk`. */
+/* Whether the current thread holds `lk`. */
 bool holdingsleep(struct sleeplock *lk);
 
 #endif

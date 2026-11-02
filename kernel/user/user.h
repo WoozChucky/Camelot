@@ -21,7 +21,7 @@ typedef unsigned long size_t;
 #define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */
 #define EBADF 9         /* not an open file descriptor, or not open for that */
 #define ECHILD 10       /* wait: no such child */
-#define EAGAIN 11       /* spawn: every process slot is taken; a socket's receive timeout ran out */
+#define EAGAIN 11       /* spawn, thread_create: every slot is taken; futex_wait: not the value; a socket's receive timeout ran out */
 #define ENOMEM 12       /* out of memory, or the heap would reach the stack */
 #define EACCES 13       /* spawn, exec: not a regular file */
 #define EFAULT 14       /* a pointer argument is not valid user memory */
@@ -262,6 +262,12 @@ int shutdown(int fd, int how);
 int getsockname(int fd, struct sockaddr_in *addr);
 int getpeername(int fd, struct sockaddr_in *addr);
 int setsockopt(int fd, int level, int option, const void *value, uint len);
+int thread_create(void (*entry)(void *), void *arg, void *stack);
+void thread_exit(int status);
+int thread_join(int tid, int *status);
+int gettid(void);
+int futex_wait(int *addr, int val);
+int futex_wake(int *addr, int n);
 /* Any call by number (for tests). */
 int syscall(int number, uint a0, uint a1, uint a2);
 
@@ -300,6 +306,45 @@ void *malloc(size_t n);
 void free(void *p);
 void *calloc(size_t count, size_t size);
 void *realloc(void *p, size_t n);
+
+/* Threads and locks (lib/atomic.s, lib/thread.s, lib/mutex.c; lib/README.md,
+ * "Threads").
+ *
+ * The atomics are each one indivisible step on a word, ordered against
+ * every load and store around them, and return the word as it was:
+ * atomic_swap stores v, atomic_add adds v, atomic_cas stores `desired` only
+ * if the word was `expect`; atomic_load and atomic_store are a plain load
+ * and store with that ordering. */
+int atomic_swap(int *p, int v);
+int atomic_add(int *p, int v);
+int atomic_cas(int *p, int expect, int desired);
+int atomic_load(int *p);
+void atomic_store(int *p, int v);
+
+/* A spinlock spins (on amoswap.w) until it is free: for short stretches
+ * between threads running on different harts. A mutex sleeps in the
+ * kernel (futex_wait) while another thread holds it, and costs no system
+ * call when nobody else wants it. Both are free when all zero, so a static
+ * one needs no setting up; mutex_trylock takes it only if it is free and
+ * returns 1 if it did. Neither may be taken twice by one thread. */
+struct spinlock {
+    int locked;
+};
+void spin_lock(struct spinlock *l);
+void spin_unlock(struct spinlock *l);
+
+struct mutex {
+    int state;
+};
+void mutex_lock(struct mutex *m);
+int mutex_trylock(struct mutex *m);
+void mutex_unlock(struct mutex *m);
+
+/* Runs fn(arg) in a new thread of this process, on the `size` bytes of
+ * stack at `stack` (which must stay until the thread has ended); fn's
+ * return value is the thread's exit status, which thread_join collects.
+ * Returns the new thread's tid, or a negative error number. */
+int thread_start(int (*fn)(void *), void *arg, void *stack, uint size);
 
 /* Formatted output (lib/printf.c): %d %u %x %p %s %c %%, with an optional
  * '-' (left align), '0' (zero padding) and width; an 'l' before d/u/x is

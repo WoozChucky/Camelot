@@ -266,12 +266,39 @@ void syscall(struct trap_frame *f) {
     case SYS_harts:
         ret = sys_harts(f);
         break;
+    case SYS_thread_create:
+        ret = thread_create(arg(f, 0), arg(f, 1), arg(f, 2));
+        break;
+    case SYS_thread_exit:
+        thread_exit((int)arg(f, 0));
+        ret = 0; /* not reached */
+        break;
+    case SYS_thread_join:
+        ret = thread_join((int)arg(f, 0), arg(f, 1));
+        break;
+    case SYS_gettid:
+        ret = (int)mythread()->tid;
+        break;
+    case SYS_futex_wait:
+        ret = futex_wait(arg(f, 0), arg(f, 1));
+        break;
+    case SYS_futex_wake:
+        ret = futex_wake(arg(f, 0), (i32)arg(f, 1));
+        break;
     default:
         ret = -ENOSYS;
         break;
     }
     if (net) {
         release(&net_lock);
+        /* Closing the socket's file takes net_lock, if this was its last
+         * reference (another thread closed the descriptor meanwhile). */
+        struct thread *t = mythread();
+        if (t->net_file != NULL) {
+            struct file *file = t->net_file;
+            t->net_file = NULL;
+            fileclose(file);
+        }
     }
     f->regs[REG_A0] = (u32)ret;
 }

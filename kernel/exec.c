@@ -90,9 +90,9 @@ int exec_spawn(const char *path, const struct proc_args *args) {
     if (err < 0) {
         return err;
     }
-    struct proc *child = proc_create(&f, path, last_name(path), args, &err);
+    int pid = proc_create(&f, path, last_name(path), args);
     prog_close(&f);
-    return child != NULL ? (int)child->pid : err;
+    return pid;
 }
 
 int exec_replace(const char *path, const struct proc_args *args) {

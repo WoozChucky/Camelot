@@ -8,7 +8,12 @@
  * old directory may free it, if it was removed meanwhile). A write is the
  * exception: file.c splits a big one into several transactions. The order
  * of the checks is the document's: a bad descriptor first, then a bad
- * pointer, then everything else. */
+ * pointer, then everything else.
+ *
+ * Another thread of the process may close a descriptor while a call uses
+ * it: so each call takes its own reference to the open file (fd_get(),
+ * proc.c) and lets go of it at the end, and the file stays open until
+ * then. */
 #include "sysfile.h"
 #include "file.h"
 #include "fs.h"
@@ -21,27 +26,6 @@
 /* The arguments as the process passed them. */
 static u32 arg(struct trap_frame *f, int n) {
     return f->regs[REG_A0 + n];
-}
-
-/* The open file behind descriptor `fd` of the current process, or NULL. */
-static struct file *fd_file(u32 fd) {
-    if (fd >= NOFILE) {
-        return NULL;
-    }
-    return myproc()->ofile[fd];
-}
-
-/* Gives `f` the lowest free descriptor of the current process: the
- * descriptor, or -EMFILE when there is none. */
-static int fd_alloc(struct file *f) {
-    struct proc *p = myproc();
-    for (u32 fd = 0; fd < NOFILE; fd++) {
-        if (p->ofile[fd] == NULL) {
-            p->ofile[fd] = f;
-            return (int)fd;
-        }
-    }
-    return -EMFILE;
 }
 
 /* Reads the rest of a user string, from `va` to its NUL, without keeping
@@ -68,63 +52,70 @@ int fetch_path(pagetable_t pt, u32 va, char *buf) {
 }
 
 int sys_read(struct trap_frame *f) {
-    struct file *file = fd_file(arg(f, 0));
+    struct file *file = fd_get(arg(f, 0));
     if (file == NULL) {
         return -EBADF;
     }
-    return fileread(file, myproc()->pagetable, arg(f, 1), arg(f, 2));
+    int r = fileread(file, myproc()->pagetable, arg(f, 1), arg(f, 2));
+    fileclose(file);
+    return r;
 }
 
 int sys_write(struct trap_frame *f) {
-    struct file *file = fd_file(arg(f, 0));
+    struct file *file = fd_get(arg(f, 0));
     if (file == NULL) {
         return -EBADF;
     }
-    return filewrite(file, myproc()->pagetable, arg(f, 1), arg(f, 2));
+    int r = filewrite(file, myproc()->pagetable, arg(f, 1), arg(f, 2));
+    fileclose(file);
+    return r;
 }
 
 int sys_close(struct trap_frame *f) {
-    u32 fd = arg(f, 0);
-    struct file *file = fd_file(fd);
+    struct file *file = fd_take(arg(f, 0));
     if (file == NULL) {
         return -EBADF;
     }
-    myproc()->ofile[fd] = NULL;
     fileclose(file);
     return 0;
 }
 
 int sys_dup(struct trap_frame *f) {
-    struct file *file = fd_file(arg(f, 0));
+    struct file *file = fd_get(arg(f, 0));
     if (file == NULL) {
         return -EBADF;
     }
-    int fd = fd_alloc(file);
-    if (fd >= 0) {
-        filedup(file);
+    /* Our reference becomes the new descriptor's. */
+    int fd = fd_install(file);
+    if (fd < 0) {
+        fileclose(file);
     }
     return fd;
 }
 
 int sys_lseek(struct trap_frame *f) {
-    struct file *file = fd_file(arg(f, 0));
+    struct file *file = fd_get(arg(f, 0));
     if (file == NULL) {
         return -EBADF;
     }
-    return filelseek(file, (i32)arg(f, 1), arg(f, 2));
+    int r = filelseek(file, (i32)arg(f, 1), arg(f, 2));
+    fileclose(file);
+    return r;
 }
 
 int sys_fstat(struct trap_frame *f) {
-    struct file *file = fd_file(arg(f, 0));
+    struct file *file = fd_get(arg(f, 0));
     if (file == NULL) {
         return -EBADF;
     }
     struct stat st;
     pagetable_t pt = myproc()->pagetable;
     if (!uvm_range_ok(pt, arg(f, 1), sizeof st, PTE_W)) {
+        fileclose(file);
         return -EFAULT;
     }
     filestat(file, &st);
+    fileclose(file);
     copyout(pt, arg(f, 1), &st, sizeof st);
     return 0;
 }
@@ -142,12 +133,7 @@ int sys_pipe(struct trap_frame *f) {
     if (err < 0) {
         return err;
     }
-    fds[0] = fd_alloc(rf);
-    fds[1] = fds[0] >= 0 ? fd_alloc(wf) : -EMFILE;
-    if (fds[1] < 0) {
-        if (fds[0] >= 0) {
-            myproc()->ofile[fds[0]] = NULL;
-        }
+    if (fd_install2(rf, wf, fds) < 0) {
         fileclose(rf);
         fileclose(wf);
         return -EMFILE;
@@ -205,10 +191,9 @@ int sys_open(struct trap_frame *f) {
     if (file == NULL) {
         return -ENFILE;
     }
-    int fd = fd_alloc(file);
-    if (fd < 0) {
+    if (!fd_available()) {
         fileclose(file); /* nothing set yet: just gives the slot back */
-        return fd;
+        return -EMFILE;
     }
     begin_op();
     struct inode *ip = open_inode(path, flags, &err);
@@ -227,7 +212,6 @@ int sys_open(struct trap_frame *f) {
     }
     if (err < 0) {
         end_op();
-        myproc()->ofile[fd] = NULL;
         fileclose(file);
         return err;
     }
@@ -241,6 +225,13 @@ int sys_open(struct trap_frame *f) {
     }
     iunlock(ip);
     end_op();
+    /* The descriptor last, once the file is whole: no other thread can use
+     * it half set up. It fails only if another thread took the last free
+     * one meanwhile. */
+    int fd = fd_install(file);
+    if (fd < 0) {
+        fileclose(file);
+    }
     return fd;
 }
 
@@ -304,9 +295,8 @@ int sys_link(struct trap_frame *f) {
 }
 
 int sys_chdir(struct trap_frame *f) {
-    struct proc *p = myproc();
     char path[MAXPATH + 1];
-    int err = fetch_path(p->pagetable, arg(f, 0), path);
+    int err = fetch_path(myproc()->pagetable, arg(f, 0), path);
     if (err < 0) {
         return err;
     }
@@ -326,10 +316,10 @@ int sys_chdir(struct trap_frame *f) {
         return -ENOTDIR;
     }
     iunlock(ip);
-    if (p->cwd != NULL) {
-        iput(p->cwd);
+    struct inode *old = proc_set_cwd(ip);
+    if (old != NULL) {
+        iput(old);
     }
-    p->cwd = ip;
     end_op();
     return 0;
 }

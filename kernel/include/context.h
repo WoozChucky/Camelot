@@ -1,6 +1,6 @@
 /* A kernel thread's saved registers, for swtch() (swtch.s): what the
- * scheduler loop of each hart (struct cpu, spinlock.h) and each process's
- * kernel thread (struct proc, proc.h) keep while another thread runs. */
+ * scheduler loop of each hart (struct cpu, spinlock.h) and each thread's
+ * kernel side (struct thread, proc.h) keep while another thread runs. */
 #ifndef CAMELOT_CONTEXT_H
 #define CAMELOT_CONTEXT_H
 

@@ -605,11 +605,10 @@ static const char *skipelem(const char *path, char *name, bool *too_long) {
  * working directory if it doesn't start with `/`. With `parent`, stops one
  * name early and copies that name to `name`. */
 static struct inode *namex(const char *path, bool parent, char *name, int *err) {
-    struct proc *p = myproc();
-    struct inode *ip;
-    if (*path != '/' && p != NULL && p->cwd != NULL) {
-        ip = idup(p->cwd);
-    } else {
+    /* The working directory comes with a reference of our own, so that
+     * another thread's chdir() can't free it under us. */
+    struct inode *ip = *path != '/' ? proc_cwd() : NULL;
+    if (ip == NULL) {
         ip = iget(fs_dev, ROOTINO);
     }
     bool too_long;
