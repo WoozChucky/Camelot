@@ -1,6 +1,6 @@
 //! Round Table's disk commands against a stand-in Lake that speaks the protocol's
-//! disk-management messages (tests/common). The real Lake server has an end-to-end
-//! test of its own with Round Table.
+//! disk-management messages (tests/common), which can fake states (attachments by
+//! other VMs) directly. tests/lake.rs runs the commands against the real Lake server.
 
 mod common;
 

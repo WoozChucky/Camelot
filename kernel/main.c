@@ -2,6 +2,9 @@
  * start() drops to S-mode, then supervisor_entry calls kmain(); its return
  * value becomes the exit code. After booting, kmain runs the user-space shell
  * as the first process, and returns when it exits. */
+#include "bio.h"
+#include "blk.h"
+#include "blktest.h"
 #include "kalloc.h"
 #include "kprintf.h"
 #include "memlayout.h"
@@ -187,6 +190,20 @@ static int run_shell(void) {
     return status;
 }
 
+/* One line per disk blk_init() found, or says there is none. */
+static void print_disks(void) {
+    u32 n = blk_count();
+    if (n == 0) {
+        kprintf("disk: none\n");
+        return;
+    }
+    for (u32 i = 0; i < n; i++) {
+        u32 sectors = blk_capacity(i);
+        kprintf("disk %u: %u sectors (%u KiB), irq %u%s\n", i, sectors, sectors / 2, blk_irq(i),
+                blk_read_only(i) ? ", read-only" : "");
+    }
+}
+
 int kmain(void) {
     uart_init();
     kprintf("Camelot v%s booting...\n", CAMELOT_VERSION);
@@ -210,9 +227,13 @@ int kmain(void) {
 
     trap_init();
     kprintf("timer: %u Hz tick, %u Hz timebase\n", TICK_HZ, timebase_hz());
+    blk_init();
+    binit();
+    print_disks();
     wait_ticks(BOOT_TICKS);
 
     deliberate_fault();
+    failed += blk_selftest();
     int status = run_shell();
     /* Failed self-tests are what the exit code reports first. */
     return failed != 0 ? failed : status;

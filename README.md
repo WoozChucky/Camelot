@@ -5,10 +5,10 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 | Piece | What it is | Status |
 |---|---|---|
 | **Excalibur** | The ISA: RV32IMA + Zicsr, M/S/U privilege, Sv32 paging, plus the Xcal extensions | Spec v0 in [`docs/excalibur-spec.md`](docs/excalibur-spec.md) |
-| **Grail** | The emulator | Passes riscv-tests rv32ui/um/ua/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps), keyboard and pointer (from the window, with PLIC interrupts), sysinfo and block devices (disk images, `--disk`); configurable RAM, real-time clock and disks |
+| **Grail** | The emulator | Passes riscv-tests rv32ui/um/ua/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps), keyboard and pointer (from the window, with PLIC interrupts), sysinfo and block devices (disk images or disks on a Lake server, `--disk`); configurable RAM, real-time clock and disks |
 | **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | Builds every example on its own, no LLVM (`cargo xtask examples`). merlin-as: complete; its objects match clang's ([encoder notes](crates/merlin-as/ENCODER.md)). merlin-ld: links clang objects to the same bytes as ld.lld except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: a C99 subset (integer types, pointers, arrays, globals, strings; structs and the preprocessor next) compiles to assembly that our own assembler and linker build into programs Grail runs ([code generation notes](crates/merlin/src/codegen.rs)). merlin-objdump: matches llvm-objdump |
-| **Camelot** | The kernel / OS | Boots on Grail in S-mode: `kprintf`, trap handling, timer ticks, page allocator and Sv32 paging, interrupt-driven UART console, user programs in C in U-mode with their own page tables, switched round robin on timer ticks, system calls ([docs/camelot-syscalls.md](docs/camelot-syscalls.md)) and a user-space shell ([kernel/](kernel/README.md)) |
-| **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Herald VM client and the Lake storage server | Protocol v1 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget and attachable consoles; the Round Table CLI creates and controls them, and manages Lake's disk images; Herald and Lake come next |
+| **Camelot** | The kernel / OS | Boots on Grail in S-mode: `kprintf`, trap handling, timer ticks, page allocator and Sv32 paging, interrupt-driven UART console, user programs in C in U-mode with their own page tables, switched round robin on timer ticks, system calls ([docs/camelot-syscalls.md](docs/camelot-syscalls.md)) and a user-space shell, an interrupt-driven disk driver with a buffer cache ([kernel/](kernel/README.md)) |
+| **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Herald VM client and the Lake storage server | Protocol v1 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget and attachable consoles; the Round Table CLI creates and controls them, and manages Lake's disk images; the Lake storage server serves disk images to them over the network; Herald attaches a terminal to a VM's console |
 
 ## Layout
 
@@ -20,6 +20,8 @@ crates/avalon-proto     the Avalon protocol: frames, messages, blocking connecti
 crates/avalon           the Avalon hypervisor server: runs N Grail VMs, serves the protocol
 crates/avalon-client    the client side of the platform: VM and disk operations, shared by Round Table and Pendragon
 crates/round-table      the Round Table control CLI (a thin layer over avalon-client)
+crates/herald           Herald, the Avalon client that attaches a terminal to one VM's console
+crates/lake             the Lake storage server: a directory of disk images, served as block devices over the protocol
 crates/merlin           the C-subset compiler (C → .s), with its test programs in tests/cases
 crates/merlin-as        the assembler (source → ELF32 .o)
 crates/merlin-ld        the linker (.o files → ELF32 executable)
@@ -45,7 +47,7 @@ Hello from Camelot!
 [dbg] pc=80000018 a0 = 0x00000014 (20)
 ```
 
-The kernel runs the same way: `cargo run --release -p grail -- kernel/kernel.elf`. It boots into a user-space shell that runs programs by name (`hello`, `echo a b`, `ticks`; `ping & pong` runs two side by side; `exit` stops the machine); when stdin is a terminal, Grail switches it to raw mode so each key reaches the guest as it is typed and the guest does the echoing (Windows consoles and Linux terminals; restored on exit and on Ctrl-C).
+The kernel runs the same way: `cargo run --release -p grail -- kernel/kernel.elf`. It boots into a user-space shell that runs programs by name (`hello`, `echo a b`, `ticks`; `ping & pong` runs two side by side; `exit` stops the machine); with `--disk IMG` it lists the disk and runs a read/write self-test on it at boot, leaving the image as it was; when stdin is a terminal, Grail switches it to raw mode so each key reaches the guest as it is typed and the guest does the echoing (Windows consoles and Linux terminals; restored on exit and on Ctrl-C).
 
 ### Building the examples
 
@@ -175,8 +177,8 @@ Grail runs one machine for one terminal. The Avalon platform runs many, as long-
 |---|---|---|---|
 | **Avalon** | `crates/avalon` | the hypervisor server: creates and runs N Grail VMs, each with its own hardware profile (RAM, clock, disks), and keeps each VM's console | done |
 | **Round Table** | `crates/round-table` | the control CLI: create, list, start, pause, resume, stop and destroy VMs; create, list and delete Lake's disk images | done |
-| **Herald** | `crates/herald` | attaches to one VM: its console (and later its screen and keyboard) | next |
-| **Lake** | `crates/lake` | the storage server: disk images served as block devices over the network | next |
+| **Herald** | `crates/herald` | attaches to one VM: its console (and later its screen and keyboard) | console done |
+| **Lake** | `crates/lake` | the storage server: disk images served as block devices over the network | done |
 
 They talk the Avalon protocol ([`docs/avalon-protocol.md`](docs/avalon-protocol.md)): length-prefixed binary frames over TCP, implemented once in `crates/avalon-proto` and shared by every program.
 
@@ -204,9 +206,11 @@ Each running VM has a thread of its own and runs in slices of Grail's `run_for`,
 
 Every VM's UART is its console. Avalon keeps the last 64 KiB of output; a client that attaches gets that scrollback, then the output live, and its input goes to the UART. Several clients can attach to one VM: they all see the output, and input from any of them reaches the guest. Attached clients also hear about state changes (`VmStateChanged`) and the VM's destruction (`Detached`). A client that stops reading while a VM writes to it is disconnected once 8 MiB are waiting for it, so it cannot make the server hold unbounded output.
 
-Every bad request gets a protocol error, never a crash: an unknown VM, a bad name, a profile Grail cannot build (bad RAM size, zero clock, a missing disk image), a program that is not a loadable ELF (checked before anything is allocated for it), a request in the wrong state, a create over the RAM budget, malformed or misdirected frames. Screen and keyboard streaming (Herald's `--screen`) and disks on a Lake server are not served yet: their requests get `Unsupported` and `InvalidProfile`.
+A VM's disks are image files on Avalon's host or images on a Lake server (`lake://host:port/name`, see [Running Lake](#running-lake)), in the order its profile lists them.
 
-Round Table (below) gives the orders from the command line. Until Herald exists, a client that reads a console is a few lines of Rust over `avalon-proto`:
+Every bad request gets a protocol error, never a crash: an unknown VM, a bad name, a profile Grail cannot build (bad RAM size, zero clock, a missing disk image, a Lake disk that does not exist, is attached by another VM or is on a server that cannot be reached: `InvalidProfile`, with Lake's own error in the message), a program that is not a loadable ELF (checked before anything is allocated for it), a request in the wrong state, a create over the RAM budget, malformed or misdirected frames. Screen and keyboard streaming (Herald's `--screen`) are not served yet: their requests get `Unsupported`.
+
+Round Table (below) gives the orders from the command line and Herald (below) attaches a terminal to a console. Both are built on `avalon-proto`, and so can any other client, in a few lines of Rust:
 
 ```rust
 use avalon_proto::{Connection, HardwareProfile, Message, VmRef};
@@ -221,6 +225,36 @@ print!("{}", String::from_utf8_lossy(&scrollback)); // then ConsoleOutput events
 ```
 
 As a library, `avalon::Server` binds an address (port 0 for an ephemeral one), runs on a thread of its own with `spawn`, and stops with `ServerThread::stop`; the tests run it that way.
+
+### Running Lake
+
+```
+cargo run --release -p lake -- --dir images
+```
+
+```
+lake: listening on 127.0.0.1:7401
+lake: images in images
+```
+
+Lake keeps a directory of disk images (created if it does not exist) and serves them over the Avalon protocol: disk management (`DiskCreate`, `ListDisks`, `DiskDelete`: what [Round Table](#round-table)'s `disk create|list|delete` send) and block I/O (`BlockOpen`, `BlockRead`, `BlockWrite`, `BlockFlush`, `BlockSize`, `BlockClose`). Each disk is a raw image file in the directory named after the disk, matched by its exact file name (names follow the protocol's rules: lowercase, no paths, no Windows device names); other files there are left alone. New images are sparse files, marked so explicitly on Windows: they take no host space until written. Option `--listen ADDR` (default `127.0.0.1:7401`; a host or IP address alone means port 7401): like Avalon, Lake listens on loopback unless told otherwise, and warns when it is not. Ctrl-C ends it; every write it has answered is already in the image files.
+
+An image has **one writer at a time**: attaching it read-write is exclusive, and any number of read-only attachments may share an image that has no writer. A second writer, a writer while there are readers, or deleting an attached image gets `Busy`; a missing image `NoSuchDisk`, a sector range past the end `OutOfRange`, a write through a read-only attachment `ReadOnly`. A connection's attachments end when it closes.
+
+A VM uses a Lake disk through Grail's network backend (`grail::lake::LakeDisk`): its profile names `lake://host:port/name` (the protocol's `DiskSource::Lake`; `DiskSource::parse` reads the argument), and Grail's `--disk lake://host:port/name` does the same for a single machine. The disk attaches the image when the machine is built (so a busy or missing image fails the create) and detaches it when the machine is dropped (a stopped, exited or destroyed VM), waiting for Lake to confirm: once `DestroyVm` is answered, another VM can attach the image. Each read, write and flush of the guest's disk is a request to Lake (transfers over 1 MiB are split), answered before the guest's next instruction; a Lake error is `BLK_ERROR` 5 for the guest, and so is a server that went away or does not answer within 10 s (the disk then stays failed).
+
+```rust
+use avalon_proto::{Connection, DeviceSpec, DiskSource, DiskSpec, HardwareProfile, Message};
+
+let mut lake = Connection::connect("127.0.0.1:7401", "example")?;
+lake.request_ok(&Message::DiskCreate { name: "root".into(), sectors: 2048 })?; // 1 MiB
+let source = DiskSource::parse("lake://127.0.0.1:7401/root")?;
+let profile = HardwareProfile {
+    devices: vec![DeviceSpec::Disk(DiskSpec { source, read_only: false })],
+    ..HardwareProfile::with_ram(64 << 20)
+};
+// CreateVm with this profile, as above: the VM's disk 0 is Lake's image "root".
+```
 
 ### Round Table
 
@@ -265,7 +299,7 @@ devices  9
   fb-vram   0x31000000 + 0x0012c000
 ```
 
-The life cycle is `start`, `pause`, `resume`, `stop` and `destroy`, each taking a VM's id or its name (`round-table pause echo`, `round-table destroy 2`). `create` takes `--name` (required), `--ram MiB` and `--clock FREQ` with exactly the syntax of `grail --ram` and `--clock` (the same parsers), `--disk SRC` and `--disk-ro SRC` (an image file on Avalon's host, or `lake://ADDR/NAME` for an image on a Lake server, which Avalon does not serve yet; repeat for more disks), and `--start`. `--server ADDR` picks the Avalon for the VM commands (default `127.0.0.1:7400`; a host alone means port 7400). `round-table --help` lists everything.
+The life cycle is `start`, `pause`, `resume`, `stop` and `destroy`, each taking a VM's id or its name (`round-table pause echo`, `round-table destroy 2`). `create` takes `--name` (required), `--ram MiB` and `--clock FREQ` with exactly the syntax of `grail --ram` and `--clock` (the same parsers), `--disk SRC` and `--disk-ro SRC` (an image file on Avalon's host, or `lake://ADDR/NAME` for an image on a Lake server; repeat for more disks), and `--start`. `--server ADDR` picks the Avalon for the VM commands (default `127.0.0.1:7400`; a host alone means port 7400). `round-table --help` lists everything.
 
 The disk commands talk to Lake (`--lake ADDR`, default `127.0.0.1:7401`; the VM commands do not take it, nor do the disk commands take `--server`):
 
@@ -282,11 +316,34 @@ data  64 MiB  131072   no
 deleted disk data
 ```
 
-Sizes take `K`, `M`, `G` (or `KiB`, `MiB`, `GiB`), `s` for 512-byte sectors, or no unit for bytes. A disk is attached to a VM when the VM is created (`--disk lake://127.0.0.1:7401/data`, once Avalon serves Lake disks; until Lake, #39, such a create is refused as an invalid hardware profile) and detached when the VM's machine ends: when the VM is stopped, its program exits, or it is destroyed. A stopped or exited VM still lists its disks (`list`, `info`), but no longer holds them. `disk list` shows each image's attachments (one writer, or any number of readers), and an attached image cannot be deleted.
+Sizes take `K`, `M`, `G` (or `KiB`, `MiB`, `GiB`), `s` for 512-byte sectors, or no unit for bytes. A disk is attached to a VM when the VM is created (`--disk lake://127.0.0.1:7401/data`; a missing image, one another VM writes, or a Lake server that cannot be reached is refused as an invalid hardware profile) and detached when the VM's machine ends: when the VM is stopped, its program exits, or it is destroyed. A stopped or exited VM still lists its disks (`list`, `info`), but no longer holds them. `disk list` shows each image's attachments (one writer, or any number of readers), and an attached image cannot be deleted.
 
 Errors are the server's, on stderr, with exit status 1 (`round-table: invalid state: VM 1 ('demo') is exited(0), not created`); an unreachable server is also 1, and a mistake on the command line is 2.
 
 The commands themselves live in `crates/avalon-client` (`Client`: `create_vm`, `list_vms`, `vm_info`, `vm_action`, `create_disk`, `list_disks`, `delete_disk`, plus the parsers and formatters for addresses, sizes, clocks and disk sources); Round Table is a thin command line over it, and the Pendragon web console will be another.
+
+### Herald
+
+Herald attaches a terminal to a VM's serial console, like a cable to its UART. With a VM running on Avalon (the Camelot kernel, say):
+
+```
+cargo run --release -p herald -- [--server ADDR] <vm>
+```
+
+```
+herald: attached to VM 1 'camelot' (running) on 127.0.0.1:7400; Ctrl-] detaches
+...
+$ ticks
+ticks: 512
+$
+herald: detached from VM 1 'camelot', which carries on
+```
+
+`<vm>` is a VM id (all digits) or name; `--server` defaults to `127.0.0.1:7400` (a host alone means port 7400; a host name is tried at each of its addresses, so `localhost` finds an Avalon on 127.0.0.1 even where it resolves to `::1` first). Herald prints the VM's scrollback (the last 64 KiB of its output), then its output live, and sends every key to the VM as it is typed: the terminal is in raw mode while Herald runs, so the guest does the echoing and line editing, as on a serial line (Windows consoles and Linux terminals; elsewhere input goes line by line). On Windows the console also gets VT input and output (arrows and other special keys reach the guest as the escape sequences a Unix terminal sends, and the guest's escape sequences are carried out), and output that is not UTF-8 is shown with U+FFFD rather than failing. The terminal's modes are put back however Herald ends: detaching, an error, a panic or Ctrl-C. The raw mode is Grail's own (`grail::console::RawMode`, with `RawOptions { vt: true }`), hand-written FFI to the Win32 console and to termios.
+
+**Ctrl-]** detaches: Herald exits and the VM carries on, whatever its state. Ctrl-C also leaves Herald (not the VM), at once and without detaching first; the server sees the connection close. Herald ends by itself, saying why on stderr, when the VM stops, exits or is destroyed, and says so when it is paused or resumed. When stdin is not a terminal, its bytes go to the VM as they are, except that a Ctrl-] byte among them still detaches (and drops what follows it), and its end detaches, so `herald demo < NUL` (`< /dev/null`) just prints the scrollback. Any number of Heralds may attach to one VM: all of them see its output, and what any of them types reaches it. Exit codes: 0 when detached or when the VM ended, 1 on an error (no server, no such VM, connection lost, console output failed), 2 for bad arguments; Ctrl-C gives an interrupted program's status (130 on Linux, `STATUS_CONTROL_C_EXIT` on Windows).
+
+As a library, `herald::Session::attach(connection, &vm)` attaches and `Session::run(input, output, notices)` streams: keys from a channel of bytes, the console to any `Write`. It knows nothing of terminals, which is how it is tested; the screen and keyboard will join it on the same connection.
 
 ## Testing
 
@@ -294,11 +351,15 @@ The commands themselves live in `crates/avalon-client` (`Client`: `create_vm`, `
 cargo test
 ```
 
-Runs the decoder and device unit tests, every riscv-tests suite (except `rv32ui-p-ma_data`, which assumes hardware misaligned access; Excalibur traps instead), the examples (the UART echo is fed both from an in-process channel and through the `grail` binary's stdin), the kernel, the merlin compiler (every test program built with merlin, merlin-as and merlin-ld and run in Grail), merlin-ld against ld.lld (the loaded bytes of clang-built fixtures and of every riscv-tests program relinked from its object must be identical), and merlin-objdump against committed llvm-objdump output (`crates/merlin-objdump/tests/golden`; regenerate the fixtures and goldens with `scripts/gen-objdump-golden.sh`, which needs clang and llvm-objdump). The framebuffer test runs `examples/colorbars` headless and checks the dumped frames pixel by pixel and against a committed hash. The keyboard tests inject events through `Machine::key_event` and run both `examples/kbd-echo` programs; the pointer tests inject input through `Machine::pointer_event` and check `examples/pointer`'s cursor pixel by pixel. The window itself needs a desktop, so its tests (drawing, and key and mouse messages turned into events) are ignored by default: `cargo test --release -p grail -- --ignored window`. `crates/grail/tests/machine.rs` runs `examples/sysinfo` on machines with different RAM and clocks (two at once, on separate threads) and checks real-time pacing with lower bounds on elapsed time and generous upper ones. `crates/grail/tests/atomics.rs` checks what riscv-tests rv32ua does not: what breaks an LR/SC reservation, misaligned and device addresses, and Sv32 permissions and A/D bits for atomics. `crates/grail/tests/block.rs` runs `examples/disk` on in-memory disks, temporary copies of `examples/disk/disk.img`, host-made backends (one that fails every request) and through `grail --disk`, and checks the committed image against the bytes it builds (`GRAIL_WRITE_DISK_IMG=1` rewrites it). The kernel's user-space shell is driven through the `grail` binary's stdin and in-process (line editing, end of input, exit statuses, more input than the UART's ring buffer holds, no UART reads while it idles); it runs user programs that must take turns on timer ticks with every register intact, faulting ones that must be killed while the kernel carries on, programs that pass the system calls bad pointers (refused with `-EFAULT`) and one that checks every call; the system call document's tables are checked against the kernel's and the user library's numbers; and on Windows `crates/grail/tests/console.rs` types into a real console (the one `cargo test` runs in, or a new one) to check raw mode end to end.
+Runs the decoder and device unit tests, every riscv-tests suite (except `rv32ui-p-ma_data`, which assumes hardware misaligned access; Excalibur traps instead), the examples (the UART echo is fed both from an in-process channel and through the `grail` binary's stdin), the kernel, the merlin compiler (every test program built with merlin, merlin-as and merlin-ld and run in Grail), merlin-ld against ld.lld (the loaded bytes of clang-built fixtures and of every riscv-tests program relinked from its object must be identical), and merlin-objdump against committed llvm-objdump output (`crates/merlin-objdump/tests/golden`; regenerate the fixtures and goldens with `scripts/gen-objdump-golden.sh`, which needs clang and llvm-objdump). The framebuffer test runs `examples/colorbars` headless and checks the dumped frames pixel by pixel and against a committed hash. The keyboard tests inject events through `Machine::key_event` and run both `examples/kbd-echo` programs; the pointer tests inject input through `Machine::pointer_event` and check `examples/pointer`'s cursor pixel by pixel. The window itself needs a desktop, so its tests (drawing, and key and mouse messages turned into events) are ignored by default: `cargo test --release -p grail -- --ignored window`. `crates/grail/tests/machine.rs` runs `examples/sysinfo` on machines with different RAM and clocks (two at once, on separate threads) and checks real-time pacing with lower bounds on elapsed time and generous upper ones. `crates/grail/tests/atomics.rs` checks what riscv-tests rv32ua does not: what breaks an LR/SC reservation, misaligned and device addresses, and Sv32 permissions and A/D bits for atomics. `crates/grail/tests/block.rs` runs `examples/disk` on in-memory disks, temporary copies of `examples/disk/disk.img`, host-made backends (one that fails every request) and through `grail --disk`, and checks the committed image against the bytes it builds (`GRAIL_WRITE_DISK_IMG=1` rewrites it). The kernel's user-space shell is driven through the `grail` binary's stdin and in-process (line editing, end of input, exit statuses, more input than the UART's ring buffer holds, no UART reads while it idles); it runs user programs that must take turns on timer ticks with every register intact, faulting ones that must be killed while the kernel carries on, programs that pass the system calls bad pointers (refused with `-EFAULT`) and one that checks every call; the system call document's tables are checked against the kernel's and the user library's numbers; with in-memory disks (and image files through `grail --disk`) the kernel's disk self-test must round-trip a block through the buffer cache, one interrupt-completed request at a time with no polling, sleeping in `wfi` while a held-back interrupt is outstanding, and leave the disk unchanged; and on Windows `crates/grail/tests/console.rs` types into a real console (the one `cargo test` runs in, or a new one) to check raw mode end to end.
 
 `crates/avalon/tests` run an Avalon server in process on an ephemeral port and drive it through the protocol: two VMs with different RAM and clocks run `examples/sysinfo` and each prints its own profile (streamed live, and again from the scrollback), with their exit states and device tables; a looping guest (assembled in the test with merlin-as and merlin-ld) is paused (no more steps), resumed, stopped and destroyed, its clients get every state change and `Detached`, and its RAM and name are free again; `examples/uart-echo` takes input from several attached clients at full speed and in real time, and pauses with input waiting; a parked full-speed VM sleeps, and a real-time one keeps to its clock, its thread sleeping between batches (counted through a test-only hook on `ServerThread`); a guest that has presented a frame still runs full slices; a client that stops reading a chatty console is cut off while the VM and the other clients carry on; a client gets a limited time for its whole `Hello`, however slowly it trickles in; a create whose disk is slow to open (a FIFO, on Linux) holds up no other request; bad requests of every kind (unknown VMs, invalid names, profiles and programs, the RAM budget, wrong states, unserved groups, malformed and misdirected frames, oversize frames, bad handshakes) get the right error code and leave the server running; the client example above is checked against the test that runs it; and shutdown stops the VMs and closes every connection. `tests/cli.rs` runs the `avalon` binary and shuts it down with Ctrl-Break (Windows) or SIGTERM (Unix).
 
-`crates/round-table/tests` drive Round Table's command layer against an Avalon server running in process: VMs are created, listed and inspected (checking the exact tables), taken through every state transition by name and by id (each checked over a separate protocol connection, and a paused VM runs no more steps), destroyed and their names reused; disks from image files are attached at create time and `examples/disk` runs on them, and the image files are open exactly until the VM is stopped, exits or is destroyed; refusals (a name taken, the RAM budget, a program that is not an ELF, a Lake disk, an unknown VM, the wrong state, an unreachable server, a VM created that then fails to start) come back as the server's error. The disk commands run against a stand-in Lake in the test that speaks the protocol's disk-management messages (Lake's own tests run them end to end). `tests/cli.rs` runs the `round-table` binary for its usage text, messages and exit statuses; the `avalon-client` library is also driven directly, as Pendragon will use it.
+`crates/lake/tests` run Lake in process on an ephemeral port, serving a temporary directory: disk management (names, sizes, listing order, images that outlive the server, files that are not disks left alone, even where the filesystem takes their names for disk names), block I/O up to the 1 MiB request limit, the one-writer-or-many-readers rule across connections, attachments released when a connection ends, the per-connection limit on attachments, and bad requests of every kind (unknown handles, out-of-range sectors, writes through read-only attachments, unserved groups, malformed and misdirected frames, oversize frames, bad handshakes), each with its error code and the server carrying on. `tests/grail.rs` runs `examples/disk` on a Lake disk (read-write, then read-only on two machines at once), splits big transfers into requests, checks that dropping a machine releases its image at once (with an explicit `BlockClose`, answered before the drop returns), and that a Lake server that goes away, answers nonsense or answers too late is `BLK_ERROR` 5 for the guest, not a hang or a panic (and a late answer is never taken for the next request's). `tests/avalon.rs` is the platform end to end, Lake and Avalon both in process: a VM writes to a Lake disk and is destroyed while still running; a new VM attaches the same image at once and reads the data back; meanwhile no second writer gets in, and three read-only VMs share the image. `tests/cli.rs` runs the `lake` binary.
+
+`crates/round-table/tests` drive Round Table's command layer against an Avalon server running in process: VMs are created, listed and inspected (checking the exact tables), taken through every state transition by name and by id (each checked over a separate protocol connection, and a paused VM runs no more steps), destroyed and their names reused; disks from image files are attached at create time and `examples/disk` runs on them, and the image files are open exactly until the VM is stopped, exits or is destroyed; refusals (a name taken, the RAM budget, a program that is not an ELF, a Lake disk on a server nobody runs, an unknown VM, the wrong state, an unreachable server, a VM created that then fails to start) come back as the server's error. The disk commands run against a stand-in Lake in the test that speaks the protocol's disk-management messages, and `tests/lake.rs` runs them against the real Lake server in process, with a VM created on a Lake disk holding it until it is destroyed. `tests/cli.rs` runs the `round-table` binary for its usage text, messages and exit statuses; the `avalon-client` library is also driven directly, as Pendragon will use it.
+
+`crates/herald/tests` drive Herald against an in-process Avalon server. `session.rs` runs the streaming layer with no terminal (keys from a channel, the console into a buffer): it attaches to `examples/uart-echo` and to the kernel's shell, types, detaches (the VM carries on), attaches again and finds the earlier session in the scrollback; several sessions share one console; a pause and a resume are reported; stopping, exiting and destroying the VM end the session, and a VM that has already exited shows its scrollback and ends it at once; a long paste arrives whole and in order. `fake_server.rs` scripts a server for the rest: output queued while attaching, events for other VMs, events that do not decode and frames of unknown types, a detach that is never confirmed, confirmed by a reply that does not decode, met by a frame out of place or by a hang-up, keys typed while it waits, a reply out of turn, a lost connection. `cli.rs` runs the `herald` binary through pipes, and `terminal.rs` on a terminal of its own making, a pseudoconsole (ConPTY) on Windows and a pseudoterminal on Linux: raw mode is on while Herald is attached, keys typed on the terminal reach the VM, and the terminal's modes are back as they were after a detach, after an error (the server hanging up) and after Ctrl-C.
 
 `crates/avalon-proto` round-trips every Avalon protocol message through `encode`/`decode` and through a `Connection` over memory and TCP, checks a few layouts byte for byte against [`docs/avalon-protocol.md`](docs/avalon-protocol.md), rejects truncated, oversize and invalid frames, tests the version handshake, and feeds the decoder random and mutated bytes from a fixed-seed generator (anything that decodes must re-encode to the same bytes). It also checks that its hardware profile still mirrors Grail's `MachineConfig`.
 

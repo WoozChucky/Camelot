@@ -198,7 +198,12 @@ fn disks_are_attached_at_create() {
     );
     assert!(why.starts_with("invalid hardware profile: "), "{why}");
 
-    // Lake disks are not served by this Avalon yet (Lake, #39).
+    // So is a Lake disk on a server nobody runs (tests/lake.rs has a real one).
+    let nobody = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let source = format!("lake://{nobody}/data");
     let why = refused(
         addr,
         &[
@@ -206,12 +211,12 @@ fn disks_are_attached_at_create() {
             "--name",
             "lakey",
             "--disk",
-            "lake://127.0.0.1:7401/data",
+            &source,
             &example_str("disk"),
         ],
     );
     assert!(why.starts_with("invalid hardware profile: "), "{why}");
-    assert!(why.contains("Lake disks are not supported"), "{why}");
+    assert!(why.contains(&source), "{why}");
     assert!(refused(addr, &["info", "lakey"]).starts_with("no such VM: "));
     server.stop().unwrap();
     let _ = std::fs::remove_dir_all(&dir);

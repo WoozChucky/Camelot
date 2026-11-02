@@ -37,7 +37,7 @@ static int sys_sleep(struct trap_frame *f) {
     /* Unsigned differences, so the count may wrap. Every tick wakes the
      * sleepers (clock_tick in trap.c), which check again. */
     while (ticks - start < n) {
-        proc_sleep((const void *)&ticks);
+        sleep((const void *)&ticks);
     }
     return 0;
 }

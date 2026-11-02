@@ -33,7 +33,7 @@ static bool after_cr;
 
 void console_intr(void) {
     uart_intr();
-    proc_wakeup(line);
+    wakeup(line);
 }
 
 /* Takes typed bytes from the UART's buffer into the line until the line is
@@ -76,7 +76,7 @@ int console_read(pagetable_t pt, u32 dst, u32 n) {
         return 0;
     }
     while (!edit_line()) {
-        proc_sleep(line);
+        sleep(line);
     }
     u32 count = line_len - line_taken;
     if (count > n) {

@@ -1,7 +1,7 @@
 //! What people type, as protocol values. Every front end (Round Table's flags,
 //! Pendragon's forms) parses with these, so they all accept the same syntax.
 
-use avalon_proto::{validate_name, DiskSource, SECTOR_SIZE};
+use avalon_proto::{DiskSource, SECTOR_SIZE};
 use std::net::{IpAddr, SocketAddr};
 
 /// Parses a `--clock` value: a number with an optional unit, `Hz`, `kHz` or `MHz` (any
@@ -54,33 +54,24 @@ pub fn parse_addr(s: &str, default_port: u16) -> Result<String, String> {
 
 /// The port of one of the protocol's default addresses (`DEFAULT_AVALON_ADDR`,
 /// `DEFAULT_LAKE_ADDR`).
-pub fn default_port(default_addr: &str) -> u16 {
-    default_addr
-        .parse::<SocketAddr>()
-        .expect("the protocol's default addresses parse")
-        .port()
-}
+pub use avalon_proto::default_port;
 
 /// Parses a disk for a VM's hardware profile: `lake://ADDR/NAME` is the image `NAME`
 /// on the Lake server at `ADDR` (port 7401 when it has none), anything else the path of
 /// an image file on the Avalon host (relative to Avalon's working directory).
+///
+/// The protocol's own parser ([`DiskSource::parse`], which Grail's `--disk` and Avalon
+/// use too) reads the argument; the address is then checked as [`parse_addr`] checks
+/// any server address (no port 0), and written the same way.
 pub fn parse_disk_source(s: &str) -> Result<DiskSource, String> {
-    if let Some(rest) = s.strip_prefix("lake://") {
-        let Some((addr, name)) = rest.rsplit_once('/') else {
-            return Err(format!("'{s}' is not a Lake disk (lake://ADDR/NAME)"));
-        };
-        let addr = parse_addr(addr, default_port(avalon_proto::DEFAULT_LAKE_ADDR))
-            .map_err(|e| format!("'{s}': {e}"))?;
-        validate_name(name).map_err(|e| format!("'{s}': {e}"))?;
-        return Ok(DiskSource::Lake {
-            addr,
-            name: name.to_string(),
-        });
+    match DiskSource::parse(s)? {
+        DiskSource::Lake { addr, name } => {
+            let addr = parse_addr(&addr, default_port(avalon_proto::DEFAULT_LAKE_ADDR))
+                .map_err(|e| format!("'{s}': {e}"))?;
+            Ok(DiskSource::Lake { addr, name })
+        }
+        file => Ok(file),
     }
-    if s.is_empty() {
-        return Err("the disk image path is empty".into());
-    }
-    Ok(DiskSource::File(s.to_string()))
 }
 
 /// Parses a disk size: a whole number with an optional unit, any case: none or `B`

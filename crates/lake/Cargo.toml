@@ -1,0 +1,17 @@
+[package]
+name = "lake"
+description = "Lake, the storage server of the Avalon platform: disk images served as block devices over the network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+avalon-proto = { path = "../avalon-proto" }
+
+[dev-dependencies]
+# The end-to-end tests run VMs on Lake disks: Grail's network backend directly, and
+# an in-process Avalon; their guests are assembled with our own toolchain.
+avalon = { path = "../avalon" }
+grail = { path = "../grail" }
+merlin-as = { path = "../merlin-as" }
+merlin-ld = { path = "../merlin-ld" }

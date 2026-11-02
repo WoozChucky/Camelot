@@ -70,12 +70,10 @@ pub fn device_name(kind: u32) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
-/// A disk source as it is typed: the file's path, or `lake://ADDR/NAME`.
+/// A disk source as it is typed: the file's path, or `lake://ADDR/NAME` (the
+/// protocol's `Display`, which `DiskSource::parse` reads back).
 pub fn disk_source_text(source: &DiskSource) -> String {
-    match source {
-        DiskSource::File(path) => path.clone(),
-        DiskSource::Lake { addr, name } => format!("lake://{addr}/{name}"),
-    }
+    source.to_string()
 }
 
 #[cfg(test)]

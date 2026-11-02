@@ -1,7 +1,9 @@
 /* Processes (spec section 10, "Kernel processes"): user programs in U-mode,
  * each with its own page table and kernel stack, switched round robin on
- * every timer tick. A process can sleep in the kernel (waiting for input, a
- * child or the clock); the system calls are in syscall.c. */
+ * every timer tick, and kernel processes, which run a kernel function on
+ * their own kernel stack. Either can sleep in the kernel until an event wakes
+ * it (input, a child ending, the clock, a disk); the system calls are in
+ * syscall.c. */
 #ifndef CAMELOT_PROC_H
 #define CAMELOT_PROC_H
 
@@ -21,7 +23,7 @@
 #define PROC_RUNNABLE 1 /* waiting for the scheduler */
 #define PROC_RUNNING 2  /* on the CPU */
 #define PROC_ZOMBIE 3   /* exited or killed; its parent (or the scheduler) frees it */
-#define PROC_SLEEPING 4 /* waiting in the kernel until proc_wakeup(chan) */
+#define PROC_SLEEPING 4 /* waiting in sleep() for a wakeup() on its channel */
 
 /* What swtch() saves of a kernel thread: the return address, the stack
  * pointer and the callee-saved registers, which is all a function call has
@@ -40,14 +42,13 @@ struct proc {
     u32 pid;
     char name[PROC_NAME_MAX + 1];
     /* The process that spawned it, which collects its exit status with
-     * wait(); NULL for the first process, and once the parent has ended. */
+     * wait(); NULL for the first process, for kernel processes, and once the
+     * parent has ended. */
     struct proc *parent;
     /* The exit status, for wait(), once it is a zombie. */
     int xstatus;
-    /* What it sleeps on while PROC_SLEEPING (any address: proc_wakeup
-     * compares them). */
-    const void *chan;
-    /* User space below USER_TOP, the kernel's mappings above (vm.h). */
+    /* User space below USER_TOP, the kernel's mappings above (vm.h). NULL
+     * for a kernel process, which runs on the kernel page table. */
     pagetable_t pagetable;
     /* The heap, from the page after the program's last segment: sbrk() moves
      * `brk` (one past its last byte) between `heap_base` and USER_LOAD_TOP.
@@ -55,14 +56,21 @@ struct proc {
     u32 heap_base;
     u32 brk;
     /* One page. The trap frame takes its top TRAP_FRAME_SIZE bytes, and the
-     * kernel's stack for this process grows down from the frame. */
+     * kernel's stack for this process grows down from the frame. A kernel
+     * process has no frame: its stack starts at the top of the page. */
     void *kstack;
     /* The user registers while the process is in the kernel. user_vec saves
      * them here (sscratch points at it in U-mode) and user_return loads
-     * them back. */
+     * them back. NULL for a kernel process. */
     struct trap_frame *frame;
     /* Where swtch() resumes the process's kernel thread. */
     struct context context;
+    /* What a PROC_SLEEPING process waits for: any address that stands for
+     * the event, such as the disk or the buffer it wants, a child's parent or
+     * the tick counter (wakeup() compares them). */
+    const void *chan;
+    /* A kernel process's function (NULL for a user process). */
+    void (*kfn)(void);
 };
 
 /* A user program embedded in the kernel image as an ELF executable
@@ -101,30 +109,39 @@ struct proc *myproc(void);
  * is left allocated then. */
 struct proc *proc_create(const struct user_program *prog, const struct proc_args *args, int *err);
 
+/* Makes a runnable kernel process called `name` that runs `fn` in S-mode on
+ * its own kernel stack, with the kernel page table and interrupts off (like
+ * any process's kernel code), and ends quietly when `fn` returns. It has no
+ * parent: the scheduler frees it. Returns NULL with *err saying why when it
+ * can't (no free slot, no memory). */
+struct proc *kproc_create(const char *name, void (*fn)(void), const char **err);
+
 /* Starts `prog` as the first process, with argv = { its name }, and runs the
  * scheduler until no process is left: the first process has exited and so has
  * everything still running when it did. Returns the first process's exit
  * status in *status, or false if it couldn't be started (having said why). */
 bool proc_run_init(const struct user_program *prog, int *status);
 
-/* Runs the processes round robin, one timer tick each, idling in wfi while
- * every process sleeps, until no process is left; then returns with
- * interrupts on. */
+/* Runs the processes round robin, one timer tick each for user processes,
+ * until none is left; then returns with interrupts on. While every process
+ * left is asleep (or a zombie its parent will free) it idles in wfi. Called
+ * by proc_run_init() and by the boot self-tests that use kernel processes. */
 void scheduler(void);
+
+/* Puts the current process to sleep on `chan` and gives up the CPU; returns
+ * once wakeup(chan) has made it runnable and the scheduler picked it again.
+ * Callers check their condition in a loop around it: a wakeup only says it
+ * may have changed. Must be called from a process's kernel code, where
+ * interrupts are off, so nothing can wake the channel between the caller's
+ * check and the sleep. */
+void sleep(const void *chan);
+
+/* Makes every process sleeping on `chan` runnable. Callable anywhere,
+ * interrupt handlers included. */
+void wakeup(const void *chan);
 
 /* Gives the CPU back to the scheduler; the process stays runnable. */
 void yield(void);
-
-/* Puts the current process to sleep on `chan` until proc_wakeup(chan). Callers
- * check their condition in a loop around it: a wakeup only means the
- * condition may have changed. No wakeup is lost between the check and the
- * sleep, since the kernel never takes an interrupt while it runs for a
- * process. */
-void proc_sleep(const void *chan);
-
-/* Makes every process sleeping on `chan` runnable. Safe from interrupt
- * handlers (it only changes states). */
-void proc_wakeup(const void *chan);
 
 /* Ends the current process with `status`: it becomes a zombie until its
  * parent waits for it (the scheduler frees it if it has none), its parent is

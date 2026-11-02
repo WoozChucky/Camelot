@@ -8,9 +8,12 @@ use grail::{DiskConfig, MachineConfig};
 /// The machine `profile` describes, validated as Grail validates it. An error is the
 /// text of an `InvalidProfile` reply.
 ///
-/// Disks that are image files are opened on Avalon's host when the machine is built
-/// (`Machine::new`), relative to Avalon's working directory. Disks on a Lake server
-/// need a network block backend, which this version of Avalon does not have yet.
+/// Disks are opened when the machine is built (`Machine::new`), in the order the
+/// profile lists them: image files on Avalon's host, relative to Avalon's working
+/// directory, and images on a Lake server through Grail's network backend
+/// (`grail::lake::LakeDisk`), which attaches the image for as long as the VM's machine
+/// exists. Only the disk names are checked here; whether an image exists and can be
+/// attached is Lake's to say, when the machine is built.
 pub fn machine_config(profile: &HardwareProfile) -> Result<MachineConfig, String> {
     let HardwareProfile {
         ram_size,
@@ -26,9 +29,7 @@ pub fn machine_config(profile: &HardwareProfile) -> Result<MachineConfig, String
         match source {
             DiskSource::File(path) => disks.push(DiskConfig::file(path).with_read_only(*read_only)),
             DiskSource::Lake { addr, name } => {
-                return Err(format!(
-                    "disk lake://{addr}/{name}: Lake disks are not supported by this Avalon yet"
-                ))
+                disks.push(DiskConfig::lake(addr.as_str(), name.as_str()).with_read_only(*read_only))
             }
         }
     }
@@ -59,6 +60,13 @@ mod tests {
                     read_only: false,
                 }),
                 DeviceSpec::Disk(DiskSpec {
+                    source: DiskSource::Lake {
+                        addr: "127.0.0.1:7401".into(),
+                        name: "root".into(),
+                    },
+                    read_only: false,
+                }),
+                DeviceSpec::Disk(DiskSpec {
                     source: DiskSource::File("b.img".into()),
                     read_only: true,
                 }),
@@ -72,6 +80,7 @@ mod tests {
                 nominal_hz: 5,
                 disks: vec![
                     DiskConfig::file("a.img"),
+                    DiskConfig::lake("127.0.0.1:7401", "root"),
                     DiskConfig::file("b.img").with_read_only(true)
                 ],
             }
@@ -120,11 +129,11 @@ mod tests {
                 HardwareProfile {
                     devices: vec![disk(DiskSource::Lake {
                         addr: "127.0.0.1:7401".into(),
-                        name: "root".into(),
+                        name: "Root".into(),
                     })],
                     ..HardwareProfile::default()
                 },
-                "lake://127.0.0.1:7401/root",
+                "lake://127.0.0.1:7401/Root",
             ),
         ] {
             let err = machine_config(&profile).unwrap_err();

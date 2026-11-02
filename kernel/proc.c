@@ -2,15 +2,15 @@
  * xv6-riscv's proc.c, for one hart and without locks: the kernel never takes
  * an interrupt while it works for a process (see user_trap), so nothing here
  * runs concurrently with anything else. The interrupt handlers only call
- * proc_wakeup(), from the scheduler's own loop.
+ * wakeup(), from the scheduler's own loop.
  *
  * Each process has two threads of control: its user program in U-mode, and
  * a kernel thread on its own kernel stack that runs whenever the process
- * traps. The scheduler runs on kmain's boot stack; swtch() moves between it
- * and the processes' kernel threads. A process gives up the CPU only from
- * its kernel thread: in yield() at the end of its time slice (one timer
- * tick) or for the yield system call, in proc_sleep() when it has to wait,
- * or in proc_exit(). */
+ * traps. A kernel process has only the kernel thread. The scheduler runs on
+ * kmain's boot stack; swtch() moves between it and the processes' kernel
+ * threads. A process gives up the CPU only from its kernel thread: in yield()
+ * at the end of its time slice (one timer tick) or for the yield system call,
+ * in sleep() when it has to wait, or in proc_exit(). */
 #include "proc.h"
 #include "elf.h"
 #include "kalloc.h"
@@ -54,6 +54,13 @@ const struct user_program *user_program_find(const char *name) {
  * and goes straight to U-mode at the program's entry point. */
 static void proc_start(void) {
     user_trap_return(current->frame);
+}
+
+/* A new kernel process starts here: runs its function, then ends. It has no
+ * parent, so the scheduler frees it. */
+static void kproc_start(void) {
+    current->kfn();
+    proc_exit(0);
 }
 
 /* Releases everything `p` holds (any of it may be missing) and frees its
@@ -109,7 +116,10 @@ static void push_args(struct proc *p, u8 *stack, const struct proc_args *args) {
     p->frame->regs[REG_A1] = argv;
 }
 
-struct proc *proc_create(const struct user_program *prog, const struct proc_args *args, int *err) {
+/* A free slot, cleared, with a kernel stack; NULL with *err set to -EAGAIN
+ * (no free slot) or -ENOMEM if it can't. The slot stays PROC_UNUSED until
+ * proc_ready(). */
+static struct proc *proc_alloc(int *err) {
     struct proc *p = NULL;
     for (u32 i = 0; i < NPROC; i++) {
         if (procs[i].state == PROC_UNUSED) {
@@ -122,10 +132,30 @@ struct proc *proc_create(const struct user_program *prog, const struct proc_args
         return NULL;
     }
     memset(p, 0, sizeof *p);
-
     p->kstack = kalloc();
+    if (p->kstack == NULL) {
+        *err = -ENOMEM;
+        return NULL;
+    }
+    return p;
+}
+
+/* Gives a fully set up `p` its pid and name and makes it runnable. */
+static struct proc *proc_ready(struct proc *p, const char *name) {
+    p->pid = next_pid;
+    next_pid++;
+    set_name(p, name);
+    p->state = PROC_RUNNABLE;
+    return p;
+}
+
+struct proc *proc_create(const struct user_program *prog, const struct proc_args *args, int *err) {
+    struct proc *p = proc_alloc(err);
+    if (p == NULL) {
+        return NULL;
+    }
     p->pagetable = uvm_create();
-    if (p->kstack == NULL || p->pagetable == NULL) {
+    if (p->pagetable == NULL) {
         *err = -ENOMEM;
         proc_free(p);
         return NULL;
@@ -166,13 +196,23 @@ struct proc *proc_create(const struct user_program *prog, const struct proc_args
      * kernel stack below the frame. */
     p->context.ra = (u32)(uintptr)proc_start;
     p->context.sp = (u32)(uintptr)p->frame;
-
-    p->pid = next_pid;
-    next_pid++;
-    set_name(p, prog->name);
     p->parent = current;
-    p->state = PROC_RUNNABLE;
-    return p;
+    return proc_ready(p, prog->name);
+}
+
+struct proc *kproc_create(const char *name, void (*fn)(void), const char **err) {
+    int alloc_err;
+    struct proc *p = proc_alloc(&alloc_err);
+    if (p == NULL) {
+        *err = alloc_err == -EAGAIN ? "too many processes" : "out of memory";
+        return NULL;
+    }
+    /* No user space, so no page table of its own and no trap frame: its first
+     * swtch() lands in kproc_start, on the empty kernel stack. */
+    p->kfn = fn;
+    p->context.ra = (u32)(uintptr)kproc_start;
+    p->context.sp = (u32)(uintptr)p->kstack + PGSIZE;
+    return proc_ready(p, name);
 }
 
 bool proc_run_init(const struct user_program *prog, int *status) {
@@ -218,14 +258,24 @@ static bool any_process(void) {
     return false;
 }
 
+/* The page table to run `p` on: its own, or the kernel's for a kernel
+ * process. */
+static pagetable_t proc_pagetable(struct proc *p) {
+    if (p->pagetable != NULL) {
+        return p->pagetable;
+    }
+    return kernel_pagetable;
+}
+
 void scheduler(void) {
     /* proc_create() fills the lowest free slots, so the processes start in
      * the order they were created. */
     next_slot = 0;
     for (;;) {
         /* Let pending interrupts in (a byte typed on the console, a tick
-         * that came while the last process was in the kernel) before going
-         * on with interrupts off. Their handlers may wake processes up. */
+         * that came while the last process was in the kernel, a disk's
+         * completion) before going on with interrupts off. Their handlers
+         * may wake processes up. */
         intr_on();
         intr_off();
         struct proc *p = pick_next();
@@ -245,7 +295,7 @@ void scheduler(void) {
         /* Its page table holds the kernel's mappings too, so the kernel
          * carries on as before; from the next sret on, U-mode sees the
          * process's memory. */
-        w_satp(MAKE_SATP(p->pagetable));
+        w_satp(MAKE_SATP(proc_pagetable(p)));
         sfence_vma();
         swtch(&scheduler_context, &p->context);
         /* Back when it yields, sleeps or exits. */
@@ -271,14 +321,14 @@ void yield(void) {
     sched();
 }
 
-void proc_sleep(const void *chan) {
+void sleep(const void *chan) {
     current->chan = chan;
     current->state = PROC_SLEEPING;
     sched();
     current->chan = NULL;
 }
 
-void proc_wakeup(const void *chan) {
+void wakeup(const void *chan) {
     for (u32 i = 0; i < NPROC; i++) {
         if (procs[i].state == PROC_SLEEPING && procs[i].chan == chan) {
             procs[i].state = PROC_RUNNABLE;
@@ -307,7 +357,7 @@ void proc_exit(int status) {
         init_proc = NULL;
     }
     if (p->parent != NULL) {
-        proc_wakeup(p->parent);
+        wakeup(p->parent);
     }
     p->state = PROC_ZOMBIE;
     sched();
@@ -354,7 +404,7 @@ int proc_wait(int pid, u32 status) {
             return -ECHILD;
         }
         /* proc_exit() wakes the parent. */
-        proc_sleep(p);
+        sleep(p);
     }
 }
 

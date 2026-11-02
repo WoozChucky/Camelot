@@ -6,13 +6,18 @@ use excalibur::csr::{
     IRQ_M_EXT, IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP,
 };
 use excalibur::reg;
-use grail::bus::{PLIC_BASE, SYSINFO_BASE, SYSINFO_SIZE, UART_BASE};
+use grail::block::{error as blk_error, BlockBackend, MemDisk};
+use grail::block::{
+    CMD_FLUSH as BLK_CMD_FLUSH, CMD_READ as BLK_CMD_READ, CMD_WRITE as BLK_CMD_WRITE, REG_CMD as BLK_REG_CMD,
+    REG_ERROR as BLK_REG_ERROR, REG_STATUS as BLK_REG_STATUS,
+};
+use grail::bus::{BLK_BASE, BLK_SIZE, MAX_DISKS, PLIC_BASE, RAM_BASE, SYSINFO_BASE, SYSINFO_SIZE, UART_BASE};
 use grail::cpu::Mode;
-use grail::devices::UART_IRQ;
+use grail::devices::{BLK_IRQ, UART_IRQ};
 use grail::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use grail::sysinfo::{REG_MAGIC, REG_TIMEBASE_HZ};
 use grail::trap::INTERRUPT_BIT;
-use grail::{Machine, MachineConfig, RunResult};
+use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -32,6 +37,7 @@ ram: 128 MiB at 0x80000000
 paging: on (Sv32)
 vm self-test: 26/26 passed
 timer: 10 Hz tick, 10000000 Hz timebase
+disk: none
 tick 1
 tick 2
 tick 3
@@ -60,6 +66,11 @@ fn halted_output() -> String {
 
 /// mtime ticks between timer interrupts: the nominal 10 MHz timebase / 10 Hz.
 const TICK_INTERVAL: u64 = 1_000_000;
+
+/// More than the steps from reset to `kmain`, nearly all of them `_start`
+/// zeroing `.bss` a word at a time (about 35 000 since the buffer cache's
+/// 30 KiB live there).
+const TO_KMAIN_STEPS: u64 = 100_000;
 
 // Kernel constants, from the kernel sources named in each comment.
 // crates/grail/tests/kernel.rs has copies of some: keep them in sync.
@@ -400,7 +411,7 @@ fn kmain_runs_in_s_mode_with_traps_delegated() {
     while m.cpu.pc != kmain {
         m.cpu.step();
         steps += 1;
-        assert!(steps < 10_000, "never reached kmain");
+        assert!(steps < TO_KMAIN_STEPS, "never reached kmain");
     }
     assert_eq!(m.cpu.mode, Mode::S);
     let c = &m.cpu.csr;
@@ -830,24 +841,52 @@ fn unmapped_load_panics() {
 fn store_to_kernel_text_panics() {
     // Outside the probes a store page fault is a kernel bug: the panic shows
     // the cause, stval and how the kernel page table maps stval.
-    let (m, elf, r, out) = run_with_fault(BOOT_FAULT_STORE_TEXT);
+    let (mut m, elf) = load_committed();
+    let kmain = sym(&elf, "kmain");
+    m.cpu
+        .bus
+        .load(sym(&elf, "boot_fault"), &BOOT_FAULT_STORE_TEXT.to_le_bytes())
+        .unwrap();
+    // Grail sets A when an access goes through the PTE: a fetch or a load on
+    // kmain's page with paging on, before the store that faults (which sets
+    // neither A nor D). Whether one happens depends on the layout (kmain may
+    // start near the end of a page whose code all runs before paging), so
+    // watch for one.
+    let page = kmain >> 12;
+    let (mut accessed, mut faulted) = (false, false);
+    let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
+        let access = mem_access(cpu);
+        if access
+            .as_ref()
+            .is_some_and(|a| a.load_rd.is_none() && a.addr == kmain)
+        {
+            faulted = true;
+        }
+        if faulted || cpu.mode == Mode::M || cpu.csr.satp >> 31 == 0 {
+            return;
+        }
+        let load = access.is_some_and(|a| a.load_rd.is_some() && a.addr >> 12 == page);
+        accessed |= cpu.pc >> 12 == page || load;
+    });
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
     assert_eq!(r, RunResult::Exited(PANIC_EXIT), "output:\n{out}");
+    assert!(faulted, "no store to kmain");
     let before = &out[..out.find("panic: ").unwrap()];
     assert_eq!(kernel::mask_dbg_pc(before), BOOT_OUTPUT);
 
-    let kmain = sym(&elf, "kmain");
     let (cause, v) = parse_panic(&out);
     assert_eq!(cause, "store page fault");
     assert_eq!(v["scause"], STORE_PAGE_FAULT);
     assert_eq!(v["stval"], kmain);
-    // Identity mapped, R+X, accessed (it ran) but never dirty.
-    let pte = (kmain >> 12) << 10 | PTE_V | PTE_R | PTE_X | PTE_A;
-    assert!(
-        out.contains(&format!(
-            "\n  va {kmain:#010x} maps to pa {kmain:#010x}, pte {pte:#010x} -A--X-RV\n"
-        )),
-        "{out}"
-    );
+    // Identity mapped, R+X, never dirty, accessed as watched above.
+    let pte = (kmain >> 12) << 10 | PTE_V | PTE_R | PTE_X;
+    let (pte, flags) = if accessed {
+        (pte | PTE_A, "-A--X-RV")
+    } else {
+        (pte, "----X-RV")
+    };
+    let line = format!("\n  va {kmain:#010x} maps to pa {kmain:#010x}, pte {pte:#010x} {flags}\n");
+    assert!(out.contains(&line), "want{line}in:\n{out}");
     let word = m.cpu.bus.peek(v["sepc"]).unwrap();
     assert!(
         matches!(excalibur::decode(word), excalibur::Inst::Store { .. }),
@@ -1548,7 +1587,12 @@ fn timer_interval_is_never_zero() {
     };
     let (mut m, elf) = load_committed_on(config, None);
     let interval = sym(&elf, "machine_scratch") + SCRATCH_INTERVAL;
-    step_until(&mut m, 10_000, |_| {}, |m| m.cpu.bus.peek(interval) != Some(0));
+    step_until(
+        &mut m,
+        TO_KMAIN_STEPS,
+        |_| {},
+        |m| m.cpu.bus.peek(interval) != Some(0),
+    );
     assert_eq!(m.cpu.bus.peek(interval), Some(1));
 }
 
@@ -1588,7 +1632,7 @@ fn boot_with_sysinfo_reg_zero(reg: u32) -> (Vec<u32>, u32, String) {
     let (mut m, elf) = load_committed_on(config, Some(kernel::typed(EXIT)));
     let kmain = sym(&elf, "kmain");
     let mut reads = Vec::new();
-    for _ in 0..10_000 {
+    for _ in 0..TO_KMAIN_STEPS {
         if m.cpu.pc == kmain {
             break;
         }
@@ -2980,6 +3024,520 @@ fn the_kernel_embeds_every_user_program() {
         // Read-only data: the kernel maps it without W.
         assert!((sym(&elf, "__rodata_start")..sym(&elf, "__data_start")).contains(&image));
     }
+}
+
+// ---- Disks: the block driver and the buffer cache (issue #65) ----
+
+/// Block size of the buffer cache (`BSIZE` in kernel/include/bio.h): two
+/// sectors.
+const BSIZE: usize = 1024;
+const BLOCK_SECTORS: u32 = 2;
+/// Buffers in the cache (`NBUF` in kernel/include/bio.h).
+const NBUF: u32 = 30;
+/// The disk most tests attach: 64 blocks, enough for the self-test's LRU
+/// check, which needs NBUF + 1.
+const DISK_SECTORS: usize = 128;
+/// What the self-test counts on a read-write disk that big
+/// (kernel/blktest.c): 4 for the three readers, 7 for the scratch block, 3
+/// for the errors, 2 for the LRU.
+const BLK_SELFTEST_CHECKS: u32 = 16;
+/// The self-test's scratch block: the last whole one, here sectors 126-127.
+const SCRATCH_SECTOR: u32 = (DISK_SECTORS as u32 / BLOCK_SECTORS - 1) * BLOCK_SECTORS;
+
+/// A disk image of `sectors` sectors in which no two neighbouring bytes, and
+/// no two sectors, are alike.
+fn disk_bytes(sectors: usize) -> Vec<u8> {
+    (0..sectors * 512).map(|i| (i * 13 + i / 512) as u8).collect()
+}
+
+/// The self-test's pattern (`fill` in kernel/blktest.c): byte i is i * 7 + 3.
+fn blk_pattern() -> Vec<u8> {
+    (0..BSIZE).map(|i| (i * 7 + 3) as u8).collect()
+}
+
+/// The boot output with `disks` (the kernel's lines about them) in place of
+/// `disk: none`, and `selftest` after the ticks.
+fn boot_output_with(disks: &str, selftest: &str) -> String {
+    format!(
+        "{}{selftest}{SHELL_BANNER}{PROMPT}exit\n",
+        BOOT_OUTPUT.replace("disk: none\n", disks)
+    )
+}
+
+/// Loads the committed kernel on a default machine with `disks` attached and
+/// `EXIT` typed.
+fn load_with_disks(disks: Vec<DiskConfig>) -> (Machine, grail::elf::Elf) {
+    let config = MachineConfig {
+        disks,
+        ..MachineConfig::default()
+    };
+    load_committed_on(config, Some(kernel::typed(EXIT)))
+}
+
+/// A command a disk ran, as the device saw it when `BLK_CMD` was written.
+#[derive(Debug, Clone, PartialEq)]
+struct DiskCommand {
+    disk: usize,
+    cmd: u32,
+    sector: u32,
+    count: u32,
+    dma: u32,
+    /// What a write sent: the `count` sectors at `dma`.
+    data: Vec<u8>,
+}
+
+/// What a run did with the disks, instruction by instruction.
+#[derive(Debug, Default)]
+struct DiskTrace {
+    commands: Vec<DiskCommand>,
+    /// `BLK_ERROR` as each acknowledgement in `blk_intr` found it, in order.
+    results: Vec<u32>,
+    /// Commands written while the disk's previous result was still
+    /// unacknowledged (`BLK_STATUS.DONE` set): there must be none.
+    overlapping: usize,
+    /// Reads of `BLK_STATUS`: polling, which the driver never does.
+    status_reads: usize,
+    /// Reads of `BLK_ERROR` outside `blk_intr`.
+    stray_error_reads: usize,
+    /// The channel (a0) of each call to `sleep`.
+    sleeps: Vec<u32>,
+    /// Every load from or store to a disk register.
+    accesses: usize,
+}
+
+/// A disk register access by the instruction about to run: (disk, offset,
+/// store?). The kernel maps the disks identity, so the address is physical.
+fn disk_access(cpu: &grail::cpu::Cpu) -> Option<(usize, u32, bool)> {
+    let a = mem_access(cpu)?;
+    let end = BLK_BASE + BLK_SIZE * MAX_DISKS as u32;
+    (BLK_BASE..end).contains(&a.addr).then(|| {
+        let off = a.addr - BLK_BASE;
+        ((off / BLK_SIZE) as usize, off % BLK_SIZE, a.load_rd.is_none())
+    })
+}
+
+/// Runs `m` (loaded with the committed kernel) for at most `max_steps`,
+/// watching every disk access.
+fn trace_disks(m: &mut Machine, elf: &grail::elf::Elf, max_steps: u64) -> (RunResult, DiskTrace) {
+    let blk_intr = function("blk_intr");
+    let sleep = sym(elf, "sleep");
+    let mut t = DiskTrace::default();
+    let mut pending_cmd = None;
+    let r = m.run(Some(max_steps), |cpu| {
+        // The command stored by the previous instruction has run by now: a
+        // write's data is still in RAM, so take it from there either way.
+        if let Some((disk, cmd)) = pending_cmd.take() {
+            let d: &grail::block::BlockDevice = &cpu.bus.disks[disk];
+            let data = if cmd == BLK_CMD_WRITE {
+                let start = (d.dma - RAM_BASE) as usize;
+                cpu.bus.ram[start..start + d.count as usize * 512].to_vec()
+            } else {
+                Vec::new()
+            };
+            t.commands.push(DiskCommand {
+                disk,
+                cmd,
+                sector: d.sector,
+                count: d.count,
+                dma: d.dma,
+                data,
+            });
+        }
+        if cpu.pc == sleep {
+            t.sleeps.push(cpu.x[x("a0") as usize]);
+        }
+        let Some((disk, off, store)) = disk_access(cpu) else {
+            return;
+        };
+        t.accesses += 1;
+        match (off, store) {
+            (BLK_REG_CMD, true) => {
+                if cpu.bus.disks[disk].done() {
+                    t.overlapping += 1;
+                }
+                pending_cmd = Some((disk, mem_access(cpu).unwrap().value));
+            }
+            (BLK_REG_STATUS, false) => t.status_reads += 1,
+            (BLK_REG_ERROR, false) if !blk_intr.contains(&cpu.pc) => t.stray_error_reads += 1,
+            (BLK_REG_STATUS, true) if blk_intr.contains(&cpu.pc) => {
+                t.results.push(cpu.bus.disks[disk].error());
+            }
+            _ => {}
+        }
+    });
+    (r, t)
+}
+
+/// Disk `i`'s whole contents, read through its backend.
+fn disk_contents(m: &mut Machine, i: usize) -> Vec<u8> {
+    let d = &mut m.cpu.bus.disks[i];
+    let mut buf = vec![0; d.capacity() as usize * 512];
+    d.backend().read(0, &mut buf).unwrap();
+    buf
+}
+
+#[test]
+fn kernel_boots_without_a_disk_and_says_so() {
+    // No disk: one line says so, no self-test runs, the disks' PLIC sources
+    // stay off and no disk register is touched.
+    let (mut m, elf) = load_committed();
+    let (r, t) = trace_disks(&mut m, &elf, BOOT_MAX_STEPS);
+    assert_eq!(r, RunResult::Exited(0));
+    let out = kernel::mask_dbg_pc(&printed(&m));
+    assert_eq!(out, halted_output());
+    assert!(out.contains("timebase\ndisk: none\ntick 1\n"), "{out}");
+    assert!(t.commands.is_empty() && t.sleeps.is_empty(), "{t:?}");
+    assert_eq!(t.accesses, 0, "{t:?}");
+    assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(1 << UART_IRQ));
+}
+
+#[test]
+fn disk_blocks_round_trip_through_the_cache_with_interrupts() {
+    // Issue #65's acceptance test: the boot self-test reads, writes and reads
+    // back a scratch block of an in-memory disk through the buffer cache,
+    // each request completing by interrupt, and leaves the disk as it was.
+    let image = disk_bytes(DISK_SECTORS);
+    let (mut m, elf) = load_with_disks(vec![DiskConfig::memory(image.clone())]);
+    let (r, t) = trace_disks(&mut m, &elf, BOOT_MAX_STEPS * 2);
+    let out = printed(&m);
+    assert_eq!(r, RunResult::Exited(0), "output:\n{out}");
+    assert_eq!(
+        kernel::mask_dbg_pc(&out),
+        boot_output_with(
+            "disk 0: 128 sectors (64 KiB), irq 3\n",
+            &format!("blk self-test: {BLK_SELFTEST_CHECKS}/{BLK_SELFTEST_CHECKS} passed\n")
+        )
+    );
+
+    // The driver set up the disk's completion interrupt.
+    assert_eq!(m.cpu.bus.disks[0].ctrl, 1);
+    assert_eq!(m.cpu.bus.read(plic_priority(BLK_IRQ), 4), Ok(1));
+    assert_eq!(
+        m.cpu.bus.read(plic_enable(1), 4),
+        Ok(1 << UART_IRQ | 1 << BLK_IRQ)
+    );
+
+    // One request at a time, each finished by its interrupt: every command
+    // was acknowledged in blk_intr before the next, with nothing polled.
+    assert!(t.commands.len() > 30, "{} commands", t.commands.len());
+    assert_eq!(t.overlapping, 0);
+    assert_eq!(t.status_reads, 0);
+    assert_eq!(t.stray_error_reads, 0);
+    assert_eq!(t.results.len(), t.commands.len(), "{t:?}");
+
+    // The writes: the pattern to the scratch block, then its old contents.
+    let writes: Vec<&DiskCommand> = t.commands.iter().filter(|c| c.cmd == BLK_CMD_WRITE).collect();
+    assert_eq!(writes.len(), 2, "{writes:?}");
+    for w in &writes {
+        assert_eq!((w.disk, w.sector, w.count), (0, SCRATCH_SECTOR, BLOCK_SECTORS));
+    }
+    assert_eq!(writes[0].data, blk_pattern());
+    let scratch = SCRATCH_SECTOR as usize * 512;
+    assert_eq!(writes[1].data, image[scratch..scratch + BSIZE]);
+    assert_eq!(disk_contents(&mut m, 0), image);
+    assert_eq!(t.commands.iter().filter(|c| c.cmd == BLK_CMD_FLUSH).count(), 1);
+
+    // The errors reached the kernel: the block past the end (twice, since a
+    // failed read isn't cached) and the buffer outside RAM. Everything else
+    // worked.
+    let failed: Vec<(u32, u32, u32)> = t
+        .commands
+        .iter()
+        .zip(&t.results)
+        .filter(|(_, e)| **e != 0)
+        .map(|(c, &e)| (c.sector, c.dma, e))
+        .collect();
+    let past_end = DISK_SECTORS as u32;
+    assert_eq!(failed.len(), 3, "{failed:?}");
+    assert_eq!((failed[0].0, failed[0].2), (past_end, blk_error::OUT_OF_RANGE));
+    assert_eq!((failed[1].0, failed[1].2), (past_end, blk_error::OUT_OF_RANGE));
+    assert_eq!((failed[2].1, failed[2].2), (0x1000, blk_error::BAD_DMA));
+
+    // The cache: every bread() that missed read one block into a buffer, and
+    // the hits needed no request at all.
+    let bufs = function("bufs");
+    let buffer_reads = t
+        .commands
+        .iter()
+        .filter(|c| c.cmd == BLK_CMD_READ && bufs.contains(&c.dma))
+        .count() as u32;
+    let (hits, misses) = (
+        m.cpu.bus.peek(sym(&elf, "bio_hits")).unwrap(),
+        m.cpu.bus.peek(sym(&elf, "bio_misses")).unwrap(),
+    );
+    assert_eq!(misses, buffer_reads);
+    // Reader c, the scratch block read back and read again to restore it;
+    // in the LRU check blocks 0 and 1 (left there by the readers) at the
+    // start of its loop, block 0 again after it, then blocks 0 and NBUF.
+    assert_eq!(hits, 8);
+    assert!(bufs.len() >= NBUF as usize * BSIZE);
+
+    // Which buffer each miss took. A buffer whose read failed holds nothing,
+    // so the next miss reuses it before any cached block: the second read
+    // past the end, then block 2 in the LRU loop, take the buffer of the
+    // first.
+    let block_reads: Vec<(u32, u32)> = t
+        .commands
+        .iter()
+        .filter(|c| c.cmd == BLK_CMD_READ && bufs.contains(&c.dma))
+        .map(|c| (c.sector / BLOCK_SECTORS, c.dma))
+        .collect();
+    let read_at = |block: u32| {
+        block_reads
+            .iter()
+            .position(|&(b, _)| b == block)
+            .unwrap_or_else(|| panic!("block {block} never read: {block_reads:?}"))
+    };
+    let end = DISK_SECTORS as u32 / BLOCK_SECTORS;
+    let first_fail = read_at(end);
+    let failed_buf = block_reads[first_fail].1;
+    assert_eq!(block_reads[first_fail + 1], (end, failed_buf));
+    assert_eq!(block_reads[first_fail + 2], (2, failed_buf));
+    // LRU, not MRU: after blocks 0 to NBUF - 1, then block 0 again, block
+    // NBUF takes the buffer block 1 was read into (by reader b), and the
+    // last miss reads block 1 back.
+    let block1 = block_reads[read_at(1)].1;
+    assert_eq!(block_reads[read_at(NBUF)], (NBUF, block1));
+    assert_eq!(block_reads.last().unwrap().0, 1);
+
+    // The requests slept: on the disk, once per request for its interrupt
+    // and once more for reader b, which found reader a's request in flight;
+    // and reader c on block 0's buffer, which reader a held.
+    let disk0 = sym(&elf, "disks");
+    let on_disk = t.sleeps.iter().filter(|&&c| c == disk0).count();
+    assert_eq!(on_disk, t.commands.len() + 1, "{:x?}", t.sleeps);
+    let on_buffers = t.sleeps.iter().filter(|&&c| bufs.contains(&c)).count();
+    assert_eq!(on_buffers, 1, "{:x?}", t.sleeps);
+    assert_eq!(on_disk + on_buffers, t.sleeps.len());
+}
+
+#[test]
+fn kernel_processes_give_back_their_pages() {
+    // The self-test's four kernel processes are gone after it, with their
+    // kernel stacks: the shell starts with as many free pages as without a
+    // disk.
+    let (mut plain, elf) = load_committed();
+    step_until(
+        &mut plain,
+        BOOT_MAX_STEPS,
+        |_| {},
+        |m| printed(m).ends_with(PROMPT),
+    );
+    let (mut with_disk, _) = load_with_disks(vec![DiskConfig::memory(disk_bytes(DISK_SECTORS))]);
+    step_until(
+        &mut with_disk,
+        BOOT_MAX_STEPS * 2,
+        |_| {},
+        |m| printed(m).ends_with(PROMPT),
+    );
+    assert!(printed(&with_disk).contains(" passed\n"));
+    assert_eq!(free_pages(&with_disk, &elf), free_pages(&plain, &elf));
+}
+
+#[test]
+fn a_slow_disk_leaves_the_kernel_asleep_in_wfi() {
+    // Grail's disks finish each command at once. Here the first one's
+    // interrupt is held back (BLK_CTRL cleared right after the command) for
+    // a few ticks, as a slow disk would: every process is then asleep and
+    // the scheduler idles in wfi, waking for each tick and nothing else.
+    let (mut m, elf) = load_with_disks(vec![DiskConfig::memory(disk_bytes(DISK_SECTORS))]);
+    let ticks = sym(&elf, "ticks");
+    let tick_count = |m: &Machine| m.cpu.bus.peek(ticks).unwrap();
+    for _ in 0..BOOT_MAX_STEPS {
+        let cmd = matches!(disk_access(&m.cpu), Some((0, BLK_REG_CMD, true)));
+        m.cpu.step();
+        if cmd {
+            break;
+        }
+    }
+    assert!(m.cpu.bus.disks[0].done(), "no disk command");
+    m.cpu.bus.disks[0].ctrl = 0;
+
+    let wfi = sym(&elf, "wfi");
+    let mut wfis = 0;
+    let start = tick_count(&m);
+    let steps = step_until(
+        &mut m,
+        BOOT_MAX_STEPS,
+        |cpu| {
+            if cpu.pc == wfi {
+                wfis += 1;
+            }
+        },
+        |m| tick_count(m) == start + 5,
+    );
+    // Polling would spend a whole tick interval (1 000 000 steps) per tick.
+    assert!(steps < 5 * 1000, "{steps} steps for 5 ticks");
+    assert!(wfis >= 5, "{wfis} wfi");
+    assert!(
+        m.cpu.bus.disks[0].done(),
+        "the result was taken without the interrupt"
+    );
+
+    // The interrupt comes at last, and the self-test carries on.
+    m.cpu.bus.disks[0].ctrl = 1;
+    assert_eq!(m.run(Some(BOOT_MAX_STEPS * 2), |_| {}), RunResult::Exited(0));
+    let want = format!("blk self-test: {BLK_SELFTEST_CHECKS}/{BLK_SELFTEST_CHECKS} passed\n");
+    assert!(printed(&m).contains(&want), "{}", printed(&m));
+}
+
+#[test]
+fn a_read_only_disk_refuses_the_write_and_stays_as_it_was() {
+    let image = disk_bytes(DISK_SECTORS);
+    let (mut m, elf) = load_with_disks(vec![DiskConfig::memory(image.clone()).with_read_only(true)]);
+    let (r, t) = trace_disks(&mut m, &elf, BOOT_MAX_STEPS * 2);
+    let out = printed(&m);
+    assert_eq!(r, RunResult::Exited(0), "output:\n{out}");
+    // No restore and no flush: 4 + 5 + 3 + 2 checks.
+    assert_eq!(
+        kernel::mask_dbg_pc(&out),
+        boot_output_with(
+            "disk 0: 128 sectors (64 KiB), irq 3, read-only\n",
+            "blk self-test: 14/14 passed\n"
+        )
+    );
+    let writes: Vec<(&DiskCommand, u32)> = t
+        .commands
+        .iter()
+        .zip(t.results.iter().copied())
+        .filter(|(c, _)| c.cmd == BLK_CMD_WRITE)
+        .collect();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].1, blk_error::READ_ONLY);
+    assert_eq!(disk_contents(&mut m, 0), image);
+}
+
+/// A disk whose writes all fail on the host side.
+struct WritesFail(MemDisk);
+
+impl BlockBackend for WritesFail {
+    fn capacity(&self) -> u64 {
+        self.0.capacity()
+    }
+    fn read(&mut self, sector: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.0.read(sector, buf)
+    }
+    fn write(&mut self, _: u64, _: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::other("the host disk is broken"))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_disk_error_reaches_the_self_test_and_the_exit_code() {
+    // Writes fail with BLK_ERR_IO: the self-test sees the error (and that
+    // the block wasn't written), says what failed, and kmain's exit code
+    // counts the failures.
+    let image = disk_bytes(DISK_SECTORS);
+    let disk = WritesFail(MemDisk::from_image(image.clone()).unwrap());
+    let mut m = Machine::with_backends(MachineConfig::default(), vec![Box::new(disk)]).unwrap();
+    m.cpu.bus.uart.capture = true;
+    let file = committed_elf();
+    let elf = grail::elf::parse(&file).unwrap();
+    m.load_elf(&file).unwrap();
+    m.set_uart_input(kernel::typed(EXIT));
+    let (r, t) = trace_disks(&mut m, &elf, BOOT_MAX_STEPS * 2);
+    let out = printed(&m);
+    let failures: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("blk self-test FAILED: "))
+        .collect();
+    assert_eq!(
+        failures,
+        [
+            "write the scratch block",
+            "read it back from the cache",
+            "the disk holds the written block",
+            "restore the scratch block",
+        ],
+        "{out}"
+    );
+    assert!(out.contains("blk self-test: 12/16 passed\n"), "{out}");
+    assert_eq!(r, RunResult::Exited(4));
+    assert!(t.results.contains(&blk_error::IO), "{t:?}");
+    assert_eq!(disk_contents(&mut m, 0), image);
+}
+
+#[test]
+fn a_disk_smaller_than_two_blocks_is_not_tested() {
+    // The self-test needs two whole blocks: reader b reads block 1, and the
+    // scratch block (the last) must not be block 0. A disk of 1 sector has
+    // no whole block, one of 2 or 3 sectors only one: it is listed, but not
+    // tested, and left alone. 4 sectors are tested (see the next tests).
+    for sectors in [1, 2, 3] {
+        let image = disk_bytes(sectors);
+        let (mut m, elf) = load_with_disks(vec![DiskConfig::memory(image.clone())]);
+        let (r, t) = trace_disks(&mut m, &elf, BOOT_MAX_STEPS);
+        assert_eq!(r, RunResult::Exited(0), "{sectors} sectors");
+        let kib = sectors / 2;
+        assert_eq!(
+            kernel::mask_dbg_pc(&printed(&m)),
+            boot_output_with(
+                &format!("disk 0: {sectors} sectors ({kib} KiB), irq 3\n"),
+                "blk self-test: disk 0 is too small, skipped\n"
+            )
+        );
+        assert!(t.commands.is_empty(), "{sectors} sectors: {t:?}");
+        assert_eq!(disk_contents(&mut m, 0), image);
+    }
+}
+
+#[test]
+fn a_disk_entry_without_a_usable_interrupt_is_skipped() {
+    // The driver doesn't poll, so a disk whose sysinfo entry has no PLIC
+    // source (0), or one past the PLIC's 31, isn't used: the kernel boots as
+    // without a disk and never touches its registers.
+    for irq in [0, 32] {
+        let (mut m, elf) = load_with_disks(vec![DiskConfig::memory(disk_bytes(DISK_SECTORS))]);
+        let devices: Vec<DeviceEntry> = m
+            .cpu
+            .bus
+            .sysinfo
+            .devices()
+            .iter()
+            .map(|d| match d.kind {
+                DeviceType::Block => DeviceEntry { irq, ..*d },
+                _ => *d,
+            })
+            .collect();
+        assert!(devices.iter().any(|d| d.kind == DeviceType::Block));
+        m.cpu.bus.sysinfo = Sysinfo::new(m.config(), devices);
+        let (r, t) = trace_disks(&mut m, &elf, BOOT_MAX_STEPS);
+        assert_eq!(r, RunResult::Exited(0), "irq {irq}");
+        assert_eq!(kernel::mask_dbg_pc(&printed(&m)), halted_output(), "irq {irq}");
+        assert_eq!(t.accesses, 0, "irq {irq}: {t:?}");
+        assert_eq!(m.cpu.bus.disks[0].ctrl, 0);
+        assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(1 << UART_IRQ));
+    }
+}
+
+#[test]
+fn every_disk_is_found_and_disk_0_is_tested() {
+    // Two blocks are enough for the self-test without its LRU check; the
+    // second disk is listed and its interrupt enabled, but left alone.
+    let second = disk_bytes(16);
+    let (mut m, elf) = load_with_disks(vec![
+        DiskConfig::memory(disk_bytes(4)),
+        DiskConfig::memory(second.clone()),
+    ]);
+    let (r, t) = trace_disks(&mut m, &elf, BOOT_MAX_STEPS * 2);
+    assert_eq!(r, RunResult::Exited(0));
+    assert_eq!(
+        kernel::mask_dbg_pc(&printed(&m)),
+        boot_output_with(
+            "disk 0: 4 sectors (2 KiB), irq 3\ndisk 1: 16 sectors (8 KiB), irq 4\n",
+            "blk self-test: 14/14 passed\n"
+        )
+    );
+    assert!(t.commands.iter().all(|c| c.disk == 0));
+    assert_eq!(m.cpu.bus.disks[1].ctrl, 1);
+    assert_eq!(
+        m.cpu.bus.read(plic_enable(1), 4),
+        Ok(1 << UART_IRQ | 1 << BLK_IRQ | 1 << (BLK_IRQ + 1))
+    );
+    assert_eq!(disk_contents(&mut m, 1), second);
 }
 
 // ---- Rebuilding from source (skipped without LLVM) ----
