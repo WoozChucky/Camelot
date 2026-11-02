@@ -1,7 +1,7 @@
 //! `grail [options] <program.elf>`
 
 use grail::display::{self, DisplayOptions, Outcome};
-use grail::{Machine, MachineConfig, RunResult};
+use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: grail [options] <program.elf>
@@ -15,6 +15,10 @@ const USAGE: &str = "usage: grail [options] <program.elf>
                   --clock 10MHz, --clock 500kHz, --clock 1.5MHz, --clock 5Hz.
                   Without it Grail runs at full speed, deterministically, and reports
                   a nominal 10 MHz clock to software
+  --disk IMG      attach the image file IMG as the next disk (spec section 9.6),
+                  read-write: the program's writes change the file. IMG must be a
+                  whole number of 512-byte sectors. Repeat for more disks (up to 8)
+  --disk-ro IMG   the same, read-only
   --fb            show the framebuffer in a window (Windows only)
   --headless      no window, even with --fb (the default)
   --fb-dump DIR   write DIR/frame-NNNN.ppm on every FB_PRESENT and at exit";
@@ -54,6 +58,10 @@ fn main() -> ExitCode {
             },
             "--clock" => match value(&mut args, "--clock", grail::parse_clock) {
                 Some(hz) => config.clock_hz = Some(hz),
+                None => return ExitCode::from(2),
+            },
+            "--disk" | "--disk-ro" => match value(&mut args, &a, |s| Ok(DiskConfig::file(s))) {
+                Some(disk) => config.disks.push(disk.with_read_only(a == "--disk-ro")),
                 None => return ExitCode::from(2),
             },
             "-h" | "--help" => {

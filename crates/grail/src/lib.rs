@@ -4,6 +4,7 @@
 //! included (UART and debug output go to sinks the host hands it), so a process can run
 //! several machines, each on its own thread.
 
+pub mod block;
 pub mod bus;
 pub mod config;
 pub mod cpu;
@@ -19,8 +20,9 @@ mod win32;
 #[cfg(windows)]
 mod window;
 
-use bus::{Bus, Exit};
-pub use config::{parse_clock, parse_ram_mib, MachineConfig, DEFAULT_RAM_SIZE};
+use block::{BlockBackend, BlockDevice};
+use bus::{Bus, Exit, MAX_DISKS};
+pub use config::{parse_clock, parse_ram_mib, DiskConfig, MachineConfig, DEFAULT_RAM_SIZE};
 use cpu::Cpu;
 use keyboard::KeyEvent;
 use std::io::Write;
@@ -44,10 +46,40 @@ pub enum RunResult {
 }
 
 impl Machine {
-    /// Builds a machine with the hardware `config` describes.
+    /// Builds a machine with the hardware `config` describes, opening its disks.
     pub fn new(config: MachineConfig) -> Result<Self, String> {
+        Machine::with_backends(config, Vec::new())
+    }
+
+    /// Like [`Machine::new`], with more disks whose backends the host made itself (a
+    /// network disk, say). They come after the disks `config.disks` describes: with two
+    /// there, `backends[0]` is disk 2. Up to [`MAX_DISKS`] in all.
+    pub fn with_backends(
+        config: MachineConfig,
+        backends: Vec<Box<dyn BlockBackend>>,
+    ) -> Result<Self, String> {
         config.validate()?;
-        let mut cpu = Cpu::new(Bus::new(&config));
+        if config.disks.len() + backends.len() > MAX_DISKS {
+            return Err(format!(
+                "{} disks, at most {MAX_DISKS}",
+                config.disks.len() + backends.len()
+            ));
+        }
+        let mut disks = Vec::new();
+        for backend in config
+            .disks
+            .iter()
+            .map(DiskConfig::open)
+            .chain(backends.into_iter().map(Ok))
+        {
+            let i = disks.len();
+            disks.push(
+                backend
+                    .and_then(BlockDevice::new)
+                    .map_err(|e| format!("disk {i}: {e}"))?,
+            );
+        }
+        let mut cpu = Cpu::new(Bus::new(&config, disks));
         let pacer = config.clock_hz.map(Pacer::new);
         // With a real-time clock a wfi takes real time; see `run_steps`.
         cpu.wfi_skips_to_timer = pacer.is_none();

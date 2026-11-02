@@ -1,7 +1,8 @@
 //! Physical address space. See spec section 7 for the memory map.
 
+use crate::block::BlockDevice;
 use crate::config::MachineConfig;
-use crate::devices::{Clint, Plic, TestDevice, Uart, KBD_IRQ, UART_IRQ};
+use crate::devices::{Clint, Plic, TestDevice, Uart, BLK_IRQ, KBD_IRQ, UART_IRQ};
 use crate::framebuffer::{Framebuffer, VRAM_SIZE};
 use crate::keyboard::Keyboard;
 use crate::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
@@ -16,6 +17,12 @@ pub const PLIC_BASE: u32 = 0x0C00_0000;
 pub const PLIC_SIZE: u32 = 0x0400_0000;
 pub const UART_BASE: u32 = 0x1000_0000;
 pub const UART_SIZE: u32 = 0x100;
+/// Disk 0's registers (spec section 9.6); disk `i` is at `BLK_BASE + i * BLK_SIZE`.
+pub const BLK_BASE: u32 = 0x1000_1000;
+pub const BLK_SIZE: u32 = 0x1000;
+/// Disks a machine can have: one page each in 0x1000_1000 - 0x1000_8FFF, PLIC sources
+/// `BLK_IRQ` (3) to 10.
+pub const MAX_DISKS: usize = 8;
 pub const FB_CTRL_BASE: u32 = 0x3000_0000;
 pub const FB_CTRL_SIZE: u32 = 0x1000;
 pub const KBD_BASE: u32 = 0x3000_1000;
@@ -25,27 +32,33 @@ pub const SYSINFO_SIZE: u32 = 0x1000;
 pub const VRAM_BASE: u32 = 0x3100_0000;
 pub const RAM_BASE: u32 = 0x8000_0000;
 
-/// The devices a machine built from `_config` has, as the sysinfo device table lists
-/// them: in address order. A new device is one more entry here (plus its decoding in
-/// [`Bus::read`] and [`Bus::write`]); devices that only some machines have can look at
-/// the config.
-pub fn device_table(_config: &MachineConfig) -> Vec<DeviceEntry> {
+/// The devices a machine built from `_config` with `disks` disks has, as the sysinfo
+/// device table lists them: in address order. A new device is one more entry here (plus
+/// its decoding in [`Bus::read`] and [`Bus::write`]); devices that only some machines
+/// have can look at the config.
+pub fn device_table(_config: &MachineConfig, disks: usize) -> Vec<DeviceEntry> {
     let dev = |kind, base, size, irq| DeviceEntry {
         kind,
         base,
         size,
         irq,
     };
-    vec![
+    let mut table = vec![
         dev(DeviceType::TestFinisher, TEST_DEV_BASE, TEST_DEV_SIZE, 0),
         dev(DeviceType::Clint, CLINT_BASE, CLINT_SIZE, 0),
         dev(DeviceType::Plic, PLIC_BASE, PLIC_SIZE, 0),
         dev(DeviceType::Uart, UART_BASE, UART_SIZE, UART_IRQ),
+    ];
+    table.extend(
+        (0..disks as u32).map(|i| dev(DeviceType::Block, BLK_BASE + i * BLK_SIZE, BLK_SIZE, BLK_IRQ + i)),
+    );
+    table.extend([
         dev(DeviceType::FbCtrl, FB_CTRL_BASE, FB_CTRL_SIZE, 0),
         dev(DeviceType::Keyboard, KBD_BASE, KBD_SIZE, KBD_IRQ),
         dev(DeviceType::Sysinfo, SYSINFO_BASE, SYSINFO_SIZE, 0),
         dev(DeviceType::FbVram, VRAM_BASE, VRAM_SIZE, 0),
-    ]
+    ]);
+    table
 }
 
 /// Physical access failed: nothing mapped there, or the device refused the width.
@@ -67,6 +80,8 @@ pub struct Bus {
     pub uart: Uart,
     pub fb: Framebuffer,
     pub kbd: Keyboard,
+    /// Disk `i` is at `BLK_BASE + i * BLK_SIZE`, on PLIC source `BLK_IRQ + i`.
+    pub disks: Vec<BlockDevice>,
     pub test: TestDevice,
     pub sysinfo: Sysinfo,
     /// Where `xcal.dbg` output goes (the CLI's stderr). `None` drops it. With
@@ -80,8 +95,10 @@ pub struct Bus {
 
 impl Bus {
     /// The bus of a machine built from `config`, which must be valid
-    /// ([`MachineConfig::validate`]).
-    pub fn new(config: &MachineConfig) -> Self {
+    /// ([`MachineConfig::validate`]), with these disks (at most [`MAX_DISKS`]). The
+    /// disks are not opened from `config.disks` here: [`crate::Machine::new`] does that.
+    pub fn new(config: &MachineConfig, disks: Vec<BlockDevice>) -> Self {
+        assert!(disks.len() <= MAX_DISKS, "at most {MAX_DISKS} disks");
         Bus {
             ram: vec![0; config.ram_size],
             rom: Vec::new(),
@@ -90,8 +107,9 @@ impl Bus {
             uart: Uart::default(),
             fb: Framebuffer::default(),
             kbd: Keyboard::default(),
+            sysinfo: Sysinfo::new(config, device_table(config, disks.len())),
+            disks,
             test: TestDevice,
-            sysinfo: Sysinfo::new(config, device_table(config)),
             debug: None,
             tohost: None,
             exit: None,
@@ -116,6 +134,16 @@ impl Bus {
         let uart = self.uart.irq();
         self.plic.set_level(UART_IRQ, uart);
         self.plic.set_level(KBD_IRQ, self.kbd.irq());
+        for (i, disk) in self.disks.iter().enumerate() {
+            self.plic.set_level(BLK_IRQ + i as u32, disk.irq());
+        }
+    }
+
+    /// The disk whose register page holds `addr`, and the offset in it.
+    fn disk_at(&self, addr: u32) -> Option<(usize, u32)> {
+        let off = addr.wrapping_sub(BLK_BASE);
+        let i = (off / BLK_SIZE) as usize;
+        (addr >= BLK_BASE && i < self.disks.len()).then_some((i, off % BLK_SIZE))
     }
 
     fn ram_range(&self, addr: u32, size: u32) -> Option<usize> {
@@ -164,6 +192,9 @@ impl Bus {
         if let Ok(v) = self.read_mem(addr, size) {
             return Ok(v);
         }
+        if let Some((i, off)) = self.disk_at(addr) {
+            return self.disks[i].read(off, size);
+        }
         match addr {
             a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => self.clint.read(a - CLINT_BASE, size),
             a if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&a) => self.plic.read(a - PLIC_BASE, size),
@@ -188,6 +219,10 @@ impl Bus {
                 self.exit = Some(Exit::Code(if val == 1 { 0 } else { val >> 1 }));
             }
             return Ok(());
+        }
+        if let Some((i, off)) = self.disk_at(addr) {
+            // The disk moves data between itself and RAM on its own (DMA).
+            return self.disks[i].write(off, size, val, &mut self.ram);
         }
         match addr {
             a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => {
@@ -244,11 +279,12 @@ impl Bus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::{self, MemDisk, SECTOR_SIZE};
     use crate::sysinfo::{self, DEV_ENTRY_SIZE, DEV_TABLE};
     use std::sync::{Arc, Mutex};
 
     fn small_bus() -> Bus {
-        Bus::new(&MachineConfig::with_ram(4096))
+        Bus::new(&MachineConfig::with_ram(4096), Vec::new())
     }
 
     #[test]
@@ -258,7 +294,7 @@ mod tests {
             clock_hz: Some(250_000),
             ..MachineConfig::default()
         };
-        let mut bus = Bus::new(&config);
+        let mut bus = Bus::new(&config, Vec::new());
         let reg = |bus: &mut Bus, off| bus.read(SYSINFO_BASE + off, 4).unwrap();
         assert_eq!(reg(&mut bus, sysinfo::REG_MAGIC), sysinfo::SYSINFO_MAGIC);
         assert_eq!(reg(&mut bus, sysinfo::REG_RAM_BASE), RAM_BASE);
@@ -281,11 +317,17 @@ mod tests {
 
     #[test]
     fn device_table_matches_the_bus() {
-        let mut bus = small_bus();
+        let bus = small_bus();
+        assert_eq!(bus.sysinfo.devices(), device_table(&MachineConfig::default(), 0));
+        device_table_matches(bus);
+    }
+
+    /// Checks that `bus`'s sysinfo table describes the bus: every entry readable by
+    /// software, decoded at both ends, no overlaps, and the right interrupt sources.
+    fn device_table_matches(mut bus: Bus) {
         let count = bus.read(SYSINFO_BASE + sysinfo::REG_DEV_COUNT, 4).unwrap();
         let table = bus.sysinfo.devices().to_vec();
         assert_eq!(count as usize, table.len());
-        assert_eq!(table, device_table(&MachineConfig::default()));
         let ram = RAM_BASE as u64..1 << 32;
         let rom = BOOT_ROM_BASE as u64..BOOT_ROM_BASE as u64 + 0x1000;
         assert!(table.is_sorted_by_key(|d| d.base), "address order");
@@ -326,6 +368,81 @@ mod tests {
         assert_eq!(uart.irq, UART_IRQ);
         let kbd = table.iter().find(|d| d.kind == DeviceType::Keyboard).unwrap();
         assert_eq!(kbd.irq, KBD_IRQ);
+        // Disks are listed in order, each on its own source.
+        let disks: Vec<_> = table.iter().filter(|d| d.kind == DeviceType::Block).collect();
+        assert_eq!(disks.len(), bus.disks.len());
+        for (i, d) in disks.iter().enumerate() {
+            assert_eq!(
+                (d.base, d.irq),
+                (BLK_BASE + i as u32 * BLK_SIZE, BLK_IRQ + i as u32)
+            );
+        }
+        // All the sources are different and exist on the PLIC.
+        let mut irqs: Vec<u32> = table.iter().map(|d| d.irq).filter(|&irq| irq != 0).collect();
+        irqs.sort();
+        irqs.dedup();
+        assert_eq!(irqs.len(), 2 + bus.disks.len());
+        assert!(irqs.iter().all(|&irq| irq < crate::devices::PLIC_SOURCES));
+    }
+
+    /// A bus with `n` disks of one sector each, disk `i` filled with byte `i`.
+    fn bus_with_disks(n: usize) -> Bus {
+        let disks = (0..n)
+            .map(|i| {
+                let disk = MemDisk::from_image(vec![i as u8; SECTOR_SIZE]).unwrap();
+                BlockDevice::new(Box::new(disk)).unwrap()
+            })
+            .collect();
+        Bus::new(&MachineConfig::with_ram(4096), disks)
+    }
+
+    #[test]
+    fn device_table_lists_every_disk() {
+        for n in [0, 1, 3, MAX_DISKS] {
+            let bus = bus_with_disks(n);
+            let table = bus.sysinfo.devices();
+            assert_eq!(table, device_table(&MachineConfig::default(), n));
+            assert_eq!(table.len(), 8 + n);
+            device_table_matches(bus);
+        }
+    }
+
+    #[test]
+    fn disk_registers_on_the_bus() {
+        let mut bus = bus_with_disks(2);
+        let disk1 = BLK_BASE + BLK_SIZE;
+        assert_eq!(bus.read(BLK_BASE + block::REG_CAPACITY, 4), Ok(1));
+        assert_eq!(bus.read(disk1 + block::REG_CAPACITY, 4), Ok(1));
+        // Disk 1, sector 0 -> the start of RAM, with DMA through the bus's own RAM.
+        bus.write(disk1 + block::REG_DMA, 4, RAM_BASE + 8).unwrap();
+        bus.write(disk1 + block::REG_COUNT, 4, 1).unwrap();
+        bus.write(disk1 + block::REG_CTRL, 4, 1).unwrap();
+        bus.write(disk1 + block::REG_CMD, 4, block::CMD_READ).unwrap();
+        assert_eq!(bus.read(disk1 + block::REG_STATUS, 4), Ok(block::STATUS_DONE));
+        assert_eq!(bus.read(disk1 + block::REG_ERROR, 4), Ok(0));
+        assert_eq!(
+            bus.read(BLK_BASE + block::REG_STATUS, 4),
+            Ok(0),
+            "disk 0 did nothing"
+        );
+        assert_eq!(&bus.ram[..8], &[0; 8]);
+        assert_eq!(&bus.ram[8..8 + SECTOR_SIZE], &[1; SECTOR_SIZE]);
+        assert_eq!(bus.ram[8 + SECTOR_SIZE], 0);
+
+        // Its line reaches the PLIC as source BLK_IRQ + 1.
+        bus.update_interrupts();
+        assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << (BLK_IRQ + 1)));
+
+        // Words only; nothing past the last disk; not memory.
+        assert_eq!(bus.read(BLK_BASE, 1), Err(BusFault));
+        assert_eq!(bus.write(BLK_BASE + block::REG_CMD, 2, 1), Err(BusFault));
+        assert_eq!(bus.read(BLK_BASE + 2 * BLK_SIZE, 4), Err(BusFault));
+        assert_eq!(bus.write(BLK_BASE + 2 * BLK_SIZE, 4, 0), Err(BusFault));
+        assert_eq!(bus.read_mem(BLK_BASE, 4), Err(BusFault));
+        // Without disks the range is unmapped.
+        let mut bus = small_bus();
+        assert_eq!(bus.read(BLK_BASE, 4), Err(BusFault));
+        assert_eq!(bus.write(BLK_BASE + block::REG_CMD, 4, 1), Err(BusFault));
     }
 
     /// A `Write` whose bytes the test can still read after handing it to the bus.
