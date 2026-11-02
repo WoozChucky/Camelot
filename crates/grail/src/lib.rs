@@ -15,6 +15,7 @@ pub mod elf;
 pub mod framebuffer;
 pub mod keyboard;
 pub mod lake;
+pub mod net;
 pub mod pointer;
 pub mod sysinfo;
 pub mod trap;
@@ -24,10 +25,11 @@ mod win32;
 mod window;
 
 use block::{BlockBackend, BlockDevice};
-use bus::{Bus, Exit, MAX_DISKS};
-pub use config::{parse_clock, parse_ram_mib, DiskConfig, MachineConfig, DEFAULT_RAM_SIZE};
+use bus::{Bus, Exit, MAX_DISKS, MAX_NETS};
+pub use config::{parse_clock, parse_ram_mib, DiskConfig, MachineConfig, NetConfig, DEFAULT_RAM_SIZE};
 use cpu::Cpu;
 use keyboard::KeyEvent;
+use net::{MacAddr, NetBackend, NetDevice};
 use pointer::PointerInput;
 use std::io::Write;
 use std::sync::mpsc::Receiver;
@@ -50,7 +52,8 @@ pub enum RunResult {
 }
 
 impl Machine {
-    /// Builds a machine with the hardware `config` describes, opening its disks.
+    /// Builds a machine with the hardware `config` describes, opening its disks and
+    /// network backends.
     pub fn new(config: MachineConfig) -> Result<Self, String> {
         Machine::with_backends(config, Vec::new())
     }
@@ -62,7 +65,27 @@ impl Machine {
         config: MachineConfig,
         backends: Vec<Box<dyn BlockBackend>>,
     ) -> Result<Self, String> {
+        Machine::with_devices(config, backends, Vec::new())
+    }
+
+    /// Like [`Machine::with_backends`], with network cards whose backends the host made
+    /// itself too (a switch port, a gateway), each with its MAC address. They come after
+    /// the cards `config.nets` describes, up to [`MAX_NETS`] in all.
+    pub fn with_devices(
+        config: MachineConfig,
+        backends: Vec<Box<dyn BlockBackend>>,
+        net_backends: Vec<(MacAddr, Box<dyn NetBackend>)>,
+    ) -> Result<Self, String> {
         config.validate()?;
+        if config.nets.len() + net_backends.len() > MAX_NETS {
+            return Err(format!(
+                "{} network cards, at most {MAX_NETS}",
+                config.nets.len() + net_backends.len()
+            ));
+        }
+        if let Some((mac, _)) = net_backends.iter().find(|(mac, _)| mac.is_multicast()) {
+            return Err(format!("{mac} is a group address, not a card's"));
+        }
         if config.disks.len() + backends.len() > MAX_DISKS {
             return Err(format!(
                 "{} disks, at most {MAX_DISKS}",
@@ -83,7 +106,18 @@ impl Machine {
                     .map_err(|e| format!("disk {i}: {e}"))?,
             );
         }
-        let mut cpu = Cpu::new(Bus::new(&config, disks));
+        let mut nets = Vec::new();
+        for card in config
+            .nets
+            .iter()
+            .map(NetConfig::open)
+            .chain(net_backends.into_iter().map(Ok))
+        {
+            let i = nets.len();
+            let (mac, backend) = card.map_err(|e| format!("network card {i}: {e}"))?;
+            nets.push(NetDevice::new(mac, backend));
+        }
+        let mut cpu = Cpu::new(Bus::with_nets(&config, disks, nets));
         let pacer = config.clock_hz.map(Pacer::new);
         // With a real-time clock a wfi takes real time; see `run_steps`.
         cpu.wfi_skips_to_timer = pacer.is_none();
@@ -206,7 +240,16 @@ impl Machine {
             if paced {
                 // Parked in wfi: let the idle ticks of this batch pass at once, keeping one
                 // step for the wake-up check. The pacer then sleeps them off in real time.
-                n += self.cpu.idle(budget - n - 1);
+                let skipped = self.cpu.idle(budget - n - 1);
+                if skipped > 0 {
+                    // Network cards poll by the step: the skipped ones count too, or a
+                    // card would poll only every few hundred batches while the guest idles.
+                    let ram = &mut self.cpu.bus.ram;
+                    for nic in &mut self.cpu.bus.nets {
+                        nic.skip(skipped, ram);
+                    }
+                }
+                n += skipped;
             }
             trace(&self.cpu);
             self.cpu.step();

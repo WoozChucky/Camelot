@@ -5,8 +5,9 @@
 //! same reason: every front end accepts the same `--ram` and `--clock` syntax.
 
 use crate::block::{BlockBackend, FileDisk, MemDisk, MAX_SECTORS, SECTOR_SIZE};
-use crate::bus::{MAX_DISKS, RAM_BASE};
+use crate::bus::{MAX_DISKS, MAX_NETS, RAM_BASE};
 use crate::lake::LakeDisk;
+use crate::net::{Hub, MacAddr, NetBackend, Pcap};
 use std::path::PathBuf;
 
 pub const MIB: usize = 1024 * 1024;
@@ -38,6 +39,91 @@ pub struct MachineConfig {
     /// and interrupts on PLIC source `BLK_IRQ + i`. At most [`MAX_DISKS`], counting any
     /// backends handed to [`crate::Machine::with_backends`].
     pub disks: Vec<DiskConfig>,
+    /// Network cards (spec section 9.8): card `i` is mapped at `NET_BASE + i * NET_SIZE`
+    /// and interrupts on PLIC source `NET_IRQ + i`. At most [`MAX_NETS`], counting any
+    /// backends handed to [`crate::Machine::with_devices`].
+    pub nets: Vec<NetConfig>,
+}
+
+/// One network card of a [`MachineConfig`]: what it is plugged into, its address, and
+/// whether its frames are captured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetConfig {
+    pub source: NetSource,
+    /// The card's MAC address (`NET_MAC`). `None` lets the backend pick one: a hub port
+    /// gives `02:ca:00:00:00:NN`, with `NN` the port's number on the hub.
+    pub mac: Option<MacAddr>,
+    /// Write every frame the card sends or receives to this file, in pcap format.
+    pub pcap: Option<PathBuf>,
+}
+
+/// What a configured card is plugged into. A host with a backend of its own passes it
+/// to [`crate::Machine::with_devices`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetSource {
+    /// A port of this in-process hub: the card sees every frame the other ports send.
+    /// Machines whose configs name the same hub are on one network.
+    Hub(Hub),
+}
+
+impl NetConfig {
+    /// A card on a port of `hub`, with the port's default MAC address.
+    pub fn hub(hub: &Hub) -> Self {
+        NetConfig {
+            source: NetSource::Hub(hub.clone()),
+            mac: None,
+            pcap: None,
+        }
+    }
+
+    /// A card from a `--net` argument: a kind, then options after commas. The kind is
+    /// `hub` (a port of `hub`, the process's hub); the option is `mac=ADDR`.
+    pub fn parse(arg: &str, hub: &Hub) -> Result<Self, String> {
+        let mut parts = arg.split(',');
+        let mut config = match parts.next() {
+            Some("hub") => NetConfig::hub(hub),
+            _ => return Err(format!("'{arg}' is not a network: the kind is hub")),
+        };
+        for option in parts {
+            match option.split_once('=') {
+                Some(("mac", mac)) => config.mac = Some(MacAddr::parse(mac)?),
+                _ => return Err(format!("unknown network option '{option}' (there is mac=ADDR)")),
+            }
+        }
+        Ok(config)
+    }
+
+    pub fn with_mac(self, mac: MacAddr) -> Self {
+        NetConfig {
+            mac: Some(mac),
+            ..self
+        }
+    }
+
+    pub fn with_pcap(self, path: impl Into<PathBuf>) -> Self {
+        NetConfig {
+            pcap: Some(path.into()),
+            ..self
+        }
+    }
+
+    /// Opens the backend this card describes, and picks its MAC address.
+    pub fn open(&self) -> Result<(MacAddr, Box<dyn NetBackend>), String> {
+        let (default_mac, backend): (MacAddr, Box<dyn NetBackend>) = match &self.source {
+            NetSource::Hub(hub) => {
+                let port = hub.attach();
+                (port.default_mac(), Box::new(port))
+            }
+        };
+        let backend = match &self.pcap {
+            None => backend,
+            Some(path) => match Pcap::create(path, backend) {
+                Ok(pcap) => Box::new(pcap),
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            },
+        };
+        Ok((self.mac.unwrap_or(default_mac), backend))
+    }
 }
 
 /// One disk of a [`MachineConfig`]: where its sectors come from.
@@ -143,6 +229,7 @@ impl Default for MachineConfig {
             clock_hz: None,
             nominal_hz: DEFAULT_NOMINAL_HZ,
             disks: Vec::new(),
+            nets: Vec::new(),
         }
     }
 }
@@ -191,6 +278,16 @@ impl MachineConfig {
                         .map_err(|e| format!("disk {}{addr}/{name}: {e}", avalon_proto::LAKE_SCHEME))?;
                 }
                 DiskSource::File(_) => {}
+            }
+        }
+        if self.nets.len() > MAX_NETS {
+            return Err(format!("{} network cards, at most {MAX_NETS}", self.nets.len()));
+        }
+        for (i, net) in self.nets.iter().enumerate() {
+            if let Some(mac) = net.mac.filter(MacAddr::is_multicast) {
+                return Err(format!(
+                    "network card {i}: {mac} is a group address, not a card's"
+                ));
             }
         }
         Ok(())
@@ -381,6 +478,69 @@ mod tests {
         assert!(e.starts_with(&format!("lake://{addr}/root: ")), "{e}");
         let e = DiskConfig::lake("no such host:1", "root").open().err().unwrap();
         assert!(e.starts_with("lake://no such host:1/root: "), "{e}");
+    }
+
+    #[test]
+    fn net_configs() {
+        let hub = Hub::new();
+        assert!(MachineConfig::default().nets.is_empty());
+        assert_eq!(NetConfig::parse("hub", &hub), Ok(NetConfig::hub(&hub)));
+        let mac = MacAddr([2, 0, 0, 0, 0, 9]);
+        assert_eq!(
+            NetConfig::parse("hub,mac=02:00:00:00:00:09", &hub),
+            Ok(NetConfig::hub(&hub).with_mac(mac))
+        );
+        for (bad, why) in [
+            ("", "not a network"),
+            ("user", "not a network"),
+            ("Hub", "not a network"),
+            ("hub,", "unknown network option ''"),
+            ("hub,mtu=1500", "unknown network option 'mtu=1500'"),
+            ("hub,mac=02:00", "not a MAC address"),
+        ] {
+            let e = NetConfig::parse(bad, &hub).unwrap_err();
+            assert!(e.contains(why), "{bad:?}: {e}");
+        }
+        // Configs name hubs by identity.
+        assert_ne!(NetConfig::hub(&hub), NetConfig::hub(&Hub::new()));
+
+        let nets = |nets: Vec<NetConfig>| MachineConfig {
+            nets,
+            ..MachineConfig::default()
+        };
+        assert_eq!(nets(vec![NetConfig::hub(&hub); MAX_NETS]).validate(), Ok(()));
+        let e = nets(vec![NetConfig::hub(&hub); MAX_NETS + 1])
+            .validate()
+            .unwrap_err();
+        assert_eq!(e, "5 network cards, at most 4");
+        let group = NetConfig::hub(&hub).with_mac(MacAddr([1, 0, 0x5e, 0, 0, 1]));
+        let e = nets(vec![NetConfig::hub(&hub), group]).validate().unwrap_err();
+        assert_eq!(
+            e,
+            "network card 1: 01:00:5e:00:00:01 is a group address, not a card's"
+        );
+    }
+
+    #[test]
+    fn net_configs_open_their_backends() {
+        let hub = Hub::new();
+        let (mac1, mut card1) = NetConfig::hub(&hub).open().unwrap();
+        let (mac2, mut card2) = NetConfig::hub(&hub).open().unwrap();
+        let mac = MacAddr([2, 0, 0, 0, 0, 9]);
+        let (mac3, _card3) = NetConfig::hub(&hub).with_mac(mac).open().unwrap();
+        assert_eq!([mac1, mac2, mac3], [MacAddr::local(1), MacAddr::local(2), mac]);
+        assert_eq!(hub.ports(), 3);
+        card1.send(&[7; 14]).unwrap();
+        assert_eq!(card2.recv(), Some(vec![7; 14]));
+
+        // A capture file that cannot be created fails the card, naming the file.
+        let e = NetConfig::hub(&hub)
+            .with_pcap("no/such/dir/x.pcap")
+            .open()
+            .err()
+            .unwrap();
+        assert!(e.starts_with("no/such/dir/x.pcap: "), "{e}");
+        assert_eq!(hub.ports(), 3, "and leaves no port behind");
     }
 
     #[test]
