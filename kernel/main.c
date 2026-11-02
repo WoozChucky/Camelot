@@ -1,6 +1,7 @@
 /* Camelot kernel: C entry point. entry.s sets up the stack and clears .bss,
  * start() drops to S-mode, then supervisor_entry calls kmain(); its return
  * value becomes the exit code. */
+#include "console.h"
 #include "kprintf.h"
 #include "mmio.h"
 #include "riscv.h"
@@ -13,8 +14,13 @@
 
 #define CAMELOT_VERSION "0.1.0"
 
-/* Timer ticks to wait for before halting. */
+/* Timer ticks to wait for before starting the shell. */
 #define BOOT_TICKS 10
+
+/* The shell's prompt and the longest command line it reads (one byte goes to
+ * the NUL). */
+#define PROMPT "camelot> "
+#define LINE_MAX 64
 
 /* Deliberate faults, to exercise the panic path. The image ships with
  * BOOT_FAULT_NONE; tests patch `boot_fault` in it to pick another one. The
@@ -114,6 +120,50 @@ static void deliberate_fault(void) {
     }
 }
 
+static bool is_blank(char c) {
+    return c == ' ' || c == '\t';
+}
+
+/* `s` without leading and trailing blanks (the trailing ones are cut off in
+ * place). */
+static char *trim(char *s) {
+    while (is_blank(*s)) {
+        s++;
+    }
+    usize n = strlen(s);
+    while (n > 0 && is_blank(s[n - 1])) {
+        n--;
+    }
+    s[n] = 0;
+    return s;
+}
+
+/* A tiny built-in shell, until there is a user-space one: reads commands from
+ * the console and returns on `halt`. */
+static void shell(void) {
+    char line[LINE_MAX];
+    kprintf("Type help for the list of commands.\n");
+    for (;;) {
+        kprintf(PROMPT);
+        console_readline(line, sizeof line);
+        char *cmd = trim(line);
+        if (cmd[0] == 0) {
+            continue;
+        }
+        if (strcmp(cmd, "help") == 0) {
+            kprintf("help    this list\n");
+            kprintf("ticks   timer ticks since boot (%u per second)\n", TICK_HZ);
+            kprintf("halt    stop the machine\n");
+        } else if (strcmp(cmd, "ticks") == 0) {
+            kprintf("ticks: %u\n", ticks);
+        } else if (strcmp(cmd, "halt") == 0) {
+            return;
+        } else {
+            kprintf("unknown command: %s (try help)\n", cmd);
+        }
+    }
+}
+
 int kmain(void) {
     uart_init();
     kprintf("Camelot v%s booting...\n", CAMELOT_VERSION);
@@ -131,5 +181,6 @@ int kmain(void) {
     wait_ticks(BOOT_TICKS);
 
     deliberate_fault();
+    shell();
     return failed;
 }

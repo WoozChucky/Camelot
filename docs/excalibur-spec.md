@@ -403,22 +403,33 @@ The kernel runs in S-mode on top of a small M-mode layer (the xv6-riscv design).
 - Machine call (ecall from S-mode): function number in a7, arguments in a0-a6, result in a0; `mepc` advances past the `ecall`. Function 0 (`MCALL_HALT`) stops the machine with exit code a0, since `xcal.halt` is M-mode only. Any other function returns -1.
 - Anything else is a kernel bug: print `mcause`/`mepc`/`mtval` and halt with 0xFF, like the early trap handler.
 
-Timer: the tick rate is 10 Hz, an interval of `timebase / 10` `mtime` ticks with the nominal 10 MHz timebase (section 7). The kernel takes the timebase from one function, `timebase_hz()`, so that it can later read it from hardware instead.
+Timer: the tick rate is 10 Hz, an interval of `timebase / 10` `mtime` ticks (at least 1). The timebase comes from sysinfo's `SYS_TIMEBASE_HZ` (section 9.5) through one function, `timebase_hz()`, which reads it on its first call (`timer_init`, in M-mode) and keeps it, so S-mode code never touches the register again (it stays valid once the kernel turns paging on). If `SYS_MAGIC` does not read "SYSI" it falls back to the nominal 10 MHz (section 7).
 
 `kernel_vec` (S-mode, `kernel/kernelvec.s`) saves x1-x31 and `sepc`, `scause`, `stval`, `sstatus` in a `struct trap_frame` on the current stack (`regs[32]` with x*n* at offset 4*n*, then the four CSRs at 128-140; 144 bytes), calls `kernel_trap(frame)`, restores `sepc`, `sstatus` and the registers from the frame, and returns with `sret`. Every trap comes from S-mode until there are user processes, so `sscratch` is unused for now.
 
-`kernel_trap` (`kernel/trap.c`): a supervisor software interrupt clears `sip.SSIP` and increments `ticks`. Any other trap is a panic: it prints
+`kernel_trap` (`kernel/trap.c`): a supervisor software interrupt clears `sip.SSIP` and increments `ticks`. A supervisor external interrupt (cause 9) claims the source from PLIC context 1, services it (the UART's receive handler, below) and completes it; `sip.SEIP` follows the PLIC's line, so there is nothing to clear. Any other trap is a panic: it prints
 
 ```
 panic: <cause name>
   scause 0x........  sepc 0x........  stval 0x........  sstatus 0x........
 ```
 
-followed by x1-x31 four per line (`   ra 01010101   sp 80007400 ...`), and halts with exit code 0xFE. After its self-tests the kernel enables the tick (`sie.SSIE`, `sstatus.SIE`), idles in `wfi` printing `tick 1` ... `tick 10`, and returns.
+followed by x1-x31 four per line (`   ra 01010101   sp 80007400 ...`), and halts with exit code 0xFE. After its self-tests the kernel sets up the PLIC and enables its interrupts (`sie.SSIE`, `sie.SEIE`, `sstatus.SIE`), idles in `wfi` printing `tick 1` ... `tick 10`, then runs its shell ("Kernel console" below) and returns when told to `halt`.
 
 For testing the panic path, the image has a word `boot_fault` in `.data`, normally 1. Patching it to 2 makes the kernel execute an illegal instruction after the ticks (with every register but sp set to its number in each byte, x5 = 0x05050505); 3 makes it load from the unmapped address 0x100.
 
 Kernel C stays inside what Merlin will compile: no libc headers (`-nostdinc`), no floating point, no inline `asm()` (CSR access and Xcal instructions live in `.s` files, with Xcal instructions written as `.word`), and `.s` files use only merlin-as syntax. The one exception is varargs: `kprintf` uses `__builtin_va_list`/`__builtin_va_start`/`__builtin_va_arg`/`__builtin_va_end` (via `kernel/include/varargs.h`), so Merlin must provide those builtins with the ILP32 convention (variadic arguments travel in a0-a7 and then on the stack like named ones; the callee spills a0-a7 next to its stack arguments and `va_list` is a pointer walking that area).
+
+### Kernel console
+
+Console input is interrupt-driven; nothing in the kernel waits on RBR.
+
+- **PLIC** (`kernel/plic.c`): `plic_init()` gives the UART's source (1, section 7.1) priority 1, enables it for context 1 (hart 0, S-mode) and sets that context's threshold to 0. Context 0 (M-mode) is left alone and `mie.MEIE` stays clear: every device interrupt goes to the kernel.
+- **UART** (`kernel/uart.c`): `uart_init()` sets 8N1 and IER.ERBFI, so the UART holds its line high while a byte waits. `uart_intr()`, called for source 1, reads RBR until LSR.DR clears into a 128-byte ring buffer. The ring has one writer per index (the handler advances the head, the reader the tail), so it needs no lock. If it fills up, the handler leaves the remaining bytes in the UART and clears IER instead of dropping them (a byte left in RBR would keep the line high and the interrupt firing). `uart_rx_pop()` sets IER again once the ring is half empty. Transmit still polls LSR.THRE, which Grail always reports as set.
+- **Console** (`kernel/console.c`): `console_getc()` pops a byte, or sleeps in `wfi` with interrupts off from the check to the `wfi` (the interrupt that wakes it is taken right after). `console_readline(buf, size)` echoes printable characters (0x20-0x7E) and keeps at most `size - 1` of them. BS (0x08) and DEL (0x7F) erase one, echoing BS, space, BS. CR, LF or CR LF ends the line and echoes a LF; a LF right after a CR is skipped, so both raw consoles (CR) and piped text (LF, CR LF) work. Other control characters are ignored.
+- **Shell** (`kmain`, until there is a user-space one): prints `Type help for the list of commands.`, then reads lines after the prompt `camelot> `. It knows `help`, `ticks` (prints `ticks: N`, the timer ticks since boot) and `halt` (returns from `kmain`, so the exit code is the self-test failure count, 0 normally). Blank lines are skipped, surrounding blanks ignored, and anything else prints `unknown command: <line> (try help)`. Lines are up to 63 characters.
+
+Host side: the `grail` command feeds its stdin to the UART. When stdin is an interactive terminal (a Windows console, or a Linux terminal), Grail switches it to raw mode while it runs: each key is passed on as typed, the terminal does not echo it (the kernel does), and Ctrl-C still stops Grail. The terminal is restored at exit and on Ctrl-C. With a pipe or file nothing changes, so `printf 'ticks\nhalt\n' | grail kernel/kernel.elf` runs the shell non-interactively. Without `--clock`, a kernel waiting for input still takes every timer tick (`wfi` skips to the next one), so the tick count grows by far more than 10 a second; `--clock 10MHz` makes it real time.
 
 ## 11. Roadmap
 

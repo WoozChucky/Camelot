@@ -28,6 +28,7 @@
 
 #define MIE_MTIE (1u << IRQ_M_TIMER)
 #define SIE_SSIE (1u << IRQ_S_SOFT)
+#define SIE_SEIE (1u << IRQ_S_EXT)
 #define SIP_SSIP (1u << IRQ_S_SOFT)
 
 /* Exception causes (spec section 6). */

@@ -11,6 +11,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver};
 
 /// Flags shared by every clang invocation: the Excalibur target. No linker
 /// relaxation, since merlin-as and merlin-ld won't do it either.
@@ -45,7 +46,8 @@ pub const C_FLAGS: &[&str] = &[
     "-Iinclude",
 ];
 
-/// Generous step budget for running the kernel (booting takes ~20k steps).
+/// Generous step budget for running the kernel non-interactively (booting
+/// takes ~20k steps, a few shell commands a few thousand more).
 pub const BOOT_MAX_STEPS: u64 = 2_000_000;
 
 /// Next to the committed `kernel/kernel.elf`: the `clang --version` line it
@@ -226,32 +228,47 @@ impl Build {
     }
 }
 
-/// Runs a kernel image on Grail with the UART captured. Returns how it ended
-/// and everything it printed (UART and `xcal.dbg`).
-pub fn run_on_grail(elf: &[u8], max_steps: u64) -> Result<(RunResult, String), String> {
+/// A UART input channel that holds `bytes` and then ends, as if they had all
+/// been typed before the machine started.
+pub fn typed(bytes: &[u8]) -> Receiver<u8> {
+    let (tx, rx) = mpsc::channel();
+    for &b in bytes {
+        tx.send(b).unwrap();
+    }
+    rx
+}
+
+/// Runs a kernel image on Grail with `input` waiting on the UART (commands
+/// for the kernel's shell, which runs until it reads `halt`) and the UART
+/// captured. Returns how it ended and everything it printed (UART and
+/// `xcal.dbg`).
+pub fn run_on_grail(elf: &[u8], input: &[u8], max_steps: u64) -> Result<(RunResult, String), String> {
     let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.cpu.bus.uart.capture = true;
     m.load_elf(elf)?;
+    m.set_uart_input(typed(input));
     let r = m.run(Some(max_steps), |_| {});
     let out = std::mem::take(&mut m.cpu.bus.uart.captured);
     Ok((r, String::from_utf8_lossy(&out).into_owned()))
 }
 
 /// What `cargo xtask kernel --run` does once the image is built: boots `elf` on a
-/// default Grail machine for at most `max_steps` steps, with UART output going to `uart`
-/// and `xcal.dbg` output to `debug`. Returns the result and the machine in its final
-/// state.
+/// default Grail machine for at most `max_steps` steps (`None`: until it halts), with
+/// the UART reading `input` and writing to `uart`, and `xcal.dbg` output going to
+/// `debug`. Returns the result and the machine in its final state.
 pub fn run_with_output(
     elf: &[u8],
-    max_steps: u64,
+    max_steps: Option<u64>,
+    input: Receiver<u8>,
     uart: impl Write + Send + 'static,
     debug: impl Write + Send + 'static,
 ) -> Result<(RunResult, Machine), String> {
     let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.load_elf(elf)?;
+    m.set_uart_input(input);
     m.set_uart_output(uart);
     m.set_debug_output(debug);
-    let r = m.run(Some(max_steps), |_| {});
+    let r = m.run(max_steps, |_| {});
     Ok((r, m))
 }
 

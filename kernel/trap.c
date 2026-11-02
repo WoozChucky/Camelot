@@ -1,11 +1,14 @@
 /* S-mode trap handling: kernel_vec (kernelvec.s) saves the registers and calls
- * kernel_trap(). The only interrupt so far is the timer tick, which arrives as
- * a supervisor software interrupt forwarded by machine_vec. Any exception is a
- * kernel bug: print what happened and stop. */
+ * kernel_trap(). Two interrupts are handled: the timer tick, which arrives as
+ * a supervisor software interrupt forwarded by machine_vec, and the supervisor
+ * external interrupt from the PLIC, so far only the UART's receive line. Any
+ * exception is a kernel bug: print what happened and stop. */
 #include "trap.h"
 #include "kprintf.h"
 #include "machine.h"
+#include "plic.h"
 #include "riscv.h"
+#include "uart.h"
 
 volatile u32 ticks;
 
@@ -97,6 +100,22 @@ static void trap_panic(struct trap_frame *f) {
     halt_after_panic();
 }
 
+/* A supervisor external interrupt: claim the source from the PLIC, service
+ * the device, complete. sip.SEIP follows the PLIC's line, so there is nothing
+ * to clear: once the claim is taken the line drops (unless another source is
+ * waiting, which then traps again after sret). */
+static void external_interrupt(void) {
+    u32 irq = plic_claim();
+    if (irq == PLIC_IRQ_UART) {
+        uart_intr();
+    }
+    /* 0: nothing left to claim. Only enabled sources can be claimed, so any
+     * other number is one the kernel set up. */
+    if (irq != 0) {
+        plic_complete(irq);
+    }
+}
+
 void kernel_trap(struct trap_frame *f) {
     if (f->scause == (CAUSE_INTERRUPT | IRQ_S_SOFT)) {
         /* A timer tick from machine_vec. Clear it first: a tick that arrives
@@ -105,10 +124,15 @@ void kernel_trap(struct trap_frame *f) {
         ticks = ticks + 1;
         return;
     }
+    if (f->scause == (CAUSE_INTERRUPT | IRQ_S_EXT)) {
+        external_interrupt();
+        return;
+    }
     trap_panic(f);
 }
 
 void trap_init(void) {
-    w_sie(r_sie() | SIE_SSIE);
+    plic_init();
+    w_sie(r_sie() | SIE_SSIE | SIE_SEIE);
     w_sstatus(r_sstatus() | SSTATUS_SIE);
 }

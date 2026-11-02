@@ -3,14 +3,27 @@
 #include "clint.h"
 #include "machine.h"
 #include "mmio.h"
+#include "sysinfo.h"
+
+/* The timebase, read once from sysinfo (0 until then). */
+static u32 timebase;
 
 u32 timebase_hz(void) {
-    /* Nominal for now: switch to Grail's sysinfo device once it exists (#31). */
-    return TIMEBASE_HZ_NOMINAL;
+    if (timebase == 0) {
+        u32 hz = 0;
+        if (mmio_read32(SYS_MAGIC) == SYSINFO_MAGIC) {
+            hz = mmio_read32(SYS_TIMEBASE_HZ);
+        }
+        timebase = hz != 0 ? hz : TIMEBASE_HZ_NOMINAL;
+    }
+    return timebase;
 }
 
 u32 timer_interval(void) {
-    return timebase_hz() / TICK_HZ;
+    u32 interval = timebase_hz() / TICK_HZ;
+    /* A timebase below TICK_HZ: tick as often as the timer can rather than
+     * rearming with 0, which would fire continuously. */
+    return interval != 0 ? interval : 1;
 }
 
 void timer_init(void) {

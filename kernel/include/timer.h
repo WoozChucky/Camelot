@@ -6,21 +6,20 @@
 
 #include "types.h"
 
-/* Nominal frequency of mtime (spec section 7). Grail advances mtime once per
- * instruction and doesn't pace execution by default, so this is a convention
- * software agrees on rather than wall-clock time. */
+/* Fallback frequency of mtime, should sysinfo be missing: the nominal clock
+ * Grail reports when it runs at full speed (spec section 7). */
 #define TIMEBASE_HZ_NOMINAL 10000000
 
 /* Timer interrupts per second. */
 #define TICK_HZ 10
 
-/* The mtime frequency the kernel derives every interval from. It is the one
- * place that knows the timebase: once Grail's sysinfo device reports the real
- * frequency (#31), this reads it from there instead of returning the nominal
- * constant. */
+/* The mtime frequency the kernel derives every interval from: SYS_TIMEBASE_HZ
+ * from sysinfo (spec section 9.5), read on the first call (timer_init, in
+ * M-mode) and remembered, or TIMEBASE_HZ_NOMINAL if SYS_MAGIC is wrong. */
 u32 timebase_hz(void);
 
-/* mtime ticks between two timer interrupts: timebase_hz() / TICK_HZ. */
+/* mtime ticks between two timer interrupts: timebase_hz() / TICK_HZ, at
+ * least 1. */
 u32 timer_interval(void);
 
 /* M-mode: arms the first timer interrupt one interval from now and stores the
