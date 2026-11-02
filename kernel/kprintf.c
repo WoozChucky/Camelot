@@ -149,6 +149,11 @@ static void uart_sink(char c, void *ctx) {
  * hold the lock (a panic inside kprintf, say), and the report must get
  * out. */
 int kprintf(const char *fmt, ...) {
+    /* Another hart is printing a panic: this one stops here, so the report
+     * comes out whole. */
+    if (panicking && panic_hart != cpuid()) {
+        panic_freeze();
+    }
     bool locking = !panicking;
     if (locking) {
         acquire(&uart_tx_lock);

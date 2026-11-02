@@ -58,7 +58,10 @@ int map_pages(pagetable_t pt, u32 va, u32 pa, u32 size, u32 perm);
 
 /* Removes the mappings of the `size` bytes at `va`, which must all be mapped
  * (else panic). With `free_pages`, also kfree()s the physical pages. The
- * second-level tables stay; pagetable_free() releases them. */
+ * second-level tables stay; pagetable_free() releases them. In between, a
+ * TLB shootdown (smp.h) makes sure no hart still translates to the pages:
+ * so the caller holds no spinlock, unless no other hart can be using
+ * `pt`. */
 void unmap_pages(pagetable_t pt, u32 va, u32 size, bool free_pages);
 
 /* Frees `pt` and its second-level tables. Every leaf must be unmapped first

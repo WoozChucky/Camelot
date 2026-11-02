@@ -3,6 +3,7 @@
 #include "clint.h"
 #include "machine.h"
 #include "mmio.h"
+#include "spinlock.h"
 #include "sysinfo.h"
 
 /* The timebase, read once from sysinfo (0 until then). */
@@ -27,8 +28,11 @@ u32 timer_interval(void) {
 }
 
 void timer_init(void) {
+    u32 hart = r_tp();
     u32 interval = timer_interval();
-    machine_scratch[MSCRATCH_INTERVAL] = interval;
+    u32 *scratch = &machine_scratch[hart * MSCRATCH_WORDS];
+    scratch[MSCRATCH_INTERVAL] = interval;
+    scratch[MSCRATCH_MTIMECMP] = CLINT_MTIMECMP_LO(hart);
 
     /* Read the 64-bit mtime as two halves: retry if the low word wrapped
      * between the reads. */
@@ -43,7 +47,7 @@ void timer_init(void) {
      * the low one changes, so no intermediate value can be in the past. */
     u32 cmp_lo = lo + interval;
     u32 cmp_hi = hi + (cmp_lo < lo ? 1 : 0);
-    mmio_write32(CLINT_MTIMECMP_HI, 0xffffffffu);
-    mmio_write32(CLINT_MTIMECMP_LO, cmp_lo);
-    mmio_write32(CLINT_MTIMECMP_HI, cmp_hi);
+    mmio_write32(CLINT_MTIMECMP_HI(hart), 0xffffffffu);
+    mmio_write32(CLINT_MTIMECMP_LO(hart), cmp_lo);
+    mmio_write32(CLINT_MTIMECMP_HI(hart), cmp_hi);
 }

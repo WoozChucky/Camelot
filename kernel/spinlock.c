@@ -23,6 +23,10 @@ void cpu_init(void) {
     c->noff = 0;
     c->intena = 0;
     c->hartid = cpuid();
+    c->pagetable = NULL;
+    c->ticks = 0;
+    c->switches = 0;
+    c->idle = false;
 }
 
 /* The message, built here because panic() takes a plain string; it stays

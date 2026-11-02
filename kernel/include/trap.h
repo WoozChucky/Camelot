@@ -36,8 +36,13 @@ extern volatile u32 ticks;
 extern struct spinlock tickslock;
 
 /* Set once the kernel panics: kprintf() stops taking the UART's lock, which
- * the code that panicked may hold. */
+ * the code that panicked may hold. panic_hart is the hart that panicked. */
 extern volatile bool panicking;
+extern volatile u32 panic_hart;
+
+/* Stops this hart for good, with interrupts off: what a hart does when
+ * another one is panicking (kprintf calls it on the others). */
+void panic_freeze(void);
 
 /* S-mode trap vector; start() points stvec at it. */
 void kernel_vec(void);

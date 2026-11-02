@@ -3,10 +3,11 @@
  * traps from U-mode go to user_vec (uservec.s), which saves them in the
  * process's trap frame and calls user_trap().
  *
- * Two interrupts are handled: the timer tick, which arrives as a supervisor
- * software interrupt forwarded by machine_vec, and the supervisor external
- * interrupt from the PLIC: the UART's receive line, the disks' completions and
- * the network card. Either may wake sleeping processes (wakeup only marks them runnable). In the
+ * Two interrupts are handled: the supervisor software interrupt, which
+ * machine_vec raises for each timer tick and for each IPI from another hart
+ * (a TLB shootdown, smp.c), and the supervisor external interrupt from the
+ * PLIC, which goes to hart 0 only: the UART's receive line, the disks'
+ * completions and the network card. Either may wake sleeping processes (wakeup only marks them runnable). In the
  * kernel an exception is a bug, so it panics, unless a memory probe (probe.s)
  * caused it. In U-mode, ecall is a call into the kernel (syscall.c) and any
  * other exception kills the process. */
@@ -21,6 +22,7 @@
 #include "probe.h"
 #include "proc.h"
 #include "riscv.h"
+#include "smp.h"
 #include "syscall.h"
 #include "vm.h"
 
@@ -28,8 +30,10 @@ volatile u32 ticks;
 struct spinlock tickslock;
 
 /* Set while panicking, so a fault inside panic() doesn't recurse, and so
- * kprintf() stops taking the UART's lock. */
+ * kprintf() stops taking the UART's lock; panic_hart is the hart that
+ * panicked. */
 volatile bool panicking;
+volatile u32 panic_hart;
 
 static const char *const exception_names[16] = {
     "instruction address misaligned",
@@ -89,21 +93,36 @@ static void halt_after_panic(void) {
     machine_halt(PANIC_EXIT_CODE);
 }
 
-void panic(const char *msg) {
-    if (panicking) {
-        halt_after_panic();
+/* The start of a panic, on whichever hart: the first hart to get here
+ * reports it; another that panics too meanwhile stops where it is, as do
+ * the others the next time they print (kprintf), so the report comes out
+ * whole; and a panic inside the report halts at once. */
+static void panic_begin(void) {
+    if (atomic_swap((volatile u32 *)&panicking, true)) {
+        if (panic_hart == cpuid()) {
+            halt_after_panic();
+        }
+        panic_freeze();
     }
-    panicking = true;
+    panic_hart = cpuid();
+}
+
+void panic_freeze(void) {
+    intr_off();
+    for (;;) {
+        wfi();
+    }
+}
+
+void panic(const char *msg) {
+    panic_begin();
     kprintf("panic: %s\n", msg);
     halt_after_panic();
 }
 
 /* panic() for a trap: the cause, the trap CSRs and every register. */
 static void trap_panic(struct trap_frame *f) {
-    if (panicking) {
-        halt_after_panic();
-    }
-    panicking = true;
+    panic_begin();
     kprintf("panic: %s\n", trap_cause_name(f->scause));
     kprintf("  scause 0x%08x  sepc 0x%08x  stval 0x%08x  sstatus 0x%08x\n", f->scause, f->sepc, f->stval,
             f->sstatus);
@@ -156,12 +175,16 @@ static bool probe_fixup(struct trap_frame *f) {
     return true;
 }
 
-/* A timer tick from machine_vec. Clear it first: a tick that arrives while
- * this runs sets SSIP again and is taken after sret. Processes in the sleep
- * system call wait on `ticks`, with tickslock. The network's timer comes
- * after, without tickslock: it takes the network's lock. */
+/* A timer tick on this hart. Every hart counts its own (for the harts
+ * system call); hart 0's are the clock: `ticks`, on which processes in the
+ * sleep system call wait (with tickslock), and the network's timer, which
+ * comes after, without tickslock: it takes the network's lock. */
 static void clock_tick(void) {
-    w_sip(r_sip() & ~SIP_SSIP);
+    struct cpu *c = mycpu();
+    c->ticks = c->ticks + 1;
+    if (c->hartid != 0) {
+        return;
+    }
     acquire(&tickslock);
     ticks = ticks + 1;
     wakeup((const void *)&ticks);
@@ -169,9 +192,26 @@ static void clock_tick(void) {
     net_timer();
 }
 
+/* A supervisor software interrupt from machine_vec: a timer tick, an IPI
+ * from another hart, or both, which share the one SSIP bit. Clear it first:
+ * a tick or an IPI that arrives while this runs sets it again and is taken
+ * after sret (and finds nothing to do, if this one did it). Then serve what
+ * other harts asked for, and count a tick if machine_vec marked one in
+ * this hart's scratch block. Returns whether there was a tick. */
+static bool soft_interrupt(void) {
+    w_sip(r_sip() & ~SIP_SSIP);
+    tlb_serve();
+    u32 *scratch = &machine_scratch[cpuid() * MSCRATCH_WORDS];
+    if (atomic_swap(&scratch[MSCRATCH_TICK], 0) == 0) {
+        return false;
+    }
+    clock_tick();
+    return true;
+}
+
 void kernel_trap(struct trap_frame *f) {
     if (f->scause == (CAUSE_INTERRUPT | IRQ_S_SOFT)) {
-        clock_tick();
+        soft_interrupt();
         return;
     }
     if (f->scause == (CAUSE_INTERRUPT | IRQ_S_EXT)) {
@@ -189,9 +229,10 @@ void user_trap(struct trap_frame *f) {
      * cleared sstatus.SIE) until the process is back in U-mode. */
     w_stvec((u32)(uintptr)kernel_vec);
     if (f->scause == (CAUSE_INTERRUPT | IRQ_S_SOFT)) {
-        /* The end of the process's time slice. */
-        clock_tick();
-        yield();
+        /* A tick ends the process's time slice; an IPI alone doesn't. */
+        if (soft_interrupt()) {
+            yield();
+        }
     } else if (f->scause == (CAUSE_INTERRUPT | IRQ_S_EXT)) {
         external_interrupt();
     } else if (f->scause == CAUSE_ECALL_U) {

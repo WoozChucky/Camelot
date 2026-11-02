@@ -111,6 +111,22 @@ static int sys_procs(struct trap_frame *f) {
     return n;
 }
 
+/* harts(buf, max): as procs, with NCPU entries of 16 bytes. */
+static int sys_harts(struct trap_frame *f) {
+    pagetable_t pt = myproc()->pagetable;
+    u32 buf = arg(f, 0);
+    u32 max = arg(f, 1);
+    if (max > USER_TOP / sizeof(struct hartinfo) || !uvm_range_ok(pt, buf, max * sizeof(struct hartinfo), PTE_W)) {
+        return -EFAULT;
+    }
+    struct hartinfo info[NCPU];
+    int n = proc_harts(info, max < NCPU ? (int)max : NCPU);
+    u32 filled = (u32)n < max ? (u32)n : max;
+    /* Checked above. */
+    copyout(pt, buf, info, filled * sizeof(struct hartinfo));
+    return n;
+}
+
 /* Whether call `num` goes into the network stack: netinfo to setsockopt,
  * numbered one after another. They run under net_lock (net.h). */
 static bool is_net_call(u32 num) {
@@ -246,6 +262,9 @@ void syscall(struct trap_frame *f) {
         break;
     case SYS_setsockopt:
         ret = sock_sys_setsockopt(arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3), arg(f, 4));
+        break;
+    case SYS_harts:
+        ret = sys_harts(f);
         break;
     default:
         ret = -ENOSYS;

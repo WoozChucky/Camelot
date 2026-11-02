@@ -13,7 +13,7 @@
     .equ LOCK_CPU, 4
     .equ CPU_NOFF, 4
     .equ CPU_INTENA, 8
-    .equ CPU_SIZE, 72
+    .equ CPU_SIZE, 88
     .equ SSTATUS_SIE, 2
 
     .text

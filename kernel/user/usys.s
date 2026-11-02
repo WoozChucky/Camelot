@@ -45,6 +45,7 @@
     .equ SYS_getsockname, 37
     .equ SYS_getpeername, 38
     .equ SYS_setsockopt, 39
+    .equ SYS_harts, 40
 
     .text
 
@@ -318,6 +319,13 @@ getpeername:
     .globl setsockopt
 setsockopt:
     li    a7, SYS_setsockopt
+    ecall
+    ret
+
+# int harts(struct hartinfo *buf, uint max)
+    .globl harts
+harts:
+    li    a7, SYS_harts
     ecall
     ret
 

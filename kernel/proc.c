@@ -9,6 +9,19 @@
  * thread: in yield() at the end of its time slice (one timer tick) or for
  * the yield system call, in sleep() when it has to wait, or in proc_exit().
  *
+ * Several harts (spec section 10, "Kernel SMP"): every hart runs the same
+ * scheduler loop over the one process table, which is the run queue, rather
+ * than a queue of its own. With 8 slots and at most 8 harts, a search of
+ * the table is a few dozen instructions, so per-hart queues would buy
+ * nothing but the work of balancing them; and with one table a runnable
+ * process is taken by the first hart that looks, so no hart idles while
+ * another has work waiting. A hart with nothing to run waits in wfi; when
+ * a process becomes runnable (new, woken up or killed in its sleep), the
+ * hart that made it so wakes one idle hart for it with an IPI (kick_idle),
+ * rather than leave it waiting for the idle hart's next tick. A process is
+ * RUNNING on at most one hart: the scheduler that picks it marks it so under
+ * proc_lock, and only that hart switches back from it.
+ *
  * Locking (spec section 10, "Kernel locking"): one spinlock, proc_lock,
  * protects the whole process table, as in the x86 xv6 (xv6-riscv has one per
  * process). It is held across every switch between a process and the
@@ -27,8 +40,10 @@
 #include "kalloc.h"
 #include "kprintf.h"
 #include "log.h"
+#include "machine.h"
 #include "memlayout.h"
 #include "riscv.h"
+#include "smp.h"
 #include "spinlock.h"
 #include "string.h"
 
@@ -185,6 +200,27 @@ static struct proc *proc_alloc(int *err) {
     return p;
 }
 
+/* `n` processes have just become runnable: wakes up to `n` of the harts
+ * that wait in the scheduler with nothing to run (not this one, which will
+ * look again itself), with an IPI each. A hart woken for nothing (another
+ * got there first) just waits again. Called with proc_lock held. */
+static void kick_idle(u32 n) {
+    u32 up = harts_running();
+    u32 me = cpuid();
+    u32 kick = 0;
+    for (u32 i = 0; i < NCPU && n > 0; i++) {
+        if (i != me && (up & (1u << i)) != 0 && cpus[i].idle) {
+            /* Woken once: the next process doesn't count on it too. */
+            cpus[i].idle = false;
+            kick |= 1u << i;
+            n--;
+        }
+    }
+    if (kick != 0) {
+        machine_ipi(kick);
+    }
+}
+
 /* Gives a fully set up `p` its pid, name and parent and makes it
  * runnable. */
 static struct proc *proc_ready(struct proc *p, const char *name, struct proc *parent) {
@@ -194,6 +230,7 @@ static struct proc *proc_ready(struct proc *p, const char *name, struct proc *pa
     set_name(p, name);
     p->parent = parent;
     p->state = PROC_RUNNABLE;
+    kick_idle(1);
     release(&proc_lock);
     return p;
 }
@@ -300,7 +337,9 @@ int proc_exec(const struct elf_file *prog, const char *path, const char *name, c
     set_name(p, name);
     release(&proc_lock);
     /* The new table holds the kernel's mappings too: switch to it before
-     * freeing the old one, which satp points at. */
+     * freeing the old one, which satp points at. No other hart uses either
+     * (a process runs on one hart at a time). */
+    mycpu()->pagetable = pt;
     w_satp(MAKE_SATP(pt));
     sfence_vma();
     if (old != NULL) {
@@ -414,10 +453,13 @@ static pagetable_t proc_pagetable(struct proc *p) {
 void scheduler(void) {
     struct cpu *c = mycpu();
     /* proc_create() fills the lowest free slots, so the processes start in
-     * the order they were created. */
-    acquire(&proc_lock);
-    next_slot = 0;
-    release(&proc_lock);
+     * the order they were created. (Only hart 0 starts the loop with
+     * processes to run, kmain's; the others start it once, before any.) */
+    if (c->hartid == 0) {
+        acquire(&proc_lock);
+        next_slot = 0;
+        release(&proc_lock);
+    }
     for (;;) {
         /* Let pending interrupts in (a byte typed on the console, a tick
          * that came while the last process was in the kernel, a disk's
@@ -428,11 +470,19 @@ void scheduler(void) {
         intr_on();
         intr_off();
         acquire(&proc_lock);
+        c->idle = false;
         struct proc *p = pick_next();
         if (p == NULL) {
             bool left = any_process();
+            /* From here to the wfi, a process that becomes runnable gets
+             * this hart an IPI, which ends the wait (or keeps it from
+             * starting: wfi doesn't wait with an interrupt pending). */
+            c->idle = true;
             release(&proc_lock);
-            if (!left) {
+            /* Hart 0 goes back to kmain once every process has ended; the
+             * others stay for good, as there may be processes again. */
+            if (!left && c->hartid == 0) {
+                c->idle = false;
                 break;
             }
             /* Everyone sleeps (or is a zombie its parent will free). Idle
@@ -445,16 +495,19 @@ void scheduler(void) {
         }
         p->state = PROC_RUNNING;
         c->proc = p;
+        c->switches = c->switches + 1;
         /* Its page table holds the kernel's mappings too, so the kernel
          * carries on as before; from the next sret on, U-mode sees the
          * process's memory. */
-        w_satp(MAKE_SATP(proc_pagetable(p)));
+        c->pagetable = proc_pagetable(p);
+        w_satp(MAKE_SATP(c->pagetable));
         sfence_vma();
         /* proc_lock stays held across the switch: the process lets go of
          * it (proc_start, or the end of yield, sleep), and takes it again
          * before it switches back here (sched). */
         swtch(&c->context, &p->context);
         /* Back when it yields, sleeps or exits. */
+        c->pagetable = kernel_pagetable;
         w_satp(MAKE_SATP(kernel_pagetable));
         sfence_vma();
         c->proc = NULL;
@@ -520,10 +573,15 @@ void sleep(const void *chan, struct spinlock *lk) {
 
 /* wakeup(), with proc_lock held. */
 static void wakeup_locked(const void *chan) {
+    u32 woken = 0;
     for (u32 i = 0; i < NPROC; i++) {
         if (procs[i].state == PROC_SLEEPING && procs[i].chan == chan) {
             procs[i].state = PROC_RUNNABLE;
+            woken++;
         }
+    }
+    if (woken != 0) {
+        kick_idle(woken);
     }
 }
 
@@ -608,6 +666,7 @@ int proc_kill_pid(int pid) {
              * an early wakeup is harmless; the long waits check `killed`. */
             if (p->state == PROC_SLEEPING) {
                 p->state = PROC_RUNNABLE;
+                kick_idle(1);
             }
         }
         r = 0;
@@ -660,6 +719,28 @@ int proc_list(struct procinfo *out, int max) {
         n++;
         last = next->pid;
     }
+}
+
+int proc_harts(struct hartinfo *out, int max) {
+    u32 up = harts_running();
+    int n = 0;
+    acquire(&proc_lock);
+    for (u32 i = 0; i < NCPU; i++) {
+        if ((up & (1u << i)) == 0) {
+            continue;
+        }
+        if (n < max) {
+            struct cpu *c = &cpus[i];
+            struct hartinfo *info = &out[n];
+            info->hart = i;
+            info->pid = c->proc != NULL ? c->proc->pid : 0;
+            info->ticks = c->ticks;
+            info->switches = c->switches;
+        }
+        n++;
+    }
+    release(&proc_lock);
+    return n;
 }
 
 int proc_wait(int pid, u32 status) {
