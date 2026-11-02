@@ -135,7 +135,9 @@ void kvminit(void) {
     kvmmap(rodata, data - rodata, PTE_R);
     kvmmap(data, ram_size - (data - ram_base), PTE_R | PTE_W);
 
-    /* Every MMIO range the machine has, whole pages, never executable. */
+    /* Every MMIO range the machine has, whole pages, never executable. The
+     * table doesn't promise that devices are page aligned, so two of them can
+     * share a page: map page by page, skipping pages already mapped. */
     u32 count = sysinfo_device_count();
     for (u32 i = 0; i < count; i++) {
         struct sysinfo_device dev;
@@ -143,9 +145,19 @@ void kvminit(void) {
         if (dev.size == 0) {
             continue;
         }
-        u32 start = PGROUNDDOWN(dev.base);
-        u32 end = PGROUNDUP(dev.base + dev.size);
-        kvmmap(start, end - start, PTE_R | PTE_W);
+        /* Page numbers, so a device ending at 2^32 doesn't wrap. */
+        u32 first = dev.base / PGSIZE;
+        u32 last = (dev.base + (dev.size - 1)) / PGSIZE;
+        for (u32 page = first;; page++) {
+            u32 a = page * PGSIZE;
+            pte_t *pte = walk(kernel_pagetable, a, false);
+            if (pte == NULL || (*pte & PTE_V) == 0) {
+                kvmmap(a, PGSIZE, PTE_R | PTE_W);
+            }
+            if (page == last) {
+                break;
+            }
+        }
     }
 }
 

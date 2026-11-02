@@ -18,7 +18,7 @@ kprintf self-test: 26/26 passed
 [dbg] pc=80000054 a0 = 0x00000000 (0)
 ram: 128 MiB at 0x80000000
 paging: on (Sv32)
-vm self-test: 24/24 passed
+vm self-test: 26/26 passed
 timer: 10 Hz tick, 10000000 Hz timebase
 tick 1
 tick 2
@@ -65,6 +65,10 @@ panic: store page fault
 
 The PTE flags are printed bit 7 to bit 0 (`DAGUXWRV`), `-` where clear.
 
+Values 5 to 11 misuse the memory API instead (a remap, unmapping an
+unmapped page, a W-only mapping, a megapage, `kfree` of a bad page), so the
+tests see each of its checks panic, e.g. `panic: map_pages: remap`.
+
 ## Files
 
 | File | What it does |
@@ -76,12 +80,12 @@ The PTE flags are printed bit 7 to bit 0 (`DAGUXWRV`), `-` where clear.
 | `trap.c` | `kernel_trap()`: counts timer ticks, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `trap_init()`, `panic()` |
 | `kalloc.c` | physical page allocator: `kinit()` reads RAM's base and size from sysinfo and frees every page from `__kernel_end` to the end of RAM; `kalloc()`, `kzalloc()`, `kfree()`, `kfree_pages()` |
 | `vm.c` | Sv32 page tables: `walk()`, `map_pages()`, `unmap_pages()`, `pagetable_create()`/`pagetable_free()`; `kvminit()` builds the kernel page table, `kvminithart()` turns paging on |
-| `vmtest.c` | the memory self-tests: allocate and free every page, a second mapping of one page, store page faults on text and rodata, building and freeing a page table |
+| `vmtest.c` | the memory self-tests: allocate and free every page, `kzalloc()` and `pagetable_create()` clear a reused dirty page, a second mapping of one page, store page faults on text and rodata, building and freeing a page table |
 | `probe.s` | `probe_load()`/`probe_store()`: a word access that returns the trap cause instead of panicking (`kernel_trap` resumes them at `probe_fault`) |
 | `sysinfo.c` | reads Grail's sysinfo block: registers and the device table |
 | `timer.c` | `timebase_hz()` (nominal 10 MHz, the one place to change once Grail reports it), `timer_interval()`, `timer_init()` |
 | `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()` and `wfi()` |
-| `main.c` | `kmain()`: banner, `kprintf` self-test, ten ticks, the optional deliberate fault |
+| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, ten ticks, the optional deliberate fault or memory API misuse |
 | `uart.c` | polling 16550 driver: `uart_putc`/`uart_puts` |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |

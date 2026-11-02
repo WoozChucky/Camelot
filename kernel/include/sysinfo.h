@@ -20,6 +20,8 @@
 #define SYS_DEV_TABLE 0x40
 
 #define SYSINFO_MAGIC 0x53595349 /* "SYSI" */
+/* The layout this kernel knows (SYS_VERSION). */
+#define SYSINFO_VERSION 1
 
 /* Device table entry i: four words at SYS_DEV_TABLE + 16 * i. */
 #define SYS_DEV_ENTRY_SIZE 16
@@ -48,7 +50,8 @@ struct sysinfo_device {
 /* Reads register `off`. */
 u32 sysinfo_read(u32 off);
 
-/* Panics unless the block is present (SYS_MAGIC). */
+/* Panics unless the block is present (SYS_MAGIC) with the layout this kernel
+ * knows (SYS_VERSION). */
 void sysinfo_check(void);
 
 /* Number of entries in the device table. */

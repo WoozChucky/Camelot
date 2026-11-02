@@ -7,6 +7,7 @@ use excalibur::csr::{
 };
 use excalibur::reg;
 use grail::cpu::Mode;
+use grail::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use grail::trap::INTERRUPT_BIT;
 use grail::{Machine, RunResult};
 use std::collections::HashMap;
@@ -24,7 +25,7 @@ kprintf self-test: 26/26 passed
 [dbg] pc=........ a0 = 0x00000000 (0)
 ram: 128 MiB at 0x80000000
 paging: on (Sv32)
-vm self-test: 24/24 passed
+vm self-test: 26/26 passed
 timer: 10 Hz tick, 10000000 Hz timebase
 tick 1
 tick 2
@@ -60,6 +61,13 @@ const BOOT_FAULT_NONE: u32 = 1;
 const BOOT_FAULT_ILLEGAL: u32 = 2;
 const BOOT_FAULT_LOAD: u32 = 3;
 const BOOT_FAULT_STORE_TEXT: u32 = 4;
+const BOOT_FAULT_REMAP: u32 = 5;
+const BOOT_FAULT_UNMAP: u32 = 6;
+const BOOT_FAULT_W_ONLY: u32 = 7;
+const BOOT_FAULT_MEGAPAGE: u32 = 8;
+const BOOT_FAULT_KFREE_UNALIGNED: u32 = 9;
+const BOOT_FAULT_KFREE_KERNEL: u32 = 10;
+const BOOT_FAULT_KFREE_PAST_RAM: u32 = 11;
 /// Where `BOOT_FAULT_LOAD` loads from: below the boot ROM, nothing is mapped.
 const UNMAPPED_ADDR: u32 = 0x100;
 
@@ -69,6 +77,9 @@ const ALIAS_VA: u32 = 0x4000_0000;
 
 /// mcause of a machine call.
 const ECALL_FROM_S: u32 = grail::trap::Exception::EcallS as u32;
+/// scause of a page fault on a load and on a store.
+const LOAD_PAGE_FAULT: u32 = grail::trap::Exception::LoadPageFault as u32;
+const STORE_PAGE_FAULT: u32 = grail::trap::Exception::StorePageFault as u32;
 
 fn kernel_dir() -> PathBuf {
     repo_root().join("kernel")
@@ -369,20 +380,30 @@ fn kmain_runs_in_s_mode_with_traps_delegated() {
 fn ticks_are_one_interval_apart() {
     let (mut m, elf) = load_committed();
     let (machine_vec, kernel_vec) = (sym(&elf, "machine_vec"), sym(&elf, "kernel_vec"));
+    let trap_init = sym(&elf, "trap_init");
+    // Machine ticks before trap_init enables the kernel's tick, and after.
+    let mut early_ticks = 0;
     let mut machine_ticks = Vec::new();
     let mut deadlines = Vec::new();
     let mut kernel_ticks = Vec::new();
-    let mut steps_after_first_tick = 0u64;
+    let mut steps_after_trap_init = None;
     let mut halts = 0;
     let probes = [sym(&elf, "probe_load_insn"), sym(&elf, "probe_store_insn")];
     let mut probe_faults = 0;
     let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
-        if !kernel_ticks.is_empty() {
-            steps_after_first_tick += 1;
+        if cpu.pc == trap_init {
+            steps_after_trap_init = Some(0u64);
+        }
+        if let Some(steps) = &mut steps_after_trap_init {
+            *steps += 1;
         }
         if cpu.pc == machine_vec {
             if cpu.csr.mcause == INTERRUPT_BIT | IRQ_M_TIMER {
-                machine_ticks.push(cpu.bus.clint.mtime);
+                if steps_after_trap_init.is_none() {
+                    early_ticks += 1;
+                } else {
+                    machine_ticks.push(cpu.bus.clint.mtime);
+                }
                 deadlines.push(cpu.bus.clint.mtimecmp);
             } else {
                 // The only other trap to M-mode: the final MCALL_HALT.
@@ -393,7 +414,11 @@ fn ticks_are_one_interval_apart() {
         if cpu.pc == kernel_vec && cpu.csr.scause & INTERRUPT_BIT == 0 {
             // The vm self-test's deliberate page faults, caught by the probes.
             assert!(probes.contains(&cpu.csr.sepc), "{:#x}", cpu.csr.sepc);
-            assert!(matches!(cpu.csr.scause, 13 | 15), "{:#x}", cpu.csr.scause);
+            assert!(
+                [LOAD_PAGE_FAULT, STORE_PAGE_FAULT].contains(&cpu.csr.scause),
+                "{:#x}",
+                cpu.csr.scause
+            );
             probe_faults += 1;
         } else if cpu.pc == kernel_vec {
             assert_eq!(cpu.csr.scause, INTERRUPT_BIT | IRQ_S_SOFT);
@@ -404,27 +429,28 @@ fn ticks_are_one_interval_apart() {
     });
     assert_eq!(r, RunResult::Exited(0));
     assert_eq!(halts, 1);
-    assert_eq!(kernel_ticks.len(), 10);
     // Unmapped load and store, stores to text and rodata.
     assert_eq!(probe_faults, 4);
-    // Setting up memory takes a few intervals before trap_init enables the
-    // tick: those machine ticks pile up in the one SSIP bit, which the kernel
-    // takes as its first tick as soon as trap_init runs.
+    // Setting up memory takes a few intervals, so machine ticks fire before
+    // trap_init. They leave SSIP pending, which trap_init drops: the kernel
+    // then waits ten whole intervals, one machine tick each.
+    assert!(early_ticks > 0, "memory setup took less than one interval");
+    assert_eq!(machine_ticks.len(), 10, "{machine_ticks:?}");
+    assert_eq!(kernel_ticks.len(), 10);
     // The deadlines are exactly one interval apart (machine_vec adds the
-    // interval to mtimecmp, so ticks don't drift); a tick that lands on an
-    // exception being taken is entered a step late.
-    assert!(machine_ticks.len() >= 10, "{machine_ticks:?}");
+    // interval to mtimecmp, so ticks don't drift), and after trap_init every
+    // tick lands in wfi, right on its deadline.
     for w in deadlines.windows(2) {
         assert_eq!(w[1] - w[0], TICK_INTERVAL, "{deadlines:?}");
     }
-    for (t, d) in machine_ticks.iter().zip(&deadlines) {
-        assert!((0..=1).contains(&(t - d)), "{machine_ticks:?}");
+    for w in machine_ticks.windows(2) {
+        assert_eq!(w[1] - w[0], TICK_INTERVAL, "{machine_ticks:?}");
     }
-    // After that, each machine tick reaches the kernel right away, the same
-    // few instructions later every time.
-    let delays: Vec<u64> = kernel_ticks[1..]
+    // Each machine tick reaches the kernel right away, the same few
+    // instructions later every time.
+    let delays: Vec<u64> = kernel_ticks
         .iter()
-        .zip(&machine_ticks[machine_ticks.len() - 9..])
+        .zip(&machine_ticks)
         .map(|(s, m)| s - m)
         .collect();
     assert!(delays.iter().all(|&d| d == delays[0] && d < 100), "{delays:?}");
@@ -432,10 +458,8 @@ fn ticks_are_one_interval_apart() {
     // wfi skips to the next tick: ten intervals of mtime pass in far fewer
     // instructions than one.
     assert!(m.cpu.bus.clint.mtime >= 10 * TICK_INTERVAL);
-    assert!(
-        steps_after_first_tick < TICK_INTERVAL,
-        "{steps_after_first_tick} steps"
-    );
+    let steps = steps_after_trap_init.unwrap();
+    assert!(steps < TICK_INTERVAL, "{steps} steps");
 }
 
 // ---- Interrupts in the middle of kernel code ----
@@ -582,7 +606,7 @@ fn ticks_preempting_kernel_code_change_nothing() {
     assert_eq!(kernel::mask_dbg_pc(&out), BOOT_OUTPUT, "raw output:\n{out}");
     assert_eq!(r, RunResult::Exited(0));
     // Fewer kernel ticks: until trap_init, the machine ticks only pile up in
-    // the one SSIP bit.
+    // the one SSIP bit, which trap_init then drops.
     assert!(
         machine_busy >= 100 && kernel_busy >= 30,
         "only {machine_busy} machine and {kernel_busy} kernel ticks outside the idle loop"
@@ -713,7 +737,7 @@ fn unmapped_load_panics() {
     // (before paging, the bus would have refused it: a load access fault).
     let (cause, v) = parse_panic(&out);
     assert_eq!(cause, "load page fault");
-    assert_eq!(v["scause"], 13);
+    assert_eq!(v["scause"], LOAD_PAGE_FAULT);
     assert_eq!(v["stval"], UNMAPPED_ADDR);
     assert!(
         out.contains(&format!("\n  va {UNMAPPED_ADDR:#010x} is not mapped\n")),
@@ -742,7 +766,7 @@ fn store_to_kernel_text_panics() {
     let kmain = sym(&elf, "kmain");
     let (cause, v) = parse_panic(&out);
     assert_eq!(cause, "store page fault");
-    assert_eq!(v["scause"], 15);
+    assert_eq!(v["scause"], STORE_PAGE_FAULT);
     assert_eq!(v["stval"], kmain);
     // Identity mapped, R+X, accessed (it ran) but never dirty.
     let pte = (kmain >> 12) << 10 | PTE_V | PTE_R | PTE_X | PTE_A;
@@ -763,6 +787,70 @@ fn store_to_kernel_text_panics() {
     assert_eq!(m.cpu.bus.peek(kmain), fresh.cpu.bus.peek(kmain));
 }
 
+/// Runs the kernel with `boot_fault` = `fault`, one of the memory API misuses,
+/// and checks that it panics after the normal boot output, printing `want`.
+fn assert_misuse_panics(fault: u32, want: &str) {
+    let (_, _, r, out) = run_with_fault(fault);
+    assert_eq!(r, RunResult::Exited(PANIC_EXIT), "output:\n{out}");
+    let masked = kernel::mask_dbg_pc(&out);
+    let rest = masked
+        .strip_prefix(BOOT_OUTPUT)
+        .unwrap_or_else(|| panic!("output:\n{out}"));
+    assert_eq!(rest, want);
+}
+
+#[test]
+fn map_pages_panics_on_a_remap() {
+    assert_misuse_panics(
+        BOOT_FAULT_REMAP,
+        "map_pages: 0x80000000 is already mapped\npanic: map_pages: remap\n",
+    );
+}
+
+#[test]
+fn unmap_pages_panics_on_an_unmapped_page() {
+    // Page 0's second-level table exists (the test device is in the same
+    // 4 MiB), so this is the invalid-PTE check, not the missing-table one.
+    assert_misuse_panics(
+        BOOT_FAULT_UNMAP,
+        "unmap_pages: 0x00000000 is not mapped\npanic: unmap_pages: not mapped\n",
+    );
+}
+
+#[test]
+fn map_pages_panics_on_write_without_read() {
+    assert_misuse_panics(BOOT_FAULT_W_ONLY, "panic: map_pages: bad permissions\n");
+}
+
+#[test]
+fn walk_panics_on_a_megapage() {
+    assert_misuse_panics(BOOT_FAULT_MEGAPAGE, "panic: walk: unexpected megapage\n");
+}
+
+#[test]
+fn kfree_panics_on_a_bad_page() {
+    let (_, elf) = load_committed();
+    let text = sym(&elf, "__text_start");
+    let ram_end = text + grail::DEFAULT_RAM_SIZE as u32;
+    for (fault, page) in [
+        (BOOT_FAULT_KFREE_KERNEL, text),
+        (BOOT_FAULT_KFREE_PAST_RAM, ram_end),
+    ] {
+        assert_misuse_panics(fault, &format!("kfree: bad page {page:#010x}\npanic: kfree\n"));
+    }
+    // A free page plus 4: whichever page kalloc handed out.
+    let (_, _, r, out) = run_with_fault(BOOT_FAULT_KFREE_UNALIGNED);
+    assert_eq!(r, RunResult::Exited(PANIC_EXIT), "output:\n{out}");
+    let rest = &out[out.find("kfree: ").unwrap()..];
+    let addr = rest
+        .strip_prefix("kfree: bad page 0x")
+        .and_then(|r| r.strip_suffix("\npanic: kfree\n"))
+        .unwrap_or_else(|| panic!("{rest}"));
+    let addr = u32::from_str_radix(addr, 16).unwrap();
+    assert_eq!(addr % PAGE, 4, "{addr:#x}");
+    assert!(addr > sym(&elf, "__kernel_end") && addr < ram_end, "{addr:#x}");
+}
+
 // ---- Memory: the page allocator and the kernel page table ----
 
 const PAGE: u32 = 4096;
@@ -773,14 +861,25 @@ const PTE_R: u32 = 1 << 1;
 const PTE_W: u32 = 1 << 2;
 const PTE_X: u32 = 1 << 3;
 const PTE_U: u32 = 1 << 4;
+const PTE_G: u32 = 1 << 5;
 const PTE_A: u32 = 1 << 6;
+/// The bits of a PTE the kernel chooses; A and D are Grail's, and RSW (9:8)
+/// is for software, which the kernel doesn't use yet.
+const PTE_KERNEL_BITS: u32 = PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_G;
+const PTE_RSW: u32 = 0x300;
 
-/// Boots the committed kernel on a machine with `ram_mib` MiB of RAM, to the
-/// end. Returns the machine, the ELF and what the kernel printed.
-fn boot_with_ram(ram_mib: usize) -> (Machine, grail::elf::Elf, String) {
+/// Boots the committed kernel on a machine with `ram_mib` MiB of RAM and
+/// `extra_devices` added to its sysinfo device table, to the end. Returns the
+/// machine, the ELF and what the kernel printed.
+fn boot_with_ram(ram_mib: usize, extra_devices: &[DeviceEntry]) -> (Machine, grail::elf::Elf, String) {
     let file = committed_elf();
     let elf = grail::elf::parse(&file).unwrap();
     let mut m = Machine::with_ram(ram_mib << 20);
+    if !extra_devices.is_empty() {
+        let mut devices = grail::bus::device_table(m.config());
+        devices.extend_from_slice(extra_devices);
+        m.cpu.bus.sysinfo = Sysinfo::new(m.config(), devices);
+    }
     m.cpu.bus.uart.capture = true;
     m.load_elf(&file).unwrap();
     let r = m.run(Some(BOOT_MAX_STEPS * 4), |_| {});
@@ -808,6 +907,9 @@ fn page_table(m: &Machine, satp: u32) -> (Vec<(u32, u32)>, u32) {
             continue;
         }
         assert_eq!(pte & (PTE_R | PTE_W | PTE_X), 0, "megapage at root[{i}]");
+        // A pointer to the next level: D, A, U and G are reserved there, and
+        // the kernel sets none of them (nor RSW).
+        assert_eq!(pte & 0x3ff, PTE_V, "root[{i}] = {pte:#x}");
         tables += 1;
         let table = (pte >> 10) * PAGE;
         for j in 0..1024u32 {
@@ -821,13 +923,13 @@ fn page_table(m: &Machine, satp: u32) -> (Vec<(u32, u32)>, u32) {
     (leaves, tables)
 }
 
-/// Checks the kernel page table after a boot with `ram_mib` MiB of RAM, and
-/// the free page count.
-fn check_kernel_memory(ram_mib: usize) {
-    let (m, elf, out) = boot_with_ram(ram_mib);
+/// Checks the kernel page table after a boot with `ram_mib` MiB of RAM and
+/// `extra_devices` (see `boot_with_ram`), and the free page count.
+fn check_kernel_memory(ram_mib: usize, extra_devices: &[DeviceEntry]) {
+    let (m, elf, out) = boot_with_ram(ram_mib, extra_devices);
     assert!(
         out.contains(&format!(
-            "ram: {ram_mib} MiB at 0x80000000\npaging: on (Sv32)\nvm self-test: 24/24 passed\n"
+            "ram: {ram_mib} MiB at 0x80000000\npaging: on (Sv32)\nvm self-test: 26/26 passed\n"
         )),
         "{out}"
     );
@@ -838,11 +940,15 @@ fn check_kernel_memory(ram_mib: usize) {
     let root = (satp & 0x3f_ffff) * PAGE;
     assert!(root >= kernel_end && u64::from(root) < ram_end, "root {root:#x}");
 
-    // What the kernel should map, identity, page by page.
+    // What the kernel should map, identity, page by page: the PTE bits the
+    // kernel sets (no U, no G).
     let mut want = std::collections::BTreeMap::new();
     let mut map = |start: u64, end: u64, perm: u32| {
         for page in (start..end).step_by(PAGE as usize) {
-            assert!(want.insert(page as u32, perm).is_none(), "{page:#x} twice");
+            assert!(
+                want.insert(page as u32, perm | PTE_V).is_none(),
+                "{page:#x} twice"
+            );
         }
     };
     let (text, rodata, data) = (
@@ -853,19 +959,25 @@ fn check_kernel_memory(ram_mib: usize) {
     map(text.into(), rodata.into(), PTE_R | PTE_X);
     map(rodata.into(), data.into(), PTE_R);
     map(data.into(), ram_end, PTE_R | PTE_W);
-    // Every device in the sysinfo table, whole pages.
-    for dev in grail::bus::device_table(m.config()) {
+    // Every device in the sysinfo table, whole pages. Devices may share a
+    // page with each other, but not with RAM.
+    let ram_pages = want.len();
+    for dev in m.cpu.bus.sysinfo.devices() {
         let start = u64::from(dev.base) & !u64::from(PAGE - 1);
         let end = (u64::from(dev.base) + u64::from(dev.size)).next_multiple_of(PAGE.into());
-        map(start, end, PTE_R | PTE_W);
+        for page in (start..end).step_by(PAGE as usize) {
+            assert!(page < u64::from(text), "device page {page:#x} in RAM");
+            want.insert(page as u32, PTE_R | PTE_W | PTE_V);
+        }
     }
+    assert!(want.len() > ram_pages);
 
     let (leaves, tables) = page_table(&m, satp);
     let mut got = std::collections::BTreeMap::new();
     for &(va, pte) in &leaves {
         assert_eq!((pte >> 10) * PAGE, va, "{va:#x} not identity mapped");
-        assert_eq!(pte & PTE_U, 0, "{va:#x} is a user page");
-        got.insert(va, pte & (PTE_R | PTE_W | PTE_X));
+        assert_eq!(pte & PTE_RSW, 0, "{va:#x}: {pte:#x}");
+        got.insert(va, pte & PTE_KERNEL_BITS);
     }
     // Compared as a whole only after spotting the first difference, since the
     // maps have tens of thousands of entries.
@@ -889,7 +1001,37 @@ fn check_kernel_memory(ram_mib: usize) {
 
 #[test]
 fn kernel_page_table_maps_kernel_ram_and_devices() {
-    check_kernel_memory(128);
+    check_kernel_memory(128, &[]);
+}
+
+#[test]
+fn devices_may_share_a_page() {
+    // The sysinfo table doesn't promise page-aligned devices (the UART is 256
+    // bytes), so the kernel must map a page two devices share only once.
+    // These extra devices only need mapping: the kernel never touches them.
+    let dev = |kind, base, size| DeviceEntry {
+        kind,
+        base,
+        size,
+        irq: 0,
+    };
+    check_kernel_memory(
+        128,
+        &[
+            // A second UART in the first one's page.
+            dev(
+                DeviceType::Uart,
+                grail::bus::UART_BASE + 0x100,
+                grail::bus::UART_SIZE,
+            ),
+            // Straddling the keyboard's page and the sysinfo block's.
+            dev(DeviceType::Keyboard, grail::bus::SYSINFO_BASE - 0x80, 0x100),
+            // Straddling two pages nothing else uses (the reserved virtio
+            // range), one of them a page a later entry shares.
+            dev(DeviceType::TestFinisher, 0x1000_1800, 0x1000),
+            dev(DeviceType::TestFinisher, 0x1000_2400, 0x10),
+        ],
+    );
 }
 
 #[test]
@@ -897,14 +1039,14 @@ fn allocator_follows_the_ram_size() {
     // RAM comes from sysinfo: the smallest machine, and one whose RAM ends
     // inside a 4 MiB region.
     for mib in [1, 6] {
-        check_kernel_memory(mib);
+        check_kernel_memory(mib, &[]);
     }
 }
 
 #[test]
 fn allocator_handles_ram_up_to_the_top_of_the_address_space() {
     // The largest machine: RAM ends at 2^32, which wraps to 0 in a u32.
-    check_kernel_memory(2048);
+    check_kernel_memory(2048, &[]);
 }
 
 #[test]

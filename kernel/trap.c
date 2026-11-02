@@ -138,6 +138,10 @@ void kernel_trap(struct trap_frame *f) {
 }
 
 void trap_init(void) {
+    /* Machine ticks that fired while the kernel set itself up left SSIP
+     * pending: drop that one, so the first tick taken is a whole interval
+     * after it arrives rather than straight away. */
+    w_sip(r_sip() & ~SIP_SSIP);
     w_sie(r_sie() | SIE_SSIE);
     w_sstatus(r_sstatus() | SSTATUS_SIE);
 }

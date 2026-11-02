@@ -26,7 +26,7 @@ const BOOT_FAULT_STORE_TEXT: u32 = 4;
 
 /// What the kernel prints once paging is on (kernel/main.c, kernel/vmtest.c).
 fn memory_lines(ram_mib: u32) -> String {
-    format!("ram: {ram_mib} MiB at 0x80000000\npaging: on (Sv32)\nvm self-test: 24/24 passed\n")
+    format!("ram: {ram_mib} MiB at 0x80000000\npaging: on (Sv32)\nvm self-test: 26/26 passed\n")
 }
 
 fn kernel_elf() -> PathBuf {

@@ -64,6 +64,43 @@ static void test_alloc_all(void) {
     check(chain == NULL && kfree_pages() == before, "kfree takes every page back");
 }
 
+/* Fills a page with all ones (every word a valid-looking PTE) and frees it,
+ * so it is the next page kalloc hands out. */
+static u32 *dirty_page(void) {
+    u32 *p = kalloc();
+    if (p != NULL) {
+        for (u32 i = 0; i < PGSIZE / 4; i++) {
+            p[i] = 0xffffffffu;
+        }
+        kfree(p);
+    }
+    return p;
+}
+
+static bool is_zero_page(const u32 *p) {
+    for (u32 i = 0; i < PGSIZE / 4; i++) {
+        if (p[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* kzalloc and pagetable_create (which walk uses for second-level tables)
+ * clear a page that was dirty when freed. RAM starts out zero on Grail, so
+ * only a reused page shows whether they do. */
+static void test_zeroing(void) {
+    u32 *dirty = dirty_page();
+    u32 *p = kzalloc();
+    check(p != NULL && p == dirty && is_zero_page(p), "kzalloc clears a dirty page");
+    kfree(p);
+
+    dirty = dirty_page();
+    pagetable_t pt = pagetable_create();
+    check(pt != NULL && pt == dirty && is_zero_page(pt), "pagetable_create clears a dirty page");
+    kfree(pt);
+}
+
 /* Maps a page a second time, at ALIAS_VA, and writes through each address. */
 static void test_alias(void) {
     volatile u32 *page = kalloc();
@@ -153,6 +190,7 @@ static void test_pagetable(void) {
 
 int vm_selftest(void) {
     test_alloc_all();
+    test_zeroing();
     test_alias();
     test_protection();
     test_pagetable();

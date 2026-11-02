@@ -25,8 +25,11 @@ void kinit(void) {
     ram_size = sysinfo_read(SYS_RAM_SIZE);
     u32 start = (u32)(uintptr)__text_start;
     u32 end = (u32)(uintptr)__kernel_end;
-    if (start != ram_base || ram_size % PGSIZE != 0) {
+    if (start != ram_base) {
         panic("kinit: the kernel is not at the start of RAM");
+    }
+    if (ram_size % PGSIZE != 0) {
+        panic("kinit: the RAM size is not a whole number of pages");
     }
     if (end - ram_base > ram_size) {
         panic("kinit: the kernel is larger than RAM");

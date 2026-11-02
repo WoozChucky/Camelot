@@ -12,6 +12,9 @@ void sysinfo_check(void) {
     if (sysinfo_read(SYS_MAGIC) != SYSINFO_MAGIC) {
         panic("no sysinfo block at 0x30002000");
     }
+    if (sysinfo_read(SYS_VERSION) != SYSINFO_VERSION) {
+        panic("sysinfo: unknown layout version");
+    }
 }
 
 u32 sysinfo_device_count(void) {
