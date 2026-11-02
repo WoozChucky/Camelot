@@ -310,10 +310,10 @@ The console is the VM's UART (Excalibur spec section 7).
 | Message | Payload | Notes |
 |---|---|---|
 | `ConsoleAttach` | `vm: VmRef` | |
-| `ConsoleAttached` | `vm: u32`, `scrollback: bytes` | the VM's id and its recent output (Avalon keeps a ring buffer per VM); `ConsoleOutput` events follow, starting right after the scrollback |
+| `ConsoleAttached` | `vm: u32`, `scrollback: bytes` | the VM's id and its recent output (Avalon keeps a ring buffer of the last 64 KiB per VM); `ConsoleOutput` events follow, starting right after the scrollback. Attaching again resends the scrollback; the stream is not doubled |
 | `ConsoleInput` | `vm: u32`, `data: bytes` | bytes for the UART's receiver |
 | `ConsoleOutput` | `vm: u32`, `data: bytes` | bytes the VM wrote to its UART |
-| `ConsoleDetach` | `vm: u32` | the VM keeps running |
+| `ConsoleDetach` | `vm: u32` | the VM keeps running. Errors: `NoSuchVm`, `InvalidState` (this connection is not attached to it) |
 
 Several clients may attach to one VM's console: all of them get the output, and input from any of them reaches the UART, in the order the server receives it. One connection may attach to several VMs; the `vm` field says which stream a frame belongs to.
 
@@ -377,4 +377,4 @@ Concurrency: an image has at most one writer at a time, and a writer excludes re
 | default Avalon address | `127.0.0.1:7400` | |
 | default Lake address | `127.0.0.1:7401` | |
 
-Servers may set lower limits of their own (a RAM budget, a maximum image size) and answer with `OverBudget`.
+Servers may set lower limits of their own (a RAM budget, a maximum image size) and answer with `OverBudget`. A server may also close the connection of a client that does not read what is sent to it, rather than hold unbounded output for it: Avalon does once 8 MiB of output (events and replies) are waiting for one client.

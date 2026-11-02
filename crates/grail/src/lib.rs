@@ -114,15 +114,15 @@ impl Machine {
         self.cpu.bus.debug = Some(Box::new(output));
     }
 
-    /// Loads an ELF image into RAM and points the boot ROM at its entry.
+    /// Loads an ELF image into RAM and points the boot ROM at its entry. A segment that
+    /// does not fit in RAM is an error, found before anything is allocated for it, so an
+    /// image from an untrusted source (a remote client) cannot make the host allocate
+    /// more than its size.
     pub fn load_elf(&mut self, file: &[u8]) -> Result<(), String> {
         let elf = elf::parse(file).map_err(|e| e.to_string())?;
         let bus = &mut self.cpu.bus;
         for seg in &elf.segments {
-            bus.load(seg.paddr, &seg.data)
-                .map_err(|_| format!("segment at {:#x} is outside RAM", seg.paddr))?;
-            let zeros = vec![0; (seg.mem_size as usize).saturating_sub(seg.data.len())];
-            bus.load(seg.paddr + seg.data.len() as u32, &zeros)
+            bus.load_zeroed(seg.paddr, &seg.data, seg.mem_size)
                 .map_err(|_| format!("segment at {:#x} is outside RAM", seg.paddr))?;
         }
         bus.tohost = elf.symbol("tohost");
