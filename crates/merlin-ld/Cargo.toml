@@ -8,6 +8,11 @@ license.workspace = true
 [lib]
 name = "merlin_ld"
 
+[dependencies]
+elf32 = { path = "../elf32" }
+
 [dev-dependencies]
+excalibur = { path = "../excalibur" }
 grail = { path = "../grail" }
 merlin-as = { path = "../merlin-as" }
+merlin-objdump = { path = "../merlin-objdump" }

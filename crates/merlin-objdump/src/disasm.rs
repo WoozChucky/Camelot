@@ -181,6 +181,18 @@ struct InlineReloc {
     text: String,
 }
 
+/// How many leading zero bytes of `bytes` llvm-objdump folds into `...`: none
+/// unless there are at least 8, and then a multiple of 4, so an instruction
+/// starting with a zero byte is not cut.
+fn skippable_zeros(bytes: &[u8]) -> usize {
+    let n = bytes.iter().take_while(|&&b| b == 0).count();
+    if n < 8 {
+        0
+    } else {
+        n & !3
+    }
+}
+
 pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result<(), Error> {
     let syntax = Syntax {
         aliases: opts.aliases,
@@ -259,6 +271,19 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
             let mut pc = start;
             while pc < region_end {
                 let off = (pc - sec_start) as usize;
+                // Like llvm-objdump (without -z), a run of zero bytes inside
+                // this region and before the next shown relocation is
+                // printed as `...` instead of one line per word.
+                let limit = relocs
+                    .peek()
+                    .map_or(region_end, |r| region_end.min(sec_start + r.offset as u64));
+                let span = data.get(off..(limit.max(pc) - sec_start) as usize).unwrap_or(&[]);
+                let skip = skippable_zeros(span);
+                if skip > 0 {
+                    out.push_str("\t\t...\n");
+                    pc += skip as u64;
+                    continue;
+                }
                 // Like llvm-objdump, a word is decoded whenever the section
                 // has 4 bytes left, even if it runs past the next label.
                 let size = if end - pc >= 4 { 4 } else { 1 };
