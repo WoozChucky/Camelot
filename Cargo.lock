@@ -146,6 +146,8 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "avalon-client",
+ "avalon-proto",
  "camelot-fs",
  "elf32",
  "excalibur",
@@ -154,4 +156,5 @@ dependencies = [
  "merlin-as",
  "merlin-ld",
  "merlin-objdump",
+ "round-table",
 ]

@@ -7,6 +7,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# `cargo xtask up --demo` creates the demo's switch, disk and VM.
+avalon-client = { path = "../avalon-client" }
+avalon-proto = { path = "../avalon-proto" }
 camelot-fs = { path = "../camelot-fs" }
 grail = { path = "../grail" }
 merlin = { path = "../merlin" }
@@ -19,3 +22,5 @@ excalibur = { path = "../excalibur" }
 # tests/examples.rs compares our executables with ld.lld's and our disassembly with
 # llvm-objdump's committed text.
 merlin-objdump = { path = "../merlin-objdump" }
+# tests/up.rs checks the README's quick start commands against Round Table's parser.
+round-table = { path = "../round-table" }
