@@ -148,7 +148,8 @@ impl Bus {
 
     fn ram_range(&self, addr: u32, size: u32) -> Option<usize> {
         let off = addr.wrapping_sub(RAM_BASE) as usize;
-        (addr >= RAM_BASE && off + size as usize <= self.ram.len()).then_some(off)
+        let end = off.checked_add(size as usize)?;
+        (addr >= RAM_BASE && end <= self.ram.len()).then_some(off)
     }
 
     fn vram_range(addr: u32, size: u32) -> Option<usize> {
@@ -270,8 +271,18 @@ impl Bus {
 
     /// Copies bytes into physical memory (used by the loader).
     pub fn load(&mut self, addr: u32, data: &[u8]) -> Result<(), BusFault> {
-        let off = self.ram_range(addr, data.len() as u32).ok_or(BusFault)?;
-        self.ram[off..off + data.len()].copy_from_slice(data);
+        self.load_zeroed(addr, data, 0)
+    }
+
+    /// Copies `data` to `addr` and zeroes the bytes after it up to `size` in all (a
+    /// loadable segment and its .bss). Fails, changing nothing, unless the whole range
+    /// is RAM.
+    pub fn load_zeroed(&mut self, addr: u32, data: &[u8], size: u32) -> Result<(), BusFault> {
+        let size = size.max(u32::try_from(data.len()).map_err(|_| BusFault)?);
+        let off = self.ram_range(addr, size).ok_or(BusFault)?;
+        let (head, tail) = self.ram[off..off + size as usize].split_at_mut(data.len());
+        head.copy_from_slice(data);
+        tail.fill(0);
         Ok(())
     }
 }
@@ -285,6 +296,23 @@ mod tests {
 
     fn small_bus() -> Bus {
         Bus::new(&MachineConfig::with_ram(4096), Vec::new())
+    }
+
+    #[test]
+    fn load_zeroed_checks_the_whole_range_first() {
+        let mut bus = small_bus();
+        bus.ram.fill(0xaa);
+        bus.load_zeroed(RAM_BASE + 8, &[1, 2], 6).unwrap();
+        assert_eq!(&bus.ram[6..16], &[0xaa, 0xaa, 1, 2, 0, 0, 0, 0, 0xaa, 0xaa]);
+        // Past the end of RAM, by data or by size: refused, nothing written.
+        assert_eq!(bus.load_zeroed(RAM_BASE + 4094, &[3, 3, 3], 0), Err(BusFault));
+        assert_eq!(bus.load_zeroed(RAM_BASE, &[3], u32::MAX), Err(BusFault));
+        assert_eq!(bus.load_zeroed(RAM_BASE + 4000, &[], 0x8000_0000), Err(BusFault));
+        assert_eq!(bus.load_zeroed(RAM_BASE - 4, &[3], 8), Err(BusFault));
+        assert_eq!(bus.ram[0], 0xaa);
+        assert_eq!(bus.ram[4094], 0xaa);
+        bus.load(RAM_BASE + 4095, &[9]).unwrap();
+        assert_eq!(bus.ram[4095], 9);
     }
 
     #[test]
