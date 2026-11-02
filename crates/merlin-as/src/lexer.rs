@@ -180,7 +180,24 @@ fn lex_quoted(s: &[u8], mut i: usize, quote: u8, line: usize) -> Result<(Vec<u8>
                     b'n' => b'\n',
                     b't' => b'\t',
                     b'r' => b'\r',
-                    b'0' => 0,
+                    // Octal, one to three digits, as GNU as and llvm-mc read
+                    // them: `\0`, `\12`, `\377` (what clang writes for bytes
+                    // that aren't printable). A value above 0o377 is no byte.
+                    b'0'..=b'7' => {
+                        let mut value = u32::from(e - b'0');
+                        let mut digits = 1;
+                        while digits < 3 {
+                            match s.get(i) {
+                                Some(&d @ b'0'..=b'7') => {
+                                    value = value * 8 + u32::from(d - b'0');
+                                    digits += 1;
+                                    i += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        u8::try_from(value).map_err(|_| Error::new(line, "octal escape out of range"))?
+                    }
                     b'\\' => b'\\',
                     b'"' => b'"',
                     b'\'' => b'\'',
@@ -246,5 +263,17 @@ mod tests {
     #[test]
     fn strings() {
         assert_eq!(toks(r#".asciz "hi\n\x41""#)[1], Tok::Str(b"hi\nA".to_vec()));
+    }
+
+    #[test]
+    fn octal_escapes() {
+        // One to three digits; an 8 or 9, or a fourth digit, is not part of it.
+        // This is how clang writes bytes it can't print (`"\377"`).
+        assert_eq!(
+            toks(r#".ascii "\0\12\377a\2008\1234""#)[1],
+            Tok::Str(vec![0, 0o12, 0o377, b'a', 0o200, b'8', 0o123, b'4'])
+        );
+        let err = lex(r#".ascii "\400""#).unwrap_err();
+        assert!(err.to_string().contains("octal escape out of range"), "{err}");
     }
 }
