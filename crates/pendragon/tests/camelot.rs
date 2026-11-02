@@ -193,6 +193,67 @@ fn the_new_vm_form_offers_camelot() {
         &"if (!request.camelot && file) {"
     );
     let css = request(platform.pendragon.addr(), "GET", "/style.css", &[], b"").text();
-    assert!(css.contains("fieldset.boot"));
+    assert!(css.contains("fieldset.boot") && css.contains("label[hidden] { display: none; }"));
+    platform.stop();
+}
+
+/// A Camelot VM is a change like any other: another site's page, a request without
+/// the token, a form body or a foreign `Host` is refused before anything is copied.
+#[test]
+fn camelot_creates_are_guarded() {
+    let platform = Platform::start("camelot-guard", 64);
+    std::fs::write(platform.dir.path().join("camelot"), spinning_image(16)).unwrap();
+    let api = platform.api();
+    let addr = api.addr;
+    let token = ("X-Pendragon-Token", api.token.as_str());
+    let json = ("Content-Type", "application/json");
+    let own = format!("http://{addr}");
+    let body = br#"{"name": "web", "camelot": true}"#;
+    for (headers, why) in [
+        (
+            vec![token, json, ("Origin", "http://evil.example")],
+            "foreign origin",
+        ),
+        (vec![json, ("Origin", own.as_str())], "no token"),
+        (
+            vec![("X-Pendragon-Token", "00"), json, ("Origin", own.as_str())],
+            "wrong token",
+        ),
+        (
+            vec![
+                token,
+                ("Content-Type", "application/x-www-form-urlencoded"),
+                ("Origin", own.as_str()),
+            ],
+            "form body",
+        ),
+    ] {
+        let r = request(addr, "POST", "/api/vms", &headers, body);
+        assert_eq!(r.status, 403, "{why}: {}", r.text());
+    }
+    let head = format!(
+        "POST /api/vms HTTP/1.1\r\nHost: evil.example\r\nX-Pendragon-Token: {}\r\nContent-Type: \
+         application/json\r\nContent-Length: {}\r\n\r\n",
+        api.token,
+        body.len()
+    );
+    let r = parse_reply(&raw(addr, &[head.as_bytes(), body].concat()));
+    assert_eq!(r.status, 403, "{}", r.text());
+    // Nothing was copied, and no VM made.
+    assert!(!platform.dir.path().join("web-root").exists());
+    assert!(list(&api.expect(200, api.get("vms")), "vms").is_empty());
+    // From Pendragon's own page it goes through.
+    let r = api.expect(
+        201,
+        api.post(
+            "vms",
+            &obj([
+                ("name", "web".into()),
+                ("camelot", true.into()),
+                ("ram", "8".into()),
+            ]),
+        ),
+    );
+    assert_eq!(s(&r, "disk"), "web-root");
     platform.stop();
 }

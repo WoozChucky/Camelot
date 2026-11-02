@@ -151,6 +151,8 @@ form.panel, .panel {
 label { display: block; margin: 8px 0; }
 label > span { display: inline-block; min-width: 110px; color: var(--muted); }
 label.inline { display: inline-block; margin-right: 16px; }
+/* `label` is display: block, which would beat the browser's own rule for hidden. */
+label[hidden] { display: none; }
 fieldset.boot { border: none; padding: 0; margin: 8px 0; }
 fieldset.boot legend { float: left; min-width: 110px; padding: 0; color: var(--muted); }
 fieldset.boot .muted { margin-right: 16px; }

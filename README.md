@@ -389,9 +389,9 @@ devices  9
   fb-vram   0x31000000 + 0x0012c000
 ```
 
-The life cycle is `start`, `pause`, `resume`, `stop` and `destroy`, each taking a VM's id or its name (`round-table pause echo`, `round-table destroy 2`). `create` takes `--name` (required), `--ram MiB`, `--clock FREQ` and `--harts N` with exactly the syntax of `grail --ram`, `--clock` and `--harts` (the same parsers), `--disk SRC` and `--disk-ro SRC` (an image file on Avalon's host, or `lake://ADDR/NAME` for an image on a Lake server; repeat for more disks), and `--start`. `--server ADDR` picks the Avalon for the VM commands (default `127.0.0.1:7400`; a host alone means port 7400). `round-table --help` lists everything.
+The life cycle is `start`, `pause`, `resume`, `stop` and `destroy`, each taking a VM's id or its name (`round-table pause echo`, `round-table destroy 2`). `create` takes `--name` (required), `--ram MiB`, `--clock FREQ` and `--harts N` with exactly the syntax of `grail --ram`, `--clock` and `--harts` (the same parsers), `--disk SRC` and `--disk-ro SRC` (an image file on Avalon's host, or `lake://ADDR/NAME` for an image on a Lake server; repeat for more disks), `--start`, and `--camelot` instead of a program (below). `--server ADDR` picks the Avalon for the VM commands (default `127.0.0.1:7400`; a host alone means port 7400). `round-table --help` lists everything.
 
-The disk commands talk to Lake (`--lake ADDR`, default `127.0.0.1:7401`; the VM commands do not take it, nor do the disk commands take `--server`):
+The disk commands talk to Lake (`--lake ADDR`, default `127.0.0.1:7401`; the VM commands do not take it, but for `create --camelot` below, nor do the disk commands take `--server`):
 
 ```
 round-table disk create data --size 64MiB
