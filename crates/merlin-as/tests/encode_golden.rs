@@ -1,14 +1,6 @@
 //! Compares the encoder against llvm-mc, line by line (tests/golden/encode.golden,
-//! regenerate with scripts/gen-encode-golden.sh).
-//!
-//! `encode_golden_progress` passes as long as nothing implemented is wrong, and
-//! prints how far along the encoder is. `encode_golden_complete` (ignored by
-//! default) additionally requires every line to be implemented:
-//!
-//!     cargo test -p merlin-as --test encode_golden -- --nocapture
-//!     cargo test -p merlin-as --test encode_golden -- --ignored
-
-use merlin_as::encode::UNIMPLEMENTED;
+//! regenerate with scripts/gen-encode-golden.sh). Each line is assembled on
+//! its own, so every label is an undefined symbol and stays a relocation.
 
 struct Case {
     src: String,
@@ -40,18 +32,9 @@ fn cases() -> Vec<Case> {
         .collect()
 }
 
-enum Outcome {
-    Pass,
-    Unimplemented,
-    Fail(String),
-}
-
-fn check(case: &Case) -> Outcome {
-    let obj = match merlin_as::assemble(&case.src) {
-        Ok(o) => o,
-        Err(errs) if errs.iter().all(|e| e.msg.starts_with(UNIMPLEMENTED)) => return Outcome::Unimplemented,
-        Err(errs) => return Outcome::Fail(format!("error: {}", errs[0].msg)),
-    };
+/// Why a line differs from llvm-mc, if it does.
+fn check(case: &Case) -> Result<(), String> {
+    let obj = merlin_as::assemble(&case.src).map_err(|errs| format!("error: {}", errs[0].msg))?;
     let text = &obj.sections[0];
     let words: Vec<u32> = text
         .data
@@ -77,60 +60,31 @@ fn check(case: &Case) -> Outcome {
         .collect();
     let fmt = |w: &[u32]| w.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(" ");
     if words != case.words {
-        return Outcome::Fail(format!(
+        return Err(format!(
             "words: got [{}], want [{}]",
             fmt(&words),
             fmt(&case.words)
         ));
     }
     if relocs != case.relocs {
-        return Outcome::Fail(format!("relocs: got {relocs:?}, want {:?}", case.relocs));
+        return Err(format!("relocs: got {relocs:?}, want {:?}", case.relocs));
     }
-    Outcome::Pass
+    Ok(())
 }
 
-fn run(require_all: bool) {
+#[test]
+fn encode_golden() {
     let cases = cases();
-    let (mut pass, mut todo, mut fails) = (0, Vec::new(), Vec::new());
-    for c in &cases {
-        match check(c) {
-            Outcome::Pass => pass += 1,
-            Outcome::Unimplemented => todo.push(c.src.clone()),
-            Outcome::Fail(why) => fails.push(format!("  {:<28} {why}", c.src)),
-        }
-    }
-    println!(
-        "encoder: {pass}/{} lines match llvm-mc, {} not implemented yet",
-        cases.len(),
-        todo.len()
-    );
-    if !todo.is_empty() {
-        let mut mnemonics: Vec<&str> = todo
-            .iter()
-            .map(|s| s.split_whitespace().next().unwrap())
-            .collect();
-        mnemonics.sort();
-        mnemonics.dedup();
-        println!("still to do: {}", mnemonics.join(" "));
-    }
+    assert_eq!(cases.len(), 118);
+    let fails: Vec<String> = cases
+        .iter()
+        .filter_map(|c| check(c).err().map(|why| format!("  {:<28} {why}", c.src)))
+        .collect();
     assert!(
         fails.is_empty(),
-        "{} lines encode differently from llvm-mc:\n{}",
+        "{} of {} lines encode differently from llvm-mc:\n{}",
         fails.len(),
+        cases.len(),
         fails.join("\n")
     );
-    if require_all {
-        assert!(todo.is_empty(), "{} lines not implemented yet", todo.len());
-    }
-}
-
-#[test]
-fn encode_golden_progress() {
-    run(false);
-}
-
-#[test]
-#[ignore = "passes once the encoder is complete"]
-fn encode_golden_complete() {
-    run(true);
 }

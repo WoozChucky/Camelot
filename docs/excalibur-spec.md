@@ -305,7 +305,7 @@ Everything that runs on the host is written by us, with no third-party libraries
 
 | Tool | Input → output | Notes |
 |---|---|---|
-| Assembler (`merlin-as`) | `.s` → `.o` | Full RV32I(+M) mnemonics, standard pseudo-instructions (`li`, `la`, `call`, `ret`, `mv`, `j`, `beqz`...), directives (`.text .data .bss .section .globl .word .byte .ascii .align .equ`), `%hi/%lo/%pcrel_hi/%pcrel_lo` |
+| Assembler (`merlin-as`) | `.s` → `.o` | Full RV32I(+M, Zicsr, Zifencei, privileged, Xcal) mnemonics, standard pseudo-instructions (`li`, `la`, `call`, `ret`, `mv`, `j`, `beqz`...), `.insn`, directives (`.text .data .bss .section .globl .word .byte .ascii .align .equ`), `%hi/%lo/%pcrel_hi/%pcrel_lo`. See "Assembler" below |
 | Linker (`merlin-ld`) | `.o` files → executable | Symbol resolution, relocation, section merging, simple linker script (or fixed layout: `.text` at 0x8000_0000) |
 | Emulator (`grail`) | executable → runs it | Loads ELF directly, no boot loader needed early on |
 | Disassembler (`merlin-objdump`) | `.o`/exe → text | Shares the decoder with the emulator; essential for debugging |
@@ -338,6 +338,23 @@ Test programs live in `crates/merlin/tests/cases/*.c`, each starting with `// ex
 Why ELF rather than a custom format: it costs little more to write, and it means clang/lld, `llvm-objdump` and `llvm-readelf` can check our output and produce reference files, and riscv-tests ELFs load directly. A custom format can still be added later as an exercise.
 
 All reading goes through one crate, `elf32` (header, program headers, sections, symbols, `.rela`/`.rel` entries, RISC-V relocation names). Grail's loader and merlin-objdump use it; merlin-ld still reads its input objects with its own `src/object.rs` and should move to it. Writers stay in each tool.
+
+### Assembler (`merlin-as`)
+
+`merlin-as [-o out.o] input.s`. The reference is clang's integrated assembler with `-march=rv32im_zicsr_zifencei -mno-relax`: for the same source, `llvm-objdump -dr` must print the same text for both objects (checked for `examples/hello/hello.S` and `examples/muldiv/muldiv.S`), and every encoding matches llvm-mc (`crates/merlin-as/tests/golden/encode.golden`). The encoder, the pseudo-instruction expansions and `li`'s choice of sequence are documented in `crates/merlin-as/ENCODER.md`.
+
+- **Single pass.** No instruction's size depends on a label's address; `.equ`/`.set` constants must be defined before use. Every label reference is first recorded as a fixup with its immediate left zero.
+- **Local labels are resolved by the assembler**, as clang does with `-mno-relax`. When the file has been read, a pc-relative reference to a label that is local (not `.globl`, also when `.globl` comes later in the file) and defined in the same section is patched in and gets no relocation: branches, `jal`/`j`, `call`/`tail` (both words), and `auipc` + `%pcrel_lo` pairs (`la`, `lla`, `lw rd, sym`, `sw rs, sym, rt`, explicit `%pcrel_hi`/`%pcrel_lo`). A branch or jump out of range is an error on its line. Everything else stays a relocation for the linker: references to global or undefined symbols, to labels in other sections, and absolute ones (`%hi`, `%lo`, `.word sym`).
+- **`.`** is the location counter: the address of the instruction (its first word, for a pseudo-instruction) or data word it appears in. Each use becomes a hidden local label there, so `j .`, `beq a0, a1, .-8` and `la a0, .` resolve like any local label, and `.word .` gets an `R_RISCV_32` against that label (clang's `.L0`).
+- **Symbols**: `.L` labels (numeric labels like `1:`, hidden `.Lpcrel_hiN` labels on `auipc`s, `.Ldot$N` labels for `.`) are written to `.symtab` only when a relocation refers to them, as in clang.
+- **`.insn`** spells out an instruction by fields, with LLVM's forms and encodings: `.insn r opcode, funct3, funct7, rd, rs1, rs2`, `.insn i opcode, funct3, rd, rs1, imm` (or `rd, imm(rs1)`), `.insn s opcode, funct3, rs2, imm(rs1)`, `.insn b opcode, funct3, rs1, rs2, target`, `.insn u opcode, rd, imm20`, and `.insn value` / `.insn 4, value`. Opcodes must be 32-bit ones (low bits `11`). This lets sources that use Xcal instructions (`examples/hello/hello.S`) build with both assemblers.
+- **`.riscv.attributes`**: every object carries clang's `Tag_RISCV_arch` for `rv32im_zicsr_zifencei` (`rv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0`), so llvm-objdump decodes M instructions without `--mattr`.
+- **Differences from clang**, on purpose:
+  - No branch relaxation. clang rewrites a conditional branch it cannot resolve or reach (to a global or undefined symbol, another section, or beyond ±4 KiB) into the inverted branch over a `jal`, even with `-mno-relax`; merlin-as keeps one instruction with `R_RISCV_BRANCH`, or reports the branch out of range. (llvm-mc's `-riscv-asm-relax-branches=0` behaves like merlin-as; the golden encodings are made with it.)
+  - A numeric label that a relocation refers to is named `.L<n>$<k>` (the k-th definition of `n:`); clang names it `.Ltmp<m>`. No `$x`/`$d` mapping symbols are written.
+  - `.insn j` is not accepted: LLVM 21 packs its numeric offset without the J-type bit scrambling.
+  - Register names are never symbols: `lw a0, a1` is an error, where LLVM reads `a1` as a symbol.
+  - Some operand forms LLVM accepts are not: `jalr rd, rs` and `jalr off(rs)` (write `jalr rd, 0(rs)`, `jalr ra, off(rs)`), `jr off(rs)` and `jr rs, off` (write `jalr zero, off(rs)`), `call rd, sym`, `jump sym, rt`, `%hi(sym)` in `.insn u`, named opcodes in `.insn` (`.insn r OP, ...`), upper-case CSR names (`MSTATUS`) and standard CSRs Excalibur doesn't have (`fflags`). The other way round, `call`/`tail` accept `sym+offset` and `.`, where clang wants a bare symbol name.
 
 ### Linker (`merlin-ld`)
 
