@@ -1231,10 +1231,12 @@ fn boot_with_ram(ram_mib: usize, extra_devices: &[DeviceEntry]) -> (Machine, gra
     (m, elf, out)
 }
 
-/// Every leaf of the Sv32 page table `satp` points at, as (va, pte), and the
-/// number of pages the table takes (root and second-level tables). Panics on
-/// a megapage or a reserved encoding, which the kernel never makes.
-fn page_table(m: &Machine, satp: u32) -> (Vec<(u32, u32)>, u32) {
+/// Every page the Sv32 page table `satp` points at maps, as (va, pte), the
+/// number of pages the table takes (root and second-level tables), and the
+/// number of 4 MiB megapages in it. A megapage counts as its 1024 pages, each
+/// with the PTE a 4 KiB leaf mapping it would have. Panics on a reserved
+/// encoding or a misaligned megapage, which the kernel never makes.
+fn page_table(m: &Machine, satp: u32) -> (Vec<(u32, u32)>, u32, u32) {
     let pte_at = |addr: u32| {
         m.cpu
             .bus
@@ -1244,12 +1246,21 @@ fn page_table(m: &Machine, satp: u32) -> (Vec<(u32, u32)>, u32) {
     let root = (satp & 0x3f_ffff) * PAGE;
     let mut leaves = Vec::new();
     let mut tables = 1;
+    let mut megapages = 0;
     for i in 0..1024u32 {
         let pte = pte_at(root + 4 * i);
         if pte & PTE_V == 0 {
             continue;
         }
-        assert_eq!(pte & (PTE_R | PTE_W | PTE_X), 0, "megapage at root[{i}]");
+        if pte & (PTE_R | PTE_W | PTE_X) != 0 {
+            // A megapage: its physical page number must be 4 MiB aligned.
+            assert_eq!(pte & (0x3ff << 10), 0, "misaligned megapage root[{i}] = {pte:#x}");
+            megapages += 1;
+            for j in 0..1024u32 {
+                leaves.push((i << 22 | j << 12, pte + (j << 10)));
+            }
+            continue;
+        }
         // A pointer to the next level: D, A, U and G are reserved there, and
         // the kernel sets none of them (nor RSW).
         assert_eq!(pte & 0x3ff, PTE_V, "root[{i}] = {pte:#x}");
@@ -1263,7 +1274,7 @@ fn page_table(m: &Machine, satp: u32) -> (Vec<(u32, u32)>, u32) {
             }
         }
     }
-    (leaves, tables)
+    (leaves, tables, megapages)
 }
 
 /// Checks the kernel page table after a boot with `ram_mib` MiB of RAM and
@@ -1315,7 +1326,7 @@ fn check_kernel_memory(ram_mib: usize, extra_devices: &[DeviceEntry]) {
     }
     assert!(want.len() > ram_pages);
 
-    let (leaves, tables) = page_table(&m, satp);
+    let (leaves, tables, megapages) = page_table(&m, satp);
     let mut got = std::collections::BTreeMap::new();
     for &(va, pte) in &leaves {
         assert_eq!((pte >> 10) * PAGE, va, "{va:#x} not identity mapped");
@@ -1335,11 +1346,22 @@ fn check_kernel_memory(ram_mib: usize, extra_devices: &[DeviceEntry]) {
     // Every page after the kernel is free but the page tables.
     let free_ram_pages = ((ram_end - u64::from(kernel_end)) / u64::from(PAGE)) as u32;
     assert_eq!(m.cpu.bus.peek(sym(&elf, "nfree")), Some(free_ram_pages - tables));
-    // The table: one root, one second-level table per 4 MiB that has a
-    // mapping, and the one the vm self-test left at ALIAS_VA.
+    // Each 4 MiB that is mapped whole and alike (the PLIC's 64 MiB, the RAM
+    // after the first 4 MiB) is one megapage. The table: one root, one
+    // second-level table per other 4 MiB that has a mapping, and the one the vm
+    // self-test left at ALIAS_VA.
     let mut regions: Vec<u32> = want.keys().map(|va| va >> 22).collect();
     regions.dedup();
-    assert_eq!(tables as usize, 1 + regions.len() + 1);
+    let whole = regions
+        .iter()
+        .filter(|&&r| {
+            let first = want.get(&(r << 22));
+            (0..1024u32).all(|j| first.is_some() && want.get(&(r << 22 | j << 12)) == first)
+        })
+        .count();
+    assert!(whole >= 16, "the PLIC alone is 16 megapages");
+    assert_eq!(megapages as usize, whole);
+    assert_eq!(tables as usize, 1 + regions.len() - whole + 1);
 }
 
 #[test]
@@ -2163,7 +2185,7 @@ fn expected_user_pages(elf: &[u8]) -> Vec<(u32, u32)> {
 
 /// The user pages `satp` maps, as (va, the PTE bits the kernel chooses).
 fn user_pages(m: &Machine, satp: u32) -> Vec<(u32, u32)> {
-    let (leaves, _) = page_table(m, satp);
+    let (leaves, _, _) = page_table(m, satp);
     leaves
         .iter()
         .filter(|(va, _)| *va < USER_TOP)
@@ -2173,7 +2195,7 @@ fn user_pages(m: &Machine, satp: u32) -> Vec<(u32, u32)> {
 
 /// Reads `len` bytes of user memory at `va` through page table `satp`.
 fn user_read(m: &Machine, satp: u32, va: u32, len: u32) -> Vec<u8> {
-    let (leaves, _) = page_table(m, satp);
+    let (leaves, _, _) = page_table(m, satp);
     (va..va + len)
         .map(|a| {
             let (_, pte) = leaves
@@ -2370,8 +2392,8 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
         .iter()
         .all(|&(va, _)| va >= USER_TEXT && va != USER_STACK - PAGE));
     assert_eq!(user_pages(&m, satp), want);
-    let (leaves, tables) = page_table(&m, satp);
-    let (kleaves, ktables) = page_table(&m, ksatp);
+    let (leaves, tables, megapages) = page_table(&m, satp);
+    let (kleaves, ktables, kmegapages) = page_table(&m, ksatp);
     let kernel_part: Vec<_> = leaves.iter().filter(|(va, _)| *va >= USER_TOP).copied().collect();
     let kernel_all: Vec<_> = kleaves
         .iter()
@@ -2388,9 +2410,9 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
         assert!(pa >= sym(&elf, "__kernel_end"), "{va:#x} at {pa:#x}");
     }
     // Its own root, one table for user space where the kernel has its root[0]
-    // table, and the kernel's other second-level tables, shared: as many as
-    // the kernel's.
-    assert_eq!(tables, ktables);
+    // table, and the kernel's other second-level tables and megapages, shared:
+    // as many as the kernel's.
+    assert_eq!((tables, megapages), (ktables, kmegapages));
 }
 
 #[test]
@@ -2680,8 +2702,9 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
     });
     let out = printed(&m);
     assert_eq!(r, RunResult::Exited(0), "{out}");
-    // Each faults at its second instruction.
-    let badload = user_sym(&user_program("badload").elf, "main") + 4;
+    // badload faults at its load, its fifth instruction (after choosing the
+    // address by its argument count); badhalt at its second.
+    let badload = user_sym(&user_program("badload").elf, "main") + 16;
     let badhalt = user_sym(&user_program("badhalt").elf, "main") + 4;
     let xcal_halt_a0 = 0x0005_100b;
     assert_eq!(

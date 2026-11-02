@@ -26,6 +26,8 @@
 
 #define PTE_LEAF (PTE_R | PTE_W | PTE_X)
 #define PTES_PER_TABLE 1024
+/* What a root entry maps: 1024 pages. */
+#define MEGAPAGE (PGSIZE * PTES_PER_TABLE)
 
 pagetable_t kernel_pagetable;
 
@@ -153,6 +155,30 @@ static void kvmmap(u32 start, u32 size, u32 perm) {
     }
 }
 
+/* Identity-maps pages `first` to `last` (page numbers, inclusive) in the
+ * kernel page table, leaving any page already mapped as it is. A whole 4 MiB
+ * stretch whose root entry is still free becomes one megapage: one PTE
+ * instead of a second-level table of 1024. */
+static void kvmmap_pages(u32 first, u32 last, u32 perm) {
+    for (u32 page = first;; page++) {
+        u32 a = page * PGSIZE;
+        pte_t *root = &kernel_pagetable[VPN(a, 1)];
+        if (page % PTES_PER_TABLE == 0 && last - page >= PTES_PER_TABLE - 1 && (*root & PTE_V) == 0) {
+            *root = PA2PTE(a) | perm | PTE_V;
+            page += PTES_PER_TABLE - 1;
+        } else if ((*root & PTE_LEAF) == 0) {
+            /* (Inside a megapage, the page is mapped already.) */
+            pte_t *pte = walk(kernel_pagetable, a, false);
+            if (pte == NULL || (*pte & PTE_V) == 0) {
+                kvmmap(a, PGSIZE, perm);
+            }
+        }
+        if (page == last) {
+            return;
+        }
+    }
+}
+
 void kvminit(void) {
     initlock(&uvm_lock, "uvm");
     kernel_pagetable = pagetable_create();
@@ -167,30 +193,18 @@ void kvminit(void) {
     u32 data = (u32)(uintptr)__data_start;
     kvmmap(text, rodata - text, PTE_R | PTE_X);
     kvmmap(rodata, data - rodata, PTE_R);
-    kvmmap(data, ram_size - (data - ram_base), PTE_R | PTE_W);
+    /* Page numbers, so that RAM ending at 2^32 doesn't wrap. */
+    kvmmap_pages(data / PGSIZE, (ram_base + (ram_size - 1)) / PGSIZE, PTE_R | PTE_W);
 
     /* Every MMIO range the machine has, whole pages, never executable. The
      * table doesn't promise that devices are page aligned, so two of them can
-     * share a page: map page by page, skipping pages already mapped. */
+     * share a page: kvmmap_pages() skips pages already mapped. */
     u32 count = sysinfo_device_count();
     for (u32 i = 0; i < count; i++) {
         struct sysinfo_device dev;
         sysinfo_device(i, &dev);
-        if (dev.size == 0) {
-            continue;
-        }
-        /* Page numbers, so a device ending at 2^32 doesn't wrap. */
-        u32 first = dev.base / PGSIZE;
-        u32 last = (dev.base + (dev.size - 1)) / PGSIZE;
-        for (u32 page = first;; page++) {
-            u32 a = page * PGSIZE;
-            pte_t *pte = walk(kernel_pagetable, a, false);
-            if (pte == NULL || (*pte & PTE_V) == 0) {
-                kvmmap(a, PGSIZE, PTE_R | PTE_W);
-            }
-            if (page == last) {
-                break;
-            }
+        if (dev.size != 0) {
+            kvmmap_pages(dev.base / PGSIZE, (dev.base + (dev.size - 1)) / PGSIZE, PTE_R | PTE_W);
         }
     }
 }
@@ -212,7 +226,14 @@ pagetable_t vm_active_pagetable(void) {
 }
 
 void vm_print_mapping(pagetable_t pt, u32 va) {
-    pte_t *pte = walk(pt, va, false);
+    /* A megapage's root entry, or the level-0 PTE (walk() panics on a
+     * megapage, which the kernel's own address space has). */
+    pte_t *pte = &pt[VPN(va, 1)];
+    u32 offset = va % MEGAPAGE;
+    if ((*pte & PTE_LEAF) == 0) {
+        pte = walk(pt, va, false);
+        offset = va % PGSIZE;
+    }
     if (pte == NULL || (*pte & PTE_V) == 0) {
         kprintf("  va 0x%08x is not mapped\n", va);
         return;
@@ -224,8 +245,7 @@ void vm_print_mapping(pagetable_t pt, u32 va) {
         flags[i] = (*pte & (1u << (7 - i))) ? letters[i] : '-';
     }
     flags[8] = '\0';
-    kprintf("  va 0x%08x maps to pa 0x%08x, pte 0x%08x %s\n", va, PTE2PA(*pte) | (va & (PGSIZE - 1)), *pte,
-            flags);
+    kprintf("  va 0x%08x maps to pa 0x%08x, pte 0x%08x %s\n", va, PTE2PA(*pte) | offset, *pte, flags);
 }
 
 pagetable_t uvm_create(void) {

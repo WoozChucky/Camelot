@@ -296,8 +296,11 @@ with `--clock 10MHz` it counts ten a second.
 The RAM size comes from Grail's sysinfo device, so `--ram` changes what the
 allocator manages (`cargo run --release -p grail -- --ram 16 kernel/kernel.elf`
 prints `ram: 16 MiB at 0x80000000`; the default is 4 MiB). Booting to the
-shell takes about 16 million instructions with 4 MiB, and 36 million with
-128 MiB, where nearly all of them go to setting up memory one page at a time.
+shell takes about 3 million instructions with 4 MiB, and 16 million with
+128 MiB, where most of them go to freeing (and, in the self-test, allocating)
+every page one at a time. The kernel page table maps every whole 4 MiB of RAM
+and devices with one megapage: page by page, the 64 MiB PLIC alone was 13
+million instructions of every boot.
 
 The exit code is `kmain()`'s return value: the shell's exit status once it
 and every program it left running have ended (the self-test failure count
