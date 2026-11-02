@@ -7,7 +7,8 @@
 //! clock, until it is ahead of the wall clock); then the window's messages are pumped
 //! and it is redrawn on a present, on a repaint request, or when ~16 ms of host time
 //! have passed since the last redraw (~60 Hz). Keys typed into the window reach the
-//! keyboard device at the same points, between slices.
+//! keyboard device, and the mouse over it the pointer device, at the same points,
+//! between slices.
 
 use crate::cpu::Cpu;
 use crate::framebuffer::FrameDumper;
@@ -123,8 +124,9 @@ impl Screen {
         w.draw(fb.enabled().then_some(fb.vram.as_slice()));
     }
 
-    /// Pumps the window, hands the keys typed into it to the machine's keyboard, and
-    /// redraws if due. Returns false once the window has been closed.
+    /// Pumps the window, hands the keys typed into it to the machine's keyboard and what
+    /// the mouse did to its pointer, and redraws if due. Returns false once the window
+    /// has been closed.
     fn update(&mut self, m: &mut Machine, presented: bool) -> bool {
         let Some(w) = &mut self.window else {
             return true;
@@ -134,6 +136,9 @@ impl Screen {
         }
         for key in w.take_keys() {
             m.key_event(key);
+        }
+        for input in w.take_pointer() {
+            m.pointer_event(input);
         }
         if presented || w.take_repaint() || self.last_draw.elapsed() >= Self::REFRESH {
             Self::draw(w, m);
@@ -154,7 +159,9 @@ impl Screen {
         w.set_title(&format!("{} ({status}, close to quit)", self.title));
         Self::draw(w, m);
         while w.pump() {
-            w.take_keys(); // nothing runs any more to read them
+            // Nothing runs any more to read them.
+            w.take_keys();
+            w.take_pointer();
             if w.take_repaint() {
                 Self::draw(w, m);
             }
@@ -261,5 +268,55 @@ mod tests {
             String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap(),
             "hi\n[dbg] pc=8000005c s1 = 0x00000004 (4)\n"
         );
+    }
+
+    /// The mouse over the window reaches the running program: another thread moves it to
+    /// (100, 50) and presses the left button there, then presses Esc, and
+    /// `examples/pointer` leaves its cursor there, red. Needs a desktop session, with
+    /// the real mouse kept off the window: `cargo test -p grail --release -- --ignored window`.
+    #[test]
+    #[ignore]
+    fn window_mouse_reaches_the_program() {
+        let elf = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/pointer/pointer.elf");
+        let mut m = Machine::with_ram(crate::DEFAULT_RAM_SIZE);
+        m.load_elf(&std::fs::read(elf).unwrap()).unwrap();
+        m.cpu.bus.uart.capture = true;
+        let title = format!("Grail display mouse test {}", std::process::id());
+        let held = format!("{title} (exited with code 0, close to quit)");
+
+        let user = std::thread::spawn({
+            let title = title.clone();
+            move || {
+                let hwnd = find_window(&title, Duration::from_secs(10)).expect("window") as HWND;
+                let at = (100 | 50 << 16) as LPARAM; // the window is 640x480: 1:1
+                for (msg, wparam, lparam) in [
+                    (WM_MOUSEMOVE, 0, at),
+                    (WM_LBUTTONDOWN, MK_LBUTTON, at),
+                    (WM_KEYDOWN, 0x1b, (1 | 0x01 << 16) as LPARAM),
+                ] {
+                    // SAFETY: posting mouse and key messages carries no pointers.
+                    unsafe { PostMessageW(hwnd, msg, wparam, lparam) };
+                }
+                let halted = find_window(&held, Duration::from_secs(10)).is_some();
+                // SAFETY: WM_CLOSE carries no pointers.
+                unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+                halted
+            }
+        });
+
+        // SAFETY: a 256-byte key state table.
+        unsafe { SetKeyboardState([0u8; 256].as_ptr()) };
+        let opts = DisplayOptions {
+            window: true,
+            dump_dir: None,
+            title,
+        };
+        let outcome = run(&mut m, None, |_| {}, &opts).unwrap();
+        assert!(user.join().unwrap(), "the program did not halt");
+        assert_eq!(outcome, Outcome::Program(RunResult::Exited(0)));
+        let fb = &m.cpu.bus.fb;
+        assert_eq!(fb.pixel(100, 50), 0xff0000, "the cursor's tip, red");
+        assert_eq!(fb.pixel(0, 0), 0x203048, "background where it started");
+        assert_eq!(m.cpu.bus.ptr.held(), crate::pointer::BUTTON_LEFT);
     }
 }

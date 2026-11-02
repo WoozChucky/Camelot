@@ -2,9 +2,10 @@
 
 use crate::block::BlockDevice;
 use crate::config::MachineConfig;
-use crate::devices::{Clint, Plic, TestDevice, Uart, BLK_IRQ, KBD_IRQ, UART_IRQ};
+use crate::devices::{Clint, Plic, TestDevice, Uart, BLK_IRQ, KBD_IRQ, PTR_IRQ, UART_IRQ};
 use crate::framebuffer::{Framebuffer, VRAM_SIZE};
 use crate::keyboard::Keyboard;
+use crate::pointer::Pointer;
 use crate::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use std::io::Write;
 
@@ -29,6 +30,8 @@ pub const KBD_BASE: u32 = 0x3000_1000;
 pub const KBD_SIZE: u32 = 0x1000;
 pub const SYSINFO_BASE: u32 = 0x3000_2000;
 pub const SYSINFO_SIZE: u32 = 0x1000;
+pub const PTR_BASE: u32 = 0x3000_3000;
+pub const PTR_SIZE: u32 = 0x1000;
 pub const VRAM_BASE: u32 = 0x3100_0000;
 pub const RAM_BASE: u32 = 0x8000_0000;
 
@@ -56,6 +59,7 @@ pub fn device_table(_config: &MachineConfig, disks: usize) -> Vec<DeviceEntry> {
         dev(DeviceType::FbCtrl, FB_CTRL_BASE, FB_CTRL_SIZE, 0),
         dev(DeviceType::Keyboard, KBD_BASE, KBD_SIZE, KBD_IRQ),
         dev(DeviceType::Sysinfo, SYSINFO_BASE, SYSINFO_SIZE, 0),
+        dev(DeviceType::Pointer, PTR_BASE, PTR_SIZE, PTR_IRQ),
         dev(DeviceType::FbVram, VRAM_BASE, VRAM_SIZE, 0),
     ]);
     table
@@ -80,6 +84,7 @@ pub struct Bus {
     pub uart: Uart,
     pub fb: Framebuffer,
     pub kbd: Keyboard,
+    pub ptr: Pointer,
     /// Disk `i` is at `BLK_BASE + i * BLK_SIZE`, on PLIC source `BLK_IRQ + i`.
     pub disks: Vec<BlockDevice>,
     pub test: TestDevice,
@@ -107,6 +112,7 @@ impl Bus {
             uart: Uart::default(),
             fb: Framebuffer::default(),
             kbd: Keyboard::default(),
+            ptr: Pointer::default(),
             sysinfo: Sysinfo::new(config, device_table(config, disks.len())),
             disks,
             test: TestDevice,
@@ -134,6 +140,7 @@ impl Bus {
         let uart = self.uart.irq();
         self.plic.set_level(UART_IRQ, uart);
         self.plic.set_level(KBD_IRQ, self.kbd.irq());
+        self.plic.set_level(PTR_IRQ, self.ptr.irq());
         for (i, disk) in self.disks.iter().enumerate() {
             self.plic.set_level(BLK_IRQ + i as u32, disk.irq());
         }
@@ -206,6 +213,7 @@ impl Bus {
             a if (SYSINFO_BASE..SYSINFO_BASE + SYSINFO_SIZE).contains(&a) => {
                 self.sysinfo.read(a - SYSINFO_BASE, size)
             }
+            a if (PTR_BASE..PTR_BASE + PTR_SIZE).contains(&a) => self.ptr.read(a - PTR_BASE, size),
             a if (TEST_DEV_BASE..TEST_DEV_BASE + TEST_DEV_SIZE).contains(&a) => Ok(0),
             _ => Err(BusFault),
         }
@@ -237,6 +245,7 @@ impl Bus {
             a if (SYSINFO_BASE..SYSINFO_BASE + SYSINFO_SIZE).contains(&a) => {
                 self.sysinfo.write(a - SYSINFO_BASE, size, val)
             }
+            a if (PTR_BASE..PTR_BASE + PTR_SIZE).contains(&a) => self.ptr.write(a - PTR_BASE, size, val),
             a if (TEST_DEV_BASE..TEST_DEV_BASE + TEST_DEV_SIZE).contains(&a) => {
                 if let Some(e) = self.test.write(a - TEST_DEV_BASE, val) {
                     self.exit = Some(e);
@@ -310,7 +319,9 @@ mod tests {
         );
         assert_eq!(bus.read(SYSINFO_BASE, 1), Err(BusFault));
         assert_eq!(bus.write(SYSINFO_BASE, 2, 0), Err(BusFault));
-        assert_eq!(bus.read(SYSINFO_BASE + SYSINFO_SIZE, 4), Err(BusFault));
+        // The next page is the pointer's.
+        assert_eq!(bus.read(SYSINFO_BASE + SYSINFO_SIZE, 4), Ok(0));
+        assert_eq!(bus.read(PTR_BASE + PTR_SIZE, 4), Err(BusFault));
         // Not memory: no instruction fetches from it.
         assert_eq!(bus.read_mem(SYSINFO_BASE, 4), Err(BusFault));
     }
@@ -363,11 +374,13 @@ mod tests {
                 );
             }
         }
-        // The UART's and keyboard's PLIC sources are the ones the bus wires them to.
+        // The UART's, keyboard's and pointer's PLIC sources are the ones the bus wires them to.
         let uart = table.iter().find(|d| d.kind == DeviceType::Uart).unwrap();
         assert_eq!(uart.irq, UART_IRQ);
         let kbd = table.iter().find(|d| d.kind == DeviceType::Keyboard).unwrap();
         assert_eq!(kbd.irq, KBD_IRQ);
+        let ptr = table.iter().find(|d| d.kind == DeviceType::Pointer).unwrap();
+        assert_eq!((ptr.base, ptr.irq), (PTR_BASE, PTR_IRQ));
         // Disks are listed in order, each on its own source.
         let disks: Vec<_> = table.iter().filter(|d| d.kind == DeviceType::Block).collect();
         assert_eq!(disks.len(), bus.disks.len());
@@ -381,7 +394,7 @@ mod tests {
         let mut irqs: Vec<u32> = table.iter().map(|d| d.irq).filter(|&irq| irq != 0).collect();
         irqs.sort();
         irqs.dedup();
-        assert_eq!(irqs.len(), 2 + bus.disks.len());
+        assert_eq!(irqs.len(), 3 + bus.disks.len());
         assert!(irqs.iter().all(|&irq| irq < crate::devices::PLIC_SOURCES));
     }
 
@@ -402,7 +415,7 @@ mod tests {
             let bus = bus_with_disks(n);
             let table = bus.sysinfo.devices();
             assert_eq!(table, device_table(&MachineConfig::default(), n));
-            assert_eq!(table.len(), 8 + n);
+            assert_eq!(table.len(), 9 + n);
             device_table_matches(bus);
         }
     }
@@ -539,5 +552,40 @@ mod tests {
         assert_eq!(bus.read(KBD_BASE + KBD_SIZE, 4), Ok(sysinfo::SYSINFO_MAGIC));
         // Data accesses only.
         assert_eq!(bus.read_mem(KBD_BASE, 4), Err(BusFault));
+    }
+
+    #[test]
+    fn pointer_registers_on_the_bus() {
+        use crate::pointer::{self as ptr, PointerInput, BUTTON_LEFT};
+        let mut bus = small_bus();
+        assert_eq!(bus.read(PTR_BASE + ptr::REG_STATUS, 4), Ok(0));
+        assert_eq!(bus.read(PTR_BASE + ptr::REG_EVENT, 4), Ok(0));
+        bus.ptr
+            .push(PointerInput::move_to(320, 240).with_buttons(BUTTON_LEFT));
+        assert_eq!(bus.read(PTR_BASE + ptr::REG_STATUS, 4), Ok(ptr::STATUS_EVENT));
+        assert_eq!(bus.read(PTR_BASE + ptr::REG_EVENT, 4), Ok(0x8000_0001));
+        assert_eq!(bus.read(PTR_BASE + ptr::REG_EVENT_XY, 4), Ok(320 | 240 << 16));
+        assert_eq!(bus.read(PTR_BASE + ptr::REG_POS, 4), Ok(320 | 240 << 16));
+        assert_eq!(bus.read(PTR_BASE + ptr::REG_BUTTONS, 4), Ok(1));
+        assert_eq!(bus.read(PTR_BASE + ptr::REG_STATUS, 4), Ok(0));
+
+        // Its line reaches the PLIC as source PTR_IRQ once enabled.
+        bus.ptr.push(PointerInput::move_to(1, 1));
+        bus.update_interrupts();
+        assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(0));
+        bus.write(PTR_BASE + ptr::REG_CTRL, 4, ptr::CTRL_IRQ_ENABLE)
+            .unwrap();
+        bus.update_interrupts();
+        assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << PTR_IRQ));
+
+        // Words only, nothing popped by a faulting access; the page ends the range.
+        assert_eq!(bus.read(PTR_BASE + ptr::REG_EVENT, 1), Err(BusFault));
+        assert_eq!(bus.read(PTR_BASE + ptr::REG_EVENT, 2), Err(BusFault));
+        assert_eq!(bus.write(PTR_BASE + ptr::REG_CTRL, 2, 0), Err(BusFault));
+        assert_eq!(bus.ptr.len(), 1);
+        assert_eq!(bus.read(PTR_BASE + 0xffc, 4), Ok(0));
+        assert_eq!(bus.read(PTR_BASE + PTR_SIZE, 4), Err(BusFault));
+        // Data accesses only.
+        assert_eq!(bus.read_mem(PTR_BASE, 4), Err(BusFault));
     }
 }

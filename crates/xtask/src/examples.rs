@@ -84,6 +84,12 @@ pub const EXAMPLES: &[Example] = &[
         sources: &["kbd-echo-irq.S"],
         script: Some("link.ld"),
     },
+    Example {
+        name: "pointer",
+        dir: "pointer",
+        sources: &["pointer.S"],
+        script: Some("link.ld"),
+    },
 ];
 
 /// The clang-only macros that let clang assemble `xcal.dbg`/`xcal.halt`
