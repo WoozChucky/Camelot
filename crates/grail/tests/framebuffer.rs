@@ -4,6 +4,7 @@
 use grail::display::{self, DisplayOptions, Outcome};
 use grail::framebuffer::{FB_HEIGHT, FB_WIDTH};
 use grail::{Machine, MachineConfig, RunResult};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -32,6 +33,11 @@ fn scratch(name: &str) -> PathBuf {
 /// Runs the `grail` binary. A run that takes more than a minute is killed and
 /// fails the test, so a regression that opens a window (which waits for a
 /// person to close it) or never stops cannot hang the test run.
+///
+/// stdout and stderr are drained on their own threads while the child runs:
+/// a pipe holds only a few KiB (4 KiB on Windows), and a child that fills one
+/// blocks on its write and would never exit if they were read only after it
+/// had.
 fn grail(args: &[&str]) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_grail"))
         .args(args)
@@ -40,15 +46,52 @@ fn grail(args: &[&str]) -> std::process::Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("cannot run grail");
+    fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            pipe.read_to_end(&mut buf).unwrap();
+            buf
+        })
+    }
+    let stdout = drain(child.stdout.take().unwrap());
+    let stderr = drain(child.stderr.take().unwrap());
     let start = Instant::now();
-    while child.try_wait().unwrap().is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         if start.elapsed() > Duration::from_secs(60) {
             let _ = child.kill();
             panic!("grail {args:?} still running after a minute");
         }
         std::thread::sleep(Duration::from_millis(10));
+    };
+    std::process::Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
     }
-    child.wait_with_output().unwrap()
+}
+
+/// A run that writes far more than a pipe holds still finishes and comes back
+/// whole: `grail()` reads the output while the child runs.
+#[test]
+fn helper_returns_large_output() {
+    let dir = scratch("colorbars-trace");
+    let out = grail(&[
+        "--max-steps",
+        "5000",
+        "--trace",
+        "--fb-dump",
+        dir.to_str().unwrap(),
+        colorbars_elf().to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(124));
+    assert!(
+        out.stderr.len() > 64 * 1024,
+        "{} bytes of trace",
+        out.stderr.len()
+    );
 }
 
 /// The pattern `colorbars.S` draws, as 0x00RRGGBB: an 8-pixel grey border around

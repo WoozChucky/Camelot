@@ -407,6 +407,26 @@ const CASES: &[(&str, &str, &str)] = &[
         "sc.w has no offset field",
     ),
     (
+        "lr.w a0, +0(a1)",
+        "a unary plus folds to 0 but is not an integer token",
+        "lr.w has no offset field",
+    ),
+    (
+        "lr.w a0, (0)(a1)",
+        "a parenthesized 0 is an expression",
+        "lr.w has no offset field",
+    ),
+    (
+        "lr.w a0, ((0))(a1)",
+        "a doubly parenthesized 0 is an expression",
+        "lr.w has no offset field",
+    ),
+    (
+        "amoswap.w a0, a1, +(0)(a2)",
+        "a unary plus on a parenthesized 0",
+        "amoswap.w has no offset field",
+    ),
+    (
         "sc.w a0, a1, a2",
         "address given as a plain register",
         "expected offset(register), found a register: sc.w takes its address as (rs1)",
@@ -486,7 +506,12 @@ fn atomic_offsets_are_a_literal_zero() {
     let same = |src: &str| merlin_as::assemble(src).unwrap().sections[0].data.clone();
     let want = same("    lr.w a0, (a1)\n");
     assert_eq!(want, 0x1005_a52fu32.to_le_bytes());
-    for src in ["    lr.w a0, 0(a1)\n", "    lr.w a0, 0x0(a1)\n"] {
+    for src in [
+        "    lr.w a0, 0(a1)\n",
+        "    lr.w a0, 0x0(a1)\n",
+        "    lr.w a0, 0 (a1)\n",
+        "    lr.w a0, ( a1 )\n",
+    ] {
         assert_eq!(same(src), want, "{src:?}");
     }
 }

@@ -429,7 +429,7 @@ fn expr(op: &Operand) -> Result<&Expr, String> {
 
 fn mem(op: &Operand) -> Result<(&Expr, Reg), String> {
     match op {
-        Operand::Mem { offset, base } => Ok((offset, *base)),
+        Operand::Mem { offset, base, .. } => Ok((offset, *base)),
         _ => Err(format!("expected offset(register), found {}", what(op))),
     }
 }
@@ -728,7 +728,7 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
         "jalr" => match ops {
             // `jalr rs`: call through a register, link in ra.
             [rs] => one(i_type(JALR, 0, RA, reg(rs)?, 0)),
-            [rd, Operand::Mem { offset, base }] => jalr(reg(rd)?, *base, offset, ctx),
+            [rd, Operand::Mem { offset, base, .. }] => jalr(reg(rd)?, *base, offset, ctx),
             [rd, rs1, Operand::Expr(offset)] => jalr(reg(rd)?, reg(rs1)?, offset, ctx),
             _ => usage("rd, offset(rs1)"),
         },
@@ -940,7 +940,7 @@ fn load(m: &str, funct3: u32, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, S
     };
     let rd = reg(rd)?;
     match src {
-        Operand::Mem { offset, base } => {
+        Operand::Mem { offset, base, .. } => {
             let f = imm12(offset, ctx, false)?;
             let word = i_type(LOAD, funct3, rd, *base, f.value);
             Ok(vec![f.emit(word)])
@@ -990,13 +990,16 @@ fn store(m: &str, funct3: u32, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, 
 
 /// The address operand of an A instruction: `(rs1)`. An A instruction has no
 /// offset field, so, as in LLVM, the only offset accepted is a literal `0`
-/// (`0(rs1)`). LLVM takes an integer token there, not an expression, so
-/// `-0(rs1)`, `1-1(rs1)` or a symbol equal to 0 are errors even though
-/// their value is 0.
+/// (`0(rs1)`, `0x0(rs1)`). LLVM takes one integer token there, not an
+/// expression, so `-0(rs1)`, `+0(rs1)`, `(0)(rs1)`, `1-1(rs1)` or a symbol
+/// equal to 0 are errors even though their value is 0. The parser folds
+/// `+0` and `(0)` to `Num(0)`, so the check uses the operand's `int_token`,
+/// which records how the offset was written.
 fn atomic_address(m: &str, addr: &Operand) -> Result<Reg, String> {
     let (offset, base) = mem(addr).map_err(|e| format!("{e}: {m} takes its address as (rs1)"))?;
+    let int_token = matches!(addr, Operand::Mem { int_token: true, .. });
     match offset {
-        Expr::Num(0) => Ok(base),
+        Expr::Num(0) if int_token => Ok(base),
         _ => Err(format!("{m} has no offset field: write the address as (rs1)")),
     }
 }
@@ -1078,7 +1081,7 @@ fn insn(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> {
         }
         "i" => {
             let (op, f3, rd, rs1, offset) = match ops {
-                [op, f3, rd, Operand::Mem { offset, base }] => (op, f3, rd, *base, offset),
+                [op, f3, rd, Operand::Mem { offset, base, .. }] => (op, f3, rd, *base, offset),
                 [op, f3, rd, rs1, imm] => (op, f3, rd, reg(rs1)?, expr(imm)?),
                 _ => return usage("opcode, funct3, rd, rs1, simm12"),
             };

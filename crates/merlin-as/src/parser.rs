@@ -213,15 +213,22 @@ impl Parser<'_> {
                 return Ok(Operand::Mem {
                     offset: Expr::Num(0),
                     base,
+                    int_token: true,
                 });
             }
         }
+        let start = self.pos;
         let e = self.expr()?;
+        let int_token = self.pos == start + 1 && matches!(self.toks[start].tok, Tok::Int(_));
         // `expr(reg)`
         if *self.peek() == Tok::Punct('(') {
             if let (Some(base), Tok::Punct(')')) = (self.reg_at(1), self.peek_at(2)) {
                 self.pos += 3;
-                return Ok(Operand::Mem { offset: e, base });
+                return Ok(Operand::Mem {
+                    offset: e,
+                    base,
+                    int_token,
+                });
             }
         }
         Ok(Operand::Expr(e))
@@ -332,7 +339,8 @@ mod tests {
                                 Box::new(Expr::Num(4))
                             ))
                         ),
-                        base: 2
+                        base: 2,
+                        int_token: false
                     }
                 ]
             )
@@ -345,11 +353,35 @@ mod tests {
                     Operand::Reg(1),
                     Operand::Mem {
                         offset: Expr::Num(0),
-                        base: 2
+                        base: 2,
+                        int_token: true
                     }
                 ]
             )
         );
+        // The offset folds to Num(0) either way; int_token keeps whether it
+        // was one integer token (what an A instruction accepts, as in LLVM).
+        let offset_token = |src: &str| match one(src) {
+            StmtKind::Instruction(_, ops) => match &ops[1] {
+                Operand::Mem {
+                    offset: Expr::Num(0),
+                    int_token,
+                    ..
+                } => *int_token,
+                op => panic!("{src}: {op:?}"),
+            },
+            kind => panic!("{src}: {kind:?}"),
+        };
+        for (src, want) in [
+            ("lr.w a0, (a1)", true),
+            ("lr.w a0, 0(a1)", true),
+            ("lr.w a0, 0x0 (a1)", true),
+            ("lr.w a0, +0(a1)", false),
+            ("lr.w a0, (0)(a1)", false),
+            ("lr.w a0, ((0))(a1)", false),
+        ] {
+            assert_eq!(offset_token(src), want, "{src}");
+        }
         assert_eq!(
             one("beqz t0, 1f"),
             StmtKind::Instruction(
@@ -384,7 +416,8 @@ mod tests {
                     Operand::Reg(10),
                     Operand::Mem {
                         offset: Expr::Num(8),
-                        base: 2
+                        base: 2,
+                        int_token: true
                     },
                 ]
             )

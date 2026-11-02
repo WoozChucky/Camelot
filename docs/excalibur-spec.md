@@ -87,7 +87,7 @@ funct5[31:27] aq[26] rl[25] rs2[24:20] rs1[19:15] 010 rd[11:7] 0101111
 | 10000 / 10100 | `amomin.w` / `amomax.w` | rd = M; M = signed min / max(M, rs2) |
 | 11000 / 11100 | `amominu.w` / `amomaxu.w` | rd = M; M = unsigned min / max(M, rs2) |
 
-Other funct5 values (`amocas.w` of Zacas, ...) are reserved and raise illegal-instruction. Assembly writes the ordering bits as a suffix: none, `.aq`, `.rl` or `.aqrl` (`amoadd.w.aqrl`). The address is written `(rs1)`, or `0(rs1)` with a literal `0` (as in LLVM, an expression equal to 0 such as `1-1` is an error); there is no offset field. Grail runs its harts one instruction at a time, in turn (section 7, "Harts"), so an AMO is atomic by construction and `aq`/`rl` change nothing; they are still encoded, decoded and disassembled.
+Other funct5 values (`amocas.w` of Zacas, ...) are reserved and raise illegal-instruction. Assembly writes the ordering bits as a suffix: none, `.aq`, `.rl` or `.aqrl` (`amoadd.w.aqrl`). The address is written `(rs1)`, or `0(rs1)` with a literal `0` (one integer token such as `0` or `0x0`; as in LLVM, an expression equal to 0 such as `1-1`, `+0` or `(0)` is an error); there is no offset field. Grail runs its harts one instruction at a time, in turn (section 7, "Harts"), so an AMO is atomic by construction and `aq`/`rl` change nothing; they are still encoded, decoded and disassembled.
 
 Addresses (checked in this order):
 
@@ -169,7 +169,7 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 | 0x3100_0000 - 0x3112_BFFF | Framebuffer VRAM |
 | 0x8000_0000 - 0x803F_FFFF | RAM, 4 MiB by default, up to 0xFFFF_FFFF with more (`--ram`, 1-2048 MiB; software reads the size from sysinfo) |
 
-Unmapped accesses raise access-fault exceptions. Instructions and page tables live only in RAM and the boot ROM: an instruction fetch from VRAM or from any other range raises an instruction access fault, and a Sv32 page-table walk that reads a PTE outside them raises an access fault of the original access type. Grail's ELF loader likewise loads `PT_LOAD` segments only into RAM: a segment anywhere else, VRAM included, is an error. So neither can trigger a device register's read side effect (such as a PLIC claim).
+Unmapped accesses raise access-fault exceptions. Instructions and page tables live only in RAM and the boot ROM: an instruction fetch from VRAM or from any other range raises an instruction access fault, and a Sv32 page-table walk that reads a PTE outside them raises an access fault of the original access type. So neither can trigger a device register's read side effect (such as a PLIC claim). Grail's ELF loader likewise loads `PT_LOAD` segments only into RAM: a segment anywhere else, VRAM included, is an error.
 
 RAM: `--ram MiB` takes a whole number from 1 to 2048, the most that fits between 0x8000_0000 and the top of the 32-bit address space; anything else is rejected with an error. Without it a machine has 4 MiB, as does a VM on Avalon whose profile leaves the size at its default (`avalon_proto::DEFAULT_RAM_SIZE`, Round Table's and Pendragon's `--ram`): enough for Camelot booted from its 2 MiB root image ("Kernel filesystem", "Root image"), and for every example. Programs that need more say so with `--ram`. (As a library, Grail accepts any non-zero multiple of 4 KiB up to 2 GiB.) Software must not assume a size: it reads `SYS_RAM_SIZE` (section 9.5).
 
