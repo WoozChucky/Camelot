@@ -67,6 +67,7 @@ Mnemonics are lower case; registers by ABI name or `xN`; CSRs by name
 |---|---|
 | RV32I | `lui auipc jal jalr beq bne blt bge bltu bgeu lb lh lw lbu lhu sb sh sw addi slti sltiu xori ori andi slli srli srai add sub sll slt sltu xor srl sra or and` |
 | M | `mul mulh mulhsu mulhu div divu rem remu` (OP with funct7 = 1) |
+| A | `lr.w rd, (rs1)`, `sc.w rd, rs2, (rs1)`, `amoswap.w amoadd.w amoxor.w amoand.w amoor.w amomin.w amomax.w amominu.w amomaxu.w rd, rs2, (rs1)`, each also with `.aq`, `.rl` or `.aqrl` (see below) |
 | Zifencei, fences | `fence` (no operands = `iorw, iorw`, or two sets like `rw, w`), `fence.tso`, `fence.i` |
 | Privileged | `ecall ebreak mret sret wfi sfence.vma [rs1[, rs2]]` |
 | Zicsr | `csrrw csrrs csrrc csrrwi csrrsi csrrci` |
@@ -95,6 +96,23 @@ Pseudo-instructions, as in the RISC-V Assembly Programmer's Manual and LLVM:
 
 `%pcrel_lo(.)` above stands for the hidden `.Lpcrel_hiN` label the driver puts
 on the `auipc` (`Target::Auipc(0)`), as the psABI requires.
+
+### Atomics (A)
+
+R-type words on the AMO opcode (`0101111`) with funct3 = `010` (word). What
+R-type calls funct7 is split in two: funct5 in bits [31:27] picks the
+operation, then the two ordering bits, aq (26) and rl (25):
+
+```
+funct5[31:27] aq[26] rl[25] rs2[24:20] rs1[19:15] 010 rd[11:7] 0101111
+```
+
+The suffix sets the ordering bits: none = 00, `.aq` = 10, `.rl` = 01,
+`.aqrl` = 11 (`atomic()` strips it, `atomic_funct5()` maps the rest). `lr.w`
+has no rs2: its field is zero. The address is written `(rs1)`; as in LLVM,
+`0(rs1)` is accepted too, and any other offset is an error, since there is no
+offset field. The source register comes before the address, as for stores
+(`amoadd.w rd, rs2, (rs1)`), and rd gets the old memory word.
 
 ### `li`
 
@@ -197,13 +215,14 @@ that remain on other input (spec section 10):
 cargo test -p merlin-as
 ```
 
-- `encode_golden`: 118 lines assembled by llvm-mc (`tests/golden/encode.s` →
-  `encode.golden`: RV32I, M, CSRs, pseudo-instructions, relocations). Words and
-  relocations must be identical.
+- `encode_golden`: 166 lines assembled by LLVM (`tests/golden/encode.s` →
+  `encode.golden`: RV32I, M, A with every ordering suffix, CSRs,
+  pseudo-instructions, relocations). Words and relocations must be identical.
 - `encode_roundtrip`: `excalibur::decode` of our words gives back the
   operation and operands of a hand-written table (Xcal, CSRs by name, `li`
-  splits, explicit `%pcrel` pairs, and the relocation on each word);
-  every llvm-mc word, disassembled by `excalibur`, assembles back to itself;
+  splits, explicit `%pcrel` pairs, and the relocation on each word), and of
+  every A mnemonic with every suffix;
+  every LLVM word, disassembled by `excalibur`, assembles back to itself;
   and so does every decodable word of a 400 000-word pseudo-random sample.
 - `encode_errors`: bad lines are rejected on their own line, with the
   wording checked for unknown mnemonics and out-of-range local branches.
@@ -228,7 +247,10 @@ assembled by merlin-as.
 ### Regenerating the references
 
 - `tests/golden/encode.golden`: add lines to `encode.s` and run
-  `scripts/gen-encode-golden.sh` (llvm-mc, llvm-objcopy, llvm-readelf, bash).
+  `scripts/gen-encode-golden.sh` (clang, llvm-objcopy, llvm-readobj, bash).
+  clang relaxes a conditional branch to a symbol, and LLVM 21 has no option to
+  stop it, so the script keeps those lines from the existing file (llvm-mc 18
+  with `-riscv-asm-relax-branches=0` made them).
 - `tests/golden/hello.ref` and `hello.dr.txt`: `scripts/gen-hello-ref.sh`
   (clang and llvm-objdump 21). Rerun when `examples/hello/hello.S` changes.
 - `tests/golden/hello.elf`: `cargo xtask hello` (merlin-as and ld.lld).

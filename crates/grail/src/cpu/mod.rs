@@ -1,9 +1,12 @@
 //! The hart: registers, the step loop, instruction execution and trap entry.
 
+mod atomic;
 mod csr;
 mod mmu;
+pub mod reservation;
 
 pub use csr::{Csrs, MISA_VALUE};
+pub use reservation::Reservation;
 
 use crate::bus::Bus;
 use crate::trap::{Exception, Trap, INTERRUPT_BIT};
@@ -41,6 +44,8 @@ pub struct Cpu {
     /// tick (the default, full-speed mode). A real-time machine turns this off and lets
     /// the wait take wall-clock time instead (see [`Cpu::idle`]).
     pub wfi_skips_to_timer: bool,
+    /// The `lr.w`/`sc.w` reservation.
+    pub reservation: Reservation,
     /// Set when the current instruction wrote minstret, which suppresses its increment.
     instret_written: bool,
 }
@@ -65,6 +70,7 @@ impl Cpu {
             bus,
             waiting: false,
             wfi_skips_to_timer: true,
+            reservation: Reservation::default(),
             instret_written: false,
         }
     }
@@ -181,6 +187,9 @@ impl Cpu {
             self.csr.medeleg
         };
         let to_s = self.mode <= Mode::S && (deleg >> code) & 1 != 0;
+        // A trap breaks any LR/SC sequence: the handler may run other code (or
+        // switch threads) before the interrupted `sc.w` executes.
+        self.reservation.clear();
         let s = &mut self.csr.mstatus;
 
         let tvec = if to_s {
@@ -293,6 +302,19 @@ impl Cpu {
             Inst::Mul { op, rd, rs1, rs2 } => {
                 let v = muldiv(op, self.reg(rs1), self.reg(rs2));
                 self.set_reg(rd, v);
+            }
+            // Single hart, in order: aq/rl need no work (see atomic.rs).
+            Inst::Lr { rd, rs1, .. } => {
+                let v = self.load_reserved(self.reg(rs1))?;
+                self.set_reg(rd, v);
+            }
+            Inst::Sc { rd, rs1, rs2, .. } => {
+                let v = self.store_conditional(self.reg(rs1), self.reg(rs2))?;
+                self.set_reg(rd, v);
+            }
+            Inst::Amo { op, rd, rs1, rs2, .. } => {
+                let old = self.amo(op, self.reg(rs1), self.reg(rs2))?;
+                self.set_reg(rd, old);
             }
             // Single hart, no caches, no instruction cache: fences are no-ops.
             Inst::Fence { .. } | Inst::FenceTso | Inst::FenceI => {}

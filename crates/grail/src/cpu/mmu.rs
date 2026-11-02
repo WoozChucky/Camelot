@@ -4,6 +4,7 @@
 //! but simple, and it means `sfence.vma` has nothing to flush.
 
 use super::{Cpu, Mode};
+use crate::bus::BusFault;
 use crate::trap::{Access, Trap};
 use excalibur::csr::*;
 
@@ -93,7 +94,7 @@ impl Cpu {
             new_pte |= PTE_D;
         }
         if new_pte != pte {
-            self.bus.write(pte_addr, 4, new_pte).map_err(|_| access_fault)?;
+            self.write_phys(pte_addr, 4, new_pte).map_err(|_| access_fault)?;
         }
 
         Ok(if level == 1 {
@@ -127,8 +128,26 @@ impl Cpu {
             return Err(Trap::new(Access::Store.misaligned(), vaddr));
         }
         let paddr = self.translate(vaddr, Access::Store)?;
-        self.bus
-            .write(paddr, size, val)
+        self.write_phys(paddr, size, val)
             .map_err(|_| Trap::new(Access::Store.access_fault(), vaddr))
+    }
+
+    /// Every write the hart makes goes through here (`sb`/`sh`/`sw`, `sc.w`,
+    /// AMOs, and the page walker's A/D updates), so the LR/SC reservation sees
+    /// it: a write to the reserved word breaks the reservation, and so does any
+    /// store to a device, which may start a DMA into RAM (see
+    /// [`super::Reservation`]). An A/D update counts because software may be
+    /// updating that PTE with `lr.w`/`sc.w`, and its `sc.w` must not overwrite
+    /// the bit the hardware just set.
+    pub(super) fn write_phys(&mut self, paddr: u32, size: u32, val: u32) -> Result<(), BusFault> {
+        self.bus.write(paddr, size, val)?;
+        if self.reservation.held().is_some() {
+            if self.bus.is_memory(paddr, size) {
+                self.reservation.snoop(paddr, size);
+            } else {
+                self.reservation.clear();
+            }
+        }
+        Ok(())
     }
 }

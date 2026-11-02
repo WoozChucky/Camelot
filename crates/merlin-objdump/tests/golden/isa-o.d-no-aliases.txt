@@ -164,7 +164,7 @@ Disassembly of section .text:
      258:      	auipc	t0, 0x0
      25c:      	jalr	ra, 0x8(t0) <calls+0x8>
      260:      	auipc	t1, 0x1
-     264:      	jalr	zero, -0x4(t1) <regs+0xf90>
+     264:      	jalr	zero, -0x4(t1) <atomics+0xf48>
      268:      	lui	a0, 0x0
      26c:      	jalr	ra, 0x10(a0)
      270:      	auipc	a1, 0x0
@@ -213,3 +213,37 @@ Disassembly of section .text:
      308:      	auipc	a3, 0x0
      30c:      	fence	iorw, iorw
      310:      	jalr	ra, 0x0(a3) <regs+0x3c>
+
+00000314 <atomics>:
+     314:      	lr.w	a0, (a1)
+     318:      	lr.w.aq	t0, (s1)
+     31c:      	lr.w.rl	zero, (t6)
+     320:      	lr.w.aqrl	a5, (sp)
+     324:      	sc.w	a0, a1, (a2)
+     328:      	sc.w.aq	t0, t1, (t2)
+     32c:      	sc.w.rl	s1, s2, (s3)
+     330:      	sc.w.aqrl	a5, zero, (a7)
+     334:      	amoswap.w	a0, a1, (a2)
+     338:      	amoadd.w.aq	a3, a4, (a5)
+     33c:      	amoxor.w.rl	s6, s7, (s8)
+     340:      	amoand.w.aqrl	a6, a7, (ra)
+     344:      	amoor.w	zero, a2, (tp)
+     348:      	amomin.w.aq	a5, s2, (t2)
+     34c:      	amomax.w.rl	s5, t3, (a0)
+     350:      	amominu.w.aqrl	s8, t6, (a3)
+     354:      	amomaxu.w	t3, tp, (a7)
+     358:      	<unknown>
+     35c:      	<unknown>
+     360:      	auipc	a3, 0x0
+     364:      	amoswap.w	a3, a1, (a0)
+     368:      	jalr	ra, 0x0(a3)
+     36c:      	auipc	a3, 0x0
+     370:      	sc.w	a3, a1, (a0)
+     374:      	jalr	ra, 0x0(a3)
+     378:      	auipc	a3, 0x0
+     37c:      	lr.w	a3, (a0)
+     380:      	jalr	ra, 0x0(a3)
+     384:      	auipc	a3, 0x0
+     388:      	lr.w	a4, (a3)
+     38c:      	amoadd.w	a4, a3, (a3)
+     390:      	jalr	ra, 0x0(a3) <atomics+0x70>
