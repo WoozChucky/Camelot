@@ -17,6 +17,8 @@
 //! * [`ld_fixtures`]: regenerates merlin-ld's test fixtures (clang, ld.lld,
 //!   llvm-readobj).
 //! * [`tools`]: finds the LLVM tools.
+//! * [`up`]: brings the Avalon platform up (Lake, Avalon and Pendragon, with
+//!   Camelot's root image as Lake's image `camelot`) until Ctrl-C.
 //! * [`userprogs`]: builds the user programs in `kernel/user/` with merlin,
 //!   merlin-as and merlin-ld (or clang's C output, for the reference build)
 //!   and embeds them in the kernel (`kernel/userprogs.s`).
@@ -29,6 +31,7 @@ pub mod kernel;
 pub mod ld_fixtures;
 pub mod toolchain;
 pub mod tools;
+pub mod up;
 pub mod userprogs;
 
 use std::path::{Path, PathBuf};

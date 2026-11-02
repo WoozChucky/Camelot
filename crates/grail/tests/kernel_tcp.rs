@@ -796,12 +796,15 @@ fn pid_in(text: &str) -> Option<u32> {
         .find_map(|l| l.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
 }
 
-/// Starts `line` in the background and returns its process id once the shell gave it.
+/// Starts `line` in the background and returns its process id once the shell gave it
+/// and printed its next prompt. Waiting for the prompt too matters: the job can run
+/// (and send its first segment) between the "[PID]" line and the prompt, and a
+/// `command` typed before that prompt would take it for its own.
 fn start(vm: &mut Vm, host: &mut Host, line: &str) -> u32 {
-    let before = vm.out().len();
+    let (before, prompts) = (vm.out().len(), vm.prompts());
     vm.type_line(&format!("{line} &"));
     run_until(&mut [vm], Some(host), |vms| {
-        pid_in(&vms[0].out()[before..]).is_some()
+        pid_in(&vms[0].out()[before..]).is_some() && vms[0].prompts() > prompts
     });
     pid_in(&vm.out()[before..]).unwrap()
 }

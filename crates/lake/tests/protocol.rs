@@ -41,6 +41,7 @@ fn disk_management() {
     let create = |name: &str, sectors| Message::DiskCreate {
         name: name.into(),
         sectors,
+        source: None,
     };
     assert_eq!(error_of(&mut rt, &create("root", 1)), ErrorCode::AlreadyExists);
     for bad in [
@@ -82,6 +83,101 @@ fn disk_management() {
     server.stop().unwrap();
 }
 
+/// `DiskCreate` with a source: a new image that is a copy of an existing one.
+#[test]
+fn cloning_disks() {
+    let dir = TempDir::new("clone");
+    let server = lake_with(Config {
+        max_sectors: 8192,
+        ..quiet(&dir)
+    });
+    let mut rt = connect(&server);
+    let clone = |name: &str, source: &str, sectors| Message::DiskCreate {
+        name: name.into(),
+        sectors,
+        source: Some(source.into()),
+    };
+    create_disk(&mut rt, "base", 4096);
+    let (h, _) = open(&mut rt, "base", false);
+    let data: Vec<u8> = (0..2048 * 512u32).map(|i| (i * 13 + i / 512) as u8).collect();
+    write(&mut rt, h, 100, &data);
+    write(&mut rt, h, 4095, &[0x5a; 512]);
+
+    // The source has a writer: refused, and nothing is left behind.
+    let mut other = connect(&server);
+    assert_eq!(error_of(&mut other, &clone("copy", "base", 0)), ErrorCode::Busy);
+    rt.request_ok(&Message::BlockClose { handle: h }).unwrap();
+
+    // A copy as long as its source, byte for byte.
+    rt.request_ok(&clone("copy", "base", 0)).unwrap();
+    let base = std::fs::read(dir.path().join("base")).unwrap();
+    assert_eq!(std::fs::read(dir.path().join("copy")).unwrap(), base);
+    assert_eq!(disk_info(&mut rt, "copy").sectors, 4096);
+    // Read back through Lake, too.
+    let (c, sectors) = open(&mut rt, "copy", true);
+    assert_eq!(sectors, 4096);
+    assert_eq!(read(&mut rt, c, 100, 2048), data);
+    assert_eq!(read(&mut rt, c, 4095, 1), [0x5a; 512]);
+    rt.request_ok(&Message::BlockClose { handle: c }).unwrap();
+
+    // A bigger copy: zeros after the source's end.
+    rt.request_ok(&clone("bigger", "base", 6000)).unwrap();
+    let bigger = std::fs::read(dir.path().join("bigger")).unwrap();
+    assert_eq!(bigger.len(), 6000 * 512);
+    assert_eq!(bigger[..base.len()], base[..]);
+    assert!(bigger[base.len()..].iter().all(|&b| b == 0));
+
+    // The copy is a disk of its own: writing it leaves the source as it was.
+    let (c, _) = open(&mut rt, "copy", false);
+    write(&mut rt, c, 100, &[0xee; 512]);
+    rt.request_ok(&Message::BlockClose { handle: c }).unwrap();
+    assert_eq!(std::fs::read(dir.path().join("base")).unwrap(), base);
+
+    // Readers do not stop a clone, and keep their attachment.
+    let (r, _) = open(&mut other, "base", true);
+    rt.request_ok(&clone("while-read", "base", 0)).unwrap();
+    assert_eq!(disk_info(&mut rt, "base").readers, 1);
+    other.request_ok(&Message::BlockClose { handle: r }).unwrap();
+
+    // Refusals.
+    for (msg, code) in [
+        (clone("x", "missing", 0), ErrorCode::NoSuchDisk),
+        (clone("copy", "base", 0), ErrorCode::AlreadyExists),
+        (clone("x", "base", 4095), ErrorCode::OutOfRange),
+        (clone("x", "base", 1), ErrorCode::OutOfRange),
+        (clone("x", "base", 8193), ErrorCode::OverBudget),
+        (clone("X", "base", 0), ErrorCode::InvalidName),
+        (clone("x", "../base", 0), ErrorCode::InvalidName),
+        (clone("x", "", 0), ErrorCode::InvalidName),
+        (clone("con", "base", 0), ErrorCode::InvalidName),
+    ] {
+        assert_eq!(error_of(&mut rt, &msg), code, "{msg:?}");
+    }
+    // A file that is not a disk is no source, and a name in use by one is taken.
+    std::fs::write(dir.path().join("odd"), [1; 100]).unwrap();
+    assert_eq!(error_of(&mut rt, &clone("x", "odd", 0)), ErrorCode::NoSuchDisk);
+    assert_eq!(
+        error_of(&mut rt, &clone("odd", "base", 0)),
+        ErrorCode::AlreadyExists
+    );
+
+    let names: Vec<String> = list(&mut rt).into_iter().map(|d| d.name).collect();
+    assert_eq!(names, ["base", "bigger", "copy", "while-read"]);
+    // No copy in progress was left behind.
+    let mut files: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["base", "bigger", "copy", "odd", "while-read"]);
+    // Every attachment was released: each can be deleted.
+    for name in &names {
+        rt.request_ok(&Message::DiskDelete { name: name.clone() })
+            .unwrap();
+    }
+    server.stop().unwrap();
+}
+
 #[test]
 fn a_size_limit_of_its_own() {
     let dir = TempDir::new("limit");
@@ -96,6 +192,7 @@ fn a_size_limit_of_its_own() {
         &Message::DiskCreate {
             name: "over".into(),
             sectors: 17,
+            source: None,
         },
     );
     assert_eq!(code, ErrorCode::OverBudget);
@@ -400,6 +497,24 @@ fn misdirected_and_malformed_frames() {
     );
     expect_reply(&mut conn, frame(ty::LIST_DISKS, &[0]), Some(ErrorCode::Malformed));
     expect_reply(&mut conn, frame(ty::DISK_CREATE, &[]), Some(ErrorCode::Malformed));
+    // A version 6 DiskCreate (no source), and a source whose option tag is not 0 or 1,
+    // or whose name is cut short.
+    let mut create = 1u32.to_le_bytes().to_vec();
+    create.push(b'c');
+    create.extend(8u64.to_le_bytes());
+    expect_reply(
+        &mut conn,
+        frame(ty::DISK_CREATE, &create),
+        Some(ErrorCode::Malformed),
+    );
+    for source in [&[2][..], &[1, 9, 0, 0, 0, b'd']] {
+        let payload = [&create[..], source].concat();
+        expect_reply(
+            &mut conn,
+            frame(ty::DISK_CREATE, &payload),
+            Some(ErrorCode::Malformed),
+        );
+    }
     // Events are never answered, good or bad.
     expect_reply(&mut conn, frame(ty::CONSOLE_INPUT, &[1]), None);
     let input = Frame::from_message(&Message::ConsoleInput {

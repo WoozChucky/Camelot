@@ -11,8 +11,9 @@ use crate::console::Hub;
 use crate::http::{Request, Response};
 use crate::json::Json;
 use avalon_client::{
-    format_hz, format_size, holds_disks, lake_disks, mac_text, parse_clock, parse_disk_size,
-    parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_ram, Client, Timeouts, VmAction,
+    create_camelot_vm, format_hz, format_size, holds_disks, lake_disks, mac_text, parse_clock,
+    parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_ram, CamelotError,
+    Client, Timeouts, VmAction, CAMELOT_IMAGE,
 };
 use avalon_proto::{
     validate_name, DeviceSpec, DiskInfo, DiskSpec, ErrorCode, HardwareProfile, NatConfig, PortOwner,
@@ -111,6 +112,25 @@ fn status_of(code: Option<ErrorCode>) -> u16 {
         Some(ErrorCode::InvalidName | ErrorCode::InvalidProfile | ErrorCode::InvalidProgram) => 422,
         // The server failed, misunderstood, or could not be reached.
         _ => 502,
+    }
+}
+
+/// A Camelot VM that could not be made: its copy of the image (Lake) or the VM itself
+/// (Avalon).
+fn camelot_fail(e: CamelotError) -> Fail {
+    match e {
+        CamelotError::Name(why) => Fail::bad(format!("name: {why}")),
+        CamelotError::NoBaseImage { .. } => Fail {
+            status: 404,
+            message: e.to_string(),
+            code: e.code(),
+        },
+        CamelotError::Lake { disk, cause } => {
+            let mut fail = client_fail("Lake", cause);
+            fail.message = format!("cannot create disk {disk}: {}", fail.message);
+            fail
+        }
+        CamelotError::Avalon(cause) => client_fail("Avalon", cause),
     }
 }
 
@@ -361,9 +381,19 @@ impl App {
     fn create_vm(&self, req: &Request) -> Reply {
         let create = parse_create(&body_json(req)?)?;
         let mut avalon = self.avalon()?;
-        let id = avalon
-            .create_vm(&create.name, create.profile, create.program)
-            .map_err(|e| client_fail("Avalon", e))?;
+        let (id, disk) = if create.camelot {
+            // Its own copy of Lake's Camelot image, as Round Table's create --camelot.
+            let mut lake = self.lake()?;
+            let (id, disk) =
+                create_camelot_vm(&mut avalon, &mut lake, &self.lake, &create.name, create.profile)
+                    .map_err(camelot_fail)?;
+            (id, Some(disk))
+        } else {
+            let id = avalon
+                .create_vm(&create.name, create.profile, create.program)
+                .map_err(|e| client_fail("Avalon", e))?;
+            (id, None)
+        };
         if create.start {
             if let Err(e) = avalon.start_vm(&VmRef::Id(id)) {
                 // Say what did happen before the error, as Round Table does.
@@ -381,6 +411,7 @@ impl App {
                 ("id", id.into()),
                 ("name", create.name.into()),
                 ("started", create.start.into()),
+                ("disk", disk.into()),
             ]),
         ))
     }
@@ -458,6 +489,9 @@ impl App {
             200,
             Json::object([
                 ("lake", self.lake.as_str().into()),
+                // The image a Camelot VM's disk is a copy of: the new-VM form offers
+                // Camelot first when Lake has it.
+                ("camelot_image", CAMELOT_IMAGE.into()),
                 ("disks", Json::Array(disks)),
                 ("vms_error", vms.err().map(|f| f.message).into()),
             ]),
@@ -792,22 +826,29 @@ fn flag(body: &Json, key: &str) -> Result<bool, Fail> {
 struct Create {
     name: String,
     profile: HardwareProfile,
+    /// Empty: boot from disk 0.
     program: Vec<u8>,
+    /// Boot Camelot from a copy of Lake's image `camelot`, made first.
+    camelot: bool,
     start: bool,
 }
 
 /// `{"name", "ram", "clock", "harts", "disks": [{"source", "read_only"}], "nets":
-/// [{"switch", "mac"}], "program", "start"}`: `ram`, `clock` and `harts` as Round Table's
-/// `--ram`, `--clock` and `--harts` take them (a number of MiB, a frequency with
-/// Hz/kHz/MHz, a number of harts; an empty clock is full speed, an empty hart count one
-/// hart), each disk source a path on Avalon's host or `lake://ADDR/NAME`, each network
-/// card the switch to plug it into (empty or null: none) and its MAC address (empty or
-/// null: Avalon makes one up), the program an ELF file in base64.
+/// [{"switch", "mac"}], "camelot", "program", "start"}`: `ram`, `clock` and `harts` as
+/// Round Table's `--ram`, `--clock` and `--harts` take them (a number of MiB, a frequency
+/// with Hz/kHz/MHz, a number of harts; an empty clock is full speed, an empty hart count
+/// one hart), each disk source a path on Avalon's host or `lake://ADDR/NAME`, each
+/// network card the switch to plug it into (empty or null: none) and its MAC address
+/// (empty or null: Avalon makes one up), the program an ELF file in base64. `camelot`
+/// true boots Camelot from `<name>-root`, a copy of Lake's image `camelot` that goes
+/// before the other disks, as Round Table's `create --camelot`; it takes no program.
+/// Otherwise the program may be left out when there is a disk: the VM boots from the
+/// first.
 fn parse_create(body: &Json) -> Result<Create, Fail> {
     only_keys(
         body,
         &[
-            "name", "ram", "clock", "harts", "disks", "nets", "program", "start",
+            "name", "ram", "clock", "harts", "disks", "nets", "camelot", "program", "start",
         ],
     )?;
     let name = string(body, "name")?.ok_or_else(|| Fail::bad("name: a VM needs a name"))?;
@@ -869,15 +910,39 @@ fn parse_create(body: &Json) -> Result<Create, Fail> {
         }
         Some(_) => return Err(Fail::bad("nets: not a list")),
     }
-    let program = string(body, "program")?.ok_or_else(|| Fail::bad("program: choose an ELF file to run"))?;
-    let program = base64::decode(program).map_err(|e| Fail::bad(format!("program: {e}")))?;
-    if program.is_empty() {
-        return Err(Fail::bad("program: the file is empty"));
+    let camelot = flag(body, "camelot")?;
+    let program = match (string(body, "program")?, camelot) {
+        (Some(_), true) => {
+            return Err(Fail::bad(
+                "program: a Camelot VM boots from its disk, and takes no program",
+            ))
+        }
+        (Some(program), false) => {
+            let program = base64::decode(program).map_err(|e| Fail::bad(format!("program: {e}")))?;
+            if program.is_empty() {
+                return Err(Fail::bad("program: the file is empty"));
+            }
+            program
+        }
+        (None, _) => Vec::new(),
+    };
+    let has_disk = profile.devices.iter().any(|d| matches!(d, DeviceSpec::Disk(_)));
+    if program.is_empty() && !camelot && !has_disk {
+        return Err(Fail::bad(
+            "program: choose an ELF file to run, or a disk to boot from",
+        ));
+    }
+    if camelot && validate_name(&avalon_client::camelot_root(name)).is_err() {
+        return Err(Fail::bad(format!(
+            "name: '{name}' is too long for a Camelot VM, whose disk is named {}",
+            avalon_client::camelot_root(name)
+        )));
     }
     Ok(Create {
         name: name.to_string(),
         profile,
         program,
+        camelot,
         start: flag(body, "start")?,
     })
 }
@@ -1196,7 +1261,28 @@ mod tests {
             ]
         );
 
+        // Camelot: no program, nor any disk of its own; or no program but a disk.
+        let c = create(r#"{"name": "os", "camelot": true, "nets": [{"switch": "nat"}]}"#).unwrap();
+        assert!(c.camelot && c.program.is_empty());
+        assert_eq!(c.profile.devices, [net(Some("nat"), None)]);
+        let c = create(r#"{"name": "os", "camelot": false, "disks": [{"source": "d.img"}]}"#).unwrap();
+        assert!(!c.camelot && c.program.is_empty());
+        let c = create(r#"{"name": "os", "camelot": null, "program": null, "disks": [{"source": "d.img"}]}"#)
+            .unwrap();
+        assert!(!c.camelot && c.program.is_empty());
+
         for (text, why) in [
+            (
+                r#"{"name": "a", "camelot": true, "program": "AA=="}"#,
+                "program: a Camelot VM boots from its disk, and takes no program",
+            ),
+            (r#"{"name": "a", "camelot": "yes"}"#, "camelot: not true or false"),
+            (r#"{"name": "a", "camelot": false}"#, "program: choose an ELF file to run, or a disk"),
+            (r#"{"name": "a", "disks": []}"#, "program: choose an ELF file to run, or a disk"),
+            (
+                r#"{"name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "camelot": true}"#,
+                "name: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' is too long for a Camelot VM",
+            ),
             (r#"{"program": "AA=="}"#, "name: a VM needs a name"),
             (
                 r#"{"name": "Web", "program": "AA=="}"#,

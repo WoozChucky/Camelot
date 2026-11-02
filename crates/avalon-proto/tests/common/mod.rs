@@ -223,6 +223,12 @@ pub fn samples() -> Vec<Message> {
         DiskCreate {
             name: "root.img".into(),
             sectors: 131_072,
+            source: None,
+        },
+        DiskCreate {
+            name: "web-root".into(),
+            sectors: 0,
+            source: Some("camelot".into()),
         },
         ListDisks,
         DiskList { disks: Vec::new() },

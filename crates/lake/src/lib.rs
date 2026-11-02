@@ -1,7 +1,7 @@
 //! Lake: the storage server of the Avalon platform. It keeps a directory of disk images
 //! and serves them over the Avalon protocol (`docs/avalon-protocol.md`): disk
-//! management (`DiskCreate`, `ListDisks`, `DiskDelete`, what Round Table's `disk`
-//! commands will send) and block I/O (`BlockOpen`, `BlockRead`, `BlockWrite`, `BlockFlush`,
+//! management (`DiskCreate`, a new image or a copy of one, `ListDisks`, `DiskDelete`,
+//! what Round Table's `disk` commands send) and block I/O (`BlockOpen`, `BlockRead`, `BlockWrite`, `BlockFlush`,
 //! `BlockSize`, `BlockClose`, what Grail's network disk sends for a VM whose profile
 //! names `lake://addr/name`). So a VM's disk can live in another process, or on
 //! another machine, and outlive the VM.

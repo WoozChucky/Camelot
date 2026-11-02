@@ -481,10 +481,25 @@ impl Session<'_> {
             }
             Message::Ping { token } => Message::Pong { token },
 
-            Message::DiskCreate { name, sectors } => {
+            Message::DiskCreate {
+                name,
+                sectors,
+                source: None,
+            } => {
                 store.create(&name, sectors)?;
                 if server.log {
                     eprintln!("lake: disk '{name}' created: {sectors} sectors");
+                }
+                Message::Ok
+            }
+            Message::DiskCreate {
+                name,
+                sectors,
+                source: Some(source),
+            } => {
+                let sectors = store.clone_from(&name, &source, sectors)?;
+                if server.log {
+                    eprintln!("lake: disk '{name}' created from '{source}': {sectors} sectors");
                 }
                 Message::Ok
             }

@@ -240,7 +240,11 @@ fn serve(stream: TcpStream, disks: &Mutex<BTreeMap<String, DiskInfo>>, agents: &
         let fail = |code, message: String| Message::Error { code, message };
         let reply = match msg {
             Message::Ping { token } => Message::Pong { token },
-            Message::DiskCreate { name, sectors } => {
+            Message::DiskCreate {
+                name,
+                sectors,
+                source: None,
+            } => {
                 let mut disks = disks.lock().unwrap();
                 if let Err(e) = validate_name(&name) {
                     fail(ErrorCode::InvalidName, e)

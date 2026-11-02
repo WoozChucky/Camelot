@@ -6,71 +6,23 @@ use avalon_proto::{Connection, VmRef, DEFAULT_AVALON_ADDR};
 use grail::console::{self, RawMode, RawOptions};
 #[cfg(windows)]
 use herald::End;
-use herald::{parse_server, Session, Utf8Lossy, AGENT, DETACH_KEY_NAME};
+use herald::{parse_args, Args, Session, Utf8Lossy, AGENT, DETACH_KEY_NAME, USAGE};
 use std::io::{self, IsTerminal, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: herald [--server ADDR] [--screen] <vm>
-
-Attaches to the serial console of a VM on an Avalon server: prints its recent
-output, then streams the output live and sends what you type to the VM. <vm> is a
-VM id (all digits) or a VM name.
-
-  --server ADDR   the Avalon server: host:port, or a host or IP address for port
-                  7400 (default 127.0.0.1:7400)
-  --screen        show the VM's screen (its framebuffer) in a window instead, and
-                  send the keys typed and the mouse moved over it to the VM's
-                  keyboard and pointer devices. Closing the window detaches; when
-                  the VM ends, the window stays on its last frame until closed.
-                  Windows only
-  -h, --help      show this text
-
-On the console, Ctrl-] detaches and leaves the VM running; so does the end of
-the input when it is not a terminal (where Ctrl-] still detaches). Herald also
-ends when the VM stops, exits or is destroyed. Ctrl-C leaves Herald at once, the
-VM running. Any number of Heralds may attach to one VM, to its console or its
-screen: all of them see its output, and what any of them types reaches it.
-
-Exit status: 0 when detached or when the VM ended, 1 on an error (no server, no
-such VM, connection lost, console output failed, --screen without a window), 2
-for bad arguments; Ctrl-C gives the usual status of an interrupted program (130
-on Linux, STATUS_CONTROL_C_EXIT on Windows).";
-
 fn main() -> ExitCode {
-    let mut server = None;
-    let mut vm = None;
-    let mut screen = false;
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        let parsed = match a.as_str() {
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                return ExitCode::SUCCESS;
-            }
-            "--screen" => {
-                screen = true;
-                Ok(())
-            }
-            "--server" => match args.next() {
-                Some(s) => parse_server(&s).map(|addrs| server = Some((s, addrs))),
-                None => Err("--server needs a value".to_string()),
-            },
-            _ if a.starts_with('-') && a.len() > 1 => Err(format!("unknown option '{a}'\n\n{USAGE}")),
-            _ if vm.is_some() => Err(format!("one VM at a time ('{a}' is one too many)\n\n{USAGE}")),
-            _ => {
-                vm = Some(VmRef::parse(&a));
-                Ok(())
-            }
-        };
-        if let Err(e) = parsed {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Args { server, screen, vm } = match parse_args(&args) {
+        Ok(Some(args)) => args,
+        Ok(None) => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
             eprintln!("herald: {e}");
             return ExitCode::from(2);
         }
-    }
-    let Some(vm) = vm else {
-        eprintln!("{USAGE}");
-        return ExitCode::from(2);
     };
     let (server, addrs) = server.unwrap_or_else(|| {
         let default = DEFAULT_AVALON_ADDR.parse().expect("the default address parses");
