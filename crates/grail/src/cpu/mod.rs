@@ -264,7 +264,7 @@ impl Cpu {
                 self.set_reg(rd, v);
             }
             // Single hart, no caches, no instruction cache: fences are no-ops.
-            Inst::Fence | Inst::FenceI => {}
+            Inst::Fence { .. } | Inst::FenceTso | Inst::FenceI => {}
             Inst::Ecall => {
                 let cause = match self.mode {
                     Mode::U => Exception::EcallU,

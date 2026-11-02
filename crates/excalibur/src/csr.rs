@@ -28,6 +28,12 @@ pub const MEPC: u16 = 0x341;
 pub const MCAUSE: u16 = 0x342;
 pub const MTVAL: u16 = 0x343;
 pub const MIP: u16 = 0x344;
+// Smrnmi (resumable NMI). Grail does not implement these; riscv-tests
+// touches mnstatus, so the disassembler knows the names.
+pub const MNSCRATCH: u16 = 0x740;
+pub const MNEPC: u16 = 0x741;
+pub const MNCAUSE: u16 = 0x742;
+pub const MNSTATUS: u16 = 0x744;
 pub const PMPCFG0: u16 = 0x3a0;
 pub const PMPADDR0: u16 = 0x3b0;
 
@@ -106,6 +112,10 @@ pub fn name(addr: u16) -> Option<&'static str> {
         MCAUSE => "mcause",
         MTVAL => "mtval",
         MIP => "mip",
+        MNSCRATCH => "mnscratch",
+        MNEPC => "mnepc",
+        MNCAUSE => "mncause",
+        MNSTATUS => "mnstatus",
         MCYCLE => "mcycle",
         MINSTRET => "minstret",
         MCYCLEH => "mcycleh",
@@ -121,6 +131,44 @@ pub fn name(addr: u16) -> Option<&'static str> {
         MIMPID => "mimpid",
         MHARTID => "mhartid",
         MCONFIGPTR => "mconfigptr",
+        a if (PMPCFG0..PMPCFG0 + 4).contains(&a) => PMPCFG_NAMES[(a - PMPCFG0) as usize],
+        a if (PMPADDR0..PMPADDR0 + 16).contains(&a) => PMPADDR_NAMES[(a - PMPADDR0) as usize],
         _ => return None,
     })
+}
+
+const PMPCFG_NAMES: [&str; 4] = ["pmpcfg0", "pmpcfg1", "pmpcfg2", "pmpcfg3"];
+const PMPADDR_NAMES: [&str; 16] = [
+    "pmpaddr0",
+    "pmpaddr1",
+    "pmpaddr2",
+    "pmpaddr3",
+    "pmpaddr4",
+    "pmpaddr5",
+    "pmpaddr6",
+    "pmpaddr7",
+    "pmpaddr8",
+    "pmpaddr9",
+    "pmpaddr10",
+    "pmpaddr11",
+    "pmpaddr12",
+    "pmpaddr13",
+    "pmpaddr14",
+    "pmpaddr15",
+];
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn names_round_trip() {
+        for a in 0..4096u16 {
+            if let Some(n) = super::name(a) {
+                assert_eq!(super::parse(n), Some(a), "{n}");
+            }
+        }
+        assert_eq!(super::name(0x3a1), Some("pmpcfg1"));
+        assert_eq!(super::name(0x3bf), Some("pmpaddr15"));
+        assert_eq!(super::parse("pmpaddr3"), Some(0x3b3));
+        assert_eq!(super::name(0x7c0), None);
+    }
 }

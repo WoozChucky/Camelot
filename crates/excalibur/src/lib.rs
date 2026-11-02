@@ -1,8 +1,8 @@
 //! Excalibur ISA definitions.
 //!
 //! This crate is the single source of truth for instruction encodings. Grail
-//! (the emulator) uses [`decode`] to execute, the disassembler uses the
-//! [`std::fmt::Display`] impl on [`Inst`], and merlin-as will use the same
+//! (the emulator) uses [`decode`] to execute, disassemblers use [`Inst::format`]
+//! (or the plain [`std::fmt::Display`] impl on [`Inst`]), and merlin-as will use the same
 //! tables to encode.
 
 pub mod csr;
@@ -11,6 +11,7 @@ mod disasm;
 pub mod reg;
 
 pub use decode::decode;
+pub use disasm::{Disasm, Syntax};
 
 /// Register index, 0..=31.
 pub type Reg = u8;
@@ -166,7 +167,15 @@ pub enum Inst {
         rs1: Reg,
         rs2: Reg,
     },
-    Fence,
+    /// `pred`/`succ` are the 4-bit I/O/R/W sets (bit 3 = I ... bit 0 = W).
+    /// Reserved encodings (non-zero rd/rs1, unknown `fm`) decode as a plain
+    /// fence, as the base ISA requires.
+    Fence {
+        pred: u8,
+        succ: u8,
+    },
+    /// `fence.tso` (fm = 1000, pred = succ = RW).
+    FenceTso,
     FenceI,
     Ecall,
     Ebreak,
