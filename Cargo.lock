@@ -37,6 +37,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "herald"
+version = "0.1.0"
+dependencies = [
+ "avalon",
+ "avalon-proto",
+ "grail",
+]
+
+[[package]]
 name = "merlin"
 version = "0.1.0"
 dependencies = [

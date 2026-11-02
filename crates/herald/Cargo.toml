@@ -1,0 +1,15 @@
+[package]
+name = "herald"
+description = "Herald, the Avalon client that attaches to one VM: its serial console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+avalon-proto = { path = "../avalon-proto" }
+# The terminal's raw mode (grail::console::RawMode), shared with Grail's own console.
+grail = { path = "../grail" }
+
+[dev-dependencies]
+# The tests run an Avalon server in process.
+avalon = { path = "../avalon" }

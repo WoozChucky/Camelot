@@ -1,0 +1,212 @@
+//! The `herald` binary with pipes for stdin, stdout and stderr (a terminal is
+//! `tests/terminal.rs`): flags, errors, a session with the detach key, the end of
+//! the input, and a VM that has already exited.
+
+mod common;
+
+use avalon_proto::VmState;
+use common::*;
+use herald::DETACH_KEY;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::Instant;
+
+fn herald() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_herald"))
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn help_and_bad_flags() {
+    let out = herald().arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.starts_with("usage: herald [--server ADDR] <vm>"), "{text}");
+    assert!(text.contains("Ctrl-] detaches"), "{text}");
+    for args in [
+        &[][..],
+        &["--bogus", "vm"],
+        &["--server"],
+        &["--server", "not an address", "vm"],
+        &["one", "two"],
+    ] {
+        let out = herald().args(args).stdin(Stdio::null()).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let err = stderr(&out);
+        assert!(
+            err.starts_with("herald: ") || err.starts_with("usage: "),
+            "{args:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn nothing_to_connect_to() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let out = herald()
+        .args(["--server", &format!("127.0.0.1:{port}"), "vm"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.starts_with(&format!("herald: cannot connect to 127.0.0.1:{port}: ")),
+        "{err}"
+    );
+}
+
+#[test]
+fn no_such_vm() {
+    let server = server();
+    let out = herald()
+        .args(["--server", &server.addr().to_string(), "ghost"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.starts_with("herald: cannot attach to VM ghost: no such VM"),
+        "{err}"
+    );
+    server.stop().unwrap();
+}
+
+/// Spawns `herald <vm>` against `server` with all three streams piped, and waits for
+/// its "attached" line on stderr.
+fn spawn(server: &avalon::ServerThread, vm: &str) -> (Child, String) {
+    let mut child = herald()
+        .args(["--server", &server.addr().to_string(), vm])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    stderr.read_line(&mut line).unwrap();
+    // The rest of stderr, read on a thread so the child never blocks on it.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut rest = String::new();
+        let _ = stderr.read_to_string(&mut rest);
+        let _ = tx.send(rest);
+    });
+    REST.with(|r| *r.borrow_mut() = Some(rx));
+    (child, line)
+}
+
+thread_local! {
+    /// The rest of the last spawned child's stderr.
+    static REST: std::cell::RefCell<Option<mpsc::Receiver<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn rest_of_stderr() -> String {
+    REST.with(|r| r.borrow_mut().take().unwrap().recv_timeout(SLOW).unwrap())
+}
+
+/// Reads the child's stdout until it holds `needle`.
+fn read_until(stdout: &mut impl Read, seen: &mut Vec<u8>, needle: &str) {
+    let start = Instant::now();
+    let mut buf = [0u8; 256];
+    while !String::from_utf8_lossy(seen).contains(needle) {
+        assert!(start.elapsed() < SLOW, "waiting for {needle:?}, got {seen:?}");
+        let n = stdout.read(&mut buf).unwrap();
+        assert!(n > 0, "stdout ended waiting for {needle:?}, got {seen:?}");
+        seen.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// Typing at the VM through the binary, then the detach key: Herald exits, the VM
+/// carries on.
+#[test]
+fn a_session_through_pipes() {
+    let server = server();
+    let id = start_vm(&server, "echo", 1, example("uart-echo"));
+    let (mut child, line) = spawn(&server, "echo");
+    assert_eq!(
+        line.trim_end(),
+        format!(
+            "herald: attached to VM {id} 'echo' (running) on {}; the end of the input detaches",
+            server.addr()
+        )
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut seen = Vec::new();
+    stdin.write_all(b"hi there\n").unwrap();
+    read_until(&mut stdout, &mut seen, "hi there\n");
+    stdin.write_all(b"!").unwrap();
+    read_until(&mut stdout, &mut seen, "!");
+    // The detach key works through a pipe too.
+    stdin.write_all(&[DETACH_KEY]).unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    stdout.read_to_end(&mut seen).unwrap();
+    assert_eq!(seen, b"hi there\n!");
+    let err = rest_of_stderr();
+    assert_eq!(
+        err.trim_end(),
+        format!("herald: detached from VM {id} 'echo', which carries on")
+    );
+    assert_eq!(state(&server, id), VmState::Running);
+
+    // With stdin at its end at once: the scrollback, and out.
+    let out = herald()
+        .args(["--server", &server.addr().to_string(), &id.to_string()])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"hi there\n!");
+    assert!(
+        stderr(&out).ends_with(&format!(
+            "herald: end of input: detached from VM {id} 'echo', which carries on\n"
+        )),
+        "{}",
+        stderr(&out)
+    );
+    server.stop().unwrap();
+}
+
+/// A VM that exits ends Herald with it; one that has already exited shows its
+/// scrollback and ends at once, with input still open.
+#[test]
+fn the_vm_exiting_ends_herald() {
+    let server = server();
+    let id = start_vm(&server, "echo", 1, example("uart-echo"));
+    let (mut child, _) = spawn(&server, "echo");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"bye").unwrap();
+    stdin.write_all(&[4]).unwrap(); // EOT halts uart-echo
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"bye");
+    assert_eq!(
+        rest_of_stderr().trim_end(),
+        format!("herald: VM {id} 'echo' exited with code 0")
+    );
+    assert_eq!(state(&server, id), VmState::Exited(0));
+
+    let (mut child, line) = spawn(&server, &id.to_string());
+    assert!(line.contains("(exited(0))"), "{line}");
+    // Held open: Herald ends because of the VM, not the input.
+    let _stdin = child.stdin.take().unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"bye");
+    assert_eq!(
+        rest_of_stderr().trim_end(),
+        format!("herald: VM {id} 'echo' exited with code 0")
+    );
+    server.stop().unwrap();
+}
