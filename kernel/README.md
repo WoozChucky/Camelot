@@ -36,6 +36,10 @@ works too:
 printf 'ticks\nhalt\n' | cargo run --release -p grail -- kernel/kernel.elf
 ```
 
+Piped or redirected input must end with `halt`, or give Grail `--max-steps`:
+when the input runs out the kernel keeps waiting at the prompt, and Grail
+keeps running.
+
 Without `--clock`, Grail runs at full speed and skips every `wfi` to the next
 timer tick, so while the shell waits for a key the tick count races ahead;
 with `--clock 10MHz` it counts ten a second.

@@ -15,7 +15,8 @@
 
 /* The mtime frequency the kernel derives every interval from: SYS_TIMEBASE_HZ
  * from sysinfo (spec section 9.5), read on the first call (timer_init, in
- * M-mode) and remembered, or TIMEBASE_HZ_NOMINAL if SYS_MAGIC is wrong. */
+ * M-mode) and remembered, or TIMEBASE_HZ_NOMINAL if SYS_MAGIC is wrong or
+ * SYS_TIMEBASE_HZ reads 0. */
 u32 timebase_hz(void);
 
 /* mtime ticks between two timer interrupts: timebase_hz() / TICK_HZ, at

@@ -13,14 +13,35 @@ use std::sync::mpsc::{self, Receiver};
 
 /// Bytes read from `src` on a background thread, until it ends or fails. Hand the
 /// receiver to [`crate::Machine::set_uart_input`].
-pub fn input_channel(mut src: impl Read + Send + 'static) -> Receiver<u8> {
+pub fn input_channel(src: impl Read + Send + 'static) -> Receiver<u8> {
+    reader(src, None)
+}
+
+/// [`input_channel`] reading this process's stdin. For a terminal in raw mode, use
+/// [`RawMode::stdin_channel`] instead.
+pub fn stdin_channel() -> Receiver<u8> {
+    input_channel(std::io::stdin())
+}
+
+/// The reader thread behind the channels. An empty read is the end of `src`, unless
+/// `empty_read` is a byte: then it stands for that byte and reading goes on.
+fn reader(mut src: impl Read + Send + 'static, empty_read: Option<u8>) -> Receiver<u8> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = [0u8; 256];
-        while let Ok(n) = src.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
+        loop {
+            let n = match src.read(&mut buf) {
+                Ok(0) => match empty_read {
+                    Some(b) => {
+                        buf[0] = b;
+                        1
+                    }
+                    None => return,
+                },
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
+            };
             for &b in &buf[..n] {
                 if tx.send(b).is_err() {
                     return;
@@ -29,11 +50,6 @@ pub fn input_channel(mut src: impl Read + Send + 'static) -> Receiver<u8> {
         }
     });
     rx
-}
-
-/// [`input_channel`] reading this process's stdin.
-pub fn stdin_channel() -> Receiver<u8> {
-    input_channel(std::io::stdin())
 }
 
 /// While alive, stdin delivers each key as soon as it is typed, without the terminal
@@ -45,9 +61,9 @@ pub fn stdin_channel() -> Receiver<u8> {
 /// stdin is not a terminal (a pipe or a file), [`RawMode::enable`] returns `None` and
 /// changes nothing.
 ///
-/// Enable it before [`stdin_channel`]: a read already waiting on a Windows console
-/// keeps the mode it started in, so the first line would still be edited and echoed
-/// by the console.
+/// Read the terminal through [`RawMode::stdin_channel`], which can only start once
+/// raw mode is on: a read already waiting on a Windows console keeps the mode it
+/// started in, so the first line would still be edited and echoed by the console.
 pub struct RawMode {
     saved: sys::Saved,
 }
@@ -55,6 +71,15 @@ pub struct RawMode {
 impl RawMode {
     pub fn enable() -> Option<RawMode> {
         sys::enable().map(|saved| RawMode { saved })
+    }
+
+    /// [`stdin_channel`] for the terminal in raw mode: every key, as typed, until the
+    /// terminal goes away. On Windows a lone Ctrl-Z reads as nothing at all (Rust's
+    /// console stdin drops a Ctrl-Z that ends a read), which is not the end of the
+    /// input there: it is passed on as the 0x1A it was, the way Ctrl-D reaches the
+    /// guest as 0x04 from a raw Linux terminal.
+    pub fn stdin_channel(&self) -> Receiver<u8> {
+        reader(std::io::stdin(), sys::EMPTY_READ)
     }
 }
 
@@ -74,6 +99,10 @@ mod sys {
 
     /// The console's input mode before [`enable`].
     pub type Saved = u32;
+
+    /// What an empty read of the raw console means: a lone Ctrl-Z, removed by Rust's
+    /// console stdin (see [`super::RawMode::stdin_channel`]).
+    pub const EMPTY_READ: Option<u8> = Some(0x1a);
 
     /// What the Ctrl-C handler restores. One console per process, so one copy.
     static SAVED_MODE: AtomicU32 = AtomicU32::new(0);
@@ -168,6 +197,10 @@ mod sys {
 
     pub type Saved = Termios;
 
+    /// A raw terminal's reads wait for at least one byte (`VMIN` 1), so an empty one
+    /// is the end: the terminal hung up.
+    pub const EMPTY_READ: Option<u8> = None;
+
     /// What the signal handler restores (set once; the first saved state is the
     /// terminal's real one).
     static SAVED: OnceLock<Termios> = OnceLock::new();
@@ -230,6 +263,8 @@ mod sys {
 mod sys {
     pub type Saved = ();
 
+    pub const EMPTY_READ: Option<u8> = None;
+
     pub fn enable() -> Option<Saved> {
         None
     }
@@ -247,6 +282,40 @@ mod tests {
         let rx = input_channel(std::io::Cursor::new(data.clone()));
         let got: Vec<u8> = rx.iter().collect();
         assert_eq!(got, data);
+    }
+
+    /// Reads that return `chunks` in turn, then an error. An `Err` chunk is an
+    /// interrupted read.
+    struct Chunks(std::collections::VecDeque<Result<&'static [u8], ()>>);
+
+    impl Read for Chunks {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                Some(Ok(c)) => {
+                    buf[..c.len()].copy_from_slice(c);
+                    Ok(c.len())
+                }
+                Some(Err(())) => Err(std::io::ErrorKind::Interrupted.into()),
+                None => Err(std::io::ErrorKind::BrokenPipe.into()),
+            }
+        }
+    }
+
+    fn chunks() -> Chunks {
+        Chunks([Ok(&b"ab"[..]), Err(()), Ok(b""), Ok(b"c")].into())
+    }
+
+    #[test]
+    fn an_empty_read_ends_the_input() {
+        let got: Vec<u8> = reader(chunks(), None).iter().collect();
+        assert_eq!(got, b"ab");
+    }
+
+    #[test]
+    fn an_empty_read_of_a_raw_console_is_a_key() {
+        // A lone Ctrl-Z on Windows: passed on, and reading goes on.
+        let got: Vec<u8> = reader(chunks(), Some(0x1a)).iter().collect();
+        assert_eq!(got, b"ab\x1ac");
     }
 
     #[cfg(windows)]

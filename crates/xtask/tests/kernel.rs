@@ -3,10 +3,13 @@
 //! also rebuilt from source and checked against the committed image.
 
 use excalibur::csr::{
-    IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP,
+    IRQ_M_EXT, IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP,
 };
 use excalibur::reg;
+use grail::bus::{PLIC_BASE, SYSINFO_BASE, SYSINFO_SIZE, UART_BASE};
 use grail::cpu::Mode;
+use grail::devices::UART_IRQ;
+use grail::sysinfo::{REG_MAGIC, REG_TIMEBASE_HZ};
 use grail::trap::INTERRUPT_BIT;
 use grail::{Machine, MachineConfig, RunResult};
 use std::collections::HashMap;
@@ -729,8 +732,7 @@ fn fault_with_interrupts_off_panics() {
 
 // ---- The console and the shell ----
 
-/// The UART (spec section 7) and the registers the tests look for.
-const UART_BASE: u32 = 0x1000_0000;
+/// The UART registers the tests look for (spec section 7).
 const UART_RBR: u32 = 0;
 const UART_IER: u32 = 1;
 const UART_LSR: u32 = 5;
@@ -738,7 +740,6 @@ const UART_LSR: u32 = 5;
 const UART_IER_ERBFI: u32 = 1;
 
 /// PLIC registers (spec section 7.1) for source `src` / context `ctx`.
-const PLIC_BASE: u32 = 0x0c00_0000;
 fn plic_priority(src: u32) -> u32 {
     PLIC_BASE + 4 * src
 }
@@ -748,8 +749,6 @@ fn plic_enable(ctx: u32) -> u32 {
 fn plic_threshold(ctx: u32) -> u32 {
     PLIC_BASE + 0x20_0000 + 0x1000 * ctx
 }
-const PLIC_UART_IRQ: u32 = 1;
-const IRQ_M_EXT: u32 = 11;
 
 /// The size of the kernel's receive ring buffer (`UART_RX_SIZE` in
 /// kernel/include/uart.h).
@@ -762,19 +761,35 @@ ticks   timer ticks since boot (10 per second)
 halt    stop the machine
 ";
 
-/// A UART register access by the instruction about to run: (offset, store?,
-/// stored value). Paging is off, so the address is physical.
-fn uart_access(cpu: &grail::cpu::Cpu) -> Option<(u32, bool, u32)> {
+/// A memory access by the instruction about to run.
+struct Access {
+    addr: u32,
+    /// The register a load writes; `None` for a store.
+    load_rd: Option<u8>,
+    /// The value a store writes.
+    value: u32,
+}
+
+/// The load or store the instruction about to run makes, if it is one. Paging
+/// is off, so the address is physical.
+fn mem_access(cpu: &grail::cpu::Cpu) -> Option<Access> {
     let word = cpu.bus.peek(cpu.pc)?;
-    let (base, imm, store, value) = match excalibur::decode(word) {
-        excalibur::Inst::Load { rs1, imm, .. } => (rs1, imm, false, 0),
-        excalibur::Inst::Store { rs1, rs2, imm, .. } => (rs1, imm, true, cpu.x[rs2 as usize]),
+    let (base, imm, load_rd, value) = match excalibur::decode(word) {
+        excalibur::Inst::Load { rd, rs1, imm, .. } => (rs1, imm, Some(rd), 0),
+        excalibur::Inst::Store { rs1, rs2, imm, .. } => (rs1, imm, None, cpu.x[rs2 as usize]),
         _ => return None,
     };
     let addr = cpu.x[base as usize].wrapping_add(imm as u32);
+    Some(Access { addr, load_rd, value })
+}
+
+/// A UART register access by the instruction about to run: (offset, store?,
+/// stored value).
+fn uart_access(cpu: &grail::cpu::Cpu) -> Option<(u32, bool, u32)> {
+    let a = mem_access(cpu)?;
     (UART_BASE..UART_BASE + 8)
-        .contains(&addr)
-        .then_some((addr - UART_BASE, store, value))
+        .contains(&a.addr)
+        .then_some((a.addr - UART_BASE, a.load_rd.is_none(), a.value))
 }
 
 /// The addresses of function `name` in the committed kernel, from its symbol's
@@ -916,8 +931,8 @@ fn plic_routes_the_uart_to_the_kernel() {
     let mut reg = |addr| m.cpu.bus.read(addr, 4).unwrap();
     // Source 1 (the UART) at priority 1, enabled for context 1 (S-mode) only,
     // whose threshold of 0 lets it through.
-    assert_eq!(reg(plic_priority(PLIC_UART_IRQ)), 1);
-    assert_eq!(reg(plic_enable(1)), 1 << PLIC_UART_IRQ);
+    assert_eq!(reg(plic_priority(UART_IRQ)), 1);
+    assert_eq!(reg(plic_enable(1)), 1 << UART_IRQ);
     assert_eq!(reg(plic_threshold(1)), 0);
     assert_eq!(reg(plic_enable(0)), 0);
     // sie.SEIE on (with the tick's SSIE); M-mode external interrupts stay off.
@@ -1054,6 +1069,110 @@ fn timer_interval_is_never_zero() {
     let interval = sym(&elf, "machine_scratch") + SCRATCH_INTERVAL;
     step_until(&mut m, 10_000, |_| {}, |m| m.cpu.bus.peek(interval) != Some(0));
     assert_eq!(m.cpu.bus.peek(interval), Some(1));
+}
+
+#[test]
+fn sysinfo_is_read_once_in_m_mode() {
+    // timebase_hz() reads sysinfo on its first call, from timer_init in
+    // M-mode, and keeps the value: S-mode code (kmain prints the timebase)
+    // never touches sysinfo, which stays true once paging is on.
+    let (mut m, _) = load_committed();
+    let mut reads = Vec::new();
+    let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
+        if let Some(a) = mem_access(cpu) {
+            if (SYSINFO_BASE..SYSINFO_BASE + SYSINFO_SIZE).contains(&a.addr) {
+                assert!(a.load_rd.is_some(), "store to sysinfo at {:#x}", cpu.pc);
+                reads.push((a.addr - SYSINFO_BASE, cpu.mode));
+            }
+        }
+    });
+    assert_eq!(r, RunResult::Exited(0));
+    assert_eq!(reads, [(REG_MAGIC, Mode::M), (REG_TIMEBASE_HZ, Mode::M)]);
+}
+
+/// Boots the committed kernel on a machine reporting a 2 MHz clock, but with
+/// sysinfo register `reg` reading as 0. Returns the sysinfo registers read
+/// before kmain, the timer interval timer_init stored and the whole output.
+fn boot_with_sysinfo_reg_zero(reg: u32) -> (Vec<u32>, u32, String) {
+    let config = MachineConfig {
+        nominal_hz: 2_000_000,
+        ..MachineConfig::default()
+    };
+    let (mut m, elf) = load_committed_on(config, Some(kernel::typed(HALT)));
+    let kmain = sym(&elf, "kmain");
+    let mut reads = Vec::new();
+    for _ in 0..10_000 {
+        if m.cpu.pc == kmain {
+            break;
+        }
+        let read = mem_access(&m.cpu)
+            .filter(|a| (SYSINFO_BASE..SYSINFO_BASE + SYSINFO_SIZE).contains(&a.addr))
+            .and_then(|a| Some((a.addr - SYSINFO_BASE, a.load_rd?)));
+        m.cpu.step();
+        if let Some((offset, rd)) = read {
+            reads.push(offset);
+            if offset == reg {
+                m.cpu.x[rd as usize] = 0;
+            }
+        }
+    }
+    assert_eq!(m.cpu.pc, kmain, "never reached kmain");
+    let interval = m
+        .cpu
+        .bus
+        .peek(sym(&elf, "machine_scratch") + SCRATCH_INTERVAL)
+        .unwrap();
+    assert_eq!(m.run(Some(BOOT_MAX_STEPS), |_| {}), RunResult::Exited(0));
+    (reads, interval, kernel::mask_dbg_pc(&printed(&m)))
+}
+
+#[test]
+fn timebase_falls_back_to_nominal_without_sysinfo() {
+    // SYS_MAGIC is wrong: no sysinfo, so SYS_TIMEBASE_HZ is not read and the
+    // timebase is the nominal 10 MHz, not the machine's 2 MHz.
+    let (reads, interval, out) = boot_with_sysinfo_reg_zero(REG_MAGIC);
+    assert_eq!(reads, [REG_MAGIC]);
+    assert_eq!(u64::from(interval), TICK_INTERVAL);
+    assert_eq!(out, halted_output());
+}
+
+#[test]
+fn timebase_falls_back_to_nominal_when_sysinfo_reports_zero() {
+    let (reads, interval, out) = boot_with_sysinfo_reg_zero(REG_TIMEBASE_HZ);
+    assert_eq!(reads, [REG_MAGIC, REG_TIMEBASE_HZ]);
+    assert_eq!(u64::from(interval), TICK_INTERVAL);
+    assert_eq!(out, halted_output());
+}
+
+#[test]
+fn input_arriving_just_before_wfi_wakes_the_console() {
+    // console_getc turns interrupts off from its check of the ring buffer
+    // until wfi. A byte that arrives in between is then still pending when
+    // wfi runs, so wfi returns at once and the shell answers within the same
+    // tick. With interrupts on, the byte's interrupt would be taken before
+    // wfi, which would then sleep until the next tick.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
+    let ticks = sym(&elf, "ticks");
+    let tick_count = |m: &Machine| m.cpu.bus.peek(ticks).unwrap();
+    let wfi = sym(&elf, "wfi");
+
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    // console_getc found nothing and is about to sleep.
+    step_until(&mut m, 10_000, |_| {}, |m| m.cpu.pc == wfi);
+    let n = tick_count(&m);
+    let before = printed(&m).len();
+    for &b in b"ticks\n" {
+        tx.send(b).unwrap();
+    }
+    step_until(
+        &mut m,
+        BOOT_MAX_STEPS,
+        |_| {},
+        |m| printed(m).ends_with(PROMPT) && printed(m).len() > before,
+    );
+    assert_eq!(&printed(&m)[before..], format!("ticks\nticks: {n}\n{PROMPT}"));
+    assert_eq!(tick_count(&m), n);
 }
 
 /// Every C file and header in the kernel, with its name.

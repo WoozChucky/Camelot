@@ -94,8 +94,11 @@ fn main() -> ExitCode {
     // The machine's console is this process's terminal. An interactive one is switched
     // to raw mode (each key goes to the UART as typed, unechoed) until Grail exits:
     // before the reader thread starts, so its first read is already a raw one.
-    let _raw = console::RawMode::enable();
-    m.set_uart_input(console::stdin_channel());
+    let raw = console::RawMode::enable();
+    m.set_uart_input(match &raw {
+        Some(raw) => raw.stdin_channel(),
+        None => console::stdin_channel(),
+    });
     m.set_uart_output(std::io::stdout());
     m.set_debug_output(std::io::stderr());
 

@@ -11,9 +11,11 @@
 
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 type HANDLE = *mut c_void;
@@ -100,6 +102,46 @@ fn input_record_layout_matches_the_sdk() {
     assert_eq!(std::mem::size_of::<KeyInputRecord>(), 20);
 }
 
+/// How long the test waits for grail to answer.
+const TIMEOUT_SECS: u64 = 20;
+
+/// A `grail` run reading the console. Dropping it kills grail if it is still
+/// running and puts the console's mode back, so a failed assertion leaves
+/// neither a grail reading the console nor a raw console behind.
+struct Session {
+    conin: File,
+    original: u32,
+    child: Child,
+    stdout: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Session {
+    /// What grail has printed so far.
+    fn stdout(&self) -> String {
+        String::from_utf8_lossy(&self.stdout.lock().unwrap()).into_owned()
+    }
+
+    /// Waits for `done` to hold on the output so far; fails with `what`
+    /// after `TIMEOUT_SECS`.
+    fn wait_for_output(&self, what: &str, done: impl Fn(&str) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(TIMEOUT_SECS);
+        while !done(&self.stdout()) {
+            assert!(Instant::now() < deadline, "{what}; stdout:\n{}", self.stdout());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // SAFETY: a console input handle. Failure is ignored: this may run
+        // while a panic unwinds.
+        unsafe { SetConsoleMode(self.conin.as_raw_handle(), self.original) };
+    }
+}
+
 #[test]
 fn kernel_shell_in_a_raw_console() {
     let open = || OpenOptions::new().read(true).write(true).open("CONIN$");
@@ -115,14 +157,28 @@ fn kernel_shell_in_a_raw_console() {
     set_mode(&conin, cooked);
 
     let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel/kernel.elf");
-    let child = Command::new(env!("CARGO_BIN_EXE_grail"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_grail"))
         .args(["--max-steps", "2000000000"])
         .arg(&kernel)
         .stdin(conin.try_clone().unwrap())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .expect("cannot run grail");
+    let mut pipe = child.stdout.take().unwrap();
+    let mut s = Session {
+        conin: conin.try_clone().unwrap(),
+        original,
+        child,
+        stdout: Arc::new(Mutex::new(Vec::new())),
+    };
+    let sink = Arc::clone(&s.stdout);
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 256];
+        while let Ok(n @ 1..) = pipe.read(&mut buf) {
+            sink.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
 
     // Grail turns line input and echo off as soon as it starts.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -136,14 +192,41 @@ fn kernel_shell_in_a_raw_console() {
     // Ctrl-C must keep working.
     assert_ne!(mode(&conin) & ENABLE_PROCESSED_INPUT, 0);
 
-    // Enter is a lone CR in a raw console; backspace is BS.
-    type_keys(&conin, "ticks\rhalx\x08t\r");
-    let out = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Keys arrive one by one, before Enter: the kernel echoes them as they are
+    // typed. (Had grail's first read of the console started before raw mode,
+    // the console would hold the whole line back until Enter.)
+    type_keys(&conin, "ticks");
+    s.wait_for_output("the keys never reached the kernel before Enter", |out| {
+        out.contains("camelot> ticks")
+    });
+    // Enter is a lone CR in a raw console.
+    type_keys(&conin, "\r");
+    s.wait_for_output("no prompt after the first command", |out| {
+        out.matches("camelot> ").count() == 2
+    });
+    // Ctrl-Z on its own is a key like any other, which the line editor
+    // ignores, not the end of the input. Give grail time to read it alone.
+    type_keys(&conin, "\x1a");
+    std::thread::sleep(Duration::from_millis(500));
+    // Backspace is BS.
+    type_keys(&conin, "halx\x08t\r");
+    let deadline = Instant::now() + Duration::from_secs(TIMEOUT_SECS);
+    let status = loop {
+        if let Some(status) = s.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grail did not halt; stdout:\n{}",
+            s.stdout()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let restored = mode(&conin);
-    set_mode(&conin, original);
+    reader.join().unwrap();
+    let stdout = s.stdout();
 
-    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}");
+    assert_eq!(status.code(), Some(0), "stdout:\n{stdout}");
     let shell = &stdout[stdout.find("camelot> ").expect("no prompt")..];
     let rest = shell
         .strip_prefix("camelot> ticks\nticks: ")
