@@ -1,3 +1,4 @@
+/* objects: norelocs/start.o norelocs/data.o norelocs/more.o */
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 

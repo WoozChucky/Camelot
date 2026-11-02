@@ -17,11 +17,11 @@ crates/grail       the emulator
 crates/merlin      the C-subset compiler (C → .s), with its test programs in tests/cases
 crates/merlin-as   the assembler (source → ELF32 .o)
 crates/merlin-ld   the linker (.o files → ELF32 executable)
-crates/xtask       build tasks: `cargo xtask kernel`
+crates/xtask       build tasks: `cargo xtask kernel`, `cargo xtask ld-fixtures`
 kernel/            the Camelot kernel (C + assembly) and its prebuilt kernel.elf
 examples/          bare-metal programs
 tests/riscv-tests  prebuilt riscv-tests ELFs (rebuild with scripts/build-riscv-tests.sh)
-scripts/           test-data generators (riscv-tests, merlin-as golden encodings, merlin-ld fixtures)
+scripts/           test-data generators (riscv-tests, merlin-as golden encodings)
 docs/              the ISA spec
 ```
 
@@ -69,4 +69,4 @@ Runs the decoder and device unit tests, every riscv-tests suite (except `rv32ui-
 
 `merlin --dump-ast file.c` prints the checked syntax tree. The compiler's end-to-end harness (`crates/merlin/tests/harness.rs`) runs every program in `crates/merlin/tests/cases/` through merlin, merlin-as and merlin-ld and checks its exit code in Grail; it is `#[ignore]`d until codegen and the linker exist. With clang and ld.lld installed, `cargo test -p merlin --test harness -- --ignored clang_reference` checks the same programs' expected exit codes against clang.
 
-The test ELFs are committed. To rebuild them you need clang + lld (the official Windows LLVM installer works) and a riscv-tests checkout: `scripts/build-riscv-tests.sh path/to/riscv-tests tests/riscv-tests`. Until merlin-as and merlin-ld exist, examples are built with clang too; the command is at the top of each `.S` file. The kernel is rebuilt with `cargo xtask kernel` (clang + ld.lld, see [kernel/README.md](kernel/README.md)); `cargo test` also rebuilds it when clang is installed and checks the committed `kernel.elf` is current. merlin-ld's test fixtures (clang-built objects, plus `llvm-readelf` of ld.lld's link of them as the expected layout) are rebuilt with `scripts/gen-ld-fixtures.sh`.
+The test ELFs are committed. To rebuild them you need clang + lld (the official Windows LLVM installer works) and a riscv-tests checkout: `scripts/build-riscv-tests.sh path/to/riscv-tests tests/riscv-tests`. Until merlin-as and merlin-ld exist, examples are built with clang too; the command is at the top of each `.S` file. The kernel is rebuilt with `cargo xtask kernel` (clang + ld.lld, see [kernel/README.md](kernel/README.md)); `cargo test` also rebuilds it when clang is installed and checks the committed `kernel.elf` is current. merlin-ld's test fixtures (clang-built objects, plus `llvm-readelf` of ld.lld's link of them as the expected layout) are rebuilt with `cargo xtask ld-fixtures`.

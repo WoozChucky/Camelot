@@ -18,6 +18,8 @@ pub const SHT_SYMTAB_SHNDX: u32 = 18;
 pub const SHF_WRITE: u32 = 0x1;
 pub const SHF_ALLOC: u32 = 0x2;
 pub const SHF_EXECINSTR: u32 = 0x4;
+pub const SHF_MERGE: u32 = 0x10;
+pub const SHF_STRINGS: u32 = 0x20;
 pub const SHF_GROUP: u32 = 0x200;
 pub const SHF_TLS: u32 = 0x400;
 
@@ -49,6 +51,8 @@ pub struct Section {
     pub size: u32,
     /// Alignment in bytes, at least 1.
     pub align: u32,
+    /// `sh_entsize`: the entry size of a `SHF_MERGE` section.
+    pub entsize: u32,
     /// Relocations that patch this section (from the `.rela` section whose
     /// `sh_info` points here).
     pub relocs: Vec<Rela>,
@@ -286,6 +290,7 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
             data,
             size: h.size,
             align: h.align.max(1),
+            entsize: h.entsize,
             relocs: Vec::new(),
         });
     }

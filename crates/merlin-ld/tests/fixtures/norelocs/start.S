@@ -1,6 +1,6 @@
 # Relocation-free startup code: absolute immediates only, so linking it needs
 # no relocation processing. Prints "OK\n" to the UART and halts with code 0.
-# Built by scripts/gen-ld-fixtures.sh.
+# Built by `cargo xtask ld-fixtures`.
     .section .text.start, "ax"
     .globl _start
 _start:

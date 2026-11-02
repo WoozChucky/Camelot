@@ -1,12 +1,19 @@
 //! End-to-end tests against clang-built objects and ld.lld's output for the
-//! same inputs (`tests/fixtures`, regenerate with scripts/gen-ld-fixtures.sh).
+//! same inputs (`tests/fixtures`, regenerate with `cargo xtask ld-fixtures`).
+//! Each `name.ld` there lists its objects in its first comment, and
+//! `name.expected.txt` is `llvm-readelf -S -l -s` of ld.lld's link.
 //!
 //! * `fixtures/norelocs`: three relocation-free objects. Linked by merlin-ld,
-//!   the PT_LOADs, section headers and symbols must equal ld.lld's
-//!   (`expected.txt` is `llvm-readelf -S -l -s` of the ld.lld executable), and
-//!   Grail must load and run the result.
+//!   the PT_LOADs, section headers and symbols must equal ld.lld's, and Grail
+//!   must load and run the result.
+//! * `fixtures/layouts`: layout edge cases (empty and assignment-only output
+//!   sections, gaps, NOBITS before PROGBITS, `. +=` sections), compared the
+//!   same way.
+//! * `fixtures/merge`: mergeable strings, where merlin-ld differs from ld.lld
+//!   on purpose (spec §10); the test pins down the difference.
 //! * `fixtures/hello`: `examples/hello/hello.S` assembled by clang. It has
 //!   relocations, so only the layout is compared until issue #7.
+//! * `fixtures/rejects`, `fixtures/symbols`: objects for error paths.
 
 use grail::{Machine, RunResult};
 use merlin_ld::{Input, Options, ScriptSource};
@@ -70,6 +77,28 @@ fn norelocs_opts() -> Options {
     }
 }
 
+/// The objects a fixture script names in its `/* objects: ... */` comment
+/// (paths relative to `fixtures/`), and the script itself.
+fn case(script: &str) -> (Vec<Input>, Options) {
+    let path = fixtures().join(script);
+    let opts = Options {
+        script: script_file(&path),
+        entry: None,
+    };
+    let text = &opts.script.as_ref().unwrap().text;
+    let list = text
+        .split("*/")
+        .next()
+        .and_then(|c| c.trim().strip_prefix("/*"))
+        .and_then(|c| c.trim().strip_prefix("objects:"))
+        .unwrap_or_else(|| panic!("{script}: no /* objects: ... */ comment"));
+    let objs = list
+        .split_whitespace()
+        .map(|o| input(&fixtures().join(o)))
+        .collect();
+    (objs, opts)
+}
+
 // ---------------------------------------------------------------------------
 // Reading `llvm-readelf -S -l -s` output (the committed expectations).
 
@@ -100,7 +129,10 @@ struct Readelf {
     /// Allocated sections only.
     sections: Vec<Sect>,
     loads: Vec<Load>,
+    /// Global and weak symbols.
     globals: HashMap<String, u32>,
+    /// Local symbols (only read from our own output).
+    locals: Vec<(String, u32)>,
 }
 
 fn hex(s: &str) -> u32 {
@@ -136,15 +168,17 @@ fn parse_readelf(text: &str) -> Readelf {
                 flags: t[6..t.len() - 1].concat(),
                 align: hex(t[t.len() - 1]),
             });
-        } else if t.len() == 8 && t[4] == "GLOBAL" {
+        } else if t.len() == 8 && (t[4] == "GLOBAL" || t[4] == "WEAK") {
             r.globals.insert(t[7].into(), hex(t[1]));
         }
     }
     r
 }
 
-fn expected(dir: &str) -> Readelf {
-    parse_readelf(&std::fs::read_to_string(fixtures().join(dir).join("expected.txt")).unwrap())
+/// `fixtures/<name>.expected.txt`, e.g. `expected("norelocs/link")`.
+fn expected(name: &str) -> Readelf {
+    let path = fixtures().join(format!("{name}.expected.txt"));
+    parse_readelf(&std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +193,36 @@ fn u32_at(b: &[u8], o: usize) -> u32 {
 fn cstr(b: &[u8], o: usize) -> String {
     let end = b[o..].iter().position(|&c| c == 0).unwrap();
     String::from_utf8(b[o..o + end].to_vec()).unwrap()
+}
+
+/// File offset of the section header named `name`.
+fn shdr(elf: &[u8], name: &str) -> usize {
+    let shoff = u32_at(elf, 32) as usize;
+    let (shnum, shstrndx) = (u16_at(elf, 48) as usize, u16_at(elf, 50) as usize);
+    let shstr = u32_at(elf, shoff + 40 * shstrndx + 16) as usize;
+    (0..shnum)
+        .map(|i| shoff + 40 * i)
+        .find(|&h| cstr(elf, shstr + u32_at(elf, h) as usize) == name)
+        .unwrap_or_else(|| panic!("no section {name}"))
+}
+
+fn section_index(elf: &[u8], name: &str) -> u32 {
+    ((shdr(elf, name) - u32_at(elf, 32) as usize) / 40) as u32
+}
+
+/// File offset of the `.symtab` entry named `name`.
+fn symbol_entry(elf: &[u8], name: &str) -> usize {
+    let symtab = shdr(elf, ".symtab");
+    let (off, size) = (
+        u32_at(elf, symtab + 16) as usize,
+        u32_at(elf, symtab + 20) as usize,
+    );
+    let shoff = u32_at(elf, 32) as usize;
+    let strtab = u32_at(elf, shoff + 40 * u32_at(elf, symtab + 24) as usize + 16) as usize;
+    (off..off + size)
+        .step_by(16)
+        .find(|&s| cstr(elf, strtab + u32_at(elf, s) as usize) == name)
+        .unwrap_or_else(|| panic!("no symbol {name}"))
 }
 
 fn read_ours(elf: &[u8]) -> Readelf {
@@ -206,10 +270,12 @@ fn read_ours(elf: &[u8]) -> Readelf {
                 sh(i, 20) as usize,
                 sh(sh(i, 24) as usize, 16) as usize,
             );
-            for s in (off..off + size).step_by(16) {
+            for s in (off + 16..off + size).step_by(16) {
+                let (name, value) = (cstr(elf, strtab + u32_at(elf, s) as usize), u32_at(elf, s + 4));
                 if elf[s + 12] >> 4 != 0 {
-                    r.globals
-                        .insert(cstr(elf, strtab + u32_at(elf, s) as usize), u32_at(elf, s + 4));
+                    r.globals.insert(name, value);
+                } else {
+                    r.locals.push((name, value));
                 }
             }
         }
@@ -243,15 +309,110 @@ fn read_ours(elf: &[u8]) -> Readelf {
 /// sections and symbol addresses as ld.lld.
 #[test]
 fn norelocs_matches_ld_lld() {
-    let linked = merlin_ld::link(&norelocs(), &norelocs_opts()).unwrap();
-    assert!(linked.layout.warnings.is_empty(), "{:?}", linked.layout.warnings);
+    assert_eq!(
+        expected("norelocs/link").loads.len(),
+        3,
+        "fixture sanity: RX, R and RW segments"
+    );
+    assert_matches_ld_lld("norelocs/link");
+}
+
+/// Links fixture script `name.ld` with the objects it lists, checks the result
+/// against ld.lld's (`name.expected.txt`) and runs it in Grail.
+fn assert_matches_ld_lld(name: &str) {
+    let (objs, opts) = case(&format!("{name}.ld"));
+    let linked = merlin_ld::link(&objs, &opts).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    assert!(
+        linked.layout.warnings.is_empty(),
+        "{name}: {:?}",
+        linked.layout.warnings
+    );
     let ours = read_ours(&linked.elf);
-    let lld = expected("norelocs");
-    assert_eq!(lld.loads.len(), 3, "fixture sanity: RX, R and RW segments");
-    assert_eq!(ours.entry, lld.entry);
-    assert_eq!(ours.loads, lld.loads);
-    assert_eq!(ours.sections, lld.sections);
-    assert_eq!(ours.globals, lld.globals);
+    let lld = expected(name);
+    assert_eq!(ours.entry, lld.entry, "{name}: entry");
+    assert_eq!(ours.sections, lld.sections, "{name}: sections");
+    assert_eq!(ours.loads, lld.loads, "{name}: PT_LOADs");
+    assert_eq!(ours.globals, lld.globals, "{name}: global symbols");
+    let (_, r, out) = run(&linked.elf);
+    assert_eq!(
+        (r, out.as_str()),
+        (RunResult::Exited(0), "OK\n"),
+        "{name}: run in Grail"
+    );
+}
+
+/// Layout edge cases against ld.lld: output sections with only empty inputs
+/// (they still align), with only assignments (kept, PROGBITS, flags of the
+/// previous section), with only `. +=` (PROGBITS with file contents), with
+/// nothing (dropped), a symbol before the first section with MEMORY (0), a
+/// gap and NOBITS before PROGBITS inside one PT_LOAD, an empty R section
+/// between RX and RW (no PT_LOAD of its own), a weak definition.
+#[test]
+fn layout_edge_cases_match_ld_lld() {
+    let mut names: Vec<String> = std::fs::read_dir(fixtures().join("layouts"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ld"))
+        .map(|p| format!("layouts/{}", p.file_stem().unwrap().to_string_lossy()))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "layouts/empty",
+            "layouts/gap",
+            "layouts/inside",
+            "layouts/nobits-first",
+            "layouts/page-gap"
+        ]
+    );
+    for name in &names {
+        assert_matches_ld_lld(name);
+    }
+    // Spot checks, so a broken fixture can't make both sides agree on nonsense.
+    let lld = expected("layouts/empty");
+    assert_eq!(lld.globals["__image_start"], 0);
+    assert_eq!(lld.globals["wk"], 0x8000_0024, "weak definition");
+    let data = lld.sections.iter().find(|s| s.name == ".data").unwrap();
+    assert_eq!((data.size, data.align), (0, 16));
+    assert!(lld.sections.iter().all(|s| s.name != ".nothing"));
+    let stack = lld.sections.iter().find(|s| s.name == ".stack").unwrap();
+    assert_eq!((stack.ty.as_str(), stack.flags.as_str()), ("PROGBITS", "WA"));
+    assert_eq!(expected("layouts/gap").loads.len(), 2);
+    assert_eq!(expected("layouts/nobits-first").loads.len(), 3);
+}
+
+/// Spec §10: merlin-ld does not merge SHF_MERGE strings. clang puts every C
+/// string literal in `.rodata.str1.1`; with the same literal in two objects
+/// ld.lld keeps one copy, merlin-ld keeps both and warns.
+#[test]
+fn mergeable_strings_are_not_merged() {
+    let (objs, opts) = case("merge/link.ld");
+    let linked = merlin_ld::link(&objs, &opts).unwrap();
+    let l = &linked.layout;
+    assert_eq!(l.warnings.len(), 1, "{:?}", l.warnings);
+    assert!(
+        l.warnings[0].starts_with(".rodata: mergeable (SHF_MERGE) input sections hold 6 bytes of duplicate"),
+        "{}",
+        l.warnings[0]
+    );
+    let lld = expected("merge/link");
+    let ours = read_ours(&linked.elf);
+    assert_eq!(ours.sections[0], lld.sections[0], ".text is unaffected");
+    let (o, t) = (&ours.sections[1], &lld.sections[1]);
+    assert_eq!((o.name.as_str(), o.addr), (".rodata", t.addr));
+    assert_eq!(o.size, t.size + 6, "one extra \"hello\\0\"");
+    assert_eq!(lld.globals["s1"], lld.globals["s2"], "ld.lld merged them");
+    assert_eq!(ours.globals["s1"], lld.globals["s1"]);
+    assert_eq!(
+        ours.globals["s2"],
+        ours.globals["after_a"] + 1,
+        "input order, no merging"
+    );
+    assert_eq!(ours.globals["__end"], lld.globals["__end"] + 6);
+    // No duplicates, no warning.
+    let one = merlin_ld::link(&objs[..2], &opts).unwrap();
+    assert!(one.layout.warnings.is_empty(), "{:?}", one.layout.warnings);
 }
 
 /// PT_LOAD contents line up with the input sections and the file is
@@ -373,7 +534,7 @@ fn hello_layout_matches_ld_lld() {
         entry: None,
     };
     let layout = merlin_ld::layout(&objs, &opts).unwrap();
-    let lld = expected("hello");
+    let lld = expected("hello/link");
     let ours: Vec<(String, u32, u32, u32)> = layout
         .sections
         .iter()
@@ -390,6 +551,49 @@ fn hello_layout_matches_ld_lld() {
         assert_eq!(layout.symbol(name), Some(*value), "{name}");
     }
     assert_eq!(layout.symbol("__stack_top"), Some(0x8001_0070));
+}
+
+/// `fixtures/hello` is built from copies of examples/hello's source and
+/// script; if the example changes, the fixture (hello.o and its ld.lld
+/// listing) is stale until `cargo xtask ld-fixtures` runs again.
+#[test]
+fn hello_fixture_is_current() {
+    for f in ["hello.S", "link.ld"] {
+        let read = |p: PathBuf| std::fs::read_to_string(&p).unwrap().replace("\r\n", "\n");
+        assert!(
+            read(repo_root().join("examples/hello").join(f)) == read(fixtures().join("hello").join(f)),
+            "examples/hello/{f} changed: run `cargo xtask ld-fixtures`"
+        );
+    }
+}
+
+/// The PCREL_HI20 sites handed to the relocation hook (issue #7) are keyed by
+/// each auipc's own address, with its symbol's final address.
+#[test]
+fn relocation_context() {
+    let opts = Options {
+        script: script_file(&repo_root().join("examples/hello/link.ld")),
+        entry: None,
+    };
+    let layout = merlin_ld::layout(&inputs("hello", &["hello.o"]), &opts).unwrap();
+    let ctx = merlin_ld::relocate::context(&layout);
+    let site = |name: &str| {
+        let i = layout.objects[0]
+            .symbols
+            .iter()
+            .position(|s| s.name == name)
+            .unwrap();
+        merlin_ld::reloc::HiSite {
+            sym: layout.reloc_symbol(0, i).unwrap(),
+            addend: 0,
+        }
+    };
+    let text = layout.section(".text").unwrap().addr;
+    let rodata = layout.section(".rodata").unwrap();
+    assert!((rodata.addr..rodata.addr + rodata.size).contains(&site("message").sym));
+    let mut sites: Vec<_> = ctx.pcrel_hi20.iter().map(|(&k, &v)| (k, v)).collect();
+    sites.sort_by_key(|&(k, _)| k);
+    assert_eq!(sites, [(text, site("__stack_top")), (text + 8, site("message"))]);
 }
 
 /// Until issue #7 the relocation hook refuses every relocation, loudly.
@@ -413,6 +617,50 @@ fn relocations_are_not_silently_skipped() {
             "hello.o: cannot apply R_RISCV_PCREL_LO12_I against '.Lpcrel_hi1' at .text.start+0xc: relocation \
              processing is not implemented yet (issue #7)",
         ]
+    );
+}
+
+/// Relocations that can't be applied are reported before the hook sees them.
+#[test]
+fn relocation_guards() {
+    let opts = Options {
+        script: script_file(&repo_root().join("examples/hello/link.ld")),
+        entry: None,
+    };
+    let hello = std::fs::read(fixtures().join("hello/hello.o")).unwrap();
+    let link = |data: Vec<u8>| {
+        errors(merlin_ld::link(
+            &[Input {
+                name: "hello.o".into(),
+                data,
+            }],
+            &opts,
+        ))
+    };
+
+    // First relocation's r_offset moved past the end of .text.start (0x50 bytes).
+    let mut b = hello.clone();
+    let rela = u32_at(&b, shdr(&b, ".rela.text.start") + 16) as usize;
+    b[rela..rela + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+    let errs = link(b);
+    assert_eq!(
+        errs[0],
+        "hello.o: R_RISCV_PCREL_HI20 at .text.start+0x1000 is outside section .text.start (size 0x50)"
+    );
+    assert_eq!(errs.len(), 4, "{errs:?}");
+
+    // The relocations retargeted at .rodata, which is made NOBITS.
+    let mut b = hello.clone();
+    let rodata = shdr(&b, ".rodata");
+    b[rodata + 4..rodata + 8].copy_from_slice(&8u32.to_le_bytes());
+    let index = section_index(&b, ".rodata");
+    let rela = shdr(&b, ".rela.text.start");
+    b[rela + 28..rela + 32].copy_from_slice(&index.to_le_bytes());
+    let errs = link(b);
+    assert_eq!(errs.len(), 4, "{errs:?}");
+    assert_eq!(
+        errs[0],
+        "hello.o: R_RISCV_PCREL_HI20 at .rodata+0x0 patches a NOBITS section"
     );
 }
 
@@ -510,6 +758,16 @@ fn locals_are_per_object() {
     assert_eq!(r, RunResult::Exited(0));
     let data = linked.layout.section(".data").unwrap();
     assert_eq!(ram(&m, data.addr, 8), &[1, 0, 0, 0, 2, 0, 0, 0]);
+    // Both are in the output .symtab, as locals, at their own addresses.
+    let ours = read_ours(&linked.elf);
+    let counts: Vec<u32> = ours
+        .locals
+        .iter()
+        .filter(|(n, _)| n == "count")
+        .map(|&(_, v)| v)
+        .collect();
+    assert_eq!(counts, [data.addr, data.addr + 4]);
+    assert!(!ours.globals.contains_key("count"));
 }
 
 #[test]
@@ -531,8 +789,26 @@ fn weak_symbols() {
         );
         let data = l.section(".data").unwrap();
         assert!((data.addr..data.addr + data.size).contains(&l.symbol("weak_only").unwrap()));
-        // Weak undefined: no error, no definition.
+        // Weak undefined: no error, no definition, and relocations against it
+        // see 0.
         assert_eq!(l.symbol("missing"), None);
+        let w = l.objects.iter().position(|o| o.name == "weak.o").unwrap();
+        let missing = l.objects[w]
+            .symbols
+            .iter()
+            .position(|s| s.name == "missing")
+            .unwrap();
+        assert_eq!(l.reloc_symbol(w, missing), Ok(0));
+        let helper = l.objects[w]
+            .symbols
+            .iter()
+            .position(|s| s.name == "helper")
+            .unwrap();
+        assert_eq!(
+            l.reloc_symbol(w, helper),
+            Ok(l.symbol("helper").unwrap()),
+            "the strong one"
+        );
         // No _start among these: warn and fall back to .text.
         assert_eq!(l.entry, text.addr);
         assert_eq!(l.warnings.len(), 1);
@@ -608,7 +884,10 @@ fn script_assignments_inside_sections() {
     assert_eq!(s(".data").size, 0x27);
     assert_eq!(s(".bss").addr, 0x8000_2030);
     assert_eq!(s(".bss").size, 0x120);
-    assert!(s(".stack").nobits);
+    // Only `. +=`: PROGBITS with the previous section's flags, as in ld.lld
+    // (fixtures/layouts/inside.ld checks this script against ld.lld).
+    assert!(!s(".stack").nobits);
+    assert_eq!(s(".stack").flags, s(".bss").flags);
     assert_eq!(s(".stack").size, 4096);
     assert_eq!(l.symbol("__stack_top"), Some(s(".stack").addr + 4096));
     let linked = merlin_ld::link(
@@ -625,15 +904,37 @@ fn script_assignments_inside_sections() {
     assert_eq!((r, out.as_str()), (RunResult::Exited(0), "OK\n"));
 }
 
+/// ld.lld's rule: an output section is dropped only if nothing matched it and
+/// it has no assignments. (fixtures/layouts/empty.ld checks the same cases
+/// against ld.lld.)
 #[test]
-fn empty_output_sections_are_dropped() {
+fn empty_output_sections() {
     let l = merlin_ld::layout(
         &inputs("norelocs", &["start.o"]),
-        &script("SECTIONS { . = 0x80000000; .text : { *(.text*) } .data : { d = .; *(.data*) } }"),
+        &script(
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) } .data : { d = .; *(.data*) } \
+             .none : { *(.none) } .sym : { e = .; } .bss : { *(.bss*) } }",
+        ),
     )
     .unwrap();
-    assert_eq!(l.sections.len(), 1);
+    let names: Vec<&str> = l.sections.iter().map(|s| s.name.as_str()).collect();
+    // start.o has no .data or .bss at all: .data stays for its assignment, .bss goes.
+    assert_eq!(names, [".text", ".data", ".sym"]);
+    for s in &l.sections[1..] {
+        assert_eq!((s.addr, s.size), (0x8000_0020, 0), "{}", s.name);
+    }
     assert_eq!(l.symbol("d"), Some(0x8000_0020));
+    assert_eq!(l.symbol("e"), Some(0x8000_0020));
+    let sym = l.section(".sym").unwrap();
+    assert!(!sym.nobits);
+    assert_eq!(sym.flags, l.section(".data").unwrap().flags);
+    // Empty sections don't get PT_LOADs of their own.
+    let linked = merlin_ld::link(
+        &inputs("norelocs", &["start.o"]),
+        &script("SECTIONS { . = 0x80000000; .text : { *(.text*) } .data : { d = .; } }"),
+    )
+    .unwrap();
+    assert_eq!(read_ours(&linked.elf).loads.len(), 1);
 }
 
 #[test]
@@ -677,6 +978,15 @@ fn layout_errors() {
             "SECTIONS { . = 0xfffffff0; .text : { *(.text*) } }",
             "test.ld:1: section .text extends past the 4 GiB address space",
         ),
+        (
+            // Exactly 4 GiB long: must not wrap to an empty section.
+            "SECTIONS { . = 0; .s : { . += 0x100000000; } }",
+            "test.ld:1: section .s extends past the 4 GiB address space",
+        ),
+        (
+            "SECTIONS { . = 0x80000000; . += 0x7fffffffffffffff; }",
+            "test.ld:1: arithmetic overflow",
+        ),
         ("SECTIONS { x = 0x100000000; }", "test.ld:1: value 0x100000000 of 'x' does not fit in 32 bits"),
         ("SECTIONS { x = ORIGIN(RAM); }", "test.ld:1: unknown memory region 'RAM'"),
         ("SECTIONS { . = ALIGN(0); }", "test.ld:1: ALIGN(0): alignment must be positive"),
@@ -705,6 +1015,27 @@ fn default_layout_rejects_unknown_sections() {
         errs,
         ["m.o: section '.mystuff' is not placed by the default layout (use a linker script with -T)"]
     );
+    // Empty, but a global lives there: it would have no address.
+    let o = merlin_as::assemble_to_elf(".globl marker\n.section .mystuff\nmarker:\n").unwrap();
+    let errs = errors(merlin_ld::link(
+        &[Input {
+            name: "m.o".into(),
+            data: o.clone(),
+        }],
+        &Options::default(),
+    ));
+    assert_eq!(
+        errs,
+        ["m.o: section '.mystuff' is not placed by the default layout (use a linker script with -T)"]
+    );
+    // An empty section with only locals (or nothing) is just left out.
+    let o = merlin_as::assemble_to_elf(".section .mystuff\nlocal_marker:\n").unwrap();
+    let mut objs = vec![Input {
+        name: "m.o".into(),
+        data: o,
+    }];
+    objs.push(input(&fixtures().join("norelocs/start.o")));
+    merlin_ld::link(&objs, &Options::default()).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -718,6 +1049,7 @@ fn rejects_bad_objects() {
         b[off..off + bytes.len()].copy_from_slice(bytes);
         b
     };
+    let reject = |name: &str| std::fs::read(fixtures().join("rejects").join(name)).unwrap();
     let cases: Vec<(Vec<u8>, &str)> = vec![
         (b"hello".to_vec(), "x.o: not an ELF file"),
         (patched(4, &[2]), "x.o: not a 32-bit ELF file"),
@@ -733,6 +1065,51 @@ fn rejects_bad_objects() {
         (
             std::fs::read(repo_root().join("examples/hello/hello.elf")).unwrap(),
             "x.o: an executable (e_type 2), expected a relocatable object (ET_REL)",
+        ),
+        (
+            reject("common.o"),
+            "x.o: common symbol 'foo' is not supported (define it in .bss, or compile with -fno-common)",
+        ),
+        (
+            reject("comdat.o"),
+            "x.o: section group '.group' (COMDAT) is not supported",
+        ),
+        (
+            // A member of a group whose SHT_GROUP section is gone.
+            {
+                let mut b = reject("comdat.o");
+                let g = shdr(&b, ".group");
+                b[g + 4..g + 8].copy_from_slice(&1u32.to_le_bytes());
+                b
+            },
+            "x.o: section '.text.f' is in a section group (COMDAT), not supported",
+        ),
+        (
+            reject("tls.o"),
+            "x.o: thread-local section '.tdata' is not supported",
+        ),
+        (
+            // STT_TLS on a symbol in an ordinary section.
+            {
+                let mut b = good.clone();
+                let s = symbol_entry(&b, "_start");
+                b[s + 12] = (1 << 4) | 6;
+                b
+            },
+            "x.o: thread-local symbol '_start' is not supported",
+        ),
+        (
+            {
+                let mut b = std::fs::read(fixtures().join("hello/hello.o")).unwrap();
+                let r = shdr(&b, ".rela.text.start");
+                b[r + 4..r + 8].copy_from_slice(&9u32.to_le_bytes());
+                b
+            },
+            "x.o: section '.rela.text.start' is SHT_REL; RISC-V objects use SHT_RELA",
+        ),
+        (
+            reject("nonalloc.o"),
+            "x.o: global symbol 'g' is defined in section '.note.camelot', which is not loaded",
         ),
     ];
     for (data, want) in cases {
@@ -780,9 +1157,11 @@ fn loads(script_text: &str) -> Vec<Load> {
     read_ours(&linked.elf).loads
 }
 
+/// One PT_LOAD per run of sections with the same permissions; gaps and NOBITS
+/// sections inside a run are zeros in the file. (Gaps of a page and NOBITS
+/// before PROGBITS are checked against ld.lld in fixtures/layouts.)
 #[test]
 fn segments_group_by_permissions() {
-    // Same permissions, small gap: one segment, gap filled in the file.
     let l = loads(
         "SECTIONS { . = 0x80000000; .text : { *(.text*) } .rodata : { *(.rodata*) } \
          .data : { *(.data) } . += 0x10; .data2 : { *(.data.*) } .bss : { *(.bss*) } }",
@@ -792,32 +1171,27 @@ fn segments_group_by_permissions() {
     assert_eq!(rw.flags, "RW");
     // .data at 0x40 (8 bytes), 0x10 gap, .data.more aligned to 16 at 0x60 (0x14 bytes).
     assert_eq!((rw.vaddr, rw.filesz), (0x8000_0040, 0x34));
-    // A page or more apart: separate segments, no padding in the file.
+    // Same permissions again after a different run: a new segment.
     let l = loads(
-        "SECTIONS { . = 0x80000000; .text : { *(.text*) } .rodata : { *(.rodata*) } \
-         .data : { *(.data) } . += 0x1000; .data2 : { *(.data.*) } .bss : { *(.bss*) } }",
+        "SECTIONS { . = 0x80000000; .text : { *(.text*) } .data : { *(.data) } \
+         .rodata : { *(.rodata*) } .data2 : { *(.data.* .bss*) } }",
     );
-    assert_eq!(l.len(), 4);
-    assert_eq!((l[2].vaddr, l[2].filesz, l[2].memsz), (0x8000_0040, 8, 8));
-    assert_eq!(l[3].vaddr, 0x8000_1050);
+    let flags: Vec<&str> = l.iter().map(|s| s.flags.as_str()).collect();
+    assert_eq!(flags, ["RE", "RW", "R", "RW"]);
     for s in &l {
         assert_eq!(s.offset % 0x1000, s.vaddr % 0x1000, "offset congruent to address");
     }
-    // File contents can't follow NOBITS bytes in a segment.
-    let l = loads(
-        "SECTIONS { . = 0x80000000; .text : { *(.text*) } .bss : { *(.bss*) } \
-         .data : { *(.data*) } .rodata : { *(.rodata*) } }",
-    );
-    let shape: Vec<(&str, u32, u32)> = l.iter().map(|s| (s.flags.as_str(), s.filesz, s.memsz)).collect();
-    assert_eq!(
-        shape,
-        [
-            ("RE", 0x28, 0x28),
-            ("RW", 0, 0x118),
-            ("RW", 0x24, 0x24),
-            ("R", 0x18, 0x18)
-        ]
-    );
+    // The NOBITS bytes inside a segment read as zeros once loaded.
+    let linked = merlin_ld::link(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) } .bss : { *(.bss*) } \
+             .data : { *(.data*) } .rodata : { *(.rodata*) } }",
+        ),
+    )
+    .unwrap();
+    let (m, _, _) = run(&linked.elf);
+    check_norelocs_memory(&m, &linked.layout);
 }
 
 // ---------------------------------------------------------------------------
@@ -846,7 +1220,7 @@ fn command_line() {
         .unwrap();
     assert!(status.success());
     let elf = std::fs::read(&out).unwrap();
-    assert_eq!(read_ours(&elf).loads, expected("norelocs").loads);
+    assert_eq!(read_ours(&elf).loads, expected("norelocs/link").loads);
     assert!(std::fs::read_to_string(&map).unwrap().contains("__stack_top"));
 
     let o = std::process::Command::new(exe)

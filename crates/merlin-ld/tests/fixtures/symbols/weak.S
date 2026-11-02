@@ -1,6 +1,6 @@
 # Weak definitions and a weak undefined reference, for symbol resolution
 # tests (layout only: the .word needs an R_RISCV_32 relocation).
-# Built by scripts/gen-ld-fixtures.sh.
+# Built by `cargo xtask ld-fixtures`.
     .data
     .weak helper            # data.o defines a strong helper: that one wins
     .weak weak_only         # nobody else defines it: this one is used

@@ -9,6 +9,8 @@ const USAGE: &str = "usage: cargo xtask <task> [options]
 
 tasks:
   kernel       build kernel/kernel.elf (clang + ld.lld from the official LLVM install)
+  ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj);
+               takes --clang, --lld and -v like kernel
 
 kernel options:
   --clang PATH       clang to use (default: PATH, then C:\\Program Files\\LLVM\\bin)
@@ -62,6 +64,17 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("ld-fixtures") => match parse_kernel_args(&args[1..]) {
+            Ok(k) if k.assembler.is_none() && k.out.is_none() && !k.run => ld_fixtures(k),
+            Ok(_) => {
+                eprintln!("xtask: ld-fixtures takes only --clang, --lld and -v\n{USAGE}");
+                ExitCode::from(2)
+            }
+            Err(e) => {
+                eprintln!("xtask: {e}\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -73,6 +86,41 @@ fn main() -> ExitCode {
         None => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn ld_fixtures(k: KernelArgs) -> ExitCode {
+    let Some(clang) = k.clang.or_else(|| tools::find("clang")) else {
+        eprintln!("xtask: clang not found; pass --clang PATH");
+        return ExitCode::FAILURE;
+    };
+    let (Some(lld), Some(readobj)) = (
+        k.lld.or_else(|| tools::find_beside("ld.lld", &clang)),
+        tools::find_beside("llvm-readobj", &clang),
+    ) else {
+        eprintln!(
+            "xtask: ld.lld and llvm-readobj must be next to {} or on PATH",
+            clang.display()
+        );
+        return ExitCode::FAILURE;
+    };
+    let root = repo_root();
+    let t = xtask::ld_fixtures::Tools {
+        clang,
+        lld,
+        readobj,
+        verbose: k.verbose,
+    };
+    let fixtures = root.join("crates/merlin-ld/tests/fixtures");
+    match xtask::ld_fixtures::run(&fixtures, &root.join("examples"), &t) {
+        Ok(files) => {
+            eprintln!("wrote {} files in {}", files.len(), fixtures.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("xtask: {e}");
+            ExitCode::FAILURE
         }
     }
 }

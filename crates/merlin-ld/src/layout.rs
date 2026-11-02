@@ -8,13 +8,19 @@
 //!    definitions of a global are an error; a strong one beats a weak one.
 //! 3. Assign input sections to output sections: script order, first matching
 //!    `*(pattern)` wins, objects in command-line order, sections in file order.
-//!    An allocated, non-empty input section no rule matches is an error.
+//!    An allocated input section no rule matches is an error if it is
+//!    non-empty or defines a global.
 //! 4. Walk `SECTIONS` with the location counter, placing each input section at
-//!    its alignment and evaluating script assignments as they come.
+//!    its alignment and evaluating script assignments as they come. As in
+//!    ld.lld, an output section is dropped only when no input section (not
+//!    even an empty one) matched it and it has no assignments.
 //! 5. Report undefined globals (`a.o: undefined reference to 'foo'`).
 //! 6. Pick the entry point.
 
-use crate::object::{self, Object, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_UNDEF, STT_SECTION};
+use crate::object::{
+    self, Object, SHF_ALLOC, SHF_EXECINSTR, SHF_MERGE, SHF_STRINGS, SHF_WRITE, SHN_ABS, SHN_LORESERVE,
+    SHN_UNDEF, STT_SECTION,
+};
 use crate::script::{self, Assign, Command, Expr, Item, Script};
 use crate::{Error, Input, Options};
 use std::collections::{HashMap, HashSet};
@@ -30,9 +36,11 @@ pub struct OutputSection {
     pub size: u32,
     /// Largest alignment of its input sections.
     pub align: u32,
-    /// `SHF_ALLOC` plus the union of the inputs' `SHF_WRITE` / `SHF_EXECINSTR`.
+    /// `SHF_ALLOC` plus the union of the inputs' `SHF_WRITE` / `SHF_EXECINSTR`;
+    /// without inputs, the flags of the previous section that had some.
     pub flags: u32,
-    /// Occupies no file space (`.bss`): every input is `SHT_NOBITS`.
+    /// Occupies no file space (`.bss`): every input is `SHT_NOBITS`
+    /// (and there is at least one).
     pub nobits: bool,
     /// Input sections in address order.
     pub inputs: Vec<InputRef>,
@@ -62,7 +70,7 @@ pub enum Def {
 struct Placed {
     addr: u32,
     /// Index into [`Layout::sections`], or `None` if its output section was
-    /// discarded for being empty.
+    /// not created (a layout error).
     out: Option<usize>,
 }
 
@@ -243,7 +251,15 @@ impl Walker<'_> {
         };
         match &a.symbol {
             None => {
-                let new = if a.add { dot as i64 + v } else { v };
+                let new = if a.add {
+                    (dot as i64).checked_add(v)
+                } else {
+                    Some(v)
+                };
+                let Some(new) = new else {
+                    self.script_err(a.line, "arithmetic overflow");
+                    return dot;
+                };
                 if new < dot as i64 {
                     self.script_err(
                         a.line,
@@ -280,6 +296,53 @@ impl Walker<'_> {
             }
         }
     }
+}
+
+/// merlin-ld does not merge `SHF_MERGE` sections (clang's `.rodata.str1.1`
+/// string literals, `.rodata.cst8` constants): it places them like any other
+/// section. ld.lld keeps one copy of each identical string or constant, so
+/// when an output section holds duplicates its size, and every address after
+/// it, differ from ld.lld's. This says so, once per affected output section.
+fn merge_warnings(layout: &Layout) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for os in &layout.sections {
+        // ld.lld merges within one output section, per (flags, entsize, align).
+        let mut seen: HashSet<(u32, u32, u32, &[u8])> = HashSet::new();
+        let mut dup_bytes = 0usize;
+        for i in &os.inputs {
+            let sec = &layout.objects[i.object].sections[i.section];
+            if sec.flags & SHF_MERGE == 0 || sec.is_nobits() || sec.entsize == 0 {
+                continue;
+            }
+            let e = sec.entsize as usize;
+            let mut rest = &sec.data[..];
+            while !rest.is_empty() {
+                let len = if sec.flags & SHF_STRINGS != 0 {
+                    // A string runs up to and including its all-zero entry.
+                    rest.chunks(e)
+                        .position(|c| c.iter().all(|&b| b == 0))
+                        .map_or(rest.len(), |n| (n + 1) * e)
+                        .min(rest.len())
+                } else {
+                    e.min(rest.len())
+                };
+                let (entry, tail) = rest.split_at(len);
+                if !seen.insert((sec.flags, sec.entsize, sec.align, entry)) {
+                    dup_bytes += len;
+                }
+                rest = tail;
+            }
+        }
+        if dup_bytes > 0 {
+            warnings.push(format!(
+                "{}: mergeable (SHF_MERGE) input sections hold {dup_bytes} bytes of duplicate strings or \
+                 constants; merlin-ld keeps them (it does not merge), so this section is larger than \
+                 ld.lld's and the addresses after it differ",
+                os.name
+            ));
+        }
+    }
+    warnings
 }
 
 pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
@@ -376,7 +439,15 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
     }
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
-            if sec.is_alloc() && !assigned[oi][si] && sec.size > 0 {
+            // An empty section can be left out, unless a global lives in it
+            // (that symbol would otherwise have no address).
+            let defines_global = || {
+                obj.symbols
+                    .iter()
+                    .skip(1)
+                    .any(|s| !s.is_local() && s.shndx as usize == si && s.shndx < SHN_LORESERVE)
+            };
+            if sec.is_alloc() && !assigned[oi][si] && (sec.size > 0 || defines_global()) {
                 errors.push(err(format!(
                     "{}: section '{}' is not placed by {}",
                     obj.name,
@@ -403,21 +474,33 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
         errors: Vec::new(),
     };
     let region = script.memory.as_ref();
-    let mut dot: u64 = region.map_or(0, |r| r.origin as u64);
-    // With a MEMORY region, sections go at the region's next free address.
+    // The location counter starts at 0, also with MEMORY (as in ld.lld): only
+    // output sections go at the region's next free address.
+    let mut dot: u64 = 0;
     let mut cursor: Option<u64> = region.map(|r| r.origin as u64);
-    let mut last_dot_move: Option<usize> = None;
+    // Line of the last top-level `.` move since the previous output section.
+    let mut dot_moved: Option<usize> = None;
+    // Flags of the last output section that had input sections; an output
+    // section without any inherits them (as in ld.lld).
+    let mut prev_flags = SHF_ALLOC;
     for (ci, cmd) in script.commands.iter().enumerate() {
         match cmd {
             Command::Assign(a) => {
                 let before = dot;
                 dot = w.assign(a, dot);
                 if a.symbol.is_none() && dot != before {
-                    last_dot_move = Some(a.line);
+                    dot_moved = Some(a.line);
                 }
             }
             Command::Output(o) => {
                 let all_inputs = rules[ci].iter().flatten();
+                // ld.lld's rule: an output section is dropped only if no input
+                // section matched it (not even an empty one) and it has no
+                // assignments. Zero-size inputs still align it.
+                let has_assign = o.items.iter().any(|i| matches!(i, Item::Assign(_)));
+                if all_inputs.clone().next().is_none() && !has_assign {
+                    continue;
+                }
                 let align = all_inputs
                     .clone()
                     .map(|&(oi, si)| objects[oi].sections[si].align)
@@ -452,25 +535,28 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                         Item::Assign(a) => d = w.assign(a, d),
                     }
                 }
-                if d > 1 << 32 {
-                    w.script_err(
-                        o.line,
-                        format!("section {} extends past the 4 GiB address space", o.name),
-                    );
-                    continue;
-                }
-                let size = (d - start) as u32;
-                if size == 0 {
-                    // Discarded, like ld.lld does with empty output sections.
-                    continue;
-                }
+                // `d` may be exactly 4 GiB (a section ending at the top of the
+                // address space), but the size must still fit in 32 bits.
+                let size = match u32::try_from(d - start) {
+                    Ok(size) if d <= 1 << 32 => size,
+                    _ => {
+                        w.script_err(
+                            o.line,
+                            format!("section {} extends past the 4 GiB address space", o.name),
+                        );
+                        continue;
+                    }
+                };
                 if inputs.is_empty() {
-                    // Only `. += n`: reserve space without file contents.
-                    flags |= SHF_WRITE;
+                    // Only assignments (`. += n`, symbols): like ld.lld, a
+                    // PROGBITS section with the previous section's flags.
+                    flags = prev_flags;
+                    nobits = false;
+                } else {
+                    prev_flags = flags;
                 }
                 if let (Some(r), Some(c)) = (region, cursor) {
-                    if dot != c {
-                        let line = last_dot_move.unwrap_or(o.line);
+                    if let (Some(line), true) = (dot_moved, dot != c) {
                         w.script_err(
                             line,
                             format!(
@@ -508,6 +594,7 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                     inputs,
                 });
                 dot = d;
+                dot_moved = None;
             }
         }
     }
@@ -524,6 +611,8 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
         global_index: w.global_index,
     };
     layout.objects = objects;
+    let merge = merge_warnings(&layout);
+    layout.warnings.extend(merge);
 
     // 5. Undefined references.
     for o in &layout.objects {

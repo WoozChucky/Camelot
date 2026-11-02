@@ -24,7 +24,7 @@ crates/grail       the emulator
 crates/merlin      the C-subset compiler (front end + test harness; codegen is #14)
 crates/merlin-as   the assembler
 crates/merlin-ld   the linker (relocation hook in src/reloc.rs is issue #7)
-crates/xtask       build tasks (`cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld)
+crates/xtask       build tasks (`cargo xtask kernel` builds kernel/kernel.elf with clang + ld.lld; `cargo xtask ld-fixtures` regenerates merlin-ld's test fixtures)
 kernel/            the Camelot kernel (C + assembly); kernel.elf is committed, rebuild it after changes
 docs/              ISA spec
 examples/          bare-metal programs

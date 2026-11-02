@@ -1,5 +1,5 @@
 # Data in every output section kind and no references to other symbols, so
-# the object has no relocations. Built by scripts/gen-ld-fixtures.sh.
+# the object has no relocations. Built by `cargo xtask ld-fixtures`.
     .section .rodata
     .globl table
     .p2align 2

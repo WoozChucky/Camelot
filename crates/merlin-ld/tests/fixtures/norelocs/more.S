@@ -1,6 +1,6 @@
 # A third object: more .data with a larger alignment and a .bss.* section,
 # to check that merging honors each input section's alignment.
-# Built by scripts/gen-ld-fixtures.sh.
+# Built by `cargo xtask ld-fixtures`.
     .section .data.more, "aw"
     .globl flag
 flag:

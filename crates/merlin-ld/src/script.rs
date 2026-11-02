@@ -146,6 +146,12 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, ScriptError> {
             }
             '/' => {
                 chars.next();
+                if chars.clone().take(8).eq("DISCARD/".chars()) {
+                    return error(
+                        line,
+                        "/DISCARD/ is not supported (non-allocated sections are dropped without it)",
+                    );
+                }
                 if chars.peek() != Some(&'*') {
                     return error(line, "unexpected '/' (only /* */ comments are supported)");
                 }
@@ -794,7 +800,11 @@ mod tests {
                 "SECTIONS { .text : { *(.text) } AT> ROM }",
                 "unsupported syntax after 'AT'",
             ),
-            ("SECTIONS { /DISCARD/ : { *(.comment) } }", "unexpected '/'"),
+            (
+                "SECTIONS { /DISCARD/ : { *(.comment) } }",
+                "/DISCARD/ is not supported",
+            ),
+            ("SECTIONS { . = 4 / 2; }", "unexpected '/'"),
             ("SECTIONS { x += 4; }", "only supported for the location counter"),
             (
                 "SECTIONS { .text : { . = 0x100; } }",

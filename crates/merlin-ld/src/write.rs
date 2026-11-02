@@ -9,9 +9,11 @@
 //! ```
 //!
 //! Segments group consecutive output sections with the same permissions (R,
-//! RX, RW), as ld.lld does. A new segment also starts after a NOBITS section
-//! (file contents can't follow memory-only bytes) and across address gaps of
-//! a page or more (so the file doesn't fill them with zeros).
+//! RX, RW), as ld.lld does when there is a `SECTIONS` command (merlin-ld
+//! always has one: the default layout is a script too). Like ld.lld, a
+//! segment does not split at address gaps or after a NOBITS section: the file
+//! holds zeros for those bytes and `p_filesz` runs to the last section with
+//! file contents. A segment holding only empty sections is dropped.
 
 use crate::layout::{Def, Layout};
 use crate::object::{
@@ -62,10 +64,8 @@ pub fn segments(layout: &Layout) -> Vec<Segment> {
             Some(seg) => {
                 let prev = &layout.sections[*seg.sections.last().unwrap()];
                 let prev_end = prev.addr as u64 + prev.size as u64;
-                seg.flags != flags
-                    || (prev.nobits && !s.nobits)
-                    || (s.addr as u64) < prev_end
-                    || s.addr as u64 - prev_end >= PAGE as u64
+                // Going backward can't be one segment.
+                seg.flags != flags || (s.addr as u64) < prev_end
             }
         };
         if start_new {
@@ -85,6 +85,9 @@ pub fn segments(layout: &Layout) -> Vec<Segment> {
             seg.filesz = end;
         }
     }
+    // E.g. an empty `.rodata` between `.text` and `.data` (ld.lld removes
+    // empty PT_LOADs too).
+    segs.retain(|s| s.memsz > 0);
     segs
 }
 
@@ -122,7 +125,7 @@ fn symtab(layout: &Layout, strtab: &mut StrTab) -> (Vec<u8>, u32) {
             return Some(SHN_ABS);
         }
         layout.input_addr(obj, sec as usize)?;
-        // Placed but in a discarded (empty) output section: keep the address.
+        // Placed but without an output section (only after a layout error).
         Some(
             layout
                 .input_output_section(obj, sec as usize)

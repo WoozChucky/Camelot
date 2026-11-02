@@ -5,6 +5,30 @@ use crate::layout::Layout;
 use crate::reloc::{self, Context, HiSite, RelocError};
 use crate::Error;
 
+/// The [`Context`] of a link: every `R_RISCV_PCREL_HI20` site, keyed by its
+/// address, for the `PCREL_LO12` relocations that point at them.
+pub fn context(layout: &Layout) -> Context {
+    let mut ctx = Context::default();
+    for os in &layout.sections {
+        for i in &os.inputs {
+            for r in &layout.objects[i.object].sections[i.section].relocs {
+                if r.ty == reloc::R_RISCV_PCREL_HI20 {
+                    if let Ok(sym) = layout.reloc_symbol(i.object, r.sym as usize) {
+                        ctx.pcrel_hi20.insert(
+                            i.addr.wrapping_add(r.offset),
+                            HiSite {
+                                sym,
+                                addend: r.addend,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    ctx
+}
+
 /// Returns one byte image per output section (empty for NOBITS sections),
 /// with input contents copied in and relocations applied.
 pub fn relocate(layout: &Layout) -> Result<Vec<Vec<u8>>, Vec<Error>> {
@@ -30,25 +54,7 @@ pub fn relocate(layout: &Layout) -> Result<Vec<Vec<u8>>, Vec<Error>> {
         }
     }
 
-    // Every PCREL_HI20 site, for the PCREL_LO12 relocations that point at them.
-    let mut ctx = Context::default();
-    for os in &layout.sections {
-        for i in &os.inputs {
-            for r in &layout.objects[i.object].sections[i.section].relocs {
-                if r.ty == reloc::R_RISCV_PCREL_HI20 {
-                    if let Ok(sym) = layout.reloc_symbol(i.object, r.sym as usize) {
-                        ctx.pcrel_hi20.insert(
-                            i.addr.wrapping_add(r.offset),
-                            HiSite {
-                                sym,
-                                addend: r.addend,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-    }
+    let ctx = context(layout);
 
     let mut errors = Vec::new();
     for (oi, os) in layout.sections.iter().enumerate() {
@@ -59,17 +65,17 @@ pub fn relocate(layout: &Layout) -> Result<Vec<Vec<u8>>, Vec<Error>> {
                 let ty = reloc::name(r.ty);
                 let sym_name = obj.symbol_display_name(r.sym);
                 let at = format!("{}+{:#x}", sec.name, r.offset);
-                if r.offset >= sec.size {
-                    errors.push(Error(format!(
-                        "{}: {ty} at {at} is outside section {} (size {:#x})",
-                        obj.name, sec.name, sec.size
-                    )));
-                    continue;
-                }
                 if sec.is_nobits() || os.nobits {
                     errors.push(Error(format!(
                         "{}: {ty} at {at} patches a NOBITS section",
                         obj.name
+                    )));
+                    continue;
+                }
+                if r.offset >= sec.size {
+                    errors.push(Error(format!(
+                        "{}: {ty} at {at} is outside section {} (size {:#x})",
+                        obj.name, sec.name, sec.size
                     )));
                     continue;
                 }
