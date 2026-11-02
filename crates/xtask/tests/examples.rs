@@ -148,6 +148,8 @@ fn scenario(name: &str) -> Scenario {
         },
         // Alone, without a network card; `net_examples_talk_over_a_hub` connects them.
         "net-ping" | "net-pong" => plain("no network card (try grail --net hub)\n", 1),
+        // Alone too; crates/grail/tests/net_user.rs runs it behind the NAT gateway.
+        "net-user" => plain("no network card (try grail --net user)\n", 1),
         other => panic!("no scenario for example {other}: add one"),
     }
 }

@@ -22,6 +22,7 @@ crates/excalibur        encodings, decoder, disassembler (shared by every tool)
 crates/elf32            ELF32 reader (grail, merlin-objdump, merlin-ld)
 crates/grail            the emulator
 crates/avalon-proto     Avalon protocol (framing, messages, Connection, Screen diffing), shared by the Avalon platform's programs; spec in docs/avalon-protocol.md
+crates/gateway          user-mode NAT gateway (DHCP, DNS, TCP/UDP NAT, hostfwd) with its own frame send/recv API; grail wraps it as a NetBackend for `--net user` (spec 9.8). Must not depend on grail
 crates/avalon           the Avalon hypervisor server: VM table, one thread per running VM (run_for slices), consoles, screen viewers and input, RAM budget, virtual Ethernet switches (src/switch.rs)
 crates/avalon-client    the client layer: VM control, virtual network and disk management operations, parsers/formatters for addresses, sizes, clocks, disk sources, network cards (shared by Round Table and Pendragon; reuses grail::parse_ram_mib/parse_clock)
 crates/round-table      the Round Table control CLI: argument parsing and text output over avalon-client (src/lib.rs `run`, main.rs is a thin wrapper)

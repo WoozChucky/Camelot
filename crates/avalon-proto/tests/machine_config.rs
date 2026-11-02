@@ -40,7 +40,12 @@ fn net_spec_from(net: &NetConfig, switches: Switches) -> Result<DeviceSpec, Stri
     if pcap.is_some() {
         return Err("a card's capture has no wire form: capture its switch".to_string());
     }
-    let NetSource::Hub(hub) = source;
+    let hub = match source {
+        NetSource::Hub(hub) => hub,
+        // User networking is a NAT gateway local to the host that runs the machine,
+        // like a memory disk: Avalon's cards are on its switches.
+        NetSource::User { .. } => return Err("user networking has no wire form".to_string()),
+    };
     let switch = switches
         .iter()
         .find(|(_, h)| *h == hub)
@@ -196,6 +201,11 @@ fn configs_survive_the_wire() {
         ..MachineConfig::default()
     };
     assert!(profile_from(&captured, &switches).is_err());
+    let user = MachineConfig {
+        nets: vec![NetConfig::user(Vec::new())],
+        ..MachineConfig::default()
+    };
+    assert!(profile_from(&user, &switches).is_err());
     let unplugged = HardwareProfile {
         devices: vec![DeviceSpec::Net(NetSpec {
             switch: None,

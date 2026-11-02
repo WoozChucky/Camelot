@@ -1,5 +1,5 @@
-# The network card driver and console helpers shared by examples/net/ping.S and
-# pong.S (spec section 9.8). Linked into both programs.
+# The network card driver and console helpers shared by examples/net/ping.S, pong.S
+# and user.S (spec section 9.8). Linked into each of them.
 #
 # The card keeps two rings of 8-byte descriptors in RAM: { u32 buffer address, u16
 # length, u16 status }. Each ring has a BASE, a SIZE (a power of two) and two
@@ -374,6 +374,7 @@ puts:
     ret
 
 # put_text(a0 = buffer, a1 = length): the bytes up to the first NUL or the end.
+    .globl put_text
 put_text:
     addi  sp, sp, -16
     sw    ra, 12(sp)
@@ -390,6 +391,7 @@ put_text:
     ret
 
 # put_dec(a0 = unsigned value): decimal, no padding.
+    .globl put_dec
 put_dec:
     addi  sp, sp, -32
     sw    ra, 28(sp)
@@ -451,6 +453,7 @@ put_digit:
     j     putc
 
 # put_mac(a0 = address of 6 bytes): "02:ca:00:00:00:01".
+    .globl put_mac
 put_mac:
     addi  sp, sp, -16
     sw    ra, 12(sp)
