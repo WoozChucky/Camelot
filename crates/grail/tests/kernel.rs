@@ -1,8 +1,8 @@
 //! The Camelot kernel (`kernel/kernel.elf`, committed) run through the `grail`
 //! binary, with `--max-steps` as a guard: booting with paging on (with several
-//! `--ram` sizes), the timer ticks, the shell driven through stdin, the panics
-//! from its deliberate faults, and user programs taking turns or getting
-//! killed. The kernel's own tests (traps, delegation, the register dump, the
+//! `--ram` sizes), the timer ticks, the user-space shell driven through
+//! stdin, the panics from its deliberate faults, and user programs taking
+//! turns or getting killed. The kernel's own tests (traps, delegation, the register dump, the
 //! page table, the console, processes) are in `crates/xtask/tests/kernel.rs`.
 
 use std::io::Write;
@@ -102,9 +102,9 @@ fn ticks() -> String {
 }
 
 /// What the shell prints before its first prompt, and the prompt
-/// (kernel/main.c).
+/// (kernel/user/sh.c).
 const SHELL_BANNER: &str = "Type help for the list of commands.\n";
-const PROMPT: &str = "camelot> ";
+const PROMPT: &str = "$ ";
 
 /// `out` from the shell's banner on.
 fn shell_output(out: &str) -> &str {
@@ -115,13 +115,13 @@ fn shell_output(out: &str) -> &str {
 }
 
 #[test]
-fn kernel_ticks_ten_times_then_halts_from_the_shell() {
-    let (code, out) = grail(&kernel_elf(), b"halt\n");
+fn kernel_ticks_ten_times_then_starts_the_shell() {
+    let (code, out) = grail(&kernel_elf(), b"exit\n");
     assert_eq!(code, Some(0), "output:\n{out}");
     assert!(out.starts_with("Camelot v0.1.0 booting...\n"), "{out}");
     assert!(
         out.ends_with(&format!(
-            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{}{SHELL_BANNER}{PROMPT}halt\n",
+            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{}{SHELL_BANNER}{PROMPT}exit\n",
             memory_lines(128),
             ticks()
         )),
@@ -130,10 +130,11 @@ fn kernel_ticks_ten_times_then_halts_from_the_shell() {
 }
 
 #[test]
-fn shell_runs_ticks_then_halt_from_stdin() {
-    // Issue #18's acceptance test. The kernel's console echoes each command,
-    // then the shell prints its output.
-    let (code, out) = grail(&kernel_elf(), b"ticks\nhalt\n");
+fn shell_runs_ticks_then_exit_from_stdin() {
+    // Issue #18's acceptance test, now with the shell in user space. The
+    // kernel's console echoes each command, then the program prints its
+    // output.
+    let (code, out) = grail(&kernel_elf(), b"ticks\nexit\n");
     assert_eq!(code, Some(0), "output:\n{out}");
     let rest = shell_output(&out)
         .strip_prefix(&format!("{SHELL_BANNER}{PROMPT}ticks\nticks: "))
@@ -142,24 +143,41 @@ fn shell_runs_ticks_then_halt_from_stdin() {
     // At least the ten boot ticks; more if stdin was slow to reach the machine.
     let n: u32 = n.parse().unwrap_or_else(|_| panic!("ticks: {n:?}"));
     assert!(n >= 10, "{out}");
-    assert_eq!(rest, format!("{PROMPT}halt\n"));
+    assert_eq!(rest, format!("{PROMPT}exit\n"));
+}
+
+#[test]
+fn booting_drops_into_the_user_shell() {
+    // Issue #21's acceptance test: the shell is the first process; it runs
+    // hello and exits, and the machine stops with its status.
+    let (code, out) = grail(&kernel_elf(), b"hello\nexit\n");
+    assert_eq!(code, Some(0), "output:\n{out}");
+    assert_eq!(
+        shell_output(&out),
+        format!("{SHELL_BANNER}{PROMPT}hello\nhello from user mode\n{PROMPT}exit\n")
+    );
+    let (code, out) = grail(&kernel_elf(), b"exit 42\n");
+    assert_eq!(code, Some(42), "output:\n{out}");
 }
 
 #[test]
 fn shell_accepts_windows_line_ends() {
     // Text piped on Windows may end its lines with CR LF, and a raw console
     // sends CR alone for Enter: both must end a line exactly once.
-    let (code, out) = grail(&kernel_elf(), b"help\r\nnope\rhalt\r\n");
+    let (code, out) = grail(&kernel_elf(), b"help\r\nnope\recho a b\r\nexit\r\n");
     assert_eq!(code, Some(0), "output:\n{out}");
     let want = format!(
         "{SHELL_BANNER}{PROMPT}help\n\
-         help    this list\n\
-         ticks   timer ticks since boot (10 per second)\n\
-         run     run user programs side by side (run PROG...; run alone lists them)\n\
-         halt    stop the machine\n\
+         help            this list\n\
+         exit [N]        leave the shell, with status N or the last program's\n\
+         wait            wait for every background program\n\
+         PROG [ARG...]   run a program, e.g. hello, echo, ticks, ping, pong, sh\n\
+         CMD & CMD       run the first command in the background\n\
          {PROMPT}nope\n\
-         unknown command: nope (try help)\n\
-         {PROMPT}halt\n"
+         sh: nope: no such program\n\
+         {PROMPT}echo a b\n\
+         a b\n\
+         {PROMPT}exit\n"
     );
     assert_eq!(shell_output(&out), want);
 }
@@ -170,10 +188,10 @@ fn kernel_boots_with_paging_on_any_ram_size() {
     // what the kernel manages; the self-tests and the ticks run with paging
     // on either way, and so does the shell.
     for mib in ["1", "16", "300"] {
-        let (code, out) = grail_with(&["--ram", mib], &kernel_elf(), b"halt\n");
+        let (code, out) = grail_with(&["--ram", mib], &kernel_elf(), b"exit\n");
         assert_eq!(code, Some(0), "--ram {mib}, output:\n{out}");
         let want = format!(
-            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{}{SHELL_BANNER}{PROMPT}halt\n",
+            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{}{SHELL_BANNER}{PROMPT}exit\n",
             memory_lines(mib.parse().unwrap()),
             ticks()
         );
@@ -217,11 +235,11 @@ fn store_to_kernel_text_panics() {
     assert!(out.contains(" -A--X-RV\n"), "{out}");
 }
 
-// ---- User processes (issue #20) ----
+// ---- User processes (issues #20 and #21) ----
 
-/// The lines `run` prints from its command to the next prompt: what the
-/// processes and the kernel printed about them.
-fn run_output<'a>(out: &'a str, command: &str) -> Vec<&'a str> {
+/// The lines between the shell's echo of `command` and its next prompt: what
+/// the programs and the kernel printed meanwhile.
+fn command_output<'a>(out: &'a str, command: &str) -> Vec<&'a str> {
     let start = format!("{PROMPT}{command}\n");
     let at = out
         .find(&start)
@@ -239,15 +257,13 @@ fn run_output<'a>(out: &'a str, command: &str) -> Vec<&'a str> {
 fn user_programs_run_interleaved() {
     // ping and pong each print four lines about half a tick apart, from
     // U-mode in their own address spaces. The scheduler switches on every
-    // timer tick, so their lines alternate in pairs.
-    let (code, out) = grail(&kernel_elf(), b"run ping pong\nhalt\n");
+    // timer tick, so their lines alternate in pairs. The shell runs ping in
+    // the background and waits for pong, then collects ping with `wait`.
+    let (code, out) = grail(&kernel_elf(), b"ping & pong\nwait\nexit\n");
     assert_eq!(code, Some(0), "output:\n{out}");
-    let lines = run_output(&out, "run ping pong");
-    let printed: Vec<&str> = lines
-        .iter()
-        .copied()
-        .filter(|l| l.starts_with("ping ") || l.starts_with("pong "))
-        .collect();
+    let lines = command_output(&out, "ping & pong");
+    assert_eq!(lines[0], "[2]", "{out}");
+    let printed: Vec<&str> = lines[1..].to_vec();
     assert_eq!(printed.len(), 8, "{out}");
     // Each in order, and they take turns more than once.
     for name in ["ping", "pong"] {
@@ -257,34 +273,46 @@ fn user_programs_run_interleaved() {
     }
     let turns = printed.windows(2).filter(|w| w[0][..4] != w[1][..4]).count();
     assert!(turns >= 3, "only {turns} switches:\n{out}");
-    // ping, created first, goes first; both exit normally.
-    assert_eq!(printed[0], "ping 1", "{out}");
-    for exit in ["pid 1 (ping) exited: 0", "pid 2 (pong) exited: 0"] {
-        assert!(lines.contains(&exit), "{exit} missing:\n{out}");
-    }
+    assert_eq!(command_output(&out, "wait"), ["[2] ping: exit 0"], "{out}");
 }
 
 #[test]
 fn faulting_user_programs_are_killed_and_the_kernel_carries_on() {
     // badload reads kernel memory (mapped in its page table, but without U),
     // badhalt executes xcal.halt (M-mode only). Both die, the kernel says
-    // why, hello still runs, and so does the shell afterwards.
-    let (code, out) = grail(&kernel_elf(), b"run badload badhalt hello\nticks\nhalt\n");
+    // why, the shell reports their status, hello still runs, and so does the
+    // shell afterwards.
+    let (code, out) = grail(&kernel_elf(), b"badload\nbadhalt\nhello\nticks\nexit\n");
     assert_eq!(code, Some(0), "output:\n{out}");
-    let lines = run_output(&out, "run badload badhalt hello");
+    let lines = command_output(&out, "badload");
+    assert_eq!(lines.len(), 4, "{out}");
+    assert_eq!(lines[0], "pid 2 (badload) killed: load page fault");
+    assert!(lines[1].starts_with("  scause 0x0000000d  sepc 0x"), "{out}");
+    assert!(lines[1].ends_with("  stval 0x80000000"), "{out}");
     assert_eq!(
-        lines,
-        [
-            "pid 1 (badload) killed: load page fault",
-            "  scause 0x0000000d  sepc 0x00001004  stval 0x80000000",
-            "  va 0x80000000 maps to pa 0x80000000, pte 0x2000004b -A--X-RV",
-            "pid 2 (badhalt) killed: illegal instruction",
-            "  scause 0x00000002  sepc 0x00001004  stval 0x0005100b",
-            "hello from user mode",
-            "pid 3 (hello) exited: 0",
-        ],
-        "{out}"
+        lines[2],
+        "  va 0x80000000 maps to pa 0x80000000, pte 0x2000004b -A--X-RV"
     );
+    assert_eq!(lines[3], "badload: exit -1");
+    let lines = command_output(&out, "badhalt");
+    assert_eq!(lines.len(), 3, "{out}");
+    assert_eq!(lines[0], "pid 3 (badhalt) killed: illegal instruction");
+    assert!(lines[1].ends_with("  stval 0x0005100b"), "{out}");
+    assert_eq!(lines[2], "badhalt: exit -1");
+    assert_eq!(command_output(&out, "hello"), ["hello from user mode"]);
     assert!(out.contains(&format!("{PROMPT}ticks\nticks: ")), "{out}");
-    assert!(out.ends_with(&format!("{PROMPT}halt\n")), "{out}");
+    assert!(out.ends_with(&format!("{PROMPT}exit\n")), "{out}");
+}
+
+#[test]
+fn bad_pointers_to_the_system_calls_are_refused() {
+    // Issue #21's second criterion, end to end: badptr hands the system
+    // calls pointers to kernel memory, page 0, unmapped and read-only pages,
+    // and every call fails with -EFAULT instead of faulting.
+    let (code, out) = grail(&kernel_elf(), b"badptr\nexit\n");
+    assert_eq!(code, Some(0), "output:\n{out}");
+    assert_eq!(
+        command_output(&out, "badptr"),
+        ["badptr: every bad pointer refused"]
+    );
 }

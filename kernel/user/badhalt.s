@@ -2,9 +2,9 @@
 # 9.2), so in U-mode it is an illegal instruction, and the kernel kills the
 # process instead.
 
-    .section .text.start
-    .globl _start
-_start:
+    .text
+    .globl main
+main:
     li    a0, 0
     xcal.halt a0
     call  exit                  # not reached

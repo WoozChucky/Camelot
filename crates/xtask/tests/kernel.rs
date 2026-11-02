@@ -44,17 +44,18 @@ tick 9
 tick 10
 ";
 
-/// What the shell prints before its first prompt, and the prompt
-/// (kernel/main.c).
+/// What the user-space shell, the first process, prints before its first
+/// prompt, and the prompt (kernel/user/sh.c).
 const SHELL_BANNER: &str = "Type help for the list of commands.\n";
-const PROMPT: &str = "camelot> ";
+const PROMPT: &str = "$ ";
 
-/// The input most runs get: the shell's command to stop the machine.
-const HALT: &[u8] = b"halt\n";
+/// The input most runs get: the shell's command to leave, after which the
+/// kernel stops the machine.
+const EXIT: &[u8] = b"exit\n";
 
-/// The whole output of a run whose shell is given `HALT`.
+/// The whole output of a run whose shell is given `EXIT`.
 fn halted_output() -> String {
-    format!("{BOOT_OUTPUT}{SHELL_BANNER}{PROMPT}halt\n")
+    format!("{BOOT_OUTPUT}{SHELL_BANNER}{PROMPT}exit\n")
 }
 
 /// mtime ticks between timer interrupts: the nominal 10 MHz timebase / 10 Hz.
@@ -111,15 +112,15 @@ fn committed_elf() -> Vec<u8> {
 }
 
 fn assert_boots(elf: &[u8]) {
-    let (r, out) = kernel::run_on_grail(elf, HALT, BOOT_MAX_STEPS).unwrap();
+    let (r, out) = kernel::run_on_grail(elf, EXIT, BOOT_MAX_STEPS).unwrap();
     assert_eq!(kernel::mask_dbg_pc(&out), halted_output(), "raw output:\n{out}");
     assert_eq!(r, RunResult::Exited(0));
 }
 
-/// Loads the committed kernel without running it, with `HALT` typed on the
+/// Loads the committed kernel without running it, with `EXIT` typed on the
 /// UART so that a full run ends.
 fn load_committed() -> (Machine, grail::elf::Elf) {
-    load_committed_on(MachineConfig::default(), Some(kernel::typed(HALT)))
+    load_committed_on(MachineConfig::default(), Some(kernel::typed(EXIT)))
 }
 
 /// Loads the committed kernel into a machine built from `config`, with the
@@ -207,7 +208,7 @@ fn run_sends_uart_and_debug_output_to_the_given_sinks() {
     let (r, _) = kernel::run_with_output(
         &committed_elf(),
         Some(BOOT_MAX_STEPS),
-        kernel::typed(HALT),
+        kernel::typed(EXIT),
         uart.clone(),
         debug.clone(),
     )
@@ -473,7 +474,7 @@ fn ticks_are_one_interval_apart() {
             );
             probe_faults += 1;
         } else if cpu.pc == kernel_vec && cpu.csr.scause == INTERRUPT_BIT | IRQ_S_EXT {
-            // The UART receiving the shell's `halt`.
+            // The UART receiving the shell's `exit`.
             external += 1;
         } else if cpu.pc == kernel_vec {
             assert_eq!(cpu.csr.scause, INTERRUPT_BIT | IRQ_S_SOFT);
@@ -484,7 +485,7 @@ fn ticks_are_one_interval_apart() {
     });
     assert_eq!(r, RunResult::Exited(0));
     assert_eq!(halts, 1);
-    // All of `halt\n` was waiting before interrupts were on: one interrupt
+    // All of `exit\n` was waiting before interrupts were on: one interrupt
     // drains it.
     assert_eq!(external, 1);
     // Unmapped load and store, stores to text and rodata.
@@ -649,17 +650,30 @@ fn ticks_preempting_kernel_code_change_nothing() {
     let idle = [sym(&elf, "wfi") + 4, sym(&elf, "intr_on") + 4];
     let (machine_vec, kernel_vec) = (sym(&elf, "machine_vec"), sym(&elf, "kernel_vec"));
     let (mut machine_busy, mut kernel_busy) = (0, 0);
-    let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
-        if cpu.pc == machine_vec
-            && cpu.csr.mcause == INTERRUPT_BIT | IRQ_M_TIMER
-            && !idle.contains(&cpu.csr.mepc)
-        {
-            machine_busy += 1;
-        }
-        if cpu.pc == kernel_vec && !idle.contains(&cpu.csr.sepc) {
-            kernel_busy += 1;
-        }
-    });
+    // Up to the first process. A tick that short leaves a process no time to
+    // run (taking one and switching back costs more than 211 instructions),
+    // so the normal interval is back for the shell.
+    step_until(
+        &mut m,
+        BOOT_MAX_STEPS,
+        |cpu| {
+            if cpu.pc == machine_vec
+                && cpu.csr.mcause == INTERRUPT_BIT | IRQ_M_TIMER
+                && !idle.contains(&cpu.csr.mepc)
+            {
+                machine_busy += 1;
+            }
+            if cpu.pc == kernel_vec && !idle.contains(&cpu.csr.sepc) {
+                kernel_busy += 1;
+            }
+        },
+        |m| m.cpu.pc == sym(&elf, "proc_run_init"),
+    );
+    m.cpu
+        .bus
+        .load(scratch + SCRATCH_INTERVAL, &(TICK_INTERVAL as u32).to_le_bytes())
+        .unwrap();
+    let r = m.run(Some(BOOT_MAX_STEPS), |_| {});
     let out = printed(&m);
     assert_eq!(kernel::mask_dbg_pc(&out), halted_output(), "raw output:\n{out}");
     assert_eq!(r, RunResult::Exited(0));
@@ -940,7 +954,7 @@ fn boot_with_ram(ram_mib: usize, extra_devices: &[DeviceEntry]) -> (Machine, gra
     }
     m.cpu.bus.uart.capture = true;
     m.load_elf(&file).unwrap();
-    m.set_uart_input(kernel::typed(HALT));
+    m.set_uart_input(kernel::typed(EXIT));
     let r = m.run(Some(BOOT_MAX_STEPS * 4), |_| {});
     let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
     assert_eq!(r, RunResult::Exited(0), "{ram_mib} MiB, output:\n{out}");
@@ -1151,13 +1165,36 @@ fn plic_threshold(ctx: u32) -> u32 {
 /// kernel/include/uart.h).
 const UART_RX_SIZE: usize = 128;
 
-/// What `help` prints (kernel/main.c).
+/// What the shell's `help` prints (kernel/user/sh.c).
 const HELP: &str = "\
-help    this list
-ticks   timer ticks since boot (10 per second)
-run     run user programs side by side (run PROG...; run alone lists them)
-halt    stop the machine
+help            this list
+exit [N]        leave the shell, with status N or the last program's
+wait            wait for every background program
+PROG [ARG...]   run a program, e.g. hello, echo, ticks, ping, pong, sh
+CMD & CMD       run the first command in the background
 ";
+
+/// `out` with the number after each `ticks: ` replaced by `N`, after checking
+/// the numbers are at least the ten boot ticks and never go down.
+fn mask_ticks(out: &str) -> String {
+    let mut masked = String::new();
+    let mut last = 10;
+    let mut rest = out;
+    while let Some(at) = rest.find("ticks: ") {
+        let (before, after) = rest.split_at(at + "ticks: ".len());
+        masked.push_str(before);
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        let n: u32 = after[..digits]
+            .parse()
+            .unwrap_or_else(|_| panic!("no number after `ticks: ` in:\n{out}"));
+        assert!(n >= last, "ticks went from {last} to {n}:\n{out}");
+        last = n;
+        masked.push('N');
+        rest = &after[digits..];
+    }
+    masked.push_str(rest);
+    masked
+}
 
 /// A memory access by the instruction about to run.
 struct Access {
@@ -1239,63 +1276,101 @@ fn step_until(
 
 #[test]
 fn shell_runs_its_commands() {
-    let (r, out) = run_shell(b"help\nticks\nfrobnicate\n\n   \n  ticks \t\nhalt\n");
+    let (r, out) = run_shell(b"help\nticks\nfrobnicate\n\n   \n  ticks \t\necho  a\tb   c \nexit\n");
     assert_eq!(r, RunResult::Exited(0));
-    // The console echoes each line, then the shell answers. All the input was
-    // there before the shell started, so no tick passes in between.
+    // The console echoes each line as the shell reads it, then the shell or
+    // the program answers. Tabs are control characters: the console drops
+    // them.
     let want = format!(
         "{SHELL_BANNER}\
          {PROMPT}help\n{HELP}\
-         {PROMPT}ticks\nticks: 10\n\
-         {PROMPT}frobnicate\nunknown command: frobnicate (try help)\n\
+         {PROMPT}ticks\nticks: N\n\
+         {PROMPT}frobnicate\nsh: frobnicate: no such program\n\
          {PROMPT}\n\
          {PROMPT}   \n\
-         {PROMPT}  ticks \nticks: 10\n\
-         {PROMPT}halt\n"
+         {PROMPT}  ticks \nticks: N\n\
+         {PROMPT}echo  ab   c \nab c\n\
+         {PROMPT}exit\n"
     );
-    assert_eq!(out, want);
+    assert_eq!(mask_ticks(&out), want);
 }
 
 #[test]
 fn console_edits_lines() {
-    let long = "x".repeat(100);
+    let long = "x".repeat(200);
     let input = format!(
         // Backspace and DEL on an empty line do nothing; then both erase.
         "\x08\x7fticky\x7fs\x08\x08ks\n\
          {long}\n\
          ticks\r\n\r\r\
-         \x01ha\tl\x1bt\n"
+         \x01ex\ti\x1bt\n"
     );
     let (r, out) = run_shell(input.as_bytes());
     assert_eq!(r, RunResult::Exited(0));
-    // Lines hold at most 63 characters (LINE_MAX in kernel/main.c); the rest
-    // is neither echoed nor kept.
-    let kept = "x".repeat(63);
+    // Lines hold at most 127 characters and the newline (CONSOLE_LINE_MAX in
+    // kernel/include/console.h); the rest is neither echoed nor kept.
+    let kept = "x".repeat(127);
     let want = format!(
         "{SHELL_BANNER}\
-         {PROMPT}ticky\x08 \x08s\x08 \x08\x08 \x08ks\nticks: 10\n\
-         {PROMPT}{kept}\nunknown command: {kept} (try help)\n\
-         {PROMPT}ticks\nticks: 10\n\
+         {PROMPT}ticky\x08 \x08s\x08 \x08\x08 \x08ks\nticks: N\n\
+         {PROMPT}{kept}\nsh: {kept}: no such program\n\
+         {PROMPT}ticks\nticks: N\n\
          {PROMPT}\n\
          {PROMPT}\n\
-         {PROMPT}halt\n"
+         {PROMPT}exit\n"
     );
-    assert_eq!(out, want);
+    assert_eq!(mask_ticks(&out), want);
+}
+
+#[test]
+fn end_of_input_ends_the_shell() {
+    // Ctrl-D on an empty line: the read returns 0, and the shell exits with
+    // the last program's status. Mid-line it ends the line without a
+    // newline, so the shell sees `echo hi` and the program's output follows
+    // the echo directly.
+    let (r, out) = run_shell(b"echo hi\x04badload\n\x04");
+    assert_eq!(r, RunResult::Exited(0xff), "{out}");
+    assert!(
+        out.starts_with(&format!("{SHELL_BANNER}{PROMPT}echo hihi\n{PROMPT}badload\n")),
+        "{out}"
+    );
+    assert!(out.ends_with(&format!("badload: exit -1\n{PROMPT}")), "{out}");
+}
+
+#[test]
+fn exit_status_becomes_the_machine_exit_code() {
+    for (input, code) in [
+        (&b"exit 7\n"[..], 7),
+        (b"exit -2\n", 0xfe),
+        (b"exit 0\n", 0),
+        // No number: the last foreground program's status, -1 for a kill.
+        (b"badload\nexit\n", 0xff),
+        (b"badload\nhello\nexit\n", 0),
+        (b"echo a & badload\nexit\n", 0xff),
+    ] {
+        let (r, out) = run_shell(input);
+        assert_eq!(
+            r,
+            RunResult::Exited(code),
+            "{}:\n{out}",
+            String::from_utf8_lossy(input)
+        );
+    }
 }
 
 #[test]
 fn shell_takes_more_input_than_the_ring_buffer_holds() {
     // 40 commands, typed all at once: 245 bytes for a 128-byte buffer. When it
     // is full the driver turns the receive interrupt off rather than drop
-    // bytes, and turns it back on once the console has emptied half of it.
-    let input = format!("{}halt\n", "ticks\n".repeat(40));
+    // bytes, and turns it back on once the console has taken half of it.
+    let input = format!("{}exit\n", "ticks\n".repeat(40));
     assert!(input.len() > UART_RX_SIZE + UART_RX_SIZE / 2);
     assert!(input.len() < 2 * UART_RX_SIZE);
     let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(kernel::typed(input.as_bytes())));
     let trap_init = sym(&elf, "trap_init");
     let mut booted = false;
     let mut ier_writes = Vec::new();
-    let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
+    let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
         booted |= cpu.pc == trap_init;
         if let Some((UART_IER, true, v)) = uart_access(cpu) {
             if booted {
@@ -1307,10 +1382,10 @@ fn shell_takes_more_input_than_the_ring_buffer_holds() {
     let out = printed(&m);
     let shell = &out[out.find(SHELL_BANNER).unwrap()..];
     let want = format!(
-        "{SHELL_BANNER}{}{PROMPT}halt\n",
-        format!("{PROMPT}ticks\nticks: 10\n").repeat(40)
+        "{SHELL_BANNER}{}{PROMPT}exit\n",
+        format!("{PROMPT}ticks\nticks: N\n").repeat(40)
     );
-    assert_eq!(shell, want);
+    assert_eq!(mask_ticks(shell), want);
     // Off when the buffer filled (128 bytes in), on again at half (64 taken),
     // off when 64 more filled it (192 in), on again at half: the last 53
     // bytes fit.
@@ -1347,10 +1422,10 @@ fn plic_routes_the_uart_to_the_kernel() {
 
 #[test]
 fn console_sleeps_until_input_and_never_polls_rbr() {
-    // The kernel reaches the prompt with nothing typed, idles, then gets a
-    // command while it sleeps. Input only arrives through the interrupt: no
-    // UART register is read while the kernel waits, and RBR only ever by the
-    // interrupt handler.
+    // The shell prints its prompt with nothing typed and sleeps in read, so
+    // the scheduler idles; then a command arrives. Input only arrives through
+    // the interrupt: no UART register is read while the kernel waits, and RBR
+    // only ever by the interrupt handler.
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
     let ticks = sym(&elf, "ticks");
@@ -1384,8 +1459,9 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
     assert!((50..=51).contains(&wfis), "{wfis} wfi for 50 ticks");
     assert!(steps < 50 * 500, "{steps} steps for 50 idle ticks");
 
-    // Type a command: the UART interrupt wakes the hart at once (no tick passes
-    // before the shell answers), and only uart_intr reads RBR.
+    // Type a command: the UART interrupt wakes the hart at once and the
+    // console wakes the shell (no tick passes before the ticks program
+    // answers), and only uart_intr reads RBR.
     let before = printed(&m).len();
     for &b in b"ticks\n" {
         tx.send(b).unwrap();
@@ -1420,11 +1496,11 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
     assert!(lsr_reads > 6, "{lsr_reads}");
     assert!(external >= 1);
 
-    for &b in HALT {
+    for &b in EXIT {
         tx.send(b).unwrap();
     }
     assert_eq!(m.run(Some(BOOT_MAX_STEPS), |_| {}), RunResult::Exited(0));
-    assert!(printed(&m).ends_with(&format!("{PROMPT}halt\n")));
+    assert!(printed(&m).ends_with(&format!("{PROMPT}exit\n")));
 }
 
 #[test]
@@ -1435,7 +1511,7 @@ fn kernel_reads_the_timebase_from_sysinfo() {
         nominal_hz: HZ,
         ..MachineConfig::default()
     };
-    let (mut m, elf) = load_committed_on(config, Some(kernel::typed(HALT)));
+    let (mut m, elf) = load_committed_on(config, Some(kernel::typed(EXIT)));
     step_to(&mut m, sym(&elf, "kmain"));
     let interval = HZ / 10;
     assert_eq!(
@@ -1509,7 +1585,7 @@ fn boot_with_sysinfo_reg_zero(reg: u32) -> (Vec<u32>, u32, String) {
         nominal_hz: 2_000_000,
         ..MachineConfig::default()
     };
-    let (mut m, elf) = load_committed_on(config, Some(kernel::typed(HALT)));
+    let (mut m, elf) = load_committed_on(config, Some(kernel::typed(EXIT)));
     let kmain = sym(&elf, "kmain");
     let mut reads = Vec::new();
     for _ in 0..10_000 {
@@ -1557,11 +1633,12 @@ fn timebase_falls_back_to_nominal_when_sysinfo_reports_zero() {
 
 #[test]
 fn input_arriving_just_before_wfi_wakes_the_console() {
-    // console_getc turns interrupts off from its check of the ring buffer
-    // until wfi. A byte that arrives in between is then still pending when
-    // wfi runs, so wfi returns at once and the shell answers within the same
-    // tick. With interrupts on, the byte's interrupt would be taken before
-    // wfi, which would then sleep until the next tick.
+    // The scheduler turns interrupts off from its search for a runnable
+    // process until wfi. A byte that arrives in between is then still pending
+    // when wfi runs, so wfi returns at once, the console wakes the shell and
+    // the answer comes within the same tick. With interrupts on, the byte's
+    // interrupt would be taken before wfi, which would then sleep until the
+    // next tick.
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
     let ticks = sym(&elf, "ticks");
@@ -1569,7 +1646,8 @@ fn input_arriving_just_before_wfi_wakes_the_console() {
     let wfi = sym(&elf, "wfi");
 
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
-    // console_getc found nothing and is about to sleep.
+    // The shell sleeps in read; the scheduler found nothing to run and is
+    // about to idle.
     step_until(&mut m, 10_000, |_| {}, |m| m.cpu.pc == wfi);
     let n = tick_count(&m);
     let before = printed(&m).len();
@@ -1586,10 +1664,15 @@ fn input_arriving_just_before_wfi_wakes_the_console() {
     assert_eq!(tick_count(&m), n);
 }
 
-/// Every C file and header in the kernel, with its name.
+/// Every C file and header in the kernel and its user programs, with its
+/// name.
 fn kernel_c_sources() -> Vec<(String, String)> {
     let mut files = Vec::new();
-    for dir in [kernel_dir(), kernel_dir().join("include")] {
+    for dir in [
+        kernel_dir(),
+        kernel_dir().join("include"),
+        kernel_dir().join("user"),
+    ] {
         for e in std::fs::read_dir(&dir).unwrap() {
             let path = e.unwrap().path();
             if matches!(path.extension().and_then(|x| x.to_str()), Some("c" | "h")) {
@@ -1605,7 +1688,8 @@ fn kernel_c_sources() -> Vec<(String, String)> {
 #[test]
 fn kernel_c_stays_freestanding() {
     // No libc headers (everything is #include "...") and no floating point,
-    // so Merlin's C subset (#15) can compile it later.
+    // so Merlin's C subset (#15) can compile it later: the kernel and the
+    // user programs alike.
     for (name, text) in kernel_c_sources() {
         for (i, line) in text.lines().enumerate() {
             let code = line.split("/*").next().unwrap();
@@ -1636,32 +1720,148 @@ fn kernel_asm_is_merlin_dialect() {
     }
 }
 
-// ---- Processes: U-mode, page tables, the scheduler ----
+// ---- Processes: U-mode, page tables, the scheduler, the system calls ----
 
 /// The top of user space and the stack page under it (kernel/include/vm.h).
 const USER_TOP: u32 = 0x40_0000;
 const USER_STACK: u32 = USER_TOP - PAGE;
 /// Where program segments must end: below the guard page under the stack.
 const USER_LOAD_TOP: u32 = USER_STACK - PAGE;
-/// Where user programs start (kernel/user/user.ld).
+/// Where user programs start (kernel/user/user.ld): crt0's `_start`.
 const USER_TEXT: u32 = 0x1000;
 /// `sizeof(struct trap_frame)` (kernel/include/trap.h).
 const TRAP_FRAME_SIZE: u32 = 144;
 /// Process slots (`NPROC`, kernel/include/proc.h).
 const NPROC: usize = 8;
+/// Offset of `name` in `struct proc` (kernel/include/proc.h).
+const PROC_NAME: u32 = 8;
 /// scause of an ecall from U-mode.
 const ECALL_FROM_U: u32 = grail::trap::Exception::EcallU as u32;
+/// The exit system call's number (`SYS_exit`, kernel/include/syscall.h).
+const SYS_EXIT: u32 = 1;
 /// A boot plus a few programs: ping and pong run about two million
 /// instructions each, regs three.
 const RUN_MAX_STEPS: u64 = 60_000_000;
 
-/// The embedded programs, by name, as the kernel's `run` lists them.
+/// The embedded programs, by name.
 fn program_names() -> Vec<String> {
     xtask::userprogs::program_names(&xtask::userprogs::user_dir(&repo_root())).unwrap()
 }
 
+/// A fresh build of user program `name`, as the kernel embeds it.
+fn user_program(name: &str) -> xtask::userprogs::Program {
+    xtask::userprogs::build_named(&xtask::userprogs::user_dir(&repo_root()), name).unwrap()
+}
+
+/// The value of symbol `name` in user program `elf`.
+fn user_sym(elf: &[u8], name: &str) -> u32 {
+    elf32::Elf::parse(elf)
+        .unwrap()
+        .symbols()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("no symbol {name}"))
+        .value
+}
+
+/// The user pages a program's ELF image asks for, as (va, PTE permissions),
+/// then its stack page: what the process's page table must map below
+/// USER_TOP.
+fn expected_user_pages(elf: &[u8]) -> Vec<(u32, u32)> {
+    let parsed = elf32::Elf::parse(elf).unwrap();
+    let mut pages = Vec::new();
+    for seg in parsed
+        .segments
+        .iter()
+        .filter(|s| s.ty == elf32::PT_LOAD && s.memsz > 0)
+    {
+        let mut perm = PTE_V | PTE_U | PTE_R;
+        if seg.flags & elf32::PF_W != 0 {
+            perm |= PTE_W;
+        }
+        if seg.flags & elf32::PF_X != 0 {
+            perm |= PTE_X;
+        }
+        let first = seg.vaddr & !(PAGE - 1);
+        let mut va = first;
+        while va < seg.vaddr + seg.memsz {
+            pages.push((va, perm));
+            va += PAGE;
+        }
+    }
+    pages.push((USER_STACK, PTE_V | PTE_U | PTE_R | PTE_W));
+    pages
+}
+
+/// The user pages `satp` maps, as (va, the PTE bits the kernel chooses).
+fn user_pages(m: &Machine, satp: u32) -> Vec<(u32, u32)> {
+    let (leaves, _) = page_table(m, satp);
+    leaves
+        .iter()
+        .filter(|(va, _)| *va < USER_TOP)
+        .map(|&(va, pte)| (va, pte & PTE_KERNEL_BITS))
+        .collect()
+}
+
+/// The byte at physical address `addr`, read without side effects.
+fn peek_byte(bus: &grail::bus::Bus, addr: u32) -> u8 {
+    (bus.peek(addr & !3).unwrap() >> (8 * (addr & 3))) as u8
+}
+
+/// Reads `len` bytes of user memory at `va` through page table `satp`.
+fn user_read(m: &Machine, satp: u32, va: u32, len: u32) -> Vec<u8> {
+    let (leaves, _) = page_table(m, satp);
+    (va..va + len)
+        .map(|a| {
+            let (_, pte) = leaves
+                .iter()
+                .find(|(page, _)| *page == a & !(PAGE - 1))
+                .unwrap_or_else(|| panic!("{a:#x} is not mapped"));
+            peek_byte(&m.cpu.bus, (pte >> 10) * PAGE + a % PAGE)
+        })
+        .collect()
+}
+
+/// The NUL-terminated string at user address `va`.
+fn user_string(m: &Machine, satp: u32, va: u32) -> String {
+    let mut s = Vec::new();
+    for a in va.. {
+        match user_read(m, satp, a, 1)[0] {
+            0 => break,
+            c => s.push(c),
+        }
+    }
+    String::from_utf8(s).unwrap()
+}
+
+/// The name of the process on the CPU (`current` in kernel/proc.c), or
+/// `None` in the scheduler.
+fn current_name(cpu: &grail::cpu::Cpu, current: u32) -> Option<String> {
+    let p = cpu.bus.peek(current).unwrap();
+    if p == 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..16)
+        .map(|i| peek_byte(&cpu.bus, p + PROC_NAME + i))
+        .take_while(|&b| b != 0)
+        .collect();
+    Some(String::from_utf8(bytes).unwrap())
+}
+
+/// Steps `m` until program `name` runs in U-mode.
+fn step_to_user(m: &mut Machine, elf: &grail::elf::Elf, name: &str) {
+    let current = sym(elf, "current");
+    step_until(
+        m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| m.cpu.mode == Mode::U && current_name(&m.cpu, current).as_deref() == Some(name),
+    );
+}
+
 /// Runs the committed kernel with `input` typed on the UART (ending in
-/// `halt`). Returns what was printed from the shell's banner on.
+/// `exit`). Returns what was printed from the shell's banner on.
 fn run_processes(input: &[u8]) -> String {
     let (mut m, _) = load_committed_on(MachineConfig::default(), Some(kernel::typed(input)));
     let r = m.run(Some(RUN_MAX_STEPS), |_| {});
@@ -1670,11 +1870,11 @@ fn run_processes(input: &[u8]) -> String {
     out[out.find(SHELL_BANNER).unwrap()..].to_string()
 }
 
-/// The lines between the echo of `command` and the next prompt.
+/// The lines between the last echo of `command` and the next prompt.
 fn command_output<'a>(out: &'a str, command: &str) -> Vec<&'a str> {
     let start = format!("{PROMPT}{command}\n");
     let at = out
-        .find(&start)
+        .rfind(&start)
         .unwrap_or_else(|| panic!("no `{command}` in:\n{out}"))
         + start.len();
     let rest = &out[at..];
@@ -1724,100 +1924,59 @@ fn free_pages(m: &Machine, elf: &grail::elf::Elf) -> u32 {
 }
 
 #[test]
-fn run_lists_the_programs_and_refuses_unknown_ones() {
-    let list = format!("programs: {}", program_names().join(" "));
-    for want in ["badhalt", "badload", "hello", "ping", "pong", "regs"] {
-        assert!(list.contains(want), "{list}");
-    }
-    let out = run_processes(b"run\nrun ping nope\n  run   \nrunning\nhalt\n");
-    let want = format!(
-        "{SHELL_BANNER}\
-         {PROMPT}run\n{list}\n\
-         {PROMPT}run ping nope\nrun: no program called nope\n\
-         {PROMPT}  run   \n{list}\n\
-         {PROMPT}running\nunknown command: running (try help)\n\
-         {PROMPT}halt\n"
-    );
-    // Nothing ran: ping never printed.
-    assert_eq!(out, want);
-}
-
-#[test]
-fn hello_prints_from_user_mode() {
-    let out = run_processes(b"run hello\nhalt\n");
+fn booting_drops_into_the_user_shell() {
+    // Issue #21's first criterion: the kernel boots into the shell, a user
+    // program, which runs hello and exits; the kernel then stops the
+    // machine with the shell's exit status.
+    let (r, out) = kernel::run_on_grail(&committed_elf(), b"hello\nexit\n", RUN_MAX_STEPS).unwrap();
     assert_eq!(
-        command_output(&out, "run hello"),
-        ["hello from user mode", "pid 1 (hello) exited: 0"]
+        kernel::mask_dbg_pc(&out),
+        format!("{BOOT_OUTPUT}{SHELL_BANNER}{PROMPT}hello\nhello from user mode\n{PROMPT}exit\n")
     );
+    assert_eq!(r, RunResult::Exited(0));
 }
 
 #[test]
-fn ping_and_pong_take_turns_on_timer_ticks() {
-    // Issue #20's first criterion, watched from the hart: two processes in
-    // U-mode, each in its own page table, and the CPU only moves from one to
-    // the other when a timer tick (or an exit) traps from U-mode.
-    let (mut m, elf) = load_committed_on(
-        MachineConfig::default(),
-        Some(kernel::typed(b"run ping pong\nhalt\n")),
+fn the_shell_is_the_first_process() {
+    // The first instruction in U-mode is sh's entry point, crt0's _start,
+    // with every register zero but sp, a0 = argc and a1 = argv, which point
+    // at { "sh", NULL } at the top of the stack.
+    let (mut m, elf) = load_committed();
+    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
+    let c = &m.cpu;
+    assert_eq!(current_name(c, sym(&elf, "current")).as_deref(), Some("sh"));
+    let pid = m.cpu.bus.peek(m.cpu.bus.peek(sym(&elf, "current")).unwrap() + 4);
+    assert_eq!(pid, Some(1));
+    assert_eq!(c.pc, USER_TEXT);
+    let (sp, argv) = (c.x[2], c.x[x("a1") as usize]);
+    let mut regs = [0u32; 32];
+    regs[2] = sp;
+    regs[x("a0") as usize] = 1;
+    regs[x("a1") as usize] = argv;
+    assert_eq!(c.x, regs);
+    assert_eq!(sp % 16, 0);
+    assert!(
+        sp <= argv && argv < USER_TOP && sp > USER_STACK + PAGE / 2,
+        "sp {sp:#x} argv {argv:#x}"
     );
-    let user_vec = sym(&elf, "user_vec");
-    // The page table of each stretch in U-mode, and the last trap from it:
-    // (scause, whether it was ECALL_EXIT).
-    let mut satps: Vec<u32> = Vec::new();
-    let mut last_trap: Option<(u32, bool)> = None;
-    let mut timer_switches = 0;
-    let mut user_steps = 0u64;
-    let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
-        if cpu.mode == Mode::U {
-            user_steps += 1;
-            assert!((USER_TEXT..USER_TOP).contains(&cpu.pc), "U-mode at {:#x}", cpu.pc);
-            if satps.last() != Some(&cpu.csr.satp) {
-                match last_trap {
-                    None => assert!(satps.is_empty(), "switched without a trap"),
-                    // The process before was preempted by a tick...
-                    Some((cause, false)) => {
-                        assert_eq!(cause, INTERRUPT_BIT | IRQ_S_SOFT, "switched after {cause:#x}");
-                        timer_switches += 1;
-                    }
-                    // ...or it exited.
-                    Some((_, true)) => {}
-                }
-                satps.push(cpu.csr.satp);
-            }
-            last_trap = None;
-        }
-        if cpu.pc == user_vec {
-            // Every trap from U-mode arrives here, in S-mode, with SPP = U.
-            assert_eq!(cpu.mode, Mode::S);
-            assert_eq!(cpu.csr.mstatus & MSTATUS_SPP, 0);
-            let exit = cpu.csr.scause == ECALL_FROM_U && cpu.x[x("a7") as usize] == 1;
-            last_trap = Some((cpu.csr.scause, exit));
-        }
-    });
-    assert_eq!(r, RunResult::Exited(0));
-    let mut distinct = satps.clone();
-    distinct.sort();
-    distinct.dedup();
-    assert_eq!(distinct.len(), 2, "{satps:x?}");
-    assert!(!distinct.contains(&kernel_satp(&m, &elf)));
-    assert!(timer_switches >= 3, "{timer_switches} switches: {satps:x?}");
-    // Each prints 4 lines with half a tick (500 000 instructions) between.
-    assert!(user_steps > 3_000_000, "{user_steps}");
+    let satp = c.csr.satp;
+    let words = user_read(&m, satp, argv, 8);
+    let argv0 = u32::from_le_bytes(words[..4].try_into().unwrap());
+    assert_eq!(words[4..], [0; 4], "argv[1] is NULL");
+    assert!(argv0 > argv);
+    assert_eq!(user_string(&m, satp, argv0), "sh");
+    // The strings end right at the top: "sh\0" is the last three bytes.
+    assert_eq!(argv0, USER_TOP - 3);
+    // Interrupts on, SUM off.
+    assert_ne!(c.csr.mstatus & MSTATUS_SIE, 0);
+    assert_eq!(c.csr.mstatus & excalibur::csr::MSTATUS_SUM, 0);
 }
 
 #[test]
 fn a_process_page_table_maps_its_program_and_the_kernel() {
-    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(kernel::typed(b"run ping\nhalt\n")));
-    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(kernel::typed(b"ping\nexit\n")));
+    step_to_user(&mut m, &elf, "ping");
     let c = &m.cpu;
-    // The first U-mode instruction: the program's entry point, with every
-    // register zero but sp at the top of the stack, and interrupts on.
-    assert_eq!(c.pc, USER_TEXT);
-    let mut regs = [0u32; 32];
-    regs[2] = USER_TOP;
-    assert_eq!(c.x, regs);
-    assert_ne!(c.csr.mstatus & MSTATUS_SIE, 0);
-    assert_eq!(c.csr.mstatus & excalibur::csr::MSTATUS_SUM, 0);
     // Traps go to user_vec, which finds the process's trap frame in
     // sscratch: at the top of its kernel stack page, in free RAM.
     assert_eq!(c.csr.stvec, sym(&elf, "user_vec"));
@@ -1837,26 +1996,19 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
             "root[{i}]"
         );
     }
-    // User space: ping's code (R+X), its read-only data and the stack (R+W),
-    // all with U; nothing at page 0 or in the guard page under the stack.
-    // Everything above is the kernel's, none of it with U.
+    // User space: ping's segments, each page with U and the segment's
+    // permissions, and the stack (R+W); nothing at page 0, in the guard page
+    // under the stack or, with an empty heap, anywhere else. Everything above
+    // is the kernel's, none of it with U.
+    let ping = user_program("ping");
+    let want = expected_user_pages(&ping.elf);
+    assert_eq!(want[0], (USER_TEXT, PTE_V | PTE_U | PTE_R | PTE_X));
+    assert!(want
+        .iter()
+        .all(|&(va, _)| va >= USER_TEXT && va != USER_STACK - PAGE));
+    assert_eq!(user_pages(&m, satp), want);
     let (leaves, tables) = page_table(&m, satp);
     let (kleaves, ktables) = page_table(&m, ksatp);
-    let user: Vec<(u32, u32)> = leaves
-        .iter()
-        .filter(|(va, _)| *va < USER_TOP)
-        .map(|&(va, pte)| (va, pte & PTE_KERNEL_BITS))
-        .collect();
-    let urw = PTE_V | PTE_U | PTE_R;
-    assert_eq!(
-        user,
-        [
-            (USER_TEXT, urw | PTE_X),
-            (USER_TEXT + PAGE, urw),
-            (USER_STACK, urw | PTE_W)
-        ],
-        "{user:x?}"
-    );
     let kernel_part: Vec<_> = leaves.iter().filter(|(va, _)| *va >= USER_TOP).copied().collect();
     let kernel_all: Vec<_> = kleaves
         .iter()
@@ -1867,7 +2019,7 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
     assert!(kernel_part.iter().all(|(_, pte)| pte & PTE_U == 0));
     // The kernel's own root[0] (the test device) is not in the process's.
     assert!(kleaves.iter().any(|(va, _)| *va < USER_TOP));
-    // User pages are fresh pages in free RAM, the stack one zeroed.
+    // User pages are fresh pages in free RAM.
     for (va, pte) in leaves.iter().filter(|(va, _)| *va < USER_TOP) {
         let pa = (pte >> 10) * PAGE;
         assert!(pa >= sym(&elf, "__kernel_end"), "{va:#x} at {pa:#x}");
@@ -1879,44 +2031,109 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
 }
 
 #[test]
-fn programs_get_zeroed_memory_and_writable_data() {
-    // data checks that its stack page and its .bss (two pages, the second with
-    // no file bytes) read zero, that its .data word holds its initial value,
-    // and that .data and .bss take stores; then it dirties them. The pages it
-    // gives back are reused by the second run (the allocator doesn't clear
-    // freed pages), so that one passes only if the loader and the stack get
-    // zeroed pages.
-    let (mut m, _) = load_committed_on(
+fn ping_and_pong_take_turns_on_timer_ticks() {
+    // Issue #20's first criterion, watched from the hart: two processes in
+    // U-mode, each in its own page table, and the CPU only moves between
+    // them when a timer tick (or an exit) traps from U-mode. The shell runs
+    // too: it starts ping in the background and waits for pong.
+    let (mut m, elf) = load_committed_on(
         MachineConfig::default(),
-        Some(kernel::typed(b"run data\nrun data\nhalt\n")),
+        Some(kernel::typed(b"ping & pong\nwait\nexit\n")),
     );
-    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
-    let (leaves, _) = page_table(&m, m.cpu.csr.satp);
-    let user: Vec<(u32, u32)> = leaves
+    let (user_vec, current) = (sym(&elf, "user_vec"), sym(&elf, "current"));
+    // The process of each stretch in U-mode, and the last trap from it:
+    // (scause, whether it was the exit call).
+    let mut stretches: Vec<(String, u32)> = Vec::new();
+    let mut last_trap: Option<(u32, bool)> = None;
+    let mut timer_switches = 0;
+    let mut user_steps = 0u64;
+    let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
+        if cpu.mode == Mode::U {
+            let name = current_name(cpu, current).unwrap();
+            if name != "sh" {
+                user_steps += 1;
+            }
+            assert!((USER_TEXT..USER_TOP).contains(&cpu.pc), "U-mode at {:#x}", cpu.pc);
+            if stretches.last().map(|s| &s.0) != Some(&name) {
+                if let Some((prev, _)) = stretches.last() {
+                    if prev != "sh" {
+                        // ping and pong never wait for anything: they leave
+                        // the CPU when a tick preempts them, or for good.
+                        match last_trap {
+                            Some((cause, false)) => {
+                                assert_eq!(cause, INTERRUPT_BIT | IRQ_S_SOFT, "{prev} left after {cause:#x}");
+                                timer_switches += 1;
+                            }
+                            Some((_, true)) => {}
+                            None => panic!("{prev} switched without a trap"),
+                        }
+                    }
+                }
+                stretches.push((name, cpu.csr.satp));
+            }
+            last_trap = None;
+        }
+        if cpu.pc == user_vec {
+            // Every trap from U-mode arrives here, in S-mode, with SPP = U.
+            assert_eq!(cpu.mode, Mode::S);
+            assert_eq!(cpu.csr.mstatus & MSTATUS_SPP, 0);
+            let exit = cpu.csr.scause == ECALL_FROM_U && cpu.x[x("a7") as usize] == SYS_EXIT;
+            last_trap = Some((cpu.csr.scause, exit));
+        }
+    });
+    assert_eq!(r, RunResult::Exited(0));
+    let mut satps: Vec<(String, u32)> = stretches.clone();
+    satps.sort();
+    satps.dedup();
+    let names: Vec<&str> = satps.iter().map(|s| s.0.as_str()).collect();
+    assert_eq!(names, ["ping", "pong", "sh"], "{stretches:?}");
+    let mut distinct: Vec<u32> = satps.iter().map(|s| s.1).collect();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 3, "each its own page table: {satps:x?}");
+    assert!(!distinct.contains(&kernel_satp(&m, &elf)));
+    assert!(timer_switches >= 3, "{timer_switches} switches: {stretches:?}");
+    // Each prints 4 lines with half a tick (500 000 instructions) between.
+    assert!(user_steps > 3_000_000, "{user_steps}");
+    // The shell: ping in the background, pong in the foreground.
+    let out = printed(&m);
+    assert!(
+        out.contains(&format!("{PROMPT}ping & pong\n[2]\nping 1\n")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("{PROMPT}wait\n[2] ping: exit 0\n{PROMPT}exit\n")),
+        "{out}"
+    );
+}
+
+#[test]
+fn programs_get_zeroed_memory_and_writable_data() {
+    // data checks that its stack page below sp and its .bss (two pages, the
+    // second with no file bytes) read zero, that its .data word holds its
+    // initial value, and that .data and .bss take stores; then it dirties
+    // them. The pages it gives back are reused by the second run (the
+    // allocator doesn't clear freed pages), so that one passes only if the
+    // loader and the stack get zeroed pages.
+    let (mut m, elf) = load_committed_on(
+        MachineConfig::default(),
+        Some(kernel::typed(b"data\ndata\nexit\n")),
+    );
+    step_to_user(&mut m, &elf, "data");
+    let data = user_program("data");
+    let want = expected_user_pages(&data.elf);
+    // .data and .bss in one PF_R|PF_W segment of two pages, the second with
+    // no file bytes.
+    let rw: Vec<_> = want
         .iter()
-        .filter(|(va, _)| *va < USER_TOP)
-        .map(|&(va, pte)| (va, pte & PTE_KERNEL_BITS))
+        .filter(|(va, p)| *va != USER_STACK && p & PTE_W != 0)
         .collect();
-    let (ur, urw) = (PTE_V | PTE_U | PTE_R, PTE_V | PTE_U | PTE_R | PTE_W);
-    // Text, then .data and .bss in one PF_R|PF_W segment, then the stack.
-    assert_eq!(
-        user,
-        [
-            (USER_TEXT, ur | PTE_X),
-            (USER_TEXT + PAGE, urw),
-            (USER_TEXT + 2 * PAGE, urw),
-            (USER_STACK, urw)
-        ],
-        "{user:x?}"
-    );
+    assert_eq!(rw.len(), 2, "{want:x?}");
+    assert_eq!(user_pages(&m, m.cpu.csr.satp), want);
+    // `exit` alone exits with the last program's status: the second run's.
     assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
     let out = printed(&m);
     assert!(
-        out.ends_with(&format!(
-            "{PROMPT}run data\npid 1 (data) exited: 0\n\
-             {PROMPT}run data\npid 2 (data) exited: 0\n\
-             {PROMPT}halt\n"
-        )),
+        out.ends_with(&format!("{PROMPT}data\n{PROMPT}data\n{PROMPT}exit\n")),
         "{out}"
     );
 }
@@ -1924,19 +2141,22 @@ fn programs_get_zeroed_memory_and_writable_data() {
 #[test]
 fn a_store_to_read_only_data_is_killed() {
     // .rodata is mapped without W: badstore's store to it faults.
-    let out = run_processes(b"run badstore\nhalt\n");
-    let lines = command_output(&out, "run badstore");
-    assert_eq!(lines.len(), 3, "{out}");
-    assert_eq!(lines[0], "pid 1 (badstore) killed: store page fault");
+    let out = run_processes(b"badstore\nexit 0\n");
+    let badstore = user_program("badstore");
+    let (main, msg) = (user_sym(&badstore.elf, "main"), user_sym(&badstore.elf, "msg"));
+    let lines = command_output(&out, "badstore");
+    assert_eq!(lines.len(), 4, "{out}");
+    assert_eq!(lines[0], "pid 2 (badstore) killed: store page fault");
+    // The store follows `la` (two instructions).
     assert_eq!(
         lines[1],
         format!(
-            "  scause {STORE_PAGE_FAULT:#010x}  sepc {:#010x}  stval {:#010x}",
-            USER_TEXT + 8,
-            USER_TEXT + PAGE
+            "  scause {STORE_PAGE_FAULT:#010x}  sepc {:#010x}  stval {msg:#010x}",
+            main + 8
         )
     );
     assert!(lines[2].ends_with(" ---U--RV"), "{out}");
+    assert_eq!(lines[3], "badstore: exit -1");
 }
 
 /// The registers `cpu` holds, and its pc.
@@ -1952,10 +2172,11 @@ fn a_tick_in_user_mode_saves_every_register_and_switches_back_later() {
     // every register and its pc as they were.
     let (mut m, elf) = load_committed_on(
         MachineConfig::default(),
-        Some(kernel::typed(b"run regs ping\nhalt\n")),
+        Some(kernel::typed(b"regs & ping\nwait\nexit\n")),
     );
     let (user_vec, user_trap) = (sym(&elf, "user_vec"), sym(&elf, "user_trap"));
     // regs, in its spin loop: all its registers are set.
+    step_to_user(&mut m, &elf, "regs");
     step_until(
         &mut m,
         RUN_MAX_STEPS,
@@ -2000,7 +2221,7 @@ fn a_tick_in_user_mode_saves_every_register_and_switches_back_later() {
         |m| m.cpu.csr.stvec == sym(&elf, "kernel_vec"),
     );
 
-    // Off to ping, then back to regs.
+    // Off to another process, then back to regs.
     let mut ran_other = false;
     step_until(
         &mut m,
@@ -2008,12 +2229,12 @@ fn a_tick_in_user_mode_saves_every_register_and_switches_back_later() {
         |cpu| ran_other |= cpu.mode == Mode::U && cpu.csr.satp != regs_satp,
         |m| m.cpu.mode == Mode::U && m.cpu.csr.satp == regs_satp,
     );
-    assert!(ran_other, "the tick didn't switch to ping");
+    assert!(ran_other, "the tick didn't switch to another process");
     assert_eq!(user_state(&m.cpu), (saved, sepc));
     assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
     // And regs found every register intact at the end, after more switches.
     let out = printed(&m);
-    assert!(out.contains("pid 1 (regs) exited: 0\n"), "{out}");
+    assert!(out.contains("[2] regs: exit 0\n"), "{out}");
 }
 
 #[test]
@@ -2021,10 +2242,13 @@ fn registers_survive_many_switches() {
     // regs checks its own registers after three ticks' worth of spinning
     // beside two programs that use the same registers: exit status 0, or the
     // number of the register that changed.
-    let out = run_processes(b"run regs ping pong\nhalt\n");
-    let lines = command_output(&out, "run regs ping pong");
-    assert!(lines.contains(&"pid 1 (regs) exited: 0"), "{lines:#?}");
-    assert_eq!(lines.iter().filter(|l| l.contains("exited: 0")).count(), 3);
+    let out = run_processes(b"regs & ping & pong\nwait\nexit\n");
+    let lines = command_output(&out, "wait");
+    let mut collected = lines.clone();
+    collected.sort();
+    assert_eq!(collected, ["[2] regs: exit 0", "[3] ping: exit 0"], "{out}");
+    // pong, in the foreground, exited 0: the shell said nothing about it.
+    assert!(!out.contains("pong: exit"), "{out}");
 }
 
 #[test]
@@ -2033,7 +2257,7 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
     // page (mapped, without U), badhalt executes xcal.halt (M-mode only).
     let (mut m, elf) = load_committed_on(
         MachineConfig::default(),
-        Some(kernel::typed(b"run badload ping badhalt\nticks\nhalt\n")),
+        Some(kernel::typed(b"badload & ping & badhalt\nwait\nticks\nexit\n")),
     );
     let user_vec = sym(&elf, "user_vec");
     let mut faults = Vec::new();
@@ -2044,59 +2268,146 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
     });
     let out = printed(&m);
     assert_eq!(r, RunResult::Exited(0), "{out}");
+    // Each faults at its second instruction.
+    let badload = user_sym(&user_program("badload").elf, "main") + 4;
+    let badhalt = user_sym(&user_program("badhalt").elf, "main") + 4;
     let xcal_halt_a0 = 0x0005_100b;
     assert_eq!(
         faults,
         [
-            (LOAD_PAGE_FAULT, USER_TEXT + 4, 0x8000_0000),
-            (ILLEGAL_INSTRUCTION, USER_TEXT + 4, xcal_halt_a0)
+            (LOAD_PAGE_FAULT, badload, 0x8000_0000),
+            (ILLEGAL_INSTRUCTION, badhalt, xcal_halt_a0)
         ]
     );
     let text = sym(&elf, "__text_start");
     let pte = (text >> 12) << 10 | PTE_V | PTE_R | PTE_X | PTE_A;
-    let lines = command_output(&out, "run badload ping badhalt");
-    let want_kills = [
-        "pid 1 (badload) killed: load page fault".to_string(),
-        "  scause 0x0000000d  sepc 0x00001004  stval 0x80000000".to_string(),
+    let lines = command_output(&out, "badload & ping & badhalt");
+    let want = [
+        "[2]".to_string(),
+        "[3]".to_string(),
+        "pid 2 (badload) killed: load page fault".to_string(),
+        format!("  scause 0x0000000d  sepc {badload:#010x}  stval 0x80000000"),
         format!("  va 0x80000000 maps to pa 0x80000000, pte {pte:#010x} -A--X-RV"),
-        "pid 3 (badhalt) killed: illegal instruction".to_string(),
-        "  scause 0x00000002  sepc 0x00001004  stval 0x0005100b".to_string(),
+        "pid 4 (badhalt) killed: illegal instruction".to_string(),
+        format!("  scause 0x00000002  sepc {badhalt:#010x}  stval 0x0005100b"),
+        "badhalt: exit -1".to_string(),
     ];
-    let kills: Vec<&str> = lines.iter().copied().filter(|l| !l.contains("ping")).collect();
-    assert_eq!(kills, want_kills, "{out}");
+    let kills: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| !l.starts_with("ping "))
+        .collect();
+    assert_eq!(kills, want, "{out}");
     // ping wasn't disturbed, and the shell still works.
-    let pings: Vec<&str> = lines.iter().copied().filter(|l| l.starts_with("ping ")).collect();
+    let pings: Vec<&str> = out.lines().filter(|l| l.starts_with("ping ")).collect();
     assert_eq!(pings, ["ping 1", "ping 2", "ping 3", "ping 4"]);
-    assert!(lines.contains(&"pid 2 (ping) exited: 0"));
+    let mut collected: Vec<&str> = command_output(&out, "wait")
+        .into_iter()
+        .filter(|l| !l.starts_with("ping "))
+        .collect();
+    collected.sort();
+    assert_eq!(collected, ["[2] badload: exit -1", "[3] ping: exit 0"]);
     assert_eq!(command_output(&out, "ticks").len(), 1);
     // The kernel never panicked, and xcal.halt never reached M-mode.
     assert!(!out.contains("panic"), "{out}");
 }
 
 #[test]
-fn bad_buffers_and_unknown_ecalls_are_refused() {
-    // badptr hands ECALL_DEBUG_WRITE kernel memory, page 0, a range past the
-    // end of user space, a length that wraps, the stack's guard page, then
-    // makes an unknown ecall: each must return -1 and print nothing.
-    let out = run_processes(b"run badptr\nhalt\n");
+fn bad_pointers_are_refused() {
+    // Issue #21's second criterion. badptr hands write and read kernel
+    // memory, page 0, a range past the end of user space, the stack's guard
+    // page, lengths that wrap, read-only memory and memory past the heap,
+    // and wait and spawn bad pointers too: each call must fail with -EFAULT,
+    // print nothing and leave the kernel running. Its failed reads take no
+    // input either: hello still gets its line.
+    let out = run_processes(b"badptr\nhello\nexit\n");
     assert_eq!(
-        command_output(&out, "run badptr"),
-        ["badptr: every bad buffer refused", "pid 1 (badptr) exited: 0"]
+        command_output(&out, "badptr"),
+        ["badptr: every bad pointer refused"]
     );
+    assert_eq!(command_output(&out, "hello"), ["hello from user mode"]);
+}
+
+#[test]
+fn the_system_calls_do_what_the_document_says() {
+    // systest checks every call from user space: the error numbers, exit
+    // statuses and arguments through spawn and wait, filling the process
+    // table, sleep, sbrk growing and shrinking the heap.
+    let out = run_processes(b"systest\nexit\n");
+    let lines = command_output(&out, "systest");
+    assert_eq!(lines.len(), 1, "{out}");
+    assert!(
+        lines[0].starts_with("systest: ") && lines[0].ends_with(" checks, 0 failed"),
+        "{out}"
+    );
+    let checks: u32 = lines[0]["systest: ".len()..]
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(checks > 70, "{checks}");
+}
+
+#[test]
+fn programs_get_their_arguments() {
+    let out = run_processes(b"echo\necho one\necho  a   b\tc  d \nexit\n");
+    assert_eq!(command_output(&out, "echo"), [""]);
+    assert_eq!(command_output(&out, "echo one"), ["one"]);
+    assert_eq!(command_output(&out, "echo  a   bc  d "), ["a bc d"]);
+}
+
+#[test]
+fn a_shell_runs_inside_the_shell() {
+    // sh is a program like any other: the inner one reads the next lines,
+    // and the outer one carries on when it exits.
+    let out = run_processes(b"sh\nhello\nexit 4\necho back\nexit 0\n");
+    assert!(
+        out.ends_with(&format!(
+            "{PROMPT}sh\n{SHELL_BANNER}{PROMPT}hello\nhello from user mode\n{PROMPT}exit 4\n\
+             sh: exit 4\n{PROMPT}echo back\nback\n{PROMPT}exit 0\n"
+        )),
+        "{out}"
+    );
+}
+
+#[test]
+fn sleeping_processes_leave_the_cpu_idle() {
+    // While everyone sleeps (sh in wait, systest's child in sleep), the
+    // scheduler idles in wfi: each tick costs a few hundred instructions.
+    let (mut m, elf) = load_committed_on(
+        MachineConfig::default(),
+        Some(kernel::typed(b"systest sleep 50\nexit\n")),
+    );
+    let ticks = sym(&elf, "ticks");
+    step_to_user(&mut m, &elf, "systest");
+    let start = m.cpu.bus.peek(ticks).unwrap();
+    let mut user_steps = 0;
+    let steps = step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |cpu| user_steps += u64::from(cpu.mode == Mode::U),
+        |m| printed(m).ends_with(&format!("{PROMPT}systest sleep 50\n{PROMPT}")),
+    );
+    let slept = m.cpu.bus.peek(ticks).unwrap() - start;
+    assert!((50..=51).contains(&slept), "{slept} ticks");
+    assert!(steps < 50 * 1000, "{steps} steps for {slept} ticks");
+    assert!(user_steps < 10_000, "{user_steps} steps in U-mode");
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
 }
 
 #[test]
 fn input_typed_while_processes_run_reaches_the_shell() {
     // The UART interrupt arrives while a process is in U-mode: user_trap
     // services it and the process carries on; the shell reads the line once
-    // `run` is over.
+    // ping is over.
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
-    for &b in b"run ping\n" {
+    for &b in b"ping\n" {
         tx.send(b).unwrap();
     }
-    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
-    for &b in b"ticks\nhalt\n" {
+    step_to_user(&mut m, &elf, "ping");
+    for &b in b"ticks\nexit\n" {
         tx.send(b).unwrap();
     }
     let user_vec = sym(&elf, "user_vec");
@@ -2109,10 +2420,7 @@ fn input_typed_while_processes_run_reaches_the_shell() {
     assert_eq!(r, RunResult::Exited(0));
     assert!(external >= 1);
     let out = printed(&m);
-    assert!(
-        out.contains("pid 1 (ping) exited: 0\ncamelot> ticks\nticks: "),
-        "{out}"
-    );
+    assert!(out.contains(&format!("ping 4\n{PROMPT}ticks\nticks: ")), "{out}");
 }
 
 #[test]
@@ -2128,32 +2436,46 @@ fn processes_give_back_every_page() {
         step_to_prompt(m, prompts);
     };
     step_to_prompt(&mut m, 1);
+    // The shell holds its own pages meanwhile.
     let before = free_pages(&m, &elf);
 
-    // Every program, the ones that exit and the ones that are killed, as many
-    // at a time as there are slots.
-    for some in program_names().chunks(NPROC) {
-        command(&mut m, &format!("run {}\n", some.join(" ")));
-        assert_eq!(free_pages(&m, &elf), before, "{some:?}");
+    // Every program on its own: the ones that exit, the ones that are
+    // killed, and systest, which spawns children and grows its heap. (sh
+    // would read the next lines itself: see a_shell_runs_inside_the_shell.)
+    let names: Vec<String> = program_names().into_iter().filter(|n| n != "sh").collect();
+    for name in &names {
+        command(&mut m, &format!("{name}\n"));
+        assert_eq!(free_pages(&m, &elf), before, "{name}");
     }
-    // More than there are slots: the ninth can't start.
-    let hellos = ["hello"; NPROC + 1].join(" ");
-    command(&mut m, &format!("run {hellos}\n"));
-    let out = printed(&m);
-    let lines = command_output(&out, &format!("run {hellos}"));
-    assert_eq!(lines[0], "run: cannot start hello: too many processes");
-    assert_eq!(
-        lines.iter().filter(|l| **l == "hello from user mode").count(),
-        NPROC
-    );
+    // Several side by side, then collected.
+    let some = ["hello", "badload", "ping", "data", "badstore", "echo"];
+    command(&mut m, &format!("{} &\n", some.join(" & ")));
+    command(&mut m, "wait\n");
     assert_eq!(free_pages(&m, &elf), before);
-    // While processes run, they hold pages.
-    for &b in b"run ping\n" {
+    // More than there are slots: the shell has one, and the eighth hello
+    // can't start. Exited children keep their slots until collected.
+    let hellos = ["hello"; NPROC].join(" & ");
+    command(&mut m, &format!("{hellos} &\n"));
+    let out = printed(&m);
+    let lines = command_output(&out, &format!("{hellos} &"));
+    assert!(lines.contains(&"sh: hello: no free process slot"), "{out}");
+    command(&mut m, "wait\n");
+    let out = printed(&m);
+    // The hellos run while the shell waits for its next line; wait collects
+    // them.
+    let waited = command_output(&out, "wait");
+    let collected = waited.iter().filter(|l| l.ends_with("] hello: exit 0")).count();
+    let greetings = waited.iter().filter(|l| **l == "hello from user mode").count();
+    assert_eq!((collected, greetings), (NPROC - 1, NPROC - 1), "{out}");
+    assert_eq!(free_pages(&m, &elf), before);
+    // While a process runs, it holds its pages: a kernel stack, a root and a
+    // user table, its segments and its stack.
+    for &b in b"ping\n" {
         tx.send(b).unwrap();
     }
-    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
-    // Kernel stack, root, user table, text, rodata, stack.
-    assert_eq!(free_pages(&m, &elf), before - 6);
+    step_to_user(&mut m, &elf, "ping");
+    let pages = expected_user_pages(&user_program("ping").elf).len() as u32;
+    assert_eq!(free_pages(&m, &elf), before - 3 - pages);
 }
 
 /// Byte offsets in an ELF32 header and program header.
@@ -2175,9 +2497,10 @@ type Patch<'a> = (u32, &'a [u8]);
 #[test]
 fn the_elf_loader_refuses_bad_images() {
     // hello's image in the kernel, patched in memory one way at a time; each
-    // `run hello` must fail with the loader's reason (or run, for the patch
-    // that keeps the image good), leak nothing, and leave the kernel running.
-    let hello = xtask::userprogs::build_program(&xtask::userprogs::user_dir(&repo_root()), "hello").unwrap();
+    // `hello` typed at the shell must fail with the loader's reason (or run,
+    // for the patches that keep the image good), leak nothing, and leave the
+    // kernel running.
+    let hello = user_program("hello");
     let parsed = elf32::Elf::parse(&hello.elf).unwrap();
     let phoff = parsed.header.phoff;
     let size = hello.elf.len() as u32;
@@ -2188,19 +2511,23 @@ fn the_elf_loader_refuses_bad_images() {
     let ph = |i: u32, field: u32| phoff + elf32::PHDR_SIZE as u32 * loads[i as usize] + field;
     let text = &parsed.segments[loads[0] as usize];
     let rodata = &parsed.segments[loads[1] as usize];
-    // The cases rely on this layout: text on the first page, then a few bytes
-    // of rodata on the next, less than a page before the end of the file.
-    assert_eq!((text.vaddr, rodata.vaddr), (USER_TEXT, USER_TEXT + PAGE));
-    assert!(text.memsz <= PAGE && rodata.memsz < PAGE);
+    // The cases rely on this layout: the text from the first page on, then
+    // less than a page of rodata on a page of its own, less than a page
+    // before the end of the file.
+    assert_eq!(text.vaddr, USER_TEXT);
+    assert!(rodata.vaddr >= text.vaddr + text.memsz && rodata.vaddr.is_multiple_of(PAGE));
+    assert!(rodata.memsz < PAGE);
     assert_eq!(rodata.filesz, rodata.memsz);
     assert!(rodata.offset + PAGE > size);
-    // hello reaches its rodata pc-relatively, so it still runs with both
-    // segments moved by the same amount: here, so that its rodata, given a
-    // whole page, ends right at USER_LOAD_TOP.
-    let (high_text, high_rodata) = (USER_LOAD_TOP - 2 * PAGE, USER_LOAD_TOP - PAGE);
+    // hello reaches its rodata pc-relatively (-mcmodel=medany), so it still
+    // runs with both segments moved by the same amount: here, so that its
+    // rodata, given a whole page, ends right at USER_LOAD_TOP.
+    let high_rodata = USER_LOAD_TOP - PAGE;
+    let high_text = high_rodata - (rodata.vaddr - text.vaddr);
+    let entry = parsed.header.entry;
     let moved_high = |rodata_memsz: u32| -> Vec<(u32, [u8; 4])> {
         vec![
-            (E_ENTRY, high_text.to_le_bytes()),
+            (E_ENTRY, (entry - text.vaddr + high_text).to_le_bytes()),
             (ph(0, P_VADDR), high_text.to_le_bytes()),
             (ph(1, P_VADDR), high_rodata.to_le_bytes()),
             (ph(1, P_MEMSZ), rodata_memsz.to_le_bytes()),
@@ -2221,7 +2548,7 @@ fn the_elf_loader_refuses_bad_images() {
     step_to_prompt(&mut m, 1);
     let before = free_pages(&m, &elf);
 
-    // What `run hello` must say: the loader's reason, or `None` if it runs.
+    // What `hello` must print: the loader's reason, or `None` if it runs.
     let cases: &[(Option<&str>, &[Patch<'_>])] = &[
         (Some("not an ELF file"), &[(0, b"\x7fELG")]),
         (Some("not a 32-bit little-endian RISC-V file"), &[(4, &[2])]),
@@ -2316,29 +2643,26 @@ fn the_elf_loader_refuses_bad_images() {
             &[(E_ENTRY, &(text.vaddr + 2).to_le_bytes())],
         ),
     ];
-    let echo = format!("{PROMPT}run hello\n");
-    let mut runs = 0;
+    let echo = format!("{PROMPT}hello\n");
     for (n, (want, patches)) in cases.iter().enumerate() {
         for (off, bytes) in *patches {
             m.cpu.bus.load(image + off, bytes).unwrap();
         }
-        for b in b"run hello\n" {
+        for b in b"hello\n" {
             tx.send(*b).unwrap();
         }
         step_to_prompt(&mut m, n + 2);
-        // What this `run hello` printed, up to the new prompt.
+        // What this `hello` printed, up to the new prompt: the kernel's
+        // reason, then the shell's (spawn returned -ENOEXEC).
         let out = printed(&m);
         let out = &out[..out.len() - PROMPT.len()];
         let lines: Vec<&str> = out[out.rfind(&echo).unwrap() + echo.len()..].lines().collect();
         let expected = match want {
-            Some(reason) => vec![format!("run: cannot start hello: {reason}")],
-            None => {
-                runs += 1;
-                vec![
-                    "hello from user mode".to_string(),
-                    format!("pid {runs} (hello) exited: 0"),
-                ]
-            }
+            Some(reason) => vec![
+                format!("spawn: hello: {reason}"),
+                "sh: hello: not an executable".to_string(),
+            ],
+            None => vec!["hello from user mode".to_string()],
         };
         assert_eq!(lines, expected, "case {n}");
         assert_eq!(free_pages(&m, &elf), before, "case {n} leaked");
@@ -2352,14 +2676,11 @@ fn the_elf_loader_refuses_bad_images() {
         }
     }
     // Restored, it runs.
-    for b in b"run hello\nhalt\n" {
+    for b in b"hello\nexit\n" {
         tx.send(*b).unwrap();
     }
     assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
-    let pid = runs + 1;
-    assert!(printed(&m).ends_with(&format!(
-        "{echo}hello from user mode\npid {pid} (hello) exited: 0\n{PROMPT}halt\n"
-    )));
+    assert!(printed(&m).ends_with(&format!("{echo}hello from user mode\n{PROMPT}exit\n")));
 }
 
 #[test]
@@ -2373,6 +2694,121 @@ fn userprogs_s_is_up_to_date() {
         committed == fresh,
         "kernel/userprogs.s is out of date: run `cargo xtask kernel` and commit it"
     );
+}
+
+#[test]
+fn every_c_program_has_its_clang_output_committed() {
+    // C programs are assembled from clang's output in kernel/user/clang, so
+    // building them needs no LLVM: every C file has its file there, and
+    // nothing else is.
+    let dir = xtask::userprogs::user_dir(&repo_root());
+    let c: Vec<_> = xtask::userprogs::sources(&dir)
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.lang == xtask::userprogs::Lang::C)
+        .collect();
+    assert!(c.len() >= 8, "{c:?}");
+    for src in &c {
+        let path = dir.join(src.asm_file());
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(
+            text.starts_with("# Generated by `cargo xtask kernel` with clang: do not edit.\n"),
+            "{}",
+            path.display()
+        );
+        assert!(text.contains(&format!("# Source: kernel/user/{}", src.file())));
+    }
+    assert_eq!(
+        xtask::userprogs::stale_clang_files(&dir).unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+/// The `| N | `name` | ...` rows of the table under `heading` in `doc`.
+fn doc_table(doc: &str, heading: &str) -> Vec<(u32, String)> {
+    let at = doc
+        .find(&format!("\n{heading}\n"))
+        .unwrap_or_else(|| panic!("no {heading}"));
+    let section = &doc[at + heading.len() + 2..];
+    let section = &section[..section.find("\n## ").unwrap_or(section.len())];
+    section
+        .lines()
+        .filter_map(|line| {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let n = cells.get(1)?.parse().ok()?;
+            let name = cells.get(2)?.strip_prefix('`')?.strip_suffix('`')?;
+            Some((n, name.to_string()))
+        })
+        .collect()
+}
+
+/// Every `#define PREFIX<name> <number>` in `text` (C) or `.equ
+/// PREFIX<name>, <number>` (assembly), as (number, name with the prefix).
+fn defines(text: &str, prefix: &str) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.split("/*").next().unwrap().trim();
+        let rest = line
+            .strip_prefix("#define ")
+            .or_else(|| line.strip_prefix(".equ "))
+            .unwrap_or("");
+        let mut words = rest.split([' ', ',']).filter(|w| !w.is_empty());
+        if let (Some(name), Some(value)) = (words.next(), words.next()) {
+            if let (true, Ok(v)) = (name.starts_with(prefix), value.parse()) {
+                out.push((v, name.to_string()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_system_call_document_matches_the_code() {
+    // Issue #21's third criterion: docs/camelot-syscalls.md's tables are the
+    // kernel's numbers, and the user side has the same ones.
+    let read = |path: &str| std::fs::read_to_string(repo_root().join(path)).unwrap();
+    let doc = read("docs/camelot-syscalls.md");
+    let header = read("kernel/include/syscall.h");
+    let usys = read("kernel/user/usys.s");
+    let user_h = read("kernel/user/user.h");
+
+    let calls = doc_table(&doc, "## Calls");
+    assert_eq!(calls.len(), 10, "{calls:?}");
+    let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
+        table
+            .iter()
+            .map(|(n, name)| (*n, format!("SYS_{name}")))
+            .collect()
+    };
+    assert_eq!(defines(&header, "SYS_"), sys(&calls), "syscall.h");
+    assert_eq!(defines(&usys, "SYS_"), sys(&calls), "usys.s");
+    for (_, name) in &calls {
+        // A stub in usys.s that uses the number, and a declaration in user.h.
+        assert!(
+            usys.contains(&format!(
+                "    .globl {name}\n{name}:\n    li    a7, SYS_{name}\n    ecall\n"
+            )),
+            "usys.s: no stub for {name}"
+        );
+        assert!(
+            user_h
+                .lines()
+                .any(|l| l.contains(&format!(" {name}(")) && l.ends_with(");")),
+            "user.h: no declaration of {name}"
+        );
+    }
+
+    let errors = doc_table(&doc, "## Error numbers");
+    assert_eq!(errors.len(), 10, "{errors:?}");
+    assert_eq!(defines(&header, "E"), errors, "syscall.h");
+    assert_eq!(defines(&user_h, "E"), errors, "user.h");
+    // And spawn's limits.
+    for limit in ["MAXARG", "ARG_MAX"] {
+        let want = defines(&header, limit);
+        assert_eq!(want.len(), 1);
+        assert_eq!(defines(&user_h, limit), want);
+        assert!(doc.contains(&format!("`{limit}` ({})", want[0].0)), "{limit}");
+    }
 }
 
 #[test]
@@ -2470,10 +2906,25 @@ fn clang_build_boots_and_matches_committed() {
     };
     let recorded = std::fs::read_to_string(kernel_dir().join(kernel::VERSION_FILE)).unwrap();
     match probe.clang_version() {
-        Ok(v) if v == recorded.trim() => assert!(
-            elf == committed_elf(),
-            "kernel/kernel.elf is out of date: run `cargo xtask kernel` and commit it"
-        ),
+        Ok(v) if v == recorded.trim() => {
+            assert!(
+                elf == committed_elf(),
+                "kernel/kernel.elf is out of date: run `cargo xtask kernel` and commit it"
+            );
+            // And the user programs' C, compiled by the same clang, is the
+            // committed assembly.
+            let dir = xtask::userprogs::user_dir(&repo_root());
+            let compiled =
+                xtask::userprogs::compile_c(&probe.clang, &dir, &scratch("userprogs"), true).unwrap();
+            assert!(!compiled.is_empty());
+            for (rel, text) in compiled {
+                let committed = std::fs::read_to_string(dir.join(&rel)).unwrap_or_default();
+                assert!(
+                    committed == text,
+                    "kernel/user/{rel} is out of date: run `cargo xtask kernel` and commit it"
+                );
+            }
+        }
         Ok(v) => eprintln!(
             "byte comparison skipped: built with `{}`, have `{v}`",
             recorded.trim()

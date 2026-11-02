@@ -2,14 +2,14 @@
 # as it was. Sets each register xN (but t6) to N in every byte, spins for
 # about three timer ticks with t6 as the counter, then compares. Exits with
 # status 0 if all of them still hold their value, else with the number of
-# the first one that changed. Run it beside other programs (`run regs ping
+# the first one that changed. Run it beside other programs (`regs & ping &
 # pong`) so that their values pass through the same registers.
 
     .equ SPIN, 1500000
 
-    .section .text.start
-    .globl _start
-_start:
+    .text
+    .globl main
+main:
     li    ra, 0x01010101
     li    sp, 0x02020202        # nothing here uses the stack
     li    gp, 0x03030303

@@ -1,7 +1,8 @@
 # data: checks the memory the kernel gives a program. Before anything is
-# pushed, its whole stack page must read zero, and so must all of .bss, which
-# spans two pages (the second has no bytes in the file); .data must hold its
-# initial value; and both must be writable. Exits with status 0 if all of
+# pushed, its stack page must read zero below sp (above it are its arguments,
+# which the kernel put there), and so must all of .bss, which spans two pages
+# (the second has no bytes in the file); .data must hold its initial value;
+# and both must be writable. Exits with status 0 if all of
 # that holds, else with the number of the check that failed. On the way out
 # it fills its stack and .bss with non-zero bytes, so that the pages it gives
 # back are dirty for whoever gets them next.
@@ -12,12 +13,12 @@
     .equ INITIAL, 0x600df00d
     .equ DIRT, 0xa5a5a5a5
 
-    .section .text.start
-    .globl _start
-_start:
-    li    s0, 1                 # the stack page reads zero
+    .text
+    .globl main
+main:
+    li    s0, 1                 # the stack page reads zero below sp
     li    a0, USER_TOP - STACK_SIZE
-    li    a1, STACK_SIZE
+    sub   a1, sp, a0
     call  all_zero
     bnez  a0, fail
 

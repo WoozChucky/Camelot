@@ -1,19 +1,40 @@
-/* The kernel console: line input on top of the interrupt-driven UART. */
+/* The kernel console (spec section 10, "Kernel console"): the read and write
+ * system calls on file descriptors 0-2, on top of the interrupt-driven UART.
+ * Input is line-buffered and edited here, like a terminal in canonical mode:
+ * a read returns once a whole line has been typed. */
 #ifndef CAMELOT_CONSOLE_H
 #define CAMELOT_CONSOLE_H
 
 #include "types.h"
+#include "vm.h"
 
-/* Returns the next byte typed on the console, sleeping in wfi until there is
- * one. Needs interrupts on (trap_init). */
-char console_getc(void);
+/* Longest input line in bytes, its newline included. */
+#define CONSOLE_LINE_MAX 128
 
-/* Reads one line into `buf` (`size` bytes, at least 1) and returns its length.
- * The line is NUL-terminated, without the newline. What is typed is echoed.
- * Backspace (BS or DEL) erases the last character. The line ends at CR, LF or
- * CR LF: a LF right after a CR is skipped, so terminals that send either work.
- * Other control characters are ignored, and characters beyond `size` - 1 are
- * dropped. */
-int console_readline(char *buf, int size);
+/* The UART's interrupt: moves received bytes into its ring buffer
+ * (uart_intr) and wakes the processes waiting in console_read(). */
+void console_intr(void);
+
+/* read(0, dst, n) for the current process, whose page table is `pt`: waits,
+ * sleeping, until a line is complete, then copies up to `n` bytes of it to
+ * user address `dst` and returns how many. What a read leaves of a line goes
+ * to the next one, so a line longer than `n` takes several reads.
+ *
+ * Lines are edited as they are typed, with the bytes echoed: printable
+ * characters (0x20-0x7E) are kept, up to CONSOLE_LINE_MAX - 1 of them; BS
+ * (0x08) and DEL (0x7F) erase one, echoing BS, space, BS; CR, LF or CR LF
+ * ends the line, which then ends with a LF (a LF right after a CR is
+ * skipped, so raw consoles and piped text both work); Ctrl-D (0x04) ends it
+ * without a newline, so on an empty line the read returns 0, the end of the
+ * input. Other control characters are ignored.
+ *
+ * Returns -EFAULT, having taken nothing, if [dst, dst + n) is not writable
+ * user memory. */
+int console_read(pagetable_t pt, u32 dst, u32 n);
+
+/* write(1 or 2, src, n): prints the `n` bytes at user address `src` and
+ * returns n, or returns -EFAULT, printing nothing, if any of them is not
+ * readable user memory. */
+int console_write(pagetable_t pt, u32 src, u32 n);
 
 #endif
