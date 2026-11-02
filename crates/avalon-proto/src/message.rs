@@ -806,10 +806,13 @@ pub enum Message {
     },
 
     // ---- Disk management (Lake) ----
-    /// Create a zero-filled image. Answered by `Ok`.
+    /// Create an image: zero-filled, or a copy of the image `source` (version 7).
+    /// A copy is `sectors` long, zeros after the source's end, or as long as its
+    /// source when `sectors` is 0. Answered by `Ok`.
     DiskCreate {
         name: String,
         sectors: u64,
+        source: Option<String>,
     },
     /// Answered by `DiskList`.
     ListDisks,
@@ -1158,9 +1161,14 @@ impl Message {
                 w.u32(*handle);
                 w.u64(*sectors);
             }
-            DiskCreate { name, sectors } => {
+            DiskCreate {
+                name,
+                sectors,
+                source,
+            } => {
                 w.str(name);
                 w.u64(*sectors);
+                w.option(source, |w, s| w.str(s));
             }
             DiskList { disks } => w.list(disks, |w, d| {
                 w.str(&d.name);
@@ -1367,6 +1375,7 @@ impl Message {
             ty::DISK_CREATE => DiskCreate {
                 name: r.string()?,
                 sectors: r.u64()?,
+                source: r.option(|r| r.string())?,
             },
             ty::LIST_DISKS => ListDisks,
             ty::DISK_LIST => DiskList {

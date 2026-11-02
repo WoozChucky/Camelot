@@ -6,8 +6,9 @@
 //! tests call [`run`] the same way against servers running in process.
 
 use avalon_client::{
-    device_name, disk_source_text, format_hz, format_size, mac_text, parse_addr, parse_clock,
-    parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_ram, Client, VmAction,
+    camelot_root, create_camelot_vm, device_name, disk_source_text, format_hz, format_size, mac_text,
+    parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net,
+    parse_ram, Client, VmAction, CAMELOT_IMAGE,
 };
 use avalon_proto::{
     validate_name, DeviceSpec, DiskInfo, DiskSpec, HardwareProfile, NatConfig, NetSpec, PortOwner,
@@ -34,6 +35,10 @@ VM commands, sent to Avalon:
                   executable, read here and sent to Avalon), in state created.
                   Without a program the VM boots from its first --disk, as
                   grail --disk IMG does
+  create --name NAME --camelot [--lake ADDR] [options]
+                  create a VM that boots Camelot from a disk of its own:
+                  Lake's image camelot (cargo xtask up puts it there) is
+                  copied to NAME-root, which becomes the VM's first disk
   list            every VM: id, name, state, RAM, clock, disks and cards
   info VM         one VM in detail: hardware, disks, network cards, steps
                   run, devices
@@ -67,6 +72,9 @@ create options:
                   address ADDR (02:00:00:00:00:01; without one Avalon makes
                   one up from the VM's name). Repeat for more cards, up to 4
   --start         start the VM as soon as it is created
+  --camelot       boot Camelot from NAME-root, a copy of Lake's image camelot
+                  made on the Lake at --lake ADDR (no program); Avalon reaches
+                  the disk at that address too
 
 Switch commands, sent to Avalon:
   switch create NAME [--nat [--hostfwd RULE]...]
@@ -104,6 +112,10 @@ Disk commands, sent to Lake:
   disk create NAME --size SIZE
                   a new zero-filled image. SIZE is a whole number of 512-byte
                   sectors: 64MiB, 512K, 1G, 2048s (sectors); no unit is bytes
+  disk create NAME --from SRC [--size SIZE]
+                  a new image that is a copy of the image SRC (which must not
+                  have a writer), as big as SRC or SIZE (no smaller than SRC;
+                  zeros after its end)
   disk list       every image: its size and how it is attached
   disk delete NAME
                   delete an image nobody has attached
@@ -118,8 +130,9 @@ ends, too.
 Options:
   --server ADDR   Avalon's address, for the VM commands: host:port, or a
                   host alone for port 7400 (default 127.0.0.1:7400)
-  --lake ADDR     Lake's address, for the disk commands: host:port, or a
-                  host alone for port 7401 (default 127.0.0.1:7401)
+  --lake ADDR     Lake's address, for the disk commands and create --camelot:
+                  host:port, or a host alone for port 7401 (default
+                  127.0.0.1:7401)
   -h, --help      show this text
 
 Exit status: 0 on success, 1 when a server refuses the request or cannot be
@@ -145,6 +158,12 @@ pub enum Command {
     DiskCreate {
         name: String,
         sectors: u64,
+    },
+    /// A copy of image `source`, as big as it (`None`) or `sectors`.
+    DiskClone {
+        name: String,
+        source: String,
+        sectors: Option<u64>,
     },
     DiskList,
     DiskDelete {
@@ -189,6 +208,8 @@ pub struct Create {
     pub profile: HardwareProfile,
     /// `None`: boot from the first disk.
     pub program: Option<PathBuf>,
+    /// Boot Camelot from a copy of Lake's image `camelot`, made first (`--camelot`).
+    pub camelot: bool,
     pub start: bool,
 }
 
@@ -229,7 +250,7 @@ pub fn run(args: &[String], out: &mut dyn Write) -> Result<(), Failure> {
 // ---- Parsing ----
 
 /// Every option, and whether it takes a value.
-const OPTIONS: [(&str, bool); 16] = [
+const OPTIONS: [(&str, bool); 18] = [
     ("--server", true),
     ("--lake", true),
     ("--name", true),
@@ -246,6 +267,8 @@ const OPTIONS: [(&str, bool); 16] = [
     ("--nat", false),
     ("--hostfwd", true),
     ("--off", false),
+    ("--from", true),
+    ("--camelot", false),
 ];
 
 /// Options that may be given more than once.
@@ -326,6 +349,8 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
                 "--disk-ro",
                 "--net",
                 "--start",
+                "--camelot",
+                "--lake",
             ],
         ),
         "list" => {
@@ -341,7 +366,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         },
     };
     let command_name = match &command {
-        Command::DiskCreate { .. } => "disk create",
+        Command::DiskCreate { .. } | Command::DiskClone { .. } => "disk create",
         Command::DiskList => "disk list",
         Command::DiskDelete { .. } => "disk delete",
         Command::SwitchCreate { .. } => "switch create",
@@ -444,14 +469,30 @@ fn parse_create(rest: &[&str], options: &[(&'static str, String)]) -> Result<Cre
         }
     }
     let name = name.ok_or("'create' needs --name NAME")?;
+    let camelot = options.iter().any(|(f, _)| *f == "--camelot");
+    if camelot && program.is_some() {
+        return Err("'create --camelot' boots Camelot from its disk, and takes no program".into());
+    }
+    if camelot && validate_name(&camelot_root(&name)).is_err() {
+        return Err(format!(
+            "--name: '{name}' is too long for a Camelot VM, whose disk is named {}",
+            camelot_root(&name)
+        ));
+    }
+    if !camelot && options.iter().any(|(f, _)| *f == "--lake") {
+        return Err("'create' takes --lake only with --camelot (the Lake that copies the disk)".into());
+    }
     let has_disk = profile.devices.iter().any(|d| matches!(d, DeviceSpec::Disk(_)));
-    if program.is_none() && !has_disk {
-        return Err("'create' needs the program to run (an ELF file), or a --disk to boot from".into());
+    if program.is_none() && !has_disk && !camelot {
+        return Err(
+            "'create' needs the program to run (an ELF file), a --disk to boot from, or --camelot".into(),
+        );
     }
     Ok(Create {
         name,
         profile,
         program,
+        camelot,
         start,
     })
 }
@@ -467,13 +508,27 @@ fn parse_disk(
         "create" => {
             let name = disk_argument(word, rest)?;
             validate_name(&name)?;
-            let size = options
-                .iter()
-                .find(|(f, _)| *f == "--size")
-                .map(|(_, v)| v)
-                .ok_or("'disk create' needs --size SIZE")?;
-            let sectors = parse_disk_size(size).map_err(|e| format!("--size: {e}"))?;
-            Ok((Command::DiskCreate { name, sectors }, &["--lake", "--size"]))
+            let option = |flag: &str| options.iter().find(|(f, _)| *f == flag).map(|(_, v)| v);
+            let sectors = option("--size")
+                .map(|size| parse_disk_size(size).map_err(|e| format!("--size: {e}")))
+                .transpose()?;
+            let allowed: &[&str] = &["--lake", "--size", "--from"];
+            match (option("--from"), sectors) {
+                (Some(source), sectors) => {
+                    validate_name(source).map_err(|e| format!("--from: {e}"))?;
+                    let source = source.clone();
+                    Ok((
+                        Command::DiskClone {
+                            name,
+                            source,
+                            sectors,
+                        },
+                        allowed,
+                    ))
+                }
+                (None, Some(sectors)) => Ok((Command::DiskCreate { name, sectors }, allowed)),
+                (None, None) => Err("'disk create' needs --size SIZE, or --from SRC to copy an image".into()),
+            }
         }
         "list" => {
             no_arguments("disk list", rest)?;
@@ -637,10 +692,24 @@ pub fn execute(invocation: &Invocation, out: &mut dyn Write) -> Result<(), Failu
                 None => Vec::new(),
             };
             let mut avalon = connect("Avalon", &invocation.server)?;
-            let id = avalon
-                .create_vm(&create.name, create.profile.clone(), program)
-                .map_err(failed)?;
-            let mut text = format!("created VM {id} ({})\n", create.name);
+            let (id, mut text) = if create.camelot {
+                let mut lake = connect("Lake", &invocation.lake)?;
+                let (id, disk) = create_camelot_vm(
+                    &mut avalon,
+                    &mut lake,
+                    &invocation.lake,
+                    &create.name,
+                    create.profile.clone(),
+                )
+                .map_err(|e| Failure::Failed(e.to_string()))?;
+                (id, format!("created disk {disk} (a copy of {CAMELOT_IMAGE})\n"))
+            } else {
+                let id = avalon
+                    .create_vm(&create.name, create.profile.clone(), program)
+                    .map_err(failed)?;
+                (id, String::new())
+            };
+            text += &format!("created VM {id} ({})\n", create.name);
             if create.start {
                 if let Err(e) = avalon.start_vm(&VmRef::Id(id)) {
                     // Say what did happen before the error.
@@ -675,6 +744,21 @@ pub fn execute(invocation: &Invocation, out: &mut dyn Write) -> Result<(), Failu
                 .create_disk(name, *sectors)
                 .map_err(failed)?;
             format!("created disk {name} ({})\n", sectors_text(*sectors))
+        }
+        Command::DiskClone {
+            name,
+            source,
+            sectors,
+        } => {
+            let mut lake = connect("Lake", &invocation.lake)?;
+            lake.clone_disk(name, source, *sectors).map_err(failed)?;
+            let size = lake
+                .list_disks()
+                .map_err(failed)?
+                .into_iter()
+                .find(|d| d.name == *name)
+                .map_or_else(String::new, |d| format!(", {}", sectors_text(d.sectors)));
+            format!("created disk {name} (a copy of {source}{size})\n")
         }
         Command::DiskList => disk_table(&connect("Lake", &invocation.lake)?.list_disks().map_err(failed)?),
         Command::DiskDelete { name } => {
@@ -1142,6 +1226,20 @@ mod tests {
             panic!()
         };
         assert_eq!(c.program, Some(PathBuf::from("-prog.elf")));
+        assert!(!c.camelot);
+        // Camelot from a copy of Lake's image: no program, no disk needed; Lake's
+        // address is the invocation's.
+        let inv = parse("create --name os --camelot --lake store --net lan --start").unwrap();
+        assert_eq!(inv.lake, "store:7401");
+        let Command::Create(c) = inv.command else { panic!() };
+        assert!(c.camelot && c.start);
+        assert_eq!((c.name.as_str(), c.program), ("os", None));
+        assert_eq!(c.profile.devices.len(), 1, "the card; the disk comes from Lake");
+        let Command::Create(c) = command("create --camelot --name os --disk-ro data.img") else {
+            panic!()
+        };
+        assert!(c.camelot);
+        assert_eq!(c.profile.devices.len(), 1);
     }
 
     #[test]
@@ -1151,6 +1249,22 @@ mod tests {
             Command::DiskCreate {
                 name: "data".into(),
                 sectors: 131_072
+            }
+        );
+        assert_eq!(
+            command("disk create web-root --from camelot"),
+            Command::DiskClone {
+                name: "web-root".into(),
+                source: "camelot".into(),
+                sectors: None
+            }
+        );
+        assert_eq!(
+            command("disk create big --size 1G --from=camelot"),
+            Command::DiskClone {
+                name: "big".into(),
+                source: "camelot".into(),
+                sectors: Some(2_097_152)
             }
         );
         assert_eq!(command("disk list"), Command::DiskList);
@@ -1172,8 +1286,25 @@ mod tests {
             ("info 1 2", "'info' takes one VM (got '2' as well)"),
             (
                 "create --name a",
-                "'create' needs the program to run (an ELF file), or a --disk to boot from",
+                "'create' needs the program to run (an ELF file), a --disk to boot from, or --camelot",
             ),
+            (
+                "create --name a --camelot a.elf",
+                "'create --camelot' boots Camelot from its disk, and takes no program",
+            ),
+            ("create --name a --camelot=yes", "--camelot takes no value"),
+            (
+                "--server x disk create a --from b",
+                "'disk create' does not take --server",
+            ),
+            ("disk create a --from B", "--from: 'B' is not a valid name"),
+            (
+                "disk create a --from b --size 1",
+                "--size: 1 is not a whole number",
+            ),
+            ("disk create a --from b --from c", "--from is given twice"),
+            ("disk list --from b", "'disk list' does not take --from"),
+            ("list --camelot", "'list' does not take --camelot"),
             (
                 "create a.elf b.elf --name a",
                 "'create' takes one program (got 'b.elf' as well)",
@@ -1202,7 +1333,10 @@ mod tests {
             ("create a.elf --name a --disk", "--disk needs a value"),
             ("disk", "'disk' needs a command"),
             ("disk resize a", "unknown disk command 'resize'"),
-            ("disk create a", "'disk create' needs --size SIZE"),
+            (
+                "disk create a",
+                "'disk create' needs --size SIZE, or --from SRC to copy an image",
+            ),
             ("disk create --size 1M", "'disk create' needs a disk name"),
             (
                 "disk create a b --size 1M",
@@ -1239,7 +1373,10 @@ mod tests {
                 "list --lake x",
                 "'list' does not take --lake (the VM commands talk to Avalon: --server ADDR)",
             ),
-            ("create a.elf --name a --lake x", "'create' does not take --lake"),
+            (
+                "create a.elf --name a --lake x",
+                "'create' takes --lake only with --camelot",
+            ),
             ("start 1 --lake x", "'start' does not take --lake"),
         ] {
             match parse(args) {

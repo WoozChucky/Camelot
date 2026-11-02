@@ -73,6 +73,7 @@ pub fn create_disk(conn: &mut Connection<TcpStream>, name: &str, sectors: u64) {
     conn.request_ok(&Message::DiskCreate {
         name: name.into(),
         sectors,
+        source: None,
     })
     .unwrap_or_else(|e| panic!("create {name}: {e}"));
 }

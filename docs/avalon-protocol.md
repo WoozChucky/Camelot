@@ -1,4 +1,4 @@
-# Avalon Protocol v6
+# Avalon Protocol v7
 
 The wire protocol of the Avalon platform. Every program in it speaks this protocol:
 
@@ -16,7 +16,7 @@ The implementation is the `avalon-proto` crate (`crates/avalon-proto`): the mess
 
 - TCP, through `std::net`. One connection is one session; either side ends it by closing the socket.
 - Servers listen on loopback by default: Avalon on `127.0.0.1:7400`, Lake on `127.0.0.1:7401`. Listening on any other interface takes an explicit command-line flag.
-- **No authentication and no encryption** (versions 1 to 6). Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
+- **No authentication and no encryption** (versions 1 to 7). Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
 - A client and a server are both just byte streams to the protocol; tests run it over in-memory buffers as well as sockets.
 
 ## 2. Framing
@@ -326,11 +326,11 @@ Any request can also be answered by `Error`. A server answers requests from a gr
 | `Ping` | `token: u32` |
 | `Pong` | `token: u32` (the `Ping`'s) |
 
-Example, `Hello` version 6 from agent `"rt"`:
+Example, `Hello` version 7 from agent `"rt"`:
 
 ```
-0e 00 00 00  01 00  41 56 4c 4e  06 00  02 00 00 00  72 74
-length 14    Hello  "AVLN"       v6     agent "rt"
+0e 00 00 00  01 00  41 56 4c 4e  07 00  02 00 00 00  72 74
+length 14    Hello  "AVLN"       v7     agent "rt"
 ```
 
 ### 6.2 VM control
@@ -423,18 +423,18 @@ Concurrency: an image has at most one writer at a time, and a writer excludes re
 
 | Message | Payload | Notes |
 |---|---|---|
-| `DiskCreate` | `name: string`, `sectors: u64` | a new zero-filled image of 1 to the server's maximum sectors (Lake: 2^32 - 1, the most a Grail disk can address). Errors: `InvalidName`, `AlreadyExists`, `OverBudget` (0 sectors, or too many), `Io` |
+| `DiskCreate` | `name: string`, `sectors: u64`, `source: option<string>` | a new image. With no `source`, zero-filled, of 1 to the server's maximum sectors (Lake: 2^32 - 1, the most a Grail disk can address). With a `source`, a copy of that image (a *clone*, below): as long as the source when `sectors` is 0, otherwise `sectors` long, zeros after the source's end. Errors: `InvalidName` (either name), `AlreadyExists`, `OverBudget` (0 sectors without a source, or too many), `NoSuchDisk` (no such source), `Busy` (the source has a writer), `OutOfRange` (`sectors` smaller than the source), `Io` |
 | `ListDisks` | empty | |
 | `DiskList` | `disks: list<DiskInfo>` | in name order |
 | `DiskDelete` | `name: string` | Errors: `InvalidName`, `NoSuchDisk`, `Busy` (attached) |
 
-Lake keeps each disk as a raw image file named after the disk, in the directory it serves (`lake --dir`): sector `n` is bytes 512·`n` to 512·`n` + 511, as in Grail's image files, so an image can be copied in and out of Lake's directory. A file there whose name is not a valid disk name, or whose size is not a whole number of sectors, is not a disk: it is not listed and cannot be attached or deleted, and its name cannot be used for a new disk (`AlreadyExists`). Disks are matched by their exact file name: where the filesystem ignores case (Windows, macOS), a file `ROOT` is not disk `root` (`NoSuchDisk`), though it still keeps the name `root` from being used for a new disk. Images never change size through the protocol.
+Lake keeps each disk as a raw image file named after the disk, in the directory it serves (`lake --dir`): sector `n` is bytes 512·`n` to 512·`n` + 511, as in Grail's image files, so an image can be copied in and out of Lake's directory. A file there whose name is not a valid disk name, or whose size is not a whole number of sectors, is not a disk: it is not listed and cannot be attached or deleted, and its name cannot be used for a new disk (`AlreadyExists`). Disks are matched by their exact file name: where the filesystem ignores case (Windows, macOS), a file `ROOT` is not disk `root` (`NoSuchDisk`), though it still keeps the name `root` from being used for a new disk. Images never change size through the protocol (a clone may be bigger than its source, but that is a new image).
+
+**Cloning.** A `DiskCreate` with a `source` copies an existing image into a new one, so that every VM can boot from its own copy of a base image (Round Table's `disk create NAME --from SRC`; `create --camelot` and Pendragon's Camelot VMs clone the image `camelot`, which `cargo xtask up` puts in Lake's directory). The source must not have a writer, since a copy of a disk being written is not a disk; it may have readers, and Lake attaches it read-only itself for the copy, so no writer can attach it until the copy is done. Checks come in the order names, source, size, destination: an invalid name is `InvalidName`, a missing source `NoSuchDisk`, a source with a writer `Busy`, a size below the source's `OutOfRange` (above the maximum `OverBudget`), a destination that exists `AlreadyExists`. The copy is made under a name that is not a disk name (`.NAME.clone` for the destination `NAME`: it starts with a `.`, so it is never listed or attached) and renamed into place when it is complete: until `Ok`, the new image does not exist for anyone, and a failed copy leaves nothing behind. A copy that a Lake ending mid-way left in the directory is removed when Lake next starts on it. While a copy is in progress its name is taken (a second `DiskCreate` of it gets `AlreadyExists`). Runs of zeros are not written, so a clone of a sparse image is sparse too. The reply comes when the copy is complete, so a large image takes as long as copying it on the server's host.
 
 A new image is a sparse file: it takes no space on the host until it is written. On Windows Lake marks it sparse explicitly (NTFS does not otherwise, and the first write near the end of a large non-sparse file would make the filesystem write zeros over everything before it, inside that one write, for longer than a Grail disk waits for an answer). On a filesystem without sparse files (FAT, exFAT), `DiskCreate` writes the zeros itself, so creating a large image there takes a while, but no later write does.
 
 There is no message to attach a disk to an existing VM or detach one from it: a VM's disks are part of its hardware profile (`DeviceSpec`), fixed when it is created, so a client attaches a Lake image by naming it in `CreateVm` (Round Table's `create --disk lake://ADDR/NAME`; Pendragon's *attach* opens its new-VM form with the image, and its *detach* stops the VMs that hold one). The VM's server opens the image (through `BlockOpen`) when it builds the VM's machine, as part of `CreateVm`, and holds the attachment as long as that machine exists. The machine ends, and the server closes the attachment (`BlockClose`), when the VM is stopped (`StopVm`), when its program exits, or when it is destroyed, whichever comes first; a stopped or exited VM cannot run again (section 6.2), so it has no use for its disks. Such a VM still names the disks in its profile (`VmList`, `VmInfo`), since that is the hardware it was created with, but no longer holds them: the images can be attached by another VM or deleted. Image files on the server's own host (`DiskSource::File`) follow the same lifetime. `DiskList` shows each image's current attachments. Hot-plugging disks would be a new message group and a version bump.
-
-The Avalon server does not open Lake disks yet: until Lake (#39) lands, a `CreateVm` whose profile names one is refused with `InvalidProfile`.
 
 ### 6.7 Virtual network
 
@@ -470,11 +470,11 @@ Avalon's VMs talk to each other over virtual Ethernet switches, kept by the serv
 
 ## 7. Versioning
 
-- The protocol version is a `u16`, currently **6** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
+- The protocol version is a `u16`, currently **7** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
 - Any change to the catalogue bumps the version: a new message type, a new field, a new enum variant or tag, a changed layout or a changed rule. (Unknown codes and tags are errors in the decoder, so an old peer could not read them anyway.)
 - Three things never change, in any version, so that peers of different versions can always tell each other so: the frame header (`u32` length, `u16` type), the `Hello` and `Welcome` messages (codes 0x0001 and 0x0002 and their layouts) and the `Error` message (code 0x0003 and its layout). Error codes are never reused or renumbered; new ones may be added with a version bump.
 - Things that are deliberately open-ended and need no new version: `DeviceEntry.kind` (sysinfo device type codes come from the Excalibur spec), `ScreenAttached.format` values a server chooses to send, free-text fields.
-- This document describes version 6. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
+- This document describes version 7. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
 
 History:
 
@@ -486,6 +486,7 @@ History:
 | 4 | `HardwareProfile.harts` (`u32`, after `nominal_hz`), for multi-hart machines |
 | 5 | NAT gateways on switches (section 6.7, **NAT**): `SetSwitchNat` (0x0608), `CreateSwitch`'s `nat` field, `SwitchInfo`'s `nat` field, `PortOwner` tag 2 (`Gateway`), the `NatConfig`, `NatInfo`, `PortForward` and `Lease` structures (at most `MAX_FORWARDS` 64 forwarded ports per gateway) and the `ipv4` field type |
 | 6 | `CreateVm` with an empty `program`: the VM boots from its disk 0 (spec section 7, "Boot from disk"), where version 5 servers answered `InvalidProgram` |
+| 7 | `DiskCreate`'s `source` field (after `sectors`): a new image that is a copy of an existing one (section 6.6, **Cloning**) |
 
 ## 8. Limits
 

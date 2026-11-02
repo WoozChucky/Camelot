@@ -8,6 +8,10 @@ use xtask::{examples, repo_root, tools};
 const USAGE: &str = "usage: cargo xtask <task> [options]
 
 tasks:
+  up           bring the Avalon platform up: build it, put the Camelot root image in Lake's
+               images directory (target/platform/images) as the image camelot, and run Lake,
+               Avalon and Pendragon until Ctrl-C. --demo also starts a Camelot VM;
+               cargo xtask up --help lists the options
   examples     build every example (or the ones named) with merlin-as + merlin-ld into
                examples/<dir>/<name>.elf; no LLVM needed. Objects go to target/examples.
                --check: build in memory and report stale .elf files instead of writing
@@ -225,6 +229,17 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("up") => match xtask::up::parse_args(&args[1..], &repo_root()) {
+            Ok(Some(options)) => up(options),
+            Ok(None) => {
+                println!("{}", xtask::up::USAGE);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("xtask: {e}\n{}", xtask::up::USAGE);
+                ExitCode::from(2)
+            }
+        },
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -236,6 +251,19 @@ fn main() -> ExitCode {
         None => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `cargo xtask up`: the platform until Ctrl-C, its output on stdout.
+fn up(options: xtask::up::Options) -> ExitCode {
+    let stop = xtask::up::on_ctrl_c();
+    let mut print = |line: &str| println!("{line}");
+    match xtask::up::run(&options, stop, &mut print) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("xtask: up: {e}");
+            ExitCode::FAILURE
         }
     }
 }

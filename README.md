@@ -8,7 +8,41 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/ua/mi/si; CLINT, PLIC, UART with receive interrupts; Xcal framebuffer (Win32 window or PPM dumps), keyboard and pointer (from the window, with PLIC interrupts), sysinfo and block devices (disk images or disks on a Lake server, `--disk`); configurable RAM, real-time clock, disks and number of harts (up to 8, with IPIs) |
 | **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, and the `merlin` C-subset compiler | Builds every example and the whole Camelot kernel on its own, no LLVM (`cargo xtask examples`, `cargo xtask kernel`). merlin-as: complete; its objects match clang's ([encoder notes](crates/merlin-as/ENCODER.md)). merlin-ld: links clang objects to the same bytes as ld.lld except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: a C99 subset (integer types, pointers, arrays, structs, globals, strings, the preprocessor, varargs, designated initializers; programs of several files) compiles to assembly that our own assembler and linker build into programs Grail runs, the kernel and its user programs among them; unoptimized, so that kernel is about 40% bigger and 5 to 6 times slower than clang `-O2`'s ([code generation notes](crates/merlin/src/codegen.rs)). merlin-objdump: matches llvm-objdump |
 | **Camelot** | The kernel / OS | Boots on Grail in S-mode: `kprintf`, trap handling, timer ticks, page allocator and Sv32 paging, interrupt-driven UART console, user programs in C in U-mode with their own page tables, switched round robin on timer ticks, system calls ([docs/camelot-syscalls.md](docs/camelot-syscalls.md)) and a user-space shell, an interrupt-driven disk driver with a buffer cache, a journaled filesystem mounted at boot ([docs/camelot-fs.md](docs/camelot-fs.md), with a host-side mkfs and fsck in `crates/camelot-fs`), a network stack with a card driver, ARP, IPv4, ICMP, UDP and DHCP ([docs/camelot-net.md](docs/camelot-net.md)) ([kernel/](kernel/README.md)) |
-| **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Pendragon web console, the Herald VM client and the Lake storage server | Protocol v6 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget, attachable consoles and screens, and network cards on virtual Ethernet switches, which can have a NAT gateway to the host and the internet; the Round Table CLI creates and controls them, and manages Lake's disk images; Pendragon does the same from a browser, with live consoles; the Lake storage server serves disk images to them over the network; Herald attaches a terminal to a VM's console, or a window to its screen, keyboard and mouse |
+| **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Pendragon web console, the Herald VM client and the Lake storage server | Protocol v7 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget, attachable consoles and screens, and network cards on virtual Ethernet switches, which can have a NAT gateway to the host and the internet; the Round Table CLI creates and controls them, and manages Lake's disk images; Pendragon does the same from a browser, with live consoles; the Lake storage server serves disk images to them over the network; Herald attaches a terminal to a VM's console, or a window to its screen, keyboard and mouse. `cargo xtask up` runs it all with one command ([Quick start](#quick-start)) |
+
+## Quick start
+
+You need [Rust](https://rustup.rs) and nothing else: no crates to download, no LLVM, no WSL. In a terminal (PowerShell, cmd or a bash) at the root of the repository:
+
+```
+cargo xtask up --demo
+```
+
+This builds the platform in release mode (a few minutes the first time), builds the Camelot root image (`target/camelot-fs.img`, the kernel and its programs on a bootable disk) and puts it in Lake's images directory, `target/platform/images`, as the image `camelot`. Then it runs Lake, Avalon and Pendragon, with their output in this terminal, each line prefixed by its server. `--demo` also creates a switch `nat` with a NAT gateway, and a VM `camelot` that boots Camelot from `camelot-root`, its own copy of the image, plugged into the switch. Once everything is up, `up` says where it is:
+
+```
+The Avalon platform is up.
+
+  Pendragon  http://127.0.0.1:7402/?token=3f9c...e1
+             open it in a browser (the token changes at every launch)
+  Avalon     127.0.0.1:7400
+  Lake       127.0.0.1:7401, images in C:\...\Camelot\target\platform\images
+```
+
+Open the Pendragon URL in a browser. Its **New VM** page creates a VM: give it a name and leave *Camelot (boot from disk)* chosen, and the VM gets a disk of its own, `NAME-root`, copied from the image `camelot`, and boots from it; its page shows the console, where Camelot's shell waits (`ls /bin`, `echo hi > /hi`, `cat /hi`). The demo's VM is in the VM list already.
+
+Or, from a second terminal, Round Table creates the VM and Herald attaches the terminal to its console:
+
+```
+cargo run --release -p round-table -- create --name web --camelot --start
+cargo run --release -p round-table -- list
+cargo run --release -p herald -- web
+cargo run --release -p herald -- camelot
+```
+
+Ctrl-] leaves Herald, and the VM carries on. **Ctrl-C** in the first terminal stops Pendragon, Avalon and Lake. The images stay in `target/platform/images`, so a VM's disk keeps what it wrote: the next `cargo xtask up` serves them again (the VMs themselves end with Avalon; `--demo` creates its VM again on its old disk). `up` replaces the image `camelot` when a build has changed it, and leaves every other image alone, so a disk copied from it before keeps the old build: `--demo` still boots `camelot-root` as it is (and says so). Delete `target/platform/images/camelot-root` while `up` is not running to have the demo copy the new image.
+
+`cargo xtask up --help` lists the options: `--images DIR` for another images directory, `--lake ADDR`, `--avalon ADDR` and `--pendragon ADDR` for other addresses, `--no-build` to start what is already built. To run the servers one by one instead, see [The Avalon platform](#the-avalon-platform); for Grail on its own, [Running](#running).
 
 ## Layout
 
@@ -29,7 +63,7 @@ crates/merlin           the C-subset compiler (C → .s), with its test programs
 crates/merlin-as        the assembler (source → ELF32 .o)
 crates/merlin-ld        the linker (.o files → ELF32 executable)
 crates/merlin-objdump   the disassembler / object dumper (llvm-objdump compatible output)
-crates/xtask            build tasks: `cargo xtask examples`, `cargo xtask kernel`, `cargo xtask fs`, `cargo xtask boot`, `cargo xtask hello`, `cargo xtask ld-fixtures`
+crates/xtask            build tasks: `cargo xtask up` (the whole platform), `cargo xtask examples`, `cargo xtask kernel`, `cargo xtask fs`, `cargo xtask boot`, `cargo xtask hello`, `cargo xtask ld-fixtures`
 kernel/                 the Camelot kernel (C + assembly) and its prebuilt kernel.elf; kernel/user holds the user programs it embeds (and kernel/user/lib their C library), kernel/net the network stack, kernel/fs the root image's files, kernel/boot the bootloader of a bootable disk
 examples/               bare-metal programs, built with merlin-as + merlin-ld (the .elf files are committed)
 tests/riscv-tests       prebuilt riscv-tests ELFs and their objects for merlin-ld (rebuild with scripts/build-riscv-tests.sh)
@@ -229,6 +263,8 @@ Grail runs one machine for one terminal. The Avalon platform runs many, as long-
 
 They talk the Avalon protocol ([`docs/avalon-protocol.md`](docs/avalon-protocol.md)): length-prefixed binary frames over TCP, implemented once in `crates/avalon-proto` and shared by every program.
 
+`cargo xtask up` starts Lake, Avalon and Pendragon together (see [Quick start](#quick-start)); the sections below run each one by hand. `up` runs the release binaries in `target/release` as child processes, Lake first, Avalon next, Pendragon last, each once the one before it is listening, and stops them in the opposite order on Ctrl-C, or when one of them ends by itself. The servers are in a process group of their own, so Ctrl-C reaches `up` alone, and on Windows also in a job object, so they end with `up` however it ends. A server told to listen on every address (`--lake 0.0.0.0`) is reached on loopback: that is the address `up` gives Pendragon, uses for the demo and prints, since Windows cannot connect to `0.0.0.0`. With port 0 (`--lake 127.0.0.1:0`) a server picks its port and `up` reads which from its output, as its test does (`crates/xtask/tests/up.rs`: the real binaries on ephemeral ports and a temporary images directory, the demo's VM booted to the shell with a second one beside it, all stopped again).
+
 ### Running Avalon
 
 ```
@@ -288,9 +324,11 @@ lake: listening on 127.0.0.1:7401
 lake: images in images
 ```
 
-Lake keeps a directory of disk images (created if it does not exist) and serves them over the Avalon protocol: disk management (`DiskCreate`, `ListDisks`, `DiskDelete`: what [Round Table](#round-table)'s `disk create|list|delete` send) and block I/O (`BlockOpen`, `BlockRead`, `BlockWrite`, `BlockFlush`, `BlockSize`, `BlockClose`). Each disk is a raw image file in the directory named after the disk, matched by its exact file name (names follow the protocol's rules: lowercase, no paths, no Windows device names); other files there are left alone. New images are sparse files, marked so explicitly on Windows: they take no host space until written. Option `--listen ADDR` (default `127.0.0.1:7401`; a host or IP address alone means port 7401): like Avalon, Lake listens on loopback unless told otherwise, and warns when it is not. Ctrl-C ends it; every write it has answered is already in the image files.
+Lake keeps a directory of disk images (created if it does not exist) and serves them over the Avalon protocol: disk management (`DiskCreate`, `ListDisks`, `DiskDelete`: what [Round Table](#round-table)'s `disk create|list|delete` send; a `DiskCreate` with a source image makes a copy of it) and block I/O (`BlockOpen`, `BlockRead`, `BlockWrite`, `BlockFlush`, `BlockSize`, `BlockClose`). Each disk is a raw image file in the directory named after the disk, matched by its exact file name (names follow the protocol's rules: lowercase, no paths, no Windows device names); other files there are left alone. New images are sparse files, marked so explicitly on Windows: they take no host space until written. Option `--listen ADDR` (default `127.0.0.1:7401`; a host or IP address alone means port 7401): like Avalon, Lake listens on loopback unless told otherwise, and warns when it is not. Ctrl-C ends it; every write it has answered is already in the image files.
 
 An image has **one writer at a time**: attaching it read-write is exclusive, and any number of read-only attachments may share an image that has no writer. A second writer, a writer while there are readers, or deleting an attached image gets `Busy`; a missing image `NoSuchDisk`, a sector range past the end `OutOfRange`, a write through a read-only attachment `ReadOnly`. A connection's attachments end when it closes.
+
+An image can be **cloned**: a new image that starts as a copy of an existing one (`DiskCreate` with a `source`, protocol version 7; Round Table's `disk create NAME --from SRC`). The source may have readers but not a writer, since a copy of a disk being written is not a disk, and Lake attaches it read-only itself while it copies, so no writer can start meanwhile. The copy is written under a name that is not a disk name and renamed into place when it is complete, so it never shows half made, and runs of zeros are not written, so the copy of a sparse image is sparse too. This is how every Camelot VM gets a root disk of its own (one writer per image): `round-table create --camelot` and Pendragon's Camelot VMs copy the image `camelot`, which `cargo xtask up` puts in Lake's directory, to `NAME-root`.
 
 A VM uses a Lake disk through Grail's network backend (`grail::lake::LakeDisk`): its profile names `lake://host:port/name` (the protocol's `DiskSource::Lake`; `DiskSource::parse` reads the argument), and Grail's `--disk lake://host:port/name` does the same for a single machine. The disk attaches the image when the machine is built (so a busy or missing image fails the create) and detaches it when the machine is dropped (a stopped, exited or destroyed VM), waiting for Lake to confirm: once `DestroyVm` is answered, another VM can attach the image. Each read, write and flush of the guest's disk is a request to Lake (transfers over 1 MiB are split), answered before the guest's next instruction; a Lake error is `BLK_ERROR` 5 for the guest, and so is a server that went away or does not answer within 10 s (the disk then stays failed).
 
@@ -298,7 +336,7 @@ A VM uses a Lake disk through Grail's network backend (`grail::lake::LakeDisk`):
 use avalon_proto::{Connection, DeviceSpec, DiskSource, DiskSpec, HardwareProfile, Message};
 
 let mut lake = Connection::connect("127.0.0.1:7401", "example")?;
-lake.request_ok(&Message::DiskCreate { name: "root".into(), sectors: 2048 })?; // 1 MiB
+lake.request_ok(&Message::DiskCreate { name: "root".into(), sectors: 2048, source: None })?; // 1 MiB
 let source = DiskSource::parse("lake://127.0.0.1:7401/root")?;
 let profile = HardwareProfile {
     devices: vec![DeviceSpec::Disk(DiskSpec { source, read_only: false })],
@@ -351,9 +389,9 @@ devices  9
   fb-vram   0x31000000 + 0x0012c000
 ```
 
-The life cycle is `start`, `pause`, `resume`, `stop` and `destroy`, each taking a VM's id or its name (`round-table pause echo`, `round-table destroy 2`). `create` takes `--name` (required), `--ram MiB`, `--clock FREQ` and `--harts N` with exactly the syntax of `grail --ram`, `--clock` and `--harts` (the same parsers), `--disk SRC` and `--disk-ro SRC` (an image file on Avalon's host, or `lake://ADDR/NAME` for an image on a Lake server; repeat for more disks), and `--start`. `--server ADDR` picks the Avalon for the VM commands (default `127.0.0.1:7400`; a host alone means port 7400). `round-table --help` lists everything.
+The life cycle is `start`, `pause`, `resume`, `stop` and `destroy`, each taking a VM's id or its name (`round-table pause echo`, `round-table destroy 2`). `create` takes `--name` (required), `--ram MiB`, `--clock FREQ` and `--harts N` with exactly the syntax of `grail --ram`, `--clock` and `--harts` (the same parsers), `--disk SRC` and `--disk-ro SRC` (an image file on Avalon's host, or `lake://ADDR/NAME` for an image on a Lake server; repeat for more disks), `--start`, and `--camelot` instead of a program (below). `--server ADDR` picks the Avalon for the VM commands (default `127.0.0.1:7400`; a host alone means port 7400). `round-table --help` lists everything.
 
-The disk commands talk to Lake (`--lake ADDR`, default `127.0.0.1:7401`; the VM commands do not take it, nor do the disk commands take `--server`):
+The disk commands talk to Lake (`--lake ADDR`, default `127.0.0.1:7401`; the VM commands do not take it, but for `create --camelot` below, nor do the disk commands take `--server`):
 
 ```
 round-table disk create data --size 64MiB
@@ -368,7 +406,29 @@ data  64 MiB  131072   no
 deleted disk data
 ```
 
-Sizes take `K`, `M`, `G` (or `KiB`, `MiB`, `GiB`), `s` for 512-byte sectors, or no unit for bytes. A disk is attached to a VM when the VM is created (`--disk lake://127.0.0.1:7401/data`; a missing image, one another VM writes, or a Lake server that cannot be reached is refused as an invalid hardware profile) and detached when the VM's machine ends: when the VM is stopped, its program exits, or it is destroyed. A stopped or exited VM still lists its disks (`list`, `info`), but no longer holds them. `disk list` shows each image's attachments (one writer, or any number of readers), and an attached image cannot be deleted.
+Sizes take `K`, `M`, `G` (or `KiB`, `MiB`, `GiB`), `s` for 512-byte sectors, or no unit for bytes. `disk create NAME --from SRC` makes the new image a copy of the image SRC, as big as it, or as `--size` if that is given (no smaller than SRC; zeros after its end); SRC may not have a writer:
+
+```
+round-table disk create backup --from data
+```
+
+```
+created disk backup (a copy of data, 64 MiB, 131072 sectors)
+```
+
+**Camelot VMs.** `create --name NAME --camelot` creates a VM that boots Camelot with no program to send: Round Table first has Lake copy the image `camelot` (the bootable root image that [`cargo xtask up`](#quick-start) puts in Lake's directory) to `NAME-root`, then creates the VM with that copy as its first disk, `lake://ADDR/NAME-root`, where ADDR is the Lake of `--lake` (default `127.0.0.1:7401`; Avalon reaches the disk at the same address). The other `create` options go with it (`--ram`, `--net`, more `--disk`s after the copy, `--start`):
+
+```
+round-table create --name web --camelot --net nat --start
+```
+
+```
+created disk web-root (a copy of camelot)
+created VM 1 (web)
+started VM 1 (web)
+```
+
+A Lake without the image says so: `the Lake at 127.0.0.1:7401 has no 'camelot' image to copy (start the platform with 'cargo xtask up', which puts it in Lake's images directory)`. A copy whose name is taken is refused (`already exists`), and so is a copy of an image that a VM writes (`busy`); when Avalon refuses the VM (its name is taken, say), the copy is deleted again. Destroying the VM leaves its disk on Lake, with what Camelot wrote to it, until `disk delete NAME-root`. A disk is attached to a VM when the VM is created (`--disk lake://127.0.0.1:7401/data`; a missing image, one another VM writes, or a Lake server that cannot be reached is refused as an invalid hardware profile) and detached when the VM's machine ends: when the VM is stopped, its program exits, or it is destroyed. A stopped or exited VM still lists its disks (`list`, `info`), but no longer holds them. `disk list` shows each image's attachments (one writer, or any number of readers), and an attached image cannot be deleted.
 
 The switch commands go to Avalon too. `create --net SWITCH[,mac=ADDR]` gives a VM a network card plugged into SWITCH (`-` for a card that starts unplugged; repeat for up to 4 cards), and `list` and `info` show each card's address and switch. Two VMs that ping each other over a switch, captured:
 
@@ -435,7 +495,7 @@ Open the URL it prints (the token in it changes at every launch). Options: `--li
 
 - **Overview** (`#/`): Avalon and Lake, each up or down with its version or the error that says why; the RAM all VMs hold against Avalon's budget, as a bar; how many VMs are running, paused, created and ended; how many disks there are, how many are attached, and their total size. It refreshes every few seconds, as the other pages do.
 - **VMs** (`#/vms`): a table of every VM with its id, name, state, RAM, clock and disks, and a button for each action its state allows (start for a created VM; pause, stop, destroy for a running one; resume for a paused one; destroy for a stopped or exited one). Stop and destroy ask first.
-- **New VM** (`#/vms/new`): name, RAM in MiB, clock (`10MHz`, `500kHz`, `5Hz`, or empty for full speed: the syntax of `--ram` and `--clock`), harts (1 to 8), the program (an ELF file chosen in the browser and uploaded), any number of disks (each a `lake://ADDR/NAME` source, offered from Lake's list, or the path of an image file on Avalon's host, read-write or read-only), network cards (each on a switch, offered from Avalon's list, or unplugged, with an address or one Avalon makes up), and whether to start it at once. Mistakes come back as Round Table would say them (`ram: 0 MiB is out of range`).
+- **New VM** (`#/vms/new`): name, RAM in MiB, clock (`10MHz`, `500kHz`, `5Hz`, or empty for full speed: the syntax of `--ram` and `--clock`), harts (1 to 8), what it boots: *Camelot (boot from disk)*, the choice when Lake has the image `camelot`, gives the VM its own copy of that image, `NAME-root`, as its first disk and boots it, as `round-table create --camelot` does; *Program (ELF)* uploads an ELF file chosen in the browser, which may be left out when the VM has a disk to boot from instead; any number of disks (each a `lake://ADDR/NAME` source, offered from Lake's list, or the path of an image file on Avalon's host, read-write or read-only), network cards (each on a switch, offered from Avalon's list, or unplugged, with an address or one Avalon makes up), and whether to start it at once. Mistakes come back as Round Table would say them (`ram: 0 MiB is out of range`).
 - **One VM** (`#/vms/ID`): its facts (state, RAM, clock, steps run, disks, the device table its guest sees), its action buttons, and its console: the scrollback, then the output live as the guest writes it, and an input line whose text goes to the VM's UART when you press Enter, followed by LF, CR or nothing as you choose (a Ctrl-D button sends EOT). Several pages, and Herald, can watch one console at once.
 - **Disks** (`#/disks`): a form to create an image (name and size: `64MiB`, `512K`, `1G`, `2048s`), and a table of Lake's images with their size, how they are attached (read-write, or how many readers) and which VMs hold them, with three buttons: *attach* opens the new-VM form with the image filled in (a VM's disks are part of its hardware, attached when it is created), *detach* stops the VMs that hold it (a VM lets go of its disks when it stops, and cannot be started again: the page says so first), and *delete*, for an image nobody holds.
 - **Switches** (`#/switches`): a form to create a switch (its name, whether it has a NAT gateway, and the ports it forwards, one rule per line as `--hostfwd` takes them), a form to plug a VM's card into a switch, and a panel per switch: its gateway (network, forwarded ports as bound, and each lease with the VM it belongs to) with a button to add or remove it, a delete button, and its ports with frames and bytes in and out, frames dropped, and an *unplug* button per card.

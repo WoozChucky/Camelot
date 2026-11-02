@@ -274,6 +274,7 @@ fn groups_avalon_does_not_serve() {
         Message::DiskCreate {
             name: "disk".into(),
             sectors: 8,
+            source: None,
         },
         Message::ListDisks,
         Message::DiskDelete { name: "disk".into() },
