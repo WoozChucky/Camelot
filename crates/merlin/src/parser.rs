@@ -2,25 +2,35 @@
 //!
 //! ```text
 //! program     := item* EOF
-//! item        := specifiers declarator '(' params ')' (block | ';')     a function
-//!              | specifiers init-decl (',' init-decl)* ';'              global variables
-//! specifiers  := ('static' | 'extern' | 'void' | 'char' | 'short' | 'int'
-//!                | 'long' | 'signed' | 'unsigned')+                     in any order, as in C
-//! declarator  := '*'* IDENT ('[' constant? ']')*
+//! item        := specifiers declarator block                            a function definition
+//!              | specifiers (init-decl (',' init-decl)*)? ';'           declarations
+//! specifiers  := (storage | qualifier | 'inline' | type-specifier)+    in any order, as in C
+//! storage     := 'static' | 'extern' | 'typedef'
+//! qualifier   := 'const' | 'volatile' | 'restrict'
+//! type-specifier := 'void' | 'char' | 'short' | 'int' | 'long' | 'signed' | 'unsigned' | '_Bool'
+//!              | struct-spec | enum-spec | TYPEDEF-NAME
+//! struct-spec := ('struct' | 'union') IDENT? '{' member-decl+ '}' | ('struct' | 'union') IDENT
+//! member-decl := specifiers declarator (',' declarator)* ';'
+//! enum-spec   := 'enum' IDENT? '{' enumerator (',' enumerator)* ','? '}' | 'enum' IDENT
+//! enumerator  := IDENT ('=' constant)?
+//! declarator  := ('*' qualifier*)* direct suffix*
+//! direct      := IDENT | '(' declarator ')' | ε                         ε only in parameters and type names
+//! suffix      := '[' constant? ']' | '(' params ')'
 //! init-decl   := declarator ('=' initializer)?
 //! initializer := assign | '{' initializer (',' initializer)* ','? '}'
 //! params      := ε | 'void' | param (',' param)*                        at most 8
 //! param       := specifiers declarator                                  the name is optional
 //!                                                                       in a prototype
-//! type-name   := specifiers '*'* ('[' constant ']')*                    for casts and sizeof
+//! type-name   := specifiers declarator                                  with no name: casts, sizeof
 //! block       := '{' (decl | stmt)* '}'
-//! decl        := specifiers init-decl (',' init-decl)* ';'
-//! stmt        := block | ';' | expr ';'
+//! decl        := specifiers (init-decl (',' init-decl)*)? ';'
+//! stmt        := block | ';' | expr ';' | IDENT ':' stmt
 //!              | 'if' '(' expr ')' stmt ('else' stmt)?
+//!              | 'switch' '(' expr ')' stmt | 'case' constant ':' stmt | 'default' ':' stmt
 //!              | 'while' '(' expr ')' stmt
 //!              | 'do' stmt 'while' '(' expr ')' ';'
 //!              | 'for' '(' (decl | expr? ';') expr? ';' expr? ')' stmt
-//!              | 'return' expr? ';' | 'break' ';' | 'continue' ';'
+//!              | 'return' expr? ';' | 'break' ';' | 'continue' ';' | 'goto' IDENT ';'
 //! expr        := assign (',' assign)*
 //! assign      := cond (('=' | '+=' | '-=' | '*=' | '/=' | '%=' | '<<=' | '>>='
 //!                      | '&=' | '|=' | '^=') assign)?                   right-associative
@@ -29,8 +39,9 @@
 //! unary       := ('++' | '--') unary | ('-' | '+' | '!' | '~' | '&' | '*') unary
 //!              | '(' type-name ')' unary | 'sizeof' '(' type-name ')' | 'sizeof' unary
 //!              | postfix
-//! postfix     := primary ('[' expr ']' | '++' | '--')*
-//! primary     := NUM | STR+ | IDENT | IDENT '(' (assign (',' assign)*)? ')' | '(' expr ')'
+//! postfix     := primary ('[' expr ']' | '(' (assign (',' assign)*)? ')'
+//!                        | '.' IDENT | '->' IDENT | '++' | '--')*
+//! primary     := NUM | STR+ | IDENT | '(' expr ')'
 //! ```
 //!
 //! Binary precedence (precedence climbing), loosest first: `||` 1, `&&` 2,
@@ -41,12 +52,34 @@
 //! lexer, a string literal is `char[len + 1]`, a cast has its target type, and
 //! array sizes are evaluated here ([`crate::consteval`]), so declared types are
 //! complete. `a[i]` becomes `*(a + i)`, which is what C defines it to mean.
+//!
+//! ## Names the parser must know
+//!
+//! C cannot be parsed without knowing which identifiers are typedef names:
+//! `T * x;` declares a pointer when `T` is a type and multiplies otherwise. So
+//! the parser keeps block scopes of its own ([`Scope`]) for what it needs to
+//! resolve: typedef names (replaced by their types), enumeration constants
+//! (replaced by their values, so `int a[N]` works) and struct, union and enum
+//! tags (each `struct tag { ... }` creates one [`Record`], which every later
+//! `struct tag` in scope shares). Variables and functions are recorded only
+//! as names that hide an outer typedef; sema resolves them.
+//!
+//! ## Declarators
+//!
+//! A declarator is read inside out, as C defines it. `int *(*fp[3])(char)`
+//! applies to `int`, in order: `*` (pointer to int), then the outer suffix
+//! `(char)` (function taking char, returning that), then the parenthesized
+//! declarator's `*` and `[3]`, innermost last: `fp` is an array of 3 pointers
+//! to functions. [`Parser::declarator_ops`] collects these steps
+//! ([`Derive`]) and [`Parser::declarator`] applies them to the base type.
 
 use crate::ast::*;
 use crate::consteval;
 use crate::lexer::{Kw, Tok, Token};
-use crate::types::{IntKind, Type, MAX_OBJECT_SIZE};
+use crate::types::{align_up, IntKind, Quals, Record, Type, MAX_OBJECT_SIZE};
 use crate::{Error, Pos};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Arguments travel in `a0-a7`; no stack-passed arguments yet.
 pub const MAX_PARAMS: usize = 8;
@@ -65,10 +98,13 @@ pub fn parse(toks: &[Token]) -> Result<Program, Error> {
         toks,
         pos: 0,
         depth: 0,
+        scopes: vec![Scope::default()],
     };
     let mut items = Vec::new();
     while *p.peek() != Tok::Eof {
-        items.push(p.item()?);
+        if let Some(item) = p.item()? {
+            items.push(item);
+        }
     }
     Ok(Program { items })
 }
@@ -124,14 +160,80 @@ enum Ctx {
     Block,
     ForInit,
     Param,
+    /// A struct or union member.
+    Member,
     TypeName,
+}
+
+/// The storage class a declaration's specifiers give.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    None,
+    Static,
+    Extern,
+    Typedef,
+}
+
+/// What a list of declaration specifiers says.
+struct Specs {
+    ty: Type,
+    class: Class,
+    inline: bool,
+    /// The specifiers declare something by themselves (a struct, union or
+    /// enum tag, or enumeration constants), so they may end the declaration
+    /// with no declarator: `struct point { int x, y; };`.
+    declares: bool,
+}
+
+/// What an ordinary identifier (C's namespace of variables, functions,
+/// typedef names and enumeration constants) means to the parser.
+#[derive(Clone, Debug, PartialEq)]
+enum Name {
+    /// A typedef name, and the type it stands for.
+    Typedef(Type),
+    /// An enumeration constant and its value (an `int`).
+    EnumConst(i64),
+    /// A variable or function: resolved by sema.
+    Object,
+}
+
+/// What a struct, union or enum tag names.
+#[derive(Clone)]
+enum Tag {
+    Record(Arc<Record>),
+    /// An enum: the integer type it is.
+    Enum(Type),
+}
+
+/// One block scope: the file, a function's parameters and body, a block, a
+/// `for` statement, or a parameter list.
+#[derive(Default)]
+struct Scope {
+    names: HashMap<String, (Name, Pos)>,
+    tags: HashMap<String, Tag>,
+}
+
+/// One step of a declarator, from the base type towards the declared type.
+enum Derive {
+    /// Pointer to the type so far, with these qualifiers.
+    Ptr(Quals),
+    /// Array of the type so far (`None`: of unknown size).
+    Array(Option<i64>, Pos),
+    /// Function returning the type so far, with these parameters (and the
+    /// scope holding their names).
+    Func(Vec<Param>, Scope),
 }
 
 /// A parsed declarator: the name, the full type, and where the name is.
 struct Decl {
+    /// Empty when the declarator has no name (allowed in parameters and type names).
     name: String,
     ty: Type,
     pos: Pos,
+    /// When the declarator declares a function (its last step is a parameter
+    /// list): the parameters with their names, and their scope, which a
+    /// function body continues.
+    func: Option<(Vec<Param>, Scope)>,
 }
 
 struct Parser<'a> {
@@ -139,6 +241,8 @@ struct Parser<'a> {
     pos: usize,
     /// Current nesting level; see [`MAX_DEPTH`].
     depth: usize,
+    /// Block scopes, innermost last; the first is the file scope.
+    scopes: Vec<Scope>,
 }
 
 impl Parser<'_> {
@@ -159,6 +263,14 @@ impl Parser<'_> {
         self.enter()?;
         let r = f(self);
         self.depth -= 1;
+        r
+    }
+
+    /// Runs `f` in a new scope.
+    fn scoped<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        self.scopes.push(Scope::default());
+        let r = f(self);
+        self.scopes.pop();
         r
     }
 
@@ -215,15 +327,84 @@ impl Parser<'_> {
         yes
     }
 
-    /// Whether the current token starts a declaration (a type or storage class).
+    // ---- scopes ----
+
+    fn lookup_name(&self, name: &str) -> Option<&Name> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.names.get(name))
+            .map(|(n, _)| n)
+    }
+
+    /// The type a typedef name in scope stands for.
+    fn typedef(&self, name: &str) -> Option<&Type> {
+        match self.lookup_name(name) {
+            Some(Name::Typedef(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    fn is_typedef(&self, t: &Tok) -> bool {
+        matches!(t, Tok::Ident(n) if self.typedef(n).is_some())
+    }
+
+    /// Declares an ordinary identifier in the innermost scope. Declaring a
+    /// variable or function again is sema's to judge; any other clash is an
+    /// error here.
+    fn bind_name(&mut self, name: &str, what: Name, pos: Pos) -> Result<(), Error> {
+        let scope = self.scopes.last_mut().expect("the file scope");
+        match scope.names.get(name) {
+            None => {
+                scope.names.insert(name.to_string(), (what, pos));
+                Ok(())
+            }
+            Some((prev, _)) if *prev == what && !matches!(what, Name::EnumConst(_)) => Ok(()),
+            Some((Name::Typedef(prev), _)) if matches!(what, Name::Typedef(_)) => {
+                let Name::Typedef(new) = what else { unreachable!() };
+                Err(Error::new(
+                    pos,
+                    format!("typedef redefinition with different types ('{new}' vs '{prev}')"),
+                ))
+            }
+            Some((Name::EnumConst(_), prev_pos)) if matches!(what, Name::EnumConst(_)) => Err(Error::new(
+                pos,
+                format!("redefinition of enumerator '{name}' (first declared at {prev_pos})"),
+            )),
+            Some((_, prev_pos)) => Err(Error::new(
+                pos,
+                format!(
+                    "redefinition of '{name}' as a different kind of symbol (first declared at {prev_pos})"
+                ),
+            )),
+        }
+    }
+
+    fn lookup_tag(&self, name: &str) -> Option<&Tag> {
+        self.scopes.iter().rev().find_map(|s| s.tags.get(name))
+    }
+
+    fn bind_tag(&mut self, name: &str, tag: Tag) {
+        let scope = self.scopes.last_mut().expect("the file scope");
+        scope.tags.insert(name.to_string(), tag);
+    }
+
+    /// Whether the current token starts a declaration: a type keyword,
+    /// storage class or qualifier, or a typedef name (that is not a label).
     fn at_decl(&self) -> bool {
-        matches!(self.peek(), Tok::Kw(k) if k.starts_decl())
+        match self.peek() {
+            Tok::Kw(k) => k.starts_decl(),
+            t => self.is_typedef(t) && !matches!(self.peek_at(1), Tok::Punct(":")),
+        }
     }
 
     /// Whether the token after the current one starts a type name: `(` then a
-    /// type keyword means a cast or `sizeof (type)`.
+    /// type means a cast or `sizeof (type)`.
     fn type_name_follows(&self) -> bool {
-        matches!(self.peek_at(1), Tok::Kw(k) if k.starts_decl())
+        match self.peek_at(1) {
+            Tok::Kw(k) => k.starts_decl(),
+            t => self.is_typedef(t),
+        }
     }
 
     fn unexpected(&self, what: &str) -> Error {
@@ -251,40 +432,97 @@ impl Parser<'_> {
         }
     }
 
-    // ---- declarations ----
+    fn expect_ident(&mut self, what: &str) -> Result<(String, Pos), Error> {
+        match self.peek().clone() {
+            Tok::Ident(name) => Ok((name, self.advance().pos)),
+            _ => Err(self.unexpected(what)),
+        }
+    }
 
-    /// Type specifiers and storage class, in any order (`unsigned static int`
-    /// is as good as `static unsigned int`, as in C).
-    fn specifiers(&mut self, ctx: Ctx) -> Result<(Type, Storage), Error> {
+    // ---- declaration specifiers ----
+
+    /// Type specifiers, qualifiers, storage class and `inline`, in any order
+    /// (`unsigned static int` is as good as `static unsigned int`, as in C).
+    fn specifiers(&mut self, ctx: Ctx) -> Result<Specs, Error> {
         let start = self.here();
-        let mut storage = Storage::None;
+        let mut class = Class::None;
+        let mut inline = false;
+        let mut quals = Quals::NONE;
+        // A struct, union or enum, or a typedef name: a type on its own.
+        let mut named: Option<Type> = None;
+        let mut declares = false;
         // How many times each type keyword appears.
-        let (mut void, mut char, mut short, mut int, mut long, mut signed, mut unsigned) =
-            (0, 0, 0, 0, 0, 0, 0);
-        while let Tok::Kw(k) = *self.peek() {
-            if !k.starts_decl() {
-                break;
-            }
-            let pos = self.advance().pos;
+        let (mut void, mut char, mut short, mut int, mut long, mut signed, mut unsigned, mut bool_) =
+            (0, 0, 0, 0, 0, 0, 0, 0);
+        loop {
+            let pos = self.here();
+            let k = match self.peek().clone() {
+                Tok::Kw(k) if k.starts_decl() => k,
+                // A typedef name is a type specifier only where no other is yet:
+                // in `int T;` the `T` is the declarator, even if it names a type.
+                Tok::Ident(name)
+                    if named.is_none()
+                        && void + char + short + int + long + signed + unsigned + bool_ == 0
+                        && self.typedef(&name).is_some() =>
+                {
+                    named = self.typedef(&name).cloned();
+                    self.advance();
+                    continue;
+                }
+                _ => break,
+            };
+            self.advance();
             let count = match k {
-                Kw::Static | Kw::Extern => {
-                    let s = if k == Kw::Static {
-                        Storage::Static
-                    } else {
-                        Storage::Extern
+                Kw::Static | Kw::Extern | Kw::Typedef => {
+                    let c = match k {
+                        Kw::Static => Class::Static,
+                        Kw::Extern => Class::Extern,
+                        _ => Class::Typedef,
                     };
                     let allowed = match ctx {
                         Ctx::File => true,
-                        Ctx::Block => k == Kw::Static,
-                        Ctx::ForInit | Ctx::Param | Ctx::TypeName => false,
+                        Ctx::Block => k != Kw::Extern,
+                        Ctx::ForInit | Ctx::Param | Ctx::Member | Ctx::TypeName => false,
                     };
                     if !allowed {
                         return Err(Error::new(pos, format!("'{}' is not allowed here", k.as_str())));
                     }
-                    if storage != Storage::None {
-                        return Err(Error::new(pos, "at most one of 'static' and 'extern' is allowed"));
+                    if class != Class::None {
+                        return Err(Error::new(
+                            pos,
+                            "at most one storage class ('static', 'extern', 'typedef') is allowed",
+                        ));
                     }
-                    storage = s;
+                    class = c;
+                    continue;
+                }
+                Kw::Inline => {
+                    if ctx != Ctx::File {
+                        return Err(Error::new(pos, "'inline' can only appear on functions"));
+                    }
+                    inline = true;
+                    continue;
+                }
+                Kw::Const => {
+                    quals.konst = true;
+                    continue;
+                }
+                Kw::Volatile => {
+                    quals.volatile = true;
+                    continue;
+                }
+                // `restrict` promises no aliasing, which merlin never relies on.
+                Kw::Restrict => continue,
+                Kw::Struct | Kw::Union | Kw::Enum => {
+                    if named.is_some() || void + char + short + int + long + signed + unsigned + bool_ > 0 {
+                        return Err(Error::new(start, "invalid combination of type specifiers"));
+                    }
+                    let (ty, d) = self.nested(|p| match k {
+                        Kw::Enum => p.enum_spec(pos),
+                        _ => p.record_spec(k == Kw::Union, pos),
+                    })?;
+                    named = Some(ty);
+                    declares = d;
                     continue;
                 }
                 Kw::Void => &mut void,
@@ -294,6 +532,7 @@ impl Parser<'_> {
                 Kw::Long => &mut long,
                 Kw::Signed => &mut signed,
                 Kw::Unsigned => &mut unsigned,
+                Kw::Bool => &mut bool_,
                 _ => unreachable!("starts_decl"),
             };
             *count += 1;
@@ -304,62 +543,287 @@ impl Parser<'_> {
                 return Err(Error::new(pos, format!("duplicate '{}'", k.as_str())));
             }
         }
-        if void + char + short + int + long + signed + unsigned == 0 {
-            return Err(Error::new(
-                self.here(),
-                format!("expected a type, found {}", self.tok().describe()),
-            ));
-        }
-        // At most one of void, char, short and long; `int` may join short and
-        // long; `signed` or `unsigned` may join anything but void.
-        let invalid = signed + unsigned > 1
-            || void + char + short + long > 1
-            || int + void + char > 1
-            || void + signed + unsigned > 1;
-        if invalid {
-            return Err(Error::new(start, "invalid combination of type specifiers"));
-        }
-        let ty = if void == 1 {
-            Type::Void
-        } else if char == 1 {
-            Type::Int(match (signed, unsigned) {
-                (1, _) => IntKind::SChar,
-                (_, 1) => IntKind::UChar,
-                _ => IntKind::Char,
-            })
-        } else if short == 1 {
-            Type::Int(if unsigned == 1 {
-                IntKind::UShort
-            } else {
-                IntKind::Short
-            })
-        } else if long == 1 {
-            Type::Int(if unsigned == 1 {
-                IntKind::ULong
-            } else {
-                IntKind::Long
-            })
-        } else {
-            Type::Int(if unsigned == 1 {
-                IntKind::UInt
-            } else {
-                IntKind::Int
-            })
+        let keywords = void + char + short + int + long + signed + unsigned + bool_;
+        let ty = match named {
+            Some(_) if keywords > 0 => {
+                return Err(Error::new(start, "invalid combination of type specifiers"));
+            }
+            Some(ty) => ty,
+            None if keywords == 0 => {
+                return Err(Error::new(
+                    self.here(),
+                    format!("expected a type, found {}", self.tok().describe()),
+                ));
+            }
+            None => {
+                // At most one of void, char, short, long and _Bool; `int` may
+                // join short and long; `signed` or `unsigned` may join
+                // anything but void and _Bool.
+                let invalid = signed + unsigned > 1
+                    || void + char + short + long + bool_ > 1
+                    || int + void + char + bool_ > 1
+                    || void + bool_ + signed + unsigned > 1;
+                if invalid {
+                    return Err(Error::new(start, "invalid combination of type specifiers"));
+                }
+                if void == 1 {
+                    Type::Void
+                } else if bool_ == 1 {
+                    Type::BOOL
+                } else if char == 1 {
+                    Type::Int(match (signed, unsigned) {
+                        (1, _) => IntKind::SChar,
+                        (_, 1) => IntKind::UChar,
+                        _ => IntKind::Char,
+                    })
+                } else if short == 1 {
+                    Type::Int(if unsigned == 1 {
+                        IntKind::UShort
+                    } else {
+                        IntKind::Short
+                    })
+                } else if long == 1 {
+                    Type::Int(if unsigned == 1 {
+                        IntKind::ULong
+                    } else {
+                        IntKind::Long
+                    })
+                } else {
+                    Type::Int(if unsigned == 1 {
+                        IntKind::UInt
+                    } else {
+                        IntKind::Int
+                    })
+                }
+            }
         };
-        Ok((ty, storage))
+        Ok(Specs {
+            ty: ty.qualified(quals),
+            class,
+            inline,
+            declares,
+        })
     }
 
-    /// `'*'*`: pointers to `base`.
-    fn pointers(&mut self, mut ty: Type) -> Result<Type, Error> {
-        let mut n = 0;
-        while self.is_punct("*") {
-            self.too_deep(n, "'*'s")?;
-            self.advance();
-            ty = Type::ptr(ty);
-            n += 1;
+    /// After `struct` or `union`: a definition (`struct tag { ... }`, the tag
+    /// optional) or a reference to a tag. Returns the type and whether the
+    /// specifier declares a tag by itself.
+    fn record_spec(&mut self, union: bool, kw_pos: Pos) -> Result<(Type, bool), Error> {
+        let kw = if union { "union" } else { "struct" };
+        let tag = match self.peek().clone() {
+            Tok::Ident(name) => Some((name, self.advance().pos)),
+            _ => None,
+        };
+        let mismatch = |name: &str, pos: Pos| {
+            Error::new(
+                pos,
+                format!("use of '{name}' with tag type that does not match previous declaration"),
+            )
+        };
+        if self.is_punct("{") {
+            let record = match &tag {
+                Some((name, pos)) => match self.scopes.last().unwrap().tags.get(name) {
+                    // `struct s;` earlier in this scope: this completes it.
+                    Some(Tag::Record(r)) if r.union == union && r.body().is_none() => r.clone(),
+                    Some(Tag::Record(r)) if r.union == union => {
+                        return Err(Error::new(*pos, format!("redefinition of '{kw} {name}'")));
+                    }
+                    Some(_) => return Err(mismatch(name, *pos)),
+                    None => {
+                        // Declared before the body, so members can point to it.
+                        let r = Record::new(union, Some(name.clone()), *pos);
+                        self.bind_tag(name, Tag::Record(r.clone()));
+                        r
+                    }
+                },
+                None => Record::new(union, None, kw_pos),
+            };
+            self.record_body(&record)?;
+            // `struct { int x; };` declares nothing anyone can name.
+            return Ok((Type::Record(record), tag.is_some()));
         }
-        Ok(ty)
+        let Some((name, pos)) = tag else {
+            return Err(self.unexpected(&format!("a name or '{{' after '{kw}'")));
+        };
+        // `struct s;` on its own declares a new type in this scope, even when
+        // an outer scope has a `struct s`.
+        let alone = self.is_punct(";");
+        let found = if alone {
+            self.scopes.last().unwrap().tags.get(&name)
+        } else {
+            self.lookup_tag(&name)
+        };
+        match found {
+            Some(Tag::Record(r)) if r.union == union => Ok((Type::Record(r.clone()), alone)),
+            Some(_) => Err(mismatch(&name, pos)),
+            None => {
+                // A tag not seen before: an incomplete type, completed by a
+                // definition later in the same scope.
+                let r = Record::new(union, Some(name.clone()), pos);
+                self.bind_tag(&name, Tag::Record(r.clone()));
+                Ok((Type::Record(r), true))
+            }
+        }
     }
+
+    /// `{ member-decl+ }`: the members, laid out into `record`.
+    fn record_body(&mut self, record: &Record) -> Result<(), Error> {
+        let open = self.expect_punct("{")?;
+        let mut members: Vec<(String, Type)> = Vec::new();
+        let mut seen: HashMap<String, Pos> = HashMap::new();
+        // The layout so far, to reject a struct too big before laying it out.
+        let mut end = 0u64;
+        while !self.eat_punct("}") {
+            if !self.at_decl() {
+                return Err(self.unexpected(&format!(
+                    "a member declaration or '}}' in the {}",
+                    record.keyword()
+                )));
+            }
+            let specs = self.specifiers(Ctx::Member)?;
+            if self.is_punct(";") {
+                return Err(Error::new(
+                    self.here(),
+                    "declaration does not declare anything (anonymous members are not supported)",
+                ));
+            }
+            loop {
+                let d = self.declarator(&specs.ty, Ctx::Member)?;
+                if self.is_punct(":") {
+                    return Err(Error::new(self.here(), "bit-fields are not supported yet"));
+                }
+                if d.ty.is_func() {
+                    return Err(Error::new(
+                        d.pos,
+                        format!("field '{}' declared as a function", d.name),
+                    ));
+                }
+                let Some(size) = d.ty.size() else {
+                    let msg = match &d.ty {
+                        Type::Array(_, None) => "flexible array members are not supported yet".to_string(),
+                        t => format!("field '{}' has incomplete type '{t}'", d.name),
+                    };
+                    return Err(Error::new(d.pos, msg));
+                };
+                if let Some(prev) = seen.insert(d.name.clone(), d.pos) {
+                    return Err(Error::new(
+                        d.pos,
+                        format!("duplicate member '{}' (first declared at {prev})", d.name),
+                    ));
+                }
+                end = if record.union {
+                    end.max(u64::from(size))
+                } else {
+                    align_up(end, d.ty.align()) + u64::from(size)
+                };
+                if end > MAX_OBJECT_SIZE {
+                    return Err(Error::new(d.pos, format!("{} is too large", record.keyword())));
+                }
+                members.push((d.name, d.ty));
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            self.expect_semi("at end of declaration list")?;
+        }
+        if members.is_empty() {
+            return Err(Error::new(open, format!("{} has no members", record.keyword())));
+        }
+        if align_up(end, members.iter().map(|(_, t)| t.align()).max().unwrap_or(1)) > MAX_OBJECT_SIZE {
+            return Err(Error::new(open, format!("{} is too large", record.keyword())));
+        }
+        record.complete(members);
+        Ok(())
+    }
+
+    /// After `enum`: a definition, whose constants go in scope one by one
+    /// (so `B = A + 1` works), or a reference to a defined tag. An enum type
+    /// is `unsigned int` when no constant is negative and `int` otherwise
+    /// (clang's and GCC's choice for C); the constants themselves are `int`s.
+    fn enum_spec(&mut self, kw_pos: Pos) -> Result<(Type, bool), Error> {
+        let tag = match self.peek().clone() {
+            Tok::Ident(name) => Some((name, self.advance().pos)),
+            _ => None,
+        };
+        if !self.eat_punct("{") {
+            let Some((name, pos)) = tag else {
+                return Err(self.unexpected("a name or '{' after 'enum'"));
+            };
+            return match self.lookup_tag(&name) {
+                Some(Tag::Enum(ty)) => Ok((ty.clone(), false)),
+                Some(Tag::Record(_)) => Err(Error::new(
+                    pos,
+                    format!("use of '{name}' with tag type that does not match previous declaration"),
+                )),
+                None => Err(Error::new(
+                    pos,
+                    format!(
+                        "use of undefined 'enum {name}' (merlin needs an enum's constants before its name)"
+                    ),
+                )),
+            };
+        }
+        if let Some((name, pos)) = &tag {
+            if self.scopes.last().unwrap().tags.contains_key(name) {
+                return Err(Error::new(*pos, format!("redefinition of 'enum {name}'")));
+            }
+        }
+        let (int_min, int_max) = IntKind::Int.range();
+        let mut next = 0i64;
+        let mut negative = false;
+        let mut count = 0;
+        loop {
+            if self.eat_punct("}") {
+                if count == 0 {
+                    return Err(Error::new(kw_pos, "use of empty enum"));
+                }
+                break;
+            }
+            let (name, pos) = self.expect_ident("an enumerator name")?;
+            let value = if self.eat_punct("=") {
+                let at = self.here();
+                let e = self.cond()?;
+                consteval::int(&e)
+                    .ok_or_else(|| Error::new(at, "enumerator value is not an integer constant expression"))?
+            } else {
+                next
+            };
+            if !(int_min..=int_max).contains(&value) {
+                return Err(Error::new(
+                    pos,
+                    format!("enumerator value {value} is not representable as an 'int'"),
+                ));
+            }
+            self.bind_name(&name, Name::EnumConst(value), pos)?;
+            negative |= value < 0;
+            next = value + 1;
+            count += 1;
+            if !self.eat_punct(",") && !self.is_punct("}") {
+                return Err(self.unexpected("',' or '}' in the enum"));
+            }
+        }
+        let ty = if negative { Type::INT } else { Type::UINT };
+        if let Some((name, _)) = tag {
+            self.bind_tag(&name, Tag::Enum(ty.clone()));
+        }
+        Ok((ty, true))
+    }
+
+    /// `const`, `volatile` and `restrict` after a `*`.
+    fn qualifiers(&mut self) -> Quals {
+        let mut q = Quals::NONE;
+        loop {
+            match self.peek() {
+                Tok::Kw(Kw::Const) => q.konst = true,
+                Tok::Kw(Kw::Volatile) => q.volatile = true,
+                Tok::Kw(Kw::Restrict) => {}
+                _ => return q,
+            }
+            self.advance();
+        }
+    }
+
+    // ---- declarators ----
 
     /// Types nest like expressions (and are as recursive to check), so a
     /// declarator may have at most [`MAX_DEPTH`] `*`s and as many `[]`s.
@@ -371,78 +835,216 @@ impl Parser<'_> {
         Ok(())
     }
 
-    /// `('[' constant? ']')*` after a name: the array dimensions, applied to
-    /// `elem` innermost last, so `int a[2][3]` is an array of 2 `int[3]`.
-    /// Only the first dimension may be left out.
-    fn array_suffix(&mut self, elem: Type) -> Result<Type, Error> {
-        let mut dims = Vec::new();
-        while self.is_punct("[") {
-            self.too_deep(dims.len(), "array dimensions")?;
-            let open = self.advance().pos;
-            if self.eat_punct("]") {
-                if !dims.is_empty() {
-                    return Err(Error::new(open, "only the first array dimension may be left out"));
-                }
-                dims.push(None);
-                continue;
-            }
-            let pos = self.here();
-            let e = self.cond()?;
-            self.expect_punct("]")?;
-            let n = consteval::int(&e).ok_or_else(|| {
-                Error::new(
-                    pos,
-                    "array size must be an integer constant expression \
-                     (literals, operators, casts and sizeof(type))",
-                )
-            })?;
-            if n <= 0 {
-                return Err(Error::new(pos, format!("array size must be positive, not {n}")));
-            }
-            dims.push(Some(n));
+    /// After the `*`s, whether a `(` opens a parenthesized declarator
+    /// (`(*fp)`, `(name)`) rather than a parameter list (`(int)`, `()`).
+    fn nested_declarator_follows(&self) -> bool {
+        match self.peek_at(1) {
+            Tok::Punct("*" | "(") => true,
+            t @ Tok::Ident(_) => !self.is_typedef(t),
+            _ => false,
         }
-        let mut ty = elem;
+    }
+
+    /// Reads a declarator: its name (if any), where the name is (or would
+    /// be), and its steps in the order they apply to the base type.
+    fn declarator_ops(&mut self, ctx: Ctx) -> Result<(String, Pos, Vec<Derive>), Error> {
+        let mut ptrs = Vec::new();
+        while self.is_punct("*") {
+            self.too_deep(ptrs.len(), "'*'s")?;
+            self.advance();
+            ptrs.push(Derive::Ptr(self.qualifiers()));
+        }
+        let pos = self.here();
+        let (name, pos, inner) = if self.is_punct("(") && self.nested_declarator_follows() {
+            self.advance();
+            let (name, pos, inner) = self.nested(|p| p.declarator_ops(ctx))?;
+            self.expect_punct(")")?;
+            (name, pos, inner)
+        } else if let Tok::Ident(name) = self.peek().clone() {
+            if ctx == Ctx::TypeName {
+                return Err(self.unexpected("')' after the type name"));
+            }
+            self.advance();
+            (name, pos, Vec::new())
+        } else if matches!(ctx, Ctx::Param | Ctx::TypeName) {
+            (String::new(), pos, Vec::new())
+        } else {
+            return Err(self.unexpected("a name"));
+        };
+        let suffixes = self.suffixes()?;
+        let mut ops = ptrs;
+        ops.extend(suffixes.into_iter().rev());
+        ops.extend(inner);
+        Ok((name, pos, ops))
+    }
+
+    /// `('[' constant? ']' | '(' params ')')*` after a declarator's name, in
+    /// source order. In a run of dimensions only the first may be left out.
+    fn suffixes(&mut self) -> Result<Vec<Derive>, Error> {
+        let mut out = Vec::new();
+        let mut dims = 0;
+        loop {
+            if self.is_punct("[") {
+                self.too_deep(dims, "array dimensions")?;
+                let open = self.advance().pos;
+                if self.eat_punct("]") {
+                    if dims > 0 {
+                        return Err(Error::new(open, "only the first array dimension may be left out"));
+                    }
+                    out.push(Derive::Array(None, open));
+                    dims += 1;
+                    continue;
+                }
+                let pos = self.here();
+                let e = self.cond()?;
+                self.expect_punct("]")?;
+                let n = consteval::int(&e).ok_or_else(|| {
+                    Error::new(
+                        pos,
+                        "array size must be an integer constant expression \
+                         (literals, enum constants, operators, casts and sizeof(type))",
+                    )
+                })?;
+                if n <= 0 {
+                    return Err(Error::new(pos, format!("array size must be positive, not {n}")));
+                }
+                out.push(Derive::Array(Some(n), open));
+                dims += 1;
+            } else if self.is_punct("(") {
+                self.advance();
+                let (params, scope) = self.params()?;
+                out.push(Derive::Func(params, scope));
+                dims = 0;
+            } else {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// A declarator, applied to `base`. In a parameter list or a type name
+    /// the name may be missing.
+    fn declarator(&mut self, base: &Type, ctx: Ctx) -> Result<Decl, Error> {
+        let (name, pos, ops) = self.declarator_ops(ctx)?;
+        let end = self.here();
+        let mut ty = base.clone();
+        let mut func = None;
         // The size of `ty`, kept as it grows: `Type::size` recurses, so asking
         // it at every dimension would be quadratic in the number of dimensions.
         let mut size = ty.size().map(u64::from);
-        for n in dims.into_iter().rev() {
-            let Some(elem_size) = size else {
-                return Err(Error::new(
-                    self.here(),
-                    format!("array has incomplete element type '{ty}'"),
-                ));
-            };
-            let total = elem_size * n.unwrap_or(1) as u64;
-            if total > MAX_OBJECT_SIZE {
-                return Err(Error::new(self.after_prev(), "array is too large"));
+        let steps = ops.len();
+        for (i, op) in ops.into_iter().enumerate() {
+            match op {
+                Derive::Ptr(q) => {
+                    ty = Type::ptr(ty).qualified(q);
+                    size = Some(4);
+                }
+                Derive::Array(n, open) => {
+                    if ty.is_func() {
+                        let what = if name.is_empty() { "type name" } else { &name };
+                        return Err(Error::new(
+                            open,
+                            format!("'{what}' declared as array of functions of type '{ty}'"),
+                        ));
+                    }
+                    let Some(elem_size) = size else {
+                        return Err(Error::new(
+                            end,
+                            format!("array has incomplete element type '{ty}'"),
+                        ));
+                    };
+                    let total = elem_size * n.unwrap_or(1) as u64;
+                    if total > MAX_OBJECT_SIZE {
+                        return Err(Error::new(self.after_prev(), "array is too large"));
+                    }
+                    size = n.map(|_| total);
+                    ty = Type::array(ty, n.map(|n| n as u32));
+                }
+                Derive::Func(params, scope) => {
+                    if ty.is_array() || ty.is_func() {
+                        let what = if ty.is_array() { "array" } else { "function" };
+                        return Err(Error::new(
+                            pos,
+                            format!("function cannot return {what} type '{ty}'"),
+                        ));
+                    }
+                    // A qualified result means nothing: the value is a copy.
+                    let ret = ty.unqual().clone();
+                    ty = Type::func(ret, params.iter().map(|p| p.ty.unqual().clone()).collect());
+                    size = None;
+                    if i + 1 == steps {
+                        func = Some((params, scope));
+                    }
+                }
             }
-            size = n.map(|_| total);
-            ty = Type::array(ty, n.map(|n| n as u32));
         }
-        Ok(ty)
+        Ok(Decl { name, ty, pos, func })
     }
 
-    /// A declarator: pointers, the name and array dimensions. In a parameter
-    /// list the name is optional.
-    fn declarator(&mut self, base: &Type, ctx: Ctx) -> Result<Decl, Error> {
-        let ty = self.pointers(base.clone())?;
-        let pos = self.here();
-        let name =
-            match self.peek().clone() {
-                Tok::Ident(name) => {
-                    self.advance();
-                    name
-                }
-                _ if ctx == Ctx::Param => String::new(),
-                Tok::Punct("(") => return Err(Error::new(
-                    pos,
-                    "parenthesized declarators (function pointers, pointers to arrays) are not supported yet",
-                )),
-                _ => return Err(self.unexpected("a name")),
-            };
-        let ty = self.array_suffix(ty)?;
-        Ok(Decl { name, ty, pos })
+    /// After `(`, up to and including `)`: the parameters, in a scope of
+    /// their own.
+    fn params(&mut self) -> Result<(Vec<Param>, Scope), Error> {
+        self.scopes.push(Scope::default());
+        let params = self.params_inner();
+        let scope = self.scopes.pop().expect("pushed above");
+        Ok((params?, scope))
     }
+
+    fn params_inner(&mut self) -> Result<Vec<Param>, Error> {
+        let mut params = Vec::new();
+        if self.eat_punct(")") {
+            return Ok(params);
+        }
+        if *self.peek() == Tok::Kw(Kw::Void) && matches!(self.peek_at(1), Tok::Punct(")")) {
+            self.advance();
+            self.advance();
+            return Ok(params);
+        }
+        loop {
+            if !self.at_decl() {
+                return Err(self.unexpected("a parameter type"));
+            }
+            let start = self.here();
+            let specs = self.specifiers(Ctx::Param)?;
+            let d = self.declarator(&specs.ty, Ctx::Param)?;
+            let pos = if d.name.is_empty() { start } else { d.pos };
+            if params.len() == MAX_PARAMS {
+                return Err(Error::new(
+                    pos,
+                    format!("too many parameters: merlin supports at most {MAX_PARAMS} (a0-a7)"),
+                ));
+            }
+            // C adjusts a parameter declared as an array or a function to a
+            // pointer (keeping qualifiers on what it points to).
+            let ty = if d.ty.is_array() || d.ty.is_func() {
+                d.ty.decay()
+            } else {
+                d.ty
+            };
+            if !d.name.is_empty() {
+                self.bind_name(&d.name, Name::Object, pos)?;
+            }
+            params.push(Param {
+                name: d.name,
+                ty,
+                pos,
+            });
+            if self.eat_punct(")") {
+                return Ok(params);
+            }
+            if !self.eat_punct(",") {
+                return Err(self.unexpected("',' or ')' in the parameter list"));
+            }
+        }
+    }
+
+    /// A type name, for casts and `sizeof`: specifiers and a declarator
+    /// without a name (`int`, `char *[4]`, `int (*)(void)`).
+    fn type_name(&mut self) -> Result<Type, Error> {
+        let specs = self.specifiers(Ctx::TypeName)?;
+        Ok(self.declarator(&specs.ty, Ctx::TypeName)?.ty)
+    }
+
+    // ---- declarations ----
 
     /// `'{' ... '}'` or an expression.
     fn initializer(&mut self) -> Result<Init, Error> {
@@ -462,6 +1064,12 @@ impl Parser<'_> {
                     }
                     return Ok(Init::List(items, pos));
                 }
+                if p.is_punct(".") || p.is_punct("[") {
+                    return Err(Error::new(
+                        p.here(),
+                        "designated initializers are not supported yet",
+                    ));
+                }
                 items.push(p.initializer()?);
                 if !p.eat_punct(",") && !p.is_punct("}") {
                     return Err(p.unexpected("',' or '}' in the initializer list"));
@@ -470,17 +1078,27 @@ impl Parser<'_> {
         })
     }
 
-    /// The declarators after the specifiers, through the `;`.
+    /// The rest of a declaration after its specifiers (and its first
+    /// declarator, if the caller has read it), through the `;`.
     fn init_declarators(
         &mut self,
-        base: &Type,
-        storage: Storage,
+        specs: &Specs,
+        first: Option<Decl>,
         ctx: Ctx,
     ) -> Result<Vec<Declarator>, Error> {
+        let storage = match specs.class {
+            Class::Static => Storage::Static,
+            Class::Extern => Storage::Extern,
+            Class::None | Class::Typedef => Storage::None,
+        };
+        let mut first = first;
         let mut decls = Vec::new();
         loop {
-            let d = self.declarator(base, ctx)?;
-            if self.is_punct("(") {
+            let d = match first.take() {
+                Some(d) => d,
+                None => self.declarator(&specs.ty, ctx)?,
+            };
+            if d.ty.is_func() {
                 let msg = if ctx == Ctx::File {
                     "declare a function on its own, not in a list of variables"
                 } else {
@@ -488,6 +1106,7 @@ impl Parser<'_> {
                 };
                 return Err(Error::new(d.pos, msg));
             }
+            self.bind_name(&d.name, Name::Object, d.pos)?;
             let init = if self.eat_punct("=") {
                 Some(self.initializer()?)
             } else {
@@ -510,104 +1129,122 @@ impl Parser<'_> {
         Ok(decls)
     }
 
-    /// A top-level function or declaration.
-    fn item(&mut self) -> Result<Item, Error> {
+    /// The declarators of a `typedef`, each binding a name to its type.
+    fn typedefs(&mut self, specs: &Specs, first: Decl, ctx: Ctx) -> Result<(), Error> {
+        let mut d = first;
+        loop {
+            if self.is_punct("=") {
+                return Err(Error::new(
+                    self.here(),
+                    "illegal initializer (only variables can be initialized)",
+                ));
+            }
+            self.bind_name(&d.name, Name::Typedef(d.ty), d.pos)?;
+            if !self.eat_punct(",") {
+                break;
+            }
+            d = self.declarator(&specs.ty, ctx)?;
+        }
+        self.expect_semi("at end of declaration")
+    }
+
+    /// After specifiers that may stand alone: `;` is fine if they declared
+    /// something (`struct s { ... };`).
+    fn bare_specifiers(&mut self, specs: &Specs) -> Result<(), Error> {
+        let pos = self.here();
+        self.advance(); // ;
+        if specs.declares {
+            Ok(())
+        } else {
+            Err(Error::new(pos, "declaration does not declare anything"))
+        }
+    }
+
+    /// A top-level function or declaration; `None` for a declaration that
+    /// only declares types (a typedef, a struct, an enum).
+    fn item(&mut self) -> Result<Option<Item>, Error> {
         if !self.at_decl() {
             return Err(self.unexpected("a declaration"));
         }
-        let (base, storage) = self.specifiers(Ctx::File)?;
-        // Look ahead past the pointers and the name: `(` means a function.
-        let save = self.pos;
-        let ret = self.pointers(base.clone())?;
-        if let (Tok::Ident(name), Tok::Punct("(")) = (self.peek().clone(), self.peek_at(1)) {
-            let pos = self.advance().pos;
-            self.advance(); // (
-            return Ok(Item::Func(self.function(name, ret, storage, pos)?));
+        let specs = self.specifiers(Ctx::File)?;
+        if self.is_punct(";") {
+            self.bare_specifiers(&specs)?;
+            return Ok(None);
         }
-        self.pos = save;
-        Ok(Item::Decl(self.init_declarators(&base, storage, Ctx::File)?))
-    }
-
-    /// After `name(`: the parameters and the body or `;`.
-    fn function(&mut self, name: String, ret: Type, storage: Storage, pos: Pos) -> Result<Function, Error> {
-        let params = self.params()?;
+        let d = self.declarator(&specs.ty, Ctx::File)?;
+        if specs.class == Class::Typedef {
+            self.typedefs(&specs, d, Ctx::File)?;
+            return Ok(None);
+        }
+        if !d.ty.is_func() {
+            if specs.inline {
+                return Err(Error::new(d.pos, "'inline' can only appear on functions"));
+            }
+            return Ok(Some(Item::Decl(self.init_declarators(
+                &specs,
+                Some(d),
+                Ctx::File,
+            )?)));
+        }
+        self.bind_name(&d.name, Name::Object, d.pos)?;
+        let mut d = d;
         let body = if self.eat_punct(";") {
             None
         } else if self.is_punct("{") {
+            let Some((params, scope)) = d.func.take() else {
+                return Err(Error::new(
+                    d.pos,
+                    "a function definition needs its parameter list",
+                ));
+            };
             if let Some(p) = params.iter().find(|p| p.name.is_empty()) {
                 return Err(Error::new(
                     p.pos,
                     "parameter name omitted in a function definition",
                 ));
             }
-            Some(self.block_body()?)
+            // The body's outermost block shares the parameters' scope.
+            self.scopes.push(scope);
+            let body = self.block_body(false);
+            self.scopes.pop();
+            return Ok(Some(Item::Func(function(d, params, &specs, Some(body?)))));
+        } else if self.is_punct(",") {
+            return Err(Error::new(
+                d.pos,
+                "declare a function on its own, not in a list of variables",
+            ));
         } else {
             return Err(self.unexpected("'{' or ';' after the parameter list"));
         };
-        Ok(Function {
-            name,
-            ret,
-            params,
-            is_static: storage == Storage::Static,
-            body,
-            locals: Vec::new(),
-            pos,
-        })
+        let params = d.func.as_ref().map(|(p, _)| p.clone()).unwrap_or_else(|| {
+            // Declared through a typedef of a function type: unnamed parameters.
+            d.ty.func_type()
+                .map(|f| {
+                    f.params
+                        .iter()
+                        .map(|t| Param {
+                            name: String::new(),
+                            ty: t.clone(),
+                            pos: d.pos,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        Ok(Some(Item::Func(function(d, params, &specs, body))))
     }
 
-    /// After `(`, up to and including `)`.
-    fn params(&mut self) -> Result<Vec<Param>, Error> {
-        let mut params = Vec::new();
-        if self.eat_punct(")") {
-            return Ok(params);
-        }
-        if *self.peek() == Tok::Kw(Kw::Void) && matches!(self.peek_at(1), Tok::Punct(")")) {
-            self.advance();
-            self.advance();
-            return Ok(params);
-        }
-        loop {
-            if !self.at_decl() {
-                return Err(self.unexpected("a parameter type"));
-            }
-            let start = self.here();
-            let (base, _) = self.specifiers(Ctx::Param)?;
-            let d = self.declarator(&base, Ctx::Param)?;
-            let pos = if d.name.is_empty() { start } else { d.pos };
-            if params.len() == MAX_PARAMS {
-                return Err(Error::new(
-                    pos,
-                    format!("too many parameters: merlin supports at most {MAX_PARAMS} (a0-a7)"),
-                ));
-            }
-            // C adjusts a parameter declared as an array to a pointer.
-            let ty = d.ty.decay();
-            params.push(Param {
-                name: d.name,
-                ty,
-                pos,
-            });
-            if self.eat_punct(")") {
-                return Ok(params);
-            }
-            if !self.eat_punct(",") {
-                return Err(self.unexpected("',' or ')' in the parameter list"));
-            }
+    /// `{ item* }`, returning the items; in a new scope unless `new_scope`
+    /// is false (a function body continues its parameters' scope).
+    fn block_body(&mut self, new_scope: bool) -> Result<Vec<Stmt>, Error> {
+        if new_scope {
+            self.scoped(|p| p.block_items())
+        } else {
+            self.block_items()
         }
     }
 
-    /// A type name, for casts and `sizeof`: specifiers, pointers, dimensions.
-    fn type_name(&mut self) -> Result<Type, Error> {
-        let (base, _) = self.specifiers(Ctx::TypeName)?;
-        let ty = self.pointers(base)?;
-        if matches!(self.peek(), Tok::Ident(_)) {
-            return Err(self.unexpected("')' after the type name"));
-        }
-        self.array_suffix(ty)
-    }
-
-    /// `{ item* }`, returning the items.
-    fn block_body(&mut self) -> Result<Vec<Stmt>, Error> {
+    fn block_items(&mut self) -> Result<Vec<Stmt>, Error> {
         self.expect_punct("{")?;
         let mut items = Vec::new();
         loop {
@@ -617,23 +1254,34 @@ impl Parser<'_> {
             if *self.peek() == Tok::Eof {
                 return Err(self.unexpected("'}'"));
             }
-            items.push(if self.at_decl() {
-                self.decl(Ctx::Block)?
+            if self.at_decl() {
+                if let Some(s) = self.decl(Ctx::Block)? {
+                    items.push(s);
+                }
             } else {
-                self.stmt()?
-            });
+                items.push(self.stmt()?);
+            }
         }
     }
 
-    /// `int a = 1, *b;`
-    fn decl(&mut self, ctx: Ctx) -> Result<Stmt, Error> {
+    /// `int a = 1, *b;`, or `None` for one that only declares types.
+    fn decl(&mut self, ctx: Ctx) -> Result<Option<Stmt>, Error> {
         let pos = self.here();
-        let (base, storage) = self.specifiers(ctx)?;
-        let decls = self.init_declarators(&base, storage, ctx)?;
-        Ok(Stmt {
+        let specs = self.specifiers(ctx)?;
+        if self.is_punct(";") {
+            self.bare_specifiers(&specs)?;
+            return Ok(None);
+        }
+        let d = self.declarator(&specs.ty, ctx)?;
+        if specs.class == Class::Typedef {
+            self.typedefs(&specs, d, ctx)?;
+            return Ok(None);
+        }
+        let decls = self.init_declarators(&specs, Some(d), ctx)?;
+        Ok(Some(Stmt {
             kind: StmtKind::Decl(decls),
             pos,
-        })
+        }))
     }
 
     // ---- statements ----
@@ -654,17 +1302,25 @@ impl Parser<'_> {
 
     fn stmt_inner(&mut self) -> Result<Stmt, Error> {
         let pos = self.here();
+        if self.at_decl() {
+            return Err(Error::new(
+                pos,
+                "a declaration is not a statement; wrap it in '{ }'",
+            ));
+        }
         let kind = match self.peek().clone() {
-            Tok::Punct("{") => StmtKind::Block(self.block_body()?),
+            Tok::Punct("{") => StmtKind::Block(self.block_body(true)?),
             Tok::Punct(";") => {
                 self.advance();
                 StmtKind::Empty
             }
-            Tok::Kw(k) if k.starts_decl() => {
-                return Err(Error::new(
-                    pos,
-                    "a declaration is not a statement; wrap it in '{ }'",
-                ));
+            Tok::Ident(name) if matches!(self.peek_at(1), Tok::Punct(":")) => {
+                self.advance();
+                self.advance();
+                StmtKind::Label {
+                    name,
+                    body: Box::new(self.stmt()?),
+                }
             }
             Tok::Kw(Kw::If) => {
                 self.advance();
@@ -676,6 +1332,35 @@ impl Parser<'_> {
                     None
                 };
                 StmtKind::If { cond, then, els }
+            }
+            Tok::Kw(Kw::Switch) => {
+                self.advance();
+                let cond = self.paren_expr()?;
+                StmtKind::Switch {
+                    cond,
+                    body: Box::new(self.stmt()?),
+                    cases: Vec::new(),
+                    default: None,
+                }
+            }
+            Tok::Kw(Kw::Case) => {
+                self.advance();
+                let expr = self.cond()?;
+                self.expect_punct(":")?;
+                StmtKind::Case {
+                    expr,
+                    value: 0,
+                    id: 0,
+                    body: Box::new(self.stmt()?),
+                }
+            }
+            Tok::Kw(Kw::Default) => {
+                self.advance();
+                self.expect_punct(":")?;
+                StmtKind::Default {
+                    id: 0,
+                    body: Box::new(self.stmt()?),
+                }
             }
             Tok::Kw(Kw::While) => {
                 self.advance();
@@ -695,41 +1380,7 @@ impl Parser<'_> {
             }
             Tok::Kw(Kw::For) => {
                 self.advance();
-                self.expect_punct("(")?;
-                let init = if self.at_decl() {
-                    Some(Box::new(self.decl(Ctx::ForInit)?))
-                } else if self.eat_punct(";") {
-                    None
-                } else {
-                    let ipos = self.here();
-                    let e = self.expr()?;
-                    self.expect_semi("in 'for' statement")?;
-                    Some(Box::new(Stmt {
-                        kind: StmtKind::Expr(e),
-                        pos: ipos,
-                    }))
-                };
-                let cond = if self.is_punct(";") {
-                    None
-                } else {
-                    Some(self.expr()?)
-                };
-                self.expect_semi("in 'for' statement")?;
-                let step = if self.is_punct(")") {
-                    None
-                } else {
-                    Some(self.expr()?)
-                };
-                if !self.eat_punct(")") {
-                    return Err(self.unexpected("')'"));
-                }
-                let body = Box::new(self.stmt()?);
-                StmtKind::For {
-                    init,
-                    cond,
-                    step,
-                    body,
-                }
+                self.scoped(|p| p.for_rest())?
             }
             Tok::Kw(Kw::Return) => {
                 self.advance();
@@ -751,6 +1402,12 @@ impl Parser<'_> {
                 self.expect_semi("after 'continue'")?;
                 StmtKind::Continue
             }
+            Tok::Kw(Kw::Goto) => {
+                self.advance();
+                let (name, _) = self.expect_ident("a label name after 'goto'")?;
+                self.expect_semi("after 'goto'")?;
+                StmtKind::Goto(name)
+            }
             Tok::Kw(Kw::Else) => return Err(Error::new(pos, "'else' without a matching 'if'")),
             _ => {
                 let e = self.expr()?;
@@ -759,6 +1416,45 @@ impl Parser<'_> {
             }
         };
         Ok(Stmt { kind, pos })
+    }
+
+    /// After `for`: `(init; cond; step) body`, in the `for`'s own scope.
+    fn for_rest(&mut self) -> Result<StmtKind, Error> {
+        self.expect_punct("(")?;
+        let init = if self.at_decl() {
+            self.decl(Ctx::ForInit)?.map(Box::new)
+        } else if self.eat_punct(";") {
+            None
+        } else {
+            let ipos = self.here();
+            let e = self.expr()?;
+            self.expect_semi("in 'for' statement")?;
+            Some(Box::new(Stmt {
+                kind: StmtKind::Expr(e),
+                pos: ipos,
+            }))
+        };
+        let cond = if self.is_punct(";") {
+            None
+        } else {
+            Some(self.expr()?)
+        };
+        self.expect_semi("in 'for' statement")?;
+        let step = if self.is_punct(")") {
+            None
+        } else {
+            Some(self.expr()?)
+        };
+        if !self.eat_punct(")") {
+            return Err(self.unexpected("')'"));
+        }
+        let body = Box::new(self.stmt()?);
+        Ok(StmtKind::For {
+            init,
+            cond,
+            step,
+            body,
+        })
     }
 
     // ---- expressions ----
@@ -875,7 +1571,8 @@ impl Parser<'_> {
                         x: Box::new(x),
                         implicit: false,
                     },
-                    ty,
+                    // A cast's result is a value: qualifiers mean nothing on it.
+                    ty: ty.unqual().clone(),
                     pos,
                 });
             }
@@ -908,6 +1605,42 @@ impl Parser<'_> {
                     // a[i] is *(a + i).
                     let sum = Expr::new(ExprKind::Binary(BinOp::Add, Box::new(e), Box::new(index)), pos);
                     e = Expr::new(ExprKind::Deref(Box::new(sum)), pos);
+                    continue;
+                }
+                Tok::Punct("(") => {
+                    self.enter()?;
+                    self.advance();
+                    let mut args = Vec::new();
+                    if !self.eat_punct(")") {
+                        loop {
+                            args.push(self.assign()?);
+                            if self.eat_punct(")") {
+                                break;
+                            }
+                            if !self.eat_punct(",") {
+                                return Err(self.unexpected("',' or ')' in the argument list"));
+                            }
+                        }
+                    }
+                    // A call is positioned at its callee, as clang reports it.
+                    let pos = e.pos;
+                    e = Expr::new(ExprKind::call(e, args), pos);
+                    continue;
+                }
+                Tok::Punct(p @ ("." | "->")) => {
+                    let arrow = *p == "->";
+                    self.enter()?;
+                    let pos = self.advance().pos;
+                    let (name, _) = self.expect_ident("a member name")?;
+                    e = Expr::new(
+                        ExprKind::Member {
+                            base: Box::new(e),
+                            name,
+                            arrow,
+                            offset: 0,
+                        },
+                        pos,
+                    );
                     continue;
                 }
                 Tok::Punct(p @ ("++" | "--")) => ExprKind::IncDec {
@@ -951,24 +1684,23 @@ impl Parser<'_> {
                 });
             }
             Tok::Ident(name) => {
-                self.advance();
-                if self.eat_punct("(") {
-                    let mut args = Vec::new();
-                    if !self.eat_punct(")") {
-                        loop {
-                            args.push(self.assign()?);
-                            if self.eat_punct(")") {
-                                break;
-                            }
-                            if !self.eat_punct(",") {
-                                return Err(self.unexpected("',' or ')' in the argument list"));
-                            }
-                        }
+                match self.lookup_name(&name) {
+                    // An enumeration constant is just an `int`.
+                    Some(Name::EnumConst(v)) => {
+                        let v = *v;
+                        self.advance();
+                        return Ok(Expr::new(ExprKind::Num(v), pos));
                     }
-                    ExprKind::Call(name, args)
-                } else {
-                    ExprKind::Var { name, var: None }
+                    Some(Name::Typedef(_)) => {
+                        return Err(Error::new(
+                            pos,
+                            format!("unexpected type name '{name}': expected expression"),
+                        ));
+                    }
+                    _ => {}
                 }
+                self.advance();
+                ExprKind::Var { name, var: None }
             }
             Tok::Punct("(") => {
                 // Keep the inner node; parentheses only steer the tree's shape.
@@ -977,6 +1709,27 @@ impl Parser<'_> {
             _ => return Err(self.unexpected("expression")),
         };
         Ok(Expr::new(kind, pos))
+    }
+}
+
+/// A function declaration or definition from its declarator.
+fn function(d: Decl, params: Vec<Param>, specs: &Specs, body: Option<Vec<Stmt>>) -> Function {
+    let ret = match d.ty.func_type() {
+        Some(f) => f.ret.clone(),
+        None => unreachable!("only function declarators get here"),
+    };
+    Function {
+        name: d.name,
+        ret,
+        params,
+        is_static: specs.class == Class::Static,
+        is_inline: specs.inline,
+        is_extern: specs.class == Class::Extern,
+        inline_only: false,
+        body,
+        locals: Vec::new(),
+        ret_ptr: None,
+        pos: d.pos,
     }
 }
 
@@ -1036,8 +1789,13 @@ mod tests {
             ExprKind::SizeofExpr(x) => format!("(sizeof {})", sx(x)),
             ExprKind::Cond(c, a, b) => format!("(? {} {} {})", sx(c), sx(a), sx(b)),
             ExprKind::Comma(a, b) => format!("(, {} {})", sx(a), sx(b)),
-            ExprKind::Call(n, args) => {
-                let mut s = format!("(call {n}");
+            ExprKind::Member {
+                base, name, arrow, ..
+            } => {
+                format!("({} {} {name})", if *arrow { "->" } else { "." }, sx(base))
+            }
+            ExprKind::Call { callee, args, .. } => {
+                let mut s = format!("(call {}", sx(callee));
                 for a in args {
                     s.push(' ');
                     s.push_str(&sx(a));
@@ -1096,6 +1854,11 @@ mod tests {
             StmtKind::Return(None) => "(return)".into(),
             StmtKind::Break => "break".into(),
             StmtKind::Continue => "continue".into(),
+            StmtKind::Switch { cond, body, .. } => format!("(switch {} {})", sx(cond), ss(body)),
+            StmtKind::Case { expr, body, .. } => format!("(case {} {})", sx(expr), ss(body)),
+            StmtKind::Default { body, .. } => format!("(default {})", ss(body)),
+            StmtKind::Label { name, body } => format!("({name}: {})", ss(body)),
+            StmtKind::Goto(name) => format!("(goto {name})"),
         }
     }
 
@@ -1197,7 +1960,334 @@ mod tests {
         assert_eq!(err("static x;"), "1:8: expected a type, found identifier 'x'");
         assert_eq!(
             err("static extern int x;"),
-            "1:8: at most one of 'static' and 'extern' is allowed"
+            "1:8: at most one storage class ('static', 'extern', 'typedef') is allowed"
+        );
+        assert_eq!(ty("_Bool"), "_Bool x");
+        assert_eq!(ty("const int"), "const int x");
+        assert_eq!(ty("int const volatile"), "const volatile int x");
+        assert_eq!(err("_Bool int x;"), "1:1: invalid combination of type specifiers");
+        assert_eq!(
+            err("unsigned _Bool x;"),
+            "1:1: invalid combination of type specifiers"
+        );
+        assert_eq!(err("int;"), "1:4: declaration does not declare anything");
+        assert_eq!(err("const x;"), "1:7: expected a type, found identifier 'x'");
+    }
+
+    /// The statements of the last function of `{globals} int f() { {stmts} }`.
+    fn body_with(globals: &str, stmts: &str) -> Vec<String> {
+        let p = prog(&format!("{globals}\nint f() {{ {stmts} }}"));
+        funcs(&p)
+            .last()
+            .unwrap()
+            .body
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(ss)
+            .collect()
+    }
+
+    #[test]
+    fn function_pointer_declarators() {
+        assert_eq!(globals("int (*f)(int);"), ["int (*f)(int)"]);
+        assert_eq!(
+            globals("void (*table[3])(void); int *(*pick)(char, int *);"),
+            ["void (*table[3])(void)", "int *(*pick)(char, int *)"]
+        );
+        assert_eq!(globals("int (*pa)[4];"), ["int (*pa)[4]"]);
+        assert_eq!(globals("char *const *volatile p;"), ["char *const *volatile p"]);
+        // A function returning a pointer to a function: the parameter list
+        // next to the name is the function's own.
+        let p = prog("int (*get(int which))(char);");
+        assert_eq!(funcs(&p)[0].ret.to_string(), "int (*)(char)");
+        assert_eq!(funcs(&p)[0].params[0].name, "which");
+        // Parameters of function type are pointers.
+        let p = prog("void apply(int f(int), int (*g)(int), const int k);");
+        let ps: Vec<String> = funcs(&p)[0]
+            .params
+            .iter()
+            .map(|p| p.ty.declare(&p.name))
+            .collect();
+        assert_eq!(ps, ["int (*f)(int)", "int (*g)(int)", "const int k"]);
+        // ... and the function's type has no top-level qualifiers on them.
+        assert_eq!(
+            funcs(&p)[0].ty().to_string(),
+            "void (int (*)(int), int (*)(int), int)"
+        );
+        assert_eq!(ex("(int (*)(void))0"), "(cast int (*)(void) 0)");
+        assert_eq!(ex("sizeof(void (*[2])(int))"), "(sizeof void (*[2])(int))");
+        assert_eq!(
+            ex("(const int)x"),
+            "(cast int x)",
+            "a cast's type has no qualifiers"
+        );
+    }
+
+    #[test]
+    fn typedefs() {
+        assert_eq!(
+            globals(
+                "typedef unsigned long size_t; typedef int *ip, arr3[3]; size_t n; ip p; arr3 a; \
+                 const ip cp;"
+            ),
+            ["unsigned long n", "int *p", "int a[3]", "int *const cp"]
+        );
+        assert_eq!(
+            globals("typedef void (*handler)(int); handler table[2]; handler (*pick)(int);"),
+            ["void (*table[2])(int)", "void (*(*pick)(int))(int)"]
+        );
+        // A typedef's name may be reused for a variable in an inner scope,
+        // and then `T * y` multiplies.
+        assert_eq!(
+            body_with(
+                "typedef int T; int x, y;",
+                "T * p; x * y; { int T = 2; T * y; } T q;"
+            ),
+            [
+                "(decl int *p)",
+                "(* x y);",
+                "{(decl int T=2) (* T y);}",
+                "(decl int q)"
+            ]
+        );
+        // Typedefs in a block end with it.
+        assert_eq!(
+            body_with("", "{ typedef char C; C c; } return 0;"),
+            ["{(decl char c)}", "(return 0)"]
+        );
+        assert_eq!(
+            err("typedef int T; int f() { return T; }"),
+            "1:33: unexpected type name 'T': expected expression"
+        );
+        assert_eq!(
+            err("typedef int T; typedef char T;"),
+            "1:29: typedef redefinition with different types ('char' vs 'int')"
+        );
+        prog("typedef int T; typedef int T;");
+        assert_eq!(
+            err("typedef int x = 1;"),
+            "1:15: illegal initializer (only variables can be initialized)"
+        );
+        assert_eq!(
+            err("int T; typedef int T;"),
+            "1:20: redefinition of 'T' as a different kind of symbol (first declared at 1:5)"
+        );
+        // A label may have a typedef's name.
+        assert_eq!(body_with("typedef int L;", "L: return 1;"), ["(L: (return 1))"]);
+    }
+
+    fn global_types(src: &str) -> Vec<Type> {
+        prog(src)
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Decl(ds) => Some(ds),
+                Item::Func(_) => None,
+            })
+            .flatten()
+            .map(|d| d.ty.clone())
+            .collect()
+    }
+
+    #[test]
+    fn structs_and_unions() {
+        assert_eq!(
+            globals("struct point { int x, y; } origin, *pp; union u { char c; int i; } v; struct point q;"),
+            [
+                "struct point origin, struct point *pp",
+                "union u v",
+                "struct point q"
+            ]
+        );
+        let t = global_types("struct point { int x, y; } origin, *pp; struct point q;");
+        // One tag, one type.
+        assert_eq!(t[1].pointee(), Some(&t[0]));
+        assert_eq!(t[2], t[0]);
+        assert_eq!(t[0].size(), Some(8));
+        // A struct may point to itself.
+        let t = global_types("struct node { int v; struct node *next; } n;");
+        let body = t[0].record().unwrap().body().unwrap();
+        assert_eq!(body.members[1].ty.pointee(), Some(&t[0]));
+        // A forward declaration, completed later.
+        let t = global_types("struct s; struct s *p; struct s { char c; } x;");
+        assert_eq!(t[0].pointee(), Some(&t[1]));
+        assert_eq!(t[0].pointee().unwrap().size(), Some(1));
+        // An inner scope's struct is a different type.
+        let p = prog("struct s { int a; } g; int f() { struct s { char c[3]; } l; return sizeof l; }");
+        let StmtKind::Decl(ds) = &funcs(&p)[0].body.as_ref().unwrap()[0].kind else {
+            panic!()
+        };
+        assert_eq!(ds[0].ty.size(), Some(3));
+        // Anonymous structs and nested definitions (whose tags are in scope outside).
+        let t = global_types("struct { struct in { short a; } i; char c; } a; struct in b;");
+        assert_eq!((t[0].size(), t[1].size()), (Some(4), Some(2)));
+        assert_eq!(t[0].to_string(), "struct (anonymous at 1:1)");
+        for (src, msg) in [
+            (
+                "struct s { int a; int a; };",
+                "1:23: duplicate member 'a' (first declared at 1:16)",
+            ),
+            (
+                "struct s { int a; }; struct s { int b; };",
+                "1:29: redefinition of 'struct s'",
+            ),
+            (
+                "struct s { int a; }; union s x;",
+                "1:28: use of 's' with tag type that does not match previous declaration",
+            ),
+            ("struct s { };", "1:10: struct has no members"),
+            (
+                "struct s { int a : 3; };",
+                "1:18: bit-fields are not supported yet",
+            ),
+            (
+                "struct s { struct t m; };",
+                "1:21: field 'm' has incomplete type 'struct t'",
+            ),
+            (
+                "struct s { int f(void); };",
+                "1:16: field 'f' declared as a function",
+            ),
+            (
+                "struct s { int n; int x[]; };",
+                "1:23: flexible array members are not supported yet",
+            ),
+            (
+                "struct s { int; };",
+                "1:15: declaration does not declare anything (anonymous members are not supported)",
+            ),
+            (
+                "struct { int a; };",
+                "1:18: declaration does not declare anything",
+            ),
+            (
+                "struct s { static int a; };",
+                "1:12: 'static' is not allowed here",
+            ),
+            ("struct;", "1:7: expected a name or '{' after 'struct', found ';'"),
+            (
+                "struct s { char c[0x7fffffff]; int i; };",
+                "1:36: struct is too large",
+            ),
+        ] {
+            assert_eq!(err(src), msg, "{src}");
+        }
+    }
+
+    #[test]
+    fn enums() {
+        assert_eq!(
+            globals("enum color { RED, GREEN = 5, BLUE } c; int a[BLUE]; enum color d;"),
+            ["unsigned int c", "int a[6]", "unsigned int d"]
+        );
+        assert_eq!(globals("enum { NEG = -1, ZERO, } e;"), ["int e"]);
+        assert_eq!(
+            body_with("enum { K = 3, L = K * 2 };", "return K + L;"),
+            ["(return (+ 3 6))"]
+        );
+        // An enumeration constant can be hidden by a variable.
+        assert_eq!(
+            body_with("enum { K = 3 };", "int K = 4; return K;"),
+            ["(decl int K=4)", "(return K)"]
+        );
+        for (src, msg) in [
+            (
+                "enum e x;",
+                "1:6: use of undefined 'enum e' (merlin needs an enum's constants before its name)",
+            ),
+            (
+                "enum { A, A };",
+                "1:11: redefinition of enumerator 'A' (first declared at 1:8)",
+            ),
+            (
+                "enum { A = 2147483647, B };",
+                "1:24: enumerator value 2147483648 is not representable as an 'int'",
+            ),
+            ("enum { };", "1:1: use of empty enum"),
+            (
+                "int x; enum { x };",
+                "1:15: redefinition of 'x' as a different kind of symbol (first declared at 1:5)",
+            ),
+            (
+                "int y; enum { A = y };",
+                "1:19: enumerator value is not an integer constant expression",
+            ),
+            ("enum e { A }; enum e { B };", "1:20: redefinition of 'enum e'"),
+            (
+                "enum { A B };",
+                "1:10: expected ',' or '}' in the enum, found identifier 'B'",
+            ),
+        ] {
+            assert_eq!(err(src), msg, "{src}");
+        }
+    }
+
+    #[test]
+    fn switch_case_and_goto() {
+        assert_eq!(
+            ss(&stmt(
+                "switch (x) { case 1: y; case 2: case 3: break; default: z; }"
+            )),
+            "(switch x {(case 1 y;) (case 2 (case 3 break)) (default z;)})"
+        );
+        assert_eq!(ss(&stmt("goto out;")), "(goto out)");
+        assert_eq!(ss(&stmt("out: return 1;")), "(out: (return 1))");
+        assert_eq!(ss(&stmt("a: b: ;")), "(a: (b: ;))");
+        assert_eq!(
+            err("int f() { case 1 x; }"),
+            "1:18: expected ':', found identifier 'x'"
+        );
+        assert_eq!(
+            err("int f() { goto 3; }"),
+            "1:16: expected a label name after 'goto', found '3'"
+        );
+        assert_eq!(
+            err("int f() { default x; }"),
+            "1:19: expected ':', found identifier 'x'"
+        );
+    }
+
+    #[test]
+    fn members_and_calls() {
+        assert_eq!(ex("s.a"), "(. s a)");
+        assert_eq!(ex("p->a.b[2]"), "(* (+ (. (-> p a) b) 2))");
+        assert_eq!(ex("&p->a"), "(& (-> p a))");
+        assert_eq!(ex("p->a++"), "((-> p a) ++)");
+        assert_eq!(ex("*p->q"), "(* (-> p q))");
+        assert_eq!(ex("fp(1)(2)"), "(call (call fp 1) 2)");
+        assert_eq!(ex("(*fp)(1)"), "(call (* fp) 1)");
+        assert_eq!(ex("table[i](x)"), "(call (* (+ table i)) x)");
+        assert_eq!(ex("s.f(1).g"), "(. (call (. s f) 1) g)");
+        assert_eq!(err("int f() { s.1; }"), "1:13: expected a member name, found '1'");
+    }
+
+    #[test]
+    fn qualifiers_and_function_specifiers() {
+        assert_eq!(
+            globals(
+                "const int a = 1; int const b = 2; volatile unsigned *reg; const char *const name = 0; \
+                 int *restrict r;"
+            ),
+            [
+                "const int a=1",
+                "const int b=2",
+                "volatile unsigned int *reg",
+                "const char *const name=0",
+                "int *r"
+            ]
+        );
+        assert_eq!(globals("const int m[2] = {1, 2};"), ["const int m[2]={1 2}"]);
+        let p = prog("static inline int twice(int x) { return 2 * x; } inline int g(void);");
+        assert!(funcs(&p)[0].is_inline && funcs(&p)[0].is_static);
+        assert!(funcs(&p)[1].is_inline && !funcs(&p)[1].is_static);
+        assert_eq!(
+            err("inline int x;"),
+            "1:12: 'inline' can only appear on functions"
+        );
+        assert_eq!(
+            err("int f(inline int x);"),
+            "1:7: 'inline' can only appear on functions"
         );
     }
 
@@ -1219,7 +2309,8 @@ mod tests {
         assert_eq!(err("int a[-1];"), "1:7: array size must be positive, not -1");
         assert_eq!(
             err("int n; int a[n];"),
-            "1:14: array size must be an integer constant expression (literals, operators, casts and sizeof(type))"
+            "1:14: array size must be an integer constant expression \
+             (literals, enum constants, operators, casts and sizeof(type))"
         );
         assert_eq!(
             err("int a[2][];"),
@@ -1231,8 +2322,20 @@ mod tests {
             "1:10: array has incomplete element type 'void'"
         );
         assert_eq!(
-            err("int (*f)(int);"),
-            "1:5: parenthesized declarators (function pointers, pointers to arrays) are not supported yet"
+            err("int f()[2];"),
+            "1:5: function cannot return array type 'int [2]'"
+        );
+        assert_eq!(
+            err("int f()(int);"),
+            "1:5: function cannot return function type 'int (int)'"
+        );
+        assert_eq!(
+            err("int a[2](void);"),
+            "1:6: 'a' declared as array of functions of type 'int (void)'"
+        );
+        assert_eq!(
+            err("int a[1] = {[0] = 1};"),
+            "1:13: designated initializers are not supported yet"
         );
         assert_eq!(
             err("int x, f(int);"),
@@ -1364,7 +2467,9 @@ mod tests {
         let StmtKind::Expr(e) = stmt("f(1, 2u, 0xffffffff, 'a', 3L, \"hey\");").kind else {
             panic!()
         };
-        let ExprKind::Call(_, args) = e.kind else { panic!() };
+        let ExprKind::Call { args, .. } = e.kind else {
+            panic!()
+        };
         let tys: Vec<String> = args.iter().map(|a| a.ty.to_string()).collect();
         assert_eq!(
             tys,

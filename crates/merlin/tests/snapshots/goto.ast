@@ -1,0 +1,216 @@
+Function int find(int *a, int n, int want) <4:5>
+  Param #0 int *a <4:15>
+  Param #1 int n <4:22>
+  Param #2 int want <4:29>
+  Local #3 int i <5:9>
+  Decl <5:5>
+    Var int i #3 <5:9>
+  For <6:5>
+    ExprStmt <6:10>
+      Assign : int <6:12>
+        Var i #3 : int <6:10>
+        Num 0 : int <6:14>
+    Binary < : int <6:19>
+      Var i #3 : int <6:17>
+      Var n #1 : int <6:21>
+    Post++ : int <6:25>
+      Var i #3 : int <6:24>
+    If <7:9>
+      Binary == : int <7:18>
+        Deref : int <7:14>
+          Binary + : int * <7:14>
+            Var a #0 : int * <7:13>
+            Var i #3 : int <7:15>
+        Var want #2 : int <7:21>
+      Goto found <8:13>
+  Return <9:5>
+    Unary - : int <9:12>
+      Num 1 : int <9:13>
+  Label found <10:1>
+    Return <11:5>
+      Var i #3 : int <11:12>
+Function int count_down(int n) <14:5>
+  Param #0 int n <14:20>
+  Local #1 int steps <15:9>
+  Decl <15:5>
+    Var int steps #1 <15:9>
+      Num 0 : int <15:17>
+  Label again <16:1>
+    If <17:5>
+      Binary > : int <17:11>
+        Var n #0 : int <17:9>
+        Num 0 : int <17:13>
+      Block <17:16>
+        ExprStmt <18:9>
+          Post-- : int <18:10>
+            Var n #0 : int <18:9>
+        ExprStmt <19:9>
+          Post++ : int <19:14>
+            Var steps #1 : int <19:9>
+        Goto again <20:9>
+  Return <22:5>
+    Var steps #1 : int <22:12>
+Function int nested_exit(void) <25:5>
+  Local #0 int i <26:9>
+  Local #1 int j <26:12>
+  Local #2 int hits <26:15>
+  Decl <26:5>
+    Var int i #0 <26:9>
+    Var int j #1 <26:12>
+    Var int hits #2 <26:15>
+      Num 0 : int <26:22>
+  For <27:5>
+    ExprStmt <27:10>
+      Assign : int <27:12>
+        Var i #0 : int <27:10>
+        Num 0 : int <27:14>
+    Binary < : int <27:19>
+      Var i #0 : int <27:17>
+      Num 10 : int <27:21>
+    Post++ : int <27:26>
+      Var i #0 : int <27:25>
+    For <28:9>
+      ExprStmt <28:14>
+        Assign : int <28:16>
+          Var j #1 : int <28:14>
+          Num 0 : int <28:18>
+      Binary < : int <28:23>
+        Var j #1 : int <28:21>
+        Num 10 : int <28:25>
+      Post++ : int <28:30>
+        Var j #1 : int <28:29>
+      Block <28:34>
+        ExprStmt <29:13>
+          Post++ : int <29:17>
+            Var hits #2 : int <29:13>
+        If <30:13>
+          Binary == : int <30:23>
+            Binary * : int <30:19>
+              Var i #0 : int <30:17>
+              Var j #1 : int <30:21>
+            Num 12 : int <30:26>
+          Goto out <31:17>
+  Label out <33:1>
+    Return <34:5>
+      Var hits #2 : int <34:12>
+Function int into_loop(void) <37:5>
+  Local #0 int i <38:9>
+  Local #1 int s <38:16>
+  Decl <38:5>
+    Var int i #0 <38:9>
+      Num 5 : int <38:13>
+    Var int s #1 <38:16>
+      Num 0 : int <38:20>
+  Goto inside <39:5>
+  While <40:5>
+    Binary < : int <40:14>
+      Var i #0 : int <40:12>
+      Num 8 : int <40:16>
+    Block <40:19>
+      ExprStmt <41:9>
+        Assign += : int <41:11>
+          Var s #1 : int <41:9>
+          Num 100 : int <41:14>
+      Label inside <42:5>
+        ExprStmt <43:9>
+          Assign += : int <43:11>
+            Var s #1 : int <43:9>
+            Var i #0 : int <43:14>
+      ExprStmt <44:9>
+        Post++ : int <44:10>
+          Var i #0 : int <44:9>
+  Return <46:5>
+    Var s #1 : int <46:12>
+Function int again_and_out(int x) <50:5>
+  Param #0 int x <50:23>
+  If <51:5>
+    Var x #0 : int <51:9>
+    Goto out <52:9>
+  ExprStmt <53:5>
+    Assign : int <53:7>
+      Var x #0 : int <53:5>
+      Num 10 : int <53:9>
+  Label again <54:1>
+    ExprStmt <55:5>
+      Post++ : int <55:6>
+        Var x #0 : int <55:5>
+  Label out <56:1>
+    If <57:5>
+      Binary < : int <57:11>
+        Var x #0 : int <57:9>
+        Num 3 : int <57:13>
+      Goto again <58:9>
+  Return <59:5>
+    Var x #0 : int <59:12>
+Function int main(void) <62:5>
+  Local #0 int ok <63:9>
+  Local #1 int a[5] <64:9>
+  Decl <63:5>
+    Var int ok #0 <63:9>
+      Num 0 : int <63:14>
+  Decl <64:5>
+    Var int a[5] #1 <64:9>
+      InitList <64:16>
+        Num 4 : int <64:17>
+        Num 8 : int <64:20>
+        Num 15 : int <64:23>
+        Num 16 : int <64:27>
+        Num 23 : int <64:31>
+  ExprStmt <65:5>
+    Assign += : int <65:8>
+      Var ok #0 : int <65:5>
+      Binary == : int <65:26>
+        Call find : int <65:11>
+          ImplicitCast : int * <65:16>
+            Var a #1 : int [5] <65:16>
+          Num 5 : int <65:19>
+          Num 15 : int <65:22>
+        Num 2 : int <65:29>
+  ExprStmt <66:5>
+    Assign += : int <66:8>
+      Var ok #0 : int <66:5>
+      Binary == : int <66:26>
+        Call find : int <66:11>
+          ImplicitCast : int * <66:16>
+            Var a #1 : int [5] <66:16>
+          Num 5 : int <66:19>
+          Num 42 : int <66:22>
+        Unary - : int <66:29>
+          Num 1 : int <66:30>
+  ExprStmt <67:5>
+    Assign += : int <67:8>
+      Var ok #0 : int <67:5>
+      Binary == : int <67:25>
+        Call count_down : int <67:11>
+          Num 7 : int <67:22>
+        Num 7 : int <67:28>
+  ExprStmt <68:5>
+    Assign += : int <68:8>
+      Var ok #0 : int <68:5>
+      Binary == : int <68:25>
+        Call nested_exit : int <68:11>
+        Num 27 : int <68:28>
+  ExprStmt <69:5>
+    Assign += : int <69:8>
+      Var ok #0 : int <69:5>
+      Binary == : int <69:23>
+        Call into_loop : int <69:11>
+        Num 218 : int <69:26>
+  ExprStmt <70:5>
+    Assign += : int <70:8>
+      Var ok #0 : int <70:5>
+      Binary == : int <70:28>
+        Call again_and_out : int <70:11>
+          Num 1 : int <70:25>
+        Num 3 : int <70:31>
+  ExprStmt <71:5>
+    Assign += : int <71:8>
+      Var ok #0 : int <71:5>
+      Binary == : int <71:28>
+        Call again_and_out : int <71:11>
+          Num 0 : int <71:25>
+        Num 11 : int <71:31>
+  Label end <72:1>
+    Empty <72:5>
+  Return <73:5>
+    Var ok #0 : int <73:12>

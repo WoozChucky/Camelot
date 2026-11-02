@@ -110,8 +110,14 @@ pub fn eval(e: &Expr) -> Option<Const> {
         }
         ExprKind::Cast { x, .. } => {
             let v = eval(x)?;
-            match (&e.ty, v) {
+            match (e.ty.unqual(), v) {
                 (Type::Int(k), Int(v, _)) => Some(Int(k.wrap(v), *k)),
+                // A non-null address is true.
+                (Type::Int(IntKind::Bool), Addr { base: Some(_), .. }) => Some(Int(1, IntKind::Bool)),
+                // A plain number used as an address converts back: that
+                // makes `(unsigned)&((struct s *)0)->field` (offsetof) a
+                // constant.
+                (Type::Int(k), Addr { base: None, offset }) => Some(Int(k.wrap(offset), *k)),
                 (Type::Ptr(_), Int(v, _)) => Some(Addr {
                     base: None,
                     offset: IntKind::UInt.wrap(v),
@@ -120,33 +126,53 @@ pub fn eval(e: &Expr) -> Option<Const> {
                 _ => None,
             }
         }
-        // Addresses, only in a checked tree.
-        ExprKind::Str(bytes) => Some(Addr {
-            base: Some(Base::Str(bytes.clone())),
-            offset: 0,
-        }),
-        // An array names its address; any other variable's value is not constant.
+        // Addresses, only in a checked tree. An array or a function stands
+        // for its address; any other object's value is not constant.
+        ExprKind::Str(_) | ExprKind::Var { .. } | ExprKind::Deref(_) | ExprKind::Member { .. }
+            if e.ty.is_array() || e.ty.is_func() =>
+        {
+            addr_of(e)
+        }
+        ExprKind::Addr(x) => addr_of(x),
+        _ => None,
+    }
+}
+
+/// The address of an lvalue, if it is an address constant: a global object
+/// (or a member or element of one, at a constant offset), a string literal,
+/// or what a constant pointer points to.
+fn addr_of(e: &Expr) -> Option<Const> {
+    match &e.kind {
         ExprKind::Var {
             var: Some(VarRef::Global(sym)),
             ..
-        } if e.ty.is_array() => Some(Addr {
+        } => Some(Const::Addr {
             base: Some(Base::Sym(sym.clone())),
             offset: 0,
         }),
-        // `*p` of array type is the array at p: its address, like any array.
-        ExprKind::Deref(p) if e.ty.is_array() => eval(p),
-        ExprKind::Addr(x) => match &x.kind {
-            ExprKind::Var {
-                var: Some(VarRef::Global(sym)),
-                ..
-            } => Some(Addr {
-                base: Some(Base::Sym(sym.clone())),
-                offset: 0,
-            }),
-            ExprKind::Deref(p) => eval(p),
-            ExprKind::Str(_) => eval(x),
-            _ => None,
+        ExprKind::Str(bytes) => Some(Const::Addr {
+            base: Some(Base::Str(bytes.clone())),
+            offset: 0,
+        }),
+        ExprKind::Deref(p) => match eval(p)? {
+            a @ Const::Addr { .. } => Some(a),
+            Const::Int(..) => None,
         },
+        ExprKind::Member {
+            base,
+            arrow,
+            offset: member,
+            ..
+        } => {
+            let at = if *arrow { eval(base)? } else { addr_of(base)? };
+            match at {
+                Const::Addr { base, offset } => Some(Const::Addr {
+                    base,
+                    offset: offset + i64::from(*member),
+                }),
+                Const::Int(..) => None,
+            }
+        }
         _ => None,
     }
 }
