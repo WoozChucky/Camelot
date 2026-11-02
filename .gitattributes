@@ -7,4 +7,5 @@ tests/riscv-tests/rv32* binary
 *.h text eol=lf
 *.s text eol=lf
 *.ld text eol=lf
+*.ast text eol=lf
 kernel/kernel.elf.clang-version text eol=lf
