@@ -58,7 +58,10 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "elf32",
  "excalibur",
  "grail",
  "merlin-as",
+ "merlin-ld",
+ "merlin-objdump",
 ]

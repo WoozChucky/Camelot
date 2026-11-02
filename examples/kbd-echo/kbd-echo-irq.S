@@ -14,11 +14,16 @@
 #
 #   cargo run --release -p grail -- --fb examples/kbd-echo/kbd-echo-irq.elf
 #
-# Built with clang for now; merlin-as will assemble this same file once it exists:
+# Built with our own tools by `cargo xtask examples kbd-echo-irq`, which does the same as
 #
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -nostdlib -static \
-#         -fuse-ld=lld -T examples/kbd-echo/link.ld examples/kbd-echo/kbd-echo-irq.S \
-#         -o examples/kbd-echo/kbd-echo-irq.elf
+#   merlin-as examples/kbd-echo/kbd-echo-irq.S -o kbd-echo-irq.o
+#   merlin-ld -T examples/kbd-echo/link.ld kbd-echo-irq.o -o examples/kbd-echo/kbd-echo-irq.elf
+#
+# Reference build with LLVM, only for comparison:
+#
+#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -T examples/kbd-echo/link.ld examples/kbd-echo/kbd-echo-irq.S -o kbd-echo-irq.elf
 
     .equ KBD_BASE,      0x30001000
     .equ KBD_DATA,      4               # pops one event
@@ -98,16 +103,15 @@ trap:
 1:  mret
 
 done:
-    # xcal.dbg s0: how many interrupts were taken.
-    .insn i 0x0b, 0, x0, s0, 0
-    # xcal.halt zero
-    .insn i 0x0b, 1, x0, zero, 0
+    # How many interrupts were taken.
+    xcal.dbg s0
+    xcal.halt zero
 
 fail:
-    # xcal.dbg t0 (the unexpected mcause), then xcal.halt with code 1.
-    .insn i 0x0b, 0, x0, t0, 0
+    # Show the unexpected mcause, then halt with exit code 1.
+    xcal.dbg t0
     li    t0, 1
-    .insn i 0x0b, 1, x0, t0, 0
+    xcal.halt t0
 
 # putkey(a0 = key code): ASCII as is, 0x80 and up as [hex].
 putkey:

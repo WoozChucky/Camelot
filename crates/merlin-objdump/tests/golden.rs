@@ -13,19 +13,31 @@ use std::path::Path;
 /// (golden file name, input relative to the repository root, options).
 /// Keep in sync with scripts/gen-objdump-golden.sh.
 const CASES: &[(&str, &str, &[&str])] = &[
-    ("hello-elf.d", "examples/hello/hello.elf", &["-d"]),
+    (
+        "hello-elf.d",
+        "crates/merlin-objdump/tests/fixtures/hello.elf",
+        &["-d"],
+    ),
     (
         "hello-elf.d-no-raw",
-        "examples/hello/hello.elf",
+        "crates/merlin-objdump/tests/fixtures/hello.elf",
         &["-d", "--no-show-raw-insn"],
     ),
     (
         "hello-elf.d-no-aliases",
-        "examples/hello/hello.elf",
+        "crates/merlin-objdump/tests/fixtures/hello.elf",
         &["-d", "-M", "no-aliases"],
     ),
-    ("hello-elf.x", "examples/hello/hello.elf", &["-x"]),
-    ("hello-elf.s", "examples/hello/hello.elf", &["-s"]),
+    (
+        "hello-elf.x",
+        "crates/merlin-objdump/tests/fixtures/hello.elf",
+        &["-x"],
+    ),
+    (
+        "hello-elf.s",
+        "crates/merlin-objdump/tests/fixtures/hello.elf",
+        &["-s"],
+    ),
     (
         "hello-o.dr",
         "crates/merlin-objdump/tests/fixtures/hello.o",
@@ -244,7 +256,10 @@ fn hello_elf_every_instruction() {
     let llvm =
         std::fs::read_to_string(root().join("crates/merlin-objdump/tests/golden/hello-elf.d-no-raw.txt"))
             .unwrap();
-    let ours = run("examples/hello/hello.elf", &["-d", "--no-show-raw-insn"]);
+    let ours = run(
+        "crates/merlin-objdump/tests/fixtures/hello.elf",
+        &["-d", "--no-show-raw-insn"],
+    );
     let insns = |text: &str| -> Vec<(u32, String)> {
         text.lines()
             .filter_map(|l| {

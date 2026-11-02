@@ -247,7 +247,9 @@ fn reads_linked_executable() {
         &0x0001_0117u32.to_le_bytes()
     );
     assert_eq!(elf.symbol("_start"), Some(0x8000_0000));
-    assert_eq!(elf.symbol("puts"), Some(0x8000_001c));
+    // After the 8-byte `call puts` and the two Xcal instructions (merlin-ld does
+    // no relaxation, so the call stays auipc + jalr).
+    assert_eq!(elf.symbol("puts"), Some(0x8000_0020));
 }
 
 #[test]

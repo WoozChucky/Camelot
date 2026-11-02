@@ -17,8 +17,12 @@
 //! the loadable bytes with `name.lld.elf`, and merlin-objdump's disassembly of
 //! the result with `name.objdump.txt`.
 //!
-//! `hello/hello.S` and `hello/link.ld` are copied from `examples/hello` first,
-//! so the fixture always follows the example (a test checks the copies).
+//! The fixtures in [`FROM_EXAMPLES`] (`hello`, `multiobj`) are copied from
+//! `examples/` first, so they always follow the examples (a test checks the
+//! copies). Their ld.lld links are the references the examples built with our
+//! own tools are compared with (`crates/xtask/tests/examples.rs`). Every
+//! source is assembled with `-include examples/xcal.inc`, which teaches clang
+//! the Xcal mnemonics the examples use.
 //!
 //! Objects are built with `-mno-relax` and linked with `--no-relax`: merlin-ld
 //! does no linker relaxation, and ld.lld must not shrink code either or the
@@ -33,6 +37,14 @@ use std::process::Command;
 /// clang flags for every fixture object, followed by [`NO_RELAX`] unless the
 /// source asks for relaxation.
 pub const ASM_FLAGS: &[&str] = &["--target=riscv32", "-march=rv32im_zicsr", "-mabi=ilp32", "-c"];
+
+/// Fixture directories copied from `examples/<same name>`, with the files
+/// copied (the sources and the linker script; objects are linked in name
+/// order, which is also each example's source order).
+pub const FROM_EXAMPLES: &[(&str, &[&str])] = &[
+    ("hello", &["hello.S", "link.ld"]),
+    ("multiobj", &["main.S", "print.S", "link.ld"]),
+];
 
 /// The default: no `R_RISCV_RELAX` or `R_RISCV_ALIGN` in the object.
 pub const NO_RELAX: &str = "-mno-relax";
@@ -111,11 +123,15 @@ fn file_name(p: &Path) -> OsString {
 /// written.
 pub fn run(fixtures: &Path, examples: &Path, tools: &Tools) -> Result<Vec<PathBuf>, String> {
     let mut written = Vec::new();
-    let hello = fixtures.join("hello");
-    for f in ["hello.S", "link.ld"] {
-        std::fs::copy(examples.join("hello").join(f), hello.join(f))
-            .map_err(|e| format!("copying examples/hello/{f}: {e}"))?;
+    for (dir, copied) in FROM_EXAMPLES {
+        let to = fixtures.join(dir);
+        std::fs::create_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
+        for f in *copied {
+            std::fs::copy(examples.join(dir).join(f), to.join(f))
+                .map_err(|e| format!("copying examples/{dir}/{f}: {e}"))?;
+        }
     }
+    let xcal = examples.join("xcal.inc");
 
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(fixtures)
         .map_err(|e| format!("{}: {e}", fixtures.display()))?
@@ -130,6 +146,7 @@ pub fn run(fixtures: &Path, examples: &Path, tools: &Tools) -> Result<Vec<PathBu
             let obj = src.with_extension("o");
             let source = std::fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?;
             let mut args: Vec<OsString> = asm_flags(&source).into_iter().map(OsString::from).collect();
+            args.extend(["-include".into(), xcal.clone().into_os_string()]);
             args.extend([file_name(&src), "-o".into(), file_name(&obj)]);
             tools.exec(&tools.clang, &args, dir)?;
             written.push(obj);
@@ -196,6 +213,20 @@ mod tests {
         );
         assert_eq!(script_objects("/* a comment */ /* objects: x.o */"), None);
         assert_eq!(script_objects("SECTIONS {}"), None);
+    }
+
+    #[test]
+    fn copied_examples_follow_the_examples_table() {
+        for (dir, files) in FROM_EXAMPLES {
+            let ex = crate::examples::find(dir).unwrap();
+            let mut want = ex.sources.to_vec();
+            want.extend(ex.script);
+            assert_eq!(*files, want.as_slice(), "{dir}");
+            // ld.lld gets the objects in name order: it must be the build's order.
+            let mut sorted = ex.sources.to_vec();
+            sorted.sort_unstable();
+            assert_eq!(sorted, ex.sources, "{dir}");
+        }
     }
 
     #[test]

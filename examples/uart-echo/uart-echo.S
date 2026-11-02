@@ -7,11 +7,16 @@
 # Receiving EOT (0x04, not echoed) prints the interrupt count with xcal.dbg and halts
 # with exit code 0. Any unexpected trap halts with exit code 1.
 #
-# Built with clang for now; merlin-as will assemble this same file once it exists:
+# Built with our own tools by `cargo xtask examples uart-echo`, which does the same as
 #
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -nostdlib -static \
-#         -fuse-ld=lld -T examples/uart-echo/link.ld examples/uart-echo/uart-echo.S \
-#         -o examples/uart-echo/uart-echo.elf
+#   merlin-as examples/uart-echo/uart-echo.S -o uart-echo.o
+#   merlin-ld -T examples/uart-echo/link.ld uart-echo.o -o examples/uart-echo/uart-echo.elf
+#
+# Reference build with LLVM, only for comparison:
+#
+#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -T examples/uart-echo/link.ld examples/uart-echo/uart-echo.S -o uart-echo.elf
 #
 # Try it: printf 'hello\n\004' | grail examples/uart-echo/uart-echo.elf
 
@@ -91,13 +96,12 @@ trap:
     mret
 
 done:
-    # xcal.dbg s0: how many interrupts were taken (one per byte, EOT included).
-    .insn i 0x0b, 0, x0, s0, 0
-    # xcal.halt zero
-    .insn i 0x0b, 1, x0, zero, 0
+    # How many interrupts were taken (one per byte, EOT included).
+    xcal.dbg s0
+    xcal.halt zero
 
 fail:
-    # xcal.dbg t0 (the unexpected mcause), then xcal.halt with code 1.
-    .insn i 0x0b, 0, x0, t0, 0
+    # Show the unexpected mcause, then halt with exit code 1.
+    xcal.dbg t0
     li    t0, 1
-    .insn i 0x0b, 1, x0, t0, 0
+    xcal.halt t0

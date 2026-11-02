@@ -6,9 +6,15 @@
 #
 # 1. Assembles the fixture sources in crates/merlin-objdump/tests/fixtures/
 #    into .o files with clang (hello.o is examples/hello/hello.S), and links
-#    linked.elf with ld.lld and linked.ld.
-# 2. Runs llvm-objdump over those objects, examples/hello/hello.elf and a few
-#    riscv-tests ELFs, writing tests/golden/<name>.txt.
+#    linked.elf with ld.lld and linked.ld. hello.elf is examples/hello built
+#    by clang and ld.lld with linker relaxation (what examples/hello/hello.elf
+#    was before our own tools built it): an executable with everything ld.lld
+#    writes (.riscv.attributes, .comment, PT_GNU_STACK, mapping symbols).
+# 2. Runs llvm-objdump over those files and a few riscv-tests ELFs, writing
+#    tests/golden/<name>.txt.
+#
+# hello.S writes the Xcal instructions as mnemonics, which clang learns from
+# examples/xcal.inc (-include).
 #
 # Paths are passed relative to the repository root because llvm-objdump
 # prints them in its header line; tests/golden.rs uses the same paths.
@@ -24,8 +30,9 @@ mkdir -p "$OUT"
 CC="clang --target=riscv32 -march=rv32im_zicsr_zifencei -mabi=ilp32 -c"
 $CC -mno-relax "$FIX/isa.S" -o "$FIX/isa.o"
 $CC "$FIX/relocs.S" -o "$FIX/relocs.o"
-$CC examples/hello/hello.S -o "$FIX/hello.o"
-$CC -mno-relax "$FIX/misc.S" -o "$FIX/misc.o"
+$CC -include examples/xcal.inc examples/hello/hello.S -o "$FIX/hello.o"
+clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -nostdlib -static -fuse-ld=lld \
+  -include examples/xcal.inc -T examples/hello/link.ld examples/hello/hello.S -o "$FIX/hello.elf"
 # -fdebug-compilation-dir keeps the build directory out of the debug info.
 $CC -O1 -g -fdebug-compilation-dir=. "$FIX/debug.c" -o "$FIX/debug.o"
 $CC -mno-relax "$FIX/linked.S" -o "$FIX/linked.o"
@@ -38,11 +45,11 @@ gen() { # golden-name input llvm-objdump-args...
   llvm-objdump "$@" "$input" > "$OUT/$name.txt"
 }
 
-gen hello-elf.d                examples/hello/hello.elf -d
-gen hello-elf.d-no-raw         examples/hello/hello.elf -d --no-show-raw-insn
-gen hello-elf.d-no-aliases     examples/hello/hello.elf -d -M no-aliases
-gen hello-elf.x                examples/hello/hello.elf -x
-gen hello-elf.s                examples/hello/hello.elf -s
+gen hello-elf.d                "$FIX/hello.elf" -d
+gen hello-elf.d-no-raw         "$FIX/hello.elf" -d --no-show-raw-insn
+gen hello-elf.d-no-aliases     "$FIX/hello.elf" -d -M no-aliases
+gen hello-elf.x                "$FIX/hello.elf" -x
+gen hello-elf.s                "$FIX/hello.elf" -s
 gen hello-o.dr                 "$FIX/hello.o" -dr
 gen hello-o.x                  "$FIX/hello.o" -x
 gen isa-o.d                    "$FIX/isa.o" -d

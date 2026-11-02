@@ -1,10 +1,16 @@
 # Framebuffer test pattern for Grail: eight vertical color bars inside an 8-pixel
-# grey border, presented once, then halt. Built with clang for now; merlin-as will
-# assemble this same file once it exists.
+# grey border, presented once, then halt.
 #
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -nostdlib -static \
-#         -fuse-ld=lld -T examples/colorbars/link.ld examples/colorbars/colorbars.S \
-#         -o examples/colorbars/colorbars.elf
+# Built with our own tools by `cargo xtask examples colorbars`, which does the same as
+#
+#   merlin-as examples/colorbars/colorbars.S -o colorbars.o
+#   merlin-ld -T examples/colorbars/link.ld colorbars.o -o examples/colorbars/colorbars.elf
+#
+# Reference build with LLVM, only for comparison:
+#
+#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -T examples/colorbars/link.ld examples/colorbars/colorbars.S -o colorbars.elf
 #
 # Run it in a window (Windows):  grail --fb examples/colorbars/colorbars.elf
 # or headless, dumping frames:   grail --fb-dump out examples/colorbars/colorbars.elf
@@ -63,8 +69,8 @@ store:
     sw    t0, FB_CTRL(s0)           # display on
     sw    t0, FB_PRESENT(s0)        # show this frame now
 
-    # xcal.halt zero: stop the machine with exit code 0.
-    .insn i 0x0b, 1, x0, zero, 0
+    # Stop the machine with exit code 0.
+    xcal.halt zero
 
     .section .rodata
     .balign 4
