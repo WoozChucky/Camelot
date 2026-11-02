@@ -81,7 +81,12 @@ int kvformat(kputc_fn put, void *ctx, const char *fmt, va_list ap) {
 
         char conv = *fmt;
         if (conv == '\0') {
-            emit(&o, '%'); /* lone '%' at the end */
+            /* An incomplete conversion at the end ("%", "%5", "%l"): print
+             * it as written. */
+            emit(&o, '%');
+            while (spec < fmt) {
+                emit(&o, *spec++);
+            }
             break;
         }
         fmt++;

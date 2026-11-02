@@ -158,7 +158,7 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 | 0x0000_1000 - 0x0000_1FFF | Boot ROM (reset vector 0x1000, jumps to the program's entry point; the other harts park at 0x1020, see "Boot"; with no program, the disk loader at 0x1100 boots from disk 0, see "Boot from disk") |
 | 0x0200_0000 - 0x0200_FFFF | CLINT: hart `i`'s msip @+0x0 + 4·i, hart `i`'s mtimecmp @+0x4000 + 8·i, mtime @+0xBFF8 (shared) |
 | 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART, keyboard, disks, pointer and network cards (section 7.1) |
-| 0x1000_0000 - 0x1000_00FF | UART, 16550-compatible subset (THR/RBR @+0, IER @+1, IIR @+2, LSR @+5) |
+| 0x1000_0000 - 0x1000_00FF | UART, 16550-compatible subset (THR/RBR @+0, IER @+1, IIR/FCR @+2, LCR @+3, MCR @+4, LSR @+5, SCR @+7) |
 | 0x1000_1000 - 0x1000_8FFF | Block devices: disk `i` at 0x1000_1000 + 0x1000·i, up to 8 (`--disk`; Xcal, section 9.6). Only the pages of attached disks are mapped |
 | 0x1000_9000 - 0x1000_CFFF | Network cards: card `i` at 0x1000_9000 + 0x1000·i, up to 4 (`--net`; Xcal, section 9.8). Only the pages of attached cards are mapped |
 | 0x0010_0000 | Test/exit device: write 0x5555 = pass/exit, 0x3333 = fail (used by riscv-tests) |
@@ -220,7 +220,7 @@ The whole 64 KiB area is the boot block's to use (stack, buffers); the RAM below
 
 Inter-processor interrupts: writing 1 to hart `i`'s `msip` sets its `mip.MSIP`; it stays pending until software writes 0 there (the hart that takes it, typically). Any hart may write any `msip`, its own included.
 
-UART: writing THR sends the byte to the machine's console, which for the `grail` command is the host terminal (stdout); RBR is fed from the console's input (host stdin). Each machine has its own console, so a host can run several machines in one process. LSR bit 5 (THRE) always 1, bit 0 (DR) set when input is available. IER bit 0 (ERBFI) enables the "received data available" interrupt: the UART holds PLIC source 1 high while IER bit 0 and LSR.DR are both set, so reading RBR until DR clears lowers it. IIR (@+2, read) reports 0x04 while that interrupt is asserted, else 0x01 (none). The other IER bits are stored but raise nothing (no transmit, line-status or modem interrupts).
+UART: writing THR sends the byte to the machine's console, which for the `grail` command is the host terminal (stdout); RBR is fed from the console's input (host stdin). Each machine has its own console, so a host can run several machines in one process. LSR bit 5 (THRE) always 1, bit 0 (DR) set when input is available. IER bit 0 (ERBFI) enables the "received data available" interrupt: the UART holds PLIC source 1 high while IER bit 0 and LSR.DR are both set, so reading RBR until DR clears lowers it. IIR (@+2, read) reports 0x04 while that interrupt is asserted, else 0x01 (none). The other IER bits are stored but raise nothing (no transmit, line-status or modem interrupts). LCR (@+3), MCR (@+4) and SCR (@+7) hold what is written and read it back, with no other effect except LCR bit 7 (DLAB): while it is set, +0 and +1 are the divisor latch, whose writes are ignored and which reads as 0 (there is no baud rate to set), so a driver writes LCR (8N1 is 0x03, DLAB clear) before IER, as `kernel/uart.c` does. Writes to FCR (@+2) are ignored. Registers are 8-bit: other access sizes are access faults.
 
 ### 7.1 PLIC
 

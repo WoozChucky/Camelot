@@ -767,4 +767,25 @@ mod tests {
             "captured bytes do not reach the sink"
         );
     }
+
+    #[test]
+    fn uart_line_control_and_divisor_latch() {
+        // Spec section 7: LCR, MCR and SCR read back what was written; with
+        // LCR.DLAB set, +0 and +1 are the divisor latch (writes ignored,
+        // reads 0), so IER keeps its value.
+        let mut u = Uart::default();
+        for (off, v) in [(3, 0x03), (4, 0x0b), (7, 0x5a)] {
+            u.write(off, 1, v).unwrap();
+            assert_eq!(u.read(off, 1).unwrap(), v, "+{off}");
+        }
+        u.write(1, 1, 0x01).unwrap();
+        u.write(3, 1, 0x83).unwrap();
+        u.write(1, 1, 0x00).unwrap();
+        assert_eq!((u.read(0, 1).unwrap(), u.read(1, 1).unwrap()), (0, 0));
+        u.write(3, 1, 0x03).unwrap();
+        assert_eq!(u.read(1, 1).unwrap(), 0x01, "IER untouched while DLAB was set");
+        // FCR (+2 on write) is ignored; +2 reads IIR.
+        u.write(2, 1, 0xc7).unwrap();
+        assert_eq!(u.read(2, 1).unwrap(), 0x01);
+    }
 }

@@ -333,15 +333,21 @@ fn entry_clears_bss() {
 #[test]
 fn early_trap_reports_and_halts() {
     // Replace start()'s first instruction (M-mode, before machine_vec is
-    // installed) with an illegal one (all zeros): the early trap handler
-    // prints mcause, mepc, mtval and exits with 0xff.
+    // installed) with an illegal one: the early trap handler prints mcause,
+    // mepc, mtval and exits with 0xff. The word is not 0, so the report
+    // shows that mtval is really read (it holds the instruction's bits).
+    let illegal = 0xffff_ffff;
+    assert_eq!(excalibur::decode(illegal), excalibur::Inst::Illegal(illegal));
     let (mut m, elf) = load_committed();
     let start = sym(&elf, "start");
-    m.cpu.bus.load(start, &[0, 0, 0, 0]).unwrap();
+    m.cpu.bus.load(start, &illegal.to_le_bytes()).unwrap();
     let r = m.run(Some(BOOT_MAX_STEPS), |_| {});
     let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
-    // mcause: illegal instruction; mtval: the instruction bits.
-    assert_eq!(dbg_values(&out), m_trap_report(2, start, 0), "output:\n{out}");
+    assert_eq!(
+        dbg_values(&out),
+        m_trap_report(ILLEGAL_INSTRUCTION, start, illegal),
+        "output:\n{out}"
+    );
     assert_eq!(r, RunResult::Exited(UNEXPECTED_TRAP_EXIT));
 }
 
@@ -353,9 +359,9 @@ fn unexpected_machine_trap_reports_and_halts() {
     let (_, elf) = load_committed();
     let (timer_init, machine_vec) = (sym(&elf, "timer_init"), sym(&elf, "machine_vec"));
     for (word, mcause, mtval) in [
-        (0x0000_0000, 2, 0),          // illegal instruction: mtval = its bits
-        (0x0000_0073, 11, 0),         // ecall from M-mode
-        (0x0010_0073, 3, timer_init), // ebreak: mtval = its pc
+        (0xffff_ffff, ILLEGAL_INSTRUCTION, 0xffff_ffff), // mtval = its bits
+        (0x0000_0073, grail::trap::Exception::EcallM as u32, 0),
+        (0x0010_0073, grail::trap::Exception::Breakpoint as u32, timer_init), // mtval = its pc
     ] {
         let (mut m, _) = load_committed();
         m.cpu.bus.load(timer_init, &u32::to_le_bytes(word)).unwrap();
@@ -379,14 +385,158 @@ fn halt_uses_kmain_return_value() {
     // Make kmain return 7 straight away (li a0, 7; ret).
     let (mut m, elf) = load_committed();
     let kmain = sym(&elf, "kmain");
-    let li_a0_7: u32 = (7 << 20) | (10 << 7) | 0x13;
+    let li_a0_7: u32 = addi(x("a0"), 0, 7);
     let ret: u32 = 0x0000_8067;
+    let decoded = (excalibur::decode(li_a0_7), excalibur::decode(ret));
+    let ra = x("ra") as u8;
+    assert_eq!(
+        decoded,
+        (
+            excalibur::Inst::OpImm {
+                op: excalibur::AluOp::Add,
+                rd: 10,
+                rs1: 0,
+                imm: 7
+            },
+            excalibur::Inst::Jalr {
+                rd: 0,
+                rs1: ra,
+                imm: 0
+            }
+        )
+    );
     let mut code = li_a0_7.to_le_bytes().to_vec();
     code.extend_from_slice(&ret.to_le_bytes());
     m.cpu.bus.load(kmain, &code).unwrap();
     // kmain runs in S-mode, so the code reaches xcal.halt via MCALL_HALT.
     assert_eq!(m.run(Some(BOOT_MAX_STEPS), |_| {}), RunResult::Exited(7));
     assert!(m.cpu.bus.uart.captured.is_empty());
+}
+
+// ---- Library functions, called one at a time ----
+
+/// Scratch memory for `call_kernel`: buffers, then the stack's top, then the
+/// return address, all near the end of the default 4 MiB of RAM, far above
+/// the kernel image.
+const CALL_DATA: u32 = RAM_BASE + 0x3e_0000;
+const CALL_STACK: u32 = RAM_BASE + 0x3f_0000;
+const CALL_RETURN: u32 = RAM_BASE + 0x3f_f000;
+
+/// A machine with the committed kernel loaded and nothing run: M-mode, no
+/// paging, so the kernel's code and `CALL_DATA` are at their physical
+/// addresses.
+fn call_machine() -> (Machine, grail::elf::Elf) {
+    let (m, elf) = load_committed_on(MachineConfig::default(), None);
+    assert!(
+        sym(&elf, "__bss_end") < CALL_DATA,
+        "the kernel reaches the call scratch area"
+    );
+    (m, elf)
+}
+
+/// Calls the kernel's function `name` with `args` in a0, a1, ... (the
+/// calling convention's registers, variadic arguments included) and returns
+/// its a0. It returns to `CALL_RETURN`, where the run stops.
+fn call_kernel(m: &mut Machine, elf: &grail::elf::Elf, name: &str, args: &[u32]) -> u32 {
+    for (i, &a) in args.iter().enumerate() {
+        m.cpu.x[x("a0") as usize + i] = a;
+    }
+    m.cpu.x[x("sp") as usize] = CALL_STACK;
+    m.cpu.x[x("ra") as usize] = CALL_RETURN;
+    m.cpu.pc = sym(elf, name);
+    for _ in 0..1_000_000 {
+        if m.cpu.pc == CALL_RETURN {
+            return m.cpu.x[x("a0") as usize];
+        }
+        m.cpu.step();
+    }
+    panic!("{name} never returned (pc {:#x})", m.cpu.pc);
+}
+
+fn put_bytes(m: &mut Machine, addr: u32, bytes: &[u8]) {
+    m.cpu.bus.load(addr, bytes).unwrap();
+}
+
+fn get_bytes(m: &Machine, addr: u32, len: u32) -> Vec<u8> {
+    (addr..addr + len).map(|a| peek_byte(&m.cpu.bus, a)).collect()
+}
+
+#[test]
+fn kernel_string_functions() {
+    let (mut m, elf) = call_machine();
+    let (a, b) = (CALL_DATA, CALL_DATA + 0x100);
+    let pattern: Vec<u8> = (1..=16).collect();
+
+    // memset: the byte of c, n times, and nothing past them; returns dst.
+    put_bytes(&mut m, a, &[0xee; 8]);
+    assert_eq!(call_kernel(&mut m, &elf, "memset", &[a + 1, 0x1ab, 5]), a + 1);
+    assert_eq!(
+        get_bytes(&m, a, 8),
+        [0xee, 0xab, 0xab, 0xab, 0xab, 0xab, 0xee, 0xee]
+    );
+
+    // memcpy.
+    put_bytes(&mut m, a, &pattern);
+    put_bytes(&mut m, b, &[0; 16]);
+    assert_eq!(call_kernel(&mut m, &elf, "memcpy", &[b, a, 15]), b);
+    assert_eq!(get_bytes(&m, b, 16), [&pattern[..15], &[0]].concat());
+
+    // memmove with overlap, both ways: the bytes as they were before.
+    put_bytes(&mut m, a, &pattern);
+    assert_eq!(call_kernel(&mut m, &elf, "memmove", &[a + 3, a, 10]), a + 3);
+    assert_eq!(
+        get_bytes(&m, a, 16),
+        [&pattern[..3], &pattern[..10], &pattern[13..]].concat()
+    );
+    put_bytes(&mut m, a, &pattern);
+    assert_eq!(call_kernel(&mut m, &elf, "memmove", &[a, a + 3, 10]), a);
+    assert_eq!(get_bytes(&m, a, 16), [&pattern[3..13], &pattern[10..]].concat());
+
+    // memcmp: the sign of the first difference, as unsigned bytes.
+    put_bytes(&mut m, a, b"abcd\x80");
+    put_bytes(&mut m, b, b"abce\x01");
+    let cmp = |m: &mut Machine, x, y, n| call_kernel(m, &elf, "memcmp", &[x, y, n]) as i32;
+    assert_eq!(cmp(&mut m, a, b, 3), 0);
+    assert_eq!(cmp(&mut m, a, b, 4), -1);
+    assert_eq!(cmp(&mut m, b, a, 4), 1);
+    assert_eq!(cmp(&mut m, a + 4, b + 4, 1), 1, "0x80 > 0x01");
+    assert_eq!(cmp(&mut m, a, b, 0), 0);
+}
+
+#[test]
+fn ksnprintf_corner_cases() {
+    // What the boot-time kprintf self-test leaves out.
+    let (mut m, elf) = call_machine();
+    let (buf, fmt) = (CALL_DATA, CALL_DATA + 0x100);
+    // Formats `format` with `args` into a 32-byte buffer of `size`; returns
+    // ksnprintf's value and the buffer up to its NUL.
+    let mut format = |format: &str, size: u32, args: &[u32]| {
+        put_bytes(&mut m, fmt, &[format.as_bytes(), &[0]].concat());
+        put_bytes(&mut m, buf - 1, &[0x5a; 34]);
+        let n = call_kernel(&mut m, &elf, "ksnprintf", &[&[buf, size, fmt][..], args].concat());
+        let out = get_bytes(&m, buf, 32);
+        let text = out.split(|&b| b == 0).next().unwrap();
+        (
+            n as i32,
+            String::from_utf8_lossy(text).into_owned(),
+            get_bytes(&m, buf - 1, 34),
+        )
+    };
+    // A width for %c pads on the left.
+    assert_eq!(format("[%3c]", 32, &[u32::from(b'x')]).1, "[  x]");
+    // An incomplete conversion at the end is copied as written.
+    for f in ["end %", "end %5", "end %05", "end %l", "end %12l"] {
+        let (n, text, _) = format(f, 32, &[]);
+        assert_eq!((n as usize, text.as_str()), (f.len(), f));
+    }
+    // Size 0: nothing is written, not even the NUL, and the full length
+    // comes back.
+    let (n, _, bytes) = format("abc%d", 0, &[42]);
+    assert_eq!(n, 5);
+    assert!(bytes.iter().all(|&b| b == 0x5a), "{bytes:x?}");
+    // Size 1: only the NUL.
+    let (n, text, bytes) = format("abc", 1, &[]);
+    assert_eq!((n, text.as_str(), bytes[0], bytes[2]), (3, "", 0x5a, 0x5a));
 }
 
 /// Encodes `addi rd, rs1, imm`.
@@ -1831,14 +1981,59 @@ fn kernel_c_sources() -> Vec<(String, String)> {
     files
 }
 
+/// `text` with its comments and the contents of its string and character
+/// literals blanked out, lines kept where they were.
+fn c_code_only(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = ' ';
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push('\n');
+                    }
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+                out.push(' ');
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '"' | '\'' => {
+                out.push(c);
+                while let Some(d) = chars.next() {
+                    if d == '\\' {
+                        chars.next();
+                    } else if d == c || d == '\n' {
+                        out.push(d);
+                        break;
+                    }
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[test]
 fn kernel_c_stays_freestanding() {
-    // No libc headers (everything is #include "...") and no floating point,
-    // so Merlin's C subset compiles it: the kernel and the user programs
-    // alike.
+    // No libc headers (everything is #include "..."), no floating point and
+    // no inline assembly, so Merlin's C subset compiles it: the kernel and
+    // the user programs alike.
     for (name, text) in kernel_c_sources() {
-        for (i, line) in text.lines().enumerate() {
-            let code = line.split("/*").next().unwrap();
+        for (i, code) in c_code_only(&text).lines().enumerate() {
             assert!(!code.contains("#include <"), "{name}:{}: system header", i + 1);
             for word in code.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
                 assert!(
@@ -1846,9 +2041,17 @@ fn kernel_c_stays_freestanding() {
                     "{name}:{}: floating point",
                     i + 1
                 );
+                assert!(
+                    !matches!(word, "asm" | "__asm" | "__asm__"),
+                    "{name}:{}: inline assembly",
+                    i + 1
+                );
             }
         }
     }
+    // What the scan sees.
+    let code = c_code_only("int a; /* asm\n float */ char *s = \"double \\\" asm\"; // __asm__\nasm(\"x\");");
+    assert_eq!(code, "int a; \n  char *s = \"\"; \nasm(\"\");");
 }
 
 #[test]
