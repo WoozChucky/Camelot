@@ -501,7 +501,16 @@ fn bad_handshakes() {
         .unwrap();
     let reply = read_all(future);
     let (msg, _) = avalon_proto::decode(&reply).unwrap();
-    assert!(matches!(msg, Message::Welcome { version: 1, .. }), "{msg:?}");
+    assert!(
+        matches!(
+            msg,
+            Message::Welcome {
+                version: avalon_proto::PROTOCOL_VERSION,
+                ..
+            }
+        ),
+        "{msg:?}"
+    );
 
     // Silence: closed once the handshake time is up.
     let silent = TcpStream::connect(server.addr()).unwrap();

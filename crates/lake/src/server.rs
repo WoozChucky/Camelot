@@ -50,7 +50,7 @@ const POLL: Duration = Duration::from_millis(100);
 /// How the server runs.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Where to listen. Loopback by default: v1 of the protocol has no authentication.
+    /// Where to listen. Loopback by default: the protocol has no authentication.
     pub listen: SocketAddr,
     /// The images directory (created if it does not exist).
     pub dir: PathBuf,
@@ -163,7 +163,7 @@ impl Server {
             eprintln!("lake: images in {}", shared.store.dir().display());
             if !shared.addr.ip().is_loopback() {
                 eprintln!(
-                    "lake: warning: {} is not a loopback address, and protocol v1 has no \
+                    "lake: warning: {} is not a loopback address, and the protocol has no \
                      authentication: anyone who can reach it can read, write and delete the disks",
                     shared.addr
                 );
