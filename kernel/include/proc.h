@@ -80,6 +80,10 @@ struct proc {
      * looked up from: an inode with a reference, or NULL when there is no
      * filesystem (and for kernel processes, which use the root). */
     struct inode *cwd;
+    /* Set by kill(): the process ends (exit status -1) when it next would
+     * return to U-mode, and the system calls that sleep for long (sleep,
+     * wait, reading the console or a pipe, writing a pipe) give up at once. */
+    bool killed;
 };
 
 /* A user program embedded in the kernel image as an ELF executable
@@ -178,6 +182,18 @@ void proc_exit(int status);
  * why (the cause, scause/sepc/stval and, for a page fault, how the process's
  * page table maps stval), then exits it with status -1. Never returns. */
 void proc_kill(struct trap_frame *f);
+
+/* kill(): marks the process `pid` killed (see `killed` in struct proc) and
+ * wakes it if it sleeps. 0 (also for a zombie, which has already ended),
+ * -ESRCH if there is no such process, -EPERM for a kernel process. */
+int proc_kill_pid(int pid);
+
+/* Whether the current process has been killed. */
+bool proc_killed(void);
+
+/* procs(): describes up to `max` processes, in pid order, in `out` and
+ * returns how many there are in all. */
+int proc_list(struct procinfo *out, int max);
 
 /* wait(): waits for a child of the current process to end, any child if
  * `pid` is -1, frees it and returns its pid, storing its exit status at user

@@ -30,7 +30,7 @@ crates/merlin-as        the assembler (source → ELF32 .o)
 crates/merlin-ld        the linker (.o files → ELF32 executable)
 crates/merlin-objdump   the disassembler / object dumper (llvm-objdump compatible output)
 crates/xtask            build tasks: `cargo xtask examples`, `cargo xtask kernel`, `cargo xtask fs`, `cargo xtask boot`, `cargo xtask hello`, `cargo xtask ld-fixtures`
-kernel/                 the Camelot kernel (C + assembly) and its prebuilt kernel.elf; kernel/user holds the user programs it embeds, kernel/fs the root image's files, kernel/boot the bootloader of a bootable disk
+kernel/                 the Camelot kernel (C + assembly) and its prebuilt kernel.elf; kernel/user holds the user programs it embeds (and kernel/user/lib their C library), kernel/fs the root image's files, kernel/boot the bootloader of a bootable disk
 examples/               bare-metal programs, built with merlin-as + merlin-ld (the .elf files are committed)
 tests/riscv-tests       prebuilt riscv-tests ELFs and their objects for merlin-ld (rebuild with scripts/build-riscv-tests.sh)
 scripts/                test-data generators (riscv-tests, merlin-as golden encodings, merlin-objdump goldens)

@@ -74,6 +74,9 @@ int pipewrite(struct pipe *p, pagetable_t pt, u32 src, u32 n) {
         }
         u32 used = p->nwrite - p->nread;
         if (used == PIPESIZE) {
+            if (proc_killed()) {
+                break; /* the caller ends on its way out */
+            }
             /* Full: let the readers at what is there, and wait for room. */
             wakeup(&p->nread);
             sleep(&p->nwrite);
@@ -91,7 +94,7 @@ int pipewrite(struct pipe *p, pagetable_t pt, u32 src, u32 n) {
 }
 
 int piperead(struct pipe *p, pagetable_t pt, u32 dst, u32 n) {
-    while (p->nread == p->nwrite && p->writeopen) {
+    while (p->nread == p->nwrite && p->writeopen && !proc_killed()) {
         sleep(&p->nread);
     }
     u32 count = 0;

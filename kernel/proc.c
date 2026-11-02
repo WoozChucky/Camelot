@@ -475,6 +475,64 @@ void proc_kill(struct trap_frame *f) {
     proc_exit(-1);
 }
 
+int proc_kill_pid(int pid) {
+    for (u32 i = 0; i < NPROC; i++) {
+        struct proc *p = &procs[i];
+        if (p->state == PROC_UNUSED || p->state == PROC_NEW || p->pid != (u32)pid) {
+            continue;
+        }
+        if (p->kfn != NULL) {
+            return -EPERM;
+        }
+        if (p->state != PROC_ZOMBIE) {
+            p->killed = true;
+            /* Every sleep() is in a loop that checks what it waits for, so
+             * an early wakeup is harmless; the long waits check `killed`. */
+            if (p->state == PROC_SLEEPING) {
+                p->state = PROC_RUNNABLE;
+            }
+        }
+        return 0;
+    }
+    return -ESRCH;
+}
+
+bool proc_killed(void) {
+    return current != NULL && current->killed;
+}
+
+int proc_list(struct procinfo *out, int max) {
+    int n = 0;
+    u32 last = 0;
+    /* In pid order: the smallest pid above the last one, each time. */
+    for (;;) {
+        struct proc *next = NULL;
+        for (u32 i = 0; i < NPROC; i++) {
+            struct proc *p = &procs[i];
+            if (p->state == PROC_UNUSED || p->state == PROC_NEW || p->pid <= last) {
+                continue;
+            }
+            if (next == NULL || p->pid < next->pid) {
+                next = p;
+            }
+        }
+        if (next == NULL) {
+            return n;
+        }
+        if (n < max) {
+            struct procinfo *info = &out[n];
+            memset(info, 0, sizeof *info);
+            info->pid = next->pid;
+            info->ppid = next->parent != NULL ? next->parent->pid : 0;
+            info->state = next->state;
+            info->size = next->pagetable != NULL ? next->brk : 0;
+            memcpy(info->name, next->name, sizeof info->name);
+        }
+        n++;
+        last = next->pid;
+    }
+}
+
 int proc_wait(int pid, u32 status) {
     struct proc *p = current;
     if (status != 0 && !uvm_range_ok(p->pagetable, status, sizeof(int), PTE_W)) {
@@ -504,6 +562,9 @@ int proc_wait(int pid, u32 status) {
         }
         if (!found) {
             return -ECHILD;
+        }
+        if (p->killed) {
+            return -ECHILD; /* never seen: the caller ends on the way out */
         }
         /* proc_exit() wakes the parent. */
         sleep(p);

@@ -80,6 +80,8 @@ there is a filesystem to look it up in.
 | 19 | `dup` | `int fd` | the new descriptor; `-EBADF`, `-EMFILE` |
 | 20 | `pipe` | `int *fds` | 0; `-EMFILE`, `-ENFILE`, `-ENOMEM`, `-EFAULT` |
 | 21 | `exec` | `const char *path, char *const argv[]` | does not return; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-ENOMEM`, `-EFAULT` |
+| 22 | `kill` | `int pid` | 0; `-ESRCH`, `-EPERM` |
+| 23 | `procs` | `struct procinfo *buf, uint max` | the number of processes; `-EFAULT` |
 
 **exit(status)** ends the caller. Its exit status is kept for its parent's
 `wait`; the slot and every page the process held are freed once the parent
@@ -272,14 +274,45 @@ becomes the last name of `path`. On success it doesn't return; on an error,
 nothing changed and the old program carries on with the error, `spawn`'s
 but `-EAGAIN` (the kernel prints `exec: PATH: REASON` for `-ENOEXEC`).
 
+**kill(pid)** ends the process `pid`: it exits with status -1, as a
+process killed for a fault does (its parent's `wait` gets -1), but
+silently, and not at once. The kernel marks it killed and, if it is asleep,
+wakes it; it ends when it would next go back to U-mode, before it runs any
+more of its own code. A system call it is in the middle of carries on to
+its end, so a change to the disk is never left half done, except that the
+calls that may wait for long give up at once: `sleep`, `wait`, a `read` of
+the console or of a pipe, a `write` to a full pipe (what they return is
+never seen). A process spinning in U-mode ends at the next timer tick. A
+process may kill itself; `kill` then returns 0 and the process ends on its
+way back from the call. Killing a zombie, which has already ended, does
+nothing and returns 0. Errors: `-ESRCH` when no process has that pid (one
+whose parent has collected it is gone), `-EPERM` for one of the kernel's
+own processes.
+
+**procs(buf, max)** describes the processes, in pid order, in the array of
+`max` `struct procinfo` (32 bytes each, `user.h`) at `buf`, and returns how
+many processes there are, which may be more than `max`: only the first
+`max` are stored then, and `procs(NULL, 0)` just counts them. Each entry
+holds `pid`; `ppid`, its parent's pid, or 0 for a process without one (the
+shell, an orphan, a kernel process); `state`: `PROC_RUNNABLE` (1, waiting
+for its turn), `PROC_RUNNING` (2, the caller itself), `PROC_ZOMBIE` (3,
+ended, its status not collected yet) or `PROC_SLEEPING` (4); `size`, the
+end of its heap (its program, data and heap, from address 0, without the
+stack page), 0 for a kernel process; and `name`, NUL-terminated (the last
+name of the path it was started from, at most 15 characters). A process
+that `spawn` is still loading is not listed. All of `buf`, `max` entries,
+must be writable, however many are stored, or it is `-EFAULT` and nothing
+is.
+
 ## Error numbers
 
 Linux's values for the same conditions.
 
 | Number | Name | Meaning |
 |---|---|---|
-| 1 | `EPERM` | link: not for a directory |
+| 1 | `EPERM` | link: not for a directory; kill: a kernel process |
 | 2 | `ENOENT` | no such file or directory |
+| 3 | `ESRCH` | kill: no such process |
 | 7 | `E2BIG` | spawn, exec: argument list too long |
 | 8 | `ENOEXEC` | spawn, exec: the file is not a valid executable |
 | 9 | `EBADF` | not an open descriptor, or not open for that |
@@ -304,7 +337,7 @@ Linux's values for the same conditions.
 | 38 | `ENOSYS` | no such system call |
 | 39 | `ENOTEMPTY` | unlink: a directory with entries |
 
-`strerror` in `kernel/user/ulib.c` has a short message for each.
+`strerror` in `kernel/user/lib/strerror.c` has a short message for each.
 
 ## File descriptors
 
@@ -442,17 +475,26 @@ line and its NUL.
 Programs are compiled freestanding with only `user.h`, which declares the
 calls above (the stubs in `usys.s`, which return the raw result, a negative
 error number included), their constants and structures (`O_*`, `SEEK_*`,
-`struct stat`, `struct dirent`, `T_*`, `MAXPATH`, `DIRSIZ`) and a small C
-library (`ulib.c`): `strlen`, `strcmp`, `strchr`, `memset`, `memcpy`,
-`memmove`, `memcmp`, `atoi`, `printf` and `fprintf` (`%d %u %x %p %s %c %%`
-with `-`, `0` and a width), `puts`, `getline` (one read, without the
-newline), `strerror`, `stat` (`open`, `fstat`, `close`) and `spin` (a busy
-loop). `syscall(number, a0, a1, a2)` makes any call by number, for tests.
+`struct stat`, `struct dirent`, `T_*`, `struct procinfo`, `PROC_*`,
+`MAXPATH`, `DIRSIZ`) and the C library in `kernel/user/lib/`, described in
+its `README.md`: strings and memory (`strlen`, `strcmp`, `strncmp`,
+`strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`,
+`memmove`, `memcmp`), numbers (`atoi`, `strtol`), the heap (`malloc`,
+`free`, `calloc`, `realloc`, on top of `sbrk`), formatted output (`printf`,
+`fprintf` to a descriptor, `snprintf`; `%d %u %x %p %s %c %%` with `-`, `0`
+and a width), `puts`, line input (`getline`, one read of the console
+without the newline; readers, `reader_getline`, for files and pipes),
+`strerror`, `stat` (`open`, `fstat`, `close`) and `spin` (a busy loop).
+`syscall(number, a0, a1, a2)` makes any call by number, for tests.
 
 ## Building programs
 
 Each `kernel/user/X.c` or `X.s` is a program called `X`, linked with the
-runtime: `crt0.s`, `usys.s` and `ulib.c`. Our own tools build them, with no
+runtime, `crt0.s` and `usys.s`, and with the members of the library
+(`kernel/user/lib/*.c`) it needs: like an archive's, a member goes in only
+if it defines something the program (or another member that went in)
+refers to and nothing else defines (`crates/merlin-ld/src/library.rs`,
+merlin-ld's `--start-lib`/`--end-lib`). Our own tools build them, with no
 LLVM: merlin compiles each C file (with `-Ikernel/user`), merlin-as
 assembles each source, merlin-ld links each program with `user.ld`, and the
 executables go to `/bin/X` on the root image (`cargo xtask fs`,

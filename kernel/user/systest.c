@@ -23,7 +23,8 @@
  *                         exits 0 if its pid is PID and descriptor 3 is
  *                         still open
  *   systest execfail      execs paths that fail, then exits 0 if each failed
- *                         as it should and the program is still its own */
+ *                         as it should and the program is still its own
+ *   systest spin          spins until it is killed */
 #include "user.h"
 
 /* Process slots (NPROC in kernel/include/proc.h). */
@@ -209,6 +210,10 @@ static int child(int argc, char **argv) {
         sleep((uint)atoi(argv[2]));
         return 0;
     }
+    if (strcmp(argv[1], "spin") == 0) {
+        for (;;) {
+        }
+    }
     if (strcmp(argv[1], "args") == 0) {
         const char *want[] = {"systest", "args", "", "two words", "x"};
         if (argc != 5 || argv[argc] != NULL) {
@@ -253,7 +258,7 @@ static void test_simple_calls(void) {
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(22, 0, 0, 0), -ENOSYS, "call 22");
+    check_eq(syscall(24, 0, 0, 0), -ENOSYS, "call 24");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
 }
 
@@ -579,6 +584,88 @@ static void test_exec(void) {
              "a failed exec returns its error");
 }
 
+/* The entry procs() gives for `pid` in `info` (`n` entries), or NULL. */
+static struct procinfo *find_proc(struct procinfo *info, int n, int pid) {
+    for (int i = 0; i < n && i < NPROC; i++) {
+        if ((int)info[i].pid == pid) {
+            return &info[i];
+        }
+    }
+    return NULL;
+}
+
+/* The state procs() gives for `pid`, or -1 if it isn't there. */
+static int state_of(int pid) {
+    struct procinfo info[NPROC];
+    int n = procs(info, NPROC);
+    struct procinfo *p = find_proc(info, n, pid);
+    return p != NULL ? (int)p->state : -1;
+}
+
+static void test_procs_and_kill(void) {
+    struct procinfo info[NPROC];
+    int me = getpid();
+    int child = spawn("/bin/systest", (char *[]){"systest", "sleep", "1000", NULL});
+    check(child > me, "a sleeper to look at");
+    /* Its turn comes and it goes to sleep. */
+    while (state_of(child) != PROC_SLEEPING) {
+        yield();
+    }
+    int n = procs(info, NPROC);
+    check(n >= 3, "procs: the shell, this and the sleeper");
+    check(strcmp(info[0].name, "sh") == 0 && info[0].ppid == 0, "the shell comes first");
+    for (int i = 1; i < n && i < NPROC; i++) {
+        check(info[i].pid > info[i - 1].pid, "in pid order");
+    }
+    struct procinfo *p = find_proc(info, n, me);
+    check(p != NULL && p->state == PROC_RUNNING && strcmp(p->name, "systest") == 0, "this one is running");
+    check(p != NULL && (int)p->size == sbrk(0), "its size is the end of its heap");
+    p = find_proc(info, n, child);
+    check(p != NULL && (int)p->ppid == me && p->state == PROC_SLEEPING, "the sleeper is this one's child");
+    check_eq(procs(NULL, 0), n, "procs counts with no room");
+    info[1].pid = 0;
+    check_eq(procs(info, 1), n, "procs with room for one");
+    check_eq((int)info[1].pid, 0, "fills in only the room it has");
+    check_eq(procs((struct procinfo *)0x10, 1), -EFAULT, "procs to unmapped memory");
+    check_eq(procs(info, 0x40000000u), -EFAULT, "procs to a buffer past user space");
+
+    check_eq(kill(0), -ESRCH, "kill pid 0");
+    check_eq(kill(-1), -ESRCH, "kill pid -1");
+    check_eq(kill(100000), -ESRCH, "kill a pid nobody has");
+    /* Killed in its sleep: it ends with -1 at once. */
+    check_eq(kill(child), 0, "kill the sleeper");
+    int status = 0;
+    check_eq(wait(child, &status), child, "the killed sleeper ends");
+    check_eq(status, -1, "killed: status -1");
+    check_eq(kill(child), -ESRCH, "kill a process that is gone");
+
+    /* A zombie has already ended: killing it changes nothing. */
+    child = spawn("/bin/systest", (char *[]){"systest", "exit", "3", NULL});
+    while (state_of(child) != PROC_ZOMBIE) {
+        yield();
+    }
+    check_eq(kill(child), 0, "kill a zombie");
+    check_eq(status_of(child), 3, "a killed zombie keeps its status");
+
+    /* A reader asleep on a pipe that still has a writer (this one). */
+    int pfd[2];
+    check_eq(pipe(pfd), 0, "a pipe for a reader to kill");
+    child = spawn_with(pfd[0], -1, (char *[]){"systest", "count", NULL});
+    while (state_of(child) != PROC_SLEEPING) {
+        yield();
+    }
+    check_eq(kill(child), 0, "kill the reader");
+    check_eq(status_of(child), -1, "the reader ends");
+    close(pfd[0]);
+    close(pfd[1]);
+
+    /* A runnable one, spinning in U-mode. */
+    child = spawn("/bin/systest", (char *[]){"systest", "spin", NULL});
+    yield();
+    check_eq(kill(child), 0, "kill a spinner");
+    check_eq(status_of(child), -1, "the spinner ends");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) {
         return child(argc, argv);
@@ -590,6 +677,7 @@ int main(int argc, char **argv) {
     test_descriptors();
     test_pipes();
     test_exec();
+    test_procs_and_kill();
     printf("systest: %d checks, %d failed\n", checks, failures);
     return failures;
 }

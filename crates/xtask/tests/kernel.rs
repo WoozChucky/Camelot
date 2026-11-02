@@ -1168,9 +1168,10 @@ fn devices_may_share_a_page() {
 
 #[test]
 fn allocator_follows_the_ram_size() {
-    // RAM comes from sysinfo: the smallest machine, and one whose RAM ends
-    // inside a 4 MiB region.
-    for mib in [1, 6] {
+    // RAM comes from sysinfo: the smallest machine the kernel fits in (its
+    // image, with the user programs it embeds, takes most of a 1 MiB one),
+    // and one whose RAM ends inside a 4 MiB region.
+    for mib in [2, 6] {
         check_kernel_memory(mib, &[]);
     }
 }
@@ -1604,9 +1605,14 @@ fn kernel_reads_the_timebase_from_sysinfo() {
     assert_eq!(kernel::mask_dbg_pc(&printed(&m)), want);
     // Ten ticks before the shell starts, each a 200 000-tick interval.
     // (Setting up memory takes a few intervals before them, so the total
-    // mtime says little; starting the shell may take more than one.)
+    // mtime says little; starting the shell may take more than one.) The
+    // first may come while the kernel is still busy rather than idle in
+    // wfi, which it reaches a few instructions sooner: how long setting up
+    // memory took decides that, so the first interval is only close.
     assert_eq!(kernel_ticks.len(), 10, "{kernel_ticks:?}");
-    for w in kernel_ticks.windows(2) {
+    let first = kernel_ticks[1] - kernel_ticks[0];
+    assert!(first.abs_diff(u64::from(interval)) < 100, "{kernel_ticks:?}");
+    for w in kernel_ticks[1..].windows(2) {
         assert_eq!(w[1] - w[0], u64::from(interval), "{kernel_ticks:?}");
     }
 }
@@ -2467,6 +2473,54 @@ fn the_system_calls_do_what_the_document_says() {
 }
 
 #[test]
+fn the_c_library_does_what_user_h_says() {
+    // libtest checks the user C library (kernel/user/lib): strings, numbers,
+    // snprintf's formats, malloc and free, and readers on a pipe fed by a
+    // child of its own.
+    let out = run_processes(b"libtest\nexit\n");
+    let lines = command_output(&out, "libtest");
+    assert_eq!(lines.len(), 1, "{out}");
+    assert!(
+        lines[0].starts_with("libtest: ") && lines[0].ends_with(" checks, 0 failed"),
+        "{out}"
+    );
+    let checks: u32 = lines[0]["libtest: ".len()..]
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(checks > 70, "{checks}");
+}
+
+#[test]
+fn programs_link_only_the_library_members_they_need() {
+    // The library is linked like an archive: hello prints with printf, so
+    // it has printf and strlen but no malloc; grep grows its line buffer
+    // with realloc, so it has the allocator too. Neither has a function it
+    // never calls, such as strtol.
+    let has = |prog: &str, name: &str| {
+        let p = user_program(prog);
+        let syms = elf32::Elf::parse(&p.elf).unwrap().symbols().unwrap();
+        syms.iter().any(|s| s.name == name)
+    };
+    for (prog, name, want) in [
+        ("hello", "printf", true),
+        ("hello", "strlen", true),
+        ("hello", "malloc", false),
+        ("hello", "strtol", false),
+        ("grep", "realloc", true),
+        ("grep", "malloc", true),
+        ("grep", "reader_getline", true),
+        ("grep", "strtol", false),
+        ("kill", "strtol", true),
+        ("regs", "printf", false),
+    ] {
+        assert_eq!(has(prog, name), want, "{prog}: {name}");
+    }
+}
+
+#[test]
 fn without_a_disk_the_shell_still_pipes_and_finds_the_programs_in_bin() {
     // Pipes need no disk, and the kernel's own programs stand in for /bin:
     // by name, by /bin/NAME and by bin/NAME from the root. Any other path,
@@ -2653,9 +2707,9 @@ fn a_heap_that_runs_out_of_memory_gives_back_what_it_took() {
     let out = run_processes(format!("{LINE}\nexit\n").as_bytes());
     assert_eq!(command_output(&out, LINE), ["systest: sbrk 3000000: 0"]);
 
-    // ...but a 1 MiB one runs out of them after mapping some.
+    // ...but a 2 MiB one runs out of them after mapping some.
     let config = MachineConfig {
-        ram_size: 1 << 20,
+        ram_size: 2 << 20,
         ..MachineConfig::default()
     };
     let (tx, rx) = std::sync::mpsc::channel();
@@ -3004,7 +3058,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 21, "{calls:?}");
+    assert_eq!(calls.len(), 23, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()
@@ -3030,7 +3084,7 @@ fn the_system_call_document_matches_the_code() {
     }
 
     let errors = doc_table(&doc, "## Error numbers");
-    assert_eq!(errors.len(), 25, "{errors:?}");
+    assert_eq!(errors.len(), 26, "{errors:?}");
     assert_eq!(defines(&header, "E"), errors, "syscall.h");
     assert_eq!(defines(&user_h, "E"), errors, "user.h");
 
@@ -3094,6 +3148,11 @@ fn the_system_call_document_matches_the_code() {
         ("kernel/include/file.h", "CONSOLE", vec![&filetest, &systest]),
         ("kernel/include/pipe.h", "PIPESIZE", vec![&systest]),
         ("kernel/include/proc.h", "NPROC", vec![&systest]),
+        // The states procs reports.
+        ("kernel/include/proc.h", "PROC_RUNNABLE", vec![&user_h]),
+        ("kernel/include/proc.h", "PROC_RUNNING", vec![&user_h]),
+        ("kernel/include/proc.h", "PROC_ZOMBIE", vec![&user_h]),
+        ("kernel/include/proc.h", "PROC_SLEEPING", vec![&user_h]),
     ] {
         let want = exactly(&read(header), name);
         assert_eq!(want.len(), 1, "{header}: {name}");
@@ -3772,12 +3831,14 @@ fn sessions(cc: CCompiler) -> Vec<(&'static str, Vec<DiskConfig>, &'static [u8])
         (
             "programs",
             Vec::new(),
-            b"help\nhello\necho a  b   c\nticks\nsystest\nbadptr\nbadload\nbadstore\nregs\nping\npong\nexit 3\n",
+            b"help\nhello\necho a  b   c\nticks\nsystest\nlibtest\nbadptr\nbadload\nbadstore\nregs\nping\npong\nexit 3\n",
         ),
         (
             "filesystem",
             vec![DiskConfig::memory(image)],
-            b"ls /\ncat /README | wc\necho hi > f\ncat f\nls /bin | wc\nmkdir d\ncd d\nfiletest\nexit\n",
+            b"ls /\ncat /README | wc\necho hi > f\ncat f\nls /bin | wc\nmkdir d\ncd d\nfiletest\n\
+              cat /README | grep Camelot | wc -l\ncp /README r\nmv r s\ngrep -n the s\ncp s /\nkill 99\n\
+              sleep 0.2\nexit\n",
         ),
     ]
 }
