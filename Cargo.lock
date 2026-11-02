@@ -34,6 +34,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "merlin-ld"
+version = "0.1.0"
+dependencies = [
+ "grail",
+ "merlin-as",
+]
+
+[[package]]
 name = "merlin-objdump"
 version = "0.1.0"
 dependencies = [
