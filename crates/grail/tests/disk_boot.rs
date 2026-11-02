@@ -98,7 +98,7 @@ fn loads_the_boot_block_and_jumps_to_it() {
     assert_eq!(uart(&m), "", "nothing to say");
     let h = m.cpu.hart(0);
     assert_eq!(h.x[T0 as usize], LOAD_ADDR, "the last 64 KiB of RAM");
-    assert_eq!(boot::boot_block_addr(RAM), LOAD_ADDR);
+    assert_eq!(boot::boot_block_addr(RAM), Some(LOAD_ADDR));
     assert_eq!(h.x[A0 as usize], 0, "the hart id");
     assert_eq!(h.x[A1 as usize], SYSINFO_BASE);
     assert_eq!(h.x[A2 as usize], BLK_BASE, "disk 0's registers");
@@ -200,6 +200,37 @@ fn a_trap_in_the_boot_block_is_reported() {
 fn no_disk_no_disk_boot() {
     let mut m = Machine::new(MachineConfig::with_ram(RAM)).unwrap();
     assert!(m.boot_from_disk().unwrap_err().contains("no disk"));
+}
+
+/// The boot area is the last 64 KiB of RAM: a smaller machine cannot boot from disk,
+/// and says so before it runs (the ROM would read the block below RAM and fail with a
+/// read error that hides why).
+#[test]
+fn disk_boot_takes_64_kib_of_ram() {
+    let block = boot_block(&[auipc(T0), HALT]);
+    for kib in [4, 32, 60] {
+        let config = MachineConfig {
+            ram_size: kib << 10,
+            disks: vec![DiskConfig::memory(disk(&block, 2))],
+            ..MachineConfig::default()
+        };
+        let mut m = Machine::new(config).unwrap();
+        let err = m.boot_from_disk().unwrap_err();
+        assert!(err.contains("at least 64 KiB of RAM"), "{kib} KiB: {err}");
+    }
+    let config = MachineConfig {
+        ram_size: 64 << 10,
+        disks: vec![DiskConfig::memory(disk(&block, 2))],
+        ..MachineConfig::default()
+    };
+    let mut m = Machine::new(config).unwrap();
+    m.boot_from_disk().unwrap();
+    assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
+    assert_eq!(
+        m.cpu.hart(0).x[T0 as usize],
+        0x8000_0000,
+        "all of RAM is the boot area"
+    );
 }
 
 /// The boot block of a two-hart machine points the ROM's entry word at code of its
@@ -416,4 +447,128 @@ fn the_kernel_must_fit_below_the_bootloader() {
         "{}",
         uart(&m)
     );
+}
+
+/// `bnez rs1, offset` (`bne rs1, zero, offset`), for a small forward offset.
+fn bnez(rs1: u32, offset: u32) -> u32 {
+    assert!(offset < 0x800 && offset.is_multiple_of(2));
+    (offset >> 5 & 0x3f) << 25 | rs1 << 15 | 1 << 12 | (offset & 0x1e) << 7 | 0x63
+}
+
+/// A minimal ELF32 RISC-V executable: the header, `phdrs` program headers (offset,
+/// paddr, filesz, memsz) right after it, then `data` placed at each file offset given.
+fn kernel_elf(entry: u32, phdrs: &[(u32, u32, u32, u32)], data: &[(usize, &[u8])], size: usize) -> Vec<u8> {
+    let mut f = vec![0u8; size];
+    f[..7].copy_from_slice(b"ELF");
+    f[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    f[18..20].copy_from_slice(&243u16.to_le_bytes()); // EM_RISCV
+    f[20..24].copy_from_slice(&1u32.to_le_bytes());
+    f[24..28].copy_from_slice(&entry.to_le_bytes());
+    f[28..32].copy_from_slice(&52u32.to_le_bytes()); // e_phoff
+    f[40..42].copy_from_slice(&52u16.to_le_bytes());
+    f[42..44].copy_from_slice(&32u16.to_le_bytes());
+    f[44..46].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
+    for (i, &(offset, paddr, filesz, memsz)) in phdrs.iter().enumerate() {
+        let at = 52 + 32 * i;
+        for (j, v) in [1, offset, paddr, paddr, filesz, memsz, 7, 0x1000]
+            .iter()
+            .enumerate()
+        {
+            f[at + 4 * j..at + 4 * j + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    for &(at, bytes) in data {
+        f[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+    f
+}
+
+/// Camelot's real bootloader with a small kernel of our own, on a two-hart machine
+/// whose RAM is filled with 0xee first (a reset leaves zeros, which would hide a
+/// bootloader that did not zero .bss). The bootloader must copy exactly the file
+/// bytes (a partial last sector included, nothing after it), zero .bss (also for a
+/// .bss-only segment at a file offset that is not a multiple of 512, as merlin-ld
+/// places one), write the entry point to the ROM's entry word, and start the kernel
+/// on hart 0, which wakes hart 1: hart 1 leaves the park loop for the kernel too.
+#[test]
+fn the_bootloader_loads_segments_and_hands_the_entry_word_over() {
+    const BASE: u32 = 0x8000_0000;
+    // The kernel's code: hart 0 sends hart 1 an IPI and waits; hart 1 stops the
+    // machine with exit code 0 and a1 = 0x10 + its hart id.
+    let code: Vec<u8> = [
+        bnez(A0, 0x14),     // 0x00: hart 1 goes to 0x14
+        lui(T1, 0x2000),    //       t1 = the CLINT
+        addi(A3, ZERO, 1),  //
+        sw(A3, T1, 4),      //       msip of hart 1
+        STOP,               // 0x10
+        addi(A1, A0, 0x10), // 0x14: hart 1
+        HALT,
+    ]
+    .iter()
+    .flat_map(|w| w.to_le_bytes())
+    .collect();
+    // Segment 1: code and data, one sector and a bit (0x234 bytes) at 0x200 in the
+    // file, then .bss up to 0x400. Segment 2: 0x10 bytes, all in a tail sector whose
+    // other bytes (0x55) must stay on the disk. Segment 3: .bss only, 0x40 bytes.
+    let text: Vec<u8> = code
+        .iter()
+        .copied()
+        .chain((code.len()..0x234).map(|i| i as u8 | 0x80))
+        .collect();
+    let data: Vec<u8> = (0..0x10).map(|i| 0x10 + i as u8).collect();
+    let after = [0x55u8; 0x1f0];
+    let elf = kernel_elf(
+        BASE,
+        &[
+            (0x200, BASE, 0x234, 0x400),
+            (0x600, BASE + 0x2000, 0x10, 0x10),
+            (0x610, BASE + 0x3010, 0, 0x40),
+        ],
+        &[(0x200, &text), (0x600, &data), (0x610, &after)],
+        0x800,
+    );
+    let mut image = camelot_fs::mkfs::mkfs(
+        &camelot_fs::mkfs::Options {
+            size: 1024,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    let boot = std::fs::read(repo().join("kernel/boot/boot.elf")).unwrap();
+    camelot_fs::boot::install(&mut image, &boot, &elf).unwrap();
+
+    let mut m = machine(2, image);
+    m.cpu.bus.ram[..0x4000].fill(0xee);
+    assert_eq!(
+        m.run(Some(1_000_000), |_| {}),
+        RunResult::Exited(0),
+        "{}",
+        uart(&m)
+    );
+    assert_eq!(
+        uart(&m),
+        "boot: kernel at sector 0x00000800
+"
+    );
+
+    let ram = &m.cpu.bus.ram;
+    let all = |range: std::ops::Range<usize>, b: u8| ram[range].iter().all(|&x| x == b);
+    assert_eq!(&ram[..0x234], &text[..], "segment 1's file bytes");
+    assert!(all(0x234..0x400, 0), "segment 1's .bss");
+    assert!(all(0x400..0x2000, 0xee), "nothing past segment 1");
+    assert_eq!(&ram[0x2000..0x2010], &data[..], "segment 2");
+    assert!(
+        all(0x2010..0x3010, 0xee),
+        "nothing of segment 2's sector past its bytes"
+    );
+    assert!(all(0x3010..0x3050, 0), "segment 3, .bss only");
+    assert!(all(0x3050..0x4000, 0xee), "nothing past segment 3");
+
+    // The entry word points at the kernel, and hart 1 got there through it.
+    assert_eq!(m.cpu.bus.peek(BOOT_ROM_BASE + 16), Some(BASE));
+    let (h0, h1) = (m.cpu.hart(0), m.cpu.hart(1));
+    assert_eq!(h0.pc, BASE + 0x10, "hart 0 waits at its j .");
+    assert_eq!((h0.x[A0 as usize], h0.x[A1 as usize]), (0, SYSINFO_BASE));
+    assert_eq!(h1.x[A1 as usize], 0x11, "hart 1 ran the kernel with a0 = 1");
 }

@@ -51,9 +51,11 @@ pub fn disk_loader() -> Vec<u8> {
     code
 }
 
-/// Where the boot block goes on a machine with `ram_size` bytes of RAM.
-pub fn boot_block_addr(ram_size: usize) -> u32 {
-    crate::bus::RAM_BASE + (ram_size as u32).wrapping_sub(BOOT_AREA_SIZE)
+/// Where the boot block goes on a machine with `ram_size` bytes of RAM: `None` if the
+/// RAM is smaller than the boot area, which [`crate::Machine::boot_from_disk`] refuses.
+pub fn boot_block_addr(ram_size: usize) -> Option<u32> {
+    let ram = u32::try_from(ram_size).ok()?;
+    Some(crate::bus::RAM_BASE + ram.checked_sub(BOOT_AREA_SIZE)?)
 }
 
 /// Whether the boot ROM accepts `block` (at least [`BOOT_BLOCK_SIZE`] bytes; the rest
@@ -111,7 +113,9 @@ mod tests {
         assert!(!is_bootable(&block[..1000]));
         block[7] ^= 0x40;
         assert!(!is_bootable(&block), "one bit off");
-        assert_eq!(boot_block_addr(128 << 20), 0x87ff_0000);
-        assert_eq!(boot_block_addr(1 << 20), 0x800f_0000);
+        assert_eq!(boot_block_addr(128 << 20), Some(0x87ff_0000));
+        assert_eq!(boot_block_addr(1 << 20), Some(0x800f_0000));
+        assert_eq!(boot_block_addr(64 << 10), Some(0x8000_0000), "all of RAM");
+        assert_eq!(boot_block_addr(60 << 10), None);
     }
 }

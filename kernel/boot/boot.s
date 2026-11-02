@@ -30,9 +30,10 @@
 #   2. for each PT_LOAD segment: check it lies in RAM below this block and in
 #      the kernel's sectors, read its whole sectors straight to p_paddr with the
 #      disk's DMA, its last partial sector through a buffer (so nothing past
-#      p_filesz is written), and zero the rest up to p_memsz (.bss). Its file
-#      offset must be a multiple of 512, as merlin-ld and ld.lld make it (they
-#      align segments to 4 KiB);
+#      p_filesz is written), and zero the rest up to p_memsz (.bss). A segment
+#      with file bytes must start at a multiple of 512 in the file, as merlin-ld
+#      and ld.lld place segments that follow 4 KiB pages; a .bss-only one
+#      (p_filesz 0) reads nothing, so its offset does not matter;
 #   3. write the kernel's entry point to the ROM's entry word (0x1010), so that
 #      harts the kernel wakes later with an IPI jump to it from the park loop,
 #      as after an ELF boot;
@@ -149,13 +150,6 @@ segment:
     lw    s8, P_PADDR(s5)
     lw    s9, P_FILESZ(s5)
     lw    s10, P_MEMSZ(s5)
-    la    a0, s_align
-    andi  t0, s7, SECTOR_SIZE - 1
-    bnez  t0, fail
-    la    a0, s_short                   # offset + filesz within the kernel
-    add   t0, s7, s9
-    bltu  t0, s7, fail
-    bgtu  t0, s3, fail
     la    a0, s_place                   # RAM_BASE <= paddr <= paddr + memsz <= s0
     bltu  s10, s9, fail
     li    t1, RAM_BASE
@@ -163,6 +157,14 @@ segment:
     add   t0, s8, s10
     bltu  t0, s8, fail
     bgtu  t0, s0, fail
+    beqz  s9, 3f                        # nothing in the file: only zeros
+    la    a0, s_align
+    andi  t0, s7, SECTOR_SIZE - 1
+    bnez  t0, fail
+    la    a0, s_short                   # offset + filesz within the kernel
+    add   t0, s7, s9
+    bltu  t0, s7, fail
+    bgtu  t0, s3, fail
 
     # Its whole sectors, straight to p_paddr.
     srli  a3, s7, 9

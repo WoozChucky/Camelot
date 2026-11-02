@@ -82,9 +82,10 @@ pub fn boot_code(elf: &[u8]) -> Result<Vec<u8>, String> {
 /// Checks that the bootloader can load the kernel ELF `elf`: an Excalibur
 /// executable (ELF32, little-endian, RISC-V, `ET_EXEC`) whose ELF header and
 /// program headers are in its first [`KERNEL_HEADERS`] bytes, and whose
-/// loadable segments start at a sector boundary of the file and go in RAM.
-/// (Whether they fit below the bootloader depends on the machine's RAM: the
-/// bootloader checks that.)
+/// loadable segments go in RAM and, when they have bytes in the file, start at
+/// a sector boundary of it (a `.bss`-only segment reads nothing, so its file
+/// offset does not matter). (Whether they fit below the bootloader depends on
+/// the machine's RAM: the bootloader checks that.)
 pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
     let e = elf32::Elf::parse(elf).map_err(|e| format!("kernel: {e}"))?;
     let h = &e.header;
@@ -99,7 +100,7 @@ pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
         ));
     }
     for p in e.segments.iter().filter(|p| p.ty == elf32::PT_LOAD) {
-        if !(p.offset as usize).is_multiple_of(SECTOR_SIZE) {
+        if p.filesz != 0 && !(p.offset as usize).is_multiple_of(SECTOR_SIZE) {
             return Err(format!(
                 "kernel: the segment at {:#x} is at file offset {:#x}, not a multiple of {SECTOR_SIZE}",
                 p.paddr, p.offset
@@ -151,7 +152,8 @@ pub fn install(image: &mut Vec<u8>, boot_elf: &[u8], kernel_elf: &[u8]) -> Resul
 
 /// What the boot block of `image` says, if Grail's boot ROM would boot it:
 /// `None` when it has no signature, an error when it has one but a bad
-/// checksum or names sectors past the image.
+/// checksum or names sectors past the image. `kernel_sectors` 0 means no
+/// kernel (Camelot's bootloader refuses it).
 pub fn boot_info(image: &[u8]) -> Result<Option<BootInfo>, String> {
     let Some(block) = image.get(..BOOT_BLOCK_SIZE) else {
         return Ok(None);
@@ -166,12 +168,15 @@ pub fn boot_info(image: &[u8]) -> Result<Option<BootInfo>, String> {
         kernel_sector: get(block, KERNEL_SECTOR_AT),
         kernel_sectors: get(block, KERNEL_SECTORS_AT),
     };
-    let end = (info.kernel_sector as u64 + info.kernel_sectors as u64) * SECTOR_SIZE as u64;
-    if end > image.len() as u64 {
+    if info.kernel_sectors == 0 {
+        return Ok(Some(info));
+    }
+    let end = info.kernel_sector as u64 + info.kernel_sectors as u64;
+    if end * SECTOR_SIZE as u64 > image.len() as u64 {
         return Err(format!(
             "the boot block's kernel (sectors {} to {}) runs past the image",
             info.kernel_sector,
-            info.kernel_sector as u64 + info.kernel_sectors as u64
+            end - 1
         ));
     }
     Ok(Some(info))
@@ -180,6 +185,9 @@ pub fn boot_info(image: &[u8]) -> Result<Option<BootInfo>, String> {
 /// The kernel ELF of a bootable image (with the padding after it).
 pub fn kernel_image(image: &[u8]) -> Result<&[u8], String> {
     let info = boot_info(image)?.ok_or("the image is not bootable")?;
+    if info.kernel_sectors == 0 {
+        return Err("the boot block names no kernel".into());
+    }
     let at = info.kernel_sector as usize * SECTOR_SIZE;
     Ok(&image[at..at + info.kernel_sectors as usize * SECTOR_SIZE])
 }
@@ -287,10 +295,26 @@ mod tests {
         let mut bad = image.clone();
         bad[100] ^= 1;
         assert!(boot_info(&bad).unwrap_err().contains("checksum"));
-        assert!(boot_info(&image[..301 * BSIZE])
-            .unwrap_err()
-            .contains("past the image"));
+        assert_eq!(
+            boot_info(&image[..301 * BSIZE]),
+            Err("the boot block's kernel (sectors 600 to 603) runs past the image".into())
+        );
         assert!(kernel_image(&mkfs::mkfs(&small(), None).unwrap()).is_err());
+        // A boot block that names no kernel: no range to check, and no kernel.
+        let mut none = image.clone();
+        put(&mut none, KERNEL_SECTOR_AT, 0xdead_beef);
+        put(&mut none, KERNEL_SECTORS_AT, 0);
+        put(&mut none, CHECKSUM_AT, 0);
+        let fix = 0u32.wrapping_sub(checksum(&none[..BOOT_BLOCK_SIZE]));
+        put(&mut none, CHECKSUM_AT, fix);
+        assert_eq!(
+            boot_info(&none),
+            Ok(Some(BootInfo {
+                kernel_sector: 0xdead_beef,
+                kernel_sectors: 0
+            }))
+        );
+        assert!(kernel_image(&none).unwrap_err().contains("no kernel"));
     }
 
     #[test]
@@ -315,6 +339,17 @@ mod tests {
         assert!(err(&boot, &rel).contains("not a RISC-V executable"));
         let odd = elf(RAM_BASE, &[(elf32::PT_LOAD, 0x204, RAM_BASE, 4, 4)], 0x300);
         assert!(err(&boot, &odd).contains("not a multiple of 512"));
+        // A .bss-only segment reads nothing from the file: its offset is not checked
+        // (merlin-ld gives it one congruent to its address modulo 4 KiB).
+        let bss_only = elf(
+            RAM_BASE,
+            &[
+                (elf32::PT_LOAD, 0x200, RAM_BASE, 4, 4),
+                (elf32::PT_LOAD, 0x210, RAM_BASE + 0x1010, 0, 0x100),
+            ],
+            0x300,
+        );
+        assert!(install(&mut fresh(), &boot, &bss_only).is_ok());
         let low = elf(0, &[(elf32::PT_LOAD, 0x200, 0x1000, 4, 4)], 0x300);
         assert!(err(&boot, &low).contains("not in RAM"));
         let wraps = elf(

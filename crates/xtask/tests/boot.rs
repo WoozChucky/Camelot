@@ -79,6 +79,10 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
         out.ends_with("$ echo from the disk\nfrom the disk\n$ exit\n"),
         "{out}"
     );
+    // The bootloader pointed the ROM's entry word at the kernel, so harts the kernel
+    // wakes with an IPI go there from the park loop, as after an ELF boot.
+    let entry = elf32::Elf::parse(&kernel).unwrap().header.entry;
+    assert_eq!(m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR), Some(entry));
 }
 
 /// The value of `.equ NAME, VALUE` in an assembly source.

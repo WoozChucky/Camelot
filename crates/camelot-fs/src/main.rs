@@ -103,17 +103,26 @@ fn read_image(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Says where a bootable image's kernel is; nothing for one that is not.
-fn print_boot(image: &[u8]) -> Result<(), String> {
-    if let Some(info) = boot::boot_info(image)? {
-        println!(
+/// Says where a bootable image's kernel is; nothing for an image with no signed
+/// boot block. A signed boot block that is not a good one of Camelot's (a bad
+/// checksum, no kernel, a kernel past the image) gets a warning, not an error:
+/// the filesystem is fine all the same, and the block may be another author's
+/// bootloader, which the boot ROM boots as well (it only checks the signature
+/// and the checksum).
+fn print_boot(image: &[u8]) {
+    match boot::boot_info(image) {
+        Ok(None) => {}
+        Ok(Some(info)) if info.kernel_sectors == 0 => {
+            println!("not bootable: the boot block names no kernel")
+        }
+        Ok(Some(info)) => println!(
             "bootable: kernel at sector {}, {} sectors ({} KiB)",
             info.kernel_sector,
             info.kernel_sectors,
             info.kernel_sectors / 2
-        );
+        ),
+        Err(e) => println!("warning: {e}"),
     }
-    Ok(())
 }
 
 fn run(args: &[String]) -> Result<ExitCode, String> {
@@ -137,7 +146,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 r.dirs,
                 r.files
             );
-            print_boot(&image)?;
+            print_boot(&image);
             Ok(ExitCode::SUCCESS)
         }
         ["fsck", rest @ ..] => {
@@ -185,7 +194,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                         r.files,
                         r.devices
                     );
-                    print_boot(&image)?;
+                    print_boot(&image);
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(problems) => {

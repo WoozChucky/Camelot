@@ -326,10 +326,11 @@ address with the disk's DMA, the last partial sector through a buffer, then
 zeros up to `p_memsz`. It refuses (printing `boot: <why>` and stopping with
 exit code 0xFC) a block with `kernel_sectors` 0, a read error, a kernel that
 is not an ELF32 little-endian RISC-V `ET_EXEC` with its program headers in
-its first 1 KiB, a segment whose file offset is not a multiple of 512
-(merlin-ld and ld.lld align them to 4 KiB) or that runs past
-`kernel_sectors`, and a segment outside RAM or reaching into the 64 KiB the
-bootloader runs in. Then it writes the kernel's entry point to the boot
+its first 1 KiB, a segment with file bytes whose file offset is not a
+multiple of 512 (merlin-ld and ld.lld place segments at page offsets) or
+that runs past `kernel_sectors` (a `.bss`-only segment, `p_filesz` 0, reads
+nothing, so its offset is not checked), and a segment outside RAM or
+reaching into the 64 KiB the bootloader runs in. Then it writes the kernel's entry point to the boot
 ROM's entry word, so harts the kernel wakes go there too, and jumps to it
 with a0 = 0 and a1 = the sysinfo block. On success it prints one line,
 `boot: kernel at sector 0x...`.

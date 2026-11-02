@@ -197,8 +197,9 @@ fn wrong_state(vm: &Vm, state: VmState, want: &str) -> Fail {
 impl Vm {
     /// Builds the machine `config` describes, with `cards` as its network cards (still
     /// unplugged), and loads `program` into it (with an empty one, the machine boots
-    /// from its disk 0), as VM 0 until the server gives it an id. Errors: `InvalidProfile` (a disk image that cannot be opened) and
-    /// `InvalidProgram`. This can take a while (it opens files on the host and
+    /// from its disk 0), as VM 0 until the server gives it an id. Errors:
+    /// `InvalidProfile` (a disk image that cannot be opened) and `InvalidProgram`
+    /// (also no disk to boot from). This can take a while (it opens files on the host and
     /// allocates the guest's RAM), so the server calls it without holding its table.
     pub fn new(
         name: String,
