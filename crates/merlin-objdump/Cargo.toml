@@ -1,0 +1,16 @@
+[package]
+name = "merlin-objdump"
+description = "Merlin disassembler: prints the headers, symbols, relocations and code of ELF32 objects and executables"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "merlin_objdump"
+
+[dependencies]
+excalibur = { path = "../excalibur" }
+elf32 = { path = "../elf32" }
+
+[dev-dependencies]
+merlin-as = { path = "../merlin-as" }

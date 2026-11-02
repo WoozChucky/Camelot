@@ -1,0 +1,20 @@
+
+crates/merlin-objdump/tests/fixtures/relocs.o:	file format elf32-littleriscv
+
+SYMBOL TABLE:
+00000000 l       .text	00000000 $x
+00000010 l       .text	00000000 .Lpcrel_hi0
+00000000 l     O .rodata	00000010 local_data
+00000018 l       .text	00000000 .Lpcrel_hi1
+00000020 l       .text	00000000 .Lpcrel_hi2
+00000028 l       .text	00000000 .Lpcrel_hi3
+00000050 l       .text	00000000 local_label
+00000000 l       .rodata	00000000 $d
+00000000 l       .data	00000000 $d
+00000000 l       .bss	00000000 $d
+00000000 l       .riscv.attributes	00000000 $d
+00000000 g     F .text	00000054 func
+00000000         *UND*	00000000 ext_func
+00000000         *UND*	00000000 ext_data
+00000000 g     O .data	0000000b table
+00000000 g       .bss	00000000 buffer

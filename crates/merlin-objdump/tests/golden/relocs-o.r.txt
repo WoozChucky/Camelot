@@ -1,0 +1,46 @@
+
+crates/merlin-objdump/tests/fixtures/relocs.o:	file format elf32-littleriscv
+
+RELOCATION RECORDS FOR [.text]:
+OFFSET   TYPE                     VALUE
+00000000 R_RISCV_CALL_PLT         ext_func
+00000000 R_RISCV_RELAX            *ABS*
+00000008 R_RISCV_CALL_PLT         ext_func
+00000008 R_RISCV_RELAX            *ABS*
+00000010 R_RISCV_PCREL_HI20       local_data
+00000010 R_RISCV_RELAX            *ABS*
+00000014 R_RISCV_PCREL_LO12_I     .Lpcrel_hi0
+00000014 R_RISCV_RELAX            *ABS*
+00000018 R_RISCV_PCREL_HI20       ext_data
+00000018 R_RISCV_RELAX            *ABS*
+0000001c R_RISCV_PCREL_LO12_I     .Lpcrel_hi1
+0000001c R_RISCV_RELAX            *ABS*
+00000020 R_RISCV_PCREL_HI20       local_data
+00000020 R_RISCV_RELAX            *ABS*
+00000024 R_RISCV_PCREL_LO12_I     .Lpcrel_hi2
+00000024 R_RISCV_RELAX            *ABS*
+00000028 R_RISCV_PCREL_HI20       ext_data
+00000028 R_RISCV_RELAX            *ABS*
+0000002c R_RISCV_PCREL_LO12_S     .Lpcrel_hi3
+0000002c R_RISCV_RELAX            *ABS*
+00000030 R_RISCV_HI20             ext_data
+00000030 R_RISCV_RELAX            *ABS*
+00000034 R_RISCV_LO12_I           ext_data
+00000034 R_RISCV_RELAX            *ABS*
+00000038 R_RISCV_LO12_I           ext_data+0x8
+00000038 R_RISCV_RELAX            *ABS*
+0000003c R_RISCV_LO12_S           ext_data-0x4
+0000003c R_RISCV_RELAX            *ABS*
+00000040 R_RISCV_BRANCH           ext_func
+00000044 R_RISCV_JAL              ext_func
+
+RELOCATION RECORDS FOR [.rodata]:
+OFFSET   TYPE                     VALUE
+00000004 R_RISCV_32               ext_data
+00000008 R_RISCV_32               ext_data+0x10
+0000000c R_RISCV_32               local_label
+
+RELOCATION RECORDS FOR [.data]:
+OFFSET   TYPE                     VALUE
+00000000 R_RISCV_32               func
+00000004 R_RISCV_32               table+0x4

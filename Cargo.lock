@@ -26,6 +26,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "merlin-objdump"
+version = "0.1.0"
+dependencies = [
+ "elf32",
+ "excalibur",
+ "merlin-as",
+]
+
+[[package]]
 name = "xtask"
 version = "0.1.0"
 dependencies = [
