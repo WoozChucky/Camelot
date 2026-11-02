@@ -1,1 +1,5 @@
 /target
+
+# Claude Code: agent worktrees and personal settings (shared .claude/ files stay tracked)
+/.claude/worktrees/
+/.claude/settings.local.json
