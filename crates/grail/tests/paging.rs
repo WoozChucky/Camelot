@@ -19,6 +19,7 @@ const R: u64 = 1 << 1;
 const W: u64 = 1 << 2;
 const X: u64 = 1 << 3;
 const U: u64 = 1 << 4;
+const G: u64 = 1 << 5;
 const A: u64 = 1 << 6;
 const D: u64 = 1 << 7;
 
@@ -255,6 +256,13 @@ fn reserved_pte_bits_fault() {
                 p.assert_page_faults(VA, &format!("{sv:?}, level {level} pointer, {bit:#x}"));
             }
         }
+        // G is not reserved in a pointer: it marks the whole subtree global.
+        let mut p = Paged::new(sv);
+        p.map(VA, 0, RAM, RWXAD);
+        let entry = ROOT + vpn(VA, sv.levels() - 1) * 8;
+        let pointer = p.pte(entry);
+        write64(&mut p.bus, entry, pointer | G);
+        assert_eq!(p.translate(VA, Access::Load), Ok(RAM | VA & 0xfff), "{sv:?}, G");
         // The PPN reaches bit 53: a page above the 48-bit physical address width
         // translates, and the access to it is the access fault (the next test).
         let mut p = Paged::new(sv);
@@ -385,6 +393,16 @@ fn sv32_pages_and_tables_above_4_gib_do_not_wrap() {
         hart.load(&mut bus, va, 4),
         Err(Trap::new(Exception::LoadAccessFault, va))
     );
+
+    // A pointer with A, D or U set is a page fault in Sv32 too.
+    for bit in [A, D, U] {
+        bus.write(ROOT as u32 + 4, 4, pte32(table, bit)).unwrap();
+        assert_eq!(
+            hart.translate(&mut bus, va, Access::Load),
+            Err(Trap::new(Exception::LoadPageFault, va)),
+            "{bit:#x}"
+        );
+    }
 
     // A pointer to a table above 4 GiB: the walk's read of it is the access fault.
     bus.write(ROOT as u32 + 4, 4, pte32(1 << 32 | table, 0)).unwrap();
