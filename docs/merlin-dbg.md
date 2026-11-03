@@ -80,7 +80,7 @@ The selected hart (`select_hart`, hart 0 to begin with) is the one these read an
 `read_memory` and `write_memory` access memory, in one of two spaces:
 
 - `Space::Physical`: physical addresses.
-- `Space::Virtual`: translated as the hart's instruction fetches are now. That means physical in M-mode or with `satp` off, through its Sv32 page table otherwise, with no permission checks, so a debugger can read a user page from S-mode.
+- `Space::Virtual`: translated as the hart's instruction fetches are now. That means physical in M-mode or with `satp` off, through its page table otherwise (Sv39 or Sv48 on an RV64 hart, Sv32 on an RV32 one), with no permission checks, so a debugger can read a user page from S-mode.
 
 Memory reads and writes stop at the first byte that is not memory (RAM, VRAM, or the boot ROM for reads). Device registers are never accessed, since reading one can change it. A write breaks the LR/SC reservations on the words it changes, as a store would.
 
