@@ -331,7 +331,7 @@ mod tests {
             .bus
             .load(crate::bus::RAM_BASE, &0x0000_006fu32.to_le_bytes())
             .unwrap(); // j .
-        m.cpu.pc = crate::bus::RAM_BASE;
+        m.cpu.pc = crate::bus::RAM_BASE.into();
         let title = format!("Grail display close test {}", std::process::id());
         let user = std::thread::spawn({
             let title = title.clone();
@@ -368,7 +368,7 @@ mod budget_tests {
                 .bus
                 .load(crate::bus::RAM_BASE, &0x0000_006fu32.to_le_bytes())
                 .unwrap(); // j .
-            m.cpu.pc = crate::bus::RAM_BASE;
+            m.cpu.pc = crate::bus::RAM_BASE.into();
             let mut steps = 0u64;
             let outcome = run(&mut m, Some(limit), |_| steps += 1, &DisplayOptions::default()).unwrap();
             assert_eq!(outcome, Outcome::Program(RunResult::StepLimit), "{limit}");

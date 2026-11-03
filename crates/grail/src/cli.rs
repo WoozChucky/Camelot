@@ -4,7 +4,9 @@
 
 use crate::config::DiskSource;
 use crate::net::Hub;
-use crate::{parse_clock, parse_harts, parse_ram_mib, DiskConfig, Machine, MachineConfig, NetConfig};
+use crate::{
+    parse_clock, parse_harts, parse_ram_mib, parse_xlen, DiskConfig, Machine, MachineConfig, NetConfig,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -24,6 +26,8 @@ for the Camelot kernel (spec section 7, \"Boot from disk\").
                   --clock 10MHz, --clock 500kHz, --clock 1.5MHz, --clock 5Hz.
                   Without it Grail runs at full speed, deterministically, and reports
                   a nominal 10 MHz clock to software
+  --xlen 32|64    the harts' width, RV32 or RV64 (default 32; an ELF64 program
+                  makes the machine RV64)
   --harts N       N harts (cores), 1 to 8 (default 1). They share memory and
                   devices and take turns, one instruction each per step, so
                   with --clock each runs at FREQ. Hart 0 starts the program;
@@ -132,6 +136,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, Error> {
             "--ram" => config.ram_size = parsed("--ram", value("--ram")?, parse_ram_mib)?,
             "--clock" => config.clock_hz = Some(parsed("--clock", value("--clock")?, parse_clock)?),
             "--harts" => config.harts = parsed("--harts", value("--harts")?, parse_harts)?,
+            "--xlen" => config.xlen = parsed("--xlen", value("--xlen")?, parse_xlen)?,
             "--disk" | "--disk-ro" => {
                 let disk = parsed(&a, value(&a)?, DiskConfig::parse)?;
                 config.disks.push(disk.with_read_only(a == "--disk-ro"));
@@ -247,6 +252,10 @@ mod tests {
         let o = parse(args("--harts 2 --ram 8 --trace p.elf")).unwrap();
         assert_eq!(o.program.as_deref(), Some("p.elf"));
         assert_eq!((o.config.harts, o.config.ram_size, o.trace), (2, 8 << 20, true));
+        assert_eq!(o.config.xlen, crate::Xlen::Rv32);
+        let o = parse(args("--xlen 64 p.elf")).unwrap();
+        assert_eq!(o.config.xlen, crate::Xlen::Rv64);
+        assert!(parse(args("--xlen 128 p.elf")).is_err());
         assert_eq!(parse(args("-h")).err(), Some(Error::Help));
         assert_eq!(
             parse(args("")).err(),

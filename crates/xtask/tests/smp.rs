@@ -105,7 +105,7 @@ fn check_harts(lines: &[HartLine], n: u32, mtime: u64) {
 /// Whether the hart whose turn it is is about to flush its TLB for another
 /// hart's shootdown: at `sfence_vma`, called from tlb_serve().
 fn serving(cpu: &Cpu, sfence: u32, serve: &Range<u32>) -> bool {
-    cpu.pc == sfence && serve.contains(&cpu.x[1])
+    cpu.pc == u64::from(sfence) && serve.contains(&(cpu.x[1] as u32))
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn boots_on_every_hart_count() {
             if serving(cpu, sfence, &serve) {
                 flushed.insert(cpu.id);
             }
-            if cpu.id == 0 && cpu.pc == kfree && selftest.contains(&cpu.x[1]) {
+            if cpu.id == 0 && cpu.pc == u64::from(kfree) && selftest.contains(&(cpu.x[1] as u32)) {
                 assert!(flushed_at_free.is_none(), "the self-test freed twice");
                 flushed_at_free = Some(flushed.clone());
             }
@@ -231,16 +231,17 @@ fn a_shootdown_waits_for_a_hart_slow_to_flush() {
             if cpu.id == 2 && flushed.is_none() && serving(cpu, sfence, &serve) {
                 flushed = Some(step);
             }
-            if cpu.id == 0 && cpu.pc == kfree && selftest.contains(&cpu.x[1]) {
+            if cpu.id == 0 && cpu.pc == u64::from(kfree) && selftest.contains(&(cpu.x[1] as u32)) {
                 freed.set(Some(step));
             }
         },
         |m| {
             let hart = m.cpu.hart(2);
-            if !skipped && hart.pc == serve.start && m.cpu.bus.peek(asked) != m.cpu.bus.peek(done) {
+            if !skipped && hart.pc == u64::from(serve.start) && m.cpu.bus.peek(asked) != m.cpu.bus.peek(done)
+            {
                 skipped = true;
-                let ra = hart.x[1];
-                m.cpu.hart_mut(2).pc = ra;
+                let ra = hart.x[1] as u32;
+                m.cpu.hart_mut(2).pc = ra.into();
             }
             freed.get().is_some()
         },
@@ -282,7 +283,7 @@ fn a_kernel_shootdown_reaches_harts_running_processes() {
     let serve = function("tlb_serve");
     let sfence = sym(&elf, "sfence_vma");
     // Hart 0's registers to put back once the call returns, while it runs.
-    let mut saved: Option<[u32; 32]> = None;
+    let mut saved: Option<[u64; 32]> = None;
     let calling = Cell::new(false);
     let mut flushed = HashSet::new();
     let returned = step_until(
@@ -295,7 +296,7 @@ fn a_kernel_shootdown_reaches_harts_running_processes() {
         },
         |m| {
             let hart0 = m.cpu.hart(0);
-            if hart0.pc != user_trap {
+            if hart0.pc != u64::from(user_trap) {
                 return false;
             }
             match saved {
@@ -307,9 +308,9 @@ fn a_kernel_shootdown_reaches_harts_running_processes() {
                     if busy {
                         saved = Some(hart0.x);
                         let h = m.cpu.hart_mut(0);
-                        h.x[10] = kernel_pt;
-                        h.x[1] = user_trap;
-                        h.pc = shootdown;
+                        h.set_reg(10, kernel_pt.into());
+                        h.set_reg(1, user_trap.into());
+                        h.pc = shootdown.into();
                         calling.set(true);
                     }
                     false
@@ -339,10 +340,10 @@ fn a_kernel_shootdown_reaches_harts_running_processes() {
 
 /// sstatus bits (spec section 3): SIE, SPIE, SPP, and the mask of the
 /// mstatus bits sstatus shows (SIE, SPIE, SPP, SUM, MXR).
-const SSTATUS_SIE: u32 = 1 << 1;
-const SSTATUS_SPIE: u32 = 1 << 5;
-const SSTATUS_SPP: u32 = 1 << 8;
-const SSTATUS_MASK: u32 = SSTATUS_SIE | SSTATUS_SPIE | SSTATUS_SPP | (1 << 18) | (1 << 19);
+const SSTATUS_SIE: u64 = 1 << 1;
+const SSTATUS_SPIE: u64 = 1 << 5;
+const SSTATUS_SPP: u64 = 1 << 8;
+const SSTATUS_MASK: u64 = SSTATUS_SIE | SSTATUS_SPIE | SSTATUS_SPP | (1 << 18) | (1 << 19);
 
 /// Exit code of a kernel panic (`PANIC_EXIT_CODE` in kernel/include/trap.h).
 const PANIC_EXIT: u32 = 0xfe;
@@ -366,7 +367,7 @@ impl Freeze {
 
     /// Whether hart `h` of `m` is there.
     fn holds(&self, m: &Machine, h: usize) -> bool {
-        let (pc, ra) = (m.cpu.hart(h).pc, m.cpu.hart(h).x[1]);
+        let (pc, ra) = (m.cpu.hart(h).pc as u32, m.cpu.hart(h).x[1] as u32);
         self.body.contains(&pc) || (self.wfi.contains(&pc) && self.body.contains(&ra))
     }
 }
@@ -403,7 +404,7 @@ fn a_panic_stops_the_harts_printing_meanwhile() {
             let Some(printer) = (0..4).find(|&h| {
                 let hart = m.cpu.hart(h);
                 let p = m.cpu.bus.peek(cpus + h as u32 * CPU_SIZE + CPU_PROC).unwrap();
-                putc.contains(&hart.pc)
+                putc.contains(&(hart.pc as u32))
                     && holder == cpus + h as u32 * CPU_SIZE
                     && p != 0
                     && proc_name(&m.cpu, p) == "stress"
@@ -412,7 +413,7 @@ fn a_panic_stops_the_harts_printing_meanwhile() {
             };
             let Some(victim) = (0..4).find(|&h| {
                 let hart = m.cpu.hart(h);
-                h != printer && hart.mode == Mode::S && hart.csr.stvec == kernel_vec
+                h != printer && hart.mode == Mode::S && hart.csr.stvec == u64::from(kernel_vec)
             }) else {
                 return false;
             };
@@ -448,7 +449,7 @@ fn a_panic_stops_the_harts_printing_meanwhile() {
     want += va;
     want += "\n";
     for (i, r) in regs.iter().enumerate().skip(1) {
-        want += &format!("  {:>3} {r:08x}", excalibur::reg::abi_name(i as u8));
+        want += &format!("  {:>3} {:08x}", excalibur::reg::abi_name(i as u8), *r as u32);
         if i % 4 == 0 || i == 31 {
             want += "\n";
         }
@@ -481,7 +482,7 @@ fn a_hart_stops_printing_while_a_panic_begins() {
             &mut m,
             RUN_MAX_STEPS,
             |_| {},
-            |m| m.cpu.hart(0).pc == smp_boot
+            |m| m.cpu.hart(0).pc == u64::from(smp_boot)
         ));
         m.cpu.bus.load(panicking, &[1]).unwrap();
         let before = printed(&m);

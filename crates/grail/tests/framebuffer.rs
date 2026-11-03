@@ -260,12 +260,13 @@ fn one_access(inst: u32, addr: u32) -> (Machine, Option<(u32, u32)>) {
     let trap_vector = RAM_BASE + 0x4000;
     let mut m = Machine::with_ram(1 << 20);
     m.cpu.bus.load(RAM_BASE, &inst.to_le_bytes()).unwrap();
-    m.cpu.pc = RAM_BASE;
-    m.cpu.csr.mtvec = trap_vector;
-    m.cpu.x[10] = addr;
+    m.cpu.pc = RAM_BASE.into();
+    m.cpu.csr.mtvec = trap_vector.into();
+    m.cpu.set_reg(10, addr.into());
     m.cpu.x[11] = 0x0000_0101;
     m.cpu.step();
-    let trap = (m.cpu.pc == trap_vector).then_some((m.cpu.csr.mcause, m.cpu.csr.mtval));
+    let trap =
+        (m.cpu.pc == u64::from(trap_vector)).then_some((m.cpu.csr.mcause as u32, m.cpu.csr.mtval as u32));
     (m, trap)
 }
 
@@ -311,10 +312,10 @@ fn programs_see_the_register_rules_as_traps() {
     let (mut m, _) = one_access(0x0000_0013, 0); // nop: just a machine
     m.cpu.bus.write(VRAM_BASE + 5, 1, 0x80).unwrap();
     m.cpu.bus.load(grail::bus::RAM_BASE, &lb.to_le_bytes()).unwrap();
-    m.cpu.pc = grail::bus::RAM_BASE;
-    m.cpu.x[10] = VRAM_BASE + 5;
+    m.cpu.pc = grail::bus::RAM_BASE.into();
+    m.cpu.set_reg(10, (VRAM_BASE + 5).into());
     m.cpu.step();
-    assert_eq!(m.cpu.x[12], 0xffff_ff80);
+    assert_eq!(m.cpu.x[12] as u32, 0xffff_ff80);
 }
 
 #[test]

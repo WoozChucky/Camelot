@@ -44,7 +44,7 @@ pub fn disk_loader() -> Vec<u8> {
     let elf = crate::elf::parse(DISKBOOT_ELF).expect("rom/diskboot.elf is an ELF file");
     let mut code = Vec::new();
     for seg in &elf.segments {
-        let at = (seg.paddr - DISK_BOOT_PC) as usize;
+        let at = (seg.paddr - u64::from(DISK_BOOT_PC)) as usize;
         code.resize(code.len().max(at + seg.mem_size as usize), 0);
         code[at..at + seg.data.len()].copy_from_slice(&seg.data);
     }
@@ -96,7 +96,11 @@ mod tests {
         assert!(code.len() > 100);
         assert!(DISK_BOOT_PC as usize - BOOT_ROM_BASE as usize + code.len() <= 0x1000);
         let elf = crate::elf::parse(DISKBOOT_ELF).unwrap();
-        assert_eq!(elf.entry, DISK_BOOT_PC, "the loader starts at its first byte");
+        assert_eq!(
+            elf.entry,
+            u64::from(DISK_BOOT_PC),
+            "the loader starts at its first byte"
+        );
     }
 
     #[test]

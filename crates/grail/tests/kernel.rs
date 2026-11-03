@@ -259,13 +259,13 @@ fn store_to_kernel_text_panics() {
     let mut m = grail::Machine::new(grail::MachineConfig::default()).unwrap();
     m.cpu.bus.uart.capture = true;
     m.load_elf(&file).unwrap();
-    const STORE_PAGE_FAULT: u32 = 15;
+    const STORE_PAGE_FAULT: u64 = 15;
     // (The vm self-test's probes make store page faults too, elsewhere.)
     let mut at_fault = None;
     let r = m.run(Some(MAX_STEPS.parse().unwrap()), |cpu| {
-        if at_fault.is_none() && cpu.csr.scause == STORE_PAGE_FAULT && cpu.csr.stval == va {
+        if at_fault.is_none() && cpu.csr.scause == STORE_PAGE_FAULT && cpu.csr.stval == u64::from(va) {
             let peek = |addr: u32| cpu.bus.peek(addr).unwrap();
-            let root = (cpu.csr.satp & 0x3f_ffff) << 12;
+            let root = (cpu.csr.satp as u32 & 0x3f_ffff) << 12;
             let table = (peek(root + 4 * (va >> 22)) >> 10) << 12;
             at_fault = Some(peek(table + 4 * (va >> 12 & 0x3ff)));
         }

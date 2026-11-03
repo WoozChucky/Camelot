@@ -76,7 +76,7 @@ impl Turns {
     fn trace(&mut self) -> impl FnMut(&Cpu) + '_ {
         |cpu| {
             self.0.write_u32(cpu.id);
-            self.0.write_u32(cpu.pc);
+            self.0.write_u32(cpu.pc as u32);
             self.0.write_u8(cpu.mode as u8);
             self.0.write_u64(cpu.bus.clint.mtime);
             self.1 += 1;
@@ -289,7 +289,7 @@ fn harts_stop_between_turns() {
     assert_eq!(m.debug_step(&mut trace), Stop::Stepped { hart: 1 });
     assert_eq!(m.pc(), work + 4);
     assert_eq!(m.cpu.next_hart(), 0);
-    assert_eq!(m.cpu.hart(0).pc, hart0, "hart 0 has not run");
+    assert_eq!(m.cpu.hart(0).pc as u32, hart0, "hart 0 has not run");
     let _ = hart0;
     // Stepping hart 1 again: hart 0 takes its turn first, then hart 1 its.
     m.debug_step(&mut trace);
@@ -298,7 +298,7 @@ fn harts_stop_between_turns() {
     m.select_hart(0).unwrap();
     m.debug_step(&mut trace);
     assert_eq!(m.cpu.next_hart(), 1);
-    assert_eq!(m.cpu.hart(1).pc, work + 8);
+    assert_eq!(m.cpu.hart(1).pc as u32, work + 8);
     assert!(m.select_hart(2).is_err());
 
     // Watching the shared counter: each stop is one hart's amoadd.w, adding 1.

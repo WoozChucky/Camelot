@@ -213,25 +213,25 @@ impl Machine {
         self.debug.hart
     }
 
+    // The debug interface is 32-bit, an RV32 machine's view: #147 widens it for RV64.
+
     /// Register `x<r>` of the selected hart (`r` < 32).
     pub fn reg(&self, r: usize) -> u32 {
-        self.cpu.hart(self.debug.hart).x[r]
+        self.cpu.hart(self.debug.hart).x[r] as u32
     }
 
     /// Writes register `x<r>` of the selected hart. Writes to `x0` are ignored.
     pub fn set_reg(&mut self, r: usize, v: u32) {
-        if r != 0 {
-            self.cpu.hart_mut(self.debug.hart).x[r] = v;
-        }
+        self.cpu.hart_mut(self.debug.hart).set_reg(r as u8, v.into());
     }
 
     /// The selected hart's pc: the instruction it executes next.
     pub fn pc(&self) -> u32 {
-        self.cpu.hart(self.debug.hart).pc
+        self.cpu.hart(self.debug.hart).pc as u32
     }
 
     pub fn set_pc(&mut self, pc: u32) {
-        self.cpu.hart_mut(self.debug.hart).pc = pc;
+        self.cpu.hart_mut(self.debug.hart).pc = pc.into();
     }
 
     /// The selected hart's privilege mode.
@@ -246,13 +246,16 @@ impl Machine {
     /// CSR `addr` of the selected hart, whatever its privilege mode. `None` if Grail has
     /// no such CSR.
     pub fn csr(&self, addr: u16) -> Option<u32> {
-        self.cpu.hart(self.debug.hart).csr_value(&self.cpu.bus, addr)
+        self.cpu
+            .hart(self.debug.hart)
+            .csr_value(&self.cpu.bus, addr)
+            .map(|v| v as u32)
     }
 
     /// Writes CSR `addr` of the selected hart, with the CSR's WARL rules. Returns false if
     /// Grail has no such CSR or it is read-only.
     pub fn set_csr(&mut self, addr: u16, v: u32) -> bool {
-        self.cpu.hart_mut(self.debug.hart).csr_store(addr, v)
+        self.cpu.hart_mut(self.debug.hart).csr_store(addr, v.into())
     }
 
     /// The physical address of `addr` in `space`, as [`Machine::read_memory`] sees it.
@@ -262,7 +265,8 @@ impl Machine {
             Space::Virtual => self
                 .cpu
                 .hart(self.debug.hart)
-                .debug_translate(&self.cpu.bus, addr),
+                .debug_translate(&self.cpu.bus, addr.into())
+                .and_then(|p| u32::try_from(p).ok()),
         }
     }
 
@@ -387,8 +391,9 @@ impl Machine {
         }
         let hart = self.cpu.next_hart();
         let h = self.cpu.hart(hart);
-        (self.debug.breakpoints.contains(&h.pc) && h.will_execute(&self.cpu.bus))
-            .then_some(Stop::Breakpoint { hart, pc: h.pc })
+        let pc = h.pc as u32;
+        (self.debug.breakpoints.contains(&pc) && h.will_execute(&self.cpu.bus))
+            .then_some(Stop::Breakpoint { hart, pc })
     }
 
     /// Runs the next hart's turn. Returns true if it ended a step.

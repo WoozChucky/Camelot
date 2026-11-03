@@ -52,16 +52,16 @@ fn machine(code: &[u32]) -> Machine {
     let mut m = Machine::with_ram(1 << 20);
     let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
     m.cpu.bus.load(RAM_BASE, &bytes).unwrap();
-    m.cpu.pc = RAM_BASE;
-    m.cpu.csr.mtvec = TRAP_VECTOR;
+    m.cpu.pc = RAM_BASE.into();
+    m.cpu.csr.mtvec = TRAP_VECTOR.into();
     m
 }
 
 fn reg(m: &Machine, r: u32) -> u32 {
-    m.cpu.x[r as usize]
+    m.cpu.x[r as usize] as u32
 }
 fn set(m: &mut Machine, r: u32, v: u32) {
-    m.cpu.x[r as usize] = v;
+    m.cpu.set_reg(r as u8, v.into());
 }
 fn word(m: &mut Machine, addr: u32) -> u32 {
     m.cpu.bus.read(addr, 4).unwrap()
@@ -86,8 +86,12 @@ fn step(m: &mut Machine) {
 fn step_traps(m: &mut Machine, cause: u32, tval: u32) {
     let pc = m.cpu.pc;
     m.cpu.step();
-    assert_eq!(m.cpu.pc, TRAP_VECTOR, "instruction at {pc:#x} did not trap");
-    assert_eq!((m.cpu.csr.mcause, m.cpu.csr.mtval), (cause, tval));
+    assert_eq!(
+        m.cpu.pc,
+        u64::from(TRAP_VECTOR),
+        "instruction at {pc:#x} did not trap"
+    );
+    assert_eq!((m.cpu.csr.mcause, m.cpu.csr.mtval), (cause.into(), tval.into()));
     assert_eq!(m.cpu.csr.mepc, pc);
 }
 
@@ -162,7 +166,7 @@ fn lr_sc_pair_succeeds_once() {
     set(&mut m, A1, 99);
     step(&mut m);
     assert_eq!(reg(&m, A2), 7);
-    assert_eq!(m.cpu.reservation().held(), Some(DATA));
+    assert_eq!(m.cpu.reservation().held(), Some(DATA.into()));
     step(&mut m);
     assert_eq!((reg(&m, A2), word(&mut m, DATA)), (0, 99), "sc succeeds");
     assert_eq!(m.cpu.reservation().held(), None);
@@ -215,16 +219,19 @@ fn sc_after(between: &[u32], a1: u32) -> u32 {
 }
 
 #[test]
-fn stores_to_the_reserved_word_break_the_reservation() {
+fn stores_to_the_reserved_line_break_the_reservation() {
     assert_eq!(sc_after(&[], 0), 0);
     assert_eq!(sc_after(&[lw(A2, A0)], 0), 0, "a load keeps it");
     assert_eq!(sc_after(&[sw(A2, A0)], 0), 1, "sw to the word");
     assert_eq!(sc_after(&[sb(A2, A1)], DATA + 3), 1, "sb to its last byte");
     assert_eq!(sc_after(&[amoadd(ZERO, A2, A0)], 0), 1, "an AMO");
+    // The reservation set is the 64-byte line holding the word (DATA starts one).
+    assert_eq!(sc_after(&[sw(A2, A1)], DATA + 4), 1, "the next word, in the line");
+    assert_eq!(sc_after(&[sw(A2, A1)], DATA + 60), 1, "the line's last word");
     assert_eq!(
-        sc_after(&[sw(A2, A1)], DATA + 4),
+        sc_after(&[sw(A2, A1)], DATA + 64),
         0,
-        "the next word is not reserved"
+        "the next line is not reserved"
     );
     assert_eq!(sc_after(&[sw(A2, A1)], DATA - 4), 0, "nor the one before");
     // A store to a device register may start a DMA into RAM.
@@ -240,7 +247,7 @@ fn traps_break_the_reservation() {
     let mut m = machine(&[lr(A2, A0), ECALL]);
     set(&mut m, A0, DATA);
     step(&mut m);
-    assert_eq!(m.cpu.reservation().held(), Some(DATA));
+    assert_eq!(m.cpu.reservation().held(), Some(DATA.into()));
     step_traps(&mut m, 11, 0);
     assert_eq!(m.cpu.reservation().held(), None);
 
@@ -358,8 +365,8 @@ fn map(m: &mut Machine, i: u32, flags: u32) -> u32 {
 
 fn paged_machine(code: &[u32]) -> Machine {
     let mut m = machine(code);
-    m.cpu.csr.satp = 1 << 31 | ROOT >> 12;
-    m.cpu.csr.mstatus |= 1 << 17 | (Mode::S as u32) << 11; // MPRV, MPP = S
+    m.cpu.csr.satp = (1 << 31 | ROOT >> 12).into();
+    m.cpu.csr.mstatus |= 1 << 17 | (Mode::S as u64) << 11; // MPRV, MPP = S
     m
 }
 
@@ -426,7 +433,7 @@ fn reservations_are_on_physical_addresses() {
     set(&mut m, A0, VA + 8);
     set(&mut m, A1, 77);
     step(&mut m);
-    assert_eq!(m.cpu.reservation().held(), Some(PAGE + 8));
+    assert_eq!(m.cpu.reservation().held(), Some((PAGE + 8).into()));
     step(&mut m);
     assert_eq!((reg(&m, A2), word(&mut m, PAGE + 8)), (0, 77));
 }

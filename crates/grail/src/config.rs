@@ -8,6 +8,7 @@ use crate::block::{BlockBackend, FileDisk, MemDisk, MAX_SECTORS, SECTOR_SIZE};
 use crate::bus::{MAX_DISKS, MAX_NETS, RAM_BASE};
 use crate::lake::LakeDisk;
 use crate::net::{Hub, MacAddr, NetBackend, Pcap};
+use excalibur::Xlen;
 use gateway::{Gateway, HostFwd};
 use std::path::PathBuf;
 
@@ -51,6 +52,10 @@ pub struct MachineConfig {
     /// and interrupts on PLIC source `NET_IRQ + i`. At most [`MAX_NETS`], counting any
     /// backends handed to [`crate::Machine::with_devices`].
     pub nets: Vec<NetConfig>,
+    /// The harts' width, RV32 or RV64. Loading an ELF64 program makes the machine RV64
+    /// ([`crate::Machine::load_elf`]). RV32 by default while both widths exist (#159
+    /// removes RV32).
+    pub xlen: Xlen,
 }
 
 /// One network card of a [`MachineConfig`]: what it is plugged into, its address, and
@@ -273,6 +278,7 @@ impl Default for MachineConfig {
             harts: 1,
             disks: Vec::new(),
             nets: Vec::new(),
+            xlen: Xlen::Rv32,
         }
     }
 }
@@ -351,6 +357,15 @@ pub fn parse_ram_mib(s: &str) -> Result<usize, String> {
         return Err(format!("{mib} MiB is out of range (1 to {MAX_MIB} MiB)"));
     }
     Ok(mib * MIB)
+}
+
+/// Parses an `--xlen` value: `32` (RV32) or `64` (RV64).
+pub fn parse_xlen(s: &str) -> Result<Xlen, String> {
+    match s.trim() {
+        "32" => Ok(Xlen::Rv32),
+        "64" => Ok(Xlen::Rv64),
+        s => Err(format!("'{s}' is not a register width (32 or 64)")),
+    }
 }
 
 /// Parses a `--harts` value: a whole number from 1 to [`MAX_HARTS`].

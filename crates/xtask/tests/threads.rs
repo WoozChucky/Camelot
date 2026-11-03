@@ -207,11 +207,11 @@ impl Shootdowns {
 
     fn step(&mut self, cpu: &Cpu) {
         let h = cpu.id as usize;
-        if cpu.pc == self.entry && cpu.x[10] != self.kernel_pt {
-            let pt = cpu.x[10];
+        if cpu.pc as u32 == self.entry && cpu.x[10] as u32 != self.kernel_pt {
+            let pt = cpu.x[10] as u32;
             self.active[h] = Some(Shootdown {
-                ra: cpu.x[1],
-                sp: cpu.x[2],
+                ra: cpu.x[1] as u32,
+                sp: cpu.x[2] as u32,
                 pt,
                 running: self.running(cpu, pt) & !(1 << h),
                 sent: false,
@@ -230,11 +230,11 @@ impl Shootdowns {
             }
         }
         if let Some(mut s) = self.active[h] {
-            if cpu.pc == self.ipi && self.body.contains(&cpu.x[1]) {
-                s.targets = cpu.x[10];
+            if cpu.pc as u32 == self.ipi && self.body.contains(&(cpu.x[1] as u32)) {
+                s.targets = cpu.x[10] as u32;
                 s.sent = true;
                 self.active[h] = Some(s);
-            } else if cpu.pc == s.ra && cpu.x[2] == s.sp {
+            } else if cpu.pc as u32 == s.ra && cpu.x[2] as u32 == s.sp {
                 assert_eq!(
                     s.running & s.targets,
                     s.running,
@@ -258,7 +258,7 @@ impl Shootdowns {
         // A flush for another hart's request: any from when the request
         // began, as a target may serve its ticket before the IPI goes out
         // (another request's IPI woke it).
-        if cpu.pc == self.sfence && self.serve.contains(&cpu.x[1]) {
+        if cpu.pc as u32 == self.sfence && self.serve.contains(&(cpu.x[1] as u32)) {
             for (k, a) in self.active.iter_mut().enumerate() {
                 if let Some(s) = a {
                     if k != h {
@@ -290,10 +290,10 @@ impl Joins {
     }
 
     fn step(&mut self, cpu: &Cpu) {
-        if cpu.pc != self.free || !self.join.contains(&cpu.x[1]) {
+        if cpu.pc as u32 != self.free || !self.join.contains(&(cpu.x[1] as u32)) {
             return;
         }
-        let t = cpu.x[10];
+        let t = cpu.x[10] as u32;
         assert_eq!(peek(cpu, t + THREAD_STATE), THREAD_ZOMBIE);
         assert_eq!(
             peek(cpu, t + THREAD_KSTACK),

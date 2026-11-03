@@ -354,7 +354,7 @@ fn write_register(m: &mut Machine, args: &[u8]) -> Result<Action, Vec<u8>> {
                 return Err(error(1));
             }
         }
-        Reg::Priv => m.set_mode(Mode::from_bits(v)),
+        Reg::Priv => m.set_mode(Mode::from_bits(v.into())),
     }
     Ok(reply("OK"))
 }
@@ -638,7 +638,7 @@ mod tests {
         // mhartid, misa and priv.
         assert_eq!(ask(&mut m, &mut stub, &format!("p{:x}", 65 + 0xf14)), "00000000");
         let misa = ask(&mut m, &mut stub, &format!("p{:x}", 65 + 0x301));
-        assert_eq!(misa, hex_word(crate::cpu::MISA_VALUE));
+        assert_eq!(misa, hex_word(crate::cpu::misa(crate::Xlen::Rv32) as u32));
         assert_eq!(ask(&mut m, &mut stub, "p1041"), "03000000", "M-mode");
         assert_eq!(ask(&mut m, &mut stub, "p21"), "E01", "no f0");
         assert_eq!(

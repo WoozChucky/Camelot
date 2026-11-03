@@ -91,7 +91,7 @@ pub fn printed(m: &Machine) -> String {
 }
 
 pub fn sym(elf: &grail::elf::Elf, name: &str) -> u32 {
-    elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"))
+    elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}")) as u32
 }
 
 /// The addresses of function `name` in the committed kernel.

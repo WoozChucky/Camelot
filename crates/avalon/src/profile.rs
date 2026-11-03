@@ -11,7 +11,7 @@ use crate::switch::generated_mac;
 use avalon_proto::{DeviceSpec, DiskSource, DiskSpec, HardwareProfile, NetSpec};
 use grail::bus::MAX_NETS;
 use grail::net::MacAddr;
-use grail::{DiskConfig, MachineConfig};
+use grail::{DiskConfig, MachineConfig, Xlen};
 
 /// One network card of a profile, as the server builds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +93,9 @@ pub fn machine_config(profile: &HardwareProfile) -> Result<MachineConfig, String
         disks,
         // The server makes the cards (`card_configs`).
         nets: Vec::new(),
+        // The protocol has no width yet (#158): RV32, unless the VM's program is ELF64,
+        // which makes it RV64 when it is loaded.
+        xlen: Xlen::Rv32,
     };
     config.validate()?;
     Ok(config)
@@ -141,6 +144,7 @@ mod tests {
                     DiskConfig::file("b.img").with_read_only(true)
                 ],
                 nets: Vec::new(),
+                xlen: Xlen::Rv32,
             }
         );
         assert_eq!(

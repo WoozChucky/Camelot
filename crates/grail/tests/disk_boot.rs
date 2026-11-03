@@ -97,17 +97,17 @@ fn loads_the_boot_block_and_jumps_to_it() {
     assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
     assert_eq!(uart(&m), "", "nothing to say");
     let h = m.cpu.hart(0);
-    assert_eq!(h.x[T0 as usize], LOAD_ADDR, "the last 64 KiB of RAM");
+    assert_eq!(h.x[T0 as usize] as u32, LOAD_ADDR, "the last 64 KiB of RAM");
     assert_eq!(boot::boot_block_addr(RAM), Some(LOAD_ADDR));
     assert_eq!(h.x[A0 as usize], 0, "the hart id");
-    assert_eq!(h.x[A1 as usize], SYSINFO_BASE);
-    assert_eq!(h.x[A2 as usize], BLK_BASE, "disk 0's registers");
+    assert_eq!(h.x[A1 as usize], u64::from(SYSINFO_BASE));
+    assert_eq!(h.x[A2 as usize], u64::from(BLK_BASE), "disk 0's registers");
     // The whole block is in RAM, and nothing after it.
     let at = (LOAD_ADDR - 0x8000_0000) as usize;
     assert_eq!(&m.cpu.bus.ram[at..at + BOOT_BLOCK_SIZE], &block[..]);
     assert!(m.cpu.bus.ram[at + BOOT_BLOCK_SIZE..].iter().all(|&b| b == 0));
     // The ROM's trap handler is still in place, and the disk's DONE acknowledged.
-    assert!((DISK_BOOT_PC..BOOT_ROM_BASE + 0x1000).contains(&h.csr.mtvec));
+    assert!((DISK_BOOT_PC..BOOT_ROM_BASE + 0x1000).contains(&(h.csr.mtvec as u32)));
     assert_eq!(m.cpu.bus.read(BLK_BASE + 0x18, 4), Ok(0));
 }
 
@@ -124,7 +124,7 @@ fn the_boot_area_follows_the_ram_size() {
         m.boot_from_disk().unwrap();
         assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
         let want = 0x8000_0000 + (mib << 20) as u32 - 0x1_0000;
-        assert_eq!(m.cpu.hart(0).x[T0 as usize], want, "{mib} MiB");
+        assert_eq!(m.cpu.hart(0).x[T0 as usize] as u32, want, "{mib} MiB");
     }
 }
 
@@ -227,7 +227,7 @@ fn disk_boot_takes_64_kib_of_ram() {
     m.boot_from_disk().unwrap();
     assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
     assert_eq!(
-        m.cpu.hart(0).x[T0 as usize],
+        m.cpu.hart(0).x[T0 as usize] as u32,
         0x8000_0000,
         "all of RAM is the boot area"
     );
@@ -258,7 +258,7 @@ fn the_boot_block_can_start_the_other_harts() {
     }
     let h1 = m.cpu.hart(1);
     assert!(
-        h1.waiting && (PARK_PC..PARK_PC + 0x40).contains(&h1.pc),
+        h1.waiting && (PARK_PC..PARK_PC + 0x40).contains(&(h1.pc as u32)),
         "parked again"
     );
     assert_eq!(m.cpu.bus.read(0x0200_0004, 4), Ok(0), "the early IPI was taken");
@@ -270,7 +270,11 @@ fn the_boot_block_can_start_the_other_harts() {
         0x11,
         "hart 1 ran the code with a0 = 1"
     );
-    assert_eq!(m.cpu.hart(0).pc, LOAD_ADDR + 0x1c, "hart 0 waits at its j .");
+    assert_eq!(
+        m.cpu.hart(0).pc,
+        u64::from(LOAD_ADDR + 0x1c),
+        "hart 0 waits at its j ."
+    );
 }
 
 // The `grail` binary, booting the Camelot kernel.
@@ -569,7 +573,7 @@ fn the_bootloader_loads_segments_and_hands_the_entry_word_over() {
     // The entry word points at the kernel, and hart 1 got there through it.
     assert_eq!(m.cpu.bus.peek(BOOT_ROM_BASE + 16), Some(BASE));
     let (h0, h1) = (m.cpu.hart(0), m.cpu.hart(1));
-    assert_eq!(h0.pc, BASE + 0x10, "hart 0 waits at its j .");
-    assert_eq!((h0.x[A0 as usize], h0.x[A1 as usize]), (0, SYSINFO_BASE));
+    assert_eq!(h0.pc, u64::from(BASE + 0x10), "hart 0 waits at its j .");
+    assert_eq!((h0.x[A0 as usize], h0.x[A1 as usize]), (0, SYSINFO_BASE.into()));
     assert_eq!(h1.x[A1 as usize], 0x11, "hart 1 ran the kernel with a0 = 1");
 }

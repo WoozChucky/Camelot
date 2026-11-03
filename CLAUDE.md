@@ -20,7 +20,7 @@ Camelot is a learning project: the Excalibur ISA (RV32IMA + Zicsr, M/S/U, Sv32, 
 ```
 crates/excalibur        encodings, decoder, disassembler (shared by every tool), for RV32 and RV64: decode and Syntax take the width (Xlen); tests/disasm.rs checks both against llvm-objdump's text for tests/golden/rv{32,64}.s (scripts/gen-excalibur-golden.sh)
 crates/elf              ELF reader, ELF32 and ELF64 alike (grail, merlin-objdump, merlin-ld), and DWARF line tables (src/lines.rs: merlin-objdump -l, merlin-dbg); tests/llvm.rs reads RV32 and RV64 files clang and ld.lld made as llvm-readelf and llvm-dwarfdump print them (scripts/gen-elf-golden.sh)
-crates/grail            the emulator (rom/diskboot.s: the boot ROM's disk loader, which boots a machine started with no program from disk 0)
+crates/grail            the emulator, RV32 or RV64 per machine (src/cpu: an RV32 hart keeps its registers sign-extended in u64, see src/cpu/mod.rs; rom/diskboot.s: the boot ROM's disk loader, which boots a machine started with no program from disk 0)
 crates/avalon-proto     Avalon protocol (framing, messages, Connection, Screen diffing), shared by the Avalon platform's programs; spec in docs/avalon-protocol.md
 crates/gateway          user-mode NAT gateway (DHCP, DNS, TCP/UDP NAT, hostfwd) with its own frame send/recv API; grail wraps it as a NetBackend for `--net user` (spec 9.8). Must not depend on grail
 crates/avalon           the Avalon hypervisor server: VM table, one thread per running VM (run_for slices), consoles, screen viewers and input, RAM budget, virtual Ethernet switches (src/switch.rs)
@@ -41,7 +41,7 @@ kernel/user/ld          the linker that runs on Camelot (/bin/ld), merlin-ld rew
 kernel/                 the Camelot kernel (C + assembly); kernel.elf and kernel-disk.elf (without built-in programs, for bootable images) are committed, rebuild them with `cargo xtask kernel` after changing the kernel, its user programs or merlin, merlin-as or merlin-ld (`cargo test` checks) (kernel/user: the user programs it embeds, C and assembly, and kernel/user/lib their C library, linked like an archive; system calls in docs/camelot-syscalls.md; kernel/net: the network stack, a file per layer, specified in docs/camelot-net.md; kernel/fs: the root image's files; kernel/boot: the bootloader of a bootable disk, which camelot-fs mkfs --boot installs)
 docs/                   ISA spec, Avalon protocol, Pendragon API, Camelot system calls, Camelot filesystem format (camelot-fs.md), Camelot network stack (camelot-net.md), merlin-dbg and Grail's GDB stub (merlin-dbg.md)
 examples/               bare-metal programs; their .elf files are committed, rebuild them with `cargo xtask examples` after changes (`cargo test` checks)
-tests/riscv-tests       prebuilt riscv-tests ELFs, and obj/ with their objects (merlin-ld relinks them)
+tests/riscv-tests       prebuilt riscv-tests ELFs, and obj/ with their objects (merlin-ld relinks them); rv64/ the same for the RV64 suites
 ```
 
 Reuse `excalibur` (register names, CSR names, decoder, `Inst::format`) and `elf` (reading ELF files, relocation names) instead of duplicating tables.
