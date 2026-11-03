@@ -679,6 +679,15 @@ static bool truncate(struct inode *ip, bool free_inode) {
         iupdate(ip);
         return false;
     }
+    /* Set with the size, before the inode is unlocked for the first time,
+     * and cleared in the last transaction: whoever writes the inode in
+     * between (a link or an unlink of a file being emptied by O_TRUNC, in
+     * one of the windows below) writes a valid state to the disk, size 0
+     * and TRUNCATING with the blocks still to free, which a crash leaves to
+     * the next mount (finish_truncations). When one transaction is enough
+     * and nobody wrote the inode meanwhile, the flag never reaches the
+     * disk. */
+    ip->flags |= INODE_TRUNCATING;
     /* Freeing blocks takes transactions of its own (docs/camelot-fs.md,
      * "Limits on transactions"), as Linux's eviction takes a journal handle
      * of its own after the unlink's: whatever the caller logged commits
@@ -686,10 +695,6 @@ static bool truncate(struct inode *ip, bool free_inode) {
      * orphan, which the next mount frees), and the caller goes on after
      * in a new operation. */
     trunc_restart(ip);
-    /* Set in the first transaction and cleared in the last: a crash in
-     * between leaves the rest to the next mount (finish_truncations).
-     * When one transaction is enough, the flag never reaches the disk. */
-    ip->flags |= INODE_TRUNCATING;
     while (!trunc_step(ip)) {
         iupdate(ip);
         trunc_restart(ip);

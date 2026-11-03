@@ -381,11 +381,18 @@ fn block_ops(ops: &[Op]) -> Vec<Op> {
 }
 
 /// Checks that the filesystem's writes in `ops` (after the disk self-test's,
-/// to the disk's last block, which it writes back as it was) follow
+/// to the disk's last block, which the filesystem doesn't use here) follow
 /// the commit protocol of docs/camelot-fs.md, "The log", every time: slots
 /// from the first, flush, header with their count, flush, as many home
 /// blocks, flush, empty header, flush. Returns the number of commits.
 fn check_commits(ops: &[Op], sb: &Superblock, disk_blocks: u32) -> usize {
+    commit_sizes(ops, sb, disk_blocks, disk_blocks - 1).len()
+}
+
+/// check_commits(), for a filesystem whose home blocks may reach `top` - 1
+/// (the disk's last block, the disk self-test's scratch block, for one the
+/// test fills to the end): the number of blocks of each commit, in order.
+fn commit_sizes(ops: &[Op], sb: &Superblock, disk_blocks: u32, top: u32) -> Vec<u32> {
     let ops = block_ops(ops);
     let scratch = disk_blocks - 1;
     let first = ops
@@ -396,6 +403,7 @@ fn check_commits(ops: &[Op], sb: &Superblock, disk_blocks: u32) -> usize {
     let header = sb.logstart;
     let mut i = 0;
     let mut commits = 0;
+    let mut sizes = Vec::new();
     let write = |o: Option<&Op>| match o {
         Some(Op::Write { sector, first_word }) => Some((*sector as u32, *first_word)),
         _ => None,
@@ -426,10 +434,7 @@ fn check_commits(ops: &[Op], sb: &Superblock, disk_blocks: u32) -> usize {
         i += 3;
         for k in 0..slots {
             let (b, _) = write(ops.get(i)).unwrap_or_else(|| panic!("commit {commits}: home {k} missing"));
-            assert!(
-                b >= sb.inodestart && b < sb.size,
-                "commit {commits}: home block {b}"
-            );
+            assert!(b >= sb.inodestart && b < top, "commit {commits}: home block {b}");
             i += 1;
         }
         assert_eq!(
@@ -449,8 +454,9 @@ fn check_commits(ops: &[Op], sb: &Superblock, disk_blocks: u32) -> usize {
         );
         i += 3;
         commits += 1;
+        sizes.push(slots);
     }
-    commits
+    sizes
 }
 
 #[test]
@@ -1082,7 +1088,9 @@ fn the_kernel_grows_trees_through_every_split() {
         assert_eq!(map.extents.len(), G_BLOCKS, "{name}: an extent per block");
     }
     let disk_blocks = (run.disk.len() / BSIZE) as u32;
-    assert!(check_commits(&run.record.ops, &after.sb, disk_blocks) > 2 * G_BLOCKS);
+    // The grow test fills the disk to its last block, which the disk
+    // self-test wrote back as it was before the mount.
+    assert!(commit_sizes(&run.record.ops, &after.sb, disk_blocks, disk_blocks).len() > 2 * G_BLOCKS);
 }
 
 #[test]
@@ -1162,8 +1170,14 @@ fn a_file_unlinked_on_the_smallest_writable_log_is_freed_in_transactions_of_its_
     // The README's block, /bin's and the root's, and rm's.
     assert_eq!((after.files, after.used_blocks, after.orphans), (2, 3 + rm, 0));
     let disk_blocks = (run.disk.len() / BSIZE) as u32;
-    // Two unlinks, and at least two transactions to free each file.
-    assert!(check_commits(&run.record.ops, &after.sb, disk_blocks) >= 6);
+    // The unlink of /t1 commits alone (its entry's block and the inode block
+    // holding the root's and /t1's inodes), before any of the freeing, which
+    // takes more than one transaction, its first full (a leaf a slot, and
+    // the bitmap): had they shared one, it would hold them all.
+    let sizes = commit_sizes(&run.record.ops, &after.sb, disk_blocks, disk_blocks - 1);
+    assert_eq!(sizes[0], 2, "{sizes:?}");
+    assert!(sizes[1] > 12, "{sizes:?}");
+    assert!(sizes.len() >= 6, "{sizes:?}");
 }
 
 #[test]
