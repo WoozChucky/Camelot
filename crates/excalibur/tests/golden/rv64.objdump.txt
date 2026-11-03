@@ -1,0 +1,203 @@
+
+crates/excalibur/tests/golden/rv64.o:	file format elf64-littleriscv
+
+Disassembly of section .text:
+
+0000000000000000 <start>:
+       0: 00000537     	lui	a0, 0x0
+       4: 00001537     	lui	a0, 0x1
+       8: 7ffff537     	lui	a0, 0x7ffff
+       c: 80000537     	lui	a0, 0x80000
+      10: ffffffb7     	lui	t6, 0xfffff
+      14: 00010117     	auipc	sp, 0x10
+      18: 80000517     	auipc	a0, 0x80000
+      1c: fffff597     	auipc	a1, 0xfffff
+      20: 060000ef     	jal	0x80 <fwd>
+      24: fddff06f     	j	0x0 <start>
+      28: 0580056f     	jal	a0, 0x80 <fwd>
+      2c: 00008067     	ret
+      30: 000500e7     	jalr	a0
+      34: 00060367     	jalr	t1, a2
+      38: ff858067     	jr	-0x8(a1)
+      3c: 004500e7     	jalr	0x4(a0)
+      40: 7ff58567     	jalr	a0, 0x7ff(a1)
+      44: 80058567     	jalr	a0, -0x800(a1)
+      48: fab50ce3     	beq	a0, a1, 0x0 <start>
+      4c: 02b51a63     	bne	a0, a1, 0x80 <fwd>
+      50: 02b54863     	blt	a0, a1, 0x80 <fwd>
+      54: 02b55663     	bge	a0, a1, 0x80 <fwd>
+      58: 02b56463     	bltu	a0, a1, 0x80 <fwd>
+      5c: 02b57263     	bgeu	a0, a1, 0x80 <fwd>
+      60: 02038063     	beqz	t2, 0x80 <fwd>
+      64: 00701e63     	bne	zero, t2, 0x80 <fwd>
+      68: 00054c63     	bltz	a0, 0x80 <fwd>
+      6c: 00a04a63     	bgtz	a0, 0x80 <fwd>
+      70: 00a05863     	blez	a0, 0x80 <fwd>
+      74: 00055663     	bgez	a0, 0x80 <fwd>
+      78: 00004463     	bltz	zero, 0x80 <fwd>
+      7c: 00005263     	blez	zero, 0x80 <fwd>
+
+0000000000000080 <fwd>:
+      80: 80040503     	lb	a0, -0x800(s0)
+      84: 7ff41503     	lh	a0, 0x7ff(s0)
+      88: ffc12503     	lw	a0, -0x4(sp)
+      8c: 0005c503     	lbu	a0, 0x0(a1)
+      90: 0025d503     	lhu	a0, 0x2(a1)
+      94: 00456583     	lwu	a1, 0x4(a0)
+      98: ff813503     	ld	a0, -0x8(sp)
+      9c: 7f8f3f83     	ld	t6, 0x7f8(t5)
+      a0: feb50fa3     	sb	a1, -0x1(a0)
+      a4: 00b51123     	sh	a1, 0x2(a0)
+      a8: feb12e23     	sw	a1, -0x4(sp)
+      ac: 00113423     	sd	ra, 0x8(sp)
+      b0: 8002b023     	sd	zero, -0x800(t0)
+      b4: 00000013     	nop
+      b8: 00000513     	li	a0, 0x0
+      bc: 00500013     	li	zero, 0x5
+      c0: 00050013     	mv	zero, a0
+      c4: 00150013     	addi	zero, a0, 0x1
+      c8: fff50513     	addi	a0, a0, -0x1
+      cc: 7ff58513     	addi	a0, a1, 0x7ff
+      d0: 80058513     	addi	a0, a1, -0x800
+      d4: 00050313     	mv	t1, a0
+      d8: fff5a513     	slti	a0, a1, -0x1
+      dc: 0015b513     	seqz	a0, a1
+      e0: 0025b513     	sltiu	a0, a1, 0x2
+      e4: fff5c513     	not	a0, a1
+      e8: 0055c513     	xori	a0, a1, 0x5
+      ec: 7ff5e513     	ori	a0, a1, 0x7ff
+      f0: 0ff5f513     	zext.b	a0, a1
+      f4: 0fe5f513     	andi	a0, a1, 0xfe
+      f8: 00051513     	slli	a0, a0, 0x0
+      fc: 01f51513     	slli	a0, a0, 0x1f
+     100: 02051513     	slli	a0, a0, 0x20
+     104: 03f51513     	slli	a0, a0, 0x3f
+     108: 0215d513     	srli	a0, a1, 0x21
+     10c: 03f5d513     	srli	a0, a1, 0x3f
+     110: 4285d513     	srai	a0, a1, 0x28
+     114: 4015d513     	srai	a0, a1, 0x1
+     118: 0005851b     	sext.w	a0, a1
+     11c: fff5851b     	addiw	a0, a1, -0x1
+     120: 7ff5851b     	addiw	a0, a1, 0x7ff
+     124: 0000001b     	sext.w	zero, zero
+     128: 0005951b     	slliw	a0, a1, 0x0
+     12c: 01f5951b     	slliw	a0, a1, 0x1f
+     130: 0015d51b     	srliw	a0, a1, 0x1
+     134: 41f5d51b     	sraiw	a0, a1, 0x1f
+     138: 00c58533     	add	a0, a1, a2
+     13c: 40c58533     	sub	a0, a1, a2
+     140: 40c00533     	neg	a0, a2
+     144: 00c59533     	sll	a0, a1, a2
+     148: 00c5a533     	slt	a0, a1, a2
+     14c: 0005a533     	sltz	a0, a1
+     150: 00c02533     	sgtz	a0, a2
+     154: 00002533     	sltz	a0, zero
+     158: 00c5b533     	sltu	a0, a1, a2
+     15c: 00c03533     	snez	a0, a2
+     160: 00003533     	snez	a0, zero
+     164: 00c5c533     	xor	a0, a1, a2
+     168: 00c5d533     	srl	a0, a1, a2
+     16c: 40c5d533     	sra	a0, a1, a2
+     170: 00c5e533     	or	a0, a1, a2
+     174: 00c5f533     	and	a0, a1, a2
+     178: 00c5853b     	addw	a0, a1, a2
+     17c: 40c5853b     	subw	a0, a1, a2
+     180: 40c0053b     	negw	a0, a2
+     184: 00c5953b     	sllw	a0, a1, a2
+     188: 00c5d53b     	srlw	a0, a1, a2
+     18c: 40c5d53b     	sraw	a0, a1, a2
+     190: 02c58533     	mul	a0, a1, a2
+     194: 02c59533     	mulh	a0, a1, a2
+     198: 02c5a533     	mulhsu	a0, a1, a2
+     19c: 02c5b533     	mulhu	a0, a1, a2
+     1a0: 02c5c533     	div	a0, a1, a2
+     1a4: 02c5d533     	divu	a0, a1, a2
+     1a8: 02c5e533     	rem	a0, a1, a2
+     1ac: 02c5f533     	remu	a0, a1, a2
+     1b0: 02c5853b     	mulw	a0, a1, a2
+     1b4: 02c5c53b     	divw	a0, a1, a2
+     1b8: 02c5d53b     	divuw	a0, a1, a2
+     1bc: 02c5e53b     	remw	a0, a1, a2
+     1c0: 02c5f53b     	remuw	a0, a1, a2
+     1c4: 1005a52f     	lr.w	a0, (a1)
+     1c8: 1405a52f     	lr.w.aq	a0, (a1)
+     1cc: 1205a52f     	lr.w.rl	a0, (a1)
+     1d0: 1605a52f     	lr.w.aqrl	a0, (a1)
+     1d4: 18b6252f     	sc.w	a0, a1, (a2)
+     1d8: 1e63a2af     	sc.w.aqrl	t0, t1, (t2)
+     1dc: 1805a52f     	sc.w	a0, zero, (a1)
+     1e0: 08b6252f     	amoswap.w	a0, a1, (a2)
+     1e4: 04b6252f     	amoadd.w.aq	a0, a1, (a2)
+     1e8: 20b6252f     	amoxor.w	a0, a1, (a2)
+     1ec: 62b6252f     	amoand.w.rl	a0, a1, (a2)
+     1f0: 40b6252f     	amoor.w	a0, a1, (a2)
+     1f4: 80b6252f     	amomin.w	a0, a1, (a2)
+     1f8: a0b6252f     	amomax.w	a0, a1, (a2)
+     1fc: c0b6252f     	amominu.w	a0, a1, (a2)
+     200: e0b6202f     	amomaxu.w	zero, a1, (a2)
+     204: 1005b52f     	lr.d	a0, (a1)
+     208: 1405b52f     	lr.d.aq	a0, (a1)
+     20c: 1205b52f     	lr.d.rl	a0, (a1)
+     210: 1605b52f     	lr.d.aqrl	a0, (a1)
+     214: 18b6352f     	sc.d	a0, a1, (a2)
+     218: 1cb6352f     	sc.d.aq	a0, a1, (a2)
+     21c: 1ab6352f     	sc.d.rl	a0, a1, (a2)
+     220: 1e63b2af     	sc.d.aqrl	t0, t1, (t2)
+     224: 08b6352f     	amoswap.d	a0, a1, (a2)
+     228: 0e05b5af     	amoswap.d.aqrl	a1, zero, (a1)
+     22c: 00b6352f     	amoadd.d	a0, a1, (a2)
+     230: 04b6352f     	amoadd.d.aq	a0, a1, (a2)
+     234: 20b6352f     	amoxor.d	a0, a1, (a2)
+     238: 60b6352f     	amoand.d	a0, a1, (a2)
+     23c: 62b6352f     	amoand.d.rl	a0, a1, (a2)
+     240: 40b6352f     	amoor.d	a0, a1, (a2)
+     244: 80b6352f     	amomin.d	a0, a1, (a2)
+     248: a0b6352f     	amomax.d	a0, a1, (a2)
+     24c: c0b6352f     	amominu.d	a0, a1, (a2)
+     250: e6b6302f     	amomaxu.d.aqrl	zero, a1, (a2)
+     254: 0ff0000f     	fence
+     258: 0330000f     	fence	rw, rw
+     25c: 8330000f     	fence.tso
+     260: 0000100f     	fence.i
+     264: 00000073     	ecall
+     268: 00100073     	ebreak
+     26c: 30200073     	mret
+     270: 10200073     	sret
+     274: 10500073     	wfi
+     278: 12000073     	sfence.vma
+     27c: 12050073     	sfence.vma	a0
+     280: 12b50073     	sfence.vma	a0, a1
+     284: c0001073     	unimp
+     288: c0002573     	rdcycle	a0
+     28c: c0102573     	rdtime	a0
+     290: c0202573     	rdinstret	a0
+     294: c0002073     	rdcycle	zero
+     298: c8002573     	csrr	a0, 0xc80
+     29c: c8102573     	csrr	a0, 0xc81
+     2a0: c8202573     	csrr	a0, 0xc82
+     2a4: 31002573     	csrr	a0, 0x310
+     2a8: 31a02573     	csrr	a0, 0x31a
+     2ac: b8002573     	csrr	a0, 0xb80
+     2b0: 3a102573     	csrr	a0, 0x3a1
+     2b4: 3a202573     	csrr	a0, pmpcfg2
+     2b8: 30002573     	csrr	a0, mstatus
+     2bc: 18002573     	csrr	a0, satp
+     2c0: 30102573     	csrr	a0, misa
+     2c4: 7c002573     	csrr	a0, 0x7c0
+     2c8: 30051073     	csrw	mstatus, a0
+     2cc: 34051573     	csrrw	a0, mscratch, a0
+     2d0: 30452073     	csrs	mie, a0
+     2d4: 34453073     	csrc	mip, a0
+     2d8: 1005b573     	csrrc	a0, sstatus, a1
+     2dc: 3002d073     	csrwi	mstatus, 0x5
+     2e0: 10016073     	csrsi	sstatus, 0x2
+     2e4: 10017073     	csrci	sstatus, 0x2
+     2e8: 300fd573     	csrrwi	a0, mstatus, 0x1f
+     2ec: 30446573     	csrrsi	a0, mie, 0x8
+     2f0: 3440f573     	csrrci	a0, mip, 0x1
+     2f4: 0205951b     	<unknown>
+     2f8: 0005a51b     	<unknown>
+     2fc: 02c5953b     	<unknown>
+     300: 80c5853b     	<unknown>
+     304: 0005c52f     	<unknown>
+     308: 08051513     	<unknown>

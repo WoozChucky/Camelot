@@ -140,7 +140,8 @@ fn tables3() -> [(&'static str, Op3Rows); 2] {
 /// The tables of a name and one value (`struct as_op2`), by C name.
 fn tables2() -> Vec<(&'static str, Vec<(&'static str, u32)>)> {
     let csrs: Vec<(&str, u32)> = (0..4096u16)
-        .filter_map(|a| excalibur::csr::name(a).map(|n| (n, u32::from(a))))
+        // The C assembler writes RV32 until #157.
+        .filter_map(|a| excalibur::csr::name(a, excalibur::Xlen::Rv32).map(|n| (n, u32::from(a))))
         .collect();
     vec![
         ("OP_IMM_FUNCT3", encode::OP_IMM_FUNCT3.to_vec()),

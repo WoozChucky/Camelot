@@ -44,7 +44,7 @@ impl Reg {
 pub fn csrs(m: &Machine) -> Vec<(u16, &'static str)> {
     (0..4096u16)
         .filter(|&a| m.csr(a).is_some())
-        .filter_map(|a| excalibur::csr::name(a).map(|n| (a, n)))
+        .filter_map(|a| excalibur::csr::name(a, excalibur::Xlen::Rv32).map(|n| (a, n)))
         .collect()
 }
 

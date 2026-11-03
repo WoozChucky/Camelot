@@ -343,7 +343,10 @@ fn early_trap_reports_and_halts() {
     // mepc, mtval and exits with 0xff. The word is not 0, so the report
     // shows that mtval is really read (it holds the instruction's bits).
     let illegal = 0xffff_ffff;
-    assert_eq!(excalibur::decode(illegal), excalibur::Inst::Illegal(illegal));
+    assert_eq!(
+        excalibur::decode(illegal, excalibur::Xlen::Rv32),
+        excalibur::Inst::Illegal(illegal)
+    );
     let (mut m, elf) = load_committed();
     let start = sym(&elf, "start");
     m.cpu.bus.load(start, &illegal.to_le_bytes()).unwrap();
@@ -393,7 +396,10 @@ fn halt_uses_kmain_return_value() {
     let kmain = sym(&elf, "kmain");
     let li_a0_7: u32 = addi(x("a0"), 0, 7);
     let ret: u32 = 0x0000_8067;
-    let decoded = (excalibur::decode(li_a0_7), excalibur::decode(ret));
+    let decoded = (
+        excalibur::decode(li_a0_7, excalibur::Xlen::Rv32),
+        excalibur::decode(ret, excalibur::Xlen::Rv32),
+    );
     let ra = x("ra") as u8;
     assert_eq!(
         decoded,
@@ -1024,9 +1030,12 @@ fn unmapped_load_panics() {
     assert!(sepc > sym(&elf, "_start") && sepc < sym(&elf, "__rodata_start"));
     let word = m.cpu.bus.peek(sepc).unwrap();
     assert!(
-        matches!(excalibur::decode(word), excalibur::Inst::Load { .. }),
+        matches!(
+            excalibur::decode(word, excalibur::Xlen::Rv32),
+            excalibur::Inst::Load { .. }
+        ),
         "sepc {sepc:#x} holds {}",
-        excalibur::decode(word)
+        excalibur::decode(word, excalibur::Xlen::Rv32)
     );
     assert_ne!(v["sstatus"] & MSTATUS_SPP, 0);
 }
@@ -1083,9 +1092,12 @@ fn store_to_kernel_text_panics() {
     assert!(out.contains(&line), "want{line}in:\n{out}");
     let word = m.cpu.bus.peek(v["sepc"]).unwrap();
     assert!(
-        matches!(excalibur::decode(word), excalibur::Inst::Store { .. }),
+        matches!(
+            excalibur::decode(word, excalibur::Xlen::Rv32),
+            excalibur::Inst::Store { .. }
+        ),
         "sepc holds {}",
-        excalibur::decode(word)
+        excalibur::decode(word, excalibur::Xlen::Rv32)
     );
     // The store didn't happen.
     let (fresh, _) = load_committed();
@@ -1507,7 +1519,7 @@ struct Access {
 /// is off, so the address is physical.
 fn mem_access(cpu: &grail::cpu::Cpu) -> Option<Access> {
     let word = cpu.bus.peek(cpu.pc)?;
-    let (base, imm, load_rd, value) = match excalibur::decode(word) {
+    let (base, imm, load_rd, value) = match excalibur::decode(word, excalibur::Xlen::Rv32) {
         excalibur::Inst::Load { rd, rs1, imm, .. } => (rs1, imm, Some(rd), 0),
         excalibur::Inst::Store { rs1, rs2, imm, .. } => (rs1, imm, None, cpu.x[rs2 as usize]),
         _ => return None,

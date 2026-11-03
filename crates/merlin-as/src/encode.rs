@@ -1185,7 +1185,11 @@ fn insn(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use excalibur::{decode, AluOp, BranchOp, Inst, StoreOp};
+    use excalibur::{AluOp, BranchOp, Inst, StoreOp, Xlen};
+
+    fn decode(w: u32) -> Inst {
+        excalibur::decode(w, Xlen::Rv32)
+    }
 
     #[test]
     fn packers_round_trip_through_the_decoder() {
@@ -1230,7 +1234,7 @@ mod tests {
                 decode(u_type(LUI, 3, imm20)),
                 Inst::Lui {
                     rd: 3,
-                    imm: imm20 << 12
+                    imm: (imm20 << 12) as i32
                 }
             );
         }

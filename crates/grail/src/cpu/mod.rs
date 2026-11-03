@@ -11,7 +11,7 @@ pub use reservation::Reservation;
 use crate::bus::Bus;
 use crate::trap::{Exception, Trap, INTERRUPT_BIT};
 use excalibur::csr::*;
-use excalibur::{decode, AluOp, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, StoreOp};
+use excalibur::{decode, AluOp, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, StoreOp, Xlen};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -402,9 +402,10 @@ impl Hart {
     /// Executes one instruction and returns the next pc.
     fn execute(&mut self, bus: &mut Bus, word: u32, pc: u32) -> Result<u32, Trap> {
         let next = pc.wrapping_add(4);
-        match decode(word) {
-            Inst::Lui { rd, imm } => self.set_reg(rd, imm),
-            Inst::Auipc { rd, imm } => self.set_reg(rd, pc.wrapping_add(imm)),
+        // Grail's harts are RV32 until #145 gives them 64-bit registers.
+        match decode(word, Xlen::Rv32) {
+            Inst::Lui { rd, imm } => self.set_reg(rd, imm as u32),
+            Inst::Auipc { rd, imm } => self.set_reg(rd, pc.wrapping_add(imm as u32)),
             Inst::Jal { rd, imm } => {
                 let target = Self::jump(pc.wrapping_add(imm as u32))?;
                 self.set_reg(rd, next);
@@ -436,6 +437,7 @@ impl Hart {
                     LoadOp::Lb => v as i8 as i32 as u32,
                     LoadOp::Lh => v as i16 as i32 as u32,
                     LoadOp::Lw | LoadOp::Lbu | LoadOp::Lhu => v,
+                    LoadOp::Lwu | LoadOp::Ld => unreachable!("RV64 only: an RV32 hart decodes it as illegal"),
                 };
                 self.set_reg(rd, v);
             }
@@ -446,6 +448,7 @@ impl Hart {
                     StoreOp::Sb => self.reg(rs2) & 0xff,
                     StoreOp::Sh => self.reg(rs2) & 0xffff,
                     StoreOp::Sw => self.reg(rs2),
+                    StoreOp::Sd => unreachable!("RV64 only: an RV32 hart decodes it as illegal"),
                 };
                 self.store(bus, addr, size, v)?;
             }
@@ -564,6 +567,10 @@ impl Hart {
                     return Err(Self::illegal());
                 }
                 bus.exit = Some(crate::bus::Exit::Code(self.reg(rs1) & 0xff));
+            }
+            // RV64 only: an RV32 hart decodes them as illegal. #145 runs them.
+            Inst::OpImm32 { .. } | Inst::Op32 { .. } | Inst::Mul32 { .. } => {
+                unreachable!("RV64 only: an RV32 hart decodes it as illegal")
             }
             Inst::Illegal(_) => return Err(Self::illegal()),
         }

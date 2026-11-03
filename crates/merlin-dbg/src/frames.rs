@@ -44,7 +44,12 @@
 //! innermost frame). A trap handler's frame is not a call either: the backtrace of an
 //! interrupted program ends at the handler, or goes on with whatever `s0` held.
 
-use excalibur::{decode, AluOp, Inst, StoreOp};
+use excalibur::{AluOp, Inst, StoreOp, Xlen};
+
+/// Frames of RV32 code until merlin-dbg learns RV64 (#153).
+fn decode(w: u32) -> Inst {
+    excalibur::decode(w, Xlen::Rv32)
+}
 
 /// Registers by number.
 const RA: u8 = 1;

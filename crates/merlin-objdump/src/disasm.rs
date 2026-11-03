@@ -5,7 +5,7 @@
 
 use crate::{reloc_type, reloc_value, relocation_sections, Options};
 use elf32::{Elf, Error, Symbol};
-use excalibur::{decode, Inst, Syntax};
+use excalibur::{decode, Inst, Syntax, Xlen};
 use std::fmt::Write;
 
 /// A symbol that can label code or name a branch target.
@@ -146,12 +146,15 @@ impl RegState {
             | Inst::Illegal(_)
             | Inst::XcalDbg { .. }
             | Inst::XcalHalt { .. } => self.reset(),
-            Inst::Auipc { rd, imm } => self.set(rd, Some(pc.wrapping_add(imm))),
+            Inst::Auipc { rd, imm } => self.set(rd, Some(pc.wrapping_add(imm as u32))),
             Inst::Lui { rd, .. }
             | Inst::Load { rd, .. }
             | Inst::OpImm { rd, .. }
+            | Inst::OpImm32 { rd, .. }
             | Inst::Op { rd, .. }
+            | Inst::Op32 { rd, .. }
             | Inst::Mul { rd, .. }
+            | Inst::Mul32 { rd, .. }
             | Inst::Lr { rd, .. }
             | Inst::Sc { rd, .. }
             | Inst::Amo { rd, .. }
@@ -291,9 +294,11 @@ impl SourceLines {
 }
 
 pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result<(), Error> {
+    // RV32 until #150 reads ELF64 and RV64.
     let syntax = Syntax {
         aliases: opts.aliases,
         hex: true,
+        xlen: Xlen::Rv32,
     };
     let mut source = if opts.line_numbers {
         Some(SourceLines::new(elf)?)
@@ -397,12 +402,16 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
                     Some(&[b]) => (format!("{b:02x}"), b as u32),
                     _ => break,
                 };
-                let inst = if size == 4 { decode(w) } else { Inst::Illegal(w) };
+                let inst = if size == 4 {
+                    decode(w, Xlen::Rv32)
+                } else {
+                    Inst::Illegal(w)
+                };
                 let pc32 = pc as u32;
                 if let Some(s) = source.as_mut() {
                     s.print(out, idx, pc32);
                 }
-                let d = inst.format(Some(pc32), syntax);
+                let d = inst.format(Some(u64::from(pc32)), syntax);
                 let (mnemonic, operands) = match size {
                     1 => (".byte", format!("{w:#04x}")),
                     _ => (d.mnemonic, d.operands),
@@ -419,6 +428,7 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
                 }
                 if let Some(l) = d
                     .target
+                    .map(|t| t as u32)
                     .or_else(|| regs.jalr_target(&inst))
                     .and_then(|t| labels.lookup(idx, t).map(|l| (l, t - l.addr)))
                 {

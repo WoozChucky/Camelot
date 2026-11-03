@@ -1,4 +1,12 @@
 //! CSR addresses and status-register bits.
+//!
+//! Some CSRs exist only on RV32: the high halves of 64-bit registers
+//! (`cycleh`, `mstatush`, ...) and the odd `pmpcfg` registers (spec section
+//! 5). [`rv32_only`] says which; [`name`] and [`parse`] know them only on
+//! RV32, as llvm-objdump and llvm-mc do, so an RV64 disassembly prints them
+//! as numbers and an RV64 assembler refuses their names.
+
+use crate::Xlen;
 
 pub const SSTATUS: u16 = 0x100;
 pub const SIE: u16 = 0x104;
@@ -68,6 +76,17 @@ pub const MSTATUS_MXR: u32 = 1 << 19;
 pub const MSTATUS_TVM: u32 = 1 << 20;
 pub const MSTATUS_TW: u32 = 1 << 21;
 pub const MSTATUS_TSR: u32 = 1 << 22;
+// RV64 only: the 64-bit fields of mstatus (and UXL, SD of sstatus). The
+// low-bit constants above become u64 with Grail's CSRs (#145).
+/// UXL [33:32]: U-mode's XLEN, read-only 2 (64-bit) on Excalibur.
+pub const MSTATUS_UXL: u64 = 3 << 32;
+/// SXL [35:34]: S-mode's XLEN, read-only 2 (64-bit) on Excalibur.
+pub const MSTATUS_SXL: u64 = 3 << 34;
+/// The value UXL and SXL hold: 2, 64-bit.
+pub const XLEN_64: u64 = 2;
+/// SD on RV64, bit 63 (on RV32 it is bit 31, [`MSTATUS_SD_RV32`]).
+pub const MSTATUS_SD: u64 = 1 << 63;
+pub const MSTATUS_SD_RV32: u32 = 1 << 31;
 
 // Interrupt bits (mip/mie and cause numbers).
 pub const IRQ_S_SOFT: u32 = 1;
@@ -77,13 +96,28 @@ pub const IRQ_M_TIMER: u32 = 7;
 pub const IRQ_S_EXT: u32 = 9;
 pub const IRQ_M_EXT: u32 = 11;
 
-/// CSR address for a name (the inverse of [`name`]), for the assembler.
-pub fn parse(name: &str) -> Option<u16> {
-    (0..4096u16).find(|&a| self::name(a) == Some(name))
+/// Whether the CSR at `addr` exists only on RV32: the high halves of the
+/// 64-bit counters (`cycleh`, `timeh`, `instreth`, `hpmcounter3h`-`31h`,
+/// `mcycleh`, `minstreth`, `mhpmcounter3h`-`31h`), of `mstatus` and
+/// `menvcfg`, and the odd PMP configuration registers. On RV64 accessing
+/// them is an illegal instruction.
+pub fn rv32_only(addr: u16) -> bool {
+    matches!(addr, MSTATUSH | MENVCFGH | 0xb80..=0xb9f | 0xc80..=0xc9f)
+        || addr == PMPCFG0 + 1
+        || addr == PMPCFG0 + 3
 }
 
-/// Human-readable name for disassembly.
-pub fn name(addr: u16) -> Option<&'static str> {
+/// CSR address for a name (the inverse of [`name`]), for the assembler.
+pub fn parse(name: &str, xlen: Xlen) -> Option<u16> {
+    (0..4096u16).find(|&a| self::name(a, xlen) == Some(name))
+}
+
+/// Human-readable name for disassembly, as the width has it: an RV32-only
+/// CSR has no name on RV64.
+pub fn name(addr: u16, xlen: Xlen) -> Option<&'static str> {
+    if xlen == Xlen::Rv64 && rv32_only(addr) {
+        return None;
+    }
     Some(match addr {
         SSTATUS => "sstatus",
         SIE => "sie",
@@ -159,16 +193,58 @@ const PMPADDR_NAMES: [&str; 16] = [
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn names_round_trip() {
-        for a in 0..4096u16 {
-            if let Some(n) = super::name(a) {
-                assert_eq!(super::parse(n), Some(a), "{n}");
+        for xlen in [Xlen::Rv32, Xlen::Rv64] {
+            for a in 0..4096u16 {
+                if let Some(n) = name(a, xlen) {
+                    assert_eq!(parse(n, xlen), Some(a), "{n}");
+                }
             }
         }
-        assert_eq!(super::name(0x3a1), Some("pmpcfg1"));
-        assert_eq!(super::name(0x3bf), Some("pmpaddr15"));
-        assert_eq!(super::parse("pmpaddr3"), Some(0x3b3));
-        assert_eq!(super::name(0x7c0), None);
+        assert_eq!(name(0x3a1, Xlen::Rv32), Some("pmpcfg1"));
+        assert_eq!(name(0x3bf, Xlen::Rv64), Some("pmpaddr15"));
+        assert_eq!(parse("pmpaddr3", Xlen::Rv64), Some(0x3b3));
+        assert_eq!(name(0x7c0, Xlen::Rv32), None);
+    }
+
+    #[test]
+    fn rv32_only_csrs_have_no_name_on_rv64() {
+        for (addr, n) in [
+            (CYCLEH, "cycleh"),
+            (TIMEH, "timeh"),
+            (INSTRETH, "instreth"),
+            (MCYCLEH, "mcycleh"),
+            (MINSTRETH, "minstreth"),
+            (MSTATUSH, "mstatush"),
+            (MENVCFGH, "menvcfgh"),
+            (0x3a1, "pmpcfg1"),
+            (0x3a3, "pmpcfg3"),
+        ] {
+            assert!(rv32_only(addr), "{n}");
+            assert_eq!(name(addr, Xlen::Rv32), Some(n));
+            assert_eq!(name(addr, Xlen::Rv64), None, "{n}");
+            assert_eq!(parse(n, Xlen::Rv64), None, "{n}");
+        }
+        // The unnamed high halves of the hardware performance counters too.
+        assert!(rv32_only(0xc83) && rv32_only(0xc9f) && rv32_only(0xb83) && rv32_only(0xb9f));
+        // Their low halves, and everything else, exist on both.
+        for addr in [
+            CYCLE,
+            TIME,
+            INSTRET,
+            MCYCLE,
+            MINSTRET,
+            MSTATUS,
+            MENVCFG,
+            PMPCFG0,
+            PMPCFG0 + 2,
+            SATP,
+        ] {
+            assert!(!rv32_only(addr), "{addr:#x}");
+            assert_eq!(name(addr, Xlen::Rv32), name(addr, Xlen::Rv64));
+        }
     }
 }

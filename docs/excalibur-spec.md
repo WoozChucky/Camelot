@@ -872,6 +872,14 @@ All reading goes through one crate, `elf32` (header, program headers, sections, 
 
 The instruction formatting itself (`Inst::format` in `excalibur`) is shared with Grail's `--trace`, which uses the plain form: no pseudo-instructions, decimal immediates, relative branch offsets.
 
+`excalibur` decodes and formats both widths:
+- **The width** is a parameter: `decode(word, xlen)` and `Syntax::xlen`. A word means different things on the two (section 4), branch targets wrap at the width, and the RV32-only CSRs are named only on RV32, as in llvm-objdump.
+- **RV64's aliases:** `sext.w` for `addiw rd, rs, 0`, `negw` for `subw rd, zero, rs`, and the `.d` atomics with their suffixes.
+- **The check:** `crates/excalibur/tests/disasm.rs` decodes every word of a corpus for each width (`tests/golden/rv32.s`, `rv64.s`, with every instruction, edge immediate, alias and illegal encoding) and compares it with llvm-objdump's text, with and without aliases (`scripts/gen-excalibur-golden.sh`).
+- **One version difference:** LLVM 23 prints `fence w, 0` as Zihintpause's `pause`, an extension Excalibur does not have; excalibur prints `fence w, 0`, as LLVM 21 does.
+
+The tools move to RV64 one by one (#141). Until then each passes `Xlen::Rv32`, and so does merlin-objdump until #150.
+
 ### Debug information
 
 Source-level debugging (merlin-dbg's `break FILE:LINE`, `step` and `next` by line, `list`) rests on DWARF line tables, which every tool in the chain handles:

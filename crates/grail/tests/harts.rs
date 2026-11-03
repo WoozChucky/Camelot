@@ -168,7 +168,7 @@ fn the_park_loop() {
     let text: Vec<String> = (PARK_PC..)
         .step_by(4)
         .map_while(|addr| m.cpu.bus.peek(addr))
-        .map(|w| excalibur::decode(w).to_string())
+        .map(|w| excalibur::decode(w, excalibur::Xlen::Rv32).to_string())
         .collect();
     assert_eq!(
         text,

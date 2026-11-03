@@ -1,0 +1,44 @@
+
+crates/excalibur/tests/golden/rv32.o:	file format elf32-littleriscv
+
+Disassembly of section .text:
+
+00000000 <start>:
+       0: 80000537     	lui	a0, 0x80000
+       4: fffff597     	auipc	a1, 0xfffff
+       8: ff9ff06f     	j	0x0 <start>
+       c: 008000ef     	jal	0x14 <fwd>
+      10: 00b50263     	beq	a0, a1, 0x14 <fwd>
+
+00000014 <fwd>:
+      14: ffc12503     	lw	a0, -0x4(sp)
+      18: feb12e23     	sw	a1, -0x4(sp)
+      1c: fff50513     	addi	a0, a0, -0x1
+      20: 01f51513     	slli	a0, a0, 0x1f
+      24: 0015d513     	srli	a0, a1, 0x1
+      28: 41f5d513     	srai	a0, a1, 0x1f
+      2c: 40c00533     	neg	a0, a2
+      30: 02c59533     	mulh	a0, a1, a2
+      34: 02c5b533     	mulhu	a0, a1, a2
+      38: 1605a52f     	lr.w.aqrl	a0, (a1)
+      3c: 18b6252f     	sc.w	a0, a1, (a2)
+      40: e0b6202f     	amomaxu.w	zero, a1, (a2)
+      44: c8002573     	rdcycleh	a0
+      48: c8102573     	rdtimeh	a0
+      4c: c8202573     	rdinstreth	a0
+      50: 31002573     	csrr	a0, mstatush
+      54: 31a02573     	csrr	a0, menvcfgh
+      58: b8002573     	csrr	a0, mcycleh
+      5c: b8202573     	csrr	a0, minstreth
+      60: 3a102573     	csrr	a0, pmpcfg1
+      64: 3a302573     	csrr	a0, pmpcfg3
+      68: 31051073     	csrw	mstatush, a0
+      6c: 03f51513     	<unknown>
+      70: ff813503     	<unknown>
+      74: 00456583     	<unknown>
+      78: 00113423     	<unknown>
+      7c: fff5851b     	<unknown>
+      80: 00c5853b     	<unknown>
+      84: 02c5853b     	<unknown>
+      88: 1005b52f     	<unknown>
+      8c: 04b6352f     	<unknown>

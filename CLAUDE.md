@@ -18,7 +18,7 @@ Camelot is a learning project: the Excalibur ISA (RV32IMA + Zicsr, M/S/U, Sv32, 
 ## Layout
 
 ```
-crates/excalibur        encodings, decoder, disassembler (shared by every tool)
+crates/excalibur        encodings, decoder, disassembler (shared by every tool), for RV32 and RV64: decode and Syntax take the width (Xlen); tests/disasm.rs checks both against llvm-objdump's text for tests/golden/rv{32,64}.s (scripts/gen-excalibur-golden.sh)
 crates/elf32            ELF32 reader (grail, merlin-objdump, merlin-ld), and DWARF line tables (src/lines.rs: merlin-objdump -l, merlin-dbg)
 crates/grail            the emulator (rom/diskboot.s: the boot ROM's disk loader, which boots a machine started with no program from disk 0)
 crates/avalon-proto     Avalon protocol (framing, messages, Connection, Screen diffing), shared by the Avalon platform's programs; spec in docs/avalon-protocol.md

@@ -226,7 +226,9 @@ fn start_grail(args: Vec<String>) -> Result<(SocketAddr, MachineThread, Option<S
         let mut trace = |cpu: &grail::cpu::Cpu| {
             if tracing {
                 let word = cpu.bus.peek(cpu.pc);
-                let text = word.map_or("<unmapped>".to_string(), |w| excalibur::decode(w).to_string());
+                let text = word.map_or("<unmapped>".to_string(), |w| {
+                    excalibur::decode(w, excalibur::Xlen::Rv32).to_string()
+                });
                 eprintln!("h{} {:?} {:08x}: {}", cpu.id, cpu.mode, cpu.pc, text);
             }
         };
