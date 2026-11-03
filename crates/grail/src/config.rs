@@ -359,6 +359,15 @@ pub fn parse_ram_mib(s: &str) -> Result<usize, String> {
     Ok(mib * MIB)
 }
 
+/// Parses an `--xlen` value: `32` (RV32) or `64` (RV64).
+pub fn parse_xlen(s: &str) -> Result<Xlen, String> {
+    match s.trim() {
+        "32" => Ok(Xlen::Rv32),
+        "64" => Ok(Xlen::Rv64),
+        s => Err(format!("'{s}' is not a register width (32 or 64)")),
+    }
+}
+
 /// Parses a `--harts` value: a whole number from 1 to [`MAX_HARTS`].
 pub fn parse_harts(s: &str) -> Result<usize, String> {
     let s = s.trim();
