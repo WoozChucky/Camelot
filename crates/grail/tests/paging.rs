@@ -1,7 +1,8 @@
 //! Sv48 and Sv39 on an RV64 hart (spec section 7, "Paging"): 4 KiB pages and every
 //! superpage size, misaligned superpages, reserved PTE bits, non-canonical addresses,
 //! the A/D updates and `sfence.vma`. riscv-tests rv64si covers the common path under
-//! Sv39; these pin down the rest, Sv48 above all.
+//! Sv39; these pin down the rest, Sv48 above all. And Sv32's 34-bit physical
+//! addresses, which share the walk.
 //!
 //! Most tests call [`Hart::translate`] on a hart in S-mode, over page tables built in
 //! RAM by [`Tables`]; the last ones run instructions on a machine.
@@ -360,6 +361,36 @@ fn m_mode_and_bare_do_not_translate() {
     p.hart.mode = Mode::S;
     p.hart.csr.satp = 0;
     assert_eq!(p.translate(1 << 47, Access::Load), Ok(1 << 47), "Bare");
+}
+
+#[test]
+fn sv32_pages_and_tables_above_4_gib_do_not_wrap() {
+    // Sv32's 22-bit PPNs make 34-bit physical addresses. Nothing is above 4 GiB, so a
+    // page there is an access fault, not the page 4 GiB below it.
+    let mut bus = Bus::new(&MachineConfig::with_ram(RAM_SIZE), Vec::new());
+    let mut hart = Hart::new(0, RAM, Xlen::Rv32);
+    hart.mode = Mode::S;
+    hart.csr.satp = 1 << 31 | ROOT >> 12;
+    let va = 0x0040_3000u64; // VPN[1] = 1, VPN[0] = 3
+    let table = ROOT + 0x1000;
+    let pte32 = |pa: u64, flags: u64| ((pa >> 12) << 10 | flags | V) as u32;
+    bus.write(ROOT as u32 + 4, 4, pte32(table, 0)).unwrap();
+
+    // A leaf whose PPN has bit 20 set.
+    bus.write(table as u32 + 3 * 4, 4, pte32(1 << 32 | RAM, RWXAD))
+        .unwrap();
+    assert_eq!(hart.translate(&mut bus, va, Access::Load), Ok(1 << 32 | RAM));
+    assert_eq!(
+        hart.load(&mut bus, va, 4),
+        Err(Trap::new(Exception::LoadAccessFault, va))
+    );
+
+    // A pointer to a table above 4 GiB: the walk's read of it is the access fault.
+    bus.write(ROOT as u32 + 4, 4, pte32(1 << 32 | table, 0)).unwrap();
+    assert_eq!(
+        hart.translate(&mut bus, va, Access::Load),
+        Err(Trap::new(Exception::LoadAccessFault, va))
+    );
 }
 
 // Instructions, on a machine: fetches through the tables, sfence.vma, and an access
