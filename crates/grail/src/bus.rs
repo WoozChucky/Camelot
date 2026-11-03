@@ -410,6 +410,9 @@ impl Bus {
         if Self::offset_in(addr, TEST_DEV_BASE, TEST_DEV_SIZE).is_some() {
             return Ok(0);
         }
+        if let Some(off) = Self::offset_in(addr, CLINT_BASE, CLINT_SIZE) {
+            return self.clint.read(off, size);
+        }
         // Every other device has 32-bit registers only, for now.
         if size == 8 {
             return Err(BusFault);
@@ -421,9 +424,7 @@ impl Bus {
             return self.nets[i].read(off, size).map(u64::from);
         }
         let at = |base, len| Self::offset_in(addr, base, len);
-        let v = if let Some(off) = at(CLINT_BASE, CLINT_SIZE) {
-            self.clint.read(off, size)
-        } else if let Some(off) = at(PLIC_BASE, PLIC_SIZE) {
+        let v = if let Some(off) = at(PLIC_BASE, PLIC_SIZE) {
             self.plic.read(off, size)
         } else if let Some(off) = at(UART_BASE, UART_SIZE) {
             self.uart.read(off, size)
@@ -469,6 +470,9 @@ impl Bus {
             }
             return Ok(());
         }
+        if let Some(off) = Self::offset_in(addr, CLINT_BASE, CLINT_SIZE) {
+            return self.clint.write(off, size, val);
+        }
         // Every other device has 32-bit registers only, for now.
         if size == 8 {
             return Err(BusFault);
@@ -494,9 +498,7 @@ impl Bus {
             });
         }
         let at = |base, len| Self::offset_in(addr, base, len);
-        if let Some(off) = at(CLINT_BASE, CLINT_SIZE) {
-            self.clint.write(off, size, val)
-        } else if let Some(off) = at(PLIC_BASE, PLIC_SIZE) {
+        if let Some(off) = at(PLIC_BASE, PLIC_SIZE) {
             self.plic.write(off, size, val)
         } else if let Some(off) = at(UART_BASE, UART_SIZE) {
             self.uart.write(off, size, val)

@@ -262,6 +262,12 @@ fn lw_sign_extends_and_lwu_zero_extends() {
     let uart = grail::bus::UART_BASE;
     set(&mut m, A1, uart);
     run_traps(&mut m, "ld a0, 0(a1)", i_type(0, A1, 3, A0, LOAD), 5, uart);
+    // The CLINT's mtime is a 64-bit register: one ld reads it whole (after the step's
+    // own tick).
+    m.cpu.bus.clint.mtime = 0x1234_5678_ffff_fffe;
+    set(&mut m, A1, grail::bus::CLINT_BASE + 0xbff8);
+    run(&mut m, "ld a0, 0(a1)", i_type(0, A1, 3, A0, LOAD));
+    assert_eq!(x(&m, A0), 0x1234_5678_ffff_ffff);
 }
 
 #[test]
