@@ -207,6 +207,7 @@ impl Bus {
     fn set_device_versions(&mut self, xlen: Xlen) {
         self.sysinfo.set_xlen(xlen);
         self.disks.iter_mut().for_each(|d| d.set_xlen(xlen));
+        self.nets.iter_mut().for_each(|n| n.set_xlen(xlen));
     }
 
     /// Fills the boot ROM (spec section 7, "Boot"). Hart 0 starts at `BOOT_ROM_BASE`, a
@@ -305,9 +306,7 @@ impl Bus {
         let reservations = &mut self.reservations;
         for nic in &mut self.nets {
             nic.skip(ticks, &mut self.ram, &mut |paddr, len| {
-                reservations
-                    .iter_mut()
-                    .for_each(|r| r.snoop(paddr.into(), len.into()))
+                reservations.iter_mut().for_each(|r| r.snoop(paddr, len.into()))
             });
         }
     }
@@ -321,9 +320,7 @@ impl Bus {
         let reservations = &mut self.reservations;
         for (i, nic) in self.nets.iter_mut().enumerate() {
             nic.tick(&mut self.ram, &mut |paddr, len| {
-                reservations
-                    .iter_mut()
-                    .for_each(|r| r.snoop(paddr.into(), len.into()))
+                reservations.iter_mut().for_each(|r| r.snoop(paddr, len.into()))
             });
             self.plic.set_level(NET_IRQ + i as u32, nic.irq());
         }
@@ -433,12 +430,12 @@ impl Bus {
         if let Some((i, off)) = self.disk_at(addr) {
             return self.disks[i].read(off, size);
         }
-        // Every other device has 32-bit registers only, for now.
+        if let Some((i, off)) = self.net_at(addr) {
+            return self.nets[i].read(off, size);
+        }
+        // Every other device has 32-bit registers only.
         if size == 8 {
             return Err(BusFault);
-        }
-        if let Some((i, off)) = self.net_at(addr) {
-            return self.nets[i].read(off, size).map(u64::from);
         }
         let at = |base, len| Self::offset_in(addr, base, len);
         let v = if let Some(off) = at(PLIC_BASE, PLIC_SIZE) {
@@ -505,22 +502,20 @@ impl Bus {
             }
             return self.disks[i].write(off, size, val, &mut self.ram);
         }
-        // Every other device has 32-bit registers only, for now.
-        if size == 8 {
-            return Err(BusFault);
-        }
-        let val = val as u32;
         if let Some((i, off)) = self.net_at(addr) {
             // Writing `NET_TX_TAIL` sends frames at once: the card reads them from RAM
             // and writes each descriptor's length and status back (DMA), which breaks
             // the reservations on those lines, whichever hart holds them.
             let reservations = &mut self.reservations;
             return self.nets[i].write(off, size, val, &mut self.ram, &mut |paddr, len| {
-                reservations
-                    .iter_mut()
-                    .for_each(|r| r.snoop(paddr.into(), len.into()))
+                reservations.iter_mut().for_each(|r| r.snoop(paddr, len.into()))
             });
         }
+        // Every other device has 32-bit registers only.
+        if size == 8 {
+            return Err(BusFault);
+        }
+        let val = val as u32;
         let at = |base, len| Self::offset_in(addr, base, len);
         if let Some(off) = at(PLIC_BASE, PLIC_SIZE) {
             self.plic.write(off, size, val)

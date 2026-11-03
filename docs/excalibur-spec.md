@@ -649,7 +649,7 @@ An Ethernet card, so machines can network. It sends and receives raw Ethernet II
 
 The ring bases are 64-bit registers; the others are 32-bit.
 
-**Descriptors** are 16 bytes, little-endian like everything else, and naturally aligned: a ring's `BASE` is a multiple of 16, as virtio requires of its descriptor table (an e1000 wants 128). A `BASE` that is not is refused: the register keeps the value written (it reads back), the ring's `SIZE` becomes 0, and `NET_ERROR` becomes 4. Alignment depends only on the low bits, so a `BASE` written by halves is checked the same way whichever half comes first:
+**Descriptors** are 16 bytes, little-endian like everything else, and naturally aligned: a ring's `BASE` is a multiple of 16, as virtio requires of its descriptor table (an e1000 wants 128). A `BASE` that is not is refused: the register keeps the value written (it reads back), the ring's `SIZE` becomes 0, and `NET_ERROR` becomes 4; so is a non-zero `SIZE` written while `BASE` is not a multiple of 16. Alignment depends only on the low bits, so a `BASE` written by halves is checked the same way whichever half comes first:
 
 | Offset | Field | Notes |
 |---|---|---|
