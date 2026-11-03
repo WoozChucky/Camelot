@@ -190,7 +190,8 @@ impl Ctx<'_> {
     /// A CSR operand: a name like `mstatus` or a number like `0x300`.
     pub fn csr(&self, e: &Expr) -> Option<u16> {
         if let Expr::Sym(name) = e {
-            if let Some(addr) = excalibur::csr::parse(name) {
+            // merlin-as assembles RV32 until #148.
+            if let Some(addr) = excalibur::csr::parse(name, excalibur::Xlen::Rv32) {
                 return Some(addr);
             }
         }

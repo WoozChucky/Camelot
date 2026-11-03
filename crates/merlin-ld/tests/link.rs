@@ -936,10 +936,10 @@ fn weak_reference_defined_elsewhere_reaches_the_definition() {
         .filter(|r| r.sym as usize == weak)
     {
         let p = base + r.offset;
-        let to = match excalibur::decode(word(p)) {
+        let to = match excalibur::decode(word(p), excalibur::Xlen::Rv32) {
             Inst::Jal { imm, .. } | Inst::Branch { imm, .. } => p.wrapping_add(imm as u32),
-            Inst::Auipc { imm: hi, .. } => match excalibur::decode(word(p + 4)) {
-                Inst::Jalr { imm: lo, .. } => p.wrapping_add(hi).wrapping_add(lo as u32),
+            Inst::Auipc { imm: hi, .. } => match excalibur::decode(word(p + 4), excalibur::Xlen::Rv32) {
+                Inst::Jalr { imm: lo, .. } => p.wrapping_add(hi as u32).wrapping_add(lo as u32),
                 other => panic!("no jalr after the auipc: {other:?}"),
             },
             other => panic!("unexpected {other:?}"),

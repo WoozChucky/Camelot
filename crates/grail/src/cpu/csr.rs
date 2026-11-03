@@ -133,7 +133,7 @@ impl Hart {
 
     pub fn csr_read(&mut self, bus: &Bus, addr: u16) -> Result<u32, Trap> {
         self.check_access(addr, false)?;
-        let counter = (0xc00..=0xc1f).contains(&addr) || (0xc80..=0xc9f).contains(&addr);
+        let counter = (CYCLE..=0xc1f).contains(&addr) || (CYCLEH..=0xc9f).contains(&addr);
         if counter && !self.counter_allowed(addr) {
             return Err(illegal());
         }
@@ -174,15 +174,15 @@ impl Hart {
             MIP => self.mip(bus),
             a if (PMPCFG0..PMPCFG0 + 4).contains(&a) => c.pmpcfg[(a - PMPCFG0) as usize],
             a if (PMPADDR0..PMPADDR0 + 16).contains(&a) => c.pmpaddr[(a - PMPADDR0) as usize],
-            0x323..=0x33f => 0, // mhpmevent3..31
+            MHPMEVENT3..=0x33f => 0,
 
             MCYCLE => c.mcycle as u32,
             MCYCLEH => (c.mcycle >> 32) as u32,
             MINSTRET => c.minstret as u32,
             MINSTRETH => (c.minstret >> 32) as u32,
-            0xb03..=0xb1f | 0xb83..=0xb9f => 0, // mhpmcounter3..31(h)
+            MHPMCOUNTER3..=0xb1f | MHPMCOUNTER3H..=0xb9f => 0,
 
-            0xc00..=0xc1f | 0xc80..=0xc9f => {
+            CYCLE..=0xc1f | CYCLEH..=0xc9f => {
                 let time = bus.clint.mtime;
                 match addr {
                     CYCLE => c.mcycle as u32,
@@ -196,8 +196,8 @@ impl Hart {
             }
 
             // Debug triggers: tselect hard-wired to a non-zero value means "no triggers".
-            0x7a0 => 1,
-            0x7a1..=0x7a5 => 0,
+            TSELECT => 1,
+            TDATA1..=TCONTROL => 0,
 
             MHARTID => self.id,
             MVENDORID | MARCHID | MIMPID | MCONFIGPTR => 0,
@@ -259,7 +259,7 @@ impl Hart {
             MIP => c.mip = (c.mip & !MIP_WMASK) | (v & MIP_WMASK),
             a if (PMPCFG0..PMPCFG0 + 4).contains(&a) => c.pmpcfg[(a - PMPCFG0) as usize] = v,
             a if (PMPADDR0..PMPADDR0 + 16).contains(&a) => c.pmpaddr[(a - PMPADDR0) as usize] = v,
-            0x323..=0x33f => {}
+            MHPMEVENT3..=0x33f => {}
 
             MCYCLE => c.mcycle = (c.mcycle & !0xffff_ffff) | v as u64,
             MCYCLEH => c.mcycle = (c.mcycle & 0xffff_ffff) | ((v as u64) << 32),
@@ -271,9 +271,9 @@ impl Hart {
                 c.minstret = (c.minstret & 0xffff_ffff) | ((v as u64) << 32);
                 self.instret_written = true;
             }
-            0xb03..=0xb1f | 0xb83..=0xb9f => {}
+            MHPMCOUNTER3..=0xb1f | MHPMCOUNTER3H..=0xb9f => {}
 
-            0x7a0..=0x7a5 => {}
+            TSELECT..=TCONTROL => {}
             _ => return false,
         }
         true

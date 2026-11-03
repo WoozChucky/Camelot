@@ -9,10 +9,14 @@ use crate::frames::{self, Regs};
 use crate::remote::{self, Remote, StopEvent, Watch};
 use crate::source::{Lines, Place};
 use crate::symbols::Symbols;
-use excalibur::Syntax;
-use excalibur::{decode, Inst};
+use excalibur::{Inst, Syntax, Xlen};
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
+
+/// RV32 code until merlin-dbg learns RV64 (#153).
+fn decode(w: u32) -> Inst {
+    excalibur::decode(w, Xlen::Rv32)
+}
 
 /// A breakpoint or a watchpoint, numbered from 1 as they are set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -714,10 +718,10 @@ impl<'a, W: Write> Session<'a, W> {
         let at = self.symbols.show(pc);
         match self.remote.read_word(pc) {
             Some(word) => {
-                let d = decode(word).format(Some(pc), Syntax::OBJDUMP);
+                let d = decode(word).format(Some(u64::from(pc)), Syntax::objdump(Xlen::Rv32));
                 let target = d
                     .target
-                    .and_then(|t| self.symbols.describe(t))
+                    .and_then(|t| self.symbols.describe(t as u32))
                     .map_or(String::new(), |s| format!(" <{s}>"));
                 format!("{mark} {at}:  {d}{target}")
             }
@@ -899,7 +903,7 @@ pub fn register_number(name: &str) -> Option<usize> {
     if let Some(r) = excalibur::reg::parse(name) {
         return Some(r as usize);
     }
-    excalibur::csr::parse(name).map(remote::csr)
+    excalibur::csr::parse(name, Xlen::Rv32).map(remote::csr)
 }
 
 #[cfg(test)]

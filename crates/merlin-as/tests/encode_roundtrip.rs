@@ -16,8 +16,15 @@
 //!   reassembles, and catches bits `decode` ignores, like fence's pred/succ.
 //!   Words patched by a relocation are left out: their fields are zero.
 
-use excalibur::{decode, AluOp, AmoOp, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, Ordering, StoreOp};
+use excalibur::{
+    AluOp, AmoOp, AmoWidth, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, Ordering, StoreOp, Xlen,
+};
 use merlin_as::reloc::RelocKind;
+
+/// merlin-as writes RV32 until #148.
+fn decode(w: u32) -> Inst {
+    excalibur::decode(w, Xlen::Rv32)
+}
 
 /// One word of `.text` and the relocation that will patch it, if any.
 struct Word {
@@ -146,7 +153,7 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
             "lui t0, 0xfffff",
             vec![Lui {
                 rd: T0,
-                imm: 0xffff_f000,
+                imm: 0xffff_f000u32 as i32,
             }],
         ),
         ("auipc sp, 1", vec![Auipc { rd: SP, imm: 0x1000 }]),
@@ -342,6 +349,7 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
         (
             "lr.w a0, (a1)",
             vec![Lr {
+                width: AmoWidth::W,
                 rd: A0,
                 rs1: A1,
                 order: Ordering::NONE,
@@ -350,6 +358,7 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
         (
             "sc.w.rl t0, t1, 0(t2)",
             vec![Sc {
+                width: AmoWidth::W,
                 rd: T0,
                 rs1: T2,
                 rs2: T1,
@@ -360,6 +369,7 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
             "amomaxu.w.aq zero, a5, (sp)",
             vec![Amo {
                 op: AmoOp::Maxu,
+                width: AmoWidth::W,
                 rd: ZERO,
                 rs1: SP,
                 rs2: A5,
@@ -617,7 +627,7 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
             "li a0, 0x80000000",
             vec![Lui {
                 rd: A0,
-                imm: 0x8000_0000,
+                imm: 0x8000_0000u32 as i32,
             }],
         ),
         (
@@ -646,7 +656,7 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
             vec![
                 Lui {
                     rd: A0,
-                    imm: 0xffff_f000,
+                    imm: 0xffff_f000u32 as i32,
                 },
                 i(AluOp::Add, A0, A0, 2047),
             ],
@@ -656,7 +666,7 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
             vec![
                 Lui {
                     rd: A0,
-                    imm: 0x8000_0000,
+                    imm: 0x8000_0000u32 as i32,
                 },
                 i(AluOp::Add, A0, A0, -2048),
             ],
@@ -911,11 +921,22 @@ fn roundtrip_atomics() {
             let (src, want) = match base {
                 "lr.w" => (
                     format!("lr.w{suffix} {}, ({})", name(rd), name(rs1)),
-                    Inst::Lr { rd, rs1, order },
+                    Inst::Lr {
+                        width: AmoWidth::W,
+                        rd,
+                        rs1,
+                        order,
+                    },
                 ),
                 "sc.w" => (
                     format!("sc.w{suffix} {}, {}, ({})", name(rd), name(rs2), name(rs1)),
-                    Inst::Sc { rd, rs1, rs2, order },
+                    Inst::Sc {
+                        width: AmoWidth::W,
+                        rd,
+                        rs1,
+                        rs2,
+                        order,
+                    },
                 ),
                 _ => {
                     let op = amos.iter().find(|a| a.0 == base).unwrap().1;
@@ -923,6 +944,7 @@ fn roundtrip_atomics() {
                         format!("{base}{suffix} {}, {}, ({})", name(rd), name(rs2), name(rs1)),
                         Inst::Amo {
                             op,
+                            width: AmoWidth::W,
                             rd,
                             rs1,
                             rs2,

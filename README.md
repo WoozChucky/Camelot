@@ -48,7 +48,7 @@ Ctrl-] leaves Herald, and the VM carries on. The console is one for the whole VM
 ## Layout
 
 ```
-crates/excalibur        instruction encodings, decoder, disassembler (shared by every tool)
+crates/excalibur        instruction encodings, decoder, disassembler for RV32 and RV64 (shared by every tool)
 crates/elf32            ELF32 reader and DWARF line tables (shared by grail, merlin-objdump, merlin-ld, merlin-dbg)
 crates/grail            the emulator
 crates/avalon-proto     the Avalon protocol: frames, messages, blocking connection, screen diffing (docs/avalon-protocol.md)

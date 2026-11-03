@@ -366,8 +366,8 @@ mod tests {
     /// `excalibur`) reads them back.
     fn imm(word: u32) -> i64 {
         use excalibur::Inst;
-        match excalibur::decode(word) {
-            Inst::Lui { imm, .. } | Inst::Auipc { imm, .. } => imm as i32 as i64,
+        match excalibur::decode(word, excalibur::Xlen::Rv32) {
+            Inst::Lui { imm, .. } | Inst::Auipc { imm, .. } => imm as i64,
             Inst::Jal { imm, .. } | Inst::Jalr { imm, .. } | Inst::Branch { imm, .. } => imm as i64,
             Inst::Load { imm, .. } | Inst::Store { imm, .. } | Inst::OpImm { imm, .. } => imm as i64,
             other => panic!("unexpected {other:?}"),

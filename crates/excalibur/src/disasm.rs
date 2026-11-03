@@ -2,7 +2,7 @@
 //! merlin-as accepts.
 //!
 //! [`Inst::format`] is the general form: it can print pseudo-instructions
-//! (`mv`, `ret`, `beqz`, ...) exactly where llvm-objdump does, hex
+//! (`mv`, `ret`, `beqz`, `sext.w`, ...) exactly where llvm-objdump does, hex
 //! immediates, and absolute branch targets. `Display` is the plain form Grail's
 //! trace uses: real instructions only, decimal immediates, branch offsets
 //! relative to the instruction.
@@ -15,29 +15,41 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Syntax {
     /// Print the pseudo-instruction llvm-objdump prints for this encoding
-    /// (`nop`, `li`, `mv`, `not`, `neg`, `seqz`, `snez`, `sltz`, `sgtz`,
-    /// `zext.b`, `beqz`/`bnez`/`blez`/`bgez`/`bltz`/`bgtz`, `j`, `jal off`,
-    /// `jr`, `jalr rs`, `ret`, `fence`, `sfence.vma`, `csrr`/`csrw`/`csrs`/
-    /// `csrc` and their `i` forms, `rdcycle`/`rdtime`/`rdinstret` and the
-    /// `h` variants). `-M no-aliases` in llvm-objdump turns this off.
+    /// (`nop`, `li`, `mv`, `not`, `neg`, `negw`, `sext.w`, `seqz`, `snez`,
+    /// `sltz`, `sgtz`, `zext.b`, `beqz`/`bnez`/`blez`/`bgez`/`bltz`/`bgtz`,
+    /// `j`, `jal off`, `jr`, `jalr rs`, `ret`, `fence`, `sfence.vma`,
+    /// `csrr`/`csrw`/`csrs`/`csrc` and their `i` forms, `rdcycle`/`rdtime`/
+    /// `rdinstret`, and on RV32 the `h` variants). `-M no-aliases` in
+    /// llvm-objdump turns this off.
     pub aliases: bool,
     /// Immediates in hex (`0x7ff`, `-0x8`), llvm-objdump's default. In
     /// decimal mode, upper immediates (`lui`/`auipc`) and unnamed CSR numbers
     /// are still printed in hex because that is how people write them.
     pub hex: bool,
+    /// The width the code is for: branch and jump targets wrap at it, and
+    /// the RV32-only CSRs have names only on RV32 (as in llvm-objdump).
+    pub xlen: Xlen,
 }
 
 impl Syntax {
-    /// What llvm-objdump prints by default.
-    pub const OBJDUMP: Syntax = Syntax {
-        aliases: true,
-        hex: true,
-    };
-    /// What `Display` prints.
-    pub const PLAIN: Syntax = Syntax {
-        aliases: false,
-        hex: false,
-    };
+    /// What llvm-objdump prints by default, for code of width `xlen`.
+    pub const fn objdump(xlen: Xlen) -> Syntax {
+        Syntax {
+            aliases: true,
+            hex: true,
+            xlen,
+        }
+    }
+
+    /// What `Display` prints (with `xlen` RV32): real instructions only,
+    /// decimal immediates.
+    pub const fn plain(xlen: Xlen) -> Syntax {
+        Syntax {
+            aliases: false,
+            hex: false,
+            xlen,
+        }
+    }
 }
 
 /// A formatted instruction.
@@ -48,7 +60,7 @@ pub struct Disasm {
     pub operands: String,
     /// For branches and `jal` formatted with a known address: the absolute
     /// target, already printed in `operands`. Tools add a `<symbol>` after it.
-    pub target: Option<u32>,
+    pub target: Option<u64>,
 }
 
 impl fmt::Display for Disasm {
@@ -61,27 +73,41 @@ impl fmt::Display for Disasm {
     }
 }
 
-/// `rdcycle` & co: `csrrs rd, <counter>, zero`.
-fn counter_alias(csr: u16) -> Option<&'static str> {
+/// `rdcycle` & co: `csrrs rd, <counter>, zero`. The `h` forms exist only on
+/// RV32, as their CSRs do.
+fn counter_alias(csr: u16, xlen: Xlen) -> Option<&'static str> {
     Some(match csr {
         csr::CYCLE => "rdcycle",
         csr::TIME => "rdtime",
         csr::INSTRET => "rdinstret",
-        csr::CYCLEH => "rdcycleh",
-        csr::TIMEH => "rdtimeh",
-        csr::INSTRETH => "rdinstreth",
+        csr::CYCLEH if xlen == Xlen::Rv32 => "rdcycleh",
+        csr::TIMEH if xlen == Xlen::Rv32 => "rdtimeh",
+        csr::INSTRETH if xlen == Xlen::Rv32 => "rdinstreth",
         _ => return None,
     })
 }
 
-/// An A-extension mnemonic with its ordering suffix. Mnemonics are
-/// `&'static str`, so each one is spelled out four times: none, `.rl`, `.aq`,
-/// `.aqrl` (indexed by the aq and rl bits).
+/// An A-extension mnemonic with its width and ordering suffixes. Mnemonics
+/// are `&'static str`, so each one is spelled out for both widths and four
+/// orderings: none, `.rl`, `.aq`, `.aqrl` (indexed by the aq and rl bits).
 macro_rules! ordered {
-    ($m:literal, $order:expr) => {{
+    ($m:literal, $width:expr, $order:expr) => {{
         let order: Ordering = $order;
-        [$m, concat!($m, ".rl"), concat!($m, ".aq"), concat!($m, ".aqrl")]
-            [order.aq as usize * 2 + order.rl as usize]
+        let i = order.aq as usize * 2 + order.rl as usize;
+        match $width {
+            AmoWidth::W => [
+                concat!($m, ".w"),
+                concat!($m, ".w.rl"),
+                concat!($m, ".w.aq"),
+                concat!($m, ".w.aqrl"),
+            ][i],
+            AmoWidth::D => [
+                concat!($m, ".d"),
+                concat!($m, ".d.rl"),
+                concat!($m, ".d.aq"),
+                concat!($m, ".d.aqrl"),
+            ][i],
+        }
     }};
 }
 
@@ -98,12 +124,88 @@ fn fence_set(bits: u8) -> String {
         .collect()
 }
 
+/// The mnemonic of an OP-IMM operation (`word` false) or an OP-IMM-32 one
+/// (`word` true, RV64).
+fn alu_imm_name(op: AluOp, word: bool) -> &'static str {
+    match (op, word) {
+        (AluOp::Add, false) => "addi",
+        (AluOp::Sll, false) => "slli",
+        (AluOp::Slt, false) => "slti",
+        (AluOp::Sltu, false) => "sltiu",
+        (AluOp::Xor, false) => "xori",
+        (AluOp::Srl, false) => "srli",
+        (AluOp::Sra, false) => "srai",
+        (AluOp::Or, false) => "ori",
+        (AluOp::And, false) => "andi",
+        (AluOp::Add, true) => "addiw",
+        (AluOp::Sll, true) => "slliw",
+        (AluOp::Srl, true) => "srliw",
+        (AluOp::Sra, true) => "sraiw",
+        // There is no subtract-immediate, and OP-IMM-32 has only addiw and
+        // the shifts: the decoder never makes these (see `Inst`).
+        (AluOp::Sub, _) | (AluOp::Slt | AluOp::Sltu | AluOp::Xor | AluOp::Or | AluOp::And, true) => {
+            unreachable!("not an instruction: {op:?} with an immediate (word {word})")
+        }
+    }
+}
+
+/// The mnemonic of an OP operation (`word` false) or an OP-32 one (`word`
+/// true, RV64).
+fn alu_reg_name(op: AluOp, word: bool) -> &'static str {
+    match (op, word) {
+        (AluOp::Add, false) => "add",
+        (AluOp::Sub, false) => "sub",
+        (AluOp::Sll, false) => "sll",
+        (AluOp::Slt, false) => "slt",
+        (AluOp::Sltu, false) => "sltu",
+        (AluOp::Xor, false) => "xor",
+        (AluOp::Srl, false) => "srl",
+        (AluOp::Sra, false) => "sra",
+        (AluOp::Or, false) => "or",
+        (AluOp::And, false) => "and",
+        (AluOp::Add, true) => "addw",
+        (AluOp::Sub, true) => "subw",
+        (AluOp::Sll, true) => "sllw",
+        (AluOp::Srl, true) => "srlw",
+        (AluOp::Sra, true) => "sraw",
+        // OP-32 has only these five: the decoder never makes the others.
+        (AluOp::Slt | AluOp::Sltu | AluOp::Xor | AluOp::Or | AluOp::And, true) => {
+            unreachable!("not an instruction: OP-32 {op:?}")
+        }
+    }
+}
+
+/// The mnemonic of an M operation (`word` false) or a 32-bit one (`word`
+/// true, RV64).
+fn mul_name(op: MulOp, word: bool) -> &'static str {
+    match (op, word) {
+        (MulOp::Mul, false) => "mul",
+        (MulOp::Mulh, false) => "mulh",
+        (MulOp::Mulhsu, false) => "mulhsu",
+        (MulOp::Mulhu, false) => "mulhu",
+        (MulOp::Div, false) => "div",
+        (MulOp::Divu, false) => "divu",
+        (MulOp::Rem, false) => "rem",
+        (MulOp::Remu, false) => "remu",
+        (MulOp::Mul, true) => "mulw",
+        (MulOp::Div, true) => "divw",
+        (MulOp::Divu, true) => "divuw",
+        (MulOp::Rem, true) => "remw",
+        (MulOp::Remu, true) => "remuw",
+        // There are no 32-bit high multiplies: the decoder never makes these.
+        (MulOp::Mulh | MulOp::Mulhsu | MulOp::Mulhu, true) => {
+            unreachable!("not an instruction: 32-bit {op:?}")
+        }
+    }
+}
+
 impl Inst {
     /// Formats the instruction. `pc` is its address: when given, branch and
-    /// `jal` targets print as absolute addresses (`0x80000044`), otherwise as
-    /// offsets.
-    pub fn format(&self, pc: Option<u32>, syntax: Syntax) -> Disasm {
+    /// `jal` targets print as absolute addresses (`0x80000044`), wrapping at
+    /// the width, otherwise as offsets.
+    pub fn format(&self, pc: Option<u64>, syntax: Syntax) -> Disasm {
         let a = syntax.aliases;
+        let xlen = syntax.xlen;
         let imm = |v: i32| {
             if !syntax.hex {
                 v.to_string()
@@ -116,20 +218,21 @@ impl Inst {
         let mut target = None;
         let mut offset = |off: i32| match pc {
             Some(pc) => {
-                let t = pc.wrapping_add(off as u32);
+                let t = pc.wrapping_add(off as i64 as u64);
+                let t = if xlen == Xlen::Rv32 { t & 0xffff_ffff } else { t };
                 target = Some(t);
                 format!("{t:#x}")
             }
             None => imm(off),
         };
-        let csr_name = |c: u16| match csr::name(c) {
+        let csr_name = |c: u16| match csr::name(c, xlen) {
             Some(n) => n.to_string(),
             None => format!("{c:#x}"),
         };
 
         let (mnemonic, operands): (&'static str, String) = match *self {
-            Inst::Lui { rd, imm } => ("lui", format!("{}, {:#x}", r(rd), imm >> 12)),
-            Inst::Auipc { rd, imm } => ("auipc", format!("{}, {:#x}", r(rd), imm >> 12)),
+            Inst::Lui { rd, imm } => ("lui", format!("{}, {:#x}", r(rd), (imm as u32) >> 12)),
+            Inst::Auipc { rd, imm } => ("auipc", format!("{}, {:#x}", r(rd), (imm as u32) >> 12)),
             Inst::Jal { rd, imm } => match rd {
                 0 if a => ("j", offset(imm)),
                 1 if a => ("jal", offset(imm)),
@@ -179,6 +282,8 @@ impl Inst {
                     LoadOp::Lw => "lw",
                     LoadOp::Lbu => "lbu",
                     LoadOp::Lhu => "lhu",
+                    LoadOp::Lwu => "lwu",
+                    LoadOp::Ld => "ld",
                 };
                 (m, format!("{}, {}({})", r(rd), imm(i), r(rs1)))
             }
@@ -187,6 +292,7 @@ impl Inst {
                     StoreOp::Sb => "sb",
                     StoreOp::Sh => "sh",
                     StoreOp::Sw => "sw",
+                    StoreOp::Sd => "sd",
                 };
                 (m, format!("{}, {}({})", r(rs2), imm(i), r(rs1)))
             }
@@ -202,23 +308,23 @@ impl Inst {
                 };
                 match alias {
                     Some(x) if a => x,
-                    _ => {
-                        let m = match op {
-                            AluOp::Add => "addi",
-                            AluOp::Slt => "slti",
-                            AluOp::Sltu => "sltiu",
-                            AluOp::Xor => "xori",
-                            AluOp::Or => "ori",
-                            AluOp::And => "andi",
-                            AluOp::Sll => "slli",
-                            AluOp::Srl => "srli",
-                            AluOp::Sra => "srai",
-                            AluOp::Sub => unreachable!("no subi encoding"),
-                        };
-                        (m, format!("{}, {}, {}", r(rd), r(rs1), imm(i)))
-                    }
+                    _ => (
+                        alu_imm_name(op, false),
+                        format!("{}, {}, {}", r(rd), r(rs1), imm(i)),
+                    ),
                 }
             }
+            // `addiw rd, rs, 0` sign-extends the low word: llvm-objdump's `sext.w`.
+            Inst::OpImm32 {
+                op: AluOp::Add,
+                rd,
+                rs1,
+                imm: 0,
+            } if a => ("sext.w", format!("{}, {}", r(rd), r(rs1))),
+            Inst::OpImm32 { op, rd, rs1, imm: i } => (
+                alu_imm_name(op, true),
+                format!("{}, {}, {}", r(rd), r(rs1), imm(i)),
+            ),
             Inst::Op { op, rd, rs1, rs2 } => {
                 let alias = match (op, rs1, rs2) {
                     (AluOp::Sub, 0, _) => Some(("neg", rs2)),
@@ -229,58 +335,63 @@ impl Inst {
                 };
                 match alias {
                     Some((m, rs)) if a => (m, format!("{}, {}", r(rd), r(rs))),
-                    _ => {
-                        let m = match op {
-                            AluOp::Add => "add",
-                            AluOp::Sub => "sub",
-                            AluOp::Sll => "sll",
-                            AluOp::Slt => "slt",
-                            AluOp::Sltu => "sltu",
-                            AluOp::Xor => "xor",
-                            AluOp::Srl => "srl",
-                            AluOp::Sra => "sra",
-                            AluOp::Or => "or",
-                            AluOp::And => "and",
-                        };
-                        (m, format!("{}, {}, {}", r(rd), r(rs1), r(rs2)))
-                    }
+                    _ => (
+                        alu_reg_name(op, false),
+                        format!("{}, {}, {}", r(rd), r(rs1), r(rs2)),
+                    ),
                 }
             }
+            // `subw rd, zero, rs`: llvm-objdump's `negw`.
+            Inst::Op32 {
+                op: AluOp::Sub,
+                rd,
+                rs1: 0,
+                rs2,
+            } if a => ("negw", format!("{}, {}", r(rd), r(rs2))),
+            Inst::Op32 { op, rd, rs1, rs2 } => (
+                alu_reg_name(op, true),
+                format!("{}, {}, {}", r(rd), r(rs1), r(rs2)),
+            ),
             Inst::Mul { op, rd, rs1, rs2 } => {
-                let m = match op {
-                    MulOp::Mul => "mul",
-                    MulOp::Mulh => "mulh",
-                    MulOp::Mulhsu => "mulhsu",
-                    MulOp::Mulhu => "mulhu",
-                    MulOp::Div => "div",
-                    MulOp::Divu => "divu",
-                    MulOp::Rem => "rem",
-                    MulOp::Remu => "remu",
-                };
-                (m, format!("{}, {}, {}", r(rd), r(rs1), r(rs2)))
+                (mul_name(op, false), format!("{}, {}, {}", r(rd), r(rs1), r(rs2)))
             }
-            Inst::Lr { rd, rs1, order } => (ordered!("lr.w", order), format!("{}, ({})", r(rd), r(rs1))),
-            Inst::Sc { rd, rs1, rs2, order } => (
-                ordered!("sc.w", order),
+            Inst::Mul32 { op, rd, rs1, rs2 } => {
+                (mul_name(op, true), format!("{}, {}, {}", r(rd), r(rs1), r(rs2)))
+            }
+            Inst::Lr {
+                width,
+                rd,
+                rs1,
+                order,
+            } => (ordered!("lr", width, order), format!("{}, ({})", r(rd), r(rs1))),
+            Inst::Sc {
+                width,
+                rd,
+                rs1,
+                rs2,
+                order,
+            } => (
+                ordered!("sc", width, order),
                 format!("{}, {}, ({})", r(rd), r(rs2), r(rs1)),
             ),
             Inst::Amo {
                 op,
+                width,
                 rd,
                 rs1,
                 rs2,
                 order,
             } => {
                 let m = match op {
-                    AmoOp::Swap => ordered!("amoswap.w", order),
-                    AmoOp::Add => ordered!("amoadd.w", order),
-                    AmoOp::Xor => ordered!("amoxor.w", order),
-                    AmoOp::And => ordered!("amoand.w", order),
-                    AmoOp::Or => ordered!("amoor.w", order),
-                    AmoOp::Min => ordered!("amomin.w", order),
-                    AmoOp::Max => ordered!("amomax.w", order),
-                    AmoOp::Minu => ordered!("amominu.w", order),
-                    AmoOp::Maxu => ordered!("amomaxu.w", order),
+                    AmoOp::Swap => ordered!("amoswap", width, order),
+                    AmoOp::Add => ordered!("amoadd", width, order),
+                    AmoOp::Xor => ordered!("amoxor", width, order),
+                    AmoOp::And => ordered!("amoand", width, order),
+                    AmoOp::Or => ordered!("amoor", width, order),
+                    AmoOp::Min => ordered!("amomin", width, order),
+                    AmoOp::Max => ordered!("amomax", width, order),
+                    AmoOp::Minu => ordered!("amominu", width, order),
+                    AmoOp::Maxu => ordered!("amomaxu", width, order),
                 };
                 (m, format!("{}, {}, ({})", r(rd), r(rs2), r(rs1)))
             }
@@ -307,7 +418,7 @@ impl Inst {
             Inst::Csr { op, rd, src, csr } => {
                 let c = csr_name(csr);
                 let alias = match (op, rd, src) {
-                    (CsrOp::Rs, _, CsrSrc::Reg(0)) => Some(match counter_alias(csr) {
+                    (CsrOp::Rs, _, CsrSrc::Reg(0)) => Some(match counter_alias(csr, xlen) {
                         Some(m) => (m, r(rd).to_string()),
                         None => ("csrr", format!("{}, {c}", r(rd))),
                     }),
@@ -350,39 +461,58 @@ impl Inst {
     }
 }
 
+/// The plain form, with RV32's CSR names. `Inst` does not know the width it
+/// was decoded for, so this is right for RV32 only: on RV64 the CSRs that
+/// exist only on RV32 (`cycleh`, `mstatush`...) are numbers, and an RV64
+/// caller formats with [`Inst::format`] and `Syntax::plain(Xlen::Rv64)`
+/// instead. Every other name, and every mnemonic and operand, is the same
+/// for both widths.
 impl fmt::Display for Inst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.format(None, Syntax::PLAIN).fmt(f)
+        self.format(None, Syntax::plain(Xlen::Rv32)).fmt(f)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Syntax;
-    use crate::decode;
+    use crate::{decode, Xlen};
 
-    fn objdump(w: u32, pc: u32) -> String {
-        decode(w).format(Some(pc), Syntax::OBJDUMP).to_string()
+    const RV32: Xlen = Xlen::Rv32;
+    const RV64: Xlen = Xlen::Rv64;
+
+    fn objdump(w: u32, pc: u64) -> String {
+        decode(w, RV32)
+            .format(Some(pc), Syntax::objdump(RV32))
+            .to_string()
+    }
+
+    fn objdump64(w: u32, pc: u64) -> String {
+        decode(w, RV64)
+            .format(Some(pc), Syntax::objdump(RV64))
+            .to_string()
     }
 
     fn no_aliases(w: u32) -> String {
         let s = Syntax {
             aliases: false,
             hex: true,
+            xlen: RV32,
         };
-        decode(w).format(Some(0), s).to_string()
+        decode(w, RV32).format(Some(0), s).to_string()
     }
 
     #[test]
     fn formats() {
-        assert_eq!(decode(0xfff50513).to_string(), "addi a0, a0, -1");
-        assert_eq!(decode(0xfeb12e23).to_string(), "sw a1, -4(sp)");
-        assert_eq!(decode(0x34051573).to_string(), "csrrw a0, mscratch, a0");
-        assert_eq!(decode(0x800002b7).to_string(), "lui t0, 0x80000");
-        assert_eq!(decode(0x00c000ef).to_string(), "jal ra, 12");
-        assert_eq!(decode(0x0ff0000f).to_string(), "fence iorw, iorw");
-        assert_eq!(decode(0x7c002573).to_string(), "csrrs a0, 0x7c0, zero");
-        assert_eq!(decode(0).to_string(), ".word 0x00000000");
+        let plain = |w| decode(w, RV32).to_string();
+        assert_eq!(plain(0xfff50513), "addi a0, a0, -1");
+        assert_eq!(plain(0xfeb12e23), "sw a1, -4(sp)");
+        assert_eq!(plain(0x34051573), "csrrw a0, mscratch, a0");
+        assert_eq!(plain(0x800002b7), "lui t0, 0x80000");
+        assert_eq!(plain(0x00c000ef), "jal ra, 12");
+        assert_eq!(plain(0x0ff0000f), "fence iorw, iorw");
+        assert_eq!(plain(0x7c002573), "csrrs a0, 0x7c0, zero");
+        assert_eq!(plain(0), ".word 0x00000000");
     }
 
     #[test]
@@ -430,43 +560,63 @@ mod tests {
         for (w, want) in cases {
             assert_eq!(objdump(w, 0), want);
             assert_eq!(no_aliases(w), want);
-            assert_eq!(decode(w).to_string(), want);
+            assert_eq!(decode(w, RV32).to_string(), want);
         }
-        // Every operation and ordering: the suffix is Ordering::suffix.
+        // Every operation, width and ordering: the suffixes are the width's
+        // and Ordering::suffix.
         for op in crate::AmoOp::ALL {
-            for bits in 0..4 {
-                let order = crate::Ordering {
-                    aq: bits & 2 != 0,
-                    rl: bits & 1 != 0,
-                };
-                let amo = |order| crate::Inst::Amo {
-                    op,
-                    rd: 1,
-                    rs1: 2,
-                    rs2: 3,
-                    order,
-                };
-                let base = amo(crate::Ordering::NONE).format(None, Syntax::PLAIN).mnemonic;
-                assert_eq!(
-                    amo(order).format(None, Syntax::PLAIN).mnemonic,
-                    format!("{base}{}", order.suffix())
-                );
+            for width in [crate::AmoWidth::W, crate::AmoWidth::D] {
+                for bits in 0..4 {
+                    let order = crate::Ordering {
+                        aq: bits & 2 != 0,
+                        rl: bits & 1 != 0,
+                    };
+                    let amo = |order| crate::Inst::Amo {
+                        op,
+                        width,
+                        rd: 1,
+                        rs1: 2,
+                        rs2: 3,
+                        order,
+                    };
+                    let base = amo(crate::Ordering::NONE)
+                        .format(None, Syntax::plain(RV64))
+                        .mnemonic;
+                    let w = if width == crate::AmoWidth::W { ".w" } else { ".d" };
+                    assert!(base.ends_with(w), "{base}");
+                    assert_eq!(
+                        amo(order).format(None, Syntax::plain(RV64)).mnemonic,
+                        format!("{base}{}", order.suffix())
+                    );
+                }
             }
         }
     }
 
     #[test]
     fn branch_targets() {
-        let d = decode(0xfe0e0ce3).format(Some(0x8000_0034), Syntax::OBJDUMP);
+        let d = decode(0xfe0e0ce3, RV32).format(Some(0x8000_0034), Syntax::objdump(RV32));
         assert_eq!(d.target, Some(0x8000_002c));
         assert_eq!(d.operands, "t3, 0x8000002c");
         // Without an address the offset is printed instead.
-        let d = decode(0xfe0e0ce3).format(None, Syntax::OBJDUMP);
+        let d = decode(0xfe0e0ce3, RV32).format(None, Syntax::objdump(RV32));
         assert_eq!((d.target, d.operands.as_str()), (None, "t3, -0x8"));
-        // Targets wrap around the 32-bit address space.
-        let d = decode(0xffdff06f).format(Some(0), Syntax::OBJDUMP);
+        // Targets wrap at the width: around 2^32 on RV32, 2^64 on RV64.
+        let d = decode(0xffdff06f, RV32).format(Some(0), Syntax::objdump(RV32));
         assert_eq!(d.operands, "0xfffffffc");
-        assert_eq!(decode(0x00000013).format(Some(0), Syntax::OBJDUMP).target, None);
+        let d = decode(0xffdff06f, RV64).format(Some(0), Syntax::objdump(RV64));
+        assert_eq!(d.operands, "0xfffffffffffffffc");
+        let d = decode(0x00c000ef, RV64).format(Some(0x1_0000_0000), Syntax::objdump(RV64));
+        assert_eq!(
+            (d.target, d.operands.as_str()),
+            (Some(0x1_0000_000c), "0x10000000c")
+        );
+        assert_eq!(
+            decode(0x00000013, RV32)
+                .format(Some(0), Syntax::objdump(RV32))
+                .target,
+            None
+        );
     }
 
     /// Both registers zero: llvm-objdump picks a particular alias.
@@ -490,16 +640,24 @@ mod tests {
     }
 
     #[test]
+    fn rv32_only_csrs_by_width() {
+        // csrrs a0, cycleh, zero: rdcycleh on RV32; on RV64 the CSR has no
+        // name, so llvm-objdump prints its number.
+        assert_eq!(objdump(0xc8002573, 0), "rdcycleh a0");
+        assert_eq!(objdump64(0xc8002573, 0), "csrr a0, 0xc80");
+        assert_eq!(objdump64(0xc0002573, 0), "rdcycle a0");
+    }
+
+    #[test]
     fn decimal() {
         let s = Syntax {
             aliases: true,
             hex: false,
+            xlen: RV32,
         };
-        assert_eq!(decode(0x80000513).format(None, s).to_string(), "li a0, -2048");
-        assert_eq!(decode(0x12345537).format(None, s).to_string(), "lui a0, 0x12345");
-        assert_eq!(
-            decode(0x3002d573).format(None, s).to_string(),
-            "csrrwi a0, mstatus, 5"
-        );
+        let f = |w| decode(w, RV32).format(None, s).to_string();
+        assert_eq!(f(0x80000513), "li a0, -2048");
+        assert_eq!(f(0x12345537), "lui a0, 0x12345");
+        assert_eq!(f(0x3002d573), "csrrwi a0, mstatus, 5");
     }
 }
