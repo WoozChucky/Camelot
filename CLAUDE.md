@@ -56,6 +56,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test --release
 ```
 
+`cargo test --release` is the whole suite: run it here before opening a pull request. GitHub's CI runs fmt, clippy and `cargo xtask ci` instead (`crates/xtask/src/ci.rs`): the important tests that take minutes, not the whole suite. Those are the unit tests, the toolchain against its references, the committed binaries current, the kernel booting and the documents. The kernel's filesystem integration tests and their crash tests, and the multi-hart, threads, self-hosting, networking and platform tests, run only here. A new test belongs in `ci.rs`'s list when it is important and quick. The ignored tests need what a plain run may not have, and have their own commands (README.md): a desktop (Grail's and Herald's windows), LLDB, clang and ld.lld (merlin's harness and ABI tests, the coreutils and kernel reference builds), or a quiet machine (Grail's throughput).
+
 A **docs-only** change touches only Markdown (`docs/`, READMEs, this file), and no code, build files, committed binaries or files that go into an image (such as `kernel/fs/`). For one, run only the tests that read documents, not the three checks above:
 
 ```
@@ -64,6 +66,6 @@ cargo test --release -p avalon --test server -- the_readme_client_example
 cargo test --release -p lake --test avalon -- the_readme_lake_example
 ```
 
-A new test that reads a document joins this list (`grep -rln '\.md' crates/*/tests` finds them). CI still runs everything.
+A new test that reads a document joins this list, and `ci.rs`'s (`grep -rln '\.md' crates/*/tests` finds them).
 
 Formatting uses `rustfmt.toml` (max width 110). Branch per issue, PR description says `Closes #N`.

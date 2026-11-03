@@ -28,6 +28,7 @@
 
 pub mod boot;
 pub mod c_tables;
+pub mod ci;
 pub mod examples;
 pub mod fs;
 pub mod hello;
