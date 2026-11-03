@@ -121,6 +121,11 @@ fn rv64mi() {
 }
 
 #[test]
+fn rv64si() {
+    run_suite("rv64si-p-");
+}
+
+#[test]
 fn hello_example() {
     let (r, out) = run(&repo_root().join("examples/hello/hello.elf"));
     assert_eq!(r, RunResult::Exited(0));

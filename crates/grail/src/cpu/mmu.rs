@@ -1,39 +1,99 @@
-//! Sv32 address translation and the load/store/fetch paths built on it.
+//! Address translation (Sv32 on RV32 harts, Sv39 and Sv48 on RV64 ones) and the
+//! load/store/fetch paths built on it.
 //!
 //! No TLB yet: every access in a paged mode walks the page table. That is slow
 //! but simple, and it means `sfence.vma` has nothing to flush.
 //!
-//! An RV64 hart's `satp` holds Bare only (its WARL rule, [`Hart::csr_store`]) until
-//! #146 adds the Sv39 and Sv48 walks, so it never translates.
+//! The three modes share one walk ([`walk`]), driven by a [`Scheme`]: how many levels,
+//! how wide a PTE is, how many bits of the virtual address index each level.
 //!
 //! The bus still takes 32-bit physical addresses and accesses of at most 4 bytes
 //! (#147 widens it): a physical address above 4 GiB is an access fault, and an
 //! 8-byte access to memory is made as two 4-byte ones, the low word first. Devices
 //! refuse 8-byte accesses.
 
+use super::csr::{SATP_MODE_SV39, SATP_MODE_SV48, SATP_RV64_MODE_SHIFT};
 use super::{Hart, Mode};
 use crate::bus::{Bus, BusFault};
 use crate::trap::{Access, Trap};
 use excalibur::csr::*;
 use excalibur::Xlen;
 
-const PTE_V: u32 = 1 << 0;
-const PTE_R: u32 = 1 << 1;
-const PTE_W: u32 = 1 << 2;
-const PTE_X: u32 = 1 << 3;
-const PTE_U: u32 = 1 << 4;
-const PTE_A: u32 = 1 << 6;
-const PTE_D: u32 = 1 << 7;
+const PTE_V: u64 = 1 << 0;
+const PTE_R: u64 = 1 << 1;
+const PTE_W: u64 = 1 << 2;
+const PTE_X: u64 = 1 << 3;
+const PTE_U: u64 = 1 << 4;
+const PTE_A: u64 = 1 << 6;
+const PTE_D: u64 = 1 << 7;
 
-const PAGE_SIZE: u32 = 4096;
+/// An Sv39 or Sv48 PTE's PPN, bits 53:10 (44 bits).
+const PTE_PPN_SV48: u64 = (1 << 44) - 1;
+/// Bits 63:54 of an Sv39 or Sv48 PTE: Svnapot's N, Svpbmt's PBMT and reserved bits,
+/// none of which Excalibur implements, so they must be 0 (spec section 7, "Paging").
+const PTE_RESERVED_SV48: u64 = 0x3ff << 54;
 
-/// The leaf of a successful Sv32 page-table walk.
+/// `satp`'s PPN field: bits 21:0 on RV32, 43:0 on RV64.
+const SATP_PPN_SV32: u64 = (1 << 22) - 1;
+const SATP_PPN_SV48: u64 = (1 << 44) - 1;
+
+const PAGE_SHIFT: u32 = 12;
+
+/// A paging mode's page-table shape.
+#[derive(Clone, Copy)]
+struct Scheme {
+    /// Levels of tables: the walk starts at level `levels - 1`, at the root.
+    levels: u32,
+    /// Bytes per PTE.
+    pte_size: u32,
+    /// Bits of the virtual page number each level takes: 10 for Sv32's 1024-entry
+    /// tables, 9 for Sv39's and Sv48's 512-entry ones.
+    vpn_bits: u32,
+    /// The PPN field of a PTE, once shifted down by 10.
+    ppn_mask: u64,
+    /// The bits of a PTE that must be 0.
+    reserved: u64,
+}
+
+const SV32: Scheme = Scheme {
+    levels: 2,
+    pte_size: 4,
+    vpn_bits: 10,
+    ppn_mask: (1 << 22) - 1,
+    reserved: 0,
+};
+const SV39: Scheme = Scheme {
+    levels: 3,
+    pte_size: 8,
+    vpn_bits: 9,
+    ppn_mask: PTE_PPN_SV48,
+    reserved: PTE_RESERVED_SV48,
+};
+const SV48: Scheme = Scheme { levels: 4, ..SV39 };
+
+impl Scheme {
+    /// The virtual address bits the mode translates: 32, 39 or 48.
+    fn va_bits(self) -> u32 {
+        PAGE_SHIFT + self.levels * self.vpn_bits
+    }
+
+    /// Whether `vaddr` is canonical: Sv39's and Sv48's upper bits must all equal the
+    /// top bit they translate (bits 63:39 equal to bit 38, 63:48 to bit 47). Sv32
+    /// translates all 32 bits of an RV32 address, so there is nothing to check.
+    fn canonical(self, vaddr: u64) -> bool {
+        let unused = 64 - self.va_bits();
+        unused == 32 || ((vaddr << unused) as i64 >> unused) as u64 == vaddr
+    }
+}
+
+/// The leaf of a successful page-table walk.
 struct Leaf {
-    pte: u32,
-    /// Where the PTE is, for the A/D update.
-    addr: u32,
+    pte: u64,
+    /// Where the PTE is, and its size, for the A/D update.
+    addr: u64,
+    size: u32,
     /// The physical address the walk translated to.
-    paddr: u32,
+    paddr: u64,
 }
 
 /// Why a walk failed: an invalid or missing entry (a page fault), or a PTE outside
@@ -52,39 +112,65 @@ impl WalkError {
     }
 }
 
-/// Walks the Sv32 page table `satp` points at for `vaddr`, down to its leaf: no
-/// permission checks and no A/D update, which are the caller's.
-fn walk(bus: &Bus, satp: u32, vaddr: u32) -> Result<Leaf, WalkError> {
-    let vpn = [(vaddr >> 12) & 0x3ff, vaddr >> 22];
-    let mut table = (satp & 0x3f_ffff).wrapping_mul(PAGE_SIZE);
-    let mut level = 1usize;
-    let (pte, addr) = loop {
-        let pte_addr = table.wrapping_add(vpn[level] * 4);
-        // Page tables must live in memory: a PTE address on a device is an access fault.
-        let pte = bus.read_mem(pte_addr, 4).map_err(|_| WalkError::AccessFault)?;
-        if pte & PTE_V == 0 || (pte & PTE_R == 0 && pte & PTE_W != 0) {
+/// Reads the `size`-byte (4 or 8) PTE at physical address `addr`. Page tables must live
+/// in memory: a PTE address on a device, or above the bus's 4 GiB, is an access fault.
+fn read_pte(bus: &Bus, addr: u64, size: u32) -> Result<u64, BusFault> {
+    let a = bus_addr(addr, size)?;
+    let lo = bus.read_mem(a, 4)?;
+    if size == 4 {
+        return Ok(lo.into());
+    }
+    let hi = bus.read_mem(a + 4, 4)?;
+    Ok(u64::from(lo) | u64::from(hi) << 32)
+}
+
+/// Walks the page table rooted at physical page `root` for `vaddr`, down to its leaf,
+/// as the privileged spec's algorithm does: no permission checks and no A/D update,
+/// which are the caller's, and no canonical check (also the caller's, before).
+///
+/// At each level, from the root down, the walk indexes the table with that level's
+/// slice of the virtual page number and reads the PTE. An entry with R or X set is a
+/// leaf: at level 0 it maps a 4 KiB page, above it a superpage that covers everything
+/// the levels below would have (Sv32: 4 MiB at level 1; Sv39 and Sv48: 2 MiB, 1 GiB,
+/// 512 GiB at levels 1, 2, 3). A superpage's PPN must be aligned to its size, and the
+/// virtual address's low bits pass through to the physical one.
+fn walk(bus: &Bus, scheme: Scheme, root: u64, vaddr: u64) -> Result<Leaf, WalkError> {
+    let vpn_mask = (1u64 << scheme.vpn_bits) - 1;
+    let mut table = root << PAGE_SHIFT;
+    let mut level = scheme.levels - 1;
+    loop {
+        // VPN[level] of the address: the bits above the page offset and the levels below.
+        let shift = PAGE_SHIFT + level * scheme.vpn_bits;
+        let vpn = (vaddr >> shift) & vpn_mask;
+        let addr = table + vpn * u64::from(scheme.pte_size);
+        let pte = read_pte(bus, addr, scheme.pte_size).map_err(|_| WalkError::AccessFault)?;
+        // Invalid, writable but not readable (a reserved encoding), or a reserved bit set.
+        if pte & PTE_V == 0 || (pte & PTE_R == 0 && pte & PTE_W != 0) || pte & scheme.reserved != 0 {
             return Err(WalkError::PageFault);
         }
+        let ppn = (pte >> 10) & scheme.ppn_mask;
         if pte & (PTE_R | PTE_X) != 0 {
-            break (pte, pte_addr);
+            // A leaf. The page covers 2^shift bytes: its PPN's low bits, those the levels
+            // below would have supplied, must be 0.
+            let offset = (1u64 << shift) - 1;
+            if (ppn << PAGE_SHIFT) & offset != 0 {
+                return Err(WalkError::PageFault);
+            }
+            let paddr = ppn << PAGE_SHIFT | (vaddr & offset);
+            return Ok(Leaf {
+                pte,
+                addr,
+                size: scheme.pte_size,
+                paddr,
+            });
         }
+        // A pointer to the next level's table; at level 0 there is none.
         if level == 0 {
             return Err(WalkError::PageFault);
         }
         level -= 1;
-        table = (pte >> 10).wrapping_mul(PAGE_SIZE);
-    };
-    // A 4 MiB superpage must be 4 MiB aligned.
-    let ppn = pte >> 10;
-    if level == 1 && ppn & 0x3ff != 0 {
-        return Err(WalkError::PageFault);
+        table = ppn << PAGE_SHIFT;
     }
-    let paddr = if level == 1 {
-        (ppn << 12) & 0xffc0_0000 | (vaddr & 0x003f_ffff)
-    } else {
-        (ppn << 12) | (vaddr & 0xfff)
-    };
-    Ok(Leaf { pte, addr, paddr })
 }
 
 /// The bus address of the `size` bytes at physical address `paddr`: the bus takes
@@ -123,11 +209,18 @@ impl Hart {
         }
     }
 
-    /// Whether `satp` turns paging on: MODE not Bare.
-    fn paging(&self) -> bool {
+    /// The paging mode `satp` selects, and its root table's page number; `None` for
+    /// Bare. `satp`'s WARL rule ([`Hart::csr_store`]) leaves an RV64 hart only Bare,
+    /// Sv39 (MODE 8) and Sv48 (9).
+    fn paging(&self) -> Option<(Scheme, u64)> {
+        let satp = self.csr.satp;
         match self.xlen {
-            Xlen::Rv32 => self.csr.satp >> 31 != 0,
-            Xlen::Rv64 => self.csr.satp >> 60 != 0,
+            Xlen::Rv32 => (satp >> 31 != 0).then_some((SV32, satp & SATP_PPN_SV32)),
+            Xlen::Rv64 => match satp >> SATP_RV64_MODE_SHIFT {
+                SATP_MODE_SV39 => Some((SV39, satp & SATP_PPN_SV48)),
+                SATP_MODE_SV48 => Some((SV48, satp & SATP_PPN_SV48)),
+                _ => None,
+            },
         }
     }
 
@@ -138,19 +231,17 @@ impl Hart {
         } else {
             self.data_mode()
         };
-        if mode == Mode::M || !self.paging() {
+        let Some((scheme, root)) = self.paging().filter(|_| mode != Mode::M) else {
             return Ok(vaddr);
-        }
+        };
 
         let page_fault = Trap::new(access.page_fault(), vaddr);
         let access_fault = Trap::new(access.access_fault(), vaddr);
-        if self.xlen == Xlen::Rv64 {
-            // satp's WARL rule keeps an RV64 hart in Bare until #146 (only a debugger
-            // writing `csr.satp` directly gets here): no page is mapped.
+        // A non-canonical address faults before any table is read (spec section 6).
+        if !scheme.canonical(vaddr) {
             return Err(page_fault);
         }
-        let leaf =
-            walk(bus, self.csr.satp as u32, vaddr as u32).map_err(|e| e.trap(page_fault, access_fault))?;
+        let leaf = walk(bus, scheme, root, vaddr).map_err(|e| e.trap(page_fault, access_fault))?;
         let pte = leaf.pte;
 
         // Permission checks on the leaf.
@@ -172,33 +263,31 @@ impl Hart {
             _ => {}
         }
 
-        // Hardware-managed accessed/dirty bits.
+        // Hardware-managed accessed/dirty bits, written back as a whole PTE.
         let mut new_pte = pte | PTE_A;
         if access == Access::Store {
             new_pte |= PTE_D;
         }
         if new_pte != pte {
-            self.write_phys(bus, leaf.addr.into(), 4, new_pte.into())
+            self.write_phys(bus, leaf.addr, leaf.size, new_pte)
                 .map_err(|_| access_fault)?;
         }
-        Ok(leaf.paddr.into())
+        Ok(leaf.paddr)
     }
 
     /// A debugger's view of `vaddr`: the physical address the hart's instruction fetches
     /// would use, in its current mode, with the hart's `satp`. Unlike [`Hart::translate`]
     /// it changes nothing (no A/D bits) and checks no permissions, so a debugger can read
     /// a page the hart could not (a U-mode page from S-mode, execute-only code). `None`
-    /// when the page is not mapped.
+    /// when the page is not mapped or the address is not canonical.
     pub fn debug_translate(&self, bus: &Bus, vaddr: u64) -> Option<u64> {
-        if self.mode == Mode::M || !self.paging() {
+        let Some((scheme, root)) = self.paging().filter(|_| self.mode != Mode::M) else {
             return Some(vaddr);
-        }
-        if self.xlen == Xlen::Rv64 {
+        };
+        if !scheme.canonical(vaddr) {
             return None;
         }
-        walk(bus, self.csr.satp as u32, vaddr as u32)
-            .ok()
-            .map(|leaf| leaf.paddr.into())
+        walk(bus, scheme, root, vaddr).ok().map(|leaf| leaf.paddr)
     }
 
     pub fn fetch(&mut self, bus: &mut Bus, pc: u64) -> Result<u32, Trap> {

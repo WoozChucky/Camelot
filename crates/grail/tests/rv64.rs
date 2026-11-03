@@ -402,12 +402,18 @@ fn satp_keeps_only_what_the_hart_implements() {
     set(&mut m, A1, 0x0fff_ffff_ffff_ffff);
     run(&mut m, "csrrw zero, satp, a1", csrw(SATP, A1));
     assert_eq!(m.cpu.csr.satp, 0x0000_000f_ffff_ffff, "ASID 0, PPN bits 35:0");
-    // A MODE the hart does not implement changes nothing: reserved ones, and Sv39 (8)
-    // and Sv48 (9) until #146 walks them.
-    for mode in [1u64, 8, 9, 10, 15] {
+    // A MODE the hart does not implement changes nothing: the reserved ones, Sv57 (10)
+    // and Sv64 (11).
+    for mode in [1u64, 7, 10, 11, 15] {
         set(&mut m, A1, mode << 60 | 0x1234);
         run(&mut m, "csrrw zero, satp, a1", csrw(SATP, A1));
         assert_eq!(m.cpu.csr.satp, 0x0000_000f_ffff_ffff, "MODE {mode}");
+    }
+    // Sv39 (8) and Sv48 (9) are kept, with the same masks.
+    for mode in [8u64, 9] {
+        set(&mut m, A1, mode << 60 | 0xffff_ffff_ffff_ffff >> 4);
+        run(&mut m, "csrrw zero, satp, a1", csrw(SATP, A1));
+        assert_eq!(m.cpu.csr.satp, mode << 60 | 0x0000_000f_ffff_ffff, "MODE {mode}");
     }
 
     // RV32 keeps any value, MODE in bit 31.
