@@ -163,7 +163,7 @@ impl Sysinfo {
 
     /// What `off` holds in this block's layout.
     fn slot(&self, off: u32) -> Slot {
-        if off % 4 != 0 {
+        if !off.is_multiple_of(4) {
             return Slot::Reserved;
         }
         match self.xlen {
@@ -245,13 +245,15 @@ impl Sysinfo {
                 Slot::High(v) => v >> 32,
                 Slot::Reserved => 0,
             }),
-            8 if self.xlen == Xlen::Rv64 && off % 8 == 0 => match (self.slot(off), self.slot(off + 4)) {
-                (Slot::Low(v), _) => Ok(v),
-                (Slot::Reserved, Slot::Reserved) => Ok(0),
-                // Two 32-bit registers, or one and reserved space: a width it does not
-                // take.
-                _ => Err(BusFault),
-            },
+            8 if self.xlen == Xlen::Rv64 && off.is_multiple_of(8) => {
+                match (self.slot(off), self.slot(off + 4)) {
+                    (Slot::Low(v), _) => Ok(v),
+                    (Slot::Reserved, Slot::Reserved) => Ok(0),
+                    // Two 32-bit registers, or one and reserved space: a width it does not
+                    // take.
+                    _ => Err(BusFault),
+                }
+            }
             _ => Err(BusFault),
         }
     }
