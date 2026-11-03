@@ -6,11 +6,31 @@ Status: draft. Base is stock RISC-V, plus the Xcal extensions in section 9.
 
 ## 1. Overview
 
-- 32-bit, little-endian, load/store architecture.
-- Base ISA: **RV32IMA + Zicsr + Zifencei**: RV32I (unprivileged spec 20191213), **M** (multiply/divide) and **A** (atomics: LR/SC and AMOs, section 4.1).
+- **64-bit** (XLEN = 64), little-endian, load/store architecture.
+- Base ISA: **RV64IMA + Zicsr + Zifencei**:
+  - **RV64I**: the unprivileged spec 20191213, its RV64I chapter on top of RV32I.
+  - **M**: multiply and divide.
+  - **A**: atomics, LR/SC and AMOs (section 4.1).
 - Planned extensions: **C** optional and late.
 - Privilege: **M-mode** and **S-mode**, plus **U-mode** for user programs. Follows the RISC-V privileged spec (20211203) subset described below.
-- Goal: a stock RV32I program built with `riscv32i-unknown-none-elf` runs unmodified. Custom features (Excalibur extensions, prefixed `xcal`, e.g. `Xcaldbg`) are additive and never change the meaning of standard encodings.
+- **ABI and objects:** lp64 (soft-float, `long` and pointers 64-bit), ELF64.
+- **Goal:** a stock RV64 program built with `clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany` runs unmodified.
+  - `medany` is required for code linked at RAM (0x8000_0000, section 7). Under `medlow`, addresses must lie within ±2 GiB of 0, and `lui` sign-extends 0x8000_0000 to 0xFFFF_FFFF_8000_0000.
+  - Custom features (Excalibur extensions, prefixed `xcal`, e.g. `Xcaldbg`) are additive and never change the meaning of standard encodings.
+- **No compat mode.** An RV64 hart runs RV64 code only: `mstatus.UXL` and `SXL` are hard-wired to 64 (section 5), as on most RISC-V cores and riscv64 Linux systems.
+
+**RV32, during the migration.** Excalibur was a 32-bit ISA until the switch to 64 bits (#141):
+- RV32IMA + Zicsr + Zifencei;
+- the ilp32 ABI;
+- ELF32;
+- Sv32 paging.
+
+Until that form is removed (#159), Grail and the tools keep supporting it, so the existing system keeps running while each layer moves:
+- Grail chooses the width per machine;
+- the assembler, linker and compiler choose it per object;
+- an ELF file's class says which it is.
+
+The sections below describe RV64 and note **RV32** wherever it differs. After #159 only the tools that read files (the `elf` crate, `elf32` until #144 renames it, and merlin-objdump) still understand RV32 and ELF32, as readelf and llvm-objdump read every class.
 
 ## 2. Registers
 
@@ -29,7 +49,7 @@ Status: draft. Base is stock RISC-V, plus the Xcal extensions in section 9.
 | x18-x27 | s2-s11 | saved |
 | x28-x31 | t3-t6 | temporaries |
 
-`pc` is a separate 32-bit register. Instruction fetch requires 4-byte alignment (2-byte if C is enabled later).
+Every register is 64 bits wide, and `pc` is a separate 64-bit register (RV32: 32 bits). Instruction fetch requires 4-byte alignment (2-byte if C is enabled later).
 
 ## 3. Instruction formats
 
@@ -44,9 +64,18 @@ U: imm[31:12]                                        rd        opcode
 J: imm[20|10:1|11|19:12]                             rd        opcode
 ```
 
-Immediates are sign-extended from their top bit. B and J immediates are multiples of 2.
+Immediates are sign-extended from their top bit to 64 bits. B and J immediates are multiples of 2. U-type places imm[31:12] in bits 31:12 of the result and sign-extends from bit 31. So `lui t0, 0x80000` gives 0xFFFF_FFFF_8000_0000, and a constant with bit 31 set but no higher bits needs more than `lui`: the assembler's `li` builds such constants with a sequence of instructions, as LLVM's does (RV64 sequences: #148).
 
-## 4. RV32I instruction list
+Shift immediates take one of two layouts:
+
+```
+RV64 shifts (slli srli srai):        funct6[31:26] shamt[25:20] rs1 funct3 rd opcode
+32-bit shifts (slliw srliw sraiw):   funct7[31:25] shamt[24:20] rs1 funct3 rd opcode
+```
+
+The RV64 shifts take a 6-bit amount. The 32-bit "W" shifts (and every RV32 shift) take 5 bits, and bit 25 set is an illegal instruction.
+
+## 4. Base instruction list
 
 | Opcode | Instructions |
 |---|---|
@@ -55,30 +84,53 @@ Immediates are sign-extended from their top bit. B and J immediates are multiple
 | 1101111 JAL | `jal` |
 | 1100111 JALR | `jalr` (target low bit cleared) |
 | 1100011 BRANCH | `beq bne blt bge bltu bgeu` |
-| 0000011 LOAD | `lb lh lw lbu lhu` |
-| 0100011 STORE | `sb sh sw` |
-| 0010011 OP-IMM | `addi slti sltiu xori ori andi slli srli srai` |
+| 0000011 LOAD | `lb lh lw lbu lhu`, and `ld lwu` (funct3 011, 110) |
+| 0100011 STORE | `sb sh sw`, and `sd` (funct3 011) |
+| 0010011 OP-IMM | `addi slti sltiu xori ori andi slli srli srai` (6-bit shift amounts) |
+| 0011011 OP-IMM-32 | `addiw slliw srliw sraiw` (funct3 000, 001, 101; every other funct3 and funct7 combination is reserved: illegal instruction) |
 | 0110011 OP | `add sub sll slt sltu xor srl sra or and` (+ M: `mul mulh mulhsu mulhu div divu rem remu`, funct7=0000001) |
-| 0101111 AMO | A, funct3=010 (word): `lr.w sc.w amoswap.w amoadd.w amoxor.w amoand.w amoor.w amomin.w amomax.w amominu.w amomaxu.w`, each with `.aq`/`.rl`/`.aqrl` (section 4.1) |
+| 0111011 OP-32 | `addw subw sllw srlw sraw` (+ M: `mulw divw divuw remw remuw`, funct7=0000001; funct3 001-011 with funct7=0000001, and every combination not listed, are reserved: illegal instruction) |
+| 0101111 AMO | A: funct3=010 (word): `lr.w sc.w amoswap.w amoadd.w amoxor.w amoand.w amoor.w amomin.w amomax.w amominu.w amomaxu.w`; funct3=011 (doubleword): the same with `.d`. Each takes `.aq`/`.rl`/`.aqrl` (section 4.1) |
 | 0001111 MISC-MEM | `fence`, `fence.tso`, `fence.i` (reserved `fm`/rd/rs1 encodings execute as a plain `fence`; Grail's harts take turns one instruction at a time on one shared memory, so every access is visible to the others at once and all are no-ops) |
 | 1110011 SYSTEM | `ecall ebreak mret sret wfi sfence.vma csrrw csrrs csrrc csrrwi csrrsi csrrci` |
 | 0001011 custom-0 | Xcal: `xcal.dbg`, `xcal.halt` (section 9) |
 | 0101011 custom-1 | reserved for future Xcal extensions |
 
-Misaligned loads/stores trap (address-misaligned exception) rather than being emulated. This keeps the emulator simple and is spec-legal. Consequence: riscv-tests `rv32ui-p-ma_data`, which assumes hardware misaligned support, is excluded.
+**64-bit semantics** (the RV64I and RV64M chapters):
+- **Arithmetic** works on all 64 bits.
+- **32-bit results are sign-extended to 64 bits:**
+  - the W instructions compute on the low 32 bits of their operands and sign-extend their result;
+  - `lw` sign-extends the word it loads, and `lwu` zero-extends it;
+  - `lr.w` and the `.w` AMOs sign-extend the word they load into rd (section 4.1).
+- **Shifts:** `sll`/`srl`/`sra` use the low 6 bits of `rs2`, and the W shifts the low 5.
+- **Multiply:** `mulh`/`mulhsu`/`mulhu` return the upper 64 bits of the 128-bit product, and `mulw` the sign-extended low 32 bits of a 32-bit product.
+- **Division:**
+  - by zero, `div`/`divu` return all ones and `rem`/`remu` the dividend;
+  - signed overflow (−2^63 / −1) returns −2^63 with remainder 0;
+  - the W forms follow the same rules on 32-bit values, then sign-extend.
+
+A consequence for device registers: a 32-bit register read with `lw` comes back sign-extended. For a register with bit 31 set, `lwu` gives its value (section 9).
+
+**RV32:**
+- registers are 32 bits;
+- `ld`, `lwu`, `sd`, OP-IMM-32, OP-32 and the `.d` atomics are illegal instructions;
+- shift amounts are 5 bits, and a set bit 25 in `slli`/`srli`/`srai` is illegal;
+- `mulh*` return the upper 32 bits of the 64-bit product.
+
+Misaligned loads/stores trap (address-misaligned exception) rather than being emulated. This keeps the emulator simple and is spec-legal. Consequence: riscv-tests `rv64ui-p-ma_data` (RV32: `rv32ui-p-ma_data`), which assumes hardware misaligned support, is excluded.
 
 ### 4.1 A extension (atomics)
 
-All A instructions are R-type on the AMO opcode with funct3 = 010 (32-bit word; the `.d` forms are RV64 only). funct7 is split: funct5 in bits [31:27] selects the instruction, bit 26 is `aq` and bit 25 is `rl`:
+All A instructions are R-type on the AMO opcode. funct3 gives the width: **010** for a 32-bit word (`.w`), **011** for a 64-bit doubleword (`.d`; RV32: illegal). funct7 is split: funct5 in bits [31:27] selects the instruction, bit 26 is `aq` and bit 25 is `rl`:
 
 ```
-funct5[31:27] aq[26] rl[25] rs2[24:20] rs1[19:15] 010 rd[11:7] 0101111
+funct5[31:27] aq[26] rl[25] rs2[24:20] rs1[19:15] 01w rd[11:7] 0101111     (w: 0 word, 1 doubleword)
 ```
 
-| funct5 | Instruction | Effect (`M` = the word at address rs1) |
+| funct5 | Instruction | Effect (`M` = the word or doubleword at address rs1) |
 |---|---|---|
-| 00010 | `lr.w rd, (rs1)` | rd = M; reserve M. rs2 must be 0 (else reserved: illegal instruction) |
-| 00011 | `sc.w rd, rs2, (rs1)` | if M is reserved: M = rs2, rd = 0; else rd = 1. The reservation is gone either way |
+| 00010 | `lr.w rd, (rs1)` / `lr.d` | rd = M (`lr.w`: the word, sign-extended to 64 bits); reserve the line holding M (below). rs2 must be 0 (else reserved: illegal instruction) |
+| 00011 | `sc.w rd, rs2, (rs1)` / `sc.d` | if the hart's reservation allows it (below): M = rs2 (`sc.w`: its low 32 bits), rd = 0; else rd = 1. The reservation is gone either way |
 | 00001 | `amoswap.w rd, rs2, (rs1)` | rd = M; M = rs2 |
 | 00000 | `amoadd.w` | rd = M; M = M + rs2 |
 | 00100 | `amoxor.w` | rd = M; M = M ^ rs2 |
@@ -87,22 +139,44 @@ funct5[31:27] aq[26] rl[25] rs2[24:20] rs1[19:15] 010 rd[11:7] 0101111
 | 10000 / 10100 | `amomin.w` / `amomax.w` | rd = M; M = signed min / max(M, rs2) |
 | 11000 / 11100 | `amominu.w` / `amomaxu.w` | rd = M; M = unsigned min / max(M, rs2) |
 
-Other funct5 values (`amocas.w` of Zacas, ...) are reserved and raise illegal-instruction. Assembly writes the ordering bits as a suffix: none, `.aq`, `.rl` or `.aqrl` (`amoadd.w.aqrl`). The address is written `(rs1)`, or `0(rs1)` with a literal `0` (one integer token such as `0` or `0x0`; as in LLVM, an expression equal to 0 such as `1-1`, `+0` or `(0)` is an error); there is no offset field. Grail runs its harts one instruction at a time, in turn (section 7, "Harts"), so an AMO is atomic by construction and `aq`/`rl` change nothing; they are still encoded, decoded and disassembled.
+Each AMO has a `.d` form with the same funct5 (`amoadd.d`, ...).
+- **The `.w` forms** load the low 32 bits at `M`, sign-extended into rd, compute on 32-bit values (`amomin.w` compares them as 32-bit signed, `amominu.w` as 32-bit unsigned) and store 32 bits.
+- **The `.d` forms** work on all 64.
+
+Other funct5 values (`amocas.w` of Zacas, ...) and AMO funct3 values other than 010 and 011 are reserved and raise illegal-instruction. Assembly writes the ordering bits as a suffix: none, `.aq`, `.rl` or `.aqrl` (`amoadd.w.aqrl`). The address is written `(rs1)`, or `0(rs1)` with a literal `0` (one integer token such as `0` or `0x0`; as in LLVM, an expression equal to 0 such as `1-1`, `+0` or `(0)` is an error); there is no offset field. Grail runs its harts one instruction at a time, in turn (section 7, "Harts"), so an AMO is atomic by construction and `aq`/`rl` change nothing; they are still encoded, decoded and disassembled.
 
 Addresses (checked in this order):
 
-- **Alignment**: the address must be 4-byte aligned. A misaligned `lr.w` raises load address misaligned (4); a misaligned `sc.w` (even one that would fail) or AMO raises store/AMO address misaligned (6). `xtval` = the address.
-- **Translation** (Sv32): `lr.w` is checked and sets A like a load (load page fault, 13); `sc.w` and the AMOs like a store: the page must be writable, A and D are set, and a fault is a store/AMO page fault (15).
-- **Memory only**: atomics work on RAM and VRAM. On any other physical address (device registers, the boot ROM, unmapped space) `lr.w` raises a load access fault (5), `sc.w` and the AMOs a store/AMO access fault (7). Device registers are not read or written.
+- **Alignment**: the address must be aligned to the access size, 4 bytes for `.w` and 8 for `.d`. A misaligned `lr` raises load address misaligned (4); a misaligned `sc` (even one that would fail) or AMO raises store/AMO address misaligned (6). `xtval` = the address.
+- **Translation** (Sv48 or Sv39; RV32: Sv32): `lr` is checked and sets A like a load (load page fault, 13); `sc` and the AMOs like a store: the page must be writable, A and D are set, and a fault is a store/AMO page fault (15).
+- **Memory only**: atomics work on RAM and VRAM. On any other physical address (device registers, the boot ROM, unmapped space) `lr` raises a load access fault (5), `sc` and the AMOs a store/AMO access fault (7). Device registers are not read or written.
 
-**Reservations.** Each hart has one reservation set (Grail keeps them all on the bus, so every write can be checked against every hart's): the naturally aligned word `lr.w` read, by physical address (so two virtual mappings of a word share it). A new `lr.w` replaces it. `sc.w` succeeds only if the hart holds a reservation on the word it writes. A `sc.w` with no reservation at all fails without accessing memory: no translation, no page fault, no A/D update (it still traps if misaligned). With a reservation, the address is translated and checked first (faults as above, A/D set), then compared. The reservation is lost when:
+**Reservations.** Each hart has one reservation (Grail keeps them all on the bus, so every write can be checked against every hart's). Its *reservation set* is the naturally aligned **64-byte line** that holds the bytes `lr` read, by physical address, so two virtual mappings of the line share it. 64 bytes is a cache line, what real RV64 cores reserve; the spec allows any set that holds the bytes read. The rule is the same on both widths.
 
-- the hart executes any `sc.w`;
+A new `lr` replaces the reservation. `sc` succeeds only if:
+- the hart holds a reservation;
+- the bytes it writes are in the reserved line;
+- its address and size are those of the `lr` that made the reservation.
+
+So `sc.w` after `lr.d`, or an `sc` to another address in the line, fails. Software never relies on those (the spec leaves them unconstrained).
+
+An `sc` with no reservation at all fails without accessing memory: no translation, no page fault, no A/D update (it still traps if misaligned). With a reservation, the address is translated and checked first (faults as above, A/D set), then compared.
+
+The reservation is lost when:
+
+- the hart executes any `sc`;
 - the hart takes a trap (exception or interrupt);
-- any write touches a byte of the reserved word: a store, an AMO, a successful `sc.w`, a hardware A/D update of a PTE (so an LR/SC update of a PTE cannot overwrite a bit the page walker just set), or a network card's DMA (section 9.8): on receive it copies a frame into a buffer and writes its descriptor's `len` and `status` between two instructions, on its own; on transmit it writes each sent descriptor's `len` and `status` during the store to `NET_TX_TAIL`, whichever hart made it. On a multi-hart machine this includes writes by other harts;
+- any write touches a byte of the reserved line:
+  - a store, an AMO, or a successful `sc`;
+  - a hardware A/D update of a PTE, so an LR/SC update of a PTE cannot overwrite a bit the page walker just set;
+  - a network card's DMA (section 9.8). On receive it copies a frame into a buffer and writes its descriptor's `len` and `status` between two instructions, on its own. On transmit it writes each sent descriptor's `len` and `status` during the store to `NET_TX_TAIL`, whichever hart made it;
+  - on a multi-hart machine, any of these by another hart;
 - the hart stores to a device register: the store may start a DMA (the block device's, section 9.6) that writes RAM without a hart storing there. A command written to a block device's `BLK_CMD` clears every hart's reservation, since its DMA may write any of them.
 
-The constrained LR/SC loop (an `lr.w`, a few ALU instructions and a `sc.w` to the same word) always succeeds on a one-hart Grail unless an interrupt arrives in between, or a network card writes that word, in which case the loop retries. With several harts, another hart's write to the word between the `lr.w` and the `sc.w` makes it retry too; a `sc.w` fails only because another hart's write got there first, so some hart always makes progress (`examples/smp` counts the retries).
+**The constrained LR/SC loop**: an `lr`, a few ALU instructions and an `sc` to the same address.
+- **One hart:** it always succeeds unless an interrupt arrives in between, or a network card writes into the line, in which case the loop retries.
+- **Several harts:** another hart's write anywhere in the line between the `lr` and the `sc` makes it retry too. This includes a write to a different variable that shares the line ("false sharing"), which is why software keeps contended data on lines of its own, as Linux does with `____cacheline_aligned`.
+- **Progress:** an `sc` fails only because some other write got there first, so some hart always makes progress (`examples/smp` counts the retries).
 
 ## 5. Privilege and CSRs
 
@@ -112,34 +186,57 @@ Minimum CSR set:
 
 | CSR | Addr | Notes |
 |---|---|---|
-| mstatus | 0x300 | MIE, MPIE, MPP, SIE, SPIE, SPP, SUM, MXR |
-| misa | 0x301 | RV32, A, I, M, S, U, X: 0x4094_1101 (read-only) |
+| mstatus | 0x300 | MIE, MPIE, MPP, SIE, SPIE, SPP, SUM, MXR. UXL [33:32] and SXL [35:34] read 2 (64-bit) and are read-only: no compat mode. SD [63] is read-only 0, since there is no F/V/X state to be dirty. The endianness bits (UBE, SBE, MBE) read 0 (little-endian) |
+| misa | 0x301 | MXL=2 (64-bit), A, I, M, S, U, X: 0x8000_0000_0094_1101. Writes are ignored (WARL, with no writable field), so it always reads this value |
 | medeleg / mideleg | 0x302 / 0x303 | delegate traps to S-mode (section 6, "Delegation") |
 | mie / mip | 0x304 / 0x344 | MSIE/MTIE/MEIE, SSIE/STIE/SEIE |
 | mtvec | 0x305 | direct mode required, vectored optional |
 | mscratch | 0x340 | |
 | mepc / mcause / mtval | 0x341 / 0x342 / 0x343 | |
-| sstatus, sie, sip | 0x100, 0x104, 0x144 | restricted views of the M versions |
+| sstatus, sie, sip | 0x100, 0x104, 0x144 | restricted views of the M versions. `sstatus` shows SIE, SPIE, SPP, SUM, MXR, UXL [33:32] (reads 2, read-only) and SD [63] (reads 0) |
 | stvec, sscratch, sepc, scause, stval | 0x105, 0x140, 0x141, 0x142, 0x143 | |
-| satp | 0x180 | Sv32 paging, hardware-managed A/D bits, no TLB |
+| satp | 0x180 | MODE [63:60], ASID [59:44], PPN [43:0]: Bare (0), **Sv39** (8) or **Sv48** (9) paging (section 7, "Paging"), hardware-managed A/D bits, no TLB. A write with any other MODE has no effect at all: `satp` keeps its old value, as the privileged spec requires. There are no ASIDs: the ASID field reads 0. PPN bits above the 48-bit physical address width (bits 43:36) read 0 |
 | mhartid | 0xF14 | the hart's index, 0 to N - 1 on an N-hart machine (section 7, "Harts") |
-| cycle/time/instret (+h) | 0xC00-0xC02, 0xC80-0xC82 | read-only counters |
+| cycle/time/instret | 0xC00-0xC02 | read-only counters, 64 bits each |
+| mcycle/minstret | 0xB00/0xB02 | the writable machine counters, 64 bits each |
 
 Accessing a CSR above the current privilege level, or writing a read-only CSR, raises illegal-instruction.
+
+The PMP registers follow the RV64 layout: the even `pmpcfg0` and `pmpcfg2` each hold 8 entries' configuration bytes, and `pmpaddr0`-`pmpaddr15` are 64-bit (address bits 55:2). `mcounteren`, `scounteren` and `mcountinhibit` stay 32 bits wide, as the privileged spec defines them.
+
+**RV32:**
+- every CSR is 32 bits;
+- `misa` is 0x4094_1101 (MXL=1), and `mstatus` has no UXL/SXL; its SD is bit 31;
+- `satp` is MODE [31] (Bare 0, **Sv32** 1), ASID [30:22], PPN [21:0];
+- the high halves of the 64-bit counters and registers are separate CSRs:
+  - `cycleh`/`timeh`/`instreth` (0xC80-0xC82) and `hpmcounter3h`-`hpmcounter31h` (0xC83-0xC9F, reading 0);
+  - `mcycleh`/`minstreth` (0xB80/0xB82) and `mhpmcounter3h`-`mhpmcounter31h` (0xB83-0xB9F, reading 0);
+  - `mstatush` (0x310, reads 0) and `menvcfgh` (0x31A, reads 0);
+- `pmpcfg1` and `pmpcfg3` exist (on RV64 the PMP configuration lives in the even `pmpcfg` registers).
+
+Those RV32-only CSRs do not exist on RV64, and accessing them raises illegal-instruction.
 
 ## 6. Traps
 
 On a trap taken into mode X (M, or S if delegated and current mode is not M):
 
 1. `xepc` = pc of the faulting instruction (or of the next instruction for interrupts).
-2. `xcause` = cause code, top bit set for interrupts.
-3. `xtval` = faulting address or instruction bits, else 0.
+2. `xcause` = cause code, with the top bit (bit 63; RV32: bit 31) set for interrupts.
+3. `xtval` = faulting address or instruction bits, else 0. `xepc`, `xcause` and `xtval` are 64 bits (RV32: 32).
 4. `xPIE` = `xIE`, `xIE` = 0, `xPP` = previous mode.
 5. Mode = X, pc = `xtvec` base (vectored: base + 4*cause for interrupts).
 
 `mret`/`sret` reverse this.
 
-Exception causes implemented: 0 instr misaligned, 1 instr access fault, 2 illegal instruction, 3 breakpoint, 4 load misaligned, 5 load access fault, 6 store/AMO misaligned, 7 store/AMO access fault, 8 ecall from U, 9 ecall from S, 11 ecall from M, 12/13/15 instruction/load/store-AMO page faults (with Sv32).
+Exception causes implemented:
+- 0 instruction address misaligned, 1 instruction access fault;
+- 2 illegal instruction, 3 breakpoint;
+- 4 load address misaligned, 5 load access fault;
+- 6 store/AMO address misaligned, 7 store/AMO access fault;
+- 8 ecall from U, 9 ecall from S, 11 ecall from M;
+- 12/13/15 instruction/load/store-AMO page faults, with paging on.
+
+With Sv48 or Sv39 a virtual address must be **canonical**: bits 63:48 (Sv39: 63:39) all equal to bit 47 (Sv39: 38). A non-canonical address raises the page fault of the access (12, 13 or 15) with `xtval` = the address, before any table is read. Sv32 has no such rule.
 
 Interrupt causes: 1 SSI, 3 MSI, 5 STI, 7 MTI, 9 SEI, 11 MEI.
 
@@ -156,22 +253,49 @@ Layout follows the QEMU `virt` board's conventions so existing docs and examples
 | Range | Device |
 |---|---|
 | 0x0000_1000 - 0x0000_1FFF | Boot ROM (reset vector 0x1000, jumps to the program's entry point; the other harts park at 0x1020, see "Boot"; with no program, the disk loader at 0x1100 boots from disk 0, see "Boot from disk") |
-| 0x0200_0000 - 0x0200_FFFF | CLINT: hart `i`'s msip @+0x0 + 4·i, hart `i`'s mtimecmp @+0x4000 + 8·i, mtime @+0xBFF8 (shared) |
+| 0x0200_0000 - 0x0200_FFFF | CLINT: hart `i`'s msip @+0x0 + 4·i, hart `i`'s mtimecmp @+0x4000 + 8·i, mtime @+0xBFF8 (shared). `msip` is 32-bit: only 4-byte accesses. `mtimecmp` and `mtime` are 64-bit registers, read or written whole with 8-byte accesses or by 4-byte halves |
 | 0x0C00_0000 - 0x0FFF_FFFF | PLIC: external interrupts from the UART, keyboard, disks, pointer and network cards (section 7.1) |
 | 0x1000_0000 - 0x1000_00FF | UART, 16550-compatible subset (THR/RBR @+0, IER @+1, IIR/FCR @+2, LCR @+3, MCR @+4, LSR @+5, SCR @+7) |
 | 0x1000_1000 - 0x1000_8FFF | Block devices: disk `i` at 0x1000_1000 + 0x1000·i, up to 8 (`--disk`; Xcal, section 9.6). Only the pages of attached disks are mapped |
 | 0x1000_9000 - 0x1000_CFFF | Network cards: card `i` at 0x1000_9000 + 0x1000·i, up to 4 (`--net`; Xcal, section 9.8). Only the pages of attached cards are mapped |
-| 0x0010_0000 | Test/exit device: write 0x5555 = pass/exit, 0x3333 = fail (used by riscv-tests) |
+| 0x0010_0000 | Test/exit device: write 0x5555 = pass/exit, 0x3333 = fail (used by riscv-tests). Any access width: reads give 0, and only the low 32 bits of a write to offset 0 count |
 | 0x3000_0000 - 0x3000_0FFF | Framebuffer control (Xcal, section 9.3) |
 | 0x3000_1000 - 0x3000_1FFF | Keyboard (Xcal, section 9.4) |
 | 0x3000_2000 - 0x3000_2FFF | Sysinfo: RAM size, clock, device table (Xcal, section 9.5) |
 | 0x3000_3000 - 0x3000_3FFF | Pointer: mouse/tablet (Xcal, section 9.7) |
 | 0x3100_0000 - 0x3112_BFFF | Framebuffer VRAM |
-| 0x8000_0000 - 0x803F_FFFF | RAM, 4 MiB by default, up to 0xFFFF_FFFF with more (`--ram`, 1-2048 MiB; software reads the size from sysinfo) |
+| 0x8000_0000 - 0x803F_FFFF | RAM, 4 MiB by default, up to 1 TiB with more, ending at 0x100_7FFF_FFFF (`--ram`; software reads the size from sysinfo). RV32: up to 2 GiB, ending at 0xFFFF_FFFF |
 
-Unmapped accesses raise access-fault exceptions. Instructions and page tables live only in RAM and the boot ROM: an instruction fetch from VRAM or from any other range raises an instruction access fault, and a Sv32 page-table walk that reads a PTE outside them raises an access fault of the original access type. So neither can trigger a device register's read side effect (such as a PLIC claim). Grail's ELF loader likewise loads `PT_LOAD` segments only into RAM: a segment anywhere else, VRAM included, is an error.
+**Physical addresses** are **48 bits**: what this machine's "silicon" implements, as a real RV64 core implements fewer address bits than the 56 that Sv48 PTEs can name.
+- Every device lives below 4 GiB. RAM starts at 2 GiB and is up to 1 TiB in size, ending at 0x100_7FFF_FFFF at most.
+- 1 TiB is the memory controller's limit, a server-class figure that leaves the physical address space ample room for later device windows. It is far beyond what an emulated machine is likely to be given, but nothing in the machine then stands between a guest and large memory.
+- Every other physical address is unmapped, up to 2^48 and beyond. A page-table entry that translates to an address at or above 2^48 gives an access fault of the access, like any unmapped address.
 
-RAM: `--ram MiB` takes a whole number from 1 to 2048, the most that fits between 0x8000_0000 and the top of the 32-bit address space; anything else is rejected with an error. Without it a machine has 4 MiB, as does a VM on Avalon whose profile leaves the size at its default (`avalon_proto::DEFAULT_RAM_SIZE`, Round Table's and Pendragon's `--ram`): enough for Camelot booted from its root image ("Kernel filesystem", "Root image"), and for every example. Programs that need more say so with `--ram`. (As a library, Grail accepts any non-zero multiple of 4 KiB up to 2 GiB.) Software must not assume a size: it reads `SYS_RAM_SIZE` (section 9.5).
+Unmapped accesses raise access-fault exceptions. Instructions and page tables live only in RAM and the boot ROM: an instruction fetch from VRAM or from any other range raises an instruction access fault, and a page-table walk that reads a PTE outside them raises an access fault of the original access type. So neither can trigger a device register's read side effect (such as a PLIC claim). Grail's ELF loader likewise loads `PT_LOAD` segments only into RAM: a segment anywhere else, VRAM included, is an error. It loads each at its physical address (`p_paddr`), and starts the program at the physical address of its entry point: `e_entry` translated through the `PT_LOAD` segment whose virtual range holds it, since paging is off at reset. This matters for a kernel linked high and loaded low (#154); Grail's loader learns it in #145. An `e_entry` in no segment is an error (`entry point outside the program's segments`), as is a segment that is not in RAM.
+
+**Paging** (`satp`, section 5), as the privileged spec defines it, with 4 KiB pages:
+- **Tables:** 512 entries of 8 bytes. A PTE's PPN is bits 53:10, and V, R, W, X, U, G, A, D are bits 0-7.
+- **Sv48** walks 4 levels (VPN[3:0], 9 bits each, from bits 47:12); leaves above level 0 are superpages of 2 MiB, 1 GiB or 512 GiB.
+- **Sv39** walks 3 levels (bits 38:12), with 2 MiB and 1 GiB superpages.
+- **Faults:**
+  - a superpage whose PPN is not aligned to its size is a page fault;
+  - bits 63:54 of a PTE (Svnapot's N, Svpbmt's PBMT and the reserved bits) must be 0, else a page fault, since neither extension is implemented;
+  - a non-canonical virtual address faults before the walk (section 6).
+- **A/D:** the walker sets A and D in memory itself, atomically with respect to the harts.
+- **No TLB:** every access walks the tables, so `sfence.vma` only orders.
+
+Camelot uses Sv48: 128 TiB of user address space and as much for the kernel, for one more level of table than Sv39. Linux on riscv64 likewise uses the largest mode the hart offers (Sv48 here). Sv39 is there because standard RV64 software (riscv-tests among it) uses it.
+
+**RV32:** Sv32 walks 2 levels of 1024 4-byte PTEs (PPN in bits 31:10) with 4 MiB megapages, and has no canonical-address rule.
+
+RAM: `--ram SIZE` takes a whole number of MiB, or a number with a unit, `M`/`MiB` or `G`/`GiB`, case-insensitive (`--ram 64`, `--ram 64M`, `--ram 16G`).
+- **Limits:** from 1 MiB to 1 TiB, the memory controller's limit. Anything else is rejected with an error. RV32: 1 to 2048 MiB, the most that fits between 0x8000_0000 and the top of the 32-bit address space.
+- **Lazy backing:** as QEMU does, Grail backs RAM lazily. It reserves the size in the host's address space and commits host memory a page at a time, the first time the guest touches the page, so a large machine costs the host only what its guest uses. A size the host cannot reserve is refused when the machine is made.
+- **Default:** without `--ram` a machine has 4 MiB, as does a VM on Avalon whose profile leaves the size at its default (`avalon_proto::DEFAULT_RAM_SIZE`, Round Table's and Pendragon's `--ram`). That is enough for Camelot booted from its root image ("Kernel filesystem", "Root image"), and for every example. Programs that need more say so with `--ram`.
+- **As a library**, Grail accepts any non-zero multiple of 4 KiB up to 1 TiB (RV32: 2 GiB).
+- **Avalon's RAM budget** counts each VM's installed size, what it may use, not what it has touched so far, so the budget stays a guarantee with lazily backed RAM.
+
+Software must not assume a size: it reads `SYS_RAM_SIZE` (section 9.5), the role a device tree's `/memory` node plays for Linux.
 
 Clock: one instruction is one cycle is one `mtime` tick, so the CPU clock and the timebase frequency are the same number. Both are reported in Hz by sysinfo (`SYS_CPU_HZ`, `SYS_TIMEBASE_HZ`), so software computes timer intervals from them (a 10 ms tick is `hz / 100` ticks) instead of hard-coding a rate. Two modes:
 
@@ -180,9 +304,9 @@ Clock: one instruction is one cycle is one `mtime` tick, so the CPU clock and th
 
 Timer: `mtime` increments once per step (in which each hart executes an instruction, takes an interrupt, or spends a tick waiting in `wfi`). A hart's MTIP is pending while `mtime >=` its `mtimecmp`. When every hart waits in `wfi` with nothing pending, the default mode jumps `mtime` forward to the earliest set `mtimecmp` (not all ones) of any hart instead of spinning, whatever that hart's `mie.MTIE`, as a one-hart machine always has: a masked timer wakes nobody, it only ends the jump early, and the next step jumps on. In real-time mode the wait lasts the real time until the earliest `mtimecmp` of a hart whose `mie.MTIE` is set (`mtime` keeps ticking at FREQ; Grail skips the idle ticks of each batch at once and sleeps; masked timers do not limit the skip), and device input such as a UART byte still wakes the hart within about one batch. A hart in `wfi` never holds the others up: they keep running, and its ticks pass one per step.
 
-Harts: `--harts N` (1 to 8, default 1; `MachineConfig::harts` as a library) builds a machine of N harts on one bus: RAM, devices and `mtime` are shared, and each hart has its own registers, pc, privilege mode, CSRs (`mhartid` = its index), LR/SC reservation, Sv32 translation (its own `satp`), `msip` and `mtimecmp` in the CLINT, and pair of PLIC contexts (section 7.1). `SYS_HARTS` in sysinfo gives N (section 9.5). Scheduling is deterministic round robin: a step runs one instruction on hart 0, then one on hart 1, and so on up to hart N - 1 (a hart waiting in `wfi` spends its turn waiting), and `mtime` ticks once per step, before the instructions. So the clock is per hart: with `--clock FREQ`, each hart runs FREQ instructions per second, and the timebase stays FREQ. A run is reproducible like a one-hart run. An exit (`xcal.halt`, the test device) ends the step at once, before the remaining harts' turns. With `--trace`, each line starts with the hart (`h1 M 00001020: ...`) when N > 1. A one-hart machine behaves exactly as before harts existed, boot ROM included.
+Harts: `--harts N` (1 to 8, default 1; `MachineConfig::harts` as a library) builds a machine of N harts on one bus: RAM, devices and `mtime` are shared, and each hart has its own registers, pc, privilege mode, CSRs (`mhartid` = its index), LR/SC reservation, translation (its own `satp`), `msip` and `mtimecmp` in the CLINT, and pair of PLIC contexts (section 7.1). `SYS_HARTS` in sysinfo gives N (section 9.5). Scheduling is deterministic round robin: a step runs one instruction on hart 0, then one on hart 1, and so on up to hart N - 1 (a hart waiting in `wfi` spends its turn waiting), and `mtime` ticks once per step, before the instructions. So the clock is per hart: with `--clock FREQ`, each hart runs FREQ instructions per second, and the timebase stays FREQ. A run is reproducible like a one-hart run. An exit (`xcal.halt`, the test device) ends the step at once, before the remaining harts' turns. `--trace` prints addresses as 16 hex digits (RV32: 8), and when N > 1 each line starts with the hart (`h1 M 0000000000001020: ...`). A one-hart machine behaves exactly as before harts existed, boot ROM included.
 
-Boot: hart 0 starts at 0x1000, a stub that loads the entry point (the word at 0x1010, set by the ELF loader, or pointing at the disk loader when the machine boots from disk) into t0 and jumps there with a0 = 0, its hart id. On a machine with more harts the others start at 0x1020, a park loop:
+Boot: hart 0 starts at 0x1000, a stub that loads the entry point into t0 and jumps there with a0 = 0, its hart id. The entry point is the **doubleword** at 0x1010 (RV32: the word), set by the ELF loader, or pointing at the disk loader when the machine boots from disk. The stub reads it with `ld`, since `lw` would sign-extend an entry at 0x8000_0000 to 0xFFFF_FFFF_8000_0000 (RV32: `lw`). On a machine with more harts the others start at 0x1020, a park loop:
 
 ```
 0x1020: csrr  a0, mhartid
@@ -192,36 +316,36 @@ Boot: hart 0 starts at 0x1000, a stub that loads the entry point (the word at 0x
         li    t2, 8              mie.MSIE (mstatus.MIE is 0: the IPI wakes wfi, no trap)
         csrw  mie, t2
 0x1038: wfi
-        lw    t2, 0(t1)
+        lw    t2, 0(t1)          msip is a 32-bit register
         beqz  t2, 0x1038         not woken by an IPI: wait again
         sw    zero, 0(t1)        acknowledge the IPI
         csrw  mie, zero
         lui   t0, 1
-        lw    t0, 16(t0)         the entry point at 0x1010
+        ld    t0, 16(t0)         the entry point at 0x1010 (RV32: lw)
         jr    t0
 ```
 
 So every hart enters the program at the same entry point, in M-mode, with a0 = its hart id and every other register as the ROM left it (`mie` = 0, `msip` clear). The boot protocol is the entry point's: it reads `mhartid` (or a0), lets hart 0 set up memory, and starts each other hart with an IPI, writing 1 to its `msip` (0x0200_0000 + 4·i), when the hart can find what it needs (a stack, say); `examples/smp` does this. A hart that is never sent an IPI stays parked in `wfi`.
 
-The entry word at 0x1010 is the ROM's one writable word: a 32-bit store changes it (any other store to the ROM, of any width, is an access fault, as before). Software that starts a program the ROM did not load, such as a bootloader starting its kernel, writes the program's entry point there first, so that the harts the program wakes later with an IPI jump to it from the park loop, exactly as after an ELF boot.
+The entry doubleword at 0x1010 is the ROM's one writable location: an 8-byte store to it changes it (RV32: a 32-bit store to the word). Unlike a 64-bit device register it takes no 4-byte halves: an entry point is written whole, so a hart woken in between never sees half of one. Any other store to the ROM, of any width, is an access fault, as before. Software that starts a program the ROM did not load, such as a bootloader starting its kernel, writes the program's entry point there first, so that the harts the program wakes later with an IPI jump to it from the park loop, exactly as after an ELF boot.
 
-Boot from disk: a machine started with no program (`grail --disk IMG`, `Machine::boot_from_disk` as a library; one with no disk, or with less than 64 KiB of RAM, the boot area below, refuses to start) boots from disk 0, like a PC's BIOS loading the master boot record. The entry word points at the ROM's disk loader, at 0x1100 (its source is `crates/grail/rom/diskboot.s`, built with merlin-as and merlin-ld by `cargo xtask boot` into the committed `diskboot.elf` that Grail includes). Hart 0, sent there by the stub:
+Boot from disk: a machine started with no program (`grail --disk IMG`, `Machine::boot_from_disk` as a library; one with no disk, or with less than 64 KiB of RAM, the boot area below, refuses to start) boots from disk 0, like a PC's BIOS loading the master boot record. The entry doubleword points at the ROM's disk loader, at 0x1100 (its source is `crates/grail/rom/diskboot.s`, built with merlin-as and merlin-ld by `cargo xtask boot` into the committed `diskboot.elf` that Grail includes). Hart 0, sent there by the stub:
 
-1. points `mtvec` at a trap handler in the ROM, which prints `boot ROM: unexpected trap, mcause X, mepc X, mtval X` on the UART and stops the machine, so a boot block that is not code ends with a message rather than a loop of faults;
+1. points `mtvec` at a trap handler in the ROM, which prints `boot ROM: unexpected trap, mcause X, mepc X, mtval X` on the UART and stops the machine, so a boot block that is not code ends with a message rather than a loop of faults. The values are 16 hex digits (RV32: 8);
 2. reads the **boot block**, sectors 0 and 1 of disk 0 (1 KiB), into RAM at `0x8000_0000 + SYS_RAM_SIZE - 0x1_0000`, the start of the last 64 KiB of RAM (0x803F_0000 with the default 4 MiB), with the disk's registers (section 9.6), waiting for `BLK_STATUS.DONE` and acknowledging it;
-3. checks it: the disk has at least 2 sectors, the read worked (`BLK_ERROR` 0), the block's last word (bytes 1020 to 1023) is the signature 0x544F_4F42 (`BOOT` in ASCII), and its 256 little-endian words add up to 0 modulo 2^32 (a checksum: whoever writes the block sets one word so that they do);
+3. checks it: the disk has at least 2 sectors, the read worked (`BLK_ERROR` 0), the block's last word (bytes 1020 to 1023) is the signature 0x544F_4F42 (`BOOT` in ASCII), and its 256 little-endian 32-bit words add up to 0 modulo 2^32 (a checksum: whoever writes the block sets one word so that they do; the RV64 ROM sums with `addw`, so the sum stays 32-bit whatever the upper 32 bits of the registers hold after the loads);
 4. jumps to its first byte, in M-mode, with `fence.i` first and
    - a0 = 0, the hart id,
    - a1 = 0x3000_2000, the sysinfo block (section 9.5),
    - a2 = 0x1000_1000, the registers of the disk it was read from,
    - `mtvec` still the ROM's trap handler, every other register as the loader left it.
 
-The whole 64 KiB area is the boot block's to use (stack, buffers); the RAM below it is free for what it loads. Any failed check prints why on the UART and stops the machine with exit code 0xFD (`xcal.halt`): `boot ROM: disk 0 is too small to hold a boot block`, `boot ROM: cannot read the boot block from disk 0`, `boot ROM: disk 0 is not bootable (no boot signature)` (an empty disk, or one never made bootable), `boot ROM: the boot block on disk 0 is corrupt (bad checksum)`. Nothing else in the ROM uses RAM, so the boot block's program sees RAM as the reset left it (zeros) apart from the block itself. The other harts park as on any boot; one woken before the boot block's program has set the entry word reaches the disk loader, which sends it back to the park loop. What the boot block does is up to its author; Camelot's bootloader (`kernel/boot/boot.s`, installed by `camelot-fs mkfs --boot`) loads the kernel ELF stored after the filesystem, writes its entry point to 0x1010 and jumps to it with a0 = 0 (`docs/camelot-fs.md`, "Booting").
+The whole 64 KiB area is the boot block's to use (stack, buffers); the RAM below it is free for what it loads. Any failed check prints why on the UART and stops the machine with exit code 0xFD (`xcal.halt`): `boot ROM: disk 0 is too small to hold a boot block`, `boot ROM: cannot read the boot block from disk 0`, `boot ROM: disk 0 is not bootable (no boot signature)` (an empty disk, or one never made bootable), `boot ROM: the boot block on disk 0 is corrupt (bad checksum)`. Nothing else in the ROM uses RAM, so the boot block's program sees RAM as the reset left it (zeros) apart from the block itself. The other harts park as on any boot; one woken before the boot block's program has set the entry doubleword reaches the disk loader, which sends it back to the park loop. What the boot block does is up to its author; Camelot's bootloader (`kernel/boot/boot.s`, installed by `camelot-fs mkfs --boot`) loads the kernel ELF stored after the filesystem at its physical addresses, writes the physical entry point to 0x1010 and jumps to it with a0 = 0 (`docs/camelot-fs.md`, "Booting").
 
 Debugging: a machine can be debugged through Grail's debug interface (`grail::debug`), and over TCP with the GDB remote serial protocol (`grail --gdb ADDR`, with `--gdb-wait` to start stopped at the first instruction; `docs/merlin-dbg.md` lists the packets). The rules:
 
 - **Breakpoints** are held by the emulator, not written into memory. A hart stops before executing an instruction whose virtual address has one, when it is about to execute it rather than take an interrupt or wait in `wfi`.
-- **Watchpoints** stop the machine right after a load, store, `lr.w`, successful `sc.w` or AMO of any hart touches a watched virtual address range. Fetches, page-table walks and device DMA don't count.
+- **Watchpoints** stop the machine right after a load, store, `lr`, successful `sc` or AMO of any hart touches a watched virtual address range. Fetches, page-table walks and device DMA don't count.
 - **Stops** happen between two harts' turns of a step, and the machine resumes at the turn where it stopped. Resuming first executes the instruction a hart stopped at, even if it has a breakpoint.
 - **Single steps** run one turn of the selected hart, after the turns of the harts before it in that step.
 - **Debugger access** has no side effects. It reads registers and CSRs whatever the hart's privilege, and reads and writes memory physically or through the selected hart's current translation (no permission checks, no A/D updates). It never touches device registers.
@@ -268,12 +392,23 @@ Typical handler: claim, service the device until it lowers its line (for the UAR
 
 ## 8. Emulator conformance
 
-- Pass `riscv-tests` rv32ui-p-*, rv32um-p-*, rv32ua-p-*, rv32mi-p-* and rv32si-p-* (all but `rv32ui-p-ma_data`, section 4). Tests are loaded as ELF and report via the test device (or `tohost` symbol).
-- Prebuilt test ELFs are committed to the repo so no cross toolchain is needed on Windows.
+- Pass `riscv-tests` rv64ui-p-*, rv64um-p-*, rv64ua-p-*, rv64mi-p-* and rv64si-p-* (all but `rv64ui-p-ma_data`, section 4), and, while RV32 exists, rv32ui-p-*, rv32um-p-*, rv32ua-p-*, rv32mi-p-* and rv32si-p-* (all but `rv32ui-p-ma_data`). Tests are loaded as ELF, the class choosing the machine's width, and report via the test device (or `tohost` symbol).
+- Prebuilt test ELFs, and the objects merlin-ld relinks, are committed to the repo so no cross toolchain is needed on Windows (`scripts/build-riscv-tests.sh` builds them with clang: `--target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax` for RV64; no relaxation, so merlin-ld can relink the objects).
 
 ## 9. Excalibur extensions (Xcal)
 
-Everything here lives in RISC-V's reserved custom space (custom-0 opcode, new MMIO ranges), so stock RV32 software keeps working. `misa` bit 23 (X, "non-standard extensions present") is set.
+Everything here lives in RISC-V's reserved custom space (custom-0 opcode, new MMIO ranges), so stock RISC-V software keeps working. `misa` bit 23 (X, "non-standard extensions present") is set.
+
+**Register widths.** A device register that holds an address, or the size of RAM, a disk or an MMIO range, is **64 bits** wide (counts and lengths such as `BLK_COUNT`, a ring's `SIZE` or a descriptor's `len` keep their own widths):
+- **Sysinfo:** the RAM base and size, and the device table's base and size.
+- **Block device:** capacity, sector, DMA address.
+- **Network card:** ring bases, and the buffer address in its descriptors.
+
+Real 64-bit devices and their descriptions (device trees, ACPI, virtio, NVMe) are all 64-bit for these, so DMA reaches all of RAM and nothing in the machine assumes 4 GiB. A 64-bit register is read or written whole with an 8-byte access, or by its two 4-byte halves, the low half at the lower address. A write of one half is a write of the register: the other half keeps its value, and whatever the write does (a network ring starting over, a check of the new value) happens with the combined 64-bit value. Each half is a write of its own, so a register written by halves has its side effects twice, once per half: harmless for every register here. Unused and reserved offsets read as 0 and ignore writes at every width a device takes; a width the device never takes is an access fault there too.
+
+Registers whose values are small (status, control, counts, frequencies, framebuffer, keyboard, pointer, PLIC) stay 32-bit. An 8-byte access to one is an access fault, like any other width it does not take. Software reading a 32-bit register whose bit 31 may be set uses `lwu`, since `lw` sign-extends (section 4).
+
+The 64-bit layouts are **version 2** of the device interface (`SYS_VERSION` 2, section 9.5), which every RV64 machine presents. **RV32:** an RV32 machine presents version 1, the all-32-bit layouts given below as "Version 1", so its software keeps working until RV32 is removed.
 
 ### 9.1 Xcaldbg: debug print
 
@@ -282,7 +417,7 @@ xcal.dbg rs1        custom-0 (0001011), funct3=000, rd=0, imm=0
 encoding: 0000_0000_0000 | rs1 | 000 | 00000 | 0001011
 ```
 
-Prints the register to the machine's debug console (stderr for the `grail` command), e.g. `[dbg] pc=80000010 a0 = 0x0000002a (42)`. No architectural side effects. Legal in every mode. Meant for the first days of the kernel, before the UART driver exists.
+Prints the register to the machine's debug console (stderr for the `grail` command), e.g. `[dbg] pc=0000000080000010 a0 = 0x000000000000002a (42)`, the value in hex and as a signed number (RV32: `[dbg] pc=80000010 a0 = 0x0000002a (42)`). No architectural side effects. Legal in every mode. Meant for the first days of the kernel, before the UART driver exists.
 
 ### 9.2 Xcalhalt: stop the machine
 
@@ -311,10 +446,10 @@ Grail also redraws at ~60 Hz on its own, so `FB_PRESENT` is optional. Host side:
 
 Details:
 
-- The registers are 32-bit only: byte or halfword accesses in 0x3000_0000 - 0x3000_0FFF raise access faults. Unused offsets in that page read as 0 and ignore writes, as do writes to the read-only registers. `FB_PRESENT` reads as 0.
+- The registers are 32-bit only: byte, halfword or doubleword accesses in 0x3000_0000 - 0x3000_0FFF raise access faults. Unused offsets in that page read as 0 and ignore writes, as do writes to the read-only registers. `FB_PRESENT` reads as 0.
 - `FB_CTRL` bits other than bit 0 are reserved, read as 0. `FB_CTRL` resets to 0, so the display starts disabled, and no present is pending at reset.
 - While the display is disabled it shows black; VRAM keeps its contents and can be drawn into before enabling.
-- VRAM is plain memory: byte, halfword and word accesses, same alignment rules as RAM (section 4). It resets to 0. The top byte of each pixel is ignored. Byte order in memory is B, G, R, X, which is also a 32-bpp Windows DIB, so Grail blits it without conversion.
+- VRAM is plain memory: byte, halfword, word and doubleword accesses, same alignment rules as RAM (section 4). It resets to 0. The top byte of each pixel is ignored. Byte order in memory is B, G, R, X, which is also a 32-bpp Windows DIB, so Grail blits it without conversion.
 - Grail runs a machine and its window on one thread: the CPU runs in slices that end early right after a `FB_PRESENT` write (or, with `--clock`, when it is ahead of the wall clock; Grail then sleeps at most ~10 ms at a time so the window stays responsive); between slices it pumps the window's messages and redraws on a present, when Windows asks for a repaint, or when ~16 ms of host time have passed. The window is opened only with `--fb` (Windows only; elsewhere Grail warns and runs headless, the default). The image is stretched to the window's client area. Closing the window stops the emulator (exit code 0); if the program stops first, the window stays open on the last frame until it is closed, and Grail then exits with the program's code.
 - `--fb-dump DIR` writes `DIR/frame-NNNN.ppm` (binary P6, 640×480, numbered from 0000) after every `FB_PRESENT` and once more when the machine stops. NNNN is at least four digits: frame 10000 is `frame-10000.ppm`, so past 9999 frames, sort the names by number rather than as text. Each file is 921,615 bytes and nothing limits the rate, so a program that presents in a tight loop fills the disk quickly: dumps are for tests and short runs. It works with or without the window.
 
@@ -339,7 +474,7 @@ Code 0 never occurs, so a `KBD_DATA` of 0 always means "empty". Bits 31:11 read 
 
 Details:
 
-- The registers are 32-bit only: byte or halfword accesses in 0x3000_1000 - 0x3000_1FFF raise access faults (and pop nothing). Unused offsets read as 0 and ignore writes, as do writes to `KBD_STATUS` and `KBD_DATA`. `KBD_CTRL` bits other than bit 0 are reserved, read as 0; it resets to 0.
+- The registers are 32-bit only: byte, halfword or doubleword accesses in 0x3000_1000 - 0x3000_1FFF raise access faults (and pop nothing). Unused offsets read as 0 and ignore writes, as do writes to `KBD_STATUS` and `KBD_DATA`. `KBD_CTRL` bits other than bit 0 are reserved, read as 0; it resets to 0.
 - Events wait in a FIFO of 64. An event that arrives while it is full is dropped (the older ones are kept).
 - **Interrupt**: the keyboard holds PLIC source 2 high while `KBD_CTRL.0` and `KBD_STATUS.0` are both set, so reading `KBD_DATA` until `KBD_STATUS.0` clears lowers it. As with the UART, a handler may pop one event per interrupt and let the line raise the next one.
 - **Printable keys** report the character the host keyboard layout types with the current Shift and Caps Lock state, so Shift+a gives 'A' (0x41) with bit 9 set and Shift+1 gives '!' on a US layout. Ctrl does not change the code: Ctrl+C is 'c' with bit 10 set, not 0x03. Keys that type no ASCII character (dead keys, accented letters, Insert, Home, ...) send no events.
@@ -351,30 +486,37 @@ Details:
 
 Read-only registers that describe the machine, so software discovers its hardware instead of hard-coding it: the kernel takes the RAM size for its page allocator and the timebase for its timer tick from here. A hypervisor host running several Grail machines gives each its own values.
 
-| Address | Register | Notes |
-|---|---|---|
-| 0x3000_2000 | `SYS_MAGIC` | 0x5359_5349 ("SYSI"): the block is present |
-| 0x3000_2004 | `SYS_VERSION` | 1. Changes only if an existing register changes meaning; new registers and device types do not need a new version |
-| 0x3000_2008 | `SYS_RAM_BASE` | 0x8000_0000 |
-| 0x3000_200C | `SYS_RAM_SIZE` | RAM size in bytes (a multiple of 4 KiB; 0x0040_0000 by default, 0x8000_0000 at most) |
-| 0x3000_2010 | `SYS_TIMEBASE_HZ` | `mtime` frequency in Hz |
-| 0x3000_2014 | `SYS_CPU_HZ` | CPU clock in Hz; equal to the timebase (one instruction per tick) |
-| 0x3000_2018 | `SYS_FLAGS` | bit 0 = the clock is real time (`--clock`); clear = nominal (default 10 MHz, runs at full speed). Other bits are reserved and read as 0 |
-| 0x3000_201C | `SYS_DEV_COUNT` | number of device table entries |
-| 0x3000_2020 | `SYS_HARTS` | number of harts, 1 to 8 (`--harts`, section 7); their `mhartid`s are 0 to `SYS_HARTS` - 1 |
-| 0x3000_2024 - 0x3000_203F | reserved | read as 0 |
-| 0x3000_2040 + 16·i | device table entry `i` | four words, below |
+| Address | Register | Width | Notes |
+|---|---|---|---|
+| 0x3000_2000 | `SYS_MAGIC` | 32 | 0x5359_5349 ("SYSI"): the block is present |
+| 0x3000_2004 | `SYS_VERSION` | 32 | **2**: the 64-bit layouts of this section (RV32 machines: 1, below). Changes only if an existing register changes meaning or place; new registers and device types do not need a new version |
+| 0x3000_2008 | `SYS_RAM_BASE` | 64 | 0x8000_0000 |
+| 0x3000_2010 | `SYS_RAM_SIZE` | 64 | RAM size in bytes: a multiple of 4 KiB, 0x40_0000 (4 MiB) by default, 0x100_0000_0000 (1 TiB) at most |
+| 0x3000_2018 | `SYS_TIMEBASE_HZ` | 32 | `mtime` frequency in Hz |
+| 0x3000_201C | `SYS_CPU_HZ` | 32 | CPU clock in Hz; equal to the timebase (one instruction per tick) |
+| 0x3000_2020 | `SYS_FLAGS` | 32 | bit 0 = the clock is real time (`--clock`); clear = nominal (default 10 MHz, runs at full speed). Other bits are reserved and read as 0 |
+| 0x3000_2024 | `SYS_DEV_COUNT` | 32 | number of device table entries |
+| 0x3000_2028 | `SYS_HARTS` | 32 | number of harts, 1 to 8 (`--harts`, section 7); their `mhartid`s are 0 to `SYS_HARTS` - 1 |
+| 0x3000_202C - 0x3000_203F | reserved | | read as 0 |
+| 0x3000_2040 + 24·i | device table entry `i` | | below |
 
 Frequencies are plain 32-bit Hz values, like the device-tree `timebase-frequency` property, so a 10 ms tick is `SYS_TIMEBASE_HZ / 100` ticks.
 
-Device table entry `i` (for `i` < `SYS_DEV_COUNT`; at most 252 fit in the page):
+Device table entry `i` (for `i` < `SYS_DEV_COUNT`; at most 168 fit in the page), 24 bytes:
 
-| Offset | Field | Notes |
-|---|---|---|
-| +0x0 | `DEV_TYPE` | device type code, below |
-| +0x4 | `DEV_BASE` | physical address of its MMIO range |
-| +0x8 | `DEV_SIZE` | size of that range in bytes |
-| +0xC | `DEV_IRQ` | its PLIC source (section 7.1), 0 = none |
+| Offset | Field | Width | Notes |
+|---|---|---|---|
+| +0x00 | `DEV_TYPE` | 32 | device type code, below |
+| +0x04 | `DEV_IRQ` | 32 | its PLIC source (section 7.1), 0 = none |
+| +0x08 | `DEV_BASE` | 64 | physical address of its MMIO range |
+| +0x10 | `DEV_SIZE` | 64 | size of that range in bytes |
+
+Addresses and sizes are 64-bit as in a device tree's `reg` property (two cells each on RV64), even though every device is below 4 GiB today. Nothing in the description assumes they are.
+
+**Version 1** (RV32 machines):
+- the registers are all 32-bit, in this order from 0x3000_2008: `SYS_RAM_BASE`, `SYS_RAM_SIZE` (0x8000_0000 at most), `SYS_TIMEBASE_HZ`, `SYS_CPU_HZ`, `SYS_FLAGS`, `SYS_DEV_COUNT`, `SYS_HARTS`;
+- 0x3000_2024 to 0x3000_203F are reserved;
+- the device table has 16-byte entries at 0x3000_2040 + 16·i: `DEV_TYPE` +0x0, `DEV_BASE` +0x4, `DEV_SIZE` +0x8, `DEV_IRQ` +0xC, at most 252.
 
 | Type | Device |
 |---|---|
@@ -393,7 +535,7 @@ Device table entry `i` (for `i` < `SYS_DEV_COUNT`; at most 252 fit in the page):
 
 Entries are in address order. Software looks devices up by type, not by index. Type codes are never reused: a new device gets the next code and an entry, with no new registers and no change to this layout (the block device, type 9, the pointer, type 10, and the network card, type 11, were added this way). Grail's current machine lists the test device, CLINT, PLIC, UART (irq 1), one block device per disk (disk `i` at 0x1000_1000 + 0x1000·`i`, irq 3 + `i`; none without `--disk`), one network card per `--net` (card `i` at 0x1000_9000 + 0x1000·`i`, irq 12 + `i`; none without `--net`), framebuffer control, keyboard (irq 2), sysinfo, pointer (irq 11) and VRAM; `examples/sysinfo` prints the table.
 
-The registers are 32-bit only: byte or halfword accesses raise access faults. Word writes are ignored, as for the framebuffer's read-only registers. Offsets past the last entry read as 0.
+The 32-bit registers take 4-byte accesses, and the 64-bit ones 8-byte accesses or their 4-byte halves. Other widths raise access faults. Writes are ignored, as for the framebuffer's read-only registers. Offsets past the last entry read as 0.
 
 ### 9.6 Block device (MMIO)
 
@@ -401,17 +543,21 @@ Disks of 512-byte sectors. A machine has 0 to 8 of them, in the order they are g
 
 The interface is one command at a time with DMA: software writes the first sector, the buffer's address in RAM and the sector count, then a command; the device copies the sectors between the disk and RAM itself, sets `BLK_STATUS.DONE` and, if enabled, raises its interrupt. The memory map used to reserve this slot for a virtio-blk device. Virtio was set aside because a driver must negotiate features and build a virtqueue in guest memory (descriptor table, available ring, used ring) behind the virtio-mmio transport registers before the first sector moves, while a driver for this device is about twenty instructions (`examples/disk`) that a first kernel driver can copy. Having only one request in flight costs nothing in an emulator that finishes each request at once. A queued device can still be added later as a new type code.
 
-| Offset | Register | Notes |
-|---|---|---|
-| +0x00 | `BLK_CAPACITY` (RO) | disk size in sectors (at most 2^32 - 1, just under 2 TiB) |
-| +0x04 | `BLK_FLAGS` (RO) | bit 0 = the disk is read-only. Other bits read as 0 |
-| +0x08 | `BLK_SECTOR` | first sector of the transfer |
-| +0x0C | `BLK_DMA` | physical address of the buffer in RAM |
-| +0x10 | `BLK_COUNT` | number of sectors to transfer |
-| +0x14 | `BLK_CMD` (WO) | writing a command runs it: 1 = read (disk to RAM), 2 = write (RAM to disk), 3 = flush. Reads as 0 |
-| +0x18 | `BLK_STATUS` | bit 0 = BUSY (read-only); bit 1 = DONE: a command finished and has not been acknowledged. Writing 1 to bit 1 clears it; other bits ignore writes |
-| +0x1C | `BLK_ERROR` (RO) | outcome of the last command, below |
-| +0x20 | `BLK_CTRL` | bit 0 = completion interrupt enable. Other bits read as 0 |
+| Offset | Register | Width | Notes |
+|---|---|---|---|
+| +0x00 | `BLK_CAPACITY` (RO) | 64 | disk size in sectors, as virtio-blk's `capacity` and Linux's `sector_t` are 64-bit: at most 2^64 - 1, so the limit is the backend's (an image file's size, Lake's), never the register |
+| +0x08 | `BLK_SECTOR` | 64 | first sector of the transfer |
+| +0x10 | `BLK_DMA` | 64 | physical address of the buffer in RAM |
+| +0x18 | `BLK_COUNT` | 32 | number of sectors to transfer |
+| +0x1C | `BLK_FLAGS` (RO) | 32 | bit 0 = the disk is read-only. Other bits read as 0 |
+| +0x20 | `BLK_CMD` (WO) | 32 | writing a command runs it: 1 = read (disk to RAM), 2 = write (RAM to disk), 3 = flush. Reads as 0 |
+| +0x24 | `BLK_STATUS` | 32 | bit 0 = BUSY (read-only); bit 1 = DONE: a command finished and has not been acknowledged. Writing 1 to bit 1 clears it; other bits ignore writes |
+| +0x28 | `BLK_ERROR` (RO) | 32 | outcome of the last command, below |
+| +0x2C | `BLK_CTRL` | 32 | bit 0 = completion interrupt enable. Other bits read as 0 |
+
+**Version 1** (RV32 machines):
+- all registers 32-bit, `BLK_CAPACITY` at most 2^32 - 1 sectors, just under 2 TiB;
+- the order: `BLK_CAPACITY` +0x00, `BLK_FLAGS` +0x04, `BLK_SECTOR` +0x08, `BLK_DMA` +0x0C, `BLK_COUNT` +0x10, `BLK_CMD` +0x14, `BLK_STATUS` +0x18, `BLK_ERROR` +0x1C, `BLK_CTRL` +0x20.
 
 | `BLK_ERROR` | Meaning |
 |---|---|
@@ -424,7 +570,7 @@ The interface is one command at a time with DMA: software writes the first secto
 
 Details:
 
-- The registers are 32-bit only: byte or halfword accesses in a disk's page raise access faults and run nothing. Unused offsets read as 0 and ignore writes, as do writes to the read-only registers. Everything writable resets to 0. `BLK_SECTOR`, `BLK_DMA` and `BLK_COUNT` keep their values after a command.
+- The 32-bit registers take 4-byte accesses, the 64-bit ones 8-byte accesses or their 4-byte halves; other widths raise access faults and run nothing. Unused offsets read as 0 and ignore writes, as do writes to the read-only registers. Everything writable resets to 0. `BLK_SECTOR`, `BLK_DMA` and `BLK_COUNT` keep their values after a command.
 - **Commands complete at once.** Grail runs a command to completion during the store to `BLK_CMD`, so BUSY never reads 1 and DONE is already set when the next instruction runs. BUSY is defined anyway, so that a driver which waits for BUSY to clear or for DONE (by polling or by interrupt) also works with a disk that takes time. A command written while BUSY is set is ignored. Every command written sets DONE and `BLK_ERROR`, failed ones included.
 - **Checks come first**, in the order of the error codes (1 to 4), before any data moves: a command that fails one transfers nothing. The range check is done without overflow, so a huge `BLK_SECTOR` or `BLK_COUNT` fails with 2 instead of wrapping. The buffer must lie in RAM (not VRAM, the boot ROM or device registers); it may start at any byte address. `BLK_DMA` is a physical address: the device does not use the MMU. With `BLK_COUNT` 0 a read or write transfers nothing, and succeeds if the checks pass (`BLK_SECTOR` at most `BLK_CAPACITY`, `BLK_DMA` in RAM or just past its end). Only error 5 can leave a transfer half done. Nothing a program writes makes the host panic or touches memory outside the buffer.
 - **Flush** ignores `BLK_SECTOR`, `BLK_DMA` and `BLK_COUNT`, and completes once every earlier write is durable on the host (for an image file, the host OS has written it to its own disk). It succeeds on a read-only disk.
@@ -467,7 +613,7 @@ Reading an event: read `PTR_EVENT` (it pops), then `PTR_EVENT_XY`. Software that
 
 Details:
 
-- The registers are 32-bit only: byte or halfword accesses in 0x3000_3000 - 0x3000_3FFF raise access faults (and pop nothing). Unused offsets read as 0 and ignore writes, as do writes to the read-only registers. Everything resets to 0: absolute mode, interrupts off, the pointer at (0, 0) with no buttons held, the FIFO empty.
+- The registers are 32-bit only: byte, halfword or doubleword accesses in 0x3000_3000 - 0x3000_3FFF raise access faults (and pop nothing). `PTR_EVENT`'s VALID bit is bit 31, and in relative mode `PTR_EVENT_XY` has bit 31 set whenever `dy` is negative, so RV64 software reads both with `lwu` (or treats them as signed on purpose). Unused offsets read as 0 and ignore writes, as do writes to the read-only registers. Everything resets to 0: absolute mode, interrupts off, the pointer at (0, 0) with no buttons held, the FIFO empty.
 - **Events** wait in a FIFO of 64. Each change the host reports makes one event, in the mode `PTR_CTRL` selects at that moment; switching modes does not change the events already queued (their RELATIVE bit says how to read them). A change that the program could not see makes no event: no motion (in relative mode, a zero `dx`, `dy`; in absolute mode, the same pixel), the same buttons and no wheel.
 - **Clamping**: absolute positions are clamped to the framebuffer, so a drag that leaves the host's window pins the pointer to the edge. In relative mode a host that reports motion as deltas has them passed on as they are, even against an edge (the absolute position, `PTR_POS`, still stops there); a host that reports positions has its deltas computed between clamped positions.
 - **Overflow**: an event that arrives while the FIFO is full is dropped (the older ones are kept) and sets OVERFLOW. `PTR_POS` and `PTR_BUTTONS` follow every change, dropped ones included, so after an overflow a program catches up by reading them, then writes 2 to `PTR_STATUS`.
@@ -482,7 +628,7 @@ An Ethernet card, so machines can network. It sends and receives raw Ethernet II
 
 | Offset | Register | Notes |
 |---|---|---|
-| +0x00 | `NET_MAC_LO` (RO) | bytes 0-3 of the card's MAC address, byte 0 (the first on the wire) in bits 7:0, so a word store of it puts the bytes in wire order |
+| +0x00 | `NET_MAC_LO` (RO) | bytes 0-3 of the card's MAC address, byte 0 (the first on the wire) in bits 7:0, so a word store of it puts the bytes in wire order (read it with `lwu`: bit 31 may be set) |
 | +0x04 | `NET_MAC_HI` (RO) | bytes 4-5 in bits 15:0; bits 31:16 read 0 |
 | +0x08 | `NET_STATUS` (RO) | bit 0 = link up (the backend can carry frames). Other bits read 0 |
 | +0x0C | `NET_ERROR` | the latest ring error, below; 0 = none. Any write clears it |
@@ -490,24 +636,32 @@ An Ethernet card, so machines can network. It sends and receives raw Ethernet II
 | +0x14 | `NET_IRQ_STATUS` | bit 0 = RX: the card handed back receive descriptors; bit 1 = TX: it handed back transmit descriptors; bit 2 = ERROR: it recorded a ring error. Writing 1 to a bit clears it |
 | +0x18 | `NET_RX_DROPPED` | frames lost on the way in (a 32-bit counter that wraps). Any write sets it to 0 |
 | +0x1C | reserved | reads 0 |
-| +0x20 | `NET_TX_BASE` | physical address of the transmit ring |
-| +0x24 | `NET_TX_SIZE` | its size in descriptors: 0 (no ring) or a power of two from 1 to 1024 |
-| +0x28 | `NET_TX_HEAD` (RO) | counter of the next descriptor the card will send |
-| +0x2C | `NET_TX_TAIL` | counter one past the last descriptor the driver has filled. Writing it sends |
-| +0x30 - +0x3C | `NET_RX_BASE`, `NET_RX_SIZE`, `NET_RX_HEAD` (RO), `NET_RX_TAIL` | the same for the receive ring |
+| +0x20 | `NET_TX_BASE` (64-bit) | physical address of the transmit ring |
+| +0x28 | `NET_TX_SIZE` | its size in descriptors: 0 (no ring) or a power of two from 1 to 1024 |
+| +0x2C | `NET_TX_HEAD` (RO) | counter of the next descriptor the card will send |
+| +0x30 | `NET_TX_TAIL` | counter one past the last descriptor the driver has filled. Writing it sends |
+| +0x34 | reserved | reads 0 |
+| +0x38 - +0x48 | `NET_RX_BASE` (64-bit, +0x38), `NET_RX_SIZE` (+0x40), `NET_RX_HEAD` (RO, +0x44), `NET_RX_TAIL` (+0x48) | the same for the receive ring |
 
-**Descriptors** are 8 bytes, little-endian like everything else:
+The ring bases are 64-bit registers; the others are 32-bit.
+
+**Descriptors** are 16 bytes, little-endian like everything else, and naturally aligned: a ring's `BASE` is a multiple of 16, as virtio requires of its descriptor table (an e1000 wants 128). A `BASE` that is not is refused: the register keeps the value written (it reads back), the ring's `SIZE` becomes 0, and `NET_ERROR` becomes 4. Alignment depends only on the low bits, so a `BASE` written by halves is checked the same way whichever half comes first:
 
 | Offset | Field | Notes |
 |---|---|---|
-| +0 | `addr` (u32) | physical address of the buffer, in RAM; any byte address |
-| +4 | `len` (u16) | transmit: the frame's length, set by the driver. Receive: the buffer's size, set by the driver; the card overwrites it with the length of the frame it received |
-| +6 | `status` (u16) | written by the card when it hands the descriptor back, below |
+| +0 | `addr` (u64) | physical address of the buffer, in RAM; any byte address |
+| +8 | `len` (u16) | transmit: the frame's length, set by the driver. Receive: the buffer's size, set by the driver; the card overwrites it with the length of the frame it received |
+| +10 | `status` (u16) | written by the card when it hands the descriptor back, below |
+| +12 | reserved (u32) | 0; the card ignores it and never writes it |
+
+**Version 1** (RV32 machines):
+- every register is 32-bit: `NET_TX_BASE`, `NET_TX_SIZE`, `NET_TX_HEAD` and `NET_TX_TAIL` at +0x20 to +0x2C, and the receive ring's at +0x30 to +0x3C;
+- descriptors are 8 bytes: `addr` (u32) +0, `len` (u16) +4, `status` (u16) +6.
 
 **Rings.** A ring is `SIZE` descriptors at `BASE`, and two free-running 32-bit counters, `HEAD` and `TAIL`; counter `n` is slot `n % SIZE` (`SIZE` is a power of two, so this holds across the wrap at 2^32). The descriptors from `HEAD` up to, not including, `TAIL` belong to the card, the rest to the driver: the driver hands descriptors over by advancing `TAIL`, the card hands them back by advancing `HEAD`. The ring is empty when `TAIL == HEAD` and full when `TAIL - HEAD == SIZE` (mod 2^32), so every slot can be used, with no slot kept free to tell the two apart. Writing `BASE` or `SIZE` starts the ring over with `HEAD = TAIL = 0`, which is how a driver sets one up (and recovers from a ring error). A `TAIL` more than `SIZE` ahead of `HEAD` is refused: the write is ignored and `NET_ERROR` becomes 2.
 
-- **Transmit**: the driver fills the descriptor at slot `TX_TAIL % SIZE` (address and length of a frame in RAM), then writes `TX_TAIL + 1` (or several at once). Grail sends every descriptor from `TX_HEAD` to the new `TX_TAIL` during that store, in order, writing each one's status and advancing `TX_HEAD` past it, so `TX_HEAD == TX_TAIL` when the next instruction runs. A driver should still wait for `TX_HEAD` (or the TX interrupt) before reusing a descriptor or its buffer, so that it also works with a card that takes time. Then `NET_IRQ_STATUS.TX` is set. Writing a descriptor's status is DMA too: it breaks any hart's LR/SC reservation on that word (section 4.1).
-- **Receive**: the driver gives the card empty buffers by filling descriptors (address, size) and advancing `RX_TAIL`; at start, typically all `SIZE` of them. Each frame that arrives goes into the buffer of the descriptor at `RX_HEAD`: the card copies it, writes its length and status, advances `RX_HEAD` and sets `NET_IRQ_STATUS.RX`. The driver reads the descriptors from its own counter up to `RX_HEAD`, then gives each buffer back by writing its size into `len` again (the card overwrote it) and advancing `RX_TAIL`. The card does not filter by destination address: every frame its backend delivers goes into the ring (and a hub repeats every frame to every port, so a card also gets frames sent to other machines). The driver drops the frames not addressed to its MAC, the broadcast address or a group it wants. Receive DMA writes RAM between two instructions without a hart storing there, so it breaks an LR/SC reservation on a word it writes (section 4.1).
+- **Transmit**: the driver fills the descriptor at slot `TX_TAIL % SIZE` (address and length of a frame in RAM), then writes `TX_TAIL + 1` (or several at once). Grail sends every descriptor from `TX_HEAD` to the new `TX_TAIL` during that store, in order, writing each one's status and advancing `TX_HEAD` past it, so `TX_HEAD == TX_TAIL` when the next instruction runs. A driver should still wait for `TX_HEAD` (or the TX interrupt) before reusing a descriptor or its buffer, so that it also works with a card that takes time. Then `NET_IRQ_STATUS.TX` is set. Writing a descriptor's status is DMA too: it breaks any hart's LR/SC reservation on that line (section 4.1).
+- **Receive**: the driver gives the card empty buffers by filling descriptors (address, size) and advancing `RX_TAIL`; at start, typically all `SIZE` of them. Each frame that arrives goes into the buffer of the descriptor at `RX_HEAD`: the card copies it, writes its length and status, advances `RX_HEAD` and sets `NET_IRQ_STATUS.RX`. The driver reads the descriptors from its own counter up to `RX_HEAD`, then gives each buffer back by writing its size into `len` again (the card overwrote it) and advancing `RX_TAIL`. The card does not filter by destination address: every frame its backend delivers goes into the ring (and a hub repeats every frame to every port, so a card also gets frames sent to other machines). The driver drops the frames not addressed to its MAC, the broadcast address or a group it wants. Receive DMA writes RAM between two instructions without a hart storing there, so it breaks an LR/SC reservation on a line it writes (section 4.1).
 - **Flow control**: a frame that arrives while the card owns no receive descriptor (`RX_HEAD == RX_TAIL`, a full ring or none set up) is dropped and counted in `NET_RX_DROPPED`. Frames never wait in the card: what the guest cannot take is lost, as on a real network, and nothing queues without bound. Frames shorter than 14 or longer than 1514 bytes from a backend are dropped and counted too. Grail takes received frames from the backend every 256 steps (instructions, or ticks spent in `wfi`, section 7; in real-time mode the idle ticks skipped in a batch count too), at most 64 at a time, so a frame lands in RAM between two instructions and wakes a hart waiting in `wfi` for the interrupt; a card the guest has not set up still drains its backend, dropping everything.
 
 | `status` | Meaning |
@@ -526,11 +680,12 @@ A received frame whose descriptor gets status 2 or 3 is lost, and counted in `NE
 | 1 | a `SIZE` that is neither 0 nor a power of two up to 1024 was written; the ring's size became 0 |
 | 2 | a `TAIL` more than `SIZE` descriptors ahead of `HEAD` was written; it was ignored |
 | 3 | a descriptor the card needed is not in RAM (`BASE` is wrong): transmit stops there (`TX_HEAD` stays on it until the ring is set up again); a received frame is dropped and counted |
+| 4 | a `BASE` that is not a multiple of 16 was written; the ring's size became 0 (version 2 only; version 1 descriptors may be at any address) |
 
 Details:
 
-- The registers are 32-bit only: byte or halfword accesses in a card's page raise access faults and do nothing. Unused offsets read as 0 and ignore writes, as do writes to the read-only registers. Everything writable resets to 0: no rings, interrupts off.
-- **DMA rules** are the block device's (section 9.6): addresses are physical (the card does not use the MMU), descriptors and buffers must lie entirely in RAM (not VRAM, the boot ROM or device registers), checked without overflow, and they may start at any byte address. A bad descriptor gets an error status and the card moves on; a bad ring is a `NET_ERROR`. Nothing a program writes makes the host panic or touches memory outside the descriptors and buffers.
+- The 32-bit registers take 4-byte accesses, the 64-bit ring bases 8-byte accesses or their 4-byte halves; other widths raise access faults and do nothing. Unused offsets read as 0 and ignore writes, as do writes to the read-only registers. Everything writable resets to 0: no rings, interrupts off.
+- **DMA rules** are the block device's (section 9.6): addresses are physical (the card does not use the MMU), descriptors and buffers must lie entirely in RAM (not VRAM, the boot ROM or device registers), checked without overflow; a buffer may start at any byte address, a ring at a multiple of 16 (version 1: any address). A bad descriptor gets an error status and the card moves on; a bad ring is a `NET_ERROR`. Nothing a program writes makes the host panic or touches memory outside the descriptors and buffers.
 - **Interrupt**: a card holds its PLIC source high while `NET_IRQ_STATUS & NET_IRQ_ENABLE` is non-zero. A handler claims the source, handles the receive ring up to `RX_HEAD` (and reclaims transmit descriptors up to `TX_HEAD`), writes the bits it saw to `NET_IRQ_STATUS` (which lowers the line) and completes. A frame dropped without a descriptor (none free, or a length outside 14 to 1514) does not interrupt; one handed back in a descriptor with status 2 or 3 sets RX like any other, and one dropped because the receive ring is not in RAM sets ERROR (`NET_ERROR` 3).
 - **MAC address**: set by the host, read-only for the guest, always an individual (not a group) and locally administered (bit 1 of the first byte set) address, so it never clashes with a manufacturer's; Grail refuses any other for a card, whether from a config, `--net hub,mac=` or `Machine::with_devices`. A configured card gets the one in its config (`--net hub,mac=02:00:00:00:00:42`); otherwise a hub port gives `02:ca:00:00:00:NN`, `NN` being the port's number on its hub in the order cards attach (from 1), and user networking `52:54:00:12:34:56`.
 - **Backends.** Where frames go is up to the host: Grail gives each card of each machine its own backend (`NetBackend` in the grail library: send a frame, poll for a received one). Both calls are made from the machine's run loop and never block, and backends are `Send`, so frames can cross to other threads: to another machine, a switch or a socket. `--net hub` puts the card on a port of an in-process **hub** (`grail::net::Hub`), shared by every `--net hub` of the process: a frame one port sends is queued for every other port (a repeater, not a switch: no address learning), up to 256 frames per port, beyond which that port's frames are dropped. Tests connect two machines in one process by giving their configs the same hub. `--net user` puts the card behind a NAT gateway of its own, which reaches the internet and the host (below). A host can hand Grail backends of its own with their MAC addresses (`Machine::with_devices`), after the configured cards. The Avalon server does that for its VMs: each card is a port of one of Avalon's **virtual switches** (`crates/avalon/src/switch.rs`), learning Ethernet switches that send a frame only to the port its destination address was learned on (flooding broadcasts and unknown destinations), each switch a network of its own; a card that is not plugged into a switch has its link down. The Avalon protocol document (section 6.7) describes them.
@@ -638,10 +793,16 @@ Test programs live in `crates/merlin/tests/cases/*.c`, each starting with `// ex
 
 ### Object and executable format
 
-**ELF32 (little-endian, EM_RISCV)**, a subset:
+**ELF64 (little-endian, EM_RISCV, `e_flags` 0: lp64 soft-float, no RVC)**, a subset. RV32 uses ELF32 with the same subset, until it is removed (#159); the steps of #141 bring each tool to ELF64:
 
+- **The objects of RV64 code:**
+  - lp64: `int` 32-bit; `long`, `long long` and pointers 64-bit;
+  - code linked at 0x8000_0000 is built with `-mcmodel=medany` (section 1);
+  - `.riscv.attributes` names `rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0`;
+  - 8-byte data that holds an address (`.dword`/`.quad`/`.8byte`) is `R_RISCV_64`;
+  - debug information is DWARF 5 with 8-byte addresses and 32-bit offsets (`R_RISCV_32` for the offsets into `.debug_*` sections).
 - Relocatable `.o`: sections `.text .data .rodata .bss`, `.symtab`, `.strtab`, `.rela.*`.
-- Relocations needed: `R_RISCV_32`, `R_RISCV_BRANCH`, `R_RISCV_JAL`, `R_RISCV_HI20`, `R_RISCV_LO12_I`, `R_RISCV_LO12_S`, `R_RISCV_PCREL_HI20`, `R_RISCV_PCREL_LO12_I/S`, `R_RISCV_CALL` and `R_RISCV_CALL_PLT` (what clang and merlin-as emit for `call`; without shared libraries it means the same). No linker relaxation: `R_RISCV_RELAX` hints are ignored, `R_RISCV_ALIGN` is an error (build with `-mno-relax`).
+- Relocations needed: `R_RISCV_64` (RV64 data), `R_RISCV_32`, `R_RISCV_BRANCH`, `R_RISCV_JAL`, `R_RISCV_HI20`, `R_RISCV_LO12_I`, `R_RISCV_LO12_S`, `R_RISCV_PCREL_HI20`, `R_RISCV_PCREL_LO12_I/S`, `R_RISCV_CALL` and `R_RISCV_CALL_PLT` (what clang and merlin-as emit for `call`; without shared libraries it means the same). No linker relaxation: `R_RISCV_RELAX` hints are ignored, `R_RISCV_ALIGN` is an error (build with `-mno-relax`).
 - Executable: `ET_EXEC`, program headers only for `PT_LOAD`, entry point in `e_entry`.
 
 Why ELF rather than a custom format: it costs little more to write, and it means clang/lld, `llvm-objdump` and `llvm-readelf` can check our output and produce reference files, and riscv-tests ELFs load directly. A custom format can still be added later as an exercise.
@@ -1153,4 +1314,19 @@ A process may have several threads, which share its address space, descriptors a
 9. **Camelot kernel** in C (built by clang at first, by merlin since #15): trap handling, timer, UART driver, then paging (Sv32), processes, a disk driver and buffer cache, syscalls and a user-space shell, a journaled filesystem (CMFS, `docs/camelot-fs.md`) with a host-side mkfs and fsck, file descriptors, pipes and programs run from the disk. Spinlocks, sleep locks and one lock order over every shared kernel structure (done, #61: "Kernel locking"), then the kernel on every hart of the machine, with one shared scheduler, IPIs and TLB shootdown (done, #63: "Kernel SMP").
 
    **Phase 9c, networking** (Ethernet and IPv4; issues #80 to #85): the network card in Grail with pluggable backends (an in-process hub, pcap capture; section 9.8), virtual Ethernet switches in Avalon connecting its VMs (protocol v3), a user-mode NAT gateway (DHCP, DNS, internet access and host port forwarding, in std Rust with no host driver) behind a Grail card or on an Avalon switch (protocol v5), and in the kernel a NIC driver, ARP, IPv4, ICMP, UDP (done, #83: `docs/camelot-net.md`), TCP (done, #84), socket syscalls and network tools (done, #85: `ping`, `ifconfig`, `nc`, `fetch`, `httpd`).
-10. **Self-hosting**: our tools running on our OS, rewritten in a language Merlin compiles, with the host tools as the bootstrap and the reference (section 10, "Self-hosting"; #23): a user address space big enough for them (#134, done), the assembler (#135, done), the linker (#136, done), then the compiler, once the Camelot language exists (#122).
+10. **Self-hosting**: our tools running on our OS, rewritten in a language Merlin compiles, with the host tools as the bootstrap and the reference (section 10, "Self-hosting"; #23): a user address space big enough for them (#134, done), the assembler (#135, done), the linker (#136, done), then the compiler, once the Camelot language exists (#122). The compiler step is paused until step 11 is done, so it is written once, for 64 bits.
+11. **64 bits** (#141): Excalibur becomes RV64.
+    - **What changes:** RV64IMA + Zicsr + Zifencei, Sv48 for Camelot (Sv39 too in Grail), the lp64 ABI and ELF64, the 64-bit device interface (section 9, version 2), 48-bit physical addresses and up to 1 TiB of lazily backed RAM.
+    - **The kernel:** a higher-half kernel in Linux's layout, with 16 KiB kernel stacks and guard pages, and a system call ABI with LP64 Linux widths.
+    - **The C subset:** `long long` and fixed-width types in merlin.
+    - **How:** each layer keeps RV32 working while it moves, in order:
+      - this spec (#142);
+      - the shared ISA crate and ELF64 (#143, #144);
+      - Grail (#145, #146, #147);
+      - merlin-as, merlin-ld and merlin-objdump (#148, #149, #150);
+      - RV64 programs end to end (#151);
+      - merlin (#152), merlin-dbg (#153);
+      - the kernel and user space (#154, #155, #156);
+      - the self-hosted tools (#157), the platform (#158).
+
+      Then RV32 is removed (#159). Paused meanwhile: #115, #116, #120, #121, #127, #133.

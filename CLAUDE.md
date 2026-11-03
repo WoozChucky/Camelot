@@ -56,4 +56,14 @@ cargo clippy --all-targets -- -D warnings
 cargo test --release
 ```
 
+A **docs-only** change touches only Markdown (`docs/`, READMEs, this file), and no code, build files, committed binaries or files that go into an image (such as `kernel/fs/`). For one, run only the tests that read documents, not the three checks above:
+
+```
+cargo test --release -p xtask --test boot --test fs --test kernel --test up -- the_rom_the_bootloader_mkfs_and_the_documents_agree the_spec_gives_the_root_images_size the_format_document_matches the_system_call_document_matches the_readme_quick_start
+cargo test --release -p avalon --test server -- the_readme_client_example
+cargo test --release -p lake --test avalon -- the_readme_lake_example
+```
+
+A new test that reads a document joins this list (`grep -rln '\.md' crates/*/tests` finds them). CI still runs everything.
+
 Formatting uses `rustfmt.toml` (max width 110). Branch per issue, PR description says `Closes #N`.
