@@ -102,9 +102,9 @@ fn read_phys(bus: &mut Bus, paddr: u64, size: u32) -> Result<u64, BusFault> {
     if size < 8 {
         return bus.read(addr, size).map(u64::from);
     }
-    // RAM or VRAM ([`Bus::is_memory`]), or RAM or the boot ROM (what `read_mem` reads).
-    let ram_or_rom = bus.read_mem(addr, 4).is_ok() && bus.read_mem(addr + 4, 4).is_ok();
-    if !bus.is_memory(addr, 8) && !ram_or_rom {
+    // RAM or VRAM ([`Bus::is_memory`]), else the boot ROM (which `read_mem` reads too).
+    let in_rom = || bus.read_mem(addr, 4).is_ok() && bus.read_mem(addr + 4, 4).is_ok();
+    if !bus.is_memory(addr, 8) && !in_rom() {
         return Err(BusFault);
     }
     let lo = bus.read(addr, 4)?;
