@@ -288,7 +288,7 @@ Unmapped accesses raise access-fault exceptions. Instructions and page tables li
 
 Camelot uses Sv48: 128 TiB of user address space and as much for the kernel, for one more level of table than Sv39. Linux on riscv64 likewise uses the largest mode the hart offers (Sv48 here). Sv39 is there because standard RV64 software (riscv-tests among it) uses it.
 
-**RV32:** Sv32 walks 2 levels of 1024 4-byte PTEs (PPN in bits 31:10) with 4 MiB megapages, and has no canonical-address rule.
+**RV32:** Sv32 walks 2 levels of 1024 4-byte PTEs (PPN in bits 31:10) with 4 MiB megapages, and has no canonical-address rule. Its 22-bit PPNs make 34-bit physical addresses: a table or a page at or above 4 GiB is an access fault, as there is nothing there.
 
 RAM: `--ram SIZE` takes a whole number of MiB, or a number with a unit, `M`/`MiB` or `G`/`GiB`, case-insensitive (`--ram 64`, `--ram 64M`, `--ram 16G`).
 - **Limits:** from 1 MiB to 1 TiB, the memory controller's limit. Anything else is rejected with an error. RV32: 1 to 2048 MiB, the most that fits between 0x8000_0000 and the top of the 32-bit address space.
@@ -395,7 +395,7 @@ Typical handler: claim, service the device until it lowers its line (for the UAR
 ## 8. Emulator conformance
 
 - Pass `riscv-tests` rv64ui-p-*, rv64um-p-*, rv64ua-p-*, rv64mi-p-* and rv64si-p-* (all but `rv64ui-p-ma_data`, section 4), and, while RV32 exists, rv32ui-p-*, rv32um-p-*, rv32ua-p-*, rv32mi-p-* and rv32si-p-* (all but `rv32ui-p-ma_data`). Tests are loaded as ELF, the class choosing the machine's width, and report via the test device (or `tohost` symbol).
-- **Grail on its way there** (#145 to #147). Its RV64 harts pass rv64ui (but `ma_data`), rv64um, rv64ua and rv64mi; rv64si needs the Sv39 walk (#146). Until #146, an RV64 `satp` accepts only MODE Bare (a write of Sv39 or Sv48 changes nothing, as for any MODE a hart does not implement). Until #147 widens the bus, physical addresses are 32-bit (above 4 GiB is an access fault), 8-byte loads work on RAM, VRAM and the boot ROM, and 8-byte stores on RAM and VRAM (anywhere else, a device register included, either is an access fault), and the boot ROM's entry word stays 32 bits, read with `lwu` on an RV64 machine. An RV64 machine does not boot from disk until the boot chain is RV64 (#151): the ROM's disk loader is RV32 code, so Grail refuses.
+- **Grail on its way there** (#145 to #147). Its RV64 harts pass every RV64 suite above, and walk Sv39 and Sv48 page tables. Until #147 widens the bus, physical addresses are 32-bit (above 4 GiB is an access fault), 8-byte loads work on RAM, VRAM and the boot ROM, and 8-byte stores on RAM and VRAM (anywhere else, a device register included, either is an access fault), and the boot ROM's entry word stays 32 bits, read with `lwu` on an RV64 machine. An RV64 machine does not boot from disk until the boot chain is RV64 (#151): the ROM's disk loader is RV32 code, so Grail refuses.
 - Prebuilt test ELFs, and the objects merlin-ld relinks, are committed to the repo so no cross toolchain is needed on Windows (`scripts/build-riscv-tests.sh` builds them with clang: `--target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax` for RV64; no relaxation, so merlin-ld can relink the objects).
 
 ## 9. Excalibur extensions (Xcal)
@@ -1333,7 +1333,7 @@ A process may have several threads, which share its address space, descriptors a
     - **How:** each layer keeps RV32 working while it moves, in order:
       - this spec (#142);
       - the shared ISA crate and ELF64 (#143, #144);
-      - Grail (#145, done; #146, #147);
+      - Grail (#145 and #146, done; #147);
       - merlin-as, merlin-ld and merlin-objdump (#148, #149, #150);
       - RV64 programs end to end (#151);
       - merlin (#152), merlin-dbg (#153);
