@@ -1,12 +1,13 @@
-//! Runs the prebuilt riscv-tests ELFs in `tests/riscv-tests/` (see
-//! `scripts/build-riscv-tests.sh`) plus the examples, and checks each exits 0.
+//! Runs the prebuilt riscv-tests ELFs in `tests/riscv-tests/` (RV32) and
+//! `tests/riscv-tests/rv64/` (see `scripts/build-riscv-tests.sh`) plus the examples, and
+//! checks each exits 0. The RV64 ones are ELF64 files, which make the machine RV64.
 
 use grail::{Machine, RunResult};
 use std::path::{Path, PathBuf};
 
 /// Excluded on purpose: assumes hardware misaligned access, which Excalibur traps
 /// instead (spec section 4).
-const EXCLUDED: &[&str] = &["rv32ui-p-ma_data"];
+const EXCLUDED: &[&str] = &["rv32ui-p-ma_data", "rv64ui-p-ma_data"];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -22,7 +23,10 @@ fn run(path: &Path) -> (RunResult, Vec<u8>) {
 }
 
 fn run_suite(prefix: &str) {
-    let dir = repo_root().join("tests/riscv-tests");
+    let dir = match &prefix[..4] {
+        "rv64" => repo_root().join("tests/riscv-tests/rv64"),
+        _ => repo_root().join("tests/riscv-tests"),
+    };
     let mut names: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -71,6 +75,26 @@ fn rv32mi() {
 #[test]
 fn rv32si() {
     run_suite("rv32si-p-");
+}
+
+#[test]
+fn rv64ui() {
+    run_suite("rv64ui-p-");
+}
+
+#[test]
+fn rv64um() {
+    run_suite("rv64um-p-");
+}
+
+#[test]
+fn rv64ua() {
+    run_suite("rv64ua-p-");
+}
+
+#[test]
+fn rv64mi() {
+    run_suite("rv64mi-p-");
 }
 
 #[test]
