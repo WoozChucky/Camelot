@@ -270,6 +270,34 @@ fn lw_sign_extends_and_lwu_zero_extends() {
     assert_eq!(x(&m, A0), 0x1234_5678_ffff_ffff);
 }
 
+/// An RV64 machine's sysinfo block is version 2 (spec section 9.5): its RAM size is a
+/// 64-bit register that one ld reads whole, and its 32-bit registers take no ld.
+#[test]
+fn sysinfo_is_version_2_on_rv64() {
+    use grail::sysinfo::{v2, REG_VERSION};
+    let sysinfo = grail::bus::SYSINFO_BASE;
+    let mut m = machine(Xlen::Rv64);
+    set(&mut m, A1, sysinfo);
+    run(
+        &mut m,
+        "lw a0, 4(a1)",
+        i_type(REG_VERSION as i32, A1, 2, A0, LOAD),
+    );
+    assert_eq!(x(&m, A0), 2);
+    let ram_size = v2::REG_RAM_SIZE as i32;
+    run(&mut m, "ld a0, 16(a1)", i_type(ram_size, A1, 3, A0, LOAD));
+    assert_eq!(x(&m, A0), m.config().ram_size as u64);
+    run(&mut m, "lwu a0, 20(a1)", i_type(ram_size + 4, A1, 6, A0, LOAD));
+    assert_eq!(x(&m, A0), m.config().ram_size as u64 >> 32);
+    run_traps(&mut m, "ld a0, 0(a1)", i_type(0, A1, 3, A0, LOAD), 5, sysinfo);
+
+    // An ELF64 program makes an RV32 machine's block version 2 too.
+    let mut m = Machine::with_ram(1 << 20);
+    assert_eq!(m.cpu.bus.read(sysinfo + u64::from(REG_VERSION), 4), Ok(1));
+    m.load_elf(&simple(Xlen::Rv64)).unwrap();
+    assert_eq!(m.cpu.bus.read(sysinfo + u64::from(REG_VERSION), 4), Ok(2));
+}
+
 #[test]
 fn word_atomics_sign_extend_and_touch_32_bits() {
     let mut m = machine(Xlen::Rv64);

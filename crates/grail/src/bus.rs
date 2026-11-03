@@ -191,9 +191,11 @@ impl Bus {
     }
 
     /// Makes the bus's harts `xlen` wide ([`crate::cpu::Cpu::set_xlen`]): the boot ROM's
-    /// code is written again for that width.
+    /// code is written again for that width, and the devices present that width's
+    /// interface version (spec section 9).
     pub(crate) fn set_xlen(&mut self, xlen: Xlen) {
         self.xlen = xlen;
+        self.sysinfo.set_xlen(xlen);
         if self.harts() > 1 {
             self.set_boot_entry(0);
         }
@@ -417,6 +419,9 @@ impl Bus {
         if let Some(off) = Self::offset_in(addr, CLINT_BASE, CLINT_SIZE) {
             return self.clint.read(off, size);
         }
+        if let Some(off) = Self::offset_in(addr, SYSINFO_BASE, SYSINFO_SIZE) {
+            return self.sysinfo.read(off, size);
+        }
         // Every other device has 32-bit registers only, for now.
         if size == 8 {
             return Err(BusFault);
@@ -436,8 +441,6 @@ impl Bus {
             self.fb.read(off, size)
         } else if let Some(off) = at(KBD_BASE, KBD_SIZE) {
             self.kbd.read(off, size)
-        } else if let Some(off) = at(SYSINFO_BASE, SYSINFO_SIZE) {
-            self.sysinfo.read(off, size)
         } else if let Some(off) = at(PTR_BASE, PTR_SIZE) {
             self.ptr.read(off, size)
         } else {
@@ -483,6 +486,9 @@ impl Bus {
         if let Some(off) = Self::offset_in(addr, CLINT_BASE, CLINT_SIZE) {
             return self.clint.write(off, size, val);
         }
+        if let Some(off) = Self::offset_in(addr, SYSINFO_BASE, SYSINFO_SIZE) {
+            return self.sysinfo.write(off, size, val);
+        }
         // Every other device has 32-bit registers only, for now.
         if size == 8 {
             return Err(BusFault);
@@ -516,8 +522,6 @@ impl Bus {
             self.fb.write(off, size, val)
         } else if let Some(off) = at(KBD_BASE, KBD_SIZE) {
             self.kbd.write(off, size, val)
-        } else if let Some(off) = at(SYSINFO_BASE, SYSINFO_SIZE) {
-            self.sysinfo.write(off, size, val)
         } else if let Some(off) = at(PTR_BASE, PTR_SIZE) {
             self.ptr.write(off, size, val)
         } else {
