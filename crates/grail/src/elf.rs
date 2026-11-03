@@ -1,7 +1,10 @@
 //! Loads executables: PT_LOAD segments, the entry point and symbol values.
-//! The parsing lives in the shared `elf32` crate.
+//! The parsing lives in the shared `elf` crate.
+//!
+//! This module is `grail::elf`; inside it, `elf::...` names the crate (a
+//! module's own name is not in scope within it), as in `elf::Elf::parse`.
 
-pub use elf32::Error as ElfError;
+pub use elf::Error as ElfError;
 
 pub struct Segment {
     pub paddr: u32,
@@ -18,27 +21,32 @@ pub struct Elf {
 }
 
 pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
-    let elf = elf32::Elf::parse(file)?;
+    let elf = elf::Elf::parse(file)?;
+    // Grail's harts are RV32 until the RV64 migration widens them, so it runs
+    // ELF32 programs, whose addresses and sizes all fit in 32 bits.
+    if elf.class != elf::Class::Elf32 {
+        return Err(ElfError("ELF64 (RV64) programs are not supported yet".into()));
+    }
     let mut segments = Vec::new();
-    for p in elf.segments.iter().filter(|p| p.ty == elf32::PT_LOAD) {
+    for p in elf.segments.iter().filter(|p| p.ty == elf::PT_LOAD) {
         segments.push(Segment {
-            paddr: p.paddr,
+            paddr: p.paddr as u32,
             data: elf.segment_data(p)?.to_vec(),
-            mem_size: p.memsz,
+            mem_size: p.memsz as u32,
         });
     }
     // Global and weak symbols first, then the locals: a name defined by
     // both (a `static` function in one file named like a global one in
-    // another) means the global one, as in `elf32::find_symbol`.
-    let mut defined: Vec<elf32::Symbol> = elf
+    // another) means the global one, as in `elf::find_symbol`.
+    let mut defined: Vec<elf::Symbol> = elf
         .symbols()?
         .into_iter()
         .filter(|s| !s.name.is_empty() && !s.is_undefined())
         .collect();
-    defined.sort_by_key(|s| s.bind() == elf32::STB_LOCAL);
-    let symbols = defined.into_iter().map(|s| (s.name, s.value)).collect();
+    defined.sort_by_key(|s| s.bind() == elf::STB_LOCAL);
+    let symbols = defined.into_iter().map(|s| (s.name, s.value as u32)).collect();
     Ok(Elf {
-        entry: elf.header.entry,
+        entry: elf.header.entry as u32,
         segments,
         symbols,
     })
@@ -53,7 +61,7 @@ impl Elf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use elf32::*;
+    use elf::*;
 
     /// A section-header-only ELF whose .symtab holds `syms` (name, value,
     /// binding), every one defined (SHN_ABS), after the null symbol.
@@ -112,6 +120,26 @@ mod tests {
         }
         out[..EHDR_SIZE].copy_from_slice(&h);
         out
+    }
+
+    /// Grail's harts are RV32: an RV64 program (ELF64) is refused, not read
+    /// with its addresses cut to 32 bits.
+    #[test]
+    fn elf64_programs_are_refused() {
+        let rv64 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../elf/tests/llvm/rv64/prog.elf"
+        ))
+        .unwrap();
+        let err = parse(&rv64).err().expect("refused");
+        assert_eq!(err.0, "ELF64 (RV64) programs are not supported yet");
+        // Its RV32 twin loads.
+        let rv32 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../elf/tests/llvm/rv32/prog.elf"
+        ))
+        .unwrap();
+        assert!(parse(&rv32).is_ok());
     }
 
     #[test]

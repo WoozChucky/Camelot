@@ -275,7 +275,7 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
 #[test]
 fn the_c_tools_tables_are_the_host_tools() {
     // kernel/user/as/tables.[ch] and kernel/user/ld/tables.[ch] are generated
-    // from merlin-as's, excalibur's and elf32's tables
+    // from merlin-as's, excalibur's and the elf crate's tables
     // (crates/xtask/src/c_tables.rs) by `cargo xtask kernel`.
     for (file, want) in xtask::c_tables::files() {
         let path = repo_root().join(file);
@@ -470,12 +470,12 @@ fn object(src: &str) -> Vec<u8> {
 /// `.rodata.str1.1` is: merlin-as writes none.
 fn mergeable(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
     let at = {
-        let elf = elf32::Elf::parse(&obj).unwrap();
+        let elf = elf::Elf::parse(&obj).unwrap();
         let i = elf.sections.iter().position(|s| s.name == name).unwrap();
         elf.header.shoff as usize + 40 * i
     };
     let flags = u32::from_le_bytes(obj[at + 8..at + 12].try_into().unwrap());
-    obj[at + 8..at + 12].copy_from_slice(&(flags | elf32::SHF_MERGE | elf32::SHF_STRINGS).to_le_bytes());
+    obj[at + 8..at + 12].copy_from_slice(&(flags | (elf::SHF_MERGE | elf::SHF_STRINGS) as u32).to_le_bytes());
     obj[at + 36..at + 40].copy_from_slice(&1u32.to_le_bytes());
     obj
 }

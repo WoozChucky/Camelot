@@ -97,7 +97,7 @@ pub fn sym(elf: &grail::elf::Elf, name: &str) -> u32 {
 /// The addresses of function `name` in the committed kernel.
 pub fn function(name: &str) -> Range<u32> {
     let file = committed_elf();
-    let s = elf32::Elf::parse(&file)
+    let s = elf::Elf::parse(&file)
         .unwrap()
         .symbols()
         .unwrap()
@@ -105,7 +105,7 @@ pub fn function(name: &str) -> Range<u32> {
         .find(|s| s.name == name)
         .unwrap_or_else(|| panic!("no symbol {name}"));
     assert!(s.size > 0, "{name} has no size");
-    s.value..s.value + s.size
+    s.value as u32..(s.value + s.size) as u32
 }
 
 pub fn peek(cpu: &Cpu, addr: u32) -> u32 {

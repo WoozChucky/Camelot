@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 excalibur = { path = "../excalibur" }
-elf32 = { path = "../elf32" }
+elf = { path = "../elf" }
 # The Avalon protocol, for disks on a Lake server (src/lake.rs).
 avalon-proto = { path = "../avalon-proto" }
 # The user-mode NAT gateway behind `--net user` (src/net/user.rs).

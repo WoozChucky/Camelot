@@ -9,7 +9,7 @@ license.workspace = true
 name = "merlin_ld"
 
 [dependencies]
-elf32 = { path = "../elf32" }
+elf = { path = "../elf" }
 
 [dev-dependencies]
 excalibur = { path = "../excalibur" }

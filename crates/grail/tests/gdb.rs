@@ -88,9 +88,9 @@ impl Client {
 
 fn symbol(elf: &str, name: &str) -> u32 {
     let file = std::fs::read(path(elf)).unwrap();
-    let elf = elf32::Elf::parse(&file).unwrap();
+    let elf = elf::Elf::parse(&file).unwrap();
     let s = elf.symbols().unwrap();
-    s.iter().find(|s| s.name == name).unwrap().value
+    s.iter().find(|s| s.name == name).unwrap().value as u32
 }
 
 fn le(v: u32) -> String {

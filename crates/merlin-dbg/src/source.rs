@@ -1,5 +1,5 @@
 //! Source lines: which line of which file each address comes from, from the
-//! programs' DWARF line tables (`.debug_line`, read through `elf32::lines`), and
+//! programs' DWARF line tables (`.debug_line`, read through `elf::lines`), and
 //! the source files themselves, for showing a line.
 //!
 //! A line table is a list of *rows*, each an address and the place in the source
@@ -56,10 +56,20 @@ pub struct Lines {
     texts: HashMap<String, Option<Vec<String>>>,
 }
 
+/// Parses an ELF file merlin-dbg can debug: an RV32 one (ELF32), whose
+/// addresses all fit in 32 bits, until merlin-dbg follows Excalibur to RV64.
+pub(crate) fn parse_elf32(file: &[u8]) -> Result<elf::Elf<'_>, String> {
+    let elf = elf::Elf::parse(file).map_err(|e| e.to_string())?;
+    if elf.class != elf::Class::Elf32 {
+        return Err("ELF64 (RV64) programs are not supported yet".into());
+    }
+    Ok(elf)
+}
+
 impl Lines {
     /// Adds the line tables of an executable (none if it has no `.debug_line`).
     pub fn add_elf(&mut self, file: &[u8]) -> Result<(), String> {
-        let elf = elf32::Elf::parse(file).map_err(|e| e.to_string())?;
+        let elf = parse_elf32(file)?;
         for table in elf.line_tables().map_err(|e| e.to_string())? {
             let ids: Vec<usize> = table
                 .files
@@ -84,7 +94,7 @@ impl Lines {
                     .iter()
                     .filter(|r| !r.end_sequence)
                     .map(|r| Row {
-                        addr: r.addr,
+                        addr: r.addr as u32,
                         file: ids.get(r.file).copied().unwrap_or(usize::MAX),
                         line: r.line,
                         is_stmt: r.is_stmt,
@@ -98,8 +108,8 @@ impl Lines {
                     continue;
                 }
                 self.runs.push(Run {
-                    start: first.addr,
-                    end: last.addr,
+                    start: first.addr as u32,
+                    end: last.addr as u32,
                     rows,
                 });
             }

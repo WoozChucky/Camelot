@@ -1945,7 +1945,7 @@ fn line_tables_are_kept_and_relocated() {
     let opts = Options::default();
     let linked = merlin_ld::link(&debug, &opts).unwrap();
     let without = merlin_ld::link(&plain, &opts).unwrap();
-    let elf = elf32::Elf::parse(&linked.elf).unwrap();
+    let elf = elf::Elf::parse(&linked.elf).unwrap();
     let names: Vec<&str> = elf.sections.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(
         names,
@@ -1961,8 +1961,8 @@ fn line_tables_are_kept_and_relocated() {
         ]
     );
     // Not loaded: the segments are the same as without the line tables.
-    let segments = |file: &[u8]| -> Vec<(u32, Vec<u8>)> {
-        let e = elf32::Elf::parse(file).unwrap();
+    let segments = |file: &[u8]| -> Vec<(u64, Vec<u8>)> {
+        let e = elf::Elf::parse(file).unwrap();
         e.segments
             .iter()
             .map(|p| (p.vaddr, e.segment_data(p).unwrap().to_vec()))
@@ -1973,7 +1973,7 @@ fn line_tables_are_kept_and_relocated() {
     // made from each table's own strings (the line_strp offsets relocated).
     let text = elf.sections.iter().find(|s| s.name == ".text").unwrap().addr;
     let tables = elf.line_tables().unwrap();
-    let rows: Vec<Vec<(u32, &str, u32, bool)>> = tables
+    let rows: Vec<Vec<(u64, &str, u32, bool)>> = tables
         .iter()
         .map(|t| {
             assert_eq!(t.sequences.len(), 1);
@@ -2003,6 +2003,19 @@ fn line_tables_are_kept_and_relocated() {
     // changes nothing.
     assert_eq!(merlin_ld::strip_debug(&linked.elf).unwrap(), without.elf);
     assert_eq!(merlin_ld::strip_debug(&without.elf).unwrap(), without.elf);
+    // An RV64 program (with debug sections) is refused, not cut at ELF32's
+    // offsets.
+    let rv64 = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../elf/tests/llvm/rv64/prog.elf"
+    ))
+    .unwrap();
+    let err = merlin_ld::strip_debug(&rv64).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("ELF64 (RV64) files are not supported yet"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -2025,8 +2038,8 @@ gone:
     };
     let opts = script("SECTIONS { . = 0x1000; .text : { *(.text) } /DISCARD/ : { *(.text.gone) } }");
     let linked = merlin_ld::link(&[obj], &opts).unwrap();
-    let elf = elf32::Elf::parse(&linked.elf).unwrap();
+    let elf = elf::Elf::parse(&linked.elf).unwrap();
     let seqs = &elf.line_tables().unwrap()[0].sequences;
-    let starts: Vec<(u32, u32)> = seqs.iter().map(|s| (s.rows[0].addr, s.rows[0].line)).collect();
+    let starts: Vec<(u64, u32)> = seqs.iter().map(|s| (s.rows[0].addr, s.rows[0].line)).collect();
     assert_eq!(starts, [(0x1000, 1), (0, 7)]);
 }

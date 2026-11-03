@@ -1541,7 +1541,7 @@ fn uart_access(cpu: &grail::cpu::Cpu) -> Option<(u32, bool, u32)> {
 /// value and size.
 fn function(name: &str) -> std::ops::Range<u32> {
     let file = committed_elf();
-    let s = elf32::Elf::parse(&file)
+    let s = elf::Elf::parse(&file)
         .unwrap()
         .symbols()
         .unwrap()
@@ -1549,7 +1549,7 @@ fn function(name: &str) -> std::ops::Range<u32> {
         .find(|s| s.name == name)
         .unwrap_or_else(|| panic!("no symbol {name}"));
     assert!(s.size > 0, "{name} has no size");
-    s.value..s.value + s.size
+    s.value as u32..(s.value + s.size) as u32
 }
 
 /// Whether the instruction about to run is in `f`, or in a leaf helper `f`
@@ -2163,37 +2163,38 @@ fn user_program(name: &str) -> xtask::userprogs::Program {
 
 /// The value of symbol `name` in user program `elf`.
 fn user_sym(elf: &[u8], name: &str) -> u32 {
-    elf32::Elf::parse(elf)
+    elf::Elf::parse(elf)
         .unwrap()
         .symbols()
         .unwrap()
         .into_iter()
         .find(|s| s.name == name)
         .unwrap_or_else(|| panic!("no symbol {name}"))
-        .value
+        .value as u32
 }
 
 /// The user pages a program's ELF image asks for, as (va, PTE permissions),
 /// then its stack page: what the process's page table must map below
 /// USER_TOP.
 fn expected_user_pages(elf: &[u8]) -> Vec<(u32, u32)> {
-    let parsed = elf32::Elf::parse(elf).unwrap();
+    let parsed = elf::Elf::parse(elf).unwrap();
     let mut pages = Vec::new();
     for seg in parsed
         .segments
         .iter()
-        .filter(|s| s.ty == elf32::PT_LOAD && s.memsz > 0)
+        .filter(|s| s.ty == elf::PT_LOAD && s.memsz > 0)
     {
         let mut perm = PTE_V | PTE_U | PTE_R;
-        if seg.flags & elf32::PF_W != 0 {
+        if seg.flags & elf::PF_W != 0 {
             perm |= PTE_W;
         }
-        if seg.flags & elf32::PF_X != 0 {
+        if seg.flags & elf::PF_X != 0 {
             perm |= PTE_X;
         }
-        let first = seg.vaddr & !(PAGE - 1);
+        let (vaddr, memsz) = (seg.vaddr as u32, seg.memsz as u32);
+        let first = vaddr & !(PAGE - 1);
         let mut va = first;
-        while va < seg.vaddr + seg.memsz {
+        while va < vaddr + memsz {
             pages.push((va, perm));
             va += PAGE;
         }
@@ -2906,7 +2907,7 @@ fn programs_link_only_the_library_members_they_need() {
     // never calls, such as strtol.
     let has = |prog: &str, name: &str| {
         let p = user_program(prog);
-        let syms = elf32::Elf::parse(&p.elf).unwrap().symbols().unwrap();
+        let syms = elf::Elf::parse(&p.elf).unwrap().symbols().unwrap();
         syms.iter().any(|s| s.name == name)
     };
     for (prog, name, want) in [
@@ -3152,13 +3153,13 @@ fn stress_runs_many_processes_through_the_locks() {
     }
     // A worker in spin() is inside heap_round, between the sbrk that grows
     // its heap and the one that shrinks it.
-    let spin = elf32::Elf::parse(&user_program("stress").elf)
+    let spin = elf::Elf::parse(&user_program("stress").elf)
         .unwrap()
         .symbols()
         .unwrap()
         .into_iter()
         .find(|s| s.name == "spin")
-        .map(|s| s.value..s.value + s.size)
+        .map(|s| s.value as u32..(s.value + s.size) as u32)
         .unwrap();
     assert!(!spin.is_empty());
     // Every switch from a stress process to another process in U-mode, and
@@ -3362,16 +3363,31 @@ fn the_elf_loader_refuses_bad_images() {
     // for the patches that keep the image good), leak nothing, and leave the
     // kernel running.
     let hello = user_program("hello");
-    let parsed = elf32::Elf::parse(&hello.elf).unwrap();
-    let phoff = parsed.header.phoff;
+    let parsed = elf::Elf::parse(&hello.elf).unwrap();
+    // hello is ELF32: the fields patched below are 4 bytes.
+    let phoff = parsed.header.phoff as u32;
     let size = hello.elf.len() as u32;
     let loads: Vec<u32> = (0..u32::from(parsed.header.phnum))
-        .filter(|&i| parsed.segments[i as usize].ty == elf32::PT_LOAD)
+        .filter(|&i| parsed.segments[i as usize].ty == elf::PT_LOAD)
         .collect();
     assert_eq!(loads.len(), 2, "hello: text and rodata");
-    let ph = |i: u32, field: u32| phoff + elf32::PHDR_SIZE as u32 * loads[i as usize] + field;
-    let text = &parsed.segments[loads[0] as usize];
-    let rodata = &parsed.segments[loads[1] as usize];
+    let ph = |i: u32, field: u32| phoff + elf::PHDR_SIZE as u32 * loads[i as usize] + field;
+    struct Load {
+        offset: u32,
+        vaddr: u32,
+        filesz: u32,
+        memsz: u32,
+    }
+    let load = |i: u32| {
+        let p = &parsed.segments[loads[i as usize] as usize];
+        Load {
+            offset: p.offset as u32,
+            vaddr: p.vaddr as u32,
+            filesz: p.filesz as u32,
+            memsz: p.memsz as u32,
+        }
+    };
+    let (text, rodata) = (&load(0), &load(1));
     // The cases rely on this layout: the text from the first page on, then
     // less than a page of rodata on a page of its own.
     assert_eq!(text.vaddr, USER_TEXT);
@@ -3383,7 +3399,7 @@ fn the_elf_loader_refuses_bad_images() {
     // rodata, given a whole page, ends right at USER_LOAD_TOP.
     let high_rodata = USER_LOAD_TOP - PAGE;
     let high_text = high_rodata - (rodata.vaddr - text.vaddr);
-    let entry = parsed.header.entry;
+    let entry = parsed.header.entry as u32;
     let moved_high = |rodata_memsz: u32| -> Vec<(u32, [u8; 4])> {
         vec![
             (E_ENTRY, (entry - text.vaddr + high_text).to_le_bytes()),
@@ -4504,7 +4520,7 @@ fn clang_reference_build_behaves_like_merlins() {
     let clang_user = dir.join("user");
     let merlin_elf = committed_elf();
     for (name, elf) in [("merlin", &merlin_elf), ("clang", &clang_elf)] {
-        let e = elf32::Elf::parse(elf).unwrap();
+        let e = elf::Elf::parse(elf).unwrap();
         let size = |s: &str| e.sections.iter().find(|x| x.name == s).map_or(0, |x| x.size);
         eprintln!(
             "{name}: .text {} bytes, .rodata {} bytes, .data {} bytes, .bss {} bytes",
@@ -4566,9 +4582,9 @@ fn merlin_as_and_merlin_ld_take_the_reference_builds_place() {
     // The layout follows kernel.ld like ld.lld's: same sections, .text
     // where ld.lld put it, page-aligned .rodata and .data, NOBITS .bss and
     // .stack, nothing from /DISCARD/.
-    let ours = elf32::Elf::parse(&linked.elf).unwrap();
-    let theirs = elf32::Elf::parse(&lld_elf).unwrap();
-    let alloc = |e: &elf32::Elf| -> Vec<(String, u32, bool)> {
+    let ours = elf::Elf::parse(&linked.elf).unwrap();
+    let theirs = elf::Elf::parse(&lld_elf).unwrap();
+    let alloc = |e: &elf::Elf| -> Vec<(String, u64, bool)> {
         e.sections
             .iter()
             .filter(|s| s.flags & 2 != 0)
@@ -4576,7 +4592,7 @@ fn merlin_as_and_merlin_ld_take_the_reference_builds_place() {
             .collect()
     };
     let (a, b) = (alloc(&ours), alloc(&theirs));
-    let names = |v: &[(String, u32, bool)]| v.iter().map(|x| (x.0.clone(), x.2)).collect::<Vec<_>>();
+    let names = |v: &[(String, u64, bool)]| v.iter().map(|x| (x.0.clone(), x.2)).collect::<Vec<_>>();
     assert_eq!(names(&a), names(&b));
     assert_eq!(a[0], b[0], ".text");
     for (name, addr, _) in &a {

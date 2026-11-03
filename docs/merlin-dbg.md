@@ -241,7 +241,7 @@ An ADDR is any of these, optionally followed by `+N` or `-N`:
 - a symbol (`main`, `puts+8`);
 - a register (`$sp`, `$a0`, `$x5`, `$pc`, `$mstatus`).
 
-Symbols come from the ELF symbol table (through `elf32`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one.
+Symbols come from the ELF symbol table (through `elf`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one.
 
 Each stop shows its reason, then the instruction at the pc, then its source line if the line tables have one (`kernel/main.c:275:     cpu_init();`, the text left out when the file cannot be found):
 
@@ -297,7 +297,7 @@ In each case `ra` holds the return address and `s0` is still the caller's frame 
 
 ### Source lines
 
-The line tables (`.debug_line`, the spec's section 10, "Debug information") map each address to a file and a line. merlin-dbg reads them from the program and from each `add-symbol-file` (`crates/merlin-dbg/src/source.rs`, through `elf32::lines`). A row marked `is_stmt` starts a statement: merlin writes one before each statement, a function's first line before its prologue, a loop's condition and step, and the closing brace before the epilogue, and marks the first statement after the prologue `prologue_end`.
+The line tables (`.debug_line`, the spec's section 10, "Debug information") map each address to a file and a line. merlin-dbg reads them from the program and from each `add-symbol-file` (`crates/merlin-dbg/src/source.rs`, through `elf::lines`). A row marked `is_stmt` starts a statement: merlin writes one before each statement, a function's first line before its prologue, a loop's condition and step, and the closing brace before the epilogue, and marks the first statement after the prologue `prologue_end`.
 
 - **`break FILE:LINE`**: FILE is the path the line table has (`kernel/main.c`) or its end after a `/` (`main.c`). The breakpoint goes at the lowest address of a statement on that line in each function that has one (a `for` line has several statements: its initialization first). A line with no code, such as a comment or a declaration without an initializer, means the next line that has some, as in gdb, and merlin-dbg says so. A function's first line is its first instruction, before the prologue; `break FUNC` is the same place.
 - **`step` and `next`** run instructions until the pc is at the start of a statement on another line. A call on the way runs to its return under `next`, a temporary breakpoint as `nexti` uses. `step` follows it into the function, and stops past its prologue, at its `prologue_end` row (or its second row). A function with no line information, an assembly one, is run to its return instead, as gdb does. A return stops in the caller, on the line of the call, wherever in it the pc is. Any other stop on the way (a breakpoint, a watchpoint, another hart's) ends the command, and Ctrl-C does too. A line that never ends (`for (;;);`) is given up after a million instructions.

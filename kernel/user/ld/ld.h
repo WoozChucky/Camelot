@@ -16,7 +16,7 @@
  *   relocate.c  the sections' contents, relocated (relocate.rs)
  *   write.c     the ELF executable (write.rs)
  *   tables.h    the relocation types' numbers and names, generated from
- *   tables.c    elf32's (crates/xtask/src/c_tables.rs)
+ *   tables.c    the elf crate's (crates/xtask/src/c_tables.rs)
  *
  * The 64-bit arithmetic merlin-ld does with Rust's i64 and u64 (addresses
  * up to 4 GiB exactly, relocation ranges) is lib/i64.c's. Not here: the
@@ -87,7 +87,7 @@ void umap_put(struct uintmap *m, uint key, int value);
 
 /* ---- Objects (object.c) ---- */
 /* The ELF constants (SHT_*, SHF_*, SHN_*, STB_*, STT_*) are tables.h's,
- * generated from elf32's. */
+ * generated from the elf crate's. */
 
 /* One Elf32_Rela. */
 struct rela {

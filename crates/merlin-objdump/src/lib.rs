@@ -17,7 +17,7 @@
 pub mod cli;
 mod disasm;
 
-use elf32::{Elf, Error, Section, Symbol};
+use elf::{Elf, Error, Section, Symbol};
 use std::fmt::Write;
 
 /// What to print, mirroring llvm-objdump's options.
@@ -88,6 +88,11 @@ impl Options {
 /// Dumps one file. `name` is printed in the header line, as given.
 pub fn dump(name: &str, data: &[u8], opts: &Options) -> Result<String, Error> {
     let elf = Elf::parse(data)?;
+    // RV64 (ELF64) comes with the RV64 migration's objdump step; until then
+    // every address printed here is a 32-bit one.
+    if elf.class != elf::Class::Elf32 {
+        return Err(Error("ELF64 (RV64) is not supported yet".into()));
+    }
     let mut out = String::new();
     let _ = writeln!(out, "\n{name}:\tfile format elf32-littleriscv");
     if opts.file_headers {
@@ -123,19 +128,19 @@ fn program_headers(out: &mut String, elf: &Elf) {
     let _ = writeln!(out, "\nProgram Header:");
     for p in &elf.segments {
         let ty = match p.ty {
-            elf32::PT_DYNAMIC => " DYNAMIC",
-            elf32::PT_GNU_EH_FRAME => "EH_FRAME",
-            elf32::PT_GNU_RELRO => "   RELRO",
-            elf32::PT_GNU_STACK => "   STACK",
-            elf32::PT_INTERP => "  INTERP",
-            elf32::PT_LOAD => "    LOAD",
-            elf32::PT_NOTE => "    NOTE",
-            elf32::PT_PHDR => "    PHDR",
-            elf32::PT_TLS => "     TLS",
+            elf::PT_DYNAMIC => " DYNAMIC",
+            elf::PT_GNU_EH_FRAME => "EH_FRAME",
+            elf::PT_GNU_RELRO => "   RELRO",
+            elf::PT_GNU_STACK => "   STACK",
+            elf::PT_INTERP => "  INTERP",
+            elf::PT_LOAD => "    LOAD",
+            elf::PT_NOTE => "    NOTE",
+            elf::PT_PHDR => "    PHDR",
+            elf::PT_TLS => "     TLS",
             _ => " UNKNOWN",
         };
         // llvm-objdump prints log2 of the alignment; 0 has 64 trailing zero bits.
-        let align = (p.align as u64).trailing_zeros();
+        let align = p.align.trailing_zeros();
         let flag = |bit, c| if p.flags & bit != 0 { c } else { '-' };
         let _ = writeln!(
             out,
@@ -147,9 +152,9 @@ fn program_headers(out: &mut String, elf: &Elf) {
             "         filesz 0x{:08x} memsz 0x{:08x} flags {}{}{}",
             p.filesz,
             p.memsz,
-            flag(elf32::PF_R, 'r'),
-            flag(elf32::PF_W, 'w'),
-            flag(elf32::PF_X, 'x')
+            flag(elf::PF_R, 'r'),
+            flag(elf::PF_W, 'w'),
+            flag(elf::PF_X, 'x')
         );
     }
     let _ = writeln!(out, "\nDynamic Section:");
@@ -165,7 +170,7 @@ fn section_kind(s: &Section) -> String {
     if s.is_alloc() && !s.is_exec() && !s.is_nobits() {
         kinds.push("DATA");
     }
-    if s.is_nobits() && s.flags & (elf32::SHF_ALLOC | elf32::SHF_WRITE) != 0 {
+    if s.is_nobits() && s.flags & (elf::SHF_ALLOC | elf::SHF_WRITE) != 0 {
         kinds.push("BSS");
     }
     if s.name.starts_with(".debug") || s.name.starts_with(".zdebug") || s.name == ".gdb_index" {
@@ -199,9 +204,9 @@ fn section_headers(out: &mut String, elf: &Elf) {
 /// Name of the section a symbol is defined in, or `*ABS*` / `*UND*` / `*COM*`.
 fn symbol_section<'a>(elf: &'a Elf, s: &Symbol) -> &'a str {
     match s.shndx {
-        elf32::SHN_ABS => "*ABS*",
-        elf32::SHN_COMMON => "*COM*",
-        elf32::SHN_UNDEF => "*UND*",
+        elf::SHN_ABS => "*ABS*",
+        elf::SHN_COMMON => "*COM*",
+        elf::SHN_UNDEF => "*UND*",
         i => elf.sections.get(i as usize).map_or("*UND*", |s| s.name.as_str()),
     }
 }
@@ -209,7 +214,7 @@ fn symbol_section<'a>(elf: &'a Elf, s: &Symbol) -> &'a str {
 /// The name a symbol is shown with: section symbols take their section's name.
 fn symbol_name<'a>(elf: &'a Elf, s: &'a Symbol) -> &'a str {
     match (s.ty(), s.section()) {
-        (elf32::STT_SECTION, Some(i)) => elf.sections.get(i).map_or("", |s| s.name.as_str()),
+        (elf::STT_SECTION, Some(i)) => elf.sections.get(i).map_or("", |s| s.name.as_str()),
         _ => &s.name,
     }
 }
@@ -217,24 +222,24 @@ fn symbol_name<'a>(elf: &'a Elf, s: &'a Symbol) -> &'a str {
 fn symbol_table(out: &mut String, elf: &Elf) -> Result<(), Error> {
     let _ = writeln!(out, "\nSYMBOL TABLE:");
     for s in elf.symbols()?.iter().skip(1) {
-        let weak = s.bind() == elf32::STB_WEAK;
-        let common = s.shndx == elf32::SHN_COMMON;
+        let weak = s.bind() == elf::STB_WEAK;
+        let common = s.shndx == elf::SHN_COMMON;
         let glob_loc = match s.bind() {
             10 => 'u', // STB_GNU_UNIQUE
-            _ if weak || (s.section().is_none() && s.shndx != elf32::SHN_ABS) => ' ',
-            elf32::STB_LOCAL => 'l',
+            _ if weak || (s.section().is_none() && s.shndx != elf::SHN_ABS) => ' ',
+            elf::STB_LOCAL => 'l',
             _ => 'g',
         };
         let ifunc = if s.ty() == 10 { 'i' } else { ' ' }; // STT_GNU_IFUNC
-        let debug = if matches!(s.ty(), elf32::STT_SECTION | elf32::STT_FILE) {
+        let debug = if matches!(s.ty(), elf::STT_SECTION | elf::STT_FILE) {
             'd'
         } else {
             ' '
         };
         let kind = match s.ty() {
-            elf32::STT_FILE => 'f',
-            elf32::STT_FUNC => 'F',
-            elf32::STT_OBJECT | elf32::STT_COMMON | elf32::STT_TLS => 'O',
+            elf::STT_FILE => 'f',
+            elf::STT_FUNC => 'F',
+            elf::STT_OBJECT | elf::STT_COMMON | elf::STT_TLS => 'O',
             _ => ' ',
         };
         let weak = if weak { 'w' } else { ' ' };
@@ -266,17 +271,17 @@ pub(crate) struct RelocSection {
     /// The symbol table they refer to (`sh_link`).
     pub symbols: Vec<Symbol>,
     /// In file order, as `-r` prints them (`-dr` sorts its own copy).
-    pub relocs: Vec<elf32::Rela>,
+    pub relocs: Vec<elf::Rela>,
 }
 
 /// Every relocation section in the file, in file order.
 pub(crate) fn relocation_sections(elf: &Elf) -> Result<Vec<RelocSection>, Error> {
     let mut out = Vec::new();
     for s in &elf.sections {
-        if s.ty == elf32::SHT_RELA || s.ty == elf32::SHT_REL {
+        if s.ty == elf::SHT_RELA || s.ty == elf::SHT_REL {
             let relocs = elf.relocations(s)?;
             let symbols = match elf.sections.get(s.link as usize) {
-                Some(symtab) if symtab.ty == elf32::SHT_SYMTAB => elf.symbols_in(symtab)?,
+                Some(symtab) if symtab.ty == elf::SHT_SYMTAB => elf.symbols_in(symtab)?,
                 _ => elf.symbols()?,
             };
             out.push(RelocSection {
@@ -291,11 +296,11 @@ pub(crate) fn relocation_sections(elf: &Elf) -> Result<Vec<RelocSection>, Error>
 
 /// `R_RISCV_PCREL_HI20`, or `Unknown` for a type we have no name for.
 pub(crate) fn reloc_type(ty: u32) -> &'static str {
-    elf32::reloc_name(ty).unwrap_or("Unknown")
+    elf::reloc_name(ty).unwrap_or("Unknown")
 }
 
 /// What a relocation points at: `symbol`, `symbol+0x8`, `.rodata-0x4`, or `*ABS*`.
-pub(crate) fn reloc_value(elf: &Elf, symbols: &[Symbol], r: &elf32::Rela) -> String {
+pub(crate) fn reloc_value(elf: &Elf, symbols: &[Symbol], r: &elf::Rela) -> String {
     let mut v = match symbols.get(r.sym as usize).filter(|_| r.sym != 0) {
         Some(s) => symbol_name(elf, s).to_string(),
         None => "*ABS*".to_string(),
@@ -329,8 +334,8 @@ fn relocations(out: &mut String, elf: &Elf) -> Result<(), Error> {
 fn contents(out: &mut String, elf: &Elf) -> Result<(), Error> {
     for s in elf.sections.iter().filter(|s| s.size > 0) {
         let _ = writeln!(out, "Contents of section {}:", s.name);
-        if s.is_nobits() && s.flags & (elf32::SHF_ALLOC | elf32::SHF_WRITE) != 0 {
-            let end = s.addr as u64 + s.size as u64;
+        if s.is_nobits() && s.flags & (elf::SHF_ALLOC | elf::SHF_WRITE) != 0 {
+            let end = s.addr + s.size;
             let _ = writeln!(
                 out,
                 "<skipping contents of bss section at [{:04x}, {end:04x})>",
@@ -340,7 +345,7 @@ fn contents(out: &mut String, elf: &Elf) -> Result<(), Error> {
         }
         let data = elf.section_data(s)?;
         for (row, chunk) in data.chunks(16).enumerate() {
-            let _ = write!(out, " {:04x} ", s.addr as u64 + row as u64 * 16);
+            let _ = write!(out, " {:04x} ", s.addr + row as u64 * 16);
             for i in 0..16 {
                 if i != 0 && i % 4 == 0 {
                     out.push(' ');

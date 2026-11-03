@@ -1,4 +1,4 @@
-//! The program's symbols, from its ELF symbol table (through `elf32`): names for
+//! The program's symbols, from its ELF symbol table (through `elf`): names for
 //! addresses (`break main`) and addresses for names (`0x80000024 <puts+4>`).
 
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ impl Symbols {
     /// Adds the symbols of another ELF file (`add-symbol-file`): a user program
     /// next to the kernel. Of a name defined in both, the first file's is kept.
     pub fn add_elf(&mut self, file: &[u8]) -> Result<(), String> {
-        let elf = elf32::Elf::parse(file).map_err(|e| e.to_string())?;
+        let elf = crate::source::parse_elf32(file)?;
         let mut found = Vec::new();
         for s in elf.symbols().map_err(|e| e.to_string())? {
             if s.name.is_empty()
@@ -54,7 +54,7 @@ impl Symbols {
             }
             // Of several at one address: a function first, then a global name.
             let rank = (s.ty() != STT_FUNC, s.bind() == STB_LOCAL);
-            found.push((s.value, rank, s.name.clone(), s.size));
+            found.push((s.value as u32, rank, s.name.clone(), s.size as u32));
         }
         // A name defined twice in the file (two files' `static` functions):
         // the lowest address.
@@ -151,6 +151,21 @@ mod tests {
         assert_eq!(s.describe(0x7fff_fffc), None);
         assert_eq!(s.show(0x8000_0024), "0x80000024 <puts+4>");
         assert_eq!(s.show(0x1000), "0x00001000");
+    }
+
+    /// merlin-dbg debugs RV32 programs: an RV64 one (ELF64) is refused, for
+    /// its symbols and its line tables, not read with its addresses cut.
+    #[test]
+    fn elf64_programs_are_refused() {
+        let rv64 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../elf/tests/llvm/rv64/prog.elf"
+        ))
+        .unwrap();
+        let want = Err("ELF64 (RV64) programs are not supported yet".to_string());
+        assert_eq!(Symbols::from_elf(&rv64).map(|_| ()), want);
+        let mut lines = crate::source::Lines::default();
+        assert_eq!(lines.add_elf(&rv64), want);
     }
 
     #[test]

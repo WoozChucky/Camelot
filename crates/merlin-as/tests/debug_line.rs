@@ -11,11 +11,11 @@ use std::path::Path;
 const STT_SECTION: u8 = 3;
 
 /// A relocation: offset, type, and the place it points at (section name, offset).
-type Reloc = (u32, u32, String, i64);
+type Reloc = (u64, u32, String, i64);
 
 /// The `.debug_*` sections of an object: contents and relocations, by name.
 fn debug_sections(file: &[u8]) -> BTreeMap<String, (Vec<u8>, Vec<Reloc>)> {
-    let elf = elf32::Elf::parse(file).unwrap();
+    let elf = elf::Elf::parse(file).unwrap();
     let symbols = elf.symbols().unwrap();
     let mut out = BTreeMap::new();
     for s in &elf.sections {
@@ -35,10 +35,10 @@ fn debug_sections(file: &[u8]) -> BTreeMap<String, (Vec<u8>, Vec<Reloc>)> {
             let sym = &symbols[r.sym as usize];
             let (place, value) = match sym.section() {
                 Some(sec) if sym.ty() == STT_SECTION => (elf.sections[sec].name.clone(), 0),
-                Some(sec) => (elf.sections[sec].name.clone(), i64::from(sym.value)),
+                Some(sec) => (elf.sections[sec].name.clone(), sym.value as i64),
                 None => (sym.name.clone(), 0),
             };
-            relocs.push((r.offset, r.ty, place, value + i64::from(r.addend)));
+            relocs.push((r.offset, r.ty, place, value + r.addend));
         }
         relocs.sort();
     }
@@ -106,13 +106,13 @@ fn debug_sections_match_llvm() {
     assert!(fails.is_empty(), "{}", fails.join("\n\n"));
 }
 
-/// The rows elf32 reads from an object, with their sections' names:
+/// The rows the elf crate reads from an object, with their sections' names:
 /// (section, [(address, path, line, column, is_stmt, prologue_end,
 /// epilogue_begin, end)]).
-type Rows = Vec<(String, Vec<(u32, String, u32, u32, bool, bool, bool, bool)>)>;
+type Rows = Vec<(String, Vec<(u64, String, u32, u32, bool, bool, bool, bool)>)>;
 
 fn rows(file: &[u8]) -> Rows {
-    let elf = elf32::Elf::parse(file).unwrap();
+    let elf = elf::Elf::parse(file).unwrap();
     let mut out = Vec::new();
     for t in elf.line_tables().unwrap() {
         for seq in &t.sequences {

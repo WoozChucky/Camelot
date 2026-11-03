@@ -78,9 +78,9 @@ pub const R_RISCV_RVC_JUMP: u32 = 45;
 pub const R_RISCV_RELAX: u32 = 51;
 
 /// The psABI name of a relocation type, for diagnostics (from the table
-/// shared with merlin-objdump in [`elf32::reloc_name`]).
+/// shared with merlin-objdump in [`elf::reloc_name`]).
 pub fn name(ty: u32) -> String {
-    elf32::reloc_name(ty).map_or_else(|| format!("relocation type {ty}"), str::to_string)
+    elf::reloc_name(ty).map_or_else(|| format!("relocation type {ty}"), str::to_string)
 }
 
 /// One `R_RISCV_PCREL_HI20` site, resolved: what a `PCREL_LO12` needs.

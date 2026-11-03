@@ -166,15 +166,15 @@ fn grep<'a>(text: &'a str, pat: &str, invert: bool) -> Vec<(usize, &'a str)> {
 /// highest segment, which `ps` reports as its size.
 fn size_of(fs: &Fs, prog: &str) -> u32 {
     let elf = fs.read_file(&format!("/bin/{prog}")).unwrap();
-    let elf = elf32::Elf::parse(&elf).unwrap();
+    let elf = elf::Elf::parse(&elf).unwrap();
     let end = elf
         .segments
         .iter()
-        .filter(|p| p.ty == elf32::PT_LOAD)
+        .filter(|p| p.ty == elf::PT_LOAD)
         .map(|p| p.vaddr + p.memsz)
         .max()
         .unwrap();
-    end.next_multiple_of(4096)
+    end.next_multiple_of(4096) as u32
 }
 
 /// The shell's line after a program that exited with `status`.

@@ -1,0 +1,8 @@
+[package]
+name = "elf"
+description = "ELF32 and ELF64 little-endian RISC-V reader shared by Grail, merlin-objdump, merlin-ld and merlin-dbg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

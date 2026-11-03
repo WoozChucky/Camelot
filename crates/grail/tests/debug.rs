@@ -18,13 +18,13 @@ fn read(path: &str) -> Vec<u8> {
 }
 
 fn symbol(elf: &[u8], name: &str) -> u32 {
-    let elf = elf32::Elf::parse(elf).unwrap();
+    let elf = elf::Elf::parse(elf).unwrap();
     let symbols = elf.symbols().unwrap();
     symbols
         .iter()
         .find(|s| s.name == name)
         .unwrap_or_else(|| panic!("no symbol {name}"))
-        .value
+        .value as u32
 }
 
 /// A shared buffer the UART writes to.

@@ -10,7 +10,7 @@ name = "merlin_objdump"
 
 [dependencies]
 excalibur = { path = "../excalibur" }
-elf32 = { path = "../elf32" }
+elf = { path = "../elf" }
 
 [dev-dependencies]
 merlin-as = { path = "../merlin-as" }

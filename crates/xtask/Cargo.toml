@@ -14,7 +14,7 @@ camelot-fs = { path = "../camelot-fs" }
 # The C tools' tables (c_tables.rs): opcodes, register, CSR and relocation names.
 excalibur = { path = "../excalibur" }
 # The C linker's relocation names (c_tables.rs), and the tests' ELF reading.
-elf32 = { path = "../elf32" }
+elf = { path = "../elf" }
 grail = { path = "../grail" }
 merlin = { path = "../merlin" }
 merlin-as = { path = "../merlin-as" }
