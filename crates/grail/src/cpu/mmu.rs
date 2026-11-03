@@ -56,7 +56,7 @@ struct Scheme {
     vpn_bits: u32,
     /// The PPN field of a PTE, once shifted down by 10.
     ppn_mask: u64,
-    /// The bits of a PTE that must be 0.
+    /// The bits of any PTE that must be 0 (a pointer also has [`POINTER_RESERVED`]).
     reserved: u64,
     /// Whether a virtual address must be canonical (Sv39 and Sv48). Sv32 has no such
     /// rule: it translates all 32 bits of an RV32 hart's addresses, which
