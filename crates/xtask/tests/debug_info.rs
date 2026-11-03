@@ -16,7 +16,7 @@ fn repo_root() -> PathBuf {
 type Loaded = (u32, Vec<(u32, u32, u32, u32, u32, Vec<u8>)>);
 
 fn loaded(elf: &[u8]) -> Loaded {
-    let e = elf32::Elf::parse(elf).unwrap();
+    let e = elf::Elf::parse(elf).unwrap();
     let segments = e
         .segments
         .iter()
@@ -35,7 +35,7 @@ fn loaded(elf: &[u8]) -> Loaded {
 }
 
 fn has_line_table(elf: &[u8]) -> bool {
-    let e = elf32::Elf::parse(elf).unwrap();
+    let e = elf::Elf::parse(elf).unwrap();
     e.sections.iter().any(|s| s.name == ".debug_line")
 }
 
@@ -84,7 +84,7 @@ fn debug_information_changes_no_loaded_byte() {
 fn the_kernel_line_table_names_its_sources() {
     // Paths relative to the repository root: a debugger run there finds them.
     let elf = committed(kernel::KERNEL_ELF);
-    let e = elf32::Elf::parse(&elf).unwrap();
+    let e = elf::Elf::parse(&elf).unwrap();
     let tables = e.line_tables().unwrap();
     let files: Vec<&str> = tables
         .iter()

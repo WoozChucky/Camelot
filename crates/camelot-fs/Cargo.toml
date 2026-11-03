@@ -10,4 +10,4 @@ name = "camelot_fs"
 
 [dependencies]
 # Reading the bootloader and kernel ELF files that mkfs installs (src/boot.rs).
-elf32 = { path = "../elf32" }
+elf = { path = "../elf" }

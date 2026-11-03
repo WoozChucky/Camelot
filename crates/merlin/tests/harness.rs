@@ -746,7 +746,7 @@ const COMPARED_SECTIONS: [&str; 4] = [".text", ".rodata", ".data", ".bss"];
 /// its relocations. A section the object lacks reads as empty, so leaving out
 /// an empty section and emitting one compare equal.
 fn section_summary(obj: &[u8], name: &str) -> Result<(u32, Vec<u8>, Vec<String>), String> {
-    let elf = elf32::Elf::parse(obj).map_err(|e| e.to_string())?;
+    let elf = elf::Elf::parse(obj).map_err(|e| e.to_string())?;
     let Some(section) = elf.sections.iter().find(|s| s.name == name) else {
         return Ok((0, Vec::new(), Vec::new()));
     };
@@ -756,7 +756,7 @@ fn section_summary(obj: &[u8], name: &str) -> Result<(u32, Vec<u8>, Vec<String>)
     if let Some(rela) = elf.sections.iter().find(|s| s.name == rela_name) {
         let syms = elf.symbols().map_err(|e| e.to_string())?;
         for r in elf.relocations(rela).map_err(|e| e.to_string())? {
-            let ty = elf32::reloc_name(r.ty).unwrap_or("?");
+            let ty = elf::reloc_name(r.ty).unwrap_or("?");
             let sym = &syms[r.sym as usize];
             // A relocation against a section symbol has no name of its own;
             // name it after the section, as both assemblers mean the same.

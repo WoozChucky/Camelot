@@ -4,7 +4,7 @@
 //! under the instruction they patch.
 
 use crate::{reloc_type, reloc_value, relocation_sections, Options};
-use elf32::{Elf, Error, Symbol};
+use elf::{Elf, Error, Symbol};
 use excalibur::{decode, Inst, Syntax, Xlen};
 use std::fmt::Write;
 
@@ -20,7 +20,7 @@ struct Label {
 /// and the assembler's label-difference temporaries (`.L0 `).
 fn is_label(s: &Symbol) -> bool {
     !s.name.is_empty()
-        && !matches!(s.ty(), elf32::STT_SECTION | elf32::STT_FILE)
+        && !matches!(s.ty(), elf::STT_SECTION | elf::STT_FILE)
         && !s.name.starts_with("$x")
         && !s.name.starts_with("$d")
         && !s.name.starts_with(".L0 ")
@@ -68,7 +68,7 @@ impl Labels {
         Ok(Labels {
             per_section,
             absolute,
-            relocatable: elf.header.ty == elf32::ET_REL,
+            relocatable: elf.header.ty == elf::ET_REL,
             section_addrs,
         })
     }
@@ -242,7 +242,7 @@ impl SourceLines {
         let mut functions: Vec<(usize, u32, u32, String)> = elf
             .symbols()?
             .into_iter()
-            .filter(|s| matches!(s.ty(), elf32::STT_NOTYPE | elf32::STT_FUNC | elf32::STT_OBJECT))
+            .filter(|s| matches!(s.ty(), elf::STT_NOTYPE | elf::STT_FUNC | elf::STT_OBJECT))
             // Not RISC-V's mapping symbols (`$x`, `$d`) and fake labels (`.L0 `).
             .filter(|s| !s.name.is_empty() && !s.name.starts_with('$') && !s.name.starts_with(".L0 "))
             .filter_map(|s| {
@@ -258,7 +258,7 @@ impl SourceLines {
         Ok(SourceLines {
             sequences,
             functions,
-            relocatable: elf.header.ty == elf32::ET_REL,
+            relocatable: elf.header.ty == elf::ET_REL,
             last: (None, None),
         })
     }
@@ -330,7 +330,7 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
             let label = Label {
                 addr: sec.addr,
                 name: sec.name.clone(),
-                ty: elf32::STT_FUNC,
+                ty: elf::STT_FUNC,
             };
             let at = syms.partition_point(|s| s.addr < sec.addr);
             syms.insert(at, label);

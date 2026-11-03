@@ -114,18 +114,18 @@ mod tests {
     /// `.weak`): its binding in `.symtab` becomes `STB_WEAK`.
     fn make_weak(elf: &mut [u8], name: &str) {
         let info_at = {
-            let parsed = elf32::Elf::parse(elf).unwrap();
+            let parsed = elf::Elf::parse(elf).unwrap();
             let symtab = &parsed.sections[parsed.symtab_index().unwrap()];
             let syms = parsed.symbols_in(symtab).unwrap();
             let i = syms
                 .iter()
                 .position(|s| s.name == name)
                 .unwrap_or_else(|| panic!("no symbol {name}"));
-            let entsize = (symtab.entsize as usize).max(elf32::SYM_SIZE);
+            let entsize = (symtab.entsize as usize).max(elf::SYM_SIZE);
             // st_info is byte 12 of the entry.
             symtab.offset as usize + i * entsize + 12
         };
-        elf[info_at] = (elf32::STB_WEAK << 4) | (elf[info_at] & 0xf);
+        elf[info_at] = (elf::STB_WEAK << 4) | (elf[info_at] & 0xf);
     }
 
     /// An object from merlin-as: `defs` defined as globals in `.text`,

@@ -16,4 +16,4 @@ excalibur = { path = "../excalibur" }
 grail = { path = "../grail" }
 merlin-as = { path = "../merlin-as" }
 merlin-ld = { path = "../merlin-ld" }
-elf32 = { path = "../elf32" }
+elf = { path = "../elf" }

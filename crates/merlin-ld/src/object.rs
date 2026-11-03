@@ -5,9 +5,9 @@
 //! Sections and symbols keep their ELF indices, so a relocation's symbol index
 //! and a symbol's `st_shndx` can be used directly.
 
-// The ELF constants, elf32's (shared with merlin-objdump, and generated into
+// The ELF constants, the elf crate's (shared with merlin-objdump, and generated into
 // the C linker's tables by crates/xtask/src/c_tables.rs).
-pub use elf32::{
+pub use elf::{
     EM_RISCV, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHF_GROUP, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE,
     SHN_ABS, SHN_COMMON, SHN_LORESERVE, SHN_UNDEF, SHT_GROUP, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL,
     SHT_RELA, SHT_STRTAB, SHT_SYMTAB, SHT_SYMTAB_SHNDX, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE,

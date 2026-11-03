@@ -349,8 +349,8 @@ fn get32(b: &[u8], at: usize) -> u32 {
 /// without theirs. A file with no debug sections comes back unchanged.
 /// Anything laid out otherwise is an error.
 pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, String> {
-    let parsed = elf32::Elf::parse(elf).map_err(|e| e.to_string())?;
-    let is_debug = |s: &elf32::Section| !s.is_alloc() && s.name.starts_with(".debug_");
+    let parsed = elf::Elf::parse(elf).map_err(|e| e.to_string())?;
+    let is_debug = |s: &elf::Section| !s.is_alloc() && s.name.starts_with(".debug_");
     if !parsed.sections.iter().any(is_debug) {
         return Ok(elf.to_vec());
     }

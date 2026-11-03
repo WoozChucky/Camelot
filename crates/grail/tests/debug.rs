@@ -18,7 +18,7 @@ fn read(path: &str) -> Vec<u8> {
 }
 
 fn symbol(elf: &[u8], name: &str) -> u32 {
-    let elf = elf32::Elf::parse(elf).unwrap();
+    let elf = elf::Elf::parse(elf).unwrap();
     let symbols = elf.symbols().unwrap();
     symbols
         .iter()

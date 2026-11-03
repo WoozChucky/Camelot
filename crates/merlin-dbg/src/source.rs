@@ -1,5 +1,5 @@
 //! Source lines: which line of which file each address comes from, from the
-//! programs' DWARF line tables (`.debug_line`, read through `elf32::lines`), and
+//! programs' DWARF line tables (`.debug_line`, read through `elf::lines`), and
 //! the source files themselves, for showing a line.
 //!
 //! A line table is a list of *rows*, each an address and the place in the source
@@ -59,7 +59,7 @@ pub struct Lines {
 impl Lines {
     /// Adds the line tables of an executable (none if it has no `.debug_line`).
     pub fn add_elf(&mut self, file: &[u8]) -> Result<(), String> {
-        let elf = elf32::Elf::parse(file).map_err(|e| e.to_string())?;
+        let elf = elf::Elf::parse(file).map_err(|e| e.to_string())?;
         for table in elf.line_tables().map_err(|e| e.to_string())? {
             let ids: Vec<usize> = table
                 .files

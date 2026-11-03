@@ -13,7 +13,7 @@
 //!   llvm-objdump's of ld.lld's. What differs outside the loaded bytes is
 //!   pinned down here and listed in docs/excalibur-spec.md section 10.
 
-use elf32::{Elf, PT_GNU_STACK, PT_LOAD, PT_RISCV_ATTRIBUTES, SHF_ALLOC, SHT_SYMTAB};
+use elf::{Elf, PT_GNU_STACK, PT_LOAD, PT_RISCV_ATTRIBUTES, SHF_ALLOC, SHT_SYMTAB};
 use grail::block::SECTOR_SIZE;
 use grail::keyboard::{code, KeyEvent};
 use grail::net::Hub;

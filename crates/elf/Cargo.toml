@@ -1,5 +1,5 @@
 [package]
-name = "elf32"
+name = "elf"
 description = "ELF32 little-endian RISC-V reader shared by Grail, merlin-objdump and merlin-ld"
 version.workspace = true
 edition.workspace = true

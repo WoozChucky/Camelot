@@ -1,4 +1,4 @@
-//! The program's symbols, from its ELF symbol table (through `elf32`): names for
+//! The program's symbols, from its ELF symbol table (through `elf`): names for
 //! addresses (`break main`) and addresses for names (`0x80000024 <puts+4>`).
 
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ impl Symbols {
     /// Adds the symbols of another ELF file (`add-symbol-file`): a user program
     /// next to the kernel. Of a name defined in both, the first file's is kept.
     pub fn add_elf(&mut self, file: &[u8]) -> Result<(), String> {
-        let elf = elf32::Elf::parse(file).map_err(|e| e.to_string())?;
+        let elf = elf::Elf::parse(file).map_err(|e| e.to_string())?;
         let mut found = Vec::new();
         for s in elf.symbols().map_err(|e| e.to_string())? {
             if s.name.is_empty()

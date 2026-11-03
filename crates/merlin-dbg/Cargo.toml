@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 excalibur = { path = "../excalibur" }
-elf32 = { path = "../elf32" }
+elf = { path = "../elf" }
 # The packet framing it shares with Grail's stub, and `merlin-dbg -- grail-args`,
 # which runs a machine under the stub in this process.
 grail = { path = "../grail" }

@@ -1,5 +1,5 @@
 //! `-g`: the debug information merlin writes (`merlin::debug`), assembled by
-//! merlin-as and read back with elf32. It must not change the code: every test
+//! merlin-as and read back with the elf crate. It must not change the code: every test
 //! case compiles to the same loaded bytes, relocations and symbols with and
 //! without it.
 
@@ -24,7 +24,7 @@ type Loaded = (
 );
 
 fn loaded(obj: &[u8]) -> Loaded {
-    let elf = elf32::Elf::parse(obj).unwrap();
+    let elf = elf::Elf::parse(obj).unwrap();
     let symbols = elf.symbols().unwrap();
     let mut sections = Vec::new();
     for (i, s) in elf.sections.iter().enumerate() {
@@ -35,7 +35,7 @@ fn loaded(obj: &[u8]) -> Loaded {
         for rel in elf
             .sections
             .iter()
-            .filter(|r| r.ty == elf32::SHT_RELA && r.info as usize == i)
+            .filter(|r| r.ty == elf::SHT_RELA && r.info as usize == i)
         {
             for r in elf.relocations(rel).unwrap() {
                 relocs.push((r.offset, r.ty, symbols[r.sym as usize].name.clone()));
@@ -45,7 +45,7 @@ fn loaded(obj: &[u8]) -> Loaded {
     }
     let symbols = symbols
         .iter()
-        .filter(|s| s.ty() != elf32::STT_SECTION)
+        .filter(|s| s.ty() != elf::STT_SECTION)
         .map(|s| (s.name.clone(), s.value, s.size, s.info))
         .collect();
     (sections, symbols)
@@ -97,7 +97,7 @@ void empty(void) {
 ";
     let asm = merlin::compile_with("loop.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
     let obj = merlin_as::assemble_to_elf(&asm).unwrap();
-    let elf = elf32::Elf::parse(&obj).unwrap();
+    let elf = elf::Elf::parse(&obj).unwrap();
     let tables = elf.line_tables().unwrap();
     assert_eq!(tables.len(), 1);
     let t = &tables[0];
@@ -161,7 +161,7 @@ fn headers_get_their_own_file_numbers() {
         "{asm}"
     );
     let obj = merlin_as::assemble_to_elf(&asm).unwrap();
-    let tables = elf32::Elf::parse(&obj).unwrap().line_tables().unwrap();
+    let tables = elf::Elf::parse(&obj).unwrap().line_tables().unwrap();
     assert_eq!(tables[0].files, ["src/m.c", "src/inc/h.h"]);
     // A file without functions has nothing to describe.
     let asm = merlin::compile_with("d.c", "int x = 1;\n", &debug_opts("src"), &merlin::no_files).unwrap();

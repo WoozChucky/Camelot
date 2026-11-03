@@ -157,7 +157,7 @@ mod tests {
             },
         ];
         let elf = link(&dir, "t.ld", &inputs, "t").unwrap();
-        assert_eq!(elf32::Elf::parse(&elf).unwrap().header.entry, 0x1000);
+        assert_eq!(elf::Elf::parse(&elf).unwrap().header.entry, 0x1000);
         let err = link(&dir, "t.ld", &inputs[1..], "t").unwrap_err();
         assert!(
             err.contains("linking t:") && err.contains("undefined reference to 'near'"),

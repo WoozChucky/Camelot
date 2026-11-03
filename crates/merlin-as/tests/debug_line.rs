@@ -15,7 +15,7 @@ type Reloc = (u32, u32, String, i64);
 
 /// The `.debug_*` sections of an object: contents and relocations, by name.
 fn debug_sections(file: &[u8]) -> BTreeMap<String, (Vec<u8>, Vec<Reloc>)> {
-    let elf = elf32::Elf::parse(file).unwrap();
+    let elf = elf::Elf::parse(file).unwrap();
     let symbols = elf.symbols().unwrap();
     let mut out = BTreeMap::new();
     for s in &elf.sections {
@@ -106,13 +106,13 @@ fn debug_sections_match_llvm() {
     assert!(fails.is_empty(), "{}", fails.join("\n\n"));
 }
 
-/// The rows elf32 reads from an object, with their sections' names:
+/// The rows the elf crate reads from an object, with their sections' names:
 /// (section, [(address, path, line, column, is_stmt, prologue_end,
 /// epilogue_begin, end)]).
 type Rows = Vec<(String, Vec<(u32, String, u32, u32, bool, bool, bool, bool)>)>;
 
 fn rows(file: &[u8]) -> Rows {
-    let elf = elf32::Elf::parse(file).unwrap();
+    let elf = elf::Elf::parse(file).unwrap();
     let mut out = Vec::new();
     for t in elf.line_tables().unwrap() {
         for seq in &t.sequences {

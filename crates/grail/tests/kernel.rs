@@ -68,7 +68,7 @@ fn grail_with(args: &[&str], elf: &Path, stdin: &[u8]) -> (Option<i32>, String) 
 /// scratch file.
 fn kernel_with_fault(fault: u32) -> PathBuf {
     let mut file = std::fs::read(kernel_elf()).unwrap();
-    let elf = elf32::Elf::parse(&file).unwrap();
+    let elf = elf::Elf::parse(&file).unwrap();
     let addr = elf
         .symbols()
         .unwrap()
@@ -80,7 +80,7 @@ fn kernel_with_fault(fault: u32) -> PathBuf {
     let seg = elf
         .segments
         .iter()
-        .find(|p| p.ty == elf32::PT_LOAD && (p.vaddr..p.vaddr + p.filesz).contains(&addr))
+        .find(|p| p.ty == elf::PT_LOAD && (p.vaddr..p.vaddr + p.filesz).contains(&addr))
         .expect("boot_fault is not in the image");
     let off = (seg.offset + (addr - seg.vaddr)) as usize;
     assert_eq!(

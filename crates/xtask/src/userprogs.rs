@@ -799,7 +799,7 @@ mod tests {
         .unwrap();
         let p = build_named(&dir, "ok").unwrap();
         assert_eq!(p.name, "ok");
-        let elf = elf32::Elf::parse(&p.elf).unwrap();
+        let elf = elf::Elf::parse(&p.elf).unwrap();
         // crt0's _start comes first and is the entry point.
         assert_eq!(elf.header.entry, 0x1000);
         let syms = elf.symbols().unwrap();
@@ -818,7 +818,7 @@ mod tests {
         )
         .unwrap();
         let twice = build_named(&dir, "ok").unwrap();
-        let syms = elf32::Elf::parse(&twice.elf).unwrap().symbols().unwrap();
+        let syms = elf::Elf::parse(&twice.elf).unwrap().symbols().unwrap();
         for want in ["twice", "nothing"] {
             assert!(syms.iter().any(|s| s.name == want), "{want} missing");
         }
@@ -877,7 +877,7 @@ mod tests {
         )
         .unwrap();
         let p = build_program_with(&dir, &cprog, CCompiler::Clang(&asm)).unwrap();
-        assert!(elf32::Elf::parse(&p.elf).is_ok());
+        assert!(elf::Elf::parse(&p.elf).is_ok());
         std::fs::write(dir.join("cprog.c"), "int main(void) { return 0; }\n").unwrap();
 
         std::fs::write(dir.join("bad.s"), "    nop\n    frobnicate a0\n").unwrap();

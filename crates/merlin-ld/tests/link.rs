@@ -1945,7 +1945,7 @@ fn line_tables_are_kept_and_relocated() {
     let opts = Options::default();
     let linked = merlin_ld::link(&debug, &opts).unwrap();
     let without = merlin_ld::link(&plain, &opts).unwrap();
-    let elf = elf32::Elf::parse(&linked.elf).unwrap();
+    let elf = elf::Elf::parse(&linked.elf).unwrap();
     let names: Vec<&str> = elf.sections.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(
         names,
@@ -1962,7 +1962,7 @@ fn line_tables_are_kept_and_relocated() {
     );
     // Not loaded: the segments are the same as without the line tables.
     let segments = |file: &[u8]| -> Vec<(u32, Vec<u8>)> {
-        let e = elf32::Elf::parse(file).unwrap();
+        let e = elf::Elf::parse(file).unwrap();
         e.segments
             .iter()
             .map(|p| (p.vaddr, e.segment_data(p).unwrap().to_vec()))
@@ -2025,7 +2025,7 @@ gone:
     };
     let opts = script("SECTIONS { . = 0x1000; .text : { *(.text) } /DISCARD/ : { *(.text.gone) } }");
     let linked = merlin_ld::link(&[obj], &opts).unwrap();
-    let elf = elf32::Elf::parse(&linked.elf).unwrap();
+    let elf = elf::Elf::parse(&linked.elf).unwrap();
     let seqs = &elf.line_tables().unwrap()[0].sequences;
     let starts: Vec<(u32, u32)> = seqs.iter().map(|s| (s.rows[0].addr, s.rows[0].line)).collect();
     assert_eq!(starts, [(0x1000, 1), (0, 7)]);

@@ -1,7 +1,7 @@
 //! Loads executables: PT_LOAD segments, the entry point and symbol values.
-//! The parsing lives in the shared `elf32` crate.
+//! The parsing lives in the shared `elf` crate.
 
-pub use elf32::Error as ElfError;
+pub use elf::Error as ElfError;
 
 pub struct Segment {
     pub paddr: u32,
@@ -18,9 +18,9 @@ pub struct Elf {
 }
 
 pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
-    let elf = elf32::Elf::parse(file)?;
+    let elf = elf::Elf::parse(file)?;
     let mut segments = Vec::new();
-    for p in elf.segments.iter().filter(|p| p.ty == elf32::PT_LOAD) {
+    for p in elf.segments.iter().filter(|p| p.ty == elf::PT_LOAD) {
         segments.push(Segment {
             paddr: p.paddr,
             data: elf.segment_data(p)?.to_vec(),
@@ -29,13 +29,13 @@ pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
     }
     // Global and weak symbols first, then the locals: a name defined by
     // both (a `static` function in one file named like a global one in
-    // another) means the global one, as in `elf32::find_symbol`.
-    let mut defined: Vec<elf32::Symbol> = elf
+    // another) means the global one, as in `elf::find_symbol`.
+    let mut defined: Vec<elf::Symbol> = elf
         .symbols()?
         .into_iter()
         .filter(|s| !s.name.is_empty() && !s.is_undefined())
         .collect();
-    defined.sort_by_key(|s| s.bind() == elf32::STB_LOCAL);
+    defined.sort_by_key(|s| s.bind() == elf::STB_LOCAL);
     let symbols = defined.into_iter().map(|s| (s.name, s.value)).collect();
     Ok(Elf {
         entry: elf.header.entry,
@@ -53,7 +53,7 @@ impl Elf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use elf32::*;
+    use elf::*;
 
     /// A section-header-only ELF whose .symtab holds `syms` (name, value,
     /// binding), every one defined (SHN_ABS), after the null symbol.
