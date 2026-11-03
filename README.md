@@ -49,7 +49,7 @@ Ctrl-] leaves Herald, and the VM carries on. The console is one for the whole VM
 
 ```
 crates/excalibur        instruction encodings, decoder, disassembler for RV32 and RV64 (shared by every tool)
-crates/elf32            ELF32 reader and DWARF line tables (shared by grail, merlin-objdump, merlin-ld, merlin-dbg)
+crates/elf              ELF32 and ELF64 reader and DWARF line tables (shared by grail, merlin-objdump, merlin-ld, merlin-dbg)
 crates/grail            the emulator
 crates/avalon-proto     the Avalon protocol: frames, messages, blocking connection, screen diffing (docs/avalon-protocol.md)
 crates/gateway          the user-mode NAT gateway behind `grail --net user` and Avalon's switches: DHCP, DNS, NAT and port forwarding over std::net
@@ -614,6 +614,7 @@ The debugger's tests:
 - The GDB stub's unit tests (`crates/grail/src/gdb`) cover packet framing, checksums and escapes, every supported command, and malformed or unsupported packets.
 - `crates/grail/tests/gdb.rs` talks to `grail --gdb` over TCP, interrupting and killing a running kernel.
 - `crates/merlin-dbg/tests/session.rs` drives the merlin-dbg binary on hello, smp (2 harts) and the kernel, by source line in the kernel and in the shell. It checks that each program's console output and exit code are those of an undebugged run. An ignored test has LLDB read the kernel's line tables.
+- The ELF reader: `crates/elf/tests/llvm.rs` reads an object, a relaxed object and a linked program that clang and ld.lld made of one C file, for RV32 (ELF32) and RV64 (ELF64), and checks it finds the header, sections, segments, symbols, relocations and line table rows `llvm-readelf` and `llvm-dwarfdump` printed (`scripts/gen-elf-golden.sh`).
 - The line tables: `crates/merlin-as/tests/debug_line.rs` compares merlin-as's debug sections with clang's on a corpus (`scripts/gen-debug-line-golden.sh`), `crates/merlin/tests/debug.rs` checks that `-g` changes no code, `crates/merlin-ld/tests/link.rs` that they are linked at the code's addresses and strip to the link without them, and `crates/xtask/tests/debug_info.rs` that the committed kernels and the root image load the same bytes with and without `-g`.
 - An ignored test runs LLDB against the stub: `cargo test --release -p grail --test gdb -- --ignored`. It needs LLDB and, on Windows, a Python runtime on the PATH (see docs/merlin-dbg.md).
 
