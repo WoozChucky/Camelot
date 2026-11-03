@@ -571,3 +571,52 @@ fn an_rv64_machine_does_not_boot_from_disk_yet() {
     .unwrap();
     assert_eq!(m.boot_from_disk(), Ok(()));
 }
+
+/// On a machine of several harts, loading an ELF64 program rebuilds the boot ROM for
+/// RV64: the stub and the park loop read the entry word with `lwu`, so hart 0 and a
+/// hart woken by an IPI both start at 0x8000_0000, not at its sign-extension.
+#[test]
+fn the_park_loop_reads_the_entry_with_lwu_on_rv64() {
+    const LW_T0: u32 = 0x0102_a283; // lw t0, 16(t0)
+    const LWU_T0: u32 = 0x0102_e283; // lwu t0, 16(t0)
+    let mut m = Machine::new(MachineConfig {
+        harts: 2,
+        ..MachineConfig::with_ram(1 << 20)
+    })
+    .unwrap();
+    let rom_words = |m: &Machine| -> Vec<u32> {
+        let rom = &m.cpu.bus.rom;
+        rom.chunks(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect()
+    };
+    assert_eq!(
+        rom_words(&m).iter().filter(|&&w| w == LW_T0).count(),
+        2,
+        "RV32 at first"
+    );
+    m.load_elf(&simple(Xlen::Rv64)).unwrap();
+    let words = rom_words(&m);
+    assert_eq!(
+        words.iter().filter(|&&w| w == LWU_T0).count(),
+        2,
+        "the stub and the park loop"
+    );
+    assert!(!words.contains(&LW_T0));
+
+    // Hart 1 waits in the park loop until its msip is set, then jumps to the entry.
+    for _ in 0..20 {
+        m.cpu.step();
+    }
+    assert!(m.cpu.hart(1).waiting, "parked in wfi");
+    m.cpu.bus.clint.msip[1] = true;
+    for _ in 0..20 {
+        m.cpu.step();
+        if m.cpu.hart(1).pc == u64::from(RAM_BASE) {
+            // (Hart 0 is still running the test: an exit would end the steps first.)
+            assert_eq!(m.exit_code(), None);
+            return;
+        }
+    }
+    panic!("hart 1 did not reach the entry: pc {:#x}", m.cpu.hart(1).pc);
+}
