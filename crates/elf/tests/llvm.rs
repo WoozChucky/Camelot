@@ -58,9 +58,10 @@ fn header_field<'a>(text: &'a str, name: &str) -> &'a str {
     line[key.len()..].trim()
 }
 
-/// The number at the start of a header field ("64 (bytes into file)").
+/// The number at the start of a header field: "64 (bytes into file)", or
+/// "0x5, RVC, double-float ABI" for flags.
 fn header_num(text: &str, name: &str) -> u64 {
-    let v = header_field(text, name).split(' ').next().unwrap();
+    let v = header_field(text, name).split([' ', ',']).next().unwrap();
     if v.starts_with("0x") {
         hex(v)
     } else {
@@ -275,6 +276,28 @@ fn check_relocations(elf: &Elf, symbols: &[Symbol], text: &str) {
         assert!(text.contains("There are no relocations in this file."));
         return;
     }
+    // Every relocation section readelf lists is one of ours, and holds as
+    // many entries as it says.
+    let listed: Vec<(&str, usize)> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("Relocation section '"))
+        .map(|l| {
+            let (name, rest) = l.split_once('\'').unwrap();
+            let n = rest
+                .split(" contains ")
+                .nth(1)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap();
+            (name, dec(n) as usize)
+        })
+        .collect();
+    let ours_listed: Vec<(&str, usize)> = ours
+        .iter()
+        .map(|rel| (rel.name.as_str(), elf.relocations(rel).unwrap().len()))
+        .collect();
+    assert_eq!(ours_listed, listed);
     let mut count = 0;
     for rel in ours {
         let rows = block(text, &format!("Relocation section '{}'", rel.name));
@@ -326,7 +349,8 @@ fn check_relocations(elf: &Elf, symbols: &[Symbol], text: &str) {
             count += 1;
         }
     }
-    assert_eq!(count, text.lines().filter(|l| l.starts_with("0000")).count());
+    assert_eq!(count, listed.iter().map(|&(_, n)| n).sum::<usize>());
+    assert!(count > 0);
 }
 
 #[test]
@@ -471,4 +495,14 @@ fn an_objects_sequences_know_their_sections() {
             );
         }
     }
+}
+
+/// The fixtures' flags are 0, but llvm-readelf names the flags it knows
+/// after the number: a regenerated fixture with any must still parse.
+#[test]
+fn header_numbers_stop_at_a_comma() {
+    let text = "  Flags:                             0x5, RVC, double-float ABI\n";
+    assert_eq!(header_num(text, "Flags"), 5);
+    let text = "  Start of program headers:          64 (bytes into file)\n";
+    assert_eq!(header_num(text, "Start of program headers"), 64);
 }
