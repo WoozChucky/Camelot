@@ -47,12 +47,23 @@ pub struct BootInfo {
     pub kernel_sectors: u32,
 }
 
+/// Parses `elf`, the bootloader's or the kernel's (`what` names it in errors).
+/// Both are RV32 programs, ELF32, which is what the bootloader loads and the
+/// boot block's layout assumes, until the RV64 migration reaches them.
+fn parse32<'a>(what: &str, elf: &'a [u8]) -> Result<elf::Elf<'a>, String> {
+    let e = elf::Elf::parse(elf).map_err(|e| format!("{what}: {e}"))?;
+    if e.class != elf::Class::Elf32 {
+        return Err(format!("{what}: not ELF32, the class the bootloader loads"));
+    }
+    Ok(e)
+}
+
 /// The code of a bootloader linked as an ELF executable (`kernel/boot/boot.elf`):
 /// its loadable bytes, from the lowest address, where its entry point must be.
 /// It must fit in [`MAX_BOOT_CODE`] bytes and have no `.bss` (nothing would
 /// zero it).
 pub fn boot_code(elf: &[u8]) -> Result<Vec<u8>, String> {
-    let e = elf::Elf::parse(elf).map_err(|e| format!("bootloader: {e}"))?;
+    let e = parse32("bootloader", elf)?;
     let segs: Vec<_> = e.segments.iter().filter(|p| p.ty == elf::PT_LOAD).collect();
     let base = segs
         .iter()
@@ -91,13 +102,10 @@ pub fn boot_code(elf: &[u8]) -> Result<Vec<u8>, String> {
 /// offset does not matter). (Whether they fit below the bootloader depends on
 /// the machine's RAM: the bootloader checks that.)
 pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
-    let e = elf::Elf::parse(elf).map_err(|e| format!("kernel: {e}"))?;
+    let e = parse32("kernel", elf)?;
     let h = &e.header;
     if h.ty != elf::ET_EXEC || h.machine != elf::EM_RISCV {
         return Err("kernel: not a RISC-V executable".into());
-    }
-    if e.class != elf::Class::Elf32 {
-        return Err("kernel: not ELF32, the class the bootloader loads".into());
     }
     if h.phentsize as usize != elf::PHDR_SIZE
         || h.phoff as usize + h.phnum as usize * elf::PHDR_SIZE > KERNEL_HEADERS
@@ -128,7 +136,8 @@ pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
 /// The bootloader reads only these parts, and the result is still an ELF file that
 /// loads the same.
 pub fn loadable(elf: &[u8]) -> Result<Vec<u8>, String> {
-    let e = elf::Elf::parse(elf).map_err(|e| format!("kernel: {e}"))?;
+    // ELF32 only: the header fields cleared below are at ELF32's offsets.
+    let e = parse32("kernel", elf)?;
     let h = &e.header;
     let headers = h.phoff as usize + h.phnum as usize * elf::PHDR_SIZE;
     let mut out = elf
@@ -323,6 +332,27 @@ mod tests {
         f[48..50].copy_from_slice(&0u16.to_le_bytes()); // e_shnum: none to parse
         f[50..52].copy_from_slice(&7u16.to_le_bytes()); // e_shstrndx
         f
+    }
+
+    /// An RV64 program (ELF64): what the bootloader cannot load yet, as
+    /// bootloader or as kernel, and whose header `loadable` must not rewrite
+    /// at ELF32's offsets.
+    #[test]
+    fn elf64_files_are_refused() {
+        let rv64 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../elf/tests/llvm/rv64/prog.elf"
+        ))
+        .unwrap();
+        let want = |what: &str| format!("{what}: not ELF32, the class the bootloader loads");
+        assert_eq!(boot_code(&rv64), Err(want("bootloader")));
+        assert_eq!(check_kernel(&rv64), Err(want("kernel")));
+        assert_eq!(loadable(&rv64), Err(want("kernel")));
+        let mut image = mkfs::mkfs(&small(), None).unwrap();
+        let err = install(&mut image, &rv64, &kernel_elf()).unwrap_err();
+        assert_eq!(err, want("bootloader"));
+        let err = install(&mut image, &bootloader(64), &rv64).unwrap_err();
+        assert_eq!(err, want("kernel"));
     }
 
     #[test]
