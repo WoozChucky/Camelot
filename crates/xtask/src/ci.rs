@@ -67,12 +67,16 @@ const STEPS: &[Step] = &[
         args: &["-p", "avalon-proto", "--tests"],
     },
     Step {
-        what: "Grail: riscv-tests, disk boot, the committed disk image",
+        what: "Grail: riscv-tests, RV64 and atomics semantics, disk boot, the committed disk image",
         args: &[
             "-p",
             "grail",
             "--test",
             "riscv_tests",
+            "--test",
+            "rv64",
+            "--test",
+            "atomics",
             "--test",
             "disk_boot",
             "--test",
