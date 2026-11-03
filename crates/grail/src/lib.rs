@@ -38,6 +38,7 @@ pub use config::{
     MAX_HARTS,
 };
 use cpu::Cpu;
+pub use excalibur::Xlen;
 use keyboard::KeyEvent;
 use net::{MacAddr, NetBackend, NetDevice};
 use pointer::PointerInput;
@@ -166,19 +167,38 @@ impl Machine {
         self.cpu.bus.debug = Some(Box::new(output));
     }
 
-    /// Loads an ELF image into RAM and points the boot ROM at its entry. A segment that
-    /// does not fit in RAM is an error, found before anything is allocated for it, so an
-    /// image from an untrusted source (a remote client) cannot make the host allocate
-    /// more than its size.
+    /// Loads an ELF image into RAM and points the boot ROM at its entry. Each `PT_LOAD`
+    /// segment goes to its physical address (`p_paddr`), and the program starts at the
+    /// physical address of its entry point ([`elf::Elf::physical_entry`]), since paging
+    /// is off at reset. A segment that does not fit in RAM is an error, found before
+    /// anything is allocated for it, so an image from an untrusted source (a remote
+    /// client) cannot make the host allocate more than its size.
+    ///
+    /// An ELF64 program makes an RV32 machine RV64 (it must not have run yet); an ELF32
+    /// program on an RV64 machine is an error.
     pub fn load_elf(&mut self, file: &[u8]) -> Result<(), String> {
         let elf = elf::parse(file).map_err(|e| e.to_string())?;
+        if elf.xlen == Xlen::Rv32 && self.config.xlen == Xlen::Rv64 {
+            return Err("an RV32 program (ELF32) cannot run on an RV64 machine".into());
+        }
+        let entry = elf.physical_entry().map_err(|e| e.to_string())?;
         let bus = &mut self.cpu.bus;
         for seg in &elf.segments {
-            bus.load_zeroed(seg.paddr, &seg.data, seg.mem_size)
-                .map_err(|_| format!("segment at {:#x} is outside RAM", seg.paddr))?;
+            let outside = || format!("segment at {:#x} is outside RAM", seg.paddr);
+            // The bus takes 32-bit addresses until #147; RAM is below 4 GiB.
+            let paddr = u32::try_from(seg.paddr).map_err(|_| outside())?;
+            let size = u32::try_from(seg.mem_size).map_err(|_| outside())?;
+            bus.load_zeroed(paddr, &seg.data, size).map_err(|_| outside())?;
         }
-        bus.tohost = elf.symbol("tohost");
-        bus.set_boot_entry(elf.entry);
+        // In a loaded segment, so in RAM, below 4 GiB.
+        let entry = u32::try_from(entry).expect("the entry point is in RAM");
+        if elf.xlen != self.config.xlen {
+            self.config.xlen = elf.xlen;
+            self.cpu.set_xlen(elf.xlen);
+        }
+        let bus = &mut self.cpu.bus;
+        bus.tohost = elf.symbol("tohost").and_then(|a| u32::try_from(a).ok());
+        bus.set_boot_entry(entry);
         Ok(())
     }
 

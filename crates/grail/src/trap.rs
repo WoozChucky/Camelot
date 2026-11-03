@@ -1,6 +1,12 @@
 //! Exception and interrupt causes (spec section 6).
 
-pub const INTERRUPT_BIT: u32 = 1 << 31;
+use excalibur::Xlen;
+
+/// The bit of `xcause` that marks an interrupt: its top bit, bit 63 on RV64 and bit
+/// 31 on RV32.
+pub fn interrupt_bit(xlen: Xlen) -> u64 {
+    1 << (xlen.bits() - 1)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -25,11 +31,11 @@ pub enum Exception {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Trap {
     pub cause: Exception,
-    pub tval: u32,
+    pub tval: u64,
 }
 
 impl Trap {
-    pub fn new(cause: Exception, tval: u32) -> Self {
+    pub fn new(cause: Exception, tval: u64) -> Self {
         Trap { cause, tval }
     }
 }

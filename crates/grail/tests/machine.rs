@@ -187,7 +187,7 @@ fn bare_machine(config: MachineConfig, program: &[u32]) -> Machine {
     let mut m = Machine::new(config).unwrap();
     let code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     m.cpu.bus.load(RAM_BASE, &code).unwrap();
-    m.cpu.pc = RAM_BASE;
+    m.cpu.pc = RAM_BASE.into();
     m
 }
 

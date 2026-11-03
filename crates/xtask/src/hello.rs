@@ -56,8 +56,8 @@ pub fn build(root: &Path, lld: &Path, work_dir: &Path, verbose: bool) -> Result<
 /// segment as (address, file bytes, memory size).
 #[derive(Debug, PartialEq, Eq)]
 pub struct LoadedImage {
-    pub entry: u32,
-    pub segments: Vec<(u32, Vec<u8>, u32)>,
+    pub entry: u64,
+    pub segments: Vec<(u64, Vec<u8>, u64)>,
 }
 
 /// The [`LoadedImage`] of an executable. Two links that load the same can

@@ -916,10 +916,11 @@ fn weak_reference_defined_elsewhere_reaches_the_definition() {
 
     let elf = grail::elf::parse(&linked.elf).unwrap();
     let word = |addr: u32| {
+        let addr = u64::from(addr);
         let seg = elf
             .segments
             .iter()
-            .find(|s| addr >= s.paddr && addr < s.paddr + s.data.len() as u32)
+            .find(|s| addr >= s.paddr && addr < s.paddr + s.data.len() as u64)
             .unwrap();
         u32_at(&seg.data, (addr - seg.paddr) as usize)
     };
@@ -1166,7 +1167,11 @@ fn data_word_relocations() {
     let linked = merlin_ld::link(&[obj(src)], &Options::default()).unwrap();
     let data = linked.layout.section(".data").unwrap();
     let elf = grail::elf::parse(&linked.elf).unwrap();
-    let seg = elf.segments.iter().find(|s| s.paddr == data.addr).unwrap();
+    let seg = elf
+        .segments
+        .iter()
+        .find(|s| s.paddr == u64::from(data.addr))
+        .unwrap();
     let words: Vec<u32> = seg.data[..16]
         .chunks(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))

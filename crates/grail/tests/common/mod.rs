@@ -83,9 +83,9 @@ impl Vm {
         let elf = grail::elf::parse(&file).unwrap();
         for (name, value) in patches {
             let addr = elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"));
-            m.cpu.bus.load(addr, &value.to_le_bytes()).unwrap();
+            m.cpu.bus.load(addr as u32, &value.to_le_bytes()).unwrap();
         }
-        let free_count = elf.symbol("free_count").expect("no symbol free_count");
+        let free_count = elf.symbol("free_count").expect("no symbol free_count") as u32;
         let (input, rx) = channel();
         m.set_uart_input(rx);
         Vm { m, input, free_count }
@@ -125,7 +125,7 @@ pub fn var_addr(name: &str) -> u32 {
     *addrs.entry(name.to_string()).or_insert_with(|| {
         let file = kernel_elf();
         let elf = grail::elf::parse(&file).unwrap();
-        elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"))
+        elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}")) as u32
     })
 }
 

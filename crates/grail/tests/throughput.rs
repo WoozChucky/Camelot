@@ -16,7 +16,7 @@ fn idle_plic_and_uart_do_not_slow_the_step_loop() {
     for _ in 0..3 {
         let mut m = Machine::with_ram(64 * 1024);
         m.cpu.bus.load(RAM_BASE, &0x0000_006fu32.to_le_bytes()).unwrap();
-        m.cpu.pc = RAM_BASE;
+        m.cpu.pc = RAM_BASE.into();
         let (_tx, rx) = std::sync::mpsc::channel::<u8>();
         m.cpu.bus.uart.input = Some(rx);
         let t = Instant::now();

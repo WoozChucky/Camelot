@@ -84,21 +84,20 @@ pub const TINFO: u16 = 0x7a4;
 pub const TCONTROL: u16 = 0x7a5;
 
 // mstatus bits
-pub const MSTATUS_SIE: u32 = 1 << 1;
-pub const MSTATUS_MIE: u32 = 1 << 3;
-pub const MSTATUS_SPIE: u32 = 1 << 5;
-pub const MSTATUS_MPIE: u32 = 1 << 7;
-pub const MSTATUS_SPP: u32 = 1 << 8;
+pub const MSTATUS_SIE: u64 = 1 << 1;
+pub const MSTATUS_MIE: u64 = 1 << 3;
+pub const MSTATUS_SPIE: u64 = 1 << 5;
+pub const MSTATUS_MPIE: u64 = 1 << 7;
+pub const MSTATUS_SPP: u64 = 1 << 8;
 pub const MSTATUS_MPP_SHIFT: u32 = 11;
-pub const MSTATUS_MPP: u32 = 3 << MSTATUS_MPP_SHIFT;
-pub const MSTATUS_MPRV: u32 = 1 << 17;
-pub const MSTATUS_SUM: u32 = 1 << 18;
-pub const MSTATUS_MXR: u32 = 1 << 19;
-pub const MSTATUS_TVM: u32 = 1 << 20;
-pub const MSTATUS_TW: u32 = 1 << 21;
-pub const MSTATUS_TSR: u32 = 1 << 22;
-// RV64 only: the 64-bit fields of mstatus (and UXL, SD of sstatus). The
-// low-bit constants above become u64 with Grail's CSRs (#145).
+pub const MSTATUS_MPP: u64 = 3 << MSTATUS_MPP_SHIFT;
+pub const MSTATUS_MPRV: u64 = 1 << 17;
+pub const MSTATUS_SUM: u64 = 1 << 18;
+pub const MSTATUS_MXR: u64 = 1 << 19;
+pub const MSTATUS_TVM: u64 = 1 << 20;
+pub const MSTATUS_TW: u64 = 1 << 21;
+pub const MSTATUS_TSR: u64 = 1 << 22;
+// RV64 only: the 64-bit fields of mstatus (and UXL, SD of sstatus).
 /// UXL [33:32]: U-mode's XLEN, read-only [`MSTATUS_UXL_64`] on Excalibur.
 pub const MSTATUS_UXL: u64 = 3 << 32;
 /// UXL holding 2, 64-bit (Linux's `SR_UXL_64`).
@@ -112,7 +111,7 @@ pub const MSTATUS_SXL_64: u64 = 2 << 34;
 /// V or custom state, so it reads 0 on both.
 pub const MSTATUS_SD: u64 = 1 << 63;
 /// SD on RV32, bit 31 (see [`MSTATUS_SD`]).
-pub const MSTATUS_SD_RV32: u32 = 1 << 31;
+pub const MSTATUS_SD_RV32: u64 = 1 << 31;
 
 // Interrupt bits (mip/mie and cause numbers).
 pub const IRQ_S_SOFT: u32 = 1;

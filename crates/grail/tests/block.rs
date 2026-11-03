@@ -301,7 +301,7 @@ fn bad_disks_are_machine_errors() {
     assert!(e.contains("whole number of 512-byte sectors"), "{e}");
 }
 
-const MEIP: u32 = 1 << IRQ_M_EXT;
+const MEIP: u64 = 1 << IRQ_M_EXT;
 const ENABLE0: u32 = PLIC_BASE + 0x2000;
 const CLAIM0: u32 = PLIC_BASE + 0x20_0004;
 
@@ -315,8 +315,8 @@ fn completion_interrupt_traps_into_m_mode() {
     ]);
     let mut m = Machine::new(config).unwrap();
     m.cpu.bus.load(RAM_BASE, &[0x13, 0, 0, 0].repeat(16)).unwrap();
-    m.cpu.pc = RAM_BASE;
-    m.cpu.csr.mtvec = RAM_BASE + 0x20;
+    m.cpu.pc = RAM_BASE.into();
+    m.cpu.csr.mtvec = (RAM_BASE + 0x20).into();
     m.cpu.csr.mie = MEIP;
     m.cpu.csr.mstatus |= MSTATUS_MIE;
     let disk1 = BLK_BASE + BLK_SIZE;
@@ -341,11 +341,15 @@ fn completion_interrupt_traps_into_m_mode() {
     m.cpu.step();
     assert_eq!(
         m.cpu.csr.mcause,
-        0x8000_0000 | IRQ_M_EXT,
+        0x8000_0000 | u64::from(IRQ_M_EXT),
         "machine external interrupt"
     );
-    assert_eq!(m.cpu.pc, RAM_BASE + 0x20, "at the handler");
-    assert_eq!(m.cpu.csr.mepc, RAM_BASE + 4, "after the one nop that ran");
+    assert_eq!(m.cpu.pc, u64::from(RAM_BASE + 0x20), "at the handler");
+    assert_eq!(
+        m.cpu.csr.mepc,
+        u64::from(RAM_BASE + 4),
+        "after the one nop that ran"
+    );
 
     // The handler: claim, acknowledge at the disk, complete. The line stays low after.
     let bus = &mut m.cpu.bus;
@@ -363,7 +367,7 @@ fn completion_interrupt_traps_into_m_mode() {
 fn unacknowledged_completion_interrupts_again() {
     let mut m = Machine::new(with_disks(vec![DiskConfig::memory(vec![0; 512])])).unwrap();
     m.cpu.bus.load(RAM_BASE, &[0x13, 0, 0, 0].repeat(16)).unwrap();
-    m.cpu.pc = RAM_BASE;
+    m.cpu.pc = RAM_BASE.into();
     let bus = &mut m.cpu.bus;
     bus.write(PLIC_BASE + 4 * BLK_IRQ, 4, 1).unwrap();
     bus.write(ENABLE0, 4, 1 << BLK_IRQ).unwrap();

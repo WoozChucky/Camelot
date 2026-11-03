@@ -5,34 +5,42 @@
 //! module's own name is not in scope within it), as in `elf::Elf::parse`.
 
 pub use elf::Error as ElfError;
+use excalibur::Xlen;
 
+/// A `PT_LOAD` segment.
 pub struct Segment {
-    pub paddr: u32,
+    /// Where it runs (`p_vaddr`).
+    pub vaddr: u64,
+    /// Where it is loaded (`p_paddr`).
+    pub paddr: u64,
     pub data: Vec<u8>,
     /// Size in memory; bytes past `data.len()` are zero (.bss).
-    pub mem_size: u32,
+    pub mem_size: u64,
 }
 
 pub struct Elf {
-    pub entry: u32,
+    /// The program's width: RV64 for an ELF64 file, RV32 for an ELF32 one.
+    pub xlen: Xlen,
+    /// `e_entry`, a virtual address (see [`Elf::physical_entry`]).
+    pub entry: u64,
     pub segments: Vec<Segment>,
     /// Defined symbols: the global and weak ones, then the locals.
-    pub symbols: Vec<(String, u32)>,
+    pub symbols: Vec<(String, u64)>,
 }
 
 pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
     let elf = elf::Elf::parse(file)?;
-    // Grail's harts are RV32 until the RV64 migration widens them, so it runs
-    // ELF32 programs, whose addresses and sizes all fit in 32 bits.
-    if elf.class != elf::Class::Elf32 {
-        return Err(ElfError("ELF64 (RV64) programs are not supported yet".into()));
-    }
+    let xlen = match elf.class {
+        elf::Class::Elf32 => Xlen::Rv32,
+        elf::Class::Elf64 => Xlen::Rv64,
+    };
     let mut segments = Vec::new();
     for p in elf.segments.iter().filter(|p| p.ty == elf::PT_LOAD) {
         segments.push(Segment {
-            paddr: p.paddr as u32,
+            vaddr: p.vaddr,
+            paddr: p.paddr,
             data: elf.segment_data(p)?.to_vec(),
-            mem_size: p.memsz as u32,
+            mem_size: p.memsz,
         });
     }
     // Global and weak symbols first, then the locals: a name defined by
@@ -44,17 +52,30 @@ pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
         .filter(|s| !s.name.is_empty() && !s.is_undefined())
         .collect();
     defined.sort_by_key(|s| s.bind() == elf::STB_LOCAL);
-    let symbols = defined.into_iter().map(|s| (s.name, s.value as u32)).collect();
+    let symbols = defined.into_iter().map(|s| (s.name, s.value)).collect();
     Ok(Elf {
-        entry: elf.header.entry as u32,
+        xlen,
+        entry: elf.header.entry,
         segments,
         symbols,
     })
 }
 
 impl Elf {
-    pub fn symbol(&self, name: &str) -> Option<u32> {
+    pub fn symbol(&self, name: &str) -> Option<u64> {
         self.symbols.iter().find(|(n, _)| n == name).map(|&(_, v)| v)
+    }
+
+    /// Where the program starts with paging off, as at reset: `e_entry` translated
+    /// through the `PT_LOAD` segment whose virtual range holds it, so a kernel linked
+    /// high and loaded low starts at its load address (spec section 7). An error if no
+    /// segment holds it.
+    pub fn physical_entry(&self) -> Result<u64, ElfError> {
+        self.segments
+            .iter()
+            .find(|s| self.entry.wrapping_sub(s.vaddr) < s.mem_size)
+            .map(|s| s.paddr.wrapping_add(self.entry - s.vaddr))
+            .ok_or_else(|| ElfError("entry point outside the program's segments".into()))
     }
 }
 
@@ -122,24 +143,60 @@ mod tests {
         out
     }
 
-    /// Grail's harts are RV32: an RV64 program (ELF64) is refused, not read
-    /// with its addresses cut to 32 bits.
+    /// The class says the program's width: the same C program built by clang for
+    /// each, linked at 0x8000_0000.
     #[test]
-    fn elf64_programs_are_refused() {
-        let rv64 = std::fs::read(concat!(
+    fn both_classes_are_read_with_their_width() {
+        let read = |path: &str| parse(&std::fs::read(path).unwrap()).unwrap();
+        let rv64 = read(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../elf/tests/llvm/rv64/prog.elf"
-        ))
-        .unwrap();
-        let err = parse(&rv64).err().expect("refused");
-        assert_eq!(err.0, "ELF64 (RV64) programs are not supported yet");
-        // Its RV32 twin loads.
-        let rv32 = std::fs::read(concat!(
+        ));
+        let rv32 = read(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../elf/tests/llvm/rv32/prog.elf"
-        ))
-        .unwrap();
-        assert!(parse(&rv32).is_ok());
+        ));
+        assert_eq!((rv64.xlen, rv32.xlen), (Xlen::Rv64, Xlen::Rv32));
+        for elf in [rv64, rv32] {
+            assert!(elf.segments.iter().any(|s| s.paddr == 0x8000_0000));
+            let entry = elf.physical_entry().unwrap();
+            assert_eq!(entry, elf.entry, "linked where it loads");
+        }
+    }
+
+    fn segment(vaddr: u64, paddr: u64, mem_size: u64) -> Segment {
+        Segment {
+            vaddr,
+            paddr,
+            data: Vec::new(),
+            mem_size,
+        }
+    }
+
+    /// A kernel linked high and loaded low starts at its load address: paging is off
+    /// at reset (spec section 7).
+    #[test]
+    fn the_entry_point_is_translated_through_its_segment() {
+        let high = 0xffff_ffc0_0000_0000;
+        let mut elf = super::Elf {
+            xlen: Xlen::Rv64,
+            entry: high + 0x1010,
+            segments: vec![
+                segment(0x1000, 0x1000, 0x10),
+                segment(high, 0x8000_0000, 0x2000),
+                segment(high + 0x2000, 0x8000_2000, 0x1000),
+            ],
+            symbols: Vec::new(),
+        };
+        assert_eq!(elf.physical_entry().unwrap(), 0x8000_1010);
+        // .bss counts: the range is the memory size.
+        elf.entry = high + 0x2fff;
+        assert_eq!(elf.physical_entry().unwrap(), 0x8000_2fff);
+        for entry in [high + 0x3000, high - 1, 0x1010, 0] {
+            elf.entry = entry;
+            let err = elf.physical_entry().expect_err("outside");
+            assert_eq!(err.0, "entry point outside the program's segments", "{entry:#x}");
+        }
     }
 
     #[test]

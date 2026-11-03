@@ -15,7 +15,7 @@ use grail::pointer::{
 use grail::{Machine, RunResult};
 use std::path::Path;
 
-const MEIP: u32 = 1 << IRQ_M_EXT;
+const MEIP: u64 = 1 << IRQ_M_EXT;
 const PTR_STATUS: u32 = PTR_BASE;
 const PTR_EVENT: u32 = PTR_BASE + 0x4;
 const PTR_EVENT_XY: u32 = PTR_BASE + 0x8;
@@ -24,8 +24,8 @@ const PTR_POS: u32 = PTR_BASE + 0x10;
 const PENDING: u32 = PLIC_BASE + 0x1000;
 const ENABLE0: u32 = PLIC_BASE + 0x2000;
 const CLAIM0: u32 = PLIC_BASE + 0x20_0004;
-const LOAD_ACCESS_FAULT: u32 = 5;
-const STORE_ACCESS_FAULT: u32 = 7;
+const LOAD_ACCESS_FAULT: u64 = 5;
+const STORE_ACCESS_FAULT: u64 = 7;
 
 /// A machine with nops in RAM, pc at RAM, mtvec just past them.
 fn bare_machine(program: &[u32]) -> Machine {
@@ -33,8 +33,8 @@ fn bare_machine(program: &[u32]) -> Machine {
     let mut code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     code.extend(std::iter::repeat_n([0x13, 0, 0, 0], 64).flatten()); // nops
     m.cpu.bus.load(RAM_BASE, &code).unwrap();
-    m.cpu.pc = RAM_BASE;
-    m.cpu.csr.mtvec = RAM_BASE + 0x80;
+    m.cpu.pc = RAM_BASE.into();
+    m.cpu.csr.mtvec = (RAM_BASE + 0x80).into();
     m
 }
 
@@ -99,19 +99,19 @@ fn narrow_accesses_fault_and_pop_nothing() {
     let lh = (4 << 20) | (6 << 15) | (1 << 12) | (5 << 7) | 0x03;
     let sb = (5 << 20) | (6 << 15) | (12 << 7) | 0x23;
     let mut m = bare_machine(&[lh]);
-    m.cpu.x[6] = PTR_BASE;
+    m.cpu.x[6] = PTR_BASE.into();
     m.pointer_event(PointerInput::move_to(1, 1));
     m.cpu.step();
     assert_eq!(m.cpu.csr.mcause, LOAD_ACCESS_FAULT);
-    assert_eq!(m.cpu.csr.mtval, PTR_EVENT);
+    assert_eq!(m.cpu.csr.mtval, u64::from(PTR_EVENT));
     assert_eq!(m.cpu.bus.ptr.len(), 1);
 
     let mut m = bare_machine(&[sb]);
-    m.cpu.x[5] = CTRL_IRQ_ENABLE;
-    m.cpu.x[6] = PTR_BASE;
+    m.cpu.x[5] = CTRL_IRQ_ENABLE.into();
+    m.cpu.x[6] = PTR_BASE.into();
     m.cpu.step();
     assert_eq!(m.cpu.csr.mcause, STORE_ACCESS_FAULT);
-    assert_eq!(m.cpu.csr.mtval, PTR_CTRL);
+    assert_eq!(m.cpu.csr.mtval, u64::from(PTR_CTRL));
     assert_eq!(m.cpu.bus.ptr.ctrl, 0);
 }
 

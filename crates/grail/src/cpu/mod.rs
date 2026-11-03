@@ -1,17 +1,26 @@
 //! The harts: registers, the step loop, instruction execution and trap entry.
+//!
+//! A hart is RV64 or RV32, as its machine is ([`crate::MachineConfig::xlen`]), and both
+//! keep their registers in 64 bits. An RV32 hart holds each register's 32-bit value
+//! sign-extended from bit 31: every result is computed on 32 bits and sign-extended
+//! ([`Hart::set_reg`]), the rule RV64's W instructions follow, and every effective
+//! address (a load's or store's, a jump target, the pc) is cut to its low 32 bits
+//! ([`Hart::addr`]). With registers in that form, a comparison on all 64 bits (`blt`,
+//! `bltu`, `slt`, `sltu`) gives the answer the 32-bit one would, signed or unsigned, so
+//! most instructions run the same code on both widths.
 
 mod atomic;
 mod csr;
 mod mmu;
 pub mod reservation;
 
-pub use csr::{Csrs, MISA_VALUE};
+pub use csr::{misa, Csrs};
 pub use reservation::Reservation;
 
 use crate::bus::Bus;
-use crate::trap::{Exception, Trap, INTERRUPT_BIT};
+use crate::trap::{interrupt_bit, Exception, Trap};
 use excalibur::csr::*;
-use excalibur::{decode, AluOp, AmoWidth, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, StoreOp, Xlen};
+use excalibur::{decode, AluOp, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, Xlen};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -23,7 +32,7 @@ pub enum Mode {
 
 impl Mode {
     /// Decodes a 2-bit privilege field. The reserved value 2 maps to U.
-    pub fn from_bits(b: u32) -> Mode {
+    pub fn from_bits(b: u64) -> Mode {
         match b & 3 {
             3 => Mode::M,
             1 => Mode::S,
@@ -41,14 +50,21 @@ impl Mode {
 pub struct Hart {
     /// `mhartid`: the hart's index in its machine, from 0.
     pub id: u32,
-    pub x: [u32; 32],
-    pub pc: u32,
+    /// The registers. An RV32 hart's hold their 32-bit values sign-extended to 64 bits
+    /// (see the module documentation): write them with [`Hart::set_reg`].
+    pub x: [u64; 32],
+    /// The address of the instruction the hart executes next: below 4 GiB on an RV32
+    /// hart.
+    pub pc: u64,
     pub mode: Mode,
     pub csr: Csrs,
     /// Stalled in `wfi` until an interrupt becomes pending.
     pub waiting: bool,
     /// Set when the current instruction wrote minstret, which suppresses its increment.
     instret_written: bool,
+    /// The register width: what the hart's instruction words mean, and how wide its
+    /// registers, addresses and CSRs are.
+    xlen: Xlen,
 }
 
 /// Every hart of a machine, and the bus they share. Grail runs the harts on one host
@@ -106,8 +122,9 @@ impl std::ops::DerefMut for Cpu {
 
 impl Cpu {
     /// The harts of a machine on `bus`, as many as the bus was built for
-    /// ([`Bus::harts`]), at reset: in M-mode, hart 0 at the boot ROM's reset vector and
-    /// the others at its park loop ([`crate::bus::PARK_PC`]), where they wait for an IPI.
+    /// ([`Bus::harts`]) and as wide ([`Bus::xlen`]), at reset: in M-mode, hart 0 at the
+    /// boot ROM's reset vector and the others at its park loop
+    /// ([`crate::bus::PARK_PC`]), where they wait for an IPI.
     pub fn new(bus: Bus) -> Self {
         let harts = (0..bus.harts() as u32)
             .map(|id| {
@@ -116,7 +133,7 @@ impl Cpu {
                 } else {
                     crate::bus::PARK_PC
                 };
-                Hart::new(id, pc)
+                Hart::new(id, pc.into(), bus.xlen())
             })
             .collect();
         Cpu {
@@ -126,6 +143,16 @@ impl Cpu {
             wfi_skips_to_timer: true,
             turn: 0,
             step_idle: true,
+        }
+    }
+
+    /// Makes every hart, and the bus, `xlen` wide: for a machine at reset, before it
+    /// runs (loading an ELF64 program selects RV64, [`crate::Machine::load_elf`]). The
+    /// harts keep their registers and CSRs, which reset sets alike on both widths.
+    pub fn set_xlen(&mut self, xlen: Xlen) {
+        self.bus.set_xlen(xlen);
+        for hart in &mut self.harts {
+            hart.xlen = xlen;
         }
     }
 
@@ -150,7 +177,7 @@ impl Cpu {
     }
 
     /// The current hart's `mip`, with the bits the devices drive (see [`Hart::mip`]).
-    pub fn mip(&self) -> u32 {
+    pub fn mip(&self) -> u64 {
         self.harts[self.current].mip(&self.bus)
     }
 
@@ -243,9 +270,22 @@ impl Cpu {
     }
 }
 
+/// `v`'s low 32 bits, sign-extended to 64: a W instruction's result, and every RV32
+/// register value.
+#[inline]
+fn sext32(v: u64) -> u64 {
+    v as i32 as i64 as u64
+}
+
+/// An immediate as an operand: sign-extended to 64 bits.
+#[inline]
+fn imm64(imm: i32) -> u64 {
+    imm as i64 as u64
+}
+
 impl Hart {
-    /// A hart at reset: M-mode, every register 0, about to fetch from `pc`.
-    pub fn new(id: u32, pc: u32) -> Self {
+    /// A hart `xlen` wide at reset: M-mode, every register 0, about to fetch from `pc`.
+    pub fn new(id: u32, pc: u64, xlen: Xlen) -> Self {
         Hart {
             id,
             x: [0; 32],
@@ -254,7 +294,13 @@ impl Hart {
             csr: Csrs::default(),
             waiting: false,
             instret_written: false,
+            xlen,
         }
+    }
+
+    /// The hart's register width.
+    pub fn xlen(&self) -> Xlen {
+        self.xlen
     }
 
     /// Whether the hart's next turn executes the instruction at `pc`, rather than taking
@@ -264,15 +310,36 @@ impl Hart {
     }
 
     #[inline]
-    fn reg(&self, r: u8) -> u32 {
+    fn reg(&self, r: u8) -> u64 {
         self.x[r as usize]
     }
 
+    /// Writes `v` to register `x<r>` as the hart holds it (writes to `x0` are ignored):
+    /// all 64 bits on RV64; on RV32 its low 32 bits, sign-extended.
     #[inline]
-    fn set_reg(&mut self, r: u8, v: u32) {
+    pub fn set_reg(&mut self, r: u8, v: u64) {
         if r != 0 {
-            self.x[r as usize] = v;
+            self.x[r as usize] = match self.xlen {
+                Xlen::Rv64 => v,
+                Xlen::Rv32 => sext32(v),
+            };
         }
+    }
+
+    /// An address as the hart uses it: all 64 bits on RV64, the low 32 on RV32, where
+    /// addresses wrap at 4 GiB.
+    #[inline]
+    pub fn addr(&self, v: u64) -> u64 {
+        match self.xlen {
+            Xlen::Rv64 => v,
+            Xlen::Rv32 => v as u32 as u64,
+        }
+    }
+
+    /// `rs1 + imm`: the address a load, a store or `jalr` uses.
+    #[inline]
+    fn ea(&self, rs1: u8, imm: i32) -> u64 {
+        self.addr(self.reg(rs1).wrapping_add(imm64(imm)))
     }
 
     /// The hart's turn in a step ([`Cpu::step`]): takes an interrupt, or runs one
@@ -281,7 +348,7 @@ impl Hart {
     pub fn step(&mut self, bus: &mut Bus) -> bool {
         if let Some(irq) = self.pending_interrupt(bus) {
             self.waiting = false;
-            self.enter_trap(bus, INTERRUPT_BIT | irq, 0, self.pc);
+            self.enter_trap(bus, interrupt_bit(self.xlen) | irq as u64, 0, self.pc);
             return false;
         }
 
@@ -298,7 +365,7 @@ impl Hart {
         let result = self.fetch(bus, pc).and_then(|word| {
             self.execute(bus, word, pc).map_err(|mut t| {
                 if t.cause == Exception::IllegalInstr {
-                    t.tval = word;
+                    t.tval = word.into();
                 }
                 t
             })
@@ -310,7 +377,7 @@ impl Hart {
                     self.csr.minstret = self.csr.minstret.wrapping_add(1);
                 }
             }
-            Err(t) => self.enter_trap(bus, t.cause as u32, t.tval, pc),
+            Err(t) => self.enter_trap(bus, t.cause as u64, t.tval, pc),
         }
         if self.csr.mcountinhibit & 1 == 0 {
             self.csr.mcycle = self.csr.mcycle.wrapping_add(1);
@@ -330,15 +397,17 @@ impl Hart {
         let m_pending = pending & !self.csr.mideleg;
         let s_pending = pending & self.csr.mideleg;
         IRQ_PRIORITY.into_iter().find(|&irq| {
-            let bit = 1 << irq;
+            let bit = 1u64 << irq;
             (m_enabled && m_pending & bit != 0) || (s_enabled && s_pending & bit != 0)
         })
     }
 
-    /// Trap entry (spec section 6). `cause` includes the interrupt bit.
-    fn enter_trap(&mut self, bus: &mut Bus, cause: u32, tval: u32, epc: u32) {
-        let interrupt = cause & INTERRUPT_BIT != 0;
-        let code = cause & !INTERRUPT_BIT;
+    /// Trap entry (spec section 6). `cause` includes the interrupt bit, the top bit of
+    /// the hart's width.
+    fn enter_trap(&mut self, bus: &mut Bus, cause: u64, tval: u64, epc: u64) {
+        let interrupt_bit = interrupt_bit(self.xlen);
+        let interrupt = cause & interrupt_bit != 0;
+        let code = cause & !interrupt_bit;
         let deleg = if interrupt {
             self.csr.mideleg
         } else {
@@ -346,7 +415,7 @@ impl Hart {
         };
         let to_s = self.mode <= Mode::S && (deleg >> code) & 1 != 0;
         // A trap breaks any LR/SC sequence: the handler may run other code (or
-        // switch threads) before the interrupted `sc.w` executes.
+        // switch threads) before the interrupted `sc` executes.
         bus.reservation_mut(self.id as usize).clear();
         let s = &mut self.csr.mstatus;
 
@@ -373,14 +442,14 @@ impl Hart {
             if mie {
                 *s |= MSTATUS_MPIE;
             }
-            *s |= (self.mode as u32) << MSTATUS_MPP_SHIFT;
+            *s |= (self.mode as u64) << MSTATUS_MPP_SHIFT;
             self.mode = Mode::M;
             self.csr.mtvec
         };
 
         let base = tvec & !3;
         self.pc = if tvec & 3 == 1 && interrupt {
-            base.wrapping_add(4 * code)
+            self.addr(base.wrapping_add(4 * code))
         } else {
             base
         };
@@ -390,8 +459,10 @@ impl Hart {
         Trap::new(Exception::IllegalInstr, 0)
     }
 
-    /// Checks a control-transfer target. Without the C extension it must be 4-byte aligned.
-    fn jump(target: u32) -> Result<u32, Trap> {
+    /// Checks a control-transfer target, cut to the hart's width. Without the C
+    /// extension it must be 4-byte aligned.
+    fn jump(&self, target: u64) -> Result<u64, Trap> {
+        let target = self.addr(target);
         if target & 3 != 0 {
             Err(Trap::new(Exception::InstrMisaligned, target))
         } else {
@@ -399,20 +470,38 @@ impl Hart {
         }
     }
 
+    /// The ALU on the hart's width: all 64 bits on RV64; on RV32 the low 32 bits, as
+    /// the W instructions compute.
+    fn alu(&self, op: AluOp, a: u64, b: u64) -> u64 {
+        match self.xlen {
+            Xlen::Rv64 => alu64(op, a, b),
+            Xlen::Rv32 => alu32(op, a, b),
+        }
+    }
+
+    /// The M extension on the hart's width, like [`Hart::alu`].
+    fn muldiv(&self, op: MulOp, a: u64, b: u64) -> u64 {
+        match self.xlen {
+            Xlen::Rv64 => muldiv64(op, a, b),
+            Xlen::Rv32 => muldiv32(op, a, b),
+        }
+    }
+
     /// Executes one instruction and returns the next pc.
-    fn execute(&mut self, bus: &mut Bus, word: u32, pc: u32) -> Result<u32, Trap> {
-        let next = pc.wrapping_add(4);
-        // Grail's harts are RV32 until #145 gives them 64-bit registers.
-        match decode(word, Xlen::Rv32) {
-            Inst::Lui { rd, imm } => self.set_reg(rd, imm as u32),
-            Inst::Auipc { rd, imm } => self.set_reg(rd, pc.wrapping_add(imm as u32)),
+    fn execute(&mut self, bus: &mut Bus, word: u32, pc: u64) -> Result<u64, Trap> {
+        let next = self.addr(pc.wrapping_add(4));
+        match decode(word, self.xlen) {
+            // U-type immediates are sign-extended from bit 31 (`lui` of 0x80000 gives
+            // 0xffff_ffff_8000_0000 on RV64).
+            Inst::Lui { rd, imm } => self.set_reg(rd, imm64(imm)),
+            Inst::Auipc { rd, imm } => self.set_reg(rd, pc.wrapping_add(imm64(imm))),
             Inst::Jal { rd, imm } => {
-                let target = Self::jump(pc.wrapping_add(imm as u32))?;
+                let target = self.jump(pc.wrapping_add(imm64(imm)))?;
                 self.set_reg(rd, next);
                 return Ok(target);
             }
             Inst::Jalr { rd, rs1, imm } => {
-                let target = Self::jump(self.reg(rs1).wrapping_add(imm as u32) & !1)?;
+                let target = self.jump(self.ea(rs1, imm) & !1)?;
                 self.set_reg(rd, next);
                 return Ok(target);
             }
@@ -421,78 +510,76 @@ impl Hart {
                 let taken = match op {
                     BranchOp::Beq => a == b,
                     BranchOp::Bne => a != b,
-                    BranchOp::Blt => (a as i32) < (b as i32),
-                    BranchOp::Bge => (a as i32) >= (b as i32),
+                    BranchOp::Blt => (a as i64) < (b as i64),
+                    BranchOp::Bge => (a as i64) >= (b as i64),
                     BranchOp::Bltu => a < b,
                     BranchOp::Bgeu => a >= b,
                 };
                 if taken {
-                    return Self::jump(pc.wrapping_add(imm as u32));
+                    return self.jump(pc.wrapping_add(imm64(imm)));
                 }
             }
             Inst::Load { op, rd, rs1, imm } => {
-                let addr = self.reg(rs1).wrapping_add(imm as u32);
-                let v = self.load(bus, addr, op.size())?;
+                let v = self.load(bus, self.ea(rs1, imm), op.size())?;
                 let v = match op {
-                    LoadOp::Lb => v as i8 as i32 as u32,
-                    LoadOp::Lh => v as i16 as i32 as u32,
-                    LoadOp::Lw | LoadOp::Lbu | LoadOp::Lhu => v,
-                    LoadOp::Lwu | LoadOp::Ld => unreachable!("RV64 only: an RV32 hart decodes it as illegal"),
+                    LoadOp::Lb => v as i8 as i64 as u64,
+                    LoadOp::Lh => v as i16 as i64 as u64,
+                    LoadOp::Lw => sext32(v),
+                    LoadOp::Lbu | LoadOp::Lhu | LoadOp::Lwu | LoadOp::Ld => v,
                 };
                 self.set_reg(rd, v);
             }
             Inst::Store { op, rs1, rs2, imm } => {
-                let addr = self.reg(rs1).wrapping_add(imm as u32);
-                let size = op.size();
-                let v = match op {
-                    StoreOp::Sb => self.reg(rs2) & 0xff,
-                    StoreOp::Sh => self.reg(rs2) & 0xffff,
-                    StoreOp::Sw => self.reg(rs2),
-                    StoreOp::Sd => unreachable!("RV64 only: an RV32 hart decodes it as illegal"),
-                };
-                self.store(bus, addr, size, v)?;
+                // `store` writes the register's low `size` bytes.
+                self.store(bus, self.ea(rs1, imm), op.size(), self.reg(rs2))?;
             }
             Inst::OpImm { op, rd, rs1, imm } => {
-                let v = alu(op, self.reg(rs1), imm as u32);
+                let v = self.alu(op, self.reg(rs1), imm64(imm));
                 self.set_reg(rd, v);
             }
             Inst::Op { op, rd, rs1, rs2 } => {
-                let v = alu(op, self.reg(rs1), self.reg(rs2));
+                let v = self.alu(op, self.reg(rs1), self.reg(rs2));
                 self.set_reg(rd, v);
             }
             Inst::Mul { op, rd, rs1, rs2 } => {
-                let v = muldiv(op, self.reg(rs1), self.reg(rs2));
+                let v = self.muldiv(op, self.reg(rs1), self.reg(rs2));
+                self.set_reg(rd, v);
+            }
+            // RV64's W forms (RV32 decodes them as illegal): 32-bit operations whose
+            // result is sign-extended, what every RV32 operation is.
+            Inst::OpImm32 { op, rd, rs1, imm } => {
+                let v = alu32(op, self.reg(rs1), imm64(imm));
+                self.set_reg(rd, v);
+            }
+            Inst::Op32 { op, rd, rs1, rs2 } => {
+                let v = alu32(op, self.reg(rs1), self.reg(rs2));
+                self.set_reg(rd, v);
+            }
+            Inst::Mul32 { op, rd, rs1, rs2 } => {
+                let v = muldiv32(op, self.reg(rs1), self.reg(rs2));
                 self.set_reg(rd, v);
             }
             // One instruction at a time, in order: aq/rl need no work (see atomic.rs).
-            Inst::Lr {
-                width: AmoWidth::W,
-                rd,
-                rs1,
-                ..
-            } => {
-                let v = self.load_reserved(bus, self.reg(rs1))?;
+            // The `.d` forms are RV64 only: RV32 decodes them as illegal.
+            Inst::Lr { width, rd, rs1, .. } => {
+                let v = self.load_reserved(bus, self.reg(rs1), width.size())?;
                 self.set_reg(rd, v);
             }
             Inst::Sc {
-                width: AmoWidth::W,
-                rd,
-                rs1,
-                rs2,
-                ..
+                width, rd, rs1, rs2, ..
             } => {
-                let v = self.store_conditional(bus, self.reg(rs1), self.reg(rs2))?;
+                let v = self.store_conditional(bus, self.reg(rs1), width.size(), self.reg(rs2))?;
                 self.set_reg(rd, v);
             }
             Inst::Amo {
-                width: AmoWidth::W,
+                width,
                 op,
                 rd,
                 rs1,
                 rs2,
                 ..
             } => {
-                let old = self.amo(bus, op, self.reg(rs1), self.reg(rs2))?;
+                let old = self.amo(bus, op, self.reg(rs1), width.size(), self.reg(rs2))?;
                 self.set_reg(rd, old);
             }
             // Harts take turns one instruction at a time on one memory, with no caches and no
@@ -557,10 +644,10 @@ impl Hart {
             Inst::Csr { op, rd, src, csr } => {
                 let (operand, writes) = match (op, src) {
                     (CsrOp::Rw, CsrSrc::Reg(r)) => (self.reg(r), true),
-                    (CsrOp::Rw, CsrSrc::Imm(i)) => (i as u32, true),
+                    (CsrOp::Rw, CsrSrc::Imm(i)) => (i as u64, true),
                     // csrrs/csrrc with x0 or a zero immediate only read.
                     (_, CsrSrc::Reg(r)) => (self.reg(r), r != 0),
-                    (_, CsrSrc::Imm(i)) => (i as u32, i != 0),
+                    (_, CsrSrc::Imm(i)) => (i as u64, i != 0),
                 };
                 let old = self.csr_read(bus, csr)?;
                 if writes {
@@ -577,29 +664,17 @@ impl Hart {
             Inst::XcalDbg { rs1 } => {
                 let v = self.reg(rs1);
                 let name = excalibur::reg::abi_name(rs1);
-                let line = format!("[dbg] pc={pc:08x} {name} = {v:#010x} ({})\n", v as i32);
+                let line = match self.xlen {
+                    Xlen::Rv64 => format!("[dbg] pc={pc:016x} {name} = {v:#018x} ({})\n", v as i64),
+                    Xlen::Rv32 => format!("[dbg] pc={pc:08x} {name} = {:#010x} ({})\n", v as u32, v as i32),
+                };
                 bus.debug_out(line.as_bytes());
             }
             Inst::XcalHalt { rs1 } => {
                 if self.mode != Mode::M {
                     return Err(Self::illegal());
                 }
-                bus.exit = Some(crate::bus::Exit::Code(self.reg(rs1) & 0xff));
-            }
-            // RV64 only: an RV32 hart decodes them as illegal. #145 runs them.
-            Inst::OpImm32 { .. }
-            | Inst::Op32 { .. }
-            | Inst::Mul32 { .. }
-            | Inst::Lr {
-                width: AmoWidth::D, ..
-            }
-            | Inst::Sc {
-                width: AmoWidth::D, ..
-            }
-            | Inst::Amo {
-                width: AmoWidth::D, ..
-            } => {
-                unreachable!("RV64 only: an RV32 hart decodes it as illegal")
+                bus.exit = Some(crate::bus::Exit::Code(self.reg(rs1) as u32 & 0xff));
             }
             Inst::Illegal(_) => return Err(Self::illegal()),
         }
@@ -607,8 +682,27 @@ impl Hart {
     }
 }
 
-fn alu(op: AluOp, a: u32, b: u32) -> u32 {
+/// The RV64 ALU: 64-bit operations, shift amounts from the low 6 bits of `b`.
+fn alu64(op: AluOp, a: u64, b: u64) -> u64 {
     match op {
+        AluOp::Add => a.wrapping_add(b),
+        AluOp::Sub => a.wrapping_sub(b),
+        AluOp::Sll => a << (b & 63),
+        AluOp::Slt => ((a as i64) < (b as i64)) as u64,
+        AluOp::Sltu => (a < b) as u64,
+        AluOp::Xor => a ^ b,
+        AluOp::Srl => a >> (b & 63),
+        AluOp::Sra => ((a as i64) >> (b & 63)) as u64,
+        AluOp::Or => a | b,
+        AluOp::And => a & b,
+    }
+}
+
+/// The 32-bit ALU of RV64's W instructions and of RV32: the operation on the low 32
+/// bits of `a` and `b` (shift amounts from the low 5 bits of `b`), sign-extended.
+fn alu32(op: AluOp, a: u64, b: u64) -> u64 {
+    let (a, b) = (a as u32, b as u32);
+    let v = match op {
         AluOp::Add => a.wrapping_add(b),
         AluOp::Sub => a.wrapping_sub(b),
         AluOp::Sll => a << (b & 31),
@@ -619,20 +713,51 @@ fn alu(op: AluOp, a: u32, b: u32) -> u32 {
         AluOp::Sra => ((a as i32) >> (b & 31)) as u32,
         AluOp::Or => a | b,
         AluOp::And => a & b,
+    };
+    sext32(v.into())
+}
+
+/// RV64's M extension. `mulh*` return the upper 64 bits of the 128-bit product.
+/// Division by zero and overflow follow the spec, with no traps: dividing by zero gives
+/// all ones (the remainder: the dividend), and `i64::MIN / -1` gives `i64::MIN`
+/// (remainder 0).
+fn muldiv64(op: MulOp, a: u64, b: u64) -> u64 {
+    let (sa, sb) = (a as i64, b as i64);
+    match op {
+        MulOp::Mul => a.wrapping_mul(b),
+        MulOp::Mulh => ((sa as i128 * sb as i128) >> 64) as u64,
+        MulOp::Mulhsu => ((sa as i128 * b as i128) >> 64) as u64,
+        MulOp::Mulhu => ((a as u128 * b as u128) >> 64) as u64,
+        MulOp::Div => match sb {
+            0 => u64::MAX,
+            -1 => sa.wrapping_neg() as u64,
+            _ => (sa / sb) as u64,
+        },
+        MulOp::Divu => a.checked_div(b).unwrap_or(u64::MAX),
+        MulOp::Rem => match sb {
+            0 => a,
+            -1 => 0,
+            _ => (sa % sb) as u64,
+        },
+        MulOp::Remu => a.checked_rem(b).unwrap_or(a),
     }
 }
 
-/// M extension. Division by zero and overflow follow the spec: no traps.
-fn muldiv(op: MulOp, a: u32, b: u32) -> u32 {
+/// The 32-bit M extension of RV64's W instructions and of RV32: the operation on the
+/// low 32 bits of `a` and `b`, sign-extended, with [`muldiv64`]'s rules on 32-bit
+/// values (`i32::MIN / -1` gives `i32::MIN`). `mulh*` (RV32 only: RV64 has no 32-bit
+/// form) return the upper 32 bits of the 64-bit product.
+fn muldiv32(op: MulOp, a: u64, b: u64) -> u64 {
+    let (a, b) = (a as u32, b as u32);
     let (sa, sb) = (a as i32, b as i32);
-    match op {
+    let v = match op {
         MulOp::Mul => a.wrapping_mul(b),
         MulOp::Mulh => ((sa as i64 * sb as i64) >> 32) as u32,
         MulOp::Mulhsu => ((sa as i64 * b as i64) >> 32) as u32,
         MulOp::Mulhu => ((a as u64 * b as u64) >> 32) as u32,
         MulOp::Div => match sb {
             0 => u32::MAX,
-            -1 => sa.wrapping_neg() as u32, // i32::MIN / -1 = i32::MIN
+            -1 => sa.wrapping_neg() as u32,
             _ => (sa / sb) as u32,
         },
         MulOp::Divu => a.checked_div(b).unwrap_or(u32::MAX),
@@ -642,5 +767,6 @@ fn muldiv(op: MulOp, a: u32, b: u32) -> u32 {
             _ => (sa % sb) as u32,
         },
         MulOp::Remu => a.checked_rem(b).unwrap_or(a),
-    }
+    };
+    sext32(v.into())
 }

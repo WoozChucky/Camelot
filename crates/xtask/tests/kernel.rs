@@ -20,7 +20,6 @@ use grail::cpu::Mode;
 use grail::devices::{BLK_IRQ, UART_IRQ};
 use grail::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use grail::sysinfo::{REG_MAGIC, REG_TIMEBASE_HZ};
-use grail::trap::INTERRUPT_BIT;
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::collections::HashMap;
 use std::io::Write;
@@ -30,6 +29,9 @@ use std::sync::{Arc, Mutex};
 use xtask::kernel::{self, Assembler, Lang, BOOT_MAX_STEPS};
 use xtask::userprogs::CCompiler;
 use xtask::{repo_root, tools};
+
+/// The interrupt bit of mcause and scause on an RV32 hart.
+const INTERRUPT_BIT: u64 = 1 << 31;
 
 /// What the kernel prints before its shell starts, with `xcal.dbg`'s pc masked
 /// (see `mask_dbg_pc`).
@@ -169,13 +171,13 @@ fn printed(m: &Machine) -> String {
 }
 
 fn sym(elf: &grail::elf::Elf, name: &str) -> u32 {
-    elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"))
+    elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}")) as u32
 }
 
 /// Steps the machine until it is about to execute (or take a trap at) `pc`.
 fn step_to(m: &mut Machine, pc: u32) {
     for _ in 0..TO_KMAIN_STEPS {
-        if m.cpu.pc == pc {
+        if m.cpu.pc == u64::from(pc) {
             return;
         }
         m.cpu.step();
@@ -376,7 +378,7 @@ fn unexpected_machine_trap_reports_and_halts() {
         m.cpu.bus.load(timer_init, &u32::to_le_bytes(word)).unwrap();
         let mut via_machine_vec = false;
         let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
-            via_machine_vec |= cpu.pc == machine_vec;
+            via_machine_vec |= cpu.pc == u64::from(machine_vec);
         });
         let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
         assert!(via_machine_vec, "{word:#x}");
@@ -451,14 +453,14 @@ fn call_machine() -> (Machine, grail::elf::Elf) {
 /// its a0. It returns to `CALL_RETURN`, where the run stops.
 fn call_kernel(m: &mut Machine, elf: &grail::elf::Elf, name: &str, args: &[u32]) -> u32 {
     for (i, &a) in args.iter().enumerate() {
-        m.cpu.x[x("a0") as usize + i] = a;
+        m.cpu.set_reg(x("a0") as u8 + i as u8, a.into());
     }
-    m.cpu.x[x("sp") as usize] = CALL_STACK;
-    m.cpu.x[x("ra") as usize] = CALL_RETURN;
-    m.cpu.pc = sym(elf, name);
+    m.cpu.set_reg(x("sp") as u8, CALL_STACK.into());
+    m.cpu.set_reg(x("ra") as u8, CALL_RETURN.into());
+    m.cpu.pc = sym(elf, name).into();
     for _ in 0..1_000_000 {
-        if m.cpu.pc == CALL_RETURN {
-            return m.cpu.x[x("a0") as usize];
+        if m.cpu.pc == u64::from(CALL_RETURN) {
+            return m.cpu.x[x("a0") as usize] as u32;
         }
         m.cpu.step();
     }
@@ -579,7 +581,7 @@ fn kmain_runs_in_s_mode_with_traps_delegated() {
     let (mut m, elf) = load_committed();
     let kmain = sym(&elf, "kmain");
     let mut steps = 0;
-    while m.cpu.pc != kmain {
+    while m.cpu.pc != u64::from(kmain) {
         m.cpu.step();
         steps += 1;
         assert!(steps < TO_KMAIN_STEPS, "never reached kmain");
@@ -595,10 +597,10 @@ fn kmain_runs_in_s_mode_with_traps_delegated() {
     );
     // The machine timer and the IPI (on one hart too) stay in M-mode.
     assert_eq!(c.mie, (1 << IRQ_M_TIMER) | (1 << IRQ_M_SOFT));
-    assert_eq!(c.mtvec, sym(&elf, "machine_vec"));
-    assert_eq!(c.stvec, sym(&elf, "kernel_vec"));
+    assert_eq!(c.mtvec, u64::from(sym(&elf, "machine_vec")));
+    assert_eq!(c.stvec, u64::from(sym(&elf, "kernel_vec")));
     let scratch = sym(&elf, "machine_scratch");
-    assert_eq!(c.mscratch, scratch);
+    assert_eq!(c.mscratch, u64::from(scratch));
     assert_eq!(
         m.cpu.bus.peek(scratch + SCRATCH_INTERVAL),
         Some(TICK_INTERVAL as u32)
@@ -633,11 +635,11 @@ fn ticks_are_one_interval_apart() {
     let probes = [sym(&elf, "probe_load_insn"), sym(&elf, "probe_store_insn")];
     let mut probe_faults = 0;
     let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
-        if cpu.pc == run_shell && !shell_started {
+        if cpu.pc == u64::from(run_shell) && !shell_started {
             shell_started = true;
             ticks_at_shell = cpu.bus.peek(ticks);
         }
-        if cpu.pc == trap_init {
+        if cpu.pc == u64::from(trap_init) {
             steps_after_trap_init = Some(0u64);
         }
         if let (Some(steps), false) = (&mut steps_after_trap_init, shell_started) {
@@ -645,13 +647,13 @@ fn ticks_are_one_interval_apart() {
         }
         if shell_started {
             // Only the final MCALL_HALT may reach M-mode other than a tick.
-            if cpu.pc == machine_vec && cpu.csr.mcause == ECALL_FROM_S {
+            if cpu.pc == u64::from(machine_vec) && cpu.csr.mcause == u64::from(ECALL_FROM_S) {
                 halts += 1;
             }
             return;
         }
-        if cpu.pc == machine_vec {
-            if cpu.csr.mcause == INTERRUPT_BIT | IRQ_M_TIMER {
+        if cpu.pc == u64::from(machine_vec) {
+            if cpu.csr.mcause == INTERRUPT_BIT | u64::from(IRQ_M_TIMER) {
                 if steps_after_trap_init.is_none() {
                     early_ticks += 1;
                 } else {
@@ -660,24 +662,24 @@ fn ticks_are_one_interval_apart() {
                 deadlines.push(cpu.bus.clint.mtimecmp[0]);
             } else {
                 // The only other trap to M-mode: the final MCALL_HALT.
-                assert_eq!(cpu.csr.mcause, ECALL_FROM_S);
+                assert_eq!(cpu.csr.mcause, u64::from(ECALL_FROM_S));
                 halts += 1;
             }
         }
-        if cpu.pc == kernel_vec && cpu.csr.scause & INTERRUPT_BIT == 0 {
+        if cpu.pc == u64::from(kernel_vec) && cpu.csr.scause & INTERRUPT_BIT == 0 {
             // The vm self-test's deliberate page faults, caught by the probes.
-            assert!(probes.contains(&cpu.csr.sepc), "{:#x}", cpu.csr.sepc);
+            assert!(probes.contains(&(cpu.csr.sepc as u32)), "{:#x}", cpu.csr.sepc);
             assert!(
-                [LOAD_PAGE_FAULT, STORE_PAGE_FAULT].contains(&cpu.csr.scause),
+                [LOAD_PAGE_FAULT, STORE_PAGE_FAULT].contains(&(cpu.csr.scause as u32)),
                 "{:#x}",
                 cpu.csr.scause
             );
             probe_faults += 1;
-        } else if cpu.pc == kernel_vec && cpu.csr.scause == INTERRUPT_BIT | IRQ_S_EXT {
+        } else if cpu.pc == u64::from(kernel_vec) && cpu.csr.scause == INTERRUPT_BIT | u64::from(IRQ_S_EXT) {
             // The UART receiving the shell's `exit`.
             external += 1;
-        } else if cpu.pc == kernel_vec {
-            assert_eq!(cpu.csr.scause, INTERRUPT_BIT | IRQ_S_SOFT);
+        } else if cpu.pc == u64::from(kernel_vec) {
+            assert_eq!(cpu.csr.scause, INTERRUPT_BIT | u64::from(IRQ_S_SOFT));
             // Ticks arrive with paging on.
             assert_ne!(cpu.csr.satp >> 31, 0, "tick before paging");
             kernel_ticks.push(cpu.bus.clint.mtime);
@@ -736,6 +738,18 @@ const FRAME_SEPC: u32 = 128;
 const FRAME_SCAUSE: u32 = 132;
 const FRAME_SSTATUS: u32 = 140;
 
+/// The registers of `m`'s current hart, each the 32-bit value an RV32 hart holds.
+fn regs32(m: &Machine) -> [u32; 32] {
+    m.cpu.x.map(|r| r as u32)
+}
+
+/// Sets the registers of `m`'s current hart to `regs`, as an RV32 hart holds them.
+fn set_regs(m: &mut Machine, regs: &[u32; 32]) {
+    for (r, &v) in regs.iter().enumerate() {
+        m.cpu.set_reg(r as u8, v.into());
+    }
+}
+
 /// A distinct value for every register but x0 and sp: `tag` in the top byte,
 /// the register number in the others.
 fn reg_pattern(tag: u32, sp: u32) -> [u32; 32] {
@@ -755,11 +769,11 @@ fn busy_kmain() -> (Machine, grail::elf::Elf, [u32; 32]) {
     step_to(&mut m, kmain);
     let code: Vec<u8> = [J_SELF, J_SELF].iter().flat_map(|w| w.to_le_bytes()).collect();
     m.cpu.bus.load(kmain, &code).unwrap();
-    let mut regs = reg_pattern(0xa5, m.cpu.x[2]);
+    let mut regs = reg_pattern(0xa5, m.cpu.x[2] as u32);
     // tp keeps the hart's id: kernel code finds its `struct cpu` through it
     // (spec section 10, "Kernel locking"), and the trap handlers take locks.
-    regs[x("tp") as usize] = m.cpu.x[x("tp") as usize];
-    m.cpu.x = regs;
+    regs[x("tp") as usize] = m.cpu.x[x("tp") as usize] as u32;
+    set_regs(&mut m, &regs);
     m.cpu.csr.mie |= 1 << IRQ_S_SOFT;
     m.cpu.csr.mstatus |= MSTATUS_SIE;
     (m, elf, regs)
@@ -776,18 +790,18 @@ fn tick_preserves_every_register() {
     let cmp = clint.mtimecmp[0];
 
     step_to(&mut m, sym(&elf, "machine_vec"));
-    assert_eq!(m.cpu.csr.mcause, INTERRUPT_BIT | IRQ_M_TIMER);
-    assert_eq!(m.cpu.csr.mepc, kmain);
+    assert_eq!(m.cpu.csr.mcause, INTERRUPT_BIT | u64::from(IRQ_M_TIMER));
+    assert_eq!(m.cpu.csr.mepc, u64::from(kmain));
     // machine_vec returns to the loop, which takes the forwarded tick at once.
     step_to(&mut m, sym(&elf, "kernel_vec"));
-    assert_eq!(m.cpu.csr.scause, INTERRUPT_BIT | IRQ_S_SOFT);
-    assert_eq!(m.cpu.csr.sepc, kmain);
-    assert_eq!(m.cpu.x, regs, "machine_vec changed registers");
+    assert_eq!(m.cpu.csr.scause, INTERRUPT_BIT | u64::from(IRQ_S_SOFT));
+    assert_eq!(m.cpu.csr.sepc, u64::from(kmain));
+    assert_eq!(regs32(&m), regs, "machine_vec changed registers");
     assert_eq!(m.cpu.bus.clint.mtimecmp[0], cmp + TICK_INTERVAL);
 
     step_to(&mut m, kmain);
     assert_eq!(m.cpu.mode, Mode::S);
-    assert_eq!(m.cpu.x, regs, "kernel_vec changed registers");
+    assert_eq!(regs32(&m), regs, "kernel_vec changed registers");
     assert_ne!(m.cpu.csr.mstatus & MSTATUS_SIE, 0);
     assert_eq!(m.cpu.csr.mip & (1 << IRQ_S_SOFT), 0);
     assert_eq!(m.cpu.bus.peek(sym(&elf, "ticks")), Some(1));
@@ -807,14 +821,17 @@ fn kernel_vec_resumes_from_the_frame() {
         .load(sym(&elf, "machine_scratch") + SCRATCH_TICK, &1u32.to_le_bytes())
         .unwrap();
     step_to(&mut m, sym(&elf, "kernel_trap"));
-    let frame = m.cpu.x[x("a0") as usize];
+    let frame = m.cpu.x[x("a0") as usize] as u32;
     let peek = |m: &Machine, off: u32| m.cpu.bus.peek(frame + off).unwrap();
     for (i, &v) in regs.iter().enumerate() {
         assert_eq!(peek(&m, 4 * i as u32), v, "{}", reg::abi_name(i as u8));
     }
     assert_eq!(peek(&m, FRAME_SEPC), kmain);
-    assert_eq!(peek(&m, FRAME_SCAUSE), INTERRUPT_BIT | IRQ_S_SOFT);
-    let sstatus = peek(&m, FRAME_SSTATUS);
+    assert_eq!(
+        u64::from(peek(&m, FRAME_SCAUSE)),
+        INTERRUPT_BIT | u64::from(IRQ_S_SOFT)
+    );
+    let sstatus = u64::from(peek(&m, FRAME_SSTATUS));
     assert_ne!(sstatus & MSTATUS_SPIE, 0);
     assert_ne!(sstatus & MSTATUS_SPP, 0);
 
@@ -826,11 +843,11 @@ fn kernel_vec_resumes_from_the_frame() {
         put(4 * i as u32, v);
     }
     put(FRAME_SEPC, kmain + 4);
-    put(FRAME_SSTATUS, sstatus & !MSTATUS_SPIE);
+    put(FRAME_SSTATUS, (sstatus & !MSTATUS_SPIE) as u32);
 
     step_to(&mut m, kmain + 4);
     assert_eq!(m.cpu.mode, Mode::S);
-    assert_eq!(m.cpu.x, new);
+    assert_eq!(regs32(&m), new);
     assert_eq!(m.cpu.csr.mstatus & MSTATUS_SIE, 0);
     assert_eq!(m.cpu.bus.peek(sym(&elf, "ticks")), Some(1));
 }
@@ -868,17 +885,17 @@ fn ticks_preempting_kernel_code_change_nothing() {
         &mut m,
         BOOT_MAX_STEPS,
         |cpu| {
-            if cpu.pc == machine_vec
-                && cpu.csr.mcause == INTERRUPT_BIT | IRQ_M_TIMER
-                && !idle.contains(&cpu.csr.mepc)
+            if cpu.pc == u64::from(machine_vec)
+                && cpu.csr.mcause == INTERRUPT_BIT | u64::from(IRQ_M_TIMER)
+                && !idle.contains(&(cpu.csr.mepc as u32))
             {
                 machine_busy += 1;
             }
-            if cpu.pc == kernel_vec && !idle.contains(&cpu.csr.sepc) {
+            if cpu.pc == u64::from(kernel_vec) && !idle.contains(&(cpu.csr.sepc as u32)) {
                 kernel_busy += 1;
             }
         },
-        |m| m.cpu.pc == sym(&elf, "proc_run_init"),
+        |m| m.cpu.pc == u64::from(sym(&elf, "proc_run_init")),
     );
     m.cpu
         .bus
@@ -907,7 +924,7 @@ fn timer_rearm_carries_into_the_high_word() {
     clint.mtime = CMP - 0x100;
     clint.mtimecmp[0] = CMP;
     step_to(&mut m, sym(&elf, "machine_vec"));
-    assert_eq!(m.cpu.csr.mcause, INTERRUPT_BIT | IRQ_M_TIMER);
+    assert_eq!(m.cpu.csr.mcause, INTERRUPT_BIT | u64::from(IRQ_M_TIMER));
     for _ in 0..100 {
         if m.cpu.mode != Mode::M {
             break;
@@ -994,8 +1011,8 @@ fn illegal_instruction_panics_with_register_dump() {
     let func = sym(&elf, "illegal_instruction");
     assert!((func..func + 0x100).contains(&sepc), "sepc {sepc:#x}");
     // From S-mode, with interrupts on.
-    assert_ne!(v["sstatus"] & MSTATUS_SPP, 0);
-    assert_ne!(v["sstatus"] & MSTATUS_SPIE, 0);
+    assert_ne!(v["sstatus"] & MSTATUS_SPP as u32, 0);
+    assert_ne!(v["sstatus"] & MSTATUS_SPIE as u32, 0);
     // illegal_instruction set every register but sp to its number in each
     // byte, so this checks the whole trap frame layout.
     for i in 1..32u8 {
@@ -1037,7 +1054,7 @@ fn unmapped_load_panics() {
         "sepc {sepc:#x} holds {}",
         excalibur::decode(word, excalibur::Xlen::Rv32)
     );
-    assert_ne!(v["sstatus"] & MSTATUS_SPP, 0);
+    assert_ne!(v["sstatus"] & MSTATUS_SPP as u32, 0);
 }
 
 #[test]
@@ -1069,7 +1086,7 @@ fn store_to_kernel_text_panics() {
             return;
         }
         let load = access.is_some_and(|a| a.load_rd.is_some() && a.addr >> 12 == page);
-        accessed |= cpu.pc >> 12 == page || load;
+        accessed |= cpu.pc as u32 >> 12 == page || load;
     });
     let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
     assert_eq!(r, RunResult::Exited(PANIC_EXIT), "output:\n{out}");
@@ -1299,7 +1316,7 @@ fn check_kernel_memory(ram_mib: usize, extra_devices: &[DeviceEntry]) {
         )),
         "{out}"
     );
-    let satp = m.cpu.csr.satp;
+    let satp = m.cpu.csr.satp as u32;
     assert_ne!(satp >> 31, 0, "paging is off");
     let ram_end = 0x8000_0000u64 + (ram_mib as u64) * (1 << 20);
     let kernel_end = sym(&elf, "__kernel_end");
@@ -1440,7 +1457,7 @@ fn fault_with_interrupts_off_panics() {
     assert!(out.starts_with("panic: illegal instruction\n"), "{out}");
     let (_, v) = parse_panic(&out);
     assert_eq!((v["scause"], v["sepc"], v["stval"]), (2, kmain, 0));
-    assert_eq!(v["sstatus"] & MSTATUS_SPIE, 0);
+    assert_eq!(v["sstatus"] & MSTATUS_SPIE as u32, 0);
     // ra is where kmain would have returned to: supervisor_entry's
     // instruction after the call (after the branch that sends the other
     // harts to hart_main, and the call's two instructions).
@@ -1518,13 +1535,13 @@ struct Access {
 /// The load or store the instruction about to run makes, if it is one. Paging
 /// is off, so the address is physical.
 fn mem_access(cpu: &grail::cpu::Cpu) -> Option<Access> {
-    let word = cpu.bus.peek(cpu.pc)?;
+    let word = cpu.bus.peek(cpu.pc as u32)?;
     let (base, imm, load_rd, value) = match excalibur::decode(word, excalibur::Xlen::Rv32) {
         excalibur::Inst::Load { rd, rs1, imm, .. } => (rs1, imm, Some(rd), 0),
-        excalibur::Inst::Store { rs1, rs2, imm, .. } => (rs1, imm, None, cpu.x[rs2 as usize]),
+        excalibur::Inst::Store { rs1, rs2, imm, .. } => (rs1, imm, None, cpu.x[rs2 as usize] as u32),
         _ => return None,
     };
-    let addr = cpu.x[base as usize].wrapping_add(imm as u32);
+    let addr = (cpu.x[base as usize] as u32).wrapping_add(imm as u32);
     Some(Access { addr, load_rd, value })
 }
 
@@ -1557,7 +1574,7 @@ fn function(name: &str) -> std::ops::Range<u32> {
 /// mmio_read32, so a register access is in the file's own copy of the
 /// helper, with `ra` still pointing back into `f`.
 fn in_function(cpu: &grail::cpu::Cpu, f: &std::ops::Range<u32>) -> bool {
-    f.contains(&cpu.pc) || f.contains(&cpu.x[x("ra") as usize])
+    f.contains(&(cpu.pc as u32)) || f.contains(&(cpu.x[x("ra") as usize] as u32))
 }
 
 /// Runs the committed kernel with `input` typed on the UART. Returns how the
@@ -1689,7 +1706,7 @@ fn shell_takes_more_input_than_the_ring_buffer_holds() {
     let mut booted = false;
     let mut ier_writes = Vec::new();
     let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
-        booted |= cpu.pc == trap_init;
+        booted |= cpu.pc == u64::from(trap_init);
         if let Some((UART_IER, true, v)) = uart_access(cpu) {
             if booted {
                 ier_writes.push(v);
@@ -1771,7 +1788,7 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
             if matches!(uart_access(cpu), Some((_, false, _))) {
                 uart_reads += 1;
             }
-            if cpu.pc == wfi {
+            if cpu.pc == u64::from(wfi) {
                 wfis += 1;
             }
         },
@@ -1801,7 +1818,7 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
                 Some((UART_LSR, false, _)) => lsr_reads += 1,
                 _ => {}
             }
-            if cpu.pc == kernel_vec && cpu.csr.scause == INTERRUPT_BIT | IRQ_S_EXT {
+            if cpu.pc == u64::from(kernel_vec) && cpu.csr.scause == INTERRUPT_BIT | u64::from(IRQ_S_EXT) {
                 external += 1;
             }
         },
@@ -1848,8 +1865,11 @@ fn kernel_reads_the_timebase_from_sysinfo() {
     let mut kernel_ticks = Vec::new();
     let mut shell_started = false;
     let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
-        shell_started |= cpu.pc == run_shell;
-        if !shell_started && cpu.pc == kernel_vec && cpu.csr.scause == INTERRUPT_BIT | IRQ_S_SOFT {
+        shell_started |= cpu.pc == u64::from(run_shell);
+        if !shell_started
+            && cpu.pc == u64::from(kernel_vec)
+            && cpu.csr.scause == INTERRUPT_BIT | u64::from(IRQ_S_SOFT)
+        {
             kernel_ticks.push(cpu.bus.clint.mtime);
         }
     });
@@ -1928,7 +1948,7 @@ fn boot_with_sysinfo_reg_zero(reg: u32) -> (Vec<u32>, u32, String) {
     let kmain = sym(&elf, "kmain");
     let mut reads = Vec::new();
     for _ in 0..TO_KMAIN_STEPS {
-        if m.cpu.pc == kmain {
+        if m.cpu.pc == u64::from(kmain) {
             break;
         }
         let read = mem_access(&m.cpu)
@@ -1942,7 +1962,7 @@ fn boot_with_sysinfo_reg_zero(reg: u32) -> (Vec<u32>, u32, String) {
             }
         }
     }
-    assert_eq!(m.cpu.pc, kmain, "never reached kmain");
+    assert_eq!(m.cpu.pc, u64::from(kmain), "never reached kmain");
     let interval = m
         .cpu
         .bus
@@ -1993,7 +2013,7 @@ fn input_arriving_just_before_wfi_wakes_the_console() {
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
     // The shell sleeps in read; the scheduler found nothing to run and is
     // about to idle.
-    step_until(&mut m, 10_000, |_| {}, |m| m.cpu.pc == wfi);
+    step_until(&mut m, 10_000, |_| {}, |m| m.cpu.pc == u64::from(wfi));
     let n = tick_count(&m);
     let before = printed(&m).len();
     for &b in b"ticks\n" {
@@ -2352,19 +2372,19 @@ fn the_shell_is_the_first_process() {
     assert_eq!(current_name(c, sym(&elf, "cpus")).as_deref(), Some("sh"));
     let pid = m.cpu.bus.peek(m.cpu.bus.peek(sym(&elf, "cpus")).unwrap() + 4);
     assert_eq!(pid, Some(1));
-    assert_eq!(c.pc, USER_TEXT);
-    let (sp, argv) = (c.x[2], c.x[x("a1") as usize]);
+    assert_eq!(c.pc, u64::from(USER_TEXT));
+    let (sp, argv) = (c.x[2] as u32, c.x[x("a1") as usize] as u32);
     let mut regs = [0u32; 32];
     regs[2] = sp;
     regs[x("a0") as usize] = 1;
     regs[x("a1") as usize] = argv;
-    assert_eq!(c.x, regs);
+    assert_eq!(regs32(&m), regs);
     assert_eq!(sp % 16, 0);
     assert!(
         sp <= argv && argv < USER_TOP && sp > USER_STACK + PAGE / 2,
         "sp {sp:#x} argv {argv:#x}"
     );
-    let satp = c.csr.satp;
+    let satp = c.csr.satp as u32;
     let words = user_read(&m, satp, argv, 8);
     let argv0 = u32::from_le_bytes(words[..4].try_into().unwrap());
     assert_eq!(words[4..], [0; 4], "argv[1] is NULL");
@@ -2384,12 +2404,12 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
     let c = &m.cpu;
     // Traps go to user_vec, which finds the process's trap frame in
     // sscratch: at the top of its kernel stack page, in free RAM.
-    assert_eq!(c.csr.stvec, sym(&elf, "user_vec"));
-    let frame = c.csr.sscratch;
+    assert_eq!(c.csr.stvec, u64::from(sym(&elf, "user_vec")));
+    let frame = c.csr.sscratch as u32;
     assert_eq!(frame % PAGE, PAGE - TRAP_FRAME_SIZE, "frame {frame:#x}");
     assert!(frame > sym(&elf, "__kernel_end"));
 
-    let satp = c.csr.satp;
+    let satp = c.csr.satp as u32;
     let ksatp = kernel_satp(&m, &elf);
     assert_ne!(satp, ksatp);
     // Root entries 48-1023 are the kernel's: the same second-level tables.
@@ -2459,7 +2479,11 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
             if name != "sh" {
                 user_steps += 1;
             }
-            assert!((USER_TEXT..USER_TOP).contains(&cpu.pc), "U-mode at {:#x}", cpu.pc);
+            assert!(
+                (USER_TEXT..USER_TOP).contains(&(cpu.pc as u32)),
+                "U-mode at {:#x}",
+                cpu.pc
+            );
             if stretches.last().map(|s| &s.0) != Some(&name) {
                 if let Some((prev, _)) = stretches.last() {
                     if prev != "sh" {
@@ -2467,7 +2491,11 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
                         // the CPU when a tick preempts them, or for good.
                         match last_trap {
                             Some((cause, false)) => {
-                                assert_eq!(cause, INTERRUPT_BIT | IRQ_S_SOFT, "{prev} left after {cause:#x}");
+                                assert_eq!(
+                                    u64::from(cause),
+                                    INTERRUPT_BIT | u64::from(IRQ_S_SOFT),
+                                    "{prev} left after {cause:#x}"
+                                );
                                 timer_switches += 1;
                             }
                             Some((_, true)) => {}
@@ -2475,16 +2503,17 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
                         }
                     }
                 }
-                stretches.push((name, cpu.csr.satp));
+                stretches.push((name, cpu.csr.satp as u32));
             }
             last_trap = None;
         }
-        if cpu.pc == user_vec {
+        if cpu.pc == u64::from(user_vec) {
             // Every trap from U-mode arrives here, in S-mode, with SPP = U.
             assert_eq!(cpu.mode, Mode::S);
             assert_eq!(cpu.csr.mstatus & MSTATUS_SPP, 0);
-            let exit = cpu.csr.scause == ECALL_FROM_U && cpu.x[x("a7") as usize] == SYS_EXIT;
-            last_trap = Some((cpu.csr.scause, exit));
+            let exit =
+                cpu.csr.scause == u64::from(ECALL_FROM_U) && cpu.x[x("a7") as usize] == u64::from(SYS_EXIT);
+            last_trap = Some((cpu.csr.scause as u32, exit));
         }
     });
     assert_eq!(r, RunResult::Exited(0));
@@ -2528,8 +2557,13 @@ fn every_return_to_user_mode_sets_the_frames_hart_id() {
     let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(kernel::typed(b"ding\nexit\n")));
     step_to_user(&mut m, &elf, "ding");
     let user_trap = sym(&elf, "user_trap");
-    step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.pc == user_trap);
-    let frame = m.cpu.x[x("a0") as usize];
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| m.cpu.pc == u64::from(user_trap),
+    );
+    let frame = m.cpu.x[x("a0") as usize] as u32;
     assert_eq!(m.cpu.bus.peek(frame + FRAME_KERNEL_TP), Some(0));
     m.cpu
         .bus
@@ -2562,7 +2596,7 @@ fn programs_get_zeroed_memory_and_writable_data() {
         .filter(|(va, p)| *va != USER_STACK && p & PTE_W != 0)
         .collect();
     assert_eq!(rw.len(), 2, "{want:x?}");
-    assert_eq!(user_pages(&m, m.cpu.csr.satp), want);
+    assert_eq!(user_pages(&m, m.cpu.csr.satp as u32), want);
     // `exit` alone exits with the last program's status: the second run's.
     assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
     let out = printed(&m);
@@ -2595,7 +2629,7 @@ fn a_store_to_read_only_data_is_killed() {
 
 /// The registers `cpu` holds, and its pc.
 fn user_state(cpu: &grail::cpu::Cpu) -> ([u32; 32], u32) {
-    (cpu.x, cpu.pc)
+    (cpu.x.map(|r| r as u32), cpu.pc as u32)
 }
 
 #[test]
@@ -2623,36 +2657,42 @@ fn a_tick_in_user_mode_saves_every_register_and_switches_back_later() {
         RUN_MAX_STEPS,
         |_| {},
         |m| {
-            m.cpu.pc == user_vec
-                && m.cpu.csr.scause == INTERRUPT_BIT | IRQ_S_SOFT
+            m.cpu.pc == u64::from(user_vec)
+                && m.cpu.csr.scause == INTERRUPT_BIT | u64::from(IRQ_S_SOFT)
                 && m.cpu.csr.satp == regs_satp
         },
     );
     let (saved, _) = user_state(&m.cpu);
-    let sepc = m.cpu.csr.sepc;
+    let sepc = m.cpu.csr.sepc as u32;
     assert!((USER_TEXT..USER_TOP).contains(&sepc));
     assert_eq!(saved[2], 0x0202_0202, "regs set sp to its pattern");
     // In U-mode, sscratch points at the process's trap frame.
-    let frame = m.cpu.csr.sscratch;
+    let frame = m.cpu.csr.sscratch as u32;
 
     step_to(&mut m, user_trap);
-    assert_eq!(m.cpu.x[x("a0") as usize], frame);
-    assert_eq!(m.cpu.x[2], frame, "the kernel stack starts below the frame");
+    assert_eq!(m.cpu.x[x("a0") as usize] as u32, frame);
+    assert_eq!(
+        m.cpu.x[2] as u32, frame,
+        "the kernel stack starts below the frame"
+    );
     // user_vec swapped the user's a0 in, to save it.
-    assert_eq!(m.cpu.csr.sscratch, saved[x("a0") as usize]);
+    assert_eq!(m.cpu.csr.sscratch as u32, saved[x("a0") as usize]);
     let peek = |m: &Machine, off: u32| m.cpu.bus.peek(frame + off).unwrap();
     for (i, &v) in saved.iter().enumerate() {
         assert_eq!(peek(&m, 4 * i as u32), v, "{}", reg::abi_name(i as u8));
     }
     assert_eq!(peek(&m, FRAME_SEPC), sepc);
-    assert_eq!(peek(&m, FRAME_SCAUSE), INTERRUPT_BIT | IRQ_S_SOFT);
-    assert_eq!(peek(&m, FRAME_SSTATUS) & MSTATUS_SPP, 0);
+    assert_eq!(
+        u64::from(peek(&m, FRAME_SCAUSE)),
+        INTERRUPT_BIT | u64::from(IRQ_S_SOFT)
+    );
+    assert_eq!(peek(&m, FRAME_SSTATUS) & MSTATUS_SPP as u32, 0);
     // Traps in the kernel go to kernel_vec again.
     step_until(
         &mut m,
         100,
         |_| {},
-        |m| m.cpu.csr.stvec == sym(&elf, "kernel_vec"),
+        |m| m.cpu.csr.stvec == u64::from(sym(&elf, "kernel_vec")),
     );
 
     // Off to another process, then back to regs.
@@ -2717,8 +2757,11 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
     let user_vec = sym(&elf, "user_vec");
     let mut faults = Vec::new();
     let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
-        if cpu.pc == user_vec && cpu.csr.scause & INTERRUPT_BIT == 0 && cpu.csr.scause != ECALL_FROM_U {
-            faults.push((cpu.csr.scause, cpu.csr.sepc, cpu.csr.stval));
+        if cpu.pc == u64::from(user_vec)
+            && cpu.csr.scause & INTERRUPT_BIT == 0
+            && cpu.csr.scause != u64::from(ECALL_FROM_U)
+        {
+            faults.push((cpu.csr.scause as u32, cpu.csr.sepc as u32, cpu.csr.stval as u32));
         }
     });
     let out = printed(&m);
@@ -3030,7 +3073,7 @@ fn input_typed_while_processes_run_reaches_the_shell() {
     let user_vec = sym(&elf, "user_vec");
     let mut external = 0;
     let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
-        if cpu.pc == user_vec && cpu.csr.scause == INTERRUPT_BIT | IRQ_S_EXT {
+        if cpu.pc == u64::from(user_vec) && cpu.csr.scause == INTERRUPT_BIT | u64::from(IRQ_S_EXT) {
             external += 1;
         }
     });
@@ -3180,7 +3223,9 @@ fn stress_runs_many_processes_through_the_locks() {
                 let prev = last;
                 last = p;
                 if let Some((cause, pc)) = last_trap.take() {
-                    if prev != 0 && cause == INTERRUPT_BIT | IRQ_S_SOFT && proc_name(&m.cpu, prev) == "stress"
+                    if prev != 0
+                        && cause == INTERRUPT_BIT | u64::from(IRQ_S_SOFT)
+                        && proc_name(&m.cpu, prev) == "stress"
                     {
                         preemptions += 1;
                         if spin.contains(&pc) {
@@ -3190,8 +3235,8 @@ fn stress_runs_many_processes_through_the_locks() {
                 }
             }
         }
-        if m.cpu.pc == user_vec {
-            last_trap = Some((m.cpu.csr.scause, m.cpu.csr.sepc));
+        if m.cpu.pc == u64::from(user_vec) {
+            last_trap = Some((m.cpu.csr.scause, m.cpu.csr.sepc as u32));
         }
         m.cpu.step();
         steps += 1;
@@ -3611,7 +3656,7 @@ fn committed_kernel_is_what_our_toolchain_builds() {
             .unwrap()
             .symbol("user_program_count")
             .unwrap();
-        m.cpu.bus.peek(at).unwrap()
+        m.cpu.bus.peek(at as u32).unwrap()
     };
     let names = program_names();
     assert_eq!(programs(&built.elf) as usize, names.len());
@@ -3995,8 +4040,8 @@ fn trace_disks(m: &mut Machine, elf: &grail::elf::Elf, max_steps: u64) -> (RunRe
                 data,
             });
         }
-        if cpu.pc == sleep {
-            t.sleeps.push(cpu.x[x("a0") as usize]);
+        if cpu.pc == u64::from(sleep) {
+            t.sleeps.push(cpu.x[x("a0") as usize] as u32);
         }
         let Some((disk, off, store)) = disk_access(cpu) else {
             return;
@@ -4215,7 +4260,7 @@ fn a_slow_disk_leaves_the_kernel_asleep_in_wfi() {
         &mut m,
         BOOT_MAX_STEPS,
         |cpu| {
-            if cpu.pc == wfi {
+            if cpu.pc == u64::from(wfi) {
                 wfis += 1;
             }
         },
