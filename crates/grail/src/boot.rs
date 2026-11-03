@@ -12,13 +12,13 @@
 use crate::bus::BOOT_ROM_BASE;
 
 /// Where the disk loader starts in the boot ROM, after the stub (0x1000) and the park
-/// loop (0x1020). The stub jumps here through the entry word when the machine boots
+/// loop (0x1020). The stub jumps here through the entry point when the machine boots
 /// from disk.
 pub const DISK_BOOT_PC: u64 = BOOT_ROM_BASE + 0x100;
 
-/// The ROM's entry word (0x1010): where the stub and the park loop jump. It is the
-/// ROM's one writable word (32-bit stores), so that a bootloader can point harts woken
-/// later at the kernel it started.
+/// The ROM's entry point (0x1010): where the stub and the park loop jump, a doubleword
+/// (RV32: the word). It is the ROM's one writable location (8-byte stores; RV32: 4-byte
+/// ones), so that a bootloader can point harts woken later at the kernel it started.
 pub const BOOT_ENTRY_ADDR: u64 = BOOT_ROM_BASE + 0x10;
 
 /// The boot block: sectors 0 and 1 of disk 0.

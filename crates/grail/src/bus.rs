@@ -205,20 +205,24 @@ impl Bus {
     /// `msip` is set (an IPI), clears it and jumps to `entry` too, with a0 = its hart id.
     /// A one-hart machine's ROM has only the stub.
     ///
-    /// On an RV64 machine both read the entry word with `lwu`, since `lw` would
-    /// sign-extend an entry point at or above 2 GiB. (#147 makes it a doubleword.)
+    /// The entry point is the doubleword at 0x1010 ([`boot::BOOT_ENTRY_ADDR`]), which
+    /// an RV64 machine's code reads with `ld` (`lw` would sign-extend an entry point at
+    /// or above 2 GiB); an RV32 machine's reads its low word with `lw`.
     pub fn set_boot_entry(&mut self, entry: u64) {
         let load_entry = match self.xlen {
-            Xlen::Rv32 => 0x0102_a283, // lw  t0, 16(t0)
-            Xlen::Rv64 => 0x0102_e283, // lwu t0, 16(t0)
+            Xlen::Rv32 => 0x0102_a283, // lw t0, 16(t0)
+            Xlen::Rv64 => 0x0102_b283, // ld t0, 16(t0)
         };
         let mut words = vec![
             0x0000_0297,  // 0x1000: auipc t0, 0
-            load_entry,   //         lw    t0, 16(t0)     the entry word
+            load_entry,   //         ld    t0, 16(t0)     the entry point
             0x0000_0513,  //         li    a0, 0
             0x0002_8067,  //         jr    t0
-            entry as u32, // 0x1010: the entry point
+            entry as u32, // 0x1010: the entry point (its low word on RV64)
         ];
+        if self.xlen == Xlen::Rv64 {
+            words.push((entry >> 32) as u32); // 0x1014: its high word
+        }
         if self.harts() > 1 {
             words.resize(((PARK_PC - BOOT_ROM_BASE) / 4) as usize, 0);
             words.extend([
@@ -234,7 +238,7 @@ impl Bus {
                 0x0003_2023, //         sw    zero, 0(t1)     acknowledge the IPI
                 0x3040_1073, //         csrw  mie, zero
                 0x0000_12b7, //         lui   t0, 1           BOOT_ROM_BASE
-                load_entry,  //         lw    t0, 16(t0)      the entry word
+                load_entry,  //         ld    t0, 16(t0)      the entry point
                 0x0002_8067, //         jr    t0
             ]);
         }
@@ -242,8 +246,8 @@ impl Bus {
     }
 
     /// Fills the boot ROM to boot from disk 0 (spec section 7, "Boot from disk"): the
-    /// stub and the park loop of [`Bus::set_boot_entry`], with the entry word pointing
-    /// at the disk loader ([`boot::DISK_BOOT_PC`]), which this adds to the ROM.
+    /// stub and the park loop of [`Bus::set_boot_entry`], with the entry point at the
+    /// disk loader ([`boot::DISK_BOOT_PC`]), which this adds to the ROM.
     pub fn set_disk_boot(&mut self) {
         self.set_boot_entry(boot::DISK_BOOT_PC);
         self.rom.resize((boot::DISK_BOOT_PC - BOOT_ROM_BASE) as usize, 0);
@@ -453,14 +457,20 @@ impl Bus {
             }
             return Ok(());
         }
-        if addr == boot::BOOT_ENTRY_ADDR && size == 4 {
-            // The ROM's entry word, its one writable word: a bootloader points the
-            // harts it has not started yet at its kernel.
+        // The ROM's entry point, its one writable location: a bootloader points the
+        // harts it has not started yet at its kernel. Written whole, a doubleword on
+        // RV64 (the word on RV32): no halves, so a hart woken in between never jumps to
+        // half of one.
+        let entry_size = match self.xlen {
+            Xlen::Rv32 => 4,
+            Xlen::Rv64 => 8,
+        };
+        if addr == boot::BOOT_ENTRY_ADDR && size == entry_size {
             let at = (boot::BOOT_ENTRY_ADDR - BOOT_ROM_BASE) as usize;
-            if self.rom.len() < at + 4 {
-                self.rom.resize(at + 4, 0);
+            if self.rom.len() < at + size as usize {
+                self.rom.resize(at + size as usize, 0);
             }
-            self.rom[at..at + 4].copy_from_slice(&(val as u32).to_le_bytes());
+            self.rom[at..at + size as usize].copy_from_slice(&val.to_le_bytes()[..size as usize]);
             return Ok(());
         }
         if let Some(off) = Self::offset_in(addr, TEST_DEV_BASE, TEST_DEV_SIZE) {

@@ -518,7 +518,7 @@ fn an_elf64_program_makes_the_machine_rv64() {
     assert_eq!(m.cpu.xlen(), Xlen::Rv32);
     m.load_elf(&simple(Xlen::Rv64)).unwrap();
     assert_eq!((m.cpu.xlen(), m.config().xlen), (Xlen::Rv64, Xlen::Rv64));
-    // The boot ROM's stub reads the entry word with lwu, so the program starts at
+    // The boot ROM's stub reads the entry point with ld, so the program starts at
     // 0x8000_0000, not at its sign-extension.
     for _ in 0..4 {
         m.cpu.step();
@@ -585,12 +585,12 @@ fn an_rv64_machine_does_not_boot_from_disk_yet() {
 }
 
 /// On a machine of several harts, loading an ELF64 program rebuilds the boot ROM for
-/// RV64: the stub and the park loop read the entry word with `lwu`, so hart 0 and a
-/// hart woken by an IPI both start at 0x8000_0000, not at its sign-extension.
+/// RV64: the stub and the park loop read the doubleword entry point with `ld`, so hart
+/// 0 and a hart woken by an IPI both start at 0x8000_0000, not at its sign-extension.
 #[test]
-fn the_park_loop_reads_the_entry_with_lwu_on_rv64() {
+fn the_park_loop_reads_the_entry_with_ld_on_rv64() {
     const LW_T0: u32 = 0x0102_a283; // lw t0, 16(t0)
-    const LWU_T0: u32 = 0x0102_e283; // lwu t0, 16(t0)
+    const LD_T0: u32 = 0x0102_b283; // ld t0, 16(t0)
     let mut m = Machine::new(MachineConfig {
         harts: 2,
         ..MachineConfig::with_ram(1 << 20)
@@ -610,11 +610,12 @@ fn the_park_loop_reads_the_entry_with_lwu_on_rv64() {
     m.load_elf(&simple(Xlen::Rv64)).unwrap();
     let words = rom_words(&m);
     assert_eq!(
-        words.iter().filter(|&&w| w == LWU_T0).count(),
+        words.iter().filter(|&&w| w == LD_T0).count(),
         2,
         "the stub and the park loop"
     );
     assert!(!words.contains(&LW_T0));
+    assert_eq!(m.cpu.bus.read_mem(grail::boot::BOOT_ENTRY_ADDR, 8), Ok(RAM_BASE));
 
     // Hart 1 waits in the park loop until its msip is set, then jumps to the entry.
     for _ in 0..20 {
@@ -629,4 +630,32 @@ fn the_park_loop_reads_the_entry_with_lwu_on_rv64() {
         }
     }
     panic!("hart 1 did not reach the entry: pc {:#x}", m.cpu.hart(1).pc);
+}
+
+/// The entry point at 0x1010 is the boot ROM's one writable location: on RV64 a
+/// doubleword, written whole by an 8-byte store (no 4-byte halves); on RV32 the word.
+#[test]
+fn the_boot_entry_is_written_whole() {
+    let entry = grail::boot::BOOT_ENTRY_ADDR;
+    let mut m = machine(Xlen::Rv64);
+    m.cpu.bus.set_boot_entry(0x1_2345_6780);
+    assert_eq!(m.cpu.bus.read_mem(entry, 8), Ok(0x1_2345_6780), "above 4 GiB");
+    set(&mut m, A1, entry);
+    set(&mut m, A2, 0x0000_00ab_8000_1000);
+    run(&mut m, "sd a2, 0(a1)", s_type(0, A2, A1, 3));
+    assert_eq!(m.cpu.bus.read_mem(entry, 8), Ok(0x0000_00ab_8000_1000));
+    // Half of it, or anything else in the ROM, is an access fault.
+    run_traps(&mut m, "sw a2, 0(a1)", s_type(0, A2, A1, 2), 7, entry);
+    run_traps(&mut m, "sw a2, 4(a1)", s_type(4, A2, A1, 2), 7, entry + 4);
+    run_traps(&mut m, "sd a2, 8(a1)", s_type(8, A2, A1, 3), 7, entry + 8);
+    assert_eq!(m.cpu.bus.read_mem(entry, 8), Ok(0x0000_00ab_8000_1000));
+
+    // RV32: the word, with a 4-byte store.
+    let mut m = machine(Xlen::Rv32);
+    m.cpu.bus.set_boot_entry(RAM_BASE);
+    set(&mut m, A1, entry);
+    set(&mut m, A2, 0x8000_2000);
+    run(&mut m, "sw a2, 0(a1)", s_type(0, A2, A1, 2));
+    assert_eq!(m.cpu.bus.read_mem(entry, 4), Ok(0x8000_2000));
+    run_traps(&mut m, "sh a2, 0(a1)", s_type(0, A2, A1, 1), 7, entry);
 }
