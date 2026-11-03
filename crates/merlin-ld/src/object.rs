@@ -5,40 +5,14 @@
 //! Sections and symbols keep their ELF indices, so a relocation's symbol index
 //! and a symbol's `st_shndx` can be used directly.
 
-pub const SHT_NULL: u32 = 0;
-pub const SHT_PROGBITS: u32 = 1;
-pub const SHT_SYMTAB: u32 = 2;
-pub const SHT_STRTAB: u32 = 3;
-pub const SHT_RELA: u32 = 4;
-pub const SHT_NOBITS: u32 = 8;
-pub const SHT_REL: u32 = 9;
-pub const SHT_GROUP: u32 = 17;
-pub const SHT_SYMTAB_SHNDX: u32 = 18;
-
-pub const SHF_WRITE: u32 = 0x1;
-pub const SHF_ALLOC: u32 = 0x2;
-pub const SHF_EXECINSTR: u32 = 0x4;
-pub const SHF_MERGE: u32 = 0x10;
-pub const SHF_STRINGS: u32 = 0x20;
-pub const SHF_GROUP: u32 = 0x200;
-pub const SHF_TLS: u32 = 0x400;
-
-pub const SHN_UNDEF: u16 = 0;
-pub const SHN_LORESERVE: u16 = 0xff00;
-pub const SHN_ABS: u16 = 0xfff1;
-pub const SHN_COMMON: u16 = 0xfff2;
-
-pub const STB_LOCAL: u8 = 0;
-pub const STB_GLOBAL: u8 = 1;
-pub const STB_WEAK: u8 = 2;
-
-pub const STT_NOTYPE: u8 = 0;
-pub const STT_SECTION: u8 = 3;
-pub const STT_FILE: u8 = 4;
-pub const STT_TLS: u8 = 6;
-
-pub const ET_REL: u16 = 1;
-pub const EM_RISCV: u16 = 243;
+// The ELF constants, elf32's (shared with merlin-objdump, and generated into
+// the C linker's tables by crates/xtask/src/c_tables.rs).
+pub use elf32::{
+    EM_RISCV, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHF_GROUP, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE,
+    SHN_ABS, SHN_COMMON, SHN_LORESERVE, SHN_UNDEF, SHT_GROUP, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL,
+    SHT_RELA, SHT_STRTAB, SHT_SYMTAB, SHT_SYMTAB_SHNDX, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE,
+    STT_NOTYPE, STT_SECTION, STT_TLS,
+};
 
 #[derive(Debug, Clone)]
 pub struct Section {

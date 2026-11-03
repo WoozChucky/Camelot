@@ -11,6 +11,7 @@ together.
 |---|---|
 | `string.c` | `strlen`, `strcmp`, `strncmp`, `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`, `memmove`, `memcmp` |
 | `stdlib.c` | `atoi`, `strtol` (bases 2 to 36, or 0 for C's prefixes; out of range gives `LONG_MAX` or `LONG_MIN`) |
+| `i64.c` | `i64`, 64-bit integers as two words (merlin has no `long long`): arithmetic, shifts, comparisons, checked division, and `i64_dec`/`i64_hex` to print them; the assembler and the linker compute with them |
 | `malloc.c` | `malloc`, `free`, `calloc`, `realloc` on top of `sbrk`, under a mutex |
 | `printf.c` | `printf`, `fprintf` (to a descriptor), `snprintf`, `puts` |
 | `getline.c` | `getline` (a console line from stdin), `reader_init` and `reader_getline` (lines from any descriptor) |
