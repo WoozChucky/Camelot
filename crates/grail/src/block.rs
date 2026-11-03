@@ -494,6 +494,9 @@ impl BlockDevice {
             return error::NONE;
         }
         let buf = &mut ram[start as usize..(start + len) as usize];
+        // The backend may hand the buffer to the host's kernel (a file's ReadFile or
+        // read), which cannot take a first touch of lazily backed RAM itself.
+        crate::ram::touch(buf);
         let result = if cmd == CMD_READ {
             self.backend.read(self.sector, buf)
         } else {

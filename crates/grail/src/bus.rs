@@ -9,6 +9,7 @@ use crate::framebuffer::{Framebuffer, VRAM_SIZE};
 use crate::keyboard::Keyboard;
 use crate::net::NetDevice;
 use crate::pointer::Pointer;
+use crate::ram::Ram;
 use crate::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use excalibur::Xlen;
 use std::io::Write;
@@ -103,7 +104,8 @@ pub enum Exit {
 }
 
 pub struct Bus {
-    pub ram: Vec<u8>,
+    /// RAM, backed lazily ([`Ram`]): a byte slice from `RAM_BASE`.
+    pub ram: Ram,
     /// The boot ROM's bytes, from `BOOT_ROM_BASE` (the rest of its page reads as 0).
     pub rom: Vec<u8>,
     pub clint: Clint,
@@ -140,20 +142,26 @@ impl Bus {
     /// The bus of a machine built from `config`, which must be valid
     /// ([`MachineConfig::validate`]), with these disks (at most [`MAX_DISKS`]) and no
     /// network cards. The disks are not opened from `config.disks` here:
-    /// [`crate::Machine::new`] does that.
+    /// [`crate::Machine::new`] does that. Panics if the host cannot reserve the RAM,
+    /// which [`Bus::with_nets`] returns as an error.
     pub fn new(config: &MachineConfig, disks: Vec<BlockDevice>) -> Self {
-        Bus::with_nets(config, disks, Vec::new())
+        Bus::with_nets(config, disks, Vec::new()).unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// [`Bus::new`] with these network cards too (at most [`MAX_NETS`]). They are not
-    /// opened from `config.nets` here: [`crate::Machine::new`] does that.
-    pub fn with_nets(config: &MachineConfig, disks: Vec<BlockDevice>, nets: Vec<NetDevice>) -> Self {
+    /// opened from `config.nets` here: [`crate::Machine::new`] does that. An error if
+    /// the host cannot reserve the RAM ([`Ram::new`]).
+    pub fn with_nets(
+        config: &MachineConfig,
+        disks: Vec<BlockDevice>,
+        nets: Vec<NetDevice>,
+    ) -> Result<Self, String> {
         assert!(disks.len() <= MAX_DISKS, "at most {MAX_DISKS} disks");
         assert!(nets.len() <= MAX_NETS, "at most {MAX_NETS} network cards");
         let harts = config.harts;
         assert!(harts >= 1, "a machine has at least one hart");
         let mut bus = Bus {
-            ram: vec![0; config.ram_size],
+            ram: Ram::new(config.ram_size)?,
             rom: Vec::new(),
             clint: Clint::new(harts),
             plic: Plic::new(harts),
@@ -178,7 +186,7 @@ impl Bus {
             // run it from reset.
             bus.set_boot_entry(0);
         }
-        bus
+        Ok(bus)
     }
 
     /// How many harts share this bus.
@@ -859,7 +867,7 @@ mod tests {
         let nets = (0..nets)
             .map(|i| NetDevice::new(MacAddr::local(i as u32 + 1), Box::new(hub.attach())))
             .collect();
-        Bus::with_nets(&MachineConfig::with_ram(4096), disks, nets)
+        Bus::with_nets(&MachineConfig::with_ram(4096), disks, nets).unwrap()
     }
 
     #[test]

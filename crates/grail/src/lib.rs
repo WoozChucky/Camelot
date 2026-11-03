@@ -23,6 +23,7 @@ pub mod lake;
 pub mod mmio;
 pub mod net;
 pub mod pointer;
+pub mod ram;
 pub mod sysinfo;
 pub mod trap;
 /// Hand-written Win32 declarations, shared with the other Windows programs of the
@@ -132,7 +133,7 @@ impl Machine {
             let (mac, backend) = card.map_err(|e| format!("network card {i}: {e}"))?;
             nets.push(NetDevice::new(mac, backend));
         }
-        let mut cpu = Cpu::new(Bus::with_nets(&config, disks, nets));
+        let mut cpu = Cpu::new(Bus::with_nets(&config, disks, nets)?);
         let pacer = config.clock_hz.map(Pacer::new);
         // With a real-time clock a wfi takes real time; see `run_steps`.
         cpu.wfi_skips_to_timer = pacer.is_none();
