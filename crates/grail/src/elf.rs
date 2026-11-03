@@ -1,5 +1,8 @@
 //! Loads executables: PT_LOAD segments, the entry point and symbol values.
 //! The parsing lives in the shared `elf` crate.
+//!
+//! This module is `grail::elf`; inside it, `elf::...` names the crate (a
+//! module's own name is not in scope within it), as in `elf::Elf::parse`.
 
 pub use elf::Error as ElfError;
 

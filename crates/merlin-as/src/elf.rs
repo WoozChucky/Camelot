@@ -1,5 +1,9 @@
 //! Writes an [`Object`] as an ELF32 little-endian relocatable file (ET_REL).
 //!
+//! Not the `elf` crate, which reads ELF files: merlin-as only uses that one
+//! in its tests (a dev-dependency), where `elf::` names the crate. In this
+//! crate's own code `elf::` is this module (`crate::elf`).
+//!
 //! Layout:
 //!
 //! ```text
