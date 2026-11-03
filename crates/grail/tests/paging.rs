@@ -7,6 +7,7 @@
 //! Most tests call [`Hart::translate`] on a hart in S-mode, over page tables built in
 //! RAM by [`Tables`]; the last ones run instructions on a machine.
 
+use excalibur::csr::MSTATUS_TVM;
 use excalibur::Xlen;
 use grail::bus::{Bus, RAM_BASE};
 use grail::cpu::{Hart, Mode};
@@ -454,6 +455,34 @@ fn sfence_vma_and_a_changed_mapping() {
     m.cpu.step();
     assert_eq!(m.cpu.x[A0 as usize], 0xbbbb_bbbb_0000_0002);
     assert_eq!(m.cpu.pc, CODE_VA + 12);
+}
+
+#[test]
+fn sfence_vma_is_privileged() {
+    // S-mode runs it (here the form that names an address); U-mode may not, nor S-mode
+    // with mstatus.TVM set: both are illegal instructions.
+    let word = SFENCE_VMA | A1 << 15;
+    for (mode, tvm, legal) in [
+        (Mode::S, false, true),
+        (Mode::U, false, false),
+        (Mode::S, true, false),
+    ] {
+        let (mut m, mut tables) = machine(&[(word, "sfence.vma a1, zero")]);
+        if mode == Mode::U {
+            tables.map(&mut m.cpu.bus, CODE_VA, 0, RAM, R | X | A | U);
+        }
+        m.cpu.mode = mode;
+        if tvm {
+            m.cpu.csr.mstatus |= MSTATUS_TVM;
+        }
+        m.cpu.step();
+        if legal {
+            assert_eq!(m.cpu.pc, CODE_VA + 4, "{mode:?}");
+        } else {
+            assert_eq!(m.cpu.pc, TRAP_VECTOR, "{mode:?}, TVM {tvm}");
+            assert_eq!((m.cpu.csr.mcause, m.cpu.csr.mtval), (2, word.into()));
+        }
+    }
 }
 
 #[test]
