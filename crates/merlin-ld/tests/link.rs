@@ -2003,6 +2003,19 @@ fn line_tables_are_kept_and_relocated() {
     // changes nothing.
     assert_eq!(merlin_ld::strip_debug(&linked.elf).unwrap(), without.elf);
     assert_eq!(merlin_ld::strip_debug(&without.elf).unwrap(), without.elf);
+    // An RV64 program (with debug sections) is refused, not cut at ELF32's
+    // offsets.
+    let rv64 = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../elf/tests/llvm/rv64/prog.elf"
+    ))
+    .unwrap();
+    let err = merlin_ld::strip_debug(&rv64).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("ELF64 (RV64) files are not supported yet"),
+        "{err}"
+    );
 }
 
 #[test]

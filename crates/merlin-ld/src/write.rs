@@ -347,9 +347,13 @@ fn get32(b: &[u8], at: usize) -> u32 {
 /// debug information: the bytes up to the debug sections stay as they are,
 /// then come the section names without theirs and the section headers
 /// without theirs. A file with no debug sections comes back unchanged.
-/// Anything laid out otherwise is an error.
+/// Anything laid out otherwise is an error, and so is an ELF64 file: the
+/// offsets below are ELF32's, the class [`write`] makes.
 pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, String> {
     let parsed = elf::Elf::parse(elf).map_err(|e| e.to_string())?;
+    if parsed.class != elf::Class::Elf32 {
+        return Err("strip_debug: ELF64 (RV64) files are not supported yet".into());
+    }
     let is_debug = |s: &elf::Section| !s.is_alloc() && s.name.starts_with(".debug_");
     if !parsed.sections.iter().any(is_debug) {
         return Ok(elf.to_vec());
