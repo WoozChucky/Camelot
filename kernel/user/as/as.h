@@ -11,6 +11,7 @@
  *   parser.c  tokens to statements (parser.rs)
  *   encode.c  one instruction to machine words (encode.rs)
  *   asm.c     sections, symbols, directives, local labels (asm.rs)
+ *   dwarf.c   the DWARF line table of `.file` and `.loc` (dwarf.rs)
  *   elf.c     the relocatable object file (elf.rs)
  *   tables.h  the encodings, names and numbers, generated from the host
  *   tables.c  tools' own tables (crates/xtask/src/as_tables.rs): the header
@@ -19,10 +20,7 @@
  *
  * Unlike merlin-as, which holds every token of the file at once, this one
  * reads a statement, assembles it and forgets it: a machine has 4 MiB of RAM
- * by default, and the kernel's biggest assembly file has 200 KB of text.
- *
- * Not yet here (the host's merlin-as has them): `.file N` and `.loc`, the
- * DWARF line tables (step 2 of #135). */
+ * by default, and the kernel's biggest assembly file has 200 KB of text. */
 #ifndef AS_H
 #define AS_H
 
@@ -293,6 +291,65 @@ void asm_statement(struct stmt *s);
 /* Ends the file: checks and resolves what needs every label (merlin-as's
  * finish). Returns the object, or 0 if there were errors. */
 struct object *asm_finish(void);
+
+/* ---- Line tables (dwarf.c) ---- */
+/* `.loc` flags. */
+#define LOC_IS_STMT 1
+#define LOC_BASIC_BLOCK 2
+#define LOC_PROLOGUE_END 4
+#define LOC_EPILOGUE_BEGIN 8
+
+/* A `.file`: a directory ("" for the compilation directory), a name, and
+ * maybe an MD5 checksum. */
+struct dfile {
+    char *dir;
+    char *name;
+    int has_md5;
+    uchar md5[16];
+};
+
+/* Where a row says its instruction comes from: a `.loc`. */
+struct loc {
+    uint file;
+    uint line;
+    uint column;
+    uint flags;
+    uint isa;
+    uint discriminator;
+};
+
+/* A row of the line table: offset `offset` of section `section`. */
+struct row {
+    int section;
+    uint offset;
+    struct loc loc;
+};
+
+/* A 4-byte field of `.debug_line` (at `at`, from the section's start) for
+ * the linker to fill in: offset `off` of `.debug_line_str` (section -1) or
+ * of a code section. */
+struct dfixup {
+    uint at;
+    int section;
+    uint off;
+};
+
+/* An encoded line table: `.debug_line`'s bytes, the strings it adds to
+ * `.debug_line_str`, and the fields to relocate. */
+struct line_table {
+    struct buf line;
+    struct buf line_str;
+    struct dfixup *fixups;
+    uint nfixups;
+    uint cap;
+};
+
+/* Encodes the rows (file 0 is `root`, files 1.. are `files`) as LLVM does,
+ * one sequence per section in the order their first rows came, each ending
+ * at the section's size. `base` is where the table goes in `.debug_line`
+ * and `str_base` where its strings go in `.debug_line_str`. */
+void dwarf_encode(struct dfile *root, struct dfile *files, uint nfiles, struct row *rows, uint nrows,
+                  struct section *sections, uint nsections, uint base, uint str_base, struct line_table *t);
 
 /* ---- The ELF file (elf.c) ---- */
 void elf_write(struct object *obj, struct buf *out);

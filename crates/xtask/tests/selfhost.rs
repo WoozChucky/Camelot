@@ -4,10 +4,11 @@
 //! kernel on an image with `/bin/sh`, `/bin/as` and the corpus in `/src`, has
 //! the shell run `as` on each file into `/out`, then reads the objects back
 //! on the host and compares them. The corpus: merlin-as's golden encodings,
-//! every hand-written `.s` of the repository, and merlin's assembly for a C
-//! file (without `-g`: the line tables of `.file` and `.loc` are step 2). An
-//! ignored test adds merlin's assembly for two big C files, the shell and the
-//! kernel's vm.c, about 500 million instructions each inside Grail.
+//! every hand-written `.s` of the repository, the line table corpus
+//! (`crates/merlin-as/tests/debug_line`, whose objects are clang's), and
+//! merlin's assembly for a C file, with `-g` (`.file`, `.loc` and a DWARF
+//! compile unit) and without. An ignored test adds merlin's `-g` assembly
+//! for two big C files, the shell and the kernel's vm.c.
 
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::read::Fs;
@@ -23,7 +24,13 @@ const PROMPT: &str = "$ ";
 fn corpus(big: bool) -> Vec<(String, String)> {
     let root = repo_root();
     let mut files: Vec<PathBuf> = vec![root.join("crates/merlin-as/tests/golden/encode.s")];
-    for dir in ["kernel", "kernel/user", "kernel/boot", "crates/grail/rom"] {
+    for dir in [
+        "kernel",
+        "kernel/user",
+        "kernel/boot",
+        "crates/grail/rom",
+        "crates/merlin-as/tests/debug_line",
+    ] {
         let mut more: Vec<PathBuf> = std::fs::read_dir(root.join(dir))
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -57,7 +64,11 @@ fn corpus(big: bool) -> Vec<(String, String)> {
             (name, std::fs::read_to_string(p).unwrap())
         })
         .collect();
-    // merlin's assembly, as the kernel and the programs are built (without -g).
+    // merlin's assembly, as the kernel and the programs are built (-g), and
+    // without debug information.
+    let user = root.join("kernel/user");
+    let plain = toolchain::without_debug_info(|| toolchain::compile_c(&user, "hello.c", &[], "kernel/user"));
+    out.push(("kernel_user_hello.c.s".into(), plain.unwrap()));
     let mut c_files = vec![("kernel/user", "hello.c", &[][..])];
     if big {
         c_files.extend([
@@ -66,10 +77,9 @@ fn corpus(big: bool) -> Vec<(String, String)> {
         ]);
     }
     for (dir, file, includes) in c_files {
-        let text = toolchain::without_debug_info(|| {
-            toolchain::compile_c(&root.join(dir), file, includes, dir).unwrap()
-        });
-        out.push((format!("{}_{file}.s", dir.replace('/', "_")), text));
+        let text = toolchain::compile_c(&root.join(dir), file, includes, dir).unwrap();
+        assert!(text.contains(".loc "), "{file} has no line information");
+        out.push((format!("{}_{file}.g.s", dir.replace('/', "_")), text));
     }
     out
 }
@@ -215,6 +225,14 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
         "    .equ x, 1 / 0\n",
         "    addi a0, a1,\n    .bogus 1\n",
         "    .ascii \"\\q\"\n",
+        // Line information (merlin-as's line_information_errors, and more).
+        ".loc 0 1 0\nnop\n",
+        ".file 1 \"a.c\"\n.loc 1 1 0\nnop\n",
+        ".file 0 \"d\" \"a.c\"\n.file 2 \"b.h\"\n.loc 2 1 0\nnop\n",
+        ".file 0 \"d\" \"a.c\"\n.loc 0 1 0 frobnicate\nnop\n.loc 0 2 0 is_stmt 2\n.loc 0 1 0 isa\n",
+        ".file 1 \"a.c\"\n.file 1 \"b.c\"\n.file 0 \"d\" \"a.c\" source \"int x;\"\n.file 0 \"d\" \"a.c\" md5\n",
+        ".file 0 \"d\" \"a.c\" md5 \"x\"\n.file\n.file \"a\" \"b\"\n.file 1\n.loc\n.loc 0 x\n",
+        ".section .debug_info\nnop\n",
     ];
     let inputs: Vec<(String, String)> = cases
         .iter()

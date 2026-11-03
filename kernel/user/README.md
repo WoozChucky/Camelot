@@ -55,7 +55,7 @@ $ wait
 
 | Program | Usage | What it does |
 |---|---|---|
-| `as` | `as [-o OUT.o] FILE.s` | the assembler, merlin-as rewritten in C (`as/`): the same language, the same object byte for byte, the same error messages (`FILE:LINE: error: ...`); no line tables (`.file N`, `.loc`) yet. The first step of self-hosting: section 10, "Self-hosting", of the spec. Only in `/bin` of the root image: the kernel does not build it in (it needs files) |
+| `as` | `as [-o OUT.o] FILE.s` | the assembler, merlin-as rewritten in C (`as/`): the same language, the same object byte for byte, the same error messages (`FILE:LINE: error: ...`), and the same line tables from `.file`/`.loc` (merlin `-g` output). The first step of self-hosting: section 10, "Self-hosting", of the spec. Only in `/bin` of the root image: the kernel does not build it in (it needs files) |
 
 ## Network programs
 
