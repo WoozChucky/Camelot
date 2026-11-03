@@ -229,7 +229,8 @@ fn start_grail(args: Vec<String>) -> Result<(SocketAddr, MachineThread, Option<S
                 let text = word.map_or("<unmapped>".to_string(), |w| {
                     excalibur::decode(w, cpu.xlen()).to_string()
                 });
-                eprintln!("h{} {:?} {:08x}: {}", cpu.id, cpu.mode, cpu.pc, text);
+                let digits = cpu.xlen().bits() as usize / 4;
+                eprintln!("h{} {:?} {:0digits$x}: {}", cpu.id, cpu.mode, cpu.pc, text);
             }
         };
         grail::gdb::serve(&mut m, listener, true, &mut trace)
