@@ -107,6 +107,22 @@ static uint npcrel_lo, cappcrel_lo;
 /* Names given to `.local`. */
 static struct strmap locals;
 static uint line;
+/* Line information: `.file 0` (the compilation directory and the main
+ * file) and the other `.file`s by number (files[n].name NULL: no .file n). */
+static int have_file0;
+static struct dfile file0;
+static struct dfile *files;
+static uint nfiles, capfiles;
+/* The last `.loc`, until an instruction (or data) takes it. */
+static int have_loc;
+static struct loc pending_loc;
+/* `.loc`'s is_stmt, which carries over from one to the next. */
+static int is_stmt = 1;
+/* The line table's rows, and the source line of the first `.loc` (for an
+ * error about the table). */
+static struct row *rows;
+static uint nrows, caprows;
+static uint first_loc_line;
 
 #define DOT "."
 #define DOT_LABEL ".Ldot$"
@@ -540,6 +556,20 @@ static void align_to(uint align) {
     }
 }
 
+/* Gives the pending `.loc`, if any, a row at the current offset: the
+ * instruction or data about to be emitted is where it points. */
+static void take_loc(void) {
+    if (!have_loc) {
+        return;
+    }
+    have_loc = 0;
+    rows = grow(rows, &caprows, nrows + 1, sizeof(struct row));
+    rows[nrows].section = current;
+    rows[nrows].offset = sections[current].size;
+    rows[nrows].loc = pending_loc;
+    nrows++;
+}
+
 /* Appends the encoder's words and turns their fixups into relocations. */
 static void place(const char *mnemonic, struct emit *emits, int n) {
     struct section *s = &sections[current];
@@ -557,6 +587,7 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
         error("instruction is not 4-byte aligned (add .align 2)");
         return;
     }
+    take_loc();
     uint base = s->size;
     char *dot = NULL;
     /* The hidden labels on auipcs a later %pcrel_lo refers to. */
@@ -644,6 +675,9 @@ static char *arg_name(struct dirarg *args, uint nargs, uint i, const char *what)
 }
 
 static void data(struct dirarg *args, uint nargs, uint size) {
+    if (nargs > 0) {
+        take_loc();
+    }
     for (uint k = 0; k < nargs; k++) {
         if (args[k].kind != DA_EXPR) {
             error("expected a number, not a string");
@@ -771,6 +805,190 @@ static int is_one_of(const char *name, const char *const *names) {
     return 0;
 }
 
+/* ---- Line information ---- */
+
+static int is_word(struct dirarg *a, const char *word) {
+    return a->kind == DA_EXPR && a->e->kind == E_SYM && strcmp(a->e->sym, word) == 0;
+}
+
+static int same_file(struct dfile *a, struct dfile *b) {
+    if (strcmp(a->dir, b->dir) != 0 || strcmp(a->name, b->name) != 0 || a->has_md5 != b->has_md5) {
+        return 0;
+    }
+    return !a->has_md5 || memcmp(a->md5, b->md5, 16) == 0;
+}
+
+/* `.file "name"` (the file's name, which merlin-as has no use for) or
+ * `.file N ["dir"] "name" [md5 0x...]`: file number N of the line table.
+ * `.file 0` gives the compilation directory and the main file. */
+static void file_directive(struct dirarg *args, uint nargs) {
+    if (nargs == 1 && args[0].kind == DA_STR) {
+        return;
+    }
+    if (nargs == 0 || args[0].kind != DA_EXPR) {
+        error(".file: expected a file number or a name");
+        return;
+    }
+    i64 v;
+    if (!eval(args[0].e, &v) || v.hi != 0) {
+        error(".file: expected a file number");
+        return;
+    }
+    uint n = v.lo;
+    char *strings[2];
+    uint nstrings = 0;
+    uint i = 1;
+    for (; i < nargs && args[i].kind == DA_STR; i++) {
+        if (nstrings < 2) {
+            strings[nstrings] = tmp_strndup((char *)args[i].str, args[i].len);
+        }
+        nstrings++;
+    }
+    struct dfile file;
+    memset(&file, 0, sizeof file);
+    if (nstrings == 1) {
+        file.dir = "";
+        file.name = strings[0];
+    } else if (nstrings == 2) {
+        file.dir = strings[0];
+        file.name = strings[1];
+    } else {
+        error(".file: expected [\"directory\"] \"name\" after the number");
+        return;
+    }
+    uint rest = nargs - i;
+    if (rest == 2 && is_word(&args[i], "md5")) {
+        struct dirarg *sum = &args[i + 1];
+        if (sum->kind == DA_WIDE) {
+            memcpy(file.md5, sum->wide, 16);
+        } else if (sum->kind == DA_EXPR && sum->e->kind == E_NUM) {
+            /* A number that fits 64 bits: the low half, big-endian. */
+            for (uint b = 0; b < 4; b++) {
+                file.md5[8 + b] = (uchar)(sum->e->num.hi >> (24 - 8 * b));
+                file.md5[12 + b] = (uchar)(sum->e->num.lo >> (24 - 8 * b));
+            }
+        } else {
+            error(".file: md5 needs a 128-bit number");
+            return;
+        }
+        file.has_md5 = 1;
+    } else if (rest > 0 && is_word(&args[i], "source")) {
+        error(".file: embedded source is not supported");
+        return;
+    } else if (rest > 0) {
+        error(".file: unexpected text after the name");
+        return;
+    }
+    file.dir = perm_strdup(file.dir);
+    file.name = perm_strdup(file.name);
+    if (n == 0) {
+        file0 = file;
+        have_file0 = 1;
+        return;
+    }
+    if (n >= 1u << 24) {
+        die("out of memory");
+    }
+    if (nfiles <= n) {
+        files = grow(files, &capfiles, n + 1, sizeof(struct dfile));
+        memset(&files[nfiles], 0, (n + 1 - nfiles) * sizeof(struct dfile));
+        nfiles = n + 1;
+    }
+    if (files[n].name != NULL && !same_file(&files[n], &file)) {
+        error(fmt("file number %u is already defined", n));
+        return;
+    }
+    files[n] = file;
+}
+
+/* `.loc FILE [LINE [COLUMN]] [basic_block] [prologue_end]
+ * [epilogue_begin] [is_stmt 0|1] [isa N] [discriminator N]`: the next
+ * instruction comes from this place in the source. */
+static void loc_directive(struct dirarg *args, uint nargs) {
+    /* Two `.loc`s in a row: the first still gets a row, here (LLVM's rule). */
+    take_loc();
+    uint nums[3];
+    uint nnums = 0;
+    uint i = 0;
+    while (nnums < 3 && i < nargs && args[i].kind == DA_EXPR && args[i].e->kind != E_SYM) {
+        i64 v;
+        if (!eval(args[i].e, &v) || v.hi != 0) {
+            error(".loc: expected a number");
+            return;
+        }
+        nums[nnums++] = v.lo;
+        i++;
+    }
+    if (nnums == 0) {
+        error(".loc: expected a file number");
+        return;
+    }
+    uint file = nums[0];
+    int defined = file == 0 ? have_file0 : file < nfiles && files[file].name != NULL;
+    if (!defined) {
+        error(fmt(".loc: file number %u has no .file", file));
+        return;
+    }
+    struct loc loc;
+    memset(&loc, 0, sizeof loc);
+    loc.file = file;
+    loc.line = nnums > 1 ? nums[1] : 0;
+    loc.column = nnums > 2 ? nums[2] : 0;
+    int stmt = is_stmt;
+    while (i < nargs) {
+        if (args[i].kind != DA_EXPR || args[i].e->kind != E_SYM) {
+            error(".loc: expected an option such as prologue_end");
+            return;
+        }
+        char *opt = args[i].e->sym;
+        i++;
+        uint flag;
+        if (strcmp(opt, "basic_block") == 0) {
+            flag = LOC_BASIC_BLOCK;
+        } else if (strcmp(opt, "prologue_end") == 0) {
+            flag = LOC_PROLOGUE_END;
+        } else if (strcmp(opt, "epilogue_begin") == 0) {
+            flag = LOC_EPILOGUE_BEGIN;
+        } else if (strcmp(opt, "is_stmt") == 0 || strcmp(opt, "isa") == 0 || strcmp(opt, "discriminator") == 0) {
+            flag = 0;
+        } else {
+            error(fmt(".loc: unknown option '%s'", opt));
+            return;
+        }
+        if (flag != 0) {
+            loc.flags |= flag;
+            continue;
+        }
+        /* An option with a number after it. */
+        i64 v;
+        if (!(i < nargs && args[i].kind == DA_EXPR && eval(args[i].e, &v) && v.hi == 0)) {
+            error(fmt(".loc: %s needs a number", opt));
+            return;
+        }
+        i++;
+        if (strcmp(opt, "is_stmt") == 0) {
+            if (v.lo > 1) {
+                error(".loc: is_stmt must be 0 or 1");
+                return;
+            }
+            stmt = v.lo == 1;
+        } else if (strcmp(opt, "isa") == 0) {
+            loc.isa = v.lo;
+        } else {
+            loc.discriminator = v.lo;
+        }
+    }
+    is_stmt = stmt;
+    if (stmt) {
+        loc.flags |= LOC_IS_STMT;
+    }
+    if (first_loc_line == 0) {
+        first_loc_line = line;
+    }
+    pending_loc = loc;
+    have_loc = 1;
+}
+
 static const char *const IGNORED[] = {".ident",       ".option",        ".attribute", ".addrsig", ".addrsig_sym",
                                       ".cfi_startproc", ".cfi_endproc", NULL};
 
@@ -833,6 +1051,9 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
     } else if (strcmp(name, ".word") == 0 || strcmp(name, ".long") == 0 || strcmp(name, ".4byte") == 0) {
         data(args, nargs, 4);
     } else if (strcmp(name, ".ascii") == 0 || strcmp(name, ".asciz") == 0 || strcmp(name, ".string") == 0) {
+        if (nargs > 0) {
+            take_loc();
+        }
         for (uint i = 0; i < nargs; i++) {
             if (args[i].kind == DA_STR) {
                 emit_bytes(args[i].str, args[i].len);
@@ -909,13 +1130,9 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
             }
         }
     } else if (strcmp(name, ".file") == 0) {
-        /* `.file "name"`: merlin-as has no use for it. `.file N` and `.loc`
-         * (line tables) are still to come here. */
-        if (!(nargs == 1 && args[0].kind == DA_STR)) {
-            error(".file with a number (line tables) is not supported yet: assemble on the host with merlin-as");
-        }
+        file_directive(args, nargs);
     } else if (strcmp(name, ".loc") == 0) {
-        error(".loc (line tables) is not supported yet: assemble on the host with merlin-as");
+        loc_directive(args, nargs);
     } else if (is_one_of(name, IGNORED)) {
         /* Metadata that does not change the output. */
     } else {
@@ -1161,6 +1378,68 @@ static char *section_symbol(int sec) {
     return symbols[i].name;
 }
 
+static uint section_size(const char *name) {
+    for (uint i = 0; i < nsections; i++) {
+        if (strcmp(sections[i].name, name) == 0) {
+            return sections[i].size;
+        }
+    }
+    return 0;
+}
+
+/* Appends `bytes` to the section named `name` (made if there is none, as
+ * debug sections are). Returns the section. */
+static int append(const char *name, struct buf *bytes) {
+    int back = current;
+    switch_section(name);
+    int sec = current;
+    buf_put(&sections[sec].data, bytes->data, bytes->len);
+    sections[sec].size += bytes->len;
+    current = back;
+    return sec;
+}
+
+/* Writes the rows as `.debug_line` (and its strings in `.debug_line_str`),
+ * with relocations for the strings and the sections' addresses. */
+static void line_table(void) {
+    if (nrows == 0) {
+        return;
+    }
+    if (!have_file0) {
+        error_at(first_loc_line, "line information (.loc) needs .file 0, the compilation directory and the main file");
+        return;
+    }
+    for (uint n = 1; n < nfiles; n++) {
+        if (files[n].name == NULL) {
+            error_at(first_loc_line, fmt("the line table's files must be numbered 1, 2, ...: no .file %u", n));
+            return;
+        }
+    }
+    uint base = section_size(".debug_line");
+    uint str_base = section_size(".debug_line_str");
+    struct line_table t;
+    dwarf_encode(&file0, files + 1, nfiles > 0 ? nfiles - 1 : 0, rows, nrows, sections, nsections, base, str_base,
+                 &t);
+    int line_sec = append(".debug_line", &t.line);
+    int str_sec = append(".debug_line_str", &t.line_str);
+    for (uint k = 0; k < t.nfixups; k++) {
+        struct dfixup *f = &t.fixups[k];
+        char *symbol = section_symbol(f->section < 0 ? str_sec : f->section);
+        struct section *s = &sections[line_sec];
+        s->relocs = grow(s->relocs, &s->cap, s->nrelocs + 1, sizeof(struct reloc));
+        struct reloc *r = &s->relocs[s->nrelocs++];
+        memset(r, 0, sizeof *r);
+        r->offset = f->at;
+        r->kind = R_RISCV_32;
+        r->symbol = symbol;
+        r->addend = i64_u(f->off);
+        r->line = first_loc_line;
+    }
+    free(t.line.data);
+    free(t.line_str.data);
+    free(t.fixups);
+}
+
 /* In debug sections, a relocation against a `.L` label is one against its
  * section, plus its offset. */
 static void debug_relocs_to_sections(void) {
@@ -1194,6 +1473,7 @@ struct object *asm_finish(void) {
         }
     }
     resolve_local_fixups();
+    line_table();
     debug_relocs_to_sections();
     if (error_count(PHASE_ASM) > 0) {
         return NULL;
