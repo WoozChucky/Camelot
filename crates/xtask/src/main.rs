@@ -515,8 +515,11 @@ fn kernel(k: KernelArgs) -> ExitCode {
     // The C assembler's tables, from the host tools' (as_tables.rs): before
     // the user programs are built.
     match xtask::as_tables::write(&root) {
-        Ok(true) => eprintln!("wrote {}", xtask::as_tables::TABLES_H),
-        Ok(false) => {}
+        Ok(wrote) => {
+            for file in wrote {
+                eprintln!("wrote {file}");
+            }
+        }
         Err(e) => {
             eprintln!("xtask: {e}");
             return ExitCode::from(1);

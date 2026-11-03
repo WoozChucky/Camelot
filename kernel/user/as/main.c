@@ -152,6 +152,9 @@ int main(int argc, char **argv) {
     int n;
     lexer_init(&lx, src, len);
     asm_init();
+    /* A syntax error that is the next statement's (parse_takes_next). */
+    int skip = 0;
+    uint skip_line = 0;
     for (;;) {
         error_phase(PHASE_LEX);
         n = lex_statement(&lx, &toks);
@@ -159,7 +162,16 @@ int main(int argc, char **argv) {
             break;
         }
         error_phase(PHASE_PARSE);
+        if (skip) {
+            parse_report_next(toks[0].line);
+            skip = 0;
+            tmp_reset();
+            continue;
+        }
         int count = parse_statement(toks, n, &stmts);
+        if (count < 0) {
+            skip = parse_takes_next(&skip_line);
+        }
         error_phase(PHASE_ASM);
         for (int i = 0; i < count; i++) {
             asm_statement(&stmts[i]);
@@ -169,6 +181,10 @@ int main(int argc, char **argv) {
     if (n < 0) {
         errors_print(input, PHASE_LEX);
         return 1;
+    }
+    if (skip) {
+        error_phase(PHASE_PARSE);
+        parse_report_next(skip_line);
     }
     if (error_count(PHASE_PARSE) > 0) {
         errors_print(input, PHASE_PARSE);

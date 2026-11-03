@@ -473,7 +473,7 @@ impl Build {
         }
         let programs = crate::userprogs::build_all(&self.kernel_dir.join(USER_DIR))?;
         let text = crate::userprogs::generate(
-            &crate::userprogs::embedded(programs.clone()),
+            &crate::userprogs::embedded(&programs),
             crate::userprogs::CCompiler::Merlin,
         );
         std::fs::write(&path, &text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
@@ -599,9 +599,8 @@ pub fn build_reference(
     userprogs::compile_clang(clang, &user, &asm, verbose)?;
     let programs = userprogs::build_all_with(&user, CCompiler::Clang(&asm))?;
     let progs = work.join(USERPROGS);
-    let programs = userprogs::embedded(programs);
-    std::fs::write(&progs, userprogs::generate(&programs, CCompiler::Clang(&asm)))
-        .map_err(|e| format!("cannot write {}: {e}", progs.display()))?;
+    let text = userprogs::generate(&userprogs::embedded(&programs), CCompiler::Clang(&asm));
+    std::fs::write(&progs, text).map_err(|e| format!("cannot write {}: {e}", progs.display()))?;
     Build {
         kernel_dir: root.join("kernel"),
         obj_dir: work.join("obj"),

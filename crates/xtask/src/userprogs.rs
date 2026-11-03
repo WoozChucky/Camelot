@@ -50,9 +50,9 @@ pub const SCRIPT: &str = "user.ld";
 pub const DISK_ONLY: &[&str] = &["as"];
 
 /// The programs the kernel builds in: all but [`DISK_ONLY`], by name.
-pub fn embedded(programs: Vec<Program>) -> Vec<Program> {
+pub fn embedded(programs: &[Program]) -> Vec<&Program> {
     programs
-        .into_iter()
+        .iter()
         .filter(|p| !DISK_ONLY.contains(&p.name.as_str()))
         .collect()
 }
@@ -495,7 +495,8 @@ fn emit_bytes(out: &mut String, bytes: &[u8]) {
 /// *elf; u32 size; }` per program, in order), `user_program_count`, then the
 /// names and the images, each image 4-byte aligned under a global label
 /// `user_elf_<name>`. `cc` is what compiled their C, which the header says.
-pub fn generate(programs: &[Program], cc: CCompiler) -> String {
+pub fn generate<P: std::borrow::Borrow<Program>>(programs: &[P], cc: CCompiler) -> String {
+    let programs: &[&Program] = &programs.iter().map(|p| p.borrow()).collect::<Vec<_>>();
     let mut s = String::new();
     let cc = match cc {
         CCompiler::Merlin => "merlin",
@@ -567,7 +568,7 @@ pub fn empty() -> String {
 /// returns the text of the kernel's `userprogs.s` ([`generate`]): all but
 /// the [`DISK_ONLY`] ones.
 pub fn generated(dir: &Path) -> Result<String, String> {
-    Ok(generate(&embedded(build_all(dir)?), CCompiler::Merlin))
+    Ok(generate(&embedded(&build_all(dir)?), CCompiler::Merlin))
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@
  * does it where merlin-as does. `.L` labels go into the symbol table only if
  * a relocation still refers to them. */
 #include "as.h"
+#include "tables.h"
 
 /* ---- A string -> int map (open addressing) ---- */
 
@@ -214,8 +215,8 @@ static int symbol_index(const char *name) {
 static void define(const char *name, int section, uint value) {
     int i = symbol_index(name);
     if (symbols[i].defined) {
-        char msg[200];
-        snprintf(msg, sizeof msg, "symbol '%s' is already defined", name);
+        char *msg;
+        msg = fmt("symbol '%s' is already defined", name);
         error(msg);
         return;
     }
@@ -488,8 +489,8 @@ static void emit_bytes(const uchar *bytes, uint n) {
     if (s->kind == SEC_BSS) {
         for (uint i = 0; i < n; i++) {
             if (bytes[i] != 0) {
-                char msg[200];
-                snprintf(msg, sizeof msg, "non-zero data in %s", s->name);
+                char *msg;
+                msg = fmt("non-zero data in %s", s->name);
                 error(msg);
                 return;
             }
@@ -542,13 +543,13 @@ static void align_to(uint align) {
 /* Appends the encoder's words and turns their fixups into relocations. */
 static void place(const char *mnemonic, struct emit *emits, int n) {
     struct section *s = &sections[current];
-    char msg[200];
+    char *msg;
     if (s->kind == SEC_BSS) {
         error("instructions are not allowed in .bss");
         return;
     }
     if (s->kind == SEC_DEBUG) {
-        snprintf(msg, sizeof msg, "instructions are not allowed in %s", s->name);
+        msg = fmt("instructions are not allowed in %s", s->name);
         error(msg);
         return;
     }
@@ -564,7 +565,7 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
         int j = emits[i].auipc;
         if (emits[i].has_fixup && j >= 0) {
             if (j >= i) {
-                snprintf(msg, sizeof msg, "internal encoder error: '%s' refers to a later auipc", mnemonic);
+                msg = fmt("internal encoder error: '%s' refers to a later auipc", mnemonic);
                 error(msg);
                 return;
             }
@@ -594,7 +595,7 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
                     }
                     symbol = dot;
                 }
-                if (e->kind == R_PCREL_LO12_I || e->kind == R_PCREL_LO12_S) {
+                if (e->kind == R_RISCV_PCREL_LO12_I || e->kind == R_RISCV_PCREL_LO12_S) {
                     pcrel_los = grow(pcrel_los, &cappcrel_lo, npcrel_lo + 1, sizeof(struct pcrel_lo));
                     pcrel_los[npcrel_lo].section = current;
                     pcrel_los[npcrel_lo].name = perm_strdup(symbol);
@@ -616,14 +617,14 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
 /* ---- Directives ---- */
 
 static int arg_const(struct dirarg *args, uint nargs, uint i, const char *what, i64 *out) {
-    char msg[200];
+    char *msg;
     if (i < nargs && args[i].kind == DA_EXPR) {
         if (eval(args[i].e, out)) {
             return 1;
         }
-        snprintf(msg, sizeof msg, "%s: expected a constant expression", what);
+        msg = fmt("%s: expected a constant expression", what);
     } else {
-        snprintf(msg, sizeof msg, "%s: missing argument", what);
+        msg = fmt("%s: missing argument", what);
     }
     error(msg);
     return 0;
@@ -636,8 +637,8 @@ static char *arg_name(struct dirarg *args, uint nargs, uint i, const char *what)
     if (i < nargs && args[i].kind == DA_STR) {
         return tmp_strndup((char *)args[i].str, args[i].len);
     }
-    char msg[200];
-    snprintf(msg, sizeof msg, "%s: expected a name", what);
+    char *msg;
+    msg = fmt("%s: expected a name", what);
     error(msg);
     return NULL;
 }
@@ -667,7 +668,7 @@ static void data(struct dirarg *args, uint nargs, uint size) {
             if (strcmp(name, DOT) == 0) {
                 name = dot_label(off);
             }
-            add_reloc(off, R_ABS32, name, addend);
+            add_reloc(off, R_RISCV_32, name, addend);
             static const uchar zero[4] = {0, 0, 0, 0};
             emit_bytes(zero, 4);
         } else if (size == 4) {
@@ -680,24 +681,24 @@ static void data(struct dirarg *args, uint nargs, uint size) {
 
 /* `.set name, label + offset`: another label at that address. */
 static void alias(const char *directive, const char *name, struct expr *e) {
-    char msg[200];
+    char *msg;
     char *target;
     i64 addend;
     if (!ctx_symbol(e, &target, &addend)) {
-        snprintf(msg, sizeof msg, "%s: expected a constant or label(+offset)", directive);
+        msg = fmt("%s: expected a constant or label(+offset)", directive);
         error(msg);
         return;
     }
     int i = symbol_index(target);
     struct symbol *t = &symbols[i];
     if (t->section < 0 || !t->defined || t->has_constant) {
-        snprintf(msg, sizeof msg, "%s: '%s' must be a label defined before this", directive, shown_name(target));
+        msg = fmt("%s: '%s' must be a label defined before this", directive, shown_name(target));
         error(msg);
         return;
     }
     i64 value = i64_add(i64_u(t->value), addend);
     if (value.hi != 0) {
-        snprintf(msg, sizeof msg, "%s: '%s' would be outside its section", directive, name);
+        msg = fmt("%s: '%s' would be outside its section", directive, name);
         error(msg);
         return;
     }
@@ -715,15 +716,14 @@ static int is_pow2(i64 v) {
 /* `.comm sym, size[, align]` for a .local symbol, or `.lcomm`: zero bytes
  * in .bss. */
 static void common(const char *directive, struct dirarg *args, uint nargs) {
-    char msg[200];
+    char *msg;
     char *sym = arg_name(args, nargs, 0, directive);
     if (sym == NULL) {
         return;
     }
     int dummy;
     if (strcmp(directive, ".comm") == 0 && !map_get(&locals, sym, &dummy)) {
-        snprintf(msg, sizeof msg,
-                 ".comm: '%s' is not .local; common symbols are not supported (use -fno-common)", sym);
+        msg = fmt(".comm: '%s' is not .local; common symbols are not supported (use -fno-common)", sym);
         error(msg);
         return;
     }
@@ -739,12 +739,12 @@ static void common(const char *directive, struct dirarg *args, uint nargs) {
         align = i64_u(1);
     }
     if (size.hi != 0) {
-        snprintf(msg, sizeof msg, "%s: bad size %s", directive, i64_dec(size));
+        msg = fmt("%s: bad size %s", directive, i64_dec(size));
         error(msg);
         return;
     }
     if (!is_pow2(align) || i64_cmp(align, i64_u(1u << 16)) > 0) {
-        snprintf(msg, sizeof msg, "%s: alignment must be a power of two up to 65536", directive);
+        msg = fmt("%s: alignment must be a power of two up to 65536", directive);
         error(msg);
         return;
     }
@@ -775,7 +775,7 @@ static const char *const IGNORED[] = {".ident",       ".option",        ".attrib
                                       ".cfi_startproc", ".cfi_endproc", NULL};
 
 static void directive(const char *name, struct dirarg *args, uint nargs) {
-    char msg[200];
+    char *msg;
     i64 v;
     if (strcmp(name, ".text") == 0 || strcmp(name, ".data") == 0 || strcmp(name, ".rodata") == 0 ||
         strcmp(name, ".bss") == 0) {
@@ -819,7 +819,7 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         int k = symbol_index(n);
         struct symbol *s = &symbols[k];
         if (s->defined && !s->has_constant) {
-            snprintf(msg, sizeof msg, "'%s' is already a label", n);
+            msg = fmt("'%s' is already a label", n);
             error(msg);
             return;
         }
@@ -841,7 +841,7 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
                     emit_bytes(nul, 1);
                 }
             } else {
-                snprintf(msg, sizeof msg, "%s: expected a string", name);
+                msg = fmt("%s: expected a string", name);
                 error(msg);
             }
         }
@@ -866,7 +866,7 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
             return;
         }
         if (!i64_in(v, i64_u(0), i64_u(17))) {
-            snprintf(msg, sizeof msg, "%s: power of two must be 0..16", name);
+            msg = fmt("%s: power of two must be 0..16", name);
             error(msg);
             return;
         }
@@ -919,7 +919,7 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
     } else if (is_one_of(name, IGNORED)) {
         /* Metadata that does not change the output. */
     } else {
-        snprintf(msg, sizeof msg, "unknown directive '%s'", name);
+        msg = fmt("unknown directive '%s'", name);
         error(msg);
     }
 }
@@ -950,6 +950,21 @@ void asm_statement(struct stmt *s) {
 
 /* ---- The end of the file ---- */
 
+/* The first relocation of `s` at or after `offset`: they are in offset
+ * order, the order the code and data were emitted in. */
+static uint first_reloc_at(struct section *s, uint offset) {
+    uint lo = 0, hi = s->nrelocs;
+    while (lo < hi) {
+        uint mid = (lo + hi) / 2;
+        if (s->relocs[mid].offset < offset) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
 /* A %pcrel_lo's label must be on an auipc with %pcrel_hi, in its section. */
 static void check_pcrel_lo(void) {
     for (uint k = 0; k < npcrel_lo; k++) {
@@ -961,16 +976,17 @@ static void check_pcrel_lo(void) {
         int paired = 0;
         if (i >= 0 && symbols[i].defined && symbols[i].section == p->section) {
             struct section *sec = &sections[p->section];
-            for (uint r = 0; r < sec->nrelocs; r++) {
-                if (sec->relocs[r].offset == symbols[i].value && sec->relocs[r].kind == R_PCREL_HI20) {
+            uint at = symbols[i].value;
+            for (uint r = first_reloc_at(sec, at); r < sec->nrelocs && sec->relocs[r].offset == at; r++) {
+                if (sec->relocs[r].kind == R_RISCV_PCREL_HI20) {
                     paired = 1;
                     break;
                 }
             }
         }
         if (!paired) {
-            char msg[200];
-            snprintf(msg, sizeof msg, "%%pcrel_lo(%s): no auipc with %%pcrel_hi at that label in this section",
+            char *msg;
+            msg = fmt("%%pcrel_lo(%s): no auipc with %%pcrel_hi at that label in this section",
                      shown_name(p->name));
             error_at(p->line, msg);
         }
@@ -1004,15 +1020,15 @@ static const char *signed_text(i64 v) {
     return r;
 }
 
-static int check_jump(i64 distance, uint bits, const char *what, char *msg, uint size) {
+static int check_jump(i64 distance, uint bits, const char *what, char **msg) {
     i64 half = i64_shl(i64_u(1), bits - 1);
     if (!i64_in(distance, i64_neg(half), half)) {
-        snprintf(msg, size, "%s target out of range: %s bytes (limit %s..=+%s)", what, signed_text(distance),
+        *msg = fmt("%s target out of range: %s bytes (limit %s..=+%s)", what, signed_text(distance),
                  i64_dec(i64_neg(half)), i64_dec(i64_sub(half, i64_u(2))));
         return 0;
     }
     if (distance.lo & 1) {
-        snprintf(msg, size, "%s target at an odd distance (%s bytes)", what, signed_text(distance));
+        *msg = fmt("%s target at an odd distance (%s bytes)", what, signed_text(distance));
         return 0;
     }
     return 1;
@@ -1029,34 +1045,34 @@ static void or_word(struct section *s, uint at, uint bits) {
 }
 
 /* Writes a resolved distance into the word(s) at `offset`, as a linker would. */
-static int patch(int section, uint offset, int kind, i64 distance, char *msg, uint size) {
+static int patch(int section, uint offset, int kind, i64 distance, char **msg) {
     uint hi;
     int lo;
     struct section *s = &sections[section];
     hi_lo((int)distance.lo, &hi, &lo);
     switch (kind) {
-    case R_BRANCH:
-        if (!check_jump(distance, 13, "branch", msg, size)) {
+    case R_RISCV_BRANCH:
+        if (!check_jump(distance, 13, "branch", msg)) {
             return 0;
         }
         or_word(s, offset, b_imm((int)distance.lo));
         return 1;
-    case R_JAL:
-        if (!check_jump(distance, 21, "jump", msg, size)) {
+    case R_RISCV_JAL:
+        if (!check_jump(distance, 21, "jump", msg)) {
             return 0;
         }
         or_word(s, offset, j_imm((int)distance.lo));
         return 1;
-    case R_PCREL_HI20:
+    case R_RISCV_PCREL_HI20:
         or_word(s, offset, u_imm(hi));
         return 1;
-    case R_PCREL_LO12_I:
+    case R_RISCV_PCREL_LO12_I:
         or_word(s, offset, i_imm(lo));
         return 1;
-    case R_PCREL_LO12_S:
+    case R_RISCV_PCREL_LO12_S:
         or_word(s, offset, s_imm(lo));
         return 1;
-    default: /* R_CALL_PLT: auipc + jalr */
+    default: /* R_RISCV_CALL_PLT: auipc + jalr */
         or_word(s, offset, u_imm(hi));
         or_word(s, offset + 4, i_imm(lo));
         return 1;
@@ -1079,24 +1095,22 @@ static void resolve_local_fixups(void) {
         for (uint k = 0; k < s->nrelocs; k++) {
             struct reloc r = s->relocs[k];
             i64 distance;
-            int resolved = (r.kind == R_BRANCH || r.kind == R_JAL || r.kind == R_CALL_PLT || r.kind == R_PCREL_HI20) &&
+            int resolved = (r.kind == R_RISCV_BRANCH || r.kind == R_RISCV_JAL || r.kind == R_RISCV_CALL_PLT || r.kind == R_RISCV_PCREL_HI20) &&
                            local_distance((int)sec, r.offset, r.symbol, r.addend, &distance);
             if (!resolved) {
                 s->relocs[kept++] = r;
                 continue;
             }
-            if (r.kind == R_PCREL_HI20) {
+            if (r.kind == R_RISCV_PCREL_HI20) {
                 ad = grow(ad, &capad, nad + 1, sizeof(struct auipc_distance));
                 ad[nad].section = (int)sec;
                 ad[nad].offset = r.offset;
                 ad[nad].distance = distance;
                 nad++;
             }
-            char msg[200];
-            if (!patch((int)sec, r.offset, r.kind, distance, msg, sizeof msg)) {
-                char full[260];
-                snprintf(full, sizeof full, "'%s': %s", shown_name(r.symbol), msg);
-                error_at(r.line, full);
+            char *msg;
+            if (!patch((int)sec, r.offset, r.kind, distance, &msg)) {
+                error_at(r.line, fmt("'%s': %s", shown_name(r.symbol), msg));
             }
         }
         s->nrelocs = kept;
@@ -1107,16 +1121,23 @@ static void resolve_local_fixups(void) {
         for (uint k = 0; k < s->nrelocs; k++) {
             struct reloc r = s->relocs[k];
             int done = 0;
-            if (r.kind == R_PCREL_LO12_I || r.kind == R_PCREL_LO12_S) {
+            if (r.kind == R_RISCV_PCREL_LO12_I || r.kind == R_RISCV_PCREL_LO12_S) {
                 int i = find_symbol(r.symbol);
                 if (i >= 0 && symbols[i].defined && symbols[i].section == (int)sec) {
-                    for (uint a = 0; a < nad; a++) {
-                        if (ad[a].section == (int)sec && ad[a].offset == symbols[i].value) {
-                            char msg[200];
-                            patch((int)sec, r.offset, r.kind, ad[a].distance, msg, sizeof msg);
-                            done = 1;
-                            break;
+                    /* `ad` is in (section, offset) order: pass 1 made it so. */
+                    uint lo = 0, hi = nad, at = symbols[i].value;
+                    while (lo < hi) {
+                        uint mid = (lo + hi) / 2;
+                        if (ad[mid].section < (int)sec || (ad[mid].section == (int)sec && ad[mid].offset < at)) {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
                         }
+                    }
+                    if (lo < nad && ad[lo].section == (int)sec && ad[lo].offset == at) {
+                        char *msg;
+                        patch((int)sec, r.offset, r.kind, ad[lo].distance, &msg);
+                        done = 1;
                     }
                 }
             }
@@ -1167,8 +1188,8 @@ struct object *asm_finish(void) {
     check_pcrel_lo();
     for (uint i = 0; i < nsymbols; i++) {
         if (!symbols[i].defined && starts_with(symbols[i].name, ".L")) {
-            char msg[200];
-            snprintf(msg, sizeof msg, "undefined local label '%s'", shown_name(symbols[i].name));
+            char *msg;
+            msg = fmt("undefined local label '%s'", shown_name(symbols[i].name));
             error_at(0, msg);
         }
     }

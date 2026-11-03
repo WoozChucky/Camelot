@@ -11,23 +11,6 @@
 #include "as.h"
 #include "tables.h"
 
-/* funct3 values the pseudo-instructions need by name. */
-#define F_ADDI 0
-#define F_SLTIU 3
-#define F_XORI 4
-#define F_ANDI 7
-#define F_SLLI 1
-#define F_BEQ 0
-#define F_BNE 1
-#define F_BLT 4
-#define F_BGE 5
-#define F_BLTU 6
-#define F_BGEU 7
-#define F_CSRRW 1
-#define F_CSRRS 2
-#define F_CSRRC 3
-#define CSR_IMM 4
-
 #define ZERO 0
 #define RA 1
 #define T1 6
@@ -87,31 +70,6 @@ void hi_lo(int value, uint *hi, int *lo) {
     *hi = ((uint)value - (uint)l) >> 12;
 }
 
-uint reloc_elf_type(int kind) {
-    switch (kind) {
-    case R_ABS32:
-        return R_RISCV_32;
-    case R_BRANCH:
-        return R_RISCV_BRANCH;
-    case R_JAL:
-        return R_RISCV_JAL;
-    case R_CALL_PLT:
-        return R_RISCV_CALL_PLT;
-    case R_PCREL_HI20:
-        return R_RISCV_PCREL_HI20;
-    case R_PCREL_LO12_I:
-        return R_RISCV_PCREL_LO12_I;
-    case R_PCREL_LO12_S:
-        return R_RISCV_PCREL_LO12_S;
-    case R_HI20:
-        return R_RISCV_HI20;
-    case R_LO12_I:
-        return R_RISCV_LO12_I;
-    default:
-        return R_RISCV_LO12_S;
-    }
-}
-
 /* ---- Errors ---- */
 
 /* The error of the instruction being encoded. */
@@ -122,9 +80,8 @@ static int fail(const char *msg) {
     return 0;
 }
 
-/* A message of up to two strings around a format: snprintf into a buffer
- * big enough for any. */
-static char msgbuf[256];
+/* The message being made (fmt). */
+static char *msgbuf;
 
 /* ---- Operands ---- */
 
@@ -210,7 +167,7 @@ static int word32(i64 v, const char *what, int *out) {
         *out = (int)v.lo;
         return 1;
     }
-    snprintf(msgbuf, sizeof msgbuf, "%s %s does not fit in 32 bits", what, i64_dec(v));
+    msgbuf = fmt("%s %s does not fit in 32 bits", what, i64_dec(v));
     return fail(msgbuf);
 }
 
@@ -220,7 +177,7 @@ static int signed_field(i64 v, uint bits, const char *what, int *out) {
         *out = (int)v.lo;
         return 1;
     }
-    snprintf(msgbuf, sizeof msgbuf, "%s %s out of range (%s..=%s)", what, i64_dec(v), i64_dec(i64_neg(half)),
+    msgbuf = fmt("%s %s out of range (%s..=%s)", what, i64_dec(v), i64_dec(i64_neg(half)),
              i64_dec(i64_sub(half, i64_u(1))));
     return fail(msgbuf);
 }
@@ -233,12 +190,12 @@ static int unsigned_field(i64 v, uint bits, const char *what, uint *out) {
     }
     if (bits >= 12) {
         if (i64_is_neg(v)) {
-            snprintf(msgbuf, sizeof msgbuf, "%s -%s out of range (0..=%s)", what, i64_hex(i64_neg(v)), i64_hex(max));
+            msgbuf = fmt("%s -%s out of range (0..=%s)", what, i64_hex(i64_neg(v)), i64_hex(max));
         } else {
-            snprintf(msgbuf, sizeof msgbuf, "%s %s out of range (0..=%s)", what, i64_hex(v), i64_hex(max));
+            msgbuf = fmt("%s %s out of range (0..=%s)", what, i64_hex(v), i64_hex(max));
         }
     } else {
-        snprintf(msgbuf, sizeof msgbuf, "%s %s out of range (0..=%s)", what, i64_dec(v), i64_dec(max));
+        msgbuf = fmt("%s %s out of range (0..=%s)", what, i64_dec(v), i64_dec(max));
     }
     return fail(msgbuf);
 }
@@ -247,12 +204,12 @@ static int unsigned_field(i64 v, uint bits, const char *what, uint *out) {
 static int offset_field(i64 v, uint bits, const char *what, int *out) {
     i64 half = i64_shl(i64_u(1), bits - 1);
     if (!i64_in(v, i64_neg(half), half)) {
-        snprintf(msgbuf, sizeof msgbuf, "%s %s out of range (%s..=%s)", what, i64_dec(v), i64_dec(i64_neg(half)),
+        msgbuf = fmt("%s %s out of range (%s..=%s)", what, i64_dec(v), i64_dec(i64_neg(half)),
                  i64_dec(i64_sub(half, i64_u(2))));
         return fail(msgbuf);
     }
     if (v.lo & 1) {
-        snprintf(msgbuf, sizeof msgbuf, "%s %s must be even", what, i64_dec(v));
+        msgbuf = fmt("%s %s must be even", what, i64_dec(v));
         return fail(msgbuf);
     }
     *out = (int)v.lo;
@@ -271,8 +228,7 @@ static int imm(struct expr *e, struct imm *out) {
         const char *m = modifier_name(e->op);
         if (ctx_constant(e->a, &v)) {
             /* `%hi(0x12345678)`: no symbol, so split the number here. */
-            char what[32];
-            snprintf(what, sizeof what, "%s() value", m);
+            char *what = fmt("%s() value", m);
             int w;
             if (!word32(v, what, &w)) {
                 return 0;
@@ -290,11 +246,11 @@ static int imm(struct expr *e, struct imm *out) {
                 out->num = i64_of(lo);
                 return 1;
             }
-            snprintf(msgbuf, sizeof msgbuf, "%s() needs a symbol, not a number", m);
+            msgbuf = fmt("%s() needs a symbol, not a number", m);
             return fail(msgbuf);
         }
         if (!ctx_symbol(e->a, &out->name, &out->addend)) {
-            snprintf(msgbuf, sizeof msgbuf, "%s() needs a symbol or a number", m);
+            msgbuf = fmt("%s() needs a symbol or a number", m);
             return fail(msgbuf);
         }
         out->kind = IMM_RELOC;
@@ -323,7 +279,7 @@ static int reg(struct operand *op, uint *out) {
         *out = (uint)op->reg;
         return 1;
     }
-    snprintf(msgbuf, sizeof msgbuf, "expected a register, found %s", what(op));
+    msgbuf = fmt("expected a register, found %s", what(op));
     return fail(msgbuf);
 }
 
@@ -332,7 +288,7 @@ static int expr_of(struct operand *op, struct expr **out) {
         *out = op->e;
         return 1;
     }
-    snprintf(msgbuf, sizeof msgbuf, "expected an immediate, found %s", what(op));
+    msgbuf = fmt("expected an immediate, found %s", what(op));
     return fail(msgbuf);
 }
 
@@ -342,12 +298,12 @@ static int mem(struct operand *op, struct expr **offset, uint *base) {
         *base = (uint)op->reg;
         return 1;
     }
-    snprintf(msgbuf, sizeof msgbuf, "expected offset(register), found %s", what(op));
+    msgbuf = fmt("expected offset(register), found %s", what(op));
     return fail(msgbuf);
 }
 
 static int not_yet_constant(const char *name, const char *more) {
-    snprintf(msgbuf, sizeof msgbuf, "'%s' is not a constant (yet): .equ/.set constants must be defined before use%s",
+    msgbuf = fmt("'%s' is not a constant (yet): .equ/.set constants must be defined before use%s",
              name, more);
     return fail(msgbuf);
 }
@@ -368,15 +324,14 @@ static int imm12(struct expr *e, int store, struct field *f) {
     }
     if (im.kind == IMM_RELOC) {
         if (im.mod == M_LO) {
-            field_reloc(f, store ? R_LO12_S : R_LO12_I, im.name, im.addend);
+            field_reloc(f, store ? R_RISCV_LO12_S : R_RISCV_LO12_I, im.name, im.addend);
             return 1;
         }
         if (im.mod == M_PCREL_LO) {
-            field_reloc(f, store ? R_PCREL_LO12_S : R_PCREL_LO12_I, im.name, im.addend);
+            field_reloc(f, store ? R_RISCV_PCREL_LO12_S : R_RISCV_PCREL_LO12_I, im.name, im.addend);
             return 1;
         }
-        snprintf(msgbuf, sizeof msgbuf,
-                 "%s() is a 20-bit upper part and belongs in %s, not in a 12-bit immediate", modifier_name(im.mod),
+        msgbuf = fmt("%s() is a 20-bit upper part and belongs in %s, not in a 12-bit immediate", modifier_name(im.mod),
                  im.mod == M_HI ? "lui" : "auipc");
         return fail(msgbuf);
     }
@@ -403,10 +358,10 @@ static int imm20(struct expr *e, uint opcode, struct field *f) {
         return 1;
     }
     if (im.kind == IMM_RELOC && im.mod == m) {
-        field_reloc(f, lui ? R_HI20 : R_PCREL_HI20, im.name, im.addend);
+        field_reloc(f, lui ? R_RISCV_HI20 : R_RISCV_PCREL_HI20, im.name, im.addend);
         return 1;
     }
-    snprintf(msgbuf, sizeof msgbuf, "%s takes a number in 0..=0xfffff or %s(sym)", lui ? "lui" : "auipc",
+    msgbuf = fmt("%s takes a number in 0..=0xfffff or %s(sym)", lui ? "lui" : "auipc",
              modifier_name(m));
     return fail(msgbuf);
 }
@@ -425,10 +380,10 @@ static int branch_target(struct expr *e, struct field *f) {
         return 1;
     }
     if (im.kind == IMM_LABEL) {
-        field_reloc(f, R_BRANCH, im.name, im.addend);
+        field_reloc(f, R_RISCV_BRANCH, im.name, im.addend);
         return 1;
     }
-    snprintf(msgbuf, sizeof msgbuf, "a branch target can't use %s()", modifier_name(im.mod));
+    msgbuf = fmt("a branch target can't use %s()", modifier_name(im.mod));
     return fail(msgbuf);
 }
 
@@ -446,10 +401,10 @@ static int jump_target(struct expr *e, struct field *f) {
         return 1;
     }
     if (im.kind == IMM_LABEL) {
-        field_reloc(f, R_JAL, im.name, im.addend);
+        field_reloc(f, R_RISCV_JAL, im.name, im.addend);
         return 1;
     }
-    snprintf(msgbuf, sizeof msgbuf, "a jump target can't use %s()", modifier_name(im.mod));
+    msgbuf = fmt("a jump target can't use %s()", modifier_name(im.mod));
     return fail(msgbuf);
 }
 
@@ -459,7 +414,7 @@ static int uimm(struct expr *e, uint bits, const char *what_, uint *out) {
     if (ctx_constant(e, &v)) {
         return unsigned_field(v, bits, what_, out);
     }
-    snprintf(msgbuf, sizeof msgbuf, "%s must be a number", what_);
+    msgbuf = fmt("%s must be a number", what_);
     return fail(msgbuf);
 }
 
@@ -476,16 +431,16 @@ static int symbol(struct operand *op, const char *m, char **name, i64 *addend) {
         return 1;
     }
     if (im.kind == IMM_NUM) {
-        snprintf(msgbuf, sizeof msgbuf, "%s needs a symbol, not a number", m);
+        msgbuf = fmt("%s needs a symbol, not a number", m);
     } else {
-        snprintf(msgbuf, sizeof msgbuf, "%s takes a plain symbol, not %s()", m, modifier_name(im.mod));
+        msgbuf = fmt("%s takes a plain symbol, not %s()", m, modifier_name(im.mod));
     }
     return fail(msgbuf);
 }
 
 static int csr_addr(struct operand *op, uint *out) {
     if (op->kind != OPD_EXPR) {
-        snprintf(msgbuf, sizeof msgbuf, "expected a CSR name or number, found %s", what(op));
+        msgbuf = fmt("expected a CSR name or number, found %s", what(op));
         return fail(msgbuf);
     }
     struct expr *e = op->e;
@@ -494,11 +449,11 @@ static int csr_addr(struct operand *op, uint *out) {
     }
     i64 v;
     if (ctx_constant(e, &v)) {
-        snprintf(msgbuf, sizeof msgbuf, "CSR number %s out of range (0..=0xfff)", i64_dec(v));
+        msgbuf = fmt("CSR number %s out of range (0..=0xfff)", i64_dec(v));
         return fail(msgbuf);
     }
     if (e->kind == E_SYM) {
-        snprintf(msgbuf, sizeof msgbuf, "unknown CSR '%s'", e->sym);
+        msgbuf = fmt("unknown CSR '%s'", e->sym);
         return fail(msgbuf);
     }
     return fail("expected a CSR name or number");
@@ -578,9 +533,9 @@ static const char *mnemonic;
 
 static int usage(const char *form) {
     if (form[0] == 0) {
-        snprintf(msgbuf, sizeof msgbuf, "%s takes no operands", mnemonic);
+        msgbuf = fmt("%s takes no operands", mnemonic);
     } else {
-        snprintf(msgbuf, sizeof msgbuf, "usage: %s %s", mnemonic, form);
+        msgbuf = fmt("usage: %s %s", mnemonic, form);
     }
     return fail(msgbuf);
 }
@@ -617,7 +572,7 @@ static int jalr(uint rd, uint rs1, struct expr *offset) {
 /* `lw rd, offset(rs1)`, or `lw rd, symbol`: auipc + load through rd. */
 static int load(const char *m, uint funct3, struct operand *ops, uint nops) {
     if (nops != 2) {
-        snprintf(msgbuf, sizeof msgbuf, "usage: %s rd, offset(rs1)  or  %s rd, symbol", m, m);
+        msgbuf = fmt("usage: %s rd, offset(rs1)  or  %s rd, symbol", m, m);
         return fail(msgbuf);
     }
     uint rd;
@@ -639,19 +594,18 @@ static int load(const char *m, uint funct3, struct operand *ops, uint nops) {
         if (!symbol(src, m, &name, &addend)) {
             return 0;
         }
-        emit_symbol(u_type(OPC_AUIPC, rd, 0), R_PCREL_HI20, name, addend);
-        emit_auipc_low(i_type(OPC_LOAD, funct3, rd, rd, 0), R_PCREL_LO12_I);
+        emit_symbol(u_type(OPC_AUIPC, rd, 0), R_RISCV_PCREL_HI20, name, addend);
+        emit_auipc_low(i_type(OPC_LOAD, funct3, rd, rd, 0), R_RISCV_PCREL_LO12_I);
         return 1;
     }
-    snprintf(msgbuf, sizeof msgbuf, "expected offset(register) or a symbol, found %s", what(src));
+    msgbuf = fmt("expected offset(register) or a symbol, found %s", what(src));
     return fail(msgbuf);
 }
 
 /* `sw rs2, offset(rs1)`, or `sw rs2, symbol, rt`: auipc + store through rt. */
 static int store(const char *m, uint funct3, struct operand *ops, uint nops) {
     if (nops == 2 && ops[1].kind == OPD_EXPR) {
-        snprintf(msgbuf, sizeof msgbuf,
-                 "a store to a symbol needs a scratch register for the address: %s rs2, symbol, rt", m);
+        msgbuf = fmt("a store to a symbol needs a scratch register for the address: %s rs2, symbol, rt", m);
         return fail(msgbuf);
     }
     if (nops == 2) {
@@ -671,11 +625,11 @@ static int store(const char *m, uint funct3, struct operand *ops, uint nops) {
         if (!reg(&ops[0], &rs2) || !symbol(&ops[1], m, &name, &addend) || !reg(&ops[2], &rt)) {
             return 0;
         }
-        emit_symbol(u_type(OPC_AUIPC, rt, 0), R_PCREL_HI20, name, addend);
-        emit_auipc_low(s_type(OPC_STORE, funct3, rt, rs2, 0), R_PCREL_LO12_S);
+        emit_symbol(u_type(OPC_AUIPC, rt, 0), R_RISCV_PCREL_HI20, name, addend);
+        emit_auipc_low(s_type(OPC_STORE, funct3, rt, rs2, 0), R_RISCV_PCREL_LO12_S);
         return 1;
     }
-    snprintf(msgbuf, sizeof msgbuf, "usage: %s rs2, offset(rs1)  or  %s rs2, symbol, rt", m, m);
+    msgbuf = fmt("usage: %s rs2, offset(rs1)  or  %s rs2, symbol, rt", m, m);
     return fail(msgbuf);
 }
 
@@ -683,15 +637,13 @@ static int store(const char *m, uint funct3, struct operand *ops, uint nops) {
 static int atomic_address(const char *m, struct operand *addr, uint *base) {
     struct expr *offset;
     if (!mem(addr, &offset, base)) {
-        char inner[128];
-        snprintf(inner, sizeof inner, "%s", *err_out);
-        snprintf(msgbuf, sizeof msgbuf, "%s: %s takes its address as (rs1)", inner, m);
+        msgbuf = fmt("%s: %s takes its address as (rs1)", *err_out, m);
         return fail(msgbuf);
     }
     if (offset->kind == E_NUM && offset->num.lo == 0 && offset->num.hi == 0 && addr->int_token) {
         return 1;
     }
-    snprintf(msgbuf, sizeof msgbuf, "%s has no offset field: write the address as (rs1)", m);
+    msgbuf = fmt("%s has no offset field: write the address as (rs1)", m);
     return fail(msgbuf);
 }
 
@@ -700,7 +652,7 @@ static int csr_op(uint funct3, uint rd, struct operand *csr, struct operand *src
     if (!csr_addr(csr, &addr)) {
         return 0;
     }
-    if (funct3 & CSR_IMM) {
+    if (funct3 & F_CSR_IMM) {
         struct expr *e;
         if (!expr_of(src, &e) || !uimm(e, 5, "CSR immediate", &rs1)) {
             return 0;
@@ -755,7 +707,7 @@ static int insn_opcode(struct operand *op, uint *out) {
         return 0;
     }
     if ((*out & 3) != 3) {
-        snprintf(msgbuf, sizeof msgbuf, "opcode 0x%x is not a 32-bit opcode (its low two bits must be 11)", *out);
+        msgbuf = fmt("opcode 0x%x is not a 32-bit opcode (its low two bits must be 11)", *out);
         return fail(msgbuf);
     }
     return 1;
@@ -764,7 +716,7 @@ static int insn_opcode(struct operand *op, uint *out) {
 static const char *insn_format;
 
 static int insn_usage(const char *form) {
-    snprintf(msgbuf, sizeof msgbuf, "usage: .insn %s %s", insn_format, form);
+    msgbuf = fmt("usage: .insn %s %s", insn_format, form);
     return fail(msgbuf);
 }
 
@@ -866,13 +818,13 @@ static int insn(const char *m, struct operand *ops, uint nops) {
             return 0;
         }
         if ((w & 3) != 3) {
-            snprintf(msgbuf, sizeof msgbuf, "0x%08x is not a 32-bit instruction (its low two bits must be 11)", w);
+            msgbuf = fmt("0x%08x is not a 32-bit instruction (its low two bits must be 11)", w);
             return fail(msgbuf);
         }
         emit_word(w);
         return 1;
     }
-    snprintf(msgbuf, sizeof msgbuf, "unknown .insn format '%s' (merlin-as knows r, i, s, b and u)", format);
+    msgbuf = fmt("unknown .insn format '%s' (merlin-as knows r, i, s, b and u)", format);
     return fail(msgbuf);
 }
 
@@ -1122,8 +1074,8 @@ static int encode_named(const char *m, struct operand *ops, uint nops) {
         if (!reg(&ops[0], &rd) || !symbol(&ops[1], m, &name, &addend)) {
             return 0;
         }
-        emit_symbol(u_type(OPC_AUIPC, rd, 0), R_PCREL_HI20, name, addend);
-        emit_auipc_low(i_type(OPC_OP_IMM, F_ADDI, rd, rd, 0), R_PCREL_LO12_I);
+        emit_symbol(u_type(OPC_AUIPC, rd, 0), R_RISCV_PCREL_HI20, name, addend);
+        emit_auipc_low(i_type(OPC_OP_IMM, F_ADDI, rd, rd, 0), R_RISCV_PCREL_LO12_I);
         return 1;
     }
     if (is(m, "call") || is(m, "tail")) {
@@ -1137,7 +1089,7 @@ static int encode_named(const char *m, struct operand *ops, uint nops) {
         }
         uint scratch = is(m, "call") ? RA : T1;
         uint link = is(m, "call") ? RA : ZERO;
-        emit_symbol(u_type(OPC_AUIPC, scratch, 0), R_CALL_PLT, name, addend);
+        emit_symbol(u_type(OPC_AUIPC, scratch, 0), R_RISCV_CALL_PLT, name, addend);
         emit_word(i_type(OPC_JALR, 0, link, scratch, 0));
         return 1;
     }
@@ -1158,7 +1110,7 @@ static int encode_named(const char *m, struct operand *ops, uint nops) {
         uint funct3 = m[3] == 'w' ? F_CSRRW : m[3] == 's' ? F_CSRRS : F_CSRRC;
         /* `csrw mstatus, 8` means csrwi, as in LLVM. */
         if (m[4] == 'i' || ops[1].kind == OPD_EXPR) {
-            funct3 |= CSR_IMM;
+            funct3 |= F_CSR_IMM;
         }
         return csr_op(funct3, ZERO, &ops[0], &ops[1]);
     }
@@ -1189,7 +1141,7 @@ static int encode_named(const char *m, struct operand *ops, uint nops) {
     if (is(m, ".insn") || strncmp(m, ".insn ", 6) == 0) {
         return insn(m, ops, nops);
     }
-    snprintf(msgbuf, sizeof msgbuf, "unknown instruction '%s'", m);
+    msgbuf = fmt("unknown instruction '%s'", m);
     return fail(msgbuf);
 }
 
@@ -1250,7 +1202,7 @@ int encode(const char *m, struct operand *ops, uint nops, struct emit *out, char
         }
     } else if ((t2 = find2(CSR_FUNCT3, m)) != NULL) {
         if (nops != 3) {
-            ok = usage(t2->value & CSR_IMM ? "rd, csr, uimm5" : "rd, csr, rs1");
+            ok = usage(t2->value & F_CSR_IMM ? "rd, csr, uimm5" : "rd, csr, rs1");
         } else {
             ok = reg(&ops[0], &rd) && csr_op(t2->value, rd, &ops[1], &ops[2]);
         }

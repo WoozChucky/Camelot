@@ -17,6 +17,20 @@
 static struct token *toks;
 static int ntoks;
 static int pos;
+/* A syntax error that belongs to the next statement (parse_takes_next). */
+static int takes_next;
+static uint takes_next_line;
+
+int parse_takes_next(uint *line) {
+    int r = takes_next;
+    *line = takes_next_line;
+    takes_next = 0;
+    return r;
+}
+
+void parse_report_next(uint line) {
+    error_at(line, "expected a modifier name after '%'");
+}
 
 static struct token *peek_at(int n) {
     int i = pos + n;
@@ -139,6 +153,13 @@ static struct expr *primary(void) {
     if (is_punct(t, '%')) {
         struct token *name = peek();
         pos++;
+        if (name->kind == T_NEWLINE) {
+            /* merlin-as reads the statement's end as the name: its error is
+             * on the next statement's line, and it skips that one too. */
+            takes_next = 1;
+            takes_next_line = name->line;
+            return NULL;
+        }
         if (name->kind != T_IDENT) {
             fail("expected a modifier name after '%'");
             return NULL;
@@ -153,9 +174,7 @@ static struct expr *primary(void) {
         } else if (strcmp(name->text, "pcrel_lo") == 0) {
             m = M_PCREL_LO;
         } else {
-            char msg[100];
-            snprintf(msg, sizeof msg, "unknown modifier '%%%s'", name->text);
-            fail(msg);
+            fail(fmt("unknown modifier '%%%s'", name->text));
             return NULL;
         }
         if (!is_punct(peek(), '(')) {

@@ -53,22 +53,42 @@ use excalibur::opcode::{
 };
 
 // funct3 values the pseudo-instructions need by name.
-const ADDI: u32 = 0b000;
-const SLTIU: u32 = 0b011;
-const XORI: u32 = 0b100;
-const ANDI: u32 = 0b111;
-const SLLI: u32 = 0b001;
-const BEQ: u32 = 0b000;
-const BNE: u32 = 0b001;
-const BLT: u32 = 0b100;
-const BGE: u32 = 0b101;
-const BLTU: u32 = 0b110;
-const BGEU: u32 = 0b111;
-const CSRRW: u32 = 0b001;
-const CSRRS: u32 = 0b010;
-const CSRRC: u32 = 0b011;
+pub const ADDI: u32 = 0b000;
+pub const SLTIU: u32 = 0b011;
+pub const XORI: u32 = 0b100;
+pub const ANDI: u32 = 0b111;
+pub const SLLI: u32 = 0b001;
+pub const BEQ: u32 = 0b000;
+pub const BNE: u32 = 0b001;
+pub const BLT: u32 = 0b100;
+pub const BGE: u32 = 0b101;
+pub const BLTU: u32 = 0b110;
+pub const BGEU: u32 = 0b111;
+pub const CSRRW: u32 = 0b001;
+pub const CSRRS: u32 = 0b010;
+pub const CSRRC: u32 = 0b011;
 /// The immediate CSR forms (`csrrwi` ...) are the register forms with bit 2 of funct3 set.
-const CSR_IMM: u32 = 0b100;
+pub const CSR_IMM: u32 = 0b100;
+
+/// The funct3 values above, by name, for tables generated from these
+/// (the C assembler's, `crates/xtask/src/as_tables.rs`).
+pub const NAMED_FUNCT3: &[(&str, u32)] = &[
+    ("ADDI", ADDI),
+    ("SLTIU", SLTIU),
+    ("XORI", XORI),
+    ("ANDI", ANDI),
+    ("SLLI", SLLI),
+    ("BEQ", BEQ),
+    ("BNE", BNE),
+    ("BLT", BLT),
+    ("BGE", BGE),
+    ("BLTU", BLTU),
+    ("BGEU", BGEU),
+    ("CSRRW", CSRRW),
+    ("CSRRS", CSRRS),
+    ("CSRRC", CSRRC),
+    ("CSR_IMM", CSR_IMM),
+];
 
 // Registers the pseudo-instructions use.
 const ZERO: Reg = 0;

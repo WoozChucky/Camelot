@@ -13,7 +13,9 @@
  *   asm.c     sections, symbols, directives, local labels (asm.rs)
  *   elf.c     the relocatable object file (elf.rs)
  *   tables.h  the encodings, names and numbers, generated from the host
- *             tools' own tables (crates/xtask/src/as_tables.rs)
+ *   tables.c  tools' own tables (crates/xtask/src/as_tables.rs): the header
+ *             declares the tables and defines the numbers, tables.c holds
+ *             the tables, once for the program
  *
  * Unlike merlin-as, which holds every token of the file at once, this one
  * reads a statement, assembles it and forgets it: a machine has 4 MiB of RAM
@@ -74,6 +76,10 @@ char *tmp_strndup(const char *s, uint n);
 /* A growable array: grow(ptr, &cap, count + 1, size) makes room. */
 void *grow(void *p, uint *cap, uint need, uint size);
 void die(const char *msg);
+/* A formatted message in tmp memory, as long as it needs to be (merlin-as's
+ * messages hold whole names): %s %d %u %x %c %%, and a width with 0 for %x
+ * (%08x). */
+char *fmt(const char *f, ...);
 
 /* A byte buffer. */
 struct buf {
@@ -191,27 +197,22 @@ struct stmt {
  * directive or instruction), in tmp memory. Returns their count, or -1 after
  * reporting a syntax error. */
 int parse_statement(struct token *toks, int n, struct stmt **out);
+/* After parse_statement failed: whether its error belongs to the next
+ * statement, which merlin-as then skips (a `%` that ends a statement: the
+ * modifier's name it reads is the statement's end). *line is the line to
+ * report it on if there is no next statement. */
+int parse_takes_next(uint *line);
+/* Reports that error, on `line`. */
+void parse_report_next(uint line);
 const char *modifier_name(int m);
 int reg_parse(const char *name);
 
 /* ---- Relocations and the encoder (encode.c) ---- */
-enum {
-    R_ABS32,
-    R_BRANCH,
-    R_JAL,
-    R_CALL_PLT,
-    R_PCREL_HI20,
-    R_PCREL_LO12_I,
-    R_PCREL_LO12_S,
-    R_HI20,
-    R_LO12_I,
-    R_LO12_S
-};
-uint reloc_elf_type(int kind);
-
 /* One instruction word, with the relocation that fills in its immediate,
  * if any: against `name` + `addend`, or (`auipc` >= 0) against the label on
- * word `auipc` of the same instruction (the low half of a pc-relative pair). */
+ * word `auipc` of the same instruction (the low half of a pc-relative pair).
+ * `kind` is the relocation's psABI type, R_RISCV_* from tables.h, as every
+ * fixup's and relocation's kind is. */
 struct emit {
     uint word;
     int has_fixup;

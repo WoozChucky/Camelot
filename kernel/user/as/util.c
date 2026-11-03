@@ -1,6 +1,75 @@
 /* as: memory, byte buffers, 64-bit numbers and errors (see as.h). */
 #include "as.h"
 
+typedef __builtin_va_list va_list;
+#define va_start(ap, last) __builtin_va_start(ap, last)
+#define va_arg(ap, type) __builtin_va_arg(ap, type)
+#define va_end(ap) __builtin_va_end(ap)
+
+static void put_number(struct buf *b, uint v, uint base, uint width, int zero) {
+    char digits[12];
+    int n = 0;
+    do {
+        digits[n++] = "0123456789abcdef"[v % base];
+        v /= base;
+    } while (v != 0);
+    while ((uint)n < width) {
+        buf_byte(b, zero ? '0' : ' ');
+        width--;
+    }
+    while (n > 0) {
+        buf_byte(b, (uchar)digits[--n]);
+    }
+}
+
+char *fmt(const char *f, ...) {
+    struct buf b;
+    memset(&b, 0, sizeof b);
+    va_list ap;
+    va_start(ap, f);
+    for (; *f; f++) {
+        if (*f != '%') {
+            buf_byte(&b, (uchar)*f);
+            continue;
+        }
+        f++;
+        int zero = 0;
+        uint width = 0;
+        if (*f == '0') {
+            zero = 1;
+            f++;
+        }
+        while (*f >= '0' && *f <= '9') {
+            width = width * 10 + (uint)(*f - '0');
+            f++;
+        }
+        if (*f == 's') {
+            const char *s = va_arg(ap, const char *);
+            buf_put(&b, s, (uint)strlen(s));
+        } else if (*f == 'd') {
+            int v = va_arg(ap, int);
+            if (v < 0) {
+                buf_byte(&b, '-');
+                put_number(&b, 0u - (uint)v, 10, width, zero);
+            } else {
+                put_number(&b, (uint)v, 10, width, zero);
+            }
+        } else if (*f == 'u') {
+            put_number(&b, va_arg(ap, uint), 10, width, zero);
+        } else if (*f == 'x') {
+            put_number(&b, va_arg(ap, uint), 16, width, zero);
+        } else if (*f == 'c') {
+            buf_byte(&b, (uchar)va_arg(ap, int));
+        } else {
+            buf_byte(&b, (uchar)*f);
+        }
+    }
+    va_end(ap);
+    char *r = tmp_strndup((char *)b.data, b.len);
+    free(b.data);
+    return r;
+}
+
 void die(const char *msg) {
     fprintf(2, "as: %s\n", msg);
     exit(2);

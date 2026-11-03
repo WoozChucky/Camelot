@@ -109,12 +109,10 @@ fn image(inputs: &[(String, String)]) -> Vec<u8> {
 }
 
 /// Boots the disk kernel on `image`, types `input` (ending with `exit`).
-/// Returns what it printed and the disk afterwards.
+/// Returns what it printed and the disk afterwards. The machine has the
+/// default 4 MiB of RAM, which the assembler is written to fit in.
 fn boot(image: Vec<u8>, input: &str, max_steps: u64) -> (String, Vec<u8>) {
-    let config = MachineConfig {
-        ram_size: 16 << 20,
-        ..MachineConfig::default()
-    };
+    let config = MachineConfig::default();
     let disk = MemDisk::from_image(image).unwrap();
     let mut m = Machine::with_backends(config, vec![Box::new(disk)]).unwrap();
     m.cpu.bus.uart.capture = true;
@@ -246,13 +244,17 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
 
 #[test]
 fn the_assemblers_tables_are_the_host_tools() {
-    // kernel/user/as/tables.h is generated from merlin-as's and excalibur's
-    // tables (crates/xtask/src/as_tables.rs) by `cargo xtask kernel`.
-    let path = repo_root().join(xtask::as_tables::TABLES_H);
-    let committed = std::fs::read_to_string(&path).unwrap().replace('\r', "");
-    assert!(
-        committed == xtask::as_tables::generate(),
-        "{} is out of date: run `cargo xtask kernel` and commit it",
-        path.display()
-    );
+    // kernel/user/as/tables.h and tables.c are generated from merlin-as's
+    // and excalibur's tables (crates/xtask/src/as_tables.rs) by `cargo xtask
+    // kernel`.
+    use xtask::as_tables::{generate_c, generate_h, TABLES_C, TABLES_H};
+    for (file, want) in [(TABLES_H, generate_h()), (TABLES_C, generate_c())] {
+        let path = repo_root().join(file);
+        let committed = std::fs::read_to_string(&path).unwrap().replace('\r', "");
+        assert!(
+            committed == want,
+            "{} is out of date: run `cargo xtask kernel` and commit it",
+            path.display()
+        );
+    }
 }

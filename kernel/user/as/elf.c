@@ -182,13 +182,11 @@ void elf_write(struct object *obj, struct buf *out) {
             struct reloc *r = &s->relocs[k];
             uint sym = index[r->sym];
             buf_u32(out, r->offset);
-            buf_u32(out, sym << 8 | reloc_elf_type(r->kind));
+            buf_u32(out, sym << 8 | (uint)r->kind);
             buf_u32(out, r->addend.lo);
         }
-        char name[80];
-        snprintf(name, sizeof name, ".rela%s", s->name);
         struct shdr *h = new_shdr();
-        h->name = strtab_add(&shstr, name);
+        h->name = strtab_add(&shstr, fmt(".rela%s", s->name));
         h->ty = SHT_RELA;
         h->flags = SHF_INFO_LINK;
         h->offset = offset;

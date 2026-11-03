@@ -3799,7 +3799,8 @@ fn the_kernel_embeds_every_user_program() {
     // a disk), which are not there at all.
     let (mut m, elf) = load_committed();
     let dir = xtask::userprogs::user_dir(&repo_root());
-    let programs = xtask::userprogs::embedded(xtask::userprogs::build_all(&dir).unwrap());
+    let all = xtask::userprogs::build_all(&dir).unwrap();
+    let programs = xtask::userprogs::embedded(&all);
     for name in xtask::userprogs::DISK_ONLY {
         assert!(
             elf.symbol(&format!("user_elf_{name}")).is_none(),

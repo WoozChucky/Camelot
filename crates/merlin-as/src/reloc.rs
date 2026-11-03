@@ -27,7 +27,9 @@ pub enum RelocKind {
 }
 
 impl RelocKind {
-    /// Every kind, for tables generated from this one (the C assembler's).
+    /// Every kind, for tables generated from this one (the C assembler's),
+    /// in [`RelocKind::index`] order: a new kind needs an arm there, which
+    /// the compiler asks for, and a place here, which the test checks.
     pub const ALL: [RelocKind; 10] = [
         RelocKind::Abs32,
         RelocKind::Branch,
@@ -40,6 +42,22 @@ impl RelocKind {
         RelocKind::Lo12I,
         RelocKind::Lo12S,
     ];
+
+    /// The kind's place in [`RelocKind::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            RelocKind::Abs32 => 0,
+            RelocKind::Branch => 1,
+            RelocKind::Jal => 2,
+            RelocKind::CallPlt => 3,
+            RelocKind::PcrelHi20 => 4,
+            RelocKind::PcrelLo12I => 5,
+            RelocKind::PcrelLo12S => 6,
+            RelocKind::Hi20 => 7,
+            RelocKind::Lo12I => 8,
+            RelocKind::Lo12S => 9,
+        }
+    }
 
     pub fn elf_type(self) -> u32 {
         match self {
@@ -106,5 +124,20 @@ impl Emit {
             word,
             fixup: Some(Fixup { kind, target }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_lists_every_kind_once() {
+        for (i, k) in RelocKind::ALL.iter().enumerate() {
+            assert_eq!(k.index(), i, "{}", k.name());
+        }
+        // Every index has its kind: none is missing from ALL.
+        let max = RelocKind::ALL.iter().map(|k| k.index()).max().unwrap();
+        assert_eq!(max + 1, RelocKind::ALL.len());
     }
 }

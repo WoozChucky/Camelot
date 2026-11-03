@@ -99,7 +99,15 @@ static int parse_u64(const char *s, uint n, uint radix, i64 *out) {
 
 /* A hex number of up to 32 digits, for `.file`'s MD5: big-endian bytes. */
 static int parse_u128_hex(const char *s, uint n, uchar *out) {
-    if (n == 0 || n > 32) {
+    if (n == 0) {
+        return 0;
+    }
+    /* Leading zeros don't count against the 32 digits (Rust's u128 parse). */
+    while (n > 1 && s[0] == '0') {
+        s++;
+        n--;
+    }
+    if (n > 32) {
         return 0;
     }
     memset(out, 0, 16);
@@ -118,15 +126,7 @@ static int parse_u128_hex(const char *s, uint n, uchar *out) {
 }
 
 static void error_text(uint line, const char *a, const char *text, uint n, const char *b) {
-    char msg[200];
-    char t[80];
-    if (n > 70) {
-        n = 70;
-    }
-    memcpy(t, text, n);
-    t[n] = 0;
-    snprintf(msg, sizeof msg, "%s%s%s", a, t, b);
-    error_at(line, msg);
+    error_at(line, fmt("%s%s%s", a, tmp_strndup(text, n), b));
 }
 
 /* A number token (merlin-as's lex_number): `1b`/`1f` label references,
@@ -284,10 +284,8 @@ static int lex_quoted(const char *s, uint len, uint i, int quote, uint line, uch
             bytes[n++] = (uchar)v;
         } else {
             char ch[4];
-            char msg[40];
             char_text(e, ch);
-            snprintf(msg, sizeof msg, "unknown escape '\\%s'", ch);
-            error_at(line, msg);
+            error_at(line, fmt("unknown escape '\\%s'", ch));
             return 0;
         }
     }
