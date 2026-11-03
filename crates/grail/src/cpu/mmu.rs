@@ -12,7 +12,7 @@
 //! 8-byte access to memory is made as two 4-byte ones, the low word first. Devices
 //! refuse 8-byte accesses.
 
-use super::csr::{SATP_MODE_SV39, SATP_MODE_SV48, SATP_RV64_MODE_SHIFT};
+use super::csr::{SATP_MODE_SV39, SATP_MODE_SV48, SATP_RV64_MODE_SHIFT, SATP_RV64_PPN};
 use super::{Hart, Mode};
 use crate::bus::{Bus, BusFault};
 use crate::trap::{Access, Trap};
@@ -32,15 +32,15 @@ const PTE_D: u64 = 1 << 7;
 /// only mean something in a leaf.
 const POINTER_RESERVED: u64 = PTE_A | PTE_D | PTE_U;
 
-/// An Sv39 or Sv48 PTE's PPN, bits 53:10 (44 bits).
-const PTE_PPN_SV48: u64 = (1 << 44) - 1;
-/// Bits 63:54 of an Sv39 or Sv48 PTE: Svnapot's N, Svpbmt's PBMT and reserved bits,
-/// none of which Excalibur implements, so they must be 0 (spec section 7, "Paging").
-const PTE_RESERVED_SV48: u64 = 0x3ff << 54;
+/// An RV64 (Sv39 or Sv48) PTE's PPN, bits 53:10 (44 bits).
+const PTE_PPN_RV64: u64 = (1 << 44) - 1;
+/// Bits 63:54 of an RV64 PTE: Svnapot's N, Svpbmt's PBMT and reserved bits, none of
+/// which Excalibur implements, so they must be 0 (spec section 7, "Paging").
+const PTE_RESERVED_RV64: u64 = 0x3ff << 54;
 
-/// `satp`'s PPN field: bits 21:0 on RV32, 43:0 on RV64.
-const SATP_PPN_SV32: u64 = (1 << 22) - 1;
-const SATP_PPN_SV48: u64 = (1 << 44) - 1;
+/// RV32 `satp`'s PPN field, bits 21:0. RV64's is [`SATP_RV64_PPN`], which its WARL
+/// rule already cut to what a 48-bit physical address has.
+const SATP_RV32_PPN: u64 = (1 << 22) - 1;
 
 const PAGE_SHIFT: u32 = 12;
 
@@ -58,6 +58,10 @@ struct Scheme {
     ppn_mask: u64,
     /// The bits of a PTE that must be 0.
     reserved: u64,
+    /// Whether a virtual address must be canonical (Sv39 and Sv48). Sv32 has no such
+    /// rule: it translates all 32 bits of an RV32 hart's addresses, which
+    /// [`Hart::addr`] keeps below 4 GiB.
+    canonical: bool,
 }
 
 const SV32: Scheme = Scheme {
@@ -66,13 +70,15 @@ const SV32: Scheme = Scheme {
     vpn_bits: 10,
     ppn_mask: (1 << 22) - 1,
     reserved: 0,
+    canonical: false,
 };
 const SV39: Scheme = Scheme {
     levels: 3,
     pte_size: 8,
     vpn_bits: 9,
-    ppn_mask: PTE_PPN_SV48,
-    reserved: PTE_RESERVED_SV48,
+    ppn_mask: PTE_PPN_RV64,
+    reserved: PTE_RESERVED_RV64,
+    canonical: true,
 };
 const SV48: Scheme = Scheme { levels: 4, ..SV39 };
 
@@ -82,12 +88,12 @@ impl Scheme {
         PAGE_SHIFT + self.levels * self.vpn_bits
     }
 
-    /// Whether `vaddr` is canonical: Sv39's and Sv48's upper bits must all equal the
-    /// top bit they translate (bits 63:39 equal to bit 38, 63:48 to bit 47). Sv32
-    /// translates all 32 bits of an RV32 address, so there is nothing to check.
-    fn canonical(self, vaddr: u64) -> bool {
+    /// Whether the mode accepts `vaddr`: under Sv39 and Sv48 its upper bits must all
+    /// equal the top bit they translate (bits 63:39 equal to bit 38, 63:48 to bit 47),
+    /// as if the address were sign-extended from it.
+    fn accepts(self, vaddr: u64) -> bool {
         let unused = 64 - self.va_bits();
-        unused == 32 || ((vaddr << unused) as i64 >> unused) as u64 == vaddr
+        !self.canonical || ((vaddr << unused) as i64 >> unused) as u64 == vaddr
     }
 }
 
@@ -221,10 +227,10 @@ impl Hart {
     fn paging(&self) -> Option<(Scheme, u64)> {
         let satp = self.csr.satp;
         match self.xlen {
-            Xlen::Rv32 => (satp >> 31 != 0).then_some((SV32, satp & SATP_PPN_SV32)),
+            Xlen::Rv32 => (satp >> 31 != 0).then_some((SV32, satp & SATP_RV32_PPN)),
             Xlen::Rv64 => match satp >> SATP_RV64_MODE_SHIFT {
-                SATP_MODE_SV39 => Some((SV39, satp & SATP_PPN_SV48)),
-                SATP_MODE_SV48 => Some((SV48, satp & SATP_PPN_SV48)),
+                SATP_MODE_SV39 => Some((SV39, satp & SATP_RV64_PPN)),
+                SATP_MODE_SV48 => Some((SV48, satp & SATP_RV64_PPN)),
                 _ => None,
             },
         }
@@ -244,7 +250,7 @@ impl Hart {
         let page_fault = Trap::new(access.page_fault(), vaddr);
         let access_fault = Trap::new(access.access_fault(), vaddr);
         // A non-canonical address faults before any table is read (spec section 6).
-        if !scheme.canonical(vaddr) {
+        if !scheme.accepts(vaddr) {
             return Err(page_fault);
         }
         let leaf = walk(bus, scheme, root, vaddr).map_err(|e| e.trap(page_fault, access_fault))?;
@@ -290,7 +296,7 @@ impl Hart {
         let Some((scheme, root)) = self.paging().filter(|_| self.mode != Mode::M) else {
             return Some(vaddr);
         };
-        if !scheme.canonical(vaddr) {
+        if !scheme.accepts(vaddr) {
             return None;
         }
         walk(bus, scheme, root, vaddr).ok().map(|leaf| leaf.paddr)

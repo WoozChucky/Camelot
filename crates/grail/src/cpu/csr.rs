@@ -55,7 +55,7 @@ const PMPADDR_RV64_MASK: u64 = (1 << 54) - 1;
 /// the ASID field [59:44] reads 0, and physical addresses are 48 bits, so the PPN keeps
 /// its low 36 bits (bits 43:36 read 0).
 pub(super) const SATP_RV64_MODE_SHIFT: u32 = 60;
-const SATP_RV64_PPN: u64 = (1 << 36) - 1;
+pub(super) const SATP_RV64_PPN: u64 = (1 << 36) - 1;
 /// `satp`'s modes on RV64: Bare (no translation), Sv39 and Sv48.
 const SATP_MODE_BARE: u64 = 0;
 pub(super) const SATP_MODE_SV39: u64 = 8;
