@@ -981,31 +981,93 @@ fn crash_points(base: &[u8], writes: &[(u64, Vec<u8>)], last: &[u8]) -> Vec<Poin
     points
 }
 
-/// The points worth booting the kernel on, among `points`: those with work
-/// for its recovery, a committed transaction to replay (installing it part
-/// way, or not yet), and the first disk after each commit (the log empty
-/// again, an orphan or a truncation maybe left). The others are the disk
-/// before a commit point with some of its slots written, which recovery
-/// ignores, as the same state's first point shows.
-fn worth_rebooting(points: &[Point]) -> Vec<usize> {
+/// The points worth booting the kernel on, among `points` (from `base`):
+/// those with work for its recovery, a committed transaction to replay
+/// (installing it part way, or not yet), and the first disk after each
+/// change of state or each commit (the log empty again, an orphan or a
+/// truncation maybe left). Every other point's write went where recovery
+/// with an empty log does not read: a log slot, the second sector of a
+/// header just emptied, or the disk self-test's scratch block before the
+/// filesystem's first write (which it writes back as it was). The function
+/// checks that, so a write anywhere else (the kernel changing the disk
+/// outside its log) keeps its point, and fails the test.
+fn worth_rebooting(base: &[u8], writes: &[(u64, Vec<u8>)], points: &[Point]) -> Vec<usize> {
+    let sb = camelot_fs::superblock(base).unwrap();
+    let scratch = (base.len() / BSIZE) as u64 - 1;
+    let first_fs_write = writes
+        .iter()
+        .position(|(sector, _)| sector / 2 != scratch)
+        .unwrap_or(writes.len());
+    let base_digest = digest(base);
     let mut out = Vec::new();
     for (j, p) in points.iter().enumerate() {
-        let changed = j > 0 && points[j - 1].digest != p.digest;
+        let before = if j == 0 {
+            &base_digest
+        } else {
+            &points[j - 1].digest
+        };
+        let changed = before != &p.digest;
         let emptied = j > 0 && points[j - 1].report.replayed > 0 && p.report.replayed == 0;
         if p.report.replayed > 0 || changed || emptied {
             out.push(j);
+            continue;
         }
+        let block = (writes[p.i].0 / 2) as u32;
+        let slot = block > sb.logstart && block < sb.inodestart;
+        let empty_header = block == sb.logstart;
+        let self_test = u64::from(block) == scratch && p.i < first_fs_write;
+        assert!(
+            slot || empty_header || self_test,
+            "sector write {}: block {block}, outside the log, without changing the state",
+            p.i
+        );
     }
     out
 }
 
-/// Boots the kernel on the disk at each of `points[js]`, rebuilding them
-/// from the recorded writes, several machines at a time.
+/// The transactions of a run, as ranges of `points`: each from the point
+/// after the one before ends, through its slots, its commit point and its
+/// installing, to the first point after its log is empty again.
+fn transactions(points: &[Point]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for j in 1..points.len() {
+        if points[j - 1].report.replayed > 0 && points[j].report.replayed == 0 {
+            out.push(start..j + 1);
+            start = j + 1;
+        }
+    }
+    if start < points.len() {
+        out.push(start..points.len());
+    }
+    out
+}
+
+/// Boots the kernel on the disk at each of `points[js]`, several machines
+/// at a time: the disks are rebuilt from the recorded writes first, then
+/// shared out evenly.
 fn reboot_at(base: &[u8], writes: &[(u64, Vec<u8>)], points: &[Point], js: &[usize]) {
     let wanted: std::collections::HashSet<usize> = js.iter().map(|&j| points[j].i).collect();
-    at_each_write(base, writes, |i, disk| {
+    let mut disk = base.to_vec();
+    let mut disks = Vec::new();
+    for (i, (sector, data)) in writes.iter().enumerate() {
+        let at = *sector as usize * SECTOR_SIZE;
+        disk[at..at + SECTOR_SIZE].copy_from_slice(data);
         if wanted.contains(&i) {
-            reboot_one(i, disk, READ_CHECKS_NO_BIN);
+            disks.push((i, disk.clone()));
+        }
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(16);
+    let chunk = disks.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for part in disks.chunks(chunk) {
+            scope.spawn(move || {
+                for (i, disk) in part {
+                    reboot_one(*i, disk, READ_CHECKS_NO_BIN);
+                }
+            });
         }
     });
 }
@@ -1693,7 +1755,7 @@ mod exhaustive {
             points.iter().any(|p| p.report.orphans > 0),
             "no disk with an orphan"
         );
-        let js = worth_rebooting(&points);
+        let js = worth_rebooting(&image, &writes, &points);
         assert!(js.len() > 50, "{} disks to reboot on", js.len());
         reboot_at(&image, &writes, &points, &js);
     }
@@ -1702,10 +1764,12 @@ mod exhaustive {
     #[ignore = "exhaustive: a crash at every sector written (cargo test --release -- --ignored exhaustive::)"]
     fn a_crash_while_a_tree_grows_leaves_whole_transactions() {
         // The grow test stopped after every sector it writes: replayed, every
-        // disk passes fsck and holds the state of a commit. Around each growth
-        // (the trees' 5th, 85th and 337th extents: depth 0 to 1, a leaf split,
-        // depth 1 to 2), the kernel boots on each disk recovery has work on and
-        // recovers it as the host does.
+        // disk passes fsck and holds the state of a commit. In each growth's
+        // transaction (the trees' 5th, 85th and 337th extents: depth 0 to 1, a
+        // leaf split, depth 1 to 2) and the three before it, and in each commit
+        // that changes nothing (the 337th's first try, which fails for want of a
+        // block and gives back what it took), the kernel boots on each disk
+        // recovery has work on and recovers it as the host does.
         let image = grow_image();
         let run = boot(image.clone(), Boot { writes: true, ..GROW });
         assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
@@ -1725,13 +1789,47 @@ mod exhaustive {
             })
             .collect();
         assert_eq!(growths.len(), 6, "each file's three growths");
-        // A transaction of a few blocks is a few dozen sector writes either side
-        // of its commit point.
-        let js: Vec<usize> = worth_rebooting(&points)
-            .into_iter()
-            .filter(|&j| growths.iter().any(|&g| j + 40 >= g && j <= g + 40))
+        let txs = transactions(&points);
+        let base = digest(&image);
+        let state_before = |r: &std::ops::Range<usize>| {
+            if r.start == 0 {
+                &base
+            } else {
+                &points[r.start - 1].digest
+            }
+        };
+        let mut chosen = Vec::new();
+        for g in &growths {
+            let t = txs.iter().position(|r| r.contains(g)).unwrap();
+            chosen.extend(t.saturating_sub(3)..=t);
+        }
+        // Commits that leave the state as it was: the failed 337th append.
+        let unchanged: Vec<usize> = (0..txs.len())
+            .filter(|&t| {
+                let r = &txs[t];
+                points[r.clone()].iter().any(|p| p.report.replayed > 0)
+                    && state_before(r) == &points[r.end - 1].digest
+            })
             .collect();
-        assert!(js.len() > 6 * 8, "{} disks to reboot on", js.len());
+        assert!(!unchanged.is_empty(), "no commit that changes nothing");
+        chosen.extend(unchanged);
+        chosen.sort_unstable();
+        chosen.dedup();
+        let worth = worth_rebooting(&image, &writes, &points);
+        let js: Vec<usize> = worth
+            .into_iter()
+            .filter(|j| chosen.iter().any(|&t| txs[t].contains(j)))
+            .collect();
+        // Each chosen transaction is covered from its commit point to its
+        // log emptied again.
+        for &t in &chosen {
+            let r = &txs[t];
+            if let Some(commit) = r.clone().find(|&j| points[j].report.replayed > 0) {
+                for j in commit..r.end {
+                    assert!(js.contains(&j), "transaction {t}: point {j} not rebooted on");
+                }
+            }
+        }
         reboot_at(&image, &writes, &points, &js);
     }
 
