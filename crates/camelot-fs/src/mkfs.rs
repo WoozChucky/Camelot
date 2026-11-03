@@ -5,12 +5,17 @@
 //! writes blocks in place, without the log.
 //!
 //! Inodes are handed out in order from 2 (1 is the root) and blocks in order
-//! from `datastart`, so the same inputs always give the same bytes. A file's
-//! blocks come right after its indirect block, if it has one.
+//! from `datastart`, so the same inputs always give the same bytes. Files
+//! grow as the kernel grows them (`extent::append`, the format document's
+//! "Growing a file"): a file's blocks are handed out one after the other, so
+//! it is one extent (one per 32 768 blocks), while a directory, which grows
+//! an entry at a time between the files it holds, gets an extent per block
+//! it adds after them.
 
+use crate::extent::{self, Blocks};
 use crate::{
-    block_mut, contents, dirents, path_names, read_inode, show_name, valid_name, write_inode, Dinode, Dirent,
-    Superblock, BSIZE, DEFAULT_INODES, DEFAULT_LOG, DEFAULT_SIZE, DIRENT_SIZE, MAX_FILE_SIZE, NDIRECT,
+    block, block_mut, contents, dirents, path_names, read_inode, show_name, valid_name, write_inode, Dinode,
+    Dirent, Superblock, BSIZE, DEFAULT_INODES, DEFAULT_LOG, DEFAULT_SIZE, DIRENT_SIZE, MAX_FILE_SIZE,
     ROOT_INODE, SUPER_BLOCK, T_DEVICE, T_DIR, T_FILE,
 };
 use std::path::Path;
@@ -111,11 +116,7 @@ impl Mkfs {
         }
         let inum = self.next_inode;
         self.next_inode += 1;
-        let d = Dinode {
-            kind,
-            ..Dinode::default()
-        };
-        write_inode(&mut self.image, &self.sb, inum, &d);
+        write_inode(&mut self.image, &self.sb, inum, &Dinode::new(kind));
         Ok(inum)
     }
 
@@ -129,45 +130,36 @@ impl Mkfs {
         write_inode(&mut self.image, &self.sb, inum, &d);
     }
 
-    /// Adds `data` at the end of inode `inum`'s contents, allocating blocks
-    /// (and the indirect block) as it goes.
+    /// Adds `data` at the end of inode `inum`'s contents, adding blocks to
+    /// its extent tree as it goes.
     fn append(&mut self, inum: u32, data: &[u8]) -> Result<(), String> {
         let mut d = self.inode(inum);
-        let mut off = d.size as usize;
-        let end = off + data.len();
-        if end > MAX_FILE_SIZE as usize {
+        let mut off = d.size;
+        let end = off + data.len() as u64;
+        if end > MAX_FILE_SIZE {
             return Err(format!(
                 "{end} bytes is more than the largest file ({MAX_FILE_SIZE})"
             ));
         }
         let mut from = 0;
         while off < end {
-            let k = off / BSIZE;
+            let k = (off / BSIZE as u64) as u32;
             // A block boundary at the end of the file: block k is new.
-            if off.is_multiple_of(BSIZE) {
-                let b = self.alloc_block()?;
-                if k < NDIRECT {
-                    d.addrs[k] = b;
-                } else {
-                    if d.addrs[NDIRECT] == 0 {
-                        // The indirect block comes before the block it points to.
-                        let ind = b;
-                        d.addrs[NDIRECT] = ind;
-                        let b = self.alloc_block()?;
-                        set_indirect(&mut self.image, ind, k - NDIRECT, b);
-                    } else {
-                        set_indirect(&mut self.image, d.addrs[NDIRECT], k - NDIRECT, b);
-                    }
-                }
-            }
-            let b = crate::bmap(&self.image, &self.sb, &d, k)?;
-            let n = (BSIZE - off % BSIZE).min(end - off);
-            let at = off % BSIZE;
+            let b = if off.is_multiple_of(BSIZE as u64) {
+                let b = self.alloc(extent::goal(self, &d.root))?;
+                extent::append(self, &mut d.root, k, b)?;
+                b
+            } else {
+                extent::lookup(&self.image, &d.root, k)?
+                    .ok_or_else(|| format!("inode {inum}: no block {k}"))?
+            };
+            let at = (off % BSIZE as u64) as usize;
+            let n = (BSIZE - at).min((end - off) as usize);
             block_mut(&mut self.image, b)[at..at + n].copy_from_slice(&data[from..from + n]);
-            off += n;
+            off += n as u64;
             from += n;
         }
-        d.size = end as u32;
+        d.size = end;
         write_inode(&mut self.image, &self.sb, inum, &d);
         Ok(())
     }
@@ -260,7 +252,7 @@ impl Mkfs {
     /// returns its inode.
     pub fn add_file(&mut self, path: &str, data: &[u8]) -> Result<u32, String> {
         let (parent, name) = self.parent_of(path)?;
-        if data.len() > MAX_FILE_SIZE as usize {
+        if data.len() as u64 > MAX_FILE_SIZE {
             return Err(format!(
                 "{path}: {} bytes is more than the largest file ({MAX_FILE_SIZE})",
                 data.len()
@@ -278,11 +270,10 @@ impl Mkfs {
         let (parent, name) = self.parent_of(path)?;
         let inum = self.alloc_inode(T_DEVICE)?;
         let d = Dinode {
-            kind: T_DEVICE,
             major,
             minor,
             nlink: 1,
-            ..Dinode::default()
+            ..Dinode::new(T_DEVICE)
         };
         write_inode(&mut self.image, &self.sb, inum, &d);
         self.link(parent, name, inum)?;
@@ -337,9 +328,30 @@ impl Mkfs {
     }
 }
 
-/// Sets entry `i` of indirect block `ind` to `b`.
-fn set_indirect(image: &mut [u8], ind: u32, i: usize, b: u32) {
-    block_mut(image, ind)[4 * i..4 * i + 4].copy_from_slice(&b.to_le_bytes());
+/// mkfs hands out blocks in order, so the goal is the next block anyway
+/// for the file being written. A block given back (when the disk fills up
+/// part way through growing a tree) is the last one handed out.
+impl Blocks for Mkfs {
+    fn block(&self, n: u32) -> &[u8] {
+        block(&self.image, n)
+    }
+
+    fn block_mut(&mut self, n: u32) -> &mut [u8] {
+        block_mut(&mut self.image, n)
+    }
+
+    fn alloc(&mut self, _goal: u32) -> Result<u32, String> {
+        self.alloc_block()
+    }
+
+    fn free(&mut self, b: u32) {
+        let (blk, byte, mask) = self.sb.bit_pos(b);
+        block_mut(&mut self.image, blk)[byte] &= !mask;
+        block_mut(&mut self.image, b).fill(0);
+        if b + 1 == self.next_block {
+            self.next_block = b;
+        }
+    }
 }
 
 /// A new directory's first two entries: `.` (itself) and `..` (its parent).
@@ -404,8 +416,8 @@ mod tests {
             BSIZE - 1,
             BSIZE,
             BSIZE + 1,
-            NDIRECT * BSIZE,
-            NDIRECT * BSIZE + 1,
+            12 * BSIZE,
+            12 * BSIZE + 1,
             100 * BSIZE + 7,
         ];
         for (i, &n) in sizes.iter().enumerate() {
@@ -426,17 +438,45 @@ mod tests {
     }
 
     #[test]
-    fn the_largest_file_fits_and_one_byte_more_does_not() {
-        let opts = Options { size: 400, ..small() };
+    fn a_file_past_version_1s_largest_is_one_extent() {
+        // Version 1's largest file was 268 blocks.
+        let opts = Options {
+            size: 1200,
+            ..small()
+        };
         let mut fs = Mkfs::new(&opts).unwrap();
-        let big = vec![0x5a; MAX_FILE_SIZE as usize];
-        fs.add_file("/big", &big).unwrap();
-        let err = fs
-            .add_file("/bigger", &vec![0; MAX_FILE_SIZE as usize + 1])
-            .unwrap_err();
-        assert!(err.contains("largest file"), "{err}");
+        let big: Vec<u8> = (0..1000 * BSIZE + 5).map(|i| (i % 251) as u8).collect();
+        let inum = fs.add_file("/big", &big).unwrap();
         let image = fs.finish();
-        assert_eq!(Fs::open(&image).unwrap().read_file("/big").unwrap(), big);
+        let r = Fs::open(&image).unwrap();
+        assert_eq!(r.read_file("/big").unwrap(), big);
+        let d = r.inode(inum).unwrap();
+        let map = extent::walk(&image, r.superblock(), &d.root).unwrap();
+        assert_eq!((map.extents.len(), map.tree_blocks.len()), (1, 0));
+        crate::fsck::check(&image).unwrap();
+    }
+
+    #[test]
+    fn a_directory_of_many_blocks_gets_a_tree() {
+        // Each of the root's blocks comes after the files named in the one
+        // before: 6 blocks of entries are 6 extents, more than the root holds.
+        let opts = Options {
+            size: 1200,
+            ninodes: 512,
+            nlog: 8,
+        };
+        let mut fs = Mkfs::new(&opts).unwrap();
+        for i in 0..6 * 64 - 2 {
+            fs.add_file(&format!("/f{i}"), b"x").unwrap();
+        }
+        let image = fs.finish();
+        let r = Fs::open(&image).unwrap();
+        let root = r.inode(ROOT_INODE).unwrap();
+        assert_eq!(root.size, 6 * BSIZE as u64);
+        let map = extent::walk(&image, r.superblock(), &root.root).unwrap();
+        assert_eq!((map.extents.len(), map.tree_blocks.len()), (6, 1));
+        assert_eq!(r.read_file("/f300").unwrap(), b"x");
+        assert_eq!(crate::fsck::check(&image).unwrap().files, 6 * 64 - 2);
     }
 
     #[test]
@@ -466,7 +506,7 @@ mod tests {
             .unwrap_err()
             .contains("no inode left"));
         let mut fs = Mkfs::new(&small()).unwrap();
-        fs.add_file("/big", &vec![1; MAX_FILE_SIZE as usize]).unwrap();
+        fs.add_file("/big", &vec![1; 300 * BSIZE]).unwrap();
         let err = fs.add_file("/huge", &vec![1; 150 * BSIZE]).unwrap_err();
         assert!(err.contains("no space left"), "{err}");
     }
@@ -497,10 +537,10 @@ mod tests {
     #[test]
     fn big_filesystems_with_several_bitmap_blocks() {
         // The 4 MiB root image's 4096 blocks (one bitmap block), and sizes
-        // whose bitmap takes two and three blocks, filled with files of the
-        // largest size until another does not fit, so their data runs through
-        // the blocks every bitmap block covers: every block is where the bitmap
-        // says, and fsck is clean.
+        // whose bitmap takes two and three blocks, filled with files of 268
+        // blocks (version 1's largest) until another does not fit, so their
+        // data runs through the blocks every bitmap block covers: every block
+        // is where the bitmap says, and fsck is clean.
         for size in [4096, BITS_PER_BLOCK + 1, 2 * BITS_PER_BLOCK + 500] {
             let opts = Options {
                 size,
@@ -513,10 +553,11 @@ mod tests {
                 size.div_ceil(BITS_PER_BLOCK),
                 "{size}"
             );
-            let big = vec![0x5a; MAX_FILE_SIZE as usize];
+            let big = vec![0x5a; 268 * BSIZE];
             let mut files = 0;
-            // A file of the largest size takes its blocks and an indirect one.
-            while fs.free_blocks() as usize > MAX_FILE_SIZE as usize / BSIZE + 1 {
+            // Each file takes its blocks; the root directory one more now and
+            // then.
+            while fs.free_blocks() as usize > 268 + 1 {
                 fs.add_file(&format!("/f{files}"), &big).unwrap();
                 files += 1;
             }

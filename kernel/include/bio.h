@@ -25,8 +25,10 @@
 #define BSIZE 1024
 #define BLOCK_SECTORS (BSIZE / BLK_SECTOR_SIZE)
 
-/* Buffers in the cache, as in xv6. bread() panics if every one is in use. */
-#define NBUF 30
+/* Buffers in the cache. bread() panics if every one is in use. The log
+ * pins up to LOGSIZE (log.h) until its transaction commits; the other 10
+ * are for the blocks operations hold at once. */
+#define NBUF 54
 
 /* Locking: `lock`, a sleep lock, is held by the process bread() returned
  * the buffer to, until brelse(), and protects `valid`, `error` and `data`.

@@ -18,10 +18,10 @@
  * - with `fs_test` = FS_TEST_WRITE (patched in by the tests) and a writable
  *   disk, transactions: make /fstest and /fstest/a (2500 bytes) in one, then
  *   /fstest/b (700 bytes), remove a, make /fstest/x (a block), write
- *   /fstest/big (13 KiB + 100 bytes, so past the direct blocks) 3 KiB per
- *   transaction, removing x while holding a reference to it (an inode with
- *   no links until the next transaction frees it) just before big's
- *   indirect block is allocated, on x's block; make and remove /fstest/d;
+ *   /fstest/big (13 KiB + 100 bytes) 3 KiB per transaction, removing x
+ *   while holding a reference to it (an inode with no links until the next
+ *   transaction frees it) part way, after which big goes on growing next to
+ *   its last block rather than in x's freed one; make and remove /fstest/d;
  *   have two kernel processes make /fstest/p1 and p2 at once (their
  *   operations share one transaction: group commit), then more processes
  *   make begin_op() wait for room in the log and for a commit; read
@@ -29,7 +29,11 @@
  *   number of commits, and list /fstest. The tests stop the machine after
  *   every disk write of this and check that the disk, replayed, holds all
  *   of each transaction or none of it;
- * - with `fs_test` = FS_TEST_FULL, a file written until the disk is full. */
+ * - with `fs_test` = FS_TEST_FULL, a file written until the disk is full,
+ *   which first finds no block for the tree to grow a level;
+ * - with `fs_test` = FS_TEST_TREE, the trees of /t1 and /t2, two files the
+ *   tests made with their blocks interleaved: read, grown, and freed in
+ *   several transactions. */
 #include "fstest.h"
 #include "blk.h"
 #include "fs.h"
@@ -314,8 +318,10 @@ static void read_checks(void) {
  * operations together, the begin_op() tests (2 + 1 + 2), removing big. */
 #define COMMITS (3 + 1 + 1 + BIG_CHUNKS + 2 + 2 + 1 + 5 + 1)
 
-/* The chunk that takes /fstest/big past its direct blocks starts a chunk. */
-_Static_assert(NDIRECT * BSIZE % CHUNK == 0, "big's chunks");
+/* Where /fstest/x goes, part way through writing /fstest/big: at the
+ * start of a chunk. */
+#define BIG_SPLIT (12 * BSIZE)
+_Static_assert(BIG_SPLIT % CHUNK == 0, "big's chunks");
 
 /* The contents of the test files: byte i of the file with `seed` is
  * i * 7 + seed + i / 251 (so no two blocks are alike). */
@@ -614,10 +620,9 @@ static void write_test(void) {
     check(fs_unlink("/fstest/a") == 0, "remove /fstest/a");
     end_op();
 
-    /* x: one block, full of the pattern (no zero word at its start). It is
-     * removed just before /fstest/big needs its indirect block, so that
-     * block is x's, reused: it must come zeroed, or big would find x's
-     * bytes as pointers. */
+    /* x: one block, in the first one a's removal freed. It is removed
+     * while big grows, which must go on next to its last block (the goal)
+     * rather than take x's, the first free one. */
     begin_op();
     make_file("/fstest/x", X_LEN, 6, data);
     end_op();
@@ -634,7 +639,7 @@ static void write_test(void) {
     end_op();
     bool wrote = big != NULL;
     u32 off;
-    for (off = 0; wrote && off < NDIRECT * BSIZE; off += CHUNK) {
+    for (off = 0; wrote && off < BIG_SPLIT; off += CHUNK) {
         wrote = write_chunk(big, off, CHUNK, 3) == CHUNK;
     }
 
@@ -650,13 +655,13 @@ static void write_test(void) {
     if (x != NULL) {
         u32 x_inum = x->inum;
         dinode(x_inum, &d);
-        x_block = d.addrs[0];
+        x_block = d.root.h.entries == 1 ? d.root.e[0].start_lo : 0;
         check(d.type == T_FILE && d.nlink == 0 && x_block != 0, "a file in use keeps its inode and blocks");
         begin_op();
         iput(x);
         end_op();
         dinode(x_inum, &d);
-        check(d.type == T_FREE && d.addrs[0] == 0, "the last user frees it");
+        check(d.type == T_FREE && d.root.h.entries == 0, "the last user frees it");
     }
 
     for (; wrote && off < BIG_LEN; off += CHUNK) {
@@ -665,8 +670,15 @@ static void write_test(void) {
     }
     check(wrote, "write /fstest/big a piece per transaction");
     if (big != NULL) {
+        /* Its first blocks went where a's were freed, around x; the rest
+         * after b, and on from there: two extents, none in x's block. */
         dinode(big->inum, &d);
-        check(d.addrs[NDIRECT] == x_block, "big's indirect block is x's freed block, zeroed");
+        bool apart = true;
+        for (u32 i = 0; i < d.root.h.entries; i++) {
+            apart = apart && (x_block < d.root.e[i].start_lo || x_block >= d.root.e[i].start_lo + d.root.e[i].len);
+        }
+        check(d.root.h.depth == 0 && d.root.h.entries == 2 && apart,
+              "big grows next to its last block, not in x's freed one");
         begin_op();
         iput(big);
         end_op();
@@ -696,7 +708,7 @@ static void write_test(void) {
 
     /* Read it all back. */
     check(holds_pattern("/fstest/b", B_LEN, 2), "/fstest/b reads back");
-    check(holds_pattern("/fstest/big", BIG_LEN, 3), "/fstest/big reads back, past its direct blocks");
+    check(holds_pattern("/fstest/big", BIG_LEN, 3), "/fstest/big reads back, from both its extents");
     check(holds_pattern("/fstest/p1", P_LEN, 4) && holds_pattern("/fstest/p2", P_LEN, 5),
           "the two writers' files read back");
     static const char *const empty[] = {"/fstest/r1", "/fstest/r2", "/fstest/j2",
@@ -707,7 +719,7 @@ static void write_test(void) {
     }
     check(all, "the begin_op() tests' files are there");
 
-    /* big goes, with its indirect block and the blocks it lists. */
+    /* big goes, with every block of both its extents. */
     begin_op();
     check(fs_unlink("/fstest/big") == 0, "remove /fstest/big");
     end_op();
@@ -729,11 +741,22 @@ static void write_test(void) {
     if (ip != NULL) {
         ilock(ip);
         check(writei(ip, data, B_LEN + 1, 1) == -EINVAL, "write: no holes");
-        check(writei(ip, data, B_LEN, MAXFILE * BSIZE) == -EFBIG, "write: past the largest file");
+        check(writei(ip, data, B_LEN, MAXFILE_BYTES - B_LEN + 1) == -EFBIG, "write: past the largest file");
         check(ip->size == B_LEN, "and the size is unchanged");
         iunlockput(ip);
     }
     end_op();
+    /* Files past what the kernel's offsets reach, which only mkfs could
+     * make: open() refuses them. */
+    struct inode big_one;
+    memset(&big_one, 0, sizeof big_one);
+    big_one.size = MAXFILE_BYTES;
+    bool fits = !inode_too_big(&big_one);
+    big_one.size = MAXFILE_BYTES + 1;
+    bool past = inode_too_big(&big_one);
+    big_one.size = 0;
+    big_one.size_hi = 1;
+    check(fits && past && inode_too_big(&big_one), "a file past 2^31 - 1 bytes is too big to open");
 
     u32 blocks;
     u32 inodes;
@@ -746,42 +769,129 @@ static void write_test(void) {
 
 /* ---- A full disk (FS_TEST_FULL) ---- */
 
-/* Writes /full a chunk per transaction until the disk is full. The tests
- * give it a disk with 13 free blocks: 12 direct blocks fill, then the 13th
- * gets the indirect block and finds nothing left for itself. Then the
- * indirect block must go back (no indirect block in a file of 12 blocks),
- * leaving 1 block free. */
+/* The tests give it a disk with 13 free blocks. /full and /pad take a block
+ * each in turn, 4 times, so /full is 4 extents (its root is full), and /pad
+ * then takes all but one of the rest. Adding a block to /full needs that
+ * block and a tree block for the root's entries to move to: there is none,
+ * so the write fails with -ENOSPC and changes nothing, the block it took
+ * given back. With /pad gone, /full fills the disk, its tree a level
+ * deeper. */
 static void full_test(void) {
     int err;
     begin_op();
-    struct inode *ip = fs_create("/full", T_FILE, 0, 0, &err);
-    check(ip != NULL, "make /full");
-    if (ip != NULL) {
-        iunlock(ip);
+    struct inode *full = fs_create("/full", T_FILE, 0, 0, &err);
+    if (full != NULL) {
+        iunlock(full);
+    }
+    struct inode *pad = fs_create("/pad", T_FILE, 0, 0, &err);
+    if (pad != NULL) {
+        iunlock(pad);
     }
     end_op();
-    if (ip == NULL) {
+    check(full != NULL && pad != NULL, "make /full and /pad");
+    if (full == NULL || pad == NULL) {
         return;
     }
     u32 off = 0;
-    int r;
-    while ((r = write_chunk(ip, off, CHUNK, 7)) > 0) {
-        off += (u32)r;
+    u32 pad_off = 0;
+    bool ok = true;
+    for (u32 i = 0; i < EXT_ROOT_MAX; i++) {
+        ok = ok && write_chunk(full, off, BSIZE, 7) == BSIZE;
+        off += BSIZE;
+        ok = ok && write_chunk(pad, pad_off, BSIZE, 8) == BSIZE;
+        pad_off += BSIZE;
     }
-    check(r == -ENOSPC, "writing to a full disk fails with ENOSPC");
-    struct dinode d;
-    dinode(ip->inum, &d);
     u32 blocks;
     u32 inodes;
     fs_count_free(&blocks, &inodes);
-    check(d.size == off && (d.addrs[NDIRECT] != 0) == (off > NDIRECT * BSIZE),
-          "a file has an indirect block only past its direct blocks");
-    check(blocks == (off == NDIRECT * BSIZE ? 1u : 0u), "and no block is lost");
+    while (ok && blocks > 1) {
+        ok = write_chunk(pad, pad_off, BSIZE, 8) == BSIZE;
+        pad_off += BSIZE;
+        fs_count_free(&blocks, &inodes);
+    }
+    struct dinode before;
+    dinode(full->inum, &before);
+    check(ok && before.root.h.depth == 0 && before.root.h.entries == EXT_ROOT_MAX && blocks == 1,
+          "/full is 4 extents, and one block is left");
+    check(write_chunk(full, off, BSIZE, 7) == -ENOSPC, "a block that needs a new tree block fails with ENOSPC");
+    struct dinode d;
+    dinode(full->inum, &d);
+    fs_count_free(&blocks, &inodes);
+    check(memcmp(&d, &before, sizeof d) == 0 && blocks == 1, "and changes nothing: the block it took went back");
     begin_op();
-    iput(ip);
+    check(fs_unlink("/pad") == 0, "remove /pad");
+    iput(pad);
+    end_op();
+    int r;
+    while ((r = write_chunk(full, off, CHUNK, 7)) > 0) {
+        off += (u32)r;
+    }
+    check(r == -ENOSPC, "writing to a full disk fails with ENOSPC");
+    dinode(full->inum, &d);
+    fs_count_free(&blocks, &inodes);
+    check(d.size == off && d.root.h.depth == 1 && blocks == 0, "/full grew a level, and no block is lost");
+    begin_op();
+    iput(full);
     end_op();
     check(holds_pattern("/full", off, 7), "/full reads back");
     kprintf("fs: the disk filled up at %u bytes\n", off);
+}
+
+/* ---- Extent trees (FS_TEST_TREE) ---- */
+
+/* The tests give it a disk holding /t1 and /t2, T_LEN bytes each of the
+ * pattern with seeds 11 and 12, their blocks interleaved (a block of t1, a
+ * block of t2, ...), made by the host's mkfs code: every block an extent of
+ * its own, so each tree is 2 deep with a dozen leaves. Their blocks read
+ * back; a block added to /t1 reads back too; removing /t1 frees its blocks
+ * in more than one transaction (a leaf emptied takes a log slot); and
+ * emptying /t2 as open's O_TRUNC does, under its write lock, leaves it
+ * empty. */
+#define T_LEN (1200 * BSIZE)
+
+static void tree_test(void) {
+    u32 blocks0;
+    u32 inodes0;
+    fs_count_free(&blocks0, &inodes0);
+    check(holds_pattern("/t1", T_LEN, 11) && holds_pattern("/t2", T_LEN, 12), "the host's trees read back");
+    int err;
+    begin_op();
+    struct inode *t1 = namei("/t1", &err);
+    struct inode *t2 = namei("/t2", &err);
+    end_op();
+    if (t1 == NULL || t2 == NULL) {
+        check(false, "find /t1 and /t2");
+        return;
+    }
+    struct dinode d1;
+    struct dinode d2;
+    dinode(t1->inum, &d1);
+    dinode(t2->inum, &d2);
+    check(d1.root.h.depth == 2 && d2.root.h.depth == 2, "both trees are 2 deep");
+    check(write_chunk(t1, T_LEN, BSIZE, 11) == BSIZE && holds_pattern("/t1", T_LEN + BSIZE, 11),
+          "a block added to a deep tree reads back");
+    u32 commits = log_commits;
+    begin_op();
+    bool removed = fs_unlink("/t1") == 0;
+    iput(t1);
+    end_op();
+    check(removed && log_commits - commits >= 2, "a big file's blocks are freed in several transactions");
+    acquiresleep(&t2->wlock);
+    begin_op();
+    ilock(t2);
+    itrunc(t2);
+    bool empty = t2->size == 0 && t2->flags == 0 && t2->root.h.depth == 0 && t2->root.h.entries == 0;
+    iunlock(t2);
+    end_op();
+    releasesleep(&t2->wlock);
+    begin_op();
+    iput(t2);
+    end_op();
+    check(empty && holds_pattern("/t2", 0, 12), "O_TRUNC's truncation empties /t2");
+    u32 blocks;
+    u32 inodes;
+    fs_count_free(&blocks, &inodes);
+    check(blocks > blocks0 + 2 * (T_LEN / BSIZE) && inodes == inodes0 + 1, "every block came back");
 }
 
 /* ---- Boot ---- */
@@ -800,6 +910,9 @@ static void fs_main(void) {
     if (log_recovered > 0) {
         kprintf("fs: replayed %u blocks from the log\n", log_recovered);
     }
+    if (fs_truncations > 0) {
+        kprintf("fs: finished %u truncations\n", fs_truncations);
+    }
     if (fs_orphans > 0) {
         kprintf("fs: freed %u inodes that no directory named\n", fs_orphans);
     }
@@ -812,14 +925,16 @@ static void fs_main(void) {
     ls("/");
     tested = true;
     read_checks();
-    if (fs_test == FS_TEST_WRITE || fs_test == FS_TEST_FULL) {
+    if (fs_test == FS_TEST_WRITE || fs_test == FS_TEST_FULL || fs_test == FS_TEST_TREE) {
         if (fs_readonly) {
             kprintf("fs: write test skipped: the %s\n",
                     fs_log_too_small ? "log is too small to write" : "disk is read-only");
         } else if (fs_test == FS_TEST_WRITE) {
             write_test();
-        } else {
+        } else if (fs_test == FS_TEST_FULL) {
             full_test();
+        } else {
+            tree_test();
         }
     }
 }

@@ -126,7 +126,8 @@ fn fsck_reports_damage_and_recover_replays_the_log() {
     let mut bad = good.clone();
     let fs = Fs::open(&good).unwrap();
     let readme = fs.inode(fs.lookup("/README").unwrap()).unwrap();
-    let (b, byte, mask) = sb.bit_pos(readme.addrs[0]);
+    let readme_block = camelot_fs::data_blocks(&good, &sb, &readme).unwrap()[0];
+    let (b, byte, mask) = sb.bit_pos(readme_block);
     block_mut(&mut bad, b)[byte] &= !mask;
     std::fs::write(&img, &bad).unwrap();
     let o = run(&["fsck", img_s]);
@@ -140,11 +141,11 @@ fn fsck_reports_damage_and_recover_replays_the_log() {
 
     // A committed transaction: README's block with new contents.
     let mut pending = good.clone();
-    let mut new = block(&good, readme.addrs[0]).to_vec();
+    let mut new = block(&good, readme_block).to_vec();
     new[..5].copy_from_slice(b"HELLO");
     block_mut(&mut pending, sb.logstart + 1).copy_from_slice(&new);
     let header = LogHeader {
-        blocks: vec![readme.addrs[0]],
+        blocks: vec![readme_block],
     };
     block_mut(&mut pending, sb.logstart).copy_from_slice(&header.encode());
     std::fs::write(&img, &pending).unwrap();
@@ -159,7 +160,7 @@ fn fsck_reports_damage_and_recover_replays_the_log() {
     assert!(stdout(&o).starts_with("replayed 1 blocks from the log\n"));
     let after = std::fs::read(&img).unwrap();
     assert!(block(&after, sb.logstart).iter().all(|&b| b == 0));
-    assert_eq!(&block(&after, readme.addrs[0])[..5], b"HELLO");
+    assert_eq!(&block(&after, readme_block)[..5], b"HELLO");
     assert_eq!(fsck::check(&after).unwrap().replayed, 0);
 
     // An orphan: README's entry gone and its count 0, as a crash leaves a
@@ -167,7 +168,8 @@ fn fsck_reports_damage_and_recover_replays_the_log() {
     let mut orphan = after.clone();
     let root = camelot_fs::read_inode(&orphan, &sb, camelot_fs::ROOT_INODE);
     let inum = fs.lookup("/README").unwrap();
-    let dir = block_mut(&mut orphan, root.addrs[0]);
+    let root_block = camelot_fs::data_blocks(&orphan, &sb, &root).unwrap()[0];
+    let dir = block_mut(&mut orphan, root_block);
     let at = (0..dir.len())
         .step_by(camelot_fs::DIRENT_SIZE)
         .find(|&i| u32::from(u16::from_le_bytes([dir[i], dir[i + 1]])) == inum)

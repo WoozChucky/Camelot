@@ -72,7 +72,7 @@ there is a filesystem to look it up in.
 | 8 | `wait` | `int pid, int *status` | the pid of the child collected; `-ECHILD`, `-EFAULT` |
 | 9 | `sbrk` | `int increment` | the old end of the heap; `-ENOMEM`, `-EINVAL` |
 | 10 | `uptime` | | timer ticks since boot |
-| 11 | `open` | `const char *path, int flags` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EISDIR`, `-ENODEV`, `-EROFS`, `-ENOSPC`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
+| 11 | `open` | `const char *path, int flags` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EISDIR`, `-ENODEV`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
 | 12 | `close` | `int fd` | 0; `-EBADF` |
 | 13 | `lseek` | `int fd, int offset, int whence` | the new offset; `-EBADF`, `-ESPIPE`, `-EINVAL` |
 | 14 | `fstat` | `int fd, struct stat *st` | 0; `-EBADF`, `-EFAULT` |
@@ -140,8 +140,8 @@ the bytes written until then. `fd` must be open for writing, or it is
 is `send`: on UDP that is an empty datagram). To a file on the disk, the bytes go
 at the descriptor's offset, which moves past them, and the file grows if they
 run past its end; a write that can write nothing fails with what stopped it:
-`-ENOSPC` (the disk is full), `-EFBIG` (the file would pass the largest a
-file can be, 274 432 bytes), `-EINVAL` (the offset is past the end of the
+`-ENOSPC` (the disk is full), `-EFBIG` (the file would pass the largest the
+kernel writes, 2^31 - 1 bytes), `-EINVAL` (the offset is past the end of the
 file, which another descriptor has emptied meanwhile), `-ENOMEM` (no page
 free for copying through). To the console, the bytes are printed. To a
 pipe, they wait in it for a reader ("Pipes"); `-EPIPE` if no read end is
@@ -236,12 +236,21 @@ opens:
   read-only filesystem; a node whose major number has no driver is
   `-ENODEV`.
 
+A file bigger than 2^31 - 1 bytes is `-EOVERFLOW`: the kernel's file
+offsets are 32-bit (`lseek` works in an `int`) until they become a 64-bit
+`off_t` (#155), so it could not reach all of it. That is Linux's answer to
+an `open` without `O_LARGEFILE` on such a file. The filesystem allows files
+far bigger (docs/camelot-fs.md, "Inodes"); only mkfs can make one.
+
 Errors: the path's (`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`), those above,
 `-ENOSPC` (no free inode or block to make the file with), `-EMFILE` (all 16
 of the caller's descriptors are taken), `-ENFILE` (all 64 of the kernel's
 open files are), `-EFAULT`. Without a free descriptor and open file nothing
-is made. Making the file, or emptying it, is one transaction: a crash leaves
-it done or not.
+is made. Making the file is one transaction: a crash leaves it done or
+not. Emptying it takes as many as freeing its blocks does, after the file
+is open (docs/camelot-fs.md, "Truncation"): from the first one on the file
+reads as empty, writes to it wait until it is done, and a crash part way
+leaves the rest to the next mount.
 
 **close(fd)** closes descriptor `fd`, which is free again. The open file
 behind it goes with the last descriptor that shares it: a pipe end is closed
@@ -646,6 +655,7 @@ Linux's values for the same conditions.
 | 36 | `ENAMETOOLONG` | a name longer than 14 bytes, or a path longer than `MAXPATH` |
 | 38 | `ENOSYS` | no such system call |
 | 39 | `ENOTEMPTY` | unlink: a directory with entries |
+| 75 | `EOVERFLOW` | open: a file bigger than the kernel's offsets reach |
 | 88 | `ENOTSOCK` | a socket call on a descriptor that is not a socket |
 | 89 | `EDESTADDRREQ` | send: a UDP socket with no peer, and no address given |
 | 90 | `EMSGSIZE` | a datagram too big for one packet |

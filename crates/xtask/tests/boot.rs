@@ -89,8 +89,8 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     let report = fsck::check(&image).unwrap();
     assert_eq!(report.files, fsck::check(&plain).unwrap().files);
     // Room for the shell to write files: at least a fifth of the filesystem free,
-    // whatever the image's size, which is also far more than filetest's largest
-    // file (274 432 bytes, 269 blocks with its indirect block) needs. The
+    // whatever the image's size, which is also far more than filetest's big
+    // file (300 KiB, 300 blocks in one extent) needs. The
     // programs in /bin grow with every one added to kernel/user: when they take
     // too much, this says so, and xtask::fs::IMAGE_SIZE must grow.
     eprintln!(

@@ -15,6 +15,7 @@
 //! written and read through redirections and pipes, filetest's checks, and
 //! a crash at every point of a sequence of calls that change the disk.
 
+use camelot_fs::extent::{self, Blocks};
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::read::Fs;
 use camelot_fs::{block, fsck, Superblock, BSIZE, SECTOR_SIZE, T_FILE};
@@ -28,13 +29,15 @@ use xtask::repo_root;
 const FS_TEST_READ: u32 = 1;
 const FS_TEST_WRITE: u32 = 2;
 const FS_TEST_FULL: u32 = 3;
+const FS_TEST_TREE: u32 = 4;
 
 /// Checks the self-test runs (kernel/fstest.c): the read checks, one fewer
 /// without a /bin, and the transactions'.
 const READ_CHECKS: u32 = 12;
 const READ_CHECKS_NO_BIN: u32 = 11;
-const WRITE_CHECKS: u32 = 61;
-const FULL_CHECKS: u32 = 5;
+const WRITE_CHECKS: u32 = 62;
+const FULL_CHECKS: u32 = 8;
+const TREE_CHECKS: u32 = 6;
 /// Transactions the write test commits (`COMMITS` in kernel/fstest.c).
 const COMMITS: usize = 21;
 
@@ -43,6 +46,9 @@ const B_LEN: usize = 700;
 const A_LEN: usize = 2500;
 const BIG_LEN: usize = 13 * BSIZE + 100;
 const P_LEN: usize = 1500;
+/// The tree test's files, /t1 and /t2: blocks each (`T_LEN` in
+/// kernel/fstest.c is this many blocks).
+const T_BLOCKS: usize = 1200;
 
 /// RAM for these machines: less than the default, so they boot faster
 /// (the allocator sets up every page).
@@ -73,6 +79,9 @@ struct Record {
     /// The disk after each sector written, if asked for: where it would
     /// stand had the machine stopped right there.
     snapshots: Vec<Vec<u8>>,
+    /// Each sector written and its bytes, if asked for: the same, for disks
+    /// too big to copy at every write (`at_each_write` replays them).
+    writes: Vec<(u64, Vec<u8>)>,
 }
 
 /// An in-memory disk that records what it is asked to do.
@@ -80,6 +89,7 @@ struct Recorder {
     data: Vec<u8>,
     read_only: bool,
     snapshots: bool,
+    writes: bool,
     record: Arc<Mutex<Record>>,
 }
 
@@ -109,6 +119,9 @@ impl BlockBackend for Recorder {
             if self.snapshots {
                 record.snapshots.push(self.data.clone());
             }
+            if self.writes {
+                record.writes.push((sector, s.to_vec()));
+            }
         }
         Ok(())
     }
@@ -133,6 +146,8 @@ struct Boot {
     read_only: bool,
     fs_test: u32,
     snapshots: bool,
+    /// Record each sector written (`Record::writes`).
+    writes: bool,
     /// Stop the machine once this many sectors have been written.
     stop_after: Option<usize>,
     /// What is typed for the shell, which runs until it reads `exit`.
@@ -144,6 +159,7 @@ const READ: Boot = Boot {
     read_only: false,
     fs_test: FS_TEST_READ,
     snapshots: false,
+    writes: false,
     stop_after: None,
     input: b"exit\n",
     max_steps: BOOT_MAX_STEPS,
@@ -167,6 +183,7 @@ fn boot(image: Vec<u8>, how: Boot) -> Run {
         data: image,
         read_only: how.read_only,
         snapshots: how.snapshots,
+        writes: how.writes,
         record: record.clone(),
     };
     let config = MachineConfig {
@@ -253,11 +270,11 @@ fn root_image() -> Vec<u8> {
     xtask::fs::build(&root, &opts).unwrap()
 }
 
-/// The layout of the small images.
+/// The layout of the small images, with mkfs's log (the kernel's LOGSIZE).
 const SMALL: Options = Options {
     size: 160,
     ninodes: 32,
-    nlog: 21,
+    nlog: camelot_fs::DEFAULT_LOG,
 };
 
 /// A small image without /bin: a README and an empty directory. Small, so
@@ -279,9 +296,8 @@ fn image_with_free_blocks(free: u32) -> Vec<u8> {
     let have = fsck::check(&Mkfs::new(&SMALL).unwrap().finish())
         .unwrap()
         .free_blocks;
-    // The filler's blocks, and its indirect block past 12.
-    let used = have - free;
-    let blocks = if used > 12 { used - 1 } else { used };
+    // The filler's blocks: one extent, in the root, so no tree block.
+    let blocks = have - free;
     let mut fs = Mkfs::new(&SMALL).unwrap();
     fs.add_file("/filler", &pattern(blocks as usize * BSIZE, 9))
         .unwrap();
@@ -701,7 +717,7 @@ fn a_disk_that_cannot_be_mounted_is_left_alone() {
     };
     let not_mounted = |why: &str| format!("fs: disk 0 not mounted: {why}\n");
     for (image, why) in [
-        (broken(&|i| set_u32(i, 1, 4, 2)), "unknown version"),
+        (broken(&|i| set_u32(i, 1, 4, 1)), "unknown version"),
         (broken(&|i| set_u32(i, 1, 20, 1)), "bad log size"),
         (broken(&|i| set_u32(i, 1, 16, 1)), "bad inode count"),
         (
@@ -745,7 +761,7 @@ fn a_disk_that_cannot_be_mounted_is_left_alone() {
     // A committed transaction (one block: the root's directory block, as it
     // is) on a read-only disk can't be replayed.
     let image = broken(&|i| {
-        let root = camelot_fs::read_inode(i, &sb, 1).addrs[0];
+        let root = camelot_fs::data_blocks(i, &sb, &camelot_fs::read_inode(i, &sb, 1)).unwrap()[0];
         let copy = block(i, root).to_vec();
         camelot_fs::block_mut(i, sb.logstart + 1).copy_from_slice(&copy);
         set_u32(i, sb.logstart, 0, 1);
@@ -784,11 +800,13 @@ fn a_read_only_root_is_read_but_never_written() {
 }
 
 #[test]
-fn a_full_disk_leaves_no_indirect_block_behind() {
-    // 13 free blocks: /full's 12 direct blocks take 12, then its 13th block
-    // gets the indirect block and finds no block for itself. The indirect
-    // block must go back: a file of 12 blocks has none, and fsck would find
-    // it allocated for nothing.
+fn a_full_disk_leaves_the_extent_tree_as_it_was() {
+    // 13 free blocks: /full and /pad take one each in turn, four times, so
+    // /full is four extents, and /pad all but one of the rest. /full's next
+    // block needs that one and a tree block for the root's entries to move
+    // to, which there isn't: the write fails and changes nothing, the block
+    // it took given back. Then, with /pad gone, /full fills the disk with
+    // its tree a level deeper (kernel/fstest.c, full_test).
     let image = image_with_free_blocks(13);
     let before = fsck::check(&image).unwrap();
     let run = boot(
@@ -800,6 +818,7 @@ fn a_full_disk_leaves_no_indirect_block_behind() {
     );
     assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
     let lines = fs_lines(&run.out);
+    // All 13 blocks: 12 of data, and the tree block.
     assert!(
         lines.ends_with(&format!(
             "fs: the disk filled up at {} bytes\n{}",
@@ -809,19 +828,200 @@ fn a_full_disk_leaves_no_indirect_block_behind() {
         "{lines}"
     );
     let after = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
-    assert_eq!(after.free_blocks, 1);
+    assert_eq!(after.free_blocks, 0);
     assert_eq!(after.files, before.files + 1);
     let fs = Fs::open(&run.disk).unwrap();
     assert_eq!(fs.read_file("/full").unwrap(), pattern(12 * BSIZE, 7));
-    assert_eq!(fs.inode(fs.lookup("/full").unwrap()).unwrap().indirect(), 0);
+    let d = fs.inode(fs.lookup("/full").unwrap()).unwrap();
+    let map = extent::walk(fs.image(), fs.superblock(), &d.root).unwrap();
+    assert_eq!(extent::Header::decode(&d.root).depth, 1);
+    assert_eq!(map.tree_blocks.len(), 1);
+}
+
+/// The blocks of an image, for growing extent trees on it as mkfs would
+/// but in any order: blocks come from the first free one.
+struct Image<'a> {
+    image: &'a mut [u8],
+    sb: Superblock,
+}
+
+impl Blocks for Image<'_> {
+    fn block(&self, n: u32) -> &[u8] {
+        block(self.image, n)
+    }
+    fn block_mut(&mut self, n: u32) -> &mut [u8] {
+        camelot_fs::block_mut(self.image, n)
+    }
+    fn alloc(&mut self, _goal: u32) -> Result<u32, String> {
+        for b in self.sb.datastart..self.sb.size {
+            let (blk, byte, mask) = self.sb.bit_pos(b);
+            if block(self.image, blk)[byte] & mask == 0 {
+                camelot_fs::block_mut(self.image, blk)[byte] |= mask;
+                camelot_fs::block_mut(self.image, b).fill(0);
+                return Ok(b);
+            }
+        }
+        Err("full".into())
+    }
+    fn free(&mut self, b: u32) {
+        let (blk, byte, mask) = self.sb.bit_pos(b);
+        camelot_fs::block_mut(self.image, blk)[byte] &= !mask;
+    }
+}
+
+/// The tree test's disk (kernel/fstest.c, tree_test): a README, then /t1 and
+/// /t2, T_BLOCKS blocks each of the pattern with seeds 11 and 12, whose
+/// blocks alternate, so every block is an extent of its own and each tree
+/// is two deep. The host's extent code grows them, so the kernel works on
+/// trees it did not build.
+fn tree_image() -> Vec<u8> {
+    let opts = Options {
+        size: 2 * T_BLOCKS as u32 + 120,
+        ninodes: 16,
+        nlog: camelot_fs::DEFAULT_LOG,
+    };
+    let mut fs = Mkfs::new(&opts).unwrap();
+    fs.add_file("/README", b"trees\n").unwrap();
+    let files = [
+        (fs.add_file("/t1", b"").unwrap(), pattern(T_BLOCKS * BSIZE, 11)),
+        (fs.add_file("/t2", b"").unwrap(), pattern(T_BLOCKS * BSIZE, 12)),
+    ];
+    let mut image = fs.finish();
+    let sb = camelot_fs::superblock(&image).unwrap();
+    let mut disk = Image {
+        image: &mut image,
+        sb,
+    };
+    for k in 0..T_BLOCKS {
+        for (inum, data) in &files {
+            let mut d = camelot_fs::read_inode(disk.image, &sb, *inum);
+            let b = disk.alloc(0).unwrap();
+            disk.block_mut(b)
+                .copy_from_slice(&data[k * BSIZE..(k + 1) * BSIZE]);
+            extent::append(&mut disk, &mut d.root, k as u32, b).unwrap();
+            d.size += BSIZE as u64;
+            camelot_fs::write_inode(disk.image, &sb, *inum, &d);
+        }
+    }
+    let r = fsck::check(&image).unwrap_or_else(|p| panic!("{p:#?}"));
+    assert_eq!(r.files, 3);
+    let fs = Fs::open(&image).unwrap();
+    for (inum, data) in &files {
+        let d = fs.inode(*inum).unwrap();
+        assert_eq!(extent::Header::decode(&d.root).depth, 2);
+        assert_eq!(&fs.contents(*inum).unwrap(), data);
+    }
+    image
+}
+
+const TREE: Boot = Boot {
+    // It reads 2.4 MB back through the disk, block by block, and frees 2400
+    // blocks: far longer than a boot.
+    max_steps: 20 * BOOT_MAX_STEPS,
+    fs_test: FS_TEST_TREE,
+    ..READ
+};
+
+#[test]
+fn the_kernel_reads_grows_and_frees_trees_the_host_built() {
+    // kernel/fstest.c's tree test: /t1 and /t2 read back, a block added to
+    // /t1 too, removing /t1 takes more than one transaction (each leaf it
+    // empties takes a log slot, and there are 15), emptying /t2 as O_TRUNC
+    // does leaves it empty. Afterwards only the README and the root's blocks
+    // are in use, and every commit followed the protocol.
+    let image = tree_image();
+    let before = fsck::check(&image).unwrap();
+    let run = boot(image, TREE);
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    assert!(
+        fs_lines(&run.out).ends_with(&passed(READ_CHECKS_NO_BIN + TREE_CHECKS)),
+        "{}",
+        run.out
+    );
+    let after = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    assert_eq!((after.orphans, after.truncating, after.replayed), (0, 0, 0));
+    assert_eq!((after.files, after.used_blocks), (before.files - 1, 2));
+    let fs = Fs::open(&run.disk).unwrap();
+    assert!(fs.lookup("/t1").is_err());
+    assert_eq!(fs.read_file("/t2").unwrap(), b"");
+    let disk_blocks = (run.disk.len() / BSIZE) as u32;
+    assert!(check_commits(&run.record.ops, &after.sb, disk_blocks) >= 5);
+}
+
+/// Calls `f` with the disk as it stood after each sector of `writes`, from
+/// `base`, in parallel: each thread replays the writes up to the start of
+/// its share, then one at a time.
+fn at_each_write(base: &[u8], writes: &[(u64, Vec<u8>)], f: impl Fn(usize, &[u8]) + Sync) {
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(16);
+    let chunk = writes.len().div_ceil(threads);
+    let f = &f;
+    std::thread::scope(|scope| {
+        for c in 0..threads {
+            scope.spawn(move || {
+                let mut disk = base.to_vec();
+                for (i, (sector, data)) in writes.iter().enumerate().take((c + 1) * chunk) {
+                    let at = *sector as usize * SECTOR_SIZE;
+                    disk[at..at + SECTOR_SIZE].copy_from_slice(data);
+                    if i >= c * chunk {
+                        f(i, &disk);
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn a_crash_during_a_truncation_leaves_it_for_the_next_mount() {
+    // The tree test stopped after every sector it writes. Replayed, every
+    // disk passes fsck and holds the state of a commit. Some hold /t2 being
+    // truncated (TRUNCATING set, a size of 0, blocks still to free) and
+    // /t1 an orphan with blocks still to free; the kernel, booted on each
+    // disk, finishes the truncation and frees the orphan as fsck --recover
+    // does.
+    let image = tree_image();
+    let run = boot(image.clone(), Boot { writes: true, ..TREE });
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    let writes = run.record.writes;
+    let seen = Mutex::new(Vec::new());
+    at_each_write(&image, &writes, |i, disk| {
+        let r = fsck::check(disk).unwrap_or_else(|p| panic!("stopped after sector write {i}: {p:#?}"));
+        seen.lock()
+            .unwrap()
+            .push((i, r.replayed > 0, r.truncating, r.orphans, state(disk)));
+        reboot_one(i, disk, READ_CHECKS_NO_BIN);
+    });
+    let mut seen = seen.into_inner().unwrap();
+    seen.sort_by_key(|s| s.0);
+    // The state changes only at a commit point: when a header with n > 0
+    // is written, to that commit's state.
+    let mut states = vec![state(&image)];
+    let mut commits = Vec::new();
+    for (_, pending, _, _, s) in &seen {
+        if *pending && commits.last() != Some(s) {
+            commits.push(s.clone());
+        }
+        if states.last() != Some(s) {
+            states.push(s.clone());
+        }
+    }
+    assert_eq!(states[1..], commits[..]);
+    assert!(
+        seen.iter().any(|s| s.2 > 0 && s.3 == 0),
+        "no disk with a file part way through its truncation"
+    );
+    assert!(seen.iter().any(|s| s.3 > 0), "no disk with an orphan");
+    assert_eq!(states.last().unwrap(), &state(&run.disk));
 }
 
 #[test]
 fn a_log_too_small_for_an_operation_is_mounted_read_only() {
     // The format allows 1 to 127 log slots; an operation may change
-    // MAXOPBLOCKS (10) blocks. With fewer slots the kernel only reads the
+    // MAXOPBLOCKS (22) blocks. With fewer slots the kernel only reads the
     // disk, rather than panic on the first big transaction.
-    let image = small_image_with(&Options { nlog: 10, ..SMALL });
+    let image = small_image_with(&Options { nlog: 22, ..SMALL });
     let report = fsck::check(&image).unwrap();
     let run = boot(image.clone(), WRITE);
     assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
@@ -835,9 +1035,9 @@ fn a_log_too_small_for_an_operation_is_mounted_read_only() {
         )
     );
     assert!(run.disk == image);
-    // 11 blocks, a header and MAXOPBLOCKS slots, is enough (for one
+    // 23 blocks, a header and MAXOPBLOCKS slots, is enough (for one
     // operation at a time): the disk is filled a transaction at a time.
-    let image = small_image_with(&Options { nlog: 11, ..SMALL });
+    let image = small_image_with(&Options { nlog: 23, ..SMALL });
     let run = boot(
         image,
         Boot {
@@ -911,8 +1111,25 @@ fn the_format_document_matches_the_kernel_and_the_host() {
     assert_eq!(define(&fs_h, "FS_MAGIC"), format!("{:#x}", camelot_fs::MAGIC));
     assert!(doc.contains(&format!("`{:#010x}`", camelot_fs::MAGIC)));
     assert_eq!(define(&fs_h, "FS_VERSION"), camelot_fs::VERSION.to_string());
-    assert_eq!(define(&fs_h, "NDIRECT"), camelot_fs::NDIRECT.to_string());
+    assert!(doc.starts_with(&format!(
+        "# The Camelot filesystem (CMFS), version {}\n",
+        camelot_fs::VERSION
+    )));
     assert_eq!(define(&fs_h, "DIRSIZ"), camelot_fs::DIRSIZ.to_string());
+    // The extent trees: ext4's magic and sizes, on both sides and in the
+    // document.
+    assert_eq!(define(&fs_h, "EXT_MAGIC"), format!("{:#x}", extent::MAGIC));
+    assert!(doc.contains("0xF30A"));
+    assert_eq!(define(&fs_h, "EXT_ROOT_MAX"), extent::ROOT_MAX.to_string());
+    assert_eq!(define(&fs_h, "EXT_MAX_DEPTH"), extent::MAX_DEPTH.to_string());
+    assert_eq!(define(&fs_h, "EXT_MAX_LEN"), extent::MAX_LEN.to_string());
+    assert!(doc.contains(&format!("(1024 - 12) / 12 = {}", extent::BLOCK_MAX)));
+    assert!(doc.contains("blocks it maps, 1 to 32 768"));
+    assert!(doc.contains(&format!("{} bytes, 8 per block", camelot_fs::INODE_SIZE)));
+    assert_eq!(
+        define(&fs_h, "INODE_TRUNCATING"),
+        camelot_fs::TRUNCATING.to_string()
+    );
     assert_eq!(define(&fs_h, "LOG_MAX"), camelot_fs::MAX_LOG.to_string());
     assert_eq!(define(&fs_h, "INODES_MAX"), camelot_fs::MAX_INODES.to_string());
     assert_eq!(define(&fs_h, "ROOTINO"), camelot_fs::ROOT_INODE.to_string());
@@ -921,12 +1138,15 @@ fn the_format_document_matches_the_kernel_and_the_host() {
         define(&log_h, "LOGSIZE").parse::<u32>().unwrap() + 1,
         camelot_fs::DEFAULT_LOG
     );
-    assert!(doc.contains("`LOGSIZE` = 20"));
-    assert!(doc.contains("`MAXOPBLOCKS` = 10"));
-    assert_eq!(define(&log_h, "MAXOPBLOCKS"), "10");
-    // The largest file, in the document's words.
-    assert_eq!(camelot_fs::MAX_FILE_SIZE, 274_432);
-    assert!(doc.contains("268\n  blocks, 274 432 bytes") || doc.contains("268 blocks, 274 432 bytes"));
+    assert!(doc.contains("`LOGSIZE` = 44"));
+    assert!(doc.contains("`MAXOPBLOCKS` = 22"));
+    assert_eq!(define(&log_h, "MAXOPBLOCKS"), "22");
+    assert!(doc.contains("(`nlog` < 23)"));
+    // The largest file: the format's, and the kernel's for now.
+    assert_eq!(camelot_fs::MAX_FILE_SIZE, 4 << 40);
+    assert!(doc.contains("2^32 blocks (its logical block numbers are\n  u32), 4 TiB"));
+    assert_eq!(define(&fs_h, "MAXFILE_BYTES"), "0x7fffffffu");
+    assert!(doc.contains("writes files of at most 2^31 - 1\n  bytes"));
 }
 
 // ---- The file system calls (issue #67) ----
@@ -991,47 +1211,82 @@ fn reboot_each(snapshots: &[Vec<u8>], read_checks: u32) {
         for (c, part) in snapshots.chunks(chunk).enumerate() {
             scope.spawn(move || {
                 for (j, snap) in part.iter().enumerate() {
-                    let i = c * chunk + j;
-                    let replayed = fsck::check(snap).unwrap().replayed;
-                    let mut want = snap.clone();
-                    fsck::recover(&mut want).unwrap();
-                    let orphans = fsck::free_orphans(&mut want).unwrap();
-                    let again = boot(snap.clone(), READ);
-                    assert_eq!(
-                        again.result,
-                        RunResult::Exited(0),
-                        "after write {i}:\n{}",
-                        again.out
-                    );
-                    let lines = fs_lines(&again.out);
-                    assert_eq!(
-                        lines.starts_with(&format!("fs: replayed {replayed} blocks from the log\n")),
-                        replayed > 0,
-                        "after write {i}:\n{lines}"
-                    );
-                    assert_eq!(
-                        lines.contains(&format!("fs: freed {orphans} inodes that no directory named\n")),
-                        orphans > 0,
-                        "after write {i}:\n{lines}"
-                    );
-                    assert!(lines.ends_with(&passed(read_checks)), "after write {i}:\n{lines}");
-                    if orphans == 0 {
-                        assert!(
-                            again.disk == want,
-                            "after write {i}: the kernel's replay is not the host's"
-                        );
-                    } else {
-                        assert!(
-                            without_log_slots(&again.disk) == without_log_slots(&want),
-                            "after write {i}: the kernel's recovery is not the host's"
-                        );
-                    }
-                    let r = fsck::check(&again.disk).unwrap();
-                    assert_eq!((r.replayed, r.orphans), (0, 0), "after write {i}");
+                    reboot_one(c * chunk + j, snap, read_checks);
                 }
             });
         }
     });
+}
+
+/// Boots the kernel on `snap`, a disk as the machine left it after sector
+/// write `i`, and checks that its mount recovers it as the host does:
+/// replays the log, finishes the truncations, frees the orphans, says so,
+/// and leaves the host's disk (but for the log slots and the free blocks'
+/// bytes, which the kernel's transactions may have gone through), which
+/// fsck finds clean.
+fn reboot_one(i: usize, snap: &[u8], read_checks: u32) {
+    let replayed = fsck::check(snap).unwrap().replayed;
+    let mut want = snap.to_vec();
+    fsck::recover(&mut want).unwrap();
+    let truncations = fsck::finish_truncations(&mut want).unwrap();
+    let orphans = fsck::free_orphans(&mut want).unwrap();
+    let again = boot(snap.to_vec(), READ);
+    assert_eq!(
+        again.result,
+        RunResult::Exited(0),
+        "after write {i}:\n{}",
+        again.out
+    );
+    let lines = fs_lines(&again.out);
+    assert_eq!(
+        lines.starts_with(&format!("fs: replayed {replayed} blocks from the log\n")),
+        replayed > 0,
+        "after write {i}:\n{lines}"
+    );
+    assert_eq!(
+        lines.contains(&format!("fs: finished {truncations} truncations\n")),
+        truncations > 0,
+        "after write {i}:\n{lines}"
+    );
+    assert_eq!(
+        lines.contains(&format!("fs: freed {orphans} inodes that no directory named\n")),
+        orphans > 0,
+        "after write {i}:\n{lines}"
+    );
+    assert!(lines.ends_with(&passed(read_checks)), "after write {i}:\n{lines}");
+    if orphans == 0 && truncations == 0 {
+        assert!(
+            again.disk == want,
+            "after write {i}: the kernel's replay is not the host's"
+        );
+    } else {
+        assert!(
+            without_free_blocks(&again.disk) == without_free_blocks(&want),
+            "after write {i}: the kernel's recovery is not the host's"
+        );
+    }
+    let r = fsck::check(&again.disk).unwrap();
+    assert_eq!(
+        (r.replayed, r.orphans, r.truncating),
+        (0, 0, 0),
+        "after write {i}"
+    );
+}
+
+/// `image` with its log slots and the blocks its bitmap marks free zeroed:
+/// what two recoveries must agree on, when one went through transactions
+/// (which use the slots, and may have changed a tree block before freeing
+/// it) and the other did not.
+fn without_free_blocks(image: &[u8]) -> Vec<u8> {
+    let mut out = without_log_slots(image);
+    let sb = camelot_fs::superblock(image).unwrap();
+    for b in sb.datastart..sb.size {
+        let (blk, byte, mask) = sb.bit_pos(b);
+        if block(image, blk)[byte] & mask == 0 {
+            camelot_fs::block_mut(&mut out, b).fill(0);
+        }
+    }
+    out
 }
 
 #[test]

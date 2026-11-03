@@ -4,6 +4,8 @@
 //!
 //! * this module: the format itself, as constants and the three on-disk
 //!   structures ([`Superblock`], [`Dinode`], [`Dirent`]) with their encodings;
+//! * [`extent`]: the extent trees that map a file's contents (reading,
+//!   checking and growing them);
 //! * [`mkfs`]: builds an image, empty or filled from a host directory;
 //! * [`read`]: reads one back ([`read::Fs`]: paths, directories, files), seeing
 //!   a pending log as recovery would;
@@ -17,6 +19,7 @@
 //! files.
 
 pub mod boot;
+pub mod extent;
 pub mod fsck;
 pub mod mkfs;
 pub mod read;
@@ -29,7 +32,7 @@ pub const SECTOR_SIZE: usize = 512;
 /// The superblock's `magic`: the bytes `C M F S`.
 pub const MAGIC: u32 = 0x5346_4d43;
 /// The format version this crate reads and writes.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// The boot block, which the filesystem leaves alone.
 pub const BOOT_BLOCK: u32 = 0;
@@ -44,15 +47,21 @@ pub const NO_INODE: u32 = 0;
 pub const ROOT_INODE: u32 = 1;
 
 /// Bytes in an on-disk inode, and inodes per block.
-pub const INODE_SIZE: usize = 64;
+pub const INODE_SIZE: usize = 128;
 pub const INODES_PER_BLOCK: u32 = (BSIZE / INODE_SIZE) as u32;
-/// Direct block pointers in an inode.
-pub const NDIRECT: usize = 12;
-/// Pointers in the indirect block.
-pub const NINDIRECT: usize = BSIZE / 4;
-/// The most blocks a file has, and its largest size in bytes.
-pub const MAX_FILE_BLOCKS: usize = NDIRECT + NINDIRECT;
-pub const MAX_FILE_SIZE: u32 = (MAX_FILE_BLOCKS * BSIZE) as u32;
+/// Where the inode's fields are: `i_block`, the extent tree's root, then
+/// `flags`, then the reserved bytes to the end.
+pub const IBLOCK_AT: usize = 16;
+pub const FLAGS_AT: usize = IBLOCK_AT + extent::ROOT_SIZE;
+pub const RESERVED_AT: usize = FLAGS_AT + 4;
+pub const RESERVED_SIZE: usize = INODE_SIZE - RESERVED_AT;
+/// `flags`: the inode's blocks are being freed ("Truncation"). No other bit
+/// is defined.
+pub const TRUNCATING: u32 = 1;
+/// The most blocks a file can have (its logical block numbers are u32),
+/// and so its largest size in bytes.
+pub const MAX_FILE_BLOCKS: u64 = 1 << 32;
+pub const MAX_FILE_SIZE: u64 = MAX_FILE_BLOCKS * BSIZE as u64;
 
 /// Bytes in a directory entry, and the longest name.
 pub const DIRENT_SIZE: usize = 16;
@@ -70,10 +79,10 @@ pub const MAX_INODES: u32 = 65536;
 pub const MAX_SIZE: u32 = 1 << 31;
 
 /// What mkfs makes unless told otherwise: 2 MiB, 256 inodes, a header and
-/// the kernel's `LOGSIZE` (20) slots.
+/// the kernel's `LOGSIZE` (44) slots.
 pub const DEFAULT_SIZE: u32 = 2048;
 pub const DEFAULT_INODES: u32 = 256;
-pub const DEFAULT_LOG: u32 = 21;
+pub const DEFAULT_LOG: u32 = 45;
 
 /// Inode types (`Dinode::kind`).
 pub const T_FREE: u16 = 0;
@@ -261,32 +270,69 @@ impl Superblock {
     }
 }
 
-/// An on-disk inode (64 bytes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// An on-disk inode (128 bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dinode {
     /// `T_FREE`, `T_DIR`, `T_FILE` or `T_DEVICE`.
     pub kind: u16,
     pub major: u16,
     pub minor: u16,
     pub nlink: u16,
-    pub size: u32,
-    /// The 12 direct pointers, then the indirect one.
-    pub addrs: [u32; NDIRECT + 1],
+    pub size: u64,
+    /// `i_block`: the root of the extent tree ([`extent`]); zeros for a
+    /// device.
+    pub root: [u8; extent::ROOT_SIZE],
+    /// `TRUNCATING`, or 0.
+    pub flags: u32,
+    /// The reserved bytes, which must be 0 (kept to check that they are).
+    pub reserved: [u8; RESERVED_SIZE],
+}
+
+impl Default for Dinode {
+    /// All zero: a free inode.
+    fn default() -> Self {
+        Dinode {
+            kind: T_FREE,
+            major: 0,
+            minor: 0,
+            nlink: 0,
+            size: 0,
+            root: [0; extent::ROOT_SIZE],
+            flags: 0,
+            reserved: [0; RESERVED_SIZE],
+        }
+    }
 }
 
 impl Dinode {
-    pub fn decode(b: &[u8]) -> Dinode {
-        let mut addrs = [0; NDIRECT + 1];
-        for (i, a) in addrs.iter_mut().enumerate() {
-            *a = u32_at(b, 12 + 4 * i);
+    /// A new inode of `kind`, empty: a directory or file with an empty
+    /// extent tree, a device with an `i_block` of zeros.
+    pub fn new(kind: u16) -> Dinode {
+        Dinode {
+            kind,
+            root: if kind == T_DEVICE {
+                [0; extent::ROOT_SIZE]
+            } else {
+                extent::empty_root()
+            },
+            ..Dinode::default()
         }
+    }
+
+    pub fn decode(b: &[u8]) -> Dinode {
+        let mut root = [0; extent::ROOT_SIZE];
+        root.copy_from_slice(&b[IBLOCK_AT..FLAGS_AT]);
+        let mut reserved = [0; RESERVED_SIZE];
+        reserved.copy_from_slice(&b[RESERVED_AT..INODE_SIZE]);
         Dinode {
             kind: u16_at(b, 0),
             major: u16_at(b, 2),
             minor: u16_at(b, 4),
             nlink: u16_at(b, 6),
-            size: u32_at(b, 8),
-            addrs,
+            size: u64::from(u32_at(b, 8)) | (u64::from(u32_at(b, 12)) << 32),
+            root,
+            flags: u32_at(b, FLAGS_AT),
+            reserved,
         }
     }
 
@@ -295,20 +341,16 @@ impl Dinode {
         put_u16(b, 2, self.major);
         put_u16(b, 4, self.minor);
         put_u16(b, 6, self.nlink);
-        put_u32(b, 8, self.size);
-        for (i, a) in self.addrs.iter().enumerate() {
-            put_u32(b, 12 + 4 * i, *a);
-        }
-    }
-
-    /// The indirect pointer.
-    pub fn indirect(&self) -> u32 {
-        self.addrs[NDIRECT]
+        put_u32(b, 8, self.size as u32);
+        put_u32(b, 12, (self.size >> 32) as u32);
+        b[IBLOCK_AT..FLAGS_AT].copy_from_slice(&self.root);
+        put_u32(b, FLAGS_AT, self.flags);
+        b[RESERVED_AT..INODE_SIZE].copy_from_slice(&self.reserved);
     }
 
     /// Blocks the contents take: ceil(size / BSIZE).
-    pub fn content_blocks(&self) -> usize {
-        (self.size as usize).div_ceil(BSIZE)
+    pub fn content_blocks(&self) -> u64 {
+        self.size.div_ceil(BSIZE as u64)
     }
 }
 
@@ -424,40 +466,37 @@ pub fn write_inode(image: &mut [u8], sb: &Superblock, inum: u32, d: &Dinode) {
     d.encode(&mut block_mut(image, b)[off..off + INODE_SIZE]);
 }
 
-/// The block holding logical block `k` of a file, 0 if it has none (the
-/// pointer, or the indirect block, is 0). `k` must be below
-/// `MAX_FILE_BLOCKS`. An indirect pointer outside the data region is an
-/// error, so a corrupt inode can't send a reader outside the image.
-pub fn bmap(image: &[u8], sb: &Superblock, d: &Dinode, k: usize) -> Result<u32, String> {
-    if k < NDIRECT {
-        return Ok(d.addrs[k]);
+/// The disk blocks of a file's or directory's contents, in order, checked:
+/// its extent tree is valid ([`extent::walk`]) and maps exactly the blocks
+/// its size needs.
+pub fn data_blocks(image: &[u8], sb: &Superblock, d: &Dinode) -> Result<Vec<u32>, String> {
+    let map = extent::walk(image, sb, &d.root)?;
+    if map.blocks() != d.content_blocks() {
+        return Err(format!(
+            "the size ({} bytes) needs {} blocks, the extent tree maps {}",
+            d.size,
+            d.content_blocks(),
+            map.blocks()
+        ));
     }
-    let ind = d.indirect();
-    if ind == 0 {
-        return Ok(0);
-    }
-    if !sb.is_data(ind) {
-        return Err(format!("indirect block {ind} is outside the data region"));
-    }
-    let i = k - NDIRECT;
-    Ok(u32_at(block(image, ind), 4 * i))
+    Ok(map.content_blocks().collect())
 }
 
-/// The contents of a file or directory: its `size` bytes. Every block below
-/// the size must be allocated and in the data region.
+/// The contents of a file or directory: its `size` bytes. A file being
+/// truncated (`TRUNCATING`) has none: the blocks it still holds are being
+/// freed, and the next mount finishes that.
 pub fn contents(image: &[u8], sb: &Superblock, d: &Dinode) -> Result<Vec<u8>, String> {
+    if d.flags & TRUNCATING != 0 {
+        extent::walk(image, sb, &d.root)?;
+        return Ok(Vec::new());
+    }
     if d.size > MAX_FILE_SIZE {
         return Err(format!("size {} is more than the largest file", d.size));
     }
-    let size = d.size as usize;
+    let blocks = data_blocks(image, sb, d)?;
+    let size = usize::try_from(d.size).map_err(|_| format!("size {} does not fit in memory", d.size))?;
     let mut out = Vec::with_capacity(size);
-    for k in 0..d.content_blocks() {
-        let b = bmap(image, sb, d, k)?;
-        if !sb.is_data(b) {
-            return Err(format!(
-                "block {k} of the contents is {b}, outside the data region"
-            ));
-        }
+    for (k, &b) in blocks.iter().enumerate() {
         let n = (size - k * BSIZE).min(BSIZE);
         out.extend_from_slice(&block(image, b)[..n]);
     }
@@ -515,10 +554,10 @@ mod tests {
     #[test]
     fn the_default_layout() {
         let sb = Superblock::layout(DEFAULT_SIZE, DEFAULT_INODES, DEFAULT_LOG).unwrap();
-        // 2 + 21 = 23; 256 inodes are 16 blocks; 2048 blocks one bitmap block.
+        // 2 + 45 = 47; 256 inodes are 32 blocks; 2048 blocks one bitmap block.
         assert_eq!(
             (sb.logstart, sb.inodestart, sb.bmapstart, sb.datastart, sb.nblocks),
-            (2, 23, 39, 40, 2008)
+            (2, 47, 79, 80, 1968)
         );
         assert_eq!(sb.validate(2048), Ok(()));
         assert!(sb.validate(2047).unwrap_err().contains("the disk only 2047"));
@@ -532,15 +571,16 @@ mod tests {
         assert!(Superblock::layout(100, 65537, 2).is_err());
         assert!(
             Superblock::layout(100, 65536, 2).is_err(),
-            "4096 inode blocks don't fit"
+            "8192 inode blocks don't fit"
         );
         // The smallest: boot, super, 2 log, 1 inode block, 1 bitmap, 1 data.
         let sb = Superblock::layout(7, 2, 2).unwrap();
         assert_eq!(sb.datastart, 6);
         assert!(Superblock::layout(6, 2, 2).is_err());
-        // Bitmap blocks: one per 8192 blocks.
-        assert_eq!(Superblock::layout(8192, 16, 2).unwrap().datastart, 6);
-        assert_eq!(Superblock::layout(8193, 16, 2).unwrap().datastart, 7);
+        // 8 inodes to a block, and one bitmap block per 8192 blocks.
+        assert_eq!(Superblock::layout(8192, 8, 2).unwrap().datastart, 6);
+        assert_eq!(Superblock::layout(8192, 9, 2).unwrap().datastart, 7);
+        assert_eq!(Superblock::layout(8193, 16, 2).unwrap().datastart, 8);
     }
 
     #[test]
@@ -551,8 +591,11 @@ mod tests {
         assert!(b[SUPERBLOCK_SIZE..].iter().all(|&x| x == 0));
         assert_eq!(Superblock::decode(&b), sb);
         let mut bad = sb;
-        bad.version = 2;
-        assert!(bad.validate(300).unwrap_err().contains("version 2"));
+        bad.version = 1;
+        assert!(bad
+            .validate(300)
+            .unwrap_err()
+            .contains("version 1 (this reads version 2)"));
         let mut bad = sb;
         bad.datastart += 1;
         assert!(bad.validate(300).unwrap_err().contains("misplaced"));
@@ -563,20 +606,33 @@ mod tests {
 
     #[test]
     fn dinode_layout() {
-        let d = Dinode {
+        let mut d = Dinode {
             kind: T_FILE,
             major: 0x1122,
             minor: 0x3344,
             nlink: 2,
-            size: 0x01020304,
-            addrs: [7; NDIRECT + 1],
+            size: 0x0506_0708_0102_0304,
+            flags: TRUNCATING,
+            ..Dinode::new(T_FILE)
         };
+        d.reserved[RESERVED_SIZE - 1] = 9;
         let mut b = [0; INODE_SIZE];
         d.encode(&mut b);
-        assert_eq!(&b[..12], &[2, 0, 0x22, 0x11, 0x44, 0x33, 2, 0, 4, 3, 2, 1]);
-        assert_eq!(&b[60..64], &[7, 0, 0, 0]);
+        assert_eq!(
+            &b[..16],
+            &[2, 0, 0x22, 0x11, 0x44, 0x33, 2, 0, 4, 3, 2, 1, 8, 7, 6, 5]
+        );
+        assert_eq!(&b[16..18], &[0x0a, 0xf3], "i_block's header");
+        assert_eq!(&b[76..80], &[1, 0, 0, 0]);
+        assert_eq!(b[127], 9);
         assert_eq!(Dinode::decode(&b), d);
-        assert_eq!(d.content_blocks(), 0x01020304usize.div_ceil(BSIZE));
+        assert_eq!(
+            d.content_blocks(),
+            0x0506_0708_0102_0304u64.div_ceil(BSIZE as u64)
+        );
+        assert_eq!(Dinode::new(T_DEVICE).root, [0; extent::ROOT_SIZE]);
+        assert_eq!((FLAGS_AT, RESERVED_AT, RESERVED_SIZE), (76, 80, 48));
+        assert_eq!(MAX_FILE_SIZE, 1 << 42);
     }
 
     #[test]

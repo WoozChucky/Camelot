@@ -76,9 +76,9 @@ fn halted_output() -> String {
 const TICK_INTERVAL: u64 = 1_000_000;
 
 /// More than the steps from reset to `kmain`, nearly all of them `_start`
-/// zeroing `.bss` a word at a time (about 35 000 since the buffer cache's
-/// 30 KiB live there).
-const TO_KMAIN_STEPS: u64 = 100_000;
+/// zeroing `.bss` a word at a time: about 26 000 words, a few steps each,
+/// since the buffer cache's 54 KiB live there.
+const TO_KMAIN_STEPS: u64 = 200_000;
 
 // Kernel constants, from the kernel sources named in each comment.
 // crates/grail/tests/kernel.rs has copies of some: keep them in sync.
@@ -174,7 +174,7 @@ fn sym(elf: &grail::elf::Elf, name: &str) -> u32 {
 
 /// Steps the machine until it is about to execute (or take a trap at) `pc`.
 fn step_to(m: &mut Machine, pc: u32) {
-    for _ in 0..100_000 {
+    for _ in 0..TO_KMAIN_STEPS {
         if m.cpu.pc == pc {
             return;
         }
@@ -3695,7 +3695,7 @@ fn the_system_call_document_matches_the_code() {
     }
 
     let errors = doc_table(&doc, "## Error numbers");
-    assert_eq!(errors.len(), 44, "{errors:?}");
+    assert_eq!(errors.len(), 45, "{errors:?}");
     assert_eq!(defines(&header, "E"), errors, "syscall.h");
     assert_eq!(defines(&user_h, "E"), errors, "user.h");
 
@@ -3851,7 +3851,7 @@ fn the_kernel_embeds_every_user_program() {
 const BSIZE: usize = 1024;
 const BLOCK_SECTORS: u32 = 2;
 /// Buffers in the cache (`NBUF` in kernel/include/bio.h).
-const NBUF: u32 = 30;
+const NBUF: u32 = 54;
 /// The disk most tests attach: 64 blocks, enough for the self-test's LRU
 /// check, which needs NBUF + 1.
 const DISK_SECTORS: usize = 128;
