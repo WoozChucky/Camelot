@@ -346,6 +346,15 @@ impl Hart {
     /// instruction, or waits in `wfi`. Returns true if it waited: stalled in `wfi` with
     /// no interrupt pending and enabled to wake it.
     pub fn step(&mut self, bus: &mut Bus) -> bool {
+        // `x` and `pc` are public (for a debugger, for tests): whoever writes them must keep
+        // an RV32 hart's form, registers sign-extended and the pc below 4 GiB.
+        debug_assert!(
+            self.xlen == Xlen::Rv64 || (self.x.iter().all(|&v| v == sext32(v)) && self.pc >> 32 == 0),
+            "hart {}: an RV32 register or pc out of its form: pc {:#x}, x {:x?}",
+            self.id,
+            self.pc,
+            self.x
+        );
         if let Some(irq) = self.pending_interrupt(bus) {
             self.waiting = false;
             self.enter_trap(bus, interrupt_bit(self.xlen) | irq as u64, 0, self.pc);
