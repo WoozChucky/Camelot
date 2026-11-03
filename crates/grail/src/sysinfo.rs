@@ -9,6 +9,7 @@
 
 use crate::bus::{BusFault, RAM_BASE};
 use crate::config::MachineConfig;
+use crate::mmio::{self, Field};
 use excalibur::Xlen;
 
 /// "SYSI" when the register is read as big-endian hex: 53 59 53 49.
@@ -99,18 +100,6 @@ pub struct DeviceEntry {
     pub irq: u32,
 }
 
-/// What a 4-byte-aligned offset of the block holds.
-enum Slot {
-    /// A 32-bit register.
-    Word(u32),
-    /// The low half (at the lower address) of a 64-bit register.
-    Low(u64),
-    /// Its high half.
-    High(u64),
-    /// Nothing: reads as 0.
-    Reserved,
-}
-
 pub struct Sysinfo {
     ram_size: u64,
     cpu_hz: u32,
@@ -161,18 +150,15 @@ impl Sysinfo {
         }
     }
 
-    /// What `off` holds in this block's layout.
-    fn slot(&self, off: u32) -> Slot {
-        if !off.is_multiple_of(4) {
-            return Slot::Reserved;
-        }
+    /// What `off` holds in this block's layout, with the register's value.
+    fn field(&self, off: u32) -> Field<u64> {
         match self.xlen {
-            Xlen::Rv32 => self.slot_v1(off),
-            Xlen::Rv64 => self.slot_v2(off),
+            Xlen::Rv32 => self.field_v1(off),
+            Xlen::Rv64 => self.field_v2(off),
         }
     }
 
-    fn slot_v1(&self, off: u32) -> Slot {
+    fn field_v1(&self, off: u32) -> Field<u64> {
         let word = match off {
             REG_MAGIC => SYSINFO_MAGIC,
             REG_VERSION => SYSINFO_VERSION,
@@ -187,7 +173,7 @@ impl Sysinfo {
             o if o >= DEV_TABLE => {
                 let index = ((o - DEV_TABLE) / DEV_ENTRY_SIZE) as usize;
                 let Some(d) = self.devices.get(index) else {
-                    return Slot::Reserved;
+                    return Field::Unused;
                 };
                 // Every device is below 4 GiB.
                 match (o - DEV_TABLE) % DEV_ENTRY_SIZE {
@@ -197,19 +183,19 @@ impl Sysinfo {
                     _ => d.irq,
                 }
             }
-            _ => return Slot::Reserved,
+            _ => return Field::Unused,
         };
-        Slot::Word(word)
+        Field::Word(word.into())
     }
 
-    fn slot_v2(&self, off: u32) -> Slot {
+    fn field_v2(&self, off: u32) -> Field<u64> {
         let word = match off {
             REG_MAGIC => SYSINFO_MAGIC,
             REG_VERSION => v2::VERSION,
-            v2::REG_RAM_BASE => return Slot::Low(RAM_BASE),
-            o if o == v2::REG_RAM_BASE + 4 => return Slot::High(RAM_BASE),
-            v2::REG_RAM_SIZE => return Slot::Low(self.ram_size),
-            o if o == v2::REG_RAM_SIZE + 4 => return Slot::High(self.ram_size),
+            v2::REG_RAM_BASE => return Field::Low(RAM_BASE),
+            o if o == v2::REG_RAM_BASE + 4 => return Field::High(RAM_BASE),
+            v2::REG_RAM_SIZE => return Field::Low(self.ram_size),
+            o if o == v2::REG_RAM_SIZE + 4 => return Field::High(self.ram_size),
             v2::REG_TIMEBASE_HZ | v2::REG_CPU_HZ => self.cpu_hz,
             v2::REG_FLAGS => self.flags,
             v2::REG_DEV_COUNT => self.devices.len() as u32,
@@ -217,45 +203,27 @@ impl Sysinfo {
             o if o >= DEV_TABLE => {
                 let index = ((o - DEV_TABLE) / v2::DEV_ENTRY_SIZE) as usize;
                 let Some(d) = self.devices.get(index) else {
-                    return Slot::Reserved;
+                    return Field::Unused;
                 };
                 return match (o - DEV_TABLE) % v2::DEV_ENTRY_SIZE {
-                    0x00 => Slot::Word(d.kind as u32),
-                    0x04 => Slot::Word(d.irq),
-                    0x08 => Slot::Low(d.base),
-                    0x0c => Slot::High(d.base),
-                    0x10 => Slot::Low(d.size),
-                    _ => Slot::High(d.size),
+                    0x00 => Field::Word(d.kind as u64),
+                    0x04 => Field::Word(d.irq.into()),
+                    0x08 => Field::Low(d.base),
+                    0x0c => Field::High(d.base),
+                    0x10 => Field::Low(d.size),
+                    _ => Field::High(d.size),
                 };
             }
-            _ => return Slot::Reserved,
+            _ => return Field::Unused,
         };
-        Slot::Word(word)
+        Field::Word(word.into())
     }
 
-    /// Reads a register. Every version takes 4-byte reads, of a 32-bit register or one
-    /// half of a 64-bit one; version 2 also takes 8-byte reads of a whole 64-bit
-    /// register (or of reserved space). Unused offsets, and entries past the device
-    /// count, read as 0.
+    /// Reads a register, at the widths of spec section 9 ([`mmio::access`]). Unused
+    /// offsets, and entries past the device count, read as 0.
     pub fn read(&self, off: u32, size: u32) -> Result<u64, BusFault> {
-        match size {
-            4 => Ok(match self.slot(off) {
-                Slot::Word(v) => v.into(),
-                Slot::Low(v) => v & 0xffff_ffff,
-                Slot::High(v) => v >> 32,
-                Slot::Reserved => 0,
-            }),
-            8 if self.xlen == Xlen::Rv64 && off.is_multiple_of(8) => {
-                match (self.slot(off), self.slot(off + 4)) {
-                    (Slot::Low(v), _) => Ok(v),
-                    (Slot::Reserved, Slot::Reserved) => Ok(0),
-                    // Two 32-bit registers, or one and reserved space: a width it does not
-                    // take.
-                    _ => Err(BusFault),
-                }
-            }
-            _ => Err(BusFault),
-        }
+        let access = mmio::access(off, size, self.xlen == Xlen::Rv64, |o| self.field(o))?;
+        Ok(access.read(|value| value))
     }
 
     /// Everything is read-only: writes of a width [`Sysinfo::read`] takes are ignored,

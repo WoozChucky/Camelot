@@ -20,6 +20,7 @@ pub mod framebuffer;
 pub mod gdb;
 pub mod keyboard;
 pub mod lake;
+pub mod mmio;
 pub mod net;
 pub mod pointer;
 pub mod sysinfo;
