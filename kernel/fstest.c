@@ -33,7 +33,10 @@
  *   which first finds no block for the tree to grow a level;
  * - with `fs_test` = FS_TEST_TREE, the trees of /t1 and /t2, two files the
  *   tests made with their blocks interleaved: read, grown, and freed in
- *   several transactions. */
+ *   several transactions;
+ * - with `fs_test` = FS_TEST_GROW, two files written a block at a time in
+ *   turn, so that their trees grow through every kind of split, each
+ *   append logging what the format document counts for it. */
 #include "fstest.h"
 #include "blk.h"
 #include "fs.h"
@@ -313,10 +316,12 @@ static void read_checks(void) {
  * begin_op() tests (r1, r2, j2, j3, c1, c2) are empty. */
 #define BLOCKS_LEFT (1 + 1 + 2 + 2)
 #define INODES_LEFT 10
-/* T1 (/fstest and a), b, removing a, making x, making big, its chunks,
- * removing x and freeing it, making d, removing d, the two writers'
- * operations together, the begin_op() tests (2 + 1 + 2), removing big. */
-#define COMMITS (3 + 1 + 1 + BIG_CHUNKS + 2 + 2 + 1 + 5 + 1)
+/* T1 (/fstest and a), b, removing a and then freeing it (a file's blocks
+ * are freed in transactions of their own, after the unlink's: itrunc),
+ * making x, making big, its chunks, removing x and freeing it, making d,
+ * removing d and freeing it, the two writers' operations together, the
+ * begin_op() tests (2 + 1 + 2), removing big and freeing it. */
+#define COMMITS (4 + 1 + 1 + BIG_CHUNKS + 2 + 3 + 1 + 5 + 2)
 
 /* Where /fstest/x goes, part way through writing /fstest/big: at the
  * start of a chunk. */
@@ -489,7 +494,7 @@ static bool committing(void) {
 }
 
 /* Room, 1: r1's operation has written blocks when r2 begins one. Both
- * reserving MAXOPBLOCKS could overflow the log (lh.n + 2 * 10 > 20), so r2
+ * reserving MAXOPBLOCKS could overflow the log (lh.n + 2 * 22 > 44), so r2
  * waits, r1 commits alone, then r2 runs: two transactions. */
 static void room1(void) {
     begin_op();
@@ -509,8 +514,8 @@ static void room2(void) {
 }
 
 /* Room, 2: j1 and j2 are in operations, neither has written, and j3 must
- * wait (3 * 10 > 20). j1 ends without writing: its end_op() wakes j3, which
- * now fits beside j2 (2 * 10) and joins its transaction before j2 writes
+ * wait (3 * 22 > 44). j1 ends without writing: its end_op() wakes j3, which
+ * now fits beside j2 (2 * 22) and joins its transaction before j2 writes
  * anything. One commit for both files. */
 static void join1(void) {
     begin_op();
@@ -894,6 +899,118 @@ static void tree_test(void) {
     check(blocks > blocks0 + 2 * (T_LEN / BSIZE) && inodes == inodes0 + 1, "every block came back");
 }
 
+/* ---- Growing trees (FS_TEST_GROW) ---- */
+
+/* The tests give it a disk of one bitmap block with a README. /g1 and /g2
+ * take a block each in turn, a transaction per block, until each holds
+ * G_BLOCKS: every block an extent of its own, so each tree grows every way
+ * there is (docs/camelot-fs.md, "Growing a file"). At g1's 5th extent the
+ * root's 4 move to a new leaf, the tree a level deeper; at its 85th that
+ * leaf is full and a new one goes under the root; at its 337th the 4 leaves
+ * and the root are full, and the tree grows to depth 2: the root's 4 index
+ * entries move to a new index block, which takes a new leaf too. Each
+ * append logs what the document counts: the data block, the bitmap block
+ * (the only one), the new tree blocks and the inode, whose block holds the
+ * root: 4, 4 and 5 blocks. Before g1's 337th, /pad fills the disk to 2 free
+ * blocks, one fewer than that append needs: it takes the data block and the
+ * old root's copy, finds none for the new leaf, gives both back and fails
+ * with -ENOSPC, the tree as it was. */
+#define G_BLOCKS 340
+#define G_SPLIT 84      /* g1's 85th extent: the first leaf is full */
+#define G_DEEPER 336    /* its 337th: every leaf and the root are full */
+#define APPEND_WORST 14 /* docs/camelot-fs.md, "Limits on transactions" */
+
+/* Adds block `k` (the pattern with `seed`) to `ip` in a transaction of its
+ * own; *logged is how many blocks it logged. */
+static int append_logged(struct inode *ip, u32 k, u32 seed, u32 *logged) {
+    begin_op();
+    ilock(ip);
+    fill(data, k * BSIZE, BSIZE, seed);
+    u32 before = log_blocks();
+    int r = writei(ip, data, k * BSIZE, BSIZE);
+    *logged = log_blocks() - before;
+    iunlock(ip);
+    end_op();
+    return r;
+}
+
+static void grow_test(void) {
+    int err;
+    struct inode *g[2];
+    begin_op();
+    g[0] = fs_create("/g1", T_FILE, 0, 0, &err);
+    if (g[0] != NULL) {
+        iunlock(g[0]);
+    }
+    g[1] = fs_create("/g2", T_FILE, 0, 0, &err);
+    if (g[1] != NULL) {
+        iunlock(g[1]);
+    }
+    struct inode *pad = fs_create("/pad", T_FILE, 0, 0, &err);
+    if (pad != NULL) {
+        iunlock(pad);
+    }
+    end_op();
+    check(g[0] != NULL && g[1] != NULL && pad != NULL, "make /g1, /g2 and /pad");
+    if (g[0] == NULL || g[1] == NULL || pad == NULL) {
+        return;
+    }
+    bool ok = true;
+    u32 worst = 0;
+    struct dinode d;
+    for (u32 k = 0; ok && k < G_BLOCKS; k++) {
+        for (u32 f = 0; ok && f < 2; f++) {
+            if (f == 0 && k == G_DEEPER) {
+                u32 blocks;
+                u32 inodes;
+                fs_count_free(&blocks, &inodes);
+                u32 pad_off = 0;
+                while (ok && blocks > 2) {
+                    ok = write_chunk(pad, pad_off, BSIZE, 8) == BSIZE;
+                    pad_off += BSIZE;
+                    fs_count_free(&blocks, &inodes);
+                }
+                struct dinode before;
+                dinode(g[0]->inum, &before);
+                u32 logged;
+                int r = append_logged(g[0], k, 21, &logged);
+                dinode(g[0]->inum, &d);
+                fs_count_free(&blocks, &inodes);
+                check(ok && r == -ENOSPC && memcmp(&d, &before, sizeof d) == 0 && blocks == 2,
+                      "with 2 blocks free, the 337th extent fails with ENOSPC and changes nothing");
+                begin_op();
+                ok = fs_unlink("/pad") == 0;
+                iput(pad);
+                end_op();
+            }
+            u32 logged;
+            ok = ok && append_logged(g[f], k, 21 + f, &logged) == BSIZE;
+            worst = logged > worst ? logged : worst;
+            if (f != 0 || !ok) {
+                continue;
+            }
+            dinode(g[0]->inum, &d);
+            if (k == EXT_ROOT_MAX) {
+                check(d.root.h.depth == 1 && d.root.h.entries == 1 && logged == 4,
+                      "the 5th extent grows the tree to depth 1: data, bitmap, a tree block, the inode");
+            } else if (k == G_SPLIT) {
+                check(d.root.h.depth == 1 && d.root.h.entries == 2 && logged == 4,
+                      "the 85th splits the full leaf: a new leaf under the root");
+            } else if (k == G_DEEPER) {
+                check(d.root.h.depth == 2 && d.root.h.entries == 1 && logged == 5,
+                      "the 337th grows the tree to depth 2: the old root's copy and a new leaf");
+            }
+        }
+    }
+    check(ok && worst <= APPEND_WORST, "every append fits the document's worst case");
+    begin_op();
+    iput(g[0]);
+    iput(g[1]);
+    end_op();
+    check(holds_pattern("/g1", G_BLOCKS * BSIZE, 21) && holds_pattern("/g2", G_BLOCKS * BSIZE, 22),
+          "/g1 and /g2 read back");
+}
+
 /* ---- Boot ---- */
 
 static void fs_main(void) {
@@ -925,7 +1042,8 @@ static void fs_main(void) {
     ls("/");
     tested = true;
     read_checks();
-    if (fs_test == FS_TEST_WRITE || fs_test == FS_TEST_FULL || fs_test == FS_TEST_TREE) {
+    if (fs_test == FS_TEST_WRITE || fs_test == FS_TEST_FULL || fs_test == FS_TEST_TREE ||
+        fs_test == FS_TEST_GROW) {
         if (fs_readonly) {
             kprintf("fs: write test skipped: the %s\n",
                     fs_log_too_small ? "log is too small to write" : "disk is read-only");
@@ -933,8 +1051,10 @@ static void fs_main(void) {
             write_test();
         } else if (fs_test == FS_TEST_FULL) {
             full_test();
-        } else {
+        } else if (fs_test == FS_TEST_TREE) {
             tree_test();
+        } else {
+            grow_test();
         }
     }
 }

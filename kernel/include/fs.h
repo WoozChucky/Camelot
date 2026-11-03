@@ -315,8 +315,10 @@ int fs_unlink(const char *path);
 
 /* Adds the entry `new` for the file `old` names, which gains a link. 0,
  * -ENOENT/-ENOTDIR/-ENAMETOOLONG (either path; -ENOENT for a directory to
- * put `new` in that has been removed), -EPERM (`old` is a directory),
- * -EEXIST, -ENOSPC, -EROFS. In a transaction. */
+ * put `new` in that has been removed, or a file whose last name was
+ * removed meanwhile), -EPERM (`old` is a directory), -EEXIST, -ENOSPC,
+ * -EROFS. In a transaction: both paths are looked up before anything is
+ * written, so the link and the entry are one change. */
 int fs_link(const char *old, const char *new);
 
 #endif

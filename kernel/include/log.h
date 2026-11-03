@@ -45,6 +45,10 @@ extern u32 log_room_waits;
 extern u32 log_commit_waits;
 bool log_committing(void);
 
+/* For the self-test: the distinct blocks the transaction being built
+ * holds so far (an operation's share, when it runs alone). */
+u32 log_blocks(void);
+
 /* Sets the log up for the filesystem `sb` on disk `dev` and replays a
  * committed transaction if the header holds one. Returns 0, -EINVAL with
  * *why for a header that breaks the format's rules, or -EROFS if there is

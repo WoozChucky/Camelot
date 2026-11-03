@@ -297,17 +297,26 @@ fn walk_node(
     Ok(())
 }
 
-/// The disk block holding logical block `k`, if the tree maps it. The tree
-/// must be valid ([`walk`]); a pointer outside the image is an error rather
-/// than a panic, so a damaged one fails cleanly.
+/// The disk block holding logical block `k`, if the tree maps it. Meant for
+/// a valid tree ([`walk`]), but a damaged one fails cleanly rather than
+/// panic or loop: a node's entries are bounded by its room, each child must
+/// be a level down, and a pointer outside the image is an error.
 pub fn lookup(image: &[u8], root: &[u8], k: u32) -> Result<Option<u32>, String> {
     let mut node = root.to_vec();
+    let mut depth = Header::decode(root).depth;
+    let mut room = ROOT_MAX;
     loop {
         let h = Header::decode(&node);
         if h.magic != MAGIC {
             return Err(format!("an extent node's magic is {:#06x}", h.magic));
         }
-        let n = usize::from(h.entries.min(BLOCK_MAX));
+        if h.depth != depth || h.depth > MAX_DEPTH {
+            return Err(format!(
+                "an extent node at depth {}, where {depth} should be",
+                h.depth
+            ));
+        }
+        let n = usize::from(h.entries.min(room));
         if h.depth == 0 {
             for i in (0..n).rev() {
                 let e = Extent::decode(&node[entry_at(i)..]);
@@ -332,6 +341,8 @@ pub fn lookup(image: &[u8], root: &[u8], k: u32) -> Result<Option<u32>, String> 
             ));
         }
         node = image[at..at + BSIZE].to_vec();
+        room = BLOCK_MAX;
+        depth = depth.wrapping_sub(1);
     }
 }
 
@@ -339,7 +350,8 @@ pub fn lookup(image: &[u8], root: &[u8], k: u32) -> Result<Option<u32>, String> 
 pub trait Blocks {
     fn block(&self, n: u32) -> &[u8];
     fn block_mut(&mut self, n: u32) -> &mut [u8];
-    /// A zeroed block marked in use, preferably `goal`.
+    /// A zeroed block marked in use: `goal` if it is free, else the first
+    /// free one (always that, for a `goal` of 0).
     fn alloc(&mut self, goal: u32) -> Result<u32, String>;
     /// Gives back a block [`Blocks::alloc`] handed out.
     fn free(&mut self, b: u32);
@@ -465,7 +477,9 @@ pub fn append(dev: &mut dyn Blocks, root: &mut [u8; ROOT_SIZE], n: u32, b: u32) 
     let wanted = chain + usize::from(grow);
     let mut new = Vec::with_capacity(wanted);
     for _ in 0..wanted {
-        match dev.alloc(b) {
+        // Tree blocks from the first free block, as the kernel takes them
+        // ("Growing a file"); the goal is the data's.
+        match dev.alloc(0) {
             Ok(x) => new.push(x),
             Err(e) => {
                 for x in new {

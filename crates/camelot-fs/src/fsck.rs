@@ -120,9 +120,9 @@ pub struct Report {
     /// the next mount (or [`free_orphans`]) frees. Counted in `dirs`, `files`
     /// or `devices` too, and their blocks in `used_blocks`.
     pub orphans: u32,
-    /// Inodes with `TRUNCATING` set, whose remaining blocks the next mount
-    /// (or [`finish_truncations`]) frees. Their blocks count in
-    /// `used_blocks`.
+    /// Files with links and `TRUNCATING` set, whose remaining blocks the next
+    /// mount (or [`finish_truncations`]) frees. Their blocks count in
+    /// `used_blocks`. (An orphan with it set counts as an orphan.)
     pub truncating: u32,
     /// Data blocks in use, and free.
     pub used_blocks: u32,
@@ -264,7 +264,11 @@ impl Checker<'_> {
                 continue;
             }
             if truncating {
-                self.truncating += 1;
+                // An orphan being freed is the next mount's to free whole: an
+                // orphan, not a truncation to finish.
+                if d.nlink != 0 {
+                    self.truncating += 1;
+                }
                 if d.size != 0 {
                     self.problem(format!(
                         "inode {inum}: being truncated, with a size of {} (it must be 0)",

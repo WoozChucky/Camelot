@@ -334,15 +334,31 @@ static struct ext_index *ext_idx(void *node, u32 i) {
     return (struct ext_index *)ext_ent(node, i);
 }
 
-/* Node `blockno` of ip's tree; *bp is its buffer (NULL for the root), for
- * node_put(). */
-static void *node_get(struct inode *ip, u32 blockno, struct buf **bp) {
+/* Node `blockno` of ip's tree, which must be at `depth`; *bp is its buffer
+ * (NULL for the root), for node_put(). The kernel trusts a mounted disk,
+ * but a node that isn't one panics here rather than send the walks past
+ * their arrays (a depth over EXT_MAX_DEPTH would overrun a path), as ext4
+ * checks every node it reads (__ext4_ext_check): the magic, the room, the
+ * entries, the depth, and that only the root is ever empty. */
+static void *node_get(struct inode *ip, u32 blockno, u32 depth, struct buf **bp) {
+    void *n;
+    u32 max;
     if (blockno == 0) {
         *bp = NULL;
-        return &ip->root;
+        n = &ip->root;
+        max = EXT_ROOT_MAX;
+    } else {
+        *bp = fs_bread(ip->dev, blockno);
+        n = (*bp)->data;
+        max = EXT_BLOCK_MAX;
     }
-    *bp = fs_bread(ip->dev, blockno);
-    return (*bp)->data;
+    struct ext_header *h = ext_hdr(n);
+    if (h->magic != EXT_MAGIC || h->max != max || h->entries > max || h->depth != depth ||
+        depth > EXT_MAX_DEPTH || (h->entries == 0 && (blockno != 0 || depth != 0))) {
+        kprintf("fs: inode %u: extent tree block %u is broken\n", ip->inum, blockno);
+        panic("fs: a broken extent tree");
+    }
+    return n;
 }
 
 /* Lets go of a node node_get() returned, logging it if it `changed` (the
@@ -384,7 +400,7 @@ static u32 ext_rightmost(struct inode *ip, u32 path[EXT_MAX_DEPTH + 1]) {
     path[0] = 0;
     for (u32 l = 0; l < depth; l++) {
         struct buf *b;
-        void *n = node_get(ip, path[l], &b);
+        void *n = node_get(ip, path[l], depth - l, &b);
         path[l + 1] = ext_idx(n, ext_hdr(n)->entries - 1u)->leaf_lo;
         node_put(b, false);
     }
@@ -395,9 +411,10 @@ static u32 ext_rightmost(struct inode *ip, u32 path[EXT_MAX_DEPTH + 1]) {
  * ("Lookup": the last entry starting at or before it, at every level). */
 static u32 ext_lookup(struct inode *ip, u32 bn) {
     u32 blockno = 0;
-    for (;;) {
+    u32 depth = ip->root.h.depth;
+    for (;; depth--) {
         struct buf *b;
-        void *n = node_get(ip, blockno, &b);
+        void *n = node_get(ip, blockno, depth, &b);
         struct ext_header *h = ext_hdr(n);
         u32 i = h->entries;
         u32 found = 0;
@@ -437,7 +454,7 @@ static u32 ext_goal(struct inode *ip) {
     u32 path[EXT_MAX_DEPTH + 1];
     u32 depth = ext_rightmost(ip, path);
     struct buf *b;
-    void *leaf = node_get(ip, path[depth], &b);
+    void *leaf = node_get(ip, path[depth], 0, &b);
     u32 goal = 0;
     if (ext_hdr(leaf)->entries > 0) {
         struct ext_extent *e = ext_ent(leaf, ext_hdr(leaf)->entries - 1u);
@@ -461,7 +478,7 @@ static int ext_append(struct inode *ip, u32 bn, u32 b) {
     u32 path[EXT_MAX_DEPTH + 1];
     u32 depth = ext_rightmost(ip, path);
     struct buf *lb;
-    void *leaf = node_get(ip, path[depth], &lb);
+    void *leaf = node_get(ip, path[depth], 0, &lb);
     struct ext_header *lh = ext_hdr(leaf);
     if (lh->entries > 0) {
         struct ext_extent *e = ext_ent(leaf, lh->entries - 1u);
@@ -476,7 +493,7 @@ static int ext_append(struct inode *ip, u32 bn, u32 b) {
     i32 level = -1;
     for (i32 l = (i32)depth; l >= 0 && level < 0; l--) {
         struct buf *nb;
-        void *n = node_get(ip, path[l], &nb);
+        void *n = node_get(ip, path[l], depth - (u32)l, &nb);
         if (ext_hdr(n)->entries < ext_hdr(n)->max) {
             level = l;
         }
@@ -535,7 +552,7 @@ static int ext_append(struct inode *ip, u32 bn, u32 b) {
         brelse(cb);
     }
     struct buf *rb;
-    void *r = node_get(ip, receiver, &rb);
+    void *r = node_get(ip, receiver, new_depth - (u32)level, &rb);
     struct ext_header *rh = ext_hdr(r);
     if (chain > 0) {
         set_index(ext_idx(r, rh->entries), bn, nodes[next]);
@@ -581,7 +598,7 @@ static bool trunc_step(struct inode *ip) {
         u32 path[EXT_MAX_DEPTH + 1];
         u32 depth = ext_rightmost(ip, path);
         struct buf *lb;
-        void *leaf = node_get(ip, path[depth], &lb);
+        void *leaf = node_get(ip, path[depth], 0, &lb);
         struct ext_header *lh = ext_hdr(leaf);
         if (lh->entries == 0) {
             node_put(lb, false); /* the root, an empty leaf */
@@ -619,7 +636,7 @@ static bool trunc_step(struct inode *ip) {
             bfree(ip->dev, path[l]);
             trunc_logged(&t, BBLOCK(path[l], fs_sb));
             struct buf *pb;
-            void *p = node_get(ip, path[l - 1], &pb);
+            void *p = node_get(ip, path[l - 1], depth - (l - 1), &pb);
             ext_hdr(p)->entries--;
             memset(ext_idx(p, ext_hdr(p)->entries), 0, sizeof(struct ext_index));
             empty = ext_hdr(p)->entries == 0;
@@ -634,26 +651,63 @@ static bool trunc_step(struct inode *ip) {
     }
 }
 
-void itrunc(struct inode *ip) {
+/* Ends the operation and begins another, `ip` unlocked in between: what
+ * was logged so far commits (if anything was), and what follows has an
+ * operation's room of its own. */
+static void trunc_restart(struct inode *ip) {
+    iunlock(ip);
+    end_op();
+    begin_op();
+    ilock(ip);
+}
+
+/* itrunc(), and iput()'s freeing of an inode: then `free_inode`, and its
+ * type becomes T_FREE in the last transaction, the one that empties it.
+ * Returns whether that took transactions of their own: then, but for an
+ * inode freed, the caller's operation goes on in a new one already. An
+ * inode freed is iput()'s to finish first (see there). */
+static bool truncate(struct inode *ip, bool free_inode) {
     ip->size = 0;
     ip->size_hi = 0;
-    if (ip->type == T_DEVICE) {
-        iupdate(ip); /* no blocks: a device's root is all zero */
-        return;
+    if (ip->type == T_DEVICE || (ip->root.h.depth == 0 && ip->root.h.entries == 0)) {
+        /* No blocks (a device's root is all zero): only the inode changes,
+         * a block the caller's operation counts already. */
+        ip->flags &= ~(u32)INODE_TRUNCATING;
+        if (free_inode) {
+            ip->type = T_FREE;
+        }
+        iupdate(ip);
+        return false;
     }
+    /* Freeing blocks takes transactions of its own (docs/camelot-fs.md,
+     * "Limits on transactions"), as Linux's eviction takes a journal handle
+     * of its own after the unlink's: whatever the caller logged commits
+     * first (an unlink's entry and link count: a crash then leaves an
+     * orphan, which the next mount frees), and the caller goes on after
+     * in a new operation. */
+    trunc_restart(ip);
     /* Set in the first transaction and cleared in the last: a crash in
      * between leaves the rest to the next mount (finish_truncations).
      * When one transaction is enough, the flag never reaches the disk. */
     ip->flags |= INODE_TRUNCATING;
     while (!trunc_step(ip)) {
         iupdate(ip);
-        iunlock(ip);
-        end_op();
-        begin_op();
-        ilock(ip);
+        trunc_restart(ip);
     }
     ip->flags &= ~(u32)INODE_TRUNCATING;
+    if (free_inode) {
+        ip->type = T_FREE;
+    } else {
+        iupdate(ip);
+        trunc_restart(ip);
+        return true;
+    }
     iupdate(ip);
+    return true;
+}
+
+void itrunc(struct inode *ip) {
+    truncate(ip, false);
 }
 
 bool inode_too_big(const struct inode *ip) {
@@ -773,12 +827,22 @@ void iput(struct inode *ip) {
         }
         acquiresleep(&ip->lock);
         release(&itable_lock);
-        itrunc(ip);
-        ip->type = T_FREE;
-        iupdate(ip);
+        bool restarted = truncate(ip, true);
         ip->valid = false;
         releasesleep(&ip->lock);
         acquire(&itable_lock);
+        if (restarted) {
+            /* The freeing took transactions of its own; the caller goes on
+             * in a new one. Only now, with the cached copy no longer valid:
+             * once the transaction that frees the inode commits, ialloc() may
+             * hand the inode out again, and iget() this slot with it, which
+             * must then read the new inode from the disk. */
+            ip->ref--;
+            release(&itable_lock);
+            end_op();
+            begin_op();
+            return;
+        }
     }
     ip->ref--;
     release(&itable_lock);
@@ -1092,11 +1156,12 @@ struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, int *e
 
 fail:
     /* No room for the entries: the new inode goes back (iput frees it, with
-     * any block it got). */
+     * any block it got, which may end this operation and begin others:
+     * itrunc). The directory first, as no sleep lock may be held then. */
     ip->nlink = 0;
     iupdate(ip);
-    iunlockput(ip);
     iunlockput(dp);
+    iunlockput(ip);
     *err = -ENOSPC;
     return NULL;
 }
@@ -1171,43 +1236,47 @@ int fs_link(const char *old, const char *new) {
     if (ip == NULL) {
         return err;
     }
-    ilock(ip);
-    if (ip->type == T_DIR) {
-        /* A directory has one name, in its parent: its `..` says which. */
-        iunlockput(ip);
-        return -EPERM;
-    }
-    /* The link first, then the entry, both in the caller's transaction; a
-     * failure below takes the link back. */
-    ip->nlink++;
-    iupdate(ip);
-    iunlock(ip);
-
+    /* Both paths first, as Linux's linkat does, before anything is
+     * written: looking a path up may drop the last reference to a removed
+     * directory, whose freeing ends the operation (itrunc), which would
+     * commit a half-made link. */
     char name[DIRSIZ + 1];
     struct inode *dp = nameiparent(new, name, &err);
     if (dp == NULL) {
-        if (err == -EINVAL) {
-            err = -EEXIST; /* `/`: the root */
-        }
-        goto undo;
+        iput(ip);
+        return err == -EINVAL ? -EEXIST : err; /* `/`: the root */
+    }
+    /* A directory has one name, in its parent: its `..` says which. Found
+     * before taking a second lock, so that only a directory and then a file
+     * are ever locked together here, as fs_unlink() locks them (two
+     * directories, in whichever order, could wait for each other). */
+    ilock(ip);
+    bool is_dir = ip->type == T_DIR;
+    iunlock(ip);
+    if (is_dir) {
+        iput(dp);
+        iput(ip);
+        return -EPERM;
     }
     ilock(dp);
-    if (dp->nlink == 0) {
+    ilock(ip);
+    if (dp->nlink == 0 || ip->nlink == 0) {
+        /* A directory removed meanwhile; a file whose last name went
+         * meanwhile, which Linux refuses to link back too. */
         err = -ENOENT;
     } else {
+        /* The link and the entry, in one transaction: a failure takes the
+         * link back. */
+        ip->nlink++;
+        iupdate(ip);
         err = dirlink(dp, name, ip->inum);
+        if (err < 0) {
+            ip->nlink--;
+            iupdate(ip);
+        }
     }
+    iunlock(ip);
     iunlockput(dp);
-    if (err < 0) {
-        goto undo;
-    }
     iput(ip);
-    return 0;
-
-undo:
-    ilock(ip);
-    ip->nlink--;
-    iupdate(ip);
-    iunlockput(ip);
     return err;
 }

@@ -203,7 +203,10 @@ extent whose `ee_block` ≤ `k`. The block is its start + (`k` - `ee_block`).
 tree that follows the rules, and fsck accepts any that does). Block `n` is
 always the next after the file's last. It is allocated next to the file's
 last disk block if that one is free, else wherever the bitmap's first free
-block is (Linux's allocators also start from such a goal). Then:
+block is (Linux's allocators also start from such a goal). New tree blocks
+come from the first free block: a file needs them only past 4 extents, so
+they are rare, and they never take the block a file's next data block
+wants unless that one is the first free. Then:
 
 1. If the last extent ends just before the new disk block and has fewer
    than 32 768 blocks, it grows by one.
@@ -396,8 +399,16 @@ bitmap block:
   directory's first block and its bitmap block, and the parent: one entry
   added, which may add a block (14, its inode included): at most 17.
   `link` changes the entry (14 at most) and the file's inode: 15. `unlink`
-  changes the entry's block and the two inodes: 3.
-- **Truncation** frees blocks in transactions of their own, each changing
+  changes the entry's block and the two inodes: 3. Freeing the file, when
+  that was its last name and nobody has it open, is not part of it: see
+  the next point.
+- **Truncation** frees blocks in transactions of their own, apart from any
+  operation it runs in (as Linux's eviction of an unlinked file takes a
+  journal handle of its own, after the unlink's): what the operation logged
+  before commits first, and the operation goes on afterwards in a new one,
+  so neither shares the other's room. A file without blocks is the
+  exception: emptying or freeing it changes only its inode, which the
+  operation counts already. Each of a truncation's transactions changes
   the inode and at most 21 other blocks: the bitmap blocks of the blocks it
   frees, and the tree blocks whose entries it removes (a leaf that ends up
   freed still took a slot when its entries went). It counts them as it

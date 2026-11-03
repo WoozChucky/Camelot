@@ -296,7 +296,9 @@ may be gone too, its inode freed or reused).
 
 **link(old, new)** gives the file `old` another name, `new`: a hard link,
 the same file under both, with one more link. Errors: the paths'
-(`-ENOENT` also for a removed directory to put `new` in), `-EPERM` if `old`
+(`-ENOENT` also for a removed directory to put `new` in, and for a file
+whose last name another process removed meanwhile, which cannot be linked
+back, as on Linux), `-EPERM` if `old`
 is a directory (a directory has one name, in its parent), `-EEXIST` if
 `new` is taken (`/` included), `-ENOSPC`, `-EROFS`, `-EFAULT`.
 

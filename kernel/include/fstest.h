@@ -6,13 +6,15 @@
 
 /* What the self-test does, from `fs_test` in fstest.c: the image ships with
  * FS_TEST_READ; tests patch it to FS_TEST_WRITE for the transactions,
- * FS_TEST_FULL to fill the disk, or FS_TEST_TREE for the extent trees of
- * /t1 and /t2, which the tests put on the disk (on scratch disks: they
- * leave /fstest, /full or /t2 behind). */
+ * FS_TEST_FULL to fill the disk, FS_TEST_TREE for the extent trees of /t1
+ * and /t2, which the tests put on the disk, or FS_TEST_GROW to grow trees
+ * through every split (on scratch disks: they leave /fstest, /full, /t2 or
+ * /g1 and /g2 behind). */
 #define FS_TEST_READ 1
 #define FS_TEST_WRITE 2
 #define FS_TEST_FULL 3
 #define FS_TEST_TREE 4
+#define FS_TEST_GROW 5
 
 extern volatile u32 fs_test;
 
