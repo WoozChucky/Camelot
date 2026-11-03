@@ -223,12 +223,14 @@ fn entries(c: &mut Cursor, strs: &Strings) -> Result<Vec<(String, u64)>, Error> 
 
 /// Runs every line table in `line` (`.debug_line`). `sections` maps the
 /// offset of a `DW_LNE_set_address` operand to the section it points into
-/// (relocatable objects only).
+/// (relocatable objects only). `addr_size` is the size of the file's
+/// addresses, 4 (ELF32) or 8 (ELF64): a table's must be the same.
 pub fn parse(
     line: &[u8],
     line_str: &[u8],
     str: &[u8],
     sections: &HashMap<usize, usize>,
+    addr_size: usize,
 ) -> Result<Vec<LineTable>, Error> {
     let strs = Strings { line_str, str };
     let mut tables = Vec::new();
@@ -239,7 +241,7 @@ pub fn parse(
         if unit_length >= 0xffff_fff0 {
             return err("line table: 64-bit DWARF is not supported");
         }
-        let end = c.at + unit_length as usize;
+        let end = c.at.checked_add(unit_length as usize).unwrap_or(usize::MAX);
         if end > line.len() {
             return err("line table: unit runs past the end of .debug_line");
         }
@@ -250,13 +252,15 @@ pub fn parse(
             return err(format!("line table: DWARF version {version} is not supported"));
         }
         if version >= 5 {
-            let (addr_size, _seg) = (c.u8()?, c.u8()?);
-            if addr_size != 4 && addr_size != 8 {
-                return err(format!("line table: {addr_size}-byte addresses"));
+            let (size, _seg) = (c.u8()?, c.u8()?);
+            if usize::from(size) != addr_size {
+                return err(format!(
+                    "line table: {size}-byte addresses in a file of {addr_size}-byte ones"
+                ));
             }
         }
         let header_length = c.u32()? as usize;
-        let program = c.at + header_length;
+        let program = c.at.saturating_add(header_length);
         let min_inst = c.u8()?;
         if version >= 4 {
             c.u8()?; // maximum_operations_per_instruction: 1 without VLIW
@@ -319,6 +323,7 @@ pub fn parse(
             sections,
             (min_inst, default_is_stmt, line_base, line_range, opcode_base),
             &lengths,
+            addr_size,
         )?;
         tables.push(table);
         at = end;
@@ -333,6 +338,7 @@ fn run(
     sections: &HashMap<usize, usize>,
     (min_inst, default_is_stmt, line_base, line_range, opcode_base): (u8, bool, i64, u8, u8),
     lengths: &[u8],
+    addr_size: usize,
 ) -> Result<(), Error> {
     let fresh = Row {
         addr: 0,
@@ -382,6 +388,11 @@ fn run(
                         seq.section = sections.get(&c.at).copied();
                         // The operand is an address: 4 bytes on RV32, 8 on RV64.
                         r.addr = match len.checked_sub(1) {
+                            Some(n) if n != addr_size => {
+                                return err(format!(
+                                    "line table: DW_LNE_set_address of {n} bytes in a file of {addr_size}-byte addresses"
+                                ))
+                            }
                             Some(4) => c.u32()?.into(),
                             Some(8) => c.u64()?,
                             _ => return err(format!("line table: DW_LNE_set_address of length {len}")),
@@ -396,7 +407,8 @@ fn run(
                 (r.prologue_end, r.epilogue_begin) = (false, false);
             }
             2 => advance(&mut r, c.uleb()?),
-            3 => r.line = (i64::from(r.line) + c.sleb()?) as u32,
+            // Wrapping: a corrupt advance must not overflow (lines are u32).
+            3 => r.line = i64::from(r.line).wrapping_add(c.sleb()?) as u32,
             4 => r.file = c.uleb()? as usize,
             5 => r.column = c.uleb()? as u32,
             6 => r.is_stmt = !r.is_stmt,
@@ -500,13 +512,63 @@ impl Elf<'_> {
             data_of(".debug_line_str")?,
             data_of(".debug_str")?,
             &sections,
+            self.class.addr_size(),
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::relocate;
+    use super::{parse, relocate};
+    use std::collections::HashMap;
+
+    /// A DWARF 4 line table (no address size in its header) for one file,
+    /// `a.c`, running `program`.
+    fn table(program: &[u8]) -> Vec<u8> {
+        let mut header = vec![1, 1, 1, 0xfb, 14, 13]; // min_inst .. opcode_base
+        header.extend_from_slice(&[0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]); // opcode lengths
+        header.push(0); // no include directories
+        header.extend_from_slice(b"a.c\0\0\0\0\0"); // a.c: directory 0, no time or size
+        let mut unit = 4u16.to_le_bytes().to_vec();
+        unit.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        unit.extend_from_slice(&header);
+        unit.extend_from_slice(program);
+        let mut out = (unit.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(&unit);
+        out
+    }
+
+    /// DW_LNE_set_address with an 8-byte operand, a row, the end.
+    fn program_at(addr: u64) -> Vec<u8> {
+        let mut p = vec![0, 9, 2];
+        p.extend_from_slice(&addr.to_le_bytes());
+        p.extend_from_slice(&[1, 0, 1, 1]); // DW_LNS_copy, DW_LNE_end_sequence
+        p
+    }
+
+    #[test]
+    fn addresses_have_the_files_size() {
+        let line = table(&program_at(0x1_2345_6789_abcd));
+        let tables = parse(&line, &[], &[], &HashMap::new(), 8).unwrap();
+        assert_eq!(tables[0].files, ["", "a.c"]);
+        assert_eq!(tables[0].sequences[0].rows[0].addr, 0x1_2345_6789_abcd);
+        // The same table in an ELF32 file: an 8-byte address is an error.
+        let err = parse(&line, &[], &[], &HashMap::new(), 4).unwrap_err();
+        assert_eq!(
+            err.0,
+            "line table: DW_LNE_set_address of 8 bytes in a file of 4-byte addresses"
+        );
+    }
+
+    #[test]
+    fn a_huge_line_advance_wraps_instead_of_overflowing() {
+        // DW_LNS_advance_line by i64::MAX (nine 7-bit groups of ones), from line 1.
+        let mut p = vec![3, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0];
+        p.extend_from_slice(&program_at(0x10));
+        let tables = parse(&table(&p), &[], &[], &HashMap::new(), 8).unwrap();
+        let want = 1i64.wrapping_add(i64::MAX) as u32;
+        assert_eq!(tables[0].sequences[0].rows[0].line, want);
+    }
 
     /// Every relocation type a line table uses, on a field between two others
     /// it must not touch.

@@ -96,7 +96,7 @@ fn elf64_files_are_refused() {
     );
     assert!(!out.contains("rv64/prog.elf"), "{out}");
     assert!(
-        out.contains("rv32/prog.elf:	file format elf32-littleriscv"),
+        out.contains("rv32/prog.elf:\tfile format elf32-littleriscv"),
         "{out}"
     );
 }
