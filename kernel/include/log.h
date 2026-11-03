@@ -24,10 +24,13 @@
 #include "types.h"
 
 /* The most blocks one operation may change, and the most a transaction
- * holds (the log's slots, if it has fewer). LOGSIZE pinned buffers must
- * leave enough of the NBUF for everyone else. */
-#define MAXOPBLOCKS 10
-#define LOGSIZE 20
+ * holds (the log's slots, if it has fewer). MAXOPBLOCKS is the worst case
+ * of an operation, counted in docs/camelot-fs.md ("Limits on
+ * transactions"): a write's chunk, when adding a block splits the extent
+ * tree at every level. LOGSIZE pinned buffers must leave enough of the
+ * NBUF for everyone else. */
+#define MAXOPBLOCKS 22
+#define LOGSIZE 44 /* room for two operations at their worst */
 
 /* Blocks the mount's replay installed (0 if the log was empty). */
 extern u32 log_recovered;
@@ -41,6 +44,10 @@ extern u32 log_commits;
 extern u32 log_room_waits;
 extern u32 log_commit_waits;
 bool log_committing(void);
+
+/* For the self-test: the distinct blocks the transaction being built
+ * holds so far (an operation's share, when it runs alone). */
+u32 log_blocks(void);
 
 /* Sets the log up for the filesystem `sb` on disk `dev` and replays a
  * committed transaction if the header holds one. Returns 0, -EINVAL with

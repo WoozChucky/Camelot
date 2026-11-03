@@ -27,6 +27,7 @@
 bool fs_mounted;
 bool fs_readonly;
 bool fs_log_too_small;
+u32 fs_truncations;
 u32 fs_orphans;
 u32 fs_dev;
 struct superblock fs_sb;
@@ -38,6 +39,7 @@ void fs_init(void) {
     initlock(&itable_lock, "itable");
     for (u32 i = 0; i < NINODE; i++) {
         initsleeplock(&itable[i].lock, "inode");
+        initsleeplock(&itable[i].wlock, "inode write");
     }
 }
 
@@ -95,13 +97,44 @@ static const char *check_superblock(const struct superblock *sb, u32 disk_sector
     return NULL;
 }
 
+/* Finishes the truncations a crash interrupted: files with
+ * INODE_TRUNCATING set and links, whose remaining blocks itrunc() frees as
+ * it would have (docs/camelot-fs.md, "Truncation"), in transactions of its
+ * own. An orphan being freed is left to free_orphans(), which frees it
+ * whole. Returns how many it finished. */
+static u32 finish_truncations(void) {
+    u32 n = 0;
+    for (u32 inum = ROOTINO; inum < fs_sb.ninodes; inum++) {
+        struct buf *b = fs_bread(fs_dev, IBLOCK(inum, fs_sb));
+        const struct dinode *dip = (const struct dinode *)b->data + inum % IPB;
+        bool truncating = dip->type != T_FREE && dip->nlink != 0 && (dip->flags & INODE_TRUNCATING) != 0;
+        brelse(b);
+        if (!truncating) {
+            continue;
+        }
+        struct inode *ip = iget(fs_dev, inum);
+        acquiresleep(&ip->wlock);
+        begin_op();
+        ilock(ip);
+        itrunc(ip);
+        iunlock(ip);
+        end_op();
+        releasesleep(&ip->wlock);
+        begin_op();
+        iput(ip);
+        end_op();
+        n++;
+    }
+    return n;
+}
+
 /* Frees the inodes a crash left allocated with no links. fs_unlink() takes
  * a file's last link in one transaction, and the last iput() frees it in
  * another, when whoever still used it (an open file, a working directory)
  * lets go; a crash
  * in between leaves it on the disk, unnamed (docs/camelot-fs.md, "Link
- * count"). Each is freed in a transaction of its own, by iput() as it would
- * have been. The root is never one: if its count is 0 the disk is broken,
+ * count"). Each is freed by iput() as it would have been, in transactions of
+ * its own. The root is never one: if its count is 0 the disk is broken,
  * and freeing it would make that worse. Returns how many were freed. */
 static u32 free_orphans(void) {
     u32 n = 0;
@@ -180,6 +213,7 @@ int fs_mount(u32 dev, const char **why) {
         fs_readonly = true;
     }
     fs_mounted = true;
+    fs_truncations = fs_readonly ? 0 : finish_truncations();
     fs_orphans = fs_readonly ? 0 : free_orphans();
     return 0;
 }
@@ -217,9 +251,32 @@ static void bzero(u32 dev, u32 bno) {
     brelse(b);
 }
 
-/* Allocates a data block, zeroed; 0 if none is free. Scans the bitmap from
- * the start of the data region for the first clear bit. */
-static u32 balloc(u32 dev) {
+/* Takes data block `bno` if its bit is clear: sets it and zeroes the block.
+ * Whether it did. */
+static bool btake(u32 dev, u32 bno) {
+    struct buf *b = fs_bread(dev, BBLOCK(bno, fs_sb));
+    u32 i = bno % BPB;
+    u8 mask = (u8)(1 << (i % 8));
+    bool was_free = (b->data[i / 8] & mask) == 0;
+    if (was_free) {
+        b->data[i / 8] |= mask;
+        log_write(b);
+    }
+    brelse(b);
+    if (was_free) {
+        bzero(dev, bno);
+    }
+    return was_free;
+}
+
+/* Allocates a data block, zeroed; 0 if none is free. `goal` first, when it
+ * is a free data block (the block after a file's last, so that the file
+ * stays one extent; 0 for none), else the first free block from the start
+ * of the data region. */
+static u32 balloc(u32 dev, u32 goal) {
+    if (goal >= fs_sb.datastart && goal < fs_sb.size && btake(dev, goal)) {
+        return goal;
+    }
     for (u32 base = 0; base < fs_sb.size; base += BPB) {
         struct buf *b = fs_bread(dev, BBLOCK(base, fs_sb));
         for (u32 i = 0; i < BPB && base + i < fs_sb.size; i++) {
@@ -254,6 +311,414 @@ static void bfree(u32 dev, u32 bno) {
     brelse(b);
 }
 
+/* ---- Extent trees ----
+ *
+ * A file's blocks are mapped by an extent tree (docs/camelot-fs.md, "Extent
+ * trees"): its root is the inode's `root` (4 entries), and when that is not
+ * enough, the root holds index entries pointing to tree blocks of 84
+ * entries, which hold extents or more index entries, up to EXT_MAX_DEPTH
+ * levels. A node is reached by its block number: 0 for the root (which the
+ * in-memory inode holds, written by iupdate()), else a tree block, read
+ * through the buffer cache. Every function here takes a locked inode. */
+
+/* A node's header, and its entry `i` as an extent or an index entry. */
+static struct ext_header *ext_hdr(void *node) {
+    return (struct ext_header *)node;
+}
+
+static struct ext_extent *ext_ent(void *node, u32 i) {
+    return (struct ext_extent *)((u8 *)node + sizeof(struct ext_header) + i * sizeof(struct ext_extent));
+}
+
+static struct ext_index *ext_idx(void *node, u32 i) {
+    return (struct ext_index *)ext_ent(node, i);
+}
+
+/* Node `blockno` of ip's tree, which must be at `depth`; *bp is its buffer
+ * (NULL for the root), for node_put(). The kernel trusts a mounted disk,
+ * but a node that isn't one panics here rather than send the walks past
+ * their arrays (a depth over EXT_MAX_DEPTH would overrun a path), as ext4
+ * checks every node it reads (__ext4_ext_check): the magic, the room, the
+ * entries, the depth, and that only the root is ever empty. */
+static void *node_get(struct inode *ip, u32 blockno, u32 depth, struct buf **bp) {
+    void *n;
+    u32 max;
+    if (blockno == 0) {
+        *bp = NULL;
+        n = &ip->root;
+        max = EXT_ROOT_MAX;
+    } else {
+        *bp = fs_bread(ip->dev, blockno);
+        n = (*bp)->data;
+        max = EXT_BLOCK_MAX;
+    }
+    struct ext_header *h = ext_hdr(n);
+    if (h->magic != EXT_MAGIC || h->max != max || h->entries > max || h->depth != depth ||
+        depth > EXT_MAX_DEPTH || (h->entries == 0 && (blockno != 0 || depth != 0))) {
+        kprintf("fs: inode %u: extent tree block %u is broken\n", ip->inum, blockno);
+        panic("fs: a broken extent tree");
+    }
+    return n;
+}
+
+/* Lets go of a node node_get() returned, logging it if it `changed` (the
+ * root is the inode's: iupdate() writes it). */
+static void node_put(struct buf *b, bool changed) {
+    if (b != NULL) {
+        if (changed) {
+            log_write(b);
+        }
+        brelse(b);
+    }
+}
+
+static void set_extent(struct ext_extent *e, u32 block, u32 start) {
+    e->block = block;
+    e->len = 1;
+    e->start_hi = 0;
+    e->start_lo = start;
+}
+
+static void set_index(struct ext_index *x, u32 block, u32 child) {
+    x->block = block;
+    x->leaf_lo = child;
+    x->leaf_hi = 0;
+    x->unused = 0;
+}
+
+/* A new tree's root: an empty leaf. */
+static void ext_init(struct ext_node *root) {
+    memset(root, 0, sizeof *root);
+    root->h.magic = EXT_MAGIC;
+    root->h.max = EXT_ROOT_MAX;
+}
+
+/* The rightmost path, from the root (path[0] = 0) to the leaf, the last
+ * child at each level. Returns the tree's depth: path[depth] is the leaf. */
+static u32 ext_rightmost(struct inode *ip, u32 path[EXT_MAX_DEPTH + 1]) {
+    u32 depth = ip->root.h.depth;
+    path[0] = 0;
+    for (u32 l = 0; l < depth; l++) {
+        struct buf *b;
+        void *n = node_get(ip, path[l], depth - l, &b);
+        path[l + 1] = ext_idx(n, ext_hdr(n)->entries - 1u)->leaf_lo;
+        node_put(b, false);
+    }
+    return depth;
+}
+
+/* The disk block holding logical block `bn`, 0 if the tree maps none
+ * ("Lookup": the last entry starting at or before it, at every level). */
+static u32 ext_lookup(struct inode *ip, u32 bn) {
+    u32 blockno = 0;
+    u32 depth = ip->root.h.depth;
+    for (;; depth--) {
+        struct buf *b;
+        void *n = node_get(ip, blockno, depth, &b);
+        struct ext_header *h = ext_hdr(n);
+        u32 i = h->entries;
+        u32 found = 0;
+        if (h->depth == 0) {
+            while (i > 0) {
+                i--;
+                struct ext_extent *e = ext_ent(n, i);
+                if (e->block <= bn) {
+                    if (bn - e->block < e->len) {
+                        found = e->start_lo + (bn - e->block);
+                    }
+                    break;
+                }
+            }
+            node_put(b, false);
+            return found;
+        }
+        while (i > 0) {
+            i--;
+            struct ext_index *x = ext_idx(n, i);
+            if (x->block <= bn) {
+                found = x->leaf_lo;
+                break;
+            }
+        }
+        node_put(b, false);
+        if (found == 0) {
+            return 0;
+        }
+        blockno = found;
+    }
+}
+
+/* Where the file's next block should go: the disk block after its last,
+ * or 0 (anywhere) if it has none. */
+static u32 ext_goal(struct inode *ip) {
+    u32 path[EXT_MAX_DEPTH + 1];
+    u32 depth = ext_rightmost(ip, path);
+    struct buf *b;
+    void *leaf = node_get(ip, path[depth], 0, &b);
+    u32 goal = 0;
+    if (ext_hdr(leaf)->entries > 0) {
+        struct ext_extent *e = ext_ent(leaf, ext_hdr(leaf)->entries - 1u);
+        goal = e->start_lo + e->len;
+    }
+    node_put(b, false);
+    return goal;
+}
+
+/* Maps logical block `bn`, the one after the file's last, to disk block `b`
+ * ("Growing a file"): the last extent grows if `b` follows it, else a new
+ * extent goes at the end, in the rightmost leaf, or in a new leaf (with a
+ * chain of new index nodes) under the lowest node on the rightmost path
+ * that has room; if none has, the tree first grows a level, the root's
+ * entries moving to a new tree block, as ext4's ext4_ext_grow_indepth()
+ * does. Every new tree block is allocated before anything changes: 0, or
+ * -ENOSPC (the disk is full) or -EFBIG (the tree is full, which no
+ * filesystem is big enough for) with the tree as it was. In a transaction:
+ * at most 1 + 5 + 5 blocks change here, and the inode (log.h). */
+static int ext_append(struct inode *ip, u32 bn, u32 b) {
+    u32 path[EXT_MAX_DEPTH + 1];
+    u32 depth = ext_rightmost(ip, path);
+    struct buf *lb;
+    void *leaf = node_get(ip, path[depth], 0, &lb);
+    struct ext_header *lh = ext_hdr(leaf);
+    if (lh->entries > 0) {
+        struct ext_extent *e = ext_ent(leaf, lh->entries - 1u);
+        if (e->start_lo + e->len == b && e->len < EXT_MAX_LEN) {
+            e->len++;
+            node_put(lb, true);
+            return 0;
+        }
+    }
+    node_put(lb, false);
+    /* The lowest node on the path with room for one more entry. */
+    i32 level = -1;
+    for (i32 l = (i32)depth; l >= 0 && level < 0; l--) {
+        struct buf *nb;
+        void *n = node_get(ip, path[l], depth - (u32)l, &nb);
+        if (ext_hdr(n)->entries < ext_hdr(n)->max) {
+            level = l;
+        }
+        node_put(nb, false);
+    }
+    bool grow = level < 0;
+    if (grow && depth == EXT_MAX_DEPTH) {
+        return -EFBIG;
+    }
+    u32 new_depth = grow ? depth + 1 : depth;
+    if (grow) {
+        level = 1; /* the old root's copy, which has room */
+    }
+    /* New nodes: the old root's copy if the tree grows, then a chain of
+     * one-entry nodes from the level below `level` down to a new leaf. */
+    u32 chain = new_depth - (u32)level;
+    u32 want = chain + (grow ? 1 : 0);
+    u32 nodes[EXT_MAX_DEPTH + 1];
+    for (u32 i = 0; i < want; i++) {
+        nodes[i] = balloc(ip->dev, 0);
+        if (nodes[i] == 0) {
+            for (u32 j = 0; j < i; j++) {
+                bfree(ip->dev, nodes[j]);
+            }
+            return -ENOSPC;
+        }
+    }
+    u32 next = 0;
+    u32 receiver = grow ? 0 : path[level]; /* 0, the root, until set below */
+    if (grow) {
+        u32 copy = nodes[next++];
+        struct buf *cb = fs_bread(ip->dev, copy);
+        memmove(cb->data, &ip->root, sizeof ip->root);
+        ext_hdr(cb->data)->max = (u16)EXT_BLOCK_MAX;
+        log_write(cb);
+        brelse(cb);
+        ext_init(&ip->root);
+        ip->root.h.depth = (u16)new_depth;
+        ip->root.h.entries = 1;
+        set_index(ext_idx(&ip->root, 0), 0, copy);
+        receiver = copy;
+    }
+    for (u32 i = 0; i < chain; i++) {
+        struct buf *cb = fs_bread(ip->dev, nodes[next + i]);
+        struct ext_header *h = ext_hdr(cb->data);
+        h->magic = EXT_MAGIC;
+        h->max = (u16)EXT_BLOCK_MAX;
+        h->depth = (u16)(new_depth - ((u32)level + 1 + i));
+        h->entries = 1;
+        if (i + 1 < chain) {
+            set_index(ext_idx(cb->data, 0), bn, nodes[next + i + 1]);
+        } else {
+            set_extent(ext_ent(cb->data, 0), bn, b);
+        }
+        log_write(cb);
+        brelse(cb);
+    }
+    struct buf *rb;
+    void *r = node_get(ip, receiver, new_depth - (u32)level, &rb);
+    struct ext_header *rh = ext_hdr(r);
+    if (chain > 0) {
+        set_index(ext_idx(r, rh->entries), bn, nodes[next]);
+    } else {
+        set_extent(ext_ent(r, rh->entries), bn, b);
+    }
+    rh->entries++;
+    node_put(rb, true);
+    return 0;
+}
+
+/* ---- Truncation ---- */
+
+/* The blocks one step of a truncation has logged, each counted once. */
+struct trunc_log {
+    u32 n;
+    u32 blocks[MAXOPBLOCKS];
+};
+
+static void trunc_logged(struct trunc_log *t, u32 b) {
+    for (u32 i = 0; i < t->n; i++) {
+        if (t->blocks[i] == b) {
+            return;
+        }
+    }
+    t->blocks[t->n++] = b;
+}
+
+/* What a step may log besides the inode's block. */
+#define TRUNC_BUDGET (MAXOPBLOCKS - 1)
+
+/* One transaction's worth of a truncation ("Limits on transactions"):
+ * frees ip's blocks from the end, one run at a time (the end of the last
+ * extent, as far back as one bitmap block covers), the tree blocks the
+ * runs empty, and their entries, while what it logs still fits. Before a
+ * run it makes sure the worst it could add fits: the run's bitmap block and
+ * leaf, and for each level it could empty, that node's bitmap block and
+ * its parent. Returns whether the tree is empty. */
+static bool trunc_step(struct inode *ip) {
+    struct trunc_log t;
+    t.n = 0;
+    for (;;) {
+        u32 path[EXT_MAX_DEPTH + 1];
+        u32 depth = ext_rightmost(ip, path);
+        struct buf *lb;
+        void *leaf = node_get(ip, path[depth], 0, &lb);
+        struct ext_header *lh = ext_hdr(leaf);
+        if (lh->entries == 0) {
+            node_put(lb, false); /* the root, an empty leaf */
+            return true;
+        }
+        if (t.n + 2 + 2 * depth > TRUNC_BUDGET) {
+            node_put(lb, false);
+            return false;
+        }
+        struct ext_extent *e = ext_ent(leaf, lh->entries - 1u);
+        u32 last = e->start_lo + e->len - 1u;
+        u32 first = last - last % BPB;
+        if (first < e->start_lo) {
+            first = e->start_lo;
+        }
+        for (u32 x = first; x <= last; x++) {
+            bfree(ip->dev, x);
+        }
+        trunc_logged(&t, BBLOCK(last, fs_sb));
+        if (path[depth] != 0) {
+            trunc_logged(&t, path[depth]);
+        }
+        e->len = (u16)(e->len - (last - first + 1));
+        bool empty = false;
+        if (e->len == 0) {
+            /* A node's bytes past its last entry are 0 (the format's rule). */
+            memset(e, 0, sizeof *e);
+            lh->entries--;
+            empty = lh->entries == 0;
+        }
+        node_put(lb, true);
+        /* The nodes the run emptied, from the leaf up: each is freed and its
+         * entry removed from its parent. */
+        for (u32 l = depth; empty && l > 0; l--) {
+            bfree(ip->dev, path[l]);
+            trunc_logged(&t, BBLOCK(path[l], fs_sb));
+            struct buf *pb;
+            void *p = node_get(ip, path[l - 1], depth - (l - 1), &pb);
+            ext_hdr(p)->entries--;
+            memset(ext_idx(p, ext_hdr(p)->entries), 0, sizeof(struct ext_index));
+            empty = ext_hdr(p)->entries == 0;
+            if (path[l - 1] != 0) {
+                trunc_logged(&t, path[l - 1]);
+            }
+            node_put(pb, true);
+        }
+        if (empty) {
+            ext_init(&ip->root); /* every node is gone: an empty leaf again */
+        }
+    }
+}
+
+/* Ends the operation and begins another, `ip` unlocked in between: what
+ * was logged so far commits (if anything was), and what follows has an
+ * operation's room of its own. */
+static void trunc_restart(struct inode *ip) {
+    iunlock(ip);
+    end_op();
+    begin_op();
+    ilock(ip);
+}
+
+/* itrunc(), and iput()'s freeing of an inode: then `free_inode`, and its
+ * type becomes T_FREE in the last transaction, the one that empties it.
+ * Returns whether that took transactions of their own: then, but for an
+ * inode freed, the caller's operation goes on in a new one already. An
+ * inode freed is iput()'s to finish first (see there). */
+static bool truncate(struct inode *ip, bool free_inode) {
+    ip->size = 0;
+    ip->size_hi = 0;
+    if (ip->type == T_DEVICE || (ip->root.h.depth == 0 && ip->root.h.entries == 0)) {
+        /* No blocks (a device's root is all zero): only the inode changes,
+         * a block the caller's operation counts already. */
+        ip->flags &= ~(u32)INODE_TRUNCATING;
+        if (free_inode) {
+            ip->type = T_FREE;
+        }
+        iupdate(ip);
+        return false;
+    }
+    /* Set with the size, before the inode is unlocked for the first time,
+     * and cleared in the last transaction: whoever writes the inode in
+     * between (a link or an unlink of a file being emptied by O_TRUNC, in
+     * one of the windows below) writes a valid state to the disk, size 0
+     * and TRUNCATING with the blocks still to free, which a crash leaves to
+     * the next mount (finish_truncations). When one transaction is enough
+     * and nobody wrote the inode meanwhile, the flag never reaches the
+     * disk. */
+    ip->flags |= INODE_TRUNCATING;
+    /* Freeing blocks takes transactions of its own (docs/camelot-fs.md,
+     * "Limits on transactions"), as Linux's eviction takes a journal handle
+     * of its own after the unlink's: whatever the caller logged commits
+     * first (an unlink's entry and link count: a crash then leaves an
+     * orphan, which the next mount frees), and the caller goes on after
+     * in a new operation. */
+    trunc_restart(ip);
+    while (!trunc_step(ip)) {
+        iupdate(ip);
+        trunc_restart(ip);
+    }
+    ip->flags &= ~(u32)INODE_TRUNCATING;
+    if (free_inode) {
+        ip->type = T_FREE;
+    } else {
+        iupdate(ip);
+        trunc_restart(ip);
+        return true;
+    }
+    iupdate(ip);
+    return true;
+}
+
+void itrunc(struct inode *ip) {
+    truncate(ip, false);
+}
+
+bool inode_too_big(const struct inode *ip) {
+    return ip->size_hi != 0 || ip->size > MAXFILE_BYTES;
+}
+
 /* ---- Inodes ---- */
 
 struct inode *ialloc(u32 dev, u16 type) {
@@ -263,6 +728,9 @@ struct inode *ialloc(u32 dev, u16 type) {
         if (dip->type == T_FREE) {
             memset(dip, 0, sizeof *dip);
             dip->type = type;
+            if (type != T_DEVICE) {
+                ext_init(&dip->root); /* a device's stays all zero */
+            }
             log_write(b);
             brelse(b);
             return iget(dev, inum);
@@ -280,7 +748,9 @@ void iupdate(struct inode *ip) {
     dip->minor = ip->minor;
     dip->nlink = ip->nlink;
     dip->size = ip->size;
-    memmove(dip->addrs, ip->addrs, sizeof ip->addrs);
+    dip->size_hi = ip->size_hi;
+    memmove(&dip->root, &ip->root, sizeof ip->root);
+    dip->flags = ip->flags;
     log_write(b);
     brelse(b);
 }
@@ -332,7 +802,9 @@ void ilock(struct inode *ip) {
         ip->minor = dip->minor;
         ip->nlink = dip->nlink;
         ip->size = dip->size;
-        memmove(ip->addrs, dip->addrs, sizeof ip->addrs);
+        ip->size_hi = dip->size_hi;
+        memmove(&ip->root, &dip->root, sizeof ip->root);
+        ip->flags = dip->flags;
         brelse(b);
         ip->valid = true;
         if (ip->type == T_FREE) {
@@ -348,29 +820,6 @@ void iunlock(struct inode *ip) {
     releasesleep(&ip->lock);
 }
 
-void itrunc(struct inode *ip) {
-    for (u32 i = 0; i < NDIRECT; i++) {
-        if (ip->addrs[i] != 0) {
-            bfree(ip->dev, ip->addrs[i]);
-            ip->addrs[i] = 0;
-        }
-    }
-    if (ip->addrs[NDIRECT] != 0) {
-        struct buf *b = fs_bread(ip->dev, ip->addrs[NDIRECT]);
-        const u32 *a = (const u32 *)b->data;
-        for (u32 i = 0; i < NINDIRECT; i++) {
-            if (a[i] != 0) {
-                bfree(ip->dev, a[i]);
-            }
-        }
-        brelse(b);
-        bfree(ip->dev, ip->addrs[NDIRECT]);
-        ip->addrs[NDIRECT] = 0;
-    }
-    ip->size = 0;
-    iupdate(ip);
-}
-
 void iput(struct inode *ip) {
     acquire(&itable_lock);
     if (ip->ref == 1 && ip->valid && ip->nlink == 0) {
@@ -383,12 +832,22 @@ void iput(struct inode *ip) {
         }
         acquiresleep(&ip->lock);
         release(&itable_lock);
-        itrunc(ip);
-        ip->type = T_FREE;
-        iupdate(ip);
+        bool restarted = truncate(ip, true);
         ip->valid = false;
         releasesleep(&ip->lock);
         acquire(&itable_lock);
+        if (restarted) {
+            /* The freeing took transactions of its own; the caller goes on
+             * in a new one. Only now, with the cached copy no longer valid:
+             * once the transaction that frees the inode commits, ialloc() may
+             * hand the inode out again, and iget() this slot with it, which
+             * must then read the new inode from the disk. */
+            ip->ref--;
+            release(&itable_lock);
+            end_op();
+            begin_op();
+            return;
+        }
     }
     ip->ref--;
     release(&itable_lock);
@@ -401,53 +860,6 @@ void iunlockput(struct inode *ip) {
 
 /* ---- Contents ---- */
 
-/* The disk block holding block `bn` of locked inode `ip`. If it has none
- * and `alloc` is set, allocates it (and the indirect block, if needed);
- * returns 0 when there is no block, or no free block to allocate. */
-static u32 bmap(struct inode *ip, u32 bn, bool alloc) {
-    if (bn < NDIRECT) {
-        if (ip->addrs[bn] == 0 && alloc) {
-            ip->addrs[bn] = balloc(ip->dev);
-        }
-        return ip->addrs[bn];
-    }
-    bn -= NDIRECT;
-    if (bn >= NINDIRECT) {
-        panic("bmap: past the largest file");
-    }
-    bool new_indirect = false;
-    if (ip->addrs[NDIRECT] == 0) {
-        if (!alloc) {
-            return 0;
-        }
-        ip->addrs[NDIRECT] = balloc(ip->dev);
-        if (ip->addrs[NDIRECT] == 0) {
-            return 0;
-        }
-        new_indirect = true;
-    }
-    struct buf *b = fs_bread(ip->dev, ip->addrs[NDIRECT]);
-    u32 *a = (u32 *)b->data;
-    u32 addr = a[bn];
-    if (addr == 0 && alloc) {
-        addr = balloc(ip->dev);
-        if (addr != 0) {
-            a[bn] = addr;
-            log_write(b);
-        }
-    }
-    brelse(b);
-    if (addr == 0 && new_indirect) {
-        /* The indirect block was got for this block, and there is none for
-         * it (the disk is full): give the indirect block back. A file has
-         * one exactly when it has more than NDIRECT blocks (no holes), and
-         * the caller writes the inode with what bmap() leaves in addrs. */
-        bfree(ip->dev, ip->addrs[NDIRECT]);
-        ip->addrs[NDIRECT] = 0;
-    }
-    return addr;
-}
-
 int readi(struct inode *ip, void *dst, u32 off, u32 n) {
     if (off >= ip->size || off + n < off) {
         return 0;
@@ -457,7 +869,7 @@ int readi(struct inode *ip, void *dst, u32 off, u32 n) {
     }
     u8 *d = (u8 *)dst;
     for (u32 done = 0; done < n;) {
-        u32 addr = bmap(ip, off / BSIZE, false);
+        u32 addr = ext_lookup(ip, off / BSIZE);
         if (addr == 0) {
             panic("readi: a hole in a file");
         }
@@ -476,15 +888,32 @@ int writei(struct inode *ip, const void *src, u32 off, u32 n) {
     if (off > ip->size || off + n < off) {
         return -EINVAL;
     }
-    if (off + n > MAXFILE * BSIZE) {
+    if (off + n > MAXFILE_BYTES) {
         return -EFBIG;
     }
     const u8 *s = (const u8 *)src;
     u32 done = 0;
+    /* The file's blocks: no holes, so exactly the ones its size needs. A
+     * block at or past them is the next one, added to the tree. */
+    u32 blocks = div_ceil(ip->size, BSIZE);
     while (done < n) {
-        u32 addr = bmap(ip, off / BSIZE, true);
-        if (addr == 0) {
-            break; /* the disk is full */
+        u32 bn = off / BSIZE;
+        u32 addr;
+        if (bn < blocks) {
+            addr = ext_lookup(ip, bn);
+            if (addr == 0) {
+                panic("writei: a hole in a file");
+            }
+        } else {
+            addr = balloc(ip->dev, ext_goal(ip));
+            if (addr == 0) {
+                break; /* the disk is full */
+            }
+            if (ext_append(ip, bn, addr) < 0) {
+                bfree(ip->dev, addr); /* no room for the tree's new nodes */
+                break;
+            }
+            blocks++;
         }
         struct buf *b = fs_bread(ip->dev, addr);
         u32 m = MIN(n - done, BSIZE - off % BSIZE);
@@ -498,7 +927,7 @@ int writei(struct inode *ip, const void *src, u32 off, u32 n) {
     if (off > ip->size) {
         ip->size = off;
     }
-    /* Even if the size is the same, bmap() may have added blocks. */
+    /* The size, and the root of the tree, which may have changed. */
     iupdate(ip);
     if (done == 0 && n > 0) {
         return -ENOSPC;
@@ -732,11 +1161,12 @@ struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, int *e
 
 fail:
     /* No room for the entries: the new inode goes back (iput frees it, with
-     * any block it got). */
+     * any block it got, which may end this operation and begin others:
+     * itrunc). The directory first, as no sleep lock may be held then. */
     ip->nlink = 0;
     iupdate(ip);
-    iunlockput(ip);
     iunlockput(dp);
+    iunlockput(ip);
     *err = -ENOSPC;
     return NULL;
 }
@@ -811,43 +1241,47 @@ int fs_link(const char *old, const char *new) {
     if (ip == NULL) {
         return err;
     }
-    ilock(ip);
-    if (ip->type == T_DIR) {
-        /* A directory has one name, in its parent: its `..` says which. */
-        iunlockput(ip);
-        return -EPERM;
-    }
-    /* The link first, then the entry, both in the caller's transaction; a
-     * failure below takes the link back. */
-    ip->nlink++;
-    iupdate(ip);
-    iunlock(ip);
-
+    /* Both paths first, as Linux's linkat does, before anything is
+     * written: looking a path up may drop the last reference to a removed
+     * directory, whose freeing ends the operation (itrunc), which would
+     * commit a half-made link. */
     char name[DIRSIZ + 1];
     struct inode *dp = nameiparent(new, name, &err);
     if (dp == NULL) {
-        if (err == -EINVAL) {
-            err = -EEXIST; /* `/`: the root */
-        }
-        goto undo;
+        iput(ip);
+        return err == -EINVAL ? -EEXIST : err; /* `/`: the root */
+    }
+    /* A directory has one name, in its parent: its `..` says which. Found
+     * before taking a second lock, so that only a directory and then a file
+     * are ever locked together here, as fs_unlink() locks them (two
+     * directories, in whichever order, could wait for each other). */
+    ilock(ip);
+    bool is_dir = ip->type == T_DIR;
+    iunlock(ip);
+    if (is_dir) {
+        iput(dp);
+        iput(ip);
+        return -EPERM;
     }
     ilock(dp);
-    if (dp->nlink == 0) {
+    ilock(ip);
+    if (dp->nlink == 0 || ip->nlink == 0) {
+        /* A directory removed meanwhile; a file whose last name went
+         * meanwhile, which Linux refuses to link back too. */
         err = -ENOENT;
     } else {
+        /* The link and the entry, in one transaction: a failure takes the
+         * link back. */
+        ip->nlink++;
+        iupdate(ip);
         err = dirlink(dp, name, ip->inum);
+        if (err < 0) {
+            ip->nlink--;
+            iupdate(ip);
+        }
     }
+    iunlock(ip);
     iunlockput(dp);
-    if (err < 0) {
-        goto undo;
-    }
     iput(ip);
-    return 0;
-
-undo:
-    ilock(ip);
-    ip->nlink--;
-    iupdate(ip);
-    iunlockput(ip);
     return err;
 }

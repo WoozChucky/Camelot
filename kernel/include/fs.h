@@ -25,15 +25,18 @@
 #include "types.h"
 
 #define FS_MAGIC 0x53464d43 /* "CMFS" */
-#define FS_VERSION 1
+#define FS_VERSION 2
 
 #define ROOTINO 1 /* the root directory's inode; inode 0 is never used */
 #define SUPERBLOCK_NO 1
 #define LOGSTART 2
 
-#define NDIRECT 12
-#define NINDIRECT (BSIZE / 4)
-#define MAXFILE (NDIRECT + NINDIRECT) /* blocks */
+/* The largest file the kernel reads or writes, in bytes: its file offsets
+ * are 32-bit (i32 in lseek) until off_t widens (#155). The format's own
+ * limit is 2^32 blocks. A bigger file (only mkfs could make one) fails to
+ * open with -EOVERFLOW, as Linux's open does for a large file without
+ * O_LARGEFILE. */
+#define MAXFILE_BYTES 0x7fffffffu
 #define DIRSIZ 14
 
 /* Inode types. */
@@ -67,15 +70,72 @@ struct superblock {
     u32 datastart;  /* the first data block */
 };
 
-/* An inode on the disk: 64 bytes, 16 per block. */
+/* Extent trees (docs/camelot-fs.md, "Extent trees"): ext4's format. A node
+ * is a header and entries of 12 bytes: extents in a leaf (depth 0), index
+ * entries above. The root is the inode's i_block (a header and 4 entries);
+ * a tree block holds a header and 84. Block numbers are 48 bits, of which
+ * the high 16 are always 0 (a filesystem is at most 2^31 blocks). */
+#define EXT_MAGIC 0xf30a
+#define EXT_ROOT_MAX 4
+#define EXT_BLOCK_MAX ((BSIZE - sizeof(struct ext_header)) / sizeof(struct ext_extent))
+#define EXT_MAX_DEPTH 5    /* ext4's EXT4_MAX_EXTENT_DEPTH */
+#define EXT_MAX_LEN 32768  /* longer ee_len is ext4's "uninitialized" */
+
+struct ext_header {
+    u16 magic;
+    u16 entries;
+    u16 max;
+    u16 depth;
+    u32 generation; /* 0 */
+};
+
+/* Logical blocks `block` to `block` + `len` - 1 are disk blocks `start_lo`
+ * on. */
+struct ext_extent {
+    u32 block;
+    u16 len;
+    u16 start_hi;
+    u32 start_lo;
+};
+
+/* The logical blocks from `block` on are under the tree block `leaf_lo`. */
+struct ext_index {
+    u32 block;
+    u32 leaf_lo;
+    u16 leaf_hi;
+    u16 unused;
+};
+
+/* A node: the root (EXT_ROOT_MAX entries) or the start of a tree block
+ * (EXT_BLOCK_MAX). Entries are extents or index entries, both 12 bytes;
+ * ext_index() reads one as the latter. */
+struct ext_node {
+    struct ext_header h;
+    struct ext_extent e[EXT_ROOT_MAX];
+};
+
+/* inode flags: the inode's blocks are being freed (docs/camelot-fs.md,
+ * "Truncation"). */
+#define INODE_TRUNCATING 1
+
+/* An inode on the disk: 128 bytes, 8 per block. The size is a u64, as
+ * size and size_hi (Merlin has no long long yet). */
 struct dinode {
     u16 type;
     u16 major; /* devices only */
     u16 minor;
-    u16 nlink;                /* entries naming it, `.` not counted */
-    u32 size;                 /* bytes */
-    u32 addrs[NDIRECT + 1];   /* direct blocks, then the indirect block */
+    u16 nlink;               /* entries naming it, `.` not counted */
+    u32 size;                /* bytes: the low half */
+    u32 size_hi;             /* and the high half */
+    struct ext_node root;    /* i_block: the extent tree's root (zeros for a device) */
+    u32 flags;               /* INODE_TRUNCATING, or 0 */
+    u8 reserved[48];         /* 0 */
 };
+
+_Static_assert(sizeof(struct ext_header) == 12 && sizeof(struct ext_extent) == 12 &&
+                   sizeof(struct ext_index) == 12 && sizeof(struct ext_node) == 60,
+               "ext4's node layout");
+_Static_assert(sizeof(struct dinode) == 128, "an inode is 128 bytes");
 
 /* Inodes per block, and the block holding inode i. */
 #define IPB (BSIZE / sizeof(struct dinode))
@@ -102,13 +162,21 @@ struct inode {
     u32 inum;
     u32 ref;
     struct sleeplock lock; /* held from ilock() to iunlock() */
-    bool valid;            /* the fields below hold the dinode */
+    /* Held by whoever changes the contents of a file across transactions,
+     * a write() or a truncation, from before its first begin_op() to after
+     * its last end_op() (Linux's i_rwsem): so a truncation can end its
+     * transaction, let go of `lock` and begin another, with no writer
+     * coming in between. Lock order: wlock, then begin_op(), then lock. */
+    struct sleeplock wlock;
+    bool valid; /* the fields below hold the dinode */
     u16 type;
     u16 major;
     u16 minor;
     u16 nlink;
     u32 size;
-    u32 addrs[NDIRECT + 1];
+    u32 size_hi; /* not 0: bigger than the kernel handles (MAXFILE_BYTES) */
+    struct ext_node root;
+    u32 flags;
 };
 
 /* Inodes in the cache. iget() panics if every one is in use, so there are
@@ -120,11 +188,13 @@ struct inode {
 /* The mounted filesystem: its disk, superblock, and whether it is
  * read-only (then nothing writes to it): because the disk is, or because
  * its log has fewer than MAXOPBLOCKS slots (`fs_log_too_small`), too few
- * for an operation. `fs_orphans` counts the inodes the mount freed that a
- * crash had left allocated with no links. */
+ * for an operation. `fs_truncations` counts the truncations the mount
+ * finished that a crash had interrupted, and `fs_orphans` the inodes it
+ * freed that a crash had left allocated with no links. */
 extern bool fs_mounted;
 extern bool fs_readonly;
 extern bool fs_log_too_small;
+extern u32 fs_truncations;
 extern u32 fs_orphans;
 extern u32 fs_dev;
 extern struct superblock fs_sb;
@@ -135,9 +205,10 @@ void fs_init(void);
 
 /* Mounts disk `dev` as the root: reads and checks the superblock (every
  * rule of the format document's superblock section), replays a committed
- * transaction from the log, checks the root is a directory, and frees the
- * inodes left with no links (unless the filesystem is read-only, which it
- * is on a read-only disk or with a log too small to write). Returns 0, or:
+ * transaction from the log, checks the root is a directory, finishes the
+ * truncations a crash interrupted and frees the inodes left with no links
+ * (unless the filesystem is read-only, which it is on a read-only disk or
+ * with a log too small to write). Returns 0, or:
  * -ENOENT if the disk has no filesystem (another magic), -EINVAL if its
  * superblock or log header is broken, -EROFS if it is read-only and its log
  * needs replaying, -EIO if the superblock can't be read; *why then says
@@ -179,8 +250,18 @@ void iunlockput(struct inode *ip);
 void iupdate(struct inode *ip);
 
 /* Frees every block of locked inode `ip` and sets its size to 0 (open's
- * O_TRUNC). In a transaction. */
+ * O_TRUNC, and iput() freeing an inode). In a transaction, which it may end
+ * and begin again, as often as freeing the blocks takes (docs/camelot-fs.md,
+ * "Truncation"): `ip` is unlocked in between, so the caller holds no other
+ * sleep lock that an operation might wait for, and holds ip->wlock if
+ * others can reach the inode (a file with links), so that no writer comes
+ * in. A small inode, whose blocks fit one transaction, is freed in the
+ * caller's alone. */
 void itrunc(struct inode *ip);
+
+/* Whether locked inode `ip` is bigger than the kernel handles
+ * (MAXFILE_BYTES): open() refuses it with -EOVERFLOW. */
+bool inode_too_big(const struct inode *ip);
 
 /* Reads up to `n` bytes at `off` of locked inode `ip` into kernel memory
  * `dst`. Returns the bytes read: fewer at the end of the file, 0 at or past
@@ -190,7 +271,7 @@ int readi(struct inode *ip, void *dst, u32 off, u32 n);
 /* Writes `n` bytes from kernel memory `src` at `off` of locked inode `ip`,
  * growing it as needed (`off` at most its size: no holes). Returns the bytes
  * written, fewer if the disk filled up; -ENOSPC if none could be, -EINVAL
- * for an `off` past the end, -EFBIG past the largest file. In a
+ * for an `off` past the end, -EFBIG past MAXFILE_BYTES. In a
  * transaction, which must have room for the blocks (see log.h). */
 int writei(struct inode *ip, const void *src, u32 off, u32 n);
 
@@ -234,8 +315,10 @@ int fs_unlink(const char *path);
 
 /* Adds the entry `new` for the file `old` names, which gains a link. 0,
  * -ENOENT/-ENOTDIR/-ENAMETOOLONG (either path; -ENOENT for a directory to
- * put `new` in that has been removed), -EPERM (`old` is a directory),
- * -EEXIST, -ENOSPC, -EROFS. In a transaction. */
+ * put `new` in that has been removed, or a file whose last name was
+ * removed meanwhile), -EPERM (`old` is a directory), -EEXIST, -ENOSPC,
+ * -EROFS. In a transaction: both paths are looked up before anything is
+ * written, so the link and the entry are one change. */
 int fs_link(const char *old, const char *new);
 
 #endif

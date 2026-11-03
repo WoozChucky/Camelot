@@ -227,6 +227,13 @@ bool log_committing(void) {
     return committing;
 }
 
+u32 log_blocks(void) {
+    acquire(&log.lock);
+    u32 n = log.lh.n;
+    release(&log.lock);
+    return n;
+}
+
 void end_op(void) {
     acquire(&log.lock);
     if (log.outstanding == 0) {

@@ -22,8 +22,9 @@
 
 /* Descriptors per process (NOFILE in kernel/include/file.h). */
 #define NOFILE 16
-/* The largest file, in bytes (MAXFILE * BSIZE in kernel/include/fs.h). */
-#define MAX_FILE_SIZE (268 * 1024)
+/* A big file: past the largest of the filesystem's version 1 (268 KiB),
+ * which version 2's extent trees have no limit like. */
+#define BIG_FILE_SIZE (300 * 1024)
 /* The console's device number (CONSOLE in kernel/include/file.h). */
 #define CONSOLE 1
 
@@ -525,14 +526,16 @@ static void test_open_file_table(void) {
     check_eq(unlink("full"), 0, "remove it");
 }
 
-static void test_largest_file(void) {
+static void test_big_file(void) {
     int fd = open("big", O_WRONLY | O_CREAT);
-    check_eq(write_pattern(fd, MAX_FILE_SIZE, 2), MAX_FILE_SIZE, "write the largest file");
-    check_eq(write(fd, "x", 1), -EFBIG, "and no byte more");
-    check_eq(size_of("big"), MAX_FILE_SIZE, "its size");
+    check_eq(write_pattern(fd, BIG_FILE_SIZE, 2), BIG_FILE_SIZE, "write a file past 268 KiB");
+    check_eq(size_of("big"), BIG_FILE_SIZE, "its size");
     close(fd);
     fd = open("big", O_RDONLY);
-    check(holds_pattern(fd, MAX_FILE_SIZE, 2, sizeof buf), "it reads back");
+    check(holds_pattern(fd, BIG_FILE_SIZE, 2, sizeof buf), "it reads back");
+    close(fd);
+    fd = open("big", O_WRONLY | O_TRUNC);
+    check_eq(size_of("big"), 0, "O_TRUNC empties it");
     close(fd);
     check_eq(unlink("big"), 0, "remove it");
 }
@@ -634,7 +637,7 @@ int main(int argc, char **argv) {
     test_programs();
     test_devices();
     test_open_file_table();
-    test_largest_file();
+    test_big_file();
     check_eq(chdir("/"), 0, "chdir /");
     check_eq(unlink("/ft"), 0, "remove /ft: it is empty");
     printf("filetest: %d checks, %d failed\n", checks, failures);

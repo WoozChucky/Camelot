@@ -7,12 +7,11 @@
 //! and jumps to its first byte (spec section 7, "Boot from disk"). The
 //! bootloader, `kernel/boot/boot.s`, then reads the kernel ELF from the
 //! sectors the boot block names and loads its segments. The kernel is not a
-//! file of the filesystem: at more than 500 KiB it is bigger than the largest
-//! file (268 blocks), and a region of its own is simpler to read for a
-//! bootloader of under 1 KiB. Neither the boot block nor the blocks past
-//! `size` belong to the filesystem, so a bootable image is still a valid
-//! version 1 filesystem, and fsck, the reader and the kernel see no
-//! difference.
+//! file of the filesystem: a region of its own is far simpler to read for a
+//! bootloader of under 1 KiB than a directory, an inode and an extent tree.
+//! Neither the boot block nor the blocks past `size` belong to the
+//! filesystem, so a bootable image is still a valid filesystem, and fsck,
+//! the reader and the kernel see no difference.
 //!
 //! Only what the bootloader loads is stored ([`loadable`]): the ELF header, the
 //! program headers and the bytes of the loadable segments, at their offsets. The

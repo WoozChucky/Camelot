@@ -160,12 +160,16 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             let mut image = read_image(path)?;
             match fsck::check(&image) {
                 Ok(mut r) => {
-                    if recover && (r.replayed > 0 || r.orphans > 0) {
+                    if recover && (r.replayed > 0 || r.orphans > 0 || r.truncating > 0) {
                         let replayed = fsck::recover(&mut image)?;
+                        let finished = fsck::finish_truncations(&mut image)?;
                         let freed = fsck::free_orphans(&mut image)?;
                         std::fs::write(path, &image).map_err(|e| format!("{}: {e}", path.display()))?;
                         if replayed > 0 {
                             println!("replayed {replayed} blocks from the log");
+                        }
+                        if finished > 0 {
+                            println!("finished {finished} truncations");
                         }
                         if freed > 0 {
                             println!("freed {freed} orphaned inodes");
@@ -174,6 +178,12 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                     } else {
                         if r.replayed > 0 {
                             println!("the log holds a committed transaction of {} blocks", r.replayed);
+                        }
+                        if r.truncating > 0 {
+                            println!(
+                                "{} truncations for the next mount to finish (inodes with TRUNCATING set)",
+                                r.truncating
+                            );
                         }
                         if r.orphans > 0 {
                             println!(

@@ -4,15 +4,17 @@
 //! [`check`] looks at the disk as a mount would leave it: a committed
 //! transaction still in the log is replayed into a copy first (and counted in
 //! the report). [`recover`] does that replay in place, as the kernel does at
-//! mount, and [`free_orphans`] then frees the inodes a crash left allocated
-//! with no links, as the kernel's mount does next. [`check`] counts those
-//! orphans in its report: they are allowed (docs/camelot-fs.md, "Link
-//! count").
+//! mount; [`finish_truncations`] then frees the blocks of the inodes a crash
+//! left part way through a truncation, and [`free_orphans`] the inodes it
+//! left allocated with no links, as the kernel's mount does next. [`check`]
+//! counts both in its report: they are allowed (docs/camelot-fs.md,
+//! "Truncation" and "Link count").
 
+use crate::extent::{self, empty_root};
 use crate::{
-    block, block_mut, bmap, contents, dirents, read_inode, show_name, superblock, valid_name, write_inode,
-    LogHeader, Superblock, BITS_PER_BLOCK, BSIZE, DIRENT_SIZE, MAX_FILE_SIZE, NDIRECT, NINDIRECT, NO_INODE,
-    ROOT_INODE, T_DEVICE, T_DIR, T_FILE, T_FREE,
+    block, block_mut, contents, dirents, read_inode, show_name, superblock, valid_name, write_inode, Dinode,
+    LogHeader, Superblock, BITS_PER_BLOCK, BSIZE, DIRENT_SIZE, MAX_FILE_SIZE, NO_INODE, ROOT_INODE,
+    TRUNCATING, T_DEVICE, T_DIR, T_FILE, T_FREE,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -39,53 +41,68 @@ pub fn recover(image: &mut [u8]) -> Result<usize, String> {
     Ok(header.blocks.len())
 }
 
+/// Frees every block of inode `inum`, as the kernel's truncation leaves an
+/// inode: its tree empty, `size` 0, `TRUNCATING` clear. The blocks are
+/// marked free in the bitmap (their contents stay). Errors, changing
+/// nothing, if its tree is broken.
+fn free_blocks(image: &mut [u8], sb: &Superblock, inum: u32) -> Result<Dinode, String> {
+    let mut d = read_inode(image, sb, inum);
+    if d.kind == T_DEVICE {
+        return Ok(d);
+    }
+    let map = extent::walk(image, sb, &d.root).map_err(|e| format!("inode {inum}: {e}"))?;
+    for b in map.content_blocks().chain(map.tree_blocks.iter().copied()) {
+        let (blk, byte, mask) = sb.bit_pos(b);
+        block_mut(image, blk)[byte] &= !mask;
+    }
+    d.root = empty_root();
+    d.size = 0;
+    d.flags = 0;
+    write_inode(image, sb, inum, &d);
+    Ok(d)
+}
+
+/// Finishes every truncation a crash interrupted, as the kernel's mount
+/// does first: frees the blocks left of each file with `TRUNCATING` set that
+/// still has links. An orphan being freed is left to [`free_orphans`],
+/// which frees it whole. Run it on a replayed image ([`recover`]). Returns
+/// how many it finished; errors if the superblock or one of their trees is
+/// invalid (the ones before it are finished).
+pub fn finish_truncations(image: &mut [u8]) -> Result<usize, String> {
+    let sb = superblock(image)?;
+    let mut n = 0;
+    for inum in ROOT_INODE..sb.ninodes {
+        let d = read_inode(image, &sb, inum);
+        if d.kind != T_FREE && d.nlink != 0 && d.flags & TRUNCATING != 0 {
+            free_blocks(image, &sb, inum)?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 /// Frees every orphaned inode of `image` (allocated, with `nlink` 0) as the
 /// kernel's mount does (`free_orphans` in kernel/fs.c, through `iput`): its
-/// blocks, the indirect one included, are marked free in the bitmap, and its
-/// `type`, `size` and pointers become 0 (`major`, `minor` and `nlink` stay as
-/// they were; the blocks' contents too). The root is never freed. Run it on
-/// a replayed image ([`recover`]). Returns how many it freed; errors, leaving
-/// `image` as it was, if the superblock is invalid or an orphan's pointers
-/// leave the data region.
+/// blocks, tree blocks included, are marked free in the bitmap, its tree
+/// emptied, its `size` and `flags` set to 0 and then its `type` (`major`,
+/// `minor` and `nlink` stay as they were; the blocks' contents too). The root
+/// is never freed. Run it on a replayed image ([`recover`]). Returns how
+/// many it freed; errors if the superblock or an orphan's tree is invalid
+/// (the ones before it are freed).
 pub fn free_orphans(image: &mut [u8]) -> Result<usize, String> {
     let sb = superblock(image)?;
-    let mut frees: Vec<(u32, Vec<u32>)> = Vec::new();
+    let mut n = 0;
     for inum in ROOT_INODE + 1..sb.ninodes {
         let d = read_inode(image, &sb, inum);
         if d.kind == T_FREE || d.nlink != 0 {
             continue;
         }
-        // Every non-zero pointer, as the kernel's itrunc() frees them.
-        let mut blocks: Vec<u32> = d.addrs[..NDIRECT].iter().copied().filter(|&a| a != 0).collect();
-        let ind = d.indirect();
-        if ind != 0 {
-            for k in NDIRECT..NDIRECT + NINDIRECT {
-                let a = bmap(image, &sb, &d, k).map_err(|e| format!("orphan inode {inum}: {e}"))?;
-                if a != 0 {
-                    blocks.push(a);
-                }
-            }
-            blocks.push(ind);
-        }
-        if let Some(b) = blocks.iter().find(|&&b| !sb.is_data(b)) {
-            return Err(format!(
-                "orphan inode {inum}: block {b} is outside the data region"
-            ));
-        }
-        frees.push((inum, blocks));
-    }
-    for (inum, blocks) in &frees {
-        for &b in blocks {
-            let (blk, byte, mask) = sb.bit_pos(b);
-            block_mut(image, blk)[byte] &= !mask;
-        }
-        let mut d = read_inode(image, &sb, *inum);
+        let mut d = free_blocks(image, &sb, inum).map_err(|e| format!("orphan {e}"))?;
         d.kind = T_FREE;
-        d.size = 0;
-        d.addrs = [0; NDIRECT + 1];
-        write_inode(image, &sb, *inum, &d);
+        write_inode(image, &sb, inum, &d);
+        n += 1;
     }
-    Ok(frees.len())
+    Ok(n)
 }
 
 /// What a consistent image holds.
@@ -103,6 +120,10 @@ pub struct Report {
     /// the next mount (or [`free_orphans`]) frees. Counted in `dirs`, `files`
     /// or `devices` too, and their blocks in `used_blocks`.
     pub orphans: u32,
+    /// Files with links and `TRUNCATING` set, whose remaining blocks the next
+    /// mount (or [`finish_truncations`]) frees. Their blocks count in
+    /// `used_blocks`. (An orphan with it set counts as an orphan.)
+    pub truncating: u32,
     /// Data blocks in use, and free.
     pub used_blocks: u32,
     pub free_blocks: u32,
@@ -119,6 +140,7 @@ pub fn check(image: &[u8]) -> Result<Report, Vec<String>> {
         problems: Vec::new(),
         owner: HashMap::new(),
         sound: vec![false; sb.ninodes as usize],
+        truncating: 0,
     };
     c.inodes();
     c.bitmap();
@@ -135,6 +157,7 @@ pub fn check(image: &[u8]) -> Result<Report, Vec<String>> {
         devices: 0,
         free_inodes: 0,
         orphans,
+        truncating: c.truncating,
         used_blocks: c.owner.len() as u32,
         free_blocks: sb.nblocks - c.owner.len() as u32,
     };
@@ -155,8 +178,10 @@ struct Checker<'a> {
     problems: Vec<String>,
     /// Each data block in use, and the inode using it.
     owner: HashMap<u32, u32>,
-    /// Inodes whose type, size and pointers are sound: only those are read.
+    /// Inodes whose fields and tree are sound: only those are read.
     sound: Vec<bool>,
+    /// Inodes with `TRUNCATING` set.
+    truncating: u32,
 }
 
 fn type_name(kind: u16) -> &'static str {
@@ -191,7 +216,7 @@ impl Checker<'_> {
         true
     }
 
-    /// Rule 2 and 3: every inode's type, size and pointers.
+    /// Rule 2 and 3: every inode's fields and extent tree.
     fn inodes(&mut self) {
         for inum in 0..self.sb.ninodes {
             let d = read_inode(self.image, &self.sb, inum);
@@ -212,6 +237,17 @@ impl Checker<'_> {
                     type_name(d.kind)
                 ));
             }
+            if let Some(i) = d.reserved.iter().position(|&x| x != 0) {
+                self.problem(format!(
+                    "inode {inum}: reserved byte {} is not 0",
+                    crate::RESERVED_AT + i
+                ));
+            }
+            if d.flags & !TRUNCATING != 0 {
+                self.problem(format!("inode {inum}: flags {:#x} has undefined bits", d.flags));
+                continue;
+            }
+            let truncating = d.flags & TRUNCATING != 0;
             if d.size > MAX_FILE_SIZE {
                 self.problem(format!(
                     "inode {inum}: size {} is more than the largest file",
@@ -219,12 +255,35 @@ impl Checker<'_> {
                 ));
                 continue;
             }
-            if d.kind == T_DEVICE && (d.size != 0 || d.addrs.iter().any(|&a| a != 0)) {
-                self.problem(format!("inode {inum}: a device with contents"));
+            if d.kind == T_DEVICE {
+                if d.size != 0 || d.root.iter().any(|&x| x != 0) || truncating {
+                    self.problem(format!("inode {inum}: a device with contents"));
+                    continue;
+                }
+                self.sound[inum as usize] = true;
                 continue;
             }
-            if d.kind == T_DIR
-                && (!(d.size as usize).is_multiple_of(DIRENT_SIZE) || (d.size as usize) < 2 * DIRENT_SIZE)
+            if truncating {
+                // An orphan being freed is the next mount's to free whole: an
+                // orphan, not a truncation to finish.
+                if d.nlink != 0 {
+                    self.truncating += 1;
+                }
+                if d.size != 0 {
+                    self.problem(format!(
+                        "inode {inum}: being truncated, with a size of {} (it must be 0)",
+                        d.size
+                    ));
+                    continue;
+                }
+                if d.kind == T_DIR && d.nlink != 0 {
+                    self.problem(format!(
+                        "inode {inum}: a directory being truncated, with links (only orphans are)"
+                    ));
+                    continue;
+                }
+            } else if d.kind == T_DIR
+                && (!d.size.is_multiple_of(DIRENT_SIZE as u64) || d.size < 2 * DIRENT_SIZE as u64)
             {
                 self.problem(format!(
                     "inode {inum}: a directory of {} bytes (not whole entries, or fewer than 2)",
@@ -232,57 +291,30 @@ impl Checker<'_> {
                 ));
                 continue;
             }
-            let mut ok = true;
-            let n = d.content_blocks();
-            for k in 0..NDIRECT {
-                let a = d.addrs[k];
-                if k < n {
-                    if a == 0 {
-                        self.problem(format!("inode {inum}: block {k} of its {n} is missing (a hole)"));
-                        ok = false;
-                    } else {
-                        ok &= self.claim(inum, a, &format!("block {k}"));
-                    }
-                } else if a != 0 {
-                    self.problem(format!(
-                        "inode {inum}: a pointer past its {n} blocks (addrs[{k}] = {a})"
-                    ));
-                    ok = false;
+            let map = match extent::walk(self.image, &self.sb, &d.root) {
+                Ok(map) => map,
+                Err(e) => {
+                    self.problem(format!("inode {inum}: {e}"));
+                    continue;
                 }
-            }
-            let ind = d.indirect();
-            if n > NDIRECT {
-                if ind == 0 {
-                    self.problem(format!("inode {inum}: {n} blocks but no indirect block"));
-                    ok = false;
-                } else if self.claim(inum, ind, "the indirect block") {
-                    for i in 0..NINDIRECT {
-                        let k = NDIRECT + i;
-                        let a = bmap(self.image, &self.sb, &d, k).unwrap_or(0);
-                        if k < n {
-                            if a == 0 {
-                                self.problem(format!(
-                                    "inode {inum}: block {k} of its {n} is missing (a hole)"
-                                ));
-                                ok = false;
-                            } else {
-                                ok &= self.claim(inum, a, &format!("block {k}"));
-                            }
-                        } else if a != 0 {
-                            self.problem(format!(
-                                "inode {inum}: indirect entry {i} past its {n} blocks is {a}"
-                            ));
-                            ok = false;
-                        }
-                    }
-                } else {
-                    ok = false;
-                }
-            } else if ind != 0 {
+            };
+            // A file being truncated maps the blocks still to free, any number
+            // of them; any other the blocks its size needs.
+            if !truncating && map.blocks() != d.content_blocks() {
                 self.problem(format!(
-                    "inode {inum}: an indirect block ({ind}) with only {n} blocks"
+                    "inode {inum}: its size ({} bytes) needs {} blocks, its extent tree maps {}",
+                    d.size,
+                    d.content_blocks(),
+                    map.blocks()
                 ));
-                ok = false;
+                continue;
+            }
+            let mut ok = true;
+            for &b in &map.tree_blocks {
+                ok &= self.claim(inum, b, "a tree block");
+            }
+            for (k, b) in map.content_blocks().enumerate() {
+                ok &= self.claim(inum, b, &format!("block {k}"));
             }
             self.sound[inum as usize] = ok;
         }
@@ -441,8 +473,9 @@ impl Checker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extent::{Extent, Header, ENTRY_SIZE, HEADER_SIZE};
     use crate::mkfs::{Mkfs, Options};
-    use crate::{put_u32, write_inode, Dinode, Dirent};
+    use crate::{data_blocks, put_u32, write_inode, Dinode, Dirent};
 
     fn opts() -> Options {
         Options {
@@ -452,8 +485,8 @@ mod tests {
         }
     }
 
-    /// An image with a bit of everything: subdirectories, a file with an
-    /// indirect block, an empty file, a device, a hard link.
+    /// An image with a bit of everything: subdirectories, a file of 21
+    /// blocks, an empty file, a device, a hard link.
     fn sample() -> Vec<u8> {
         let mut fs = Mkfs::new(&opts()).unwrap();
         fs.mkdir("/bin").unwrap();
@@ -471,8 +504,9 @@ mod tests {
         let r = check(&sample()).unwrap();
         assert_eq!((r.dirs, r.files, r.devices, r.replayed), (3, 3, 1, 0));
         assert_eq!(r.free_inodes, 48 - 1 - 7);
-        // Root, bin, sub: one block each; big: 21 + its indirect; README 1.
-        assert_eq!(r.used_blocks, 3 + 22 + 1);
+        // Root, bin, sub: one block each; big: 21, one extent; README 1.
+        assert_eq!(r.used_blocks, 3 + 21 + 1);
+        assert_eq!(r.truncating, 0);
         assert_eq!(r.free_blocks, r.sb.nblocks - r.used_blocks);
     }
 
@@ -497,6 +531,19 @@ mod tests {
         let mut d = read_inode(image, sb, inum);
         f(&mut d);
         write_inode(image, sb, inum, &d);
+    }
+
+    /// The first data block of inode `inum`.
+    fn first_block(image: &[u8], sb: &Superblock, inum: u32) -> u32 {
+        data_blocks(image, sb, &read_inode(image, sb, inum)).unwrap()[0]
+    }
+
+    /// Changes the first extent in an inode's root (a tree of depth 0).
+    fn edit_extent(d: &mut Dinode, f: impl FnOnce(&mut Extent)) {
+        assert_eq!(Header::decode(&d.root).depth, 0);
+        let mut e = Extent::decode(&d.root[HEADER_SIZE..]);
+        f(&mut e);
+        e.encode(&mut d.root[HEADER_SIZE..HEADER_SIZE + ENTRY_SIZE]);
     }
 
     #[test]
@@ -528,34 +575,59 @@ mod tests {
         broken("not whole entries", |img, sb| {
             edit_inode(img, sb, 1, |d| d.size += 1)
         });
-        broken("a hole", |img, sb| {
+        // A hole: the size needs more blocks than the tree maps; and a tree
+        // that maps more than the size needs.
+        broken("needs 30 blocks, its extent tree maps 21", |img, sb| {
             let i = inode_of(img, "/bin/big");
-            edit_inode(img, sb, i, |d| d.addrs[3] = 0)
+            edit_inode(img, sb, i, |d| d.size = 30 * BSIZE as u64)
         });
-        broken("a pointer past its", |img, sb| {
+        broken("needs 1 blocks, its extent tree maps 2", |img, sb| {
             let i = inode_of(img, "/README");
-            edit_inode(img, sb, i, |d| d.addrs[5] = 200)
+            edit_inode(img, sb, i, |d| edit_extent(d, |e| e.len = 2))
         });
         broken("outside the data region", |img, sb| {
             let i = inode_of(img, "/README");
-            edit_inode(img, sb, i, |d| d.addrs[0] = 3)
+            edit_inode(img, sb, i, |d| edit_extent(d, |e| e.start = 3))
         });
         broken("uses too", |img, sb| {
-            let readme = read_inode(img, sb, inode_of(img, "/README"));
+            let readme = first_block(img, sb, inode_of(img, "/README"));
             let i = inode_of(img, "/bin/big");
-            edit_inode(img, sb, i, |d| d.addrs[0] = readme.addrs[0])
+            edit_inode(img, sb, i, |d| edit_extent(d, |e| e.start = u64::from(readme)))
         });
-        broken("an indirect block", |img, sb| {
+        broken("the root's magic", |img, sb| {
             let i = inode_of(img, "/README");
-            edit_inode(img, sb, i, |d| d.addrs[NDIRECT] = 250)
+            edit_inode(img, sb, i, |d| d.root[0] = 0)
         });
-        broken("indirect entry", |img, sb| {
-            let big = read_inode(img, sb, inode_of(img, "/bin/big"));
-            put_u32(block_mut(img, big.indirect()), 4 * 100, 251);
+        broken("a device with contents", |img, sb| {
+            let i = inode_of(img, "/console");
+            edit_inode(img, sb, i, |d| d.root[20] = 1)
+        });
+        broken("reserved byte 127 is not 0", |img, sb| {
+            let i = inode_of(img, "/README");
+            edit_inode(img, sb, i, |d| d.reserved[47] = 1)
+        });
+        broken("flags 0x2 has undefined bits", |img, sb| {
+            let i = inode_of(img, "/README");
+            edit_inode(img, sb, i, |d| d.flags = 2)
+        });
+        broken("being truncated, with a size of 6", |img, sb| {
+            let i = inode_of(img, "/README");
+            edit_inode(img, sb, i, |d| d.flags = TRUNCATING)
+        });
+        broken("a directory being truncated, with links", |img, sb| {
+            let i = inode_of(img, "/bin/sub");
+            edit_inode(img, sb, i, |d| {
+                d.flags = TRUNCATING;
+                d.size = 0;
+            })
+        });
+        broken("a device with contents", |img, sb| {
+            let i = inode_of(img, "/console");
+            edit_inode(img, sb, i, |d| d.flags = TRUNCATING)
         });
         broken("marked free in the bitmap, but inode", |img, sb| {
-            let readme = read_inode(img, sb, inode_of(img, "/README"));
-            let (blk, byte, mask) = sb.bit_pos(readme.addrs[0]);
+            let readme = first_block(img, sb, inode_of(img, "/README"));
+            let (blk, byte, mask) = sb.bit_pos(readme);
             block_mut(img, blk)[byte] &= !mask;
         });
         broken("(metadata) is marked free", |img, sb| {
@@ -590,9 +662,10 @@ mod tests {
             let inum = inode_of(img, dir);
             let d = read_inode(img, sb, inum);
             let at = i * DIRENT_SIZE;
-            block_mut(img, d.addrs[0])[at..at + DIRENT_SIZE].copy_from_slice(&e.encode());
-            if at >= d.size as usize {
-                edit_inode(img, sb, inum, |d| d.size = (at + DIRENT_SIZE) as u32);
+            let first = first_block(img, sb, inum);
+            block_mut(img, first)[at..at + DIRENT_SIZE].copy_from_slice(&e.encode());
+            if at as u64 >= d.size {
+                edit_inode(img, sb, inum, |d| d.size = (at + DIRENT_SIZE) as u64);
             }
         };
         broken("entry 0 is `x`", |img, sb| {
@@ -633,18 +706,16 @@ mod tests {
         // new entry in the root's block and the new link count.
         let readme = inode_of(&image, "/README");
         let root = read_inode(&image, &sb, ROOT_INODE);
-        let mut dir_block = block(&image, root.addrs[0]).to_vec();
+        let root_block = first_block(&image, &sb, ROOT_INODE);
+        let mut dir_block = block(&image, root_block).to_vec();
         let n = root.size as usize;
         dir_block[n..n + DIRENT_SIZE].copy_from_slice(&Dirent::new(readme as u16, b"again").encode());
         let mut inodes = image.clone();
         edit_inode(&mut inodes, &sb, readme, |d| d.nlink = 3);
-        edit_inode(&mut inodes, &sb, ROOT_INODE, |d| d.size += DIRENT_SIZE as u32);
+        edit_inode(&mut inodes, &sb, ROOT_INODE, |d| d.size += DIRENT_SIZE as u64);
         let (iblock, _) = sb.inode_pos(readme);
         assert_eq!(sb.inode_pos(ROOT_INODE).0, iblock);
-        let slots = [
-            (root.addrs[0], dir_block),
-            (iblock, block(&inodes, iblock).to_vec()),
-        ];
+        let slots = [(root_block, dir_block), (iblock, block(&inodes, iblock).to_vec())];
         for (i, (_, data)) in slots.iter().enumerate() {
             block_mut(&mut image, sb.logstart + 1 + i as u32).copy_from_slice(data);
         }
@@ -683,8 +754,8 @@ mod tests {
     /// Removes the entry `name` from directory `dir` (its first block), as
     /// the kernel's unlink does: the slot's inode number becomes 0.
     fn remove_entry(image: &mut [u8], sb: &Superblock, dir: &str, name: &[u8]) {
-        let d = read_inode(image, sb, inode_of(image, dir));
-        let b = block_mut(image, d.addrs[0]);
+        let first = first_block(image, sb, inode_of(image, dir));
+        let b = block_mut(image, first);
         let i = dirents(b)
             .iter()
             .position(|e| e.inum != 0 && e.name() == name)
@@ -726,8 +797,8 @@ mod tests {
         assert_eq!(r.orphans, 0);
         assert_eq!(r.files, before.files - 2);
         assert_eq!(r.free_inodes, before.free_inodes + 2);
-        // big's 21 blocks and its indirect block.
-        assert_eq!(r.used_blocks, before.used_blocks - 22);
+        // big's 21 blocks.
+        assert_eq!(r.used_blocks, before.used_blocks - 21);
         let d = read_inode(&image, &sb, big);
         assert_eq!(
             d,
@@ -735,7 +806,7 @@ mod tests {
                 kind: T_FREE,
                 nlink: 0,
                 size: 0,
-                addrs: [0; NDIRECT + 1],
+                root: empty_root(),
                 ..big_d
             }
         );
@@ -743,6 +814,81 @@ mod tests {
         let once = image.clone();
         assert_eq!(free_orphans(&mut image), Ok(0));
         assert_eq!(image, once);
+    }
+
+    #[test]
+    fn truncations_are_allowed_and_finished() {
+        // A crash part way through freeing a file's blocks leaves it with
+        // TRUNCATING set, a size of 0, and the blocks still to free: a valid
+        // disk, on which the next mount finishes the job. Here none were
+        // freed yet, and the file still has its name.
+        let mut image = sample();
+        let sb = superblock(&image).unwrap();
+        let before = check(&image).unwrap();
+        let big = inode_of(&image, "/bin/big");
+        edit_inode(&mut image, &sb, big, |d| {
+            d.flags = TRUNCATING;
+            d.size = 0;
+        });
+        let r = check(&image).unwrap();
+        assert_eq!((r.truncating, r.used_blocks), (1, before.used_blocks));
+        // It reads as the mount will leave it: empty.
+        let fs = crate::read::Fs::open(&image).unwrap();
+        assert_eq!(fs.read_file("/bin/big").unwrap(), b"");
+        assert_eq!(finish_truncations(&mut image), Ok(1));
+        let r = check(&image).unwrap();
+        assert_eq!((r.truncating, r.used_blocks), (0, before.used_blocks - 21));
+        let d = read_inode(&image, &sb, big);
+        assert_eq!(
+            (d.kind, d.size, d.flags, d.nlink, d.root),
+            (T_FILE, 0, 0, 1, empty_root())
+        );
+        let once = image.clone();
+        assert_eq!(finish_truncations(&mut image), Ok(0));
+        assert_eq!(image, once);
+    }
+
+    #[test]
+    fn tree_blocks_are_claimed() {
+        // A directory of 6 blocks, each after the files in the block before:
+        // 6 extents, which need a tree block.
+        let mut fs = Mkfs::new(&Options {
+            size: 1200,
+            ninodes: 512,
+            nlog: 8,
+        })
+        .unwrap();
+        for i in 0..6 * 64 - 2 {
+            fs.add_file(&format!("/f{i}"), b"x").unwrap();
+        }
+        let mut image = fs.finish();
+        let sb = superblock(&image).unwrap();
+        let root = read_inode(&image, &sb, ROOT_INODE);
+        let tree = extent::walk(&image, &sb, &root.root).unwrap().tree_blocks;
+        assert_eq!(tree.len(), 1);
+        assert_eq!(check(&image).unwrap().used_blocks, 6 + 1 + 6 * 64 - 2);
+        // A broken tree block is found through its inode.
+        let mut broken_tree = image.clone();
+        put_u32(block_mut(&mut broken_tree, tree[0]), 8, 7);
+        let problems = check(&broken_tree).unwrap_err();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.starts_with("inode 1: a tree block's eh_generation")),
+            "{problems:#?}"
+        );
+        // A file's block that is the root's tree block too.
+        let f = inode_of(&image, "/f7");
+        edit_inode(&mut image, &sb, f, |d| {
+            edit_extent(d, |e| e.start = u64::from(tree[0]))
+        });
+        let problems = check(&image).unwrap_err();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains(&format!("is block {}, which inode 1 uses too", tree[0]))),
+            "{problems:#?}"
+        );
     }
 
     #[test]

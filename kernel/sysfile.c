@@ -216,6 +216,8 @@ int sys_open(struct trap_frame *f) {
             err = -ENODEV;
         } else if (ip->type == T_FILE && writable && fs_readonly) {
             err = -EROFS;
+        } else if (inode_too_big(ip)) {
+            err = -EOVERFLOW;
         }
         if (err < 0) {
             iunlockput(ip);
@@ -231,11 +233,21 @@ int sys_open(struct trap_frame *f) {
     file->ip = ip;
     file->readable = readable;
     file->writable = writable;
-    if ((flags & O_TRUNC) != 0 && writable && ip->type == T_FILE) {
-        itrunc(ip);
-    }
     iunlock(ip);
     end_op();
+    /* Truncated in transactions of its own: freeing a big file's blocks
+     * takes several (itrunc), under the file's write lock, which comes
+     * before begin_op(). Writers wait for it; a reader meanwhile sees the
+     * file empty already. */
+    if ((flags & O_TRUNC) != 0 && writable && ip->type == T_FILE) {
+        acquiresleep(&ip->wlock);
+        begin_op();
+        ilock(ip);
+        itrunc(ip);
+        iunlock(ip);
+        end_op();
+        releasesleep(&ip->wlock);
+    }
     /* The descriptor last, once the file is whole: no other thread can use
      * it half set up. It fails only if another thread took the last free
      * one meanwhile. */

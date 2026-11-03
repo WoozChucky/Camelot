@@ -53,15 +53,18 @@ bool device_has_driver(u32 major) {
     return major != 0 && major < NDEV;
 }
 
-/* The most a write puts in one transaction: an operation may change
- * MAXOPBLOCKS blocks, and a write of this many bytes changes at most the
- * inode, the indirect block, and its data blocks (one more than it fills,
- * when it doesn't start on a block boundary) with as many bitmap blocks
- * (xv6's formula). Bigger writes take several transactions: a crash part
- * way leaves the file with a prefix of the bytes, never a torn block. */
-#define MAXWRITE (((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE)
+/* The most a write puts in one transaction: a page, 4 blocks. A chunk
+ * changes at most its 4 new blocks and the partly written one it starts
+ * in, the new ones' bitmap blocks, the extent tree's rightmost leaf, the
+ * inode, and one split of the tree (a new leaf has room for 83 extents
+ * before the next): 1 + 4 + 4 + 1 + 1 + 11 = MAXOPBLOCKS
+ * (docs/camelot-fs.md, "Limits on transactions"). Bigger writes take
+ * several transactions: a crash part way leaves the file with a prefix of
+ * the bytes, never a torn block. */
+#define MAXWRITE (4 * BSIZE)
 
-_Static_assert(MAXWRITE >= BSIZE && MAXWRITE <= PGSIZE, "a write's chunk fits the bounce page");
+_Static_assert(MAXWRITE <= PGSIZE, "a write's chunk fits the bounce page");
+_Static_assert(1 + 2 * (MAXWRITE / BSIZE) + 1 + 1 + 11 <= MAXOPBLOCKS, "a write's chunk fits an operation");
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
@@ -169,6 +172,9 @@ static int inode_write(struct file *f, pagetable_t pt, u32 src, u32 n) {
     }
     u32 done = 0;
     int err = 0;
+    /* The whole write, against a truncation (and another write) coming in
+     * between its transactions. */
+    acquiresleep(&f->ip->wlock);
     while (done < n) {
         u32 m = MIN(n - done, MAXWRITE);
         /* As in inode_read: never write a chunk that wasn't copied in (the
@@ -194,6 +200,7 @@ static int inode_write(struct file *f, pagetable_t pt, u32 src, u32 n) {
             break; /* the disk is full */
         }
     }
+    releasesleep(&f->ip->wlock);
     kfree(buf);
     return done > 0 || err == 0 ? (int)done : err;
 }
@@ -263,8 +270,9 @@ int filelseek(struct file *f, i32 offset, u32 whence) {
     } else {
         return -EINVAL;
     }
-    /* Files are far smaller than 2^31 bytes (MAXFILE), so none of this
-     * overflows unless `offset` is huge, which the checks below refuse. */
+    /* Files are at most 2^31 - 1 bytes (MAXFILE_BYTES; open refuses
+     * bigger ones), so none of this overflows unless `offset` is huge,
+     * which the checks below refuse. */
     if ((offset > 0 && base > 0x7fffffff - offset) || base + offset < 0 || (u32)(base + offset) > size) {
         return -EINVAL;
     }

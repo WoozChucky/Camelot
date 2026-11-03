@@ -58,6 +58,8 @@ const char *strerror(int err) {
         return "no such system call";
     case ENOTEMPTY:
         return "directory not empty";
+    case EOVERFLOW:
+        return "value too large for defined data type";
     case ENOTSOCK:
         return "not a socket";
     case EDESTADDRREQ:
