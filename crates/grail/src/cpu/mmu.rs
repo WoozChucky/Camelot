@@ -244,7 +244,9 @@ impl Hart {
     /// whichever hart holds it, and a store to a device breaks this hart's, since it may
     /// start a DMA into RAM (see [`super::Reservation`]). An A/D update counts because
     /// software may be updating that PTE with `lr`/`sc`, and its `sc` must not overwrite
-    /// the bit the hardware just set. 8 bytes are written only to RAM or VRAM.
+    /// the bit the hardware just set. Only the low `size` bytes of `val` reach the bus
+    /// (a device sees the byte an `sb` stored, not the whole register). 8 bytes are
+    /// written only to RAM or VRAM.
     pub(super) fn write_phys(
         &mut self,
         bus: &mut Bus,
@@ -254,7 +256,8 @@ impl Hart {
     ) -> Result<(), BusFault> {
         let addr = bus_addr(paddr, size)?;
         if size < 8 {
-            bus.write(addr, size, val as u32)?;
+            let low_bytes = (1u64 << (8 * size)) - 1;
+            bus.write(addr, size, (val & low_bytes) as u32)?;
         } else if bus.is_memory(addr, 8) {
             bus.write(addr, 4, val as u32)?;
             bus.write(addr + 4, 4, (val >> 32) as u32)?;

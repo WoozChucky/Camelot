@@ -523,3 +523,28 @@ fn an_elf64_program_makes_the_machine_rv64() {
         Err("an RV32 program (ELF32) cannot run on an RV64 machine".into())
     );
 }
+
+/// `sb` and `sh` hand the bus only the bytes they store, never the rest of the
+/// register: a device (the test device here) or the riscv-tests `tohost` word sees
+/// exactly what was written.
+#[test]
+fn narrow_stores_write_only_their_bytes() {
+    for xlen in [Xlen::Rv32, Xlen::Rv64] {
+        let mut m = machine(xlen);
+        // sb of 0x5555 writes 0x55 to the test device: not its exit code 0x5555.
+        set(&mut m, A1, grail::bus::TEST_DEV_BASE.into());
+        set(&mut m, A2, 0x5555);
+        run(&mut m, "sb a2, 0(a1)", s_type(0, A2, A1, 0));
+        assert_eq!(m.exit_code(), None, "{xlen:?}");
+        run(&mut m, "sh a2, 0(a1)", s_type(0, A2, A1, 1));
+        assert_eq!(m.exit_code(), Some(0), "{xlen:?}: the halfword is 0x5555");
+
+        // sb of 0x100 writes a zero byte to tohost, which does not stop the machine.
+        let mut m = machine(xlen);
+        m.cpu.bus.tohost = Some(DATA);
+        set(&mut m, A1, DATA.into());
+        set(&mut m, A2, 0x100);
+        run(&mut m, "sb a2, 0(a1)", s_type(0, A2, A1, 0));
+        assert_eq!(m.exit_code(), None, "{xlen:?}");
+    }
+}
