@@ -54,10 +54,12 @@ const PMPADDR_RV64_MASK: u64 = (1 << 54) - 1;
 /// RV64 `satp`: MODE [63:60] and PPN [43:0] (spec section 5). There are no ASIDs, so
 /// the ASID field [59:44] reads 0, and physical addresses are 48 bits, so the PPN keeps
 /// its low 36 bits (bits 43:36 read 0).
-const SATP_RV64_MODE_SHIFT: u32 = 60;
-const SATP_RV64_PPN: u64 = (1 << 36) - 1;
-/// `satp`'s Bare mode: no translation.
+pub(super) const SATP_RV64_MODE_SHIFT: u32 = 60;
+pub(super) const SATP_RV64_PPN: u64 = (1 << 36) - 1;
+/// `satp`'s modes on RV64: Bare (no translation), Sv39 and Sv48.
 const SATP_MODE_BARE: u64 = 0;
+pub(super) const SATP_MODE_SV39: u64 = 8;
+pub(super) const SATP_MODE_SV48: u64 = 9;
 
 #[derive(Default)]
 pub struct Csrs {
@@ -271,13 +273,14 @@ impl Hart {
     /// The new `satp` after a write of `v` (WARL). RV32: any value, MODE [31] picking
     /// Bare or Sv32. RV64: a write whose MODE the hart does not implement changes
     /// nothing, as the privileged spec requires; the others keep MODE and the PPN bits
-    /// a 48-bit physical address has (spec section 5). Grail's RV64 harts implement Bare
-    /// only until they learn the Sv39 and Sv48 page walks (#146).
+    /// a 48-bit physical address has (spec section 5): Bare, Sv39 and Sv48.
     fn warl_satp(&self, v: u64) -> u64 {
         match self.xlen {
             Xlen::Rv32 => v,
             Xlen::Rv64 => match v >> SATP_RV64_MODE_SHIFT {
-                SATP_MODE_BARE => v & ((0xf << SATP_RV64_MODE_SHIFT) | SATP_RV64_PPN),
+                SATP_MODE_BARE | SATP_MODE_SV39 | SATP_MODE_SV48 => {
+                    v & ((0xf << SATP_RV64_MODE_SHIFT) | SATP_RV64_PPN)
+                }
                 _ => self.csr.satp,
             },
         }

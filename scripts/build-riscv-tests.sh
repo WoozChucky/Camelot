@@ -4,7 +4,7 @@
 #
 # Clone riscv-tests with its env submodule (git clone --recursive) at the
 # commit named in tests/riscv-tests/README.md. With no suites given, builds
-# rv32ui rv32um rv32ua rv32mi rv32si rv64ui rv64um rv64ua rv64mi.
+# rv32ui rv32um rv32ua rv32mi rv32si rv64ui rv64um rv64ua rv64mi rv64si.
 #
 # Writes each RV32 test as an ELF linked by ld.lld (<out dir>/rv32ui-p-add, ...)
 # and, for merlin-ld's relink test, the object it was linked from
@@ -19,7 +19,7 @@
 # -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany.
 set -u
 RT=$(realpath "$1"); OUT=$(realpath -m "$2"); shift 2; TMP=$(mktemp -d)
-SUITES=${*:-rv32ui rv32um rv32ua rv32mi rv32si rv64ui rv64um rv64ua rv64mi}
+SUITES=${*:-rv32ui rv32um rv32ua rv32mi rv32si rv64ui rv64um rv64ua rv64mi rv64si}
 for s in $SUITES; do
   case $s in
     rv32ua) FLAGS="--target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32"; DIR=$OUT ;;
