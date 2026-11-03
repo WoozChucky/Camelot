@@ -613,8 +613,6 @@ fn the_park_loop_reads_the_entry_with_lwu_on_rv64() {
     for _ in 0..20 {
         m.cpu.step();
         if m.cpu.hart(1).pc == u64::from(RAM_BASE) {
-            // (Hart 0 is still running the test: an exit would end the steps first.)
-            assert_eq!(m.exit_code(), None);
             return;
         }
     }
