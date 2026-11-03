@@ -548,3 +548,26 @@ fn narrow_stores_write_only_their_bytes() {
         assert_eq!(m.exit_code(), None, "{xlen:?}");
     }
 }
+
+/// The disk loader and the boot chain it starts are RV32 code until #151: an RV64
+/// machine refuses to boot from disk rather than running them.
+#[test]
+fn an_rv64_machine_does_not_boot_from_disk_yet() {
+    let disk = || grail::DiskConfig::memory(vec![0; 1 << 20]);
+    let mut m = Machine::new(MachineConfig {
+        xlen: Xlen::Rv64,
+        disks: vec![disk()],
+        ..MachineConfig::default()
+    })
+    .unwrap();
+    assert_eq!(
+        m.boot_from_disk(),
+        Err("booting from disk takes an RV32 machine: its boot code is RV32".into())
+    );
+    let mut m = Machine::new(MachineConfig {
+        disks: vec![disk()],
+        ..MachineConfig::default()
+    })
+    .unwrap();
+    assert_eq!(m.boot_from_disk(), Ok(()));
+}
