@@ -282,6 +282,7 @@ Unmapped accesses raise access-fault exceptions. Instructions and page tables li
 - **Faults:**
   - a superpage whose PPN is not aligned to its size is a page fault;
   - bits 63:54 of a PTE (Svnapot's N, Svpbmt's PBMT and the reserved bits) must be 0, else a page fault, since neither extension is implemented;
+  - a pointer to the next level's table (R, W and X clear) with A, D or U set is a page fault: those bits are reserved in a pointer (Sv32 too);
   - a non-canonical virtual address faults before the walk (section 6).
 - **A/D:** the walker sets A and D in memory itself, atomically with respect to the harts.
 - **No TLB:** every access walks the tables, so `sfence.vma` only orders.

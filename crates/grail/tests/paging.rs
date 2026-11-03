@@ -16,6 +16,7 @@ const V: u64 = 1 << 0;
 const R: u64 = 1 << 1;
 const W: u64 = 1 << 2;
 const X: u64 = 1 << 3;
+const U: u64 = 1 << 4;
 const A: u64 = 1 << 6;
 const D: u64 = 1 << 7;
 
@@ -233,6 +234,24 @@ fn reserved_pte_bits_fault() {
             let pointer = p.pte(entry);
             write64(&mut p.bus, entry, pointer | 1 << bit);
             p.assert_page_faults(VA, &format!("{sv:?}, pointer bit {bit}"));
+        }
+        // A pointer's A, D and U bits are reserved too, at every level: they only mean
+        // something in a leaf.
+        for level in 1..sv.levels() {
+            for bit in [A, D, U] {
+                let mut p = Paged::new(sv);
+                p.map(VA, 0, RAM, RWXAD);
+                let mut table = ROOT;
+                for l in (level..sv.levels()).rev() {
+                    let entry = table + vpn(VA, l) * 8;
+                    let pointer = p.pte(entry);
+                    if l == level {
+                        write64(&mut p.bus, entry, pointer | bit);
+                    }
+                    table = (pointer >> 10) << 12;
+                }
+                p.assert_page_faults(VA, &format!("{sv:?}, level {level} pointer, {bit:#x}"));
+            }
         }
         // The PPN reaches bit 53: a page above the 48-bit physical address width
         // translates, and the access to it is the access fault (the next test).

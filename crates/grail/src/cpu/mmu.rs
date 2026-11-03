@@ -27,6 +27,11 @@ const PTE_U: u64 = 1 << 4;
 const PTE_A: u64 = 1 << 6;
 const PTE_D: u64 = 1 << 7;
 
+/// The bits of a pointer PTE (one with R, W and X clear) reserved for future standard
+/// use, which the privileged spec's walk faults on in every mode: A, D and U, which
+/// only mean something in a leaf.
+const POINTER_RESERVED: u64 = PTE_A | PTE_D | PTE_U;
+
 /// An Sv39 or Sv48 PTE's PPN, bits 53:10 (44 bits).
 const PTE_PPN_SV48: u64 = (1 << 44) - 1;
 /// Bits 63:54 of an Sv39 or Sv48 PTE: Svnapot's N, Svpbmt's PBMT and reserved bits,
@@ -164,8 +169,9 @@ fn walk(bus: &Bus, scheme: Scheme, root: u64, vaddr: u64) -> Result<Leaf, WalkEr
                 paddr,
             });
         }
-        // A pointer to the next level's table; at level 0 there is none.
-        if level == 0 {
+        // A pointer to the next level's table; at level 0 there is none. A pointer's
+        // A, D and U bits are reserved: one with any of them set is a page fault.
+        if level == 0 || pte & POINTER_RESERVED != 0 {
             return Err(WalkError::PageFault);
         }
         level -= 1;
