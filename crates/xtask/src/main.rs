@@ -512,6 +512,19 @@ fn ld_fixtures(k: KernelArgs) -> ExitCode {
 fn kernel(k: KernelArgs) -> ExitCode {
     let root = repo_root();
     let kernel_dir = root.join("kernel");
+    // The C assembler's tables, from the host tools' (as_tables.rs): before
+    // the user programs are built.
+    match xtask::as_tables::write(&root) {
+        Ok(wrote) => {
+            for file in wrote {
+                eprintln!("wrote {file}");
+            }
+        }
+        Err(e) => {
+            eprintln!("xtask: {e}");
+            return ExitCode::from(1);
+        }
+    }
     // The tools run inside kernel/, so a relative -o must be made absolute here.
     let out = match k.out.map(std::path::absolute).transpose() {
         Ok(out) => out,

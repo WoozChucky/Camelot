@@ -302,8 +302,10 @@ fn without_log_slots(image: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The programs the kernel builds in (not the disk-only ones), which its
+/// self-test looks for in /bin.
 fn programs() -> usize {
-    xtask::userprogs::program_names(&xtask::userprogs::user_dir(&repo_root()))
+    xtask::userprogs::embedded_names(&xtask::userprogs::user_dir(&repo_root()))
         .unwrap()
         .len()
 }

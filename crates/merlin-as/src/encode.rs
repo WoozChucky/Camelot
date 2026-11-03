@@ -53,22 +53,42 @@ use excalibur::opcode::{
 };
 
 // funct3 values the pseudo-instructions need by name.
-const ADDI: u32 = 0b000;
-const SLTIU: u32 = 0b011;
-const XORI: u32 = 0b100;
-const ANDI: u32 = 0b111;
-const SLLI: u32 = 0b001;
-const BEQ: u32 = 0b000;
-const BNE: u32 = 0b001;
-const BLT: u32 = 0b100;
-const BGE: u32 = 0b101;
-const BLTU: u32 = 0b110;
-const BGEU: u32 = 0b111;
-const CSRRW: u32 = 0b001;
-const CSRRS: u32 = 0b010;
-const CSRRC: u32 = 0b011;
+pub const ADDI: u32 = 0b000;
+pub const SLTIU: u32 = 0b011;
+pub const XORI: u32 = 0b100;
+pub const ANDI: u32 = 0b111;
+pub const SLLI: u32 = 0b001;
+pub const BEQ: u32 = 0b000;
+pub const BNE: u32 = 0b001;
+pub const BLT: u32 = 0b100;
+pub const BGE: u32 = 0b101;
+pub const BLTU: u32 = 0b110;
+pub const BGEU: u32 = 0b111;
+pub const CSRRW: u32 = 0b001;
+pub const CSRRS: u32 = 0b010;
+pub const CSRRC: u32 = 0b011;
 /// The immediate CSR forms (`csrrwi` ...) are the register forms with bit 2 of funct3 set.
-const CSR_IMM: u32 = 0b100;
+pub const CSR_IMM: u32 = 0b100;
+
+/// The funct3 values above, by name, for tables generated from these
+/// (the C assembler's, `crates/xtask/src/as_tables.rs`).
+pub const NAMED_FUNCT3: &[(&str, u32)] = &[
+    ("ADDI", ADDI),
+    ("SLTIU", SLTIU),
+    ("XORI", XORI),
+    ("ANDI", ANDI),
+    ("SLLI", SLLI),
+    ("BEQ", BEQ),
+    ("BNE", BNE),
+    ("BLT", BLT),
+    ("BGE", BGE),
+    ("BLTU", BLTU),
+    ("BGEU", BGEU),
+    ("CSRRW", CSRRW),
+    ("CSRRS", CSRRS),
+    ("CSRRC", CSRRC),
+    ("CSR_IMM", CSR_IMM),
+];
 
 // Registers the pseudo-instructions use.
 const ZERO: Reg = 0;
@@ -477,119 +497,148 @@ fn fence_set(op: &Operand, ctx: &Ctx) -> Result<u32, String> {
 
 // ===================================================================
 // Mnemonic tables: (funct3, funct7) for each real instruction, by format
+//
+// Data rather than code, so that `cargo xtask kernel` can write the same
+// tables into the C header of the assembler that runs on Camelot
+// (`kernel/user/as/tables.h`), which then can't drift from this one.
 // ===================================================================
 
-/// OP: `rd = rs1 <op> rs2`. The M extension shares the opcode with funct7 = 1.
-fn op_funct(m: &str) -> Option<(u32, u32)> {
-    Some(match m {
-        "add" => (0b000, 0b0000000),
-        "sub" => (0b000, 0b0100000),
-        "sll" => (0b001, 0b0000000),
-        "slt" => (0b010, 0b0000000),
-        "sltu" => (0b011, 0b0000000),
-        "xor" => (0b100, 0b0000000),
-        "srl" => (0b101, 0b0000000),
-        "sra" => (0b101, 0b0100000),
-        "or" => (0b110, 0b0000000),
-        "and" => (0b111, 0b0000000),
-        "mul" => (0b000, 0b0000001),
-        "mulh" => (0b001, 0b0000001),
-        "mulhsu" => (0b010, 0b0000001),
-        "mulhu" => (0b011, 0b0000001),
-        "div" => (0b100, 0b0000001),
-        "divu" => (0b101, 0b0000001),
-        "rem" => (0b110, 0b0000001),
-        "remu" => (0b111, 0b0000001),
-        _ => return None,
-    })
-}
+/// OP: `rd = rs1 <op> rs2`, (mnemonic, funct3, funct7). The M extension
+/// shares the opcode with funct7 = 1.
+pub const OP_FUNCT: &[(&str, u32, u32)] = &[
+    ("add", 0b000, 0b0000000),
+    ("sub", 0b000, 0b0100000),
+    ("sll", 0b001, 0b0000000),
+    ("slt", 0b010, 0b0000000),
+    ("sltu", 0b011, 0b0000000),
+    ("xor", 0b100, 0b0000000),
+    ("srl", 0b101, 0b0000000),
+    ("sra", 0b101, 0b0100000),
+    ("or", 0b110, 0b0000000),
+    ("and", 0b111, 0b0000000),
+    ("mul", 0b000, 0b0000001),
+    ("mulh", 0b001, 0b0000001),
+    ("mulhsu", 0b010, 0b0000001),
+    ("mulhu", 0b011, 0b0000001),
+    ("div", 0b100, 0b0000001),
+    ("divu", 0b101, 0b0000001),
+    ("rem", 0b110, 0b0000001),
+    ("remu", 0b111, 0b0000001),
+];
 
-/// OP-IMM with a 12-bit immediate: `rd = rs1 <op> imm`.
-fn op_imm_funct3(m: &str) -> Option<u32> {
-    Some(match m {
-        "addi" => ADDI,
-        "slti" => 0b010,
-        "sltiu" => SLTIU,
-        "xori" => XORI,
-        "ori" => 0b110,
-        "andi" => ANDI,
-        _ => return None,
-    })
-}
+/// OP-IMM with a 12-bit immediate: `rd = rs1 <op> imm`, (mnemonic, funct3).
+pub const OP_IMM_FUNCT3: &[(&str, u32)] = &[
+    ("addi", ADDI),
+    ("slti", 0b010),
+    ("sltiu", SLTIU),
+    ("xori", XORI),
+    ("ori", 0b110),
+    ("andi", ANDI),
+];
 
-/// OP-IMM shifts: the immediate is a 5-bit shift amount, and the top 7 bits
-/// of the I-type immediate act as a funct7 (0100000 selects arithmetic).
-fn shift_funct(m: &str) -> Option<(u32, u32)> {
-    Some(match m {
-        "slli" => (SLLI, 0b0000000),
-        "srli" => (0b101, 0b0000000),
-        "srai" => (0b101, 0b0100000),
-        _ => return None,
-    })
-}
+/// OP-IMM shifts, (mnemonic, funct3, funct7): the immediate is a 5-bit shift
+/// amount, and the top 7 bits of the I-type immediate act as a funct7
+/// (0100000 selects arithmetic).
+pub const SHIFT_FUNCT: &[(&str, u32, u32)] = &[
+    ("slli", SLLI, 0b0000000),
+    ("srli", 0b101, 0b0000000),
+    ("srai", 0b101, 0b0100000),
+];
 
-fn load_funct3(m: &str) -> Option<u32> {
-    Some(match m {
-        "lb" => 0b000,
-        "lh" => 0b001,
-        "lw" => 0b010,
-        "lbu" => 0b100,
-        "lhu" => 0b101,
-        _ => return None,
-    })
-}
+/// Loads, (mnemonic, funct3).
+pub const LOAD_FUNCT3: &[(&str, u32)] = &[
+    ("lb", 0b000),
+    ("lh", 0b001),
+    ("lw", 0b010),
+    ("lbu", 0b100),
+    ("lhu", 0b101),
+];
 
-fn store_funct3(m: &str) -> Option<u32> {
-    Some(match m {
-        "sb" => 0b000,
-        "sh" => 0b001,
-        "sw" => 0b010,
-        _ => return None,
-    })
-}
+/// Stores, (mnemonic, funct3).
+pub const STORE_FUNCT3: &[(&str, u32)] = &[("sb", 0b000), ("sh", 0b001), ("sw", 0b010)];
 
-fn branch_funct3(m: &str) -> Option<u32> {
-    Some(match m {
-        "beq" => BEQ,
-        "bne" => BNE,
-        "blt" => BLT,
-        "bge" => BGE,
-        "bltu" => BLTU,
-        "bgeu" => BGEU,
-        _ => return None,
-    })
-}
+/// Conditional branches, (mnemonic, funct3).
+pub const BRANCH_FUNCT3: &[(&str, u32)] = &[
+    ("beq", BEQ),
+    ("bne", BNE),
+    ("blt", BLT),
+    ("bge", BGE),
+    ("bltu", BLTU),
+    ("bgeu", BGEU),
+];
 
-/// The six `csrr*` instructions: funct3 (bit 2 set for the immediate forms).
-fn csr_funct3(m: &str) -> Option<u32> {
-    Some(match m {
-        "csrrw" => CSRRW,
-        "csrrs" => CSRRS,
-        "csrrc" => CSRRC,
-        "csrrwi" => CSRRW | CSR_IMM,
-        "csrrsi" => CSRRS | CSR_IMM,
-        "csrrci" => CSRRC | CSR_IMM,
-        _ => return None,
-    })
-}
+/// The six `csrr*` instructions, (mnemonic, funct3): bit 2 is set for the
+/// immediate forms.
+pub const CSR_FUNCT3: &[(&str, u32)] = &[
+    ("csrrw", CSRRW),
+    ("csrrs", CSRRS),
+    ("csrrc", CSRRC),
+    ("csrrwi", CSRRW | CSR_IMM),
+    ("csrrsi", CSRRS | CSR_IMM),
+    ("csrrci", CSRRC | CSR_IMM),
+];
 
 /// A extension: funct5 (bits [31:27]) of each `.w` mnemonic, without its
 /// ordering suffix.
-fn atomic_funct5(m: &str) -> Option<u32> {
-    Some(match m {
-        "lr.w" => 0b00010,
-        "sc.w" => 0b00011,
-        "amoswap.w" => 0b00001,
-        "amoadd.w" => 0b00000,
-        "amoxor.w" => 0b00100,
-        "amoand.w" => 0b01100,
-        "amoor.w" => 0b01000,
-        "amomin.w" => 0b10000,
-        "amomax.w" => 0b10100,
-        "amominu.w" => 0b11000,
-        "amomaxu.w" => 0b11100,
-        _ => return None,
-    })
+pub const ATOMIC_FUNCT5: &[(&str, u32)] = &[
+    ("lr.w", 0b00010),
+    ("sc.w", 0b00011),
+    ("amoswap.w", 0b00001),
+    ("amoadd.w", 0b00000),
+    ("amoxor.w", 0b00100),
+    ("amoand.w", 0b01100),
+    ("amoor.w", 0b01000),
+    ("amomin.w", 0b10000),
+    ("amomax.w", 0b10100),
+    ("amominu.w", 0b11000),
+    ("amomaxu.w", 0b11100),
+];
+
+/// SYSTEM instructions with no operands: their funct12 (the I-type immediate).
+pub const SYSTEM_FUNCT12: &[(&str, u32)] = &[
+    ("ecall", 0x000),
+    ("ebreak", 0x001),
+    ("sret", 0x102),
+    ("wfi", 0x105),
+    ("mret", 0x302),
+];
+
+/// The entry of `table` for mnemonic `m`.
+fn find<T: Copy>(table: &[(&str, T)], m: &str) -> Option<T> {
+    table.iter().find(|e| e.0 == m).map(|e| e.1)
+}
+
+/// The entry of a three-column table for mnemonic `m`.
+fn find2(table: &[(&str, u32, u32)], m: &str) -> Option<(u32, u32)> {
+    table.iter().find(|e| e.0 == m).map(|e| (e.1, e.2))
+}
+
+fn op_funct(m: &str) -> Option<(u32, u32)> {
+    find2(OP_FUNCT, m)
+}
+
+fn op_imm_funct3(m: &str) -> Option<u32> {
+    find(OP_IMM_FUNCT3, m)
+}
+
+fn shift_funct(m: &str) -> Option<(u32, u32)> {
+    find2(SHIFT_FUNCT, m)
+}
+
+fn load_funct3(m: &str) -> Option<u32> {
+    find(LOAD_FUNCT3, m)
+}
+
+fn store_funct3(m: &str) -> Option<u32> {
+    find(STORE_FUNCT3, m)
+}
+
+fn branch_funct3(m: &str) -> Option<u32> {
+    find(BRANCH_FUNCT3, m)
+}
+
+fn csr_funct3(m: &str) -> Option<u32> {
+    find(CSR_FUNCT3, m)
 }
 
 /// Splits an A mnemonic into its base (`amoadd.w`) and its ordering bits
@@ -599,19 +648,11 @@ fn atomic(m: &str) -> Option<(&str, u32, u32)> {
         .into_iter()
         .find_map(|(suffix, bits)| Some((m.strip_suffix(suffix)?, bits)))
         .unwrap_or((m, 0b00));
-    Some((base, atomic_funct5(base)?, aqrl))
+    Some((base, find(ATOMIC_FUNCT5, base)?, aqrl))
 }
 
-/// SYSTEM instructions with no operands: their funct12 (the I-type immediate).
 fn system_funct12(m: &str) -> Option<i32> {
-    Some(match m {
-        "ecall" => 0x000,
-        "ebreak" => 0x001,
-        "sret" => 0x102,
-        "wfi" => 0x105,
-        "mret" => 0x302,
-        _ => return None,
-    })
+    find(SYSTEM_FUNCT12, m).map(|f| f as i32)
 }
 
 // ===================================================================

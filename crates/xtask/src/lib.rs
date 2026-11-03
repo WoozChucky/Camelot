@@ -26,6 +26,7 @@
 //!   and generates the assembly that embeds them in the kernel (`userprogs.s`,
 //!   made at build time, not committed).
 
+pub mod as_tables;
 pub mod boot;
 pub mod examples;
 pub mod fs;

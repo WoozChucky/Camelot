@@ -1,6 +1,7 @@
 # Camelot's user programs
 
-Every `X.c` or `X.s` here is a program called `X`. They run in U-mode on
+Every `X.c` or `X.s` here is a program called `X`, and so is every
+subdirectory `X/` but `lib/` (a program of several files: `as/`). They run in U-mode on
 the system calls of `docs/camelot-syscalls.md`, declared in `user.h` with
 the C library of `lib/` (see `lib/README.md`). Built by merlin, merlin-as
 and merlin-ld (`cargo xtask kernel`, which embeds them in the kernel for
@@ -49,6 +50,12 @@ $ kill 12
 $ wait
 [12] sleep: exit -1
 ```
+
+## Tools
+
+| Program | Usage | What it does |
+|---|---|---|
+| `as` | `as [-o OUT.o] FILE.s` | the assembler, merlin-as rewritten in C (`as/`): the same language, the same object byte for byte, the same error messages (`FILE:LINE: error: ...`); no line tables (`.file N`, `.loc`) yet. The first step of self-hosting: section 10, "Self-hosting", of the spec. Only in `/bin` of the root image: the kernel does not build it in (it needs files) |
 
 ## Network programs
 
