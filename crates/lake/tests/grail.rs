@@ -196,7 +196,7 @@ fn a_server_that_goes_away_is_an_io_error() {
         for (reg, val) in [
             (block::REG_SECTOR, 1),
             (block::REG_COUNT, 2),
-            (block::REG_DMA, RAM_BASE),
+            (block::REG_DMA, RAM_BASE as u32),
             (block::REG_CMD, cmd),
         ] {
             dev.write(reg, 4, val, &mut ram).unwrap();
@@ -319,7 +319,7 @@ fn command(dev: &mut BlockDevice, ram: &mut [u8], sector: u32, cmd: u32) -> u32 
     for (reg, val) in [
         (block::REG_SECTOR, sector),
         (block::REG_COUNT, 1),
-        (block::REG_DMA, RAM_BASE),
+        (block::REG_DMA, RAM_BASE as u32),
         (block::REG_CMD, cmd),
     ] {
         dev.write(reg, 4, val, ram).unwrap();

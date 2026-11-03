@@ -46,8 +46,7 @@ fn main() -> ExitCode {
     let tracing = o.trace;
     let mut trace = |cpu: &grail::cpu::Cpu| {
         if tracing {
-            // The bus reads 32-bit addresses until #147.
-            let word = u32::try_from(cpu.pc).ok().and_then(|pc| cpu.bus.peek(pc));
+            let word = cpu.bus.peek(cpu.pc);
             let text = word.map_or("<unmapped>".to_string(), |w| {
                 excalibur::decode(w, cpu.xlen()).to_string()
             });

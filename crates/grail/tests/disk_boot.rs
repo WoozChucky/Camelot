@@ -93,21 +93,21 @@ fn loads_the_boot_block_and_jumps_to_it() {
     // auipc t0, 0: where it runs. Then stop with exit code 0.
     let block = boot_block(&[auipc(T0), HALT]);
     let mut m = machine(1, disk(&block, 8));
-    assert_eq!(m.cpu.bus.peek(BOOT_ROM_BASE + 16), Some(DISK_BOOT_PC));
+    assert_eq!(m.cpu.bus.peek(BOOT_ROM_BASE + 16), Some(DISK_BOOT_PC as u32));
     assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
     assert_eq!(uart(&m), "", "nothing to say");
     let h = m.cpu.hart(0);
     assert_eq!(h.x[T0 as usize] as u32, LOAD_ADDR, "the last 64 KiB of RAM");
-    assert_eq!(boot::boot_block_addr(RAM), Some(LOAD_ADDR));
+    assert_eq!(boot::boot_block_addr(RAM), Some(LOAD_ADDR.into()));
     assert_eq!(h.x[A0 as usize], 0, "the hart id");
-    assert_eq!(h.x[A1 as usize], u64::from(SYSINFO_BASE));
-    assert_eq!(h.x[A2 as usize], u64::from(BLK_BASE), "disk 0's registers");
+    assert_eq!(h.x[A1 as usize], SYSINFO_BASE);
+    assert_eq!(h.x[A2 as usize], BLK_BASE, "disk 0's registers");
     // The whole block is in RAM, and nothing after it.
     let at = (LOAD_ADDR - 0x8000_0000) as usize;
     assert_eq!(&m.cpu.bus.ram[at..at + BOOT_BLOCK_SIZE], &block[..]);
     assert!(m.cpu.bus.ram[at + BOOT_BLOCK_SIZE..].iter().all(|&b| b == 0));
     // The ROM's trap handler is still in place, and the disk's DONE acknowledged.
-    assert!((DISK_BOOT_PC..BOOT_ROM_BASE + 0x1000).contains(&(h.csr.mtvec as u32)));
+    assert!((DISK_BOOT_PC..BOOT_ROM_BASE + 0x1000).contains(&h.csr.mtvec));
     assert_eq!(m.cpu.bus.read(BLK_BASE + 0x18, 4), Ok(0));
 }
 
@@ -258,7 +258,7 @@ fn the_boot_block_can_start_the_other_harts() {
     }
     let h1 = m.cpu.hart(1);
     assert!(
-        h1.waiting && (PARK_PC..PARK_PC + 0x40).contains(&(h1.pc as u32)),
+        h1.waiting && (PARK_PC..PARK_PC + 0x40).contains(&h1.pc),
         "parked again"
     );
     assert_eq!(m.cpu.bus.read(0x0200_0004, 4), Ok(0), "the early IPI was taken");
@@ -574,6 +574,6 @@ fn the_bootloader_loads_segments_and_hands_the_entry_word_over() {
     assert_eq!(m.cpu.bus.peek(BOOT_ROM_BASE + 16), Some(BASE));
     let (h0, h1) = (m.cpu.hart(0), m.cpu.hart(1));
     assert_eq!(h0.pc, u64::from(BASE + 0x10), "hart 0 waits at its j .");
-    assert_eq!((h0.x[A0 as usize], h0.x[A1 as usize]), (0, SYSINFO_BASE.into()));
+    assert_eq!((h0.x[A0 as usize], h0.x[A1 as usize]), (0, SYSINFO_BASE));
     assert_eq!(h1.x[A1 as usize], 0x11, "hart 1 ran the kernel with a0 = 1");
 }

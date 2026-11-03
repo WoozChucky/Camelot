@@ -293,13 +293,16 @@ fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     assert_eq!(equ(&rom, "BOOT_SIG") as usize, boot::MAGIC_AT);
     assert_eq!(equ(&rom, "BOOT_AREA"), grail::boot::BOOT_AREA_SIZE);
     assert_eq!(equ(&rom, "EXIT_BOOT_FAILED"), grail::boot::EXIT_BOOT_FAILED);
-    assert_eq!(equ(&rom, "PARK_PC"), grail::bus::PARK_PC);
+    assert_eq!(u64::from(equ(&rom, "PARK_PC")), grail::bus::PARK_PC);
     assert!(spec.contains("exit code 0xFD") && spec.contains("0x544F_4F42"));
     // The fields the bootloader reads are where mkfs writes them.
     assert_eq!(equ(&loader, "KERNEL_SECTOR") as usize, boot::KERNEL_SECTOR_AT);
     assert_eq!(equ(&loader, "KERNEL_SECTORS") as usize, boot::KERNEL_SECTORS_AT);
     assert_eq!(equ(&loader, "HEADERS_SIZE") as usize, boot::KERNEL_HEADERS);
-    assert_eq!(equ(&loader, "BOOT_ENTRY"), grail::boot::BOOT_ENTRY_ADDR);
+    assert_eq!(
+        u64::from(equ(&loader, "BOOT_ENTRY")),
+        grail::boot::BOOT_ENTRY_ADDR
+    );
     assert_eq!(equ(&loader, "RAM_BASE"), boot::RAM_BASE);
     for (at, field) in [
         (boot::KERNEL_SECTOR_AT, "kernel_sector"),

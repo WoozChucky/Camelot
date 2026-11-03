@@ -189,7 +189,7 @@ impl Shootdowns {
             ipi: sym(elf, "machine_ipi"),
             sfence: sym(elf, "sfence_vma"),
             serve: function("tlb_serve"),
-            kernel_pt: m.cpu.bus.peek(sym(elf, "kernel_pagetable")).unwrap(),
+            kernel_pt: m.cpu.bus.peek(sym(elf, "kernel_pagetable").into()).unwrap(),
             cpus: sym(elf, "cpus"),
             harts,
             active: [None; grail::MAX_HARTS],

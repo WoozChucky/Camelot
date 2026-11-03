@@ -302,8 +302,13 @@ fn bad_disks_are_machine_errors() {
 }
 
 const MEIP: u64 = 1 << IRQ_M_EXT;
-const ENABLE0: u32 = PLIC_BASE + 0x2000;
-const CLAIM0: u32 = PLIC_BASE + 0x20_0004;
+const ENABLE0: u64 = PLIC_BASE + 0x2000;
+const CLAIM0: u64 = PLIC_BASE + 0x20_0004;
+
+/// The address of register `off` of the disk whose page is at `disk`.
+fn disk_reg(disk: u64, off: u32) -> u64 {
+    disk + u64::from(off)
+}
 
 #[test]
 fn completion_interrupt_traps_into_m_mode() {
@@ -315,28 +320,30 @@ fn completion_interrupt_traps_into_m_mode() {
     ]);
     let mut m = Machine::new(config).unwrap();
     m.cpu.bus.load(RAM_BASE, &[0x13, 0, 0, 0].repeat(16)).unwrap();
-    m.cpu.pc = RAM_BASE.into();
-    m.cpu.csr.mtvec = (RAM_BASE + 0x20).into();
+    m.cpu.pc = RAM_BASE;
+    m.cpu.csr.mtvec = RAM_BASE + 0x20;
     m.cpu.csr.mie = MEIP;
     m.cpu.csr.mstatus |= MSTATUS_MIE;
     let disk1 = BLK_BASE + BLK_SIZE;
-    let irq = BLK_IRQ + 1;
+    let irq = u64::from(BLK_IRQ + 1);
     let bus = &mut m.cpu.bus;
     bus.write(PLIC_BASE + 4 * irq, 4, 1).unwrap();
     bus.write(ENABLE0, 4, 1 << irq).unwrap();
-    bus.write(disk1 + block::REG_CTRL, 4, block::CTRL_IRQ_ENABLE)
+    bus.write(disk_reg(disk1, block::REG_CTRL), 4, block::CTRL_IRQ_ENABLE.into())
         .unwrap();
     m.cpu.step();
     assert_eq!(m.cpu.csr.mcause, 0, "nothing to interrupt yet");
 
     let bus = &mut m.cpu.bus;
-    bus.write(disk1 + block::REG_SECTOR, 4, 1).unwrap();
-    bus.write(disk1 + block::REG_COUNT, 4, 1).unwrap();
-    bus.write(disk1 + block::REG_DMA, 4, RAM_BASE + 0x800).unwrap();
-    bus.write(disk1 + block::REG_CMD, 4, block::CMD_READ).unwrap();
+    bus.write(disk_reg(disk1, block::REG_SECTOR), 4, 1).unwrap();
+    bus.write(disk_reg(disk1, block::REG_COUNT), 4, 1).unwrap();
+    bus.write(disk_reg(disk1, block::REG_DMA), 4, RAM_BASE + 0x800)
+        .unwrap();
+    bus.write(disk_reg(disk1, block::REG_CMD), 4, block::CMD_READ.into())
+        .unwrap();
     assert_eq!(
         bus.read(RAM_BASE + 0x800, 2),
-        Ok(u16::from_le_bytes(*b"hi") as u32)
+        Ok(u64::from(u16::from_le_bytes(*b"hi")))
     );
     m.cpu.step();
     assert_eq!(
@@ -344,18 +351,17 @@ fn completion_interrupt_traps_into_m_mode() {
         0x8000_0000 | u64::from(IRQ_M_EXT),
         "machine external interrupt"
     );
-    assert_eq!(m.cpu.pc, u64::from(RAM_BASE + 0x20), "at the handler");
-    assert_eq!(
-        m.cpu.csr.mepc,
-        u64::from(RAM_BASE + 4),
-        "after the one nop that ran"
-    );
+    assert_eq!(m.cpu.pc, RAM_BASE + 0x20, "at the handler");
+    assert_eq!(m.cpu.csr.mepc, RAM_BASE + 4, "after the one nop that ran");
 
     // The handler: claim, acknowledge at the disk, complete. The line stays low after.
     let bus = &mut m.cpu.bus;
     assert_eq!(bus.read(CLAIM0, 4), Ok(irq));
-    assert_eq!(bus.read(disk1 + block::REG_ERROR, 4), Ok(block::error::NONE));
-    bus.write(disk1 + block::REG_STATUS, 4, block::STATUS_DONE)
+    assert_eq!(
+        bus.read(disk_reg(disk1, block::REG_ERROR), 4),
+        Ok(block::error::NONE.into())
+    );
+    bus.write(disk_reg(disk1, block::REG_STATUS), 4, block::STATUS_DONE.into())
         .unwrap();
     bus.write(CLAIM0, 4, irq).unwrap();
     m.cpu.step();
@@ -367,24 +373,30 @@ fn completion_interrupt_traps_into_m_mode() {
 fn unacknowledged_completion_interrupts_again() {
     let mut m = Machine::new(with_disks(vec![DiskConfig::memory(vec![0; 512])])).unwrap();
     m.cpu.bus.load(RAM_BASE, &[0x13, 0, 0, 0].repeat(16)).unwrap();
-    m.cpu.pc = RAM_BASE.into();
+    m.cpu.pc = RAM_BASE;
+    let irq = u64::from(BLK_IRQ);
     let bus = &mut m.cpu.bus;
-    bus.write(PLIC_BASE + 4 * BLK_IRQ, 4, 1).unwrap();
-    bus.write(ENABLE0, 4, 1 << BLK_IRQ).unwrap();
-    bus.write(BLK_BASE + block::REG_CTRL, 4, 1).unwrap();
-    bus.write(BLK_BASE + block::REG_CMD, 4, block::CMD_FLUSH).unwrap();
+    bus.write(PLIC_BASE + 4 * irq, 4, 1).unwrap();
+    bus.write(ENABLE0, 4, 1 << irq).unwrap();
+    bus.write(disk_reg(BLK_BASE, block::REG_CTRL), 4, 1).unwrap();
+    bus.write(disk_reg(BLK_BASE, block::REG_CMD), 4, block::CMD_FLUSH.into())
+        .unwrap();
     m.cpu.step();
     assert_eq!(m.cpu.mip() & MEIP, MEIP);
     // Complete without acknowledging: DONE still holds the line high, so it pends again.
-    assert_eq!(m.cpu.bus.read(CLAIM0, 4), Ok(BLK_IRQ));
-    m.cpu.bus.write(CLAIM0, 4, BLK_IRQ).unwrap();
+    assert_eq!(m.cpu.bus.read(CLAIM0, 4), Ok(irq));
+    m.cpu.bus.write(CLAIM0, 4, irq).unwrap();
     m.cpu.step();
-    assert_eq!(m.cpu.bus.read(CLAIM0, 4), Ok(BLK_IRQ));
+    assert_eq!(m.cpu.bus.read(CLAIM0, 4), Ok(irq));
     m.cpu
         .bus
-        .write(BLK_BASE + block::REG_STATUS, 4, block::STATUS_DONE)
+        .write(
+            disk_reg(BLK_BASE, block::REG_STATUS),
+            4,
+            block::STATUS_DONE.into(),
+        )
         .unwrap();
-    m.cpu.bus.write(CLAIM0, 4, BLK_IRQ).unwrap();
+    m.cpu.bus.write(CLAIM0, 4, irq).unwrap();
     m.cpu.step();
     assert_eq!(m.cpu.bus.read(CLAIM0, 4), Ok(0));
 }

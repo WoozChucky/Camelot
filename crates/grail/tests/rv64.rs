@@ -21,9 +21,9 @@ const A1: u32 = 11;
 const A2: u32 = 12;
 
 /// Where the tests keep their data.
-const DATA: u32 = RAM_BASE + 0x8000;
+const DATA: u64 = RAM_BASE + 0x8000;
 /// Trap vector: the tests only look at the cause, nothing runs there.
-const TRAP_VECTOR: u32 = RAM_BASE + 0x4000;
+const TRAP_VECTOR: u64 = RAM_BASE + 0x4000;
 
 const LOAD: u32 = 0x03;
 const OP_IMM: u32 = 0x13;
@@ -62,7 +62,7 @@ fn machine(xlen: Xlen) -> Machine {
         ..MachineConfig::with_ram(1 << 20)
     })
     .unwrap();
-    m.cpu.csr.mtvec = TRAP_VECTOR.into();
+    m.cpu.csr.mtvec = TRAP_VECTOR;
     m
 }
 
@@ -75,11 +75,11 @@ fn run(m: &mut Machine, text: &str, word: u32) {
         "{word:#010x}"
     );
     m.cpu.bus.load(RAM_BASE, &word.to_le_bytes()).unwrap();
-    m.cpu.pc = RAM_BASE.into();
+    m.cpu.pc = RAM_BASE;
     m.cpu.step();
     assert_eq!(
         m.cpu.pc,
-        u64::from(RAM_BASE + 4),
+        RAM_BASE + 4,
         "{text} trapped: mcause {:#x}",
         m.cpu.csr.mcause
     );
@@ -94,11 +94,11 @@ fn run_traps(m: &mut Machine, text: &str, word: u32, mcause: u64, mtval: u64) {
         "{word:#010x}"
     );
     m.cpu.bus.load(RAM_BASE, &word.to_le_bytes()).unwrap();
-    m.cpu.pc = RAM_BASE.into();
+    m.cpu.pc = RAM_BASE;
     m.cpu.step();
-    assert_eq!(m.cpu.pc, u64::from(TRAP_VECTOR), "{text} did not trap");
+    assert_eq!(m.cpu.pc, TRAP_VECTOR, "{text} did not trap");
     assert_eq!((m.cpu.csr.mcause, m.cpu.csr.mtval), (mcause, mtval), "{text}");
-    assert_eq!(m.cpu.csr.mepc, u64::from(RAM_BASE), "{text}");
+    assert_eq!(m.cpu.csr.mepc, RAM_BASE, "{text}");
 }
 
 /// Runs `word` and checks it raised illegal-instruction, with the word in `mtval`.
@@ -112,13 +112,13 @@ fn x(m: &Machine, r: u32) -> u64 {
 fn set(m: &mut Machine, r: u32, v: u64) {
     m.cpu.set_reg(r as u8, v);
 }
-fn poke64(m: &mut Machine, addr: u32, v: u64) {
-    m.cpu.bus.write(addr, 4, v as u32).unwrap();
-    m.cpu.bus.write(addr + 4, 4, (v >> 32) as u32).unwrap();
+fn poke64(m: &mut Machine, addr: u64, v: u64) {
+    m.cpu.bus.write(addr, 4, v).unwrap();
+    m.cpu.bus.write(addr + 4, 4, v >> 32).unwrap();
 }
-fn peek64(m: &mut Machine, addr: u32) -> u64 {
-    let lo = m.cpu.bus.read(addr, 4).unwrap() as u64;
-    lo | (m.cpu.bus.read(addr + 4, 4).unwrap() as u64) << 32
+fn peek64(m: &mut Machine, addr: u64) -> u64 {
+    let lo = m.cpu.bus.read(addr, 4).unwrap();
+    lo | m.cpu.bus.read(addr + 4, 4).unwrap() << 32
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn rv64m_on_64_and_32_bits() {
 fn lw_sign_extends_and_lwu_zero_extends() {
     let mut m = machine(Xlen::Rv64);
     poke64(&mut m, DATA, 0x1122_3344_8899_aabb);
-    set(&mut m, A1, DATA.into());
+    set(&mut m, A1, DATA);
     run(&mut m, "lw a0, 0(a1)", i_type(0, A1, 2, A0, LOAD));
     assert_eq!(x(&m, A0), 0xffff_ffff_8899_aabb);
     run(&mut m, "lwu a0, 0(a1)", i_type(0, A1, 6, A0, LOAD));
@@ -255,19 +255,19 @@ fn lw_sign_extends_and_lwu_zero_extends() {
     assert_eq!(peek64(&mut m, DATA + 8), 0x0506_0708_0506_0708);
 
     // ld and sd must be 8-byte aligned (spec section 4).
-    let at = u64::from(DATA + 4);
+    let at = DATA + 4;
     run_traps(&mut m, "ld a0, 4(a1)", i_type(4, A1, 3, A0, LOAD), 4, at);
     run_traps(&mut m, "sd a2, 4(a1)", s_type(4, A2, A1, 3), 6, at);
-    // A device refuses 8-byte accesses until #147 widens the bus.
+    // An 8-byte access to 32-bit registers (the UART's) is an access fault.
     let uart = grail::bus::UART_BASE;
-    set(&mut m, A1, uart.into());
-    run_traps(&mut m, "ld a0, 0(a1)", i_type(0, A1, 3, A0, LOAD), 5, uart.into());
+    set(&mut m, A1, uart);
+    run_traps(&mut m, "ld a0, 0(a1)", i_type(0, A1, 3, A0, LOAD), 5, uart);
 }
 
 #[test]
 fn word_atomics_sign_extend_and_touch_32_bits() {
     let mut m = machine(Xlen::Rv64);
-    set(&mut m, A1, DATA.into());
+    set(&mut m, A1, DATA);
 
     // lr.w sign-extends; sc.w stores the low 32 bits of rs2 and leaves the next word.
     poke64(&mut m, DATA, 0x5555_5555_8000_0000);
@@ -305,7 +305,7 @@ fn word_atomics_sign_extend_and_touch_32_bits() {
     assert_eq!(x(&m, A0), 1 << 63);
     run(&mut m, "sc.w a0, a2, (a1)", a_type(0b00011, 2, A0, A1, A2));
     assert_eq!(x(&m, A0), 1, "sc.w after lr.d fails");
-    let at = u64::from(DATA + 4);
+    let at = DATA + 4;
     set(&mut m, A1, at);
     run_traps(&mut m, "lr.d a0, (a1)", a_type(0b00010, 3, A0, A1, 0), 4, at);
     run(&mut m, "lr.w a0, (a1)", a_type(0b00010, 2, A0, A1, 0));
@@ -434,9 +434,9 @@ fn interrupts_set_the_top_bit_of_the_width() {
         m.cpu.bus.clint.mtimecmp[0] = 0;
         m.cpu.csr.mie = 1 << 7;
         m.cpu.csr.mstatus = MSTATUS_MIE;
-        m.cpu.pc = RAM_BASE.into();
+        m.cpu.pc = RAM_BASE;
         m.cpu.step();
-        assert_eq!(m.cpu.pc, u64::from(TRAP_VECTOR), "{xlen:?}");
+        assert_eq!(m.cpu.pc, TRAP_VECTOR, "{xlen:?}");
         assert_eq!(m.cpu.csr.mcause, bit | 7, "{xlen:?}");
     }
 }
@@ -465,7 +465,7 @@ fn rv32_registers_hold_values_sign_extended() {
     assert_eq!(x(&m, A0), 0x4000_0000);
     // lw gives the loaded word sign-extended, and set_reg cuts what it is given.
     m.cpu.bus.write(DATA, 4, 0x8000_0001).unwrap();
-    set(&mut m, A1, DATA.into());
+    set(&mut m, A1, DATA);
     run(&mut m, "lw a0, 0(a1)", i_type(0, A1, 2, A0, LOAD));
     assert_eq!(x(&m, A0), 0xffff_ffff_8000_0001);
     set(&mut m, A0, 0x1_0000_0002);
@@ -482,7 +482,7 @@ fn rv32_addresses_wrap_at_4_gib() {
     let mut m = machine(Xlen::Rv32);
     // a1 holds 0x8000_7ff0 sign-extended; the sum is cut to its low 32 bits, DATA.
     m.cpu.bus.write(DATA, 4, 0x1234_5678).unwrap();
-    set(&mut m, A1, DATA.wrapping_sub(16).into());
+    set(&mut m, A1, DATA.wrapping_sub(16));
     run(&mut m, "lw a0, 16(a1)", i_type(16, A1, 2, A0, LOAD));
     assert_eq!(x(&m, A0), 0x1234_5678);
     // A jump target is cut to 32 bits: 0xffff_ffff_8000_0102 & !1 is 0x8000_0102,
@@ -517,7 +517,7 @@ fn an_elf64_program_makes_the_machine_rv64() {
     for _ in 0..4 {
         m.cpu.step();
     }
-    assert_eq!(m.cpu.pc, u64::from(RAM_BASE));
+    assert_eq!(m.cpu.pc, RAM_BASE);
 
     // An RV32 machine stays RV32 for an ELF32 program; an RV64 one refuses it.
     let mut m = Machine::with_ram(1 << 20);
@@ -538,7 +538,7 @@ fn narrow_stores_write_only_their_bytes() {
     for xlen in [Xlen::Rv32, Xlen::Rv64] {
         let mut m = machine(xlen);
         // sb of 0x5555 writes 0x55 to the test device: not its exit code 0x5555.
-        set(&mut m, A1, grail::bus::TEST_DEV_BASE.into());
+        set(&mut m, A1, grail::bus::TEST_DEV_BASE);
         set(&mut m, A2, 0x5555);
         run(&mut m, "sb a2, 0(a1)", s_type(0, A2, A1, 0));
         assert_eq!(m.exit_code(), None, "{xlen:?}");
@@ -548,7 +548,7 @@ fn narrow_stores_write_only_their_bytes() {
         // sb of 0x100 writes a zero byte to tohost, which does not stop the machine.
         let mut m = machine(xlen);
         m.cpu.bus.tohost = Some(DATA);
-        set(&mut m, A1, DATA.into());
+        set(&mut m, A1, DATA);
         set(&mut m, A2, 0x100);
         run(&mut m, "sb a2, 0(a1)", s_type(0, A2, A1, 0));
         assert_eq!(m.exit_code(), None, "{xlen:?}");
@@ -618,7 +618,7 @@ fn the_park_loop_reads_the_entry_with_lwu_on_rv64() {
     m.cpu.bus.clint.msip[1] = true;
     for _ in 0..20 {
         m.cpu.step();
-        if m.cpu.hart(1).pc == u64::from(RAM_BASE) {
+        if m.cpu.hart(1).pc == RAM_BASE {
             return;
         }
     }

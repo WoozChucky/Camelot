@@ -72,8 +72,7 @@ impl Hart {
             return Err(Trap::new(access.misaligned(), vaddr));
         }
         let paddr = self.translate(bus, vaddr, access)?;
-        let memory = u32::try_from(paddr).is_ok_and(|a| bus.is_memory(a, size));
-        if !memory {
+        if !bus.is_memory(paddr, size) {
             return Err(Trap::new(access.access_fault(), vaddr));
         }
         Ok(paddr)

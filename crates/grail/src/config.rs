@@ -17,7 +17,7 @@ pub const MIB: usize = 1024 * 1024;
 pub const DEFAULT_RAM_SIZE: usize = 4 * MIB;
 /// RAM must end at or below 4 GiB: everything from `RAM_BASE` to the top of the address
 /// space, 2 GiB.
-pub const MAX_RAM_SIZE: usize = (u32::MAX - RAM_BASE) as usize + 1;
+pub const MAX_RAM_SIZE: usize = (u32::MAX as u64 - RAM_BASE) as usize + 1;
 /// RAM is handed out in whole 4 KiB pages.
 pub const RAM_GRANULE: usize = 4096;
 /// Clock frequency the machine reports when it is not paced to a real-time clock.

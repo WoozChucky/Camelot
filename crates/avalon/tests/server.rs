@@ -74,8 +74,8 @@ fn two_vms_with_their_own_profiles() {
         .iter()
         .map(|d| DeviceEntry {
             kind: d.kind as u32,
-            base: d.base,
-            size: d.size,
+            base: u32::try_from(d.base).expect("devices are below 4 GiB"),
+            size: u32::try_from(d.size).expect("devices are below 4 GiB"),
             irq: d.irq,
         })
         .collect();

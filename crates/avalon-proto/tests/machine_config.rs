@@ -285,21 +285,29 @@ fn device_table_mirrors_sysinfo() {
             } = e;
             DeviceEntry {
                 kind: kind as u32,
-                base,
-                size,
+                base: u32::try_from(base).expect("devices are below 4 GiB"),
+                size: u32::try_from(size).expect("devices are below 4 GiB"),
                 irq,
             }
         })
         .collect();
     // What a running guest reads from its own sysinfo block.
     let mut machine = grail::Machine::new(config).unwrap();
-    let read = |m: &mut grail::Machine, off: u32| m.cpu.bus.read(grail::bus::SYSINFO_BASE + off, 4).unwrap();
+    let read = |m: &mut grail::Machine, off: u32| {
+        m.cpu
+            .bus
+            .read(grail::bus::SYSINFO_BASE + u64::from(off), 4)
+            .unwrap()
+    };
     let count = read(&mut machine, grail::sysinfo::REG_DEV_COUNT);
     assert_eq!(count as usize, table.len());
     for (i, entry) in table.iter().enumerate() {
         let at = grail::sysinfo::DEV_TABLE + i as u32 * grail::sysinfo::DEV_ENTRY_SIZE;
-        let words: Vec<u32> = (0..4).map(|w| read(&mut machine, at + 4 * w)).collect();
-        assert_eq!(words, [entry.kind, entry.base, entry.size, entry.irq]);
+        let words: Vec<u64> = (0..4).map(|w| read(&mut machine, at + 4 * w)).collect();
+        assert_eq!(
+            words,
+            [entry.kind, entry.base, entry.size, entry.irq].map(u64::from)
+        );
     }
 }
 

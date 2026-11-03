@@ -133,7 +133,7 @@ impl Cpu {
                 } else {
                     crate::bus::PARK_PC
                 };
-                Hart::new(id, pc.into(), bus.xlen())
+                Hart::new(id, pc, bus.xlen())
             })
             .collect();
         Cpu {

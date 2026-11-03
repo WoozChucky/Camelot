@@ -378,8 +378,8 @@ impl BlockDevice {
         }
         // The buffer must lie entirely in RAM. 64-bit arithmetic: no wrap-around.
         let len = self.count as u64 * SECTOR_SIZE as u64;
-        let start = (self.dma as u64).wrapping_sub(RAM_BASE as u64);
-        if self.dma < RAM_BASE || start + len > ram.len() as u64 {
+        let start = u64::from(self.dma).wrapping_sub(RAM_BASE);
+        if u64::from(self.dma) < RAM_BASE || start + len > ram.len() as u64 {
             return error::BAD_DMA;
         }
         if cmd == CMD_WRITE && self.read_only {
@@ -406,6 +406,8 @@ impl BlockDevice {
 mod tests {
     use super::*;
 
+    /// RAM's base as the DMA register holds it: a 32-bit physical address.
+    const RAM_BASE: u32 = crate::bus::RAM_BASE as u32;
     const RAM_SIZE: usize = 4 * SECTOR_SIZE;
 
     /// A 4-sector disk whose sector `n` is filled with byte `n + 1`, and a RAM of 4 sectors.

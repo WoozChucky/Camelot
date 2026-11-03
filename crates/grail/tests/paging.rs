@@ -26,7 +26,7 @@ const D: u64 = 1 << 7;
 /// Every permission, with A and D already set: translating changes nothing.
 const RWXAD: u64 = R | W | X | A | D;
 
-const RAM: u64 = RAM_BASE as u64;
+const RAM: u64 = RAM_BASE;
 const RAM_SIZE: usize = 4 << 20;
 
 #[derive(Clone, Copy, Debug)]
@@ -56,14 +56,14 @@ fn vpn(va: u64, level: u32) -> u64 {
 }
 
 fn read64(bus: &mut Bus, addr: u64) -> u64 {
-    let lo = bus.read(addr as u32, 4).unwrap();
-    let hi = bus.read(addr as u32 + 4, 4).unwrap();
-    u64::from(lo) | u64::from(hi) << 32
+    let lo = bus.read(addr, 4).unwrap();
+    let hi = bus.read(addr + 4, 4).unwrap();
+    lo | hi << 32
 }
 
 fn write64(bus: &mut Bus, addr: u64, v: u64) {
-    bus.write(addr as u32, 4, v as u32).unwrap();
-    bus.write(addr as u32 + 4, 4, (v >> 32) as u32).unwrap();
+    bus.write(addr, 4, v).unwrap();
+    bus.write(addr + 4, 4, v >> 32).unwrap();
 }
 
 /// Page tables in RAM: the root at `RAM + 1 MiB`, the tables below it in the pages
@@ -382,12 +382,11 @@ fn sv32_pages_and_tables_above_4_gib_do_not_wrap() {
     hart.csr.satp = 1 << 31 | ROOT >> 12;
     let va = 0x0040_3000u64; // VPN[1] = 1, VPN[0] = 3
     let table = ROOT + 0x1000;
-    let pte32 = |pa: u64, flags: u64| ((pa >> 12) << 10 | flags | V) as u32;
-    bus.write(ROOT as u32 + 4, 4, pte32(table, 0)).unwrap();
+    let pte32 = |pa: u64, flags: u64| (pa >> 12) << 10 | flags | V;
+    bus.write(ROOT + 4, 4, pte32(table, 0)).unwrap();
 
     // A leaf whose PPN has bit 20 set.
-    bus.write(table as u32 + 3 * 4, 4, pte32(1 << 32 | RAM, RWXAD))
-        .unwrap();
+    bus.write(table + 3 * 4, 4, pte32(1 << 32 | RAM, RWXAD)).unwrap();
     assert_eq!(hart.translate(&mut bus, va, Access::Load), Ok(1 << 32 | RAM));
     assert_eq!(
         hart.load(&mut bus, va, 4),
@@ -396,7 +395,7 @@ fn sv32_pages_and_tables_above_4_gib_do_not_wrap() {
 
     // A pointer with A, D or U set is a page fault in Sv32 too.
     for bit in [A, D, U] {
-        bus.write(ROOT as u32 + 4, 4, pte32(table, bit)).unwrap();
+        bus.write(ROOT + 4, 4, pte32(table, bit)).unwrap();
         assert_eq!(
             hart.translate(&mut bus, va, Access::Load),
             Err(Trap::new(Exception::LoadPageFault, va)),
@@ -405,7 +404,7 @@ fn sv32_pages_and_tables_above_4_gib_do_not_wrap() {
     }
 
     // A pointer to a table above 4 GiB: the walk's read of it is the access fault.
-    bus.write(ROOT as u32 + 4, 4, pte32(1 << 32 | table, 0)).unwrap();
+    bus.write(ROOT + 4, 4, pte32(1 << 32 | table, 0)).unwrap();
     assert_eq!(
         hart.translate(&mut bus, va, Access::Load),
         Err(Trap::new(Exception::LoadAccessFault, va))
@@ -441,7 +440,7 @@ fn machine(code: &[(u32, &str)]) -> (Machine, Tables) {
             text,
             "{word:#010x}"
         );
-        m.cpu.bus.write(RAM_BASE + 4 * i as u32, 4, word).unwrap();
+        m.cpu.bus.write(RAM_BASE + 4 * i as u64, 4, word.into()).unwrap();
     }
     tables.map(&mut m.cpu.bus, CODE_VA, 0, RAM, R | X | A);
     m.cpu.csr.satp = tables.satp();

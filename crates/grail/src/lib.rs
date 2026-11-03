@@ -185,20 +185,15 @@ impl Machine {
         let entry = elf.physical_entry().map_err(|e| e.to_string())?;
         let bus = &mut self.cpu.bus;
         for seg in &elf.segments {
-            let outside = || format!("segment at {:#x} is outside RAM", seg.paddr);
-            // The bus takes 32-bit addresses until #147; RAM is below 4 GiB.
-            let paddr = u32::try_from(seg.paddr).map_err(|_| outside())?;
-            let size = u32::try_from(seg.mem_size).map_err(|_| outside())?;
-            bus.load_zeroed(paddr, &seg.data, size).map_err(|_| outside())?;
+            bus.load_zeroed(seg.paddr, &seg.data, seg.mem_size)
+                .map_err(|_| format!("segment at {:#x} is outside RAM", seg.paddr))?;
         }
-        // In a loaded segment, so in RAM, below 4 GiB.
-        let entry = u32::try_from(entry).expect("the entry point is in RAM");
         if elf.xlen != self.config.xlen {
             self.config.xlen = elf.xlen;
             self.cpu.set_xlen(elf.xlen);
         }
         let bus = &mut self.cpu.bus;
-        bus.tohost = elf.symbol("tohost").and_then(|a| u32::try_from(a).ok());
+        bus.tohost = elf.symbol("tohost");
         bus.set_boot_entry(entry);
         Ok(())
     }

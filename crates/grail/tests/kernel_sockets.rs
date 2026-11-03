@@ -166,10 +166,10 @@ fn socktest_passes() {
 /// crates/xtask/src/userprogs.rs): `{ name, elf, size }` words each.
 fn embedded_programs(vm: &Vm) -> Vec<(String, Vec<u8>)> {
     let mem = &vm.m.cpu.bus;
-    let word = |a: u32| mem.read_mem(a, 4).unwrap();
+    let word = |a: u64| mem.read_mem(a, 4).unwrap();
     let table = var_addr("user_programs");
     let count = vm.read_var("user_program_count");
-    (0..count)
+    (0..u64::from(count))
         .map(|i| {
             let entry = table + 12 * i;
             let (name, elf, size) = (word(entry), word(entry + 4), word(entry + 8));

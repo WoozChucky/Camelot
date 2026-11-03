@@ -278,7 +278,10 @@ impl Machine {
             let Some(a) = addr.checked_add(i as u32) else {
                 return i;
             };
-            match self.translate(a, space).and_then(|p| self.cpu.bus.debug_read(p)) {
+            match self
+                .translate(a, space)
+                .and_then(|p| self.cpu.bus.debug_read(p.into()))
+            {
                 Some(v) => *b = v,
                 None => return i,
             }
@@ -295,7 +298,7 @@ impl Machine {
                 return i;
             };
             match self.translate(a, space) {
-                Some(p) if self.cpu.bus.debug_write(p, b) => {}
+                Some(p) if self.cpu.bus.debug_write(p.into(), b) => {}
                 _ => return i,
             }
         }

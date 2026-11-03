@@ -13,41 +13,41 @@ use crate::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use excalibur::Xlen;
 use std::io::Write;
 
-pub const BOOT_ROM_BASE: u32 = 0x0000_1000;
+pub const BOOT_ROM_BASE: u64 = 0x0000_1000;
 /// Where harts other than hart 0 start: the boot ROM's park loop, which waits for an
 /// IPI and then jumps to the entry point (spec section 7, "Boot").
-pub const PARK_PC: u32 = BOOT_ROM_BASE + 0x20;
-pub const TEST_DEV_BASE: u32 = 0x0010_0000;
-pub const TEST_DEV_SIZE: u32 = 0x1000;
-pub const CLINT_BASE: u32 = 0x0200_0000;
-pub const CLINT_SIZE: u32 = 0x1_0000;
-pub const PLIC_BASE: u32 = 0x0C00_0000;
-pub const PLIC_SIZE: u32 = 0x0400_0000;
-pub const UART_BASE: u32 = 0x1000_0000;
-pub const UART_SIZE: u32 = 0x100;
+pub const PARK_PC: u64 = BOOT_ROM_BASE + 0x20;
+pub const TEST_DEV_BASE: u64 = 0x0010_0000;
+pub const TEST_DEV_SIZE: u64 = 0x1000;
+pub const CLINT_BASE: u64 = 0x0200_0000;
+pub const CLINT_SIZE: u64 = 0x1_0000;
+pub const PLIC_BASE: u64 = 0x0C00_0000;
+pub const PLIC_SIZE: u64 = 0x0400_0000;
+pub const UART_BASE: u64 = 0x1000_0000;
+pub const UART_SIZE: u64 = 0x100;
 /// Disk 0's registers (spec section 9.6); disk `i` is at `BLK_BASE + i * BLK_SIZE`.
-pub const BLK_BASE: u32 = 0x1000_1000;
-pub const BLK_SIZE: u32 = 0x1000;
+pub const BLK_BASE: u64 = 0x1000_1000;
+pub const BLK_SIZE: u64 = 0x1000;
 /// Disks a machine can have: one page each in 0x1000_1000 - 0x1000_8FFF, PLIC sources
 /// `BLK_IRQ` (3) to 10.
 pub const MAX_DISKS: usize = 8;
 /// Network card 0's registers (spec section 9.8), right after the disks' pages; card
 /// `i` is at `NET_BASE + i * NET_SIZE`.
-pub const NET_BASE: u32 = 0x1000_9000;
-pub const NET_SIZE: u32 = 0x1000;
+pub const NET_BASE: u64 = 0x1000_9000;
+pub const NET_SIZE: u64 = 0x1000;
 /// Network cards a machine can have: one page each in 0x1000_9000 - 0x1000_CFFF, PLIC
 /// sources `NET_IRQ` (12) to 15.
 pub const MAX_NETS: usize = 4;
-pub const FB_CTRL_BASE: u32 = 0x3000_0000;
-pub const FB_CTRL_SIZE: u32 = 0x1000;
-pub const KBD_BASE: u32 = 0x3000_1000;
-pub const KBD_SIZE: u32 = 0x1000;
-pub const SYSINFO_BASE: u32 = 0x3000_2000;
-pub const SYSINFO_SIZE: u32 = 0x1000;
-pub const PTR_BASE: u32 = 0x3000_3000;
-pub const PTR_SIZE: u32 = 0x1000;
-pub const VRAM_BASE: u32 = 0x3100_0000;
-pub const RAM_BASE: u32 = 0x8000_0000;
+pub const FB_CTRL_BASE: u64 = 0x3000_0000;
+pub const FB_CTRL_SIZE: u64 = 0x1000;
+pub const KBD_BASE: u64 = 0x3000_1000;
+pub const KBD_SIZE: u64 = 0x1000;
+pub const SYSINFO_BASE: u64 = 0x3000_2000;
+pub const SYSINFO_SIZE: u64 = 0x1000;
+pub const PTR_BASE: u64 = 0x3000_3000;
+pub const PTR_SIZE: u64 = 0x1000;
+pub const VRAM_BASE: u64 = 0x3100_0000;
+pub const RAM_BASE: u64 = 0x8000_0000;
 
 /// The devices a machine built from `config` with `disks` disks has, as the sysinfo
 /// device table lists them: in address order. Its network cards are the ones
@@ -73,18 +73,20 @@ pub fn device_table_with(_config: &MachineConfig, disks: usize, nets: usize) -> 
         dev(DeviceType::Plic, PLIC_BASE, PLIC_SIZE, 0),
         dev(DeviceType::Uart, UART_BASE, UART_SIZE, UART_IRQ),
     ];
-    table.extend(
-        (0..disks as u32).map(|i| dev(DeviceType::Block, BLK_BASE + i * BLK_SIZE, BLK_SIZE, BLK_IRQ + i)),
-    );
-    table.extend(
-        (0..nets as u32).map(|i| dev(DeviceType::Net, NET_BASE + i * NET_SIZE, NET_SIZE, NET_IRQ + i)),
-    );
+    table.extend((0..disks as u32).map(|i| {
+        let base = BLK_BASE + u64::from(i) * BLK_SIZE;
+        dev(DeviceType::Block, base, BLK_SIZE, BLK_IRQ + i)
+    }));
+    table.extend((0..nets as u32).map(|i| {
+        let base = NET_BASE + u64::from(i) * NET_SIZE;
+        dev(DeviceType::Net, base, NET_SIZE, NET_IRQ + i)
+    }));
     table.extend([
         dev(DeviceType::FbCtrl, FB_CTRL_BASE, FB_CTRL_SIZE, 0),
         dev(DeviceType::Keyboard, KBD_BASE, KBD_SIZE, KBD_IRQ),
         dev(DeviceType::Sysinfo, SYSINFO_BASE, SYSINFO_SIZE, 0),
         dev(DeviceType::Pointer, PTR_BASE, PTR_SIZE, PTR_IRQ),
-        dev(DeviceType::FbVram, VRAM_BASE, VRAM_SIZE, 0),
+        dev(DeviceType::FbVram, VRAM_BASE, VRAM_SIZE.into(), 0),
     ]);
     table
 }
@@ -120,7 +122,7 @@ pub struct Bus {
     /// `uart.capture` on, it goes into the UART capture buffer instead.
     pub debug: Option<Box<dyn Write + Send>>,
     /// Address of the riscv-tests `tohost` symbol, if the loaded ELF has one.
-    pub tohost: Option<u32>,
+    pub tohost: Option<u64>,
     /// Set when a device or `tohost` asks the machine to stop.
     pub exit: Option<Exit>,
     /// A debugger's watchpoints, which the harts' loads and stores report to.
@@ -205,17 +207,17 @@ impl Bus {
     ///
     /// On an RV64 machine both read the entry word with `lwu`, since `lw` would
     /// sign-extend an entry point at or above 2 GiB. (#147 makes it a doubleword.)
-    pub fn set_boot_entry(&mut self, entry: u32) {
+    pub fn set_boot_entry(&mut self, entry: u64) {
         let load_entry = match self.xlen {
             Xlen::Rv32 => 0x0102_a283, // lw  t0, 16(t0)
             Xlen::Rv64 => 0x0102_e283, // lwu t0, 16(t0)
         };
         let mut words = vec![
-            0x0000_0297, // 0x1000: auipc t0, 0
-            load_entry,  //         lw    t0, 16(t0)     the entry word
-            0x0000_0513, //         li    a0, 0
-            0x0002_8067, //         jr    t0
-            entry,       // 0x1010: the entry point
+            0x0000_0297,  // 0x1000: auipc t0, 0
+            load_entry,   //         lw    t0, 16(t0)     the entry word
+            0x0000_0513,  //         li    a0, 0
+            0x0002_8067,  //         jr    t0
+            entry as u32, // 0x1010: the entry point
         ];
         if self.harts() > 1 {
             words.resize(((PARK_PC - BOOT_ROM_BASE) / 4) as usize, 0);
@@ -261,13 +263,13 @@ impl Bus {
     /// successful `sc`, an A/D update): a write to memory breaks every reservation on
     /// the lines it touched, whichever hart holds it; a store to a device breaks the
     /// storing hart's own reservation (the device may start a DMA into RAM).
-    pub fn snoop_store(&mut self, hart: usize, paddr: u32, size: u32) {
+    pub fn snoop_store(&mut self, hart: usize, paddr: u64, size: u32) {
         if self.reservations.iter().all(|r| r.held().is_none()) {
             return;
         }
         if self.is_memory(paddr, size) {
             for r in &mut self.reservations {
-                r.snoop(paddr.into(), size.into());
+                r.snoop(paddr, size.into());
             }
         } else {
             self.reservations[hart].clear();
@@ -321,114 +323,157 @@ impl Bus {
     }
 
     /// The disk whose register page holds `addr`, and the offset in it.
-    fn disk_at(&self, addr: u32) -> Option<(usize, u32)> {
-        let off = addr.wrapping_sub(BLK_BASE);
-        let i = (off / BLK_SIZE) as usize;
-        (addr >= BLK_BASE && i < self.disks.len()).then_some((i, off % BLK_SIZE))
+    fn disk_at(&self, addr: u64) -> Option<(usize, u32)> {
+        let off = addr.checked_sub(BLK_BASE)?;
+        let i = usize::try_from(off / BLK_SIZE).ok()?;
+        (i < self.disks.len()).then_some((i, (off % BLK_SIZE) as u32))
     }
 
     /// The network card whose register page holds `addr`, and the offset in it.
-    fn net_at(&self, addr: u32) -> Option<(usize, u32)> {
-        let off = addr.wrapping_sub(NET_BASE);
-        let i = (off / NET_SIZE) as usize;
-        (addr >= NET_BASE && i < self.nets.len()).then_some((i, off % NET_SIZE))
+    fn net_at(&self, addr: u64) -> Option<(usize, u32)> {
+        let off = addr.checked_sub(NET_BASE)?;
+        let i = usize::try_from(off / NET_SIZE).ok()?;
+        (i < self.nets.len()).then_some((i, (off % NET_SIZE) as u32))
     }
 
-    fn ram_range(&self, addr: u32, size: u32) -> Option<usize> {
-        let off = addr.wrapping_sub(RAM_BASE) as usize;
-        let end = off.checked_add(size as usize)?;
-        (addr >= RAM_BASE && end <= self.ram.len()).then_some(off)
+    /// The offset in RAM of the `size` bytes at physical `addr`, if they are all RAM.
+    fn ram_range(&self, addr: u64, size: u32) -> Option<usize> {
+        let off = addr.checked_sub(RAM_BASE)?;
+        let end = off.checked_add(size.into())?;
+        (end <= self.ram.len() as u64).then_some(off as usize)
     }
 
-    fn vram_range(addr: u32, size: u32) -> Option<usize> {
-        let off = addr.wrapping_sub(VRAM_BASE);
-        (addr >= VRAM_BASE && off < VRAM_SIZE && VRAM_SIZE - off >= size).then_some(off as usize)
+    fn vram_range(addr: u64, size: u32) -> Option<usize> {
+        let off = addr.checked_sub(VRAM_BASE)?;
+        let end = off.checked_add(size.into())?;
+        (end <= VRAM_SIZE.into()).then_some(off as usize)
+    }
+
+    /// The offset in the boot ROM's page of the `size` bytes at `addr`, if they are all
+    /// in it.
+    fn rom_range(addr: u64, size: u32) -> Option<usize> {
+        let off = addr.checked_sub(BOOT_ROM_BASE)?;
+        (off + u64::from(size) <= 0x1000).then_some(off as usize)
+    }
+
+    /// The offset of `addr` in the `size` bytes at `base`, if it is there. Device
+    /// registers are 4 KiB to 64 MiB pages: their offsets fit in 32 bits.
+    fn offset_in(addr: u64, base: u64, size: u64) -> Option<u32> {
+        let off = addr.checked_sub(base)?;
+        (off < size).then_some(off as u32)
     }
 
     /// Whether `[addr, addr + size)` is plain memory (RAM or VRAM) rather than a device
     /// register or nothing. Atomics (LR/SC, AMOs) only work there.
-    pub fn is_memory(&self, addr: u32, size: u32) -> bool {
+    pub fn is_memory(&self, addr: u64, size: u32) -> bool {
         self.ram_range(addr, size).is_some() || Self::vram_range(addr, size).is_some()
     }
 
     /// RAM and VRAM: plain memory, accessed directly instead of through a device.
-    fn memory(&mut self, addr: u32, size: u32) -> Option<&mut [u8]> {
+    fn memory(&mut self, addr: u64, size: u32) -> Option<&mut [u8]> {
         if let Some(off) = self.ram_range(addr, size) {
             return Some(&mut self.ram[off..off + size as usize]);
         }
         Self::vram_range(addr, size).map(|off| &mut self.fb.vram[off..off + size as usize])
     }
 
-    /// Reads `size` (1, 2 or 4) bytes of RAM or boot ROM, little-endian, zero-extended.
-    /// Device registers fault here: instruction fetches and page-table walks use this, so
-    /// they can never trigger a device's read side effect (such as a PLIC claim).
-    pub fn read_mem(&self, addr: u32, size: u32) -> Result<u32, BusFault> {
+    /// Reads `size` (1, 2, 4 or 8) bytes of RAM or boot ROM, little-endian,
+    /// zero-extended. Device registers fault here: instruction fetches and page-table
+    /// walks use this, so they can never trigger a device's read side effect (such as a
+    /// PLIC claim).
+    pub fn read_mem(&self, addr: u64, size: u32) -> Result<u64, BusFault> {
         let bytes = if let Some(off) = self.ram_range(addr, size) {
             &self.ram[off..off + size as usize]
-        } else if (BOOT_ROM_BASE..BOOT_ROM_BASE + 0x1000).contains(&addr) {
+        } else if let Some(off) = Self::rom_range(addr, size) {
             // Past the end of the stub (but inside the ROM window) reads as 0.
-            let off = (addr - BOOT_ROM_BASE) as usize;
             self.rom.get(off..).unwrap_or(&[])
         } else {
             return Err(BusFault);
         };
-        let mut v = 0u32;
-        for i in (0..size as usize).rev() {
-            v = (v << 8) | *bytes.get(i).unwrap_or(&0) as u32;
-        }
-        Ok(v)
+        Ok((0..size as usize)
+            .rev()
+            .fold(0, |v, i| (v << 8) | u64::from(*bytes.get(i).unwrap_or(&0))))
     }
 
-    /// Reads `size` (1, 2 or 4) bytes, little-endian, zero-extended.
-    pub fn read(&mut self, addr: u32, size: u32) -> Result<u32, BusFault> {
+    /// Reads `size` (1, 2, 4 or 8) bytes at physical `addr`, little-endian,
+    /// zero-extended. Memory (RAM, VRAM, the boot ROM) takes every size; a device takes
+    /// the sizes its registers have (spec section 9, "Register widths"), so an 8-byte
+    /// access to 32-bit registers is a fault.
+    pub fn read(&mut self, addr: u64, size: u32) -> Result<u64, BusFault> {
         if let Some(mem) = self.memory(addr, size) {
-            return Ok(mem.iter().rev().fold(0, |v, &b| (v << 8) | b as u32));
+            return Ok(mem.iter().rev().fold(0, |v, &b| (v << 8) | u64::from(b)));
         }
         if let Ok(v) = self.read_mem(addr, size) {
             return Ok(v);
         }
+        // The test device takes any width (spec section 7) and reads as 0.
+        if Self::offset_in(addr, TEST_DEV_BASE, TEST_DEV_SIZE).is_some() {
+            return Ok(0);
+        }
+        // Every other device has 32-bit registers only, for now.
+        if size == 8 {
+            return Err(BusFault);
+        }
         if let Some((i, off)) = self.disk_at(addr) {
-            return self.disks[i].read(off, size);
+            return self.disks[i].read(off, size).map(u64::from);
         }
         if let Some((i, off)) = self.net_at(addr) {
-            return self.nets[i].read(off, size);
+            return self.nets[i].read(off, size).map(u64::from);
         }
-        match addr {
-            a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => self.clint.read(a - CLINT_BASE, size),
-            a if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&a) => self.plic.read(a - PLIC_BASE, size),
-            a if (UART_BASE..UART_BASE + UART_SIZE).contains(&a) => self.uart.read(a - UART_BASE, size),
-            a if (FB_CTRL_BASE..FB_CTRL_BASE + FB_CTRL_SIZE).contains(&a) => {
-                self.fb.read(a - FB_CTRL_BASE, size)
-            }
-            a if (KBD_BASE..KBD_BASE + KBD_SIZE).contains(&a) => self.kbd.read(a - KBD_BASE, size),
-            a if (SYSINFO_BASE..SYSINFO_BASE + SYSINFO_SIZE).contains(&a) => {
-                self.sysinfo.read(a - SYSINFO_BASE, size)
-            }
-            a if (PTR_BASE..PTR_BASE + PTR_SIZE).contains(&a) => self.ptr.read(a - PTR_BASE, size),
-            a if (TEST_DEV_BASE..TEST_DEV_BASE + TEST_DEV_SIZE).contains(&a) => Ok(0),
-            _ => Err(BusFault),
-        }
+        let at = |base, len| Self::offset_in(addr, base, len);
+        let v = if let Some(off) = at(CLINT_BASE, CLINT_SIZE) {
+            self.clint.read(off, size)
+        } else if let Some(off) = at(PLIC_BASE, PLIC_SIZE) {
+            self.plic.read(off, size)
+        } else if let Some(off) = at(UART_BASE, UART_SIZE) {
+            self.uart.read(off, size)
+        } else if let Some(off) = at(FB_CTRL_BASE, FB_CTRL_SIZE) {
+            self.fb.read(off, size)
+        } else if let Some(off) = at(KBD_BASE, KBD_SIZE) {
+            self.kbd.read(off, size)
+        } else if let Some(off) = at(SYSINFO_BASE, SYSINFO_SIZE) {
+            self.sysinfo.read(off, size)
+        } else if let Some(off) = at(PTR_BASE, PTR_SIZE) {
+            self.ptr.read(off, size)
+        } else {
+            Err(BusFault)
+        };
+        v.map(u64::from)
     }
 
-    pub fn write(&mut self, addr: u32, size: u32, val: u32) -> Result<(), BusFault> {
+    /// Writes the low `size` (1, 2, 4 or 8) bytes of `val` at physical `addr`; the
+    /// sizes taken are [`Bus::read`]'s.
+    pub fn write(&mut self, addr: u64, size: u32, val: u64) -> Result<(), BusFault> {
         if let Some(mem) = self.memory(addr, size) {
             mem.copy_from_slice(&val.to_le_bytes()[..size as usize]);
             if self.tohost == Some(addr) && val != 0 {
                 // riscv-tests convention: 1 = pass, otherwise (test_number << 1) | 1.
-                self.exit = Some(Exit::Code(if val == 1 { 0 } else { val >> 1 }));
+                self.exit = Some(Exit::Code(if val == 1 { 0 } else { (val >> 1) as u32 }));
             }
             return Ok(());
         }
         if addr == boot::BOOT_ENTRY_ADDR && size == 4 {
             // The ROM's entry word, its one writable word: a bootloader points the
             // harts it has not started yet at its kernel.
-            let at = (addr - BOOT_ROM_BASE) as usize;
+            let at = (boot::BOOT_ENTRY_ADDR - BOOT_ROM_BASE) as usize;
             if self.rom.len() < at + 4 {
                 self.rom.resize(at + 4, 0);
             }
-            self.rom[at..at + 4].copy_from_slice(&val.to_le_bytes());
+            self.rom[at..at + 4].copy_from_slice(&(val as u32).to_le_bytes());
             return Ok(());
         }
+        if let Some(off) = Self::offset_in(addr, TEST_DEV_BASE, TEST_DEV_SIZE) {
+            // Any width; only the low 32 bits of a write to offset 0 count.
+            if let Some(e) = self.test.write(off, val as u32) {
+                self.exit = Some(e);
+            }
+            return Ok(());
+        }
+        // Every other device has 32-bit registers only, for now.
+        if size == 8 {
+            return Err(BusFault);
+        }
+        let val = val as u32;
         if let Some((i, off)) = self.disk_at(addr) {
             if off == block::REG_CMD {
                 // The disk moves data between itself and RAM on its own (DMA), which
@@ -448,27 +493,23 @@ impl Bus {
                     .for_each(|r| r.snoop(paddr.into(), len.into()))
             });
         }
-        match addr {
-            a if (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&a) => {
-                self.clint.write(a - CLINT_BASE, size, val)
-            }
-            a if (PLIC_BASE..PLIC_BASE + PLIC_SIZE).contains(&a) => self.plic.write(a - PLIC_BASE, size, val),
-            a if (UART_BASE..UART_BASE + UART_SIZE).contains(&a) => self.uart.write(a - UART_BASE, size, val),
-            a if (FB_CTRL_BASE..FB_CTRL_BASE + FB_CTRL_SIZE).contains(&a) => {
-                self.fb.write(a - FB_CTRL_BASE, size, val)
-            }
-            a if (KBD_BASE..KBD_BASE + KBD_SIZE).contains(&a) => self.kbd.write(a - KBD_BASE, size, val),
-            a if (SYSINFO_BASE..SYSINFO_BASE + SYSINFO_SIZE).contains(&a) => {
-                self.sysinfo.write(a - SYSINFO_BASE, size, val)
-            }
-            a if (PTR_BASE..PTR_BASE + PTR_SIZE).contains(&a) => self.ptr.write(a - PTR_BASE, size, val),
-            a if (TEST_DEV_BASE..TEST_DEV_BASE + TEST_DEV_SIZE).contains(&a) => {
-                if let Some(e) = self.test.write(a - TEST_DEV_BASE, val) {
-                    self.exit = Some(e);
-                }
-                Ok(())
-            }
-            _ => Err(BusFault),
+        let at = |base, len| Self::offset_in(addr, base, len);
+        if let Some(off) = at(CLINT_BASE, CLINT_SIZE) {
+            self.clint.write(off, size, val)
+        } else if let Some(off) = at(PLIC_BASE, PLIC_SIZE) {
+            self.plic.write(off, size, val)
+        } else if let Some(off) = at(UART_BASE, UART_SIZE) {
+            self.uart.write(off, size, val)
+        } else if let Some(off) = at(FB_CTRL_BASE, FB_CTRL_SIZE) {
+            self.fb.write(off, size, val)
+        } else if let Some(off) = at(KBD_BASE, KBD_SIZE) {
+            self.kbd.write(off, size, val)
+        } else if let Some(off) = at(SYSINFO_BASE, SYSINFO_SIZE) {
+            self.sysinfo.write(off, size, val)
+        } else if let Some(off) = at(PTR_BASE, PTR_SIZE) {
+            self.ptr.write(off, size, val)
+        } else {
+            Err(BusFault)
         }
     }
 
@@ -483,11 +524,11 @@ impl Bus {
     }
 
     /// Side-effect-free 32-bit read of RAM or ROM, for tracing and debugging.
-    pub fn peek(&self, addr: u32) -> Option<u32> {
+    pub fn peek(&self, addr: u64) -> Option<u32> {
         let mem = if let Some(off) = self.ram_range(addr, 4) {
             &self.ram[off..off + 4]
         } else {
-            let off = addr.checked_sub(BOOT_ROM_BASE)? as usize;
+            let off = Self::rom_range(addr, 4)?;
             self.rom.get(off..off + 4)?
         };
         Some(u32::from_le_bytes([mem[0], mem[1], mem[2], mem[3]]))
@@ -495,7 +536,7 @@ impl Bus {
 
     /// A debugger's read of the byte at physical `addr`: RAM, VRAM or the boot ROM, never
     /// a device register (reading one can change it). `None` elsewhere.
-    pub fn debug_read(&self, addr: u32) -> Option<u8> {
+    pub fn debug_read(&self, addr: u64) -> Option<u8> {
         if let Some(off) = self.ram_range(addr, 1) {
             return Some(self.ram[off]);
         }
@@ -507,29 +548,34 @@ impl Bus {
 
     /// A debugger's write of the byte at physical `addr`, in RAM or VRAM; false elsewhere.
     /// Like a store, it breaks the LR/SC reservations on its line.
-    pub fn debug_write(&mut self, addr: u32, val: u8) -> bool {
+    pub fn debug_write(&mut self, addr: u64, val: u8) -> bool {
         let Some(mem) = self.memory(addr, 1) else {
             return false;
         };
         mem[0] = val;
         for r in &mut self.reservations {
-            r.snoop(addr.into(), 1);
+            r.snoop(addr, 1);
         }
         true
     }
 
     /// Copies bytes into physical memory (used by the loader).
-    pub fn load(&mut self, addr: u32, data: &[u8]) -> Result<(), BusFault> {
+    pub fn load(&mut self, addr: u64, data: &[u8]) -> Result<(), BusFault> {
         self.load_zeroed(addr, data, 0)
     }
 
     /// Copies `data` to `addr` and zeroes the bytes after it up to `size` in all (a
     /// loadable segment and its .bss). Fails, changing nothing, unless the whole range
     /// is RAM.
-    pub fn load_zeroed(&mut self, addr: u32, data: &[u8], size: u32) -> Result<(), BusFault> {
-        let size = size.max(u32::try_from(data.len()).map_err(|_| BusFault)?);
-        let off = self.ram_range(addr, size).ok_or(BusFault)?;
-        let (head, tail) = self.ram[off..off + size as usize].split_at_mut(data.len());
+    pub fn load_zeroed(&mut self, addr: u64, data: &[u8], size: u64) -> Result<(), BusFault> {
+        let size = size.max(data.len() as u64);
+        let off = addr.checked_sub(RAM_BASE).ok_or(BusFault)?;
+        let end = off.checked_add(size).ok_or(BusFault)?;
+        if end > self.ram.len() as u64 {
+            return Err(BusFault);
+        }
+        let (off, size) = (off as usize, size as usize);
+        let (head, tail) = self.ram[off..off + size].split_at_mut(data.len());
         head.copy_from_slice(data);
         tail.fill(0);
         Ok(())
@@ -556,7 +602,7 @@ mod tests {
         assert_eq!(&bus.ram[6..16], &[0xaa, 0xaa, 1, 2, 0, 0, 0, 0, 0xaa, 0xaa]);
         // Past the end of RAM, by data or by size: refused, nothing written.
         assert_eq!(bus.load_zeroed(RAM_BASE + 4094, &[3, 3, 3], 0), Err(BusFault));
-        assert_eq!(bus.load_zeroed(RAM_BASE, &[3], u32::MAX), Err(BusFault));
+        assert_eq!(bus.load_zeroed(RAM_BASE, &[3], u32::MAX.into()), Err(BusFault));
         // VRAM is memory, but programs are loaded into RAM only (spec section 7).
         assert_eq!(bus.load(VRAM_BASE, &[3]), Err(BusFault));
         assert_eq!(bus.fb.vram[0], 0);
@@ -605,7 +651,7 @@ mod tests {
         bus.set_disk_boot();
         // The stub, its entry word pointing at the loader, and the loader.
         assert_eq!(bus.peek(BOOT_ROM_BASE), Some(0x0000_0297), "auipc t0, 0");
-        assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(boot::DISK_BOOT_PC));
+        assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(boot::DISK_BOOT_PC as u32));
         assert_eq!(
             bus.peek(boot::DISK_BOOT_PC),
             Some(0xf140_22f3),
@@ -639,20 +685,19 @@ mod tests {
         assert_eq!(bus.harts(), 3);
         // The same devices as a one-hart machine: the CLINT and PLIC pages have room.
         assert_eq!(bus.sysinfo.devices(), device_table(&MachineConfig::default(), 0));
-        assert_eq!(bus.read(SYSINFO_BASE + sysinfo::REG_HARTS, 4), Ok(3));
+        assert_eq!(bus.read(SYSINFO_BASE + u64::from(sysinfo::REG_HARTS), 4), Ok(3));
         // The park loop is there from the start; set_boot_entry only sets the entry.
         assert_eq!(bus.peek(PARK_PC), Some(0xf140_2573), "csrr a0, mhartid");
         assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(0));
         bus.set_boot_entry(RAM_BASE);
-        assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(RAM_BASE));
+        assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(RAM_BASE as u32));
         assert_eq!(bus.peek(PARK_PC), Some(0xf140_2573));
 
         // A store to memory breaks every hart's reservation on the line; a store to a
         // device only the storing hart's.
         let reserve = |bus: &mut Bus| {
             for hart in 0..3 {
-                bus.reservation_mut(hart)
-                    .reserve(u64::from(RAM_BASE) + 64 * hart as u64, 4);
+                bus.reservation_mut(hart).reserve(RAM_BASE + 64 * hart as u64, 4);
             }
         };
         let held = |bus: &Bus| -> Vec<bool> { (0..3).map(|h| bus.reservation(h).held().is_some()).collect() };
@@ -674,14 +719,21 @@ mod tests {
             ..MachineConfig::default()
         };
         let mut bus = Bus::new(&config, Vec::new());
-        let reg = |bus: &mut Bus, off| bus.read(SYSINFO_BASE + off, 4).unwrap();
-        assert_eq!(reg(&mut bus, sysinfo::REG_MAGIC), sysinfo::SYSINFO_MAGIC);
+        let reg = |bus: &mut Bus, off: u32| bus.read(SYSINFO_BASE + u64::from(off), 4).unwrap();
+        assert_eq!(
+            reg(&mut bus, sysinfo::REG_MAGIC),
+            u64::from(sysinfo::SYSINFO_MAGIC)
+        );
         assert_eq!(reg(&mut bus, sysinfo::REG_RAM_BASE), RAM_BASE);
         assert_eq!(reg(&mut bus, sysinfo::REG_RAM_SIZE), 32 * 1024 * 1024);
         assert_eq!(reg(&mut bus, sysinfo::REG_TIMEBASE_HZ), 250_000);
         assert_eq!(reg(&mut bus, sysinfo::REG_CPU_HZ), 250_000);
-        assert_eq!(reg(&mut bus, sysinfo::REG_FLAGS), sysinfo::FLAG_REAL_TIME);
-        bus.write(SYSINFO_BASE + sysinfo::REG_RAM_SIZE, 4, 1).unwrap();
+        assert_eq!(
+            reg(&mut bus, sysinfo::REG_FLAGS),
+            u64::from(sysinfo::FLAG_REAL_TIME)
+        );
+        bus.write(SYSINFO_BASE + u64::from(sysinfo::REG_RAM_SIZE), 4, 1)
+            .unwrap();
         assert_eq!(
             reg(&mut bus, sysinfo::REG_RAM_SIZE),
             32 * 1024 * 1024,
@@ -706,30 +758,32 @@ mod tests {
     /// Checks that `bus`'s sysinfo table describes the bus: every entry readable by
     /// software, decoded at both ends, no overlaps, and the right interrupt sources.
     fn device_table_matches(mut bus: Bus) {
-        let count = bus.read(SYSINFO_BASE + sysinfo::REG_DEV_COUNT, 4).unwrap();
+        let count = bus
+            .read(SYSINFO_BASE + u64::from(sysinfo::REG_DEV_COUNT), 4)
+            .unwrap();
         let table = bus.sysinfo.devices().to_vec();
         assert_eq!(count as usize, table.len());
-        let ram = RAM_BASE as u64..1 << 32;
-        let rom = BOOT_ROM_BASE as u64..BOOT_ROM_BASE as u64 + 0x1000;
+        let ram = RAM_BASE..1 << 32;
+        let rom = BOOT_ROM_BASE..BOOT_ROM_BASE + 0x1000;
         assert!(table.is_sorted_by_key(|d| d.base), "address order");
         for (i, d) in table.iter().enumerate() {
             // The entry as software reads it.
-            let at = |field: u32| SYSINFO_BASE + DEV_TABLE + i as u32 * DEV_ENTRY_SIZE + field;
-            assert_eq!(bus.read(at(0), 4), Ok(d.kind as u32));
+            let at = |field: u32| SYSINFO_BASE + u64::from(DEV_TABLE + i as u32 * DEV_ENTRY_SIZE + field);
+            assert_eq!(bus.read(at(0), 4), Ok(d.kind as u64));
             assert_eq!(bus.read(at(4), 4), Ok(d.base));
             assert_eq!(bus.read(at(8), 4), Ok(d.size));
-            assert_eq!(bus.read(at(12), 4), Ok(d.irq));
+            assert_eq!(bus.read(at(12), 4), Ok(d.irq.into()));
 
             // Both ends of the range are decoded (UART registers are bytes, the rest words),
             // and the byte past it is not this device.
             let width = if d.kind == DeviceType::Uart { 1 } else { 4 };
-            let last = d.base + d.size - width;
+            let last = d.base + d.size - u64::from(width);
             assert!(bus.read(d.base, width).is_ok(), "{:?} base", d.kind);
             assert!(bus.read(last, width).is_ok(), "{:?} last", d.kind);
             assert!(d.size > 0 && d.base.checked_add(d.size).is_some());
-            let range = d.base as u64..(d.base + d.size) as u64;
+            let range = d.base..d.base + d.size;
             for other in &table[i + 1..] {
-                let o = other.base as u64..(other.base + other.size) as u64;
+                let o = other.base..other.base + other.size;
                 assert!(
                     range.end <= o.start || o.end <= range.start,
                     "{:?} overlaps {:?}",
@@ -757,7 +811,7 @@ mod tests {
         for (i, d) in disks.iter().enumerate() {
             assert_eq!(
                 (d.base, d.irq),
-                (BLK_BASE + i as u32 * BLK_SIZE, BLK_IRQ + i as u32)
+                (BLK_BASE + i as u64 * BLK_SIZE, BLK_IRQ + i as u32)
             );
         }
         // So are network cards.
@@ -766,7 +820,7 @@ mod tests {
         for (i, d) in nets.iter().enumerate() {
             assert_eq!(
                 (d.base, d.irq),
-                (NET_BASE + i as u32 * NET_SIZE, NET_IRQ + i as u32)
+                (NET_BASE + i as u64 * NET_SIZE, NET_IRQ + i as u32)
             );
         }
         // All the sources are different and exist on the PLIC.
@@ -816,40 +870,51 @@ mod tests {
         let mut bus = bus_with_nets(0, 2, &hub);
         let mut peer = hub.attach();
         let card1 = NET_BASE + NET_SIZE;
-        assert_eq!(bus.read(NET_BASE + net::REG_MAC_LO, 4), Ok(0x0000_ca02));
-        assert_eq!(bus.read(NET_BASE + net::REG_MAC_HI, 4), Ok(0x0100));
-        assert_eq!(bus.read(card1 + net::REG_MAC_HI, 4), Ok(0x0200));
+        assert_eq!(
+            bus.read(NET_BASE + u64::from(net::REG_MAC_LO), 4),
+            Ok(0x0000_ca02)
+        );
+        assert_eq!(bus.read(NET_BASE + u64::from(net::REG_MAC_HI), 4), Ok(0x0100));
+        assert_eq!(bus.read(card1 + u64::from(net::REG_MAC_HI), 4), Ok(0x0200));
 
         // Card 1 sends a frame from RAM: a one-descriptor ring at RAM_BASE, the frame
         // at RAM_BASE + 64.
         let frame: Vec<u8> = (0..20).collect();
         bus.ram[64..84].copy_from_slice(&frame);
-        bus.ram[..4].copy_from_slice(&(RAM_BASE + 64).to_le_bytes());
+        bus.ram[..4].copy_from_slice(&((RAM_BASE + 64) as u32).to_le_bytes());
         bus.ram[4..6].copy_from_slice(&20u16.to_le_bytes());
-        bus.write(card1 + net::REG_TX_BASE, 4, RAM_BASE).unwrap();
-        bus.write(card1 + net::REG_TX_SIZE, 4, 1).unwrap();
-        bus.write(card1 + net::REG_IRQ_ENABLE, 4, IRQ_TX).unwrap();
-        bus.write(card1 + net::REG_TX_TAIL, 4, 1).unwrap();
-        assert_eq!(bus.read(card1 + net::REG_TX_HEAD, 4), Ok(1));
+        bus.write(card1 + u64::from(net::REG_TX_BASE), 4, RAM_BASE)
+            .unwrap();
+        bus.write(card1 + u64::from(net::REG_TX_SIZE), 4, 1).unwrap();
+        bus.write(card1 + u64::from(net::REG_IRQ_ENABLE), 4, IRQ_TX.into())
+            .unwrap();
+        bus.write(card1 + u64::from(net::REG_TX_TAIL), 4, 1).unwrap();
+        assert_eq!(bus.read(card1 + u64::from(net::REG_TX_HEAD), 4), Ok(1));
         assert_eq!(peer.recv(), Some(frame.clone()));
         // Card 0 is on the same hub, and gets it at its next poll: no ring, so dropped.
         for _ in 0..net::POLL_STEPS {
             bus.update_interrupts();
         }
-        assert_eq!(bus.read(NET_BASE + net::REG_RX_DROPPED, 4), Ok(1));
+        assert_eq!(bus.read(NET_BASE + u64::from(net::REG_RX_DROPPED), 4), Ok(1));
         // Card 1's line reaches the PLIC as source NET_IRQ + 1.
         assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << (NET_IRQ + 1)));
 
         // Words only; nothing past the last card; not memory.
         assert_eq!(bus.read(NET_BASE, 1), Err(BusFault));
-        assert_eq!(bus.write(NET_BASE + net::REG_TX_TAIL, 2, 1), Err(BusFault));
+        assert_eq!(
+            bus.write(NET_BASE + u64::from(net::REG_TX_TAIL), 2, 1),
+            Err(BusFault)
+        );
         assert_eq!(bus.read(NET_BASE + 2 * NET_SIZE, 4), Err(BusFault));
         assert_eq!(bus.write(NET_BASE + 2 * NET_SIZE, 4, 0), Err(BusFault));
         assert_eq!(bus.read_mem(NET_BASE, 4), Err(BusFault));
         // Without cards the range is unmapped, even with every disk.
         let mut bus = bus_with_nets(MAX_DISKS, 0, &hub);
         assert_eq!(bus.read(NET_BASE, 4), Err(BusFault));
-        assert_eq!(bus.write(NET_BASE + net::REG_TX_TAIL, 4, 1), Err(BusFault));
+        assert_eq!(
+            bus.write(NET_BASE + u64::from(net::REG_TX_TAIL), 4, 1),
+            Err(BusFault)
+        );
         assert!(bus.read(NET_BASE - 4, 4).is_ok(), "the last disk's page");
     }
 
@@ -879,17 +944,22 @@ mod tests {
     fn disk_registers_on_the_bus() {
         let mut bus = bus_with_disks(2);
         let disk1 = BLK_BASE + BLK_SIZE;
-        assert_eq!(bus.read(BLK_BASE + block::REG_CAPACITY, 4), Ok(1));
-        assert_eq!(bus.read(disk1 + block::REG_CAPACITY, 4), Ok(1));
+        assert_eq!(bus.read(BLK_BASE + u64::from(block::REG_CAPACITY), 4), Ok(1));
+        assert_eq!(bus.read(disk1 + u64::from(block::REG_CAPACITY), 4), Ok(1));
         // Disk 1, sector 0 -> the start of RAM, with DMA through the bus's own RAM.
-        bus.write(disk1 + block::REG_DMA, 4, RAM_BASE + 8).unwrap();
-        bus.write(disk1 + block::REG_COUNT, 4, 1).unwrap();
-        bus.write(disk1 + block::REG_CTRL, 4, 1).unwrap();
-        bus.write(disk1 + block::REG_CMD, 4, block::CMD_READ).unwrap();
-        assert_eq!(bus.read(disk1 + block::REG_STATUS, 4), Ok(block::STATUS_DONE));
-        assert_eq!(bus.read(disk1 + block::REG_ERROR, 4), Ok(0));
+        bus.write(disk1 + u64::from(block::REG_DMA), 4, RAM_BASE + 8)
+            .unwrap();
+        bus.write(disk1 + u64::from(block::REG_COUNT), 4, 1).unwrap();
+        bus.write(disk1 + u64::from(block::REG_CTRL), 4, 1).unwrap();
+        bus.write(disk1 + u64::from(block::REG_CMD), 4, block::CMD_READ.into())
+            .unwrap();
         assert_eq!(
-            bus.read(BLK_BASE + block::REG_STATUS, 4),
+            bus.read(disk1 + u64::from(block::REG_STATUS), 4),
+            Ok(block::STATUS_DONE.into())
+        );
+        assert_eq!(bus.read(disk1 + u64::from(block::REG_ERROR), 4), Ok(0));
+        assert_eq!(
+            bus.read(BLK_BASE + u64::from(block::REG_STATUS), 4),
             Ok(0),
             "disk 0 did nothing"
         );
@@ -903,14 +973,20 @@ mod tests {
 
         // Words only; nothing past the last disk; not memory.
         assert_eq!(bus.read(BLK_BASE, 1), Err(BusFault));
-        assert_eq!(bus.write(BLK_BASE + block::REG_CMD, 2, 1), Err(BusFault));
+        assert_eq!(
+            bus.write(BLK_BASE + u64::from(block::REG_CMD), 2, 1),
+            Err(BusFault)
+        );
         assert_eq!(bus.read(BLK_BASE + 2 * BLK_SIZE, 4), Err(BusFault));
         assert_eq!(bus.write(BLK_BASE + 2 * BLK_SIZE, 4, 0), Err(BusFault));
         assert_eq!(bus.read_mem(BLK_BASE, 4), Err(BusFault));
         // Without disks the range is unmapped.
         let mut bus = small_bus();
         assert_eq!(bus.read(BLK_BASE, 4), Err(BusFault));
-        assert_eq!(bus.write(BLK_BASE + block::REG_CMD, 4, 1), Err(BusFault));
+        assert_eq!(
+            bus.write(BLK_BASE + u64::from(block::REG_CMD), 4, 1),
+            Err(BusFault)
+        );
     }
 
     /// A `Write` whose bytes the test can still read after handing it to the bus.
@@ -962,7 +1038,7 @@ mod tests {
     #[test]
     fn vram_bounds() {
         let mut bus = small_bus();
-        let last = VRAM_BASE + VRAM_SIZE - 4;
+        let last = VRAM_BASE + u64::from(VRAM_SIZE) - 4;
         assert_eq!(last, 0x3112_bffc);
         bus.write(last, 4, 0x0011_2233).unwrap();
         assert_eq!(bus.read(last, 4), Ok(0x0011_2233));
@@ -1004,7 +1080,10 @@ mod tests {
         assert_eq!(bus.read(KBD_BASE, 1), Err(BusFault));
         assert_eq!(bus.write(KBD_BASE + 8, 2, 0), Err(BusFault));
         // The next page is sysinfo's, not the keyboard's.
-        assert_eq!(bus.read(KBD_BASE + KBD_SIZE, 4), Ok(sysinfo::SYSINFO_MAGIC));
+        assert_eq!(
+            bus.read(KBD_BASE + KBD_SIZE, 4),
+            Ok(u64::from(sysinfo::SYSINFO_MAGIC))
+        );
         // Data accesses only.
         assert_eq!(bus.read_mem(KBD_BASE, 4), Err(BusFault));
     }
@@ -1013,30 +1092,31 @@ mod tests {
     fn pointer_registers_on_the_bus() {
         use crate::pointer::{self as ptr, PointerInput, BUTTON_LEFT};
         let mut bus = small_bus();
-        assert_eq!(bus.read(PTR_BASE + ptr::REG_STATUS, 4), Ok(0));
-        assert_eq!(bus.read(PTR_BASE + ptr::REG_EVENT, 4), Ok(0));
+        let reg = |off: u32| PTR_BASE + u64::from(off);
+        assert_eq!(bus.read(reg(ptr::REG_STATUS), 4), Ok(0));
+        assert_eq!(bus.read(reg(ptr::REG_EVENT), 4), Ok(0));
         bus.ptr
             .push(PointerInput::move_to(320, 240).with_buttons(BUTTON_LEFT));
-        assert_eq!(bus.read(PTR_BASE + ptr::REG_STATUS, 4), Ok(ptr::STATUS_EVENT));
-        assert_eq!(bus.read(PTR_BASE + ptr::REG_EVENT, 4), Ok(0x8000_0001));
-        assert_eq!(bus.read(PTR_BASE + ptr::REG_EVENT_XY, 4), Ok(320 | 240 << 16));
-        assert_eq!(bus.read(PTR_BASE + ptr::REG_POS, 4), Ok(320 | 240 << 16));
-        assert_eq!(bus.read(PTR_BASE + ptr::REG_BUTTONS, 4), Ok(1));
-        assert_eq!(bus.read(PTR_BASE + ptr::REG_STATUS, 4), Ok(0));
+        assert_eq!(bus.read(reg(ptr::REG_STATUS), 4), Ok(ptr::STATUS_EVENT.into()));
+        assert_eq!(bus.read(reg(ptr::REG_EVENT), 4), Ok(0x8000_0001));
+        assert_eq!(bus.read(reg(ptr::REG_EVENT_XY), 4), Ok(320 | 240 << 16));
+        assert_eq!(bus.read(reg(ptr::REG_POS), 4), Ok(320 | 240 << 16));
+        assert_eq!(bus.read(reg(ptr::REG_BUTTONS), 4), Ok(1));
+        assert_eq!(bus.read(reg(ptr::REG_STATUS), 4), Ok(0));
 
         // Its line reaches the PLIC as source PTR_IRQ once enabled.
         bus.ptr.push(PointerInput::move_to(1, 1));
         bus.update_interrupts();
         assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(0));
-        bus.write(PTR_BASE + ptr::REG_CTRL, 4, ptr::CTRL_IRQ_ENABLE)
+        bus.write(reg(ptr::REG_CTRL), 4, ptr::CTRL_IRQ_ENABLE.into())
             .unwrap();
         bus.update_interrupts();
         assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << PTR_IRQ));
 
         // Words only, nothing popped by a faulting access; the page ends the range.
-        assert_eq!(bus.read(PTR_BASE + ptr::REG_EVENT, 1), Err(BusFault));
-        assert_eq!(bus.read(PTR_BASE + ptr::REG_EVENT, 2), Err(BusFault));
-        assert_eq!(bus.write(PTR_BASE + ptr::REG_CTRL, 2, 0), Err(BusFault));
+        assert_eq!(bus.read(reg(ptr::REG_EVENT), 1), Err(BusFault));
+        assert_eq!(bus.read(reg(ptr::REG_EVENT), 2), Err(BusFault));
+        assert_eq!(bus.write(reg(ptr::REG_CTRL), 2, 0), Err(BusFault));
         assert_eq!(bus.ptr.len(), 1);
         assert_eq!(bus.read(PTR_BASE + 0xffc, 4), Ok(0));
         assert_eq!(bus.read(PTR_BASE + PTR_SIZE, 4), Err(BusFault));

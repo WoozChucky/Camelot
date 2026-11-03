@@ -65,8 +65,8 @@ pub enum DeviceType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceEntry {
     pub kind: DeviceType,
-    pub base: u32,
-    pub size: u32,
+    pub base: u64,
+    pub size: u64,
     pub irq: u32,
 }
 
@@ -107,7 +107,7 @@ impl Sysinfo {
         Ok(match off {
             REG_MAGIC => SYSINFO_MAGIC,
             REG_VERSION => SYSINFO_VERSION,
-            REG_RAM_BASE => RAM_BASE,
+            REG_RAM_BASE => RAM_BASE as u32,
             REG_RAM_SIZE => self.ram_size,
             // One instruction = one cycle = one mtime tick: both run at the same rate.
             REG_TIMEBASE_HZ | REG_CPU_HZ => self.cpu_hz,
@@ -119,8 +119,8 @@ impl Sysinfo {
                 match self.devices.get(index) {
                     Some(d) => match (o - DEV_TABLE) % DEV_ENTRY_SIZE {
                         0 => d.kind as u32,
-                        4 => d.base,
-                        8 => d.size,
+                        4 => d.base as u32,
+                        8 => d.size as u32,
                         12 => d.irq,
                         _ => 0,
                     },

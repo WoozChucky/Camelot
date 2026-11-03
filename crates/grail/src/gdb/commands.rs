@@ -487,8 +487,10 @@ fn unhex_bytes(s: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::RAM_BASE;
     use crate::MachineConfig;
+
+    /// RAM's base as the debug interface takes addresses: 32 bits.
+    const RAM_BASE: u32 = crate::bus::RAM_BASE as u32;
 
     /// A machine of `harts` harts with 64 KiB of RAM, and its stub.
     fn setup(harts: usize) -> (Machine, Stub) {
@@ -551,7 +553,7 @@ mod tests {
             assert_eq!(ask(&mut m, &mut stub, p), "E01", "{p:?}");
         }
         // Nothing changed.
-        assert_eq!(m.pc(), crate::bus::BOOT_ROM_BASE);
+        assert_eq!(m.pc(), crate::bus::BOOT_ROM_BASE as u32);
         assert_eq!(m.breakpoints().count(), 0);
     }
 
@@ -698,10 +700,10 @@ mod tests {
             "length mismatch"
         );
         // The boot ROM reads; device registers and holes do not.
-        m.cpu.bus.set_boot_entry(RAM_BASE);
+        m.cpu.bus.set_boot_entry(crate::bus::RAM_BASE);
         assert_eq!(
             ask(&mut m, &mut stub, "m1000,4"),
-            hex_word(m.cpu.bus.read_mem(0x1000, 4).unwrap())
+            hex_word(m.cpu.bus.read_mem(0x1000, 4).unwrap() as u32)
         );
         assert_ne!(ask(&mut m, &mut stub, "m1000,4"), "00000000");
         assert_eq!(ask(&mut m, &mut stub, "m10000000,1"), "E0e", "UART");
@@ -774,7 +776,10 @@ mod tests {
         assert_eq!(ask(&mut m, &mut stub, "Hg2"), "OK");
         assert_eq!(m.selected_hart(), 1);
         assert_eq!(ask(&mut m, &mut stub, "qC"), "QC2");
-        assert_eq!(ask(&mut m, &mut stub, "p20"), hex_word(crate::bus::PARK_PC));
+        assert_eq!(
+            ask(&mut m, &mut stub, "p20"),
+            hex_word(crate::bus::PARK_PC as u32)
+        );
         assert_eq!(ask(&mut m, &mut stub, "Hg0"), "OK", "any: unchanged");
         assert_eq!(m.selected_hart(), 1);
         assert_eq!(ask(&mut m, &mut stub, "Hg3"), "E16");

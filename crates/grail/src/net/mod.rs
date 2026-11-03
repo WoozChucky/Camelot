@@ -489,7 +489,7 @@ impl NetDevice {
 /// The RAM indices of the physical range `[addr, addr + len)`, if it is all RAM.
 /// 64-bit arithmetic: no wrap-around.
 fn ram_range(ram: &[u8], addr: u64, len: u64) -> Option<std::ops::Range<usize>> {
-    let start = addr.checked_sub(RAM_BASE as u64)?;
+    let start = addr.checked_sub(RAM_BASE)?;
     let end = start + len;
     (end <= ram.len() as u64).then_some(start as usize..end as usize)
 }

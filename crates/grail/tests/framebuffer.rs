@@ -245,7 +245,7 @@ fn run_for_stops_only_at_a_present_of_its_own() {
     let file = std::fs::read(colorbars_elf()).unwrap();
     let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.load_elf(&file).unwrap();
-    let present = grail::bus::FB_CTRL_BASE + grail::framebuffer::REG_PRESENT;
+    let present = grail::bus::FB_CTRL_BASE + u64::from(grail::framebuffer::REG_PRESENT);
     m.cpu.bus.write(present, 4, 1).unwrap();
     assert!(m.cpu.bus.fb.present_pending());
     assert_eq!(m.run_for(1000, &mut |_| {}), 1000);
@@ -255,18 +255,17 @@ fn run_for_stops_only_at_a_present_of_its_own() {
 
 /// Runs one load or store with `a0` = `addr` and `a1` = 0x0000_0101 at
 /// RAM_BASE; returns the machine and, if it trapped, (mcause, mtval).
-fn one_access(inst: u32, addr: u32) -> (Machine, Option<(u32, u32)>) {
-    const RAM_BASE: u32 = grail::bus::RAM_BASE;
+fn one_access(inst: u32, addr: u64) -> (Machine, Option<(u64, u64)>) {
+    use grail::bus::RAM_BASE;
     let trap_vector = RAM_BASE + 0x4000;
     let mut m = Machine::with_ram(1 << 20);
     m.cpu.bus.load(RAM_BASE, &inst.to_le_bytes()).unwrap();
-    m.cpu.pc = RAM_BASE.into();
-    m.cpu.csr.mtvec = trap_vector.into();
-    m.cpu.set_reg(10, addr.into());
+    m.cpu.pc = RAM_BASE;
+    m.cpu.csr.mtvec = trap_vector;
+    m.cpu.set_reg(10, addr);
     m.cpu.x[11] = 0x0000_0101;
     m.cpu.step();
-    let trap =
-        (m.cpu.pc == u64::from(trap_vector)).then_some((m.cpu.csr.mcause as u32, m.cpu.csr.mtval as u32));
+    let trap = (m.cpu.pc == trap_vector).then_some((m.cpu.csr.mcause, m.cpu.csr.mtval));
     (m, trap)
 }
 
@@ -280,8 +279,8 @@ fn programs_see_the_register_rules_as_traps() {
     let load = |funct3: u32| 10 << 15 | funct3 << 12 | 12 << 7 | 0x03;
     let store = |funct3: u32| 11 << 20 | 10 << 15 | funct3 << 12 | 0x23;
     let (lb, lh, lw, sb, sh, sw) = (load(0), load(1), load(2), store(0), store(1), store(2));
-    let ctrl = FB_CTRL_BASE + REG_CTRL;
-    let present = FB_CTRL_BASE + REG_PRESENT;
+    let ctrl = FB_CTRL_BASE + u64::from(REG_CTRL);
+    let present = FB_CTRL_BASE + u64::from(REG_PRESENT);
     for (inst, addr, cause) in [
         (lb, ctrl, 5),
         (lh, ctrl, 5),
@@ -290,8 +289,8 @@ fn programs_see_the_register_rules_as_traps() {
         (sb, present, 7),
         (lw, FB_CTRL_BASE + 2, 4), // misaligned
         (sw, FB_CTRL_BASE + 2, 6),
-        (lw, VRAM_BASE + VRAM_SIZE, 5), // just past VRAM
-        (sb, VRAM_BASE + VRAM_SIZE, 7),
+        (lw, VRAM_BASE + u64::from(VRAM_SIZE), 5), // just past VRAM
+        (sb, VRAM_BASE + u64::from(VRAM_SIZE), 7),
         (lw, VRAM_BASE + 2, 4),
     ] {
         let (m, trap) = one_access(inst, addr);
@@ -312,8 +311,8 @@ fn programs_see_the_register_rules_as_traps() {
     let (mut m, _) = one_access(0x0000_0013, 0); // nop: just a machine
     m.cpu.bus.write(VRAM_BASE + 5, 1, 0x80).unwrap();
     m.cpu.bus.load(grail::bus::RAM_BASE, &lb.to_le_bytes()).unwrap();
-    m.cpu.pc = grail::bus::RAM_BASE.into();
-    m.cpu.set_reg(10, (VRAM_BASE + 5).into());
+    m.cpu.pc = grail::bus::RAM_BASE;
+    m.cpu.set_reg(10, VRAM_BASE + 5);
     m.cpu.step();
     assert_eq!(m.cpu.x[12] as u32, 0xffff_ff80);
 }

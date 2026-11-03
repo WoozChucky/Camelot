@@ -187,7 +187,7 @@ fn bare_machine(config: MachineConfig, program: &[u32]) -> Machine {
     let mut m = Machine::new(config).unwrap();
     let code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     m.cpu.bus.load(RAM_BASE, &code).unwrap();
-    m.cpu.pc = RAM_BASE.into();
+    m.cpu.pc = RAM_BASE;
     m
 }
 
@@ -229,7 +229,7 @@ fn wfi_program(when: u32, mie: u32) -> Vec<u32> {
     const T0: u32 = 5;
     const T1: u32 = 6;
     let mut p = Vec::new();
-    p.extend(li(T0, CLINT_BASE + 0x4000)); // t0 = &mtimecmp
+    p.extend(li(T0, (CLINT_BASE + 0x4000) as u32)); // t0 = &mtimecmp
     p.extend(li(T1, when));
     p.push(0x0062_a023); // sw   t1, 0(t0)
     p.push(0x0002_a223); // sw   zero, 4(t0)

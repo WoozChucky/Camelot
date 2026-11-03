@@ -16,9 +16,9 @@ const A2: u32 = 12;
 const ZERO: u32 = 0;
 
 /// Where the tests keep their data words.
-const DATA: u32 = RAM_BASE + 0x8000;
+const DATA: u64 = RAM_BASE + 0x8000;
 /// Trap vector: the tests only look at the cause, nothing runs there.
-const TRAP_VECTOR: u32 = RAM_BASE + 0x4000;
+const TRAP_VECTOR: u64 = RAM_BASE + 0x4000;
 
 const OP_AMO: u32 = 0b0101111;
 
@@ -52,21 +52,22 @@ fn machine(code: &[u32]) -> Machine {
     let mut m = Machine::with_ram(1 << 20);
     let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
     m.cpu.bus.load(RAM_BASE, &bytes).unwrap();
-    m.cpu.pc = RAM_BASE.into();
-    m.cpu.csr.mtvec = TRAP_VECTOR.into();
+    m.cpu.pc = RAM_BASE;
+    m.cpu.csr.mtvec = TRAP_VECTOR;
     m
 }
 
-fn reg(m: &Machine, r: u32) -> u32 {
-    m.cpu.x[r as usize] as u32
+/// Register `r` as the RV32 hart sees it: its low 32 bits (`x` holds them sign-extended).
+fn reg(m: &Machine, r: u32) -> u64 {
+    u64::from(m.cpu.x[r as usize] as u32)
 }
-fn set(m: &mut Machine, r: u32, v: u32) {
-    m.cpu.set_reg(r as u8, v.into());
+fn set(m: &mut Machine, r: u32, v: u64) {
+    m.cpu.set_reg(r as u8, v);
 }
-fn word(m: &mut Machine, addr: u32) -> u32 {
+fn word(m: &mut Machine, addr: u64) -> u64 {
     m.cpu.bus.read(addr, 4).unwrap()
 }
-fn poke(m: &mut Machine, addr: u32, v: u32) {
+fn poke(m: &mut Machine, addr: u64, v: u64) {
     m.cpu.bus.write(addr, 4, v).unwrap();
 }
 
@@ -83,15 +84,11 @@ fn step(m: &mut Machine) {
 }
 
 /// Steps one instruction and checks it trapped with `cause` and `mtval`.
-fn step_traps(m: &mut Machine, cause: u32, tval: u32) {
+fn step_traps(m: &mut Machine, cause: u64, tval: u64) {
     let pc = m.cpu.pc;
     m.cpu.step();
-    assert_eq!(
-        m.cpu.pc,
-        u64::from(TRAP_VECTOR),
-        "instruction at {pc:#x} did not trap"
-    );
-    assert_eq!((m.cpu.csr.mcause, m.cpu.csr.mtval), (cause.into(), tval.into()));
+    assert_eq!(m.cpu.pc, TRAP_VECTOR, "instruction at {pc:#x} did not trap");
+    assert_eq!((m.cpu.csr.mcause, m.cpu.csr.mtval), (cause, tval));
     assert_eq!(m.cpu.csr.mepc, pc);
 }
 
@@ -106,11 +103,11 @@ fn misa_reports_a() {
 
 #[test]
 fn every_amo_returns_the_old_word_and_writes_the_result() {
-    let (neg, pos) = (0x8000_0000u32, 1u32);
+    let (neg, pos) = (0x8000_0000u64, 1u64);
     // (funct5, memory before, rs2, memory after)
     let cases = [
         (0b00001, 5, 7, 7),                               // amoswap
-        (0b00000, u32::MAX, 2, 1),                        // amoadd wraps
+        (0b00000, u64::from(u32::MAX), 2, 1),             // amoadd wraps
         (0b00100, 0b1100, 0b1010, 0b0110),                // amoxor
         (0b01100, 0b1100, 0b1010, 0b1000),                // amoand
         (0b01000, 0b1100, 0b1010, 0b1110),                // amoor
@@ -166,7 +163,7 @@ fn lr_sc_pair_succeeds_once() {
     set(&mut m, A1, 99);
     step(&mut m);
     assert_eq!(reg(&m, A2), 7);
-    assert_eq!(m.cpu.reservation().held(), Some(DATA.into()));
+    assert_eq!(m.cpu.reservation().held(), Some(DATA));
     step(&mut m);
     assert_eq!((reg(&m, A2), word(&mut m, DATA)), (0, 99), "sc succeeds");
     assert_eq!(m.cpu.reservation().held(), None);
@@ -205,7 +202,7 @@ fn sc_to_another_word_fails_and_drops_the_reservation() {
 
 /// Runs `lr a2, (a0)`, then `between` (with a1 = `a1`), then `sc a2, zero, (a0)`,
 /// and returns what the sc wrote to a2: 0 if the reservation survived `between`.
-fn sc_after(between: &[u32], a1: u32) -> u32 {
+fn sc_after(between: &[u32], a1: u64) -> u64 {
     let mut code = vec![lr(A2, A0)];
     code.extend(between);
     code.push(sc(A2, ZERO, A0));
@@ -247,7 +244,7 @@ fn traps_break_the_reservation() {
     let mut m = machine(&[lr(A2, A0), ECALL]);
     set(&mut m, A0, DATA);
     step(&mut m);
-    assert_eq!(m.cpu.reservation().held(), Some(DATA.into()));
+    assert_eq!(m.cpu.reservation().held(), Some(DATA));
     step_traps(&mut m, 11, 0);
     assert_eq!(m.cpu.reservation().held(), None);
 
@@ -315,7 +312,7 @@ fn atomics_do_not_read_device_registers() {
     // Spec 4.1: "Device registers are not read or written". Reading the
     // keyboard's 32-bit KBD_DATA takes the oldest event; an lr.w or AMO on
     // it traps and leaves the event for the next lw.
-    let data = KBD_BASE + grail::keyboard::REG_DATA;
+    let data = KBD_BASE + u64::from(grail::keyboard::REG_DATA);
     for (inst, cause) in [(lr(A2, A0), 5), (amoadd(A2, A1, A0), 7)] {
         let mut m = machine(&[inst]);
         assert!(m.key_event(KeyEvent::press(b'x')));
@@ -341,22 +338,22 @@ fn atomics_work_on_vram() {
 // --- Sv32: M-mode with MPRV set and MPP = S, so data accesses are translated
 // (as for S-mode) while instructions are still fetched from physical RAM.
 
-const ROOT: u32 = RAM_BASE + 0x1000;
-const LEAF_TABLE: u32 = RAM_BASE + 0x2000;
+const ROOT: u64 = RAM_BASE + 0x1000;
+const LEAF_TABLE: u64 = RAM_BASE + 0x2000;
 /// Virtual pages, all in the 4 MiB region at 0x4000_0000 (one leaf table).
-const VA: u32 = 0x4000_0000;
+const VA: u64 = 0x4000_0000;
 /// Physical page behind them.
-const PAGE: u32 = RAM_BASE + 0x8000;
+const PAGE: u64 = RAM_BASE + 0x8000;
 
-const PTE_V: u32 = 1;
-const PTE_R: u32 = 2;
-const PTE_W: u32 = 4;
-const PTE_A: u32 = 1 << 6;
-const PTE_D: u32 = 1 << 7;
+const PTE_V: u64 = 1;
+const PTE_R: u64 = 2;
+const PTE_W: u64 = 4;
+const PTE_A: u64 = 1 << 6;
+const PTE_D: u64 = 1 << 7;
 
 /// Maps virtual page `VA + 4 KiB * i` to `PAGE` with `flags` (`PTE_V` added), and
 /// returns the PTE's address.
-fn map(m: &mut Machine, i: u32, flags: u32) -> u32 {
+fn map(m: &mut Machine, i: u64, flags: u64) -> u64 {
     poke(m, ROOT + (VA >> 22) * 4, (LEAF_TABLE >> 12) << 10 | PTE_V);
     let pte = LEAF_TABLE + i * 4;
     poke(m, pte, (PAGE >> 12) << 10 | flags | PTE_V);
@@ -365,7 +362,7 @@ fn map(m: &mut Machine, i: u32, flags: u32) -> u32 {
 
 fn paged_machine(code: &[u32]) -> Machine {
     let mut m = machine(code);
-    m.cpu.csr.satp = (1 << 31 | ROOT >> 12).into();
+    m.cpu.csr.satp = 1 << 31 | ROOT >> 12;
     m.cpu.csr.mstatus |= 1 << 17 | (Mode::S as u64) << 11; // MPRV, MPP = S
     m
 }
@@ -433,7 +430,7 @@ fn reservations_are_on_physical_addresses() {
     set(&mut m, A0, VA + 8);
     set(&mut m, A1, 77);
     step(&mut m);
-    assert_eq!(m.cpu.reservation().held(), Some((PAGE + 8).into()));
+    assert_eq!(m.cpu.reservation().held(), Some(PAGE + 8));
     step(&mut m);
     assert_eq!((reg(&m, A2), word(&mut m, PAGE + 8)), (0, 77));
 }

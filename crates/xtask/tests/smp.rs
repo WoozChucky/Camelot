@@ -54,7 +54,9 @@ const TICK_INTERVAL: u64 = 1_000_000;
 
 /// The process running on the hart whose turn it is (0 for none).
 fn running(cpu: &Cpu, cpus: u32) -> u32 {
-    cpu.bus.peek(cpus + cpu.id * CPU_SIZE + CPU_PROC).unwrap()
+    cpu.bus
+        .peek(u64::from(cpus + cpu.id * CPU_SIZE + CPU_PROC))
+        .unwrap()
 }
 
 /// One line of the `harts` program: hart, pid (None while idle), ticks and
@@ -141,7 +143,7 @@ fn boots_on_every_hart_count() {
                 seen = out.len();
                 if out.ends_with(PROMPT.as_bytes()) {
                     prompts.push(cpu.bus.clint.mtime);
-                    clock.push(cpu.bus.peek(ticks).unwrap());
+                    clock.push(cpu.bus.peek(ticks.into()).unwrap());
                 }
                 if first_tick.is_none() && out.ends_with(b"tick 1\n") {
                     first_tick = Some(cpu.bus.clint.mtime);
@@ -179,7 +181,7 @@ fn boots_on_every_hart_count() {
 
 /// The value of the kernel's variable `name`.
 fn peek_sym(m: &Machine, elf: &grail::elf::Elf, name: &str) -> u32 {
-    m.cpu.bus.peek(sym(elf, name)).unwrap()
+    m.cpu.bus.peek(sym(elf, name).into()).unwrap()
 }
 
 /// Steps `m` until `stop` says so, at most `max` steps; between steps, so
@@ -237,7 +239,9 @@ fn a_shootdown_waits_for_a_hart_slow_to_flush() {
         },
         |m| {
             let hart = m.cpu.hart(2);
-            if !skipped && hart.pc == u64::from(serve.start) && m.cpu.bus.peek(asked) != m.cpu.bus.peek(done)
+            if !skipped
+                && hart.pc == u64::from(serve.start)
+                && m.cpu.bus.peek(asked.into()) != m.cpu.bus.peek(done.into())
             {
                 skipped = true;
                 let ra = hart.x[1] as u32;
@@ -302,7 +306,11 @@ fn a_kernel_shootdown_reaches_harts_running_processes() {
             match saved {
                 None => {
                     let busy = (1..4).all(|h| {
-                        let satp = m.cpu.bus.peek(cpus + h * CPU_SIZE + CPU_PAGETABLE).unwrap();
+                        let satp = m
+                            .cpu
+                            .bus
+                            .peek(u64::from(cpus + h * CPU_SIZE + CPU_PAGETABLE))
+                            .unwrap();
                         m.cpu.hart(h as usize).mode == Mode::U && satp != kernel_pt && satp != 0
                     });
                     if busy {
@@ -400,10 +408,14 @@ fn a_panic_stops_the_harts_printing_meanwhile() {
         RUN_MAX_STEPS,
         |_| {},
         |m| {
-            let holder = m.cpu.bus.peek(tx_lock + LOCK_CPU).unwrap();
+            let holder = m.cpu.bus.peek(u64::from(tx_lock + LOCK_CPU)).unwrap();
             let Some(printer) = (0..4).find(|&h| {
                 let hart = m.cpu.hart(h);
-                let p = m.cpu.bus.peek(cpus + h as u32 * CPU_SIZE + CPU_PROC).unwrap();
+                let p = m
+                    .cpu
+                    .bus
+                    .peek(u64::from(cpus + h as u32 * CPU_SIZE + CPU_PROC))
+                    .unwrap();
                 putc.contains(&(hart.pc as u32))
                     && holder == cpus + h as u32 * CPU_SIZE
                     && p != 0
@@ -484,7 +496,7 @@ fn a_hart_stops_printing_while_a_panic_begins() {
             |_| {},
             |m| m.cpu.hart(0).pc == u64::from(smp_boot)
         ));
-        m.cpu.bus.load(panicking, &[1]).unwrap();
+        m.cpu.bus.load(panicking.into(), &[1]).unwrap();
         let before = printed(&m);
         let freeze = Freeze::new(&elf);
         let stopped = step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| freeze.holds(m, 0));
@@ -533,7 +545,7 @@ fn primes_workers_run_side_by_side_on_four_harts() {
         on[h] = 0;
         if cpu.mode == Mode::U {
             let p = running(cpu, cpus);
-            let parent = cpu.bus.peek(p + PROC_PARENT).unwrap();
+            let parent = cpu.bus.peek(u64::from(p + PROC_PARENT)).unwrap();
             if proc_name(cpu, p) == "primes" && parent != 0 && proc_name(cpu, parent) == "primes" {
                 on[h] = p;
                 ran_on.insert(h);

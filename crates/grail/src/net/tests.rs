@@ -4,6 +4,10 @@ use std::sync::{Arc, Mutex};
 
 const RAM_SIZE: usize = 16 * 1024;
 const MAC: MacAddr = MacAddr([0x02, 0xca, 0x11, 0x22, 0x33, 0x44]);
+/// RAM's and VRAM's bases as the card's registers and descriptors hold them: 32-bit
+/// physical addresses.
+const RAM_BASE: u32 = crate::bus::RAM_BASE as u32;
+const VRAM_BASE: u32 = crate::bus::VRAM_BASE as u32;
 
 // A layout in the test RAM: the transmit ring, the receive ring, then buffers.
 const TX_RING: u32 = RAM_BASE;
@@ -317,13 +321,13 @@ fn bad_transmit_descriptors_are_errors_not_panics() {
         (BUFS, MIN_FRAME as u16 - 1, status::BAD_LENGTH),
         (BUFS, MAX_FRAME as u16 + 1, status::BAD_LENGTH),
         (BUFS, u16::MAX, status::BAD_LENGTH),
-        (0, 60, status::BAD_DMA),                     // not RAM
-        (RAM_BASE - 1, 60, status::BAD_DMA),          // starts just below RAM
-        (end - 59, 60, status::BAD_DMA),              // one byte past the end
-        (end, 60, status::BAD_DMA),                   // starts at the end
-        (0xffff_fff0, 60, status::BAD_DMA),           // would wrap around
-        (crate::bus::VRAM_BASE, 60, status::BAD_DMA), // memory, but not RAM
-        (BUFS, 60, status::OK),                       // and the next good one goes
+        (0, 60, status::BAD_DMA),            // not RAM
+        (RAM_BASE - 1, 60, status::BAD_DMA), // starts just below RAM
+        (end - 59, 60, status::BAD_DMA),     // one byte past the end
+        (end, 60, status::BAD_DMA),          // starts at the end
+        (0xffff_fff0, 60, status::BAD_DMA),  // would wrap around
+        (VRAM_BASE, 60, status::BAD_DMA),    // memory, but not RAM
+        (BUFS, 60, status::OK),              // and the next good one goes
     ];
     for (i, &(addr, len, _)) in cases.iter().enumerate() {
         set_desc(&mut ram, TX_RING, i as u32, addr, len);
@@ -531,7 +535,7 @@ fn bad_receive_descriptors_are_errors_not_panics() {
         (0, 0x800, status::BAD_DMA),
         (end - 0x7ff, 0x800, status::BAD_DMA), // the whole buffer must be RAM
         (0xffff_ff00, 0x800, status::BAD_DMA),
-        (crate::bus::VRAM_BASE, 0x800, status::BAD_DMA),
+        (VRAM_BASE, 0x800, status::BAD_DMA),
         (BUFS, 100, status::OK),
     ];
     for (i, &(addr, cap, _)) in cases.iter().enumerate() {
