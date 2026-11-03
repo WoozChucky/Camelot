@@ -41,7 +41,7 @@ impl Symbols {
     /// Adds the symbols of another ELF file (`add-symbol-file`): a user program
     /// next to the kernel. Of a name defined in both, the first file's is kept.
     pub fn add_elf(&mut self, file: &[u8]) -> Result<(), String> {
-        let elf = elf::Elf::parse(file).map_err(|e| e.to_string())?;
+        let elf = crate::source::parse_elf32(file)?;
         let mut found = Vec::new();
         for s in elf.symbols().map_err(|e| e.to_string())? {
             if s.name.is_empty()
@@ -54,7 +54,7 @@ impl Symbols {
             }
             // Of several at one address: a function first, then a global name.
             let rank = (s.ty() != STT_FUNC, s.bind() == STB_LOCAL);
-            found.push((s.value, rank, s.name.clone(), s.size));
+            found.push((s.value as u32, rank, s.name.clone(), s.size as u32));
         }
         // A name defined twice in the file (two files' `static` functions):
         // the lowest address.

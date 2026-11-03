@@ -19,8 +19,8 @@ fn debug_opts(comp_dir: &str) -> Options {
 /// bytes and relocations (offset, type, symbol name), and the symbols other
 /// than section symbols.
 type Loaded = (
-    Vec<(String, Vec<u8>, Vec<(u32, u32, String)>)>,
-    Vec<(String, u32, u32, u8)>,
+    Vec<(String, Vec<u8>, Vec<(u64, u32, String)>)>,
+    Vec<(String, u64, u64, u8)>,
 );
 
 fn loaded(obj: &[u8]) -> Loaded {

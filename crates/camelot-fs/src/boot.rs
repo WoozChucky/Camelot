@@ -96,6 +96,9 @@ pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
     if h.ty != elf::ET_EXEC || h.machine != elf::EM_RISCV {
         return Err("kernel: not a RISC-V executable".into());
     }
+    if e.class != elf::Class::Elf32 {
+        return Err("kernel: not ELF32, the class the bootloader loads".into());
+    }
     if h.phentsize as usize != elf::PHDR_SIZE
         || h.phoff as usize + h.phnum as usize * elf::PHDR_SIZE > KERNEL_HEADERS
     {
@@ -110,7 +113,8 @@ pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
                 p.paddr, p.offset
             ));
         }
-        if p.memsz < p.filesz || p.paddr < RAM_BASE || p.paddr.checked_add(p.memsz).is_none() {
+        // ELF32 values: the end must not pass 2^32 - 1.
+        if p.memsz < p.filesz || p.paddr < u64::from(RAM_BASE) || p.paddr + p.memsz > u64::from(u32::MAX) {
             return Err(format!("kernel: the segment at {:#x} is not in RAM", p.paddr));
         }
     }

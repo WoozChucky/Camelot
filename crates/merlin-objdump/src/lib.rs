@@ -88,6 +88,11 @@ impl Options {
 /// Dumps one file. `name` is printed in the header line, as given.
 pub fn dump(name: &str, data: &[u8], opts: &Options) -> Result<String, Error> {
     let elf = Elf::parse(data)?;
+    // RV64 (ELF64) comes with the RV64 migration's objdump step; until then
+    // every address printed here is a 32-bit one.
+    if elf.class != elf::Class::Elf32 {
+        return Err(Error("ELF64 (RV64) is not supported yet".into()));
+    }
     let mut out = String::new();
     let _ = writeln!(out, "\n{name}:\tfile format elf32-littleriscv");
     if opts.file_headers {
@@ -135,7 +140,7 @@ fn program_headers(out: &mut String, elf: &Elf) {
             _ => " UNKNOWN",
         };
         // llvm-objdump prints log2 of the alignment; 0 has 64 trailing zero bits.
-        let align = (p.align as u64).trailing_zeros();
+        let align = p.align.trailing_zeros();
         let flag = |bit, c| if p.flags & bit != 0 { c } else { '-' };
         let _ = writeln!(
             out,
@@ -330,7 +335,7 @@ fn contents(out: &mut String, elf: &Elf) -> Result<(), Error> {
     for s in elf.sections.iter().filter(|s| s.size > 0) {
         let _ = writeln!(out, "Contents of section {}:", s.name);
         if s.is_nobits() && s.flags & (elf::SHF_ALLOC | elf::SHF_WRITE) != 0 {
-            let end = s.addr as u64 + s.size as u64;
+            let end = s.addr + s.size;
             let _ = writeln!(
                 out,
                 "<skipping contents of bss section at [{:04x}, {end:04x})>",
@@ -340,7 +345,7 @@ fn contents(out: &mut String, elf: &Elf) -> Result<(), Error> {
         }
         let data = elf.section_data(s)?;
         for (row, chunk) in data.chunks(16).enumerate() {
-            let _ = write!(out, " {:04x} ", s.addr as u64 + row as u64 * 16);
+            let _ = write!(out, " {:04x} ", s.addr + row as u64 * 16);
             for i in 0..16 {
                 if i != 0 && i % 4 == 0 {
                     out.push(' ');

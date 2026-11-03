@@ -745,7 +745,7 @@ const COMPARED_SECTIONS: [&str; 4] = [".text", ".rodata", ".data", ".bss"];
 /// One section of an object, as text for comparing: its size, its bytes and
 /// its relocations. A section the object lacks reads as empty, so leaving out
 /// an empty section and emitting one compare equal.
-fn section_summary(obj: &[u8], name: &str) -> Result<(u32, Vec<u8>, Vec<String>), String> {
+fn section_summary(obj: &[u8], name: &str) -> Result<(u64, Vec<u8>, Vec<String>), String> {
     let elf = elf::Elf::parse(obj).map_err(|e| e.to_string())?;
     let Some(section) = elf.sections.iter().find(|s| s.name == name) else {
         return Ok((0, Vec::new(), Vec::new()));

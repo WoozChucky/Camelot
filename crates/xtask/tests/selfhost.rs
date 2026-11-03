@@ -475,7 +475,7 @@ fn mergeable(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
         elf.header.shoff as usize + 40 * i
     };
     let flags = u32::from_le_bytes(obj[at + 8..at + 12].try_into().unwrap());
-    obj[at + 8..at + 12].copy_from_slice(&(flags | elf::SHF_MERGE | elf::SHF_STRINGS).to_le_bytes());
+    obj[at + 8..at + 12].copy_from_slice(&(flags | (elf::SHF_MERGE | elf::SHF_STRINGS) as u32).to_le_bytes());
     obj[at + 36..at + 40].copy_from_slice(&1u32.to_le_bytes());
     obj
 }

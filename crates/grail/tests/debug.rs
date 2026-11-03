@@ -24,7 +24,7 @@ fn symbol(elf: &[u8], name: &str) -> u32 {
         .iter()
         .find(|s| s.name == name)
         .unwrap_or_else(|| panic!("no symbol {name}"))
-        .value
+        .value as u32
 }
 
 /// A shared buffer the UART writes to.

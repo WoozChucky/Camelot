@@ -174,7 +174,7 @@ fn size_of(fs: &Fs, prog: &str) -> u32 {
         .map(|p| p.vaddr + p.memsz)
         .max()
         .unwrap();
-    end.next_multiple_of(4096)
+    end.next_multiple_of(4096) as u32
 }
 
 /// The shell's line after a program that exited with `status`.

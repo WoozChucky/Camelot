@@ -13,7 +13,7 @@ fn repo_root() -> PathBuf {
 
 /// The entry point and every segment: type, addresses, sizes, flags and the
 /// bytes it loads.
-type Loaded = (u32, Vec<(u32, u32, u32, u32, u32, Vec<u8>)>);
+type Loaded = (u64, Vec<(u32, u64, u64, u64, u32, Vec<u8>)>);
 
 fn loaded(elf: &[u8]) -> Loaded {
     let e = elf::Elf::parse(elf).unwrap();

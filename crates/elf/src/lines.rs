@@ -7,6 +7,9 @@
 //! relocations, applied here first; each sequence then says which section its
 //! addresses are in.
 //!
+//! Addresses are 4 bytes in an RV32 program and 8 in an RV64 one: the size of
+//! `DW_LNE_set_address`'s operand, which DWARF 5 also gives in the header.
+//!
 //! The opcodes and the header are explained in merlin-as's `dwarf` module, which
 //! writes them.
 
@@ -16,7 +19,7 @@ use std::collections::HashMap;
 /// One row of a line table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Row {
-    pub addr: u32,
+    pub addr: u64,
     /// An index into [`LineTable::files`].
     pub file: usize,
     pub line: u32,
@@ -102,6 +105,9 @@ impl<'a> Cursor<'a> {
         let b = self.bytes(4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
+    fn u64(&mut self) -> Result<u64, Error> {
+        Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
+    }
     fn uleb(&mut self) -> Result<u64, Error> {
         let (mut v, mut shift) = (0u64, 0);
         loop {
@@ -171,10 +177,7 @@ fn read_form(c: &mut Cursor, form: u64, strs: &Strings) -> Result<Value, Error> 
         0x0b => Value::Num(c.u8()?.into()), // data1
         0x05 => Value::Num(c.u16()?.into()), // data2
         0x06 => Value::Num(c.u32()?.into()), // data4
-        0x07 => {
-            let b = c.bytes(8)?;
-            Value::Num(u64::from_le_bytes(b.try_into().unwrap()))
-        }
+        0x07 => Value::Num(c.u64()?),  // data8
         0x0f => Value::Num(c.uleb()?), // udata
         0x1e => {
             c.bytes(16)?; // data16: an MD5 sum
@@ -248,7 +251,7 @@ pub fn parse(
         }
         if version >= 5 {
             let (addr_size, _seg) = (c.u8()?, c.u8()?);
-            if addr_size != 4 {
+            if addr_size != 4 && addr_size != 8 {
                 return err(format!("line table: {addr_size}-byte addresses"));
             }
         }
@@ -346,8 +349,8 @@ fn run(
         section: None,
         rows: Vec::new(),
     };
-    let min_inst = u32::from(min_inst);
-    let advance = |r: &mut Row, n: u64| r.addr = r.addr.wrapping_add((n as u32).wrapping_mul(min_inst));
+    let min_inst = u64::from(min_inst);
+    let advance = |r: &mut Row, n: u64| r.addr = r.addr.wrapping_add(n.wrapping_mul(min_inst));
     while c.at < c.data.len() {
         let op = c.u8()?;
         if op >= opcode_base {
@@ -377,14 +380,16 @@ fn run(
                     }
                     2 => {
                         seq.section = sections.get(&c.at).copied();
-                        r.addr = match len - 1 {
-                            4 => c.u32()?,
-                            n => return err(format!("line table: {n}-byte address")),
+                        // The operand is an address: 4 bytes on RV32, 8 on RV64.
+                        r.addr = match len.checked_sub(1) {
+                            Some(4) => c.u32()?.into(),
+                            Some(8) => c.u64()?,
+                            _ => return err(format!("line table: DW_LNE_set_address of length {len}")),
                         };
                     }
                     _ => {} // define_file, set_discriminator, vendor ones: skipped
                 }
-                c.at = start + len;
+                c.at = start.saturating_add(len);
             }
             1 => {
                 seq.rows.push(r);
@@ -409,6 +414,41 @@ fn run(
         }
     }
     Ok(())
+}
+
+/// Applies one relocation of `.debug_line` at `at` with the value `v` (S + A),
+/// as a linker would. Returns false for a type a line table does not use, or
+/// a field outside `data`.
+///
+/// R_RISCV_32 and R_RISCV_64 write an address, 4 bytes on RV32 and 8 on RV64.
+/// With linker relaxation, address advances are differences of two labels:
+/// an R_RISCV_ADDn adds one, an R_RISCV_SUBn subtracts the other, and
+/// R_RISCV_SETn sets the value. Each writes the low `n` bits of the result.
+fn relocate(data: &mut [u8], at: usize, ty: u32, v: u64) -> bool {
+    let (size, op): (usize, fn(u64, u64) -> u64) = match ty {
+        1 => (4, |_, v| v),           // R_RISCV_32
+        2 => (8, |_, v| v),           // R_RISCV_64
+        33 => (1, u64::wrapping_add), // R_RISCV_ADD8
+        34 => (2, u64::wrapping_add), // R_RISCV_ADD16
+        35 => (4, u64::wrapping_add), // R_RISCV_ADD32
+        36 => (8, u64::wrapping_add), // R_RISCV_ADD64
+        37 => (1, u64::wrapping_sub), // R_RISCV_SUB8
+        38 => (2, u64::wrapping_sub), // R_RISCV_SUB16
+        39 => (4, u64::wrapping_sub), // R_RISCV_SUB32
+        40 => (8, u64::wrapping_sub), // R_RISCV_SUB64
+        54 => (1, |_, v| v),          // R_RISCV_SET8
+        55 => (2, |_, v| v),          // R_RISCV_SET16
+        56 => (4, |_, v| v),          // R_RISCV_SET32
+        _ => return false,
+    };
+    let Some(field) = at.checked_add(size).and_then(|end| data.get_mut(at..end)) else {
+        return false;
+    };
+    let mut old = [0; 8];
+    old[..size].copy_from_slice(field);
+    let new = op(u64::from_le_bytes(old), v).to_le_bytes();
+    field.copy_from_slice(&new[..size]);
+    true
 }
 
 impl Elf<'_> {
@@ -440,33 +480,14 @@ impl Elf<'_> {
                         continue;
                     };
                     let value = if sym.ty() == STT_SECTION { 0 } else { sym.value };
-                    let v = value.wrapping_add(r.addend as u32);
-                    let at = r.offset as usize;
-                    // R_RISCV_32 writes an address (S + A). With linker
-                    // relaxation, address advances are differences of two
-                    // labels: an R_RISCV_ADDn adds one, an R_RISCV_SUBn
-                    // subtracts the other, and R_RISCV_SETn sets the value.
-                    let (size, op): (usize, fn(u32, u32) -> u32) = match r.ty {
-                        1 => (4, |_, v| v),
-                        33 => (1, u32::wrapping_add),
-                        34 => (2, u32::wrapping_add),
-                        35 => (4, u32::wrapping_add),
-                        37 => (1, u32::wrapping_sub),
-                        38 => (2, u32::wrapping_sub),
-                        39 => (4, u32::wrapping_sub),
-                        54 => (1, |_, v| v),
-                        55 => (2, |_, v| v),
-                        56 => (4, |_, v| v),
-                        _ => continue,
-                    };
-                    let Some(field) = line.get_mut(at..at + size) else {
+                    let v = value.wrapping_add(r.addend as u64);
+                    let Ok(at) = usize::try_from(r.offset) else {
                         continue;
                     };
-                    let mut old = [0; 4];
-                    old[..size].copy_from_slice(field);
-                    let new = op(u32::from_le_bytes(old), v).to_le_bytes();
-                    field.copy_from_slice(&new[..size]);
-                    if r.ty == 1 {
+                    if !relocate(&mut line, at, r.ty, v) {
+                        continue;
+                    }
+                    if r.ty == 1 || r.ty == 2 {
                         if let Some(sec) = sym.section() {
                             sections.insert(at, sec);
                         }
@@ -480,5 +501,62 @@ impl Elf<'_> {
             data_of(".debug_str")?,
             &sections,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relocate;
+
+    /// Every relocation type a line table uses, on a field between two others
+    /// it must not touch.
+    #[test]
+    fn relocations_write_their_fields() {
+        let v = 0x1122_3344_5566_7788;
+        let cases: [(u32, &[u8]); 13] = [
+            (1, &[0x88, 0x77, 0x66, 0x55, 9, 9, 9, 9]),
+            (2, &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]),
+            (33, &[0x88 + 1, 9, 9, 9, 9, 9, 9, 9]),
+            (34, &[0x88 + 1, 0x77 + 2, 9, 9, 9, 9, 9, 9]),
+            (35, &[0x88 + 1, 0x77 + 2, 0x66 + 3, 0x55 + 4, 9, 9, 9, 9]),
+            (
+                36,
+                &[
+                    0x88 + 1,
+                    0x77 + 2,
+                    0x66 + 3,
+                    0x55 + 4,
+                    0x44 + 5,
+                    0x33 + 6,
+                    0x22 + 7,
+                    0x11 + 8,
+                ],
+            ),
+            (37, &[0x79, 9, 9, 9, 9, 9, 9, 9]),
+            (38, &[0x79, 0x8a, 9, 9, 9, 9, 9, 9]),
+            (39, &[0x79, 0x8a, 0x9c, 0xae, 9, 9, 9, 9]),
+            (40, &[0x79, 0x8a, 0x9c, 0xae, 0xc0, 0xd2, 0xe4, 0xf6]),
+            (54, &[0x88, 9, 9, 9, 9, 9, 9, 9]),
+            (55, &[0x88, 0x77, 9, 9, 9, 9, 9, 9]),
+            (56, &[0x88, 0x77, 0x66, 0x55, 9, 9, 9, 9]),
+        ];
+        for (ty, want) in cases {
+            // The field holds 1, 2, ... 8 (low byte first) before the relocation.
+            let mut data = [0xaa, 1, 2, 3, 4, 5, 6, 7, 8, 0xaa];
+            let size = want.iter().rposition(|&b| b != 9).unwrap() + 1;
+            data[1 + size..9].fill(9);
+            assert!(relocate(&mut data, 1, ty, v), "type {ty}");
+            assert_eq!(data[0], 0xaa, "type {ty}");
+            assert_eq!(&data[1..9], want, "type {ty}");
+            assert_eq!(data[9], 0xaa, "type {ty}");
+        }
+        let mut data = [0; 8];
+        assert!(
+            !relocate(&mut data, 0, 43, v),
+            "R_RISCV_ALIGN is not a line table's"
+        );
+        assert!(!relocate(&mut data, 4, 2, v), "the field runs past the end");
+        assert!(!relocate(&mut data, usize::MAX, 1, v));
+        assert_eq!(data, [0; 8]);
     }
 }

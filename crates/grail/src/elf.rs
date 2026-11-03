@@ -19,12 +19,17 @@ pub struct Elf {
 
 pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
     let elf = elf::Elf::parse(file)?;
+    // Grail's harts are RV32 until the RV64 migration widens them, so it runs
+    // ELF32 programs, whose addresses and sizes all fit in 32 bits.
+    if elf.class != elf::Class::Elf32 {
+        return Err(ElfError("ELF64 (RV64) programs are not supported yet".into()));
+    }
     let mut segments = Vec::new();
     for p in elf.segments.iter().filter(|p| p.ty == elf::PT_LOAD) {
         segments.push(Segment {
-            paddr: p.paddr,
+            paddr: p.paddr as u32,
             data: elf.segment_data(p)?.to_vec(),
-            mem_size: p.memsz,
+            mem_size: p.memsz as u32,
         });
     }
     // Global and weak symbols first, then the locals: a name defined by
@@ -36,9 +41,9 @@ pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
         .filter(|s| !s.name.is_empty() && !s.is_undefined())
         .collect();
     defined.sort_by_key(|s| s.bind() == elf::STB_LOCAL);
-    let symbols = defined.into_iter().map(|s| (s.name, s.value)).collect();
+    let symbols = defined.into_iter().map(|s| (s.name, s.value as u32)).collect();
     Ok(Elf {
-        entry: elf.header.entry,
+        entry: elf.header.entry as u32,
         segments,
         symbols,
     })

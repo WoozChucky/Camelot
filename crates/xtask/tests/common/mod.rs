@@ -105,7 +105,7 @@ pub fn function(name: &str) -> Range<u32> {
         .find(|s| s.name == name)
         .unwrap_or_else(|| panic!("no symbol {name}"));
     assert!(s.size > 0, "{name} has no size");
-    s.value..s.value + s.size
+    s.value as u32..(s.value + s.size) as u32
 }
 
 pub fn peek(cpu: &Cpu, addr: u32) -> u32 {

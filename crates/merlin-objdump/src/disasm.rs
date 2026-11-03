@@ -43,8 +43,9 @@ impl Labels {
         let mut per_section = vec![Vec::new(); elf.sections.len()];
         let mut absolute = Vec::new();
         for s in elf.symbols()?.iter().filter(|s| is_label(s)) {
+            // ELF32 only (`dump` checks), so every address fits in 32 bits.
             let label = Label {
-                addr: s.value,
+                addr: s.value as u32,
                 name: s.name.clone(),
                 ty: s.ty(),
             };
@@ -62,7 +63,7 @@ impl Labels {
             .sections
             .iter()
             .enumerate()
-            .map(|(i, s)| (s.addr, i))
+            .map(|(i, s)| (s.addr as u32, i))
             .collect();
         section_addrs.sort_by_key(|&(a, _)| a);
         Ok(Labels {
@@ -234,9 +235,9 @@ impl SourceLines {
                     .rows
                     .iter()
                     .filter(|r| !r.end_sequence)
-                    .map(|r| (r.addr, t.path(r.file).to_string(), r.line))
+                    .map(|r| (r.addr as u32, t.path(r.file).to_string(), r.line))
                     .collect();
-                sequences.push((seq.section, first.addr, end.addr, rows));
+                sequences.push((seq.section, first.addr as u32, end.addr as u32, rows));
             }
         }
         let mut functions: Vec<(usize, u32, u32, String)> = elf
@@ -250,7 +251,7 @@ impl SourceLines {
                 elf.sections
                     .get(sec)?
                     .is_alloc()
-                    .then_some((sec, s.value, s.size, s.name))
+                    .then_some((sec, s.value as u32, s.size as u32, s.name))
             })
             .collect();
         // By address, then size: of several at one address the biggest wins.
@@ -318,21 +319,23 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
         }
         let data = elf.section_data(sec)?;
         // Addresses are u64 here so a section ending at 2^32 does not wrap.
-        let sec_start = sec.addr as u64;
-        let end = sec_start + sec.size as u64;
+        let sec_start = sec.addr;
+        let end = sec_start + sec.size;
+        // An ELF32 address (`dump` reads no other class).
+        let sec_addr = sec.addr as u32;
         let _ = writeln!(out, "\nDisassembly of section {}:", sec.name);
 
         // A section with no symbol at its start gets one named after it. A
         // linker script can define symbols below the section start, so the
         // label goes where it keeps the list sorted, not necessarily first.
         let syms = &mut labels.per_section[idx];
-        if !syms.iter().any(|s| s.addr == sec.addr) {
+        if !syms.iter().any(|s| s.addr == sec_addr) {
             let label = Label {
-                addr: sec.addr,
+                addr: sec_addr,
                 name: sec.name.clone(),
                 ty: elf::STT_FUNC,
             };
-            let at = syms.partition_point(|s| s.addr < sec.addr);
+            let at = syms.partition_point(|s| s.addr < sec_addr);
             syms.insert(at, label);
         }
         let syms = syms.clone();
@@ -342,13 +345,13 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
             for r in &rs.relocs {
                 // In an executable, relocation offsets are addresses.
                 let offset = if labels.relocatable {
-                    r.offset
+                    r.offset as u32
                 } else {
-                    r.offset.wrapping_sub(sec.addr)
+                    (r.offset as u32).wrapping_sub(sec_addr)
                 };
                 let text = format!(
                     "\t\t\t{:08x}:  {}\t{}",
-                    sec.addr.wrapping_add(offset),
+                    sec_addr.wrapping_add(offset),
                     reloc_type(r.ty),
                     reloc_value(elf, &rs.symbols, r)
                 );

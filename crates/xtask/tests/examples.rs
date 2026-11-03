@@ -452,7 +452,7 @@ fn fixture(dir: &str, file: &str) -> PathBuf {
 }
 
 /// `PT_LOAD`s as (vaddr, memsz, file bytes).
-fn loads(elf: &Elf) -> Vec<(u32, u32, Vec<u8>)> {
+fn loads(elf: &Elf) -> Vec<(u64, u64, Vec<u8>)> {
     elf.segments
         .iter()
         .filter(|p| p.ty == PT_LOAD)
@@ -464,7 +464,7 @@ fn loads(elf: &Elf) -> Vec<(u32, u32, Vec<u8>)> {
 }
 
 /// Allocated sections as (name, type, address, size, alignment, flags).
-fn alloc_sections(elf: &Elf) -> Vec<(String, u32, u32, u32, u32, u32)> {
+fn alloc_sections(elf: &Elf) -> Vec<(String, u32, u64, u64, u64, u64)> {
     elf.sections
         .iter()
         .filter(|s| s.flags & SHF_ALLOC != 0)
@@ -474,7 +474,7 @@ fn alloc_sections(elf: &Elf) -> Vec<(String, u32, u32, u32, u32, u32)> {
 
 /// Symbols as (name, value), leaving out the `$x`/`$d` mapping symbols that
 /// clang writes and merlin-as does not.
-fn symbols(elf: &Elf) -> BTreeSet<(String, u32)> {
+fn symbols(elf: &Elf) -> BTreeSet<(String, u64)> {
     let symtab = elf.sections.iter().find(|s| s.ty == SHT_SYMTAB).unwrap();
     elf.symbols_in(symtab)
         .unwrap()

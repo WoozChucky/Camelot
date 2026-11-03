@@ -60,21 +60,21 @@ fn reloc_names() -> Vec<(u32, &'static str)> {
 }
 
 /// The ELF constants the C linker uses, the elf crate's: (C name, value).
-fn elf_constants() -> Vec<(&'static str, u32)> {
+fn elf_constants() -> Vec<(&'static str, u64)> {
     use elf::*;
     vec![
         ("ET_REL", ET_REL.into()),
         ("ET_EXEC", ET_EXEC.into()),
         ("EM_RISCV", EM_RISCV.into()),
-        ("SHT_NULL", SHT_NULL),
-        ("SHT_PROGBITS", SHT_PROGBITS),
-        ("SHT_SYMTAB", SHT_SYMTAB),
-        ("SHT_STRTAB", SHT_STRTAB),
-        ("SHT_RELA", SHT_RELA),
-        ("SHT_NOBITS", SHT_NOBITS),
-        ("SHT_REL", SHT_REL),
-        ("SHT_GROUP", SHT_GROUP),
-        ("SHT_SYMTAB_SHNDX", SHT_SYMTAB_SHNDX),
+        ("SHT_NULL", SHT_NULL.into()),
+        ("SHT_PROGBITS", SHT_PROGBITS.into()),
+        ("SHT_SYMTAB", SHT_SYMTAB.into()),
+        ("SHT_STRTAB", SHT_STRTAB.into()),
+        ("SHT_RELA", SHT_RELA.into()),
+        ("SHT_NOBITS", SHT_NOBITS.into()),
+        ("SHT_REL", SHT_REL.into()),
+        ("SHT_GROUP", SHT_GROUP.into()),
+        ("SHT_SYMTAB_SHNDX", SHT_SYMTAB_SHNDX.into()),
         ("SHF_WRITE", SHF_WRITE),
         ("SHF_ALLOC", SHF_ALLOC),
         ("SHF_EXECINSTR", SHF_EXECINSTR),

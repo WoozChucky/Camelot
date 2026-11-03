@@ -2,55 +2,75 @@ use super::*;
 
 /// Builds a small ET_REL by hand: null, .text, .rela.text, .symtab, .strtab, .shstrtab.
 fn tiny_object() -> Vec<u8> {
-    build_object(false)
+    build_object(false, Class::Elf32)
 }
 
 /// The same object with its relocations in a `.rel.text` (SHT_REL, no addends).
 fn tiny_rel_object() -> Vec<u8> {
-    build_object(true)
+    build_object(true, Class::Elf32)
 }
 
-fn build_object(rel: bool) -> Vec<u8> {
+fn build_object(rel: bool, class: Class) -> Vec<u8> {
     fn p16(b: &mut Vec<u8>, v: u16) {
         b.extend_from_slice(&v.to_le_bytes());
     }
     fn p32(b: &mut Vec<u8>, v: u32) {
         b.extend_from_slice(&v.to_le_bytes());
     }
+    // An address-sized field: 4 bytes in ELF32, 8 in ELF64.
+    let pa = |b: &mut Vec<u8>, v: u64| match class {
+        Class::Elf32 => p32(b, v as u32),
+        Class::Elf64 => b.extend_from_slice(&v.to_le_bytes()),
+    };
+    // r_info: the symbol index above the type.
+    let info = |b: &mut Vec<u8>, sym: u32, ty: u32| match class {
+        Class::Elf32 => p32(b, (sym << 8) | ty),
+        Class::Elf64 => b.extend_from_slice(&((u64::from(sym) << 32) | u64::from(ty)).to_le_bytes()),
+    };
     let text: Vec<u8> = [0x0000_0097u32, 0x0000_80e7]
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect();
     let mut rela = Vec::new();
-    p32(&mut rela, 0);
-    p32(&mut rela, (2 << 8) | 19); // sym 2 (ext), R_RISCV_CALL_PLT
+    pa(&mut rela, 0);
+    info(&mut rela, 2, 19); // sym 2 (ext), R_RISCV_CALL_PLT
     if rel {
         // A second entry, so reading an addend from a REL entry would pick
         // up this one's offset.
-        p32(&mut rela, 4);
-        p32(&mut rela, 51); // R_RISCV_RELAX
+        pa(&mut rela, 4);
+        info(&mut rela, 0, 51); // R_RISCV_RELAX
     } else {
-        p32(&mut rela, -4i32 as u32);
+        pa(&mut rela, -4i64 as u64);
     }
     let strtab = b"\0start\0ext\0".to_vec();
-    let mut symtab = vec![0u8; 16];
+    let mut symtab = vec![0u8; class.sym_size()];
     for (name, value, info, shndx) in [
-        (1u32, 4u32, (STB_GLOBAL << 4) | STT_FUNC, 1u16),
+        (1u32, 4u64, (STB_GLOBAL << 4) | STT_FUNC, 1u16),
         (7, 0, STB_GLOBAL << 4, 0),
     ] {
         p32(&mut symtab, name);
-        p32(&mut symtab, value);
-        p32(&mut symtab, 8);
+        if class == Class::Elf32 {
+            pa(&mut symtab, value);
+            pa(&mut symtab, 8);
+        }
         symtab.push(info);
         symtab.push(0);
         p16(&mut symtab, shndx);
+        if class == Class::Elf64 {
+            pa(&mut symtab, value);
+            pa(&mut symtab, 8);
+        }
     }
     let shstrtab = b"\0.text\0.rela.text\0.symtab\0.strtab\0.shstrtab\0.rel.text\0".to_vec();
-    let (rel_name, rel_ty, rel_entsize) = if rel { (44, SHT_REL, 8) } else { (7, SHT_RELA, 12) };
+    let (rel_name, rel_ty, rel_entsize) = if rel {
+        (44, SHT_REL, class.rel_size())
+    } else {
+        (7, SHT_RELA, class.rela_size())
+    };
 
-    let mut out = vec![0u8; EHDR_SIZE];
+    let mut out = vec![0u8; class.ehdr_size()];
     let mut place = |data: &[u8]| {
-        let off = out.len() as u32;
+        let off = out.len() as u64;
         out.extend_from_slice(data);
         off
     };
@@ -61,7 +81,7 @@ fn build_object(rel: bool) -> Vec<u8> {
         place(&strtab),
         place(&shstrtab),
     ];
-    let shoff = out.len() as u32;
+    let shoff = out.len() as u64;
     // (name, type, flags, offset, size, link, info, entsize)
     let shdrs = [
         (0, SHT_NULL, 0, 0, 0, 0, 0, 0),
@@ -71,43 +91,68 @@ fn build_object(rel: bool) -> Vec<u8> {
             rel_ty,
             SHF_INFO_LINK,
             offs[1],
-            rela.len() as u32,
+            rela.len() as u64,
             3,
             1,
-            rel_entsize,
+            rel_entsize as u64,
         ),
-        (18, SHT_SYMTAB, 0, offs[2], 48, 4, 1, 16),
-        (26, SHT_STRTAB, 0, offs[3], strtab.len() as u32, 0, 0, 0),
-        (34, SHT_STRTAB, 0, offs[4], shstrtab.len() as u32, 0, 0, 0),
+        (
+            18,
+            SHT_SYMTAB,
+            0,
+            offs[2],
+            symtab.len() as u64,
+            4,
+            1,
+            class.sym_size() as u64,
+        ),
+        (26, SHT_STRTAB, 0, offs[3], strtab.len() as u64, 0, 0, 0),
+        (34, SHT_STRTAB, 0, offs[4], shstrtab.len() as u64, 0, 0, 0),
     ];
     for (name, ty, flags, off, size, link, info, entsize) in shdrs {
-        for v in [name, ty, flags, 0, off, size, link, info, 4, entsize] {
-            p32(&mut out, v);
+        p32(&mut out, name);
+        p32(&mut out, ty);
+        for v in [flags, 0, off, size] {
+            pa(&mut out, v);
         }
+        p32(&mut out, link);
+        p32(&mut out, info);
+        pa(&mut out, 4);
+        pa(&mut out, entsize);
     }
     let mut h = Vec::new();
-    h.extend_from_slice(b"\x7fELF\x01\x01\x01\0\0\0\0\0\0\0\0\0");
+    h.extend_from_slice(b"\x7fELF");
+    h.push(match class {
+        Class::Elf32 => ELFCLASS32,
+        Class::Elf64 => ELFCLASS64,
+    });
+    h.extend_from_slice(b"\x01\x01\0\0\0\0\0\0\0\0\0");
     p16(&mut h, ET_REL);
     p16(&mut h, EM_RISCV);
     p32(&mut h, 1);
-    p32(&mut h, 0); // entry
-    p32(&mut h, 0); // phoff
-    p32(&mut h, shoff);
+    pa(&mut h, 0); // entry
+    pa(&mut h, 0); // phoff
+    pa(&mut h, shoff);
     p32(&mut h, 0); // flags
-    p16(&mut h, EHDR_SIZE as u16);
-    p16(&mut h, PHDR_SIZE as u16);
+    p16(&mut h, class.ehdr_size() as u16);
+    p16(&mut h, class.phdr_size() as u16);
     p16(&mut h, 0);
-    p16(&mut h, SHDR_SIZE as u16);
+    p16(&mut h, class.shdr_size() as u16);
     p16(&mut h, shdrs.len() as u16);
     p16(&mut h, 5);
-    out[..EHDR_SIZE].copy_from_slice(&h);
+    out[..class.ehdr_size()].copy_from_slice(&h);
     out
 }
 
 #[test]
 fn parses_hand_built_object() {
-    let bytes = tiny_object();
+    parses_hand_built_object_of(tiny_object(), Class::Elf32);
+    parses_hand_built_object_of(build_object(false, Class::Elf64), Class::Elf64);
+}
+
+fn parses_hand_built_object_of(bytes: Vec<u8>, class: Class) {
     let elf = Elf::parse(&bytes).unwrap();
+    assert_eq!(elf.class, class);
     assert_eq!(elf.header.ty, ET_REL);
     assert!(elf.segments.is_empty());
     let names: Vec<&str> = elf.sections.iter().map(|s| s.name.as_str()).collect();
@@ -147,7 +192,11 @@ fn parses_hand_built_object() {
 
 #[test]
 fn reads_rel_entries_without_addends() {
-    let bytes = tiny_rel_object();
+    reads_rel_entries_without_addends_of(tiny_rel_object());
+    reads_rel_entries_without_addends_of(build_object(true, Class::Elf64));
+}
+
+fn reads_rel_entries_without_addends_of(bytes: Vec<u8>) {
     let elf = Elf::parse(&bytes).unwrap();
     assert_eq!(elf.sections[2].name, ".rel.text");
     assert_eq!(elf.sections[2].ty, SHT_REL);
@@ -176,8 +225,11 @@ fn rejects_wrong_files() {
     let good = tiny_object();
     assert_eq!(Elf::parse(b"MZ\x90\0").err().unwrap().0, "missing magic");
     let mut bad = good.clone();
-    bad[4] = 2;
-    assert!(Elf::parse(&bad).err().unwrap().0.contains("32-bit"));
+    bad[4] = 3;
+    assert_eq!(
+        Elf::parse(&bad).err().unwrap().0,
+        "EI_CLASS 3 is neither ELFCLASS32 nor ELFCLASS64"
+    );
     let mut bad = good.clone();
     bad[5] = 2;
     assert!(Elf::parse(&bad).err().unwrap().0.contains("little-endian"));
@@ -203,13 +255,14 @@ fn corrupt_files_do_not_panic() {
             let _ = elf.segment_data(p);
         }
         let _ = elf.symbol("_start");
+        let _ = elf.line_tables();
     }
     let hello = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/hello/hello.elf"
     ))
     .unwrap();
-    for file in [tiny_object(), hello] {
+    for file in [tiny_object(), build_object(false, Class::Elf64), hello] {
         for len in 0..file.len() {
             exercise(&file[..len]);
         }

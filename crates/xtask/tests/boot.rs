@@ -149,7 +149,7 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     // The bootloader pointed the ROM's entry word at the kernel, so harts the kernel
     // wakes with an IPI go there from the park loop, as after an ELF boot.
     let entry = elf::Elf::parse(&kernel).unwrap().header.entry;
-    assert_eq!(m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR), Some(entry));
+    assert_eq!(m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR), Some(entry as u32));
 }
 
 #[test]

@@ -1961,7 +1961,7 @@ fn line_tables_are_kept_and_relocated() {
         ]
     );
     // Not loaded: the segments are the same as without the line tables.
-    let segments = |file: &[u8]| -> Vec<(u32, Vec<u8>)> {
+    let segments = |file: &[u8]| -> Vec<(u64, Vec<u8>)> {
         let e = elf::Elf::parse(file).unwrap();
         e.segments
             .iter()
@@ -1973,7 +1973,7 @@ fn line_tables_are_kept_and_relocated() {
     // made from each table's own strings (the line_strp offsets relocated).
     let text = elf.sections.iter().find(|s| s.name == ".text").unwrap().addr;
     let tables = elf.line_tables().unwrap();
-    let rows: Vec<Vec<(u32, &str, u32, bool)>> = tables
+    let rows: Vec<Vec<(u64, &str, u32, bool)>> = tables
         .iter()
         .map(|t| {
             assert_eq!(t.sequences.len(), 1);
@@ -2027,6 +2027,6 @@ gone:
     let linked = merlin_ld::link(&[obj], &opts).unwrap();
     let elf = elf::Elf::parse(&linked.elf).unwrap();
     let seqs = &elf.line_tables().unwrap()[0].sequences;
-    let starts: Vec<(u32, u32)> = seqs.iter().map(|s| (s.rows[0].addr, s.rows[0].line)).collect();
+    let starts: Vec<(u64, u32)> = seqs.iter().map(|s| (s.rows[0].addr, s.rows[0].line)).collect();
     assert_eq!(starts, [(0x1000, 1), (0, 7)]);
 }
