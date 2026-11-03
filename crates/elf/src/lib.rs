@@ -364,7 +364,7 @@ impl<'a> Elf<'a> {
                 return err("e_phentsize too small");
             }
             for i in 0..header.phnum as usize {
-                let ph = idx(header.phoff).saturating_add(i * header.phentsize as usize);
+                let ph = idx(header.phoff).saturating_add(i.saturating_mul(header.phentsize as usize));
                 bytes_at(data, ph, class.phdr_size())?;
                 segments.push(match class {
                     Class::Elf32 => ProgramHeader {
@@ -400,7 +400,7 @@ impl<'a> Elf<'a> {
             }
             let mut name_offsets = Vec::new();
             for i in 0..header.shnum as usize {
-                let sh = idx(header.shoff).saturating_add(i * header.shentsize as usize);
+                let sh = idx(header.shoff).saturating_add(i.saturating_mul(header.shentsize as usize));
                 bytes_at(data, sh, class.shdr_size())?;
                 name_offsets.push(u32_at(data, sh)? as usize);
                 // The same order in both classes: sh_flags, sh_addr,

@@ -241,7 +241,7 @@ pub fn parse(
         if unit_length >= 0xffff_fff0 {
             return err("line table: 64-bit DWARF is not supported");
         }
-        let end = c.at.checked_add(unit_length as usize).unwrap_or(usize::MAX);
+        let end = c.at.saturating_add(unit_length as usize);
         if end > line.len() {
             return err("line table: unit runs past the end of .debug_line");
         }

@@ -10,6 +10,15 @@ fn tiny_rel_object() -> Vec<u8> {
     build_object(true, Class::Elf32)
 }
 
+/// Added to the hand-built object's offsets, values, sizes and addends in
+/// ELF64, so that a 64-bit field cut to 32 bits shows.
+fn high(class: Class) -> u64 {
+    match class {
+        Class::Elf32 => 0,
+        Class::Elf64 => 0x1234_5678_0000_0000,
+    }
+}
+
 fn build_object(rel: bool, class: Class) -> Vec<u8> {
     fn p16(b: &mut Vec<u8>, v: u16) {
         b.extend_from_slice(&v.to_le_bytes());
@@ -32,33 +41,34 @@ fn build_object(rel: bool, class: Class) -> Vec<u8> {
         .flat_map(|w| w.to_le_bytes())
         .collect();
     let mut rela = Vec::new();
-    pa(&mut rela, 0);
+    let high = high(class);
+    pa(&mut rela, high);
     info(&mut rela, 2, 19); // sym 2 (ext), R_RISCV_CALL_PLT
     if rel {
         // A second entry, so reading an addend from a REL entry would pick
         // up this one's offset.
-        pa(&mut rela, 4);
+        pa(&mut rela, high + 4);
         info(&mut rela, 0, 51); // R_RISCV_RELAX
     } else {
-        pa(&mut rela, -4i64 as u64);
+        pa(&mut rela, (-4i64 as u64).wrapping_sub(high));
     }
     let strtab = b"\0start\0ext\0".to_vec();
     let mut symtab = vec![0u8; class.sym_size()];
     for (name, value, info, shndx) in [
-        (1u32, 4u64, (STB_GLOBAL << 4) | STT_FUNC, 1u16),
+        (1u32, high + 4, (STB_GLOBAL << 4) | STT_FUNC, 1u16),
         (7, 0, STB_GLOBAL << 4, 0),
     ] {
         p32(&mut symtab, name);
         if class == Class::Elf32 {
             pa(&mut symtab, value);
-            pa(&mut symtab, 8);
+            pa(&mut symtab, high + 8);
         }
         symtab.push(info);
         symtab.push(0);
         p16(&mut symtab, shndx);
         if class == Class::Elf64 {
             pa(&mut symtab, value);
-            pa(&mut symtab, 8);
+            pa(&mut symtab, high + 8);
         }
     }
     let shstrtab = b"\0.text\0.rela.text\0.symtab\0.strtab\0.shstrtab\0.rel.text\0".to_vec();
@@ -174,17 +184,19 @@ fn parses_hand_built_object_of(bytes: Vec<u8>, class: Class) {
         (STB_GLOBAL, STT_FUNC, Some(1))
     );
     assert!(syms[2].is_undefined() && syms[2].section().is_none());
-    assert_eq!(elf.symbol("start"), Some(4));
+    let high = high(class);
+    assert_eq!(syms[1].size, high + 8);
+    assert_eq!(elf.symbol("start"), Some(high + 4));
     assert_eq!(elf.symbol("ext"), None, "undefined symbols have no value");
 
     let relocs = elf.relocations(&elf.sections[2]).unwrap();
     assert_eq!(
         relocs,
         [Rela {
-            offset: 0,
+            offset: high,
             sym: 2,
             ty: 19,
-            addend: -4
+            addend: -4 - high as i64
         }]
     );
     assert!(elf.relocations(&elf.sections[1]).is_err());
@@ -192,12 +204,13 @@ fn parses_hand_built_object_of(bytes: Vec<u8>, class: Class) {
 
 #[test]
 fn reads_rel_entries_without_addends() {
-    reads_rel_entries_without_addends_of(tiny_rel_object());
-    reads_rel_entries_without_addends_of(build_object(true, Class::Elf64));
+    reads_rel_entries_without_addends_of(tiny_rel_object(), Class::Elf32);
+    reads_rel_entries_without_addends_of(build_object(true, Class::Elf64), Class::Elf64);
 }
 
-fn reads_rel_entries_without_addends_of(bytes: Vec<u8>) {
+fn reads_rel_entries_without_addends_of(bytes: Vec<u8>, class: Class) {
     let elf = Elf::parse(&bytes).unwrap();
+    let high = high(class);
     assert_eq!(elf.sections[2].name, ".rel.text");
     assert_eq!(elf.sections[2].ty, SHT_REL);
     let relocs = elf.relocations(&elf.sections[2]).unwrap();
@@ -205,13 +218,13 @@ fn reads_rel_entries_without_addends_of(bytes: Vec<u8>) {
         relocs,
         [
             Rela {
-                offset: 0,
+                offset: high,
                 sym: 2,
                 ty: 19,
                 addend: 0
             },
             Rela {
-                offset: 4,
+                offset: high + 4,
                 sym: 0,
                 ty: 51,
                 addend: 0
