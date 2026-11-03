@@ -1655,16 +1655,15 @@ fn ls_reports_an_entry_it_cannot_open_rather_than_leaving_it_out() {
     assert_eq!(shell_output(&run.out, "ls /dev"), want);
 }
 
-/// The exhaustive tier (CLAUDE.md, "Before pushing"): the crash tests that
-/// stop the machine after every sector a test writes and check, and boot
-/// the kernel on, the disks it could leave. Ignored by `cargo test`, which CI
-/// runs; `cargo test --release -- --ignored exhaustive::` runs them, and the
-/// local pre-push check does.
-mod exhaustive {
+/// The crash tests that stop the machine after every sector a test writes,
+/// check each disk it could leave, and boot the kernel on those its recovery
+/// has work on: the slowest of the suite, which runs them locally before a
+/// pull request (`cargo test --release`); CI's `cargo xtask ci` leaves all of
+/// this file out.
+mod every_sector {
     use super::*;
 
     #[test]
-    #[ignore = "exhaustive: a crash at every sector written (cargo test --release -- --ignored exhaustive::)"]
     fn a_crash_after_any_write_leaves_whole_transactions() {
         // Issue #66's crash-recovery test, at every point: the machine stopped
         // after each sector the write test sends to the disk (a block is two
@@ -1732,7 +1731,6 @@ mod exhaustive {
     }
 
     #[test]
-    #[ignore = "exhaustive: a crash at every sector written (cargo test --release -- --ignored exhaustive::)"]
     fn a_crash_during_a_truncation_leaves_it_for_the_next_mount() {
         // The tree test stopped after every sector it writes. Replayed, every
         // disk passes fsck and holds the state of a commit. Some hold /t2 being
@@ -1761,7 +1759,6 @@ mod exhaustive {
     }
 
     #[test]
-    #[ignore = "exhaustive: a crash at every sector written (cargo test --release -- --ignored exhaustive::)"]
     fn a_crash_while_a_tree_grows_leaves_whole_transactions() {
         // The grow test stopped after every sector it writes: replayed, every
         // disk passes fsck and holds the state of a commit. In each growth's
@@ -1834,7 +1831,6 @@ mod exhaustive {
     }
 
     #[test]
-    #[ignore = "exhaustive: a crash at every sector written (cargo test --release -- --ignored exhaustive::)"]
     fn a_crash_during_the_file_system_calls_leaves_whole_transactions() {
         // The crash test of issue #66, for the calls that change the disk:
         // `filetest ops` makes directories and files, links, truncates and

@@ -40,6 +40,9 @@ tasks:
                with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
   ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj, llvm-objdump);
                takes --clang, --lld and -v like kernel
+  ci           the tests GitHub's CI runs: the important, quick ones (unit tests, the
+               toolchain against its references, the committed binaries current, the
+               kernel boots, the documents); the whole suite is cargo test --release
 
 kernel options:
   --cc merlin|clang  C compiler (default: merlin); clang is the reference build
@@ -253,6 +256,13 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("ci") if args.len() == 1 => {
+            if xtask::ci::run() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         Some("-h" | "--help" | "help") => {
             println!("{}", usage());
             ExitCode::SUCCESS
