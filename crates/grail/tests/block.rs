@@ -240,7 +240,7 @@ fn example_on_a_host_backend() {
 fn host_backends_come_after_configured_disks() {
     let config = with_disks(vec![DiskConfig::memory(vec![0; 2 * SECTOR_SIZE])]);
     let m = Machine::with_backends(config.clone(), vec![Box::new(MemDisk::new(5))]).unwrap();
-    let capacities: Vec<u32> = m.cpu.bus.disks.iter().map(|d| d.capacity()).collect();
+    let capacities: Vec<u64> = m.cpu.bus.disks.iter().map(|d| d.capacity()).collect();
     assert_eq!(capacities, [2, 5]);
     let blocks = m
         .cpu

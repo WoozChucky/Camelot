@@ -298,6 +298,52 @@ fn sysinfo_is_version_2_on_rv64() {
     assert_eq!(m.cpu.bus.read(sysinfo + u64::from(REG_VERSION), 4), Ok(2));
 }
 
+/// An RV64 machine's disks have version 2's registers (spec section 9.6): sd writes a
+/// 64-bit BLK_DMA whole, and a command reads into the buffer it names.
+#[test]
+fn disks_have_64_bit_registers_on_rv64() {
+    use grail::block::{v2, CMD_READ, SECTOR_SIZE};
+    let image: Vec<u8> = (1..=2u8).flat_map(|n| [n; SECTOR_SIZE]).collect();
+    let mut m = Machine::new(MachineConfig {
+        xlen: Xlen::Rv64,
+        disks: vec![grail::DiskConfig::memory(image)],
+        ..MachineConfig::with_ram(1 << 20)
+    })
+    .unwrap();
+    m.cpu.csr.mtvec = TRAP_VECTOR;
+    let disk = grail::bus::BLK_BASE;
+    set(&mut m, A1, disk);
+    run(
+        &mut m,
+        "ld a0, 0(a1)",
+        i_type(v2::REG_CAPACITY as i32, A1, 3, A0, LOAD),
+    );
+    assert_eq!(x(&m, A0), 2);
+    set(&mut m, A2, 1);
+    run(&mut m, "sd a2, 8(a1)", s_type(v2::REG_SECTOR as i32, A2, A1, 3));
+    run(&mut m, "sw a2, 24(a1)", s_type(v2::REG_COUNT as i32, A2, A1, 2));
+    set(&mut m, A2, DATA);
+    run(&mut m, "sd a2, 16(a1)", s_type(v2::REG_DMA as i32, A2, A1, 3));
+    set(&mut m, A2, CMD_READ.into());
+    run(&mut m, "sw a2, 32(a1)", s_type(v2::REG_CMD as i32, A2, A1, 2));
+    assert_eq!(peek64(&mut m, DATA), 0x0202_0202_0202_0202, "sector 1");
+    run(
+        &mut m,
+        "lw a0, 40(a1)",
+        i_type(v2::REG_ERROR as i32, A1, 2, A0, LOAD),
+    );
+    assert_eq!(x(&m, A0), 0);
+    // BLK_COUNT is 32-bit: no sd.
+    let count = disk + u64::from(v2::REG_COUNT);
+    run_traps(
+        &mut m,
+        "sd a2, 24(a1)",
+        s_type(v2::REG_COUNT as i32, A2, A1, 3),
+        7,
+        count,
+    );
+}
+
 #[test]
 fn word_atomics_sign_extend_and_touch_32_bits() {
     let mut m = machine(Xlen::Rv64);

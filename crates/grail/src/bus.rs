@@ -1,6 +1,6 @@
 //! Physical address space. See spec section 7 for the memory map.
 
-use crate::block::{self, BlockDevice};
+use crate::block::BlockDevice;
 use crate::boot;
 use crate::config::MachineConfig;
 use crate::cpu::Reservation;
@@ -172,6 +172,7 @@ impl Bus {
             reservations: vec![Reservation::default(); harts],
             xlen: config.xlen,
         };
+        bus.set_device_versions(config.xlen);
         if harts > 1 {
             // The park loop must be there before any program is loaded: the other harts
             // run it from reset.
@@ -195,10 +196,17 @@ impl Bus {
     /// interface version (spec section 9).
     pub(crate) fn set_xlen(&mut self, xlen: Xlen) {
         self.xlen = xlen;
-        self.sysinfo.set_xlen(xlen);
+        self.set_device_versions(xlen);
         if self.harts() > 1 {
             self.set_boot_entry(0);
         }
+    }
+
+    /// Gives the devices the registers of an `xlen` machine's: version 2 of the
+    /// interfaces on RV64, 1 on RV32 (spec section 9).
+    fn set_device_versions(&mut self, xlen: Xlen) {
+        self.sysinfo.set_xlen(xlen);
+        self.disks.iter_mut().for_each(|d| d.set_xlen(xlen));
     }
 
     /// Fills the boot ROM (spec section 7, "Boot"). Hart 0 starts at `BOOT_ROM_BASE`, a
@@ -422,12 +430,12 @@ impl Bus {
         if let Some(off) = Self::offset_in(addr, SYSINFO_BASE, SYSINFO_SIZE) {
             return self.sysinfo.read(off, size);
         }
+        if let Some((i, off)) = self.disk_at(addr) {
+            return self.disks[i].read(off, size);
+        }
         // Every other device has 32-bit registers only, for now.
         if size == 8 {
             return Err(BusFault);
-        }
-        if let Some((i, off)) = self.disk_at(addr) {
-            return self.disks[i].read(off, size).map(u64::from);
         }
         if let Some((i, off)) = self.net_at(addr) {
             return self.nets[i].read(off, size).map(u64::from);
@@ -489,19 +497,19 @@ impl Bus {
         if let Some(off) = Self::offset_in(addr, SYSINFO_BASE, SYSINFO_SIZE) {
             return self.sysinfo.write(off, size, val);
         }
-        // Every other device has 32-bit registers only, for now.
-        if size == 8 {
-            return Err(BusFault);
-        }
-        let val = val as u32;
         if let Some((i, off)) = self.disk_at(addr) {
-            if off == block::REG_CMD {
+            if self.disks[i].is_command(off) {
                 // The disk moves data between itself and RAM on its own (DMA), which
                 // may write any hart's reserved line: no reservation survives a command.
                 self.reservations.iter_mut().for_each(Reservation::clear);
             }
             return self.disks[i].write(off, size, val, &mut self.ram);
         }
+        // Every other device has 32-bit registers only, for now.
+        if size == 8 {
+            return Err(BusFault);
+        }
+        let val = val as u32;
         if let Some((i, off)) = self.net_at(addr) {
             // Writing `NET_TX_TAIL` sends frames at once: the card reads them from RAM
             // and writes each descriptor's length and status back (DMA), which breaks

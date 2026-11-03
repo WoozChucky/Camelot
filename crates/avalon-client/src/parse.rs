@@ -83,7 +83,8 @@ pub fn parse_disk_source(s: &str) -> Result<DiskSource, String> {
 /// Parses a disk size: a whole number with an optional unit, any case: none or `B`
 /// for bytes, `K`/`KiB`, `M`/`MiB`, `G`/`GiB` (powers of 1024), or `S`/`sector(s)` for
 /// 512-byte sectors (`64MiB`, `1G`, `2048s`). The size must be a non-zero whole number
-/// of sectors, at most what a Grail disk can have. Returns sectors.
+/// of sectors, at most what a Grail disk shows an RV32 machine (2^32 - 1 sectors, which
+/// is also Lake's largest image). Returns sectors.
 pub fn parse_disk_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let bad = || format!("'{s}' is not a disk size (examples: 64MiB, 512K, 1G, 2048s)");
@@ -99,7 +100,12 @@ pub fn parse_disk_size(s: &str) -> Result<u64, String> {
         _ => return Err(bad()),
     };
     let n: u64 = number.parse().map_err(|_| bad())?;
-    let too_big = || format!("{s} is too big (at most {} sectors)", grail::block::MAX_SECTORS);
+    let too_big = || {
+        format!(
+            "{s} is too big (at most {} sectors)",
+            grail::block::V1_MAX_SECTORS
+        )
+    };
     let bytes = n.checked_mul(scale).ok_or_else(too_big)?;
     if bytes == 0 || !bytes.is_multiple_of(SECTOR_SIZE as u64) {
         return Err(format!(
@@ -107,7 +113,7 @@ pub fn parse_disk_size(s: &str) -> Result<u64, String> {
         ));
     }
     let sectors = bytes / SECTOR_SIZE as u64;
-    if sectors > grail::block::MAX_SECTORS {
+    if sectors > grail::block::V1_MAX_SECTORS {
         return Err(too_big());
     }
     Ok(sectors)
@@ -333,7 +339,7 @@ mod tests {
         ok("1 sector", 1);
         ok("1Sector", 1);
         ok("2047GiB", 2047 << 21);
-        ok("4294967295s", grail::block::MAX_SECTORS);
+        ok("4294967295s", grail::block::V1_MAX_SECTORS);
         for bad in [
             "",
             "0",

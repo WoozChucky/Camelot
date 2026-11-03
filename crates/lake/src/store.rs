@@ -36,7 +36,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Largest image Lake creates by default, in sectors: what one Grail disk can address
-/// (its `BLK_CAPACITY` register is 32 bits), just under 2 TiB.
+/// on an RV32 machine (version 1's `BLK_CAPACITY` register is 32 bits), just under
+/// 2 TiB.
 pub const MAX_IMAGE_SECTORS: u64 = u32::MAX as u64;
 
 const SECTOR: u64 = SECTOR_SIZE as u64;

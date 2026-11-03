@@ -4059,7 +4059,7 @@ fn trace_disks(m: &mut Machine, elf: &grail::elf::Elf, max_steps: u64) -> (RunRe
         if let Some((disk, cmd)) = pending_cmd.take() {
             let d: &grail::block::BlockDevice = &cpu.bus.disks[disk];
             let data = if cmd == BLK_CMD_WRITE {
-                let start = (u64::from(d.dma) - RAM_BASE) as usize;
+                let start = (d.dma - RAM_BASE) as usize;
                 cpu.bus.ram[start..start + d.count as usize * 512].to_vec()
             } else {
                 Vec::new()
@@ -4067,9 +4067,9 @@ fn trace_disks(m: &mut Machine, elf: &grail::elf::Elf, max_steps: u64) -> (RunRe
             t.commands.push(DiskCommand {
                 disk,
                 cmd,
-                sector: d.sector,
+                sector: d.sector as u32, // an RV32 kernel
                 count: d.count,
-                dma: d.dma,
+                dma: d.dma as u32,
                 data,
             });
         }
