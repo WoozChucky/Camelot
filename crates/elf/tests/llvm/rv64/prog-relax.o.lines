@@ -1,0 +1,77 @@
+prog-relax.o:	file format elf64-littleriscv
+
+.debug_line contents:
+debug_line[0x00000000]
+Line table prologue:
+    total_length: 0x00000137
+          format: DWARF32
+         version: 5
+    address_size: 8
+ seg_select_size: 0
+ prologue_length: 0x00000037
+ min_inst_length: 1
+max_ops_per_inst: 1
+ default_is_stmt: 1
+       line_base: -5
+      line_range: 14
+     opcode_base: 13
+standard_opcode_lengths[DW_LNS_copy] = 0
+standard_opcode_lengths[DW_LNS_advance_pc] = 1
+standard_opcode_lengths[DW_LNS_advance_line] = 1
+standard_opcode_lengths[DW_LNS_set_file] = 1
+standard_opcode_lengths[DW_LNS_set_column] = 1
+standard_opcode_lengths[DW_LNS_negate_stmt] = 0
+standard_opcode_lengths[DW_LNS_set_basic_block] = 0
+standard_opcode_lengths[DW_LNS_const_add_pc] = 0
+standard_opcode_lengths[DW_LNS_fixed_advance_pc] = 1
+standard_opcode_lengths[DW_LNS_set_prologue_end] = 0
+standard_opcode_lengths[DW_LNS_set_epilogue_begin] = 0
+standard_opcode_lengths[DW_LNS_set_isa] = 1
+include_directories[  0] = "/camelot"
+file_names[  0]:
+           name: "prog.c"
+      dir_index: 0
+   md5_checksum: 2b8aa02ba56a250351bea672fccdafd9
+
+Address            Line   Column File   ISA Discriminator OpIndex Flags
+------------------ ------ ------ ------ --- ------------- ------- -------------
+0x0000000000000000     15      0      0   0             0       0  is_stmt
+0x0000000000000018     16      9      0   0             0       0  is_stmt prologue_end
+0x0000000000000020     17     14      0   0             0       0  is_stmt
+0x0000000000000024     17     10      0   0             0       0 
+0x0000000000000028     17     21      0   0             0       0 
+0x000000000000002c     17     25      0   0             0       0 
+0x0000000000000030     17      5      0   0             0       0 
+0x0000000000000038     18     20      0   0             0       0  is_stmt
+0x000000000000003c     18     22      0   0             0       0 
+0x0000000000000040     18     20      0   0             0       0 
+0x000000000000004c     18     14      0   0             0       0 
+0x0000000000000058     18     11      0   0             0       0 
+0x0000000000000064     18      9      0   0             0       0 
+0x0000000000000068     17     29      0   0             0       0  is_stmt
+0x0000000000000074     17      5      0   0             0       0 
+0x0000000000000078     19     12      0   0             0       0  is_stmt
+0x000000000000007c     19      5      0   0             0       0  epilogue_begin
+0x000000000000008e     11      0      0   0             0       0  is_stmt
+0x00000000000000a2     12     12      0   0             0       0  is_stmt prologue_end
+0x00000000000000a6     12     14      0   0             0       0 
+0x00000000000000aa     12      5      0   0             0       0  epilogue_begin
+0x00000000000000ba     12      5      0   0             0       0  end_sequence
+0x00000000000000bc     26      0      0   0             0       0  is_stmt
+0x00000000000000cc     27     15      0   0             0       0  is_stmt prologue_end
+0x00000000000000e4     27     31      0   0             0       0 
+0x00000000000000f4     27     29      0   0             0       0 
+0x00000000000000f8     27     13      0   0             0       0 
+0x0000000000000104     28      5      0   0             0       0  is_stmt
+0x0000000000000108     28      5      0   0             0       0 
+0x000000000000010c     28      5      0   0             0       0  end_sequence
+0x0000000000000000     22      0      0   0             0       0  is_stmt
+0x0000000000000010     23     12      0   0             0       0  is_stmt prologue_end
+0x000000000000001c     23     22      0   0             0       0 
+0x0000000000000028     23     20      0   0             0       0 
+0x000000000000002c     23     36      0   0             0       0 
+0x0000000000000038     23     35      0   0             0       0 
+0x000000000000003c     23     33      0   0             0       0 
+0x0000000000000040     23      5      0   0             0       0  epilogue_begin
+0x0000000000000050     23      5      0   0             0       0  end_sequence
+

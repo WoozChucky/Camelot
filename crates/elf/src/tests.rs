@@ -262,7 +262,8 @@ fn corrupt_files_do_not_panic() {
         "/../../examples/hello/hello.elf"
     ))
     .unwrap();
-    for file in [tiny_object(), build_object(false, Class::Elf64), hello] {
+    let rv64 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/llvm/rv64/prog.elf")).unwrap();
+    for file in [tiny_object(), build_object(false, Class::Elf64), hello, rv64] {
         for len in 0..file.len() {
             exercise(&file[..len]);
         }
