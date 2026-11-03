@@ -54,7 +54,10 @@ CI runs on Linux only (Windows runners are expensive), so Windows is covered by 
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --release
+cargo test --release -- --ignored exhaustive::
 ```
+
+The tests come in two tiers. `cargo test --release` runs the fast one, and it is all CI runs, on PRs and on main. The **exhaustive tier** is the last command, and it runs only here, before every push: tests whose cost grows with every point they replay, such as the crash tests in `crates/xtask/tests/fs.rs` that stop the machine after every sector written and boot the kernel on each disk it could leave. Such a test goes in a module named `exhaustive`, marked `#[ignore = "exhaustive: ..."]`, so that the filter finds it and nothing else; a fast test of the same thing (one crash point, say) stays in the fast tier. The other ignored tests (Grail's and Herald's windows, LLDB, the clang reference build) need a desktop or LLVM and have their own commands (README.md).
 
 A **docs-only** change touches only Markdown (`docs/`, READMEs, this file), and no code, build files, committed binaries or files that go into an image (such as `kernel/fs/`). For one, run only the tests that read documents, not the three checks above:
 
@@ -64,6 +67,6 @@ cargo test --release -p avalon --test server -- the_readme_client_example
 cargo test --release -p lake --test avalon -- the_readme_lake_example
 ```
 
-A new test that reads a document joins this list (`grep -rln '\.md' crates/*/tests` finds them). CI still runs everything.
+A new test that reads a document joins this list (`grep -rln '\.md' crates/*/tests` finds them). CI still runs the whole fast tier.
 
 Formatting uses `rustfmt.toml` (max width 110). Branch per issue, PR description says `Closes #N`.

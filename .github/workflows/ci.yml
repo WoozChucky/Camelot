@@ -23,5 +23,8 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      # The fast tier. The exhaustive one (`cargo test --release -- --ignored
+      # exhaustive::`: crash tests at every sector written, and the like) runs
+      # only locally, before every push (CLAUDE.md, "Before pushing").
       - name: Test
         run: cargo test --release

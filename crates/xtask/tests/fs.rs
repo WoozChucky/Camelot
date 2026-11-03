@@ -540,73 +540,6 @@ fn the_kernels_transactions_are_what_the_host_reads_back() {
 }
 
 #[test]
-fn a_crash_after_any_write_leaves_whole_transactions() {
-    // Issue #66's crash-recovery test, at every point: the machine stopped
-    // after each sector the write test sends to the disk (a block is two
-    // sectors, so also with a block half written). Replayed, every one of
-    // those disks is consistent, and holds the state before or after each
-    // transaction, never one in between: the state changes exactly when a
-    // header with n > 0 is written, to the state of that commit, in order.
-    // Then the kernel boots on each one, replays its log and frees an inode
-    // left with no links (the write test removes /fstest/x while holding a
-    // reference to it, and frees it a transaction later) as the host does
-    // (the disk afterwards is byte for byte the host's, but for the log
-    // slots that freeing went through) and passes its self-test.
-    let image = small_image();
-    let run = boot(
-        image.clone(),
-        Boot {
-            snapshots: true,
-            ..WRITE
-        },
-    );
-    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
-    assert!(
-        run.out.contains(&passed(READ_CHECKS_NO_BIN + WRITE_CHECKS)),
-        "{}",
-        run.out
-    );
-    let snapshots = run.record.snapshots;
-    // Each commit writes at least a slot, the header, a home and the header
-    // again: 8 sectors.
-    assert!(snapshots.len() >= 8 * COMMITS, "{} snapshots", snapshots.len());
-    assert_eq!(snapshots.last(), Some(&run.disk));
-
-    let mut states = vec![state(&image)];
-    let mut commits = Vec::new();
-    let mut pending = 0;
-    for (i, snap) in snapshots.iter().enumerate() {
-        let r = fsck::check(snap).unwrap_or_else(|p| panic!("stopped after sector write {i}: {p:#?}"));
-        let s = state(snap);
-        if r.replayed > 0 {
-            pending += 1;
-            if commits.last() != Some(&s) {
-                commits.push(s.clone());
-            }
-        }
-        if states.last() != Some(&s) {
-            states.push(s);
-        }
-    }
-    assert!(pending > COMMITS, "{pending} disks with a transaction to replay");
-    assert!(
-        snapshots.iter().any(|s| fsck::check(s).unwrap().orphans == 1),
-        "no disk with an orphan"
-    );
-    assert_eq!(commits.len(), COMMITS);
-    assert_eq!(states[1..], commits[..]);
-    // The host reads /fstest/big, past its direct blocks, as the kernel
-    // wrote it, before it is removed.
-    let big = pattern(BIG_LEN, 3);
-    assert!(states
-        .iter()
-        .any(|(files, _, _)| files.iter().any(|f| f.0 == "/fstest/big" && f.4 == big)));
-    assert_eq!(states.last().unwrap(), &state(&run.disk));
-
-    reboot_each(&snapshots, READ_CHECKS_NO_BIN);
-}
-
-#[test]
 fn stopping_the_machine_mid_commit_then_rebooting_completes_the_transaction() {
     // The same, step by step, for one point: a first run finds the write
     // that commits the first transaction (/fstest and /fstest/a); a second
@@ -994,47 +927,87 @@ fn at_each_write(base: &[u8], writes: &[(u64, Vec<u8>)], f: impl Fn(usize, &[u8]
     });
 }
 
-#[test]
-fn a_crash_during_a_truncation_leaves_it_for_the_next_mount() {
-    // The tree test stopped after every sector it writes. Replayed, every
-    // disk passes fsck and holds the state of a commit. Some hold /t2 being
-    // truncated (TRUNCATING set, a size of 0, blocks still to free) and
-    // /t1 an orphan with blocks still to free; the kernel, booted on each
-    // disk, finishes the truncation and frees the orphan as fsck --recover
-    // does.
-    let image = tree_image();
-    let run = boot(image.clone(), Boot { writes: true, ..TREE });
-    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
-    let writes = run.record.writes;
+/// A disk's state (`state`) with each file's contents as their length and a
+/// hash: small enough to keep for each of thousands of crash points.
+type Digest = (Vec<(String, u32, u16, u16, usize, u64)>, u32, u32);
+
+fn digest(image: &[u8]) -> Digest {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let (files, free_blocks, free_inodes) = state(image);
+    let files = files
+        .into_iter()
+        .map(|(path, inum, kind, nlink, contents)| {
+            let mut h = DefaultHasher::new();
+            contents.hash(&mut h);
+            (path, inum, kind, nlink, contents.len(), h.finish())
+        })
+        .collect();
+    (files, free_blocks, free_inodes)
+}
+
+/// One crash point: the disk as the machine left it after sector write `i`.
+struct Point {
+    i: usize,
+    report: fsck::Report,
+    digest: Digest,
+}
+
+/// The crash test of a run whose `writes` the disk recorded, from `base`:
+/// every disk the machine could have left passes fsck, and its state, as
+/// recovery would leave it, changes only at a commit point (when a header
+/// with n > 0 is written), to that commit's state, ending at `last`'s.
+/// Returns the points in order.
+fn crash_points(base: &[u8], writes: &[(u64, Vec<u8>)], last: &[u8]) -> Vec<Point> {
     let seen = Mutex::new(Vec::new());
-    at_each_write(&image, &writes, |i, disk| {
-        let r = fsck::check(disk).unwrap_or_else(|p| panic!("stopped after sector write {i}: {p:#?}"));
-        seen.lock()
-            .unwrap()
-            .push((i, r.replayed > 0, r.truncating, r.orphans, state(disk)));
-        reboot_one(i, disk, READ_CHECKS_NO_BIN);
+    at_each_write(base, writes, |i, disk| {
+        let report = fsck::check(disk).unwrap_or_else(|p| panic!("stopped after sector write {i}: {p:#?}"));
+        let digest = digest(disk);
+        seen.lock().unwrap().push(Point { i, report, digest });
     });
-    let mut seen = seen.into_inner().unwrap();
-    seen.sort_by_key(|s| s.0);
-    // The state changes only at a commit point: when a header with n > 0
-    // is written, to that commit's state.
-    let mut states = vec![state(&image)];
+    let mut points = seen.into_inner().unwrap();
+    points.sort_by_key(|p| p.i);
+    let mut states = vec![digest(base)];
     let mut commits = Vec::new();
-    for (_, pending, _, _, s) in &seen {
-        if *pending && commits.last() != Some(s) {
-            commits.push(s.clone());
+    for p in &points {
+        if p.report.replayed > 0 && commits.last() != Some(&p.digest) {
+            commits.push(p.digest.clone());
         }
-        if states.last() != Some(s) {
-            states.push(s.clone());
+        if states.last() != Some(&p.digest) {
+            states.push(p.digest.clone());
         }
     }
     assert_eq!(states[1..], commits[..]);
-    assert!(
-        seen.iter().any(|s| s.2 > 0 && s.3 == 0),
-        "no disk with a file part way through its truncation"
-    );
-    assert!(seen.iter().any(|s| s.3 > 0), "no disk with an orphan");
-    assert_eq!(states.last().unwrap(), &state(&run.disk));
+    assert_eq!(states.last().unwrap(), &digest(last));
+    points
+}
+
+/// The points worth booting the kernel on, among `points`: those with work
+/// for its recovery, a committed transaction to replay (installing it part
+/// way, or not yet), and the first disk after each commit (the log empty
+/// again, an orphan or a truncation maybe left). The others are the disk
+/// before a commit point with some of its slots written, which recovery
+/// ignores, as the same state's first point shows.
+fn worth_rebooting(points: &[Point]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (j, p) in points.iter().enumerate() {
+        let changed = j > 0 && points[j - 1].digest != p.digest;
+        let emptied = j > 0 && points[j - 1].report.replayed > 0 && p.report.replayed == 0;
+        if p.report.replayed > 0 || changed || emptied {
+            out.push(j);
+        }
+    }
+    out
+}
+
+/// Boots the kernel on the disk at each of `points[js]`, rebuilding them
+/// from the recorded writes, several machines at a time.
+fn reboot_at(base: &[u8], writes: &[(u64, Vec<u8>)], points: &[Point], js: &[usize]) {
+    let wanted: std::collections::HashSet<usize> = js.iter().map(|&j| points[j].i).collect();
+    at_each_write(base, writes, |i, disk| {
+        if wanted.contains(&i) {
+            reboot_one(i, disk, READ_CHECKS_NO_BIN);
+        }
+    });
 }
 
 /// The grow test's disk (kernel/fstest.c, grow_test): one bitmap block, a
@@ -1091,54 +1064,6 @@ fn the_kernel_grows_trees_through_every_split() {
     // The grow test fills the disk to its last block, which the disk
     // self-test wrote back as it was before the mount.
     assert!(commit_sizes(&run.record.ops, &after.sb, disk_blocks, disk_blocks).len() > 2 * G_BLOCKS);
-}
-
-#[test]
-fn a_crash_while_a_tree_grows_leaves_whole_transactions() {
-    // The grow test stopped after every sector it writes: replayed, every
-    // disk passes fsck and holds the state of a commit. Around each growth
-    // (the trees' 5th, 85th and 337th extents: depth 0 to 1, a leaf split,
-    // depth 1 to 2), the kernel boots on each disk and recovers it as the
-    // host does.
-    let image = grow_image();
-    let run = boot(image.clone(), Boot { writes: true, ..GROW });
-    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
-    let writes = run.record.writes;
-    let near_growth = |s: &State| {
-        s.0.iter().any(|f| {
-            (f.0 == "/g1" || f.0 == "/g2")
-                && [4, 84, 336]
-                    .iter()
-                    .any(|&k| (k * BSIZE..=(k + 2) * BSIZE).contains(&f.4.len()))
-        })
-    };
-    let seen = Mutex::new(Vec::new());
-    let rebooted = std::sync::atomic::AtomicUsize::new(0);
-    at_each_write(&image, &writes, |i, disk| {
-        let r = fsck::check(disk).unwrap_or_else(|p| panic!("stopped after sector write {i}: {p:#?}"));
-        let s = state(disk);
-        if near_growth(&s) {
-            reboot_one(i, disk, READ_CHECKS_NO_BIN);
-            rebooted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        seen.lock().unwrap().push((i, r.replayed > 0, s));
-    });
-    let mut seen = seen.into_inner().unwrap();
-    seen.sort_by_key(|s| s.0);
-    let mut states = vec![state(&image)];
-    let mut commits = Vec::new();
-    for (_, pending, s) in &seen {
-        if *pending && commits.last() != Some(s) {
-            commits.push(s.clone());
-        }
-        if states.last() != Some(s) {
-            states.push(s.clone());
-        }
-    }
-    assert_eq!(states[1..], commits[..]);
-    assert_eq!(states.last().unwrap(), &state(&run.disk));
-    // Both files, through all three growths, a dozen points or more each.
-    assert!(rebooted.into_inner() > 6 * 12);
 }
 
 #[test]
@@ -1615,81 +1540,6 @@ fn stress_on_the_root_image_leaves_it_as_it_was() {
 }
 
 #[test]
-fn a_crash_during_the_file_system_calls_leaves_whole_transactions() {
-    // The crash test of issue #66, for the calls that change the disk:
-    // `filetest ops` makes directories and files, links, truncates and
-    // removes them (one while it is open, which leaves an orphan until it
-    // is closed), from the shell. The machine is stopped after each sector
-    // written; every disk replayed is consistent and holds the state before
-    // or after each commit, never one in between; and the kernel, rebooted
-    // on each one, recovers it as the host does.
-    let image = small_image_with_programs(&["filetest"]);
-    let before = fsck::check(&image).unwrap();
-    let run = boot(
-        image.clone(),
-        Boot {
-            snapshots: true,
-            input: b"filetest ops\nexit\n",
-            max_steps: SHELL_MAX_STEPS,
-            ..READ
-        },
-    );
-    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
-    assert_eq!(shell_output(&run.out, "filetest ops"), "filetest: ops done\n");
-    let after = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
-    let disk_blocks = (run.disk.len() / BSIZE) as u32;
-    let commits_made = check_commits(&run.record.ops, &after.sb, disk_blocks);
-    let snapshots = run.record.snapshots;
-    assert_eq!(snapshots.last(), Some(&run.disk));
-
-    let mut states = vec![state(&image)];
-    let mut commits = Vec::new();
-    for (i, snap) in snapshots.iter().enumerate() {
-        let r = fsck::check(snap).unwrap_or_else(|p| panic!("stopped after sector write {i}: {p:#?}"));
-        let s = state(snap);
-        if r.replayed > 0 && commits.last() != Some(&s) {
-            commits.push(s.clone());
-        }
-        if states.last() != Some(&s) {
-            states.push(s);
-        }
-    }
-    assert_eq!(commits.len(), commits_made);
-    assert_eq!(states[1..], commits[..]);
-    assert!(
-        snapshots.iter().any(|s| fsck::check(s).unwrap().orphans == 1),
-        "no disk with an orphan"
-    );
-    // What each step leaves, as the host reads it.
-    let holds = |path: &str, nlink: u16, contents: &[u8]| {
-        states.iter().any(|(files, _, _)| {
-            files
-                .iter()
-                .any(|f| f.0 == path && f.3 == nlink && f.4 == contents)
-        })
-    };
-    assert!(holds("/ops/a", 1, &pattern(5000, 11)), "/ops/a");
-    assert!(holds("/ops/b", 2, &pattern(5000, 11)), "/ops/b, a link to a");
-    assert!(holds("/ops/d/c", 1, &pattern(100, 12)), "/ops/d/c");
-    assert!(holds("/ops/b", 2, &[]), "/ops/b emptied");
-    assert!(holds("/ops/a", 2, &pattern(10, 13)), "/ops/a written through b");
-    // In the end, /ops and an empty /ops/e: everything else came back.
-    let (files, free_blocks, free_inodes) = states.last().unwrap();
-    let ops: Vec<&str> = files
-        .iter()
-        .map(|f| f.0.as_str())
-        .filter(|p| p.starts_with("/ops"))
-        .collect();
-    assert_eq!(ops, ["/ops", "/ops/e"]);
-    assert_eq!(
-        (*free_blocks, *free_inodes),
-        (before.free_blocks - 1, before.free_inodes - 2)
-    );
-
-    reboot_each(&snapshots, READ_CHECKS);
-}
-
-#[test]
 fn on_a_read_only_root_every_change_fails_and_reading_works() {
     // `filetest ro`: every call that would write the disk fails with
     // EROFS, reading, running programs and changing directory work, and
@@ -1741,4 +1591,223 @@ fn ls_reports_an_entry_it_cannot_open_rather_than_leaving_it_out() {
     assert!(want.contains("nodriver"), "{host}");
     want.push_str("ls: exit 1\n");
     assert_eq!(shell_output(&run.out, "ls /dev"), want);
+}
+
+/// The exhaustive tier (CLAUDE.md, "Before pushing"): the crash tests that
+/// stop the machine after every sector a test writes and check, and boot
+/// the kernel on, the disks it could leave. Ignored by `cargo test`, which CI
+/// runs; `cargo test --release -- --ignored exhaustive::` runs them, and the
+/// local pre-push check does.
+mod exhaustive {
+    use super::*;
+
+    #[test]
+    #[ignore = "exhaustive: a crash at every sector written (cargo test --release -- --ignored exhaustive::)"]
+    fn a_crash_after_any_write_leaves_whole_transactions() {
+        // Issue #66's crash-recovery test, at every point: the machine stopped
+        // after each sector the write test sends to the disk (a block is two
+        // sectors, so also with a block half written). Replayed, every one of
+        // those disks is consistent, and holds the state before or after each
+        // transaction, never one in between: the state changes exactly when a
+        // header with n > 0 is written, to the state of that commit, in order.
+        // Then the kernel boots on each one, replays its log and frees an inode
+        // left with no links (the write test removes /fstest/x while holding a
+        // reference to it, and frees it a transaction later) as the host does
+        // (the disk afterwards is byte for byte the host's, but for the log
+        // slots that freeing went through) and passes its self-test.
+        let image = small_image();
+        let run = boot(
+            image.clone(),
+            Boot {
+                snapshots: true,
+                ..WRITE
+            },
+        );
+        assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+        assert!(
+            run.out.contains(&passed(READ_CHECKS_NO_BIN + WRITE_CHECKS)),
+            "{}",
+            run.out
+        );
+        let snapshots = run.record.snapshots;
+        // Each commit writes at least a slot, the header, a home and the header
+        // again: 8 sectors.
+        assert!(snapshots.len() >= 8 * COMMITS, "{} snapshots", snapshots.len());
+        assert_eq!(snapshots.last(), Some(&run.disk));
+
+        let mut states = vec![state(&image)];
+        let mut commits = Vec::new();
+        let mut pending = 0;
+        for (i, snap) in snapshots.iter().enumerate() {
+            let r = fsck::check(snap).unwrap_or_else(|p| panic!("stopped after sector write {i}: {p:#?}"));
+            let s = state(snap);
+            if r.replayed > 0 {
+                pending += 1;
+                if commits.last() != Some(&s) {
+                    commits.push(s.clone());
+                }
+            }
+            if states.last() != Some(&s) {
+                states.push(s);
+            }
+        }
+        assert!(pending > COMMITS, "{pending} disks with a transaction to replay");
+        assert!(
+            snapshots.iter().any(|s| fsck::check(s).unwrap().orphans == 1),
+            "no disk with an orphan"
+        );
+        assert_eq!(commits.len(), COMMITS);
+        assert_eq!(states[1..], commits[..]);
+        // The host reads /fstest/big, past its direct blocks, as the kernel
+        // wrote it, before it is removed.
+        let big = pattern(BIG_LEN, 3);
+        assert!(states
+            .iter()
+            .any(|(files, _, _)| files.iter().any(|f| f.0 == "/fstest/big" && f.4 == big)));
+        assert_eq!(states.last().unwrap(), &state(&run.disk));
+
+        reboot_each(&snapshots, READ_CHECKS_NO_BIN);
+    }
+
+    #[test]
+    #[ignore = "exhaustive: a crash at every sector written (cargo test --release -- --ignored exhaustive::)"]
+    fn a_crash_during_a_truncation_leaves_it_for_the_next_mount() {
+        // The tree test stopped after every sector it writes. Replayed, every
+        // disk passes fsck and holds the state of a commit. Some hold /t2 being
+        // truncated (TRUNCATING set, a size of 0, blocks still to free) and
+        // /t1 an orphan with blocks still to free; the kernel, booted on each
+        // disk recovery has work on, finishes the truncation and frees the
+        // orphan as fsck --recover does.
+        let image = tree_image();
+        let run = boot(image.clone(), Boot { writes: true, ..TREE });
+        assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+        let writes = run.record.writes;
+        let points = crash_points(&image, &writes, &run.disk);
+        assert!(
+            points
+                .iter()
+                .any(|p| p.report.truncating > 0 && p.report.orphans == 0),
+            "no disk with a file part way through its truncation"
+        );
+        assert!(
+            points.iter().any(|p| p.report.orphans > 0),
+            "no disk with an orphan"
+        );
+        let js = worth_rebooting(&points);
+        assert!(js.len() > 50, "{} disks to reboot on", js.len());
+        reboot_at(&image, &writes, &points, &js);
+    }
+
+    #[test]
+    #[ignore = "exhaustive: a crash at every sector written (cargo test --release -- --ignored exhaustive::)"]
+    fn a_crash_while_a_tree_grows_leaves_whole_transactions() {
+        // The grow test stopped after every sector it writes: replayed, every
+        // disk passes fsck and holds the state of a commit. Around each growth
+        // (the trees' 5th, 85th and 337th extents: depth 0 to 1, a leaf split,
+        // depth 1 to 2), the kernel boots on each disk recovery has work on and
+        // recovers it as the host does.
+        let image = grow_image();
+        let run = boot(image.clone(), Boot { writes: true, ..GROW });
+        assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+        let writes = run.record.writes;
+        let points = crash_points(&image, &writes, &run.disk);
+        let size = |d: &Digest, name: &str| d.0.iter().find(|f| f.0 == name).map_or(0, |f| f.4);
+        // The commits that grow a tree: a file's size goes from k to k + 1
+        // blocks for those k.
+        let growths: Vec<usize> = (1..points.len())
+            .filter(|&j| {
+                ["/g1", "/g2"].iter().any(|name| {
+                    [4, 84, 336].iter().any(|&k| {
+                        size(&points[j - 1].digest, name) == k * BSIZE
+                            && size(&points[j].digest, name) == (k + 1) * BSIZE
+                    })
+                })
+            })
+            .collect();
+        assert_eq!(growths.len(), 6, "each file's three growths");
+        // A transaction of a few blocks is a few dozen sector writes either side
+        // of its commit point.
+        let js: Vec<usize> = worth_rebooting(&points)
+            .into_iter()
+            .filter(|&j| growths.iter().any(|&g| j + 40 >= g && j <= g + 40))
+            .collect();
+        assert!(js.len() > 6 * 8, "{} disks to reboot on", js.len());
+        reboot_at(&image, &writes, &points, &js);
+    }
+
+    #[test]
+    #[ignore = "exhaustive: a crash at every sector written (cargo test --release -- --ignored exhaustive::)"]
+    fn a_crash_during_the_file_system_calls_leaves_whole_transactions() {
+        // The crash test of issue #66, for the calls that change the disk:
+        // `filetest ops` makes directories and files, links, truncates and
+        // removes them (one while it is open, which leaves an orphan until it
+        // is closed), from the shell. The machine is stopped after each sector
+        // written; every disk replayed is consistent and holds the state before
+        // or after each commit, never one in between; and the kernel, rebooted
+        // on each one, recovers it as the host does.
+        let image = small_image_with_programs(&["filetest"]);
+        let before = fsck::check(&image).unwrap();
+        let run = boot(
+            image.clone(),
+            Boot {
+                snapshots: true,
+                input: b"filetest ops\nexit\n",
+                max_steps: SHELL_MAX_STEPS,
+                ..READ
+            },
+        );
+        assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+        assert_eq!(shell_output(&run.out, "filetest ops"), "filetest: ops done\n");
+        let after = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+        let disk_blocks = (run.disk.len() / BSIZE) as u32;
+        let commits_made = check_commits(&run.record.ops, &after.sb, disk_blocks);
+        let snapshots = run.record.snapshots;
+        assert_eq!(snapshots.last(), Some(&run.disk));
+
+        let mut states = vec![state(&image)];
+        let mut commits = Vec::new();
+        for (i, snap) in snapshots.iter().enumerate() {
+            let r = fsck::check(snap).unwrap_or_else(|p| panic!("stopped after sector write {i}: {p:#?}"));
+            let s = state(snap);
+            if r.replayed > 0 && commits.last() != Some(&s) {
+                commits.push(s.clone());
+            }
+            if states.last() != Some(&s) {
+                states.push(s);
+            }
+        }
+        assert_eq!(commits.len(), commits_made);
+        assert_eq!(states[1..], commits[..]);
+        assert!(
+            snapshots.iter().any(|s| fsck::check(s).unwrap().orphans == 1),
+            "no disk with an orphan"
+        );
+        // What each step leaves, as the host reads it.
+        let holds = |path: &str, nlink: u16, contents: &[u8]| {
+            states.iter().any(|(files, _, _)| {
+                files
+                    .iter()
+                    .any(|f| f.0 == path && f.3 == nlink && f.4 == contents)
+            })
+        };
+        assert!(holds("/ops/a", 1, &pattern(5000, 11)), "/ops/a");
+        assert!(holds("/ops/b", 2, &pattern(5000, 11)), "/ops/b, a link to a");
+        assert!(holds("/ops/d/c", 1, &pattern(100, 12)), "/ops/d/c");
+        assert!(holds("/ops/b", 2, &[]), "/ops/b emptied");
+        assert!(holds("/ops/a", 2, &pattern(10, 13)), "/ops/a written through b");
+        // In the end, /ops and an empty /ops/e: everything else came back.
+        let (files, free_blocks, free_inodes) = states.last().unwrap();
+        let ops: Vec<&str> = files
+            .iter()
+            .map(|f| f.0.as_str())
+            .filter(|p| p.starts_with("/ops"))
+            .collect();
+        assert_eq!(ops, ["/ops", "/ops/e"]);
+        assert_eq!(
+            (*free_blocks, *free_inodes),
+            (before.free_blocks - 1, before.free_inodes - 2)
+        );
+
+        reboot_each(&snapshots, READ_CHECKS);
+    }
 }
