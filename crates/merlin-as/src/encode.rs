@@ -71,7 +71,7 @@ pub const CSRRC: u32 = 0b011;
 pub const CSR_IMM: u32 = 0b100;
 
 /// The funct3 values above, by name, for tables generated from these
-/// (the C assembler's, `crates/xtask/src/as_tables.rs`).
+/// (the C assembler's, `crates/xtask/src/c_tables.rs`).
 pub const NAMED_FUNCT3: &[(&str, u32)] = &[
     ("ADDI", ADDI),
     ("SLTIU", SLTIU),

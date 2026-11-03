@@ -242,6 +242,11 @@ fn passed(n: u32) -> String {
     format!("fs self-test: {n}/{n} passed\n")
 }
 
+/// The size of the root filesystems these tests boot, in blocks: about what
+/// the bootable root image gives its filesystem (`xtask::fs::IMAGE_SIZE`
+/// less the kernel), room for `/bin` and for filetest's largest file.
+const ROOT_BLOCKS: u32 = 4096;
+
 /// The root image `cargo xtask fs` builds, `size` blocks.
 fn root_image(size: u32) -> Vec<u8> {
     xtask::fs::build(
@@ -439,7 +444,7 @@ fn the_kernel_mounts_the_root_image_and_lists_it() {
     // Issue #66's acceptance test: mkfs builds the root image, the kernel
     // mounts it at boot and lists / in its self-test, as the host lists it;
     // every program in /bin reads back as the kernel's own copy.
-    let image = root_image(2048);
+    let image = root_image(ROOT_BLOCKS);
     let report = fsck::check(&image).unwrap();
     let host = Fs::open(&image).unwrap();
     let run = boot(image.clone(), READ);
@@ -474,7 +479,7 @@ fn the_kernels_transactions_are_what_the_host_reads_back() {
     // removed ones gone (one past its direct blocks, whose blocks all came
     // back), the kernel's listing of /fstest is the host's, and every commit
     // followed the protocol.
-    let image = root_image(2048);
+    let image = root_image(ROOT_BLOCKS);
     let before = fsck::check(&image).unwrap();
     let root_listing = Fs::open(&image).unwrap().ls("/").unwrap();
     let run = boot(image, WRITE);
@@ -1042,7 +1047,7 @@ fn the_shell_runs_programs_from_bin_and_redirects_through_files_and_pipes() {
     // `<`, and runs a program by a path of its own (a link to /bin/echo,
     // which only the disk has). The host reads what the kernel wrote, fsck
     // finds the disk consistent, and every change was a whole transaction.
-    let image = root_image(2048);
+    let image = root_image(ROOT_BLOCKS);
     let before = fsck::check(&image).unwrap();
     let bin = Fs::open(&image).unwrap().ls("/bin").unwrap();
     let run = boot(
@@ -1098,7 +1103,7 @@ fn filetest_passes_on_the_root_image_and_leaves_it_as_it_was() {
     // Every file system call and its errors (kernel/user/filetest.c), on
     // the root image. filetest removes what it made: the disk ends as it
     // began, consistent, with every block and inode back.
-    let image = root_image(2048);
+    let image = root_image(ROOT_BLOCKS);
     let run = boot(
         image.clone(),
         Boot {
@@ -1132,7 +1137,7 @@ fn stress_on_the_root_image_leaves_it_as_it_was() {
     // ends consistent and as it began. That ticks really do preempt the
     // workers mid-round is checked by kernel.rs's
     // stress_runs_many_processes_through_the_locks, which watches the hart.
-    let image = root_image(2048);
+    let image = root_image(ROOT_BLOCKS);
     let run = boot(
         image.clone(),
         Boot {

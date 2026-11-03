@@ -93,7 +93,19 @@ fn short(i: usize) -> String {
 /// An image with the shell and the assembler in /bin, `inputs` in /src
 /// (named by `short`), and an empty /out.
 fn image(inputs: &[(String, String)]) -> Vec<u8> {
-    let bytes: usize = inputs.iter().map(|(_, t)| t.len()).sum();
+    let files: Vec<(String, Vec<u8>)> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, (_, text))| (format!("/src/{}.s", short(i)), text.as_bytes().to_vec()))
+        .collect();
+    image_of(&["as"], &["/src"], &files)
+}
+
+/// An image with the shell and `bins` in /bin (the user programs of those
+/// names), the directories `dirs`, `files` (path, contents) and an empty
+/// /out.
+fn image_of(bins: &[&str], dirs: &[&str], files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let bytes: usize = files.iter().map(|(_, t)| t.len()).sum();
     let blocks = 2048 + 3 * bytes / camelot_fs::BSIZE;
     let mut fs = Mkfs::new(&Options {
         size: blocks as u32,
@@ -105,15 +117,15 @@ fn image(inputs: &[(String, String)]) -> Vec<u8> {
         .unwrap();
     fs.mkdir("/bin").unwrap();
     let user = userprogs::user_dir(&repo_root());
-    for name in ["sh", "as"] {
+    for name in std::iter::once(&"sh").chain(bins) {
         let prog = userprogs::build_named(&user, name).unwrap();
         fs.add_file(&format!("/bin/{name}"), &prog.elf).unwrap();
     }
-    fs.mkdir("/src").unwrap();
-    fs.mkdir("/out").unwrap();
-    for (i, (_, text)) in inputs.iter().enumerate() {
-        fs.add_file(&format!("/src/{}.s", short(i)), text.as_bytes())
-            .unwrap();
+    for d in dirs.iter().chain(&["/out"]) {
+        fs.mkdir(d).unwrap();
+    }
+    for (path, data) in files {
+        fs.add_file(path, data).unwrap();
     }
     fs.finish()
 }
@@ -261,12 +273,11 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
 }
 
 #[test]
-fn the_assemblers_tables_are_the_host_tools() {
-    // kernel/user/as/tables.h and tables.c are generated from merlin-as's
-    // and excalibur's tables (crates/xtask/src/as_tables.rs) by `cargo xtask
-    // kernel`.
-    use xtask::as_tables::{generate_c, generate_h, TABLES_C, TABLES_H};
-    for (file, want) in [(TABLES_H, generate_h()), (TABLES_C, generate_c())] {
+fn the_c_tools_tables_are_the_host_tools() {
+    // kernel/user/as/tables.[ch] and kernel/user/ld/tables.[ch] are generated
+    // from merlin-as's, excalibur's and elf32's tables
+    // (crates/xtask/src/c_tables.rs) by `cargo xtask kernel`.
+    for (file, want) in xtask::c_tables::files() {
         let path = repo_root().join(file);
         let committed = std::fs::read_to_string(&path).unwrap().replace('\r', "");
         assert!(
@@ -274,5 +285,269 @@ fn the_assemblers_tables_are_the_host_tools() {
             "{} is out of date: run `cargo xtask kernel` and commit it",
             path.display()
         );
+    }
+}
+
+/// The second step (#136): the linker that runs on Camelot (`kernel/user/ld`,
+/// `/bin/ld`) links every user program from the host's objects into the
+/// executable merlin-ld makes, byte for byte, without the line tables (`-S`,
+/// as `/bin` holds them).
+#[test]
+fn the_linker_on_camelot_links_every_user_program_as_merlin_ld_does() {
+    link_every_program(false);
+}
+
+/// The same, and with the line tables too, as `cargo xtask kernel` writes
+/// them to target/kernel/obj/user: twice the links, and the bigger files.
+#[test]
+#[ignore]
+fn the_linker_on_camelot_keeps_the_line_tables_as_merlin_ld_does() {
+    link_every_program(true);
+}
+
+/// Links every user program on Camelot (`-S`, and without it if
+/// `with_debug`) and compares the executables with merlin-ld's. The objects
+/// go in `/o`, each program's command line in a response file in `/a` (a
+/// link line is longer than a console line), the results in `/out`.
+fn link_every_program(with_debug: bool) {
+    use userprogs::CCompiler;
+    let dir = userprogs::user_dir(&repo_root());
+    let rt = userprogs::build_runtime(&dir, CCompiler::Merlin).unwrap();
+    let progs = userprogs::programs(&dir).unwrap();
+    // What every machine has: the script, the runtime's objects and the
+    // library's members.
+    let script = std::fs::read(dir.join(userprogs::SCRIPT)).unwrap();
+    let mut shared: Vec<(String, Vec<u8>)> = vec![("/user.ld".into(), script)];
+    let mut runtime = Vec::new();
+    for (i, o) in rt.objects.iter().enumerate() {
+        runtime.push(format!("/o/r{i}.o"));
+        shared.push((format!("/o/r{i}.o"), o.data.clone()));
+    }
+    let mut library = Vec::new();
+    for (i, o) in rt.library.iter().enumerate() {
+        library.push(format!("/o/l{i}.o"));
+        shared.push((format!("/o/l{i}.o"), o.data.clone()));
+    }
+    // Per program: its own objects, its response file, and what merlin-ld
+    // makes of them.
+    struct Job {
+        name: String,
+        files: Vec<(String, Vec<u8>)>,
+        want: userprogs::Program,
+    }
+    let jobs: Vec<Job> = progs
+        .iter()
+        .enumerate()
+        .map(|(k, prog)| {
+            let objects = userprogs::program_objects(&dir, prog, CCompiler::Merlin, &rt).unwrap();
+            let own = &objects[..objects.len() - rt.objects.len()];
+            let mut files = Vec::new();
+            let mut args = format!("-T /user.ld -o /out/{k}");
+            for (j, o) in own.iter().enumerate() {
+                let path = format!("/o/p{k}_{j}.o");
+                args.push_str(&format!(" {path}"));
+                files.push((path, o.data.clone()));
+            }
+            args.push_str(&format!(" {}\n--start-lib", runtime.join(" ")));
+            for l in &library {
+                args.push_str(&format!("\n  {l}"));
+            }
+            args.push_str("\n--end-lib\n");
+            files.push((format!("/a/{k}"), args.into_bytes()));
+            Job {
+                name: prog.stem.clone(),
+                files,
+                want: userprogs::link_program(&dir, prog, CCompiler::Merlin, &rt).unwrap(),
+            }
+        })
+        .collect();
+    assert!(jobs.len() > 30, "{}", jobs.len());
+    // Every MACHINES-th program on each machine.
+    let wrong: Vec<String> = std::thread::scope(|scope| {
+        let runs: Vec<_> = (0..MACHINES)
+            .map(|m| {
+                let (jobs, shared) = (&jobs, &shared);
+                scope.spawn(move || {
+                    let mine: Vec<(usize, &Job)> =
+                        jobs.iter().enumerate().skip(m).step_by(MACHINES).collect();
+                    let mut files = shared.clone();
+                    let mut commands = Vec::new();
+                    // (command, output, merlin-ld's executable) for each link.
+                    let mut checks: Vec<(String, String, &Job, &Vec<u8>)> = Vec::new();
+                    for (k, job) in &mine {
+                        files.extend(job.files.iter().cloned());
+                        let stripped = format!("/out/{k}s");
+                        checks.push((
+                            format!("ld @/a/{k} -S -o {stripped}"),
+                            stripped,
+                            job,
+                            &job.want.elf,
+                        ));
+                        if with_debug {
+                            checks.push((format!("ld @/a/{k}"), format!("/out/{k}"), job, &job.want.debug));
+                        }
+                    }
+                    for (c, ..) in &checks {
+                        commands.push(c.clone());
+                    }
+                    let input = format!("{}\nexit 0\n", commands.join("\n"));
+                    let (out, disk) = boot(image_of(&["ld"], &["/o", "/a"], &files), &input, 20_000_000_000);
+                    let fs = Fs::open(&disk).unwrap();
+                    let mut wrong = Vec::new();
+                    for (command, file, job, want) in &checks {
+                        let said = shell_output(&out, command);
+                        match fs.read_file(file) {
+                            Ok(got) if got == **want && said.is_empty() => {}
+                            Ok(got) => wrong.push(format!(
+                                "{} ({command}): {} bytes, merlin-ld's {} (first difference at {:?}){}",
+                                job.name,
+                                got.len(),
+                                want.len(),
+                                got.iter().zip(want.iter()).position(|(a, b)| a != b),
+                                if said.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("; it said: {said}")
+                                }
+                            )),
+                            Err(e) => wrong.push(format!(
+                                "{} ({command}): no executable ({e}); it said: {said}",
+                                job.name
+                            )),
+                        }
+                    }
+                    wrong
+                })
+            })
+            .collect();
+        runs.into_iter().flat_map(|r| r.join().unwrap()).collect()
+    });
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// #23's acceptance: `hello` assembled and linked inside Camelot, by `/bin/as`
+/// and `/bin/ld`, is the host's `examples/hello/hello.elf` byte for byte, and
+/// it runs (on a machine of its own: it is a bare-metal program).
+#[test]
+fn hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs() {
+    let root = repo_root();
+    let ex = xtask::examples::find("hello").unwrap();
+    let host = xtask::examples::build(&root, ex).unwrap();
+    assert_eq!(host.elf, std::fs::read(ex.elf_path(&root)).unwrap());
+    let files: Vec<(String, Vec<u8>)> = ["hello.S", "link.ld"]
+        .iter()
+        .map(|f| (format!("/src/{f}"), std::fs::read(ex.dir(&root).join(f)).unwrap()))
+        .collect();
+    let commands = [
+        "as /src/hello.S -o /out/hello.o",
+        "ld -T /src/link.ld /out/hello.o -o /out/hello",
+    ];
+    let input = format!("{}\nexit 0\n", commands.join("\n"));
+    let (out, disk) = boot(image_of(&["as", "ld"], &["/src"], &files), &input, 2_000_000_000);
+    for c in commands {
+        assert_eq!(shell_output(&out, c), "", "{c}");
+    }
+    let elf = Fs::open(&disk).unwrap().read_file("/out/hello").unwrap();
+    assert!(elf == host.elf, "/out/hello is not examples/hello/hello.elf");
+    let mut m = Machine::new(MachineConfig::default()).unwrap();
+    m.cpu.bus.uart.capture = true;
+    m.load_elf(&elf).unwrap();
+    assert_eq!(m.run(Some(10_000_000), |_| {}), RunResult::Exited(0));
+    let said = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+    assert!(said.contains("Hello"), "{said:?}");
+}
+
+#[test]
+fn the_linker_on_camelot_reports_merlin_ld_errors() {
+    // Bad links: the messages merlin-ld gives, word for word. Each case is
+    // its objects' assembly, a script, and more arguments.
+    let script = "ENTRY(_start)\nSECTIONS\n{\n    . = 0x1000;\n    .text : { *(.text) }\n    .data : { *(.data) }\n}\n";
+    let start = ".text\n.globl _start\n_start: nop\n";
+    let cases: &[(&[&str], &str, &str)] = &[
+        (
+            &[".text\n.globl _start\n_start: call missing\n    call gone\n"],
+            script,
+            "",
+        ),
+        (&[start, start], script, ""),
+        (&[start], "SECTIONS { .text 0x100 : { *(.text) } }", ""),
+        (
+            &[".text\n.globl _start\n_start: nop\n.section .extra\n.word 1\n"],
+            script,
+            "",
+        ),
+        (
+            &[
+                ".text\n.globl _start\n_start: beq a0, a1, far\n",
+                ".text\n.zero 8192\n.globl far\nfar: nop\n",
+            ],
+            script,
+            "",
+        ),
+        (&[start], script, "-e nosuch"),
+        (
+            &[start],
+            "SECTIONS { . = 0x1000; . = 0x10; .text : { *(.text) } x = nothere; }",
+            "",
+        ),
+        (
+            &[".text\n.globl _start\n_start: nop\n.zero 64\n"],
+            "MEMORY { RAM : ORIGIN = 0x1000, LENGTH = 32 }\nSECTIONS { .text : { *(.text) } > RAM }",
+            "",
+        ),
+        (
+            &[start],
+            "SECTIONS { . = 0xfffffff0; .text : { *(.text) . += 0x20; } }",
+            "",
+        ),
+        (&[start], "MEMORY { a : o = 0, l = 1 b : o = 1, l = 1 }", ""),
+        (
+            &[".text\n.globl _start\n_start: la a0, x\n.data\n.globl x\nx: .word _start\n"],
+            "SECTIONS { /DISCARD/ : { *(.data) } .text : { *(.text) } }",
+            "",
+        ),
+    ];
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut commands = Vec::new();
+    let mut wants = Vec::new();
+    for (k, (objects, script, extra)) in cases.iter().enumerate() {
+        let mut inputs = Vec::new();
+        let mut args = format!("ld -T /e/{k}.ld -o /out/{k}");
+        for (j, src) in objects.iter().enumerate() {
+            let data = merlin_as::assemble_to_elf(src).unwrap();
+            let path = format!("/e/{k}_{j}.o");
+            args.push_str(&format!(" {path}"));
+            files.push((path.clone(), data.clone()));
+            inputs.push(merlin_ld::Input { name: path, data });
+        }
+        files.push((format!("/e/{k}.ld"), script.as_bytes().to_vec()));
+        let mut opts = merlin_ld::Options {
+            script: Some(merlin_ld::ScriptSource {
+                name: format!("/e/{k}.ld"),
+                text: script.to_string(),
+            }),
+            entry: None,
+        };
+        if let Some(e) = extra.strip_prefix("-e ") {
+            opts.entry = Some(e.to_string());
+        }
+        if !extra.is_empty() {
+            args.push_str(&format!(" {extra}"));
+        }
+        let errors = merlin_ld::link(&inputs, &opts).unwrap_err();
+        wants.push(
+            errors
+                .iter()
+                .map(|e| format!("ld: error: {e}\n"))
+                .collect::<String>(),
+        );
+        commands.push(args);
+    }
+    let input = format!("{}\nexit 0\n", commands.join("\n"));
+    let (out, _) = boot(image_of(&["ld"], &["/e"], &files), &input, 2_000_000_000);
+    for (k, want) in wants.iter().enumerate() {
+        let got = shell_output(&out, &commands[k]);
+        let got = got.split("ld: exit").next().unwrap();
+        assert_eq!(got.replace("\r", ""), *want, "case {k}: {:?}", cases[k]);
     }
 }

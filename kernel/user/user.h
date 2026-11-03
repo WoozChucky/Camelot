@@ -273,6 +273,42 @@ int syscall(int number, uint a0, uint a1, uint a2);
 
 /* ---- The C library (lib/, see lib/README.md) ---- */
 
+/* 64-bit integers (lib/i64.c): merlin has no long long, so a value is
+ * two words, in two's complement. The assembler and the linker compute with
+ * them as merlin-as and merlin-ld do with Rust's i64. */
+typedef struct {
+    uint lo;
+    uint hi;
+} i64;
+
+i64 i64_of(int v);
+i64 i64_u(uint v);
+i64 i64_add(i64 a, i64 b);
+i64 i64_sub(i64 a, i64 b);
+i64 i64_neg(i64 a);
+i64 i64_not(i64 a);
+i64 i64_mul(i64 a, i64 b);
+/* a / b and a % b truncated toward zero, as Rust's checked_div/checked_rem:
+ * 0 when there is no result (b is 0, or i64::MIN / -1). */
+int i64_div(i64 a, i64 b, i64 *q);
+int i64_rem(i64 a, i64 b, i64 *r);
+/* Shifts by the low 6 bits of n (wrapping_shl, wrapping_shr: arithmetic). */
+i64 i64_shl(i64 a, uint n);
+i64 i64_sar(i64 a, uint n);
+i64 i64_and(i64 a, i64 b);
+i64 i64_or(i64 a, i64 b);
+i64 i64_xor(i64 a, i64 b);
+/* -1, 0 or 1, comparing as signed. */
+int i64_cmp(i64 a, i64 b);
+int i64_eq(i64 a, i64 b);
+int i64_is_neg(i64 a);
+/* Whether lo <= v < hi (signed). */
+int i64_in(i64 v, i64 lo, i64 hi);
+/* Decimal (signed), and 0x-prefixed hexadecimal of the unsigned value, as
+ * Rust's {} and {:#x}: each call returns one of a few rotating buffers. */
+const char *i64_dec(i64 v);
+const char *i64_hex(i64 v);
+
 /* Strings and memory (lib/string.c). */
 size_t strlen(const char *s);
 int strcmp(const char *a, const char *b);

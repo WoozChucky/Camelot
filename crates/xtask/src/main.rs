@@ -512,9 +512,9 @@ fn ld_fixtures(k: KernelArgs) -> ExitCode {
 fn kernel(k: KernelArgs) -> ExitCode {
     let root = repo_root();
     let kernel_dir = root.join("kernel");
-    // The C assembler's tables, from the host tools' (as_tables.rs): before
+    // The C tools' tables, from the host tools' (c_tables.rs): before
     // the user programs are built.
-    match xtask::as_tables::write(&root) {
+    match xtask::c_tables::write(&root) {
         Ok(wrote) => {
             for file in wrote {
                 eprintln!("wrote {file}");

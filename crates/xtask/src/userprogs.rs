@@ -46,8 +46,8 @@ pub const SCRIPT: &str = "user.ld";
 /// Programs the root image's `/bin` holds but the kernel does not build in:
 /// they read and write files, which a machine without a disk has none of,
 /// and their copies would not fit in the 2 MiB the kernel boots in (`as` is
-/// over 100 KB).
-pub const DISK_ONLY: &[&str] = &["as"];
+/// over 100 KB, `ld` not much less).
+pub const DISK_ONLY: &[&str] = &["as", "ld"];
 
 /// The programs the kernel builds in: all but [`DISK_ONLY`], by name.
 pub fn embedded(programs: &[Program]) -> Vec<&Program> {
@@ -350,11 +350,7 @@ pub fn build_runtime(dir: &Path, cc: CCompiler) -> Result<Runtime, String> {
 /// with [`SCRIPT`], the program first. merlin-ld's warnings are errors
 /// here.
 pub fn link_program(dir: &Path, prog: &Source, cc: CCompiler, rt: &Runtime) -> Result<Program, String> {
-    let mut inputs = Vec::new();
-    for part in prog.parts(dir)? {
-        inputs.push(object(dir, &part, cc)?);
-    }
-    inputs.extend(rt.objects.iter().cloned());
+    let inputs = program_objects(dir, prog, cc, rt)?;
     let inputs = merlin_ld::library::with_needed(&inputs, &rt.library).map_err(|errors| {
         let lines: Vec<String> = errors.iter().map(|e| format!("merlin-ld: error: {e}")).collect();
         format!("linking {}:\n{}", prog.stem, lines.join("\n"))
@@ -365,6 +361,22 @@ pub fn link_program(dir: &Path, prog: &Source, cc: CCompiler, rt: &Runtime) -> R
         elf: merlin_ld::strip_debug(&debug).map_err(|e| format!("{}: {e}", prog.stem))?,
         debug,
     })
+}
+
+/// The objects [`link_program`] links `prog` from before the library's: its
+/// own (each part compiled by `cc` and assembled), then the runtime's.
+pub fn program_objects(
+    dir: &Path,
+    prog: &Source,
+    cc: CCompiler,
+    rt: &Runtime,
+) -> Result<Vec<merlin_ld::Input>, String> {
+    let mut inputs = Vec::new();
+    for part in prog.parts(dir)? {
+        inputs.push(object(dir, &part, cc)?);
+    }
+    inputs.extend(rt.objects.iter().cloned());
+    Ok(inputs)
 }
 
 /// Builds program `prog` from `dir`, its C and the runtime's compiled by

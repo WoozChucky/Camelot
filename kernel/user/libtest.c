@@ -94,6 +94,23 @@ static void test_numbers(void) {
     check_eq((int)strtol("0x100000000", NULL, 0), LONG_MAX, "strtol of a hex number out of range");
 }
 
+/* lib/i64.c: 64-bit integers as two words. */
+static void test_i64(void) {
+    i64 big = i64_add(i64_u(0xffffffffu), i64_u(1));
+    check(big.lo == 0 && big.hi == 1, "i64_add carries into the high word");
+    check_str(i64_dec(i64_sub(i64_u(5), i64_u(7))), "-2", "i64_sub below zero");
+    check_str(i64_hex(i64_of(-16)), "0xfffffffffffffff0", "i64_hex of a negative number");
+    check_str(i64_dec(i64_mul(i64_u(0x80000000u), i64_u(6))), "12884901888", "i64_mul past 32 bits");
+    i64 q, r;
+    check(i64_div(i64_of(-7), i64_of(2), &q) && i64_eq(q, i64_of(-3)), "i64_div truncates toward zero");
+    check(i64_rem(i64_of(-7), i64_of(2), &r) && i64_eq(r, i64_of(-1)), "i64_rem has the dividend's sign");
+    check(!i64_div(i64_u(1), i64_u(0), &q), "i64_div by zero has no result");
+    check_str(i64_hex(i64_shl(i64_u(1), 40)), "0x10000000000", "i64_shl");
+    check_str(i64_dec(i64_sar(i64_of(-64), 3)), "-8", "i64_sar keeps the sign");
+    check(i64_cmp(i64_of(-1), i64_u(1)) < 0, "i64_cmp is signed");
+    check(i64_in(i64_u(4), i64_u(4), i64_u(5)) && !i64_in(i64_u(5), i64_u(4), i64_u(5)), "i64_in is half open");
+}
+
 static void test_snprintf(void) {
     char buf[64];
     snprintf(buf, sizeof buf, "%d %u %x %c %s %%", -42, 4294967295u, 0xcafef00du, 'K', "excalibur");
@@ -418,6 +435,7 @@ int main(int argc, char **argv) {
     test_inet();
     test_strings();
     test_numbers();
+    test_i64();
     test_snprintf();
     /* First, while the heap is still empty. */
     test_merge();

@@ -6,7 +6,7 @@
  * merlin-as, whose comments explain the rules in more depth:
  *
  *   main.c    the command line, reading the file, the passes (main.rs, lib.rs)
- *   util.c    memory, byte buffers, 64-bit numbers, errors
+ *   util.c    memory, byte buffers, errors (64-bit numbers: lib/i64.c)
  *   lexer.c   text to tokens, one statement at a time (lexer.rs)
  *   parser.c  tokens to statements (parser.rs)
  *   encode.c  one instruction to machine words (encode.rs)
@@ -14,7 +14,7 @@
  *   dwarf.c   the DWARF line table of `.file` and `.loc` (dwarf.rs)
  *   elf.c     the relocatable object file (elf.rs)
  *   tables.h  the encodings, names and numbers, generated from the host
- *   tables.c  tools' own tables (crates/xtask/src/as_tables.rs): the header
+ *   tables.c  tools' own tables (crates/xtask/src/c_tables.rs): the header
  *             declares the tables and defines the numbers, tables.c holds
  *             the tables, once for the program
  *
@@ -25,42 +25,6 @@
 #define AS_H
 
 #include "../user.h"
-
-/* ---- 64-bit integers ----
- * merlin-as computes with i64 (expressions, range checks), and merlin has no
- * long long, so a value is two words, in two's complement. */
-typedef struct {
-    uint lo;
-    uint hi;
-} i64;
-
-i64 i64_of(int v);
-i64 i64_u(uint v);
-i64 i64_add(i64 a, i64 b);
-i64 i64_sub(i64 a, i64 b);
-i64 i64_neg(i64 a);
-i64 i64_not(i64 a);
-i64 i64_mul(i64 a, i64 b);
-/* a / b and a % b truncated toward zero, as Rust's checked_div/checked_rem:
- * 0 when there is no result (b is 0, or i64::MIN / -1). */
-int i64_div(i64 a, i64 b, i64 *q);
-int i64_rem(i64 a, i64 b, i64 *r);
-/* Shifts by the low 6 bits of n (wrapping_shl, wrapping_shr: arithmetic). */
-i64 i64_shl(i64 a, uint n);
-i64 i64_sar(i64 a, uint n);
-i64 i64_and(i64 a, i64 b);
-i64 i64_or(i64 a, i64 b);
-i64 i64_xor(i64 a, i64 b);
-/* -1, 0 or 1, comparing as signed. */
-int i64_cmp(i64 a, i64 b);
-int i64_eq(i64 a, i64 b);
-int i64_is_neg(i64 a);
-/* Whether lo <= v < hi (signed). */
-int i64_in(i64 v, i64 lo, i64 hi);
-/* Decimal (signed), and 0x-prefixed hexadecimal of the unsigned value, as
- * Rust's {} and {:#x}: each call returns one of a few rotating buffers. */
-const char *i64_dec(i64 v);
-const char *i64_hex(i64 v);
 
 /* ---- Memory ----
  * Two bump allocators: perm_alloc's memory lasts the whole run (symbols,
