@@ -10,13 +10,13 @@ use crate::remote::{self, Remote, StopEvent, Watch};
 use crate::source::{Lines, Place};
 use crate::symbols::Symbols;
 use excalibur::{Inst, Syntax, Xlen};
+use std::io::Write;
+use std::sync::atomic::AtomicBool;
 
 /// RV32 code until merlin-dbg learns RV64 (#153).
 fn decode(w: u32) -> Inst {
     excalibur::decode(w, Xlen::Rv32)
 }
-use std::io::Write;
-use std::sync::atomic::AtomicBool;
 
 /// A breakpoint or a watchpoint, numbered from 1 as they are set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -19,12 +19,12 @@
 use excalibur::{
     AluOp, AmoOp, AmoWidth, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, Ordering, StoreOp, Xlen,
 };
+use merlin_as::reloc::RelocKind;
 
 /// merlin-as writes RV32 until #148.
 fn decode(w: u32) -> Inst {
     excalibur::decode(w, Xlen::Rv32)
 }
-use merlin_as::reloc::RelocKind;
 
 /// One word of `.text` and the relocation that will patch it, if any.
 struct Word {

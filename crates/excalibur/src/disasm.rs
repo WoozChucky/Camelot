@@ -124,30 +124,59 @@ fn fence_set(bits: u8) -> String {
         .collect()
 }
 
-/// The mnemonic of an ALU operation in OP-IMM (`suffix` ""), OP-IMM-32
-/// ("w"), OP ("") and OP-32 ("w"), as `(immediate form, register form)`.
-fn alu_names(op: AluOp, word: bool) -> (&'static str, &'static str) {
+/// The mnemonic of an OP-IMM operation (`word` false) or an OP-IMM-32 one
+/// (`word` true, RV64).
+fn alu_imm_name(op: AluOp, word: bool) -> &'static str {
     match (op, word) {
-        (AluOp::Add, false) => ("addi", "add"),
-        (AluOp::Sub, false) => ("", "sub"),
-        (AluOp::Sll, false) => ("slli", "sll"),
-        (AluOp::Slt, false) => ("slti", "slt"),
-        (AluOp::Sltu, false) => ("sltiu", "sltu"),
-        (AluOp::Xor, false) => ("xori", "xor"),
-        (AluOp::Srl, false) => ("srli", "srl"),
-        (AluOp::Sra, false) => ("srai", "sra"),
-        (AluOp::Or, false) => ("ori", "or"),
-        (AluOp::And, false) => ("andi", "and"),
-        (AluOp::Add, true) => ("addiw", "addw"),
-        (AluOp::Sub, true) => ("", "subw"),
-        (AluOp::Sll, true) => ("slliw", "sllw"),
-        (AluOp::Srl, true) => ("srliw", "srlw"),
-        (AluOp::Sra, true) => ("sraiw", "sraw"),
-        // Not encodable: the decoder never produces these.
-        (AluOp::Slt | AluOp::Sltu | AluOp::Xor | AluOp::Or | AluOp::And, true) => ("", ""),
+        (AluOp::Add, false) => "addi",
+        (AluOp::Sll, false) => "slli",
+        (AluOp::Slt, false) => "slti",
+        (AluOp::Sltu, false) => "sltiu",
+        (AluOp::Xor, false) => "xori",
+        (AluOp::Srl, false) => "srli",
+        (AluOp::Sra, false) => "srai",
+        (AluOp::Or, false) => "ori",
+        (AluOp::And, false) => "andi",
+        (AluOp::Add, true) => "addiw",
+        (AluOp::Sll, true) => "slliw",
+        (AluOp::Srl, true) => "srliw",
+        (AluOp::Sra, true) => "sraiw",
+        // There is no subtract-immediate, and OP-IMM-32 has only addiw and
+        // the shifts: the decoder never makes these (see `Inst`).
+        (AluOp::Sub, _) | (AluOp::Slt | AluOp::Sltu | AluOp::Xor | AluOp::Or | AluOp::And, true) => {
+            unreachable!("not an instruction: {op:?} with an immediate (word {word})")
+        }
     }
 }
 
+/// The mnemonic of an OP operation (`word` false) or an OP-32 one (`word`
+/// true, RV64).
+fn alu_reg_name(op: AluOp, word: bool) -> &'static str {
+    match (op, word) {
+        (AluOp::Add, false) => "add",
+        (AluOp::Sub, false) => "sub",
+        (AluOp::Sll, false) => "sll",
+        (AluOp::Slt, false) => "slt",
+        (AluOp::Sltu, false) => "sltu",
+        (AluOp::Xor, false) => "xor",
+        (AluOp::Srl, false) => "srl",
+        (AluOp::Sra, false) => "sra",
+        (AluOp::Or, false) => "or",
+        (AluOp::And, false) => "and",
+        (AluOp::Add, true) => "addw",
+        (AluOp::Sub, true) => "subw",
+        (AluOp::Sll, true) => "sllw",
+        (AluOp::Srl, true) => "srlw",
+        (AluOp::Sra, true) => "sraw",
+        // OP-32 has only these five: the decoder never makes the others.
+        (AluOp::Slt | AluOp::Sltu | AluOp::Xor | AluOp::Or | AluOp::And, true) => {
+            unreachable!("not an instruction: OP-32 {op:?}")
+        }
+    }
+}
+
+/// The mnemonic of an M operation (`word` false) or a 32-bit one (`word`
+/// true, RV64).
 fn mul_name(op: MulOp, word: bool) -> &'static str {
     match (op, word) {
         (MulOp::Mul, false) => "mul",
@@ -163,8 +192,10 @@ fn mul_name(op: MulOp, word: bool) -> &'static str {
         (MulOp::Divu, true) => "divuw",
         (MulOp::Rem, true) => "remw",
         (MulOp::Remu, true) => "remuw",
-        // No 32-bit high multiplies: the decoder never produces these.
-        (MulOp::Mulh | MulOp::Mulhsu | MulOp::Mulhu, true) => "",
+        // There are no 32-bit high multiplies: the decoder never makes these.
+        (MulOp::Mulh | MulOp::Mulhsu | MulOp::Mulhu, true) => {
+            unreachable!("not an instruction: 32-bit {op:?}")
+        }
     }
 }
 
@@ -278,7 +309,7 @@ impl Inst {
                 match alias {
                     Some(x) if a => x,
                     _ => (
-                        alu_names(op, false).0,
+                        alu_imm_name(op, false),
                         format!("{}, {}, {}", r(rd), r(rs1), imm(i)),
                     ),
                 }
@@ -291,7 +322,7 @@ impl Inst {
                 imm: 0,
             } if a => ("sext.w", format!("{}, {}", r(rd), r(rs1))),
             Inst::OpImm32 { op, rd, rs1, imm: i } => (
-                alu_names(op, true).0,
+                alu_imm_name(op, true),
                 format!("{}, {}, {}", r(rd), r(rs1), imm(i)),
             ),
             Inst::Op { op, rd, rs1, rs2 } => {
@@ -305,7 +336,7 @@ impl Inst {
                 match alias {
                     Some((m, rs)) if a => (m, format!("{}, {}", r(rd), r(rs))),
                     _ => (
-                        alu_names(op, false).1,
+                        alu_reg_name(op, false),
                         format!("{}, {}, {}", r(rd), r(rs1), r(rs2)),
                     ),
                 }
@@ -318,7 +349,7 @@ impl Inst {
                 rs2,
             } if a => ("negw", format!("{}, {}", r(rd), r(rs2))),
             Inst::Op32 { op, rd, rs1, rs2 } => (
-                alu_names(op, true).1,
+                alu_reg_name(op, true),
                 format!("{}, {}, {}", r(rd), r(rs1), r(rs2)),
             ),
             Inst::Mul { op, rd, rs1, rs2 } => {
@@ -430,8 +461,12 @@ impl Inst {
     }
 }
 
-/// The plain form, with RV32's CSR names: they are a superset of RV64's, so
-/// an instruction decoded for either width prints every name it has.
+/// The plain form, with RV32's CSR names. `Inst` does not know the width it
+/// was decoded for, so this is right for RV32 only: on RV64 the CSRs that
+/// exist only on RV32 (`cycleh`, `mstatush`...) are numbers, and an RV64
+/// caller formats with [`Inst::format`] and `Syntax::plain(Xlen::Rv64)`
+/// instead. Every other name, and every mnemonic and operand, is the same
+/// for both widths.
 impl fmt::Display for Inst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.format(None, Syntax::plain(Xlen::Rv32)).fmt(f)

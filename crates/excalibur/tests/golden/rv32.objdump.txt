@@ -33,12 +33,231 @@ Disassembly of section .text:
       60: 3a102573     	csrr	a0, pmpcfg1
       64: 3a302573     	csrr	a0, pmpcfg3
       68: 31051073     	csrw	mstatush, a0
-      6c: 03f51513     	<unknown>
-      70: ff813503     	<unknown>
-      74: 00456583     	<unknown>
-      78: 00113423     	<unknown>
-      7c: fff5851b     	<unknown>
-      80: 00c5853b     	<unknown>
-      84: 02c5853b     	<unknown>
-      88: 1005b52f     	<unknown>
-      8c: 04b6352f     	<unknown>
+      6c: 10002573     	csrr	a0, sstatus
+      70: 10402573     	csrr	a0, sie
+      74: 10502573     	csrr	a0, stvec
+      78: 10602573     	csrr	a0, scounteren
+      7c: 10a02573     	csrr	a0, senvcfg
+      80: 14002573     	csrr	a0, sscratch
+      84: 14102573     	csrr	a0, sepc
+      88: 14202573     	csrr	a0, scause
+      8c: 14302573     	csrr	a0, stval
+      90: 14402573     	csrr	a0, sip
+      94: 18002573     	csrr	a0, satp
+      98: 30002573     	csrr	a0, mstatus
+      9c: 30102573     	csrr	a0, misa
+      a0: 30202573     	csrr	a0, medeleg
+      a4: 30302573     	csrr	a0, mideleg
+      a8: 30402573     	csrr	a0, mie
+      ac: 30502573     	csrr	a0, mtvec
+      b0: 30602573     	csrr	a0, mcounteren
+      b4: 30a02573     	csrr	a0, menvcfg
+      b8: 31002573     	csrr	a0, mstatush
+      bc: 31a02573     	csrr	a0, menvcfgh
+      c0: 32002573     	csrr	a0, mcountinhibit
+      c4: 32302573     	csrr	a0, mhpmevent3
+      c8: 32402573     	csrr	a0, mhpmevent4
+      cc: 32502573     	csrr	a0, mhpmevent5
+      d0: 32602573     	csrr	a0, mhpmevent6
+      d4: 32702573     	csrr	a0, mhpmevent7
+      d8: 32802573     	csrr	a0, mhpmevent8
+      dc: 32902573     	csrr	a0, mhpmevent9
+      e0: 32a02573     	csrr	a0, mhpmevent10
+      e4: 32b02573     	csrr	a0, mhpmevent11
+      e8: 32c02573     	csrr	a0, mhpmevent12
+      ec: 32d02573     	csrr	a0, mhpmevent13
+      f0: 32e02573     	csrr	a0, mhpmevent14
+      f4: 32f02573     	csrr	a0, mhpmevent15
+      f8: 33002573     	csrr	a0, mhpmevent16
+      fc: 33102573     	csrr	a0, mhpmevent17
+     100: 33202573     	csrr	a0, mhpmevent18
+     104: 33302573     	csrr	a0, mhpmevent19
+     108: 33402573     	csrr	a0, mhpmevent20
+     10c: 33502573     	csrr	a0, mhpmevent21
+     110: 33602573     	csrr	a0, mhpmevent22
+     114: 33702573     	csrr	a0, mhpmevent23
+     118: 33802573     	csrr	a0, mhpmevent24
+     11c: 33902573     	csrr	a0, mhpmevent25
+     120: 33a02573     	csrr	a0, mhpmevent26
+     124: 33b02573     	csrr	a0, mhpmevent27
+     128: 33c02573     	csrr	a0, mhpmevent28
+     12c: 33d02573     	csrr	a0, mhpmevent29
+     130: 33e02573     	csrr	a0, mhpmevent30
+     134: 33f02573     	csrr	a0, mhpmevent31
+     138: 34002573     	csrr	a0, mscratch
+     13c: 34102573     	csrr	a0, mepc
+     140: 34202573     	csrr	a0, mcause
+     144: 34302573     	csrr	a0, mtval
+     148: 34402573     	csrr	a0, mip
+     14c: 3a002573     	csrr	a0, pmpcfg0
+     150: 3a102573     	csrr	a0, pmpcfg1
+     154: 3a202573     	csrr	a0, pmpcfg2
+     158: 3a302573     	csrr	a0, pmpcfg3
+     15c: 3b002573     	csrr	a0, pmpaddr0
+     160: 3b102573     	csrr	a0, pmpaddr1
+     164: 3b202573     	csrr	a0, pmpaddr2
+     168: 3b302573     	csrr	a0, pmpaddr3
+     16c: 3b402573     	csrr	a0, pmpaddr4
+     170: 3b502573     	csrr	a0, pmpaddr5
+     174: 3b602573     	csrr	a0, pmpaddr6
+     178: 3b702573     	csrr	a0, pmpaddr7
+     17c: 3b802573     	csrr	a0, pmpaddr8
+     180: 3b902573     	csrr	a0, pmpaddr9
+     184: 3ba02573     	csrr	a0, pmpaddr10
+     188: 3bb02573     	csrr	a0, pmpaddr11
+     18c: 3bc02573     	csrr	a0, pmpaddr12
+     190: 3bd02573     	csrr	a0, pmpaddr13
+     194: 3be02573     	csrr	a0, pmpaddr14
+     198: 3bf02573     	csrr	a0, pmpaddr15
+     19c: 74002573     	csrr	a0, mnscratch
+     1a0: 74102573     	csrr	a0, mnepc
+     1a4: 74202573     	csrr	a0, mncause
+     1a8: 74402573     	csrr	a0, mnstatus
+     1ac: 7a002573     	csrr	a0, tselect
+     1b0: 7a102573     	csrr	a0, tdata1
+     1b4: 7a202573     	csrr	a0, tdata2
+     1b8: 7a302573     	csrr	a0, tdata3
+     1bc: 7a402573     	csrr	a0, tinfo
+     1c0: 7a502573     	csrr	a0, tcontrol
+     1c4: b0002573     	csrr	a0, mcycle
+     1c8: b0202573     	csrr	a0, minstret
+     1cc: b0302573     	csrr	a0, mhpmcounter3
+     1d0: b0402573     	csrr	a0, mhpmcounter4
+     1d4: b0502573     	csrr	a0, mhpmcounter5
+     1d8: b0602573     	csrr	a0, mhpmcounter6
+     1dc: b0702573     	csrr	a0, mhpmcounter7
+     1e0: b0802573     	csrr	a0, mhpmcounter8
+     1e4: b0902573     	csrr	a0, mhpmcounter9
+     1e8: b0a02573     	csrr	a0, mhpmcounter10
+     1ec: b0b02573     	csrr	a0, mhpmcounter11
+     1f0: b0c02573     	csrr	a0, mhpmcounter12
+     1f4: b0d02573     	csrr	a0, mhpmcounter13
+     1f8: b0e02573     	csrr	a0, mhpmcounter14
+     1fc: b0f02573     	csrr	a0, mhpmcounter15
+     200: b1002573     	csrr	a0, mhpmcounter16
+     204: b1102573     	csrr	a0, mhpmcounter17
+     208: b1202573     	csrr	a0, mhpmcounter18
+     20c: b1302573     	csrr	a0, mhpmcounter19
+     210: b1402573     	csrr	a0, mhpmcounter20
+     214: b1502573     	csrr	a0, mhpmcounter21
+     218: b1602573     	csrr	a0, mhpmcounter22
+     21c: b1702573     	csrr	a0, mhpmcounter23
+     220: b1802573     	csrr	a0, mhpmcounter24
+     224: b1902573     	csrr	a0, mhpmcounter25
+     228: b1a02573     	csrr	a0, mhpmcounter26
+     22c: b1b02573     	csrr	a0, mhpmcounter27
+     230: b1c02573     	csrr	a0, mhpmcounter28
+     234: b1d02573     	csrr	a0, mhpmcounter29
+     238: b1e02573     	csrr	a0, mhpmcounter30
+     23c: b1f02573     	csrr	a0, mhpmcounter31
+     240: b8002573     	csrr	a0, mcycleh
+     244: b8202573     	csrr	a0, minstreth
+     248: b8302573     	csrr	a0, mhpmcounter3h
+     24c: b8402573     	csrr	a0, mhpmcounter4h
+     250: b8502573     	csrr	a0, mhpmcounter5h
+     254: b8602573     	csrr	a0, mhpmcounter6h
+     258: b8702573     	csrr	a0, mhpmcounter7h
+     25c: b8802573     	csrr	a0, mhpmcounter8h
+     260: b8902573     	csrr	a0, mhpmcounter9h
+     264: b8a02573     	csrr	a0, mhpmcounter10h
+     268: b8b02573     	csrr	a0, mhpmcounter11h
+     26c: b8c02573     	csrr	a0, mhpmcounter12h
+     270: b8d02573     	csrr	a0, mhpmcounter13h
+     274: b8e02573     	csrr	a0, mhpmcounter14h
+     278: b8f02573     	csrr	a0, mhpmcounter15h
+     27c: b9002573     	csrr	a0, mhpmcounter16h
+     280: b9102573     	csrr	a0, mhpmcounter17h
+     284: b9202573     	csrr	a0, mhpmcounter18h
+     288: b9302573     	csrr	a0, mhpmcounter19h
+     28c: b9402573     	csrr	a0, mhpmcounter20h
+     290: b9502573     	csrr	a0, mhpmcounter21h
+     294: b9602573     	csrr	a0, mhpmcounter22h
+     298: b9702573     	csrr	a0, mhpmcounter23h
+     29c: b9802573     	csrr	a0, mhpmcounter24h
+     2a0: b9902573     	csrr	a0, mhpmcounter25h
+     2a4: b9a02573     	csrr	a0, mhpmcounter26h
+     2a8: b9b02573     	csrr	a0, mhpmcounter27h
+     2ac: b9c02573     	csrr	a0, mhpmcounter28h
+     2b0: b9d02573     	csrr	a0, mhpmcounter29h
+     2b4: b9e02573     	csrr	a0, mhpmcounter30h
+     2b8: b9f02573     	csrr	a0, mhpmcounter31h
+     2bc: c0002573     	rdcycle	a0
+     2c0: c0102573     	rdtime	a0
+     2c4: c0202573     	rdinstret	a0
+     2c8: c0302573     	csrr	a0, hpmcounter3
+     2cc: c0402573     	csrr	a0, hpmcounter4
+     2d0: c0502573     	csrr	a0, hpmcounter5
+     2d4: c0602573     	csrr	a0, hpmcounter6
+     2d8: c0702573     	csrr	a0, hpmcounter7
+     2dc: c0802573     	csrr	a0, hpmcounter8
+     2e0: c0902573     	csrr	a0, hpmcounter9
+     2e4: c0a02573     	csrr	a0, hpmcounter10
+     2e8: c0b02573     	csrr	a0, hpmcounter11
+     2ec: c0c02573     	csrr	a0, hpmcounter12
+     2f0: c0d02573     	csrr	a0, hpmcounter13
+     2f4: c0e02573     	csrr	a0, hpmcounter14
+     2f8: c0f02573     	csrr	a0, hpmcounter15
+     2fc: c1002573     	csrr	a0, hpmcounter16
+     300: c1102573     	csrr	a0, hpmcounter17
+     304: c1202573     	csrr	a0, hpmcounter18
+     308: c1302573     	csrr	a0, hpmcounter19
+     30c: c1402573     	csrr	a0, hpmcounter20
+     310: c1502573     	csrr	a0, hpmcounter21
+     314: c1602573     	csrr	a0, hpmcounter22
+     318: c1702573     	csrr	a0, hpmcounter23
+     31c: c1802573     	csrr	a0, hpmcounter24
+     320: c1902573     	csrr	a0, hpmcounter25
+     324: c1a02573     	csrr	a0, hpmcounter26
+     328: c1b02573     	csrr	a0, hpmcounter27
+     32c: c1c02573     	csrr	a0, hpmcounter28
+     330: c1d02573     	csrr	a0, hpmcounter29
+     334: c1e02573     	csrr	a0, hpmcounter30
+     338: c1f02573     	csrr	a0, hpmcounter31
+     33c: c8002573     	rdcycleh	a0
+     340: c8102573     	rdtimeh	a0
+     344: c8202573     	rdinstreth	a0
+     348: c8302573     	csrr	a0, hpmcounter3h
+     34c: c8402573     	csrr	a0, hpmcounter4h
+     350: c8502573     	csrr	a0, hpmcounter5h
+     354: c8602573     	csrr	a0, hpmcounter6h
+     358: c8702573     	csrr	a0, hpmcounter7h
+     35c: c8802573     	csrr	a0, hpmcounter8h
+     360: c8902573     	csrr	a0, hpmcounter9h
+     364: c8a02573     	csrr	a0, hpmcounter10h
+     368: c8b02573     	csrr	a0, hpmcounter11h
+     36c: c8c02573     	csrr	a0, hpmcounter12h
+     370: c8d02573     	csrr	a0, hpmcounter13h
+     374: c8e02573     	csrr	a0, hpmcounter14h
+     378: c8f02573     	csrr	a0, hpmcounter15h
+     37c: c9002573     	csrr	a0, hpmcounter16h
+     380: c9102573     	csrr	a0, hpmcounter17h
+     384: c9202573     	csrr	a0, hpmcounter18h
+     388: c9302573     	csrr	a0, hpmcounter19h
+     38c: c9402573     	csrr	a0, hpmcounter20h
+     390: c9502573     	csrr	a0, hpmcounter21h
+     394: c9602573     	csrr	a0, hpmcounter22h
+     398: c9702573     	csrr	a0, hpmcounter23h
+     39c: c9802573     	csrr	a0, hpmcounter24h
+     3a0: c9902573     	csrr	a0, hpmcounter25h
+     3a4: c9a02573     	csrr	a0, hpmcounter26h
+     3a8: c9b02573     	csrr	a0, hpmcounter27h
+     3ac: c9c02573     	csrr	a0, hpmcounter28h
+     3b0: c9d02573     	csrr	a0, hpmcounter29h
+     3b4: c9e02573     	csrr	a0, hpmcounter30h
+     3b8: c9f02573     	csrr	a0, hpmcounter31h
+     3bc: f1102573     	csrr	a0, mvendorid
+     3c0: f1202573     	csrr	a0, marchid
+     3c4: f1302573     	csrr	a0, mimpid
+     3c8: f1402573     	csrr	a0, mhartid
+     3cc: f1502573     	csrr	a0, mconfigptr
+     3d0: 03f51513     	<unknown>
+     3d4: 0215d513     	<unknown>
+     3d8: 4215d513     	<unknown>
+     3dc: ff813503     	<unknown>
+     3e0: 00456583     	<unknown>
+     3e4: 00113423     	<unknown>
+     3e8: fff5851b     	<unknown>
+     3ec: 00c5853b     	<unknown>
+     3f0: 02c5853b     	<unknown>
+     3f4: 1005b52f     	<unknown>
+     3f8: 04b6352f     	<unknown>

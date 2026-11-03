@@ -12,9 +12,9 @@ Disassembly of section .text:
       14: 00010117     	auipc	sp, 0x10
       18: 80000517     	auipc	a0, 0x80000
       1c: fffff597     	auipc	a1, 0xfffff
-      20: 060000ef     	jal	0x80 <fwd>
+      20: 064000ef     	jal	0x84 <fwd>
       24: fddff06f     	j	0x0 <start>
-      28: 0580056f     	jal	a0, 0x80 <fwd>
+      28: 05c0056f     	jal	a0, 0x84 <fwd>
       2c: 00008067     	ret
       30: 000500e7     	jalr	a0
       34: 00060367     	jalr	t1, a2
@@ -23,181 +23,424 @@ Disassembly of section .text:
       40: 7ff58567     	jalr	a0, 0x7ff(a1)
       44: 80058567     	jalr	a0, -0x800(a1)
       48: fab50ce3     	beq	a0, a1, 0x0 <start>
-      4c: 02b51a63     	bne	a0, a1, 0x80 <fwd>
-      50: 02b54863     	blt	a0, a1, 0x80 <fwd>
-      54: 02b55663     	bge	a0, a1, 0x80 <fwd>
-      58: 02b56463     	bltu	a0, a1, 0x80 <fwd>
-      5c: 02b57263     	bgeu	a0, a1, 0x80 <fwd>
-      60: 02038063     	beqz	t2, 0x80 <fwd>
-      64: 00701e63     	bne	zero, t2, 0x80 <fwd>
-      68: 00054c63     	bltz	a0, 0x80 <fwd>
-      6c: 00a04a63     	bgtz	a0, 0x80 <fwd>
-      70: 00a05863     	blez	a0, 0x80 <fwd>
-      74: 00055663     	bgez	a0, 0x80 <fwd>
-      78: 00004463     	bltz	zero, 0x80 <fwd>
-      7c: 00005263     	blez	zero, 0x80 <fwd>
+      4c: 02b51c63     	bne	a0, a1, 0x84 <fwd>
+      50: 02b54a63     	blt	a0, a1, 0x84 <fwd>
+      54: 02b55863     	bge	a0, a1, 0x84 <fwd>
+      58: 02b56663     	bltu	a0, a1, 0x84 <fwd>
+      5c: 02b57463     	bgeu	a0, a1, 0x84 <fwd>
+      60: 02038263     	beqz	t2, 0x84 <fwd>
+      64: 02701063     	bne	zero, t2, 0x84 <fwd>
+      68: 00039e63     	bnez	t2, 0x84 <fwd>
+      6c: 00054c63     	bltz	a0, 0x84 <fwd>
+      70: 00a04a63     	bgtz	a0, 0x84 <fwd>
+      74: 00a05863     	blez	a0, 0x84 <fwd>
+      78: 00055663     	bgez	a0, 0x84 <fwd>
+      7c: 00004463     	bltz	zero, 0x84 <fwd>
+      80: 00005263     	blez	zero, 0x84 <fwd>
 
-0000000000000080 <fwd>:
-      80: 80040503     	lb	a0, -0x800(s0)
-      84: 7ff41503     	lh	a0, 0x7ff(s0)
-      88: ffc12503     	lw	a0, -0x4(sp)
-      8c: 0005c503     	lbu	a0, 0x0(a1)
-      90: 0025d503     	lhu	a0, 0x2(a1)
-      94: 00456583     	lwu	a1, 0x4(a0)
-      98: ff813503     	ld	a0, -0x8(sp)
-      9c: 7f8f3f83     	ld	t6, 0x7f8(t5)
-      a0: feb50fa3     	sb	a1, -0x1(a0)
-      a4: 00b51123     	sh	a1, 0x2(a0)
-      a8: feb12e23     	sw	a1, -0x4(sp)
-      ac: 00113423     	sd	ra, 0x8(sp)
-      b0: 8002b023     	sd	zero, -0x800(t0)
-      b4: 00000013     	nop
-      b8: 00000513     	li	a0, 0x0
-      bc: 00500013     	li	zero, 0x5
-      c0: 00050013     	mv	zero, a0
-      c4: 00150013     	addi	zero, a0, 0x1
-      c8: fff50513     	addi	a0, a0, -0x1
-      cc: 7ff58513     	addi	a0, a1, 0x7ff
-      d0: 80058513     	addi	a0, a1, -0x800
-      d4: 00050313     	mv	t1, a0
-      d8: fff5a513     	slti	a0, a1, -0x1
-      dc: 0015b513     	seqz	a0, a1
-      e0: 0025b513     	sltiu	a0, a1, 0x2
-      e4: fff5c513     	not	a0, a1
-      e8: 0055c513     	xori	a0, a1, 0x5
-      ec: 7ff5e513     	ori	a0, a1, 0x7ff
-      f0: 0ff5f513     	zext.b	a0, a1
-      f4: 0fe5f513     	andi	a0, a1, 0xfe
-      f8: 00051513     	slli	a0, a0, 0x0
-      fc: 01f51513     	slli	a0, a0, 0x1f
-     100: 02051513     	slli	a0, a0, 0x20
-     104: 03f51513     	slli	a0, a0, 0x3f
-     108: 0215d513     	srli	a0, a1, 0x21
-     10c: 03f5d513     	srli	a0, a1, 0x3f
-     110: 4285d513     	srai	a0, a1, 0x28
-     114: 4015d513     	srai	a0, a1, 0x1
-     118: 0005851b     	sext.w	a0, a1
-     11c: fff5851b     	addiw	a0, a1, -0x1
-     120: 7ff5851b     	addiw	a0, a1, 0x7ff
-     124: 0000001b     	sext.w	zero, zero
-     128: 0005951b     	slliw	a0, a1, 0x0
-     12c: 01f5951b     	slliw	a0, a1, 0x1f
-     130: 0015d51b     	srliw	a0, a1, 0x1
-     134: 41f5d51b     	sraiw	a0, a1, 0x1f
-     138: 00c58533     	add	a0, a1, a2
-     13c: 40c58533     	sub	a0, a1, a2
-     140: 40c00533     	neg	a0, a2
-     144: 00c59533     	sll	a0, a1, a2
-     148: 00c5a533     	slt	a0, a1, a2
-     14c: 0005a533     	sltz	a0, a1
-     150: 00c02533     	sgtz	a0, a2
-     154: 00002533     	sltz	a0, zero
-     158: 00c5b533     	sltu	a0, a1, a2
-     15c: 00c03533     	snez	a0, a2
-     160: 00003533     	snez	a0, zero
-     164: 00c5c533     	xor	a0, a1, a2
-     168: 00c5d533     	srl	a0, a1, a2
-     16c: 40c5d533     	sra	a0, a1, a2
-     170: 00c5e533     	or	a0, a1, a2
-     174: 00c5f533     	and	a0, a1, a2
-     178: 00c5853b     	addw	a0, a1, a2
-     17c: 40c5853b     	subw	a0, a1, a2
-     180: 40c0053b     	negw	a0, a2
-     184: 00c5953b     	sllw	a0, a1, a2
-     188: 00c5d53b     	srlw	a0, a1, a2
-     18c: 40c5d53b     	sraw	a0, a1, a2
-     190: 02c58533     	mul	a0, a1, a2
-     194: 02c59533     	mulh	a0, a1, a2
-     198: 02c5a533     	mulhsu	a0, a1, a2
-     19c: 02c5b533     	mulhu	a0, a1, a2
-     1a0: 02c5c533     	div	a0, a1, a2
-     1a4: 02c5d533     	divu	a0, a1, a2
-     1a8: 02c5e533     	rem	a0, a1, a2
-     1ac: 02c5f533     	remu	a0, a1, a2
-     1b0: 02c5853b     	mulw	a0, a1, a2
-     1b4: 02c5c53b     	divw	a0, a1, a2
-     1b8: 02c5d53b     	divuw	a0, a1, a2
-     1bc: 02c5e53b     	remw	a0, a1, a2
-     1c0: 02c5f53b     	remuw	a0, a1, a2
-     1c4: 1005a52f     	lr.w	a0, (a1)
-     1c8: 1405a52f     	lr.w.aq	a0, (a1)
-     1cc: 1205a52f     	lr.w.rl	a0, (a1)
-     1d0: 1605a52f     	lr.w.aqrl	a0, (a1)
-     1d4: 18b6252f     	sc.w	a0, a1, (a2)
-     1d8: 1e63a2af     	sc.w.aqrl	t0, t1, (t2)
-     1dc: 1805a52f     	sc.w	a0, zero, (a1)
-     1e0: 08b6252f     	amoswap.w	a0, a1, (a2)
-     1e4: 04b6252f     	amoadd.w.aq	a0, a1, (a2)
-     1e8: 20b6252f     	amoxor.w	a0, a1, (a2)
-     1ec: 62b6252f     	amoand.w.rl	a0, a1, (a2)
-     1f0: 40b6252f     	amoor.w	a0, a1, (a2)
-     1f4: 80b6252f     	amomin.w	a0, a1, (a2)
-     1f8: a0b6252f     	amomax.w	a0, a1, (a2)
-     1fc: c0b6252f     	amominu.w	a0, a1, (a2)
-     200: e0b6202f     	amomaxu.w	zero, a1, (a2)
-     204: 1005b52f     	lr.d	a0, (a1)
-     208: 1405b52f     	lr.d.aq	a0, (a1)
-     20c: 1205b52f     	lr.d.rl	a0, (a1)
-     210: 1605b52f     	lr.d.aqrl	a0, (a1)
-     214: 18b6352f     	sc.d	a0, a1, (a2)
-     218: 1cb6352f     	sc.d.aq	a0, a1, (a2)
-     21c: 1ab6352f     	sc.d.rl	a0, a1, (a2)
-     220: 1e63b2af     	sc.d.aqrl	t0, t1, (t2)
-     224: 08b6352f     	amoswap.d	a0, a1, (a2)
-     228: 0e05b5af     	amoswap.d.aqrl	a1, zero, (a1)
-     22c: 00b6352f     	amoadd.d	a0, a1, (a2)
-     230: 04b6352f     	amoadd.d.aq	a0, a1, (a2)
-     234: 20b6352f     	amoxor.d	a0, a1, (a2)
-     238: 60b6352f     	amoand.d	a0, a1, (a2)
-     23c: 62b6352f     	amoand.d.rl	a0, a1, (a2)
-     240: 40b6352f     	amoor.d	a0, a1, (a2)
-     244: 80b6352f     	amomin.d	a0, a1, (a2)
-     248: a0b6352f     	amomax.d	a0, a1, (a2)
-     24c: c0b6352f     	amominu.d	a0, a1, (a2)
-     250: e6b6302f     	amomaxu.d.aqrl	zero, a1, (a2)
-     254: 0ff0000f     	fence
-     258: 0330000f     	fence	rw, rw
-     25c: 8330000f     	fence.tso
-     260: 0000100f     	fence.i
-     264: 00000073     	ecall
-     268: 00100073     	ebreak
-     26c: 30200073     	mret
-     270: 10200073     	sret
-     274: 10500073     	wfi
-     278: 12000073     	sfence.vma
-     27c: 12050073     	sfence.vma	a0
-     280: 12b50073     	sfence.vma	a0, a1
-     284: c0001073     	unimp
-     288: c0002573     	rdcycle	a0
-     28c: c0102573     	rdtime	a0
-     290: c0202573     	rdinstret	a0
-     294: c0002073     	rdcycle	zero
-     298: c8002573     	csrr	a0, 0xc80
-     29c: c8102573     	csrr	a0, 0xc81
-     2a0: c8202573     	csrr	a0, 0xc82
-     2a4: 31002573     	csrr	a0, 0x310
-     2a8: 31a02573     	csrr	a0, 0x31a
-     2ac: b8002573     	csrr	a0, 0xb80
-     2b0: 3a102573     	csrr	a0, 0x3a1
-     2b4: 3a202573     	csrr	a0, pmpcfg2
-     2b8: 30002573     	csrr	a0, mstatus
-     2bc: 18002573     	csrr	a0, satp
-     2c0: 30102573     	csrr	a0, misa
-     2c4: 7c002573     	csrr	a0, 0x7c0
-     2c8: 30051073     	csrw	mstatus, a0
-     2cc: 34051573     	csrrw	a0, mscratch, a0
-     2d0: 30452073     	csrs	mie, a0
-     2d4: 34453073     	csrc	mip, a0
-     2d8: 1005b573     	csrrc	a0, sstatus, a1
-     2dc: 3002d073     	csrwi	mstatus, 0x5
-     2e0: 10016073     	csrsi	sstatus, 0x2
-     2e4: 10017073     	csrci	sstatus, 0x2
-     2e8: 300fd573     	csrrwi	a0, mstatus, 0x1f
-     2ec: 30446573     	csrrsi	a0, mie, 0x8
-     2f0: 3440f573     	csrrci	a0, mip, 0x1
-     2f4: 0205951b     	<unknown>
-     2f8: 0005a51b     	<unknown>
-     2fc: 02c5953b     	<unknown>
-     300: 80c5853b     	<unknown>
-     304: 0005c52f     	<unknown>
-     308: 08051513     	<unknown>
+0000000000000084 <fwd>:
+      84: 80040503     	lb	a0, -0x800(s0)
+      88: 7ff41503     	lh	a0, 0x7ff(s0)
+      8c: ffc12503     	lw	a0, -0x4(sp)
+      90: 0005c503     	lbu	a0, 0x0(a1)
+      94: 0025d503     	lhu	a0, 0x2(a1)
+      98: 00456583     	lwu	a1, 0x4(a0)
+      9c: ff813503     	ld	a0, -0x8(sp)
+      a0: 7f8f3f83     	ld	t6, 0x7f8(t5)
+      a4: feb50fa3     	sb	a1, -0x1(a0)
+      a8: 00b51123     	sh	a1, 0x2(a0)
+      ac: feb12e23     	sw	a1, -0x4(sp)
+      b0: 00113423     	sd	ra, 0x8(sp)
+      b4: 8002b023     	sd	zero, -0x800(t0)
+      b8: 00000013     	nop
+      bc: 00000513     	li	a0, 0x0
+      c0: 00500013     	li	zero, 0x5
+      c4: 00050013     	mv	zero, a0
+      c8: 00150013     	addi	zero, a0, 0x1
+      cc: fff50513     	addi	a0, a0, -0x1
+      d0: 7ff58513     	addi	a0, a1, 0x7ff
+      d4: 80058513     	addi	a0, a1, -0x800
+      d8: 00050313     	mv	t1, a0
+      dc: fff5a513     	slti	a0, a1, -0x1
+      e0: 0015b513     	seqz	a0, a1
+      e4: 0025b513     	sltiu	a0, a1, 0x2
+      e8: fff5c513     	not	a0, a1
+      ec: 0055c513     	xori	a0, a1, 0x5
+      f0: 7ff5e513     	ori	a0, a1, 0x7ff
+      f4: 0ff5f513     	zext.b	a0, a1
+      f8: 0fe5f513     	andi	a0, a1, 0xfe
+      fc: 00051513     	slli	a0, a0, 0x0
+     100: 01f51513     	slli	a0, a0, 0x1f
+     104: 02051513     	slli	a0, a0, 0x20
+     108: 03f51513     	slli	a0, a0, 0x3f
+     10c: 0215d513     	srli	a0, a1, 0x21
+     110: 03f5d513     	srli	a0, a1, 0x3f
+     114: 4285d513     	srai	a0, a1, 0x28
+     118: 4015d513     	srai	a0, a1, 0x1
+     11c: 0005851b     	sext.w	a0, a1
+     120: fff5851b     	addiw	a0, a1, -0x1
+     124: 7ff5851b     	addiw	a0, a1, 0x7ff
+     128: 0000001b     	sext.w	zero, zero
+     12c: 0005951b     	slliw	a0, a1, 0x0
+     130: 01f5951b     	slliw	a0, a1, 0x1f
+     134: 0015d51b     	srliw	a0, a1, 0x1
+     138: 41f5d51b     	sraiw	a0, a1, 0x1f
+     13c: 00c58533     	add	a0, a1, a2
+     140: 40c58533     	sub	a0, a1, a2
+     144: 40c00533     	neg	a0, a2
+     148: 00c59533     	sll	a0, a1, a2
+     14c: 00c5a533     	slt	a0, a1, a2
+     150: 0005a533     	sltz	a0, a1
+     154: 00c02533     	sgtz	a0, a2
+     158: 00002533     	sltz	a0, zero
+     15c: 00c5b533     	sltu	a0, a1, a2
+     160: 00c03533     	snez	a0, a2
+     164: 00003533     	snez	a0, zero
+     168: 00c5c533     	xor	a0, a1, a2
+     16c: 00c5d533     	srl	a0, a1, a2
+     170: 40c5d533     	sra	a0, a1, a2
+     174: 00c5e533     	or	a0, a1, a2
+     178: 00c5f533     	and	a0, a1, a2
+     17c: 00c5853b     	addw	a0, a1, a2
+     180: 40c5853b     	subw	a0, a1, a2
+     184: 40c0053b     	negw	a0, a2
+     188: 00c5953b     	sllw	a0, a1, a2
+     18c: 00c5d53b     	srlw	a0, a1, a2
+     190: 40c5d53b     	sraw	a0, a1, a2
+     194: 02c58533     	mul	a0, a1, a2
+     198: 02c59533     	mulh	a0, a1, a2
+     19c: 02c5a533     	mulhsu	a0, a1, a2
+     1a0: 02c5b533     	mulhu	a0, a1, a2
+     1a4: 02c5c533     	div	a0, a1, a2
+     1a8: 02c5d533     	divu	a0, a1, a2
+     1ac: 02c5e533     	rem	a0, a1, a2
+     1b0: 02c5f533     	remu	a0, a1, a2
+     1b4: 02c5853b     	mulw	a0, a1, a2
+     1b8: 02c5c53b     	divw	a0, a1, a2
+     1bc: 02c5d53b     	divuw	a0, a1, a2
+     1c0: 02c5e53b     	remw	a0, a1, a2
+     1c4: 02c5f53b     	remuw	a0, a1, a2
+     1c8: 1005a52f     	lr.w	a0, (a1)
+     1cc: 1405a52f     	lr.w.aq	a0, (a1)
+     1d0: 1205a52f     	lr.w.rl	a0, (a1)
+     1d4: 1605a52f     	lr.w.aqrl	a0, (a1)
+     1d8: 18b6252f     	sc.w	a0, a1, (a2)
+     1dc: 1e63a2af     	sc.w.aqrl	t0, t1, (t2)
+     1e0: 1805a52f     	sc.w	a0, zero, (a1)
+     1e4: 08b6252f     	amoswap.w	a0, a1, (a2)
+     1e8: 04b6252f     	amoadd.w.aq	a0, a1, (a2)
+     1ec: 20b6252f     	amoxor.w	a0, a1, (a2)
+     1f0: 62b6252f     	amoand.w.rl	a0, a1, (a2)
+     1f4: 40b6252f     	amoor.w	a0, a1, (a2)
+     1f8: 80b6252f     	amomin.w	a0, a1, (a2)
+     1fc: a0b6252f     	amomax.w	a0, a1, (a2)
+     200: c0b6252f     	amominu.w	a0, a1, (a2)
+     204: e0b6202f     	amomaxu.w	zero, a1, (a2)
+     208: 1005b52f     	lr.d	a0, (a1)
+     20c: 1405b52f     	lr.d.aq	a0, (a1)
+     210: 1205b52f     	lr.d.rl	a0, (a1)
+     214: 1605b52f     	lr.d.aqrl	a0, (a1)
+     218: 18b6352f     	sc.d	a0, a1, (a2)
+     21c: 1cb6352f     	sc.d.aq	a0, a1, (a2)
+     220: 1ab6352f     	sc.d.rl	a0, a1, (a2)
+     224: 1e63b2af     	sc.d.aqrl	t0, t1, (t2)
+     228: 08b6352f     	amoswap.d	a0, a1, (a2)
+     22c: 0e05b5af     	amoswap.d.aqrl	a1, zero, (a1)
+     230: 00b6352f     	amoadd.d	a0, a1, (a2)
+     234: 04b6352f     	amoadd.d.aq	a0, a1, (a2)
+     238: 20b6352f     	amoxor.d	a0, a1, (a2)
+     23c: 60b6352f     	amoand.d	a0, a1, (a2)
+     240: 62b6352f     	amoand.d.rl	a0, a1, (a2)
+     244: 40b6352f     	amoor.d	a0, a1, (a2)
+     248: 80b6352f     	amomin.d	a0, a1, (a2)
+     24c: a0b6352f     	amomax.d	a0, a1, (a2)
+     250: c0b6352f     	amominu.d	a0, a1, (a2)
+     254: e6b6302f     	amomaxu.d.aqrl	zero, a1, (a2)
+     258: 0ff0000f     	fence
+     25c: 0330000f     	fence	rw, rw
+     260: 8330000f     	fence.tso
+     264: 0000100f     	fence.i
+     268: 00000073     	ecall
+     26c: 00100073     	ebreak
+     270: 30200073     	mret
+     274: 10200073     	sret
+     278: 10500073     	wfi
+     27c: 12000073     	sfence.vma
+     280: 12050073     	sfence.vma	a0
+     284: 12b50073     	sfence.vma	a0, a1
+     288: c0001073     	unimp
+     28c: c0002573     	rdcycle	a0
+     290: c0102573     	rdtime	a0
+     294: c0202573     	rdinstret	a0
+     298: c0002073     	rdcycle	zero
+     29c: c8002573     	csrr	a0, 0xc80
+     2a0: c8102573     	csrr	a0, 0xc81
+     2a4: c8202573     	csrr	a0, 0xc82
+     2a8: 31002573     	csrr	a0, 0x310
+     2ac: 31a02573     	csrr	a0, 0x31a
+     2b0: b8002573     	csrr	a0, 0xb80
+     2b4: 3a102573     	csrr	a0, 0x3a1
+     2b8: 3a202573     	csrr	a0, pmpcfg2
+     2bc: 30002573     	csrr	a0, mstatus
+     2c0: 18002573     	csrr	a0, satp
+     2c4: 30102573     	csrr	a0, misa
+     2c8: 7c002573     	csrr	a0, 0x7c0
+     2cc: 30051073     	csrw	mstatus, a0
+     2d0: 34051573     	csrrw	a0, mscratch, a0
+     2d4: 30452073     	csrs	mie, a0
+     2d8: 34453073     	csrc	mip, a0
+     2dc: 1005b573     	csrrc	a0, sstatus, a1
+     2e0: 3002d073     	csrwi	mstatus, 0x5
+     2e4: 10016073     	csrsi	sstatus, 0x2
+     2e8: 10017073     	csrci	sstatus, 0x2
+     2ec: 300fd573     	csrrwi	a0, mstatus, 0x1f
+     2f0: 30446573     	csrrsi	a0, mie, 0x8
+     2f4: 3440f573     	csrrci	a0, mip, 0x1
+     2f8: 10002573     	csrr	a0, sstatus
+     2fc: 10402573     	csrr	a0, sie
+     300: 10502573     	csrr	a0, stvec
+     304: 10602573     	csrr	a0, scounteren
+     308: 10a02573     	csrr	a0, senvcfg
+     30c: 14002573     	csrr	a0, sscratch
+     310: 14102573     	csrr	a0, sepc
+     314: 14202573     	csrr	a0, scause
+     318: 14302573     	csrr	a0, stval
+     31c: 14402573     	csrr	a0, sip
+     320: 18002573     	csrr	a0, satp
+     324: 30002573     	csrr	a0, mstatus
+     328: 30102573     	csrr	a0, misa
+     32c: 30202573     	csrr	a0, medeleg
+     330: 30302573     	csrr	a0, mideleg
+     334: 30402573     	csrr	a0, mie
+     338: 30502573     	csrr	a0, mtvec
+     33c: 30602573     	csrr	a0, mcounteren
+     340: 30a02573     	csrr	a0, menvcfg
+     344: 31002573     	csrr	a0, 0x310
+     348: 31a02573     	csrr	a0, 0x31a
+     34c: 32002573     	csrr	a0, mcountinhibit
+     350: 32302573     	csrr	a0, mhpmevent3
+     354: 32402573     	csrr	a0, mhpmevent4
+     358: 32502573     	csrr	a0, mhpmevent5
+     35c: 32602573     	csrr	a0, mhpmevent6
+     360: 32702573     	csrr	a0, mhpmevent7
+     364: 32802573     	csrr	a0, mhpmevent8
+     368: 32902573     	csrr	a0, mhpmevent9
+     36c: 32a02573     	csrr	a0, mhpmevent10
+     370: 32b02573     	csrr	a0, mhpmevent11
+     374: 32c02573     	csrr	a0, mhpmevent12
+     378: 32d02573     	csrr	a0, mhpmevent13
+     37c: 32e02573     	csrr	a0, mhpmevent14
+     380: 32f02573     	csrr	a0, mhpmevent15
+     384: 33002573     	csrr	a0, mhpmevent16
+     388: 33102573     	csrr	a0, mhpmevent17
+     38c: 33202573     	csrr	a0, mhpmevent18
+     390: 33302573     	csrr	a0, mhpmevent19
+     394: 33402573     	csrr	a0, mhpmevent20
+     398: 33502573     	csrr	a0, mhpmevent21
+     39c: 33602573     	csrr	a0, mhpmevent22
+     3a0: 33702573     	csrr	a0, mhpmevent23
+     3a4: 33802573     	csrr	a0, mhpmevent24
+     3a8: 33902573     	csrr	a0, mhpmevent25
+     3ac: 33a02573     	csrr	a0, mhpmevent26
+     3b0: 33b02573     	csrr	a0, mhpmevent27
+     3b4: 33c02573     	csrr	a0, mhpmevent28
+     3b8: 33d02573     	csrr	a0, mhpmevent29
+     3bc: 33e02573     	csrr	a0, mhpmevent30
+     3c0: 33f02573     	csrr	a0, mhpmevent31
+     3c4: 34002573     	csrr	a0, mscratch
+     3c8: 34102573     	csrr	a0, mepc
+     3cc: 34202573     	csrr	a0, mcause
+     3d0: 34302573     	csrr	a0, mtval
+     3d4: 34402573     	csrr	a0, mip
+     3d8: 3a002573     	csrr	a0, pmpcfg0
+     3dc: 3a102573     	csrr	a0, 0x3a1
+     3e0: 3a202573     	csrr	a0, pmpcfg2
+     3e4: 3a302573     	csrr	a0, 0x3a3
+     3e8: 3b002573     	csrr	a0, pmpaddr0
+     3ec: 3b102573     	csrr	a0, pmpaddr1
+     3f0: 3b202573     	csrr	a0, pmpaddr2
+     3f4: 3b302573     	csrr	a0, pmpaddr3
+     3f8: 3b402573     	csrr	a0, pmpaddr4
+     3fc: 3b502573     	csrr	a0, pmpaddr5
+     400: 3b602573     	csrr	a0, pmpaddr6
+     404: 3b702573     	csrr	a0, pmpaddr7
+     408: 3b802573     	csrr	a0, pmpaddr8
+     40c: 3b902573     	csrr	a0, pmpaddr9
+     410: 3ba02573     	csrr	a0, pmpaddr10
+     414: 3bb02573     	csrr	a0, pmpaddr11
+     418: 3bc02573     	csrr	a0, pmpaddr12
+     41c: 3bd02573     	csrr	a0, pmpaddr13
+     420: 3be02573     	csrr	a0, pmpaddr14
+     424: 3bf02573     	csrr	a0, pmpaddr15
+     428: 74002573     	csrr	a0, mnscratch
+     42c: 74102573     	csrr	a0, mnepc
+     430: 74202573     	csrr	a0, mncause
+     434: 74402573     	csrr	a0, mnstatus
+     438: 7a002573     	csrr	a0, tselect
+     43c: 7a102573     	csrr	a0, tdata1
+     440: 7a202573     	csrr	a0, tdata2
+     444: 7a302573     	csrr	a0, tdata3
+     448: 7a402573     	csrr	a0, tinfo
+     44c: 7a502573     	csrr	a0, tcontrol
+     450: b0002573     	csrr	a0, mcycle
+     454: b0202573     	csrr	a0, minstret
+     458: b0302573     	csrr	a0, mhpmcounter3
+     45c: b0402573     	csrr	a0, mhpmcounter4
+     460: b0502573     	csrr	a0, mhpmcounter5
+     464: b0602573     	csrr	a0, mhpmcounter6
+     468: b0702573     	csrr	a0, mhpmcounter7
+     46c: b0802573     	csrr	a0, mhpmcounter8
+     470: b0902573     	csrr	a0, mhpmcounter9
+     474: b0a02573     	csrr	a0, mhpmcounter10
+     478: b0b02573     	csrr	a0, mhpmcounter11
+     47c: b0c02573     	csrr	a0, mhpmcounter12
+     480: b0d02573     	csrr	a0, mhpmcounter13
+     484: b0e02573     	csrr	a0, mhpmcounter14
+     488: b0f02573     	csrr	a0, mhpmcounter15
+     48c: b1002573     	csrr	a0, mhpmcounter16
+     490: b1102573     	csrr	a0, mhpmcounter17
+     494: b1202573     	csrr	a0, mhpmcounter18
+     498: b1302573     	csrr	a0, mhpmcounter19
+     49c: b1402573     	csrr	a0, mhpmcounter20
+     4a0: b1502573     	csrr	a0, mhpmcounter21
+     4a4: b1602573     	csrr	a0, mhpmcounter22
+     4a8: b1702573     	csrr	a0, mhpmcounter23
+     4ac: b1802573     	csrr	a0, mhpmcounter24
+     4b0: b1902573     	csrr	a0, mhpmcounter25
+     4b4: b1a02573     	csrr	a0, mhpmcounter26
+     4b8: b1b02573     	csrr	a0, mhpmcounter27
+     4bc: b1c02573     	csrr	a0, mhpmcounter28
+     4c0: b1d02573     	csrr	a0, mhpmcounter29
+     4c4: b1e02573     	csrr	a0, mhpmcounter30
+     4c8: b1f02573     	csrr	a0, mhpmcounter31
+     4cc: b8002573     	csrr	a0, 0xb80
+     4d0: b8202573     	csrr	a0, 0xb82
+     4d4: b8302573     	csrr	a0, 0xb83
+     4d8: b8402573     	csrr	a0, 0xb84
+     4dc: b8502573     	csrr	a0, 0xb85
+     4e0: b8602573     	csrr	a0, 0xb86
+     4e4: b8702573     	csrr	a0, 0xb87
+     4e8: b8802573     	csrr	a0, 0xb88
+     4ec: b8902573     	csrr	a0, 0xb89
+     4f0: b8a02573     	csrr	a0, 0xb8a
+     4f4: b8b02573     	csrr	a0, 0xb8b
+     4f8: b8c02573     	csrr	a0, 0xb8c
+     4fc: b8d02573     	csrr	a0, 0xb8d
+     500: b8e02573     	csrr	a0, 0xb8e
+     504: b8f02573     	csrr	a0, 0xb8f
+     508: b9002573     	csrr	a0, 0xb90
+     50c: b9102573     	csrr	a0, 0xb91
+     510: b9202573     	csrr	a0, 0xb92
+     514: b9302573     	csrr	a0, 0xb93
+     518: b9402573     	csrr	a0, 0xb94
+     51c: b9502573     	csrr	a0, 0xb95
+     520: b9602573     	csrr	a0, 0xb96
+     524: b9702573     	csrr	a0, 0xb97
+     528: b9802573     	csrr	a0, 0xb98
+     52c: b9902573     	csrr	a0, 0xb99
+     530: b9a02573     	csrr	a0, 0xb9a
+     534: b9b02573     	csrr	a0, 0xb9b
+     538: b9c02573     	csrr	a0, 0xb9c
+     53c: b9d02573     	csrr	a0, 0xb9d
+     540: b9e02573     	csrr	a0, 0xb9e
+     544: b9f02573     	csrr	a0, 0xb9f
+     548: c0002573     	rdcycle	a0
+     54c: c0102573     	rdtime	a0
+     550: c0202573     	rdinstret	a0
+     554: c0302573     	csrr	a0, hpmcounter3
+     558: c0402573     	csrr	a0, hpmcounter4
+     55c: c0502573     	csrr	a0, hpmcounter5
+     560: c0602573     	csrr	a0, hpmcounter6
+     564: c0702573     	csrr	a0, hpmcounter7
+     568: c0802573     	csrr	a0, hpmcounter8
+     56c: c0902573     	csrr	a0, hpmcounter9
+     570: c0a02573     	csrr	a0, hpmcounter10
+     574: c0b02573     	csrr	a0, hpmcounter11
+     578: c0c02573     	csrr	a0, hpmcounter12
+     57c: c0d02573     	csrr	a0, hpmcounter13
+     580: c0e02573     	csrr	a0, hpmcounter14
+     584: c0f02573     	csrr	a0, hpmcounter15
+     588: c1002573     	csrr	a0, hpmcounter16
+     58c: c1102573     	csrr	a0, hpmcounter17
+     590: c1202573     	csrr	a0, hpmcounter18
+     594: c1302573     	csrr	a0, hpmcounter19
+     598: c1402573     	csrr	a0, hpmcounter20
+     59c: c1502573     	csrr	a0, hpmcounter21
+     5a0: c1602573     	csrr	a0, hpmcounter22
+     5a4: c1702573     	csrr	a0, hpmcounter23
+     5a8: c1802573     	csrr	a0, hpmcounter24
+     5ac: c1902573     	csrr	a0, hpmcounter25
+     5b0: c1a02573     	csrr	a0, hpmcounter26
+     5b4: c1b02573     	csrr	a0, hpmcounter27
+     5b8: c1c02573     	csrr	a0, hpmcounter28
+     5bc: c1d02573     	csrr	a0, hpmcounter29
+     5c0: c1e02573     	csrr	a0, hpmcounter30
+     5c4: c1f02573     	csrr	a0, hpmcounter31
+     5c8: c8002573     	csrr	a0, 0xc80
+     5cc: c8102573     	csrr	a0, 0xc81
+     5d0: c8202573     	csrr	a0, 0xc82
+     5d4: c8302573     	csrr	a0, 0xc83
+     5d8: c8402573     	csrr	a0, 0xc84
+     5dc: c8502573     	csrr	a0, 0xc85
+     5e0: c8602573     	csrr	a0, 0xc86
+     5e4: c8702573     	csrr	a0, 0xc87
+     5e8: c8802573     	csrr	a0, 0xc88
+     5ec: c8902573     	csrr	a0, 0xc89
+     5f0: c8a02573     	csrr	a0, 0xc8a
+     5f4: c8b02573     	csrr	a0, 0xc8b
+     5f8: c8c02573     	csrr	a0, 0xc8c
+     5fc: c8d02573     	csrr	a0, 0xc8d
+     600: c8e02573     	csrr	a0, 0xc8e
+     604: c8f02573     	csrr	a0, 0xc8f
+     608: c9002573     	csrr	a0, 0xc90
+     60c: c9102573     	csrr	a0, 0xc91
+     610: c9202573     	csrr	a0, 0xc92
+     614: c9302573     	csrr	a0, 0xc93
+     618: c9402573     	csrr	a0, 0xc94
+     61c: c9502573     	csrr	a0, 0xc95
+     620: c9602573     	csrr	a0, 0xc96
+     624: c9702573     	csrr	a0, 0xc97
+     628: c9802573     	csrr	a0, 0xc98
+     62c: c9902573     	csrr	a0, 0xc99
+     630: c9a02573     	csrr	a0, 0xc9a
+     634: c9b02573     	csrr	a0, 0xc9b
+     638: c9c02573     	csrr	a0, 0xc9c
+     63c: c9d02573     	csrr	a0, 0xc9d
+     640: c9e02573     	csrr	a0, 0xc9e
+     644: c9f02573     	csrr	a0, 0xc9f
+     648: f1102573     	csrr	a0, mvendorid
+     64c: f1202573     	csrr	a0, marchid
+     650: f1302573     	csrr	a0, mimpid
+     654: f1402573     	csrr	a0, mhartid
+     658: f1502573     	csrr	a0, mconfigptr
+     65c: 0205951b     	<unknown>
+     660: 0205d51b     	<unknown>
+     664: 4205d51b     	<unknown>
+     668: 08051513     	<unknown>
+     66c: 40051513     	<unknown>
+     670: 44055513     	<unknown>
+     674: 0005a51b     	<unknown>
+     678: 0005b51b     	<unknown>
+     67c: 0005c51b     	<unknown>
+     680: 0005e51b     	<unknown>
+     684: 0005f51b     	<unknown>
+     688: 02c5953b     	<unknown>
+     68c: 02c5a53b     	<unknown>
+     690: 02c5b53b     	<unknown>
+     694: 00c5a53b     	<unknown>
+     698: 00c5b53b     	<unknown>
+     69c: 00c5c53b     	<unknown>
+     6a0: 00c5e53b     	<unknown>
+     6a4: 00c5f53b     	<unknown>
+     6a8: 40c5953b     	<unknown>
+     6ac: 80c5853b     	<unknown>
+     6b0: 0005f503     	<unknown>
+     6b4: 00b54023     	<unknown>
+     6b8: 00b55023     	<unknown>
+     6bc: 00b56023     	<unknown>
+     6c0: 00b57023     	<unknown>
+     6c4: 0005852f     	<unknown>
+     6c8: 0005952f     	<unknown>
+     6cc: 0005c52f     	<unknown>
+     6d0: 0005d52f     	<unknown>
+     6d4: 1015b52f     	<unknown>

@@ -111,8 +111,8 @@ impl StoreOp {
 }
 
 /// Integer ALU operations shared by OP and OP-IMM, and by their 32-bit forms
-/// OP-32 and OP-IMM-32 (RV64), which use only `Add`, `Sub`, `Sll`, `Srl` and
-/// `Sra`.
+/// OP-32 (RV64), which uses only `Add`, `Sub`, `Sll`, `Srl` and `Sra`, and
+/// OP-IMM-32, which uses only `Add`, `Sll`, `Srl` and `Sra` (see [`Inst`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AluOp {
     Add,
@@ -238,6 +238,19 @@ pub enum CsrSrc {
 
 /// A decoded instruction. Immediates are already sign-extended and, for
 /// branches and jumps, already byte offsets.
+///
+/// The 32-bit operations of RV64 (`addiw`, `addw`, `mulw`...) are variants of
+/// their own, [`Inst::OpImm32`], [`Inst::Op32`] and [`Inst::Mul32`], rather
+/// than a `word: bool` on `OpImm`, `Op` and `Mul`. A variant is one major
+/// opcode, as the encoding has it (OP-IMM-32 and OP-32 are opcodes of their
+/// own), and a match over `Inst`, such as Grail's execute step, cannot handle
+/// `add` and forget that `addw` truncates and sign-extends: the 32-bit forms
+/// are arms the compiler asks for. The cost is that they reuse [`AluOp`] and
+/// [`MulOp`], which name more operations than they have: the decoder never
+/// makes `OpImm32 { op: AluOp::Xor, .. }` (OP-IMM-32 has only `Add`, `Sll`,
+/// `Srl` and `Sra`), `Op32` with anything but `Add`, `Sub`, `Sll`, `Srl` and
+/// `Sra`, or `Mul32` with `Mulh`, `Mulhsu` or `Mulhu`. Those values are not
+/// instructions; the disassembler treats them as a bug.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Inst {
     /// `imm` is the U-type immediate, its low 12 bits zero, as a signed

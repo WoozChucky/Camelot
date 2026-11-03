@@ -33,12 +33,231 @@ Disassembly of section .text:
       60: 3a102573     	csrrs	a0, pmpcfg1, zero
       64: 3a302573     	csrrs	a0, pmpcfg3, zero
       68: 31051073     	csrrw	zero, mstatush, a0
-      6c: 03f51513     	<unknown>
-      70: ff813503     	<unknown>
-      74: 00456583     	<unknown>
-      78: 00113423     	<unknown>
-      7c: fff5851b     	<unknown>
-      80: 00c5853b     	<unknown>
-      84: 02c5853b     	<unknown>
-      88: 1005b52f     	<unknown>
-      8c: 04b6352f     	<unknown>
+      6c: 10002573     	csrrs	a0, sstatus, zero
+      70: 10402573     	csrrs	a0, sie, zero
+      74: 10502573     	csrrs	a0, stvec, zero
+      78: 10602573     	csrrs	a0, scounteren, zero
+      7c: 10a02573     	csrrs	a0, senvcfg, zero
+      80: 14002573     	csrrs	a0, sscratch, zero
+      84: 14102573     	csrrs	a0, sepc, zero
+      88: 14202573     	csrrs	a0, scause, zero
+      8c: 14302573     	csrrs	a0, stval, zero
+      90: 14402573     	csrrs	a0, sip, zero
+      94: 18002573     	csrrs	a0, satp, zero
+      98: 30002573     	csrrs	a0, mstatus, zero
+      9c: 30102573     	csrrs	a0, misa, zero
+      a0: 30202573     	csrrs	a0, medeleg, zero
+      a4: 30302573     	csrrs	a0, mideleg, zero
+      a8: 30402573     	csrrs	a0, mie, zero
+      ac: 30502573     	csrrs	a0, mtvec, zero
+      b0: 30602573     	csrrs	a0, mcounteren, zero
+      b4: 30a02573     	csrrs	a0, menvcfg, zero
+      b8: 31002573     	csrrs	a0, mstatush, zero
+      bc: 31a02573     	csrrs	a0, menvcfgh, zero
+      c0: 32002573     	csrrs	a0, mcountinhibit, zero
+      c4: 32302573     	csrrs	a0, mhpmevent3, zero
+      c8: 32402573     	csrrs	a0, mhpmevent4, zero
+      cc: 32502573     	csrrs	a0, mhpmevent5, zero
+      d0: 32602573     	csrrs	a0, mhpmevent6, zero
+      d4: 32702573     	csrrs	a0, mhpmevent7, zero
+      d8: 32802573     	csrrs	a0, mhpmevent8, zero
+      dc: 32902573     	csrrs	a0, mhpmevent9, zero
+      e0: 32a02573     	csrrs	a0, mhpmevent10, zero
+      e4: 32b02573     	csrrs	a0, mhpmevent11, zero
+      e8: 32c02573     	csrrs	a0, mhpmevent12, zero
+      ec: 32d02573     	csrrs	a0, mhpmevent13, zero
+      f0: 32e02573     	csrrs	a0, mhpmevent14, zero
+      f4: 32f02573     	csrrs	a0, mhpmevent15, zero
+      f8: 33002573     	csrrs	a0, mhpmevent16, zero
+      fc: 33102573     	csrrs	a0, mhpmevent17, zero
+     100: 33202573     	csrrs	a0, mhpmevent18, zero
+     104: 33302573     	csrrs	a0, mhpmevent19, zero
+     108: 33402573     	csrrs	a0, mhpmevent20, zero
+     10c: 33502573     	csrrs	a0, mhpmevent21, zero
+     110: 33602573     	csrrs	a0, mhpmevent22, zero
+     114: 33702573     	csrrs	a0, mhpmevent23, zero
+     118: 33802573     	csrrs	a0, mhpmevent24, zero
+     11c: 33902573     	csrrs	a0, mhpmevent25, zero
+     120: 33a02573     	csrrs	a0, mhpmevent26, zero
+     124: 33b02573     	csrrs	a0, mhpmevent27, zero
+     128: 33c02573     	csrrs	a0, mhpmevent28, zero
+     12c: 33d02573     	csrrs	a0, mhpmevent29, zero
+     130: 33e02573     	csrrs	a0, mhpmevent30, zero
+     134: 33f02573     	csrrs	a0, mhpmevent31, zero
+     138: 34002573     	csrrs	a0, mscratch, zero
+     13c: 34102573     	csrrs	a0, mepc, zero
+     140: 34202573     	csrrs	a0, mcause, zero
+     144: 34302573     	csrrs	a0, mtval, zero
+     148: 34402573     	csrrs	a0, mip, zero
+     14c: 3a002573     	csrrs	a0, pmpcfg0, zero
+     150: 3a102573     	csrrs	a0, pmpcfg1, zero
+     154: 3a202573     	csrrs	a0, pmpcfg2, zero
+     158: 3a302573     	csrrs	a0, pmpcfg3, zero
+     15c: 3b002573     	csrrs	a0, pmpaddr0, zero
+     160: 3b102573     	csrrs	a0, pmpaddr1, zero
+     164: 3b202573     	csrrs	a0, pmpaddr2, zero
+     168: 3b302573     	csrrs	a0, pmpaddr3, zero
+     16c: 3b402573     	csrrs	a0, pmpaddr4, zero
+     170: 3b502573     	csrrs	a0, pmpaddr5, zero
+     174: 3b602573     	csrrs	a0, pmpaddr6, zero
+     178: 3b702573     	csrrs	a0, pmpaddr7, zero
+     17c: 3b802573     	csrrs	a0, pmpaddr8, zero
+     180: 3b902573     	csrrs	a0, pmpaddr9, zero
+     184: 3ba02573     	csrrs	a0, pmpaddr10, zero
+     188: 3bb02573     	csrrs	a0, pmpaddr11, zero
+     18c: 3bc02573     	csrrs	a0, pmpaddr12, zero
+     190: 3bd02573     	csrrs	a0, pmpaddr13, zero
+     194: 3be02573     	csrrs	a0, pmpaddr14, zero
+     198: 3bf02573     	csrrs	a0, pmpaddr15, zero
+     19c: 74002573     	csrrs	a0, mnscratch, zero
+     1a0: 74102573     	csrrs	a0, mnepc, zero
+     1a4: 74202573     	csrrs	a0, mncause, zero
+     1a8: 74402573     	csrrs	a0, mnstatus, zero
+     1ac: 7a002573     	csrrs	a0, tselect, zero
+     1b0: 7a102573     	csrrs	a0, tdata1, zero
+     1b4: 7a202573     	csrrs	a0, tdata2, zero
+     1b8: 7a302573     	csrrs	a0, tdata3, zero
+     1bc: 7a402573     	csrrs	a0, tinfo, zero
+     1c0: 7a502573     	csrrs	a0, tcontrol, zero
+     1c4: b0002573     	csrrs	a0, mcycle, zero
+     1c8: b0202573     	csrrs	a0, minstret, zero
+     1cc: b0302573     	csrrs	a0, mhpmcounter3, zero
+     1d0: b0402573     	csrrs	a0, mhpmcounter4, zero
+     1d4: b0502573     	csrrs	a0, mhpmcounter5, zero
+     1d8: b0602573     	csrrs	a0, mhpmcounter6, zero
+     1dc: b0702573     	csrrs	a0, mhpmcounter7, zero
+     1e0: b0802573     	csrrs	a0, mhpmcounter8, zero
+     1e4: b0902573     	csrrs	a0, mhpmcounter9, zero
+     1e8: b0a02573     	csrrs	a0, mhpmcounter10, zero
+     1ec: b0b02573     	csrrs	a0, mhpmcounter11, zero
+     1f0: b0c02573     	csrrs	a0, mhpmcounter12, zero
+     1f4: b0d02573     	csrrs	a0, mhpmcounter13, zero
+     1f8: b0e02573     	csrrs	a0, mhpmcounter14, zero
+     1fc: b0f02573     	csrrs	a0, mhpmcounter15, zero
+     200: b1002573     	csrrs	a0, mhpmcounter16, zero
+     204: b1102573     	csrrs	a0, mhpmcounter17, zero
+     208: b1202573     	csrrs	a0, mhpmcounter18, zero
+     20c: b1302573     	csrrs	a0, mhpmcounter19, zero
+     210: b1402573     	csrrs	a0, mhpmcounter20, zero
+     214: b1502573     	csrrs	a0, mhpmcounter21, zero
+     218: b1602573     	csrrs	a0, mhpmcounter22, zero
+     21c: b1702573     	csrrs	a0, mhpmcounter23, zero
+     220: b1802573     	csrrs	a0, mhpmcounter24, zero
+     224: b1902573     	csrrs	a0, mhpmcounter25, zero
+     228: b1a02573     	csrrs	a0, mhpmcounter26, zero
+     22c: b1b02573     	csrrs	a0, mhpmcounter27, zero
+     230: b1c02573     	csrrs	a0, mhpmcounter28, zero
+     234: b1d02573     	csrrs	a0, mhpmcounter29, zero
+     238: b1e02573     	csrrs	a0, mhpmcounter30, zero
+     23c: b1f02573     	csrrs	a0, mhpmcounter31, zero
+     240: b8002573     	csrrs	a0, mcycleh, zero
+     244: b8202573     	csrrs	a0, minstreth, zero
+     248: b8302573     	csrrs	a0, mhpmcounter3h, zero
+     24c: b8402573     	csrrs	a0, mhpmcounter4h, zero
+     250: b8502573     	csrrs	a0, mhpmcounter5h, zero
+     254: b8602573     	csrrs	a0, mhpmcounter6h, zero
+     258: b8702573     	csrrs	a0, mhpmcounter7h, zero
+     25c: b8802573     	csrrs	a0, mhpmcounter8h, zero
+     260: b8902573     	csrrs	a0, mhpmcounter9h, zero
+     264: b8a02573     	csrrs	a0, mhpmcounter10h, zero
+     268: b8b02573     	csrrs	a0, mhpmcounter11h, zero
+     26c: b8c02573     	csrrs	a0, mhpmcounter12h, zero
+     270: b8d02573     	csrrs	a0, mhpmcounter13h, zero
+     274: b8e02573     	csrrs	a0, mhpmcounter14h, zero
+     278: b8f02573     	csrrs	a0, mhpmcounter15h, zero
+     27c: b9002573     	csrrs	a0, mhpmcounter16h, zero
+     280: b9102573     	csrrs	a0, mhpmcounter17h, zero
+     284: b9202573     	csrrs	a0, mhpmcounter18h, zero
+     288: b9302573     	csrrs	a0, mhpmcounter19h, zero
+     28c: b9402573     	csrrs	a0, mhpmcounter20h, zero
+     290: b9502573     	csrrs	a0, mhpmcounter21h, zero
+     294: b9602573     	csrrs	a0, mhpmcounter22h, zero
+     298: b9702573     	csrrs	a0, mhpmcounter23h, zero
+     29c: b9802573     	csrrs	a0, mhpmcounter24h, zero
+     2a0: b9902573     	csrrs	a0, mhpmcounter25h, zero
+     2a4: b9a02573     	csrrs	a0, mhpmcounter26h, zero
+     2a8: b9b02573     	csrrs	a0, mhpmcounter27h, zero
+     2ac: b9c02573     	csrrs	a0, mhpmcounter28h, zero
+     2b0: b9d02573     	csrrs	a0, mhpmcounter29h, zero
+     2b4: b9e02573     	csrrs	a0, mhpmcounter30h, zero
+     2b8: b9f02573     	csrrs	a0, mhpmcounter31h, zero
+     2bc: c0002573     	csrrs	a0, cycle, zero
+     2c0: c0102573     	csrrs	a0, time, zero
+     2c4: c0202573     	csrrs	a0, instret, zero
+     2c8: c0302573     	csrrs	a0, hpmcounter3, zero
+     2cc: c0402573     	csrrs	a0, hpmcounter4, zero
+     2d0: c0502573     	csrrs	a0, hpmcounter5, zero
+     2d4: c0602573     	csrrs	a0, hpmcounter6, zero
+     2d8: c0702573     	csrrs	a0, hpmcounter7, zero
+     2dc: c0802573     	csrrs	a0, hpmcounter8, zero
+     2e0: c0902573     	csrrs	a0, hpmcounter9, zero
+     2e4: c0a02573     	csrrs	a0, hpmcounter10, zero
+     2e8: c0b02573     	csrrs	a0, hpmcounter11, zero
+     2ec: c0c02573     	csrrs	a0, hpmcounter12, zero
+     2f0: c0d02573     	csrrs	a0, hpmcounter13, zero
+     2f4: c0e02573     	csrrs	a0, hpmcounter14, zero
+     2f8: c0f02573     	csrrs	a0, hpmcounter15, zero
+     2fc: c1002573     	csrrs	a0, hpmcounter16, zero
+     300: c1102573     	csrrs	a0, hpmcounter17, zero
+     304: c1202573     	csrrs	a0, hpmcounter18, zero
+     308: c1302573     	csrrs	a0, hpmcounter19, zero
+     30c: c1402573     	csrrs	a0, hpmcounter20, zero
+     310: c1502573     	csrrs	a0, hpmcounter21, zero
+     314: c1602573     	csrrs	a0, hpmcounter22, zero
+     318: c1702573     	csrrs	a0, hpmcounter23, zero
+     31c: c1802573     	csrrs	a0, hpmcounter24, zero
+     320: c1902573     	csrrs	a0, hpmcounter25, zero
+     324: c1a02573     	csrrs	a0, hpmcounter26, zero
+     328: c1b02573     	csrrs	a0, hpmcounter27, zero
+     32c: c1c02573     	csrrs	a0, hpmcounter28, zero
+     330: c1d02573     	csrrs	a0, hpmcounter29, zero
+     334: c1e02573     	csrrs	a0, hpmcounter30, zero
+     338: c1f02573     	csrrs	a0, hpmcounter31, zero
+     33c: c8002573     	csrrs	a0, cycleh, zero
+     340: c8102573     	csrrs	a0, timeh, zero
+     344: c8202573     	csrrs	a0, instreth, zero
+     348: c8302573     	csrrs	a0, hpmcounter3h, zero
+     34c: c8402573     	csrrs	a0, hpmcounter4h, zero
+     350: c8502573     	csrrs	a0, hpmcounter5h, zero
+     354: c8602573     	csrrs	a0, hpmcounter6h, zero
+     358: c8702573     	csrrs	a0, hpmcounter7h, zero
+     35c: c8802573     	csrrs	a0, hpmcounter8h, zero
+     360: c8902573     	csrrs	a0, hpmcounter9h, zero
+     364: c8a02573     	csrrs	a0, hpmcounter10h, zero
+     368: c8b02573     	csrrs	a0, hpmcounter11h, zero
+     36c: c8c02573     	csrrs	a0, hpmcounter12h, zero
+     370: c8d02573     	csrrs	a0, hpmcounter13h, zero
+     374: c8e02573     	csrrs	a0, hpmcounter14h, zero
+     378: c8f02573     	csrrs	a0, hpmcounter15h, zero
+     37c: c9002573     	csrrs	a0, hpmcounter16h, zero
+     380: c9102573     	csrrs	a0, hpmcounter17h, zero
+     384: c9202573     	csrrs	a0, hpmcounter18h, zero
+     388: c9302573     	csrrs	a0, hpmcounter19h, zero
+     38c: c9402573     	csrrs	a0, hpmcounter20h, zero
+     390: c9502573     	csrrs	a0, hpmcounter21h, zero
+     394: c9602573     	csrrs	a0, hpmcounter22h, zero
+     398: c9702573     	csrrs	a0, hpmcounter23h, zero
+     39c: c9802573     	csrrs	a0, hpmcounter24h, zero
+     3a0: c9902573     	csrrs	a0, hpmcounter25h, zero
+     3a4: c9a02573     	csrrs	a0, hpmcounter26h, zero
+     3a8: c9b02573     	csrrs	a0, hpmcounter27h, zero
+     3ac: c9c02573     	csrrs	a0, hpmcounter28h, zero
+     3b0: c9d02573     	csrrs	a0, hpmcounter29h, zero
+     3b4: c9e02573     	csrrs	a0, hpmcounter30h, zero
+     3b8: c9f02573     	csrrs	a0, hpmcounter31h, zero
+     3bc: f1102573     	csrrs	a0, mvendorid, zero
+     3c0: f1202573     	csrrs	a0, marchid, zero
+     3c4: f1302573     	csrrs	a0, mimpid, zero
+     3c8: f1402573     	csrrs	a0, mhartid, zero
+     3cc: f1502573     	csrrs	a0, mconfigptr, zero
+     3d0: 03f51513     	<unknown>
+     3d4: 0215d513     	<unknown>
+     3d8: 4215d513     	<unknown>
+     3dc: ff813503     	<unknown>
+     3e0: 00456583     	<unknown>
+     3e4: 00113423     	<unknown>
+     3e8: fff5851b     	<unknown>
+     3ec: 00c5853b     	<unknown>
+     3f0: 02c5853b     	<unknown>
+     3f4: 1005b52f     	<unknown>
+     3f8: 04b6352f     	<unknown>

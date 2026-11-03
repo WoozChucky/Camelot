@@ -199,6 +199,8 @@ Minimum CSR set:
 | mhartid | 0xF14 | the hart's index, 0 to N - 1 on an N-hart machine (section 7, "Harts") |
 | cycle/time/instret | 0xC00-0xC02 | read-only counters, 64 bits each |
 | mcycle/minstret | 0xB00/0xB02 | the writable machine counters, 64 bits each |
+| hpmcounter3-31 / mhpmcounter3-31 / mhpmevent3-31 | 0xC03-0xC1F / 0xB03-0xB1F / 0x323-0x33F | the hardware performance counters and their events: there is nothing for them to count, so they read 0 and ignore writes |
+| tselect / tdata1-3 / tinfo / tcontrol | 0x7A0 / 0x7A1-0x7A3 / 0x7A4 / 0x7A5 | debug triggers: there are none. Writes are ignored, `tselect` always reads 1 and the others 0: the debug spec's probe writes 0 to `tselect` and reads back, and anything else says there are no triggers |
 
 Accessing a CSR above the current privilege level, or writing a read-only CSR, raises illegal-instruction.
 
@@ -875,7 +877,7 @@ The instruction formatting itself (`Inst::format` in `excalibur`) is shared with
 `excalibur` decodes and formats both widths:
 - **The width** is a parameter: `decode(word, xlen)` and `Syntax::xlen`. A word means different things on the two (section 4), branch targets wrap at the width, and the RV32-only CSRs are named only on RV32, as in llvm-objdump.
 - **RV64's aliases:** `sext.w` for `addiw rd, rs, 0`, `negw` for `subw rd, zero, rs`, and the `.d` atomics with their suffixes.
-- **The check:** `crates/excalibur/tests/disasm.rs` decodes every word of a corpus for each width (`tests/golden/rv32.s`, `rv64.s`, with every instruction, edge immediate, alias and illegal encoding) and compares it with llvm-objdump's text, with and without aliases (`scripts/gen-excalibur-golden.sh`).
+- **The check:** `crates/excalibur/tests/disasm.rs` decodes every word of a corpus for each width (`tests/golden/rv32.s`, `rv64.s`: every instruction and alias, the edge immediates, and the reserved encodings next to the ones that differ by width, such as funct3 values a load, store, AMO or 32-bit operation does not use, or shift fields with bits the width does not allow) and compares it with llvm-objdump's text, with and without aliases (`scripts/gen-excalibur-golden.sh`, made with LLVM 23).
 - **One version difference:** LLVM 23 prints `fence w, 0` as Zihintpause's `pause`, an extension Excalibur does not have; excalibur prints `fence w, 0`, as LLVM 21 does.
 
 The tools move to RV64 one by one (#141). Until then each passes `Xlen::Rv32`, and so does merlin-objdump until #150.

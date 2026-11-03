@@ -18,12 +18,25 @@ set -eu
 cd "$(dirname "$0")/.."
 DIR=crates/excalibur/tests/golden
 
+# Aliases come and go between LLVM versions (LLVM 23 added `pause`), so the
+# files are made with the version the test was written against.
+LLVM_MAJOR=23
+for tool in clang llvm-objdump; do
+    version=$("$tool" --version | grep -o 'version [0-9]*' | head -n 1 | cut -d ' ' -f 2)
+    if [ "$version" != "$LLVM_MAJOR" ]; then
+        echo "$tool is LLVM ${version:-?}, expected LLVM $LLVM_MAJOR" >&2
+        exit 1
+    fi
+done
+
 for xlen in 32 64; do
     src="$DIR/rv$xlen.s"
     # The object goes next to its source (and is removed): llvm-objdump
     # names it in its header, which should not depend on the machine.
     obj="$DIR/rv$xlen.o"
-    clang --target=riscv$xlen -march=rv${xlen}ima_zicsr_zifencei -mno-relax -c "$src" -o "$obj"
+    if [ $xlen = 64 ]; then abi=lp64; else abi=ilp32; fi
+    clang --target=riscv$xlen -march=rv${xlen}ima_zicsr_zifencei -mabi=$abi -mno-relax \
+        -c "$src" -o "$obj"
     llvm-objdump -d "$obj" > "$DIR/rv$xlen.objdump.txt"
     llvm-objdump -d -M no-aliases "$obj" > "$DIR/rv$xlen.no-aliases.txt"
     rm "$obj"

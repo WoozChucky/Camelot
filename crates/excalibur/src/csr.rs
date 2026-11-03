@@ -31,6 +31,9 @@ pub const MENVCFG: u16 = 0x30a;
 pub const MSTATUSH: u16 = 0x310;
 pub const MENVCFGH: u16 = 0x31a;
 pub const MCOUNTINHIBIT: u16 = 0x320;
+/// `mhpmevent3`-`mhpmevent31` (0x323-0x33F): the events the hardware
+/// performance counters count. Grail has none: they read 0.
+pub const MHPMEVENT3: u16 = 0x323;
 pub const MSCRATCH: u16 = 0x340;
 pub const MEPC: u16 = 0x341;
 pub const MCAUSE: u16 = 0x342;
@@ -62,6 +65,24 @@ pub const MIMPID: u16 = 0xf13;
 pub const MHARTID: u16 = 0xf14;
 pub const MCONFIGPTR: u16 = 0xf15;
 
+// The hardware performance counters 3-31, each the first of 29. Grail has
+// no events to count: they read 0 and ignore writes.
+pub const HPMCOUNTER3: u16 = 0xc03;
+/// RV32 only (see [`rv32_only`]).
+pub const HPMCOUNTER3H: u16 = 0xc83;
+pub const MHPMCOUNTER3: u16 = 0xb03;
+/// RV32 only (see [`rv32_only`]).
+pub const MHPMCOUNTER3H: u16 = 0xb83;
+
+// Debug triggers (the Sdtrig registers M-mode reaches). Grail has no
+// triggers: tselect reads a non-zero value, which says so, and the others 0.
+pub const TSELECT: u16 = 0x7a0;
+pub const TDATA1: u16 = 0x7a1;
+pub const TDATA2: u16 = 0x7a2;
+pub const TDATA3: u16 = 0x7a3;
+pub const TINFO: u16 = 0x7a4;
+pub const TCONTROL: u16 = 0x7a5;
+
 // mstatus bits
 pub const MSTATUS_SIE: u32 = 1 << 1;
 pub const MSTATUS_MIE: u32 = 1 << 3;
@@ -78,14 +99,19 @@ pub const MSTATUS_TW: u32 = 1 << 21;
 pub const MSTATUS_TSR: u32 = 1 << 22;
 // RV64 only: the 64-bit fields of mstatus (and UXL, SD of sstatus). The
 // low-bit constants above become u64 with Grail's CSRs (#145).
-/// UXL [33:32]: U-mode's XLEN, read-only 2 (64-bit) on Excalibur.
+/// UXL [33:32]: U-mode's XLEN, read-only [`MSTATUS_UXL_64`] on Excalibur.
 pub const MSTATUS_UXL: u64 = 3 << 32;
-/// SXL [35:34]: S-mode's XLEN, read-only 2 (64-bit) on Excalibur.
+/// UXL holding 2, 64-bit (Linux's `SR_UXL_64`).
+pub const MSTATUS_UXL_64: u64 = 2 << 32;
+/// SXL [35:34]: S-mode's XLEN, read-only [`MSTATUS_SXL_64`] on Excalibur.
 pub const MSTATUS_SXL: u64 = 3 << 34;
-/// The value UXL and SXL hold: 2, 64-bit.
-pub const XLEN_64: u64 = 2;
-/// SD on RV64, bit 63 (on RV32 it is bit 31, [`MSTATUS_SD_RV32`]).
+/// SXL holding 2, 64-bit.
+pub const MSTATUS_SXL_64: u64 = 2 << 34;
+/// SD, the summary of the FS, VS and XS dirty states, is the top bit:
+/// bit 63 on RV64, bit 31 on RV32 ([`MSTATUS_SD_RV32`]). Excalibur has no F,
+/// V or custom state, so it reads 0 on both.
 pub const MSTATUS_SD: u64 = 1 << 63;
+/// SD on RV32, bit 31 (see [`MSTATUS_SD`]).
 pub const MSTATUS_SD_RV32: u32 = 1 << 31;
 
 // Interrupt bits (mip/mie and cause numbers).
@@ -102,7 +128,7 @@ pub const IRQ_M_EXT: u32 = 11;
 /// `menvcfg`, and the odd PMP configuration registers. On RV64 accessing
 /// them is an illegal instruction.
 pub fn rv32_only(addr: u16) -> bool {
-    matches!(addr, MSTATUSH | MENVCFGH | 0xb80..=0xb9f | 0xc80..=0xc9f)
+    matches!(addr, MSTATUSH | MENVCFGH | MCYCLEH..=0xb9f | CYCLEH..=0xc9f)
         || addr == PMPCFG0 + 1
         || addr == PMPCFG0 + 3
 }
@@ -165,12 +191,178 @@ pub fn name(addr: u16, xlen: Xlen) -> Option<&'static str> {
         MIMPID => "mimpid",
         MHARTID => "mhartid",
         MCONFIGPTR => "mconfigptr",
+        TSELECT => "tselect",
+        TDATA1 => "tdata1",
+        TDATA2 => "tdata2",
+        TDATA3 => "tdata3",
+        TINFO => "tinfo",
+        TCONTROL => "tcontrol",
+        a @ HPMCOUNTER3..=0xc1f => HPMCOUNTER_NAMES[(a - HPMCOUNTER3) as usize],
+        a @ HPMCOUNTER3H..=0xc9f => HPMCOUNTERH_NAMES[(a - HPMCOUNTER3H) as usize],
+        a @ MHPMCOUNTER3..=0xb1f => MHPMCOUNTER_NAMES[(a - MHPMCOUNTER3) as usize],
+        a @ MHPMCOUNTER3H..=0xb9f => MHPMCOUNTERH_NAMES[(a - MHPMCOUNTER3H) as usize],
+        a @ MHPMEVENT3..=0x33f => MHPMEVENT_NAMES[(a - MHPMEVENT3) as usize],
         a if (PMPCFG0..PMPCFG0 + 4).contains(&a) => PMPCFG_NAMES[(a - PMPCFG0) as usize],
         a if (PMPADDR0..PMPADDR0 + 16).contains(&a) => PMPADDR_NAMES[(a - PMPADDR0) as usize],
         _ => return None,
     })
 }
 
+const HPMCOUNTER_NAMES: [&str; 29] = [
+    "hpmcounter3",
+    "hpmcounter4",
+    "hpmcounter5",
+    "hpmcounter6",
+    "hpmcounter7",
+    "hpmcounter8",
+    "hpmcounter9",
+    "hpmcounter10",
+    "hpmcounter11",
+    "hpmcounter12",
+    "hpmcounter13",
+    "hpmcounter14",
+    "hpmcounter15",
+    "hpmcounter16",
+    "hpmcounter17",
+    "hpmcounter18",
+    "hpmcounter19",
+    "hpmcounter20",
+    "hpmcounter21",
+    "hpmcounter22",
+    "hpmcounter23",
+    "hpmcounter24",
+    "hpmcounter25",
+    "hpmcounter26",
+    "hpmcounter27",
+    "hpmcounter28",
+    "hpmcounter29",
+    "hpmcounter30",
+    "hpmcounter31",
+];
+const HPMCOUNTERH_NAMES: [&str; 29] = [
+    "hpmcounter3h",
+    "hpmcounter4h",
+    "hpmcounter5h",
+    "hpmcounter6h",
+    "hpmcounter7h",
+    "hpmcounter8h",
+    "hpmcounter9h",
+    "hpmcounter10h",
+    "hpmcounter11h",
+    "hpmcounter12h",
+    "hpmcounter13h",
+    "hpmcounter14h",
+    "hpmcounter15h",
+    "hpmcounter16h",
+    "hpmcounter17h",
+    "hpmcounter18h",
+    "hpmcounter19h",
+    "hpmcounter20h",
+    "hpmcounter21h",
+    "hpmcounter22h",
+    "hpmcounter23h",
+    "hpmcounter24h",
+    "hpmcounter25h",
+    "hpmcounter26h",
+    "hpmcounter27h",
+    "hpmcounter28h",
+    "hpmcounter29h",
+    "hpmcounter30h",
+    "hpmcounter31h",
+];
+const MHPMCOUNTER_NAMES: [&str; 29] = [
+    "mhpmcounter3",
+    "mhpmcounter4",
+    "mhpmcounter5",
+    "mhpmcounter6",
+    "mhpmcounter7",
+    "mhpmcounter8",
+    "mhpmcounter9",
+    "mhpmcounter10",
+    "mhpmcounter11",
+    "mhpmcounter12",
+    "mhpmcounter13",
+    "mhpmcounter14",
+    "mhpmcounter15",
+    "mhpmcounter16",
+    "mhpmcounter17",
+    "mhpmcounter18",
+    "mhpmcounter19",
+    "mhpmcounter20",
+    "mhpmcounter21",
+    "mhpmcounter22",
+    "mhpmcounter23",
+    "mhpmcounter24",
+    "mhpmcounter25",
+    "mhpmcounter26",
+    "mhpmcounter27",
+    "mhpmcounter28",
+    "mhpmcounter29",
+    "mhpmcounter30",
+    "mhpmcounter31",
+];
+const MHPMCOUNTERH_NAMES: [&str; 29] = [
+    "mhpmcounter3h",
+    "mhpmcounter4h",
+    "mhpmcounter5h",
+    "mhpmcounter6h",
+    "mhpmcounter7h",
+    "mhpmcounter8h",
+    "mhpmcounter9h",
+    "mhpmcounter10h",
+    "mhpmcounter11h",
+    "mhpmcounter12h",
+    "mhpmcounter13h",
+    "mhpmcounter14h",
+    "mhpmcounter15h",
+    "mhpmcounter16h",
+    "mhpmcounter17h",
+    "mhpmcounter18h",
+    "mhpmcounter19h",
+    "mhpmcounter20h",
+    "mhpmcounter21h",
+    "mhpmcounter22h",
+    "mhpmcounter23h",
+    "mhpmcounter24h",
+    "mhpmcounter25h",
+    "mhpmcounter26h",
+    "mhpmcounter27h",
+    "mhpmcounter28h",
+    "mhpmcounter29h",
+    "mhpmcounter30h",
+    "mhpmcounter31h",
+];
+const MHPMEVENT_NAMES: [&str; 29] = [
+    "mhpmevent3",
+    "mhpmevent4",
+    "mhpmevent5",
+    "mhpmevent6",
+    "mhpmevent7",
+    "mhpmevent8",
+    "mhpmevent9",
+    "mhpmevent10",
+    "mhpmevent11",
+    "mhpmevent12",
+    "mhpmevent13",
+    "mhpmevent14",
+    "mhpmevent15",
+    "mhpmevent16",
+    "mhpmevent17",
+    "mhpmevent18",
+    "mhpmevent19",
+    "mhpmevent20",
+    "mhpmevent21",
+    "mhpmevent22",
+    "mhpmevent23",
+    "mhpmevent24",
+    "mhpmevent25",
+    "mhpmevent26",
+    "mhpmevent27",
+    "mhpmevent28",
+    "mhpmevent29",
+    "mhpmevent30",
+    "mhpmevent31",
+];
 const PMPCFG_NAMES: [&str; 4] = ["pmpcfg0", "pmpcfg1", "pmpcfg2", "pmpcfg3"];
 const PMPADDR_NAMES: [&str; 16] = [
     "pmpaddr0",
@@ -228,8 +420,17 @@ mod tests {
             assert_eq!(name(addr, Xlen::Rv64), None, "{n}");
             assert_eq!(parse(n, Xlen::Rv64), None, "{n}");
         }
-        // The unnamed high halves of the hardware performance counters too.
-        assert!(rv32_only(0xc83) && rv32_only(0xc9f) && rv32_only(0xb83) && rv32_only(0xb9f));
+        // The high halves of the hardware performance counters too.
+        for (addr, n) in [
+            (HPMCOUNTER3H, "hpmcounter3h"),
+            (0xc9f, "hpmcounter31h"),
+            (MHPMCOUNTER3H, "mhpmcounter3h"),
+            (0xb9f, "mhpmcounter31h"),
+        ] {
+            assert!(rv32_only(addr), "{n}");
+            assert_eq!(name(addr, Xlen::Rv32), Some(n));
+            assert_eq!(name(addr, Xlen::Rv64), None, "{n}");
+        }
         // Their low halves, and everything else, exist on both.
         for addr in [
             CYCLE,
@@ -242,6 +443,9 @@ mod tests {
             PMPCFG0,
             PMPCFG0 + 2,
             SATP,
+            HPMCOUNTER3,
+            MHPMCOUNTER3,
+            MHPMEVENT3,
         ] {
             assert!(!rv32_only(addr), "{addr:#x}");
             assert_eq!(name(addr, Xlen::Rv32), name(addr, Xlen::Rv64));

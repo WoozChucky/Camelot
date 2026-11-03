@@ -22,7 +22,7 @@ fn lines(name: &str) -> Vec<Line> {
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let mut out = Vec::new();
     for l in text.lines() {
-        // "     2f8: 0205951b     \tslli\ta0, a0, 0x3f"
+        // "      98: 00456583     \tlwu\ta1, 0x4(a0)"
         let Some((addr, rest)) = l.trim_start().split_once(": ") else {
             continue;
         };
@@ -39,6 +39,10 @@ fn lines(name: &str) -> Vec<Line> {
             Some(i) => insn[..i].to_string(),
             None => insn,
         };
+        // The corpus is one section from address 0, and every instruction
+        // is a word: a line the parser skipped would show as a gap.
+        let expected = 4 * out.len() as u64;
+        assert_eq!(addr, expected, "{path}: {l}: expected address {expected:#x}");
         out.push(Line {
             addr,
             word,
@@ -74,6 +78,51 @@ fn check(name: &str, xlen: Xlen, aliases: bool) {
         }
     }
     assert!(wrong.is_empty(), "{name}:\n{}", wrong.join("\n"));
+}
+
+/// Both files of a width are one object disassembled twice: the same words
+/// at the same addresses.
+fn same_words(xlen: u32) {
+    let words = |name: String| lines(&name).iter().map(|l| (l.addr, l.word)).collect::<Vec<_>>();
+    assert_eq!(
+        words(format!("rv{xlen}.objdump.txt")),
+        words(format!("rv{xlen}.no-aliases.txt"))
+    );
+}
+
+/// Every CSR excalibur has a name for, on either width, is in both corpora,
+/// so llvm-objdump has checked each name, and that the RV32-only ones are
+/// numbers on RV64.
+#[test]
+fn every_named_csr_is_in_both_corpora() {
+    for (name, xlen) in [("rv32.objdump.txt", Xlen::Rv32), ("rv64.objdump.txt", Xlen::Rv64)] {
+        let used: Vec<u16> = lines(name)
+            .iter()
+            .filter_map(|l| match decode(l.word, xlen) {
+                Inst::Csr { csr, .. } => Some(csr),
+                _ => None,
+            })
+            .collect();
+        let missing: Vec<String> = (0..4096u16)
+            .filter(|&a| excalibur::csr::name(a, Xlen::Rv32).is_some() && !used.contains(&a))
+            .map(|a| format!("{a:#x}"))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{name}: no instruction uses CSRs {}",
+            missing.join(", ")
+        );
+    }
+}
+
+#[test]
+fn both_rv64_files_hold_the_same_words() {
+    same_words(64);
+}
+
+#[test]
+fn both_rv32_files_hold_the_same_words() {
+    same_words(32);
 }
 
 #[test]

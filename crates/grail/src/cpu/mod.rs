@@ -11,7 +11,7 @@ pub use reservation::Reservation;
 use crate::bus::Bus;
 use crate::trap::{Exception, Trap, INTERRUPT_BIT};
 use excalibur::csr::*;
-use excalibur::{decode, AluOp, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, StoreOp, Xlen};
+use excalibur::{decode, AluOp, AmoWidth, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, StoreOp, Xlen};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -465,15 +465,33 @@ impl Hart {
                 self.set_reg(rd, v);
             }
             // One instruction at a time, in order: aq/rl need no work (see atomic.rs).
-            Inst::Lr { rd, rs1, .. } => {
+            Inst::Lr {
+                width: AmoWidth::W,
+                rd,
+                rs1,
+                ..
+            } => {
                 let v = self.load_reserved(bus, self.reg(rs1))?;
                 self.set_reg(rd, v);
             }
-            Inst::Sc { rd, rs1, rs2, .. } => {
+            Inst::Sc {
+                width: AmoWidth::W,
+                rd,
+                rs1,
+                rs2,
+                ..
+            } => {
                 let v = self.store_conditional(bus, self.reg(rs1), self.reg(rs2))?;
                 self.set_reg(rd, v);
             }
-            Inst::Amo { op, rd, rs1, rs2, .. } => {
+            Inst::Amo {
+                width: AmoWidth::W,
+                op,
+                rd,
+                rs1,
+                rs2,
+                ..
+            } => {
                 let old = self.amo(bus, op, self.reg(rs1), self.reg(rs2))?;
                 self.set_reg(rd, old);
             }
@@ -569,7 +587,18 @@ impl Hart {
                 bus.exit = Some(crate::bus::Exit::Code(self.reg(rs1) & 0xff));
             }
             // RV64 only: an RV32 hart decodes them as illegal. #145 runs them.
-            Inst::OpImm32 { .. } | Inst::Op32 { .. } | Inst::Mul32 { .. } => {
+            Inst::OpImm32 { .. }
+            | Inst::Op32 { .. }
+            | Inst::Mul32 { .. }
+            | Inst::Lr {
+                width: AmoWidth::D, ..
+            }
+            | Inst::Sc {
+                width: AmoWidth::D, ..
+            }
+            | Inst::Amo {
+                width: AmoWidth::D, ..
+            } => {
                 unreachable!("RV64 only: an RV32 hart decodes it as illegal")
             }
             Inst::Illegal(_) => return Err(Self::illegal()),
