@@ -150,7 +150,7 @@ static int header(uint *shoff, uint *shentsize, uint *shnum, uint *shstrndx, cha
     if (!rd_u16(i64_u(16), &e_type)) {
         return 0;
     }
-    if (e_type != 1) {
+    if (e_type != ET_REL) {
         const char *what = e_type == 2   ? "an executable"
                            : e_type == 3 ? "a shared object"
                            : e_type == 4 ? "a core file"
@@ -161,7 +161,7 @@ static int header(uint *shoff, uint *shentsize, uint *shnum, uint *shstrndx, cha
     if (!rd_u16(i64_u(18), &v)) {
         return 0;
     }
-    if (v != 243) {
+    if (v != EM_RISCV) {
         *err = fmt("e_machine is %u, not RISC-V (243)", v);
         return 0;
     }

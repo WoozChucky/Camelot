@@ -56,7 +56,7 @@ $ wait
 | Program | Usage | What it does |
 |---|---|---|
 | `as` | `as [-o OUT.o] FILE.s` | the assembler, merlin-as rewritten in C (`as/`): the same language, the same object byte for byte, the same error messages (`FILE:LINE: error: ...`), and the same line tables from `.file`/`.loc` (merlin `-g` output). The first step of self-hosting: section 10, "Self-hosting", of the spec. Only in `/bin` of the root image: the kernel does not build it in (it needs files) |
-| `ld` | `ld [-T SCRIPT] [-o OUT] [-S] FILE.o ... [--start-lib LIB.o ... --end-lib] [@ARGS]` | the linker, merlin-ld rewritten in C (`ld/`): the same scripts, libraries and messages, the same executable byte for byte; `@ARGS` reads more arguments from a file, for link lines longer than the shell takes. `as` then `ld` builds a program on Camelot itself. Only in `/bin` of the root image, as `as` |
+| `ld` | `ld [-T SCRIPT] [-e ENTRY] [-o OUT] [-S] FILE.o ... [--start-lib LIB.o ... --end-lib] [@ARGS]` | the linker, merlin-ld rewritten in C (`ld/`): the same scripts, libraries and messages, the same executable byte for byte; `@ARGS` reads more arguments from a file, for link lines longer than the shell takes. `as` then `ld` builds a program on Camelot itself. Only in `/bin` of the root image, as `as` |
 
 ## Network programs
 

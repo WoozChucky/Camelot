@@ -66,6 +66,29 @@ static char *describe(int code, struct reloc_error *e, const char *ty, const cha
     }
 }
 
+/* Where a relocation is, for messages: SECTION+0xOFFSET (made only when one
+ * is reported). */
+static char *where(struct section *sec, struct rela *r) {
+    return fmt("%s+0x%x", sec->name, r->offset);
+}
+
+/* Reports `what` (taken) about relocation `r`: `a.o: TYPE at SECTION+0xOFF what`. */
+static void report(struct object *o, struct section *sec, struct rela *r, char *what) {
+    char *at = where(sec, r);
+    error(fmt("%s: %s at %s %s", o->name, reloc_type_name(r->type), at, what));
+    free(at);
+    free(what);
+}
+
+/* Reports a relocation reloc_apply refused. */
+static void report_refused(struct object *o, struct section *sec, struct rela *r, int code, struct reloc_error *e) {
+    char *at = where(sec, r);
+    char *msg = describe(code, e, reloc_type_name(r->type), symbol_display_name(o, r->sym), at, sec, r);
+    error(fmt("%s: %s", o->name, msg));
+    free(msg);
+    free(at);
+}
+
 /* The psABI puts a PCREL_LO12's symbol, the label on its auipc, in the same
  * section as the relocation: anywhere else is a mistake. */
 static char *pcrel_lo12_section_error(struct object *o, uint section, struct rela *r) {
@@ -119,31 +142,27 @@ static uchar **loaded(struct layout *l) {
                     /* Hints that patch nothing: merlin-ld never relaxes. */
                     continue;
                 }
-                const char *ty = reloc_type_name(r->type);
-                char *at = fmt("%s+0x%x", sec->name, r->offset);
                 if (sec->type == SHT_NOBITS || os->nobits) {
-                    error(fmt("%s: %s at %s patches a NOBITS section", o->name, ty, at));
+                    report(o, sec, r, xstrdup("patches a NOBITS section"));
                     continue;
                 }
                 if (r->offset >= sec->size) {
-                    error(fmt("%s: %s at %s is outside section %s (size 0x%x)", o->name, ty, at, sec->name,
-                              sec->size));
+                    report(o, sec, r, fmt("is outside section %s (size 0x%x)", sec->name, sec->size));
                     continue;
                 }
                 char *e = pcrel_lo12_section_error(o, in->section, r);
                 if (e != NULL) {
-                    error(fmt("%s: %s at %s %s", o->name, ty, at, e));
+                    report(o, sec, r, e);
                     continue;
                 }
                 uint sym;
                 if (!reloc_symbol(l, in->object, r->sym, &sym, &e)) {
-                    error(fmt("%s: %s at %s %s", o->name, ty, at, e));
+                    report(o, sec, r, e);
                     continue;
                 }
                 int dummy;
                 if (is_lo12(r->type) && umap_get(&failed_hi20, sym, &dummy)) {
                     /* Its PCREL_HI20 already reported the symbol. */
-                    free(at);
                     continue;
                 }
                 uint place = in->addr + r->offset;
@@ -158,10 +177,8 @@ static uchar **loaded(struct layout *l) {
                 struct reloc_error re;
                 int code = reloc_apply(r->type, place, sym, r->addend, images[k] + start, end - start, &ctx, &re);
                 if (code != RE_OK) {
-                    error(fmt("%s: %s", o->name,
-                              describe(code, &re, ty, symbol_display_name(o, r->sym), at, sec, r)));
+                    report_refused(o, sec, r, code, &re);
                 }
-                free(at);
             }
         }
     }
@@ -188,11 +205,8 @@ static uchar **debug(struct layout *l) {
                 if (r->type == R_RISCV_NONE || r->type == R_RISCV_RELAX) {
                     continue;
                 }
-                const char *ty = reloc_type_name(r->type);
-                char *at = fmt("%s+0x%x", sec->name, r->offset);
                 if (r->offset >= sec->size) {
-                    error(fmt("%s: %s at %s is outside section %s (size 0x%x)", o->name, ty, at, sec->name,
-                              sec->size));
+                    report(o, sec, r, fmt("is outside section %s (size 0x%x)", sec->name, sec->size));
                     continue;
                 }
                 uint sym;
@@ -200,7 +214,7 @@ static uchar **debug(struct layout *l) {
                 if (in_dropped_section(l, in->object, r->sym)) {
                     sym = 0u - (uint)r->addend;
                 } else if (!reloc_symbol(l, in->object, r->sym, &sym, &e)) {
-                    error(fmt("%s: %s at %s %s", o->name, ty, at, e));
+                    report(o, sec, r, e);
                     continue;
                 }
                 uint place = in->addr + r->offset;
@@ -208,10 +222,8 @@ static uchar **debug(struct layout *l) {
                 int code = reloc_apply(r->type, place, sym, r->addend, images[k] + place,
                                        in->addr + sec->datalen - place, &none, &re);
                 if (code != RE_OK) {
-                    error(fmt("%s: %s", o->name,
-                              describe(code, &re, ty, symbol_display_name(o, r->sym), at, sec, r)));
+                    report_refused(o, sec, r, code, &re);
                 }
-                free(at);
             }
         }
     }

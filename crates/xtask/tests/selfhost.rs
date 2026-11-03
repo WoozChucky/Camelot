@@ -291,25 +291,28 @@ fn the_c_tools_tables_are_the_host_tools() {
 /// The second step (#136): the linker that runs on Camelot (`kernel/user/ld`,
 /// `/bin/ld`) links every user program from the host's objects into the
 /// executable merlin-ld makes, byte for byte, without the line tables (`-S`,
-/// as `/bin` holds them).
+/// as `/bin` holds them); and a few with them too, as `cargo xtask kernel`
+/// writes them to target/kernel/obj/user (the debug sections, their
+/// relocations and headers): programs of C with the library's members, and
+/// `as`, of several files.
 #[test]
 fn the_linker_on_camelot_links_every_user_program_as_merlin_ld_does() {
-    link_every_program(false);
+    link_every_program(&|name| ["hello", "cat", "grep", "as"].contains(&name));
 }
 
-/// The same, and with the line tables too, as `cargo xtask kernel` writes
-/// them to target/kernel/obj/user: twice the links, and the bigger files.
+/// Every program with the line tables too: twice the links, and the bigger
+/// files.
 #[test]
 #[ignore]
 fn the_linker_on_camelot_keeps_the_line_tables_as_merlin_ld_does() {
-    link_every_program(true);
+    link_every_program(&|_| true);
 }
 
-/// Links every user program on Camelot (`-S`, and without it if
-/// `with_debug`) and compares the executables with merlin-ld's. The objects
-/// go in `/o`, each program's command line in a response file in `/a` (a
-/// link line is longer than a console line), the results in `/out`.
-fn link_every_program(with_debug: bool) {
+/// Links every user program on Camelot with `-S`, and without it those
+/// `with_debug` names, and compares the executables with merlin-ld's. The
+/// objects go in `/o`, each program's command line in a response file in
+/// `/a` (a link line is longer than a console line), the results in `/out`.
+fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
     use userprogs::CCompiler;
     let dir = userprogs::user_dir(&repo_root());
     let rt = userprogs::build_runtime(&dir, CCompiler::Merlin).unwrap();
@@ -383,7 +386,7 @@ fn link_every_program(with_debug: bool) {
                             job,
                             &job.want.elf,
                         ));
-                        if with_debug {
+                        if with_debug(&job.name) {
                             checks.push((format!("ld @/a/{k}"), format!("/out/{k}"), job, &job.want.debug));
                         }
                     }
@@ -457,68 +460,127 @@ fn hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs() {
     assert!(said.contains("Hello"), "{said:?}");
 }
 
+/// An object from merlin-as.
+fn object(src: &str) -> Vec<u8> {
+    merlin_as::assemble_to_elf(src).unwrap_or_else(|e| panic!("{e:?}\n{src}"))
+}
+
+/// `obj` with its section `name` made a mergeable string section
+/// (`SHF_MERGE | SHF_STRINGS`, entries of one byte), as clang's
+/// `.rodata.str1.1` is: merlin-as writes none.
+fn mergeable(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
+    let at = {
+        let elf = elf32::Elf::parse(&obj).unwrap();
+        let i = elf.sections.iter().position(|s| s.name == name).unwrap();
+        elf.header.shoff as usize + 40 * i
+    };
+    let flags = u32::from_le_bytes(obj[at + 8..at + 12].try_into().unwrap());
+    obj[at + 8..at + 12].copy_from_slice(&(flags | elf32::SHF_MERGE | elf32::SHF_STRINGS).to_le_bytes());
+    obj[at + 36..at + 40].copy_from_slice(&1u32.to_le_bytes());
+    obj
+}
+
 #[test]
-fn the_linker_on_camelot_reports_merlin_ld_errors() {
-    // Bad links: the messages merlin-ld gives, word for word. Each case is
-    // its objects' assembly, a script, and more arguments.
-    let script = "ENTRY(_start)\nSECTIONS\n{\n    . = 0x1000;\n    .text : { *(.text) }\n    .data : { *(.data) }\n}\n";
-    let start = ".text\n.globl _start\n_start: nop\n";
-    let cases: &[(&[&str], &str, &str)] = &[
+fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
+    // Links that fail, and links that succeed with a warning: what merlin-ld
+    // says, word for word, the exit status, and the file (none after an
+    // error, merlin-ld's after a warning). Each case is its inputs, a
+    // script, and more arguments.
+    let script = "ENTRY(_start)\nSECTIONS\n{\n    . = 0x1000;\n    .text : { *(.text) }\n    .rodata : { *(.rodata) }\n    .data : { *(.data) }\n}\n";
+    let start = object(".text\n.globl _start\n_start: nop\n");
+    let truncated = start[..start.len() - 50].to_vec();
+    let strings = ".rodata\n.asciz \"hello\"\n.asciz \"world\"\n";
+    let cases: Vec<(Vec<Vec<u8>>, &str, &str)> = vec![
+        // Errors.
         (
-            &[".text\n.globl _start\n_start: call missing\n    call gone\n"],
+            vec![object(
+                ".text\n.globl _start\n_start: call missing\n    call gone\n",
+            )],
             script,
             "",
         ),
-        (&[start, start], script, ""),
-        (&[start], "SECTIONS { .text 0x100 : { *(.text) } }", ""),
+        (vec![start.clone(), start.clone()], script, ""),
+        (vec![start.clone()], "SECTIONS { .text 0x100 : { *(.text) } }", ""),
         (
-            &[".text\n.globl _start\n_start: nop\n.section .extra\n.word 1\n"],
+            vec![object(
+                ".text\n.globl _start\n_start: nop\n.section .extra\n.word 1\n",
+            )],
             script,
             "",
         ),
         (
-            &[
-                ".text\n.globl _start\n_start: beq a0, a1, far\n",
-                ".text\n.zero 8192\n.globl far\nfar: nop\n",
+            vec![
+                object(".text\n.globl _start\n_start: beq a0, a1, far\n"),
+                object(".text\n.zero 8192\n.globl far\nfar: nop\n"),
             ],
             script,
             "",
         ),
-        (&[start], script, "-e nosuch"),
+        (vec![start.clone()], script, "-e nosuch"),
+        (vec![start.clone()], script, "-e 0x+10"),
         (
-            &[start],
+            vec![start.clone()],
             "SECTIONS { . = 0x1000; . = 0x10; .text : { *(.text) } x = nothere; }",
             "",
         ),
         (
-            &[".text\n.globl _start\n_start: nop\n.zero 64\n"],
+            vec![object(".text\n.globl _start\n_start: nop\n.zero 64\n")],
             "MEMORY { RAM : ORIGIN = 0x1000, LENGTH = 32 }\nSECTIONS { .text : { *(.text) } > RAM }",
             "",
         ),
         (
-            &[start],
+            vec![start.clone()],
             "SECTIONS { . = 0xfffffff0; .text : { *(.text) . += 0x20; } }",
             "",
         ),
-        (&[start], "MEMORY { a : o = 0, l = 1 b : o = 1, l = 1 }", ""),
         (
-            &[".text\n.globl _start\n_start: la a0, x\n.data\n.globl x\nx: .word _start\n"],
+            vec![start.clone()],
+            "MEMORY { a : o = 0, l = 1 b : o = 1, l = 1 }",
+            "",
+        ),
+        (
+            vec![object(
+                ".text\n.globl _start\n_start: la a0, x\n.data\n.globl x\nx: .word _start\n",
+            )],
             "SECTIONS { /DISCARD/ : { *(.data) } .text : { *(.text) } }",
+            "",
+        ),
+        (vec![b"not an object".to_vec()], script, ""),
+        (vec![start.clone(), truncated], script, ""),
+        // Warnings: no entry symbol (the first code section's address is
+        // used), and duplicate strings in mergeable sections.
+        (
+            vec![object(".text\nmain: nop\n")],
+            "SECTIONS { . = 0x1000; .text : { *(.text) } }",
+            "",
+        ),
+        (
+            vec![
+                mergeable(
+                    object(&format!("{}{strings}", ".text\n.globl _start\n_start: nop\n")),
+                    ".rodata",
+                ),
+                mergeable(object(strings), ".rodata"),
+            ],
+            script,
             "",
         ),
     ];
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut commands = Vec::new();
-    let mut wants = Vec::new();
+    // What merlin-ld says and writes for each case.
+    let mut wants: Vec<(String, Option<Vec<u8>>)> = Vec::new();
     for (k, (objects, script, extra)) in cases.iter().enumerate() {
         let mut inputs = Vec::new();
         let mut args = format!("ld -T /e/{k}.ld -o /out/{k}");
-        for (j, src) in objects.iter().enumerate() {
-            let data = merlin_as::assemble_to_elf(src).unwrap();
+        for (j, data) in objects.iter().enumerate() {
             let path = format!("/e/{k}_{j}.o");
             args.push_str(&format!(" {path}"));
             files.push((path.clone(), data.clone()));
-            inputs.push(merlin_ld::Input { name: path, data });
+            inputs.push(merlin_ld::Input {
+                name: path,
+                data: data.clone(),
+            });
         }
         files.push((format!("/e/{k}.ld"), script.as_bytes().to_vec()));
         let mut opts = merlin_ld::Options {
@@ -530,24 +592,42 @@ fn the_linker_on_camelot_reports_merlin_ld_errors() {
         };
         if let Some(e) = extra.strip_prefix("-e ") {
             opts.entry = Some(e.to_string());
-        }
-        if !extra.is_empty() {
             args.push_str(&format!(" {extra}"));
         }
-        let errors = merlin_ld::link(&inputs, &opts).unwrap_err();
-        wants.push(
-            errors
-                .iter()
-                .map(|e| format!("ld: error: {e}\n"))
-                .collect::<String>(),
-        );
+        wants.push(match merlin_ld::link(&inputs, &opts) {
+            Ok(linked) => {
+                assert!(!linked.layout.warnings.is_empty(), "case {k} links cleanly");
+                let said = linked
+                    .layout
+                    .warnings
+                    .iter()
+                    .map(|w| format!("ld: warning: {w}\n"));
+                (said.collect(), Some(linked.elf))
+            }
+            Err(errors) => (errors.iter().map(|e| format!("ld: error: {e}\n")).collect(), None),
+        });
         commands.push(args);
     }
     let input = format!("{}\nexit 0\n", commands.join("\n"));
-    let (out, _) = boot(image_of(&["ld"], &["/e"], &files), &input, 2_000_000_000);
-    for (k, want) in wants.iter().enumerate() {
-        let got = shell_output(&out, &commands[k]);
-        let got = got.split("ld: exit").next().unwrap();
-        assert_eq!(got.replace("\r", ""), *want, "case {k}: {:?}", cases[k]);
+    let (out, disk) = boot(image_of(&["ld"], &["/e"], &files), &input, 2_000_000_000);
+    let fs = Fs::open(&disk).unwrap();
+    for (k, (said, elf)) in wants.iter().enumerate() {
+        let got = shell_output(&out, &commands[k]).replace("\r", "");
+        let written = fs.read_file(&format!("/out/{k}")).ok();
+        match elf {
+            // An error: the messages, exit status 1, and no file.
+            None => {
+                assert_eq!(got, format!("{said}ld: exit 1\n"), "case {k}: {}", commands[k]);
+                assert!(written.is_none(), "case {k} wrote /out/{k}");
+            }
+            // A warning: the messages, success, and merlin-ld's file.
+            Some(elf) => {
+                assert_eq!(got, *said, "case {k}: {}", commands[k]);
+                assert!(
+                    written.as_ref() == Some(elf),
+                    "case {k}: /out/{k} is not merlin-ld's"
+                );
+            }
+        }
     }
 }

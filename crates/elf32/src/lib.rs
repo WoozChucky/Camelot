@@ -27,12 +27,18 @@ pub const SHT_STRTAB: u32 = 3;
 pub const SHT_RELA: u32 = 4;
 pub const SHT_NOBITS: u32 = 8;
 pub const SHT_REL: u32 = 9;
+pub const SHT_GROUP: u32 = 17;
+pub const SHT_SYMTAB_SHNDX: u32 = 18;
 
 // Section flags.
 pub const SHF_WRITE: u32 = 0x1;
 pub const SHF_ALLOC: u32 = 0x2;
 pub const SHF_EXECINSTR: u32 = 0x4;
+pub const SHF_MERGE: u32 = 0x10;
+pub const SHF_STRINGS: u32 = 0x20;
 pub const SHF_INFO_LINK: u32 = 0x40;
+pub const SHF_GROUP: u32 = 0x200;
+pub const SHF_TLS: u32 = 0x400;
 
 // Special section indices.
 pub const SHN_UNDEF: u16 = 0;

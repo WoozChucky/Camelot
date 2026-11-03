@@ -29,7 +29,10 @@ const char *reloc_type_name(uint type) {
             return RELOC_NAMES[i].name;
         }
     }
-    return fmt("relocation type %u", type);
+    /* One message uses one name at a time: a static buffer will do. */
+    static char unknown[32];
+    snprintf(unknown, sizeof unknown, "relocation type %u", type);
+    return unknown;
 }
 
 /* ---- Instruction fields (spec section 3): each keeps the other bits ---- */

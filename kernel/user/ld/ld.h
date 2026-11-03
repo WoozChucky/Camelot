@@ -86,37 +86,8 @@ int umap_get(struct uintmap *m, uint key, int *value);
 void umap_put(struct uintmap *m, uint key, int value);
 
 /* ---- Objects (object.c) ---- */
-#define SHT_NULL 0
-#define SHT_PROGBITS 1
-#define SHT_SYMTAB 2
-#define SHT_STRTAB 3
-#define SHT_RELA 4
-#define SHT_NOBITS 8
-#define SHT_REL 9
-#define SHT_GROUP 17
-#define SHT_SYMTAB_SHNDX 18
-
-#define SHF_WRITE 0x1
-#define SHF_ALLOC 0x2
-#define SHF_EXECINSTR 0x4
-#define SHF_MERGE 0x10
-#define SHF_STRINGS 0x20
-#define SHF_GROUP 0x200
-#define SHF_TLS 0x400
-
-#define SHN_UNDEF 0
-#define SHN_LORESERVE 0xff00
-#define SHN_ABS 0xfff1
-#define SHN_COMMON 0xfff2
-
-#define STB_LOCAL 0
-#define STB_GLOBAL 1
-#define STB_WEAK 2
-
-#define STT_NOTYPE 0
-#define STT_SECTION 3
-#define STT_FILE 4
-#define STT_TLS 6
+/* The ELF constants (SHT_*, SHF_*, SHN_*, STB_*, STT_*) are tables.h's,
+ * generated from elf32's. */
 
 /* One Elf32_Rela. */
 struct rela {

@@ -273,7 +273,7 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
     static const uchar ident[16] = {0x7f, 'E', 'L', 'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     memcpy(out->data, ident, 16);
     uint e[9];
-    e[0] = 2 | 243 << 16; /* e_type ET_EXEC, e_machine EM_RISCV */
+    e[0] = ET_EXEC | EM_RISCV << 16; /* e_type, e_machine */
     e[1] = 1;             /* e_version */
     e[2] = l->entry;
     e[3] = nsegs == 0 ? 0 : phoff;

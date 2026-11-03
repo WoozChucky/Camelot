@@ -251,6 +251,10 @@ pub fn parse_number(w: &str) -> Option<i64> {
         _ => (w, 1),
     };
     let v = if let Some(h) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        // Digits only: from_str_radix would take a sign too (`-e 0x+10`).
+        if h.is_empty() || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
         i64::from_str_radix(h, 16).ok()?
     } else if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
         digits.parse::<i64>().ok()?
@@ -847,6 +851,10 @@ mod tests {
         assert_eq!(parse_number("0x10K"), Some(16 * 1024));
         assert_eq!(parse_number("12a"), None);
         assert_eq!(parse_number("K"), None);
+        // No sign after 0x (an -e argument can have one; script words can't).
+        assert_eq!(parse_number("0x+10"), None);
+        assert_eq!(parse_number("0x-10"), None);
+        assert_eq!(parse_number("0x"), None);
     }
 
     #[test]
