@@ -153,6 +153,21 @@ mod tests {
         assert_eq!(s.show(0x1000), "0x00001000");
     }
 
+    /// merlin-dbg debugs RV32 programs: an RV64 one (ELF64) is refused, for
+    /// its symbols and its line tables, not read with its addresses cut.
+    #[test]
+    fn elf64_programs_are_refused() {
+        let rv64 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../elf/tests/llvm/rv64/prog.elf"
+        ))
+        .unwrap();
+        let want = Err("ELF64 (RV64) programs are not supported yet".to_string());
+        assert_eq!(Symbols::from_elf(&rv64).map(|_| ()), want);
+        let mut lines = crate::source::Lines::default();
+        assert_eq!(lines.add_elf(&rv64), want);
+    }
+
     #[test]
     fn sized_symbols_end() {
         let file = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernel/kernel.elf")).unwrap();

@@ -119,6 +119,26 @@ mod tests {
         out
     }
 
+    /// Grail's harts are RV32: an RV64 program (ELF64) is refused, not read
+    /// with its addresses cut to 32 bits.
+    #[test]
+    fn elf64_programs_are_refused() {
+        let rv64 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../elf/tests/llvm/rv64/prog.elf"
+        ))
+        .unwrap();
+        let err = parse(&rv64).err().expect("refused");
+        assert_eq!(err.0, "ELF64 (RV64) programs are not supported yet");
+        // Its RV32 twin loads.
+        let rv32 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../elf/tests/llvm/rv32/prog.elf"
+        ))
+        .unwrap();
+        assert!(parse(&rv32).is_ok());
+    }
+
     #[test]
     fn a_global_symbol_wins_over_a_local_of_the_same_name() {
         // A `static void start(...)` in one file and the global `start` in

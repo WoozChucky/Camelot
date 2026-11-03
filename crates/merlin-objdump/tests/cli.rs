@@ -78,6 +78,29 @@ fn errors_and_exit_codes() {
     assert!(out.contains("start address: 0x80000000"));
 }
 
+#[test]
+fn elf64_files_are_refused() {
+    // merlin-objdump prints 32-bit addresses: an RV64 file is an error, not
+    // a listing with its addresses cut short.
+    let (code, out, err) = objdump(&[
+        "-d",
+        "crates/elf/tests/llvm/rv64/prog.elf",
+        "crates/elf/tests/llvm/rv32/prog.elf",
+    ]);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains(
+            "error: 'crates/elf/tests/llvm/rv64/prog.elf': bad ELF: ELF64 (RV64) is not supported yet"
+        ),
+        "{err}"
+    );
+    assert!(!out.contains("rv64/prog.elf"), "{out}");
+    assert!(
+        out.contains("rv32/prog.elf:	file format elf32-littleriscv"),
+        "{out}"
+    );
+}
+
 fn fixtures() -> Vec<PathBuf> {
     let mut files = vec![root().join("examples/hello/hello.elf")];
     for f in ["hello.elf", "hello.o", "isa.o", "relocs.o"] {
