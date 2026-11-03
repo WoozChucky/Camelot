@@ -1294,7 +1294,7 @@ mod tests {
             (r#"{"name": "a", "program": "A"}"#, "program: not base64"),
             (
                 r#"{"name": "a", "program": "AA==", "ram": "0"}"#,
-                "ram: 0 MiB is out of range",
+                "ram: 0 is out of range",
             ),
             (
                 r#"{"name": "a", "program": "AA==", "ram": 64}"#,

@@ -11,7 +11,9 @@
 use avalon_proto::{
     DeviceEntry, DeviceSpec, DiskSpec, HardwareProfile, KeyEvent, Message, NetSpec, PIXEL_FORMAT_XRGB8888,
 };
-use grail::config::{DiskSource, NetSource, DEFAULT_NOMINAL_HZ, MAX_HARTS, MAX_RAM_SIZE, MIB};
+use grail::config::{
+    DiskSource, NetSource, DEFAULT_NOMINAL_HZ, MAX_HARTS, MAX_RAM_SIZE, MAX_RAM_SIZE_RV32, MIB,
+};
 use grail::net::{Hub, MacAddr};
 use grail::{DiskConfig, MachineConfig, NetConfig};
 
@@ -166,7 +168,9 @@ fn configs_survive_the_wire() {
     let configs = [
         MachineConfig::default(),
         MachineConfig::with_ram(MIB),
-        MachineConfig::with_ram(MAX_RAM_SIZE),
+        // The protocol has no width (#158): its VMs are RV32 unless their program is
+        // ELF64, so the most a profile on its own takes is RV32's.
+        MachineConfig::with_ram(MAX_RAM_SIZE_RV32),
         MachineConfig {
             ram_size: 64 * MIB,
             clock_hz: Some(2_000_000),
@@ -239,6 +243,7 @@ fn invalid_profiles_decode_and_are_left_to_the_server() {
     for bad in [
         HardwareProfile::with_ram(0),
         HardwareProfile::with_ram(4095),
+        HardwareProfile::with_ram(MAX_RAM_SIZE_RV32 as u64 + 4096),
         HardwareProfile::with_ram(MAX_RAM_SIZE as u64 + 4096),
         HardwareProfile::with_ram(u64::MAX),
         HardwareProfile {

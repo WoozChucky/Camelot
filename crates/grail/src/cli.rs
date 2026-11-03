@@ -5,7 +5,7 @@
 use crate::config::DiskSource;
 use crate::net::Hub;
 use crate::{
-    parse_clock, parse_harts, parse_ram_mib, parse_xlen, DiskConfig, Machine, MachineConfig, NetConfig,
+    parse_clock, parse_harts, parse_ram_size, parse_xlen, DiskConfig, Machine, MachineConfig, NetConfig,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -19,7 +19,10 @@ for the Camelot kernel (spec section 7, \"Boot from disk\").
   --trace         print every instruction before it runs (with its hart's
                   number, h0, h1, ..., on a machine of several harts)
   --max-steps N   stop after N steps (exit code 124)
-  --ram MiB       RAM size in MiB, 1 to 2048 (default 4)
+  --ram SIZE      RAM size: MiB, or a number with a unit, M/MiB or G/GiB, any
+                  case (--ram 64, --ram 64M, --ram 16G); 1 MiB to 1 TiB, RV32 at
+                  most 2 GiB (default 4 MiB). Backed lazily: the host pays for
+                  what the guest touches
   --clock FREQ    real time: run FREQ instructions per second, and mtime ticks at FREQ.
                   FREQ is a number with an optional unit, Hz, kHz or MHz (any case;
                   no unit = Hz); fractions are fine if the result is whole Hz:
@@ -133,7 +136,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, Error> {
                     .map_err(|_| bad(format!("--max-steps: '{s}' is not a number")))?;
                 o.max_steps = Some(n);
             }
-            "--ram" => config.ram_size = parsed("--ram", value("--ram")?, parse_ram_mib)?,
+            "--ram" => config.ram_size = parsed("--ram", value("--ram")?, parse_ram_size)?,
             "--clock" => config.clock_hz = Some(parsed("--clock", value("--clock")?, parse_clock)?),
             "--harts" => config.harts = parsed("--harts", value("--harts")?, parse_harts)?,
             "--xlen" => config.xlen = parsed("--xlen", value("--xlen")?, parse_xlen)?,
@@ -202,6 +205,11 @@ impl Options {
             None => None,
         };
         let shown = self.shown();
+        // An ELF64 program makes the machine RV64 (`Machine::load_elf`): it is built
+        // so from the start, so that its RAM is checked against RV64's limit.
+        if let Some(crate::Xlen::Rv64) = file.as_deref().and_then(crate::elf::class) {
+            self.config.xlen = crate::Xlen::Rv64;
+        }
         let mut m = Machine::new(std::mem::take(&mut self.config))?;
         match &file {
             Some(file) => m.load_elf(file),
@@ -227,6 +235,53 @@ mod tests {
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    /// The smallest ELF64 RISC-V program: one `PT_LOAD` segment at the start of RAM
+    /// holding `j .`, its entry.
+    fn tiny_elf64() -> Vec<u8> {
+        let code = 0x0000_006fu32.to_le_bytes(); // j .
+        let mut f = vec![0u8; 64 + 56];
+        f[..16].copy_from_slice(b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0");
+        f[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        f[18..20].copy_from_slice(&243u16.to_le_bytes()); // EM_RISCV
+        f[20..24].copy_from_slice(&1u32.to_le_bytes());
+        f[24..32].copy_from_slice(&0x8000_0000u64.to_le_bytes()); // e_entry
+        f[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        f[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        f[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        f[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        f[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        let ph = &mut f[64..];
+        ph[..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        ph[4..8].copy_from_slice(&5u32.to_le_bytes()); // R + X
+        ph[8..16].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+        ph[16..24].copy_from_slice(&0x8000_0000u64.to_le_bytes()); // p_vaddr
+        ph[24..32].copy_from_slice(&0x8000_0000u64.to_le_bytes()); // p_paddr
+        ph[32..40].copy_from_slice(&4u64.to_le_bytes()); // p_filesz
+        ph[40..48].copy_from_slice(&4u64.to_le_bytes()); // p_memsz
+        ph[48..56].copy_from_slice(&4u64.to_le_bytes()); // p_align
+        f.extend_from_slice(&code);
+        f
+    }
+
+    #[test]
+    fn an_elf64_program_gets_an_rv64_machine_and_its_ram() {
+        // 16 GiB is past RV32's 2 GiB: the machine is built RV64 from the start, as
+        // the program's class says, and its RAM reserved (lazily: this costs nothing).
+        let path = std::env::temp_dir().join(format!("grail-cli-{}.elf", std::process::id()));
+        std::fs::write(&path, tiny_elf64()).unwrap();
+        let file = path.to_str().unwrap().to_string();
+        let mut o = parse(vec!["--ram".into(), "16G".into(), file.clone()]).unwrap();
+        let m = o.machine().unwrap();
+        assert_eq!(m.config().xlen, crate::Xlen::Rv64);
+        assert_eq!(m.cpu.bus.ram.len(), 16 << 30);
+        // (An RV32 program with that much is refused: tests/machine.rs.)
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(crate::elf::class(b"\x7fELF\x01"), Some(crate::Xlen::Rv32));
+        assert_eq!(crate::elf::class(b"\x7fELF\x02"), Some(crate::Xlen::Rv64));
+        assert_eq!(crate::elf::class(b"\x7fELF\x03"), None);
+        assert_eq!(crate::elf::class(b"MZ"), None);
     }
 
     #[test]

@@ -519,7 +519,8 @@ impl Shared {
     /// other request.
     fn create(&self, name: String, profile: HardwareProfile, program: &[u8]) -> Result<u32, Fail> {
         validate_name(&name).map_err(|e| Fail::new(ErrorCode::InvalidName, e))?;
-        let config = machine_config(&profile).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
+        let config =
+            machine_config(&profile, program).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
         let cards = card_configs(&name, &profile).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
         // Checked again when the cards are plugged in, in case a switch is deleted
         // meanwhile; this saves building a machine that cannot be plugged in.

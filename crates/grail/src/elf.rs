@@ -28,6 +28,18 @@ pub struct Elf {
     pub symbols: Vec<(String, u64)>,
 }
 
+/// The width `file` is for, from its ELF header's class alone (`EI_CLASS`): RV64 for
+/// ELF64, RV32 for ELF32; `None` if it is not an ELF file of either class. Front ends
+/// read it before they build a machine for the program, so that the machine is checked
+/// against its width's limits (RAM) from the start; [`parse`] checks the rest.
+pub fn class(file: &[u8]) -> Option<Xlen> {
+    match file {
+        [0x7f, b'E', b'L', b'F', 1, ..] => Some(Xlen::Rv32),
+        [0x7f, b'E', b'L', b'F', 2, ..] => Some(Xlen::Rv64),
+        _ => None,
+    }
+}
+
 pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
     let elf = elf::Elf::parse(file)?;
     let xlen = match elf.class {

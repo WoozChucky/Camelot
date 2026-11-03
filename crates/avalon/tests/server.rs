@@ -69,7 +69,7 @@ fn two_vms_with_their_own_profiles() {
     assert_eq!(details.vm.profile, profile(32, Some(5_000_000)));
     assert_eq!(details.vm.state, VmState::Exited(0));
     assert_eq!(details.vm.name, "paced");
-    let config = avalon::machine_config(&details.vm.profile).unwrap();
+    let config = avalon::machine_config(&details.vm.profile, &[]).unwrap();
     let expected: Vec<DeviceEntry> = grail::bus::device_table(&config, 0)
         .iter()
         .map(|d| DeviceEntry {

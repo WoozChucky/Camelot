@@ -55,7 +55,9 @@ VM commands, sent to Avalon:
 create options:
   --name NAME     the VM's name (required): 1 to 64 lowercase letters,
                   digits, '.', '_' and '-', not all digits
-  --ram MiB       RAM size in MiB, 1 to 2048 (default 4)
+  --ram SIZE      RAM size: MiB, or a number with a unit, M/MiB or G/GiB
+                  (--ram 64, --ram 16G); 1 MiB to 1 TiB, an RV32 VM at most
+                  2 GiB (default 4 MiB)
   --clock FREQ    real time: run FREQ instructions per second. FREQ is a
                   number with an optional unit, Hz, kHz or MHz: 10MHz, 500kHz,
                   1.5MHz, 5Hz. Without it the VM runs at full speed and
@@ -1218,9 +1220,7 @@ mod tests {
         assert_eq!(c.profile.ram_size, 4 << 20);
         assert_eq!(avalon_proto::DEFAULT_RAM_SIZE, 4 << 20);
         let mib = avalon_proto::DEFAULT_RAM_SIZE >> 20;
-        assert!(USAGE.contains(&format!(
-            "--ram MiB       RAM size in MiB, 1 to 2048 (default {mib})\n"
-        )));
+        assert!(USAGE.contains(&format!("2 GiB (default {mib} MiB)\n")));
         assert!(!c.start);
         // No program: the VM boots from its disk.
         let Command::Create(c) = command("create --name os --disk root.img") else {
@@ -1322,10 +1322,10 @@ mod tests {
             ("create a.elf --name a --size 1M", "'create' does not take --size"),
             ("create a.elf --name Web", "--name: 'Web' is not a valid name"),
             ("create a.elf --name 42", "--name: '42' is not a valid name"),
-            ("create a.elf --name a --ram 0", "--ram: 0 MiB is out of range"),
+            ("create a.elf --name a --ram 0", "--ram: 0 is out of range"),
             (
-                "create a.elf --name a --ram 64MiB",
-                "--ram: '64MiB' is not a whole number of MiB",
+                "create a.elf --name a --ram 64MB",
+                "--ram: '64MB' is not a RAM size",
             ),
             (
                 "create a.elf --name a --clock fast",

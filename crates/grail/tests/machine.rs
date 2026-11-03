@@ -425,13 +425,12 @@ fn cli_rejects_bad_ram_and_clock_values() {
     for (args, message) in [
         (
             &["--ram", "0", elf][..],
-            "--ram: 0 MiB is out of range (1 to 2048 MiB)",
+            "--ram: 0 is out of range (1 MiB to 1 TiB)",
         ),
-        (&["--ram", "2049", elf], "--ram: 2049 MiB is out of range"),
-        (
-            &["--ram", "lots", elf],
-            "--ram: 'lots' is not a whole number of MiB",
-        ),
+        (&["--ram", "1025G", elf], "--ram: 1025G is out of range"),
+        (&["--ram", "lots", elf], "--ram: 'lots' is not a RAM size"),
+        // An RV32 program's machine has at most 2 GiB.
+        (&["--ram", "4G", elf], "an RV32 machine has at most 2 GiB"),
         (
             &["--clock", "0", elf],
             "--clock: the clock must be faster than 0 Hz",
@@ -516,8 +515,9 @@ fn usage_documents_clock_and_its_units() {
         "--clock FREQ",
         "Hz, kHz or MHz",
         "--clock 1.5MHz",
-        "--ram MiB",
-        "1 to 2048",
+        "--ram SIZE",
+        "1 MiB to 1 TiB",
+        "--ram 16G",
         "--harts N",
     ] {
         assert!(usage.contains(text), "usage lacks {text:?}:\n{usage}");
@@ -526,7 +526,7 @@ fn usage_documents_clock_and_its_units() {
     assert_eq!(grail::DEFAULT_RAM_SIZE, 4 << 20);
     assert_eq!(grail::MachineConfig::default().ram_size, grail::DEFAULT_RAM_SIZE);
     assert!(
-        usage.contains("--ram MiB       RAM size in MiB, 1 to 2048 (default 4)\n"),
+        usage.contains("most 2 GiB (default 4 MiB). Backed lazily"),
         "{usage}"
     );
 }

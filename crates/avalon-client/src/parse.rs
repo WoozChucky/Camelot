@@ -9,10 +9,11 @@ use std::net::{IpAddr, SocketAddr};
 /// case; no unit = Hz), as Grail's `--clock` does: `10MHz`, `500kHz`, `1.5MHz`, `5Hz`.
 pub use grail::parse_clock;
 
-/// Parses a `--ram` value, a whole number of MiB from 1 to 2048 (Grail's `--ram`).
-/// Returns bytes.
+/// Parses a `--ram` value as Grail's `--ram` does: MiB, or a number with a unit,
+/// `M`/`MiB` or `G`/`GiB` in any case, 1 MiB to 1 TiB (an RV32 VM, which every VM is
+/// until its program is ELF64, takes at most 2 GiB: the server says so). Returns bytes.
 pub fn parse_ram(s: &str) -> Result<u64, String> {
-    grail::parse_ram_mib(s).map(|bytes| bytes as u64)
+    grail::parse_ram_size(s).map(|bytes| bytes as u64)
 }
 
 /// Parses a `--harts` value, a whole number from 1 to 8 (Grail's `--harts`).
@@ -274,9 +275,12 @@ mod tests {
     fn ram_and_clock_are_grails() {
         assert_eq!(parse_ram("64"), Ok(64 << 20));
         assert_eq!(parse_ram("2048"), Ok(2048 << 20));
+        assert_eq!(parse_ram("64MiB"), Ok(64 << 20));
+        assert_eq!(parse_ram("16G"), Ok(16 << 30));
+        assert_eq!(parse_ram("1024GiB"), Ok(1 << 40));
         assert!(parse_ram("0").is_err());
-        assert!(parse_ram("2049").is_err());
-        assert!(parse_ram("64MiB").is_err());
+        assert!(parse_ram("1025G").is_err());
+        assert!(parse_ram("64MB").is_err());
         assert_eq!(parse_clock("10MHz"), Ok(10_000_000));
         assert_eq!(parse_clock("1.5mhz"), Ok(1_500_000));
         assert!(parse_clock("0").is_err());

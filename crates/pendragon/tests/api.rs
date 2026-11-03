@@ -585,14 +585,25 @@ fn create_options_and_refusals() {
             422,
             Some("invalid hardware profile"),
         ),
+        // Past 1 TiB: not a size at all.
+        (
+            vec![
+                ("name", "x".into()),
+                ("ram", "1025G".into()),
+                ("program", program("hello")),
+            ],
+            400,
+            None,
+        ),
+        // 4 GiB is a size, but more than an RV32 VM (an ELF32 program's) takes.
         (
             vec![
                 ("name", "x".into()),
                 ("ram", "4096".into()),
                 ("program", program("hello")),
             ],
-            400,
-            None,
+            422,
+            Some("invalid hardware profile"),
         ),
         (
             vec![
