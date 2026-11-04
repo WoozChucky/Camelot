@@ -266,21 +266,123 @@ impl CursorPlane<'_> {
         Some(&self.pixels[at..at + 4])
     }
 
+    /// The part of a `width` × `height` frame the image covers: columns `left..right`
+    /// of rows `top..bottom`, empty when it is wholly off the frame.
+    fn covers(&self, width: u32, height: u32) -> Covered {
+        let clamp = |at: i64, size: u32| at.clamp(0, i64::from(size)) as u32;
+        Covered {
+            left: clamp(i64::from(self.x), width),
+            right: clamp(i64::from(self.x) + i64::from(self.width), width),
+            top: clamp(i64::from(self.y), height),
+            bottom: clamp(i64::from(self.y) + i64::from(self.height), height),
+        }
+    }
+
     /// Blends the cursor over `dst`, a `width` × `height` XRGB8888 frame (rows packed,
     /// top row first), with OVER on premultiplied alpha ([`blend_pixel`]), as KMS's
     /// default blend mode ("Pre-multiplied") and pixman do. What of the image is off the
     /// frame is left out.
     pub fn blend_into(&self, dst: &mut [u8], width: u32, height: u32) {
-        let left = i64::from(self.x).clamp(0, i64::from(width)) as u32;
-        let right = (i64::from(self.x) + i64::from(self.width)).clamp(0, i64::from(width)) as u32;
-        let top = i64::from(self.y).clamp(0, i64::from(height)) as u32;
-        let bottom = (i64::from(self.y) + i64::from(self.height)).clamp(0, i64::from(height)) as u32;
+        let Covered {
+            left,
+            right,
+            top,
+            bottom,
+        } = self.covers(width, height);
         for fy in top..bottom {
             for fx in left..right {
                 let src = self.source(fx, fy).expect("inside the image");
                 let at = (fy as usize * width as usize + fx as usize) * 4;
                 blend_pixel(&mut dst[at..at + 4], src);
             }
+        }
+    }
+}
+
+/// Columns `left..right` of rows `top..bottom` of a frame: what a cursor covers of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Covered {
+    left: u32,
+    right: u32,
+    top: u32,
+    bottom: u32,
+}
+
+/// A host's picture of the display, the cursor blended over the frame, kept from one
+/// drawing to the next (Grail's window, and Herald's, which is the same window), as a
+/// compositor keeps its output. Drawing a frame with a cursor over it then allocates
+/// nothing once the frame's size is known, and a drawing for a change of the cursor
+/// alone (it moved, took another image or went) touches only the rectangle it covered,
+/// restored from the frame, and the one it covers now, blended again. A frame with no
+/// cursor over it is shown as it is, not copied.
+#[derive(Debug, Default)]
+pub struct Composite {
+    /// The picture, `width * 4` bytes a row, while `kept`.
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    /// `pixels` is the picture last drawn, which a change of the cursor alone can start
+    /// from: false until a frame with a cursor over it is drawn, and after a frame with
+    /// none (shown as it is) or a disabled display.
+    kept: bool,
+    /// What the cursor covers of `pixels`.
+    cursor: Option<Covered>,
+}
+
+impl Composite {
+    pub fn new() -> Composite {
+        Composite::default()
+    }
+
+    /// The whole picture of `frame`, whose pixels may have changed anywhere: its pixels
+    /// with the cursor blended over them (the pixels themselves when no cursor shows).
+    /// `None` while the display is disabled: black.
+    pub fn draw<'a>(&'a mut self, frame: &Frame<'a>) -> Option<&'a [u8]> {
+        self.kept = false;
+        let pixels = frame.pixels?;
+        if frame.cursor.is_none() {
+            return Some(pixels);
+        }
+        self.pixels.clear();
+        self.pixels.extend_from_slice(pixels);
+        (self.width, self.height, self.kept, self.cursor) = (frame.width, frame.height, true, None);
+        self.blend(frame);
+        Some(&self.pixels)
+    }
+
+    /// The picture after a change of the cursor alone since the last drawing: the
+    /// rectangle it covered is restored from `frame`, it is blended where it is now, and
+    /// the rest is the picture of the last drawing. So `frame` is that drawing's frame,
+    /// or a newer one that a full drawing ([`Composite::draw`]) shows soon, as Grail's
+    /// window draws in full every 16 ms. With nothing kept to start from (no cursor
+    /// showed, or the frame has another size now), it is a full drawing.
+    pub fn draw_cursor<'a>(&'a mut self, frame: &Frame<'a>) -> Option<&'a [u8]> {
+        let pixels = frame.pixels?;
+        if !self.kept || (self.width, self.height) != (frame.width, frame.height) {
+            return self.draw(frame);
+        }
+        let row = frame.width as usize * 4;
+        if let Some(Covered {
+            left,
+            right,
+            top,
+            bottom,
+        }) = self.cursor.take()
+        {
+            for y in top as usize..bottom as usize {
+                let span = y * row + left as usize * 4..y * row + right as usize * 4;
+                self.pixels[span.clone()].copy_from_slice(&pixels[span]);
+            }
+        }
+        self.blend(frame);
+        Some(&self.pixels)
+    }
+
+    /// Blends `frame`'s cursor, if it shows, over the picture, and notes what it covers.
+    fn blend(&mut self, frame: &Frame) {
+        if let Some(cursor) = &frame.cursor {
+            cursor.blend_into(&mut self.pixels, frame.width, frame.height);
+            self.cursor = Some(cursor.covers(frame.width, frame.height));
         }
     }
 }
@@ -1553,6 +1655,72 @@ mod tests {
         fb.ctrl = 0;
         let frame = fb.frame(&ram);
         assert_eq!((frame.pixels, frame.cursor), (None, None));
+    }
+
+    /// The kept picture: a full drawing is the composited frame; a change of the cursor
+    /// alone (a move, another image, one off an edge or the frame, hiding it) gives what
+    /// a full drawing of the new frame would; a frame with no cursor is not copied; a new
+    /// size is drawn whole, and a display that is off is black.
+    #[test]
+    fn a_composite_redraws_only_the_cursor() {
+        let (width, height) = (16u32, 8u32);
+        let pixels: Vec<u8> = (0..width * height * 4).map(|i| (i * 7) as u8).collect();
+        let image_a = [0xffu8; 4 * 4 * 4];
+        let image_b: Vec<u8> = (0..3 * 2 * 4).map(|i| [0x40, 0, 0x20, 0x80][i % 4]).collect();
+        let cursor = |x, y, w, h, pixels| CursorPlane {
+            x,
+            y,
+            width: w,
+            height: h,
+            hot_x: 0,
+            hot_y: 0,
+            pixels,
+        };
+        let frame = |cursor, pixels| Frame {
+            width,
+            height,
+            pixels: Some(pixels),
+            cursor,
+        };
+        let full = |f: &Frame| f.composited().unwrap().into_owned();
+        let mut composite = Composite::new();
+        let shown = frame(Some(cursor(2, 1, 4, 4, &image_a[..])), &pixels[..]);
+        assert_eq!(composite.draw(&shown).unwrap(), full(&shown));
+        for next in [
+            Some(cursor(9, 3, 4, 4, &image_a[..])),
+            Some(cursor(9, 3, 3, 2, &image_b[..])),
+            Some(cursor(-2, -1, 4, 4, &image_a[..])),
+            Some(cursor(14, 7, 3, 2, &image_b[..])),
+            Some(cursor(40, 40, 4, 4, &image_a[..])),
+            None,
+            Some(cursor(5, 5, 3, 2, &image_b[..])),
+        ] {
+            let next = frame(next, &pixels[..]);
+            let want = full(&next);
+            assert_eq!(composite.draw_cursor(&next).unwrap(), want, "{:?}", next.cursor);
+        }
+        // No cursor: the frame itself, not a copy; a cursor that shows again then starts
+        // from the whole frame.
+        let bare = frame(None, &pixels[..]);
+        assert!(std::ptr::eq(composite.draw(&bare).unwrap(), &pixels[..]));
+        let back = frame(Some(cursor(0, 0, 4, 4, &image_a[..])), &pixels[..]);
+        assert_eq!(composite.draw_cursor(&back).unwrap(), full(&back));
+        // Another size: drawn whole.
+        let small = [0x33u8; 4 * 4 * 4];
+        let resized = Frame {
+            width: 4,
+            height: 4,
+            pixels: Some(&small[..]),
+            cursor: Some(cursor(1, 1, 4, 4, &image_a[..])),
+        };
+        assert_eq!(composite.draw_cursor(&resized).unwrap(), full(&resized));
+        // The display off: black.
+        let off = Frame {
+            pixels: None,
+            cursor: None,
+            ..resized
+        };
+        assert_eq!(composite.draw_cursor(&off), None);
     }
 
     /// Saturation: a pixel that is not validly premultiplied (colour above alpha) adds

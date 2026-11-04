@@ -5,9 +5,10 @@
 //! [`ScreenSession`] is the streaming layer, and knows nothing of windows: it attaches
 //! over an Avalon [`Connection`], rebuilds the VM's screen from the frames the server
 //! sends ([`Screen::apply_frame`]) and its cursor from the cursor messages
-//! ([`Cursor::apply`]), and runs one loop until the view is closed or the VM ends. Everything it needs from the window is the [`View`] trait, so the tests
-//! drive a session with a view that is a few vectors, on any platform. The Windows
-//! view is `crate::window`, Grail's own framebuffer window.
+//! ([`Cursor::apply`]), and runs one loop until the view is closed or the VM ends.
+//! Everything it needs from the window is the [`View`] trait, so the tests drive a
+//! session with a view that is a few vectors, on any platform. The Windows view is
+//! `crate::window`, Grail's own framebuffer window.
 
 use crate::{ended, out_of_step, End};
 use avalon_proto::{
@@ -53,6 +54,15 @@ pub trait View {
     /// [`frame`] blends it.
     fn draw(&mut self, screen: &Screen, cursor: &Cursor);
 
+    /// Shows `cursor` over `screen` after a change of the cursor alone since the last
+    /// drawing (it moved, took another image or went; the screen is the same): a view
+    /// that keeps its picture redraws only where the cursor was and is, as Grail's
+    /// window does ([`grail::framebuffer::Composite::draw_cursor`]). Draws in full
+    /// unless the view says otherwise.
+    fn draw_cursor(&mut self, screen: &Screen, cursor: &Cursor) {
+        self.draw(screen, cursor);
+    }
+
     /// The VM is now in `state`, for the view to show (in its title, say).
     fn vm_state(&mut self, _state: VmState) {}
 }
@@ -85,6 +95,8 @@ pub struct ScreenSession {
     held: Option<u8>,
     /// The screen changed since it was last drawn.
     dirty: bool,
+    /// The cursor changed since it was last drawn.
+    cursor_dirty: bool,
 }
 
 impl ScreenSession {
@@ -122,6 +134,7 @@ impl ScreenSession {
             detaching: false,
             held: None,
             dirty: true,
+            cursor_dirty: false,
         })
     }
 
@@ -147,7 +160,7 @@ impl ScreenSession {
             }
         }
         view.draw(&self.screen, &self.cursor);
-        self.dirty = false;
+        (self.dirty, self.cursor_dirty) = (false, false);
         if ended(self.vm.state) {
             return Ok(End::VmEnded(self.vm.state));
         }
@@ -210,14 +223,19 @@ impl ScreenSession {
                 .chain(std::iter::from_fn(|| events.try_recv().ok()))
             {
                 if let Some(end) = self.on_frame(frame, view)? {
-                    if self.dirty {
+                    if self.dirty || self.cursor_dirty {
                         view.draw(&self.screen, &self.cursor);
                     }
                     return Ok(end);
                 }
             }
+            // In full when the screen changed (or the view asks), else where the cursor
+            // was and is when only it changed.
+            let cursor = std::mem::take(&mut self.cursor_dirty);
             if std::mem::take(&mut self.dirty) | view.needs_redraw() {
                 view.draw(&self.screen, &self.cursor);
+            } else if cursor {
+                view.draw_cursor(&self.screen, &self.cursor);
             }
         }
     }
@@ -278,7 +296,7 @@ impl ScreenSession {
                 Ok(msg @ (Message::CursorShape { vm, .. } | Message::CursorPosition { vm, .. })),
             ) if vm == id => {
                 self.cursor.apply(&msg);
-                self.dirty = true;
+                self.cursor_dirty = true;
             }
             (Some(MessageKind::Event), Ok(Message::VmStateChanged { vm, state })) if vm == id => {
                 self.vm.state = state;

@@ -11,6 +11,7 @@ use avalon_proto::{
     Connection, Cursor, KeyEvent, Message, PointerChange, PointerMotion, Screen, VmRef, VmState, POINTER_LEFT,
 };
 use common::*;
+use grail::framebuffer::Composite;
 use herald::screen::{Input, ScreenSession, View};
 use herald::End;
 use std::sync::{Arc, Mutex};
@@ -28,9 +29,13 @@ struct ViewState {
     drawn: Option<Screen>,
     cursor: Cursor,
     draws: usize,
+    /// How many of those were for a change of the cursor alone (`View::draw_cursor`).
+    cursor_draws: usize,
     /// What the last drawing showed: the screen with the cursor blended over it, as the
-    /// window shows it (`herald::screen::frame`).
+    /// window shows it (`herald::screen::frame`, kept from one drawing to the next as
+    /// the window keeps it).
     shown: Vec<u8>,
+    composite: Composite,
     /// Ask for a redraw, as an uncovered window does.
     redraw: bool,
     /// Every state the session reported.
@@ -57,14 +62,11 @@ impl View for FakeView {
     }
 
     fn draw(&mut self, screen: &Screen, cursor: &Cursor) {
-        let mut st = self.0.lock().unwrap();
-        st.drawn = Some(screen.clone());
-        st.cursor = cursor.clone();
-        st.shown = herald::screen::frame(screen, cursor)
-            .composited()
-            .unwrap()
-            .into_owned();
-        st.draws += 1;
+        self.show(screen, cursor, false);
+    }
+
+    fn draw_cursor(&mut self, screen: &Screen, cursor: &Cursor) {
+        self.show(screen, cursor, true);
     }
 
     fn vm_state(&mut self, state: VmState) {
@@ -73,6 +75,23 @@ impl View for FakeView {
 }
 
 impl FakeView {
+    /// Draws as the window does: the whole picture, or only the cursor's part of it.
+    fn show(&self, screen: &Screen, cursor: &Cursor, cursor_only: bool) {
+        let mut st = self.0.lock().unwrap();
+        let st = &mut *st;
+        st.drawn = Some(screen.clone());
+        st.cursor = cursor.clone();
+        let frame = herald::screen::frame(screen, cursor);
+        let shown = if cursor_only {
+            st.composite.draw_cursor(&frame)
+        } else {
+            st.composite.draw(&frame)
+        };
+        st.shown = shown.unwrap().to_vec();
+        st.draws += 1;
+        st.cursor_draws += usize::from(cursor_only);
+    }
+
     fn send(&self, input: Input) {
         self.0.lock().unwrap().input.push(input);
     }
@@ -652,6 +671,10 @@ fn cursor_messages_draw_the_cursor() {
     next.send(()).unwrap();
     wait_until("the cursor moved to (3, 3)", || shown(3, 3, 4) == Some(0xff_0000));
     assert_eq!(shown(0, 2, 4), Some(0x11_1111), "gone from where it was");
+    assert!(
+        view.0.lock().unwrap().cursor_draws > 0,
+        "only the cursor's part drawn again"
+    );
     assert_eq!(
         running
             .view

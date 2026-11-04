@@ -77,6 +77,10 @@ impl View for WindowView {
         self.window.draw(frame(screen, cursor));
     }
 
+    fn draw_cursor(&mut self, screen: &Screen, cursor: &Cursor) {
+        self.window.draw_cursor(frame(screen, cursor));
+    }
+
     fn vm_state(&mut self, state: VmState) {
         match state {
             VmState::Running => self.window.set_title(&self.title),
