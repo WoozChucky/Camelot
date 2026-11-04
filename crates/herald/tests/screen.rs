@@ -261,6 +261,31 @@ fn closing_the_view_detaches() {
     server.stop().unwrap();
 }
 
+/// The input of the pump that closes the view still goes out, before the detach: a
+/// window closed with Alt+F4 sends the keys of that pump, and the releases of every key
+/// held as it went. Here the last key is the Esc that ends the guest.
+#[test]
+fn input_taken_as_the_view_closes_goes_out() {
+    let server = server();
+    let id = create(&server, "ptr", example("pointer"));
+    connect(&server)
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let running = Running::start(attach(&server, VmRef::Id(id)));
+    running.view.wait_for_pixel(320, 240, 0x203048);
+    {
+        let mut st = running.view.0.lock().unwrap();
+        st.input.push(key(0x1b));
+        st.closed = true;
+    }
+    let (end, _) = running.end();
+    assert_eq!(end.unwrap(), End::Detached);
+    wait_until("the guest to take the Esc", || {
+        state(&server, id) == VmState::Exited(0)
+    });
+    server.stop().unwrap();
+}
+
 /// Pausing is reported to the view; destroying the VM ends the session.
 #[test]
 fn pause_and_destroy() {

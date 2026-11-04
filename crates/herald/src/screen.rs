@@ -172,7 +172,12 @@ impl ScreenSession {
                         self.conn.send(&msg)?;
                     }
                 } else {
-                    // Closed: detach, and end once the server says so.
+                    // Closed: what the last pump took in goes first (the keys of
+                    // Alt+F4, and the releases of every key held as the window went),
+                    // then detach, and end once the server says so.
+                    for msg in input_messages(self.vm.id, &mut self.held, view.take_input()) {
+                        self.conn.send(&msg)?;
+                    }
                     self.conn.send(&Message::ScreenDetach { vm: self.vm.id })?;
                     self.detaching = true;
                     deadline = Some(Instant::now() + self.detach_timeout);

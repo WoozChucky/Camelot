@@ -37,7 +37,11 @@
 //!
 //! Keys and pointer changes from viewers queue here (at most [`MAX_INPUT_QUEUE`] of
 //! each) and the thread hands them to the machine's keyboard and pointer devices
-//! before its next slice, as Grail's own window does between slices.
+//! before its next slice, as Grail's own window does between slices. A viewer that
+//! goes (it detaches, or its connection ends) lets go of what it held: the VM queues
+//! a release for every key it has down and every pointer button it holds, as Linux's
+//! input core releases the keys of a keyboard that is unplugged
+//! (`input_dev_release_keys`), so a viewer closed with Alt+F4 leaves no Alt held.
 //!
 //! A VM's network cards ([`Card`]) plug into Avalon's switches. A frame queued for
 //! one of them rings the VM's bell ([`Vm::kick`]), so a machine parked in `wfi`
@@ -163,6 +167,70 @@ struct Viewer {
     /// Updates were held back from it (its queue was over [`SCREEN_BACKLOG`]): it gets a
     /// full frame once it has caught up.
     behind: bool,
+    /// The keys it has down, as their presses went to the machine, in the order they
+    /// went down: released when it goes ([`Viewer::let_go`]).
+    keys: Vec<keyboard::KeyEvent>,
+    /// The pointer buttons its last pointer change held.
+    buttons: u8,
+}
+
+impl Viewer {
+    fn new(outbox: &Arc<Outbox>) -> Viewer {
+        Viewer {
+            outbox: Arc::clone(outbox),
+            behind: false,
+            keys: Vec::new(),
+            buttons: 0,
+        }
+    }
+
+    /// Key `key` went to the machine: a press is held until its release. A key is the
+    /// physical key its usage names, or, with no usage the HID page defines, its ASCII
+    /// code; one that is neither reaches no mode and is not kept. So there are at most
+    /// as many held keys as the two tables have entries.
+    fn key(&mut self, key: keyboard::KeyEvent) {
+        let Some(id) = key_id(&key) else {
+            return;
+        };
+        let at = self.keys.iter().position(|k| key_id(k) == Some(id));
+        match (key.release, at) {
+            (false, None) => self.keys.push(key),
+            (true, Some(at)) => {
+                self.keys.remove(at);
+            }
+            // A repeat of a key held, or the release of one that was not.
+            _ => {}
+        }
+    }
+
+    /// The viewer is going: queues a release for each key it has down, in the order
+    /// they went down, with the code and usage of its press, and a pointer change that
+    /// lets go of its buttons. These go past [`MAX_INPUT_QUEUE`]: there are few of
+    /// them, and a release lost would leave the key stuck.
+    fn let_go(self, keys: &mut VecDeque<keyboard::KeyEvent>, pointer: &mut VecDeque<PointerInput>) {
+        for key in self.keys {
+            keys.push_back(keyboard::KeyEvent::release(key.code).with_usage(key.usage));
+        }
+        if self.buttons != 0 {
+            pointer.push_back(PointerInput {
+                motion: Motion::None,
+                buttons: 0,
+                wheel: 0,
+            });
+        }
+    }
+}
+
+/// Which key `key` is, for [`Viewer::key`]: its usage if the HID page defines it,
+/// otherwise 0x1_0000 plus its ASCII code if the spec's table has it.
+fn key_id(key: &keyboard::KeyEvent) -> Option<u32> {
+    if keyboard::usage::is_valid(key.usage) {
+        Some(key.usage as u32)
+    } else if keyboard::code::is_valid(key.code) {
+        Some(0x1_0000 | key.code as u32)
+    } else {
+        None
+    }
 }
 
 /// Collects what a machine writes to its UART. Only the VM's own thread touches it,
@@ -627,10 +695,7 @@ impl Vm {
         if client.event(&full) {
             match inner.viewers.iter_mut().find(|v| v.outbox.id == client.id) {
                 Some(v) => v.behind = false,
-                None => inner.viewers.push(Viewer {
-                    outbox: Arc::clone(client),
-                    behind: false,
-                }),
+                None => inner.viewers.push(Viewer::new(client)),
             }
         }
         // A paused thread that owes the screen a look takes it now.
@@ -638,12 +703,19 @@ impl Vm {
         Ok(())
     }
 
-    /// Detaches client `id` from the screen. False if it was not attached.
+    /// Detaches client `id` from the screen, releasing the keys and buttons it held.
+    /// False if it was not attached.
     pub fn detach_screen(&self, id: u64) -> bool {
         let mut inner = self.lock();
-        let before = inner.viewers.len();
-        inner.viewers.retain(|v| v.outbox.id != id);
-        inner.viewers.len() != before
+        let Some(at) = inner.viewers.iter().position(|v| v.outbox.id == id) else {
+            return false;
+        };
+        let viewer = inner.viewers.remove(at);
+        let Inner { keys, pointer, .. } = &mut *inner;
+        viewer.let_go(keys, pointer);
+        inner.kick = true;
+        self.wake.notify_all();
+        true
     }
 
     /// A key from client `id` for the keyboard device. Dropped (false) unless that
@@ -658,19 +730,36 @@ impl Vm {
             shift: key.shift,
             ctrl: key.ctrl,
         };
-        self.input_event(id, |inner| queue(&mut inner.keys, key))
+        self.input_event(id, |inner, at| {
+            let queued = queue(&mut inner.keys, key);
+            if queued {
+                inner.viewers[at].key(key);
+            }
+            queued
+        })
     }
 
     /// A pointer change from client `id` for the pointer device; dropped as
     /// [`Vm::key_input`] drops keys.
     pub fn pointer_input(&self, id: u64, change: PointerChange) -> bool {
-        self.input_event(id, |inner| queue(&mut inner.pointer, pointer_input(change)))
+        self.input_event(id, |inner, at| {
+            let queued = queue(&mut inner.pointer, pointer_input(change));
+            if queued {
+                inner.viewers[at].buttons = change.buttons;
+            }
+            queued
+        })
     }
 
-    fn input_event(&self, id: u64, push: impl FnOnce(&mut Inner) -> bool) -> bool {
+    /// Queues input from client `id` with `push`, which is given the client's place in
+    /// the viewers, if it is one and the machine can still run.
+    fn input_event(&self, id: u64, push: impl FnOnce(&mut Inner, usize) -> bool) -> bool {
         let mut inner = self.lock();
         let live = matches!(inner.state, VmState::Created | VmState::Running | VmState::Paused);
-        if inner.gone || !live || !inner.viewers.iter().any(|v| v.outbox.id == id) || !push(&mut inner) {
+        let Some(at) = inner.viewers.iter().position(|v| v.outbox.id == id) else {
+            return false;
+        };
+        if inner.gone || !live || !push(&mut inner, at) {
             return false;
         }
         inner.kick = true;
@@ -827,10 +916,18 @@ impl Vm {
             Vec::new()
         };
         let id = self.id;
-        let Inner { viewers, screen, .. } = inner;
+        let Inner {
+            viewers,
+            screen,
+            keys,
+            pointer,
+            kick,
+            ..
+        } = inner;
         let frames: Vec<Frame> = rects.iter().map(|&r| event_frame(&screen.frame(id, r))).collect();
         let mut full = None;
-        viewers.retain_mut(|v| {
+        // Whether viewer `v` stays: false once its client is gone (or cut off).
+        let mut send = |v: &mut Viewer| {
             let keeping_up = v.outbox.queued() <= SCREEN_BACKLOG;
             if v.behind {
                 if !(keeping_up || last) {
@@ -849,7 +946,16 @@ impl Vm {
             }
             // `event` is false once the client is gone (or cut off): it is dropped.
             frames.iter().all(|f| v.outbox.event(f))
-        });
+        };
+        for mut v in std::mem::take(viewers) {
+            if send(&mut v) {
+                viewers.push(v);
+            } else {
+                // Gone, as if it had detached: what it held is let go.
+                v.let_go(keys, pointer);
+                *kick = true;
+            }
+        }
     }
 
     /// New console output: into the scrollback and to every attached client.
@@ -940,6 +1046,56 @@ mod tests {
     use super::*;
     use crate::switch::Switch;
     use grail::net::MacAddr;
+
+    #[test]
+    fn a_viewer_lets_go_of_what_it_held() {
+        use keyboard::{code, usage, KeyEvent};
+        let mut v = Viewer::new(&Arc::new(Outbox::new(1, || {})));
+        let shift = KeyEvent::key_press(usage::LEFT_SHIFT);
+        let a = KeyEvent::press(b'A').with_usage(usage::A).with_shift(true);
+        let enter = KeyEvent::press(code::ENTER).with_usage(usage::ENTER);
+        let kp_enter = KeyEvent::press(code::ENTER).with_usage(usage::KP_ENTER);
+        let f1 = KeyEvent::press(code::F1); // a viewer that knows no usages
+        for key in [
+            shift,
+            a,
+            a.with_repeat(true),
+            enter,
+            kp_enter,
+            f1,
+            KeyEvent::release(code::ENTER).with_usage(usage::ENTER),
+            KeyEvent::key_release(usage::ESCAPE),  // never went down
+            KeyEvent::press(0).with_usage(0xffff), // no key of either table
+        ] {
+            v.key(key);
+        }
+        v.buttons = grail::pointer::BUTTON_LEFT;
+        let (mut keys, mut pointer) = (VecDeque::new(), VecDeque::new());
+        v.let_go(&mut keys, &mut pointer);
+        // Each held key once, in the order it went down, with no Shift or Ctrl; the
+        // keypad's Enter, which shares Enter's code, is still held.
+        assert_eq!(
+            Vec::from(keys),
+            [
+                KeyEvent::key_release(usage::LEFT_SHIFT),
+                KeyEvent::release(b'A').with_usage(usage::A),
+                KeyEvent::release(code::ENTER).with_usage(usage::KP_ENTER),
+                KeyEvent::release(code::F1),
+            ]
+        );
+        assert_eq!(
+            Vec::from(pointer),
+            [PointerInput {
+                motion: Motion::None,
+                buttons: 0,
+                wheel: 0
+            }]
+        );
+        // Nothing held, nothing to let go.
+        let (mut keys, mut pointer) = (VecDeque::new(), VecDeque::new());
+        Viewer::new(&Arc::new(Outbox::new(2, || {}))).let_go(&mut keys, &mut pointer);
+        assert!(keys.is_empty() && pointer.is_empty());
+    }
 
     #[test]
     fn scrollback_keeps_the_latest_bytes() {
