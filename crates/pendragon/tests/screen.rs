@@ -512,6 +512,9 @@ fn refused_handshakes() {
             403,
             "wrong token",
         ),
+        // The token's subprotocol counts on the screen's route only: an upgrade to
+        // another one is a request without the token.
+        (good.replace("/screen HTTP", " HTTP"), 403, "no token"),
         (
             good.replace(&format!("Origin: http://{addr}"), "Origin: http://evil.example"),
             403,
