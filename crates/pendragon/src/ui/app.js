@@ -381,7 +381,7 @@ function newVmPage(main, ctx, disk) {
     "form",
     { class: "panel" },
     field("Name", name, "lowercase letters, digits, '.', '_' and '-'"),
-    field("RAM (MiB)", ram, "1 to 2048"),
+    field("RAM", ram, "MiB, or 512M, 16G; 1 MiB to 1 TiB, an RV32 program's VM at most 2 GiB"),
     field("Clock", clock, "e.g. 10MHz, 500kHz, 5Hz; empty runs at full speed"),
     field("Harts", harts, "cores, 1 to 8; each runs at the clock"),
     boot,
