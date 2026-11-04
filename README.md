@@ -171,14 +171,16 @@ cargo run --release -p merlin-dbg -- -- examples/hello/hello.elf
 
 ```
 (merlin-dbg) break puts
-breakpoint 1 at 0x80000020 <puts>
+breakpoint 1 at 0x80000028 <puts+8>
 (merlin-dbg) continue
 breakpoint 1
-=> 0x80000020 <puts>:  lui t0, 0x10000
+=> 0x80000028 <puts+8>:  lbu t2, 0x0(t1)
 (merlin-dbg) bt
-#0  0x80000020 <puts>
+#0  0x80000028 <puts+8>
 #1  0x80000018 <_start+24>
 ```
+
+As in GDB, `break FUNC` stops past the function's prologue (here, by GDB's prologue analysis, past `li` and `mv`), and `break *FUNC` at its first instruction.
 
 It has breakpoints and watchpoints, `stepi`, `nexti` and `finish`, `regs`, `x/N`, `disas`, `bt` (by frame pointer) and `hart N`. Commands can also come from a file (`-x FILE`) or a pipe.
 
@@ -190,14 +192,14 @@ cargo run --release -p merlin-dbg -- -- kernel/kernel.elf
 
 ```
 (merlin-dbg) break kernel/main.c:273
-breakpoint 1 at 0x80017668 <kmain>: kernel/main.c:273
+breakpoint 1 at 0x8001ccb4 <kmain+16>: kernel/main.c:275
 (merlin-dbg) continue
 breakpoint 1
-=> 0x80017668 <kmain>:  addi sp, sp, -0x10
-kernel/main.c:273: int kmain(void) {
-(merlin-dbg) next
-=> 0x80017678 <kmain+16>:  auipc ra, 0x23
+=> 0x8001ccb4 <kmain+16>:  auipc ra, 0x23
 kernel/main.c:275:     cpu_init();
+(merlin-dbg) next
+=> 0x8001ccbc <kmain+24>:  auipc ra, 0x2a
+kernel/main.c:276:     uart_init();
 ```
 
 A user program's line tables are in `target/kernel/obj/user/<name>.elf` after `cargo xtask kernel`: `add-symbol-file target/kernel/obj/user/sh.elf`, then `break kernel/user/sh.c:502`.

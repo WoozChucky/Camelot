@@ -23,7 +23,7 @@ cargo run --release -p merlin-dbg -- -- examples/hello/hello.elf
 
 ```
 => 0x00001000:  auipc t0, 0x0
-(merlin-dbg) break puts
+(merlin-dbg) break *puts
 breakpoint 1 at 0x80000020 <puts>
 (merlin-dbg) continue
 breakpoint 1
@@ -225,7 +225,8 @@ Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 
 | Command | What it does |
 |---|---|
-| `break ADDR`, `b` | breakpoint at ADDR |
+| `break FUNC`, `b` | breakpoint on a function past its prologue, as GDB's `break FUNC`: see "Breakpoints on functions" |
+| `break ADDR`, `break *ADDR` | breakpoint at ADDR exactly (a `*` before a function's name, as in GDB, means its first instruction) |
 | `break FILE:LINE` | breakpoint on a source line (`kernel/main.c:273`, or `main.c:273`): see "Source lines" |
 | `watch [-r\|-a] ADDR [LEN]` | watchpoint on LEN bytes at ADDR: writes, `-r` reads, `-a` either. Without LEN, as GDB watches as many bytes as an expression's type has: the size of the symbol ADDR names in the symbol table (a C variable's, `watch total` on a `long` watches 8 bytes), at most 8, or else a register's worth (4 bytes on RV32, 8 on RV64), for an assembly label or an address |
 | `delete [N]`, `d` | deletes breakpoint or watchpoint N, or all of them |
@@ -270,6 +271,11 @@ An ADDR is any of these, optionally followed by `+N` or `-N`:
 - a register (`$sp`, `$a0`, `$x5`, `$pc`, `$mstatus`).
 
 Symbols come from the ELF symbol table (through `elf`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one, and within its section when it has none (an assembly label), as GDB's minimal symbols are: the stack past the program's last section has no name. Where GDB pads an address with zeros to the target's width, so does merlin-dbg: in backtraces (`bt`), disassembly (`disas` and the `=>` line of each stop), `finish`'s frame, the harts' pcs, and `info breakpoints`' breakpoint addresses (GDB's Address column). That is 8 digits on RV32 and 16 on RV64: `0x0000000080000024 <puts+4>`. Everywhere else, as GDB, an address has no leading zeros: `x`'s line prefixes, `breakpoint N at ADDR`, watchpoints as they are set, hit and listed (GDB shows a watchpoint's expression), `regs`' code pointers, and a read that fails (`(cannot read past 0x80400000)`). So on RV32 only addresses below 0x10000000 look different between the two, such as a user program's `breakpoint 1 at 0x3bc4 <main>`. A branch's target in an instruction is as merlin-objdump and llvm-objdump write it (`beqz t2, 0x80000048 <puts+40>`).
+
+**Breakpoints on functions.** As in GDB, `break FUNC` stops past the function's prologue, where its frame is built and its arguments are in their places, and `break *FUNC` at its first instruction. FUNC is a symbol in code (a C function, or an assembly label in `.text`); any other ADDR, a data symbol, a number or `FUNC+N`, is an exact address. Past the prologue is where GDB puts it (`skip_prologue_sal`, then `riscv_skip_prologue`):
+
+- with line information: at the function's row marked `prologue_end` (as GDB 13 and later), else at its second row, the end of its first line (`skip_prologue_using_sal`). kmain's breakpoint is at its first statement, `kernel/main.c:275`, not on line 273, its `{`;
+- without (an assembly function): by GDB's RISC-V prologue analysis (`riscv_scan_prologue`), which counts as prologue `addi` and `add` with any registers, `addiw sp, sp` and `addw s0, sp, zero`, `sw` and `sd` to `sp` or `s0`, `lui`, `auipc`, `lw` and `ld`, and ends at the first instruction of another kind, or after 100 bytes. hello's `puts` (`li t0, UART_BASE`, `mv t1, a0`, then `lbu`) is `puts+8`, the top of its loop, which every character passes: `break *puts` stops once.
 
 Each stop shows its reason, then the instruction at the pc, then its source line if the line tables have one (`kernel/main.c:275:     cpu_init();`, the text left out when the file cannot be found):
 
@@ -336,7 +342,7 @@ In each case `ra` holds the return address and `s0` is still the caller's frame 
 
 The line tables (`.debug_line`, the spec's section 10, "Debug information") map each address to a file and a line. merlin-dbg reads them from the program and from each `add-symbol-file` (`crates/merlin-dbg/src/source.rs`, through `elf::lines`). A row marked `is_stmt` starts a statement: merlin writes one before each statement, a function's first line before its prologue, a loop's condition and step, and the closing brace before the epilogue, and marks the first statement after the prologue `prologue_end`.
 
-- **`break FILE:LINE`**: FILE is the path the line table has (`kernel/main.c`) or its end after a `/` (`main.c`). The breakpoint goes at the lowest address of a statement on that line in each function that has one (a `for` line has several statements: its initialization first). A line with no code, such as a comment or a declaration without an initializer, means the next line that has some, as in gdb, and merlin-dbg says so. A function's first line is its first instruction, before the prologue; `break FUNC` is the same place.
+- **`break FILE:LINE`**: FILE is the path the line table has (`kernel/main.c`) or its end after a `/` (`main.c`). The breakpoint goes at the lowest address of a statement on that line in each function that has one (a `for` line has several statements: its initialization first). A line with no code, such as a comment or a declaration without an initializer, means the next line that has some, as in gdb, and merlin-dbg says so. A function's first line is its prologue, so a breakpoint there goes past the prologue, as `break FUNC` does (and as GDB's `skip_prologue_sal` does with a line in a function's prologue); a line further in stays where it is.
 - **`step` and `next`** run instructions until the pc is at the start of a statement on another line. A call on the way runs to its return under `next`, a temporary breakpoint as `nexti` uses. `step` follows it into the function, and stops past its prologue, at its `prologue_end` row (or its second row). A function with no line information, an assembly one, is run to its return instead, as gdb does. A return stops in the caller, on the line of the call, wherever in it the pc is. Any other stop on the way (a breakpoint, a watchpoint, another hart's) ends the command, and Ctrl-C does too. A line that never ends (`for (;;);`) is given up after a million instructions.
 - **Sources** are found by their paths in the line tables, under a `directory` first, then relative to the current directory. The kernel's are relative to the repository root (`kernel/main.c`, `kernel/user/sh.c`), so run merlin-dbg there.
 - **User programs**: the kernel embeds its programs without their line tables, and `/bin` holds them the same way; `cargo xtask kernel` writes them with their line tables to `target/kernel/obj/user/<name>.elf`. Every program runs at the same virtual addresses, so a breakpoint in one stops whichever process runs that address; telling processes apart is #121.
@@ -344,14 +350,14 @@ The line tables (`.debug_line`, the spec's section 10, "Debug information") map 
 ```
 $ cargo run -p merlin-dbg -- -- kernel/kernel.elf
 (merlin-dbg) break kernel/main.c:273
-breakpoint 1 at 0x80017668 <kmain>: kernel/main.c:273
+breakpoint 1 at 0x8001ccb4 <kmain+16>: kernel/main.c:275
 (merlin-dbg) continue
 breakpoint 1
-=> 0x80017668 <kmain>:  addi sp, sp, -0x10
-kernel/main.c:273: int kmain(void) {
-(merlin-dbg) next
-=> 0x80017678 <kmain+16>:  auipc ra, 0x23
+=> 0x8001ccb4 <kmain+16>:  auipc ra, 0x23
 kernel/main.c:275:     cpu_init();
+(merlin-dbg) next
+=> 0x8001ccbc <kmain+24>:  auipc ra, 0x2a
+kernel/main.c:276:     uart_init();
 (merlin-dbg) step
 ...
 (merlin-dbg) add-symbol-file target/kernel/obj/user/sh.elf

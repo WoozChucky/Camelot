@@ -199,6 +199,16 @@ impl Lines {
     /// `prologue_end`, else its second row (the first statement after its
     /// first line), else `start`.
     pub fn after_prologue(&self, start: u64, end: u64) -> u64 {
+        self.prologue_end(start, end).unwrap_or(start)
+    }
+
+    /// Where the line tables say the function at `start..end` is past its
+    /// prologue, as GDB finds it: its row marked `prologue_end` (GDB 13 on), else
+    /// the start of its second row (`skip_prologue_using_sal`, the end of the
+    /// function's first line). `None` when the tables have no row in it past
+    /// `start`: no line information (an assembly function), or a function all on
+    /// one line, which GDB's prologue analysis is left to.
+    pub fn prologue_end(&self, start: u64, end: u64) -> Option<u64> {
         let rows: Vec<&Row> = self
             .runs
             .iter()
@@ -206,13 +216,9 @@ impl Lines {
             .filter(|r| (start..end).contains(&r.addr))
             .collect();
         if let Some(r) = rows.iter().find(|r| r.prologue_end) {
-            return r.addr;
+            return Some(r.addr);
         }
-        rows.iter()
-            .map(|r| r.addr)
-            .filter(|&a| a > start)
-            .min()
-            .unwrap_or(start)
+        rows.iter().map(|r| r.addr).filter(|&a| a > start).min()
     }
 
     /// Where the lines of file `name` were looked for: `directory` first.

@@ -69,7 +69,7 @@
 //! interrupted program ends at the handler, or goes on with whatever `s0` held.
 
 use crate::remote::wrap;
-use excalibur::{AluOp, Inst, StoreOp, Xlen};
+use excalibur::{AluOp, Inst, LoadOp, StoreOp, Xlen};
 
 /// Registers by number.
 const RA: u8 = 1;
@@ -171,6 +171,69 @@ pub fn prologue(mem: &mut impl Memory, start: u64, xlen: Xlen) -> Option<Prologu
         }
     }
     None
+}
+
+/// How far GDB's RISC-V prologue analysis looks, in bytes (`riscv_scan_prologue`'s
+/// "arbitrary large number" when the line tables give no bound).
+const SCAN_LIMIT: u64 = 100;
+
+/// Where the function at `start` is past its prologue, by GDB's prologue analysis
+/// (`riscv_scan_prologue` in GDB's `riscv-tdep.c`), for a function with no line
+/// information: what `break FUNC` stops at then. The prologue goes on as long as
+/// the instructions are those GDB counts as one's, at most 100 bytes:
+///
+/// - `addi` (any registers: `addi sp, sp, -N`, `addi s0, sp, N`, `mv`, `li`, `nop`),
+///   and `addiw sp, sp, -N`;
+/// - `sw` and `sd` to `sp` or `s0` (saving registers);
+/// - `add` (any registers) and `addw s0, sp, zero`;
+/// - `auipc` and `lui` (an address or a constant being built);
+/// - `lw` and `ld` (any registers).
+///
+/// The first instruction of another kind is where the prologue ends: hello's
+/// `puts`, `li t0, UART_BASE` (`lui`), `mv t1, a0`, then `lbu`, so `puts+8`. An
+/// unreadable instruction gives `start`, as GDB keeps the pc it was given when the
+/// analysis fails.
+pub fn scan_prologue(mem: &mut impl Memory, start: u64, xlen: Xlen) -> u64 {
+    let mut pc = start;
+    while pc.wrapping_sub(start) < SCAN_LIMIT {
+        let Some(word) = mem.word(pc) else {
+            return start;
+        };
+        // GDB's cases, in its order.
+        let prologue = matches!(
+            excalibur::decode(word, xlen),
+            Inst::OpImm { op: AluOp::Add, .. }
+                | Inst::OpImm32 {
+                    op: AluOp::Add,
+                    rd: SP,
+                    rs1: SP,
+                    ..
+                }
+                | Inst::Store {
+                    op: StoreOp::Sw | StoreOp::Sd,
+                    rs1: SP | S0,
+                    ..
+                }
+                | Inst::Op { op: AluOp::Add, .. }
+                | Inst::Op32 {
+                    op: AluOp::Add,
+                    rd: S0,
+                    rs1: SP,
+                    rs2: 0,
+                }
+                | Inst::Auipc { .. }
+                | Inst::Lui { .. }
+                | Inst::Load {
+                    op: LoadOp::Lw | LoadOp::Ld,
+                    ..
+                }
+        );
+        if !prologue {
+            return pc;
+        }
+        pc = wrap(xlen, pc.wrapping_add(4));
+    }
+    pc
 }
 
 /// One frame of a backtrace: where its function will go on (for the innermost one,
@@ -368,6 +431,34 @@ mod tests {
     #[test]
     fn reads_rv64_prologues() {
         reads_prologues(&RV64);
+    }
+
+    /// GDB's prologue analysis, for `break FUNC` on a function without lines.
+    #[test]
+    fn scans_prologues_as_gdb() {
+        const LUI_T0: u32 = 0x100002b7; // lui t0, 0x10000 (li t0, UART_BASE)
+        const MV_T1_A0: u32 = 0x00050313; // mv t1, a0
+        const LBU_T2: u32 = 0x00034383; // lbu t2, 0x0(t1)
+        const SW_RA_A0: u32 = 0x00152023; // sw ra, 0x0(a0): not to sp or s0
+        for w in [&RV32, &RV64] {
+            let mut mem = Words::default();
+            // hello's puts: li and mv are prologue to GDB, the lbu is not.
+            asm(&mut mem, 0x100, &[LUI_T0, MV_T1_A0, LBU_T2]);
+            assert_eq!(scan_prologue(&mut mem, 0x100, w.xlen), 0x108);
+            // merlin's prologue, then a return.
+            asm(
+                &mut mem,
+                0x200,
+                &[ADDI_SP_M16, w.save_ra, w.save_s0, ADDI_S0_16, RET],
+            );
+            assert_eq!(scan_prologue(&mut mem, 0x200, w.xlen), 0x210);
+            asm(&mut mem, 0x300, &[NOP, SW_RA_A0]);
+            assert_eq!(scan_prologue(&mut mem, 0x300, w.xlen), 0x304);
+            // At most 100 bytes; and nothing to read gives the start back.
+            asm(&mut mem, 0x400, &[NOP; 30]);
+            assert_eq!(scan_prologue(&mut mem, 0x400, w.xlen), 0x464);
+            assert_eq!(scan_prologue(&mut mem, 0x900, w.xlen), 0x900);
+        }
     }
 
     /// Saves of the other width do not count: on RV64 a `sw ra` keeps half of it.

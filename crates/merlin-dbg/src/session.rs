@@ -64,7 +64,8 @@ type Result<T> = std::result::Result<T, String>;
 type Halt = (usize, Option<(Watch, u64)>, u8);
 
 const HELP: &str = "\
-break|b ADDR            set a breakpoint (ADDR: 0x80000000, 1234, main, main+8, $ra)
+break|b FUNC            set a breakpoint on FUNC past its prologue (break *FUNC: at its start)
+break|b ADDR            ... at ADDR (0x80000000, 1234, main+8, $ra)
 break|b FILE:LINE       ... on a source line (kernel/main.c:42, or main.c:42)
 watch [-r|-a] ADDR [N]  stop after a write (-r read, -a either) of N bytes at ADDR
 delete|d [N]            delete breakpoint or watchpoint N, or all of them
@@ -287,9 +288,25 @@ impl<'a, W: Write> Session<'a, W> {
                 if place.line != line {
                     self.say(format!("line {line} has no code: {place} instead"));
                 }
+                // A line whose code is a function's prologue (its first line, the
+                // one with its name) means the function past its prologue, as GDB
+                // has it (skip_prologue_sal); a line further in stays where it is.
                 addrs
+                    .into_iter()
+                    .map(|addr| match self.symbols.containing(addr) {
+                        Some((_, start)) => addr.max(self.skip_prologue(start)),
+                        None => addr,
+                    })
+                    .collect()
             }
-            None => vec![self.eval(expr)?],
+            // `break *ADDR`: exactly there, as in GDB.
+            None if expr.starts_with('*') => vec![self.eval(&expr[1..])?],
+            // A function's name (a symbol in code) means the function past its
+            // prologue, as GDB's `break FUNC`; anything else is an exact address.
+            None => match self.symbols.code(expr) {
+                Some(entry) => vec![self.skip_prologue(entry)],
+                None => vec![self.eval(expr)?],
+            },
         };
         for addr in addrs {
             if !self.has_breakpoint(addr) {
@@ -300,6 +317,22 @@ impl<'a, W: Write> Session<'a, W> {
             self.say(format!("breakpoint {n} at {at}"));
         }
         Ok(())
+    }
+
+    /// Where `break` puts a breakpoint on the function at `entry`: past its
+    /// prologue, as GDB finds it (`skip_prologue_sal`, then `riscv_skip_prologue`).
+    /// From the line tables when the function has them ([`Lines::prologue_end`]:
+    /// its `prologue_end` row, else its second row), else by GDB's prologue
+    /// analysis of its code ([`frames::scan_prologue`]).
+    fn skip_prologue(&mut self, entry: u64) -> u64 {
+        let (start, end) = self
+            .symbols
+            .range(entry)
+            .unwrap_or((entry, entry.wrapping_add(1)));
+        match self.lines.prologue_end(start, end) {
+            Some(body) => body.max(entry),
+            None => frames::scan_prologue(&mut self.remote, entry, self.xlen),
+        }
     }
 
     /// `0x80000024 <puts+4>`, and `: file:line` where the line tables say: without
