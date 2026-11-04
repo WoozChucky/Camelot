@@ -149,6 +149,8 @@ pub struct Readelf {
     /// Allocated sections only.
     pub sections: Vec<Sect>,
     pub loads: Vec<Load>,
+    /// The `PT_PHDR`, when the headers are loaded (write.rs, "The headers").
+    pub phdr: Option<Load>,
     /// Global and weak symbols.
     pub globals: HashMap<String, u64>,
     /// Local symbols (only read from our own output).
@@ -180,8 +182,8 @@ pub fn parse_readelf(text: &str) -> Readelf {
                     align: rest[9].parse().unwrap(),
                 });
             }
-        } else if t.first() == Some(&"LOAD") {
-            r.loads.push(Load {
+        } else if t.first() == Some(&"LOAD") || t.first() == Some(&"PHDR") {
+            let p = Load {
                 offset: hex(t[1]),
                 vaddr: hex(t[2]),
                 paddr: hex(t[3]),
@@ -189,7 +191,12 @@ pub fn parse_readelf(text: &str) -> Readelf {
                 memsz: hex(t[5]),
                 flags: t[6..t.len() - 1].concat(),
                 align: hex(t[t.len() - 1]),
-            });
+            };
+            if t[0] == "LOAD" {
+                r.loads.push(p);
+            } else {
+                r.phdr = Some(p);
+            }
         } else if t.len() == 8 && (t[4] == "GLOBAL" || t[4] == "WEAK") && t[6] != "UND" {
             // (ld.lld lists undefined weak symbols, merlin-ld leaves them out.)
             r.globals.insert(t[7].into(), hex(t[1]));
@@ -237,9 +244,8 @@ pub fn read_ours(file: &[u8]) -> Readelf {
         entry: e.header.entry,
         ..Default::default()
     };
-    for p in &e.segments {
-        assert_eq!(p.ty, elf::PT_LOAD, "only PT_LOAD");
-        r.loads.push(Load {
+    for (i, p) in e.segments.iter().enumerate() {
+        let load = Load {
             offset: p.offset,
             vaddr: p.vaddr,
             paddr: p.paddr,
@@ -247,7 +253,13 @@ pub fn read_ours(file: &[u8]) -> Readelf {
             memsz: p.memsz,
             flags: segment_flags(p.flags),
             align: p.align,
-        });
+        };
+        match p.ty {
+            elf::PT_LOAD => r.loads.push(load),
+            // Only first, and only for loaded headers.
+            elf::PT_PHDR if i == 0 => r.phdr = Some(load),
+            t => panic!("program header {i} of type {t:#x}: only PT_LOAD, and PT_PHDR first"),
+        }
     }
     for s in e.sections.iter().skip(1) {
         if s.ty == elf::SHT_SYMTAB {
@@ -363,19 +375,25 @@ pub fn assert_matches_ld_lld_exit(set: &str, name: &str, output: &str, exit: u32
     assert_eq!(ours.entry, lld.entry, "{name}: entry");
     assert_eq!(ours.sections, lld.sections, "{name}: sections");
     assert_eq!(ours.loads, lld.loads, "{name}: PT_LOADs");
+    assert_eq!(ours.phdr, lld.phdr, "{name}: PT_PHDR");
     assert_eq!(ours.globals, lld.globals, "{name}: global symbols");
 
-    // Byte for byte: every loaded byte, relocated code and data included.
+    // Byte for byte: every loaded byte, relocated code and data included,
+    // but for the headers when they are loaded (the first segment's first
+    // bytes, up to the end of the program header table's room): each
+    // linker's own ELF header and program headers.
+    let headers = lld.phdr.as_ref().map_or(0, |p| (p.offset + p.filesz) as usize);
     let lld_elf = std::fs::read(fixtures(set).join(format!("{name}.lld.elf"))).unwrap();
     let (ours_img, lld_img) = (load_images(&linked.elf), load_images(&lld_elf));
     assert_eq!(ours_img.len(), lld_img.len(), "{name}: PT_LOAD count");
-    for ((va, msz, a), (vb, mszb, b)) in ours_img.iter().zip(&lld_img) {
+    for (k, ((va, msz, a), (vb, mszb, b))) in ours_img.iter().zip(&lld_img).enumerate() {
         assert_eq!(
             (va, msz, a.len()),
             (vb, mszb, b.len()),
             "{name}: segment at {va:#x}"
         );
-        if let Some(i) = (0..a.len()).find(|&i| a[i] != b[i]) {
+        let from = if k == 0 { headers } else { 0 };
+        if let Some(i) = (from..a.len()).find(|&i| a[i] != b[i]) {
             panic!(
                 "{name}: first difference at {:#x}: ours {:02x?}, ld.lld {:02x?}",
                 va + i as u64,

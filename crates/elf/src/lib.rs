@@ -42,6 +42,8 @@ pub const SHT_NOBITS: u32 = 8;
 pub const SHT_REL: u32 = 9;
 pub const SHT_GROUP: u32 = 17;
 pub const SHT_SYMTAB_SHNDX: u32 = 18;
+/// `.riscv.attributes` (the psABI's build attributes: `Tag_RISCV_arch`, ...).
+pub const SHT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 
 // Section flags (`sh_flags` is 4 bytes in ELF32 and 8 in ELF64).
 pub const SHF_WRITE: u64 = 0x1;

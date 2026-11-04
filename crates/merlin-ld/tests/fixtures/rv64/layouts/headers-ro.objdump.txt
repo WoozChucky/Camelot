@@ -1,0 +1,18 @@
+
+headers-ro.lld.elf:	file format elf64-littleriscv
+
+Disassembly of section .text:
+
+0000000080100418 <_start>:
+80100418: 100002b7     	lui	t0, 0x10000
+8010041c: 04f00313     	li	t1, 0x4f
+80100420: 00628023     	sb	t1, 0x0(t0)
+80100424: 04b00313     	li	t1, 0x4b
+80100428: 00628023     	sb	t1, 0x0(t0)
+8010042c: 00a00313     	li	t1, 0xa
+80100430: 00628023     	sb	t1, 0x0(t0)
+80100434: 0000100b     	<unknown>
+
+0000000080100438 <helper>:
+80100438: 00150513     	addi	a0, a0, 0x1
+8010043c: 00008067     	ret

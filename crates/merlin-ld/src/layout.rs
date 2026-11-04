@@ -167,6 +167,18 @@ pub struct Layout {
     /// The entry symbol's name, unless the entry is a number or a fallback.
     pub entry_symbol: Option<String>,
     pub warnings: Vec<String>,
+    /// The script has a `MEMORY` region, which every output section is in
+    /// (ld.lld gives every section a region when there are any). Such a
+    /// section never shares a segment with the ELF and program headers,
+    /// which are in no region ([`crate::write::segments`]).
+    pub memory: bool,
+    /// ld.lld would write a `.riscv.attributes` section for these objects,
+    /// and so a `PT_RISCV_ATTRIBUTES` program header: one of them has an
+    /// `SHT_RISCV_ATTRIBUTES` section, and the script does not throw it away
+    /// ([`riscv_attributes_kept`]). merlin-ld writes neither, but leaves room
+    /// for that header, as it does for every one ld.lld counts
+    /// ([`crate::write`], "The headers").
+    pub riscv_attributes: bool,
     /// `[object][section]`.
     placement: Vec<Vec<Option<Placed>>>,
     /// The input sections `/DISCARD/` matched, as `(object, section)`.
@@ -614,6 +626,28 @@ fn load_overlaps(class: Class, sections: &[OutputSection]) -> Vec<Error> {
             ))
         })
         .collect()
+}
+
+/// Whether ld.lld would write a `.riscv.attributes` section: it merges every
+/// input `SHT_RISCV_ATTRIBUTES` section (clang and merlin-as give each
+/// object one) into one section of that name, which the script then places
+/// like any other, by its name: the first output section whose pattern
+/// matches `.riscv.attributes` gets it, and only a `/DISCARD/` there throws
+/// it away. (The merged section belongs to no object, so a pattern that
+/// names one would not match it; merlin-ld's patterns name none.)
+fn riscv_attributes_kept(objects: &[Object], script: &Script) -> bool {
+    let any = objects
+        .iter()
+        .any(|o| o.sections.iter().any(|s| s.ty == elf::SHT_RISCV_ATTRIBUTES));
+    let first_rule = script.commands.iter().find_map(|c| match c {
+        Command::Output(o) => o
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Input(p) if p.iter().any(|p| script::glob_match(p, ".riscv.attributes"))))
+            .then_some(o),
+        Command::Assign(_) => None,
+    });
+    any && !first_rule.is_some_and(|o| o.is_discard())
 }
 
 pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
@@ -1070,6 +1104,8 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
         entry: 0,
         entry_symbol: None,
         warnings: Vec::new(),
+        memory: script.memory.is_some(),
+        riscv_attributes: riscv_attributes_kept(&objects, &script),
         placement: w.placement,
         discarded: w.discarded,
         debug_offsets,

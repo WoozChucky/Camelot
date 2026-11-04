@@ -1,0 +1,68 @@
+There are 10 section headers, starting at offset 0x850:
+
+Section Headers:
+  [Nr] Name              Type            Address          Off    Size   ES Flg Lk Inf Al
+  [ 0]                   NULL            0000000000000000 000000 000000 00      0   0  0
+  [ 1] .text             PROGBITS        0000000080000400 000400 000028 00  AX  0   0  4
+  [ 2] .rodata           PROGBITS        0000000080000428 000428 000018 00   A  0   0  4
+  [ 3] .data             PROGBITS        0000000080000440 000440 000024 00  WA  0   0 16
+  [ 4] .bss              NOBITS          0000000080000470 000464 000118 00  WA  0   0 16
+  [ 5] .riscv.attributes RISCV_ATTRIBUTES 0000000000000000 000464 000055 00      0   0  1
+  [ 6] .comment          PROGBITS        0000000000000000 0004b9 000063 01  MS  0   0  1
+  [ 7] .symtab           SYMTAB          0000000000000000 000520 0001f8 18      9  12  8
+  [ 8] .shstrtab         STRTAB          0000000000000000 000718 00004f 00      0   0  1
+  [ 9] .strtab           STRTAB          0000000000000000 000767 0000e6 00      0   0  1
+Key to Flags:
+  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
+  L (link order), O (extra OS processing required), G (group), T (TLS),
+  C (compressed), x (unknown), o (OS specific), E (exclude),
+  R (retain), p (processor specific)
+
+Elf file type is EXEC (Executable file)
+Entry point 0x80000400
+There are 7 program headers, starting at offset 64
+
+Program Headers:
+  Type           Offset   VirtAddr           PhysAddr           FileSiz  MemSiz   Flg Align
+  PHDR           0x000040 0x0000000080000040 0x0000000080000040 0x000188 0x000188 R   0x8
+  LOAD           0x000000 0x0000000080000000 0x0000000080000000 0x0001c8 0x0001c8 R   0x1000
+  LOAD           0x000400 0x0000000080000400 0x0000000080000400 0x000028 0x000028 R E 0x1000
+  LOAD           0x000428 0x0000000080000428 0x0000000080000428 0x000018 0x000018 R   0x1000
+  LOAD           0x000440 0x0000000080000440 0x0000000080000440 0x000024 0x000148 RW  0x1000
+  GNU_STACK      0x000000 0x0000000000000000 0x0000000000000000 0x000000 0x000000 RW  0x0
+  ATTRIBUTES     0x000464 0x0000000000000000 0x0000000000000000 0x000055 0x000055 R   0x1
+
+ Section to Segment mapping:
+  Segment Sections...
+   00     
+   01     
+   02     .text 
+   03     .rodata 
+   04     .data .bss 
+   05     
+   06     .riscv.attributes 
+   None   .comment .symtab .shstrtab .strtab 
+
+Symbol table '.symtab' contains 21 entries:
+   Num:    Value          Size Type    Bind   Vis       Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   UND 
+     1: 0000000080000400     0 NOTYPE  LOCAL  DEFAULT     1 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+     2: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
+     3: 0000000080000428     0 NOTYPE  LOCAL  DEFAULT     2 $d
+     4: 0000000080000438     0 NOTYPE  LOCAL  DEFAULT     2 $d
+     5: 0000000080000440     0 NOTYPE  LOCAL  DEFAULT     3 $d
+     6: 0000000080000470     0 NOTYPE  LOCAL  DEFAULT     4 $d
+     7: 0000000080000420     0 NOTYPE  LOCAL  DEFAULT     1 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+     8: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
+     9: 0000000080000450     0 NOTYPE  LOCAL  DEFAULT     3 $d
+    10: 0000000080000570     0 NOTYPE  LOCAL  DEFAULT     4 $d
+    11: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
+    12: 0000000080000400     0 NOTYPE  GLOBAL DEFAULT     1 _start
+    13: 0000000080000428     0 NOTYPE  GLOBAL DEFAULT     2 table
+    14: 0000000080000438     0 NOTYPE  GLOBAL DEFAULT     2 greeting
+    15: 0000000080000440     0 NOTYPE  GLOBAL DEFAULT     3 counter
+    16: 0000000080000470     0 NOTYPE  GLOBAL DEFAULT     4 buffer
+    17: 0000000080000420     0 NOTYPE  GLOBAL DEFAULT     1 helper
+    18: 0000000080000450     0 NOTYPE  GLOBAL DEFAULT     3 flag
+    19: 0000000080000460     0 NOTYPE  GLOBAL DEFAULT     3 wide
+    20: 0000000080000570     0 NOTYPE  GLOBAL DEFAULT     4 scratch

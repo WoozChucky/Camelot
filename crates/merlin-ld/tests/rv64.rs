@@ -488,7 +488,7 @@ fn layout_edge_cases_match_ld_lld() {
         .map(|p| format!("layouts/{}", p.file_stem().unwrap().to_string_lossy()))
         .collect();
     names.sort();
-    assert_eq!(names.len(), 7, "{names:?}");
+    assert_eq!(names.len(), 10, "{names:?}");
     for name in &names {
         assert_matches_ld_lld(name, "OK\n");
     }
@@ -503,6 +503,23 @@ fn layout_edge_cases_match_ld_lld() {
     let marker = expected("layouts/no-inputs");
     let marker = marker.sections.iter().find(|s| s.name == ".marker").unwrap();
     assert_eq!(marker.flags, "A", "no inputs after the code: not executable");
+    // ELF64's headers take 0x1c8 bytes (64 + 7 * 56) where ELF32's take
+    // 0x114: not loaded below a section at 0x100 into its page, loaded below
+    // one at 0x400.
+    let unaligned = expected("layouts/unaligned");
+    assert_eq!(unaligned.phdr, None);
+    assert_eq!(unaligned.loads[0].offset, 0x1100);
+    let headers = expected("layouts/headers");
+    assert_eq!(
+        (
+            headers.loads[0].offset,
+            headers.loads[0].vaddr,
+            headers.loads[0].filesz
+        ),
+        (0, 0x8000_0000, 0x1c8)
+    );
+    let phdr = headers.phdr.unwrap();
+    assert_eq!((phdr.offset, phdr.filesz, phdr.align), (64, 0x188, 8));
 }
 
 /// examples/hello assembled for RV64 by clang: xcal.dbg prints 64-bit
@@ -802,7 +819,11 @@ fn layout_errors_and_the_4_gib_limits_that_are_rv32s() {
     );
     assert!(ours.sections[1].addr > 0xffff_ffff);
     assert_eq!(ours.globals["x"], 0x1_0000_0000);
-    assert_eq!(ours.loads[0].vaddr, 0xffff_fff0);
+    // The headers (0x1c8 bytes) fit below .text in its page, so they are
+    // loaded at the page's start, as ld.lld loads them (write.rs, "The
+    // headers").
+    assert_eq!((ours.loads[0].offset, ours.loads[0].vaddr), (0, 0xffff_f000));
+    assert_eq!((ours.loads[1].offset, ours.loads[1].vaddr), (0xff0, 0xffff_fff0));
     // A section 4 GiB long, and `+` past 2^63 (exact on RV32 and an error
     // there, a 64-bit address here).
     let l = merlin_ld::layout(

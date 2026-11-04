@@ -14,7 +14,8 @@
 //!
 //! * `fixtures/norelocs`: three relocation-free objects.
 //! * `fixtures/layouts`: layout edge cases (empty and assignment-only output
-//!   sections, gaps, NOBITS before PROGBITS, `. +=` sections).
+//!   sections, gaps, NOBITS before PROGBITS, `. +=` sections, a first
+//!   section not at a page start, with and without the headers loaded).
 //! * `fixtures/hello`: `examples/hello/hello.S` assembled by clang.
 //! * `fixtures/multiobj`: `examples/multiobj`, two objects that call and
 //!   point into each other.
@@ -150,7 +151,10 @@ fn norelocs_matches_ld_lld() {
 /// previous section but never executable), with only `. +=` (PROGBITS with file contents), with
 /// nothing (dropped), a symbol before the first section with MEMORY (0), a
 /// gap and NOBITS before PROGBITS inside one PT_LOAD, an empty R section
-/// between RX and RW (no PT_LOAD of its own), a weak definition.
+/// between RX and RW (no PT_LOAD of its own), a weak definition, and where
+/// the file starts when the first section is not at the start of a page:
+/// a page in, or after the headers, loaded below the section (in a PT_LOAD
+/// of their own, or in a read-only first section's) with a PT_PHDR.
 #[test]
 fn layout_edge_cases_match_ld_lld() {
     let mut names: Vec<String> = std::fs::read_dir(fixtures().join("layouts"))
@@ -166,10 +170,13 @@ fn layout_edge_cases_match_ld_lld() {
             "layouts/attrs",
             "layouts/empty",
             "layouts/gap",
+            "layouts/headers",
+            "layouts/headers-ro",
             "layouts/inside",
             "layouts/no-inputs",
             "layouts/nobits-first",
-            "layouts/page-gap"
+            "layouts/page-gap",
+            "layouts/unaligned"
         ]
     );
     for name in &names {
@@ -221,6 +228,47 @@ fn layout_edge_cases_match_ld_lld() {
     assert!(!attrs.globals.contains_key("dropped"));
     assert_eq!(attrs.globals["__end"], 0x8000_2000);
     assert_eq!(attrs.loads.len(), 3);
+    // The headers (0x114 bytes: the ELF header and 7 program headers) don't
+    // fit in the 0x100 bytes below .text: not loaded, and .text a page in.
+    let unaligned = expected("layouts/unaligned");
+    assert_eq!(unaligned.phdr, None);
+    assert_eq!(
+        (unaligned.loads[0].offset, unaligned.loads[0].vaddr),
+        (0x1000 + 0x100, 0x8000_0100)
+    );
+    // They fit in 0x400: loaded at the page, in a segment of their own
+    // before the code's, the program header table in it.
+    let headers = expected("layouts/headers");
+    let hdr = Load {
+        offset: 0,
+        vaddr: 0x8000_0000,
+        paddr: 0x8000_0000,
+        filesz: 0x114,
+        memsz: 0x114,
+        flags: "R".into(),
+        align: 0x1000,
+    };
+    assert_eq!(headers.loads[0], hdr);
+    assert_eq!(
+        (headers.loads[1].offset, headers.loads[1].flags.as_str()),
+        (0x400, "RE")
+    );
+    let phdr = headers.phdr.unwrap();
+    assert_eq!((phdr.offset, phdr.vaddr, phdr.filesz), (52, 0x8000_0034, 0xe0));
+    // Or in .rodata's, which then starts at the page, its load address
+    // moved down with it.
+    let ro = expected("layouts/headers-ro");
+    assert_eq!(ro.loads.len(), 3);
+    assert_eq!(
+        (
+            ro.loads[0].offset,
+            ro.loads[0].vaddr,
+            ro.loads[0].paddr,
+            ro.loads[0].flags.as_str()
+        ),
+        (0, 0x8010_0000, 0x8000_0000, "R")
+    );
+    assert_eq!(ro.phdr.unwrap().paddr, 0x8000_0034);
 }
 
 /// What /DISCARD/ throws away cannot be referred to: ld.lld's "relocation
