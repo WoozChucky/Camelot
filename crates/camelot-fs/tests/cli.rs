@@ -286,7 +286,7 @@ fn mkfs_makes_a_bootable_image() {
         "--boot",
         boot.to_str().unwrap(),
         "--kernel",
-        boot.to_str().unwrap().replace("boot.elf", "boot.s").as_str(),
+        boot.to_str().unwrap().replace("boot.elf", "boot.S").as_str(),
     ]);
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("kernel:"), "{o:?}");

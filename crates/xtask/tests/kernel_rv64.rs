@@ -527,3 +527,73 @@ fn a_kernel_stack_overflow_hits_the_guard_page_and_is_reported() {
         "{report}"
     );
 }
+
+/// A bootable RV64 disk: the root image's files (kernel/fs, /dev/console) in
+/// the filesystem, the RV64 bootloader in the boot block and the RV64 disk
+/// kernel after the filesystem, as `camelot-fs mkfs --boot` makes one. No
+/// /bin: there are no RV64 programs yet (#156).
+fn rv64_bootable_image(blocks: u32) -> (Vec<u8>, camelot_fs::boot::BootInfo) {
+    let root = repo_root();
+    let kernel = std::fs::read(root.join("kernel").join(kernel::DISK_KERNEL_RV64)).unwrap();
+    let opts = xtask::fs::bootable_layout(blocks, &kernel).unwrap();
+    let mut fs = camelot_fs::mkfs::Mkfs::new(&opts).unwrap();
+    fs.add_host_dir(&root.join(xtask::fs::ROOT_DIR), "/").unwrap();
+    fs.mkdir(xtask::fs::DEV).unwrap();
+    fs.add_device(
+        &format!("{}/console", xtask::fs::DEV),
+        xtask::fs::CONSOLE_MAJOR,
+        0,
+    )
+    .unwrap();
+    let mut image = fs.finish();
+    let boot = xtask::boot::bootloader_rv64(&root).unwrap();
+    let info = camelot_fs::boot::install(&mut image, &boot, &kernel).unwrap();
+    (image, info)
+}
+
+#[test]
+fn the_rv64_kernel_boots_from_disk() {
+    let (image, info) = rv64_bootable_image(2048);
+    for harts in [1, 4] {
+        let mut m = Machine::new(MachineConfig {
+            harts,
+            xlen: grail::Xlen::Rv64,
+            disks: vec![grail::DiskConfig::memory(image.clone())],
+            ..MachineConfig::default()
+        })
+        .unwrap();
+        m.boot_from_disk().unwrap();
+        m.cpu.bus.uart.capture = true;
+        let r = m.run(Some(2 * BOOT_MAX_STEPS), |_| {});
+        let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+        // The bootloader found the kernel, loaded its segments at their
+        // physical addresses and started it at the entry's: the kernel
+        // turned paging on and ran its self-tests, the disk's too.
+        assert_eq!(r, RunResult::Exited(0), "{harts} harts:\n{out}");
+        assert!(
+            out.starts_with(&format!(
+                "boot: kernel at sector 0x{:08x}\n{}Camelot v0.1.0 booting...\n",
+                info.kernel_sector,
+                xtask::kernel::BANNER
+            )),
+            "{out}"
+        );
+        assert!(out.contains("\npaging: on (Sv48)\n"), "{out}");
+        assert!(out.contains("\ndisk 0: 4096 sectors (2048 KiB), irq "), "{out}");
+        // The disk driver's DMA (physical addresses of direct-map buffers),
+        // the filesystem on it, and their self-tests.
+        assert!(out.contains("\nblk self-test: 16/16 passed\n"), "{out}");
+        assert!(out.contains("\nfs: disk 0 mounted: "), "{out}");
+        assert!(out.contains("\nfs self-test: 11/11 passed\n"), "{out}");
+        assert!(!out.contains("FAILED"), "{out}");
+        assert!(out.ends_with("user space: not on RV64 yet\n"), "{out}");
+        if harts > 1 {
+            assert!(out.contains(&format!("\nsmp: {harts} harts running\n")), "{out}");
+        }
+        // The ROM's entry doubleword is the kernel's physical entry point, so
+        // the harts it woke came in at 0x8000_0000, with paging off.
+        let lo = m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR).unwrap() as u64;
+        let hi = m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR + 4).unwrap() as u64;
+        assert_eq!(lo | hi << 32, LOAD_ADDR);
+    }
+}
