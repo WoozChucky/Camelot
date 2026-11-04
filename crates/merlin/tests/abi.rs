@@ -1,9 +1,11 @@
 //! merlin's calling convention against clang's, on RV32 (ILP32) and RV64
 //! (LP64): structs of every size class, the narrow scalars, `int`, `unsigned
-//! int`, `long` and pointers mixed (32-bit values sign-extended on RV64),
-//! arguments on the stack and variadic arguments, passed and returned both
-//! ways between merlin-compiled and clang-compiled code (see
-//! `tests/abi/clang_side.c` for the cases).
+//! int`, `long`, `long long` and pointers mixed (32-bit values sign-extended
+//! on RV64, unsigned ones too), arguments on the stack (from odd words, and
+//! split across a7) and variadic arguments (pairs from an even register on
+//! RV32), function pointers, passed and returned both ways between
+//! merlin-compiled and clang-compiled code (see `tests/abi/clang_side.c` for
+//! the cases).
 //!
 //! Run by `cargo test`, without LLVM: the clang objects are committed,
 //! `tests/abi/clang_side.o` for RV32 and `tests/abi/clang_side.rv64.o` for

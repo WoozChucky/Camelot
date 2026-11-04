@@ -1124,13 +1124,380 @@ c_vqlate:                               # @c_vqlate
 .Lfunc_end47:
 	.size	c_vqlate, .Lfunc_end47-c_vqlate
                                         # -- End function
+	.globl	c_q67                           # -- Begin function c_q67
+	.p2align	2
+	.type	c_q67,@function
+c_q67:                                  # @c_q67
+# %bb.0:
+	add	a0, a1, a0
+	add	a2, a2, a3
+	add	a0, a0, a2
+	add	a4, a4, a5
+	slli	a1, a6, 1
+	addw	a0, a0, a4
+	add	a1, a1, a6
+	add	a0, a1, a0
+	ret
+.Lfunc_end48:
+	.size	c_q67, .Lfunc_end48-c_q67
+                                        # -- End function
+	.globl	c_oddstack                      # -- Begin function c_oddstack
+	.p2align	2
+	.type	c_oddstack,@function
+c_oddstack:                             # @c_oddstack
+# %bb.0:
+	ld	t0, 32(sp)
+	ld	t1, 24(sp)
+	ld	t2, 16(sp)
+	ld	t3, 8(sp)
+	add	a0, a1, a0
+	add	a2, a2, a3
+	ld	a1, 0(sp)
+	add	a0, a0, a2
+	add	a4, a4, a5
+	li	a2, 100
+	mul	a2, t3, a2
+	li	a3, 1000
+	add	a4, a4, a6
+	mul	a3, t2, a3
+	ld	a5, 40(sp)
+	add	a0, a0, a4
+	slli	a4, a1, 1
+	slli	a1, a1, 3
+	add	a0, a0, a7
+	add	a1, a1, a4
+	srli	a4, t3, 32
+	add	a0, a0, a1
+	add	a0, a0, a2
+	slli	a1, a5, 48
+	add	a3, a4, a3
+	srai	a1, a1, 48
+	sraiw	a2, a5, 16
+	add	t0, t1, t0
+	slli	a5, a5, 16
+	add	a1, t0, a1
+	srai	a5, a5, 48
+	add	a1, a1, a2
+	addw	a0, a0, a3
+	add	a1, a1, a5
+	add	a0, a1, a0
+	ret
+.Lfunc_end49:
+	.size	c_oddstack, .Lfunc_end49-c_oddstack
+                                        # -- End function
+	.globl	c_vq3                           # -- Begin function c_vq3
+	.p2align	2
+	.type	c_vq3,@function
+c_vq3:                                  # @c_vq3
+# %bb.0:
+	addi	sp, sp, -64
+	sd	a7, 56(sp)
+	sd	a3, 24(sp)
+	sd	a4, 32(sp)
+	sd	a5, 40(sp)
+	sd	a6, 48(sp)
+	addi	a3, sp, 24
+	addw	a0, a1, a0
+	sd	a3, 8(sp)
+	li	a1, 105
+	li	a4, 113
+	j	.LBB50_3
+.LBB50_1:                               #   in Loop: Header=BB50_3 Depth=1
+	addi	a6, a3, 8
+	sd	a6, 8(sp)
+	ld	a5, 0(a3)
+.LBB50_2:                               #   in Loop: Header=BB50_3 Depth=1
+	mv	a3, a6
+	add	a0, a5, a0
+	addi	a2, a2, 1
+.LBB50_3:                               # =>This Inner Loop Header: Depth=1
+	lbu	a5, 0(a2)
+	beq	a5, a1, .LBB50_6
+# %bb.4:                                #   in Loop: Header=BB50_3 Depth=1
+	beq	a5, a4, .LBB50_1
+# %bb.5:                                #   in Loop: Header=BB50_3 Depth=1
+	bnez	a5, .LBB50_1
+	j	.LBB50_7
+.LBB50_6:                               #   in Loop: Header=BB50_3 Depth=1
+	addi	a6, a3, 8
+	sd	a6, 8(sp)
+	lw	a5, 0(a3)
+	j	.LBB50_2
+.LBB50_7:
+	addi	sp, sp, 64
+	ret
+.Lfunc_end50:
+	.size	c_vq3, .Lfunc_end50-c_vq3
+                                        # -- End function
+	.globl	c_rev9                          # -- Begin function c_rev9
+	.p2align	2
+	.type	c_rev9,@function
+c_rev9:                                 # @c_rev9
+# %bb.0:
+	addi	sp, sp, -32
+	addi	a2, sp, 8
+	sd	a0, 0(sp)
+	sb	a1, 8(sp)
+	addi	a0, sp, 16
+	addi	a1, sp, -1
+.LBB51_1:                               # =>This Inner Loop Header: Depth=1
+	lbu	a3, 0(a2)
+	addi	a2, a2, -1
+	sb	a3, 0(a0)
+	addi	a0, a0, 1
+	bne	a2, a1, .LBB51_1
+# %bb.2:
+	ld	a0, 16(sp)
+	lbu	a1, 24(sp)
+	addi	sp, sp, 32
+	ret
+.Lfunc_end51:
+	.size	c_rev9, .Lfunc_end51-c_rev9
+                                        # -- End function
+	.globl	c_neg10                         # -- Begin function c_neg10
+	.p2align	2
+	.type	c_neg10,@function
+c_neg10:                                # @c_neg10
+# %bb.0:
+	addi	sp, sp, -16
+	sd	a0, 0(sp)
+	sh	a1, 8(sp)
+	mv	a0, sp
+	addi	a1, sp, 10
+.LBB52_1:                               # =>This Inner Loop Header: Depth=1
+	lh	a2, 0(a0)
+	neg	a2, a2
+	sh	a2, 0(a0)
+	addi	a0, a0, 2
+	bne	a0, a1, .LBB52_1
+# %bb.2:
+	ld	a0, 0(sp)
+	lhu	a1, 8(sp)
+	addi	sp, sp, 16
+	ret
+.Lfunc_end52:
+	.size	c_neg10, .Lfunc_end52-c_neg10
+                                        # -- End function
+	.globl	c_late910                       # -- Begin function c_late910
+	.p2align	2
+	.type	c_late910,@function
+c_late910:                              # @c_late910
+# %bb.0:
+	lh	t0, 16(sp)
+	lh	t1, 8(sp)
+	add	a0, a1, a0
+	add	a2, a2, a3
+	lbu	a1, 0(sp)
+	add	a0, a0, a2
+	add	a4, a4, a5
+	li	a2, 100
+	add	a4, a4, a6
+	mul	a2, t0, a2
+	add	a0, a0, a4
+	zext.b	a3, a7
+	add	a0, a0, a3
+	slli	a3, a1, 1
+	slli	a1, a1, 3
+	add	a1, a1, a3
+	add	a0, a0, t1
+	add	a0, a0, a1
+	addw	a0, a0, a2
+	ret
+.Lfunc_end53:
+	.size	c_late910, .Lfunc_end53-c_late910
+                                        # -- End function
+	.globl	c_v910                          # -- Begin function c_v910
+	.p2align	2
+	.type	c_v910,@function
+c_v910:                                 # @c_v910
+# %bb.0:
+	addi	sp, sp, -80
+	mv	t0, a0
+	li	a0, 0
+	sd	a5, 56(sp)
+	sd	a6, 64(sp)
+	sd	a7, 72(sp)
+	sd	a1, 24(sp)
+	sd	a2, 32(sp)
+	sd	a3, 40(sp)
+	sd	a4, 48(sp)
+	addi	a6, sp, 24
+	sd	a6, 8(sp)
+	li	a1, 56
+	li	a2, 48
+	li	a3, 100
+	li	a4, 57
+	li	a5, 105
+	j	.LBB54_4
+.LBB54_1:                               #   in Loop: Header=BB54_4 Depth=1
+	addi	t1, a6, 16
+	lbu	a7, 8(a6)
+	sd	t1, 8(sp)
+	lbu	a6, 0(a6)
+	slli	t2, a7, 1
+	slli	a7, a7, 3
+	add	a7, a7, t2
+.LBB54_2:                               #   in Loop: Header=BB54_4 Depth=1
+	add	a7, a7, a6
+.LBB54_3:                               #   in Loop: Header=BB54_4 Depth=1
+	mv	a6, t1
+	add	a0, a7, a0
+	addi	t0, t0, 1
+.LBB54_4:                               # =>This Inner Loop Header: Depth=1
+	lbu	a7, 0(t0)
+	bge	a1, a7, .LBB54_8
+# %bb.5:                                #   in Loop: Header=BB54_4 Depth=1
+	beq	a7, a4, .LBB54_1
+# %bb.6:                                #   in Loop: Header=BB54_4 Depth=1
+	bne	a7, a5, .LBB54_11
+# %bb.7:                                #   in Loop: Header=BB54_4 Depth=1
+	addi	t1, a6, 8
+	sd	t1, 8(sp)
+	lw	a7, 0(a6)
+	j	.LBB54_3
+.LBB54_8:                               #   in Loop: Header=BB54_4 Depth=1
+	bne	a7, a2, .LBB54_10
+# %bb.9:                                #   in Loop: Header=BB54_4 Depth=1
+	lh	a7, 8(a6)
+	addi	t1, a6, 16
+	mul	a7, a7, a3
+	sd	t1, 8(sp)
+	lh	a6, 0(a6)
+	j	.LBB54_2
+.LBB54_10:                              #   in Loop: Header=BB54_4 Depth=1
+	beqz	a7, .LBB54_12
+.LBB54_11:                              #   in Loop: Header=BB54_4 Depth=1
+	addi	t1, a6, 16
+	sd	t1, 8(sp)
+	lbu	a7, 0(a6)
+	ld	a6, 8(a6)
+	add	a7, a6, a7
+	j	.LBB54_3
+.LBB54_12:
+	addi	sp, sp, 80
+	ret
+.Lfunc_end54:
+	.size	c_v910, .Lfunc_end54-c_v910
+                                        # -- End function
+	.globl	c_cq                            # -- Begin function c_cq
+	.p2align	2
+	.type	c_cq,@function
+c_cq:                                   # @c_cq
+# %bb.0:
+	addi	a2, a0, 1
+	andi	a0, a0, -256
+	zext.b	a2, a2
+	neg	a1, a1
+	or	a0, a2, a0
+	ret
+.Lfunc_end55:
+	.size	c_cq, .Lfunc_end55-c_cq
+                                        # -- End function
+	.globl	c_cqsum                         # -- Begin function c_cqsum
+	.p2align	2
+	.type	c_cqsum,@function
+c_cqsum:                                # @c_cqsum
+# %bb.0:
+	zext.b	a1, a1
+	zext.b	a3, a3
+	addw	a0, a1, a0
+	slli	a1, a3, 1
+	slli	a3, a3, 3
+	add	a2, a4, a2
+	add	a1, a3, a1
+	add	a0, a2, a0
+	add	a0, a0, a1
+	ret
+.Lfunc_end56:
+	.size	c_cqsum, .Lfunc_end56-c_cqsum
+                                        # -- End function
+	.globl	c_ucmp                          # -- Begin function c_ucmp
+	.p2align	2
+	.type	c_ucmp,@function
+c_ucmp:                                 # @c_ucmp
+# %bb.0:
+	lui	a2, 524288
+	xor	a2, a0, a2
+	sltu	a3, a0, a1
+	seqz	a2, a2
+	addi	a1, a1, 1
+	srli	a0, a0, 28
+	seqz	a1, a1
+	andi	a0, a0, 8
+	slli	a1, a1, 2
+	or	a0, a0, a3
+	slli	a2, a2, 1
+	or	a0, a0, a1
+	or	a0, a0, a2
+	ret
+.Lfunc_end57:
+	.size	c_ucmp, .Lfunc_end57-c_ucmp
+                                        # -- End function
+	.globl	c_uadd                          # -- Begin function c_uadd
+	.p2align	2
+	.type	c_uadd,@function
+c_uadd:                                 # @c_uadd
+# %bb.0:
+	addw	a0, a1, a0
+	ret
+.Lfunc_end58:
+	.size	c_uadd, .Lfunc_end58-c_uadd
+                                        # -- End function
+	.globl	c_ushr                          # -- Begin function c_ushr
+	.p2align	2
+	.type	c_ushr,@function
+c_ushr:                                 # @c_ushr
+# %bb.0:
+	srlw	a0, a0, a1
+	ret
+.Lfunc_end59:
+	.size	c_ushr, .Lfunc_end59-c_ushr
+                                        # -- End function
+	.globl	c_udiv                          # -- Begin function c_udiv
+	.p2align	2
+	.type	c_udiv,@function
+c_udiv:                                 # @c_udiv
+# %bb.0:
+	divuw	a0, a0, a1
+	ret
+.Lfunc_end60:
+	.size	c_udiv, .Lfunc_end60-c_udiv
+                                        # -- End function
+	.globl	c_shlq                          # -- Begin function c_shlq
+	.p2align	2
+	.type	c_shlq,@function
+c_shlq:                                 # @c_shlq
+# %bb.0:
+	sll	a0, a0, a1
+	ret
+.Lfunc_end61:
+	.size	c_shlq, .Lfunc_end61-c_shlq
+                                        # -- End function
+	.globl	c_applyq                        # -- Begin function c_applyq
+	.p2align	2
+	.type	c_applyq,@function
+c_applyq:                               # @c_applyq
+# %bb.0:
+	addi	sp, sp, -16
+	sd	ra, 8(sp)                       # 8-byte Folded Spill
+	mv	a3, a0
+	mv	a0, a1
+	mv	a1, a2
+	jalr	a3
+	addi	a0, a0, 1
+	ld	ra, 8(sp)                       # 8-byte Folded Reload
+	addi	sp, sp, 16
+	ret
+.Lfunc_end62:
+	.size	c_applyq, .Lfunc_end62-c_applyq
+                                        # -- End function
 	.section	.rodata.cst8,"aM",@progbits,8
 	.p2align	3, 0x0                          # -- Begin function c_calls_merlin
-.LCPI48_0:
+.LCPI63_0:
 	.quad	2305843009347911894             # 0x20000000080000d6
-.LCPI48_1:
+.LCPI63_1:
 	.quad	1152921504875282743             # 0x1000000010000137
-.LCPI48_2:
+.LCPI63_2:
 	.quad	-6066930334832433271            # 0xabcdef0123456789
 	.text
 	.globl	c_calls_merlin
@@ -1138,73 +1505,74 @@ c_vqlate:                               # @c_vqlate
 	.type	c_calls_merlin,@function
 c_calls_merlin:                         # @c_calls_merlin
 # %bb.0:
-	addi	sp, sp, -256
-	sd	ra, 248(sp)                     # 8-byte Folded Spill
-	sd	s0, 240(sp)                     # 8-byte Folded Spill
-	sd	s1, 232(sp)                     # 8-byte Folded Spill
-	sd	s2, 224(sp)                     # 8-byte Folded Spill
-	sd	s3, 216(sp)                     # 8-byte Folded Spill
-	sd	s4, 208(sp)                     # 8-byte Folded Spill
-	sd	s5, 200(sp)                     # 8-byte Folded Spill
-	sd	s6, 192(sp)                     # 8-byte Folded Spill
-	sd	s7, 184(sp)                     # 8-byte Folded Spill
-	sd	s8, 176(sp)                     # 8-byte Folded Spill
-	sd	s9, 168(sp)                     # 8-byte Folded Spill
+	addi	sp, sp, -272
+	sd	ra, 264(sp)                     # 8-byte Folded Spill
+	sd	s0, 256(sp)                     # 8-byte Folded Spill
+	sd	s1, 248(sp)                     # 8-byte Folded Spill
+	sd	s2, 240(sp)                     # 8-byte Folded Spill
+	sd	s3, 232(sp)                     # 8-byte Folded Spill
+	sd	s4, 224(sp)                     # 8-byte Folded Spill
+	sd	s5, 216(sp)                     # 8-byte Folded Spill
+	sd	s6, 208(sp)                     # 8-byte Folded Spill
+	sd	s7, 200(sp)                     # 8-byte Folded Spill
+	sd	s8, 192(sp)                     # 8-byte Folded Spill
+	sd	s9, 184(sp)                     # 8-byte Folded Spill
+	sd	s10, 176(sp)                    # 8-byte Folded Spill
 	lui	a0, 98305
 	slli	a0, a0, 5
 	addi	a0, a0, 1
 	call	m_sum6
 .Lpcrel_hi2:
-	auipc	s2, %pcrel_hi(.L_MergedGlobals)
-	addi	s2, s2, %pcrel_lo(.Lpcrel_hi2)
-	lw	a1, 4(s2)
+	auipc	s5, %pcrel_hi(.L_MergedGlobals)
+	addi	s5, s5, %pcrel_lo(.Lpcrel_hi2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
 	li	s0, 6
-	sw	a1, 4(s2)
-	beq	a0, s0, .LBB48_3
+	sw	a1, 4(s5)
+	beq	a0, s0, .LBB63_3
 # %bb.1:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_3
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_3
 # %bb.2:
-	sw	a1, 0(s2)
-.LBB48_3:
+	sw	a1, 0(s5)
+.LBB63_3:
 	li	a0, 4
 	call	m_make12
-	lw	a0, 4(s2)
+	lw	a0, 4(s5)
 	sext.w	a1, a1
 	addi	a0, a0, 1
-	sw	a0, 4(s2)
-	beq	a1, s0, .LBB48_6
+	sw	a0, 4(s5)
+	beq	a1, s0, .LBB63_6
 # %bb.4:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_6
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_6
 # %bb.5:
-	sw	a0, 0(s2)
-.LBB48_6:
+	sw	a0, 0(s5)
+.LBB63_6:
 	li	a0, 7
 	slli	a0, a0, 32
 	addi	a0, a0, 5
 	call	m_swap8
 	mv	s0, a0
-	lw	a0, 4(s2)
+	lw	a0, 4(s5)
 	li	a1, 5
 	slli	a1, a1, 32
 	addi	a0, a0, 1
 	addi	a1, a1, 7
-	sw	a0, 4(s2)
-	beq	s0, a1, .LBB48_9
+	sw	a0, 4(s5)
+	beq	s0, a1, .LBB63_9
 # %bb.7:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_9
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_9
 # %bb.8:
-	sw	a0, 0(s2)
-.LBB48_9:
+	sw	a0, 0(s5)
+.LBB63_9:
 	lui	a0, 328707
 	slli	a0, a0, 4
 	addi	a0, a0, 513
 	call	m_rev5
 	li	a1, 255
-	lw	a2, 4(s2)
+	lw	a2, 4(s5)
 	slli	a1, a1, 32
 	addi	a1, a1, 255
 	li	a3, 1
@@ -1212,31 +1580,31 @@ c_calls_merlin:                         # @c_calls_merlin
 	slli	a3, a3, 32
 	addi	a0, a2, 1
 	addi	a3, a3, 5
-	sw	a0, 4(s2)
-	beq	a1, a3, .LBB48_12
+	sw	a0, 4(s5)
+	beq	a1, a3, .LBB63_12
 # %bb.10:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_12
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_12
 # %bb.11:
-	sw	a0, 0(s2)
-.LBB48_12:
+	sw	a0, 0(s5)
+.LBB63_12:
 	li	a0, 1
 	li	a1, 2
 	li	a2, 3
 	li	s1, 3
 	call	m_make3
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	slli	a0, a0, 40
 	srli	a2, a0, 56
 	addi	a0, a1, 1
-	sw	a0, 4(s2)
-	beq	a2, s1, .LBB48_15
+	sw	a0, 4(s5)
+	beq	a2, s1, .LBB63_15
 # %bb.13:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_15
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_15
 # %bb.14:
-	sw	a0, 0(s2)
-.LBB48_15:
+	sw	a0, 0(s5)
+.LBB63_15:
 	lui	a0, 98305
 	li	a1, 5
 	slli	a0, a0, 5
@@ -1249,31 +1617,31 @@ c_calls_merlin:                         # @c_calls_merlin
 	li	a6, 3
 	mv	a1, s0
 	call	m_many
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
 	li	a2, 107
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_18
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_18
 # %bb.16:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_18
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_18
 # %bb.17:
-	sw	a1, 0(s2)
-.LBB48_18:
-	addi	a0, sp, 88
+	sw	a1, 0(s5)
+.LBB63_18:
+	addi	a0, sp, 96
 	li	a1, 3
 	call	m_big
-	lw	a0, 120(sp)
-	lw	a1, 108(sp)
-	lwu	a2, 112(sp)
-	lw	a3, 116(sp)
-	lwu	a4, 104(sp)
-	lw	a5, 92(sp)
-	lwu	a6, 96(sp)
-	lw	a7, 100(sp)
-	lwu	t0, 88(sp)
-	lw	s4, 124(sp)
-	sw	a0, 160(sp)
+	lw	a0, 128(sp)
+	lw	a1, 116(sp)
+	lwu	a2, 120(sp)
+	lw	a3, 124(sp)
+	lwu	a4, 112(sp)
+	lw	a5, 100(sp)
+	lwu	a6, 104(sp)
+	lw	a7, 108(sp)
+	lwu	t0, 96(sp)
+	lw	s2, 132(sp)
+	sw	a0, 168(sp)
 	slli	a3, a3, 32
 	or	a2, a3, a2
 	slli	a1, a1, 32
@@ -1283,187 +1651,187 @@ c_calls_merlin:                         # @c_calls_merlin
 	slli	a5, a5, 32
 	or	a4, a5, t0
 	li	a0, 12
-	sd	a4, 128(sp)
-	sd	a3, 136(sp)
-	sd	a1, 144(sp)
-	sd	a2, 152(sp)
-	bne	s4, a0, .LBB48_20
+	sd	a4, 136(sp)
+	sd	a3, 144(sp)
+	sd	a1, 152(sp)
+	sd	a2, 160(sp)
+	bne	s2, a0, .LBB63_20
 # %bb.19:
-	ld	a1, 128(sp)
-	ld	a2, 136(sp)
-	ld	a3, 144(sp)
-	ld	a4, 152(sp)
-	lw	a5, 160(sp)
-	sd	a1, 88(sp)
-	sd	a2, 96(sp)
-	sd	a3, 104(sp)
-	sd	a4, 112(sp)
-	sw	a5, 120(sp)
-	sw	a0, 124(sp)
-	addi	a0, sp, 88
+	ld	a1, 136(sp)
+	ld	a2, 144(sp)
+	ld	a3, 152(sp)
+	ld	a4, 160(sp)
+	lw	a5, 168(sp)
+	sd	a1, 96(sp)
+	sd	a2, 104(sp)
+	sd	a3, 112(sp)
+	sd	a4, 120(sp)
+	sw	a5, 128(sp)
+	sw	a0, 132(sp)
+	addi	a0, sp, 96
 	call	m_sumbig
 	addi	a0, a0, -75
 	seqz	a1, a0
-	j	.LBB48_21
-.LBB48_20:
+	j	.LBB63_21
+.LBB63_20:
 	li	a1, 0
-.LBB48_21:
-	lw	a0, 4(s2)
+.LBB63_21:
+	lw	a0, 4(s5)
 	addi	a0, a0, 1
-	sw	a0, 4(s2)
-	bnez	a1, .LBB48_24
+	sw	a0, 4(s5)
+	bnez	a1, .LBB63_24
 # %bb.22:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_24
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_24
 # %bb.23:
-	sw	a0, 0(s2)
-.LBB48_24:
+	sw	a0, 0(s5)
+.LBB63_24:
 	li	a0, 97
 	call	m_inc1
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	zext.b	a2, a0
 	addi	a0, a1, 1
 	li	a1, 98
-	sw	a0, 4(s2)
-	beq	a2, a1, .LBB48_27
+	sw	a0, 4(s5)
+	beq	a2, a1, .LBB63_27
 # %bb.25:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_27
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_27
 # %bb.26:
-	sw	a0, 0(s2)
-.LBB48_27:
+	sw	a0, 0(s5)
+.LBB63_27:
 	li	s3, -1
 	slli	s3, s3, 32
 	li	s1, 21
 	slli	a0, s1, 32
 	addi	a0, a0, 120
 	call	m_mixed
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a2, s3, 255
 	and	a2, a0, a2
 	slli	s1, s1, 33
 	addi	a0, a1, 1
 	addi	a1, s1, 121
-	sw	a0, 4(s2)
-	beq	a2, a1, .LBB48_30
+	sw	a0, 4(s5)
+	beq	a2, a1, .LBB63_30
 # %bb.28:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_30
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_30
 # %bb.29:
-	sw	a0, 0(s2)
-.LBB48_30:
+	sw	a0, 0(s5)
+.LBB63_30:
 	li	a0, 41
 	call	m_union
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	and	a2, a0, s3
 	addi	a0, a1, 1
-	sw	a0, 4(s2)
-	beq	a2, s1, .LBB48_33
+	sw	a0, 4(s5)
+	beq	a2, s1, .LBB63_33
 # %bb.31:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_33
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_33
 # %bb.32:
-	sw	a0, 0(s2)
-.LBB48_33:
+	sw	a0, 0(s5)
+.LBB63_33:
 	li	a0, 5
 	slli	a0, a0, 34
 	addi	a0, a0, 10
 	li	a1, 30
 	call	m_modify12
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
 	li	a2, 1020
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_36
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_36
 # %bb.34:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_36
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_36
 # %bb.35:
-	sw	a1, 0(s2)
-.LBB48_36:
-	lui	s5, 16
-	addi	a2, s5, -3
+	sw	a1, 0(s5)
+.LBB63_36:
+	lui	s4, 16
+	addi	a2, s4, -3
 	li	a0, -3
 	li	a1, -3
 	li	a3, 1
 	li	s1, -3
 	call	m_widen
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
-	addi	s5, s5, -8
-	sw	a1, 4(s2)
-	beq	a0, s5, .LBB48_39
+	addi	s4, s4, -8
+	sw	a1, 4(s5)
+	beq	a0, s4, .LBB63_39
 # %bb.37:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_39
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_39
 # %bb.38:
-	sw	a1, 0(s2)
-.LBB48_39:
+	sw	a1, 0(s5)
+.LBB63_39:
 	lui	a0, 32
 	addi	a0, a0, -3
 	call	m_trunc_sc
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
-	beq	a0, s1, .LBB48_42
+	sw	a1, 4(s5)
+	beq	a0, s1, .LBB63_42
 # %bb.40:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_42
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_42
 # %bb.41:
-	sw	a1, 0(s2)
-.LBB48_42:
+	sw	a1, 0(s5)
+.LBB63_42:
 	lui	a0, 24
 	call	m_trunc_s
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
 	lui	a2, 1048568
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_45
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_45
 # %bb.43:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_45
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_45
 # %bb.44:
-	sw	a1, 0(s2)
-.LBB48_45:
+	sw	a1, 0(s5)
+.LBB63_45:
 	lui	a0, 32
 	addi	a0, a0, -3
 	call	m_trunc_us
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	lui	a2, 16
 	addi	a1, a1, 1
 	addi	a2, a2, -3
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_48
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_48
 # %bb.46:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_48
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_48
 # %bb.47:
-	sw	a1, 0(s2)
-.LBB48_48:
+	sw	a1, 0(s5)
+.LBB63_48:
 	li	a0, 256
 	call	m_tobool
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
-	bnez	a0, .LBB48_51
+	sw	a1, 4(s5)
+	bnez	a0, .LBB63_51
 # %bb.49:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_51
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_51
 # %bb.50:
-	sw	a1, 0(s2)
-.LBB48_51:
+	sw	a1, 0(s5)
+.LBB63_51:
 	li	a0, 0
 	call	m_vsum
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
-	beqz	a0, .LBB48_54
+	sw	a1, 4(s5)
+	beqz	a0, .LBB63_54
 # %bb.52:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_54
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_54
 # %bb.53:
-	sw	a1, 0(s2)
-.LBB48_54:
+	sw	a1, 0(s5)
+.LBB63_54:
 	li	t0, 10
 	li	t1, 9
 	li	t2, 8
@@ -1480,28 +1848,28 @@ c_calls_merlin:                         # @c_calls_merlin
 	sd	t0, 16(sp)
 	li	s1, 5
 	call	m_vsum
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
 	li	a2, 55
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_57
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_57
 # %bb.55:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_57
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_57
 # %bb.56:
-	sw	a1, 0(s2)
-.LBB48_57:
-	ld	a0, 128(sp)
-	ld	a1, 136(sp)
-	ld	a2, 144(sp)
-	ld	a3, 152(sp)
-	lw	a4, 160(sp)
-	sd	a0, 88(sp)
-	sd	a1, 96(sp)
-	sd	a2, 104(sp)
-	sd	a3, 112(sp)
-	sw	a4, 120(sp)
-	sw	s4, 124(sp)
+	sw	a1, 0(s5)
+.LBB63_57:
+	ld	a0, 136(sp)
+	ld	a1, 144(sp)
+	ld	a2, 152(sp)
+	ld	a3, 160(sp)
+	lw	a4, 168(sp)
+	sd	a0, 96(sp)
+	sd	a1, 104(sp)
+	sd	a2, 112(sp)
+	sd	a3, 120(sp)
+	sw	a4, 128(sp)
+	sw	s2, 132(sp)
 .Lpcrel_hi3:
 	auipc	a0, %pcrel_hi(.L.str)
 	lui	a1, 98305
@@ -1513,38 +1881,38 @@ c_calls_merlin:                         # @c_calls_merlin
 	li	a1, 7
 	li	a2, -3
 	li	a6, 30
-	addi	a7, sp, 88
+	addi	a7, sp, 96
 	mv	a3, s1
 	mv	a4, s0
 	call	m_vmix
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
-	li	s5, 180
-	sw	a1, 4(s2)
-	beq	a0, s5, .LBB48_60
+	li	s4, 180
+	sw	a1, 4(s5)
+	beq	a0, s4, .LBB63_60
 # %bb.58:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_60
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_60
 # %bb.59:
-	sw	a1, 0(s2)
-.LBB48_60:
-	ld	a0, 128(sp)
-	ld	a1, 136(sp)
-	ld	a2, 144(sp)
-	ld	a3, 152(sp)
-	lw	a4, 160(sp)
-	sd	a0, 88(sp)
-	sd	a1, 96(sp)
-	sd	a2, 104(sp)
-	sd	a3, 112(sp)
-	sw	a4, 120(sp)
-	sw	s4, 124(sp)
+	sw	a1, 0(s5)
+.LBB63_60:
+	ld	a0, 136(sp)
+	ld	a1, 144(sp)
+	ld	a2, 152(sp)
+	ld	a3, 160(sp)
+	lw	a4, 168(sp)
+	sd	a0, 96(sp)
+	sd	a1, 104(sp)
+	sd	a2, 112(sp)
+	sd	a3, 120(sp)
+	sw	a4, 128(sp)
+	sw	s2, 132(sp)
 .Lpcrel_hi4:
 	auipc	a0, %pcrel_hi(.L.str.1)
 	li	a1, 5
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi4)
 	slli	a2, a1, 34
-	addi	a1, sp, 88
+	addi	a1, sp, 96
 	addi	a2, a2, 10
 	li	a3, 30
 	li	a6, -3
@@ -1552,16 +1920,16 @@ c_calls_merlin:                         # @c_calls_merlin
 	mv	a4, s0
 	mv	a5, s1
 	call	m_vmix
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
-	beq	a0, s5, .LBB48_63
+	sw	a1, 4(s5)
+	beq	a0, s4, .LBB63_63
 # %bb.61:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_63
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_63
 # %bb.62:
-	sw	a1, 0(s2)
-.LBB48_63:
+	sw	a1, 0(s5)
+.LBB63_63:
 	li	t0, 100
 	li	a0, 1
 	li	a1, 2
@@ -1574,17 +1942,17 @@ c_calls_merlin:                         # @c_calls_merlin
 	sd	t0, 0(sp)
 	li	s1, 5
 	call	m_vlate
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
 	li	a2, 203
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_66
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_66
 # %bb.64:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_66
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_66
 # %bb.65:
-	sw	a1, 0(s2)
-.LBB48_66:
+	sw	a1, 0(s5)
+.LBB63_66:
 	li	t0, -5
 	li	a0, 97
 	li	a1, 30
@@ -1607,19 +1975,19 @@ c_calls_merlin:                         # @c_calls_merlin
 	sd	t0, 24(sp)
 	sd	t1, 32(sp)
 	call	m_stack
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a2, a1, 1
 	li	a3, 261
-	sw	a2, 4(s2)
-	beq	a0, a3, .LBB48_69
+	sw	a2, 4(s5)
+	beq	a0, a3, .LBB63_69
 # %bb.67:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_69
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_69
 # %bb.68:
-	sw	a2, 0(s2)
-.LBB48_69:
+	sw	a2, 0(s5)
+.LBB63_69:
 	addi	a1, a1, 2
-	sw	a1, 4(s2)
+	sw	a1, 4(s5)
 	li	t0, 9
 	li	a0, 1
 	li	a1, 2
@@ -1630,10 +1998,10 @@ c_calls_merlin:                         # @c_calls_merlin
 	li	a6, 7
 	li	a7, 8
 	sd	t0, 0(sp)
-	li	s0, 1
+	li	s1, 1
 	call	m_stack_ret
 	li	a2, 15
-	lw	a3, 4(s2)
+	lw	a3, 4(s5)
 	slli	a2, a2, 32
 	slli	a1, a1, 32
 	addi	a2, a2, 6
@@ -1642,257 +2010,257 @@ c_calls_merlin:                         # @c_calls_merlin
 	xori	a1, a1, 65
 	or	a1, a0, a1
 	addi	a0, a3, 1
-	sw	a0, 4(s2)
-	beqz	a1, .LBB48_72
+	sw	a0, 4(s5)
+	beqz	a1, .LBB63_72
 # %bb.70:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_72
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_72
 # %bb.71:
-	sw	a0, 0(s2)
-.LBB48_72:
+	sw	a0, 0(s5)
+.LBB63_72:
 .Lpcrel_hi5:
 	auipc	a1, %pcrel_hi(.L.str.2)
-	slli	a2, s0, 60
+	slli	a2, s1, 60
 	li	a0, -5
 	addi	a4, a1, %pcrel_lo(.Lpcrel_hi5)
 	li	a1, -1
 	lui	a3, 524288
 	call	m_mixw
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	lui	a2, 32768
 	addi	a2, a2, 1
 	slli	a3, a2, 61
 	addi	a1, a1, 1
 	add	a2, a2, a3
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_75
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_75
 # %bb.73:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_75
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_75
 # %bb.74:
-	sw	a1, 0(s2)
-.LBB48_75:
+	sw	a1, 0(s5)
+.LBB63_75:
 	li	a0, -1
 	call	m_umax
-	beqz	a0, .LBB48_77
+	beqz	a0, .LBB63_77
 # %bb.76:
 	lui	a0, 524288
 	addiw	a0, a0, -1
 	call	m_umax
 	seqz	a1, a0
-	j	.LBB48_78
-.LBB48_77:
+	j	.LBB63_78
+.LBB63_77:
 	li	a1, 0
-.LBB48_78:
-	lw	a0, 4(s2)
+.LBB63_78:
+	lw	a0, 4(s5)
 	addi	a0, a0, 1
-	sw	a0, 4(s2)
-	bnez	a1, .LBB48_81
+	sw	a0, 4(s5)
+	bnez	a1, .LBB63_81
 # %bb.79:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_81
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_81
 # %bb.80:
-	sw	a0, 0(s2)
-.LBB48_81:
+	sw	a0, 0(s5)
+.LBB63_81:
 	li	a0, -5
-	li	s0, -5
+	li	s1, -5
 	call	m_sext
-	bne	a0, s0, .LBB48_83
+	bne	a0, s1, .LBB63_83
 # %bb.82:
-	lui	s0, 524288
-	addiw	s0, s0, -1
-	mv	a0, s0
+	lui	s1, 524288
+	addiw	s1, s1, -1
+	mv	a0, s1
 	call	m_sext
-	xor	a0, a0, s0
+	xor	a0, a0, s1
 	seqz	a1, a0
-	j	.LBB48_84
-.LBB48_83:
+	j	.LBB63_84
+.LBB63_83:
 	li	a1, 0
-.LBB48_84:
-	lw	a0, 4(s2)
+.LBB63_84:
+	lw	a0, 4(s5)
 	addi	a0, a0, 1
-	sw	a0, 4(s2)
-	bnez	a1, .LBB48_87
+	sw	a0, 4(s5)
+	bnez	a1, .LBB63_87
 # %bb.85:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_87
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_87
 # %bb.86:
-	sw	a0, 0(s2)
-.LBB48_87:
+	sw	a0, 0(s5)
+.LBB63_87:
 	li	a0, -1
-	li	s0, -1
+	li	s1, -1
 	call	m_zext
-	srli	s0, s0, 32
-	bne	a0, s0, .LBB48_89
+	srli	s1, s1, 32
+	bne	a0, s1, .LBB63_89
 # %bb.88:
 	lui	a0, 524288
 	call	m_zext
 	snez	a1, a0
-	j	.LBB48_90
-.LBB48_89:
+	j	.LBB63_90
+.LBB63_89:
 	li	a1, 0
-.LBB48_90:
-	lw	a0, 4(s2)
+.LBB63_90:
+	lw	a0, 4(s5)
 	addi	a0, a0, 1
-	sw	a0, 4(s2)
-	bnez	a1, .LBB48_93
+	sw	a0, 4(s5)
+	bnez	a1, .LBB63_93
 # %bb.91:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_93
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_93
 # %bb.92:
-	sw	a0, 0(s2)
-.LBB48_93:
-	lui	s1, 524288
-	addi	s0, s1, 5
-	mv	a0, s0
+	sw	a0, 0(s5)
+.LBB63_93:
+	lui	s2, 524288
+	addi	s1, s2, 5
+	mv	a0, s1
 	call	m_narrow
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
-	beq	a0, s0, .LBB48_96
+	sw	a1, 4(s5)
+	beq	a0, s1, .LBB63_96
 # %bb.94:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_96
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_96
 # %bb.95:
-	sw	a1, 0(s2)
-.LBB48_96:
+	sw	a1, 0(s5)
+.LBB63_96:
 	lui	a0, 524288
 	call	m_unarrow
-	bne	a0, s1, .LBB48_98
+	bne	a0, s2, .LBB63_98
 # %bb.97:
 	lui	a0, 524288
 	call	m_unarrow
 	snez	a1, a0
-	j	.LBB48_99
-.LBB48_98:
+	j	.LBB63_99
+.LBB63_98:
 	li	a1, 0
-.LBB48_99:
-	lw	a0, 4(s2)
+.LBB63_99:
+	lw	a0, 4(s5)
 	addi	a0, a0, 1
-	sw	a0, 4(s2)
-	bnez	a1, .LBB48_102
+	sw	a0, 4(s5)
+	bnez	a1, .LBB63_102
 # %bb.100:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_102
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_102
 # %bb.101:
-	sw	a0, 0(s2)
-.LBB48_102:
-	li	s0, 1
-	slli	s0, s0, 60
-	mv	a0, s0
+	sw	a0, 0(s5)
+.LBB63_102:
+	li	s1, 1
+	slli	s1, s1, 60
+	mv	a0, s1
 	call	m_incl1
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
-	addi	a2, s0, 1
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_105
+	addi	a2, s1, 1
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_105
 # %bb.103:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_105
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_105
 # %bb.104:
-	sw	a1, 0(s2)
-.LBB48_105:
+	sw	a1, 0(s5)
+.LBB63_105:
 	li	a1, -7
-	mv	a0, s0
+	mv	a0, s1
 	call	m_swapl2
-	lw	a2, 4(s2)
-	xor	a1, a1, s0
+	lw	a2, 4(s5)
+	xor	a1, a1, s1
 	xori	a0, a0, -7
 	or	a1, a0, a1
 	addi	a0, a2, 1
-	sw	a0, 4(s2)
-	beqz	a1, .LBB48_108
+	sw	a0, 4(s5)
+	beqz	a1, .LBB63_108
 # %bb.106:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_108
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_108
 # %bb.107:
-	sw	a0, 0(s2)
-.LBB48_108:
-	li	s1, 1
-	slli	a1, s1, 32
-	slli	s1, s1, 60
+	sw	a0, 0(s5)
+.LBB63_108:
+	li	s2, 1
+	slli	a1, s2, 32
+	slli	s2, s2, 60
 	addi	a1, a1, -3
-	mv	a0, s1
+	mv	a0, s2
 	call	m_li
-	mv	s0, a1
-	lw	a1, 4(s2)
+	mv	s1, a1
+	lw	a1, 4(s5)
 	li	a2, -33
-	slli	a3, s0, 32
+	slli	a3, s1, 32
 	srli	a2, a2, 4
 	srli	a3, a3, 32
 	xor	a0, a0, a2
 	xori	a2, a3, 3
 	or	a2, a0, a2
 	addi	a0, a1, 1
-	sw	a0, 4(s2)
-	beqz	a2, .LBB48_111
+	sw	a0, 4(s5)
+	beqz	a2, .LBB63_111
 # %bb.109:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_111
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_111
 # %bb.110:
-	sw	a0, 0(s2)
-.LBB48_111:
+	sw	a0, 0(s5)
+.LBB63_111:
 	li	a0, 97
-	mv	a1, s1
+	mv	a1, s2
 	call	m_cl
-	lw	a2, 4(s2)
-	li	s8, -1
+	lw	a2, 4(s5)
+	li	s9, -1
 	zext.b	a3, a0
-	slli	a0, s8, 60
+	slli	a0, s9, 60
 	xori	a3, a3, 98
 	xor	a1, a1, a0
 	or	a3, a3, a1
 	addi	a1, a2, 1
-	sw	a1, 4(s2)
-	beqz	a3, .LBB48_114
+	sw	a1, 4(s5)
+	beqz	a3, .LBB63_114
 # %bb.112:
-	lw	a2, 0(s2)
-	bnez	a2, .LBB48_114
+	lw	a2, 0(s5)
+	bnez	a2, .LBB63_114
 # %bb.113:
-	sw	a1, 0(s2)
-.LBB48_114:
-	li	s9, 1
+	sw	a1, 0(s5)
+.LBB63_114:
+	li	s10, 1
 	li	a1, 2
-	slli	s1, s9, 60
-	sd	s1, 64(sp)
-	sd	a1, 72(sp)
-	sd	a0, 80(sp)
-	sd	s1, 40(sp)
-	sd	a1, 48(sp)
-	sd	a0, 56(sp)
-	addi	a0, sp, 88
-	addi	a1, sp, 64
-	addi	a2, sp, 40
-	addi	s7, sp, 88
+	slli	s2, s10, 60
+	sd	s2, 72(sp)
+	sd	a1, 80(sp)
+	sd	a0, 88(sp)
+	sd	s2, 48(sp)
+	sd	a1, 56(sp)
+	sd	a0, 64(sp)
+	addi	a0, sp, 96
+	addi	a1, sp, 72
+	addi	a2, sp, 48
+	addi	s8, sp, 96
 	call	m_addl3
-	ld	s4, 88(sp)
-	ld	s5, 96(sp)
+	ld	s4, 96(sp)
 	ld	s6, 104(sp)
+	ld	s7, 112(sp)
+	slli	s10, s10, 61
+	lw	a0, 4(s5)
+	xor	a1, s4, s10
+	xori	a2, s6, 4
 	slli	s9, s9, 61
-	lw	a0, 4(s2)
-	xor	a1, s4, s9
-	xori	a2, s5, 4
-	slli	s8, s8, 61
 	or	a1, a1, a2
-	xor	a2, s6, s8
+	xor	a2, s7, s9
 	or	a1, a1, a2
 	addi	a0, a0, 1
-	sw	a0, 4(s2)
-	beqz	a1, .LBB48_117
+	sw	a0, 4(s5)
+	beqz	a1, .LBB63_117
 # %bb.115:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_117
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_117
 # %bb.116:
-	sw	a0, 0(s2)
-.LBB48_117:
-	and	s0, s0, s3
+	sw	a0, 0(s5)
+.LBB63_117:
+	and	s1, s1, s3
 	li	a0, 5
-	addi	s0, s0, 6
-	sd	s4, 88(sp)
-	sd	s5, 96(sp)
+	addi	s1, s1, 6
+	sd	s4, 96(sp)
 	sd	s6, 104(sp)
+	sd	s7, 112(sp)
 	sd	a0, 0(sp)
-	sd	s0, 8(sp)
+	sd	s1, 8(sp)
 .Lpcrel_hi6:
 	auipc	a0, %pcrel_hi(.L.str.3)
 .Lpcrel_hi7:
@@ -1904,57 +2272,57 @@ c_calls_merlin:                         # @c_calls_merlin
 	lui	a4, 524288
 	li	a6, 3
 	li	a7, 4
-	mv	a3, s1
-	sd	s7, 16(sp)
-	li	s7, -1
+	mv	a3, s2
+	sd	s8, 16(sp)
+	li	s8, -1
 	call	m_vmixw
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 .Lpcrel_hi8:
-	auipc	a2, %pcrel_hi(.LCPI48_0)
+	auipc	a2, %pcrel_hi(.LCPI63_0)
 	ld	s3, %pcrel_lo(.Lpcrel_hi8)(a2)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
-	beq	a0, s3, .LBB48_120
+	sw	a1, 4(s5)
+	beq	a0, s3, .LBB63_120
 # %bb.118:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_120
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_120
 # %bb.119:
-	sw	a1, 0(s2)
-.LBB48_120:
-	sd	s4, 88(sp)
-	sd	s5, 96(sp)
+	sw	a1, 0(s5)
+.LBB63_120:
+	sd	s4, 96(sp)
 	sd	s6, 104(sp)
-	li	s1, 1
+	sd	s7, 112(sp)
+	li	s2, 1
 .Lpcrel_hi9:
 	auipc	a0, %pcrel_hi(.L.str.5)
-	slli	s1, s1, 60
-	sd	s1, 0(sp)
-	sd	s7, 8(sp)
-	sd	s7, 16(sp)
+	slli	s2, s2, 60
+	sd	s2, 0(sp)
+	sd	s8, 8(sp)
+	sd	s8, 16(sp)
 .Lpcrel_hi10:
 	auipc	a1, %pcrel_hi(.L.str.4)
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi9)
 	addi	a6, a1, %pcrel_lo(.Lpcrel_hi10)
-	addi	a1, sp, 88
+	addi	a1, sp, 96
 	li	a2, 5
 	li	a4, 3
 	li	a5, 4
 	lui	a7, 524288
-	mv	a3, s0
+	mv	a3, s1
 	li	s4, 3
-	li	s5, 4
+	li	s6, 4
 	call	m_vmixw
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
-	beq	a0, s3, .LBB48_123
+	sw	a1, 4(s5)
+	beq	a0, s3, .LBB63_123
 # %bb.121:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_123
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_123
 # %bb.122:
-	sw	a1, 0(s2)
-.LBB48_123:
-	li	s0, -1
+	sw	a1, 0(s5)
+.LBB63_123:
+	li	s1, -1
 	li	a0, 1
 	li	a1, 2
 	li	a2, 3
@@ -1964,30 +2332,30 @@ c_calls_merlin:                         # @c_calls_merlin
 	li	a6, 7
 	li	a7, -2
 	sd	s4, 0(sp)
-	sd	s5, 8(sp)
-	sd	s0, 16(sp)
-	sd	s1, 24(sp)
+	sd	s6, 8(sp)
+	sd	s1, 16(sp)
+	sd	s2, 24(sp)
 	call	m_stackw
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 .Lpcrel_hi11:
-	auipc	a2, %pcrel_hi(.LCPI48_1)
+	auipc	a2, %pcrel_hi(.LCPI63_1)
 	ld	a2, %pcrel_lo(.Lpcrel_hi11)(a2)
 	addi	a1, a1, 1
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_126
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_126
 # %bb.124:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_126
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_126
 # %bb.125:
-	sw	a1, 0(s2)
-.LBB48_126:
+	sw	a1, 0(s5)
+.LBB63_126:
 	li	a0, 1
 	slli	a0, a0, 32
 	li	a1, -1
 	mv	a2, a0
 	call	m_qadd
-	srli	s0, s0, 31
-	bne	a0, s0, .LBB48_128
+	srli	s1, s1, 31
+	bne	a0, s1, .LBB63_128
 # %bb.127:
 	li	a0, -1
 	li	a1, -1
@@ -1995,43 +2363,43 @@ c_calls_merlin:                         # @c_calls_merlin
 	call	m_qadd
 	addi	a0, a0, 3
 	seqz	a1, a0
-	j	.LBB48_129
-.LBB48_128:
+	j	.LBB63_129
+.LBB63_128:
 	li	a1, 0
-.LBB48_129:
-	lw	a0, 4(s2)
+.LBB63_129:
+	lw	a0, 4(s5)
 	addi	a0, a0, 1
-	sw	a0, 4(s2)
-	bnez	a1, .LBB48_132
+	sw	a0, 4(s5)
+	bnez	a1, .LBB63_132
 # %bb.130:
-	lw	a1, 0(s2)
-	bnez	a1, .LBB48_132
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_132
 # %bb.131:
-	sw	a0, 0(s2)
-.LBB48_132:
+	sw	a0, 0(s5)
+.LBB63_132:
 .Lpcrel_hi12:
-	auipc	a0, %pcrel_hi(.LCPI48_2)
+	auipc	a0, %pcrel_hi(.LCPI63_2)
 	ld	a0, %pcrel_lo(.Lpcrel_hi12)(a0)
 	call	m_qhigh
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	lui	a2, 172
 	addi	a2, a2, -801
 	slli	a2, a2, 12
 	addi	a1, a1, 1
 	addi	a2, a2, -255
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_135
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_135
 # %bb.133:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_135
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_135
 # %bb.134:
-	sw	a1, 0(s2)
-.LBB48_135:
-	li	s0, 1
+	sw	a1, 0(s5)
+.LBB63_135:
+	li	s1, 1
 	li	a0, -1
 	li	t0, 9
 	slli	a0, a0, 32
-	slli	a7, s0, 32
+	slli	a7, s1, 32
 	sd	a0, 0(sp)
 	li	a0, 1
 	li	a1, 2
@@ -2043,57 +2411,57 @@ c_calls_merlin:                         # @c_calls_merlin
 	sd	t0, 8(sp)
 	sd	a7, 16(sp)
 	call	m_qlate
-	lw	a1, 4(s2)
-	slli	s0, s0, 34
+	lw	a1, 4(s5)
+	slli	s1, s1, 34
 	addi	a1, a1, 1
-	addi	a2, s0, 37
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_138
+	addi	a2, s1, 37
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_138
 # %bb.136:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_138
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_138
 # %bb.137:
-	sw	a1, 0(s2)
-.LBB48_138:
+	sw	a1, 0(s5)
+.LBB63_138:
 	lui	a0, 2384
-	addi	s1, a0, 761
-	slli	s0, s1, 9
-	mv	a0, s0
+	addi	s2, a0, 761
+	slli	s1, s2, 9
+	mv	a0, s1
 	call	m_qtwice
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
-	slli	s1, s1, 10
-	sw	a1, 4(s2)
-	beq	a0, s1, .LBB48_141
+	slli	s2, s2, 10
+	sw	a1, 4(s5)
+	beq	a0, s2, .LBB63_141
 # %bb.139:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_141
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_141
 # %bb.140:
-	sw	a1, 0(s2)
-.LBB48_141:
+	sw	a1, 0(s5)
+.LBB63_141:
 	lui	a0, 682365
 	slli	a0, a0, 1
 	addi	a1, a0, 512
 	li	a0, 7
-	mv	a2, s0
+	mv	a2, s1
 	call	m_qsum
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	lui	a2, 488281
 	addi	a1, a1, 1
 	addi	a2, a2, 1031
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_144
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_144
 # %bb.142:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_144
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_144
 # %bb.143:
-	sw	a1, 0(s2)
-.LBB48_144:
+	sw	a1, 0(s5)
+.LBB63_144:
 .Lpcrel_hi13:
 	auipc	a0, %pcrel_hi(.L.str.6)
-	li	s0, 1
+	li	s1, 1
 	addi	a0, a0, %pcrel_lo(.Lpcrel_hi13)
-	slli	s0, s0, 32
+	slli	s1, s1, 32
 	lui	a1, 2384
 	li	a5, -1
 	addi	a4, a1, 761
@@ -2101,22 +2469,22 @@ c_calls_merlin:                         # @c_calls_merlin
 	slli	a4, a4, 9
 	li	a1, 1
 	li	a3, 2
-	mv	a2, s0
+	mv	a2, s1
 	call	m_vq
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	lui	a2, 298
 	addi	a2, a2, 95
 	slli	a2, a2, 12
 	addi	a1, a1, 1
 	addi	a2, a2, 515
-	sw	a1, 4(s2)
-	beq	a0, a2, .LBB48_147
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_147
 # %bb.145:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_147
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_147
 # %bb.146:
-	sw	a1, 0(s2)
-.LBB48_147:
+	sw	a1, 0(s5)
+.LBB63_147:
 .Lpcrel_hi14:
 	auipc	a0, %pcrel_hi(.L.str.7)
 	li	a1, 1
@@ -2126,57 +2494,662 @@ c_calls_merlin:                         # @c_calls_merlin
 	li	a4, 4
 	li	a5, 5
 	li	a6, 6
-	mv	a7, s0
+	mv	a7, s1
 	call	m_vq
-	lw	a1, 4(s2)
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
-	addi	s0, s0, 21
-	sw	a1, 4(s2)
-	beq	a0, s0, .LBB48_150
+	addi	s1, s1, 21
+	sw	a1, 4(s5)
+	beq	a0, s1, .LBB63_150
 # %bb.148:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_150
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_150
 # %bb.149:
-	sw	a1, 0(s2)
-.LBB48_150:
-	li	s0, 1
+	sw	a1, 0(s5)
+.LBB63_150:
+	li	s1, 1
 	li	a0, 1
 	li	a1, 2
+	slli	s1, s1, 32
+	li	a2, 3
+	li	a3, 4
+	li	a4, 5
+	li	a5, 6
+	li	a6, 7
+	mv	a7, s1
+	li	s2, 3
+	call	m_vqlate
+	lw	a1, 4(s5)
+	addi	a1, a1, 1
+	addi	a2, s1, 28
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_153
+# %bb.151:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_153
+# %bb.152:
+	sw	a1, 0(s5)
+.LBB63_153:
+	li	a0, 1
+	li	a1, 2
+	li	a2, 3
+	li	a3, 4
+	li	a4, 5
+	li	a5, 6
+	mv	a6, s1
+	li	s1, 4
+	call	m_q67
+	lw	a1, 4(s5)
+	slli	s2, s2, 32
+	addi	a1, a1, 1
+	addi	s2, s2, 21
+	sw	a1, 4(s5)
+	beq	a0, s2, .LBB63_156
+# %bb.154:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_156
+# %bb.155:
+	sw	a1, 0(s5)
+.LBB63_156:
+	li	a0, -2
+	li	t0, 9
+	lui	a1, 98305
+	slli	a1, a1, 5
+	lui	a2, 2384
+	addi	a1, a1, 1
+	sd	a0, 32(sp)
+	sd	a1, 40(sp)
+	addi	a0, a2, 761
+	slli	t1, a0, 9
+	li	a0, 1
+	li	a1, 2
+	li	a2, 3
+	li	a3, 4
+	li	a4, 5
+	li	a5, 6
+	li	a6, 7
+	li	a7, 8
+	sd	t0, 0(sp)
+	sd	s0, 8(sp)
+	sd	s1, 16(sp)
+	sd	t1, 24(sp)
+	li	s0, 1
+	call	m_oddstack
+	lw	a1, 4(s5)
+	lui	a2, 38147
+	slli	a2, a2, 5
+	addi	a1, a1, 1
+	addi	a2, a2, 1251
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_159
+# %bb.157:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_159
+# %bb.158:
+	sw	a1, 0(s5)
+.LBB63_159:
+.Lpcrel_hi15:
+	auipc	a0, %pcrel_hi(.L.str.8)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi15)
 	slli	s0, s0, 32
+	mv	a1, s0
+	call	m_vq
+	bne	a0, s0, .LBB63_161
+# %bb.160:
+	lui	a0, 2384
+.Lpcrel_hi16:
+	auipc	a1, %pcrel_hi(.L.str.9)
+	addi	s0, a0, 761
+	addi	a0, a1, %pcrel_lo(.Lpcrel_hi16)
+	slli	s0, s0, 9
+	mv	a1, s0
+	call	m_vq
+	xor	a0, a0, s0
+	seqz	a1, a0
+	j	.LBB63_162
+.LBB63_161:
+	li	a1, 0
+.LBB63_162:
+	lw	a0, 4(s5)
+	addi	a0, a0, 1
+	sw	a0, 4(s5)
+	bnez	a1, .LBB63_165
+# %bb.163:
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_165
+# %bb.164:
+	sw	a0, 0(s5)
+.LBB63_165:
+.Lpcrel_hi17:
+	auipc	a0, %pcrel_hi(.L.str.10)
+	lui	a2, 2384
+	li	a1, 1
+	addi	s0, a2, 761
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi17)
+	slli	s0, s0, 9
+	li	a2, 2
+	li	a3, 3
+	li	a4, 4
+	li	a5, 5
+	mv	a6, s0
+	call	m_vq
+	lw	a1, 4(s5)
+	lui	a2, 298
+	addi	a2, a2, 95
+	slli	s1, a2, 12
+	addi	a1, a1, 1
+	addi	a2, s1, 527
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_168
+# %bb.166:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_168
+# %bb.167:
+	sw	a1, 0(s5)
+.LBB63_168:
+.Lpcrel_hi18:
+	auipc	a0, %pcrel_hi(.L.str.11)
+	li	a1, 1
+	li	a2, 2
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi18)
+	li	a3, 3
+	li	a4, 4
+	li	a5, 5
+	li	a6, 6
+	mv	a7, s0
+	li	s0, 1
+	call	m_vq
+	lw	a1, 4(s5)
+	addi	a1, a1, 1
+	addi	a2, s1, 533
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_171
+# %bb.169:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_171
+# %bb.170:
+	sw	a1, 0(s5)
+.LBB63_171:
+.Lpcrel_hi19:
+	auipc	a0, %pcrel_hi(.L.str.12)
+	slli	a3, s0, 32
+	li	a5, -1
+	addi	a2, a0, %pcrel_lo(.Lpcrel_hi19)
+	lui	a0, 2384
+	slli	a5, a5, 32
+	addi	a6, a0, 761
+	slli	a6, a6, 9
+	li	a0, 1
+	li	a1, 2
+	li	a4, 3
+	call	m_vq3
+	lw	a1, 4(s5)
+	lui	a2, 298
+	addi	a2, a2, 95
+	slli	a2, a2, 12
+	addi	a1, a1, 1
+	addi	a2, a2, 518
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_174
+# %bb.172:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_174
+# %bb.173:
+	sw	a1, 0(s5)
+.LBB63_174:
+.Lpcrel_hi20:
+	auipc	a0, %pcrel_hi(.L.str.13)
+	li	s0, 1
+	addi	a2, a0, %pcrel_lo(.Lpcrel_hi20)
+	slli	s0, s0, 32
+	li	a0, 1
+	li	a1, 2
+	li	a3, 3
+	li	a4, 4
+	li	a5, 5
+	mv	a6, s0
+	call	m_vq3
+	lw	a1, 4(s5)
+	addi	a1, a1, 1
+	addi	s0, s0, 15
+	sw	a1, 4(s5)
+	beq	a0, s0, .LBB63_177
+# %bb.175:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_177
+# %bb.176:
+	sw	a1, 0(s5)
+.LBB63_177:
+.Lpcrel_hi21:
+	auipc	a0, %pcrel_hi(.L.str.14)
+	lui	a1, 2384
+	addi	a2, a0, %pcrel_lo(.Lpcrel_hi21)
+	addi	a7, a1, 761
+	li	a0, 1
+	slli	a7, a7, 9
+	li	a1, 2
+	li	a3, 3
+	li	a4, 4
+	li	a5, 5
+	li	a6, 6
+	call	m_vq3
+	lw	a1, 4(s5)
+	lui	a2, 298
+	addi	a2, a2, 95
+	slli	a2, a2, 12
+	addi	a1, a1, 1
+	addi	a2, a2, 533
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_180
+# %bb.178:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_180
+# %bb.179:
+	sw	a1, 0(s5)
+.LBB63_180:
+	li	a0, 1
+	li	a1, 9
+	call	m_rev9
+	mv	s0, a0
+	li	a0, 255
+	slli	a0, a0, 32
+	lw	a2, 4(s5)
+	addi	a0, a0, 255
+	zext.b	s2, a1
+	and	a0, s0, a0
+	xori	a1, s2, 1
+	xori	a0, a0, 9
+	or	a1, a0, a1
+	addi	a0, a2, 1
+	sw	a0, 4(s5)
+	beqz	a1, .LBB63_183
+# %bb.181:
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_183
+# %bb.182:
+	sw	a0, 0(s5)
+.LBB63_183:
+	lui	s4, 16
+	addi	a1, s4, -3
+	li	a0, 2
+	call	m_neg10
+	mv	s1, a0
+	addi	a0, s4, -1
+	lw	a2, 4(s5)
+	and	s3, a1, a0
+	and	a0, s1, a0
+	addi	s4, s4, -2
+	xor	a0, a0, s4
+	xori	a1, s3, 3
+	or	a1, a0, a1
+	addi	a0, a2, 1
+	sw	a0, 4(s5)
+	beqz	a1, .LBB63_186
+# %bb.184:
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_186
+# %bb.185:
+	sw	a0, 0(s5)
+.LBB63_186:
+	sd	s2, 0(sp)
+	li	a0, 1
+	li	a1, 2
 	li	a2, 3
 	li	a3, 4
 	li	a4, 5
 	li	a5, 6
 	li	a6, 7
 	mv	a7, s0
-	call	m_vqlate
-	lw	a1, 4(s2)
+	sd	s1, 8(sp)
+	sd	s3, 16(sp)
+	call	m_late910
+	lw	a1, 4(s5)
 	addi	a1, a1, 1
-	addi	s0, s0, 28
-	sw	a1, 4(s2)
-	beq	a0, s0, .LBB48_153
-# %bb.151:
-	lw	a0, 0(s2)
-	bnez	a0, .LBB48_153
-# %bb.152:
-	sw	a1, 0(s2)
-.LBB48_153:
-	lw	a0, 0(s2)
-	ld	ra, 248(sp)                     # 8-byte Folded Reload
-	ld	s0, 240(sp)                     # 8-byte Folded Reload
-	ld	s1, 232(sp)                     # 8-byte Folded Reload
-	ld	s2, 224(sp)                     # 8-byte Folded Reload
-	ld	s3, 216(sp)                     # 8-byte Folded Reload
-	ld	s4, 208(sp)                     # 8-byte Folded Reload
-	ld	s5, 200(sp)                     # 8-byte Folded Reload
-	ld	s6, 192(sp)                     # 8-byte Folded Reload
-	ld	s7, 184(sp)                     # 8-byte Folded Reload
-	ld	s8, 176(sp)                     # 8-byte Folded Reload
-	ld	s9, 168(sp)                     # 8-byte Folded Reload
-	addi	sp, sp, 256
+	li	a2, 345
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_189
+# %bb.187:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_189
+# %bb.188:
+	sw	a1, 0(s5)
+.LBB63_189:
+.Lpcrel_hi22:
+	auipc	a0, %pcrel_hi(.L.str.15)
+	li	s4, -1
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi22)
+	slli	s4, s4, 32
+	li	a5, 97
+	li	a7, 5
+	mv	a1, s0
+	mv	a2, s2
+	mv	a3, s1
+	mv	a4, s3
+	mv	a6, s4
+	call	m_v910
+	lw	a1, 4(s5)
+	addi	a1, a1, 1
+	addi	a2, s4, 419
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_192
+# %bb.190:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_192
+# %bb.191:
+	sw	a1, 0(s5)
+.LBB63_192:
+.Lpcrel_hi23:
+	auipc	a0, %pcrel_hi(.L.str.16)
+	li	a1, 1
+	li	a2, 2
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi23)
+	li	a3, 3
+	li	a4, 4
+	li	a5, 5
+	li	a6, 6
+	mv	a7, s0
+	sd	s2, 0(sp)
+	call	m_v910
+	lw	a1, 4(s5)
+	addi	a1, a1, 1
+	li	a2, 40
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_195
+# %bb.193:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_195
+# %bb.194:
+	sw	a1, 0(s5)
+.LBB63_195:
+	li	s0, -1
+	li	a0, 97
+.Lpcrel_hi24:
+	auipc	a1, %pcrel_hi(.L.str.17)
+	slli	s0, s0, 32
+	sd	s1, 0(sp)
+	sd	s3, 8(sp)
+	sd	a0, 16(sp)
+	addi	a0, a1, %pcrel_lo(.Lpcrel_hi24)
+	li	a1, 1
+	li	a2, 2
+	li	a3, 3
+	li	a4, 4
+	li	a5, 5
+	li	a6, 6
+	li	a7, 7
+	sd	s0, 24(sp)
+	li	s1, 1
+	call	m_v910
+	lw	a1, 4(s5)
+	addi	a1, a1, 1
+	addi	a2, s0, 423
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_198
+# %bb.196:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_198
+# %bb.197:
+	sw	a1, 0(s5)
+.LBB63_198:
+	li	a0, 97
+	mv	a1, s0
+	call	m_cq
+	mv	a3, a0
+	mv	a2, a1
+	lw	a0, 4(s5)
+	zext.b	a1, a3
+	slli	s1, s1, 32
+	xori	a1, a1, 98
+	xor	s1, a2, s1
+	or	a1, a1, s1
+	addi	a0, a0, 1
+	sw	a0, 4(s5)
+	beqz	a1, .LBB63_201
+# %bb.199:
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_201
+# %bb.200:
+	sw	a0, 0(s5)
+.LBB63_201:
+	li	a0, 3
+	mv	a1, a3
+	mv	a4, a2
+	call	m_cqsum
+	lw	a1, 4(s5)
+	li	a2, 1
+	slli	a2, a2, 33
+	addi	a1, a1, 1
+	addi	a2, a2, 1081
+	sw	a1, 4(s5)
+	beq	a0, a2, .LBB63_204
+# %bb.202:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_204
+# %bb.203:
+	sw	a1, 0(s5)
+.LBB63_204:
+	lui	a0, 524288
+	li	a1, -1
+	call	m_ucmp
+	li	a1, 15
+	bne	a0, a1, .LBB63_206
+# %bb.205:
+	li	a0, 5
+	li	a1, 3
+	call	m_ucmp
+	seqz	a1, a0
+	j	.LBB63_207
+.LBB63_206:
+	li	a1, 0
+.LBB63_207:
+	lw	a0, 4(s5)
+	addi	a0, a0, 1
+	sw	a0, 4(s5)
+	bnez	a1, .LBB63_210
+# %bb.208:
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_210
+# %bb.209:
+	sw	a0, 0(s5)
+.LBB63_210:
+	lui	s0, 524288
+	addiw	a0, s0, -1
+	li	a1, 1
+	call	m_uadd
+	bne	a0, s0, .LBB63_212
+# %bb.211:
+	li	a0, -1
+	li	a1, 2
+	call	m_uadd
+	addi	a0, a0, -1
+	seqz	a1, a0
+	j	.LBB63_213
+.LBB63_212:
+	li	a1, 0
+.LBB63_213:
+	lw	a0, 4(s5)
+	addi	a0, a0, 1
+	sw	a0, 4(s5)
+	bnez	a1, .LBB63_216
+# %bb.214:
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_216
+# %bb.215:
+	sw	a0, 0(s5)
+.LBB63_216:
+	lui	a0, 524288
+	li	a1, 0
+	lui	s0, 524288
+	call	m_ushr
+	li	a1, 0
+	bne	a0, s0, .LBB63_218
+# %bb.217:
+	li	a0, -1
+	li	a1, 4
+	call	m_ushr
+	lui	a1, 65536
+	addi	a1, a1, -1
+	xor	a0, a0, a1
+	seqz	a1, a0
+.LBB63_218:
+	lw	a0, 4(s5)
+	addi	a0, a0, 1
+	sw	a0, 4(s5)
+	bnez	a1, .LBB63_221
+# %bb.219:
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_221
+# %bb.220:
+	sw	a0, 0(s5)
+.LBB63_221:
+	li	a0, -2
+	li	a1, 1
+	li	s0, -2
+	call	m_udiv
+	bne	a0, s0, .LBB63_223
+# %bb.222:
+	li	a0, -1
+	li	a1, 2
+	call	m_udiv
+	lui	a1, 524288
+	addiw	a1, a1, -1
+	xor	a0, a0, a1
+	seqz	a1, a0
+	j	.LBB63_224
+.LBB63_223:
+	li	a1, 0
+.LBB63_224:
+	lw	a0, 4(s5)
+	addi	a0, a0, 1
+	sw	a0, 4(s5)
+	bnez	a1, .LBB63_227
+# %bb.225:
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_227
+# %bb.226:
+	sw	a0, 0(s5)
+.LBB63_227:
+	lui	s2, 524288
+	addiw	a0, s2, -1
+	li	a1, 1
+	call	m_uadd
+	mv	s0, a0
+	li	a0, -1
+	li	a1, 1
+	call	m_udiv
+	mv	a1, a0
+	mv	a0, s0
+	call	m_ucmp
+	lw	a1, 4(s5)
+	addi	a1, a1, 1
+	li	s3, 15
+	sw	a1, 4(s5)
+	beq	a0, s3, .LBB63_230
+# %bb.228:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_230
+# %bb.229:
+	sw	a1, 0(s5)
+.LBB63_230:
+	lui	a0, 524288
+	li	a1, 0
+	call	m_ushr
+	mv	s0, a0
+	li	a0, -2
+	li	a1, 1
+	li	s1, 1
+	call	m_uadd
+	xor	a1, s0, s2
+	srli	a2, s0, 28
+	sltu	a3, s0, a0
+	andi	a2, a2, 8
+	or	a2, a2, a3
+	lw	a3, 4(s5)
+	seqz	a1, a1
+	addi	a0, a0, 1
+	slli	a1, a1, 1
+	seqz	a0, a0
+	slli	a0, a0, 2
+	or	a1, a2, a1
+	or	a1, a1, a0
+	addi	a0, a3, 1
+	sw	a0, 4(s5)
+	beq	a1, s3, .LBB63_233
+# %bb.231:
+	lw	a1, 0(s5)
+	bnez	a1, .LBB63_233
+# %bb.232:
+	sw	a0, 0(s5)
+.LBB63_233:
+.Lpcrel_hi25:
+	auipc	a0, %pcrel_hi(m_shlq)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi25)
+	slli	a1, s1, 32
+	li	a2, 3
+	call	m_applyq
+	lw	a1, 4(s5)
+	slli	s1, s1, 35
+	addi	a1, a1, 1
+	addi	s1, s1, 1
+	sw	a1, 4(s5)
+	beq	a0, s1, .LBB63_236
+# %bb.234:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_236
+# %bb.235:
+	sw	a1, 0(s5)
+.LBB63_236:
+.Lpcrel_hi26:
+	auipc	a0, %pcrel_hi(c_shlq)
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi26)
+	li	a1, 5
+	li	a2, 40
+	li	s0, 5
+	call	m_applyq
+	lw	a1, 4(s5)
+	slli	s0, s0, 40
+	addi	a1, a1, 1
+	addi	s0, s0, 1
+	sw	a1, 4(s5)
+	beq	a0, s0, .LBB63_239
+# %bb.237:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_239
+# %bb.238:
+	sw	a1, 0(s5)
+.LBB63_239:
+	li	a0, 3
+	li	a1, 33
+	li	s0, 3
+	call	m_shlq
+	lw	a1, 4(s5)
+	addi	a1, a1, 1
+	slli	s0, s0, 33
+	sw	a1, 4(s5)
+	beq	a0, s0, .LBB63_242
+# %bb.240:
+	lw	a0, 0(s5)
+	bnez	a0, .LBB63_242
+# %bb.241:
+	sw	a1, 0(s5)
+.LBB63_242:
+	lw	a0, 0(s5)
+	ld	ra, 264(sp)                     # 8-byte Folded Reload
+	ld	s0, 256(sp)                     # 8-byte Folded Reload
+	ld	s1, 248(sp)                     # 8-byte Folded Reload
+	ld	s2, 240(sp)                     # 8-byte Folded Reload
+	ld	s3, 232(sp)                     # 8-byte Folded Reload
+	ld	s4, 224(sp)                     # 8-byte Folded Reload
+	ld	s5, 216(sp)                     # 8-byte Folded Reload
+	ld	s6, 208(sp)                     # 8-byte Folded Reload
+	ld	s7, 200(sp)                     # 8-byte Folded Reload
+	ld	s8, 192(sp)                     # 8-byte Folded Reload
+	ld	s9, 184(sp)                     # 8-byte Folded Reload
+	ld	s10, 176(sp)                    # 8-byte Folded Reload
+	addi	sp, sp, 272
 	ret
-.Lfunc_end48:
-	.size	c_calls_merlin, .Lfunc_end48-c_calls_merlin
+.Lfunc_end63:
+	.size	c_calls_merlin, .Lfunc_end63-c_calls_merlin
                                         # -- End function
 	.type	.L.str,@object                  # @.str
 	.section	.rodata.str1.1,"aMS",@progbits,1
@@ -2218,6 +3191,56 @@ c_calls_merlin:                         # @c_calls_merlin
 .L.str.7:
 	.asciz	"iiiiiiq"
 	.size	.L.str.7, 8
+
+	.type	.L.str.8,@object                # @.str.8
+.L.str.8:
+	.asciz	"q"
+	.size	.L.str.8, 2
+
+	.type	.L.str.9,@object                # @.str.9
+.L.str.9:
+	.asciz	"s"
+	.size	.L.str.9, 2
+
+	.type	.L.str.10,@object               # @.str.10
+.L.str.10:
+	.asciz	"iiiiis"
+	.size	.L.str.10, 7
+
+	.type	.L.str.11,@object               # @.str.11
+.L.str.11:
+	.asciz	"iiiiiis"
+	.size	.L.str.11, 8
+
+	.type	.L.str.12,@object               # @.str.12
+.L.str.12:
+	.asciz	"qiqs"
+	.size	.L.str.12, 5
+
+	.type	.L.str.13,@object               # @.str.13
+.L.str.13:
+	.asciz	"iiiq"
+	.size	.L.str.13, 5
+
+	.type	.L.str.14,@object               # @.str.14
+.L.str.14:
+	.asciz	"iiiis"
+	.size	.L.str.14, 6
+
+	.type	.L.str.15,@object               # @.str.15
+.L.str.15:
+	.asciz	"90ci"
+	.size	.L.str.15, 5
+
+	.type	.L.str.16,@object               # @.str.16
+.L.str.16:
+	.asciz	"iiiiii9"
+	.size	.L.str.16, 8
+
+	.type	.L.str.17,@object               # @.str.17
+.L.str.17:
+	.asciz	"iiiiiii0c"
+	.size	.L.str.17, 10
 
 	.type	.L_MergedGlobals,@object        # @_MergedGlobals
 	.local	.L_MergedGlobals

@@ -10,11 +10,17 @@
  *   more            by reference to a copy  s12, big (results through a
  *                                            hidden pointer in a0)
  *
+ * on RV32, and on RV64 up to 16 bytes in one or two registers (l2, li, cl,
+ * s9, s10, cq), more by reference (l3, big);
+ *
  * and so do the narrow scalars (_Bool, signed char, short, unsigned short),
  * which the caller extends to 32 bits as an argument and the callee as a
- * result: clang -O1 relies on both. So do arguments past a7, on the stack
- * (a pair may straddle a7 and the stack), and the variadic arguments of
- * functions with `...`, every kind of them.
+ * result: clang -O1 relies on both, and on RV64 on 32-bit values, unsigned
+ * ones too, being sign-extended. So do arguments past a7, on the stack (a
+ * pair may straddle a7 and the stack, a struct start at an odd word), the
+ * variadic arguments of functions with `...`, every kind of them (a long
+ * long, or a struct holding one, from an even register on RV32), and
+ * pointers to functions.
  *
  * Each side numbers its checks from 1 and reports the first that fails (0
  * when all pass); tests/abi.rs prints which one it was.
@@ -107,6 +113,22 @@ struct iq {
     long long v;
 };
 
+/* Bigger than two registers on RV32 (by reference there), two registers on
+ * RV64: 9 and 10 bytes aligned to 1 and 2, and a char before a long long
+ * (16 bytes aligned to 8). */
+struct s9 {
+    char b[9];
+};
+
+struct s10 {
+    short h[5];
+};
+
+struct cq {
+    char c;
+    long long v;
+};
+
 /* What <stdarg.h> is made of (clang's builtins, which merlin has too). */
 typedef __builtin_va_list va_list;
 #define va_start(ap, last) __builtin_va_start(ap, last)
@@ -157,6 +179,22 @@ struct q1 m_qtwice(struct q1 s);
 long long m_qsum(struct iq s, struct q1 t);
 long long m_vq(const char *fmt, ...);
 long long m_vqlate(int a, int b, int c, int d, int e, int f, int g, ...);
+long long m_q67(int a, int b, int c, int d, int e, int f, long long g);
+long long m_oddstack(int a, int b, int c, int d, int e, int f, int g, int h, int i, struct s8 j, int k,
+                     struct q1 l, short m, struct s6 n);
+long long m_vq3(int a, int b, const char *fmt, ...);
+struct s9 m_rev9(struct s9 s);
+struct s10 m_neg10(struct s10 s);
+int m_late910(int a, int b, int c, int d, int e, int f, int g, struct s9 h, struct s10 i);
+long long m_v910(const char *fmt, ...);
+struct cq m_cq(struct cq s);
+long long m_cqsum(int a, struct cq s, struct cq t);
+int m_ucmp(unsigned a, unsigned b);
+unsigned m_uadd(unsigned a, unsigned b);
+unsigned m_ushr(unsigned a, int n);
+unsigned m_udiv(unsigned a, unsigned b);
+long long m_shlq(long long v, int n);
+long long m_applyq(long long (*f)(long long, int), long long v, int n);
 
 static int checks, first_failure;
 
@@ -534,6 +572,124 @@ long long c_vqlate(int a, int b, int c, int d, int e, int f, int g, ...) {
     return x + a + b + c + d + e + f + g;
 }
 
+/* g in a6:a7 on RV32. */
+long long c_q67(int a, int b, int c, int d, int e, int f, long long g) {
+    return a + b + c + d + e + f + g * 3;
+}
+
+/* Past a7 on RV32: i at 0(sp), j (a struct s8, aligned to 4) from the odd
+ * word 4(sp), k at 12(sp), l (aligned to 8) at 16(sp), m at 24(sp) and n (a
+ * struct s6) from the odd word 28(sp); on RV64 each from an 8-byte slot. */
+long long c_oddstack(int a, int b, int c, int d, int e, int f, int g, int h, int i, struct s8 j, int k,
+                     struct q1 l, short m, struct s6 n) {
+    return a + b + c + d + e + f + g + h + i * 10 + j.x * 100 + j.y + k * 1000 + l.v + m + n.a + n.b + n.c;
+}
+
+/* Three named arguments, an odd number: on RV32 a variadic long long or
+ * struct q1 after them starts at an even register, a4 (a3 left out), and
+ * one that would start in a7 goes to the stack instead. Letters of fmt: i
+ * an int, q a long long, s a struct q1. */
+long long c_vq3(int a, int b, const char *fmt, ...) {
+    va_list ap;
+    long long s = a + b;
+    va_start(ap, fmt);
+    for (; *fmt; fmt++) {
+        if (*fmt == 'i') {
+            s += va_arg(ap, int);
+        } else if (*fmt == 'q') {
+            s += va_arg(ap, long long);
+        } else {
+            struct q1 v = va_arg(ap, struct q1);
+            s += v.v;
+        }
+    }
+    va_end(ap);
+    return s;
+}
+
+struct s9 c_rev9(struct s9 s) {
+    struct s9 r;
+    int i;
+    for (i = 0; i < 9; i++)
+        r.b[i] = s.b[8 - i];
+    return r;
+}
+
+struct s10 c_neg10(struct s10 s) {
+    int i;
+    for (i = 0; i < 5; i++)
+        s.h[i] = -s.h[i];
+    return s;
+}
+
+/* h after seven ints: on RV64 its first 8 bytes in a7 and the last at
+ * 0(sp), i at 8(sp) and 16(sp); on RV32 their copies' addresses in a7 and
+ * at 0(sp). */
+int c_late910(int a, int b, int c, int d, int e, int f, int g, struct s9 h, struct s10 i) {
+    return a + b + c + d + e + f + g + h.b[0] + h.b[8] * 10 + i.h[0] + i.h[4] * 100;
+}
+
+/* Letters of fmt: i an int, 9 a struct s9, 0 a struct s10, c a struct cq. */
+long long c_v910(const char *fmt, ...) {
+    va_list ap;
+    long long s = 0;
+    va_start(ap, fmt);
+    for (; *fmt; fmt++) {
+        if (*fmt == 'i') {
+            s += va_arg(ap, int);
+        } else if (*fmt == '9') {
+            struct s9 v = va_arg(ap, struct s9);
+            s += v.b[0] + v.b[8] * 10;
+        } else if (*fmt == '0') {
+            struct s10 v = va_arg(ap, struct s10);
+            s += v.h[0] + v.h[4] * 100;
+        } else {
+            struct cq v = va_arg(ap, struct cq);
+            s += v.c + v.v;
+        }
+    }
+    va_end(ap);
+    return s;
+}
+
+struct cq c_cq(struct cq s) {
+    s.c++;
+    s.v = -s.v;
+    return s;
+}
+
+long long c_cqsum(int a, struct cq s, struct cq t) {
+    return a + s.c + s.v + t.c * 10 + t.v;
+}
+
+/* On RV64 an unsigned int travels sign-extended, an argument and a result
+ * alike, and clang -O1 compares and passes on such registers as they are:
+ * 0x80000000 is 0xffffffff80000000 in one. */
+int c_ucmp(unsigned a, unsigned b) {
+    return (a < b) + 2 * (a == 0x80000000u) + 4 * (b == 0xffffffffu) + 8 * (a > 0x7fffffffu);
+}
+
+unsigned c_uadd(unsigned a, unsigned b) {
+    return a + b;
+}
+
+unsigned c_ushr(unsigned a, int n) {
+    return a >> n;
+}
+
+unsigned c_udiv(unsigned a, unsigned b) {
+    return a / b;
+}
+
+long long c_shlq(long long v, int n) {
+    return v << n;
+}
+
+/* A call through a pointer to a function returning a long long. */
+long long c_applyq(long long (*f)(long long, int), long long v, int n) {
+    return f(v, n) + 1;
+}
+
 /* Calls every m_ function; returns 0 if all its checks pass, else the number
  * of the first that fails. */
 int c_calls_merlin(void) {
@@ -557,6 +713,9 @@ int c_calls_merlin(void) {
     long long qbig;
     struct q1 qone;
     struct iq qmix;
+    struct s9 s9 = {{1, 0, 0, 0, 0, 0, 0, 0, 9}};
+    struct s10 s10 = {{2, 0, 0, 0, -3}};
+    struct cq cqv;
     un.i[0] = 41;
     un.i[1] = 0;
     check(m_sum6(s6) == 6);
@@ -641,5 +800,40 @@ int c_calls_merlin(void) {
     check(m_vq("iqisq", 1, qbig, 2, qone, -qbig) == 3 + 5000000000LL);
     check(m_vq("iiiiiiq", 1, 2, 3, 4, 5, 6, qbig) == qbig + 21);
     check(m_vqlate(1, 2, 3, 4, 5, 6, 7, qbig) == qbig + 28);
+    /* More pairs: in a6:a7, at odd stack words, after an odd number of
+     * named arguments; 9- and 10-byte structs, a char before a long long,
+     * unsigned ints sign-extended on RV64, a pointer to a function
+     * returning a long long. */
+    cqv.c = 'a';
+    cqv.v = -qbig;
+    check(m_q67(1, 2, 3, 4, 5, 6, qbig) == 21 + 3 * qbig);
+    check(m_oddstack(1, 2, 3, 4, 5, 6, 7, 8, 9, p, 4, qone, -2, s6) ==
+          36 + 90 + 7 * 100 + 5 + 4000 + qone.v - 2 + 6);
+    check(m_vq("q", qbig) == qbig && m_vq("s", qone) == qone.v);
+    check(m_vq("iiiiis", 1, 2, 3, 4, 5, qone) == 15 + qone.v);
+    check(m_vq("iiiiiis", 1, 2, 3, 4, 5, 6, qone) == 21 + qone.v);
+    check(m_vq3(1, 2, "qiqs", qbig, 3, -qbig, qone) == 6 + qone.v);
+    check(m_vq3(1, 2, "iiiq", 3, 4, 5, qbig) == 15 + qbig);
+    check(m_vq3(1, 2, "iiiis", 3, 4, 5, 6, qone) == 21 + qone.v);
+    s9 = m_rev9(s9);
+    check(s9.b[0] == 9 && s9.b[8] == 1 && s9.b[4] == 0);
+    s10 = m_neg10(s10);
+    check(s10.h[0] == -2 && s10.h[4] == 3);
+    check(m_late910(1, 2, 3, 4, 5, 6, 7, s9, s10) == 28 + 9 + 10 - 2 + 300);
+    check(m_v910("90ci", s9, s10, cqv, 5) == 19 + 298 + 'a' - qbig + 5);
+    check(m_v910("iiiiii9", 1, 2, 3, 4, 5, 6, s9) == 21 + 19);
+    check(m_v910("iiiiiii0c", 1, 2, 3, 4, 5, 6, 7, s10, cqv) == 28 + 298 + 'a' - qbig);
+    cqv = m_cq(cqv);
+    check(cqv.c == 'b' && cqv.v == qbig);
+    check(m_cqsum(3, cqv, cqv) == 3 + 'b' + qbig + 'b' * 10 + qbig);
+    check(m_ucmp(0x80000000u, 0xffffffffu) == 15 && m_ucmp(5, 3) == 0);
+    check(m_uadd(0x7fffffffu, 1) == 0x80000000u && m_uadd(0xffffffffu, 2) == 1);
+    check(m_ushr(0x80000000u, 0) == 0x80000000u && m_ushr(0xffffffffu, 4) == 0x0fffffffu);
+    check(m_udiv(0xfffffffeu, 1) == 0xfffffffeu && m_udiv(0xffffffffu, 2) == 0x7fffffffu);
+    check(m_ucmp(m_uadd(0x7fffffffu, 1), m_udiv(0xffffffffu, 1)) == 15);
+    check(c_ucmp(m_ushr(0x80000000u, 0), m_uadd(0xfffffffeu, 1)) == 15);
+    check(m_applyq(m_shlq, qbig, 3) == (qbig << 3) + 1);
+    check(m_applyq(c_shlq, 5, 40) == (5LL << 40) + 1);
+    check(c_applyq(m_shlq, 3, 33) == (3LL << 33) + 1);
     return first_failure;
 }
