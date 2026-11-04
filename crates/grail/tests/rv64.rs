@@ -733,3 +733,29 @@ fn the_boot_entry_is_written_whole() {
     assert_eq!(m.cpu.bus.read_mem(entry, 4), Ok(0x8000_2000));
     run_traps(&mut m, "sh a2, 0(a1)", s_type(0, A2, A1, 1), 7, entry);
 }
+
+#[test]
+fn ld_and_sd_reach_ram_past_4_gib() {
+    // 6 GiB of RAM, backed only where it is touched. In M-mode addresses are physical,
+    // so `ld` and `sd` at RAM_BASE + 5 GiB use the whole 64-bit address.
+    let mut m = Machine::new(MachineConfig {
+        xlen: Xlen::Rv64,
+        ..MachineConfig::with_ram(6 << 30)
+    })
+    .unwrap();
+    m.cpu.csr.mtvec = TRAP_VECTOR;
+    let high = RAM_BASE + (5 << 30);
+    set(&mut m, A1, high);
+    set(&mut m, A2, 0x8877_6655_4433_2211);
+    run(&mut m, "sd a2, 0(a1)", s_type(0, A2, A1, 3));
+    assert_eq!(peek64(&mut m, high), 0x8877_6655_4433_2211);
+    assert_eq!(peek64(&mut m, high - (4 << 30)), 0, "not 4 GiB lower");
+    poke64(&mut m, high + 8, 0x0102_0304_0506_0708);
+    run(&mut m, "ld a0, 8(a1)", i_type(8, A1, 3, A0, LOAD));
+    assert_eq!(x(&m, A0), 0x0102_0304_0506_0708);
+    // Just past the end of RAM: an access fault (load 5, store 7), the address in mtval.
+    let end = RAM_BASE + (6 << 30);
+    set(&mut m, A1, end);
+    run_traps(&mut m, "ld a0, 0(a1)", i_type(0, A1, 3, A0, LOAD), 5, end);
+    run_traps(&mut m, "sd a2, 0(a1)", s_type(0, A2, A1, 3), 7, end);
+}

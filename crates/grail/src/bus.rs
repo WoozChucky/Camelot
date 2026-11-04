@@ -1150,4 +1150,62 @@ mod tests {
         // Data accesses only.
         assert_eq!(bus.read_mem(PTR_BASE, 4), Err(BusFault));
     }
+
+    #[test]
+    fn memory_takes_doublewords() {
+        let mut bus = small_bus();
+        // RAM, up to its last doubleword and not across its end.
+        bus.write(RAM_BASE + 8, 8, 0x0123_4567_89ab_cdef).unwrap();
+        assert_eq!(bus.read(RAM_BASE + 8, 8), Ok(0x0123_4567_89ab_cdef));
+        assert_eq!(bus.read(RAM_BASE + 12, 4), Ok(0x0123_4567));
+        assert_eq!(&bus.ram[8..16], &0x0123_4567_89ab_cdef_u64.to_le_bytes());
+        assert_eq!(bus.write(RAM_BASE + 4088, 8, 1), Ok(()));
+        assert_eq!(bus.read_mem(RAM_BASE + 4088, 8), Ok(1));
+        assert_eq!(bus.write(RAM_BASE + 4092, 8, 1), Err(BusFault));
+        assert_eq!(bus.read(RAM_BASE + 4092, 8), Err(BusFault));
+        // VRAM: two pixels at a time, the first in the low word.
+        let last = VRAM_BASE + u64::from(VRAM_SIZE) - 8;
+        bus.write(last, 8, 0x00aa_bbcc_0011_2233).unwrap();
+        assert_eq!(bus.read(last, 8), Ok(0x00aa_bbcc_0011_2233));
+        assert_eq!(bus.fb.pixel(638, 479), 0x0011_2233);
+        assert_eq!(bus.fb.pixel(639, 479), 0x00aa_bbcc);
+        assert_eq!(bus.read(last + 4, 8), Err(BusFault), "across VRAM's end");
+        assert_eq!(bus.write(last + 4, 8, 0), Err(BusFault));
+        // The boot ROM: a doubleword of the stub, and none across its 4 KiB window.
+        bus.set_boot_entry(RAM_BASE);
+        let stub = |a| u64::from(bus.peek(a).unwrap());
+        let both = stub(BOOT_ROM_BASE) | stub(BOOT_ROM_BASE + 4) << 32;
+        assert_eq!(bus.read(BOOT_ROM_BASE, 8), Ok(both));
+        assert_eq!(bus.read_mem(BOOT_ROM_BASE, 8), Ok(both));
+        assert_eq!(bus.read(BOOT_ROM_BASE + 0xff8, 8), Ok(0));
+        assert_eq!(bus.read(BOOT_ROM_BASE + 0xffc, 8), Err(BusFault));
+        assert_eq!(bus.read_mem(BOOT_ROM_BASE + 0xffc, 8), Err(BusFault));
+    }
+
+    #[test]
+    fn devices_with_32_bit_registers_refuse_doublewords() {
+        use crate::keyboard::KeyEvent;
+        let mut bus = small_bus();
+        bus.kbd.push(KeyEvent::press(b'k'));
+        for (name, addr) in [
+            ("PLIC", PLIC_BASE + 0x1000),
+            ("UART", UART_BASE),
+            ("framebuffer", FB_CTRL_BASE),
+            ("keyboard", KBD_BASE),
+            ("keyboard event", KBD_BASE + 4),
+            ("pointer", PTR_BASE),
+        ] {
+            assert_eq!(bus.read(addr, 8), Err(BusFault), "{name}");
+            assert_eq!(bus.write(addr, 8, 0), Err(BusFault), "{name}");
+        }
+        // Nothing happened: the key is still queued, the screen still off.
+        assert_eq!(bus.read(KBD_BASE, 4), Ok(1));
+        assert!(!bus.fb.enabled());
+        // The test device takes any width, and only the low 32 bits of a write count.
+        assert_eq!(bus.read(TEST_DEV_BASE, 8), Ok(0));
+        bus.write(TEST_DEV_BASE, 8, 0xdead_beef_0000_1234).unwrap();
+        assert_eq!(bus.exit, None);
+        bus.write(TEST_DEV_BASE, 8, 0xdead_beef_0000_5555).unwrap();
+        assert_eq!(bus.exit, Some(Exit::Code(0)));
+    }
 }
