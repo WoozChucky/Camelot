@@ -9,7 +9,8 @@
 //! - the toolchain against its references: excalibur's decoder and
 //!   disassembler against llvm-objdump's text, the elf crate against
 //!   llvm-readelf's and llvm-dwarfdump's, merlin-as's encodings and round
-//!   trips, merlin-ld's links (riscv-tests relinked, the fixtures current),
+//!   trips, merlin-ld's links on both widths (riscv-tests relinked, the
+//!   fixtures current),
 //!   merlin-objdump's goldens, the compiler's end-to-end harness, riscv-tests
 //!   on Grail;
 //! - the committed binaries are what the tools build now: the kernel, the
@@ -47,7 +48,7 @@ const STEPS: &[Step] = &[
         args: &["-p", "merlin-as", "--tests"],
     },
     Step {
-        what: "merlin-ld: links, riscv-tests relinked, fixtures current",
+        what: "merlin-ld: links, riscv-tests relinked, fixtures current, both widths",
         args: &["-p", "merlin-ld", "--tests"],
     },
     Step {

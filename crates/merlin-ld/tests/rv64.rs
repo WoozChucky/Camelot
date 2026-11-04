@@ -5,10 +5,12 @@
 //!
 //! * The fixtures: every one of them gives ld.lld's executable (entry,
 //!   allocated section headers, PT_LOADs with their offsets and load
-//!   addresses, symbols, every loaded byte) and runs in Grail, an RV64
-//!   machine for an ELF64 file. `rv64/relocs` is RV64's own (what RV64 code
-//!   reaches is not what RV32 code does: the +-2 GiB window of lui, auipc and
-//!   call, R_RISCV_64 data); the others are copies of the RV32 set's
+//!   addresses, the PT_PHDR of loaded headers, symbols, every loaded byte)
+//!   and runs in Grail, an RV64 machine for an ELF64 file. `rv64/relocs` and
+//!   `rv64/at` are RV64's own (what RV64 code reaches is not what RV32 code
+//!   does: the +-2 GiB window of lui, auipc and call, R_RISCV_64 data; and a
+//!   higher-half program, linked at 0xffffffff80000000 and loaded in RAM with
+//!   `AT(ADDR(.x) - OFFSET)`); the others are copies of the RV32 set's
 //!   sources. Their `.objdump.txt` files are compared from #150, when
 //!   merlin-objdump reads ELF64.
 //! * The ELF64 file merlin-ld writes, its map, its line tables (R_RISCV_64

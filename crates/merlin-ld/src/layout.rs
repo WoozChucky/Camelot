@@ -13,7 +13,8 @@
 //! 4. Walk `SECTIONS` with the location counter, placing each input section at
 //!    its alignment and evaluating script assignments as they come. As in
 //!    ld.lld, an output section is dropped only when no input section (not
-//!    even an empty one) matched it and it has no assignments.
+//!    even an empty one) matched it, it has no assignments, no `ADDR` in
+//!    the script names it and its `AT` and `ALIGN` use no symbol.
 //! 5. Report undefined globals (`a.o: undefined reference to 'foo'`).
 //! 6. Pick the entry point.
 //!

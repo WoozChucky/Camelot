@@ -23,6 +23,10 @@
 //!   of their ranges; one object built with relaxation (`R_RISCV_RELAX`).
 //! * `fixtures/data64`: `.dword sym + A` (R_RISCV_64) on RV32, in `.data`
 //!   and in a debug section, which ld.lld fills differently.
+//! * `fixtures/at`: `AT(lma)` load addresses: on the first section only, on
+//!   a section right after one with the same permissions, in the middle
+//!   (`.data` copied from its load address, a NOLOAD `.bss` after it), and
+//!   the empty sections ld.lld drops or keeps.
 //! * `fixtures/merge`: mergeable strings, where merlin-ld differs from ld.lld
 //!   on purpose (spec §10); the test pins down the difference.
 //! * `fixtures/rejects`, `fixtures/symbols`: objects for error paths.

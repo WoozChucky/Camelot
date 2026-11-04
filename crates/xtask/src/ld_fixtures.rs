@@ -11,9 +11,9 @@
 //! directories built with its own clang flags: RV32 ([`RV32`]) in
 //! `fixtures/` itself and RV64 ([`RV64`]) in `fixtures/rv64/`. The RV64 set
 //! has sources of its own (`rv64/relocs`: what RV64 code can reach is not
-//! what RV32's can; `rv64/at`: a higher-half program) and copies of the RV32 sources that work on both widths
-//! unchanged ([`SHARED_WITH_RV64`]), which [`run`] makes first, as it copies
-//! the examples, and a test checks.
+//! what RV32's can; `rv64/at`: a higher-half program) and copies of the
+//! RV32 sources that work on both widths unchanged ([`SHARED_WITH_RV64`]),
+//! which [`run`] makes first, as it copies the examples, and a test checks.
 //!
 //! In every fixture directory:
 //!
