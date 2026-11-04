@@ -251,8 +251,9 @@ impl Machine {
     /// instruction on every hart ([`Cpu::step`]). Stops early when the program exits, or
     /// at the end of a step that showed a new frame (right after the instruction that
     /// did it, on a one-hart machine), so the host can show or dump that frame: one that
-    /// wrote `FB_PRESENT` or `FB_MODE` (a modeset), or whose vertical blank made a page
-    /// flip take effect ([`framebuffer::Framebuffer::shown`]). Only a frame shown during
+    /// wrote `FB_PRESENT`, made a modeset that took effect (a write to `FB_MODE` the
+    /// display refused shows nothing new), or whose vertical blank made a page flip take
+    /// effect ([`framebuffer::Framebuffer::shown`]). Only a frame shown during
     /// this call counts: a present the host has not taken yet
     /// ([`framebuffer::Framebuffer::take_present`]) does not stop the next call.
     ///

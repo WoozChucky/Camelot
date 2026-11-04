@@ -736,8 +736,9 @@ impl Vm {
             }
             let steps = machine.run_for(SLICE, &mut |_| {});
             // `run_for` ends a slice early once the guest has shown a new frame (written
-            // FB_PRESENT or FB_MODE, or a page flip took effect at a vertical blank), until
-            // the host takes that frame: take it, or every later slice is a single step.
+            // FB_PRESENT, made a modeset that took effect, or a page flip took effect at a
+            // vertical blank), until the host takes that frame: take it, or every later
+            // slice is a single step.
             // The screen goes out at the pace of `look`, not on presents: viewers see
             // the framebuffer, presented or not, as Grail's window does.
             machine.cpu.bus.fb.take_present();

@@ -3,8 +3,8 @@
 //!
 //! Everything happens on the calling thread, and the window belongs to this call, not to
 //! a process-wide singleton: each machine can have its own. The CPU runs until the
-//! program shows a new frame (writes `FB_PRESENT` or `FB_MODE`, or a page flip takes
-//! effect at a vertical blank) or a slice of `SLICE` steps is done (or, with a real-time
+//! program shows a new frame (writes `FB_PRESENT`, makes a modeset that takes effect, or
+//! a page flip takes effect at a vertical blank) or a slice of `SLICE` steps is done (or, with a real-time
 //! clock, until it is ahead of the wall clock); then the window's messages are pumped
 //! and it is redrawn on a present, on a repaint request, or when ~16 ms of host time
 //! have passed since the last redraw (~60 Hz). The window shows what the framebuffer
