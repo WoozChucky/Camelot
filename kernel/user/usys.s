@@ -52,6 +52,7 @@
     .equ SYS_gettid, 44
     .equ SYS_futex_wait, 45
     .equ SYS_futex_wake, 46
+    .equ SYS_fcntl, 47
 
     .text
 
@@ -377,6 +378,13 @@ futex_wait:
     .globl futex_wake
 futex_wake:
     li    a7, SYS_futex_wake
+    ecall
+    ret
+
+# int fcntl(int fd, int cmd, int arg)
+    .globl fcntl
+fcntl:
+    li    a7, SYS_fcntl
     ecall
     ret
 

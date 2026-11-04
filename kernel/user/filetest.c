@@ -165,6 +165,13 @@ static void test_read_write_seek(void) {
     close(fd);
     fd = open("a", O_WRONLY);
     check_eq(read(fd, buf, 1), -EBADF, "no reading a file opened for writing");
+    check_eq(fcntl(fd, F_GETFD, 0), 0, "a file opened without O_CLOEXEC stays open on exec");
+    close(fd);
+    /* O_CLOEXEC: the descriptor closes on exec (systest checks exec closes
+     * it), and the file opens as ever. */
+    fd = open("a", O_RDONLY | O_CLOEXEC);
+    check_eq(fcntl(fd, F_GETFD, 0), FD_CLOEXEC, "O_CLOEXEC sets FD_CLOEXEC");
+    check_eq(read(fd, buf, 1), 1, "and the file reads");
     close(fd);
     /* O_CREAT on a file that exists opens it; O_TRUNC empties it, if it is
      * opened for writing. */
