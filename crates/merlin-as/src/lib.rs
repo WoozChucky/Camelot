@@ -14,6 +14,7 @@ pub mod ast;
 pub mod dwarf;
 pub mod elf;
 pub mod encode;
+pub mod isa;
 pub mod lexer;
 pub mod parser;
 pub mod reloc;

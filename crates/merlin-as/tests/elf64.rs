@@ -2,12 +2,10 @@
 //! what clang writes for the same source.
 //!
 //! merlin-as lays out its sections in its own order (clang puts `.strtab`
-//! first and each `.rela.X` after its X) and writes no `$x`/`$d` mapping
-//! symbols, so the files differ as wholes. Everything else here is clang's,
-//! except the two numbers those symbols change, which are merlin-as's and
-//! say what clang's are: the size of `.symtab` and its `sh_info`. The
-//! expectations come from `llvm-readelf -h -S -s -r` and `llvm-objdump -s`
-//! of the source assembled by clang 23 with
+//! first, with the section names in it, and each `.rela.X` after its X), so
+//! the files differ as wholes. Everything here is clang's: the expectations
+//! come from `llvm-readelf -h -S -s -r` and `llvm-objdump -s` of the source
+//! assembled by clang 23 with
 //!
 //! ```text
 //! clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mno-relax -c
@@ -97,10 +95,9 @@ fn sections_are_clangs() {
         (".riscv.attributes", 0x7000_0003, 0, 0x55, 1, 0),
         (".rela.text", elf::SHT_RELA, elf::SHF_INFO_LINK, 0x48, 8, 0x18),
         (".rela.data", elf::SHT_RELA, elf::SHF_INFO_LINK, 0x60, 8, 0x18),
-        // merlin-as's size, not clang's: the null symbol and 7 others.
-        // clang's is 0x120, 12 entries, with its four mapping symbols ($x in
-        // .text, $d in .data, .bss and .riscv.attributes).
-        (".symtab", elf::SHT_SYMTAB, 0, 8 * 0x18, 8, 0x18),
+        // The null symbol and 11 others, four of them mapping symbols ($x
+        // in .text, $d in .data, .bss and .riscv.attributes).
+        (".symtab", elf::SHT_SYMTAB, 0, 12 * 0x18, 8, 0x18),
     ];
     for (name, ty, flags, size, align, entsize) in expected {
         let s = section(&file, name);
@@ -145,18 +142,24 @@ fn symbols_are_clangs() {
         .iter()
         .map(|s| (s.name.as_str(), s.value, s.size, s.bind(), s.ty(), where_(s)))
         .collect();
-    // llvm-readelf -s, without clang's mapping symbols ($xrv64i2p1_..., $d).
-    // The constants are their whole 64-bit values, sign-extended: an ELF32
+    // llvm-readelf -s, in its order: the mapping symbols ($xrv64i2p1_...
+    // where the code starts, $d where data does) among the other locals,
+    // each made when the line that needs it is read. The constants are their whole 64-bit values, sign-extended: an ELF32
     // object holds 0xffffffff and 0x80000000. `f` is a FUNC of 24 bytes
     // (.type and .size), `buf` an OBJECT of 16 (.comm's size).
     use elf::{STB_GLOBAL as GLOBAL, STB_LOCAL as LOCAL};
     use elf::{STT_FUNC as FUNC, STT_NOTYPE as NOTYPE, STT_OBJECT as OBJECT};
+    const X: &str = "$xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0";
     let clang = [
         ("K", 0xffff_ffff_ffff_ffff, 0, LOCAL, NOTYPE, "ABS"),
         ("N", 0xffff_ffff_8000_0000, 0, LOCAL, NOTYPE, "ABS"),
+        (X, 0, 0, LOCAL, NOTYPE, ".text"),
         (".Lpcrel_hi0", 8, 0, LOCAL, NOTYPE, ".text"),
         ("var", 0, 0, LOCAL, NOTYPE, ".data"),
+        ("$d", 0, 0, LOCAL, NOTYPE, ".data"),
         ("buf", 0, 16, LOCAL, OBJECT, ".bss"),
+        ("$d", 0, 0, LOCAL, NOTYPE, ".bss"),
+        ("$d", 0, 0, LOCAL, NOTYPE, ".riscv.attributes"),
         ("f", 0, 24, GLOBAL, FUNC, ".text"),
         ("ext", 0, 0, GLOBAL, NOTYPE, "UND"),
     ];
@@ -166,9 +169,8 @@ fn symbols_are_clangs() {
         .collect();
     assert_eq!(ours, clang);
     // sh_info: the index of the first global, after the null symbol and the
-    // five locals. merlin-as's, not clang's: clang's is 10, after its four
-    // mapping symbols too.
-    assert_eq!(section(&file, ".symtab").info, 6);
+    // nine locals.
+    assert_eq!(section(&file, ".symtab").info, 10);
 
     // The raw Elf64_Sym of K: st_name, then st_info, st_other, st_shndx
     // (SHN_ABS), then the 8-byte st_value and st_size.
@@ -190,6 +192,7 @@ fn symbol_sizes_are_as_wide_as_the_class() {
         let symbols = file.symbols().unwrap();
         symbols[1..]
             .iter()
+            .filter(|s| !s.name.starts_with('$'))
             .map(|s| (s.name.clone(), s.size))
             .collect::<Vec<_>>()
     };

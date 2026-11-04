@@ -1,4 +1,8 @@
 //! merlin-objdump on objects made by merlin-as, the files it exists to debug.
+//! merlin-as marks code with `$x<isa>` and data with `$d` as clang does
+//! (#192), so data among instructions lists as data, as llvm-objdump 23
+//! lists it: these listings are llvm-objdump's of the same objects, but for
+//! the instructions LLVM does not know (`<unknown>` there, spec section 10).
 
 use merlin_objdump::{dump, Options};
 
@@ -7,7 +11,8 @@ const SRC: &str = "
     .word 0x00000013
 start:
     add a0, a1, a2
-    .word 0x0005000b
+    xcal.dbg a0
+    .insn 4, 0x0000005b
     .word 0xffffffff
     .byte 1, 2, 3
 
@@ -34,23 +39,25 @@ fn disassembly() {
         ..Options::default()
     };
     let out = dump("t.o", &object(), &opts).unwrap();
-    // No symbol at the start of .text: the section name labels it. Words that
-    // do not decode are .word, the trailing odd bytes are .byte.
+    // No symbol at the start of .text: the section name labels it. The data
+    // is data, a word, a halfword and a byte, its bytes one by one (`.word
+    // 0x13` is no `nop`); an instruction that does not decode is a `.word`
+    // too (llvm-objdump: `<unknown>`), its word as one.
     let expected = "
 t.o:\tfile format elf32-littleriscv
 
 Disassembly of section .text:
 
 00000000 <.text>:
-       0: 00000013     \tnop
+       0: 13 00 00 00  \t.word\t0x00000013
 
 00000004 <start>:
        4: 00c58533     \tadd\ta0, a1, a2
        8: 0005000b     \txcal.dbg\ta0
-       c: ffffffff     \t.word\t0xffffffff
-      10: 01           \t.byte\t0x01
-      11: 02           \t.byte\t0x02
-      12: 03           \t.byte\t0x03
+       c: 0000005b     \t.word\t0x0000005b
+      10: ff ff ff ff  \t.word\t0xffffffff
+      14: 01 02        \t.short\t0x0201
+      16: 03           \t.byte\t0x03
 ";
     assert_eq!(out, expected);
 }
@@ -78,12 +85,11 @@ fn data_relocations_and_symbols() {
 }
 
 /// Like llvm-objdump, a run of at least 8 zero bytes is printed as `...`,
-/// but never past a relocation shown with `-r` (clang's object for the same
-/// source gives the same lines, except that LLVM prints each zero halfword
-/// as `0000 <unknown>`). A run whose length is not a multiple of 4 is folded
-/// only up to the last whole word: 9 zero bytes, the 9th being the first byte
-/// of `0x00001300`, give `...` for 8 and that word at its own address (LLVM
-/// prints it as the halfwords `1300` and `0000`, from the same address).
+/// in data too, but never past a relocation shown with `-r` (clang's object
+/// for the same source gives the same lines). A run whose length is not a
+/// multiple of 4 is folded only up to the last whole word: 9 zero bytes, the
+/// 9th being the first byte of `0x00001300`, give `...` for 8 and that word
+/// at its own address.
 #[test]
 fn zero_runs() {
     let src = "
@@ -112,18 +118,18 @@ z.o:\tfile format elf32-littleriscv
 Disassembly of section .text:
 
 00000000 <.text>:
-       0: 00000013     \tnop
+       0: 13 00 00 00  \t.word\t0x00000013
 \t\t...
-      10: 00000013     \tnop
-      14: 00000000     \t.word\t0x00000000
-      18: 00000013     \tnop
+      10: 13 00 00 00  \t.word\t0x00000013
+      14: 00 00 00 00  \t.word\t0x00000000
+      18: 13 00 00 00  \t.word\t0x00000013
 \t\t...
-      24: 00000000     \t.word\t0x00000000
+      24: 00 00 00 00  \t.word\t0x00000000
 \t\t\t00000024:  R_RISCV_32\text
-      28: 00000013     \tnop
+      28: 13 00 00 00  \t.word\t0x00000013
 \t\t...
-      34: 00001300     \t.word\t0x00001300
-      38: 00000013     \tnop
+      34: 00 13 00 00  \t.word\t0x00001300
+      38: 13 00 00 00  \t.word\t0x00000013
 ";
     assert_eq!(out, expected);
 }

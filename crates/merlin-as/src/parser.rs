@@ -127,6 +127,8 @@ impl Parser<'_> {
                 let args = match name.as_str() {
                     ".file" | ".loc" => self.spaced_args()?,
                     ".section" => self.section_args()?,
+                    ".option" => self.option_args(),
+                    ".align" | ".p2align" | ".balign" => self.args(true)?,
                     _ => self.dir_args()?,
                 };
                 out.push(Stmt {
@@ -160,12 +162,20 @@ impl Parser<'_> {
     }
 
     fn dir_args(&mut self) -> Result<Vec<DirArg>, Error> {
+        self.args(false)
+    }
+
+    /// Arguments separated by commas; with `empty`, one may be left out
+    /// after a comma when another comma follows (the fill of `.p2align 3,,4`,
+    /// as LLVM reads it; a trailing comma is still an error).
+    fn args(&mut self, empty: bool) -> Result<Vec<DirArg>, Error> {
         let mut args = Vec::new();
         if matches!(self.peek(), Tok::Newline) {
             return Ok(args);
         }
         loop {
             match self.peek().clone() {
+                Tok::Punct(',') if empty && !args.is_empty() => args.push(DirArg::Empty),
                 Tok::Str(s) => {
                     self.pos += 1;
                     args.push(DirArg::Str(s));
@@ -177,6 +187,29 @@ impl Parser<'_> {
             }
             self.pos += 1;
         }
+    }
+
+    /// The arguments of `.option`, one string each, the text of its tokens
+    /// up to the next comma: `arch`, `+zicond`, `-a`, `rv32ima_zicsr`.
+    fn option_args(&mut self) -> Vec<DirArg> {
+        let mut args = Vec::new();
+        let mut item = String::new();
+        loop {
+            match self.peek().clone() {
+                Tok::Newline => break,
+                Tok::Punct(',') => args.push(DirArg::Str(std::mem::take(&mut item).into_bytes())),
+                Tok::Ident(t) => item.push_str(&t),
+                Tok::Punct(c) => item.push(c),
+                Tok::Int(n) => item.push_str(&n.to_string()),
+                Tok::Str(s) => item.push_str(&String::from_utf8_lossy(&s)),
+                _ => item.push('?'),
+            }
+            self.pos += 1;
+        }
+        if !item.is_empty() || !args.is_empty() {
+            args.push(DirArg::Str(item.into_bytes()));
+        }
+        args
     }
 
     /// The arguments of `.section name, "flags", @type, entsize`, read as

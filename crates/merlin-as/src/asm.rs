@@ -38,6 +38,12 @@
 //! section holds (`NOBITS`: zeros only) and how `.align` pads it (`nop`s in
 //! code).
 //!
+//! Mapping symbols mark where code and data start in every section, as
+//! clang marks them: `$x<isa>` before a run of instructions, `$d` before a
+//! run of data ([`Assembler::mapping_symbol`]). The symbol table lists them
+//! among the other local symbols in the order clang does, the order in which
+//! the source makes them.
+//!
 //! Debug information: `.debug_*` sections are not loaded (no `SHF_ALLOC`) and
 //! hold data only. A `.word` or `.dword` there that names a `.L` label (the
 //! 8-byte addresses of RV64's DWARF) becomes a relocation against the label's
@@ -104,6 +110,25 @@ pub enum SymType {
     /// A section's own symbol (`STT_SECTION`), at its start, for relocations
     /// from debug information. Named by [`section_symbol_name`].
     Section,
+    /// A mapping symbol (psABI "Mapping Symbol"): `$x<isa>` where code
+    /// starts, `$d` where data starts. `STT_NOTYPE` and local, like a plain
+    /// label, but nothing refers to it: a label the source names `$d` is
+    /// another symbol (see [`Assembler::mapping_symbol`]).
+    Mapping,
+    /// The source file's name, from `.file "name"` (`STT_FILE`, absolute,
+    /// value 0, local): the first one is the first local symbol of the
+    /// object, as clang writes it ([`crate::elf::write`]). Nothing refers to
+    /// it either.
+    File,
+}
+
+/// What a mapping symbol says follows it ([`SymType::Mapping`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mapping {
+    /// Instructions: `$x<isa>`.
+    Code,
+    /// Data: `$d`.
+    Data,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +145,10 @@ pub struct Symbol {
     /// `st_size`, as `.size` gave it: 64 bits, which an ELF32 object cuts
     /// to 32.
     pub size: u64,
+    /// Named by `.local`: local even if nothing defines it (clang writes
+    /// such a symbol as a local undefined one), where any other undefined
+    /// symbol is global.
+    pub local: bool,
 }
 
 /// The assembled result, ready for [`crate::elf::write`].
@@ -150,10 +179,18 @@ pub struct Assembler {
     /// Names given to `.local`, so that a later `.comm` allocates them in
     /// `.bss` (see the `.comm` directive).
     locals: HashSet<String>,
+    /// `.size`s of symbols nothing has named yet, for when something does:
+    /// `.size` alone makes no symbol, as in LLVM (`MCELFStreamer::emitELFSize`
+    /// registers none), so a symbol sized before its label has its place in
+    /// the symbol table where it is defined or first named.
+    pending_sizes: HashMap<String, u64>,
     /// Line information: `.file 0` (the compilation directory and the main
     /// file) and the other `.file`s by number.
     file0: Option<dwarf::File>,
     files: Vec<Option<dwarf::File>>,
+    /// What each section holds at its end, for its mapping symbols
+    /// ([`Assembler::mapping_symbol`]): None until it has code or data.
+    mapping: Vec<Option<Mapping>>,
     /// The last `.loc`, until an instruction (or data) takes it.
     loc: Option<dwarf::Loc>,
     /// `.loc`'s `is_stmt`, which carries over from one to the next.
@@ -162,6 +199,9 @@ pub struct Assembler {
     rows: Vec<(usize, u32, dwarf::Loc)>,
     /// The source line of the first `.loc`, for an error about the line table.
     first_loc_line: usize,
+    /// The source line of the first numbered `.file`, which makes a line
+    /// table even without a `.loc` ([`Assembler::line_table`]).
+    first_file_line: usize,
     errors: Vec<Error>,
     line: usize,
 }
@@ -259,12 +299,15 @@ impl Assembler {
             dot_labels: 0,
             pcrel_lo: Vec::new(),
             locals: HashSet::new(),
+            pending_sizes: HashMap::new(),
             file0: None,
             files: Vec::new(),
+            mapping: Vec::new(),
             loc: None,
             is_stmt: true,
             rows: Vec::new(),
             first_loc_line: 0,
+            first_file_line: 0,
             errors: Vec::new(),
             line: 0,
         };
@@ -298,13 +341,18 @@ impl Assembler {
             }
         }
         self.resolve_local_fixups();
+        // What clang's assembler writes when the source has been read, in
+        // its order: the attributes (`RISCVTargetELFStreamer::finish`), then
+        // the line table (`MCObjectStreamer::finishImpl`).
+        self.attributes_section();
         self.line_table();
         self.debug_relocs_to_sections();
         if !self.errors.is_empty() {
             self.errors.sort_by_key(|e| e.line);
             return Err(self.errors);
         }
-        // `.L` labels are assembler-internal: keep only those a relocation needs.
+        // `.L` labels are assembler-internal, and a section symbol stands in
+        // for labels: keep only those a relocation needs.
         let referenced: HashSet<&str> = self
             .sections
             .iter()
@@ -314,7 +362,10 @@ impl Assembler {
         let symbols = self
             .symbols
             .iter()
-            .filter(|s| !s.name.starts_with(".L") || referenced.contains(s.name.as_str()))
+            .filter(|s| {
+                let internal = s.name.starts_with(".L") || s.ty == SymType::Section;
+                !internal || referenced.contains(s.name.as_str())
+            })
             .cloned()
             .collect();
         Ok(Object {
@@ -489,7 +540,8 @@ impl Assembler {
             defined: false,
             constant: None,
             ty: SymType::NoType,
-            size: 0,
+            size: self.pending_sizes.remove(name).unwrap_or(0),
+            local: false,
         });
         self.by_name.insert(name.to_string(), self.symbols.len() - 1);
         self.symbols.len() - 1
@@ -641,6 +693,13 @@ impl Assembler {
     /// `.text` at the start with the alignment of an instruction
     /// (`MCELFStreamer::initSections`), and no other section, not even code
     /// (`.text.f`, `"ax"`), gets one unless it asks.
+    ///
+    /// Its section symbol is made here too, so that it has its place among
+    /// the other symbols even if a relocation needs it only at the end (the
+    /// line table's): LLVM registers a section's symbol when it first
+    /// switches to the section (`MCELFStreamer::changeSection`), and keeps it
+    /// in the symbol table only if a relocation uses it, as [`Assembler::finish`]
+    /// does.
     fn new_section(&mut self, name: &str, attrs: Attrs) {
         self.sections.push(Section {
             name: name.to_string(),
@@ -650,7 +709,66 @@ impl Assembler {
             align: if name == ".text" { 4 } else { 1 },
             relocs: Vec::new(),
         });
+        self.mapping.push(None);
         self.current = self.sections.len() - 1;
+        self.section_symbol(self.current);
+    }
+
+    /// Marks what comes next in the current section, code or data, with a
+    /// mapping symbol where that changes, as clang's assembler does
+    /// (`RISCVELFStreamer`): the psABI's `$x<isa>` before the first
+    /// instruction of a run (`$xrv64i2p1_m2p0_..._zalrsc1p0`, the ISA of the
+    /// object's `.riscv.attributes`), `$d` before the first data. That is
+    /// what lets a disassembler tell a `.word` among instructions from an
+    /// instruction.
+    ///
+    /// Each section remembers what it had last, from its first byte: a
+    /// section starts with neither, and going back to it carries on where it
+    /// stopped. Every instruction asks for code ([`Assembler::place`]), and
+    /// every data directive for data, even one that writes no bytes
+    /// (`.zero 0`, `.ascii ""`), as LLVM's `emitBytes`, `emitFill` and
+    /// `emitValue` do; padding (`.align`) asks for neither. Each one is a
+    /// new local symbol, made after the labels the line defines (a
+    /// `.Lpcrel_hi`, a `.`) and before the symbols it is the first to name.
+    fn mapping_symbol(&mut self, kind: Mapping) {
+        let sec = self.current;
+        if self.mapping[sec] == Some(kind) {
+            return;
+        }
+        self.mapping[sec] = Some(kind);
+        let name = match kind {
+            Mapping::Code => format!("$x{}", crate::elf::arch(self.xlen)),
+            Mapping::Data => "$d".to_string(),
+        };
+        // Not in `by_name`: no reference can name it.
+        self.symbols.push(Symbol {
+            name,
+            section: Some(sec),
+            value: self.sections[sec].size,
+            global: false,
+            defined: true,
+            constant: None,
+            ty: SymType::Mapping,
+            size: 0,
+            local: true,
+        });
+    }
+
+    /// `.riscv.attributes`, which clang writes at the end (its contents are
+    /// [`crate::elf::riscv_attributes`]): a section like the others, data
+    /// with its `$d`, after every section of the source but before the
+    /// line table's, which come after it.
+    fn attributes_section(&mut self) {
+        let back = self.current;
+        let attrs = Attrs {
+            ty: section::SHT_RISCV_ATTRIBUTES,
+            flags: 0,
+            entsize: 0,
+        };
+        self.new_section(".riscv.attributes", attrs);
+        self.mapping_symbol(Mapping::Data);
+        self.emit_bytes(&crate::elf::riscv_attributes(crate::elf::arch(self.xlen)));
+        self.current = back;
     }
 
     /// Whether `n` more bytes fit in the current section, which reports an
@@ -707,18 +825,51 @@ impl Assembler {
     }
 
     fn align_to(&mut self, align: u32) {
+        self.align_with(align, None, None);
+    }
+
+    /// Pads the current section to a multiple of `align` and raises its
+    /// alignment to it, as LLVM's `emitValueToAlignment` and
+    /// `emitCodeAlignment` do: with `fill` bytes if one is given (in code
+    /// too: an explicit fill is never `nop`s), else as the section pads, `nop`s
+    /// in code and zeros elsewhere. A padding longer than `max` bytes is left
+    /// out, but the section's alignment is raised all the same. Padding is
+    /// neither code nor data: it makes no mapping symbol.
+    fn align_with(&mut self, align: u32, fill: Option<u8>, max: Option<u32>) {
         if align <= 1 {
             return;
         }
         let sec = &mut self.sections[self.current];
         sec.align = sec.align.max(align);
-        let pad = (align - sec.size % align) % align;
-        if sec.is_code() && pad.is_multiple_of(4) && sec.size.is_multiple_of(4) {
-            for _ in 0..pad / 4 {
-                self.emit_bytes(&0x0000_0013u32.to_le_bytes()); // nop
-            }
-        } else {
-            self.emit_zeros(pad.into());
+        let mut pad = (align - sec.size % align) % align;
+        if max.is_some_and(|m| pad > m) {
+            return;
+        }
+        if let Some(f) = fill {
+            return if f == 0 {
+                self.emit_zeros(pad.into())
+            } else {
+                self.emit_bytes(&vec![f; pad as usize])
+            };
+        }
+        if !sec.is_code() {
+            return self.emit_zeros(pad.into());
+        }
+        // Code pads as LLVM's `RISCVAsmBackend::writeNopData` pads it: a zero
+        // byte to an even offset, then a 2-byte `c.nop` (0x0001) to a
+        // multiple of 4, then `nop`s. Only the `nop`s are ever executed (an
+        // instruction is 4-byte aligned, and merlin-as has no 16-bit ones);
+        // the bytes before them pad data, but they are LLVM's.
+        if pad % 2 == 1 {
+            self.emit_zeros(1);
+            pad -= 1;
+        }
+        if pad % 4 == 2 {
+            self.emit_bytes(&[0x01, 0x00]);
+            pad -= 2;
+        }
+        for _ in 0..pad / 4 {
+            self.emit_bytes(&0x0000_0013u32.to_le_bytes()); // nop
         }
     }
 
@@ -743,8 +894,13 @@ impl Assembler {
         }
         self.take_loc();
         let base = self.sections[self.current].size;
-        // `.` in any operand is the address of the instruction's first word.
-        let mut dot = None;
+        // `.` in any operand is the address of the instruction's first word:
+        // a label there, made first, as clang makes it when it reads the
+        // operand.
+        let names_dot = emits
+            .iter()
+            .any(|e| matches!(&e.fixup, Some(f) if matches!(&f.target, Target::Symbol { name, .. } if name == DOT)));
+        let dot = names_dot.then(|| self.dot_label(base));
         // Hidden labels on auipcs that a later %pcrel_lo in this expansion refers to.
         let mut auipc_labels: HashMap<usize, String> = HashMap::new();
         for (i, e) in emits.iter().enumerate() {
@@ -764,13 +920,16 @@ impl Assembler {
                 }
             }
         }
+        // After the labels, before the symbols the operands name (clang's
+        // `emitLabel`s, then `emitInstruction`).
+        self.mapping_symbol(Mapping::Code);
         for (i, Emit { word, fixup }) in emits.into_iter().enumerate() {
             let offset = base + 4 * i as u32;
             if let Some(f) = fixup {
                 let (symbol, addend) = match f.target {
                     Target::Symbol { mut name, addend } => {
                         if name == DOT {
-                            name = dot.get_or_insert_with(|| self.dot_label(base)).clone();
+                            name = dot.clone().expect("made above");
                         }
                         if matches!(f.kind, RelocKind::PcrelLo12I | RelocKind::PcrelLo12S) {
                             self.pcrel_lo.push((self.current, name.clone(), self.line));
@@ -844,6 +1003,7 @@ impl Assembler {
                     continue;
                 }
                 let bytes = (v as u64).to_le_bytes();
+                self.mapping_symbol(Mapping::Data);
                 self.emit_bytes(&bytes[..size as usize]);
                 continue;
             }
@@ -864,6 +1024,8 @@ impl Assembler {
             if name == DOT {
                 name = self.dot_label(off);
             }
+            // After the label for `.`, before the symbol it names.
+            self.mapping_symbol(Mapping::Data);
             self.add_reloc(off, kind, name, addend);
             self.emit_bytes(&[0; 8][..size as usize]);
         }
@@ -1004,6 +1166,101 @@ impl Assembler {
         }
     }
 
+    /// `.p2align n[, fill[, max]]` (RISC-V's `.align` is the same) and
+    /// `.balign bytes[, fill[, max]]`, as LLVM's `parseDirectiveAlign` reads
+    /// them: the fill may be left out between the commas (`.p2align 3,,4`).
+    /// Only the fill's low byte counts (`0x1ff` is 0xff, `-1` too). A `max`
+    /// below 1 is LLVM's error; one of at least the alignment changes
+    /// nothing (LLVM warns that it has no effect).
+    fn align_directive(&mut self, name: &str, args: &[DirArg]) {
+        let Some(n) = self.arg_const(args, 0, name) else {
+            return;
+        };
+        let align = if name == ".balign" {
+            if n <= 0 || n & (n - 1) != 0 || n > 1 << 16 {
+                return self.error(".balign: alignment must be a power of two, at most 65536");
+            }
+            n as u32
+        } else {
+            if !(0..=16).contains(&n) {
+                return self.error(format!("{name}: power of two must be 0..16"));
+            }
+            1 << n
+        };
+        if args.len() > 3 {
+            return self.error(format!(
+                "{name}: expected at most an alignment, a fill and a maximum"
+            ));
+        }
+        let fill = match args.get(1) {
+            None | Some(DirArg::Empty) => None,
+            Some(_) => match self.arg_const(args, 1, name) {
+                Some(f) => Some(f as u8),
+                None => return,
+            },
+        };
+        let max = match args.get(2) {
+            None => None,
+            Some(_) => match self.arg_const(args, 2, name) {
+                Some(m) if m < 1 => {
+                    return self.error(
+                        "alignment directive can never be satisfied in this many bytes, ignoring maximum bytes                          expression",
+                    )
+                }
+                Some(m) => (m < i64::from(align)).then_some(m as u32),
+                None => return,
+            },
+        };
+        self.align_with(align, fill, max);
+    }
+
+    /// `.option NAME[, ...]`, its arguments as the parser wrote them, one
+    /// string each (`arch`, `+zicond`, `rv32ima_zicsr`). `arch` and `rvc`
+    /// change the ISA in clang, which merlin-as never does: one that names
+    /// another ISA than `-march`'s is an error ([`crate::isa`]), and the
+    /// same ISA is accepted. The others change nothing merlin-as writes
+    /// (`push`, `pop`, `norvc`, `relax`, `norelax`, `pic`, `nopic`) or are
+    /// unknown, which LLVM only warns about: they are ignored.
+    fn option(&mut self, args: &[DirArg]) {
+        let items: Vec<String> = args
+            .iter()
+            .map(|a| match a {
+                DirArg::Str(s) => String::from_utf8_lossy(s).into_owned(),
+                _ => String::new(),
+            })
+            .collect();
+        let result = match items.first().map(String::as_str) {
+            None => Err(".option: expected an option such as push, pop or arch".into()),
+            Some("arch") => crate::isa::check_option_arch(&items[1..], self.xlen),
+            Some("rvc") => Err(crate::isa::rvc(self.xlen)),
+            _ => Ok(()),
+        };
+        if let Err(msg) = result {
+            self.error(msg);
+        }
+    }
+
+    /// `.attribute TAG, value`: `arch` (tag 5) must name `-march`'s ISA
+    /// ([`crate::isa`]): merlin-as writes `-march`'s `Tag_RISCV_arch`
+    /// whatever the source says. The other attributes are ignored.
+    fn attribute(&mut self, args: &[DirArg]) {
+        let arch = match args.first() {
+            Some(DirArg::Expr(Expr::Sym(t))) => t == "arch",
+            Some(DirArg::Expr(e)) => self.eval(e) == Some(5),
+            _ => false,
+        };
+        if !arch {
+            return;
+        }
+        let result = match args.get(1) {
+            Some(DirArg::Str(s)) => crate::isa::check_attribute(&String::from_utf8_lossy(s), self.xlen),
+            _ => Err(".attribute arch: expected a string".into()),
+        };
+        if let Err(msg) = result {
+            self.error(msg);
+        }
+    }
+
     /// `.space n[, fill]` (and its other names, `.zero` and `.skip`): `n`
     /// bytes of `fill`, zero if it is left out. As in LLVM, only the low
     /// byte of `fill` counts (`.space 3, 0x1ff` is three 0xff), and a
@@ -1029,6 +1286,7 @@ impl Assembler {
         if !self.has_room(n) {
             return;
         }
+        self.mapping_symbol(Mapping::Data);
         if fill == 0 {
             self.emit_zeros(n);
         } else {
@@ -1092,6 +1350,8 @@ impl Assembler {
         if self.symbols[i].ty == SymType::NoType {
             self.symbols[i].ty = SymType::Object;
         }
+        // LLVM's emitZeros: data, after the label.
+        self.mapping_symbol(Mapping::Data);
         self.emit_zeros(size as u64);
         self.current = back;
     }
@@ -1110,7 +1370,11 @@ impl Assembler {
             }
             ".local" => {
                 for i in 0..args.len() {
+                    // As in LLVM (`emitSymbolAttribute`), `.local` names the
+                    // symbol: its place in the symbol table is here.
                     if let Some(n) = self.arg_name(args, i, name) {
+                        let s = self.symbol_index(&n);
+                        self.symbols[s].local = true;
                         self.locals.insert(n);
                     }
                 }
@@ -1148,6 +1412,7 @@ impl Assembler {
                     match a {
                         DirArg::Str(s) => {
                             let s = s.clone();
+                            self.mapping_symbol(Mapping::Data);
                             self.emit_bytes(&s);
                             if name != ".ascii" {
                                 self.emit_bytes(&[0]);
@@ -1159,22 +1424,7 @@ impl Assembler {
             }
             ".zero" | ".space" | ".skip" => self.space(name, args),
             // RISC-V `.align n` means 2^n bytes, same as `.p2align`.
-            ".align" | ".p2align" => {
-                if let Some(n) = self.arg_const(args, 0, name) {
-                    if !(0..=16).contains(&n) {
-                        return self.error(format!("{name}: power of two must be 0..16"));
-                    }
-                    self.align_to(1 << n);
-                }
-            }
-            ".balign" => {
-                if let Some(n) = self.arg_const(args, 0, name) {
-                    if n <= 0 || n & (n - 1) != 0 {
-                        return self.error(".balign: alignment must be a power of two");
-                    }
-                    self.align_to(n as u32);
-                }
-            }
+            ".align" | ".p2align" | ".balign" => self.align_directive(name, args),
             ".type" => {
                 if let Some(n) = self.arg_name(args, 0, ".type") {
                     let ty = match args.get(1) {
@@ -1198,10 +1448,12 @@ impl Assembler {
                         _ => None,
                     };
                     match v {
-                        Some(v) => {
-                            let s = self.symbol_index(&n);
-                            self.symbols[s].size = v as u64;
-                        }
+                        Some(v) => match self.by_name.get(&n) {
+                            Some(&s) => self.symbols[s].size = v as u64,
+                            None => {
+                                self.pending_sizes.insert(n, v as u64);
+                            }
+                        },
                         None => self.error(
                             ".size: expected a constant, or a difference of '.' and labels \
                              defined earlier in this section",
@@ -1212,8 +1464,9 @@ impl Assembler {
             ".file" => self.file_directive(args),
             ".loc" => self.loc_directive(args),
             // Accepted and ignored: metadata that does not change the output.
-            ".ident" | ".option" | ".attribute" | ".addrsig" | ".addrsig_sym" | ".cfi_startproc"
-            | ".cfi_endproc" => {}
+            ".option" => self.option(args),
+            ".attribute" => self.attribute(args),
+            ".ident" | ".addrsig" | ".addrsig_sym" | ".cfi_startproc" | ".cfi_endproc" => {}
             _ => self.error(format!("unknown directive '{name}'")),
         }
     }
@@ -1231,12 +1484,27 @@ impl Assembler {
         }
     }
 
-    /// `.file "name"` (the file's name, which merlin-as has no use for) or
-    /// `.file N ["dir"] "name" [md5 0x...]`: file number N of the line table.
-    /// `.file 0` gives the compilation directory and the main file.
+    /// `.file "name"`, the source file's name: an `STT_FILE` symbol, made
+    /// here, as LLVM's `emitFileDirective` records it (each one, a name
+    /// given twice too). Or `.file N ["dir"] "name" [md5 0x...]`: file
+    /// number N of the line table, no symbol. `.file 0` gives the
+    /// compilation directory and the main file.
     fn file_directive(&mut self, args: &[DirArg]) {
         let n = match args.first() {
-            Some(DirArg::Str(_)) if args.len() == 1 => return,
+            Some(DirArg::Str(name)) if args.len() == 1 => {
+                self.symbols.push(Symbol {
+                    name: String::from_utf8_lossy(name).into_owned(),
+                    section: None,
+                    value: 0,
+                    global: false,
+                    defined: true,
+                    constant: None,
+                    ty: SymType::File,
+                    size: 0,
+                    local: true,
+                });
+                return;
+            }
             Some(DirArg::Expr(e)) => match self.eval(e) {
                 Some(n) if (0..=u32::MAX as i64).contains(&n) => n as usize,
                 _ => return self.error(".file: expected a file number"),
@@ -1267,16 +1535,29 @@ impl Assembler {
             _ => return self.error(".file: unexpected text after the name"),
         };
         let file = dwarf::File { dir, name, md5 };
+        if self.first_file_line == 0 {
+            self.first_file_line = self.line;
+        }
         if n == 0 {
             self.file0 = Some(file);
+            return;
+        }
+        // LLVM's `tryGetFile`: a file named as the main one, with the same
+        // checksum (or none), is the main file, file 0, and takes no number
+        // (its number stays unassigned); a number is given once.
+        if self
+            .file0
+            .as_ref()
+            .is_some_and(|root| root.name == file.name && root.md5 == file.md5)
+        {
             return;
         }
         if self.files.len() <= n {
             self.files.resize(n + 1, None);
         }
         match &self.files[n] {
-            Some(old) if *old != file => self.error(format!("file number {n} is already defined")),
-            _ => self.files[n] = Some(file),
+            Some(_) => self.error("file number already allocated"),
+            None => self.files[n] = Some(file),
         }
     }
 
@@ -1305,8 +1586,11 @@ impl Assembler {
             0 => self.file0.is_some(),
             n => self.files.get(n as usize).is_some_and(Option::is_some),
         };
+        if !defined && file == 0 {
+            return self.error(".loc: file number 0 has no .file");
+        }
         if !defined {
-            return self.error(format!(".loc: file number {file} has no .file"));
+            return self.error("unassigned file number in '.loc' directive");
         }
         let mut loc = dwarf::Loc {
             file,
@@ -1373,6 +1657,7 @@ impl Assembler {
     fn append(&mut self, name: &str, bytes: &[u8]) -> (usize, u32) {
         let back = self.current;
         self.switch_section(name);
+        self.mapping_symbol(Mapping::Data);
         let sec = self.current;
         let at = self.sections[sec].size;
         self.sections[sec].data.extend_from_slice(bytes);
@@ -1384,13 +1669,26 @@ impl Assembler {
     /// Writes the rows as `.debug_line` (and its strings in
     /// `.debug_line_str`), one sequence per section in the order their first
     /// rows came, with relocations for the strings and the sections' addresses.
+    ///
+    /// A numbered `.file` makes the table even when no `.loc` follows, as
+    /// in LLVM (`.file N` makes the compile unit's `MCDwarfLineTable`, and
+    /// `MCDwarfLineTable::emit` writes every one there is): then it is the
+    /// header alone, the directories and files, with no sequence.
     fn line_table(&mut self) {
-        if self.rows.is_empty() {
+        if self.rows.is_empty() && self.first_file_line == 0 {
             return;
         }
-        let line = self.first_loc_line;
+        let line = if self.rows.is_empty() {
+            self.first_file_line
+        } else {
+            self.first_loc_line
+        };
         let Some(root) = self.file0.clone() else {
-            let msg = "line information (.loc) needs .file 0, the compilation directory and the main file";
+            let msg = if self.rows.is_empty() {
+                "a line table (.file N) needs .file 0, the compilation directory and the main file"
+            } else {
+                "line information (.loc) needs .file 0, the compilation directory and the main file"
+            };
             return self.errors.push(Error::new(line, msg));
         };
         let mut files = Vec::new();
@@ -1398,7 +1696,7 @@ impl Assembler {
             match f {
                 Some(f) => files.push(f.clone()),
                 None => {
-                    let msg = format!("the line table's files must be numbered 1, 2, ...: no .file {n}");
+                    let msg = format!("unassigned file number: {n} for .file directives");
                     return self.errors.push(Error::new(line, msg));
                 }
             }
@@ -2451,7 +2749,7 @@ f:      nop
             (".file 1 \"a.c\"\n.loc 1 1 0\nnop\n", "needs .file 0"),
             (
                 ".file 0 \"d\" \"a.c\"\n.file 2 \"b.h\"\n.loc 2 1 0\nnop\n",
-                "no .file 1",
+                "unassigned file number: 1 for .file directives",
             ),
             (
                 ".file 0 \"d\" \"a.c\"\n.loc 0 1 0 frobnicate\nnop\n",
@@ -2466,8 +2764,8 @@ f:      nop
                 "isa needs a number",
             ),
             (
-                ".file 1 \"a.c\"\n.file 1 \"b.c\"\n",
-                "file number 1 is already defined",
+                ".file 1 \"a.c\"\n.file 1 \"a.c\"\n",
+                "file number already allocated",
             ),
             (
                 ".file 0 \"d\" \"a.c\" source \"int x;\"\n",
@@ -2486,9 +2784,27 @@ f:      nop
             let errs = crate::assemble(src).unwrap_err();
             assert!(errs.iter().any(|e| e.msg.contains(want)), "{src:?}: {errs:?}");
         }
-        // The same .file twice is fine; a .file and .loc with no code make no table.
-        let obj =
-            crate::assemble(".file 1 \"a.c\"\n.file 1 \"a.c\"\n.file 0 \"d\" \"a.c\"\n.loc 0 3\n").unwrap();
+        // A file named as the main one is file 0 and leaves its number
+        // unassigned (LLVM's messages).
+        for (src, want) in [
+            (
+                ".file 0 \"d\" \"a.c\"\n.file 1 \"x\" \"a.c\"\n.loc 1 3\nnop\n",
+                "unassigned file number in '.loc' directive",
+            ),
+            (
+                ".file 0 \"d\" \"a.c\"\n.file 1 \"a.c\"\n.file 2 \"b.c\"\n.loc 2 3\nnop\n",
+                "unassigned file number: 1 for .file directives",
+            ),
+        ] {
+            let errs = crate::assemble(src).unwrap_err();
+            let msgs: Vec<&str> = errs.iter().map(|e| e.msg.as_str()).collect();
+            assert_eq!(msgs, [want], "{src:?}");
+        }
+        // A numbered .file makes a line table, its header alone without a
+        // .loc that takes a row, as in LLVM; a .file "name" makes none.
+        let obj = crate::assemble(".file 0 \"d\" \"a.c\"\n.file 1 \"a.c\"\n.loc 0 3\n").unwrap();
+        assert!(obj.sections.iter().any(|s| s.name == ".debug_line"));
+        let obj = crate::assemble(".file \"a.c\"\nnop\n").unwrap();
         assert!(obj.sections.iter().all(|s| !s.is_debug()));
     }
 
