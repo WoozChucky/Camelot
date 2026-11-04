@@ -66,7 +66,7 @@
 #define ADDW add
 #endif
 
-    .equ PARK_PC,         0x1020       # the park loop
+    .equ PARK_PC,          0x1020       # the park loop
     .equ RAM_BASE,         0x80000000
     .equ BOOT_AREA,        0x10000      # the boot block's area: the last 64 KiB of RAM
     .equ BOOT_SIZE,        1024         # the boot block: sectors 0 and 1
