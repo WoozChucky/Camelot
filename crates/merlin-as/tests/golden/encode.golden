@@ -134,6 +134,8 @@ seqz a0, a1 | 0015b513 |
 snez a0, a1 | 00b03533 | 
 sltz a0, a1 | 0005a533 | 
 sgtz a0, a1 | 00b02533 | 
+sgt a0, a1, a2 | 00b62533 | 
+sgtu t0, t1, t2 | 0063b2b3 | 
 j 16 | 0100006f | 
 jr ra | 00008067 | 
 jalr t0 | 000280e7 | 

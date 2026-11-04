@@ -492,6 +492,9 @@ fn expected() -> Rows {
         ("snez a0, a1", vec![r(AluOp::Sltu, A0, ZERO, A1)]),
         ("sltz a0, a1", vec![r(AluOp::Slt, A0, A1, ZERO)]),
         ("sgtz a0, a1", vec![r(AluOp::Slt, A0, ZERO, A1)]),
+        // sgt a, b is slt b, a: the sources swapped.
+        ("sgt a0, a1, a2", vec![r(AluOp::Slt, A0, A2, A1)]),
+        ("sgtu t0, t1, t2", vec![r(AluOp::Sltu, T0, T2, T1)]),
         ("zext.b a0, a1", vec![i(AluOp::And, A0, A1, 0xff)]),
         ("j -8", vec![Jal { rd: ZERO, imm: -8 }]),
         (

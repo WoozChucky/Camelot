@@ -301,6 +301,7 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
         "    .word \"x\"\n    lw a0, %hi(sym)(a1)\n",
         "1:  nop\n    j 2b\n",
         "    li a0, 0x1000000000\n",
+        "    sgt a0, a1\n    sgtu a0, a1, 5\n    sgt a0, x99, a1\n",
         "    .equ x, 1 / 0\n",
         "    addi a0, a1,\n    .bogus 1\n",
         "    .ascii \"\\q\"\n",

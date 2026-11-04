@@ -1005,6 +1005,16 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
                 _ => i_type(OP_IMM, ANDI, rd, rs, 0xff),         // zext.b: andi rd, rs, 255
             })
         }
+        // The missing comparisons, by swapping the sources, as for `bgt`:
+        // sgt rd, a, b == slt rd, b, a (and `sgtu` is `sltu`).
+        "sgt" | "sgtu" => {
+            let [rd, rs, rt] = ops else {
+                return usage("rd, rs, rt");
+            };
+            let (rd, rs, rt) = (reg(rd)?, reg(rs)?, reg(rt)?);
+            let funct3 = if m == "sgt" { 0b010 } else { 0b011 }; // slt's, sltu's
+            one(r_type(OP, funct3, 0, rd, rt, rs))
+        }
         // RV64's 32-bit forms: sign-extend the low word, or negate it.
         "sext.w" | "negw" if rv64 => {
             let [rd, rs] = ops else { return usage("rd, rs") };

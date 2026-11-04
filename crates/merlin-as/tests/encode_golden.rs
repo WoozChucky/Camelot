@@ -102,14 +102,14 @@ fn check_all(golden: &str, xlen: Xlen, lines: usize) {
 
 #[test]
 fn encode_golden() {
-    check_all(include_str!("golden/encode.golden"), Xlen::Rv32, 166);
+    check_all(include_str!("golden/encode.golden"), Xlen::Rv32, 168);
 }
 
 #[test]
 fn encode_golden_rv64() {
     let golden = include_str!("golden/rv64/encode.golden");
-    check_all(golden, Xlen::Rv64, 297);
-    // Its first 166 lines are encode.s's, and only the ISA may make them
+    check_all(golden, Xlen::Rv64, 299);
+    // Its first 168 lines are encode.s's, and only the ISA may make them
     // differ from RV32's: `li` of a value that is negative as a 32-bit word
     // but not as a 64-bit one takes more than a `lui` on RV64.
     let rv32 = cases(include_str!("golden/encode.golden"));

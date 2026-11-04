@@ -172,6 +172,12 @@ const CASES: &[(&str, &str, &str)] = &[
         "immediate where a register belongs (sub has no immediate form)",
         "expected a register, found an immediate",
     ),
+    ("sgt a0, a1", "missing operand", "usage: sgt rd, rs, rt"),
+    (
+        "sgtu a0, a1, 5",
+        "immediate where a register belongs (sgtu is sltu, not sltiu)",
+        "expected a register, found an immediate",
+    ),
     // Deliberately stricter than LLVM, which reads `a1` here as a symbol named
     // a1 (`lw rd, symbol`). In merlin-as register names are never symbols.
     (

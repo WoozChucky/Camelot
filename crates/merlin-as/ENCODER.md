@@ -113,6 +113,7 @@ Pseudo-instructions, as in the RISC-V Assembly Programmer's Manual and LLVM:
 | `li rd, imm` | see below |
 | `mv`, `not`, `neg`, `seqz`, `snez`, `sltz`, `sgtz`, `zext.b` | `addi rd, rs, 0`, `xori rd, rs, -1`, `sub rd, zero, rs`, `sltiu rd, rs, 1`, `sltu rd, zero, rs`, `slt rd, rs, zero`, `slt rd, zero, rs`, `andi rd, rs, 255` |
 | `beqz bnez bltz bgez` / `blez bgtz` | the branch with `zero` as rs2 / as rs1 |
+| `sgt sgtu rd, a, b` | `slt sltu rd, b, a` (sources swapped) |
 | `bgt ble bgtu bleu a, b, t` | `blt bge bltu bgeu b, a, t` (operands swapped) |
 | `j t`, `jal t` | `jal zero, t`, `jal ra, t` |
 | `jr rs`, `jalr rs`, `ret` | `jalr zero, 0(rs)`, `jalr ra, 0(rs)`, `jalr zero, 0(ra)` |
@@ -348,9 +349,9 @@ subdirectories, out of the corpus that Camelot's `/bin/as`, which is RV32,
 assembles in `crates/xtask/tests/selfhost.rs`.
 
 - `encode_golden`: lines assembled by LLVM, words and relocations identical.
-  RV32: 166 lines (`tests/golden/encode.s` → `encode.golden`: RV32I, M, A
+  RV32: 168 lines (`tests/golden/encode.s` → `encode.golden`: RV32I, M, A
   with every ordering suffix, CSRs, pseudo-instructions, relocations). RV64:
-  297 lines (`golden/rv64/encode.golden`): `encode.s` again, assembled for
+  299 lines (`golden/rv64/encode.golden`): `encode.s` again, assembled for
   RV64, where only `li a0, 0x80000000` differs (the test checks that), then
   `golden/rv64/encode.s`: the W operations, `ld`/`lwu`/`sd` and their
   pc-relative forms, 6-bit shifts, the `.d` atomics with every ordering,
