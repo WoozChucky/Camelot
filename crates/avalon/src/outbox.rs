@@ -154,6 +154,11 @@ impl Outbox {
     /// client is gone, so its reading thread must stop too); after the last frame, the
     /// thread that closed the queue ends it, gracefully (`close_gracefully`, so that a
     /// reset over input the server did not read cannot discard those last frames).
+    /// Except in two cases: when the server shuts down, `shut_down` ends every
+    /// connection with `shutdown(Both)` once its writer is done; and when the writer
+    /// is still blocked after the reading thread's `wait_done` times out, nothing ends
+    /// it on purpose, and the socket closes when the writer, ending by itself, drops the
+    /// last handle on it.
     pub fn run_writer(&self, mut out: impl Write) {
         let mut failed = false;
         loop {
