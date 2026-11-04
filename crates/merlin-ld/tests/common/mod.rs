@@ -320,24 +320,28 @@ fn disassembly_body(text: &str) -> Vec<String> {
 ///   names the instruction; the address and the word must still agree;
 /// * a symbol assigned by the script is `SHN_ABS` in merlin-ld's output, so
 ///   when it shares its address with a symbol of the section, a label line
-///   may name the other one; and a target outside every section, which
-///   llvm-objdump names after an absolute symbol, may be named after it
-///   where ld.lld's file has another (the same address, `<call_min>` for
-///   `<missing+0xffa3c>`).
+///   may name the other one; and a target outside every allocated section,
+///   which llvm-objdump names after an absolute symbol, may be named after
+///   a global absolute symbol the script assigned where ld.lld's file has
+///   another (the same address, `<call_min>` for `<missing+0xffa3c>`).
 pub fn assert_same_disassembly(set: &str, name: &str, linked: &merlin_ld::Linked) {
     let elf = &linked.elf;
     let lld_elf = std::fs::read(fixtures(set).join(format!("{name}.lld.elf"))).unwrap();
-    // The value of symbol `sym` in `file`.
-    let value = |file: &[u8], sym: &str| {
+    // The value of the one symbol named `sym` in `file` that `keep` accepts:
+    // none if there are several (a `.Lpcrel_hiN` of two objects), so that a
+    // duplicated local name cannot stand for the wrong address.
+    let value = |file: &[u8], sym: &str, keep: &dyn Fn(&elf::Symbol) -> bool| {
         let e = elf::Elf::parse(file).unwrap();
-        e.symbols()
-            .unwrap()
-            .into_iter()
-            .find(|s| s.name == sym)
-            .map(|s| s.value)
+        let symbols = e.symbols().unwrap();
+        let mut found = symbols.iter().filter(|s| s.name == sym && keep(s));
+        match (found.next(), found.next()) {
+            (Some(s), None) => Some(s.value),
+            _ => None,
+        }
     };
-    // `jalr -0x800(ra) <missing+0xffa3c>` -> ("jalr -0x800(ra)", address).
-    let target = |l: &str, file: &[u8]| {
+    // `jalr -0x800(ra) <missing+0xffa3c>` -> ("jalr -0x800(ra)", address,
+    // "missing").
+    let target = |l: &str, file: &[u8], keep: &dyn Fn(&elf::Symbol) -> bool| {
         let (insn, t) = l.strip_suffix('>')?.rsplit_once(" <")?;
         let (sym, off) = match t.split_once("+0x") {
             Some((s, off)) => (s, u64::from_str_radix(off, 16).ok()?),
@@ -345,7 +349,7 @@ pub fn assert_same_disassembly(set: &str, name: &str, linked: &merlin_ld::Linked
         };
         Some((
             insn.to_string(),
-            value(file, sym)?.wrapping_add(off),
+            value(file, sym, keep)?.wrapping_add(off),
             sym.to_string(),
         ))
     };
@@ -355,6 +359,19 @@ pub fn assert_same_disassembly(set: &str, name: &str, linked: &merlin_ld::Linked
             .globals
             .iter()
             .any(|(g, d)| g == n && matches!(d, merlin_ld::layout::Def::Script(_)))
+    };
+    // Our name for such a target must be a global absolute symbol (what
+    // merlin-ld makes of a script assignment), the address outside every
+    // section the program loads.
+    let absolute = |s: &elf::Symbol| s.bind() != elf::STB_LOCAL && s.shndx == elf::SHN_ABS;
+    let any = |_: &elf::Symbol| true;
+    let ours_elf = elf::Elf::parse(elf).unwrap();
+    let outside_sections = |addr: u64| {
+        ours_elf
+            .sections
+            .iter()
+            .filter(|s| s.flags & elf::SHF_ALLOC != 0)
+            .all(|s| addr < s.addr || addr - s.addr >= s.size)
     };
     let opts = merlin_objdump::Options {
         disassemble: true,
@@ -379,10 +396,10 @@ pub fn assert_same_disassembly(set: &str, name: &str, linked: &merlin_ld::Linked
                 "{name}:\n ours: {o}\n llvm: {l}"
             );
         } else if let (true, Some((oi, ot, os)), Some((li, lt, _))) =
-            (o != l, target(o, elf), target(l, &lld_elf))
+            (o != l, target(o, elf, &absolute), target(l, &lld_elf, &any))
         {
             assert!(
-                oi == li && ot == lt && script_symbol(&os),
+                oi == li && ot == lt && script_symbol(&os) && outside_sections(ot),
                 "{name}:\n ours: {o}\n llvm: {l}"
             );
         } else {
