@@ -100,6 +100,7 @@ const BOOT_FAULT_POP_UNMATCHED: u32 = 15;
 const BOOT_FAULT_POP_INTR_ON: u32 = 16;
 const BOOT_FAULT_KSTACK_OVERFLOW: u32 = 17;
 const BOOT_FAULT_PA_VMALLOC: u32 = 18;
+const BOOT_FAULT_BOOT_STACK_OVERFLOW: u32 = 19;
 
 /// What the RV64 kernel prints from the banner to the ticks, with the
 /// `[dbg]` line's pc masked.
@@ -645,6 +646,35 @@ fn misuses_panic() {
         assert_eq!(r, RunResult::Exited(PANIC_EXIT), "fault {fault}:\n{out}");
         assert!(out.ends_with(want), "fault {fault}: want {want:?}, got:\n{out}");
     }
+}
+
+#[test]
+fn the_boot_stack_has_a_guard_page() {
+    // The page below hart 0's boot stack is past .bss, and unmapped: an
+    // overflow faults there, and kernel_vec reports it like a kernel
+    // stack's.
+    let (k, r, out) = run_with_fault(BOOT_FAULT_BOOT_STACK_OVERFLOW);
+    assert_eq!(r, RunResult::Exited(PANIC_EXIT), "output:\n{out}");
+    let bottom = k.sym("__stack_bottom");
+    assert_eq!(bottom % KSTACK_SLOT, 0);
+    assert!(bottom - 4096 >= k.sym("__bss_end"));
+    let kpt = k.pa(k.read64(k.sym("kernel_pagetable")));
+    assert!(k.translate(kpt, bottom - 4096).is_none());
+    assert!(k.translate(kpt, bottom).is_some());
+    assert!(k.translate(kpt, bottom - 8192).is_some());
+    let report = &out[out.find("panic: ").unwrap()..];
+    let mut lines = report.lines();
+    assert_eq!(
+        lines.next(),
+        Some("panic: kernel stack overflow on hart 0's boot stack"),
+        "{report}"
+    );
+    assert_eq!(
+        lines.next().unwrap().rsplit(' ').next(),
+        Some(format!("{bottom:#018x}-{:#018x}", bottom + KSTACK_SIZE).as_str()),
+        "{report}"
+    );
+    assert_eq!(lines.next(), Some("  store page fault"), "{report}");
 }
 
 #[test]

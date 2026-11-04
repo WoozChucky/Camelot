@@ -69,8 +69,11 @@ SECTIONS
     /* Hart 0's boot stack: 16 KiB. On RV64 it is KSTACK_SIZE
      * (include/vm.h), aligned to twice that, as every kernel stack is, so
      * that kernel_vec's one-bit overflow check (kernelvec.S) holds for it
-     * too. */
+     * too, with a page of its own below it, after .bss, which the kernel
+     * page table leaves unmapped (vm.c, kvminit()): its guard page, as the
+     * other kernel stacks have one. */
 #if __riscv_xlen == 64
+    . += 4K;
     .stack (NOLOAD) : ALIGN(32K) {
 #else
     .stack (NOLOAD) : ALIGN(16) {

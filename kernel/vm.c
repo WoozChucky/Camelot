@@ -361,7 +361,13 @@ void kvminit(void) {
         panic("kvminit: out of memory");
     }
 #if __riscv_xlen == 64
-    if (map_pages(kernel_pagetable, data, pa(data), end - data, PAGE_KERNEL) != 0) {
+    /* The rest of the image, but for the page below hart 0's boot stack:
+     * its guard page (kernel.lds.S keeps it clear of .bss), so that the
+     * boot stack overflows into an unmapped page, as every kernel stack
+     * does (kernel_vec reports it). */
+    uintptr guard = (uintptr)__stack_bottom - PGSIZE;
+    if (map_pages(kernel_pagetable, data, pa(data), guard - data, PAGE_KERNEL) != 0 ||
+        map_pages(kernel_pagetable, guard + PGSIZE, pa(guard + PGSIZE), end - (guard + PGSIZE), PAGE_KERNEL) != 0) {
         panic("kvminit: out of memory");
     }
     /* All of RAM in the direct map (kinit has cut ram_size to what the
