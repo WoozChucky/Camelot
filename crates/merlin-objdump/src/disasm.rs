@@ -316,9 +316,10 @@ fn inst_start_padding(column: usize, raw_insn: bool) -> usize {
 /// object or untyped symbol at or before the address (not a mapping symbol
 /// like `$x` or a fake label `.L0 `) in an allocated section, if the address
 /// is inside it (a symbol of size 0 runs to the next one); in an object,
-/// whatever section it is in, all of them starting at 0. (LLVM falls back to
-/// the debug information's name for an address no symbol covers; such an
-/// address gets none here.)
+/// whatever section it is in, all of them starting at 0. For an address no
+/// symbol covers, the function is the debug information's, from the compile
+/// unit that covers it ([`elf::units::function_name`]). A name is printed
+/// with `()` after it, unless it ends with them.
 ///
 /// The line is the line table row at or before the address, in the table of
 /// the compile unit whose ranges hold the address (`.debug_aranges`, or the
@@ -375,13 +376,17 @@ impl SourceLines {
         })
     }
 
+    /// The compile unit that covers `addr`: its index in `units`.
+    fn unit(&self, addr: u64) -> Option<usize> {
+        let offset = self.unit_ranges.find(addr)?;
+        self.units
+            .iter()
+            .position(|u| u.offset <= offset && offset < u.next)
+    }
+
     /// The line for `addr` in section `sec`: path and line.
     fn row(&self, sec: usize, addr: u64) -> Option<(String, u32)> {
-        let offset = self.unit_ranges.find(addr)?;
-        let unit = self
-            .units
-            .iter()
-            .find(|u| u.offset <= offset && offset < u.next)?;
+        let unit = &self.units[self.unit(addr)?];
         let table = self.tables.iter().find(|t| Some(t.offset) == unit.stmt_list)?;
         let rows = table.sequences.iter().find_map(|seq| {
             let (first, end) = (seq.rows.first()?, seq.rows.last()?);
@@ -401,11 +406,13 @@ impl SourceLines {
             .checked_sub(1)
             .map(|i| &self.functions[i])
             .filter(|(start, size, _)| *size == 0 || addr - start < *size)
-            .map(|f| f.2.clone());
+            .map(|f| f.2.clone())
+            .or_else(|| elf::units::function_name(&self.units, self.unit(addr)?, addr));
         let line = self.row(sec, addr).filter(|(_, l)| *l != 0);
         let new_function = function.is_some() && function != self.last.0;
         if let (true, Some(f)) = (new_function, &function) {
-            let _ = writeln!(out, "; {f}():");
+            let parens = if f.ends_with("()") { "" } else { "()" };
+            let _ = writeln!(out, "; {f}{parens}:");
         }
         if let Some((path, n)) = &line {
             if new_function || self.last.1.as_ref() != Some(&(path.clone(), *n)) {

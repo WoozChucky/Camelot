@@ -116,6 +116,11 @@ const CASES: &[(&str, &str, &[&str])] = &[
         &["-d", "-l"],
     ),
     (
+        "subprograms-o.dl",
+        "crates/merlin-objdump/tests/fixtures/subprograms.o",
+        &["-d", "-l"],
+    ),
+    (
         "linked-elf.d",
         "crates/merlin-objdump/tests/fixtures/linked.elf",
         &["-d"],
@@ -185,6 +190,11 @@ const CASES: &[(&str, &str, &[&str])] = &[
     (
         "rv64/nocu-o.dl",
         "crates/merlin-objdump/tests/fixtures/rv64/nocu.o",
+        &["-d", "-l"],
+    ),
+    (
+        "rv64/subprograms-o.dl",
+        "crates/merlin-objdump/tests/fixtures/rv64/subprograms.o",
         &["-d", "-l"],
     ),
     (

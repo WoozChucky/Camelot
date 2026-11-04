@@ -149,6 +149,8 @@ fn fixtures() -> Vec<PathBuf> {
         "rv64/units.o",
         "rv64/units-dwarf4.o",
         "rv64/units-aranges.o",
+        "subprograms.o",
+        "rv64/subprograms.o",
     ] {
         files.push(root().join("crates/merlin-objdump/tests/fixtures").join(f));
     }

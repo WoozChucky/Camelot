@@ -10,13 +10,16 @@
 //! that unit's line table. A line table no unit names is never read, and
 //! neither is one for an address outside every unit.
 //!
-//! [`Elf::compile_units`] reads the unit DIEs; [`Elf::unit_ranges`] maps
+//! [`Elf::compile_units`] reads the units; [`Elf::unit_ranges`] maps
 //! addresses to units as LLVM's `DWARFDebugAranges` does, from
-//! `.debug_aranges` and then the ranges of the units it does not list.
+//! `.debug_aranges` and then the ranges of the units it does not list. Below
+//! the unit DIE, the unit's entries name its functions: [`function_name`]
+//! gives the subprogram or inlined subroutine at an address, as LLVM's
+//! symbolizer does where no symbol covers it.
 //!
-//! Only the unit DIE is read, not its children: an abbreviation (in
-//! `.debug_abbrev`) gives each attribute's form, which says how many bytes
-//! its value takes. Addresses may be indices into `.debug_addr` (`addrx`
+//! An entry's abbreviation (in `.debug_abbrev`) gives its tag, whether
+//! children follow, and each attribute's form, which says how many bytes its
+//! value takes. Addresses may be indices into `.debug_addr` (`addrx`
 //! forms, from `DW_AT_addr_base`), strings into `.debug_str` through
 //! `.debug_str_offsets` (`strx`), and range lists are in `.debug_rnglists`
 //! (DWARF 5) or `.debug_ranges` (before). In a relocatable object every one of
@@ -25,7 +28,7 @@
 
 use crate::lines::Relocated;
 use crate::{err, Elf, Error};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// One compile unit: where it is and what its unit DIE says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +44,105 @@ pub struct CompileUnit {
     pub comp_dir: Option<String>,
     /// The address ranges of its code, `[start, end)`, from the unit DIE.
     pub ranges: Vec<(u64, u64)>,
+    /// Its entries in order (their offsets increasing), and the code ranges
+    /// of the subprograms and inlined subroutines among them.
+    dies: Vec<Die>,
+    subroutines: AddrDieMap,
+}
+
+impl CompileUnit {
+    /// The entry at `offset` of `.debug_info`, if it is in this unit.
+    fn die_at(&self, offset: u64) -> Option<&Die> {
+        let i = self.dies.binary_search_by_key(&offset, |d| d.offset).ok()?;
+        Some(&self.dies[i])
+    }
+}
+
+/// What an entry says that a function's name may come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Die {
+    /// Its offset in `.debug_info`.
+    offset: u64,
+    /// `DW_AT_linkage_name` (or `DW_AT_MIPS_linkage_name`) and `DW_AT_name`:
+    /// None where the entry has no such attribute, Some(None) where its value
+    /// is no string.
+    linkage_name: Option<Option<String>>,
+    name: Option<Option<String>>,
+    /// `DW_AT_abstract_origin` and `DW_AT_specification`, as offsets in
+    /// `.debug_info`.
+    abstract_origin: Option<u64>,
+    specification: Option<u64>,
+}
+
+/// LLVM's `DWARFUnit::AddrDieMap`: the code ranges of a unit's subprograms
+/// and inlined subroutines, start to (end, entry), as `updateAddressDieMap`
+/// makes it: parents first, a range inside an earlier one cutting that one
+/// in two around it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AddrDieMap(BTreeMap<u64, (u64, usize)>);
+
+impl AddrDieMap {
+    fn insert(&mut self, start: u64, end: u64, die: usize) {
+        if start == end {
+            return; // LLVM ignores empty ranges.
+        }
+        if let Some((&key, &(prev_end, prev_die))) = self.0.range(..=start).next_back() {
+            if start < prev_end {
+                if end < prev_end {
+                    self.0.insert(end, (prev_end, prev_die));
+                }
+                if start > key {
+                    self.0.insert(key, (start, prev_die));
+                }
+            }
+        }
+        self.0.insert(start, (end, die));
+    }
+
+    fn find(&self, addr: u64) -> Option<usize> {
+        let (_, &(end, die)) = self.0.range(..=addr).next_back()?;
+        (addr < end).then_some(die)
+    }
+}
+
+/// The name LLVM's symbolizer gives the function at `addr` from the debug
+/// information of `units[unit]`, the unit that covers `addr`
+/// (`getFunctionNameAndStartLineForAddress`): the innermost subprogram or
+/// inlined subroutine whose code holds it (`getInlinedChainForAddress`), by
+/// its linkage name if it has one, else by its name (`DWARFDie::getName` for
+/// `LinkageName`), each looked for through `DW_AT_specification` and
+/// `DW_AT_abstract_origin` too, in any unit (`findRecursively`).
+/// llvm-objdump `-l` uses it for an address no symbol covers.
+pub fn function_name(units: &[CompileUnit], unit: usize, addr: u64) -> Option<String> {
+    let u = units.get(unit)?;
+    let die = &u.dies[u.subroutines.find(addr)?];
+    let lookup = |offset: u64| {
+        units
+            .iter()
+            .find(|u| u.offset <= offset && offset < u.next)
+            .and_then(|u| u.die_at(offset))
+    };
+    // The first entry that has the attribute: LLVM's work list, a stack, gets
+    // an entry's abstract origin and then its specification, each entry once.
+    let find = |get: &dyn Fn(&Die) -> &Option<Option<String>>| -> Option<String> {
+        let mut work = vec![die];
+        let mut seen = vec![die.offset];
+        while let Some(d) = work.pop() {
+            if let Some(v) = get(d) {
+                return v.clone();
+            }
+            for r in [d.abstract_origin, d.specification].into_iter().flatten() {
+                if let Some(next) = lookup(r) {
+                    if !seen.contains(&next.offset) {
+                        seen.push(next.offset);
+                        work.push(next);
+                    }
+                }
+            }
+        }
+        None
+    };
+    find(&|d| &d.linkage_name).or_else(|| find(&|d| &d.name))
 }
 
 /// DWARF 5 unit types (`DW_UT_*`) that are not compile units.
@@ -59,6 +161,15 @@ const AT_RANGES: u64 = 0x55;
 const AT_STR_OFFSETS_BASE: u64 = 0x72;
 const AT_ADDR_BASE: u64 = 0x73;
 const AT_RNGLISTS_BASE: u64 = 0x74;
+const AT_NAME: u64 = 0x03;
+const AT_ABSTRACT_ORIGIN: u64 = 0x31;
+const AT_SPECIFICATION: u64 = 0x47;
+const AT_LINKAGE_NAME: u64 = 0x6e;
+const AT_MIPS_LINKAGE_NAME: u64 = 0x2007;
+
+/// The entries that are functions (`DW_TAG_*`).
+const TAG_SUBPROGRAM: u64 = 0x2e;
+const TAG_INLINED_SUBROUTINE: u64 = 0x1d;
 
 /// The forms (`DW_FORM_*`).
 const FORM_ADDR: u64 = 0x01;
@@ -215,7 +326,12 @@ enum Value {
     StrIndex(u64),
     /// `rnglistx`: an index into the unit's range list offsets.
     RnglistIndex(u64),
-    /// Anything else (references, blocks, expressions, ...).
+    /// `ref1` to `ref8`, `ref_udata`: an entry of the same unit, by its
+    /// offset from the unit's start.
+    UnitRef(u64),
+    /// `ref_addr`: an entry anywhere in `.debug_info`, by its offset there.
+    InfoRef(u64),
+    /// Anything else (blocks, expressions, other files' references, ...).
     Other,
 }
 
@@ -270,17 +386,20 @@ fn read_value(
         FORM_STRX | FORM_GNU_STR_INDEX => Value::StrIndex(r.uleb()?),
         FORM_STRX1..=FORM_STRX4 => Value::StrIndex(r.uint(form - FORM_STRX1 + 1)?),
         FORM_RNGLISTX => Value::RnglistIndex(r.uleb()?),
-        FORM_LOCLISTX | FORM_REF_UDATA => {
+        FORM_LOCLISTX => {
             r.uleb()?;
             Value::Other
         }
-        FORM_REF1 => skip(r, 1)?,
-        FORM_REF2 => skip(r, 2)?,
-        FORM_REF4 | FORM_REF_SUP4 | FORM_STRP_SUP | FORM_GNU_REF_ALT | FORM_GNU_STRP_ALT => skip(r, 4)?,
-        FORM_REF8 | FORM_REF_SIG8 | FORM_REF_SUP8 => skip(r, 8)?,
+        FORM_REF_UDATA => Value::UnitRef(r.uleb()?),
+        FORM_REF1 => Value::UnitRef(r.uint(1)?),
+        FORM_REF2 => Value::UnitRef(r.uint(2)?),
+        FORM_REF4 => Value::UnitRef(r.uint(4)?),
+        FORM_REF8 => Value::UnitRef(r.uint(8)?),
+        FORM_REF_SUP4 | FORM_STRP_SUP | FORM_GNU_REF_ALT | FORM_GNU_STRP_ALT => skip(r, 4)?,
+        FORM_REF_SIG8 | FORM_REF_SUP8 => skip(r, 8)?,
         FORM_DATA16 => skip(r, 16)?,
         // DWARF 2's DW_FORM_ref_addr is an address; later, an offset.
-        FORM_REF_ADDR => skip(r, if version == 2 { addr_size } else { 4 })?,
+        FORM_REF_ADDR => Value::InfoRef(r.uint(if version == 2 { addr_size } else { 4 })?),
         FORM_BLOCK1 => {
             let n = r.uint(1)?;
             skip(r, n)?
@@ -314,17 +433,26 @@ fn skip(r: &mut Reader, n: u64) -> Result<Value, Error> {
     Ok(Value::Other)
 }
 
-/// The attributes of abbreviation `code` in the table at `offset` of
-/// `.debug_abbrev`: (attribute, form, implicit constant).
-fn abbreviation(abbrev: &[u8], offset: u64, code: u64) -> Result<Vec<(u64, u64, i64)>, Error> {
+/// One abbreviation: the entry's tag, whether it has children, and its
+/// attributes (attribute, form, implicit constant).
+struct Abbrev {
+    tag: u64,
+    children: bool,
+    attrs: Vec<(u64, u64, i64)>,
+}
+
+/// The abbreviation table at `offset` of `.debug_abbrev`, by code (the
+/// first of a code given twice).
+fn abbreviations(abbrev: &[u8], offset: u64) -> Result<HashMap<u64, Abbrev>, Error> {
     let mut r = Reader::new(abbrev, offset, ".debug_abbrev")?;
+    let mut table = HashMap::new();
     loop {
-        let c = r.uleb()?;
-        if c == 0 {
-            return err(format!("debug info: no abbreviation {code}"));
+        let code = r.uleb()?;
+        if code == 0 {
+            return Ok(table);
         }
-        r.uleb()?; // the tag
-        r.u8()?; // has children
+        let tag = r.uleb()?;
+        let children = r.u8()? != 0;
         let mut attrs = Vec::new();
         loop {
             let (at, form) = (r.uleb()?, r.uleb()?);
@@ -334,9 +462,7 @@ fn abbreviation(abbrev: &[u8], offset: u64, code: u64) -> Result<Vec<(u64, u64, 
             let implicit = if form == FORM_IMPLICIT_CONST { r.sleb()? } else { 0 };
             attrs.push((at, form, implicit));
         }
-        if c == code {
-            return Ok(attrs);
-        }
+        table.entry(code).or_insert(Abbrev { tag, children, attrs });
     }
 }
 
@@ -368,9 +494,82 @@ struct Unit<'a> {
     addr_base: Option<u64>,
     str_offsets_base: Option<u64>,
     rnglists_base: u64,
+    /// The unit's base address, which range list offsets are from: its
+    /// `DW_AT_low_pc` (or `DW_AT_entry_pc`).
+    base: Option<u64>,
+}
+
+/// One entry (DIE) as read: its offset in `.debug_info`, its tag, whether
+/// children follow it, and its attributes.
+struct Entry {
+    offset: u64,
+    tag: u64,
+    children: bool,
+    attrs: Vec<(u64, Value)>,
+}
+
+/// The value of attribute `a` (its first, as LLVM's `find` takes it).
+fn find(attrs: &[(u64, Value)], a: u64) -> Option<&Value> {
+    attrs.iter().find(|(at, _)| *at == a).map(|(_, v)| v)
+}
+
+impl CompileUnit {
+    /// Keeps what entry `e` says of function names, and, for a subprogram or
+    /// an inlined subroutine, its code ranges (a range list LLVM cannot read
+    /// gives none, without a word).
+    fn add(&mut self, unit: &Unit, e: Entry) {
+        let index = self.dies.len();
+        let string = |a| find(&e.attrs, a).map(|v| unit.string(v));
+        let reference = |a| match find(&e.attrs, a) {
+            Some(&Value::UnitRef(off)) => self.offset.checked_add(off),
+            Some(&Value::InfoRef(off)) => Some(off),
+            _ => None,
+        };
+        let die = Die {
+            offset: e.offset,
+            linkage_name: string(AT_MIPS_LINKAGE_NAME).or_else(|| string(AT_LINKAGE_NAME)),
+            name: string(AT_NAME),
+            abstract_origin: reference(AT_ABSTRACT_ORIGIN),
+            specification: reference(AT_SPECIFICATION),
+        };
+        if e.tag == TAG_SUBPROGRAM || e.tag == TAG_INLINED_SUBROUTINE {
+            for (start, end) in unit.ranges(&e.attrs).unwrap_or_default() {
+                self.subroutines.insert(start, end, index);
+            }
+        }
+        self.dies.push(die);
+    }
 }
 
 impl Unit<'_> {
+    /// An entry's code ranges, as LLVM's `DWARFDie::getAddressRanges` reads
+    /// them: low and high pc (an address, or a constant added to the low
+    /// one), else the range list `DW_AT_ranges`, its offsets from the unit's
+    /// base address.
+    fn ranges(&self, attrs: &[(u64, Value)]) -> Result<Vec<(u64, u64)>, Error> {
+        let low = find(attrs, AT_LOW_PC).and_then(|v| self.address(v));
+        let high = |low: u64| {
+            let v = find(attrs, AT_HIGH_PC)?;
+            self.address(v)
+                .or_else(|| v.unsigned().map(|n| low.wrapping_add(n)))
+        };
+        if let Some(range) = low
+            .filter(|&l| l != self.tombstone())
+            .and_then(|l| Some((l, high(l)?)))
+        {
+            return Ok(vec![range]);
+        }
+        let list = match find(attrs, AT_RANGES) {
+            Some(&Value::RnglistIndex(i)) => self.rnglist_offset(i),
+            Some(v) => v.section_offset(),
+            None => None,
+        };
+        match list {
+            Some(offset) => self.range_list(offset, self.base),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// The largest address, which marks a discarded one (LLVM's tombstone).
     fn tombstone(&self) -> u64 {
         if self.addr_size == 4 {
@@ -513,8 +712,8 @@ impl Unit<'_> {
 
 impl Elf<'_> {
     /// The compile units of `.debug_info` (none if there is no such
-    /// section): for each, what its unit DIE says. Type units are left out,
-    /// as they have no code.
+    /// section): for each, what its unit DIE says, and what its other entries
+    /// say of its functions. Type units are left out, as they have no code.
     pub fn compile_units(&self) -> Result<Vec<CompileUnit>, Error> {
         let Some(info) = self.relocated(".debug_info")? else {
             return Ok(Vec::new());
@@ -575,59 +774,76 @@ impl Elf<'_> {
                 ));
             }
             let addr_size = u64::from(addr_size);
-            let code = r.uleb()?;
-            let mut attrs = Vec::new();
-            if code != 0 {
-                for (attr, form, implicit) in abbreviation(&s.abbrev, abbrev_offset, code)? {
-                    attrs.push((attr, read_value(&mut r, form, implicit, version, addr_size)?));
+            let abbrevs = abbreviations(&s.abbrev, abbrev_offset)?;
+            let entry = |r: &mut Reader| -> Result<Option<Entry>, Error> {
+                let offset = r.at as u64;
+                let code = r.uleb()?;
+                if code == 0 {
+                    return Ok(None); // the end of a list of children
                 }
-            }
-            let find = |a: u64| attrs.iter().find(|(at, _)| *at == a).map(|(_, v)| v);
+                let Some(a) = abbrevs.get(&code) else {
+                    return err(format!("debug info: no abbreviation {code}"));
+                };
+                let mut attrs = Vec::new();
+                for &(attr, form, implicit) in &a.attrs {
+                    attrs.push((attr, read_value(r, form, implicit, version, addr_size)?));
+                }
+                Ok(Some(Entry {
+                    offset,
+                    tag: a.tag,
+                    children: a.children,
+                    attrs,
+                }))
+            };
+            let die = entry(&mut r)?;
+            let attrs = die.as_ref().map_or(&[][..], |d| &d.attrs[..]);
             let unit = Unit {
                 s: &s,
                 version,
                 addr_size,
-                addr_base: find(AT_ADDR_BASE).and_then(Value::section_offset),
-                str_offsets_base: find(AT_STR_OFFSETS_BASE).and_then(Value::section_offset),
-                rnglists_base: find(AT_RNGLISTS_BASE)
+                addr_base: find(attrs, AT_ADDR_BASE).and_then(Value::section_offset),
+                str_offsets_base: find(attrs, AT_STR_OFFSETS_BASE).and_then(Value::section_offset),
+                rnglists_base: find(attrs, AT_RNGLISTS_BASE)
                     .and_then(Value::section_offset)
                     .unwrap_or(0),
-            };
-            // LLVM's DWARFDie::getAddressRanges: low and high pc (an address,
-            // or a constant added to the low one), else the range list.
-            let low = find(AT_LOW_PC).and_then(|v| unit.address(v));
-            let high = |low: u64| {
-                let v = find(AT_HIGH_PC)?;
-                unit.address(v)
-                    .or_else(|| v.unsigned().map(|n| low.wrapping_add(n)))
+                base: None,
             };
             // A range list's offsets are from the unit's base address.
-            let base = find(AT_LOW_PC)
-                .or(find(AT_ENTRY_PC))
-                .and_then(|v| unit.address(v));
-            let list = match find(AT_RANGES) {
-                Some(&Value::RnglistIndex(i)) => unit.rnglist_offset(i),
-                Some(v) => v.section_offset(),
-                None => None,
+            let unit = Unit {
+                base: find(attrs, AT_LOW_PC)
+                    .or(find(attrs, AT_ENTRY_PC))
+                    .and_then(|v| unit.address(v)),
+                ..unit
             };
-            let ranges = match low
-                .filter(|&l| l != unit.tombstone())
-                .and_then(|l| Some((l, high(l)?)))
-            {
-                Some(range) => vec![range],
-                None => match list {
-                    Some(offset) => unit.range_list(offset, base)?,
-                    None => Vec::new(),
-                },
-            };
-            units.push(CompileUnit {
+            let ranges = unit.ranges(attrs)?;
+            let mut cu = CompileUnit {
                 offset: at,
                 next,
                 version,
-                stmt_list: find(AT_STMT_LIST).and_then(Value::section_offset),
-                comp_dir: find(AT_COMP_DIR).and_then(|v| unit.string(v)),
+                stmt_list: find(attrs, AT_STMT_LIST).and_then(Value::section_offset),
+                comp_dir: find(attrs, AT_COMP_DIR).and_then(|v| unit.string(v)),
                 ranges,
-            });
+                dies: Vec::new(),
+                subroutines: AddrDieMap::default(),
+            };
+            // Every entry, depth first (parents before their children, as
+            // updateAddressDieMap wants them). LLVM stops at an entry it
+            // cannot read and keeps those before it; so does this.
+            if let Some(die) = die {
+                let mut depth = usize::from(die.children);
+                cu.add(&unit, die);
+                while depth > 0 && (r.at as u64) < next {
+                    match entry(&mut r) {
+                        Ok(Some(die)) => {
+                            depth += usize::from(die.children);
+                            cu.add(&unit, die);
+                        }
+                        Ok(None) => depth -= 1,
+                        Err(_) => break,
+                    }
+                }
+            }
+            units.push(cu);
             at = next;
         }
         Ok(units)
@@ -799,7 +1015,22 @@ impl UnitRanges {
 
 #[cfg(test)]
 mod tests {
-    use super::{push_range, UnitRanges};
+    use super::{push_range, AddrDieMap, UnitRanges};
+
+    /// LLVM's updateAddressDieMap: an inner range cuts the outer one in two,
+    /// a later one at the same start replaces it, an empty one is none.
+    #[test]
+    fn subroutine_ranges_nest() {
+        let mut m = AddrDieMap::default();
+        m.insert(0x10, 0x40, 0);
+        m.insert(0x20, 0x28, 1);
+        m.insert(0x30, 0x30, 2);
+        m.insert(0x10, 0x18, 3);
+        let found: Vec<_> = [0xf, 0x10, 0x18, 0x20, 0x28, 0x3f, 0x40]
+            .map(|a| m.find(a))
+            .into();
+        assert_eq!(found, [None, Some(3), Some(0), Some(1), Some(0), Some(0), None]);
+    }
 
     /// LLVM's DWARFDebugAranges: where units overlap, the one already
     /// running goes on, else the lowest offset; empty ranges are none.

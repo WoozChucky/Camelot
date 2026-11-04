@@ -59,6 +59,8 @@ rm "$FIX/linked.o"
 clang --target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32 -c -mno-relax "$FIX/lines.s" -o "$FIX/lines.o"
 ld.lld -Ttext=0x10000 -e add "$FIX/lines.o" -o "$FIX/lines.elf"
 rm "$FIX/lines.o"
+# subprograms.s: function names from a hand-written compile unit.
+clang --target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32 -c -mno-relax "$FIX/subprograms.s" -o "$FIX/subprograms.o"
 
 # RV64, built as RV32 is: relocs.S, hello.o, hello.elf and debug.c with
 # relaxation on (R_RISCV_RELAX and the relocations it keeps, ADD/SUB pairs in
@@ -85,6 +87,7 @@ $CC64 -O1 -g -fdebug-compilation-dir=. "$FIX/units.c" -o "$FIX/rv64/units.o"
 $CC64 -O1 -gdwarf-4 -fdebug-compilation-dir=build "$FIX/units.c" -o "$FIX/rv64/units-dwarf4.o"
 $CC64 -O1 -g -gdwarf-aranges -fdebug-compilation-dir=. "$FIX/units.c" -o "$FIX/rv64/units-aranges.o"
 $CC64 "$FIX/rv64/nocu.s" -o "$FIX/rv64/nocu.o"
+$CC64 -mno-relax "$FIX/rv64/subprograms.s" -o "$FIX/rv64/subprograms.o"
 ld.lld -Ttext=0x10000 -e f "$FIX/rv64/units.o" "$FIX/rv64/nocu.o" -o "$FIX/rv64/units.elf"
 
 gen() { # golden-name input llvm-objdump-args...
@@ -120,6 +123,7 @@ gen debug-o.d                  "$FIX/debug.o" -d
 gen debug-o.h                  "$FIX/debug.o" -h
 gen_lines debug-o.dl           "$FIX/debug.o" -d -l
 gen_lines lines-elf.dl         "$FIX/lines.elf" -d -l
+gen_lines subprograms-o.dl     "$FIX/subprograms.o" -d -l
 gen linked-elf.d               "$FIX/linked.elf" -d
 gen linked-elf.x               "$FIX/linked.elf" -x
 # The riscv-tests ELFs' mapping symbols ($x.0) make llvm-objdump warn on
@@ -155,6 +159,7 @@ gen_lines rv64/units-dwarf4-o.dl "$FIX/rv64/units-dwarf4.o" -d -l
 # Its .debug_aranges makes llvm-objdump warn on stderr of a premature end.
 gen_lines rv64/units-aranges-o.dl "$FIX/rv64/units-aranges.o" -d -l
 gen_lines rv64/nocu-o.dl       "$FIX/rv64/nocu.o" -d -l
+gen_lines rv64/subprograms-o.dl "$FIX/rv64/subprograms.o" -d -l
 gen_lines rv64/units-elf.dl    "$FIX/rv64/units.elf" -d -l
 gen rv64/linked-elf.d          "$FIX/rv64/linked.elf" -d
 gen rv64/linked-elf.x          "$FIX/rv64/linked.elf" -x
