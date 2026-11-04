@@ -273,8 +273,11 @@ impl Debug {
     // ---- types ----
 
     /// Through typedefs, `const` and `volatile`.
+    /// (A chain longer than any real one is a loop in broken information: it
+    /// ends as `void`.)
     fn strip(&self, mut t: Option<DieRef>) -> Option<DieRef> {
-        while let Some(r) = t {
+        for _ in 0..64 {
+            let r = t?;
             match self.die(r).tag {
                 dw::TAG_TYPEDEF | dw::TAG_CONST_TYPE | dw::TAG_VOLATILE_TYPE | dw::TAG_RESTRICT_TYPE => {
                     t = self.type_of(r)
@@ -1310,6 +1313,14 @@ impl<T: Target> Eval<'_, T> {
     }
 
     fn show_bytes(&mut self, ty: &Ty, b: &[u8], addr: Option<u64>, top: bool, hex: bool) -> String {
+        // A member past the end of its struct, in broken information.
+        if self
+            .debug
+            .size(ty, self.xlen)
+            .is_some_and(|n| (b.len() as u64) < n)
+        {
+            return "<unavailable>".into();
+        }
         match self.debug.shape(ty) {
             Shape::Void => "void".into(),
             Shape::Int {

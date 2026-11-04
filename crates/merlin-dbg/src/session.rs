@@ -205,8 +205,7 @@ impl<'a, W: Write> Session<'a, W> {
                 Some("harts" | "threads") => self.harts()?,
                 Some("locals") => self.info_locals()?,
                 Some("args") => self.info_args()?,
-                Some("frame") => self.select_frame(self.frame)?,
-                _ => return Err("info breakpoints, registers, harts, locals, args or frame".into()),
+                _ => return Err("info breakpoints, registers, harts, locals or args".into()),
             },
             "continue" | "c" => self.continue_()?,
             "stepi" | "si" => {

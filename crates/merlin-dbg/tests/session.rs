@@ -1308,7 +1308,7 @@ fn variables_and_types() {
         assert!(bt[4].ends_with(" in _start ()"), "{out}");
         let want = [
             format!("list = {}\ndepth = 2", node(2)),
-            "calls = 3\nsum = 0".to_string(),
+            "sum = 0\ncalls = 3".to_string(),
             format!("$1 = (Node *) {}", node(2)),
             "$2 = {value = 30, next = 0x0}".to_string(),
             "$3 = 30".to_string(),
@@ -1496,13 +1496,13 @@ fn variables_in_the_kernel() {
 
 /// `tests/vars/vars.c` built by clang (`CLANG`, -O0 -g) and linked by ld.lld (`LLD`)
 /// with tests/rv64/crt0.s (which merlin-as assembles: it has Grail's `xcal.halt`),
-/// for `xlen`.
-fn clang_program(xlen: excalibur::Xlen) -> TempFile {
+/// for `xlen`, into files named for `test`.
+fn clang_program(xlen: excalibur::Xlen, test: &str) -> TempFile {
     let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
     let lld = std::env::var("LLD").unwrap_or_else(|_| format!("ld.lld{}", std::env::consts::EXE_SUFFIX));
     let bits = xlen.bits();
     let abi = if bits == 64 { "lp64" } else { "ilp32" };
-    let obj = TempFile::new(&format!("clang-vars-{bits}.o"), b"");
+    let obj = TempFile::new(&format!("{test}-clang-vars-{bits}.o"), b"");
     let out = Command::new(&clang)
         .current_dir(path(VARS_DIR))
         .args([
@@ -1527,11 +1527,11 @@ fn clang_program(xlen: excalibur::Xlen) -> TempFile {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let crt0 = std::fs::read_to_string(path(RV64_DIR).join("crt0.s")).unwrap();
     let crt0 = merlin_as::assemble_to_elf_with(&crt0, &merlin_as::Options { xlen }).unwrap();
-    let crt0 = TempFile::new(&format!("clang-crt0-{bits}.o"), &crt0);
-    let elf = TempFile::new(&format!("clang-vars-{bits}.elf"), b"");
+    let crt0 = TempFile::new(&format!("{test}-clang-crt0-{bits}.o"), &crt0);
+    let elf = TempFile::new(&format!("{test}-clang-vars-{bits}.elf"), b"");
     // Everything in RAM, from 0x80000000, as merlin-ld lays a program out.
     let script = TempFile::new(
-        &format!("clang-vars-{bits}.ld"),
+        &format!("{test}-clang-vars-{bits}.ld"),
         b"SECTIONS {\n  . = 0x80000000;\n  .text : { *(.text*) }\n  .rodata : { *(.rodata*) *(.srodata*) }\n  \
           .data : { *(.data*) *(.sdata*) }\n  .bss : { *(.bss*) *(.sbss*) *(COMMON) }\n}\n",
     );
@@ -1599,21 +1599,67 @@ fn lldb_variables(elf: &Path) -> Vec<String> {
             continue;
         }
         if keep && !l.trim().is_empty() {
-            let mut s = String::new();
-            let mut rest = l;
-            while let Some(i) = rest.find("0x") {
-                s += &rest[..i];
-                let hex = rest[i + 2..]
-                    .find(|c: char| !c.is_ascii_hexdigit())
-                    .unwrap_or(rest.len() - i - 2);
-                s += "ADDR";
-                rest = &rest[i + 2 + hex..];
-            }
-            s += rest;
-            lines.push(s);
+            lines.push(without_addresses(l));
         }
     }
     lines
+}
+
+/// `line` with every hex number, an address, as `ADDR`.
+fn without_addresses(line: &str) -> String {
+    let mut s = String::new();
+    let mut rest = line;
+    while let Some(i) = rest.find("0x") {
+        s += &rest[..i];
+        let hex = rest[i + 2..]
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(rest.len() - i - 2);
+        s += "ADDR";
+        rest = &rest[i + 2 + hex..];
+    }
+    s + rest
+}
+
+/// merlin-dbg reads clang's debug information as it reads merlin's: on
+/// tests/vars/vars.c built by each, stopped at the same line, the backtrace, the
+/// arguments and locals of each frame, values of every kind of type and `ptype`
+/// are the same, addresses aside. clang's locations are `DW_OP_breg2` (from `sp`,
+/// a caller's from the CFA of the frame it called) and `DW_OP_addrx`, merlin's
+/// `DW_OP_fbreg` and `DW_OP_addr`. At both widths. Ignored: it needs clang and
+/// ld.lld (`CLANG` and `LLD` name them if they are not on the PATH).
+#[test]
+#[ignore]
+fn merlin_dbg_reads_clangs_variables_as_merlins() {
+    let file = format!("{VARS_DIR}/vars.c");
+    let add = line_of(&file, "    sum += list->value;");
+    let script = format!(
+        "break vars.c:{add}\ncontinue\nbt\ninfo args\ninfo locals\nprint *list\nprint nodes\nprint box\n\
+         print grid\nprint big\nprint total\nptype Node\nptype box\nwhatis nodes\nup\ninfo args\ninfo locals\n\
+         up 2\ninfo locals\nprint w\ndelete\nbreak area\ncontinue\nbt\ninfo args\ndelete\ncontinue\n"
+    );
+    // What the session shows of the program, without the lines that depend on
+    // its code (a stop's instruction, a breakpoint's address) and the addresses.
+    let shown = |elf: &Path| -> Vec<String> {
+        let out = connected(elf.to_str().unwrap(), 1, b"", &script);
+        out.lines()
+            .filter(|l| !l.starts_with("=> ") && !l.starts_with("breakpoint ") && !l.ends_with(" ()"))
+            .map(without_addresses)
+            .collect()
+    };
+    for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
+        let merlin = program(VARS_DIR, "vars.c", xlen, &format!("dbg-vars-{}", xlen.bits()));
+        let clang = clang_program(xlen, "dbg");
+        let ours = shown(&merlin);
+        assert!(
+            ours.iter().any(|l| l == "$1 = {value = 30, next = ADDR}"),
+            "{ours:#?}"
+        );
+        assert_eq!(
+            ours,
+            shown(&clang),
+            "merlin's (left) and clang's (right), {xlen:?}"
+        );
+    }
 }
 
 /// LLDB reads merlin's debug information as it reads clang's: tests/vars/vars.c
@@ -1627,7 +1673,7 @@ fn lldb_variables(elf: &Path) -> Vec<String> {
 fn lldb_reads_merlins_variables_as_clangs() {
     for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
         let merlin = program(VARS_DIR, "vars.c", xlen, &format!("lldb-vars-{}", xlen.bits()));
-        let clang = clang_program(xlen);
+        let clang = clang_program(xlen, "lldb");
         let ours = lldb_variables(&merlin);
         let theirs = lldb_variables(&clang);
         assert!(
