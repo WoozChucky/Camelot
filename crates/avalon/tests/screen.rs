@@ -7,7 +7,7 @@
 mod common;
 
 use avalon_proto::{
-    AttachKind, ErrorCode, KeyEvent, Message, PointerChange, PointerMotion, Screen, VmRef, VmState,
+    AttachKind, Cursor, ErrorCode, KeyEvent, Message, PointerChange, PointerMotion, Screen, VmRef, VmState,
     POINTER_LEFT,
 };
 use common::*;
@@ -389,6 +389,104 @@ fn a_viewer_held_back_catches_up_with_a_full_frame() {
             _ => {}
         }
     }
+    server.stop().unwrap();
+}
+
+/// Turns the display on and fills the screen once (with the full frame of the attach,
+/// two frames' worth for a viewer that reads nothing), then shows a cursor and changes
+/// its image all the time: its first pixel counts. A screen that stays the same under
+/// a cursor that is a new `CursorShape` of 16 KiB at every look, as an animated cursor is.
+fn cursor_animator() -> Vec<u8> {
+    guest(
+        "
+    .globl _start
+_start:
+    li    t0, 0x30000000
+    li    t1, 1
+    sw    t1, 0x10(t0)
+    li    t3, 0x123456
+    li    t2, 0x31000000
+    li    t5, 0x3112c000
+1:  sw    t3, 0(t2)
+    addi  t2, t2, 4
+    bltu  t2, t5, 1b
+    li    t2, 0x80200000
+    sw    t2, 0x50(t0)
+    sw    t1, 0x4c(t0)
+2:  addi  t3, t3, 1
+    sw    t3, 0(t2)
+    j     2b
+",
+    )
+}
+
+/// A viewer that stops reading while only the cursor changes is held back as frames
+/// would hold it: a cursor's image goes through the same queue (protocol doc, section
+/// 6.4, **Backlog**), so an animated cursor must not run it up to the 32 MiB that cuts
+/// a client off. Once it reads again (the VM paused) it gets a full frame and then the
+/// whole cursor, which give it what a viewer that attaches then has.
+#[test]
+fn a_viewer_held_back_by_the_cursor_catches_up_with_the_cursor() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "animate", profile(4, None), cursor_animator());
+    let mut conn = connect(&server);
+    let Ok(Message::ScreenAttached { width, height, .. }) =
+        conn.request(&Message::ScreenAttach { vm: VmRef::Id(id) })
+    else {
+        panic!("attach")
+    };
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    // Not reading: once its queue is over the backlog, the cursor holds it back.
+    wait_until("the viewer held back", SLOW, || {
+        server.debug_vm(id).unwrap().behind == 1
+    });
+    rt.request_ok(&Message::PauseVm { vm: VmRef::Id(id) }).unwrap();
+    let mut late = Viewer::attach(&server, VmRef::Id(id));
+    late.wait_until(|v| v.cursor.visible, "the cursor's place");
+    late.idle(Duration::from_millis(200));
+    assert_eq!(server.debug_vm(id).unwrap().viewers, 2, "held back, not cut off");
+
+    let mut screen = Screen::new(width, height);
+    let mut cursor = Cursor::default();
+    let mut paused = false;
+    // Since the full frame after the pause: the cursor's messages, in order.
+    let mut after_full: Option<Vec<Message>> = None;
+    let start = Instant::now();
+    while !(after_full.as_ref().is_some_and(|m| m.len() == 2) && screen == late.screen) {
+        assert!(
+            start.elapsed() < SLOW,
+            "paused {paused}, after the full frame {after_full:?}"
+        );
+        let msg = conn.recv().unwrap();
+        match &msg {
+            Message::ScreenFrame { .. } => {
+                let rect = screen.apply_frame(&msg).unwrap();
+                if paused && rect == screen.bounds() {
+                    after_full = Some(Vec::new());
+                }
+            }
+            Message::CursorShape { .. } | Message::CursorPosition { .. } => {
+                assert!(cursor.apply(&msg));
+                if let Some(after) = &mut after_full {
+                    after.push(msg);
+                }
+            }
+            Message::VmStateChanged {
+                state: VmState::Paused,
+                ..
+            } => paused = true,
+            _ => {}
+        }
+    }
+    let after = after_full.unwrap();
+    assert!(matches!(after[0], Message::CursorShape { .. }), "{after:?}");
+    assert!(
+        matches!(after[1], Message::CursorPosition { visible: true, .. }),
+        "{after:?}"
+    );
+    assert_eq!(cursor, late.cursor, "the cursor a viewer that kept up has");
+    assert_eq!(server.debug_vm(id).unwrap().behind, 0);
     server.stop().unwrap();
 }
 

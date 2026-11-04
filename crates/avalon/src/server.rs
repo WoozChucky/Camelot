@@ -263,6 +263,7 @@ impl ServerThread {
             bells: vm.bells(),
             consoles: vm.console_count(),
             viewers: vm.viewer_count(),
+            behind: vm.behind_count(),
             keys,
             pointer,
         })
@@ -303,6 +304,9 @@ pub struct VmDebug {
     pub consoles: usize,
     /// Clients attached to the screen.
     pub viewers: usize,
+    /// Viewers held back for being over their backlog (`screen_backlog`), owed a full
+    /// frame and the cursor once they catch up.
+    pub behind: usize,
     /// Keys waiting for the machine (at most [`crate::MAX_INPUT_QUEUE`]).
     pub keys: usize,
     /// Pointer changes waiting for the machine (at most [`crate::MAX_INPUT_QUEUE`]).
