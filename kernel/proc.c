@@ -145,7 +145,7 @@ static void kproc_start(void) {
  * looks at yet. */
 static void thread_free(struct thread *t) {
     if (t->kstack != NULL) {
-        kfree(t->kstack);
+        kstack_free(t->kstack);
         t->kstack = NULL;
     }
     t->frame = NULL;
@@ -226,7 +226,7 @@ static struct thread *thread_alloc(struct proc *p, int *err) {
     t->state = THREAD_NEW;
     t->proc = p;
     release(&proc_lock);
-    t->kstack = kalloc();
+    t->kstack = kstack_alloc();
     if (t->kstack == NULL) {
         acquire(&proc_lock);
         thread_free(t);
@@ -327,7 +327,7 @@ static int proc_ready(struct proc *p, struct thread *t, const char *name, struct
 
 /* The trap frame at the top of `t`'s kernel stack page. */
 static struct trap_frame *frame_of(struct thread *t) {
-    return (struct trap_frame *)((u8 *)t->kstack + PGSIZE - TRAP_FRAME_SIZE);
+    return (struct trap_frame *)((u8 *)t->kstack + KSTACK_SIZE - TRAP_FRAME_SIZE);
 }
 
 /* A new user address space for `prog`: its segments and a zeroed stack
@@ -357,7 +357,7 @@ static pagetable_t build_space(const struct elf_file *prog, const char *who, con
     }
     u8 *stack = kzalloc();
     if (stack == NULL ||
-        map_pages(pt, USER_STACK, (u32)(uintptr)stack, PGSIZE, PTE_U | PTE_R | PTE_W) != 0) {
+        map_pages(pt, USER_STACK, pa(stack), PGSIZE, PTE_U | PTE_R | PTE_W) != 0) {
         if (stack != NULL) {
             kfree(stack);
         }
@@ -393,8 +393,8 @@ int proc_create(const struct elf_file *prog, const char *path, const char *name,
 
     /* The thread's kernel side: its first swtch() lands in thread_start, on
      * the empty kernel stack below the frame. */
-    t->context.ra = (u32)(uintptr)thread_start;
-    t->context.sp = (u32)(uintptr)t->frame;
+    t->context.ra = (uintptr)thread_start;
+    t->context.sp = (uintptr)t->frame;
     /* What the child inherits: the standard descriptors, sharing their open
      * files (and offsets), and the working directory. A descriptor above 2
      * stays the parent's own, so a pipe end the parent keeps for itself
@@ -541,8 +541,8 @@ struct proc *kproc_create(const char *name, void (*fn)(void), const char **err) 
     /* No user space, so no page table of its own and no trap frame: its first
      * swtch() lands in kproc_start, on the empty kernel stack. */
     p->kfn = fn;
-    t->context.ra = (u32)(uintptr)kproc_start;
-    t->context.sp = (u32)(uintptr)t->kstack + PGSIZE;
+    t->context.ra = (uintptr)kproc_start;
+    t->context.sp = (uintptr)t->kstack + KSTACK_SIZE;
     proc_ready(p, t, name, NULL);
     return p;
 }
@@ -593,8 +593,8 @@ bool proc_run_init(const char *path, const char *name, int *status) {
      * table, like a kernel process. */
     t->frame = frame_of(t);
     memset(t->frame, 0, sizeof *t->frame);
-    t->context.ra = (u32)(uintptr)init_start;
-    t->context.sp = (u32)(uintptr)t->frame;
+    t->context.ra = (uintptr)init_start;
+    t->context.sp = (uintptr)t->frame;
     acquire(&proc_lock);
     init_path = path;
     init_name = name;
@@ -652,7 +652,7 @@ static pagetable_t proc_pagetable(struct proc *p) {
  * the thread: its slot goes, and so does the process if it is an orphan
  * (a zombie with a parent waits for it). Called with proc_lock held. */
 static void reap_thread(struct thread *t) {
-    kfree(t->kstack);
+    kstack_free(t->kstack);
     t->kstack = NULL;
     t->frame = NULL;
     struct proc *p = t->proc;
@@ -734,6 +734,10 @@ void scheduler(void) {
             reap_thread(t);
         }
         release(&proc_lock);
+        /* The kernel stacks freed holding proc_lock, here or elsewhere, that
+         * this hart's cache had no room for: unmapped now that no lock is
+         * held (vm.h). */
+        kstack_reclaim();
     }
     intr_on();
 }
@@ -887,7 +891,7 @@ void proc_exit(int status) {
 void proc_kill(struct trap_frame *f) {
     struct proc *p = myproc();
     kprintf("pid %u (%s) killed: %s\n", p->pid, p->name, trap_cause_name(f->scause));
-    kprintf("  scause 0x%08x  sepc 0x%08x  stval 0x%08x\n", f->scause, f->sepc, f->stval);
+    kprintf("  scause " REG_FMT "  sepc " REG_FMT "  stval " REG_FMT "\n", f->scause, f->sepc, f->stval);
     if (is_page_fault(f->scause)) {
         vm_print_mapping(p->pagetable, f->stval);
     }
@@ -1066,7 +1070,7 @@ int proc_grow_stack(u32 va) {
     while (p->stack_low > low) {
         u32 a = p->stack_low - PGSIZE;
         void *mem = kzalloc();
-        if (mem == NULL || map_pages(p->pagetable, a, (u32)(uintptr)mem, PGSIZE, PTE_U | PTE_R | PTE_W) != 0) {
+        if (mem == NULL || map_pages(p->pagetable, a, pa(mem), PGSIZE, PTE_U | PTE_R | PTE_W) != 0) {
             /* What was mapped stays: the stack is just shorter. */
             if (mem != NULL) {
                 kfree(mem);
@@ -1102,7 +1106,7 @@ int proc_sbrk(i32 increment) {
         u32 first = PGROUNDUP(old);
         for (u32 a = first; a < end; a += PGSIZE) {
             void *mem = kzalloc();
-            if (mem == NULL || map_pages(p->pagetable, a, (u32)(uintptr)mem, PGSIZE, PTE_U | PTE_R | PTE_W) != 0) {
+            if (mem == NULL || map_pages(p->pagetable, a, pa(mem), PGSIZE, PTE_U | PTE_R | PTE_W) != 0) {
                 if (mem != NULL) {
                     kfree(mem);
                 }
@@ -1133,7 +1137,7 @@ int proc_sbrk(i32 increment) {
          * later hands out zeroed memory, as for a new page. */
         if (end < keep) {
             pte_t *pte = walk(p->pagetable, end, false);
-            u8 *page = (u8 *)(uintptr)PTE2PA(*pte);
+            u8 *page = va(PTE2PA(*pte));
             memset(page + (end % PGSIZE), 0, keep - end);
         }
     }
@@ -1164,8 +1168,8 @@ int thread_create(u32 entry, u32 arg, u32 stack) {
     t->frame->sepc = entry;
     t->frame->regs[REG_SP] = stack;
     t->frame->regs[REG_A0] = arg;
-    t->context.ra = (u32)(uintptr)thread_start;
-    t->context.sp = (u32)(uintptr)t->frame;
+    t->context.ra = (uintptr)thread_start;
+    t->context.sp = (uintptr)t->frame;
     acquire(&proc_lock);
     /* A process being ended, or replaced by exec, takes no new thread: the
      * thread ending it waits for the ones it knows of. */

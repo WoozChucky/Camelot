@@ -5,7 +5,7 @@
 //! Grail's boot ROM reads the boot block (block 0, 1 KiB) into RAM, checks
 //! that its last word is [`BOOT_MAGIC`] and that its 256 words add up to 0,
 //! and jumps to its first byte (spec section 7, "Boot from disk"). The
-//! bootloader, `kernel/boot/boot.s`, then reads the kernel ELF from the
+//! bootloader, `kernel/boot/boot.S`, then reads the kernel ELF from the
 //! sectors the boot block names and loads its segments. The kernel is not a
 //! file of the filesystem: a region of its own is far simpler to read for a
 //! bootloader of under 1 KiB than a directory, an inode and an extent tree.
@@ -17,6 +17,11 @@
 //! program headers and the bytes of the loadable segments, at their offsets. The
 //! section headers, the symbols and their names stay in the kernel's file on the
 //! host, for the disassembler and the tests.
+//!
+//! Both widths: an RV32 bootloader (`boot.elf`, ELF32) loads an RV32 kernel
+//! (ELF32), an RV64 one (`boot-rv64.elf`, ELF64) an RV64 kernel (ELF64), whose
+//! segments run at their link addresses (`p_vaddr`, high) but load at their
+//! physical ones (`p_paddr`).
 
 use crate::{Superblock, BSIZE, SECTOR_SIZE, SUPER_BLOCK};
 
@@ -37,6 +42,8 @@ pub const MAX_BOOT_CODE: usize = KERNEL_SECTOR_AT;
 pub const KERNEL_HEADERS: usize = 1024;
 /// Where RAM starts (spec section 7): the kernel's segments go there or above.
 pub const RAM_BASE: u32 = 0x8000_0000;
+/// Where RAM can end on an RV64 machine: 1 TiB of it (spec section 7).
+pub const RAM_END_RV64: u64 = 0x100_8000_0000;
 
 /// Where a bootable image keeps its kernel, as its boot block says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,15 +54,18 @@ pub struct BootInfo {
     pub kernel_sectors: u32,
 }
 
-/// Parses `elf`, the bootloader's or the kernel's (`what` names it in errors).
-/// Both are RV32 programs, ELF32, which is what the bootloader loads and the
-/// boot block's layout assumes, until the RV64 migration reaches them.
-fn parse32<'a>(what: &str, elf: &'a [u8]) -> Result<elf::Elf<'a>, String> {
-    let e = elf::Elf::parse(elf).map_err(|e| format!("{what}: {e}"))?;
-    if e.class != elf::Class::Elf32 {
-        return Err(format!("{what}: not ELF32, the class the bootloader loads"));
+/// Parses `elf`, the bootloader's or the kernel's (`what` names it in errors):
+/// ELF32 (RV32) or ELF64 (RV64).
+fn parse<'a>(what: &str, elf: &'a [u8]) -> Result<elf::Elf<'a>, String> {
+    elf::Elf::parse(elf).map_err(|e| format!("{what}: {e}"))
+}
+
+/// The size of a program header of `class`.
+fn phdr_size(class: elf::Class) -> usize {
+    match class {
+        elf::Class::Elf32 => elf::PHDR_SIZE,
+        elf::Class::Elf64 => elf::PHDR64_SIZE,
     }
-    Ok(e)
 }
 
 /// The code of a bootloader linked as an ELF executable (`kernel/boot/boot.elf`):
@@ -63,7 +73,7 @@ fn parse32<'a>(what: &str, elf: &'a [u8]) -> Result<elf::Elf<'a>, String> {
 /// It must fit in [`MAX_BOOT_CODE`] bytes and have no `.bss` (nothing would
 /// zero it).
 pub fn boot_code(elf: &[u8]) -> Result<Vec<u8>, String> {
-    let e = parse32("bootloader", elf)?;
+    let e = parse("bootloader", elf)?;
     let segs: Vec<_> = e.segments.iter().filter(|p| p.ty == elf::PT_LOAD).collect();
     let base = segs
         .iter()
@@ -95,21 +105,22 @@ pub fn boot_code(elf: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Checks that the bootloader can load the kernel ELF `elf`: an Excalibur
-/// executable (ELF32, little-endian, RISC-V, `ET_EXEC`) whose ELF header and
-/// program headers are in its first [`KERNEL_HEADERS`] bytes, and whose
-/// loadable segments go in RAM and, when they have bytes in the file, start at
-/// a sector boundary of it (a `.bss`-only segment reads nothing, so its file
-/// offset does not matter). (Whether they fit below the bootloader depends on
+/// executable (ELF32 or ELF64, little-endian, RISC-V, `ET_EXEC`) whose ELF
+/// header and program headers are in its first [`KERNEL_HEADERS`] bytes, and
+/// whose loadable segments load in RAM (at `p_paddr`) and, when they have
+/// bytes in the file, start at a sector boundary of it (a `.bss`-only segment
+/// reads nothing, so its file offset does not matter); its entry point must be
+/// in one of them, since the bootloader starts the kernel at the entry's load
+/// address, with paging off. (Whether they fit below the bootloader depends on
 /// the machine's RAM: the bootloader checks that.)
 pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
-    let e = parse32("kernel", elf)?;
+    let e = parse("kernel", elf)?;
     let h = &e.header;
     if h.ty != elf::ET_EXEC || h.machine != elf::EM_RISCV {
         return Err("kernel: not a RISC-V executable".into());
     }
-    if h.phentsize as usize != elf::PHDR_SIZE
-        || h.phoff as usize + h.phnum as usize * elf::PHDR_SIZE > KERNEL_HEADERS
-    {
+    let phdr = phdr_size(e.class);
+    if h.phentsize as usize != phdr || h.phoff as usize + h.phnum as usize * phdr > KERNEL_HEADERS {
         return Err(format!(
             "kernel: the program headers must be in the first {KERNEL_HEADERS} bytes"
         ));
@@ -121,10 +132,24 @@ pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
                 p.paddr, p.offset
             ));
         }
-        // ELF32 values: the end must not pass 2^32 - 1.
-        if p.memsz < p.filesz || p.paddr < u64::from(RAM_BASE) || p.paddr + p.memsz > u64::from(u32::MAX) {
+        // ELF32 values: the end must not pass 2^32 - 1; ELF64 ones RAM's
+        // largest end.
+        let end = match e.class {
+            elf::Class::Elf32 => u64::from(u32::MAX),
+            elf::Class::Elf64 => RAM_END_RV64,
+        };
+        let fits = p.paddr.checked_add(p.memsz).is_some_and(|last| last <= end);
+        if p.memsz < p.filesz || p.paddr < u64::from(RAM_BASE) || !fits {
             return Err(format!("kernel: the segment at {:#x} is not in RAM", p.paddr));
         }
+    }
+    let entry_loaded = e
+        .segments
+        .iter()
+        .filter(|p| p.ty == elf::PT_LOAD)
+        .any(|p| h.entry >= p.vaddr && h.entry - p.vaddr < p.memsz);
+    if !entry_loaded {
+        return Err(format!("kernel: the entry point {:#x} is in no segment", h.entry));
     }
     Ok(())
 }
@@ -136,12 +161,15 @@ pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
 /// The bootloader reads only these parts, and the result is still an ELF file that
 /// loads the same.
 pub fn loadable(elf: &[u8]) -> Result<Vec<u8>, String> {
-    // ELF32 only: the header fields cleared below are at ELF32's offsets.
-    let e = parse32("kernel", elf)?;
+    let e = parse("kernel", elf)?;
     let h = &e.header;
-    let headers = h.phoff as usize + h.phnum as usize * elf::PHDR_SIZE;
+    let headers = h.phoff as usize + h.phnum as usize * phdr_size(e.class);
+    let ehdr = match e.class {
+        elf::Class::Elf32 => elf::EHDR_SIZE,
+        elf::Class::Elf64 => elf::EHDR64_SIZE,
+    };
     let mut out = elf
-        .get(..headers.max(elf::EHDR_SIZE))
+        .get(..headers.max(ehdr))
         .ok_or("kernel: the program headers run past the file")?
         .to_vec();
     for p in e
@@ -154,9 +182,18 @@ pub fn loadable(elf: &[u8]) -> Result<Vec<u8>, String> {
         out.resize(out.len().max(at + data.len()), 0);
         out[at..at + data.len()].copy_from_slice(data);
     }
-    // No section headers: e_shoff, then e_shentsize, e_shnum and e_shstrndx.
-    out[32..36].fill(0);
-    out[46..52].fill(0);
+    // No section headers: e_shoff, then e_shentsize, e_shnum and e_shstrndx,
+    // at each class's offsets.
+    match e.class {
+        elf::Class::Elf32 => {
+            out[32..36].fill(0);
+            out[46..52].fill(0);
+        }
+        elf::Class::Elf64 => {
+            out[40..48].fill(0);
+            out[58..64].fill(0);
+        }
+    }
     Ok(out)
 }
 
@@ -169,6 +206,12 @@ pub fn loadable(elf: &[u8]) -> Result<Vec<u8>, String> {
 pub fn install(image: &mut Vec<u8>, boot_elf: &[u8], kernel_elf: &[u8]) -> Result<BootInfo, String> {
     let code = boot_code(boot_elf)?;
     check_kernel(kernel_elf)?;
+    // A bootloader loads kernels of its own width: the boot ROM of an RV32
+    // machine runs an RV32 boot block, which reads ELF32.
+    let class = |elf: &[u8]| parse("", elf).map(|e| e.class);
+    if class(boot_elf)? != class(kernel_elf)? {
+        return Err("the bootloader and the kernel are not of the same width (ELF32 and ELF64)".into());
+    }
     let kernel_elf = &loadable(kernel_elf)?;
     let sb = Superblock::decode(crate::block(image, SUPER_BLOCK));
     sb.validate((image.len() / BSIZE) as u64)?;
@@ -334,25 +377,49 @@ mod tests {
         f
     }
 
-    /// An RV64 program (ELF64): what the bootloader cannot load yet, as
-    /// bootloader or as kernel, and whose header `loadable` must not rewrite
-    /// at ELF32's offsets.
+    fn repo_file(path: &str) -> Vec<u8> {
+        std::fs::read(format!("{}/../../{path}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    /// RV64: the RV64 kernel (ELF64, linked high, loaded at 0x8000_0000) is
+    /// checked and stripped at ELF64's offsets, and goes with the RV64
+    /// bootloader only; the RV32 bootloader takes only ELF32 kernels.
     #[test]
-    fn elf64_files_are_refused() {
-        let rv64 = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../elf/tests/llvm/rv64/prog.elf"
-        ))
-        .unwrap();
-        let want = |what: &str| format!("{what}: not ELF32, the class the bootloader loads");
-        assert_eq!(boot_code(&rv64), Err(want("bootloader")));
-        assert_eq!(check_kernel(&rv64), Err(want("kernel")));
-        assert_eq!(loadable(&rv64), Err(want("kernel")));
+    fn elf64_kernels_go_with_the_rv64_bootloader() {
+        let kernel = repo_file("kernel/kernel-disk-rv64.elf");
+        let boot = repo_file("kernel/boot/boot-rv64.elf");
+        assert_eq!(check_kernel(&kernel), Ok(()));
+        let stored = loadable(&kernel).unwrap();
+        let (full, kept) = (
+            elf::Elf::parse(&kernel).unwrap(),
+            elf::Elf::parse(&stored).unwrap(),
+        );
+        assert_eq!(kept.class, elf::Class::Elf64);
+        assert_eq!(kept.header.shoff, 0);
+        assert_eq!(kept.header.shnum, 0);
+        assert_eq!(kept.header.entry, full.header.entry);
+        assert_eq!(kept.segments, full.segments);
+        assert!(kept.segments.iter().all(|p| p.vaddr != p.paddr));
         let mut image = mkfs::mkfs(&small(), None).unwrap();
-        let err = install(&mut image, &rv64, &kernel_elf()).unwrap_err();
-        assert_eq!(err, want("bootloader"));
-        let err = install(&mut image, &bootloader(64), &rv64).unwrap_err();
-        assert_eq!(err, want("kernel"));
+        let want = "the bootloader and the kernel are not of the same width (ELF32 and ELF64)";
+        assert_eq!(
+            install(&mut image.clone(), &bootloader(64), &kernel),
+            Err(want.into())
+        );
+        assert_eq!(
+            install(&mut image.clone(), &boot, &kernel_elf()),
+            Err(want.into())
+        );
+        let info = install(&mut image, &boot, &kernel).unwrap();
+        assert!(kernel_image(&image).unwrap().starts_with(&stored));
+        assert_eq!(boot_info(&image), Ok(Some(info)));
+        // An ELF64 file whose entry is in no segment is refused.
+        let mut bad = kernel.clone();
+        bad[24..32].copy_from_slice(&0x1000u64.to_le_bytes());
+        assert_eq!(
+            check_kernel(&bad),
+            Err("kernel: the entry point 0x1000 is in no segment".into())
+        );
     }
 
     #[test]

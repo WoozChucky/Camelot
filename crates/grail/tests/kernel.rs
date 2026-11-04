@@ -334,8 +334,9 @@ fn store_to_kernel_text_panics() {
         .enumerate()
         .map(|(i, c)| if pte >> (7 - i) & 1 != 0 { c } else { '-' })
         .collect();
-    assert_eq!(&flags[2..], "--X-RV", "pte {pte:#010x}");
-    assert!(!flags.starts_with('D'), "pte {pte:#010x}");
+    // R+X, and A, D and G, which the kernel sets on its own leaves (vm.h's
+    // PTE_KERNEL): no access through them waits for the hardware to.
+    assert_eq!(flags, "DAG-X-RV", "pte {pte:#010x}");
     let line = format!("  va {va:#010x} maps to pa {va:#010x}, pte {pte:#010x} {flags}\n");
     assert!(out.contains(&line), "want {line}in:\n{out}");
 }
@@ -399,7 +400,7 @@ fn faulting_user_programs_are_killed_and_the_kernel_carries_on() {
     assert!(lines[1].ends_with("  stval 0x80000000"), "{out}");
     assert_eq!(
         lines[2],
-        "  va 0x80000000 maps to pa 0x80000000, pte 0x2000004b -A--X-RV"
+        "  va 0x80000000 maps to pa 0x80000000, pte 0x200000eb DAG-X-RV"
     );
     assert_eq!(lines[3], "badload: exit -1");
     let lines = command_output(&out, "badhalt");
@@ -416,8 +417,8 @@ fn faulting_user_programs_are_killed_and_the_kernel_carries_on() {
 fn a_fault_in_a_megapage_reports_its_mapping() {
     // The kernel maps the 64 MiB PLIC with 4 MiB megapages. `badload plic`
     // loads 2 MiB into one of them from U-mode: the report shows the
-    // megapage's PTE and the physical address with the whole 22-bit offset
-    // (the kernel has written there, so A and D are set).
+    // megapage's PTE (A, D and G, as the kernel makes its leaves) and the
+    // physical address with the whole 22-bit offset.
     let (code, out) = grail(&kernel_elf(), b"badload plic\nhello\nexit\n");
     assert_eq!(code, Some(0), "output:\n{out}");
     let lines = command_output(&out, "badload plic");
@@ -425,7 +426,7 @@ fn a_fault_in_a_megapage_reports_its_mapping() {
     assert!(lines[1].ends_with("  stval 0x0c201000"), "{out}");
     assert_eq!(
         lines[2],
-        "  va 0x0c201000 maps to pa 0x0c201000, pte 0x030000c7 DA---WRV"
+        "  va 0x0c201000 maps to pa 0x0c201000, pte 0x030000e7 DAG--WRV"
     );
     assert_eq!(lines[3], "badload: exit -1");
 }

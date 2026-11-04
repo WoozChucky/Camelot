@@ -273,11 +273,13 @@ impl Hart {
     /// The new `satp` after a write of `v` (WARL). RV32: any value, MODE [31] picking
     /// Bare or Sv32. RV64: a write whose MODE the hart does not implement changes
     /// nothing, as the privileged spec requires; the others keep MODE and the PPN bits
-    /// a 48-bit physical address has (spec section 5): Bare, Sv39 and Sv48.
+    /// a 48-bit physical address has (spec section 5): Bare, Sv39 and Sv48, or Bare
+    /// and Sv39 on a hart without Sv48 ([`crate::Paging::Sv39`]).
     fn warl_satp(&self, v: u64) -> u64 {
         match self.xlen {
             Xlen::Rv32 => v,
             Xlen::Rv64 => match v >> SATP_RV64_MODE_SHIFT {
+                SATP_MODE_SV48 if !self.sv48 => self.csr.satp,
                 SATP_MODE_BARE | SATP_MODE_SV39 | SATP_MODE_SV48 => {
                     v & ((0xf << SATP_RV64_MODE_SHIFT) | SATP_RV64_PPN)
                 }

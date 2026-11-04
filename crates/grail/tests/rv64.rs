@@ -496,6 +496,25 @@ fn satp_keeps_only_what_the_hart_implements() {
         assert_eq!(m.cpu.csr.satp, mode << 60 | 0x0000_000f_ffff_ffff, "MODE {mode}");
     }
 
+    // A hart without Sv48 (--paging sv39, #172) refuses MODE 9 like any other it
+    // lacks, which is how a kernel finds out, and keeps Sv39.
+    let mut m = Machine::new(MachineConfig {
+        xlen: Xlen::Rv64,
+        paging: grail::Paging::Sv39,
+        ..MachineConfig::with_ram(1 << 20)
+    })
+    .unwrap();
+    m.cpu.csr.mtvec = TRAP_VECTOR;
+    set(&mut m, A1, 9 << 60 | 0x1234);
+    run(&mut m, "csrrw zero, satp, a1", csrw(SATP, A1));
+    assert_eq!(m.cpu.csr.satp, 0, "no Sv48");
+    set(&mut m, A1, 8 << 60 | 0x1234);
+    run(&mut m, "csrrw zero, satp, a1", csrw(SATP, A1));
+    assert_eq!(m.cpu.csr.satp, 8 << 60 | 0x1234, "Sv39");
+    assert_eq!(grail::parse_paging("sv39"), Ok(grail::Paging::Sv39));
+    assert_eq!(grail::parse_paging("sv48"), Ok(grail::Paging::Sv48));
+    assert!(grail::parse_paging("sv57").is_err());
+
     // RV32 keeps any value, MODE in bit 31.
     let mut m = machine(Xlen::Rv32);
     set(&mut m, A1, 0x8000_1234);

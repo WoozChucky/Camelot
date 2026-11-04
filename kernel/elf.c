@@ -68,7 +68,7 @@ static const char *load_segment(pagetable_t pt, const struct elf_file *f, const 
             kfree(mem);
             return "segment outside the file";
         }
-        if (map_pages(pt, page, (u32)(uintptr)mem, PGSIZE, perm) != 0) {
+        if (map_pages(pt, page, pa(mem), PGSIZE, perm) != 0) {
             kfree(mem);
             return ELF_OUT_OF_MEMORY;
         }

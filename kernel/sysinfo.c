@@ -1,11 +1,28 @@
-/* Reading Grail's sysinfo block (spec section 9.5). Works with paging off and
- * on: the kernel page table maps the block at its physical address. */
+/* Reading Grail's sysinfo block (spec section 9.5) through sysinfo_regs: its
+ * physical address, which is its mapping on RV32 (and RV64's with paging
+ * off); on RV64 the fixmap's page from setup_vm() on, then the kernel's
+ * ioremap() of it (sysinfo_map()). */
 #include "sysinfo.h"
 #include "mmio.h"
 #include "trap.h"
+#include "vm.h"
+
+uintptr sysinfo_regs = SYSINFO_BASE;
+
+void sysinfo_map(void) {
+    sysinfo_regs = ioremap(SYSINFO_BASE, SYSINFO_SIZE);
+}
 
 u32 sysinfo_read(u32 off) {
-    return mmio_read32(SYSINFO_BASE + off);
+    return mmio_read32(sysinfo_regs + off);
+}
+
+usize sysinfo_read_reg(u32 off) {
+#if __riscv_xlen == 64
+    return mmio_read64(sysinfo_regs + off);
+#else
+    return mmio_read32(sysinfo_regs + off);
+#endif
 }
 
 void sysinfo_check(void) {
@@ -24,7 +41,7 @@ u32 sysinfo_device_count(void) {
 void sysinfo_device(u32 i, struct sysinfo_device *dev) {
     u32 entry = SYS_DEV_TABLE + i * SYS_DEV_ENTRY_SIZE;
     dev->type = sysinfo_read(entry + DEV_TYPE);
-    dev->base = sysinfo_read(entry + DEV_BASE);
-    dev->size = sysinfo_read(entry + DEV_SIZE);
+    dev->base = sysinfo_read_reg(entry + DEV_BASE);
+    dev->size = sysinfo_read_reg(entry + DEV_SIZE);
     dev->irq = sysinfo_read(entry + DEV_IRQ);
 }

@@ -1,9 +1,10 @@
 //! merlin's preprocessor in assembler-with-cpp mode against clang's (#193):
-//! every `.S` source of the repository (the examples, the boot ROM,
-//! merlin-ld's and merlin-objdump's test fixtures: every `.S` file outside
-//! `target/` and hidden directories) and `include/asm.h`, preprocessed for
-//! RV32 and for RV64 with
-//! `-I include`, must come out of `merlin -E` exactly as out of
+//! every `.S` source of the repository (the examples, the boot ROM, the
+//! kernel's assembly and linker script, merlin-ld's and merlin-objdump's
+//! test fixtures: every `.S` file outside `target/` and hidden directories)
+//! and `include/asm.h`, preprocessed for RV32 and for RV64 with
+//! `-I include` (and `-I kernel/include` for the kernel's, whose headers it
+//! shares with the C), must come out of `merlin -E` exactly as out of
 //! `clang -E -x assembler-with-cpp`, but for two things clang writes that
 //! merlin does not:
 //!
@@ -12,6 +13,10 @@
 //!   "file.S" 2` that comes back from them);
 //! * on Windows, the `\` clang joins an include directory and a header's
 //!   name with (`include\\asm.h`), where merlin writes `/`.
+//!
+//! With `-P` (no line markers, as `cargo xtask kernel` preprocesses the
+//! kernel's linker script, `kernel/kernel.lds.S`) the two must be the same
+//! with nothing taken out.
 //!
 //! Needs clang on the PATH (the official LLVM installer's, 23.1.4 when this
 //! was written), so it is ignored by default:
@@ -71,12 +76,23 @@ fn normalized(clang: &str) -> String {
     out.iter().map(|l| format!("{l}\n")).collect()
 }
 
-fn clang_e(root: &Path, source: &str, x: Xlen) -> String {
+/// The `-I` directories for `source`, relative to the repository root:
+/// `include`, and the kernel's headers for a kernel source.
+fn include_dirs(source: &str) -> Vec<&'static str> {
+    if source.starts_with("kernel/") {
+        vec!["include", "kernel/include"]
+    } else {
+        vec!["include"]
+    }
+}
+
+fn clang_e(root: &Path, source: &str, x: Xlen, line_markers: bool) -> String {
     let (target, march, mabi) = match x {
         Xlen::Rv32 => ("riscv32", "rv32ima_zicsr_zifencei", "ilp32"),
         Xlen::Rv64 => ("riscv64", "rv64ima_zicsr_zifencei", "lp64"),
     };
     let out = Command::new("clang")
+        .args((!line_markers).then_some("-P"))
         .args([
             &format!("--target={target}"),
             &format!("-march={march}"),
@@ -84,10 +100,9 @@ fn clang_e(root: &Path, source: &str, x: Xlen) -> String {
             "-E",
             "-x",
             "assembler-with-cpp",
-            "-I",
-            "include",
-            source,
         ])
+        .args(include_dirs(source).iter().flat_map(|d| ["-I", d]))
+        .arg(source)
         .current_dir(root)
         .output()
         .expect("clang on the PATH");
@@ -99,11 +114,12 @@ fn clang_e(root: &Path, source: &str, x: Xlen) -> String {
     String::from_utf8(out.stdout).unwrap().replace("\r\n", "\n")
 }
 
-fn merlin_e(root: &Path, source: &str, x: Xlen) -> String {
+fn merlin_e(root: &Path, source: &str, x: Xlen, line_markers: bool) -> String {
     let text = std::fs::read_to_string(root.join(source)).unwrap();
     let opts = merlin::Options {
         xlen: x,
-        include_dirs: vec![PathBuf::from("include")],
+        include_dirs: include_dirs(source).into_iter().map(PathBuf::from).collect(),
+        line_markers,
         ..merlin::Options::default()
     };
     let load = |p: &Path| std::fs::read_to_string(root.join(p)).ok();
@@ -126,9 +142,15 @@ fn assembler_with_cpp_matches_clang() {
     }
     let mut wrong = Vec::new();
     for source in &sources {
-        for x in [Xlen::Rv32, Xlen::Rv64] {
-            let clang = normalized(&clang_e(&root, source, x));
-            let ours = merlin_e(&root, source, x);
+        for (x, line_markers) in [
+            (Xlen::Rv32, true),
+            (Xlen::Rv64, true),
+            (Xlen::Rv32, false),
+            (Xlen::Rv64, false),
+        ] {
+            let clang = clang_e(&root, source, x, line_markers);
+            let clang = if line_markers { normalized(&clang) } else { clang };
+            let ours = merlin_e(&root, source, x, line_markers);
             if ours != clang {
                 let line = ours
                     .lines()
@@ -136,7 +158,8 @@ fn assembler_with_cpp_matches_clang() {
                     .position(|(a, b)| a != b)
                     .unwrap_or(ours.lines().count().min(clang.lines().count()));
                 wrong.push(format!(
-                    "{source} ({x:?}), line {}:\n  merlin: {:?}\n  clang:  {:?}",
+                    "{source} ({x:?}{}), line {}:\n  merlin: {:?}\n  clang:  {:?}",
+                    if line_markers { "" } else { ", -P" },
                     line + 1,
                     ours.lines().nth(line),
                     clang.lines().nth(line)

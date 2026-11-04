@@ -31,6 +31,7 @@
 #include "mmio.h"
 #include "plic.h"
 #include "sysinfo.h"
+#include "vm.h"
 
 /* The interface's card. */
 struct nic {
@@ -65,6 +66,16 @@ static void set_reg(u32 off, u32 val) {
     mmio_write32(nic.base + off, val);
 }
 
+/* Writes a ring's base, a physical address: one 64-bit register in version
+ * 2 of the interface, a 32-bit one in version 1. */
+static void set_base(u32 off, phys_addr_t base) {
+#if __riscv_xlen == 64
+    mmio_write64(nic.base + off, base);
+#else
+    mmio_write32(nic.base + off, base);
+#endif
+}
+
 /* The MAC address of the card at `base`, bytes in wire order. */
 static void read_mac(uintptr base, u8 *out) {
     u32 lo = mmio_read32(base + NET_MAC_LO);
@@ -82,7 +93,7 @@ static void read_mac(uintptr base, u8 *out) {
  * caller.) */
 static void arm_rx(u32 slot) {
     volatile struct nic_desc *d = &nic.rx_ring[slot];
-    d->addr = (u32)(uintptr)nic.rx_buf[slot]->data;
+    d->addr = pa(nic.rx_buf[slot]->data);
     d->len = PBUF_SIZE;
     d->status = 0;
 }
@@ -104,9 +115,9 @@ static bool setup(uintptr base, u32 irq) {
     /* Interrupts off while the rings are set up; writing BASE or SIZE
      * starts a ring over with HEAD = TAIL = 0. */
     set_reg(NET_IRQ_ENABLE, 0);
-    set_reg(NET_TX_BASE, (u32)(uintptr)nic.tx_ring);
+    set_base(NET_TX_BASE, pa(nic.tx_ring));
     set_reg(NET_TX_SIZE, NIC_TX_RING);
-    set_reg(NET_RX_BASE, (u32)(uintptr)nic.rx_ring);
+    set_base(NET_RX_BASE, pa(nic.rx_ring));
     set_reg(NET_RX_SIZE, NIC_RX_RING);
     nic.rx_next = 0;
     nic.tx_head = 0;
@@ -132,8 +143,9 @@ bool nic_init(void) {
             continue;
         }
         u8 m[ETH_ALEN];
-        read_mac(dev.base, m);
-        bool link = (mmio_read32(dev.base + NET_STATUS) & NET_STATUS_LINK) != 0;
+        uintptr regs = ioremap(dev.base, dev.size);
+        read_mac(regs, m);
+        bool link = (mmio_read32(regs + NET_STATUS) & NET_STATUS_LINK) != 0;
         kprintf("net %u: mac %02x:%02x:%02x:%02x:%02x:%02x, irq %u, link %s", cards, m[0], m[1], m[2], m[3],
                 m[4], m[5], dev.irq, link ? "up" : "down");
         if (cards > 0) {
@@ -142,7 +154,7 @@ bool nic_init(void) {
         } else if (dev.irq == 0 || dev.irq > 31) {
             /* This driver needs the interrupt; Grail gives every card one. */
             kprintf(", no interrupt: not used\n");
-        } else if (!setup(dev.base, dev.irq)) {
+        } else if (!setup(regs, dev.irq)) {
             kprintf(", no memory for its buffers: not used\n");
         } else {
             kprintf("\n");
@@ -178,7 +190,7 @@ u32 nic_rx_dropped(void) {
 static void send_now(struct pbuf *p) {
     u32 slot = nic.tx_tail % NIC_TX_RING;
     volatile struct nic_desc *d = &nic.tx_ring[slot];
-    d->addr = (u32)(uintptr)p->data;
+    d->addr = pa(p->data);
     d->len = (u16)p->len;
     d->status = 0;
     nic.tx_buf[slot] = p;

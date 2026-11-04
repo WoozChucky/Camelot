@@ -25,10 +25,20 @@
 /* Size of the receive ring buffer in bytes, a power of two. */
 #define UART_RX_SIZE 128
 
-/* 8N1 with the receive interrupt on. It reaches the kernel once the PLIC and
- * sie.SEIE are set up (plic_init, trap_init); bytes typed before that wait in
- * the UART. */
+/* Where the registers are reached: UART_BASE (RV32, and RV64 with paging
+ * off), the fixmap's page (RV64, from setup_vm(), vm.h), then the kernel's
+ * ioremap() of it (uart_map()). */
+extern uintptr uart_regs;
+
+/* 8N1 with the receive interrupt on, through uart_regs as it is: the first
+ * thing kmain does, as early as the boot can print. The interrupt reaches the
+ * kernel once the PLIC and sie.SEIE are set up (plic_init, trap_init); bytes
+ * typed before that wait in the UART. */
 void uart_init(void);
+
+/* Points uart_regs at the UART's ioremap() mapping, once kvminit() has made
+ * ioremap() work (as Linux's 8250 driver takes over from earlycon). */
+void uart_map(void);
 
 /* Held while writing to the UART, by the callers of uart_putc() and
  * uart_puts(): kprintf() for a whole message, console_write() for each
@@ -40,6 +50,11 @@ extern struct spinlock uart_tx_lock;
  * uart_tx_lock. */
 void uart_putc(char c);
 void uart_puts(const char *s);
+
+/* Writes a byte at the UART's physical address, with no lock: for the
+ * messages of the early boot code (setup_vm()), which runs with paging off,
+ * before the fixmap is there. */
+void uart_putc_phys(char c);
 
 /* The receive interrupt handler, called by kernel_trap for PLIC_IRQ_UART:
  * moves bytes from RBR into the ring buffer until LSR.DR is clear. If the
