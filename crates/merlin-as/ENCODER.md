@@ -374,8 +374,8 @@ assembles in `crates/xtask/tests/selfhost.rs`.
   `-march`.
 - `encode_hello`: hello.S against clang's object (`tests/golden/hello.ref`,
   `tests/golden/hello.dr.txt`), word for word and as `llvm-objdump -dr` text
-  (printed by merlin-objdump). On RV64 word for word (`golden/rv64/hello.ref`);
-  `golden/rv64/hello.dr.txt` waits for merlin-objdump to read ELF64 (#150).
+  (printed by merlin-objdump), and on RV64 the same against
+  `golden/rv64/hello.ref` and `golden/rv64/hello.dr.txt`.
 - `elf64`: an RV64 object read back with the `elf` crate against what clang
   writes for the same source (`--target=riscv64 -march=rv64ima_zicsr_zifencei
   -mabi=lp64 -mno-relax`): header, sections, symbols, relocations and line

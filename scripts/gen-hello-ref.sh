@@ -11,8 +11,6 @@
 # Needs clang and llvm-objdump from any LLVM install, plus bash (Git Bash on
 # Windows). LLVM 23 made the committed files, and merlin-objdump prints what
 # llvm-objdump 23 prints.
-# rv64/hello.dr.txt is not compared yet: merlin-objdump reads ELF32 only until
-# #150.
 #
 # Relaxation is off: with it on, clang adds R_RISCV_RELAX next to every
 # relocation and leaves calls to the linker, which merlin-as never does.

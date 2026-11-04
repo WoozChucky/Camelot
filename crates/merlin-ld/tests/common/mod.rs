@@ -320,9 +320,35 @@ fn disassembly_body(text: &str) -> Vec<String> {
 ///   names the instruction; the address and the word must still agree;
 /// * a symbol assigned by the script is `SHN_ABS` in merlin-ld's output, so
 ///   when it shares its address with a symbol of the section, a label line
-///   may name the other one.
+///   may name the other one; and a target outside every section, which
+///   llvm-objdump names after an absolute symbol, may be named after it
+///   where ld.lld's file has another (the same address, `<call_min>` for
+///   `<missing+0xffa3c>`).
 pub fn assert_same_disassembly(set: &str, name: &str, linked: &merlin_ld::Linked) {
     let elf = &linked.elf;
+    let lld_elf = std::fs::read(fixtures(set).join(format!("{name}.lld.elf"))).unwrap();
+    // The value of symbol `sym` in `file`.
+    let value = |file: &[u8], sym: &str| {
+        let e = elf::Elf::parse(file).unwrap();
+        e.symbols()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == sym)
+            .map(|s| s.value)
+    };
+    // `jalr -0x800(ra) <missing+0xffa3c>` -> ("jalr -0x800(ra)", address).
+    let target = |l: &str, file: &[u8]| {
+        let (insn, t) = l.strip_suffix('>')?.rsplit_once(" <")?;
+        let (sym, off) = match t.split_once("+0x") {
+            Some((s, off)) => (s, u64::from_str_radix(off, 16).ok()?),
+            None => (t, 0),
+        };
+        Some((
+            insn.to_string(),
+            value(file, sym)?.wrapping_add(off),
+            sym.to_string(),
+        ))
+    };
     let script_symbol = |n: &str| {
         linked
             .layout
@@ -350,6 +376,13 @@ pub fn assert_same_disassembly(set: &str, name: &str, linked: &merlin_ld::Linked
         } else if let (Some((oa, _)), Some((la, ln))) = (label(o), label(l)) {
             assert!(
                 o == l || (oa == la && script_symbol(&ln)),
+                "{name}:\n ours: {o}\n llvm: {l}"
+            );
+        } else if let (true, Some((oi, ot, os)), Some((li, lt, _))) =
+            (o != l, target(o, elf), target(l, &lld_elf))
+        {
+            assert!(
+                oi == li && ot == lt && script_symbol(&os),
                 "{name}:\n ours: {o}\n llvm: {l}"
             );
         } else {
@@ -402,12 +435,7 @@ pub fn assert_matches_ld_lld_exit(set: &str, name: &str, output: &str, exit: u32
             );
         }
     }
-    // merlin-objdump reads ELF32 only until #150, which compares the RV64
-    // set's `.objdump.txt` files too. Until then the RV64 links are checked
-    // through their bytes, above, which says more than the listing.
-    if linked.layout.class == elf::Class::Elf32 {
-        assert_same_disassembly(set, name, &linked);
-    }
+    assert_same_disassembly(set, name, &linked);
 
     let (_, r, out) = run(&linked.elf);
     assert_eq!(
