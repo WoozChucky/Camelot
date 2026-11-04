@@ -576,17 +576,36 @@ fn cursor_messages_draw_the_cursor() {
     let (addr, server) = fake_server(move |mut conn| {
         fake_screen_attach(&mut conn, 4, 4, 0);
         // A 2x1 image: an opaque red pixel, then a half-covered green one.
-        let shape = |vm| Message::CursorShape {
-            vm,
+        let shape = Message::CursorShape {
+            vm: 1,
             width: 2,
             height: 1,
             hot_x: 0,
             hot_y: 0,
             pixels: vec![0, 0, 0xff, 0xff, 0, 0x80, 0, 0x80],
         };
+        // VM 2's cursor, after VM 1's: an opaque blue pixel at (0, 0), which a session
+        // that took it would show there instead.
+        let other = Message::CursorShape {
+            vm: 2,
+            width: 1,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            pixels: vec![0xff, 0, 0, 0xff],
+        };
         let at = |vm, visible, x, y| Message::CursorPosition { vm, visible, x, y };
+        // Then a frame of VM 1's, a pixel at (3, 0), to know the session has taken them all.
+        let mark = Message::ScreenFrame {
+            vm: 1,
+            x: 3,
+            y: 0,
+            width: 1,
+            height: 1,
+            pixels: vec![0x22, 0, 0, 0],
+        };
         let script = [
-            vec![shape(2), at(2, true, 0, 0), shape(1), at(1, true, -1, 2)],
+            vec![shape, at(1, true, -1, 2), other, at(2, true, 0, 0), mark],
             vec![at(1, true, 3, 3)],
             vec![Message::ScreenResized {
                 vm: 1,
@@ -618,8 +637,10 @@ fn cursor_messages_draw_the_cursor() {
     };
     // The screen is 0x11 in every byte; the green pixel of the image over it: blue and
     // red 0x11 * 0x7f / 255 = 8, green 0x80 + 8.
-    wait_until("the cursor at (-1, 2)", || shown(0, 2, 4) == Some(0x08_8808));
+    wait_until("the frame after the cursors", || shown(3, 0, 4) == Some(0x22));
+    assert_eq!(shown(0, 2, 4), Some(0x08_8808), "the cursor at (-1, 2)");
     assert_eq!(shown(1, 2, 4), Some(0x11_1111), "beside it");
+    assert_eq!(shown(0, 0, 4), Some(0x11_1111), "VM 2's cursor passed over");
     let frames = running
         .view
         .0
