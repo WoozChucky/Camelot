@@ -2,7 +2,7 @@
 
 merlin-dbg is the Camelot debugger. This document covers its first two layers:
 
-- **machine-level debugging** of any program running in Grail, with no help from the compiler: breakpoints, watchpoints, single steps, registers, CSRs, memory, disassembly and backtraces by frame pointer, on one hart or several;
+- **machine-level debugging** of any program running in Grail, RV32 or RV64, with no help from the compiler: breakpoints, watchpoints, single steps, registers, CSRs, memory, disassembly and backtraces by frame pointer, on one hart or several;
 - **source-level debugging** of programs built with `merlin -g` (the kernel and its user programs are): breakpoints on a source line, stepping by line, the source shown at every stop, from the programs' DWARF line tables (see "Source lines" below).
 
 It has three parts:
@@ -39,6 +39,16 @@ breakpoint 1
 Hello from Camelot!
 [dbg] pc=80000018 a0 = 0x00000014 (20)
 program exited with code 0
+```
+
+An RV64 program (`examples/hello/hello-rv64.elf`) runs on an RV64 machine, and merlin-dbg shows its registers and addresses with 16 digits:
+
+```
+(merlin-dbg) x/2g $a0
+0x0000000080000050 <message>:  0x7266206f6c6c6548  0x6c656d6143206d6f
+(merlin-dbg) bt
+#0  0x0000000080000024 <puts+4>
+#1  0x0000000080000018 <_start+24>
 ```
 
 Or run Grail with its stub and connect to it, from another terminal or from GDB or LLDB:
@@ -211,6 +221,8 @@ merlin-dbg [-x FILE] -- [grail options] program.elf
 
 Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 
+**The machine's width** (RV32 or RV64) comes from the stub, as GDB takes it: the target description's `<architecture>`, `riscv:rv32` or `riscv:rv64` (`qXfer:features:read:target.xml`). A stub without a description is asked for its registers instead, and the length of the `g` reply, 33 registers of 4 or 8 bytes, gives the width. The width decides how the code decodes and disassembles, how wide registers, addresses and saved frame slots are, and which CSR names exist (RV64 has no `cycleh`). A program must be of the machine's width, an ELF32 one for RV32 and ELF64 for RV64: one of the other width is refused (`program.elf: an RV32 program (ELF32), but the machine is RV64`), at the start and by `add-symbol-file`, as its symbols would be wrong for the machine. On RV32, address arithmetic wraps at 2^32 and an address past it is refused.
+
 | Command | What it does |
 |---|---|
 | `break ADDR`, `b` | breakpoint at ADDR |
@@ -224,8 +236,8 @@ Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 | `stepi [N]`, `si` | N instructions (1) of the selected hart |
 | `nexti [N]`, `ni` | the same, but a call runs until it returns: a `jal`/`jalr` that links, or the `auipc ra` + `jalr ra` of a `call` |
 | `finish` | runs until the current function returns to its caller (the backtrace's frame 1), and shows `a0` |
-| `regs`, `info registers` | the selected hart's registers, pc and privilege mode |
-| `x/N[w\|b] ADDR` | N words (default) or bytes of memory |
+| `regs`, `info registers` | the selected hart's registers, pc and privilege mode, with all their digits (8, or 16 on RV64) |
+| `x/N[b\|h\|w\|g] ADDR` | N units of memory, in hex: GDB's unit letters, bytes (`b`, 8 to a line), halfwords (`h`, 8), words (`w`, 4, the default) or giants (`g`, 8 bytes, 2 to a line), at either width. An `x` (hex, the only format) may come before or after the letter |
 | `disas [ADDR] [N]` | N instructions (8) from ADDR (the pc), `=>` at the pc |
 | `bt`, `backtrace` | the call stack, with each frame's source line |
 | `list [FILE:]LINE`, `list FUNC`, `l` | ten source lines around LINE (of the file listed last) or a function's first line; `list` alone goes on after the lines listed last, or shows those around the stop |
@@ -241,7 +253,7 @@ An ADDR is any of these, optionally followed by `+N` or `-N`:
 - a symbol (`main`, `puts+8`);
 - a register (`$sp`, `$a0`, `$x5`, `$pc`, `$mstatus`).
 
-Symbols come from the ELF symbol table (through `elf`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one.
+Symbols come from the ELF symbol table (through `elf`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one. They have all of an address's digits: on RV64, `0x0000000080000024 <puts+4>`, as GDB shows a 64-bit target's code addresses in backtraces and disassembly. A branch's target in an instruction is as merlin-objdump and llvm-objdump write it (`beqz t2, 0x80000048 <puts+40>`).
 
 Each stop shows its reason, then the instruction at the pc, then its source line if the line tables have one (`kernel/main.c:275:     cpu_init();`, the text left out when the file cannot be found):
 
@@ -272,11 +284,20 @@ merlin's prologue (`crates/merlin/src/codegen.rs`, "Stack frame"):
     addi  s0, sp, 16         s0 = CFA
 ```
 
-clang's prologue is the same with the frame's whole size in the first `addi`. In a variadic function, the saved argument registers come first, and merlin puts `ra` at CFA - 32 and `s0` at CFA - 36. So the unwinder doesn't assume where the slots are. It reads the prologue of the function holding each pc, from its symbol's address, for at most 16 instructions. It follows the `sp` adjustments to find where `ra` and `s0` are stored and what `s0` is set to.
+On RV64 (LP64) the slots are doublewords, saved with `sd` and restored with `ld`, as clang lays them out too:
 
-From one frame's `s0`, the caller's pc and `s0` are the words in those slots. The walk follows the chain up and stops when any of these happens:
+```
+    addi  sp, sp, -16        sp = CFA - 16
+    sd    ra, 8(sp)          ra        at CFA - 8
+    sd    s0, 0(sp)          caller s0 at CFA - 16
+    addi  s0, sp, 16         s0 = CFA
+```
 
-- the frame pointer is 0 (`_start` and the kernel's entry leave `s0` at its reset value 0), misaligned, not above the one before, or unreadable;
+clang's prologue is the same with the frame's whole size in the first `addi`. In a variadic function, the saved argument registers come first, and merlin puts `ra` at CFA - 32 and `s0` at CFA - 36 (on RV64, CFA - 64 and CFA - 72). So the unwinder doesn't assume where the slots are. It reads the prologue of the function holding each pc, from its symbol's address, for at most 16 instructions. It follows the `sp` adjustments to find where `ra` and `s0` are stored, by a store as wide as a register (`sw` on RV32, `sd` on RV64: a `sw ra` on RV64 would keep half of it), and what `s0` is set to. Instructions are read a word at a time at both widths; the slots are read at the machine's width.
+
+From one frame's `s0`, the caller's pc and `s0` are the values in those slots. The walk follows the chain up and stops when any of these happens:
+
+- the frame pointer is 0 (`_start` and the kernel's entry leave `s0` at its reset value 0), not 16-byte aligned (a CFA is the `sp` of a call, which the psABI keeps 16-byte aligned on RV32 and RV64), not above the one before, or unreadable;
 - a pc is 0;
 - a function's prologue sets no `s0`;
 - 64 frames have been shown.
@@ -284,7 +305,7 @@ From one frame's `s0`, the caller's pc and `s0` are the words in those slots. Th
 The innermost frame is different, because its function may not have its frame:
 
 - **Not built yet:** the pc is in the prologue, at or before `addi s0`.
-- **Already taken down:** the pc is at the `ret`, or right after the `lw s0` that restores the caller's frame pointer.
+- **Already taken down:** the pc is at the `ret`, or right after the `lw s0` (`ld s0`) that restores the caller's frame pointer.
 - **No frame at all:** a leaf function.
 
 In each case `ra` holds the return address and `s0` is still the caller's frame pointer. So frame 1 is `ra`, and the walk goes on from `s0`.
@@ -334,6 +355,15 @@ LLDB reads the same tables: `image lookup -a ADDR` gives the line, `breakpoint s
 - `merlin-dbg -- ...` with a script (`-x`);
 - interrupting a running machine;
 - source lines: a breakpoint on `kmain`'s line of `kernel/main.c` and on a line with no code, `next` and `step` by line, `list`, the lines in a backtrace, and the same in the shell, a user program added with `add-symbol-file`; LLDB on the kernel's line tables (ignored).
+
+The same on RV64 machines, against the stub's `riscv:rv64` description:
+
+- `examples/hello/hello-rv64.elf`: registers and addresses with 16 digits, `x/b`, `x/h`, `x/w` and `x/g`, steps, a backtrace, disassembly and `finish`;
+- `examples/smp/smp-rv64.elf` with 2 harts: harts and watchpoints;
+- `crates/merlin-dbg/tests/rv64/prog.c`, built by the test with `merlin -g` for RV64, merlin-as and merlin-ld: `break FILE:LINE`, `next` and `step` by line, `list`, a backtrace through a variadic function and five frames of a recursive one, `finish`, and a watchpoint on a 64-bit global;
+- `merlin-dbg -- ...` on an RV64 program, and an RV32 program's symbols refused for an RV64 machine.
+
+The kernel's RV64 case follows once the kernel is RV64 (#154). `src/remote.rs`'s unit tests give it a stub with no target description, whose width comes from the `g` reply.
 
 ## What's next
 
