@@ -69,8 +69,8 @@ void riscv_attributes(struct buf *out) {
 }
 
 static int is_global(struct symbol *s) {
-    /* Undefined symbols are always global. */
-    return s->global || (!s->defined && !s->has_constant);
+    /* Undefined symbols are global, but those .local names. */
+    return s->global || (!s->defined && !s->has_constant && !s->local);
 }
 
 void elf_write(struct object *obj, struct buf *out) {

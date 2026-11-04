@@ -284,6 +284,7 @@ struct symbol {
     int ty;
     uint size;
     int keep; /* written to the symbol table (see asm_finish) */
+    int local; /* named by .local: local even if undefined */
 };
 
 struct object {

@@ -145,6 +145,10 @@ static int find_symbol(const char *name) {
     return map_get(&by_name, name, &i) ? i : -1;
 }
 
+/* `.size`s of symbols nothing has named yet (merlin-as's pending_sizes):
+ * `.size` alone makes no symbol, as in LLVM. */
+static struct strmap pending_sizes;
+
 static int symbol_index(const char *name) {
     int i = find_symbol(name);
     if (i >= 0) {
@@ -155,6 +159,11 @@ static int symbol_index(const char *name) {
     memset(s, 0, sizeof *s);
     s->name = perm_strdup(name);
     s->section = -1;
+    int size;
+    if (map_get(&pending_sizes, name, &size)) {
+        s->size = (uint)size;
+        map_put(&pending_sizes, perm_strdup(name), 0);
+    }
     map_put(&by_name, s->name, (int)nsymbols);
     return (int)nsymbols++;
 }
@@ -472,6 +481,7 @@ static void mapping_symbol(int kind) {
     s->value = sec->size;
     s->defined = 1;
     s->ty = SYM_MAPPING;
+    s->local = 1;
 }
 
 /* Makes the section named `name` the current one, made with the attributes
@@ -1542,8 +1552,10 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         }
     } else if (strcmp(name, ".local") == 0) {
         for (uint i = 0; i < nargs; i++) {
+            /* As in LLVM, .local names the symbol: its place is here. */
             char *n = arg_name(args, nargs, i, name);
             if (n != NULL) {
+                symbols[symbol_index(n)].local = 1;
                 map_put(&locals, perm_strdup(n), 1);
             }
         }
@@ -1654,8 +1666,12 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         if (n != NULL) {
             int ok = nargs > 1 && args[1].kind == DA_EXPR && eval_relative(args[1].e, &v);
             if (ok) {
-                int k = symbol_index(n);
-                symbols[k].size = v.lo;
+                int k = find_symbol(n);
+                if (k >= 0) {
+                    symbols[k].size = v.lo;
+                } else {
+                    map_put(&pending_sizes, perm_strdup(n), (int)v.lo);
+                }
             } else {
                 error(".size: expected a constant, or a difference of '.' and labels defined earlier in this "
                       "section");

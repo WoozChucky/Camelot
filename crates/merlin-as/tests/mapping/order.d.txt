@@ -1,0 +1,24 @@
+
+order.o:	file format elf32-littleriscv
+
+Disassembly of section .text:
+
+00000000 <.text>:
+       0: 00000013     	nop
+
+00000004 <tgt>:
+       4: 00000013     	nop
+       8: 00000537     	lui	a0, 0x0
+			00000008:  R_RISCV_HI20	late
+       c: 00050513     	mv	a0, a0
+			0000000c:  R_RISCV_LO12_I	late
+      10: 00000097     	auipc	ra, 0x0
+			00000010:  R_RISCV_CALL_PLT	u
+      14: 000080e7     	jalr	ra <tgt+0xc>
+      18: 00 00 00 00  	.word	0x00000000
+
+0000001c <f>:
+      1c: 00008067     	ret
+
+00000020 <h>:
+      20: 00 00 00 00  	.word	0x00000000

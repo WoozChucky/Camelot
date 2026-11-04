@@ -140,6 +140,10 @@ pub struct Symbol {
     /// `st_size`, as `.size` gave it: 64 bits, which an ELF32 object cuts
     /// to 32.
     pub size: u64,
+    /// Named by `.local`: local even if nothing defines it (clang writes
+    /// such a symbol as a local undefined one), where any other undefined
+    /// symbol is global.
+    pub local: bool,
 }
 
 /// The assembled result, ready for [`crate::elf::write`].
@@ -170,6 +174,11 @@ pub struct Assembler {
     /// Names given to `.local`, so that a later `.comm` allocates them in
     /// `.bss` (see the `.comm` directive).
     locals: HashSet<String>,
+    /// `.size`s of symbols nothing has named yet, for when something does:
+    /// `.size` alone makes no symbol, as in LLVM (`MCELFStreamer::emitELFSize`
+    /// registers none), so a symbol sized before its label has its place in
+    /// the symbol table where it is defined or first named.
+    pending_sizes: HashMap<String, u64>,
     /// Line information: `.file 0` (the compilation directory and the main
     /// file) and the other `.file`s by number.
     file0: Option<dwarf::File>,
@@ -282,6 +291,7 @@ impl Assembler {
             dot_labels: 0,
             pcrel_lo: Vec::new(),
             locals: HashSet::new(),
+            pending_sizes: HashMap::new(),
             file0: None,
             files: Vec::new(),
             mapping: Vec::new(),
@@ -521,7 +531,8 @@ impl Assembler {
             defined: false,
             constant: None,
             ty: SymType::NoType,
-            size: 0,
+            size: self.pending_sizes.remove(name).unwrap_or(0),
+            local: false,
         });
         self.by_name.insert(name.to_string(), self.symbols.len() - 1);
         self.symbols.len() - 1
@@ -730,6 +741,7 @@ impl Assembler {
             constant: None,
             ty: SymType::Mapping,
             size: 0,
+            local: true,
         });
     }
 
@@ -1349,7 +1361,11 @@ impl Assembler {
             }
             ".local" => {
                 for i in 0..args.len() {
+                    // As in LLVM (`emitSymbolAttribute`), `.local` names the
+                    // symbol: its place in the symbol table is here.
                     if let Some(n) = self.arg_name(args, i, name) {
+                        let s = self.symbol_index(&n);
+                        self.symbols[s].local = true;
                         self.locals.insert(n);
                     }
                 }
@@ -1423,10 +1439,12 @@ impl Assembler {
                         _ => None,
                     };
                     match v {
-                        Some(v) => {
-                            let s = self.symbol_index(&n);
-                            self.symbols[s].size = v as u64;
-                        }
+                        Some(v) => match self.by_name.get(&n) {
+                            Some(&s) => self.symbols[s].size = v as u64,
+                            None => {
+                                self.pending_sizes.insert(n, v as u64);
+                            }
+                        },
                         None => self.error(
                             ".size: expected a constant, or a difference of '.' and labels \
                              defined earlier in this section",

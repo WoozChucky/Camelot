@@ -247,8 +247,9 @@ pub fn write(obj: &Object) -> Vec<u8> {
     }
 
     // Symbol table: null, locals, then globals (ELF requires locals first).
-    // Undefined symbols are always global.
-    let is_global = |s: &crate::asm::Symbol| s.global || (!s.defined && s.constant.is_none());
+    // Undefined symbols are global, but those `.local` names.
+    // (`.local` keeps an undefined symbol local, as clang writes it.)
+    let is_global = |s: &crate::asm::Symbol| s.global || (!s.defined && s.constant.is_none() && !s.local);
     let mut order: Vec<usize> = (0..obj.symbols.len())
         .filter(|&i| !is_global(&obj.symbols[i]))
         .collect();

@@ -142,7 +142,7 @@ fn clang_names(mut syms: Vec<Sym>) -> Vec<Sym> {
 
 fn check_mapping_corpus(xlen: Xlen) {
     let names = names("mapping", xlen);
-    assert_eq!(names, ["align", "dot", "mapping"], "{xlen:?}");
+    assert_eq!(names, ["align", "dot", "mapping", "order"], "{xlen:?}");
     for name in &names {
         let ours = assemble(&source("mapping", name, xlen), xlen);
         let clang = std::fs::read(objects("mapping", xlen).join(format!("{name}.o"))).unwrap();
