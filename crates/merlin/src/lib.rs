@@ -179,7 +179,7 @@ pub fn preprocess_asm(name: &str, src: &str, opts: &Options, load: Loader) -> Re
         lang: Lang::AssemblerWithCpp,
         ..opts.clone()
     };
-    preprocess(name, src, &opts, load).map(|pp| pp.print_asm())
+    preprocess(name, src, &opts, load).map(|pp| pp.print_asm(opts.line_markers))
 }
 
 /// Preprocesses, lexes, parses and checks one translation unit. The

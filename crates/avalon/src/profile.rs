@@ -63,8 +63,9 @@ pub fn card_configs(vm: &str, profile: &HardwareProfile) -> Result<Vec<CardConfi
 /// attached is Lake's to say, when the machine is built.
 ///
 /// The VM is as wide as its `program`: RV64 if it is ELF64 (as `Machine::load_elf`
-/// would make it), else RV32, also for a VM that boots from disk (Camelot's
-/// bootloader and kernel are RV32 until #154, #158). Its RAM is checked against that width's limit (Grail's
+/// would make it), else RV32, also for a VM that boots from disk (the protocol
+/// carries no width until #158, and a root image's bootloader and kernel are
+/// RV32 until #156). Its RAM is checked against that width's limit (Grail's
 /// `max_ram_size`: 1 TiB, 2 GiB on RV32).
 pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<MachineConfig, String> {
     let HardwareProfile {
@@ -100,6 +101,8 @@ pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<Machi
         nets: Vec::new(),
         // The protocol has no width yet (#158): the program's.
         xlen: grail::elf::class(program).unwrap_or(Xlen::Rv32),
+        // Nor paging modes (#158): Sv48 and Sv39, the default.
+        paging: grail::Paging::Sv48,
     };
     config.validate()?;
     Ok(config)
@@ -149,6 +152,7 @@ mod tests {
                 ],
                 nets: Vec::new(),
                 xlen: Xlen::Rv32,
+                paging: grail::Paging::Sv48,
             }
         );
         assert_eq!(

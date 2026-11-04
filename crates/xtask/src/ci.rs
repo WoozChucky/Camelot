@@ -137,6 +137,10 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
+        what: "the committed RV64 kernel is current, boots on 1-8 harts and panics as it should",
+        args: &["-p", "xtask", "--test", "kernel_rv64"],
+    },
+    Step {
         what: "the committed examples, boot programs and hello are current; an RV64 boot block boots",
         args: &[
             "-p",

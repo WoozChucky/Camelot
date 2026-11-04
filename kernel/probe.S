@@ -6,12 +6,14 @@
 # a0 = scause and a1 = stval, and probe_fault stores stval through the probe's
 # third argument and returns scause. (Linux calls this an exception table.)
 #
-#   u32 probe_load(const u32 *addr, u32 *val, u32 *stval)
+#   uintptr probe_load(const u32 *addr, u32 *val, uintptr *stval)
 #       *val = *addr; returns 0, or the scause of the fault (*val unchanged).
-#   u32 probe_store(u32 *addr, u32 val, u32 *stval)
+#   uintptr probe_store(u32 *addr, u32 val, uintptr *stval)
 #       *addr = val; returns 0, or the scause of the fault.
 #
-# *stval is written only after a fault.
+# *stval is written only after a fault. scause and stval are a register wide.
+
+#include <asm.h>
 
     .text
 
@@ -36,5 +38,5 @@ probe_store_insn:
 # still holds the probe's stval pointer.
     .globl probe_fault
 probe_fault:
-    sw    a1, 0(a2)
+    REG_S a1, 0(a2)
     ret

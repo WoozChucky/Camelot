@@ -145,11 +145,11 @@ static u32 isn(u32 laddr, u32 lport, u32 raddr, u32 rport) {
 /* Copies `n` bytes from `src` (in `pt`'s user memory, or kernel memory if
  * `pt` is NULL) into the ring `ring` from index `at` on. Returns 0, or
  * -EFAULT. */
-static int ring_in(u8 *ring, u32 at, pagetable_t pt, u32 src, u32 n) {
+static int ring_in(u8 *ring, u32 at, pagetable_t pt, uintptr src, u32 n) {
     while (n > 0) {
         u32 m = MIN(n, TCP_BUF - at);
         if (pt == NULL) {
-            memcpy(ring + at, (const void *)(uintptr)src, m);
+            memcpy(ring + at, (const void *)src, m);
         } else if (copyin(pt, ring + at, src, m) < 0) {
             return -EFAULT;
         }
@@ -162,11 +162,11 @@ static int ring_in(u8 *ring, u32 at, pagetable_t pt, u32 src, u32 n) {
 
 /* Copies `n` bytes of the ring from index `at` on to `dst`, the same
  * way. */
-static int ring_out(const u8 *ring, u32 at, pagetable_t pt, u32 dst, u32 n) {
+static int ring_out(const u8 *ring, u32 at, pagetable_t pt, uintptr dst, u32 n) {
     while (n > 0) {
         u32 m = MIN(n, TCP_BUF - at);
         if (pt == NULL) {
-            memcpy((void *)(uintptr)dst, ring + at, m);
+            memcpy((void *)dst, ring + at, m);
         } else if (copyout(pt, dst, ring + at, m) < 0) {
             return -EFAULT;
         }
@@ -349,7 +349,7 @@ static int xmit(u32 src, u32 sport, u32 dst, u32 dport, u32 seq, u32 ack, u32 fl
         put16(t + 22, TCP_MSS);
     }
     if (len > 0) {
-        ring_out(ring, at, NULL, (u32)(uintptr)(t + hlen), len);
+        ring_out(ring, at, NULL, (uintptr)(t + hlen), len);
     }
     if (src == 0) {
         src = ip_source(dst);
@@ -739,7 +739,7 @@ static bool take_data(struct tcp_sock *s, const struct seg *g) {
     }
     u32 skip = s->rcv_nxt - g->seq; /* bytes it has that came already */
     u32 n = MIN(g->len - skip, rcv_space(s));
-    ring_in(s->rbuf, (s->rhead + s->rlen) % TCP_BUF, NULL, (u32)(uintptr)(g->data + skip), n);
+    ring_in(s->rbuf, (s->rhead + s->rlen) % TCP_BUF, NULL, (uintptr)(g->data + skip), n);
     s->rlen += n;
     s->rcv_nxt += n;
     s->ack_now = true;
@@ -1201,7 +1201,7 @@ static int not_connected(const struct tcp_sock *s) {
     return s->state == TCP_CLOSED && s->err != 0 ? s->err : -ENOTCONN;
 }
 
-int tcp_send(struct tcp_sock *s, pagetable_t pt, u32 src, u32 n) {
+int tcp_send(struct tcp_sock *s, pagetable_t pt, uintptr src, u32 n) {
     u32 done = 0;
     while (done < n) {
         if (s->fin_queued) {
@@ -1242,7 +1242,7 @@ static void window_update(struct tcp_sock *s) {
     }
 }
 
-int tcp_recv(struct tcp_sock *s, pagetable_t pt, u32 dst, u32 n, u32 timeout) {
+int tcp_recv(struct tcp_sock *s, pagetable_t pt, uintptr dst, u32 n, u32 timeout) {
     u32 start = ticks;
     for (;;) {
         if (s->rlen > 0) {

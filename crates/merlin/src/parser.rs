@@ -488,7 +488,32 @@ impl Parser<'_> {
                     e.kind = ExprKind::SizeofType(t);
                 }
             }
-            ExprKind::Unary(_, x) | ExprKind::Cast { x, .. } => self.resolve_sizeof(x),
+            ExprKind::Unary(_, x) | ExprKind::Cast { x, .. } | ExprKind::Addr(x) | ExprKind::Deref(x) => {
+                self.resolve_sizeof(x)
+            }
+            // A member's offset is sema's to fill in, which comes too late for
+            // a constant the parser evaluates: `offsetof`'s
+            // `(unsigned long)&((struct s *)0)->m` in a `_Static_assert`.
+            ExprKind::Member {
+                base,
+                name,
+                arrow,
+                offset,
+            } => {
+                self.resolve_sizeof(base);
+                let record = if *arrow {
+                    self.value_type(base).and_then(|t| t.pointee().cloned())
+                } else {
+                    self.operand_type(base)
+                };
+                if let Some(m) = record
+                    .as_ref()
+                    .and_then(|r| r.record())
+                    .and_then(|r| r.body()?.member(name))
+                {
+                    *offset = m.offset;
+                }
+            }
             ExprKind::Binary(_, l, r) => {
                 self.resolve_sizeof(l);
                 self.resolve_sizeof(r);
@@ -3410,6 +3435,17 @@ mod tests {
             "1:23: static assertion expression is not an integer constant expression"
         );
         assert_eq!(err("_Static_assert(1);"), "1:17: expected ',', found ')'");
+        // offsetof, as <stddef.h> spells it: the member's offset, which sema
+        // has not filled in yet when the parser evaluates the assertion.
+        let offsetof = "struct s { char c; int n; struct { short a, b; } in; }; \
+                        _Static_assert((unsigned long)&((struct s *)0)->n == 4, \"n\"); \
+                        _Static_assert((unsigned long)&((struct s *)0)->in.b == 10, \"in.b\"); \
+                        _Static_assert((unsigned long)&(*(struct s *)0).in == 8, \"in\");";
+        assert_eq!(prog(offsetof).items.len(), 0);
+        assert_eq!(
+            err("struct s { char c; int n; }; _Static_assert((unsigned long)&((struct s *)0)->n == 0, \"n\");"),
+            "1:30: static assertion failed: n"
+        );
     }
 
     #[test]

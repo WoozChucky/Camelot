@@ -23,12 +23,11 @@
 #include "bio.h"
 #include "blk.h"
 #include "fs.h"
+#include "kalloc.h"
 #include "kprintf.h"
 #include "proc.h"
 #include "string.h"
 
-/* The boot ROM: not RAM, so the device refuses it as a buffer. */
-#define NOT_RAM 0x00001000
 
 static int passed;
 static int failed;
@@ -162,7 +161,9 @@ static void error_test(void) {
     b = bread(0, nblocks);
     check(b->error == BLK_ERR_OUT_OF_RANGE && bio_misses == misses + 2, "a failed read isn't cached");
     brelse(b);
-    check(blk_read(0, 0, (void *)NOT_RAM, 1) == BLK_ERR_BAD_DMA, "a buffer outside RAM is refused");
+    /* The page after the end of RAM, as a direct-map pointer (pa() takes no
+     * other kind): not RAM, so the device refuses it as a buffer. */
+    check(blk_read(0, 0, va(ram_base + ram_size), 1) == BLK_ERR_BAD_DMA, "a buffer outside RAM is refused");
 }
 
 static void lru_test(void) {
