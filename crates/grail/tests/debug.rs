@@ -103,8 +103,8 @@ fn breakpoint_step_and_continue_on_hello() {
     let puts = symbol(&elf, "puts");
     let (mut m, out) = machine(&elf, 1, 4, b"");
     let mut trace = |_: &Cpu| {};
-    assert!(m.set_breakpoint(puts));
-    assert!(!m.set_breakpoint(puts), "already set");
+    assert!(m.set_breakpoint(puts).unwrap());
+    assert!(!m.set_breakpoint(puts).unwrap(), "already set");
     assert_eq!(
         m.debug_continue(u64::MAX, &mut trace),
         Some(Stop::Breakpoint { hart: 0, pc: puts })
@@ -138,7 +138,7 @@ fn a_budget_returns_control_and_a_resume_steps_over_the_breakpoint() {
     let mut trace = |_: &Cpu| {};
     // `mv t1, a0`, before the loop: hit once.
     let loop_top = symbol(&elf, "puts") + 4;
-    m.set_breakpoint(loop_top);
+    m.set_breakpoint(loop_top).unwrap();
     assert_eq!(m.debug_continue(3, &mut trace), None, "3 steps are not enough");
     let mut hits = 0;
     while let Some(Stop::Breakpoint { pc, .. }) = m.debug_continue(u64::MAX, &mut trace) {
@@ -150,7 +150,7 @@ fn a_budget_returns_control_and_a_resume_steps_over_the_breakpoint() {
     // then an exit.
     let (mut m, _) = machine(&elf, 1, 4, b"");
     let lbu = symbol(&elf, "puts") + 8;
-    m.set_breakpoint(lbu);
+    m.set_breakpoint(lbu).unwrap();
     let mut hits = 0;
     let stop = loop {
         match m.debug_continue(u64::MAX, &mut trace) {
@@ -216,7 +216,7 @@ fn same_run_debugged(elf: &[u8], harts: usize, ram: usize, input: &[u8], stops: 
     let (mut m, out) = machine(elf, harts, ram, input);
     let mut turns = Turns::new();
     for &pc in stops {
-        m.set_breakpoint(pc);
+        m.set_breakpoint(pc).unwrap();
     }
     let mut stopped = 0;
     let mut trace = turns.trace();
@@ -264,7 +264,7 @@ fn harts_stop_between_turns() {
     // Every hart works: hart 0 once it has woken the others, hart 1 once woken.
     let (mut m, _) = machine(&smp, 2, 4, b"");
     let mut trace = |_: &Cpu| {};
-    m.set_breakpoint(work);
+    m.set_breakpoint(work).unwrap();
     assert_eq!(
         m.debug_continue(u64::MAX, &mut trace),
         Some(Stop::Breakpoint { hart: 0, pc: work })

@@ -107,7 +107,7 @@ impl Session {
         let reader = stream.try_clone()?;
         let (tx, events) = mpsc::channel();
         std::thread::spawn(move || read_events(reader, tx));
-        let mut stub = Stub::new(m);
+        let mut stub = Stub::new();
         stub.stopped(m, StopReason::Interrupted);
         Ok(Session {
             stub,

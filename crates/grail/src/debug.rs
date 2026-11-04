@@ -152,9 +152,14 @@ impl Default for Debug {
 
 impl Machine {
     /// Sets a breakpoint at virtual address `pc`: a hart about to execute the
-    /// instruction there stops the machine. Returns false if there was one already.
-    pub fn set_breakpoint(&mut self, pc: u64) -> bool {
-        self.debug.breakpoints.insert(pc)
+    /// instruction there stops the machine. Returns false if there was one already; an
+    /// error for an address past the machine's address space (4 GiB on RV32), which no
+    /// hart could ever reach.
+    pub fn set_breakpoint(&mut self, pc: u64) -> Result<bool, String> {
+        if pc & !self.width_mask() != 0 {
+            return Err(format!("{pc:#x} is past the end of the address space"));
+        }
+        Ok(self.debug.breakpoints.insert(pc))
     }
 
     /// Removes the breakpoint at `pc`. Returns false if there was none.

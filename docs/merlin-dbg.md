@@ -135,7 +135,7 @@ Packets are `$payload#checksum`, with `+`/`-` acks until `QStartNoAckMode`. A 0x
 | `c [addr]`, `C sig[;addr]`, `s [addr]`, `S sig[;addr]` | resumes (at `addr` if given; signals are ignored). `c` replies when the machine stops, `s` after one instruction of the `Hc` hart |
 | `vCont?` | `vCont;c;C;s;S` |
 | `vCont;action[:thread]...` | a step (`s`/`S`) of its thread if there is one, else continue. Every hart runs either way: a step of one hart is a turn of each hart before it |
-| `Z0`/`z0`, `Z1`/`z1 ,addr,kind` | sets/clears a breakpoint (software and hardware ones are the same thing here). Conditions after `;` are ignored |
+| `Z0`/`z0`, `Z1`/`z1 ,addr,kind` | sets/clears a breakpoint (software and hardware ones are the same thing here). Conditions after `;` are ignored. On RV32, a breakpoint at an address past 4 GiB, which no hart can reach, gets `E16` |
 | `Z2`-`Z4` / `z2`-`z4 ,addr,len` | sets/clears a write, read or access watchpoint on `len` bytes (`E16` for an empty range or one past the end of the address space, 2^64 or, on RV32, 2^32) |
 | `Hg thread`, `Hc thread` | selects the hart for registers and memory / for `c` and `s` |
 | `T thread` | `OK` if the hart exists |

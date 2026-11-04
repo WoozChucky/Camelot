@@ -55,20 +55,23 @@ pub struct Stub {
     no_ack: bool,
     /// The client understands the `swbreak` stop reason (`qSupported`).
     swbreak: bool,
-    /// The target description, made once.
-    xml: String,
     /// The hart `c` and `s` act on, from `Hc`; `None` is "any" (the selected hart).
     resume_hart: Option<usize>,
     last_stop: StopReason,
 }
 
+impl Default for Stub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Stub {
-    /// A stub for `m`, which is stopped.
-    pub fn new(m: &Machine) -> Stub {
+    /// A stub for a machine that is stopped.
+    pub fn new() -> Stub {
         Stub {
             no_ack: false,
             swbreak: false,
-            xml: target::xml(m),
             resume_hart: None,
             last_stop: StopReason::Interrupted,
         }
@@ -245,7 +248,7 @@ impl Stub {
                 reply("OK")
             }
             "qXfer" => match rest.strip_prefix("features:read:target.xml:") {
-                Some(range) => self.read_xml(range),
+                Some(range) => read_xml(m, range),
                 None => reply(""),
             },
             "qfThreadInfo" => {
@@ -286,23 +289,25 @@ impl Stub {
             _ => reply(""),
         }
     }
+}
 
-    /// `qXfer:features:read:target.xml:off,len`: `m` and a part of the description, or
-    /// `l` and its last part.
-    fn read_xml(&self, range: &str) -> Action {
-        let Some((off, len)) = range.split_once(',') else {
-            return Action::Reply(malformed());
-        };
-        let (Some(off), Some(len)) = (hex(off.as_bytes()), hex(len.as_bytes())) else {
-            return Action::Reply(malformed());
-        };
-        let xml = self.xml.as_bytes();
-        let start = (off as usize).min(xml.len());
-        let end = start.saturating_add(len as usize).min(xml.len());
-        let mut out = vec![if end == xml.len() { b'l' } else { b'm' }];
-        out.extend(packet::escape(&xml[start..end]));
-        Action::Reply(out)
-    }
+/// `qXfer:features:read:target.xml:off,len`: `m` and a part of the description, or `l`
+/// and its last part. The description is made at each request, so it is the machine's
+/// as it is now (a program loaded after the stub was made may have made it RV64).
+fn read_xml(m: &Machine, range: &str) -> Action {
+    let Some((off, len)) = range.split_once(',') else {
+        return Action::Reply(malformed());
+    };
+    let (Some(off), Some(len)) = (hex(off.as_bytes()), hex(len.as_bytes())) else {
+        return Action::Reply(malformed());
+    };
+    let xml = target::xml(m);
+    let xml = xml.as_bytes();
+    let start = (off as usize).min(xml.len());
+    let end = start.saturating_add(len as usize).min(xml.len());
+    let mut out = vec![if end == xml.len() { b'l' } else { b'm' }];
+    out.extend(packet::escape(&xml[start..end]));
+    Action::Reply(out)
 }
 
 /// `g`: `x0`-`x31` and `pc`, each little-endian in hex.
@@ -422,7 +427,7 @@ fn point(m: &mut Machine, set: bool, args: &[u8]) -> Result<Action, Vec<u8>> {
     let watch = match ty {
         b"0" | b"1" => {
             if set {
-                m.set_breakpoint(addr);
+                m.set_breakpoint(addr).map_err(|_| error(22))?;
             } else {
                 m.clear_breakpoint(addr);
             }
@@ -516,7 +521,7 @@ mod tests {
             ..MachineConfig::with_ram(64 * 1024)
         };
         let m = Machine::new(config).unwrap();
-        let stub = Stub::new(&m);
+        let stub = Stub::new();
         (m, stub)
     }
 
@@ -830,7 +835,7 @@ mod tests {
             ..MachineConfig::with_ram(ram)
         })
         .unwrap();
-        let stub = Stub::new(&m);
+        let stub = Stub::new();
         (m, stub)
     }
 
@@ -899,12 +904,50 @@ mod tests {
         assert!(ask(&mut m, &mut stub, "qRegisterInfo1").contains("bitsize:64;offset:8;"));
     }
 
+    /// The whole target description `stub` gives for `m`, read in parts as a client does.
+    fn read_description(m: &mut Machine, stub: &mut Stub) -> String {
+        let mut xml = String::new();
+        loop {
+            let part = ask(
+                m,
+                stub,
+                &format!("qXfer:features:read:target.xml:{:x},800", xml.len()),
+            );
+            xml.push_str(&part[1..]);
+            if part.starts_with('l') {
+                return xml;
+            }
+            assert!(part.starts_with('m'), "{part}");
+        }
+    }
+
+    #[test]
+    fn the_description_is_the_machines_as_it_is_asked_for() {
+        // The stub keeps no description of its own: it describes the machine it is
+        // handed at each request, so it cannot describe a machine that is no longer so.
+        let (mut m32, mut stub) = setup(1);
+        let (mut m64, _) = setup64(64 * 1024);
+        let xml = read_description(&mut m32, &mut stub);
+        assert!(xml.contains("<architecture>riscv:rv32</architecture>"));
+        assert_eq!(xml, target::xml(&m32));
+        let xml = read_description(&mut m64, &mut stub);
+        assert!(xml.contains("<architecture>riscv:rv64</architecture>"));
+        assert_eq!(xml, target::xml(&m64));
+    }
+
     #[test]
     fn an_rv32_machine_has_no_addresses_past_4_gib() {
         let (mut m, mut stub) = setup(1);
         assert_eq!(ask(&mut m, &mut stub, "m100001000,4"), "E0e");
         assert_eq!(ask(&mut m, &mut stub, "Z2,fffffffc,4"), "OK");
         assert_eq!(ask(&mut m, &mut stub, "Z2,fffffffe,4"), "E16", "past 2^32");
+        assert_eq!(ask(&mut m, &mut stub, "Z0,fffffffc,4"), "OK");
+        assert_eq!(
+            ask(&mut m, &mut stub, "Z0,100001000,4"),
+            "E16",
+            "a breakpoint past 2^32"
+        );
+        assert_eq!(m.breakpoints().collect::<Vec<_>>(), [0xffff_fffc]);
         assert_eq!(
             ask(&mut m, &mut stub, "P5=efcdab8967452301"),
             "E01",
