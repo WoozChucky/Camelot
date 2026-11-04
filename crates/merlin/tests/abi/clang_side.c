@@ -95,6 +95,18 @@ struct l3 {
     long a, b, c;
 };
 
+/* A long long is 64 bits on both widths: on RV32 a pair of registers, as is
+ * a struct holding one (aligned to 8, so it starts at an even register when
+ * variadic and at an even word on the stack). */
+struct q1 {
+    long long v;
+};
+
+struct iq {
+    int i;
+    long long v;
+};
+
 /* What <stdarg.h> is made of (clang's builtins, which merlin has too). */
 typedef __builtin_va_list va_list;
 #define va_start(ap, last) __builtin_va_start(ap, last)
@@ -138,6 +150,13 @@ struct cl m_cl(struct cl s);
 struct l3 m_addl3(struct l3 x, struct l3 y);
 long m_vmixw(const char *fmt, ...);
 long m_stackw(int a, int b, int c, int d, int e, int f, int g, long h, struct l2 i, unsigned j, long k);
+long long m_qadd(long long a, int b, long long c);
+unsigned long long m_qhigh(unsigned long long x);
+long long m_qlate(int a, int b, int c, int d, int e, int f, int g, long long h, long long i, int j, long long k);
+struct q1 m_qtwice(struct q1 s);
+long long m_qsum(struct iq s, struct q1 t);
+long long m_vq(const char *fmt, ...);
+long long m_vqlate(int a, int b, int c, int d, int e, int f, int g, ...);
 
 static int checks, first_failure;
 
@@ -463,6 +482,58 @@ long c_stackw(int a, int b, int c, int d, int e, int f, int g, long h, struct l2
     return a + b + c + d + e + f + g + h * 10 + i.a * 100 + i.b + (long)(j >> 4) + k;
 }
 
+long long c_qadd(long long a, int b, long long c) {
+    return a + b + c;
+}
+
+unsigned long long c_qhigh(unsigned long long x) {
+    return x >> 32;
+}
+
+/* h starts in a7 on RV32, its high word at 0(sp); i, j and k are on the
+ * stack, i and k from an even word. */
+long long c_qlate(int a, int b, int c, int d, int e, int f, int g, long long h, long long i, int j, long long k) {
+    return a + b + c + d + e + f + g + h * 2 + i * 3 + j + k * 5;
+}
+
+struct q1 c_qtwice(struct q1 s) {
+    s.v *= 2;
+    return s;
+}
+
+long long c_qsum(struct iq s, struct q1 t) {
+    return s.i + s.v + t.v;
+}
+
+/* Letters of fmt: i an int, q a long long, s a struct q1. */
+long long c_vq(const char *fmt, ...) {
+    va_list ap;
+    long long s = 0;
+    va_start(ap, fmt);
+    for (; *fmt; fmt++) {
+        if (*fmt == 'i') {
+            s += va_arg(ap, int);
+        } else if (*fmt == 'q') {
+            s += va_arg(ap, long long);
+        } else {
+            struct q1 v = va_arg(ap, struct q1);
+            s += v.v;
+        }
+    }
+    va_end(ap);
+    return s;
+}
+
+/* Seven named ints: on RV32 the variadic pair skips a7. */
+long long c_vqlate(int a, int b, int c, int d, int e, int f, int g, ...) {
+    va_list ap;
+    long long x;
+    va_start(ap, g);
+    x = va_arg(ap, long long);
+    va_end(ap);
+    return x + a + b + c + d + e + f + g;
+}
+
 /* Calls every m_ function; returns 0 if all its checks pass, else the number
  * of the first that fails. */
 int c_calls_merlin(void) {
@@ -483,6 +554,9 @@ int c_calls_merlin(void) {
     struct li lint;
     struct cl chl;
     struct l3 lthree;
+    long long qbig;
+    struct q1 qone;
+    struct iq qmix;
     un.i[0] = 41;
     un.i[1] = 0;
     check(m_sum6(s6) == 6);
@@ -554,5 +628,18 @@ int c_calls_merlin(void) {
     check(m_vmixw("TtqpLlui", lthree, lint, ltwo, "z", ubig, big, 0xffffffffu, -1) ==
           4 + 56 + 34 + 'z' + (long)(ubig >> 4) + big + 0x0fffffff - 1);
     check(m_stackw(1, 2, 3, 4, 5, 6, 7, -2, ltwo, 0xffffffffu, big) == 28 - 20 + 304 + 0x0fffffff + big);
+    /* long long: pairs in registers, across a7, on the stack, variadic. */
+    qbig = 0x100000000LL;
+    qone.v = 5000000000LL;
+    qmix.i = 7;
+    qmix.v = -3000000000LL;
+    check(m_qadd(qbig, -1, qbig) == 0x1ffffffffLL && m_qadd(-1, -1, -1) == -3);
+    check(m_qhigh(0xabcdef0123456789ULL) == 0xabcdef01ULL);
+    check(m_qlate(1, 2, 3, 4, 5, 6, 7, qbig, -qbig, 9, qbig) == 28 + 4 * qbig + 9);
+    check(m_qtwice(qone).v == 10000000000LL);
+    check(m_qsum(qmix, qone) == 2000000007LL);
+    check(m_vq("iqisq", 1, qbig, 2, qone, -qbig) == 3 + 5000000000LL);
+    check(m_vq("iiiiiiq", 1, 2, 3, 4, 5, 6, qbig) == qbig + 21);
+    check(m_vqlate(1, 2, 3, 4, 5, 6, 7, qbig) == qbig + 28);
     return first_failure;
 }

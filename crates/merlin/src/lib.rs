@@ -11,9 +11,9 @@
 //! expressions, and [`abi`] says how arguments and results travel (the
 //! RISC-V integer calling convention).
 //!
-//! The language (spec section 10) is a subset of C99 without floating point
-//! and `long long`: the C99 preprocessor, the integer types (`_Bool`, `char`,
-//! `short`, `int`, `long`, signed and unsigned), `enum`, pointers (to
+//! The language (spec section 10) is a subset of C99 without floating point:
+//! the C99 preprocessor, the integer types (`_Bool`, `char`, `short`, `int`,
+//! `long`, `long long`, signed and unsigned), `enum`, pointers (to
 //! functions too), arrays, structs and unions (passed and returned by value
 //! as clang does), `typedef`, the `const` and `volatile` qualifiers, global
 //! and `static` variables with initializers (designators included), compound

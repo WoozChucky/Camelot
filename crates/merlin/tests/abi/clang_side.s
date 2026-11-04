@@ -950,6 +950,237 @@ c_stackw:                               # @c_stackw
 .Lfunc_end40:
 	.size	c_stackw, .Lfunc_end40-c_stackw
                                         # -- End function
+	.globl	c_qadd                          # -- Begin function c_qadd
+	.p2align	2
+	.type	c_qadd,@function
+c_qadd:                                 # @c_qadd
+# %bb.0:
+	srai	a5, a2, 31
+	add	a2, a0, a2
+	sltu	a0, a2, a0
+	add	a1, a1, a5
+	add	a1, a1, a0
+	add	a0, a2, a3
+	sltu	a2, a0, a2
+	add	a1, a1, a4
+	add	a1, a1, a2
+	ret
+.Lfunc_end41:
+	.size	c_qadd, .Lfunc_end41-c_qadd
+                                        # -- End function
+	.globl	c_qhigh                         # -- Begin function c_qhigh
+	.p2align	2
+	.type	c_qhigh,@function
+c_qhigh:                                # @c_qhigh
+# %bb.0:
+	mv	a0, a1
+	li	a1, 0
+	ret
+.Lfunc_end42:
+	.size	c_qhigh, .Lfunc_end42-c_qhigh
+                                        # -- End function
+	.globl	c_qlate                         # -- Begin function c_qlate
+	.p2align	2
+	.type	c_qlate,@function
+c_qlate:                                # @c_qlate
+# %bb.0:
+	lw	t2, 16(sp)
+	srai	t3, t2, 31
+	lw	t0, 28(sp)
+	lw	t1, 24(sp)
+	lw	t4, 12(sp)
+	lw	t5, 8(sp)
+	add	a0, a1, a0
+	add	a2, a2, a3
+	add	a4, a4, a5
+	add	a0, a0, a2
+	add	a4, a4, a6
+	lw	a1, 0(sp)
+	add	a0, a0, a4
+	srai	a2, a0, 31
+	li	a3, 3
+	slli	a4, a7, 1
+	mulhu	a3, t5, a3
+	srli	a5, a7, 31
+	add	a0, a4, a0
+	slli	a1, a1, 1
+	sltu	a4, a0, a4
+	or	a1, a1, a5
+	add	a2, a2, a4
+	add	a1, a1, a2
+	slli	a2, t4, 1
+	add	a2, a2, t4
+	slli	a4, t5, 1
+	add	a2, a3, a2
+	add	a4, a4, t5
+	add	a4, a0, a4
+	li	a3, 5
+	sltu	a0, a4, a0
+	mulhu	a3, t1, a3
+	add	a0, a1, a0
+	add	t2, a4, t2
+	sltu	a1, t2, a4
+	add	a0, a0, t3
+	add	a1, a0, a1
+	slli	a0, t1, 2
+	slli	a4, t0, 2
+	add	a0, a0, t1
+	add	a4, a4, t0
+	add	a0, t2, a0
+	add	a3, a3, a4
+	sltu	a4, a0, t2
+	add	a1, a1, a2
+	add	a3, a3, a4
+	add	a1, a1, a3
+	ret
+.Lfunc_end43:
+	.size	c_qlate, .Lfunc_end43-c_qlate
+                                        # -- End function
+	.globl	c_qtwice                        # -- Begin function c_qtwice
+	.p2align	2
+	.type	c_qtwice,@function
+c_qtwice:                               # @c_qtwice
+# %bb.0:
+	srli	a2, a0, 31
+	slli	a1, a1, 1
+	or	a1, a1, a2
+	slli	a0, a0, 1
+	ret
+.Lfunc_end44:
+	.size	c_qtwice, .Lfunc_end44-c_qtwice
+                                        # -- End function
+	.globl	c_qsum                          # -- Begin function c_qsum
+	.p2align	2
+	.type	c_qsum,@function
+c_qsum:                                 # @c_qsum
+# %bb.0:
+	lw	a3, 0(a0)
+	lw	a4, 8(a0)
+	lw	a5, 12(a0)
+	srai	a0, a3, 31
+	add	a3, a1, a3
+	sltu	a1, a3, a1
+	add	a0, a2, a0
+	add	a1, a0, a1
+	add	a0, a3, a4
+	sltu	a2, a0, a3
+	add	a1, a1, a5
+	add	a1, a1, a2
+	ret
+.Lfunc_end45:
+	.size	c_qsum, .Lfunc_end45-c_qsum
+                                        # -- End function
+	.globl	c_vq                            # -- Begin function c_vq
+	.p2align	2
+	.type	c_vq,@function
+c_vq:                                   # @c_vq
+# %bb.0:
+	addi	sp, sp, -48
+	mv	t1, a1
+	mv	t0, a0
+	li	a0, 0
+	li	a1, 0
+	sw	a5, 36(sp)
+	sw	a6, 40(sp)
+	sw	a7, 44(sp)
+	addi	a5, sp, 20
+	sw	t1, 20(sp)
+	sw	a2, 24(sp)
+	sw	a3, 28(sp)
+	sw	a4, 32(sp)
+	sw	a5, 12(sp)
+	li	a2, 105
+	li	a3, 113
+	j	.LBB46_3
+.LBB46_1:                               #   in Loop: Header=BB46_3 Depth=1
+	addi	a5, a5, 7
+	andi	a6, a5, -8
+	addi	a5, a6, 8
+	sw	a5, 12(sp)
+	lw	a4, 0(a6)
+	lw	a6, 4(a6)
+.LBB46_2:                               #   in Loop: Header=BB46_3 Depth=1
+	add	a0, a4, a0
+	sltu	a4, a0, a4
+	add	a1, a6, a1
+	add	a1, a1, a4
+	addi	t0, t0, 1
+.LBB46_3:                               # =>This Inner Loop Header: Depth=1
+	lbu	a4, 0(t0)
+	beq	a4, a2, .LBB46_6
+# %bb.4:                                #   in Loop: Header=BB46_3 Depth=1
+	beq	a4, a3, .LBB46_1
+# %bb.5:                                #   in Loop: Header=BB46_3 Depth=1
+	bnez	a4, .LBB46_1
+	j	.LBB46_7
+.LBB46_6:                               #   in Loop: Header=BB46_3 Depth=1
+	addi	a6, a5, 4
+	sw	a6, 12(sp)
+	lw	a4, 0(a5)
+	mv	a5, a6
+	srai	a6, a4, 31
+	j	.LBB46_2
+.LBB46_7:
+	addi	sp, sp, 48
+	ret
+.Lfunc_end46:
+	.size	c_vq, .Lfunc_end46-c_vq
+                                        # -- End function
+	.globl	c_vqlate                        # -- Begin function c_vqlate
+	.p2align	2
+	.type	c_vqlate,@function
+c_vqlate:                               # @c_vqlate
+# %bb.0:
+	addi	sp, sp, -16
+	sw	s0, 4(sp)                       # 4-byte Folded Spill
+	sw	a7, 12(sp)
+	addi	a7, sp, 12
+	addi	t0, sp, 19
+	sw	a7, 0(sp)
+	andi	a7, t0, -8
+	lw	t0, 0(a7)
+	lw	a7, 4(a7)
+	srai	t1, a0, 31
+	srai	t2, a1, 31
+	srai	t3, a2, 31
+	srai	t4, a3, 31
+	srai	t5, a4, 31
+	srai	t6, a5, 31
+	srai	s0, a6, 31
+	add	a0, a1, a0
+	sltu	a1, a0, a1
+	add	t1, t2, t1
+	add	a1, t1, a1
+	add	a2, a0, a2
+	sltu	a0, a2, a0
+	add	a1, a1, t3
+	add	a0, a0, t4
+	add	a3, a2, a3
+	add	a0, a1, a0
+	sltu	a1, a3, a2
+	add	a1, a1, t5
+	add	a4, a3, a4
+	add	a0, a0, a1
+	sltu	a1, a4, a3
+	add	a1, a1, t6
+	add	a5, a4, a5
+	add	a0, a0, a1
+	sltu	a1, a5, a4
+	add	a1, a1, s0
+	add	a6, a5, a6
+	add	a1, a0, a1
+	sltu	a0, a6, a5
+	add	a7, a0, a7
+	add	a0, a6, t0
+	add	a1, a1, a7
+	sltu	a2, a0, a6
+	add	a1, a1, a2
+	lw	s0, 4(sp)                       # 4-byte Folded Reload
+	addi	sp, sp, 16
+	ret
+.Lfunc_end47:
+	.size	c_vqlate, .Lfunc_end47-c_vqlate
+                                        # -- End function
 	.globl	c_calls_merlin                  # -- Begin function c_calls_merlin
 	.p2align	2
 	.type	c_calls_merlin,@function
@@ -976,29 +1207,29 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	li	s0, 6
 	sw	a1, 4(s3)
-	beq	a0, s0, .LBB41_3
+	beq	a0, s0, .LBB48_3
 # %bb.1:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_3
+	bnez	a0, .LBB48_3
 # %bb.2:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_3:
-	addi	a0, sp, 60
+.LBB48_3:
+	addi	a0, sp, 56
 	li	a1, 4
 	call	m_make12
 	lw	a0, 4(s3)
-	lw	a1, 68(sp)
+	lw	a1, 64(sp)
 	addi	a0, a0, 1
 	sw	a0, 4(s3)
-	beq	a1, s0, .LBB41_6
+	beq	a1, s0, .LBB48_6
 # %bb.4:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_6
+	bnez	a1, .LBB48_6
 # %bb.5:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_6:
+.LBB48_6:
 	li	a0, 5
 	li	a1, 7
 	call	m_swap8
@@ -1010,14 +1241,14 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a1, a1, a2
 	addi	a0, a0, 1
 	sw	a0, 4(s3)
-	beqz	a1, .LBB41_9
+	beqz	a1, .LBB48_9
 # %bb.7:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_9
+	bnez	a1, .LBB48_9
 # %bb.8:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_9:
+.LBB48_9:
 	lui	a0, 16432
 	addi	a0, a0, 513
 	li	a1, 5
@@ -1030,14 +1261,14 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a1, a0, a1
 	addi	a0, a2, 1
 	sw	a0, 4(s3)
-	beqz	a1, .LBB41_12
+	beqz	a1, .LBB48_12
 # %bb.10:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_12
+	bnez	a1, .LBB48_12
 # %bb.11:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_12:
+.LBB48_12:
 	li	a0, 1
 	li	a1, 2
 	li	a2, 3
@@ -1048,25 +1279,25 @@ c_calls_merlin:                         # @c_calls_merlin
 	srli	a2, a0, 24
 	addi	a0, a1, 1
 	sw	a0, 4(s3)
-	beq	a2, s2, .LBB41_15
+	beq	a2, s2, .LBB48_15
 # %bb.13:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_15
+	bnez	a1, .LBB48_15
 # %bb.14:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_15:
+.LBB48_15:
 	li	a0, 10
 	li	a1, 20
 	li	a2, 30
-	sw	a0, 60(sp)
-	sw	a1, 64(sp)
-	sw	a2, 68(sp)
+	sw	a0, 56(sp)
+	sw	a1, 60(sp)
+	sw	a2, 64(sp)
 	lui	a3, 32
 	li	a0, 1
 	li	a4, 3
 	addi	a3, a3, 1
-	addi	a5, sp, 60
+	addi	a5, sp, 56
 	li	a6, 2
 	li	a7, 3
 	mv	a1, s0
@@ -1076,49 +1307,49 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	li	a2, 107
 	sw	a1, 4(s3)
-	beq	a0, a2, .LBB41_18
+	beq	a0, a2, .LBB48_18
 # %bb.16:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_18
+	bnez	a0, .LBB48_18
 # %bb.17:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_18:
-	addi	a0, sp, 60
+.LBB48_18:
+	addi	a0, sp, 56
 	li	a1, 3
 	call	m_big
 	addi	a0, sp, 100
-	addi	a1, sp, 60
+	addi	a1, sp, 56
 	li	a2, 36
 	call	memcpy
-	lw	s4, 96(sp)
+	lw	s4, 92(sp)
 	li	s2, 12
-	bne	s4, s2, .LBB41_20
+	bne	s4, s2, .LBB48_20
 # %bb.19:
-	addi	a0, sp, 60
+	addi	a0, sp, 56
 	addi	a1, sp, 100
 	li	a2, 36
 	call	memcpy
-	sw	s2, 96(sp)
-	addi	a0, sp, 60
+	sw	s2, 92(sp)
+	addi	a0, sp, 56
 	call	m_sumbig
 	addi	a0, a0, -75
 	seqz	a1, a0
-	j	.LBB41_21
-.LBB41_20:
+	j	.LBB48_21
+.LBB48_20:
 	li	a1, 0
-.LBB41_21:
+.LBB48_21:
 	lw	a0, 4(s3)
 	addi	a0, a0, 1
 	sw	a0, 4(s3)
-	bnez	a1, .LBB41_24
+	bnez	a1, .LBB48_24
 # %bb.22:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_24
+	bnez	a1, .LBB48_24
 # %bb.23:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_24:
+.LBB48_24:
 	li	a0, 97
 	call	m_inc1
 	lw	a1, 4(s3)
@@ -1126,14 +1357,14 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a0, a1, 1
 	li	a1, 98
 	sw	a0, 4(s3)
-	beq	a2, a1, .LBB41_27
+	beq	a2, a1, .LBB48_27
 # %bb.25:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_27
+	bnez	a1, .LBB48_27
 # %bb.26:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_27:
+.LBB48_27:
 	li	a0, 120
 	li	a1, 21
 	call	m_mixed
@@ -1144,14 +1375,14 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a1, a0, a1
 	addi	a0, a2, 1
 	sw	a0, 4(s3)
-	beqz	a1, .LBB41_30
+	beqz	a1, .LBB48_30
 # %bb.28:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_30
+	bnez	a1, .LBB48_30
 # %bb.29:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_30:
+.LBB48_30:
 	li	a0, 41
 	li	a1, 0
 	call	m_union
@@ -1159,34 +1390,34 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a0, a0, 1
 	li	a2, 42
 	sw	a0, 4(s3)
-	beq	a1, a2, .LBB41_33
+	beq	a1, a2, .LBB48_33
 # %bb.31:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_33
+	bnez	a1, .LBB48_33
 # %bb.32:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_33:
+.LBB48_33:
 	li	a0, 10
 	li	a1, 20
 	li	a2, 30
-	sw	a0, 60(sp)
-	sw	a1, 64(sp)
-	sw	a2, 68(sp)
-	addi	a0, sp, 60
+	sw	a0, 56(sp)
+	sw	a1, 60(sp)
+	sw	a2, 64(sp)
+	addi	a0, sp, 56
 	call	m_modify12
 	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	li	a2, 1020
 	sw	a1, 4(s3)
-	beq	a0, a2, .LBB41_36
+	beq	a0, a2, .LBB48_36
 # %bb.34:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_36
+	bnez	a0, .LBB48_36
 # %bb.35:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_36:
+.LBB48_36:
 	lui	s5, 16
 	addi	a2, s5, -3
 	li	a0, -3
@@ -1198,42 +1429,42 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	addi	s5, s5, -8
 	sw	a1, 4(s3)
-	beq	a0, s5, .LBB41_39
+	beq	a0, s5, .LBB48_39
 # %bb.37:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_39
+	bnez	a0, .LBB48_39
 # %bb.38:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_39:
+.LBB48_39:
 	lui	a0, 32
 	addi	a0, a0, -3
 	call	m_trunc_sc
 	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	sw	a1, 4(s3)
-	beq	a0, s2, .LBB41_42
+	beq	a0, s2, .LBB48_42
 # %bb.40:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_42
+	bnez	a0, .LBB48_42
 # %bb.41:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_42:
+.LBB48_42:
 	lui	a0, 24
 	call	m_trunc_s
 	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	lui	a2, 1048568
 	sw	a1, 4(s3)
-	beq	a0, a2, .LBB41_45
+	beq	a0, a2, .LBB48_45
 # %bb.43:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_45
+	bnez	a0, .LBB48_45
 # %bb.44:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_45:
+.LBB48_45:
 	lui	a0, 32
 	addi	a0, a0, -3
 	call	m_trunc_us
@@ -1242,40 +1473,40 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	addi	a2, a2, -3
 	sw	a1, 4(s3)
-	beq	a0, a2, .LBB41_48
+	beq	a0, a2, .LBB48_48
 # %bb.46:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_48
+	bnez	a0, .LBB48_48
 # %bb.47:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_48:
+.LBB48_48:
 	li	a0, 256
 	call	m_tobool
 	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	sw	a1, 4(s3)
-	bnez	a0, .LBB41_51
+	bnez	a0, .LBB48_51
 # %bb.49:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_51
+	bnez	a0, .LBB48_51
 # %bb.50:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_51:
+.LBB48_51:
 	li	a0, 0
 	call	m_vsum
 	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	sw	a1, 4(s3)
-	beqz	a0, .LBB41_54
+	beqz	a0, .LBB48_54
 # %bb.52:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_54
+	bnez	a0, .LBB48_54
 # %bb.53:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_54:
+.LBB48_54:
 	li	s2, 10
 	li	t0, 9
 	li	t1, 8
@@ -1295,25 +1526,25 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	li	a2, 55
 	sw	a1, 4(s3)
-	beq	a0, a2, .LBB41_57
+	beq	a0, a2, .LBB48_57
 # %bb.55:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_57
+	bnez	a0, .LBB48_57
 # %bb.56:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_57:
+.LBB48_57:
 	li	s5, 20
 	li	s6, 30
-	sw	s2, 48(sp)
-	sw	s5, 52(sp)
-	sw	s6, 56(sp)
-	addi	a0, sp, 60
+	sw	s2, 44(sp)
+	sw	s5, 48(sp)
+	sw	s6, 52(sp)
+	addi	a0, sp, 56
 	addi	a1, sp, 100
 	li	a2, 36
-	addi	s7, sp, 60
+	addi	s7, sp, 56
 	call	memcpy
-	sw	s4, 96(sp)
+	sw	s4, 92(sp)
 	lui	a0, %hi(.L.str)
 	addi	a0, a0, %lo(.L.str)
 	lui	s2, 32
@@ -1321,7 +1552,7 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	s2, s2, 1
 	li	a2, -3
 	li	a4, 3
-	addi	a7, sp, 48
+	addi	a7, sp, 44
 	mv	a3, s2
 	mv	a5, s0
 	mv	a6, s1
@@ -1332,27 +1563,27 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	li	s8, 180
 	sw	a1, 4(s3)
-	beq	a0, s8, .LBB41_60
+	beq	a0, s8, .LBB48_60
 # %bb.58:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_60
+	bnez	a0, .LBB48_60
 # %bb.59:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_60:
-	addi	a0, sp, 60
+.LBB48_60:
+	addi	a0, sp, 56
 	addi	a1, sp, 100
 	li	a2, 36
 	call	memcpy
 	li	a0, 10
-	sw	s4, 96(sp)
-	sw	a0, 48(sp)
-	sw	s5, 52(sp)
-	sw	s6, 56(sp)
+	sw	s4, 92(sp)
+	sw	a0, 44(sp)
+	sw	s5, 48(sp)
+	sw	s6, 52(sp)
 	lui	a0, %hi(.L.str.1)
 	addi	a0, a0, %lo(.L.str.1)
-	addi	a1, sp, 60
-	addi	a2, sp, 48
+	addi	a1, sp, 56
+	addi	a2, sp, 44
 	li	a6, 3
 	li	a7, -3
 	mv	a3, s0
@@ -1363,14 +1594,14 @@ c_calls_merlin:                         # @c_calls_merlin
 	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	sw	a1, 4(s3)
-	beq	a0, s8, .LBB41_63
+	beq	a0, s8, .LBB48_63
 # %bb.61:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_63
+	bnez	a0, .LBB48_63
 # %bb.62:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_63:
+.LBB48_63:
 	li	t0, 100
 	sw	s1, 0(sp)
 	li	a0, 1
@@ -1388,27 +1619,27 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	li	a2, 203
 	sw	a1, 4(s3)
-	beq	a0, a2, .LBB41_66
+	beq	a0, a2, .LBB48_66
 # %bb.64:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_66
+	bnez	a0, .LBB48_66
 # %bb.65:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_66:
+.LBB48_66:
 	li	a0, 10
 	li	a1, 20
 	li	a2, 30
-	sw	a0, 60(sp)
-	sw	a1, 64(sp)
-	sw	a2, 68(sp)
+	sw	a0, 56(sp)
+	sw	a1, 60(sp)
+	sw	a2, 64(sp)
 	lui	a0, 32
 	li	t0, -5
 	addi	a0, a0, 1
 	li	t1, 97
 	sw	a0, 16(sp)
 	sw	s2, 20(sp)
-	addi	a0, sp, 60
+	addi	a0, sp, 56
 	sw	s1, 0(sp)
 	sw	a0, 4(sp)
 	li	a0, 1
@@ -1426,19 +1657,19 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a2, a1, 1
 	li	a3, 261
 	sw	a2, 4(s3)
-	beq	a0, a3, .LBB41_69
+	beq	a0, a3, .LBB48_69
 # %bb.67:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_69
+	bnez	a0, .LBB48_69
 # %bb.68:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a2, %lo(.L_MergedGlobals)(a0)
-.LBB41_69:
+.LBB48_69:
 	addi	a1, a1, 2
 	sw	a1, 4(s3)
 	li	t0, 9
 	li	t1, 8
-	addi	a0, sp, 60
+	addi	a0, sp, 56
 	li	a1, 1
 	li	a2, 2
 	li	a3, 3
@@ -1449,9 +1680,9 @@ c_calls_merlin:                         # @c_calls_merlin
 	sw	t1, 0(sp)
 	sw	t0, 4(sp)
 	call	m_stack_ret
-	lw	a0, 60(sp)
-	lw	a1, 64(sp)
-	lw	a2, 68(sp)
+	lw	a0, 56(sp)
+	lw	a1, 60(sp)
+	lw	a2, 64(sp)
 	lw	a3, 4(s3)
 	xori	a0, a0, 6
 	xori	a1, a1, 15
@@ -1460,14 +1691,14 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a1, a0, a1
 	addi	a0, a3, 1
 	sw	a0, 4(s3)
-	beqz	a1, .LBB41_72
+	beqz	a1, .LBB48_72
 # %bb.70:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_72
+	bnez	a1, .LBB48_72
 # %bb.71:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_72:
+.LBB48_72:
 	lui	a4, %hi(.L.str.2)
 	addi	a4, a4, %lo(.L.str.2)
 	li	a0, -5
@@ -1480,41 +1711,41 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	addi	a2, a2, 1
 	sw	a1, 4(s3)
-	beq	a0, a2, .LBB41_75
+	beq	a0, a2, .LBB48_75
 # %bb.73:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_75
+	bnez	a0, .LBB48_75
 # %bb.74:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_75:
+.LBB48_75:
 	li	a0, -1
 	call	m_umax
-	beqz	a0, .LBB41_77
+	beqz	a0, .LBB48_77
 # %bb.76:
 	lui	a0, 524288
 	addi	a0, a0, -1
 	call	m_umax
 	seqz	a1, a0
-	j	.LBB41_78
-.LBB41_77:
+	j	.LBB48_78
+.LBB48_77:
 	li	a1, 0
-.LBB41_78:
+.LBB48_78:
 	lw	a0, 4(s3)
 	addi	a0, a0, 1
 	sw	a0, 4(s3)
-	bnez	a1, .LBB41_81
+	bnez	a1, .LBB48_81
 # %bb.79:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_81
+	bnez	a1, .LBB48_81
 # %bb.80:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_81:
+.LBB48_81:
 	li	a0, -5
 	li	s0, -5
 	call	m_sext
-	bne	a0, s0, .LBB41_83
+	bne	a0, s0, .LBB48_83
 # %bb.82:
 	lui	s0, 524288
 	addi	s0, s0, -1
@@ -1522,44 +1753,44 @@ c_calls_merlin:                         # @c_calls_merlin
 	call	m_sext
 	xor	a0, a0, s0
 	seqz	a1, a0
-	j	.LBB41_84
-.LBB41_83:
+	j	.LBB48_84
+.LBB48_83:
 	li	a1, 0
-.LBB41_84:
+.LBB48_84:
 	lw	a0, 4(s3)
 	addi	a0, a0, 1
 	sw	a0, 4(s3)
-	bnez	a1, .LBB41_87
+	bnez	a1, .LBB48_87
 # %bb.85:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_87
+	bnez	a1, .LBB48_87
 # %bb.86:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_87:
+.LBB48_87:
 	li	a0, -1
 	li	s0, -1
 	call	m_zext
-	beq	a0, s0, .LBB41_89
+	beq	a0, s0, .LBB48_89
 # %bb.88:
 	li	a1, 0
-	j	.LBB41_90
-.LBB41_89:
+	j	.LBB48_90
+.LBB48_89:
 	lui	a0, 524288
 	call	m_zext
 	snez	a1, a0
-.LBB41_90:
+.LBB48_90:
 	lw	a0, 4(s3)
 	addi	a0, a0, 1
 	sw	a0, 4(s3)
-	bnez	a1, .LBB41_93
+	bnez	a1, .LBB48_93
 # %bb.91:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_93
+	bnez	a1, .LBB48_93
 # %bb.92:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_93:
+.LBB48_93:
 	lui	s1, 524288
 	addi	s0, s1, 5
 	mv	a0, s0
@@ -1567,36 +1798,36 @@ c_calls_merlin:                         # @c_calls_merlin
 	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	sw	a1, 4(s3)
-	beq	a0, s0, .LBB41_96
+	beq	a0, s0, .LBB48_96
 # %bb.94:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_96
+	bnez	a0, .LBB48_96
 # %bb.95:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_96:
+.LBB48_96:
 	lui	a0, 524288
 	call	m_unarrow
-	bne	a0, s1, .LBB41_98
+	bne	a0, s1, .LBB48_98
 # %bb.97:
 	lui	a0, 524288
 	call	m_unarrow
 	snez	a1, a0
-	j	.LBB41_99
-.LBB41_98:
+	j	.LBB48_99
+.LBB48_98:
 	li	a1, 0
-.LBB41_99:
+.LBB48_99:
 	lw	a0, 4(s3)
 	addi	a0, a0, 1
 	sw	a0, 4(s3)
-	bnez	a1, .LBB41_102
+	bnez	a1, .LBB48_102
 # %bb.100:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_102
+	bnez	a1, .LBB48_102
 # %bb.101:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_102:
+.LBB48_102:
 	lui	a0, 65536
 	lui	s0, 65536
 	call	m_incl1
@@ -1604,14 +1835,14 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	addi	a2, s0, 1
 	sw	a1, 4(s3)
-	beq	a0, a2, .LBB41_105
+	beq	a0, a2, .LBB48_105
 # %bb.103:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_105
+	bnez	a0, .LBB48_105
 # %bb.104:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_105:
+.LBB48_105:
 	lui	a0, 65536
 	li	a1, -7
 	call	m_swapl2
@@ -1621,14 +1852,14 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a1, a0, a1
 	addi	a0, a2, 1
 	sw	a0, 4(s3)
-	beqz	a1, .LBB41_108
+	beqz	a1, .LBB48_108
 # %bb.106:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_108
+	bnez	a1, .LBB48_108
 # %bb.107:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_108:
+.LBB48_108:
 	lui	a0, 65536
 	li	a1, -3
 	lui	s0, 65536
@@ -1640,14 +1871,14 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a1, a0, a1
 	addi	a0, a2, 1
 	sw	a0, 4(s3)
-	beqz	a1, .LBB41_111
+	beqz	a1, .LBB48_111
 # %bb.109:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_111
+	bnez	a1, .LBB48_111
 # %bb.110:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_111:
+.LBB48_111:
 	li	a0, 97
 	lui	a1, 65536
 	lui	s0, 65536
@@ -1660,29 +1891,29 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a3, a3, a1
 	addi	a1, a2, 1
 	sw	a1, 4(s3)
-	beqz	a3, .LBB41_114
+	beqz	a3, .LBB48_114
 # %bb.112:
 	lw	a2, 0(s3)
-	bnez	a2, .LBB41_114
+	bnez	a2, .LBB48_114
 # %bb.113:
 	lui	a2, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a2)
-.LBB41_114:
+.LBB48_114:
 	li	a1, 2
-	sw	s0, 48(sp)
-	sw	a1, 52(sp)
-	sw	a0, 56(sp)
-	sw	s0, 36(sp)
-	sw	a1, 40(sp)
-	sw	a0, 44(sp)
-	addi	a0, sp, 60
-	addi	a1, sp, 48
-	addi	a2, sp, 36
-	addi	s4, sp, 60
+	sw	s0, 44(sp)
+	sw	a1, 48(sp)
+	sw	a0, 52(sp)
+	sw	s0, 32(sp)
+	sw	a1, 36(sp)
+	sw	a0, 40(sp)
+	addi	a0, sp, 56
+	addi	a1, sp, 44
+	addi	a2, sp, 32
+	addi	s4, sp, 56
 	call	m_addl3
-	lw	s0, 60(sp)
-	lw	s1, 64(sp)
-	lw	s2, 68(sp)
+	lw	s0, 56(sp)
+	lw	s1, 60(sp)
+	lw	s2, 64(sp)
 	lui	a0, 131072
 	lw	a1, 4(s3)
 	xor	a0, s0, a0
@@ -1693,17 +1924,17 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a2, a0, a2
 	addi	a0, a1, 1
 	sw	a0, 4(s3)
-	beqz	a2, .LBB41_117
+	beqz	a2, .LBB48_117
 # %bb.115:
 	lw	a1, 0(s3)
-	bnez	a1, .LBB41_117
+	bnez	a1, .LBB48_117
 # %bb.116:
 	lui	a1, %hi(.L_MergedGlobals)
 	sw	a0, %lo(.L_MergedGlobals)(a1)
-.LBB41_117:
-	sw	s0, 60(sp)
-	sw	s1, 64(sp)
-	sw	s2, 68(sp)
+.LBB48_117:
+	sw	s0, 56(sp)
+	sw	s1, 60(sp)
+	sw	s2, 64(sp)
 	li	a0, 5
 	li	a1, 6
 	sw	a0, 0(sp)
@@ -1727,17 +1958,17 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	addi	s4, a2, 214
 	sw	a1, 4(s3)
-	beq	a0, s4, .LBB41_120
+	beq	a0, s4, .LBB48_120
 # %bb.118:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_120
+	bnez	a0, .LBB48_120
 # %bb.119:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_120:
-	sw	s0, 60(sp)
-	sw	s1, 64(sp)
-	sw	s2, 68(sp)
+.LBB48_120:
+	sw	s0, 56(sp)
+	sw	s1, 60(sp)
+	sw	s2, 64(sp)
 	sw	s6, 0(sp)
 	sw	s5, 4(sp)
 	sw	s5, 8(sp)
@@ -1745,7 +1976,7 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a0, a0, %lo(.L.str.5)
 	lui	a6, %hi(.L.str.4)
 	addi	a6, a6, %lo(.L.str.4)
-	addi	a1, sp, 60
+	addi	a1, sp, 56
 	li	a2, 5
 	li	a3, 6
 	li	a4, 3
@@ -1757,14 +1988,14 @@ c_calls_merlin:                         # @c_calls_merlin
 	lw	a1, 4(s3)
 	addi	a1, a1, 1
 	sw	a1, 4(s3)
-	beq	a0, s4, .LBB41_123
+	beq	a0, s4, .LBB48_123
 # %bb.121:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_123
+	bnez	a0, .LBB48_123
 # %bb.122:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_123:
+.LBB48_123:
 	lui	t0, 65536
 	li	t1, -1
 	li	a0, 1
@@ -1785,14 +2016,224 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	addi	a2, a2, 311
 	sw	a1, 4(s3)
-	beq	a0, a2, .LBB41_126
+	beq	a0, a2, .LBB48_126
 # %bb.124:
 	lw	a0, 0(s3)
-	bnez	a0, .LBB41_126
+	bnez	a0, .LBB48_126
 # %bb.125:
 	lui	a0, %hi(.L_MergedGlobals)
 	sw	a1, %lo(.L_MergedGlobals)(a0)
-.LBB41_126:
+.LBB48_126:
+	li	a1, 1
+	li	a2, -1
+	li	a4, 1
+	li	a0, 0
+	li	a3, 0
+	call	m_qadd
+	xori	a1, a1, 1
+	not	a0, a0
+	or	a0, a0, a1
+	li	a1, 0
+	bnez	a0, .LBB48_128
+# %bb.127:
+	li	a0, -1
+	li	a1, -1
+	li	a2, -1
+	li	a3, -1
+	li	a4, -1
+	call	m_qadd
+	not	a1, a1
+	xori	a0, a0, -3
+	or	a0, a0, a1
+	seqz	a1, a0
+.LBB48_128:
+	lw	a0, 4(s3)
+	addi	a0, a0, 1
+	sw	a0, 4(s3)
+	bnez	a1, .LBB48_131
+# %bb.129:
+	lw	a1, 0(s3)
+	bnez	a1, .LBB48_131
+# %bb.130:
+	lui	a1, %hi(.L_MergedGlobals)
+	sw	a0, %lo(.L_MergedGlobals)(a1)
+.LBB48_131:
+	lui	a0, 144470
+	lui	a1, 703711
+	addi	a0, a0, 1929
+	addi	s0, a1, -255
+	mv	a1, s0
+	call	m_qhigh
+	lw	a2, 4(s3)
+	xor	a0, a0, s0
+	or	a1, a0, a1
+	addi	a0, a2, 1
+	sw	a0, 4(s3)
+	beqz	a1, .LBB48_134
+# %bb.132:
+	lw	a1, 0(s3)
+	bnez	a1, .LBB48_134
+# %bb.133:
+	lui	a1, %hi(.L_MergedGlobals)
+	sw	a0, %lo(.L_MergedGlobals)(a1)
+.LBB48_134:
+	li	a7, 0
+	li	t0, 1
+	sw	zero, 24(sp)
+	sw	t0, 28(sp)
+	li	t1, 9
+	li	t2, -1
+	li	a0, 1
+	li	a1, 2
+	li	a2, 3
+	li	a3, 4
+	li	a4, 5
+	li	a5, 6
+	li	a6, 7
+	sw	t0, 0(sp)
+	sw	zero, 8(sp)
+	sw	t2, 12(sp)
+	sw	t1, 16(sp)
+	call	m_qlate
+	lw	a2, 4(s3)
+	xori	a1, a1, 4
+	xori	a0, a0, 37
+	or	a1, a0, a1
+	addi	a0, a2, 1
+	sw	a0, 4(s3)
+	beqz	a1, .LBB48_137
+# %bb.135:
+	lw	a1, 0(s3)
+	bnez	a1, .LBB48_137
+# %bb.136:
+	lui	a1, %hi(.L_MergedGlobals)
+	sw	a0, %lo(.L_MergedGlobals)(a1)
+.LBB48_137:
+	lui	s0, 172127
+	addi	s0, s0, 512
+	li	a1, 1
+	mv	a0, s0
+	call	m_qtwice
+	lw	a2, 4(s3)
+	lui	a3, 344254
+	addi	a3, a3, 1024
+	xor	a0, a0, a3
+	xori	a1, a1, 2
+	or	a1, a0, a1
+	addi	a0, a2, 1
+	sw	a0, 4(s3)
+	beqz	a1, .LBB48_140
+# %bb.138:
+	lw	a1, 0(s3)
+	bnez	a1, .LBB48_140
+# %bb.139:
+	lui	a1, %hi(.L_MergedGlobals)
+	sw	a0, %lo(.L_MergedGlobals)(a1)
+.LBB48_140:
+	li	a0, 7
+	li	s1, -1
+	lui	a1, 316154
+	addi	a1, a1, 512
+	sw	a0, 56(sp)
+	sw	a1, 64(sp)
+	sw	s1, 68(sp)
+	addi	a0, sp, 56
+	li	a2, 1
+	mv	a1, s0
+	call	m_qsum
+	lw	a2, 4(s3)
+	lui	a3, 488281
+	addi	a3, a3, 1031
+	xor	a0, a0, a3
+	or	a1, a0, a1
+	addi	a0, a2, 1
+	sw	a0, 4(s3)
+	beqz	a1, .LBB48_143
+# %bb.141:
+	lw	a1, 0(s3)
+	bnez	a1, .LBB48_143
+# %bb.142:
+	lui	a1, %hi(.L_MergedGlobals)
+	sw	a0, %lo(.L_MergedGlobals)(a1)
+.LBB48_143:
+	li	a2, 0
+	sw	zero, 0(sp)
+	lui	s2, 172127
+	lui	a0, %hi(.L.str.6)
+	addi	a0, a0, %lo(.L.str.6)
+	addi	a6, s2, 512
+	li	a1, 1
+	li	a3, 1
+	li	a4, 2
+	li	a7, 1
+	sw	s1, 4(sp)
+	li	s0, 1
+	call	m_vq
+	lw	a2, 4(s3)
+	addi	a3, s2, 515
+	xor	a0, a0, a3
+	xori	a1, a1, 1
+	or	a1, a0, a1
+	addi	a0, a2, 1
+	sw	a0, 4(s3)
+	beqz	a1, .LBB48_146
+# %bb.144:
+	lw	a1, 0(s3)
+	bnez	a1, .LBB48_146
+# %bb.145:
+	lui	a1, %hi(.L_MergedGlobals)
+	sw	a0, %lo(.L_MergedGlobals)(a1)
+.LBB48_146:
+	lui	a0, %hi(.L.str.7)
+	addi	a0, a0, %lo(.L.str.7)
+	li	a1, 1
+	li	a2, 2
+	li	a3, 3
+	li	a4, 4
+	li	a5, 5
+	li	a6, 6
+	sw	zero, 0(sp)
+	sw	s0, 4(sp)
+	call	m_vq
+	lw	a2, 4(s3)
+	xori	a1, a1, 1
+	xori	a0, a0, 21
+	or	a1, a0, a1
+	addi	a0, a2, 1
+	sw	a0, 4(s3)
+	beqz	a1, .LBB48_149
+# %bb.147:
+	lw	a1, 0(s3)
+	bnez	a1, .LBB48_149
+# %bb.148:
+	lui	a1, %hi(.L_MergedGlobals)
+	sw	a0, %lo(.L_MergedGlobals)(a1)
+.LBB48_149:
+	li	a7, 1
+	li	a0, 1
+	li	a1, 2
+	li	a2, 3
+	li	a3, 4
+	li	a4, 5
+	li	a5, 6
+	li	a6, 7
+	sw	zero, 0(sp)
+	sw	a7, 4(sp)
+	call	m_vqlate
+	lw	a2, 4(s3)
+	xori	a1, a1, 1
+	xori	a0, a0, 28
+	or	a1, a0, a1
+	addi	a0, a2, 1
+	sw	a0, 4(s3)
+	beqz	a1, .LBB48_152
+# %bb.150:
+	lw	a1, 0(s3)
+	bnez	a1, .LBB48_152
+# %bb.151:
+	lui	a1, %hi(.L_MergedGlobals)
+	sw	a0, %lo(.L_MergedGlobals)(a1)
+.LBB48_152:
 	lui	a0, %hi(.L_MergedGlobals)
 	lw	a0, %lo(.L_MergedGlobals)(a0)
 	lw	ra, 172(sp)                     # 4-byte Folded Reload
@@ -1807,8 +2248,8 @@ c_calls_merlin:                         # @c_calls_merlin
 	lw	s8, 136(sp)                     # 4-byte Folded Reload
 	addi	sp, sp, 176
 	ret
-.Lfunc_end41:
-	.size	c_calls_merlin, .Lfunc_end41-c_calls_merlin
+.Lfunc_end48:
+	.size	c_calls_merlin, .Lfunc_end48-c_calls_merlin
                                         # -- End function
 	.type	.L.str,@object                  # @.str
 	.section	.rodata.str1.1,"aMS",@progbits,1
@@ -1840,6 +2281,16 @@ c_calls_merlin:                         # @c_calls_merlin
 .L.str.5:
 	.asciz	"TtqpLlui"
 	.size	.L.str.5, 9
+
+	.type	.L.str.6,@object                # @.str.6
+.L.str.6:
+	.asciz	"iqisq"
+	.size	.L.str.6, 6
+
+	.type	.L.str.7,@object                # @.str.7
+.L.str.7:
+	.asciz	"iiiiiiq"
+	.size	.L.str.7, 8
 
 	.type	.L_MergedGlobals,@object        # @_MergedGlobals
 	.local	.L_MergedGlobals

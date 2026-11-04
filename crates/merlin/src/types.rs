@@ -1,7 +1,8 @@
 //! C types as merlin knows them, with their sizes for the target: RISC-V's
 //! `ilp32` on RV32 and `lp64` on RV64 ([`Xlen`] says which). `char` is 1
-//! byte, `short` 2 and `int` 4 on both; `long` and pointers are 4 bytes on
-//! RV32 and 8 on RV64, each aligned to its size. Plain `char` is unsigned,
+//! byte, `short` 2, `int` 4 and `long long` 8 on both; `long` and pointers
+//! are 4 bytes on RV32 and 8 on RV64, each aligned to its size (so a `long
+//! long` is 8-aligned on RV32 too, as the psABI says). Plain `char` is unsigned,
 //! as on every RISC-V target, so `(char)200` stays 200 and `char` loads use
 //! `lbu`.
 //!
@@ -39,7 +40,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
-/// The integer types. `long long` is not supported yet.
+/// The integer types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IntKind {
     /// `_Bool`: 1 byte holding 0 or 1. Converting anything to it gives
@@ -55,6 +56,10 @@ pub enum IntKind {
     UInt,
     Long,
     ULong,
+    /// `long long`: 64 bits on both widths, as C99 requires (on RV32 a
+    /// register pair, see [`crate::codegen`]).
+    LongLong,
+    ULongLong,
 }
 
 /// The size of a pointer, and of `long`, on the target: 4 bytes on RV32
@@ -70,12 +75,13 @@ impl IntKind {
             IntKind::Short | IntKind::UShort => 2,
             IntKind::Int | IntKind::UInt => 4,
             IntKind::Long | IntKind::ULong => ptr_size(x),
+            IntKind::LongLong | IntKind::ULongLong => 8,
         }
     }
 
     /// C's integer conversion rank (C99 6.3.1.1): `_Bool` lowest, then
-    /// `char`, `short`, `int` and `long`, each type with its unsigned
-    /// counterpart.
+    /// `char`, `short`, `int`, `long` and `long long`, each type with its
+    /// unsigned counterpart.
     fn rank(self) -> u32 {
         match self {
             IntKind::Bool => 0,
@@ -83,6 +89,7 @@ impl IntKind {
             IntKind::Short | IntKind::UShort => 2,
             IntKind::Int | IntKind::UInt => 3,
             IntKind::Long | IntKind::ULong => 4,
+            IntKind::LongLong | IntKind::ULongLong => 5,
         }
     }
 
@@ -109,6 +116,7 @@ impl IntKind {
         match self {
             IntKind::Int => IntKind::UInt,
             IntKind::Long => IntKind::ULong,
+            IntKind::LongLong => IntKind::ULongLong,
             k => k,
         }
     }
@@ -116,7 +124,7 @@ impl IntKind {
     pub fn signed(self) -> bool {
         matches!(
             self,
-            IntKind::SChar | IntKind::Short | IntKind::Int | IntKind::Long
+            IntKind::SChar | IntKind::Short | IntKind::Int | IntKind::Long | IntKind::LongLong
         )
     }
 
@@ -132,6 +140,8 @@ impl IntKind {
             IntKind::UInt => "unsigned int",
             IntKind::Long => "long",
             IntKind::ULong => "unsigned long",
+            IntKind::LongLong => "long long",
+            IntKind::ULongLong => "unsigned long long",
         }
     }
 
@@ -761,6 +771,32 @@ mod tests {
         assert!(!Type::Int(UChar).is_unsigned(), "promotes to int");
         assert!(Type::UINT.is_unsigned());
         assert!(Type::ptr(Type::INT).is_unsigned());
+    }
+
+    #[test]
+    fn long_long_is_64_bits_on_both_widths() {
+        for x in [R32, Xlen::Rv64] {
+            assert_eq!(Type::Int(LongLong).size(x), Some(8));
+            assert_eq!(Type::Int(ULongLong).align(x), 8);
+            assert_eq!(ULongLong.range(x), (0, u64::MAX.into()));
+            assert_eq!(LongLong.wrap(1 << 63, x), i64::MIN.into());
+            assert_eq!(common(ULongLong, Int, x), ULongLong);
+        }
+        // On ILP32 a long long holds every unsigned long; on LP64 it does not.
+        assert_eq!(common(LongLong, ULong, R32), LongLong);
+        assert_eq!(common(LongLong, ULong, Xlen::Rv64), ULongLong);
+        assert_eq!(common(LongLong, UInt, R32), LongLong);
+        assert_eq!(common(LongLong, Long, Xlen::Rv64), LongLong);
+        // 8-aligned on RV32 too: { int; long long } is 16 bytes.
+        let r = Record::new(false, Some("s".into()), Pos::default());
+        assert!(r.complete(
+            vec![("i".into(), Type::INT), ("ll".into(), Type::Int(LongLong))],
+            R32
+        ));
+        let s = Type::Record(r);
+        assert_eq!(offsets(&s), [0, 8]);
+        assert_eq!((s.size(R32), s.align(R32)), (Some(16), 8));
+        assert_eq!(Type::Int(ULongLong).to_string(), "unsigned long long");
     }
 
     #[test]

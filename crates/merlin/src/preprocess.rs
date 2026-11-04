@@ -129,6 +129,7 @@ pub fn predefined(x: Xlen) -> Vec<(&'static str, &'static str)> {
         ("__CHAR_UNSIGNED__", "1"),
         ("__SIZEOF_INT__", "4"),
         ("__SIZEOF_LONG__", long),
+        ("__SIZEOF_LONG_LONG__", "8"),
         ("__SIZEOF_POINTER__", pointer),
     ]);
     macros

@@ -368,19 +368,27 @@ impl<'a> Interp<'a> {
             self.put(frame[i], &f.locals[i].ty, *v)?;
         }
         if f.variadic {
-            let extra = &args[named..];
+            // The words of all the arguments, as the calling convention
+            // numbers them (an aligned pair at an even word), from an area
+            // aligned to two words; va_start points at the first word the
+            // named ones leave.
             let x = self.x;
-            let words: usize = extra.iter().map(|(_, t)| abi::classify(t, x).registers()).sum();
+            let types: Vec<Type> = args.iter().map(|(_, t)| t.clone()).collect();
+            let (places, total) = abi::call_arguments(&f.ret, &types, named, x);
+            let (_, first) = abi::call_arguments(&f.ret, &types[..named], named, x);
             // A word is a register: a `long` on either width.
             let word = Type::Int(IntKind::Long);
-            // At least a word, so that the area has an address of its own.
-            let area_ty = Type::array(word.clone(), Some(words.max(1) as u32));
-            let mut at = self.alloc_frame(&area_ty);
-            frame.push(at);
-            for (v, t) in extra {
-                let pass = abi::classify(t, x);
+            let w = ptr_size(x);
+            // Two words more, so that the area is aligned and has an address
+            // of its own.
+            let area_ty = Type::array(word.clone(), Some(total as u32 + 2));
+            let base = self.alloc_frame(&area_ty).next_multiple_of(2 * w);
+            frame.push(base + w * first as u32);
+            for ((v, t), &(n, pass)) in args.iter().zip(&places).skip(named) {
+                let at = base + w * n as u32;
                 match pass {
                     Pass::Scalar => self.store(at, &word, *v)?,
+                    Pass::Pair => self.store(at, t, *v)?,
                     Pass::Words(_) => self.copy(at, address(*v), t)?,
                     Pass::Ref => {
                         let copy = self.alloc_frame(t);
@@ -388,7 +396,6 @@ impl<'a> Interp<'a> {
                         self.store(at, &word, copy.into())?;
                     }
                 }
-                at += ptr_size(x) * pass.registers() as u32;
             }
         }
         self.depth += 1;
@@ -759,13 +766,18 @@ impl<'a> Interp<'a> {
             }
             ExprKind::VaArg(ap) => {
                 let a = self.addr(ap, frame)?;
-                let at = self.load(a, &ap.ty)?;
+                let mut at = self.load(a, &ap.ty)?;
                 let pass = abi::classify(&e.ty, x);
+                // An aligned pair is at the next even word.
+                if abi::aligned_pair(&e.ty, pass, x) {
+                    let align = Val::from(2 * ptr_size(x));
+                    at = (at + align - 1) / align * align;
+                }
                 let words = ptr_size(x) * pass.registers() as u32;
                 self.store(a, &ap.ty, at + Val::from(words))?;
                 match pass {
                     // A narrower scalar is in the low bytes of its word.
-                    Pass::Scalar => self.load(address(at), &e.ty)?,
+                    Pass::Scalar | Pass::Pair => self.load(address(at), &e.ty)?,
                     // The struct's bytes are right there.
                     Pass::Words(_) => at,
                     Pass::Ref => self.load(address(at), &Type::ptr(Type::Void))?,

@@ -269,7 +269,7 @@ fn reference_interpreter_semantics() {
     assert_eq!(eval("return 7 % id(0);"), 7);
     assert_eq!(eval("return 0x7fffffff + 1;"), i32::MIN);
     // 0xffffffff is an `unsigned int`; a decimal literal that big would be
-    // `long long`, which merlin rejects.
+    // `long long`.
     assert_eq!(eval("return 0xffffffff;"), -1);
     assert_eq!(
         eval("return 0xffffffff / 2 == 0x7fffffff;"),
@@ -294,7 +294,8 @@ fn reference_interpreter_semantics() {
         eval("int a[3] = {1, 2}; int *p = a + 2; return p - a + *(p - 1) * 10 + a[2];"),
         22
     );
-    assert!(merlin::parse("int main() { return 2147483648; }").is_err());
+    assert_eq!(eval("return 2147483648 > 0;"), 1, "a long long");
+    assert_eq!(eval("return (int)(2147483648 - 1);"), i32::MAX);
     assert_eq!(eval("return 3 == 3;"), 1);
     assert_eq!(eval("return !7 || 5 && 9;"), 1);
     assert_eq!(eval("int x = 1; x = 5;"), 0, "falling off the end returns 0");
@@ -483,12 +484,21 @@ impl Backend {
     }
 }
 
-/// Builds C programs with crt0 into executables for one width, and runs
-/// them in Grail. crt0.s is the same source for both widths.
+/// The C library's 64-bit division routines (`__divdi3` and the others
+/// code for RV32 calls), which every program is linked with:
+/// `kernel/user/lib/libgcc.c`.
+fn libgcc_c() -> PathBuf {
+    tests_dir().join("../../../kernel/user/lib/libgcc.c")
+}
+
+/// Builds C programs with crt0 and the division routines ([`libgcc_c`],
+/// compiled by merlin) into executables for one width, and runs them in
+/// Grail. crt0.s is the same source for both widths.
 struct Pipeline {
     backend: Backend,
     scratch: Scratch,
-    crt0: PathBuf,
+    /// crt0 and the division routines, assembled.
+    crt0: Vec<PathBuf>,
     xlen: Xlen,
 }
 
@@ -499,10 +509,15 @@ impl Pipeline {
         let crt0 = backend
             .assemble(&backend.crt0(), &scratch.path("crt0.o"), x)
             .expect("assembling crt0.s");
+        let src = std::fs::read_to_string(libgcc_c()).unwrap();
+        let asm = compile(&src, x).unwrap_or_else(|e| panic!("libgcc.c: {e:?}"));
+        let libgcc = backend
+            .assemble(&asm, &scratch.path("libgcc.o"), x)
+            .expect("assembling libgcc.c");
         Pipeline {
             backend,
             scratch,
-            crt0,
+            crt0: vec![crt0, libgcc],
             xlen: x,
         }
     }
@@ -513,7 +528,9 @@ impl Pipeline {
             .backend
             .assemble(asm, &self.scratch.path(&format!("{name}.o")), self.xlen)?;
         let elf = self.scratch.path(&format!("{name}.elf"));
-        self.backend.link(&[self.crt0.clone(), obj], &elf)
+        let mut objs = self.crt0.clone();
+        objs.push(obj);
+        self.backend.link(&objs, &elf)
     }
 
     /// Compiles `src`, builds it and returns its exit code.
@@ -780,7 +797,7 @@ fn multi_file_programs(x: Xlen) {
             include_dirs: case.include.iter().cloned().collect(),
             ..options(x)
         };
-        let mut objs = vec![pipeline.crt0.clone()];
+        let mut objs = pipeline.crt0.clone();
         for c in &case.c_files {
             let asm = merlin::compile_file(c, &opts).unwrap_or_else(|errs| {
                 let msgs: Vec<String> = errs.iter().map(|e| e.render(&c.to_string_lossy())).collect();
@@ -819,21 +836,31 @@ fn multi_file_clang_reference() {
     }
 }
 
-/// crt0.s assembled by clang for `x`, in `scratch`.
-fn clang_crt0(scratch: &Scratch, x: Xlen) -> PathBuf {
+/// crt0.s assembled by clang for `x`, in `scratch`, and the division
+/// routines ([`libgcc_c`]) compiled by clang.
+fn clang_crt0(scratch: &Scratch, x: Xlen) -> Vec<PathBuf> {
     let crt0_s = scratch.path("crt0.s");
     let crt0 = std::fs::read_to_string(tests_dir().join("crt0.s")).unwrap();
     std::fs::write(&crt0_s, crt0_for_llvm(&crt0)).unwrap();
     let crt0_o = scratch.path("crt0.o");
     tool(clang(x).arg(&crt0_s).arg("-o").arg(&crt0_o)).expect("assembling crt0.s with clang");
-    crt0_o
+    let libgcc_o = scratch.path("libgcc.o");
+    tool(
+        clang(x)
+            .args(["-std=c99", "-O1", "-ffreestanding", "-fno-builtin"])
+            .arg(libgcc_c())
+            .arg("-o")
+            .arg(&libgcc_o),
+    )
+    .expect("compiling libgcc.c with clang");
+    vec![crt0_o, libgcc_o]
 }
 
 fn multi_file_clang(x: Xlen) {
     let scratch = Scratch::new(&format!("multi-clang-{}", width(x)));
     let crt0_o = clang_crt0(&scratch, x);
     for case in multi_cases() {
-        let mut objs = vec![crt0_o.clone()];
+        let mut objs = crt0_o.clone();
         for f in case.c_files.iter().chain(case.s_files_for(x)) {
             let stem = f.file_stem().unwrap().to_string_lossy();
             let ext = f.extension().unwrap().to_string_lossy();
@@ -1038,7 +1065,9 @@ fn clang_reference_for(x: Xlen) {
                 .arg("-o")
                 .arg(&obj),
         )?;
-        let elf = ld_lld(&[crt0_o.clone(), obj], &scratch.path(&format!("{}.elf", c.name)))?;
+        let mut objs = crt0_o.clone();
+        objs.push(obj);
+        let elf = ld_lld(&objs, &scratch.path(&format!("{}.elf", c.name)))?;
         run_in_grail(&elf)
     });
 }

@@ -988,12 +988,150 @@ c_stackw:                               # @c_stackw
 .Lfunc_end40:
 	.size	c_stackw, .Lfunc_end40-c_stackw
                                         # -- End function
+	.globl	c_qadd                          # -- Begin function c_qadd
+	.p2align	2
+	.type	c_qadd,@function
+c_qadd:                                 # @c_qadd
+# %bb.0:
+	add	a0, a0, a1
+	add	a0, a0, a2
+	ret
+.Lfunc_end41:
+	.size	c_qadd, .Lfunc_end41-c_qadd
+                                        # -- End function
+	.globl	c_qhigh                         # -- Begin function c_qhigh
+	.p2align	2
+	.type	c_qhigh,@function
+c_qhigh:                                # @c_qhigh
+# %bb.0:
+	srli	a0, a0, 32
+	ret
+.Lfunc_end42:
+	.size	c_qhigh, .Lfunc_end42-c_qhigh
+                                        # -- End function
+	.globl	c_qlate                         # -- Begin function c_qlate
+	.p2align	2
+	.type	c_qlate,@function
+c_qlate:                                # @c_qlate
+# %bb.0:
+	ld	t0, 16(sp)
+	ld	t1, 8(sp)
+	ld	t2, 0(sp)
+	add	a0, a1, a0
+	add	a2, a2, a3
+	add	a4, a4, a5
+	add	a0, a0, a2
+	add	a4, a4, a6
+	addw	a0, a0, a4
+	slli	a7, a7, 1
+	slli	a1, t2, 1
+	add	a0, a7, a0
+	add	a1, a1, t2
+	add	a0, a0, t1
+	slli	a2, t0, 2
+	add	a0, a0, a1
+	add	a2, a2, t0
+	add	a0, a0, a2
+	ret
+.Lfunc_end43:
+	.size	c_qlate, .Lfunc_end43-c_qlate
+                                        # -- End function
+	.globl	c_qtwice                        # -- Begin function c_qtwice
+	.p2align	2
+	.type	c_qtwice,@function
+c_qtwice:                               # @c_qtwice
+# %bb.0:
+	slli	a0, a0, 1
+	ret
+.Lfunc_end44:
+	.size	c_qtwice, .Lfunc_end44-c_qtwice
+                                        # -- End function
+	.globl	c_qsum                          # -- Begin function c_qsum
+	.p2align	2
+	.type	c_qsum,@function
+c_qsum:                                 # @c_qsum
+# %bb.0:
+	add	a1, a2, a1
+	sext.w	a0, a0
+	add	a0, a1, a0
+	ret
+.Lfunc_end45:
+	.size	c_qsum, .Lfunc_end45-c_qsum
+                                        # -- End function
+	.globl	c_vq                            # -- Begin function c_vq
+	.p2align	2
+	.type	c_vq,@function
+c_vq:                                   # @c_vq
+# %bb.0:
+	addi	sp, sp, -80
+	mv	t0, a0
+	li	a0, 0
+	sd	a5, 56(sp)
+	sd	a6, 64(sp)
+	sd	a7, 72(sp)
+	addi	a5, sp, 24
+	sd	a1, 24(sp)
+	sd	a2, 32(sp)
+	sd	a3, 40(sp)
+	sd	a4, 48(sp)
+	sd	a5, 8(sp)
+	li	a1, 105
+	li	a2, 113
+	j	.LBB46_3
+.LBB46_1:                               #   in Loop: Header=BB46_3 Depth=1
+	addi	a4, a5, 8
+	sd	a4, 8(sp)
+	ld	a3, 0(a5)
+.LBB46_2:                               #   in Loop: Header=BB46_3 Depth=1
+	mv	a5, a4
+	add	a0, a3, a0
+	addi	t0, t0, 1
+.LBB46_3:                               # =>This Inner Loop Header: Depth=1
+	lbu	a3, 0(t0)
+	beq	a3, a1, .LBB46_6
+# %bb.4:                                #   in Loop: Header=BB46_3 Depth=1
+	beq	a3, a2, .LBB46_1
+# %bb.5:                                #   in Loop: Header=BB46_3 Depth=1
+	bnez	a3, .LBB46_1
+	j	.LBB46_7
+.LBB46_6:                               #   in Loop: Header=BB46_3 Depth=1
+	addi	a4, a5, 8
+	sd	a4, 8(sp)
+	lw	a3, 0(a5)
+	j	.LBB46_2
+.LBB46_7:
+	addi	sp, sp, 80
+	ret
+.Lfunc_end46:
+	.size	c_vq, .Lfunc_end46-c_vq
+                                        # -- End function
+	.globl	c_vqlate                        # -- Begin function c_vqlate
+	.p2align	2
+	.type	c_vqlate,@function
+c_vqlate:                               # @c_vqlate
+# %bb.0:
+	addi	sp, sp, -32
+	add	a0, a1, a0
+	add	a2, a2, a3
+	add	a4, a4, a5
+	add	a0, a0, a2
+	add	a4, a4, a6
+	add	a0, a0, a4
+	add	a0, a0, a7
+	sd	a7, 24(sp)
+	addi	sp, sp, 32
+	ret
+.Lfunc_end47:
+	.size	c_vqlate, .Lfunc_end47-c_vqlate
+                                        # -- End function
 	.section	.rodata.cst8,"aM",@progbits,8
 	.p2align	3, 0x0                          # -- Begin function c_calls_merlin
-.LCPI41_0:
+.LCPI48_0:
 	.quad	2305843009347911894             # 0x20000000080000d6
-.LCPI41_1:
+.LCPI48_1:
 	.quad	1152921504875282743             # 0x1000000010000137
+.LCPI48_2:
+	.quad	-6066930334832433271            # 0xabcdef0123456789
 	.text
 	.globl	c_calls_merlin
 	.p2align	2
@@ -1023,26 +1161,26 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	li	s0, 6
 	sw	a1, 4(s2)
-	beq	a0, s0, .LBB41_3
+	beq	a0, s0, .LBB48_3
 # %bb.1:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_3
+	bnez	a0, .LBB48_3
 # %bb.2:
 	sw	a1, 0(s2)
-.LBB41_3:
+.LBB48_3:
 	li	a0, 4
 	call	m_make12
 	lw	a0, 4(s2)
 	sext.w	a1, a1
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-	beq	a1, s0, .LBB41_6
+	beq	a1, s0, .LBB48_6
 # %bb.4:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_6
+	bnez	a1, .LBB48_6
 # %bb.5:
 	sw	a0, 0(s2)
-.LBB41_6:
+.LBB48_6:
 	li	a0, 7
 	slli	a0, a0, 32
 	addi	a0, a0, 5
@@ -1054,13 +1192,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a0, a0, 1
 	addi	a1, a1, 7
 	sw	a0, 4(s2)
-	beq	s0, a1, .LBB41_9
+	beq	s0, a1, .LBB48_9
 # %bb.7:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_9
+	bnez	a1, .LBB48_9
 # %bb.8:
 	sw	a0, 0(s2)
-.LBB41_9:
+.LBB48_9:
 	lui	a0, 328707
 	slli	a0, a0, 4
 	addi	a0, a0, 513
@@ -1075,13 +1213,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a0, a2, 1
 	addi	a3, a3, 5
 	sw	a0, 4(s2)
-	beq	a1, a3, .LBB41_12
+	beq	a1, a3, .LBB48_12
 # %bb.10:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_12
+	bnez	a1, .LBB48_12
 # %bb.11:
 	sw	a0, 0(s2)
-.LBB41_12:
+.LBB48_12:
 	li	a0, 1
 	li	a1, 2
 	li	a2, 3
@@ -1092,13 +1230,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	srli	a2, a0, 56
 	addi	a0, a1, 1
 	sw	a0, 4(s2)
-	beq	a2, s1, .LBB41_15
+	beq	a2, s1, .LBB48_15
 # %bb.13:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_15
+	bnez	a1, .LBB48_15
 # %bb.14:
 	sw	a0, 0(s2)
-.LBB41_15:
+.LBB48_15:
 	lui	a0, 98305
 	li	a1, 5
 	slli	a0, a0, 5
@@ -1115,13 +1253,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	li	a2, 107
 	sw	a1, 4(s2)
-	beq	a0, a2, .LBB41_18
+	beq	a0, a2, .LBB48_18
 # %bb.16:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_18
+	bnez	a0, .LBB48_18
 # %bb.17:
 	sw	a1, 0(s2)
-.LBB41_18:
+.LBB48_18:
 	addi	a0, sp, 88
 	li	a1, 3
 	call	m_big
@@ -1149,7 +1287,7 @@ c_calls_merlin:                         # @c_calls_merlin
 	sd	a3, 136(sp)
 	sd	a1, 144(sp)
 	sd	a2, 152(sp)
-	bne	s4, a0, .LBB41_20
+	bne	s4, a0, .LBB48_20
 # %bb.19:
 	ld	a1, 128(sp)
 	ld	a2, 136(sp)
@@ -1166,20 +1304,20 @@ c_calls_merlin:                         # @c_calls_merlin
 	call	m_sumbig
 	addi	a0, a0, -75
 	seqz	a1, a0
-	j	.LBB41_21
-.LBB41_20:
+	j	.LBB48_21
+.LBB48_20:
 	li	a1, 0
-.LBB41_21:
+.LBB48_21:
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-	bnez	a1, .LBB41_24
+	bnez	a1, .LBB48_24
 # %bb.22:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_24
+	bnez	a1, .LBB48_24
 # %bb.23:
 	sw	a0, 0(s2)
-.LBB41_24:
+.LBB48_24:
 	li	a0, 97
 	call	m_inc1
 	lw	a1, 4(s2)
@@ -1187,13 +1325,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a0, a1, 1
 	li	a1, 98
 	sw	a0, 4(s2)
-	beq	a2, a1, .LBB41_27
+	beq	a2, a1, .LBB48_27
 # %bb.25:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_27
+	bnez	a1, .LBB48_27
 # %bb.26:
 	sw	a0, 0(s2)
-.LBB41_27:
+.LBB48_27:
 	li	s3, -1
 	slli	s3, s3, 32
 	li	s1, 21
@@ -1207,26 +1345,26 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a0, a1, 1
 	addi	a1, s1, 121
 	sw	a0, 4(s2)
-	beq	a2, a1, .LBB41_30
+	beq	a2, a1, .LBB48_30
 # %bb.28:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_30
+	bnez	a1, .LBB48_30
 # %bb.29:
 	sw	a0, 0(s2)
-.LBB41_30:
+.LBB48_30:
 	li	a0, 41
 	call	m_union
 	lw	a1, 4(s2)
 	and	a2, a0, s3
 	addi	a0, a1, 1
 	sw	a0, 4(s2)
-	beq	a2, s1, .LBB41_33
+	beq	a2, s1, .LBB48_33
 # %bb.31:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_33
+	bnez	a1, .LBB48_33
 # %bb.32:
 	sw	a0, 0(s2)
-.LBB41_33:
+.LBB48_33:
 	li	a0, 5
 	slli	a0, a0, 34
 	addi	a0, a0, 10
@@ -1236,13 +1374,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	li	a2, 1020
 	sw	a1, 4(s2)
-	beq	a0, a2, .LBB41_36
+	beq	a0, a2, .LBB48_36
 # %bb.34:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_36
+	bnez	a0, .LBB48_36
 # %bb.35:
 	sw	a1, 0(s2)
-.LBB41_36:
+.LBB48_36:
 	lui	s5, 16
 	addi	a2, s5, -3
 	li	a0, -3
@@ -1254,39 +1392,39 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	addi	s5, s5, -8
 	sw	a1, 4(s2)
-	beq	a0, s5, .LBB41_39
+	beq	a0, s5, .LBB48_39
 # %bb.37:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_39
+	bnez	a0, .LBB48_39
 # %bb.38:
 	sw	a1, 0(s2)
-.LBB41_39:
+.LBB48_39:
 	lui	a0, 32
 	addi	a0, a0, -3
 	call	m_trunc_sc
 	lw	a1, 4(s2)
 	addi	a1, a1, 1
 	sw	a1, 4(s2)
-	beq	a0, s1, .LBB41_42
+	beq	a0, s1, .LBB48_42
 # %bb.40:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_42
+	bnez	a0, .LBB48_42
 # %bb.41:
 	sw	a1, 0(s2)
-.LBB41_42:
+.LBB48_42:
 	lui	a0, 24
 	call	m_trunc_s
 	lw	a1, 4(s2)
 	addi	a1, a1, 1
 	lui	a2, 1048568
 	sw	a1, 4(s2)
-	beq	a0, a2, .LBB41_45
+	beq	a0, a2, .LBB48_45
 # %bb.43:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_45
+	bnez	a0, .LBB48_45
 # %bb.44:
 	sw	a1, 0(s2)
-.LBB41_45:
+.LBB48_45:
 	lui	a0, 32
 	addi	a0, a0, -3
 	call	m_trunc_us
@@ -1295,37 +1433,37 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	addi	a2, a2, -3
 	sw	a1, 4(s2)
-	beq	a0, a2, .LBB41_48
+	beq	a0, a2, .LBB48_48
 # %bb.46:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_48
+	bnez	a0, .LBB48_48
 # %bb.47:
 	sw	a1, 0(s2)
-.LBB41_48:
+.LBB48_48:
 	li	a0, 256
 	call	m_tobool
 	lw	a1, 4(s2)
 	addi	a1, a1, 1
 	sw	a1, 4(s2)
-	bnez	a0, .LBB41_51
+	bnez	a0, .LBB48_51
 # %bb.49:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_51
+	bnez	a0, .LBB48_51
 # %bb.50:
 	sw	a1, 0(s2)
-.LBB41_51:
+.LBB48_51:
 	li	a0, 0
 	call	m_vsum
 	lw	a1, 4(s2)
 	addi	a1, a1, 1
 	sw	a1, 4(s2)
-	beqz	a0, .LBB41_54
+	beqz	a0, .LBB48_54
 # %bb.52:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_54
+	bnez	a0, .LBB48_54
 # %bb.53:
 	sw	a1, 0(s2)
-.LBB41_54:
+.LBB48_54:
 	li	t0, 10
 	li	t1, 9
 	li	t2, 8
@@ -1346,13 +1484,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	li	a2, 55
 	sw	a1, 4(s2)
-	beq	a0, a2, .LBB41_57
+	beq	a0, a2, .LBB48_57
 # %bb.55:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_57
+	bnez	a0, .LBB48_57
 # %bb.56:
 	sw	a1, 0(s2)
-.LBB41_57:
+.LBB48_57:
 	ld	a0, 128(sp)
 	ld	a1, 136(sp)
 	ld	a2, 144(sp)
@@ -1383,13 +1521,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	li	s5, 180
 	sw	a1, 4(s2)
-	beq	a0, s5, .LBB41_60
+	beq	a0, s5, .LBB48_60
 # %bb.58:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_60
+	bnez	a0, .LBB48_60
 # %bb.59:
 	sw	a1, 0(s2)
-.LBB41_60:
+.LBB48_60:
 	ld	a0, 128(sp)
 	ld	a1, 136(sp)
 	ld	a2, 144(sp)
@@ -1417,13 +1555,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	lw	a1, 4(s2)
 	addi	a1, a1, 1
 	sw	a1, 4(s2)
-	beq	a0, s5, .LBB41_63
+	beq	a0, s5, .LBB48_63
 # %bb.61:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_63
+	bnez	a0, .LBB48_63
 # %bb.62:
 	sw	a1, 0(s2)
-.LBB41_63:
+.LBB48_63:
 	li	t0, 100
 	li	a0, 1
 	li	a1, 2
@@ -1440,13 +1578,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	li	a2, 203
 	sw	a1, 4(s2)
-	beq	a0, a2, .LBB41_66
+	beq	a0, a2, .LBB48_66
 # %bb.64:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_66
+	bnez	a0, .LBB48_66
 # %bb.65:
 	sw	a1, 0(s2)
-.LBB41_66:
+.LBB48_66:
 	li	t0, -5
 	li	a0, 97
 	li	a1, 30
@@ -1473,13 +1611,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a2, a1, 1
 	li	a3, 261
 	sw	a2, 4(s2)
-	beq	a0, a3, .LBB41_69
+	beq	a0, a3, .LBB48_69
 # %bb.67:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_69
+	bnez	a0, .LBB48_69
 # %bb.68:
 	sw	a2, 0(s2)
-.LBB41_69:
+.LBB48_69:
 	addi	a1, a1, 2
 	sw	a1, 4(s2)
 	li	t0, 9
@@ -1505,13 +1643,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a1, a0, a1
 	addi	a0, a3, 1
 	sw	a0, 4(s2)
-	beqz	a1, .LBB41_72
+	beqz	a1, .LBB48_72
 # %bb.70:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_72
+	bnez	a1, .LBB48_72
 # %bb.71:
 	sw	a0, 0(s2)
-.LBB41_72:
+.LBB48_72:
 .Lpcrel_hi5:
 	auipc	a1, %pcrel_hi(.L.str.2)
 	slli	a2, s0, 60
@@ -1527,39 +1665,39 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	add	a2, a2, a3
 	sw	a1, 4(s2)
-	beq	a0, a2, .LBB41_75
+	beq	a0, a2, .LBB48_75
 # %bb.73:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_75
+	bnez	a0, .LBB48_75
 # %bb.74:
 	sw	a1, 0(s2)
-.LBB41_75:
+.LBB48_75:
 	li	a0, -1
 	call	m_umax
-	beqz	a0, .LBB41_77
+	beqz	a0, .LBB48_77
 # %bb.76:
 	lui	a0, 524288
 	addiw	a0, a0, -1
 	call	m_umax
 	seqz	a1, a0
-	j	.LBB41_78
-.LBB41_77:
+	j	.LBB48_78
+.LBB48_77:
 	li	a1, 0
-.LBB41_78:
+.LBB48_78:
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-	bnez	a1, .LBB41_81
+	bnez	a1, .LBB48_81
 # %bb.79:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_81
+	bnez	a1, .LBB48_81
 # %bb.80:
 	sw	a0, 0(s2)
-.LBB41_81:
+.LBB48_81:
 	li	a0, -5
 	li	s0, -5
 	call	m_sext
-	bne	a0, s0, .LBB41_83
+	bne	a0, s0, .LBB48_83
 # %bb.82:
 	lui	s0, 524288
 	addiw	s0, s0, -1
@@ -1567,43 +1705,43 @@ c_calls_merlin:                         # @c_calls_merlin
 	call	m_sext
 	xor	a0, a0, s0
 	seqz	a1, a0
-	j	.LBB41_84
-.LBB41_83:
+	j	.LBB48_84
+.LBB48_83:
 	li	a1, 0
-.LBB41_84:
+.LBB48_84:
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-	bnez	a1, .LBB41_87
+	bnez	a1, .LBB48_87
 # %bb.85:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_87
+	bnez	a1, .LBB48_87
 # %bb.86:
 	sw	a0, 0(s2)
-.LBB41_87:
+.LBB48_87:
 	li	a0, -1
 	li	s0, -1
 	call	m_zext
 	srli	s0, s0, 32
-	bne	a0, s0, .LBB41_89
+	bne	a0, s0, .LBB48_89
 # %bb.88:
 	lui	a0, 524288
 	call	m_zext
 	snez	a1, a0
-	j	.LBB41_90
-.LBB41_89:
+	j	.LBB48_90
+.LBB48_89:
 	li	a1, 0
-.LBB41_90:
+.LBB48_90:
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-	bnez	a1, .LBB41_93
+	bnez	a1, .LBB48_93
 # %bb.91:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_93
+	bnez	a1, .LBB48_93
 # %bb.92:
 	sw	a0, 0(s2)
-.LBB41_93:
+.LBB48_93:
 	lui	s1, 524288
 	addi	s0, s1, 5
 	mv	a0, s0
@@ -1611,34 +1749,34 @@ c_calls_merlin:                         # @c_calls_merlin
 	lw	a1, 4(s2)
 	addi	a1, a1, 1
 	sw	a1, 4(s2)
-	beq	a0, s0, .LBB41_96
+	beq	a0, s0, .LBB48_96
 # %bb.94:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_96
+	bnez	a0, .LBB48_96
 # %bb.95:
 	sw	a1, 0(s2)
-.LBB41_96:
+.LBB48_96:
 	lui	a0, 524288
 	call	m_unarrow
-	bne	a0, s1, .LBB41_98
+	bne	a0, s1, .LBB48_98
 # %bb.97:
 	lui	a0, 524288
 	call	m_unarrow
 	snez	a1, a0
-	j	.LBB41_99
-.LBB41_98:
+	j	.LBB48_99
+.LBB48_98:
 	li	a1, 0
-.LBB41_99:
+.LBB48_99:
 	lw	a0, 4(s2)
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-	bnez	a1, .LBB41_102
+	bnez	a1, .LBB48_102
 # %bb.100:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_102
+	bnez	a1, .LBB48_102
 # %bb.101:
 	sw	a0, 0(s2)
-.LBB41_102:
+.LBB48_102:
 	li	s0, 1
 	slli	s0, s0, 60
 	mv	a0, s0
@@ -1647,13 +1785,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	addi	a1, a1, 1
 	addi	a2, s0, 1
 	sw	a1, 4(s2)
-	beq	a0, a2, .LBB41_105
+	beq	a0, a2, .LBB48_105
 # %bb.103:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_105
+	bnez	a0, .LBB48_105
 # %bb.104:
 	sw	a1, 0(s2)
-.LBB41_105:
+.LBB48_105:
 	li	a1, -7
 	mv	a0, s0
 	call	m_swapl2
@@ -1663,13 +1801,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a1, a0, a1
 	addi	a0, a2, 1
 	sw	a0, 4(s2)
-	beqz	a1, .LBB41_108
+	beqz	a1, .LBB48_108
 # %bb.106:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_108
+	bnez	a1, .LBB48_108
 # %bb.107:
 	sw	a0, 0(s2)
-.LBB41_108:
+.LBB48_108:
 	li	s1, 1
 	slli	a1, s1, 32
 	slli	s1, s1, 60
@@ -1687,13 +1825,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a2, a0, a2
 	addi	a0, a1, 1
 	sw	a0, 4(s2)
-	beqz	a2, .LBB41_111
+	beqz	a2, .LBB48_111
 # %bb.109:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_111
+	bnez	a1, .LBB48_111
 # %bb.110:
 	sw	a0, 0(s2)
-.LBB41_111:
+.LBB48_111:
 	li	a0, 97
 	mv	a1, s1
 	call	m_cl
@@ -1706,13 +1844,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a3, a3, a1
 	addi	a1, a2, 1
 	sw	a1, 4(s2)
-	beqz	a3, .LBB41_114
+	beqz	a3, .LBB48_114
 # %bb.112:
 	lw	a2, 0(s2)
-	bnez	a2, .LBB41_114
+	bnez	a2, .LBB48_114
 # %bb.113:
 	sw	a1, 0(s2)
-.LBB41_114:
+.LBB48_114:
 	li	s9, 1
 	li	a1, 2
 	slli	s1, s9, 60
@@ -1740,13 +1878,13 @@ c_calls_merlin:                         # @c_calls_merlin
 	or	a1, a1, a2
 	addi	a0, a0, 1
 	sw	a0, 4(s2)
-	beqz	a1, .LBB41_117
+	beqz	a1, .LBB48_117
 # %bb.115:
 	lw	a1, 0(s2)
-	bnez	a1, .LBB41_117
+	bnez	a1, .LBB48_117
 # %bb.116:
 	sw	a0, 0(s2)
-.LBB41_117:
+.LBB48_117:
 	and	s0, s0, s3
 	li	a0, 5
 	addi	s0, s0, 6
@@ -1772,17 +1910,17 @@ c_calls_merlin:                         # @c_calls_merlin
 	call	m_vmixw
 	lw	a1, 4(s2)
 .Lpcrel_hi8:
-	auipc	a2, %pcrel_hi(.LCPI41_0)
+	auipc	a2, %pcrel_hi(.LCPI48_0)
 	ld	s3, %pcrel_lo(.Lpcrel_hi8)(a2)
 	addi	a1, a1, 1
 	sw	a1, 4(s2)
-	beq	a0, s3, .LBB41_120
+	beq	a0, s3, .LBB48_120
 # %bb.118:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_120
+	bnez	a0, .LBB48_120
 # %bb.119:
 	sw	a1, 0(s2)
-.LBB41_120:
+.LBB48_120:
 	sd	s4, 88(sp)
 	sd	s5, 96(sp)
 	sd	s6, 104(sp)
@@ -1803,20 +1941,20 @@ c_calls_merlin:                         # @c_calls_merlin
 	li	a5, 4
 	lui	a7, 524288
 	mv	a3, s0
-	li	s0, 3
-	li	s4, 4
+	li	s4, 3
+	li	s5, 4
 	call	m_vmixw
 	lw	a1, 4(s2)
 	addi	a1, a1, 1
 	sw	a1, 4(s2)
-	beq	a0, s3, .LBB41_123
+	beq	a0, s3, .LBB48_123
 # %bb.121:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_123
+	bnez	a0, .LBB48_123
 # %bb.122:
 	sw	a1, 0(s2)
-.LBB41_123:
-	li	t0, -1
+.LBB48_123:
+	li	s0, -1
 	li	a0, 1
 	li	a1, 2
 	li	a2, 3
@@ -1825,24 +1963,204 @@ c_calls_merlin:                         # @c_calls_merlin
 	li	a5, 6
 	li	a6, 7
 	li	a7, -2
-	sd	s0, 0(sp)
-	sd	s4, 8(sp)
-	sd	t0, 16(sp)
+	sd	s4, 0(sp)
+	sd	s5, 8(sp)
+	sd	s0, 16(sp)
 	sd	s1, 24(sp)
 	call	m_stackw
 	lw	a1, 4(s2)
 .Lpcrel_hi11:
-	auipc	a2, %pcrel_hi(.LCPI41_1)
+	auipc	a2, %pcrel_hi(.LCPI48_1)
 	ld	a2, %pcrel_lo(.Lpcrel_hi11)(a2)
 	addi	a1, a1, 1
 	sw	a1, 4(s2)
-	beq	a0, a2, .LBB41_126
+	beq	a0, a2, .LBB48_126
 # %bb.124:
 	lw	a0, 0(s2)
-	bnez	a0, .LBB41_126
+	bnez	a0, .LBB48_126
 # %bb.125:
 	sw	a1, 0(s2)
-.LBB41_126:
+.LBB48_126:
+	li	a0, 1
+	slli	a0, a0, 32
+	li	a1, -1
+	mv	a2, a0
+	call	m_qadd
+	srli	s0, s0, 31
+	bne	a0, s0, .LBB48_128
+# %bb.127:
+	li	a0, -1
+	li	a1, -1
+	li	a2, -1
+	call	m_qadd
+	addi	a0, a0, 3
+	seqz	a1, a0
+	j	.LBB48_129
+.LBB48_128:
+	li	a1, 0
+.LBB48_129:
+	lw	a0, 4(s2)
+	addi	a0, a0, 1
+	sw	a0, 4(s2)
+	bnez	a1, .LBB48_132
+# %bb.130:
+	lw	a1, 0(s2)
+	bnez	a1, .LBB48_132
+# %bb.131:
+	sw	a0, 0(s2)
+.LBB48_132:
+.Lpcrel_hi12:
+	auipc	a0, %pcrel_hi(.LCPI48_2)
+	ld	a0, %pcrel_lo(.Lpcrel_hi12)(a0)
+	call	m_qhigh
+	lw	a1, 4(s2)
+	lui	a2, 172
+	addi	a2, a2, -801
+	slli	a2, a2, 12
+	addi	a1, a1, 1
+	addi	a2, a2, -255
+	sw	a1, 4(s2)
+	beq	a0, a2, .LBB48_135
+# %bb.133:
+	lw	a0, 0(s2)
+	bnez	a0, .LBB48_135
+# %bb.134:
+	sw	a1, 0(s2)
+.LBB48_135:
+	li	s0, 1
+	li	a0, -1
+	li	t0, 9
+	slli	a0, a0, 32
+	slli	a7, s0, 32
+	sd	a0, 0(sp)
+	li	a0, 1
+	li	a1, 2
+	li	a2, 3
+	li	a3, 4
+	li	a4, 5
+	li	a5, 6
+	li	a6, 7
+	sd	t0, 8(sp)
+	sd	a7, 16(sp)
+	call	m_qlate
+	lw	a1, 4(s2)
+	slli	s0, s0, 34
+	addi	a1, a1, 1
+	addi	a2, s0, 37
+	sw	a1, 4(s2)
+	beq	a0, a2, .LBB48_138
+# %bb.136:
+	lw	a0, 0(s2)
+	bnez	a0, .LBB48_138
+# %bb.137:
+	sw	a1, 0(s2)
+.LBB48_138:
+	lui	a0, 2384
+	addi	s1, a0, 761
+	slli	s0, s1, 9
+	mv	a0, s0
+	call	m_qtwice
+	lw	a1, 4(s2)
+	addi	a1, a1, 1
+	slli	s1, s1, 10
+	sw	a1, 4(s2)
+	beq	a0, s1, .LBB48_141
+# %bb.139:
+	lw	a0, 0(s2)
+	bnez	a0, .LBB48_141
+# %bb.140:
+	sw	a1, 0(s2)
+.LBB48_141:
+	lui	a0, 682365
+	slli	a0, a0, 1
+	addi	a1, a0, 512
+	li	a0, 7
+	mv	a2, s0
+	call	m_qsum
+	lw	a1, 4(s2)
+	lui	a2, 488281
+	addi	a1, a1, 1
+	addi	a2, a2, 1031
+	sw	a1, 4(s2)
+	beq	a0, a2, .LBB48_144
+# %bb.142:
+	lw	a0, 0(s2)
+	bnez	a0, .LBB48_144
+# %bb.143:
+	sw	a1, 0(s2)
+.LBB48_144:
+.Lpcrel_hi13:
+	auipc	a0, %pcrel_hi(.L.str.6)
+	li	s0, 1
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi13)
+	slli	s0, s0, 32
+	lui	a1, 2384
+	li	a5, -1
+	addi	a4, a1, 761
+	slli	a5, a5, 32
+	slli	a4, a4, 9
+	li	a1, 1
+	li	a3, 2
+	mv	a2, s0
+	call	m_vq
+	lw	a1, 4(s2)
+	lui	a2, 298
+	addi	a2, a2, 95
+	slli	a2, a2, 12
+	addi	a1, a1, 1
+	addi	a2, a2, 515
+	sw	a1, 4(s2)
+	beq	a0, a2, .LBB48_147
+# %bb.145:
+	lw	a0, 0(s2)
+	bnez	a0, .LBB48_147
+# %bb.146:
+	sw	a1, 0(s2)
+.LBB48_147:
+.Lpcrel_hi14:
+	auipc	a0, %pcrel_hi(.L.str.7)
+	li	a1, 1
+	li	a2, 2
+	addi	a0, a0, %pcrel_lo(.Lpcrel_hi14)
+	li	a3, 3
+	li	a4, 4
+	li	a5, 5
+	li	a6, 6
+	mv	a7, s0
+	call	m_vq
+	lw	a1, 4(s2)
+	addi	a1, a1, 1
+	addi	s0, s0, 21
+	sw	a1, 4(s2)
+	beq	a0, s0, .LBB48_150
+# %bb.148:
+	lw	a0, 0(s2)
+	bnez	a0, .LBB48_150
+# %bb.149:
+	sw	a1, 0(s2)
+.LBB48_150:
+	li	s0, 1
+	li	a0, 1
+	li	a1, 2
+	slli	s0, s0, 32
+	li	a2, 3
+	li	a3, 4
+	li	a4, 5
+	li	a5, 6
+	li	a6, 7
+	mv	a7, s0
+	call	m_vqlate
+	lw	a1, 4(s2)
+	addi	a1, a1, 1
+	addi	s0, s0, 28
+	sw	a1, 4(s2)
+	beq	a0, s0, .LBB48_153
+# %bb.151:
+	lw	a0, 0(s2)
+	bnez	a0, .LBB48_153
+# %bb.152:
+	sw	a1, 0(s2)
+.LBB48_153:
 	lw	a0, 0(s2)
 	ld	ra, 248(sp)                     # 8-byte Folded Reload
 	ld	s0, 240(sp)                     # 8-byte Folded Reload
@@ -1857,8 +2175,8 @@ c_calls_merlin:                         # @c_calls_merlin
 	ld	s9, 168(sp)                     # 8-byte Folded Reload
 	addi	sp, sp, 256
 	ret
-.Lfunc_end41:
-	.size	c_calls_merlin, .Lfunc_end41-c_calls_merlin
+.Lfunc_end48:
+	.size	c_calls_merlin, .Lfunc_end48-c_calls_merlin
                                         # -- End function
 	.type	.L.str,@object                  # @.str
 	.section	.rodata.str1.1,"aMS",@progbits,1
@@ -1890,6 +2208,16 @@ c_calls_merlin:                         # @c_calls_merlin
 .L.str.5:
 	.asciz	"TtqpLlui"
 	.size	.L.str.5, 9
+
+	.type	.L.str.6,@object                # @.str.6
+.L.str.6:
+	.asciz	"iqisq"
+	.size	.L.str.6, 6
+
+	.type	.L.str.7,@object                # @.str.7
+.L.str.7:
+	.asciz	"iiiiiiq"
+	.size	.L.str.7, 8
 
 	.type	.L_MergedGlobals,@object        # @_MergedGlobals
 	.local	.L_MergedGlobals

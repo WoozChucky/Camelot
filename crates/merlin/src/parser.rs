@@ -691,10 +691,11 @@ impl Parser<'_> {
                 _ => unreachable!("starts_decl"),
             };
             *count += 1;
-            if k == Kw::Long && *count == 2 {
-                return Err(Error::new(pos, "'long long' is not supported yet"));
+            // `long` may come twice: `long long`.
+            if k == Kw::Long && *count == 3 {
+                return Err(Error::new(pos, "'long long long' is invalid"));
             }
-            if *count > 1 {
+            if *count > 1 && !(k == Kw::Long && *count == 2) {
                 return Err(Error::new(pos, format!("duplicate '{}'", k.as_str())));
             }
         }
@@ -711,11 +712,11 @@ impl Parser<'_> {
                 ));
             }
             None => {
-                // At most one of void, char, short, long and _Bool; `int` may
-                // join short and long; `signed` or `unsigned` may join
-                // anything but void and _Bool.
+                // At most one of void, char, short, long (or long long) and
+                // _Bool; `int` may join short and long; `signed` or
+                // `unsigned` may join anything but void and _Bool.
                 let invalid = signed + unsigned > 1
-                    || void + char + short + long + bool_ > 1
+                    || void + char + short + long.min(1) + bool_ > 1
                     || int + void + char + bool_ > 1
                     || void + bool_ + signed + unsigned > 1;
                 if invalid {
@@ -736,6 +737,12 @@ impl Parser<'_> {
                         IntKind::UShort
                     } else {
                         IntKind::Short
+                    })
+                } else if long == 2 {
+                    Type::Int(if unsigned == 1 {
+                        IntKind::ULongLong
+                    } else {
+                        IntKind::LongLong
                     })
                 } else if long == 1 {
                     Type::Int(if unsigned == 1 {
@@ -2387,7 +2394,11 @@ mod tests {
             );
         }
         assert_eq!(err("int int x;"), "1:5: duplicate 'int'");
-        assert_eq!(err("long long x;"), "1:6: 'long long' is not supported yet");
+        assert_eq!(err("long long long x;"), "1:11: 'long long long' is invalid");
+        assert_eq!(
+            err("short long long x;"),
+            "1:1: invalid combination of type specifiers"
+        );
         assert_eq!(err("static x;"), "1:8: expected a type, found identifier 'x'");
         assert_eq!(
             err("static extern int x;"),

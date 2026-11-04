@@ -33,10 +33,19 @@
 //!   first argument in `a0`, which moves every other argument one register
 //!   up, and the callee stores the result there.
 //!
-//! Without `long long` and `double` on RV32, and without `__int128` and
-//! `long double` on RV64, there is no type aligned to two words, so the
-//! even-register alignment the psABI asks of those never comes up, and
-//! without floating point the hardware-float rules do not apply.
+//! * On RV32 a `long long` (a scalar of two words) takes a pair of words,
+//!   the low word first, like a struct of 8 bytes; a result comes back in
+//!   `a0` and `a1`. On RV64 it is a scalar like any other.
+//! * A pair aligned to two words (on RV32 a `long long`, or a struct of 8
+//!   bytes holding one: clang passes it as an `i64`) starts at an even word
+//!   when it goes on the stack, and when it is a variadic argument, in an
+//!   even register too ("an aligned register pair"), skipping `a7` (or a
+//!   word of the stack) if it must, as the psABI and LLVM's
+//!   `CC_RISCVAssign2XLen` say. A named one may still start in `a7`, its
+//!   high word at `0(sp)`. On RV64 only `__int128` and `long double` would be
+//!   aligned so, and merlin has neither.
+//!
+//! Without floating point the hardware-float rules do not apply.
 
 use crate::types::{ptr_size, FuncType, Type, Xlen};
 
@@ -45,6 +54,8 @@ use crate::types::{ptr_size, FuncType, Type, Xlen};
 pub enum Pass {
     /// An integer or pointer, in one register.
     Scalar,
+    /// A `long long` on RV32: two words, the low one first.
+    Pair,
     /// A struct or union of at most two words, as 1 or 2 words in registers.
     Words(u32),
     /// A struct or union of more than two words: the address of a copy.
@@ -56,6 +67,7 @@ impl Pass {
     pub fn registers(self) -> usize {
         match self {
             Pass::Scalar | Pass::Ref => 1,
+            Pass::Pair => 2,
             Pass::Words(n) => n as usize,
         }
     }
@@ -64,7 +76,11 @@ impl Pass {
 /// How a value of type `ty` (complete, not void) travels on the target.
 pub fn classify(ty: &Type, x: Xlen) -> Pass {
     if !ty.is_record() {
-        return Pass::Scalar;
+        return if ty.size(x) == Some(2 * ptr_size(x)) {
+            Pass::Pair
+        } else {
+            Pass::Scalar
+        };
     }
     let word = ptr_size(x);
     match ty.size(x).expect("a complete struct or union") {
@@ -80,21 +96,33 @@ pub fn returns_in_memory(ret: &Type, x: Xlen) -> bool {
     ret.is_record() && classify(ret, x) == Pass::Ref
 }
 
+/// Whether a value of type `ty` passed as `pass` is two words aligned to two
+/// words, which start at an even word on the stack, and in registers too
+/// when variadic (see the module's notes).
+pub fn aligned_pair(ty: &Type, pass: Pass, x: Xlen) -> bool {
+    pass == Pass::Pair || (pass == Pass::Words(2) && ty.align(x) == 2 * ptr_size(x))
+}
+
 /// Where each named parameter of a function goes: see [`call_arguments`].
 pub fn arguments(f: &FuncType, x: Xlen) -> (Vec<(usize, Pass)>, usize) {
-    call_arguments(&f.ret, &f.params, x)
+    call_arguments(&f.ret, &f.params, f.params.len(), x)
 }
 
 /// Where each argument of a call goes, given the function's result type and
-/// the arguments' types (a variadic call's after promotion): the number of
-/// its first word (words below [`ARG_REGS`] are registers, `aN` for word N)
-/// and how it is passed, plus the number of words taken in all (counting the
-/// hidden result address). Every type must be complete.
-pub fn call_arguments(ret: &Type, args: &[Type], x: Xlen) -> (Vec<(usize, Pass)>, usize) {
+/// the arguments' types (a variadic call's after promotion), of which the
+/// first `named` are the function's parameters and the rest its `...`: the
+/// number of its first word (words below [`ARG_REGS`] are registers, `aN`
+/// for word N) and how it is passed, plus the number of words taken in all
+/// (counting the hidden result address, and any word an aligned pair
+/// skips). Every type must be complete.
+pub fn call_arguments(ret: &Type, args: &[Type], named: usize, x: Xlen) -> (Vec<(usize, Pass)>, usize) {
     let mut next = usize::from(returns_in_memory(ret, x));
     let mut out = Vec::with_capacity(args.len());
-    for a in args {
+    for (i, a) in args.iter().enumerate() {
         let pass = classify(a, x);
+        if aligned_pair(a, pass, x) && (i >= named || next >= ARG_REGS) && next % 2 == 1 {
+            next += 1;
+        }
         out.push((next, pass));
         next += pass.registers();
     }
@@ -152,6 +180,58 @@ mod tests {
     }
 
     #[test]
+    fn long_long_pairs_on_rv32() {
+        let x = Xlen::Rv32;
+        let ll = Type::Int(IntKind::LongLong);
+        assert_eq!(classify(&ll, x), Pass::Pair);
+        assert_eq!(classify(&ll, Xlen::Rv64), Pass::Scalar);
+        let int = Type::INT;
+        // Named: a pair may start in an odd register, and in a7.
+        let (w, total) = call_arguments(&int, &[int.clone(), ll.clone()], 2, x);
+        assert_eq!((w, total), (vec![(0, Pass::Scalar), (1, Pass::Pair)], 3));
+        let seven = vec![int.clone(); 7];
+        let mut args = seven.clone();
+        args.push(ll.clone());
+        assert_eq!(call_arguments(&int, &args, 8, x).0[7], (7, Pass::Pair));
+        // Both words on the stack: from an even word.
+        let mut args = vec![int.clone(); 9];
+        args.push(ll.clone());
+        assert_eq!(
+            call_arguments(&int, &args, 10, x),
+            (
+                [
+                    vec![(0, Pass::Scalar)],
+                    (1..9).map(|i| (i, Pass::Scalar)).collect()
+                ]
+                .concat()
+                .into_iter()
+                .chain([(10, Pass::Pair)])
+                .collect(),
+                12
+            )
+        );
+        // Variadic: an aligned register pair, skipping a1, or a7.
+        let (w, _) = call_arguments(&int, &[int.clone(), ll.clone()], 1, x);
+        assert_eq!(w[1], (2, Pass::Pair));
+        let mut args = seven;
+        args.push(ll.clone());
+        assert_eq!(call_arguments(&int, &args, 7, x).0[7], (8, Pass::Pair));
+        // A struct holding a long long is aligned the same; one of two ints is not.
+        let r = Record::new(false, Some("s".into()), Pos::default());
+        r.complete(vec![("v".into(), ll)], x);
+        let s = Type::Record(r);
+        assert_eq!(classify(&s, x), Pass::Words(2));
+        assert_eq!(
+            call_arguments(&int, &[int.clone(), s], 1, x).0[1],
+            (2, Pass::Words(2))
+        );
+        assert_eq!(
+            call_arguments(&int, &[int.clone(), record(8)], 1, x).0[1],
+            (1, Pass::Words(2))
+        );
+    }
+
+    #[test]
     fn register_assignment() {
         let f = FuncType {
             ret: Type::INT,
@@ -188,7 +268,7 @@ mod tests {
             record(8),
             Type::INT,
         ];
-        let (words, total) = call_arguments(&Type::INT, &args, Xlen::Rv32);
+        let (words, total) = call_arguments(&Type::INT, &args, args.len(), Xlen::Rv32);
         assert_eq!(words[7..], [(7, Pass::Words(2)), (9, Pass::Scalar)]);
         assert_eq!((total, stack_words(total)), (10, 2));
         assert_eq!(stack_words(3), 0);

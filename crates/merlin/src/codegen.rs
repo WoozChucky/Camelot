@@ -89,6 +89,42 @@
 //! An `int` needs nothing to become a `long` or an index: it is its own
 //! sign extension already.
 //!
+//! ### Register pairs (RV32)
+//!
+//! A `long long` is 64 bits on both widths. On RV64 it is a register like a
+//! `long`. On RV32 it is a *pair*: an expression leaves its low word in `a0`
+//! and its high word in `a1`, a push takes 8 bytes (the low word at the lower
+//! address, as in memory), and a binary operator finds its left operand in
+//! `a2:a3` and its right one in `a0:a1` (a narrower operand is extended into
+//! the other word by its signedness: `srai a1, a0, 31`, or `li a1, 0`). The
+//! operations are inline, as LLVM expands them on RV32 with M:
+//!
+//! ```text
+//!   add  a0, a2, a0           # +: the low words,
+//!   sltu t0, a0, a2           #    their carry,
+//!   add  a1, a3, a1           #    the high words
+//!   add  a1, a1, t0
+//!   mul  t0, a3, a0           # *: the cross products' low words, and the
+//!   mul  t1, a2, a1           #    high word of lo * lo (mulhu)
+//!   add  t0, t0, t1
+//!   mulhu t1, a2, a0
+//!   add  a1, t0, t1
+//!   mul  a0, a2, a0
+//! ```
+//!
+//! `-` borrows the same way; `& | ^ ~` work word by word; a comparison
+//! compares the high words (signed or not) and, when they are equal, the low
+//! ones unsigned; a shift by `n` (its low 6 bits) moves a word across when
+//! `n` reaches 32 and shifts the bits crossing between the words otherwise
+//! ([`FuncGen::pair_shift`]); a condition is `or a0, a0, a1`. Division and
+//! remainder call libgcc's routines (`__divdi3`, `__udivdi3`, `__moddi3`,
+//! `__umoddi3`, with the operands in `a0:a1` and `a2:a3`), which the C
+//! library and the kernel provide (`kernel/user/lib/libgcc.c`), as clang's
+//! code calls them too. A conversion to a narrower type takes the low word;
+//! one to `_Bool` both. Pairs travel as the psABI says ([`crate::abi`]): in
+//! two argument words, from an even one on the stack and, when variadic, in
+//! an even register; a result in `a0` and `a1`.
+//!
 //! A `_Bool` holds 0 or 1: converting to it is `snez a0, a0` (from a pointer
 //! too), and it is loaded with `lbu`.
 //!
@@ -526,7 +562,7 @@ impl ArgLayout {
     fn new(ft: &FuncType, args: &[Expr], x: Xlen) -> ArgLayout {
         let mut types = ft.params.clone();
         types.extend(args[ft.params.len()..].iter().map(|a| a.ty.clone()));
-        let (words, used) = abi::call_arguments(&ft.ret, &types, x);
+        let (words, used) = abi::call_arguments(&ft.ret, &types, ft.params.len(), x);
         ArgLayout { types, words, used }
     }
 }
@@ -579,6 +615,12 @@ fn store_op(ty: &Type, x: Xlen) -> &'static str {
         Some(8) => "sd",
         _ => unreachable!("no value of type '{ty}' is stored"),
     }
+}
+
+/// The low and high words of a 64-bit value, as `li` takes them.
+fn pair_image(v: i128) -> (i32, i32) {
+    let v = v as i64;
+    (v as i32, (v >> 32) as i32)
 }
 
 /// `log2(n)` if `n` is a power of two.
@@ -989,6 +1031,76 @@ impl<'a> FuncGen<'a, '_> {
         }
     }
 
+    /// Whether a value of type `ty` is a register pair: a `long long` on
+    /// RV32, its low word in `a0` and its high word in `a1` (see "Register
+    /// pairs").
+    fn is_pair(&self, ty: &Type) -> bool {
+        self.xlen == Xlen::Rv32 && ty.int_kind().is_some_and(|k| k.size(self.xlen) == 8)
+    }
+
+    /// `a0` (and `a1`) = the constant `v` of type `k`.
+    fn constant(&mut self, v: i128, k: IntKind) {
+        if self.is_pair(&Type::Int(k)) {
+            let (lo, hi) = pair_image(k.wrap(v, self.xlen));
+            self.li("a0", lo.into());
+            self.li("a1", hi.into());
+        } else {
+            self.li("a0", self.image(v, k));
+        }
+    }
+
+    /// Evaluates a condition into `a0`, nonzero when it holds: a pair is
+    /// nonzero when either word is (`or a0, a0, a1`).
+    fn test(&mut self, e: &'a Expr) {
+        self.expr(e);
+        if self.is_pair(&e.ty) {
+            self.ins("or", "a0, a0, a1");
+        }
+    }
+
+    /// Pushes the value of type `ty`: `a0`, or a pair's two words (the low
+    /// one at the lower address, as in memory).
+    fn push_value(&mut self, ty: &Type) {
+        if self.is_pair(ty) {
+            self.ins("addi", "sp, sp, -8");
+            self.ins("sw", "a0, 0(sp)");
+            self.ins("sw", "a1, 4(sp)");
+            self.depth += 2;
+        } else {
+            self.push();
+        }
+    }
+
+    /// Pops a pushed pair into `lo` and `hi`.
+    fn pop_pair(&mut self, lo: &str, hi: &str) {
+        self.ins("lw", format!("{lo}, 0(sp)"));
+        self.ins("lw", format!("{hi}, 4(sp)"));
+        self.ins("addi", "sp, sp, 8");
+        self.depth -= 2;
+    }
+
+    /// Pops the left operand of `l op r`, of type `l`: into `a1`, or a pair
+    /// into `a2` and `a3` (the right one is in `a0`, or `a0:a1`). An operand
+    /// the operation widens to a pair goes to `a2`, so as not to clobber the
+    /// right one's high word ([`Self::binary`] extends it into `a3`); a
+    /// shift uses only its amount's low word.
+    fn pop_left(&mut self, op: BinOp, l: &Type, r: &Type) {
+        if self.is_pair(l) {
+            self.pop_pair("a2", "a3");
+        } else if self.is_pair(r) && l.is_integer() && !matches!(op, BinOp::Shl | BinOp::Shr) {
+            self.pop("a2");
+        } else {
+            self.pop("a1");
+        }
+    }
+
+    /// `a0:a1 += delta` (a `++` or `--` of a long long on RV32).
+    fn pair_step(&mut self, delta: i32) {
+        self.li("a2", delta.into());
+        self.li("a3", if delta < 0 { -1 } else { 0 });
+        self.pair_arith(BinOp::Add, false);
+    }
+
     /// Whether arithmetic in the (promoted) type `ty` is 32-bit arithmetic
     /// on 64-bit registers: an `int` or `unsigned int` on RV64, which the W
     /// instructions do (`addw`, `sllw`, `divuw`...), each leaving its result
@@ -1127,10 +1239,11 @@ impl<'a> FuncGen<'a, '_> {
                     self.access_local(store_op(&p.ty, self.xlen), &reg, off);
                 }
                 // A small struct: its words, as they lie in memory (the slot is
-                // a whole number of words).
-                Pass::Words(n) => {
-                    for i in 0..n {
-                        let reg = self.incoming(word + i as usize);
+                // a whole number of words); a long long on RV32: its low word,
+                // then its high word.
+                Pass::Words(_) | Pass::Pair => {
+                    for i in 0..pass.registers() {
+                        let reg = self.incoming(word + i);
                         self.access_local(store, &reg, off + w * i as i32);
                     }
                 }
@@ -1168,6 +1281,9 @@ impl<'a> FuncGen<'a, '_> {
         self.loc(f.end);
         if !returned {
             self.li("a0", 0);
+            if self.is_pair(&f.ret) {
+                self.li("a1", 0);
+            }
         }
 
         // Epilogue: the result is in a0. Free the frame from s0 (whatever its
@@ -1265,7 +1381,7 @@ impl<'a> FuncGen<'a, '_> {
                 //                             .L.else.N:
                 //                               <els>
                 //                             .L.end.N:
-                self.expr(cond);
+                self.test(cond);
                 match els {
                     None => {
                         let end = self.new_label("end");
@@ -1296,7 +1412,7 @@ impl<'a> FuncGen<'a, '_> {
                 let brk = self.new_label("break");
                 self.label(&cont);
                 self.loc(cond.pos);
-                self.expr(cond);
+                self.test(cond);
                 self.branch_if_zero(&brk);
                 self.loop_body(body, &cont, &brk);
                 self.ins("j", &cont);
@@ -1316,7 +1432,7 @@ impl<'a> FuncGen<'a, '_> {
                 self.loop_body(body, &cont, &brk);
                 self.label(&cont);
                 self.loc(cond.pos);
-                self.expr(cond);
+                self.test(cond);
                 self.branch_if_nonzero(&top);
                 self.label(&brk);
             }
@@ -1344,7 +1460,7 @@ impl<'a> FuncGen<'a, '_> {
                 self.label(&top);
                 if let Some(cond) = cond {
                     self.loc(cond.pos);
-                    self.expr(cond);
+                    self.test(cond);
                     self.branch_if_zero(&brk);
                 }
                 self.loop_body(body, &cont, &brk);
@@ -1401,11 +1517,23 @@ impl<'a> FuncGen<'a, '_> {
                 let brk = self.new_label("break");
                 self.expr(cond);
                 let kind = cond.ty.int_kind().expect("sema: an integer condition");
+                let pair = self.is_pair(&cond.ty);
                 for &(value, id) in cases {
+                    let target = self.case_label(id);
+                    if pair {
+                        // A long long on RV32: equal when both words are.
+                        let (lo, hi) = pair_image(value);
+                        self.li("t0", lo.into());
+                        self.li("t1", hi.into());
+                        self.ins("xor", "t0, a0, t0");
+                        self.ins("xor", "t1, a1, t1");
+                        self.ins("or", "t0, t0, t1");
+                        self.branch("beqz", "t0", &target);
+                        continue;
+                    }
                     // The value as the register holds it: an `unsigned`
                     // 0xffffffff is `li t0, -1`.
                     self.li("t0", self.image(value, kind));
-                    let target = self.case_label(id);
                     self.branch("beq", "a0, t0", &target);
                 }
                 let otherwise = match default {
@@ -1536,7 +1664,7 @@ impl<'a> FuncGen<'a, '_> {
             }
             (_, Init::Expr(e)) => {
                 self.expr(e);
-                self.access_local(store_op(ty, self.xlen), "a0", off);
+                self.store_local(ty, off);
             }
             _ => unreachable!("sema checked initializer shapes"),
         }
@@ -1574,7 +1702,7 @@ impl<'a> FuncGen<'a, '_> {
                 // The value as the register holds it: an `unsigned int`
                 // 0xffffffff is `li a0, -1`.
                 let kind = e.ty.int_kind().expect("an integer constant");
-                self.li("a0", self.image(*v, kind));
+                self.constant(*v, kind);
             }
             ExprKind::Str(bytes) => {
                 let label = self.file.string(bytes);
@@ -1586,7 +1714,7 @@ impl<'a> FuncGen<'a, '_> {
                     if e.ty.is_addressed() {
                         self.add_imm("a0", "s0", off); // an array or struct: its address
                     } else {
-                        self.access_local(load_op(&e.ty, self.xlen), "a0", off);
+                        self.load_local(&e.ty, off);
                     }
                 }
                 Some(VarRef::Global(sym)) => {
@@ -1624,9 +1752,9 @@ impl<'a> FuncGen<'a, '_> {
             } => {
                 let place = self.place(target);
                 self.load_place(&place, &target.ty);
-                self.push();
+                self.push_value(&target.ty);
                 self.expr(value);
-                self.pop("a1"); // a1 = the target's value, a0 = value
+                self.pop_left(*op, &target.ty, &value.ty); // the target's value, then value
                 let (t, v) = (target.ty.decay(), value.ty.decay());
                 self.binary(*op, &t, &v);
                 let result = arith_type(*op, &t, &v, self.xlen).expect("sema checked the operands");
@@ -1654,6 +1782,15 @@ impl<'a> FuncGen<'a, '_> {
                     }
                     return;
                 }
+                if self.is_pair(ty) {
+                    // A long long on RV32: the step as a pair, added with carry.
+                    self.pair_step(delta);
+                    self.store_place(place, ty);
+                    if !prefix {
+                        self.pair_step(-delta);
+                    }
+                    return;
+                }
                 self.step(ty, delta);
                 self.store_place(place, ty);
                 if !prefix {
@@ -1668,28 +1805,49 @@ impl<'a> FuncGen<'a, '_> {
                 //   .L.and.N:
                 //     snez a0, a0         # 0 or 1
                 let end = self.new_label("and");
-                self.expr(l);
+                self.test(l);
                 self.branch_if_zero(&end);
-                self.expr(r);
+                self.test(r);
                 self.label(&end);
                 self.ins("snez", "a0, a0");
             }
             ExprKind::Binary(BinOp::LogOr, l, r) => {
                 // The mirror image: a nonzero l skips r and becomes 1.
                 let end = self.new_label("or");
-                self.expr(l);
+                self.test(l);
                 self.branch_if_nonzero(&end);
-                self.expr(r);
+                self.test(r);
                 self.label(&end);
                 self.ins("snez", "a0, a0");
             }
             ExprKind::Binary(op, l, r) => {
                 self.expr(l);
-                self.push();
+                self.push_value(&l.ty);
                 self.expr(r);
-                self.pop("a1");
-                // Now a1 = l, a0 = r.
+                self.pop_left(*op, &l.ty, &r.ty);
+                // Now a1 = l, a0 = r (a2:a3 and a0:a1 for pairs).
                 self.binary(*op, &l.ty.decay(), &r.ty.decay());
+            }
+            ExprKind::Unary(op, x) if self.is_pair(&e.ty) || (*op == UnOp::Not && self.is_pair(&x.ty)) => {
+                self.expr(x);
+                match op {
+                    // 0 - x: the high word borrows when the low one is not 0.
+                    UnOp::Neg => {
+                        self.ins("snez", "t0, a0");
+                        self.ins("neg", "a0, a0");
+                        self.ins("neg", "a1, a1");
+                        self.ins("sub", "a1, a1, t0");
+                    }
+                    UnOp::Plus => {}
+                    UnOp::Not => {
+                        self.ins("or", "a0, a0, a1");
+                        self.ins("seqz", "a0, a0");
+                    }
+                    UnOp::BitNot => {
+                        self.ins("not", "a0, a0");
+                        self.ins("not", "a1, a1");
+                    }
+                }
             }
             ExprKind::Unary(op, x) => {
                 self.expr(x);
@@ -1712,7 +1870,7 @@ impl<'a> FuncGen<'a, '_> {
                 let Some(Const::Int(v, kind)) = consteval::eval(e, self.xlen) else {
                     unreachable!("an integer literal cast to an integer type is constant")
                 };
-                self.li("a0", self.image(v, kind));
+                self.constant(v, kind);
             }
             ExprKind::Cast { x, .. } => {
                 self.expr(x);
@@ -1729,7 +1887,7 @@ impl<'a> FuncGen<'a, '_> {
                 //   .L.end.N:
                 let else_ = self.new_label("else");
                 let end = self.new_label("end");
-                self.expr(c);
+                self.test(c);
                 self.branch_if_zero(&else_);
                 self.expr(a);
                 self.ins("j", &end);
@@ -1808,16 +1966,29 @@ impl<'a> FuncGen<'a, '_> {
     /// `va_arg(ap, ty)`: the argument is where ap points, and ap moves past
     /// its words. A scalar is loaded from there; a small struct's value is
     /// its address, there; a big one's address is the word there.
+    ///
+    /// A pair aligned to two words (a long long on RV32) is at the next even
+    /// word, as the caller placed it ([`abi`]): `ap` is rounded up to 8 bytes
+    /// first, as clang's `va_arg` does.
     fn va_arg(&mut self, ap: &'a Expr, ty: &Type) {
         let pass = abi::classify(ty, self.xlen);
         let place = self.place(ap);
         self.load_place(&place, &ap.ty);
+        if abi::aligned_pair(ty, pass, self.xlen) {
+            let align = 2 * self.word();
+            self.ins("addi", format!("a0, a0, {}", align - 1));
+            self.ins("andi", format!("a0, a0, {}", -align));
+        }
         self.ins("mv", "t1, a0");
         self.add_imm("a0", "a0", self.word() * pass.registers() as i32);
         self.store_place(place, &ap.ty);
         match pass {
             // A narrower scalar is in the low bytes of its word.
             Pass::Scalar => self.ins(load_op(ty, self.xlen), "a0, 0(t1)"),
+            Pass::Pair => {
+                self.ins("lw", "a0, 0(t1)");
+                self.ins("lw", "a1, 4(t1)");
+            }
             Pass::Words(_) => self.ins("mv", "a0, t1"),
             Pass::Ref => self.ins(self.load_reg(), "a0, 0(t1)"),
         }
@@ -1826,8 +1997,33 @@ impl<'a> FuncGen<'a, '_> {
     /// Loads the value of type `ty` at the address in `a0`. Arrays, structs
     /// and functions are not loaded: their value is that address.
     fn load(&mut self, ty: &Type) {
-        if !ty.is_addressed() {
+        if self.is_pair(ty) {
+            // The high word first: a0 holds the address.
+            self.ins("lw", "a1, 4(a0)");
+            self.ins("lw", "a0, 0(a0)");
+        } else if !ty.is_addressed() {
             self.ins(load_op(ty, self.xlen), "a0, 0(a0)");
+        }
+    }
+
+    /// Loads the local of type `ty` at `off(s0)`: into `a0`, or for a pair
+    /// into `a0` (low word) and `a1` (high).
+    fn load_local(&mut self, ty: &Type, off: i32) {
+        if self.is_pair(ty) {
+            self.access_local("lw", "a0", off);
+            self.access_local("lw", "a1", off + 4);
+        } else {
+            self.access_local(load_op(ty, self.xlen), "a0", off);
+        }
+    }
+
+    /// Stores `a0` (and for a pair `a1`) to the local of type `ty` at `off(s0)`.
+    fn store_local(&mut self, ty: &Type, off: i32) {
+        if self.is_pair(ty) {
+            self.access_local("sw", "a0", off);
+            self.access_local("sw", "a1", off + 4);
+        } else {
+            self.access_local(store_op(ty, self.xlen), "a0", off);
         }
     }
 
@@ -1877,7 +2073,7 @@ impl<'a> FuncGen<'a, '_> {
     /// Loads the value at a place into `a0`; a pushed address stays pushed.
     fn load_place(&mut self, place: &Place, ty: &Type) {
         match place {
-            Place::Frame(off) => self.access_local(load_op(ty, self.xlen), "a0", *off),
+            Place::Frame(off) => self.load_local(ty, *off),
             Place::Pushed => {
                 self.ins(self.load_reg(), "a0, 0(sp)"); // the address, left on the stack
                 self.load(ty);
@@ -1888,7 +2084,13 @@ impl<'a> FuncGen<'a, '_> {
     /// Stores `a0` to a place, popping a pushed address.
     fn store_place(&mut self, place: Place, ty: &Type) {
         match place {
-            Place::Frame(off) => self.access_local(store_op(ty, self.xlen), "a0", off),
+            Place::Frame(off) => self.store_local(ty, off),
+            // A pair's value is in a0 and a1: the address goes to t2.
+            Place::Pushed if self.is_pair(ty) => {
+                self.pop("t2");
+                self.ins("sw", "a0, 0(t2)");
+                self.ins("sw", "a1, 4(t2)");
+            }
             Place::Pushed => {
                 self.pop("a1");
                 self.ins(store_op(ty, self.xlen), "a0, 0(a1)");
@@ -1897,8 +2099,34 @@ impl<'a> FuncGen<'a, '_> {
     }
 
     /// Converts the value in `a0` from type `from` to type `to`.
+    ///
+    /// On RV32 a `long long` is a pair: one comes from a 32-bit value with
+    /// its high word the sign (`srai a1, a0, 31`) or 0, by the value's
+    /// signedness; one goes to a narrower type from its low word, and to
+    /// `_Bool` from both (`or` then `snez`).
     fn convert(&mut self, from: &Type, to: &Type) {
-        self.convert_reg("a0", from, to);
+        match (self.is_pair(from), self.is_pair(to)) {
+            (false, true) => self.widen_to_pair("a0", "a1", from),
+            (true, true) => {}
+            (true, false) if to.int_kind() == Some(IntKind::Bool) => {
+                self.ins("or", "a0, a0, a1");
+                self.ins("snez", "a0, a0");
+            }
+            // The low word, as the unsigned int it is.
+            (true, false) => self.convert_reg("a0", &Type::UINT, to),
+            (false, false) => self.convert_reg("a0", from, to),
+        }
+    }
+
+    /// `lo:hi` = the 32-bit value of type `from` in `lo`, as a long long:
+    /// its high word copies the sign of a signed value, and is 0 for an
+    /// unsigned one (narrow types are extended already).
+    fn widen_to_pair(&mut self, lo: &str, hi: &str, from: &Type) {
+        if from.is_integer() && !from.is_unsigned() {
+            self.ins("srai", format!("{hi}, {lo}, 31"));
+        } else {
+            self.ins("li", format!("{hi}, 0"));
+        }
     }
 
     /// Converts the value in `reg` from type `from` to type `to`, keeping
@@ -2009,6 +2237,18 @@ impl<'a> FuncGen<'a, '_> {
                 BinOp::Shl | BinOp::Shr => lk.promoted(),
                 _ => crate::types::common(lk, rk, x),
             });
+            if self.is_pair(&k) {
+                // In a long long on RV32: the left operand in a2:a3, the
+                // right in a0:a1 (a shift's amount is its low word, a0).
+                // A narrower left operand is in a2 already (see `pop_left`).
+                if !self.is_pair(l) {
+                    self.widen_to_pair("a2", "a3", l);
+                }
+                if !matches!(op, BinOp::Shl | BinOp::Shr) && !self.is_pair(r) {
+                    self.widen_to_pair("a0", "a1", r);
+                }
+                return self.pair_arith(op, k.is_unsigned());
+            }
             self.convert_reg("a1", l, &k);
             if !matches!(op, BinOp::Shl | BinOp::Shr) {
                 self.convert_reg("a0", r, &k);
@@ -2026,11 +2266,176 @@ impl<'a> FuncGen<'a, '_> {
             })
         };
         if l.is_ptr() && r.is_integer() {
-            self.convert_reg("a0", r, &index(r));
+            // A pair index on RV32: its low word, in a0 already.
+            if !self.is_pair(r) {
+                self.convert_reg("a0", r, &index(r));
+            }
         } else if r.is_ptr() && l.is_integer() {
-            self.convert_reg("a1", l, &index(l));
+            if self.is_pair(l) {
+                self.ins("mv", "a1, a2");
+            } else {
+                self.convert_reg("a1", l, &index(l));
+            }
         }
         self.arith(op, l, r);
+    }
+
+    /// `a0:a1 = a2:a3 op a0:a1` for a long long on RV32 (`unsigned` for an
+    /// `unsigned long long`), as LLVM expands 64-bit operations on RV32
+    /// with M: a carry or a borrow from the low words (`sltu`), `mul` and
+    /// `mulhu` for the product, each shift in two halves by whether the
+    /// amount reaches 32, comparisons on the high words and then the low
+    /// ones, unsigned (their result, 0 or 1, in `a0`). Division and
+    /// remainder call the libgcc routines (`__divdi3`, `__udivdi3`,
+    /// `__moddi3`, `__umoddi3`), which the C library and the kernel
+    /// provide. Clobbers `t0`-`t2`.
+    fn pair_arith(&mut self, op: BinOp, unsigned: bool) {
+        let less = if unsigned { "sltu" } else { "slt" };
+        match op {
+            BinOp::Add => {
+                self.ins("add", "a0, a2, a0");
+                self.ins("sltu", "t0, a0, a2"); // the carry
+                self.ins("add", "a1, a3, a1");
+                self.ins("add", "a1, a1, t0");
+            }
+            BinOp::Sub => {
+                self.ins("sltu", "t0, a2, a0"); // the borrow
+                self.ins("sub", "a0, a2, a0");
+                self.ins("sub", "a1, a3, a1");
+                self.ins("sub", "a1, a1, t0");
+            }
+            BinOp::Mul => {
+                self.ins("mul", "t0, a3, a0"); // hi(l) * lo(r)
+                self.ins("mul", "t1, a2, a1"); // lo(l) * hi(r)
+                self.ins("add", "t0, t0, t1");
+                self.ins("mulhu", "t1, a2, a0"); // the carry out of lo(l) * lo(r)
+                self.ins("add", "a1, t0, t1");
+                self.ins("mul", "a0, a2, a0");
+            }
+            BinOp::Div | BinOp::Rem => {
+                let helper = match (op, unsigned) {
+                    (BinOp::Div, false) => "__divdi3",
+                    (BinOp::Div, true) => "__udivdi3",
+                    (_, false) => "__moddi3",
+                    (_, true) => "__umoddi3",
+                };
+                // The dividend in a0:a1, the divisor in a2:a3.
+                self.ins("mv", "t0, a0");
+                self.ins("mv", "t1, a1");
+                self.ins("mv", "a0, a2");
+                self.ins("mv", "a1, a3");
+                self.ins("mv", "a2, t0");
+                self.ins("mv", "a3, t1");
+                let pad = (16 - (self.depth as i32 * self.word()) % 16) % 16;
+                if pad != 0 {
+                    self.ins("addi", format!("sp, sp, {}", -pad));
+                }
+                self.ins_sized(8, "call", helper);
+                if pad != 0 {
+                    self.ins("addi", format!("sp, sp, {pad}"));
+                }
+            }
+            BinOp::Shl | BinOp::Shr => self.pair_shift(op == BinOp::Shl, unsigned),
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                let w = match op {
+                    BinOp::BitAnd => "and",
+                    BinOp::BitOr => "or",
+                    _ => "xor",
+                };
+                self.ins(w, "a0, a2, a0");
+                self.ins(w, "a1, a3, a1");
+            }
+            BinOp::Eq | BinOp::Ne => {
+                self.ins("xor", "t0, a2, a0");
+                self.ins("xor", "t1, a3, a1");
+                self.ins("or", "a0, t0, t1");
+                self.ins(if op == BinOp::Eq { "seqz" } else { "snez" }, "a0, a0");
+            }
+            // l < r: the high words decide, or when they are equal the low
+            // ones (unsigned). `>` swaps the sides; `<=` and `>=` negate.
+            BinOp::Lt | BinOp::Ge => {
+                self.pair_less(less, ("a2", "a3"), ("a0", "a1"));
+                if op == BinOp::Ge {
+                    self.ins("xori", "a0, a0, 1");
+                }
+            }
+            BinOp::Gt | BinOp::Le => {
+                self.pair_less(less, ("a0", "a1"), ("a2", "a3"));
+                if op == BinOp::Le {
+                    self.ins("xori", "a0, a0, 1");
+                }
+            }
+            BinOp::LogAnd | BinOp::LogOr => unreachable!("handled in expr: they short-circuit"),
+        }
+    }
+
+    /// `a0 = x < y` for the pairs `x` and `y` (`slt` or `sltu` on the high
+    /// words): `(x.hi < y.hi) | (x.hi == y.hi & x.lo <u y.lo)`.
+    fn pair_less(&mut self, less: &str, x: (&str, &str), y: (&str, &str)) {
+        self.ins(less, format!("t0, {}, {}", x.1, y.1));
+        self.ins("xor", format!("t1, {}, {}", x.1, y.1));
+        self.ins("seqz", "t1, t1");
+        self.ins("sltu", format!("t2, {}, {}", x.0, y.0));
+        self.ins("and", "t1, t1, t2");
+        self.ins("or", "a0, t0, t1");
+    }
+
+    /// `a0:a1 = a2:a3 << a0` (or `>>`, arithmetic unless `unsigned`), by the
+    /// low 6 bits of the amount, as RV64's `sll` takes them. From 32 up one
+    /// word moves to the other, shifted by the rest (`sll` takes its low 5
+    /// bits); below 32 the bits crossing between the words are shifted by
+    /// `31 - n` after a shift by 1, which is right for `n = 0` too:
+    ///
+    /// ```text
+    ///     andi  a0, a0, 63       # n
+    ///     andi  t0, a0, 32
+    ///     beqz  t0, .L.shl.N
+    ///     sll   a1, a2, a0       # n >= 32: hi = lo << (n - 32), lo = 0
+    ///     li    a0, 0
+    ///     j     .L.shift.N
+    ///   .L.shl.N:                # n < 32
+    ///     sll   a1, a3, a0       # hi << n
+    ///     srli  t1, a2, 1        # | lo >> (32 - n)
+    ///     not   t2, a0
+    ///     srl   t1, t1, t2
+    ///     or    a1, a1, t1
+    ///     sll   a0, a2, a0       # lo << n
+    ///   .L.shift.N:
+    /// ```
+    fn pair_shift(&mut self, left: bool, unsigned: bool) {
+        let small = self.new_label(if left { "shl" } else { "shr" });
+        let end = self.new_label("shift");
+        self.ins("andi", "a0, a0, 63");
+        self.ins("andi", "t0, a0, 32");
+        self.branch("beqz", "t0", &small);
+        if left {
+            self.ins("sll", "a1, a2, a0");
+            self.ins("li", "a0, 0");
+        } else if unsigned {
+            self.ins("srl", "a0, a3, a0");
+            self.ins("li", "a1, 0");
+        } else {
+            self.ins("sra", "a0, a3, a0");
+            self.ins("srai", "a1, a3, 31");
+        }
+        self.ins("j", &end);
+        self.label(&small);
+        self.ins("not", "t2, a0");
+        if left {
+            self.ins("sll", "a1, a3, a0");
+            self.ins("srli", "t1, a2, 1");
+            self.ins("srl", "t1, t1, t2");
+            self.ins("or", "a1, a1, t1");
+            self.ins("sll", "a0, a2, a0");
+        } else {
+            self.ins("srl", "t0, a2, a0"); // lo >> n
+            self.ins("slli", "t1, a3, 1"); // | hi << (32 - n)
+            self.ins("sll", "t1, t1, t2");
+            self.ins("or", "t0, t0, t1");
+            self.ins(if unsigned { "srl" } else { "sra" }, "a1, a3, a0");
+            self.ins("mv", "a0, t0");
+        }
+        self.label(&end);
     }
 
     /// [`Self::binary`] once the operands are converted: both of the
@@ -2166,12 +2571,17 @@ impl<'a> FuncGen<'a, '_> {
         if let Some(last) = args.len().checked_sub(1) {
             for i in 0..last {
                 self.argument(&args[i], copies[i]);
-                self.push();
+                self.push_value(&args[i].ty);
             }
             self.argument(&args[last], copies[last]);
             match regs[last] {
-                (0, Pass::Scalar | Pass::Ref) => {}
+                (0, Pass::Scalar | Pass::Ref | Pass::Pair) => {}
                 (r, Pass::Scalar | Pass::Ref) => self.ins("mv", format!("a{r}, a0")),
+                // The high word first: a1 may be where the low word goes.
+                (r, Pass::Pair) => {
+                    self.ins("mv", format!("a{}, a1", r + 1));
+                    self.ins("mv", format!("a{r}, a0"));
+                }
                 (r, Pass::Words(n)) => {
                     self.ins("mv", "t1, a0");
                     self.load_words("t1", r, n, &types[last]);
@@ -2180,6 +2590,7 @@ impl<'a> FuncGen<'a, '_> {
             for i in (0..last).rev() {
                 match regs[i] {
                     (r, Pass::Scalar | Pass::Ref) => self.pop(&format!("a{r}")),
+                    (r, Pass::Pair) => self.pop_pair(&format!("a{r}"), &format!("a{}", r + 1)),
                     (r, Pass::Words(n)) => {
                         self.pop("t1");
                         self.load_words("t1", r, n, &types[i]);
@@ -2265,11 +2676,14 @@ impl<'a> FuncGen<'a, '_> {
             self.expr(callee);
             self.push();
         }
+        // How many words each argument takes pushed: a pair two, others one.
+        let mut sizes = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             self.argument(a, copies[i]);
-            self.push();
+            self.push_value(&a.ty);
+            sizes.push(if self.is_pair(&a.ty) { 2 } else { 1 });
         }
-        let n = args.len() as i32;
+        let n: i32 = sizes.iter().sum();
         let (w, load, store) = (self.word(), self.load_reg(), self.store_reg());
         let pushed = w * self.depth as i32;
         let stack = w * abi::stack_words(used) as i32;
@@ -2280,7 +2694,7 @@ impl<'a> FuncGen<'a, '_> {
         });
         self.add_imm("sp", "sp", -area);
         // Where argument i was pushed: the last one is right above the area.
-        let temp = |i: usize| area + w * (n - 1 - i as i32);
+        let temp = |i: usize| area + w * sizes[i + 1..].iter().sum::<i32>();
         // The stack words first (with t1, t2 and t0), then the registers.
         for (i, &(word, pass)) in words.iter().enumerate() {
             match pass {
@@ -2288,6 +2702,15 @@ impl<'a> FuncGen<'a, '_> {
                     if let ArgWord::Stack(at) = arg_word(word, self.xlen) {
                         self.ins(load, format!("t1, {}(sp)", temp(i)));
                         self.ins(store, format!("t1, {at}(sp)"));
+                    }
+                }
+                // A pair's words were pushed as they go: low, then high.
+                Pass::Pair => {
+                    for k in 0..2 {
+                        if let ArgWord::Stack(at) = arg_word(word + k, self.xlen) {
+                            self.ins(load, format!("t1, {}(sp)", temp(i) + w * k as i32));
+                            self.ins(store, format!("t1, {at}(sp)"));
+                        }
                     }
                 }
                 Pass::Words(nw) => {
@@ -2306,6 +2729,13 @@ impl<'a> FuncGen<'a, '_> {
                 Pass::Scalar | Pass::Ref => {
                     if let ArgWord::Reg(r) = arg_word(word, self.xlen) {
                         self.ins(load, format!("{r}, {}(sp)", temp(i)));
+                    }
+                }
+                Pass::Pair => {
+                    for k in 0..2 {
+                        if let ArgWord::Reg(r) = arg_word(word + k, self.xlen) {
+                            self.ins(load, format!("{r}, {}(sp)", temp(i) + w * k as i32));
+                        }
                     }
                 }
                 Pass::Words(nw) => {
@@ -3435,6 +3865,140 @@ main:
         }
         // Locals may have any name: they have no symbol.
         compile("int main() { int a0 = 1; return a0; }");
+    }
+
+    /// `long long` on RV32: register pairs.
+    mod pairs {
+        use super::{body_of, compile};
+
+        /// The instructions of `f` after the prologue and the parameters'
+        /// stores and loads, up to the epilogue.
+        fn tail(src: &str, f: &str, skip: usize) -> String {
+            body_of(&compile(src), f)[skip..].join("; ")
+        }
+
+        #[test]
+        fn arithmetic_across_the_words() {
+            let op = |e: &str| {
+                tail(
+                    &format!("long long f(long long a, long long b) {{ return {e}; }}"),
+                    "f",
+                    19,
+                )
+            };
+            assert_eq!(
+                op("a + b"),
+                "add a0, a2, a0; sltu t0, a0, a2; add a1, a3, a1; add a1, a1, t0"
+            );
+            assert_eq!(
+                op("a - b"),
+                "sltu t0, a2, a0; sub a0, a2, a0; sub a1, a3, a1; sub a1, a1, t0"
+            );
+            assert_eq!(
+                op("a * b"),
+                "mul t0, a3, a0; mul t1, a2, a1; add t0, t0, t1; mulhu t1, a2, a0; add a1, t0, t1; mul a0, a2, a0"
+            );
+            assert_eq!(op("a & b"), "and a0, a2, a0; and a1, a3, a1");
+            // Division calls libgcc's routines, with the operands in a0:a1 and a2:a3.
+            assert_eq!(
+                op("a / b"),
+                "mv t0, a0; mv t1, a1; mv a0, a2; mv a1, a3; mv a2, t0; mv a3, t1; call __divdi3"
+            );
+            assert!(tail(
+                "unsigned long long f(unsigned long long a, unsigned long long b) { return a % b; }",
+                "f",
+                19
+            )
+            .ends_with("call __umoddi3"));
+            // Comparisons: the high words, then the low ones unsigned.
+            let cmp = tail("int f(long long a, long long b) { return a < b; }", "f", 19);
+            assert_eq!(
+                cmp,
+                "slt t0, a3, a1; xor t1, a3, a1; seqz t1, t1; sltu t2, a2, a0; and t1, t1, t2; or a0, t0, t1"
+            );
+            let eq = tail("int f(long long a, long long b) { return a == b; }", "f", 19);
+            assert_eq!(eq, "xor t0, a2, a0; xor t1, a3, a1; or a0, t0, t1; seqz a0, a0");
+        }
+
+        #[test]
+        fn shifts_by_whether_the_amount_reaches_32() {
+            let body = tail("long long f(long long a, int n) { return a << n; }", "f", 17);
+            assert!(
+                body.starts_with(
+                    "andi a0, a0, 63; andi t0, a0, 32; beqz t0, .L.shl.1; sll a1, a2, a0; li a0, 0; j .L.shift.2; \
+                     not t2, a0; sll a1, a3, a0; srli t1, a2, 1; srl t1, t1, t2; or a1, a1, t1; sll a0, a2, a0"
+                ),
+                "{body}"
+            );
+            let body = tail("long long f(long long a, int n) { return a >> n; }", "f", 17);
+            assert!(body.contains("sra a0, a3, a0; srai a1, a3, 31"), "{body}");
+            let body = tail(
+                "unsigned long long f(unsigned long long a, int n) { return a >> n; }",
+                "f",
+                17,
+            );
+            assert!(body.contains("srl a0, a3, a0; li a1, 0"), "{body}");
+        }
+
+        #[test]
+        fn conversions() {
+            // To a pair: the sign, or 0; from one, the low word.
+            let cast =
+                |from: &str, to: &str| tail(&format!("{to} f({from} x) {{ return ({to})x; }}"), "f", 6);
+            assert_eq!(cast("int", "long long"), "srai a1, a0, 31");
+            assert_eq!(cast("unsigned", "long long"), "li a1, 0");
+            assert_eq!(cast("unsigned char", "long long"), "srai a1, a0, 31");
+            assert_eq!(cast("char *", "unsigned long long"), "li a1, 0");
+            let cast =
+                |from: &str, to: &str| tail(&format!("{to} f({from} x) {{ return ({to})x; }}"), "f", 8);
+            assert_eq!(cast("long long", "int"), "");
+            assert_eq!(cast("long long", "short"), "slli a0, a0, 16; srai a0, a0, 16");
+            assert_eq!(cast("long long", "_Bool"), "or a0, a0, a1; snez a0, a0");
+            // A constant is two li.
+            assert_eq!(
+                tail("long long f(void) { return 0x123456789LL; }", "f", 4),
+                "li a0, 591751049; li a1, 1"
+            );
+        }
+
+        #[test]
+        fn arguments_take_pairs_of_words() {
+            // A named pair may start in a7, its high word at 0(s0).
+            let body = body_of(
+                &compile(
+                    "long long f(int a, int b, int c, int d, int e, int f, int g, long long h) { return h; }",
+                ),
+                "f",
+            );
+            assert!(
+                body.join("; ")
+                    .contains("sw a7, -48(s0); lw t1, 0(s0); sw t1, -44(s0)"),
+                "{body:?}"
+            );
+            // A variadic one starts in an even register: 5LL skips a1.
+            let body = tail(
+                "long long v(int n, ...); int f(void) { return v(1, 5LL); }",
+                "f",
+                4,
+            );
+            assert_eq!(
+                body,
+                "li a0, 1; addi sp, sp, -4; sw a0, 0(sp); li a0, 5; li a1, 0; mv a3, a1; mv a2, a0; \
+                 lw a0, 0(sp); addi sp, sp, 4; call v"
+            );
+            // va_arg rounds the pointer up to 8 bytes first.
+            let body = tail(
+                "long long f(int n, ...) { __builtin_va_list ap; __builtin_va_start(ap, n); \
+                 return __builtin_va_arg(ap, long long); }",
+                "f",
+                14,
+            );
+            assert!(
+                body.contains("addi a0, a0, 7; andi a0, a0, -8; mv t1, a0; addi a0, a0, 8"),
+                "{body}"
+            );
+            assert!(body.ends_with("lw a0, 0(t1); lw a1, 4(t1)"), "{body}");
+        }
     }
 
     /// The RV64 counterparts of the tests above: LP64 sizes, the W

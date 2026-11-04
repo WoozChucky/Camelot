@@ -16,11 +16,12 @@
 //!
 //! Integer literals get their C type in [`finish`] (C99 6.4.4.1): the first
 //! of the candidate types that holds the value. A decimal literal is `int`,
-//! else `long`; a hex or octal one is `int`, `unsigned int`, `long` or
-//! `unsigned long`; `u`, `l` and `ul` suffixes start the list further on.
-//! Which types hold a value depends on the target: `long` is 32 bits on
-//! ILP32, so `2147483648` would be `long long` there, which merlin rejects,
-//! and 64 bits on LP64, where it is a `long`. Character literals are `int`s
+//! `long` or `long long`; a hex or octal one may also be the unsigned type
+//! of each (`int`, `unsigned int`, `long`, `unsigned long`, `long long`,
+//! `unsigned long long`); `u`, `l`, `ll` and their mixes (`ul`, `ull`...)
+//! start the list further on. Which types hold a value depends on the
+//! target: `long` is 32 bits on ILP32, so `2147483648` is a `long long`
+//! there, and 64 bits on LP64, where it is a `long`. Character literals are `int`s
 //! holding the byte (plain `char` is unsigned, so `'ÿ'` is 255). String
 //! literals are bytes, with the escapes C has.
 
@@ -574,26 +575,33 @@ pub fn number(text: &str, pos: Pos, x: Xlen) -> Result<Tok, Error> {
         unsigned,
         long,
     } = integer(text, pos)?;
-    // The candidate types, in C's order; the first that holds the value wins.
+    // The candidate types, in C's order (C99 6.4.4.1p5); the first that
+    // holds the value wins.
     use IntKind::*;
-    let candidates: &[IntKind] = match (unsigned, long, decimal) {
-        (false, false, true) => &[Int, Long],
-        (false, false, false) => &[Int, UInt, Long, ULong],
-        (true, false, _) => &[UInt, ULong],
-        (false, true, true) => &[Long],
-        (false, true, false) => &[Long, ULong],
-        (true, true, _) => &[ULong],
+    let all: &[IntKind] = match (unsigned, decimal) {
+        (false, true) => &[Int, Long, LongLong],
+        (false, false) => &[Int, UInt, Long, ULong, LongLong, ULongLong],
+        (true, _) => &[UInt, ULong, ULongLong],
     };
-    // Past 64 bits it fits none of them either.
-    let value = value.unwrap_or(u64::MAX);
-    match candidates.iter().find(|k| i128::from(value) <= k.range(x).1) {
+    // `l` starts at `long`, `ll` at `long long`.
+    let candidates = all.iter().filter(|k| match long {
+        0 => true,
+        1 => !matches!(k, Int | UInt),
+        _ => matches!(k, LongLong | ULongLong),
+    });
+    let Some(value) = value else {
+        return Err(Error::new(
+            pos,
+            format!("integer literal '{text}' is too large to be represented in any integer type"),
+        ));
+    };
+    match candidates.into_iter().find(|k| i128::from(value) <= k.range(x).1) {
         Some(&k) => Ok(Tok::Num(value.into(), k)),
+        // A decimal literal past LLONG_MAX: C99 gives it no type (clang
+        // takes it as unsigned, with a warning).
         None => Err(Error::new(
             pos,
-            format!(
-                "integer literal '{text}' is too large for any type merlin has \
-                 ('long long' is not supported yet)"
-            ),
+            format!("integer literal '{text}' is too large to be represented in a signed integer type"),
         )),
     }
 }
@@ -605,9 +613,10 @@ pub struct IntLit {
     pub value: Option<u64>,
     /// Written in decimal (not hex or octal).
     pub decimal: bool,
-    /// The suffix has a `u`, an `l`.
+    /// The suffix has a `u`.
     pub unsigned: bool,
-    pub long: bool,
+    /// The suffix has an `l` (1) or an `ll` (2).
+    pub long: u8,
 }
 
 /// Reads an integer constant. The preprocessor's `#if` uses it too, where
@@ -633,18 +642,17 @@ pub fn integer(text: &str, pos: Pos) -> Result<IntLit, Error> {
         return Err(invalid());
     }
     let (unsigned, long) = match suffix {
-        "" => (false, false),
-        "u" => (true, false),
-        "l" => (false, true),
-        "ul" | "lu" => (true, true),
-        "ll" | "ull" | "llu" => {
-            return Err(Error::new(
-                pos,
-                format!("'long long' is not supported yet: '{text}'"),
-            ))
-        }
+        "" => (false, 0),
+        "u" => (true, 0),
+        "l" => (false, 1),
+        "ul" | "lu" => (true, 1),
+        "ll" | "ull" | "llu" => (suffix.contains('u'), 2),
         _ => return Err(invalid()),
     };
+    // `ll` is `ll` or `LL`, never `lL` (C99 6.4.4.1).
+    if long == 2 && !(text.contains("ll") || text.contains("LL")) {
+        return Err(invalid());
+    }
     // The digits are valid, so the only way to fail is to overflow.
     Ok(IntLit {
         value: u64::from_str_radix(digits, radix).ok(),
@@ -841,22 +849,27 @@ mod tests {
         assert_eq!(num("0xffffffffL"), (0xffff_ffff, ULong));
         assert_eq!(num("10ul"), (10, ULong));
         assert_eq!(num("10LU"), (10, ULong));
-        // A decimal literal past INT_MAX would be long long in C.
-        let too_large = |lit: &str| {
-            format!(
-                "1:1: integer literal '{lit}' is too large for any type merlin has ('long long' is not supported yet)"
-            )
-        };
-        for lit in [
-            "2147483648",
-            "2147483648l",
-            "4294967296u",
-            "0x100000000",
-            "99999999999999999999",
-        ] {
-            assert_eq!(err(lit), too_large(lit));
-        }
-        assert_eq!(err("10ll"), "1:1: 'long long' is not supported yet: '10ll'");
+        // Past (unsigned) long on ILP32: long long.
+        assert_eq!(num("2147483648"), (0x8000_0000, LongLong));
+        assert_eq!(num("2147483648l"), (0x8000_0000, LongLong));
+        assert_eq!(num("4294967296u"), (1 << 32, ULongLong));
+        assert_eq!(num("0x100000000"), (1 << 32, LongLong));
+        assert_eq!(num("0xffffffffffffffff"), (u64::MAX.into(), ULongLong));
+        assert_eq!(num("10ll"), (10, LongLong));
+        assert_eq!(num("10LL"), (10, LongLong));
+        assert_eq!(num("10ull"), (10, ULongLong));
+        assert_eq!(num("10LLU"), (10, ULongLong));
+        assert_eq!(num("0x8000000000000000ll"), (1 << 63, ULongLong));
+        assert_eq!(
+            err("99999999999999999999"),
+            "1:1: integer literal '99999999999999999999' is too large to be represented in any integer type"
+        );
+        assert_eq!(
+            err("9223372036854775808"),
+            "1:1: integer literal '9223372036854775808' is too large to be represented in a signed integer type"
+        );
+        assert_eq!(err("10lL"), "1:1: invalid integer literal '10lL'");
+        assert_eq!(err("10lll"), "1:1: invalid integer literal '10lll'");
         assert_eq!(err("x = 09;"), "1:5: invalid integer literal '09'");
         assert_eq!(err("12abc"), "1:1: invalid integer literal '12abc'");
         assert_eq!(err("0x"), "1:1: invalid integer literal '0x'");
