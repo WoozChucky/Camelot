@@ -19,7 +19,7 @@ Camelot is a learning project: the Excalibur ISA (RV64IMA + Zicsr + Zifencei, M/
 
 ```
 crates/excalibur        encodings, decoder, disassembler (shared by every tool), for RV32 and RV64: decode and Syntax take the width (Xlen); tests/disasm.rs checks both against llvm-objdump's text for tests/golden/rv{32,64}.s (scripts/gen-excalibur-golden.sh)
-crates/elf              ELF reader, ELF32 and ELF64 alike (grail, merlin-objdump, merlin-ld), and DWARF line tables (src/lines.rs: merlin-objdump -l, merlin-dbg); tests/llvm.rs reads RV32 and RV64 files clang and ld.lld made as llvm-readelf and llvm-dwarfdump print them (scripts/gen-elf-golden.sh)
+crates/elf              ELF reader, ELF32 and ELF64 alike (grail, merlin-objdump, merlin-ld), DWARF line tables (src/lines.rs: merlin-objdump -l, merlin-dbg) and compile units (src/units.rs: their address ranges and function names, which line table and name an address has for merlin-objdump -l, as LLVM's symbolizer finds them); tests/llvm.rs reads RV32 and RV64 files clang and ld.lld made as llvm-readelf and llvm-dwarfdump print them (scripts/gen-elf-golden.sh)
 crates/grail            the emulator, RV32 or RV64 per machine (src/cpu: an RV32 hart keeps its registers sign-extended in u64, see src/cpu/mod.rs; rom/diskboot.s: the boot ROM's disk loader, which boots a machine started with no program from disk 0)
 crates/avalon-proto     Avalon protocol (framing, messages, Connection, Screen diffing), shared by the Avalon platform's programs; spec in docs/avalon-protocol.md
 crates/gateway          user-mode NAT gateway (DHCP, DNS, TCP/UDP NAT, hostfwd) with its own frame send/recv API; grail wraps it as a NetBackend for `--net user` (spec 9.8). Must not depend on grail
