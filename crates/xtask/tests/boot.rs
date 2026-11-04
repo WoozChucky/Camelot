@@ -12,6 +12,7 @@
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::{boot, fsck, read::Fs, BSIZE};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
+use std::collections::BTreeSet;
 use xtask::kernel::BOOT_MAX_STEPS;
 use xtask::repo_root;
 
@@ -447,6 +448,71 @@ fn equ(source: &str, name: &str) -> u32 {
     }
 }
 
+/// Whether an assembly source has `.equ NAME, VALUE`.
+fn has_equ(source: &str, name: &str) -> bool {
+    source
+        .lines()
+        .any(|l| l.trim_start().starts_with(&format!(".equ {name},")))
+}
+
+/// The names the RV64 sources give version 2's device registers and their
+/// values, and Grail's value of each: the sysinfo block's (spec section 9.5),
+/// the disk's (9.6) and the network card's (9.8), with the bits and codes
+/// read from them. Every name is defined by at least one RV64 source.
+const V2_REGISTERS: &[(&str, u32)] = {
+    use grail::block::{self, v2 as blk};
+    use grail::net::{self, v2 as nic};
+    use grail::sysinfo::{self, v2 as sys, DeviceType};
+    &[
+        ("SYSINFO_MAGIC", sysinfo::SYSINFO_MAGIC),
+        ("SYS_MAGIC", sysinfo::REG_MAGIC),
+        ("SYS_VERSION", sysinfo::REG_VERSION),
+        ("SYS_RAM_BASE", sys::REG_RAM_BASE),
+        ("SYS_RAM_SIZE", sys::REG_RAM_SIZE),
+        ("SYS_TIMEBASE_HZ", sys::REG_TIMEBASE_HZ),
+        ("SYS_CPU_HZ", sys::REG_CPU_HZ),
+        ("SYS_FLAGS", sys::REG_FLAGS),
+        ("SYS_DEV_COUNT", sys::REG_DEV_COUNT),
+        ("SYS_HARTS", sys::REG_HARTS),
+        ("SYS_DEV_TABLE", sysinfo::DEV_TABLE),
+        ("DEV_ENTRY_SIZE", sys::DEV_ENTRY_SIZE),
+        ("FLAG_REAL_TIME", sysinfo::FLAG_REAL_TIME),
+        ("DEV_BLOCK", DeviceType::Block as u32),
+        ("DEV_NET", DeviceType::Net as u32),
+        ("BLK_CAPACITY", blk::REG_CAPACITY),
+        ("BLK_SECTOR", blk::REG_SECTOR),
+        ("BLK_DMA", blk::REG_DMA),
+        ("BLK_COUNT", blk::REG_COUNT),
+        ("BLK_FLAGS", blk::REG_FLAGS),
+        ("BLK_CMD", blk::REG_CMD),
+        ("BLK_STATUS", blk::REG_STATUS),
+        ("BLK_ERROR", blk::REG_ERROR),
+        ("BLK_CTRL", blk::REG_CTRL),
+        ("CMD_READ", block::CMD_READ),
+        ("CMD_WRITE", block::CMD_WRITE),
+        ("CMD_FLUSH", block::CMD_FLUSH),
+        ("STATUS_DONE", block::STATUS_DONE),
+        ("FLAG_READ_ONLY", block::FLAG_READ_ONLY),
+        ("ERR_OUT_OF_RANGE", block::error::OUT_OF_RANGE),
+        ("SECTOR_SIZE", block::SECTOR_SIZE as u32),
+        ("NET_MAC_LO", net::REG_MAC_LO),
+        ("NET_MAC_HI", net::REG_MAC_HI),
+        ("NET_STATUS", net::REG_STATUS),
+        ("NET_IRQ_ENABLE", net::REG_IRQ_ENABLE),
+        ("NET_IRQ_STATUS", net::REG_IRQ_STATUS),
+        ("NET_TX_BASE", nic::REG_TX_BASE),
+        ("NET_TX_SIZE", nic::REG_TX_SIZE),
+        ("NET_TX_HEAD", nic::REG_TX_HEAD),
+        ("NET_TX_TAIL", nic::REG_TX_TAIL),
+        ("NET_RX_BASE", nic::REG_RX_BASE),
+        ("NET_RX_SIZE", nic::REG_RX_SIZE),
+        ("NET_RX_HEAD", nic::REG_RX_HEAD),
+        ("NET_RX_TAIL", nic::REG_RX_TAIL),
+        ("DESC_SIZE", nic::DESC_SIZE),
+        ("IRQ_RX", net::IRQ_RX),
+    ]
+};
+
 #[test]
 fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     let root = repo_root();
@@ -484,6 +550,36 @@ fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     ] {
         assert_eq!(equ(&rom64, name), equ(&rom, name), "{name}");
     }
+    // The RV64 loader's and the RV64 examples' device registers are where
+    // version 2 of each interface has them (spec sections 9.5, 9.6, 9.8).
+    let mut rv64 = vec![("crates/grail/rom/diskboot-rv64.s".to_string(), rom64.clone())];
+    for dir in std::fs::read_dir(root.join("examples")).unwrap() {
+        let dir = dir.unwrap().path();
+        if !dir.is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(&dir).unwrap() {
+            let f = f.unwrap().path();
+            let assembly = f.extension().is_some_and(|e| e == "S" || e == "s");
+            if assembly
+                && f.file_stem()
+                    .is_some_and(|s| s.to_string_lossy().ends_with("-rv64"))
+            {
+                let text = std::fs::read_to_string(&f).unwrap();
+                rv64.push((f.strip_prefix(&root).unwrap().display().to_string(), text));
+            }
+        }
+    }
+    let mut unchecked: BTreeSet<&str> = V2_REGISTERS.iter().map(|&(name, _)| name).collect();
+    for (path, source) in &rv64 {
+        for &(name, value) in V2_REGISTERS {
+            if has_equ(source, name) {
+                assert_eq!(equ(source, name), value, "{path}: {name}");
+                unchecked.remove(name);
+            }
+        }
+    }
+    assert!(unchecked.is_empty(), "no RV64 source defines {unchecked:?}");
     assert!(spec.contains("exit code 0xFD") && spec.contains("0x544F_4F42"));
     // The fields the bootloader reads are where mkfs writes them.
     assert_eq!(equ(&loader, "KERNEL_SECTOR") as usize, boot::KERNEL_SECTOR_AT);
