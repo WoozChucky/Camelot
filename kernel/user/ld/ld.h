@@ -255,6 +255,10 @@ struct input_ref {
 struct output_section {
     char *name;
     uint addr;
+    /* 1 for an empty section at exactly 4 GiB (addr is then 0), the one
+     * address past 32 bits a section may have on ELF32: merlin-ld keeps it
+     * 64-bit, and so it is above every other section, not below. */
+    uint addr_hi;
     uint size;
     /* The load address (LMA, the segment's p_paddr): addr unless the script
      * says otherwise with AT. 64 bits, as merlin-ld's u64: a load range past

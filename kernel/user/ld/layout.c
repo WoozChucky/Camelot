@@ -982,6 +982,7 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
     }
     os.name = o->name;
     os.addr = start.lo;
+    os.addr_hi = start.hi;
     os.size = size.lo;
     os.lma = lma;
     os.at = at;

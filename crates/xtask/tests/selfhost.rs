@@ -786,11 +786,14 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
         from("0x80000000", ".marker : { . += 4; } .big : ALIGN(8K) { . += 8; }"),
         // A RELRO section, which ends its segment and counts a program
         // header in the room.
-        "SECTIONS { . = 0x80000400; .text : { *(.text) } .rodata : { *(.rodata) } .two : { *(.rodata.two) }          .data.rel.ro : { *(.data) } .bss : { *(.bss) } /DISCARD/ : { *(.text.gone) } }"
+        "SECTIONS { . = 0x80000400; .text : { *(.text) } .rodata : { *(.rodata) } .two : { *(.rodata.two) } \
+         .data.rel.ro : { *(.data) } .bss : { *(.bss) } /DISCARD/ : { *(.text.gone) } }"
             .into(),
         // An empty section alone in its run, which is dropped, and a gap
         // before .bss.
-        "SECTIONS { . = 0x80000000; .text : { *(.text) } .x : { sym = .; } .data : { *(.data) }          . = . + 0x100; .bss : { *(.bss) } .rodata : { *(.rodata) *(.rodata.two) }          /DISCARD/ : { *(.text.gone) } }"
+        "SECTIONS { . = 0x80000000; .text : { *(.text) } .x : { sym = .; } .data : { *(.data) } \
+         . = . + 0x100; .bss : { *(.bss) } .rodata : { *(.rodata) *(.rodata.two) } \
+         /DISCARD/ : { *(.text.gone) } }"
             .into(),
         // A top-level `.` moved backward: the code above the rest; with
         // OUTPUT_FORMAT's three arguments, a -freebsd name, and ADDR of
@@ -806,6 +809,20 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
             "OUTPUT_FORMAT(elf32-littleriscv) ENTRY(_start) SECTIONS {{ . = 0x80000000; . = ALIGN(0); \
              .text-x : ALIGN(0) {{ *(.text .text-none) }} a-b = ADDR(.text-x)-4; {rest} }}"
         ),
+        // Empty sections kept because their AT or ALIGN uses a symbol.
+        from(
+            "0x80000000",
+            "lma = 0x80100000; al = 16; .kept : AT(lma) { *(.nothing) } .kept2 : ALIGN(al) { *(.nothing) }",
+        ),
+        // An empty section at exactly 4 GiB: above the others, so the
+        // headers are still loaded below them. It follows the code, so it is
+        // not executable and its segment of its own is dropped (after a
+        // writable section it would join that one's segment, which would
+        // then reach 4 GiB, a 2 GiB file in ld.lld and merlin-ld alike).
+        "ENTRY(_start) SECTIONS { . = 0x80000400; .rodata : { *(.rodata) } .two : { *(.rodata.two) } \
+         .data : { *(.data) } .bss : { *(.bss) } .text : { *(.text) } /DISCARD/ : { *(.text.gone) } \
+         . = 0x100000000; .end : { . += 0; } }"
+            .into(),
     ];
     let mut links: Vec<(Vec<Vec<u8>>, String)> = scripts.into_iter().map(|s| (objects.to_vec(), s)).collect();
     // Empty orphans of every rank, one of a script section's name, without
@@ -822,10 +839,14 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
     );
     for script in [
         from("0x80000001", "foo = .;"),
-        "MEMORY { RAM (rwx) : ORIGIN = 0x80000000, LENGTH = 1M } SECTIONS { .text : { *(.text) } > RAM          .data : { *(.data) *(.rodata) *(.rodata.two) *(.bss) } > RAM /DISCARD/ : { *(.text.gone) } }"
+        "MEMORY { RAM (rwx) : ORIGIN = 0x80000000, LENGTH = 1M } SECTIONS { .text : { *(.text) } > RAM \
+         .data : { *(.data) *(.rodata) *(.rodata.two) *(.bss) } > RAM /DISCARD/ : { *(.text.gone) } }"
             .into(),
     ] {
-        links.push((vec![objects[0].clone(), objects[1].clone(), orphans.clone()], script));
+        links.push((
+            vec![objects[0].clone(), objects[1].clone(), orphans.clone()],
+            script,
+        ));
     }
     // Label differences and set values.
     links.push((
@@ -908,6 +929,9 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
     let script = "ENTRY(_start)\nSECTIONS\n{\n    . = 0x1000;\n    .text : { *(.text) }\n    .rodata : { *(.rodata) }\n    .data : { *(.data) }\n}\n";
     let start = object(".text\n.globl _start\n_start: nop\n");
     let truncated = start[..start.len() - 50].to_vec();
+    // EI_CLASS 3: neither ELFCLASS32 nor ELFCLASS64.
+    let mut bad_class = start.clone();
+    bad_class[4] = 3;
     let strings = ".rodata\n.asciz \"hello\"\n.asciz \"world\"\n";
     let with_rodata = object(".text\n.globl _start\n_start: nop\n.rodata\n.word 1\n");
     let cases: Vec<(Vec<Vec<u8>>, &str, &str)> = vec![
@@ -920,6 +944,7 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
             "",
         ),
         (vec![start.clone(), start.clone()], script, ""),
+        (vec![bad_class], script, ""),
         (vec![start.clone()], "SECTIONS { .text 0x100 : { *(.text) } }", ""),
         (
             vec![object(
@@ -1031,7 +1056,8 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         // ADDR: of a section not placed yet, in its own ALIGN, of none.
         (
             vec![start.clone()],
-            "SECTIONS { . = 0x1000; x = ADDR(.text); .text : ALIGN(ADDR(.text)) { *(.text) } y = ADDR(.nope); }",
+            "SECTIONS { . = 0x1000; x = ADDR(.text); .text : ALIGN(ADDR(.text)) { *(.text) } \
+             y = ADDR(.nope); }",
             "",
         ),
         // ALIGN: not a power of two, in an expression and on a section, and

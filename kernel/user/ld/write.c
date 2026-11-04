@@ -155,13 +155,21 @@ static uint segments(struct layout *l, struct segment *out, struct headers *h) {
     /* 2. Are they loaded? Only if they fit between the start of the page of
      * the lowest section and that section ("only allocate program headers
      * if that would not add a page"). Without sections ld.lld's lowest
-     * address is the top of the address space. */
+     * address is the top of the address space. An empty section at
+     * exactly 4 GiB (addr_hi) is above every other one; if it is the
+     * lowest, it starts its page and nothing fits below it. */
     uint lowest = 0xffffffffu;
+    int low = 0, top = 0;
     for (uint i = 0; i < l->nsections; i++) {
+        if (l->sections[i].addr_hi != 0) {
+            top = 1;
+            continue;
+        }
+        low = 1;
         lowest = l->sections[i].addr < lowest ? l->sections[i].addr : lowest;
     }
     uint page = lowest - lowest % PAGE;
-    h->loaded = h->size <= lowest - page;
+    h->loaded = (low || !top) && h->size <= lowest - page;
     h->addr = page;
     struct segment *first = segs;
     uint total = n;

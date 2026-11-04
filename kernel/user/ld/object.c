@@ -128,8 +128,14 @@ static int header(uint *shoff, uint *shentsize, uint *shnum, uint *shstrndx, cha
     if (!rd_u8(i64_u(4), &v)) {
         return 0;
     }
-    if (v != 1) {
-        *err = "not a 32-bit ELF file (EI_CLASS is not ELFCLASS32)";
+    /* merlin-ld's message for a class that is neither; ELFCLASS64 objects
+     * (RV64) are merlin-ld's only, until /bin/ld links RV64 (#157). */
+    if (v != 1 && v != 2) {
+        *err = fmt("not a 32- or 64-bit ELF file (EI_CLASS is %u)", v);
+        return 0;
+    }
+    if (v == 2) {
+        *err = "64-bit ELF objects are not supported by this ld";
         return 0;
     }
     if (!rd_u8(i64_u(5), &v)) {
