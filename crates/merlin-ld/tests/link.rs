@@ -728,22 +728,62 @@ fn hello_layout_matches_ld_lld() {
     assert_eq!(layout.symbol("__stack_top"), Some(0x8001_0070));
 }
 
-/// `fixtures/hello` and `fixtures/multiobj` are built from copies of the
-/// examples' sources and scripts; if an example changes, its fixture (the
-/// objects and their ld.lld listings) is stale until `cargo xtask ld-fixtures`
-/// runs again.
+/// Some fixture sources are copies, which `cargo xtask ld-fixtures` makes
+/// before it builds anything: `fixtures/hello` and `fixtures/multiobj` of
+/// the examples' sources and scripts, and the RV64 set's directories that
+/// work on both widths (`SHARED_WITH_RV64` in crates/xtask/src/ld_fixtures.rs)
+/// of the RV32 set's. If an original changes, its copy (and the objects and
+/// ld.lld listings made from it) is stale until the tool runs again.
 #[test]
-fn example_fixtures_are_current() {
+fn fixture_copies_are_current() {
+    let read = |p: PathBuf| {
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+            .replace("\r\n", "\n")
+    };
+    let stale = "changed: run `cargo xtask ld-fixtures`";
     let copies = [
         ("hello", &["hello.S", "link.ld"][..]),
         ("multiobj", &["main.S", "print.S", "link.ld"]),
     ];
     for (dir, files) in copies {
         for f in files {
-            let read = |p: PathBuf| std::fs::read_to_string(&p).unwrap().replace("\r\n", "\n");
             assert!(
                 read(repo_root().join("examples").join(dir).join(f)) == read(fixtures().join(dir).join(f)),
-                "examples/{dir}/{f} changed: run `cargo xtask ld-fixtures`"
+                "examples/{dir}/{f} {stale}"
+            );
+        }
+    }
+
+    // The sources (.S and .ld) of a fixture directory, by name.
+    let sources = |dir: PathBuf| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".S") || n.ends_with(".ld"))
+            .collect();
+        v.sort();
+        v
+    };
+    let shared = ["hello", "layouts", "merge", "norelocs", "rejects", "symbols"];
+    let rv64_only = ["relocs"];
+    let rv64 = fixtures().join("rv64");
+    let mut dirs: Vec<String> = std::fs::read_dir(&rv64)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    dirs.sort();
+    let mut known: Vec<&str> = shared.iter().chain(&rv64_only).copied().collect();
+    known.sort();
+    assert_eq!(dirs, known, "the RV64 set's directories: copies and its own");
+    for dir in shared {
+        let files = sources(fixtures().join(dir));
+        assert!(!files.is_empty(), "{dir}");
+        assert_eq!(sources(rv64.join(dir)), files, "rv64/{dir}: {stale}");
+        for f in files {
+            assert!(
+                read(fixtures().join(dir).join(&f)) == read(rv64.join(dir).join(&f)),
+                "{dir}/{f} {stale}"
             );
         }
     }

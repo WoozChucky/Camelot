@@ -7,6 +7,14 @@
 //! merlin-ld's tests compare (they check the allocated sections and the
 //! global symbols).
 //!
+//! There are two sets of fixtures ([`SETS`]), each a directory of fixture
+//! directories built with its own clang flags: RV32 ([`RV32`]) in
+//! `fixtures/` itself and RV64 ([`RV64`]) in `fixtures/rv64/`. The RV64 set
+//! has sources of its own (`rv64/relocs`: what RV64 code can reach is not
+//! what RV32's can) and copies of the RV32 sources that work on both widths
+//! unchanged ([`SHARED_WITH_RV64`]), which [`run`] makes first, as it copies
+//! the examples, and a test checks.
+//!
 //! In every fixture directory:
 //!
 //! * each `name.S` is assembled by clang into the committed `name.o`;
@@ -14,7 +22,7 @@
 //!   with `llvm-readelf -S -l -s` of it in `name.expected.txt` and
 //!   `llvm-objdump -d` of it in `name.objdump.txt`. The objects are listed in
 //!   the script's first comment, `/* objects: norelocs/start.o layouts/edge.o */`
-//!   (paths relative to the fixtures directory); without one, every `.o` in
+//!   (paths relative to the set's directory); without one, every `.o` in
 //!   the script's directory is linked, in name order.
 //!
 //! merlin-ld's tests link the same objects with the same scripts and compare
@@ -46,17 +54,57 @@ use std::process::Command;
 /// The fixtures directory, relative to the repository root.
 pub const FIXTURES: &str = "crates/merlin-ld/tests/fixtures";
 
-/// clang flags for every fixture object, followed by [`NO_RELAX`] unless the
-/// source asks for relaxation.
-pub const ASM_FLAGS: &[&str] = &["--target=riscv32", "-march=rv32im_zicsr", "-mabi=ilp32", "-c"];
+/// A set of fixtures: a directory of fixture directories, and how its
+/// objects are built.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Set {
+    /// Its directory, relative to [`FIXTURES`] (`""`: the fixtures directory
+    /// itself).
+    pub dir: &'static str,
+    /// clang flags for every object of the set, followed by [`NO_RELAX`]
+    /// unless the source asks for relaxation ([`asm_flags`]).
+    pub flags: &'static [&'static str],
+}
 
-/// Fixture directories copied from `examples/<same name>`, with the files
-/// copied (the sources and the linker script; objects are linked in name
-/// order, which is also each example's source order).
+/// The RV32 set, in the fixtures directory itself.
+pub const RV32: Set = Set {
+    dir: "",
+    flags: &["--target=riscv32", "-march=rv32im_zicsr", "-mabi=ilp32", "-c"],
+};
+
+/// The RV64 set, in `fixtures/rv64`: the target and ABI of RV64 Camelot,
+/// with the code model its programs need at 0x8000_0000 (`medany`:
+/// pc-relative addressing, as `lui` cannot reach there on RV64). The model
+/// changes no byte of an assembled `.S`; it is there so that the rule holds
+/// for everything built for RV64.
+pub const RV64: Set = Set {
+    dir: "rv64",
+    flags: &[
+        "--target=riscv64",
+        "-march=rv64ima_zicsr_zifencei",
+        "-mabi=lp64",
+        "-mcmodel=medany",
+        "-c",
+    ],
+};
+
+/// Every set, in the order [`run`] builds them.
+pub const SETS: &[Set] = &[RV32, RV64];
+
+/// Fixture directories of the RV32 set copied from `examples/<same name>`,
+/// with the files copied (the sources and the linker script; objects are
+/// linked in name order, which is also each example's source order).
 pub const FROM_EXAMPLES: &[(&str, &[&str])] = &[
     ("hello", &["hello.S", "link.ld"]),
     ("multiobj", &["main.S", "print.S", "link.ld"]),
 ];
+
+/// Fixture directories of the RV32 set whose sources (`.S` and `.ld`) the
+/// RV64 set has too, copied into `fixtures/rv64/<same name>`: they assemble,
+/// link and run the same on both widths. Not `relocs`, `data64` (RV32's
+/// R_RISCV_64) or `multiobj` (its `.word` pointers would be sign-extended by
+/// RV64's `lw`; #151 brings RV64 examples).
+pub const SHARED_WITH_RV64: &[&str] = &["hello", "layouts", "merge", "norelocs", "rejects", "symbols"];
 
 /// The default: no `R_RISCV_RELAX` or `R_RISCV_ALIGN` in the object.
 pub const NO_RELAX: &str = "-mno-relax";
@@ -69,9 +117,10 @@ pub fn wants_relax(source: &str) -> bool {
     source.lines().any(|l| l.trim_end() == RELAX_MARKER)
 }
 
-/// The clang arguments that assemble a fixture source (before its file names).
-pub fn asm_flags(source: &str) -> Vec<&'static str> {
-    let mut flags = ASM_FLAGS.to_vec();
+/// The clang arguments that assemble a fixture source of `set` (before its
+/// file names).
+pub fn asm_flags(set: &Set, source: &str) -> Vec<&'static str> {
+    let mut flags = set.flags.to_vec();
     flags.push(if wants_relax(source) { "-mrelax" } else { NO_RELAX });
     flags
 }
@@ -189,11 +238,12 @@ pub fn prepare_out(fixtures: &Path, out: &Path) -> Result<PathBuf, String> {
     Ok(out)
 }
 
-/// Regenerates everything under `fixtures` (see the module documentation).
+/// Regenerates everything under `fixtures` (see the module documentation):
+/// the copies of the examples ([`FROM_EXAMPLES`]) and of the shared sources
+/// ([`copy_shared`]), then every set's objects and links ([`SETS`]).
 /// `examples` is the repository's `examples` directory. Returns the files
 /// written.
 pub fn run(fixtures: &Path, examples: &Path, tools: &Tools) -> Result<Vec<PathBuf>, String> {
-    let mut written = Vec::new();
     for (dir, copied) in FROM_EXAMPLES {
         let to = fixtures.join(dir);
         std::fs::create_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
@@ -202,29 +252,87 @@ pub fn run(fixtures: &Path, examples: &Path, tools: &Tools) -> Result<Vec<PathBu
                 .map_err(|e| format!("copying examples/{dir}/{f}: {e}"))?;
         }
     }
+    // After the examples: `hello` is shared too.
+    copy_shared(fixtures)?;
     let xcal = examples.join("xcal.inc");
+    let mut written = Vec::new();
+    for set in SETS {
+        written.extend(build_set(fixtures, set, &xcal, tools)?);
+    }
+    Ok(written)
+}
 
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(fixtures)
-        .map_err(|e| format!("{}: {e}", fixtures.display()))?
+/// The hand-written sources (`.S` and `.ld`) directly in `dir`, in name order.
+pub fn sources(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut v = files(dir, "S")?;
+    v.extend(files(dir, "ld")?);
+    v.sort();
+    Ok(v)
+}
+
+/// Gives each directory of [`SHARED_WITH_RV64`] in the RV64 set the
+/// sources of the RV32 one, `fixtures/<dir>` into `fixtures/rv64/<dir>`:
+/// copies them, and removes any other source there (one the RV32 set no
+/// longer has), so the two hold the same files.
+pub fn copy_shared(fixtures: &Path) -> Result<(), String> {
+    for dir in SHARED_WITH_RV64 {
+        let (from, to) = (fixtures.join(dir), fixtures.join(RV64.dir).join(dir));
+        std::fs::create_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
+        let wanted = sources(&from)?;
+        for old in sources(&to)? {
+            if !wanted.iter().any(|w| w.file_name() == old.file_name()) {
+                std::fs::remove_file(&old).map_err(|e| format!("{}: {e}", old.display()))?;
+            }
+        }
+        for src in wanted {
+            let target = to.join(file_name(&src));
+            std::fs::copy(&src, &target).map_err(|e| format!("copying {}: {e}", src.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The fixture directories of `set`: the directories in its own, but not
+/// another set's (the RV64 set's `rv64` is in the RV32 set's directory),
+/// in name order.
+pub fn set_dirs(fixtures: &Path, set: &Set) -> Result<Vec<PathBuf>, String> {
+    let root = fixtures.join(set.dir);
+    let other_sets: Vec<PathBuf> = SETS
+        .iter()
+        .filter(|s| s.dir != set.dir)
+        .map(|s| fixtures.join(s.dir))
+        .collect();
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
+        .map_err(|e| format!("{}: {e}", root.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_dir())
+        .filter(|p| p.is_dir() && !other_sets.contains(p))
         .collect();
     dirs.sort();
+    Ok(dirs)
+}
+
+/// Builds one set: every source's object with the set's flags, then every
+/// script's link, listing and disassembly.
+fn build_set(fixtures: &Path, set: &Set, xcal: &Path, tools: &Tools) -> Result<Vec<PathBuf>, String> {
+    let root = fixtures.join(set.dir);
+    let dirs = set_dirs(fixtures, set)?;
+    let mut written = Vec::new();
 
     // Objects first: scripts may use objects from other directories.
     for dir in &dirs {
         for src in files(dir, "S")? {
             let obj = src.with_extension("o");
             let source = std::fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?;
-            let mut args: Vec<OsString> = asm_flags(&source).into_iter().map(OsString::from).collect();
-            args.extend(["-include".into(), xcal.clone().into_os_string()]);
+            let mut args: Vec<OsString> = asm_flags(set, &source).into_iter().map(OsString::from).collect();
+            args.extend(["-include".into(), xcal.as_os_str().to_os_string()]);
             args.extend([file_name(&src), "-o".into(), file_name(&obj)]);
             tools.exec(&tools.clang, &args, dir)?;
             written.push(obj);
         }
     }
 
-    let tmp = std::env::temp_dir().join(format!("xtask-ld-fixtures-{}", std::process::id()));
+    let set_name = if set.dir.is_empty() { "rv32" } else { set.dir };
+    let tmp = std::env::temp_dir().join(format!("xtask-ld-fixtures-{set_name}-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
     let result = (|| {
         for dir in &dirs {
@@ -232,7 +340,7 @@ pub fn run(fixtures: &Path, examples: &Path, tools: &Tools) -> Result<Vec<PathBu
                 let text =
                     std::fs::read_to_string(&script).map_err(|e| format!("{}: {e}", script.display()))?;
                 let objects: Vec<PathBuf> = match script_objects(&text) {
-                    Some(list) => list.iter().map(|o| fixtures.join(o)).collect(),
+                    Some(list) => list.iter().map(|o| root.join(o)).collect(),
                     None => files(dir, "o")?,
                 };
                 let stem = script
@@ -245,7 +353,7 @@ pub fn run(fixtures: &Path, examples: &Path, tools: &Tools) -> Result<Vec<PathBu
                     vec!["--no-relax".into(), "-T".into(), script.clone().into_os_string()];
                 args.extend(objects.into_iter().map(PathBuf::into_os_string));
                 args.extend(["-o".into(), elf.clone().into_os_string()]);
-                tools.exec(&tools.lld, &args, fixtures)?;
+                tools.exec(&tools.lld, &args, &root)?;
                 let args: Vec<OsString> = ["--elf-output-style=GNU", "-S", "-l", "-s"]
                     .iter()
                     .map(OsString::from)
@@ -300,14 +408,42 @@ mod tests {
         }
     }
 
+    /// The committed fixtures as the sets see them: the RV32 set's
+    /// directories leave out the RV64 set's, and every directory the RV64
+    /// set shares has sources in the RV32 one.
+    #[test]
+    fn sets_of_the_committed_fixtures() {
+        let fixtures = crate::repo_root().join(FIXTURES);
+        let names = |set: &Set| -> Vec<String> {
+            set_dirs(&fixtures, set)
+                .unwrap()
+                .iter()
+                .map(|d| file_name(d).to_string_lossy().into_owned())
+                .collect()
+        };
+        let (rv32, rv64) = (names(&RV32), names(&RV64));
+        assert!(!rv32.iter().any(|d| d == RV64.dir), "{rv32:?}");
+        assert!(rv32.iter().any(|d| d == "relocs") && rv64.iter().any(|d| d == "relocs"));
+        for dir in SHARED_WITH_RV64 {
+            assert!(
+                rv32.iter().any(|d| d == dir) && rv64.iter().any(|d| d == dir),
+                "{dir}"
+            );
+            assert!(!sources(&fixtures.join(dir)).unwrap().is_empty(), "{dir}");
+        }
+    }
+
     #[test]
     fn relax_marker() {
-        let plain = asm_flags("    .text\n    nop\n");
-        assert_eq!(plain.last(), Some(&"-mno-relax"));
-        assert_eq!(&plain[..plain.len() - 1], ASM_FLAGS);
-        let relax = asm_flags("# xtask: relax\r\n# built with relaxation\n    nop\n");
-        assert_eq!(relax.last(), Some(&"-mrelax"));
-        assert!(!relax.contains(&"-mno-relax"));
+        for set in SETS {
+            let plain = asm_flags(set, "    .text\n    nop\n");
+            assert_eq!(plain.last(), Some(&"-mno-relax"));
+            assert_eq!(&plain[..plain.len() - 1], set.flags);
+            let relax = asm_flags(set, "# xtask: relax\r\n# built with relaxation\n    nop\n");
+            assert_eq!(relax.last(), Some(&"-mrelax"));
+            assert!(!relax.contains(&"-mno-relax"));
+        }
+        assert!(asm_flags(&RV64, "").contains(&"-mabi=lp64"));
         // Only as a line of its own.
         assert!(!wants_relax("# see `# xtask: relax` in relax.S\n"));
     }

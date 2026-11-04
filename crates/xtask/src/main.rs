@@ -38,7 +38,8 @@ tasks:
                -v: print the equivalent merlin-as/merlin-ld command lines
   hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
                with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
-  ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj, llvm-objdump);
+  ld-fixtures  regenerate crates/merlin-ld/tests/fixtures, the RV32 set and the RV64 set in
+               fixtures/rv64 (clang, ld.lld, llvm-readobj, llvm-objdump);
                takes --clang, --lld and -v like kernel
                --out DIR: regenerate into DIR (new or empty) from copies of the sources instead,
                leaving the committed files as they are (diff -r shows what would change)
