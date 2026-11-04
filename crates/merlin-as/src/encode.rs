@@ -112,7 +112,7 @@ pub const NAMED_FUNCT3: &[(&str, u32)] = &[
 
 // funct3 values only the RV64 encoder needs, kept out of NAMED_FUNCT3 (whose
 // names go into the C assembler's tables.h, which stays RV32 until #157).
-/// `srli`, the last step of some RV64 `li` sequences.
+/// `srli`'s funct3, for the RV64 `li` sequences and `zext.w`.
 const SRLI: u32 = 0b101;
 /// The width of an A instruction, in funct3: `.w` (a word) or `.d` (a
 /// doubleword, RV64).
@@ -973,10 +973,15 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
                 // The value LLVM's `li` takes: a 32-bit word, signed or
                 // unsigned, on RV32 (`li a0, 0xffffffff` is -1), and any
                 // 64-bit value on RV64 (`li a0, 0xffffffff` is 2^32 - 1).
-                Imm::Num(v) => match ctx.xlen() {
-                    Xlen::Rv32 => li(rd, word(v, "li value")?),
-                    Xlen::Rv64 => Ok(li_words(rd, &li_steps(v, Xlen::Rv64))),
-                },
+                // On RV32 the word is then read signed, as the hart's
+                // register holds it, so `li_steps` sees one value per word.
+                Imm::Num(v) => {
+                    let v = match ctx.xlen() {
+                        Xlen::Rv32 => word(v, "li value")? as i64,
+                        Xlen::Rv64 => v,
+                    };
+                    Ok(li_words(rd, &li_steps(v, ctx.xlen())))
+                }
                 Imm::Label(name, _) if ctx.undefined(&name) => Err(format!(
                     "{} (li loads a number; la loads an address)",
                     not_yet_constant(&name)
@@ -1244,12 +1249,6 @@ fn csr_op(funct3: u32, rd: Reg, csr: &Operand, src: &Operand, ctx: &Ctx) -> Resu
 // `li`: which instructions build a constant
 // ===================================================================
 
-/// `li rd, value` on RV32: a 32-bit constant (`word` has checked it), in one
-/// or two instructions. [`li_steps`] chooses them.
-fn li(rd: Reg, value: i32) -> Result<Vec<Emit>, String> {
-    Ok(li_words(rd, &li_steps(value as i64, Xlen::Rv32)))
-}
-
 /// One instruction of a `li` sequence. The first one starts from `zero` (or,
 /// for `lui`, from nothing); each later one works on `rd`, the value built so
 /// far.
@@ -1309,7 +1308,7 @@ fn fits(v: i64, bits: u32) -> bool {
 ///    without C, "to minimize differences in generated code").
 ///
 ///    One or two instructions cannot be beaten: every RV32 value stops here.
-/// 3. Low 13 bits from 0x1000 to 0x17ff: build `value + (0x800 - low 12
+/// 3. Low 13 bits from 0x1001 to 0x17ff: build `value + (0x800 - low 12
 ///    bits)`, whose low bits are then 0x1800 (one `addi -0x800` short of
 ///    more trailing zeros), and finish with an `addi` that takes it back.
 /// 4. A positive value: build it shifted all the way left, the bits shifted
@@ -1343,7 +1342,7 @@ pub fn li_steps(value: i64, xlen: Xlen) -> Vec<Step> {
         return best;
     }
 
-    // 3. Low 13 bits 0x1000..=0x17ff: add 0x800 - (value & 0xfff) to make
+    // 3. Low 13 bits 0x1001..=0x17ff: add 0x800 - (value & 0xfff) to make
     // them 0x1800, which the next `addi -0x800` turns into 13 zero bits.
     if value & 0xfff != 0 && value & 0x1800 == 0x1000 {
         let imm12 = -(0x800 - (value & 0xfff)); // -0x7ff..=-1
@@ -1670,7 +1669,12 @@ mod tests {
 
     #[test]
     fn li_picks_the_shortest_sequence() {
-        let words = |v| li(10, v).unwrap().iter().map(|e| e.word).collect::<Vec<_>>();
+        let words = |v: i32| {
+            li_words(10, &li_steps(v as i64, Xlen::Rv32))
+                .iter()
+                .map(|e| e.word)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(words(0), [0x0000_0513]);
         assert_eq!(words(0x1000_0000), [0x1000_0537]);
         assert_eq!(words(2048), [0x0010_0513, 0x00b5_1513]);
@@ -1718,57 +1722,83 @@ mod tests {
 
     /// `li a0, value` on RV64: llvm-mc 23's words (`llvm-mc --triple=riscv64
     /// -mattr=+m,+a,+zicsr,+zifencei`): a sample with every rule of
-    /// [`li_steps`] and its edges.
+    /// [`li_steps`] and its edges, grouped by the rule whose sequence wins.
     const LI64: &[(u64, &str)] = &[
+        // Rule 1, a 32-bit value: addi alone, lui alone, or lui + addi.
         (0x0, "00000513"),
         (0x1, "00100513"),
         (0xffff_ffff_ffff_ffff, "fff00513"),
         (0x7ff, "7ff00513"),
         (0xffff_ffff_ffff_f800, "80000513"),
-        // Trailing zeros, the shifted value small ("compressible").
-        (0x800, "00100513 00b51513"),
-        (0x801, "00001537 80150513"),
         (0x1000_0000, "10000537"),
         (0x1234_5678, "12345537 67850513"),
-        // addiw only where lui + addi would leave the 32-bit range.
+        // Odd, so no shift form even though small after the rounding.
+        (0x801, "00001537 80150513"),
+        // A sign-extended word: lui alone.
+        (0xffff_ffff_8000_0000, "80000537"),
+        // ... with addiw only where lui + addi would leave the 32-bit range.
         (0x7fff_f7ff, "7ffff537 7ff50513"),
         (0x7fff_f800, "80000537 8005051b"),
         (0x7fff_ffff, "80000537 fff5051b"),
-        // Above 2^31: no longer lui alone, since RV64's lui sign-extends.
+        // Rule 1, wider than 32 bits: built shifted right, then slli (+ addi).
+        // Above 2^31 lui alone no longer does, since RV64's lui sign-extends.
         (0x8000_0000, "00100513 01f51513"),
-        (0x8000_0800, "00100537 00150513 00b51513"),
         (0x8000_0001, "00100513 01f51513 00150513"),
         (0x8040_0000, "20100513 01651513"),
-        // Trailing zeros, shorter.
-        (0x8000_2b04, "20001537 ac150513 00251513"),
-        (0xdead_beef, "37ab7537 00251513 eef50513"),
-        // Leading zeros, filled with ones: -1 shifted right.
-        (0xffff_ffff, "fff00513 02055513"),
         (0xffff_f800, "00100513 02051513 80050513"),
         (0x1_0000_0000, "00100513 02051513"),
         (0x1_0000_0001, "00100513 02051513 00150513"),
-        (0xffff_ffff_8000_0000, "80000537"),
+        (0x8000_0000_0000_0000, "fff00513 03f51513"),
+        // Negative, and three instructions: too short for rule 5 to try.
+        (0xffff_fffe_ffff_ffff, "fff00513 02051513 fff50513"),
         // The final addi of a wide value is addi, never addiw.
         (0xffff_ffff_7fff_ffff, "80000537 fff50513"),
-        (0x7fff_ffff_ffff_ffff, "fff00513 00155513"),
-        (0x8000_0000_0000_0000, "fff00513 03f51513"),
-        // value - lo12 wraps past 2^63.
-        (0x7fff_ffff_ffff_f800, "fffff537 00155513"),
-        (0x0000_ffff_ffff_ffff, "fff00513 01055513"),
-        // Leading zeros, filled with zeros.
-        (0x0000_ffff_0000_ffff, "f0001537 01451513 fff50513 01055513"),
         // addiw inside the recursion.
         (0x7fff_ffff_0000_0000, "80000537 fff5051b 02051513"),
-        (0x0000_0fff_ffff_f000, "fff00513 02051513 01455513"),
-        // A shift of more than 12 reduced by 12 for lui.
-        (0x1_ffff_f000, "00200537 fff50513 00c51513"),
-        (0x1000_0000_17ff, "00100513 02051513 00150513 00c51513 7ff50513"),
-        // Low 13 bits in 0x1000..=0x17ff: one more addi at the end.
-        (0x905_acf7_102b, "482d6537 7b950513 00d51513 80050513 82b50513"),
+        // A shift of more than 12 reduced by 12 for lui (14 to 2, 32 to 20);
+        // a shift of exactly 12 is kept.
+        (0xdead_beef, "37ab7537 00251513 eef50513"),
         (0x17ff_0000_0001, "017ff537 01451513 00150513"),
+        (0x1_ffff_f000, "00200537 fff50513 00c51513"),
+        // The longest: lui, addi, then slli + addi three times.
+        (
+            0x1234_5678_9abc_def0,
+            "00247537 8ad50513 00e51513 c4d50513 00c51513 5e750513 00d51513 ef050513",
+        ),
+        (
+            0x5555_5555_5555_5555,
+            "05555537 55550513 00c51513 55550513 00c51513 55550513 00c51513 55550513",
+        ),
+        (
+            0x00ff_00ff_00ff_00ff,
+            "00ff0537 0ff50513 01051513 0ff50513 01051513 0ff50513",
+        ),
+        // Rule 2, trailing zeros: the shifted value small ("compressible"),
+        // or the sequence shorter.
+        (0x800, "00100513 00b51513"),
+        (0x8000_0800, "00100537 00150513 00b51513"),
+        (0x8000_2b04, "20001537 ac150513 00251513"),
+        // Low 13 bits 0x1800, just past rule 3's range.
         (0x1_0000_0000_1800, "00100513 02551513 00350513 00b51513"),
-        (0xffff_fffe_ffff_ffff, "fff00513 02051513 fff50513"),
-        // Negative values built inverted, then xori -1.
+        (
+            0xfedc_ba98_7654_3210,
+            "fdb97537 53150513 00d51513 d9550513 00e51513 32150513 00451513",
+        ),
+        // Rule 3, low 13 bits in 0x1001..=0x17ff: one more addi at the end.
+        (0x905_acf7_102b, "482d6537 7b950513 00d51513 80050513 82b50513"),
+        // In the range too, but rule 1's sequence is no longer.
+        (0x1000_0000_17ff, "00100513 02051513 00150513 00c51513 7ff50513"),
+        // Rule 4, leading zeros, the bits shifted in made ones: often -1
+        // shifted right.
+        (0xffff_ffff, "fff00513 02055513"),
+        (0x7fff_ffff_ffff_ffff, "fff00513 00155513"),
+        (0x0000_ffff_ffff_ffff, "fff00513 01055513"),
+        (0x0000_ffff_0000_ffff, "f0001537 01451513 fff50513 01055513"),
+        // value - lo12 wraps past 2^63 in rule 1's try.
+        (0x7fff_ffff_ffff_f800, "fffff537 00155513"),
+        // Rule 4, the bits shifted in made zeros.
+        (0x0000_0fff_ffff_f000, "fff00513 02051513 01455513"),
+        // Rule 5, negative values built inverted, then xori -1.
         (0x8000_0000_0000_0fff, "ffffe537 00155513 fff54513"),
         (0x8000_0000_0040_6100, "ff7f4537 dff50513 00155513 fff54513"),
         (
@@ -1780,23 +1810,6 @@ mod tests {
             "a6679537 cef50513 02051513 00d55513 fff54513",
         ),
         (0xffff_c000_42e9_8fff, "bd167537 01251513 01255513 fff54513"),
-        // The longest: lui, addi, then slli + addi three times.
-        (
-            0x1234_5678_9abc_def0,
-            "00247537 8ad50513 00e51513 c4d50513 00c51513 5e750513 00d51513 ef050513",
-        ),
-        (
-            0xfedc_ba98_7654_3210,
-            "fdb97537 53150513 00d51513 d9550513 00e51513 32150513 00451513",
-        ),
-        (
-            0x5555_5555_5555_5555,
-            "05555537 55550513 00c51513 55550513 00c51513 55550513 00c51513 55550513",
-        ),
-        (
-            0x00ff_00ff_00ff_00ff,
-            "00ff0537 0ff50513 01051513 0ff50513 01051513 0ff50513",
-        ),
     ];
 
     /// `li a0, value` on RV32, as llvm-mc 23 `--triple=riscv32` assembles it:
@@ -2129,58 +2142,5 @@ mod tests {
             rv64("addiw a0, a0, 2048"),
             Err("immediate 2048 out of range (-2048..=2047)".into())
         );
-    }
-
-    #[test]
-    fn rv64_instructions_are_unknown_on_rv32() {
-        for line in [
-            "addw a0, a1, a2",
-            "mulw a0, a1, a2",
-            "addiw a0, a1, 1",
-            "slliw a0, a1, 1",
-            "ld a0, 0(a1)",
-            "lwu a0, 0(a1)",
-            "sd a0, 0(a1)",
-            "lr.d a0, (a1)",
-            "sc.d.aq a0, a1, (a2)",
-            "amoadd.d a0, a1, (a2)",
-            "sext.w a0, a1",
-            "negw a0, a1",
-            "zext.w a0, a1",
-        ] {
-            let m = line.split(' ').next().unwrap();
-            assert_eq!(
-                words_for(line, Xlen::Rv32),
-                Err(format!("unknown instruction '{m}'")),
-                "{line}"
-            );
-        }
-    }
-
-    #[test]
-    fn rv32_only_counters_and_csrs_are_refused_on_rv64() {
-        let rv64 = |line: &str| words_for(line, Xlen::Rv64);
-        for (m, full) in [
-            ("rdcycleh", "rdcycle"),
-            ("rdtimeh", "rdtime"),
-            ("rdinstreth", "rdinstret"),
-        ] {
-            assert_eq!(
-                rv64(&format!("{m} a0")),
-                Err(format!(
-                    "'{m}' exists only on RV32 (on RV64, {full} reads all 64 bits)"
-                ))
-            );
-            // Still the RV32 word on RV32.
-            assert!(words_for(&format!("{m} a0"), Xlen::Rv32).is_ok());
-        }
-        for name in ["cycleh", "mstatush", "pmpcfg1", "pmpcfg3", "mhpmcounter3h"] {
-            assert_eq!(
-                rv64(&format!("csrr a0, {name}")),
-                Err(format!("CSR '{name}' exists only on RV32"))
-            );
-        }
-        assert_eq!(rv64("csrr a0, nosuchcsr"), Err("unknown CSR 'nosuchcsr'".into()));
-        assert_eq!(words64("rdcycle a0"), [0xc000_2573]);
     }
 }

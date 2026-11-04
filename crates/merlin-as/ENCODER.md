@@ -154,16 +154,16 @@ funct5[31:27] aq[26] rl[25] rs2[24:20] rs1[19:15] 01w rd[11:7] 0101111
 
 The suffix sets the ordering bits: none = 00, `.aq` = 10, `.rl` = 01,
 `.aqrl` = 11 (`atomic()` strips it, looks the rest up in `ATOMIC_FUNCT5`, a
-`.d` form under its `.w` row, and returns the funct3 of the width). `lr.w`
-and `lr.d` have no rs2: its field is zero. The address is written `(rs1)`; as in LLVM,
-`0(rs1)` is accepted too, and any other offset is an error, since there is no
-offset field. Like LLVM, it must be the literal `0`, one integer token (`0`,
-`0x0`): an expression or a symbol that equals 0 (`-0(rs1)`, `+0(rs1)`,
-`(0)(rs1)`, `1-1(rs1)`) is an error too. The parser folds `+0` and `(0)` to
-the number 0, so it records in the operand (`int_token`) whether the offset
-was a single integer token, and `atomic_address()` checks that. The source
-register comes before the address, as for stores (`amoadd.w rd, rs2, (rs1)`),
-and rd gets the old memory word.
+`.d` form under its `.w` row, and returns the funct3 of the width). `lr.w` and
+`lr.d` have no rs2: their rs2 field is zero. The address is written `(rs1)`;
+as in LLVM, `0(rs1)` is accepted too, and any other offset is an error, since
+there is no offset field. Like LLVM, it must be the literal `0`, one integer
+token (`0`, `0x0`): an expression or a symbol that equals 0 (`-0(rs1)`,
+`+0(rs1)`, `(0)(rs1)`, `1-1(rs1)`) is an error too. The parser folds `+0` and
+`(0)` to the number 0, so it records in the operand (`int_token`) whether the
+offset was a single integer token, and `atomic_address()` checks that. The
+source register comes before the address, as for stores
+(`amoadd.w rd, rs2, (rs1)`), and rd gets the old memory word.
 
 ### `li`
 
@@ -184,7 +184,7 @@ instructions:
 3. even and `c << s` with `c` in -32..=31: `addi rd, zero, c` + `slli rd, rd, s`
    (LLVM prefers it because with the C extension both halves compress;
    `li a0, 2048` is `addi a0, zero, 1; slli a0, a0, 11`);
-4. otherwise `lui rd, hi` + `addi rd, rd, lo`, split by `hi_lo()`.
+4. otherwise `lui rd, hi` + `addi rd, rd, lo`, split by `hi_lo64()`.
 
 **RV64** takes any 64-bit constant and gives 1 to 8 instructions, from
 `lui`, `addi`, `addiw`, `slli`, `srli` and `xori`. The length depends only on
@@ -198,14 +198,19 @@ only if it is shorter (the comments on `li_steps` go through each):
    `addi` becomes an `addiw` (`0x7fffffff` is `lui 0x80000; addiw -1`, but
    `0x12345678` stays `lui 0x12345; addi 0x678`). A wider value puts its low
    12 bits in an `addi` at the end and builds the rest shifted right, then
-   shifted back with `slli`: `0x123456789abcdef0` is `lui`, `addi`, then
-   `slli`+`addi` three times, 8 instructions.
-2. Trailing zeros: build `value >> tz`, then `slli tz`. Kept when shorter, or
-   (as rule 3 of RV32) when the shifted value fits in 6 bits:
-   `li a0, 0x80000000` is `addi a0, zero, 1; slli a0, a0, 31`, and
-   `li sp, 0x80400000` is `addi sp, zero, 513; slli sp, sp, 22`. One or two
-   instructions cannot be beaten, so a sequence that short stops here.
-3. Low 13 bits from 0x1000 to 0x17ff: build `value + (0x800 - low 12 bits)`,
+   shifted back with `slli`: `li a0, 0x80000000` is
+   `addi a0, zero, 1; slli a0, a0, 31`, `li sp, 0x80400000` is
+   `addi sp, zero, 513; slli sp, sp, 22`, and `0x123456789abcdef0` is `lui`,
+   `addi`, then `slli`+`addi` three times, 8 instructions.
+2. Trailing zeros (when the low 12 bits are not all zero, which rule 1
+   already shifts away): build `value >> tz`, then `slli tz`. Kept when
+   shorter, or (as rule 3 of RV32) when the shifted value fits in 6 bits:
+   `li a0, 2048` is `addi a0, zero, 1; slli a0, a0, 11` where rule 1 has
+   `lui a0, 1; addi a0, a0, -2048`, and `li a0, 0x80002b04` is
+   `lui a0, 0x20001; addi a0, a0, -0x53f; slli a0, a0, 2` where rule 1 takes
+   four instructions. One or two instructions cannot be beaten, so a
+   sequence that short stops here.
+3. Low 13 bits from 0x1001 to 0x17ff: build `value + (0x800 - low 12 bits)`,
    whose low bits are then 0x1800, and finish with an `addi` that takes it
    back.
 4. A positive value: build it shifted all the way left, with ones or zeros
