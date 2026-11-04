@@ -576,16 +576,182 @@ fn mergeable(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
     obj
 }
 
+/// A program for [`the_linker_on_camelot_links_scripts_as_merlin_ld_does`]:
+/// code, read-only data, data with `.dword` (R_RISCV_64) and `.word`
+/// pointers, a section the scripts throw away, and debug information
+/// pointing at all of them (R_RISCV_64 and R_RISCV_32 in a section that is
+/// not loaded, at discarded code with a positive addend too).
+const SCRIPTED: &str = "
+        .text
+        .globl _start
+_start: la a0, table
+        lw a1, 0(a0)
+        call far
+        nop
+        .section .text.gone, \"ax\"
+gone:   nop
+        nop
+        .rodata
+msg:    .asciz \"hi\"
+        .section .rodata.two, \"a\"
+        .word 5
+        .data
+        .p2align 3
+table:  .dword _start
+        .dword _start - 1
+        .dword table + 0x7fffffff
+        .dword far + 4
+        .word msg
+        .bss
+        .space 16
+        .section .debug_info, \"\", @progbits
+        .dword _start
+        .dword table + 4
+        .quad far
+        .word _start
+        .dword gone + 4
+        .word gone + 4
+";
+
+/// The other object of [`SCRIPTED`]'s links.
+const FAR: &str = "
+        .text
+        .globl far
+far:    ret
+";
+
+/// Links that succeed, linked on Camelot as merlin-ld links them, byte for
+/// byte, with the debug information and without it (`-S`): load addresses
+/// (`AT` on the first section, in the middle with `ADDR` and a NOLOAD
+/// section after it, `AT(.)` on a section with the permissions of the one
+/// before, an empty section kept because `ADDR` names it), where the headers
+/// go (a page in, loaded in a segment of their own, in a read-only first
+/// section's, in a MEMORY region, without `.riscv.attributes`, without any
+/// section), a segment aligned past the page, and a section without inputs
+/// after the code.
+#[test]
+fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
+    let objects = [object(SCRIPTED), object(FAR)];
+    // `.text`, `more`, the rest from `start`.
+    let rest = ".rodata : { *(.rodata) } .two : { *(.rodata.two) } .data : { *(.data) } .bss : { *(.bss) } \
+                /DISCARD/ : { *(.text.gone) }";
+    let from = |start: &str, more: &str| {
+        format!("ENTRY(_start) SECTIONS {{ . = {start}; .text : {{ *(.text) }} {more} {rest} }}")
+    };
+    let scripts: Vec<String> = vec![
+        // AT on the first section: the whole image is loaded 1 MiB lower.
+        format!("SECTIONS {{ . = 0x80100000; .text : AT(0x80000000) {{ *(.text) }} {rest} }}"),
+        // AT in the middle, by ADDR, aligned, with a NOLOAD section after it
+        // and an empty one an ADDR keeps.
+        "SECTIONS { . = 0x80000000; .text : { *(.text) } .rodata : { *(.rodata) } \
+         .two : { *(.rodata.two) } .data : AT(ADDR(.text) + 0x8000) ALIGN(16) { *(.data) } \
+         .bss (NOLOAD) : { *(.bss) . += 16; } .keep : { *(.nothing) } here = ADDR(.keep); \
+         /DISCARD/ : { *(.text.gone) } }"
+            .into(),
+        // AT(.) on a read-only section right after another.
+        "SECTIONS { . = 0x80000000; .text : { *(.text) } .rodata : { *(.rodata) } \
+         .two : AT(.) { *(.rodata.two) } .data : { *(.data) } .bss : { *(.bss) } \
+         /DISCARD/ : { *(.text.gone) } }"
+            .into(),
+        // The headers: no room below the first section (a page in), room
+        // (their own segment), a read-only first section (theirs), and a
+        // MEMORY region (their own again).
+        from("0x80000100", ""),
+        from("0x80000400", ""),
+        "SECTIONS { . = 0x80000400; .rodata : { *(.rodata) } .text : { *(.text) } \
+         .two : { *(.rodata.two) } .data : { *(.data) } .bss : { *(.bss) } \
+         /DISCARD/ : { *(.text.gone) } }"
+            .into(),
+        "MEMORY { RAM (rwx) : ORIGIN = 0x80000400, LENGTH = 1M } SECTIONS { \
+         .rodata : { *(.rodata) *(.rodata.two) } > RAM .text : { *(.text) } > RAM \
+         .data : { *(.data) } > RAM .bss : { *(.bss) } > RAM /DISCARD/ : { *(.text.gone) } }"
+            .into(),
+        // Without .riscv.attributes ld.lld counts one program header less,
+        // and 0xf4 bytes fit below 0x800000f4.
+        "SECTIONS { . = 0x800000f4; .text : { *(.text) } .rodata : { *(.rodata) *(.rodata.two) } \
+         .data : { *(.data) } .bss : { *(.bss) } /DISCARD/ : { *(.text.gone) *(.riscv.attributes) } }"
+            .into(),
+        // A section of only an assignment after the code, which is not
+        // executable, and a segment aligned to 8 KiB.
+        from("0x80000000", ".marker : { . += 4; } .big : ALIGN(8K) { . += 8; }"),
+    ];
+    let mut links: Vec<(Vec<Vec<u8>>, String)> = scripts.into_iter().map(|s| (objects.to_vec(), s)).collect();
+    // No section at all: the headers in the last page.
+    links.push((
+        vec![object("    .globl _start\n    .set _start, 0x80000000\n")],
+        "SECTIONS { /DISCARD/ : { *(.text) } }".into(),
+    ));
+
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut commands = Vec::new();
+    // (command, output, merlin-ld's file) for each link.
+    let mut checks: Vec<(String, String, Vec<u8>)> = Vec::new();
+    for (k, (objects, script)) in links.iter().enumerate() {
+        let mut inputs = Vec::new();
+        let mut args = format!("-T /s/{k}.ld");
+        for (j, data) in objects.iter().enumerate() {
+            let path = format!("/s/{k}_{j}.o");
+            args.push_str(&format!(" {path}"));
+            files.push((path.clone(), data.clone()));
+            inputs.push(merlin_ld::Input {
+                name: path,
+                data: data.clone(),
+            });
+        }
+        files.push((format!("/s/{k}.ld"), script.as_bytes().to_vec()));
+        let opts = merlin_ld::Options {
+            script: Some(merlin_ld::ScriptSource {
+                name: format!("/s/{k}.ld"),
+                text: script.clone(),
+            }),
+            entry: None,
+        };
+        let linked = merlin_ld::link_with_library(&inputs, &[], &opts)
+            .unwrap_or_else(|e| panic!("link {k}: {e:?}\n{script}"));
+        assert!(
+            linked.layout.warnings.is_empty(),
+            "link {k}: {:?}",
+            linked.layout.warnings
+        );
+        let stripped = merlin_ld::strip_debug(&linked.elf).unwrap();
+        checks.push((format!("ld {args} -o /out/{k}"), format!("/out/{k}"), linked.elf));
+        checks.push((
+            format!("ld {args} -S -o /out/{k}s"),
+            format!("/out/{k}s"),
+            stripped,
+        ));
+    }
+    for (c, ..) in &checks {
+        commands.push(c.clone());
+    }
+    let input = format!("{}\nexit 0\n", commands.join("\n"));
+    let (out, disk) = boot(image_of(&["ld"], &["/s"], &files), &input, 2_000_000_000);
+    let fs = Fs::open(&disk).unwrap();
+    for (command, file, want) in &checks {
+        assert_eq!(shell_output(&out, command), "", "{command}");
+        let got = fs.read_file(file).unwrap_or_else(|e| panic!("{command}: {e}"));
+        assert!(
+            got == *want,
+            "{command}: {} bytes, merlin-ld's {} (first difference at {:?})",
+            got.len(),
+            want.len(),
+            got.iter().zip(want.iter()).position(|(a, b)| a != b)
+        );
+    }
+}
+
 #[test]
 fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
     // Links that fail, and links that succeed with a warning: what merlin-ld
     // says, word for word, the exit status, and the file (none after an
     // error, merlin-ld's after a warning). Each case is its inputs, a
-    // script, and more arguments.
+    // script, and more arguments: `--start-lib` makes the last input a
+    // library member.
     let script = "ENTRY(_start)\nSECTIONS\n{\n    . = 0x1000;\n    .text : { *(.text) }\n    .rodata : { *(.rodata) }\n    .data : { *(.data) }\n}\n";
     let start = object(".text\n.globl _start\n_start: nop\n");
     let truncated = start[..start.len() - 50].to_vec();
     let strings = ".rodata\n.asciz \"hello\"\n.asciz \"world\"\n";
+    let with_rodata = object(".text\n.globl _start\n_start: nop\n.rodata\n.word 1\n");
     let cases: Vec<(Vec<Vec<u8>>, &str, &str)> = vec![
         // Errors.
         (
@@ -643,11 +809,57 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         ),
         (vec![b"not an object".to_vec()], script, ""),
         (vec![start.clone(), truncated], script, ""),
+        // Load addresses: two sections loaded over each other, a load range
+        // past 4 GiB, AT after ALIGN, /DISCARD/ with an AT.
+        (
+            vec![with_rodata.clone()],
+            "SECTIONS { . = 0x1000; .text : { *(.text) } .rodata : AT(0x1000) { *(.rodata) } }",
+            "",
+        ),
+        (
+            vec![with_rodata.clone()],
+            "SECTIONS { . = 0x1000; .text : AT(0xfffffffe) { *(.text) } .rodata : AT(0 - 4) { *(.rodata) } }",
+            "",
+        ),
+        (
+            vec![start.clone()],
+            "SECTIONS { .text : ALIGN(4) AT(0x100) { *(.text) } }",
+            "",
+        ),
+        (
+            vec![start.clone()],
+            "SECTIONS { /DISCARD/ : AT(0x100) { *(.comment) } }",
+            "",
+        ),
+        // ADDR: of a section not placed yet, in its own ALIGN, of none.
+        (
+            vec![start.clone()],
+            "SECTIONS { . = 0x1000; x = ADDR(.text); .text : ALIGN(ADDR(.text)) { *(.text) } y = ADDR(.nope); }",
+            "",
+        ),
+        // OUTPUT_FORMAT: an unknown name, and elf64-littleriscv with RV32
+        // objects, every one of them reported, library members too.
+        (
+            vec![start.clone()],
+            "OUTPUT_FORMAT(\"elf32-littleriscv\", \"elf64-bigriscv\")",
+            "",
+        ),
+        (
+            vec![start.clone(), object(".text\n.globl f\nf: nop\n")],
+            "OUTPUT_FORMAT(\"elf64-littleriscv\")\nSECTIONS { . = 0x1000; .text : { *(.text) } }",
+            "--start-lib",
+        ),
         // Warnings: no entry symbol (the first code section's address is
         // used), and duplicate strings in mergeable sections.
         (
             vec![object(".text\nmain: nop\n")],
             "SECTIONS { . = 0x1000; .text : { *(.text) } }",
+            "",
+        ),
+        // The same, loaded elsewhere, and with the headers loaded below it.
+        (
+            vec![object(".text\nmain: nop\n")],
+            "SECTIONS { . = 0x1400; .text : AT(0x800) { *(.text) } }",
             "",
         ),
         (
@@ -668,15 +880,22 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
     let mut wants: Vec<(String, Option<Vec<u8>>)> = Vec::new();
     for (k, (objects, script, extra)) in cases.iter().enumerate() {
         let mut inputs = Vec::new();
+        let mut library = Vec::new();
         let mut args = format!("ld -T /e/{k}.ld -o /out/{k}");
         for (j, data) in objects.iter().enumerate() {
             let path = format!("/e/{k}_{j}.o");
-            args.push_str(&format!(" {path}"));
-            files.push((path.clone(), data.clone()));
-            inputs.push(merlin_ld::Input {
-                name: path,
+            let input = merlin_ld::Input {
+                name: path.clone(),
                 data: data.clone(),
-            });
+            };
+            if *extra == "--start-lib" && j == objects.len() - 1 {
+                args.push_str(&format!(" --start-lib {path} --end-lib"));
+                library.push(input);
+            } else {
+                args.push_str(&format!(" {path}"));
+                inputs.push(input);
+            }
+            files.push((path, data.clone()));
         }
         files.push((format!("/e/{k}.ld"), script.as_bytes().to_vec()));
         let mut opts = merlin_ld::Options {
@@ -690,7 +909,8 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
             opts.entry = Some(e.to_string());
             args.push_str(&format!(" {extra}"));
         }
-        wants.push(match merlin_ld::link(&inputs, &opts) {
+        // As merlin-ld's command line links (/bin/ld's too).
+        wants.push(match merlin_ld::link_with_library(&inputs, &library, &opts) {
             Ok(linked) => {
                 assert!(!linked.layout.warnings.is_empty(), "case {k} links cleanly");
                 let said = linked

@@ -59,13 +59,28 @@ static void add_needs(struct strmap *names, struct object *o) {
 }
 
 struct object *parse_with_needed(struct input *inputs, uint ninputs, struct input *library, uint nlibrary,
-                                 uint *n) {
+                                 int format, uint *n) {
     struct object *objects = parse_all(inputs, ninputs);
     if (objects == NULL) {
         return NULL;
     }
     struct object *members = parse_all(library, nlibrary);
     if (members == NULL) {
+        return NULL;
+    }
+    /* Every object and every member, needed or not, must be of the
+     * executable's class, the script's OUTPUT_FORMAT's if it names one, as
+     * ld.lld checks its lazy objects too: merlin-ld's check_classes. The
+     * objects read here are all ELF32 (object.c refuses the others, until
+     * #157), so only an elf64-littleriscv format can be another class, and
+     * then each of them is: all are reported, in order, and the link stops. */
+    if (ninputs > 0 && format == FORMAT_ELF64) {
+        for (uint i = 0; i < ninputs; i++) {
+            error(fmt("%s is incompatible with %s", objects[i].name, format_name(format)));
+        }
+        for (uint i = 0; i < nlibrary; i++) {
+            error(fmt("%s is incompatible with %s", members[i].name, format_name(format)));
+        }
         return NULL;
     }
     struct strmap names;

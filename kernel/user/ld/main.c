@@ -245,8 +245,12 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* The members are compared with the executable's class before the link,
+     * which may come from the script's OUTPUT_FORMAT (merlin-ld's
+     * link_with_library). */
+    int format = script_text != NULL ? declared_format(script_text) : FORMAT_NONE;
     uint nobjects;
-    struct object *objects = parse_with_needed(files, nfiles, library, nlibrary, &nobjects);
+    struct object *objects = parse_with_needed(files, nfiles, library, nlibrary, format, &nobjects);
     struct layout layout;
     uchar **images, **debug;
     if (objects == NULL || !layout_build(objects, nobjects, script, script_text, entry, &layout) ||

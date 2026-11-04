@@ -2,20 +2,32 @@
  * "Linker scripts"):
  *
  *     OUTPUT_ARCH(riscv)                       optional; must say riscv
- *     OUTPUT_FORMAT("elf32-littleriscv")       optional
+ *     OUTPUT_FORMAT("elf32-littleriscv")       optional; elf32-littleriscv or
+ *                                              elf64-littleriscv, the objects' class
  *     ENTRY(symbol)
  *     MEMORY { RAM (rwx) : ORIGIN = expr, LENGTH = expr }      at most one region
  *     SECTIONS
  *     {
  *         . = expr;   . += expr;   symbol = expr;
  *         .name : { *(pattern pattern ...) ... . = ALIGN(n); . += n; symbol = expr; } > RAM
- *         .name (NOLOAD) : ALIGN(n) { ... } > RAM    both optional
+ *         .name (NOLOAD) : AT(lma) ALIGN(n) { ... } > RAM    each optional, in this order
  *         /DISCARD/ : { *(pattern ...) }
  *     }
  *
  * Expressions: numbers (16, 0x80000000, 64K, 128M), `.`, symbols, ALIGN(n),
- * ORIGIN(region), LENGTH(region), parentheses, + and -. Comments are
- * slash-star ones. Anything else is an error naming what was found. */
+ * ORIGIN(region), LENGTH(region), ADDR(section), parentheses, + and -.
+ * Comments are slash-star ones. Anything else is an error naming what was
+ * found.
+ *
+ * AT(lma) gives an output section a load address (the p_paddr of its
+ * segment) other than the address it runs at; ADDR(section) is an output
+ * section's address, as in Linux's `AT(ADDR(.text) - LOAD_OFFSET)`. layout.c
+ * explains what they mean.
+ *
+ * The objects are RV32 here (object.c reads ELF32 only, until #157), so a
+ * script's values are merlin-ld's ELF32 ones: exact 64-bit numbers up to
+ * 2^63 - 1, an overflow an error, the 4 GiB address space checked where a
+ * value is used. */
 #include "ld.h"
 
 const char DEFAULT_SCRIPT[] = "\n"
@@ -165,6 +177,51 @@ static int lex(const char *src) {
     return 1;
 }
 
+/* ---- Output formats ---- */
+
+const char *format_name(int format) {
+    return format == FORMAT_ELF64 ? "elf64-littleriscv" : "elf32-littleriscv";
+}
+
+/* The class an OUTPUT_FORMAT name stands for; FORMAT_NONE if merlin-ld does
+ * not know it. */
+static int format_class(const char *name) {
+    if (strcmp(name, "elf32-littleriscv") == 0) {
+        return FORMAT_ELF32;
+    }
+    if (strcmp(name, "elf64-littleriscv") == 0) {
+        return FORMAT_ELF64;
+    }
+    return FORMAT_NONE;
+}
+
+/* The executable's class is the script's OUTPUT_FORMAT's when it names one,
+ * and every object and library member must have it, so library.c needs it
+ * before the script is parsed. Commands are the words at the top level,
+ * outside every ( ) and { }; like the parser, take the first OUTPUT_FORMAT's
+ * first argument. */
+int declared_format(const char *src) {
+    if (!lex(src)) {
+        return FORMAT_NONE;
+    }
+    uint depth = 0;
+    for (uint i = 0; i < ntoks; i++) {
+        struct tok *t = &toks[i];
+        if (t->kind == TK_PUNCT && (strcmp(t->text, "(") == 0 || strcmp(t->text, "{") == 0)) {
+            depth++;
+        } else if (t->kind == TK_PUNCT && (strcmp(t->text, ")") == 0 || strcmp(t->text, "}") == 0)) {
+            depth = depth > 0 ? depth - 1 : 0;
+        } else if (t->kind == TK_WORD && depth == 0 && strcmp(t->text, "OUTPUT_FORMAT") == 0) {
+            if (i + 2 < ntoks && toks[i + 1].kind == TK_PUNCT && strcmp(toks[i + 1].text, "(") == 0 &&
+                (toks[i + 2].kind == TK_WORD || toks[i + 2].kind == TK_STR)) {
+                return format_class(toks[i + 2].text);
+            }
+            return FORMAT_NONE;
+        }
+    }
+    return FORMAT_NONE;
+}
+
 /* ---- Numbers and globs ---- */
 
 int parse_number(const char *w, i64 *out) {
@@ -268,6 +325,60 @@ int expr_uses_dot(struct expr *e) {
     }
     if (e->kind == X_ADD || e->kind == X_SUB) {
         return expr_uses_dot(e->a) || expr_uses_dot(e->b);
+    }
+    return 0;
+}
+
+/* ld.lld's expressionsUseSymbols: ADDR and ORIGIN name no symbol. */
+int expr_uses_symbols(struct expr *e) {
+    if (e->kind == X_SYMBOL) {
+        return 1;
+    }
+    if (e->kind == X_ALIGN) {
+        return expr_uses_symbols(e->a);
+    }
+    if (e->kind == X_ADD || e->kind == X_SUB) {
+        return expr_uses_symbols(e->a) || expr_uses_symbols(e->b);
+    }
+    return 0;
+}
+
+static int expr_names_addr(struct expr *e, const char *name) {
+    if (e == NULL) {
+        return 0;
+    }
+    if (e->kind == X_ADDR) {
+        return strcmp(e->name, name) == 0;
+    }
+    if (e->kind == X_ALIGN) {
+        return expr_names_addr(e->a, name);
+    }
+    if (e->kind == X_ADD || e->kind == X_SUB) {
+        return expr_names_addr(e->a, name) || expr_names_addr(e->b, name);
+    }
+    return 0;
+}
+
+/* ld.lld's usedInExpression: an empty section still has an address, which
+ * the expression needs. */
+int script_names_addr(struct script *s, const char *name) {
+    for (uint c = 0; c < s->ncommands; c++) {
+        struct command *cmd = &s->commands[c];
+        if (!cmd->is_output) {
+            if (expr_names_addr(cmd->assign.e, name)) {
+                return 1;
+            }
+            continue;
+        }
+        struct output_desc *o = &cmd->out;
+        if (expr_names_addr(o->at, name) || expr_names_addr(o->align, name)) {
+            return 1;
+        }
+        for (uint i = 0; i < o->nitems; i++) {
+            if (o->items[i].is_assign && expr_names_addr(o->items[i].assign.e, name)) {
+                return 1;
+            }
+        }
     }
     return 0;
 }
@@ -398,6 +509,11 @@ static int atom(struct expr **out) {
     } else if (strcmp(w, "ORIGIN") == 0 || strcmp(w, "LENGTH") == 0) {
         e = new_expr(w[0] == 'O' ? X_ORIGIN : X_LENGTH);
         if (!word("a memory region name", &e->name)) {
+            return 0;
+        }
+    } else if (strcmp(w, "ADDR") == 0) {
+        e = new_expr(X_ADDR);
+        if (!word("a section name", &e->name)) {
             return 0;
         }
     } else {
@@ -560,7 +676,8 @@ static int assign(char *name, uint line, struct assign *a) {
 }
 
 /* The rest of an output section after its name, its (NOLOAD) and the colon:
- * [ALIGN(n)] { items } [> REGION]. */
+ * [AT(lma)] [ALIGN(n)] { items } [> REGION]. ld.lld reads AT and ALIGN in
+ * that order only (`ALIGN(n) AT(lma)` is its "{ expected, but got AT"). */
 static int output_section(char *name, int noload, uint line, struct output_desc *o) {
     memset(o, 0, sizeof *o);
     o->name = name;
@@ -574,6 +691,16 @@ static int output_section(char *name, int noload, uint line, struct output_desc 
         return fail(line, "/DISCARD/ cannot be NOLOAD");
     }
     struct tok *t = peek();
+    if (t != NULL && t->kind == TK_WORD && strcmp(t->text, "AT") == 0) {
+        if (discard) {
+            return fail(cur_line(), "/DISCARD/ cannot have an AT");
+        }
+        pos++;
+        if (!expect("(") || !expr(&o->at) || !expect(")")) {
+            return 0;
+        }
+        t = peek();
+    }
     if (t != NULL && t->kind == TK_WORD && strcmp(t->text, "ALIGN") == 0) {
         uint aline = cur_line();
         if (discard) {
@@ -589,10 +716,14 @@ static int output_section(char *name, int noload, uint line, struct output_desc 
         if (!expect(")")) {
             return 0;
         }
-    } else if (t == NULL) {
+        t = peek();
+    }
+    if (t == NULL) {
         return fail(cur_line(), "unexpected end of script");
-    } else if (!(t->kind == TK_PUNCT && strcmp(t->text, "{") == 0)) {
-        return fail(cur_line(), fmt("unsupported syntax after '%s :': found %s (only ALIGN(n) may come before '{')",
+    }
+    if (!(t->kind == TK_PUNCT && strcmp(t->text, "{") == 0)) {
+        return fail(cur_line(), fmt("unsupported syntax after '%s :': found %s (only AT(lma) and then ALIGN(n) may "
+                                    "come before '{')",
                                     name, shown(t)));
     }
     if (!expect("{")) {
@@ -717,7 +848,7 @@ static int sections(struct script *s) {
             return fail(line, fmt("unsupported linker script command '%s'", name));
         }
         return fail(line, fmt("unsupported syntax after '%s': found %s (output sections are `name [(NOLOAD)] : "
-                              "[ALIGN(n)] { ... }`, without an address or other attributes)",
+                              "[AT(lma)] [ALIGN(n)] { ... }`, without an address or other attributes)",
                               name, shown(t)));
     }
     return 1;
@@ -756,13 +887,21 @@ static int script(struct script *s) {
             if (!expect("(")) {
                 return 0;
             }
+            /* OUTPUT_FORMAT(default, big, little): ld.lld goes by the first;
+             * merlin-ld also wants the others to be names it knows. */
             for (;;) {
                 char *f;
                 if (!word_or_str("an output format", &f)) {
                     return 0;
                 }
-                if (strcmp(f, "elf32-littleriscv") != 0) {
-                    return fail(line, fmt("OUTPUT_FORMAT(%s): only elf32-littleriscv is supported", f));
+                int format = format_class(f);
+                if (format == FORMAT_NONE) {
+                    return fail(line, fmt("OUTPUT_FORMAT(%s): only elf32-littleriscv and elf64-littleriscv are "
+                                          "supported",
+                                          f));
+                }
+                if (s->format == FORMAT_NONE) {
+                    s->format = format;
                 }
                 if (!eat(",")) {
                     break;

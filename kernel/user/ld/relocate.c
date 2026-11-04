@@ -175,7 +175,8 @@ static uchar **loaded(struct layout *l) {
                 uint start = place - os->addr;
                 uint end = (in->addr - os->addr) + sec->datalen;
                 struct reloc_error re;
-                int code = reloc_apply(r->type, place, sym, r->addend, images[k] + start, end - start, &ctx, &re);
+                int code =
+                    reloc_apply(r->type, place, i64_u(sym), r->addend, images[k] + start, end - start, &ctx, &re);
                 if (code != RE_OK) {
                     report_refused(o, sec, r, code, &re);
                 }
@@ -189,8 +190,10 @@ static uchar **loaded(struct layout *l) {
  * relocation against a place that is not in the executable (code /DISCARD/
  * threw away, or not loaded) writes 0, as ld.lld does. */
 static uchar **debug(struct layout *l) {
+    /* No PCREL_HI20 sites; R_RISCV_64 as in a section not loaded. */
     struct reloc_context none;
     memset(&none, 0, sizeof none);
+    none.debug = 1;
     uchar **images = xcalloc((l->ndebug + 1) * sizeof(uchar *));
     for (uint k = 0; k < l->ndebug; k++) {
         struct debug_section *ds = &l->debug[k];
@@ -209,11 +212,18 @@ static uchar **debug(struct layout *l) {
                     report(o, sec, r, fmt("is outside section %s (size 0x%x)", sec->name, sec->size));
                     continue;
                 }
-                uint sym;
+                i64 sym;
+                uint value;
                 char *e;
                 if (in_dropped_section(l, in->object, r->sym)) {
-                    sym = 0u - (uint)r->addend;
-                } else if (!reloc_symbol(l, in->object, r->sym, &sym, &e)) {
+                    /* S = -A, modulo 2^64, so that S + A, the value written,
+                     * is 0 for R_RISCV_32 (an offset) and R_RISCV_64 (an
+                     * address) alike, whatever the addend: ld.lld writes 0
+                     * there too. */
+                    sym = i64_neg(i64_of(r->addend));
+                } else if (reloc_symbol(l, in->object, r->sym, &value, &e)) {
+                    sym = i64_u(value);
+                } else {
                     report(o, sec, r, e);
                     continue;
                 }

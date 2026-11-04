@@ -8,6 +8,7 @@
  * auipc), A the addend, P the place, the address of the bytes patched.
  *
  *   R_RISCV_32               S + A                the whole word
+ *   R_RISCV_64               S + A                the whole doubleword
  *   R_RISCV_BRANCH           S + A - P            B-type imm, +-4 KiB, even
  *   R_RISCV_JAL              S + A - P            J-type imm, +-1 MiB, even
  *   R_RISCV_CALL(_PLT)       S + A - P            auipc (hi) + jalr (lo)
@@ -20,7 +21,14 @@
  * Values are computed exactly (64 bits), then checked against what the
  * field holds. A hi/lo pair builds a full 32-bit value and wraps modulo
  * 2^32 as the hardware does, so only R_RISCV_32, BRANCH and JAL can be out
- * of range. R_RISCV_ALIGN needs relaxation, which merlin-ld never does. */
+ * of range. R_RISCV_ALIGN needs relaxation, which merlin-ld never does.
+ *
+ * R_RISCV_64 is `.dword sym` (`.quad`), which assemblers emit on RV32 too,
+ * for a 64-bit datum holding an address: S + A in 64 bits (S zero-extended,
+ * A sign-extended), never checked. In a section that is not loaded (debug
+ * information, ctx->debug) it is the 32-bit value sign-extended, as ld.lld's
+ * relocateNonAlloc does on RV32: `.dword _start` at 0x80000000 is
+ * 0xffffffff80000000 there, and 0x80000000 in .data. */
 #include "ld.h"
 
 const char *reloc_type_name(uint type) {
@@ -109,9 +117,13 @@ static int check_offset(i64 value, uint bits, uint *out, struct reloc_error *e) 
     return RE_OK;
 }
 
-int reloc_apply(uint type, uint place, uint sym, int addend, uchar *bytes, uint have, struct reloc_context *ctx,
+int reloc_apply(uint type, uint place, i64 sym, int addend, uchar *bytes, uint have, struct reloc_context *ctx,
                 struct reloc_error *e) {
-    i64 s = i64_u(sym), a = i64_of(addend), p = i64_u(place);
+    /* S is 64 bits: a debug relocation against discarded code has S = -A
+     * modulo 2^64 (relocate.c), so that S + A is 0. The fields take the low
+     * 32 bits, `sl`. */
+    i64 s = sym, a = i64_of(addend), p = i64_u(place);
+    uint sl = sym.lo;
     uint need;
     if (type == R_RISCV_NONE || type == R_RISCV_RELAX) {
         return RE_OK;
@@ -119,7 +131,7 @@ int reloc_apply(uint type, uint place, uint sym, int addend, uchar *bytes, uint 
     if (type == R_RISCV_ALIGN) {
         return RE_NEEDS_RELAXATION;
     }
-    if (type == R_RISCV_CALL || type == R_RISCV_CALL_PLT) {
+    if (type == R_RISCV_64 || type == R_RISCV_CALL || type == R_RISCV_CALL_PLT) {
         need = 8;
     } else if (type == R_RISCV_32 || type == R_RISCV_BRANCH || type == R_RISCV_JAL || type == R_RISCV_PCREL_HI20 ||
                type == R_RISCV_PCREL_LO12_I || type == R_RISCV_PCREL_LO12_S || type == R_RISCV_HI20 ||
@@ -132,6 +144,13 @@ int reloc_apply(uint type, uint place, uint sym, int addend, uchar *bytes, uint 
         e->need = need;
         e->have = have;
         return RE_TRUNCATED;
+    }
+    if (type == R_RISCV_64) {
+        /* A doubleword holding an address, never out of range. */
+        i64 value = ctx->debug ? i64_of((int)(sl + (uint)addend)) : i64_add(s, a);
+        write32(bytes, value.lo);
+        write32(bytes + 4, value.hi);
+        return RE_OK;
     }
     uint inst = read32(bytes);
     uint patched, imm;
@@ -159,11 +178,11 @@ int reloc_apply(uint type, uint place, uint sym, int addend, uchar *bytes, uint 
         /* auipc ra, %hi(off) + jalr ra, %lo(off)(ra), off = S + A - P with P
          * the auipc's address: the jalr adds to ra (P + hi), so both halves
          * use the same off. */
-        uint off = sym + (uint)addend - place;
+        uint off = sl + (uint)addend - place;
         write32(bytes + 4, set_i(read32(bytes + 4), lo12(off)));
         patched = set_u(inst, hi20(off));
     } else if (type == R_RISCV_PCREL_HI20) {
-        patched = set_u(inst, hi20(sym + (uint)addend - place));
+        patched = set_u(inst, hi20(sl + (uint)addend - place));
     } else if (type == R_RISCV_PCREL_LO12_I || type == R_RISCV_PCREL_LO12_S) {
         /* The low part of the same value as the HI20 at the auipc this
          * relocation's symbol labels: that HI20's S + A - P, P = S here. */
@@ -171,17 +190,17 @@ int reloc_apply(uint type, uint place, uint sym, int addend, uchar *bytes, uint 
             return RE_LO12_ADDEND;
         }
         int k;
-        if (!umap_get(&ctx->by_place, sym, &k)) {
+        if (!umap_get(&ctx->by_place, sl, &k)) {
             return RE_MISSING_HI20;
         }
-        uint value = ctx->sites[k].sym + (uint)ctx->sites[k].addend - sym;
+        uint value = ctx->sites[k].sym + (uint)ctx->sites[k].addend - sl;
         patched = type == R_RISCV_PCREL_LO12_I ? set_i(inst, lo12(value)) : set_s(inst, lo12(value));
     } else if (type == R_RISCV_HI20) {
-        patched = set_u(inst, hi20(sym + (uint)addend));
+        patched = set_u(inst, hi20(sl + (uint)addend));
     } else if (type == R_RISCV_LO12_I) {
-        patched = set_i(inst, lo12(sym + (uint)addend));
+        patched = set_i(inst, lo12(sl + (uint)addend));
     } else {
-        patched = set_s(inst, lo12(sym + (uint)addend));
+        patched = set_s(inst, lo12(sl + (uint)addend));
     }
     write32(bytes, patched);
     return RE_OK;

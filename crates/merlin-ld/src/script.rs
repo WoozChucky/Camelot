@@ -619,7 +619,8 @@ impl Parser {
                     line,
                     format!(
                         "unsupported syntax after '{name}': found {t} (output sections are \
-                         `name [(NOLOAD)] : [ALIGN(n)] {{ ... }}`, without an address or other attributes)"
+                         `name [(NOLOAD)] : [AT(lma)] [ALIGN(n)] {{ ... }}`, without an address or other \
+                         attributes)"
                     ),
                 ),
                 None => error(line, "unexpected end of script"),
@@ -1283,7 +1284,8 @@ mod tests {
             ),
             (
                 "SECTIONS { .text 0x100 : { *(.text) } }",
-                "without an address or other attributes",
+                "1: unsupported syntax after '.text': found '0x100' (output sections are \
+                 `name [(NOLOAD)] : [AT(lma)] [ALIGN(n)] { ... }`, without an address or other attributes)",
             ),
             (
                 "SECTIONS { .bss (COPY) : { *(.bss) } }",

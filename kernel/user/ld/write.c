@@ -1,9 +1,10 @@
 /* ld: the linked image as an ELF32 little-endian executable (merlin-ld's
- * write.rs):
+ * write.rs, which explains each rule at length):
  *
  *   ELF header (52 bytes)
- *   program headers, one PT_LOAD per segment
- *   segment contents, each at a file offset congruent to its address mod 4 KiB
+ *   program headers (32 bytes each): PT_PHDR if the headers are loaded, one
+ *     PT_LOAD per segment, in the room ld.lld leaves for its own
+ *   segment contents, each at a file offset congruent to its address mod its p_align
  *   .symtab, .strtab, the debug sections (.debug_line, ...), .shstrtab
  *   section headers: null, output sections, .symtab, .strtab, debug sections, .shstrtab
  *
@@ -14,22 +15,53 @@
  * Segments group consecutive output sections with the same permissions (R,
  * RX, RW), as ld.lld does with a SECTIONS command. A segment does not split
  * at address gaps or after a NOBITS section: the file holds zeros for those
- * bytes. A segment of only empty sections is dropped. */
+ * bytes. A segment of only empty sections is dropped. A section with an AT
+ * of its own starts a segment, and a segment's p_paddr is its first
+ * section's load address. Its p_align is the page, 4 KiB, or the largest
+ * alignment of its sections if that is more (ld.lld's PhdrEntry::add).
+ *
+ * The headers, as ld.lld places them for a script without PHDRS:
+ *
+ *   1. ld.lld sizes its program header table for every header it makes
+ *      before it knows which it keeps: PT_PHDR, a PT_LOAD for the headers,
+ *      one PT_LOAD per run of sections (an empty one too), PT_GNU_STACK, and
+ *      PT_RISCV_ATTRIBUTES if it writes a .riscv.attributes section. A
+ *      read-only first section in no MEMORY region joins the headers'
+ *      PT_LOAD: one PT_LOAD fewer.
+ *   2. The headers are loaded if that room fits between the start of the
+ *      lowest section's page and the section: at that page, at file offset
+ *      0, in a read-only PT_LOAD of their own or in the first section's
+ *      (then moved down to the page), and a PT_PHDR covers the room after
+ *      the ELF header.
+ *   3. Either way the segment contents come after the room.
+ *
+ * merlin-ld, and so this, writes only the PT_PHDR and the PT_LOADs, with
+ * zeros for the rest of the room, so that every segment is where ld.lld
+ * puts it. */
 #include "ld.h"
 
 #define PAGE 0x1000
-#define PT_LOAD 1
-#define PF_X 1
-#define PF_W 2
-#define PF_R 4
 
 struct segment {
     uint vaddr;
+    uint paddr; /* the load address: its first section's */
     uint filesz;
     uint memsz;
     uint flags;
+    uint align; /* p_align: its file offset is congruent to vaddr modulo this */
     uint first; /* the sections [first, first + n) of the layout */
     uint n;
+    /* It loads the ELF header and the program headers: it starts at the
+     * headers' page, at file offset 0. */
+    int headers;
+};
+
+/* The room the ELF header and the program header table take at the start
+ * of the file, and where they are loaded, if they are. */
+struct headers {
+    uint size;
+    int loaded;
+    uint addr;
 };
 
 static uint pflags(uint shflags) {
@@ -43,8 +75,9 @@ static uint pflags(uint shflags) {
     return f;
 }
 
-/* Groups the output sections into PT_LOAD segments. Returns how many. */
-static uint segments(struct layout *l, struct segment *segs) {
+/* Groups the output sections into runs, the PT_LOADs they need, empty ones
+ * included. Returns how many. */
+static uint runs(struct layout *l, struct segment *segs) {
     uint n = 0;
     for (uint i = 0; i < l->nsections; i++) {
         struct output_section *s = &l->sections[i];
@@ -53,29 +86,102 @@ static uint segments(struct layout *l, struct segment *segs) {
         if (!start_new) {
             struct output_section *prev = &l->sections[segs[n - 1].first + segs[n - 1].n - 1];
             i64 prev_end = i64_add(i64_u(prev->addr), i64_u(prev->size));
-            /* Going backward can't be one segment. */
-            start_new = segs[n - 1].flags != flags || i64_cmp(i64_u(s->addr), prev_end) < 0;
+            /* Going backward can't be one segment. A section with its own
+             * load address starts one: a segment has one p_paddr, and its
+             * sections are loaded contiguously from there. */
+            start_new = segs[n - 1].flags != flags || i64_cmp(i64_u(s->addr), prev_end) < 0 || s->at;
         }
         if (start_new) {
             memset(&segs[n], 0, sizeof segs[n]);
             segs[n].vaddr = s->addr;
+            /* Below 4 GiB: the layout checks every load range. */
+            segs[n].paddr = s->lma.lo;
             segs[n].flags = flags;
+            segs[n].align = PAGE;
             segs[n].first = i;
             n++;
         }
         struct segment *seg = &segs[n - 1];
         seg->n++;
+        /* Every section counts, an empty or NOBITS one too (ld.lld). */
+        seg->align = s->align > seg->align ? s->align : seg->align;
         uint end = s->addr - seg->vaddr + s->size;
         seg->memsz = end;
         if (!s->nobits) {
             seg->filesz = end;
         }
     }
-    /* E.g. an empty .rodata between .text and .data. */
+    return n;
+}
+
+/* The PT_LOAD segments into `out` (room for one more than the layout has
+ * sections), the headers' one first if they are loaded, and where the
+ * headers go into *h. Returns how many segments. */
+static uint segments(struct layout *l, struct segment *out, struct headers *h) {
+    /* The runs go after a free first entry, where the headers' own segment
+     * may go. */
+    struct segment *segs = out + 1;
+    uint n = runs(l, segs);
+
+    /* 1. ld.lld's program header table, sized for every header it makes:
+     * PT_PHDR, the headers' PT_LOAD, one PT_LOAD per run (an empty one
+     * too), PT_GNU_STACK and PT_RISCV_ATTRIBUTES. A read-only first section
+     * in no MEMORY region goes into the headers' PT_LOAD instead (an AT on
+     * it does not keep it out). */
+    int joins = !l->memory && n > 0 && segs[0].flags == PF_R;
+    uint count = 2 + n - (uint)joins + 1 + (uint)(l->riscv_attributes != 0);
+    h->size = 52 + 32 * count;
+
+    /* 2. Are they loaded? Only if they fit between the start of the page of
+     * the lowest section and that section ("only allocate program headers
+     * if that would not add a page"). Without sections ld.lld's lowest
+     * address is the top of the address space. */
+    uint lowest = 0xffffffffu;
+    for (uint i = 0; i < l->nsections; i++) {
+        lowest = l->sections[i].addr < lowest ? l->sections[i].addr : lowest;
+    }
+    uint page = lowest - lowest % PAGE;
+    h->loaded = h->size <= lowest - page;
+    h->addr = page;
+    struct segment *first = segs;
+    uint total = n;
+    if (h->loaded) {
+        if (joins) {
+            /* The first segment, moved down to the page: the headers, the
+             * gap up to its first section, its sections. Its file size runs
+             * to its last section with file contents, or to the end of the
+             * headers if none has any; its load address moves down too. */
+            uint below = segs[0].vaddr - page;
+            int file = 0;
+            for (uint i = segs[0].first; i < segs[0].first + segs[0].n; i++) {
+                file |= !l->sections[i].nobits;
+            }
+            segs[0].vaddr = page;
+            segs[0].paddr -= below;
+            segs[0].filesz = file ? below + segs[0].filesz : h->size;
+            segs[0].memsz += below;
+            segs[0].headers = 1;
+        } else {
+            /* A read-only segment of the headers alone, at their address. */
+            first = out;
+            total = n + 1;
+            memset(&out[0], 0, sizeof out[0]);
+            out[0].vaddr = page;
+            out[0].paddr = page;
+            out[0].filesz = h->size;
+            out[0].memsz = h->size;
+            out[0].flags = PF_R;
+            out[0].align = PAGE;
+            out[0].headers = 1;
+        }
+    }
+    /* E.g. an empty .rodata between .text and .data (ld.lld removes empty
+     * PT_LOADs too, after it has sized the table). The headers' segment is
+     * never empty. Moved down to out[0..], in order. */
     uint kept = 0;
-    for (uint i = 0; i < n; i++) {
-        if (segs[i].memsz > 0) {
-            segs[kept++] = segs[i];
+    for (uint i = 0; i < total; i++) {
+        if (first[i].memsz > 0) {
+            out[kept++] = first[i];
         }
     }
     return kept;
@@ -180,19 +286,26 @@ static void shdr(struct buf *h, uint name, uint type, uint flags, uint addr, uin
 }
 
 void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struct buf *out) {
-    struct segment *segs = xcalloc((l->nsections + 1) * sizeof(struct segment));
-    uint nsegs = segments(l, segs);
+    struct segment *segs = xcalloc((l->nsections + 2) * sizeof(struct segment));
+    struct headers hd;
+    uint nsegs = segments(l, segs, &hd);
     uint phoff = 52;
     memset(out, 0, sizeof *out);
-    buf_pad(out, phoff + 32 * nsegs);
+    /* The room ld.lld leaves for the headers, which holds ours. */
+    buf_pad(out, hd.size);
 
     /* Segment contents. */
     uint *sec_offset = xcalloc((l->nsections + 1) * sizeof(uint));
     uint *seg_offset = xcalloc((nsegs + 1) * sizeof(uint));
     for (uint k = 0; k < nsegs; k++) {
-        /* The smallest offset >= the end with offset = vaddr (mod PAGE). */
-        uint cur = out->len;
-        uint off = cur + (segs[k].vaddr % PAGE + PAGE - cur % PAGE) % PAGE;
+        uint off = 0;
+        if (!segs[k].headers) {
+            /* The smallest offset >= the end with offset = vaddr (mod
+             * p_align). The headers' segment maps the start of the file;
+             * its sections, if any, are past the room. */
+            uint cur = out->len, a = segs[k].align;
+            off = cur + (segs[k].vaddr % a + a - cur % a) % a;
+        }
         buf_pad(out, off);
         for (uint i = segs[k].first; i < segs[k].first + segs[k].n; i++) {
             struct output_section *s = &l->sections[i];
@@ -205,20 +318,40 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
         }
         seg_offset[k] = off;
     }
+    /* Program headers. With the headers loaded, a PT_PHDR first: the table
+     * in the headers' segment (the first one), all of the room after the
+     * ELF header, at the address and load address it has there. */
+    uint nphdrs = 0;
+    if (hd.loaded) {
+        uint ph[8];
+        ph[0] = PT_PHDR;
+        ph[1] = phoff;
+        ph[2] = hd.addr + phoff;
+        ph[3] = segs[0].paddr + phoff;
+        ph[4] = hd.size - phoff;
+        ph[5] = hd.size - phoff;
+        ph[6] = PF_R;
+        ph[7] = 4; /* the size of an address */
+        for (uint w = 0; w < 8; w++) {
+            put_word(out, phoff + 4 * w, ph[w]);
+        }
+        nphdrs++;
+    }
     for (uint k = 0; k < nsegs; k++) {
-        uint at = phoff + 32 * k;
+        uint at = phoff + 32 * nphdrs;
         uint ph[8];
         ph[0] = PT_LOAD;
         ph[1] = seg_offset[k];
         ph[2] = segs[k].vaddr;
-        ph[3] = segs[k].vaddr;
+        ph[3] = segs[k].paddr;
         ph[4] = segs[k].filesz;
         ph[5] = segs[k].memsz;
         ph[6] = segs[k].flags;
-        ph[7] = PAGE;
+        ph[7] = segs[k].align;
         for (uint w = 0; w < 8; w++) {
             put_word(out, at + 4 * w, ph[w]);
         }
+        nphdrs++;
     }
 
     /* Symbol and string tables, and the debug sections. */
@@ -276,11 +409,11 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
     e[0] = ET_EXEC | EM_RISCV << 16; /* e_type, e_machine */
     e[1] = 1;             /* e_version */
     e[2] = l->entry;
-    e[3] = nsegs == 0 ? 0 : phoff;
+    e[3] = nphdrs == 0 ? 0 : phoff;
     e[4] = shoff;
     e[5] = 0;                   /* e_flags: ilp32 soft-float, no RVC */
     e[6] = 52 | 32 << 16;       /* e_ehsize, e_phentsize */
-    e[7] = nsegs | 40 << 16;    /* e_phnum, e_shentsize */
+    e[7] = nphdrs | 40 << 16;   /* e_phnum, e_shentsize */
     e[8] = nshdrs | (nshdrs - 1) << 16; /* e_shnum, e_shstrndx */
     for (uint w = 0; w < 9; w++) {
         put_word(out, 16 + 4 * w, e[w]);

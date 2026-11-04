@@ -11,20 +11,42 @@
  *   4. SECTIONS walked with the location counter, each input section placed
  *      at its alignment, the script's assignments evaluated as they come.
  *      As in ld.lld, an output section is dropped only when no input section
- *      (not even an empty one) matched it and it has no assignments.
+ *      (not even an empty one) matched it and it has no assignments, and an
+ *      expression does not need it (an ADDR names it, or its AT or ALIGN
+ *      uses a symbol). Then the load addresses must not overlap.
  *   5. Debug information: each .debug_* input section goes into the output
  *      section of its name, after everything loaded; a symbol in one is its
  *      offset there.
  *   6. Undefined globals, then the entry point.
  *
  * The location counter is a 64-bit number (merlin-ld's u64): a section may
- * end exactly at 4 GiB, and going past it is an error, not a wrap. */
+ * end exactly at 4 GiB, and going past it is an error, not a wrap.
+ *
+ * Load addresses (AT), as merlin-ld's layout.rs explains them: a section
+ * runs at its address (VMA) and is loaded at its load address (LMA, its
+ * segment's p_paddr), the same unless the script says `AT(lma)`. In AT, `.`
+ * is the section's aligned start. The difference LMA - VMA (modulo 2^64)
+ * carries on to every later section without an AT, NOLOAD and empty ones
+ * too; a dropped section evaluates nothing. A section with an AT starts a
+ * segment of its own (write.c). Load ranges must stay within 4 GiB and not
+ * overlap. ADDR(.x) is the address of output section .x: one already
+ * placed, or the one being placed (in its AT and its assignments).
+ *
+ * The executable's class is the objects', ELF32 (object.c reads no other,
+ * until #157). A script whose OUTPUT_FORMAT says elf64-littleriscv is
+ * refused before the layout, with the objects (library.c), as merlin-ld's
+ * link_with_library does. */
 #include "ld.h"
 
 /* The link's state while it is laid out. */
 static struct layout *L;
 static struct script S;
 static const char *script_name;
+/* The output section being placed and its start, once that is known: what
+ * ADDR of it is, in its AT and among its assignments. */
+static int has_current;
+static const char *current_name;
+static i64 current_start;
 
 static void script_err(uint line, char *msg) {
     error(fmt("%s:%u: %s", script_name, line, msg));
@@ -225,6 +247,33 @@ static int eval(struct expr *e, i64 dot, i64 *out, char **err) {
         }
         *out = i64_u(e->kind == X_ORIGIN ? S.origin : S.length);
         return 1;
+    case X_ADDR:
+        /* The address of an output section: one already placed, or the
+         * one being placed once its start is known (in its own AT, not in
+         * its ALIGN, which that start depends on). The script is walked
+         * once, so a later section has no address yet: an error, where
+         * ld.lld would go round again, as for symbols. */
+        if (has_current && strcmp(current_name, e->name) == 0) {
+            *out = current_start;
+            return 1;
+        }
+        for (uint k = 0; k < L->nsections; k++) {
+            if (strcmp(L->sections[k].name, e->name) == 0) {
+                *out = i64_u(L->sections[k].addr);
+                return 1;
+            }
+        }
+        for (uint c = 0; c < S.ncommands; c++) {
+            struct command *cmd = &S.commands[c];
+            if (cmd->is_output && strcmp(cmd->out.name, DISCARD_NAME) != 0 && strcmp(cmd->out.name, e->name) == 0) {
+                *err = fmt("section '%s' is used before it is placed", e->name);
+                return 0;
+            }
+        }
+        /* ld.lld's words. (A section of the script that ADDR names is never
+         * dropped, so only an unknown name gets here.) */
+        *err = fmt("undefined section %s", e->name);
+        return 0;
     default:
         if (!eval(e->a, dot, &a, err) || !eval(e->b, dot, &b, err)) {
             return 0;
@@ -480,10 +529,22 @@ static void assign_inputs(int have_script) {
 
 static uint capsections;
 
+/* Whether a section loaded at `lma` with `size` bytes is within the 4 GiB
+ * address space, as its address range must be (ld.lld would truncate
+ * p_paddr to 32 bits). `lma` is 64 bits: an AT may move it anywhere. */
+static int load_range_fits(i64 lma, uint size) {
+    if (lma.hi == 0) {
+        return i64_cmp(i64_add(lma, i64_u(size)), four_gib()) <= 0;
+    }
+    /* At 4 GiB exactly, only an empty range ends there. */
+    return lma.hi == 1 && lma.lo == 0 && size == 0;
+}
+
 /* One output section of the walk (merlin-ld's Command::Output arm).
- * *dot, *cursor and *dot_moved are the walk's state. */
+ * *dot, *cursor, *dot_moved, *prev_flags and *lma_offset are the walk's
+ * state. */
 static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor, i64 *cursor, uint *dot_moved,
-                         uint *prev_flags) {
+                         uint *prev_flags, i64 *lma_offset) {
     struct rule *r = rules[c];
     uint ninputs = 0;
     int has_assign = 0;
@@ -496,7 +557,13 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
             align = a > align ? a : align;
         }
     }
-    if (ninputs == 0 && !has_assign) {
+    /* Nor is a section dropped that an expression needs: one an ADDR names
+     * (ld.lld's usedInExpression), or one whose AT or ALIGN uses a symbol
+     * (expressionsUseSymbols). A dropped section evaluates nothing, so its
+     * AT changes no load address. */
+    int needed = script_names_addr(&S, o->name) || (o->at != NULL && expr_uses_symbols(o->at)) ||
+                 (o->align != NULL && expr_uses_symbols(o->align));
+    if (ninputs == 0 && !has_assign && !needed) {
         return;
     }
     /* `.name : ALIGN(n) { ... }`: at least n. */
@@ -517,6 +584,25 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
     }
     i64 base = has_cursor ? *cursor : *dot;
     i64 start = align_up(base, i64_u(align));
+    /* From here on ADDR of this section is `start`. */
+    has_current = 1;
+    current_name = o->name;
+    current_start = start;
+    /* AT(lma), with `.` at the section's aligned start (`AT(. - OFFSET)` is
+     * LMA = VMA - OFFSET). It sets the offset the sections after this one
+     * keep. */
+    int at = 0;
+    if (o->at != NULL) {
+        i64 v;
+        char *err;
+        if (eval(o->at, start, &v, &err)) {
+            *lma_offset = i64_sub(v, start);
+            at = 1;
+        } else {
+            script_err(o->line, err);
+        }
+    }
+    i64 lma = i64_add(start, *lma_offset);
     i64 d = start;
     struct output_section os;
     memset(&os, 0, sizeof os);
@@ -549,9 +635,18 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
         script_err(o->line, fmt("section %s extends past the 4 GiB address space", o->name));
         return;
     }
+    /* The load address range must fit as the address range does. The
+     * section is still placed: its addresses are right, and the sections
+     * after it go where they should. */
+    if (!load_range_fits(lma, size.lo)) {
+        script_err(o->line, fmt("section %s load address range extends past the 4 GiB address space", o->name));
+    }
     if (os.ninputs == 0) {
-        /* Only assignments: like ld.lld, PROGBITS with the previous flags. */
-        flags = *prev_flags;
+        /* Only assignments: like ld.lld, PROGBITS with the previous flags,
+         * but only SHF_ALLOC and SHF_WRITE of them (ld.lld's
+         * adjustOutputSections leaves SHF_EXECINSTR out, so that such a
+         * section after the code goes with the data that follows it). */
+        flags = *prev_flags & (SHF_ALLOC | SHF_WRITE);
         nobits = 0;
     } else {
         *prev_flags = flags;
@@ -578,6 +673,8 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
     os.name = o->name;
     os.addr = start.lo;
     os.size = size.lo;
+    os.lma = lma;
+    os.at = at;
     os.align = align;
     os.flags = flags;
     os.nobits = nobits;
@@ -596,8 +693,12 @@ static void walk(void) {
     uint dot_moved = 0;
     /* Flags of the last output section that had input sections. */
     uint prev_flags = SHF_ALLOC;
+    /* LMA - VMA (modulo 2^64): 0 until a section has an AT; every section
+     * after it without one keeps its difference. */
+    i64 lma_offset = i64_u(0);
     for (uint c = 0; c < S.ncommands; c++) {
         struct command *cmd = &S.commands[c];
+        has_current = 0;
         if (!cmd->is_output) {
             i64 before = dot;
             dot = assign(&cmd->assign, dot);
@@ -611,9 +712,72 @@ static void walk(void) {
                 }
             }
         } else {
-            place_output(c, &cmd->out, &dot, S.has_memory, &cursor, &dot_moved, &prev_flags);
+            place_output(c, &cmd->out, &dot, S.has_memory, &cursor, &dot_moved, &prev_flags, &lma_offset);
         }
     }
+    has_current = 0;
+}
+
+/* Sections loaded over each other, as ld.lld's checkSections finds them
+ * ("load address range overlaps"): with AT, two sections can be given load
+ * addresses that overlap although their addresses do not. Only sections
+ * with bytes in the file count. Like ld.lld, sort them by load address and
+ * compare each with the next one, naming the lower one first. */
+static void load_overlaps(void) {
+    uint *order = xcalloc((L->nsections + 1) * sizeof(uint));
+    uint n = 0;
+    for (uint k = 0; k < L->nsections; k++) {
+        struct output_section *s = &L->sections[k];
+        /* (One whose load range does not fit has been reported already.) */
+        if (s->nobits || s->size == 0 || !load_range_fits(s->lma, s->size)) {
+            continue;
+        }
+        /* Insertion sort, stable: sections at the same load address stay
+         * in script order. These load addresses are below 4 GiB. */
+        uint j = n;
+        while (j > 0 && L->sections[order[j - 1]].lma.lo > s->lma.lo) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = k;
+        n++;
+    }
+    for (uint i = 0; i + 1 < n; i++) {
+        struct output_section *a = &L->sections[order[i]];
+        struct output_section *b = &L->sections[order[i + 1]];
+        if (i64_cmp(b->lma, i64_add(a->lma, i64_u(a->size))) < 0) {
+            error(fmt("section %s load address range overlaps with %s (%s is [0x%x, 0x%x], %s is [0x%x, 0x%x])",
+                      a->name, b->name, a->name, a->lma.lo, a->lma.lo + a->size - 1, b->name, b->lma.lo,
+                      b->lma.lo + b->size - 1));
+        }
+    }
+    free(order);
+}
+
+/* Whether ld.lld would write a .riscv.attributes section: it merges every
+ * input SHT_RISCV_ATTRIBUTES section (clang and merlin-as give each object
+ * one) into one section of that name, which the script places by its name:
+ * the first output section whose pattern matches .riscv.attributes gets it,
+ * and only a /DISCARD/ there throws it away. */
+static int riscv_attributes_kept(void) {
+    int any = 0;
+    for (uint oi = 0; oi < L->nobjects; oi++) {
+        for (uint si = 0; si < L->objects[oi].nsections; si++) {
+            any |= L->objects[oi].sections[si].type == SHT_RISCV_ATTRIBUTES;
+        }
+    }
+    for (uint c = 0; c < S.ncommands; c++) {
+        struct command *cmd = &S.commands[c];
+        if (!cmd->is_output) {
+            continue;
+        }
+        for (uint it = 0; it < cmd->out.nitems; it++) {
+            if (!cmd->out.items[it].is_assign && pattern_matches(&cmd->out.items[it], ".riscv.attributes")) {
+                return any && strcmp(cmd->out.name, DISCARD_NAME) != 0;
+            }
+        }
+    }
+    return any;
 }
 
 static int is_debug(struct section *s) {
@@ -770,6 +934,9 @@ int layout_build(struct object *objects, uint nobjects, const char *name, const 
     globals();
     assign_inputs(have_script);
     walk();
+    load_overlaps();
+    l->memory = S.has_memory;
+    l->riscv_attributes = riscv_attributes_kept();
     place_debug();
     merge_warnings();
     undefined_references();
