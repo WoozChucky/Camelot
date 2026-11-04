@@ -744,9 +744,8 @@ static void data(struct dirarg *args, uint nargs, uint size) {
         i64 v;
         if (eval(e, &v) || eval_relative(e, &v)) {
             if (!fits_in_bytes(v, size)) {
-                char *msg;
-                msg = fmt("data value %s does not fit in %u %s", i64_dec(v), size, size == 1 ? "byte" : "bytes");
-                error(msg);
+                const char *unit = size == 1 ? "byte" : "bytes";
+                error(fmt("data value %s does not fit in %u %s", i64_dec(v), size, unit));
                 continue;
             }
             uchar bytes[8];
