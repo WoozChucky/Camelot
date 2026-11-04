@@ -273,6 +273,33 @@ fn win_scan(vk: u32, lparam: LPARAM) -> u16 {
     }
 }
 
+/// Whether key message `msg` (`wparam`, `lparam`, sent at `time`) is the Left Ctrl that
+/// Windows makes up for AltGr: on a layout with AltGr, the Right Alt key comes as a
+/// Left Ctrl message and then the Right Alt one, both at the same time, though no
+/// Ctrl key moved. `next` is the message after it in the queue. The physical keyboard
+/// sent Right Alt alone, so that is all raw mode reports, as SDL does (its
+/// `SkipAltGrLeftControl`). A Left Ctrl really pressed has no Right Alt queued behind
+/// it at the same millisecond.
+fn is_altgr_ctrl(msg: u32, wparam: WPARAM, lparam: LPARAM, time: u32, next: Option<&MSG>) -> bool {
+    let down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+    let pair = |m: u32| {
+        if down {
+            matches!(m, WM_KEYDOWN | WM_SYSKEYDOWN)
+        } else {
+            matches!(m, WM_KEYUP | WM_SYSKEYUP)
+        }
+    };
+    let Some(next) = next else {
+        return false;
+    };
+    wparam as u32 == VK_CONTROL
+        && lparam & KF_EXTENDED_LPARAM == 0
+        && pair(next.message)
+        && next.wParam as u32 == VK_MENU
+        && next.lParam & KF_EXTENDED_LPARAM != 0
+        && next.time == time
+}
+
 fn key_down(vk: u32) -> bool {
     // SAFETY: no pointers involved.
     unsafe { GetKeyState(vk as i32) < 0 }
@@ -342,9 +369,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Ctrl+Alt is AltGr: the character it types is the event, not a Ctrl chord.
             let ctrl = key_down(VK_CONTROL) && !key_down(VK_MENU);
             let scan = (lparam as u32 >> 16) & 0x1ff;
-            st.key(vk, win_scan(vk, lparam), press, key_down(VK_SHIFT), ctrl, || {
-                printable(vk, scan)
-            });
+            let mut next: MSG = std::mem::zeroed();
+            let next = (PeekMessageW(&mut next, hwnd, 0, 0, PM_NOREMOVE) != 0).then_some(&next);
+            if !is_altgr_ctrl(msg, wparam, lparam, GetMessageTime() as u32, next) {
+                st.key(vk, win_scan(vk, lparam), press, key_down(VK_SHIFT), ctrl, || {
+                    printable(vk, scan)
+                });
+            }
             // In ASCII mode Alt chords still reach Windows, so Alt+F4 closes the window
             // (menu mode is stopped at WM_SYSCOMMAND below). In raw mode they are the
             // program's keys, as in a virtual machine's window that has the keyboard:
@@ -804,6 +835,77 @@ mod tests {
         assert_eq!(win_scan(VK_HOME, 1), SC_HOME);
         assert_eq!(win_scan(VK_NUMPAD7, 1), SC_KP7);
         assert_eq!(usage::from_win_scan(win_scan(VK_LWIN, 1)), Some(usage::LEFT_GUI));
+    }
+
+    #[test]
+    fn the_left_ctrl_of_altgr_is_not_a_key() {
+        let lp = |scan: isize, ext: bool| (scan << 16 | if ext { KF_EXTENDED_LPARAM } else { 0 }) | 1;
+        let msg = |message: u32, vk: u32, lparam: LPARAM, time: u32| MSG {
+            hwnd: null_mut(),
+            message,
+            wParam: vk as WPARAM,
+            lParam: lparam,
+            time,
+            pt: POINT::default(),
+        };
+        let ctrl = lp(0x1d, false);
+        let ralt = msg(WM_SYSKEYDOWN, VK_MENU, lp(0x38, true), 500);
+        // AltGr down: Left Ctrl and Right Alt at the same time. Up likewise.
+        assert!(is_altgr_ctrl(
+            WM_KEYDOWN,
+            VK_CONTROL as WPARAM,
+            ctrl,
+            500,
+            Some(&ralt)
+        ));
+        let ralt_up = msg(WM_KEYUP, VK_MENU, lp(0x38, true), 640);
+        assert!(is_altgr_ctrl(
+            WM_KEYUP,
+            VK_CONTROL as WPARAM,
+            ctrl,
+            640,
+            Some(&ralt_up)
+        ));
+        // A real Left Ctrl: nothing queued, a later Right Alt, a Left Alt, a key-up
+        // after a key-down, or Right Ctrl.
+        assert!(!is_altgr_ctrl(WM_KEYDOWN, VK_CONTROL as WPARAM, ctrl, 500, None));
+        assert!(!is_altgr_ctrl(
+            WM_KEYDOWN,
+            VK_CONTROL as WPARAM,
+            ctrl,
+            499,
+            Some(&ralt)
+        ));
+        let lalt = msg(WM_SYSKEYDOWN, VK_MENU, lp(0x38, false), 500);
+        assert!(!is_altgr_ctrl(
+            WM_KEYDOWN,
+            VK_CONTROL as WPARAM,
+            ctrl,
+            500,
+            Some(&lalt)
+        ));
+        assert!(!is_altgr_ctrl(
+            WM_KEYDOWN,
+            VK_CONTROL as WPARAM,
+            ctrl,
+            640,
+            Some(&ralt_up)
+        ));
+        let rctrl = lp(0x1d, true);
+        assert!(!is_altgr_ctrl(
+            WM_KEYDOWN,
+            VK_CONTROL as WPARAM,
+            rctrl,
+            500,
+            Some(&ralt)
+        ));
+        assert!(!is_altgr_ctrl(
+            WM_KEYDOWN,
+            VK_SHIFT as WPARAM,
+            lp(0x2a, false),
+            500,
+            Some(&ralt)
+        ));
     }
 
     #[test]

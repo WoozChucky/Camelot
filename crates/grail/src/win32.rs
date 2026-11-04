@@ -62,6 +62,7 @@ pub const WHEEL_DELTA: i32 = 120;
 /// the character of an Alt chord (Alt+Space), or 0 for a lone Alt tap or F10.
 pub const SC_KEYMENU: usize = 0xf100;
 pub const PM_REMOVE: u32 = 0x0001;
+pub const PM_NOREMOVE: u32 = 0x0000;
 
 pub const GWLP_USERDATA: i32 = -21;
 
@@ -265,6 +266,7 @@ extern "system" {
     pub fn GetKeyboardState(state: *mut u8) -> BOOL;
     pub fn ToUnicode(vkey: u32, scan: u32, state: *const u8, buf: *mut u16, len: i32, flags: u32) -> i32;
     pub fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
+    pub fn GetMessageTime() -> i32;
     #[cfg(target_pointer_width = "64")]
     pub fn SetWindowLongPtrW(hwnd: HWND, index: i32, value: isize) -> isize;
     #[cfg(target_pointer_width = "64")]
