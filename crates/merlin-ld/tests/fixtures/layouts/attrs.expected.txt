@@ -1,4 +1,4 @@
-There are 12 section headers, starting at offset 0x23dc:
+There are 12 section headers, starting at offset 0x2468:
 
 Section Headers:
   [Nr] Name              Type            Address  Off    Size   ES Flg Lk Inf Al
@@ -10,10 +10,10 @@ Section Headers:
   [ 5] .noload           NOBITS          8000119c 00205c 00000c 00  WA  0   0  4
   [ 6] .stack            NOBITS          800011b0 00205c 000100 00  WA  0   0 16
   [ 7] .riscv.attributes RISCV_ATTRIBUTES 00000000 00205c 000031 00      0   0  1
-  [ 8] .comment          PROGBITS        00000000 00208d 000013 01  MS  0   0  1
-  [ 9] .symtab           SYMTAB          00000000 0020a0 000230 10     11  18  4
-  [10] .shstrtab         STRTAB          00000000 0022d0 00005e 00      0   0  1
-  [11] .strtab           STRTAB          00000000 00232e 0000ab 00      0   0  1
+  [ 8] .comment          PROGBITS        00000000 00208d 000063 01  MS  0   0  1
+  [ 9] .symtab           SYMTAB          00000000 0020f0 000230 10     11  18  4
+  [10] .shstrtab         STRTAB          00000000 002320 00005e 00      0   0  1
+  [11] .strtab           STRTAB          00000000 00237e 0000e9 00      0   0  1
 Key to Flags:
   W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
   L (link order), O (extra OS processing required), G (group), T (TLS),
@@ -44,13 +44,13 @@ Program Headers:
 Symbol table '.symtab' contains 35 entries:
    Num:    Value  Size Type    Bind   Vis       Ndx Name
      0: 00000000     0 NOTYPE  LOCAL  DEFAULT   UND 
-     1: 80000000     0 NOTYPE  LOCAL  DEFAULT     1 $x
+     1: 80000000     0 NOTYPE  LOCAL  DEFAULT     1 $xrv32i2p1_m2p0_zicsr2p0_zmmul1p0
      2: 00000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
      3: 80001000     0 NOTYPE  LOCAL  DEFAULT     2 $d
      4: 80001010     0 NOTYPE  LOCAL  DEFAULT     2 $d
      5: 80001020     0 NOTYPE  LOCAL  DEFAULT     3 $d
      6: 80001080     0 NOTYPE  LOCAL  DEFAULT     4 $d
-     7: 80000020     0 NOTYPE  LOCAL  DEFAULT     1 $x
+     7: 80000020     0 NOTYPE  LOCAL  DEFAULT     1 $xrv32i2p1_m2p0_zicsr2p0_zmmul1p0
      8: 00000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
      9: 80001030     0 NOTYPE  LOCAL  DEFAULT     3 $d
     10: 80001180     0 NOTYPE  LOCAL  DEFAULT     4 $d

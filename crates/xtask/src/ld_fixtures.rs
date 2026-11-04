@@ -1,6 +1,11 @@
 //! `cargo xtask ld-fixtures`: regenerates merlin-ld's test fixtures in
 //! `crates/merlin-ld/tests/fixtures` ([`FIXTURES`]) with clang, ld.lld,
-//! llvm-readobj and llvm-objdump.
+//! llvm-readobj and llvm-objdump. The committed files were made by LLVM
+//! 23.1.4 (clang and LLD 23.1.4, from the official Windows installer): the
+//! version shows in the `.comment` section of every `.lld.elf` and in the
+//! names of the mapping symbols (`$xrv32i2p1_m2p0_...`), neither of which
+//! merlin-ld's tests compare (they check the allocated sections and the
+//! global symbols).
 //!
 //! In every fixture directory:
 //!

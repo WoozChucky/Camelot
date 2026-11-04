@@ -1,5 +1,6 @@
 //! End-to-end tests against clang-built objects and ld.lld's output for the
-//! same inputs (`tests/fixtures`, regenerate with `cargo xtask ld-fixtures`).
+//! same inputs (`tests/fixtures`, made by clang and LLD 23.1.4; regenerate
+//! with `cargo xtask ld-fixtures`).
 //! Each `name.ld` there lists its objects in its first comment;
 //! `name.lld.elf` is ld.lld's link, `name.expected.txt` is
 //! `llvm-readelf -S -l -s` of it and `name.objdump.txt` is `llvm-objdump -d`
@@ -862,7 +863,13 @@ fn relocs_match_ld_lld() {
         "main.o is built with -mno-relax"
     );
     let relax = reloc_types("relocs/relax.o");
-    assert_eq!(relax.get("R_RISCV_RELAX"), Some(&5), "{relax:?}");
+    // A hint for each relaxable instruction: the call, both halves of the lw,
+    // the lui and the sw, and the loop's j, which clang 23 leaves to the
+    // linker together with the branch over it (relax.S).
+    assert_eq!(relax.get("R_RISCV_RELAX"), Some(&6), "{relax:?}");
+    for ty in ["R_RISCV_BRANCH", "R_RISCV_JAL"] {
+        assert_eq!(relax.get(ty), Some(&1), "{ty}: {relax:?}");
+    }
     assert_eq!(reloc_types("rejects/align.o").get("R_RISCV_ALIGN"), Some(&1));
 
     let linked = assert_matches_ld_lld("relocs/link", "OK\n");
@@ -1205,7 +1212,7 @@ fn align_needs_relaxation() {
     assert_eq!(
         errs,
         [
-            "align.o: R_RISCV_ALIGN at .text+0x4 needs linker relaxation, which merlin-ld does not do; \
+            "align.o: R_RISCV_ALIGN at .text+0xc needs linker relaxation, which merlin-ld does not do; \
           assemble with -mno-relax"
         ]
     );

@@ -1,4 +1,4 @@
-There are 10 section headers, starting at offset 0x13d0:
+There are 10 section headers, starting at offset 0x1460:
 
 Section Headers:
   [Nr] Name              Type            Address  Off    Size   ES Flg Lk Inf Al
@@ -8,10 +8,10 @@ Section Headers:
   [ 3] .data             PROGBITS        80000150 001150 000024 00  WA  0   0 16
   [ 4] .rodata           PROGBITS        80000174 001174 000018 00   A  0   0  4
   [ 5] .riscv.attributes RISCV_ATTRIBUTES 00000000 00118c 000031 00      0   0  1
-  [ 6] .comment          PROGBITS        00000000 0011bd 000013 01  MS  0   0  1
-  [ 7] .symtab           SYMTAB          00000000 0011d0 000150 10      9  12  4
-  [ 8] .shstrtab         STRTAB          00000000 001320 00004f 00      0   0  1
-  [ 9] .strtab           STRTAB          00000000 00136f 000060 00      0   0  1
+  [ 6] .comment          PROGBITS        00000000 0011bd 000063 01  MS  0   0  1
+  [ 7] .symtab           SYMTAB          00000000 001220 000150 10      9  12  4
+  [ 8] .shstrtab         STRTAB          00000000 001370 00004f 00      0   0  1
+  [ 9] .strtab           STRTAB          00000000 0013bf 00009e 00      0   0  1
 Key to Flags:
   W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
   L (link order), O (extra OS processing required), G (group), T (TLS),
@@ -42,13 +42,13 @@ Program Headers:
 Symbol table '.symtab' contains 21 entries:
    Num:    Value  Size Type    Bind   Vis       Ndx Name
      0: 00000000     0 NOTYPE  LOCAL  DEFAULT   UND 
-     1: 80000000     0 NOTYPE  LOCAL  DEFAULT     1 $x
+     1: 80000000     0 NOTYPE  LOCAL  DEFAULT     1 $xrv32i2p1_m2p0_zicsr2p0_zmmul1p0
      2: 00000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
      3: 80000174     0 NOTYPE  LOCAL  DEFAULT     4 $d
      4: 80000184     0 NOTYPE  LOCAL  DEFAULT     4 $d
      5: 80000150     0 NOTYPE  LOCAL  DEFAULT     3 $d
      6: 80000030     0 NOTYPE  LOCAL  DEFAULT     2 $d
-     7: 80000020     0 NOTYPE  LOCAL  DEFAULT     1 $x
+     7: 80000020     0 NOTYPE  LOCAL  DEFAULT     1 $xrv32i2p1_m2p0_zicsr2p0_zmmul1p0
      8: 00000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
      9: 80000160     0 NOTYPE  LOCAL  DEFAULT     3 $d
     10: 80000130     0 NOTYPE  LOCAL  DEFAULT     2 $d

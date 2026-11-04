@@ -1,4 +1,4 @@
-There are 11 section headers, starting at offset 0x31c8:
+There are 11 section headers, starting at offset 0x3238:
 
 Section Headers:
   [Nr] Name              Type            Address  Off    Size   ES Flg Lk Inf Al
@@ -9,10 +9,10 @@ Section Headers:
   [ 4] .bss              NOBITS          80002028 001028 000003 00  WA  0   0  1
   [ 5] .data2            PROGBITS        8000202b 00302b 000004 00  WA  0   0  1
   [ 6] .riscv.attributes RISCV_ATTRIBUTES 00000000 00302f 000031 00      0   0  1
-  [ 7] .comment          PROGBITS        00000000 003060 000013 01  MS  0   0  1
-  [ 8] .symtab           SYMTAB          00000000 003074 0000d0 10     10   7  4
-  [ 9] .shstrtab         STRTAB          00000000 003144 000056 00      0   0  1
-  [10] .strtab           STRTAB          00000000 00319a 00002c 00      0   0  1
+  [ 7] .comment          PROGBITS        00000000 003060 000063 01  MS  0   0  1
+  [ 8] .symtab           SYMTAB          00000000 0030c4 0000d0 10     10   7  4
+  [ 9] .shstrtab         STRTAB          00000000 003194 000056 00      0   0  1
+  [10] .strtab           STRTAB          00000000 0031ea 00004b 00      0   0  1
 Key to Flags:
   W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
   L (link order), O (extra OS processing required), G (group), T (TLS),
@@ -41,7 +41,7 @@ Program Headers:
 Symbol table '.symtab' contains 13 entries:
    Num:    Value  Size Type    Bind   Vis       Ndx Name
      0: 00000000     0 NOTYPE  LOCAL  DEFAULT   UND 
-     1: 80000000     0 NOTYPE  LOCAL  DEFAULT     1 $x
+     1: 80000000     0 NOTYPE  LOCAL  DEFAULT     1 $xrv32i2p1_m2p0_zicsr2p0_zmmul1p0
      2: 00000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
      3: 80000020     0 NOTYPE  LOCAL  DEFAULT     3 $d
      4: 80002028     0 NOTYPE  LOCAL  DEFAULT     4 $d
