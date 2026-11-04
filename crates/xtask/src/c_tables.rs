@@ -221,6 +221,9 @@ pub fn generate_h() -> String {
         let _ = writeln!(s, "#define {} {}", k.name(), k.elf_type());
     }
 
+    // merlin-as writes `elf::arch(xlen)`, one string per width, but the C
+    // assembler writes RV32 objects only until #157 teaches it RV64, so it
+    // takes the RV32 string (`ARCH`), the one merlin-as's default writes.
     let _ = writeln!(
         s,
         "\n/* Tag_RISCV_arch in every object's .riscv.attributes (merlin-as's elf.rs). */\n\
