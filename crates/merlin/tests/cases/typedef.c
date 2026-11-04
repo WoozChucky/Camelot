@@ -1,7 +1,7 @@
 // expect: 11
-// expect-lp64: 10
 // typedef names for every kind of type, scoped like variables. The sizes
-// checked last are ILP32's: on LP64 a pointer is 8 bytes, and that check fails.
+// checked last hold on both widths: a list is a pointer, 4 bytes on ILP32 and
+// 8 on LP64, and a node an int padded to a pointer's alignment and a pointer.
 
 typedef int myint;
 typedef unsigned char byte;
@@ -52,6 +52,7 @@ int main(void) {
         ok += c == 255 && sizeof(myint) == 1;
     }
     ok += sizeof(myint) == 4;
-    ok += sizeof(list) == 4 && sizeof(node) == 8;
+    ok += sizeof(list) == sizeof(void *) && sizeof(list) == __SIZEOF_POINTER__ &&
+          sizeof(node) == 2 * sizeof(list);
     return ok;
 }
