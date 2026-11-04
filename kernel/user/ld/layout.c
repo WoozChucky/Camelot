@@ -1165,6 +1165,7 @@ static void place_debug(void) {
             out->ninputs++;
             sec->placed = PLACED_DEBUG;
             sec->addr = at;
+            sec->debug_out = (uint)(out - L->debug);
             out->size = at + sec->size;
         }
     }

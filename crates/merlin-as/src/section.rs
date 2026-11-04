@@ -43,6 +43,9 @@ pub const SHT_PREINIT_ARRAY: u32 = 16;
 pub const SHT_GNU_SFRAME: u32 = 0x6fff_fff4;
 /// `.llvm.callgraph`'s type.
 pub const SHT_LLVM_CALL_GRAPH: u32 = 0x6fff_4c0f;
+/// `.riscv.attributes`'s type, which the assembler writes itself
+/// ([`crate::elf::riscv_attributes`]).
+pub const SHT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 
 /// Section flags (`sh_flags`).
 pub const SHF_WRITE: u64 = 0x1;

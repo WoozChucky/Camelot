@@ -357,8 +357,10 @@ static struct dirarg *new_arg(struct stmt *s, uint *cap) {
     return a;
 }
 
-/* A directive's arguments: expressions or strings, separated by commas. */
-static int dir_args(struct stmt *s) {
+/* A directive's arguments: expressions or strings, separated by commas.
+ * With `empty`, one may be left out after a comma when another comma
+ * follows (the fill of `.p2align 3,,4`, as LLVM reads it). */
+static int dir_args(struct stmt *s, int empty) {
     if (peek()->kind == T_NEWLINE) {
         return 0;
     }
@@ -366,7 +368,9 @@ static int dir_args(struct stmt *s) {
     for (;;) {
         struct dirarg *a = new_arg(s, &cap);
         struct token *t = peek();
-        if (t->kind == T_STR) {
+        if (empty && s->nargs > 1 && is_punct(t, ',')) {
+            a->kind = DA_EMPTY;
+        } else if (t->kind == T_STR) {
             pos++;
             a->kind = DA_STR;
             a->str = (uchar *)t->text;
@@ -380,6 +384,44 @@ static int dir_args(struct stmt *s) {
         }
         if (!is_punct(peek(), ',')) {
             return 0;
+        }
+        pos++;
+    }
+}
+
+/* The arguments of `.option`, one string each: the text of its tokens up
+ * to the next comma (`arch`, `+zicond`, `rv32ima_zicsr`), merlin-as's
+ * option_args. */
+static int option_args(struct stmt *s) {
+    uint cap = 0;
+    struct buf item;
+    memset(&item, 0, sizeof item);
+    int any = 0;
+    for (;;) {
+        struct token *t = peek();
+        if (t->kind == T_NEWLINE || is_punct(t, ',')) {
+            if (t->kind == T_NEWLINE && item.len == 0 && !any) {
+                return 0;
+            }
+            struct dirarg *a = new_arg(s, &cap);
+            a->kind = DA_STR;
+            a->str = (uchar *)tmp_strndup(item.len ? (char *)item.data : "", item.len);
+            a->len = item.len;
+            item.len = 0;
+            any = 1;
+            if (t->kind == T_NEWLINE) {
+                free(item.data);
+                return 0;
+            }
+        } else if (t->kind == T_IDENT || t->kind == T_STR) {
+            buf_put(&item, t->text, t->len);
+        } else if (t->kind == T_PUNCT) {
+            buf_byte(&item, (uint)t->punct);
+        } else if (t->kind == T_INT) {
+            const char *d = i64_dec(t->num);
+            buf_put(&item, d, (uint)strlen(d));
+        } else {
+            buf_byte(&item, '?');
         }
         pos++;
     }
@@ -542,8 +584,12 @@ int parse_statement(struct token *t, int n, struct stmt **out) {
             r = spaced_args(s);
         } else if (strcmp(head->text, ".section") == 0) {
             r = section_args(s);
+        } else if (strcmp(head->text, ".option") == 0) {
+            r = option_args(s);
         } else {
-            r = dir_args(s);
+            int align = strcmp(head->text, ".align") == 0 || strcmp(head->text, ".p2align") == 0 ||
+                        strcmp(head->text, ".balign") == 0;
+            r = dir_args(s, align);
         }
         if (r < 0) {
             return -1;
