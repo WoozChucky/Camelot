@@ -1,9 +1,11 @@
-//! merlin-objdump: prints what is inside our ELF32 `.o` files and
-//! executables, so merlin-as and merlin-ld output can be debugged without LLVM.
+//! merlin-objdump: prints what is inside our `.o` files and executables,
+//! ELF32 (RV32) and ELF64 (RV64), so merlin-as and merlin-ld output can be
+//! debugged without LLVM.
 //!
 //! The output follows llvm-objdump (LLVM 23) line for line, so the two can be
 //! diffed: the tests compare against llvm-objdump output committed under
-//! `tests/golden/`. Differences are deliberate and few:
+//! `tests/golden/` (`tests/golden/rv64/` for RV64). Differences are
+//! deliberate and few:
 //!
 //! - Words that do not decode print as `.word 0x...` (one per 4 bytes) where
 //!   llvm-objdump prints `<unknown>`, and the Xcal instructions print as
@@ -94,10 +96,6 @@ pub fn dump(name: &str, data: &[u8], opts: &Options) -> Result<String, Error> {
 /// file (without its `llvm-objdump: warning: 'file': ` prefix), in order.
 pub fn dump_with_warnings(name: &str, data: &[u8], opts: &Options) -> Result<(String, Vec<String>), Error> {
     let elf = Elf::parse(data)?;
-    // RV64 (ELF64) comes with the RV64 migration's objdump step.
-    if elf.class != elf::Class::Elf32 {
-        return Err(Error("ELF64 (RV64) is not supported yet".into()));
-    }
     let mut out = String::new();
     let mut warnings = Vec::new();
     let _ = writeln!(out, "\n{name}:\tfile format elf{}-littleriscv", bits(&elf));

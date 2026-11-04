@@ -33,3 +33,32 @@ isa-o.d-no-aliases	     364:      	.word	0x2805a52f
 linked-elf.d	80000022: 8067fe9f     	.word	0x8067fe9f
 linked-elf.d	80000026: 00           	.byte	0x00
 linked-elf.d	80000027: 00           	.byte	0x00
+rv64/hello-elf.d	80000014: 0005000b     	xcal.dbg	a0
+rv64/hello-elf.d	80000018: 0000100b     	xcal.halt	zero
+rv64/hello-elf.d-no-raw	80000014:      	xcal.dbg	a0
+rv64/hello-elf.d-no-raw	80000018:      	xcal.halt	zero
+rv64/hello-elf.d-no-aliases	80000014: 0005000b     	xcal.dbg	a0
+rv64/hello-elf.d-no-aliases	80000018: 0000100b     	xcal.halt	zero
+rv64/hello-o.dr	      18: 0005000b     	xcal.dbg	a0
+rv64/hello-o.dr	      1c: 0000100b     	xcal.halt	zero
+rv64/isa-o.d	      bc: 0215951b     	.word	0x0215951b
+rv64/isa-o.d	      c0: 0205d51b     	.word	0x0205d51b
+rv64/isa-o.d	      c4: 4405d513     	.word	0x4405d513
+rv64/isa-o.d	      c8: 0005f503     	.word	0x0005f503
+rv64/isa-o.d	      cc: 02c5953b     	.word	0x02c5953b
+rv64/isa-o.d	      d0: 0005c52f     	.word	0x0005c52f
+rv64/isa-o.d	      d4: 0005000b     	xcal.dbg	a0
+rv64/isa-o.d	      d8: 0000100b     	xcal.halt	zero
+rv64/isa-o.d	     12c: 1015b52f     	.word	0x1015b52f
+rv64/isa-o.d-no-aliases	      bc:      	.word	0x0215951b
+rv64/isa-o.d-no-aliases	      c0:      	.word	0x0205d51b
+rv64/isa-o.d-no-aliases	      c4:      	.word	0x4405d513
+rv64/isa-o.d-no-aliases	      c8:      	.word	0x0005f503
+rv64/isa-o.d-no-aliases	      cc:      	.word	0x02c5953b
+rv64/isa-o.d-no-aliases	      d0:      	.word	0x0005c52f
+rv64/isa-o.d-no-aliases	      d4:      	xcal.dbg	a0
+rv64/isa-o.d-no-aliases	      d8:      	xcal.halt	zero
+rv64/isa-o.d-no-aliases	     12c:      	.word	0x1015b52f
+rv64/linked-elf.d	80000022: 8067fe9f     	.word	0x8067fe9f
+rv64/linked-elf.d	80000026: 00           	.byte	0x00
+rv64/linked-elf.d	80000027: 00           	.byte	0x00

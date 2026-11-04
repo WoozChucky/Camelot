@@ -79,24 +79,23 @@ fn errors_and_exit_codes() {
 }
 
 #[test]
-fn elf64_files_are_refused() {
-    // merlin-objdump prints 32-bit addresses: an RV64 file is an error, not
-    // a listing with its addresses cut short.
+fn both_widths() {
+    // An ELF64 file is RV64 code, with 16-digit addresses; an ELF32 one
+    // next to it keeps its 8 digits.
     let (code, out, err) = objdump(&[
         "-d",
+        "-f",
         "crates/elf/tests/llvm/rv64/prog.elf",
         "crates/elf/tests/llvm/rv32/prog.elf",
     ]);
-    assert_eq!(code, 1);
+    assert_eq!((code, err.as_str()), (0, ""));
     assert!(
-        err.contains(
-            "error: 'crates/elf/tests/llvm/rv64/prog.elf': bad ELF: ELF64 (RV64) is not supported yet"
-        ),
-        "{err}"
+        out.contains("rv64/prog.elf:\tfile format elf64-littleriscv\narchitecture: riscv64\n"),
+        "{out}"
     );
-    assert!(!out.contains("rv64/prog.elf"), "{out}");
+    assert!(out.contains("start address: 0x00000000800000b8\n"), "{out}");
     assert!(
-        out.contains("rv32/prog.elf:\tfile format elf32-littleriscv"),
+        out.contains("rv32/prog.elf:\tfile format elf32-littleriscv\narchitecture: riscv32\n"),
         "{out}"
     );
 }
@@ -121,7 +120,16 @@ fn unparsable_isa_mapping_symbols_warn() {
 
 fn fixtures() -> Vec<PathBuf> {
     let mut files = vec![root().join("examples/hello/hello.elf")];
-    for f in ["hello.elf", "hello.o", "isa.o", "relocs.o"] {
+    for f in [
+        "hello.elf",
+        "hello.o",
+        "isa.o",
+        "relocs.o",
+        "rv64/hello.elf",
+        "rv64/isa.o",
+        "rv64/relocs.o",
+        "rv64/linked.elf",
+    ] {
         files.push(root().join("crates/merlin-objdump/tests/fixtures").join(f));
     }
     files

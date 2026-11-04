@@ -156,7 +156,7 @@ cargo run --release -p merlin-objdump -- -d examples/hello/hello.elf
 80000018: 0005000b     	xcal.dbg	a0
 ```
 
-The options are llvm-objdump's: `-d` disassemble, `-r` relocations (under each instruction with `-dr`), `-t` symbols, `-h` sections, `-x` all headers, `-s` section contents, `-M no-aliases`, `--no-show-raw-insn`. The output is the same as llvm-objdump 23's apart from Xcal instructions and undecodable words (`.word`), so the two can be diffed.
+The options are llvm-objdump's: `-d` disassemble, `-r` relocations (under each instruction with `-dr`), `-t` symbols, `-h` sections, `-x` all headers, `-s` section contents, `-M no-aliases`, `--no-show-raw-insn`, `-l`. It reads RV32 (ELF32) and RV64 (ELF64) files, and the output is the same as llvm-objdump 23's apart from Xcal instructions and undecodable words (`.word`), so the two can be diffed.
 
 ### Debugging
 

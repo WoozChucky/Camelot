@@ -1,0 +1,58 @@
+
+crates/merlin-objdump/tests/fixtures/rv64/misc.o:	file format elf64-littleriscv
+architecture: riscv64
+start address: 0x0000000000000000
+
+Program Header:
+
+Dynamic Section:
+
+Sections:
+Idx Name                Size     VMA              Type
+  0                     00000000 0000000000000000 
+  1 .strtab             000000e2 0000000000000000 
+  2 .text               00000010 0000000000000000 TEXT
+  3 .rela.text          00000030 0000000000000000 
+  4 .data               00000008 0000000000000000 DATA
+  5 .init_array         00000008 0000000000000000 DATA
+  6 .rela.init_array    00000018 0000000000000000 
+  7 .preinit_array      00000008 0000000000000000 DATA
+  8 .rela.preinit_array 00000018 0000000000000000 
+  9 .fini_array         00000008 0000000000000000 DATA
+ 10 .rela.fini_array    00000018 0000000000000000 
+ 11 .note.x             00000004 0000000000000000 DATA
+ 12 .debug_x            00000004 0000000000000000 DEBUG
+ 13 .riscv.attributes   00000055 0000000000000000 
+ 14 .symtab             00000150 0000000000000000 
+
+SYMBOL TABLE:
+0000000000000000 l       .text	0000000000000000 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+0000000000000000 l       .data	0000000000000000 $d
+0000000000000000 l       .init_array	0000000000000000 $d
+0000000000000000 l       .preinit_array	0000000000000000 $d
+0000000000000000 l       .fini_array	0000000000000000 $d
+0000000000000000 l       .note.x	0000000000000000 $d
+0000000000000000 l       .debug_x	0000000000000000 $d
+0000000000000000 l       .riscv.attributes	0000000000000000 $d
+0000000000000000 g     F .text	0000000000000010 .hidden entry
+0000000000000000         *UND*	0000000000000000 bar
+0000000000000000         *UND*	0000000000000000 baz
+0000000000000020       O *COM*	0000000000000008 common_buf
+0000000000000000 g       .data	0000000000000000 .protected prot
+
+RELOCATION RECORDS FOR [.text]:
+OFFSET           TYPE                     VALUE
+0000000000000004 R_RISCV_NONE             bar
+0000000000000000 R_RISCV_NONE             baz
+
+RELOCATION RECORDS FOR [.init_array]:
+OFFSET           TYPE                     VALUE
+0000000000000000 R_RISCV_64               entry
+
+RELOCATION RECORDS FOR [.preinit_array]:
+OFFSET           TYPE                     VALUE
+0000000000000000 R_RISCV_64               entry
+
+RELOCATION RECORDS FOR [.fini_array]:
+OFFSET           TYPE                     VALUE
+0000000000000000 R_RISCV_64               entry

@@ -133,7 +133,73 @@ const CASES: &[(&str, &str, &[&str])] = &[
         &["-d", "-x"],
     ),
     ("rv32ua-p-lrsc.d", "tests/riscv-tests/rv32ua-p-lrsc", &["-d"]),
+    // RV64: ELF64 files, in golden/rv64/.
+    ("rv64/hello-elf.d", RV64_HELLO_ELF, &["-d"]),
+    (
+        "rv64/hello-elf.d-no-raw",
+        RV64_HELLO_ELF,
+        &["-d", "--no-show-raw-insn"],
+    ),
+    (
+        "rv64/hello-elf.d-no-aliases",
+        RV64_HELLO_ELF,
+        &["-d", "-M", "no-aliases"],
+    ),
+    ("rv64/hello-elf.x", RV64_HELLO_ELF, &["-x"]),
+    ("rv64/hello-elf.s", RV64_HELLO_ELF, &["-s"]),
+    ("rv64/hello-o.dr", RV64_HELLO_O, &["-dr"]),
+    ("rv64/hello-o.x", RV64_HELLO_O, &["-x"]),
+    ("rv64/isa-o.d", RV64_ISA, &["-d"]),
+    (
+        "rv64/isa-o.d-no-aliases",
+        RV64_ISA,
+        &["-d", "-M", "no-aliases", "--no-show-raw-insn"],
+    ),
+    ("rv64/relocs-o.dr", RV64_RELOCS, &["-dr"]),
+    ("rv64/relocs-o.r", RV64_RELOCS, &["-r"]),
+    ("rv64/relocs-o.t", RV64_RELOCS, &["-t"]),
+    ("rv64/relocs-o.h", RV64_RELOCS, &["-h"]),
+    ("rv64/relocs-o.x", RV64_RELOCS, &["-x"]),
+    ("rv64/relocs-o.s", RV64_RELOCS, &["-s"]),
+    ("rv64/misc-o.x", RV64_MISC, &["-x"]),
+    ("rv64/misc-o.dr", RV64_MISC, &["-dr"]),
+    ("rv64/debug-o.d", RV64_DEBUG, &["-d"]),
+    ("rv64/debug-o.h", RV64_DEBUG, &["-h"]),
+    ("rv64/debug-o.dl", RV64_DEBUG, &["-d", "-l"]),
+    ("rv64/lines-elf.dl", RV64_LINES, &["-d", "-l"]),
+    ("rv64/linked-elf.d", RV64_LINKED, &["-d"]),
+    ("rv64/linked-elf.x", RV64_LINKED, &["-x"]),
+    ("rv64/linked-elf.s", RV64_LINKED, &["-s"]),
+    (
+        "rv64/rv64ui-p-add.d",
+        "tests/riscv-tests/rv64/rv64ui-p-add",
+        &["-d"],
+    ),
+    (
+        "rv64/rv64mi-p-csr.d",
+        "tests/riscv-tests/rv64/rv64mi-p-csr",
+        &["-d"],
+    ),
+    (
+        "rv64/rv64si-p-dirty.dx",
+        "tests/riscv-tests/rv64/rv64si-p-dirty",
+        &["-d", "-x"],
+    ),
+    (
+        "rv64/rv64ua-p-lrsc.d",
+        "tests/riscv-tests/rv64/rv64ua-p-lrsc",
+        &["-d"],
+    ),
 ];
+
+const RV64_HELLO_ELF: &str = "crates/merlin-objdump/tests/fixtures/rv64/hello.elf";
+const RV64_HELLO_O: &str = "crates/merlin-objdump/tests/fixtures/rv64/hello.o";
+const RV64_ISA: &str = "crates/merlin-objdump/tests/fixtures/rv64/isa.o";
+const RV64_RELOCS: &str = "crates/merlin-objdump/tests/fixtures/rv64/relocs.o";
+const RV64_MISC: &str = "crates/merlin-objdump/tests/fixtures/rv64/misc.o";
+const RV64_DEBUG: &str = "crates/merlin-objdump/tests/fixtures/rv64/debug.o";
+const RV64_LINES: &str = "crates/merlin-objdump/tests/fixtures/rv64/lines.elf";
+const RV64_LINKED: &str = "crates/merlin-objdump/tests/fixtures/rv64/linked.elf";
 
 fn root() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))

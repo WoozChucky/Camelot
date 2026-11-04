@@ -1,0 +1,40 @@
+
+crates/merlin-objdump/tests/fixtures/rv64/hello.o:	file format elf64-littleriscv
+architecture: riscv64
+start address: 0x0000000000000000
+
+Program Header:
+
+Dynamic Section:
+
+Sections:
+Idx Name              Size     VMA              Type
+  0                   00000000 0000000000000000 
+  1 .strtab           000000df 0000000000000000 
+  2 .text             00000000 0000000000000000 TEXT
+  3 .text.start       00000050 0000000000000000 TEXT
+  4 .rela.text.start  00000060 0000000000000000 
+  5 .rodata           00000015 0000000000000000 DATA
+  6 .riscv.attributes 00000055 0000000000000000 
+  7 .symtab           00000138 0000000000000000 
+
+SYMBOL TABLE:
+0000000010000000 l       *ABS*	0000000000000000 UART_BASE
+0000000000000005 l       *ABS*	0000000000000000 UART_LSR
+0000000000000020 l       *ABS*	0000000000000000 LSR_THRE
+0000000000000000 l       .text.start	0000000000000000 .Lpcrel_hi0
+0000000000000000 l       .text.start	0000000000000000 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+0000000000000008 l       .text.start	0000000000000000 .Lpcrel_hi1
+0000000000000000 l       .rodata	0000000000000000 message
+0000000000000020 l       .text.start	0000000000000000 puts
+0000000000000000 l       .rodata	0000000000000000 $d
+0000000000000000 l       .riscv.attributes	0000000000000000 $d
+0000000000000000 g       .text.start	0000000000000000 _start
+0000000000000000         *UND*	0000000000000000 __stack_top
+
+RELOCATION RECORDS FOR [.text.start]:
+OFFSET           TYPE                     VALUE
+0000000000000000 R_RISCV_PCREL_HI20       __stack_top
+0000000000000004 R_RISCV_PCREL_LO12_I     .Lpcrel_hi0
+0000000000000008 R_RISCV_PCREL_HI20       message
+000000000000000c R_RISCV_PCREL_LO12_I     .Lpcrel_hi1
