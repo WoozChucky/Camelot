@@ -121,6 +121,9 @@ struct section {
     uint addr;
     int out;
     int discarded;
+    /* A debug input section's: which of the layout's debug sections holds
+     * it (place_debug). */
+    uint debug_out;
 };
 
 struct symbol {

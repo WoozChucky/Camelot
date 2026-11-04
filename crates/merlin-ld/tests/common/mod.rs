@@ -290,6 +290,30 @@ pub fn read_ours(file: &[u8]) -> Readelf {
     r
 }
 
+/// The local symbols of an executable, in its order: name, value, type and
+/// where (a section's name, or `ABS`). ld.lld keeps every object's that has
+/// a place in the executable, mapping symbols (`$x<isa>`, `$d`) included,
+/// those of the debug sections at their offsets there and those of
+/// `.riscv.attributes` absolute; but no `STT_FILE` symbol in merlin-ld's,
+/// which writes none (clang makes them of C files only, which the fixtures
+/// are not).
+pub fn locals(file: &[u8]) -> Vec<(String, u64, u8, String)> {
+    let e = elf::Elf::parse(file).unwrap();
+    e.symbols()
+        .unwrap()
+        .into_iter()
+        .skip(1)
+        .filter(|s| s.bind() == elf::STB_LOCAL && s.ty() != elf::STT_FILE)
+        .map(|s| {
+            let place = match s.shndx {
+                elf::SHN_ABS => "ABS".to_string(),
+                i => e.sections[i as usize].name.clone(),
+            };
+            (s.name.clone(), s.value, s.ty(), place)
+        })
+        .collect()
+}
+
 /// `(vaddr, memsz, file bytes)` of every PT_LOAD of an executable.
 pub fn load_images(file: &[u8]) -> Vec<(u64, u64, Vec<u8>)> {
     let e = elf::Elf::parse(file).unwrap();
@@ -427,13 +451,14 @@ pub fn assert_matches_ld_lld_exit(set: &str, name: &str, output: &str, exit: u32
     assert_eq!(ours.loads, lld.loads, "{name}: PT_LOADs");
     assert_eq!(ours.phdr, lld.phdr, "{name}: PT_PHDR");
     assert_eq!(ours.globals, lld.globals, "{name}: global symbols");
+    let lld_elf = std::fs::read(fixtures(set).join(format!("{name}.lld.elf"))).unwrap();
+    assert_eq!(locals(&linked.elf), locals(&lld_elf), "{name}: local symbols");
 
     // Byte for byte: every loaded byte, relocated code and data included,
     // but for the headers when they are loaded (the first segment's first
     // bytes, up to the end of the program header table's room): each
     // linker's own ELF header and program headers.
     let headers = lld.phdr.as_ref().map_or(0, |p| (p.offset + p.filesz) as usize);
-    let lld_elf = std::fs::read(fixtures(set).join(format!("{name}.lld.elf"))).unwrap();
     let (ours_img, lld_img) = (load_images(&linked.elf), load_images(&lld_elf));
     assert_eq!(ours_img.len(), lld_img.len(), "{name}: PT_LOAD count");
     for (k, ((va, msz, a), (vb, mszb, b))) in ours_img.iter().zip(&lld_img).enumerate() {

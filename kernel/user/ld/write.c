@@ -272,8 +272,12 @@ static void sym_entry(struct buf *out, struct buf *strtab, const char *name, uin
 }
 
 /* The symbol table: null, locals, then globals. Returns the first global's
- * index. */
-static uint symtab(struct layout *l, struct buf *out, struct buf *strtab) {
+ * index. The locals are those ld.lld keeps (merlin-ld's symtab): in a loaded
+ * section, or in a debug section (at its offset there; not with -S, which
+ * writes the link without them), no section or file symbol, no `.L` label
+ * of a mergeable section; one of .riscv.attributes is absolute, if ld.lld
+ * would write that section. */
+static uint symtab(struct layout *l, int strip, struct buf *out, struct buf *strtab) {
     for (uint i = 0; i < 16; i++) {
         buf_byte(out, 0);
     }
@@ -284,11 +288,29 @@ static uint symtab(struct layout *l, struct buf *out, struct buf *strtab) {
             if (!sym_is_local(s) || s->type == STT_SECTION || s->type == STT_FILE || sym_is_undefined(s)) {
                 continue;
             }
-            uint shndx, value;
-            if (!shndx_of(l, oi, s->shndx, &shndx) || !object_symbol(l, oi, si, &value)) {
-                continue; /* in a section that isn't loaded (debug info, ...) */
+            struct section *in = s->shndx < SHN_LORESERVE ? &o->sections[s->shndx] : NULL;
+            if (in != NULL && (in->flags & SHF_MERGE) != 0 && strncmp(s->name, ".L", 2) == 0) {
+                continue;
             }
-            sym_entry(out, strtab, s->name, value, s->size, (STB_LOCAL << 4) | s->type, shndx);
+            uint info = (STB_LOCAL << 4) | s->type;
+            if (in != NULL && in->type == SHT_RISCV_ATTRIBUTES) {
+                if (l->riscv_attributes) {
+                    sym_entry(out, strtab, s->name, s->value, s->size, info, SHN_ABS);
+                }
+                continue;
+            }
+            uint shndx, value;
+            if (!shndx_of(l, oi, s->shndx, &shndx)) {
+                if (in == NULL || in->placed != PLACED_DEBUG || strip) {
+                    continue; /* in a section the executable does not have */
+                }
+                /* After the loaded sections, .symtab and .strtab. */
+                shndx = l->nsections + 3 + in->debug_out;
+            }
+            if (!object_symbol(l, oi, si, &value)) {
+                continue;
+            }
+            sym_entry(out, strtab, s->name, value, s->size, info, shndx);
         }
     }
     uint first_global = out->len / 16;
@@ -429,7 +451,7 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
     memset(&syms, 0, sizeof syms);
     buf_byte(&strtab, 0);
     buf_byte(&shstrtab, 0);
-    uint first_global = symtab(l, &syms, &strtab);
+    uint first_global = symtab(l, strip, &syms, &strtab);
     buf_pad(out, (out->len + 3) & ~3u);
     uint symtab_off = out->len;
     buf_put(out, syms.data, syms.len);

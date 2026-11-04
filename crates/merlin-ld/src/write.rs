@@ -106,12 +106,15 @@
 
 use crate::layout::{Def, Layout};
 use crate::object::{
-    Class, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, STB_GLOBAL, STB_LOCAL, STT_FILE, STT_NOTYPE, STT_SECTION,
+    Class, SHF_EXECINSTR, SHF_MERGE, SHF_WRITE, SHN_ABS, SHN_LORESERVE, STB_GLOBAL, STB_LOCAL, STT_FILE,
+    STT_NOTYPE, STT_SECTION,
 };
 use crate::relocate::Images;
 use elf::{
-    EM_RISCV, ET_EXEC, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR, SHT_NOBITS, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB,
+    EM_RISCV, ET_EXEC, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR, SHT_NOBITS, SHT_PROGBITS, SHT_RISCV_ATTRIBUTES,
+    SHT_STRTAB, SHT_SYMTAB,
 };
+use std::collections::HashMap;
 
 /// The page size segments are aligned to: ld.lld's for RISC-V, both classes.
 pub const PAGE: u64 = 0x1000;
@@ -491,9 +494,29 @@ fn shoff_and_shnum_at(class: Class) -> (usize, usize) {
 
 /// Symbol table entries: null, locals, then globals. Returns the table and
 /// the index of its first global (`sh_info`).
+///
+/// The locals are each object's, in its order, those ld.lld keeps
+/// (`includeInSymtab`, `shouldKeepInSymtab`): every one defined in a section
+/// that is in the executable, the loaded ones and the debug sections (whose
+/// symbols, such as the `$d` mapping symbols of merlin-as's objects, have
+/// their offsets in the output section for values), but no section or file
+/// symbol, and no `.L` label of a mergeable section (which the assembler
+/// keeps only for its relocations). A symbol of `.riscv.attributes`, which
+/// ld.lld merges into a section of its own, is absolute there, its value
+/// its offset in its input section; merlin-ld writes no such section, but
+/// keeps the symbol as ld.lld does when it writes one
+/// ([`Layout::riscv_attributes`]).
 fn symtab(layout: &Layout, strtab: &mut StrTab) -> (Vec<u8>, u32) {
     let class = layout.class;
     let mut out = vec![0u8; class.sym_size()];
+    // The section header index of each debug input section's output
+    // section: after the loaded ones, .symtab and .strtab.
+    let mut debug_index: HashMap<(usize, usize), u16> = HashMap::new();
+    for (k, d) in layout.debug.iter().enumerate() {
+        for i in &d.inputs {
+            debug_index.insert((i.object, i.section), (layout.sections.len() + 3 + k) as u16);
+        }
+    }
     let shndx_of = |obj: usize, sec: u16| -> Option<u16> {
         if sec == SHN_ABS {
             return Some(SHN_ABS);
@@ -516,10 +539,22 @@ fn symtab(layout: &Layout, strtab: &mut StrTab) -> (Vec<u8>, u32) {
             if !s.is_local() || s.ty == STT_SECTION || s.ty == STT_FILE || s.is_undefined() {
                 continue;
             }
-            let (Some(shndx), Some(value)) = (shndx_of(oi, s.shndx), layout.object_symbol(oi, si)) else {
-                continue; // in a section that isn't loaded (debug info, ...)
+            let input = (s.shndx < SHN_LORESERVE).then(|| &o.sections[s.shndx as usize]);
+            if s.name.starts_with(".L") && input.is_some_and(|i| i.flags & SHF_MERGE != 0) {
+                continue;
+            }
+            let info = (STB_LOCAL << 4) | s.ty;
+            if input.is_some_and(|i| i.ty == SHT_RISCV_ATTRIBUTES) {
+                if layout.riscv_attributes {
+                    entry(&mut out, &s.name, s.value, s.size, info, SHN_ABS);
+                }
+                continue;
+            }
+            let shndx = shndx_of(oi, s.shndx).or_else(|| debug_index.get(&(oi, s.shndx as usize)).copied());
+            let (Some(shndx), Some(value)) = (shndx, layout.object_symbol(oi, si)) else {
+                continue; // in a section the executable does not have
             };
-            entry(&mut out, &s.name, value, s.size, (STB_LOCAL << 4) | s.ty, shndx);
+            entry(&mut out, &s.name, value, s.size, info, shndx);
         }
     }
     let first_global = (out.len() / class.sym_size()) as u32;
@@ -735,8 +770,10 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
 /// The executable `elf` without its debug sections (`.debug_*`, not
 /// loaded), for a program that is installed rather than debugged. For a file
 /// [`write`] made, of either class, the result is what it writes for the
-/// same link without debug information: the bytes up to the debug sections
-/// stay as they are (the program headers among them), then come the section
+/// same link without debug information: the bytes up to the symbol table
+/// stay as they are (the program headers among them), then come the symbol
+/// and string tables without the symbols of the debug sections (the `$d`
+/// mapping symbols, which [`symtab`] keeps as ld.lld does), the section
 /// names without theirs and the section headers without theirs. A file with
 /// no debug sections comes back unchanged. Anything laid out otherwise is an
 /// error.
@@ -761,18 +798,62 @@ pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, String> {
         .map(|s| (s.offset + s.size) as usize);
     let headers_end = class.ehdr_size() + class.phdr_size() * parsed.segments.len();
     let cut = ends.max().unwrap_or(0).max(headers_end);
-    if !ordered || cut > parsed.sections[first].offset as usize {
+    // Right before them, .symtab and its .strtab, after everything loaded.
+    let symtab_index = first.checked_sub(2).filter(|&i| i > 0);
+    let tables = symtab_index.is_some_and(|i| {
+        let (symtab, strtab) = (&parsed.sections[i], &parsed.sections[i + 1]);
+        let loaded_end = parsed.sections[1..i]
+            .iter()
+            .filter(|s| !s.is_nobits())
+            .map(|s| s.offset + s.size)
+            .max()
+            .unwrap_or(0)
+            .max(headers_end as u64);
+        symtab.ty == SHT_SYMTAB
+            && strtab.ty == SHT_STRTAB
+            && symtab.link as usize == i + 1
+            && loaded_end <= symtab.offset
+            && strtab.offset == symtab.offset + symtab.size
+    });
+    if !ordered || !tables || cut > parsed.sections[first].offset as usize {
         return Err("the debug sections are not where merlin-ld puts them (last)".into());
     }
-    let mut out = elf[..cut].to_vec();
-    // The kept sections' headers as they are, but for the names: a new
-    // string table of theirs, in their order (offsets as write() gives them).
+    let symtab_index = symtab_index.unwrap();
+    let symtab = &parsed.sections[symtab_index];
+    let mut out = elf[..symtab.offset as usize].to_vec();
+    // The symbols but the debug sections', in their order, their names in a
+    // new string table: what write() makes of the link without them.
+    let mut syms = vec![0u8; class.sym_size()];
+    let mut strtab = StrTab(vec![0]);
+    let mut first_global = 1;
+    let symbols = parsed.symbols_in(symtab).map_err(|e| e.to_string())?;
+    for s in symbols.iter().skip(1) {
+        if (first..SHN_LORESERVE as usize).contains(&(s.shndx as usize)) {
+            continue;
+        }
+        if s.bind() == STB_LOCAL {
+            first_global += 1;
+        }
+        let name = strtab.add(&s.name);
+        put_symbol(class, &mut syms, name, s.value, s.size, s.info, s.shndx);
+    }
+    out.extend_from_slice(&syms);
+    let strtab_off = out.len() as u64;
+    out.extend_from_slice(&strtab.0);
+    // The kept sections' headers as they are, but for the names (a new
+    // string table of theirs, in their order, offsets as write() gives
+    // them) and the symbol and string tables'.
     let mut names = StrTab(vec![0]);
     let mut headers: Vec<Shdr> = Vec::new();
     for (i, s) in parsed.sections[..first].iter().enumerate() {
         let mut h = Shdr::from_section(s);
         if i > 0 {
             h.name = names.add(&s.name);
+        }
+        if i == symtab_index {
+            (h.size, h.info) = (syms.len() as u64, first_global);
+        } else if i == symtab_index + 1 {
+            (h.offset, h.size) = (strtab_off, strtab.0.len() as u64);
         }
         headers.push(h);
     }
