@@ -1,13 +1,14 @@
 //! The listener: one thread per connection, one request per connection.
 
-use crate::api::{error_response, App, RELEASE_WAIT};
+use crate::api::{error_response, is_screen, App, RELEASE_WAIT};
 use crate::console::ConsoleLimits;
 use crate::guard::{Guard, Refusal, SECURITY_HEADERS};
 use crate::http::{read_request_head, Deadline, Limits, Request, Response};
 use crate::random;
+use crate::screen::ScreenLimits;
 use avalon_client::Timeouts;
 use avalon_proto::{DEFAULT_AVALON_ADDR, DEFAULT_LAKE_ADDR};
-use std::io;
+use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -51,6 +52,8 @@ pub struct Config {
     /// How many consoles may be open, how much output each keeps, and when an
     /// unused one is closed.
     pub consoles: ConsoleLimits,
+    /// How many screens may be open, and when a silent page is given up on.
+    pub screens: ScreenLimits,
     /// How long detaching a disk waits for Lake to see it released.
     pub release_wait: Duration,
     /// Say where it listens on stderr.
@@ -68,6 +71,7 @@ impl Default for Config {
             limits: Limits::default(),
             timeouts: Timeouts::default(),
             consoles: ConsoleLimits::default(),
+            screens: ScreenLimits::default(),
             release_wait: RELEASE_WAIT,
             log: true,
         }
@@ -197,6 +201,7 @@ impl Server {
             }
         }
         shared.app.hub.close_all();
+        shared.app.screens.close_all();
         Ok(())
     }
 
@@ -286,12 +291,25 @@ impl Shared {
         .and_then(|head| {
             let head_only = head.request.method == "HEAD";
             match self.refuse(&head.request) {
-                Some(refusal) => Ok((refusal, head_only)),
-                None => Ok((self.app.handle(&head.read_body(&mut reader)?), head_only)),
+                Some(refusal) => Ok(Some((refusal, head_only))),
+                // A screen's WebSocket: the connection is the screen's from here.
+                None if is_screen(&head.request) => match self.app.open_screen(&head.request) {
+                    Ok(accepted) => {
+                        let (_, rest) = head.into_parts();
+                        if (&*stream).write_all(&accepted.response).is_ok() {
+                            accepted.viewer.run(stream, rest);
+                        }
+                        Ok(None)
+                    }
+                    Err(response) => Ok(Some((response, false))),
+                },
+                None => Ok(Some((self.app.handle(&head.read_body(&mut reader)?), head_only))),
             }
         });
         let (response, head_only) = match answer {
-            Ok(answer) => answer,
+            Ok(Some(answer)) => answer,
+            // A screen that ran closes like any other connection.
+            Ok(None) => return finish(stream),
             Err(e) => match e.status() {
                 Some(status) => (Response::text(status, &e.to_string()), false),
                 None => return,
@@ -309,7 +327,10 @@ impl Shared {
             self.guard.check_host(req)?;
             if api {
                 self.guard.check_token(req)?;
-                if !matches!(req.method.as_str(), "GET" | "HEAD") {
+                // A WebSocket's handshake is a GET, but browsers let any page open
+                // one to any server (there is no CORS for WebSockets): its Origin is
+                // checked like a change's.
+                if !matches!(req.method.as_str(), "GET" | "HEAD") || crate::websocket::is_upgrade(req) {
                     self.guard.check_origin(req)?;
                 }
             }

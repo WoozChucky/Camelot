@@ -82,6 +82,24 @@ impl Json {
         }
     }
 
+    /// A number that is a whole number from `i64::MIN` to `i64::MAX`, written without
+    /// a fraction or exponent.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Json::Number(text) if !text.contains(['.', 'e', 'E']) => text.parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// Any number, as the nearest `f64` (a browser's numbers are all `f64`). A number
+    /// too large for one is `None`, not infinity.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Json::Number(text) => text.parse::<f64>().ok().filter(|n| n.is_finite()),
+            _ => None,
+        }
+    }
+
     pub fn as_array(&self) -> Option<&[Json]> {
         match self {
             Json::Array(items) => Some(items),

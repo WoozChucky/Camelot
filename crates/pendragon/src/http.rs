@@ -222,6 +222,12 @@ pub struct Head {
 }
 
 impl Head {
+    /// The request (its body not read) and what was read after its head: for a
+    /// connection that becomes something else (a WebSocket), the first bytes of that.
+    pub fn into_parts(self) -> (Request, Vec<u8>) {
+        (self.request, self.rest)
+    }
+
     /// The body's length, as `Content-Length` says.
     pub fn body_length(&self) -> usize {
         self.length

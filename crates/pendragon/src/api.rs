@@ -10,6 +10,8 @@ use crate::base64;
 use crate::console::Hub;
 use crate::http::{Request, Response};
 use crate::json::Json;
+use crate::screen::{OpenError, Screens, Viewer, SUBPROTOCOL};
+use crate::websocket::{accept_response, Handshake};
 use avalon_client::{
     create_camelot_vm, format_hz, format_size, holds_disks, lake_disks, mac_text, parse_clock,
     parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_ram, CamelotError,
@@ -59,6 +61,20 @@ pub struct App {
     /// How long a detach waits for Lake to see the disk released.
     release_wait: Duration,
     pub(crate) hub: Hub,
+    pub(crate) screens: Screens,
+}
+
+/// A screen's WebSocket handshake accepted and its VM attached: the `101` to send,
+/// and the viewer to run once it is sent.
+pub(crate) struct Accepted {
+    pub response: Vec<u8>,
+    pub viewer: Viewer,
+}
+
+/// Whether `req` is for a VM's screen, `/api/vms/{vm}/screen`, which the server
+/// serves with [`App::open_screen`] instead of [`App::handle`].
+pub(crate) fn is_screen(req: &Request) -> bool {
+    matches!(req.segments.as_slice(), [api, vms, _, screen] if api == "api" && vms == "vms" && screen == "screen")
 }
 
 /// A failed request: the HTTP status, the message for the page, and the protocol's
@@ -156,6 +172,13 @@ fn json(status: u16, value: Json) -> Response {
 
 type Reply = Result<Response, Fail>;
 
+/// A screen that cannot be opened: a failure with the API's error body, or a
+/// response made already (with the headers a refused handshake needs).
+enum ScreenFail {
+    Fail(Fail),
+    Refused(Response),
+}
+
 impl App {
     pub fn new(config: &crate::Config) -> App {
         App {
@@ -165,6 +188,7 @@ impl App {
             max_ram: config.avalon_max_ram,
             release_wait: config.release_wait,
             hub: Hub::new(&config.avalon, config.timeouts, config.consoles),
+            screens: Screens::new(&config.avalon, config.timeouts, config.screens),
         }
     }
 
@@ -252,6 +276,68 @@ impl App {
             (["switches", _, "attach" | "detach"], _) => allow("POST"),
             _ => Err(Fail::new(404, format!("no such API: {}", req.path))),
         }
+    }
+
+    /// Opens a VM's screen for a page ([`is_screen`]): the WebSocket handshake
+    /// checked (the guard's checks passed already), then the screen attached on
+    /// Avalon, so that a VM that does not exist or an Avalon that is away is an HTTP
+    /// error like any other, before the connection becomes a WebSocket.
+    pub(crate) fn open_screen(&self, req: &Request) -> Result<Accepted, Response> {
+        self.accept_screen(req).map_err(|f| match f {
+            ScreenFail::Fail(f) => f.response(),
+            ScreenFail::Refused(response) => response,
+        })
+    }
+
+    fn accept_screen(&self, req: &Request) -> Result<Accepted, ScreenFail> {
+        if req.method != "GET" {
+            let fail = Fail::new(405, format!("{} takes GET (a WebSocket)", req.path));
+            return Err(ScreenFail::Refused(fail.response().with_header("Allow", "GET")));
+        }
+        let handshake = Handshake::check(req).map_err(|refused| {
+            let response = refused.headers.iter().fold(
+                error_response(refused.status, &refused.message, None),
+                |r, (name, value)| r.with_header(name, value),
+            );
+            ScreenFail::Refused(response)
+        })?;
+        // A page offers pendragon.screen (and its token, which is not answered);
+        // a client may offer none.
+        let protocol = match handshake.protocols.iter().any(|p| p == SUBPROTOCOL) {
+            true => Some(SUBPROTOCOL),
+            false
+                if handshake
+                    .protocols
+                    .iter()
+                    .all(|p| p.starts_with(crate::guard::TOKEN_PROTOCOL)) =>
+            {
+                None
+            }
+            false => {
+                return Err(ScreenFail::Fail(Fail::bad(format!(
+                    "the screen's subprotocol is {SUBPROTOCOL}"
+                ))))
+            }
+        };
+        let vm = vm_ref(&req.segments[2]).map_err(ScreenFail::Fail)?;
+        let viewer = self.screens.open(&vm).map_err(|e| {
+            ScreenFail::Fail(match e {
+                OpenError::Full(why) => Fail {
+                    status: 409,
+                    message: why,
+                    code: Some(ErrorCode::OverBudget),
+                },
+                OpenError::Avalon(e) => client_fail("Avalon", e),
+                OpenError::Screen(what) => Fail::new(
+                    502,
+                    format!("Avalon's screen is {what}, which Pendragon cannot show"),
+                ),
+            })
+        })?;
+        Ok(Accepted {
+            response: accept_response(&handshake.key, protocol),
+            viewer,
+        })
     }
 
     /// [`QUICK`], or shorter where the configured limits are.
@@ -345,6 +431,7 @@ impl App {
                 ("ram", ram.into()),
                 ("disks", disk_stats.into()),
                 ("consoles", self.hub.open().into()),
+                ("screens", self.screens.open_count().into()),
             ]),
         )
     }
@@ -948,7 +1035,7 @@ fn parse_create(body: &Json) -> Result<Create, Fail> {
 }
 
 /// The one-word state, for the page to style and decide by.
-fn state_word(state: VmState) -> &'static str {
+pub(crate) fn state_word(state: VmState) -> &'static str {
     match state {
         VmState::Created => "created",
         VmState::Running => "running",

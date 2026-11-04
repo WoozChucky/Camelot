@@ -30,11 +30,13 @@ pub mod websocket;
 
 mod api;
 mod console;
+pub mod screen;
 mod server;
 
 pub use api::{MAX_BODY, MAX_UPLOAD, MAX_WAIT};
 pub use console::{ConsoleLimits, IDLE as CONSOLE_IDLE, KEEP as CONSOLE_KEEP, MAX_TAPS};
-pub use guard::TOKEN_HEADER;
+pub use guard::{TOKEN_HEADER, TOKEN_PROTOCOL};
+pub use screen::{ScreenLimits, MAX_SCREENS};
 pub use server::{
     Config, Server, ServerThread, ShutdownHandle, DEFAULT_AVALON_MAX_RAM, DEFAULT_LISTEN, MAX_CONNECTIONS,
 };

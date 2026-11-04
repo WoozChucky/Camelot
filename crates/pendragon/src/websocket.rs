@@ -49,6 +49,8 @@ pub const CLOSE_NORMAL: u16 = 1000;
 pub const CLOSE_GOING_AWAY: u16 = 1001;
 /// A frame broke the protocol.
 pub const CLOSE_PROTOCOL_ERROR: u16 = 1002;
+/// A kind of message the endpoint does not take (binary where it takes text).
+pub const CLOSE_UNSUPPORTED: u16 = 1003;
 /// A text message that is not UTF-8.
 pub const CLOSE_INVALID_DATA: u16 = 1007;
 /// A message that breaks the application's rules (`screen.rs`'s messages).

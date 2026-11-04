@@ -29,6 +29,12 @@ use std::net::{IpAddr, SocketAddr};
 /// The header that carries the token.
 pub const TOKEN_HEADER: &str = "x-pendragon-token";
 
+/// How a page's WebSocket carries the token: a page cannot set headers of its own on
+/// a WebSocket's handshake, only the subprotocols it offers (`Sec-WebSocket-Protocol`),
+/// so it offers one more, this prefix and the token. Kubernetes passes its bearer
+/// tokens the same way. Pendragon never chooses it, so the answer does not repeat it.
+pub const TOKEN_PROTOCOL: &str = "pendragon.token.";
+
 /// Sent with every response: no framing, no MIME sniffing, no referrer (the page's
 /// URL carries the token when it is first opened), and a policy that allows only
 /// Pendragon's own script, style and requests.
@@ -123,9 +129,22 @@ impl Guard {
         }
     }
 
-    /// The request carries the token.
+    /// The request carries the token: in its header, or for a WebSocket's handshake
+    /// in the subprotocols it offers ([`TOKEN_PROTOCOL`]).
     pub fn check_token(&self, req: &Request) -> Result<(), Refusal> {
-        match req.header(TOKEN_HEADER) {
+        let offered = || {
+            req.headers
+                .iter()
+                .filter(|(n, _)| n == "sec-websocket-protocol")
+                .flat_map(|(_, v)| v.split(','))
+                .find_map(|p| p.trim().strip_prefix(TOKEN_PROTOCOL))
+        };
+        let token = match req.header(TOKEN_HEADER) {
+            Some(token) => Some(token),
+            None if crate::websocket::is_upgrade(req) => offered(),
+            None => None,
+        };
+        match token {
             None => Err(Refusal(
                 "no token: open the URL pendragon printed when it started (it ends in ?token=...)".into(),
             )),
