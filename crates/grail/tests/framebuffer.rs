@@ -387,9 +387,11 @@ fn flip_ppm(k: u32) -> Vec<u8> {
     ppm
 }
 
-/// The frames dumped into `dir` are each of `examples/flip`'s eight frames in turn,
-/// whole (frame-0000 from the modeset, the next seven from the page flips), then the
-/// last one again at exit: no frame shows a buffer being drawn.
+/// The frames dumped into `dir` are each of `examples/flip`'s eight frames in turn
+/// (frame-0000 from the modeset, the next seven from the page flips), then the last one
+/// again at exit. A dump is written as a flip takes effect, so it shows the new buffer
+/// whole whatever the program does: this checks `--fb-dump`, not tearing
+/// ([`the_display_never_shows_a_buffer_being_drawn`] does).
 fn check_flip_dumps(dir: &Path) {
     let mut names: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
@@ -405,11 +407,10 @@ fn check_flip_dumps(dir: &Path) {
     }
 }
 
-/// Acceptance of #176: `examples/flip` switches to 800x600 and double-buffers in RAM
-/// with page flips on the vertical-blank interrupt, and `--fb-dump` shows every frame
-/// whole, with no tearing, at both widths.
+/// `examples/flip` through `grail --fb-dump`, at both widths: one dump per frame it
+/// shows, at 800x600, in order.
 #[test]
-fn flip_dumps_every_frame_whole() {
+fn flip_dumps_every_frame_it_shows() {
     for rv64 in [false, true] {
         let dir = scratch(&format!("flip-{}", if rv64 { 64 } else { 32 }));
         let out = grail(&[
@@ -424,6 +425,87 @@ fn flip_dumps_every_frame_whole() {
             String::from_utf8_lossy(&out.stderr)
         );
         check_flip_dumps(&dir);
+    }
+}
+
+/// Acceptance of #176: `examples/flip` switches to 800x600 and double-buffers in RAM
+/// with page flips on the vertical-blank interrupt, and shows its moving bands with no
+/// tearing, at both widths.
+///
+/// The display scans out the buffer it shows for a whole frame, from one vertical blank
+/// to the next, so a frame is torn if that buffer is drawn into meanwhile. The machine
+/// runs a step at a time, and the frame shown is checked at the start of every frame
+/// (right after the modeset or the vertical blank that began it) and at its end (right
+/// before the tick of the next vertical blank): both times it must be one of the eight
+/// frames whole, the same one, and never an earlier one than the frame before. A
+/// program that drew into the buffer on screen (one that went on without waiting for
+/// FLIP_PENDING to clear) fails at the end of the frame it tore.
+#[test]
+fn the_display_never_shows_a_buffer_being_drawn() {
+    let frames: Vec<Vec<u8>> = (0..FLIP_FRAMES).map(flip_ppm).collect();
+    // Which of the eight frames the display shows whole, if any.
+    let shown = |m: &Machine| {
+        let ppm = m.cpu.bus.frame().to_ppm();
+        frames.iter().position(|f| *f == ppm).map(|k| k as u32)
+    };
+    for rv64 in [false, true] {
+        let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+        m.load_elf(&std::fs::read(flip_elf(rv64)).unwrap()).unwrap();
+        // The frame shown since the current frame began; None before the modeset.
+        let mut current: Option<u32> = None;
+        let mut seen = Vec::new();
+        let (mut ends, mut first_vblank) = (0u64, 0u64);
+        let mut steps = 0u64;
+        while m.exit_code().is_none() {
+            assert!(steps < 50_000_000, "never halts");
+            let fb = &m.cpu.bus.fb;
+            if let Some(k) = current.filter(|_| fb.ticks_to_vblank() == 1) {
+                // The end of a frame: the buffer shown all along it is still the same
+                // frame, whole.
+                assert_eq!(
+                    shown(&m),
+                    Some(k),
+                    "torn: the end of the frame before vertical blank {} (rv64 {rv64})",
+                    fb.vblanks + 1
+                );
+                ends += 1;
+            }
+            let (modesets, vblanks) = (fb.modesets, fb.vblanks);
+            m.cpu.step();
+            steps += 1;
+            let fb = &m.cpu.bus.fb;
+            if fb.modesets != modesets || (current.is_some() && fb.vblanks != vblanks) {
+                // A frame begins, with the buffer the modeset or the flip latched.
+                if current.is_none() {
+                    first_vblank = fb.vblanks;
+                }
+                let k = shown(&m).unwrap_or_else(|| {
+                    panic!(
+                        "torn: the start of the frame at vertical blank {} (rv64 {rv64})",
+                        fb.vblanks
+                    )
+                });
+                assert!(
+                    current.is_none_or(|last| k >= last),
+                    "frame {k} after frame {current:?}"
+                );
+                current = Some(k);
+                if seen.last() != Some(&k) {
+                    seen.push(k);
+                }
+            }
+        }
+        assert_eq!(m.exit_code(), Some(0));
+        let fb = &m.cpu.bus.fb;
+        assert_eq!((fb.mode().width, fb.mode().height), (800, 600));
+        assert_eq!(
+            seen,
+            (0..FLIP_FRAMES).collect::<Vec<_>>(),
+            "each frame shown, in order"
+        );
+        // Every frame since the modeset was checked at its end: no idle jump skipped one.
+        assert!(ends > u64::from(FLIP_FRAMES), "{ends} frames");
+        assert_eq!(ends, fb.vblanks - first_vblank, "a frame's end was skipped");
     }
 }
 
