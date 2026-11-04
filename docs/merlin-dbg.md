@@ -236,7 +236,7 @@ Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 | `stepi [N]`, `si` | N instructions (1) of the selected hart |
 | `nexti [N]`, `ni` | the same, but a call runs until it returns: a `jal`/`jalr` that links, or the `auipc ra` + `jalr ra` of a `call` |
 | `finish` | runs until the current function returns to its caller (the backtrace's frame 1), and shows `a0` |
-| `regs`, `info registers` | the selected hart's registers, pc and privilege mode, with all their digits (8, or 16 on RV64) |
+| `regs`, `info registers` | the selected hart's registers, pc and privilege mode, in GDB's `info registers` layout (see below) |
 | `x/N[b\|h\|w\|g] ADDR` | N units of memory, in hex: GDB's unit letters, bytes (`b`, 8 to a line), halfwords (`h`, 8), words (`w`, 4, the default) or giants (`g`, 8 bytes, 2 to a line), at either width. An `x` (hex, the only format) may come before or after the letter |
 | `disas [ADDR] [N]` | N instructions (8) from ADDR (the pc), `=>` at the pc |
 | `bt`, `backtrace` | the call stack, with each frame's source line |
@@ -246,6 +246,22 @@ Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 | `hart`, `info harts` | every hart, its mode and pc. `*` marks the selected one |
 | `hart N` | selects hart N |
 | `quit`, `q` | leaves |
+
+**`regs`** shows the registers as GDB's `info registers` does for RISC-V, one to a line, so a line fits 80 columns at either width: the name, padded to 15 columns, the value in hex without leading zeros, a tab, and the value as its type in GDB's target description shows it. `ra` and `pc` are code pointers, shown with their symbol; `sp`, `gp`, `tp` and `fp` (`s0`, as GDB names it) are data pointers, in hex; the others are integers, signed at the register's width. `zero` is left out, as GDB leaves it out. `priv`, the privilege mode, comes last, as GDB's `info registers priv` shows it:
+
+```
+ra             0x80000018	0x80000018 <_start+24>
+sp             0x80010070	0x80010070
+...
+t0             0x80000000	-2147483648
+...
+a0             0x80000050	-2147483568
+...
+pc             0x80000020	0x80000020 <puts>
+priv           0x3	prv:3 [Machine]
+```
+
+On RV64 the same `t0` is `2147483648`, a positive 64-bit number.
 
 An ADDR is any of these, optionally followed by `+N` or `-N`:
 

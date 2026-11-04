@@ -78,7 +78,7 @@ finish                  run until the current function returns
 list|l [FILE:]LINE|FUNC show ten source lines around LINE; list alone goes on
 directory DIR           look for source files in DIR first
 add-symbol-file FILE    add the symbols and lines of another program (a user one)
-regs|info registers     the selected hart's registers
+regs|info registers     the selected hart's registers, as GDB shows them
 x/N[b|h|w|g] ADDR       N bytes (b), halfwords (h), words (w) or giants (g, 8) at ADDR
 disas [ADDR] [N]        disassemble N instructions (8) from ADDR (the pc)
 bt|backtrace            the call stack, by frame pointer
@@ -310,9 +310,16 @@ impl<'a, W: Write> Session<'a, W> {
         }
     }
 
-    /// `0x80000024 <puts+4>` (16 digits on RV64).
+    /// `0x80000024 <puts+4>` with all of an address's digits (16 on RV64), as GDB
+    /// shows a code address in a frame and in disassembly.
     fn show(&self, addr: u64) -> String {
         self.symbols.show(addr, self.xlen)
+    }
+
+    /// `0x80000024 <puts+4>` without leading zeros, as GDB shows an address
+    /// everywhere else: `x`, `break`'s and `watch`'s messages, a code pointer's value.
+    fn show_plain(&self, addr: u64) -> String {
+        self.symbols.show_plain(addr)
     }
 
     /// A register's value in hex, with all its digits.
@@ -621,11 +628,7 @@ impl<'a, W: Write> Session<'a, W> {
         // Back in the caller, sp is above where it is now (or the same, from a leaf).
         if self.run_to(caller.pc, |sp, sp0| sp >= sp0, true)? {
             let a0 = self.remote.register(10)?;
-            // As a signed number of the register's width.
-            let signed = match self.xlen {
-                Xlen::Rv32 => i64::from(a0 as u32 as i32),
-                Xlen::Rv64 => a0 as i64,
-            };
+            let signed = self.signed(a0);
             self.say(format!("returned: a0 = {} ({signed})", self.hex(a0)));
         }
         Ok(())
@@ -678,27 +681,51 @@ impl<'a, W: Write> Session<'a, W> {
 
     // ---- Looking ----
 
+    /// `regs`, `info registers`: GDB's layout for RISC-V, a register to a line, its
+    /// name, its value in hex (no leading zeros) and then as its type in GDB's
+    /// target description shows it. `ra` and `pc` are code pointers (with their
+    /// symbol), `sp`, `gp`, `tp` and `fp` (`s0`) data pointers, and the rest signed
+    /// integers of the register's width. `zero` is left out, as GDB leaves it, and
+    /// `priv` (the privilege mode) comes last, as `info registers priv` shows it.
     fn regs(&mut self) -> Result<()> {
         let r = self.remote.registers()?;
         let mut lines = Vec::new();
-        for row in 0..8 {
-            let line: Vec<String> = (0..4)
-                .map(|col| {
-                    let n = row * 4 + col;
-                    format!("{:<4} {}", excalibur::reg::abi_name(n as u8), self.hex(r[n]))
-                })
-                .collect();
-            lines.push(line.join("  "));
+        let line = |name: &str, hex: String, natural: String| format!("{name:<15}{hex}\t{natural}");
+        for (n, &v) in r.iter().enumerate().take(32).skip(1) {
+            // GDB calls x8 fp.
+            let name = if n == 8 {
+                "fp"
+            } else {
+                excalibur::reg::abi_name(n as u8)
+            };
+            let natural = match n {
+                1 => self.show_plain(v),
+                2 | 3 | 4 | 8 => format!("{v:#x}"),
+                _ => self.signed(v).to_string(),
+            };
+            lines.push(line(name, format!("{v:#x}"), natural));
         }
-        let mode = match self.remote.register(remote::PRIV) {
-            Ok(0) => "U",
-            Ok(1) => "S",
-            Ok(3) => "M",
-            _ => "?",
-        };
-        lines.push(format!("pc   {}  mode {mode}", self.show(r[32])));
+        lines.push(line("pc", format!("{:#x}", r[32]), self.show_plain(r[32])));
+        if let Ok(p) = self.remote.register(remote::PRIV) {
+            let mode = match p {
+                0 => "User/Application",
+                1 => "Supervisor",
+                2 => "Hypervisor",
+                3 => "Machine",
+                _ => "INVALID",
+            };
+            lines.push(line("priv", format!("{p:#x}"), format!("prv:{p} [{mode}]")));
+        }
         self.say(lines.join("\n"));
         Ok(())
+    }
+
+    /// A register's value as a signed number of the register's width.
+    fn signed(&self, v: u64) -> i64 {
+        match self.xlen {
+            Xlen::Rv32 => i64::from(v as u32 as i32),
+            Xlen::Rv64 => v as i64,
+        }
     }
 
     /// `x/N[b|h|w|g] ADDR`: GDB's unit letters, a byte, a halfword, a word (the

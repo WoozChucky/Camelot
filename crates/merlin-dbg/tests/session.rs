@@ -152,6 +152,37 @@ fn assert_lines(out: &str, lines: &[&str]) {
     }
 }
 
+/// The lines `out` shows for the command `cmd` (echoed as `(merlin-dbg) cmd`): those
+/// after it, up to the next command.
+fn block_after(out: &str, cmd: &str) -> String {
+    let lines: Vec<&str> = out
+        .lines()
+        .skip_while(|l| *l != cmd)
+        .skip(1)
+        .take_while(|l| !l.starts_with("(merlin-dbg) "))
+        .collect();
+    lines.join("\n")
+}
+
+/// What `regs` shows, in GDB's layout: `given`'s lines (`name`, then the value in
+/// hex at column 15, a tab and its natural form), each register they leave out a
+/// signed integer that is 0. `given` must have every pointer register (`ra`, `sp`,
+/// `gp`, `tp`, `fp`), `pc` and `priv`.
+fn gdb_regs(given: &[&str]) -> String {
+    let names = [
+        "ra", "sp", "gp", "tp", "t0", "t1", "t2", "fp", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+        "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6", "pc", "priv",
+    ];
+    let lines: Vec<String> = names
+        .iter()
+        .map(|name| {
+            let line = given.iter().find(|l| l.split(' ').next() == Some(name));
+            line.map_or(format!("{name:<15}0x0\t0"), |l| l.to_string())
+        })
+        .collect();
+    lines.join("\n")
+}
+
 /// A debugged run over `--connect` of `elf`: merlin-dbg's output, and the console's,
 /// which must be the undebugged run's, with the same exit code.
 fn connected(elf: &str, harts: usize, input: &[u8], commands: &str) -> String {
@@ -197,9 +228,6 @@ fn hello() {
             "(merlin-dbg) continue",
             "breakpoint 1",
             "=> 0x80000020 <puts>:  lui t0, 0x10000",
-            "zero 0x00000000  ra   0x80000018  sp   0x80010070  gp   0x00000000",
-            "s0   0x00000000  s1   0x00000000  a0   0x80000050  a1   0x00000000",
-            "pc   0x80000020 <puts>  mode M",
             "0x80000050 <message>:  0x48  0x65  0x6c  0x6c  0x6f",
             "0x80000050 <message>:  0x6c6c6548  0x7266206f",
             "=> 0x80000024 <puts+4>:  mv t1, a0",
@@ -212,6 +240,21 @@ fn hello() {
             "=> 0x8000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
             "program exited with code 0",
         ],
+    );
+    // GDB's info registers: the integers signed at 32 bits.
+    assert_eq!(
+        block_after(&out, "(merlin-dbg) regs"),
+        gdb_regs(&[
+            "ra             0x80000018\t0x80000018 <_start+24>",
+            "sp             0x80010070\t0x80010070",
+            "gp             0x0\t0x0",
+            "tp             0x0\t0x0",
+            "t0             0x80000000\t-2147483648",
+            "fp             0x0\t0x0",
+            "a0             0x80000050\t-2147483568",
+            "pc             0x80000020\t0x80000020 <puts>",
+            "priv           0x3\tprv:3 [Machine]",
+        ])
     );
 }
 
@@ -261,12 +304,12 @@ fn kernel() {
             &format!("=> {kvminit:#010x} <kvminit>:  addi sp, sp, -0x10"),
         ],
     );
-    assert!(
-        out.contains(&format!(
-            "pc   {kmain:#010x} <kmain>  mode S
-"
-        )),
-        "{out}"
+    assert_lines(
+        &out,
+        &[
+            &format!("pc             {kmain:#x}\t{kmain:#x} <kmain>"),
+            "priv           0x1\tprv:1 [Supervisor]",
+        ],
     );
     // The backtrace: kvminit, called from kmain, called from the assembly that enters
     // S-mode (whose ra kmain saved; the chain ends there, s0 = 0).
@@ -535,7 +578,6 @@ fn harts_and_watchpoints() {
             "[hart 1] breakpoint 1",
             "=> 0x80000070 <work>:  auipc t0, 0x0",
             "* hart 1, M-mode, at 0x80000070 <work>",
-            "s0   0x00000001  s1   0x00000002  a0   0x00000001  a1   0x00000000",
             "hart 0",
             "hart 1",
             "=> 0x80000074 <work+4>:  addi t0, t0, 0x3c0",
@@ -548,6 +590,24 @@ fn harts_and_watchpoints() {
             "3    watchpoint  0x8000043c <ready>, 4 bytes, read",
             "error: no hart 3: the machine has 2",
         ],
+    );
+    // Hart 1's registers, the same at both widths.
+    assert_eq!(
+        block_after(&out, "(merlin-dbg) regs"),
+        gdb_regs(&[
+            "ra             0x0\t0x0",
+            "sp             0x8000f470\t0x8000f470",
+            "gp             0x0\t0x0",
+            "tp             0x0\t0x0",
+            "t0             0x30002000\t805314560",
+            "t1             0x2000004\t33554436",
+            "t2             0x1\t1",
+            "fp             0x1\t0x1",
+            "s1             0x2\t2",
+            "a0             0x1\t1",
+            "pc             0x80000070\t0x80000070 <work>",
+            "priv           0x3\tprv:3 [Machine]",
+        ])
     );
 }
 
@@ -662,9 +722,6 @@ fn hello_rv64() {
             "(merlin-dbg) continue",
             "breakpoint 1",
             "=> 0x0000000080000020 <puts>:  lui t0, 0x10000",
-            "zero 0x0000000000000000  ra   0x0000000080000018  sp   0x0000000080010070  gp   0x0000000000000000",
-            "s0   0x0000000000000000  s1   0x0000000000000000  a0   0x0000000080000050  a1   0x0000000000000000",
-            "pc   0x0000000080000020 <puts>  mode M",
             "0x0000000080000050 <message>:  0x48  0x65  0x6c  0x6c  0x6f",
             "0x0000000080000050 <message>:  0x6c6c6548  0x7266206f",
             "0x0000000080000050 <message>:  0x7266206f6c6c6548  0x6c656d6143206d6f",
@@ -682,6 +739,21 @@ fn hello_rv64() {
             "returned: a0 = 0x0000000000000014 (20)",
             "program exited with code 0",
         ],
+    );
+    // GDB's info registers: the integers signed at 64 bits.
+    assert_eq!(
+        block_after(&out, "(merlin-dbg) regs"),
+        gdb_regs(&[
+            "ra             0x80000018\t0x80000018 <_start+24>",
+            "sp             0x80010070\t0x80010070",
+            "gp             0x0\t0x0",
+            "tp             0x0\t0x0",
+            "t0             0x80000000\t2147483648",
+            "fp             0x0\t0x0",
+            "a0             0x80000050\t2147483728",
+            "pc             0x80000020\t0x80000020 <puts>",
+            "priv           0x3\tprv:3 [Machine]",
+        ])
     );
 }
 
@@ -720,7 +792,6 @@ fn harts_and_watchpoints_rv64() {
             "[hart 1] breakpoint 1",
             "=> 0x0000000080000070 <work>:  auipc t0, 0x0",
             "* hart 1, M-mode, at 0x0000000080000070 <work>",
-            "s0   0x0000000000000001  s1   0x0000000000000002  a0   0x0000000000000001  a1   0x0000000000000000",
             "hart 0",
             "hart 1",
             "=> 0x0000000080000074 <work+4>:  addi t0, t0, 0x3c0",
@@ -733,6 +804,24 @@ fn harts_and_watchpoints_rv64() {
             "3    watchpoint  0x000000008000043c <ready>, 4 bytes, read",
             "error: no hart 3: the machine has 2",
         ],
+    );
+    // Hart 1's registers, the same at both widths.
+    assert_eq!(
+        block_after(&out, "(merlin-dbg) regs"),
+        gdb_regs(&[
+            "ra             0x0\t0x0",
+            "sp             0x8000f470\t0x8000f470",
+            "gp             0x0\t0x0",
+            "tp             0x0\t0x0",
+            "t0             0x30002000\t805314560",
+            "t1             0x2000004\t33554436",
+            "t2             0x1\t1",
+            "fp             0x1\t0x1",
+            "s1             0x2\t2",
+            "a0             0x1\t1",
+            "pc             0x80000070\t0x80000070 <work>",
+            "priv           0x3\tprv:3 [Machine]",
+        ])
     );
 }
 

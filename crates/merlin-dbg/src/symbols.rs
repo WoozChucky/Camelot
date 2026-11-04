@@ -144,7 +144,16 @@ impl Symbols {
     /// many digits as an `xlen` address has (`0x0000000080000024 <puts+4>` on RV64,
     /// as GDB shows a 64-bit target's code addresses).
     pub fn show(&self, addr: u64, xlen: Xlen) -> String {
-        let hex = hex_value(addr, xlen);
+        self.with_name(hex_value(addr, xlen), addr)
+    }
+
+    /// The same without leading zeros (`0x1000`, `0x80000024 <puts+4>`), as GDB
+    /// shows an address outside frames and disassembly.
+    pub fn show_plain(&self, addr: u64) -> String {
+        self.with_name(format!("{addr:#x}"), addr)
+    }
+
+    fn with_name(&self, hex: String, addr: u64) -> String {
         match self.describe(addr) {
             Some(d) => format!("{hex} <{d}>"),
             None => hex,
@@ -185,6 +194,8 @@ mod tests {
         assert_eq!(s.show(0x1000, Xlen::Rv32), "0x00001000");
         assert_eq!(s.show(0x8000_0024, Xlen::Rv64), "0x0000000080000024 <puts+4>");
         assert_eq!(s.show(0x1000, Xlen::Rv64), "0x0000000000001000");
+        assert_eq!(s.show_plain(0x8000_0024), "0x80000024 <puts+4>");
+        assert_eq!(s.show_plain(0x1000), "0x1000");
     }
 
     /// A program of the other width is refused against the machine's.
