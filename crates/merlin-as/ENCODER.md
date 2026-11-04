@@ -387,7 +387,12 @@ assembles in `crates/xtask/tests/selfhost.rs`.
   table.
 - `debug_line`: every `.debug_*` section and its relocations against clang's
   objects, `tests/debug_line/*.o` and, for RV64, `tests/debug_line/rv64/*.o`
-  (`rv64/merlin.s` is the RV64 version of the compiler output `merlin.s`).
+  (`rv64/merlin.s` is the RV64 version of the compiler output `merlin.s`;
+  `files.s` is a table of `.file`s without a `.loc`).
+- `mapping`: the `$x`/`$d` mapping symbols, the whole symbol table and
+  every section against clang's objects, `tests/mapping/*.o` and
+  `tests/mapping/rv64/*.o`, and merlin-objdump's listing against
+  llvm-objdump's (`*.d.txt`).
 - Unit tests in `encode.rs` (packers against the decoder, `hi_lo`, `li` and
   `li_steps` on both widths, the RV64 instructions decoded back), `asm.rs`
   (local resolution, against words from clang; data of every size), `elf.rs`
@@ -425,5 +430,7 @@ Windows); their output is committed, so `cargo test` needs none of it.
   `examples/hello/hello.S` changes.
 - `tests/debug_line/*.o` and `tests/debug_line/rv64/*.o`:
   `scripts/gen-debug-line-golden.sh`.
+- `tests/mapping/*.o`, `*.d.txt` and their `rv64/` twins:
+  `scripts/gen-mapping-golden.sh`.
 - `tests/golden/hello.elf` and `golden/rv64/hello.elf`: `cargo xtask hello`
   (merlin-as and ld.lld, both widths; LLD 23.1.4 made them).

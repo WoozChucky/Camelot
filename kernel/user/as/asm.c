@@ -54,6 +54,9 @@ static int is_stmt = 1;
 static struct row *rows;
 static uint nrows, caprows;
 static uint first_loc_line;
+/* The line of the first numbered `.file`, which makes a line table even
+ * without a `.loc` (merlin-as's first_file_line). */
+static uint first_file_line;
 
 #define DOT "."
 #define DOT_LABEL ".Ldot$"
@@ -1058,16 +1061,9 @@ static int is_word(struct dirarg *a, const char *word) {
     return a->kind == DA_EXPR && a->e->kind == E_SYM && strcmp(a->e->sym, word) == 0;
 }
 
-static int same_file(struct dfile *a, struct dfile *b) {
-    if (strcmp(a->dir, b->dir) != 0 || strcmp(a->name, b->name) != 0 || a->has_md5 != b->has_md5) {
-        return 0;
-    }
-    return !a->has_md5 || memcmp(a->md5, b->md5, 16) == 0;
-}
-
-/* `.file "name"` (the file's name, which merlin-as has no use for) or
- * `.file N ["dir"] "name" [md5 0x...]`: file number N of the line table.
- * `.file 0` gives the compilation directory and the main file. */
+/* `.file "name"`: an STT_FILE symbol. Or `.file N ["dir"] "name" [md5
+ * 0x...]`: file number N of the line table, which it makes even without a
+ * `.loc`. `.file 0` gives the compilation directory and the main file. */
 static void file_directive(struct dirarg *args, uint nargs) {
     /* `.file "name"`: an STT_FILE symbol, here (merlin-as's file_directive). */
     if (nargs == 1 && args[0].kind == DA_STR) {
@@ -1137,9 +1133,18 @@ static void file_directive(struct dirarg *args, uint nargs) {
     }
     file.dir = perm_strdup(file.dir);
     file.name = perm_strdup(file.name);
+    if (first_file_line == 0) {
+        first_file_line = line;
+    }
     if (n == 0) {
         file0 = file;
         have_file0 = 1;
+        return;
+    }
+    /* LLVM's tryGetFile: a file named as the main one, with the same checksum
+     * (or none), is file 0 and takes no number; a number is given once. */
+    if (have_file0 && strcmp(file0.name, file.name) == 0 && file0.has_md5 == file.has_md5 &&
+        (!file.has_md5 || memcmp(file0.md5, file.md5, 16) == 0)) {
         return;
     }
     if (n >= 1u << 24) {
@@ -1150,8 +1155,8 @@ static void file_directive(struct dirarg *args, uint nargs) {
         memset(&files[nfiles], 0, (n + 1 - nfiles) * sizeof(struct dfile));
         nfiles = n + 1;
     }
-    if (files[n].name != NULL && !same_file(&files[n], &file)) {
-        error(fmt("file number %u is already defined", n));
+    if (files[n].name != NULL) {
+        error("file number already allocated");
         return;
     }
     files[n] = file;
@@ -1181,8 +1186,12 @@ static void loc_directive(struct dirarg *args, uint nargs) {
     }
     uint file = nums[0];
     int defined = file == 0 ? have_file0 : file < nfiles && files[file].name != NULL;
+    if (!defined && file == 0) {
+        error(".loc: file number 0 has no .file");
+        return;
+    }
     if (!defined) {
-        error(fmt(".loc: file number %u has no .file", file));
+        error("unassigned file number in '.loc' directive");
         return;
     }
     struct loc loc;
@@ -1964,16 +1973,20 @@ static int append(const char *name, struct buf *bytes) {
 /* Writes the rows as `.debug_line` (and its strings in `.debug_line_str`),
  * with relocations for the strings and the sections' addresses. */
 static void line_table(void) {
-    if (nrows == 0) {
+    /* A numbered .file makes the table without a .loc too, as in LLVM: the
+     * header alone, no sequence. */
+    if (nrows == 0 && first_file_line == 0) {
         return;
     }
+    uint at = nrows == 0 ? first_file_line : first_loc_line;
     if (!have_file0) {
-        error_at(first_loc_line, "line information (.loc) needs .file 0, the compilation directory and the main file");
+        error_at(at, nrows == 0 ? "a line table (.file N) needs .file 0, the compilation directory and the main file"
+                                : "line information (.loc) needs .file 0, the compilation directory and the main file");
         return;
     }
     for (uint n = 1; n < nfiles; n++) {
         if (files[n].name == NULL) {
-            error_at(first_loc_line, fmt("the line table's files must be numbered 1, 2, ...: no .file %u", n));
+            error_at(at, fmt("unassigned file number: %u for .file directives", n));
             return;
         }
     }
@@ -1995,7 +2008,7 @@ static void line_table(void) {
         r->kind = R_RISCV_32;
         r->symbol = symbol;
         r->addend = i64_u(f->off);
-        r->line = first_loc_line;
+        r->line = at;
     }
     free(t.line.data);
     free(t.line_str.data);

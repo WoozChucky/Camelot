@@ -360,6 +360,21 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
          .option arch, rv32ima2p1_zicsr\n.attribute arch, \"rv32i2p1_m2p0\"\n.attribute 5, \"rv32gc\"\n\
          .option arch, -zmmul\n.option arch, +m2p0\n.option arch, m\n.option arch\n.option\n\
          .attribute arch, 5\n",
+        // The line table's files: a number given twice, the main file under
+        // a number (which leaves it unassigned), a gap, a table of .file N
+        // without .file 0 and without a .loc.
+        ".file 0 \"d\" \"a.c\"
+.file 1 \"x\" \"a.c\"
+.file 2 \"b.c\"
+.file 2 \"b.c\"
+.loc 1 3
+nop
+.loc 2 4
+nop
+",
+        ".file 1 \"a.c\"
+nop
+",
         // Alignment: fills and maxima LLVM takes, and those it does not.
         ".p2align 2, 0x55, 0\n.balign 8,, -1\n.p2align 3,,\n.p2align 2,\n.balign 3\n.p2align 2, 1, 2, 3\n\
          .p2align 2, x\n.balign 8, 0, x\n.p2align 17\n",

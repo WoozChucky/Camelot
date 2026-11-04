@@ -199,6 +199,9 @@ pub struct Assembler {
     rows: Vec<(usize, u32, dwarf::Loc)>,
     /// The source line of the first `.loc`, for an error about the line table.
     first_loc_line: usize,
+    /// The source line of the first numbered `.file`, which makes a line
+    /// table even without a `.loc` ([`Assembler::line_table`]).
+    first_file_line: usize,
     errors: Vec<Error>,
     line: usize,
 }
@@ -304,6 +307,7 @@ impl Assembler {
             is_stmt: true,
             rows: Vec::new(),
             first_loc_line: 0,
+            first_file_line: 0,
             errors: Vec::new(),
             line: 0,
         };
@@ -1531,16 +1535,29 @@ impl Assembler {
             _ => return self.error(".file: unexpected text after the name"),
         };
         let file = dwarf::File { dir, name, md5 };
+        if self.first_file_line == 0 {
+            self.first_file_line = self.line;
+        }
         if n == 0 {
             self.file0 = Some(file);
+            return;
+        }
+        // LLVM's `tryGetFile`: a file named as the main one, with the same
+        // checksum (or none), is the main file, file 0, and takes no number
+        // (its number stays unassigned); a number is given once.
+        if self
+            .file0
+            .as_ref()
+            .is_some_and(|root| root.name == file.name && root.md5 == file.md5)
+        {
             return;
         }
         if self.files.len() <= n {
             self.files.resize(n + 1, None);
         }
         match &self.files[n] {
-            Some(old) if *old != file => self.error(format!("file number {n} is already defined")),
-            _ => self.files[n] = Some(file),
+            Some(_) => self.error("file number already allocated"),
+            None => self.files[n] = Some(file),
         }
     }
 
@@ -1569,8 +1586,11 @@ impl Assembler {
             0 => self.file0.is_some(),
             n => self.files.get(n as usize).is_some_and(Option::is_some),
         };
+        if !defined && file == 0 {
+            return self.error(".loc: file number 0 has no .file");
+        }
         if !defined {
-            return self.error(format!(".loc: file number {file} has no .file"));
+            return self.error("unassigned file number in '.loc' directive");
         }
         let mut loc = dwarf::Loc {
             file,
@@ -1649,13 +1669,26 @@ impl Assembler {
     /// Writes the rows as `.debug_line` (and its strings in
     /// `.debug_line_str`), one sequence per section in the order their first
     /// rows came, with relocations for the strings and the sections' addresses.
+    ///
+    /// A numbered `.file` makes the table even when no `.loc` follows, as
+    /// in LLVM (`.file N` makes the compile unit's `MCDwarfLineTable`, and
+    /// `MCDwarfLineTable::emit` writes every one there is): then it is the
+    /// header alone, the directories and files, with no sequence.
     fn line_table(&mut self) {
-        if self.rows.is_empty() {
+        if self.rows.is_empty() && self.first_file_line == 0 {
             return;
         }
-        let line = self.first_loc_line;
+        let line = if self.rows.is_empty() {
+            self.first_file_line
+        } else {
+            self.first_loc_line
+        };
         let Some(root) = self.file0.clone() else {
-            let msg = "line information (.loc) needs .file 0, the compilation directory and the main file";
+            let msg = if self.rows.is_empty() {
+                "a line table (.file N) needs .file 0, the compilation directory and the main file"
+            } else {
+                "line information (.loc) needs .file 0, the compilation directory and the main file"
+            };
             return self.errors.push(Error::new(line, msg));
         };
         let mut files = Vec::new();
@@ -1663,7 +1696,7 @@ impl Assembler {
             match f {
                 Some(f) => files.push(f.clone()),
                 None => {
-                    let msg = format!("the line table's files must be numbered 1, 2, ...: no .file {n}");
+                    let msg = format!("unassigned file number: {n} for .file directives");
                     return self.errors.push(Error::new(line, msg));
                 }
             }
@@ -2716,7 +2749,7 @@ f:      nop
             (".file 1 \"a.c\"\n.loc 1 1 0\nnop\n", "needs .file 0"),
             (
                 ".file 0 \"d\" \"a.c\"\n.file 2 \"b.h\"\n.loc 2 1 0\nnop\n",
-                "no .file 1",
+                "unassigned file number: 1 for .file directives",
             ),
             (
                 ".file 0 \"d\" \"a.c\"\n.loc 0 1 0 frobnicate\nnop\n",
@@ -2731,8 +2764,8 @@ f:      nop
                 "isa needs a number",
             ),
             (
-                ".file 1 \"a.c\"\n.file 1 \"b.c\"\n",
-                "file number 1 is already defined",
+                ".file 1 \"a.c\"\n.file 1 \"a.c\"\n",
+                "file number already allocated",
             ),
             (
                 ".file 0 \"d\" \"a.c\" source \"int x;\"\n",
@@ -2751,9 +2784,27 @@ f:      nop
             let errs = crate::assemble(src).unwrap_err();
             assert!(errs.iter().any(|e| e.msg.contains(want)), "{src:?}: {errs:?}");
         }
-        // The same .file twice is fine; a .file and .loc with no code make no table.
-        let obj =
-            crate::assemble(".file 1 \"a.c\"\n.file 1 \"a.c\"\n.file 0 \"d\" \"a.c\"\n.loc 0 3\n").unwrap();
+        // A file named as the main one is file 0 and leaves its number
+        // unassigned (LLVM's messages).
+        for (src, want) in [
+            (
+                ".file 0 \"d\" \"a.c\"\n.file 1 \"x\" \"a.c\"\n.loc 1 3\nnop\n",
+                "unassigned file number in '.loc' directive",
+            ),
+            (
+                ".file 0 \"d\" \"a.c\"\n.file 1 \"a.c\"\n.file 2 \"b.c\"\n.loc 2 3\nnop\n",
+                "unassigned file number: 1 for .file directives",
+            ),
+        ] {
+            let errs = crate::assemble(src).unwrap_err();
+            let msgs: Vec<&str> = errs.iter().map(|e| e.msg.as_str()).collect();
+            assert_eq!(msgs, [want], "{src:?}");
+        }
+        // A numbered .file makes a line table, its header alone without a
+        // .loc that takes a row, as in LLVM; a .file "name" makes none.
+        let obj = crate::assemble(".file 0 \"d\" \"a.c\"\n.file 1 \"a.c\"\n.loc 0 3\n").unwrap();
+        assert!(obj.sections.iter().any(|s| s.name == ".debug_line"));
+        let obj = crate::assemble(".file \"a.c\"\nnop\n").unwrap();
         assert!(obj.sections.iter().all(|s| !s.is_debug()));
     }
 
