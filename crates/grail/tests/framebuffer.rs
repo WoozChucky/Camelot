@@ -361,3 +361,131 @@ fn display_run_follows_a_real_time_clock() {
     check_colorbars_ppm(&std::fs::read(dir.join("frame-0000.ppm")).unwrap());
     check_colorbars_ppm(&std::fs::read(dir.join("frame-0001.ppm")).unwrap());
 }
+
+/// `examples/flip`, for an RV32 or an RV64 machine.
+fn flip_elf(rv64: bool) -> PathBuf {
+    let name = if rv64 { "flip-rv64.elf" } else { "flip.elf" };
+    repo_root().join("examples/flip").join(name)
+}
+
+/// Frames `examples/flip` shows, and the bands it draws: row `y` of frame `k` is
+/// `BANDS[(y + 25 k) / 75 % 8]`, as 0x00RRGGBB.
+const FLIP_FRAMES: u32 = 8;
+const BANDS: [u32; 8] = [
+    0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x000000,
+];
+
+/// The PPM of frame `k` of `examples/flip`: 800x600, every row one band's colour.
+fn flip_ppm(k: u32) -> Vec<u8> {
+    let mut ppm = b"P6\n800 600\n255\n".to_vec();
+    for y in 0..600 {
+        let [_, r, g, b] = BANDS[((y + 25 * k) / 75 % 8) as usize].to_be_bytes();
+        for _ in 0..800 {
+            ppm.extend_from_slice(&[r, g, b]);
+        }
+    }
+    ppm
+}
+
+/// The frames dumped into `dir` are each of `examples/flip`'s eight frames in turn,
+/// whole (frame-0000 from the modeset, the next seven from the page flips), then the
+/// last one again at exit: no frame shows a buffer being drawn.
+fn check_flip_dumps(dir: &Path) {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    let want: Vec<String> = (0..=FLIP_FRAMES).map(|i| format!("frame-{i:04}.ppm")).collect();
+    assert_eq!(names, want);
+    for (i, name) in names.iter().enumerate() {
+        let k = (i as u32).min(FLIP_FRAMES - 1);
+        let got = std::fs::read(dir.join(name)).unwrap();
+        assert!(got == flip_ppm(k), "{name} is not frame {k} whole");
+    }
+}
+
+/// Acceptance of #176: `examples/flip` switches to 800x600 and double-buffers in RAM
+/// with page flips on the vertical-blank interrupt, and `--fb-dump` shows every frame
+/// whole, with no tearing, at both widths.
+#[test]
+fn flip_dumps_every_frame_whole() {
+    for rv64 in [false, true] {
+        let dir = scratch(&format!("flip-{}", if rv64 { 64 } else { 32 }));
+        let out = grail(&[
+            "--fb-dump",
+            dir.to_str().unwrap(),
+            flip_elf(rv64).to_str().unwrap(),
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        check_flip_dumps(&dir);
+    }
+}
+
+/// A hart waiting in `wfi` for the vertical blank wakes at each one: the jump over
+/// idle time stops short of it, so every vertical blank is an interrupt of its own
+/// (the handler counts them in s8), none merged into the next, and the idle time is
+/// skipped rather than run a tick per step.
+#[test]
+fn a_waiting_hart_wakes_at_every_vertical_blank() {
+    for rv64 in [false, true] {
+        let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+        m.load_elf(&std::fs::read(flip_elf(rv64)).unwrap()).unwrap();
+        // Frame 0 is drawn before the interrupt is enabled: those vertical blanks
+        // interrupt nobody.
+        let mut steps = 0u64;
+        while !m.cpu.bus.fb.vblank_irq_enabled() {
+            m.cpu.step();
+            steps += 1;
+            assert!(steps < 10_000_000, "the interrupt is never enabled");
+        }
+        let before = m.cpu.bus.fb.vblanks;
+        assert_eq!(m.run(Some(50_000_000), |_| steps += 1), RunResult::Exited(0));
+        let fb = &m.cpu.bus.fb;
+        assert_eq!((fb.modesets, fb.flips), (1, u64::from(FLIP_FRAMES) - 1));
+        assert_eq!((fb.mode().width, fb.mode().height), (800, 600));
+        let interrupts = m.cpu.x[24]; // s8
+        assert!(interrupts > 0);
+        assert_eq!(
+            interrupts,
+            fb.vblanks - before,
+            "one interrupt per vertical blank"
+        );
+        assert!(m.cpu.bus.clint.mtime > steps, "idle time skipped");
+        // The last frame is what the display shows, from RAM.
+        let frame = m.cpu.bus.frame();
+        assert_eq!((frame.width, frame.height), (800, 600));
+        assert!(frame.to_ppm() == flip_ppm(FLIP_FRAMES - 1));
+    }
+}
+
+/// Paced by a real-time clock, the vertical blank wakes the waiting hart too (the
+/// pacer's idle skip stops short of it), and the dumps are the same.
+#[test]
+fn flip_follows_a_real_time_clock() {
+    let mut m = Machine::new(MachineConfig {
+        clock_hz: Some(400_000_000),
+        ..MachineConfig::default()
+    })
+    .unwrap();
+    m.load_elf(&std::fs::read(flip_elf(false)).unwrap()).unwrap();
+    let dir = scratch("flip-clock");
+    let opts = DisplayOptions {
+        dump_dir: Some(dir.clone()),
+        ..DisplayOptions::default()
+    };
+    let outcome = display::run(&mut m, None, |_| {}, &opts).unwrap();
+    assert_eq!(outcome, Outcome::Program(RunResult::Exited(0)));
+    // At 400 MHz a frame is 6.7 M ticks, more than drawing frame 0 takes, so every
+    // vertical blank comes after the interrupt is enabled.
+    assert_eq!(
+        m.cpu.x[24], m.cpu.bus.fb.vblanks,
+        "one interrupt per vertical blank"
+    );
+    check_flip_dumps(&dir);
+}

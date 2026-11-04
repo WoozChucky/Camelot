@@ -98,7 +98,8 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
-        what: "Grail: riscv-tests, RV64, paging and atomics semantics, disk boot, the committed disk image",
+        what: "Grail: riscv-tests, RV64, paging and atomics semantics, disk boot, the committed disk \
+               image, the display controller",
         args: &[
             "-p",
             "grail",
@@ -114,6 +115,8 @@ const STEPS: &[Step] = &[
             "disk_boot",
             "--test",
             "block",
+            "--test",
+            "framebuffer",
         ],
     },
     Step {
