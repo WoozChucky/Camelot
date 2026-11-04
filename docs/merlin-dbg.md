@@ -1,9 +1,10 @@
 # merlin-dbg and Grail's GDB stub
 
-merlin-dbg is the Camelot debugger. This document covers its first two layers:
+merlin-dbg is the Camelot debugger. This document covers its first three layers:
 
 - **machine-level debugging** of any program running in Grail, RV32 or RV64, with no help from the compiler: breakpoints, watchpoints, single steps, registers, CSRs, memory, disassembly and backtraces by frame pointer, on one hart or several;
-- **source-level debugging** of programs built with `merlin -g` (the kernel and its user programs are): breakpoints on a source line, stepping by line, the source shown at every stop, from the programs' DWARF line tables (see "Source lines" below).
+- **source-level debugging** of programs built with `merlin -g` (the kernel and its user programs are): breakpoints on a source line, stepping by line, the source shown at every stop, from the programs' DWARF line tables (see "Source lines" below);
+- **variables and types**, from the rest of the programs' DWARF debug information: `print` of C expressions, `info locals` and `info args`, `ptype` and `whatis`, and a backtrace with each frame's arguments, in the frame `frame`, `up` and `down` select (see "Variables and types" below).
 
 It has three parts:
 
@@ -33,8 +34,8 @@ breakpoint 1
 (merlin-dbg) stepi
 => 0x80000024 <puts+4>:  mv t1, a0
 (merlin-dbg) bt
-#0  0x80000024 <puts+4>
-#1  0x80000018 <_start+24>
+#0  0x80000024 in puts ()
+#1  0x80000018 in _start ()
 (merlin-dbg) continue
 Hello from Camelot!
 [dbg] pc=80000018 a0 = 0x00000014 (20)
@@ -47,8 +48,8 @@ An RV64 program (`examples/hello/hello-rv64.elf`) runs on an RV64 machine, and m
 (merlin-dbg) x/2g $a0
 0x80000050 <message>:  0x7266206f6c6c6548  0x6c656d6143206d6f
 (merlin-dbg) bt
-#0  0x0000000080000024 <puts+4>
-#1  0x0000000080000018 <_start+24>
+#0  0x0000000080000024 in puts ()
+#1  0x0000000080000018 in _start ()
 ```
 
 Or run Grail with its stub and connect to it, from another terminal or from GDB or LLDB:
@@ -240,7 +241,9 @@ Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 | `regs`, `info registers` | the selected hart's registers, pc and privilege mode, in GDB's `info registers` layout (see below) |
 | `x/N[b\|h\|w\|g] ADDR` | N units of memory, in hex: GDB's unit letters, bytes (`b`, 8 to a line), halfwords (`h`, 8), words (`w`, 4, the default) or giants (`g`, 8 bytes, 2 to a line), at either width. An `x` (hex, the only format) may come before or after the letter |
 | `disas [ADDR] [N]` | N instructions (8) from ADDR (the pc), `=>` at the pc |
-| `bt`, `backtrace` | the call stack, with each frame's source line |
+| `bt`, `backtrace` | the call stack as GDB shows it: each frame's pc, function, arguments and source line (see "Variables and types") |
+| `frame [N]`, `up [N]`, `down [N]` | selects the frame `print`, `info locals` and `info args` look in |
+| `print EXPR`, `info locals`, `info args`, `ptype`, `whatis` | variables and types: see "Variables and types" |
 | `list [FILE:]LINE`, `list FUNC`, `l` | ten source lines around LINE (of the file listed last) or a function's first line; `list` alone goes on after the lines listed last, or shows those around the stop |
 | `directory DIR` | looks for source files under DIR first |
 | `add-symbol-file FILE` | adds the symbols and line tables of another program: a user program next to the kernel |
@@ -270,7 +273,7 @@ An ADDR is any of these, optionally followed by `+N` or `-N`:
 - a symbol (`main`, `puts+8`);
 - a register (`$sp`, `$a0`, `$x5`, `$pc`, `$mstatus`).
 
-Symbols come from the ELF symbol table (through `elf`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one, and within its section when it has none (an assembly label), as GDB's minimal symbols are: the stack past the program's last section has no name. Where GDB pads an address with zeros to the target's width, so does merlin-dbg: in backtraces (`bt`), disassembly (`disas` and the `=>` line of each stop), `finish`'s frame, the harts' pcs, and `info breakpoints`' breakpoint addresses (GDB's Address column). That is 8 digits on RV32 and 16 on RV64: `0x0000000080000024 <puts+4>`. Everywhere else, as GDB, an address has no leading zeros: `x`'s line prefixes, `breakpoint N at ADDR`, watchpoints as they are set, hit and listed (GDB shows a watchpoint's expression), `regs`' code pointers, and a read that fails (`(cannot read past 0x80400000)`). So on RV32 only addresses below 0x10000000 look different between the two, such as a user program's `breakpoint 1 at 0x3bc4 <main>`. A branch's target in an instruction is as merlin-objdump and llvm-objdump write it (`beqz t2, 0x80000048 <puts+40>`).
+Symbols come from the ELF symbol table (through `elf`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one, and within its section when it has none (an assembly label), as GDB's minimal symbols are: the stack past the program's last section has no name. Where GDB pads an address with zeros to the target's width, so does merlin-dbg: in backtraces (`bt`, `frame`, `up` and `down`: a frame's pc), disassembly (`disas` and the `=>` line of each stop), `finish`'s frame, the harts' pcs, and `info breakpoints`' breakpoint addresses (GDB's Address column). That is 8 digits on RV32 and 16 on RV64: `0x0000000080000024 <puts+4>`. Everywhere else, as GDB, an address has no leading zeros: a pointer's value, `x`'s line prefixes, `breakpoint N at ADDR`, watchpoints as they are set, hit and listed (GDB shows a watchpoint's expression), `regs`' code pointers, and a read that fails (`(cannot read past 0x80400000)`). So on RV32 only addresses below 0x10000000 look different between the two, such as a user program's `breakpoint 1 at 0x3bc4 <main>`. A branch's target in an instruction is as merlin-objdump and llvm-objdump write it (`beqz t2, 0x80000048 <puts+40>`).
 
 **Breakpoints on functions.** As in GDB, `break FUNC` stops past the function's prologue, where its frame is built and its arguments are in their places, and `break *FUNC` at its first instruction. FUNC is a symbol in code (a C function, or an assembly label in `.text`); any other ADDR, a data symbol, a number or `FUNC+N`, is an exact address. Past the prologue is where GDB puts it (`skip_prologue_sal`, then `riscv_skip_prologue`):
 
@@ -366,6 +369,78 @@ kernel/main.c:276:     uart_init();
 
 LLDB reads the same tables: `image lookup -a ADDR` gives the line, `breakpoint set -f main.c -l LINE` the address (`cargo test -p merlin-dbg --test session -- --ignored`).
 
+### Variables and types
+
+`merlin -g` describes the program's data too (the spec's section 10, "Debug information"): each function's parameters and locals, its blocks, the globals and every type, as DWARF debugging information entries in `.debug_info`. merlin-dbg reads them (`crates/merlin-dbg/src/vars.rs`, through `elf::dies`) for a program and for each `add-symbol-file`, and does with them what GDB does for C:
+
+| Command | What it does |
+|---|---|
+| `print EXPR`, `p`, `print/x EXPR` | the value of a C expression in the selected frame, `$N = value` (`/x`: integers in hex) |
+| `info locals` | the selected frame's variables, `name = value`: those of the innermost block holding its pc first, then those of each block around it, then the function's own (its `static` locals with them) |
+| `info args` | its parameters |
+| `ptype EXPR`, `ptype TYPE` | a type as C declares it, with the members of the struct or union, or the constants of the enum, it is, points to or is an array of: `type = struct node {...} *` (typedefs seen through) |
+| `whatis EXPR`, `whatis TYPE` | the type's name only (a typedef name one level down) |
+| `frame [N]`, `f` | selects frame N of the backtrace (shows the selected one without N), and shows it and its line |
+| `up [N]`, `down [N]` | selects the frame N (1) further out, or further in |
+
+An expression is C's, the part a debugger needs: variables, numbers and character constants, registers (`$sp`), members (`s.m`, `p->m`), elements (`a[i]`, `m[i][j]`), `*p`, `&x`, `-`, `!`, `~`, `+`, `-`, `*`, `/` and `%` with C's integer promotions and conversions, pointer arithmetic (an element at a time, and the difference of two pointers), `sizeof x`, `sizeof (TYPE)` and casts to a named type (`(struct node *) $a0`). A TYPE is `struct TAG`, `union TAG`, `enum TAG`, a typedef name or a base type, with `*`s. A name is looked up as C scopes it, and as GDB looks it up: the blocks of the selected frame's function that hold its pc, the innermost first, then its parameters, then the variables of the file's scope (of the unit holding the pc first, then of any other), then the functions. A symbol without debug information is GDB's error, `'puts' has unknown type; cast it to its declared type`.
+
+Where a variable lives is a DWARF expression (`DW_AT_location`), which merlin-dbg evaluates in the selected frame: merlin's `DW_OP_fbreg N` (N bytes from the function's frame base, `DW_OP_reg8`, `s0`) and `DW_OP_addr`, and clang's at -O0, `DW_OP_breg2 N` (from `sp`) and `DW_OP_addrx` (through `.debug_addr`). The innermost frame has every register; a caller has what the unwinder found: its frame pointer, and its `sp`, which is the CFA of the frame it called (that frame's `s0`, as merlin and clang lay frames out), or the called frame's own `sp` when that frame is not built (a leaf, or a stop in a prologue). Every stop selects the innermost frame again.
+
+Values are shown as GDB shows C's:
+
+- integers in decimal (`print/x` in hex), a character type as its value and its character (`65 'A'`, `0 '\000'`, `255 '\377'`), `_Bool` as `true` or `false`, an enum by its constant's name (its number if none has it);
+- a pointer in hex, with the symbol it points into (`0x80001018 <nodes+16>`), a `char *` with the string it points to (`0x8004e0a5 "heap"`, at most 200 characters, then `...`), a function as `{int (Node *, int)} 0x80000064 <walk>`; `print` gives a pointer's type first, `(Node *) 0x80001018 <nodes+16>`, as GDB does except for `char *`;
+- a struct or union as `{x = 1, y = 2}`, an array as `{1, 2, 3}`, an array of characters as a string (its last NUL left out), at most 200 elements (then `...`), and ten or more equal elements in a row once, `0x0 <repeats 13 times>` (`"sh", '\000' <repeats 13 times>` in a string).
+
+Types are written as C declares them, as GDB writes them: `Node *`, `int [3]`, `short [2][3]`, `const char *`, `char * const`, `int (*)(int)`, `struct node {...}`.
+
+**The backtrace** is GDB's too: each frame's function, from the debug information (or the symbols, or `??`), its arguments and its line, `#1  0x80000108 in walk (list=0x800005d0 <nodes+8>, depth=1) at crates/merlin-dbg/tests/vars/vars.c:51`. A caller's pc is its return address, and its line and block those of the call before it. The innermost frame's pc is left out when it is at the start of a line, as GDB leaves it out. An argument that is a struct, a union or an array is `...` (GDB's `print frame-arguments scalars`); `info args` shows it whole. A function without debug information has no arguments shown: `#4  0x80000010 in _start ()`.
+
+The shell's first `write`, in the kernel:
+
+```
+(merlin-dbg) break sys_write
+breakpoint 1 at 0x80042edc <sys_write+24>: kernel/sysfile.c:65
+(merlin-dbg) continue
+breakpoint 1
+=> 0x80042edc <sys_write+24>:  lw a0, -0xc(s0)
+kernel/sysfile.c:65:     struct file *file = fd_get(arg(f, 0));
+(merlin-dbg) bt
+#0  sys_write (f=0x803f8f60) at kernel/sysfile.c:65
+#1  0x80041a8c in syscall (f=0x803f8f60) at kernel/syscall.c:164
+#2  0x8004630c in user_trap (f=0x803f8f60) at kernel/trap.c:272
+(merlin-dbg) print f->regs[17]
+$1 = 2
+(merlin-dbg) up
+#1  0x80041a8c in syscall (f=0x803f8f60) at kernel/syscall.c:164
+kernel/syscall.c:164:         ret = sys_write(f);
+(merlin-dbg) info locals
+p = 0x801cc370 <procs>
+ret = -2143318036
+num = 2
+sp = 201326224
+net = 0
+(merlin-dbg) print p->name
+$2 = "sh", '\000' <repeats 13 times>
+(merlin-dbg) print p->ofile
+$3 = {0x801c395c <ftable>, 0x801c3980 <ftable+36>, 0x801c39a4 <ftable+72>, 0x0 <repeats 13 times>}
+(merlin-dbg) ptype p
+type = struct proc {
+    u32 state;
+    u32 pid;
+    char name[16];
+    struct proc *parent;
+    ...
+    struct file *ofile[16];
+    struct inode *cwd;
+} *
+```
+
+`user_trap` is where the chain ends: the trap vector that called it is assembly, entered from U-mode, and the `s0` it leaves is the program's.
+
+LLDB reads the same entries: `frame variable` and `target variable` show the same variables, types and values for a program built by merlin as for the same one built by clang (`cargo test -p merlin-dbg --test session -- --ignored`).
+
 ### Tests
 
 `crates/merlin-dbg/tests/session.rs` drives the merlin-dbg binary against the stub, on `examples/hello`, `examples/smp` with 2 harts, and the kernel booted to its shell. The stub is `grail::gdb::serve`, what `grail --gdb` runs, in the test's process, so the test can capture the machine's console. The test checks:
@@ -376,7 +451,9 @@ LLDB reads the same tables: `image lookup -a ADDR` gives the line, `breakpoint s
 - that each run's console output and exit code are those of the same program run without a debugger;
 - `merlin-dbg -- ...` with a script (`-x`);
 - interrupting a running machine;
-- source lines: a breakpoint on `kmain`'s line of `kernel/main.c` and on a line with no code, `next` and `step` by line, `list`, the lines in a backtrace, and the same in the shell, a user program added with `add-symbol-file`; LLDB on the kernel's line tables (ignored).
+- source lines: a breakpoint on `kmain`'s line of `kernel/main.c` and on a line with no code, `next` and `step` by line, `list`, the lines in a backtrace, and the same in the shell, a user program added with `add-symbol-file`; LLDB on the kernel's line tables (ignored);
+- variables in the kernel, stopped in the shell's first `write`: the backtrace through `sys_write`, `syscall` and `user_trap` with their arguments, `info args` and `info locals` up the frames, the trap frame's members and its registers (an array), the process reached by a pointer and its name (a char array), `whatis` and `ptype`;
+- `crates/merlin-dbg/tests/vars/vars.c`, built by the test with `merlin -g` for RV32 and for RV64: stopped three calls deep in a recursion, the backtrace with every frame's arguments and line, `info args` and `info locals` in each frame (`up`, `down`, `frame`), the locals of a nested block, globals of every kind of type (a struct of an enum, an array of structs and a string, an array of two dimensions, a `long long`, a typedef), members, elements, pointers followed, `&`, `sizeof`, pointer differences, `print/x`, a function, `ptype` and `whatis` of expressions and of type names, struct arguments (`...` in a backtrace), errors; and LLDB (ignored), which shows the same variables, types and values for it built by merlin and by clang.
 
 The same on RV64 machines, against the stub's `riscv:rv64` description:
 
@@ -389,7 +466,6 @@ The kernel's RV64 case follows once the kernel is RV64 (#154). `src/remote.rs`'s
 
 ## What's next
 
-The next layers of merlin-dbg build on this one:
+The next layer of merlin-dbg builds on these:
 
-- variables and types from DWARF (#120);
 - debugging Avalon VMs and individual Camelot processes (#121).

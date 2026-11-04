@@ -6,7 +6,7 @@ A learning project: design an instruction set, emulate it, build the toolchain f
 |---|---|---|
 | **Excalibur** | The ISA: RV64IMA + Zicsr + Zifencei, M/S/U privilege, Sv48 paging (Sv39 too), plus the Xcal extensions; its RV32 form (RV32IMA, Sv32) is kept until #159, while each piece moves to 64 bits | Spec v0 in [`docs/excalibur-spec.md`](docs/excalibur-spec.md) |
 | **Grail** | The emulator | Passes riscv-tests rv32ui/um/ua/mi/si and rv64ui/um/ua/mi/si (RV32 or RV64 per machine; Sv32, or Sv39 and Sv48 paging); CLINT, PLIC, UART with receive interrupts; Xcal framebuffer, a display controller (modes up to 1920×1080 scanned out of RAM, page flips at vertical blank, its interrupt; Win32 window or PPM dumps), keyboard and pointer (from the window, with PLIC interrupts), sysinfo and block devices (disk images or disks on a Lake server, `--disk`); configurable RAM, real-time clock, disks and number of harts (up to 8, with IPIs) |
-| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, the `merlin` C-subset compiler and the `merlin-dbg` debugger | Builds every example and the whole Camelot kernel on its own, no LLVM (`cargo xtask examples`, `cargo xtask kernel`). merlin-as: complete, RV32 or RV64 (`-march`, ELF32 or ELF64 objects); its objects match clang's ([encoder notes](crates/merlin-as/ENCODER.md)). merlin-ld: RV32 or RV64, an ELF32 or ELF64 executable like its objects, with `AT` load addresses (a higher-half kernel's layout); links clang objects to the same bytes as ld.lld, with its program headers, except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: a C99 subset (integer types, `long long` included, pointers, arrays, structs, globals, strings, the preprocessor, varargs, designated initializers; programs of several files) compiles to assembly that our own assembler and linker build into programs Grail runs, the kernel and its user programs among them, for RV32 (ILP32) or RV64 (LP64, `-march`); unoptimized, so that kernel is about 40% bigger and 5 to 6 times slower than clang `-O2`'s ([code generation notes](crates/merlin/src/codegen.rs)). merlin-objdump: matches llvm-objdump (`-l` too). merlin-dbg: a debugger over Grail's GDB remote stub, which GDB and LLDB can use too, for RV32 or RV64 machines (the width from the stub, as GDB takes it), at the machine level (breakpoints, watchpoints, steps, registers, memory, disassembly, backtraces, harts) and by source line, from the DWARF line tables `merlin -g` writes (merlin-as encodes them as clang does, byte for byte) ([docs/merlin-dbg.md](docs/merlin-dbg.md)) |
+| **Merlin** | The toolchain: `merlin-as`, `merlin-ld`, `merlin-objdump`, the `merlin` C-subset compiler and the `merlin-dbg` debugger | Builds every example and the whole Camelot kernel on its own, no LLVM (`cargo xtask examples`, `cargo xtask kernel`). merlin-as: complete, RV32 or RV64 (`-march`, ELF32 or ELF64 objects); its objects match clang's ([encoder notes](crates/merlin-as/ENCODER.md)). merlin-ld: RV32 or RV64, an ELF32 or ELF64 executable like its objects, with `AT` load addresses (a higher-half kernel's layout); links clang objects to the same bytes as ld.lld, with its program headers, except where ld.lld merges `SHF_MERGE` strings and constants (see [spec §10](docs/excalibur-spec.md)), no relaxation (relocations explained in [src/reloc.rs](crates/merlin-ld/src/reloc.rs)). merlin: a C99 subset (integer types, `long long` included, pointers, arrays, structs, globals, strings, the preprocessor, varargs, designated initializers; programs of several files) compiles to assembly that our own assembler and linker build into programs Grail runs, the kernel and its user programs among them, for RV32 (ILP32) or RV64 (LP64, `-march`); unoptimized, so that kernel is about 40% bigger and 5 to 6 times slower than clang `-O2`'s ([code generation notes](crates/merlin/src/codegen.rs)). merlin-objdump: matches llvm-objdump (`-l` too). merlin-dbg: a debugger over Grail's GDB remote stub, which GDB and LLDB can use too, for RV32 or RV64 machines (the width from the stub, as GDB takes it), at the machine level (breakpoints, watchpoints, steps, registers, memory, disassembly, backtraces, harts) by source line, from the DWARF line tables `merlin -g` writes (merlin-as encodes them as clang does, byte for byte), and by variable, from the DWARF description of the program's variables and types `merlin -g` writes too (`print`, `info locals`, `ptype`, backtraces with arguments, as GDB shows them) ([docs/merlin-dbg.md](docs/merlin-dbg.md)) |
 | **Camelot** | The kernel / OS | Boots on Grail in S-mode: `kprintf`, trap handling, timer ticks, page allocator and Sv32 paging, interrupt-driven UART console, user programs in C in U-mode with their own page tables, switched round robin on timer ticks, system calls ([docs/camelot-syscalls.md](docs/camelot-syscalls.md)) and a user-space shell, an interrupt-driven disk driver with a buffer cache, a journaled filesystem mounted at boot ([docs/camelot-fs.md](docs/camelot-fs.md), with a host-side mkfs and fsck in `crates/camelot-fs`), a network stack with a card driver, ARP, IPv4, ICMP, UDP, TCP and DHCP, sockets behind file descriptors and network programs (`ifconfig`, `ping`, `nc`, `fetch`, `httpd`) ([docs/camelot-net.md](docs/camelot-net.md)) ([kernel/](kernel/README.md)) |
 | **Avalon** | The platform around Grail: the Avalon hypervisor server, the Round Table control CLI, the Pendragon web console, the Herald VM client and the Lake storage server | Protocol v9 in [`docs/avalon-protocol.md`](docs/avalon-protocol.md), implemented by `crates/avalon-proto`. The Avalon server runs N VMs with their own hardware profiles, a RAM budget, attachable consoles and screens, and network cards on virtual Ethernet switches, which can have a NAT gateway to the host and the internet; the Round Table CLI creates and controls them, and manages Lake's disk images; Pendragon does the same from a browser, with live consoles; the Lake storage server serves disk images to them over the network; Herald attaches a terminal to a VM's console, or a window to its screen, keyboard and mouse. `cargo xtask up` runs it all with one command ([Quick start](#quick-start)) |
 
@@ -49,7 +49,7 @@ Ctrl-] leaves Herald, and the VM carries on. The console is one for the whole VM
 
 ```
 crates/excalibur        instruction encodings, decoder, disassembler for RV32 and RV64 (shared by every tool)
-crates/elf              ELF32 and ELF64 reader and DWARF line tables (shared by grail, merlin-objdump, merlin-ld, merlin-dbg)
+crates/elf              ELF32 and ELF64 reader, DWARF line tables and debugging information entries (shared by grail, merlin-objdump, merlin-ld, merlin-dbg)
 crates/grail            the emulator
 crates/avalon-proto     the Avalon protocol: frames, messages, blocking connection, screen diffing (docs/avalon-protocol.md)
 crates/gateway          the user-mode NAT gateway behind `grail --net user` and Avalon's switches: DHCP, DNS, NAT and port forwarding over std::net
@@ -64,7 +64,7 @@ crates/merlin           the C-subset compiler (C → .s, RV32 or RV64 with -marc
 crates/merlin-as        the assembler (source → ELF32 .o, or ELF64 for RV64 with -march)
 crates/merlin-ld        the linker (.o files → ELF32 or ELF64 executable)
 crates/merlin-objdump   the disassembler / object dumper (llvm-objdump compatible output)
-crates/merlin-dbg       the debugger: a GDB remote protocol client for Grail's stub (`grail --gdb`), RV32 or RV64, machine-level and by source line (docs/merlin-dbg.md)
+crates/merlin-dbg       the debugger: a GDB remote protocol client for Grail's stub (`grail --gdb`), RV32 or RV64, machine-level, by source line and by variable (docs/merlin-dbg.md)
 crates/xtask            build tasks: `cargo xtask up` (the whole platform), `cargo xtask examples`, `cargo xtask kernel`, `cargo xtask fs`, `cargo xtask boot`, `cargo xtask hello`, `cargo xtask ld-fixtures`
 kernel/                 the Camelot kernel (C + assembly) and its prebuilt kernel.elf (and kernel-disk.elf, without the built-in programs, for bootable images); kernel/user holds the user programs it embeds (and kernel/user/lib their C library), kernel/net the network stack, kernel/fs the root image's files, kernel/boot the bootloader of a bootable disk
 examples/               bare-metal programs, built with merlin-as + merlin-ld (the .elf files are committed)
@@ -163,7 +163,7 @@ The options are llvm-objdump's: `-d` disassemble, `-r` relocations (under each i
 
 ### Debugging
 
-`merlin-dbg` debugs a program running in Grail at the machine level, and by source line where the program has line tables ([docs/merlin-dbg.md](docs/merlin-dbg.md)). Given `--` and Grail's arguments, it starts the machine itself, stopped at its first instruction:
+`merlin-dbg` debugs a program running in Grail at the machine level, and by source line and by variable where the program has debug information ([docs/merlin-dbg.md](docs/merlin-dbg.md)). Given `--` and Grail's arguments, it starts the machine itself, stopped at its first instruction:
 
 ```
 cargo run --release -p merlin-dbg -- -- examples/hello/hello.elf
@@ -176,13 +176,13 @@ breakpoint 1 at 0x80000028 <puts+8>
 breakpoint 1
 => 0x80000028 <puts+8>:  lbu t2, 0x0(t1)
 (merlin-dbg) bt
-#0  0x80000028 <puts+8>
-#1  0x80000018 <_start+24>
+#0  0x80000028 in puts ()
+#1  0x80000018 in _start ()
 ```
 
 As in GDB, `break FUNC` stops past the function's prologue (here, by GDB's prologue analysis, past `li` and `mv`), and `break *FUNC` at its first instruction.
 
-It has breakpoints and watchpoints, `stepi`, `nexti` and `finish`, `regs`, `x/N`, `disas`, `bt` (by frame pointer) and `hart N`. Commands can also come from a file (`-x FILE`) or a pipe.
+It has breakpoints and watchpoints, `stepi`, `nexti` and `finish`, `regs`, `x/N`, `disas`, `bt` (by frame pointer, as GDB shows it) and `hart N`. Commands can also come from a file (`-x FILE`) or a pipe.
 
 The kernel and its user programs are built with `merlin -g`, so in them it works by source line too: `break FILE:LINE`, `step` and `next` by line, `list`, and every stop shows its line. Run it in the repository root, where the line tables' paths lead to the sources:
 
