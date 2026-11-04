@@ -187,15 +187,16 @@ enum fixed_addresses {
 #define fix_to_virt(slot) (FIXADDR_TOP - ((uintptr)(slot) << PGSHIFT))
 
 /* The physical address of kernel pointer `v`: a direct-map pointer, or one
- * into the kernel image (its code, data and boot stack), as Linux's __pa().
- * Page tables, satp and the devices' DMA registers take physical addresses. */
+ * into the kernel image (its code, data and boot stack, up to and with
+ * __kernel_end), as Linux's __pa(). Page tables, satp and the devices' DMA
+ * registers take physical addresses. Any other pointer has no physical
+ * address to compute: one into the vmalloc area (a kernel stack, a device's
+ * ioremap() mapping, whose pages need not be contiguous or RAM at all) or
+ * the fixmap, a user address; kernel_pa() panics on it, as Linux's
+ * CONFIG_DEBUG_VIRTUAL __virt_to_phys() warns, rather than give a wrong
+ * one (vm.c). */
 #ifndef __ASSEMBLER__
-static inline phys_addr_t kernel_pa(uintptr v) {
-    if (v >= KERNEL_LINK_ADDR) {
-        return v - va_kernel_pa_offset;
-    }
-    return v - va_pa_offset;
-}
+phys_addr_t kernel_pa(uintptr v);
 #endif
 #define pa(v) kernel_pa((uintptr)(v))
 /* The kernel's pointer to physical address `p` of RAM: its direct-map

@@ -78,6 +78,9 @@ static const char *const banner[] = {
 /* RV64: a kernel process recurses until its stack runs into the guard page
  * below it, which kernel_vec reports as a kernel stack overflow. */
 #define BOOT_FAULT_KSTACK_OVERFLOW 17
+/* RV64: pa() of an ioremap() address, which has no physical address to
+ * compute (kernel_pa() panics). */
+#define BOOT_FAULT_PA_VMALLOC 18
 
 /* Nothing is mapped below the boot ROM (spec section 7), so the kernel page
  * table doesn't map it either (on RV64 it maps nothing in the lower half). */
@@ -285,6 +288,11 @@ static void deliberate_fault(void) {
             return;
         }
         scheduler();
+    }
+    if (boot_fault == BOOT_FAULT_PA_VMALLOC) {
+        phys_addr_t p = pa(uart_regs);
+        kprintf("pa(%p) gave %lx instead of panicking\n", (void *)uart_regs, p);
+        failed++;
     }
 #endif
     if (boot_fault >= BOOT_FAULT_DOUBLE_ACQUIRE && boot_fault <= BOOT_FAULT_POP_INTR_ON) {

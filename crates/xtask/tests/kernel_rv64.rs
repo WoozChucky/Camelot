@@ -99,6 +99,7 @@ const BOOT_FAULT_YIELD_HOLDING: u32 = 14;
 const BOOT_FAULT_POP_UNMATCHED: u32 = 15;
 const BOOT_FAULT_POP_INTR_ON: u32 = 16;
 const BOOT_FAULT_KSTACK_OVERFLOW: u32 = 17;
+const BOOT_FAULT_PA_VMALLOC: u32 = 18;
 
 /// What the RV64 kernel prints from the banner to the ticks, with the
 /// `[dbg]` line's pc masked.
@@ -644,6 +645,20 @@ fn misuses_panic() {
         assert_eq!(r, RunResult::Exited(PANIC_EXIT), "fault {fault}:\n{out}");
         assert!(out.ends_with(want), "fault {fault}: want {want:?}, got:\n{out}");
     }
+}
+
+#[test]
+fn pa_of_a_vmalloc_address_panics() {
+    // pa() of the UART's ioremap() address: in the vmalloc area, where a
+    // virtual address has no physical one to compute (Linux's
+    // CONFIG_DEBUG_VIRTUAL check), so it panics instead of giving a wrong one.
+    let (k, r, out) = run_with_fault(BOOT_FAULT_PA_VMALLOC);
+    assert_eq!(r, RunResult::Exited(PANIC_EXIT), "output:\n{out}");
+    let uart = k.read64(k.sym("uart_regs"));
+    let want = format!(
+        "pa: {uart:#018x} is neither in the direct map nor in the kernel image\npanic: pa: no physical address\n"
+    );
+    assert!(out.ends_with(&want), "want {want:?}, got:\n{out}");
 }
 
 #[test]

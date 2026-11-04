@@ -114,13 +114,15 @@ static u32 request(u32 dev, u32 cmd, u32 sector, uintptr buf, u32 count) {
     d->busy = true;
     d->done = false;
     /* The device wants the buffer's physical address (it does not use the
-     * MMU): pa() of the kernel pointer, which on RV32 is the same number. */
+     * MMU): pa() of the kernel pointer, which on RV32 is the same number. A
+     * command without data (a flush) has no buffer, and 0 there. */
+    phys_addr_t dma = buf != 0 ? pa(buf) : 0;
 #if __riscv_xlen == 64
     mmio_write64(d->base + BLK_SECTOR, sector);
-    mmio_write64(d->base + BLK_DMA, pa(buf));
+    mmio_write64(d->base + BLK_DMA, dma);
 #else
     mmio_write32(d->base + BLK_SECTOR, sector);
-    mmio_write32(d->base + BLK_DMA, pa(buf));
+    mmio_write32(d->base + BLK_DMA, dma);
 #endif
     mmio_write32(d->base + BLK_COUNT, count);
     mmio_write32(d->base + BLK_CMD, cmd);

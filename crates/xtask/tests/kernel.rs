@@ -4178,7 +4178,9 @@ fn disk_blocks_round_trip_through_the_cache_with_interrupts() {
     assert_eq!(failed.len(), 3, "{failed:?}");
     assert_eq!((failed[0].0, failed[0].2), (past_end, blk_error::OUT_OF_RANGE));
     assert_eq!((failed[1].0, failed[1].2), (past_end, blk_error::OUT_OF_RANGE));
-    assert_eq!((failed[2].1, failed[2].2), (0x1000, blk_error::BAD_DMA));
+    // The page after the end of RAM (the self-test's buffer outside RAM).
+    let ram_end = RAM_BASE as u32 + grail::DEFAULT_RAM_SIZE as u32;
+    assert_eq!((failed[2].1, failed[2].2), (ram_end, blk_error::BAD_DMA));
 
     // The cache: every bread() that missed read one block into a buffer, and
     // the hits needed no request at all.

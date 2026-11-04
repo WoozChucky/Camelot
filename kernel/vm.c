@@ -103,6 +103,20 @@ extern pte_t early_pg_dir[];
 extern pte_t early_tables[];
 #endif
 
+#if __riscv_xlen == 64
+phys_addr_t kernel_pa(uintptr v) {
+    if (v >= KERNEL_LINK_ADDR && v <= (uintptr)__kernel_end) {
+        return v - va_kernel_pa_offset;
+    }
+    if (v >= PAGE_OFFSET && v - PAGE_OFFSET < direct_map_size) {
+        return v - va_pa_offset;
+    }
+    kprintf("pa: %p is neither in the direct map nor in the kernel image\n", (void *)v);
+    panic("pa: no physical address");
+    return 0; /* not reached: panic() stops the machine */
+}
+#endif
+
 pagetable_t pagetable_create(void) {
     return kzalloc();
 }
