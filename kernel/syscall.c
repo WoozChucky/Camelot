@@ -299,6 +299,9 @@ void syscall(struct trap_frame *f) {
     case SYS_futex_wake:
         ret = futex_wake(arg(f, 0), (i32)arg(f, 1));
         break;
+    case SYS_fcntl:
+        ret = sys_fcntl(f);
+        break;
     default:
         ret = -ENOSYS;
         break;

@@ -3311,10 +3311,9 @@ fn killing_stress_workers_mid_run_leaves_no_lock_held() {
     let (mut m, elf) = load_committed_on(MachineConfig::default(), Some(rx));
     step_to_prompt(&mut m, 1);
     let before = free_pages(&m, &elf);
-    // stress is pid 2 and its workers 4 to 7 (the shell starts `sleep 3`, pid
-    // 3, before stress spawns them); by the end of the sleep each is a few
+    // stress is pid 2; by the end of the sleep each of its workers is a few
     // rounds in, so the kills land in the middle of their work.
-    for b in format!("{LINE}\nsleep 3\nps\nkill 4\nkill 6\nwait\n").bytes() {
+    for b in format!("{LINE}\nsleep 3\nps\n").bytes() {
         tx.send(b).unwrap();
     }
     let mut locks = LockWatch::new(&elf);
@@ -3322,19 +3321,35 @@ fn killing_stress_workers_mid_run_leaves_no_lock_held() {
         &mut m,
         RUN_MAX_STEPS,
         |cpu| locks.step(cpu),
+        |m| {
+            let out = printed(m);
+            out.find(&format!("{PROMPT}ps\n"))
+                .is_some_and(|at| out[at + 3..].contains(&format!("\n{PROMPT}")))
+        },
+    );
+    // ps shows the workers, stress's children, spawned in order: worker 1 has
+    // the lowest pid. Whether the shell's `sleep 3` or the first workers came
+    // first depends on who ran first, so the pids are read, not assumed.
+    let out = printed(&m);
+    let mut workers: Vec<u32> = command_output(&out, "ps")
+        .iter()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.len() == 5 && f[1] == "2" && f[4] == "stress").then(|| f[0].parse().unwrap())
+        })
+        .collect();
+    workers.sort();
+    assert_eq!(workers.len(), 4, "{out}");
+    for b in format!("kill {}\nkill {}\nwait\n", workers[0], workers[2]).bytes() {
+        tx.send(b).unwrap();
+    }
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |cpu| locks.step(cpu),
         |m| m.cpu.bus.uart.captured.ends_with(b"[2] stress: exit 1\n$ "),
     );
     let out = printed(&m);
-    // ps shows whom the kills hit: two of stress's children.
-    for pid in ["4", "6"] {
-        assert!(
-            command_output(&out, "ps").iter().any(|l| {
-                let f: Vec<&str> = l.split_whitespace().collect();
-                f.len() == 5 && f[0] == pid && f[1] == "2" && f[4] == "stress"
-            }),
-            "{out}"
-        );
-    }
     let lines: Vec<&str> = out[out.find(&format!("{PROMPT}{LINE}\n")).unwrap()..]
         .lines()
         .collect();
@@ -3378,9 +3393,10 @@ fn a_heap_that_runs_out_of_memory_gives_back_what_it_took() {
     let out = run_processes_on(config, format!("{LINE}\nexit\n").as_bytes());
     assert_eq!(command_output(&out, LINE), ["systest: sbrk 3000000: 0"]);
 
-    // ...but a 2 MiB one runs out of them after mapping some.
+    // ...but a 3 MiB one runs out of them after mapping some (2 MiB, most of it
+    // the kernel with its embedded programs, leaves systest too few to start in).
     let config = MachineConfig {
-        ram_size: 2 << 20,
+        ram_size: 3 << 20,
         ..MachineConfig::default()
     };
     let (tx, rx) = std::sync::mpsc::channel();
@@ -3775,7 +3791,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 46, "{calls:?}");
+    assert_eq!(calls.len(), 47, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()

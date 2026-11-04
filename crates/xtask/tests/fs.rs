@@ -1342,7 +1342,7 @@ const PROMPT: &str = "$ ";
 
 /// Checks `filetest` makes on the root image, and `filetest ro` on a
 /// read-only one (kernel/user/filetest.c).
-const FILETEST_CHECKS: u32 = 168;
+const FILETEST_CHECKS: u32 = 171;
 const FILETEST_RO_CHECKS: u32 = 14;
 
 /// What the shell printed after reading `command`, up to its next prompt.
