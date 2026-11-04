@@ -1224,18 +1224,28 @@ impl Assembler {
         }
         let base = self.section_size(".debug_line");
         let str_base = self.section_size(".debug_line_str");
-        let table = dwarf::encode(&root.dir, &root, &files, &sequences, base, str_base);
+        // An address is as wide as the target's registers: 4 bytes on RV32,
+        // 8 on RV64 (DWARF's address_size).
+        let address_size = (self.xlen.bits() / 8) as u8;
+        let table = dwarf::encode(&root.dir, &root, &files, &sequences, base, str_base, address_size);
         let (line_sec, _) = self.append(".debug_line", &table.line);
         let (str_sec, _) = self.append(".debug_line_str", &table.line_str);
+        // A string's offset is a 4-byte DWARF32 field on both widths
+        // (R_RISCV_32, as clang writes it); a code address is R_RISCV_32 on
+        // RV32 and R_RISCV_64 on RV64.
+        let address = match self.xlen {
+            Xlen::Rv32 => RelocKind::Abs32,
+            Xlen::Rv64 => RelocKind::Abs64,
+        };
         for (at, target) in table.fixups {
-            let (sec, addend) = match target {
-                dwarf::Target::LineStr(off) => (str_sec, off),
-                dwarf::Target::Section(sec, off) => (sec, off),
+            let (sec, addend, kind) = match target {
+                dwarf::Target::LineStr(off) => (str_sec, off, RelocKind::Abs32),
+                dwarf::Target::Section(sec, off) => (sec, off, address),
             };
             let symbol = self.section_symbol(sec);
             self.sections[line_sec].relocs.push(Reloc {
                 offset: at,
-                kind: RelocKind::Abs32,
+                kind,
                 symbol,
                 addend: addend.into(),
                 line,
