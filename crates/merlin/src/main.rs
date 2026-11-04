@@ -1,4 +1,4 @@
-//! `merlin [-o out.s] [-I dir] [-D name[=value]] [-U name] [-g] [-E | --dump-ast] input.c...`
+//! `merlin [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]] [-U name] [-g] [-E | --dump-ast] input.c...`
 
 use merlin::{CmdMacro, Options};
 use std::path::{Path, PathBuf};
@@ -6,6 +6,9 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: merlin [options] input.c...
 
+  -march=ISA        rv32ima_zicsr_zifencei (default) or rv64ima_zicsr_zifencei
+  -mabi=ABI         ilp32 for rv32 (the default), lp64 for rv64: the one
+                    the ISA has (merlin has no floating point)
   -o FILE           output file (default: each input with a .s extension;
                     with -E, standard output); needs a single input
   -I DIR            look for #include files in DIR (after the including
@@ -56,6 +59,7 @@ fn run() -> ExitCode {
     let mut opts = Options::default();
     let mut debug = false;
     let mut comp_dir = None;
+    let mut abi = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         // `-I dir` or `-Idir`, and the same for -D, -U and -o.
@@ -82,6 +86,12 @@ fn run() -> ExitCode {
                 }
             }
             "--dump-ast" => mode = Mode::DumpAst,
+            // `-march=ISA` and `-mabi=ABI` only, as clang takes them.
+            _ if a.starts_with("-march=") => match merlin::parse_march(&a["-march=".len()..]) {
+                Ok(x) => opts.xlen = x,
+                Err(e) => return usage_error(&e),
+            },
+            _ if a.starts_with("-mabi=") => abi = Some(a["-mabi=".len()..].to_string()),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -105,6 +115,11 @@ fn run() -> ExitCode {
             _ if a.starts_with('-') => return usage_error(&format!("unknown option {a}")),
             _ => inputs.push(a),
         }
+    }
+    // The ABI must be the ISA's, whichever of the two came first; clang calls
+    // any other an unknown one (`-mabi=lp64` with an RV32 `-march` too).
+    if let Some(abi) = abi.filter(|a| a != merlin::abi_name(opts.xlen)) {
+        return usage_error(&format!("unknown target ABI '{abi}'"));
     }
     if debug {
         let comp_dir = comp_dir.unwrap_or_else(|| {

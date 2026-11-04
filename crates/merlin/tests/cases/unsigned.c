@@ -1,7 +1,8 @@
 // expect: 30
 // Unsigned arithmetic wraps, divides and compares as unsigned, and shifts in
 // zeros; mixing int and unsigned converts the int (the usual arithmetic
-// conversions). long is 32 bits, like int.
+// conversions). long is 32 bits on ILP32, like int, and 64 on LP64, as
+// __SIZEOF_LONG__ says.
 int main() {
     unsigned u = 0;
     u = u - 1;                                   // 4294967295
@@ -19,7 +20,7 @@ int main() {
     unsigned long ul = 3000000000u;
     r += (ul > 2000000000) + (ul / 1000000 == 3000);   // 26
     long l = -5;
-    r += (l * 2 == -10) + (sizeof l == 4);       // 28
+    r += (l * 2 == -10) + (sizeof l == __SIZEOF_LONG__ && sizeof l == __riscv_xlen / 8); // 28
     unsigned big = 0x80000000;
     r += (big >> 31) + ((int)big >> 31 == -1);   // 30
     return r;

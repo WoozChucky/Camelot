@@ -5,13 +5,15 @@
 //! → [`codegen`]. [`parse_with`] runs the front end and returns a checked,
 //! typed AST; [`compile_with`] goes all the way to assembly text, one
 //! translation unit at a time ([`parse`] and [`compile`] for a source with no
-//! headers). [`types`] has the C types and their ILP32 layout, [`consteval`]
-//! evaluates constant expressions, and [`abi`] says how arguments and results
-//! travel (the RISC-V ILP32 calling convention).
+//! headers). The target is [`Options::xlen`] (`-march`): RV32 with the
+//! ILP32 ABI, the default until #159, or RV64 with LP64. [`types`] has the C
+//! types and their layout on each, [`consteval`] evaluates constant
+//! expressions, and [`abi`] says how arguments and results travel (the
+//! RISC-V integer calling convention).
 //!
-//! The language (spec section 10) is a subset of C99 without floating point
-//! and `long long`: the C99 preprocessor, the integer types (`_Bool`, `char`,
-//! `short`, `int`, `long`, signed and unsigned), `enum`, pointers (to
+//! The language (spec section 10) is a subset of C99 without floating point:
+//! the C99 preprocessor, the integer types (`_Bool`, `char`, `short`, `int`,
+//! `long`, `long long`, signed and unsigned), `enum`, pointers (to
 //! functions too), arrays, structs and unions (passed and returned by value
 //! as clang does), `typedef`, the `const` and `volatile` qualifiers, global
 //! and `static` variables with initializers (designators included), compound
@@ -110,6 +112,34 @@ impl fmt::Display for Error {
     }
 }
 
+/// The `-march=` values merlin takes, and the width each one means: the two
+/// ISAs merlin-as assembles, as clang spells them.
+pub const MARCH: &[(&str, types::Xlen)] = &[
+    ("rv32ima_zicsr_zifencei", types::Xlen::Rv32),
+    ("rv64ima_zicsr_zifencei", types::Xlen::Rv64),
+];
+
+/// Reads the value of `-march=`: one of [`MARCH`].
+pub fn parse_march(s: &str) -> Result<types::Xlen, String> {
+    MARCH
+        .iter()
+        .find(|(name, _)| *name == s)
+        .map(|&(_, x)| x)
+        .ok_or_else(|| {
+            let takes: Vec<&str> = MARCH.iter().map(|&(name, _)| name).collect();
+            format!("unsupported -march '{s}' (merlin takes {})", takes.join(" or "))
+        })
+}
+
+/// The ABI of each width, as `-mabi=` names it: `ilp32` for RV32, `lp64`
+/// for RV64 (soft-float: merlin has no floating point).
+pub fn abi_name(x: types::Xlen) -> &'static str {
+    match x {
+        types::Xlen::Rv32 => "ilp32",
+        types::Xlen::Rv64 => "lp64",
+    }
+}
+
 /// The name [`parse`] and [`compile`] give their source (for `__FILE__`).
 pub const INPUT_NAME: &str = "<input>";
 
@@ -140,22 +170,22 @@ pub fn preprocess(
 /// every error it finds. Errors in headers have their [`Error::file`] set.
 pub fn parse_with(name: &str, src: &str, opts: &Options, load: Loader) -> Result<ast::Program, Vec<Error>> {
     let pp = preprocess(name, src, opts, load)?;
-    check(&pp).map_err(|errors| pp.name_files(errors))
+    check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))
 }
 
 /// Compiles one translation unit to assembly text for merlin-as.
 pub fn compile_with(name: &str, src: &str, opts: &Options, load: Loader) -> Result<String, Vec<Error>> {
     let pp = preprocess(name, src, opts, load)?;
     let debug = opts.debug.as_ref().map(|d| (d, pp.files.as_slice()));
-    check(&pp)
+    check(&pp, opts.xlen)
         .and_then(|prog| codegen::generate_with(&prog, debug).map_err(|e| vec![e]))
         .map_err(|errors| pp.name_files(errors))
 }
 
 /// The front end after the preprocessor: tokens, syntax tree, checks.
-fn check(pp: &preprocess::Output) -> Result<ast::Program, Vec<Error>> {
-    let toks = lexer::finish(pp.tokens.clone(), pp.end).map_err(|e| vec![e])?;
-    let mut prog = parser::parse(&toks).map_err(|e| vec![e])?;
+fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec<Error>> {
+    let toks = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|e| vec![e])?;
+    let mut prog = parser::parse(&toks, xlen).map_err(|e| vec![e])?;
     sema::check(&mut prog)?;
     Ok(prog)
 }

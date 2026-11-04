@@ -127,16 +127,14 @@ static void ls(const char *dir) {
 /* ---- Read checks ---- */
 
 /* The root's entries other than `.` and `..` that namei() didn't find as
- * themselves, the first regular file there, and how many entries. */
+ * themselves, and the first regular file there. */
 static u32 entries_wrong;
-static u32 entries_seen;
 static char first_file[DIRSIZ + 1];
 
 static void check_entry(const char *name, u32 inum) {
     if (namecmp(name, ".") == 0 || namecmp(name, "..") == 0) {
         return;
     }
-    entries_seen++;
     int err;
     struct inode *ip = namei(join("/", name), &err);
     if (ip == NULL || ip->inum != inum) {
@@ -263,7 +261,6 @@ static void read_checks(void) {
     check(all, "every spelling of / finds the root");
 
     entries_wrong = 0;
-    entries_seen = 0;
     first_file[0] = 0;
     for_each_entry("/", check_entry);
     check(entries_wrong == 0, "every entry of / is found by its path");
@@ -983,7 +980,7 @@ static void grow_test(void) {
                 iput(pad);
                 end_op();
             }
-            u32 logged;
+            u32 logged = 0;
             ok = ok && append_logged(g[f], k, 21 + f, &logged) == BSIZE;
             worst = logged > worst ? logged : worst;
             if (f != 0 || !ok) {

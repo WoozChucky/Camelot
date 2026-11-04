@@ -56,7 +56,7 @@ const STEPS: &[Step] = &[
         args: &["-p", "merlin-objdump", "--tests"],
     },
     Step {
-        what: "merlin: the compiler end to end",
+        what: "merlin: the compiler end to end, both widths",
         args: &["-p", "merlin", "--tests"],
     },
     Step {

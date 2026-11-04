@@ -635,7 +635,7 @@ fn merge_warnings(layout: &Layout) -> Vec<String> {
         }
         if dup_bytes > 0 {
             warnings.push(format!(
-                "{}: mergeable (SHF_MERGE) input sections hold {dup_bytes} bytes of duplicate strings or \
+                "{}{MERGE_WARNING}{dup_bytes} bytes of duplicate strings or \
                  constants; merlin-ld keeps them (it does not merge), so this section is larger than \
                  ld.lld's and the addresses after it differ",
                 os.name
@@ -643,6 +643,17 @@ fn merge_warnings(layout: &Layout) -> Vec<String> {
         }
     }
     warnings
+}
+
+/// What a [`merge_warnings`] warning says after its output section's name.
+const MERGE_WARNING: &str = ": mergeable (SHF_MERGE) input sections hold ";
+
+/// Whether `warning`, one of [`Layout::warnings`], is the one about the
+/// duplicates merlin-ld keeps in mergeable sections, which clang's objects
+/// give it when two of them hold the same string literal: the program runs
+/// the same, only its layout differs from ld.lld's.
+pub fn is_merge_warning(warning: &str) -> bool {
+    warning.contains(MERGE_WARNING)
 }
 
 /// Whether a section loaded at `lma` with `size` bytes fits the class's

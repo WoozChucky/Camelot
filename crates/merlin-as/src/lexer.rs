@@ -186,6 +186,10 @@ fn lex_quoted(s: &[u8], mut i: usize, quote: u8, line: usize) -> Result<(Vec<u8>
                     b'n' => b'\n',
                     b't' => b'\t',
                     b'r' => b'\r',
+                    // Backspace and form feed, as llvm-mc reads them: clang
+                    // writes bytes 8 and 12 this way (`"\001\002\004\b"`).
+                    b'b' => 0x08,
+                    b'f' => 0x0c,
                     // Octal, one to three digits, as GNU as and llvm-mc read
                     // them: `\0`, `\12`, `\377` (what clang writes for bytes
                     // that aren't printable). A value above 0o377 is no byte.
@@ -269,6 +273,10 @@ mod tests {
     #[test]
     fn strings() {
         assert_eq!(toks(r#".asciz "hi\n\x41""#)[1], Tok::Str(b"hi\nA".to_vec()));
+        assert_eq!(
+            toks(r#".ascii "\b\f\t\r\"\\""#)[1],
+            Tok::Str(vec![8, 12, 9, 13, b'"', b'\\'])
+        );
     }
 
     #[test]

@@ -1,22 +1,23 @@
-# Hand-written assembly linked with the C files: functions C calls, one that
-# calls back into C, and data C reads.
+# util.rv32.s for RV64: the same functions and data, with `ra` saved as a
+# doubleword and the int arithmetic in W instructions, which keep a 32-bit
+# result sign-extended as the calling convention wants it.
 
     .text
     .globl triple
 # int triple(int x)
 triple:
-    slli  t0, a0, 1
-    add   a0, a0, t0
+    slliw t0, a0, 1
+    addw  a0, a0, t0
     ret
 
     .globl square_plus_one
 # int square_plus_one(int x): square(x) + 1, with square in main.c.
 square_plus_one:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
+    sd    ra, 8(sp)
     call  square
-    addi  a0, a0, 1
-    lw    ra, 12(sp)
+    addiw a0, a0, 1
+    ld    ra, 8(sp)
     addi  sp, sp, 16
     ret
 

@@ -103,7 +103,12 @@ struct thread {
 /* The kernel tests walk threads[] by this size and read the fields up to
  * `kstack` at their offsets (state 0, tid 4, proc 8, kstack 12). */
 #define THREAD_SIZE 96
+/* RV32 layouts, this one and PROC_SIZE: on RV64 (a compiler's check of the
+ * kernel, which does not run there yet) struct thread and struct proc are
+ * re-laid out by #155. */
+#if __riscv_xlen == 32
 _Static_assert(sizeof(struct thread) == THREAD_SIZE, "the tests index threads[] by THREAD_SIZE");
+#endif
 
 /* The fields up to `parent` are at fixed offsets (state 0, pid 4, name 8,
  * parent 24): the kernel tests read them.
@@ -170,7 +175,9 @@ struct proc {
 
 /* The tests walk procs[] by this size (and read pagetable at 32). */
 #define PROC_SIZE 168
+#if __riscv_xlen == 32
 _Static_assert(sizeof(struct proc) == PROC_SIZE, "the tests index procs[] by PROC_SIZE");
+#endif
 
 /* A user program embedded in the kernel image as an ELF executable
  * (userprogs.s, generated from kernel/user/ by `cargo xtask kernel`):

@@ -47,6 +47,7 @@ pub fn compile_c(dir: &Path, file: &str, include_dirs: &[&str], comp_dir: &str) 
     let opts = merlin::Options {
         include_dirs: include_dirs.iter().map(PathBuf::from).collect(),
         macros: Vec::new(),
+        xlen: merlin::types::Xlen::Rv32,
         debug: DEBUG_INFO.get().then(|| merlin::DebugInfo {
             comp_dir: comp_dir.into(),
         }),
@@ -77,6 +78,23 @@ pub fn assemble(name: &str, text: &str) -> Result<Vec<u8>, String> {
 /// `dir`). merlin-ld's warnings are errors here: a kernel or a program
 /// should link cleanly. `what` names the result in errors.
 pub fn link(dir: &Path, script: &str, inputs: &[merlin_ld::Input], what: &str) -> Result<Vec<u8>, String> {
+    link_with(dir, script, inputs, what, false)
+}
+
+/// [`link`], but with `clang_objects` the warning that mergeable sections
+/// hold duplicates ([`merlin_ld::layout::is_merge_warning`]) is not an
+/// error. merlin never writes mergeable sections, but clang puts string
+/// literals in them, and two files of a program built by clang (the
+/// reference build's `as` and `ld`) share some; merlin-ld keeps every copy
+/// where ld.lld keeps one, and the program runs the same. Any other
+/// warning is still an error.
+pub fn link_with(
+    dir: &Path,
+    script: &str,
+    inputs: &[merlin_ld::Input],
+    what: &str,
+    clang_objects: bool,
+) -> Result<Vec<u8>, String> {
     let path = dir.join(script);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let opts = merlin_ld::Options {
@@ -90,7 +108,8 @@ pub fn link(dir: &Path, script: &str, inputs: &[merlin_ld::Input], what: &str) -
         let lines: Vec<String> = errors.iter().map(|e| format!("merlin-ld: error: {e}")).collect();
         format!("linking {what}:\n{}", lines.join("\n"))
     })?;
-    if let Some(w) = linked.layout.warnings.first() {
+    let tolerated = |w: &String| clang_objects && merlin_ld::layout::is_merge_warning(w);
+    if let Some(w) = linked.layout.warnings.iter().find(|w| !tolerated(w)) {
         return Err(format!("linking {what}: merlin-ld: warning: {w}"));
     }
     Ok(linked.elf)
@@ -166,6 +185,38 @@ mod tests {
         assert!(link(&dir, "none.ld", &inputs, "t")
             .unwrap_err()
             .contains("cannot read"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_strings_are_an_error_but_for_clang_objects() {
+        let dir = scratch("merge");
+        let sections = "SECTIONS { . = 0x1000; .text : { *(.text*) } .rodata : { *(.rodata*) } }\n";
+        std::fs::write(dir.join("t.ld"), format!("ENTRY(_start)\n{sections}")).unwrap();
+        // Two objects with the same string literal, as clang writes them.
+        let strings = |name: &str, start: &str| merlin_ld::Input {
+            name: name.into(),
+            data: assemble(
+                name,
+                &format!("{start}    .section .rodata.str1.1,\"aMS\",@progbits,1\n    .asciz \"same\"\n"),
+            )
+            .unwrap(),
+        };
+        let inputs = [
+            strings("a.o", "    .globl _start\n_start:\n    ret\n"),
+            strings("b.o", ""),
+        ];
+        let err = link(&dir, "t.ld", &inputs, "t").unwrap_err();
+        assert!(
+            err.starts_with("linking t: merlin-ld: warning: .rodata: mergeable (SHF_MERGE)"),
+            "{err}"
+        );
+        assert!(link_with(&dir, "t.ld", &inputs, "t", true).is_ok());
+        // Any other warning is still an error: here, no entry symbol.
+        std::fs::write(dir.join("u.ld"), sections).unwrap();
+        let err = link_with(&dir, "u.ld", &inputs[1..], "t", true).unwrap_err();
+        assert!(err.starts_with("linking t: merlin-ld: warning: "), "{err}");
+        assert!(!err.contains("SHF_MERGE"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

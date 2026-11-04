@@ -27,7 +27,7 @@
 //!   apostrophe in a sentence too).
 //! * `#error` stops with its text; `#line N "name"` renumbers the lines
 //!   that follow; `#` alone does nothing. Any other directive is an error.
-//! * `__FILE__` and `__LINE__`, and a few predefined macros ([`PREDEFINED`]).
+//! * `__FILE__` and `__LINE__`, and a few predefined macros ([`predefined`]).
 //!
 //! ## Macro replacement
 //!
@@ -57,6 +57,7 @@
 //! their own.
 
 use crate::lexer::{self, PpKind, PpToken};
+use crate::types::Xlen;
 use crate::{Error, Pos};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
@@ -72,8 +73,9 @@ pub enum CmdMacro {
     Undef(String),
 }
 
-/// What the command line tells the preprocessor.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// What the command line tells the compiler: the preprocessor's options,
+/// the target and `-g`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     /// `-I`: where `#include` looks, in order (after the including file's
     /// own directory, for `#include "..."`).
@@ -82,29 +84,108 @@ pub struct Options {
     pub macros: Vec<CmdMacro>,
     /// `-g`: debug information, for the code generator.
     pub debug: Option<crate::DebugInfo>,
+    /// `-march`: RV32 (ILP32) or RV64 (LP64).
+    pub xlen: Xlen,
+}
+
+impl Default for Options {
+    /// No `-I`, `-D` or `-g`, for RV32 (the default until #159).
+    fn default() -> Options {
+        Options {
+            include_dirs: Vec::new(),
+            macros: Vec::new(),
+            debug: None,
+            xlen: Xlen::Rv32,
+        }
+    }
 }
 
 /// Reads the file at a path for `#include`, or `None` if there is none.
 pub type Loader<'a> = &'a dyn Fn(&Path) -> Option<String>;
 
 /// Macros every translation unit starts with. merlin compiles freestanding
-/// C99 for RISC-V ILP32, with plain `char` unsigned, so it says what clang
-/// says for `--target=riscv32 -ffreestanding -std=c99` about those, and
-/// `__merlin__` says who is compiling.
-pub const PREDEFINED: &[(&str, &str)] = &[
-    ("__STDC__", "1"),
-    ("__STDC_VERSION__", "199901L"),
-    ("__STDC_HOSTED__", "0"),
-    ("__merlin__", "1"),
-    ("__riscv", "1"),
-    ("__riscv_xlen", "32"),
-    ("__ILP32__", "1"),
-    ("__CHAR_BIT__", "8"),
-    ("__CHAR_UNSIGNED__", "1"),
-    ("__SIZEOF_INT__", "4"),
-    ("__SIZEOF_LONG__", "4"),
-    ("__SIZEOF_POINTER__", "4"),
-];
+/// C99 for RISC-V, ILP32 on RV32 and LP64 on RV64, with plain `char`
+/// unsigned, so it says what clang says for `--target=riscv32 -mabi=ilp32`
+/// and `--target=riscv64 -mabi=lp64` (`-ffreestanding -std=c99`) about
+/// those, and `__merlin__` says who is compiling.
+pub fn predefined(x: Xlen) -> Vec<(&'static str, &'static str)> {
+    let mut macros = vec![
+        ("__STDC__", "1"),
+        ("__STDC_VERSION__", "199901L"),
+        ("__STDC_HOSTED__", "0"),
+        ("__merlin__", "1"),
+        ("__riscv", "1"),
+    ];
+    match x {
+        Xlen::Rv32 => macros.extend([("__riscv_xlen", "32"), ("_ILP32", "1"), ("__ILP32__", "1")]),
+        Xlen::Rv64 => macros.extend([("__riscv_xlen", "64"), ("_LP64", "1"), ("__LP64__", "1")]),
+    }
+    // The sizes and limits of the integer types, and the types <stddef.h>
+    // and <stdint.h> are made of, spelled as clang spells them. ILP32 builds
+    // size_t, ptrdiff_t and intptr_t from int and int64_t from long long;
+    // LP64 builds all of them from long. The 8-, 16- and 32-bit types are the
+    // same on both.
+    macros.extend([
+        ("__CHAR_BIT__", "8"),
+        ("__CHAR_UNSIGNED__", "1"),
+        ("__SIZEOF_SHORT__", "2"),
+        ("__SIZEOF_INT__", "4"),
+        ("__SIZEOF_LONG_LONG__", "8"),
+        ("__SCHAR_MAX__", "127"),
+        ("__SHRT_MAX__", "32767"),
+        ("__INT_MAX__", "2147483647"),
+        ("__LONG_LONG_MAX__", "9223372036854775807LL"),
+        ("__INT8_TYPE__", "signed char"),
+        ("__INT16_TYPE__", "short"),
+        ("__INT32_TYPE__", "int"),
+        ("__UINT8_TYPE__", "unsigned char"),
+        ("__UINT16_TYPE__", "unsigned short"),
+        ("__UINT32_TYPE__", "unsigned int"),
+        ("__INT32_MAX__", "2147483647"),
+        ("__UINT32_MAX__", "4294967295U"),
+    ]);
+    match x {
+        Xlen::Rv32 => macros.extend([
+            ("__SIZEOF_LONG__", "4"),
+            ("__SIZEOF_POINTER__", "4"),
+            ("__SIZEOF_SIZE_T__", "4"),
+            ("__SIZEOF_PTRDIFF_T__", "4"),
+            ("__LONG_MAX__", "2147483647L"),
+            ("__SIZE_TYPE__", "unsigned int"),
+            ("__PTRDIFF_TYPE__", "int"),
+            ("__INTPTR_TYPE__", "int"),
+            ("__UINTPTR_TYPE__", "unsigned int"),
+            ("__INT64_TYPE__", "long long int"),
+            ("__UINT64_TYPE__", "long long unsigned int"),
+            ("__SIZE_MAX__", "4294967295U"),
+            ("__PTRDIFF_MAX__", "2147483647"),
+            ("__INTPTR_MAX__", "2147483647"),
+            ("__UINTPTR_MAX__", "4294967295U"),
+            ("__INT64_MAX__", "9223372036854775807LL"),
+            ("__UINT64_MAX__", "18446744073709551615ULL"),
+        ]),
+        Xlen::Rv64 => macros.extend([
+            ("__SIZEOF_LONG__", "8"),
+            ("__SIZEOF_POINTER__", "8"),
+            ("__SIZEOF_SIZE_T__", "8"),
+            ("__SIZEOF_PTRDIFF_T__", "8"),
+            ("__LONG_MAX__", "9223372036854775807L"),
+            ("__SIZE_TYPE__", "long unsigned int"),
+            ("__PTRDIFF_TYPE__", "long int"),
+            ("__INTPTR_TYPE__", "long int"),
+            ("__UINTPTR_TYPE__", "long unsigned int"),
+            ("__INT64_TYPE__", "long int"),
+            ("__UINT64_TYPE__", "long unsigned int"),
+            ("__SIZE_MAX__", "18446744073709551615UL"),
+            ("__PTRDIFF_MAX__", "9223372036854775807L"),
+            ("__INTPTR_MAX__", "9223372036854775807L"),
+            ("__UINTPTR_MAX__", "18446744073709551615UL"),
+            ("__INT64_MAX__", "9223372036854775807L"),
+            ("__UINT64_MAX__", "18446744073709551615UL"),
+        ]),
+    }
+    macros
+}
 
 /// How deeply `#include`s may nest (clang's limit too).
 const MAX_INCLUDE_DEPTH: usize = 200;
@@ -364,7 +445,7 @@ impl Pp<'_> {
     fn run(&mut self, src: &str) -> Result<(Vec<PpToken>, Pos), Error> {
         // The predefined macros, then -D and -U, as directives of their own
         // files.
-        let mut builtin: String = PREDEFINED
+        let mut builtin: String = predefined(self.opts.xlen)
             .iter()
             .map(|(name, value)| format!("#define {name} {value}\n"))
             .collect();
@@ -1829,6 +1910,7 @@ puts( "The first, second, and third items." );
         );
         // `<...>` and `"..."` both look in the -I directories, in order.
         let opts = Options {
+            xlen: Xlen::Rv32,
             include_dirs: vec![PathBuf::from("inc"), PathBuf::from("sub")],
             macros: Vec::new(),
             debug: None,
@@ -2137,6 +2219,7 @@ puts( "The first, second, and third items." );
     #[test]
     fn command_line_macros() {
         let opts = Options {
+            xlen: Xlen::Rv32,
             include_dirs: Vec::new(),
             macros: vec![
                 CmdMacro::Define("ONE".into()),
@@ -2152,6 +2235,7 @@ puts( "The first, second, and third items." );
         let out = run(&[], "ONE TWO F(3) GONE __merlin__ __STDC_VERSION__", &opts).unwrap();
         assert_eq!(words(&out.tokens), same("1 22 (3+1) GONE __merlin__ 199901L"));
         let opts = Options {
+            xlen: Xlen::Rv32,
             include_dirs: Vec::new(),
             macros: vec![CmdMacro::Define("1X".into())],
             debug: None,
@@ -2167,6 +2251,51 @@ puts( "The first, second, and third items." );
         assert_eq!(
             pp("__STDC__ __STDC_HOSTED__ __merlin__ __riscv __riscv_xlen __ILP32__ __CHAR_UNSIGNED__"),
             same("1 0 1 1 32 1 1")
+        );
+        let names =
+            "__riscv_xlen _ILP32 __ILP32__ _LP64 __LP64__ __SIZEOF_INT__ __SIZEOF_LONG__ __SIZEOF_POINTER__";
+        assert_eq!(pp(names), same("32 1 1 _LP64 __LP64__ 4 4 4"));
+        // RV64 is LP64, as clang's `--target=riscv64 -mabi=lp64` says.
+        let opts = Options {
+            xlen: Xlen::Rv64,
+            ..Options::default()
+        };
+        let out = run(&[], names, &opts).unwrap();
+        assert_eq!(words(&out.tokens), same("64 _ILP32 __ILP32__ 1 1 4 8 8"));
+    }
+
+    #[test]
+    fn predefined_types_and_limits() {
+        // What clang's `-E -dM` says for each width (the ignored harness test
+        // predefined_macros_match_clang checks every one against clang).
+        let names = "__SIZE_TYPE__, __PTRDIFF_TYPE__, __INTPTR_TYPE__, __UINTPTR_TYPE__, \
+                     __INT64_TYPE__, __UINT64_TYPE__, __SIZEOF_SIZE_T__, __SIZEOF_PTRDIFF_T__, \
+                     __SIZEOF_SHORT__, __CHAR_BIT__, __INT_MAX__, __LONG_MAX__, __LONG_LONG_MAX__, \
+                     __SIZE_MAX__, __UINT64_MAX__, __INT8_TYPE__, __UINT16_TYPE__";
+        let expand = |x: Xlen| {
+            let opts = Options {
+                xlen: x,
+                ..Options::default()
+            };
+            spell(&run(&[], names, &opts).unwrap().tokens)
+        };
+        assert_eq!(
+            expand(Xlen::Rv32),
+            concat!(
+                "unsigned int, int, int, unsigned int, ",
+                "long long int, long long unsigned int, 4, 4, ",
+                "2, 8, 2147483647, 2147483647L, 9223372036854775807LL, ",
+                "4294967295U, 18446744073709551615ULL, signed char, unsigned short\n",
+            )
+        );
+        assert_eq!(
+            expand(Xlen::Rv64),
+            concat!(
+                "long unsigned int, long int, long int, long unsigned int, ",
+                "long int, long unsigned int, 8, 8, ",
+                "2, 8, 2147483647, 9223372036854775807L, 9223372036854775807LL, ",
+                "18446744073709551615UL, 18446744073709551615UL, signed char, unsigned short\n",
+            )
         );
     }
 

@@ -324,6 +324,7 @@ fn mergeable_strings_are_not_merged() {
         "{}",
         l.warnings[0]
     );
+    assert!(merlin_ld::layout::is_merge_warning(&l.warnings[0]));
     let lld = expected("merge/link");
     let ours = read_ours(&linked.elf);
     assert_eq!(ours.sections[0], lld.sections[0], ".text is unaffected");
@@ -1287,6 +1288,7 @@ fn weak_symbols() {
         // No _start among these: warn and fall back to .text.
         assert_eq!(l.entry, text.addr);
         assert_eq!(l.warnings.len(), 1);
+        assert!(!merlin_ld::layout::is_merge_warning(&l.warnings[0]));
     }
 }
 

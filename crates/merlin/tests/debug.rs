@@ -3,6 +3,7 @@
 //! case compiles to the same loaded bytes, relocations and symbols with and
 //! without it.
 
+use merlin::types::Xlen;
 use merlin::{DebugInfo, Options};
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,19 @@ fn debug_opts(comp_dir: &str) -> Options {
         }),
         ..Options::default()
     }
+}
+
+/// [`debug_opts`] for RV64.
+fn debug_opts_rv64(comp_dir: &str) -> Options {
+    Options {
+        xlen: Xlen::Rv64,
+        ..debug_opts(comp_dir)
+    }
+}
+
+/// Assembles for RV64.
+fn assemble_rv64(asm: &str) -> Vec<u8> {
+    merlin_as::assemble_to_elf_with(asm, &merlin_as::Options { xlen: Xlen::Rv64 }).unwrap()
 }
 
 /// The parts of an object that end up loaded: each allocated section's name,
@@ -66,16 +80,78 @@ fn cases() -> Vec<PathBuf> {
 fn debug_information_changes_no_code() {
     let cases = cases();
     assert!(cases.len() > 50);
-    for path in cases {
-        let src = std::fs::read_to_string(&path).unwrap();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let plain = merlin::compile_with(&name, &src, &Options::default(), &merlin::no_files).unwrap();
-        let debug = merlin::compile_with(&name, &src, &debug_opts("tests/cases"), &merlin::no_files).unwrap();
-        assert!(debug.contains(".loc 0 "), "{name}: no line information");
-        let plain = merlin_as::assemble_to_elf(&plain).unwrap();
-        let debug = merlin_as::assemble_to_elf(&debug).unwrap_or_else(|e| panic!("{name}: {e:?}"));
-        assert_eq!(loaded(&plain), loaded(&debug), "{name}");
+    for x in [Xlen::Rv32, Xlen::Rv64] {
+        let plain_opts = Options {
+            xlen: x,
+            ..Options::default()
+        };
+        let debug_opts = Options {
+            xlen: x,
+            ..debug_opts("tests/cases")
+        };
+        let as_opts = merlin_as::Options { xlen: x };
+        for path in &cases {
+            let src = std::fs::read_to_string(path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let plain = merlin::compile_with(&name, &src, &plain_opts, &merlin::no_files).unwrap();
+            let debug = merlin::compile_with(&name, &src, &debug_opts, &merlin::no_files).unwrap();
+            assert!(debug.contains(".loc 0 "), "{name}: no line information");
+            let plain = merlin_as::assemble_to_elf_with(&plain, &as_opts).unwrap();
+            let debug =
+                merlin_as::assemble_to_elf_with(&debug, &as_opts).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(loaded(&plain), loaded(&debug), "{name} ({x:?})");
+        }
     }
+}
+
+/// On RV64 the compile unit's addresses are 8 bytes: its header says so,
+/// `DW_FORM_addr` is a `.quad` (an R_RISCV_64 relocation), and the unit's
+/// length counts them. The line table reads back as on RV32.
+#[test]
+fn rv64_addresses_are_eight_bytes() {
+    let src = "int f(int n) {\n    return n + 1;\n}\nlong g(long x) {\n    return f(x);\n}\n";
+    let asm = merlin::compile_with("w.c", src, &debug_opts_rv64("dir"), &merlin::no_files).unwrap();
+    assert!(asm.contains("    .byte 8    # address size\n"), "{asm}");
+    assert!(asm.contains("    .quad f\n"), "{asm}");
+    assert!(!asm.contains(".word f\n"), "{asm}");
+    let obj = assemble_rv64(&asm);
+    let elf = elf::Elf::parse(&obj).unwrap();
+    let (i, info) = elf
+        .sections
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.name == ".debug_info")
+        .unwrap();
+    let data = elf.section_data(info).unwrap();
+    let length = u32::from_le_bytes(data[..4].try_into().unwrap());
+    assert_eq!(length as usize + 4, data.len());
+    assert_eq!(u16::from_le_bytes([data[4], data[5]]), 5, "DWARF 5");
+    assert_eq!(data[7], 8, "address size");
+    // The unit's low_pc and each function's: 8-byte relocations.
+    let symbols = elf.symbols().unwrap();
+    let rela = elf
+        .sections
+        .iter()
+        .find(|r| r.ty == elf::SHT_RELA && r.info as usize == i)
+        .unwrap();
+    let addrs: Vec<String> = elf
+        .relocations(rela)
+        .unwrap()
+        .iter()
+        .filter(|r| elf::reloc_name(r.ty) == Some("R_RISCV_64"))
+        .map(|r| symbols[r.sym as usize].name.clone())
+        .collect();
+    assert_eq!(addrs, ["f", "f", "g"]);
+    // The line table: both functions, in order.
+    let tables = elf.line_tables().unwrap();
+    assert_eq!(tables[0].files, ["dir/w.c"]);
+    let lines: Vec<u32> = tables[0].sequences[0]
+        .rows
+        .iter()
+        .filter(|r| !r.end_sequence)
+        .map(|r| r.line)
+        .collect();
+    assert_eq!(lines, [1, 2, 3, 4, 5, 6]);
 }
 
 #[test]

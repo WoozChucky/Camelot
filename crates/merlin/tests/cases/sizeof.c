@@ -1,6 +1,8 @@
 // expect: 107
+// expect-lp64: 127
 // sizeof gives the size of a type or of an expression's type at compile
-// time; the expression is not evaluated. Its type is unsigned (size_t).
+// time; the expression is not evaluated. Its type is unsigned (size_t). The
+// sums below are ILP32's; on LP64 long and the pointers take 8 bytes each.
 int g[7];
 
 int main() {

@@ -1,6 +1,7 @@
 // expect: 119
+// expect-lp64: 131
 // Pointer arithmetic counts elements, whatever their size; the difference of
-// two pointers counts elements too.
+// two pointers counts elements too. (A long is 8 bytes on LP64.)
 int main() {
     char c[8];
     short s[8];
