@@ -16,10 +16,12 @@
 #             status into its descriptor, and moves RX_HEAD past it. When no buffer
 #             is free, the frame is dropped and counted in NET_RX_DROPPED.
 #
-# A counter is a 32-bit value that lw sign-extends: one the driver computes is
-# kept in that form with addiw, so that it compares equal to the card's register
-# across 2^31. The card's address and the buffers' are 64-bit (ld, sd), and the
-# functions save ra and the s registers with sd.
+# A counter is a 32-bit value that lw sign-extends: one the driver computes and
+# compares with the card's register is kept in that form with addiw, so that the
+# two are equal across 2^31; one it only stores with sw (the low 32 bits) and
+# reads back with lw may be computed with addi. The card's address and the
+# buffers' are 64-bit (ld, sd), and the functions save ra and the s registers
+# with sd.
 
     .equ UART_BASE,       0x10000000
     .equ UART_LSR,        5
@@ -97,7 +99,7 @@ net_init:
     la    t2, net_irq
     sw    t1, 0(t2)
     la    t2, net_mac               # the MAC, in wire order
-    lwu   t3, NET_MAC_LO(s1)        # bit 31 may be set
+    lw    t3, NET_MAC_LO(s1)        # sw stores its 32 bits as they are
     sw    t3, 0(t2)
     lw    t3, NET_MAC_HI(s1)
     sw    t3, 4(t2)
