@@ -128,10 +128,19 @@ static void big_heap(int mib) {
     check_eq(sbrk(0), start, "back where it was");
 }
 
-/* `spacetest overflow`: never returns. */
+/* Always 1, but volatile: a compiler cannot tell that forever() never
+ * stops (clang -O2 would otherwise reject it, -Winfinite-recursion). */
+static volatile int deeper = 1;
+
+/* `spacetest overflow`: never returns. Every call keeps a 1000-byte frame
+ * in memory (volatile, so an optimizer keeps it too) until the stack runs
+ * into its guard page. */
 static int forever(int n) {
-    char frame[1000];
+    volatile char frame[1000];
     frame[0] = (char)n;
+    if (!deeper) {
+        return frame[0];
+    }
     return forever(n + 1) + frame[0];
 }
 
