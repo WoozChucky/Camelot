@@ -52,6 +52,8 @@ impl Default for Limits {
 pub struct Request {
     /// `GET`, `POST`, ... (a valid token, case kept: methods are case-sensitive).
     pub method: String,
+    /// `HTTP/1.1` or `HTTP/1.0`.
+    pub version: String,
     /// The target's path as sent (still percent-encoded), always starting with `/`.
     pub path: String,
     /// The path's segments, percent-decoded: `/api/vms/3` is `["api", "vms", "3"]`,
@@ -427,6 +429,7 @@ fn parse_request_line(line: &[u8]) -> Result<Request, HttpError> {
         .collect::<Result<_, HttpError>>()?;
     Ok(Request {
         method: method.to_string(),
+        version: version.to_string(),
         path: path.to_string(),
         segments,
         query,

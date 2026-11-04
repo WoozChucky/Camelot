@@ -220,6 +220,7 @@ mod tests {
     fn request(headers: &[(&str, &str)], body: &[u8]) -> Request {
         Request {
             method: "POST".into(),
+            version: "HTTP/1.1".into(),
             path: "/api/vms".into(),
             segments: vec!["api".into(), "vms".into()],
             query: vec![],

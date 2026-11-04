@@ -25,6 +25,8 @@ pub mod guard;
 pub mod http;
 pub mod json;
 pub mod random;
+pub mod sha1;
+pub mod websocket;
 
 mod api;
 mod console;
