@@ -119,6 +119,38 @@ fn two_vms_with_their_own_profiles() {
 }
 
 #[test]
+fn an_rv64_vm_has_more_ram_than_the_host() {
+    // 512 GiB, more than any machine running these tests has: RAM is reserved, not
+    // allocated, so the VM is made and runs, its host paying for what it touches. An
+    // RV64 VM (its program is ELF64) takes it; an RV32 one is refused as a bad profile.
+    let server = server(None);
+    let mut conn = connect(&server);
+    let vm = create(
+        &mut conn,
+        "big",
+        HardwareProfile::with_ram(512 << 30),
+        rv64_spinner(),
+    );
+    assert_eq!(info(&mut conn, vm).vm.profile.ram_size, 512 << 30);
+    match conn.request(&Message::StartVm { vm: VmRef::Id(vm) }) {
+        Ok(Message::Ok) => {}
+        other => panic!("start: {other:?}"),
+    }
+    wait_until("the VM to run", Duration::from_secs(10), || {
+        slices(&server, vm) > 0
+    });
+    let refused = error_of(
+        &mut conn,
+        &Message::CreateVm {
+            name: "big32".into(),
+            profile: HardwareProfile::with_ram(512 << 30),
+            program: example("hello"),
+        },
+    );
+    assert_eq!(refused, avalon_proto::ErrorCode::InvalidProfile);
+}
+
+#[test]
 fn exit_codes_are_reported() {
     let server = server(None);
     let mut rt = connect(&server);

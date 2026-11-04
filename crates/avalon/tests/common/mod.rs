@@ -113,6 +113,37 @@ _start:
     ))
 }
 
+/// The smallest RV64 program: an ELF64 file with one `PT_LOAD` segment at the start of
+/// RAM, its entry, holding `addi a0, zero, 7` and `j .`.
+pub fn rv64_spinner() -> Vec<u8> {
+    let code: Vec<u8> = [0x0070_0513u32, 0x0000_006f]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let mut f = vec![0u8; 64 + 56];
+    f[..8].copy_from_slice(b"\x7fELF\x02\x01\x01\0");
+    f[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    f[18..20].copy_from_slice(&243u16.to_le_bytes()); // EM_RISCV
+    f[20..24].copy_from_slice(&1u32.to_le_bytes());
+    f[24..32].copy_from_slice(&0x8000_0000u64.to_le_bytes()); // e_entry
+    f[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    f[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    f[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    f[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+    f[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+    let ph = &mut f[64..];
+    ph[..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    ph[4..8].copy_from_slice(&5u32.to_le_bytes()); // R + X
+    ph[8..16].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+    ph[16..24].copy_from_slice(&0x8000_0000u64.to_le_bytes()); // p_vaddr
+    ph[24..32].copy_from_slice(&0x8000_0000u64.to_le_bytes()); // p_paddr
+    ph[32..40].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_filesz
+    ph[40..48].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_memsz
+    ph[48..56].copy_from_slice(&4u64.to_le_bytes()); // p_align
+    f.extend_from_slice(&code);
+    f
+}
+
 pub fn profile(ram_mib: u64, clock_hz: Option<u32>) -> HardwareProfile {
     HardwareProfile {
         clock_hz,

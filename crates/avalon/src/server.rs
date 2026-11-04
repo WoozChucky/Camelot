@@ -630,12 +630,16 @@ impl Shared {
         cards: &[CardConfig],
         program: &[u8],
     ) -> Result<Vm, Fail> {
-        // Grail allocates RAM with no way to fail but aborting the process, so make
-        // sure the host can give it first.
-        if Vec::<u8>::new().try_reserve_exact(config.ram_size).is_err() {
+        // Grail backs RAM lazily (spec section 7, "RAM"): the size is reserved in the
+        // host's address space, not allocated, and a size the host cannot reserve is
+        // refused. Reserved here, and let go at once, so that refusal is the budget's
+        // answer, OverBudget, rather than a bad profile when the machine is built.
+        // Committing the whole size first (as an allocation would) would undo the lazy
+        // backing, and refuse any VM bigger than the host's memory.
+        if let Err(e) = grail::ram::Ram::new(config.ram_size) {
             return Err(Fail::new(
                 ErrorCode::OverBudget,
-                format!("the host cannot allocate {} of RAM", show_size(profile.ram_size)),
+                format!("{} of RAM: {e}", show_size(profile.ram_size)),
             ));
         }
         let cards = cards
