@@ -558,17 +558,56 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// RFC 6455 section 5.7's examples, masked: "Hello" in one frame, a fragmented
-    /// one, and a ping.
+    /// RFC 6455 section 5.7's examples. The client's frames are masked: the masked
+    /// "Hello" and the masked pong as the RFC gives them, and its fragmented "Hello"
+    /// and its ping, which it gives unmasked, masked with the same key (each frame's
+    /// masking starts afresh, section 5.3); unmasked, they are refused (section 5.1).
+    /// The server's frames are not: its unmasked "Hello", ping and lengths.
     #[test]
     fn the_rfcs_frames() {
+        const HELLO_MASKED: [u8; 9] = [0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58];
         let mut r = Reader::new(1000);
-        r.push(&[0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58]);
+        r.push(&[[0x81, 0x85].as_slice(), &HELLO_MASKED].concat());
         assert_eq!(r.message().unwrap(), Some(Incoming::Text("Hello".into())));
-        // An unmasked "Hello" is how the server writes it.
+        r.push(&[[0x8a, 0x85].as_slice(), &HELLO_MASKED].concat());
+        assert_eq!(r.message().unwrap(), Some(Incoming::Pong(b"Hello".to_vec())));
+        r.push(&[[0x89, 0x85].as_slice(), &HELLO_MASKED].concat());
+        assert_eq!(r.message().unwrap(), Some(Incoming::Ping(b"Hello".to_vec())));
+        // "Hel" then "lo", masked with the RFC's key: 'l' ^ 0x37, 'o' ^ 0xfa.
+        let fragmented = [
+            [0x01, 0x83, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d].as_slice(),
+            &[0x80, 0x82, 0x37, 0xfa, 0x21, 0x3d, 0x5b, 0x95],
+        ]
+        .concat();
+        assert_eq!(
+            fragmented,
+            [
+                client_frame(false, OP_TEXT, [0x37, 0xfa, 0x21, 0x3d], b"Hel"),
+                client_frame(true, OP_CONTINUATION, [0x37, 0xfa, 0x21, 0x3d], b"lo"),
+            ]
+            .concat()
+        );
+        r.push(&fragmented[..9]);
+        assert_eq!(r.message().unwrap(), None, "the first fragment alone");
+        r.push(&fragmented[9..]);
+        assert_eq!(r.message().unwrap(), Some(Incoming::Text("Hello".into())));
+        assert_eq!(r.message().unwrap(), None);
+        // The RFC's unmasked fragmented "Hello" and ping, as a client must not send them.
+        for unmasked in [
+            [0x01, 0x03, 0x48, 0x65, 0x6c, 0x80, 0x02, 0x6c, 0x6f].as_slice(),
+            &[0x89, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f],
+        ] {
+            let mut r = Reader::new(1000);
+            r.push(unmasked);
+            assert_eq!(r.message().unwrap_err().code, CLOSE_PROTOCOL_ERROR);
+        }
+        // An unmasked "Hello" and ping are how the server writes them.
         let mut out = Vec::new();
         write_frame(&mut out, OP_TEXT, b"Hello").unwrap();
         assert_eq!(out, [0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f]);
+        out.clear();
+        write_frame(&mut out, OP_PING, b"Hello").unwrap();
+        assert_eq!(out, [0x89, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f]);
         out.clear();
         write_frame(&mut out, OP_BINARY, &[0; 256]).unwrap();
         assert_eq!(out[..4], [0x82, 0x7e, 0x01, 0x00]);
