@@ -11,16 +11,21 @@
 //!   disassembly of ours by merlin-objdump (which prints what llvm-objdump 21
 //!   prints) must be the same text, labels and relocations included.
 //!
+//! hello.S is the same source on both widths, and assembled for RV64 it must
+//! match `tests/golden/rv64/hello.ref` (the same script) in the same way. Its
+//! `rv64/hello.dr.txt` is not compared yet: merlin-objdump reads ELF32 objects
+//! only, until #150 teaches it ELF64.
+//!
 //! Linking the result with ld.lld and running it in Grail is checked by
 //! `crates/xtask/tests/hello.rs`.
 
-use merlin_as::Object;
+use merlin_as::{Object, Options, Xlen};
 
 const SOURCE: &str = include_str!("../../../examples/hello/hello.S");
 const SECTION: &str = ".text.start";
 
-fn assemble() -> Object {
-    match merlin_as::assemble(SOURCE) {
+fn assemble(xlen: Xlen) -> Object {
+    match merlin_as::assemble_with(SOURCE, &Options { xlen }) {
         Ok(o) => o,
         Err(errs) => {
             let lines: Vec<&str> = SOURCE.lines().collect();
@@ -36,11 +41,10 @@ fn assemble() -> Object {
     }
 }
 
-/// One word of clang's `.text.start`, as in hello.ref:
+/// The words of clang's `.text.start`, as in hello.ref, one per line:
 /// `<hex offset> <word> [<R_RISCV_TYPE> <symbol or <auipc>>[+hexaddend]]`.
-fn reference() -> Vec<String> {
-    include_str!("golden/hello.ref")
-        .lines()
+fn reference(text: &str) -> Vec<String> {
+    text.lines()
         .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
         .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect()
@@ -78,18 +82,23 @@ fn ours(obj: &Object) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn reference_is_well_formed() {
-    let refs = reference();
-    assert_eq!(refs.len(), 20);
-    // hello.S's first instruction is `la sp, __stack_top`.
-    assert_eq!(refs[0], "0 00000117 R_RISCV_PCREL_HI20 __stack_top");
-}
+const REF32: &str = include_str!("golden/hello.ref");
+const REF64: &str = include_str!("golden/rv64/hello.ref");
 
 #[test]
-fn hello_matches_clang() {
-    let obj = assemble();
-    let (ours, refs) = (ours(&obj), reference());
+fn reference_is_well_formed() {
+    for text in [REF32, REF64] {
+        let refs = reference(text);
+        assert_eq!(refs.len(), 20);
+        // hello.S's first instruction is `la sp, __stack_top`.
+        assert_eq!(refs[0], "0 00000117 R_RISCV_PCREL_HI20 __stack_top");
+    }
+}
+
+/// Why our `.text.start` for `xlen` differs from clang's, if it does.
+fn compare(xlen: Xlen, reference_text: &str) {
+    let obj = assemble(xlen);
+    let (ours, refs) = (ours(&obj), reference(reference_text));
     let diffs: Vec<String> = (0..ours.len().max(refs.len()))
         .filter_map(|i| {
             let (a, b) = (ours.get(i), refs.get(i));
@@ -104,14 +113,28 @@ fn hello_matches_clang() {
         .collect();
     assert!(
         diffs.is_empty(),
-        "{SECTION} differs from clang:\n  {}",
+        "{xlen:?}: {SECTION} differs from clang:\n  {}",
         diffs.join("\n  ")
     );
 }
 
 #[test]
+fn hello_matches_clang() {
+    compare(Xlen::Rv32, REF32);
+}
+
+/// hello.S assembles to the same words on RV64: it has no instruction whose
+/// encoding depends on the width.
+#[test]
+fn hello_matches_clang_on_rv64() {
+    compare(Xlen::Rv64, REF64);
+}
+
+/// RV32 only for now: the RV64 twin, against `golden/rv64/hello.dr.txt`,
+/// waits for merlin-objdump to read ELF64 (#150); today `dump` refuses it.
+#[test]
 fn hello_disassembles_like_clang() {
-    let elf = merlin_as::elf::write(&assemble());
+    let elf = merlin_as::elf::write(&assemble(Xlen::Rv32));
     let opts = merlin_objdump::Options {
         disassemble: true,
         relocs: true,

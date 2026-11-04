@@ -15,15 +15,30 @@
 //!   assemble back to exactly that word. Proves the disassembler's syntax
 //!   reassembles, and catches bits `decode` ignores, like fence's pred/succ.
 //!   Words patched by a relocation are left out: their fields are zero.
+//!
+//! Each check runs for both widths. On RV64 the decoder and the disassembler
+//! are given `Xlen::Rv64`, the RV64-only instructions have tables of their
+//! own (`expected64`, `CLANG_WORDS64`, the `.d` atomics, rv64/encode.golden),
+//! and the RV32 rows the width changes are left out (`WIDTH_DEPENDENT`).
 
 use excalibur::{
-    AluOp, AmoOp, AmoWidth, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, Ordering, StoreOp, Xlen,
+    AluOp, AmoOp, AmoWidth, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, Ordering, StoreOp, Syntax, Xlen,
 };
 use merlin_as::reloc::RelocKind;
+use merlin_as::Options;
 
-/// merlin-as writes RV32 until #148.
-fn decode(w: u32) -> Inst {
-    excalibur::decode(w, Xlen::Rv32)
+const RV32: Xlen = Xlen::Rv32;
+const RV64: Xlen = Xlen::Rv64;
+
+fn decode(w: u32, xlen: Xlen) -> Inst {
+    excalibur::decode(w, xlen)
+}
+
+/// The disassembler's plain text for `inst` (decimal immediates, no
+/// pseudo-instructions), which merlin-as must accept. The width matters for
+/// CSR names only: `cycleh` is a name on RV32 and a number on RV64.
+fn disasm(inst: Inst, xlen: Xlen) -> String {
+    inst.format(None, Syntax::plain(xlen)).to_string()
 }
 
 /// One word of `.text` and the relocation that will patch it, if any.
@@ -49,9 +64,9 @@ enum To {
     Auipc(u32),
 }
 
-/// The words of `.text`, or the first error.
-fn assemble(src: &str) -> Result<Vec<Word>, String> {
-    let obj = merlin_as::assemble(src).map_err(|errs| errs[0].to_string())?;
+/// The words of `.text` for `xlen`, or the first error.
+fn assemble(src: &str, xlen: Xlen) -> Result<Vec<Word>, String> {
+    let obj = merlin_as::assemble_with(src, &Options { xlen }).map_err(|errs| errs[0].to_string())?;
     let text = &obj.sections[0];
     let reloc_at = |offset: u32| {
         let r = text.relocs.iter().find(|r| r.offset == offset)?;
@@ -135,10 +150,13 @@ const S3: u8 = 19;
 const T5: u8 = 30;
 const T6: u8 = 31;
 
+/// Source lines, each with the instructions `decode` must return for it.
+type Rows = Vec<(&'static str, Vec<Inst>)>;
+
 /// Source and the instructions `decode` must return, one per emitted word.
 /// Words carrying a relocation have zero immediates, so their expected
 /// immediates are 0.
-fn expected() -> Vec<(&'static str, Vec<Inst>)> {
+fn expected() -> Rows {
     use Inst::*;
     vec![
         // U and J
@@ -790,10 +808,13 @@ fn expected() -> Vec<(&'static str, Vec<Inst>)> {
 /// (word index, kind, target)
 type WordReloc = (usize, RelocKind, To);
 
+/// Rows of relocations: a source line, and the relocation on each of its words that has one.
+type RelocRows = Vec<(&'static str, Vec<WordReloc>)>;
+
 /// The relocation on each word of the rows above that refer to a label.
 /// Every word not listed must carry no relocation. Matches clang/llvm-mc with
 /// relaxation off.
-fn expected_relocs() -> Vec<(&'static str, Vec<WordReloc>)> {
+fn expected_relocs() -> RelocRows {
     use RelocKind::*;
     let target = || To::Sym("target".into(), 0);
     let pcrel = |lo| vec![(0, PcrelHi20, target()), (1, lo, To::Auipc(0))];
@@ -834,35 +855,211 @@ fn expected_relocs() -> Vec<(&'static str, Vec<WordReloc>)> {
     ]
 }
 
-/// A typo in `expected_relocs` would silently drop its checks.
+/// The rows of `expected()` that encode differently on RV64, or not at all,
+/// and why. `roundtrip_expected_on_rv64` leaves them out.
+const WIDTH_DEPENDENT: &[(&str, &str)] = &[
+    ("rdcycleh a0", "RV32 only"),
+    ("rdtimeh a0", "RV32 only"),
+    ("rdinstreth a0", "RV32 only"),
+    ("li a0, 0x80000000", "positive on RV64: addi 1; slli 31"),
+    ("li a0, 0x7ffff800", "lui alone would sign-extend it: lui; addiw"),
+];
+
+/// RV64-only source lines and the instructions `decode` must return for them.
+fn expected64() -> Rows {
+    use Inst::*;
+    let w32 = |op, rd, rs1, imm| OpImm32 { op, rd, rs1, imm };
+    let r32 = |op, rd, rs1, rs2| Op32 { op, rd, rs1, rs2 };
+    let m32 = |op, rd, rs1, rs2| Mul32 { op, rd, rs1, rs2 };
+    let load = |op, rd, rs1, imm| Load { op, rd, rs1, imm };
+    let store = |op, rs1, rs2, imm| Store { op, rs1, rs2, imm };
+    vec![
+        // OP-IMM-32 and OP-32
+        ("addiw a0, a1, -1", vec![w32(AluOp::Add, A0, A1, -1)]),
+        ("addiw sp, sp, 2047", vec![w32(AluOp::Add, SP, SP, 2047)]),
+        ("slliw a0, a1, 31", vec![w32(AluOp::Sll, A0, A1, 31)]),
+        ("srliw t0, t1, 1", vec![w32(AluOp::Srl, T0, T1, 1)]),
+        ("sraiw a0, a1, 0", vec![w32(AluOp::Sra, A0, A1, 0)]),
+        ("addw a0, a1, a2", vec![r32(AluOp::Add, A0, A1, A2)]),
+        ("subw t0, t1, t2", vec![r32(AluOp::Sub, T0, T1, T2)]),
+        ("sllw a0, a1, a2", vec![r32(AluOp::Sll, A0, A1, A2)]),
+        ("srlw t5, t6, a0", vec![r32(AluOp::Srl, T5, T6, A0)]),
+        ("sraw a1, a2, a3", vec![r32(AluOp::Sra, A1, A2, A3)]),
+        ("mulw a0, a1, a2", vec![m32(MulOp::Mul, A0, A1, A2)]),
+        ("divw a0, a1, a2", vec![m32(MulOp::Div, A0, A1, A2)]),
+        ("divuw s2, s3, a0", vec![m32(MulOp::Divu, S2, S3, A0)]),
+        ("remw a0, a1, a2", vec![m32(MulOp::Rem, A0, A1, A2)]),
+        ("remuw t0, t1, t2", vec![m32(MulOp::Remu, T0, T1, T2)]),
+        // 6-bit shift amounts
+        ("slli a0, a1, 63", vec![i(AluOp::Sll, A0, A1, 63)]),
+        ("srli a0, a1, 32", vec![i(AluOp::Srl, A0, A1, 32)]),
+        ("srai a0, a1, 45", vec![i(AluOp::Sra, A0, A1, 45)]),
+        // Doublewords and unsigned words
+        ("ld ra, 2040(sp)", vec![load(LoadOp::Ld, RA, SP, 2040)]),
+        ("ld a0, (a1)", vec![load(LoadOp::Ld, A0, A1, 0)]),
+        ("lwu t0, -2048(t1)", vec![load(LoadOp::Lwu, T0, T1, -2048)]),
+        ("sd ra, 2040(sp)", vec![store(StoreOp::Sd, SP, RA, 2040)]),
+        ("sd a5, -8(s2)", vec![store(StoreOp::Sd, S2, A5, -8)]),
+        (
+            "lr.d.aqrl a0, (a1)",
+            vec![Lr {
+                width: AmoWidth::D,
+                rd: A0,
+                rs1: A1,
+                order: Ordering { aq: true, rl: true },
+            }],
+        ),
+        // Pseudo-instructions
+        ("sext.w a0, a1", vec![w32(AluOp::Add, A0, A1, 0)]),
+        ("negw a0, a1", vec![r32(AluOp::Sub, A0, ZERO, A1)]),
+        (
+            "zext.w a0, a1",
+            vec![i(AluOp::Sll, A0, A1, 32), i(AluOp::Srl, A0, A0, 32)],
+        ),
+        // A CSR that has a name on RV32 only is still reachable by number.
+        (
+            "csrr a0, 0xc80",
+            vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc80)],
+        ),
+        // li, as LLVM's RISCVMatInt builds 64-bit values (rv64/li.golden has
+        // many more, word for word): addiw only where addi would be wrong,
+        // then shifts, a final srli for leading zeros, xori for leading ones.
+        (
+            "li a0, 0x7fffffff",
+            vec![
+                Lui {
+                    rd: A0,
+                    imm: 0x8000_0000u32 as i32,
+                },
+                w32(AluOp::Add, A0, A0, -1),
+            ],
+        ),
+        (
+            "li a0, 0x80000000",
+            vec![i(AluOp::Add, A0, ZERO, 1), i(AluOp::Sll, A0, A0, 31)],
+        ),
+        (
+            "li a0, 0xffffffff",
+            vec![i(AluOp::Add, A0, ZERO, -1), i(AluOp::Srl, A0, A0, 32)],
+        ),
+        (
+            "li a0, 0x100000001",
+            vec![
+                i(AluOp::Add, A0, ZERO, 1),
+                i(AluOp::Sll, A0, A0, 32),
+                i(AluOp::Add, A0, A0, 1),
+            ],
+        ),
+        (
+            "li a0, 0x8000000000000fff",
+            vec![
+                Lui {
+                    rd: A0,
+                    imm: 0xffff_e000u32 as i32,
+                },
+                i(AluOp::Srl, A0, A0, 1),
+                i(AluOp::Xor, A0, A0, -1),
+            ],
+        ),
+        // Label operands: relocated fields are zero, the rest must be right.
+        (
+            "ld a0, target",
+            vec![Auipc { rd: A0, imm: 0 }, load(LoadOp::Ld, A0, A0, 0)],
+        ),
+        (
+            "lwu a0, target",
+            vec![Auipc { rd: A0, imm: 0 }, load(LoadOp::Lwu, A0, A0, 0)],
+        ),
+        (
+            "sd a0, target, t0",
+            vec![Auipc { rd: T0, imm: 0 }, store(StoreOp::Sd, T0, A0, 0)],
+        ),
+        ("ld a1, %lo(target)(a0)", vec![load(LoadOp::Ld, A1, A0, 0)]),
+        ("addiw a0, a0, %lo(target)", vec![w32(AluOp::Add, A0, A0, 0)]),
+    ]
+}
+
+/// The relocations on `expected64()`'s rows, as `expected_relocs` for
+/// `expected()`'s.
+fn expected_relocs64() -> RelocRows {
+    use RelocKind::*;
+    let target = || To::Sym("target".into(), 0);
+    let pcrel = |lo| vec![(0, PcrelHi20, target()), (1, lo, To::Auipc(0))];
+    vec![
+        ("ld a0, target", pcrel(PcrelLo12I)),
+        ("lwu a0, target", pcrel(PcrelLo12I)),
+        ("sd a0, target, t0", pcrel(PcrelLo12S)),
+        ("ld a1, %lo(target)(a0)", vec![(0, Lo12I, target())]),
+        ("addiw a0, a0, %lo(target)", vec![(0, Lo12I, target())]),
+    ]
+}
+
+/// The rows and relocations `roundtrip_expected` checks on `xlen`.
+fn rows(xlen: Xlen) -> (Rows, RelocRows) {
+    match xlen {
+        Xlen::Rv32 => (expected(), expected_relocs()),
+        Xlen::Rv64 => {
+            let same = |src: &str| !WIDTH_DEPENDENT.iter().any(|(s, _)| *s == src);
+            let mut rows: Vec<_> = expected().into_iter().filter(|(src, _)| same(src)).collect();
+            rows.extend(expected64());
+            let mut relocs: Vec<_> = expected_relocs()
+                .into_iter()
+                .filter(|(src, _)| same(src))
+                .collect();
+            relocs.extend(expected_relocs64());
+            (rows, relocs)
+        }
+    }
+}
+
+/// A typo in `expected_relocs` or `WIDTH_DEPENDENT` would silently drop
+/// their checks.
 #[test]
 fn every_expected_reloc_row_is_in_the_table() {
+    for (table, relocs) in [
+        (expected(), expected_relocs()),
+        (expected64(), expected_relocs64()),
+    ] {
+        let rows: Vec<&str> = table.iter().map(|(src, _)| *src).collect();
+        for (src, relocs) in relocs {
+            assert!(rows.contains(&src), "'{src}' is not in its table");
+            let words = table.iter().find(|(s, _)| *s == src).unwrap().1.len();
+            assert!(
+                relocs.iter().all(|r| r.0 < words),
+                "'{src}': word index out of range"
+            );
+        }
+    }
     let rows: Vec<&str> = expected().iter().map(|(src, _)| *src).collect();
-    for (src, relocs) in expected_relocs() {
-        assert!(rows.contains(&src), "'{src}' is not in expected()");
-        let words = expected().into_iter().find(|(s, _)| *s == src).unwrap().1.len();
-        assert!(
-            relocs.iter().all(|r| r.0 < words),
-            "'{src}': word index out of range"
-        );
+    for (src, _) in WIDTH_DEPENDENT {
+        assert!(rows.contains(src), "'{src}' is not in expected()");
     }
 }
 
 #[test]
 fn roundtrip_expected() {
+    check_expected(RV32);
+}
+
+#[test]
+fn roundtrip_expected_on_rv64() {
+    check_expected(RV64);
+}
+
+fn check_expected(xlen: Xlen) {
     let mut rep = Report::new("decode(encode(x)) == x");
-    let relocs = expected_relocs();
-    for (src, want) in expected() {
+    let (rows, relocs) = rows(xlen);
+    for (src, want) in rows {
         rep.total += 1;
         let shown = src.replace('\n', "; ");
-        let words = match assemble(src) {
+        let words = match assemble(src, xlen) {
             Ok(w) => w,
             Err(e) => {
                 rep.fails.push(format!("  {shown:<34} error: {e}"));
                 continue;
             }
         };
-        let got: Vec<Inst> = words.iter().map(|w| decode(w.word)).collect();
+        let got: Vec<Inst> = words.iter().map(|w| decode(w.word, xlen)).collect();
         if got != want {
             rep.fails
                 .push(format!("  {shown:<34} got {got:?}\n  {:<34} want {want:?}", ""));
@@ -888,21 +1085,36 @@ fn roundtrip_expected() {
 }
 
 /// Every A mnemonic with every ordering suffix, with registers that vary per
-/// line, decodes to the instruction it names. The mnemonic-to-operation table
-/// here is the test's own.
+/// line, decodes to the instruction it names: the `.w` forms on both widths,
+/// the `.d` forms on RV64. The mnemonic-to-operation table here is the
+/// test's own.
 #[test]
 fn roundtrip_atomics() {
+    check_atomics(RV32, AmoWidth::W);
+}
+
+#[test]
+fn roundtrip_atomics_on_rv64() {
+    check_atomics(RV64, AmoWidth::W);
+    check_atomics(RV64, AmoWidth::D);
+}
+
+fn check_atomics(xlen: Xlen, width: AmoWidth) {
     let mut rep = Report::new("A extension: decode(encode(x)) == x");
+    let w = match width {
+        AmoWidth::W => "w",
+        AmoWidth::D => "d",
+    };
     let amos = [
-        ("amoswap.w", AmoOp::Swap),
-        ("amoadd.w", AmoOp::Add),
-        ("amoxor.w", AmoOp::Xor),
-        ("amoand.w", AmoOp::And),
-        ("amoor.w", AmoOp::Or),
-        ("amomin.w", AmoOp::Min),
-        ("amomax.w", AmoOp::Max),
-        ("amominu.w", AmoOp::Minu),
-        ("amomaxu.w", AmoOp::Maxu),
+        ("amoswap", AmoOp::Swap),
+        ("amoadd", AmoOp::Add),
+        ("amoxor", AmoOp::Xor),
+        ("amoand", AmoOp::And),
+        ("amoor", AmoOp::Or),
+        ("amomin", AmoOp::Min),
+        ("amomax", AmoOp::Max),
+        ("amominu", AmoOp::Minu),
+        ("amomaxu", AmoOp::Maxu),
     ];
     let orders = [
         ("", false, false),
@@ -912,26 +1124,26 @@ fn roundtrip_atomics() {
     ];
     let name = |r: u8| excalibur::reg::abi_name(r);
     let mut n = 0u8;
-    for base in ["lr.w", "sc.w"].into_iter().chain(amos.iter().map(|a| a.0)) {
+    for base in ["lr", "sc"].into_iter().chain(amos.iter().map(|a| a.0)) {
         for (suffix, aq, rl) in orders {
             // Spread the registers over all 32 (rd, rs1 and rs2 differ).
             let (rd, rs1, rs2) = (n % 32, (n + 11) % 32, (n + 23) % 32);
             n += 5;
             let order = Ordering { aq, rl };
             let (src, want) = match base {
-                "lr.w" => (
-                    format!("lr.w{suffix} {}, ({})", name(rd), name(rs1)),
+                "lr" => (
+                    format!("lr.{w}{suffix} {}, ({})", name(rd), name(rs1)),
                     Inst::Lr {
-                        width: AmoWidth::W,
+                        width,
                         rd,
                         rs1,
                         order,
                     },
                 ),
-                "sc.w" => (
-                    format!("sc.w{suffix} {}, {}, ({})", name(rd), name(rs2), name(rs1)),
+                "sc" => (
+                    format!("sc.{w}{suffix} {}, {}, ({})", name(rd), name(rs2), name(rs1)),
                     Inst::Sc {
-                        width: AmoWidth::W,
+                        width,
                         rd,
                         rs1,
                         rs2,
@@ -941,10 +1153,10 @@ fn roundtrip_atomics() {
                 _ => {
                     let op = amos.iter().find(|a| a.0 == base).unwrap().1;
                     (
-                        format!("{base}{suffix} {}, {}, ({})", name(rd), name(rs2), name(rs1)),
+                        format!("{base}.{w}{suffix} {}, {}, ({})", name(rd), name(rs2), name(rs1)),
                         Inst::Amo {
                             op,
-                            width: AmoWidth::W,
+                            width,
                             rd,
                             rs1,
                             rs2,
@@ -954,16 +1166,16 @@ fn roundtrip_atomics() {
                 }
             };
             rep.total += 1;
-            match assemble(&src) {
-                Ok(words) if words.len() == 1 && decode(words[0].word) == want => {
+            match assemble(&src, xlen) {
+                Ok(words) if words.len() == 1 && decode(words[0].word, xlen) == want => {
                     // And the disassembly is the source back.
-                    let text = decode(words[0].word).to_string();
+                    let text = disasm(want, xlen);
                     if text != src {
                         rep.fails.push(format!("  {src:<36} disassembles to '{text}'"));
                     }
                 }
                 Ok(words) => {
-                    let got: Vec<Inst> = words.iter().map(|w| decode(w.word)).collect();
+                    let got: Vec<Inst> = words.iter().map(|w| decode(w.word, xlen)).collect();
                     rep.fails.push(format!("  {src:<36} got {got:?}, want {want:?}"));
                 }
                 Err(e) => rep.fails.push(format!("  {src:<36} error: {e}")),
@@ -1022,12 +1234,97 @@ const CLANG_WORDS: &[(&str, &[u32])] = &[
     ("li a0, 0x7ff800", &[0x0080_0537, 0x8005_0513]),
 ];
 
+/// The same for RV64 (`clang --target=riscv64 -march=rv64ima_zicsr_zifencei
+/// -mabi=lp64 -mno-relax -c`, LLVM 23.1.4): `CLANG_WORDS` without the RV32-only
+/// counter reads, the `.insn` forms of the RV64 opcodes and of `ld`/`lwu`/`sd`,
+/// RV32-only CSRs by number, `%hi`/`%lo` of constants wider than 32 bits, and
+/// `li` of values written in ways that wrap or shift in 64 bits.
+const CLANG_WORDS64: &[(&str, &[u32])] = &[
+    (".insn r 0x33, 0, 0x20, a0, a1, a2", &[0x40c5_8533]),
+    (".insn r 0x0b, 7, 0x7f, t6, s0, a5", &[0xfef4_7f8b]),
+    (".insn i 0x13, 0, a0, a1, -5", &[0xffb5_8513]),
+    (".insn i 0x03, 2, a0, 8(a1)", &[0x0085_a503]),
+    (".insn i 0x67, 0, ra, -16(t0)", &[0xff02_80e7]),
+    (".insn s 0x23, 2, a1, 12(a0)", &[0x00b5_2623]),
+    (".insn s 0x23, 0, t1, -2048(sp)", &[0x8061_0023]),
+    (".insn b 0x63, 1, a0, a1, 16", &[0x00b5_1863]),
+    (".insn b 0x63, 4, t0, t1, -4096", &[0x8062_c063]),
+    (".insn u 0x37, a0, 0x12345", &[0x1234_5537]),
+    (".insn u 0x17, t0, 0xfffff", &[0xffff_f297]),
+    (".insn 0x00b50533", &[0x00b5_0533]),
+    (".insn 4, 0x40b50533", &[0x40b5_0533]),
+    // OP-32 (addw, mulw, sraw), OP-IMM-32 (addiw), ld, lwu and sd.
+    (".insn r 0x3b, 0, 0, a0, a1, a2", &[0x00c5_853b]),
+    (".insn r 0x3b, 0, 1, a0, a1, a2", &[0x02c5_853b]),
+    (".insn r 0x3b, 5, 0x20, a0, a1, a2", &[0x40c5_d53b]),
+    (".insn i 0x1b, 0, a0, a1, -1", &[0xfff5_851b]),
+    (".insn i 0x03, 3, a0, 8(a1)", &[0x0085_b503]),
+    (".insn i 0x03, 6, a0, 8(a1)", &[0x0085_e503]),
+    (".insn s 0x23, 3, a1, 12(a0)", &[0x00b5_3623]),
+    ("zext.b a0, a1", &[0x0ff5_f513]),
+    ("rdcycle a0", &[0xc000_2573]),
+    ("rdtime a1", &[0xc010_25f3]),
+    ("rdinstret a2", &[0xc020_2673]),
+    ("jalr ra, t0, 8", &[0x0082_80e7]),
+    ("jalr a0, a1, -2048", &[0x8005_8567]),
+    ("jalr t0", &[0x0002_80e7]),
+    ("csrw mstatus, 8", &[0x3004_5073]),
+    ("csrs sie, 31", &[0x104f_e073]),
+    ("csrc sstatus, 2", &[0x1001_7073]),
+    ("sfence.vma a0", &[0x1205_0073]),
+    // cycleh and mstatush have no names on RV64, but their numbers assemble.
+    ("csrr a0, 0xc80", &[0xc800_2573]),
+    ("csrrs a0, 0x310, zero", &[0x3100_2573]),
+    ("csrr a0, pmpcfg2", &[0x3a20_2573]),
+    ("csrr a1, cycle", &[0xc000_25f3]),
+    // The shift form's edges, as on RV32.
+    ("li a0, 0x10800", &[0x0001_1537, 0x8005_0513]),
+    ("li a0, -0x10800", &[0xffff_0537, 0x8005_0513]),
+    ("li a0, 0xf800", &[0x01f0_0513, 0x00b5_1513]),
+    ("li a0, -0xf800", &[0xfe10_0513, 0x00b5_1513]),
+    ("li a0, -3968", &[0xfe10_0513, 0x0075_1513]),
+    ("li a0, -4224", &[0xffff_f537, 0xf805_0513]),
+    ("li a0, 0x7ff800", &[0x0080_0537, 0x8005_0513]),
+    // Leading zeros: build the value shifted up, then srli.
+    ("li a0, 0xfffffffff", &[0xfff0_0513, 0x01c5_5513]),
+    (
+        "li a0, 0x0000ffff0000ffff",
+        &[0xf000_1537, 0x0145_1513, 0xfff5_0513, 0x0105_5513],
+    ),
+    // Values that wrap in 64 bits: -(2^63) is 2^63, and -(2^63 + 1) is
+    // 2^63 - 1; a u64 literal is its two's complement.
+    ("li a0, -0x8000000000000000", &[0xfff0_0513, 0x03f5_1513]),
+    ("li a0, -0x8000000000000001", &[0xfff0_0513, 0x0015_5513]),
+    ("li a0, 18446744073709551615", &[0xfff0_0513]),
+    // Expressions are 64-bit: >> is logical, << reaches bit 32.
+    ("li a0, -1 >> 1", &[0xfff0_0513, 0x0015_5513]),
+    ("li a0, 1 << 32", &[0x0010_0513, 0x0205_1513]),
+    // %hi/%lo of a constant take its low 32 bits, whatever its width.
+    ("lui a0, %hi(0x123456789)", &[0x2345_6537]),
+    ("addi a0, a0, %lo(0x123456789)", &[0x7895_0513]),
+    ("lui a0, %hi(0xffffffff7ffff800)", &[0x8000_0537]),
+    ("addi a0, a0, %lo(0xffffffff7ffff800)", &[0x8005_0513]),
+    ("addiw a0, a0, 2047", &[0x7ff5_051b]),
+    ("addiw a0, a0, -2048", &[0x8005_051b]),
+    ("sraiw a0, a1, 0", &[0x4005_d51b]),
+    ("slli zero, zero, 63", &[0x03f0_1013]),
+];
+
 #[test]
 fn matches_clang_words() {
+    check_clang_words(CLANG_WORDS, RV32);
+}
+
+#[test]
+fn matches_clang_words_on_rv64() {
+    check_clang_words(CLANG_WORDS64, RV64);
+}
+
+fn check_clang_words(lines: &[(&str, &[u32])], xlen: Xlen) {
     let mut rep = Report::new("words == clang's");
-    for &(src, want) in CLANG_WORDS {
+    for &(src, want) in lines {
         rep.total += 1;
-        match assemble(src) {
+        match assemble(src, xlen) {
             Ok(words) => {
                 let got: Vec<u32> = words.iter().map(|w| w.word).collect();
                 if got != want || words.iter().any(|w| w.reloc.is_some()) {
@@ -1043,12 +1340,12 @@ fn matches_clang_words() {
 
 // ----- decode → disassemble → assemble again -----
 
-/// Each golden line with LLVM's words for it, leaving out the words a
-/// relocation patches (their fields are zero, so they don't disassemble back
-/// to the source). Lines left with no words are dropped.
-fn golden_words() -> Vec<(&'static str, Vec<u32>)> {
+/// Each line of a golden file with LLVM's words for it, leaving out the
+/// words a relocation patches (their fields are zero, so they don't
+/// disassemble back to the source). Lines left with no words are dropped.
+fn golden_words(golden: &'static str) -> Vec<(&'static str, Vec<u32>)> {
     let hex = |s: &str| u32::from_str_radix(s, 16).unwrap();
-    include_str!("golden/encode.golden")
+    golden
         .lines()
         .filter_map(|l| {
             let mut parts = l.split(" | ");
@@ -1070,11 +1367,12 @@ fn golden_words() -> Vec<(&'static str, Vec<u32>)> {
         .collect()
 }
 
-/// Re-assembles the plain disassembly of `w`. Err: why it doesn't round-trip.
-fn reassemble(w: u32) -> Result<u32, String> {
-    // `{inst}` is the disassembler's syntax, which merlin-as accepts.
-    let text = decode(w).to_string();
-    match assemble(&text) {
+/// Re-assembles the plain disassembly of `w` for `xlen`. Err: why it doesn't
+/// round-trip.
+fn reassemble(w: u32, xlen: Xlen) -> Result<u32, String> {
+    // The disassembler's syntax, which merlin-as accepts.
+    let text = disasm(decode(w, xlen), xlen);
+    match assemble(&text, xlen) {
         Ok(again) if again.len() == 1 => Ok(again[0].word),
         Ok(again) => {
             let again: Vec<String> = again.iter().map(|w| format!("{:08x}", w.word)).collect();
@@ -1089,8 +1387,18 @@ fn reassemble(w: u32) -> Result<u32, String> {
 
 #[test]
 fn roundtrip_disasm() {
+    check_disasm(include_str!("golden/encode.golden"), CLANG_WORDS, RV32);
+}
+
+#[test]
+fn roundtrip_disasm_on_rv64() {
+    check_disasm(include_str!("golden/rv64/encode.golden"), CLANG_WORDS64, RV64);
+}
+
+fn check_disasm(golden: &'static str, clang: &[(&'static str, &[u32])], xlen: Xlen) {
     let mut rep = Report::new("encode(disasm(decode(w))) == w");
-    // Not in the golden file. Words from clang (Xcal written as `.insn i 0x0b, ...`).
+    // Not in the golden files, and the same on both widths. Words from clang
+    // (Xcal written as `.insn i 0x0b, ...`).
     let extra = [
         ("xcal.dbg a0", vec![0x0005_000b]),
         ("xcal.halt zero", vec![0x0000_100b]),
@@ -1100,13 +1408,13 @@ fn roundtrip_disasm() {
         ("fence.tso", vec![0x8330_000f]),
         ("unimp", vec![0xc000_1073]),
     ];
-    let clang = CLANG_WORDS.iter().map(|&(src, words)| (src, words.to_vec()));
-    for (src, words) in golden_words().into_iter().chain(extra).chain(clang) {
+    let clang = clang.iter().map(|&(src, words)| (src, words.to_vec()));
+    for (src, words) in golden_words(golden).into_iter().chain(extra).chain(clang) {
         rep.total += 1;
         // Words are compared, not decoded `Inst`s: `decode` ignores some bits
         // (fence's pred/succ, for one) that must still come out right.
         for w in words {
-            match reassemble(w) {
+            match reassemble(w, xlen) {
                 Ok(again) if again == w => {}
                 Ok(again) => {
                     rep.fails
@@ -1126,9 +1434,19 @@ fn roundtrip_disasm() {
 /// The same round trip on a large pseudo-random sample of instruction words:
 /// every word the decoder accepts must disassemble to text that assembles to
 /// an instruction decoding the same way, and to the very same word unless it
-/// is a fence (whose reserved fields the decoder ignores).
+/// is a fence (whose reserved fields the decoder ignores). On RV64 too, where
+/// more words are instructions (OP-32, OP-IMM-32, ld, 6-bit shifts...).
 #[test]
 fn roundtrip_random_words() {
+    check_random_words(RV32);
+}
+
+#[test]
+fn roundtrip_random_words_on_rv64() {
+    check_random_words(RV64);
+}
+
+fn check_random_words(xlen: Xlen) {
     let mut rep = Report::new("random words");
     let mut x: u32 = 0x1234_5678;
     let mut valid = 0;
@@ -1140,18 +1458,19 @@ fn roundtrip_random_words() {
         // Force a 32-bit instruction, and pick the major opcode from the low
         // bits so every format gets a fair share.
         let w = x | 3;
-        let inst = decode(w);
+        let inst = decode(w, xlen);
         if matches!(inst, Inst::Illegal(_)) {
             continue;
         }
         valid += 1;
         rep.total += 1;
-        match reassemble(w) {
+        match reassemble(w, xlen) {
             Ok(again) if again == w => {}
-            Ok(again) if w & 0x7f == 0b0001111 && decode(again) == inst => {}
-            Ok(again) => rep
-                .fails
-                .push(format!("  {w:08x} ({inst}) assembles back to {again:08x}")),
+            Ok(again) if w & 0x7f == 0b0001111 && decode(again, xlen) == inst => {}
+            Ok(again) => rep.fails.push(format!(
+                "  {w:08x} ({}) assembles back to {again:08x}",
+                disasm(inst, xlen)
+            )),
             Err(why) => rep.fails.push(format!("  {why}")),
         }
         if rep.fails.len() > 20 {

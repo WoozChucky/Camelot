@@ -1,6 +1,9 @@
 //! Bad instructions must be rejected with an error on their own source line,
-//! never silently encoded with truncated fields.
+//! never silently encoded with truncated fields. `CASES` are RV32's; `CASES64`
+//! are what RV64 changes: wider shift amounts, the RV64-only instructions'
+//! ranges, and the CSRs and counter reads that exist on RV32 only.
 
+use merlin_as::{Options, Xlen};
 use std::process::Command;
 
 /// Each case is assembled on line 3, after two lines that cannot fail.
@@ -444,15 +447,171 @@ const CASES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The same for RV64.
+const CASES64: &[(&str, &str, &str)] = &[
+    // Shift amounts: 0..=63, and 0..=31 for the W shifts
+    (
+        "slli a0, a0, 64",
+        "shamt above 63",
+        "shift amount 64 out of range (0..=63)",
+    ),
+    (
+        "srai a0, a0, -1",
+        "negative shamt",
+        "shift amount -1 out of range (0..=63)",
+    ),
+    (
+        "slliw a0, a0, 32",
+        "W shift amount above 31",
+        "shift amount 32 out of range (0..=31)",
+    ),
+    (
+        "sraiw a0, a1, -1",
+        "negative W shift amount",
+        "shift amount -1 out of range (0..=31)",
+    ),
+    (
+        "srliw a0, a1, x",
+        "a W shift amount must be a constant",
+        "shift amount must be a number",
+    ),
+    // addiw, ld, lwu and sd: 12-bit signed immediates, as addi, lw and sw
+    (
+        "addiw a0, a1, 2048",
+        "addiw immediate above 2047",
+        "immediate 2048 out of range (-2048..=2047)",
+    ),
+    (
+        "addiw a0, a1, -2049",
+        "addiw immediate below -2048",
+        "immediate -2049 out of range",
+    ),
+    (
+        "ld a0, 2048(sp)",
+        "ld offset out of range",
+        "immediate 2048 out of range",
+    ),
+    (
+        "lwu a0, -2049(sp)",
+        "lwu offset out of range",
+        "immediate -2049 out of range",
+    ),
+    (
+        "sd a0, 2048(sp)",
+        "sd offset out of range",
+        "immediate 2048 out of range",
+    ),
+    // The W operations take registers only (LLVM reads `addw a0, a1, 5` as
+    // addiw; merlin-as, as for `add a0, a1, 5`, does not).
+    (
+        "addw a0, a1, 5",
+        "addw with an immediate",
+        "expected a register, found an immediate",
+    ),
+    ("sext.w a0", "sext.w without its source", "usage: sext.w rd, rs"),
+    // The .d atomics: no offset, ordering suffixes in order
+    (
+        "lr.d a0, 4(a1)",
+        "A instructions have no offset field",
+        "lr.d has no offset field: write the address as (rs1)",
+    ),
+    (
+        "amoadd.d.rlaq a0, a1, (a2)",
+        "ordering suffix out of order",
+        "unknown instruction 'amoadd.d.rlaq'",
+    ),
+    // RV32 only: the high halves of the counters, and the CSRs that hold
+    // the high half of a 64-bit register on RV32
+    (
+        "rdcycleh a0",
+        "rdcycleh is RV32 only",
+        "'rdcycleh' exists only on RV32 (on RV64, rdcycle reads all 64 bits)",
+    ),
+    (
+        "rdtimeh a0",
+        "rdtimeh is RV32 only",
+        "'rdtimeh' exists only on RV32 (on RV64, rdtime reads all 64 bits)",
+    ),
+    (
+        "rdinstreth a0",
+        "rdinstreth is RV32 only",
+        "'rdinstreth' exists only on RV32 (on RV64, rdinstret reads all 64 bits)",
+    ),
+    (
+        "csrr a0, cycleh",
+        "cycleh is RV32 only",
+        "CSR 'cycleh' exists only on RV32",
+    ),
+    (
+        "csrr a0, timeh",
+        "timeh is RV32 only",
+        "CSR 'timeh' exists only on RV32",
+    ),
+    (
+        "csrr a0, instreth",
+        "instreth is RV32 only",
+        "CSR 'instreth' exists only on RV32",
+    ),
+    (
+        "csrw mcycleh, a0",
+        "mcycleh is RV32 only",
+        "CSR 'mcycleh' exists only on RV32",
+    ),
+    (
+        "csrw minstreth, a0",
+        "minstreth is RV32 only",
+        "CSR 'minstreth' exists only on RV32",
+    ),
+    (
+        "csrs mstatush, a0",
+        "mstatush is RV32 only",
+        "CSR 'mstatush' exists only on RV32",
+    ),
+    (
+        "csrc menvcfgh, a0",
+        "menvcfgh is RV32 only",
+        "CSR 'menvcfgh' exists only on RV32",
+    ),
+    (
+        "csrr a0, hpmcounter3h",
+        "hpmcounter3h is RV32 only",
+        "CSR 'hpmcounter3h' exists only on RV32",
+    ),
+    (
+        "csrrw a0, mhpmcounter31h, a1",
+        "mhpmcounter31h is RV32 only",
+        "CSR 'mhpmcounter31h' exists only on RV32",
+    ),
+    (
+        "csrr a0, pmpcfg1",
+        "pmpcfg1 is RV32 only (pmpcfg0 holds 8 entries on RV64)",
+        "CSR 'pmpcfg1' exists only on RV32",
+    ),
+    (
+        "csrrsi a0, pmpcfg3, 1",
+        "pmpcfg3 is RV32 only",
+        "CSR 'pmpcfg3' exists only on RV32",
+    ),
+];
+
 fn source(case: &str) -> String {
     format!("    .text\nstart:\n    {case}\n")
 }
 
 #[test]
 fn bad_instructions_are_rejected_on_their_line() {
+    check_cases(CASES, Xlen::Rv32);
+}
+
+#[test]
+fn bad_rv64_instructions_are_rejected_on_their_line() {
+    check_cases(CASES64, Xlen::Rv64);
+}
+
+fn check_cases(cases: &[(&str, &str, &str)], xlen: Xlen) {
     let mut fails = Vec::new();
-    for &(case, why, says) in CASES {
-        match merlin_as::assemble(&source(case)) {
+    for &(case, why, says) in cases {
+        match merlin_as::assemble_with(&source(case), &Options { xlen }) {
             Ok(_) => fails.push(format!("  {case:<30} assembled, but should fail: {why}")),
             Err(errs) => {
                 if let Some(e) = errs.iter().find(|e| e.line != LINE) {
@@ -522,6 +681,59 @@ fn unknown_mnemonics_are_named() {
     for m in ["frobnicate", "mulw", "c.addi", "amoadd.d"] {
         let errs = merlin_as::assemble(&format!("    {m} a0, a1, a2\n")).unwrap_err();
         assert_eq!(errs[0].msg, format!("unknown instruction '{m}'"));
+    }
+}
+
+/// On RV32 an RV64-only mnemonic is just not an instruction: the same error
+/// as any unknown mnemonic, whatever its operands. On RV64 each of the same
+/// lines assembles.
+#[test]
+fn rv64_instructions_are_unknown_on_rv32() {
+    let lines = [
+        "addiw a0, a1, 1",
+        "slliw a0, a1, 1",
+        "srliw a0, a1, 1",
+        "sraiw a0, a1, 1",
+        "addw a0, a1, a2",
+        "subw a0, a1, a2",
+        "sllw a0, a1, a2",
+        "srlw a0, a1, a2",
+        "sraw a0, a1, a2",
+        "mulw a0, a1, a2",
+        "divw a0, a1, a2",
+        "divuw a0, a1, a2",
+        "remw a0, a1, a2",
+        "remuw a0, a1, a2",
+        "ld a0, 8(a1)",
+        "lwu a0, 8(a1)",
+        "sd a0, 8(a1)",
+        "ld a0, target",
+        "sd a0, target, t0",
+        "lr.d a0, (a1)",
+        "sc.d.aq a0, a1, (a2)",
+        "amoswap.d a0, a1, (a2)",
+        "amoadd.d.rl a0, a1, (a2)",
+        "amoxor.d a0, a1, (a2)",
+        "amoand.d a0, a1, (a2)",
+        "amoor.d a0, a1, (a2)",
+        "amomin.d a0, a1, (a2)",
+        "amomax.d a0, a1, (a2)",
+        "amominu.d a0, a1, (a2)",
+        "amomaxu.d.aqrl a0, a1, (a2)",
+        "sext.w a0, a1",
+        "negw a0, a1",
+        "zext.w a0, a1",
+    ];
+    for line in lines {
+        let m = line.split_whitespace().next().unwrap();
+        let errs = merlin_as::assemble(&format!("    {line}\n")).unwrap_err();
+        assert_eq!(
+            (errs.len(), errs[0].line, errs[0].msg.as_str()),
+            (1, 1, format!("unknown instruction '{m}'").as_str()),
+            "{line}"
+        );
+        let rv64 = Options { xlen: Xlen::Rv64 };
+        assert!(merlin_as::assemble_with(line, &rv64).is_ok(), "{line} on RV64");
     }
 }
 
