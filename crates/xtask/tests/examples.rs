@@ -152,7 +152,7 @@ fn scenario_rv32(name: &str) -> Scenario {
         // Presses seen, Esc included.
         "kbd-echo" => Scenario {
             keys: typed("ok"),
-            ..plain("ok[dbg] pc=8000005c s1 = 0x00000003 (3)\n", 0)
+            ..plain("ok[dbg] pc=800000f0 s1 = 0x00000003 (3)\n", 0)
         },
         // One interrupt per event: two taps and the Esc press.
         "kbd-echo-irq" => Scenario {
@@ -231,7 +231,7 @@ fn scenario_rv64(name: &str) -> Scenario {
         "colorbars" => plain("", 0),
         "kbd-echo" => Scenario {
             keys: typed("ok"),
-            ..plain("ok[dbg] pc=000000008000005c s1 = 0x0000000000000003 (3)\n", 0)
+            ..plain("ok[dbg] pc=00000000800000f0 s1 = 0x0000000000000003 (3)\n", 0)
         },
         "kbd-echo-irq" => Scenario {
             keys: typed("ok"),
