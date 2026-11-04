@@ -1,0 +1,185 @@
+prog.o:	file format elf32-littleriscv
+
+.debug_info contents:
+0x00000000: Compile Unit: length = 0x00000100, format = DWARF32, version = 0x0005, unit_type = DW_UT_compile, abbr_offset = 0x0000, addr_size = 0x04 (next unit at 0x00000104)
+
+0x0000000c: DW_TAG_compile_unit
+              DW_AT_producer	("clang version 23.1.4 (https://github.com/llvm/llvm-project 7a941dfb2877a0b8cf30323fefa85ad019e0b0f5)")
+              DW_AT_language	(DW_LANG_C11)
+              DW_AT_name	("prog.c")
+              DW_AT_str_offsets_base	(0x00000008)
+              DW_AT_stmt_list	(0x00000000)
+              DW_AT_comp_dir	("/camelot")
+              DW_AT_low_pc	(0x00000000)
+              DW_AT_ranges	(indexed (0x0) rangelist = 0x00000010
+                 [0x00000000, 0x000000b8)
+                 [0x000000b8, 0x00000108)
+                 [0x00000000, 0x00000050))
+              DW_AT_addr_base	(0x00000008)
+              DW_AT_rnglists_base	(0x0000000c)
+
+0x00000027:   DW_TAG_subprogram
+                DW_AT_low_pc	(0x00000000)
+                DW_AT_high_pc	(0x0000008c)
+                DW_AT_frame_base	(DW_OP_reg8 X8)
+                DW_AT_name	("sum")
+                DW_AT_decl_file	("/camelot\prog.c")
+                DW_AT_decl_line	(15)
+                DW_AT_prototyped	(true)
+                DW_AT_type	(0x000000b6 "int")
+                DW_AT_external	(true)
+
+0x00000036:     DW_TAG_formal_parameter
+                  DW_AT_location	(DW_OP_breg2 X2+20)
+                  DW_AT_name	("p")
+                  DW_AT_decl_file	("/camelot\prog.c")
+                  DW_AT_decl_line	(15)
+                  DW_AT_type	(0x000000f9 "const int *")
+
+0x00000041:     DW_TAG_formal_parameter
+                  DW_AT_location	(DW_OP_breg2 X2+16)
+                  DW_AT_name	("n")
+                  DW_AT_decl_file	("/camelot\prog.c")
+                  DW_AT_decl_line	(15)
+                  DW_AT_type	(0x000000b6 "int")
+
+0x0000004c:     DW_TAG_variable
+                  DW_AT_location	(DW_OP_breg2 X2+12)
+                  DW_AT_name	("s")
+                  DW_AT_decl_file	("/camelot\prog.c")
+                  DW_AT_decl_line	(16)
+                  DW_AT_type	(0x000000b6 "int")
+
+0x00000057:     DW_TAG_lexical_block
+                  DW_AT_low_pc	(0x00000020)
+                  DW_AT_high_pc	(0x00000078)
+
+0x0000005d:       DW_TAG_variable
+                    DW_AT_location	(DW_OP_breg2 X2+8)
+                    DW_AT_name	("i")
+                    DW_AT_decl_file	("/camelot\prog.c")
+                    DW_AT_decl_line	(17)
+                    DW_AT_type	(0x000000b6 "int")
+
+0x00000068:       NULL
+
+0x00000069:     NULL
+
+0x0000006a:   DW_TAG_subprogram
+                DW_AT_low_pc	(0x0000008c)
+                DW_AT_high_pc	(0x000000b8)
+                DW_AT_frame_base	(DW_OP_reg8 X8)
+                DW_AT_name	("twice")
+                DW_AT_decl_file	("/camelot\prog.c")
+                DW_AT_decl_line	(11)
+                DW_AT_prototyped	(true)
+                DW_AT_type	(0x000000b6 "int")
+
+0x00000079:     DW_TAG_formal_parameter
+                  DW_AT_location	(DW_OP_breg2 X2+4)
+                  DW_AT_name	("x")
+                  DW_AT_decl_file	("/camelot\prog.c")
+                  DW_AT_decl_line	(11)
+                  DW_AT_type	(0x000000b6 "int")
+
+0x00000084:     NULL
+
+0x00000085:   DW_TAG_subprogram
+                DW_AT_low_pc	(0x00000000)
+                DW_AT_high_pc	(0x00000050)
+                DW_AT_frame_base	(DW_OP_reg8 X8)
+                DW_AT_name	("other")
+                DW_AT_decl_file	("/camelot\prog.c")
+                DW_AT_decl_line	(22)
+                DW_AT_prototyped	(true)
+                DW_AT_type	(0x000000b6 "int")
+                DW_AT_external	(true)
+
+0x00000094:   DW_TAG_subprogram
+                DW_AT_low_pc	(0x000000b8)
+                DW_AT_high_pc	(0x00000108)
+                DW_AT_frame_base	(DW_OP_reg8 X8)
+                DW_AT_name	("_start")
+                DW_AT_decl_file	("/camelot\prog.c")
+                DW_AT_decl_line	(26)
+                DW_AT_prototyped	(true)
+                DW_AT_external	(true)
+
+0x0000009f:   DW_TAG_variable
+                DW_AT_name	("table")
+                DW_AT_type	(0x000000aa "int[4]")
+                DW_AT_external	(true)
+                DW_AT_decl_file	("/camelot\prog.c")
+                DW_AT_decl_line	(7)
+                DW_AT_location	(DW_OP_addrx 0x5)
+
+0x000000aa:   DW_TAG_array_type
+                DW_AT_type	(0x000000b6 "int")
+
+0x000000af:     DW_TAG_subrange_type
+                  DW_AT_type	(0x000000ba "__ARRAY_SIZE_TYPE__")
+                  DW_AT_count	(0x04)
+
+0x000000b5:     NULL
+
+0x000000b6:   DW_TAG_base_type
+                DW_AT_name	("int")
+                DW_AT_encoding	(DW_ATE_signed)
+                DW_AT_byte_size	(0x04)
+
+0x000000ba:   DW_TAG_base_type
+                DW_AT_name	("__ARRAY_SIZE_TYPE__")
+                DW_AT_byte_size	(0x08)
+                DW_AT_encoding	(DW_ATE_unsigned)
+
+0x000000be:   DW_TAG_variable
+                DW_AT_name	("message")
+                DW_AT_type	(0x000000c9 "const char[4]")
+                DW_AT_external	(true)
+                DW_AT_decl_file	("/camelot\prog.c")
+                DW_AT_decl_line	(8)
+                DW_AT_location	(DW_OP_addrx 0x6)
+
+0x000000c9:   DW_TAG_array_type
+                DW_AT_type	(0x000000d5 "const char")
+
+0x000000ce:     DW_TAG_subrange_type
+                  DW_AT_type	(0x000000ba "__ARRAY_SIZE_TYPE__")
+                  DW_AT_count	(0x04)
+
+0x000000d4:     NULL
+
+0x000000d5:   DW_TAG_const_type
+                DW_AT_type	(0x000000da "char")
+
+0x000000da:   DW_TAG_base_type
+                DW_AT_name	("char")
+                DW_AT_encoding	(DW_ATE_unsigned_char)
+                DW_AT_byte_size	(0x01)
+
+0x000000de:   DW_TAG_variable
+                DW_AT_name	("where")
+                DW_AT_type	(0x000000e9 "int *")
+                DW_AT_external	(true)
+                DW_AT_decl_file	("/camelot\prog.c")
+                DW_AT_decl_line	(9)
+                DW_AT_location	(DW_OP_addrx 0x7)
+
+0x000000e9:   DW_TAG_pointer_type
+                DW_AT_type	(0x000000b6 "int")
+
+0x000000ee:   DW_TAG_variable
+                DW_AT_name	("counter")
+                DW_AT_type	(0x000000b6 "int")
+                DW_AT_external	(true)
+                DW_AT_decl_file	("/camelot\prog.c")
+                DW_AT_decl_line	(6)
+                DW_AT_location	(DW_OP_addrx 0x8)
+
+0x000000f9:   DW_TAG_pointer_type
+                DW_AT_type	(0x000000fe "const int")
+
+0x000000fe:   DW_TAG_const_type
+                DW_AT_type	(0x000000b6 "int")
+
+0x00000103:   NULL

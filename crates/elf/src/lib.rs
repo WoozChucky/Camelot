@@ -1,7 +1,7 @@
 //! ELF reader for little-endian RISC-V files of either class, ELF32 (RV32)
 //! and ELF64 (RV64): the ELF header, program headers, section headers,
 //! symbols and relocations, and the DWARF line tables of `.debug_line`
-//! ([`lines`]).
+//! ([`lines`]), and the entries of `.debug_info` ([`units`], [`dies`]).
 //!
 //! The two classes hold the same records. ELF64 widens addresses, offsets and
 //! sizes to 8 bytes and moves a few narrow fields so that the wide ones stay
@@ -17,6 +17,7 @@
 
 use std::fmt;
 
+pub mod dies;
 pub mod lines;
 pub mod units;
 
