@@ -226,7 +226,7 @@ Closing the window stops the emulator. When the program stops first, the window 
 
 ### Keyboard
 
-Keys typed into the framebuffer window go to the Xcal keyboard device (spec section 9.4): a FIFO of press/release events with Shift and Ctrl flags, polled through `KBD_STATUS`/`KBD_DATA` or delivered as PLIC interrupts (source 2). Without a window the keyboard stays empty and stdin keeps feeding the UART. `examples/kbd-echo` echoes key presses to the terminal, polling (`kbd-echo.elf`) or interrupt-driven (`kbd-echo-irq.elf`); Esc stops it:
+Keys typed into the framebuffer window go to the Xcal keyboard device (spec section 9.4): a FIFO of press/release events, polled through `KBD_STATUS`/`KBD_DATA` or delivered as PLIC interrupts (source 2). In ASCII mode (the default) an event is the character typed with Shift and Ctrl flags; in raw mode (`KBD_CTRL` bit 1) it is the physical key, as the USB HID usage a USB keyboard sends, with a press and a release for every key, modifiers included, which is what a desktop needs. Without a window the keyboard stays empty and stdin keeps feeding the UART. `examples/kbd-echo` echoes key presses to the terminal, polling (`kbd-echo.elf`) or interrupt-driven (`kbd-echo-irq.elf`); in the polling one F12 switches to raw mode and back, where it prints every event's usage (`+e1 +04 -04 -e1 ` for Shift+a); Esc stops it:
 
 ```
 cargo run --release -p grail -- --fb examples/kbd-echo/kbd-echo.elf
