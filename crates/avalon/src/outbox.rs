@@ -19,7 +19,7 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Bytes a client may have queued and not yet written before it is considered stuck:
-/// more than a screen viewer that is held back can have (`SCREEN_BACKLOG`, then a look's
+/// more than a screen viewer that is held back can have (`screen_backlog`, then a look's
 /// changes and a resize's full frame, each up to a 1920x1080 frame).
 pub const MAX_QUEUED: usize = 32 * 1024 * 1024;
 

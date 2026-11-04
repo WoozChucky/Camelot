@@ -242,7 +242,8 @@ fn a_busy_screen_is_rate_limited() {
 
 /// A viewer that stops reading while the whole screen changes all the time (~36 MB/s
 /// at the full rate) is sent nothing more until it reads again, so it is not cut off
-/// for falling 8 MiB behind; when it reads again it gets whole frames that apply.
+/// for falling [`avalon::MAX_QUEUED`] behind; when it reads again it gets whole frames
+/// that apply.
 #[test]
 fn a_viewer_that_stops_reading_is_held_back_not_cut_off() {
     let server = server(None);
