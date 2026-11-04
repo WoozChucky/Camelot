@@ -114,6 +114,36 @@ fn merlin_dbg(args: &[&str], commands: &str) -> String {
     stdout
 }
 
+/// A file of the test's in the temporary directory, removed when the guard is
+/// dropped: when the test ends, and when it fails part way.
+struct TempFile(PathBuf);
+
+impl TempFile {
+    /// `name` (made unique to this process) with `data` in it.
+    fn new(name: &str, data: &[u8]) -> TempFile {
+        let path = std::env::temp_dir().join(format!("merlin-dbg-{}-{name}", std::process::id()));
+        std::fs::write(&path, data).unwrap();
+        TempFile(path)
+    }
+
+    fn to_str(&self) -> &str {
+        self.0.to_str().unwrap()
+    }
+}
+
+impl std::ops::Deref for TempFile {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Checks that `out` has `lines`, in this order (other lines may come between).
 fn assert_lines(out: &str, lines: &[&str]) {
     let mut rest = out.lines();
@@ -394,8 +424,7 @@ fn stepping_through_a_user_program() {
     // the objects; the kernel runs the same program without them. It is the first
     // user program to run, so its main is where the breakpoint stops.
     let sh = xtask::userprogs::build_named(&path("kernel/user"), "sh").unwrap();
-    let elf = std::env::temp_dir().join(format!("merlin-dbg-sh-{}.elf", std::process::id()));
-    std::fs::write(&elf, &sh.debug).unwrap();
+    let elf = TempFile::new("sh.elf", &sh.debug);
     let main = line_of("kernel/user/sh.c", "int main(void) {");
     let out = connected(
         "kernel/kernel.elf",
@@ -414,7 +443,6 @@ fn stepping_through_a_user_program() {
             elf.display()
         ),
     );
-    let _ = std::fs::remove_file(&elf);
     let symbols = merlin_dbg::symbols::Symbols::from_elf(&sh.debug).unwrap();
     let main_at = symbols.lookup("main").unwrap();
     assert_lines(
@@ -527,18 +555,16 @@ fn harts_and_watchpoints() {
 fn starting_grail_itself() {
     // merlin-dbg -- grail-args: the machine in merlin-dbg's process, its console on
     // merlin-dbg's stdout. Commands from a file (-x), then stdin.
-    let script = std::env::temp_dir().join(format!("merlin-dbg-{}.cmds", std::process::id()));
-    std::fs::write(&script, "# a comment\nbreak puts\ncontinue\n").unwrap();
+    let script = TempFile::new("script.cmds", b"# a comment\nbreak puts\ncontinue\n");
     let out = merlin_dbg(
         &[
             "-x",
-            script.to_str().unwrap(),
+            script.to_str(),
             "--",
             path("examples/hello/hello.elf").to_str().unwrap(),
         ],
         "bogus\nx/1 nowhere\ndelete 7\ncontinue\nregs\n",
     );
-    let _ = std::fs::remove_file(&script);
     assert_lines(
         &out,
         &[
@@ -717,8 +743,9 @@ const RV64_DIR: &str = "crates/merlin-dbg/tests/rv64";
 
 /// `tests/rv64/prog.c` and `crt0.s` built for RV64 with our tools, `prog.c` with
 /// its line tables (merlin -g), into an executable at 0x80000000 (merlin-ld's
-/// default layout), written to a file of its own for `test`. Its path.
-fn rv64_program(test: &str) -> PathBuf {
+/// default layout), written to a file of its own for `test`, removed with the
+/// guard.
+fn rv64_program(test: &str) -> TempFile {
     let xlen = excalibur::Xlen::Rv64;
     let dir = path(RV64_DIR);
     let opts = merlin::Options {
@@ -743,9 +770,7 @@ fn rv64_program(test: &str) -> PathBuf {
         .collect();
     let linked = merlin_ld::link(&inputs, &merlin_ld::Options::default())
         .unwrap_or_else(|e| panic!("merlin-ld: {e:?}"));
-    let elf = std::env::temp_dir().join(format!("merlin-dbg-rv64-{test}-{}.elf", std::process::id()));
-    std::fs::write(&elf, &linked.elf).unwrap();
-    elf
+    TempFile::new(&format!("rv64-{test}.elf"), &linked.elf)
 }
 
 /// The addresses of `names` in the program at `elf`, from its symbols (so that
@@ -774,7 +799,7 @@ fn source_lines_of_an_rv64_program() {
     let main = line_of(&file, "int main(void) {");
     let fact = line_of(&file, "long fact(long n) {");
     let out = connected(
-        elf.to_str().unwrap(),
+        elf.to_str(),
         1,
         b"",
         &format!(
@@ -792,7 +817,6 @@ fn source_lines_of_an_rv64_program() {
             main - 1
         ),
     );
-    let _ = std::fs::remove_file(&elf);
     assert_lines(
         &out,
         &[
@@ -860,7 +884,7 @@ fn stepping_through_an_rv64_program() {
     let file = format!("{RV64_DIR}/prog.c");
     let line = |start: &str| line_of(&file, start);
     let out = connected(
-        elf.to_str().unwrap(),
+        elf.to_str(),
         1,
         b"",
         "break sum\n\
@@ -882,7 +906,6 @@ fn stepping_through_an_rv64_program() {
          step\n\
          continue\n",
     );
-    let _ = std::fs::remove_file(&elf);
     let sum = line("long sum(int n, ...) {");
     let base_case = line("        return sum(1, 1L);");
     let recursion = line("    return n * fact(n - 1);");
