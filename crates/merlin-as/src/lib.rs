@@ -77,11 +77,17 @@ pub fn parse_march(s: &str) -> Result<Xlen, String> {
         .iter()
         .find(|(name, _)| *name == s)
         .map(|&(_, xlen)| xlen)
-        .ok_or_else(|| {
-            format!(
-                "unsupported -march '{s}' (merlin-as takes rv32ima_zicsr_zifencei or rv64ima_zicsr_zifencei)"
-            )
-        })
+        .ok_or_else(|| unsupported_march(s))
+}
+
+/// The error for a `-march=` value that is not in [`MARCH`]. It lists the
+/// strings from the table, so a new one is named without a second edit.
+fn unsupported_march(s: &str) -> String {
+    let takes: Vec<&str> = MARCH.iter().map(|&(name, _)| name).collect();
+    format!(
+        "unsupported -march '{s}' (merlin-as takes {})",
+        takes.join(" or ")
+    )
 }
 
 /// Assembles source text into an RV32 object. Returns every error found.
@@ -127,12 +133,12 @@ mod tests {
             "RV64IMA_ZICSR_ZIFENCEI",
             "rv64ima_zicsr_zifencei_zba",
         ] {
-            assert_eq!(
-                parse_march(s),
-                Err(format!(
-                    "unsupported -march '{s}' (merlin-as takes rv32ima_zicsr_zifencei or rv64ima_zicsr_zifencei)"
-                ))
-            );
+            assert_eq!(parse_march(s), Err(unsupported_march(s)));
         }
+        // What the message looks like, spelled out once.
+        assert_eq!(
+            unsupported_march("rv64gc"),
+            "unsupported -march 'rv64gc' (merlin-as takes rv32ima_zicsr_zifencei or rv64ima_zicsr_zifencei)"
+        );
     }
 }

@@ -4,7 +4,8 @@
 /// The subset of RISC-V ELF relocations we emit (psABI numbering).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelocKind {
-    /// 32-bit absolute address, for `.word sym`.
+    /// 32-bit absolute address: `.word sym`, RV32 DWARF addresses, and the
+    /// 4-byte DWARF32 string offsets (`.debug_line_str`) on both widths.
     Abs32,
     /// 64-bit absolute address: `.dword sym`, and RV64 DWARF addresses.
     Abs64,

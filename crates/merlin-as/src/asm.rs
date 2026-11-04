@@ -533,8 +533,9 @@ impl Assembler {
                     BinOp::Rem => a.checked_rem(b)?,
                     BinOp::Shl => a.wrapping_shl(b as u32),
                     // Logical, not arithmetic, as in LLVM (MCAsmInfo's
-                    // `UseLogicalShr`, on for ELF targets): a negative value
-                    // shifts zeros in (`-16 >> 2` is 0x3ffffffffffffffc).
+                    // `UseLogicalShr`, true by default and left on by
+                    // RISC-V): a negative value shifts zeros in (`-16 >> 2`
+                    // is 0x3ffffffffffffffc).
                     BinOp::Shr => (a as u64).wrapping_shr(b as u32) as i64,
                     BinOp::And => a & b,
                     BinOp::Or => a | b,
@@ -839,7 +840,10 @@ impl Assembler {
                 "{directive}: '{shown}' must be a label defined before this"
             ));
         };
-        let value = t.value as i64 + addend;
+        // The sum wraps like every other (`.set y, x + BIG` with a 64-bit
+        // BIG must not overflow); whatever it comes to, it must land in the
+        // section.
+        let value = (t.value as i64).wrapping_add(addend);
         if !(0..=u32::MAX as i64).contains(&value) {
             return self.error(format!("{directive}: '{name}' would be outside its section"));
         }
@@ -1224,19 +1228,17 @@ impl Assembler {
         }
         let base = self.section_size(".debug_line");
         let str_base = self.section_size(".debug_line_str");
-        // An address is as wide as the target's registers: 4 bytes on RV32,
-        // 8 on RV64 (DWARF's address_size).
-        let address_size = (self.xlen.bits() / 8) as u8;
+        // A code address is as wide as the target's registers: 4 bytes on
+        // RV32 and 8 on RV64 (DWARF's address_size), relocated by R_RISCV_32
+        // or R_RISCV_64. A string's offset is a 4-byte DWARF32 field on both
+        // widths (R_RISCV_32, as clang writes it).
+        let (address_size, address) = match self.xlen {
+            Xlen::Rv32 => (4, RelocKind::Abs32),
+            Xlen::Rv64 => (8, RelocKind::Abs64),
+        };
         let table = dwarf::encode(&root.dir, &root, &files, &sequences, base, str_base, address_size);
         let (line_sec, _) = self.append(".debug_line", &table.line);
         let (str_sec, _) = self.append(".debug_line_str", &table.line_str);
-        // A string's offset is a 4-byte DWARF32 field on both widths
-        // (R_RISCV_32, as clang writes it); a code address is R_RISCV_32 on
-        // RV32 and R_RISCV_64 on RV64.
-        let address = match self.xlen {
-            Xlen::Rv32 => RelocKind::Abs32,
-            Xlen::Rv64 => RelocKind::Abs64,
-        };
         for (at, target) in table.fixups {
             let (sec, addend, kind) = match target {
                 dwarf::Target::LineStr(off) => (str_sec, off, RelocKind::Abs32),
@@ -1261,9 +1263,11 @@ impl Assembler {
     }
 
     /// A relocation in debug information against a `.L` label becomes one
-    /// against the label's section, plus the label's offset (as GNU as and
-    /// LLVM do for local symbols they can drop), so that compiler-made labels
-    /// need no symbols.
+    /// against the label's section, plus the label's offset, so that
+    /// compiler-made labels need no symbols. GNU as does the same for the
+    /// local symbols it drops; LLVM keeps the `.L` symbol on RISC-V (clang's
+    /// `.quad .Lend` in `.debug_info` is `R_RISCV_64 .Lend + 0`), but the
+    /// linker computes the same address either way.
     fn debug_relocs_to_sections(&mut self) {
         for sec in 0..self.sections.len() {
             if self.sections[sec].kind != SectionKind::Debug {
@@ -2054,6 +2058,18 @@ third = .L_MergedGlobals+8
                 errs[0].msg.contains("must be a label defined before this"),
                 "{bad}: {errs:?}"
             );
+        }
+        // And the address must be in the label's section: not before its
+        // start, nor past 4 GiB, even when the addend wraps around in 64
+        // bits (x + 0x7fffffffffffffff is 0x8000000000000003, which llvm-mc
+        // takes, but no merlin-as section reaches it).
+        for bad in [
+            ".data\nx: .word 0\n.set y, x - 1\n",
+            ".data\nx: .word 0\n.set y, x + 0x100000000\n",
+            ".data\n.word 0\nx: .word 0\n.equ BIG, 0x7fffffffffffffff\n.set y, x + BIG\n",
+        ] {
+            let errs = crate::assemble(bad).unwrap_err();
+            assert_eq!(errs[0].msg, ".set: 'y' would be outside its section", "{bad}");
         }
     }
 }

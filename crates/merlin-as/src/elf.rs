@@ -348,9 +348,12 @@ pub fn write(obj: &Object) -> Vec<u8> {
             let ty = r.kind.elf_type();
             class.put_word(&mut out, r.offset.into());
             match obj.xlen {
-                // ELF32_R_INFO(sym, type); the addend is a 32-bit field, and
-                // an RV32 address wraps at 32 bits, so cutting it changes
-                // nothing the linker computes (LLVM writes the same).
+                // ELF32_R_INFO(sym, type); the addend field holds 32 bits, so
+                // a wider addend loses its high bits, as LLVM cuts it. For a
+                // 32-bit field (`.word sym`, an instruction) that changes
+                // nothing, since an RV32 address wraps at 32 bits; for the
+                // 64-bit field of `.dword sym + 0x100000000` the high word of
+                // the addend is lost (clang's R_RISCV_64 is `sym + 0` too).
                 Xlen::Rv32 => {
                     put32(&mut out, (sym << 8) | ty);
                     put32(&mut out, r.addend as i32 as u32);

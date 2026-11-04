@@ -552,7 +552,8 @@ mod tests {
                        1405010a 4b020400 0101";
         assert_eq!(rv64.line, hex(clang64));
         // R_RISCV_32 .debug_line_str+0 and +5, R_RISCV_64 .text+0: the same
-        // places, since the address is the last field before the program.
+        // places, since nothing before the address (the header, set_file,
+        // set_column) depends on its width.
         assert_eq!(rv64.fixups, fixups);
         assert_eq!(rv64.line_str, rv32.line_str);
     }
