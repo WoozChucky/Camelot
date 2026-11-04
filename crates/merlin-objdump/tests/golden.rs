@@ -150,18 +150,18 @@ fn run(input: &str, args: &[&str]) -> String {
 
 /// The address of a disassembly line (`80000000: ...`, `      1c: ...`).
 /// Labels (`80000000 <_start>:`) and relocation lines (tab-indented) are not.
-fn insn_addr(line: &str) -> Option<u32> {
+fn insn_addr(line: &str) -> Option<u64> {
     if line.starts_with('\t') {
         return None;
     }
     let (addr, _) = line.trim_start().split_once(':')?;
-    u32::from_str_radix(addr, 16).ok()
+    u64::from_str_radix(addr, 16).ok()
 }
 
 /// The address of a label line (`80000000 <_start>:`).
-fn label_addr(line: &str) -> Option<u32> {
+fn label_addr(line: &str) -> Option<u64> {
     let (addr, rest) = line.split_once(" <")?;
-    rest.ends_with(">:").then(|| u32::from_str_radix(addr, 16).ok())?
+    rest.ends_with(">:").then(|| u64::from_str_radix(addr, 16).ok())?
 }
 
 /// Our exact lines for the instructions llvm-objdump prints as `<unknown>`,
@@ -184,19 +184,19 @@ fn compare(ours: &str, llvm: &str, unknown: &[String]) -> Vec<String> {
     // address llvm prints. llvm steps through them in 1, 2, 4 or more bytes
     // (it guesses the length from the low bits), we step in words, so our
     // lines there are checked against `unknown` instead.
-    let mut addrs: Vec<u32> = llvm
+    let mut addrs: Vec<u64> = llvm
         .lines()
         .filter_map(|l| insn_addr(l).or_else(|| label_addr(l)))
         .collect();
     addrs.sort();
     addrs.dedup();
-    let ranges: Vec<(u32, u32)> = llvm
+    let ranges: Vec<(u64, u64)> = llvm
         .lines()
         .filter(|l| l.ends_with("<unknown>"))
         .filter_map(insn_addr)
-        .map(|a| (a, addrs.iter().copied().find(|&b| b > a).unwrap_or(u32::MAX)))
+        .map(|a| (a, addrs.iter().copied().find(|&b| b > a).unwrap_or(u64::MAX)))
         .collect();
-    let is_unknown = |a: u32| ranges.iter().any(|&(start, end)| (start..end).contains(&a));
+    let is_unknown = |a: u64| ranges.iter().any(|&(start, end)| (start..end).contains(&a));
     let mut problems = Vec::new();
     let llvm_lines: Vec<&str> = llvm.lines().filter(|l| !l.ends_with("<unknown>")).collect();
     let mut our_lines = Vec::new();
@@ -300,7 +300,7 @@ fn hello_elf_every_instruction() {
         "crates/merlin-objdump/tests/fixtures/hello.elf",
         &["-d", "--no-show-raw-insn"],
     );
-    let insns = |text: &str| -> Vec<(u32, String)> {
+    let insns = |text: &str| -> Vec<(u64, String)> {
         text.lines()
             .filter_map(|l| {
                 let a = insn_addr(l)?;

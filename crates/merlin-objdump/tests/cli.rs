@@ -101,6 +101,24 @@ fn elf64_files_are_refused() {
     );
 }
 
+/// A mapping symbol whose ISA LLVM cannot parse gets llvm-objdump's warning
+/// on stderr, once per name; the listing is the same. The riscv-tests ELFs,
+/// built by GNU's assembler, have `$x.0`.
+#[test]
+fn unparsable_isa_mapping_symbols_warn() {
+    let (code, out, err) = objdump(&["-d", "tests/riscv-tests/rv32ui-p-add", "-t"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        err,
+        "merlin-objdump: warning: 'tests/riscv-tests/rv32ui-p-add': could not parse ISA mapping \
+         symbol '$x.0': string may only contain [a-z0-9_]; falling back to default disassembler\n"
+    );
+    assert!(out.contains("<test_2>:"), "{out}");
+    // Only the disassembly reads them.
+    let (code, _, err) = objdump(&["-t", "tests/riscv-tests/rv32ui-p-add"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+}
+
 fn fixtures() -> Vec<PathBuf> {
     let mut files = vec![root().join("examples/hello/hello.elf")];
     for f in ["hello.elf", "hello.o", "isa.o", "relocs.o"] {

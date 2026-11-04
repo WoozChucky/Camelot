@@ -18,8 +18,10 @@
 #
 # Paths are passed relative to the repository root because llvm-objdump
 # prints them in its header line; tests/golden.rs uses the same paths.
-# The golden files were made with LLVM 21 (hex immediates are the default
-# since LLVM 19; older versions print decimal and will not match).
+# The golden files are made with LLVM 23, which the script checks: versions
+# differ in what they print (LLVM 23 names hints such as `pause` and
+# `prefetch.i` and prints data in code under `$d` as `.word`, which LLVM 21
+# did not; hex immediates are the default since LLVM 19).
 # Keep the list below in sync with CASES in crates/merlin-objdump/tests/golden.rs.
 set -eu
 cd "$(dirname "$0")/.."
@@ -27,9 +29,18 @@ FIX=crates/merlin-objdump/tests/fixtures
 OUT=crates/merlin-objdump/tests/golden
 mkdir -p "$OUT"
 
+LLVM_MAJOR=23
+for tool in clang ld.lld llvm-objdump; do
+    # "clang version 23.1.4", "LLVM version 23.1.4", "LLD 23.1.4".
+    version=$("$tool" --version | grep -oE '(version|LLD) [0-9]+' | head -n 1 | cut -d ' ' -f 2)
+    if [ "$version" != "$LLVM_MAJOR" ]; then
+        echo "$tool is LLVM ${version:-?}, expected LLVM $LLVM_MAJOR" >&2
+        exit 1
+    fi
+done
+
 CC="clang --target=riscv32 -march=rv32im_zicsr_zifencei -mabi=ilp32 -c"
-# isa.S has the A instructions too: its .riscv.attributes must name A, or
-# llvm-objdump prints them as <unknown>.
+# isa.S has the A instructions too: its .riscv.attributes names A.
 clang --target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32 -c -mno-relax "$FIX/isa.S" -o "$FIX/isa.o"
 $CC "$FIX/relocs.S" -o "$FIX/relocs.o"
 $CC -include examples/xcal.inc examples/hello/hello.S -o "$FIX/hello.o"
@@ -81,9 +92,11 @@ gen_lines debug-o.dl           "$FIX/debug.o" -d -l
 gen_lines lines-elf.dl         "$FIX/lines.elf" -d -l
 gen linked-elf.d               "$FIX/linked.elf" -d
 gen linked-elf.x               "$FIX/linked.elf" -x
+# The riscv-tests ELFs' mapping symbols ($x.0) make llvm-objdump warn on
+# stderr that they name no ISA.
 gen rv32ui-p-add.d             tests/riscv-tests/rv32ui-p-add -d
 gen rv32mi-p-csr.d             tests/riscv-tests/rv32mi-p-csr -d
 gen rv32si-p-dirty.dx          tests/riscv-tests/rv32si-p-dirty -d -x
 gen rv32ua-p-lrsc.d            tests/riscv-tests/rv32ua-p-lrsc -d
 
-echo "wrote $(ls "$OUT" | wc -l) golden files"
+echo "wrote $(ls "$OUT"/*.txt | wc -l) golden files"

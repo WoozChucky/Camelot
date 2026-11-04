@@ -19,15 +19,15 @@ Idx Name          Size     VMA      Type
   1 .text         00000028 80000000 TEXT
   2 .text.far     00000008 80001000 TEXT
   3 .text.hi      00000010 fffffff0 TEXT
-  4 .comment      00000013 00000000 
+  4 .comment      00000063 00000000 
   5 .symtab       000000b0 00000000 
   6 .shstrtab     0000003d 00000000 
-  7 .strtab       0000002d 00000000 
+  7 .strtab       000000ae 00000000 
 
 SYMBOL TABLE:
-80000000 l       .text	00000000 $x
-80001000 l       .text.far	00000000 $x
-fffffff0 l       .text.hi	00000000 $x
+80000000 l       .text	00000000 $xrv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0
+80001000 l       .text.far	00000000 $xrv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0
+fffffff0 l       .text.hi	00000000 $xrv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0
 00000000 l       *ABS*	00000000 $d
 80000008 g       .text	00000000 _start
 80001000 g       .text.far	00000000 far

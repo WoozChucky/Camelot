@@ -4,9 +4,9 @@ crates/merlin-objdump/tests/fixtures/relocs.o:	file format elf32-littleriscv
 Sections:
 Idx Name              Size     VMA      Type
   0                   00000000 00000000 
-  1 .strtab           000000b7 00000000 
+  1 .strtab           000000e2 00000000 
   2 .text             00000054 00000000 TEXT
-  3 .rela.text        00000168 00000000 
+  3 .rela.text        00000198 00000000 
   4 .rodata           00000010 00000000 DATA
   5 .rela.rodata      00000024 00000000 
   6 .data             0000000b 00000000 DATA

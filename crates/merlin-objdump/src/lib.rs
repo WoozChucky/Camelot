@@ -1,17 +1,17 @@
 //! merlin-objdump: prints what is inside our ELF32 `.o` files and
 //! executables, so merlin-as and merlin-ld output can be debugged without LLVM.
 //!
-//! The output follows llvm-objdump (LLVM 21) line for line, so the two can be
+//! The output follows llvm-objdump (LLVM 23) line for line, so the two can be
 //! diffed: the tests compare against llvm-objdump output committed under
 //! `tests/golden/`. Differences are deliberate and few:
 //!
 //! - Words that do not decode print as `.word 0x...` (one per 4 bytes) where
 //!   llvm-objdump prints `<unknown>`, and the Xcal instructions print as
-//!   `xcal.dbg` / `xcal.halt`.
+//!   `xcal.dbg` / `xcal.halt`. (Data the assembler marked with a `$d`
+//!   mapping symbol prints as llvm-objdump prints it: `.word`, `.short` and
+//!   `.byte` with their bytes.)
 //! - Reserved fence encodings print as the `fence`/`fence.i` Grail executes
 //!   them as, and `dret` prints as `.word`.
-//! - Targets that wrap below the symbol they are named after get a 32-bit
-//!   displacement (`<f+0xffffff04>`); llvm-objdump prints a 64-bit one.
 //! - Only the CSR names in `excalibur::csr` are known; others print as numbers.
 
 pub mod cli;
@@ -87,14 +87,20 @@ impl Options {
 
 /// Dumps one file. `name` is printed in the header line, as given.
 pub fn dump(name: &str, data: &[u8], opts: &Options) -> Result<String, Error> {
+    dump_with_warnings(name, data, opts).map(|(text, _)| text)
+}
+
+/// [`dump`], and the warnings llvm-objdump would print on stderr for the
+/// file (without its `llvm-objdump: warning: 'file': ` prefix), in order.
+pub fn dump_with_warnings(name: &str, data: &[u8], opts: &Options) -> Result<(String, Vec<String>), Error> {
     let elf = Elf::parse(data)?;
-    // RV64 (ELF64) comes with the RV64 migration's objdump step; until then
-    // every address printed here is a 32-bit one.
+    // RV64 (ELF64) comes with the RV64 migration's objdump step.
     if elf.class != elf::Class::Elf32 {
         return Err(Error("ELF64 (RV64) is not supported yet".into()));
     }
     let mut out = String::new();
-    let _ = writeln!(out, "\n{name}:\tfile format elf32-littleriscv");
+    let mut warnings = Vec::new();
+    let _ = writeln!(out, "\n{name}:\tfile format elf{}-littleriscv", bits(&elf));
     if opts.file_headers {
         file_headers(&mut out, &elf);
     }
@@ -114,17 +120,41 @@ pub fn dump(name: &str, data: &[u8], opts: &Options) -> Result<String, Error> {
         contents(&mut out, &elf)?;
     }
     if opts.disassemble {
-        disasm::disassemble(&mut out, &elf, opts)?;
+        disasm::disassemble(&mut out, &mut warnings, &elf, opts)?;
     }
-    Ok(out)
+    Ok((out, warnings))
+}
+
+/// 32 for an ELF32 file (RV32 code), 64 for an ELF64 one (RV64).
+fn bits(elf: &Elf) -> u32 {
+    match elf.class {
+        elf::Class::Elf32 => 32,
+        elf::Class::Elf64 => 64,
+    }
+}
+
+/// The width the file's code is for, from its class.
+pub(crate) fn xlen(elf: &Elf) -> excalibur::Xlen {
+    match elf.class {
+        elf::Class::Elf32 => excalibur::Xlen::Rv32,
+        elf::Class::Elf64 => excalibur::Xlen::Rv64,
+    }
+}
+
+/// How many hex digits llvm-objdump gives an address (or a symbol's size)
+/// in its columns: 8 in an ELF32 file, 16 in an ELF64 one.
+pub(crate) fn addr_width(elf: &Elf) -> usize {
+    bits(elf) as usize / 4
 }
 
 fn file_headers(out: &mut String, elf: &Elf) {
-    let _ = writeln!(out, "architecture: riscv32");
-    let _ = writeln!(out, "start address: 0x{:08x}", elf.header.entry);
+    let w = addr_width(elf);
+    let _ = writeln!(out, "architecture: riscv{}", bits(elf));
+    let _ = writeln!(out, "start address: 0x{:0w$x}", elf.header.entry);
 }
 
 fn program_headers(out: &mut String, elf: &Elf) {
+    let w = addr_width(elf);
     let _ = writeln!(out, "\nProgram Header:");
     for p in &elf.segments {
         let ty = match p.ty {
@@ -144,12 +174,12 @@ fn program_headers(out: &mut String, elf: &Elf) {
         let flag = |bit, c| if p.flags & bit != 0 { c } else { '-' };
         let _ = writeln!(
             out,
-            "{ty} off    0x{:08x} vaddr 0x{:08x} paddr 0x{:08x} align 2**{align}",
+            "{ty} off    0x{:0w$x} vaddr 0x{:0w$x} paddr 0x{:0w$x} align 2**{align}",
             p.offset, p.vaddr, p.paddr
         );
         let _ = writeln!(
             out,
-            "         filesz 0x{:08x} memsz 0x{:08x} flags {}{}{}",
+            "         filesz 0x{:0w$x} memsz 0x{:0w$x} flags {}{}{}",
             p.filesz,
             p.memsz,
             flag(elf::PF_R, 'r'),
@@ -187,12 +217,14 @@ fn section_headers(out: &mut String, elf: &Elf) {
         .max()
         .unwrap_or(0)
         .max(13);
+    // The size takes 8 digits on both widths, the address the class's.
+    let w = addr_width(elf);
     let _ = writeln!(out, "\nSections:");
-    let _ = writeln!(out, "Idx {:<width$} Size     VMA      Type", "Name");
+    let _ = writeln!(out, "Idx {:<width$} Size     {:<w$} Type", "Name", "VMA");
     for (i, s) in elf.sections.iter().enumerate() {
         let _ = writeln!(
             out,
-            "{i:3} {:<width$} {:08x} {:08x} {}",
+            "{i:3} {:<width$} {:08x} {:0w$x} {}",
             s.name,
             s.size,
             s.addr,
@@ -220,6 +252,7 @@ fn symbol_name<'a>(elf: &'a Elf, s: &'a Symbol) -> &'a str {
 }
 
 fn symbol_table(out: &mut String, elf: &Elf) -> Result<(), Error> {
+    let w = addr_width(elf);
     let _ = writeln!(out, "\nSYMBOL TABLE:");
     for s in elf.symbols()?.iter().skip(1) {
         let weak = s.bind() == elf::STB_WEAK;
@@ -252,7 +285,7 @@ fn symbol_table(out: &mut String, elf: &Elf) -> Result<(), Error> {
         };
         let _ = writeln!(
             out,
-            "{:08x} {glob_loc}{weak}  {ifunc}{debug}{kind} {}\t{:08x}{visibility} {}",
+            "{:0w$x} {glob_loc}{weak}  {ifunc}{debug}{kind} {}\t{:0w$x}{visibility} {}",
             // A common symbol's st_value is its alignment; llvm-objdump shows
             // its size in the first column and the alignment in the second.
             if common { s.size } else { s.value },
@@ -314,14 +347,15 @@ pub(crate) fn reloc_value(elf: &Elf, symbols: &[Symbol], r: &elf::Rela) -> Strin
 }
 
 fn relocations(out: &mut String, elf: &Elf) -> Result<(), Error> {
+    let w = addr_width(elf);
     for rs in relocation_sections(elf)? {
         let name = elf.sections.get(rs.target).map_or("", |s| s.name.as_str());
         let _ = writeln!(out, "\nRELOCATION RECORDS FOR [{name}]:");
-        let _ = writeln!(out, "OFFSET   TYPE                     VALUE");
+        let _ = writeln!(out, "{:<w$} TYPE                     VALUE", "OFFSET");
         for r in &rs.relocs {
             let _ = writeln!(
                 out,
-                "{:08x} {:<24} {}",
+                "{:0w$x} {:<24} {}",
                 r.offset,
                 reloc_type(r.ty),
                 reloc_value(elf, &rs.symbols, r)

@@ -10,32 +10,26 @@ hello-o.dr	      18: 0005000b     	xcal.dbg	a0
 hello-o.dr	      1c: 0000100b     	xcal.halt	zero
 isa-o.d	     1f4: 0005000b     	xcal.dbg	a0
 isa-o.d	     1f8: 0000100b     	xcal.halt	zero
-isa-o.d	     1fc: 00000000     	.word	0x00000000
-isa-o.d	     200: ffffffff     	.word	0xffffffff
 isa-o.d	     204: 0005200b     	.word	0x0005200b
-isa-o.d	     244: 8ff0000f     	fence
-isa-o.d	     248: 0ff5000f     	fence
-isa-o.d	     24c: 0ff0008f     	fence
-isa-o.d	     280: 00000000     	.word	0x00000000
-isa-o.d	     2b0: 0005000b     	xcal.dbg	a0
-isa-o.d	     2f4: 8ff0000f     	fence
-isa-o.d	     300: 0010100f     	fence.i
-isa-o.d	     358: 1015a52f     	.word	0x1015a52f
-isa-o.d	     35c: 2805a52f     	.word	0x2805a52f
+isa-o.d	     24c: 8ff0000f     	fence
+isa-o.d	     250: 0ff5000f     	fence
+isa-o.d	     254: 0ff0008f     	fence
+isa-o.d	     2b8: 0005000b     	xcal.dbg	a0
+isa-o.d	     2fc: 8ff0000f     	fence
+isa-o.d	     308: 0010100f     	fence.i
+isa-o.d	     360: 1015a52f     	.word	0x1015a52f
+isa-o.d	     364: 2805a52f     	.word	0x2805a52f
 isa-o.d-no-aliases	     1f4:      	xcal.dbg	a0
 isa-o.d-no-aliases	     1f8:      	xcal.halt	zero
-isa-o.d-no-aliases	     1fc:      	.word	0x00000000
-isa-o.d-no-aliases	     200:      	.word	0xffffffff
 isa-o.d-no-aliases	     204:      	.word	0x0005200b
-isa-o.d-no-aliases	     244:      	fence	iorw, iorw
-isa-o.d-no-aliases	     248:      	fence	iorw, iorw
 isa-o.d-no-aliases	     24c:      	fence	iorw, iorw
-isa-o.d-no-aliases	     280:      	.word	0x00000000
-isa-o.d-no-aliases	     2b0:      	xcal.dbg	a0
-isa-o.d-no-aliases	     2f4:      	fence	iorw, iorw
-isa-o.d-no-aliases	     300:      	fence.i
-isa-o.d-no-aliases	     358:      	.word	0x1015a52f
-isa-o.d-no-aliases	     35c:      	.word	0x2805a52f
+isa-o.d-no-aliases	     250:      	fence	iorw, iorw
+isa-o.d-no-aliases	     254:      	fence	iorw, iorw
+isa-o.d-no-aliases	     2b8:      	xcal.dbg	a0
+isa-o.d-no-aliases	     2fc:      	fence	iorw, iorw
+isa-o.d-no-aliases	     308:      	fence.i
+isa-o.d-no-aliases	     360:      	.word	0x1015a52f
+isa-o.d-no-aliases	     364:      	.word	0x2805a52f
 linked-elf.d	80000022: 8067fe9f     	.word	0x8067fe9f
 linked-elf.d	80000026: 00           	.byte	0x00
 linked-elf.d	80000027: 00           	.byte	0x00

@@ -58,6 +58,7 @@ fn check(name: &str, xlen: Xlen, aliases: bool) {
         aliases,
         hex: true,
         xlen,
+        zicbop: true,
     };
     let mut wrong = Vec::new();
     for l in lines(name) {

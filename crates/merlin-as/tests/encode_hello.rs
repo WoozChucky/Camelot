@@ -8,7 +8,7 @@
 //!   relocation on it. Ours must be identical: same words (the labels clang
 //!   resolves, merlin-as resolves too) and the same relocations.
 //! * `tests/golden/hello.dr.txt`: `llvm-objdump -dr` of clang's object. The
-//!   disassembly of ours by merlin-objdump (which prints what llvm-objdump 21
+//!   disassembly of ours by merlin-objdump (which prints what llvm-objdump 23
 //!   prints) must be the same text, labels and relocations included.
 //!
 //! hello.S is the same source on both widths, and assembled for RV64 it must

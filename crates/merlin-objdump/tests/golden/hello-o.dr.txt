@@ -28,13 +28,20 @@ Disassembly of section .text.start:
 00000020 <puts>:
       20: 100002b7     	lui	t0, 0x10000
       24: 00050313     	mv	t1, a0
+
+00000028 <.Ltmp0>:
       28: 00034383     	lbu	t2, 0x0(t1)
-      2c: 00038e63     	beqz	t2, 0x48 <puts+0x28>
+      2c: 00038063     	beqz	t2, 0x2c <.Ltmp0+0x4>
+			0000002c:  R_RISCV_BRANCH	.Ltmp1
       30: 0052ce03     	lbu	t3, 0x5(t0)
       34: 020e7e13     	andi	t3, t3, 0x20
-      38: fe0e0ce3     	beqz	t3, 0x30 <puts+0x10>
+      38: fe0e0ce3     	beqz	t3, 0x30 <.Ltmp0+0x8>
       3c: 00728023     	sb	t2, 0x0(t0)
       40: 00130313     	addi	t1, t1, 0x1
-      44: fe5ff06f     	j	0x28 <puts+0x8>
+      44: 0000006f     	j	0x44 <.Ltmp0+0x1c>
+			00000044:  R_RISCV_JAL	.Ltmp0
+			00000044:  R_RISCV_RELAX	*ABS*
+
+00000048 <.Ltmp1>:
       48: 40a30533     	sub	a0, t1, a0
       4c: 00008067     	ret

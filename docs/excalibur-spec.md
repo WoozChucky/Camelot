@@ -895,12 +895,16 @@ The reference is clang's integrated assembler with `-mno-relax` and the same `-m
 
 ### Disassembler output
 
-`merlin-objdump` takes llvm-objdump's options (`-d -r -t -h -x -f -p -s`, `-l` with `-d`, `-M no-aliases`, `--no-show-raw-insn`) and prints the same text as llvm-objdump 21, so the two can be diffed: same layout, pseudo-instructions where LLVM prints them (`mv`, `ret`, `beqz`, `csrr`, ...), hex immediates, branch targets as `0x80000044 <puts+0x28>`, `jalr` after `auipc` resolved to `<symbol>`, and relocations under their instruction with `-dr`. The deliberate differences:
+`merlin-objdump` takes llvm-objdump's options (`-d -r -t -h -x -f -p -s`, `-l` with `-d`, `-M no-aliases`, `--no-show-raw-insn`) and prints the same text as llvm-objdump 23, so the two can be diffed: same layout, pseudo-instructions where LLVM prints them (`mv`, `ret`, `beqz`, `csrr`, ...), hex immediates, branch targets as `0x80000044 <puts+0x28>`, `jalr` after `auipc` resolved to `<symbol>`, and relocations under their instruction with `-dr`. Besides:
 
-- Xcal instructions print as `xcal.dbg`/`xcal.halt` and undecodable words as `.word 0x...` (trailing odd bytes as `.byte`), where LLVM prints `<unknown>`.
+- **Targets are 64-bit** when a symbol is looked up for them, as LLVM evaluates branches: on RV32 the operand of a branch below 0 wraps at 2^32 (`j 0xffffff04`) and the label does not (`<f+0xffffffffffffff04>`); the `auipc` values behind `jalr` targets are kept the same way. The mnemonic starts at column 24 (16 with `--no-show-raw-insn`), or the next tab stop on a longer line.
+- **Mapping symbols** (LLVM 23): data the assembler marks with `$d` prints as `.word` while 4 bytes are left before the next symbol or mapping symbol, then `.short`, then `.byte`, each with its bytes one by one (`13 00 00 00  .word 0x00000013`), and a run of zeros as `...` as in code. At each mapping symbol, `$x` or `$d`, the `auipc` values tracked for `jalr` are forgotten. A `$x<isa>` symbol names the ISA of the code after it (`$xrv32i2p1_m2p0_...`, as LLVM's assembler writes them); an ISA LLVM cannot parse (the riscv-tests ELFs' `$x.0`, from GNU's assembler) gets its warning on stderr, once per name (`could not parse ISA mapping symbol '$x.0': string may only contain [a-z0-9_]; falling back to default disassembler`). Nothing else depends on the ISA: LLVM 23 decodes the same instructions whatever it names.
+
+The deliberate differences:
+
+- Xcal instructions print as `xcal.dbg`/`xcal.halt` and undecodable words as `.word 0x...` (trailing odd bytes as `.byte`), where LLVM prints `<unknown>` (unlike data under `$d`, which both print as data).
 - Reserved fence encodings (non-zero `fm`, `rs1` or `rd`, and `fence.i` with operand bits set) print as the `fence`/`fence.i` Grail executes. Like LLVM, the disassembler still forgets the `auipc` values it tracks at them.
 - `dret` (debug mode, which Excalibur does not have) prints as `.word 0x7b200073`.
-- A branch or jump target below the symbol it is named after (a negative target that wraps around in a `.o`) gets a 32-bit displacement, `<f+0xffffff04>`, where LLVM prints a 64-bit one, `<f+0xffffffffffffff04>`.
 - CSR names come from `excalibur::csr`; CSRs not listed there print as numbers.
 
 The instruction formatting itself (`Inst::format` in `excalibur`) is shared with Grail's `--trace`, which uses the plain form: no pseudo-instructions, decimal immediates, relative branch offsets.
@@ -909,7 +913,7 @@ The instruction formatting itself (`Inst::format` in `excalibur`) is shared with
 - **The width** is a parameter: `decode(word, xlen)` and `Syntax::xlen`. A word means different things on the two (section 4), branch targets wrap at the width, and the RV32-only CSRs are named only on RV32, as in llvm-objdump.
 - **RV64's aliases:** `sext.w` for `addiw rd, rs, 0`, `negw` for `subw rd, zero, rs`, and the `.d` atomics with their suffixes.
 - **The check:** `crates/excalibur/tests/disasm.rs` decodes every word of a corpus for each width (`tests/golden/rv32.s`, `rv64.s`: every instruction and alias, the edge immediates, and the reserved encodings next to the ones that differ by width, such as funct3 values a load, store, AMO or 32-bit operation does not use, or shift fields with bits the width does not allow) and compares it with llvm-objdump's text, with and without aliases (`scripts/gen-excalibur-golden.sh`, made with LLVM 23).
-- **One version difference:** LLVM 23 prints `fence w, 0` as Zihintpause's `pause`, an extension Excalibur does not have; excalibur prints `fence w, 0`, as LLVM 21 does.
+- **The hints LLVM 23 names:** LLVM 23 decodes some HINT encodings as the extensions that give them meaning, whatever the object's ISA says, and excalibur does the same (Excalibur executes them as the plain instructions they are): Zihintpause's `pause` (`fence w, 0`), Zihintntl's `ntl.p1`, `ntl.pall`, `ntl.s1` and `ntl.all` (`add zero, zero, x2..x5`) and Zicfilp's `lpad imm` (`auipc zero, imm`) as aliases, and Zicbop's `prefetch.i`, `prefetch.r` and `prefetch.w offset(rs1)` (`ori zero, rs1, imm` with `imm[4:0]` 0, 1 or 3) as instructions, so also without aliases. LLVM 21 printed them all as the plain instructions. Grail's trace, the plain form, keeps them plain (`Syntax::zicbop` off): what it prints, merlin-as assembles (`crates/merlin-as/tests/encode_roundtrip.rs`), and merlin-as, like clang for an ISA without Zicbop, takes no `prefetch.*`.
 
 The tools move to RV64 one by one (#141). merlin-as passes the width of its `-march` (#148), and merlin-ld, which decodes nothing, links in the class of its objects (#149); until its step each other tool passes `Xlen::Rv32`, merlin-objdump until #150.
 
