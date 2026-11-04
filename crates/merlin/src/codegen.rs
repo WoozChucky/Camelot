@@ -3341,6 +3341,20 @@ main:
         assert!(!data.contains(".globl u"), "static");
         assert!(!data.contains(".globl main.n"), "static local");
         assert!(asm.contains("la    a0, main.n\n"), "{asm}");
+        // An address converted to a 32-bit integer is a `.word`, as clang
+        // writes it, moved by bytes.
+        let asm = compile(
+            "int i[2]; long a = (long)&i; unsigned b = (unsigned)&i[1] - 2; int c = 8 + (int)i;\n\
+             char *d = (char *)((long)\"xy\" + 1);",
+        );
+        for want in [
+            "a:\n    .word i\n",
+            "b:\n    .word i+2\n",
+            "c:\n    .word i+8\n",
+            "d:\n    .word .L.str.0+1\n",
+        ] {
+            assert!(asm.contains(want), "missing {want:?} in\n{asm}");
+        }
     }
 
     #[test]
@@ -4218,6 +4232,15 @@ main:
                 "s:\n    .quad .L.str.0\n",
                 "u:\n    .quad 1\n",
             ] {
+                assert!(asm.contains(want), "missing {want:?} in\n{asm}");
+            }
+            // An address converted to a 64-bit integer is a `.quad`, as
+            // clang writes it.
+            let asm = compile(
+                "int i[2]; long a = (long)&i; unsigned long long b = (unsigned long long)&i[1] - 2;\n\
+                 long c = 8 + (long)i;",
+            );
+            for want in ["a:\n    .quad i\n", "b:\n    .quad i+2\n", "c:\n    .quad i+8\n"] {
                 assert!(asm.contains(want), "missing {want:?} in\n{asm}");
             }
         }

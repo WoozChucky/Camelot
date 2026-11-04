@@ -13,9 +13,17 @@
 //! casts, `sizeof`) rather than read from [`Expr::ty`]. Address constants
 //! (`&g`, `arr + 2`, `"text"`) need the types sema assigns, so they are only
 //! found in a checked tree.
+//!
+//! An address converted to an integer type as wide as a pointer stays an
+//! address constant, as clang has it: `(long)&g` (or `(unsigned)&g` on
+//! RV32, `(unsigned long long)&g` on RV64) initializes a global with `.word
+//! g` or `.quad g`, and adding or subtracting an integer moves it by that
+//! many bytes (`(long)&g + 4` is `g+4`). Any other arithmetic on it is not
+//! constant, nor is a narrower or wider conversion (`(int)&g` on RV64,
+//! `(long long)&g` on RV32): clang rejects those in an initializer too.
 
 use crate::ast::*;
-use crate::types::{common, IntKind, Type, Xlen};
+use crate::types::{common, ptr_size, IntKind, Type, Xlen};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Const {
@@ -81,9 +89,11 @@ pub fn eval(e: &Expr, xlen: Xlen) -> Option<Const> {
             let (lc, rc) = (eval(l, xlen)?, eval(r, xlen)?);
             match (lc, rc) {
                 (Int(a, ak), Int(b, bk)) => binary(*op, a, ak, b, bk, xlen),
-                // Address arithmetic: pointer plus or minus an integer.
+                // Address arithmetic: pointer plus or minus an integer, by
+                // whole elements, or an address converted to an integer
+                // plus or minus one, by bytes.
                 (Addr { base, offset }, Int(n, _)) if matches!(op, BinOp::Add | BinOp::Sub) => {
-                    let size = i128::from(l.ty.pointee()?.size(xlen)?);
+                    let size = step(&l.ty, xlen)?;
                     let n = if *op == BinOp::Sub { -n } else { n };
                     Some(Addr {
                         base,
@@ -91,7 +101,7 @@ pub fn eval(e: &Expr, xlen: Xlen) -> Option<Const> {
                     })
                 }
                 (Int(n, _), Addr { base, offset }) if *op == BinOp::Add => {
-                    let size = i128::from(r.ty.pointee()?.size(xlen)?);
+                    let size = step(&r.ty, xlen)?;
                     Some(Addr {
                         base,
                         offset: offset + n * size,
@@ -121,6 +131,10 @@ pub fn eval(e: &Expr, xlen: Xlen) -> Option<Const> {
                 // makes `(unsigned)&((struct s *)0)->field` (offsetof) a
                 // constant.
                 (Type::Int(k), Addr { base: None, offset }) => Some(Int(k.wrap(offset, xlen), *k)),
+                // An address converted to an integer as wide as a pointer
+                // stays one, what the linker will fill in; to any other
+                // width it is not a constant.
+                (Type::Int(k), a @ Addr { .. }) if k.size(xlen) == ptr_size(xlen) => Some(a),
                 // An address is a pointer-sized unsigned number.
                 (Type::Ptr(_), Int(v, _)) => Some(Addr {
                     base: None,
@@ -183,6 +197,15 @@ fn addr_of(e: &Expr, xlen: Xlen) -> Option<Const> {
         }
         _ => None,
     }
+}
+
+/// How many bytes adding 1 to a constant of type `t` moves an address: a
+/// pointer's element size, or 1 for an address converted to an integer.
+fn step(t: &Type, xlen: Xlen) -> Option<i128> {
+    if t.is_integer() {
+        return Some(1);
+    }
+    Some(i128::from(t.pointee()?.size(xlen)?))
 }
 
 fn int_of(c: Const) -> Option<(i128, IntKind)> {

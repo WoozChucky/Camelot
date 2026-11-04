@@ -2234,10 +2234,54 @@ mod tests {
             err("int f() { static int s = f(); return s; }"),
             "1:26: initializer element is not a compile-time constant"
         );
-        assert_eq!(
-            err("int a; int b = (int)&a;"),
-            "1:16: initializer element is not a compile-time constant"
-        );
+        // An address converted to an integer as wide as a pointer is one,
+        // moved by adding or subtracting an integer; any other width or
+        // arithmetic is not constant, as clang has it.
+        let err_on = |x: Xlen, src: &str| -> Option<String> {
+            let opts = crate::Options {
+                xlen: x,
+                ..crate::Options::default()
+            };
+            crate::parse_with("t.c", src, &opts, &crate::no_files)
+                .err()
+                .map(|e| e.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "))
+        };
+        const NOT_CONSTANT: &str = "initializer element is not a compile-time constant";
+        for (src, rv32, rv64) in [
+            ("int a; long b = (long)&a;", true, true),
+            ("int a; unsigned long b = (unsigned long)&a + 4;", true, true),
+            ("int a; long b = 4 + (long)&a - 8;", true, true),
+            ("int a; int *b = (int *)((long)&a + 4);", true, true),
+            (
+                "int a[2]; long b = (long)a, c = (long)\"s\", d = (long)&a[1];",
+                true,
+                true,
+            ),
+            ("void f(void); long b = (long)f;", true, true),
+            ("int a; int b = (int)&a;", true, false),
+            ("int a; unsigned b = (unsigned)&a;", true, false),
+            ("int a; int b = (int)(long)&a;", true, false),
+            ("int a; long long b = (long long)&a;", false, true),
+            (
+                "int a; unsigned long long b = (unsigned long long)&a;",
+                false,
+                true,
+            ),
+            ("int a; short b = (short)&a;", false, false),
+            ("int a; char b = (char)&a;", false, false),
+            ("int a; long b = (long)&a * 2;", false, false),
+            ("int a; long b = (long)&a | 1;", false, false),
+            ("int a; long b = -(long)&a;", false, false),
+            ("int a; long b = 4 - (long)&a;", false, false),
+            ("int a; long b = (long)&a - (long)&a;", false, false),
+        ] {
+            for (x, ok) in [(Xlen::Rv32, rv32), (Xlen::Rv64, rv64)] {
+                match err_on(x, src) {
+                    None => assert!(ok, "{src} ({x:?}) compiles"),
+                    Some(e) => assert!(!ok && e.ends_with(NOT_CONSTANT), "{src} ({x:?}): {e}"),
+                }
+            }
+        }
         // Locals may be initialized with anything.
         ok("int f(int x) { int y = x * 2; int a[2] = {x, f(y)}; return a[1]; }");
     }
