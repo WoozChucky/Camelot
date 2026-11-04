@@ -163,6 +163,9 @@ fn scenario_rv32(name: &str) -> Scenario {
         "pointer" => pointer_input("[dbg] pc=8000017c s4 = 0x00000003 (3)\n"),
         // Eight frames shown; the frames are checked in `examples_run_in_grail`.
         "flip" => plain("[dbg] pc=8000013c s4 = 0x00000008 (8)\n", 0),
+        // Six places of the cursor over one frame; `crates/grail/tests/framebuffer.rs`
+        // checks what the display shows at each.
+        "cursor" => plain("[dbg] pc=80000194 s1 = 0x00000006 (6)\n", 0),
         // One hart: every count is its own, and no store-conditional can fail.
         // `smp_example_runs_on_every_hart_count` runs it on more.
         "smp" => plain(
@@ -241,6 +244,7 @@ fn scenario_rv64(name: &str) -> Scenario {
         },
         "pointer" => pointer_input("[dbg] pc=0000000080000180 s4 = 0x0000000000000003 (3)\n"),
         "flip" => plain("[dbg] pc=000000008000013c s4 = 0x0000000000000008 (8)\n", 0),
+        "cursor" => plain("[dbg] pc=000000008000019c s1 = 0x0000000000000006 (6)\n", 0),
         "smp" | "net-ping" | "net-pong" | "net-user" => scenario_rv32(name),
         other => panic!("no RV64 scenario for example {other}: add one"),
     }
