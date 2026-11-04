@@ -256,8 +256,9 @@ and encodings as LLVM:
 .insn value                                  .insn 4, value
 ```
 
-`.insn j` is not supported: LLVM 21 packs its numeric offset without the
-J-type scrambling, and matching that would be matching a bug.
+`.insn j` is not supported: LLVM (21, and still 23) packs its numeric offset
+without the J-type scrambling (`.insn j 0x6f, a0, 2048` gives `0040056f`,
+`jal a0, 0x4`), and matching that would be matching a bug.
 
 ## Errors
 

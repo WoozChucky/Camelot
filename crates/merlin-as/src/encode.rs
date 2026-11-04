@@ -1498,7 +1498,7 @@ fn li_words(rd: Reg, steps: &[Step]) -> Vec<Emit> {
 /// .insn value                                  .insn 4, value
 /// ```
 ///
-/// (`.insn j` is left out: LLVM 21 packs its numeric offsets unscrambled.)
+/// (`.insn j` is left out: LLVM, 21 and 23 alike, packs its numeric offsets unscrambled.)
 fn insn(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> {
     let format = m.strip_prefix(".insn").unwrap_or(m).trim();
     let field = |op: &Operand, bits: u32, what: &str| uimm(expr(op)?, ctx, bits, what);
