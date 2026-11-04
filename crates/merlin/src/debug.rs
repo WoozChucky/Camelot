@@ -607,8 +607,14 @@ impl Lines {
     }
 
     /// The entries of a scope's variables and blocks.
+    /// The variables in the frame come first, then the `static` ones, as clang
+    /// orders them.
     fn scope_children(&self, s: &Scope, out: &mut Vec<Die>) {
-        for v in &s.vars {
+        let (frame, statics): (Vec<&Var>, Vec<&Var>) = s
+            .vars
+            .iter()
+            .partition(|v| matches!(v.location, Location::Frame(_)));
+        for v in frame.into_iter().chain(statics) {
             out.push(self.var_die(TAG_VARIABLE, v));
         }
         for b in &s.blocks {

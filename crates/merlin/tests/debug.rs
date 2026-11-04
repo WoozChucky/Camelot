@@ -424,16 +424,17 @@ fn variables_and_types_are_described() {
         assert_eq!(type_of(list), "Node *");
         assert_eq!(type_of(kids[1]), "color_t");
         assert_eq!(at(kids[1]).unsigned(dw::AT_DECL_LINE), Some(12));
-        // The static local is at its symbol, the other in the frame.
-        let calls = kids[2];
+        // The local in the frame, then the static one, at its symbol (clang's
+        // order, though `calls` is declared first).
+        assert_eq!(at(kids[2]).name(), Some("sum"));
+        assert_eq!(
+            at(kids[2]).block(dw::AT_LOCATION).unwrap(),
+            slot("local long sum").as_slice()
+        );
+        let calls = kids[3];
         assert_eq!(at(calls).name(), Some("calls"));
         let loc = at(calls).block(dw::AT_LOCATION).unwrap();
         assert_eq!((loc[0], loc.len() as u64), (0x03, 1 + ptr), "DW_OP_addr");
-        assert_eq!(at(kids[3]).name(), Some("sum"));
-        assert_eq!(
-            at(kids[3]).block(dw::AT_LOCATION).unwrap(),
-            slot("local long sum").as_slice()
-        );
         // The block of `w`, and in it the `for`'s, with `i` and its body's,
         // with `p`: each inside the one around it.
         let block = kids[4];
