@@ -5,7 +5,8 @@
 //! the shell run `as` on each file into `/out`, then reads the objects back
 //! on the host and compares them. The corpus: merlin-as's golden encodings,
 //! every hand-written `.s` of the repository, the line table corpus
-//! (`crates/merlin-as/tests/debug_line`, whose objects are clang's), and
+//! (`crates/merlin-as/tests/debug_line`, whose objects are clang's), the
+//! mapping symbol corpus (`crates/merlin-as/tests/mapping`, clang's too), and
 //! merlin's assembly for a C file, with `-g` (`.file`, `.loc` and a DWARF
 //! compile unit) and without, data of every size (`DATA`) and sections of
 //! every kind (`SECTIONS`). An ignored test adds merlin's `-g` assembly for
@@ -37,6 +38,7 @@ fn corpus(big: bool) -> Vec<(String, String)> {
         "kernel/boot",
         "crates/grail/rom",
         "crates/merlin-as/tests/debug_line",
+        "crates/merlin-as/tests/mapping",
     ] {
         let mut more: Vec<PathBuf> = std::fs::read_dir(root.join(dir))
             .unwrap()

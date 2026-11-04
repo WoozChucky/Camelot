@@ -178,6 +178,7 @@ fn section_constants() -> Vec<(&'static str, u32)> {
         ("SHT_INIT_ARRAY", SHT_INIT_ARRAY),
         ("SHT_FINI_ARRAY", SHT_FINI_ARRAY),
         ("SHT_PREINIT_ARRAY", SHT_PREINIT_ARRAY),
+        ("SHT_RISCV_ATTRIBUTES", SHT_RISCV_ATTRIBUTES),
         ("SHF_WRITE", flag(SHF_WRITE)),
         ("SHF_ALLOC", flag(SHF_ALLOC)),
         ("SHF_EXECINSTR", flag(SHF_EXECINSTR)),

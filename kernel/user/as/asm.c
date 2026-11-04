@@ -6,81 +6,12 @@
  *
  * Symbols are kept in the order they are first named (the symbol table's
  * order, after locals and globals are split): every place that names one
- * does it where merlin-as does. `.L` labels go into the symbol table only if
- * a relocation still refers to them. */
+ * does it where merlin-as does. `.L` labels and section symbols go into the
+ * symbol table only if a relocation still refers to them. Mapping symbols
+ * ($x<isa>, $d) mark where code and data start, as clang marks them
+ * (mapping_symbol). */
 #include "as.h"
 #include "tables.h"
-
-/* ---- A string -> int map (open addressing) ---- */
-
-struct strmap {
-    char **keys;
-    int *values;
-    uint cap;
-    uint count;
-};
-
-static uint hash(const char *s) {
-    uint h = 2166136261u;
-    for (; *s; s++) {
-        h = (h ^ (uchar)*s) * 16777619u;
-    }
-    return h;
-}
-
-static int map_get(struct strmap *m, const char *key, int *value) {
-    if (m->cap == 0) {
-        return 0;
-    }
-    for (uint i = hash(key) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
-        if (m->keys[i] == NULL) {
-            return 0;
-        }
-        if (strcmp(m->keys[i], key) == 0) {
-            *value = m->values[i];
-            return 1;
-        }
-    }
-}
-
-static void map_put(struct strmap *m, char *key, int value);
-
-static void map_grow(struct strmap *m) {
-    struct strmap old = *m;
-    m->cap = old.cap ? old.cap * 2 : 256;
-    m->keys = calloc(m->cap, sizeof(char *));
-    m->values = calloc(m->cap, sizeof(int));
-    if (m->keys == NULL || m->values == NULL) {
-        die("out of memory");
-    }
-    m->count = 0;
-    for (uint i = 0; i < old.cap; i++) {
-        if (old.keys[i] != NULL) {
-            map_put(m, old.keys[i], old.values[i]);
-        }
-    }
-    free(old.keys);
-    free(old.values);
-}
-
-/* Sets key to value; `key` must stay alive (perm memory). */
-static void map_put(struct strmap *m, char *key, int value) {
-    if ((m->count + 1) * 2 > m->cap) {
-        map_grow(m);
-    }
-    for (uint i = hash(key) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
-        if (m->keys[i] == NULL) {
-            m->keys[i] = key;
-            m->values[i] = value;
-            m->count++;
-            return;
-        }
-        if (strcmp(m->keys[i], key) == 0) {
-            m->values[i] = value;
-            return;
-        }
-    }
-}
 
 /* ---- The assembler's state ---- */
 
@@ -500,10 +431,14 @@ static int find_section(const char *name) {
     return 0;
 }
 
+static char *section_symbol(int sec);
+
 /* Adds a section, which becomes the current one. Its alignment starts at
  * 1, except for `.text`'s, 4: LLVM makes `.text` before the first line with
  * an instruction's alignment, and no other section, code or not, has one
- * until `.align` (or `.comm`) asks. */
+ * until `.align` (or `.comm`) asks. Its section symbol is made here, where
+ * LLVM registers it (the first switch to the section), and kept only if a
+ * relocation uses it. */
 static void new_section(const char *name, struct sec_attrs attrs) {
     sections = grow(sections, &capsections, nsections + 1, sizeof(struct section));
     struct section *s = &sections[nsections];
@@ -512,6 +447,31 @@ static void new_section(const char *name, struct sec_attrs attrs) {
     s->attrs = attrs;
     s->align = strcmp(name, ".text") == 0 ? 4 : 1;
     current = (int)nsections++;
+    section_symbol(current);
+}
+
+#define MAP_CODE 1
+#define MAP_DATA 2
+
+/* Marks what comes next in the current section, code or data, with a
+ * mapping symbol where that changes (merlin-as's Assembler::mapping_symbol,
+ * clang's RISCVELFStreamer): $x<isa> before a run of instructions, $d before
+ * a run of data, even data of no bytes. A local symbol of its own, which no
+ * name finds (not in by_name). */
+static void mapping_symbol(int kind) {
+    struct section *sec = &sections[current];
+    if (sec->mapping == kind) {
+        return;
+    }
+    sec->mapping = kind;
+    symbols = grow(symbols, &capsymbols, nsymbols + 1, sizeof(struct symbol));
+    struct symbol *s = &symbols[nsymbols++];
+    memset(s, 0, sizeof *s);
+    s->name = kind == MAP_CODE ? "$x" RISCV_ARCH : "$d";
+    s->section = current;
+    s->value = sec->size;
+    s->defined = 1;
+    s->ty = SYM_MAPPING;
 }
 
 /* Makes the section named `name` the current one, made with the attributes
@@ -593,13 +553,24 @@ static void align_to(uint align) {
         s->align = align;
     }
     uint pad = (align - s->size % align) % align;
-    if (is_code(s) && pad % 4 == 0 && s->size % 4 == 0) {
-        static const uchar nop[4] = {0x13, 0, 0, 0};
-        for (uint i = 0; i < pad / 4; i++) {
-            emit_bytes(nop, 4);
-        }
-    } else {
+    if (!is_code(s)) {
         emit_zeros(pad);
+        return;
+    }
+    /* Code pads as LLVM's writeNopData pads it: a zero byte to an even
+     * offset, a c.nop (0x0001) to a multiple of 4, then nops. */
+    if (pad % 2 == 1) {
+        emit_zeros(1);
+        pad--;
+    }
+    if (pad % 4 == 2) {
+        static const uchar c_nop[2] = {0x01, 0};
+        emit_bytes(c_nop, 2);
+        pad -= 2;
+    }
+    static const uchar nop[4] = {0x13, 0, 0, 0};
+    for (uint i = 0; i < pad / 4; i++) {
+        emit_bytes(nop, 4);
     }
 }
 
@@ -632,7 +603,14 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
     }
     take_loc();
     uint base = s->size;
+    /* A label for `.` in an operand, made first, as clang makes it when it
+     * reads the operand. */
     char *dot = NULL;
+    for (int i = 0; i < n; i++) {
+        if (emits[i].has_fixup && emits[i].auipc < 0 && strcmp(emits[i].name, DOT) == 0 && dot == NULL) {
+            dot = dot_label(base);
+        }
+    }
     /* The hidden labels on auipcs a later %pcrel_lo refers to. */
     char *auipc_labels[2] = {NULL, NULL};
     for (int i = 0; i < n; i++) {
@@ -651,6 +629,8 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
             }
         }
     }
+    /* After the labels, before the symbols the operands name. */
+    mapping_symbol(MAP_CODE);
     for (int i = 0; i < n; i++) {
         uint offset = base + 4 * (uint)i;
         struct emit *e = &emits[i];
@@ -664,9 +644,6 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
                 symbol = e->name;
                 addend = e->addend;
                 if (strcmp(symbol, DOT) == 0) {
-                    if (dot == NULL) {
-                        dot = dot_label(base);
-                    }
                     symbol = dot;
                 }
                 if (e->kind == R_RISCV_PCREL_LO12_I || e->kind == R_RISCV_PCREL_LO12_S) {
@@ -753,6 +730,7 @@ static void data(struct dirarg *args, uint nargs, uint size) {
                 bytes[i] = (uchar)(v.lo >> (8 * i));
                 bytes[4 + i] = (uchar)(v.hi >> (8 * i));
             }
+            mapping_symbol(MAP_DATA);
             emit_bytes(bytes, size);
             continue;
         }
@@ -770,6 +748,8 @@ static void data(struct dirarg *args, uint nargs, uint size) {
         if (strcmp(name, DOT) == 0) {
             name = dot_label(off);
         }
+        /* After the label for `.`, before the symbol it names. */
+        mapping_symbol(MAP_DATA);
         add_reloc(off, size == 8 ? R_RISCV_64 : R_RISCV_32, name, addend);
         static const uchar zero[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         emit_bytes(zero, size);
@@ -970,6 +950,7 @@ static void common(const char *directive, struct dirarg *args, uint nargs) {
     if (symbols[i].ty == SYM_NOTYPE) {
         symbols[i].ty = SYM_OBJECT;
     }
+    mapping_symbol(MAP_DATA);
     if (size.hi != 0) {
         no_room();
     } else {
@@ -1237,6 +1218,7 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         }
         for (uint i = 0; i < nargs; i++) {
             if (args[i].kind == DA_STR) {
+                mapping_symbol(MAP_DATA);
                 emit_bytes(args[i].str, args[i].len);
                 if (strcmp(name, ".ascii") != 0) {
                     static const uchar nul[1] = {0};
@@ -1271,6 +1253,7 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         if (!has_room(v.lo)) {
             return;
         }
+        mapping_symbol(MAP_DATA);
         uint byte = fill.lo & 0xff;
         if (byte == 0 || v.lo == 0) {
             emit_zeros(v.lo);
@@ -1592,6 +1575,7 @@ static uint section_size(const char *name) {
 static int append(const char *name, struct buf *bytes) {
     int back = current;
     switch_section(name);
+    mapping_symbol(MAP_DATA);
     int sec = current;
     buf_put(&sections[sec].data, bytes->data, bytes->len);
     sections[sec].size += bytes->len;
@@ -1663,6 +1647,25 @@ static void debug_relocs_to_sections(void) {
     }
 }
 
+/* `.riscv.attributes`, which clang writes at the end: a section of the
+ * object, data with its $d, after the source's sections and before the line
+ * table's. */
+static void attributes_section(void) {
+    int back = current;
+    struct sec_attrs a;
+    a.ty = SHT_RISCV_ATTRIBUTES;
+    a.flags = 0;
+    a.entsize = 0;
+    new_section(".riscv.attributes", a);
+    mapping_symbol(MAP_DATA);
+    struct buf b;
+    memset(&b, 0, sizeof b);
+    riscv_attributes(&b);
+    emit_bytes(b.data, b.len);
+    free(b.data);
+    current = back;
+}
+
 struct object *asm_finish(void) {
     check_pcrel_lo();
     for (uint i = 0; i < nsymbols; i++) {
@@ -1673,12 +1676,17 @@ struct object *asm_finish(void) {
         }
     }
     resolve_local_fixups();
+    /* What clang writes when the source has been read, in its order: the
+     * attributes, then the line table. */
+    attributes_section();
     line_table();
     debug_relocs_to_sections();
     if (error_count(PHASE_ASM) > 0) {
         return NULL;
     }
-    /* `.L` labels are assembler-internal: keep only those a relocation needs. */
+    /* `.L` labels are assembler-internal, and a section symbol stands in for
+     * labels: keep only those a relocation needs. A relocation names the
+     * first symbol of its name that is no mapping symbol. */
     struct strmap referenced;
     memset(&referenced, 0, sizeof referenced);
     for (uint sec = 0; sec < nsections; sec++) {
@@ -1697,8 +1705,9 @@ struct object *asm_finish(void) {
     memset(&first, 0, sizeof first);
     for (uint i = 0; i < nsymbols; i++) {
         int dummy;
-        if (!starts_with(symbols[i].name, ".L") || map_get(&referenced, symbols[i].name, &dummy)) {
-            if (!map_get(&first, symbols[i].name, &dummy)) {
+        int internal = starts_with(symbols[i].name, ".L") || symbols[i].ty == SYM_SECTION;
+        if (!internal || map_get(&referenced, symbols[i].name, &dummy)) {
+            if (symbols[i].ty != SYM_MAPPING && !map_get(&first, symbols[i].name, &dummy)) {
                 map_put(&first, symbols[i].name, (int)obj->nsymbols);
             }
             obj->symbols[obj->nsymbols++] = symbols[i];

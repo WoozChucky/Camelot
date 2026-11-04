@@ -79,6 +79,7 @@ extern const struct as_op2 CSR_NAMES[];
 #define SHT_INIT_ARRAY 0xe
 #define SHT_FINI_ARRAY 0xf
 #define SHT_PREINIT_ARRAY 0x10
+#define SHT_RISCV_ATTRIBUTES 0x70000003
 #define SHF_WRITE 0x1
 #define SHF_ALLOC 0x2
 #define SHF_EXECINSTR 0x4
