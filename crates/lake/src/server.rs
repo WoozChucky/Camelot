@@ -14,8 +14,8 @@
 use crate::store::{Image, Store, MAX_IMAGE_SECTORS};
 use crate::{lock, Fail};
 use avalon_proto::{
-    default_port, kind_of, type_name, Connection, Error, ErrorCode, Frame, Message, MessageKind,
-    DEFAULT_LAKE_ADDR,
+    close_gracefully, default_port, kind_of, type_name, Connection, Error, ErrorCode, Frame, Message,
+    MessageKind, DEFAULT_LAKE_ADDR,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
@@ -114,6 +114,9 @@ struct Clients {
     next_id: u64,
     live: HashMap<u64, Client>,
     threads: Vec<JoinHandle<()>>,
+    /// Connections whose thread has finished with them, their sockets closed: only
+    /// ever grows (for tests, [`ServerThread::debug_connections_finished`]).
+    finished: u64,
 }
 
 struct Client {
@@ -233,6 +236,14 @@ impl ServerThread {
         lock(&self.handle.shared.clients).live.len()
     }
 
+    /// For tests: how many connections the server has finished with and closed, ever.
+    /// Unlike [`ServerThread::debug_connections`], which is also 0 before the server has
+    /// accepted a connection, this says that a connection has been closed.
+    #[doc(hidden)]
+    pub fn debug_connections_finished(&self) -> u64 {
+        lock(&self.handle.shared.clients).finished
+    }
+
     /// Shuts the server down and waits until it has.
     pub fn stop(self) -> io::Result<()> {
         self.handle.shutdown();
@@ -260,7 +271,12 @@ impl Shared {
         let shared = Arc::clone(&self);
         let spawned = std::thread::Builder::new()
             .name(format!("client-{id}"))
-            .spawn(move || shared.serve(id, socket));
+            .spawn(move || {
+                Arc::clone(&shared).serve(id, socket);
+                // Every handle on the socket is gone now: `serve`'s, and the one in
+                // `live`, which it removed.
+                lock(&shared.clients).finished += 1;
+            });
         if let Ok(thread) = spawned {
             clients.live.insert(
                 id,
@@ -291,6 +307,10 @@ impl Shared {
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(POLL));
         let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+        // Closing waits for the client a moment (`close_gracefully`), unless the
+        // connection is being hung up (the server is shutting down).
+        let hang_up = Arc::clone(&socket.hang_up);
+        let stopping = || hang_up.load(Ordering::SeqCst);
         let mut conn = Connection::new(socket);
         let agent = match conn.server_handshake(SERVER_NAME) {
             Ok(agent) => agent,
@@ -298,7 +318,9 @@ impl Shared {
                 if self.log {
                     eprintln!("lake: {peer}: handshake failed: {e}");
                 }
-                let _ = conn.get_ref().stream.shutdown(Shutdown::Both);
+                // The Welcome or Error just sent must not be lost to a reset over
+                // what the client sent after its first frame.
+                close_gracefully(&conn.get_ref().stream, stopping);
                 self.forget(id);
                 return;
             }
@@ -337,7 +359,8 @@ impl Shared {
         // Detach everything this connection had attached.
         let attached = session.handles.len();
         drop(session);
-        let _ = conn.get_ref().stream.shutdown(Shutdown::Both);
+        // After an oversize frame, its body is still unread behind the Error.
+        close_gracefully(&conn.get_ref().stream, stopping);
         self.forget(id);
         if self.log {
             match attached {

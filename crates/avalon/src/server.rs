@@ -16,8 +16,9 @@ use crate::switch::{Card, Switch, MAX_SWITCHES};
 use crate::vm::Vm;
 use crate::{lock, machine_config, Fail};
 use avalon_proto::{
-    default_port, kind_of, type_name, validate_name, Connection, Error, ErrorCode, Frame, HardwareProfile,
-    Message, MessageKind, NatConfig, PortOwner, SwitchInfo, VmRef, VmSummary, DEFAULT_AVALON_ADDR,
+    close_gracefully, default_port, kind_of, type_name, validate_name, Connection, Error, ErrorCode, Frame,
+    HardwareProfile, Message, MessageKind, NatConfig, PortOwner, SwitchInfo, VmRef, VmSummary,
+    DEFAULT_AVALON_ADDR,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
@@ -130,6 +131,9 @@ struct Clients {
     next_id: u64,
     live: HashMap<u64, Client>,
     threads: Vec<JoinHandle<()>>,
+    /// Connections whose threads have finished with them, their sockets closed: only
+    /// ever grows (for tests, [`ServerThread::debug_connections_finished`]).
+    finished: u64,
 }
 
 struct Client {
@@ -270,6 +274,14 @@ impl ServerThread {
         lock(&self.handle.shared.clients).live.len()
     }
 
+    /// For tests: how many connections the server has finished with and closed, ever.
+    /// Unlike [`ServerThread::debug_connections`], which is also 0 before the server has
+    /// accepted a connection, this says that a connection has been closed.
+    #[doc(hidden)]
+    pub fn debug_connections_finished(&self) -> u64 {
+        lock(&self.handle.shared.clients).finished
+    }
+
     /// Shuts the server down and waits until it has.
     pub fn stop(self) -> io::Result<()> {
         self.handle.shutdown();
@@ -315,7 +327,13 @@ impl Shared {
         let shared = Arc::clone(&self);
         let spawned = std::thread::Builder::new()
             .name(format!("client-{id}"))
-            .spawn(move || shared.serve(id, socket));
+            .spawn(move || {
+                Arc::clone(&shared).serve(id, socket);
+                // The socket is closed now: `serve`'s handles are gone, and so is the
+                // one in `live`, which it removed (unless its writer was left blocked,
+                // in which case the writer's handle closes it when the writer ends).
+                lock(&shared.clients).finished += 1;
+            });
         if let Ok(thread) = spawned {
             clients.live.insert(
                 id,
@@ -348,6 +366,10 @@ impl Shared {
         // Reads wake up this often to see whether the connection is being ended.
         let _ = stream.set_read_timeout(Some(POLL));
         let hang_up = Arc::clone(&socket.hang_up);
+        // Closing waits for the client a moment (`close_gracefully`), unless the
+        // connection is being hung up (server shutdown or cut-off).
+        let stopped = Arc::clone(&socket.hang_up);
+        let stopping = || stopped.load(Ordering::SeqCst);
         let (Ok(cut), Ok(out)) = (stream.try_clone(), stream.try_clone()) else {
             let _ = stream.shutdown(Shutdown::Both);
             self.forget(id);
@@ -360,7 +382,9 @@ impl Shared {
                 if self.log {
                     eprintln!("avalon: {peer}: handshake failed: {e}");
                 }
-                let _ = cut.shutdown(Shutdown::Both);
+                // The Welcome or Error just sent must not be lost to a reset over
+                // what the client sent after its first frame.
+                close_gracefully(&cut, stopping);
                 self.forget(id);
                 return;
             }
@@ -424,6 +448,11 @@ impl Shared {
         // client reads or goes, and the connection is forgotten now.
         if outbox.wait_done(DRAIN_TIMEOUT) {
             let _ = writer.join();
+            // Everything queued has been written. After an oversize frame its body is
+            // still unread behind the Error: close so that the Error is not lost to a
+            // reset. (A connection cut off, or ended by a failed write, is shut down
+            // already, and this returns at once.)
+            close_gracefully(&conn.get_ref().stream, stopping);
         }
         self.forget(id);
         if self.log {

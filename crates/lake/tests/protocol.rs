@@ -557,43 +557,47 @@ fn an_oversize_frame_ends_the_connection_only() {
     server.stop().unwrap();
 }
 
+/// Everything the server sends on `s` before it closes the connection, which must end
+/// cleanly: a reset is not an end, since it can discard what the server sent last.
+fn read_to_close(mut s: TcpStream) -> Vec<u8> {
+    s.set_read_timeout(Some(SLOW)).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => return got,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                panic!("the server did not close the connection")
+            }
+            Err(e) => panic!(
+                "the connection ended with an error, not a clean close ({e}), after {} bytes",
+                got.len()
+            ),
+        }
+    }
+}
+
 #[test]
 fn bad_handshakes() {
+    // The default handshake time: a loaded machine can take a while to run the
+    // server's thread for a connection, and these clients send at once.
     let dir = TempDir::new("handshake");
-    let server = lake_with(Config {
-        handshake_timeout: Duration::from_millis(300),
-        ..quiet(&dir)
-    });
-    // Everything the server sends before it closes the connection.
-    let read_all = |mut s: TcpStream| {
-        s.set_read_timeout(Some(SLOW)).unwrap();
-        let mut got = Vec::new();
-        let mut buf = [0u8; 256];
-        loop {
-            match s.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => got.extend_from_slice(&buf[..n]),
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    panic!("the server did not close the connection")
-                }
-                Err(_) => break,
-            }
-        }
-        got
-    };
+    let server = lake(&dir);
 
-    // A stray HTTP client.
+    // A stray HTTP client: its "GET " is an oversize length and the rest of its request
+    // is never read, yet the connection ends cleanly.
     let mut http = TcpStream::connect(server.addr()).unwrap();
     http.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-    read_all(http);
+    assert!(read_to_close(http).is_empty());
 
     // A request before Hello: an error, then the connection is closed.
     let mut early = TcpStream::connect(server.addr()).unwrap();
     early.write_all(&encode(&Message::ListDisks).unwrap()).unwrap();
-    let reply = read_all(early);
+    let reply = read_to_close(early);
     let (msg, _) = avalon_proto::decode(&reply).unwrap();
     assert!(matches!(
         msg,
@@ -614,7 +618,7 @@ fn bad_handshakes() {
             .unwrap(),
         )
         .unwrap();
-    let reply = read_all(future);
+    let reply = read_to_close(future);
     let (msg, _) = avalon_proto::decode(&reply).unwrap();
     assert!(
         matches!(
@@ -627,16 +631,115 @@ fn bad_handshakes() {
         "{msg:?}"
     );
 
-    // Silence: closed once the handshake time is up.
-    let silent = TcpStream::connect(server.addr()).unwrap();
-    assert!(read_all(silent).is_empty());
-    wait_until("the connections to be forgotten", || {
-        server.debug_connections() == 0
+    // Silence: closed once the handshake time is up. A short time, on a server of its
+    // own, so that it cannot run out on the clients above before the server reads them.
+    let hasty_dir = TempDir::new("handshake-hasty");
+    let hasty = lake_with(Config {
+        handshake_timeout: Duration::from_millis(300),
+        ..quiet(&hasty_dir)
     });
+    let silent = TcpStream::connect(hasty.addr()).unwrap();
+    assert!(read_to_close(silent).is_empty());
+    wait_until("the connections to be forgotten", || {
+        server.debug_connections() == 0 && hasty.debug_connections() == 0
+    });
+    hasty.stop().unwrap();
 
     // The server carries on.
     let mut ok = connect(&server);
     assert_eq!(list(&mut ok), []);
+    server.stop().unwrap();
+}
+
+/// A handshake that runs out of time before the server reads the client's first
+/// frame gets no reply at all, which reads as `Truncated`: what `bad_handshakes`
+/// saw on a loaded machine, when its 300 ms ran out before the server's thread for a
+/// connection got to read it. Here the time is up at once.
+#[test]
+fn a_handshake_out_of_time_gets_no_reply() {
+    let dir = TempDir::new("handshake-none");
+    let server = lake_with(Config {
+        handshake_timeout: Duration::ZERO,
+        ..quiet(&dir)
+    });
+    let mut early = TcpStream::connect(server.addr()).unwrap();
+    early.write_all(&encode(&Message::ListDisks).unwrap()).unwrap();
+    let reply = read_to_close(early);
+    assert!(matches!(
+        avalon_proto::decode(&reply),
+        Err(avalon_proto::Error::Truncated)
+    ));
+    server.stop().unwrap();
+}
+
+/// The server's last frame before it closes a connection arrives whole, though the
+/// client had sent more that the server never read. Closing a socket with input unread
+/// resets the connection, and a reset can throw away what was sent just before it;
+/// the server closes gracefully instead (`avalon_proto::close_gracefully`).
+#[test]
+fn the_last_frame_survives_unread_input() {
+    let dir = TempDir::new("last-frame");
+    let server = lake(&dir);
+    let hello = |version| {
+        encode(&Message::Hello {
+            version,
+            agent: "pipelined".into(),
+        })
+        .unwrap()
+    };
+    let ours = avalon_proto::PROTOCOL_VERSION;
+    let request = |msg: Message| encode(&msg).unwrap();
+    // A frame as the cases below name it: its message, and an Error's code.
+    let name = |m: &Message| match m {
+        Message::Error { code, .. } => format!("Error {code:?}"),
+        other => other.name().to_string(),
+    };
+    // What the client sends, all at once; then the frames it must get before the close.
+    let cases = [
+        (
+            "another version, then a request",
+            [hello(99), request(Message::ListDisks)].concat(),
+            &["Welcome"][..],
+        ),
+        (
+            "a request before Hello, then another",
+            [request(Message::ListDisks), request(Message::Ping { token: 1 })].concat(),
+            &["Error Unexpected"][..],
+        ),
+        (
+            "an oversize frame in a session, with some of its body",
+            [
+                hello(ours),
+                (64u32 << 20).to_le_bytes().to_vec(),
+                vec![0xee; 4096],
+            ]
+            .concat(),
+            &["Welcome", "Error Malformed"][..],
+        ),
+    ];
+    for (what, input, expected) in cases {
+        let finished = server.debug_connections_finished();
+        let mut s = TcpStream::connect(server.addr()).unwrap();
+        s.write_all(&input).unwrap();
+        // Done sending: a server that lingers sees the end at once.
+        s.shutdown(std::net::Shutdown::Write).unwrap();
+        // Nothing is read until the server has closed the socket (the count of closed
+        // connections grows only then, while the count of open ones is also 0 before
+        // the server accepts), so that a reset, if it sent one, is on its way before
+        // the frames are read.
+        wait_until("the connection to be closed", || {
+            server.debug_connections_finished() > finished
+        });
+        let reply = read_to_close(s);
+        let mut got = Vec::new();
+        let mut rest = &reply[..];
+        while !rest.is_empty() {
+            let (msg, n) = avalon_proto::decode(rest).unwrap_or_else(|e| panic!("{what}: {e}"));
+            got.push(name(&msg));
+            rest = &rest[n..];
+        }
+        assert_eq!(got, expected, "{what}");
+    }
     server.stop().unwrap();
 }
 

@@ -15,7 +15,9 @@
 //! Plus [`Screen`], a VM's screen as a server and its viewers keep it, with the change
 //! detection that turns a framebuffer into `ScreenFrame` rectangles; and what every
 //! program's command line shares: [`parse_listen`] for a server's `--listen`, and
-//! [`DiskSource::parse`] for a disk argument (a path or `lake://addr/name`).
+//! [`DiskSource::parse`] for a disk argument (a path or `lake://addr/name`); and
+//! [`close_gracefully`], how every server (Avalon, Lake, Pendragon) ends a connection
+//! after its last reply without a reset throwing that reply away.
 //!
 //! Everything a peer sends is checked: a truncated, oversize or otherwise malformed
 //! frame is an [`Error`], never a panic or an unbounded allocation.
@@ -26,6 +28,7 @@ use std::io;
 mod addr;
 pub mod conn;
 pub mod frame;
+mod linger;
 pub mod message;
 pub mod screen;
 mod wire;
@@ -33,6 +36,7 @@ mod wire;
 pub use addr::{default_port, parse_listen, LAKE_SCHEME};
 pub use conn::Connection;
 pub use frame::{decode, encode, read_frame, write_frame, Frame};
+pub use linger::{close_gracefully, LINGER, LINGER_BYTES};
 pub use message::*;
 pub use screen::{Rect, Screen};
 

@@ -15,6 +15,9 @@
 //!   on Grail;
 //! - the committed binaries are what the tools build now: the kernel, the
 //!   examples, the boot programs, hello, the disk image; and the kernel boots;
+//! - how Avalon and Lake end connections: bad handshakes, and a server's last
+//!   frame arriving whole though the client sent more (Linux's TCP stack is not
+//!   Windows's here);
 //! - the tests that check the documents against the code (instant).
 //!
 //! Left to the local run: the kernel's filesystem integration tests and their
@@ -66,6 +69,33 @@ const STEPS: &[Step] = &[
     Step {
         what: "Avalon protocol",
         args: &["-p", "avalon-proto", "--tests"],
+    },
+    // How the servers close connections depends on the host's TCP stack (Linux and
+    // Windows answer a close with unread input differently), and CI runs on Linux.
+    Step {
+        what: "Avalon: bad handshakes, and the last frame before a close arrives whole",
+        args: &[
+            "-p",
+            "avalon",
+            "--test",
+            "errors",
+            "--",
+            "bad_handshakes",
+            "the_last_frame_survives_unread_input",
+        ],
+    },
+    Step {
+        what: "Lake: bad handshakes, and the last frame before a close arrives whole",
+        args: &[
+            "-p",
+            "lake",
+            "--test",
+            "protocol",
+            "--",
+            "bad_handshakes",
+            "the_last_frame_survives_unread_input",
+            "a_handshake_out_of_time_gets_no_reply",
+        ],
     },
     Step {
         what: "Grail: riscv-tests, RV64, paging and atomics semantics, disk boot, the committed disk image",
