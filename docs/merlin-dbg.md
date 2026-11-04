@@ -128,23 +128,23 @@ Packets are `$payload#checksum`, with `+`/`-` acks until `QStartNoAckMode`. A 0x
 | `qSupported[:features]` | `PacketSize=4000;qXfer:features:read+;QStartNoAckMode+;swbreak+;vContSupported+`. A client that sends `swbreak+` gets `swbreak:;` in breakpoint stop replies |
 | `QStartNoAckMode` | `OK`, then no more acks either way |
 | `?` | the last stop (see below) |
-| `g` / `G data` | `x0`-`x31` and `pc` of the selected hart, 4 little-endian bytes each in hex / writes as many of them as `data` holds |
-| `p n` / `P n=value` | register `n`: 0-31 `x0`-`x31`, 32 `pc`, 65 + `a` CSR `a`, 4161 `priv` (0 U, 1 S, 3 M; writing it changes the mode). GDB's own numbering, so a client agrees with it with or without the target description |
-| `m addr,len` | the bytes that can be read from `addr` on, through the selected hart's translation, at most 4096 |
+| `g` / `G data` | `x0`-`x31` and `pc` of the selected hart, little-endian in hex, as wide as the machine's harts (4 bytes each on RV32, 8 on RV64) / writes as many of them as `data` holds |
+| `p n` / `P n=value` | register `n`: 0-31 `x0`-`x31`, 32 `pc`, 65 + `a` CSR `a`, 4161 `priv` (0 U, 1 S, 3 M; writing it changes the mode), as wide as `g`'s (a value of another width is `E01`). GDB's own numbering, so a client agrees with it with or without the target description |
+| `m addr,len` | the bytes that can be read from `addr` on, through the selected hart's translation, at most 4096. Addresses are up to 64 bits; on RV32, one past 4 GiB is unmapped |
 | `M addr,len:hex`, `X addr,len:binary` | `OK` if all `len` bytes were written |
 | `c [addr]`, `C sig[;addr]`, `s [addr]`, `S sig[;addr]` | resumes (at `addr` if given; signals are ignored). `c` replies when the machine stops, `s` after one instruction of the `Hc` hart |
 | `vCont?` | `vCont;c;C;s;S` |
 | `vCont;action[:thread]...` | a step (`s`/`S`) of its thread if there is one, else continue. Every hart runs either way: a step of one hart is a turn of each hart before it |
 | `Z0`/`z0`, `Z1`/`z1 ,addr,kind` | sets/clears a breakpoint (software and hardware ones are the same thing here). Conditions after `;` are ignored |
-| `Z2`-`Z4` / `z2`-`z4 ,addr,len` | sets/clears a write, read or access watchpoint on `len` bytes |
+| `Z2`-`Z4` / `z2`-`z4 ,addr,len` | sets/clears a write, read or access watchpoint on `len` bytes (`E16` for an empty range or one past the end of the address space, 2^64 or, on RV32, 2^32) |
 | `Hg thread`, `Hc thread` | selects the hart for registers and memory / for `c` and `s` |
 | `T thread` | `OK` if the hart exists |
 | `qfThreadInfo`, `qsThreadInfo`, `qC` | `m1,2,...`, `l`, `QC` and the selected thread |
 | `qThreadExtraInfo,thread` | e.g. `hart 1, S-mode, in wfi`, hex encoded |
 | `qAttached` | `1` |
-| `qXfer:features:read:target.xml:off,len` | the target description: `riscv:rv32`, the `org.gnu.gdb.riscv.cpu` registers, every CSR Grail implements that has a name, and `priv` |
-| `qRegisterInfoN` | LLDB's register description, for `x0`-`x31` and `pc` (LLDB builds without XML support, such as LLVM 21's Windows build, ask for these instead of `target.xml`) |
-| `qHostInfo`, `qProcessInfo` | LLDB's: triple `riscv32-unknown-unknown-elf`, little endian, 4-byte pointers |
+| `qXfer:features:read:target.xml:off,len` | the target description: `riscv:rv32` or `riscv:rv64` with every register 32 or 64 bits wide (`bitsize`), the `org.gnu.gdb.riscv.cpu` registers, every CSR Grail implements that has a name for the machine's width (RV64 has no `cycleh`), and `priv` |
+| `qRegisterInfoN` | LLDB's register description, for `x0`-`x31` and `pc`, as wide as `g`'s and at their offsets in it (LLDB builds without XML support, such as LLVM 21's Windows build, ask for these instead of `target.xml`) |
+| `qHostInfo`, `qProcessInfo` | LLDB's: triple `riscv32-unknown-unknown-elf` and 4-byte pointers, or `riscv64-unknown-unknown-elf` and 8-byte pointers; little endian |
 | `k`, `vKill` | `X09` (ended by SIGKILL), then kills the machine. GDB expects no reply to `k` and ignores it; LLDB waits for one |
 | `D` | `OK`, then detaches |
 | anything else | empty: not supported |

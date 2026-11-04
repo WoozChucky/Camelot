@@ -87,7 +87,7 @@ impl Hart {
             .read_phys(bus, paddr, size)
             .map_err(|_| Trap::new(Access::Load.access_fault(), vaddr))?;
         bus.reservation_mut(self.id as usize).reserve(paddr, size);
-        bus.watches.note(self.id, vaddr as u32, size, true, false);
+        bus.watches.note(self.id, vaddr, size, true, false);
         Ok(loaded(size, v))
     }
 
@@ -119,7 +119,7 @@ impl Hart {
         }
         self.write_phys(bus, paddr, size, val)
             .map_err(|_| Trap::new(Access::Store.access_fault(), vaddr))?;
-        bus.watches.note(self.id, vaddr as u32, size, false, true);
+        bus.watches.note(self.id, vaddr, size, false, true);
         Ok(0)
     }
 
@@ -140,7 +140,7 @@ impl Hart {
         let old = self.read_phys(bus, paddr, size).map_err(fault)?;
         self.write_phys(bus, paddr, size, amo_result(op, size, old, src))
             .map_err(fault)?;
-        bus.watches.note(self.id, vaddr as u32, size, true, true);
+        bus.watches.note(self.id, vaddr, size, true, true);
         Ok(loaded(size, old))
     }
 }

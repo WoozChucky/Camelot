@@ -288,7 +288,7 @@ impl Hart {
         let v = bus
             .read(paddr, size)
             .map_err(|_| Trap::new(Access::Load.access_fault(), vaddr))?;
-        bus.watches.note(self.id, vaddr as u32, size, true, false);
+        bus.watches.note(self.id, vaddr, size, true, false);
         Ok(v)
     }
 
@@ -300,7 +300,7 @@ impl Hart {
         let paddr = self.translate(bus, vaddr, Access::Store)?;
         self.write_phys(bus, paddr, size, val)
             .map_err(|_| Trap::new(Access::Store.access_fault(), vaddr))?;
-        bus.watches.note(self.id, vaddr as u32, size, false, true);
+        bus.watches.note(self.id, vaddr, size, false, true);
         Ok(())
     }
 

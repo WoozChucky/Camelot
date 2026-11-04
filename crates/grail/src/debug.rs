@@ -15,6 +15,10 @@
 //!   ([`Machine::select_hart`]), memory through its address translation or physical
 //!   ([`Space`]).
 //!
+//! Addresses and values are `u64`, as wide as an RV64 hart's. On an RV32 machine they
+//! are its 32-bit values: registers, the pc and CSRs read as their low 32 bits
+//! (zero-extended), and virtual addresses past 4 GiB are not in its address space.
+//!
 //! Debugging does not change what the machine does: a debugged run executes exactly the
 //! instructions an undebugged one does, in the same order, with the same results. The
 //! machine stops between two harts' turns ([`Cpu::turn_traced`]) and picks up where it
@@ -23,6 +27,7 @@
 
 use crate::cpu::{Cpu, Mode};
 use crate::Machine;
+use excalibur::Xlen;
 use std::collections::BTreeSet;
 use std::time::Instant;
 
@@ -50,8 +55,8 @@ impl WatchKind {
 /// A watched range of virtual addresses, `[addr, addr + len)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Watchpoint {
-    pub addr: u32,
-    pub len: u32,
+    pub addr: u64,
+    pub len: u64,
     pub kind: WatchKind,
 }
 
@@ -61,7 +66,7 @@ pub struct WatchHit {
     pub hart: usize,
     pub kind: WatchKind,
     /// The first watched byte the access touched.
-    pub addr: u32,
+    pub addr: u64,
 }
 
 /// The watchpoints, kept on the bus, where the harts' loads and stores report to them
@@ -77,20 +82,21 @@ impl Watches {
     /// say which it was; an AMO is both). Cheap when there is no watchpoint: this runs on
     /// every access.
     #[inline]
-    pub(crate) fn note(&mut self, hart: u32, vaddr: u32, size: u32, read: bool, write: bool) {
+    pub(crate) fn note(&mut self, hart: u32, vaddr: u64, size: u32, read: bool, write: bool) {
         if !self.list.is_empty() && self.hit.is_none() {
             self.check(hart, vaddr, size, read, write);
         }
     }
 
-    fn check(&mut self, hart: u32, vaddr: u32, size: u32, read: bool, write: bool) {
-        let end = vaddr as u64 + size as u64;
+    fn check(&mut self, hart: u32, vaddr: u64, size: u32, read: bool, write: bool) {
+        // In u128: a range may end at 2^64.
+        let end = u128::from(vaddr) + u128::from(size);
         self.hit = self
             .list
             .iter()
             .find(|w| {
-                let w_end = w.addr as u64 + w.len as u64;
-                w.kind.matches(read, write) && (vaddr as u64) < w_end && (w.addr as u64) < end
+                let w_end = u128::from(w.addr) + u128::from(w.len);
+                w.kind.matches(read, write) && u128::from(vaddr) < w_end && u128::from(w.addr) < end
             })
             .map(|w| WatchHit {
                 hart: hart as usize,
@@ -104,7 +110,7 @@ impl Watches {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
     /// `hart` is about to execute the instruction at `pc`, a breakpoint.
-    Breakpoint { hart: usize, pc: u32 },
+    Breakpoint { hart: usize, pc: u64 },
     /// An instruction of `hart` hit a watchpoint; it has completed, and the hart's pc is
     /// the next instruction.
     Watchpoint(WatchHit),
@@ -126,7 +132,7 @@ pub enum Space {
 
 /// A machine's debugger state: breakpoints and the selected hart.
 pub struct Debug {
-    breakpoints: BTreeSet<u32>,
+    breakpoints: BTreeSet<u64>,
     hart: usize,
     /// The machine has stopped (or not run yet) since it last ran a turn: the next turn
     /// is not stopped by a breakpoint at its hart's pc, so resuming from a breakpoint
@@ -147,24 +153,26 @@ impl Default for Debug {
 impl Machine {
     /// Sets a breakpoint at virtual address `pc`: a hart about to execute the
     /// instruction there stops the machine. Returns false if there was one already.
-    pub fn set_breakpoint(&mut self, pc: u32) -> bool {
+    pub fn set_breakpoint(&mut self, pc: u64) -> bool {
         self.debug.breakpoints.insert(pc)
     }
 
     /// Removes the breakpoint at `pc`. Returns false if there was none.
-    pub fn clear_breakpoint(&mut self, pc: u32) -> bool {
+    pub fn clear_breakpoint(&mut self, pc: u64) -> bool {
         self.debug.breakpoints.remove(&pc)
     }
 
     /// The breakpoints, in address order.
-    pub fn breakpoints(&self) -> impl Iterator<Item = u32> + '_ {
+    pub fn breakpoints(&self) -> impl Iterator<Item = u64> + '_ {
         self.debug.breakpoints.iter().copied()
     }
 
     /// Watches `[addr, addr + len)` (virtual addresses) for `kind` accesses by any hart.
-    /// An error for an empty range or one past the end of the address space.
-    pub fn set_watchpoint(&mut self, addr: u32, len: u32, kind: WatchKind) -> Result<(), String> {
-        if len == 0 || addr.checked_add(len - 1).is_none() {
+    /// An error for an empty range or one past the end of the machine's address space
+    /// (2^64, or 2^32 on RV32).
+    pub fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> Result<(), String> {
+        let end = u128::from(addr) + u128::from(len);
+        if len == 0 || end > 1u128 << self.config().xlen.bits() {
             return Err(format!("cannot watch {len} bytes at {addr:#x}"));
         }
         let w = Watchpoint { addr, len, kind };
@@ -177,7 +185,7 @@ impl Machine {
 
     /// Removes a watchpoint set with the same range and kind. Returns false if there was
     /// none.
-    pub fn clear_watchpoint(&mut self, addr: u32, len: u32, kind: WatchKind) -> bool {
+    pub fn clear_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> bool {
         let list = &mut self.cpu.bus.watches.list;
         let before = list.len();
         list.retain(|w| *w != Watchpoint { addr, len, kind });
@@ -213,25 +221,34 @@ impl Machine {
         self.debug.hart
     }
 
-    // The debug interface is 32-bit, an RV32 machine's view: #147 widens it for RV64.
-
-    /// Register `x<r>` of the selected hart (`r` < 32).
-    pub fn reg(&self, r: usize) -> u32 {
-        self.cpu.hart(self.debug.hart).x[r] as u32
+    /// The machine's values as a debugger sees them: all 64 bits, or the low 32 on RV32
+    /// (whose registers the harts keep sign-extended).
+    fn width_mask(&self) -> u64 {
+        match self.config().xlen {
+            Xlen::Rv32 => u32::MAX.into(),
+            Xlen::Rv64 => u64::MAX,
+        }
     }
 
-    /// Writes register `x<r>` of the selected hart. Writes to `x0` are ignored.
-    pub fn set_reg(&mut self, r: usize, v: u32) {
-        self.cpu.hart_mut(self.debug.hart).set_reg(r as u8, v.into());
+    /// Register `x<r>` of the selected hart (`r` < 32).
+    pub fn reg(&self, r: usize) -> u64 {
+        self.cpu.hart(self.debug.hart).x[r] & self.width_mask()
+    }
+
+    /// Writes register `x<r>` of the selected hart (its low 32 bits on RV32). Writes to
+    /// `x0` are ignored.
+    pub fn set_reg(&mut self, r: usize, v: u64) {
+        self.cpu.hart_mut(self.debug.hart).set_reg(r as u8, v);
     }
 
     /// The selected hart's pc: the instruction it executes next.
-    pub fn pc(&self) -> u32 {
-        self.cpu.hart(self.debug.hart).pc as u32
+    pub fn pc(&self) -> u64 {
+        self.cpu.hart(self.debug.hart).pc & self.width_mask()
     }
 
-    pub fn set_pc(&mut self, pc: u32) {
-        self.cpu.hart_mut(self.debug.hart).pc = pc.into();
+    pub fn set_pc(&mut self, pc: u64) {
+        let mask = self.width_mask();
+        self.cpu.hart_mut(self.debug.hart).pc = pc & mask;
     }
 
     /// The selected hart's privilege mode.
@@ -245,43 +262,42 @@ impl Machine {
 
     /// CSR `addr` of the selected hart, whatever its privilege mode. `None` if Grail has
     /// no such CSR.
-    pub fn csr(&self, addr: u16) -> Option<u32> {
+    pub fn csr(&self, addr: u16) -> Option<u64> {
+        let mask = self.width_mask();
         self.cpu
             .hart(self.debug.hart)
             .csr_value(&self.cpu.bus, addr)
-            .map(|v| v as u32)
+            .map(|v| v & mask)
     }
 
     /// Writes CSR `addr` of the selected hart, with the CSR's WARL rules. Returns false if
     /// Grail has no such CSR or it is read-only.
-    pub fn set_csr(&mut self, addr: u16, v: u32) -> bool {
-        self.cpu.hart_mut(self.debug.hart).csr_store(addr, v.into())
+    pub fn set_csr(&mut self, addr: u16, v: u64) -> bool {
+        self.cpu.hart_mut(self.debug.hart).csr_store(addr, v)
     }
 
     /// The physical address of `addr` in `space`, as [`Machine::read_memory`] sees it.
-    pub fn translate(&self, addr: u32, space: Space) -> Option<u32> {
+    /// A virtual address an RV32 hart cannot form (past 4 GiB) has none.
+    pub fn translate(&self, addr: u64, space: Space) -> Option<u64> {
         match space {
             Space::Physical => Some(addr),
+            Space::Virtual if addr & !self.width_mask() != 0 => None,
             Space::Virtual => self
                 .cpu
                 .hart(self.debug.hart)
-                .debug_translate(&self.cpu.bus, addr.into())
-                .and_then(|p| u32::try_from(p).ok()),
+                .debug_translate(&self.cpu.bus, addr),
         }
     }
 
     /// Reads memory at `addr` into `buf`, stopping at the first byte that cannot be read:
     /// unmapped, or not memory (RAM, VRAM or the boot ROM; device registers are never
     /// read, since reading one can change it). Returns the bytes read.
-    pub fn read_memory(&self, addr: u32, buf: &mut [u8], space: Space) -> usize {
+    pub fn read_memory(&self, addr: u64, buf: &mut [u8], space: Space) -> usize {
         for (i, b) in buf.iter_mut().enumerate() {
-            let Some(a) = addr.checked_add(i as u32) else {
+            let Some(a) = addr.checked_add(i as u64) else {
                 return i;
             };
-            match self
-                .translate(a, space)
-                .and_then(|p| self.cpu.bus.debug_read(p.into()))
-            {
+            match self.translate(a, space).and_then(|p| self.cpu.bus.debug_read(p)) {
                 Some(v) => *b = v,
                 None => return i,
             }
@@ -292,13 +308,13 @@ impl Machine {
     /// Writes `data` to memory at `addr`, stopping at the first byte that cannot be
     /// written: unmapped, or not RAM or VRAM. Returns the bytes written. A write breaks
     /// the LR/SC reservations on the words it changes, as a store would.
-    pub fn write_memory(&mut self, addr: u32, data: &[u8], space: Space) -> usize {
+    pub fn write_memory(&mut self, addr: u64, data: &[u8], space: Space) -> usize {
         for (i, &b) in data.iter().enumerate() {
-            let Some(a) = addr.checked_add(i as u32) else {
+            let Some(a) = addr.checked_add(i as u64) else {
                 return i;
             };
             match self.translate(a, space) {
-                Some(p) if self.cpu.bus.debug_write(p.into(), b) => {}
+                Some(p) if self.cpu.bus.debug_write(p, b) => {}
                 _ => return i,
             }
         }
@@ -394,7 +410,7 @@ impl Machine {
         }
         let hart = self.cpu.next_hart();
         let h = self.cpu.hart(hart);
-        let pc = h.pc as u32;
+        let pc = h.pc & self.width_mask();
         (self.debug.breakpoints.contains(&pc) && h.will_execute(&self.cpu.bus))
             .then_some(Stop::Breakpoint { hart, pc })
     }

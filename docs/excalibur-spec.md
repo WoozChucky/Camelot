@@ -347,6 +347,7 @@ The whole 64 KiB area is the boot block's to use (stack, buffers); the RAM below
 
 Debugging: a machine can be debugged through Grail's debug interface (`grail::debug`), and over TCP with the GDB remote serial protocol (`grail --gdb ADDR`, with `--gdb-wait` to start stopped at the first instruction; `docs/merlin-dbg.md` lists the packets). The rules:
 
+- **Width:** the interface and the stub are as wide as the machine. Addresses, registers, the pc and CSRs are 64-bit values; on an RV32 machine they are its 32-bit ones (registers read as their low 32 bits), and a virtual address past 4 GiB is not in its address space. The stub describes `riscv:rv32` or `riscv:rv64`, with registers of that width.
 - **Breakpoints** are held by the emulator, not written into memory. A hart stops before executing an instruction whose virtual address has one, when it is about to execute it rather than take an interrupt or wait in `wfi`.
 - **Watchpoints** stop the machine right after a load, store, `lr`, successful `sc` or AMO of any hart touches a watched virtual address range. Fetches, page-table walks and device DMA don't count.
 - **Stops** happen between two harts' turns of a step, and the machine resumes at the turn where it stopped. Resuming first executes the instruction a hart stopped at, even if it has a breakpoint.
