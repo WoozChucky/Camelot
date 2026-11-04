@@ -26,16 +26,28 @@
 //! ```
 //!
 //! clang's is the same with the frame's whole size in the first `addi`. The slots move
-//! in a variadic function, whose saved argument registers come first (merlin puts
-//! `ra` at `CFA - 32` then on RV32, `CFA - 64` on RV64), so the unwinder does not
-//! assume them: it reads the function's prologue, from its symbol's address, and works
-//! out where `sp` stood when each of `ra` and `s0` was stored (by a store as wide as a
-//! register: `sw` on RV32, `sd` on RV64), and what `s0` was set to ([`Prologue`]).
-//! From one frame's `s0`, the next frame is then
+//! in a variadic function, whose saved argument registers come first: merlin saves the
+//! `8 - k` argument registers its named parameters leave free (they take `k` argument
+//! words, at most 8) right below the CFA, and `ra` and `s0` below those, so with `W`
+//! a register's bytes (4 or 8)
 //!
 //! ```text
-//!     caller's pc = the register-sized value at s0 - CFA offset of s0 + CFA offset of ra's slot
-//!     caller's s0 = the register-sized value at s0 - CFA offset of s0 + CFA offset of s0's slot
+//!     ra        at CFA - W * (9 - k)
+//!     caller s0 at CFA - W * (10 - k)
+//! ```
+//!
+//! which with one named parameter, as kprintf, is `CFA - 32` and `CFA - 36` on RV32,
+//! `CFA - 64` and `CFA - 72` on RV64. So the unwinder does not assume the slots
+//! anywhere: it reads the function's prologue, from its symbol's address, and works
+//! out where `sp` stood when each of `ra` and `s0` was stored (by a store as wide as a
+//! register: `sw` on RV32, `sd` on RV64), and what `s0` was set to ([`Prologue`]).
+//! From one frame's `s0`, the next frame is then found in two steps, with the
+//! prologue's offsets from the CFA (`fp`, `ra_slot` and `s0_slot` of [`Prologue`]):
+//!
+//! ```text
+//!     CFA         = s0 - fp                   (fp is 0 for merlin and clang: s0 = CFA)
+//!     caller's pc = xword(CFA + ra_slot)      (xword: a register's worth of memory,
+//!     caller's s0 = xword(CFA + s0_slot)       4 bytes on RV32, 8 on RV64)
 //! ```
 //!
 //! and so on up the chain of saved `s0`s, until a frame pointer is 0, misaligned (the
