@@ -45,6 +45,9 @@ const char DEFAULT_SCRIPT[] = "\n"
 static uint err_line;
 static char *err_msg;
 
+/* Whether the script is read for ELF64 (script_parse's elf64). */
+static int elf64;
+
 static int fail(uint line, char *msg) {
     err_line = line;
     err_msg = msg;
@@ -206,40 +209,16 @@ static int format_class(const char *name) {
     return FORMAT_NONE;
 }
 
-static int name_or_str(const char *what, char **out);
-
-/* The executable's class is the script's OUTPUT_FORMAT's when it names one,
- * and every object and library member must have it, so library.c needs it
- * before the script is parsed. Commands are the words at the top level,
- * outside every ( ) and { }; like the parser, take the first OUTPUT_FORMAT's
- * first argument. */
-int declared_format(const char *src) {
-    if (!lex(src)) {
-        return FORMAT_NONE;
-    }
-    uint depth = 0;
-    for (uint i = 0; i < ntoks; i++) {
-        struct tok *t = &toks[i];
-        if (t->kind == TK_PUNCT && (strcmp(t->text, "(") == 0 || strcmp(t->text, "{") == 0)) {
-            depth++;
-        } else if (t->kind == TK_PUNCT && (strcmp(t->text, ")") == 0 || strcmp(t->text, "}") == 0)) {
-            depth = depth > 0 ? depth - 1 : 0;
-        } else if (t->kind == TK_WORD && depth == 0 && strcmp(t->text, "OUTPUT_FORMAT") == 0) {
-            char *f;
-            pos = i + 2;
-            if (i + 2 < ntoks && toks[i + 1].kind == TK_PUNCT && strcmp(toks[i + 1].text, "(") == 0 &&
-                name_or_str("", &f)) {
-                return format_class(f);
-            }
-            return FORMAT_NONE;
-        }
-    }
-    return FORMAT_NONE;
-}
-
 /* ---- Numbers and globs ---- */
 
-int parse_number(const char *w, i64 *out) {
+/* a > b, as unsigned 64-bit numbers. */
+static int ugt(i64 a, i64 b) {
+    return a.hi != b.hi ? a.hi > b.hi : a.lo > b.lo;
+}
+
+/* parse_number, for an ELF64 script (wide) or an ELF32 one: up to 2^64 - 1,
+ * or up to i64::MAX. */
+static int number(const char *w, i64 *out, int wide) {
     uint n = (uint)strlen(w);
     if (n == 0) {
         return 0;
@@ -252,10 +231,12 @@ int parse_number(const char *w, i64 *out) {
         mult = 1024 * 1024;
         n--;
     }
-    /* i64::MAX, the most either form may be before the multiplier. */
-    i64 max;
+    /* The most either form may be before the multiplier, and a tenth of it. */
+    i64 max, tenth;
     max.lo = 0xffffffffu;
-    max.hi = 0x7fffffffu;
+    max.hi = wide ? 0xffffffffu : 0x7fffffffu;
+    tenth.lo = wide ? 0x99999999u : 0xccccccccu;
+    tenth.hi = wide ? 0x19999999u : 0x0cccccccu;
     i64 v = i64_u(0);
     if (n >= 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X')) {
         if (n == 2) {
@@ -267,7 +248,7 @@ int parse_number(const char *w, i64 *out) {
                      : c >= 'a' && c <= 'f' ? (uint)(c - 'a' + 10)
                      : c >= 'A' && c <= 'F' ? (uint)(c - 'A' + 10)
                                             : 16;
-            if (d >= 16 || i64_cmp(v, i64_sar(max, 4)) > 0) {
+            if (d >= 16 || ugt(v, i64_shr(max, 4))) {
                 return 0;
             }
             v = i64_add(i64_shl(v, 4), i64_u(d));
@@ -280,28 +261,29 @@ int parse_number(const char *w, i64 *out) {
             if (w[i] < '0' || w[i] > '9') {
                 return 0;
             }
-            i64 ten = i64_mul(v, i64_u(10));
-            i64 q;
-            i64_div(max, i64_u(10), &q);
-            if (i64_cmp(v, q) > 0) {
+            if (ugt(v, tenth)) {
                 return 0;
             }
+            i64 ten = i64_mul(v, i64_u(10));
             v = i64_add(ten, i64_u((uint)(w[i] - '0')));
-            if (i64_is_neg(v)) {
+            /* Past max, or round 2^64. */
+            if (ugt(v, max) || ugt(ten, v)) {
                 return 0;
             }
         }
     }
     if (mult != 1) {
-        i64 q;
-        i64_div(max, i64_u(mult), &q);
-        if (i64_cmp(v, q) > 0) {
+        if (ugt(v, i64_shr(max, mult == 1024 ? 10 : 20))) {
             return 0;
         }
         v = i64_mul(v, i64_u(mult));
     }
     *out = v;
     return 1;
+}
+
+int parse_number(const char *w, i64 *out) {
+    return number(w, out, 0);
 }
 
 int glob_match(const char *p, const char *n) {
@@ -519,7 +501,7 @@ static int atom(struct expr **out) {
     }
     if (w[0] >= '0' && w[0] <= '9') {
         struct expr *e = new_expr(X_NUM);
-        if (!parse_number(w, &e->num)) {
+        if (!number(w, &e->num, elf64)) {
             return fail(line, fmt("bad number '%s'", w));
         }
         *out = e;
@@ -603,7 +585,12 @@ static int const_eval(struct expr *e, i64 *out) {
         return 0;
     }
     i64 r = e->kind == X_ADD ? i64_add(a, b) : i64_sub(a, b);
-    /* checked_add / checked_sub: no signed overflow. */
+    /* ELF64: modulo 2^64. ELF32: checked_add / checked_sub, no signed
+     * overflow. */
+    if (elf64) {
+        *out = r;
+        return 1;
+    }
     int na = i64_is_neg(a), nb = i64_is_neg(b) ^ (e->kind == X_SUB), nr = i64_is_neg(r);
     if (e->kind == X_SUB && b.hi == 0x80000000u && b.lo == 0) {
         /* -i64::MIN does not exist: a - MIN overflows unless a < 0. */
@@ -681,16 +668,23 @@ static int memory(struct script *s) {
             !region_field(LENGTH_NAMES, &length)) {
             return 0;
         }
-        if (!fits_u32(origin)) {
-            return fail(line, fmt("MEMORY ORIGIN %s does not fit in 32 bits", i64_hex(origin)));
-        }
-        if (!fits_u32(length)) {
-            return fail(line, fmt("MEMORY LENGTH %s does not fit in 32 bits", i64_hex(length)));
-        }
-        /* origin + length > 2^32: the region may end exactly at 4 GiB. */
-        i64 end = i64_add(origin, length);
-        if (end.hi > 1 || (end.hi == 1 && end.lo != 0)) {
-            return fail(line, fmt("MEMORY region %s extends past 4 GiB", name));
+        if (elf64) {
+            /* ELF64: the region ends below 2^64. */
+            if (ugt(origin, i64_add(origin, length))) {
+                return fail(line, fmt("MEMORY region %s extends past the 64-bit address space", name));
+            }
+        } else {
+            if (!fits_u32(origin)) {
+                return fail(line, fmt("MEMORY ORIGIN %s does not fit in 32 bits", i64_hex(origin)));
+            }
+            if (!fits_u32(length)) {
+                return fail(line, fmt("MEMORY LENGTH %s does not fit in 32 bits", i64_hex(length)));
+            }
+            /* origin + length > 2^32: the region may end exactly at 4 GiB. */
+            i64 end = i64_add(origin, length);
+            if (end.hi > 1 || (end.hi == 1 && end.lo != 0)) {
+                return fail(line, fmt("MEMORY region %s extends past 4 GiB", name));
+            }
         }
         have = 1;
         s->has_memory = 1;
@@ -976,8 +970,9 @@ static int script(struct script *s) {
     return 1;
 }
 
-int script_parse(const char *src, struct script *out, uint *line, char **msg) {
+int script_parse(const char *src, struct script *out, uint *line, char **msg, int for_elf64) {
     memset(out, 0, sizeof *out);
+    elf64 = for_elf64;
     pos = 0;
     if (!lex(src) || !script(out)) {
         *line = err_line;

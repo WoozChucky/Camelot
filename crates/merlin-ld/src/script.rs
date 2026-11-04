@@ -354,38 +354,6 @@ fn format_class(name: &str) -> Option<Class> {
         .find(|&c| format_name(c) == name)
 }
 
-/// The class `src`'s `OUTPUT_FORMAT` names (its first argument, the one
-/// ld.lld goes by), found without reading the rest of the script: `None`
-/// if it has none, or one [`parse`] will refuse.
-///
-/// The executable's class is the script's when it names one, else the
-/// first object's, and ld.lld compares every object (library members too)
-/// with it. So the layout and [`crate::library`] need it before the script
-/// is parsed: the layout to know which class to parse the script for.
-pub fn declared_format(src: &str) -> Option<Class> {
-    let (toks, glued) = lex(src).ok()?;
-    // Commands are the words at the top level, outside every `( )` and
-    // `{ }`; like the parser, take the first OUTPUT_FORMAT's first argument.
-    let mut depth = 0usize;
-    let at = toks.iter().position(|(t, _)| {
-        match t {
-            Tok::Punct("(" | "{") => depth += 1,
-            Tok::Punct(")" | "}") => depth = depth.saturating_sub(1),
-            Tok::Word(w) => return depth == 0 && w == "OUTPUT_FORMAT",
-            _ => {}
-        }
-        false
-    })?;
-    let mut p = Parser {
-        toks,
-        glued,
-        pos: at + 1,
-        class: Class::Elf64,
-    };
-    p.expect("(").ok()?;
-    format_class(&p.name_or_str("").ok()?)
-}
-
 /// Parses a number: decimal or `0x` hex, with an optional `K` or `M` suffix
 /// (ld.lld has no `G` either). ELF64 takes any `u64`; ELF32 (RV32, until
 /// #159) only values up to `i64::MAX`, the type its scripts are evaluated in.
@@ -1276,7 +1244,7 @@ mod tests {
         .unwrap();
         assert_eq!(s.format, Some(Class::Elf64));
         assert_eq!(parse("ENTRY(_start)", Class::Elf32).unwrap().format, None);
-        // declared_format finds the same name without parsing the script.
+        // The first OUTPUT_FORMAT's first argument counts.
         for (src, want) in [
             (r#"OUTPUT_FORMAT("elf64-littleriscv")"#, Some(Class::Elf64)),
             (
@@ -1287,25 +1255,15 @@ mod tests {
                 "MEMORY { RAM (rwx) : ORIGIN = 0, LENGTH = 4 }\nOUTPUT_FORMAT(\"elf64-littleriscv\")",
                 Some(Class::Elf64),
             ),
-            // The first command counts, as in the parser.
             (
                 r#"OUTPUT_FORMAT("elf32-littleriscv") OUTPUT_FORMAT("elf64-littleriscv")"#,
                 Some(Class::Elf32),
             ),
             ("ENTRY(_start)", None),
-        ] {
-            assert_eq!(declared_format(src), want, "{src}");
-            assert_eq!(parse(src, Class::Elf64).unwrap().format, want, "{src}");
-        }
-        // And nothing where the parser finds no OUTPUT_FORMAT it knows.
-        for src in [
-            r#"OUTPUT_FORMAT("elf64-bigriscv")"#,
-            "OUTPUT_FORMAT",
             // A word among a command's arguments, or in SECTIONS, is no command.
-            "ENTRY(OUTPUT_FORMAT) SECTIONS { OUTPUT_FORMAT = 1; }",
-            "/* unterminated",
+            ("ENTRY(OUTPUT_FORMAT) SECTIONS { OUTPUT_FORMAT = 1; }", None),
         ] {
-            assert_eq!(declared_format(src), None, "{src}");
+            assert_eq!(parse(src, Class::Elf64).unwrap().format, want, "{src}");
         }
         assert_eq!(
             err("OUTPUT_FORMAT(\"elf32-littleriscv\", \"elf64-bigriscv\")"),
@@ -1322,7 +1280,6 @@ mod tests {
             ("OUTPUT_FORMAT(elf32-littleriscv)", Class::Elf32),
         ] {
             assert_eq!(parse(src, class).unwrap().format, Some(class), "{src}");
-            assert_eq!(declared_format(src), Some(class), "{src}");
         }
         assert_eq!(
             err("OUTPUT_FORMAT(elf64-bigriscv)"),

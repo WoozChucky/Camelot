@@ -158,13 +158,15 @@ struct input {
 };
 
 /* ---- Libraries (library.c) ---- */
-/* Parses `inputs` and the members of `library` they need (merlin-ld's
- * with_needed_for), which follow them in library order. `format` is the
- * class the script's OUTPUT_FORMAT names (declared_format), which every
- * object and member must have. Returns the objects and their count in *n,
- * or NULL after adding errors. */
-struct object *parse_with_needed(struct input *inputs, uint ninputs, struct input *library, uint nlibrary,
-                                 int format, uint *n);
+/* Parses the n files of a command line, in its order, lazy[i] saying which
+ * are library members, compares their classes and picks the members the
+ * others need (merlin-ld's layout::read, check_classes and library::pulled):
+ * the files that are not members, in order, then the members needed, in
+ * library order. `format` is the class the script's OUTPUT_FORMAT names,
+ * which every file must have. Returns the objects and their count in *count,
+ * or NULL after adding errors; NULL too when errors were added before (the
+ * script's), once every file is parsed. */
+struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, int format, uint *count);
 
 /* ---- Linker scripts (script.c) ---- */
 enum { X_NUM, X_DOT, X_SYMBOL, X_ALIGN, X_ORIGIN, X_LENGTH, X_ADDR, X_ADD, X_SUB };
@@ -225,12 +227,11 @@ struct script {
 
 #define DISCARD_NAME "/DISCARD/"
 extern const char DEFAULT_SCRIPT[];
-/* Parses a script. 0 with *line and *msg set on an error. */
-int script_parse(const char *src, struct script *out, uint *line, char **msg);
-/* The class `src`'s OUTPUT_FORMAT names, found without parsing the rest of
- * it (merlin-ld's declared_format): FORMAT_NONE if it has none, or one
- * script_parse will refuse. */
-int declared_format(const char *src);
+/* Parses a script, for ELF32 (its exact values and 4 GiB limits) or, when
+ * elf64 is set, for ELF64 (64-bit values, wrapping), as merlin-ld reads it
+ * first, for the errors ld.lld gives whatever the class. 0 with *line and
+ * *msg set on an error. */
+int script_parse(const char *src, struct script *out, uint *line, char **msg, int elf64);
 /* "elf32-littleriscv" or "elf64-littleriscv". */
 const char *format_name(int format);
 /* A number: decimal or 0x hex, with an optional K or M. */

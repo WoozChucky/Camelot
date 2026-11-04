@@ -987,7 +987,7 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
             "",
         ),
         (vec![b"not an object".to_vec()], script, ""),
-        (vec![start.clone(), truncated], script, ""),
+        (vec![start.clone(), truncated.clone()], script, ""),
         // An alignment that is not a power of two (sh_addralign at 32), a
         // symbol table whose size is not a multiple of 16 (sh_size at 20).
         (vec![shdr_field(start.clone(), ".text", 32, |_| 12)], script, ""),
@@ -1047,6 +1047,19 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
             "OUTPUT_FORMAT(\"elf64-littleriscv\")\nSECTIONS { . = 0x1000; .text : { *(.text) } }",
             "--start-lib",
         ),
+        // ld.lld's order: the script read first, for 64-bit values, its
+        // errors before the objects' and hiding the classes'; then the
+        // files, a library member among them, in command-line order.
+        (
+            vec![start.clone(), truncated.clone()],
+            "OUTPUT_FORMAT(elf64-littleriscv) SECTIONS {",
+            "",
+        ),
+        (
+            vec![start.clone(), object(".text\n.globl f\nf: nop\n"), start.clone()],
+            "OUTPUT_FORMAT(elf64-littleriscv) SECTIONS { . = 0xffffffffffffffff; MEMORY_TOP = 0x8000000000000000; }",
+            "--start-lib 1",
+        ),
         // Warnings: no entry symbol (the first code section's address is
         // used), and duplicate strings in mergeable sections.
         (
@@ -1077,22 +1090,25 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
     // What merlin-ld says and writes for each case.
     let mut wants: Vec<(String, Option<Vec<u8>>)> = Vec::new();
     for (k, (objects, script, extra)) in cases.iter().enumerate() {
+        // (input, whether it is a library member), in command-line order.
         let mut inputs = Vec::new();
-        let mut library = Vec::new();
         let mut args = format!("ld -T /e/{k}.ld -o /out/{k}");
+        let member = match *extra {
+            "--start-lib" => Some(objects.len() - 1),
+            e => e.strip_prefix("--start-lib ").map(|j| j.parse().unwrap()),
+        };
         for (j, data) in objects.iter().enumerate() {
             let path = format!("/e/{k}_{j}.o");
             let input = merlin_ld::Input {
                 name: path.clone(),
                 data: data.clone(),
             };
-            if *extra == "--start-lib" && j == objects.len() - 1 {
+            if member == Some(j) {
                 args.push_str(&format!(" --start-lib {path} --end-lib"));
-                library.push(input);
             } else {
                 args.push_str(&format!(" {path}"));
-                inputs.push(input);
             }
+            inputs.push((input, member == Some(j)));
             files.push((path, data.clone()));
         }
         files.push((format!("/e/{k}.ld"), script.as_bytes().to_vec()));
@@ -1108,7 +1124,8 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
             args.push_str(&format!(" {extra}"));
         }
         // As merlin-ld's command line links (/bin/ld's too).
-        wants.push(match merlin_ld::link_with_library(&inputs, &library, &opts) {
+        let inputs: Vec<(&merlin_ld::Input, bool)> = inputs.iter().map(|(i, lib)| (i, *lib)).collect();
+        wants.push(match merlin_ld::link_files(&inputs, &opts) {
             Ok(linked) => {
                 assert!(!linked.layout.warnings.is_empty(), "case {k} links cleanly");
                 let said = linked

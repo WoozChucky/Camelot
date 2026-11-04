@@ -1251,7 +1251,7 @@ int layout_build(struct object *objects, uint nobjects, const char *name, const 
     script_name = have_script ? name : "<default layout>";
     uint line;
     char *msg;
-    if (!script_parse(have_script ? text : DEFAULT_SCRIPT, &S, &line, &msg)) {
+    if (!script_parse(have_script ? text : DEFAULT_SCRIPT, &S, &line, &msg, 0)) {
         error(fmt("%s:%u: %s", script_name, line, msg));
         return 0;
     }

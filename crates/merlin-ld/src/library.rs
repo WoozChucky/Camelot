@@ -22,9 +22,10 @@
 //! only on which members are needed.
 //!
 //! Every member must still be of the executable's class, needed or not, as
-//! ld.lld checks its lazy objects ([`object::check_classes`]).
+//! ld.lld checks its lazy objects, in command-line order with the other
+//! files ([`object::check_classes`]).
 
-use crate::object::{self, Class, Object};
+use crate::object::{self, Object};
 use crate::{Error, Input};
 use std::collections::BTreeSet;
 
@@ -64,48 +65,43 @@ fn parse_all(inputs: &[Input]) -> Result<Vec<Object>, Vec<Error>> {
 }
 
 /// Which members of `library` linking `inputs` needs: their indexes, in
-/// library order. For a link without `OUTPUT_FORMAT`: [`needed_for`].
+/// library order, for a link without a script (`cargo xtask kernel` links
+/// each user program with the C library this way). The files are checked
+/// as [`crate::link_with_library`] checks them: the objects, then the
+/// members, each of the first object's class.
 pub fn needed(inputs: &[Input], library: &[Input]) -> Result<Vec<usize>, Vec<Error>> {
-    needed_for(inputs, library, None)
-}
-
-/// [`needed`], for a link whose script's `OUTPUT_FORMAT` names `format`
-/// ([`crate::script::declared_format`]), if it has one.
-///
-/// Every object and every member, needed or not, must be of the
-/// executable's class: `format`'s, else the first object's. ld.lld checks
-/// its lazy objects (`--start-lib`) too, in command-line order. merlin-ld
-/// is given the program's objects and the library apart, so it checks the
-/// objects and then the members, against the first program object (ld.lld,
-/// given a library member first, says only `a.o is incompatible`).
-pub fn needed_for(
-    inputs: &[Input],
-    library: &[Input],
-    format: Option<Class>,
-) -> Result<Vec<usize>, Vec<Error>> {
     let objects = parse_all(inputs)?;
     let members = parse_all(library)?;
     if let Some(first) = objects.first() {
-        let (class, against) = match format {
-            Some(f) => (f, crate::script::format_name(f)),
-            None => (first.class, first.name.as_str()),
-        };
-        let wrong = object::check_classes(class, against, objects.iter().chain(&members));
+        let files = objects
+            .iter()
+            .map(|o| (o, false))
+            .chain(members.iter().map(|m| (m, true)));
+        let wrong = object::check_classes(first.class, None, files);
         if !wrong.is_empty() {
             return Err(wrong);
         }
     }
-    let mut defined: BTreeSet<&str> = objects.iter().flat_map(defines).collect();
-    let mut undefined: BTreeSet<&str> = objects
-        .iter()
-        .flat_map(needs)
-        .filter(|n| !defined.contains(n))
-        .collect();
-    let mut pulled = vec![false; members.len()];
+    let all: Vec<&Object> = objects.iter().chain(&members).collect();
+    let lazy: Vec<bool> = (0..all.len()).map(|i| i >= objects.len()).collect();
+    let pulled = pulled(&all, &lazy);
+    Ok((0..members.len())
+        .filter(|&i| pulled[objects.len() + i])
+        .collect())
+}
+
+/// Which of a link's files are library members it pulls in: `files` in
+/// command-line order, `lazy` saying which are members. The others are
+/// always linked.
+pub(crate) fn pulled(files: &[&Object], lazy: &[bool]) -> Vec<bool> {
+    let program = files.iter().zip(lazy).filter(|&(_, &l)| !l).map(|(o, _)| *o);
+    let mut defined: BTreeSet<&str> = program.clone().flat_map(defines).collect();
+    let mut undefined: BTreeSet<&str> = program.flat_map(needs).filter(|n| !defined.contains(n)).collect();
+    let mut pulled = vec![false; files.len()];
     loop {
         let mut progress = false;
-        for (i, m) in members.iter().enumerate() {
-            if pulled[i] || !defines(m).any(|n| undefined.contains(n)) {
+        for (i, m) in files.iter().enumerate() {
+            if !lazy[i] || pulled[i] || !defines(m).any(|n| undefined.contains(n)) {
                 continue;
             }
             pulled[i] = true;
@@ -124,23 +120,13 @@ pub fn needed_for(
             break;
         }
     }
-    Ok((0..members.len()).filter(|&i| pulled[i]).collect())
+    pulled
 }
 
 /// `inputs` followed by the members of `library` they need ([`needed`]):
 /// what to hand the linker.
 pub fn with_needed(inputs: &[Input], library: &[Input]) -> Result<Vec<Input>, Vec<Error>> {
-    with_needed_for(inputs, library, None)
-}
-
-/// [`with_needed`] for a script whose `OUTPUT_FORMAT` names `format`
-/// ([`needed_for`]).
-pub fn with_needed_for(
-    inputs: &[Input],
-    library: &[Input],
-    format: Option<Class>,
-) -> Result<Vec<Input>, Vec<Error>> {
-    let needed = needed_for(inputs, library, format)?;
+    let needed = needed(inputs, library)?;
     let mut all = inputs.to_vec();
     all.extend(needed.into_iter().map(|i| library[i].clone()));
     Ok(all)
@@ -149,6 +135,7 @@ pub fn with_needed_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::Class;
 
     /// Makes global symbol `name` of the object `elf` weak (merlin-as has no
     /// `.weak`): its binding in `.symtab` becomes `STB_WEAK`.
@@ -316,18 +303,52 @@ mod tests {
                 "b32.o is incompatible with main.o"
             ]
         );
-        // With an OUTPUT_FORMAT, every object and member is compared with it.
+    }
+
+    #[test]
+    fn classes_are_checked_in_command_line_order() {
+        let parse = |i: Input| object::parse(&i.name.clone(), &i.data).unwrap();
+        let a64 = parse(obj_of(Class::Elf64, "a64.o", &[], &[], &[]));
+        let b64 = parse(obj_of(Class::Elf64, "b64.o", &[], &[], &[]));
+        let b32 = parse(obj("b32.o", &[], &[], &[]));
+        let c32 = parse(obj("c32.o", &[], &[], &[]));
+        let check = |class, format, files: &[(&Object, bool)]| -> Vec<String> {
+            object::check_classes(class, format, files.iter().copied())
+                .into_iter()
+                .map(|e| e.0)
+                .collect()
+        };
+        // `a64.o --start-lib b32.o --end-lib c32.o`: in that order, as ld.lld.
         assert_eq!(
-            messages(needed_for(&program, &library[1..2], Some(Class::Elf32))),
+            check(Class::Elf64, None, &[(&a64, false), (&b32, true), (&c32, false)]),
             [
-                "main.o is incompatible with elf32-littleriscv",
-                "more.o is incompatible with elf32-littleriscv",
-                "f.o is incompatible with elf32-littleriscv"
+                "b32.o is incompatible with a64.o",
+                "c32.o is incompatible with a64.o"
             ]
         );
+        // `--start-lib b32.o --end-lib a64.o b64.o`: the class is the library
+        // member's, and before any other file has it ld.lld names nothing.
         assert_eq!(
-            needed_for(&program, &library[1..2], Some(Class::Elf64)).unwrap(),
-            [0]
+            check(Class::Elf32, None, &[(&b32, true), (&a64, false), (&b64, false)]),
+            ["a64.o is incompatible", "b64.o is incompatible"]
         );
+        // `--start-lib b32.o --end-lib c32.o a64.o`: then c32.o has it.
+        assert_eq!(
+            check(Class::Elf32, None, &[(&b32, true), (&c32, false), (&a64, false)]),
+            ["a64.o is incompatible with c32.o"]
+        );
+        // With an OUTPUT_FORMAT, every file is compared with it.
+        assert_eq!(
+            check(
+                Class::Elf32,
+                Some(Class::Elf32),
+                &[(&a64, false), (&b32, false), (&b64, true)]
+            ),
+            [
+                "a64.o is incompatible with elf32-littleriscv",
+                "b64.o is incompatible with elf32-littleriscv"
+            ]
+        );
+        assert!(check(Class::Elf64, Some(Class::Elf64), &[(&a64, false), (&b64, true)]).is_empty());
     }
 }

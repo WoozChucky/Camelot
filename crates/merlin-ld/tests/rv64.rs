@@ -319,6 +319,66 @@ fn library_members_of_the_other_class_are_errors_even_when_not_needed() {
     );
 }
 
+/// merlin-ld's command line: ld.lld reads the script first, then every
+/// file in command-line order, library members among them, and compares
+/// the classes only when all of that read.
+#[test]
+fn the_command_line_is_read_in_ld_llds_order() {
+    let a64 = rv64("a64.o", START);
+    let b32 = rv32("b32.o", &defines("b"));
+    let c32 = rv32("c32.o", &defines("c"));
+    let b64 = rv64("b64.o", &defines("b"));
+    let link = |files: &[(&Input, bool)], opts: &Options| errors(merlin_ld::link_files(files, opts));
+    let ok = Options::default();
+    // `a64.o --start-lib b32.o --end-lib c32.o`: in that order.
+    assert_eq!(
+        link(&[(&a64, false), (&b32, true), (&c32, false)], &ok),
+        [
+            "b32.o is incompatible with a64.o",
+            "c32.o is incompatible with a64.o"
+        ]
+    );
+    // `--start-lib b32.o --end-lib a64.o b64.o`: the class is the member's,
+    // and ld.lld names nothing for it.
+    assert_eq!(
+        link(&[(&b32, true), (&a64, false), (&b64, false)], &ok),
+        ["a64.o is incompatible", "b64.o is incompatible"]
+    );
+    // A script's errors come first and hide the classes', also through a
+    // library, and also with an OUTPUT_FORMAT merlin-ld does not know.
+    for (src, want) in [
+        ("SECTIONS { .text : {", "test.ld:1: unexpected end of script"),
+        (
+            "OUTPUT_FORMAT(foo)",
+            "test.ld:1: OUTPUT_FORMAT(foo): only elf32-littleriscv and elf64-littleriscv are supported",
+        ),
+    ] {
+        assert_eq!(
+            link(&[(&a64, false), (&b32, true)], &script(src)),
+            [want],
+            "{src}"
+        );
+        assert_eq!(
+            errors(merlin_ld::link_with_library(
+                &[a64.clone(), b32.clone()],
+                &[],
+                &script(src)
+            )),
+            [want],
+            "{src}"
+        );
+    }
+    // Then the objects' errors, all of them, before the classes.
+    let cut = Input {
+        name: "cut.o".into(),
+        data: a64.data[..64].to_vec(),
+    };
+    let errs = link(&[(&cut, false), (&b32, false)], &script("SECTIONS {"));
+    assert_eq!(errs.len(), 2, "{errs:?}");
+    assert_eq!(errs[0], "test.ld:1: unexpected end of script");
+    assert!(errs[1].starts_with("cut.o: "), "{errs:?}");
+}
+
 #[test]
 fn output_format_decides_the_class() {
     let sections = "SECTIONS { . = 0x80000000; .text : { *(.text) } .data : { *(.data) } }";

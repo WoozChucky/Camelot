@@ -3,7 +3,8 @@
 //!
 //! Steps, in order:
 //!
-//! 1. Parse every object ([`crate::object`]).
+//! 1. Read the script and every object ([`crate::object`]), in ld.lld's
+//!    order, and pick the executable's class ([`read`]).
 //! 2. Build the global symbol table. Locals stay per object. Two strong
 //!    definitions of a global are an error; a strong one beats a weak one.
 //! 3. Assign input sections to output sections: script order, first matching
@@ -972,50 +973,91 @@ fn orphan_position(
     i
 }
 
-pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
-    // 1. Objects.
+/// The script's name in messages and its text: `-T`'s, or the default
+/// layout's.
+fn script_source(opts: &Options) -> (&str, &str) {
+    match &opts.script {
+        Some(s) => (s.name.as_str(), s.text.as_str()),
+        None => (DEFAULT_SCRIPT_NAME, script::DEFAULT_SCRIPT),
+    }
+}
+
+/// Step 1: reads a link's files and its script, as ld.lld reads them, and
+/// picks the executable's class. `files` are the command line's, in its
+/// order, each with whether it is a library member (between `--start-lib`
+/// and `--end-lib`, [`crate::library`]); the objects come back in the same
+/// order.
+///
+/// ld.lld reads the script when it meets `-T`, before it reads any object,
+/// so a script's errors come first, then every object's, and only when all
+/// of them read does it compare their classes. Its script values are
+/// 64-bit whatever the class, so the script is read for ELF64 first, where
+/// no value is refused for being past 4 GiB: its errors are the ones ld.lld
+/// gives. Once the class is known an ELF32 link (RV32, until #159) reads it
+/// again, for its exact arithmetic and its 4 GiB limits.
+///
+/// The class is ld.lld's (it needs no option either): the script's
+/// `OUTPUT_FORMAT` if it names one, else the first file's, a library
+/// member's too. Every file must have it, or the link stops
+/// ([`object::check_classes`]).
+pub(crate) fn read(
+    files: &[(&Input, bool)],
+    opts: &Options,
+) -> Result<(Vec<Object>, Script, Class), Vec<Error>> {
+    let (script_name, src) = script_source(opts);
     let mut errors = Vec::new();
+    let script64 = match script::parse(src, Class::Elf64) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            errors.push(err(format!("{script_name}:{e}")));
+            None
+        }
+    };
     let mut objects = Vec::new();
-    for i in inputs {
+    for (i, _) in files {
         match object::parse(&i.name, &i.data) {
             Ok(o) => objects.push(o),
             Err(e) => errors.push(err(format!("{}: {e}", i.name))),
         }
     }
-    if !errors.is_empty() {
+    let Some(script64) = script64.filter(|_| errors.is_empty()) else {
         return Err(errors);
-    }
-    if objects.is_empty() {
+    };
+    if files.iter().all(|&(_, lazy)| lazy) {
         return Err(vec![err("no input files")]);
     }
-    let (script_name, src) = match &opts.script {
-        Some(s) => (s.name.as_str(), s.text.as_str()),
-        None => (DEFAULT_SCRIPT_NAME, script::DEFAULT_SCRIPT),
-    };
-    // The class of the executable, as ld.lld picks it (it needs no option
-    // either): the script's `OUTPUT_FORMAT` if it names one, else the first
-    // object's. Every object must have it, or the link stops:
-    // `b.o is incompatible with a.o`, or `a.o is incompatible with
-    // elf32-littleriscv`.
-    let declared = script::declared_format(src);
-    let (class, against) = match declared {
-        Some(format) => (format, script::format_name(format)),
-        None => (objects[0].class, objects[0].name.as_str()),
-    };
-    let wrong = object::check_classes(class, against, &objects);
-
-    // Script. Its numbers and arithmetic depend on the class. ld.lld reads
-    // the script before it compares the classes, so a script's own errors
-    // come first; but its numbers are 64-bit whatever the class. So when an
-    // object is of the wrong class the script is read for ELF64, where no
-    // value is refused for being past 4 GiB, and its errors are the ones
-    // ld.lld gives before it refuses the objects.
-    let read_for = if wrong.is_empty() { class } else { Class::Elf64 };
-    let script = script::parse(src, read_for).map_err(|e| vec![err(format!("{script_name}:{e}"))])?;
-    debug_assert_eq!(script.format, declared);
+    let class = script64.format.unwrap_or(objects[0].class);
+    let lazy = files.iter().map(|&(_, lazy)| lazy);
+    let wrong = object::check_classes(class, script64.format, objects.iter().zip(lazy));
     if !wrong.is_empty() {
         return Err(wrong);
     }
+    let script = match class {
+        Class::Elf64 => script64,
+        Class::Elf32 => {
+            script::parse(src, Class::Elf32).map_err(|e| vec![err(format!("{script_name}:{e}"))])?
+        }
+    };
+    Ok((objects, script, class))
+}
+
+/// The layout of a link of `inputs`, every one linked.
+pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
+    let files: Vec<(&Input, bool)> = inputs.iter().map(|i| (i, false)).collect();
+    let (objects, script, class) = read(&files, opts)?;
+    build_from(objects, script, class, opts)
+}
+
+/// Steps 2 to 6, for the objects [`read`] read (only those linked: a
+/// library's members that are needed, after the others) and its script.
+pub(crate) fn build_from(
+    objects: Vec<Object>,
+    script: Script,
+    class: Class,
+    opts: &Options,
+) -> Result<Layout, Vec<Error>> {
+    let (script_name, _) = script_source(opts);
+    let mut errors = Vec::new();
 
     // 2. Globals.
     let mut globals: Vec<(String, Def)> = Vec::new();

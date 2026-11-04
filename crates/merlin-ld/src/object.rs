@@ -127,22 +127,44 @@ impl Object {
     }
 }
 
-/// Every object in `objects` that is not of class `class`, the
-/// executable's: `b.o is incompatible with a.o`, as ld.lld says it.
-/// `against` names where the class came from: the first object (`a.o`), or
-/// the linker script's `OUTPUT_FORMAT` (`elf32-littleriscv`). Like ld.lld,
-/// this reports all of them, in input order, and then the link stops: an
-/// RV32 object's code cannot run on an RV64 hart, or the other way round.
+/// Every file of a link that is not of class `class`, the executable's,
+/// as ld.lld's isCompatible finds them: `files` in command-line order, each
+/// with whether it is a library member (`--start-lib`), which ld.lld checks
+/// too, needed or not. Like ld.lld, this reports all of them, and then the
+/// link stops: an RV32 object's code cannot run on an RV64 hart, or the
+/// other way round.
+///
+/// The message says where the class came from, in ld.lld's words: the
+/// script's `OUTPUT_FORMAT` if it names one (`a.o is incompatible with
+/// elf32-littleriscv`), else the first file that is not a library member
+/// and has the class (`b.o is incompatible with a.o`). Before there is one
+/// the class came from a library member, and ld.lld names nothing: `a.o is
+/// incompatible`.
 pub fn check_classes<'a>(
     class: Class,
-    against: &str,
-    objects: impl IntoIterator<Item = &'a Object>,
+    format: Option<Class>,
+    files: impl IntoIterator<Item = (&'a Object, bool)>,
 ) -> Vec<Error> {
-    objects
-        .into_iter()
-        .filter(|o| o.class != class)
-        .map(|o| Error(format!("{} is incompatible with {against}", o.name)))
-        .collect()
+    let mut first: Option<&str> = None;
+    let mut errors = Vec::new();
+    for (o, lazy) in files {
+        if o.class == class {
+            if !lazy && first.is_none() {
+                first = Some(&o.name);
+            }
+            continue;
+        }
+        errors.push(Error(match (format, first) {
+            (Some(f), _) => format!(
+                "{} is incompatible with {}",
+                o.name,
+                crate::script::format_name(f)
+            ),
+            (None, Some(a)) => format!("{} is incompatible with {a}", o.name),
+            (None, None) => format!("{} is incompatible", o.name),
+        }));
+    }
+    errors
 }
 
 /// Bounds-checked reads of the file, for the header fields this module
