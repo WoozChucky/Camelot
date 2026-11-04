@@ -422,6 +422,30 @@ fn the_rv64_kernel_runs_on_up_to_eight_harts() {
 }
 
 #[test]
+fn the_rv64_kernel_configures_its_network_with_dhcp() {
+    // Version 2 of the network card (64-bit ring bases, 16-byte descriptors
+    // with their buffers' physical addresses) and Grail's user-mode gateway.
+    let file = under_test();
+    let mut m = Machine::new(MachineConfig {
+        xlen: grail::Xlen::Rv64,
+        paging: mode().paging,
+        nets: vec![grail::NetConfig::user(Vec::new())],
+        ..MachineConfig::default()
+    })
+    .unwrap();
+    m.cpu.bus.uart.capture = true;
+    m.load_elf(&file).unwrap();
+    let r = m.run(Some(BOOT_MAX_STEPS), |_| {});
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+    assert_eq!(r, RunResult::Exited(0), "{out}");
+    assert!(out.contains("\nnet 0: mac 52:54:00:12:34:56, irq "), "{out}");
+    assert!(
+        out.contains("\nnet: 10.0.2.15/24, gateway 10.0.2.2, dns 10.0.2.3 (dhcp)\n"),
+        "{out}"
+    );
+}
+
+#[test]
 fn the_rv64_kernel_takes_ram_from_sysinfo() {
     for mib in [2usize, 64] {
         let mut k = Kernel::load(1, mib << 20);
@@ -719,6 +743,7 @@ fn the_rv64_reference_builds_pass_the_same_tests() {
         the_page_table_maps_the_kernel_half_only();
         the_rv64_kernel_runs_on_up_to_eight_harts();
         the_rv64_kernel_takes_ram_from_sysinfo();
+        the_rv64_kernel_configures_its_network_with_dhcp();
         kernel_stacks_keep_a_margin();
         illegal_instruction_panics_with_a_64_bit_register_dump();
         unmapped_load_and_text_store_page_fault();
@@ -739,6 +764,7 @@ fn the_rv64_kernel_falls_back_to_sv39() {
     the_page_table_maps_the_kernel_half_only();
     the_rv64_kernel_runs_on_up_to_eight_harts();
     the_rv64_kernel_takes_ram_from_sysinfo();
+    the_rv64_kernel_configures_its_network_with_dhcp();
     kernel_stacks_keep_a_margin();
     illegal_instruction_panics_with_a_64_bit_register_dump();
     unmapped_load_and_text_store_page_fault();

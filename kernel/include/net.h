@@ -339,7 +339,7 @@ void udp_close(struct udp_sock *s);
 /* Sends the `len` bytes at `src` (in `pt`'s user memory, or kernel memory
  * when `pt` is NULL) to `dst`:`port`, from s's port. Returns `len`, or
  * -EMSGSIZE (over UDP_MAX_DATA), -EFAULT, or ip_output()'s error. */
-int udp_sendto(struct udp_sock *s, u32 dst, u32 port, pagetable_t pt, u32 src, u32 len);
+int udp_sendto(struct udp_sock *s, u32 dst, u32 port, pagetable_t pt, uintptr src, u32 len);
 
 /* Takes the oldest datagram that came to `s`: copies up to `size` bytes
  * of it to `dst` (in `pt`'s user memory, or kernel memory when `pt` is
@@ -348,7 +348,7 @@ int udp_sendto(struct udp_sock *s, u32 dst, u32 port, pagetable_t pt, u32 src, u
  * there is none, for at most `timeout` ticks (0: no limit), then
  * -ETIMEDOUT; -EINTR at once if the process is killed. Must be called by a
  * process. */
-int udp_recvfrom(struct udp_sock *s, pagetable_t pt, u32 dst, u32 size, u32 *from, u32 *port, u32 timeout);
+int udp_recvfrom(struct udp_sock *s, pagetable_t pt, uintptr dst, u32 size, u32 *from, u32 *port, u32 timeout);
 
 /* The length of the oldest datagram waiting in `s`, 0 if none. */
 u32 udp_pending(const struct udp_sock *s);
@@ -512,14 +512,14 @@ struct tcp_sock *tcp_accept(struct tcp_sock *l, u32 timeout, int *err);
  * buffer as it goes. Returns `n` (fewer if the process was killed after
  * some), or -EPIPE (after tcp_shutdown), -ENOTCONN, the error that ended
  * the connection, -EFAULT, -EINTR. */
-int tcp_send(struct tcp_sock *s, pagetable_t pt, u32 src, u32 n);
+int tcp_send(struct tcp_sock *s, pagetable_t pt, uintptr src, u32 n);
 
 /* Waits for data, at most `timeout` ticks (0: no limit), and copies up to
  * `n` bytes of it to `dst`. Returns how many; 0 at the end (the peer's
  * FIN, once everything before it was read); or -ENOTCONN, the error that
  * ended the connection (a reset loses what was not read), -EFAULT,
  * -EAGAIN (the time ran out), -EINTR. */
-int tcp_recv(struct tcp_sock *s, pagetable_t pt, u32 dst, u32 n, u32 timeout);
+int tcp_recv(struct tcp_sock *s, pagetable_t pt, uintptr dst, u32 n, u32 timeout);
 
 /* No more sending: a FIN follows what is queued. Receiving goes on. 0, or
  * -ENOTCONN. */
