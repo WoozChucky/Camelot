@@ -283,7 +283,7 @@ off_t filelseek(struct file *f, off_t offset, u32 whence) {
     if (offset < -base || offset > size - base) {
         return -EINVAL;
     }
-    f->off = (u32)(base + offset);
+    f->off = (u64)(base + offset);
     return base + offset;
 }
 

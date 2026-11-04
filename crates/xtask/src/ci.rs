@@ -17,6 +17,8 @@
 //!   `examples/kbd-echo`;
 //! - the committed binaries are what the tools build now: the kernel, the
 //!   examples, the boot programs, hello, the disk image; and the kernel boots;
+//! - RV64 processes' system call ABI: results sign-extended, pointers into the
+//!   kernel's half refused, 64-bit values through the calls;
 //! - how Avalon and Lake end connections: bad handshakes, and a server's last
 //!   frame arriving whole though the client sent more (Linux's TCP stack is not
 //!   Windows's here);
@@ -139,6 +141,19 @@ const STEPS: &[Step] = &[
     Step {
         what: "the committed RV64 kernel is current, boots on 1-8 harts and panics as it should",
         args: &["-p", "xtask", "--test", "kernel_rv64"],
+    },
+    Step {
+        what: "RV64 processes: the LP64 system call ABI, sign-extended results, the kernel half refused",
+        args: &[
+            "-p",
+            "xtask",
+            "--test",
+            "processes_rv64",
+            "--",
+            "negative_results_arrive_sign_extended",
+            "pointers_into_the_kernel_half_are_refused",
+            "the_calls_take_and_return_64_bit_values",
+        ],
     },
     Step {
         what: "the committed examples, boot programs and hello are current; an RV64 boot block boots",

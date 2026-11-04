@@ -161,8 +161,8 @@ static void test_read_write_seek(void) {
     check_eq(lseek(fd, LONG_MAX, SEEK_SET), -EINVAL, "LONG_MAX");
     check_eq(lseek(fd, LONG_MAX, SEEK_END), -EINVAL, "LONG_MAX from the end");
     check_eq(lseek(fd, LONG_MIN, SEEK_END), -EINVAL, "LONG_MIN from the end");
-    check_eq(lseek(fd, -0x100000000l + 4990, SEEK_END), -EINVAL, "before the start by 2^32 - 10");
-    check_eq(lseek(fd, 0, SEEK_CUR), 4990, "and the offset is where it was");
+    check_eq(lseek(fd, -0x100000000l + 4990, SEEK_END), -EINVAL, "2^32 - 10 bytes before the start");
+    check_eq(lseek(fd, 0, SEEK_CUR), 5000, "and the offset is where it was");
 #endif
     check_eq(lseek(fd, 100, SEEK_SET), 100, "seek into the middle");
     check_eq(write(fd, "XYZ", 3), 3, "write in the middle");

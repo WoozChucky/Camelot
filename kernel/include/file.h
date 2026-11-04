@@ -57,7 +57,7 @@ struct file {
     struct pipe *pipe;  /* FD_PIPE */
     struct socket *sock; /* FD_SOCKET */
     struct inode *ip;   /* FD_INODE, and FD_DEVICE opened by its path */
-    u32 off;            /* FD_INODE */
+    u64 off;            /* FD_INODE: at most MAXFILE_BYTES (fs.h) */
     u16 major;          /* FD_DEVICE */
 };
 

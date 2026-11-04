@@ -1325,10 +1325,12 @@ fn the_format_document_matches_the_kernel_and_the_host() {
     assert!(doc.contains("`MAXOPBLOCKS` = 22"));
     assert_eq!(define(&log_h, "MAXOPBLOCKS"), "22");
     assert!(doc.contains("(`nlog` < 23)"));
-    // The largest file: the format's, and the kernel's for now.
+    // The largest file: the format's, which is the RV64 kernel's, and the
+    // RV32 kernel's off_t's reach.
     assert_eq!(camelot_fs::MAX_FILE_SIZE, 4 << 40);
     assert!(doc.contains("2^32 blocks (its logical block numbers are\n  u32), 4 TiB"));
-    assert_eq!(define(&fs_h, "MAXFILE_BYTES"), "0x7fffffffu");
+    assert!(fs_h.contains("#if __riscv_xlen == 64\n#define MAXFILE_BYTES ((u64)BSIZE << 32)\n#else\n#define MAXFILE_BYTES 0x7fffffffull\n"));
+    assert_eq!(1u64 << 10 << 32, camelot_fs::MAX_FILE_SIZE);
     assert!(doc.contains("writes files of at most 2^31 - 1\n  bytes"));
 }
 
