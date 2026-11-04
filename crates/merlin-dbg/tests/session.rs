@@ -213,6 +213,8 @@ fn hello() {
          regs\n\
          x/5b $a0\n\
          x/2 message\n\
+         x/2g message\n\
+         x/3xh message\n\
          stepi\n\
          si 2\n\
          bt\n\
@@ -230,6 +232,9 @@ fn hello() {
             "=> 0x80000020 <puts>:  lui t0, 0x10000",
             "0x80000050 <message>:  0x48  0x65  0x6c  0x6c  0x6f",
             "0x80000050 <message>:  0x6c6c6548  0x7266206f",
+            // GDB's giants and halfwords on RV32 too.
+            "0x80000050 <message>:  0x7266206f6c6c6548  0x6c656d6143206d6f",
+            "0x80000050 <message>:  0x6548  0x6c6c  0x206f",
             "=> 0x80000024 <puts+4>:  mv t1, a0",
             "=> 0x80000028 <puts+8>:  lbu t2, 0x0(t1)",
             "=> 0x8000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
@@ -579,6 +584,9 @@ fn harts_and_watchpoints() {
             "=> 0x80000070 <work>:  auipc t0, 0x0",
             "* hart 1, M-mode, at 0x80000070 <work>",
             "hart 0",
+            // Hart 0's stack, past every section: no symbol names it.
+            "(merlin-dbg) x/1 $sp",
+            "0x80010470:  0x00000000",
             "hart 1",
             "=> 0x80000074 <work+4>:  addi t0, t0, 0x3c0",
             "watchpoint 2 (write) at 0x80000430 <counter>, 4 bytes",
@@ -793,6 +801,9 @@ fn harts_and_watchpoints_rv64() {
             "=> 0x0000000080000070 <work>:  auipc t0, 0x0",
             "* hart 1, M-mode, at 0x0000000080000070 <work>",
             "hart 0",
+            // Hart 0's stack, past every section: no symbol names it.
+            "(merlin-dbg) x/1g $sp",
+            "0x0000000080010470:  0x0000000000000000",
             "hart 1",
             "=> 0x0000000080000074 <work+4>:  addi t0, t0, 0x3c0",
             "watchpoint 2 (write) at 0x0000000080000430 <counter>, 4 bytes",

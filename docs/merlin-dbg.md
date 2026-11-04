@@ -269,7 +269,7 @@ An ADDR is any of these, optionally followed by `+N` or `-N`:
 - a symbol (`main`, `puts+8`);
 - a register (`$sp`, `$a0`, `$x5`, `$pc`, `$mstatus`).
 
-Symbols come from the ELF symbol table (through `elf`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one. They have all of an address's digits: on RV64, `0x0000000080000024 <puts+4>`, as GDB shows a 64-bit target's code addresses in backtraces and disassembly. A branch's target in an instruction is as merlin-objdump and llvm-objdump write it (`beqz t2, 0x80000048 <puts+40>`).
+Symbols come from the ELF symbol table (through `elf`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one, and within its section when it has none (an assembly label), as GDB's minimal symbols are: the stack past the program's last section has no name. They have all of an address's digits: on RV64, `0x0000000080000024 <puts+4>`, as GDB shows a 64-bit target's code addresses in backtraces and disassembly. A branch's target in an instruction is as merlin-objdump and llvm-objdump write it (`beqz t2, 0x80000048 <puts+40>`).
 
 Each stop shows its reason, then the instruction at the pc, then its source line if the line tables have one (`kernel/main.c:275:     cpu_init();`, the text left out when the file cannot be found):
 

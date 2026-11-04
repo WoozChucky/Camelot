@@ -36,21 +36,32 @@ pub fn check_xlen(file: &[u8], machine: Xlen) -> Result<(), String> {
     ))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Symbol {
-    name: String,
     addr: u64,
+    /// Of several symbols at one address, the lowest is kept: a function before
+    /// anything else, then a global name before a local one.
+    rank: (bool, bool),
+    name: String,
     /// 0 when the symbol says nothing about its size (an assembly label).
     size: u64,
+    /// The end of the section the symbol is in: a symbol without a size covers
+    /// the addresses up to the next symbol, but not past its section, as GDB's
+    /// minimal symbols do (the stack beyond the last section has no name).
+    section_end: u64,
+    /// Whether the section is code (`SHF_EXECINSTR`): `break` skips the prologue
+    /// of a symbol there, as GDB does of a text symbol.
+    code: bool,
 }
 
 #[derive(Default)]
 pub struct Symbols {
     /// By address; of several symbols at one address only the best name is kept.
     sorted: Vec<Symbol>,
-    by_name: HashMap<String, u64>,
-    /// Every symbol of every file added: (address, rank, name, size).
-    candidates: Vec<(u64, (bool, bool), String, u64)>,
+    /// Each name's symbol, an index into `all`.
+    by_name: HashMap<String, usize>,
+    /// Every symbol of every file added.
+    all: Vec<Symbol>,
 }
 
 impl Symbols {
@@ -77,25 +88,28 @@ impl Symbols {
             {
                 continue;
             }
-            // Of several at one address: a function first, then a global name.
-            let rank = (s.ty() != STT_FUNC, s.bind() == STB_LOCAL);
-            found.push((s.value, rank, s.name.clone(), s.size));
+            let section = s.section().and_then(|i| elf.sections.get(i));
+            found.push(Symbol {
+                addr: s.value,
+                // Of several at one address: a function first, then a global name.
+                rank: (s.ty() != STT_FUNC, s.bind() == STB_LOCAL),
+                name: s.name.clone(),
+                size: s.size,
+                section_end: section.map_or(u64::MAX, |sec| sec.addr.saturating_add(sec.size)),
+                code: section.is_some_and(|sec| sec.is_exec()),
+            });
         }
         // A name defined twice in the file (two files' `static` functions):
         // the lowest address.
         found.sort();
-        for (addr, _, name, _) in &found {
-            self.by_name.entry(name.clone()).or_insert(*addr);
+        for s in found {
+            self.by_name.entry(s.name.clone()).or_insert(self.all.len());
+            self.all.push(s);
         }
-        self.candidates.extend(found);
-        let mut all = self.candidates.clone();
-        all.sort();
-        self.sorted.clear();
-        for (addr, _, name, size) in all {
-            if self.sorted.last().is_none_or(|s| s.addr != addr) {
-                self.sorted.push(Symbol { name, addr, size });
-            }
-        }
+        let mut sorted = self.all.clone();
+        sorted.sort();
+        sorted.dedup_by_key(|s| s.addr);
+        self.sorted = sorted;
         Ok(())
     }
 
@@ -105,30 +119,44 @@ impl Symbols {
 
     /// The address of symbol `name`.
     pub fn lookup(&self, name: &str) -> Option<u64> {
-        self.by_name.get(name).copied()
+        self.by_name.get(name).map(|&i| self.all[i].addr)
     }
 
-    /// The symbol at or before `addr`, if `addr` can be in it: inside its size, or
-    /// before the next symbol when it has none. Its name and address.
-    pub fn containing(&self, addr: u64) -> Option<(&str, u64)> {
-        let i = self.sorted.partition_point(|s| s.addr <= addr).checked_sub(1)?;
-        let s = &self.sorted[i];
-        if s.size != 0 && addr - s.addr >= s.size {
-            return None;
-        }
-        Some((&s.name, s.addr))
+    /// The address of symbol `name` if it is in code (a function, or an assembly
+    /// label in `.text`): what `break NAME` skips the prologue of.
+    pub fn code(&self, name: &str) -> Option<u64> {
+        let s = &self.all[*self.by_name.get(name)?];
+        s.code.then_some(s.addr)
     }
 
-    /// The address range of the symbol holding `addr`: its size, or up to the
-    /// next symbol when it has none (or the end of the address space).
-    pub fn range(&self, addr: u64) -> Option<(u64, u64)> {
+    /// The symbol at or before `addr` whose range ([`Symbols::range`]) holds it, and
+    /// that range.
+    fn holding(&self, addr: u64) -> Option<(&Symbol, u64)> {
         let i = self.sorted.partition_point(|s| s.addr <= addr).checked_sub(1)?;
         let s = &self.sorted[i];
         let end = match s.size {
-            0 => self.sorted.get(i + 1).map_or(u64::MAX, |n| n.addr),
+            0 => {
+                let next = self.sorted.get(i + 1).map_or(u64::MAX, |n| n.addr);
+                // A symbol at the very end of its section (`_end`) still names its
+                // own address.
+                next.min(s.section_end.max(s.addr.saturating_add(1)))
+            }
             size => s.addr.saturating_add(size),
         };
-        (addr < end).then_some((s.addr, end))
+        (addr < end).then_some((s, end))
+    }
+
+    /// The symbol at or before `addr`, if `addr` can be in it: inside its size, or
+    /// before the next symbol and the end of its section when it has none. Its name
+    /// and address.
+    pub fn containing(&self, addr: u64) -> Option<(&str, u64)> {
+        self.holding(addr).map(|(s, _)| (s.name.as_str(), s.addr))
+    }
+
+    /// The address range of the symbol holding `addr`: its size, or up to the
+    /// next symbol (or the end of its section) when it has none.
+    pub fn range(&self, addr: u64) -> Option<(u64, u64)> {
+        self.holding(addr).map(|(s, end)| (s.addr, end))
     }
 
     /// `name` or `name+off` for `addr`, if a symbol holds it.
@@ -188,6 +216,13 @@ mod tests {
             assert_eq!(s.describe(0x8000_0018).as_deref(), Some("_start+24"));
             assert_eq!(s.describe(0x8000_0024).as_deref(), Some("puts+4"));
             assert_eq!(s.describe(0x7fff_fffc), None);
+            // message, a label without a size, ends with .rodata: past it (the
+            // stack) has no name, as with GDB.
+            assert_eq!(s.describe(0x8000_0064).as_deref(), Some("message+20"));
+            assert_eq!(s.describe(0x8001_0000), None);
+            assert_eq!(s.code("puts"), Some(0x8000_0020));
+            assert_eq!(s.code("message"), None, "data");
+            assert_eq!(s.code("nowhere"), None);
         }
         let s = Symbols::from_elf(&read("examples/hello/hello.elf")).unwrap();
         assert_eq!(s.show(0x8000_0024, Xlen::Rv32), "0x80000024 <puts+4>");
