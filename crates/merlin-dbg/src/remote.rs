@@ -1,7 +1,17 @@
 //! The client side of the GDB remote serial protocol: what merlin-dbg says to a stub
 //! (Grail's, `grail --gdb`) to read and change a stopped machine, and to run it until it
 //! stops. The framing is Grail's own ([`grail::gdb::packet`]).
+//!
+//! ## The target's width
+//!
+//! The stub says how wide the machine's registers are, as it tells GDB: in its
+//! target description (`qXfer:features:read:target.xml`), whose `<architecture>` is
+//! `riscv:rv32` or `riscv:rv64`. A stub with no description is asked for its
+//! registers instead, and the length of the `g` reply (33 registers, `x0`-`x31` and
+//! `pc`, of 4 or 8 bytes each) gives the width. Registers, addresses and lengths
+//! are `u64` here: on RV32, 32-bit values zero-extended, as the stub sends them.
 
+use excalibur::Xlen;
 use grail::gdb::packet::{self, Decoder, Event};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -50,7 +60,7 @@ pub enum StopEvent {
     Stopped {
         signal: u8,
         hart: usize,
-        watch: Option<(Watch, u32)>,
+        watch: Option<(Watch, u64)>,
     },
     /// `W`: the program stopped the machine with this exit code (`X`: killed).
     Exited(u32),
@@ -65,6 +75,40 @@ pub struct Remote {
     no_ack: bool,
     /// How many harts the machine has (its threads).
     pub harts: usize,
+    /// The width of its registers and addresses (see the module's documentation).
+    pub xlen: Xlen,
+}
+
+/// The number of registers in a `g` packet: `x0`-`x31` and `pc`.
+const GENERAL_REGS: usize = 33;
+
+/// `v` cut to `xlen`'s width: address arithmetic wraps at 2^32 on RV32.
+pub fn wrap(xlen: Xlen, v: u64) -> u64 {
+    match xlen {
+        Xlen::Rv32 => v & 0xffff_ffff,
+        Xlen::Rv64 => v,
+    }
+}
+
+/// A register's value or an address in hex with all its digits: `0x80000024` on
+/// RV32, `0x0000000080000024` on RV64.
+pub fn hex_value(v: u64, xlen: Xlen) -> String {
+    let width = 2 + xlen.bits() as usize / 4;
+    format!("{v:#0width$x}")
+}
+
+/// The width a target description's `<architecture>` names, if it names one.
+pub fn xml_xlen(xml: &str) -> Option<Xlen> {
+    let arch = xml
+        .split("<architecture>")
+        .nth(1)?
+        .split("</architecture>")
+        .next()?;
+    match arch.trim() {
+        "riscv:rv32" => Some(Xlen::Rv32),
+        "riscv:rv64" => Some(Xlen::Rv64),
+        _ => None,
+    }
 }
 
 /// An error reply (`Exx`) or a failed connection.
@@ -72,7 +116,7 @@ pub type Result<T> = std::result::Result<T, String>;
 
 impl Remote {
     /// Connects to the stub at `addr` and agrees on the protocol: `swbreak` stop
-    /// reasons, no acks if the stub can, and the list of harts.
+    /// reasons, no acks if the stub can, the target's width and the list of harts.
     pub fn connect(addr: SocketAddr) -> Result<Remote> {
         let stream = TcpStream::connect(addr).map_err(|e| format!("cannot connect to {addr}: {e}"))?;
         let _ = stream.set_nodelay(true);
@@ -82,16 +126,66 @@ impl Remote {
             events: VecDeque::new(),
             no_ack: false,
             harts: 1,
+            xlen: Xlen::Rv32,
         };
         let features = r.request("qSupported:swbreak+")?;
-        if features.split(';').any(|f| f == "QStartNoAckMode+") && r.request("QStartNoAckMode")? == "OK" {
+        let supports = |f: &str| features.split(';').any(|g| g == f);
+        let (no_ack, xml) = (supports("QStartNoAckMode+"), supports("qXfer:features:read+"));
+        if no_ack && r.request("QStartNoAckMode")? == "OK" {
             r.no_ack = true;
         }
+        let described = if xml {
+            r.target_xml().ok().as_deref().and_then(xml_xlen)
+        } else {
+            None
+        };
+        r.xlen = match described {
+            Some(x) => x,
+            None => r.xlen_from_registers()?,
+        };
         let threads = r.request("qfThreadInfo")?;
         r.harts = threads
             .strip_prefix('m')
             .map_or(1, |list| list.split(',').count());
         Ok(r)
+    }
+
+    /// The target description, read in parts (`m` and a part, then `l` and the last).
+    pub fn target_xml(&mut self) -> Result<String> {
+        let mut xml = Vec::new();
+        loop {
+            let reply = self.request(&format!("qXfer:features:read:target.xml:{:x},800", xml.len()))?;
+            let (last, part) = match reply.split_at_checked(1) {
+                Some(("l", part)) => (true, part),
+                Some(("m", part)) => (false, part),
+                _ => return Err("a malformed target description".into()),
+            };
+            let part = packet::unescape(part.as_bytes()).ok_or("a malformed target description")?;
+            if !last && part.is_empty() {
+                return Err("an endless target description".into());
+            }
+            xml.extend(part);
+            if last {
+                return Ok(String::from_utf8_lossy(&xml).into_owned());
+            }
+        }
+    }
+
+    /// The width a `g` reply's length says: 33 registers of 4 or 8 bytes.
+    fn xlen_from_registers(&mut self) -> Result<Xlen> {
+        let g = self.request("g")?;
+        match g.len() / 2 {
+            n if n == GENERAL_REGS * 4 => Ok(Xlen::Rv32),
+            n if n == GENERAL_REGS * 8 => Ok(Xlen::Rv64),
+            n => Err(format!(
+                "a register packet of {n} bytes, neither RV32's nor RV64's"
+            )),
+        }
+    }
+
+    /// The size of a register, in bytes.
+    fn reg_bytes(&self) -> usize {
+        self.xlen.bits() as usize / 8
     }
 
     /// Sends a packet and returns the reply's payload. `E` replies are errors; an empty
@@ -194,36 +288,41 @@ impl Remote {
     }
 
     /// The selected hart's `x0`-`x31` and `pc`.
-    pub fn registers(&mut self) -> Result<[u32; 33]> {
+    pub fn registers(&mut self) -> Result<[u64; GENERAL_REGS]> {
         let g = self.request("g")?;
         let bytes = unhex(&g).ok_or("a malformed register packet")?;
-        let mut regs = [0u32; 33];
-        for (r, w) in regs.iter_mut().zip(bytes.as_chunks::<4>().0) {
-            *r = u32::from_le_bytes(*w);
+        let size = self.reg_bytes();
+        if bytes.len() != GENERAL_REGS * size {
+            return Err(format!("a register packet of {} bytes", bytes.len()));
+        }
+        let mut regs = [0u64; GENERAL_REGS];
+        for (r, w) in regs.iter_mut().zip(bytes.chunks(size)) {
+            *r = le(w);
         }
         Ok(regs)
     }
 
     /// Register `n` (GDB's numbering) of the selected hart.
-    pub fn register(&mut self, n: usize) -> Result<u32> {
+    pub fn register(&mut self, n: usize) -> Result<u64> {
         let p = self.request(&format!("p{n:x}"))?;
-        match unhex(&p).as_deref() {
-            Some(&[a, b, c, d]) => Ok(u32::from_le_bytes([a, b, c, d])),
+        match unhex(&p) {
+            Some(bytes) if bytes.len() == self.reg_bytes() => Ok(le(&bytes)),
             _ => Err("a malformed register value".into()),
         }
     }
 
-    pub fn set_register(&mut self, n: usize, v: u32) -> Result<()> {
-        self.request(&format!("P{n:x}={}", hex(&v.to_le_bytes())))
+    pub fn set_register(&mut self, n: usize, v: u64) -> Result<()> {
+        let bytes = v.to_le_bytes();
+        self.request(&format!("P{n:x}={}", hex(&bytes[..self.reg_bytes()])))
             .map(drop)
     }
 
     /// Up to `len` bytes at `addr`, through the selected hart's translation: fewer when
     /// the memory ends, an error when not even the first byte can be read.
-    pub fn read_memory(&mut self, addr: u32, len: usize) -> Result<Vec<u8>> {
+    pub fn read_memory(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(len);
         while out.len() < len {
-            let at = addr.wrapping_add(out.len() as u32);
+            let at = wrap(self.xlen, addr.wrapping_add(out.len() as u64));
             let want = (len - out.len()).min(0x800);
             let reply = match self.request(&format!("m{at:x},{want:x}")) {
                 Ok(r) => r,
@@ -240,10 +339,18 @@ impl Remote {
         Ok(out)
     }
 
-    /// A word of memory, if it can be read.
-    pub fn read_word(&mut self, addr: u32) -> Option<u32> {
+    /// A word of memory (an instruction), if it can be read.
+    pub fn read_word(&mut self, addr: u64) -> Option<u32> {
         let b = self.read_memory(addr, 4).ok()?;
         (b.len() == 4).then(|| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// A register's worth of memory (a saved register, a pointer): 4 bytes on RV32,
+    /// 8 on RV64, if they can be read.
+    pub fn read_xword(&mut self, addr: u64) -> Option<u64> {
+        let size = self.reg_bytes();
+        let b = self.read_memory(addr, size).ok()?;
+        (b.len() == size).then(|| le(&b))
     }
 
     /// Selects the hart the register and memory packets use.
@@ -269,20 +376,22 @@ impl Remote {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    pub fn set_breakpoint(&mut self, addr: u32) -> Result<()> {
+    /// A breakpoint on the 4-byte instruction at `addr` (kind 4, as GDB's RISC-V
+    /// target sends for an instruction that is not compressed).
+    pub fn set_breakpoint(&mut self, addr: u64) -> Result<()> {
         self.request(&format!("Z0,{addr:x},4")).map(drop)
     }
 
-    pub fn clear_breakpoint(&mut self, addr: u32) -> Result<()> {
+    pub fn clear_breakpoint(&mut self, addr: u64) -> Result<()> {
         self.request(&format!("z0,{addr:x},4")).map(drop)
     }
 
-    pub fn set_watchpoint(&mut self, kind: Watch, addr: u32, len: u32) -> Result<()> {
+    pub fn set_watchpoint(&mut self, kind: Watch, addr: u64, len: u64) -> Result<()> {
         self.request(&format!("Z{},{addr:x},{len:x}", kind.z_type()))
             .map(drop)
     }
 
-    pub fn clear_watchpoint(&mut self, kind: Watch, addr: u32, len: u32) -> Result<()> {
+    pub fn clear_watchpoint(&mut self, kind: Watch, addr: u64, len: u64) -> Result<()> {
         self.request(&format!("z{},{addr:x},{len:x}", kind.z_type()))
             .map(drop)
     }
@@ -343,7 +452,7 @@ pub fn parse_stop(reply: &str) -> Option<StopEvent> {
                     "awatch" => Watch::Access,
                     _ => continue,
                 };
-                watch = Some((kind, u32::from_str_radix(value, 16).ok()?));
+                watch = Some((kind, u64::from_str_radix(value, 16).ok()?));
             }
             Some(StopEvent::Stopped {
                 signal: code as u8,
@@ -353,6 +462,11 @@ pub fn parse_stop(reply: &str) -> Option<StopEvent> {
         }
         _ => None,
     }
+}
+
+/// Little-endian bytes (at most 8) as a number.
+fn le(bytes: &[u8]) -> u64 {
+    bytes.iter().rev().fold(0, |v, &b| v << 8 | u64::from(b))
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -401,6 +515,14 @@ mod tests {
                 watch: None
             })
         );
+        assert_eq!(
+            parse_stop("T05watch:ffffffc000001000;thread:1;"),
+            Some(StopEvent::Stopped {
+                signal: 5,
+                hart: 0,
+                watch: Some((Watch::Write, 0xffff_ffc0_0000_1000))
+            })
+        );
         assert_eq!(parse_stop("T05thread:0;"), None);
         assert_eq!(parse_stop("OK"), None);
         assert_eq!(parse_stop(""), None);
@@ -413,5 +535,22 @@ mod tests {
         assert_eq!(unhex("00ab10"), Some(vec![0, 0xab, 0x10]));
         assert_eq!(unhex("0"), None);
         assert_eq!(unhex("zz"), None);
+        assert_eq!(le(&[0x78, 0x56, 0x34, 0x12]), 0x1234_5678);
+        assert_eq!(le(&0x8000_0000_0000_0020u64.to_le_bytes()), 0x8000_0000_0000_0020);
+    }
+
+    #[test]
+    fn widths() {
+        let xml = "<?xml version=\"1.0\"?>\n<target version=\"1.0\">\n\
+                   <architecture>riscv:rv64</architecture>\n<feature name=\"org.gnu.gdb.riscv.cpu\">";
+        assert_eq!(xml_xlen(xml), Some(Xlen::Rv64));
+        assert_eq!(xml_xlen(&xml.replace("rv64", "rv32")), Some(Xlen::Rv32));
+        assert_eq!(xml_xlen(&xml.replace("riscv:rv64", "i386")), None);
+        assert_eq!(xml_xlen("<target/>"), None);
+        assert_eq!(wrap(Xlen::Rv32, 0x1_0000_0004), 4);
+        assert_eq!(wrap(Xlen::Rv64, 0x1_0000_0004), 0x1_0000_0004);
+        assert_eq!(hex_value(0x8000_0024, Xlen::Rv32), "0x80000024");
+        assert_eq!(hex_value(0x8000_0024, Xlen::Rv64), "0x0000000080000024");
+        assert_eq!(hex_value(0, Xlen::Rv32), "0x00000000");
     }
 }

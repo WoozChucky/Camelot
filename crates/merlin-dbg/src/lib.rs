@@ -123,15 +123,21 @@ fn start(
         ),
     };
     let mut lines = Lines::default();
-    let symbols = match &program {
+    let (symbols, file) = match &program {
         Some(path) => {
             let file = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
             lines.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
-            Symbols::from_elf(&file).map_err(|e| format!("{path}: {e}"))?
+            let symbols = Symbols::from_elf(&file).map_err(|e| format!("{path}: {e}"))?;
+            (symbols, Some((path, file)))
         }
-        None => Symbols::default(),
+        None => (Symbols::default(), None),
     };
     let remote = Remote::connect(addr)?;
+    // The machine's width, from the stub, is the program's (an ELF32 program on an
+    // RV64 machine would have the wrong symbols, and no RV32 code runs there).
+    if let Some((path, file)) = &file {
+        symbols::check_xlen(file, remote.xlen).map_err(|e| format!("{path}: {e}"))?;
+    }
     let mut session = Session::new(remote, symbols, lines, &mut *out, on_quit, interrupt);
     session.start()?;
 

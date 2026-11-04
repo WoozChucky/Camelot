@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// A row, with its file as an index into [`Lines::files`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Row {
-    addr: u32,
+    addr: u64,
     file: usize,
     line: u32,
     is_stmt: bool,
@@ -25,8 +25,8 @@ struct Row {
 /// A run of code and its rows, in address order: `start..end`.
 #[derive(Debug, Clone)]
 struct Run {
-    start: u32,
-    end: u32,
+    start: u64,
+    end: u64,
     rows: Vec<Row>,
 }
 
@@ -56,20 +56,11 @@ pub struct Lines {
     texts: HashMap<String, Option<Vec<String>>>,
 }
 
-/// Parses an ELF file merlin-dbg can debug: an RV32 one (ELF32), whose
-/// addresses all fit in 32 bits, until merlin-dbg follows Excalibur to RV64.
-pub(crate) fn parse_elf32(file: &[u8]) -> Result<elf::Elf<'_>, String> {
-    let elf = elf::Elf::parse(file).map_err(|e| e.to_string())?;
-    if elf.class != elf::Class::Elf32 {
-        return Err("ELF64 (RV64) programs are not supported yet".into());
-    }
-    Ok(elf)
-}
-
 impl Lines {
-    /// Adds the line tables of an executable (none if it has no `.debug_line`).
+    /// Adds the line tables of an executable (none if it has no `.debug_line`), of
+    /// either width: an ELF64 file's tables have 8-byte addresses.
     pub fn add_elf(&mut self, file: &[u8]) -> Result<(), String> {
-        let elf = parse_elf32(file)?;
+        let elf = elf::Elf::parse(file).map_err(|e| e.to_string())?;
         for table in elf.line_tables().map_err(|e| e.to_string())? {
             let ids: Vec<usize> = table
                 .files
@@ -94,7 +85,7 @@ impl Lines {
                     .iter()
                     .filter(|r| !r.end_sequence)
                     .map(|r| Row {
-                        addr: r.addr as u32,
+                        addr: r.addr,
                         file: ids.get(r.file).copied().unwrap_or(usize::MAX),
                         line: r.line,
                         is_stmt: r.is_stmt,
@@ -108,8 +99,8 @@ impl Lines {
                     continue;
                 }
                 self.runs.push(Run {
-                    start: first.addr as u32,
-                    end: last.addr as u32,
+                    start: first.addr,
+                    end: last.addr,
                     rows,
                 });
             }
@@ -130,7 +121,7 @@ impl Lines {
     }
 
     /// The row in effect at `addr`.
-    fn row(&self, addr: u32) -> Option<&Row> {
+    fn row(&self, addr: u64) -> Option<&Row> {
         let i = self.runs.partition_point(|r| r.start <= addr).checked_sub(1)?;
         let run = self.runs[..=i]
             .iter()
@@ -141,12 +132,12 @@ impl Lines {
     }
 
     /// Where the code at `addr` comes from.
-    pub fn at(&self, addr: u32) -> Option<Place> {
+    pub fn at(&self, addr: u64) -> Option<Place> {
         self.row(addr).filter(|r| r.line != 0).map(|r| self.place_of(r))
     }
 
     /// Whether a statement starts at `addr`: an `is_stmt` row there.
-    pub fn starts_statement(&self, addr: u32) -> bool {
+    pub fn starts_statement(&self, addr: u64) -> bool {
         self.row(addr)
             .is_some_and(|r| r.addr == addr && r.is_stmt && r.line != 0)
     }
@@ -173,8 +164,8 @@ impl Lines {
         &self,
         file: &str,
         line: u32,
-        function: impl Fn(u32) -> Option<u32>,
-    ) -> Result<(Vec<u32>, Place), String> {
+        function: impl Fn(u64) -> Option<u64>,
+    ) -> Result<(Vec<u64>, Place), String> {
         let files = self.matching(file);
         if files.is_empty() {
             return Err(format!("no source file named {file} in the line tables"));
@@ -188,14 +179,14 @@ impl Lines {
         let Some(taken) = rows().map(|r| r.line).filter(|&l| l >= line).min() else {
             return Err(format!("{file} has no code at or after line {line}"));
         };
-        let mut best: HashMap<Option<u32>, (u32, usize)> = HashMap::new();
+        let mut best: HashMap<Option<u64>, (u64, usize)> = HashMap::new();
         for r in rows().filter(|r| r.line == taken) {
             let e = best.entry(function(r.addr)).or_insert((r.addr, r.file));
             if r.addr < e.0 {
                 *e = (r.addr, r.file);
             }
         }
-        let mut addrs: Vec<(u32, usize)> = best.into_values().collect();
+        let mut addrs: Vec<(u64, usize)> = best.into_values().collect();
         addrs.sort();
         let place = Place {
             file: self.files[addrs[0].1].clone(),
@@ -207,7 +198,7 @@ impl Lines {
     /// Where the function at `start..end` is past its prologue: its row marked
     /// `prologue_end`, else its second row (the first statement after its
     /// first line), else `start`.
-    pub fn after_prologue(&self, start: u32, end: u32) -> u32 {
+    pub fn after_prologue(&self, start: u64, end: u64) -> u64 {
         let rows: Vec<&Row> = self
             .runs
             .iter()
