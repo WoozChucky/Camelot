@@ -78,15 +78,11 @@ pub fn parse_listen(s: &str) -> Result<SocketAddr, String> {
     avalon_proto::parse_listen(s, default_port(DEFAULT_AVALON_ADDR))
 }
 
-/// Parses a `--max-ram` value, a whole number of MiB (at least 1). Returns bytes.
+/// Parses a `--max-ram` value: MiB, or a number with a unit, `M`/`MiB`, `G`/`GiB` or
+/// `T`/`TiB` (`4096`, `64G`, `2T`), at least 1 MiB: `--ram`'s syntax without its 1 TiB
+/// limit (Grail's `parse_size`). Returns bytes.
 pub fn parse_max_ram(s: &str) -> Result<u64, String> {
-    let s = s.trim();
-    match s.parse::<u64>() {
-        Ok(mib) if mib > 0 && s.bytes().all(|b| b.is_ascii_digit()) => mib
-            .checked_mul(MIB)
-            .ok_or_else(|| format!("{mib} MiB is too large")),
-        _ => Err(format!("'{s}' is not a whole number of MiB (at least 1)")),
-    }
+    grail::parse_size(s)
 }
 
 /// A bound server, ready to [`Server::run`].
@@ -1105,7 +1101,9 @@ mod tests {
     fn max_ram_values() {
         assert_eq!(parse_max_ram("1").unwrap(), MIB);
         assert_eq!(parse_max_ram(" 4096 ").unwrap(), DEFAULT_MAX_RAM);
-        for bad in ["0", "-1", "+5", "1.5", "64MiB", "", "99999999999999999999"] {
+        assert_eq!(parse_max_ram("64MiB").unwrap(), 64 * MIB);
+        assert_eq!(parse_max_ram("2T").unwrap(), 2 << 40);
+        for bad in ["0", "-1", "+5", "1.5", "64MB", "", "99999999999999999999"] {
             assert!(parse_max_ram(bad).is_err(), "{bad}");
         }
         assert!(parse_max_ram(&(u64::MAX / MIB + 1).to_string()).is_err());

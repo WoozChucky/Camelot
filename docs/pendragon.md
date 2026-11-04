@@ -5,7 +5,7 @@ Pendragon (`crates/pendragon`) serves a browser page for the Avalon platform: th
 Everything is std only and written in the crate: a small HTTP/1.1 server on `std::net` (`http.rs`), JSON (`json.rs`) and base64 (`base64.rs`) for the API, and the page itself, plain HTML, JavaScript and CSS (`src/ui/`) built into the binary with `include_str!`. There is no frontend build step.
 
 ```
-pendragon [--listen ADDR] [--avalon ADDR] [--lake ADDR] [--avalon-max-ram MiB] [--allow-host NAME]...
+pendragon [--listen ADDR] [--avalon ADDR] [--lake ADDR] [--avalon-max-ram SIZE] [--allow-host NAME]...
 ```
 
 | Option | Default | Meaning |
@@ -13,7 +13,7 @@ pendragon [--listen ADDR] [--avalon ADDR] [--lake ADDR] [--avalon-max-ram MiB] [
 | `--listen` | `127.0.0.1:7402` | where to serve the page (a host alone means port 7402) |
 | `--avalon` | `127.0.0.1:7400` | Avalon's address (a host alone means port 7400) |
 | `--lake` | `127.0.0.1:7401` | Lake's address (a host alone means port 7401) |
-| `--avalon-max-ram` | 4096 | Avalon's RAM budget in MiB (its `--max-ram`), for the overview: the protocol does not report it |
+| `--avalon-max-ram` | 4096 | Avalon's RAM budget (its `--max-ram`), in MiB or with `M`/`MiB`, `G`/`GiB` or `T`/`TiB`, for the overview: the protocol does not report it |
 | `--allow-host` | | another `Host` the page may be reached by (repeatable; see below) |
 
 Pendragon prints the URL to open on stdout, alone on its line: `http://127.0.0.1:7402/?token=<64 hex digits>`. `cargo xtask up` starts it with Avalon and Lake, and prints the URL again once all three are up (README, *Quick start*).
@@ -58,7 +58,7 @@ Every route is under `/api/`, takes and returns JSON (`Content-Type: application
 
 | Status | When |
 |---|---|
-| 400 | the request itself is wrong: bad JSON, a missing or unknown field, a value Round Table would refuse too (`ram: 0 MiB is out of range`) |
+| 400 | the request itself is wrong: bad JSON, a missing or unknown field, a value Round Table would refuse too (`ram: 0 is out of range (1 MiB to 1 TiB)`) |
 | 403 | the checks of section 1 |
 | 404 | `NoSuchVm`, `NoSuchDisk`, `NoSuchSwitch`, `NoSuchCard`, an unknown route |
 | 405 | a route that does not take that method |

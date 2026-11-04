@@ -1,11 +1,11 @@
-//! `avalon [--listen ADDR] [--max-ram MiB]`
+//! `avalon [--listen ADDR] [--max-ram SIZE]`
 
 use avalon::{parse_listen, parse_max_ram, Config, Server, ShutdownHandle};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-const USAGE: &str = "usage: avalon [--listen ADDR] [--max-ram MiB]
+const USAGE: &str = "usage: avalon [--listen ADDR] [--max-ram SIZE]
 
 Runs Grail virtual machines and serves the Avalon protocol (docs/avalon-protocol.md):
 Round Table creates and controls the VMs, Herald attaches to their consoles and
@@ -15,8 +15,11 @@ screens.
                   (default 127.0.0.1:7400). The protocol has no authentication, so
                   anything but a loopback address lets anyone who can reach it create,
                   control and read VMs, and open files on this host as their disks
-  --max-ram MiB   total RAM of all VMs, in MiB (default 4096). Creating a VM that
-                  would go over it is refused; destroying a VM gives its RAM back
+  --max-ram SIZE  total RAM of all VMs: MiB, or a number with a unit, M/MiB,
+                  G/GiB or T/TiB (default 4096, 4 GiB; --max-ram 64G, 2T). Creating
+                  a VM that would go over it is refused; destroying a VM gives its
+                  RAM back. A VM's whole size counts, though its RAM is backed only
+                  as its guest touches it
   -h, --help      show this text
 
 Ctrl-C stops every VM, closes the connections and exits.";

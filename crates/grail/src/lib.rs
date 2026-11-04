@@ -37,8 +37,8 @@ pub mod window;
 use block::{BlockBackend, BlockDevice};
 use bus::{Bus, Exit, MAX_DISKS, MAX_NETS};
 pub use config::{
-    max_ram_size, parse_clock, parse_harts, parse_ram_size, parse_xlen, DiskConfig, MachineConfig, NetConfig,
-    DEFAULT_RAM_SIZE, MAX_HARTS,
+    max_ram_size, parse_clock, parse_harts, parse_ram_size, parse_size, parse_xlen, DiskConfig,
+    MachineConfig, NetConfig, DEFAULT_RAM_SIZE, MAX_HARTS,
 };
 use cpu::Cpu;
 pub use excalibur::Xlen;

@@ -291,7 +291,7 @@ Camelot uses Sv48: 128 TiB of user address space and as much for the kernel, for
 
 **RV32:** Sv32 walks 2 levels of 1024 4-byte PTEs (PPN in bits 31:10) with 4 MiB megapages, and has no canonical-address rule. Its 22-bit PPNs make 34-bit physical addresses: a table or a page at or above 4 GiB is an access fault, as there is nothing there.
 
-RAM: `--ram SIZE` takes a whole number of MiB, or a number with a unit, `M`/`MiB` or `G`/`GiB`, case-insensitive (`--ram 64`, `--ram 64M`, `--ram 16G`).
+RAM: `--ram SIZE` takes a whole number of MiB, or a number with a unit, `M`/`MiB`, `G`/`GiB` or `T`/`TiB`, case-insensitive (`--ram 64`, `--ram 64M`, `--ram 16G`, `--ram 1T`). Avalon's RAM budget (`--max-ram`, and Pendragon's `--avalon-max-ram`) takes the same syntax, with no upper limit.
 - **Limits:** from 1 MiB to 1 TiB, the memory controller's limit. Anything else is rejected with an error. RV32: 1 to 2048 MiB, the most that fits between 0x8000_0000 and the top of the 32-bit address space.
 - **Lazy backing:** as QEMU does, Grail backs RAM lazily. It reserves the size in the host's address space and commits host memory a page at a time (64 KiB at a time on Windows), the first time the guest touches the page, so a large machine costs the host only what its guest uses. A size the host cannot reserve is refused when the machine is made.
 - **Default:** without `--ram` a machine has 4 MiB, as does a VM on Avalon whose profile leaves the size at its default (`avalon_proto::DEFAULT_RAM_SIZE`, Round Table's and Pendragon's `--ram`). That is enough for Camelot booted from its root image ("Kernel filesystem", "Root image"), and for every example. Programs that need more say so with `--ram`.

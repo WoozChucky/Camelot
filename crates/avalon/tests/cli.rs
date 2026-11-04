@@ -19,7 +19,7 @@ fn help_and_bad_flags() {
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(
-        text.starts_with("usage: avalon [--listen ADDR] [--max-ram MiB]"),
+        text.starts_with("usage: avalon [--listen ADDR] [--max-ram SIZE]"),
         "{text}"
     );
     for args in [

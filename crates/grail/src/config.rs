@@ -363,28 +363,46 @@ pub fn max_ram_size(xlen: Xlen) -> usize {
     }
 }
 
-/// Parses a `--ram` value (spec section 7, "RAM"): a whole number of MiB, or a whole
-/// number with a unit, `M`/`MiB` or `G`/`GiB` in any case (`64`, `64M`, `16G`, `16GiB`).
-/// From 1 MiB to 1 TiB; an RV32 machine takes at most 2 GiB, which the machine's
-/// validation says ([`MachineConfig::validate`]). Returns the size in bytes.
-pub fn parse_ram_size(s: &str) -> Result<usize, String> {
-    let s = s.trim();
+/// A size of memory as people type it: a whole number of MiB, or a whole number with a
+/// unit, `M`/`MiB`, `G`/`GiB` or `T`/`TiB` in any case (`64`, `64M`, `16G`, `2TiB`).
+/// `Ok(None)` if it is one but does not fit in 64 bits.
+fn size_in_bytes(s: &str) -> Result<Option<u64>, String> {
     let bad = || format!("'{s}' is not a RAM size (examples: 64, 64M, 512MiB, 16G, 16GiB)");
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (number, unit) = s.split_at(split);
-    let scale = match unit.to_ascii_lowercase().as_str() {
-        "" | "m" | "mib" => MIB,
-        "g" | "gib" => GIB,
+    let scale: u64 = match unit.to_ascii_lowercase().as_str() {
+        "" | "m" | "mib" => 1 << 20,
+        "g" | "gib" => 1 << 30,
+        "t" | "tib" => 1 << 40,
         _ => return Err(bad()),
     };
     if number.is_empty() {
         return Err(bad());
     }
-    let n: usize = number
-        .parse()
-        .map_err(|_| format!("{s} is out of range (1 MiB to 1 TiB)"))?;
-    match n.checked_mul(scale) {
-        Some(size) if (MIB..=MAX_RAM_SIZE).contains(&size) => Ok(size),
+    Ok(number.parse::<u64>().ok().and_then(|n| n.checked_mul(scale)))
+}
+
+/// Parses a size of memory with no limit but 64 bits (a RAM budget: Avalon's
+/// `--max-ram`): the syntax of `--ram` ([`parse_ram_size`]), at least 1 MiB. Returns
+/// bytes.
+pub fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    match size_in_bytes(s)? {
+        Some(0) => Err(format!("{s} is too small (at least 1 MiB)")),
+        Some(size) => Ok(size),
+        None => Err(format!("{s} does not fit in 64 bits")),
+    }
+}
+
+/// Parses a `--ram` value (spec section 7, "RAM"): a whole number of MiB, or a whole
+/// number with a unit, `M`/`MiB`, `G`/`GiB` or `T`/`TiB` in any case (`64`, `64M`,
+/// `16G`, `16GiB`, `1T`). From 1 MiB to 1 TiB; an RV32 machine takes at most 2 GiB,
+/// which the machine's validation says ([`MachineConfig::validate`]). Returns the size
+/// in bytes.
+pub fn parse_ram_size(s: &str) -> Result<usize, String> {
+    let s = s.trim();
+    match size_in_bytes(s)? {
+        Some(size) if (MIB as u64..=MAX_RAM_SIZE as u64).contains(&size) => Ok(size as usize),
         _ => Err(format!("{s} is out of range (1 MiB to 1 TiB)")),
     }
 }
@@ -767,6 +785,8 @@ mod tests {
             ("16GIB", 16 * GIB),
             ("1024G", MAX_RAM_SIZE),
             ("1048576", MAX_RAM_SIZE),
+            ("1T", MAX_RAM_SIZE),
+            ("1tib", MAX_RAM_SIZE),
         ] {
             assert_eq!(parse_ram_size(s), Ok(size), "{s:?}");
         }
@@ -777,12 +797,24 @@ mod tests {
     }
 
     #[test]
+    fn budgets_take_the_same_sizes_without_the_ram_limit() {
+        assert_eq!(parse_size("4096"), Ok(4 << 30));
+        assert_eq!(parse_size("2T"), Ok(2 << 40));
+        assert_eq!(parse_size("16384G"), Ok(16 << 40));
+        assert_eq!(parse_size(" 512MiB "), Ok(512 << 20));
+        assert!(parse_size("0").unwrap_err().contains("at least 1 MiB"));
+        assert!(parse_size("99999999999T").unwrap_err().contains("64 bits"));
+        assert!(parse_size("64MB").unwrap_err().contains("is not a RAM size"));
+    }
+
+    #[test]
     fn ram_rejects_out_of_range_and_garbage() {
         for big in [
             "0",
             "0G",
             "1025G",
             "1048577",
+            "2T",
             "99999999999999999999999",
             "99999999999999999G",
         ] {
@@ -790,7 +822,7 @@ mod tests {
             assert!(e.contains("out of range (1 MiB to 1 TiB)"), "{big:?}: {e}");
         }
         for bad in [
-            "-1", "+5", "1.5", "1.5G", "12K", "12KiB", "12T", "G", "", "abc", "0x10", "64 M", "64MB",
+            "-1", "+5", "1.5", "1.5G", "12K", "12KiB", "12P", "G", "", "abc", "0x10", "64 M", "64MB",
         ] {
             let e = parse_ram_size(bad).unwrap_err();
             assert!(e.contains("is not a RAM size"), "{bad:?}: {e}");

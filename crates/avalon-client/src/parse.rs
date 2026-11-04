@@ -16,6 +16,12 @@ pub fn parse_ram(s: &str) -> Result<u64, String> {
     grail::parse_ram_size(s).map(|bytes| bytes as u64)
 }
 
+/// Parses a RAM budget (Pendragon's `--avalon-max-ram`, as Avalon's `--max-ram`):
+/// `--ram`'s syntax, at least 1 MiB and no upper limit. Returns bytes.
+pub fn parse_budget(s: &str) -> Result<u64, String> {
+    grail::parse_size(s)
+}
+
 /// Parses a `--harts` value, a whole number from 1 to 8 (Grail's `--harts`).
 pub fn parse_harts(s: &str) -> Result<u32, String> {
     grail::parse_harts(s).map(|n| n as u32)
