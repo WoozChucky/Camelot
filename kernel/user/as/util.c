@@ -6,11 +6,14 @@ typedef __builtin_va_list va_list;
 #define va_arg(ap, type) __builtin_va_arg(ap, type)
 #define va_end(ap) __builtin_va_end(ap)
 
-static void put_number(struct buf *b, uint v, uint base, uint width, int zero) {
+/* v in `base`, at least `width` wide (padded with zeros or spaces), its
+ * hexadecimal digits in upper case if `upper`. */
+static void put_number(struct buf *b, uint v, uint base, uint width, int zero, int upper) {
+    const char *names = upper ? "0123456789ABCDEF" : "0123456789abcdef";
     char digits[12];
     int n = 0;
     do {
-        digits[n++] = "0123456789abcdef"[v % base];
+        digits[n++] = names[v % base];
         v /= base;
     } while (v != 0);
     while ((uint)n < width) {
@@ -50,14 +53,14 @@ char *fmt(const char *f, ...) {
             int v = va_arg(ap, int);
             if (v < 0) {
                 buf_byte(&b, '-');
-                put_number(&b, 0u - (uint)v, 10, width, zero);
+                put_number(&b, 0u - (uint)v, 10, width, zero, 0);
             } else {
-                put_number(&b, (uint)v, 10, width, zero);
+                put_number(&b, (uint)v, 10, width, zero, 0);
             }
         } else if (*f == 'u') {
-            put_number(&b, va_arg(ap, uint), 10, width, zero);
-        } else if (*f == 'x') {
-            put_number(&b, va_arg(ap, uint), 16, width, zero);
+            put_number(&b, va_arg(ap, uint), 10, width, zero, 0);
+        } else if (*f == 'x' || *f == 'X') {
+            put_number(&b, va_arg(ap, uint), 16, width, zero, *f == 'X');
         } else if (*f == 'c') {
             buf_byte(&b, (uchar)va_arg(ap, int));
         } else {

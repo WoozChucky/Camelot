@@ -35,7 +35,7 @@
 //! The tables of 8-byte fields (`.rela.*`, `.symtab`, the section headers)
 //! start at 8-byte offsets in an ELF64 file, as clang writes them.
 
-use crate::asm::{Object, SectionKind, SymType};
+use crate::asm::{Object, SymType};
 use crate::Xlen;
 
 /// The ISA merlin-as assembles for RV32, in the psABI's `Tag_RISCV_arch`
@@ -56,17 +56,12 @@ pub fn arch(xlen: Xlen) -> &'static str {
     }
 }
 
+// The types and flags of the sections a source makes are crate::section's;
+// these are the writer's own sections'.
 const SHT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
-const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
-const SHT_NOBITS: u32 = 8;
-const SHF_WRITE: u64 = 1;
-const SHF_ALLOC: u64 = 2;
-const SHF_EXECINSTR: u64 = 4;
-const SHF_MERGE: u64 = 0x10;
-const SHF_STRINGS: u64 = 0x20;
 const SHF_INFO_LINK: u64 = 0x40;
 const SHN_UNDEF: u16 = 0;
 const SHN_ABS: u16 = 0xfff1;
@@ -208,11 +203,6 @@ pub fn riscv_attributes(arch: &str) -> Vec<u8> {
     out
 }
 
-/// Debug sections of strings (`SHF_MERGE | SHF_STRINGS`).
-fn is_string_section(name: &str) -> bool {
-    matches!(name, ".debug_str" | ".debug_line_str")
-}
-
 pub fn write(obj: &Object) -> Vec<u8> {
     let class = Class::of(obj.xlen);
     let mut shstr = StrTab::new();
@@ -230,31 +220,22 @@ pub fn write(obj: &Object) -> Vec<u8> {
         entsize: 0,
     }];
 
-    // User sections: header index = position + 1.
+    // User sections: header index = position + 1, with the type, flags and
+    // entry size the assembler gave them (crate::section).
     for s in &obj.sections {
-        let (ty, flags) = match s.kind {
-            SectionKind::Text => (SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR),
-            SectionKind::Data => (SHT_PROGBITS, SHF_ALLOC | SHF_WRITE),
-            SectionKind::Rodata => (SHT_PROGBITS, SHF_ALLOC),
-            SectionKind::Bss => (SHT_NOBITS, SHF_ALLOC | SHF_WRITE),
-            // Strings a debugger reads by offset, which a linker may merge.
-            SectionKind::Debug if is_string_section(&s.name) => (SHT_PROGBITS, SHF_MERGE | SHF_STRINGS),
-            SectionKind::Debug => (SHT_PROGBITS, 0),
-        };
-        let entsize = if flags & SHF_STRINGS != 0 { 1 } else { 0 };
         align(&mut out, s.align.max(1) as usize);
         let offset = out.len() as u64;
         out.extend_from_slice(&s.data);
         shdrs.push(Shdr {
             name: shstr.add(&s.name),
-            ty,
-            flags,
+            ty: s.attrs.ty,
+            flags: s.attrs.flags,
             offset,
             size: s.size.into(),
             link: 0,
             info: 0,
             align: s.align.max(1).into(),
-            entsize,
+            entsize: s.attrs.entsize,
         });
     }
 

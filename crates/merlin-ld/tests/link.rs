@@ -1550,7 +1550,9 @@ fn layout_errors() {
 
 #[test]
 fn default_layout_rejects_unknown_sections() {
-    let o = merlin_as::assemble_to_elf(".section .mystuff\n.word 1\n").unwrap();
+    // An allocated section (a name with no flags of its own, `.mystuff`, is
+    // not even loaded, as in LLVM).
+    let o = merlin_as::assemble_to_elf(".section .mystuff, \"aw\"\n.word 1\n").unwrap();
     let errs = errors(merlin_ld::link(
         &[Input {
             name: "m.o".into(),
@@ -1563,7 +1565,7 @@ fn default_layout_rejects_unknown_sections() {
         ["m.o: section '.mystuff' is not placed by the default layout (use a linker script with -T)"]
     );
     // Empty, but a global lives there: it would have no address.
-    let o = merlin_as::assemble_to_elf(".globl marker\n.section .mystuff\nmarker:\n").unwrap();
+    let o = merlin_as::assemble_to_elf(".globl marker\n.section .mystuff, \"aw\"\nmarker:\n").unwrap();
     let errs = errors(merlin_ld::link(
         &[Input {
             name: "m.o".into(),
@@ -1576,7 +1578,7 @@ fn default_layout_rejects_unknown_sections() {
         ["m.o: section '.mystuff' is not placed by the default layout (use a linker script with -T)"]
     );
     // An empty section with only locals (or nothing) is just left out.
-    let o = merlin_as::assemble_to_elf(".section .mystuff\nlocal_marker:\n").unwrap();
+    let o = merlin_as::assemble_to_elf(".section .mystuff, \"aw\"\nlocal_marker:\n").unwrap();
     let mut objs = vec![Input {
         name: "m.o".into(),
         data: o,

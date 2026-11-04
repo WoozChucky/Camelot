@@ -33,6 +33,11 @@
 //! hidden `.Lpcrel_hi` labels on `auipc`s) only go into the symbol table when
 //! a relocation still refers to them.
 //!
+//! Sections get the ELF type, flags and entry size LLVM gives them, from
+//! their names and `.section` ([`crate::section`]); the flags decide what a
+//! section holds (`NOBITS`: zeros only) and how `.align` pads it (`nop`s in
+//! code).
+//!
 //! Debug information: `.debug_*` sections are not loaded (no `SHF_ALLOC`) and
 //! hold data only. A `.word` or `.dword` there that names a `.L` label (the
 //! 8-byte addresses of RV64's DWARF) becomes a relocation against the label's
@@ -43,33 +48,42 @@
 
 use crate::ast::*;
 use crate::reloc::{Emit, RelocKind, Target};
+use crate::section::{self, Attrs, SHF_EXECINSTR, SHT_NOBITS};
 use crate::{dwarf, encode, Error};
 use excalibur::Xlen;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SectionKind {
-    /// Code: allocated + executable.
-    Text,
-    /// Writable data.
-    Data,
-    /// Read-only data.
-    Rodata,
-    /// Zero-initialised, no file contents.
-    Bss,
-    /// Debug information (`.debug_*`): data that is not loaded.
-    Debug,
-}
-
 #[derive(Debug)]
 pub struct Section {
     pub name: String,
-    pub kind: SectionKind,
-    /// Contents. For `.bss` this stays empty and `size` grows instead.
+    /// Its ELF type, flags and entry size, as LLVM decides them from the
+    /// name and `.section` ([`crate::section`]).
+    pub attrs: Attrs,
+    /// Contents. For a `NOBITS` section (`.bss`) this stays empty and `size`
+    /// grows instead.
     pub data: Vec<u8>,
     pub size: u32,
     pub align: u32,
     pub relocs: Vec<Reloc>,
+}
+
+impl Section {
+    /// `SHT_NOBITS`: room that takes no bytes in the file, zeros only.
+    pub fn is_nobits(&self) -> bool {
+        self.attrs.ty == SHT_NOBITS
+    }
+
+    /// `SHF_EXECINSTR`: code, which `.align` pads with `nop`s.
+    pub fn is_code(&self) -> bool {
+        self.attrs.flags & SHF_EXECINSTR != 0
+    }
+
+    /// Debug information: a section named `.debug_*`, which holds data only,
+    /// and whose relocations against `.L` labels are made against section
+    /// symbols (see [`Assembler::debug_relocs_to_sections`]).
+    pub fn is_debug(&self) -> bool {
+        self.name.starts_with(".debug_")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -599,29 +613,41 @@ impl Assembler {
 
     // ----- sections and emission -----
 
+    /// Makes the section named `name` the current one, made with the
+    /// attributes its name gives it ([`section::by_name`]) if there is none
+    /// yet: `.text`, `.data`, `.rodata` and `.bss`, the `.bss` of `.lcomm`,
+    /// the line table's sections.
     fn switch_section(&mut self, name: &str) {
-        if let Some(i) = self.sections.iter().position(|s| s.name == name) {
-            self.current = i;
-            return;
+        if !self.find_section(name) {
+            self.new_section(name, section::by_name(name));
         }
-        let kind = if name.starts_with(".debug_") {
-            SectionKind::Debug
-        } else if name == ".text" || name.starts_with(".text.") || name.starts_with(".init") {
-            SectionKind::Text
-        } else if name == ".bss" || name.starts_with(".bss.") || name.starts_with(".sbss") {
-            SectionKind::Bss
-        } else if name.starts_with(".rodata") || name.starts_with(".srodata") {
-            SectionKind::Rodata
-        } else {
-            SectionKind::Data
-        };
-        let align = if kind == SectionKind::Text { 4 } else { 1 };
+    }
+
+    /// Makes the section named `name` the current one if there is one.
+    fn find_section(&mut self, name: &str) -> bool {
+        match self.sections.iter().position(|s| s.name == name) {
+            Some(i) => {
+                self.current = i;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Adds a section, which becomes the current one.
+    ///
+    /// Its alignment starts at 1, raised by `.align` (and by the data
+    /// `.lcomm` places), except for `.text`'s, which starts at 4: LLVM makes
+    /// `.text` at the start with the alignment of an instruction
+    /// (`MCELFStreamer::initSections`), and no other section, not even code
+    /// (`.text.f`, `"ax"`), gets one unless it asks.
+    fn new_section(&mut self, name: &str, attrs: Attrs) {
         self.sections.push(Section {
             name: name.to_string(),
-            kind,
+            attrs,
             data: Vec::new(),
             size: 0,
-            align,
+            align: if name == ".text" { 4 } else { 1 },
             relocs: Vec::new(),
         });
         self.current = self.sections.len() - 1;
@@ -647,7 +673,7 @@ impl Assembler {
             return;
         }
         let sec = &mut self.sections[self.current];
-        if sec.kind == SectionKind::Bss {
+        if sec.is_nobits() {
             if bytes.iter().any(|&b| b != 0) {
                 self.error(format!("non-zero data in {}", self.sections[self.current].name));
                 return;
@@ -663,7 +689,7 @@ impl Assembler {
             return;
         }
         let sec = &mut self.sections[self.current];
-        if sec.kind != SectionKind::Bss {
+        if !sec.is_nobits() {
             sec.data.resize(sec.data.len() + n as usize, 0);
         }
         sec.size += n as u32;
@@ -687,7 +713,7 @@ impl Assembler {
         let sec = &mut self.sections[self.current];
         sec.align = sec.align.max(align);
         let pad = (align - sec.size % align) % align;
-        if sec.kind == SectionKind::Text && pad.is_multiple_of(4) && sec.size.is_multiple_of(4) {
+        if sec.is_code() && pad.is_multiple_of(4) && sec.size.is_multiple_of(4) {
             for _ in 0..pad / 4 {
                 self.emit_bytes(&0x0000_0013u32.to_le_bytes()); // nop
             }
@@ -706,13 +732,11 @@ impl Assembler {
     /// Appends the encoder's words to the current section and turns their
     /// fixups into relocations.
     fn place(&mut self, mnemonic: &str, emits: Vec<Emit>) {
-        match self.sections[self.current].kind {
-            SectionKind::Bss => return self.error("instructions are not allowed in .bss"),
-            SectionKind::Debug => {
-                let name = self.sections[self.current].name.clone();
-                return self.error(format!("instructions are not allowed in {name}"));
-            }
-            _ => {}
+        // Zeros only in a NOBITS section, data only in debug information.
+        let sec = &self.sections[self.current];
+        if sec.is_nobits() || sec.is_debug() {
+            let msg = format!("instructions are not allowed in {}", sec.name);
+            return self.error(msg);
         }
         if !self.sections[self.current].size.is_multiple_of(4) {
             return self.error("instruction is not 4-byte aligned (add .align 2)");
@@ -873,6 +897,113 @@ impl Assembler {
         self.define(name, section, value as u32);
     }
 
+    /// `.section name[, "flags"[, @type[, entsize]]]`: switches to the
+    /// section, made with the attributes LLVM gives it (see
+    /// [`crate::section`]: the name's defaults, plus the flags, the type
+    /// instead of the name's, or LLVM's own for a section it predefines).
+    /// The parser has made the type a string, however it was written.
+    fn section_directive(&mut self, args: &[DirArg]) {
+        let Some(name) = self.arg_name(args, 0, ".section") else {
+            return;
+        };
+        let (mut ty, mut flags) = section::name_defaults(&name);
+        // What the line asks for, which a section that exists must have.
+        let (mut given_flags, mut given_type, mut entsize) = (0, false, 0);
+        if args.len() > 1 {
+            let Some(DirArg::Str(f)) = args.get(1) else {
+                return self.error(".section: expected a string of flags");
+            };
+            given_flags = match section::parse_flags(f) {
+                Ok(f) => f,
+                Err(c @ (b'G' | b'o')) => {
+                    let what = if c == b'G' {
+                        "section groups"
+                    } else {
+                        "linked-to sections"
+                    };
+                    let c = c as char;
+                    return self.error(format!(".section: flag '{c}': {what} are not supported"));
+                }
+                // A byte that is no printable character is given by number.
+                Err(c) if c.is_ascii_graphic() => {
+                    return self.error(format!(".section: unknown flag '{}'", c as char));
+                }
+                Err(c) => return self.error(format!(".section: unknown flag {c:#04x}")),
+            };
+            flags |= given_flags;
+            match args.get(2) {
+                None => {}
+                Some(DirArg::Str(t)) => {
+                    let t = String::from_utf8_lossy(t);
+                    let Some(n) = section::type_named(&t) else {
+                        return self.error(format!(".section: unknown section type '{t}'"));
+                    };
+                    (ty, given_type) = (n, true);
+                }
+                Some(_) => {
+                    return self.error(".section: expected '@<type>', '%<type>' or \"<type>\"");
+                }
+            }
+            // A mergeable section's entries are all one size, given after
+            // the type.
+            if flags & section::SHF_MERGE != 0 {
+                if !given_type {
+                    return self.error(".section: a mergeable section (M) must give its type");
+                }
+                if args.len() < 4 {
+                    return self.error(".section: a mergeable section (M) must give its entry size");
+                }
+                let Some(n) = self.arg_const(args, 3, ".section") else {
+                    return;
+                };
+                if n <= 0 {
+                    return self.error(".section: the entry size must be positive");
+                }
+                // sh_entsize is 32 bits in ELF32, and LLVM keeps an entry
+                // size in 32 bits on either width (a larger one is cut, then
+                // fails its own check), so it is an error on both.
+                if n > u32::MAX as i64 {
+                    return self.error(format!(".section: entry size {n} does not fit in 32 bits"));
+                }
+                entsize = n as u64;
+            }
+            let used = if flags & section::SHF_MERGE != 0 { 4 } else { 3 };
+            if args.len() > used {
+                return self.error(".section: unexpected argument (unique sections are not supported)");
+            }
+        }
+        let attrs = Attrs { ty, flags, entsize };
+        if !self.find_section(&name) {
+            // LLVM's own sections exist before the first line: theirs win.
+            self.new_section(&name, section::predefined(&name).unwrap_or(attrs));
+        }
+        // As LLVM (and GNU as) do, a `.section` with nothing after the name
+        // takes the section as it is; with flags, a type or an entry size it
+        // must not change it. The messages are LLVM's, which prints the
+        // numbers in upper-case hexadecimal.
+        let have = self.sections[self.current].attrs;
+        if given_type && have.ty != ty {
+            self.error(format!(
+                "changed section type for {name}, expected: {:#X}",
+                have.ty
+            ));
+        }
+        if given_flags != 0 || entsize != 0 || given_type {
+            if have.flags != flags {
+                self.error(format!(
+                    "changed section flags for {name}, expected: {:#X}",
+                    have.flags
+                ));
+            }
+            if have.entsize != entsize {
+                self.error(format!(
+                    "changed section entsize for {name}, expected: {}",
+                    have.entsize
+                ));
+            }
+        }
+    }
+
     /// `.space n[, fill]` (and its other names, `.zero` and `.skip`): `n`
     /// bytes of `fill`, zero if it is left out. As in LLVM, only the low
     /// byte of `fill` counts (`.space 3, 0x1ff` is three 0xff), and a
@@ -956,11 +1087,7 @@ impl Assembler {
     fn directive(&mut self, name: &str, args: &[DirArg]) {
         match name {
             ".text" | ".data" | ".rodata" | ".bss" => self.switch_section(name),
-            ".section" => {
-                if let Some(n) = self.arg_name(args, 0, ".section") {
-                    self.switch_section(&n);
-                }
-            }
+            ".section" => self.section_directive(args),
             ".globl" | ".global" => {
                 for i in 0..args.len() {
                     if let Some(n) = self.arg_name(args, i, name) {
@@ -1319,7 +1446,7 @@ impl Assembler {
     /// linker computes the same address either way.
     fn debug_relocs_to_sections(&mut self) {
         for sec in 0..self.sections.len() {
-            if self.sections[sec].kind != SectionKind::Debug {
+            if !self.sections[sec].is_debug() {
                 continue;
             }
             for r in 0..self.sections[sec].relocs.len() {
@@ -1852,6 +1979,177 @@ g:      nop
         }
     }
 
+    // ----- sections -----
+
+    /// The attributes of the section `name` in `src`'s object.
+    fn attrs(src: &str, name: &str) -> Attrs {
+        section(&crate::assemble(src).unwrap(), name).1.attrs
+    }
+
+    #[test]
+    fn going_back_to_a_section_keeps_it() {
+        // llvm-mc takes all of these: nothing after the name, flags that are
+        // already the section's, or none ("" adds none, so checks nothing).
+        let a = Attrs {
+            ty: section::SHT_PROGBITS,
+            flags: section::SHF_ALLOC,
+            entsize: 0,
+        };
+        for src in [
+            ".section .foo, \"a\"\n.section .foo\n",
+            ".section .foo, \"a\"\n.section .foo, \"\"\n",
+            ".section .foo, \"a\"\n.section .foo, \"a\", @progbits\n",
+        ] {
+            assert_eq!(attrs(src, ".foo"), a, "{src}");
+        }
+        // A name's own flags are there whether or not they are written:
+        // `.text` is AX, so `"a"` asks for nothing new.
+        let text = attrs(".section .text, \"a\"\nnop\n", ".text");
+        assert_eq!(text.flags, section::SHF_ALLOC | section::SHF_EXECINSTR);
+        // LLVM's own sections have their attributes from the start.
+        let s = attrs(".section .debug_str\n.asciz \"x\"\n", ".debug_str");
+        assert_eq!(
+            (s.flags, s.entsize),
+            (section::SHF_MERGE | section::SHF_STRINGS, 1)
+        );
+        let s = attrs(".section .rodata.cst8\n.dword 1\n", ".rodata.cst8");
+        assert_eq!((s.flags, s.entsize), (section::SHF_ALLOC | section::SHF_MERGE, 8));
+    }
+
+    #[test]
+    fn section_errors() {
+        // The "changed section" messages are LLVM's, word for word; the
+        // others are merlin-as's for the line llvm-mc also rejects.
+        for (src, msgs) in [
+            (
+                ".section .foo, \"a\"\n.section .foo, \"aw\"\n",
+                &["changed section flags for .foo, expected: 0x2"][..],
+            ),
+            (
+                ".section .foo, \"a\", @progbits\n.section .foo, \"a\", @nobits\n",
+                &["changed section type for .foo, expected: 0x1"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits, 4\n.section .foo, \"aM\", @progbits, 8\n",
+                &["changed section entsize for .foo, expected: 4"],
+            ),
+            (
+                ".section .bss, \"aw\", @progbits\n",
+                &["changed section type for .bss, expected: 0x8"],
+            ),
+            (
+                ".section .rodata.cst4, \"a\"\n",
+                &[
+                    "changed section flags for .rodata.cst4, expected: 0x12",
+                    "changed section entsize for .rodata.cst4, expected: 4",
+                ],
+            ),
+            (
+                ".section .debug_line_str, \"\", @progbits\n",
+                &[
+                    "changed section flags for .debug_line_str, expected: 0x30",
+                    "changed section entsize for .debug_line_str, expected: 1",
+                ],
+            ),
+            (".section\n", &[".section: expected a name"]),
+            (".section .foo, a\n", &[".section: expected a string of flags"]),
+            (".section .foo, \"aq\"\n", &[".section: unknown flag 'q'"]),
+            (".section .foo, \"a \"\n", &[".section: unknown flag 0x20"]),
+            (
+                ".section .foo, \"aG\", @progbits, grp\n",
+                &[".section: flag 'G': section groups are not supported"],
+            ),
+            (
+                ".section .foo, \"ao\", @progbits, sym\n",
+                &[".section: flag 'o': linked-to sections are not supported"],
+            ),
+            (
+                ".section .foo, \"a\", @weird\n",
+                &[".section: unknown section type 'weird'"],
+            ),
+            (
+                ".section .foo, \"a\", foo\n",
+                &[".section: expected '@<type>', '%<type>' or \"<type>\""],
+            ),
+            (
+                ".section .foo, \"aM\"\n",
+                &[".section: a mergeable section (M) must give its type"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits\n",
+                &[".section: a mergeable section (M) must give its entry size"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits, 0\n",
+                &[".section: the entry size must be positive"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits, -1\n",
+                &[".section: the entry size must be positive"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits, 0x100000001\n",
+                &[".section: entry size 4294967297 does not fit in 32 bits"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits, x\n",
+                &[".section: expected a constant expression"],
+            ),
+            (
+                ".section .foo, \"a\", @progbits, 1\n",
+                &[".section: unexpected argument (unique sections are not supported)"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits, 1, 2\n",
+                &[".section: unexpected argument (unique sections are not supported)"],
+            ),
+            // Zeros only in NOBITS, data only in debug information, whatever
+            // the section's name.
+            (
+                ".section .bss.x\nnop\n",
+                &["instructions are not allowed in .bss.x"],
+            ),
+            (
+                ".section .b, \"aw\", @nobits\n.byte 1\n",
+                &["non-zero data in .b"],
+            ),
+            (
+                ".section .debug_x\nnop\n",
+                &["instructions are not allowed in .debug_x"],
+            ),
+        ] {
+            let errs = crate::assemble(src).unwrap_err();
+            let got: Vec<&str> = errs.iter().map(|e| e.msg.as_str()).collect();
+            assert_eq!(got, msgs, "{src}");
+        }
+    }
+
+    #[test]
+    fn the_type_is_written_three_ways() {
+        // `@nobits`, `%nobits` and `"nobits"` are the same type, and a
+        // number is a type too (`@0x70000001`, `%0x70000001`), as in LLVM.
+        for t in ["@nobits", "%nobits", "\"nobits\"", "@8", "%8"] {
+            let src = format!(".section .b, \"aw\", {t}\n.space 4\n");
+            assert_eq!(attrs(&src, ".b").ty, section::SHT_NOBITS, "{src}");
+        }
+        for t in ["@0x70000001", "%0x70000001", "\"0x70000001\""] {
+            let src = format!(".section .p, \"a\", {t}\n");
+            assert_eq!(attrs(&src, ".p").ty, 0x7000_0001, "{src}");
+        }
+    }
+
+    #[test]
+    fn code_sections_pad_with_nops() {
+        // `.align` in any executable section pads with `nop`s, as in LLVM,
+        // and with zeros elsewhere: the section's flags decide, not its name.
+        let obj = crate::assemble(
+            ".section .myx, \"ax\"\nnop\n.p2align 3\n.section .d, \"a\"\n.byte 1\n.p2align 2\n",
+        )
+        .unwrap();
+        assert_eq!(section(&obj, ".myx").1.data, [0x13, 0, 0, 0, 0x13, 0, 0, 0]);
+        assert_eq!(section(&obj, ".d").1.data, [1, 0, 0, 0]);
+    }
+
     // ----- debug information -----
 
     #[test]
@@ -1873,7 +2171,7 @@ f:      nop
         let obj = crate::assemble(src).unwrap();
         let (i, info) = section(&obj, ".debug_info");
         assert_eq!(info.data, [8, 0, 0, 0, 4, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(obj.sections[i].kind, SectionKind::Debug);
+        assert!(obj.sections[i].is_debug());
         // The label's word: a relocation against .text's section symbol, the
         // label's offset its addend; the label itself is no symbol.
         let r = &info.relocs[0];
@@ -2120,7 +2418,7 @@ f:      nop
         // The same .file twice is fine; a .file and .loc with no code make no table.
         let obj =
             crate::assemble(".file 1 \"a.c\"\n.file 1 \"a.c\"\n.file 0 \"d\" \"a.c\"\n.loc 0 3\n").unwrap();
-        assert!(obj.sections.iter().all(|s| s.kind != SectionKind::Debug));
+        assert!(obj.sections.iter().all(|s| !s.is_debug()));
     }
 
     #[test]

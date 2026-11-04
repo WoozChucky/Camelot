@@ -474,32 +474,54 @@ int ctx_csr(struct expr *e, uint *addr) {
 
 /* ---- Sections and emission ---- */
 
-static void switch_section(const char *name) {
+/* SHT_NOBITS: room that takes no bytes in the file, zeros only. */
+static int is_nobits(struct section *s) {
+    return s->attrs.ty == SHT_NOBITS;
+}
+
+/* SHF_EXECINSTR: code, which `.align` pads with `nop`s. */
+static int is_code(struct section *s) {
+    return (s->attrs.flags & SHF_EXECINSTR) != 0;
+}
+
+/* Debug information: a `.debug_*` section, data only. */
+static int is_debug(struct section *s) {
+    return starts_with(s->name, ".debug_");
+}
+
+/* Makes the section named `name` the current one if there is one. */
+static int find_section(const char *name) {
     for (uint i = 0; i < nsections; i++) {
         if (strcmp(sections[i].name, name) == 0) {
             current = (int)i;
-            return;
+            return 1;
         }
     }
-    int kind;
-    if (starts_with(name, ".debug_")) {
-        kind = SEC_DEBUG;
-    } else if (strcmp(name, ".text") == 0 || starts_with(name, ".text.") || starts_with(name, ".init")) {
-        kind = SEC_TEXT;
-    } else if (strcmp(name, ".bss") == 0 || starts_with(name, ".bss.") || starts_with(name, ".sbss")) {
-        kind = SEC_BSS;
-    } else if (starts_with(name, ".rodata") || starts_with(name, ".srodata")) {
-        kind = SEC_RODATA;
-    } else {
-        kind = SEC_DATA;
-    }
+    return 0;
+}
+
+/* Adds a section, which becomes the current one. Its alignment starts at
+ * 1, except for `.text`'s, 4: LLVM makes `.text` before the first line with
+ * an instruction's alignment, and no other section, code or not, has one
+ * until `.align` (or `.lcomm`) asks. */
+static void new_section(const char *name, struct sec_attrs attrs) {
     sections = grow(sections, &capsections, nsections + 1, sizeof(struct section));
     struct section *s = &sections[nsections];
     memset(s, 0, sizeof *s);
     s->name = perm_strdup(name);
-    s->kind = kind;
-    s->align = kind == SEC_TEXT ? 4 : 1;
+    s->attrs = attrs;
+    s->align = strcmp(name, ".text") == 0 ? 4 : 1;
     current = (int)nsections++;
+}
+
+/* Makes the section named `name` the current one, made with the attributes
+ * its name gives it if there is none yet. */
+static void switch_section(const char *name) {
+    if (!find_section(name)) {
+        struct sec_attrs a;
+        section_by_name(name, &a);
+        new_section(name, a);
+    }
 }
 
 /* The error for bytes that would take the current section to 4 GiB. */
@@ -524,7 +546,7 @@ static void emit_bytes(const uchar *bytes, uint n) {
         return;
     }
     struct section *s = &sections[current];
-    if (s->kind == SEC_BSS) {
+    if (is_nobits(s)) {
         for (uint i = 0; i < n; i++) {
             if (bytes[i] != 0) {
                 char *msg;
@@ -544,7 +566,7 @@ static void emit_zeros(uint n) {
         return;
     }
     struct section *s = &sections[current];
-    if (s->kind != SEC_BSS) {
+    if (!is_nobits(s)) {
         buf_zeros(&s->data, n);
     }
     s->size += n;
@@ -571,7 +593,7 @@ static void align_to(uint align) {
         s->align = align;
     }
     uint pad = (align - s->size % align) % align;
-    if (s->kind == SEC_TEXT && pad % 4 == 0 && s->size % 4 == 0) {
+    if (is_code(s) && pad % 4 == 0 && s->size % 4 == 0) {
         static const uchar nop[4] = {0x13, 0, 0, 0};
         for (uint i = 0; i < pad / 4; i++) {
             emit_bytes(nop, 4);
@@ -599,13 +621,9 @@ static void take_loc(void) {
 static void place(const char *mnemonic, struct emit *emits, int n) {
     struct section *s = &sections[current];
     char *msg;
-    if (s->kind == SEC_BSS) {
-        error("instructions are not allowed in .bss");
-        return;
-    }
-    if (s->kind == SEC_DEBUG) {
-        msg = fmt("instructions are not allowed in %s", s->name);
-        error(msg);
+    /* Zeros only in a NOBITS section, data only in debug information. */
+    if (is_nobits(s) || is_debug(s)) {
+        error(fmt("instructions are not allowed in %s", s->name));
         return;
     }
     if (s->size % 4 != 0) {
@@ -783,6 +801,113 @@ static void alias(const char *directive, const char *name, struct expr *e) {
         return;
     }
     define(name, t->section, value.lo);
+}
+
+/* `.section name[, "flags"[, @type[, entsize]]]` (merlin-as's
+ * section_directive): switches to the section, made with the attributes
+ * LLVM gives it (section.c): the name's defaults, plus the flags, the type
+ * instead of the name's, or LLVM's own for a section it predefines. The
+ * parser has made the type a string, however it was written. */
+static void section_directive(struct dirarg *args, uint nargs) {
+    char *name = arg_name(args, nargs, 0, ".section");
+    if (name == NULL) {
+        return;
+    }
+    struct sec_attrs want;
+    section_name_defaults(name, &want.ty, &want.flags);
+    want.entsize = 0;
+    /* What the line asks for, which a section that exists must have. */
+    uint given_flags = 0;
+    int given_type = 0;
+    if (nargs > 1) {
+        if (args[1].kind != DA_STR) {
+            error(".section: expected a string of flags");
+            return;
+        }
+        uint bad;
+        if (!section_flags(args[1].str, args[1].len, &given_flags, &bad)) {
+            if (bad == 'G') {
+                error(".section: flag 'G': section groups are not supported");
+            } else if (bad == 'o') {
+                error(".section: flag 'o': linked-to sections are not supported");
+            } else if (bad > ' ' && bad < 127) {
+                error(fmt(".section: unknown flag '%c'", (int)bad));
+            } else {
+                /* A byte that is no printable character, by number. */
+                error(fmt(".section: unknown flag 0x%02x", bad));
+            }
+            return;
+        }
+        want.flags |= given_flags;
+        if (nargs > 2) {
+            if (args[2].kind != DA_STR) {
+                error(".section: expected '@<type>', '%<type>' or \"<type>\"");
+                return;
+            }
+            if (!section_type(args[2].str, args[2].len, &want.ty)) {
+                char *t = tmp_strndup((char *)args[2].str, args[2].len);
+                error(fmt(".section: unknown section type '%s'", t));
+                return;
+            }
+            given_type = 1;
+        }
+        /* A mergeable section's entries are all one size, given after the
+         * type. */
+        uint used = 3;
+        if (want.flags & SHF_MERGE) {
+            if (!given_type) {
+                error(".section: a mergeable section (M) must give its type");
+                return;
+            }
+            if (nargs < 4) {
+                error(".section: a mergeable section (M) must give its entry size");
+                return;
+            }
+            i64 n;
+            if (!arg_const(args, nargs, 3, ".section", &n)) {
+                return;
+            }
+            if (i64_is_neg(n) || (n.hi == 0 && n.lo == 0)) {
+                error(".section: the entry size must be positive");
+                return;
+            }
+            /* sh_entsize is 32 bits in ELF32, and LLVM keeps an entry size
+             * in 32 bits (a larger one fails its own check). */
+            if (n.hi != 0) {
+                error(fmt(".section: entry size %s does not fit in 32 bits", i64_dec(n)));
+                return;
+            }
+            want.entsize = n.lo;
+            used = 4;
+        }
+        if (nargs > used) {
+            error(".section: unexpected argument (unique sections are not supported)");
+            return;
+        }
+    }
+    if (!find_section(name)) {
+        /* LLVM's own sections exist before the first line: theirs win. */
+        struct sec_attrs a;
+        if (!section_predefined(name, &a)) {
+            a = want;
+        }
+        new_section(name, a);
+    }
+    /* As LLVM (and GNU as) do, a `.section` with nothing after the name
+     * takes the section as it is; with flags, a type or an entry size it
+     * must not change it. The messages are LLVM's. */
+    struct sec_attrs have = sections[current].attrs;
+    if (given_type && have.ty != want.ty) {
+        error(fmt("changed section type for %s, expected: 0x%X", name, have.ty));
+    }
+    if (given_flags != 0 || want.entsize != 0 || given_type) {
+        if (have.flags != want.flags) {
+            error(fmt("changed section flags for %s, expected: 0x%X", name, have.flags));
+        }
+        if (have.entsize != want.entsize) {
+            error(fmt("changed section entsize for %s, expected: %u", name, have.entsize));
+        }
+    }
 }
 
 static int is_pow2(i64 v) {
@@ -1045,10 +1170,7 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         strcmp(name, ".bss") == 0) {
         switch_section(name);
     } else if (strcmp(name, ".section") == 0) {
-        char *n = arg_name(args, nargs, 0, ".section");
-        if (n != NULL) {
-            switch_section(n);
-        }
+        section_directive(args, nargs);
     } else if (strcmp(name, ".globl") == 0 || strcmp(name, ".global") == 0) {
         for (uint i = 0; i < nargs; i++) {
             char *n = arg_name(args, nargs, i, name);
@@ -1511,7 +1633,7 @@ static void line_table(void) {
  * section, plus its offset. */
 static void debug_relocs_to_sections(void) {
     for (uint sec = 0; sec < nsections; sec++) {
-        if (sections[sec].kind != SEC_DEBUG) {
+        if (!is_debug(&sections[sec])) {
             continue;
         }
         for (uint k = 0; k < sections[sec].nrelocs; k++) {

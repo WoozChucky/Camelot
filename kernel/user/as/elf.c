@@ -11,17 +11,12 @@
 #include "as.h"
 #include "tables.h"
 
-#define SHT_PROGBITS 1
+/* The types and flags of the sections a source makes are in tables.h
+ * (merlin-as's section.rs); these are the writer's own sections'. */
 #define SHT_SYMTAB 2
 #define SHT_STRTAB 3
 #define SHT_RELA 4
-#define SHT_NOBITS 8
 #define SHT_RISCV_ATTRIBUTES 0x70000003u
-#define SHF_WRITE 1
-#define SHF_ALLOC 2
-#define SHF_EXECINSTR 4
-#define SHF_MERGE 0x10
-#define SHF_STRINGS 0x20
 #define SHF_INFO_LINK 0x40
 #define SHN_UNDEF 0
 #define SHN_ABS 0xfff1
@@ -82,34 +77,20 @@ void elf_write(struct object *obj, struct buf *out) {
     new_shdr();
 
     for (uint i = 0; i < obj->nsections; i++) {
+        /* The type, flags and entry size the assembler gave it (section.c). */
         struct section *s = &obj->sections[i];
-        uint ty = SHT_PROGBITS, flags;
-        if (s->kind == SEC_TEXT) {
-            flags = SHF_ALLOC | SHF_EXECINSTR;
-        } else if (s->kind == SEC_DATA) {
-            flags = SHF_ALLOC | SHF_WRITE;
-        } else if (s->kind == SEC_RODATA) {
-            flags = SHF_ALLOC;
-        } else if (s->kind == SEC_BSS) {
-            ty = SHT_NOBITS;
-            flags = SHF_ALLOC | SHF_WRITE;
-        } else if (strcmp(s->name, ".debug_str") == 0 || strcmp(s->name, ".debug_line_str") == 0) {
-            flags = SHF_MERGE | SHF_STRINGS;
-        } else {
-            flags = 0;
-        }
         uint align = s->align ? s->align : 1;
         buf_align(out, align);
         uint offset = out->len;
         buf_put(out, s->data.data, s->data.len);
         struct shdr *h = new_shdr();
         h->name = strtab_add(&shstr, s->name);
-        h->ty = ty;
-        h->flags = flags;
+        h->ty = s->attrs.ty;
+        h->flags = s->attrs.flags;
         h->offset = offset;
         h->size = s->size;
         h->align = align;
-        h->entsize = flags & SHF_STRINGS ? 1 : 0;
+        h->entsize = s->attrs.entsize;
     }
 
     struct shdr *attr = new_shdr();

@@ -2,7 +2,8 @@
 //! or RV64 ([`Options::xlen`], `-march=` on the command line).
 //!
 //! Pipeline: [`lexer`] → [`parser`] → [`asm`] (calls [`encode`] per instruction,
-//! and [`dwarf`] for the line table of `.file` and `.loc`) → [`elf`].
+//! [`dwarf`] for the line table of `.file` and `.loc`, and [`section`] for
+//! the ELF attributes of the sections) → [`elf`].
 //!
 //! The width is chosen once, for the whole file, as clang's `-march` does: it
 //! reaches the encoder through [`Ctx::xlen`], and the object carries it
@@ -16,6 +17,7 @@ pub mod encode;
 pub mod lexer;
 pub mod parser;
 pub mod reloc;
+pub mod section;
 
 pub use asm::{Ctx, Object};
 pub use excalibur::Xlen;

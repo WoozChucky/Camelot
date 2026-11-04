@@ -126,6 +126,7 @@ impl Parser<'_> {
             Tok::Ident(name) if name.starts_with('.') => {
                 let args = match name.as_str() {
                     ".file" | ".loc" => self.spaced_args()?,
+                    ".section" => self.section_args()?,
                     _ => self.dir_args()?,
                 };
                 out.push(Stmt {
@@ -169,9 +170,52 @@ impl Parser<'_> {
                     self.pos += 1;
                     args.push(DirArg::Str(s));
                 }
-                // Section flags/types like `@progbits` are written as `@ident` in GNU
-                // syntax; we only accept the quoted-flags form and plain names.
                 _ => args.push(DirArg::Expr(self.expr()?)),
+            }
+            if *self.peek() != Tok::Punct(',') {
+                return Ok(args);
+            }
+            self.pos += 1;
+        }
+    }
+
+    /// The arguments of `.section name, "flags", @type, entsize`, read as
+    /// [`Parser::dir_args`] reads them, except the type, the third: LLVM
+    /// takes it as `@progbits`, `%progbits` or `"progbits"` (a name or a
+    /// number), and whichever it is, it becomes the string `progbits` for
+    /// the assembler. `%progbits` alone would not parse as an expression.
+    fn section_args(&mut self) -> Result<Vec<DirArg>, Error> {
+        let mut args = Vec::new();
+        if matches!(self.peek(), Tok::Newline) {
+            return Ok(args);
+        }
+        loop {
+            let ty = if args.len() == 2 {
+                match (self.peek().clone(), self.peek_at(1).clone()) {
+                    (Tok::Ident(t), _) if t.starts_with('@') => {
+                        self.pos += 1;
+                        Some(t[1..].to_string())
+                    }
+                    (Tok::Punct('%'), Tok::Ident(t)) => {
+                        self.pos += 2;
+                        Some(t)
+                    }
+                    (Tok::Punct('%'), Tok::Int(n)) => {
+                        self.pos += 2;
+                        Some(n.to_string())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match (ty, self.peek().clone()) {
+                (Some(t), _) => args.push(DirArg::Str(t.into_bytes())),
+                (None, Tok::Str(s)) => {
+                    self.pos += 1;
+                    args.push(DirArg::Str(s));
+                }
+                (None, _) => args.push(DirArg::Expr(self.expr()?)),
             }
             if *self.peek() != Tok::Punct(',') {
                 return Ok(args);
