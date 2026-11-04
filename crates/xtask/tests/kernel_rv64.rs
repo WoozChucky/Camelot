@@ -330,8 +330,11 @@ fn the_rv64_kernel_boots_through_its_self_tests() {
     assert!(rest.starts_with(&boot), "output:\n{out}");
     let rest = &rest[boot.len()..];
     let lines: Vec<&str> = rest.lines().collect();
-    assert!(lines[0].starts_with("kstack: "), "{rest}");
-    assert_eq!(lines[1..], ["user space: not on RV64 yet"], "{rest}");
+    // Kernel stacks freed past each hart's cache are unmapped and their
+    // pages freed (vm.h, kstack_free()).
+    assert_eq!(lines[0], "kstack self-test: 3/3 passed", "{rest}");
+    assert!(lines[1].starts_with("kstack: "), "{rest}");
+    assert_eq!(lines[2..], ["user space: not on RV64 yet"], "{rest}");
 
     // The layout's variables: Sv48 on a hart that has it, else Sv39, with
     // Linux's values for the mode.

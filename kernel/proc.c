@@ -728,6 +728,10 @@ void scheduler(void) {
             reap_thread(t);
         }
         release(&proc_lock);
+        /* The kernel stacks freed holding proc_lock, here or elsewhere, that
+         * this hart's cache had no room for: unmapped now that no lock is
+         * held (vm.h). */
+        kstack_reclaim();
     }
     intr_on();
 }

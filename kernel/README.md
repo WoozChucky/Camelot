@@ -382,6 +382,9 @@ grail --paging sv39 --harts 4 kernel/kernel-rv64.elf
   and the devices' DMA registers take physical ones.
 - Kernel stacks are 16 KiB with an unmapped guard page below, and a stack
   that overflows is reported as `panic: kernel stack overflow in <name>`.
+  A freed stack stays mapped in its hart's cache (two at most, Linux's
+  `NR_CACHED_STACKS`); the others are unmapped and their pages freed where
+  no lock is held (`kstack_reclaim()`).
 - The boot runs every self-test, on 1 to 8 harts, from the ROM or from a
   disk (`boot/boot.S` builds `boot-rv64.elf` too), and ends with `user
   space: not on RV64 yet` and the failure count as the exit code.
@@ -391,8 +394,9 @@ grail --paging sv39 --harts 4 kernel/kernel-rv64.elf
 paging: on (Sv48)
 vm self-test: 26/26 passed
 ...
+kstack self-test: 3/3 passed
 smp: 4 harts running
-kstack: 664 of 16384 bytes used at most
+kstack: 880 of 16384 bytes used at most
 user space: not on RV64 yet
 ```
 

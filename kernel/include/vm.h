@@ -241,6 +241,9 @@ uintptr ioremap(phys_addr_t p, usize size);
  * area (2 MiB; the slot below the first is not the kernel's, and unmapped). */
 #define KSTACK_SLOTS 64
 #define KSTACK_AREA VMALLOC_START
+/* How many freed stacks each hart keeps mapped for its next kstack_alloc()
+ * (Linux's NR_CACHED_STACKS). */
+#define NR_CACHED_STACKS 2
 /* Then the devices' mappings (ioremap()), up to VM_TEST_AREA. */
 #define IOREMAP_START (KSTACK_AREA + KSTACK_SLOTS * KSTACK_SLOT)
 /* The second half of the vmalloc area's first root entry: for the paging
@@ -260,15 +263,37 @@ extern u8 overflow_stacks[];
 
 /* A kernel stack: returns its lowest address (the stack is the KSTACK_SIZE
  * bytes from there; its top is that plus KSTACK_SIZE), or NULL if no memory
- * is left. Must be called with no spinlock held (it maps pages). */
+ * (or, on RV64, no slot) is left. Must be called with no spinlock held (it
+ * maps pages, and first unmaps the freed ones, kstack_reclaim()). On RV64
+ * one this hart freed, if it has one cached, else a new one in a free slot. */
 #ifndef __ASSEMBLER__
 void *kstack_alloc(void);
 
 /* Gives back a stack from kstack_alloc(), which nothing may run on any
- * more. May be called with spinlocks held: on RV64 the stack stays mapped,
- * cached for the next kstack_alloc() (as Linux caches freed thread stacks),
- * since unmapping it would need a TLB shootdown. */
+ * more. May be called with spinlocks held (threads are freed holding
+ * proc_lock). On RV64 the stack stays mapped: this hart keeps up to
+ * NR_CACHED_STACKS for its next kstack_alloc(), as Linux caches freed thread
+ * stacks per CPU; any other is unmapped and its pages freed by
+ * kstack_reclaim(), later, since unmapping needs a TLB shootdown, which
+ * must not wait for harts that may be spinning on a lock this one holds
+ * (as Linux defers it with vfree_atomic()). */
 void kstack_free(void *stack);
+
+/* Unmaps the stacks kstack_free() deferred and frees their pages, with a
+ * shootdown. Called with no spinlock held: by kstack_alloc(), and by the
+ * scheduler after each switch back to it, once it has let go of proc_lock,
+ * so that the memory of threads that ended comes back without waiting for
+ * a new one. Nothing on RV32. */
+void kstack_reclaim(void);
+
+/* The kernel stacks there are on RV64, for the self-test: mapped (in use,
+ * cached or deferred), cached by the harts, and deferred. All 0 on RV32. */
+struct kstack_counts {
+    u32 mapped;
+    u32 cached;
+    u32 deferred;
+};
+void kstack_count(struct kstack_counts *n);
 
 /* The deepest use of any kernel stack so far, in bytes: every stack is
  * zeroed when it is first made, and the lowest non-zero word of each is how

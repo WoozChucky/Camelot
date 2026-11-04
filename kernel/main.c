@@ -385,6 +385,9 @@ int kmain(void) {
     failed += blk_selftest();
     failed += fs_boot();
     failed += net_boot();
+#if __riscv_xlen == 64
+    failed += kstack_selftest();
+#endif
     /* The other harts, last: the self-tests above run their kernel
      * processes on hart 0 alone. */
     failed += smp_boot();

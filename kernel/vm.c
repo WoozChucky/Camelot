@@ -29,6 +29,7 @@
 #include "machine.h"
 #include "memlayout.h"
 #include "mmio.h"
+#include "proc.h"
 #include "riscv.h"
 #include "smp.h"
 #include "spinlock.h"
@@ -57,13 +58,31 @@ static struct spinlock uvm_lock;
 /* The vmalloc area's state, under vmalloc_lock, which also keeps two harts
  * from making the same table under its root entry at once (Linux's
  * init_mm.page_table_lock): a leaf of the lock order but for kalloc's.
- * kstack_next: the next stack slot never handed out, from KSTACK_AREA up;
- * kstack_cache: the stacks given back, each holding the next one's address
- * in its top word; ioremap_next: where the next device mapping may go. */
+ * The kernel stacks' (kstack_alloc()):
+ * - kstack_state: each slot's, KSTACK_FREE (unmapped, free to take),
+ *   KSTACK_MAPPED (its stack is mapped: in use, cached or deferred) or
+ *   KSTACK_BUSY (being mapped or unmapped, not to be read);
+ * - kstack_cached: each hart's freed stacks, kept mapped for its next
+ *   kstack_alloc(), NR_CACHED_STACKS at most, 0 for none (Linux's
+ *   cached_stacks);
+ * - kstack_deferred: the other freed stacks, each holding the next one's
+ *   address in its top word, until kstack_reclaim() unmaps them;
+ * - kstack_deepest: the deepest use of a stack that has been unmapped.
+ * ioremap_next: where the next device mapping may go. */
 static struct spinlock vmalloc_lock;
-static uintptr kstack_next;
-static uintptr kstack_cache;
+#define KSTACK_FREE 0
+#define KSTACK_MAPPED 1
+#define KSTACK_BUSY 2
+static u8 kstack_state[KSTACK_SLOTS];
+static uintptr kstack_cached[NCPU][NR_CACHED_STACKS];
+static volatile uintptr kstack_deferred;
+static usize kstack_deepest;
 static uintptr ioremap_next;
+/* Enough slots for every stack there can be at once: one per thread and
+ * per other hart, the harts' caches, and some freed ones waiting to be
+ * unmapped (kstack_alloc() returns NULL if they are all taken). */
+_Static_assert(KSTACK_SLOTS >= NTHREAD + NCPU + NCPU * NR_CACHED_STACKS + NCPU,
+               "a slot for every kernel stack");
 #endif
 
 #if __riscv_xlen == 64
@@ -376,7 +395,6 @@ void kvminit(void) {
         panic("kvminit: out of memory");
     }
     initlock(&vmalloc_lock, "vmalloc");
-    kstack_next = KSTACK_AREA;
     ioremap_next = IOREMAP_START;
     kernel_satp = MAKE_SATP(kernel_pagetable);
 #endif
@@ -422,25 +440,84 @@ void vm_print_mapping(pagetable_t pt, uintptr va) {
 /* ---- Kernel stacks ---- */
 
 #if __riscv_xlen == 64
-void *kstack_alloc(void) {
-    acquire(&vmalloc_lock);
-    if (kstack_cache != 0) {
-        uintptr stack = kstack_cache;
-        kstack_cache = *(uintptr *)(stack + KSTACK_SIZE - sizeof(uintptr));
-        release(&vmalloc_lock);
-        return (void *)stack;
+/* The address of slot `i`'s stack, and the slot of a stack. */
+#define KSTACK_OF(i) (KSTACK_AREA + (uintptr)(i) * KSTACK_SLOT)
+#define SLOT_OF(stack) (((uintptr)(stack) - KSTACK_AREA) / KSTACK_SLOT)
+/* A freed stack's link to the next on kstack_deferred: its top word. */
+#define NEXT_OF(stack) (*(uintptr *)((uintptr)(stack) + KSTACK_SIZE - sizeof(uintptr)))
+
+/* How much of the stack at [bottom, bottom + size) has been used: the
+ * distance from the top to its lowest non-zero word. */
+static usize stack_used(uintptr bottom, usize size) {
+    for (usize off = 0; off < size; off += sizeof(uintptr)) {
+        if (*(volatile uintptr *)(bottom + off) != 0) {
+            return size - off;
+        }
     }
-    /* A new slot, of KSTACK_SLOTS. */
-    uintptr stack = kstack_next;
-    if (stack == IOREMAP_START) {
+    return 0;
+}
+
+void kstack_reclaim(void) {
+    /* Read without the lock first: the scheduler calls this after every
+     * switch back, and there is seldom anything to do. */
+    if (kstack_deferred == 0) {
+        return;
+    }
+    acquire(&vmalloc_lock);
+    uintptr list = kstack_deferred;
+    kstack_deferred = 0;
+    for (uintptr s = list; s != 0; s = NEXT_OF(s)) {
+        kstack_state[SLOT_OF(s)] = KSTACK_BUSY;
+    }
+    release(&vmalloc_lock);
+    /* No spinlock held: unmap_pages() shoots the pages down on every hart,
+     * which waits for each of them, before kfree()ing them (as Linux's
+     * vfree() of a stack, deferred by vfree_atomic() from where it was freed
+     * with locks held). */
+    while (list != 0) {
+        uintptr s = list;
+        list = NEXT_OF(s);
+        usize used = stack_used(s, KSTACK_SIZE);
+        unmap_pages(kernel_pagetable, s, KSTACK_SIZE, true);
+        acquire(&vmalloc_lock);
+        if (used > kstack_deepest) {
+            kstack_deepest = used;
+        }
+        kstack_state[SLOT_OF(s)] = KSTACK_FREE;
+        release(&vmalloc_lock);
+    }
+}
+
+void *kstack_alloc(void) {
+    /* Stacks freed holding locks are unmapped here, where none is held, so
+     * that their memory goes back before more is taken. */
+    kstack_reclaim();
+    acquire(&vmalloc_lock);
+    /* One this hart freed, still mapped: no new pages, no new mapping. */
+    uintptr *cached = kstack_cached[cpuid()];
+    for (u32 i = 0; i < NR_CACHED_STACKS; i++) {
+        if (cached[i] != 0) {
+            uintptr stack = cached[i];
+            cached[i] = 0;
+            release(&vmalloc_lock);
+            return (void *)stack;
+        }
+    }
+    /* A free slot. */
+    u32 slot = 0;
+    while (slot < KSTACK_SLOTS && kstack_state[slot] != KSTACK_FREE) {
+        slot++;
+    }
+    if (slot == KSTACK_SLOTS) {
         release(&vmalloc_lock);
         return NULL;
     }
-    kstack_next = stack + KSTACK_SLOT;
+    uintptr stack = KSTACK_OF(slot);
     /* The stack's pages, zeroed (kstack_max_used() measures from that). The
      * page below the stack, the upper half of the slot under it, stays
      * unmapped: the guard. Under the lock, so that two harts don't race to
      * make the same table. */
+    kstack_state[slot] = KSTACK_BUSY;
     usize mapped = 0;
     while (mapped < KSTACK_SIZE) {
         void *page = kzalloc();
@@ -454,42 +531,84 @@ void *kstack_alloc(void) {
     }
     release(&vmalloc_lock);
     if (mapped < KSTACK_SIZE) {
-        /* Out of memory: the pages go back (the slot is not used again). */
+        /* Out of memory: the pages go back, and the slot. */
         if (mapped != 0) {
             unmap_pages(kernel_pagetable, stack, mapped, true);
         }
+        acquire(&vmalloc_lock);
+        kstack_state[slot] = KSTACK_FREE;
+        release(&vmalloc_lock);
         return NULL;
     }
+    /* The new PTEs before this hart's first access through them: its TLB
+     * may hold the slot's old, invalid translation (the ISA lets it cache
+     * one, and the slot may have been mapped and unmapped before). Another
+     * hart reaches the stack only by switching to a thread on it, or to its
+     * page table, which fences (the scheduler, entry.S): as Linux fences
+     * locally for a new vmalloc mapping and leaves the other harts to their
+     * next fence (new_vmalloc). */
+    sfence_vma();
+    acquire(&vmalloc_lock);
+    kstack_state[slot] = KSTACK_MAPPED;
+    release(&vmalloc_lock);
     return (void *)stack;
 }
 
 void kstack_free(void *stack) {
     acquire(&vmalloc_lock);
-    *(uintptr *)((uintptr)stack + KSTACK_SIZE - sizeof(uintptr)) = kstack_cache;
-    kstack_cache = (uintptr)stack;
+    /* Cached for this hart's next thread, as Linux keeps NR_CACHED_STACKS
+     * per CPU; any other waits for kstack_reclaim(), since unmapping needs a
+     * shootdown, which can't wait for other harts holding a lock. */
+    uintptr *cached = kstack_cached[cpuid()];
+    for (u32 i = 0; i < NR_CACHED_STACKS; i++) {
+        if (cached[i] == 0) {
+            cached[i] = (uintptr)stack;
+            release(&vmalloc_lock);
+            return;
+        }
+    }
+    NEXT_OF(stack) = kstack_deferred;
+    kstack_deferred = (uintptr)stack;
     release(&vmalloc_lock);
 }
 
-/* How much of the stack at [bottom, bottom + size) has been used: the
- * distance from the top to its lowest non-zero word. */
-static usize stack_used(uintptr bottom, usize size) {
-    for (usize off = 0; off < size; off += sizeof(uintptr)) {
-        if (*(volatile uintptr *)(bottom + off) != 0) {
-            return size - off;
+void kstack_count(struct kstack_counts *n) {
+    acquire(&vmalloc_lock);
+    n->mapped = 0;
+    for (u32 i = 0; i < KSTACK_SLOTS; i++) {
+        if (kstack_state[i] != KSTACK_FREE) {
+            n->mapped++;
         }
     }
-    return 0;
+    n->cached = 0;
+    for (u32 h = 0; h < NCPU; h++) {
+        for (u32 i = 0; i < NR_CACHED_STACKS; i++) {
+            if (kstack_cached[h][i] != 0) {
+                n->cached++;
+            }
+        }
+    }
+    n->deferred = 0;
+    for (uintptr s = kstack_deferred; s != 0; s = NEXT_OF(s)) {
+        n->deferred++;
+    }
+    release(&vmalloc_lock);
 }
 
 usize kstack_max_used(void) {
-    /* Hart 0's boot stack (entry.S zeroes it), then every slot handed out:
-     * all are mapped, in use or cached. */
+    /* Hart 0's boot stack (entry.S zeroes it), every stack mapped now, in
+     * use, cached or waiting, and those unmapped before. */
     usize most = stack_used((uintptr)__stack_bottom, KSTACK_SIZE);
     acquire(&vmalloc_lock);
-    for (uintptr s = KSTACK_AREA; s < kstack_next; s += KSTACK_SLOT) {
-        usize used = stack_used(s, KSTACK_SIZE);
-        if (used > most) {
-            most = used;
+    if (kstack_deepest > most) {
+        most = kstack_deepest;
+    }
+    for (u32 i = 0; i < KSTACK_SLOTS; i++) {
+        if (kstack_state[i] == KSTACK_MAPPED) {
+            usize used = stack_used(KSTACK_OF(i), KSTACK_SIZE);
+            if (used > most) {
+                most = used;
+            }
         }
     }
     release(&vmalloc_lock);
@@ -502,6 +621,15 @@ void *kstack_alloc(void) {
 
 void kstack_free(void *stack) {
     kfree(stack);
+}
+
+void kstack_reclaim(void) {
+}
+
+void kstack_count(struct kstack_counts *n) {
+    n->mapped = 0;
+    n->cached = 0;
+    n->deferred = 0;
 }
 
 usize kstack_max_used(void) {

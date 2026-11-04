@@ -5,6 +5,7 @@
 #include "kprintf.h"
 #include "memlayout.h"
 #include "probe.h"
+#include "proc.h"
 #include "riscv.h"
 #include "vm.h"
 
@@ -211,3 +212,47 @@ int vm_selftest(void) {
     kprintf("vm self-test: %d/%d passed\n", passed, passed + failed);
     return failed;
 }
+
+#if __riscv_xlen == 64
+/* A kernel process that ends at once: what kstack_selftest() runs. */
+static void kstack_noop(void) {
+}
+
+/* NPROC kernel processes at once, run until all have ended. */
+static void kstack_round(void) {
+    for (u32 i = 0; i < NPROC; i++) {
+        const char *err;
+        if (kproc_create("kstack", kstack_noop, &err) == NULL) {
+            check(false, "start a kernel process");
+        }
+    }
+    scheduler();
+}
+
+/* The pages of every kernel stack in kstack_count()'s `stacks`. */
+static u32 stack_pages(u32 stacks) {
+    return stacks * (u32)(KSTACK_SIZE / PGSIZE);
+}
+
+int kstack_selftest(void) {
+    passed = 0;
+    failed = 0;
+    /* A first round, for the page tables the stacks' slots may need. */
+    kstack_round();
+    struct kstack_counts n;
+    kstack_count(&n);
+    u32 before = kfree_pages() + stack_pages(n.cached);
+    /* More threads end than this hart caches stacks for: the rest are
+     * deferred and unmapped by the scheduler as soon as it holds no lock. */
+    for (u32 round = 0; round < 3; round++) {
+        kstack_round();
+    }
+    kstack_count(&n);
+    check(n.deferred == 0, "no freed kernel stack is left to unmap");
+    check(n.mapped == n.cached && n.cached <= NR_CACHED_STACKS,
+          "only this hart's cached kernel stacks stay mapped");
+    check(kfree_pages() + stack_pages(n.cached) == before, "every other kernel stack's pages come back");
+    kprintf("kstack self-test: %d/%d passed\n", passed, passed + failed);
+    return failed;
+}
+#endif
