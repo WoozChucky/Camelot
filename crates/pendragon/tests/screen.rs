@@ -611,7 +611,31 @@ fn pings_limits_and_shutdown() {
     create(&api, "ptr", &example("pointer"), false);
 
     let mut silent = Page::open(&api, "ptr");
-    let mut answering = Page::open(&api, "ptr");
+    // The answering page answers from the moment it opens, as a browser does, on a
+    // thread of its own: its pings come while the test waits for the silent page's
+    // close. Every message it reads comes to the test, the pings among them.
+    let answering = Page::open(&api, "ptr");
+    let (to_test, answered) = std::sync::mpsc::channel();
+    let answerer = std::thread::spawn(move || {
+        let mut page = answering;
+        while let Some(msg) = page.recv() {
+            match &msg {
+                Msg::Ping(payload) => page.send_frame(OP_PONG, payload),
+                Msg::Close(..) => {
+                    page.send_frame(OP_CLOSE, &close_payload(1000, ""));
+                    let _ = to_test.send(msg);
+                    return;
+                }
+                _ => {}
+            }
+            let _ = to_test.send(msg);
+        }
+    });
+    let next = || {
+        answered
+            .recv_timeout(SLOW)
+            .expect("a message to the answering page")
+    };
     let (status, _, mut third) =
         Page::try_open(api.addr, &handshake(api.addr, "ptr", &protocols(&api.token), ""));
     assert_eq!(status, 409);
@@ -630,19 +654,16 @@ fn pings_limits_and_shutdown() {
         Some(&Msg::Close(Some(1001), "no answer to a ping".into()))
     );
 
-    // The answering page outlives a few pings.
-    let start = Instant::now();
+    // The answering page outlives a few pings (it has had one at least by the time
+    // the silent page was closed for not answering its own).
     let mut pings = 0;
-    while start.elapsed() < Duration::from_millis(1500) {
-        if let Some(Msg::Ping(payload)) = answering.recv() {
-            answering.send_frame(OP_PONG, &payload);
-            pings += 1;
-        }
-        if pings >= 3 {
-            break;
+    while pings < 3 {
+        match next() {
+            Msg::Ping(_) => pings += 1,
+            other @ Msg::Close(..) => panic!("the answering page was closed: {other:?}"),
+            _ => {}
         }
     }
-    assert!(pings >= 3);
     // A slot is free again: the silent page's.
     wait_for("the silent page's slot", || {
         (n(&api.expect(200, api.get("overview")), "screens") == 1).then_some(())
@@ -653,12 +674,11 @@ fn pings_limits_and_shutdown() {
         pendragon_for(&dead_addr(), &dead_addr(), 64 * MIB),
     );
     pendragon.stop().unwrap();
-    let msgs = answering.until("the close", |m| {
-        if let Msg::Ping(_) = m {
-            return false;
-        }
-        matches!(m, Msg::Close(..))
-    });
+    let mut msgs = Vec::new();
+    while !matches!(msgs.last(), Some(Msg::Close(..))) {
+        msgs.push(next());
+    }
+    answerer.join().unwrap();
     let end = msgs.iter().find_map(|m| match m {
         Msg::Text(json) if s(json, "type") == "end" => Some(s(json, "reason").to_string()),
         _ => None,
