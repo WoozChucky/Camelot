@@ -503,7 +503,7 @@ static int find_section(const char *name) {
 /* Adds a section, which becomes the current one. Its alignment starts at
  * 1, except for `.text`'s, 4: LLVM makes `.text` before the first line with
  * an instruction's alignment, and no other section, code or not, has one
- * until `.align` (or `.lcomm`) asks. */
+ * until `.align` (or `.comm`) asks. */
 static void new_section(const char *name, struct sec_attrs attrs) {
     sections = grow(sections, &capsections, nsections + 1, sizeof(struct section));
     struct section *s = &sections[nsections];
@@ -917,22 +917,25 @@ static int is_pow2(i64 v) {
     return m.lo == 0 && m.hi == 0;
 }
 
-/* `.comm sym, size[, align]` for a .local symbol, or `.lcomm`: zero bytes
- * in .bss. */
+/* `.comm sym, size[, align]` for a .local symbol, or `.lcomm sym, size`:
+ * zero bytes in .bss, at that alignment (`.lcomm`: 1). */
 static void common(const char *directive, struct dirarg *args, uint nargs) {
-    char *msg;
     char *sym = arg_name(args, nargs, 0, directive);
     if (sym == NULL) {
         return;
     }
     int dummy;
     if (strcmp(directive, ".comm") == 0 && !map_get(&locals, sym, &dummy)) {
-        msg = fmt(".comm: '%s' is not .local; common symbols are not supported (use -fno-common)", sym);
-        error(msg);
+        error(fmt(".comm: '%s' is not .local; common symbols are not supported (use -fno-common)", sym));
         return;
     }
     i64 size, align;
     if (!arg_const(args, nargs, 1, directive, &size)) {
+        return;
+    }
+    /* LLVM's ELF `.lcomm` takes no alignment. */
+    if (strcmp(directive, ".lcomm") == 0 && nargs > 2) {
+        error(".lcomm: alignment not supported on this target");
         return;
     }
     if (nargs > 2) {
@@ -942,14 +945,19 @@ static void common(const char *directive, struct dirarg *args, uint nargs) {
     } else {
         align = i64_u(1);
     }
-    if (size.hi != 0) {
-        msg = fmt("%s: bad size %s", directive, i64_dec(size));
-        error(msg);
+    /* LLVM's messages; a size too big for the section is the 4 GiB error
+     * below, as for `.space`. */
+    if (i64_is_neg(size)) {
+        error(fmt("%s: size must be non-negative", directive));
         return;
     }
-    if (!is_pow2(align) || i64_cmp(align, i64_u(1u << 16)) > 0) {
-        msg = fmt("%s: alignment must be a power of two up to 65536", directive);
-        error(msg);
+    if (!is_pow2(align)) {
+        error(fmt("%s: alignment must be a power of 2", directive));
+        return;
+    }
+    /* merlin-as's own limit, `.p2align`'s too. */
+    if (i64_cmp(align, i64_u(1u << 16)) > 0) {
+        error(fmt("%s: alignment must be at most 65536", directive));
         return;
     }
     int back = current;
@@ -962,7 +970,11 @@ static void common(const char *directive, struct dirarg *args, uint nargs) {
     if (symbols[i].ty == SYM_NOTYPE) {
         symbols[i].ty = SYM_OBJECT;
     }
-    emit_zeros(size.lo);
+    if (size.hi != 0) {
+        no_room();
+    } else {
+        emit_zeros(size.lo);
+    }
     current = back;
 }
 

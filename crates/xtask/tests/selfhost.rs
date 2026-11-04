@@ -321,6 +321,10 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
         // .space: no negative count, no section of 4 GiB or more.
         ".data\n.space -1\n.skip -5, 7\n.space 0x100000003\n.word 1\n.space 2, x\n",
         ".bss\n.space 0xffffffff\n.byte 0\n.lcomm b, 1\n",
+        // .comm and .lcomm: LLVM's messages, merlin-as's alignment limit, and
+        // a size past 32 bits.
+        ".local x\n.comm x, 4, 3\n.comm x, -1\n.lcomm y, 16, 8\n.lcomm y, -1\n.comm x, 4, 0x20000\n\
+         .lcomm z\n.lcomm w, 0x100000000\n",
         // .section: going back with other attributes (LLVM's messages, the
         // numbers in upper-case hexadecimal), and lines LLVM rejects.
         ".section .foo, \"a\"\n.section .foo, \"aw\"\n.section .foo, \"a\", @nobits\n\

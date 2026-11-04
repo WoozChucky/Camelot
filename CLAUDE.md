@@ -1,6 +1,6 @@
 # Camelot: notes for Claude Code sessions
 
-Camelot is a learning project: the Excalibur ISA (RV32IMA + Zicsr, M/S/U, Sv32, Xcal extensions), the Grail emulator, the Merlin toolchain (merlin-as, merlin-ld, merlin-objdump, merlin C-subset compiler) and the Camelot OS. The spec is `docs/excalibur-spec.md`; the roadmap is its §11 and the tracking issue on GitHub (label `roadmap`).
+Camelot is a learning project: the Excalibur ISA (RV64IMA + Zicsr + Zifencei, M/S/U, Sv48 paging (Sv39 too), Xcal extensions; its RV32/Sv32 form kept until #159), the Grail emulator, the Merlin toolchain (merlin-as, merlin-ld, merlin-objdump, merlin C-subset compiler) and the Camelot OS. The spec is `docs/excalibur-spec.md`; the roadmap is its §11 and the tracking issue on GitHub (label `roadmap`).
 
 ## Picking up work
 

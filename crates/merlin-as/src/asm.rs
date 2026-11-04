@@ -615,7 +615,7 @@ impl Assembler {
 
     /// Makes the section named `name` the current one, made with the
     /// attributes its name gives it ([`section::by_name`]) if there is none
-    /// yet: `.text`, `.data`, `.rodata` and `.bss`, the `.bss` of `.lcomm`,
+    /// yet: `.text`, `.data`, `.rodata` and `.bss`, the `.bss` of `.comm`,
     /// the line table's sections.
     fn switch_section(&mut self, name: &str) {
         if !self.find_section(name) {
@@ -637,7 +637,7 @@ impl Assembler {
     /// Adds a section, which becomes the current one.
     ///
     /// Its alignment starts at 1, raised by `.align` (and by the data
-    /// `.lcomm` places), except for `.text`'s, which starts at 4: LLVM makes
+    /// `.comm` places), except for `.text`'s, which starts at 4: LLVM makes
     /// `.text` at the start with the alignment of an instruction
     /// (`MCELFStreamer::initSections`), and no other section, not even code
     /// (`.text.f`, `"ax"`), gets one unless it asks.
@@ -1037,8 +1037,8 @@ impl Assembler {
     }
 
     /// `.comm sym, size[, align]` for a symbol made `.local` first, or
-    /// `.lcomm sym, size[, align]`: reserves `size` zero bytes for `sym` in
-    /// `.bss`, aligned to `align` bytes, as clang's assembler does. This is
+    /// `.lcomm sym, size`: reserves `size` zero bytes for `sym` in `.bss`,
+    /// aligned to `align` bytes (`.lcomm`: 1), as clang's assembler does. This is
     /// how clang writes a `static` variable without an initializer in its
     /// assembly output (`.local buf` then `.comm buf,100,1`). The current
     /// section stays what it was. A global `.comm` would be an
@@ -1056,6 +1056,12 @@ impl Assembler {
         let Some(size) = self.arg_const(args, 1, name) else {
             return;
         };
+        // LLVM's ELF `.lcomm` takes no alignment (its LCOMM::NoAlignment):
+        // `.lcomm sym, size, align` is "alignment not supported on this
+        // target" on riscv32 and riscv64 alike. `.comm` takes one.
+        if name == ".lcomm" && args.len() > 2 {
+            return self.error(".lcomm: alignment not supported on this target");
+        }
         let align = if args.len() > 2 {
             match self.arg_const(args, 2, name) {
                 Some(a) => a,
@@ -1064,11 +1070,17 @@ impl Assembler {
         } else {
             1
         };
-        if !(0..=u32::MAX as i64).contains(&size) {
-            return self.error(format!("{name}: bad size {size}"));
+        // LLVM's messages. A size too big for the section is left to
+        // emit_zeros below, which says so as `.space` does.
+        if size < 0 {
+            return self.error(format!("{name}: size must be non-negative"));
         }
-        if align <= 0 || align & (align - 1) != 0 || align > 1 << 16 {
-            return self.error(format!("{name}: alignment must be a power of two up to 65536"));
+        if align <= 0 || align & (align - 1) != 0 {
+            return self.error(format!("{name}: alignment must be a power of 2"));
+        }
+        // merlin-as's own limit, the same as `.p2align`'s (0..16).
+        if align > 1 << 16 {
+            return self.error(format!("{name}: alignment must be at most 65536"));
         }
         let back = self.current;
         self.switch_section(".bss");
@@ -1938,15 +1950,18 @@ f:      nop
         .comm   buf,100,1
         .local  n
         .comm   n,4,4
-        .lcomm  big, 16, 8
+        .local  big
+        .comm   big, 16, 8
+        .lcomm  odd, 3
 g:      nop
 ";
         let obj = crate::assemble(src).unwrap();
         let (bss, s) = section(&obj, ".bss");
-        // buf at 0, n aligned up to 100, big aligned up to 104.
-        assert_eq!(s.size, 120);
+        // buf at 0, n aligned up to 100, big aligned up to 104, odd right
+        // after it (.lcomm aligns to 1).
+        assert_eq!(s.size, 123);
         assert_eq!(s.align, 8);
-        for (name, value, size) in [("buf", 0, 100), ("n", 100, 4), ("big", 104, 16)] {
+        for (name, value, size) in [("buf", 0, 100), ("n", 100, 4), ("big", 104, 16), ("odd", 120, 3)] {
             let s = sym(&obj, name);
             assert_eq!((s.section, s.value, s.size), (Some(bss), value, size), "{name}");
             assert!(s.defined && !s.global, "{name}");
@@ -1962,12 +1977,31 @@ g:      nop
         let errs = crate::assemble("        .comm shared, 4, 4\n").unwrap_err();
         assert_eq!(errs.len(), 1);
         assert!(errs[0].msg.contains("-fno-common"), "{}", errs[0].msg);
-        for bad in [
-            ".local x\n.comm x, 4, 3\n",
-            ".local x\n.comm x, -1\n",
-            ".lcomm x\n",
+        // The messages llvm-mc 23 gives, on riscv32 and riscv64 alike, but
+        // for the last two: merlin-as's own limits on an argument LLVM wants.
+        for (bad, msg) in [
+            (
+                ".local x\n.comm x, 4, 3\n",
+                ".comm: alignment must be a power of 2",
+            ),
+            (
+                ".local x\n.comm x, 4, 0\n",
+                ".comm: alignment must be a power of 2",
+            ),
+            (".local x\n.comm x, -1\n", ".comm: size must be non-negative"),
+            (".lcomm x, -1\n", ".lcomm: size must be non-negative"),
+            (
+                ".lcomm x, 16, 8\n",
+                ".lcomm: alignment not supported on this target",
+            ),
+            (
+                ".local x\n.comm x, 4, 0x20000\n",
+                ".comm: alignment must be at most 65536",
+            ),
+            (".lcomm x\n", ".lcomm: missing argument"),
         ] {
-            assert!(crate::assemble(bad).is_err(), "{bad}");
+            let errs = crate::assemble(bad).unwrap_err();
+            assert!(errs[0].msg.starts_with(msg), "{bad}: {errs:?}");
         }
     }
 
