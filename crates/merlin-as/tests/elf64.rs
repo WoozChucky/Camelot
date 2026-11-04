@@ -3,9 +3,11 @@
 //!
 //! merlin-as lays out its sections in its own order (clang puts `.strtab`
 //! first and each `.rela.X` after its X) and writes no `$x`/`$d` mapping
-//! symbols, so the files differ as wholes; everything else here is clang's.
-//! The expectations come from `llvm-readelf -h -S -s -r` and
-//! `llvm-objdump -s` of the source assembled by clang 23 with
+//! symbols, so the files differ as wholes. Everything else here is clang's,
+//! except the two numbers those symbols change, which are merlin-as's and
+//! say what clang's are: the size of `.symtab` and its `sh_info`. The
+//! expectations come from `llvm-readelf -h -S -s -r` and `llvm-objdump -s`
+//! of the source assembled by clang 23 with
 //!
 //! ```text
 //! clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mno-relax -c
@@ -16,18 +18,22 @@ use merlin_as::{Options, Xlen};
 const RV64: Options = Options { xlen: Xlen::Rv64 };
 
 /// Code with pc-relative and call relocations, data with 64-bit addresses
-/// and addends (and a 32-bit one), and two absolute constants whose 64-bit
-/// values a 32-bit symbol would cut.
+/// and addends (and a 32-bit one), two absolute constants whose 64-bit
+/// values a 32-bit symbol would cut, a function with its type and size, and
+/// a `static` buffer as clang writes one (`.local` then `.comm`): an object
+/// symbol with a size, in `.bss`, a section with no bytes in the file.
 const SRC: &str = "
     .equ K, -1
     .equ N, -0x80000000
     .globl f
+    .type f, @function
     .text
 f:
     call ext
     la a0, var
     ld a1, 0(a0)
     ret
+    .size f, . - f
     .data
     .p2align 3
 var:
@@ -36,6 +42,8 @@ var:
     .word ext
     .word 0
     .dword f
+    .local buf
+    .comm buf, 16, 8
 ";
 
 fn hex(s: &str) -> Vec<u8> {
@@ -80,14 +88,19 @@ fn sections_are_clangs() {
     let file = elf::Elf::parse(&bytes).expect("parses");
     const AX: u64 = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
     const WA: u64 = elf::SHF_WRITE | elf::SHF_ALLOC;
-    // name, type, flags, size, addralign, entsize (llvm-readelf -S).
-    let expected: [(&str, u32, u64, u64, u64, u64); 6] = [
+    // name, type, flags, size, addralign, entsize (llvm-readelf -S). The
+    // .bss is NOBITS: 16 bytes in memory, none in the file.
+    let expected: [(&str, u32, u64, u64, u64, u64); 7] = [
         (".text", elf::SHT_PROGBITS, AX, 0x18, 4, 0),
         (".data", elf::SHT_PROGBITS, WA, 0x20, 8, 0),
+        (".bss", elf::SHT_NOBITS, WA, 0x10, 8, 0),
         (".riscv.attributes", 0x7000_0003, 0, 0x55, 1, 0),
         (".rela.text", elf::SHT_RELA, elf::SHF_INFO_LINK, 0x48, 8, 0x18),
         (".rela.data", elf::SHT_RELA, elf::SHF_INFO_LINK, 0x60, 8, 0x18),
-        (".symtab", elf::SHT_SYMTAB, 0, 6 * 0x18 + 0x18, 8, 0x18),
+        // merlin-as's size, not clang's: the null symbol and 7 others.
+        // clang's is 0x120, 12 entries, with its four mapping symbols ($x in
+        // .text, $d in .data, .bss and .riscv.attributes).
+        (".symtab", elf::SHT_SYMTAB, 0, 8 * 0x18, 8, 0x18),
     ];
     for (name, ty, flags, size, align, entsize) in expected {
         let s = section(&file, name);
@@ -134,14 +147,17 @@ fn symbols_are_clangs() {
         .collect();
     // llvm-readelf -s, without clang's mapping symbols ($xrv64i2p1_..., $d).
     // The constants are their whole 64-bit values, sign-extended: an ELF32
-    // object holds 0xffffffff and 0x80000000.
-    use elf::{STB_GLOBAL as GLOBAL, STB_LOCAL as LOCAL, STT_NOTYPE as NOTYPE};
+    // object holds 0xffffffff and 0x80000000. `f` is a FUNC of 24 bytes
+    // (.type and .size), `buf` an OBJECT of 16 (.comm's size).
+    use elf::{STB_GLOBAL as GLOBAL, STB_LOCAL as LOCAL};
+    use elf::{STT_FUNC as FUNC, STT_NOTYPE as NOTYPE, STT_OBJECT as OBJECT};
     let clang = [
         ("K", 0xffff_ffff_ffff_ffff, 0, LOCAL, NOTYPE, "ABS"),
         ("N", 0xffff_ffff_8000_0000, 0, LOCAL, NOTYPE, "ABS"),
         (".Lpcrel_hi0", 8, 0, LOCAL, NOTYPE, ".text"),
         ("var", 0, 0, LOCAL, NOTYPE, ".data"),
-        ("f", 0, 0, GLOBAL, NOTYPE, ".text"),
+        ("buf", 0, 16, LOCAL, OBJECT, ".bss"),
+        ("f", 0, 24, GLOBAL, FUNC, ".text"),
         ("ext", 0, 0, GLOBAL, NOTYPE, "UND"),
     ];
     let clang: Vec<_> = clang
@@ -150,8 +166,9 @@ fn symbols_are_clangs() {
         .collect();
     assert_eq!(ours, clang);
     // sh_info: the index of the first global, after the null symbol and the
-    // four locals.
-    assert_eq!(section(&file, ".symtab").info, 5);
+    // five locals. merlin-as's, not clang's: clang's is 10, after its four
+    // mapping symbols too.
+    assert_eq!(section(&file, ".symtab").info, 6);
 
     // The raw Elf64_Sym of K: st_name, then st_info, st_other, st_shndx
     // (SHN_ABS), then the 8-byte st_value and st_size.

@@ -1698,6 +1698,43 @@ data:   .word 0
     }
 
     #[test]
+    fn rv64_pcrel_loads_and_stores_to_local_labels_are_resolved() {
+        // RV64's `ld`, `lwu` and `sd` to a label are auipc pairs like `lw`
+        // and `sw`, resolved the same way. Words from clang --target=riscv64
+        // -mno-relax for the same source (llvm-objdump -dr: no relocations).
+        let src = "
+        ld   a0, data
+        lwu  a1, data
+        sd   a2, data, t0
+        nop
+data:   .dword 5
+";
+        let obj = assemble_for(src, Xlen::Rv64).unwrap();
+        let text = &obj.sections[0];
+        let words: Vec<u32> = text
+            .data
+            .chunks(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            words,
+            [
+                0x0000_0517, // auipc a0, 0
+                0x01c5_3503, // ld a0, 0x1c(a0)
+                0x0000_0597, // auipc a1, 0
+                0x0145_e583, // lwu a1, 0x14(a1)
+                0x0000_0297, // auipc t0, 0
+                0x00c2_b623, // sd a2, 0xc(t0)
+                0x0000_0013, // nop
+                5,           // .dword 5, low word
+                0,           // and high word
+            ]
+        );
+        assert!(text.relocs.is_empty());
+        assert!(obj.symbols.iter().all(|s| !s.name.starts_with(".L")));
+    }
+
+    #[test]
     fn far_pcrel_pairs_round_the_upper_part() {
         // `la` 0x1800 bytes ahead: the low 12 bits are 0x800, so lo12 is
         // -2048 and hi20 rounds up to 2. The call is 0x17f8 ahead: no rounding.

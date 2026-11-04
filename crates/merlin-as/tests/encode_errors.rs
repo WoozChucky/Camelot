@@ -3,6 +3,7 @@
 //! are what RV64 changes: wider shift amounts, the RV64-only instructions'
 //! ranges, and the CSRs and counter reads that exist on RV32 only.
 
+use merlin_as::elf::riscv_attributes;
 use merlin_as::{Options, Xlen};
 use std::process::Command;
 
@@ -714,6 +715,7 @@ fn rv64_instructions_are_unknown_on_rv32() {
         "lwu a0, 8(a1)",
         "sd a0, 8(a1)",
         "ld a0, target",
+        "lwu a0, target",
         "sd a0, target, t0",
         "lr.d a0, (a1)",
         "sc.d.aq a0, a1, (a2)",
@@ -830,42 +832,123 @@ fn cli_reports_file_and_line() {
 
 /// `-march=` picks the width for the whole file: `cycleh`, the high half of
 /// the cycle counter, is a CSR on RV32 only, so the same source assembles for
-/// one width and not the other. An ISA merlin-as does not implement is a usage
-/// error (status 2), not an assembly error.
+/// one width and not the other, and an RV64 source that assembles is written
+/// as an ELF64 object. An ISA merlin-as does not implement is a usage error
+/// (status 2), not an assembly error.
 #[test]
 fn cli_takes_the_width_from_march() {
     let dir = std::env::temp_dir().join(format!("merlin-as-march-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let input = dir.join("cycleh.s");
-    let output = dir.join("cycleh.o");
-    std::fs::write(&input, "    csrr a0, cycleh\n").unwrap();
-    let run = |march: Option<&str>| {
+    let cycleh = dir.join("cycleh.s");
+    std::fs::write(&cycleh, "    csrr a0, cycleh\n").unwrap();
+    let ld = dir.join("ld.s");
+    std::fs::write(&ld, "    ld a0, 0(a1)\n").unwrap();
+    let output = dir.join("out.o");
+    // (exit status, stderr, the object if one was written).
+    let run = |march: Option<&str>, input: &std::path::Path| {
         let _ = std::fs::remove_file(&output);
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_merlin-as"));
-        cmd.args(march).arg("-o").arg(&output).arg(&input);
+        cmd.args(march).arg("-o").arg(&output).arg(input);
         let out = cmd.output().unwrap();
         (
             out.status.code(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
-            output.exists(),
+            std::fs::read(&output).ok(),
         )
     };
-    let default = run(None);
-    let rv32 = run(Some("-march=rv32ima_zicsr_zifencei"));
-    let rv64 = run(Some("-march=rv64ima_zicsr_zifencei"));
-    let other = run(Some("-march=rv64gc"));
+    let default = run(None, &cycleh);
+    let rv32 = run(Some("-march=rv32ima_zicsr_zifencei"), &cycleh);
+    let rv64 = run(Some("-march=rv64ima_zicsr_zifencei"), &cycleh);
+    let other = run(Some("-march=rv64gc"), &cycleh);
+    let rv64_ld = run(Some("-march=rv64ima_zicsr_zifencei"), &ld);
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert_eq!(default, (Some(0), String::new(), true));
-    assert_eq!(rv32, (Some(0), String::new(), true));
-    let (code, stderr, wrote) = rv64;
-    assert_eq!((code, wrote), (Some(1), false), "stderr: {stderr}");
+    // Without -march and with RV32's: an ELF32 object (EI_CLASS 1).
+    for (code, stderr, object) in [default, rv32] {
+        assert_eq!((code, stderr.as_str()), (Some(0), ""));
+        assert_eq!(object.expect("an object")[4], 1, "ELFCLASS32");
+    }
+    let (code, stderr, object) = rv64;
+    assert_eq!((code, object), (Some(1), None), "stderr: {stderr}");
     assert!(
-        stderr.starts_with(&format!("{}:1: error: ", input.display())),
+        stderr.starts_with(&format!("{}:1: error: ", cycleh.display())),
         "{stderr:?}"
     );
     assert!(stderr.contains("'cycleh'"), "{stderr:?}");
-    let (code, stderr, wrote) = other;
-    assert_eq!((code, wrote), (Some(2), false), "stderr: {stderr}");
+    let (code, stderr, object) = other;
+    assert_eq!((code, object), (Some(2), None), "stderr: {stderr}");
     assert!(stderr.contains("unsupported -march 'rv64gc'"), "{stderr:?}");
+
+    // RV64's ld: an ELF64 object (EI_CLASS 2) whose .riscv.attributes names
+    // the RV64 ISA, as clang's does for the same -march.
+    let (code, stderr, object) = rv64_ld;
+    assert_eq!((code, stderr.as_str()), (Some(0), ""));
+    let bytes = object.expect("an object");
+    assert_eq!(bytes[4], 2, "ELFCLASS64");
+    assert_eq!(attributes(&bytes), riscv_attributes(merlin_as::elf::ARCH_RV64));
+}
+
+/// The contents of an object's `.riscv.attributes`.
+fn attributes(object: &[u8]) -> Vec<u8> {
+    let file = elf::Elf::parse(object).expect("parses");
+    let section = file.sections.iter().find(|s| s.name == ".riscv.attributes");
+    file.section_data(section.expect(".riscv.attributes"))
+        .unwrap()
+        .to_vec()
+}
+
+/// The width and the ISA come only from the options: `.option` and
+/// `.attribute`, which change them in LLVM (`.option arch`, `.option rvc`,
+/// `.attribute arch`, or by its number, 5), are ignored. A source that
+/// claims the other width assembles for its own: RV64's instructions stay
+/// unknown on RV32 and RV32's counter halves on RV64, and the object's
+/// `.riscv.attributes` is still the ISA of its width.
+#[test]
+fn option_and_attribute_leave_the_width_alone() {
+    // Four lines that claim `isa`, so the instruction after them is line 5.
+    let claim = |isa: &str, line: &str| {
+        format!(
+            "    .option arch, {isa}\n    .option rvc\n    .attribute arch, \"{isa}\"\n    \
+             .attribute 5, \"{isa}\"\n    {line}\n"
+        )
+    };
+    // (width, the other width's ISA, its instruction and why it is refused,
+    // an instruction of this width).
+    let cases = [
+        (
+            Xlen::Rv32,
+            "rv64gc",
+            "ld a0, 0(a1)",
+            "unknown instruction 'ld'",
+            "rdcycleh a0",
+        ),
+        (
+            Xlen::Rv64,
+            "rv32gc",
+            "rdcycleh a0",
+            "'rdcycleh' exists only on RV32 (on RV64, rdcycle reads all 64 bits)",
+            "ld a0, 0(a1)",
+        ),
+    ];
+    for (xlen, claimed, theirs, why, ours) in cases {
+        let options = Options { xlen };
+        let errs = merlin_as::assemble_with(&claim(claimed, theirs), &options).unwrap_err();
+        assert_eq!(
+            (errs.len(), errs[0].line, errs[0].msg.as_str()),
+            (1, 5, why),
+            "{xlen:?}"
+        );
+        let object = merlin_as::assemble_to_elf_with(&claim(claimed, ours), &options);
+        let object = object.unwrap_or_else(|e| panic!("{xlen:?}: {e:?}"));
+        let class = match xlen {
+            Xlen::Rv32 => 1,
+            Xlen::Rv64 => 2,
+        };
+        assert_eq!(object[4], class, "{xlen:?}: EI_CLASS");
+        assert_eq!(
+            attributes(&object),
+            riscv_attributes(merlin_as::elf::arch(xlen)),
+            "{xlen:?}"
+        );
+    }
 }
