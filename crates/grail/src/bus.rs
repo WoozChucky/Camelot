@@ -550,10 +550,13 @@ impl Bus {
             });
         }
         if let Some(off) = Self::offset_in(addr, FB_CTRL_BASE, FB_CTRL_SIZE) {
+            let modesets = self.fb.modesets;
             let written = self.fb.write(off, size, val, self.ram.len() as u64);
-            // A modeset changes the screen the pointer's positions are on.
-            let mode = self.fb.mode();
-            self.ptr.set_screen(mode.width, mode.height);
+            if self.fb.modesets != modesets {
+                // A modeset took effect: the pointer's positions are on its screen now.
+                let mode = self.fb.mode();
+                self.ptr.set_screen(mode.width, mode.height);
+            }
             return written;
         }
         // Every other device has 32-bit registers only.
@@ -1165,6 +1168,13 @@ mod tests {
             (frame.width, frame.height, frame.pixel(1, 0)),
             (1024, 768, 0xab_cdef)
         );
+        bus.ptr.push(PointerInput::move_to(5000, 5000));
+        assert_eq!(bus.ptr.position(), (1023, 767));
+        // A modeset the display refuses (1920x1080 does not fit from A in 8 MiB) leaves
+        // the pointer on the screen it had.
+        bus.write(reg(fb::REG_MODE), 4, 5).unwrap();
+        assert_eq!(bus.read(reg(fb::REG_WIDTH), 4), Ok(1024));
+        bus.write(reg(fb::REG_STATUS), 4, 0xffff_ffff).unwrap();
         bus.ptr.push(PointerInput::move_to(5000, 5000));
         assert_eq!(bus.ptr.position(), (1023, 767));
 
