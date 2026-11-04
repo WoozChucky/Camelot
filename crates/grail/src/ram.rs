@@ -1,4 +1,4 @@
-//! A machine's RAM, backed lazily (spec section 6, "RAM"): the whole size is
+//! A machine's RAM, backed lazily (spec section 7, "RAM"): the whole size is
 //! reserved in the host's address space when the machine is made, and host memory
 //! is committed a piece at a time, the first time the guest (or a device's DMA, or
 //! the loader) touches it. A 1 TiB machine costs the host what its guest uses, as
@@ -29,8 +29,19 @@
 //! host I/O calls [`touch`] on it first.
 //!
 //! Every function of the Windows side's FFI is declared by hand (CLAUDE.md: std only).
+//!
+//! **Debugging Grail itself on Windows:** a debugger is told of every exception before
+//! any vectored handler runs, so each first touch of a 64 KiB piece shows up as a
+//! first-chance access violation (and stops a debugger set to stop on those). Let them
+//! pass: the handler settles them. An access violation that is not a first touch of
+//! RAM is passed on, as if the handler were not there.
+//!
+//! Grail needs a 64-bit host: RAM of up to 1 TiB is that much address space.
 
 use std::ops::{Deref, DerefMut};
+
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("Grail needs a 64-bit host: a machine's RAM is up to 1 TiB of the host's address space");
 
 /// How much the Windows side commits on a first touch: 64 KiB, the granularity of
 /// Windows' own allocations, so a guest that sweeps memory takes one fault per 16
@@ -96,12 +107,14 @@ pub fn touch(buf: &[u8]) {
     }
 }
 
+/// The slice is the whole RAM, reserved for as long as the `Ram` lives. Every byte of
+/// it reads as written (or 0) when this process's code touches it: on Windows the first
+/// touch of a piece commits it before the access completes. A host system call is not
+/// such a touch: before a piece of RAM goes to host I/O (a file's read or write, a
+/// socket's send), [`touch`] it.
 impl Deref for Ram {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        // The whole range is reserved for as long as `self` lives, and every byte of
-        // it reads as written (or 0): on Windows the first touch of a piece commits it
-        // before the access completes.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
@@ -173,7 +186,7 @@ mod windows {
     use super::COMMIT_CHUNK;
     use std::ffi::c_void;
     use std::ptr::null_mut;
-    use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Once;
 
     const MEM_COMMIT: u32 = 0x1000;
@@ -184,6 +197,8 @@ mod windows {
     const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
     const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
     const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    /// `STD_ERROR_HANDLE`, (DWORD)-12.
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
 
     #[repr(C)]
     struct ExceptionRecord {
@@ -210,27 +225,50 @@ mod windows {
         fn VirtualAlloc(addr: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
         fn VirtualFree(addr: *mut c_void, size: usize, kind: u32) -> i32;
         fn AddVectoredExceptionHandler(first: u32, handler: Handler) -> *mut c_void;
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn WriteFile(
+            file: *mut c_void,
+            data: *const u8,
+            len: u32,
+            written: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
     }
 
     /// One reserved RAM, `base` and `len`, in a slot of a list the handler reads
     /// without a lock: it runs in the middle of whatever faulted, on any thread, so it
     /// must not wait or allocate. Slots are never freed, only reused.
     ///
-    /// `state` says what the slot is. Only a `LIVE` slot's `base` and `len` are a pair,
-    /// and nobody but its owner (the `Ram`, when it is dropped) takes a live slot back:
+    /// `word` says what the slot is, in its low 2 bits, and counts every change of it
+    /// in the rest (a generation). Only a `LIVE` slot's `base` and `len` are a pair, and
+    /// nobody but its owner (the `Ram`, when it is dropped) takes a live slot back:
     /// looking for a free slot claims `FREE` ones only, so a live region never drops out
     /// of the handler's sight, as it would if every slot passed were locked to look at.
+    /// The generation makes the handler's read of a pair a seqlock: it reads `word`,
+    /// the pair, and `word` again, and uses the pair only if `word` did not change, so
+    /// a slot freed and taken by another RAM in between can never give it one region's
+    /// base with another's length.
     pub struct Region {
         base: AtomicUsize,
         len: AtomicUsize,
-        state: AtomicU8,
+        word: AtomicU64,
         next: AtomicPtr<Region>,
     }
 
-    const FREE: u8 = 0;
+    const FREE: u64 = 0;
     /// Being set up or taken down: not a region the handler may use.
-    const CLAIMED: u8 = 1;
-    const LIVE: u8 = 2;
+    const CLAIMED: u64 = 1;
+    const LIVE: u64 = 2;
+    const STATE: u64 = 3;
+
+    impl Region {
+        /// Moves the slot to `state`, a new generation, publishing what was written
+        /// before (`Release`).
+        fn set(&self, state: u64) {
+            let w = self.word.load(Ordering::Relaxed);
+            self.word.store(((w & !STATE) + 4) | state, Ordering::Release);
+        }
+    }
 
     static REGIONS: AtomicPtr<Region> = AtomicPtr::new(null_mut());
     static INSTALL: Once = Once::new();
@@ -239,9 +277,11 @@ mod windows {
     fn take_slot() -> &'static Region {
         let mut at = REGIONS.load(Ordering::Acquire);
         while let Some(r) = unsafe { at.as_ref() } {
-            if r.state
-                .compare_exchange(FREE, CLAIMED, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
+            let w = r.word.load(Ordering::Acquire);
+            if w & STATE == FREE
+                && r.word
+                    .compare_exchange(w, (w + 4) | CLAIMED, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
             {
                 return r;
             }
@@ -250,7 +290,7 @@ mod windows {
         let r: &'static Region = Box::leak(Box::new(Region {
             base: AtomicUsize::new(0),
             len: AtomicUsize::new(0),
-            state: AtomicU8::new(CLAIMED),
+            word: AtomicU64::new(CLAIMED),
             next: AtomicPtr::new(null_mut()),
         }));
         let mut head = REGIONS.load(Ordering::Acquire);
@@ -266,8 +306,9 @@ mod windows {
 
     pub fn reserve(len: usize) -> Result<(*mut u8, &'static Region), String> {
         INSTALL.call_once(|| unsafe {
-            // First in line, so a first touch is settled before anyone else's handler
-            // (or a debugger's first-chance report) sees a fault that isn't one.
+            // First in line, so a first touch is settled before any other vectored
+            // handler sees a fault that isn't one. (A debugger hears of it even
+            // earlier: see the module's doc.)
             if AddVectoredExceptionHandler(1, first_touch).is_null() {
                 panic!("cannot install the RAM's exception handler");
             }
@@ -280,7 +321,7 @@ mod windows {
         r.base.store(p as usize, Ordering::Relaxed);
         r.len.store(len, Ordering::Relaxed);
         // Publishes base and len: the handler reads them only after seeing LIVE.
-        r.state.store(LIVE, Ordering::Release);
+        r.set(LIVE);
         Ok((p.cast(), r))
     }
 
@@ -288,20 +329,26 @@ mod windows {
         // Out of the handler's sight first, so it commits nothing here any more. The
         // owner is the only one to take a live slot back, and nothing touches its RAM
         // while it is dropped.
-        r.state.store(CLAIMED, Ordering::Release);
+        r.set(CLAIMED);
         unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) };
         r.len.store(0, Ordering::Relaxed);
         r.base.store(0, Ordering::Relaxed);
-        r.state.store(FREE, Ordering::Release);
+        r.set(FREE);
     }
 
     /// The region `addr` is in, as (base, len).
     fn region_of(addr: usize) -> Option<(usize, usize)> {
         let mut at = REGIONS.load(Ordering::Acquire);
         while let Some(r) = unsafe { at.as_ref() } {
-            if r.state.load(Ordering::Acquire) == LIVE {
+            let w = r.word.load(Ordering::Acquire);
+            if w & STATE == LIVE {
                 let (base, len) = (r.base.load(Ordering::Relaxed), r.len.load(Ordering::Relaxed));
-                if addr >= base && addr - base < len {
+                // Ordered after the loads above, as a seqlock's second read must be.
+                std::sync::atomic::fence(Ordering::Acquire);
+                // Unchanged: the pair is this region's. Changed: the slot was taken
+                // down meanwhile, so it is no region that can be faulting now (an owner
+                // takes its region down only when nothing touches it).
+                if r.word.load(Ordering::Relaxed) == w && addr >= base && addr - base < len {
                     return Some((base, len));
                 }
             }
@@ -314,7 +361,9 @@ mod windows {
     /// chunk around it and runs the access again.
     unsafe extern "system" fn first_touch(info: *mut ExceptionPointers) -> i32 {
         let record = unsafe { &*(*info).record };
-        if record.code != EXCEPTION_ACCESS_VIOLATION || record.parameters < 2 {
+        // An execution fault is not a first touch (RAM is committed read-write, never
+        // executable): committing would only fault again, forever.
+        if record.code != EXCEPTION_ACCESS_VIOLATION || record.parameters < 2 || record.information[0] == 8 {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let addr = record.information[1];
@@ -325,7 +374,20 @@ mod windows {
         let size = COMMIT_CHUNK.min(base + len - start);
         let p = unsafe { VirtualAlloc(start as *mut c_void, size, MEM_COMMIT, PAGE_READWRITE) };
         if p.is_null() {
-            // The host is out of memory: let the fault take its normal course.
+            // The host is out of memory (its commit limit): say so, as Rust's own
+            // out-of-memory handler does, without allocating, and let the fault take
+            // its normal course.
+            const MESSAGE: &[u8] = b"grail: the host has no memory left to back the guest's RAM\n";
+            unsafe {
+                let mut written = 0;
+                WriteFile(
+                    GetStdHandle(STD_ERROR_HANDLE),
+                    MESSAGE.as_ptr(),
+                    MESSAGE.len() as u32,
+                    &mut written,
+                    null_mut(),
+                );
+            }
             return EXCEPTION_CONTINUE_SEARCH;
         }
         EXCEPTION_CONTINUE_EXECUTION

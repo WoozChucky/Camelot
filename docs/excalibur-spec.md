@@ -293,7 +293,7 @@ Camelot uses Sv48: 128 TiB of user address space and as much for the kernel, for
 
 RAM: `--ram SIZE` takes a whole number of MiB, or a number with a unit, `M`/`MiB` or `G`/`GiB`, case-insensitive (`--ram 64`, `--ram 64M`, `--ram 16G`).
 - **Limits:** from 1 MiB to 1 TiB, the memory controller's limit. Anything else is rejected with an error. RV32: 1 to 2048 MiB, the most that fits between 0x8000_0000 and the top of the 32-bit address space.
-- **Lazy backing:** as QEMU does, Grail backs RAM lazily. It reserves the size in the host's address space and commits host memory a page at a time, the first time the guest touches the page, so a large machine costs the host only what its guest uses. A size the host cannot reserve is refused when the machine is made.
+- **Lazy backing:** as QEMU does, Grail backs RAM lazily. It reserves the size in the host's address space and commits host memory a page at a time (64 KiB at a time on Windows), the first time the guest touches the page, so a large machine costs the host only what its guest uses. A size the host cannot reserve is refused when the machine is made.
 - **Default:** without `--ram` a machine has 4 MiB, as does a VM on Avalon whose profile leaves the size at its default (`avalon_proto::DEFAULT_RAM_SIZE`, Round Table's and Pendragon's `--ram`). That is enough for Camelot booted from its root image ("Kernel filesystem", "Root image"), and for every example. Programs that need more say so with `--ram`.
 - **As a library**, Grail accepts any non-zero multiple of 4 KiB up to 1 TiB (RV32: 2 GiB).
 - **Avalon's RAM budget** counts each VM's installed size, what it may use, not what it has touched so far, so the budget stays a guarantee with lazily backed RAM.

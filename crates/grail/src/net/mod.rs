@@ -469,10 +469,16 @@ impl NetDevice {
             } else {
                 match ram_range(ram, addr, len.into()) {
                     None => status::BAD_DMA,
-                    Some(buf) => match self.backend.send(&ram[buf]) {
-                        Ok(()) => status::OK,
-                        Err(_) => status::IO,
-                    },
+                    Some(buf) => {
+                        // The backend may hand the frame to the host's kernel (a
+                        // socket's send), which cannot take a first touch of lazily
+                        // backed RAM itself.
+                        crate::ram::touch(&ram[buf.clone()]);
+                        match self.backend.send(&ram[buf]) {
+                            Ok(()) => status::OK,
+                            Err(_) => status::IO,
+                        }
+                    }
                 }
             };
             layout.write_result(&mut ram[desc], len, st as u16);
