@@ -68,6 +68,11 @@
 //!
 //!       cargo test -p merlin --test harness -- --ignored multi_file_clang
 //!
+//! * `predefined_macros_match_clang`: every macro merlin predefines (but
+//!   `__merlin__`) has the value clang's `-E -dM` gives it. Needs clang.
+//!
+//!       cargo test -p merlin --test harness -- --ignored predefined_macros
+//!
 //! * `clang_reference`: compiles every case with clang instead of merlin, links
 //!   with ld.lld and runs it in Grail. It checks the expectations and crt0
 //!   against a real C compiler (crt0's `memset` and `memcpy` are there for
@@ -1029,6 +1034,35 @@ fn assembles_like_clang(x: Xlen) {
     let far = compile(&far_branches_src(), x).unwrap();
     assert_eq!(compare("far", &far), Ok(()));
     assert_eq!(compare("big-frames", &big_frames_asm(x)), Ok(()));
+}
+
+/// Every macro merlin predefines but `__merlin__` is one clang predefines
+/// too, with the same value, for `-ffreestanding -std=c99` on each width
+/// (`clang -E -dM`). Needs clang.
+#[test]
+#[ignore = "needs clang on PATH"]
+fn predefined_macros_match_clang() {
+    for x in WIDTHS {
+        let scratch = Scratch::new(&format!("predefined-{}", width(x)));
+        let empty = scratch.path("empty.c");
+        std::fs::write(&empty, "").unwrap();
+        let out = clang(x)
+            .args(["-ffreestanding", "-std=c99", "-E", "-dM"])
+            .arg(&empty)
+            .output()
+            .expect("cannot run clang");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8(out.stdout).unwrap();
+        let clang: std::collections::HashMap<&str, &str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("#define ")?.split_once(' '))
+            .collect();
+        for (name, value) in merlin::preprocess::predefined(x) {
+            if name != "__merlin__" {
+                assert_eq!(clang.get(name), Some(&value), "{name} ({})", width(x));
+            }
+        }
+    }
 }
 
 #[test]

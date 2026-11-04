@@ -120,18 +120,70 @@ pub fn predefined(x: Xlen) -> Vec<(&'static str, &'static str)> {
         Xlen::Rv32 => macros.extend([("__riscv_xlen", "32"), ("_ILP32", "1"), ("__ILP32__", "1")]),
         Xlen::Rv64 => macros.extend([("__riscv_xlen", "64"), ("_LP64", "1"), ("__LP64__", "1")]),
     }
-    let (long, pointer) = match x {
-        Xlen::Rv32 => ("4", "4"),
-        Xlen::Rv64 => ("8", "8"),
-    };
+    // The sizes and limits of the integer types, and the types <stddef.h>
+    // and <stdint.h> are made of, spelled as clang spells them. ILP32 builds
+    // size_t, ptrdiff_t and intptr_t from int and int64_t from long long;
+    // LP64 builds all of them from long. The 8-, 16- and 32-bit types are the
+    // same on both.
     macros.extend([
         ("__CHAR_BIT__", "8"),
         ("__CHAR_UNSIGNED__", "1"),
+        ("__SIZEOF_SHORT__", "2"),
         ("__SIZEOF_INT__", "4"),
-        ("__SIZEOF_LONG__", long),
         ("__SIZEOF_LONG_LONG__", "8"),
-        ("__SIZEOF_POINTER__", pointer),
+        ("__SCHAR_MAX__", "127"),
+        ("__SHRT_MAX__", "32767"),
+        ("__INT_MAX__", "2147483647"),
+        ("__LONG_LONG_MAX__", "9223372036854775807LL"),
+        ("__INT8_TYPE__", "signed char"),
+        ("__INT16_TYPE__", "short"),
+        ("__INT32_TYPE__", "int"),
+        ("__UINT8_TYPE__", "unsigned char"),
+        ("__UINT16_TYPE__", "unsigned short"),
+        ("__UINT32_TYPE__", "unsigned int"),
+        ("__INT32_MAX__", "2147483647"),
+        ("__UINT32_MAX__", "4294967295U"),
     ]);
+    match x {
+        Xlen::Rv32 => macros.extend([
+            ("__SIZEOF_LONG__", "4"),
+            ("__SIZEOF_POINTER__", "4"),
+            ("__SIZEOF_SIZE_T__", "4"),
+            ("__SIZEOF_PTRDIFF_T__", "4"),
+            ("__LONG_MAX__", "2147483647L"),
+            ("__SIZE_TYPE__", "unsigned int"),
+            ("__PTRDIFF_TYPE__", "int"),
+            ("__INTPTR_TYPE__", "int"),
+            ("__UINTPTR_TYPE__", "unsigned int"),
+            ("__INT64_TYPE__", "long long int"),
+            ("__UINT64_TYPE__", "long long unsigned int"),
+            ("__SIZE_MAX__", "4294967295U"),
+            ("__PTRDIFF_MAX__", "2147483647"),
+            ("__INTPTR_MAX__", "2147483647"),
+            ("__UINTPTR_MAX__", "4294967295U"),
+            ("__INT64_MAX__", "9223372036854775807LL"),
+            ("__UINT64_MAX__", "18446744073709551615ULL"),
+        ]),
+        Xlen::Rv64 => macros.extend([
+            ("__SIZEOF_LONG__", "8"),
+            ("__SIZEOF_POINTER__", "8"),
+            ("__SIZEOF_SIZE_T__", "8"),
+            ("__SIZEOF_PTRDIFF_T__", "8"),
+            ("__LONG_MAX__", "9223372036854775807L"),
+            ("__SIZE_TYPE__", "long unsigned int"),
+            ("__PTRDIFF_TYPE__", "long int"),
+            ("__INTPTR_TYPE__", "long int"),
+            ("__UINTPTR_TYPE__", "long unsigned int"),
+            ("__INT64_TYPE__", "long int"),
+            ("__UINT64_TYPE__", "long unsigned int"),
+            ("__SIZE_MAX__", "18446744073709551615UL"),
+            ("__PTRDIFF_MAX__", "9223372036854775807L"),
+            ("__INTPTR_MAX__", "9223372036854775807L"),
+            ("__UINTPTR_MAX__", "18446744073709551615UL"),
+            ("__INT64_MAX__", "9223372036854775807L"),
+            ("__UINT64_MAX__", "18446744073709551615UL"),
+        ]),
+    }
     macros
 }
 
@@ -2210,6 +2262,41 @@ puts( "The first, second, and third items." );
         };
         let out = run(&[], names, &opts).unwrap();
         assert_eq!(words(&out.tokens), same("64 _ILP32 __ILP32__ 1 1 4 8 8"));
+    }
+
+    #[test]
+    fn predefined_types_and_limits() {
+        // What clang's `-E -dM` says for each width (the ignored harness test
+        // predefined_macros_match_clang checks every one against clang).
+        let names = "__SIZE_TYPE__, __PTRDIFF_TYPE__, __INTPTR_TYPE__, __UINTPTR_TYPE__, \
+                     __INT64_TYPE__, __UINT64_TYPE__, __SIZEOF_SIZE_T__, __SIZEOF_PTRDIFF_T__, \
+                     __SIZEOF_SHORT__, __CHAR_BIT__, __INT_MAX__, __LONG_MAX__, __LONG_LONG_MAX__, \
+                     __SIZE_MAX__, __UINT64_MAX__, __INT8_TYPE__, __UINT16_TYPE__";
+        let expand = |x: Xlen| {
+            let opts = Options {
+                xlen: x,
+                ..Options::default()
+            };
+            spell(&run(&[], names, &opts).unwrap().tokens)
+        };
+        assert_eq!(
+            expand(Xlen::Rv32),
+            concat!(
+                "unsigned int, int, int, unsigned int, ",
+                "long long int, long long unsigned int, 4, 4, ",
+                "2, 8, 2147483647, 2147483647L, 9223372036854775807LL, ",
+                "4294967295U, 18446744073709551615ULL, signed char, unsigned short\n",
+            )
+        );
+        assert_eq!(
+            expand(Xlen::Rv64),
+            concat!(
+                "long unsigned int, long int, long int, long unsigned int, ",
+                "long int, long unsigned int, 8, 8, ",
+                "2, 8, 2147483647, 9223372036854775807L, 9223372036854775807LL, ",
+                "18446744073709551615UL, 18446744073709551615UL, signed char, unsigned short\n",
+            )
+        );
     }
 
     #[test]
