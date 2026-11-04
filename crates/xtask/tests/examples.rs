@@ -569,9 +569,16 @@ fn multiobj_needs_both(xlen: Xlen, main_o: &str) {
 // ---------------------------------------------------------------------------
 // Against ld.lld.
 
-fn fixture(dir: &str, file: &str) -> PathBuf {
+/// `file` of the fixture directory `dir` of the `xlen` set (RV64's in
+/// `fixtures/rv64`).
+fn fixture(xlen: Xlen, dir: &str, file: &str) -> PathBuf {
+    let set = match xlen {
+        Xlen::Rv32 => xtask::ld_fixtures::RV32.dir,
+        Xlen::Rv64 => xtask::ld_fixtures::RV64.dir,
+    };
     repo_root()
-        .join("crates/merlin-ld/tests/fixtures")
+        .join(xtask::ld_fixtures::FIXTURES)
+        .join(set)
         .join(dir)
         .join(file)
 }
@@ -635,11 +642,16 @@ fn llvm_style_disassembly(name: &str, elf: &[u8]) -> String {
 
 /// Acceptance of #8: the merlin-built example against clang + ld.lld (both
 /// with relaxation off; see the reference command at the top of each source).
-fn assert_like_ld_lld(name: &str) {
+///
+/// At each width: the RV64 build against the RV64 set's link of clang's RV64
+/// objects (`fixtures/rv64`). Its disassembly is compared from #150, when
+/// merlin-objdump reads ELF64; the loaded bytes already are.
+fn assert_like_ld_lld(name: &str, xlen: Xlen) {
     let ex = example(name);
-    let ours_bytes = build(ex, Xlen::Rv32).elf;
-    let lld_bytes = std::fs::read(fixture(ex.dir, "link.lld.elf")).unwrap();
+    let ours_bytes = build(ex, xlen).elf;
+    let lld_bytes = std::fs::read(fixture(xlen, ex.dir, "link.lld.elf")).unwrap();
     let (ours, lld) = (Elf::parse(&ours_bytes).unwrap(), Elf::parse(&lld_bytes).unwrap());
+    assert_eq!(ours.class, lld.class, "{name}: class");
 
     // Everything Grail loads is the same.
     assert_eq!(ours.header.entry, lld.header.entry, "{name}: entry");
@@ -647,14 +659,16 @@ fn assert_like_ld_lld(name: &str) {
     assert_eq!(alloc_sections(&ours), alloc_sections(&lld), "{name}: sections");
 
     // The disassembly is the same text (llvm-objdump -d of ld.lld's output).
-    let want = std::fs::read_to_string(fixture(ex.dir, "link.objdump.txt"))
-        .unwrap()
-        .replace("\r\n", "\n");
-    assert_eq!(
-        llvm_style_disassembly("link.lld.elf", &ours_bytes),
-        want,
-        "{name}: disassembly"
-    );
+    if xlen == Xlen::Rv32 {
+        let want = std::fs::read_to_string(fixture(xlen, ex.dir, "link.objdump.txt"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert_eq!(
+            llvm_style_disassembly("link.lld.elf", &ours_bytes),
+            want,
+            "{name}: disassembly"
+        );
+    }
 
     // Symbols: the same names and values, except the mapping symbols.
     let (ours_syms, lld_syms) = (symbols(&ours), symbols(&lld));
@@ -677,22 +691,30 @@ fn assert_like_ld_lld(name: &str) {
 
 #[test]
 fn hello_is_like_ld_lld() {
-    assert_like_ld_lld("hello");
+    for xlen in XLENS {
+        assert_like_ld_lld("hello", xlen);
+    }
 }
 
 #[test]
 fn multiobj_is_like_ld_lld() {
-    assert_like_ld_lld("multiobj");
+    for xlen in XLENS {
+        assert_like_ld_lld("multiobj", xlen);
+    }
 }
 
 /// Bootstrapping step 1 (merlin-as output linked by ld.lld, the committed
-/// `cargo xtask hello` image) and the full chain load the same image.
+/// `cargo xtask hello` images) and the full chain load the same image, at
+/// each width.
 #[test]
 fn hello_linked_by_ld_lld_or_merlin_ld_loads_the_same() {
-    let ours = build(example("hello"), Xlen::Rv32).elf;
-    let lld = std::fs::read(repo_root().join(xtask::hello::GOLDEN)).unwrap();
-    assert_eq!(
-        xtask::hello::loaded_image(&ours).unwrap(),
-        xtask::hello::loaded_image(&lld).unwrap()
-    );
+    for xlen in XLENS {
+        let ours = build(example("hello"), xlen).elf;
+        let lld = std::fs::read(repo_root().join(xtask::hello::golden(xlen))).unwrap();
+        assert_eq!(
+            xtask::hello::loaded_image(&ours).unwrap(),
+            xtask::hello::loaded_image(&lld).unwrap(),
+            "{xlen:?}"
+        );
+    }
 }

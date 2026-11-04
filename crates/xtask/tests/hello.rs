@@ -1,30 +1,33 @@
-//! `examples/hello/hello.S` built with merlin-as (acceptance criteria of #4).
+//! `examples/hello/hello.S` built with merlin-as (acceptance criteria of #4),
+//! for RV32 and for RV64 (#151).
 //!
-//! The committed image (`crates/merlin-as/tests/golden/hello.elf`: merlin-as
-//! and ld.lld, rebuilt by `cargo xtask hello`) always runs on Grail, so this
-//! passes without LLVM. With ld.lld installed the image is rebuilt from the
-//! current merlin-as and must load the same; with clang and llvm-objdump too,
-//! `llvm-objdump -dr` of our object must equal that of clang's (`-mno-relax`).
+//! The committed images (`crates/merlin-as/tests/golden/hello.elf` and
+//! `golden/rv64/hello.elf`: merlin-as and ld.lld, rebuilt by `cargo xtask
+//! hello`) always run on Grail, so this passes without LLVM. With ld.lld
+//! installed the images are rebuilt from the current merlin-as and must load
+//! the same; with clang and llvm-objdump too, `llvm-objdump -dr` of our object
+//! must equal that of clang's (`-mno-relax`), for every example source.
 //! `crates/merlin-as/tests/encode_hello.rs` checks the object against
 //! committed clang output without LLVM.
 
 use grail::RunResult;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use xtask::hello::{self, GOLDEN, OUTPUT};
+use xtask::examples::Xlen;
+use xtask::hello::{self, golden, output};
 use xtask::{examples, kernel, repo_root, tools};
 
 const MAX_STEPS: u64 = 100_000;
 
-fn assert_prints_hello(elf: &[u8]) {
-    // hello reads nothing from the UART.
+fn assert_prints_hello(elf: &[u8], xlen: Xlen) {
+    // hello reads nothing from the UART. An ELF64 file makes the machine RV64.
     let (r, out) = kernel::run_on_grail(elf, b"", MAX_STEPS).unwrap();
-    assert_eq!(out, OUTPUT);
+    assert_eq!(out, output(xlen));
     assert_eq!(r, RunResult::Exited(0));
 }
 
-fn committed() -> Vec<u8> {
-    let path = repo_root().join(GOLDEN);
+fn committed(xlen: Xlen) -> Vec<u8> {
+    let path = repo_root().join(golden(xlen));
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
@@ -38,7 +41,16 @@ fn scratch(name: &str) -> PathBuf {
 
 #[test]
 fn committed_hello_prints_hello() {
-    assert_prints_hello(&committed());
+    for xlen in examples::XLENS {
+        let elf = committed(xlen);
+        let class = elf::Elf::parse(&elf).unwrap().class;
+        let want = match xlen {
+            Xlen::Rv32 => elf::Class::Elf32,
+            Xlen::Rv64 => elf::Class::Elf64,
+        };
+        assert_eq!(class, want, "{}", golden(xlen));
+        assert_prints_hello(&elf, xlen);
+    }
 }
 
 #[test]
@@ -47,12 +59,15 @@ fn rebuilt_hello_prints_hello_and_matches_committed() {
         eprintln!("skipped: ld.lld not found");
         return;
     };
-    let elf = hello::build(&repo_root(), &lld, &scratch("lld"), true).unwrap();
-    assert_prints_hello(&elf);
-    assert!(
-        hello::loaded_image(&elf).unwrap() == hello::loaded_image(&committed()).unwrap(),
-        "{GOLDEN} is out of date: run `cargo xtask hello` and commit it"
-    );
+    for xlen in examples::XLENS {
+        let elf = hello::build(&repo_root(), &lld, &scratch(&format!("lld-{xlen:?}")), xlen, true).unwrap();
+        assert_prints_hello(&elf, xlen);
+        assert!(
+            hello::loaded_image(&elf).unwrap() == hello::loaded_image(&committed(xlen)).unwrap(),
+            "{} is out of date: run `cargo xtask hello` and commit it",
+            golden(xlen)
+        );
+    }
 }
 
 /// `llvm-objdump -d -r` of `obj`, run inside its directory so the header

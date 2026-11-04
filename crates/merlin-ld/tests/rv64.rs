@@ -647,6 +647,34 @@ fn hello_matches_ld_lld_and_runs() {
     );
 }
 
+/// examples/multiobj's RV64 build, two clang objects (`main-rv64.S`,
+/// `print.S`): calls, pc-relative addresses and `.dword` pointers from one into
+/// the other (R_RISCV_64), `.data` written at run time and `.bss` (link.rs's
+/// twin).
+#[test]
+fn multiobj_matches_ld_lld_and_runs() {
+    for (obj, ty) in [
+        ("multiobj/main-rv64.o", "R_RISCV_CALL_PLT"),
+        ("multiobj/main-rv64.o", "R_RISCV_64"),
+        ("multiobj/main-rv64.o", "R_RISCV_PCREL_HI20"),
+        ("multiobj/print.o", "R_RISCV_PCREL_LO12_I"),
+    ] {
+        assert!(reloc_types(obj).contains_key(ty), "{obj} has no {ty}");
+    }
+    let linked = common::assert_matches_ld_lld_exit(
+        RV64,
+        "multiobj/link",
+        "Hello from two objects!\nputs lives in print.S.\n\
+         [dbg] pc=0000000080000034 a0 = 0x000000000000002f (47)\n",
+        42,
+    );
+    let l = &linked.layout;
+    assert_eq!(l.class, Class::Elf64);
+    let bss = l.section(".bss").unwrap();
+    assert_eq!(l.symbol("bytes_written"), Some(bss.addr));
+    assert!(l.symbol("puts").unwrap() > l.symbol("_start").unwrap());
+}
+
 /// Spec §10: merlin-ld does not merge SHF_MERGE strings (link.rs's twin).
 #[test]
 fn mergeable_strings_are_not_merged() {

@@ -40,7 +40,8 @@ tasks:
                --check: build in memory and report stale .elf files instead of writing
                -v: print the equivalent merlin-as/merlin-ld command lines
   hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
-               with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
+               with ld.lld into crates/merlin-as/tests/golden/hello.elf, and the same for
+               RV64 into crates/merlin-as/tests/golden/rv64/hello.elf; takes --lld and -v
   ld-fixtures  regenerate crates/merlin-ld/tests/fixtures, the RV32 set and the RV64 set in
                fixtures/rv64 (clang, ld.lld, llvm-readobj, llvm-objdump);
                takes --clang, --lld and -v like kernel
@@ -502,20 +503,25 @@ fn hello(k: KernelArgs) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let root = repo_root();
-    let work = root.join("target").join("hello");
-    let elf = match xtask::hello::build(&root, &lld, &work, k.verbose) {
-        Ok(elf) => elf,
-        Err(e) => {
-            eprintln!("xtask: {e}");
+    for xlen in examples::XLENS {
+        let work = match xlen {
+            examples::Xlen::Rv32 => root.join("target").join("hello"),
+            examples::Xlen::Rv64 => root.join("target").join("hello").join("rv64"),
+        };
+        let elf = match xtask::hello::build(&root, &lld, &work, xlen, k.verbose) {
+            Ok(elf) => elf,
+            Err(e) => {
+                eprintln!("xtask: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let out = root.join(xtask::hello::golden(xlen));
+        if let Err(e) = std::fs::write(&out, elf) {
+            eprintln!("xtask: cannot write {}: {e}", out.display());
             return ExitCode::FAILURE;
         }
-    };
-    let out = root.join(xtask::hello::GOLDEN);
-    if let Err(e) = std::fs::write(&out, elf) {
-        eprintln!("xtask: cannot write {}: {e}", out.display());
-        return ExitCode::FAILURE;
+        eprintln!("built {}", out.display());
     }
-    eprintln!("built {}", out.display());
     ExitCode::SUCCESS
 }
 

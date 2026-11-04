@@ -393,10 +393,10 @@ merlin-as and merlin-ld, runs it in Grail and compares `hello` and
 `multiobj` with ld.lld's link of clang's objects;
 `crates/merlin-ld/tests/merlin_as_programs.rs` builds
 `examples/muldiv/muldiv.S` with merlin-as and merlin-ld and runs it in Grail;
-`crates/xtask/tests/hello.rs` runs the committed merlin-as + ld.lld build of
-hello (`tests/golden/hello.elf`) in Grail and, when LLVM is installed,
-rebuilds it and compares `llvm-objdump -dr` of every example object with
-clang's;
+`crates/xtask/tests/hello.rs` runs the committed merlin-as + ld.lld builds of
+hello (`tests/golden/hello.elf`, and `golden/rv64/hello.elf` for RV64) in
+Grail and, when LLVM is installed, rebuilds them and compares
+`llvm-objdump -dr` of every example object, RV32 and RV64, with clang's;
 `crates/xtask/tests/kernel.rs` boots the kernel with `kernel/entry.s`
 assembled by merlin-as.
 
@@ -420,4 +420,5 @@ Windows); their output is committed, so `cargo test` needs none of it.
   `examples/hello/hello.S` changes.
 - `tests/debug_line/*.o` and `tests/debug_line/rv64/*.o`:
   `scripts/gen-debug-line-golden.sh`.
-- `tests/golden/hello.elf`: `cargo xtask hello` (merlin-as and ld.lld, RV32).
+- `tests/golden/hello.elf` and `golden/rv64/hello.elf`: `cargo xtask hello`
+  (merlin-as and ld.lld, both widths; LLD 23.1.4 made them).
