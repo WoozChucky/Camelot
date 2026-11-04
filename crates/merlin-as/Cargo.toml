@@ -1,6 +1,6 @@
 [package]
 name = "merlin-as"
-description = "Merlin assembler: Excalibur assembly to ELF32 relocatable objects"
+description = "Merlin assembler: Excalibur assembly (RV32 or RV64) to ELF32 or ELF64 relocatable objects"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
