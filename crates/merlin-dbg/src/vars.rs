@@ -550,7 +550,9 @@ impl Debug {
 /// A token of an expression.
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
-    Num(u64),
+    /// A number, whether a `u` suffix made it unsigned, and whether it was
+    /// written in decimal (which types it may have, C99 6.4.4.1).
+    Num(u64, bool, bool),
     Ident(String),
     Reg(String),
     Char(u8),
@@ -558,8 +560,10 @@ enum Tok {
 }
 
 fn tokens(s: &str) -> Result<Vec<Tok>> {
-    const PUNCTS: [&str; 15] = [
-        "->", "(", ")", "[", "]", ".", "*", "&", "+", "-", "/", "%", "~", "!", ",",
+    // The longer first: `->` before `-`, `<=` and `<<` before `<`.
+    const PUNCTS: [&str; 28] = [
+        "->", "==", "!=", "<=", ">=", "<<", ">>", "&&", "||", "(", ")", "[", "]", ".", "*", "&", "+", "-",
+        "/", "%", "~", "!", ",", "<", ">", "|", "^", "@",
     ];
     let b = s.as_bytes();
     let mut out = Vec::new();
@@ -582,7 +586,10 @@ fn tokens(s: &str) -> Result<Vec<Tok>> {
             } else {
                 digits.parse()
             };
-            out.push(Tok::Num(n.map_err(|_| format!("invalid number \"{text}\""))?));
+            let n = n.map_err(|_| format!("invalid number \"{text}\""))?;
+            let unsigned = text.contains(['u', 'U']);
+            let decimal = !digits.starts_with('0') || digits == "0";
+            out.push(Tok::Num(n, unsigned, decimal));
         } else if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
             let start = i;
             i += 1;
@@ -627,7 +634,7 @@ fn tokens(s: &str) -> Result<Vec<Tok>> {
 /// An expression as parsed: C's, the part a debugger needs.
 #[derive(Debug, Clone)]
 enum Expr {
-    Num(u64),
+    Num(u64, bool, bool),
     Char(u8),
     Var(String),
     Reg(String),
@@ -640,6 +647,11 @@ enum Expr {
     Not(Box<Expr>),
     Compl(Box<Expr>),
     Binary(&'static str, Box<Expr>, Box<Expr>),
+    /// `&&` (true) or `||`, which evaluate their right operand only if the left
+    /// one does not decide.
+    Logical(bool, Box<Expr>, Box<Expr>),
+    /// GDB's `x@n`: `n` objects like `x`, from where `x` is, as an array.
+    Repeat(Box<Expr>, Box<Expr>),
     /// `sizeof x`, `sizeof (type)`.
     Sizeof(Box<Expr>),
     SizeofType(String),
@@ -697,8 +709,62 @@ impl Parser<'_> {
         Some(format!("{base}{}", "*".repeat(stars)))
     }
 
+    /// The whole expression. `@` binds loosest, as in GDB (`*p@3` is `(*p)@3`),
+    /// then C's operators by their precedence.
     fn expr(&mut self) -> Result<Expr> {
-        self.additive()
+        let mut l = self.logical_or()?;
+        while self.eat("@") {
+            let r = self.logical_or()?;
+            l = Expr::Repeat(Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
+    fn logical_or(&mut self) -> Result<Expr> {
+        let mut l = self.logical_and()?;
+        while self.eat("||") {
+            let r = self.logical_and()?;
+            l = Expr::Logical(false, Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
+    fn logical_and(&mut self) -> Result<Expr> {
+        let mut l = self.binary_level(0)?;
+        while self.eat("&&") {
+            let r = self.binary_level(0)?;
+            l = Expr::Logical(true, Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
+    /// C's binary operators from `|` to the shifts, loosest first; the
+    /// additive and multiplicative ones come after.
+    fn binary_level(&mut self, level: usize) -> Result<Expr> {
+        const LEVELS: [&[&str]; 6] = [
+            &["|"],
+            &["^"],
+            &["&"],
+            &["==", "!="],
+            &["<=", ">=", "<", ">"],
+            &["<<", ">>"],
+        ];
+        if level == LEVELS.len() {
+            return self.additive();
+        }
+        let mut l = self.binary_level(level + 1)?;
+        'more: loop {
+            for &op in LEVELS[level] {
+                // `&&` and `||` are tokens of their own, so `&` and `|` here are
+                // the bitwise operators.
+                if self.eat(op) {
+                    let r = self.binary_level(level + 1)?;
+                    l = Expr::Binary(op, Box::new(l), Box::new(r));
+                    continue 'more;
+                }
+            }
+            return Ok(l);
+        }
     }
 
     fn additive(&mut self) -> Result<Expr> {
@@ -805,7 +871,7 @@ impl Parser<'_> {
         let t = self.peek().cloned();
         self.at += 1;
         match t {
-            Some(Tok::Num(n)) => Ok(Expr::Num(n)),
+            Some(Tok::Num(n, u, d)) => Ok(Expr::Num(n, u, d)),
             Some(Tok::Char(c)) => Ok(Expr::Char(c)),
             Some(Tok::Ident(n)) => Ok(Expr::Var(n)),
             Some(Tok::Reg(r)) => Ok(Expr::Reg(r)),
@@ -1051,13 +1117,37 @@ impl<T: Target> Eval<'_, T> {
 
     fn eval(&mut self, e: &Expr) -> Result<Value> {
         match e {
-            Expr::Num(n) => {
-                let ty = if *n <= i32::MAX as u64 {
-                    INT
-                } else {
-                    long(self.xlen, *n > i64::MAX as u64)
+            Expr::Num(n, unsigned, decimal) => {
+                // C's first type of these that holds it: `int`, `long` and `long
+                // long` for a decimal number, with their unsigned types after each
+                // for a hex or octal one, and only those for a `u` suffix.
+                let word = self.word();
+                let candidates = [
+                    (true, 4),
+                    (false, 4),
+                    (true, word),
+                    (false, word),
+                    (true, 8),
+                    (false, 8),
+                ];
+                let allowed = |signed: bool| {
+                    if *unsigned {
+                        !signed
+                    } else {
+                        signed || !*decimal
+                    }
                 };
-                Ok(self.int_value(ty, i128::from(*n)))
+                let fits = |&(signed, size): &(bool, u64)| {
+                    let bits = 8 * size as u32;
+                    let max = if signed {
+                        (1u128 << (bits - 1)) - 1
+                    } else {
+                        (1u128 << bits) - 1
+                    };
+                    allowed(signed) && u128::from(*n) <= max
+                };
+                let (signed, size) = candidates.iter().copied().find(|c| fits(c)).unwrap_or((false, 8));
+                Ok(self.int_value(Ty::Int { signed, size }, i128::from(*n)))
             }
             Expr::Char(c) => Ok(self.int_value(INT, i128::from(*c))),
             Expr::Var(n) => self.lookup(n),
@@ -1127,6 +1217,33 @@ impl<T: Target> Eval<'_, T> {
                 let l = self.eval(l)?;
                 let r = self.eval(r)?;
                 self.binary(op, l, r)
+            }
+            Expr::Logical(and, l, r) => {
+                let l = self.eval(l)?;
+                let l = self.decay(l)?;
+                let left = self.number(&l)? != 0;
+                if left != *and {
+                    return Ok(self.int_value(INT, i128::from(left)));
+                }
+                let r = self.eval(r)?;
+                let r = self.decay(r)?;
+                let right = self.number(&r)? != 0;
+                Ok(self.int_value(INT, i128::from(right)))
+            }
+            Expr::Repeat(l, n) => {
+                let v = self.eval(l)?;
+                let n = self.eval(n)?;
+                let n = self.number(&n)?;
+                if n <= 0 {
+                    return Err(format!("invalid number {n} of repetitions"));
+                }
+                let (Loc::Mem(a), Ty::Die(elem)) = (&v.loc, &v.ty) else {
+                    return Err("only values in memory can be extended with '@'".into());
+                };
+                Ok(Value {
+                    ty: Ty::Array(*elem, vec![Some(n as u64)]),
+                    loc: Loc::Mem(*a),
+                })
             }
             Expr::Sizeof(e) => {
                 let v = self.eval(e)?;
@@ -1263,9 +1380,27 @@ impl<T: Target> Eval<'_, T> {
                 let n = self.number(&r)?;
                 self.offset(l, -n)
             }
+            // Comparisons of pointers: their addresses.
+            ("==" | "!=" | "<" | ">" | "<=" | ">=", Shape::Ptr(_), _)
+            | ("==" | "!=" | "<" | ">" | "<=" | ">=", _, Shape::Ptr(_)) => {
+                let (x, y) = (self.number(&l)?, self.number(&r)?);
+                Ok(self.int_value(INT, i128::from(compare(op, x, y))))
+            }
+            ("<<" | ">>", _, _) => {
+                // The result has the promoted left operand's type.
+                let ty = self.promoted(&l.ty)?;
+                let x = convert(self.number(&l)?, &ty);
+                let y = self.number(&r)?;
+                let bits = 8 * self.debug.size(&ty, self.xlen).unwrap_or(4) as i128;
+                if !(0..bits).contains(&y) {
+                    return Err(format!("a shift by {y} of a {bits}-bit value"));
+                }
+                let v = if op == "<<" { x << y } else { x >> y };
+                Ok(self.int_value(ty, v))
+            }
             _ => {
                 // The usual arithmetic conversions: the wider type, unsigned if
-                // either operand of that width is.
+                // either operand of that width is; both operands converted to it.
                 let (lt, rt) = (self.promoted(&l.ty)?, self.promoted(&r.ty)?);
                 let (Ty::Int { signed: a, size: x }, Ty::Int { signed: b, size: y }) = (&lt, &rt) else {
                     unreachable!("promoted types are integers")
@@ -1278,11 +1413,17 @@ impl<T: Target> Eval<'_, T> {
                         size: *x,
                     },
                 };
-                let (x, y) = (self.number(&l)?, self.number(&r)?);
+                let (x, y) = (convert(self.number(&l)?, &ty), convert(self.number(&r)?, &ty));
                 let v = match op {
                     "+" => x + y,
                     "-" => x - y,
                     "*" => x * y,
+                    "&" => x & y,
+                    "|" => x | y,
+                    "^" => x ^ y,
+                    "==" | "!=" | "<" | ">" | "<=" | ">=" => {
+                        return Ok(self.int_value(INT, i128::from(compare(op, x, y))));
+                    }
                     _ if y == 0 => return Err("division by zero".into()),
                     "/" => x / y,
                     _ => x % y,
@@ -1518,6 +1659,27 @@ impl<T: Target> Eval<'_, T> {
     }
 }
 
+/// `x op y` for a comparison.
+fn compare(op: &str, x: i128, y: i128) -> bool {
+    match op {
+        "==" => x == y,
+        "!=" => x != y,
+        "<" => x < y,
+        ">" => x > y,
+        "<=" => x <= y,
+        _ => x >= y,
+    }
+}
+
+/// `n` converted to the integer type `ty`: cut to its size, and sign-extended
+/// if it is signed.
+fn convert(n: i128, ty: &Ty) -> i128 {
+    let Ty::Int { signed, size } = *ty else {
+        return n;
+    };
+    from_le(&n.to_le_bytes()[..size.min(16) as usize], signed)
+}
+
 /// Elements as GDB lists them: a run of [`REPEATS`] or more equal ones once, with
 /// `<repeats N times>`.
 fn repeats(items: Vec<String>) -> Vec<String> {
@@ -1699,11 +1861,37 @@ mod tests {
         assert_eq!(from_le(&[0xff], true), -1);
         assert_eq!(from_le(&[0xff], false), 255);
         assert_eq!(from_le(&[0, 0, 0, 0x80], true), i128::from(i32::MIN));
+        let t = tokens("a<=b<<c&&d").unwrap();
+        let punct = |i: usize| match &t[i] {
+            Tok::Punct(p) => *p,
+            _ => "",
+        };
+        assert_eq!((punct(1), punct(3), punct(5)), ("<=", "<<", "&&"));
+        assert_eq!(
+            convert(
+                -1,
+                &Ty::Int {
+                    signed: false,
+                    size: 4
+                }
+            ),
+            0xffff_ffff
+        );
+        assert_eq!(
+            convert(
+                0x1_0000_0005,
+                &Ty::Int {
+                    signed: true,
+                    size: 4
+                }
+            ),
+            5
+        );
         let t = tokens("p->next[2].x + 0x10 * 'a'").unwrap();
         assert_eq!(t.len(), 12);
         assert_eq!(t[0], Tok::Ident("p".into()));
         assert_eq!(t[1], Tok::Punct("->"));
-        assert_eq!(t[9], Tok::Num(16));
+        assert_eq!(t[9], Tok::Num(16, false, false));
         assert_eq!(t[11], Tok::Char(b'a'));
         assert!(tokens("a # b").is_err());
     }

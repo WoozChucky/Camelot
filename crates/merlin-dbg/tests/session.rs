@@ -718,7 +718,8 @@ fn interrupting_a_running_machine() {
     setter.join().unwrap();
     let out = String::from_utf8(out).unwrap();
     assert!(out.contains("(merlin-dbg) continue\ninterrupted\n=> 0x"), "{out}");
-    assert!(out.contains("(merlin-dbg) bt\n#0  0x"), "{out}");
+    // The innermost frame, its pc shown unless it starts a line, as in GDB.
+    assert!(out.contains("(merlin-dbg) bt\n#0  "), "{out}");
     // quit with --connect detaches: the machine runs on, and the stub waits for the
     // next client. Kill it through one.
     let mut remote = merlin_dbg::remote::Remote::connect(addr).unwrap();
@@ -1277,6 +1278,11 @@ fn variables_and_types() {
         "print depth",
         "frame 0",
         "print nope",
+        "print *nodes@2",
+        "print depth == 2 && list->next == 0",
+        "print counter << 2 | 1",
+        "print -1 < 0u",
+        "print list->value > 25 || nope",
     ];
     for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
         let elf = program(VARS_DIR, "vars.c", xlen, &format!("vars-{}", xlen.bits()));
@@ -1379,6 +1385,24 @@ fn variables_and_types() {
         assert_eq!(r[37], "$20 = 0");
         assert!(r[38].starts_with("#0  walk (list="), "{out}");
         assert_eq!(r[39], "error: no symbol \"nope\" in current context");
+        // GDB's `@`, and C's comparisons, logical operators (the right one not
+        // evaluated when the left decides), shifts and bitwise operators, with
+        // C's conversions: -1 is not below 0u.
+        assert_eq!(
+            r[40..45],
+            [
+                format!(
+                    "$21 = {{{{value = 10, next = {}}}, {{value = 20, next = {}}}}}",
+                    node(1),
+                    node(2)
+                ),
+                "$22 = 1".to_string(),
+                "$23 = 13".to_string(),
+                "$24 = 0".to_string(),
+                "$25 = 1".to_string(),
+            ],
+            "{out}"
+        );
         // area's struct arguments: `...` in a backtrace, as GDB's frame-arguments
         // scalars, and in full in info args.
         assert_lines(
@@ -1391,7 +1415,7 @@ fn variables_and_types() {
                 "(merlin-dbg) info args",
                 "a = {x = 1, y = 2}",
                 "b = {x = 30, y = 40}",
-                "$21 = 29",
+                "$26 = 29",
             ],
         );
         assert!(out.contains(&format!(" in main () {}\n", at(area_call))), "{out}");
