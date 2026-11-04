@@ -62,7 +62,8 @@ for the Camelot kernel (spec section 7, \"Boot from disk\").
   --fb            show the framebuffer in a window (Windows only)
   --headless      no window, even with --fb (the default)
   --fb-dump DIR   write DIR/frame-NNNN.ppm on every new frame (FB_PRESENT, a mode
-                  change, a page flip) and at exit
+                  change, a page flip), on every change of the cursor (moved, shown,
+                  hidden or a new image) and at exit
   --gdb ADDR      run under a GDB remote stub listening on ADDR, for GDB, LLDB or
                   merlin-dbg (docs/merlin-dbg.md): HOST:PORT, a host (port 1234) or
                   a port (on 127.0.0.1). The machine runs and a client that connects

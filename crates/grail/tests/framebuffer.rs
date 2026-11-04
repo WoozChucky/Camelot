@@ -253,6 +253,49 @@ fn run_for_stops_only_at_a_present_of_its_own() {
     assert!(m.cpu.bus.fb.take_present(), "still pending for the host");
 }
 
+/// A cursor image redrawn in place shows when the program writes `FB_CURSOR_ADDR`
+/// again, with the address it holds (spec 9.3, as a write of Intel's CURBASE): the
+/// vertical blank that takes the write ends `run_for`'s slice and tells the host (which
+/// redraws its window and dumps the picture), and a redraw without it does neither. A
+/// new hotspot alone changes no pixel, and is no change either.
+#[test]
+fn run_for_stops_at_a_cursor_image_written_again() {
+    use grail::bus::{FB_CTRL_BASE, RAM_BASE};
+    use grail::framebuffer::{REG_CTRL, REG_CURSOR_ADDR, REG_CURSOR_CTRL, REG_CURSOR_HOT};
+    let mut m = Machine::with_ram(1 << 20);
+    // `j .`: the program does nothing; the test writes the registers, as it would.
+    m.cpu.bus.load(RAM_BASE, &0x0000_006f_u32.to_le_bytes()).unwrap();
+    m.cpu.pc = RAM_BASE;
+    let image = RAM_BASE + 0x4000;
+    let reg = |m: &mut Machine, off: u32, size: u32, val: u64| {
+        m.cpu.bus.write(FB_CTRL_BASE + u64::from(off), size, val).unwrap();
+    };
+    let first_pixel = |m: &Machine| m.cpu.bus.frame().cursor.map(|c| c.pixels[..4].to_vec());
+    reg(&mut m, REG_CTRL, 4, 1);
+    reg(&mut m, REG_CURSOR_ADDR, 8, image);
+    reg(&mut m, REG_CURSOR_CTRL, 4, 1);
+    // Bounded budgets, each several frames long: a regression must fail, not hang.
+    const BUDGET: u64 = 2_000_000;
+    assert!(m.run_for(BUDGET, &mut |_| {}) < BUDGET, "the cursor shows");
+    assert!(m.cpu.bus.fb.take_cursor_update());
+    assert_eq!(first_pixel(&m), Some(vec![0; 4]));
+
+    // Redrawn in place: the host reads the new pixels when it draws, but nothing tells it.
+    m.cpu.bus.load(image, &[0xff; 4]).unwrap();
+    assert_eq!(m.run_for(BUDGET, &mut |_| {}), BUDGET);
+    assert!(!m.cpu.bus.fb.take_cursor_update());
+    reg(&mut m, REG_CURSOR_HOT, 4, 3);
+    assert_eq!(m.run_for(BUDGET, &mut |_| {}), BUDGET, "a hotspot alone");
+    assert!(!m.cpu.bus.fb.take_cursor_update());
+    // Written again, the same address: the next vertical blank takes it as a new image.
+    let updates = m.cpu.bus.fb.cursor_updates;
+    reg(&mut m, REG_CURSOR_ADDR, 8, image);
+    assert!(m.run_for(BUDGET, &mut |_| {}) < BUDGET);
+    assert!(m.cpu.bus.fb.take_cursor_update());
+    assert_eq!(m.cpu.bus.fb.cursor_updates, updates + 1);
+    assert_eq!(first_pixel(&m), Some(vec![0xff; 4]));
+}
+
 /// Runs one load or store with `a0` = `addr` and `a1` = 0x0000_0101 at
 /// RAM_BASE; returns the machine and, if it trapped, (mcause, mtval).
 fn one_access(inst: u32, addr: u64) -> (Machine, Option<(u64, u64)>) {

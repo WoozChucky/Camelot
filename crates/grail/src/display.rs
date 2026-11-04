@@ -5,7 +5,8 @@
 //! a process-wide singleton: each machine can have its own. The CPU runs until the
 //! program shows a new frame (writes `FB_PRESENT`, makes a modeset that takes effect, or
 //! a page flip takes effect at a vertical blank), a vertical blank moves, shows or hides
-//! the cursor, or a slice of `SLICE` steps is done (or, with a real-time clock, until it
+//! the cursor or gives it an image (takes a write of `FB_CURSOR_ADDR`, even of the
+//! address it had: an image redrawn in place), or a slice of `SLICE` steps is done (or, with a real-time clock, until it
 //! is ahead of the wall clock); then the window's messages are pumped and it is redrawn
 //! on any of these, on a repaint request, or when ~16 ms of host time have passed since
 //! the last redraw (~60 Hz). The window shows what the framebuffer scans out, VRAM or a
@@ -29,7 +30,8 @@ pub struct DisplayOptions {
     /// Open a window showing the framebuffer. Ignored where `WINDOW_SUPPORTED` is false.
     pub window: bool,
     /// Write `frame-NNNN.ppm` here on every new frame shown (`FB_PRESENT`, a modeset, a
-    /// page flip taking effect) and once at exit.
+    /// page flip taking effect), on every vertical blank that changes the cursor (moves,
+    /// shows or hides it, or gives it an image) and once at exit.
     pub dump_dir: Option<PathBuf>,
     /// Window title.
     pub title: String,

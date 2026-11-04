@@ -864,7 +864,7 @@ impl Vm {
             // `run_for` ends a slice early once the guest has shown a new frame (written
             // FB_PRESENT, made a modeset that took effect, or a page flip took effect at a
             // vertical blank), and once a vertical blank has changed the cursor (moved,
-            // shown or hidden it, or taken a new image or hotspot). A present also waits
+            // shown or hidden it, or given it an image). A present also waits
             // for the host to take it: take it, so that `present_pending` does not say a
             // frame is waiting when none is.
             // The screen goes out at the pace of `look`, not on presents: viewers see

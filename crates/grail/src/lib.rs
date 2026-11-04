@@ -257,8 +257,10 @@ impl Machine {
     /// wrote `FB_PRESENT`, made a modeset that took effect (a write to `FB_MODE` the
     /// display refused shows nothing new), or whose vertical blank made a page flip take
     /// effect ([`framebuffer::Framebuffer::shown`]); and at the end of a step whose
-    /// vertical blank moved, showed or hid the cursor, which changes the picture without a
-    /// new frame ([`framebuffer::Framebuffer::changes`]). Only a change during this call
+    /// vertical blank moved, showed or hid the cursor or gave it an image (took a write of
+    /// `FB_CURSOR_ADDR`, even of the address it had: an image redrawn in place), which
+    /// changes the picture without a new frame ([`framebuffer::Framebuffer::changes`]); a
+    /// new hotspot alone does not, since the display does not use it. Only a change during this call
     /// counts: a present the host has not taken yet
     /// ([`framebuffer::Framebuffer::take_present`]) does not stop the next call.
     ///

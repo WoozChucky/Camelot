@@ -17,7 +17,8 @@
 //!   image in RAM, premultiplied, which the host blends over the frame where the guest
 //!   puts it, so that moving the pointer redraws nothing. Its registers are
 //!   double-buffered: what the guest writes takes effect at the next vertical blank, as a
-//!   flip does.
+//!   flip does. A write of `FB_CURSOR_ADDR`, even of the address it holds, is a new image
+//!   (as a write of Intel's `CURBASE` is), so an image redrawn in place is shown again.
 //!
 //! The vertical blank is guest time: [`Framebuffer::advance`] counts the machine's ticks
 //! (one per step, as `mtime`), and a frame is a sixtieth of a second of them
@@ -389,11 +390,16 @@ pub struct Framebuffer {
     cursor_hot: u32,
     /// A cursor register was written since the last vertical blank (`FB_STATUS` bit 3).
     cursor_armed: bool,
+    /// `FB_CURSOR_ADDR` was written since the last vertical blank, of any value: the
+    /// image is new, a new one or the old one redrawn in place.
+    cursor_image_written: bool,
     /// The cursor the display shows, as the last vertical blank that took the registers
     /// latched it.
     cursor: CursorState,
     /// How many vertical blanks changed the cursor shown (`cursor`): it moved, appeared,
-    /// went, or took another image or hotspot.
+    /// went, or took an image (a write of `FB_CURSOR_ADDR`, of a new address or of the
+    /// same one). A new hotspot alone is none: the display does not use it, so the picture
+    /// is the same.
     pub cursor_updates: u64,
     /// Set when a vertical blank changes the cursor shown; cleared by the host with
     /// `take_cursor_update`.
@@ -438,6 +444,7 @@ impl Framebuffer {
             cursor_pos: 0,
             cursor_hot: 0,
             cursor_armed: false,
+            cursor_image_written: false,
             cursor: CursorState::default(),
             cursor_updates: 0,
             cursor_update: false,
@@ -582,9 +589,13 @@ impl Framebuffer {
                 self.cursor_ctrl = word & CURSOR_CTRL_ENABLE;
                 self.cursor_armed = true;
             }
+            // A write of the address, even of the one it holds, is a new image: a
+            // program that redraws its cursor in place writes it again to show it, as
+            // one writes Intel's CURBASE.
             Reg::CursorAddr => {
                 self.cursor_addr = access.merge(self.cursor_addr, val);
                 self.cursor_armed = true;
+                self.cursor_image_written = true;
             }
             Reg::CursorPos => {
                 self.cursor_pos = word;
@@ -708,10 +719,13 @@ impl Framebuffer {
             hot_x: self.cursor_hot & 0xffff,
             hot_y: self.cursor_hot >> 16,
         };
-        // What a hidden cursor holds does not show: hiding or keeping it hidden is
-        // one change at most.
-        let shown = |c: CursorState| c.on.then_some(c);
-        if shown(next) != shown(self.cursor) {
+        // What the picture shows of the cursor: whether it is on and where; and, while it
+        // is on, its image, new at each write of FB_CURSOR_ADDR. What a hidden cursor
+        // holds does not show (hiding or keeping it hidden is one change at most), nor
+        // does the hotspot, which the display does not use.
+        let image = std::mem::take(&mut self.cursor_image_written);
+        let shown = |c: CursorState| c.on.then_some((c.x, c.y));
+        if shown(next) != shown(self.cursor) || (next.on && image) {
             self.cursor_updates += 1;
             self.cursor_update = true;
         }
@@ -742,7 +756,8 @@ impl Framebuffer {
     /// What the display shows now: VRAM, or a buffer in `ram` (all of RAM, from
     /// `RAM_BASE`), and the cursor's image in `ram` over it. The image is read as it is
     /// now, as the frame is: a program that changes the cursor's look draws the new one
-    /// into another image and points `FB_CURSOR_ADDR` at it.
+    /// into another image and points `FB_CURSOR_ADDR` at it, or redraws it in place and
+    /// writes `FB_CURSOR_ADDR` again, so that the vertical blank counts the change.
     pub fn frame<'a>(&'a self, ram: &'a [u8]) -> Frame<'a> {
         let mode = self.mode();
         let len = mode.frame_size() as usize;
@@ -800,7 +815,8 @@ impl Framebuffer {
 
     /// How many times what the display shows changed by the program's doing: the new
     /// frames of [`Framebuffer::shown`], and the vertical blanks that moved, showed or
-    /// hid the cursor, which change the picture without a new frame.
+    /// hid the cursor or gave it an image (`cursor_updates`), which change the picture
+    /// without a new frame.
     /// [`crate::Machine::run_for`] stops when it changes.
     pub fn changes(&self) -> u64 {
         self.shown() + self.cursor_updates
@@ -1390,6 +1406,36 @@ mod tests {
         w(&mut fb, REG_CURSOR_POS, pos(7, 7));
         fb.advance(1000);
         assert_eq!((fb.cursor().x, fb.cursor_updates), (7, 5));
+        assert!(fb.take_cursor_update());
+        // A write of the address it holds is a new image (one redrawn in place), at the
+        // blank, as a write of Intel's CURBASE is; on RV32, written by halves, it is one.
+        fb.write(REG_CURSOR_ADDR, 8, image, RAM).unwrap();
+        fb.advance(99);
+        assert_eq!(fb.cursor_updates, 5, "not yet");
+        fb.advance(1);
+        assert!(fb.take_cursor_update());
+        assert_eq!((fb.cursor().addr, fb.cursor_updates, fb.changes()), (image, 6, 6));
+        fb.write(REG_CURSOR_ADDR, 4, image & 0xffff_ffff, RAM).unwrap();
+        fb.write(REG_CURSOR_ADDR + 4, 4, image >> 32, RAM).unwrap();
+        fb.advance(100);
+        assert_eq!(fb.cursor_updates, 7);
+        // The hotspot alone changes nothing the display shows: taken, and no change.
+        w(&mut fb, REG_CURSOR_HOT, 9 | 1 << 16);
+        fb.advance(100);
+        assert_eq!((fb.cursor().hot_x, fb.cursor().hot_y), (9, 1));
+        assert_eq!(fb.cursor_updates, 7);
+        // An image for a hidden cursor shows nothing; showing it again is one change.
+        w(&mut fb, REG_CURSOR_CTRL, 0);
+        fb.advance(100);
+        assert_eq!(fb.cursor_updates, 8);
+        fb.write(REG_CURSOR_ADDR, 8, image, RAM).unwrap();
+        fb.advance(100);
+        assert_eq!(fb.cursor_updates, 8);
+        w(&mut fb, REG_CURSOR_CTRL, 1);
+        fb.write(REG_CURSOR_ADDR, 8, image, RAM).unwrap();
+        fb.advance(100);
+        assert_eq!(fb.cursor_updates, 9);
+        assert!(fb.take_cursor_update());
         // A modeset keeps the cursor where it is, as a CRTC keeps its cursor plane.
         fb.write(REG_SCANOUT, 8, RAM_BASE + 0x10_0000, RAM).unwrap();
         w(&mut fb, REG_MODE, 1);
