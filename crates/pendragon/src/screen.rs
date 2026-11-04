@@ -43,7 +43,7 @@ use grail::keyboard::{code, usage};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The subprotocol the page asks for (`Sec-WebSocket-Protocol`), and Pendragon
@@ -799,11 +799,23 @@ fn serve(
     ws.set_read_timeout(Some(POLL))?;
     shared.page.text(&screen_json(vm, width, height))?;
     shared.page.text(&state_json(state))?;
+    // The pump says it has ended by dropping its end of this channel, which it does
+    // however it ends (a panic too): the receiver then sees it disconnected.
+    let (pump_alive, pump_ended) = mpsc::channel::<()>();
     let pump = {
         let shared = Arc::clone(&shared);
         std::thread::Builder::new()
             .name(format!("screen-{vm}"))
-            .spawn(move || pump(conn, &shared, state))?
+            .spawn(move || {
+                let _alive = pump_alive;
+                pump(conn, &shared, state)
+            })?
+    };
+    let pump_done = |wait: Duration| {
+        matches!(
+            pump_ended.recv_timeout(wait),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        )
     };
 
     // From here on nothing returns early: the pump must be stopped and joined.
@@ -904,13 +916,10 @@ fn serve(
     if !shared.ended.load(Ordering::SeqCst) {
         shared.detaching.store(true, Ordering::SeqCst);
         let _ = to_avalon.send(&Message::ScreenDetach { vm });
-        let deadline = Instant::now() + DETACH_WAIT;
-        while !pump.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        pump_done(DETACH_WAIT);
     }
     let _ = avalon_socket.shutdown(Shutdown::Both);
-    if !pump.is_finished() {
+    if !pump_done(Duration::ZERO) {
         // Stuck writing a frame to a page that reads no more.
         let _ = ws.shutdown(Shutdown::Both);
     }
