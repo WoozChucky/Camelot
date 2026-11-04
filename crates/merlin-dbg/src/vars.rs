@@ -27,7 +27,7 @@
 //! Types are written as C declares them (`Node *`, `int [3]`, `int (*)(int)`).
 
 use crate::symbols::Symbols;
-use elf::dies::{dw, Die, InfoUnit};
+use elf::dies::{dw, Attr, Die, InfoUnit};
 use excalibur::Xlen;
 
 type Result<T> = std::result::Result<T, String>;
@@ -72,6 +72,9 @@ pub struct Debug {
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub pc: u64,
+    /// The frame's own pc, `$pc`: where it is stopped, or for a caller where its
+    /// call returns to.
+    pub at: u64,
     pub regs: [Option<u64>; 32],
 }
 
@@ -88,9 +91,30 @@ pub enum Ty {
     Array(Option<DieRef>, Vec<Option<u64>>),
     /// A pointer to the type.
     Ptr(Box<Ty>),
-    /// An integer of `size` bytes: `int`, or `long` (4 or 8 bytes) for a result
-    /// as wide as an address.
-    Int { signed: bool, size: u64 },
+    /// One of C's integer types, as an expression makes it (`int`, `unsigned
+    /// long` of a `sizeof`, `long` of a difference of pointers) or a cast or
+    /// `sizeof` names it when the program describes no such type: its name as
+    /// GDB writes it, its size, and whether it is signed.
+    Int {
+        name: &'static str,
+        size: u64,
+        signed: bool,
+    },
+    /// `void ()`, a function of unknown parameters: what `$pc` and `$ra` point
+    /// to, as GDB has them (`void (*)()`).
+    Code,
+}
+
+/// C's integer conversion ranks (C99 6.3.1.1), for the integer promotions and
+/// the usual arithmetic conversions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    Bool,
+    Char,
+    Short,
+    Int,
+    Long,
+    LongLong,
 }
 
 /// What a type is, once typedefs, `const` and `volatile` are seen through.
@@ -105,12 +129,14 @@ enum Shape {
         chr: bool,
         boolean: bool,
     },
-    Enum(DieRef, u64),
+    /// An enum: its entry, its size, and whether its values are signed.
+    Enum(DieRef, u64, bool),
     Ptr(Ty),
     /// An array of the element type, with its count (none: unknown).
     Array(Ty, Option<u64>),
     Record(DieRef),
-    Func(DieRef),
+    /// A function's type (none: [`Ty::Code`]).
+    Func(Option<DieRef>),
 }
 
 /// Where a value is.
@@ -243,9 +269,22 @@ impl Debug {
     }
 
     /// A type named as C names it: `struct node`, `union word`, `enum color`, a
-    /// typedef name or a base type.
-    pub fn type_named(&self, name: &str) -> Option<Ty> {
+    /// typedef name or a base type. An integer type may be spelled any way C
+    /// allows (`unsigned`, `long int`, `long unsigned`), and is C's own (as
+    /// GDB knows them) if the program describes none of that name.
+    pub fn type_named(&self, name: &str, xlen: Xlen) -> Option<Ty> {
         let name = name.trim();
+        let words: Vec<&str> = name.split_whitespace().collect();
+        if let Some((canonical, size, signed)) = c_integer(&words, xlen) {
+            return self.described(&[dw::TAG_BASE_TYPE], canonical).or(Some(Ty::Int {
+                name: canonical,
+                size,
+                signed,
+            }));
+        }
+        if name == "void" {
+            return Some(Ty::Die(None));
+        }
         let (tags, bare): (&[u64], &str) = if let Some(n) = name.strip_prefix("struct ") {
             (&[dw::TAG_STRUCTURE_TYPE], n.trim())
         } else if let Some(n) = name.strip_prefix("union ") {
@@ -255,6 +294,11 @@ impl Debug {
         } else {
             (&[dw::TAG_TYPEDEF, dw::TAG_BASE_TYPE], name)
         };
+        self.described(tags, bare)
+    }
+
+    /// The type of one of `tags` named `bare`, as the program describes it.
+    fn described(&self, tags: &[u64], bare: &str) -> Option<Ty> {
         // A definition wins over a declaration (an incomplete struct).
         let found: Vec<DieRef> = self
             .all()
@@ -308,12 +352,13 @@ impl Debug {
 
     fn shape(&self, t: &Ty) -> Shape {
         match t {
-            Ty::Int { signed, size } => Shape::Int {
+            Ty::Int { name, size, signed } => Shape::Int {
                 size: *size,
                 signed: *signed,
-                chr: false,
-                boolean: false,
+                chr: name.contains("char"),
+                boolean: *name == "_Bool",
             },
+            Ty::Code => Shape::Func(None),
             Ty::Ptr(to) => Shape::Ptr((**to).clone()),
             Ty::Array(elem, dims) => self.array_shape(*elem, dims),
             Ty::Die(t) => {
@@ -331,17 +376,64 @@ impl Debug {
                             boolean: enc == dw::ATE_BOOLEAN,
                         }
                     }
-                    dw::TAG_ENUMERATION_TYPE => Shape::Enum(r, d.unsigned(dw::AT_BYTE_SIZE).unwrap_or(4)),
+                    dw::TAG_ENUMERATION_TYPE => {
+                        Shape::Enum(r, d.unsigned(dw::AT_BYTE_SIZE).unwrap_or(4), self.enum_signed(r))
+                    }
                     dw::TAG_POINTER_TYPE => Shape::Ptr(Ty::Die(self.type_of(r))),
                     dw::TAG_ARRAY_TYPE => {
                         let (elem, dims) = self.dims(r);
                         self.array_shape(elem, &dims)
                     }
                     dw::TAG_STRUCTURE_TYPE | dw::TAG_UNION_TYPE => Shape::Record(r),
-                    dw::TAG_SUBROUTINE_TYPE | dw::TAG_SUBPROGRAM => Shape::Func(r),
+                    dw::TAG_SUBROUTINE_TYPE | dw::TAG_SUBPROGRAM => Shape::Func(Some(r)),
                     _ => Shape::Void,
                 }
             }
+        }
+    }
+
+    /// Whether an enum's values are signed: as its integer type is (merlin's and
+    /// clang's say, `int` or `unsigned int`), or without one, if a constant is
+    /// negative.
+    fn enum_signed(&self, r: DieRef) -> bool {
+        if let Some(t) = self.type_of(r) {
+            if let Shape::Int { signed, .. } = self.shape(&Ty::Die(Some(t))) {
+                return signed;
+            }
+        }
+        self.children(r).any(|c| {
+            let d = self.die(c);
+            d.tag == dw::TAG_ENUMERATOR
+                && matches!(d.attr(dw::AT_CONST_VALUE), Some(Attr::Signed(v)) if *v < 0)
+        })
+    }
+
+    /// The rank of an integer type: by its C name (`unsigned long`, `long long
+    /// int`), else by its size.
+    fn rank(&self, t: &Ty, xlen: Xlen) -> Rank {
+        let name = match t {
+            Ty::Int { name, .. } => Some(*name),
+            Ty::Die(t) => self.strip(*t).and_then(|r| {
+                let d = self.die(r);
+                (d.tag == dw::TAG_BASE_TYPE).then(|| d.name()).flatten()
+            }),
+            _ => None,
+        };
+        let size = self.size(t, xlen).unwrap_or(4);
+        match name {
+            Some(n) if n.contains("_Bool") || n == "bool" => Rank::Bool,
+            Some(n) if n.contains("char") => Rank::Char,
+            Some(n) if n.contains("short") => Rank::Short,
+            Some(n) if n.contains("long long") => Rank::LongLong,
+            Some(n) if n.contains("long") => Rank::Long,
+            Some(n) if n.contains("int") || n == "unsigned" || n == "signed" => Rank::Int,
+            _ => match size {
+                1 => Rank::Char,
+                2 => Rank::Short,
+                4 => Rank::Int,
+                _ if u64::from(xlen.bits() / 8) == size => Rank::Long,
+                _ => Rank::LongLong,
+            },
         }
     }
 
@@ -355,13 +447,21 @@ impl Debug {
     }
 
     /// The size of a type in bytes (none: unknown, as of `void` or an incomplete
-    /// struct).
+    /// struct, or past [`DEPTH`] arrays, an array of itself in broken
+    /// information).
     fn size(&self, t: &Ty, xlen: Xlen) -> Option<u64> {
+        self.size_at(t, xlen, 0)
+    }
+
+    fn size_at(&self, t: &Ty, xlen: Xlen, depth: usize) -> Option<u64> {
+        if depth > DEPTH {
+            return None;
+        }
         match self.shape(t) {
             Shape::Void | Shape::Func(_) => None,
-            Shape::Int { size, .. } | Shape::Enum(_, size) => Some(size),
+            Shape::Int { size, .. } | Shape::Enum(_, size, _) => Some(size),
             Shape::Ptr(_) => Some(u64::from(xlen.bits() / 8)),
-            Shape::Array(elem, n) => Some(self.size(&elem, xlen)? * n?),
+            Shape::Array(elem, n) => self.size_at(&elem, xlen, depth + 1)?.checked_mul(n?),
             Shape::Record(r) => self.die(r).unsigned(dw::AT_BYTE_SIZE),
         }
     }
@@ -369,6 +469,14 @@ impl Debug {
     /// The type as C declares something of it named `inner` (empty: the type's
     /// own name, as GDB writes it: `Node *`, `int [3]`, `int (*)(int)`).
     pub fn declare(&self, t: &Ty, inner: &str) -> String {
+        self.declare_at(t, inner, 0)
+    }
+
+    /// [`Debug::declare`], `depth` types down from the one declared: past
+    /// [`DEPTH`] (a pointer to itself in broken information), `?`.
+    fn declare_at(&self, t: &Ty, inner: &str, depth: usize) -> String {
+        let depth = depth + 1;
+        let declare = |t: &Ty, inner: &str| self.declare_at(t, inner, depth);
         let join = |base: &str, inner: &str| {
             if inner.is_empty() {
                 base.to_string()
@@ -388,18 +496,14 @@ impl Debug {
                 .map(|n| n.map_or("[]".to_string(), |n| format!("[{n}]")))
                 .collect()
         };
+        if depth > DEPTH {
+            return join("?", inner);
+        }
         match t {
-            Ty::Int { signed, size } => {
-                let name = match (signed, size) {
-                    (true, 4) => "int",
-                    (false, 4) => "unsigned int",
-                    (true, _) => "long",
-                    (false, _) => "unsigned long",
-                };
-                join(name, inner)
-            }
-            Ty::Ptr(to) => self.declare(to, &format!("*{inner}")),
-            Ty::Array(elem, d) => self.declare(&Ty::Die(*elem), &format!("{}{}", paren(inner), dims(d))),
+            Ty::Int { name, .. } => join(name, inner),
+            Ty::Code => join("void", &format!("{}()", paren(inner))),
+            Ty::Ptr(to) => declare(to, &format!("*{inner}")),
+            Ty::Array(elem, d) => declare(&Ty::Die(*elem), &format!("{}{}", paren(inner), dims(d))),
             Ty::Die(None) => join("void", inner),
             Ty::Die(Some(r)) => {
                 let d = self.die(r.to_owned());
@@ -414,7 +518,7 @@ impl Debug {
                     dw::TAG_STRUCTURE_TYPE => join(&named("struct"), inner),
                     dw::TAG_UNION_TYPE => join(&named("union"), inner),
                     dw::TAG_ENUMERATION_TYPE => join(&named("enum"), inner),
-                    dw::TAG_POINTER_TYPE => self.declare(&Ty::Die(self.type_of(*r)), &format!("*{inner}")),
+                    dw::TAG_POINTER_TYPE => declare(&Ty::Die(self.type_of(*r)), &format!("*{inner}")),
                     dw::TAG_CONST_TYPE | dw::TAG_VOLATILE_TYPE => {
                         let q = if d.tag == dw::TAG_CONST_TYPE {
                             "const"
@@ -426,20 +530,20 @@ impl Debug {
                         match of.map(|o| self.die(o).tag) {
                             Some(dw::TAG_POINTER_TYPE) => {
                                 let target = self.type_of(of.unwrap());
-                                self.declare(&Ty::Die(target), &format!("* {}", join(q, inner)))
+                                declare(&Ty::Die(target), &format!("* {}", join(q, inner)))
                             }
-                            _ => format!("{q} {}", self.declare(&Ty::Die(of), inner)),
+                            _ => format!("{q} {}", declare(&Ty::Die(of), inner)),
                         }
                     }
                     dw::TAG_ARRAY_TYPE => {
                         let (elem, d) = self.dims(*r);
-                        self.declare(&Ty::Die(elem), &format!("{}{}", paren(inner), dims(&d)))
+                        declare(&Ty::Die(elem), &format!("{}{}", paren(inner), dims(&d)))
                     }
                     dw::TAG_SUBROUTINE_TYPE | dw::TAG_SUBPROGRAM => {
                         let mut params: Vec<String> = self
                             .children(*r)
                             .filter_map(|c| match self.die(c).tag {
-                                dw::TAG_FORMAL_PARAMETER => Some(self.declare(&Ty::Die(self.type_of(c)), "")),
+                                dw::TAG_FORMAL_PARAMETER => Some(declare(&Ty::Die(self.type_of(c)), "")),
                                 dw::TAG_UNSPECIFIED_PARAMETERS => Some("...".to_string()),
                                 _ => None,
                             })
@@ -448,7 +552,7 @@ impl Debug {
                             params.push("void".into());
                         }
                         let ret = Ty::Die(self.type_of(*r));
-                        self.declare(&ret, &format!("{}({})", paren(inner), params.join(", ")))
+                        declare(&ret, &format!("{}({})", paren(inner), params.join(", ")))
                     }
                     _ => join("?", inner),
                 }
@@ -458,20 +562,32 @@ impl Debug {
 
     /// `ptype`: the type, with the members of a struct or union (or the
     /// constants of an enum) it is, points to or is an array of, as GDB's
-    /// `ptype` shows them; typedefs seen through.
+    /// `ptype` shows them; typedefs seen through. A member of an anonymous
+    /// struct, union or enum type shows its body too, indented, as GDB does.
     pub fn ptype(&self, t: &Ty) -> String {
         // A typedef name stands for its type (`ptype Node` is the struct).
         let mut base = t.clone();
-        while let Ty::Die(Some(r)) = base {
-            if self.die(r).tag != dw::TAG_TYPEDEF {
-                break;
+        for _ in 0..DEPTH {
+            match base {
+                Ty::Die(Some(r)) if self.die(r).tag == dw::TAG_TYPEDEF => base = Ty::Die(self.type_of(r)),
+                _ => break,
             }
-            base = Ty::Die(self.type_of(r));
         }
-        let t = &base;
-        // The struct, union or enum at the bottom of the declarator.
+        let bottom = self.bottom(&base);
+        match bottom.clone() {
+            Ty::Die(Some(r)) => match self.strip(Some(r)) {
+                Some(r) => self.expand(&base, "", &bottom, r, 0),
+                None => self.declare(&base, ""),
+            },
+            _ => self.declare(&base, ""),
+        }
+    }
+
+    /// The type at the bottom of `t`'s declarator: what it points to or is an
+    /// array of, through `const` and `volatile` (as far as [`DEPTH`] types).
+    fn bottom(&self, t: &Ty) -> Ty {
         let mut bottom = t.clone();
-        loop {
+        for _ in 0..DEPTH {
             bottom = match &bottom {
                 Ty::Ptr(to) => (**to).clone(),
                 Ty::Array(e, _) => Ty::Die(*e),
@@ -485,23 +601,43 @@ impl Debug {
                 _ => break,
             };
         }
-        // As the declarator names it (a typedef, say), and what that stands for.
-        let named = bottom.clone();
-        let Ty::Die(Some(r)) = bottom else {
-            return self.declare(t, "");
-        };
-        let Some(r) = self.strip(Some(r)) else {
-            return self.declare(t, "");
-        };
+        bottom
+    }
+
+    /// `t` declared as `inner`, with the body of `r` (the struct, union or enum
+    /// that `bottom`, the bottom of `t`'s declarator, is or names) where
+    /// `bottom` is spelled, its lines indented by `indent` spaces more.
+    fn expand(&self, t: &Ty, inner: &str, bottom: &Ty, r: DieRef, indent: usize) -> String {
         let d = self.die(r);
+        let pad = " ".repeat(indent);
         let body = match d.tag {
-            dw::TAG_STRUCTURE_TYPE | dw::TAG_UNION_TYPE if !d.flag(dw::AT_DECLARATION) => {
+            dw::TAG_STRUCTURE_TYPE | dw::TAG_UNION_TYPE
+                if !d.flag(dw::AT_DECLARATION) && indent < 4 * DEPTH =>
+            {
                 let mut s = String::from("{\n");
                 for m in self.children(r).filter(|&c| self.die(c).tag == dw::TAG_MEMBER) {
                     let name = self.die(m).name().unwrap_or("");
-                    s += &format!("    {};\n", self.declare(&Ty::Die(self.type_of(m)), name));
+                    let ty = Ty::Die(self.type_of(m));
+                    // An anonymous type has no name to show it by: its body.
+                    let mb = self.bottom(&ty);
+                    let anonymous = match mb {
+                        Ty::Die(Some(b)) => {
+                            let bd = self.die(b);
+                            matches!(
+                                bd.tag,
+                                dw::TAG_STRUCTURE_TYPE | dw::TAG_UNION_TYPE | dw::TAG_ENUMERATION_TYPE
+                            ) && bd.name().is_none()
+                                && b != r
+                        }
+                        _ => false,
+                    };
+                    let decl = match mb {
+                        Ty::Die(Some(b)) if anonymous => self.expand(&ty, name, &mb, b, indent + 4),
+                        _ => self.declare(&ty, name),
+                    };
+                    s += &format!("{pad}    {decl};\n");
                 }
-                s + "}"
+                s + &pad + "}"
             }
             dw::TAG_ENUMERATION_TYPE => {
                 let mut next = 0i64;
@@ -517,20 +653,28 @@ impl Debug {
                         } else {
                             format!("{name} = {v}")
                         };
-                        next = v + 1;
+                        next = v.wrapping_add(1);
                         s
                     })
                     .collect();
                 format!("{{{}}}", constants.join(", "))
             }
-            _ => return self.declare(t, ""),
+            _ => return self.declare(t, inner),
         };
         // `struct node {...} *`: the body where the name was (`Node *` names it
         // `Node`), the rest of the declarator around it.
-        let name = self.declare(&Ty::Die(Some(r)), "");
-        let whole = self.declare(t, "");
-        let spelled = self.declare(&named, "");
-        whole.replacen(&spelled, &format!("{name} {body}"), 1)
+        let head = match d.tag {
+            dw::TAG_STRUCTURE_TYPE => "struct",
+            dw::TAG_UNION_TYPE => "union",
+            _ => "enum",
+        };
+        let head = match d.name() {
+            Some(n) => format!("{head} {n}"),
+            None => head.to_string(),
+        };
+        let whole = self.declare(t, inner);
+        let spelled = self.declare(bottom, "");
+        whole.replacen(&spelled, &format!("{head} {body}"), 1)
     }
 
     /// `whatis` of a type name: what it stands for, one typedef level down, as GDB
@@ -550,13 +694,23 @@ impl Debug {
 /// A token of an expression.
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
-    /// A number, whether a `u` suffix made it unsigned, and whether it was
-    /// written in decimal (which types it may have, C99 6.4.4.1).
-    Num(u64, bool, bool),
+    /// A number and what decides its type (C99 6.4.4.1).
+    Num(u64, Suffix),
     Ident(String),
     Reg(String),
     Char(u8),
     Punct(&'static str),
+}
+
+/// What decides a number's type besides its value: whether a `u` suffix makes it
+/// unsigned, how many `l`s it has (`L` makes it at least `long`, `LL` `long
+/// long`), and whether it is written in decimal (a hex or octal one may take an
+/// unsigned type without a `u`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Suffix {
+    unsigned: bool,
+    longs: u8,
+    decimal: bool,
 }
 
 fn tokens(s: &str) -> Result<Vec<Tok>> {
@@ -579,6 +733,18 @@ fn tokens(s: &str) -> Result<Vec<Tok>> {
             }
             let text = &s[start..i];
             let digits = text.trim_end_matches(['u', 'U', 'l', 'L']);
+            let suffix = &text[digits.len()..];
+            let longs = suffix.matches(['l', 'L']).count() as u8;
+            let us = suffix.matches(['u', 'U']).count();
+            // `u` before or after the `l`s, which are of one case: `ul`, `LLU`.
+            let ls = suffix.trim_matches(['u', 'U']);
+            if us > 1
+                || longs > 2
+                || ls.len() != usize::from(longs)
+                || (longs == 2 && ls != "ll" && ls != "LL")
+            {
+                return Err(format!("invalid number \"{text}\""));
+            }
             let n = if let Some(h) = digits.strip_prefix("0x").or(digits.strip_prefix("0X")) {
                 u64::from_str_radix(h, 16)
             } else if digits.len() > 1 && digits.starts_with('0') {
@@ -587,9 +753,14 @@ fn tokens(s: &str) -> Result<Vec<Tok>> {
                 digits.parse()
             };
             let n = n.map_err(|_| format!("invalid number \"{text}\""))?;
-            let unsigned = text.contains(['u', 'U']);
-            let decimal = !digits.starts_with('0') || digits == "0";
-            out.push(Tok::Num(n, unsigned, decimal));
+            out.push(Tok::Num(
+                n,
+                Suffix {
+                    unsigned: us == 1,
+                    longs,
+                    decimal: !digits.starts_with('0') || digits == "0",
+                },
+            ));
         } else if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
             let start = i;
             i += 1;
@@ -634,7 +805,7 @@ fn tokens(s: &str) -> Result<Vec<Tok>> {
 /// An expression as parsed: C's, the part a debugger needs.
 #[derive(Debug, Clone)]
 enum Expr {
-    Num(u64, bool, bool),
+    Num(u64, Suffix),
     Char(u8),
     Var(String),
     Reg(String),
@@ -662,6 +833,7 @@ struct Parser<'a> {
     toks: &'a [Tok],
     at: usize,
     debug: &'a Debug,
+    xlen: Xlen,
 }
 
 impl Parser<'_> {
@@ -701,7 +873,8 @@ impl Parser<'_> {
         let is_type = matches!(
             words.first().map(String::as_str),
             Some("struct" | "union" | "enum")
-        ) || self.debug.type_named(&base).is_some() && self.debug.global(&base, None).is_none();
+        ) || self.debug.type_named(&base, self.xlen).is_some()
+            && self.debug.global(&base, None).is_none();
         if words.is_empty() || !is_type || !matches!(self.peek(), Some(Tok::Punct(")"))) {
             self.at = save;
             return None;
@@ -709,15 +882,11 @@ impl Parser<'_> {
         Some(format!("{base}{}", "*".repeat(stars)))
     }
 
-    /// The whole expression. `@` binds loosest, as in GDB (`*p@3` is `(*p)@3`),
-    /// then C's operators by their precedence.
+    /// The whole expression: C's operators by their precedence, and GDB's `@`
+    /// between the shifts and `+` and `-`, as GDB's grammar has it (c-exp.y):
+    /// `*p@3` is `(*p)@3`, `a@n+1` is `a@(n+1)`, `a@2 == b` is `(a@2) == b`.
     fn expr(&mut self) -> Result<Expr> {
-        let mut l = self.logical_or()?;
-        while self.eat("@") {
-            let r = self.logical_or()?;
-            l = Expr::Repeat(Box::new(l), Box::new(r));
-        }
-        Ok(l)
+        self.logical_or()
     }
 
     fn logical_or(&mut self) -> Result<Expr> {
@@ -738,8 +907,8 @@ impl Parser<'_> {
         Ok(l)
     }
 
-    /// C's binary operators from `|` to the shifts, loosest first; the
-    /// additive and multiplicative ones come after.
+    /// C's binary operators from `|` to the shifts, loosest first; `@`, the
+    /// additive and the multiplicative ones come after.
     fn binary_level(&mut self, level: usize) -> Result<Expr> {
         const LEVELS: [&[&str]; 6] = [
             &["|"],
@@ -750,7 +919,7 @@ impl Parser<'_> {
             &["<<", ">>"],
         ];
         if level == LEVELS.len() {
-            return self.additive();
+            return self.repeat();
         }
         let mut l = self.binary_level(level + 1)?;
         'more: loop {
@@ -765,6 +934,16 @@ impl Parser<'_> {
             }
             return Ok(l);
         }
+    }
+
+    /// GDB's `x@n`.
+    fn repeat(&mut self) -> Result<Expr> {
+        let mut l = self.additive()?;
+        while self.eat("@") {
+            let r = self.additive()?;
+            l = Expr::Repeat(Box::new(l), Box::new(r));
+        }
+        Ok(l)
     }
 
     fn additive(&mut self) -> Result<Expr> {
@@ -871,7 +1050,7 @@ impl Parser<'_> {
         let t = self.peek().cloned();
         self.at += 1;
         match t {
-            Some(Tok::Num(n, u, d)) => Ok(Expr::Num(n, u, d)),
+            Some(Tok::Num(n, suffix)) => Ok(Expr::Num(n, suffix)),
             Some(Tok::Char(c)) => Ok(Expr::Char(c)),
             Some(Tok::Ident(n)) => Ok(Expr::Var(n)),
             Some(Tok::Reg(r)) => Ok(Expr::Reg(r)),
@@ -895,19 +1074,81 @@ pub struct Eval<'a, T: Target> {
     pub xlen: Xlen,
 }
 
-/// The `ATE`-less integer an address-sized result is: `long` (4 bytes on RV32, 8 on
-/// RV64), signed or not.
-fn long(xlen: Xlen, signed: bool) -> Ty {
-    Ty::Int {
-        signed,
-        size: u64::from(xlen.bits() / 8),
-    }
+/// C's integer type of `rank`, signed or not, at the width: `long` is 4 bytes on
+/// RV32 and 8 on RV64 (`int` 4 and `long long` 8 on both).
+fn c_int(rank: Rank, signed: bool, xlen: Xlen) -> Ty {
+    let (name, size) = match (rank, signed) {
+        (Rank::Bool, _) => ("_Bool", 1),
+        (Rank::Char, true) => ("signed char", 1),
+        (Rank::Char, false) => ("unsigned char", 1),
+        (Rank::Short, true) => ("short", 2),
+        (Rank::Short, false) => ("unsigned short", 2),
+        (Rank::Int, true) => ("int", 4),
+        (Rank::Int, false) => ("unsigned int", 4),
+        (Rank::Long, true) => ("long", u64::from(xlen.bits() / 8)),
+        (Rank::Long, false) => ("unsigned long", u64::from(xlen.bits() / 8)),
+        (Rank::LongLong, true) => ("long long", 8),
+        (Rank::LongLong, false) => ("unsigned long long", 8),
+    };
+    // `_Bool` is unsigned (its values are 0 and 1).
+    let signed = signed && rank != Rank::Bool;
+    Ty::Int { name, size, signed }
 }
 
-const INT: Ty = Ty::Int {
-    signed: true,
-    size: 4,
-};
+/// An integer type spelled as C allows, its words in any order (`unsigned`, `long
+/// int`, `long unsigned long`): its name as GDB writes it, its size and whether
+/// it is signed. Plain `char` is unsigned, as on RISC-V.
+fn c_integer(words: &[&str], xlen: Xlen) -> Option<(&'static str, u64, bool)> {
+    let count = |w: &str| words.iter().filter(|&&x| x == w).count();
+    let (unsigned, signed, longs, short, char_, int, bool_) = (
+        count("unsigned"),
+        count("signed"),
+        count("long"),
+        count("short"),
+        count("char"),
+        count("int"),
+        count("_Bool"),
+    );
+    if words.is_empty() || unsigned + signed + longs + short + char_ + int + bool_ != words.len() {
+        return None;
+    }
+    if unsigned + signed > 1 || int > 1 || char_ > 1 || short > 1 || bool_ > 1 || longs > 2 {
+        return None;
+    }
+    let others = |n: usize| words.len() - unsigned - signed - n;
+    let rank = if bool_ == 1 {
+        (words.len() == 1).then_some(Rank::Bool)?
+    } else if char_ == 1 {
+        if others(1) != 0 {
+            return None;
+        }
+        if unsigned + signed == 0 {
+            return Some(("char", 1, false));
+        }
+        Rank::Char
+    } else if short == 1 {
+        (others(short + int) == 0).then_some(Rank::Short)?
+    } else if longs > 0 {
+        if others(longs + int) != 0 {
+            return None;
+        }
+        if longs == 2 {
+            Rank::LongLong
+        } else {
+            Rank::Long
+        }
+    } else {
+        Rank::Int
+    };
+    let Ty::Int { name, size, signed } = c_int(rank, unsigned == 0, xlen) else {
+        unreachable!("c_int makes integers")
+    };
+    Some((name, size, signed))
+}
+
+/// How deep types go inside each other (pointers, arrays, members) before
+/// broken information that makes one part of itself is cut short.
+const DEPTH: usize = 64;
 
 /// How many elements of an array are shown, as GDB's `print elements`.
 const ELEMENTS: usize = 200;
@@ -925,6 +1166,7 @@ impl<T: Target> Eval<'_, T> {
             toks: &toks,
             at: 0,
             debug: self.debug,
+            xlen: self.xlen,
         };
         let e = p.expr()?;
         if p.at != toks.len() {
@@ -948,7 +1190,7 @@ impl<T: Target> Eval<'_, T> {
         if self.debug.global(base, None).is_some() && !base.contains(' ') {
             return None;
         }
-        let mut t = self.debug.type_named(base)?;
+        let mut t = self.debug.type_named(base, self.xlen)?;
         for _ in 0..stars {
             t = Ty::Ptr(Box::new(t));
         }
@@ -957,6 +1199,16 @@ impl<T: Target> Eval<'_, T> {
 
     fn word(&self) -> u64 {
         u64::from(self.xlen.bits() / 8)
+    }
+
+    /// C's integer type of `rank` at the machine's width.
+    fn int_ty(&self, rank: Rank, signed: bool) -> Ty {
+        c_int(rank, signed, self.xlen)
+    }
+
+    /// `int`, the type of a comparison, of `!` and of a character constant.
+    fn int(&self) -> Ty {
+        self.int_ty(Rank::Int, true)
     }
 
     fn bytes(&mut self, v: &Value) -> Result<Vec<u8>> {
@@ -979,21 +1231,32 @@ impl<T: Target> Eval<'_, T> {
     fn number(&mut self, v: &Value) -> Result<i128> {
         let shape = self.debug.shape(&v.ty);
         let (size, signed) = match shape {
-            Shape::Int { size, signed, .. } => (size, signed),
-            Shape::Enum(_, size) => (size, false),
+            Shape::Int { size, signed, .. } | Shape::Enum(_, size, signed) => (size, signed),
             Shape::Ptr(_) => (self.word(), false),
             _ => return Err("not a number".into()),
         };
         let b = self.bytes(v)?;
-        Ok(from_le(&b[..size as usize], signed))
+        let b = usize::try_from(size)
+            .ok()
+            .and_then(|n| b.get(..n))
+            .ok_or("a value shorter than its type")?;
+        Ok(from_le(b, signed))
     }
 
-    fn int_value(&self, ty: Ty, n: i128) -> Value {
-        let size = self.debug.size(&ty, self.xlen).unwrap_or(4) as usize;
-        Value {
-            ty,
-            loc: Loc::Bytes(n.to_le_bytes()[..size].to_vec()),
+    /// The number `n` as a value of the integer, enum or pointer type `ty`: its
+    /// low bytes, as many as the type has (at most 16, an `i128`'s).
+    fn int_value(&self, ty: Ty, n: i128) -> Result<Value> {
+        let size = self
+            .debug
+            .size(&ty, self.xlen)
+            .ok_or("a number of a type of unknown size")?;
+        if size > 16 {
+            return Err(format!("a number cannot be {size} bytes"));
         }
+        Ok(Value {
+            ty,
+            loc: Loc::Bytes(n.to_le_bytes()[..size as usize].to_vec()),
+        })
     }
 
     /// The location of a variable's entry in the selected frame.
@@ -1117,50 +1380,55 @@ impl<T: Target> Eval<'_, T> {
 
     fn eval(&mut self, e: &Expr) -> Result<Value> {
         match e {
-            Expr::Num(n, unsigned, decimal) => {
+            Expr::Num(n, suffix) => {
                 // C's first type of these that holds it: `int`, `long` and `long
                 // long` for a decimal number, with their unsigned types after each
-                // for a hex or octal one, and only those for a `u` suffix.
-                let word = self.word();
+                // for a hex or octal one, and only those for a `u` suffix; from
+                // `long` with an `l`, from `long long` with `ll`.
                 let candidates = [
-                    (true, 4),
-                    (false, 4),
-                    (true, word),
-                    (false, word),
-                    (true, 8),
-                    (false, 8),
+                    (Rank::Int, true),
+                    (Rank::Int, false),
+                    (Rank::Long, true),
+                    (Rank::Long, false),
+                    (Rank::LongLong, true),
+                    (Rank::LongLong, false),
                 ];
-                let allowed = |signed: bool| {
-                    if *unsigned {
-                        !signed
-                    } else {
-                        signed || !*decimal
-                    }
+                let least = match suffix.longs {
+                    0 => Rank::Int,
+                    1 => Rank::Long,
+                    _ => Rank::LongLong,
                 };
-                let fits = |&(signed, size): &(bool, u64)| {
+                let allowed = |rank: Rank, signed: bool| {
+                    rank >= least
+                        && if suffix.unsigned {
+                            !signed
+                        } else {
+                            signed || !suffix.decimal
+                        }
+                };
+                let fits = |&(rank, signed): &(Rank, bool)| {
+                    let size = self
+                        .debug
+                        .size(&self.int_ty(rank, signed), self.xlen)
+                        .unwrap_or(8);
                     let bits = 8 * size as u32;
                     let max = if signed {
                         (1u128 << (bits - 1)) - 1
                     } else {
                         (1u128 << bits) - 1
                     };
-                    allowed(signed) && u128::from(*n) <= max
+                    allowed(rank, signed) && u128::from(*n) <= max
                 };
-                let (signed, size) = candidates.iter().copied().find(|c| fits(c)).unwrap_or((false, 8));
-                Ok(self.int_value(Ty::Int { signed, size }, i128::from(*n)))
+                let (rank, signed) = candidates
+                    .iter()
+                    .copied()
+                    .find(|c| fits(c))
+                    .unwrap_or((Rank::LongLong, false));
+                self.int_value(self.int_ty(rank, signed), i128::from(*n))
             }
-            Expr::Char(c) => Ok(self.int_value(INT, i128::from(*c))),
+            Expr::Char(c) => self.int_value(self.int(), i128::from(*c)),
             Expr::Var(n) => self.lookup(n),
-            Expr::Reg(r) => {
-                let n = crate::session::register_number(r, self.xlen)
-                    .ok_or_else(|| format!("no register ${r}"))?;
-                let v = match n {
-                    0..=31 => self.frame.as_ref().and_then(|f| f.regs[n]),
-                    _ => None,
-                };
-                let v = v.ok_or_else(|| format!("${r} is not available here"))?;
-                Ok(self.int_value(long(self.xlen, true), i128::from(v as i64)))
-            }
+            Expr::Reg(r) => self.register(r),
             Expr::Member(base, m) => {
                 let v = self.eval(base)?;
                 self.member(v, m)
@@ -1188,7 +1456,7 @@ impl<T: Target> Eval<'_, T> {
                 match v.loc {
                     Loc::Mem(a) => {
                         let ty = Ty::Ptr(Box::new(v.ty));
-                        Ok(self.int_value(ty, i128::from(a)))
+                        self.int_value(ty, i128::from(a))
                     }
                     Loc::Bytes(_) => {
                         Err("attempt to take the address of a value not located in memory".into())
@@ -1199,19 +1467,19 @@ impl<T: Target> Eval<'_, T> {
                 let v = self.eval(e)?;
                 let ty = self.promoted(&v.ty)?;
                 let n = self.number(&v)?;
-                Ok(self.int_value(ty, -n))
+                self.int_value(ty, n.wrapping_neg())
             }
             Expr::Compl(e) => {
                 let v = self.eval(e)?;
                 let ty = self.promoted(&v.ty)?;
                 let n = self.number(&v)?;
-                Ok(self.int_value(ty, !n))
+                self.int_value(ty, !n)
             }
             Expr::Not(e) => {
                 let v = self.eval(e)?;
                 let v = self.decay(v)?;
                 let n = self.number(&v)?;
-                Ok(self.int_value(INT, i128::from(n == 0)))
+                self.int_value(self.int(), i128::from(n == 0))
             }
             Expr::Binary(op, l, r) => {
                 let l = self.eval(l)?;
@@ -1223,18 +1491,18 @@ impl<T: Target> Eval<'_, T> {
                 let l = self.decay(l)?;
                 let left = self.number(&l)? != 0;
                 if left != *and {
-                    return Ok(self.int_value(INT, i128::from(left)));
+                    return self.int_value(self.int(), i128::from(left));
                 }
                 let r = self.eval(r)?;
                 let r = self.decay(r)?;
                 let right = self.number(&r)? != 0;
-                Ok(self.int_value(INT, i128::from(right)))
+                self.int_value(self.int(), i128::from(right))
             }
             Expr::Repeat(l, n) => {
                 let v = self.eval(l)?;
                 let n = self.eval(n)?;
                 let n = self.number(&n)?;
-                if n <= 0 {
+                if n <= 0 || n > i128::from(u32::MAX) {
                     return Err(format!("invalid number {n} of repetitions"));
                 }
                 let (Loc::Mem(a), Ty::Die(elem)) = (&v.loc, &v.ty) else {
@@ -1245,13 +1513,14 @@ impl<T: Target> Eval<'_, T> {
                     loc: Loc::Mem(*a),
                 })
             }
+            // GDB's `sizeof` is an `unsigned long`, as a `size_t` is.
             Expr::Sizeof(e) => {
                 let v = self.eval(e)?;
                 let n = self
                     .debug
                     .size(&v.ty, self.xlen)
                     .ok_or("sizeof of a type of unknown size")?;
-                Ok(self.int_value(long(self.xlen, false), i128::from(n)))
+                self.int_value(self.int_ty(Rank::Long, false), i128::from(n))
             }
             Expr::SizeofType(t) => {
                 let t = self.type_name(t).ok_or_else(|| format!("no type named {t}"))?;
@@ -1259,31 +1528,114 @@ impl<T: Target> Eval<'_, T> {
                     .debug
                     .size(&t, self.xlen)
                     .ok_or("sizeof of a type of unknown size")?;
-                Ok(self.int_value(long(self.xlen, false), i128::from(n)))
+                self.int_value(self.int_ty(Rank::Long, false), i128::from(n))
             }
             Expr::Cast(t, e) => {
                 let ty = self.type_name(t).ok_or_else(|| format!("no type named {t}"))?;
                 let v = self.eval(e)?;
                 let v = self.decay(v)?;
+                // A scalar becomes another scalar (or nothing, `void`); a struct,
+                // a union, an array or a function is no cast's result or operand,
+                // as GDB has it.
+                let scalar = |s: &Shape| matches!(s, Shape::Int { .. } | Shape::Enum(..) | Shape::Ptr(_));
+                let to = self.debug.shape(&ty);
+                if to == Shape::Void {
+                    return Ok(Value {
+                        ty,
+                        loc: Loc::Bytes(Vec::new()),
+                    });
+                }
+                if !scalar(&to) || !scalar(&self.debug.shape(&v.ty)) {
+                    return Err("Invalid cast.".into());
+                }
                 let n = self.number(&v)?;
-                Ok(self.int_value(ty, n))
+                // To `_Bool`, anything not 0 is 1.
+                let n = match to {
+                    Shape::Int { boolean: true, .. } => i128::from(n != 0),
+                    _ => n,
+                };
+                self.int_value(ty, n)
             }
         }
+    }
+
+    /// `$name`: a register of the selected frame, as GDB types them on RISC-V:
+    /// `$pc` and `$ra` code pointers (`void (*)()`), `$sp`, `$gp` and `$tp` data
+    /// pointers (`void *`), the others `long`.
+    fn register(&mut self, r: &str) -> Result<Value> {
+        let n = crate::session::register_number(r, self.xlen).ok_or_else(|| format!("no register ${r}"))?;
+        let v = match n {
+            0..=31 => self.frame.as_ref().and_then(|f| f.regs[n]),
+            crate::remote::PC => self.frame.as_ref().map(|f| f.at),
+            _ => None,
+        };
+        let v = v.ok_or_else(|| format!("${r} is not available here"))?;
+        let ty = match n {
+            1 | crate::remote::PC => Ty::Ptr(Box::new(Ty::Code)),
+            2..=4 => Ty::Ptr(Box::new(Ty::Die(None))),
+            _ => self.int_ty(Rank::Long, true),
+        };
+        let v = crate::remote::wrap(self.xlen, v);
+        let v = match ty {
+            Ty::Int { .. } => from_le(&v.to_le_bytes()[..self.word() as usize], true),
+            _ => i128::from(v),
+        };
+        self.int_value(ty, v)
     }
 }
 
 impl<T: Target> Eval<'_, T> {
     /// C's integer promotion of an operand's type: narrower than `int` becomes
-    /// `int` (an enum `unsigned int`).
+    /// `int`, an enum its integer type (`int` or `unsigned int`, as its values
+    /// are signed or not, without one).
     fn promoted(&self, ty: &Ty) -> Result<Ty> {
         match self.debug.shape(ty) {
-            Shape::Int { size, signed, .. } if size >= 4 => Ok(Ty::Int { signed, size }),
-            Shape::Int { .. } => Ok(INT),
-            Shape::Enum(..) => Ok(Ty::Int {
-                signed: false,
-                size: 4,
-            }),
+            Shape::Int { signed, .. } => {
+                let rank = self.debug.rank(ty, self.xlen);
+                Ok(if rank < Rank::Int {
+                    self.int()
+                } else {
+                    self.int_ty(rank, signed)
+                })
+            }
+            Shape::Enum(r, size, signed) => match self.debug.type_of(r) {
+                Some(t) if matches!(self.debug.shape(&Ty::Die(Some(t))), Shape::Int { .. }) => {
+                    self.promoted(&Ty::Die(Some(t)))
+                }
+                _ => {
+                    let rank = if size > 4 { Rank::LongLong } else { Rank::Int };
+                    Ok(self.int_ty(rank, signed))
+                }
+            },
             _ => Err("an integer is needed".into()),
+        }
+    }
+
+    /// The usual arithmetic conversions (C99 6.3.1.8) of two promoted types: the
+    /// one of higher rank if both are signed or both unsigned; else the unsigned
+    /// one if its rank is not lower, the signed one if it is wider, and else the
+    /// unsigned type of the signed one's rank.
+    fn common(&self, a: &Ty, b: &Ty) -> Ty {
+        let info = |t: &Ty| {
+            let signed = matches!(self.debug.shape(t), Shape::Int { signed: true, .. });
+            let size = self.debug.size(t, self.xlen).unwrap_or(4);
+            (self.debug.rank(t, self.xlen), signed, size)
+        };
+        let ((ra, sa, za), (rb, sb, zb)) = (info(a), info(b));
+        if sa == sb {
+            return self.int_ty(ra.max(rb), sa);
+        }
+        let ((ru, zu), (rs, zs)) = if sa {
+            ((rb, zb), (ra, za))
+        } else {
+            ((ra, za), (rb, zb))
+        };
+        if ru >= rs {
+            self.int_ty(ru, false)
+        } else if zs > zu {
+            self.int_ty(rs, true)
+        } else {
+            self.int_ty(rs, false)
         }
     }
 
@@ -1291,7 +1643,7 @@ impl<T: Target> Eval<'_, T> {
     fn decay(&mut self, v: Value) -> Result<Value> {
         match self.debug.shape(&v.ty) {
             Shape::Array(elem, _) => match v.loc {
-                Loc::Mem(a) => Ok(self.int_value(Ty::Ptr(Box::new(elem)), i128::from(a))),
+                Loc::Mem(a) => self.int_value(Ty::Ptr(Box::new(elem)), i128::from(a)),
                 Loc::Bytes(_) => Err("an array not in memory".into()),
             },
             _ => Ok(v),
@@ -1324,8 +1676,9 @@ impl<T: Target> Eval<'_, T> {
             .size(&to, self.xlen)
             .ok_or("pointer arithmetic on a type of unknown size")?;
         let a = self.number(&p)?;
-        let a = crate::remote::wrap(self.xlen, (a + n * i128::from(size)) as u64);
-        Ok(self.int_value(p.ty, i128::from(a)))
+        let a = a.wrapping_add(n.wrapping_mul(i128::from(size)));
+        let a = crate::remote::wrap(self.xlen, a as u64);
+        self.int_value(p.ty, i128::from(a))
     }
 
     /// Member `name` of the struct or union `v`.
@@ -1371,24 +1724,26 @@ impl<T: Target> Eval<'_, T> {
                 let n = self.number(&l)?;
                 self.offset(r, n)
             }
+            // A difference of pointers is a `long`, as a `ptrdiff_t` is.
             ("-", Shape::Ptr(a), Shape::Ptr(_)) => {
                 let size = self.debug.size(a, self.xlen).unwrap_or(1).max(1);
-                let d = (self.number(&l)? - self.number(&r)?) / i128::from(size);
-                Ok(self.int_value(long(self.xlen, true), d))
+                let d = self.number(&l)?.wrapping_sub(self.number(&r)?) / i128::from(size);
+                self.int_value(self.int_ty(Rank::Long, true), d)
             }
             ("-", Shape::Ptr(_), _) => {
                 let n = self.number(&r)?;
-                self.offset(l, -n)
+                self.offset(l, n.wrapping_neg())
             }
             // Comparisons of pointers: their addresses.
             ("==" | "!=" | "<" | ">" | "<=" | ">=", Shape::Ptr(_), _)
             | ("==" | "!=" | "<" | ">" | "<=" | ">=", _, Shape::Ptr(_)) => {
                 let (x, y) = (self.number(&l)?, self.number(&r)?);
-                Ok(self.int_value(INT, i128::from(compare(op, x, y))))
+                self.int_value(self.int(), i128::from(compare(op, x, y)))
             }
             ("<<" | ">>", _, _) => {
                 // The result has the promoted left operand's type.
                 let ty = self.promoted(&l.ty)?;
+                self.promoted(&r.ty)?;
                 let x = convert(self.number(&l)?, &ty);
                 let y = self.number(&r)?;
                 let bits = 8 * self.debug.size(&ty, self.xlen).unwrap_or(4) as i128;
@@ -1396,39 +1751,30 @@ impl<T: Target> Eval<'_, T> {
                     return Err(format!("a shift by {y} of a {bits}-bit value"));
                 }
                 let v = if op == "<<" { x << y } else { x >> y };
-                Ok(self.int_value(ty, v))
+                self.int_value(ty, v)
             }
             _ => {
-                // The usual arithmetic conversions: the wider type, unsigned if
-                // either operand of that width is; both operands converted to it.
+                // The usual arithmetic conversions, both operands converted to
+                // their common type; in an i128, so nothing overflows before the
+                // result is cut to that type.
                 let (lt, rt) = (self.promoted(&l.ty)?, self.promoted(&r.ty)?);
-                let (Ty::Int { signed: a, size: x }, Ty::Int { signed: b, size: y }) = (&lt, &rt) else {
-                    unreachable!("promoted types are integers")
-                };
-                let ty = match x.cmp(y) {
-                    std::cmp::Ordering::Greater => lt.clone(),
-                    std::cmp::Ordering::Less => rt.clone(),
-                    std::cmp::Ordering::Equal => Ty::Int {
-                        signed: *a && *b,
-                        size: *x,
-                    },
-                };
+                let ty = self.common(&lt, &rt);
                 let (x, y) = (convert(self.number(&l)?, &ty), convert(self.number(&r)?, &ty));
                 let v = match op {
-                    "+" => x + y,
-                    "-" => x - y,
-                    "*" => x * y,
+                    "+" => x.wrapping_add(y),
+                    "-" => x.wrapping_sub(y),
+                    "*" => x.wrapping_mul(y),
                     "&" => x & y,
                     "|" => x | y,
                     "^" => x ^ y,
                     "==" | "!=" | "<" | ">" | "<=" | ">=" => {
-                        return Ok(self.int_value(INT, i128::from(compare(op, x, y))));
+                        return self.int_value(self.int(), i128::from(compare(op, x, y)));
                     }
                     _ if y == 0 => return Err("division by zero".into()),
-                    "/" => x / y,
-                    _ => x % y,
+                    "/" => x.wrapping_div(y),
+                    _ => x.wrapping_rem(y),
                 };
-                Ok(self.int_value(ty, v))
+                self.int_value(ty, v)
             }
         }
     }
@@ -1438,11 +1784,11 @@ impl<T: Target> Eval<'_, T> {
     /// `v` as `print` shows it (`top`: with a pointer's type), integers in hex
     /// with `hex` (`print/x`).
     pub fn show(&mut self, v: &Value, top: bool, hex: bool) -> Result<String> {
-        if let Shape::Func(f) = self.debug.shape(&v.ty) {
+        if let Shape::Func(_) = self.debug.shape(&v.ty) {
             let Loc::Mem(a) = v.loc else {
                 return Err("a function not in memory".into());
             };
-            let ty = self.debug.declare(&Ty::Die(Some(f)), "");
+            let ty = self.debug.declare(&v.ty, "");
             return Ok(format!("{{{ty}}} {}", self.symbols.show_plain(a)));
         }
         let b = self.bytes(v)?;
@@ -1450,10 +1796,24 @@ impl<T: Target> Eval<'_, T> {
             Loc::Mem(a) => Some(a),
             Loc::Bytes(_) => None,
         };
-        Ok(self.show_bytes(&v.ty, &b, addr, top, hex))
+        Ok(self.show_bytes(&v.ty, &b, addr, top, hex, 0))
     }
 
-    fn show_bytes(&mut self, ty: &Ty, b: &[u8], addr: Option<u64>, top: bool, hex: bool) -> String {
+    /// The value of type `ty` in bytes `b` (from `addr`, if in memory), `depth`
+    /// structs and arrays down from the one printed: past [`DEPTH`] (a struct of
+    /// itself in broken information), `...`.
+    fn show_bytes(
+        &mut self,
+        ty: &Ty,
+        b: &[u8],
+        addr: Option<u64>,
+        top: bool,
+        hex: bool,
+        depth: usize,
+    ) -> String {
+        if depth > DEPTH {
+            return "...".into();
+        }
         // A member past the end of its struct, in broken information.
         if self
             .debug
@@ -1472,13 +1832,7 @@ impl<T: Target> Eval<'_, T> {
             } => {
                 let n = from_le(&b[..size as usize], signed);
                 if hex {
-                    let bits = 8 * size as u32;
-                    let mask = if bits >= 128 {
-                        u128::MAX
-                    } else {
-                        (1u128 << bits) - 1
-                    };
-                    format!("{:#x}", (n as u128) & mask)
+                    hex_of(n, size)
                 } else if boolean {
                     match n {
                         0 => "false".into(),
@@ -1491,16 +1845,20 @@ impl<T: Target> Eval<'_, T> {
                     n.to_string()
                 }
             }
-            Shape::Enum(r, size) => {
-                let n = from_le(&b[..size as usize], false);
-                let signed_n = from_le(&b[..size as usize], true);
+            Shape::Enum(r, size, signed) => {
+                let n = from_le(&b[..size as usize], signed);
                 if hex {
-                    return format!("{n:#x}");
+                    return hex_of(n, size);
                 }
                 let name = self.debug.children(r).find_map(|c| {
                     let e = self.debug.die(c);
-                    let v = e.attr(dw::AT_CONST_VALUE)?.signed()?;
-                    (i128::from(v) == signed_n || i128::from(v) == n)
+                    let v = e.attr(dw::AT_CONST_VALUE)?;
+                    let v = if signed {
+                        i128::from(v.signed()?)
+                    } else {
+                        i128::from(v.unsigned()?)
+                    };
+                    (convert(v, &c_int(Rank::LongLong, signed, self.xlen)) == n)
                         .then(|| e.name().unwrap_or("?").to_string())
                 });
                 name.unwrap_or_else(|| n.to_string())
@@ -1536,9 +1894,14 @@ impl<T: Target> Eval<'_, T> {
                     return "0x0".into();
                 };
                 let esize = self.debug.size(&elem, self.xlen).unwrap_or(0) as usize;
-                if let Shape::Int {
-                    chr: true, size: 1, ..
-                } = self.debug.shape(&elem)
+                // An array of characters is a string, but with /x: its elements
+                // in hex, as GDB shows it.
+                if let (
+                    Shape::Int {
+                        chr: true, size: 1, ..
+                    },
+                    false,
+                ) = (self.debug.shape(&elem), hex)
                 {
                     return quote_chars(&b[..n as usize]);
                 }
@@ -1547,7 +1910,7 @@ impl<T: Target> Eval<'_, T> {
                     .map(|i| {
                         let part = &b[i * esize..(i + 1) * esize];
                         let at = addr.map(|a| a + (i * esize) as u64);
-                        self.show_bytes(&elem, part, at, false, hex)
+                        self.show_bytes(&elem, part, at, false, hex, depth + 1)
                     })
                     .collect();
                 let mut out = repeats(items);
@@ -1577,15 +1940,20 @@ impl<T: Target> Eval<'_, T> {
                     .into_iter()
                     .map(|(name, t, off)| {
                         let size = self.debug.size(&t, self.xlen).unwrap_or(0) as usize;
-                        let off = off as usize;
-                        let part = b.get(off..off + size).unwrap_or_default();
-                        let at = addr.map(|a| a + off as u64);
-                        format!("{name} = {}", self.show_bytes(&t, part, at, false, hex))
+                        let part = usize::try_from(off)
+                            .ok()
+                            .and_then(|off| b.get(off..off.checked_add(size)?))
+                            .unwrap_or_default();
+                        let at = addr.map(|a| a.wrapping_add(off));
+                        format!(
+                            "{name} = {}",
+                            self.show_bytes(&t, part, at, false, hex, depth + 1)
+                        )
                     })
                     .collect();
                 format!("{{{}}}", parts.join(", "))
             }
-            Shape::Func(f) => self.debug.declare(&Ty::Die(Some(f)), ""),
+            Shape::Func(_) => self.debug.declare(ty, ""),
         }
     }
 
@@ -1674,10 +2042,22 @@ fn compare(op: &str, x: i128, y: i128) -> bool {
 /// `n` converted to the integer type `ty`: cut to its size, and sign-extended
 /// if it is signed.
 fn convert(n: i128, ty: &Ty) -> i128 {
-    let Ty::Int { signed, size } = *ty else {
+    let Ty::Int { signed, size, .. } = *ty else {
         return n;
     };
     from_le(&n.to_le_bytes()[..size.min(16) as usize], signed)
+}
+
+/// An integer of `size` bytes in hex, as `print/x` shows it: its bits, not its
+/// sign (`-1` of an `int` is `0xffffffff`).
+fn hex_of(n: i128, size: u64) -> String {
+    let bits = 8 * size.min(16) as u32;
+    let mask = if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    format!("{:#x}", (n as u128) & mask)
 }
 
 /// Elements as GDB lists them: a run of [`REPEATS`] or more equal ones once, with
@@ -1867,32 +2247,57 @@ mod tests {
             _ => "",
         };
         assert_eq!((punct(1), punct(3), punct(5)), ("<=", "<<", "&&"));
-        assert_eq!(
-            convert(
-                -1,
-                &Ty::Int {
-                    signed: false,
-                    size: 4
-                }
-            ),
-            0xffff_ffff
-        );
-        assert_eq!(
-            convert(
-                0x1_0000_0005,
-                &Ty::Int {
-                    signed: true,
-                    size: 4
-                }
-            ),
-            5
-        );
+        let x32 = Xlen::Rv32;
+        assert_eq!(convert(-1, &c_int(Rank::Int, false, x32)), 0xffff_ffff);
+        assert_eq!(convert(0x1_0000_0005, &c_int(Rank::Int, true, x32)), 5);
+        assert_eq!(hex_of(-2, 4), "0xfffffffe");
         let t = tokens("p->next[2].x + 0x10 * 'a'").unwrap();
         assert_eq!(t.len(), 12);
         assert_eq!(t[0], Tok::Ident("p".into()));
         assert_eq!(t[1], Tok::Punct("->"));
-        assert_eq!(t[9], Tok::Num(16, false, false));
+        let suffix = |unsigned, longs, decimal| Suffix {
+            unsigned,
+            longs,
+            decimal,
+        };
+        assert_eq!(t[9], Tok::Num(16, suffix(false, 0, false)));
         assert_eq!(t[11], Tok::Char(b'a'));
+        // The suffixes stay: they decide the type.
+        let num = |s: &str| tokens(s).map(|t| t[0].clone());
+        assert_eq!(num("1L"), Ok(Tok::Num(1, suffix(false, 1, true))));
+        assert_eq!(num("7ull"), Ok(Tok::Num(7, suffix(true, 2, true))));
+        assert_eq!(num("0x7LLU"), Ok(Tok::Num(7, suffix(true, 2, false))));
+        for bad in ["1lL", "1uu", "1lul", "1lll", "1x"] {
+            assert!(num(bad).is_err(), "{bad}");
+        }
         assert!(tokens("a # b").is_err());
+    }
+
+    #[test]
+    fn integer_types_as_c_spells_them() {
+        let (x32, x64) = (Xlen::Rv32, Xlen::Rv64);
+        let c = |s: &str, x| c_integer(&s.split_whitespace().collect::<Vec<_>>(), x);
+        assert_eq!(c("unsigned", x32), Some(("unsigned int", 4, false)));
+        assert_eq!(c("signed", x32), Some(("int", 4, true)));
+        assert_eq!(c("long int", x32), Some(("long", 4, true)));
+        assert_eq!(c("long int", x64), Some(("long", 8, true)));
+        assert_eq!(
+            c("long unsigned long", x32),
+            Some(("unsigned long long", 8, false))
+        );
+        assert_eq!(c("short int", x64), Some(("short", 2, true)));
+        assert_eq!(c("char", x64), Some(("char", 1, false)));
+        assert_eq!(c("signed char", x64), Some(("signed char", 1, true)));
+        assert_eq!(c("_Bool", x64), Some(("_Bool", 1, false)));
+        for bad in [
+            "long long long",
+            "long char",
+            "short long",
+            "unsigned signed",
+            "int int",
+            "node",
+        ] {
+            assert_eq!(c(bad, x64), None, "{bad}");
+        }
     }
 }

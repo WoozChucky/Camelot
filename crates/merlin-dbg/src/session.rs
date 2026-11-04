@@ -245,16 +245,28 @@ impl<'a, W: Write> Session<'a, W> {
             "bt" | "backtrace" | "where" => self.backtrace()?,
             "frame" | "f" => match args.first() {
                 None => self.select_frame(self.frame)?,
-                Some(n) => self.select_frame(parse_number(n).ok_or("frame needs a frame number")? as usize)?,
+                Some(n) => {
+                    let n = parse_number(n).ok_or("frame needs a frame number")?;
+                    if n >= self.frames()?.len() as u64 {
+                        return Err(format!("No frame at level {}.", args[0]));
+                    }
+                    self.select_frame(n as usize)?
+                }
             },
+            // As GDB: `up` and `down` alone say when there is no frame to go to,
+            // `up N` and `down N` go as far as there are frames.
             "up" => {
                 let n = count(&args)? as usize;
-                self.select_frame(self.frame + n)?
+                let outermost = self.frames()?.len().saturating_sub(1);
+                if self.frame >= outermost && args.is_empty() {
+                    return Err("Initial frame selected; you cannot go up.".into());
+                }
+                self.select_frame(self.frame.saturating_add(n).min(outermost))?
             }
             "down" => {
                 let n = count(&args)? as usize;
-                if self.frame == 0 {
-                    return Err("bottom (innermost) frame selected; you cannot go down".into());
+                if self.frame == 0 && args.is_empty() {
+                    return Err("Bottom (innermost) frame selected; you cannot go down.".into());
                 }
                 self.select_frame(self.frame.saturating_sub(n))?
             }
@@ -266,8 +278,18 @@ impl<'a, W: Write> Session<'a, W> {
                 || cmd.starts_with("print/")
                 || cmd.starts_with("p/") =>
             {
-                let format = cmd.split_once('/').map(|(_, f)| f);
-                self.print_(rest, format)?
+                // The format after the command (`print/x`) or apart (`print /x`).
+                let (format, expr) = match cmd.split_once('/') {
+                    Some((_, f)) => (Some(f), rest),
+                    None => match rest.strip_prefix('/') {
+                        Some(r) => {
+                            let end = r.find(char::is_whitespace).unwrap_or(r.len());
+                            (Some(&r[..end]), r[end..].trim())
+                        }
+                        None => (None, rest),
+                    },
+                };
+                self.print_(expr, format)?
             }
             "hart" | "thread" => match args.first() {
                 None => self.harts()?,
@@ -986,7 +1008,7 @@ impl<'a, W: Write> Session<'a, W> {
     fn select_frame(&mut self, n: usize) -> Result<()> {
         let frames = self.frames()?;
         if n >= frames.len() {
-            return Err("initial frame selected; you cannot go up".into());
+            return Err(format!("No frame at level {n}."));
         }
         self.frame = n;
         let regs = self.remote.registers()?;
@@ -1187,7 +1209,6 @@ impl<'a, W: Write> Session<'a, W> {
 /// How many instructions `step` and `next` run at most looking for another line.
 const STEP_LIMIT: u32 = 1_000_000;
 
-/// `FILE:LINE` (a file name, a colon, a decimal line number), if `s` is one.
 /// The registers each frame has, as far as they are known: all of them in the
 /// innermost; in a caller its frame pointer, and its `sp`, which is where the frame
 /// it called began (that frame's CFA, its `s0`) or, past a frame not built yet
@@ -1212,11 +1233,16 @@ fn frame_contexts(frames: &[frames::Frame], regs: &[u64]) -> Vec<vars::Frame> {
             };
         }
         let pc = if i == 0 { f.pc } else { f.pc.wrapping_sub(1) };
-        out.push(vars::Frame { pc, regs: r });
+        out.push(vars::Frame {
+            pc,
+            at: f.pc,
+            regs: r,
+        });
     }
     out
 }
 
+/// `FILE:LINE` (a file name, a colon, a decimal line number), if `s` is one.
 fn source_line(s: &str) -> Option<(&str, u32)> {
     let (file, line) = s.rsplit_once(':')?;
     let line = line.trim().parse::<u32>().ok().filter(|&l| l > 0)?;
