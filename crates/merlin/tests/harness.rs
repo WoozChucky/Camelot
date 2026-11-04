@@ -2,7 +2,9 @@
 //!
 //! Every `tests/cases/*.c` is a whole program whose first line is
 //! `// expect: N`: the exit code it must produce (main's return value, low 8
-//! bits). To add a test, drop a new `.c` file in `tests/cases/`.
+//! bits). To add a test, drop a new `.c` file in `tests/cases/`. Every case
+//! runs for RV32 (ILP32) and for RV64 (LP64); one whose sizes make it give
+//! another result on RV64 says so on its second line, `// expect-lp64: N`.
 //!
 //! `tests/cases-merlin/*.c` are the same kind of program, but they rely on how
 //! merlin defines what C leaves undefined (spec section 10: wrapping overflow,
@@ -14,15 +16,18 @@
 //! * `cases_are_well_formed`: every case has an expectation and passes the
 //!   front end (lexer, parser, name resolution, arity checks).
 //! * `cases_match_reference_interpreter`: an AST interpreter
-//!   (`tests/common/interp.rs`) agrees with every `// expect:`, so the
+//!   (`tests/common/interp.rs`) agrees with every `// expect:`, on both
+//!   widths, so the
 //!   expectations and the parser check each other, and a pipeline failure
 //!   below can be told apart from a front-end bug. A case must not read a
 //!   local it never assigned (C: indeterminate): the interpreter fills fresh
 //!   locals with 0xa5 bytes, so such a case fails here rather than pass on
 //!   zeros and depend on the stack's contents in Grail.
-//! * `cases_run_in_grail`: the whole toolchain. merlin compiles each case to
-//!   assembly, merlin-as assembles it and `tests/crt0.s`, merlin-ld links them
-//!   (default layout) and Grail runs the result, comparing exit codes. Set
+//! * `cases_run_in_grail` and `cases_run_in_grail_rv64`: the whole toolchain.
+//!   merlin compiles each case to assembly, merlin-as assembles it and
+//!   `tests/crt0.s` (the same source for both widths), merlin-ld links them
+//!   (default layout: an ELF64 executable for RV64 objects) and Grail runs
+//!   the result (on an RV64 machine for ELF64), comparing exit codes. Set
 //!   `MERLIN_HARNESS_LLVM=1` to assemble merlin's output with clang and link
 //!   with ld.lld instead, which checks the generated assembly against LLVM:
 //!
@@ -30,19 +35,24 @@
 //!
 //! * `far_branches_run_in_grail`, `deep_expressions_run_in_grail`,
 //!   `big_frames_run_in_grail`: generated programs too big to keep as files,
-//!   through the same pipeline (big frames also check that `sp` is 16-byte
-//!   aligned at calls, with a helper in assembly).
+//!   through the same pipeline on both widths (big frames also check that
+//!   `sp` is 16-byte aligned at calls, with a helper in assembly).
 //! * `multi_file_programs_run_in_grail`: programs of several files, each a
 //!   directory `tests/multi/<name>/`: merlin compiles every `.c` file (with
 //!   `include/` as `-I`, if there is one), merlin-as assembles every `.s`
-//!   file, and merlin-ld links them all with crt0. The first line of
-//!   `main.c` is `// expect: N`.
+//!   file (one named `NAME.rv32.s` or `NAME.rv64.s` only for that width),
+//!   and merlin-ld links them all with crt0. The first line of `main.c` is
+//!   `// expect: N`.
 //! * `kernel_sources_compile`: merlin compiles every C file of the Camelot
 //!   kernel and its user programs (`kernel/*.c`, `kernel/user/*.c`), and
-//!   merlin-as assembles the result. Nothing runs here: `cargo xtask kernel`
-//!   builds the kernel this way, and xtask's tests boot it.
+//!   merlin-as assembles the result, on both widths (on RV64 the kernel's
+//!   checks of its RV32 layouts fail, and only those, until #154). Nothing
+//!   runs here: `cargo xtask kernel` builds the kernel this way, and xtask's
+//!   tests boot it.
 //!
-//! Ignored, since they need LLVM:
+//! Ignored, since they need LLVM (each for both widths, with clang's
+//! `--target=riscv32 -mabi=ilp32` or `--target=riscv64 -mabi=lp64
+//! -mcmodel=medany`):
 //!
 //! * `generated_assembly_assembles_like_clang`: clang's assembler (with
 //!   `-mno-relax`) turns merlin's output for every case, and for the far
@@ -70,14 +80,62 @@
 mod interp;
 
 use grail::{Machine, RunResult};
+use merlin::types::Xlen;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Both widths: every pipeline test runs on RV32 (ILP32) and RV64 (LP64).
+const WIDTHS: [Xlen; 2] = [Xlen::Rv32, Xlen::Rv64];
+
+/// merlin's options for a source on its own, for the target `x`.
+fn options(x: Xlen) -> merlin::Options {
+    merlin::Options {
+        xlen: x,
+        ..merlin::Options::default()
+    }
+}
+
+/// [`merlin::compile`] for the target `x`.
+fn compile(src: &str, x: Xlen) -> Result<String, Vec<merlin::Error>> {
+    merlin::compile_with(merlin::INPUT_NAME, src, &options(x), &merlin::no_files)
+}
+
+/// [`merlin::parse`] for the target `x`.
+fn parse(src: &str, x: Xlen) -> Result<merlin::ast::Program, Vec<merlin::Error>> {
+    merlin::parse_with(merlin::INPUT_NAME, src, &options(x), &merlin::no_files)
+}
+
+/// merlin-as's options for the target `x`.
+fn as_options(x: Xlen) -> merlin_as::Options {
+    merlin_as::Options { xlen: x }
+}
+
+/// The name a test's scratch directory and messages give the width.
+fn width(x: Xlen) -> &'static str {
+    match x {
+        Xlen::Rv32 => "rv32",
+        Xlen::Rv64 => "rv64",
+    }
+}
 
 struct Case {
     name: String,
     path: PathBuf,
     src: String,
     expect: u8,
+    /// `// expect-lp64: N` on the second line: what the case gives on RV64,
+    /// when its sizes make it differ.
+    expect_lp64: Option<u8>,
+}
+
+impl Case {
+    /// The exit code the case must give on the target `x`.
+    fn expect(&self, x: Xlen) -> u8 {
+        match x {
+            Xlen::Rv64 => self.expect_lp64.unwrap_or(self.expect),
+            Xlen::Rv32 => self.expect,
+        }
+    }
 }
 
 fn tests_dir() -> PathBuf {
@@ -115,24 +173,36 @@ fn cases(dirs: &[&str]) -> Vec<Case> {
                 .and_then(|l| l.trim().strip_prefix("// expect:"))
                 .and_then(|n| n.trim().parse().ok())
                 .unwrap_or_else(|| panic!("{name}.c: first line must be `// expect: N` with N in 0..=255"));
+            let expect_lp64 = src
+                .lines()
+                .nth(1)
+                .and_then(|l| l.trim().strip_prefix("// expect-lp64:"))
+                .map(|n| {
+                    n.trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("{name}.c: `// expect-lp64: N` with N in 0..=255"))
+                });
             Case {
                 name,
                 path,
                 src,
                 expect,
+                expect_lp64,
             }
         })
         .collect()
 }
 
-/// Runs `check` on every case, prints a summary, and fails listing every mismatch.
-fn for_each_case(what: &str, dirs: &[&str], mut check: impl FnMut(&Case) -> Result<u8, String>) {
+/// Runs `check` on every case, for the target `x`, prints a summary, and
+/// fails listing every mismatch.
+fn for_each_case(what: &str, dirs: &[&str], x: Xlen, mut check: impl FnMut(&Case) -> Result<u8, String>) {
     let cases = cases(dirs);
     let mut failures = Vec::new();
     for c in &cases {
+        let expect = c.expect(x);
         match check(c) {
-            Ok(code) if code == c.expect => {}
-            Ok(code) => failures.push(format!("  {}: exit code {code}, expected {}", c.name, c.expect)),
+            Ok(code) if code == expect => {}
+            Ok(code) => failures.push(format!("  {}: exit code {code}, expected {expect}", c.name)),
             Err(e) => failures.push(format!("  {}: {e}", c.name)),
         }
     }
@@ -165,7 +235,7 @@ fn cases_are_well_formed() {
     assert!(n >= 20, "only {n} C99 cases");
     let n = cases(&[MERLIN_CASES]).len();
     assert!(n >= 4, "only {n} cases for merlin's defined behavior");
-    for_each_case("front end", ALL_CASES, |c| {
+    for_each_case("front end", ALL_CASES, Xlen::Rv32, |c| {
         let prog = merlin::parse(&c.src).map_err(|e| render(&e, c))?;
         if !prog.funcs().any(|f| f.name == "main" && f.body.is_some()) {
             return Err("no main".into());
@@ -176,10 +246,13 @@ fn cases_are_well_formed() {
 
 #[test]
 fn cases_match_reference_interpreter() {
-    for_each_case("reference interpreter", ALL_CASES, |c| {
-        let prog = merlin::parse(&c.src).map_err(|e| render(&e, c))?;
-        interp::run(&prog, "main").map(|v| v as u8)
-    });
+    for x in WIDTHS {
+        let what = format!("reference interpreter ({})", width(x));
+        for_each_case(&what, ALL_CASES, x, |c| {
+            let prog = parse(&c.src, x).map_err(|e| render(&e, c))?;
+            interp::run(&prog, "main").map(|v| v as u8)
+        });
+    }
 }
 
 #[test]
@@ -251,7 +324,8 @@ fn reference_interpreter_semantics() {
     assert_eq!(eval("int x; x = 4; return x;"), 4);
 }
 
-/// Loads an executable into Grail and returns its exit code.
+/// Loads an executable into Grail (an RV64 machine for an ELF64 file) and
+/// returns its exit code.
 fn run_in_grail(elf: &[u8]) -> Result<u8, String> {
     let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.load_elf(elf)?;
@@ -296,9 +370,21 @@ fn tool(cmd: &mut Command) -> Result<(), String> {
     }
 }
 
-fn clang() -> Command {
+/// clang for the target `x`: `--target=riscv32 -mabi=ilp32` or
+/// `--target=riscv64 -mabi=lp64 -mcmodel=medany` (code linked at
+/// 0x8000_0000), compiling or assembling to an object.
+fn clang(x: Xlen) -> Command {
     let mut c = Command::new("clang");
-    c.args(["--target=riscv32", "-march=rv32im", "-mabi=ilp32", "-c"]);
+    match x {
+        Xlen::Rv32 => c.args(["--target=riscv32", "-march=rv32ima_zicsr_zifencei", "-mabi=ilp32"]),
+        Xlen::Rv64 => c.args([
+            "--target=riscv64",
+            "-march=rv64ima_zicsr_zifencei",
+            "-mabi=lp64",
+            "-mcmodel=medany",
+        ]),
+    };
+    c.arg("-c");
     c
 }
 
@@ -350,10 +436,10 @@ impl Backend {
         }
     }
 
-    fn assemble(&self, src: &str, out: &Path) -> Result<PathBuf, String> {
+    fn assemble(&self, src: &str, out: &Path, x: Xlen) -> Result<PathBuf, String> {
         match self {
             Backend::Merlin => {
-                let obj = merlin_as::assemble_to_elf(src).map_err(|errs| {
+                let obj = merlin_as::assemble_to_elf_with(src, &as_options(x)).map_err(|errs| {
                     let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
                     format!("merlin-as: {}", msgs.join("; "))
                 })?;
@@ -362,7 +448,7 @@ impl Backend {
             Backend::Llvm => {
                 let s = out.with_extension("s");
                 std::fs::write(&s, src).map_err(|e| e.to_string())?;
-                tool(clang().arg("-mno-relax").arg(&s).arg("-o").arg(out))?;
+                tool(clang(x).arg("-mno-relax").arg(&s).arg("-o").arg(out))?;
             }
         }
         Ok(out.to_path_buf())
@@ -397,24 +483,27 @@ impl Backend {
     }
 }
 
-/// Builds C programs with crt0 into executables, and runs them in Grail.
+/// Builds C programs with crt0 into executables for one width, and runs
+/// them in Grail. crt0.s is the same source for both widths.
 struct Pipeline {
     backend: Backend,
     scratch: Scratch,
     crt0: PathBuf,
+    xlen: Xlen,
 }
 
 impl Pipeline {
-    fn new(test: &str) -> Pipeline {
+    fn new(test: &str, x: Xlen) -> Pipeline {
         let backend = Backend::from_env();
-        let scratch = Scratch::new(test);
+        let scratch = Scratch::new(&format!("{test}-{}", width(x)));
         let crt0 = backend
-            .assemble(&backend.crt0(), &scratch.path("crt0.o"))
+            .assemble(&backend.crt0(), &scratch.path("crt0.o"), x)
             .expect("assembling crt0.s");
         Pipeline {
             backend,
             scratch,
             crt0,
+            xlen: x,
         }
     }
 
@@ -422,14 +511,14 @@ impl Pipeline {
     fn build(&self, name: &str, asm: &str) -> Result<Vec<u8>, String> {
         let obj = self
             .backend
-            .assemble(asm, &self.scratch.path(&format!("{name}.o")))?;
+            .assemble(asm, &self.scratch.path(&format!("{name}.o")), self.xlen)?;
         let elf = self.scratch.path(&format!("{name}.elf"));
         self.backend.link(&[self.crt0.clone(), obj], &elf)
     }
 
     /// Compiles `src`, builds it and returns its exit code.
     fn run(&self, name: &str, src: &str) -> Result<u8, String> {
-        let asm = merlin::compile(src).map_err(|errs| {
+        let asm = compile(src, self.xlen).map_err(|errs| {
             let file = format!("{name}.c");
             errs.iter()
                 .map(|e| e.render(&file))
@@ -442,49 +531,71 @@ impl Pipeline {
 
 #[test]
 fn cases_run_in_grail() {
-    let pipeline = Pipeline::new("pipeline");
-    for_each_case("merlin pipeline", ALL_CASES, |c| pipeline.run(&c.name, &c.src));
+    let pipeline = Pipeline::new("pipeline", Xlen::Rv32);
+    for_each_case("merlin pipeline", ALL_CASES, Xlen::Rv32, |c| {
+        pipeline.run(&c.name, &c.src)
+    });
+}
+
+#[test]
+fn cases_run_in_grail_rv64() {
+    let pipeline = Pipeline::new("pipeline", Xlen::Rv64);
+    for_each_case("merlin pipeline (rv64)", ALL_CASES, Xlen::Rv64, |c| {
+        pipeline.run(&c.name, &c.src)
+    });
 }
 
 /// A conditional branch reaches only 4 KiB, so codegen must rewrite the ones
 /// that span bigger `if` and loop bodies (merlin-as rejects them otherwise).
 #[test]
 fn far_branches_run_in_grail() {
-    let pipeline = Pipeline::new("far");
-    let src = far_branches_src();
-    let asm = merlin::compile(&src).unwrap();
-    assert!(asm.contains("\n1:\n"), "expected long branches:\n{asm}");
-    // x = 500 (if) + 1500 (while) + 500 (for, first pass) = 2500.
-    assert_eq!(pipeline.run("far", &src), Ok(26));
+    for x in WIDTHS {
+        let pipeline = Pipeline::new("far", x);
+        let src = far_branches_src();
+        let asm = compile(&src, x).unwrap();
+        assert!(asm.contains("\n1:\n"), "expected long branches:\n{asm}");
+        // x = 500 (if) + 1500 (while) + 500 (for, first pass) = 2500.
+        assert_eq!(pipeline.run("far", &src), Ok(26), "{}", width(x));
+    }
 }
 
 /// Codegen picks the short or long form of a branch from estimated sizes,
 /// which must never be smaller than what merlin-as makes: a `li` of a big
-/// constant, a `call` and an `la` are two words each. For each kind of body,
-/// grow it a statement at a time to the last size whose branch is still
-/// short, which is where an underestimate would leave a branch merlin-as
-/// cannot encode, and assemble that.
+/// constant, a `call` and an `la` are two words each, and on RV64 a 64-bit
+/// constant up to eight. For each kind of body, grow it a statement at a
+/// time to the last size whose branch is still short, which is where an
+/// underestimate would leave a branch merlin-as cannot encode, and assemble
+/// that.
 #[test]
 fn branch_size_estimates_are_never_too_small() {
-    for stmt in ["x = x + 100000;", "x = g(x);", "x = x + *&glob;"] {
+    let cases = [
+        (Xlen::Rv32, "x = x + 100000;"),
+        (Xlen::Rv32, "x = g(x);"),
+        (Xlen::Rv32, "x = x + *&glob;"),
+        (Xlen::Rv64, "x = x + 100000;"),
+        (Xlen::Rv64, "x = g(x);"),
+        (Xlen::Rv64, "x = x + *&glob;"),
+        (Xlen::Rv64, "x = x + 0x123456789abcdef1L;"),
+    ];
+    for (xlen, stmt) in cases {
         let src = |n: usize| {
             format!(
                 "int glob = 1; int g(int v) {{ return v + 1; }}
-                 int f(int x) {{ if (x) {{ {} }} return x; }}",
+                 long f(long x) {{ if (x) {{ {} }} return x; }}",
                 stmt.repeat(n)
             )
         };
         let long = |asm: &str| asm.contains("\n1:\n");
         let mut n = 1;
-        while !long(&merlin::compile(&src(n + 1)).unwrap()) {
+        while !long(&compile(&src(n + 1), xlen).unwrap()) {
             n += 1;
             assert!(n < 2000, "{stmt}: no long branch yet");
         }
         // `n` statements: the most that keep the branch short.
-        let asm = merlin::compile(&src(n)).unwrap();
+        let asm = compile(&src(n), xlen).unwrap();
         assert!(!long(&asm));
-        if let Err(e) = merlin_as::assemble_to_elf(&asm) {
-            panic!("{stmt} x {n}: {e:?}");
+        if let Err(e) = merlin_as::assemble_to_elf_with(&asm, &as_options(xlen)) {
+            panic!("{} {stmt} x {n}: {e:?}", width(xlen));
         }
     }
 }
@@ -511,7 +622,13 @@ fn far_branches_src() -> String {
 /// Deeply nested expressions keep many temporaries on the stack, around calls.
 #[test]
 fn deep_expressions_run_in_grail() {
-    let pipeline = Pipeline::new("deep");
+    for x in WIDTHS {
+        deep_expressions(x);
+    }
+}
+
+fn deep_expressions(x: Xlen) {
+    let pipeline = Pipeline::new("deep", x);
     // 1 + (2 + (... + (99 + id(100)))): the call happens with 99 values pushed.
     let mut e = "id(100)".to_string();
     for i in (1..100).rev() {
@@ -538,17 +655,19 @@ fn deep_expressions_run_in_grail() {
 /// call. The caller's locals, `s0` and `sp` must survive the big frame.
 #[test]
 fn big_frames_run_in_grail() {
-    let pipeline = Pipeline::new("big-frames");
-    let asm = big_frames_asm();
-    for big_frame in ["add   sp, sp, t0", "add   t0, s0, t0"] {
-        assert!(asm.contains(big_frame), "expected '{big_frame}':\n{asm}");
+    for x in WIDTHS {
+        let pipeline = Pipeline::new("big-frames", x);
+        let asm = big_frames_asm(x);
+        for big_frame in ["add   sp, sp, t0", "add   t0, s0, t0"] {
+            assert!(asm.contains(big_frame), "expected '{big_frame}':\n{asm}");
+        }
+        let elf = pipeline.build("big-frames", &asm).unwrap();
+        assert_eq!(run_in_grail(&elf), Ok(18), "{}", width(x));
     }
-    let elf = pipeline.build("big-frames", &asm).unwrap();
-    assert_eq!(run_in_grail(&elf), Ok(18));
 }
 
-/// `big_frames_run_in_grail`'s program, compiled, with `sp_low` added.
-fn big_frames_asm() -> String {
+/// `big_frames_run_in_grail`'s program, compiled for `x`, with `sp_low` added.
+fn big_frames_asm(x: Xlen) -> String {
     // 600 ints and a 3000-byte array: about 5.4 KiB of locals.
     let decls: String = (0..600).map(|i| format!("int v{i}; ")).collect();
     let src = format!(
@@ -569,7 +688,7 @@ fn big_frames_asm() -> String {
              return 3 + (4 + (5 + (6 + sp_low())));
          }}"
     );
-    let mut asm = merlin::compile(&src).unwrap();
+    let mut asm = compile(&src, x).unwrap();
     asm.push_str("\n    .text\n    .globl sp_low\nsp_low:\n    andi  a0, sp, 15\n    ret\n");
     asm
 }
@@ -580,8 +699,24 @@ struct MultiCase {
     /// `include/`, if the program has one: the `-I` directory.
     include: Option<PathBuf>,
     c_files: Vec<PathBuf>,
+    /// Hand-written assembly: `NAME.s` for both widths, or `NAME.rv32.s` and
+    /// `NAME.rv64.s` for one ([`MultiCase::s_files_for`]).
     s_files: Vec<PathBuf>,
     expect: u8,
+}
+
+impl MultiCase {
+    /// The assembly files for the target `x`: those for both widths, and
+    /// those named for `x` (`util.rv64.s`).
+    fn s_files_for(&self, x: Xlen) -> impl Iterator<Item = &PathBuf> {
+        let other = match x {
+            Xlen::Rv32 => ".rv64",
+            Xlen::Rv64 => ".rv32",
+        };
+        self.s_files
+            .iter()
+            .filter(move |p| !p.file_stem().unwrap().to_string_lossy().ends_with(other))
+    }
 }
 
 fn multi_cases() -> Vec<MultiCase> {
@@ -631,15 +766,19 @@ fn multi_cases() -> Vec<MultiCase> {
 
 #[test]
 fn multi_file_programs_run_in_grail() {
-    let pipeline = Pipeline::new("multi");
+    for x in WIDTHS {
+        multi_file_programs(x);
+    }
+}
+
+fn multi_file_programs(x: Xlen) {
+    let pipeline = Pipeline::new("multi", x);
     let cases = multi_cases();
     assert!(!cases.is_empty());
     for case in cases {
         let opts = merlin::Options {
             include_dirs: case.include.iter().cloned().collect(),
-            macros: Vec::new(),
-            debug: None,
-            xlen: merlin::types::Xlen::Rv32,
+            ..options(x)
         };
         let mut objs = vec![pipeline.crt0.clone()];
         for c in &case.c_files {
@@ -649,39 +788,57 @@ fn multi_file_programs_run_in_grail() {
             });
             let stem = c.file_stem().unwrap().to_string_lossy();
             let obj = pipeline.scratch.path(&format!("{}-{stem}.o", case.name));
-            objs.push(pipeline.backend.assemble(&asm, &obj).unwrap());
+            objs.push(pipeline.backend.assemble(&asm, &obj, x).unwrap());
         }
-        for s in &case.s_files {
+        for s in case.s_files_for(x) {
             let stem = s.file_stem().unwrap().to_string_lossy();
             let obj = pipeline.scratch.path(&format!("{}-{stem}-s.o", case.name));
             let src = std::fs::read_to_string(s).unwrap();
-            objs.push(pipeline.backend.assemble(&src, &obj).unwrap());
+            objs.push(pipeline.backend.assemble(&src, &obj, x).unwrap());
         }
         let elf = pipeline.scratch.path(&format!("{}.elf", case.name));
         let elf = pipeline
             .backend
             .link(&objs, &elf)
             .unwrap_or_else(|e| panic!("{}: {e}", case.name));
-        assert_eq!(run_in_grail(&elf), Ok(case.expect), "{}", case.name);
+        assert_eq!(
+            run_in_grail(&elf),
+            Ok(case.expect),
+            "{} ({})",
+            case.name,
+            width(x)
+        );
     }
 }
 
 #[test]
 #[ignore = "needs clang and ld.lld on PATH"]
 fn multi_file_clang_reference() {
-    let scratch = Scratch::new("multi-clang");
+    for x in WIDTHS {
+        multi_file_clang(x);
+    }
+}
+
+/// crt0.s assembled by clang for `x`, in `scratch`.
+fn clang_crt0(scratch: &Scratch, x: Xlen) -> PathBuf {
     let crt0_s = scratch.path("crt0.s");
     let crt0 = std::fs::read_to_string(tests_dir().join("crt0.s")).unwrap();
     std::fs::write(&crt0_s, crt0_for_llvm(&crt0)).unwrap();
     let crt0_o = scratch.path("crt0.o");
-    tool(clang().arg(&crt0_s).arg("-o").arg(&crt0_o)).expect("assembling crt0.s with clang");
+    tool(clang(x).arg(&crt0_s).arg("-o").arg(&crt0_o)).expect("assembling crt0.s with clang");
+    crt0_o
+}
+
+fn multi_file_clang(x: Xlen) {
+    let scratch = Scratch::new(&format!("multi-clang-{}", width(x)));
+    let crt0_o = clang_crt0(&scratch, x);
     for case in multi_cases() {
         let mut objs = vec![crt0_o.clone()];
-        for f in case.c_files.iter().chain(&case.s_files) {
+        for f in case.c_files.iter().chain(case.s_files_for(x)) {
             let stem = f.file_stem().unwrap().to_string_lossy();
             let ext = f.extension().unwrap().to_string_lossy();
             let obj = scratch.path(&format!("{}-{stem}-{ext}.o", case.name));
-            let mut cmd = clang();
+            let mut cmd = clang(x);
             cmd.args(["-std=c99", "-O1", "-ffreestanding", "-fno-builtin"]);
             if let Some(dir) = &case.include {
                 cmd.arg("-I").arg(dir);
@@ -690,15 +847,33 @@ fn multi_file_clang_reference() {
             objs.push(obj);
         }
         let elf = ld_lld(&objs, &scratch.path(&format!("{}.elf", case.name))).unwrap();
-        assert_eq!(run_in_grail(&elf), Ok(case.expect), "{}", case.name);
+        assert_eq!(
+            run_in_grail(&elf),
+            Ok(case.expect),
+            "{} ({})",
+            case.name,
+            width(x)
+        );
     }
 }
 
 /// Every C file of the kernel (its network stack in `kernel/net` too) and its
 /// user programs compiles with merlin, with the include directories `cargo xtask
-/// kernel` gives clang, and the result assembles.
+/// kernel` gives clang, and the result assembles, for RV32 and for RV64.
+///
+/// On RV64 the user programs compile and assemble. The kernel's own files
+/// check, with `_Static_assert`, that their structures have the RV32 sizes
+/// its assembly and tests index them by (`CPU_SIZE`, `PROC_SIZE`...), and
+/// those fail until the kernel moves to RV64 (#154, #155): there, every
+/// error must be one of those, so the rest of each file passes the front end.
 #[test]
 fn kernel_sources_compile() {
+    for x in WIDTHS {
+        kernel_sources(x);
+    }
+}
+
+fn kernel_sources(x: Xlen) {
     let kernel = tests_dir().join("../../../kernel");
     let mut failures = Vec::new();
     let mut count = 0;
@@ -715,17 +890,24 @@ fn kernel_sources_compile() {
         files.sort();
         let opts = merlin::Options {
             include_dirs: includes,
-            macros: Vec::new(),
-            debug: None,
-            xlen: merlin::types::Xlen::Rv32,
+            ..options(x)
         };
+        let kernel_side = !dir.ends_with("user");
         for f in files {
             count += 1;
             let name = f.file_name().unwrap().to_string_lossy().into_owned();
             match merlin::compile_file(&f, &opts) {
                 Ok(asm) => {
-                    if let Err(errs) = merlin_as::assemble_to_elf(&asm) {
+                    if let Err(errs) = merlin_as::assemble_to_elf_with(&asm, &as_options(x)) {
                         failures.push(format!("  {name}: merlin-as: {:?}", errs.first()));
+                    }
+                }
+                Err(errs) if x == Xlen::Rv64 && kernel_side => {
+                    if let Some(e) = errs
+                        .iter()
+                        .find(|e| !e.msg.starts_with("static assertion failed"))
+                    {
+                        failures.push(format!("  {name}: {}", e.render(&name)));
                     }
                 }
                 Err(errs) => failures.push(format!("  {name}: {}", errs[0].render(&name))),
@@ -735,7 +917,8 @@ fn kernel_sources_compile() {
     assert!(count >= 20, "only {count} kernel C files");
     assert!(
         failures.is_empty(),
-        "kernel files merlin cannot compile:\n{}",
+        "kernel files merlin cannot compile for {}:\n{}",
+        width(x),
         failures.join("\n")
     );
 }
@@ -781,13 +964,20 @@ fn section_summary(obj: &[u8], name: &str) -> Result<(u64, Vec<u8>, Vec<String>)
 #[test]
 #[ignore = "needs clang on PATH"]
 fn generated_assembly_assembles_like_clang() {
-    let scratch = Scratch::new("asm-vs-clang");
+    for x in WIDTHS {
+        assembles_like_clang(x);
+    }
+}
+
+fn assembles_like_clang(x: Xlen) {
+    let scratch = Scratch::new(&format!("asm-vs-clang-{}", width(x)));
     let compare = |name: &str, asm: &str| -> Result<(), String> {
-        let ours = merlin_as::assemble_to_elf(asm).map_err(|e| format!("merlin-as: {e:?}"))?;
+        let ours =
+            merlin_as::assemble_to_elf_with(asm, &as_options(x)).map_err(|e| format!("merlin-as: {e:?}"))?;
         let s = scratch.path(&format!("{name}.s"));
         let o = scratch.path(&format!("{name}.o"));
         std::fs::write(&s, asm).map_err(|e| e.to_string())?;
-        tool(clang().arg("-mno-relax").arg(&s).arg("-o").arg(&o))?;
+        tool(clang(x).arg("-mno-relax").arg(&s).arg("-o").arg(&o))?;
         let theirs = std::fs::read(&o).map_err(|e| e.to_string())?;
         for section in COMPARED_SECTIONS {
             let (ours, theirs) = (
@@ -808,31 +998,35 @@ fn generated_assembly_assembles_like_clang() {
         }
         Ok(())
     };
-    for_each_case("merlin-as vs clang", ALL_CASES, |c| {
-        let asm = merlin::compile(&c.src).map_err(|e| render(&e, c))?;
+    let what = format!("merlin-as vs clang ({})", width(x));
+    for_each_case(&what, ALL_CASES, x, |c| {
+        let asm = compile(&c.src, x).map_err(|e| render(&e, c))?;
         compare(&c.name, &asm)?;
-        Ok(c.expect)
+        Ok(c.expect(x))
     });
     // The generated programs: the long branch form (`bnez a0, 1f` / `j` /
     // `1:`), and big frames reached through t0.
-    let far = merlin::compile(&far_branches_src()).unwrap();
+    let far = compile(&far_branches_src(), x).unwrap();
     assert_eq!(compare("far", &far), Ok(()));
-    assert_eq!(compare("big-frames", &big_frames_asm()), Ok(()));
+    assert_eq!(compare("big-frames", &big_frames_asm(x)), Ok(()));
 }
 
 #[test]
 #[ignore = "needs clang and ld.lld on PATH"]
 fn clang_reference() {
-    let scratch = Scratch::new("clang");
-    let crt0_s = scratch.path("crt0.s");
-    let crt0 = std::fs::read_to_string(tests_dir().join("crt0.s")).unwrap();
-    std::fs::write(&crt0_s, crt0_for_llvm(&crt0)).unwrap();
-    let crt0_o = scratch.path("crt0.o");
-    tool(clang().arg(&crt0_s).arg("-o").arg(&crt0_o)).expect("assembling crt0.s with clang");
-    for_each_case("clang reference", &[C99_CASES], |c| {
+    for x in WIDTHS {
+        clang_reference_for(x);
+    }
+}
+
+fn clang_reference_for(x: Xlen) {
+    let scratch = Scratch::new(&format!("clang-{}", width(x)));
+    let crt0_o = clang_crt0(&scratch, x);
+    let what = format!("clang reference ({})", width(x));
+    for_each_case(&what, &[C99_CASES], x, |c| {
         let obj = scratch.path(&format!("{}.o", c.name));
         tool(
-            clang()
+            clang(x)
                 .args([
                     "-std=c99",
                     "-O0",

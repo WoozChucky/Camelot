@@ -1,5 +1,7 @@
 // expect: 11
-// typedef names for every kind of type, scoped like variables.
+// expect-lp64: 10
+// typedef names for every kind of type, scoped like variables. The sizes
+// checked last are ILP32's: on LP64 a pointer is 8 bytes, and that check fails.
 
 typedef int myint;
 typedef unsigned char byte;

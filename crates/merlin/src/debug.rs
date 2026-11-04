@@ -23,9 +23,14 @@
 //!   through compile units: without one, lldb and llvm-objdump ignore
 //!   `.debug_line`.
 //!
+//! Addresses (`DW_FORM_addr`) are the target's: 4 bytes written `.word` on
+//! RV32, 8 bytes written `.quad` on RV64, as clang writes them, and the
+//! unit's header says which (its address size).
+//!
 //! None of it changes the code: labels and directives assemble to no bytes
 //! in `.text`, and the debug sections are not loaded.
 
+use crate::types::{ptr_size, Xlen};
 use crate::Pos;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -81,6 +86,8 @@ pub(crate) struct Lines {
     /// A name already numbered (a header read twice is one file).
     by_name: HashMap<String, u32>,
     functions: Vec<Function>,
+    /// The target, whose addresses are 4 or 8 bytes.
+    xlen: Xlen,
 }
 
 /// `s` as an assembly string literal.
@@ -98,13 +105,14 @@ fn quoted(s: &str) -> String {
 }
 
 impl Lines {
-    pub fn new(info: &DebugInfo, names: &[String]) -> Self {
+    pub fn new(info: &DebugInfo, names: &[String], xlen: Xlen) -> Self {
         Lines {
             info: info.clone(),
             names: names.to_vec(),
             numbers: HashMap::new(),
             by_name: HashMap::new(),
             functions: Vec::new(),
+            xlen,
         }
     }
 
@@ -228,10 +236,15 @@ impl Lines {
         let asciz = |t: &str| t.len() as u32 + 1;
         let producer = "merlin";
         let name = self.name(0);
+        let addr = ptr_size(self.xlen);
+        let addr_directive = match self.xlen {
+            Xlen::Rv32 => ".word",
+            Xlen::Rv64 => ".quad",
+        };
         let mut length = 2 + 1 + 1 + 4; // version, unit type, address size, abbreviations
-        length += 1 + asciz(producer) + 2 + asciz(&name) + asciz(&self.info.comp_dir) + 4 + 4 + 4;
+        length += 1 + asciz(producer) + 2 + asciz(&name) + asciz(&self.info.comp_dir) + 4 + addr + 4;
         for f in &self.functions {
-            length += 1 + 4 + 4 + asciz(&f.name) + 2 + 4 + 1;
+            length += 1 + addr + 4 + asciz(&f.name) + 2 + 4 + 1;
         }
         length += 1; // the end of the unit's children
 
@@ -239,7 +252,7 @@ impl Lines {
         line(&mut s, format!(".word {length}    # unit length"));
         line(&mut s, ".half 5    # DWARF version".into());
         line(&mut s, format!(".byte {UT_COMPILE}    # a compile unit"));
-        line(&mut s, ".byte 4    # address size".into());
+        line(&mut s, format!(".byte {addr}    # address size"));
         line(&mut s, ".word .Ldebug_abbrev0".into());
         line(&mut s, ".byte 1    # the compile unit".into());
         line(&mut s, format!(".asciz {}", quoted(producer)));
@@ -247,11 +260,11 @@ impl Lines {
         line(&mut s, format!(".asciz {}", quoted(&name)));
         line(&mut s, format!(".asciz {}", quoted(&self.info.comp_dir)));
         line(&mut s, ".word .Lline_table_start0".into());
-        line(&mut s, format!(".word {}", first.name));
+        line(&mut s, format!("{addr_directive} {}", first.name));
         line(&mut s, format!(".word {} - {}", last.end, first.name));
         for f in &self.functions {
             line(&mut s, format!(".byte 2    # {}", f.name));
-            line(&mut s, format!(".word {}", f.name));
+            line(&mut s, format!("{addr_directive} {}", f.name));
             line(&mut s, format!(".word {} - {}", f.end, f.name));
             line(&mut s, format!(".asciz {}", quoted(&f.name)));
             line(&mut s, format!(".half {}", f.file));

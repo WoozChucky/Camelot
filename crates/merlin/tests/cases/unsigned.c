@@ -1,7 +1,9 @@
 // expect: 30
+// expect-lp64: 29
 // Unsigned arithmetic wraps, divides and compares as unsigned, and shifts in
 // zeros; mixing int and unsigned converts the int (the usual arithmetic
-// conversions). long is 32 bits, like int.
+// conversions). long is 32 bits on ILP32, like int; on LP64 it is 64, and
+// sizeof l == 4 fails there.
 int main() {
     unsigned u = 0;
     u = u - 1;                                   // 4294967295

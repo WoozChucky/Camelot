@@ -1,18 +1,24 @@
-//! How arguments and results travel: the RISC-V ILP32 integer calling
-//! convention (the psABI's "integer calling convention", as clang
-//! `--target=riscv32 -mabi=ilp32` implements it), for the types merlin has.
+//! How arguments and results travel: the RISC-V integer calling convention
+//! (the psABI's "integer calling convention"), ILP32 on RV32 and LP64 on
+//! RV64, as clang `--target=riscv32 -mabi=ilp32` and `--target=riscv64
+//! -mabi=lp64` implement it, for the types merlin has. A *word* here is a
+//! register: 4 bytes on RV32 (XLEN 32), 8 on RV64.
 //!
-//! * A scalar (an integer or a pointer) takes one argument register.
-//! * A struct or union of at most 4 bytes takes one register, and one of 5 to
-//!   8 bytes a pair: its bytes as they lie in memory, loaded as words (the
-//!   first 4 bytes in the lower-numbered register; bytes past the end are
-//!   undefined).
+//! * A scalar (an integer or a pointer) takes one argument register. One
+//!   narrower than the register travels extended as the psABI says: by its
+//!   signedness up to 32 bits, then sign-extended to the register, so on
+//!   RV64 an `unsigned int` 0xffffffff is -1 in its register (see "The 32-bit
+//!   invariant" in [`crate::codegen`]).
+//! * A struct or union of at most one word takes one register, and one of up
+//!   to two words (8 bytes on RV32, 16 on RV64) a pair: its bytes as they
+//!   lie in memory, loaded as words (the first word in the lower-numbered
+//!   register; bytes past the end are undefined).
 //! * A bigger struct or union is passed by reference: the caller copies it
 //!   and passes the copy's address in one register. The callee may change
 //!   the copy.
 //! * Arguments take the words of a sequence in order: words 0 to 7 are `a0`
-//!   to `a7`, word 8 is at `0(sp)` when the call is made, word 9 at
-//!   `4(sp)`, and so on. A pair that starts in `a7` has its second word at
+//!   to `a7`, word 8 is at `0(sp)` when the call is made, word 9 one word
+//!   above, and so on. A pair that starts in `a7` has its second word at
 //!   `0(sp)`. The caller makes room for the stack words; the callee finds
 //!   them at its `s0`, the `sp` it was called with.
 //! * The arguments a variadic function's `...` takes travel exactly like
@@ -27,7 +33,8 @@
 //!   first argument in `a0`, which moves every other argument one register
 //!   up, and the callee stores the result there.
 //!
-//! There are no 8-byte aligned types without `long long` and `double`, so the
+//! Without `long long` and `double` on RV32, and without `__int128` and
+//! `long double` on RV64, there is no type aligned to two words, so the
 //! even-register alignment the psABI asks of those never comes up, and
 //! without floating point the hardware-float rules do not apply.
 
@@ -38,9 +45,9 @@ use crate::types::{ptr_size, FuncType, Type, Xlen};
 pub enum Pass {
     /// An integer or pointer, in one register.
     Scalar,
-    /// A struct or union of at most 8 bytes, as 1 or 2 words in registers.
+    /// A struct or union of at most two words, as 1 or 2 words in registers.
     Words(u32),
-    /// A struct or union of more than 8 bytes: the address of a copy.
+    /// A struct or union of more than two words: the address of a copy.
     Ref,
 }
 
@@ -129,6 +136,19 @@ mod tests {
         assert!(returns_in_memory(&record(12), Xlen::Rv32));
         assert!(!returns_in_memory(&record(8), Xlen::Rv32));
         assert!(!returns_in_memory(&Type::INT, Xlen::Rv32));
+    }
+
+    #[test]
+    fn classification_on_rv64() {
+        let x = Xlen::Rv64;
+        assert_eq!(classify(&Type::Int(IntKind::Long), x), Pass::Scalar);
+        // A word is 8 bytes: one register up to 8, a pair up to 16.
+        assert_eq!(classify(&record(8), x), Pass::Words(1));
+        assert_eq!(classify(&record(9), x), Pass::Words(2));
+        assert_eq!(classify(&record(16), x), Pass::Words(2));
+        assert_eq!(classify(&record(17), x), Pass::Ref);
+        assert!(returns_in_memory(&record(24), x));
+        assert!(!returns_in_memory(&record(12), x));
     }
 
     #[test]
