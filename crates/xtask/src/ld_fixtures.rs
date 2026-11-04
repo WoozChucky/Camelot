@@ -1,6 +1,6 @@
 //! `cargo xtask ld-fixtures`: regenerates merlin-ld's test fixtures in
-//! `crates/merlin-ld/tests/fixtures` with clang, ld.lld, llvm-readobj and
-//! llvm-objdump.
+//! `crates/merlin-ld/tests/fixtures` ([`FIXTURES`]) with clang, ld.lld,
+//! llvm-readobj and llvm-objdump.
 //!
 //! In every fixture directory:
 //!
@@ -29,10 +29,17 @@
 //! outputs would differ. A source containing the line `# xtask: relax` is
 //! assembled with relaxation instead ([`RELAX_MARKER`]), to check that
 //! merlin-ld ignores the `R_RISCV_RELAX` hints that come with it.
+//!
+//! `--out DIR` regenerates into `DIR` instead, from copies of the sources
+//! ([`prepare_out`]): `diff -r` of the two trees then shows what a new LLVM
+//! would change, with the committed files untouched.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The fixtures directory, relative to the repository root.
+pub const FIXTURES: &str = "crates/merlin-ld/tests/fixtures";
 
 /// clang flags for every fixture object, followed by [`NO_RELAX`] unless the
 /// source asks for relaxation.
@@ -116,6 +123,65 @@ fn files(dir: &Path, ext: &str) -> Result<Vec<PathBuf>, String> {
 
 fn file_name(p: &Path) -> OsString {
     p.file_name().unwrap_or_default().to_os_string()
+}
+
+/// Whether a file is a hand-written fixture source (`.S` or `.ld`), as
+/// opposed to an output of [`run`].
+fn is_source(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e == "S" || e == "ld")
+}
+
+/// Copies the hand-written sources of the fixtures in `from` (every `.S` and
+/// `.ld`, in every directory below it) into the same places under `to`, so
+/// that [`run`] can regenerate the outputs there (`cargo xtask ld-fixtures
+/// --out DIR`). Returns the files copied.
+pub fn copy_sources(from: &Path, to: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut copied = Vec::new();
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(from)
+        .map_err(|e| format!("{}: {e}", from.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    entries.sort();
+    for path in entries {
+        let target = to.join(file_name(&path));
+        if path.is_dir() {
+            copied.extend(copy_sources(&path, &target)?);
+        } else if is_source(&path) {
+            std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
+            std::fs::copy(&path, &target).map_err(|e| format!("copying {}: {e}", path.display()))?;
+            copied.push(target);
+        }
+    }
+    Ok(copied)
+}
+
+/// Gets `out` ready for [`run`] in place of the committed `fixtures`
+/// (`cargo xtask ld-fixtures --out DIR`): a new or empty directory, into
+/// which the sources are copied ([`copy_sources`]). Regenerating there and
+/// comparing the two trees shows what a new LLVM (or a changed source) would
+/// change, without touching the committed files. An `out` that is the
+/// fixtures directory itself is returned as it is: that is a plain run.
+/// Returns `out` made absolute (the tools run in other directories).
+pub fn prepare_out(fixtures: &Path, out: &Path) -> Result<PathBuf, String> {
+    let out = std::path::absolute(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    if out.exists() {
+        let same =
+            |a: &Path, b: &Path| matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b);
+        if same(&out, fixtures) {
+            return Ok(out);
+        }
+        let mut contents = std::fs::read_dir(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+        if contents.next().is_some() {
+            // Old outputs or sources left there would make the comparison lie.
+            return Err(format!(
+                "{} is not empty (--out needs a new or empty directory)",
+                out.display()
+            ));
+        }
+    }
+    std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    copy_sources(fixtures, &out)?;
+    Ok(out)
 }
 
 /// Regenerates everything under `fixtures` (see the module documentation).
@@ -239,5 +305,60 @@ mod tests {
         assert!(!relax.contains(&"-mno-relax"));
         // Only as a line of its own.
         assert!(!wants_relax("# see `# xtask: relax` in relax.S\n"));
+    }
+
+    /// A new scratch directory for one test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xtask-ld-fixtures-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn out_gets_the_sources_only() {
+        let dir = scratch("out");
+        let fixtures = dir.join("fixtures");
+        for (f, text) in [
+            ("a/x.S", "nop\n"),
+            ("a/x.o", "object"),
+            ("a/link.ld", "SECTIONS {}\n"),
+            ("a/link.expected.txt", "listing"),
+            ("a/link.lld.elf", "elf"),
+            ("b/c/y.S", "ret\n"),
+        ] {
+            let path = fixtures.join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let out = prepare_out(&fixtures, &dir.join("out")).unwrap();
+        assert!(out.is_absolute());
+        // Only the hand-written sources, at every depth.
+        let mut got = Vec::new();
+        let mut todo = vec![out.clone()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    todo.push(p);
+                } else {
+                    got.push(p.strip_prefix(&out).unwrap().to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        got.sort();
+        assert_eq!(got, ["a/link.ld", "a/x.S", "b/c/y.S"]);
+        assert_eq!(std::fs::read_to_string(out.join("b/c/y.S")).unwrap(), "ret\n");
+
+        // A directory that is not empty is refused; the fixtures themselves
+        // are a plain run, nothing copied.
+        let err = prepare_out(&fixtures, &out).unwrap_err();
+        assert!(
+            err.ends_with("is not empty (--out needs a new or empty directory)"),
+            "{err}"
+        );
+        assert_eq!(prepare_out(&fixtures, &fixtures).unwrap(), fixtures);
+        assert_eq!(std::fs::read_to_string(fixtures.join("a/x.o")).unwrap(), "object");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
