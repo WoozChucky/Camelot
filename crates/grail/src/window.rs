@@ -481,9 +481,13 @@ impl Window {
     }
 
     /// Gives the window a client area of `width` × `height` pixels, keeping its top
-    /// left corner, unless it is maximized or minimized.
+    /// left corner, unless it is maximized or minimized. It stays on its monitor's work
+    /// area ([`fitted`]): a mode bigger than the screen (1920x1080 on a 1080p monitor,
+    /// once the borders and the title bar are counted) gets a smaller window, which the
+    /// frame is stretched to as always.
     fn fit_to(&self, width: u32, height: u32) {
-        // SAFETY: a valid window handle and RECTs the calls fill in.
+        // SAFETY: a valid window handle, and structs the calls fill in (MONITORINFO with
+        // its size set, as GetMonitorInfoW requires).
         unsafe {
             if IsZoomed(self.hwnd) != 0 || IsIconic(self.hwnd) != 0 {
                 return;
@@ -491,17 +495,49 @@ impl Window {
             let (mut outer, mut client) = (RECT::default(), RECT::default());
             GetWindowRect(self.hwnd, &mut outer);
             GetClientRect(self.hwnd, &mut client);
-            let extra_w = (outer.right - outer.left) - client.right;
-            let extra_h = (outer.bottom - outer.top) - client.bottom;
+            let extra = (
+                (outer.right - outer.left) - client.right,
+                (outer.bottom - outer.top) - client.bottom,
+            );
+            let mut monitor = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..MONITORINFO::default()
+            };
+            let on = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+            let work = (GetMonitorInfoW(on, &mut monitor) != 0).then_some(monitor.rcWork);
+            let to = fitted(outer, extra, width, height, work);
             MoveWindow(
                 self.hwnd,
-                outer.left,
-                outer.top,
-                width as i32 + extra_w,
-                height as i32 + extra_h,
+                to.left,
+                to.top,
+                to.right - to.left,
+                to.bottom - to.top,
                 1,
             );
         }
+    }
+}
+
+/// Where a window whose outer rectangle is `outer` goes for a client area of `width` ×
+/// `height`, `extra` being what its frame adds (borders, title bar): at its top left
+/// corner, but inside `work`, its monitor's work area, when that is known. There it is
+/// no bigger than the work area, and moved up or left as far as needed for its right
+/// and bottom edges to be in it, so that the title bar stays on screen.
+fn fitted(outer: RECT, extra: (i32, i32), width: u32, height: u32, work: Option<RECT>) -> RECT {
+    let mut w = (width as i32).saturating_add(extra.0);
+    let mut h = (height as i32).saturating_add(extra.1);
+    let (mut left, mut top) = (outer.left, outer.top);
+    if let Some(work) = work {
+        w = w.min(work.right - work.left);
+        h = h.min(work.bottom - work.top);
+        left = left.min(work.right - w).max(work.left);
+        top = top.min(work.bottom - h).max(work.top);
+    }
+    RECT {
+        left,
+        top,
+        right: left + w,
+        bottom: top + h,
     }
 }
 
@@ -655,6 +691,44 @@ mod tests {
         );
         st.release_all();
         assert!(st.keys.take().is_empty());
+    }
+
+    /// A window resized for a new mode keeps its corner when it fits on the monitor's
+    /// work area, and otherwise shrinks to it and moves back onto it.
+    #[test]
+    fn a_resized_window_stays_on_its_monitor() {
+        let rect = |left, top, right, bottom| RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let pos = |r: RECT| (r.left, r.top, r.right - r.left, r.bottom - r.top);
+        // A 1080p monitor with a 48-pixel taskbar; the frame adds 16 x 39.
+        let work = Some(rect(0, 0, 1920, 1032));
+        let extra = (16, 39);
+        let outer = rect(100, 50, 100 + 656, 50 + 519);
+        // 800x600 fits where the window is.
+        assert_eq!(pos(fitted(outer, extra, 800, 600, work)), (100, 50, 816, 639));
+        // 1280x1024 fits across but not down: as tall as the work area, from its top.
+        assert_eq!(pos(fitted(outer, extra, 1280, 1024, work)), (100, 0, 1296, 1032));
+        // 1920x1080 fits neither way: the whole work area.
+        assert_eq!(pos(fitted(outer, extra, 1920, 1080, work)), (0, 0, 1920, 1032));
+        // Near the right edge, it moves left as far as it must.
+        let right = rect(1500, 50, 1500 + 656, 50 + 519);
+        assert_eq!(pos(fitted(right, extra, 800, 600, work)), (1104, 50, 816, 639));
+        // A second monitor left of the first, at negative coordinates.
+        let left_monitor = Some(rect(-1280, 0, 0, 984));
+        let on_it = rect(-1200, 100, -1200 + 656, 100 + 519);
+        assert_eq!(
+            pos(fitted(on_it, extra, 1280, 720, left_monitor)),
+            (-1280, 100, 1280, 759)
+        );
+        // No monitor known: just the size asked for.
+        assert_eq!(
+            pos(fitted(right, extra, 1920, 1080, None)),
+            (1500, 50, 1936, 1119)
+        );
     }
 
     #[test]
@@ -956,6 +1030,31 @@ mod tests {
         assert!(w.pump());
         assert_eq!(client_size(&w), (800, 600));
         assert_eq!(w.frame_size(), (800, 600));
+        // One bigger than any monitor stays on the monitor's work area.
+        w.draw(off(8000, 8000));
+        assert!(w.pump());
+        // SAFETY: a valid window handle, and structs the calls fill in.
+        let (outer, work) = unsafe {
+            let mut outer = RECT::default();
+            GetWindowRect(w.hwnd, &mut outer);
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..MONITORINFO::default()
+            };
+            let on = MonitorFromWindow(w.hwnd, MONITOR_DEFAULTTONEAREST);
+            assert_ne!(GetMonitorInfoW(on, &mut info), 0);
+            (outer, info.rcWork)
+        };
+        assert!(
+            outer.left >= work.left
+                && outer.top >= work.top
+                && outer.right <= work.right
+                && outer.bottom <= work.bottom,
+            "window {:?} outside the work area {:?}",
+            (outer.left, outer.top, outer.right, outer.bottom),
+            (work.left, work.top, work.right, work.bottom)
+        );
+        assert_eq!(w.frame_size(), (8000, 8000), "the mouse maps to the frame");
         drop(w);
         // A second window on the same thread still works after the first was destroyed.
         let mut w = Window::open("Grail window test 2").unwrap();

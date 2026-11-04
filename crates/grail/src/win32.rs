@@ -14,6 +14,7 @@ pub type HICON = HANDLE;
 pub type HCURSOR = HANDLE;
 pub type HBRUSH = HANDLE;
 pub type HMENU = HANDLE;
+pub type HMONITOR = HANDLE;
 pub type WPARAM = usize;
 pub type LPARAM = isize;
 pub type LRESULT = isize;
@@ -141,6 +142,21 @@ pub struct RECT {
     pub bottom: i32,
 }
 
+/// What `GetMonitorInfoW` fills in: the monitor's rectangle and its work area (the
+/// monitor less the taskbar and docked bars), in virtual-screen coordinates.
+#[repr(C)]
+#[derive(Default)]
+pub struct MONITORINFO {
+    /// `size_of::<MONITORINFO>()`, set by the caller.
+    pub cbSize: u32,
+    pub rcMonitor: RECT,
+    pub rcWork: RECT,
+    pub dwFlags: u32,
+}
+
+/// `MonitorFromWindow`: the monitor nearest the window when it is on none.
+pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
+
 #[repr(C)]
 pub struct MSG {
     pub hwnd: HWND,
@@ -242,6 +258,8 @@ extern "system" {
     pub fn GetWindowRect(hwnd: HWND, rect: *mut RECT) -> BOOL;
     pub fn IsZoomed(hwnd: HWND) -> BOOL;
     pub fn IsIconic(hwnd: HWND) -> BOOL;
+    pub fn MonitorFromWindow(hwnd: HWND, flags: u32) -> HMONITOR;
+    pub fn GetMonitorInfoW(monitor: HMONITOR, info: *mut MONITORINFO) -> BOOL;
     pub fn SetWindowTextW(hwnd: HWND, text: *const u16) -> BOOL;
     pub fn LoadCursorW(hinst: HINSTANCE, name: *const u16) -> HCURSOR;
     pub fn GetDC(hwnd: HWND) -> HDC;
@@ -333,6 +351,7 @@ mod tests {
             assert_eq!(size_of::<CREATESTRUCTW>(), 48);
         }
         assert_eq!(size_of::<RECT>(), 16);
+        assert_eq!(size_of::<MONITORINFO>(), 40);
         assert_eq!(size_of::<BITMAPINFOHEADER>(), 40);
         assert_eq!(size_of::<BITMAPINFO>(), 44);
     }
