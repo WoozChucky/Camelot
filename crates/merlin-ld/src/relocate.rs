@@ -80,7 +80,7 @@ pub fn relocate(layout: &Layout) -> Result<Images, Vec<Error>> {
 /// `/DISCARD/` threw away, or one not loaded) writes 0, as ld.lld does: the
 /// debug information of code that is gone points nowhere.
 fn debug(layout: &Layout, errors: &mut Vec<Error>) -> Vec<Vec<u8>> {
-    let ctx = Context::new(layout.class);
+    let ctx = Context::debug(layout.class);
     let mut images = Vec::new();
     for ds in &layout.debug {
         let mut img = vec![0; ds.size as usize];
@@ -102,7 +102,9 @@ fn debug(layout: &Layout, errors: &mut Vec<Error>) -> Vec<Vec<u8>> {
                     )));
                     continue;
                 }
-                // S = -A, modulo 2^64, so that S + A, the value written, is 0.
+                // S = -A, modulo 2^64, so that S + A, the value written, is
+                // 0 for R_RISCV_32 (an offset) and R_RISCV_64 (an address)
+                // alike, whatever the addend: ld.lld writes 0 there too.
                 let sym = if layout.in_dropped_section(i.object, r.sym as usize) {
                     Ok(0u64.wrapping_sub(r.addend as u64))
                 } else {

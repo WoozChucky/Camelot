@@ -18,6 +18,8 @@
 //!   point into each other.
 //! * `fixtures/relocs`: every relocation type, across objects, at the edges
 //!   of their ranges; one object built with relaxation (`R_RISCV_RELAX`).
+//! * `fixtures/data64`: `.dword sym + A` (R_RISCV_64) on RV32, in `.data`
+//!   and in a debug section, which ld.lld fills differently.
 //! * `fixtures/merge`: mergeable strings, where merlin-ld differs from ld.lld
 //!   on purpose (spec §10); the test pins down the difference.
 //! * `fixtures/rejects`, `fixtures/symbols`: objects for error paths.
@@ -882,6 +884,55 @@ fn relocs_match_ld_lld() {
     let edges = l.symbol("branch_edges").unwrap();
     assert_eq!(edges - l.symbol("branch_back").unwrap(), 4096);
     assert_eq!(l.symbol("branch_fwd").unwrap() - (edges + 4), 4092);
+}
+
+/// `.dword sym + A` (R_RISCV_64) on RV32 gives ld.lld's bytes: in `.data`,
+/// S + A in 64 bits (the program checks the words at run time); in a debug
+/// section, the 32-bit S + A sign-extended, as ld.lld's relocateNonAlloc
+/// writes it.
+#[test]
+fn data64_matches_ld_lld() {
+    let types = reloc_types("data64/data64.o");
+    assert_eq!(types.get("R_RISCV_64"), Some(&8), "{types:?}");
+    let linked = assert_matches_ld_lld("data64/link", "OK\n");
+
+    let lld_file = std::fs::read(fixtures().join("data64/link.lld.elf")).unwrap();
+    let debug_info = |file: &[u8]| -> Vec<u8> {
+        let e = elf::Elf::parse(file).unwrap();
+        let s = e.sections.iter().find(|s| s.name == ".debug_info").unwrap();
+        e.section_data(s).unwrap().to_vec()
+    };
+    let ours = debug_info(&linked.elf);
+    assert_eq!(ours, debug_info(&lld_file), ".debug_info");
+    // What the comparison is about, spelled out: `target` (0x800000d0) and
+    // `target + 0x7fffffff`, loaded and not.
+    let target = linked.layout.symbol("target").unwrap();
+    assert_eq!(target, 0x8000_00d0);
+    let dwords = |b: &[u8]| -> Vec<u64> {
+        b.chunks(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    assert_eq!(
+        dwords(&ours),
+        [
+            0xffff_ffff_8000_00d0,
+            0xffff_ffff_8000_00cf,
+            0xcf,
+            0xffff_ffff_ffff_ffff
+        ]
+    );
+    let data = linked
+        .layout
+        .sections
+        .iter()
+        .position(|s| s.name == ".data")
+        .unwrap();
+    let images = merlin_ld::relocate::relocate(&linked.layout).unwrap();
+    assert_eq!(
+        dwords(&images.sections[data][..32]),
+        [0x8000_00d0, 0x8000_00cf, 0x1_0000_00cf, 0xffff_ffff]
+    );
 }
 
 /// A jump or call to an undefined weak symbol aims at itself (as in ld.lld):
