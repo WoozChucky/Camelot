@@ -456,6 +456,15 @@ mod tests {
         assert_eq!(n("1e3").as_u64(), None);
         assert_eq!(Json::from(u64::MAX).encode(), "18446744073709551615");
         assert_eq!(Json::from(-5i64).encode(), "-5");
+        assert_eq!(n("-9223372036854775808").as_i64(), Some(i64::MIN));
+        assert_eq!(n("9223372036854775808").as_i64(), None);
+        assert_eq!(n("-3").as_i64(), Some(-3));
+        assert_eq!(n("-3.0").as_i64(), None);
+        assert_eq!(n("2E1").as_i64(), None);
+        assert_eq!(n("-33.25").as_f64(), Some(-33.25));
+        assert_eq!(n("1e2").as_f64(), Some(100.0));
+        assert_eq!(n("1e999").as_f64(), None, "not infinity");
+        assert_eq!(Json::from("1").as_f64(), None);
         for bad in [
             "01", "-", "1.", ".5", "1e", "1e+", "+1", "-01", "0x10", "NaN", "Infinity", "1_000",
         ] {
