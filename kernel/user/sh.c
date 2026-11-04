@@ -28,11 +28,24 @@
  *   sh: NAME: REASON     when a program can't be started, a file can't be
  *                        opened, or a line makes no sense
  *
- * Built-ins: help, exit [N], wait, cd [DIR]. They run in the shell itself,
- * with its redirections, but can't be part of a pipeline. The shell ends
- * with `exit`, or at the end of the input (Ctrl-D on an empty line), with
- * the status N or else the last foreground program's; when it is the first
- * process, the kernel then stops the machine with it.
+ * Built-ins: help, exit [N], wait, cd [DIR], exec [PROG [ARG...]]. They run
+ * in the shell itself, with its redirections, but can't be part of a
+ * pipeline. The shell ends with `exit`, or at the end of the input (Ctrl-D
+ * on an empty line), with the status N or else the last foreground
+ * program's; when it is the first process, the kernel then stops the
+ * machine with it.
+ *
+ * `exec PROG [ARG...]` is POSIX's: the program replaces the shell in its
+ * process (the kernel's exec), with the same pid, parent, descriptors and
+ * children, so the shell's parent waits for the program instead, and the
+ * program's status is the session's. If the program can't be started, the
+ * shell says so and carries on, unless the line redirected its input or
+ * output: those are the shell's own by then (it keeps no copy of its old
+ * ones for the program to inherit), so it ends, with 127 if there is no such
+ * program and 126 otherwise. Without a program, `exec`'s redirections stay
+ * the shell's: `exec < FILE` reads the next lines from FILE. In a pipeline
+ * or a background job, which POSIX runs apart from the shell, `exec PROG`
+ * runs PROG as if `exec` were not there.
  *
  * Its input is usually the console, whose line discipline edits and echoes
  * a line and hands it over whole, one per read. Any other input (a network
@@ -72,6 +85,11 @@ static struct job jobs[MAX_JOBS];
 
 /* The exit status of the last foreground program. */
 static int last_status;
+
+/* Whether the input is the console (a device) or a network connection: see
+ * the top. */
+static int console_input;
+static int connection_input;
 
 /* A token of a line: a word, or an operator ('&', '|', '<', '>'). */
 struct token {
@@ -176,6 +194,7 @@ static void help(void) {
     printf("exit [N]        leave the shell, with status N or the last program's\n");
     printf("wait            wait for every background program\n");
     printf("cd [DIR]        change the working directory, to / without DIR\n");
+    printf("exec [PROG ...] replace the shell with PROG; without one, keep its redirections\n");
     printf("PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /\n");
     printf("CMD < FILE      read the input from FILE\n");
     printf("CMD > FILE      write the output to FILE\n");
@@ -187,7 +206,7 @@ static void help(void) {
 static int is_builtin(const struct cmd *c) {
     const char *name = c->argv[0];
     return strcmp(name, "exit") == 0 || strcmp(name, "help") == 0 || strcmp(name, "wait") == 0 ||
-           strcmp(name, "cd") == 0;
+           strcmp(name, "cd") == 0 || strcmp(name, "exec") == 0;
 }
 
 /* Runs built-in `c`. Returns 1 if the shell should exit, with the status in
@@ -307,10 +326,79 @@ static void close_if(int fd) {
     }
 }
 
+/* Says why program `name` can't be started: spawn's or exec's error `err`. */
+static void cannot_start(const char *name, int err) {
+    /* A name that isn't in /bin is the usual mistake. */
+    int bare = strchr(name, '/') == NULL;
+    int missing = err == -ENOENT || err == -ENAMETOOLONG;
+    const char *why = bare && missing ? "no such program" : strerror(-err);
+    fprintf(STDERR, "sh: %s: %s\n", name, why);
+}
+
+/* Looks at what the input is (see the top). */
+static void look_at_input(void) {
+    struct stat st;
+    int got_stat = fstat(STDIN, &st) == 0;
+    console_input = got_stat && st.type == T_DEVICE;
+    connection_input = got_stat && st.type == T_SOCKET;
+}
+
+/* `exec [PROG [ARG...]]`, alone in the foreground (see the top). Returns 1
+ * if the shell should exit, with the status in *exit_status: PROG could not
+ * be started after the redirections took the shell's own input or output. */
+static int exec_builtin(struct cmd *c, int *exit_status) {
+    int in = -1;
+    int out = -1;
+    if (open_files(c, &in, &out) < 0) {
+        return 0;
+    }
+    /* No copies kept: the program gets the shell's descriptors, nothing else. */
+    if (in >= 0) {
+        put_at(STDIN, in);
+        close(in);
+    }
+    if (out >= 0) {
+        put_at(STDOUT, out);
+        close(out);
+    }
+    if (c->argc == 1) {
+        look_at_input();
+        return 0;
+    }
+    char path[MAXPATH + 2];
+    int err = exec(program_path(c->argv[1], path), &c->argv[1]);
+    /* Still here: the program couldn't start, and nothing else changed. */
+    cannot_start(c->argv[1], err);
+    if (in < 0 && out < 0) {
+        return 0;
+    }
+    int missing = err == -ENOENT || err == -ENAMETOOLONG || err == -ENOTDIR;
+    *exit_status = missing ? 127 : 126;
+    return 1;
+}
+
 /* Runs the pipeline cmds[0..n), in the background or not. Returns 1 if the
- * shell should exit (the `exit` built-in), with the status in
- * *exit_status. */
+ * shell should exit (the `exit` built-in, or a failed `exec`), with the
+ * status in *exit_status. */
 static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
+    if (n == 1 && !background && strcmp(cmds[0].argv[0], "exec") == 0) {
+        return exec_builtin(&cmds[0], exit_status);
+    }
+    /* Apart from the shell, `exec PROG` is PROG: drop the word. */
+    for (int i = 0; i < n; i++) {
+        struct cmd *c = &cmds[i];
+        while (strcmp(c->argv[0], "exec") == 0) {
+            if (c->argc == 1) {
+                fprintf(STDERR, "sh: exec: no program to run in a pipeline or the background\n");
+                return 0;
+            }
+            /* argv[argc] is the NULL, which moves down too. */
+            for (int k = 0; k < c->argc; k++) {
+                c->argv[k] = c->argv[k + 1];
+            }
+            c->argc--;
+        }
+    }
     if (n == 1 && is_builtin(&cmds[0]) && cmds[0].in == NULL && cmds[0].out == NULL) {
         return builtin(&cmds[0], exit_status);
     }
@@ -372,11 +460,7 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
         char path[MAXPATH + 2];
         int pid = spawn(program_path(cmds[i].argv[0], path), cmds[i].argv);
         if (pid < 0) {
-            /* A name that isn't in /bin is the usual mistake. */
-            int bare = strchr(cmds[i].argv[0], '/') == NULL;
-            int missing = pid == -ENOENT || pid == -ENAMETOOLONG;
-            const char *why = bare && missing ? "no such program" : strerror(-pid);
-            fprintf(STDERR, "sh: %s: %s\n", cmds[i].argv[0], why);
+            cannot_start(cmds[i].argv[0], pid);
             break;
         }
         pids[started] = pid;
@@ -459,9 +543,6 @@ static int run_line(char *line, int *exit_status) {
     return 0;
 }
 
-/* Whether the input is the console (a device): see the top. */
-static int console_input;
-
 /* Reads a line of input that isn't the console's into `buf` (LINE_SIZE
  * bytes), a byte at a time, without its newline (and a '\r' before it).
  * A longer line is read to its end, said to be too long, and left out.
@@ -501,10 +582,7 @@ static int read_line(char *buf) {
 
 int main(void) {
     char line[LINE_SIZE];
-    struct stat st;
-    int got_stat = fstat(STDIN, &st) == 0;
-    console_input = got_stat && st.type == T_DEVICE;
-    int connection_input = got_stat && st.type == T_SOCKET;
+    look_at_input();
     printf("Type help for the list of commands.\n");
     for (;;) {
         printf(PROMPT);

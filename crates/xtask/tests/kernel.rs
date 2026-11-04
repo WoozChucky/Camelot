@@ -1512,6 +1512,7 @@ help            this list
 exit [N]        leave the shell, with status N or the last program's
 wait            wait for every background program
 cd [DIR]        change the working directory, to / without DIR
+exec [PROG ...] replace the shell with PROG; without one, keep its redirections
 PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /
 CMD < FILE      read the input from FILE
 CMD > FILE      write the output to FILE

@@ -1531,6 +1531,56 @@ fn the_shell_runs_programs_from_bin_and_redirects_through_files_and_pipes() {
 }
 
 #[test]
+fn exec_keeps_its_redirections_or_ends_the_shell() {
+    // The shell's `exec` without a program: its redirections stay the shell's, POSIX's
+    // way. `exec > /log` sends the shell's output (its prompts and its programs') to
+    // /log from then on; `exec < /script` reads the next lines from /script, a byte at
+    // a time as from any input that is not the console, and the end of the file ends
+    // the shell with the last program's status, which stops the machine.
+    let image = root_image();
+    let run = boot(
+        image,
+        Boot {
+            input: b"echo systest exit 5 > /script\n\
+                exec > /log\n\
+                echo into the log\n\
+                exec < /script\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(5), "{}", run.out);
+    assert_eq!(shell_output(&run.out, "echo systest exit 5 > /script"), "");
+    fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    let fs = Fs::open(&run.disk).unwrap();
+    assert_eq!(
+        String::from_utf8(fs.read_file("/log").unwrap()).unwrap(),
+        format!("{PROMPT}into the log\n{PROMPT}{PROMPT}systest: exit 5\n{PROMPT}")
+    );
+
+    // `exec PROG` with a redirection, PROG missing: the shell's output is /out by
+    // then, with no copy of the console's kept, so the shell ends, with 127 (POSIX's
+    // status for a program not found), rather than go on writing where nobody looks.
+    let run = boot(
+        root_image(),
+        Boot {
+            input: b"exec nosuch > /out\necho not run > /not-run\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(127), "{}", run.out);
+    assert_eq!(
+        shell_output(&run.out, "exec nosuch > /out"),
+        "sh: nosuch: no such program\n"
+    );
+    fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    let fs = Fs::open(&run.disk).unwrap();
+    assert_eq!(fs.read_file("/out").unwrap(), b"");
+    assert!(fs.lookup("/not-run").is_err());
+}
+
+#[test]
 fn filetest_passes_on_the_root_image_and_leaves_it_as_it_was() {
     // Every file system call and its errors (kernel/user/filetest.c), on
     // the root image. filetest removes what it made: the disk ends as it

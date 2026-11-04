@@ -16,7 +16,7 @@ for `grep`, whose 1 means "no line matched".
 
 | Program | Usage | What it does |
 |---|---|---|
-| `sh` | `sh` | the shell: commands, `<`, `>`, `\|`, `&`, and the built-ins `cd`, `wait`, `exit`, `help`; it reads the console a line at a time, any other input (a connection from `shd`, a pipe, a file) a byte at a time, up to each newline |
+| `sh` | `sh` | the shell: commands, `<`, `>`, `\|`, `&`, and the built-ins `cd`, `wait`, `exit`, `exec`, `help`; it reads the console a line at a time, any other input (a connection from `shd`, a pipe, a file) a byte at a time, up to each newline |
 | `ls` | `ls [PATH...]` | lists directories (the working directory without arguments): type, inode, links, size, name |
 | `cat` | `cat [FILE...]` | copies files, or its input, to its output; refuses a directory |
 | `echo` | `echo [-n] [ARG...]` | prints its arguments, with a newline unless `-n` |
