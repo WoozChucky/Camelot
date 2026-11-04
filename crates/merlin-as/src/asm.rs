@@ -625,7 +625,25 @@ impl Assembler {
         self.current = self.sections.len() - 1;
     }
 
+    /// Whether `n` more bytes fit in the current section, which reports an
+    /// error if they do not. A section's size and offsets are 32-bit here
+    /// (all ELF32 has room for; on RV64 merlin-as's own limit), so a section
+    /// stops short of 4 GiB: whatever would take it there is an error, never
+    /// a size that wraps around.
+    fn has_room(&mut self, n: u64) -> bool {
+        let sec = &self.sections[self.current];
+        if u64::from(sec.size) + n <= u64::from(u32::MAX) {
+            return true;
+        }
+        let msg = format!("section {} would be 4 GiB or larger", sec.name);
+        self.error(msg);
+        false
+    }
+
     fn emit_bytes(&mut self, bytes: &[u8]) {
+        if !self.has_room(bytes.len() as u64) {
+            return;
+        }
         let sec = &mut self.sections[self.current];
         if sec.kind == SectionKind::Bss {
             if bytes.iter().any(|&b| b != 0) {
@@ -638,12 +656,15 @@ impl Assembler {
         sec.size += bytes.len() as u32;
     }
 
-    fn emit_zeros(&mut self, n: u32) {
+    fn emit_zeros(&mut self, n: u64) {
+        if !self.has_room(n) {
+            return;
+        }
         let sec = &mut self.sections[self.current];
         if sec.kind != SectionKind::Bss {
             sec.data.resize(sec.data.len() + n as usize, 0);
         }
-        sec.size += n;
+        sec.size += n as u32;
     }
 
     fn add_reloc(&mut self, offset: u32, kind: RelocKind, symbol: String, addend: i64) {
@@ -669,7 +690,7 @@ impl Assembler {
                 self.emit_bytes(&0x0000_0013u32.to_le_bytes()); // nop
             }
         } else {
-            self.emit_zeros(pad);
+            self.emit_zeros(pad.into());
         }
     }
 
@@ -850,6 +871,38 @@ impl Assembler {
         self.define(name, section, value as u32);
     }
 
+    /// `.space n[, fill]` (and its other names, `.zero` and `.skip`): `n`
+    /// bytes of `fill`, zero if it is left out. As in LLVM, only the low
+    /// byte of `fill` counts (`.space 3, 0x1ff` is three 0xff), and a
+    /// negative `n` is "invalid number of bytes". `n` is never cut to fit:
+    /// one that would take the section to 4 GiB is an error too.
+    fn space(&mut self, name: &str, args: &[DirArg]) {
+        let Some(n) = self.arg_const(args, 0, name) else {
+            return;
+        };
+        let fill = if args.len() > 1 {
+            match self.arg_const(args, 1, name) {
+                Some(f) => f as u8,
+                None => return,
+            }
+        } else {
+            0
+        };
+        let Ok(n) = u64::try_from(n) else {
+            return self.error("invalid number of bytes");
+        };
+        // Checked before the bytes are made, so that a huge count is an
+        // error rather than a huge allocation.
+        if !self.has_room(n) {
+            return;
+        }
+        if fill == 0 {
+            self.emit_zeros(n);
+        } else {
+            self.emit_bytes(&vec![fill; n as usize]);
+        }
+    }
+
     /// `.comm sym, size[, align]` for a symbol made `.local` first, or
     /// `.lcomm sym, size[, align]`: reserves `size` zero bytes for `sym` in
     /// `.bss`, aligned to `align` bytes, as clang's assembler does. This is
@@ -894,7 +947,7 @@ impl Assembler {
         if self.symbols[i].ty == SymType::NoType {
             self.symbols[i].ty = SymType::Object;
         }
-        self.emit_zeros(size as u32);
+        self.emit_zeros(size as u64);
         self.current = back;
     }
 
@@ -963,16 +1016,7 @@ impl Assembler {
                     }
                 }
             }
-            ".zero" | ".space" | ".skip" => {
-                if let Some(n) = self.arg_const(args, 0, name) {
-                    if args.len() > 1 {
-                        let fill = self.arg_const(args, 1, name).unwrap_or(0) as u8;
-                        self.emit_bytes(&vec![fill; n as usize]);
-                    } else {
-                        self.emit_zeros(n as u32);
-                    }
-                }
-            }
+            ".zero" | ".space" | ".skip" => self.space(name, args),
             // RISC-V `.align n` means 2^n bytes, same as `.p2align`.
             ".align" | ".p2align" => {
                 if let Some(n) = self.arg_const(args, 0, name) {
@@ -1749,6 +1793,51 @@ g:      nop
             ".lcomm x\n",
         ] {
             assert!(crate::assemble(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn space_fills_with_the_low_byte() {
+        // llvm-mc's .data for the same lines: fffffffe fe050580.
+        let src = ".data\n.space 3, 0x1ff\n.space 2, -2\n.zero 2, 5\n.skip 1, 0x80\n.space 0\n";
+        let obj = crate::assemble(src).unwrap();
+        let (_, data) = section(&obj, ".data");
+        assert_eq!(data.data, [0xff, 0xff, 0xff, 0xfe, 0xfe, 5, 5, 0x80]);
+    }
+
+    #[test]
+    fn space_counts_are_never_cut() {
+        // A negative count is LLVM's "invalid number of bytes", whatever the
+        // directive is called and whether or not it has a fill.
+        for bad in [
+            ".data\n.space -1\n",
+            ".data\n.space -1, 7\n",
+            ".data\n.skip -5\n",
+            ".bss\n.zero -1\n",
+        ] {
+            let errs = crate::assemble(bad).unwrap_err();
+            assert_eq!(errs[0].msg, "invalid number of bytes", "{bad}");
+        }
+        // A section holds up to 4 GiB - 1 bytes: 0xffffffff fit in .bss (as
+        // llvm-mc writes it), one more is an error, by .space, by data or
+        // by .lcomm, and a count past 32 bits is never cut to its low bits
+        // (`.space 0x100000003` is not 3 bytes) nor allocated.
+        let obj = crate::assemble(".bss\n.space 0xffffffff\n").unwrap();
+        assert_eq!(section(&obj, ".bss").1.size, u32::MAX);
+        for bad in [
+            ".bss\n.space 0xffffffff\n.byte 0\n",
+            ".bss\n.byte 0\n.space 0xffffffff\n",
+            ".bss\n.space 0x100000003\n",
+            ".data\n.space 0x100000003\n.word 1\n",
+            ".data\n.space 0x7fffffffffffffff, 1\n",
+            ".lcomm a, 0xffffffff\n.lcomm b, 1\n",
+        ] {
+            let errs = crate::assemble(bad).unwrap_err();
+            assert_eq!(errs.len(), 1, "{bad}: {errs:?}");
+            assert!(
+                errs[0].msg.ends_with(" would be 4 GiB or larger"),
+                "{bad}: {errs:?}"
+            );
         }
     }
 

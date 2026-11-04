@@ -269,6 +269,12 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
         ".file 1 \"a.c\"\n.file 1 \"b.c\"\n.file 0 \"d\" \"a.c\" source \"int x;\"\n.file 0 \"d\" \"a.c\" md5\n",
         ".file 0 \"d\" \"a.c\" md5 \"x\"\n.file\n.file \"a\" \"b\"\n.file 1\n.loc\n.loc 0 x\n",
         ".section .debug_info\nnop\n",
+        // An alias's address wraps around in 64 bits, then must be in its
+        // section.
+        ".data\n.word 0\nx: .word 0\n.equ BIG, 0x7fffffffffffffff\n.set y, x + BIG\n.set z, x - 8\n",
+        // .space: no negative count, no section of 4 GiB or more.
+        ".data\n.space -1\n.skip -5, 7\n.space 0x100000003\n.word 1\n.space 2, x\n",
+        ".bss\n.space 0xffffffff\n.byte 0\n.lcomm b, 1\n",
     ];
     let inputs: Vec<(String, String)> = cases
         .iter()

@@ -502,7 +502,27 @@ static void switch_section(const char *name) {
     current = (int)nsections++;
 }
 
+/* The error for bytes that would take the current section to 4 GiB. */
+static void no_room(void) {
+    error(fmt("section %s would be 4 GiB or larger", sections[current].name));
+}
+
+/* Whether n more bytes fit in the current section, which reports an error
+ * if they do not. A section's size and offsets are 32-bit (all ELF32 has
+ * room for), so a section stops short of 4 GiB: whatever would take it
+ * there is an error, never a size that wraps around. */
+static int has_room(uint n) {
+    if (n <= 0xffffffffu - sections[current].size) {
+        return 1;
+    }
+    no_room();
+    return 0;
+}
+
 static void emit_bytes(const uchar *bytes, uint n) {
+    if (!has_room(n)) {
+        return;
+    }
     struct section *s = &sections[current];
     if (s->kind == SEC_BSS) {
         for (uint i = 0; i < n; i++) {
@@ -520,6 +540,9 @@ static void emit_bytes(const uchar *bytes, uint n) {
 }
 
 static void emit_zeros(uint n) {
+    if (!has_room(n)) {
+        return;
+    }
     struct section *s = &sections[current];
     if (s->kind != SEC_BSS) {
         buf_zeros(&s->data, n);
@@ -1092,19 +1115,36 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
             }
         }
     } else if (strcmp(name, ".zero") == 0 || strcmp(name, ".space") == 0 || strcmp(name, ".skip") == 0) {
+        /* `.space n[, fill]`: n bytes of fill's low byte (zero without one).
+         * A negative n is LLVM's "invalid number of bytes"; n is never cut
+         * to fit: one that would take the section to 4 GiB is an error. */
         if (!arg_const(args, nargs, 0, name, &v)) {
             return;
         }
-        if (nargs > 1) {
-            i64 fill;
-            if (!arg_const(args, nargs, 1, name, &fill)) {
-                fill = i64_u(0);
-            }
-            uchar *bytes = tmp_alloc(v.lo + 1);
-            memset(bytes, (int)(fill.lo & 0xff), v.lo);
-            emit_bytes(bytes, v.lo);
-        } else {
+        i64 fill = i64_u(0);
+        if (nargs > 1 && !arg_const(args, nargs, 1, name, &fill)) {
+            return;
+        }
+        if (i64_is_neg(v)) {
+            error("invalid number of bytes");
+            return;
+        }
+        /* Checked before the bytes are made, so that a huge count is an
+         * error rather than a huge allocation. */
+        if (v.hi != 0) {
+            no_room();
+            return;
+        }
+        if (!has_room(v.lo)) {
+            return;
+        }
+        uint byte = fill.lo & 0xff;
+        if (byte == 0 || v.lo == 0) {
             emit_zeros(v.lo);
+        } else {
+            uchar *bytes = tmp_alloc(v.lo);
+            memset(bytes, (int)byte, v.lo);
+            emit_bytes(bytes, v.lo);
         }
     } else if (strcmp(name, ".align") == 0 || strcmp(name, ".p2align") == 0) {
         /* RISC-V `.align n` means 2^n bytes, as `.p2align` does. */
