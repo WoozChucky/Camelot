@@ -363,18 +363,33 @@ pub enum AttachKind {
 }
 
 /// A key press or release for the guest's keyboard device (Excalibur spec section
-/// 9.4). `code` is a key code from the spec's table, never 0.
+/// 9.4), in both of the device's forms: a viewer does not know which mode the guest
+/// chose, so it sends the character typed and the physical key, and the device keeps
+/// the one of its mode. At least one of `code` and `usage` is not 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyEvent {
+    /// ASCII mode's key code, from the spec's table; 0 for a key that types nothing
+    /// (a modifier alone, Home, an accented letter).
     pub code: u8,
     pub release: bool,
+    /// Shift was held (for ASCII mode).
     pub shift: bool,
+    /// Ctrl was held (for ASCII mode).
     pub ctrl: bool,
+    /// A press of a key already down (the viewer's auto-repeat): another press in
+    /// ASCII mode, nothing in raw mode. Never set on a release.
+    pub repeat: bool,
+    /// Raw mode's USB HID usage of the physical key (Keyboard/Keypad page); 0 if the
+    /// viewer does not know it.
+    pub usage: u16,
 }
 
 const KEY_RELEASE: u8 = 1 << 0;
 const KEY_SHIFT: u8 = 1 << 1;
 const KEY_CTRL: u8 = 1 << 2;
+const KEY_REPEAT: u8 = 1 << 3;
+/// Every key flag bit; the others must be 0.
+const KEY_FLAGS: u8 = KEY_RELEASE | KEY_SHIFT | KEY_CTRL | KEY_REPEAT;
 
 /// Pointer button bits of [`PointerChange::buttons`], as in the guest's pointer device
 /// (Excalibur spec section 9.7).
@@ -992,7 +1007,12 @@ impl Message {
                     ErrorCode::from_u16(*n)
                 ));
             }
-            Message::KeyInput { key, .. } if key.code == 0 => return invalid("key code 0".into()),
+            Message::KeyInput { key, .. } if key.code == 0 && key.usage == 0 => {
+                return invalid("key with code 0 and usage 0".into())
+            }
+            Message::KeyInput { key, .. } if key.repeat && key.release => {
+                return invalid("a repeat is a press, not a release".into())
+            }
             Message::PointerInput { pointer, .. } if pointer.buttons & !POINTER_BUTTONS != 0 => {
                 return invalid(format!("reserved pointer buttons {:#04x}", pointer.buttons));
             }
@@ -1129,12 +1149,14 @@ impl Message {
                     (key.release, KEY_RELEASE),
                     (key.shift, KEY_SHIFT),
                     (key.ctrl, KEY_CTRL),
+                    (key.repeat, KEY_REPEAT),
                 ] {
                     if on {
                         flags |= bit;
                     }
                 }
                 w.u8(flags);
+                w.u16(key.usage);
             }
             PointerInput { vm, pointer } => {
                 w.u32(*vm);
@@ -1339,7 +1361,7 @@ impl Message {
                 let vm = r.u32()?;
                 let code = r.u8()?;
                 let flags = r.u8()?;
-                if flags & !(KEY_RELEASE | KEY_SHIFT | KEY_CTRL) != 0 {
+                if flags & !KEY_FLAGS != 0 {
                     return Err(crate::Error::Invalid(format!("reserved key flags {flags:#04x}")));
                 }
                 KeyInput {
@@ -1349,6 +1371,8 @@ impl Message {
                         release: flags & KEY_RELEASE != 0,
                         shift: flags & KEY_SHIFT != 0,
                         ctrl: flags & KEY_CTRL != 0,
+                        repeat: flags & KEY_REPEAT != 0,
+                        usage: r.u16()?,
                     },
                 }
             }

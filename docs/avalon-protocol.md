@@ -1,4 +1,4 @@
-# Avalon Protocol v8
+# Avalon Protocol v9
 
 The wire protocol of the Avalon platform. Every program in it speaks this protocol:
 
@@ -79,7 +79,7 @@ Decoding is strict:
 Rules beyond the field types, enforced by both the encoder and the decoder (`Message::check`):
 
 - `ScreenFrame`: `width` and `height` non-zero, `pixels` exactly `width × height × 4` bytes.
-- `KeyInput`: key code not 0; flag bits other than 0-2 clear.
+- `KeyInput`: key code and usage not both 0; flag bits other than 0-3 clear; the repeat flag (bit 3) only on a press (bit 0 clear).
 - `PointerInput`: button bits other than 0-2 clear.
 - `BlockRead`: `count` from 1 to `MAX_BLOCK_SECTORS` (2048).
 - `BlockData`, `BlockWrite`: `data` a non-zero whole number of 512-byte sectors, at most 2048 sectors (1 MiB).
@@ -144,7 +144,7 @@ On a command line a disk is one argument (the crate's `DiskSource::parse`): `lak
 
 **DeviceEntry**, one entry of the guest's sysinfo device table (Excalibur spec section 9.5): `kind: u32` (the device type code), `base: u32`, `size: u32`, `irq: u32` (PLIC source, 0 = none). The type code is passed through raw, so new device types need no protocol change.
 
-**KeyEvent**, a key for the guest's keyboard device (Excalibur spec section 9.4): `code: u8` (a key code from the spec's table, never 0), `flags: u8` (bit 0 release, bit 1 Shift, bit 2 Ctrl; other bits must be 0).
+**KeyEvent**, a key for the guest's keyboard device (Excalibur spec section 9.4), in both of the device's forms, since a viewer does not know which mode the guest chose: `code: u8` (ASCII mode's key code, from the spec's table; 0 for a key that types nothing, such as a modifier alone or Home), `flags: u8` (bit 0 release, bit 1 Shift, bit 2 Ctrl, bit 3 repeat: a press of a key already down, the viewer's auto-repeat, so never with bit 0; other bits must be 0), `usage: u16` (raw mode's USB HID usage of the physical key, Keyboard/Keypad page; 0 if the viewer does not know it). `code` and `usage` are not both 0. The device keeps the form of its mode: in ASCII mode the code with Shift and Ctrl (a repeat is another press), in raw mode the usage and the release bit (a repeat is dropped). A browser's `KeyboardEvent.code` gives the usage directly, through `grail::keyboard::usage::from_dom_code`; Grail's window gets it from the scan code.
 
 **PointerChange**, one change of a viewer's pointer for the guest's pointer device (Excalibur spec section 9.7): `motion: PointerMotion`, `buttons: u8` (the buttons held after the change: bit 0 left, bit 1 right, bit 2 middle, as in the device's `PTR_BUTTONS`; other bits must be 0), `wheel: i8` (notches turned, positive away from the user).
 
@@ -329,11 +329,11 @@ Any request can also be answered by `Error`. A server answers requests from a gr
 | `Ping` | `token: u32` |
 | `Pong` | `token: u32` (the `Ping`'s) |
 
-Example, `Hello` version 8 from agent `"rt"`:
+Example, `Hello` version 9 from agent `"rt"`:
 
 ```
-0e 00 00 00  01 00  41 56 4c 4e  08 00  02 00 00 00  72 74
-length 14    Hello  "AVLN"       v8     agent "rt"
+0e 00 00 00  01 00  41 56 4c 4e  09 00  02 00 00 00  72 74
+length 14    Hello  "AVLN"       v9     agent "rt"
 ```
 
 ### 6.2 VM control
@@ -388,8 +388,8 @@ The screen is the VM's framebuffer (Excalibur spec section 9.3); the input goes 
 | `ScreenAttach` | `vm: VmRef` | Errors: `NoSuchVm` |
 | `ScreenAttached` | `vm: u32`, `width: u32`, `height: u32`, `format: u32` | the VM's id and its screen: the size of the framebuffer's current mode (Avalon: 640, 480 until the guest changes modes), format 0. A full `ScreenFrame` follows, then frames whenever the screen changes. Attaching again resends the full frame; the stream is not doubled |
 | `ScreenFrame` | `vm: u32`, `x: u32`, `y: u32`, `width: u32`, `height: u32`, `pixels: bytes` | the rectangle at (`x`, `y`), rows top to bottom, `width × height × 4` bytes in the attachment's format. It lies inside the screen; a viewer treats one that does not as a broken server |
-| `KeyInput` | `vm: u32`, `key: KeyEvent` | for the VM's keyboard device, as if typed into Grail's window |
-| `ScreenDetach` | `vm: u32` | the VM keeps running. Errors: `NoSuchVm`, `InvalidState` (this connection is not attached to it) |
+| `KeyInput` | `vm: u32`, `key: KeyEvent` | for the VM's keyboard device, as if typed into Grail's window: the character typed and the physical key, so the guest sees the keys of the mode it chose |
+| `ScreenDetach` | `vm: u32` | the VM keeps running; the keys and buttons this viewer held are released (Input, below). Errors: `NoSuchVm`, `InvalidState` (this connection is not attached to it) |
 | `PointerInput` | `vm: u32`, `pointer: PointerChange` | for the VM's pointer device, as if the mouse moved over Grail's window |
 | `ScreenResized` | `vm: u32`, `width: u32`, `height: u32`, `format: u32` | the VM's screen has a new size (the guest changed modes): the viewer's screen starts again from black at `width × height`, in `format`, and a full `ScreenFrame` follows. Sent to every viewer, one that is behind included (see **Backlog**) |
 
@@ -403,7 +403,7 @@ Format 0 is XRGB8888: each pixel a little-endian word `0x00RRGGBB` (bytes B, G, 
 
 **Backlog.** Frames go through the client's queue like every event (section 8), so a viewer on a slow link must not fall behind without limit: one with more than a little over one full frame of the screen queued and not yet written (`avalon::screen_backlog`: the frame's bytes and 512 KiB more, at least 2 MiB; so 2 MiB at 640 × 480 and 8.4 MiB in the largest mode, 1920 × 1080 × 4 bytes = 8.3 MB) is sent no updates; once its queue has drained it is sent one full frame, which brings it level with the other viewers. A slow viewer sees fewer frames rather than older ones, and is not cut off for falling 32 MiB behind (section 8), which a backlog and one more full frame cannot reach.
 
-**Input.** `KeyInput` and `PointerInput` are taken only from a viewer of the VM (they are events: from anyone else they are dropped, unanswered), and only while it can still run (created, running or paused). Keys reach the keyboard, and pointer changes the pointer, each in the order the server receives them, between two slices of the VM's run, as Grail's window hands over its input (the two are separate devices, with a FIFO each: the order between a key and a pointer change that arrive for the same slice is not kept, here or in Grail's window); input sent before the VM starts, or while it is paused, waits for it, up to 256 keys and 256 pointer changes per VM, past which more are dropped (as the devices' own FIFOs drop events when full). A viewer that reports a mouse's many moves may send only the last of a run of moves with the same buttons held: only where the pointer ends up matters. A button change (a press or a release, which Grail's window reports as a move to where it happened) is not part of the run before or after it: it is sent where it happened, so that a drag starts and ends where it did.
+**Input.** `KeyInput` and `PointerInput` are taken only from a viewer of the VM (they are events: from anyone else they are dropped, unanswered), and only while it can still run (created, running or paused). Keys reach the keyboard, and pointer changes the pointer, each in the order the server receives them, between two slices of the VM's run, as Grail's window hands over its input (the two are separate devices, with a FIFO each: the order between a key and a pointer change that arrive for the same slice is not kept, here or in Grail's window); input sent before the VM starts, or while it is paused, waits for it, up to 256 keys and 256 pointer changes per VM, past which more are dropped (as the devices' own FIFOs drop events when full). A viewer that goes, by `ScreenDetach` or because its connection ends, lets go of what it held: the server queues a release for every key it pressed and has not released (with the code and usage of the press) and, if its last pointer change held buttons, one that releases them, as Linux's input core releases the keys of a keyboard that is unplugged. So a viewer closed with a key down (Alt of Alt+F4) leaves none stuck in the guest. These releases are queued past the 256. A viewer that reports a mouse's many moves may send only the last of a run of moves with the same buttons held: only where the pointer ends up matters. A button change (a press or a release, which Grail's window reports as a move to where it happened) is not part of the run before or after it: it is sent where it happened, so that a drag starts and ends where it did.
 
 Several clients may view one VM: all of them get its frames, and input from any of them reaches it. One connection may view several VMs, and view and attach to the console of the same VM; the `vm` field says which stream a frame belongs to.
 
@@ -480,7 +480,7 @@ Avalon's VMs talk to each other over virtual Ethernet switches, kept by the serv
 - Any change to the catalogue bumps the version: a new message type, a new field, a new enum variant or tag, a changed layout or a changed rule. (Unknown codes and tags are errors in the decoder, so an old peer could not read them anyway.)
 - Three things never change, in any version, so that peers of different versions can always tell each other so: the frame header (`u32` length, `u16` type), the `Hello` and `Welcome` messages (codes 0x0001 and 0x0002 and their layouts) and the `Error` message (code 0x0003 and its layout). Error codes are never reused or renumbered; new ones may be added with a version bump.
 - Things that are deliberately open-ended and need no new version: `DeviceEntry.kind` (sysinfo device type codes come from the Excalibur spec), `ScreenAttached.format` values a server chooses to send, free-text fields.
-- This document describes version 8. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
+- This document describes version 9. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
 
 History:
 
@@ -494,6 +494,7 @@ History:
 | 6 | `CreateVm` with an empty `program`: the VM boots from its disk 0 (spec section 7, "Boot from disk"), where version 5 servers answered `InvalidProgram` |
 | 7 | `DiskCreate`'s `source` field (after `sectors`): a new image that is a copy of an existing one (section 6.6, **Cloning**) |
 | 8 | `ScreenResized` (0x0307): a VM's screen changes size when its guest changes the framebuffer's mode (section 6.4, **Modes**), followed by a full frame; screens up to 1920 × 1080, with Avalon's viewer backlog following the screen's size (`screen_backlog`, a little over one full frame: 2 MiB at 640 × 480, as before, up to 8.4 MiB at 1920 × 1080) and its limit on a client's queued output 32 MiB (section 8), which was 8 MiB for 640 × 480 screens |
+| 9 | `KeyEvent` carries the physical key for the keyboard's raw mode (Excalibur spec section 9.4): the `usage` field (`u16`, after `flags`) and the repeat flag (bit 3); `code` may be 0 when `usage` is not; the repeat flag only on a press; a viewer that goes (`ScreenDetach`, or its connection ends) has the keys and buttons it held released (section 6.4, **Input**) |
 
 ## 8. Limits
 

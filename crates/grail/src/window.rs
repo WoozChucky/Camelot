@@ -14,7 +14,7 @@
 //! is the window class, which Windows registers once per process anyway.
 
 use crate::framebuffer::{Frame, FB_HEIGHT, FB_WIDTH};
-use crate::keyboard::{code, KeyEvent};
+use crate::keyboard::{code, usage, KeyEvent};
 use crate::pointer::{Motion, PointerInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT};
 use crate::win32::*;
 use std::cell::{Cell, RefCell};
@@ -31,9 +31,12 @@ struct State {
     repaint: Cell<bool>,
     destroyed: Cell<bool>,
     keys: RefCell<Vec<KeyEvent>>,
-    /// Key code reported for each virtual key that is down (0 = up, or a key with no
-    /// code), so a release carries the same code as its press even if Shift changed.
-    down: RefCell<Vec<u8>>,
+    /// The keys that are down, in the order they went down, with what their press
+    /// reported, so a release carries the same code as its press even if Shift changed.
+    down: RefCell<Vec<Held>>,
+    /// The program reads physical keys (raw mode, spec section 9.4): Alt chords and F10
+    /// are its keys, not the window's ([`Window::set_raw_keys`]).
+    raw: Cell<bool>,
     pointer: RefCell<Vec<PointerInput>>,
     /// Buttons the last pointer input said were held, to release them if the window
     /// loses the mouse in the middle of a click.
@@ -46,49 +49,169 @@ struct State {
     frame: Cell<(u32, u32)>,
 }
 
+/// A key that is down, and what its press reported.
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    /// Which physical key: its scan code as [`usage::Key::win`] gives it, or, for a
+    /// message with no scan code, 0x1_0000 plus the virtual key.
+    id: u32,
+    code: u8,
+    usage: u16,
+    /// Its press was reported with its release at once (a key Windows may send no
+    /// key-up for, [`taps`]): the key-up, if one comes, reports nothing.
+    tapped: bool,
+}
+
+/// Whether the key of usage `u` is one the program sees as a press and a release at
+/// once, whatever messages Windows sends: Lang1 and Lang2, the Korean Hangul and Hanja
+/// keys, are make-only on a PC keyboard (scan code set 1 sends 0xF2 and 0xF1 with no
+/// break, and Windows' HID translation sends them so); Linux's `atkbd` likewise makes
+/// up their releases (its `force_release_mask`).
+fn taps(u: u16) -> bool {
+    matches!(u, usage::LANG1 | usage::LANG2)
+}
+
+/// The virtual key `GetKeyState` reads for modifier `u` (by side), `None` for the
+/// other keys.
+fn modifier_vk(u: u16) -> Option<u32> {
+    Some(match u {
+        usage::LEFT_CTRL => VK_LCONTROL,
+        usage::LEFT_SHIFT => VK_LSHIFT,
+        usage::LEFT_ALT => VK_LMENU,
+        usage::LEFT_GUI => VK_LWIN,
+        usage::RIGHT_CTRL => VK_RCONTROL,
+        usage::RIGHT_SHIFT => VK_RSHIFT,
+        usage::RIGHT_ALT => VK_RMENU,
+        usage::RIGHT_GUI => VK_RWIN,
+        _ => return None,
+    })
+}
+
 impl State {
     fn new() -> Self {
         State {
-            down: RefCell::new(vec![0; 256]),
             frame: Cell::new((FB_WIDTH, FB_HEIGHT)),
             ..State::default()
         }
     }
 
-    /// Virtual key `vk` went down (`press`) or up. `char_code` gives the printable
-    /// character it types, for keys that are not in the spec's table of special keys.
-    fn key(&self, vk: u32, press: bool, shift: bool, ctrl: bool, char_code: impl FnOnce() -> Option<u8>) {
-        let mut down = self.down.borrow_mut();
-        let Some(slot) = down.get_mut(vk as usize) else {
-            return;
-        };
-        let code = if press {
-            // Auto-repeat sends more key-downs: each one is another press of the code
-            // the key got when it first went down.
-            if *slot == 0 {
-                *slot = special_code(vk).or_else(char_code).unwrap_or(0);
-            }
-            *slot
-        } else {
-            std::mem::take(slot)
-        };
-        if code != 0 {
-            self.keys.borrow_mut().push(KeyEvent {
-                code,
-                release: !press,
-                shift,
-                ctrl,
-            });
+    /// The key with virtual key `vk` and scan code `scan` (0xe0xx for extended keys,
+    /// as [`usage::Key::win`]) went down (`press`) or up. `char_code` gives the
+    /// printable character it types, for keys that are not in the spec's table of
+    /// special keys. Each event carries both forms of the key, the ASCII-mode code and
+    /// the HID usage of its scan code, for the mode the program chose.
+    fn key(
+        &self,
+        vk: u32,
+        scan: u16,
+        press: bool,
+        shift: bool,
+        ctrl: bool,
+        char_code: impl FnOnce() -> Option<u8>,
+    ) {
+        if vk > 0xff {
+            return; // not a virtual key
         }
+        // Keys are told apart by scan code, so left and right Shift, or Enter and the
+        // keypad's Enter, are separate keys with separate presses and releases.
+        let id = if scan != 0 { scan as u32 } else { 0x1_0000 | vk };
+        let mut down = self.down.borrow_mut();
+        let at = down.iter().position(|h| h.id == id);
+        let (held, repeat) = match (press, at) {
+            // A key that was reported as a tap: nothing more until it is up again.
+            (true, Some(i)) if down[i].tapped => return,
+            (false, Some(i)) if down[i].tapped => {
+                down.remove(i);
+                return;
+            }
+            // Auto-repeat sends more key-downs: each one is another press of what the
+            // key got when it first went down, marked as a repeat.
+            (true, Some(i)) => (down[i], true),
+            (true, None) => {
+                let usage = usage::from_win_scan(scan).unwrap_or(0);
+                let held = Held {
+                    id,
+                    code: special_code(vk).or_else(char_code).unwrap_or(0),
+                    usage,
+                    tapped: taps(usage),
+                };
+                if held.code == 0 && held.usage == 0 {
+                    return; // nothing to report in either mode
+                }
+                down.push(held);
+                if held.tapped {
+                    drop(down);
+                    self.tap(held.code, held.usage);
+                    return;
+                }
+                (held, false)
+            }
+            (false, Some(i)) => (down.remove(i), false),
+            (false, None) => {
+                // Print Screen's key-down goes to the system's hotkey, so only its
+                // key-up comes: it is a press and a release, as SDL makes it. So is a
+                // make-only key whose message is a key-up.
+                let usage = usage::from_win_scan(scan).unwrap_or(0);
+                if usage == usage::PRINT_SCREEN || taps(usage) {
+                    drop(down);
+                    self.tap(0, usage);
+                }
+                // Any other release with no press seen (the key was held when the
+                // window got the focus): the program never saw it go down.
+                return;
+            }
+        };
+        self.keys.borrow_mut().push(KeyEvent {
+            code: held.code,
+            usage: held.usage,
+            release: !press,
+            repeat,
+            shift,
+            ctrl,
+        });
+    }
+
+    /// Reports a press of the key with `code` and `usage` and its release at once.
+    fn tap(&self, code: u8, usage: u16) {
+        let press = KeyEvent::press(code).with_usage(usage);
+        self.keys.borrow_mut().extend([
+            press,
+            KeyEvent {
+                release: true,
+                ..press
+            },
+        ]);
     }
 
     /// Focus moved away, so the key-ups will go to another window: release every key the
-    /// program saw go down instead of leaving it stuck.
+    /// program saw go down, modifiers included, instead of leaving it stuck.
     fn release_all(&self) {
         let mut keys = self.keys.borrow_mut();
-        for c in self.down.borrow_mut().iter_mut().filter(|c| **c != 0) {
-            keys.push(KeyEvent::release(std::mem::take(c)));
+        for held in self.down.borrow_mut().drain(..) {
+            if !held.tapped {
+                keys.push(KeyEvent::release(held.code).with_usage(held.usage));
+            }
         }
+    }
+
+    /// Releases every modifier the program saw go down that `is_down` (`GetKeyState`
+    /// for its side's virtual key) says is up. Windows loses key-ups: with both Shifts
+    /// down, letting go of one sends no key-up, and letting go of the other sends one,
+    /// for that key alone; the shell may keep the Windows key's key-up for its
+    /// hotkeys. The window's thread key state is right all the same (it changes as
+    /// key messages are read), so after each pump the window looks at it, as SDL does
+    /// (`WIN_PumpEvents`), and a modifier is never left stuck.
+    fn resync_modifiers(&self, is_down: impl Fn(u32) -> bool) {
+        let mut keys = self.keys.borrow_mut();
+        self.down
+            .borrow_mut()
+            .retain(|held| match modifier_vk(held.usage) {
+                Some(vk) if !held.tapped && !is_down(vk) => {
+                    keys.push(KeyEvent::release(held.code).with_usage(held.usage));
+                    false
+                }
+                _ => true,
+            });
     }
 }
 
@@ -215,6 +338,70 @@ fn special_code(vk: u32) -> Option<u8> {
     })
 }
 
+/// The scan code of a key message, as [`usage::Key::win`] gives it: `lParam` bits
+/// 16-23, plus 0xe000 for an extended key (bit 24). A message with none (synthesized
+/// from a virtual key alone, as some remote-control programs send) gets the scan code
+/// the keyboard layout gives the virtual key. `VK_PACKET`, a character sent as a key
+/// (`SendInput` with `KEYEVENTF_UNICODE`), has none: its `wScan` is the character's
+/// UTF-16 unit, which lands in the scan code field and names no key.
+fn win_scan(vk: u32, lparam: LPARAM) -> u16 {
+    if vk == VK_PACKET {
+        return 0;
+    }
+    let scan = (lparam >> 16) as u16 & 0xff;
+    match (scan, lparam & KF_EXTENDED_LPARAM != 0) {
+        // The layout gives no key of the table for these: Num Lock is 0x45 there,
+        // which Windows' messages give Pause; Pause is 0xE11D (its set 1 E1 1D 45)
+        // and Print Screen 0x54 (SysRq). Ctrl+Pause comes as VK_CANCEL. They get what
+        // their key messages carry.
+        (0, _) if vk == VK_NUMLOCK => 0xe045,
+        (0, _) if vk == VK_PAUSE || vk == VK_CANCEL => 0x45,
+        (0, _) if vk == VK_SNAPSHOT => 0xe037,
+        (0, _) => {
+            // SAFETY: no pointers involved.
+            let scan = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX) } as u16;
+            // The arrows, Insert, Delete, Home, End, Page Up and Page Down are also
+            // the keypad's keys with Num Lock off, and the layout gives their keypad
+            // scan code: a virtual key alone means the grey key, extended.
+            const VK_PRIOR: u32 = 0x21;
+            const VK_INSERT: u32 = 0x2d;
+            const VK_DELETE: u32 = 0x2e;
+            if scan != 0 && matches!(vk, VK_PRIOR..=VK_DOWN | VK_INSERT | VK_DELETE) {
+                0xe000 | scan
+            } else {
+                scan
+            }
+        }
+        (scan, true) => 0xe000 | scan,
+        (scan, false) => scan,
+    }
+}
+
+/// Whether key-down message `msg` (`wparam`, `lparam`, sent at `time`) is the Left Ctrl
+/// that Windows makes up for AltGr: on a layout with AltGr, the Right Alt key comes as
+/// a Left Ctrl message and then the Right Alt one, both at the same time, though no
+/// Ctrl key moved. `next` is the message after it in the queue. The physical keyboard
+/// sent Right Alt alone, so that is all raw mode reports, as SDL does (its
+/// `SkipAltGrLeftControl`). A Left Ctrl really pressed has no Right Alt queued behind
+/// it at the same millisecond.
+///
+/// Key-ups are never skipped: the made-up Left Ctrl's key-up is a release of a key the
+/// window did not see go down, which reports nothing anyway. Should a made-up press go
+/// through (a posted message queued before the Right Alt one hides it from `next`), its
+/// key-up then releases it, instead of leaving Left Ctrl held.
+fn is_altgr_ctrl(msg: u32, wparam: WPARAM, lparam: LPARAM, time: u32, next: Option<&MSG>) -> bool {
+    let Some(next) = next else {
+        return false;
+    };
+    matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN)
+        && wparam as u32 == VK_CONTROL
+        && lparam & KF_EXTENDED_LPARAM == 0
+        && matches!(next.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+        && next.wParam as u32 == VK_MENU
+        && next.lParam & KF_EXTENDED_LPARAM != 0
+        && next.time == time
+}
+
 fn key_down(vk: u32) -> bool {
     // SAFETY: no pointers involved.
     unsafe { GetKeyState(vk as i32) < 0 }
@@ -284,18 +471,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Ctrl+Alt is AltGr: the character it types is the event, not a Ctrl chord.
             let ctrl = key_down(VK_CONTROL) && !key_down(VK_MENU);
             let scan = (lparam as u32 >> 16) & 0x1ff;
-            st.key(vk, press, key_down(VK_SHIFT), ctrl, || printable(vk, scan));
-            // Alt chords still reach Windows, so Alt+F4 closes the window (menu mode
-            // is stopped at WM_SYSCOMMAND below).
-            if matches!(msg, WM_SYSKEYDOWN | WM_SYSKEYUP) {
+            let mut next: MSG = std::mem::zeroed();
+            let next = (PeekMessageW(&mut next, hwnd, 0, 0, PM_NOREMOVE) != 0).then_some(&next);
+            if !is_altgr_ctrl(msg, wparam, lparam, GetMessageTime() as u32, next) {
+                st.key(vk, win_scan(vk, lparam), press, key_down(VK_SHIFT), ctrl, || {
+                    printable(vk, scan)
+                });
+            }
+            // In ASCII mode Alt chords still reach Windows, so Alt+F4 closes the window
+            // (menu mode is stopped at WM_SYSCOMMAND below). In raw mode they are the
+            // program's keys, as in a virtual machine's window that has the keyboard:
+            // Alt+F4 is for the guest's own windows, and the close button still works.
+            if matches!(msg, WM_SYSKEYDOWN | WM_SYSKEYUP) && !st.raw.get() {
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
             }
             0
         }
+        // In raw mode an Alt chord's character is no menu mnemonic (nor a beep).
+        WM_SYSCHAR if st.raw.get() => 0,
         // A lone Alt tap or F10 asks for keyboard menu mode, a modal loop inside
         // DispatchMessageW: the emulator would stop until a key ends it, and that key
-        // would be swallowed. Refuse it; Alt+Space (lParam ' ') still opens the menu.
-        WM_SYSCOMMAND if wparam & 0xfff0 == SC_KEYMENU && lparam == 0 => 0,
+        // would be swallowed. Refuse it; in ASCII mode Alt+Space (lParam ' ') still
+        // opens the menu.
+        WM_SYSCOMMAND if wparam & 0xfff0 == SC_KEYMENU && (lparam == 0 || st.raw.get()) => 0,
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
         | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_CAPTURECHANGED | WM_KILLFOCUS => {
             let mut client = RECT::default();
@@ -399,7 +597,8 @@ impl Window {
     }
 
     /// Handles pending window messages without blocking (for every window of this
-    /// thread: each one's procedure updates its own state). Returns false once this
+    /// thread: each one's procedure updates its own state), then releases the modifiers
+    /// whose key-ups Windows lost (`State::resync_modifiers`). Returns false once this
     /// window has been closed.
     pub fn pump(&mut self) -> bool {
         // SAFETY: MSG is plain data; the calls follow the usual message-loop pattern.
@@ -410,6 +609,7 @@ impl Window {
                 DispatchMessageW(&msg);
             }
         }
+        self.state.resync_modifiers(key_down);
         self.is_open()
     }
 
@@ -426,7 +626,16 @@ impl Window {
         self.state.repaint.replace(false)
     }
 
-    /// Key events typed into the window since the last call, oldest first.
+    /// Tells the window whether the program reads physical keys (the keyboard's raw
+    /// mode, spec section 9.4). In raw mode Alt chords and F10 are the program's keys:
+    /// the window no longer gives them to Windows, so Alt+F4 does not close it and no
+    /// key opens the window menu. Off (ASCII mode) when the window opens.
+    pub fn set_raw_keys(&self, raw: bool) {
+        self.state.raw.set(raw);
+    }
+
+    /// Key events typed into the window since the last call, oldest first. Each one
+    /// carries the key's ASCII-mode code and its HID usage (spec section 9.4).
     pub fn take_keys(&self) -> Vec<KeyEvent> {
         self.state.keys.take()
     }
@@ -635,61 +844,435 @@ mod tests {
         }
     }
 
+    // Scan codes (as `usage::Key::win`) of the keys the tests press.
+    const SC_A: u16 = 0x1e;
+    const SC_W: u16 = 0x11;
+    const SC_Q: u16 = 0x10;
+    const SC_F5: u16 = 0x3f;
+    const SC_ENTER: u16 = 0x1c;
+    const SC_KP_ENTER: u16 = 0xe01c;
+    const SC_LEFT: u16 = 0xe04b;
+    const SC_UP: u16 = 0xe048;
+    const SC_HOME: u16 = 0xe047;
+    const SC_KP7: u16 = 0x47;
+    const SC_LSHIFT: u16 = 0x2a;
+    const SC_RSHIFT: u16 = 0x36;
+    const SC_LCTRL: u16 = 0x1d;
+    const SC_RCTRL: u16 = 0xe01d;
+    const SC_LALT: u16 = 0x38;
+    const SC_RALT: u16 = 0xe038;
+    const SC_LWIN: u16 = 0xe05b;
+    const SC_RWIN: u16 = 0xe05c;
+    const SC_PRTSC: u16 = 0xe037;
+    const SC_HANGUL: u16 = 0x72;
+    const SC_HANJA: u16 = 0x71;
+    const VK_HOME: u32 = 0x24;
+    const VK_NUMPAD7: u32 = 0x67;
+    const VK_HANGUL: u32 = 0x15;
+    const VK_HANJA: u32 = 0x19;
+
     #[test]
     fn release_reports_the_code_of_the_press() {
         let st = State::new();
-        // Shift+A down, Shift up, A up: the release is still 'A'.
-        st.key(b'A' as u32, true, true, false, || Some(b'A'));
-        st.key(b'A' as u32, false, false, false, || Some(b'a'));
+        // Shift+A down, Shift up, A up: the release is still 'A', of the same key.
+        st.key(b'A' as u32, SC_A, true, true, false, || Some(b'A'));
+        st.key(b'A' as u32, SC_A, false, false, false, || Some(b'a'));
         assert_eq!(
             st.keys.take(),
-            [KeyEvent::press(b'A').with_shift(true), KeyEvent::release(b'A')]
+            [
+                KeyEvent::press(b'A').with_usage(usage::A).with_shift(true),
+                KeyEvent::release(b'A').with_usage(usage::A),
+            ]
         );
     }
 
     #[test]
     fn auto_repeat_and_flags() {
         let st = State::new();
-        st.key(VK_LEFT, true, false, true, || unreachable!("special key"));
-        st.key(VK_LEFT, true, false, true, || unreachable!("special key"));
-        st.key(VK_LEFT, false, false, false, || unreachable!("special key"));
+        st.key(VK_LEFT, SC_LEFT, true, false, true, || {
+            unreachable!("special key")
+        });
+        st.key(VK_LEFT, SC_LEFT, true, false, true, || {
+            unreachable!("special key")
+        });
+        st.key(VK_LEFT, SC_LEFT, false, false, false, || {
+            unreachable!("special key")
+        });
+        let left = KeyEvent::press(code::LEFT).with_usage(usage::LEFT);
         assert_eq!(
             st.keys.take(),
             [
-                KeyEvent::press(code::LEFT).with_ctrl(true),
-                KeyEvent::press(code::LEFT).with_ctrl(true),
-                KeyEvent::release(code::LEFT),
+                left.with_ctrl(true),
+                left.with_ctrl(true).with_repeat(true),
+                KeyEvent::release(code::LEFT).with_usage(usage::LEFT),
             ]
         );
     }
 
     #[test]
-    fn keys_without_a_code_send_nothing() {
+    fn keys_without_a_code_or_a_usage_send_nothing() {
         let st = State::new();
-        st.key(VK_SHIFT, true, true, false, || None);
-        st.key(0xde, true, false, false, || None); // a dead key, say
-        st.key(0xde, false, false, false, || panic!("no lookup on release"));
-        st.key(VK_SHIFT, false, false, false, || None);
-        // A release with no press seen (key held when the window got focus).
-        st.key(b'Q' as u32, false, false, false, || Some(b'q'));
-        st.key(0x1_0000, true, false, false, || Some(b'x')); // out of range
+        st.key(0xde, 0, true, false, false, || None); // a dead key, say, of no scan code
+        st.key(0xde, 0, true, false, false, || None);
+        st.key(0xde, 0, false, false, false, || panic!("no lookup on release"));
+        st.key(0xe5, 0xe0ff, true, false, false, || None); // a scan code of no key
+                                                           // A release with no press seen (key held when the window got focus).
+        st.key(b'Q' as u32, SC_Q, false, false, false, || Some(b'q'));
+        st.key(0x1_0000, SC_A, true, false, false, || Some(b'x')); // out of range
         assert!(st.keys.take().is_empty());
+        // A key with a code but no scan code still reports its code.
+        st.key(b'Q' as u32, 0, true, false, false, || Some(b'q'));
+        st.key(b'Q' as u32, 0, false, false, false, || Some(b'q'));
+        assert_eq!(st.keys.take(), [KeyEvent::press(b'q'), KeyEvent::release(b'q')]);
+    }
+
+    #[test]
+    fn modifiers_are_keys_of_their_own() {
+        let st = State::new();
+        // Alone, each modifier is a press and a release with its usage and no code,
+        // left and right apart.
+        let mods = [
+            (VK_SHIFT, SC_LSHIFT, usage::LEFT_SHIFT),
+            (VK_SHIFT, SC_RSHIFT, usage::RIGHT_SHIFT),
+            (VK_CONTROL, SC_LCTRL, usage::LEFT_CTRL),
+            (VK_CONTROL, SC_RCTRL, usage::RIGHT_CTRL),
+            (VK_MENU, SC_LALT, usage::LEFT_ALT),
+            (VK_MENU, SC_RALT, usage::RIGHT_ALT),
+            (VK_LWIN, SC_LWIN, usage::LEFT_GUI),
+            (VK_RWIN, SC_RWIN, usage::RIGHT_GUI),
+        ];
+        for (vk, scan, _) in mods {
+            st.key(vk, scan, true, false, false, || None);
+            st.key(vk, scan, false, false, false, || None);
+        }
+        let want: Vec<KeyEvent> = mods
+            .iter()
+            .flat_map(|&(_, _, u)| [KeyEvent::key_press(u), KeyEvent::key_release(u)])
+            .collect();
+        assert_eq!(st.keys.take(), want);
+
+        // Both Shifts down (one virtual key, VK_SHIFT): two keys.
+        st.key(VK_SHIFT, SC_LSHIFT, true, true, false, || None);
+        st.key(VK_SHIFT, SC_RSHIFT, true, true, false, || None);
+        assert_eq!(
+            st.keys.take(),
+            [
+                KeyEvent::key_press(usage::LEFT_SHIFT).with_shift(true),
+                KeyEvent::key_press(usage::RIGHT_SHIFT).with_shift(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn modifiers_whose_key_up_windows_lost_are_released() {
+        let st = State::new();
+        let held = |vks: &'static [u32]| move |vk: u32| vks.contains(&vk);
+        // Both Shifts down, then Left Shift let go: Windows sends no key-up for it,
+        // but the key state has it up. The pump after it releases it.
+        st.key(VK_SHIFT, SC_LSHIFT, true, true, false, || None);
+        st.key(VK_SHIFT, SC_RSHIFT, true, true, false, || None);
+        st.key(b'A' as u32, SC_A, true, true, false, || Some(b'A'));
+        st.resync_modifiers(held(&[VK_LSHIFT, VK_RSHIFT]));
+        st.resync_modifiers(held(&[VK_RSHIFT]));
+        // Right Shift's key-up does come. 'A' is no modifier: the key state is not
+        // asked about it.
+        st.key(VK_SHIFT, SC_RSHIFT, false, false, false, || None);
+        st.resync_modifiers(held(&[]));
+        assert_eq!(
+            st.keys.take(),
+            [
+                KeyEvent::key_press(usage::LEFT_SHIFT).with_shift(true),
+                KeyEvent::key_press(usage::RIGHT_SHIFT).with_shift(true),
+                KeyEvent::press(b'A').with_usage(usage::A).with_shift(true),
+                KeyEvent::key_release(usage::LEFT_SHIFT),
+                KeyEvent::key_release(usage::RIGHT_SHIFT),
+            ]
+        );
+        // Every modifier by its side's virtual key: the Windows key whose key-up the
+        // shell kept, Right Alt, Left Ctrl.
+        for (vk, scan, side, u) in [
+            (VK_LWIN, SC_LWIN, VK_LWIN, usage::LEFT_GUI),
+            (VK_RWIN, SC_RWIN, VK_RWIN, usage::RIGHT_GUI),
+            (VK_MENU, SC_LALT, VK_LMENU, usage::LEFT_ALT),
+            (VK_MENU, SC_RALT, VK_RMENU, usage::RIGHT_ALT),
+            (VK_CONTROL, SC_LCTRL, VK_LCONTROL, usage::LEFT_CTRL),
+            (VK_CONTROL, SC_RCTRL, VK_RCONTROL, usage::RIGHT_CTRL),
+            (VK_SHIFT, SC_LSHIFT, VK_LSHIFT, usage::LEFT_SHIFT),
+            (VK_SHIFT, SC_RSHIFT, VK_RSHIFT, usage::RIGHT_SHIFT),
+        ] {
+            st.key(vk, scan, true, false, false, || None);
+            // Its side down, every other key up: still held.
+            st.resync_modifiers(|v| v == side);
+            assert_eq!(st.keys.take(), [KeyEvent::key_press(u)], "vk {side:#x}");
+            st.resync_modifiers(|v| v != side);
+            assert_eq!(st.keys.take(), [KeyEvent::key_release(u)], "vk {side:#x}");
+        }
+        // 'A' is still down; only focus loss releases it.
+        st.release_all();
+        assert_eq!(st.keys.take(), [KeyEvent::release(b'A').with_usage(usage::A)]);
+    }
+
+    #[test]
+    fn print_screen_comes_as_its_key_up_alone() {
+        let st = State::new();
+        // Windows keeps Print Screen's key-down for its hotkey: the key-up alone is a
+        // press and a release.
+        st.key(VK_SNAPSHOT, SC_PRTSC, false, false, false, || None);
+        let prtsc = KeyEvent::key_press(usage::PRINT_SCREEN);
+        assert_eq!(
+            st.keys.take(),
+            [
+                prtsc,
+                KeyEvent {
+                    release: true,
+                    ..prtsc
+                }
+            ]
+        );
+        // Should its key-down come (no hotkey), it is a key as any other.
+        st.key(VK_SNAPSHOT, SC_PRTSC, true, false, false, || None);
+        st.key(VK_SNAPSHOT, SC_PRTSC, false, false, false, || None);
+        assert_eq!(
+            st.keys.take(),
+            [
+                prtsc,
+                KeyEvent {
+                    release: true,
+                    ..prtsc
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn hangul_and_hanja_are_taps() {
+        let st = State::new();
+        let tap = |u: u16| [KeyEvent::key_press(u), KeyEvent::key_release(u)];
+        // A key-down: the press and the release at once; its repeats and key-up, if
+        // they come, report nothing.
+        st.key(VK_HANGUL, SC_HANGUL, true, false, false, || None);
+        st.key(VK_HANGUL, SC_HANGUL, true, false, false, || None);
+        assert_eq!(st.keys.take(), tap(usage::LANG1));
+        st.release_all();
+        st.resync_modifiers(|_| false);
+        assert!(st.keys.take().is_empty(), "released already");
+        st.key(VK_HANJA, SC_HANJA, true, false, false, || None);
+        st.key(VK_HANJA, SC_HANJA, false, false, false, || None);
+        // A key-up alone: the same.
+        st.key(VK_HANGUL, SC_HANGUL, false, false, false, || None);
+        assert_eq!(st.keys.take(), [tap(usage::LANG2), tap(usage::LANG1)].concat());
+        // Pressed again after its key-up: another tap.
+        st.key(VK_HANJA, SC_HANJA, true, false, false, || None);
+        assert_eq!(st.keys.take(), tap(usage::LANG2));
+    }
+
+    #[test]
+    fn extended_keys_are_the_grey_keys() {
+        let st = State::new();
+        // Enter and the keypad's Enter: the same virtual key and code, two usages.
+        st.key(VK_RETURN, SC_ENTER, true, false, false, || None);
+        st.key(VK_RETURN, SC_KP_ENTER, true, false, false, || None);
+        st.key(VK_RETURN, SC_ENTER, false, false, false, || None);
+        st.key(VK_RETURN, SC_KP_ENTER, false, false, false, || None);
+        // Home and the keypad's 7 with Num Lock off (VK_HOME too): the scan code tells.
+        st.key(VK_HOME, SC_HOME, true, false, false, || None);
+        st.key(VK_HOME, SC_HOME, false, false, false, || None);
+        st.key(VK_HOME, SC_KP7, true, false, false, || None);
+        // Num Lock on: the same key is VK_NUMPAD7 and types '7'.
+        st.key(VK_NUMPAD7, SC_KP7, false, false, false, || Some(b'7'));
+        let enter = KeyEvent::press(code::ENTER);
+        assert_eq!(
+            st.keys.take(),
+            [
+                enter.with_usage(usage::ENTER),
+                enter.with_usage(usage::KP_ENTER),
+                KeyEvent::release(code::ENTER).with_usage(usage::ENTER),
+                KeyEvent::release(code::ENTER).with_usage(usage::KP_ENTER),
+                KeyEvent::key_press(usage::HOME),
+                KeyEvent::key_release(usage::HOME),
+                KeyEvent::key_press(usage::KP1 + 6),
+                KeyEvent::key_release(usage::KP1 + 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_codes_from_lparam() {
+        let lp = |scan: isize, ext: bool| (scan << 16 | if ext { KF_EXTENDED_LPARAM } else { 0 }) | 1;
+        assert_eq!(win_scan(b'A' as u32, lp(0x1e, false)), SC_A);
+        assert_eq!(win_scan(VK_CONTROL, lp(0x1d, true)), SC_RCTRL);
+        // Key-up messages set bits 30 and 31; the scan code is the same.
+        assert_eq!(
+            win_scan(VK_UP, lp(0x48, true) | 0xc000_0000u32 as i32 as isize),
+            SC_UP
+        );
+        // A message with no scan code gets the layout's, extended keys included.
+        assert_eq!(win_scan(b'A' as u32, 1), SC_A);
+        assert_eq!(win_scan(VK_UP, 1), SC_UP);
+        assert_eq!(win_scan(VK_HOME, 1), SC_HOME);
+        assert_eq!(win_scan(VK_NUMPAD7, 1), SC_KP7);
+        assert_eq!(usage::from_win_scan(win_scan(VK_LWIN, 1)), Some(usage::LEFT_GUI));
+        for (vk, u) in [
+            (VK_NUMLOCK, usage::NUM_LOCK),
+            (VK_PAUSE, usage::PAUSE),
+            (VK_CANCEL, usage::PAUSE),
+            (VK_SNAPSHOT, usage::PRINT_SCREEN),
+        ] {
+            assert_eq!(usage::from_win_scan(win_scan(vk, 1)), Some(u), "vk {vk:#x}");
+        }
+        // With their scan codes, as the keyboard sends them: Num Lock is extended,
+        // Ctrl+Pause (Break) is E0 46, Alt+Print Screen (SysRq) is 54.
+        assert_eq!(
+            usage::from_win_scan(win_scan(VK_NUMLOCK, lp(0x45, true))),
+            Some(usage::NUM_LOCK)
+        );
+        assert_eq!(
+            usage::from_win_scan(win_scan(VK_PAUSE, lp(0x45, false))),
+            Some(usage::PAUSE)
+        );
+        assert_eq!(
+            usage::from_win_scan(win_scan(VK_CANCEL, lp(0x46, true))),
+            Some(usage::PAUSE)
+        );
+        assert_eq!(
+            usage::from_win_scan(win_scan(VK_SNAPSHOT, lp(0x54, false))),
+            Some(usage::PRINT_SCREEN)
+        );
+        // A character sent as a key: whatever its scan code field holds, no key.
+        assert_eq!(win_scan(VK_PACKET, lp(0x41, false)), 0);
+        assert_eq!(win_scan(VK_PACKET, lp(0xe9, true)), 0);
+        assert_eq!(win_scan(VK_PACKET, 1), 0);
+    }
+
+    #[test]
+    fn the_left_ctrl_of_altgr_is_not_a_key() {
+        let lp = |scan: isize, ext: bool| (scan << 16 | if ext { KF_EXTENDED_LPARAM } else { 0 }) | 1;
+        let msg = |message: u32, vk: u32, lparam: LPARAM, time: u32| MSG {
+            hwnd: null_mut(),
+            message,
+            wParam: vk as WPARAM,
+            lParam: lparam,
+            time,
+            pt: POINT::default(),
+        };
+        let ctrl = lp(0x1d, false);
+        let ralt = msg(WM_SYSKEYDOWN, VK_MENU, lp(0x38, true), 500);
+        // AltGr down: Left Ctrl and Right Alt at the same time. Up likewise.
+        assert!(is_altgr_ctrl(
+            WM_KEYDOWN,
+            VK_CONTROL as WPARAM,
+            ctrl,
+            500,
+            Some(&ralt)
+        ));
+        // Its key-up is not skipped: with no press seen, it reports nothing anyway.
+        let ralt_up = msg(WM_KEYUP, VK_MENU, lp(0x38, true), 640);
+        assert!(!is_altgr_ctrl(
+            WM_KEYUP,
+            VK_CONTROL as WPARAM,
+            ctrl,
+            640,
+            Some(&ralt_up)
+        ));
+        // A real Left Ctrl: nothing queued, a later Right Alt, a Left Alt, a key-up
+        // after a key-down, or Right Ctrl.
+        assert!(!is_altgr_ctrl(WM_KEYDOWN, VK_CONTROL as WPARAM, ctrl, 500, None));
+        assert!(!is_altgr_ctrl(
+            WM_KEYDOWN,
+            VK_CONTROL as WPARAM,
+            ctrl,
+            499,
+            Some(&ralt)
+        ));
+        let lalt = msg(WM_SYSKEYDOWN, VK_MENU, lp(0x38, false), 500);
+        assert!(!is_altgr_ctrl(
+            WM_KEYDOWN,
+            VK_CONTROL as WPARAM,
+            ctrl,
+            500,
+            Some(&lalt)
+        ));
+        assert!(!is_altgr_ctrl(
+            WM_KEYDOWN,
+            VK_CONTROL as WPARAM,
+            ctrl,
+            640,
+            Some(&ralt_up)
+        ));
+        let rctrl = lp(0x1d, true);
+        assert!(!is_altgr_ctrl(
+            WM_KEYDOWN,
+            VK_CONTROL as WPARAM,
+            rctrl,
+            500,
+            Some(&ralt)
+        ));
+        assert!(!is_altgr_ctrl(
+            WM_KEYDOWN,
+            VK_SHIFT as WPARAM,
+            lp(0x2a, false),
+            500,
+            Some(&ralt)
+        ));
+    }
+
+    #[test]
+    fn a_missed_altgr_press_does_not_hold_left_ctrl() {
+        // The made-up Left Ctrl press went through (a posted message hid the Right Alt
+        // behind it); its key-up, never skipped, releases it.
+        let st = State::new();
+        st.key(VK_CONTROL, SC_LCTRL, true, false, true, || None);
+        st.key(VK_MENU, SC_RALT, true, false, false, || None);
+        st.key(VK_CONTROL, SC_LCTRL, false, false, false, || None);
+        st.key(VK_MENU, SC_RALT, false, false, false, || None);
+        assert_eq!(
+            st.keys.take(),
+            [
+                KeyEvent::key_press(usage::LEFT_CTRL).with_ctrl(true),
+                KeyEvent::key_press(usage::RIGHT_ALT),
+                KeyEvent::key_release(usage::LEFT_CTRL),
+                KeyEvent::key_release(usage::RIGHT_ALT),
+            ]
+        );
+        assert!(st.down.borrow().is_empty());
+        // Caught, it is skipped, and its key-up then has no press to release.
+        st.key(VK_MENU, SC_RALT, true, false, false, || None);
+        st.key(VK_CONTROL, SC_LCTRL, false, false, false, || None);
+        st.key(VK_MENU, SC_RALT, false, false, false, || None);
+        assert_eq!(
+            st.keys.take(),
+            [
+                KeyEvent::key_press(usage::RIGHT_ALT),
+                KeyEvent::key_release(usage::RIGHT_ALT),
+            ]
+        );
     }
 
     #[test]
     fn losing_focus_releases_held_keys() {
         let st = State::new();
-        st.key(b'W' as u32, true, false, false, || Some(b'w'));
-        st.key(VK_UP, true, false, false, || None);
-        st.key(VK_UP, false, false, false, || None);
-        st.key(VK_F1 + 4, true, false, false, || None);
+        st.key(b'W' as u32, SC_W, true, false, false, || Some(b'w'));
+        st.key(VK_CONTROL, SC_RCTRL, true, false, true, || None);
+        st.key(VK_UP, SC_UP, true, false, true, || None);
+        st.key(VK_UP, SC_UP, false, false, true, || None);
+        st.key(VK_F1 + 4, SC_F5, true, false, true, || None);
+        st.key(VK_LWIN, SC_LWIN, true, false, true, || None);
         st.keys.take();
         st.release_all();
+        // Modifiers included, in the order they went down, with no flags.
         assert_eq!(
             st.keys.take(),
-            [KeyEvent::release(b'w'), KeyEvent::release(code::F1 + 4)]
+            [
+                KeyEvent::release(b'w').with_usage(usage::A + 22),
+                KeyEvent::key_release(usage::RIGHT_CTRL),
+                KeyEvent::release(code::F1 + 4).with_usage(usage::F1 + 4),
+                KeyEvent::key_release(usage::LEFT_GUI),
+            ]
         );
         st.release_all();
+        assert!(st.keys.take().is_empty());
+        // Up after the focus came back: no release, it was given already.
+        st.key(b'W' as u32, SC_W, false, false, false, || Some(b'w'));
         assert!(st.keys.take().is_empty());
     }
 
@@ -963,12 +1546,16 @@ mod tests {
         assert_eq!(st.pointer.take(), [PointerInput::buttons(0)]);
 
         msg(WM_RBUTTONDOWN, MK_RBUTTON);
-        st.key(VK_UP, true, false, false, || None);
+        st.key(VK_UP, SC_UP, true, false, false, || None);
         st.pointer.take();
         st.keys.take();
         assert_eq!(msg(WM_KILLFOCUS, 0), None);
         assert_eq!(st.pointer.take(), [PointerInput::buttons(0)]);
-        assert_eq!(st.keys.take(), [KeyEvent::release(code::UP)], "keys go too");
+        assert_eq!(
+            st.keys.take(),
+            [KeyEvent::release(code::UP).with_usage(usage::UP)],
+            "keys go too"
+        );
         msg(WM_KILLFOCUS, 0);
         msg(WM_CAPTURECHANGED, 0);
         assert!(st.pointer.take().is_empty(), "nothing held, nothing to release");
@@ -1164,6 +1751,8 @@ mod tests {
         send(&a, WM_KEYUP, b'A' as u32, 0x1e);
         send(&b, WM_KEYDOWN, VK_F1 + 1, 0x3c);
         send(&a, WM_KEYDOWN, VK_RETURN, 0x1c);
+        // Left Shift is down in the key state too, or the pump would release it.
+        hold_keys(&[VK_SHIFT, VK_LSHIFT]);
         send(&a, WM_KEYDOWN, VK_SHIFT, 0x2a);
         send(&a, WM_KEYUP, VK_RETURN, 0x1c);
         send(&a, WM_KEYDOWN, VK_SPACE, 0x39);
@@ -1173,21 +1762,68 @@ mod tests {
         assert_eq!(
             a.take_keys(),
             [
-                KeyEvent::press(b'a'),
-                KeyEvent::release(b'a'),
-                KeyEvent::press(code::ENTER),
-                KeyEvent::release(code::ENTER),
-                KeyEvent::press(b' '),
+                KeyEvent::press(b'a').with_usage(usage::A),
+                KeyEvent::release(b'a').with_usage(usage::A),
+                KeyEvent::press(code::ENTER).with_usage(usage::ENTER),
+                KeyEvent::key_press(usage::LEFT_SHIFT).with_shift(true),
+                KeyEvent::release(code::ENTER)
+                    .with_usage(usage::ENTER)
+                    .with_shift(true),
+                KeyEvent::press(b' ').with_usage(usage::SPACE).with_shift(true),
             ]
         );
         assert_eq!(
             b.take_keys(),
-            [KeyEvent::press(code::F1 + 1), KeyEvent::press(code::F1 + 9)]
+            [
+                KeyEvent::press(code::F1 + 1).with_usage(usage::F1 + 1),
+                // Shift is down in the thread's key state, which both windows read.
+                KeyEvent::press(code::F1 + 9)
+                    .with_usage(usage::F1 + 9)
+                    .with_shift(true),
+            ]
         );
         assert!(a.take_keys().is_empty());
         // SAFETY: a valid window handle.
         unsafe { SendMessageW(a.hwnd, WM_KILLFOCUS, 0, 0) };
-        assert_eq!(a.take_keys(), [KeyEvent::release(b' ')]);
+        assert_eq!(
+            a.take_keys(),
+            [
+                KeyEvent::key_release(usage::LEFT_SHIFT),
+                KeyEvent::release(b' ').with_usage(usage::SPACE),
+            ]
+        );
+        hold_keys(&[]);
+    }
+
+    /// The pump releases a modifier the thread's key state has up though its key-up
+    /// never came, as Windows does with both Shifts down. Needs a desktop session:
+    /// `cargo test -p grail --release -- --ignored window`.
+    #[test]
+    #[ignore]
+    fn window_releases_modifiers_windows_lost() {
+        let _saved = SavedKeys::save();
+        let mut w = Window::open("Grail lost key-up test").unwrap();
+        assert!(w.pump());
+        w.take_keys();
+        hold_keys(&[VK_SHIFT, VK_LSHIFT, VK_RSHIFT]);
+        send(&w, WM_KEYDOWN, VK_SHIFT, 0x2a);
+        send(&w, WM_KEYDOWN, VK_SHIFT, 0x36);
+        assert!(w.pump());
+        // Left Shift let go: no key-up, only the key state.
+        hold_keys(&[VK_SHIFT, VK_RSHIFT]);
+        assert!(w.pump());
+        hold_keys(&[]);
+        send(&w, WM_KEYUP, VK_SHIFT, 0x36);
+        assert!(w.pump());
+        assert_eq!(
+            w.take_keys(),
+            [
+                KeyEvent::key_press(usage::LEFT_SHIFT).with_shift(true),
+                KeyEvent::key_press(usage::RIGHT_SHIFT).with_shift(true),
+                KeyEvent::key_release(usage::LEFT_SHIFT),
+                KeyEvent::key_release(usage::RIGHT_SHIFT),
+            ]
+        );
     }
 
     /// Shift picks the character through the layout, Ctrl only sets its bit (Ctrl+C is
@@ -1214,17 +1850,24 @@ mod tests {
         tap(&ctrl, b'C' as u32, 0x2e);
         tap(&[shift, ctrl].concat(), VK_LEFT, 0x4b);
         tap(&altgr, VK_RIGHT, 0x4d);
+        let (a, c) = (usage::A, usage::A + 2);
         assert_eq!(
             w.take_keys(),
             [
-                KeyEvent::press(b'A').with_shift(true),
-                KeyEvent::release(b'A').with_shift(true),
-                KeyEvent::press(b'c').with_ctrl(true),
-                KeyEvent::release(b'c').with_ctrl(true),
-                KeyEvent::press(code::LEFT).with_shift(true).with_ctrl(true),
-                KeyEvent::release(code::LEFT).with_shift(true).with_ctrl(true),
-                KeyEvent::press(code::RIGHT),
-                KeyEvent::release(code::RIGHT),
+                KeyEvent::press(b'A').with_usage(a).with_shift(true),
+                KeyEvent::release(b'A').with_usage(a).with_shift(true),
+                KeyEvent::press(b'c').with_usage(c).with_ctrl(true),
+                KeyEvent::release(b'c').with_usage(c).with_ctrl(true),
+                KeyEvent::press(code::LEFT)
+                    .with_usage(usage::LEFT)
+                    .with_shift(true)
+                    .with_ctrl(true),
+                KeyEvent::release(code::LEFT)
+                    .with_usage(usage::LEFT)
+                    .with_shift(true)
+                    .with_ctrl(true),
+                KeyEvent::press(code::RIGHT).with_usage(usage::RIGHT),
+                KeyEvent::release(code::RIGHT).with_usage(usage::RIGHT),
             ]
         );
 
@@ -1262,30 +1905,67 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        for (vk, scan, letter, scan2) in [(VK_MENU, 0x38, b'A', 0x1e), (VK_F10, 0x44, b'B', 0x30)] {
-            if vk == VK_MENU {
-                hold_keys(&[VK_MENU, VK_LMENU]);
+        // In ASCII mode, and in raw mode, where the window keeps no key for itself.
+        for raw in [false, true] {
+            w.set_raw_keys(raw);
+            for (vk, scan, letter, scan2) in [(VK_MENU, 0x38, b'A', 0x1e), (VK_F10, 0x44, b'B', 0x30)] {
+                if vk == VK_MENU {
+                    hold_keys(&[VK_MENU, VK_LMENU]);
+                }
+                send(&w, WM_SYSKEYDOWN, vk, scan);
+                hold_keys(&[]);
+                send(&w, WM_SYSKEYUP, vk, scan);
+                post(&w, WM_KEYDOWN, letter as u32, scan2);
+                post(&w, WM_KEYUP, letter as u32, scan2);
+                assert!(w.pump());
+                let c = letter.to_ascii_lowercase();
+                let u = usage::from_win_scan(scan2 as u16).unwrap();
+                let first = match vk {
+                    VK_F10 => KeyEvent::press(code::F1 + 9).with_usage(usage::F1 + 9),
+                    _ => KeyEvent::key_press(usage::LEFT_ALT),
+                };
+                let want = [
+                    first,
+                    KeyEvent {
+                        release: true,
+                        ..first
+                    },
+                    KeyEvent::press(c).with_usage(u),
+                    KeyEvent::release(c).with_usage(u),
+                ];
+                assert_eq!(w.take_keys(), want, "the key after vk {vk:#x}, raw {raw}");
             }
-            send(&w, WM_SYSKEYDOWN, vk, scan);
-            hold_keys(&[]);
-            send(&w, WM_SYSKEYUP, vk, scan);
-            post(&w, WM_KEYDOWN, letter as u32, scan2);
-            post(&w, WM_KEYUP, letter as u32, scan2);
-            assert!(w.pump());
-            let c = letter.to_ascii_lowercase();
-            let mut want = vec![KeyEvent::press(c), KeyEvent::release(c)];
-            if vk == VK_F10 {
-                want.splice(
-                    0..0,
-                    [KeyEvent::press(code::F1 + 9), KeyEvent::release(code::F1 + 9)],
-                );
-            }
-            assert_eq!(w.take_keys(), want, "the key after vk {vk:#x}");
         }
         let took = start.elapsed();
         let _ = done.send(());
         rescue.join().unwrap();
         assert!(took < std::time::Duration::from_millis(500), "took {took:?}");
+    }
+
+    /// In raw mode Alt+F4 is the program's key; in ASCII mode it closes the window, as
+    /// before. Needs a desktop session: `cargo test -p grail --release -- --ignored
+    /// window`.
+    #[test]
+    #[ignore]
+    fn window_alt_f4_is_the_programs_in_raw_mode() {
+        let _saved = SavedKeys::save();
+        let mut w = Window::open("Grail Alt+F4 test").unwrap();
+        assert!(w.pump());
+        w.take_keys();
+        let f4 = KeyEvent::press(code::F1 + 3).with_usage(usage::F1 + 3);
+        let alt_f4 = |w: &Window| {
+            hold_keys(&[VK_MENU, VK_LMENU]);
+            send(w, WM_SYSKEYDOWN, VK_F1 + 3, 0x3e);
+            send(w, WM_SYSKEYUP, VK_F1 + 3, 0x3e);
+            hold_keys(&[]);
+        };
+        w.set_raw_keys(true);
+        alt_f4(&w);
+        assert!(w.pump(), "still open");
+        assert_eq!(w.take_keys(), [f4, KeyEvent { release: true, ..f4 }]);
+        w.set_raw_keys(false);
+        alt_f4(&w);
+        assert!(!w.pump(), "Alt+F4 closes the window in ASCII mode");
     }
 
     /// Resizes `w` so that its client area is `width` x `height`.

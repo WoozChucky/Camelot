@@ -495,10 +495,15 @@ Details:
 | Address | Register | Notes |
 |---|---|---|
 | 0x3000_1000 | `KBD_STATUS` (RO) | bit 0 = event available |
-| 0x3000_1004 | `KBD_DATA` (RO) | pops one event: bits [7:0] key code, bit 8 = 1 on release, bit 9 = shift, bit 10 = ctrl. 0 if empty |
-| 0x3000_1008 | `KBD_CTRL` | bit 0 = interrupt enable (PLIC source 2, section 7.1) |
+| 0x3000_1004 | `KBD_DATA` (RO) | pops one event, in the format of the mode (below). 0 if empty |
+| 0x3000_1008 | `KBD_CTRL` | bit 0 = interrupt enable (PLIC source 2, section 7.1); bit 1 = raw mode |
 
-Key codes:
+The keyboard reports keys in one of two modes, which `KBD_CTRL` bit 1 selects:
+
+- **ASCII mode** (bit 1 clear, the reset state): the character the host's keyboard layout typed, with Shift and Ctrl as bits on it. Enough for a shell, and what every program written before raw mode existed sees.
+- **Raw mode** (bit 1 set): the physical keys, as the codes a USB keyboard sends: each key, modifiers included, has a press and a release of its own. A desktop needs this: Alt and Super for shortcuts, a modifier held alone, the keys that type nothing (Home, Delete, the keypad), and its own keyboard layout, applied in software as every real OS does. The kernel maps the codes to its key codes, as Linux's HID driver does (`hid_keyboard[]` in `drivers/hid/hid-input.c`), and user space applies the layout.
+
+**ASCII mode.** `KBD_DATA`: bits [7:0] key code, bit 8 = 1 on release, bit 9 = shift, bit 10 = ctrl; bits 31:11 read as 0. Key codes:
 
 | Key | Code |
 |---|---|
@@ -507,17 +512,38 @@ Key codes:
 | Up, Down, Left, Right | 0x80, 0x81, 0x82, 0x83 |
 | F1-F12 | 0x90-0x9B |
 
-Code 0 never occurs, so a `KBD_DATA` of 0 always means "empty". Bits 31:11 read as 0.
+Code 0 never occurs, so a `KBD_DATA` of 0 always means "empty".
 
-Details:
-
-- The registers are 32-bit only: byte, halfword or doubleword accesses in 0x3000_1000 - 0x3000_1FFF raise access faults (and pop nothing). Unused offsets read as 0 and ignore writes, as do writes to `KBD_STATUS` and `KBD_DATA`. `KBD_CTRL` bits other than bit 0 are reserved, read as 0; it resets to 0.
-- Events wait in a FIFO of 64. An event that arrives while it is full is dropped (the older ones are kept).
-- **Interrupt**: the keyboard holds PLIC source 2 high while `KBD_CTRL.0` and `KBD_STATUS.0` are both set, so reading `KBD_DATA` until `KBD_STATUS.0` clears lowers it. As with the UART, a handler may pop one event per interrupt and let the line raise the next one.
 - **Printable keys** report the character the host keyboard layout types with the current Shift and Caps Lock state, so Shift+a gives 'A' (0x41) with bit 9 set and Shift+1 gives '!' on a US layout. Ctrl does not change the code: Ctrl+C is 'c' with bit 10 set, not 0x03. Keys that type no ASCII character (dead keys, accented letters, Insert, Home, ...) send no events.
 - Shift and Ctrl (and Alt) send no events of their own; they only set bits 9 and 10 of other keys' events, as held at that moment. Ctrl+Alt is AltGr on Windows: it types the layout's AltGr character and does not set bit 10.
-- A release carries the same code as its press, even if Shift changed in between. A held key auto-repeats as more press events. When the window loses focus, every key it saw go down gets a release event, so none stays stuck.
-- Grail delivers the events typed into the framebuffer window between instruction slices (section 9.3). Without a window (headless) nothing produces events and the device stays empty; the UART remains the text input. Hosts that embed Grail as a library inject events with `Machine::key_event`, the same entry point the window uses.
+- A release carries the same code as its press, even if Shift changed in between. A held key auto-repeats as more press events.
+
+**Raw mode.** `KBD_DATA`: bits [15:0] the key's **usage ID** on the Keyboard/Keypad page (0x07) of the USB HID Usage Tables (version 1.4, chapter 10), bit 16 = 1 on release; bits 31:17 read as 0. A usage names the key's position, not what it types: 0x04 is the key labelled A on a US keyboard, Q on a French one.
+
+| Keys | Usages |
+|---|---|
+| A to Z, then 1 to 9 and 0 | 0x04-0x1D, 0x1E-0x27 |
+| Enter, Escape, Backspace, Tab, Space | 0x28, 0x29, 0x2A, 0x2B, 0x2C |
+| F1-F12, F13-F24 | 0x3A-0x45, 0x68-0x73 |
+| Print Screen, Scroll Lock, Pause, Insert, Home, Page Up, Delete, End, Page Down | 0x46-0x4E |
+| Right, Left, Down, Up | 0x4F, 0x50, 0x51, 0x52 |
+| Num Lock and the keypad (/ * - + Enter, 1-9, 0, .) | 0x53-0x63 |
+| Left Ctrl, Shift, Alt, GUI (Windows/Super); Right Ctrl, Shift, Alt, GUI | 0xE0-0xE3; 0xE4-0xE7 |
+
+The table above is a summary; the HID Usage Tables are the reference for every key (punctuation 0x2D-0x38, Caps Lock 0x39, the ISO key next to left Shift 0x64, Menu 0x65, the Japanese and Korean keys 0x87-0x93, ...). A usage is always one the page defines (0x04-0xA4, 0xB0-0xDD, 0xE0-0xE7): 0 never occurs, so a `KBD_DATA` of 0 means "empty", nor do the error codes 0x01-0x03.
+
+- Every key has a press and a release, the modifiers too: left and right are separate keys, Alt and GUI included, and a modifier held alone is seen. Right Alt is its own key (0xE6), never Ctrl+Alt, even on a layout where it is AltGr. Shift and Ctrl change nothing in other keys' events.
+- A key reports one press while it is held: there is no auto-repeat, as a USB keyboard repeats nothing; repeating is software's job (Linux's input layer does it for every keyboard).
+- A release carries the usage of its press.
+
+**Both modes:**
+
+- The registers are 32-bit only: byte, halfword or doubleword accesses in 0x3000_1000 - 0x3000_1FFF raise access faults (and pop nothing, and change no mode). Unused offsets read as 0 and ignore writes, as do writes to `KBD_STATUS` and `KBD_DATA`. `KBD_CTRL` bits other than bits 0 and 1 are reserved, read as 0; it resets to 0 (ASCII mode, no interrupt).
+- Events wait in a FIFO of 64. An event that arrives while it is full is dropped (the older ones are kept). Each event is queued in the format of the mode set when it arrives. A write to `KBD_CTRL` that changes bit 1 empties the FIFO, so a program never reads an event of the other mode (as a PS/2 keyboard clears its output buffer when told to change scan code sets); a key held across the switch then gives its release in the new mode with no press before it, which a driver ignores. A write that leaves bit 1 as it was keeps the FIFO.
+- **Interrupt**: the keyboard holds PLIC source 2 high while `KBD_CTRL.0` and `KBD_STATUS.0` are both set, so reading `KBD_DATA` until `KBD_STATUS.0` clears lowers it. As with the UART, a handler may pop one event per interrupt and let the line raise the next one.
+- When the window loses focus, every key it saw go down, modifiers included, gets a release event, so none stays stuck.
+- Grail delivers the events typed into the framebuffer window between instruction slices (section 9.3). Without a window (headless) nothing produces events and the device stays empty; the UART remains the text input. Hosts that embed Grail as a library inject events with `Machine::key_event`, the same entry point the window uses. A host does not know which mode the program chose, so an event carries both forms of the key, the ASCII-mode code (0 for a key that types nothing) and the usage (0 if unknown), and whether it is an auto-repeat; the device queues the form of its mode and drops an event with none.
+- **The window's keys.** Grail's window takes the usage from the scan code of each key message (`WM_KEYDOWN`, `WM_KEYUP`, `WM_SYSKEYDOWN`, `WM_SYSKEYUP`, with the extended-key flag), through the table `grail::keyboard::usage::KEYS`, which also gives each key's `KeyboardEvent.code` for browsers (both after Chromium's `dom_code_data.inc`). Keys are told apart by scan code, so left and right Shift, or Enter and the keypad's Enter, are separate keys. Two keys send another scan code under a modifier, which names the same key: Pause with Ctrl held (Break, E0 46) and Print Screen with Alt held (SysRq, 54), as Linux's `atkbd` maps them. A message with no scan code (synthesized from a virtual key alone) gets the one the keyboard layout gives the virtual key, except for the keys whose layout code is not what their messages carry: Num Lock, Pause and Print Screen get E0 45, 45 and E0 37, and the grey keys the extended codes. `VK_PACKET`, a character sent as a key (`SendInput` with `KEYEVENTF_UNICODE`, whose scan code field holds the character), is no physical key and has no usage. On a layout with AltGr, Windows sends a Left Ctrl message before each Right Alt one, at the same time, though no Ctrl key moved; the window drops the key-down (as SDL does), so the program sees Right Alt alone, as the keyboard sent it, and the made-up key-up then releases nothing. Windows loses some key-ups: with both Shifts down, letting go of one sends none, and the shell may keep the Windows key's for its hotkeys. So after handling its messages the window asks the thread's key state (`GetKeyState`, by side) about each modifier it saw go down, and releases those that are up, as SDL does; a modifier is never left held. Print Screen's key-down goes to the system's hotkey, so only its key-up comes: the window reports a press and a release (as SDL does). The Korean Hangul and Hanja keys (Lang1, Lang2) are make-only on a PC keyboard: the window reports each as a press and its release at once, on its key-down or, when only a key-up comes, on that, as Linux's `atkbd` makes their releases up. In ASCII mode Alt chords still reach Windows, so Alt+F4 closes the window (a lone Alt tap or F10 never enters menu mode, which would stop the emulator). In raw mode they are the program's keys, as in a virtual machine's window that has the keyboard: Alt+F4, Alt+Space and F10 go to the program, and the close button closes the window. Keys Windows keeps for itself before any window sees them (Alt+Tab, Ctrl+Alt+Del, the Windows key's Start menu, which opens after the program has seen the key) are not captured. A remote viewer's window (Herald's `--screen`) does not know the guest's mode: it sends both forms of every key (Avalon protocol, `KeyEvent`) and keeps ASCII mode's window behaviour, so Alt+F4 closes it.
 
 ### 9.5 Sysinfo (MMIO)
 

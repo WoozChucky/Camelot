@@ -132,16 +132,96 @@ fn polling_example_echoes_presses() {
     tap(&mut m, KeyEvent::press(b'c').with_ctrl(true));
     tap(&mut m, KeyEvent::press(b'!').with_shift(true));
     tap(&mut m, KeyEvent::press(code::BACKSPACE));
-    for c in [code::UP, code::RIGHT, code::F1, code::F12, code::TAB, code::ENTER] {
+    for c in [
+        code::UP,
+        code::RIGHT,
+        code::F1,
+        code::F12 - 1,
+        code::TAB,
+        code::ENTER,
+    ] {
         tap(&mut m, KeyEvent::press(c));
     }
     tap(&mut m, KeyEvent::press(code::ESC));
     assert_eq!(m.run(Some(1_000_000), |_| {}), RunResult::Exited(0));
     assert_eq!(
         output(&mut m),
-        "Hi^c!\x08 \x08[80][83][90][9b]\t\n[dbg] pc=8000005c s1 = 0x0000000c (12)\n"
+        format!("Hi^c!\x08 \x08[80][83][90][9a]\t\n[dbg] pc={DONE_PC} s1 = 0x0000000c (12)\n")
     );
     assert_eq!(m.cpu.bus.kbd.len(), 1, "only the release of Esc is left");
+}
+
+/// Where `examples/kbd-echo/kbd-echo.elf` shows its count, as `xcal.dbg` prints it.
+const DONE_PC: &str = "800000f0";
+
+/// A key as Grail's window reports it: its ASCII-mode code and its usage.
+fn key(code: u8, usage: u16) -> KeyEvent {
+    KeyEvent::press(code).with_usage(usage)
+}
+
+/// Hands `events` to the machine, as Grail's window would (some are invisible in the
+/// keyboard's mode), and runs the program for a while; returns what it printed.
+fn feed(m: &mut Machine, events: &[KeyEvent]) -> String {
+    for &ev in events {
+        m.key_event(ev);
+    }
+    assert_eq!(m.run(Some(100_000), |_| {}), RunResult::StepLimit);
+    output(m)
+}
+
+fn up(ev: KeyEvent) -> KeyEvent {
+    KeyEvent { release: true, ..ev }
+}
+
+#[test]
+fn polling_example_switches_to_raw_mode_and_back() {
+    use grail::keyboard::usage;
+    for name in ["kbd-echo.elf", "kbd-echo-rv64.elf"] {
+        let mut m = load(name);
+        let f12 = key(code::F12, usage::F12);
+        let a = key(b'a', usage::A);
+        // ASCII mode: 'a', then F12 switches. Its release comes after the switch, so
+        // it is the first raw event.
+        assert_eq!(feed(&mut m, &[a, up(a), f12]), "a\n", "{name}");
+        assert!(m.cpu.bus.kbd.raw());
+        assert_eq!(feed(&mut m, &[up(f12)]), "-45 ");
+
+        // Raw mode: Shift+A as the window sends it (the auto-repeat is not seen), a
+        // modifier alone, Alt and GUI, keys that type nothing, the keypad's Enter.
+        let shift = KeyEvent::key_press(usage::LEFT_SHIFT).with_shift(true);
+        let big_a = key(b'A', usage::A).with_shift(true);
+        let mut events = vec![shift, big_a, big_a.with_repeat(true), up(big_a), up(shift)];
+        for k in [
+            KeyEvent::key_press(usage::RIGHT_ALT),
+            KeyEvent::key_press(usage::LEFT_GUI),
+            KeyEvent::key_press(usage::HOME),
+            key(code::ENTER, usage::KP_ENTER),
+        ] {
+            events.extend([k, up(k)]);
+        }
+        assert_eq!(
+            feed(&mut m, &events),
+            "+e1 +04 -04 -e1 +e6 -e6 +e3 -e3 +4a -4a +58 -58 "
+        );
+
+        // F12 again: back to ASCII mode, where a key with no code sends nothing and
+        // F12's release is skipped like any release.
+        assert_eq!(feed(&mut m, &[f12]), "\n");
+        assert!(!m.cpu.bus.kbd.raw());
+        let b = key(b'b', usage::A + 1);
+        let lshift = KeyEvent::key_press(usage::LEFT_SHIFT);
+        assert_eq!(feed(&mut m, &[up(f12), lshift, b, up(b), up(lshift)]), "b");
+
+        // Esc stops it in raw mode too.
+        assert_eq!(feed(&mut m, &[f12]), "\n");
+        assert_eq!(feed(&mut m, &[up(f12)]), "-45 ");
+        m.key_event(key(code::ESC, usage::ESCAPE));
+        assert_eq!(m.run(Some(100_000), |_| {}), RunResult::Exited(0));
+        // Presses: a, F12, Shift, A, Right Alt, GUI, Home, keypad Enter, F12, b, F12, Esc.
+        let dbg = output(&mut m);
+        assert!(dbg.starts_with("[dbg] pc="), "{dbg}");
+        assert!(dbg.ends_with("s1 = 0x0000000c (12)\n") || dbg.ends_with("s1 = 0x000000000000000c (12)\n"));
+    }
 }
 
 #[test]

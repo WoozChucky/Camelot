@@ -15,12 +15,23 @@ use std::time::{Duration, Instant};
 
 const FULL: u64 = 640 * 480;
 
+/// A key with an ASCII-mode code only, as a viewer that knows no usages sends it.
 fn key(code: u8, release: bool) -> KeyEvent {
     KeyEvent {
         code,
         release,
         shift: false,
         ctrl: false,
+        repeat: false,
+        usage: 0,
+    }
+}
+
+/// A key with both forms, as Herald's window sends it.
+fn key2(code: u8, usage: u16, release: bool) -> KeyEvent {
+    KeyEvent {
+        usage,
+        ..key(code, release)
     }
 }
 
@@ -476,6 +487,77 @@ fn keys_need_a_screen_attachment() {
     assert_eq!(console.wait_for("!"), "hi!");
     again.key(key(0x1b, false));
     again.wait_for_event(exited(id));
+    server.stop().unwrap();
+}
+
+/// A key carries both forms: the guest's keyboard mode picks the one it sees. kbd-echo
+/// switches to raw mode on F12 and prints physical keys there, Shift alone included.
+#[test]
+fn keys_reach_the_guest_in_the_mode_it_chose() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "raw", profile(1, None), example("kbd-echo"));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    let mut console = Console::attach(&server, VmRef::Id(id));
+    let mut viewer = Viewer::attach(&server, VmRef::Id(id));
+    // ASCII mode: Shift sends nothing, 'q' its character.
+    viewer.key(key2(0, 0xe1, false));
+    viewer.key(key2(b'q', 0x14, false));
+    viewer.key(key2(b'q', 0x14, true));
+    viewer.key(key2(0, 0xe1, true));
+    viewer.key(key2(0x9b, 0x45, false));
+    assert_eq!(console.wait_for("q\n"), "q\n");
+    // Raw mode: F12's release, Shift, 'q' (its repeat dropped), and a key with no
+    // usage, which raw mode cannot see.
+    viewer.key(key2(0x9b, 0x45, true));
+    viewer.key(key2(0, 0xe1, false));
+    viewer.key(key2(b'Q', 0x14, false));
+    viewer.key(KeyEvent {
+        repeat: true,
+        ..key2(b'Q', 0x14, false)
+    });
+    viewer.key(key(b'x', false));
+    viewer.key(key2(b'Q', 0x14, true));
+    viewer.key(key2(0, 0xe1, true));
+    viewer.key(key2(0x1b, 0x29, false));
+    viewer.wait_for_event(exited(id));
+    // Esc ended it, so nothing came after.
+    assert_eq!(console.wait_for("-e1 "), "q\n-45 +e1 +14 -14 -e1 ");
+    server.stop().unwrap();
+}
+
+/// A viewer that goes lets go of the keys it held, as an unplugged keyboard does: a
+/// raw-mode guest sees their releases whether the viewer detaches or its connection
+/// ends (a viewer closed with Alt+F4 must not leave Alt held).
+#[test]
+fn a_viewer_that_goes_releases_its_keys() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "release", profile(1, None), example("kbd-echo"));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    let mut console = Console::attach(&server, VmRef::Id(id));
+    let mut viewer = Viewer::attach(&server, VmRef::Id(id));
+    // F12 switches kbd-echo to raw mode (which empties the FIFO: the keys after it wait
+    // for the switch); Left Alt and 'q' go down and stay down.
+    viewer.key(key2(0x9b, 0x45, false));
+    assert_eq!(console.wait_for("\n"), "\n");
+    viewer.key(key2(0x9b, 0x45, true));
+    viewer.key(key2(0, 0xe2, false));
+    viewer.key(key2(b'q', 0x14, false));
+    assert_eq!(console.wait_for("+14 "), "\n-45 +e2 +14 ");
+    assert_eq!(viewer.request(&Message::ScreenDetach { vm: id }), Message::Ok);
+    assert_eq!(console.wait_for("-14 "), "\n-45 +e2 +14 -e2 -14 ");
+
+    // A viewer whose connection ends: Right Ctrl, held, is released.
+    let mut gone = Viewer::attach(&server, VmRef::Id(id));
+    gone.key(key2(0, 0xe4, false));
+    assert_eq!(console.wait_for("+e4 "), "\n-45 +e2 +14 -e2 -14 +e4 ");
+    gone.conn.get_ref().shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(console.wait_for("-e4 "), "\n-45 +e2 +14 -e2 -14 +e4 -e4 ");
+
+    let mut last = Viewer::attach(&server, VmRef::Id(id));
+    last.key(key2(0x1b, 0x29, false));
+    last.wait_for_event(exited(id));
     server.stop().unwrap();
 }
 

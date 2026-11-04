@@ -133,6 +133,8 @@ impl Screen {
         let Some(w) = &mut self.window else {
             return true;
         };
+        // The keys are the window's or the program's by the mode it chose last.
+        w.set_raw_keys(m.cpu.bus.kbd.raw());
         if !w.pump() {
             return false;
         }
@@ -268,7 +270,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Program(RunResult::Exited(0)));
         assert_eq!(
             String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap(),
-            "hi\n[dbg] pc=8000005c s1 = 0x00000004 (4)\n"
+            "hi\n[dbg] pc=800000f0 s1 = 0x00000004 (4)\n"
         );
     }
 
