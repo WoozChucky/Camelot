@@ -278,8 +278,14 @@ fn input_taken_as_the_view_closes_goes_out() {
         st.input.push(key(0x1b));
         st.closed = true;
     }
+    // The Esc goes before the detach, so the guest may end before the server answers
+    // it: either way the session is over.
     let (end, _) = running.end();
-    assert_eq!(end.unwrap(), End::Detached);
+    let end = end.unwrap();
+    assert!(
+        matches!(end, End::Detached | End::VmEnded(VmState::Exited(0))),
+        "{end:?}"
+    );
     wait_until("the guest to take the Esc", || {
         state(&server, id) == VmState::Exited(0)
     });
