@@ -976,15 +976,13 @@ fn branch_and_jump_range_errors() {
     let objs = inputs("relocs", &["main.o", "lib.o", "relax.o"]);
     // .high 4 bytes too far, .low 4 bytes too low, and .text.branch (8 KiB)
     // between main.o's checks and lib.o.
-    let errs = errors(merlin_ld::link(
-        &objs,
-        &script(
-            "ENTRY(_start) SECTIONS { . = 0x7ffffffc; .low : { *(.low) } . = 0x80100000; \
-             .text : { *(.text.start) *(.text.branch) *(.text*) } .rodata : { *(.rodata*) } \
-             .data : { *(.data*) } .bss : { *(.bss*) } __stack_top = . + 4K; \
-             . = 0x80200004; .high : { *(.high) } }",
-        ),
-    ));
+    let far = script(
+        "ENTRY(_start) SECTIONS { . = 0x7ffffffc; .low : { *(.low) } . = 0x80100000; \
+         .text : { *(.text.start) *(.text.branch) *(.text*) } .rodata : { *(.rodata*) } \
+         .data : { *(.data*) } .bss : { *(.bss*) } __stack_top = . + 4K; \
+         . = 0x80200004; .high : { *(.high) } }",
+    );
+    let errs = errors(merlin_ld::link(&objs, &far));
     // lib_check's `bne a0, t0, fail` is 0x3c into lib.o's .text, 8280 bytes
     // after `fail` once .text.branch is in between; main.o's branch to the
     // weak (but defined) lib_inc is about as far the other way. Were it taken for
@@ -993,13 +991,13 @@ fn branch_and_jump_range_errors() {
         errs,
         [
             "main.o: relocation R_RISCV_JAL out of range for 'high_target' at .text.start+0x4: 1048576 is not \
-             in [-1048576, 1048574]",
+             in [-1048576, 1048575]",
             "main.o: relocation R_RISCV_JAL out of range for 'low_target' at .text.start+0x8: -1048580 is not \
-             in [-1048576, 1048574]",
+             in [-1048576, 1048575]",
             "main.o: relocation R_RISCV_BRANCH out of range for 'lib_inc' at .text.start+0x268: 8444 is not \
-             in [-4096, 4094]",
+             in [-4096, 4095]",
             "lib.o: relocation R_RISCV_BRANCH out of range for 'fail' at .text+0x3c: -8280 is not in [-4096, \
-             4094]",
+             4095]",
         ]
     );
 
@@ -1023,6 +1021,19 @@ fn branch_and_jump_range_errors() {
         [
             "main.o: relocation R_RISCV_JAL against 'high_target' at .text.start+0x4 is misaligned: offset \
           1048573 is not a multiple of 2"
+        ]
+    );
+    // Odd and out of range: both errors, the range first, as ld.lld
+    // reports them ("out of range: 1048577 is not in [-1048576, 1048575]",
+    // then "improper alignment").
+    let errs = errors(merlin_ld::link(&objs, &far));
+    assert_eq!(
+        errs[..2],
+        [
+            "main.o: relocation R_RISCV_JAL out of range for 'high_target' at .text.start+0x4: 1048577 is not \
+             in [-1048576, 1048575]",
+            "main.o: relocation R_RISCV_JAL against 'high_target' at .text.start+0x4 is misaligned: offset \
+             1048577 is not a multiple of 2",
         ]
     );
 }
@@ -1098,10 +1109,21 @@ fn data_word_relocations() {
     );
 }
 
-/// R_RISCV_ALIGN only makes sense with relaxation; R_RISCV_RELAX is ignored
-/// (relocs/relax.o, above).
+/// Label differences and set values (ADD/SUB/SET, 32_PCREL) give ld.lld's
+/// bytes. In debug information on RV32 each value is sign-extended from 32
+/// bits first (ld.lld: `.dword gone - _start` is 0x8000_0000 there, gone
+/// being 0).
 #[test]
-fn align_needs_relaxation() {
+fn label_differences_and_sets() {
+    let ranges = common::assert_diffs(merlin_as::assemble_to_elf(common::DIFFS).unwrap());
+    assert_eq!(ranges, [0, 0, 0, 0x80, 0, 0, 0, 0, 4, 0, 0, 0]);
+}
+
+/// R_RISCV_ALIGN is refused: ld.lld deletes the padding beyond what the
+/// alignment needs, with --no-relax too, and merlin-ld does not.
+/// R_RISCV_RELAX is ignored (relocs/relax.o, above).
+#[test]
+fn align_padding_is_refused() {
     let errs = errors(merlin_ld::link(
         &inputs("rejects", &["align.o"]),
         &Options::default(),
@@ -1109,8 +1131,8 @@ fn align_needs_relaxation() {
     assert_eq!(
         errs,
         [
-            "align.o: R_RISCV_ALIGN at .text+0xc needs linker relaxation, which merlin-ld does not do; \
-          assemble with -mno-relax"
+            "align.o: R_RISCV_ALIGN at .text+0xc: merlin-ld does not delete alignment padding as ld.lld \
+             does; assemble with -mno-relax"
         ]
     );
 }

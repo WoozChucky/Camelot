@@ -45,9 +45,9 @@ static char *describe(int code, struct reloc_error *e, const char *ty, const cha
     switch (code) {
     case RE_UNSUPPORTED:
         return fmt("unsupported relocation %s against '%s' at %s", ty, sym, at);
-    case RE_NEEDS_RELAXATION:
-        return fmt("%s at %s needs linker relaxation, which merlin-ld does not do; assemble with -mno-relax", ty,
-                   at);
+    case RE_ALIGN_PADDING:
+        return fmt("%s at %s: merlin-ld does not delete alignment padding as ld.lld does; assemble with -mno-relax",
+                   ty, at);
     case RE_OUT_OF_RANGE:
         return fmt("relocation %s out of range for '%s' at %s: %s is not in [%s, %s]", ty, sym, at,
                    i64_dec(e->value), i64_dec(e->min), i64_dec(e->max));
@@ -80,12 +80,21 @@ static void report(struct object *o, struct section *sec, struct rela *r, char *
     free(what);
 }
 
-/* Reports a relocation reloc_apply refused. */
+/* Reports a relocation reloc_apply refused: one error, or two for an odd
+ * offset out of range, the range first, as ld.lld reports it. */
 static void report_refused(struct object *o, struct section *sec, struct rela *r, int code, struct reloc_error *e) {
     char *at = where(sec, r);
-    char *msg = describe(code, e, reloc_type_name(r->type), symbol_display_name(o, r->sym), at, sec, r);
+    const char *ty = reloc_type_name(r->type);
+    const char *sym = symbol_display_name(o, r->sym);
+    char *msg = describe(code == RE_RANGE_AND_ALIGN ? RE_OUT_OF_RANGE : code, e, ty, sym, at, sec, r);
     error(fmt("%s: %s", o->name, msg));
     free(msg);
+    if (code == RE_RANGE_AND_ALIGN) {
+        e->min = i64_u(2);
+        msg = describe(RE_MISALIGNED, e, ty, sym, at, sec, r);
+        error(fmt("%s: %s", o->name, msg));
+        free(msg);
+    }
     free(at);
 }
 
@@ -222,8 +231,12 @@ static uchar **debug(struct layout *l) {
                     /* S = tombstone - A, modulo 2^64, so that S + A, the
                      * value written, is the tombstone for R_RISCV_32 (an
                      * offset) and R_RISCV_64 (an address) alike, whatever
-                     * the addend. */
-                    sym = i64_sub(i64_u(tombstone), i64_of(r->addend));
+                     * the addend. Any other type (an ADD/SUB half of a
+                     * label difference) gets S = 0, as in ld.lld. */
+                    sym = i64_u(0);
+                    if (r->type == R_RISCV_32 || r->type == R_RISCV_64) {
+                        sym = i64_sub(i64_u(tombstone), i64_of(r->addend));
+                    }
                 } else if (reloc_symbol(l, in->object, r->sym, &value, &e)) {
                     sym = i64_u(value);
                 } else {

@@ -773,8 +773,8 @@ fn rejects_unsupported_rv64_objects() {
     assert_eq!(
         errs,
         [
-            "align.o: R_RISCV_ALIGN at .text+0xc needs linker relaxation, which merlin-ld does not do; \
-          assemble with -mno-relax"
+            "align.o: R_RISCV_ALIGN at .text+0xc: merlin-ld does not delete alignment padding as ld.lld \
+             does; assemble with -mno-relax"
         ]
     );
 }
@@ -1207,6 +1207,14 @@ gone:
     want.extend_from_slice(&0x1004u32.to_le_bytes());
     want.extend_from_slice(&0x1004u64.to_le_bytes());
     assert_eq!(elf.section_data(info).unwrap(), want);
+}
+
+/// link.rs's `label_differences_and_sets` on RV64: the same `.data`, and
+/// `.dword gone - _start` 0 - 0x8000_0000 in 64 bits, as ld.lld writes it.
+#[test]
+fn label_differences_and_sets() {
+    let ranges = common::assert_diffs(rv64("a.o", common::DIFFS).data);
+    assert_eq!(ranges, [0, 0, 0, 0x80, 0xff, 0xff, 0xff, 0xff, 4, 0, 0, 0]);
 }
 
 /// link.rs's test of a global defined in discarded code and a weak symbol

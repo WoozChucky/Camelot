@@ -490,6 +490,100 @@ pub fn assert_tombstones(a: Vec<u8>, b: Vec<u8>) {
     }
 }
 
+/// Label differences and set values (R_RISCV_ADD*, SUB*, SET*, 32_PCREL),
+/// which merlin-as does not emit: [`DIFFS`] assembled, its relocations given
+/// the types and offsets of [`DIFFS_RELOCS`] by [`retype`], is what clang
+/// makes of `.dword g - .`, `.word g - .`, `.half g - .`, `.byte g - .` and
+/// `.reloc`s of the others in `.data`, and of `.dword gone - _start` and a
+/// SET32 of `gone + 4` in `.debug_ranges`, `gone` in code `/DISCARD/`
+/// throws away. The old contents of each field are in the `.byte`s; the
+/// words after them only carry the relocations.
+pub const DIFFS: &str = "
+        .text
+        .globl _start
+_start: nop
+        .section .text.gone, \"ax\"
+gone:   nop
+        .data
+d0:     .byte 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .byte 0, 0, 0, 0, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0xff, 0xc3, 0xff
+        .zero 3
+        .word g, d0, g, d0 + 8, g, d0 + 12, g, d0 + 14
+        .word g + 4, g + 4, g + 4, g + 4, g + 4, g + 4, g
+        .section .debug_ranges, \"\", @progbits
+        .zero 12
+        .word gone, _start, gone + 4
+";
+/// (type, offset) of each of [`DIFFS`]'s relocations, in order: `.data`'s,
+/// then `.debug_ranges`'s.
+pub const DIFFS_RELOCS: [(u32, u64); 18] = [
+    (36, 0),  // R_RISCV_ADD64 g
+    (40, 0),  // R_RISCV_SUB64 d0 (the place)
+    (35, 8),  // R_RISCV_ADD32
+    (39, 8),  // R_RISCV_SUB32
+    (34, 12), // R_RISCV_ADD16
+    (38, 12), // R_RISCV_SUB16
+    (33, 14), // R_RISCV_ADD8
+    (37, 14), // R_RISCV_SUB8
+    (57, 15), // R_RISCV_32_PCREL g + 4
+    (56, 19), // R_RISCV_SET32 g + 4
+    (55, 23), // R_RISCV_SET16
+    (54, 25), // R_RISCV_SET8
+    (53, 26), // R_RISCV_SET6
+    (52, 27), // R_RISCV_SUB6
+    (33, 28), // R_RISCV_ADD8 g
+    (36, 0),  // R_RISCV_ADD64 gone
+    (40, 0),  // R_RISCV_SUB64 _start
+    (56, 8),  // R_RISCV_SET32 gone + 4
+];
+pub const DIFFS_LD: &str = "SECTIONS { g = 0x100; . = 0x80000000; .text : { *(.text) } .data : { *(.data) } \
+                            /DISCARD/ : { *(.text.gone) } }";
+/// ld.lld 23's `.data` for [`DIFFS`] (from 0x8000_0004), on both widths.
+pub const DIFFS_DATA: [u8; 29] = [
+    0xfc, 0, 0, 0x80, 0xff, 0xff, 0xff, 0xff, 0xf4, 0, 0, 0x80, 0xf0, 0, 0xee, 0xf1, 0, 0, 0x80, 4, 1, 0, 0,
+    4, 1, 4, 0xc4, 0xff, 0xff,
+];
+
+/// `obj` (ELF32 or ELF64) with its relocations, in section order, given the
+/// types and offsets of `relocs`.
+pub fn retype(mut obj: Vec<u8>, relocs: &[(u32, u64)]) -> Vec<u8> {
+    let elf = elf::Elf::parse(&obj).unwrap();
+    let wide = elf.class == elf::Class::Elf64;
+    let mut at = Vec::new();
+    for s in elf.sections.iter().filter(|s| s.ty == elf::SHT_RELA) {
+        at.extend((0..s.size / s.entsize).map(|i| (s.offset + i * s.entsize) as usize));
+    }
+    assert_eq!(at.len(), relocs.len(), "relocations");
+    for (&e, &(ty, off)) in at.iter().zip(relocs) {
+        if wide {
+            obj[e..e + 8].copy_from_slice(&off.to_le_bytes());
+            obj[e + 8..e + 12].copy_from_slice(&ty.to_le_bytes());
+        } else {
+            obj[e..e + 4].copy_from_slice(&(off as u32).to_le_bytes());
+            obj[e + 4] = ty as u8;
+        }
+    }
+    obj
+}
+
+/// Links [`DIFFS`] and checks `.data` against ld.lld's bytes, and that the
+/// discarded `gone` is 0 in the label difference and the SET32 of
+/// `.debug_ranges` (no tombstone for these types, as in ld.lld). Returns
+/// `.debug_ranges`, which differs between the widths.
+pub fn assert_diffs(obj: Vec<u8>) -> Vec<u8> {
+    let objs = [Input {
+        name: "a.o".into(),
+        data: retype(obj, &DIFFS_RELOCS),
+    }];
+    let linked = merlin_ld::link(&objs, &script(DIFFS_LD)).unwrap();
+    let elf = elf::Elf::parse(&linked.elf).unwrap();
+    let data = elf.sections.iter().find(|s| s.name == ".data").unwrap();
+    assert_eq!(data.addr, 0x8000_0004);
+    assert_eq!(elf.section_data(data).unwrap()[..29], DIFFS_DATA);
+    let ranges = elf.sections.iter().find(|s| s.name == ".debug_ranges").unwrap();
+    elf.section_data(ranges).unwrap()[..12].to_vec()
+}
+
 /// `obj` (ELF32 or ELF64) with its global symbol `name` made weak.
 pub fn weaken(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
     let elf = elf::Elf::parse(&obj).unwrap();

@@ -36,6 +36,12 @@
 //! | `R_RISCV_PCREL_LO12_I/S` | its HI20's S + A - P | I- or S-type imm, the low part         |
 //! | `R_RISCV_HI20`           | S + A              | U-type imm, the high part                |
 //! | `R_RISCV_LO12_I/S`       | S + A              | I- or S-type imm, the low part           |
+//! | `R_RISCV_ADD8/16/32/64`  | field + (S + A)    | a byte, half, word or doubleword         |
+//! | `R_RISCV_SUB8/16/32/64`  | field - (S + A)    | a byte, half, word or doubleword         |
+//! | `R_RISCV_SUB6`           | field - (S + A)    | the low 6 bits of a byte                 |
+//! | `R_RISCV_SET6`           | S + A              | the low 6 bits of a byte                 |
+//! | `R_RISCV_SET8/16/32`     | S + A              | a byte, half or word                     |
+//! | `R_RISCV_32_PCREL`       | S + A - P          | the whole 32-bit word                    |
 //! | `R_RISCV_RELAX`          | (none)             | nothing: a hint, merlin-ld never relaxes |
 //! | `R_RISCV_NONE`           | (none)             | nothing                                  |
 //!
@@ -43,14 +49,21 @@
 //! the addresses in RV64 debug information. Assemblers emit it on RV32 too,
 //! for a 64-bit datum holding an address, so it is applied on both widths.
 //!
-//! `R_RISCV_ALIGN` (padding that relaxation may shrink) is refused: merlin-ld
-//! does no relaxation, so objects must be built with `-mno-relax`, which
-//! makes clang pad with plain `nop`s and emit no `R_RISCV_ALIGN`. (Even with
-//! relaxation, LLVM 23 emits one only when a linker-relaxable instruction,
-//! a `call` or an `la`, comes before the padding in its section: before
-//! that, nothing can shrink, so the assembler knows the padding's size.)
-//! Everything else (GOT, TLS, compressed, `ADD`/`SUB` pairs) is
-//! [`RelocError::Unsupported`].
+//! The `ADD`/`SUB` pairs are label differences the assembler could not
+//! work out (`.dword g - .`, `.word end - start` across sections), the
+//! `SET`s and `SUB6` what DWARF call frame information uses, and
+//! `R_RISCV_32_PCREL` a pc-relative pointer (clang's `.eh_frame` with
+//! `-funwind-tables`); LLVM emits them with `-mno-relax` too.
+//!
+//! `R_RISCV_ALIGN` (padding that relaxation may shrink) is refused. ld.lld
+//! deletes the padding beyond what the alignment needs, even with
+//! `--no-relax`, moving what follows; merlin-ld does not, so objects must be
+//! built with `-mno-relax`, which makes clang pad with plain `nop`s and emit
+//! no `R_RISCV_ALIGN`. (With relaxation, LLVM 23 emits one only when a
+//! linker-relaxable instruction, a `call` or an `la`, comes before the
+//! padding in its section: before that, nothing can shrink, so the
+//! assembler knows the padding's size.) Everything else (GOT, TLS,
+//! compressed, `SET_ULEB128`/`SUB_ULEB128`) is [`RelocError::Unsupported`].
 //!
 //! Two decisions are made by the caller, [`crate::relocate`], because they
 //! need the object file: a `PCREL_LO12`'s auipc label must be in its own
@@ -85,7 +98,15 @@
 //!     (`-mcmodel=medany`), which reaches ±2 GiB around itself.
 //! * **`R_RISCV_BRANCH` and `R_RISCV_JAL`**: ±4 KiB and ±1 MiB on both
 //!   widths. RV64 offsets wrap at 2^64 (a jump from 0 to the top of memory is
-//!   -16); RV32 offsets do not wrap at 2^32, as in ld.lld.
+//!   -16); RV32 offsets do not wrap at 2^32, as in ld.lld. The error gives
+//!   ld.lld's range, a 13- or 21-bit number (`4096 is not in [-4096,
+//!   4095]`, though only even offsets can be encoded), and an offset that is
+//!   also odd gets the misalignment error too, after it, as in ld.lld.
+//! * **`SET32` and `32_PCREL`** must fit 32 bits read as signed, as ld.lld
+//!   checks them (on RV32 too, where an address from 0x8000_0000 up does
+//!   not); the other `ADD`, `SUB` and `SET` types keep the low bits of their
+//!   value, unchecked. On RV32, in a section that is not loaded, their value
+//!   is sign-extended from 32 bits as `R_RISCV_64`'s is (below).
 //! * **`R_RISCV_32`** must fit 32 bits read as unsigned (an address) or as
 //!   signed (`.word sym - 0x1000` below a small address). On RV64, S + A is
 //!   read as signed, so a higher-half address 0xffff_ffff_8xxx_xxxx is
@@ -116,10 +137,24 @@ pub const R_RISCV_PCREL_LO12_S: u32 = 25;
 pub const R_RISCV_HI20: u32 = 26;
 pub const R_RISCV_LO12_I: u32 = 27;
 pub const R_RISCV_LO12_S: u32 = 28;
+pub const R_RISCV_ADD8: u32 = 33;
+pub const R_RISCV_ADD16: u32 = 34;
+pub const R_RISCV_ADD32: u32 = 35;
+pub const R_RISCV_ADD64: u32 = 36;
+pub const R_RISCV_SUB8: u32 = 37;
+pub const R_RISCV_SUB16: u32 = 38;
+pub const R_RISCV_SUB32: u32 = 39;
+pub const R_RISCV_SUB64: u32 = 40;
 pub const R_RISCV_ALIGN: u32 = 43;
 pub const R_RISCV_RVC_BRANCH: u32 = 44;
 pub const R_RISCV_RVC_JUMP: u32 = 45;
 pub const R_RISCV_RELAX: u32 = 51;
+pub const R_RISCV_SUB6: u32 = 52;
+pub const R_RISCV_SET6: u32 = 53;
+pub const R_RISCV_SET8: u32 = 54;
+pub const R_RISCV_SET16: u32 = 55;
+pub const R_RISCV_SET32: u32 = 56;
+pub const R_RISCV_32_PCREL: u32 = 57;
 
 /// The psABI name of a relocation type, for diagnostics (from the table
 /// shared with merlin-objdump in [`elf::reloc_name`]).
@@ -175,12 +210,21 @@ impl Context {
 pub enum RelocError {
     /// A type merlin-ld does not handle (GOT, TLS, compressed, ...).
     Unsupported,
-    /// `R_RISCV_ALIGN`: only meaningful with linker relaxation.
-    NeedsRelaxation,
+    /// `R_RISCV_ALIGN`: padding ld.lld deletes down to what the alignment
+    /// needs (also with `--no-relax`), which merlin-ld does not do.
+    AlignPadding,
     /// The value doesn't fit the field: it must lie in `min..=max`.
     OutOfRange { value: i64, min: i64, max: i64 },
     /// A branch or jump offset that is not a multiple of `align` bytes.
     Misaligned { value: i64, align: i64 },
+    /// Both: a branch or jump offset out of range and odd, which ld.lld
+    /// reports as two errors, the range first.
+    OutOfRangeMisaligned {
+        value: i64,
+        min: i64,
+        max: i64,
+        align: i64,
+    },
     /// The patched field runs past the end of its section: it needs `need`
     /// bytes, only `have` are left.
     Truncated { need: usize, have: usize },
@@ -305,21 +349,53 @@ fn write32(bytes: &mut [u8], at: usize, v: u32) {
 }
 
 /// Checks that `value` is a signed `bits`-bit even number: the range of a
-/// B-type (13 bits) or J-type (21 bits) offset.
+/// B-type (13 bits) or J-type (21 bits) offset. As ld.lld's `checkInt` and
+/// `checkAlignment`, the range is that of a `bits`-bit number (its largest
+/// value odd, so out of reach), and an offset both out of range and odd is
+/// two errors.
 fn check_offset(value: i64, bits: u32) -> Result<u32, RelocError> {
     let (min, max) = (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1);
+    let odd = value % 2 != 0;
     if value < min || value > max {
-        return Err(RelocError::OutOfRange {
-            value,
-            min,
-            // The largest *even* offset: an odd one could not be encoded.
-            max: max - 1,
+        return Err(if odd {
+            RelocError::OutOfRangeMisaligned {
+                value,
+                min,
+                max,
+                align: 2,
+            }
+        } else {
+            RelocError::OutOfRange { value, min, max }
         });
     }
-    if value % 2 != 0 {
+    if odd {
         return Err(RelocError::Misaligned { value, align: 2 });
     }
     Ok(value as u32)
+}
+
+/// Reads a little-endian field of 1, 2, 4 or 8 bytes.
+fn read_le(field: &[u8]) -> u64 {
+    field.iter().rev().fold(0, |v, &b| v << 8 | u64::from(b))
+}
+
+/// Writes the low `field.len()` bytes of `v`, little-endian.
+fn write_le(field: &mut [u8], v: u64) {
+    let n = field.len();
+    field.copy_from_slice(&v.to_le_bytes()[..n]);
+}
+
+/// The data relocations that compute a field from its old contents and a
+/// value, or set it: label differences (`ADD`/`SUB` pairs) and `SET`s, and
+/// `R_RISCV_32_PCREL`. Their field's size in bytes.
+fn data_field(ty: u32) -> Option<usize> {
+    Some(match ty {
+        R_RISCV_ADD8 | R_RISCV_SUB8 | R_RISCV_SUB6 | R_RISCV_SET6 | R_RISCV_SET8 => 1,
+        R_RISCV_ADD16 | R_RISCV_SUB16 | R_RISCV_SET16 => 2,
+        R_RISCV_ADD32 | R_RISCV_SUB32 | R_RISCV_SET32 | R_RISCV_32_PCREL => 4,
+        R_RISCV_ADD64 | R_RISCV_SUB64 => 8,
+        _ => return None,
+    })
 }
 
 /// Patches `bytes` for one relocation. See the module documentation.
@@ -346,11 +422,11 @@ pub fn apply(
     // How many bytes each type patches; check them before touching anything.
     let need = match ty {
         R_RISCV_NONE | R_RISCV_RELAX => return Ok(()),
-        R_RISCV_ALIGN => return Err(RelocError::NeedsRelaxation),
+        R_RISCV_ALIGN => return Err(RelocError::AlignPadding),
         R_RISCV_64 | R_RISCV_CALL | R_RISCV_CALL_PLT => 8,
         R_RISCV_32 | R_RISCV_BRANCH | R_RISCV_JAL | R_RISCV_PCREL_HI20 | R_RISCV_PCREL_LO12_I
         | R_RISCV_PCREL_LO12_S | R_RISCV_HI20 | R_RISCV_LO12_I | R_RISCV_LO12_S => 4,
-        _ => return Err(RelocError::Unsupported),
+        _ => data_field(ty).ok_or(RelocError::Unsupported)?,
     };
     if bytes.len() < need {
         return Err(RelocError::Truncated {
@@ -359,17 +435,62 @@ pub fn apply(
         });
     }
 
+    // On RV32, in a section that is not loaded, ld.lld's relocateNonAlloc
+    // sign-extends the 32-bit value of every relocation it applies there
+    // (`SignExtend64<32>`): it shows in the 64-bit fields, R_RISCV_64 and
+    // the ADD64/SUB64 halves.
+    let nonalloc = |v: u64| match ctx.class {
+        Class::Elf32 if ctx.debug => v as u32 as i32 as i64 as u64,
+        _ => v,
+    };
+
+    // Label differences and set values, ld.lld's read-modify-write of the
+    // field, cut to its width: `.dword a - b` is an R_RISCV_ADD64 of a and
+    // an R_RISCV_SUB64 of b at the same place (LLVM emits the pair when the
+    // difference is not known when assembling, with -mno-relax too: b in
+    // another section, or `.`), which add S + A to the field and subtract
+    // the other S + A. SUB6 and SET6 change only the low 6 bits of their
+    // byte (DWARF call frame instructions). The SETs write S + A, and
+    // R_RISCV_32_PCREL S + A - P (a pc-relative `.eh_frame` pointer). Only
+    // SET32 and 32_PCREL are checked, as signed 32-bit numbers, as ld.lld's
+    // `checkInt(val, 32)`; the others keep the low bits.
+    if let Some(n) = data_field(ty) {
+        let v = nonalloc(abs);
+        let field = &mut bytes[..n];
+        let old = read_le(field);
+        let new = match ty {
+            R_RISCV_ADD8 | R_RISCV_ADD16 | R_RISCV_ADD32 | R_RISCV_ADD64 => old.wrapping_add(v),
+            R_RISCV_SUB8 | R_RISCV_SUB16 | R_RISCV_SUB32 | R_RISCV_SUB64 => old.wrapping_sub(v),
+            R_RISCV_SUB6 => (old & 0xc0) | (old.wrapping_sub(v) & 0x3f),
+            R_RISCV_SET6 => (old & 0xc0) | (v & 0x3f),
+            R_RISCV_SET8 | R_RISCV_SET16 => v,
+            _ => {
+                let v = if ty == R_RISCV_32_PCREL {
+                    nonalloc(pcrel)
+                } else {
+                    v
+                };
+                let (min, max) = (i32::MIN as i64, i32::MAX as i64);
+                if (v as i64) < min || (v as i64) > max {
+                    return Err(RelocError::OutOfRange {
+                        value: v as i64,
+                        min,
+                        max,
+                    });
+                }
+                v
+            }
+        };
+        write_le(field, new);
+        return Ok(());
+    }
+
     // `.dword sym + A`: a doubleword holding an address, never out of range.
     if ty == R_RISCV_64 {
-        let value = match ctx.class {
-            // ELF32 (RV32, until #159): in a section that is not loaded,
-            // ld.lld's relocateNonAlloc keeps the 32-bit value and
-            // sign-extends it (`SignExtend64<32>`). Loaded, it is S + A in
-            // 64 bits, as everywhere on RV64.
-            Class::Elf32 if ctx.debug => abs as u32 as i32 as i64 as u64,
-            _ => abs,
-        };
-        bytes[..8].copy_from_slice(&value.to_le_bytes());
+        // ELF32 (RV32, until #159): in a section that is not loaded, the
+        // 32-bit value sign-extended. Loaded, it is S + A in 64 bits, as
+        // everywhere on RV64.
+        bytes[..8].copy_from_slice(&nonalloc(abs).to_le_bytes());
         return Ok(());
     }
 
@@ -590,13 +711,13 @@ mod tests {
         // Addend counts: S + A - P.
         let w = run(R_RISCV_BRANCH, p, p, -12, &[BEQ_A0_A1]).unwrap();
         assert_eq!(imm(w[0]), -12);
-        // ±4 KiB.
+        // ±4 KiB, ld.lld's range (a 13-bit number).
         assert_eq!(
             run(R_RISCV_BRANCH, p, p + 4096, 0, &[BEQ_A0_A1]),
             Err(RelocError::OutOfRange {
                 value: 4096,
                 min: -4096,
-                max: 4094
+                max: 4095
             })
         );
         assert!(matches!(
@@ -606,6 +727,16 @@ mod tests {
         assert_eq!(
             run(R_RISCV_BRANCH, p, p + 7, 0, &[BEQ_A0_A1]),
             Err(RelocError::Misaligned { value: 7, align: 2 })
+        );
+        // Out of range and odd: both, as ld.lld reports them.
+        assert_eq!(
+            run(R_RISCV_BRANCH, p, p - 4097, 0, &[BEQ_A0_A1]),
+            Err(RelocError::OutOfRangeMisaligned {
+                value: -4097,
+                min: -4096,
+                max: 4095,
+                align: 2
+            })
         );
     }
 
@@ -624,7 +755,16 @@ mod tests {
             Err(RelocError::OutOfRange {
                 value: 0x10_0000,
                 min: -0x10_0000,
-                max: 0xf_fffe
+                max: 0xf_ffff
+            })
+        );
+        assert_eq!(
+            run(R_RISCV_JAL, p, p + 0x10_0001, 0, &[JAL_RA]),
+            Err(RelocError::OutOfRangeMisaligned {
+                value: 0x10_0001,
+                min: -0x10_0000,
+                max: 0xf_ffff,
+                align: 2
             })
         );
         assert!(matches!(
@@ -798,14 +938,14 @@ mod tests {
         assert_eq!(run(R_RISCV_NONE, 0, 0, 0, &[7]).unwrap(), [7]);
         assert_eq!(
             run(R_RISCV_ALIGN, 0, 0, 4, &[0x13]),
-            Err(RelocError::NeedsRelaxation)
+            Err(RelocError::AlignPadding)
         );
         for ty in [
             R_RISCV_GOT_HI20,
             R_RISCV_RVC_BRANCH,
             R_RISCV_RVC_JUMP,
-            35,
-            39,
+            60, // R_RISCV_SET_ULEB128
+            61, // R_RISCV_SUB_ULEB128
             200,
         ] {
             assert_eq!(run(ty, 0, 0, 0, &[0]), Err(RelocError::Unsupported), "{ty}");
@@ -1009,7 +1149,7 @@ mod tests {
             Err(RelocError::OutOfRange {
                 value: 4096,
                 min: -4096,
-                max: 4094
+                max: 4095
             })
         );
         assert_eq!(
@@ -1017,7 +1157,7 @@ mod tests {
             Err(RelocError::OutOfRange {
                 value: -0x10_0002,
                 min: -0x10_0000,
-                max: 0xf_fffe
+                max: 0xf_ffff
             })
         );
         // Not wrapped at 2^32: 0 to 0xffff_fff0 is 4 GiB away on RV64.
@@ -1159,5 +1299,102 @@ mod tests {
             let w = apply_words(R_RISCV_64, 0, s, a, &[1, 1], &debug).unwrap();
             assert_eq!(dword(&w), 0);
         }
+    }
+
+    /// `apply` on a byte field: the bytes after it (0xee) stay.
+    fn bytes(ty: u32, p: u64, s: u64, a: i64, old: &[u8], ctx: &Context) -> Result<Vec<u8>, RelocError> {
+        let mut b = old.to_vec();
+        b.push(0xee);
+        apply(ty, p, s, a, &mut b, ctx)?;
+        assert_eq!(b.pop(), Some(0xee));
+        Ok(b)
+    }
+
+    /// The ADD/SUB/SET types and R_RISCV_32_PCREL, as ld.lld 23 applies them
+    /// to clang's `.dword g - .`, `.word g - .`, `.half g - .`, `.byte g - .`
+    /// and `.reloc`s of the others, with g = 0x100 and the data from
+    /// 0x8000_0004, on both widths.
+    #[test]
+    fn label_differences_and_sets() {
+        for class in [Class::Elf32, Class::Elf64] {
+            let ctx = Context::new(class);
+            let diff = |add, sub, p: u64, n: usize| {
+                let b = bytes(add, p, 0x100, 0, &vec![0; n], &ctx).unwrap();
+                bytes(sub, p, p, 0, &b, &ctx).unwrap()
+            };
+            let p = 0x8000_0004;
+            assert_eq!(
+                diff(R_RISCV_ADD64, R_RISCV_SUB64, p, 8),
+                0xffff_ffff_8000_00fcu64.to_le_bytes()
+            );
+            assert_eq!(diff(R_RISCV_ADD32, R_RISCV_SUB32, p + 8, 4), [0xf4, 0, 0, 0x80]);
+            assert_eq!(diff(R_RISCV_ADD16, R_RISCV_SUB16, p + 12, 2), [0xf0, 0]);
+            assert_eq!(diff(R_RISCV_ADD8, R_RISCV_SUB8, p + 14, 1), [0xee]);
+            let one = |ty, p, old: &[u8]| bytes(ty, p, 0x100, 4, old, &ctx);
+            assert_eq!(
+                one(R_RISCV_32_PCREL, p + 15, &[0; 4]).unwrap(),
+                [0xf1, 0, 0, 0x80]
+            );
+            assert_eq!(one(R_RISCV_SET32, p + 19, &[0x11; 4]).unwrap(), [4, 1, 0, 0]);
+            assert_eq!(one(R_RISCV_SET16, p + 23, &[0x11; 2]).unwrap(), [4, 1]);
+            assert_eq!(one(R_RISCV_SET8, p + 25, &[0x11]).unwrap(), [4]);
+            // The low 6 bits only: 0xff keeps 0xc0 and gets 0x104 & 0x3f;
+            // 0xc3 gets (3 - 0x104) & 0x3f.
+            assert_eq!(one(R_RISCV_SET6, p + 26, &[0xff]).unwrap(), [0xc4]);
+            assert_eq!(one(R_RISCV_SUB6, p + 27, &[0xc3]).unwrap(), [0xff]);
+            assert_eq!(bytes(R_RISCV_ADD8, 0, 0x100, 0, &[0xff], &ctx).unwrap(), [0xff]);
+            // SET32 and 32_PCREL are signed 32-bit numbers, on RV32 too
+            // (ld.lld: "2147488312 is not in [-2147483648, 2147483647]");
+            // nothing is written.
+            let (min, max) = (-0x8000_0000, 0x7fff_ffff);
+            assert_eq!(
+                bytes(R_RISCV_SET32, p, 0x8000_1234, 4, &[0; 4], &ctx),
+                Err(RelocError::OutOfRange {
+                    value: 0x8000_1238,
+                    min,
+                    max
+                })
+            );
+            assert_eq!(
+                bytes(R_RISCV_32_PCREL, 0x100, 0x8000_0100, 0, &[0; 4], &ctx),
+                Err(RelocError::OutOfRange {
+                    value: 0x8000_0000,
+                    min,
+                    max
+                })
+            );
+            // The other fields keep the low bits, unchecked.
+            assert_eq!(
+                bytes(R_RISCV_SET16, 0, 0x7fff_1234, 0, &[0; 2], &ctx).unwrap(),
+                [0x34, 0x12]
+            );
+            assert_eq!(
+                apply(R_RISCV_ADD16, 0, 2, 0, &mut [0x41], &ctx),
+                Err(RelocError::Truncated { need: 2, have: 1 })
+            );
+        }
+    }
+
+    /// In debug information on RV32, the value is sign-extended from 32 bits
+    /// first, as ld.lld's relocateNonAlloc does: `.dword g - _start`, g =
+    /// 0x100, _start = 0x8000_0000, is 0x8000_0100 there, and
+    /// 0xffff_ffff_8000_0100 on RV64; `.dword _start - g` is
+    /// 0xffff_ffff_8000_0000 on RV32.
+    #[test]
+    fn label_differences_in_debug_information() {
+        let pair = |class, a: u64, b: u64| {
+            let ctx = Context::debug(class);
+            let f = bytes(R_RISCV_ADD64, 0, a, 0, &[0; 8], &ctx).unwrap();
+            u64::from_le_bytes(
+                bytes(R_RISCV_SUB64, 0, b, 0, &f, &ctx)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(pair(Class::Elf32, 0x100, 0x8000_0000), 0x8000_0100);
+        assert_eq!(pair(Class::Elf64, 0x100, 0x8000_0000), 0xffff_ffff_8000_0100);
+        assert_eq!(pair(Class::Elf32, 0x8000_0000, 0), 0xffff_ffff_8000_0000);
+        assert_eq!(pair(Class::Elf64, 0x8000_0000, 0), 0x8000_0000);
     }
 }

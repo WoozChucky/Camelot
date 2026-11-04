@@ -647,6 +647,67 @@ far:    ret
 fargone: nop
 ";
 
+/// `obj`, an ELF32 object, with its relocations, in section order, given
+/// the types and offsets of `relocs`: merlin-as emits no ADD/SUB/SET,
+/// 32_PCREL or ALIGN.
+fn retype(mut obj: Vec<u8>, relocs: &[(u8, u32)]) -> Vec<u8> {
+    let at: Vec<usize> = {
+        let elf = elf::Elf::parse(&obj).unwrap();
+        elf.sections
+            .iter()
+            .filter(|s| s.ty == elf::SHT_RELA)
+            .flat_map(|s| (0..s.size / 12).map(move |i| (s.offset + i * 12) as usize))
+            .collect()
+    };
+    assert_eq!(at.len(), relocs.len());
+    for (&e, &(ty, off)) in at.iter().zip(relocs) {
+        obj[e..e + 4].copy_from_slice(&off.to_le_bytes());
+        obj[e + 4] = ty;
+    }
+    obj
+}
+
+/// merlin-ld's tests/common's `DIFFS`: label differences and set values in
+/// `.data` (ADD/SUB pairs of every width, 32_PCREL, SET32/16/8/6, SUB6),
+/// and in `.debug_ranges` against code `/DISCARD/` throws away, once
+/// [`retype`] has given its relocations [`DIFFS_RELOCS`].
+const DIFFS: &str = "
+        .text
+        .globl _start
+_start: nop
+        .section .text.gone, \"ax\"
+gone:   nop
+        .data
+d0:     .byte 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .byte 0, 0, 0, 0, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0xff, 0xc3, 0xff
+        .zero 3
+        .word g, d0, g, d0 + 8, g, d0 + 12, g, d0 + 14
+        .word g + 4, g + 4, g + 4, g + 4, g + 4, g + 4, g
+        .section .debug_ranges, \"\", @progbits
+        .zero 12
+        .word gone, _start, gone + 4
+";
+const DIFFS_RELOCS: [(u8, u32); 18] = [
+    (36, 0),
+    (40, 0),
+    (35, 8),
+    (39, 8),
+    (34, 12),
+    (38, 12),
+    (33, 14),
+    (37, 14),
+    (57, 15),
+    (56, 19),
+    (55, 23),
+    (54, 25),
+    (53, 26),
+    (52, 27),
+    (33, 28),
+    (36, 0),
+    (40, 0),
+    (56, 8),
+];
+
 /// `obj`, an ELF32 object, with its global symbol `name` made weak
 /// (merlin-as has no `.weak`).
 fn weaken(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
@@ -752,6 +813,13 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
     ] {
         links.push((vec![objects[0].clone(), objects[1].clone(), orphans.clone()], script));
     }
+    // Label differences and set values.
+    links.push((
+        vec![retype(object(DIFFS), &DIFFS_RELOCS)],
+        "SECTIONS { g = 0x100; . = 0x80000000; .text : { *(.text) } .data : { *(.data) } \
+         /DISCARD/ : { *(.text.gone) } }"
+            .into(),
+    ));
     // No section at all: the headers in the last page.
     links.push((
         vec![object("    .globl _start\n    .set _start, 0x80000000\n")],
@@ -852,6 +920,21 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
                 object(".text\n.zero 8192\n.globl far\nfar: nop\n"),
             ],
             script,
+            "",
+        ),
+        // A branch out of range and odd (two errors), R_RISCV_ALIGN, and a
+        // SET32 out of range.
+        (
+            vec![object(".text\n.globl _start\n_start: beq a0, a1, odd\n")],
+            "SECTIONS { . = 0x1000; .text : { *(.text) } odd = 0x1000 + 4097; }",
+            "",
+        ),
+        (
+            vec![retype(
+                object(".text\n.globl _start\n_start: nop\n.data\n.word _start\n.word big\n"),
+                &[(43, 0), (56, 4)],
+            )],
+            "SECTIONS { . = 0x1000; .text : { *(.text) } .data : { *(.data) } big = 0x80000000; }",
             "",
         ),
         (vec![start.clone()], script, "-e nosuch"),

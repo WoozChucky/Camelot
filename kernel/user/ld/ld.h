@@ -323,12 +323,13 @@ int is_relro(const char *name, uint flags);
 int reloc_symbol(struct layout *l, uint obj, uint sym, uint *out, char **err);
 
 /* ---- Relocations (reloc.c, relocate.c) ---- */
-enum { RE_OK, RE_UNSUPPORTED, RE_NEEDS_RELAXATION, RE_OUT_OF_RANGE, RE_MISALIGNED, RE_TRUNCATED, RE_MISSING_HI20,
-       RE_LO12_ADDEND };
+enum { RE_OK, RE_UNSUPPORTED, RE_ALIGN_PADDING, RE_OUT_OF_RANGE, RE_MISALIGNED, RE_RANGE_AND_ALIGN, RE_TRUNCATED,
+       RE_MISSING_HI20, RE_LO12_ADDEND };
 
-/* What a failed relocation says: the value and its bounds (OUT_OF_RANGE),
- * the value and the alignment, in min (MISALIGNED), the bytes needed and
- * left (TRUNCATED). */
+/* What a failed relocation says: the value and its bounds (OUT_OF_RANGE,
+ * and RANGE_AND_ALIGN, an odd offset out of range: two errors, misaligned
+ * by 2 too), the value and the alignment, in min (MISALIGNED), the bytes
+ * needed and left (TRUNCATED). */
 struct reloc_error {
     i64 value;
     i64 min;
