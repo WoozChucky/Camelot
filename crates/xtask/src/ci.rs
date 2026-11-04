@@ -8,8 +8,8 @@
 //! - every crate's unit tests;
 //! - the toolchain against its references: excalibur's decoder and
 //!   disassembler against llvm-objdump's text, the elf crate against
-//!   llvm-readelf's and llvm-dwarfdump's, merlin-as's encodings and round
-//!   trips, merlin-ld's links on both widths (riscv-tests relinked, the
+//!   llvm-readelf's and llvm-dwarfdump's, merlin-as's encodings, round
+//!   trips and mapping symbols, merlin-ld's links on both widths (riscv-tests relinked, the
 //!   fixtures current),
 //!   merlin-objdump's goldens, the compiler's end-to-end harness, riscv-tests
 //!   on Grail;
@@ -44,7 +44,7 @@ const STEPS: &[Step] = &[
         args: &["-p", "elf", "--test", "llvm"],
     },
     Step {
-        what: "merlin-as: encodings, round trips, line tables, hello",
+        what: "merlin-as: encodings, round trips, line tables, mapping symbols, hello",
         args: &["-p", "merlin-as", "--tests"],
     },
     Step {

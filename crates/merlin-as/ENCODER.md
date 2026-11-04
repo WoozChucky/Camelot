@@ -303,7 +303,11 @@ word) or data word it appears in: each use becomes a hidden `.Ldot$N` label
 there, so `j .` and `beq a0, a1, .-8` are resolved like any local label.
 
 `.L` labels (numeric labels like `1:`, the hidden `.Lpcrel_hiN` and `.Ldot$N`) go into
-the symbol table only when a relocation still uses them, and the object
+the symbol table only when a relocation still uses them. Every section
+marks where its code and data start with clang's mapping symbols, `$x<isa>`
+before a run of instructions and `$d` before a run of data
+(`Assembler::mapping_symbol`; spec section 10 has the rules), so a
+disassembler lists a `.word` among instructions as data. The object
 carries the same `.riscv.attributes` as clang's for its `-march`
 (`rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0`, and
 `rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0` on
@@ -324,11 +328,7 @@ input (spec section 10):
   reports it out of range.
 - A numeric label a relocation refers to is called `.L1$0` (`1:`, first
   definition) where clang says `.Ltmp0`.
-- No `$x`/`$d` mapping symbols in the symbol table yet: they come with #192
-  (merlin-as and `/bin/as`, after #151). Until then llvm-objdump 23 (and
-  merlin-objdump) list data in a code section of a merlin-as object as
-  instructions, where clang's object lists it as `.word`, and don't forget
-  the `auipc` values behind `jalr` targets where the data starts and ends.
+- `.file "t.c"` makes no `STT_FILE` symbol, where clang makes one.
 - Operand forms LLVM accepts and merlin-as doesn't: `jalr rd, rs`,
   `jalr off(rs)`, `jr off(rs)`, `jr rs, off`, `call rd, sym`, `jump sym, rt`,
   `%hi(sym)` in `.insn u`, named `.insn` opcodes (`.insn r OP, ...`),
