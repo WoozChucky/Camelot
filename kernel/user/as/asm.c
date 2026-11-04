@@ -321,7 +321,9 @@ static int eval(struct expr *e, i64 *out) {
             *out = i64_shl(a, b.lo);
             return 1;
         case B_SHR:
-            *out = i64_sar(a, b.lo);
+            /* Logical, as in LLVM (and merlin-as): -16 >> 2 is
+             * 0x3ffffffffffffffc. */
+            *out = i64_shr(a, b.lo);
             return 1;
         case B_AND:
             *out = i64_and(a, b);
@@ -472,37 +474,79 @@ int ctx_csr(struct expr *e, uint *addr) {
 
 /* ---- Sections and emission ---- */
 
-static void switch_section(const char *name) {
+/* SHT_NOBITS: room that takes no bytes in the file, zeros only. */
+static int is_nobits(struct section *s) {
+    return s->attrs.ty == SHT_NOBITS;
+}
+
+/* SHF_EXECINSTR: code, which `.align` pads with `nop`s. */
+static int is_code(struct section *s) {
+    return (s->attrs.flags & SHF_EXECINSTR) != 0;
+}
+
+/* Debug information: a `.debug_*` section, data only. */
+static int is_debug(struct section *s) {
+    return starts_with(s->name, ".debug_");
+}
+
+/* Makes the section named `name` the current one if there is one. */
+static int find_section(const char *name) {
     for (uint i = 0; i < nsections; i++) {
         if (strcmp(sections[i].name, name) == 0) {
             current = (int)i;
-            return;
+            return 1;
         }
     }
-    int kind;
-    if (starts_with(name, ".debug_")) {
-        kind = SEC_DEBUG;
-    } else if (strcmp(name, ".text") == 0 || starts_with(name, ".text.") || starts_with(name, ".init")) {
-        kind = SEC_TEXT;
-    } else if (strcmp(name, ".bss") == 0 || starts_with(name, ".bss.") || starts_with(name, ".sbss")) {
-        kind = SEC_BSS;
-    } else if (starts_with(name, ".rodata") || starts_with(name, ".srodata")) {
-        kind = SEC_RODATA;
-    } else {
-        kind = SEC_DATA;
-    }
+    return 0;
+}
+
+/* Adds a section, which becomes the current one. Its alignment starts at
+ * 1, except for `.text`'s, 4: LLVM makes `.text` before the first line with
+ * an instruction's alignment, and no other section, code or not, has one
+ * until `.align` (or `.comm`) asks. */
+static void new_section(const char *name, struct sec_attrs attrs) {
     sections = grow(sections, &capsections, nsections + 1, sizeof(struct section));
     struct section *s = &sections[nsections];
     memset(s, 0, sizeof *s);
     s->name = perm_strdup(name);
-    s->kind = kind;
-    s->align = kind == SEC_TEXT ? 4 : 1;
+    s->attrs = attrs;
+    s->align = strcmp(name, ".text") == 0 ? 4 : 1;
     current = (int)nsections++;
 }
 
+/* Makes the section named `name` the current one, made with the attributes
+ * its name gives it if there is none yet. */
+static void switch_section(const char *name) {
+    if (!find_section(name)) {
+        struct sec_attrs a;
+        section_by_name(name, &a);
+        new_section(name, a);
+    }
+}
+
+/* The error for bytes that would take the current section to 4 GiB. */
+static void no_room(void) {
+    error(fmt("section %s would be 4 GiB or larger", sections[current].name));
+}
+
+/* Whether n more bytes fit in the current section, which reports an error
+ * if they do not. A section's size and offsets are 32-bit (all ELF32 has
+ * room for), so a section stops short of 4 GiB: whatever would take it
+ * there is an error, never a size that wraps around. */
+static int has_room(uint n) {
+    if (n <= 0xffffffffu - sections[current].size) {
+        return 1;
+    }
+    no_room();
+    return 0;
+}
+
 static void emit_bytes(const uchar *bytes, uint n) {
+    if (!has_room(n)) {
+        return;
+    }
     struct section *s = &sections[current];
-    if (s->kind == SEC_BSS) {
+    if (is_nobits(s)) {
         for (uint i = 0; i < n; i++) {
             if (bytes[i] != 0) {
                 char *msg;
@@ -518,8 +562,11 @@ static void emit_bytes(const uchar *bytes, uint n) {
 }
 
 static void emit_zeros(uint n) {
+    if (!has_room(n)) {
+        return;
+    }
     struct section *s = &sections[current];
-    if (s->kind != SEC_BSS) {
+    if (!is_nobits(s)) {
         buf_zeros(&s->data, n);
     }
     s->size += n;
@@ -546,7 +593,7 @@ static void align_to(uint align) {
         s->align = align;
     }
     uint pad = (align - s->size % align) % align;
-    if (s->kind == SEC_TEXT && pad % 4 == 0 && s->size % 4 == 0) {
+    if (is_code(s) && pad % 4 == 0 && s->size % 4 == 0) {
         static const uchar nop[4] = {0x13, 0, 0, 0};
         for (uint i = 0; i < pad / 4; i++) {
             emit_bytes(nop, 4);
@@ -574,13 +621,9 @@ static void take_loc(void) {
 static void place(const char *mnemonic, struct emit *emits, int n) {
     struct section *s = &sections[current];
     char *msg;
-    if (s->kind == SEC_BSS) {
-        error("instructions are not allowed in .bss");
-        return;
-    }
-    if (s->kind == SEC_DEBUG) {
-        msg = fmt("instructions are not allowed in %s", s->name);
-        error(msg);
+    /* Zeros only in a NOBITS section, data only in debug information. */
+    if (is_nobits(s) || is_debug(s)) {
+        error(fmt("instructions are not allowed in %s", s->name));
         return;
     }
     if (s->size % 4 != 0) {
@@ -674,6 +717,20 @@ static char *arg_name(struct dirarg *args, uint nargs, uint i, const char *what)
     return NULL;
 }
 
+/* Whether v can be written in size bytes, as a signed or an unsigned value
+ * (merlin-as's fits_in_bytes, LLVM's isIntN || isUIntN). */
+static int fits_in_bytes(i64 v, uint size) {
+    if (size >= 8) {
+        return 1;
+    }
+    i64 top = i64_shl(i64_u(1), 8 * size);
+    i64 bottom = i64_neg(i64_shl(i64_u(1), 8 * size - 1));
+    return i64_in(v, bottom, top);
+}
+
+/* .byte, .half, .word and .dword: merlin-as's Assembler::data. A number
+ * must fit; a symbol's address is R_RISCV_32 in a .word and R_RISCV_64 in
+ * a .dword. */
 static void data(struct dirarg *args, uint nargs, uint size) {
     if (nargs > 0) {
         take_loc();
@@ -686,6 +743,11 @@ static void data(struct dirarg *args, uint nargs, uint size) {
         struct expr *e = args[k].e;
         i64 v;
         if (eval(e, &v) || eval_relative(e, &v)) {
+            if (!fits_in_bytes(v, size)) {
+                const char *unit = size == 1 ? "byte" : "bytes";
+                error(fmt("data value %s does not fit in %u %s", i64_dec(v), size, unit));
+                continue;
+            }
             uchar bytes[8];
             for (uint i = 0; i < 4; i++) {
                 bytes[i] = (uchar)(v.lo >> (8 * i));
@@ -694,22 +756,23 @@ static void data(struct dirarg *args, uint nargs, uint size) {
             emit_bytes(bytes, size);
             continue;
         }
+        if (size != 4 && size != 8) {
+            error("only .word and .dword can hold a symbol address");
+            continue;
+        }
         char *name;
         i64 addend;
-        int sym = ctx_symbol(e, &name, &addend);
-        if (size == 4 && sym) {
-            uint off = sections[current].size;
-            if (strcmp(name, DOT) == 0) {
-                name = dot_label(off);
-            }
-            add_reloc(off, R_RISCV_32, name, addend);
-            static const uchar zero[4] = {0, 0, 0, 0};
-            emit_bytes(zero, 4);
-        } else if (size == 4) {
+        if (!ctx_symbol(e, &name, &addend)) {
             error("expected a constant or symbol(+offset)");
-        } else {
-            error("only .word can hold a symbol address");
+            continue;
         }
+        uint off = sections[current].size;
+        if (strcmp(name, DOT) == 0) {
+            name = dot_label(off);
+        }
+        add_reloc(off, size == 8 ? R_RISCV_64 : R_RISCV_32, name, addend);
+        static const uchar zero[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        emit_bytes(zero, size);
     }
 }
 
@@ -739,6 +802,113 @@ static void alias(const char *directive, const char *name, struct expr *e) {
     define(name, t->section, value.lo);
 }
 
+/* `.section name[, "flags"[, @type[, entsize]]]` (merlin-as's
+ * section_directive): switches to the section, made with the attributes
+ * LLVM gives it (section.c): the name's defaults, plus the flags, the type
+ * instead of the name's, or LLVM's own for a section it predefines. The
+ * parser has made the type a string, however it was written. */
+static void section_directive(struct dirarg *args, uint nargs) {
+    char *name = arg_name(args, nargs, 0, ".section");
+    if (name == NULL) {
+        return;
+    }
+    struct sec_attrs want;
+    section_name_defaults(name, &want.ty, &want.flags);
+    want.entsize = 0;
+    /* What the line asks for, which a section that exists must have. */
+    uint given_flags = 0;
+    int given_type = 0;
+    if (nargs > 1) {
+        if (args[1].kind != DA_STR) {
+            error(".section: expected a string of flags");
+            return;
+        }
+        uint bad;
+        if (!section_flags(args[1].str, args[1].len, &given_flags, &bad)) {
+            if (bad == 'G') {
+                error(".section: flag 'G': section groups are not supported");
+            } else if (bad == 'o') {
+                error(".section: flag 'o': linked-to sections are not supported");
+            } else if (bad > ' ' && bad < 127) {
+                error(fmt(".section: unknown flag '%c'", (int)bad));
+            } else {
+                /* A byte that is no printable character, by number. */
+                error(fmt(".section: unknown flag 0x%02x", bad));
+            }
+            return;
+        }
+        want.flags |= given_flags;
+        if (nargs > 2) {
+            if (args[2].kind != DA_STR) {
+                error(".section: expected '@<type>', '%<type>' or \"<type>\"");
+                return;
+            }
+            if (!section_type(args[2].str, args[2].len, &want.ty)) {
+                char *t = tmp_strndup((char *)args[2].str, args[2].len);
+                error(fmt(".section: unknown section type '%s'", t));
+                return;
+            }
+            given_type = 1;
+        }
+        /* A mergeable section's entries are all one size, given after the
+         * type. */
+        uint used = 3;
+        if (want.flags & SHF_MERGE) {
+            if (!given_type) {
+                error(".section: a mergeable section (M) must give its type");
+                return;
+            }
+            if (nargs < 4) {
+                error(".section: a mergeable section (M) must give its entry size");
+                return;
+            }
+            i64 n;
+            if (!arg_const(args, nargs, 3, ".section", &n)) {
+                return;
+            }
+            if (i64_is_neg(n) || (n.hi == 0 && n.lo == 0)) {
+                error(".section: the entry size must be positive");
+                return;
+            }
+            /* sh_entsize is 32 bits in ELF32, and LLVM keeps an entry size
+             * in 32 bits (a larger one fails its own check). */
+            if (n.hi != 0) {
+                error(fmt(".section: entry size %s does not fit in 32 bits", i64_dec(n)));
+                return;
+            }
+            want.entsize = n.lo;
+            used = 4;
+        }
+        if (nargs > used) {
+            error(".section: unexpected argument (unique sections are not supported)");
+            return;
+        }
+    }
+    if (!find_section(name)) {
+        /* LLVM's own sections exist before the first line: theirs win. */
+        struct sec_attrs a;
+        if (!section_predefined(name, &a)) {
+            a = want;
+        }
+        new_section(name, a);
+    }
+    /* As LLVM (and GNU as) do, a `.section` with nothing after the name
+     * takes the section as it is; with flags, a type or an entry size it
+     * must not change it. The messages are LLVM's. */
+    struct sec_attrs have = sections[current].attrs;
+    if (given_type && have.ty != want.ty) {
+        error(fmt("changed section type for %s, expected: 0x%X", name, have.ty));
+    }
+    if (given_flags != 0 || want.entsize != 0 || given_type) {
+        if (have.flags != want.flags) {
+            error(fmt("changed section flags for %s, expected: 0x%X", name, have.flags));
+        }
+        if (have.entsize != want.entsize) {
+            error(fmt("changed section entsize for %s, expected: %u", name, have.entsize));
+        }
+    }
+}
+
 static int is_pow2(i64 v) {
     if (i64_is_neg(v) || (v.lo == 0 && v.hi == 0)) {
         return 0;
@@ -747,22 +917,25 @@ static int is_pow2(i64 v) {
     return m.lo == 0 && m.hi == 0;
 }
 
-/* `.comm sym, size[, align]` for a .local symbol, or `.lcomm`: zero bytes
- * in .bss. */
+/* `.comm sym, size[, align]` for a .local symbol, or `.lcomm sym, size`:
+ * zero bytes in .bss, at that alignment (`.lcomm`: 1). */
 static void common(const char *directive, struct dirarg *args, uint nargs) {
-    char *msg;
     char *sym = arg_name(args, nargs, 0, directive);
     if (sym == NULL) {
         return;
     }
     int dummy;
     if (strcmp(directive, ".comm") == 0 && !map_get(&locals, sym, &dummy)) {
-        msg = fmt(".comm: '%s' is not .local; common symbols are not supported (use -fno-common)", sym);
-        error(msg);
+        error(fmt(".comm: '%s' is not .local; common symbols are not supported (use -fno-common)", sym));
         return;
     }
     i64 size, align;
     if (!arg_const(args, nargs, 1, directive, &size)) {
+        return;
+    }
+    /* LLVM's ELF `.lcomm` takes no alignment. */
+    if (strcmp(directive, ".lcomm") == 0 && nargs > 2) {
+        error(".lcomm: alignment not supported on this target");
         return;
     }
     if (nargs > 2) {
@@ -772,14 +945,19 @@ static void common(const char *directive, struct dirarg *args, uint nargs) {
     } else {
         align = i64_u(1);
     }
-    if (size.hi != 0) {
-        msg = fmt("%s: bad size %s", directive, i64_dec(size));
-        error(msg);
+    /* LLVM's messages; a size too big for the section is the 4 GiB error
+     * below, as for `.space`. */
+    if (i64_is_neg(size)) {
+        error(fmt("%s: size must be non-negative", directive));
         return;
     }
-    if (!is_pow2(align) || i64_cmp(align, i64_u(1u << 16)) > 0) {
-        msg = fmt("%s: alignment must be a power of two up to 65536", directive);
-        error(msg);
+    if (!is_pow2(align)) {
+        error(fmt("%s: alignment must be a power of 2", directive));
+        return;
+    }
+    /* merlin-as's own limit, `.p2align`'s too. */
+    if (i64_cmp(align, i64_u(1u << 16)) > 0) {
+        error(fmt("%s: alignment must be at most 65536", directive));
         return;
     }
     int back = current;
@@ -792,7 +970,11 @@ static void common(const char *directive, struct dirarg *args, uint nargs) {
     if (symbols[i].ty == SYM_NOTYPE) {
         symbols[i].ty = SYM_OBJECT;
     }
-    emit_zeros(size.lo);
+    if (size.hi != 0) {
+        no_room();
+    } else {
+        emit_zeros(size.lo);
+    }
     current = back;
 }
 
@@ -999,10 +1181,7 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         strcmp(name, ".bss") == 0) {
         switch_section(name);
     } else if (strcmp(name, ".section") == 0) {
-        char *n = arg_name(args, nargs, 0, ".section");
-        if (n != NULL) {
-            switch_section(n);
-        }
+        section_directive(args, nargs);
     } else if (strcmp(name, ".globl") == 0 || strcmp(name, ".global") == 0) {
         for (uint i = 0; i < nargs; i++) {
             char *n = arg_name(args, nargs, i, name);
@@ -1050,6 +1229,8 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         data(args, nargs, 2);
     } else if (strcmp(name, ".word") == 0 || strcmp(name, ".long") == 0 || strcmp(name, ".4byte") == 0) {
         data(args, nargs, 4);
+    } else if (strcmp(name, ".dword") == 0 || strcmp(name, ".quad") == 0 || strcmp(name, ".8byte") == 0) {
+        data(args, nargs, 8);
     } else if (strcmp(name, ".ascii") == 0 || strcmp(name, ".asciz") == 0 || strcmp(name, ".string") == 0) {
         if (nargs > 0) {
             take_loc();
@@ -1067,19 +1248,36 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
             }
         }
     } else if (strcmp(name, ".zero") == 0 || strcmp(name, ".space") == 0 || strcmp(name, ".skip") == 0) {
+        /* `.space n[, fill]`: n bytes of fill's low byte (zero without one).
+         * A negative n is LLVM's "invalid number of bytes"; n is never cut
+         * to fit: one that would take the section to 4 GiB is an error. */
         if (!arg_const(args, nargs, 0, name, &v)) {
             return;
         }
-        if (nargs > 1) {
-            i64 fill;
-            if (!arg_const(args, nargs, 1, name, &fill)) {
-                fill = i64_u(0);
-            }
-            uchar *bytes = tmp_alloc(v.lo + 1);
-            memset(bytes, (int)(fill.lo & 0xff), v.lo);
-            emit_bytes(bytes, v.lo);
-        } else {
+        i64 fill = i64_u(0);
+        if (nargs > 1 && !arg_const(args, nargs, 1, name, &fill)) {
+            return;
+        }
+        if (i64_is_neg(v)) {
+            error("invalid number of bytes");
+            return;
+        }
+        /* Checked before the bytes are made, so that a huge count is an
+         * error rather than a huge allocation. */
+        if (v.hi != 0) {
+            no_room();
+            return;
+        }
+        if (!has_room(v.lo)) {
+            return;
+        }
+        uint byte = fill.lo & 0xff;
+        if (byte == 0 || v.lo == 0) {
             emit_zeros(v.lo);
+        } else {
+            uchar *bytes = tmp_alloc(v.lo);
+            memset(bytes, (int)byte, v.lo);
+            emit_bytes(bytes, v.lo);
         }
     } else if (strcmp(name, ".align") == 0 || strcmp(name, ".p2align") == 0) {
         /* RISC-V `.align n` means 2^n bytes, as `.p2align` does. */
@@ -1117,11 +1315,13 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         }
     } else if (strcmp(name, ".size") == 0) {
         /* `.size f, . - f` (merlin's), `.size f, .Lfunc_end0 - f` (clang's)
-         * or a constant. */
+         * or a constant. Any value is taken, as LLVM takes it, and an
+         * ELF32 st_size keeps its low 32 bits (clang riscv32 writes 0 for
+         * 0x100000000 and 0xfffffffc for -4). */
         char *n = arg_name(args, nargs, 0, ".size");
         if (n != NULL) {
             int ok = nargs > 1 && args[1].kind == DA_EXPR && eval_relative(args[1].e, &v);
-            if (ok && v.hi == 0) {
+            if (ok) {
                 int k = symbol_index(n);
                 symbols[k].size = v.lo;
             } else {
@@ -1444,7 +1644,7 @@ static void line_table(void) {
  * section, plus its offset. */
 static void debug_relocs_to_sections(void) {
     for (uint sec = 0; sec < nsections; sec++) {
-        if (sections[sec].kind != SEC_DEBUG) {
+        if (!is_debug(&sections[sec])) {
             continue;
         }
         for (uint k = 0; k < sections[sec].nrelocs; k++) {

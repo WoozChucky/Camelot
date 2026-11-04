@@ -7,8 +7,9 @@
 //! every hand-written `.s` of the repository, the line table corpus
 //! (`crates/merlin-as/tests/debug_line`, whose objects are clang's), and
 //! merlin's assembly for a C file, with `-g` (`.file`, `.loc` and a DWARF
-//! compile unit) and without. An ignored test adds merlin's `-g` assembly
-//! for two big C files, the shell and the kernel's vm.c.
+//! compile unit) and without, data of every size (`DATA`) and sections of
+//! every kind (`SECTIONS`). An ignored test adds merlin's `-g` assembly for
+//! two big C files, the shell and the kernel's vm.c.
 
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::read::Fs;
@@ -81,8 +82,74 @@ fn corpus(big: bool) -> Vec<(String, String)> {
         assert!(text.contains(".loc "), "{file} has no line information");
         out.push((format!("{}_{file}.g.s", dir.replace('/', "_")), text));
     }
+    out.push(("data.s".into(), DATA.into()));
+    out.push(("sections.s".into(), SECTIONS.into()));
     out
 }
+
+/// `.section` with flags, every way of writing the type, mergeable sections
+/// and their entry sizes, names with no flags of their own, LLVM's own
+/// sections, code sections with and without `.text`'s alignment, and going
+/// back to a section (merlin-as's tests/sections.rs has clang's headers).
+const SECTIONS: &str = "
+        .text
+        nop
+        .section .text.start
+        nop
+        .section .myx, \"ax\", @progbits
+        nop
+        .p2align 3
+        nop
+        .section .rodata.str1.1, \"aMS\", @progbits, 1
+        .asciz \"hi\"
+        .section .rodata.cst8x, \"aM\", %progbits, 8
+        .dword 1
+        .section .mystuff
+        .word 1
+        .section .sbss
+        .word 0
+        .section .mybss, \"aw\", @nobits
+        .space 12
+        .section .init_array, \"aw\"
+        .word 0
+        .section .note.camelot, \"a\", \"note\"
+        .word 4
+        .section .flags, \"0x3\"
+        .section .num, \"a\", %8
+        .section .proc, \"a\", @0x70000001
+        .section .debug_str
+        .asciz \"s\"
+        .section .tdata, \"awT\", @progbits
+        .word 7
+        .section .text.start
+        nop
+        .section .rodata.str1.1, \"aMS\", @progbits, 1
+        .asciz \"x\"
+";
+
+/// Data of every size at the edges of its range, `>>` (logical) and the
+/// relocations of `.word` and `.dword`, in a section and in debug
+/// information: what no file of the corpus has all of.
+const DATA: &str = "
+        .text
+f:      nop
+.Lend:  nop
+        .data
+        .byte 255, -128, -16 >> 62
+        .half -32768, 0xffff
+        .word 0xffffffff, -0x80000000, 0x80000000 >> 31
+        .equ BIG, 0x7fffffffffffffff
+        .dword -16 >> 2, 1 << 63 >> 63, BIG + 1
+        .quad -1
+x:      .8byte x + 8, ., f + BIG + 1
+        .word x, ., 1 + (BIG + f)
+        .space 3, 0x1ff
+        .size x, 0x100000003
+        .size f, -4
+        .section .debug_info,\"\",@progbits
+        .quad .Lend
+        .dword f + 2, .Lend - f
+";
 
 /// The name a file of the corpus has on the image: short enough for a
 /// directory entry (DIRSIZ, kernel/include/fs.h).
@@ -234,9 +301,12 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
         "    .word \"x\"\n    lw a0, %hi(sym)(a1)\n",
         "1:  nop\n    j 2b\n",
         "    li a0, 0x1000000000\n",
+        "    sgt a0, a1\n    sgtu a0, a1, 5\n    sgt a0, x99, a1\n",
         "    .equ x, 1 / 0\n",
         "    addi a0, a1,\n    .bogus 1\n",
         "    .ascii \"\\q\"\n",
+        // Data must fit its size; only .word and .dword hold an address.
+        "    .byte 1, 256\n    .half x\n    .word -16 >> 2\n    .4byte -0x80000001\n",
         // Line information (merlin-as's line_information_errors, and more).
         ".loc 0 1 0\nnop\n",
         ".file 1 \"a.c\"\n.loc 1 1 0\nnop\n",
@@ -245,6 +315,32 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
         ".file 1 \"a.c\"\n.file 1 \"b.c\"\n.file 0 \"d\" \"a.c\" source \"int x;\"\n.file 0 \"d\" \"a.c\" md5\n",
         ".file 0 \"d\" \"a.c\" md5 \"x\"\n.file\n.file \"a\" \"b\"\n.file 1\n.loc\n.loc 0 x\n",
         ".section .debug_info\nnop\n",
+        // An alias's address wraps around in 64 bits, then must be in its
+        // section.
+        ".data\n.word 0\nx: .word 0\n.equ BIG, 0x7fffffffffffffff\n.set y, x + BIG\n.set z, x - 8\n",
+        // .space: no negative count, no section of 4 GiB or more.
+        ".data\n.space -1\n.skip -5, 7\n.space 0x100000003\n.word 1\n.space 2, x\n",
+        ".bss\n.space 0xffffffff\n.byte 0\n.lcomm b, 1\n",
+        // .comm and .lcomm: LLVM's messages, merlin-as's alignment limit, and
+        // a size past 32 bits.
+        ".local x\n.comm x, 4, 3\n.comm x, -1\n.lcomm y, 16, 8\n.lcomm y, -1\n.comm x, 4, 0x20000\n\
+         .lcomm z\n.lcomm w, 0x100000000\n",
+        // .section: going back with other attributes (LLVM's messages, the
+        // numbers in upper-case hexadecimal), and lines LLVM rejects.
+        ".section .foo, \"a\"\n.section .foo, \"aw\"\n.section .foo, \"a\", @nobits\n\
+         .section .rodata.cst4, \"a\"\n.section .debug_line_str, \"\", @progbits\n\
+         .section .bss, \"aw\", @progbits\n.section .m, \"aM\", @progbits, 4\n\
+         .section .m, \"aM\", @progbits, 8\n.section .x, \"0xa\"\n.section .x, \"a\"\n",
+        ".section\n.section .foo, a\n.section .foo, \"aq\"\n.section .foo, \"a \"\n\
+         .section .foo, \"a\\377\"\n.section .foo, \"aG\", @progbits, grp\n\
+         .section .foo, \"ao\", @progbits, sym\n.section .foo, \"a\", @weird\n\
+         .section .foo, \"a\", %weird\n.section .foo, \"a\", foo\n.section .foo, \"aM\"\n\
+         .section .foo, \"aM\", @progbits\n.section .foo, \"aM\", @progbits, 0\n\
+         .section .foo, \"aM\", %progbits, -1\n.section .foo, \"aM\", \"progbits\", 0x100000001\n\
+         .section .foo, \"aM\", @progbits, x\n.section .foo, \"a\", @progbits, 1\n\
+         .section .foo, \"aM\", @progbits, 1, 2\n",
+        ".section .foo, \"a\", %\nnop\n",
+        ".section .bss.x\nnop\n.section .b, \"aw\", @nobits\n.byte 1\n.section .debug_x\nnop\n",
     ];
     let inputs: Vec<(String, String)> = cases
         .iter()
@@ -503,7 +599,7 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         (vec![start.clone()], "SECTIONS { .text 0x100 : { *(.text) } }", ""),
         (
             vec![object(
-                ".text\n.globl _start\n_start: nop\n.section .extra\n.word 1\n",
+                ".text\n.globl _start\n_start: nop\n.section .extra, \"aw\"\n.word 1\n",
             )],
             script,
             "",

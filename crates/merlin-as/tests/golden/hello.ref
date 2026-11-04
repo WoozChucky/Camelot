@@ -1,4 +1,4 @@
-# clang --target=riscv32 -march=rv32im_zicsr_zifencei -mabi=ilp32 -mno-relax
+# clang --target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32 -mno-relax
 #   -include examples/xcal.inc -c examples/hello/hello.S
 # regenerate with scripts/gen-hello-ref.sh
 0 00000117 R_RISCV_PCREL_HI20 __stack_top

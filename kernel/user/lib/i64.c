@@ -93,6 +93,23 @@ i64 i64_shl(i64 a, uint n) {
     return r;
 }
 
+/* A logical shift: zeros come in at the top (Rust's u64 wrapping_shr). */
+i64 i64_shr(i64 a, uint n) {
+    n &= 63;
+    i64 r;
+    if (n == 0) {
+        return a;
+    }
+    if (n >= 32) {
+        r.lo = a.hi >> (n - 32);
+        r.hi = 0;
+    } else {
+        r.lo = (a.lo >> n) | (a.hi << (32 - n));
+        r.hi = a.hi >> n;
+    }
+    return r;
+}
+
 i64 i64_sar(i64 a, uint n) {
     n &= 63;
     i64 r;

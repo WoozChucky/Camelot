@@ -107,6 +107,14 @@ static void test_i64(void) {
     check(!i64_div(i64_u(1), i64_u(0), &q), "i64_div by zero has no result");
     check_str(i64_hex(i64_shl(i64_u(1), 40)), "0x10000000000", "i64_shl");
     check_str(i64_dec(i64_sar(i64_of(-64), 3)), "-8", "i64_sar keeps the sign");
+    check_str(i64_hex(i64_shr(i64_of(-64), 3)), "0x1ffffffffffffff8", "i64_shr shifts zeros in");
+    check_str(i64_hex(i64_shr(i64_of(-1), 40)), "0xffffff", "i64_shr past 32 bits");
+    /* The edges: no shift, the high word alone, the top bit alone, and a
+     * count of 64, whose low 6 bits are 0 (Rust's wrapping_shr). */
+    check_str(i64_hex(i64_shr(i64_of(-1), 0)), "0xffffffffffffffff", "i64_shr by 0");
+    check_str(i64_hex(i64_shr(i64_of(-1), 32)), "0xffffffff", "i64_shr by 32");
+    check_str(i64_hex(i64_shr(i64_of(-1), 63)), "0x1", "i64_shr by 63");
+    check_str(i64_hex(i64_shr(i64_of(-16), 64)), "0xfffffffffffffff0", "i64_shr by 64 is by 0");
     check(i64_cmp(i64_of(-1), i64_u(1)) < 0, "i64_cmp is signed");
     check(i64_in(i64_u(4), i64_u(4), i64_u(5)) && !i64_in(i64_u(5), i64_u(4), i64_u(5)), "i64_in is half open");
 }

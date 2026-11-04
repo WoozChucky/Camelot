@@ -41,6 +41,9 @@ pub enum BinOp {
     Div,
     Rem,
     Shl,
+    /// `>>`: a logical shift, of the value's 64 bits, as in LLVM, whose
+    /// MCAsmInfo has `UseLogicalShr` true by default and RISC-V leaves it on
+    /// (`-16 >> 2` is 0x3ffffffffffffffc).
     Shr,
     And,
     Or,

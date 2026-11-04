@@ -3,8 +3,26 @@
 //! Turns one instruction (mnemonic + parsed operands) into machine words.
 //! Everything around it (lexing, parsing, labels, sections, directives,
 //! relocations, ELF output) lives elsewhere; this module is the whole ISA:
-//! RV32I, M, A, Zicsr, Zifencei, the privileged instructions, Xcal (spec section
-//! 9), the standard pseudo-instructions and the `.insn` directive.
+//! RV32I or RV64I, M, A, Zicsr, Zifencei, the privileged instructions, Xcal
+//! (spec section 9), the standard pseudo-instructions and the `.insn` directive.
+//!
+//! ## The two widths
+//!
+//! The width ([`Ctx::xlen`], from `-march=`) changes little: every instruction
+//! word is 32 bits on both, and RV64 is RV32 plus a few things.
+//!
+//! * RV64-only instructions: the 32-bit operations `addiw`, `slliw`, `addw`,
+//!   `mulw`... (opcodes OP-IMM-32 and OP-32, their result sign-extended from
+//!   bit 31), the doubleword loads and stores `ld`, `lwu`, `sd`, and the `.d`
+//!   atomics. They live in tables of their own (`OP_32_FUNCT` ...), looked up
+//!   only on RV64, so on RV32 they are unknown instructions as before.
+//! * Shift amounts are 6 bits on RV64 (`slli a0, a0, 63`), 5 on RV32.
+//! * `li` takes any 64-bit constant on RV64, in up to 8 instructions.
+//! * RV32-only: the high halves of the counters (`rdcycleh`, CSR `cycleh`...),
+//!   which RV64 does not need: its CSRs hold all 64 bits.
+//!
+//! Every place that looks at the width tests `rv64` (or matches on
+//! [`Xlen`]), so the RV32 paths are easy to find once RV32 goes (#159).
 //!
 //! ## Contract with the assembler driver ([`crate::asm`])
 //!
@@ -13,7 +31,7 @@
 //!   `la`, ...).
 //! * The number of words never depends on a label's address (the assembler is
 //!   single pass). It may depend on constants: `li a0, 5` is 1 word,
-//!   `li a0, 0x12345678` is 2.
+//!   `li a0, 0x12345678` is 2, and on RV64 `li a0, 0x123456789abcdef0` is 8.
 //! * An operand that refers to a label becomes a fixup: the immediate bits are
 //!   left zero and the [`Emit`] carries the relocation that fills them in. The
 //!   driver later resolves the ones clang would resolve (pc-relative references
@@ -31,25 +49,27 @@
 //! 1. The six field packers ([`r_type`] ... [`j_type`]) and the immediate
 //!    scramblers they use ([`i_imm`] ... [`j_imm`]). They are the mirror image
 //!    of the `imm_*` functions in `crates/excalibur/src/decode.rs`.
-//! 2. [`hi_lo`], the split of a 32-bit value into a 20-bit upper part and a
-//!    sign-extended 12-bit lower part, used by `li`, `%hi`/`%lo` and the
-//!    linker-style patching in `asm.rs`.
+//! 2. [`hi_lo64`] (and [`hi_lo`], its 32-bit form), the split of a value into
+//!    a 20-bit upper part and a sign-extended 12-bit lower part, used by
+//!    `%hi`/`%lo` and the linker-style patching in `asm.rs`.
 //! 3. Operand evaluation (`Imm`, `imm12`, `imm20`, `branch_target`, ...):
 //!    where range checks and relocation modifiers are handled.
 //! 4. [`encode`] itself: real instructions grouped by format, then the
 //!    pseudo-instructions, then `.insn`.
+//! 5. [`li_steps`], LLVM's choice of instructions for `li`.
 
 use crate::ast::{Expr, Modifier, Operand};
 use crate::reloc::{Emit, Fixup, RelocKind, Target};
 use crate::Ctx;
-use excalibur::{csr, Reg};
+use excalibur::{csr, Reg, Xlen};
 
 // Major opcodes, bits [6:0] (spec section 4): the decoder's own constants.
-// custom-0 holds the Xcal instructions (spec section 9).
+// custom-0 holds the Xcal instructions (spec section 9). OP-IMM-32 and OP-32
+// are RV64's 32-bit operations (`addiw`, `addw`, ...).
 use excalibur::opcode::{
-    OP_AMO as AMO, OP_AUIPC as AUIPC, OP_BRANCH as BRANCH, OP_CUSTOM0 as CUSTOM_0, OP_IMM, OP_JAL as JAL,
-    OP_JALR as JALR, OP_LOAD as LOAD, OP_LUI as LUI, OP_MISC_MEM as MISC_MEM, OP_OP as OP, OP_STORE as STORE,
-    OP_SYSTEM as SYSTEM,
+    OP_32, OP_AMO as AMO, OP_AUIPC as AUIPC, OP_BRANCH as BRANCH, OP_CUSTOM0 as CUSTOM_0, OP_IMM, OP_IMM_32,
+    OP_JAL as JAL, OP_JALR as JALR, OP_LOAD as LOAD, OP_LUI as LUI, OP_MISC_MEM as MISC_MEM, OP_OP as OP,
+    OP_STORE as STORE, OP_SYSTEM as SYSTEM,
 };
 
 // funct3 values the pseudo-instructions need by name.
@@ -89,6 +109,15 @@ pub const NAMED_FUNCT3: &[(&str, u32)] = &[
     ("CSRRC", CSRRC),
     ("CSR_IMM", CSR_IMM),
 ];
+
+// funct3 values only the RV64 encoder needs, kept out of NAMED_FUNCT3 (whose
+// names go into the C assembler's tables.h, which stays RV32 until #157).
+/// `srli`'s funct3, for the RV64 `li` sequences and `zext.w`.
+const SRLI: u32 = 0b101;
+/// The width of an A instruction, in funct3: `.w` (a word) or `.d` (a
+/// doubleword, RV64).
+const AMO_W: u32 = 0b010;
+const AMO_D: u32 = 0b011;
 
 // Registers the pseudo-instructions use.
 const ZERO: Reg = 0;
@@ -219,10 +248,22 @@ pub fn j_imm(imm: i32) -> u32 {
 /// ```
 ///
 /// Everything wraps at 32 bits: `0x7ffff800` gives `hi = 0x80000`, `lo = -2048`.
+/// [`hi_lo64`] is the same split for any 64-bit value; on a 32-bit one they agree.
 pub fn hi_lo(value: i32) -> (u32, i32) {
     let lo = (value << 20) >> 20; // the low 12 bits, sign-extended
     let hi = (value.wrapping_sub(lo) as u32) >> 12; // exact: value - lo ends in 12 zero bits
     (hi, lo)
+}
+
+/// [`hi_lo`] for a 64-bit value, as LLVM computes `%hi(c)` and `%lo(c)` of a
+/// constant on both widths (`RISCVAsmBackend`'s `fixup_riscv_hi20` and
+/// `fixup_riscv_lo12_i`): `hi = ((c + 0x800) >> 12) & 0xfffff`, `lo` the low
+/// 12 bits sign-extended. Bits above 31 are simply dropped, never an error:
+/// `%hi(0x123456789)` is `0x23456`, `%lo` of it `0x789`.
+pub fn hi_lo64(value: i64) -> (u32, i32) {
+    let lo = (value << 52) >> 52; // the low 12 bits, sign-extended
+    let hi = (value.wrapping_add(0x800) >> 12) as u32 & 0xf_ffff;
+    (hi, lo as i32)
 }
 
 // ===================================================================
@@ -248,10 +289,15 @@ fn imm(e: &Expr, ctx: &Ctx) -> Result<Imm, String> {
     if let Expr::Mod(m, inner) = e {
         if let Some(v) = ctx.constant(inner) {
             // `%hi(0x12345678)`: no symbol, so split the number right here.
-            let v = word(v, &format!("{}() value", m.name()))?;
+            // RV64 takes any constant, as LLVM does (on both widths); RV32
+            // keeps merlin-as's check that the value is a 32-bit word.
+            let v = match ctx.xlen() {
+                Xlen::Rv32 => word(v, &format!("{}() value", m.name()))? as i64,
+                Xlen::Rv64 => v,
+            };
             return match m {
-                Modifier::Hi => Ok(Imm::Num(hi_lo(v).0 as i64)),
-                Modifier::Lo => Ok(Imm::Num(hi_lo(v).1 as i64)),
+                Modifier::Hi => Ok(Imm::Num(hi_lo64(v).0 as i64)),
+                Modifier::Lo => Ok(Imm::Num(hi_lo64(v).1 as i64)),
                 _ => Err(format!("{}() needs a symbol, not a number", m.name())),
             };
         }
@@ -462,6 +508,13 @@ fn csr_addr(op: &Operand, ctx: &Ctx) -> Result<u32, String> {
     }
     match (e, ctx.constant(e)) {
         (_, Some(v)) => Err(format!("CSR number {v} out of range (0..=0xfff)")),
+        // Not a name on this width but one on RV32: so this is RV64, and the
+        // name is the high half of a 64-bit CSR (`cycleh`, `mstatush`) or an
+        // odd `pmpcfg`, which RV64 does not have (LLVM: "system register
+        // 'cycleh' is RV32 only"). Its number is still accepted, as in LLVM.
+        (Expr::Sym(name), None) if csr::parse(name, Xlen::Rv32).is_some() => {
+            Err(format!("CSR '{name}' exists only on RV32"))
+        }
         (Expr::Sym(name), None) => Err(format!("unknown CSR '{name}'")),
         _ => Err("expected a CSR name or number".into()),
     }
@@ -538,7 +591,9 @@ pub const OP_IMM_FUNCT3: &[(&str, u32)] = &[
 
 /// OP-IMM shifts, (mnemonic, funct3, funct7): the immediate is a 5-bit shift
 /// amount, and the top 7 bits of the I-type immediate act as a funct7
-/// (0100000 selects arithmetic).
+/// (0100000 selects arithmetic). On RV64 the shift amount is 6 bits, imm[5:0],
+/// and only imm[11:6] is left for the function (a funct6); the rows hold for
+/// both, since every funct7 here has its lowest bit (imm[5]) clear.
 pub const SHIFT_FUNCT: &[(&str, u32, u32)] = &[
     ("slli", SLLI, 0b0000000),
     ("srli", 0b101, 0b0000000),
@@ -603,6 +658,50 @@ pub const SYSTEM_FUNCT12: &[(&str, u32)] = &[
     ("mret", 0x302),
 ];
 
+// -------------------------------------------------------------------
+// RV64-only tables (RV64I and RV64M), in the same shapes as the ones above.
+//
+// Separate tables rather than more rows in the RV32 ones: the encoder looks
+// them up only on RV64, so on RV32 `addw` or `ld` stay unknown instructions,
+// and the RV32 tables stay exactly what the C assembler (`kernel/user/as`,
+// RV32 until #157) is generated from.
+// -------------------------------------------------------------------
+
+/// OP-32: `rd = sext32(rs1 <op> rs2)` on the low 32 bits of the registers,
+/// (mnemonic, funct3, funct7). The rows mirror [`OP_FUNCT`]'s for the
+/// operations that have a 32-bit form; the M extension has funct7 = 1.
+pub const OP_32_FUNCT: &[(&str, u32, u32)] = &[
+    ("addw", 0b000, 0b0000000),
+    ("subw", 0b000, 0b0100000),
+    ("sllw", 0b001, 0b0000000),
+    ("srlw", 0b101, 0b0000000),
+    ("sraw", 0b101, 0b0100000),
+    ("mulw", 0b000, 0b0000001),
+    ("divw", 0b100, 0b0000001),
+    ("divuw", 0b101, 0b0000001),
+    ("remw", 0b110, 0b0000001),
+    ("remuw", 0b111, 0b0000001),
+];
+
+/// OP-IMM-32 with a 12-bit immediate, (mnemonic, funct3): only `addiw`
+/// (`sext.w` is `addiw rd, rs, 0`).
+pub const OP_IMM_32_FUNCT3: &[(&str, u32)] = &[("addiw", ADDI)];
+
+/// OP-IMM-32 shifts, (mnemonic, funct3, funct7): as [`SHIFT_FUNCT`], but the
+/// shift amount stays 5 bits, since they shift a 32-bit value.
+pub const SHIFT_32_FUNCT: &[(&str, u32, u32)] = &[
+    ("slliw", SLLI, 0b0000000),
+    ("srliw", 0b101, 0b0000000),
+    ("sraiw", 0b101, 0b0100000),
+];
+
+/// RV64 loads, (mnemonic, funct3): `lwu`, a word zero-extended (`lw`
+/// sign-extends it), and `ld`, a doubleword.
+pub const LOAD_RV64_FUNCT3: &[(&str, u32)] = &[("lwu", 0b110), ("ld", 0b011)];
+
+/// RV64 stores, (mnemonic, funct3): `sd`, a doubleword.
+pub const STORE_RV64_FUNCT3: &[(&str, u32)] = &[("sd", 0b011)];
+
 /// The entry of `table` for mnemonic `m`.
 fn find<T: Copy>(table: &[(&str, T)], m: &str) -> Option<T> {
     table.iter().find(|e| e.0 == m).map(|e| e.1)
@@ -641,14 +740,49 @@ fn csr_funct3(m: &str) -> Option<u32> {
     find(CSR_FUNCT3, m)
 }
 
-/// Splits an A mnemonic into its base (`amoadd.w`) and its ordering bits
-/// aq|rl, from the suffix: none, `.aq` (10), `.rl` (01) or `.aqrl` (11).
-fn atomic(m: &str) -> Option<(&str, u32, u32)> {
+// The RV64-only tables, seen only when `rv64`: on RV32 these mnemonics find
+// nothing and end up as unknown instructions.
+
+fn op_32_funct(m: &str, rv64: bool) -> Option<(u32, u32)> {
+    find2(OP_32_FUNCT, m).filter(|_| rv64)
+}
+
+fn op_imm_32_funct3(m: &str, rv64: bool) -> Option<u32> {
+    find(OP_IMM_32_FUNCT3, m).filter(|_| rv64)
+}
+
+fn shift_32_funct(m: &str, rv64: bool) -> Option<(u32, u32)> {
+    find2(SHIFT_32_FUNCT, m).filter(|_| rv64)
+}
+
+fn load_rv64_funct3(m: &str, rv64: bool) -> Option<u32> {
+    find(LOAD_RV64_FUNCT3, m).filter(|_| rv64)
+}
+
+fn store_rv64_funct3(m: &str, rv64: bool) -> Option<u32> {
+    find(STORE_RV64_FUNCT3, m).filter(|_| rv64)
+}
+
+/// Splits an A mnemonic into its base (`amoadd.w`), its funct5, its width
+/// as funct3 ([`AMO_W`] or [`AMO_D`]) and its ordering bits aq|rl, from the
+/// suffix: none, `.aq` (10), `.rl` (01) or `.aqrl` (11).
+///
+/// A `.d` form (RV64 only) is its `.w` form with funct3 = 011: the same
+/// operation on a doubleword, so [`ATOMIC_FUNCT5`] lists only the `.w` names.
+fn atomic(m: &str, rv64: bool) -> Option<(&str, u32, u32, u32)> {
     let (base, aqrl) = [(".aqrl", 0b11), (".aq", 0b10), (".rl", 0b01)]
         .into_iter()
         .find_map(|(suffix, bits)| Some((m.strip_suffix(suffix)?, bits)))
         .unwrap_or((m, 0b00));
-    Some((base, find(ATOMIC_FUNCT5, base)?, aqrl))
+    if let Some(funct5) = find(ATOMIC_FUNCT5, base) {
+        return Some((base, funct5, AMO_W, aqrl));
+    }
+    let op = base.strip_suffix(".d").filter(|_| rv64)?; // `amoadd` of `amoadd.d`
+    let funct5 = ATOMIC_FUNCT5
+        .iter()
+        .find(|e| e.0.strip_suffix(".w") == Some(op))?
+        .1;
+    Some((base, funct5, AMO_D, aqrl))
 }
 
 fn system_funct12(m: &str) -> Option<i32> {
@@ -673,39 +807,55 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
             Err(format!("usage: {m} {form}"))
         }
     };
+    // RV64 adds instructions, widens the shift amounts and `li`, and drops the
+    // `rd*h` counter reads; everything else is the same on both widths.
+    let rv64 = ctx.xlen() == Xlen::Rv64;
 
-    // ----- R-type: OP and M -----
-    if let Some((funct3, funct7)) = op_funct(m) {
+    // ----- R-type: OP and M, and their 32-bit forms OP-32 (RV64) -----
+    if let Some((opcode, (funct3, funct7))) = op_funct(m)
+        .map(|f| (OP, f))
+        .or_else(|| op_32_funct(m, rv64).map(|f| (OP_32, f)))
+    {
         let [rd, rs1, rs2] = ops else {
             return usage("rd, rs1, rs2");
         };
-        return one(r_type(OP, funct3, funct7, reg(rd)?, reg(rs1)?, reg(rs2)?));
+        return one(r_type(opcode, funct3, funct7, reg(rd)?, reg(rs1)?, reg(rs2)?));
     }
 
-    // ----- I-type: OP-IMM -----
-    if let Some(funct3) = op_imm_funct3(m) {
+    // ----- I-type: OP-IMM, and OP-IMM-32's addiw (RV64) -----
+    if let Some((opcode, funct3)) = op_imm_funct3(m)
+        .map(|f| (OP_IMM, f))
+        .or_else(|| op_imm_32_funct3(m, rv64).map(|f| (OP_IMM_32, f)))
+    {
         let [rd, rs1, imm] = ops else {
             return usage("rd, rs1, imm");
         };
         let (rd, rs1, f) = (reg(rd)?, reg(rs1)?, imm12(expr(imm)?, ctx, false)?);
-        let word = i_type(OP_IMM, funct3, rd, rs1, f.value);
+        let word = i_type(opcode, funct3, rd, rs1, f.value);
         return Ok(vec![f.emit(word)]);
     }
-    if let Some((funct3, funct7)) = shift_funct(m) {
+    // Shifts by an immediate. The shift amount has as many bits as it takes
+    // to count the bits of the value shifted: 6 for RV64's 64-bit registers,
+    // 5 for RV32's and for the 32-bit shifts of OP-IMM-32 (`slliw`...).
+    if let Some((opcode, bits, (funct3, funct7))) = shift_funct(m)
+        .map(|f| (OP_IMM, if rv64 { 6 } else { 5 }, f))
+        .or_else(|| shift_32_funct(m, rv64).map(|f| (OP_IMM_32, 5, f)))
+    {
         let [rd, rs1, shamt] = ops else {
             return usage("rd, rs1, shamt");
         };
-        let shamt = uimm(expr(shamt)?, ctx, 5, "shift amount")?;
-        // funct7 sits in imm[11:5], the shift amount in imm[4:0].
+        let shamt = uimm(expr(shamt)?, ctx, bits, "shift amount")?;
+        // funct7 sits in imm[11:5], the shift amount in imm[4:0] (RV64:
+        // imm[5:0], where funct7's bit 0, always clear, leaves room for it).
         let imm = (funct7 << 5 | shamt) as i32;
-        return one(i_type(OP_IMM, funct3, reg(rd)?, reg(rs1)?, imm));
+        return one(i_type(opcode, funct3, reg(rd)?, reg(rs1)?, imm));
     }
 
-    // ----- loads (I-type) and stores (S-type) -----
-    if let Some(funct3) = load_funct3(m) {
+    // ----- loads (I-type) and stores (S-type); RV64 adds ld, lwu and sd -----
+    if let Some(funct3) = load_funct3(m).or_else(|| load_rv64_funct3(m, rv64)) {
         return load(m, funct3, ops, ctx);
     }
-    if let Some(funct3) = store_funct3(m) {
+    if let Some(funct3) = store_funct3(m).or_else(|| store_rv64_funct3(m, rv64)) {
         return store(m, funct3, ops, ctx);
     }
 
@@ -736,17 +886,17 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
     }
 
     // ----- A extension (R-type, AMO opcode) -----
-    // funct7 is funct5 followed by the aq and rl bits; funct3 = 010 (word).
-    // lr.w has no rs2 (the field is zero).
-    if let Some((base, funct5, aqrl)) = atomic(m) {
+    // funct7 is funct5 followed by the aq and rl bits; funct3 is the width,
+    // 010 (word) or 011 (doubleword, RV64). lr has no rs2 (the field is zero).
+    if let Some((base, funct5, width, aqrl)) = atomic(m, rv64) {
         let (rd, rs2, addr) = match (base, ops) {
-            ("lr.w", [rd, addr]) => (rd, ZERO, addr),
-            ("lr.w", _) => return usage("rd, (rs1)"),
+            ("lr.w" | "lr.d", [rd, addr]) => (rd, ZERO, addr),
+            ("lr.w" | "lr.d", _) => return usage("rd, (rs1)"),
             (_, [rd, rs2, addr]) => (rd, reg(rs2)?, addr),
             _ => return usage("rd, rs2, (rs1)"),
         };
         let rs1 = atomic_address(m, addr)?;
-        return one(r_type(AMO, 0b010, funct5 << 2 | aqrl, reg(rd)?, rs1, rs2));
+        return one(r_type(AMO, width, funct5 << 2 | aqrl, reg(rd)?, rs1, rs2));
     }
 
     match m {
@@ -820,7 +970,18 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
             let [rd, value] = ops else { return usage("rd, imm") };
             let rd = reg(rd)?;
             match imm(expr(value)?, ctx)? {
-                Imm::Num(v) => li(rd, word(v, "li value")?),
+                // The value LLVM's `li` takes: a 32-bit word, signed or
+                // unsigned, on RV32 (`li a0, 0xffffffff` is -1), and any
+                // 64-bit value on RV64 (`li a0, 0xffffffff` is 2^32 - 1).
+                // On RV32 the word is then read signed, as the hart's
+                // register holds it, so `li_steps` sees one value per word.
+                Imm::Num(v) => {
+                    let v = match ctx.xlen() {
+                        Xlen::Rv32 => word(v, "li value")? as i64,
+                        Xlen::Rv64 => v,
+                    };
+                    Ok(li_words(rd, &li_steps(v, ctx.xlen())))
+                }
                 Imm::Label(name, _) if ctx.undefined(&name) => Err(format!(
                     "{} (li loads a number; la loads an address)",
                     not_yet_constant(&name)
@@ -843,6 +1004,35 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
                 "sgtz" => slt(ZERO, rs),                         // slt rd, zero, rs
                 _ => i_type(OP_IMM, ANDI, rd, rs, 0xff),         // zext.b: andi rd, rs, 255
             })
+        }
+        // The missing comparisons, by swapping the sources, as for `bgt`:
+        // sgt rd, a, b == slt rd, b, a (and `sgtu` is `sltu`).
+        "sgt" | "sgtu" => {
+            let [rd, rs, rt] = ops else {
+                return usage("rd, rs, rt");
+            };
+            let (rd, rs, rt) = (reg(rd)?, reg(rs)?, reg(rt)?);
+            let funct3 = if m == "sgt" { 0b010 } else { 0b011 }; // slt's, sltu's
+            one(r_type(OP, funct3, 0, rd, rt, rs))
+        }
+        // RV64's 32-bit forms: sign-extend the low word, or negate it.
+        "sext.w" | "negw" if rv64 => {
+            let [rd, rs] = ops else { return usage("rd, rs") };
+            let (rd, rs) = (reg(rd)?, reg(rs)?);
+            one(match m {
+                "sext.w" => i_type(OP_IMM_32, ADDI, rd, rs, 0), // addiw rd, rs, 0
+                _ => r_type(OP_32, 0, 0b0100000, rd, ZERO, rs), // negw: subw rd, zero, rs
+            })
+        }
+        // Zero-extend the low word (RV64): without Zba's `add.uw`, two
+        // shifts, as LLVM expands it. slli rd, rs, 32; srli rd, rd, 32.
+        "zext.w" if rv64 => {
+            let [rd, rs] = ops else { return usage("rd, rs") };
+            let (rd, rs) = (reg(rd)?, reg(rs)?);
+            Ok(vec![
+                Emit::word(i_type(OP_IMM, SLLI, rd, rs, 32)),
+                Emit::word(i_type(OP_IMM, SRLI, rd, rd, 32)),
+            ])
         }
         "j" => {
             let [target] = ops else { return usage("offset") };
@@ -933,7 +1123,6 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
         }
         // Counter reads: csrrs rd, <counter>, zero.
         "rdcycle" | "rdtime" | "rdinstret" | "rdcycleh" | "rdtimeh" | "rdinstreth" => {
-            let [rd] = ops else { return usage("rd") };
             let counter = match m {
                 "rdcycle" => csr::CYCLE,
                 "rdtime" => csr::TIME,
@@ -942,6 +1131,15 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
                 "rdtimeh" => csr::TIMEH,
                 _ => csr::INSTRETH,
             };
+            // The `h` forms read the high half of a 64-bit counter on RV32.
+            // RV64 has no such CSRs: its `rdcycle` reads the whole counter.
+            if rv64 && csr::rv32_only(counter) {
+                let full = m.strip_suffix('h').unwrap_or(m);
+                return Err(format!(
+                    "'{m}' exists only on RV32 (on RV64, {full} reads all 64 bits)"
+                ));
+            }
+            let [rd] = ops else { return usage("rd") };
             one(i_type(SYSTEM, CSRRS, reg(rd)?, ZERO, counter as i32))
         }
         // The canonical illegal instruction: csrrw zero, cycle, zero (cycle is read-only).
@@ -1057,31 +1255,233 @@ fn csr_op(funct3: u32, rd: Reg, csr: &Operand, src: &Operand, ctx: &Ctx) -> Resu
     one(i_type(SYSTEM, funct3, rd, rs1, addr as i32))
 }
 
-/// `li rd, value`: a 32-bit constant in one or two instructions, chosen the
-/// way LLVM does (the golden file comes from llvm-mc):
+// ===================================================================
+// `li`: which instructions build a constant
+// ===================================================================
+
+/// One instruction of a `li` sequence. The first one starts from `zero` (or,
+/// for `lui`, from nothing); each later one works on `rd`, the value built so
+/// far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// `lui rd, imm20`: `imm20 << 12`, sign-extended from bit 31 on RV64.
+    Lui(u32),
+    /// `addi rd, rs, imm`, a 12-bit signed immediate.
+    Addi(i32),
+    /// `addiw rd, rs, imm` (RV64): the sum's low 32 bits, sign-extended.
+    Addiw(i32),
+    /// `slli rd, rd, shamt`.
+    Slli(u32),
+    /// `srli rd, rd, shamt` (RV64).
+    Srli(u32),
+    /// `xori rd, rd, imm` (RV64), with imm always -1: `not rd, rd`.
+    Xori(i32),
+}
+
+/// True if `v` is a `bits`-bit signed value: sign-extending its low `bits`
+/// bits gives it back (LLVM's `isInt<bits>`).
+fn fits(v: i64, bits: u32) -> bool {
+    (v << (64 - bits)) >> (64 - bits) == v
+}
+
+/// The instructions `li` builds `value` with: exactly LLVM's choice,
+/// `RISCVMatInt::generateInstSeq` (llvm/lib/Target/RISCV/MCTargetDesc/
+/// RISCVMatInt.cpp), for the base ISA. With Zba, Zbb or Zbs LLVM has more
+/// instructions to try (`bseti`, `rori`, `sh1add`, ...), and with C it would
+/// weigh the compressed ones; merlin-as has none of them, so the cost of a
+/// sequence is its length.
 ///
-/// 1. fits in 12 signed bits: `addi rd, zero, value`;
-/// 2. low 12 bits zero: `lui rd, value >> 12`;
-/// 3. an even value `c << s` with `c` in -32..=31: `addi rd, zero, c` +
-///    `slli rd, rd, s` (LLVM prefers it because with the C extension both
-///    compress to 16 bits; `li a0, 2048` is `addi a0, zero, 1; slli a0, a0, 11`);
-/// 4. anything else: `lui rd, hi` + `addi rd, rd, lo`, split by [`hi_lo`].
-fn li(rd: Reg, value: i32) -> Result<Vec<Emit>, String> {
-    let addi = |rs1, imm| Emit::word(i_type(OP_IMM, ADDI, rd, rs1, imm));
-    let lui = |imm20| Emit::word(u_type(LUI, rd, imm20));
-    if (-2048..=2047).contains(&value) {
-        return Ok(vec![addi(ZERO, value)]);
+/// On RV32 `value` is a sign-extended 32-bit value, and the answer is one or
+/// two instructions:
+///
+/// * fits in 12 signed bits: `addi rd, zero, value`;
+/// * low 12 bits zero: `lui rd, value >> 12`;
+/// * an even value `c << s` with `c` in -32..=31: `addi rd, zero, c` +
+///   `slli rd, rd, s` (step 2 below: `li a0, 2048` is `addi a0, zero, 1;
+///   slli a0, a0, 11`);
+/// * anything else: `lui rd, hi` + `addi rd, rd, lo`, split by [`hi_lo64`].
+///
+/// On RV64 any 64-bit value takes from 1 to 8 instructions
+/// (`li a0, 0x123456789abcdef0` is `lui`, `addi`, then `slli`+`addi` three
+/// times). The length depends only on the value, so `li` with a constant
+/// keeps the assembler single pass.
+///
+/// LLVM builds a first sequence (step 1), then tries other shapes and keeps
+/// one only if it is shorter:
+///
+/// 1. [`li_base`]: `lui` + `addi` for a 32-bit value; for a wider one, the
+///    low 12 bits are an `addi` at the end and the rest is built shifted
+///    right, then shifted back with `slli`.
+/// 2. Trailing zeros: build `value >> tz` and add one `slli tz`. Kept when
+///    shorter, or (as on RV32) when the shifted value fits in 6 bits, where
+///    with C both would be 16-bit instructions (LLVM prefers that shape even
+///    without C, "to minimize differences in generated code").
+///
+///    One or two instructions cannot be beaten: every RV32 value stops here.
+/// 3. Low 13 bits from 0x1001 to 0x17ff: build `value + (0x800 - low 12
+///    bits)`, whose low bits are then 0x1800 (one `addi -0x800` short of
+///    more trailing zeros), and finish with an `addi` that takes it back.
+/// 4. A positive value: build it shifted all the way left, the bits shifted
+///    in made ones (which can make it a small negative number) or zeros, and
+///    finish with `srli` by the leading zeros: [`li_leading_zeros`].
+///    `0xffffffff` is `addi -1; srli 32`.
+/// 5. A negative value: build its complement as in 4 and finish with
+///    `xori -1` (`not`).
+pub fn li_steps(value: i64, xlen: Xlen) -> Vec<Step> {
+    let rv64 = xlen == Xlen::Rv64;
+    debug_assert!(
+        rv64 || fits(value, 32),
+        "an RV32 li value is a sign-extended word"
+    );
+
+    // 1.
+    let mut best = li_base(value, rv64);
+
+    // 2. Trailing zeros. (`value & 0xfff != 0`: with the low 12 bits zero,
+    // step 1 already shifted them away.)
+    if value & 0xfff != 0 && value & 1 == 0 && best.len() >= 2 {
+        let tz = value.trailing_zeros();
+        let shifted = value >> tz;
+        let mut seq = li_base(shifted, rv64);
+        if seq.len() + 1 < best.len() || fits(shifted, 6) {
+            seq.push(Step::Slli(tz));
+            best = seq;
+        }
     }
-    let (hi, lo) = hi_lo(value);
-    if lo == 0 {
-        return Ok(vec![lui(hi)]);
+    if best.len() <= 2 {
+        return best;
     }
-    let shift = value.trailing_zeros(); // 1..=11 for an even value here: lo != 0
-    if shift > 0 && (-32..=31).contains(&(value >> shift)) {
-        let slli = Emit::word(i_type(OP_IMM, SLLI, rd, rd, shift as i32));
-        return Ok(vec![addi(ZERO, value >> shift), slli]);
+
+    // 3. Low 13 bits 0x1001..=0x17ff: add 0x800 - (value & 0xfff) to make
+    // them 0x1800, which the next `addi -0x800` turns into 13 zero bits.
+    if value & 0xfff != 0 && value & 0x1800 == 0x1000 {
+        let imm12 = -(0x800 - (value & 0xfff)); // -0x7ff..=-1
+        let mut seq = li_base(value.wrapping_sub(imm12), rv64);
+        if seq.len() + 1 < best.len() {
+            seq.push(Step::Addi(imm12 as i32));
+            best = seq;
+        }
     }
-    Ok(vec![lui(hi), addi(rd, lo)])
+
+    // 4. Leading zeros of a positive value.
+    if value > 0 && best.len() > 2 {
+        li_leading_zeros(value, rv64, &mut best);
+    }
+
+    // 5. A negative value as the complement of a positive one. (Only when it
+    // could save something: the complement's sequence plus the `xori` must
+    // beat what we have.)
+    if value < 0 && best.len() > 3 {
+        let mut seq = Vec::new();
+        li_leading_zeros(!value, rv64, &mut seq);
+        if !seq.is_empty() && seq.len() + 1 < best.len() {
+            seq.push(Step::Xori(-1));
+            best = seq;
+        }
+    }
+    best
+}
+
+/// LLVM's `generateInstSeqImpl`: the plain sequence for `value`.
+///
+/// A 32-bit value is `lui hi` + `addi lo` ([`hi_lo64`]), either one left out
+/// when it is zero (`addi` stays if both are: `li a0, 0`). On RV64 `lui`
+/// sign-extends from bit 31, so `lui 0x80000` + `addi -1` would give
+/// 0xffffffff_7fffffff, not 0x7fffffff: when the 64-bit sum leaves the 32-bit
+/// range (only for 0x7ffff800..=0x7fffffff), the second instruction is
+/// `addiw`, which sign-extends the 32-bit sum instead.
+///
+/// A wider value (RV64 only) is built from the most significant bits down,
+/// though worked out from the least significant up: its low 12 bits become an
+/// `addi` at the end (taking them away can carry into bit 12, as in
+/// [`hi_lo64`]), and what is left is shifted right past its trailing zeros
+/// and built the same way, recursively, followed by the `slli` that shifts it
+/// back. At most three rounds of `slli` + `addi` follow the first two
+/// instructions. When the shift is more than 12 and the shifted value is too
+/// wide for one `addi`, 12 bits less of shift leave its low 12 bits zero, for
+/// a `lui` to make in one instruction.
+fn li_base(value: i64, rv64: bool) -> Vec<Step> {
+    let mut seq = Vec::new();
+    li_base_into(value, rv64, &mut seq);
+    seq
+}
+
+fn li_base_into(value: i64, rv64: bool, seq: &mut Vec<Step>) {
+    let (hi20, lo12) = hi_lo64(value);
+    if fits(value, 32) {
+        if hi20 != 0 {
+            seq.push(Step::Lui(hi20));
+        }
+        if lo12 != 0 || hi20 == 0 {
+            let lui = (hi20 << 12) as i32 as i64; // what lui leaves, sign-extended
+            let addiw = rv64 && hi20 != 0 && !fits(lui + lo12 as i64, 32);
+            seq.push(if addiw {
+                Step::Addiw(lo12)
+            } else {
+                Step::Addi(lo12)
+            });
+        }
+        return;
+    }
+    debug_assert!(rv64, "only RV64 has values wider than 32 bits");
+    // Wrapping: 0x7fffffff_fffff800 - (-0x800) is 2^63.
+    let mut rest = value.wrapping_sub(lo12 as i64);
+    let mut shift = 0;
+    if !fits(rest, 32) {
+        shift = rest.trailing_zeros(); // rest is not 0: 0 fits
+        rest >>= shift;
+        if shift > 12 && !fits(rest, 12) && fits(rest << 12, 32) {
+            shift -= 12;
+            rest <<= 12;
+        }
+    }
+    li_base_into(rest, rv64, seq);
+    if shift != 0 {
+        seq.push(Step::Slli(shift));
+    }
+    if lo12 != 0 {
+        seq.push(Step::Addi(lo12));
+    }
+}
+
+/// LLVM's `generateInstSeqLeadingZeros`, for `value > 0`: shift it left past
+/// its leading zeros, build that, and `srli` it back. The bits the shift
+/// brings in are free to choose, since `srli` drops them: all ones is tried
+/// first (`0x0000ffff_ffffffff` becomes -1, one `addi`), then all zeros. Each
+/// replaces `best` if it is shorter, or if `best` is empty (step 5 of
+/// [`li_steps`]) and it is a sequence at all (at most 7 + the `srli`).
+fn li_leading_zeros(value: i64, rv64: bool, best: &mut Vec<Step>) {
+    debug_assert!(value > 0);
+    let lz = value.leading_zeros(); // 1..=63
+    let low = ((1u64 << lz) - 1) as i64; // the lz bits shifted in
+    let ones = value << lz | low;
+    for shifted in [ones, ones & !low] {
+        let mut seq = li_base(shifted, rv64);
+        if seq.len() + 1 < best.len() || (best.is_empty() && seq.len() < 8) {
+            seq.push(Step::Srli(lz));
+            *best = seq;
+        }
+    }
+}
+
+/// The words of a `li` sequence into `rd`.
+fn li_words(rd: Reg, steps: &[Step]) -> Vec<Emit> {
+    let mut src = ZERO; // the first instruction starts from zero, the others from rd
+    steps
+        .iter()
+        .map(|&step| {
+            let word = match step {
+                Step::Lui(imm20) => u_type(LUI, rd, imm20),
+                Step::Addi(imm) => i_type(OP_IMM, ADDI, rd, src, imm),
+                Step::Addiw(imm) => i_type(OP_IMM_32, ADDI, rd, src, imm),
+                Step::Slli(shamt) => i_type(OP_IMM, SLLI, rd, src, shamt as i32),
+                Step::Srli(shamt) => i_type(OP_IMM, SRLI, rd, src, shamt as i32),
+                Step::Xori(imm) => i_type(OP_IMM, XORI, rd, src, imm),
+            };
+            src = rd;
+            Emit::word(word)
+        })
+        .collect()
 }
 
 /// `.insn`: an instruction written field by field, for encodings the
@@ -1098,7 +1498,7 @@ fn li(rd: Reg, value: i32) -> Result<Vec<Emit>, String> {
 /// .insn value                                  .insn 4, value
 /// ```
 ///
-/// (`.insn j` is left out: LLVM 21 packs its numeric offsets unscrambled.)
+/// (`.insn j` is left out: LLVM, 21 and 23 alike, packs its numeric offsets unscrambled.)
 fn insn(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> {
     let format = m.strip_prefix(".insn").unwrap_or(m).trim();
     let field = |op: &Operand, bits: u32, what: &str| uimm(expr(op)?, ctx, bits, what);
@@ -1279,12 +1679,478 @@ mod tests {
 
     #[test]
     fn li_picks_the_shortest_sequence() {
-        let words = |v| li(10, v).unwrap().iter().map(|e| e.word).collect::<Vec<_>>();
+        let words = |v: i32| {
+            li_words(10, &li_steps(v as i64, Xlen::Rv32))
+                .iter()
+                .map(|e| e.word)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(words(0), [0x0000_0513]);
         assert_eq!(words(0x1000_0000), [0x1000_0537]);
         assert_eq!(words(2048), [0x0010_0513, 0x00b5_1513]);
         assert_eq!(words(0x1234_5678), [0x1234_5537, 0x6785_0513]);
         // Odd, so no shift form even though small after the rounding.
         assert_eq!(words(0x801), [0x0000_1537, 0x8015_0513]);
+    }
+
+    // ----- RV64 -----
+
+    /// The `.text` words of `src` assembled for `xlen`, or the first error.
+    fn words_for(src: &str, xlen: Xlen) -> Result<Vec<u32>, String> {
+        let obj = crate::assemble_with(src, &crate::Options { xlen }).map_err(|e| e[0].msg.clone())?;
+        let text = &obj.sections[0].data;
+        Ok(text
+            .chunks(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect())
+    }
+
+    fn words64(src: &str) -> Vec<u32> {
+        words_for(src, Xlen::Rv64).unwrap_or_else(|e| panic!("{src}: {e}"))
+    }
+
+    /// Runs a `li` sequence the way the hart would, with RV32's registers
+    /// kept sign-extended from bit 31 as on RV64 (as Grail does).
+    fn run(steps: &[Step], xlen: Xlen) -> i64 {
+        let word = |v: i64| if xlen == Xlen::Rv32 { v as i32 as i64 } else { v };
+        steps.iter().fold(0, |rd, &step| match step {
+            Step::Lui(imm20) => (imm20 << 12) as i32 as i64,
+            Step::Addi(imm) => word(rd.wrapping_add(imm as i64)),
+            Step::Addiw(imm) => rd.wrapping_add(imm as i64) as i32 as i64,
+            Step::Slli(s) => word(rd << s),
+            Step::Srli(s) => word(((rd as u64) >> s) as i64),
+            Step::Xori(imm) => word(rd ^ imm as i64),
+        })
+    }
+
+    /// Words written as llvm-mc prints them: hex, separated by spaces.
+    fn hex_words(s: &str) -> Vec<u32> {
+        s.split_whitespace()
+            .map(|w| u32::from_str_radix(w, 16).unwrap())
+            .collect()
+    }
+
+    /// `li a0, value` on RV64: llvm-mc 23's words (`llvm-mc --triple=riscv64
+    /// -mattr=+m,+a,+zicsr,+zifencei`): a sample with every rule of
+    /// [`li_steps`] and its edges, grouped by the rule whose sequence wins.
+    const LI64: &[(u64, &str)] = &[
+        // Rule 1, a 32-bit value: addi alone, lui alone, or lui + addi.
+        (0x0, "00000513"),
+        (0x1, "00100513"),
+        (0xffff_ffff_ffff_ffff, "fff00513"),
+        (0x7ff, "7ff00513"),
+        (0xffff_ffff_ffff_f800, "80000513"),
+        (0x1000_0000, "10000537"),
+        (0x1234_5678, "12345537 67850513"),
+        // Odd, so no shift form even though small after the rounding.
+        (0x801, "00001537 80150513"),
+        // A sign-extended word: lui alone.
+        (0xffff_ffff_8000_0000, "80000537"),
+        // ... with addiw only where lui + addi would leave the 32-bit range.
+        (0x7fff_f7ff, "7ffff537 7ff50513"),
+        (0x7fff_f800, "80000537 8005051b"),
+        (0x7fff_ffff, "80000537 fff5051b"),
+        // Rule 1, wider than 32 bits: built shifted right, then slli (+ addi).
+        // Above 2^31 lui alone no longer does, since RV64's lui sign-extends.
+        (0x8000_0000, "00100513 01f51513"),
+        (0x8000_0001, "00100513 01f51513 00150513"),
+        (0x8040_0000, "20100513 01651513"),
+        (0xffff_f800, "00100513 02051513 80050513"),
+        (0x1_0000_0000, "00100513 02051513"),
+        (0x1_0000_0001, "00100513 02051513 00150513"),
+        (0x8000_0000_0000_0000, "fff00513 03f51513"),
+        // Negative, and three instructions: too short for rule 5 to try.
+        (0xffff_fffe_ffff_ffff, "fff00513 02051513 fff50513"),
+        // The final addi of a wide value is addi, never addiw.
+        (0xffff_ffff_7fff_ffff, "80000537 fff50513"),
+        // addiw inside the recursion.
+        (0x7fff_ffff_0000_0000, "80000537 fff5051b 02051513"),
+        // A shift of more than 12 reduced by 12 for lui (14 to 2, 32 to 20);
+        // a shift of exactly 12 is kept.
+        (0xdead_beef, "37ab7537 00251513 eef50513"),
+        (0x17ff_0000_0001, "017ff537 01451513 00150513"),
+        (0x1_ffff_f000, "00200537 fff50513 00c51513"),
+        // The longest: lui, addi, then slli + addi three times.
+        (
+            0x1234_5678_9abc_def0,
+            "00247537 8ad50513 00e51513 c4d50513 00c51513 5e750513 00d51513 ef050513",
+        ),
+        (
+            0x5555_5555_5555_5555,
+            "05555537 55550513 00c51513 55550513 00c51513 55550513 00c51513 55550513",
+        ),
+        (
+            0x00ff_00ff_00ff_00ff,
+            "00ff0537 0ff50513 01051513 0ff50513 01051513 0ff50513",
+        ),
+        // Rule 2, trailing zeros: the shifted value small ("compressible"),
+        // or the sequence shorter.
+        (0x800, "00100513 00b51513"),
+        (0x8000_0800, "00100537 00150513 00b51513"),
+        (0x8000_2b04, "20001537 ac150513 00251513"),
+        // Low 13 bits 0x1800, just past rule 3's range.
+        (0x1_0000_0000_1800, "00100513 02551513 00350513 00b51513"),
+        (
+            0xfedc_ba98_7654_3210,
+            "fdb97537 53150513 00d51513 d9550513 00e51513 32150513 00451513",
+        ),
+        // Rule 3, low 13 bits in 0x1001..=0x17ff: one more addi at the end.
+        (0x905_acf7_102b, "482d6537 7b950513 00d51513 80050513 82b50513"),
+        // In the range too, but rule 1's sequence is no longer.
+        (0x1000_0000_17ff, "00100513 02051513 00150513 00c51513 7ff50513"),
+        // Rule 4, leading zeros, the bits shifted in made ones: often -1
+        // shifted right.
+        (0xffff_ffff, "fff00513 02055513"),
+        (0x7fff_ffff_ffff_ffff, "fff00513 00155513"),
+        (0x0000_ffff_ffff_ffff, "fff00513 01055513"),
+        (0x0000_ffff_0000_ffff, "f0001537 01451513 fff50513 01055513"),
+        // value - lo12 wraps past 2^63 in rule 1's try.
+        (0x7fff_ffff_ffff_f800, "fffff537 00155513"),
+        // Rule 4, the bits shifted in made zeros.
+        (0x0000_0fff_ffff_f000, "fff00513 02051513 01455513"),
+        // Rule 5, negative values built inverted, then xori -1.
+        (0x8000_0000_0000_0fff, "ffffe537 00155513 fff54513"),
+        (0x8000_0000_0040_6100, "ff7f4537 dff50513 00155513 fff54513"),
+        (
+            0x8000_4c06_2000_0088,
+            "d9fcf537 01251513 eef50513 00155513 fff54513",
+        ),
+        (
+            0xfffa_ccc3_9887_ffff,
+            "a6679537 cef50513 02051513 00d55513 fff54513",
+        ),
+        (0xffff_c000_42e9_8fff, "bd167537 01251513 01255513 fff54513"),
+    ];
+
+    /// `li a0, value` on RV32, as llvm-mc 23 `--triple=riscv32` assembles it:
+    /// the same algorithm, never more than two instructions.
+    const LI32: &[(u32, &str)] = &[
+        (0x0, "00000513"),
+        (0x7ff, "7ff00513"),
+        (0xffff_f800, "80000513"),
+        (0x800, "00100513 00b51513"),
+        (0x801, "00001537 80150513"),
+        (0x1000_0000, "10000537"),
+        (0x1234_5678, "12345537 67850513"),
+        (0x7fff_f800, "80000537 80050513"),
+        (0x7fff_ffff, "80000537 fff50513"),
+        (0x8000_0000, "80000537"),
+        (0x8040_0000, "80400537"),
+        (0xdead_beef, "deadc537 eef50513"),
+        (0xffff_ffff, "fff00513"),
+    ];
+
+    #[test]
+    fn li_steps_are_llvms_on_rv64() {
+        for &(value, words) in LI64 {
+            let words = hex_words(words);
+            let steps = li_steps(value as i64, Xlen::Rv64);
+            let got: Vec<u32> = li_words(10, &steps).iter().map(|e| e.word).collect();
+            assert_eq!(got, words, "li a0, {value:#x}: {steps:?}");
+            assert_eq!(run(&steps, Xlen::Rv64), value as i64, "{value:#x}: {steps:?}");
+            // And through the assembler.
+            assert_eq!(words64(&format!("li a0, {value:#x}")), words, "{value:#x}");
+        }
+    }
+
+    #[test]
+    fn li_steps_are_llvms_on_rv32() {
+        for &(word, words) in LI32 {
+            let (value, words) = (word as i32 as i64, hex_words(words));
+            let steps = li_steps(value, Xlen::Rv32);
+            let got: Vec<u32> = li_words(10, &steps).iter().map(|e| e.word).collect();
+            assert_eq!(got, words, "li a0, {word:#x}: {steps:?}");
+            assert_eq!(run(&steps, Xlen::Rv32), value, "{word:#x}: {steps:?}");
+            assert_eq!(
+                words_for(&format!("li a0, {word:#x}"), Xlen::Rv32),
+                Ok(words),
+                "{word:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn li_takes_the_width_of_the_value() {
+        // RV32 reads 0xffffffff as the word -1; RV64 as 2^32 - 1.
+        assert_eq!(words_for("li a0, 0xffffffff", Xlen::Rv32), Ok(vec![0xfff0_0513]));
+        assert_eq!(words64("li a0, 0xffffffff"), [0xfff0_0513, 0x0205_5513]);
+        // `li sp, 0x80400000`, the stack of examples linked at 0x80000000.
+        assert_eq!(words_for("li sp, 0x80400000", Xlen::Rv32), Ok(vec![0x8040_0137]));
+        assert_eq!(words64("li sp, 0x80400000"), [0x2010_0113, 0x0161_1113]);
+        assert_eq!(
+            words_for("li a0, 0x100000000", Xlen::Rv32),
+            Err("li value 4294967296 does not fit in 32 bits".into())
+        );
+        // 64-bit expressions wrap, as in LLVM: -2^63 - 1 is 2^63 - 1.
+        assert_eq!(
+            words64("li a0, -0x8000000000000000 - 1"),
+            [0xfff0_0513, 0x0015_5513]
+        );
+    }
+
+    /// RV64 instructions and their words from llvm-mc 23 (`--triple=riscv64
+    /// -mattr=+m,+a,+zicsr,+zifencei -show-encoding`), with what
+    /// `excalibur::decode` reads back from each word on RV64.
+    #[test]
+    fn rv64_instructions_are_llvms_and_decode_back() {
+        use excalibur::{AmoOp, AmoWidth, CsrOp, CsrSrc, LoadOp, MulOp, Ordering};
+        // The instructions below use rd = a0 (10), rs1 = a1 (11), rs2 = a2 (12)
+        // unless said otherwise; the atomics take their address in a2.
+        let op32 = |op, rs1, rs2| Inst::Op32 { op, rd: 10, rs1, rs2 };
+        let mul32 = |op| Inst::Mul32 {
+            op,
+            rd: 10,
+            rs1: 11,
+            rs2: 12,
+        };
+        let imm32 = |op, imm| Inst::OpImm32 {
+            op,
+            rd: 10,
+            rs1: 11,
+            imm,
+        };
+        let imm = |op, imm| Inst::OpImm {
+            op,
+            rd: 10,
+            rs1: 11,
+            imm,
+        };
+        let load = |op, rd, imm| Inst::Load { op, rd, rs1: 2, imm };
+        let sd = |rs2, imm| Inst::Store {
+            op: StoreOp::Sd,
+            rs1: 2,
+            rs2,
+            imm,
+        };
+        let order = |aq, rl| Ordering { aq, rl };
+        let lr_d = |rd, rs1, order| Inst::Lr {
+            width: AmoWidth::D,
+            rd,
+            rs1,
+            order,
+        };
+        let sc_d = |order| Inst::Sc {
+            width: AmoWidth::D,
+            rd: 10,
+            rs1: 12,
+            rs2: 11,
+            order,
+        };
+        let amo = |op, width, order| Inst::Amo {
+            op,
+            width,
+            rd: 10,
+            rs1: 12,
+            rs2: 11,
+            order,
+        };
+        let csrr = |csr| Inst::Csr {
+            op: CsrOp::Rs,
+            rd: 10,
+            src: CsrSrc::Reg(0),
+            csr,
+        };
+        let (none, aq, rl, aqrl) = (
+            Ordering::NONE,
+            order(true, false),
+            order(false, true),
+            order(true, true),
+        );
+        let cases: &[(&str, u32, Inst)] = &[
+            ("addw a0, a1, a2", 0x00c5_853b, op32(AluOp::Add, 11, 12)),
+            ("subw a0, a1, a2", 0x40c5_853b, op32(AluOp::Sub, 11, 12)),
+            ("sllw a0, a1, a2", 0x00c5_953b, op32(AluOp::Sll, 11, 12)),
+            ("srlw a0, a1, a2", 0x00c5_d53b, op32(AluOp::Srl, 11, 12)),
+            ("sraw a0, a1, a2", 0x40c5_d53b, op32(AluOp::Sra, 11, 12)),
+            ("mulw a0, a1, a2", 0x02c5_853b, mul32(MulOp::Mul)),
+            ("divw a0, a1, a2", 0x02c5_c53b, mul32(MulOp::Div)),
+            ("divuw a0, a1, a2", 0x02c5_d53b, mul32(MulOp::Divu)),
+            ("remw a0, a1, a2", 0x02c5_e53b, mul32(MulOp::Rem)),
+            ("remuw a0, a1, a2", 0x02c5_f53b, mul32(MulOp::Remu)),
+            ("addiw a0, a1, -2048", 0x8005_851b, imm32(AluOp::Add, -2048)),
+            ("addiw a0, a1, 2047", 0x7ff5_851b, imm32(AluOp::Add, 2047)),
+            ("slliw a0, a1, 31", 0x01f5_951b, imm32(AluOp::Sll, 31)),
+            ("srliw a0, a1, 1", 0x0015_d51b, imm32(AluOp::Srl, 1)),
+            ("sraiw a0, a1, 31", 0x41f5_d51b, imm32(AluOp::Sra, 31)),
+            // 6-bit shift amounts.
+            ("slli a0, a1, 63", 0x03f5_9513, imm(AluOp::Sll, 63)),
+            ("srli a0, a1, 32", 0x0205_d513, imm(AluOp::Srl, 32)),
+            ("srai a0, a1, 63", 0x43f5_d513, imm(AluOp::Sra, 63)),
+            ("srai a0, a1, 32", 0x4205_d513, imm(AluOp::Sra, 32)),
+            // Doublewords, and the zero-extended word.
+            ("ld a0, -8(sp)", 0xff81_3503, load(LoadOp::Ld, 10, -8)),
+            ("ld ra, -2048(sp)", 0x8001_3083, load(LoadOp::Ld, 1, -2048)),
+            ("lwu a0, 4(sp)", 0x0041_6503, load(LoadOp::Lwu, 10, 4)),
+            ("sd a0, 8(sp)", 0x00a1_3423, sd(10, 8)),
+            ("sd ra, 2040(sp)", 0x7e11_3c23, sd(1, 2040)),
+            // The .d atomics, with every ordering suffix.
+            ("lr.d a0, (a1)", 0x1005_b52f, lr_d(10, 11, none)),
+            ("lr.d.aq a0, (a1)", 0x1405_b52f, lr_d(10, 11, aq)),
+            ("lr.d.rl a0, (a1)", 0x1205_b52f, lr_d(10, 11, rl)),
+            ("lr.d.aqrl a0, (a1)", 0x1605_b52f, lr_d(10, 11, aqrl)),
+            ("lr.d zero, 0(x31)", 0x100f_b02f, lr_d(0, 31, none)),
+            ("sc.d a0, a1, (a2)", 0x18b6_352f, sc_d(none)),
+            ("sc.d.aqrl a0, a1, (a2)", 0x1eb6_352f, sc_d(aqrl)),
+            (
+                "amoswap.d a0, a1, (a2)",
+                0x08b6_352f,
+                amo(AmoOp::Swap, AmoWidth::D, none),
+            ),
+            (
+                "amoadd.d.aq a0, a1, (a2)",
+                0x04b6_352f,
+                amo(AmoOp::Add, AmoWidth::D, aq),
+            ),
+            (
+                "amoxor.d.rl a0, a1, (a2)",
+                0x22b6_352f,
+                amo(AmoOp::Xor, AmoWidth::D, rl),
+            ),
+            (
+                "amoand.d a0, a1, (a2)",
+                0x60b6_352f,
+                amo(AmoOp::And, AmoWidth::D, none),
+            ),
+            (
+                "amoor.d.aqrl a0, a1, (a2)",
+                0x46b6_352f,
+                amo(AmoOp::Or, AmoWidth::D, aqrl),
+            ),
+            (
+                "amomin.d a0, a1, (a2)",
+                0x80b6_352f,
+                amo(AmoOp::Min, AmoWidth::D, none),
+            ),
+            (
+                "amomax.d a0, a1, (a2)",
+                0xa0b6_352f,
+                amo(AmoOp::Max, AmoWidth::D, none),
+            ),
+            (
+                "amominu.d a0, a1, (a2)",
+                0xc0b6_352f,
+                amo(AmoOp::Minu, AmoWidth::D, none),
+            ),
+            (
+                "amomaxu.d.rl a0, a1, (a2)",
+                0xe2b6_352f,
+                amo(AmoOp::Maxu, AmoWidth::D, rl),
+            ),
+            // The .w forms are the same on both widths.
+            (
+                "amoadd.w a0, a1, (a2)",
+                0x00b6_252f,
+                amo(AmoOp::Add, AmoWidth::W, none),
+            ),
+            // Pseudo-instructions.
+            ("sext.w a0, a1", 0x0005_851b, imm32(AluOp::Add, 0)),
+            ("negw a0, a1", 0x40b0_053b, op32(AluOp::Sub, 0, 11)),
+            ("mv a0, a1", 0x0005_8513, imm(AluOp::Add, 0)),
+            ("not a0, a1", 0xfff5_c513, imm(AluOp::Xor, -1)),
+            // CSRs: a number is accepted, RV32-only or not.
+            ("csrr a0, 0xc80", 0xc800_2573, csrr(0xc80)),
+            ("csrr a0, pmpcfg2", 0x3a20_2573, csrr(0x3a2)),
+        ];
+        for &(line, word, inst) in cases {
+            assert_eq!(words64(line), [word], "{line}");
+            assert_eq!(excalibur::decode(word, Xlen::Rv64), inst, "{line}");
+            // The disassembler's text assembles back to the same word.
+            let text = inst
+                .format(None, excalibur::Syntax::plain(Xlen::Rv64))
+                .to_string();
+            assert_eq!(words64(&text), [word], "{line} -> {text}");
+        }
+    }
+
+    #[test]
+    fn zext_w_is_two_shifts() {
+        // LLVM 23 without Zba: slli a0, a1, 32; srli a0, a0, 32.
+        assert_eq!(words64("zext.w a0, a1"), [0x0205_9513, 0x0205_5513]);
+    }
+
+    #[test]
+    fn rv64_loads_and_stores_reach_symbols_pc_relative() {
+        // As llvm-mc: PCREL_HI20 on the auipc, PCREL_LO12_I/S on the access.
+        for (line, words, lo) in [
+            ("ld a0, target", [0x0000_0517, 0x0005_3503], RelocKind::PcrelLo12I),
+            (
+                "lwu a0, target",
+                [0x0000_0517, 0x0005_6503],
+                RelocKind::PcrelLo12I,
+            ),
+            (
+                "sd a0, target, t0",
+                [0x0000_0297, 0x00a2_b023],
+                RelocKind::PcrelLo12S,
+            ),
+        ] {
+            let obj = crate::assemble_with(line, &crate::Options { xlen: Xlen::Rv64 }).unwrap();
+            assert_eq!(words64(line), words, "{line}");
+            let kinds: Vec<_> = obj.sections[0]
+                .relocs
+                .iter()
+                .map(|r| (r.offset, r.kind))
+                .collect();
+            assert_eq!(kinds, [(0, RelocKind::PcrelHi20), (4, lo)], "{line}");
+            assert_eq!(obj.sections[0].relocs[0].symbol, "target");
+        }
+    }
+
+    #[test]
+    fn hi_lo_of_a_constant_takes_64_bits_on_rv64() {
+        // LLVM's words, on both widths; RV32 keeps its 32-bit check.
+        assert_eq!(words64("lui a0, %hi(0x123456789)"), [0x2345_6537]);
+        assert_eq!(words64("addi a0, a0, %lo(0x123456789)"), [0x7895_0513]);
+        assert_eq!(words64("lui a0, %hi(0xffffffff80000000)"), [0x8000_0537]);
+        assert_eq!(words64("addi a0, a0, %lo(0xffffffff7ffff800)"), [0x8005_0513]);
+        assert_eq!(words64("lui a0, %hi(-1)"), [0x0000_0537]);
+        assert_eq!(words64("addi a0, a0, %lo(-1)"), [0xfff5_0513]);
+        assert_eq!(words64("lui a0, %hi(0x7fffffffffffffff)"), [0x0000_0537]);
+        assert_eq!(
+            words_for("lui a0, %hi(0x123456789)", Xlen::Rv32),
+            Err("%hi() value 4886718345 does not fit in 32 bits".into())
+        );
+        // hi_lo64 agrees with hi_lo on every 32-bit value.
+        for v in [
+            0,
+            1,
+            -1,
+            0x7ff,
+            0x800,
+            -0x801,
+            i32::MIN,
+            i32::MAX,
+            0x7fff_f800,
+            0x1234_5fff,
+        ] {
+            assert_eq!(hi_lo64(v as i64), hi_lo(v), "{v:#x}");
+        }
+    }
+
+    #[test]
+    fn shift_amounts_have_the_width_of_the_register() {
+        assert_eq!(words64("slli a0, a0, 63"), [0x03f5_1513]);
+        let rv64 = |line: &str| words_for(line, Xlen::Rv64);
+        assert_eq!(
+            rv64("slli a0, a0, 64"),
+            Err("shift amount 64 out of range (0..=63)".into())
+        );
+        assert_eq!(
+            rv64("srai a0, a0, -1"),
+            Err("shift amount -1 out of range (0..=63)".into())
+        );
+        // The 32-bit shifts keep 5 bits.
+        assert_eq!(
+            rv64("slliw a0, a0, 32"),
+            Err("shift amount 32 out of range (0..=31)".into())
+        );
+        assert_eq!(
+            words_for("slli a0, a0, 32", Xlen::Rv32),
+            Err("shift amount 32 out of range (0..=31)".into())
+        );
+        assert_eq!(
+            rv64("addiw a0, a0, 2048"),
+            Err("immediate 2048 out of range (-2048..=2047)".into())
+        );
     }
 }

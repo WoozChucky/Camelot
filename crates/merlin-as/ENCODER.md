@@ -20,6 +20,14 @@ its immediate bits zero and the `Emit` carries a fixup (`RelocKind` +
 target). The number of words never depends on a label's address, so the
 assembler can stay single pass; it may depend on a constant (`li`).
 
+The width, RV32 or RV64, is the whole file's: `-march=rv32ima_zicsr_zifencei`
+(the default, until RV32 goes in #159) or `-march=rv64ima_zicsr_zifencei` on
+the command line, `Options { xlen }` for `merlin_as::assemble_with`. The
+encoder reads it from `ctx.xlen()`. Every instruction word is 32 bits on both;
+RV64 is RV32 plus a few instructions, 6-bit shift amounts and wider `li`
+constants, and minus the RV32-only counter halves (see below). `.option` and
+`.attribute` never change it.
+
 ## Formats and field packers
 
 Every instruction is one of six formats. They keep `opcode`, `rd`, `rs1`,
@@ -54,9 +62,18 @@ hi = (value + 0x800) >> 12      lo = value - (hi << 12)    (lo in -2048..=2047)
 0x12345fff → hi = 0x12346, lo = -1
 ```
 
-`hi_lo()` does this; `li`, `%hi`/`%lo` of a constant, and the resolution of
-pc-relative pairs all use it (ld.lld does the same for `R_RISCV_HI20` and
-friends).
+`hi_lo()` does this for a word; the resolution of pc-relative pairs uses it
+(ld.lld does the same for `R_RISCV_HI20` and friends). `hi_lo64()` is the
+same split of a 64-bit value, as LLVM folds `%hi(c)` and `%lo(c)`, and `li`
+and `%hi`/`%lo` of a constant use it: `hi = ((c + 0x800) >> 12) & 0xfffff`,
+so the bits above 31 are dropped (`%hi(0x123456789)` is `0x23456`); on a word
+it gives what `hi_lo()` does. On RV64 `%hi`/`%lo` take any
+64-bit constant that way; on RV32 the constant must be a word, as before
+(`%hi() value 4886718345 does not fit in 32 bits`), where LLVM would fold it.
+
+On RV64 `lui` sign-extends its result from bit 31: `lui a0, 0x80000` is
+0xffff_ffff_8000_0000. So `lui` + `addi` builds only the sign-extended 32-bit
+values, and `li` needs other sequences for the rest (below).
 
 ## What it accepts
 
@@ -72,6 +89,21 @@ Mnemonics are lower case; registers by ABI name or `xN`; CSRs by name
 | Privileged | `ecall ebreak mret sret wfi sfence.vma [rs1[, rs2]]` |
 | Zicsr | `csrrw csrrs csrrc csrrwi csrrsi csrrci` |
 | Xcal (spec §9) | `xcal.dbg rs1`, `xcal.halt rs1` (custom-0, funct3 0 / 1) |
+| RV64I only | `ld lwu sd` (funct3 `011`, `110`; `011`), `addiw slliw srliw sraiw` (OP-IMM-32), `addw subw sllw srlw sraw` (OP-32) |
+| M, RV64 only | `mulw divw divuw remw remuw` (OP-32 with funct7 = 1) |
+| A, RV64 only | `lr.d`, `sc.d`, `amoswap.d` ... `amomaxu.d`, with the same suffixes |
+
+The RV64-only mnemonics live in tables of their own (`OP_32_FUNCT`,
+`OP_IMM_32_FUNCT3`, `SHIFT_32_FUNCT`, `LOAD_RV64_FUNCT3`,
+`STORE_RV64_FUNCT3`), looked up only on RV64, so on RV32 each is still
+`unknown instruction 'mulw'`; the RV32 tables are exported to the C
+assembler (`crates/xtask/src/c_tables.rs`), which stays RV32 until #157.
+
+Shift amounts are 6 bits on RV64: `slli`, `srli` and `srai` put the amount in
+bits [25:20] and keep only funct6 in [31:26] (`srai` is `010000`), so
+`slli a0, a0, 63` is legal and 64 is `shift amount 64 out of range (0..=63)`.
+The W shifts, and every RV32 shift, take 5 bits (`0..=31`) under a full
+funct7, as before.
 
 Pseudo-instructions, as in the RISC-V Assembly Programmer's Manual and LLVM:
 
@@ -81,55 +113,117 @@ Pseudo-instructions, as in the RISC-V Assembly Programmer's Manual and LLVM:
 | `li rd, imm` | see below |
 | `mv`, `not`, `neg`, `seqz`, `snez`, `sltz`, `sgtz`, `zext.b` | `addi rd, rs, 0`, `xori rd, rs, -1`, `sub rd, zero, rs`, `sltiu rd, rs, 1`, `sltu rd, zero, rs`, `slt rd, rs, zero`, `slt rd, zero, rs`, `andi rd, rs, 255` |
 | `beqz bnez bltz bgez` / `blez bgtz` | the branch with `zero` as rs2 / as rs1 |
+| `sgt sgtu rd, a, b` | `slt sltu rd, b, a` (sources swapped) |
 | `bgt ble bgtu bleu a, b, t` | `blt bge bltu bgeu b, a, t` (operands swapped) |
 | `j t`, `jal t` | `jal zero, t`, `jal ra, t` |
 | `jr rs`, `jalr rs`, `ret` | `jalr zero, 0(rs)`, `jalr ra, 0(rs)`, `jalr zero, 0(ra)` |
 | `la rd, sym`, `lla rd, sym` | `auipc rd, %pcrel_hi(sym)` + `addi rd, rd, %pcrel_lo(.)` |
-| `lw rd, sym` (any load) | `auipc rd, %pcrel_hi(sym)` + `lw rd, %pcrel_lo(.)(rd)` |
-| `sw rs, sym, rt` (any store) | `auipc rt, %pcrel_hi(sym)` + `sw rs, %pcrel_lo(.)(rt)` |
+| `lw rd, sym` (any load, `ld` and `lwu` on RV64) | `auipc rd, %pcrel_hi(sym)` + `lw rd, %pcrel_lo(.)(rd)` |
+| `sw rs, sym, rt` (any store, `sd` on RV64) | `auipc rt, %pcrel_hi(sym)` + `sw rs, %pcrel_lo(.)(rt)` |
 | `call sym` / `tail sym` | `auipc ra/t1, 0` + `jalr ra/zero, 0(ra/t1)`, one `R_RISCV_CALL_PLT` on the auipc |
 | `csrr rd, c` | `csrrs rd, c, zero` |
 | `csrw csrs csrc c, rs` | `csrrw csrrs csrrc zero, c, rs` (with an immediate: the `i` form) |
 | `csrwi csrsi csrci c, imm` | `csrrwi csrrsi csrrci zero, c, imm` |
-| `rdcycle rdtime rdinstret` (and `h`) | `csrrs rd, cycle/time/instret, zero` |
+| `rdcycle rdtime rdinstret` (and, on RV32, `h`) | `csrrs rd, cycle/time/instret, zero` (`cycleh`...) |
 | `unimp` | `csrrw zero, cycle, zero` |
+| `sext.w`, `negw` (RV64) | `addiw rd, rs, 0`, `subw rd, zero, rs` |
+| `zext.w` (RV64) | `slli rd, rs, 32` + `srli rd, rd, 32` (LLVM's expansion without Zba) |
+
+`sext.b`, `sext.h` and `zext.h`, which LLVM expands without Zbb into two
+shifts, are not provided. `mv` and `not` are the same words on both widths.
+
+RV64 has no high counter halves: its CSRs hold all 64 bits. So on RV64
+`rdcycleh a0` is `'rdcycleh' exists only on RV32 (on RV64, rdcycle reads all 64 bits)`
+(and `rdtimeh`, `rdinstreth`), and the name of an RV32-only CSR (`cycleh`,
+`mstatush`, `pmpcfg1`..., `excalibur::csr::rv32_only`) is
+`CSR 'cycleh' exists only on RV32`. A CSR number is accepted on both widths,
+as LLVM does (`csrr a0, 0xc80`).
 
 `%pcrel_lo(.)` above stands for the hidden `.Lpcrel_hiN` label the driver puts
 on the `auipc` (`Target::Auipc(0)`), as the psABI requires.
 
 ### Atomics (A)
 
-R-type words on the AMO opcode (`0101111`) with funct3 = `010` (word). What
-R-type calls funct7 is split in two: funct5 in bits [31:27] picks the
-operation, then the two ordering bits, aq (26) and rl (25):
+R-type words on the AMO opcode (`0101111`) with funct3 = `010` (`.w`, a
+word) or, on RV64, `011` (`.d`, a doubleword). What R-type calls funct7 is
+split in two: funct5 in bits [31:27] picks the operation, then the two
+ordering bits, aq (26) and rl (25):
 
 ```
-funct5[31:27] aq[26] rl[25] rs2[24:20] rs1[19:15] 010 rd[11:7] 0101111
+funct5[31:27] aq[26] rl[25] rs2[24:20] rs1[19:15] 01w rd[11:7] 0101111
 ```
 
 The suffix sets the ordering bits: none = 00, `.aq` = 10, `.rl` = 01,
-`.aqrl` = 11 (`atomic()` strips it, `atomic_funct5()` maps the rest). `lr.w`
-has no rs2: its field is zero. The address is written `(rs1)`; as in LLVM,
-`0(rs1)` is accepted too, and any other offset is an error, since there is no
-offset field. Like LLVM, it must be the literal `0`, one integer token (`0`,
-`0x0`): an expression or a symbol that equals 0 (`-0(rs1)`, `+0(rs1)`,
-`(0)(rs1)`, `1-1(rs1)`) is an error too. The parser folds `+0` and `(0)` to
-the number 0, so it records in the operand (`int_token`) whether the offset
-was a single integer token, and `atomic_address()` checks that. The source
-register comes before the address, as for stores (`amoadd.w rd, rs2, (rs1)`),
-and rd gets the old memory word.
+`.aqrl` = 11 (`atomic()` strips it, looks the rest up in `ATOMIC_FUNCT5`, a
+`.d` form under its `.w` row, and returns the funct3 of the width). `lr.w` and
+`lr.d` have no rs2: their rs2 field is zero. The address is written `(rs1)`;
+as in LLVM, `0(rs1)` is accepted too, and any other offset is an error, since
+there is no offset field. Like LLVM, it must be the literal `0`, one integer
+token (`0`, `0x0`): an expression or a symbol that equals 0 (`-0(rs1)`,
+`+0(rs1)`, `(0)(rs1)`, `1-1(rs1)`) is an error too. The parser folds `+0` and
+`(0)` to the number 0, so it records in the operand (`int_token`) whether the
+offset was a single integer token, and `atomic_address()` checks that. The
+source register comes before the address, as for stores
+(`amoadd.w rd, rs2, (rs1)`), and rd gets the old memory word.
 
 ### `li`
 
-`li rd, value` takes a 32-bit constant (signed or unsigned) and picks the same
-sequence as LLVM, which the golden file comes from:
+`li rd, value` picks exactly LLVM's sequence: `li_steps(value, xlen)` is a
+port of `RISCVMatInt::generateInstSeq` (llvm/lib/Target/RISCV/MCTargetDesc/
+RISCVMatInt.cpp) for the base ISA. With Zba, Zbb or Zbs LLVM would have more
+instructions to try, and with C it would weigh the compressed ones; merlin-as
+has none of them, so a sequence costs its length. The constant is an
+expression computed in 64 bits, wrapping around (`-0x8000000000000000 - 1` is
+`0x7fffffffffffffff`, as in LLVM).
+
+**RV32** takes a 32-bit constant, signed or unsigned, [-2^31, 2^32) (`li value
+4294967296 does not fit in 32 bits` otherwise), and gives one or two
+instructions:
 
 1. fits in 12 signed bits: `addi rd, zero, value`;
 2. low 12 bits zero: `lui rd, value >> 12`;
 3. even and `c << s` with `c` in -32..=31: `addi rd, zero, c` + `slli rd, rd, s`
    (LLVM prefers it because with the C extension both halves compress;
    `li a0, 2048` is `addi a0, zero, 1; slli a0, a0, 11`);
-4. otherwise `lui rd, hi` + `addi rd, rd, lo`, split by `hi_lo()`.
+4. otherwise `lui rd, hi` + `addi rd, rd, lo`, split by `hi_lo64()`.
+
+**RV64** takes any 64-bit constant and gives 1 to 8 instructions, from
+`lui`, `addi`, `addiw`, `slli`, `srli` and `xori`. The length depends only on
+the value, so the assembler stays single pass, and 8 words is the most a `li`
+takes. LLVM builds a first sequence, then tries other shapes and keeps one
+only if it is shorter (the comments on `li_steps` go through each):
+
+1. The plain sequence (`li_base`, LLVM's `generateInstSeqImpl`). A
+   sign-extended 32-bit value is `lui hi` + `addi lo`; `lui` sign-extends
+   from bit 31, so when the 64-bit sum would leave the 32-bit range the
+   `addi` becomes an `addiw` (`0x7fffffff` is `lui 0x80000; addiw -1`, but
+   `0x12345678` stays `lui 0x12345; addi 0x678`). A wider value puts its low
+   12 bits in an `addi` at the end and builds the rest shifted right, then
+   shifted back with `slli`: `li a0, 0x80000000` is
+   `addi a0, zero, 1; slli a0, a0, 31`, `li sp, 0x80400000` is
+   `addi sp, zero, 513; slli sp, sp, 22`, and `0x123456789abcdef0` is `lui`,
+   `addi`, then `slli`+`addi` three times, 8 instructions.
+2. Trailing zeros (when the low 12 bits are not all zero, which rule 1
+   already shifts away): build `value >> tz`, then `slli tz`. Kept when
+   shorter, or (as rule 3 of RV32) when the shifted value fits in 6 bits:
+   `li a0, 2048` is `addi a0, zero, 1; slli a0, a0, 11` where rule 1 has
+   `lui a0, 1; addi a0, a0, -2048`, and `li a0, 0x80002b04` is
+   `lui a0, 0x20001; addi a0, a0, -0x53f; slli a0, a0, 2` where rule 1 takes
+   four instructions. One or two instructions cannot be beaten, so a
+   sequence that short stops here.
+3. Low 13 bits from 0x1001 to 0x17ff: build `value + (0x800 - low 12 bits)`,
+   whose low bits are then 0x1800, and finish with an `addi` that takes it
+   back.
+4. A positive value: build it shifted all the way left, with ones or zeros
+   shifted in, and finish with `srli` by the leading zeros
+   (`li_leading_zeros`). `0xffffffff` is `addi -1; srli 32`, zero-extended,
+   where RV32 reads the same number as the word -1 (`addi -1`).
+5. A negative value: build its complement as in 4, then `xori -1` (`not`).
+
+On RV32 the same code runs on the sign-extended word, and every value stops
+at step 2 with the four rules above. `li a0, 0x80000000` is the one line of
+`tests/golden/encode.s` whose words differ between the widths (`lui 0x80000`
+on RV32).
 
 ### Relocation modifiers
 
@@ -141,7 +235,8 @@ sequence as LLVM, which the golden file comes from:
 | `%pcrel_lo(label)` | I-type immediates / stores; `label` is on the `auipc` | `R_RISCV_PCREL_LO12_I` / `_S` |
 | a label | branches, `jal`, `j`, `la`, `call`, ... | `R_RISCV_BRANCH`, `R_RISCV_JAL`, ... |
 
-`%hi`/`%lo` of a plain number are computed on the spot. A modifier anywhere
+`%hi`/`%lo` of a plain number are computed on the spot (`hi_lo64()`, with the
+range of each width given above). A modifier anywhere
 else (on a branch, a shift amount, `%hi` in an `addi`, `%pcrel_hi` in a `lui`)
 and a label where only a number fits (`li a0, sym`) are errors.
 
@@ -161,17 +256,33 @@ and encodings as LLVM:
 .insn value                                  .insn 4, value
 ```
 
-`.insn j` is not supported: LLVM 21 packs its numeric offset without the
-J-type scrambling, and matching that would be matching a bug.
+`.insn j` is not supported: LLVM (21, and still 23) packs its numeric offset
+without the J-type scrambling (`.insn j 0x6f, a0, 2048` gives `0040056f`,
+`jal a0, 0x4`), and matching that would be matching a bug.
 
 ## Errors
 
 Everything is range checked and reported on the instruction's line:
-immediates (`immediate 2048 out of range (-2048..=2047)`), shift amounts,
-even branch/jump offsets, CSR numbers and 5-bit CSR immediates, `.insn`
-fields, operand kinds (`expected a register, found an immediate`), operand
-counts (`usage: add rd, rs1, rs2`) and unknown mnemonics
-(`unknown instruction 'mulw'`). The CLI prints `file:line: error: message`.
+immediates (`immediate 2048 out of range (-2048..=2047)`), shift amounts
+(`shift amount 64 out of range (0..=63)` on RV64, `(0..=31)` on RV32 and for
+the W shifts), even branch/jump offsets, CSR numbers and 5-bit CSR
+immediates, `.insn` fields, operand kinds (`expected a register, found an
+immediate`), operand counts (`usage: add rd, rs1, rs2`) and unknown mnemonics
+(`unknown instruction 'frob'`; on RV32 also every RV64-only one,
+`unknown instruction 'mulw'`). The width adds two of its own on RV64:
+`'rdcycleh' exists only on RV32 (on RV64, rdcycle reads all 64 bits)` and
+`CSR 'cycleh' exists only on RV32`. The CLI prints
+`file:line: error: message`; a `-march` it does not take is
+`merlin-as: unsupported -march 'rv64gc' (merlin-as takes rv32ima_zicsr_zifencei or rv64ima_zicsr_zifencei)`,
+with exit status 2.
+
+Data directives (`asm.rs`, not the encoder) check their numbers too: N-byte
+data takes [-2^(8N-1), 2^(8N) - 1], as LLVM does, else
+`data value 256 does not fit in 1 byte`; a `.dword` takes any 64-bit value;
+a symbol fits only `.word` (`R_RISCV_32`) and `.dword` (`R_RISCV_64`),
+whatever the width (`only .word and .dword can hold a symbol address`).
+Expressions are 64-bit and wrap around, and `>>` is logical, as in LLVM:
+`-16 >> 2` is `0x3ffffffffffffffc`.
 
 ## After the last line: resolving local labels
 
@@ -179,12 +290,13 @@ Like clang with `-mno-relax`, `asm.rs` resolves pc-relative references to
 labels that are local (not `.globl`) and defined in the same section as the
 instruction, once the whole file is read: the distance can't change at link
 time. That covers branches, `jal`/`j`, `call`/`tail` (both words of the pair)
-and `auipc` + `%pcrel_lo` pairs (`la`, `lw rd, sym`, `sw rs, sym, rt`, explicit
+and `auipc` + `%pcrel_lo` pairs (`la`, `lw rd, sym`, `sw rs, sym, rt`, on
+RV64 `ld`/`lwu rd, sym` and `sd rs, sym, rt`, explicit
 `%pcrel_hi`/`%pcrel_lo`, whose low half gets the low 12 bits of its own
 auipc's distance). The immediate is patched with the same `x_imm` functions
 and no relocation is written; an out-of-range branch or jump is an error on
 its line. Everything else stays a relocation: global or undefined symbols, labels in other sections, and absolute references (`%hi`, `%lo`,
-`.word sym`).
+`.word sym`, `.dword sym`).
 
 `.`, the location counter, is the address of the instruction (its first
 word) or data word it appears in: each use becomes a hidden `.Ldot$N` label
@@ -192,13 +304,17 @@ there, so `j .` and `beq a0, a1, .-8` are resolved like any local label.
 
 `.L` labels (numeric labels like `1:`, the hidden `.Lpcrel_hiN` and `.Ldot$N`) go into
 the symbol table only when a relocation still uses them, and the object
-carries the same `.riscv.attributes` as clang's
-(`rv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0`), so llvm-objdump decodes the M
-instructions without extra flags.
+carries the same `.riscv.attributes` as clang's for its `-march`
+(`rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0`, and
+`rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0` on
+RV64: `elf::arch(xlen)`), so llvm-objdump decodes the M and A instructions
+without extra flags. An RV32 object is ELF32 and an RV64 one ELF64, from one
+writer (`src/elf.rs`, whose module docs show what the class changes).
 
 For every source in `examples/` (clang assembling it with
 `-include examples/xcal.inc`), `llvm-objdump -dr` prints exactly the same text
-for our object as for clang's. The differences
+for our object as for clang's (on RV32; the examples come to RV64 in #151).
+The differences
 that remain on other input (spec section 10):
 
 - clang rewrites a branch it can't resolve or reach (to a global, an
@@ -213,6 +329,15 @@ that remain on other input (spec section 10):
   `%hi(sym)` in `.insn u`, named `.insn` opcodes (`.insn r OP, ...`),
   upper-case CSR names and CSRs Excalibur doesn't have (`fflags`). And
   `call`/`tail` take `sym+offset` or `.`, where clang wants a bare symbol.
+- An immediate in a register operation (`add a0, a1, 5`, on RV64
+  `addw a0, a1, 5` and `sllw a0, a1, 3`), which LLVM assembles as the
+  immediate form, is an error: write `addi`, `addiw`, `slliw`.
+- `li rd, %lo(sym)` is an error (LLVM: `addi rd, zero, %lo(sym)`), and
+  `li rd, %hi(c)` of a constant is accepted, where LLVM refuses it.
+- On RV32, `%hi`/`%lo` of a constant must be a word; LLVM folds any 64-bit
+  value, as merlin-as does on RV64.
+- No `sext.b`, `sext.h` or `zext.h`.
+- `.option` and `.attribute` are ignored: only `-march` sets the width.
 
 ## Tests
 
@@ -220,22 +345,48 @@ that remain on other input (spec section 10):
 cargo test -p merlin-as
 ```
 
-- `encode_golden`: 166 lines assembled by LLVM (`tests/golden/encode.s` →
-  `encode.golden`: RV32I, M, A with every ordering suffix, CSRs,
-  pseudo-instructions, relocations). Words and relocations must be identical.
+The tests cover both widths; the RV64 references live in `rv64/`
+subdirectories, out of the corpus that Camelot's `/bin/as`, which is RV32,
+assembles in `crates/xtask/tests/selfhost.rs`.
+
+- `encode_golden`: lines assembled by LLVM, words and relocations identical.
+  RV32: 168 lines (`tests/golden/encode.s` → `encode.golden`: RV32I, M, A
+  with every ordering suffix, CSRs, pseudo-instructions, relocations). RV64:
+  299 lines (`golden/rv64/encode.golden`): `encode.s` again, assembled for
+  RV64, where only `li a0, 0x80000000` differs (the test checks that), then
+  `golden/rv64/encode.s`: the W operations, `ld`/`lwu`/`sd` and their
+  pc-relative forms, 6-bit shifts, the `.d` atomics with every ordering,
+  `sext.w`/`negw`/`zext.w` and `li` edge cases. And `li` against LLVM's
+  choice for 425 RV32 values (`golden/li.golden`) and 2246 RV64 values
+  (`golden/rv64/li.golden`, which reach every length from 1 to 8): the words,
+  and `li_steps`'s length.
 - `encode_roundtrip`: `excalibur::decode` of our words gives back the
   operation and operands of a hand-written table (Xcal, CSRs by name, `li`
-  splits, explicit `%pcrel` pairs, and the relocation on each word), and of
-  every A mnemonic with every suffix;
+  splits, explicit `%pcrel` pairs, and the relocation on each word; RV64's
+  own rows, and the RV32 rows whose meaning depends on the width left out),
+  and of every A mnemonic with every suffix (`.w`, and `.d` on RV64);
   every LLVM word, disassembled by `excalibur`, assembles back to itself;
   and so does every decodable word of a 400 000-word pseudo-random sample.
 - `encode_errors`: bad lines are rejected on their own line, with the
-  wording checked for unknown mnemonics and out-of-range local branches.
+  wording checked for unknown mnemonics and out-of-range local branches; on
+  RV64, shift and immediate ranges, the RV32-only counters and CSRs; every
+  RV64-only mnemonic is `unknown instruction` on RV32; and the CLI's
+  `-march`.
 - `encode_hello`: hello.S against clang's object (`tests/golden/hello.ref`,
   `tests/golden/hello.dr.txt`), word for word and as `llvm-objdump -dr` text
-  (printed by merlin-objdump).
-- Unit tests in `encode.rs` (packers against the decoder, `hi_lo`, `li`),
-  `asm.rs` (local resolution, against words from clang) and `elf.rs`.
+  (printed by merlin-objdump). On RV64 word for word (`golden/rv64/hello.ref`);
+  `golden/rv64/hello.dr.txt` waits for merlin-objdump to read ELF64 (#150).
+- `elf64`: an RV64 object read back with the `elf` crate against what clang
+  writes for the same source (`--target=riscv64 -march=rv64ima_zicsr_zifencei
+  -mabi=lp64 -mno-relax`): header, sections, symbols, relocations and line
+  table.
+- `debug_line`: every `.debug_*` section and its relocations against clang's
+  objects, `tests/debug_line/*.o` and, for RV64, `tests/debug_line/rv64/*.o`
+  (`rv64/merlin.s` is the RV64 version of the compiler output `merlin.s`).
+- Unit tests in `encode.rs` (packers against the decoder, `hi_lo`, `li` and
+  `li_steps` on both widths, the RV64 instructions decoded back), `asm.rs`
+  (local resolution, against words from clang; data of every size), `elf.rs`
+  and `dwarf.rs` (the attributes and line tables of both widths).
 
 Elsewhere: `crates/xtask/tests/examples.rs` builds every example with
 merlin-as and merlin-ld, runs it in Grail and compares `hello` and
@@ -251,11 +402,22 @@ assembled by merlin-as.
 
 ### Regenerating the references
 
-- `tests/golden/encode.golden`: add lines to `encode.s` and run
-  `scripts/gen-encode-golden.sh` (clang, llvm-objcopy, llvm-readobj, bash).
-  clang relaxes a conditional branch to a symbol, and LLVM 21 has no option to
-  stop it, so the script keeps those lines from the existing file (llvm-mc 18
-  with `-riscv-asm-relax-branches=0` made them).
-- `tests/golden/hello.ref` and `hello.dr.txt`: `scripts/gen-hello-ref.sh`
-  (clang and llvm-objdump 21). Rerun when `examples/hello/hello.S` changes.
-- `tests/golden/hello.elf`: `cargo xtask hello` (merlin-as and ld.lld).
+The scripts need LLVM (clang, llvm-mc, llvm-objcopy, llvm-readobj,
+llvm-objdump; LLVM 23 made the committed files) and bash (Git Bash on
+Windows); their output is committed, so `cargo test` needs none of it.
+
+- `tests/golden/encode.golden` and `golden/rv64/encode.golden`: add lines to
+  `encode.s` (both widths) or `golden/rv64/encode.s` (RV64 only) and run
+  `scripts/gen-encode-golden.sh` (both; `rv32` or `rv64` for one). clang
+  relaxes a conditional branch to a symbol even with `-mno-relax`, and LLVM
+  has no option to stop it, so for those lines the script takes the word and
+  the fixup from `llvm-mc -show-encoding`, which prints them as written.
+- `tests/golden/li.golden` and `golden/rv64/li.golden`:
+  `scripts/gen-li-golden.sh`, whose list of values is fixed (powers of two
+  and their neighbours, masks, and a deterministic pseudo-random sample).
+- `tests/golden/hello.ref` and `hello.dr.txt`, and their RV64 twins in
+  `golden/rv64/`: `scripts/gen-hello-ref.sh`. Rerun when
+  `examples/hello/hello.S` changes.
+- `tests/debug_line/*.o` and `tests/debug_line/rv64/*.o`:
+  `scripts/gen-debug-line-golden.sh`.
+- `tests/golden/hello.elf`: `cargo xtask hello` (merlin-as and ld.lld, RV32).

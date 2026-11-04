@@ -1,0 +1,299 @@
+lui a0, 0x12345 | 12345537 | 
+lui t0, 0xfffff | fffff2b7 | 
+auipc sp, 1 | 00001117 | 
+jal ra, 2048 | 001000ef | 
+jal zero, -4 | ffdff06f | 
+jalr ra, 0(t0) | 000280e7 | 
+jalr zero, -2048(a5) | 80078067 | 
+jalr s1, 2047(s2) | 7ff904e7 | 
+beq a0, a1, 8 | 00b50463 | 
+bne t0, t1, -8 | fe629ce3 | 
+blt s0, s1, 4094 | 7e944fe3 | 
+bge a2, a3, -4096 | 80d65063 | 
+bltu a4, a5, 16 | 00f76863 | 
+bgeu t3, t4, -16 | ffde78e3 | 
+lb a0, 0(a1) | 00058503 | 
+lh a0, -1(sp) | fff11503 | 
+lw ra, 2047(sp) | 7ff12083 | 
+lbu t0, -2048(t1) | 80034283 | 
+lhu s2, 12(s3) | 00c9d903 | 
+sb a0, 0(a1) | 00a58023 | 
+sh t5, -2(t6) | ffef9f23 | 
+sw ra, 2044(sp) | 7e112e23 | 
+addi a0, a1, -1 | fff58513 | 
+addi sp, sp, -2048 | 80010113 | 
+slti t0, t1, 5 | 00532293 | 
+sltiu t0, t1, -1 | fff33293 | 
+xori a0, a0, 0x7ff | 7ff54513 | 
+ori a0, a0, -2048 | 80056513 | 
+andi a0, a0, 255 | 0ff57513 | 
+slli a0, a0, 31 | 01f51513 | 
+srli a0, a0, 1 | 00155513 | 
+srai a0, a0, 17 | 41155513 | 
+add a0, a1, a2 | 00c58533 | 
+sub a0, a1, a2 | 40c58533 | 
+sll s0, s1, s2 | 01249433 | 
+slt t0, t1, t2 | 007322b3 | 
+sltu t3, t4, t5 | 01eebe33 | 
+xor a0, a0, a0 | 00a54533 | 
+srl a1, a2, a3 | 00d655b3 | 
+sra a1, a2, a3 | 40d655b3 | 
+or zero, ra, sp | 0020e033 | 
+and x31, x30, x29 | 01df7fb3 | 
+mul a0, a1, a2 | 02c58533 | 
+mulh a0, a1, a2 | 02c59533 | 
+mulhsu a0, a1, a2 | 02c5a533 | 
+mulhu a0, a1, a2 | 02c5b533 | 
+div a0, a1, a2 | 02c5c533 | 
+divu a0, a1, a2 | 02c5d533 | 
+rem a0, a1, a2 | 02c5e533 | 
+remu a0, a1, a2 | 02c5f533 | 
+lr.w a0, (a1) | 1005a52f | 
+lr.w.aq t0, (s1) | 1404a2af | 
+lr.w.rl s1, (t6) | 120fa4af | 
+lr.w.aqrl a5, (sp) | 160127af | 
+sc.w a0, a1, (a2) | 18b6252f | 
+sc.w.aq t0, t1, (t2) | 1c63a2af | 
+sc.w.rl s1, s2, (s3) | 1b29a4af | 
+sc.w.aqrl a5, a6, (a7) | 1f08a7af | 
+amoswap.w a0, a1, (a2) | 08b6252f | 
+amoswap.w.aq t3, t4, (t5) | 0ddf2e2f | 
+amoswap.w.rl ra, sp, (gp) | 0a21a0af | 
+amoswap.w.aqrl s10, s11, (tp) | 0fb22d2f | 
+amoadd.w a0, a1, (a2) | 00b6252f | 
+amoadd.w.aq a3, a4, (a5) | 04e7a6af | 
+amoadd.w.rl t0, t1, (t2) | 0263a2af | 
+amoadd.w.aqrl s0, s1, (s2) | 0699242f | 
+amoxor.w a0, a1, (a2) | 20b6252f | 
+amoxor.w.aq s3, s4, (s5) | 254aa9af | 
+amoxor.w.rl s6, s7, (s8) | 237c2b2f | 
+amoxor.w.aqrl s9, t3, (t6) | 27cfacaf | 
+amoand.w a0, a1, (a2) | 60b6252f | 
+amoand.w.aq a6, a7, (ra) | 6510a82f | 
+amoand.w.rl t0, a0, (sp) | 62a122af | 
+amoand.w.aqrl t1, a1, (gp) | 66b1a32f | 
+amoor.w a0, a1, (a2) | 40b6252f | 
+amoor.w.aq t2, a2, (tp) | 44c223af | 
+amoor.w.rl s0, a3, (t0) | 42d2a42f | 
+amoor.w.aqrl s1, a4, (t1) | 46e324af | 
+amomin.w a0, a1, (a2) | 80b6252f | 
+amomin.w.aq a5, s2, (t2) | 8523a7af | 
+amomin.w.rl a6, s3, (s0) | 8334282f | 
+amomin.w.aqrl a7, s4, (s1) | 8744a8af | 
+amomax.w a0, a1, (a2) | a0b6252f | 
+amomax.w.aq s5, t3, (a0) | a5c52aaf | 
+amomax.w.rl s6, t4, (a1) | a3d5ab2f | 
+amomax.w.aqrl s7, t5, (a2) | a7e62baf | 
+amominu.w a0, a1, (a2) | c0b6252f | 
+amominu.w.aq s8, t6, (a3) | c5f6ac2f | 
+amominu.w.rl s9, ra, (a4) | c2172caf | 
+amominu.w.aqrl s10, sp, (a5) | c627ad2f | 
+amomaxu.w a0, a1, (a2) | e0b6252f | 
+amomaxu.w.aq s11, gp, (a6) | e4382daf | 
+amomaxu.w.rl t3, tp, (a7) | e248ae2f | 
+amomaxu.w.aqrl t4, t0, (s2) | e6592eaf | 
+lr.w zero, 0(x31) | 100fa02f | 
+sc.w x0, x31, 0(a0) | 19f5202f | 
+amoadd.w zero, a1, 0(a2) | 00b6202f | 
+amoswap.w.aqrl x31, x0, (x0) | 0e002faf | 
+fence | 0ff0000f | 
+fence.i | 0000100f | 
+ecall | 00000073 | 
+ebreak | 00100073 | 
+mret | 30200073 | 
+sret | 10200073 | 
+wfi | 10500073 | 
+sfence.vma | 12000073 | 
+sfence.vma a0, a1 | 12b50073 | 
+csrrw a0, mstatus, a1 | 30059573 | 
+csrrs t0, mepc, zero | 341022f3 | 
+csrrc a0, 0x7c0, a1 | 7c05b573 | 
+csrrwi zero, mtvec, 5 | 3052d073 | 
+csrrsi a0, sie, 31 | 104fe573 | 
+csrrci a0, mie, 1 | 3040f573 | 
+csrr a0, mcause | 34202573 | 
+csrw mscratch, sp | 34011073 | 
+csrs mie, t0 | 3042a073 | 
+csrc mstatus, t1 | 30033073 | 
+csrwi mstatus, 8 | 30045073 | 
+csrsi sstatus, 2 | 10016073 | 
+csrci sstatus, 2 | 10017073 | 
+nop | 00000013 | 
+li a0, 0 | 00000513 | 
+li a0, 2047 | 7ff00513 | 
+li a0, -2048 | 80000513 | 
+li a0, 2048 | 00100513 00b51513 | 
+li a0, 0x12345678 | 12345537 67850513 | 
+li a0, 0x80000000 | 00100513 01f51513 | 
+li a0, -1 | fff00513 | 
+li t0, 0x10000000 | 100002b7 | 
+mv a0, a1 | 00058513 | 
+not a0, a1 | fff5c513 | 
+neg a0, a1 | 40b00533 | 
+seqz a0, a1 | 0015b513 | 
+snez a0, a1 | 00b03533 | 
+sltz a0, a1 | 0005a533 | 
+sgtz a0, a1 | 00b02533 | 
+sgt a0, a1, a2 | 00b62533 | 
+sgtu t0, t1, t2 | 0063b2b3 | 
+j 16 | 0100006f | 
+jr ra | 00008067 | 
+jalr t0 | 000280e7 | 
+ret | 00008067 | 
+beqz a0, 8 | 00050463 | 
+bnez a0, -8 | fe051ce3 | 
+blez a0, 4 | 00a05263 | 
+bgez a0, 4 | 00055263 | 
+bltz a0, 4 | 00054263 | 
+bgtz a0, 4 | 00a04263 | 
+bgt a0, a1, 8 | 00a5c463 | 
+ble a0, a1, 8 | 00a5d463 | 
+bgtu a0, a1, 8 | 00a5e463 | 
+bleu a0, a1, 8 | 00a5f463 | 
+beq a0, a1, target | 00b50063 | 0:R_RISCV_BRANCH:target
+bnez a0, target | 00051063 | 0:R_RISCV_BRANCH:target
+jal ra, target | 000000ef | 0:R_RISCV_JAL:target
+jal target | 000000ef | 0:R_RISCV_JAL:target
+j target | 0000006f | 0:R_RISCV_JAL:target
+call target | 00000097 000080e7 | 0:R_RISCV_CALL_PLT:target
+tail target | 00000317 00030067 | 0:R_RISCV_CALL_PLT:target
+la a0, target | 00000517 00050513 | 0:R_RISCV_PCREL_HI20:target 4:R_RISCV_PCREL_LO12_I:<auipc>
+lla a0, target | 00000517 00050513 | 0:R_RISCV_PCREL_HI20:target 4:R_RISCV_PCREL_LO12_I:<auipc>
+lui a0, %hi(target) | 00000537 | 0:R_RISCV_HI20:target
+addi a0, a0, %lo(target) | 00050513 | 0:R_RISCV_LO12_I:target
+lw a0, %lo(target)(a0) | 00052503 | 0:R_RISCV_LO12_I:target
+sw a1, %lo(target)(a0) | 00b52023 | 0:R_RISCV_LO12_S:target
+lui a0, %hi(target+16) | 00000537 | 0:R_RISCV_HI20:target+10
+lw a0, target | 00000517 00052503 | 0:R_RISCV_PCREL_HI20:target 4:R_RISCV_PCREL_LO12_I:<auipc>
+sw a0, target, t0 | 00000297 00a2a023 | 0:R_RISCV_PCREL_HI20:target 4:R_RISCV_PCREL_LO12_S:<auipc>
+addiw a0, a1, -1 | fff5851b | 
+addiw a0, a1, 2047 | 7ff5851b | 
+addiw sp, sp, -2048 | 8001011b | 
+slliw a0, a1, 31 | 01f5951b | 
+slliw a0, a1, 0 | 0005951b | 
+srliw a0, a1, 1 | 0015d51b | 
+srliw t0, t1, 31 | 01f3529b | 
+sraiw a0, a1, 17 | 4115d51b | 
+sraiw a0, a1, 31 | 41f5d51b | 
+addw a0, a1, a2 | 00c5853b | 
+subw a0, a1, a2 | 40c5853b | 
+sllw s0, s1, s2 | 0124943b | 
+srlw a1, a2, a3 | 00d655bb | 
+sraw a1, a2, a3 | 40d655bb | 
+addw x31, x30, x29 | 01df0fbb | 
+mulw a0, a1, a2 | 02c5853b | 
+divw a0, a1, a2 | 02c5c53b | 
+divuw a0, a1, a2 | 02c5d53b | 
+remw a0, a1, a2 | 02c5e53b | 
+remuw a0, a1, a2 | 02c5f53b | 
+ld a0, -8(sp) | ff813503 | 
+ld ra, 2047(sp) | 7ff13083 | 
+ld t0, -2048(t1) | 80033283 | 
+lwu a1, 4(a0) | 00456583 | 
+lwu s2, 2047(s3) | 7ff9e903 | 
+sd ra, 2040(sp) | 7e113c23 | 
+sd s0, -2048(a5) | 8087b023 | 
+sd zero, 0(a0) | 00053023 | 
+slli a0, a0, 32 | 02051513 | 
+slli a0, a0, 63 | 03f51513 | 
+srli a0, a0, 32 | 02055513 | 
+srli a0, a0, 63 | 03f55513 | 
+srai a0, a0, 32 | 42055513 | 
+srai a0, a0, 63 | 43f55513 | 
+srai t0, t1, 33 | 42135293 | 
+lr.d a0, (a1) | 1005b52f | 
+lr.d.aq t0, (s1) | 1404b2af | 
+lr.d.rl s1, (t6) | 120fb4af | 
+lr.d.aqrl a5, (sp) | 160137af | 
+sc.d a0, a1, (a2) | 18b6352f | 
+sc.d.aq t0, t1, (t2) | 1c63b2af | 
+sc.d.rl s1, s2, (s3) | 1b29b4af | 
+sc.d.aqrl a5, a6, (a7) | 1f08b7af | 
+amoswap.d a0, a1, (a2) | 08b6352f | 
+amoswap.d.aq t3, t4, (t5) | 0ddf3e2f | 
+amoswap.d.rl ra, sp, (gp) | 0a21b0af | 
+amoswap.d.aqrl s10, s11, (tp) | 0fb23d2f | 
+amoadd.d a0, a1, (a2) | 00b6352f | 
+amoadd.d.aq a3, a4, (a5) | 04e7b6af | 
+amoadd.d.rl t0, t1, (t2) | 0263b2af | 
+amoadd.d.aqrl s0, s1, (s2) | 0699342f | 
+amoxor.d a0, a1, (a2) | 20b6352f | 
+amoxor.d.aq s3, s4, (s5) | 254ab9af | 
+amoxor.d.rl s6, s7, (s8) | 237c3b2f | 
+amoxor.d.aqrl s9, t3, (t6) | 27cfbcaf | 
+amoand.d a0, a1, (a2) | 60b6352f | 
+amoand.d.aq a6, a7, (ra) | 6510b82f | 
+amoand.d.rl t0, a0, (sp) | 62a132af | 
+amoand.d.aqrl t1, a1, (gp) | 66b1b32f | 
+amoor.d a0, a1, (a2) | 40b6352f | 
+amoor.d.aq t2, a2, (tp) | 44c233af | 
+amoor.d.rl s0, a3, (t0) | 42d2b42f | 
+amoor.d.aqrl s1, a4, (t1) | 46e334af | 
+amomin.d a0, a1, (a2) | 80b6352f | 
+amomin.d.aq a5, s2, (t2) | 8523b7af | 
+amomin.d.rl a6, s3, (s0) | 8334382f | 
+amomin.d.aqrl a7, s4, (s1) | 8744b8af | 
+amomax.d a0, a1, (a2) | a0b6352f | 
+amomax.d.aq s5, t3, (a0) | a5c53aaf | 
+amomax.d.rl s6, t4, (a1) | a3d5bb2f | 
+amomax.d.aqrl s7, t5, (a2) | a7e63baf | 
+amominu.d a0, a1, (a2) | c0b6352f | 
+amominu.d.aq s8, t6, (a3) | c5f6bc2f | 
+amominu.d.rl s9, ra, (a4) | c2173caf | 
+amominu.d.aqrl s10, sp, (a5) | c627bd2f | 
+amomaxu.d a0, a1, (a2) | e0b6352f | 
+amomaxu.d.aq s11, gp, (a6) | e4383daf | 
+amomaxu.d.rl t3, tp, (a7) | e248be2f | 
+amomaxu.d.aqrl t4, t0, (s2) | e6593eaf | 
+lr.d zero, 0(x31) | 100fb02f | 
+sc.d x0, x31, 0(a0) | 19f5302f | 
+amoadd.d zero, a1, 0(a2) | 00b6302f | 
+amoswap.d.aqrl x31, x0, (x0) | 0e003faf | 
+sext.w a0, a1 | 0005851b | 
+sext.w t0, t0 | 0002829b | 
+negw a0, a1 | 40b0053b | 
+zext.w a0, a1 | 02059513 02055513 | 
+zext.w s0, t6 | 020f9413 02045413 | 
+li a0, 0x7fffffff | 80000537 fff5051b | 
+li a0, 0x7ffff800 | 80000537 8005051b | 
+li a0, 0x7ffff7ff | 7ffff537 7ff50513 | 
+li a0, 0xffffffff | fff00513 02055513 | 
+li sp, 0x80400000 | 20100113 01611113 | 
+li a0, -0x80000000 | 80000537 | 
+li a0, -0x80000001 | 80000537 fff50513 | 
+li a0, 0x80000800 | 00100537 00150513 00b51513 | 
+li a0, 0xfffff800 | 00100513 02051513 80050513 | 
+li a0, 0xffff0000 | 0ffff537 00451513 | 
+li a0, 0xdeadbeef | 37ab7537 00251513 eef50513 | 
+li a0, 0x80002b04 | 20001537 ac150513 00251513 | 
+li a0, 0x100000000 | 00100513 02051513 | 
+li a0, 0x100000001 | 00100513 02051513 00150513 | 
+li a0, 0x1fffff000 | 00200537 fff50513 00c51513 | 
+li a0, 0x7fffffffffffffff | fff00513 00155513 | 
+li a0, 0x8000000000000000 | fff00513 03f51513 | 
+li a0, 0xfffffffffffff800 | 80000513 | 
+li a0, 0x00ffffffffffffff | fff00513 00855513 | 
+li a0, 0x8000000000000fff | ffffe537 00155513 fff54513 | 
+li a0, 0xffff000000000fff | f0000537 01055513 fff54513 | 
+li a0, 0xffffffff00000000 | fff00513 02051513 | 
+li a0, 0x7fffffff00000000 | 80000537 fff5051b 02051513 | 
+li a0, 0x00000ffffffff000 | fff00513 02051513 01455513 | 
+li a0, 0x00000000ffff0fff | f0fff537 01451513 02055513 | 
+li a0, 0xffffffff00000fff | fff00537 00150513 00c51513 fff50513 | 
+li a0, 0x1000000017ff | 00100513 02051513 00150513 00c51513 7ff50513 | 
+li a0, 0x905acf7102b | 482d6537 7b950513 00d51513 80050513 82b50513 | 
+li a0, 0x12345678abcd | 00092537 a2b50513 00d51513 78b50513 00c51513 bcd50513 | 
+li a0, 0x1234567800000000 | 02469537 acf50513 02351513 | 
+li a0, 0x123456789abcdef0 | 00247537 8ad50513 00e51513 c4d50513 00c51513 5e750513 00d51513 ef050513 | 
+li a0, 0xfedcba9876543210 | fdb97537 53150513 00d51513 d9550513 00e51513 32150513 00451513 | 
+li a0, 0x5555555555555555 | 05555537 55550513 00c51513 55550513 00c51513 55550513 00c51513 55550513 | 
+li a0, 0xaaaaaaaaaaaaaaaa | faaab537 aab50513 00c51513 aab50513 00c51513 aab50513 00c51513 aaa50513 | 
+li a0, 0x7fffffff + 1 | 00100513 01f51513 | 
+li a0, 1 << 63 | fff00513 03f51513 | 
+ld a0, target | 00000517 00053503 | 0:R_RISCV_PCREL_HI20:target 4:R_RISCV_PCREL_LO12_I:<auipc>
+lwu a0, target | 00000517 00056503 | 0:R_RISCV_PCREL_HI20:target 4:R_RISCV_PCREL_LO12_I:<auipc>
+sd a0, target, t0 | 00000297 00a2b023 | 0:R_RISCV_PCREL_HI20:target 4:R_RISCV_PCREL_LO12_S:<auipc>
+ld a0, %lo(target)(a0) | 00053503 | 0:R_RISCV_LO12_I:target
+lwu a0, %lo(target)(a0) | 00056503 | 0:R_RISCV_LO12_I:target
+sd a1, %lo(target)(a0) | 00b53023 | 0:R_RISCV_LO12_S:target
+addiw a0, a0, %lo(target) | 0005051b | 0:R_RISCV_LO12_I:target

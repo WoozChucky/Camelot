@@ -385,6 +385,55 @@ static int dir_args(struct stmt *s) {
     }
 }
 
+/* Makes `a` the string of the n bytes at p. */
+static void str_arg(struct dirarg *a, const char *p, uint n) {
+    a->kind = DA_STR;
+    a->str = (uchar *)p;
+    a->len = n;
+}
+
+/* The arguments of `.section name, "flags", @type, entsize`, read as
+ * dir_args reads them, except the type, the third: LLVM takes it as
+ * `@progbits`, `%progbits` or `"progbits"` (a name or a number), and
+ * whichever it is, it becomes the string `progbits` for the assembler.
+ * `%progbits` alone would not parse as an expression. */
+static int section_args(struct stmt *s) {
+    if (peek()->kind == T_NEWLINE) {
+        return 0;
+    }
+    uint cap = 0;
+    for (;;) {
+        struct dirarg *a = new_arg(s, &cap);
+        struct token *t = peek();
+        struct token *next = peek_at(1);
+        if (s->nargs == 3 && t->kind == T_IDENT && t->text[0] == '@') {
+            pos++;
+            str_arg(a, t->text + 1, (uint)strlen(t->text) - 1);
+        } else if (s->nargs == 3 && is_punct(t, '%') && next->kind == T_IDENT) {
+            pos += 2;
+            str_arg(a, next->text, (uint)strlen(next->text));
+        } else if (s->nargs == 3 && is_punct(t, '%') && next->kind == T_INT) {
+            /* The number in decimal, as the type name's digits. */
+            pos += 2;
+            const char *d = i64_dec(next->num);
+            str_arg(a, tmp_strndup(d, (uint)strlen(d)), (uint)strlen(d));
+        } else if (t->kind == T_STR) {
+            pos++;
+            str_arg(a, t->text, t->len);
+        } else {
+            a->kind = DA_EXPR;
+            a->e = expr();
+            if (a->e == NULL) {
+                return -1;
+            }
+        }
+        if (!is_punct(peek(), ',')) {
+            return 0;
+        }
+        pos++;
+    }
+}
+
 /* The arguments of `.file` and `.loc`, separated by spaces (or commas). */
 static int spaced_args(struct stmt *s) {
     uint cap = 0;
@@ -488,7 +537,14 @@ int parse_statement(struct token *t, int n, struct stmt **out) {
     } else if (head->kind == T_IDENT && head->text[0] == '.') {
         s->kind = S_DIRECTIVE;
         s->name = head->text;
-        int r = strcmp(head->text, ".file") == 0 || strcmp(head->text, ".loc") == 0 ? spaced_args(s) : dir_args(s);
+        int r;
+        if (strcmp(head->text, ".file") == 0 || strcmp(head->text, ".loc") == 0) {
+            r = spaced_args(s);
+        } else if (strcmp(head->text, ".section") == 0) {
+            r = section_args(s);
+        } else {
+            r = dir_args(s);
+        }
         if (r < 0) {
             return -1;
         }

@@ -22,7 +22,8 @@
 //! written. An out-of-range result is an error on the instruction's line.
 //! Everything else stays a relocation for the linker: references to global or
 //! undefined symbols or to labels in other sections, and absolute ones
-//! (`%hi`, `%lo`, `.word sym`), which depend on where the section is loaded.
+//! (`%hi`, `%lo`, `.word sym`, `.dword sym`), which depend on where the
+//! section is loaded.
 //!
 //! Unlike clang, merlin-as never rewrites a branch it cannot resolve (to a
 //! global, or out of range) into an inverted branch over a `jal`: the branch
@@ -32,41 +33,57 @@
 //! hidden `.Lpcrel_hi` labels on `auipc`s) only go into the symbol table when
 //! a relocation still refers to them.
 //!
+//! Sections get the ELF type, flags and entry size LLVM gives them, from
+//! their names and `.section` ([`crate::section`]); the flags decide what a
+//! section holds (`NOBITS`: zeros only) and how `.align` pads it (`nop`s in
+//! code).
+//!
 //! Debug information: `.debug_*` sections are not loaded (no `SHF_ALLOC`) and
-//! hold data only. A `.word` there that names a `.L` label becomes a
-//! relocation against the label's section symbol, plus the label's offset, so
-//! that compiler-made labels (`.Lfunc_begin0`) stay out of the symbol table and
-//! out of the linked program's. `.file` and `.loc` become the `.debug_line`
-//! line table ([`crate::dwarf`]).
+//! hold data only. A `.word` or `.dword` there that names a `.L` label (the
+//! 8-byte addresses of RV64's DWARF) becomes a relocation against the label's
+//! section symbol, plus the label's offset, so that compiler-made labels
+//! (`.Lfunc_begin0`) stay out of the symbol table and out of the linked
+//! program's. `.file` and `.loc` become the `.debug_line` line table
+//! ([`crate::dwarf`]).
 
 use crate::ast::*;
 use crate::reloc::{Emit, RelocKind, Target};
+use crate::section::{self, Attrs, SHF_EXECINSTR, SHT_NOBITS};
 use crate::{dwarf, encode, Error};
+use excalibur::Xlen;
 use std::collections::{HashMap, HashSet};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SectionKind {
-    /// Code: allocated + executable.
-    Text,
-    /// Writable data.
-    Data,
-    /// Read-only data.
-    Rodata,
-    /// Zero-initialised, no file contents.
-    Bss,
-    /// Debug information (`.debug_*`): data that is not loaded.
-    Debug,
-}
 
 #[derive(Debug)]
 pub struct Section {
     pub name: String,
-    pub kind: SectionKind,
-    /// Contents. For `.bss` this stays empty and `size` grows instead.
+    /// Its ELF type, flags and entry size, as LLVM decides them from the
+    /// name and `.section` ([`crate::section`]).
+    pub attrs: Attrs,
+    /// Contents. For a `NOBITS` section (`.bss`) this stays empty and `size`
+    /// grows instead.
     pub data: Vec<u8>,
     pub size: u32,
     pub align: u32,
     pub relocs: Vec<Reloc>,
+}
+
+impl Section {
+    /// `SHT_NOBITS`: room that takes no bytes in the file, zeros only.
+    pub fn is_nobits(&self) -> bool {
+        self.attrs.ty == SHT_NOBITS
+    }
+
+    /// `SHF_EXECINSTR`: code, which `.align` pads with `nop`s.
+    pub fn is_code(&self) -> bool {
+        self.attrs.flags & SHF_EXECINSTR != 0
+    }
+
+    /// Debug information: a section named `.debug_*`, which holds data only,
+    /// and whose relocations against `.L` labels are made against section
+    /// symbols (see [`Assembler::debug_relocs_to_sections`]).
+    pub fn is_debug(&self) -> bool {
+        self.name.starts_with(".debug_")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +117,9 @@ pub struct Symbol {
     /// Set for `.equ`/`.set` constants.
     pub constant: Option<i64>,
     pub ty: SymType,
-    pub size: u32,
+    /// `st_size`, as `.size` gave it: 64 bits, which an ELF32 object cuts
+    /// to 32.
+    pub size: u64,
 }
 
 /// The assembled result, ready for [`crate::elf::write`].
@@ -108,9 +127,14 @@ pub struct Symbol {
 pub struct Object {
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
+    /// The width it was assembled for: the ELF writer makes an ELF32 object
+    /// for RV32 and an ELF64 one for RV64.
+    pub xlen: Xlen,
 }
 
 pub struct Assembler {
+    /// RV32 or RV64, for the whole file (`-march=`).
+    xlen: Xlen,
     sections: Vec<Section>,
     current: usize,
     symbols: Vec<Symbol>,
@@ -148,6 +172,13 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    /// The width being assembled for. The encoder asks it to choose between
+    /// the RV32 and RV64 forms of an instruction (shift amounts, `li`) and
+    /// to refuse the instructions of the other width.
+    pub fn xlen(&self) -> Xlen {
+        self.asm.xlen
+    }
+
     /// Evaluates an expression made only of numbers and `.equ` constants.
     /// Returns None if it mentions a label or a `%modifier`.
     pub fn constant(&self, e: &Expr) -> Option<i64> {
@@ -157,19 +188,28 @@ impl Ctx<'_> {
     /// Splits `sym`, `sym + c` or `sym - c` into a resolved symbol name and addend.
     /// Numeric label references (`1b`, `1f`) come back as their internal names.
     /// Returns None for anything else (including plain constants).
+    ///
+    /// The addend wraps around in 64 bits, as every other sum of constants
+    /// does (`eval`): with 64-bit `.equ` values, `sym + BIG + BIG` must not
+    /// overflow.
     pub fn symbol(&self, e: &Expr) -> Option<(String, i64)> {
         match e {
             Expr::Sym(name) if self.asm.eval(e).is_none() => Some((self.asm.resolve_name(name), 0)),
             // `c + sym`
             Expr::Bin(BinOp::Add, a, b) if self.asm.eval(a).is_some() => {
                 let (name, addend) = self.symbol(b)?;
-                Some((name, addend + self.asm.eval(a)?))
+                Some((name, addend.wrapping_add(self.asm.eval(a)?)))
             }
             // `sym + c`, `sym - c`
             Expr::Bin(op @ (BinOp::Add | BinOp::Sub), a, b) => {
                 let (name, addend) = self.symbol(a)?;
                 let c = self.asm.eval(b)?;
-                Some((name, if *op == BinOp::Add { addend + c } else { addend - c }))
+                let addend = if *op == BinOp::Add {
+                    addend.wrapping_add(c)
+                } else {
+                    addend.wrapping_sub(c)
+                };
+                Some((name, addend))
             }
             _ => None,
         }
@@ -188,10 +228,15 @@ impl Ctx<'_> {
     }
 
     /// A CSR operand: a name like `mstatus` or a number like `0x300`.
+    ///
+    /// Names are those of the width being assembled
+    /// ([`excalibur::csr::rv32_only`]): the high halves of 64-bit registers
+    /// (`cycleh`, `mstatush`, ...) and the odd `pmpcfg`s exist only on RV32,
+    /// where a CSR holds 32 bits, so on RV64 they are no CSR name. A number is
+    /// any 12-bit address on either width, as LLVM takes it.
     pub fn csr(&self, e: &Expr) -> Option<u16> {
         if let Expr::Sym(name) = e {
-            // merlin-as assembles RV32 until #148.
-            if let Some(addr) = excalibur::csr::parse(name, excalibur::Xlen::Rv32) {
+            if let Some(addr) = excalibur::csr::parse(name, self.asm.xlen) {
                 return Some(addr);
             }
         }
@@ -201,8 +246,10 @@ impl Ctx<'_> {
 }
 
 impl Assembler {
-    pub fn new() -> Self {
+    /// An assembler for `xlen` (RV32 or RV64) with an empty `.text` section.
+    pub fn new(xlen: Xlen) -> Self {
         let mut a = Assembler {
+            xlen,
             sections: Vec::new(),
             current: 0,
             symbols: Vec::new(),
@@ -273,6 +320,7 @@ impl Assembler {
         Ok(Object {
             sections: self.sections,
             symbols,
+            xlen: self.xlen,
         })
     }
 
@@ -282,7 +330,7 @@ impl Assembler {
     fn local_distance(&self, section: usize, offset: u32, symbol: &str, addend: i64) -> Option<i64> {
         let s = &self.symbols[*self.by_name.get(symbol)?];
         let local = s.defined && !s.global && s.constant.is_none() && s.section == Some(section);
-        local.then(|| s.value as i64 + addend - offset as i64)
+        local.then(|| (s.value as i64).wrapping_add(addend).wrapping_sub(offset as i64))
     }
 
     /// Resolves the fixups clang resolves with `-mno-relax` (see the module
@@ -371,7 +419,9 @@ impl Assembler {
                 let (hi, lo) = encode::hi_lo(distance as i32);
                 (encode::u_imm(hi), Some(encode::i_imm(lo)))
             }
-            Abs32 | Hi20 | Lo12I | Lo12S => unreachable!("absolute relocations are never resolved"),
+            Abs32 | Abs64 | Hi20 | Lo12I | Lo12S => {
+                unreachable!("absolute relocations are never resolved")
+            }
         };
         let data = &mut self.sections[section].data;
         let at = offset as usize;
@@ -498,7 +548,11 @@ impl Assembler {
                     BinOp::Div => a.checked_div(b)?,
                     BinOp::Rem => a.checked_rem(b)?,
                     BinOp::Shl => a.wrapping_shl(b as u32),
-                    BinOp::Shr => a.wrapping_shr(b as u32),
+                    // Logical, not arithmetic, as in LLVM (MCAsmInfo's
+                    // `UseLogicalShr`, true by default and left on by
+                    // RISC-V): a negative value shifts zeros in (`-16 >> 2`
+                    // is 0x3ffffffffffffffc).
+                    BinOp::Shr => (a as u64).wrapping_shr(b as u32) as i64,
                     BinOp::And => a & b,
                     BinOp::Or => a | b,
                     BinOp::Xor => a ^ b,
@@ -559,37 +613,67 @@ impl Assembler {
 
     // ----- sections and emission -----
 
+    /// Makes the section named `name` the current one, made with the
+    /// attributes its name gives it ([`section::by_name`]) if there is none
+    /// yet: `.text`, `.data`, `.rodata` and `.bss`, the `.bss` of `.comm`,
+    /// the line table's sections.
     fn switch_section(&mut self, name: &str) {
-        if let Some(i) = self.sections.iter().position(|s| s.name == name) {
-            self.current = i;
-            return;
+        if !self.find_section(name) {
+            self.new_section(name, section::by_name(name));
         }
-        let kind = if name.starts_with(".debug_") {
-            SectionKind::Debug
-        } else if name == ".text" || name.starts_with(".text.") || name.starts_with(".init") {
-            SectionKind::Text
-        } else if name == ".bss" || name.starts_with(".bss.") || name.starts_with(".sbss") {
-            SectionKind::Bss
-        } else if name.starts_with(".rodata") || name.starts_with(".srodata") {
-            SectionKind::Rodata
-        } else {
-            SectionKind::Data
-        };
-        let align = if kind == SectionKind::Text { 4 } else { 1 };
+    }
+
+    /// Makes the section named `name` the current one if there is one.
+    fn find_section(&mut self, name: &str) -> bool {
+        match self.sections.iter().position(|s| s.name == name) {
+            Some(i) => {
+                self.current = i;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Adds a section, which becomes the current one.
+    ///
+    /// Its alignment starts at 1, raised by `.align` (and by the data
+    /// `.comm` places), except for `.text`'s, which starts at 4: LLVM makes
+    /// `.text` at the start with the alignment of an instruction
+    /// (`MCELFStreamer::initSections`), and no other section, not even code
+    /// (`.text.f`, `"ax"`), gets one unless it asks.
+    fn new_section(&mut self, name: &str, attrs: Attrs) {
         self.sections.push(Section {
             name: name.to_string(),
-            kind,
+            attrs,
             data: Vec::new(),
             size: 0,
-            align,
+            align: if name == ".text" { 4 } else { 1 },
             relocs: Vec::new(),
         });
         self.current = self.sections.len() - 1;
     }
 
+    /// Whether `n` more bytes fit in the current section, which reports an
+    /// error if they do not. A section's size and offsets are 32-bit here
+    /// (all ELF32 has room for; on RV64 merlin-as's own limit), so a section
+    /// stops short of 4 GiB: whatever would take it there is an error, never
+    /// a size that wraps around.
+    fn has_room(&mut self, n: u64) -> bool {
+        let sec = &self.sections[self.current];
+        if u64::from(sec.size) + n <= u64::from(u32::MAX) {
+            return true;
+        }
+        let msg = format!("section {} would be 4 GiB or larger", sec.name);
+        self.error(msg);
+        false
+    }
+
     fn emit_bytes(&mut self, bytes: &[u8]) {
+        if !self.has_room(bytes.len() as u64) {
+            return;
+        }
         let sec = &mut self.sections[self.current];
-        if sec.kind == SectionKind::Bss {
+        if sec.is_nobits() {
             if bytes.iter().any(|&b| b != 0) {
                 self.error(format!("non-zero data in {}", self.sections[self.current].name));
                 return;
@@ -600,12 +684,15 @@ impl Assembler {
         sec.size += bytes.len() as u32;
     }
 
-    fn emit_zeros(&mut self, n: u32) {
+    fn emit_zeros(&mut self, n: u64) {
+        if !self.has_room(n) {
+            return;
+        }
         let sec = &mut self.sections[self.current];
-        if sec.kind != SectionKind::Bss {
+        if !sec.is_nobits() {
             sec.data.resize(sec.data.len() + n as usize, 0);
         }
-        sec.size += n;
+        sec.size += n as u32;
     }
 
     fn add_reloc(&mut self, offset: u32, kind: RelocKind, symbol: String, addend: i64) {
@@ -626,12 +713,12 @@ impl Assembler {
         let sec = &mut self.sections[self.current];
         sec.align = sec.align.max(align);
         let pad = (align - sec.size % align) % align;
-        if sec.kind == SectionKind::Text && pad.is_multiple_of(4) && sec.size.is_multiple_of(4) {
+        if sec.is_code() && pad.is_multiple_of(4) && sec.size.is_multiple_of(4) {
             for _ in 0..pad / 4 {
                 self.emit_bytes(&0x0000_0013u32.to_le_bytes()); // nop
             }
         } else {
-            self.emit_zeros(pad);
+            self.emit_zeros(pad.into());
         }
     }
 
@@ -645,13 +732,11 @@ impl Assembler {
     /// Appends the encoder's words to the current section and turns their
     /// fixups into relocations.
     fn place(&mut self, mnemonic: &str, emits: Vec<Emit>) {
-        match self.sections[self.current].kind {
-            SectionKind::Bss => return self.error("instructions are not allowed in .bss"),
-            SectionKind::Debug => {
-                let name = self.sections[self.current].name.clone();
-                return self.error(format!("instructions are not allowed in {name}"));
-            }
-            _ => {}
+        // Zeros only in a NOBITS section, data only in debug information.
+        let sec = &self.sections[self.current];
+        if sec.is_nobits() || sec.is_debug() {
+            let msg = format!("instructions are not allowed in {}", sec.name);
+            return self.error(msg);
         }
         if !self.sections[self.current].size.is_multiple_of(4) {
             return self.error("instruction is not 4-byte aligned (add .align 2)");
@@ -729,6 +814,20 @@ impl Assembler {
         }
     }
 
+    /// `.byte`, `.half`, `.word` and `.dword` (and their other names): each
+    /// argument is `size` bytes, little-endian.
+    ///
+    /// A number must fit in those bytes as a signed or an unsigned value,
+    /// as LLVM requires (`isIntN || isUIntN`): `.byte 255` and `.byte -1`
+    /// are the same byte, `.byte 256` is an error, not a silent 0. A
+    /// `.dword` takes any 64-bit value.
+    ///
+    /// A label's address is only known at link time, so `.word sym` and
+    /// `.dword sym` leave zeros and a relocation (`R_RISCV_32`, `R_RISCV_64`)
+    /// for the linker to fill. The width of the data, not of the machine,
+    /// picks it: LLVM writes `R_RISCV_64` for a `.dword` on RV32 too, and
+    /// `R_RISCV_32` for a `.word` on RV64. The psABI has no 1- or 2-byte
+    /// absolute relocation.
     fn data(&mut self, args: &[DirArg], size: u32) {
         if !args.is_empty() {
             self.take_loc();
@@ -739,23 +838,34 @@ impl Assembler {
                 continue;
             };
             if let Some(v) = self.eval(e).or_else(|| self.eval_relative(e)) {
+                if !fits_in_bytes(v, size) {
+                    let unit = if size == 1 { "byte" } else { "bytes" };
+                    self.error(format!("data value {v} does not fit in {size} {unit}"));
+                    continue;
+                }
                 let bytes = (v as u64).to_le_bytes();
                 self.emit_bytes(&bytes[..size as usize]);
                 continue;
             }
-            let ctx = Ctx { asm: self };
-            match (size, ctx.symbol(e)) {
-                (4, Some((mut name, addend))) => {
-                    let off = self.sections[self.current].size;
-                    if name == DOT {
-                        name = self.dot_label(off);
-                    }
-                    self.add_reloc(off, RelocKind::Abs32, name, addend);
-                    self.emit_bytes(&[0; 4]);
+            let kind = match size {
+                4 => RelocKind::Abs32,
+                8 => RelocKind::Abs64,
+                _ => {
+                    self.error("only .word and .dword can hold a symbol address");
+                    continue;
                 }
-                (4, None) => self.error("expected a constant or symbol(+offset)"),
-                _ => self.error("only .word can hold a symbol address"),
+            };
+            let ctx = Ctx { asm: self };
+            let Some((mut name, addend)) = ctx.symbol(e) else {
+                self.error("expected a constant or symbol(+offset)");
+                continue;
+            };
+            let off = self.sections[self.current].size;
+            if name == DOT {
+                name = self.dot_label(off);
             }
+            self.add_reloc(off, kind, name, addend);
+            self.emit_bytes(&[0; 8][..size as usize]);
         }
     }
 
@@ -777,16 +887,158 @@ impl Assembler {
                 "{directive}: '{shown}' must be a label defined before this"
             ));
         };
-        let value = t.value as i64 + addend;
+        // The sum wraps like every other (`.set y, x + BIG` with a 64-bit
+        // BIG must not overflow); whatever it comes to, it must land in the
+        // section.
+        let value = (t.value as i64).wrapping_add(addend);
         if !(0..=u32::MAX as i64).contains(&value) {
             return self.error(format!("{directive}: '{name}' would be outside its section"));
         }
         self.define(name, section, value as u32);
     }
 
+    /// `.section name[, "flags"[, @type[, entsize]]]`: switches to the
+    /// section, made with the attributes LLVM gives it (see
+    /// [`crate::section`]: the name's defaults, plus the flags, the type
+    /// instead of the name's, or LLVM's own for a section it predefines).
+    /// The parser has made the type a string, however it was written.
+    fn section_directive(&mut self, args: &[DirArg]) {
+        let Some(name) = self.arg_name(args, 0, ".section") else {
+            return;
+        };
+        let (mut ty, mut flags) = section::name_defaults(&name);
+        // What the line asks for, which a section that exists must have.
+        let (mut given_flags, mut given_type, mut entsize) = (0, false, 0);
+        if args.len() > 1 {
+            let Some(DirArg::Str(f)) = args.get(1) else {
+                return self.error(".section: expected a string of flags");
+            };
+            given_flags = match section::parse_flags(f) {
+                Ok(f) => f,
+                Err(c @ (b'G' | b'o')) => {
+                    let what = if c == b'G' {
+                        "section groups"
+                    } else {
+                        "linked-to sections"
+                    };
+                    let c = c as char;
+                    return self.error(format!(".section: flag '{c}': {what} are not supported"));
+                }
+                // A byte that is no printable character is given by number.
+                Err(c) if c.is_ascii_graphic() => {
+                    return self.error(format!(".section: unknown flag '{}'", c as char));
+                }
+                Err(c) => return self.error(format!(".section: unknown flag {c:#04x}")),
+            };
+            flags |= given_flags;
+            match args.get(2) {
+                None => {}
+                Some(DirArg::Str(t)) => {
+                    let t = String::from_utf8_lossy(t);
+                    let Some(n) = section::type_named(&t) else {
+                        return self.error(format!(".section: unknown section type '{t}'"));
+                    };
+                    (ty, given_type) = (n, true);
+                }
+                Some(_) => {
+                    return self.error(".section: expected '@<type>', '%<type>' or \"<type>\"");
+                }
+            }
+            // A mergeable section's entries are all one size, given after
+            // the type.
+            if flags & section::SHF_MERGE != 0 {
+                if !given_type {
+                    return self.error(".section: a mergeable section (M) must give its type");
+                }
+                if args.len() < 4 {
+                    return self.error(".section: a mergeable section (M) must give its entry size");
+                }
+                let Some(n) = self.arg_const(args, 3, ".section") else {
+                    return;
+                };
+                if n <= 0 {
+                    return self.error(".section: the entry size must be positive");
+                }
+                // sh_entsize is 32 bits in ELF32, and LLVM keeps an entry
+                // size in 32 bits on either width (a larger one is cut, then
+                // fails its own check), so it is an error on both.
+                if n > u32::MAX as i64 {
+                    return self.error(format!(".section: entry size {n} does not fit in 32 bits"));
+                }
+                entsize = n as u64;
+            }
+            let used = if flags & section::SHF_MERGE != 0 { 4 } else { 3 };
+            if args.len() > used {
+                return self.error(".section: unexpected argument (unique sections are not supported)");
+            }
+        }
+        let attrs = Attrs { ty, flags, entsize };
+        if !self.find_section(&name) {
+            // LLVM's own sections exist before the first line: theirs win.
+            self.new_section(&name, section::predefined(&name).unwrap_or(attrs));
+        }
+        // As LLVM (and GNU as) do, a `.section` with nothing after the name
+        // takes the section as it is; with flags, a type or an entry size it
+        // must not change it. The messages are LLVM's, which prints the
+        // numbers in upper-case hexadecimal.
+        let have = self.sections[self.current].attrs;
+        if given_type && have.ty != ty {
+            self.error(format!(
+                "changed section type for {name}, expected: {:#X}",
+                have.ty
+            ));
+        }
+        if given_flags != 0 || entsize != 0 || given_type {
+            if have.flags != flags {
+                self.error(format!(
+                    "changed section flags for {name}, expected: {:#X}",
+                    have.flags
+                ));
+            }
+            if have.entsize != entsize {
+                self.error(format!(
+                    "changed section entsize for {name}, expected: {}",
+                    have.entsize
+                ));
+            }
+        }
+    }
+
+    /// `.space n[, fill]` (and its other names, `.zero` and `.skip`): `n`
+    /// bytes of `fill`, zero if it is left out. As in LLVM, only the low
+    /// byte of `fill` counts (`.space 3, 0x1ff` is three 0xff), and a
+    /// negative `n` is "invalid number of bytes". `n` is never cut to fit:
+    /// one that would take the section to 4 GiB is an error too.
+    fn space(&mut self, name: &str, args: &[DirArg]) {
+        let Some(n) = self.arg_const(args, 0, name) else {
+            return;
+        };
+        let fill = if args.len() > 1 {
+            match self.arg_const(args, 1, name) {
+                Some(f) => f as u8,
+                None => return,
+            }
+        } else {
+            0
+        };
+        let Ok(n) = u64::try_from(n) else {
+            return self.error("invalid number of bytes");
+        };
+        // Checked before the bytes are made, so that a huge count is an
+        // error rather than a huge allocation.
+        if !self.has_room(n) {
+            return;
+        }
+        if fill == 0 {
+            self.emit_zeros(n);
+        } else {
+            self.emit_bytes(&vec![fill; n as usize]);
+        }
+    }
+
     /// `.comm sym, size[, align]` for a symbol made `.local` first, or
-    /// `.lcomm sym, size[, align]`: reserves `size` zero bytes for `sym` in
-    /// `.bss`, aligned to `align` bytes, as clang's assembler does. This is
+    /// `.lcomm sym, size`: reserves `size` zero bytes for `sym` in `.bss`,
+    /// aligned to `align` bytes (`.lcomm`: 1), as clang's assembler does. This is
     /// how clang writes a `static` variable without an initializer in its
     /// assembly output (`.local buf` then `.comm buf,100,1`). The current
     /// section stays what it was. A global `.comm` would be an
@@ -804,6 +1056,12 @@ impl Assembler {
         let Some(size) = self.arg_const(args, 1, name) else {
             return;
         };
+        // LLVM's ELF `.lcomm` takes no alignment (its LCOMM::NoAlignment):
+        // `.lcomm sym, size, align` is "alignment not supported on this
+        // target" on riscv32 and riscv64 alike. `.comm` takes one.
+        if name == ".lcomm" && args.len() > 2 {
+            return self.error(".lcomm: alignment not supported on this target");
+        }
         let align = if args.len() > 2 {
             match self.arg_const(args, 2, name) {
                 Some(a) => a,
@@ -812,11 +1070,17 @@ impl Assembler {
         } else {
             1
         };
-        if !(0..=u32::MAX as i64).contains(&size) {
-            return self.error(format!("{name}: bad size {size}"));
+        // LLVM's messages. A size too big for the section is left to
+        // emit_zeros below, which says so as `.space` does.
+        if size < 0 {
+            return self.error(format!("{name}: size must be non-negative"));
         }
-        if align <= 0 || align & (align - 1) != 0 || align > 1 << 16 {
-            return self.error(format!("{name}: alignment must be a power of two up to 65536"));
+        if align <= 0 || align & (align - 1) != 0 {
+            return self.error(format!("{name}: alignment must be a power of 2"));
+        }
+        // merlin-as's own limit, the same as `.p2align`'s (0..16).
+        if align > 1 << 16 {
+            return self.error(format!("{name}: alignment must be at most 65536"));
         }
         let back = self.current;
         self.switch_section(".bss");
@@ -824,22 +1088,18 @@ impl Assembler {
         let off = self.sections[self.current].size;
         self.define(&sym, self.current, off);
         let i = self.symbol_index(&sym);
-        self.symbols[i].size = size as u32;
+        self.symbols[i].size = size as u64;
         if self.symbols[i].ty == SymType::NoType {
             self.symbols[i].ty = SymType::Object;
         }
-        self.emit_zeros(size as u32);
+        self.emit_zeros(size as u64);
         self.current = back;
     }
 
     fn directive(&mut self, name: &str, args: &[DirArg]) {
         match name {
             ".text" | ".data" | ".rodata" | ".bss" => self.switch_section(name),
-            ".section" => {
-                if let Some(n) = self.arg_name(args, 0, ".section") {
-                    self.switch_section(&n);
-                }
-            }
+            ".section" => self.section_directive(args),
             ".globl" | ".global" => {
                 for i in 0..args.len() {
                     if let Some(n) = self.arg_name(args, i, name) {
@@ -879,6 +1139,7 @@ impl Assembler {
             ".byte" => self.data(args, 1),
             ".half" | ".short" | ".2byte" => self.data(args, 2),
             ".word" | ".long" | ".4byte" => self.data(args, 4),
+            ".dword" | ".quad" | ".8byte" => self.data(args, 8),
             ".ascii" | ".asciz" | ".string" => {
                 if !args.is_empty() {
                     self.take_loc();
@@ -896,16 +1157,7 @@ impl Assembler {
                     }
                 }
             }
-            ".zero" | ".space" | ".skip" => {
-                if let Some(n) = self.arg_const(args, 0, name) {
-                    if args.len() > 1 {
-                        let fill = self.arg_const(args, 1, name).unwrap_or(0) as u8;
-                        self.emit_bytes(&vec![fill; n as usize]);
-                    } else {
-                        self.emit_zeros(n as u32);
-                    }
-                }
-            }
+            ".zero" | ".space" | ".skip" => self.space(name, args),
             // RISC-V `.align n` means 2^n bytes, same as `.p2align`.
             ".align" | ".p2align" => {
                 if let Some(n) = self.arg_const(args, 0, name) {
@@ -936,18 +1188,21 @@ impl Assembler {
             }
             ".size" => {
                 // `.size f, . - f` (merlin's), `.size f, .Lfunc_end0 - f`
-                // (clang's) or a constant.
+                // (clang's) or a constant. Any value is taken, as LLVM
+                // takes it: its bits are the symbol's st_size, cut to the
+                // 32 bits of an ELF32 field by the writer (clang riscv32
+                // writes 0 for 0x100000000 and 0xfffffffc for -4).
                 if let Some(n) = self.arg_name(args, 0, ".size") {
                     let v = match args.get(1) {
                         Some(DirArg::Expr(e)) => self.eval_relative(e),
                         _ => None,
                     };
                     match v {
-                        Some(v) if (0..=u32::MAX as i64).contains(&v) => {
+                        Some(v) => {
                             let s = self.symbol_index(&n);
-                            self.symbols[s].size = v as u32;
+                            self.symbols[s].size = v as u64;
                         }
-                        _ => self.error(
+                        None => self.error(
                             ".size: expected a constant, or a difference of '.' and labels \
                              defined earlier in this section",
                         ),
@@ -1161,18 +1416,26 @@ impl Assembler {
         }
         let base = self.section_size(".debug_line");
         let str_base = self.section_size(".debug_line_str");
-        let table = dwarf::encode(&root.dir, &root, &files, &sequences, base, str_base);
+        // A code address is as wide as the target's registers: 4 bytes on
+        // RV32 and 8 on RV64 (DWARF's address_size), relocated by R_RISCV_32
+        // or R_RISCV_64. A string's offset is a 4-byte DWARF32 field on both
+        // widths (R_RISCV_32, as clang writes it).
+        let (address_size, address) = match self.xlen {
+            Xlen::Rv32 => (4, RelocKind::Abs32),
+            Xlen::Rv64 => (8, RelocKind::Abs64),
+        };
+        let table = dwarf::encode(&root.dir, &root, &files, &sequences, base, str_base, address_size);
         let (line_sec, _) = self.append(".debug_line", &table.line);
         let (str_sec, _) = self.append(".debug_line_str", &table.line_str);
         for (at, target) in table.fixups {
-            let (sec, addend) = match target {
-                dwarf::Target::LineStr(off) => (str_sec, off),
-                dwarf::Target::Section(sec, off) => (sec, off),
+            let (sec, addend, kind) = match target {
+                dwarf::Target::LineStr(off) => (str_sec, off, RelocKind::Abs32),
+                dwarf::Target::Section(sec, off) => (sec, off, address),
             };
             let symbol = self.section_symbol(sec);
             self.sections[line_sec].relocs.push(Reloc {
                 offset: at,
-                kind: RelocKind::Abs32,
+                kind,
                 symbol,
                 addend: addend.into(),
                 line,
@@ -1188,12 +1451,14 @@ impl Assembler {
     }
 
     /// A relocation in debug information against a `.L` label becomes one
-    /// against the label's section, plus the label's offset (as GNU as and
-    /// LLVM do for local symbols they can drop), so that compiler-made labels
-    /// need no symbols.
+    /// against the label's section, plus the label's offset, so that
+    /// compiler-made labels need no symbols. GNU as does the same for the
+    /// local symbols it drops; LLVM keeps the `.L` symbol on RISC-V (clang's
+    /// `.quad .Lend` in `.debug_info` is `R_RISCV_64 .Lend + 0`), but the
+    /// linker computes the same address either way.
     fn debug_relocs_to_sections(&mut self) {
         for sec in 0..self.sections.len() {
-            if self.sections[sec].kind != SectionKind::Debug {
+            if !self.sections[sec].is_debug() {
                 continue;
             }
             for r in 0..self.sections[sec].relocs.len() {
@@ -1209,15 +1474,28 @@ impl Assembler {
                 let symbol = self.section_symbol(target);
                 let r = &mut self.sections[sec].relocs[r];
                 r.symbol = symbol;
-                r.addend += i64::from(value);
+                r.addend = r.addend.wrapping_add(i64::from(value));
             }
         }
     }
 }
 
+/// True if `v` can be written in `size` bytes: as a signed value
+/// (-2^(8·size-1) and up) or an unsigned one (up to 2^(8·size) - 1). This is
+/// LLVM's check for data directives (`isIntN(n, v) || isUIntN(n, v)`). Every
+/// i64 fits in 8 bytes.
+fn fits_in_bytes(v: i64, size: u32) -> bool {
+    if size >= 8 {
+        return true;
+    }
+    let bits = 8 * size;
+    (-(1i64 << (bits - 1))..1i64 << bits).contains(&v)
+}
+
 impl Default for Assembler {
+    /// RV32, until the migration to RV64 ends (#159).
     fn default() -> Self {
-        Self::new()
+        Self::new(Xlen::Rv32)
     }
 }
 
@@ -1286,7 +1564,7 @@ mod tests {
     /// Feeds `place` the words an encoder would return, one instruction per
     /// line, with `labels` defined just before the instruction on that line.
     fn assemble(lines: &[(&[&str], Emit)]) -> Result<Object, Vec<Error>> {
-        let mut a = Assembler::new();
+        let mut a = Assembler::new(Xlen::Rv32);
         for (i, (labels, emit)) in lines.iter().enumerate() {
             a.line = i + 1;
             for l in *labels {
@@ -1328,7 +1606,7 @@ mod tests {
 
     #[test]
     fn pcrel_lo_label_in_another_section_is_an_error() {
-        let mut a = Assembler::new();
+        let mut a = Assembler::new(Xlen::Rv32);
         a.line = 1;
         a.label("1");
         a.place("test", vec![hi("target")]);
@@ -1428,6 +1706,43 @@ data:   .word 0
         );
         let obj = crate::assemble(src).unwrap();
         assert!(obj.sections[0].relocs.is_empty());
+        assert!(obj.symbols.iter().all(|s| !s.name.starts_with(".L")));
+    }
+
+    #[test]
+    fn rv64_pcrel_loads_and_stores_to_local_labels_are_resolved() {
+        // RV64's `ld`, `lwu` and `sd` to a label are auipc pairs like `lw`
+        // and `sw`, resolved the same way. Words from clang --target=riscv64
+        // -mno-relax for the same source (llvm-objdump -dr: no relocations).
+        let src = "
+        ld   a0, data
+        lwu  a1, data
+        sd   a2, data, t0
+        nop
+data:   .dword 5
+";
+        let obj = assemble_for(src, Xlen::Rv64).unwrap();
+        let text = &obj.sections[0];
+        let words: Vec<u32> = text
+            .data
+            .chunks(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            words,
+            [
+                0x0000_0517, // auipc a0, 0
+                0x01c5_3503, // ld a0, 0x1c(a0)
+                0x0000_0597, // auipc a1, 0
+                0x0145_e583, // lwu a1, 0x14(a1)
+                0x0000_0297, // auipc t0, 0
+                0x00c2_b623, // sd a2, 0xc(t0)
+                0x0000_0013, // nop
+                5,           // .dword 5, low word
+                0,           // and high word
+            ]
+        );
+        assert!(text.relocs.is_empty());
         assert!(obj.symbols.iter().all(|s| !s.name.starts_with(".L")));
     }
 
@@ -1607,7 +1922,6 @@ w:      .word 0, 0, 0
             "    .text\n    .size f, . - f\nf: nop\n",
             "    .text\nf: nop\n    .size f, . * f\n",
             "    .text\nf: nop\n    .size f\n",
-            "    .text\nf: nop\n    .size f, -4\n",
             // An offset that does not cancel out is not a size.
             "    .text\n    nop\nf: nop\n    .size f, f\n",
             "    .text\n    nop\nf: nop\n    .size f, . + f\n",
@@ -1616,6 +1930,13 @@ w:      .word 0, 0, 0
             let errs = crate::assemble(bad).unwrap_err();
             assert!(errs[0].msg.contains(".size: expected"), "{bad:?}: {errs:?}");
         }
+        // Any constant is a size, as in LLVM, a negative or a 64-bit one
+        // too: the ELF writer cuts it to 32 bits in an ELF32 object.
+        let obj = crate::assemble("f: nop\n.size f, -4\ng: nop\n.size g, 0x100000000\n").unwrap();
+        assert_eq!(
+            (sym(&obj, "f").size, sym(&obj, "g").size),
+            (-4i64 as u64, 0x1_0000_0000)
+        );
     }
 
     #[test]
@@ -1629,15 +1950,18 @@ f:      nop
         .comm   buf,100,1
         .local  n
         .comm   n,4,4
-        .lcomm  big, 16, 8
+        .local  big
+        .comm   big, 16, 8
+        .lcomm  odd, 3
 g:      nop
 ";
         let obj = crate::assemble(src).unwrap();
         let (bss, s) = section(&obj, ".bss");
-        // buf at 0, n aligned up to 100, big aligned up to 104.
-        assert_eq!(s.size, 120);
+        // buf at 0, n aligned up to 100, big aligned up to 104, odd right
+        // after it (.lcomm aligns to 1).
+        assert_eq!(s.size, 123);
         assert_eq!(s.align, 8);
-        for (name, value, size) in [("buf", 0, 100), ("n", 100, 4), ("big", 104, 16)] {
+        for (name, value, size) in [("buf", 0, 100), ("n", 100, 4), ("big", 104, 16), ("odd", 120, 3)] {
             let s = sym(&obj, name);
             assert_eq!((s.section, s.value, s.size), (Some(bss), value, size), "{name}");
             assert!(s.defined && !s.global, "{name}");
@@ -1653,13 +1977,248 @@ g:      nop
         let errs = crate::assemble("        .comm shared, 4, 4\n").unwrap_err();
         assert_eq!(errs.len(), 1);
         assert!(errs[0].msg.contains("-fno-common"), "{}", errs[0].msg);
-        for bad in [
-            ".local x\n.comm x, 4, 3\n",
-            ".local x\n.comm x, -1\n",
-            ".lcomm x\n",
+        // The messages llvm-mc 23 gives, on riscv32 and riscv64 alike, but
+        // for the last two: merlin-as's own limits on an argument LLVM wants.
+        for (bad, msg) in [
+            (
+                ".local x\n.comm x, 4, 3\n",
+                ".comm: alignment must be a power of 2",
+            ),
+            (
+                ".local x\n.comm x, 4, 0\n",
+                ".comm: alignment must be a power of 2",
+            ),
+            (".local x\n.comm x, -1\n", ".comm: size must be non-negative"),
+            (".lcomm x, -1\n", ".lcomm: size must be non-negative"),
+            (
+                ".lcomm x, 16, 8\n",
+                ".lcomm: alignment not supported on this target",
+            ),
+            (
+                ".local x\n.comm x, 4, 0x20000\n",
+                ".comm: alignment must be at most 65536",
+            ),
+            (".lcomm x\n", ".lcomm: missing argument"),
         ] {
-            assert!(crate::assemble(bad).is_err(), "{bad}");
+            let errs = crate::assemble(bad).unwrap_err();
+            assert!(errs[0].msg.starts_with(msg), "{bad}: {errs:?}");
         }
+    }
+
+    #[test]
+    fn space_fills_with_the_low_byte() {
+        // llvm-mc's .data for the same lines: fffffffe fe050580.
+        let src = ".data\n.space 3, 0x1ff\n.space 2, -2\n.zero 2, 5\n.skip 1, 0x80\n.space 0\n";
+        let obj = crate::assemble(src).unwrap();
+        let (_, data) = section(&obj, ".data");
+        assert_eq!(data.data, [0xff, 0xff, 0xff, 0xfe, 0xfe, 5, 5, 0x80]);
+    }
+
+    #[test]
+    fn space_counts_are_never_cut() {
+        // A negative count is LLVM's "invalid number of bytes", whatever the
+        // directive is called and whether or not it has a fill.
+        for bad in [
+            ".data\n.space -1\n",
+            ".data\n.space -1, 7\n",
+            ".data\n.skip -5\n",
+            ".bss\n.zero -1\n",
+        ] {
+            let errs = crate::assemble(bad).unwrap_err();
+            assert_eq!(errs[0].msg, "invalid number of bytes", "{bad}");
+        }
+        // A section holds up to 4 GiB - 1 bytes: 0xffffffff fit in .bss (as
+        // llvm-mc writes it), one more is an error, by .space, by data or
+        // by .lcomm, and a count past 32 bits is never cut to its low bits
+        // (`.space 0x100000003` is not 3 bytes) nor allocated.
+        let obj = crate::assemble(".bss\n.space 0xffffffff\n").unwrap();
+        assert_eq!(section(&obj, ".bss").1.size, u32::MAX);
+        for bad in [
+            ".bss\n.space 0xffffffff\n.byte 0\n",
+            ".bss\n.byte 0\n.space 0xffffffff\n",
+            ".bss\n.space 0x100000003\n",
+            ".data\n.space 0x100000003\n.word 1\n",
+            ".data\n.space 0x7fffffffffffffff, 1\n",
+            ".lcomm a, 0xffffffff\n.lcomm b, 1\n",
+        ] {
+            let errs = crate::assemble(bad).unwrap_err();
+            assert_eq!(errs.len(), 1, "{bad}: {errs:?}");
+            assert!(
+                errs[0].msg.ends_with(" would be 4 GiB or larger"),
+                "{bad}: {errs:?}"
+            );
+        }
+    }
+
+    // ----- sections -----
+
+    /// The attributes of the section `name` in `src`'s object.
+    fn attrs(src: &str, name: &str) -> Attrs {
+        section(&crate::assemble(src).unwrap(), name).1.attrs
+    }
+
+    #[test]
+    fn going_back_to_a_section_keeps_it() {
+        // llvm-mc takes all of these: nothing after the name, flags that are
+        // already the section's, or none ("" adds none, so checks nothing).
+        let a = Attrs {
+            ty: section::SHT_PROGBITS,
+            flags: section::SHF_ALLOC,
+            entsize: 0,
+        };
+        for src in [
+            ".section .foo, \"a\"\n.section .foo\n",
+            ".section .foo, \"a\"\n.section .foo, \"\"\n",
+            ".section .foo, \"a\"\n.section .foo, \"a\", @progbits\n",
+        ] {
+            assert_eq!(attrs(src, ".foo"), a, "{src}");
+        }
+        // A name's own flags are there whether or not they are written:
+        // `.text` is AX, so `"a"` asks for nothing new.
+        let text = attrs(".section .text, \"a\"\nnop\n", ".text");
+        assert_eq!(text.flags, section::SHF_ALLOC | section::SHF_EXECINSTR);
+        // LLVM's own sections have their attributes from the start.
+        let s = attrs(".section .debug_str\n.asciz \"x\"\n", ".debug_str");
+        assert_eq!(
+            (s.flags, s.entsize),
+            (section::SHF_MERGE | section::SHF_STRINGS, 1)
+        );
+        let s = attrs(".section .rodata.cst8\n.dword 1\n", ".rodata.cst8");
+        assert_eq!((s.flags, s.entsize), (section::SHF_ALLOC | section::SHF_MERGE, 8));
+    }
+
+    #[test]
+    fn section_errors() {
+        // The "changed section" messages are LLVM's, word for word; the
+        // others are merlin-as's for the line llvm-mc also rejects.
+        for (src, msgs) in [
+            (
+                ".section .foo, \"a\"\n.section .foo, \"aw\"\n",
+                &["changed section flags for .foo, expected: 0x2"][..],
+            ),
+            (
+                ".section .foo, \"a\", @progbits\n.section .foo, \"a\", @nobits\n",
+                &["changed section type for .foo, expected: 0x1"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits, 4\n.section .foo, \"aM\", @progbits, 8\n",
+                &["changed section entsize for .foo, expected: 4"],
+            ),
+            (
+                ".section .bss, \"aw\", @progbits\n",
+                &["changed section type for .bss, expected: 0x8"],
+            ),
+            (
+                ".section .rodata.cst4, \"a\"\n",
+                &[
+                    "changed section flags for .rodata.cst4, expected: 0x12",
+                    "changed section entsize for .rodata.cst4, expected: 4",
+                ],
+            ),
+            (
+                ".section .debug_line_str, \"\", @progbits\n",
+                &[
+                    "changed section flags for .debug_line_str, expected: 0x30",
+                    "changed section entsize for .debug_line_str, expected: 1",
+                ],
+            ),
+            (".section\n", &[".section: expected a name"]),
+            (".section .foo, a\n", &[".section: expected a string of flags"]),
+            (".section .foo, \"aq\"\n", &[".section: unknown flag 'q'"]),
+            (".section .foo, \"a \"\n", &[".section: unknown flag 0x20"]),
+            (
+                ".section .foo, \"aG\", @progbits, grp\n",
+                &[".section: flag 'G': section groups are not supported"],
+            ),
+            (
+                ".section .foo, \"ao\", @progbits, sym\n",
+                &[".section: flag 'o': linked-to sections are not supported"],
+            ),
+            (
+                ".section .foo, \"a\", @weird\n",
+                &[".section: unknown section type 'weird'"],
+            ),
+            (
+                ".section .foo, \"a\", foo\n",
+                &[".section: expected '@<type>', '%<type>' or \"<type>\""],
+            ),
+            (
+                ".section .foo, \"aM\"\n",
+                &[".section: a mergeable section (M) must give its type"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits\n",
+                &[".section: a mergeable section (M) must give its entry size"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits, 0\n",
+                &[".section: the entry size must be positive"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits, -1\n",
+                &[".section: the entry size must be positive"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits, 0x100000001\n",
+                &[".section: entry size 4294967297 does not fit in 32 bits"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits, x\n",
+                &[".section: expected a constant expression"],
+            ),
+            (
+                ".section .foo, \"a\", @progbits, 1\n",
+                &[".section: unexpected argument (unique sections are not supported)"],
+            ),
+            (
+                ".section .foo, \"aM\", @progbits, 1, 2\n",
+                &[".section: unexpected argument (unique sections are not supported)"],
+            ),
+            // Zeros only in NOBITS, data only in debug information, whatever
+            // the section's name.
+            (
+                ".section .bss.x\nnop\n",
+                &["instructions are not allowed in .bss.x"],
+            ),
+            (
+                ".section .b, \"aw\", @nobits\n.byte 1\n",
+                &["non-zero data in .b"],
+            ),
+            (
+                ".section .debug_x\nnop\n",
+                &["instructions are not allowed in .debug_x"],
+            ),
+        ] {
+            let errs = crate::assemble(src).unwrap_err();
+            let got: Vec<&str> = errs.iter().map(|e| e.msg.as_str()).collect();
+            assert_eq!(got, msgs, "{src}");
+        }
+    }
+
+    #[test]
+    fn the_type_is_written_three_ways() {
+        // `@nobits`, `%nobits` and `"nobits"` are the same type, and a
+        // number is a type too (`@0x70000001`, `%0x70000001`), as in LLVM.
+        for t in ["@nobits", "%nobits", "\"nobits\"", "@8", "%8"] {
+            let src = format!(".section .b, \"aw\", {t}\n.space 4\n");
+            assert_eq!(attrs(&src, ".b").ty, section::SHT_NOBITS, "{src}");
+        }
+        for t in ["@0x70000001", "%0x70000001", "\"0x70000001\""] {
+            let src = format!(".section .p, \"a\", {t}\n");
+            assert_eq!(attrs(&src, ".p").ty, 0x7000_0001, "{src}");
+        }
+    }
+
+    #[test]
+    fn code_sections_pad_with_nops() {
+        // `.align` in any executable section pads with `nop`s, as in LLVM,
+        // and with zeros elsewhere: the section's flags decide, not its name.
+        let obj = crate::assemble(
+            ".section .myx, \"ax\"\nnop\n.p2align 3\n.section .d, \"a\"\n.byte 1\n.p2align 2\n",
+        )
+        .unwrap();
+        assert_eq!(section(&obj, ".myx").1.data, [0x13, 0, 0, 0, 0x13, 0, 0, 0]);
+        assert_eq!(section(&obj, ".d").1.data, [1, 0, 0, 0]);
     }
 
     // ----- debug information -----
@@ -1683,7 +2242,7 @@ f:      nop
         let obj = crate::assemble(src).unwrap();
         let (i, info) = section(&obj, ".debug_info");
         assert_eq!(info.data, [8, 0, 0, 0, 4, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(obj.sections[i].kind, SectionKind::Debug);
+        assert!(obj.sections[i].is_debug());
         // The label's word: a relocation against .text's section symbol, the
         // label's offset its addend; the label itself is no symbol.
         let r = &info.relocs[0];
@@ -1694,6 +2253,195 @@ f:      nop
         // Differences across sections are not numbers.
         let errs = crate::assemble(".text\nf: nop\n.data\ng: .word 0\n.word g - f\n").unwrap_err();
         assert!(errs[0].msg.contains("expected a constant or symbol"), "{errs:?}");
+    }
+
+    /// Assembles `src` for the width `xlen`.
+    fn assemble_for(src: &str, xlen: Xlen) -> Result<Object, Vec<Error>> {
+        crate::assemble_with(src, &crate::Options { xlen })
+    }
+
+    /// A relocation as (offset, kind, the target's section and value, addend).
+    fn relocs_of(obj: &Object, sec: &Section) -> Vec<(u32, RelocKind, Option<usize>, u32, i64)> {
+        sec.relocs
+            .iter()
+            .map(|r| {
+                let s = sym(obj, &r.symbol);
+                (r.offset, r.kind, s.section, s.value, r.addend)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn data_of_every_size() {
+        // The bytes and relocations llvm-mc 23 writes for this source, the
+        // same for riscv32 and riscv64 (llvm-objdump -s, llvm-readelf -r):
+        // `.dword sym` is R_RISCV_64 on RV32 too, `.word sym` R_RISCV_32 on
+        // RV64 too, and `>>` is a logical shift.
+        let src = "
+        .data
+        .byte 255, -128
+        .half -32768, 0xffff
+        .word 0xffffffff, -0x80000000
+        .dword -16 >> 2
+        .dword 1 << 63 >> 63
+        .word 0x80000000 >> 31
+x:      .dword x + 8, .
+        .quad .
+        .8byte -1
+        .word x
+";
+        #[rustfmt::skip]
+        let want: [u8; 0x46] = [
+            0xff, 0x80,                                     // .byte
+            0x00, 0x80, 0xff, 0xff,                         // .half
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x80, // .word
+            0xfc, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f, // -16 >> 2
+            0x01, 0, 0, 0, 0, 0, 0, 0,                      // 1 << 63 >> 63
+            0x01, 0, 0, 0,                                  // 0x80000000 >> 31
+            0, 0, 0, 0, 0, 0, 0, 0,                         // x + 8
+            0, 0, 0, 0, 0, 0, 0, 0,                         // .
+            0, 0, 0, 0, 0, 0, 0, 0,                         // .
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // -1
+            0, 0, 0, 0,                                     // x
+        ];
+        for xlen in [Xlen::Rv32, Xlen::Rv64] {
+            let obj = assemble_for(src, xlen).unwrap();
+            let (i, data) = section(&obj, ".data");
+            assert_eq!(data.data, want, "{xlen:?}");
+            // `.` is a hidden label at its own word, as clang's `.L0`.
+            assert_eq!(
+                relocs_of(&obj, data),
+                [
+                    (0x22, RelocKind::Abs64, Some(i), 0x22, 8),
+                    (0x2a, RelocKind::Abs64, Some(i), 0x2a, 0),
+                    (0x32, RelocKind::Abs64, Some(i), 0x32, 0),
+                    (0x42, RelocKind::Abs32, Some(i), 0x22, 0),
+                ],
+                "{xlen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_must_fit_its_size() {
+        // llvm-mc says "out of range literal value" for each number here,
+        // and "2-byte data relocations not supported" for `.half x`.
+        for xlen in [Xlen::Rv32, Xlen::Rv64] {
+            for (src, want) in [
+                (".byte 256", "data value 256 does not fit in 1 byte"),
+                (".byte -129", "data value -129 does not fit in 1 byte"),
+                (".half 0x10000", "data value 65536 does not fit in 2 bytes"),
+                (".short -32769", "data value -32769 does not fit in 2 bytes"),
+                (
+                    ".word 0x100000000",
+                    "data value 4294967296 does not fit in 4 bytes",
+                ),
+                (
+                    ".4byte -0x80000001",
+                    "data value -2147483649 does not fit in 4 bytes",
+                ),
+                // Logical: a negative value shifted right is a big one.
+                (
+                    ".word -16 >> 2",
+                    "data value 4611686018427387900 does not fit in 4 bytes",
+                ),
+                // An `.equ` holds any 64-bit value; it is checked where used.
+                (
+                    ".equ BIG, 0x123456789\n.word BIG",
+                    "data value 4886718345 does not fit in 4 bytes",
+                ),
+                (
+                    ".byte 1, 2\n.byte 3, 0x100, 4",
+                    "data value 256 does not fit in 1 byte",
+                ),
+                ("x: .half x", "only .word and .dword can hold a symbol address"),
+                (".byte .", "only .word and .dword can hold a symbol address"),
+            ] {
+                let errs = assemble_for(&format!(".data\n{src}\n"), xlen).unwrap_err();
+                let line = 1 + src.lines().count();
+                assert_eq!(errs.len(), 1, "{src}: {errs:?}");
+                assert_eq!(
+                    (errs[0].line, errs[0].msg.as_str()),
+                    (line, want),
+                    "{xlen:?} {src}"
+                );
+            }
+            // The edges of each range, and any `.dword`.
+            let src = ".data\n.byte -128, 255\n.half -32768, 65535\n.word -0x80000000, 0xffffffff\n\
+                       .dword -0x8000000000000000, 0xffffffffffffffff\n";
+            assert!(assemble_for(src, xlen).is_ok(), "{xlen:?}");
+        }
+    }
+
+    #[test]
+    fn right_shifts_are_logical() {
+        // llvm-mc 23 -show-encoding: `li a0, -1 >> 32` is `li a0, -1` on
+        // riscv32 (0xffffffff is -1 in 32 bits) and `li a0, -1; srli a0, a0,
+        // 32` on riscv64; `-16 >> 60` is 15 on both.
+        let words = |src: &str, xlen| {
+            let obj = assemble_for(src, xlen).unwrap();
+            let data = &obj.sections[0].data;
+            data.chunks(4)
+                .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let src = "li a0, -1 >> 32\nli a1, -16 >> 60\n";
+        assert_eq!(words(src, Xlen::Rv32), [0xfff0_0513, 0x00f0_0593]);
+        assert_eq!(words(src, Xlen::Rv64), [0xfff0_0513, 0x0205_5513, 0x00f0_0593]);
+    }
+
+    #[test]
+    fn symbol_addends_wrap_around() {
+        // A 64-bit constant added to a label: the addend wraps in 64 bits as
+        // in LLVM (`x - 0x8000000000000000` from llvm-readelf on riscv64),
+        // where an unchecked sum would overflow (`sym + c` and `c + sym`).
+        let src =
+            ".data\nx: .word 0\n.equ BIG, 0x7fffffffffffffff\n.dword x + BIG + 1\n.word 1 + (BIG + x)\n";
+        for xlen in [Xlen::Rv32, Xlen::Rv64] {
+            let obj = assemble_for(src, xlen).unwrap();
+            let (i, data) = section(&obj, ".data");
+            assert_eq!(
+                relocs_of(&obj, data),
+                [
+                    (4, RelocKind::Abs64, Some(i), 0, i64::MIN),
+                    (12, RelocKind::Abs32, Some(i), 0, i64::MIN),
+                ],
+                "{xlen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dwords_in_debug_sections_name_the_section() {
+        // RV64's DWARF holds 8-byte addresses (`.quad .Lfunc_begin0`): as
+        // for a `.word`, a `.L` label becomes its section's symbol plus the
+        // label's offset; any other symbol stays.
+        let src = "
+        .text
+f:      nop
+.Lend:  nop
+        .section .debug_info,\"\",@progbits
+        .quad .Lend
+        .dword f + 2
+        .8byte .Lend - f
+";
+        for xlen in [Xlen::Rv32, Xlen::Rv64] {
+            let obj = assemble_for(src, xlen).unwrap();
+            let (_, info) = section(&obj, ".debug_info");
+            let mut want = [0; 24];
+            want[16] = 4;
+            assert_eq!(info.data, want, "{xlen:?}");
+            let r = &info.relocs;
+            assert_eq!(r.len(), 2, "{xlen:?}");
+            assert_eq!((r[0].offset, r[0].kind, r[0].addend), (0, RelocKind::Abs64, 4));
+            let s = sym(&obj, &r[0].symbol);
+            assert_eq!((s.ty, s.section), (SymType::Section, Some(0)));
+            assert_eq!(
+                (r[1].offset, r[1].kind, r[1].symbol.as_str(), r[1].addend),
+                (8, RelocKind::Abs64, "f", 2)
+            );
+            assert!(obj.symbols.iter().all(|s| !s.name.starts_with(".L")));
+        }
     }
 
     #[test]
@@ -1741,7 +2489,7 @@ f:      nop
         // The same .file twice is fine; a .file and .loc with no code make no table.
         let obj =
             crate::assemble(".file 1 \"a.c\"\n.file 1 \"a.c\"\n.file 0 \"d\" \"a.c\"\n.loc 0 3\n").unwrap();
-        assert!(obj.sections.iter().all(|s| s.kind != SectionKind::Debug));
+        assert!(obj.sections.iter().all(|s| !s.is_debug()));
     }
 
     #[test]
@@ -1779,6 +2527,18 @@ third = .L_MergedGlobals+8
                 errs[0].msg.contains("must be a label defined before this"),
                 "{bad}: {errs:?}"
             );
+        }
+        // And the address must be in the label's section: not before its
+        // start, nor past 4 GiB, even when the addend wraps around in 64
+        // bits (x + 0x7fffffffffffffff is 0x8000000000000003, which llvm-mc
+        // takes, but no merlin-as section reaches it).
+        for bad in [
+            ".data\nx: .word 0\n.set y, x - 1\n",
+            ".data\nx: .word 0\n.set y, x + 0x100000000\n",
+            ".data\n.word 0\nx: .word 0\n.equ BIG, 0x7fffffffffffffff\n.set y, x + BIG\n",
+        ] {
+            let errs = crate::assemble(bad).unwrap_err();
+            assert_eq!(errs[0].msg, ".set: 'y' would be outside its section", "{bad}");
         }
     }
 }

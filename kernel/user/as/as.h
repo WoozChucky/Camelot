@@ -11,6 +11,7 @@
  *   parser.c  tokens to statements (parser.rs)
  *   encode.c  one instruction to machine words (encode.rs)
  *   asm.c     sections, symbols, directives, local labels (asm.rs)
+ *   section.c a section's ELF type, flags and entry size (section.rs)
  *   dwarf.c   the DWARF line table of `.file` and `.loc` (dwarf.rs)
  *   elf.c     the relocatable object file (elf.rs)
  *   tables.h  the encodings, names and numbers, generated from the host
@@ -39,8 +40,8 @@ char *tmp_strndup(const char *s, uint n);
 void *grow(void *p, uint *cap, uint need, uint size);
 void die(const char *msg);
 /* A formatted message in tmp memory, as long as it needs to be (merlin-as's
- * messages hold whole names): %s %d %u %x %c %%, and a width with 0 for %x
- * (%08x). */
+ * messages hold whole names): %s %d %u %x %X (upper case) %c %%, and a
+ * width with 0 for %x (%08x). */
 char *fmt(const char *f, ...);
 
 /* A byte buffer. */
@@ -204,8 +205,34 @@ uint j_imm(int imm);
 /* value = (hi << 12) + lo, lo the sign-extended low 12 bits. */
 void hi_lo(int value, uint *hi, int *lo);
 
+/* ---- Sections' ELF attributes (section.c) ---- */
+/* A section's sh_type, sh_flags and sh_entsize (SHT_* and SHF_* are in
+ * tables.h). */
+struct sec_attrs {
+    uint ty;
+    uint flags;
+    uint entsize;
+};
+/* The type and flags LLVM gives a section from its name alone. */
+void section_name_defaults(const char *name, uint *ty, uint *flags);
+/* Whether `name` is one of the sections LLVM makes before the first line,
+ * and if so, its attributes in *out. */
+int section_predefined(const char *name, struct sec_attrs *out);
+/* The attributes of a section named without a `.section` that says more:
+ * LLVM's own for a predefined one, else its name's defaults. */
+void section_by_name(const char *name, struct sec_attrs *out);
+/* The `len` bytes at s as a number, read as LLVM's getAsInteger(0) reads
+ * a whole string (0x, 0b, 0o or 0 for octal, else decimal), in *out.
+ * Returns 0 if they are none or the number passes 32 bits. */
+int section_number(const uchar *s, uint len, uint *out);
+/* The flags of a `.section` flags string, a number or letters, in *out.
+ * Returns 0 at the first byte that is no flag letter (G and o too), which
+ * goes in *bad. */
+int section_flags(const uchar *s, uint len, uint *out, uint *bad);
+/* The type a `.section` type name or number stands for, in *out; 0 if none. */
+int section_type(const uchar *s, uint len, uint *out);
+
 /* ---- The object (asm.c) ---- */
-enum { SEC_TEXT, SEC_DATA, SEC_RODATA, SEC_BSS, SEC_DEBUG };
 enum { SYM_NOTYPE, SYM_FUNC, SYM_OBJECT, SYM_SECTION };
 
 struct reloc {
@@ -221,7 +248,7 @@ struct reloc {
 
 struct section {
     char *name;
-    int kind;
+    struct sec_attrs attrs;
     struct buf data;
     uint size;
     uint align;

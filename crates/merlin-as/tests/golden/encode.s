@@ -155,6 +155,8 @@ seqz a0, a1
 snez a0, a1
 sltz a0, a1
 sgtz a0, a1
+sgt a0, a1, a2
+sgtu t0, t1, t2
 j 16
 jr ra
 jalr t0

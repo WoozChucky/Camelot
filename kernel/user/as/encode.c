@@ -1006,6 +1006,18 @@ static int encode_named(const char *m, struct operand *ops, uint nops) {
         emit_word(w);
         return 1;
     }
+    if (is(m, "sgt") || is(m, "sgtu")) {
+        /* sgt rd, a, b is slt rd, b, a: the sources swapped (sgtu: sltu). */
+        if (nops != 3) {
+            return usage("rd, rs, rt");
+        }
+        uint rt;
+        if (!reg(&ops[0], &rd) || !reg(&ops[1], &rs) || !reg(&ops[2], &rt)) {
+            return 0;
+        }
+        emit_word(r_type(OPC_OP, is(m, "sgt") ? 2 : 3, 0, rd, rt, rs));
+        return 1;
+    }
     if (is(m, "j")) {
         if (nops != 1) {
             return usage("offset");
