@@ -72,7 +72,9 @@
 //!   directive, so a comment may not start with `# if` or `# define`.
 //! * `__ASSEMBLER__` is defined.
 //! * Pasting two tokens that do not form one (`. ## name`) is no error: they
-//!   stay two, written with nothing between them.
+//!   stay two, written with nothing between them, unless the second is a
+//!   token of the macro's body with a space before it (`call f ## @plt`
+//!   is `call foo @plt`, as in clang).
 //! * Trigraphs are characters, and what is no C token (`$`, `@`, `\`)
 //!   passes through ([`lexer::lex_pp_asm`]).
 //!
@@ -1286,6 +1288,11 @@ impl Pp<'_> {
                 space = true;
             }
             let next_is_paste = body.get(i + 1).is_some_and(|n| n.is_punct("##"));
+            // After a `##` that forms no token (assembly), a token of the
+            // body keeps the space it had before it (`call f ## @plt` is
+            // `call foo @plt`, as in clang); an argument's first token has
+            // none (`f ## g` with `@plt` is `foo@plt`).
+            let own_space = t.space && m.param(t).is_none();
             // In a function-like macro, `#` is always before a parameter
             // (`define` checks).
             let stringized = body
@@ -1340,7 +1347,7 @@ impl Pp<'_> {
                 paste = false;
                 let left = out.pop().expect("'##' is never first in a body");
                 match piece.next() {
-                    Some(right) => out.extend(glue(left, right, self.asm)?),
+                    Some(right) => out.extend(glue(left, right, self.asm, own_space)?),
                     None => out.push(left), // an argument that expanded to nothing
                 }
             }
@@ -1943,9 +1950,11 @@ fn stringize(arg: &[PTok]) -> Option<String> {
 }
 
 /// `left ## right`: the two spellings joined, which must read as one token.
-/// In assembly (`asm`) two that do not stay two, with no space between
-/// them, as clang leaves them (`. ## name` is `.name`).
-fn glue(left: PTok, right: PTok, asm: bool) -> Result<Vec<PTok>, Error> {
+/// In assembly (`asm`) two that do not stay two, as clang leaves them:
+/// `right` with a space before it if it is a token of the macro's body
+/// written with one (`space`: `call f ## @plt` is `call foo @plt`), else
+/// with none (`. ## name` is `.name`).
+fn glue(left: PTok, right: PTok, asm: bool, space: bool) -> Result<Vec<PTok>, Error> {
     if left.t.kind == PpKind::Placemarker {
         return Ok(vec![right]);
     }
@@ -1964,8 +1973,8 @@ fn glue(left: PTok, right: PTok, asm: bool) -> Result<Vec<PTok>, Error> {
     let Some(kind) = one else {
         if asm {
             let mut right = right;
-            right.t.space = false;
-            right.lead = false;
+            right.t.space = space;
+            right.lead = space;
             return Ok(vec![left, right]);
         }
         return Err(Error::new(
@@ -2953,6 +2962,16 @@ puts( "The first, second, and third items." );
             "# 1 \"main.S\"\n\n\n\n\n # A comment: don't R 'a' R, R\n  # 2^64 - 1, lw\n\n \
              li a0, 'a' # it's R\n    li a0, 1\n lw lw\n  x = -lw -1 lw- 1+lw lw+1 [a] [1]+1 [-]-1\n  \
              .lw 12 x+ .L1: ?? =??=\n  la a0, $x@ \\rs1\n  [a b] [c\n   d] z\n"
+        );
+        // A `##` that forms no token: a token of the body keeps the space
+        // it had before it, an argument's first token has none.
+        let src = "#define C1(f) call f ## @plt\n#define C2(f) call f ##@plt\n\
+                   #define C3(f, g) call f ## g\n#define C4(f) call f ## %lo\n#define C5(f) f ## :\n\
+                   \x20 C1(foo)\n  C2(foo)\n  C3(foo, @plt)\n  C3(foo, @ plt)\n  C4(foo)\n  C5(lbl) nop\n";
+        assert_eq!(
+            asm(&[], src),
+            "# 1 \"main.S\"\n\n\n\n\n\n  call foo @plt\n  call foo@plt\n  call foo@plt\n  call foo@ plt\n  \
+             call foo %lo\n  lbl : nop\n"
         );
         // `__ASSEMBLER__`, and the width.
         assert_eq!(asm(&[], "__ASSEMBLER__ __riscv_xlen"), "# 1 \"main.S\"\n1 32\n");
