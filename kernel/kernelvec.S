@@ -17,7 +17,7 @@
 # anything is stored, as Linux's handle_exception does under CONFIG_VMAP_STACK
 # (arch/riscv/kernel/entry.S). Each stack is the lower half of a slot of
 # twice KSTACK_SIZE, aligned to that, so bit KSTACK_SHIFT of an address is 0
-# on the stack and 1 just below it: one bit of sp - FRAME_SIZE says whether
+# on the stack and 1 just below it: one bit of sp - TRAP_FRAME_SIZE says whether
 # the frame still fits. Testing it needs a free register, and the only one
 # is sscratch: in S-mode it holds nothing (user_return sets it again before
 # every return to U-mode), so t0 goes there for the test. A frame that does
@@ -26,18 +26,8 @@
 # page, and again, until sp left the guard page for whatever lies below.
 
 #include <asm.h>
-
-#if __riscv_xlen == 64
-    .equ FRAME_SIZE, 304        # TRAP_FRAME_SIZE, a multiple of 16
-    .equ KSTACK_SHIFT, 14       # log2 of KSTACK_SIZE (16 KiB, vm.h)
-    .equ OVERFLOW_STACK_SHIFT, 12 # log2 of OVERFLOW_STACK_SIZE (4 KiB, Linux's)
-#else
-    .equ FRAME_SIZE, 160
-#endif
-    .equ FRAME_SEPC, 32*SZREG
-    .equ FRAME_SCAUSE, 33*SZREG
-    .equ FRAME_STVAL, 34*SZREG
-    .equ FRAME_SSTATUS, 35*SZREG
+#include "trap.h"               /* TRAP_FRAME_SIZE, FRAME_SEPC... */
+#include "vm.h"                 /* KSTACK_SHIFT, OVERFLOW_STACK_SHIFT */
 
     .text
     .align 2
@@ -45,13 +35,13 @@
 kernel_vec:
 #if __riscv_xlen == 64
     csrw  sscratch, t0
-    addi  t0, sp, -FRAME_SIZE
+    addi  t0, sp, -TRAP_FRAME_SIZE
     srli  t0, t0, KSTACK_SHIFT
     andi  t0, t0, 1
     bnez  t0, kernel_stack_overflow
     csrr  t0, sscratch
 #endif
-    addi  sp, sp, -FRAME_SIZE
+    addi  sp, sp, -TRAP_FRAME_SIZE
     # regs[0] is x0 (always 0) and regs[2] the sp from before the trap;
     # both are stored once a temporary is free.
     REG_S ra, 1*SZREG(sp)
@@ -85,7 +75,7 @@ kernel_vec:
     REG_S t5, 30*SZREG(sp)
     REG_S t6, 31*SZREG(sp)
     REG_S zero, 0*SZREG(sp)
-    addi  t0, sp, FRAME_SIZE
+    addi  t0, sp, TRAP_FRAME_SIZE
     REG_S t0, 2*SZREG(sp)
     csrr  t0, sepc
     REG_S t0, FRAME_SEPC(sp)
@@ -133,7 +123,7 @@ kernel_vec:
     REG_L t4, 29*SZREG(sp)
     REG_L t5, 30*SZREG(sp)
     REG_L t6, 31*SZREG(sp)
-    addi  sp, sp, FRAME_SIZE
+    addi  sp, sp, TRAP_FRAME_SIZE
     sret
 
 #if __riscv_xlen == 64
@@ -151,7 +141,7 @@ kernel_stack_overflow:
     add   sp, sp, tp
     srli  tp, tp, OVERFLOW_STACK_SHIFT
     addi  tp, tp, -1
-    addi  sp, sp, -FRAME_SIZE
+    addi  sp, sp, -TRAP_FRAME_SIZE
     REG_S ra, 1*SZREG(sp)
     REG_S gp, 3*SZREG(sp)
     REG_S tp, 4*SZREG(sp)

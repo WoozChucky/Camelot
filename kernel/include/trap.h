@@ -2,6 +2,10 @@
 #ifndef CAMELOT_TRAP_H
 #define CAMELOT_TRAP_H
 
+/* Assembly includes this file too, for the trap frame's layout (kernelvec.S,
+ * uservec.S) and the exit codes (entry.S): the C is under
+ * #ifndef __ASSEMBLER__ (const.h). */
+#ifndef __ASSEMBLER__
 #include "spinlock.h"
 #include "types.h"
 
@@ -32,17 +36,40 @@ struct trap_frame {
 #endif
 };
 
+#endif
+
+/* The frame's layout, which kernelvec.S and uservec.S use: its size, a
+ * multiple of 16, and the CSRs' offsets, after the 32 registers, in slots a
+ * register wide (FRAME_SLOT). */
 #if __riscv_xlen == 64
 #define TRAP_FRAME_SIZE 304
+#define FRAME_SLOT 8
 #else
 #define TRAP_FRAME_SIZE 160
+#define FRAME_SLOT 4
 #endif
-_Static_assert(sizeof(struct trap_frame) == TRAP_FRAME_SIZE, "kernelvec.S and uservec.S use TRAP_FRAME_SIZE");
-_Static_assert(offsetof(struct trap_frame, sepc) == 32 * sizeof(uintptr), "the FRAME_ offsets of the .S files");
-_Static_assert(offsetof(struct trap_frame, kernel_tp) == 36 * sizeof(uintptr), "the FRAME_ offsets of the .S files");
+#define FRAME_SEPC (32 * FRAME_SLOT)
+#define FRAME_SCAUSE (33 * FRAME_SLOT)
+#define FRAME_STVAL (34 * FRAME_SLOT)
+#define FRAME_SSTATUS (35 * FRAME_SLOT)
+#define FRAME_KERNEL_TP (36 * FRAME_SLOT)
 
-/* Exit code after a kernel panic. (0xff means an unexpected M-mode trap.) */
+#ifndef __ASSEMBLER__
+_Static_assert(sizeof(struct trap_frame) == TRAP_FRAME_SIZE, "kernelvec.S and uservec.S use TRAP_FRAME_SIZE");
+_Static_assert(sizeof(uintptr) == FRAME_SLOT, "a frame slot is a register wide");
+_Static_assert(offsetof(struct trap_frame, sepc) == FRAME_SEPC, "kernelvec.S and uservec.S use FRAME_SEPC");
+_Static_assert(offsetof(struct trap_frame, scause) == FRAME_SCAUSE, "kernelvec.S and uservec.S use FRAME_SCAUSE");
+_Static_assert(offsetof(struct trap_frame, stval) == FRAME_STVAL, "kernelvec.S and uservec.S use FRAME_STVAL");
+_Static_assert(offsetof(struct trap_frame, sstatus) == FRAME_SSTATUS, "kernelvec.S and uservec.S use FRAME_SSTATUS");
+_Static_assert(offsetof(struct trap_frame, kernel_tp) == FRAME_KERNEL_TP, "uservec.S uses FRAME_KERNEL_TP");
+#endif
+
+/* Exit code after a kernel panic, and after an unexpected M-mode trap or
+ * an S-mode one before kernel_vec (entry.S's early_trap, early_s_trap). */
 #define PANIC_EXIT_CODE 0xfe
+#define EXIT_UNEXPECTED_TRAP 0xff
+
+#ifndef __ASSEMBLER__
 
 /* Timer ticks since boot, counted by kernel_trap under `tickslock` (which
  * the sleep system call sleeps with). A single aligned word, so reading it
@@ -131,5 +158,6 @@ void panic(const char *msg);
  * 0x0505050505050505 on RV64), so a test can check the panic's register
  * dump. Never returns. */
 void illegal_instruction(void);
+#endif
 
 #endif

@@ -33,25 +33,18 @@
 #   5         1 when the last SSIP came with a timer tick (a u32)
 
 #include <asm.h>
+#include "clint.h"              /* CLINT_BASE: msip of hart h at + 4 * h */
+#include "machine.h"            /* MCALL_HALT, MCALL_IPI, MSCRATCH_* */
+#include "riscv.h"              /* CAUSE_INTERRUPT, IRQ_M_*, CAUSE_ECALL_S, MIP_SSIP */
 
-    .equ CLINT_MSIP, 0x02000000
-#if __riscv_xlen == 64
-    .equ MCAUSE_MSI, 0x8000000000000003
-    .equ MCAUSE_MTI, 0x8000000000000007
-#else
-    .equ MCAUSE_MSI, 0x80000003
-    .equ MCAUSE_MTI, 0x80000007
-#endif
-    .equ MCAUSE_ECALL_S, 9
-    .equ MCALL_HALT, 0
-    .equ MCALL_IPI, 1
-    .equ SCRATCH_A1, 0*SZREG
-    .equ SCRATCH_A2, 1*SZREG
-    .equ SCRATCH_A3, 2*SZREG
-    .equ SCRATCH_INTERVAL, 3*SZREG
-    .equ SCRATCH_MTIMECMP, 4*SZREG
-    .equ SCRATCH_TICK, 5*SZREG
-    .equ MIP_SSIP, 2
+    .equ MCAUSE_MSI, CAUSE_INTERRUPT | IRQ_M_SOFT
+    .equ MCAUSE_MTI, CAUSE_INTERRUPT | IRQ_M_TIMER
+    .equ SCRATCH_A1, (MSCRATCH_SAVE0 + 0) * SZREG
+    .equ SCRATCH_A2, (MSCRATCH_SAVE0 + 1) * SZREG
+    .equ SCRATCH_A3, (MSCRATCH_SAVE0 + 2) * SZREG
+    .equ SCRATCH_INTERVAL, MSCRATCH_INTERVAL * SZREG
+    .equ SCRATCH_MTIMECMP, MSCRATCH_MTIMECMP * SZREG
+    .equ SCRATCH_TICK, MSCRATCH_TICK * SZREG
 
     .text
     .align 2
@@ -66,7 +59,7 @@ machine_vec:
     beq   a1, a2, machine_timer
     li    a2, MCAUSE_MSI
     beq   a1, a2, machine_soft
-    li    a2, MCAUSE_ECALL_S
+    li    a2, CAUSE_ECALL_S
     beq   a1, a2, machine_call
     j     early_trap
 
@@ -99,7 +92,7 @@ machine_timer:
 machine_soft:
     csrr  a1, mhartid
     slli  a1, a1, 2
-    li    a2, CLINT_MSIP
+    li    a2, CLINT_BASE
     add   a1, a1, a2
     sw    zero, 0(a1)
     csrsi mip, MIP_SSIP
@@ -115,7 +108,7 @@ machine_call:
     bne   a7, a2, machine_call_unknown
     # msip[i] = 1 for every bit i of the caller's a0, from bit 0 up.
     csrr  a1, mscratch          # the caller's a0: the harts
-    li    a2, CLINT_MSIP
+    li    a2, CLINT_BASE
 1:  beqz  a1, 3f
     andi  a3, a1, 1
     beqz  a3, 2f

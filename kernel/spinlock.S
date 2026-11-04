@@ -5,31 +5,20 @@
 # kprintf, sleep and wakeup: merlin's C would make each call several times
 # longer. The C each function stands for is in its comment.
 #
-# struct spinlock: locked (a u32) at 0, cpu (a pointer) at LOCK_CPU (name
-# after it, only read by C). struct cpu: proc at 0, the u32s noff and intena
-# at CPU_NOFF and CPU_INTENA, CPU_SIZE bytes per entry of cpus[], indexed by
-# tp, the hart id. Keep these in sync with spinlock.h, whose _Static_asserts
-# check the C side: on RV64 the pointers are 8 bytes, 8-aligned.
+# struct spinlock: locked (a u32) at LOCK_LOCKED, cpu (a pointer) at
+# LOCK_CPU (name after it, only read by C). struct cpu: proc at 0, the u32s
+# noff and intena at CPU_NOFF and CPU_INTENA, CPU_SIZE bytes per entry of
+# cpus[], indexed by tp, the hart id. spinlock.h defines them, and its
+# _Static_asserts check them against the structures: on RV64 the pointers
+# are 8 bytes, 8-aligned.
 #
 # The C each function stands for is in a C comment, not a # one: this file
 # goes through the C preprocessor, which would take `#  if (...)` for a
 # directive.
 
 #include <asm.h>
-
-    .equ LOCK_LOCKED, 0
-#if __riscv_xlen == 64
-    .equ LOCK_CPU, 8
-    .equ CPU_NOFF, 8
-    .equ CPU_INTENA, 12
-    .equ CPU_SIZE, 168
-#else
-    .equ LOCK_CPU, 4
-    .equ CPU_NOFF, 4
-    .equ CPU_INTENA, 8
-    .equ CPU_SIZE, 92
-#endif
-    .equ SSTATUS_SIE, 2
+#include "riscv.h"              /* SSTATUS_SIE */
+#include "spinlock.h"           /* LOCK_LOCKED, LOCK_CPU, CPU_NOFF, CPU_INTENA, CPU_SIZE */
 
     .text
 

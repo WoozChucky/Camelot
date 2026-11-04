@@ -23,14 +23,19 @@
 #ifndef CAMELOT_SPINLOCK_H
 #define CAMELOT_SPINLOCK_H
 
+/* Assembly includes this file too (spinlock.S, for the layouts below;
+ * entry.S, for NCPU): the C is under #ifndef __ASSEMBLER__ (const.h). */
+#ifndef __ASSEMBLER__
 #include "context.h"
 #include "types.h"
 #include "vm.h"
+#endif
 
 /* The most harts the kernel can run on: Grail's limit (spec section 7,
  * "Harts"). cpus[] has one entry per hart, indexed by mhartid. */
 #define NCPU 8
 
+#ifndef __ASSEMBLER__
 struct proc;
 struct thread;
 
@@ -38,9 +43,9 @@ struct thread;
  * set by _start in M-mode and never changed by the kernel; user_vec puts it
  * back after a trap from U-mode, where programs may use tp as they like), so
  * mycpu() is &cpus[tp]. spinlock.S reaches the fields at fixed offsets
- * (CPU_NOFF, CPU_INTENA) and the entries at CPU_SIZE apart, which it defines
- * for each width as below: keep them in sync (the _Static_asserts check
- * this side). */
+ * (CPU_NOFF, CPU_INTENA) and the entries at CPU_SIZE apart, as defined for
+ * each width below, which the _Static_asserts check against the
+ * structure. */
 struct cpu {
     /* The process of the thread running on this hart (thread->proc), or
      * NULL while the hart runs the scheduler loop or kmain. */
@@ -73,6 +78,7 @@ struct cpu {
     /* The thread running on this hart, or NULL with `proc`. */
     struct thread *thread;
 };
+#endif
 
 /* The layout spinlock.S and the kernel tests (crates/xtask/tests/common)
  * use. RV64's pointers and saved registers are 8 bytes, and the pointers
@@ -92,6 +98,8 @@ struct cpu {
 #define CPU_THREAD 88
 #define CPU_SIZE 92
 #endif
+
+#ifndef __ASSEMBLER__
 _Static_assert(sizeof(struct cpu) == CPU_SIZE, "spinlock.S indexes cpus[] by CPU_SIZE");
 _Static_assert(offsetof(struct cpu, noff) == CPU_NOFF, "spinlock.S reads noff at CPU_NOFF");
 _Static_assert(offsetof(struct cpu, intena) == CPU_INTENA, "spinlock.S reads intena at CPU_INTENA");
@@ -113,8 +121,8 @@ u32 cpuid(void);
  * calls it first thing, before anything takes a lock. */
 void cpu_init(void);
 
-/* The fields are at fixed offsets (locked at 0, cpu at LOCK_CPU: 4 on RV32,
- * 8 on RV64): spinlock.S uses them. */
+/* The fields are at fixed offsets (locked at LOCK_LOCKED, 0, cpu at
+ * LOCK_CPU: 4 on RV32, 8 on RV64): spinlock.S uses them. */
 struct spinlock {
     /* 0 when free, 1 when held: acquire() swaps a 1 in with amoswap.w. */
     u32 locked;
@@ -123,12 +131,17 @@ struct spinlock {
     /* For the panic messages. */
     const char *name;
 };
+#endif
 
+#define LOCK_LOCKED 0
 #if __riscv_xlen == 64
 #define LOCK_CPU 8
 #else
 #define LOCK_CPU 4
 #endif
+
+#ifndef __ASSEMBLER__
+_Static_assert(offsetof(struct spinlock, locked) == LOCK_LOCKED, "spinlock.S swaps locked at LOCK_LOCKED");
 _Static_assert(offsetof(struct spinlock, cpu) == LOCK_CPU, "spinlock.S reads cpu at LOCK_CPU");
 
 /* Sets up `lk`, unlocked. A lock in .bss that is all zero works unlocked
@@ -164,5 +177,6 @@ void spin_panic(const struct spinlock *lk, const char *what);
 
 /* Reads tp (spinlock.S): the hart's id. */
 u32 r_tp(void);
+#endif
 
 #endif

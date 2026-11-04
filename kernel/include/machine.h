@@ -5,7 +5,11 @@
 #ifndef CAMELOT_MACHINE_H
 #define CAMELOT_MACHINE_H
 
+/* Assembly includes this file too (machine.S), for the machine calls and the
+ * scratch block's layout: the C is under #ifndef __ASSEMBLER__ (const.h). */
+#ifndef __ASSEMBLER__
 #include "types.h"
+#endif
 
 /* Machine calls: `ecall` from S-mode with the function number in a7 and the
  * arguments in a0-a6. Unknown functions return -1 in a0. */
@@ -14,9 +18,9 @@
 
 /* Layout of each hart's block of machine_scratch, which its mscratch points
  * at: slots a register wide (XLEN bits), since machine_vec saves registers
- * in them and holds an address. machine.S uses the same slot numbers (as
- * .equ constants, times SZREG): keep them in sync. The tick slot is read
- * and swapped as a u32, its low half on RV64. */
+ * in them and holds an address. machine.S uses these slot numbers, times
+ * SZREG. The tick slot is read and swapped as a u32, its low half on
+ * RV64. */
 #define MSCRATCH_SAVE0 0    /* slots 0-2: a1-a3 while machine_vec runs */
 #define MSCRATCH_INTERVAL 3 /* timer interval in mtime ticks */
 #define MSCRATCH_MTIMECMP 4 /* the physical address of the hart's mtimecmp in the CLINT */
@@ -28,6 +32,7 @@
  * mscratch holds the block's physical address, and machine_vec reaches the
  * CLINT at its physical address too. S-mode reaches the same memory at the
  * symbol's (virtual) address. */
+#ifndef __ASSEMBLER__
 extern uintptr machine_scratch[];
 
 /* M-mode setup, called from _start (entry.s) on every hart, on its own
@@ -51,5 +56,6 @@ void machine_halt(u32 code);
  * bit is set in `harts`, which machine_vec there turns into a supervisor
  * software interrupt (spec section 10, "Kernel SMP"). */
 void machine_ipi(u32 harts);
+#endif
 
 #endif

@@ -1,9 +1,10 @@
 //! merlin's preprocessor in assembler-with-cpp mode against clang's (#193):
-//! every `.S` source of the repository (the examples, the boot ROM,
-//! merlin-ld's and merlin-objdump's test fixtures: every `.S` file outside
-//! `target/` and hidden directories) and `include/asm.h`, preprocessed for
-//! RV32 and for RV64 with
-//! `-I include`, must come out of `merlin -E` exactly as out of
+//! every `.S` source of the repository (the examples, the boot ROM, the
+//! kernel's assembly and linker script, merlin-ld's and merlin-objdump's
+//! test fixtures: every `.S` file outside `target/` and hidden directories)
+//! and `include/asm.h`, preprocessed for RV32 and for RV64 with
+//! `-I include` (and `-I kernel/include` for the kernel's, whose headers it
+//! shares with the C), must come out of `merlin -E` exactly as out of
 //! `clang -E -x assembler-with-cpp`, but for two things clang writes that
 //! merlin does not:
 //!
@@ -75,6 +76,16 @@ fn normalized(clang: &str) -> String {
     out.iter().map(|l| format!("{l}\n")).collect()
 }
 
+/// The `-I` directories for `source`, relative to the repository root:
+/// `include`, and the kernel's headers for a kernel source.
+fn include_dirs(source: &str) -> Vec<&'static str> {
+    if source.starts_with("kernel/") {
+        vec!["include", "kernel/include"]
+    } else {
+        vec!["include"]
+    }
+}
+
 fn clang_e(root: &Path, source: &str, x: Xlen, line_markers: bool) -> String {
     let (target, march, mabi) = match x {
         Xlen::Rv32 => ("riscv32", "rv32ima_zicsr_zifencei", "ilp32"),
@@ -89,10 +100,9 @@ fn clang_e(root: &Path, source: &str, x: Xlen, line_markers: bool) -> String {
             "-E",
             "-x",
             "assembler-with-cpp",
-            "-I",
-            "include",
-            source,
         ])
+        .args(include_dirs(source).iter().flat_map(|d| ["-I", d]))
+        .arg(source)
         .current_dir(root)
         .output()
         .expect("clang on the PATH");
@@ -108,7 +118,7 @@ fn merlin_e(root: &Path, source: &str, x: Xlen, line_markers: bool) -> String {
     let text = std::fs::read_to_string(root.join(source)).unwrap();
     let opts = merlin::Options {
         xlen: x,
-        include_dirs: vec![PathBuf::from("include")],
+        include_dirs: include_dirs(source).into_iter().map(PathBuf::from).collect(),
         line_markers,
         ..merlin::Options::default()
     };

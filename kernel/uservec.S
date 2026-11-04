@@ -17,12 +17,7 @@
 # Every slot is a register wide (SZREG, asm.h), as in kernelvec.S.
 
 #include <asm.h>
-
-    .equ FRAME_SEPC, 32*SZREG
-    .equ FRAME_SCAUSE, 33*SZREG
-    .equ FRAME_STVAL, 34*SZREG
-    .equ FRAME_SSTATUS, 35*SZREG
-    .equ FRAME_KERNEL_TP, 36*SZREG
+#include "trap.h"               /* FRAME_SEPC... FRAME_KERNEL_TP */
 
     .text
     .align 2

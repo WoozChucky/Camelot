@@ -25,7 +25,13 @@
 #ifndef CAMELOT_VM_H
 #define CAMELOT_VM_H
 
+#include "const.h"
 #include "memlayout.h"
+
+/* Assembly includes this file too, for the kernel stacks' and the early
+ * page table's sizes (entry.S, kernelvec.S) and the link address
+ * (kernel.lds.S): the C is under #ifndef __ASSEMBLER__ (const.h). */
+#ifndef __ASSEMBLER__
 #include "types.h"
 
 #if __riscv_xlen == 64
@@ -34,6 +40,7 @@ typedef u64 pte_t;
 typedef u32 pte_t;
 #endif
 typedef pte_t *pagetable_t; /* one page: PTES_PER_TABLE PTEs */
+#endif
 
 #define PTE_V (1u << 0) /* valid */
 #define PTE_R (1u << 1) /* readable */
@@ -58,8 +65,10 @@ typedef pte_t *pagetable_t; /* one page: PTES_PER_TABLE PTEs */
 /* The paging mode, chosen once at boot by probing satp (vm.c, setup_vm(),
  * as Linux's set_satp_mode()): Sv48 where the hart has it, Sv39 otherwise.
  * pt_levels is 4 or 3, satp_mode SATP_MODE_SV48 or SATP_MODE_SV39. */
+#ifndef __ASSEMBLER__
 extern u32 pt_levels;
 extern uintptr satp_mode;
+#endif
 #define PT_LEVELS pt_levels
 /* satp value that turns paging on with root table `pt`, a kernel pointer. */
 #define MAKE_SATP(pt) (satp_mode | (pa(pt) >> PGSHIFT))
@@ -109,7 +118,7 @@ extern uintptr satp_mode;
  * kernel_map and PAGE_OFFSET are: the image's link address is the same in
  * both modes, so the kernel is linked once. */
 #if __riscv_xlen == 64
-#define KERNEL_LINK_ADDR 0xffffffff80000000ull
+#define KERNEL_LINK_ADDR _UL(0xffffffff80000000)
 #define PAGE_OFFSET_SV48 0xffffaf8000000000ull
 #define PAGE_OFFSET_SV39 0xffffffd600000000ull
 #define VMALLOC_START_SV48 0xffff8f8000000000ull
@@ -123,6 +132,7 @@ extern uintptr satp_mode;
 #define DIRECT_MAP_SIZE_SV39 0x2000000000ull
 
 /* Set by setup_vm() before paging goes on, read-only afterwards. */
+#ifndef __ASSEMBLER__
 extern uintptr page_offset;   /* PAGE_OFFSET */
 extern uintptr vmalloc_start; /* VMALLOC_START */
 extern u64 direct_map_size;   /* the most of RAM the direct map holds */
@@ -134,18 +144,21 @@ extern uintptr va_pa_offset;
  * kernel_map.va_kernel_pa_offset). entry.S adds it to jump to the high
  * addresses. */
 extern uintptr va_kernel_pa_offset;
+#endif
 #define PAGE_OFFSET page_offset
 #define VMALLOC_START vmalloc_start
 
 /* The physical address of kernel pointer `v`: a direct-map pointer, or one
  * into the kernel image (its code, data and boot stack), as Linux's __pa().
  * Page tables, satp and the devices' DMA registers take physical addresses. */
+#ifndef __ASSEMBLER__
 static inline phys_addr_t kernel_pa(uintptr v) {
     if (v >= KERNEL_LINK_ADDR) {
         return v - va_kernel_pa_offset;
     }
     return v - va_pa_offset;
 }
+#endif
 #define pa(v) kernel_pa((uintptr)(v))
 /* The kernel's pointer to physical address `p` of RAM: its direct-map
  * address, as Linux's __va(). */
@@ -159,7 +172,9 @@ static inline phys_addr_t kernel_pa(uintptr v) {
  * (`size` bytes, all mapped by kvminit(), which maps every device in the
  * sysinfo table): VMALLOC_START + p on RV64, p itself on RV32. Panics if the
  * range is outside the devices' window. After paging is on. */
+#ifndef __ASSEMBLER__
 uintptr ioremap(phys_addr_t p, usize size);
+#endif
 
 /* ---- Kernel stacks ----
  *
@@ -176,7 +191,7 @@ uintptr ioremap(phys_addr_t p, usize size);
  * identity there, and RV32 goes in #159). */
 #if __riscv_xlen == 64
 #define KSTACK_SHIFT 14
-#define KSTACK_SIZE (1ul << KSTACK_SHIFT)
+#define KSTACK_SIZE (_UL(1) << KSTACK_SHIFT)
 #define KSTACK_SLOT (2 * KSTACK_SIZE)
 /* Where the stacks start: after the devices' window. They take what one
  * root entry of the vmalloc area holds (kvminit() makes that entry, before
@@ -187,9 +202,13 @@ uintptr ioremap(phys_addr_t p, usize size);
  * it: 256 GiB of them in Sv48, 512 MiB (16384 stacks) in Sv39. */
 #define VM_TEST_AREA (KSTACK_AREA + LEVEL_SIZE(PT_LEVELS - 1) / 2)
 /* Each hart's overflow stack, for the report of an overflow: kernel_vec
- * puts the frame at overflow_stacks + (hart + 1) * OVERFLOW_STACK_SIZE. */
-#define OVERFLOW_STACK_SIZE 4096
+ * puts the frame at overflow_stacks + (hart + 1) * OVERFLOW_STACK_SIZE
+ * (Linux's OVERFLOW_STACK_SIZE, 4 KiB; entry.S reserves NCPU of them). */
+#define OVERFLOW_STACK_SHIFT 12
+#define OVERFLOW_STACK_SIZE (_UL(1) << OVERFLOW_STACK_SHIFT)
+#ifndef __ASSEMBLER__
 extern u8 overflow_stacks[];
+#endif
 #else
 #define KSTACK_SIZE PGSIZE
 #endif
@@ -197,6 +216,7 @@ extern u8 overflow_stacks[];
 /* A kernel stack: returns its lowest address (the stack is the KSTACK_SIZE
  * bytes from there; its top is that plus KSTACK_SIZE), or NULL if no memory
  * is left. Must be called with no spinlock held (it maps pages). */
+#ifndef __ASSEMBLER__
 void *kstack_alloc(void);
 
 /* Gives back a stack from kstack_alloc(), which nothing may run on any
@@ -243,7 +263,17 @@ void unmap_pages(pagetable_t pt, uintptr va, usize size, bool free_pages);
 /* Frees `pt` and every table under it. Every leaf must be unmapped first
  * (else panic): the pages they map belong to someone else. */
 void pagetable_free(pagetable_t pt);
+#endif
 
+#if __riscv_xlen == 64
+/* The early page table's lower tables (vm.c, setup_vm()), a page each, in
+ * .bss after early_pg_dir, the root (entry.S): Sv48 needs at most seven,
+ * two under the root for each of the image's two addresses, two for the
+ * direct map of 1 TiB, one for the devices. */
+#define EARLY_TABLES 8
+#endif
+
+#ifndef __ASSEMBLER__
 #if __riscv_xlen == 64
 /* With paging off, on hart 0, before anything else in S-mode (entry.S):
  * probes the paging mode, reads RAM from sysinfo and builds the early page
@@ -275,6 +305,7 @@ void vm_print_mapping(pagetable_t pt, uintptr va);
 
 /* The page table satp points at, or NULL while paging is off. */
 pagetable_t vm_active_pagetable(void);
+#endif
 
 /* User address spaces (spec section 10, "Kernel processes").
  *
@@ -305,7 +336,9 @@ pagetable_t vm_active_pagetable(void);
 #if __riscv_xlen == 64
 /* The top of user space for the paging mode: 2^47 (Sv48) or 2^38 (Sv39),
  * set by setup_vm(). */
+#ifndef __ASSEMBLER__
 extern uintptr user_top;
+#endif
 #define USER_TOP user_top
 #define USER_ROOT_ENTRIES (PTES_PER_TABLE / 2)
 #else
@@ -328,6 +361,7 @@ extern uintptr user_top;
  * USER_ROOT_ENTRIES on (sharing its tables), nothing in user space. NULL if
  * no page is free. Must be called after kvminit(), and the kernel must not
  * add root entries afterwards. */
+#ifndef __ASSEMBLER__
 pagetable_t uvm_create(void);
 
 /* Frees a table from uvm_create(): every page mapped in user space, the
@@ -355,5 +389,6 @@ int copyout(pagetable_t pt, uintptr va, const void *src, usize len);
  * if a byte up to its NUL is not readable user memory; -2 if it has no NUL in
  * its first `max` bytes. `dst` holds a string (maybe cut short) either way. */
 int copyinstr(pagetable_t pt, char *dst, uintptr va, u32 max);
+#endif
 
 #endif

@@ -8,16 +8,22 @@
 #ifndef CAMELOT_RISCV_H
 #define CAMELOT_RISCV_H
 
+#include "const.h"
+
+/* Assembly includes this file too (machine.S, spinlock.S), for the bits and
+ * causes: the accessors are under #ifndef __ASSEMBLER__ (const.h). */
+#ifndef __ASSEMBLER__
 #include "types.h"
+#endif
 
 /* mstatus / sstatus */
-#define MSTATUS_SIE (1ul << 1)
-#define MSTATUS_MIE (1ul << 3)
-#define MSTATUS_SPIE (1ul << 5)
-#define MSTATUS_MPIE (1ul << 7)
-#define MSTATUS_SPP (1ul << 8)
-#define MSTATUS_MPP_MASK (3ul << 11)
-#define MSTATUS_MPP_S (1ul << 11)
+#define MSTATUS_SIE (_UL(1) << 1)
+#define MSTATUS_MIE (_UL(1) << 3)
+#define MSTATUS_SPIE (_UL(1) << 5)
+#define MSTATUS_MPIE (_UL(1) << 7)
+#define MSTATUS_SPP (_UL(1) << 8)
+#define MSTATUS_MPP_MASK (_UL(3) << 11)
+#define MSTATUS_MPP_S (_UL(1) << 11)
 #define SSTATUS_SIE MSTATUS_SIE
 #define SSTATUS_SPIE MSTATUS_SPIE
 #define SSTATUS_SPP MSTATUS_SPP
@@ -31,11 +37,14 @@
 #define IRQ_S_EXT 9
 #define IRQ_M_EXT 11
 
-#define MIE_MSIE (1ul << IRQ_M_SOFT)
-#define MIE_MTIE (1ul << IRQ_M_TIMER)
-#define SIE_SSIE (1ul << IRQ_S_SOFT)
-#define SIE_SEIE (1ul << IRQ_S_EXT)
-#define SIP_SSIP (1ul << IRQ_S_SOFT)
+#define MIE_MSIE (_UL(1) << IRQ_M_SOFT)
+#define MIE_MTIE (_UL(1) << IRQ_M_TIMER)
+#define SIE_SSIE (_UL(1) << IRQ_S_SOFT)
+#define SIE_SEIE (_UL(1) << IRQ_S_EXT)
+#define SIP_SSIP (_UL(1) << IRQ_S_SOFT)
+/* The same bit in mip, which M-mode sets to raise the S-mode software
+ * interrupt (machine.S). */
+#define MIP_SSIP (_UL(1) << IRQ_S_SOFT)
 
 /* Exception causes (spec section 6). */
 #define CAUSE_INSTR_MISALIGNED 0
@@ -55,24 +64,28 @@
 
 /* Top bit of xcause: the trap is an interrupt. Bit XLEN-1: 31 on RV32, 63
  * on RV64. */
-#define CAUSE_INTERRUPT (1ul << (__riscv_xlen - 1))
+#define CAUSE_INTERRUPT (_UL(1) << (__riscv_xlen - 1))
 
 #if __riscv_xlen == 64
 /* satp: MODE in bits 63:60 (0 Bare, 8 Sv39, 9 Sv48), ASID in 59:44 (Camelot
  * uses 0), and the root page table's physical page number in 43:0. */
 #define SATP_MODE_SHIFT 60
-#define SATP_MODE_SV39 (8ul << SATP_MODE_SHIFT)
-#define SATP_MODE_SV48 (9ul << SATP_MODE_SHIFT)
-#define SATP_MODE_MASK (0xful << SATP_MODE_SHIFT)
-#define SATP_PPN_MASK 0x00000fffffffffffull
+#define SATP_MODE_SV39 (_UL(8) << SATP_MODE_SHIFT)
+#define SATP_MODE_SV48 (_UL(9) << SATP_MODE_SHIFT)
+#define SATP_MODE_MASK (_UL(0xf) << SATP_MODE_SHIFT)
+#define SATP_PPN_MASK _ULL(0x00000fffffffffff)
 #else
 /* satp: MODE (bit 31) = 1 selects Sv32; PPN (bits 21:0) is the physical page
  * number of the root page table. */
-#define SATP_SV32 (1ul << 31)
+#define SATP_SV32 (_UL(1) << 31)
 #define SATP_MODE_MASK SATP_SV32
-#define SATP_PPN_MASK 0x003fffffu
+#define SATP_PPN_MASK _U(0x003fffff)
 #endif
 
+/* Which counters S-mode may read: bit 1 (TM) is `time` (w_mcounteren()). */
+#define MCOUNTEREN_TM (_UL(1) << 1)
+
+#ifndef __ASSEMBLER__
 /* M-mode CSRs (only usable before start() drops to S-mode). */
 uintptr r_mstatus(void);
 void w_mstatus(uintptr v);
@@ -84,9 +97,8 @@ void w_medeleg(uintptr v);
 uintptr r_mideleg(void);
 void w_mideleg(uintptr v);
 void w_mie(uintptr v);
-/* Which counters S-mode may read: bit 1 (TM) is `time`. */
+/* Which counters S-mode may read (MCOUNTEREN_TM). */
 void w_mcounteren(uintptr v);
-#define MCOUNTEREN_TM (1ul << 1)
 
 /* S-mode CSRs. */
 uintptr r_sstatus(void);
@@ -130,5 +142,6 @@ u32 atomic_or(volatile u32 *p, u32 v);
  * store a word and then load the other's (cpus[i].pagetable against a PTE,
  * smp.c), which locks and AMOs don't cover. */
 void fence_rw(void);
+#endif
 
 #endif

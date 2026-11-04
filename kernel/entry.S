@@ -35,8 +35,9 @@
 #   xcal.halt a0 = 0x0005100b   (rs1 = a0 = x10, funct3 = 001, custom-0)
 
 #include <asm.h>
-
-    .equ EXIT_UNEXPECTED_TRAP, 0xff
+#include "spinlock.h"           /* NCPU */
+#include "trap.h"               /* EXIT_UNEXPECTED_TRAP */
+#include "vm.h"                 /* EARLY_TABLES, OVERFLOW_STACK_SIZE */
 
     .section .text.start
     .globl _start
@@ -180,14 +181,14 @@ early_s_trap:
 # The early page table and the pool of its lower tables (vm.c, setup_vm()),
 # page aligned, and each hart's overflow stack (kernelvec.S), 16-aligned.
     .bss
-    .balign 4096
+    .balign PGSIZE
     .globl early_pg_dir
 early_pg_dir:
-    .zero 4096
+    .zero PGSIZE
     .globl early_tables
 early_tables:
-    .zero 8 * 4096              # EARLY_TABLES (vm.c)
+    .zero EARLY_TABLES * PGSIZE
     .globl overflow_stacks
 overflow_stacks:
-    .zero 8 * 4096              # NCPU * OVERFLOW_STACK_SIZE (vm.h)
+    .zero NCPU * OVERFLOW_STACK_SIZE
 #endif

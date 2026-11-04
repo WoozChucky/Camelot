@@ -463,11 +463,8 @@ usize kstack_max_used(void) {
 /* ---- The early page table (RV64), with paging off ---- */
 
 #if __riscv_xlen == 64
-/* The early page table and the pool its lower tables come from, in .bss
- * (entry.S, page aligned). Sv48 needs at most seven: two under the root for
- * each of the image's two addresses, two for the direct map of 1 TiB, one
- * for the devices. */
-#define EARLY_TABLES 8
+/* The early page table and the pool of EARLY_TABLES (vm.h) its lower tables
+ * come from, in .bss (entry.S, page aligned). */
 extern pte_t early_pg_dir[];
 extern pte_t early_tables[];
 static u32 early_used;
