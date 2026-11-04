@@ -413,7 +413,7 @@ fn threads_using_the_filesystem_end_with_their_process_on_one_and_four_harts() {
     let image = xtask::fs::build(
         &repo_root(),
         &Options {
-            size: 2048,
+            size: xtask::fs::IMAGE_SIZE,
             ..Options::default()
         },
     )

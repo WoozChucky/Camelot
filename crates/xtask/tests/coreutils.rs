@@ -13,7 +13,6 @@
 //! by clang instead, so that a program that builds with only one of the
 //! compilers, or behaves differently with each, is caught.
 
-use camelot_fs::mkfs::Options;
 use camelot_fs::read::Fs;
 use camelot_fs::{fsck, SECTOR_SIZE};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
@@ -136,9 +135,14 @@ impl Session {
     }
 }
 
-/// The root image, its programs compiled by `cc`.
+/// The root image, its programs compiled by `cc`, laid out as the real one
+/// is (`cargo xtask fs`: [`xtask::fs::IMAGE_SIZE`] blocks with the kernel's
+/// left out), so the programs have the room they have on Camelot.
 fn root_image(cc: CCompiler) -> Vec<u8> {
-    xtask::fs::build_with(&repo_root(), &Options::default(), cc).unwrap()
+    let root = repo_root();
+    let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
+    let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
+    xtask::fs::build_with(&root, &opts, cc).unwrap()
 }
 
 /// What `wc` counts in `text`: lines, words, bytes.

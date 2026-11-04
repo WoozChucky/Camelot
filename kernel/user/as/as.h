@@ -57,6 +57,17 @@ void buf_u32(struct buf *b, uint v);
 void buf_zeros(struct buf *b, uint n);
 void buf_align(struct buf *b, uint a);
 
+/* A string -> int map (open addressing). */
+struct strmap {
+    char **keys;
+    int *values;
+    uint cap;
+    uint count;
+};
+int map_get(struct strmap *m, const char *key, int *value);
+/* Sets key to value; `key` must stay alive (perm memory). */
+void map_put(struct strmap *m, char *key, int value);
+
 /* ---- Errors ----
  * An error, by source line (0: not tied to a line), with its message. */
 struct error {
@@ -136,7 +147,8 @@ struct operand {
     int int_token;    /* OPD_MEM: the offset was one integer token, or none */
 };
 
-enum { DA_EXPR, DA_STR, DA_WIDE };
+/* DA_EMPTY: an argument left out between commas (the fill of `.p2align 3,,4`). */
+enum { DA_EXPR, DA_STR, DA_WIDE, DA_EMPTY };
 struct dirarg {
     int kind;
     struct expr *e;
@@ -233,7 +245,9 @@ int section_flags(const uchar *s, uint len, uint *out, uint *bad);
 int section_type(const uchar *s, uint len, uint *out);
 
 /* ---- The object (asm.c) ---- */
-enum { SYM_NOTYPE, SYM_FUNC, SYM_OBJECT, SYM_SECTION };
+/* SYM_MAPPING: a mapping symbol ($x<isa>, $d); SYM_FILE: `.file "name"`'s
+ * STT_FILE symbol. Nothing refers to either. */
+enum { SYM_NOTYPE, SYM_FUNC, SYM_OBJECT, SYM_SECTION, SYM_MAPPING, SYM_FILE };
 
 struct reloc {
     uint offset;
@@ -255,6 +269,9 @@ struct section {
     struct reloc *relocs;
     uint nrelocs;
     uint cap;
+    /* What it holds at its end, for its mapping symbols: 0 (nothing yet),
+     * MAP_CODE or MAP_DATA (asm.c's mapping_symbol). */
+    int mapping;
 };
 
 struct symbol {
@@ -268,6 +285,7 @@ struct symbol {
     int ty;
     uint size;
     int keep; /* written to the symbol table (see asm_finish) */
+    int local; /* named by .local: local even if undefined */
 };
 
 struct object {
@@ -344,5 +362,8 @@ void dwarf_encode(struct dfile *root, struct dfile *files, uint nfiles, struct r
 
 /* ---- The ELF file (elf.c) ---- */
 void elf_write(struct object *obj, struct buf *out);
+/* The contents of `.riscv.attributes` (merlin-as's elf::riscv_attributes):
+ * Tag_RISCV_arch = RISCV_ARCH. */
+void riscv_attributes(struct buf *out);
 
 #endif

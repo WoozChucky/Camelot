@@ -897,58 +897,85 @@ fn attributes(object: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
-/// The width and the ISA come only from the options: `.option` and
-/// `.attribute`, which change them in LLVM (`.option arch`, `.option rvc`,
-/// `.attribute arch`, or by its number, 5), are ignored. A source that
-/// claims the other width assembles for its own: RV64's instructions stay
-/// unknown on RV32 and RV32's counter halves on RV64, and the object's
-/// `.riscv.attributes` is still the ISA of its width.
+/// The width and the ISA come only from the options. In LLVM `.option arch`,
+/// `.option rvc`, `.attribute arch` and `.attribute 5` change the ISA (a new
+/// `$x<isa>`, another `Tag_RISCV_arch`); merlin-as has no other ISA than
+/// `-march`'s, so one that names another is an error on its line, and one
+/// that names the same (clang's `-S` output: `.attribute 5, "rv32i2p1_..."`,
+/// or `.option arch, -a`, which changes nothing in LLVM either) is accepted
+/// and changes nothing: the object's `.riscv.attributes` is the ISA of its
+/// width, and the other width's instructions stay unknown.
 #[test]
 fn option_and_attribute_leave_the_width_alone() {
-    // Four lines that claim `isa`, so the instruction after them is line 5.
-    let claim = |isa: &str, line: &str| {
-        format!(
-            "    .option arch, {isa}\n    .option rvc\n    .attribute arch, \"{isa}\"\n    \
-             .attribute 5, \"{isa}\"\n    {line}\n"
-        )
-    };
-    // (width, the other width's ISA, its instruction and why it is refused,
-    // an instruction of this width).
-    let cases = [
-        (
-            Xlen::Rv32,
-            "rv64gc",
-            "ld a0, 0(a1)",
-            "unknown instruction 'ld'",
-            "rdcycleh a0",
-        ),
-        (
-            Xlen::Rv64,
-            "rv32gc",
-            "rdcycleh a0",
-            "'rdcycleh' exists only on RV32 (on RV64, rdcycle reads all 64 bits)",
-            "ld a0, 0(a1)",
-        ),
-    ];
-    for (xlen, claimed, theirs, why, ours) in cases {
+    for xlen in [Xlen::Rv32, Xlen::Rv64] {
         let options = Options { xlen };
-        let errs = merlin_as::assemble_with(&claim(claimed, theirs), &options).unwrap_err();
-        assert_eq!(
-            (errs.len(), errs[0].line, errs[0].msg.as_str()),
-            (1, 5, why),
-            "{xlen:?}"
+        let (bits, other) = match xlen {
+            Xlen::Rv32 => ("32", "rv64ima_zicsr_zifencei"),
+            Xlen::Rv64 => ("64", "rv32ima_zicsr_zifencei"),
+        };
+        let march = format!("rv{bits}ima_zicsr_zifencei");
+        let arch = merlin_as::elf::arch(xlen);
+        // The same ISA, in every spelling: no error, and -march's attributes.
+        let same = format!(
+            "    .option arch, {march}\n    .option arch, +m, -c\n    .option arch, -a\n    .option push\n    \
+             .option norvc\n    .option pop\n    .attribute arch, \"{arch}\"\n    .attribute 5, \"{march}\"\n    \
+             .attribute 4, 16\n    nop\n"
         );
-        let object = merlin_as::assemble_to_elf_with(&claim(claimed, ours), &options);
+        let object = merlin_as::assemble_to_elf_with(&same, &options);
         let object = object.unwrap_or_else(|e| panic!("{xlen:?}: {e:?}"));
         let class = match xlen {
             Xlen::Rv32 => 1,
             Xlen::Rv64 => 2,
         };
         assert_eq!(object[4], class, "{xlen:?}: EI_CLASS");
+        assert_eq!(attributes(&object), riscv_attributes(arch), "{xlen:?}");
+
+        // Another ISA, each line an error of its own; the other width among
+        // them, whose instructions stay unknown after it.
+        let another = [
+            format!(".option arch, {other}"),
+            ".option arch, +zicond".into(),
+            ".option arch, -m".into(),
+            format!(".option arch, rv{bits}imac_zicsr_zifencei"),
+            ".option rvc".into(),
+            format!(".attribute arch, \"{other}\""),
+            format!(".attribute 5, \"rv{bits}i2p1_m2p0\""),
+        ];
+        let src: String = another.iter().map(|l| format!("    {l}\n")).collect();
+        let theirs = match xlen {
+            Xlen::Rv32 => "ld a0, 0(a1)",
+            Xlen::Rv64 => "rdcycleh a0",
+        };
+        let errs = merlin_as::assemble_with(&format!("{src}    {theirs}\n"), &options).unwrap_err();
+        let lines: Vec<usize> = errs.iter().map(|e| e.line).collect();
         assert_eq!(
-            attributes(&object),
-            riscv_attributes(merlin_as::elf::arch(xlen)),
-            "{xlen:?}"
+            lines,
+            (1..=another.len() + 1).collect::<Vec<_>>(),
+            "{xlen:?}: {errs:?}"
+        );
+        for (e, line) in errs.iter().zip(&another) {
+            let directive = if line.starts_with(".option rvc") {
+                ".option rvc"
+            } else if line.starts_with(".option") {
+                ".option arch"
+            } else {
+                ".attribute arch"
+            };
+            let msg = format!(
+                "{directive}: merlin-as assembles only -march's ISA ({arch}), and this names another"
+            );
+            assert_eq!(e.msg, msg, "{xlen:?}: {line}");
+        }
+        // LLVM's own errors.
+        let errs = merlin_as::assemble_with("    .option arch, -zmmul\n    .option arch, +m2p0\n", &options)
+            .unwrap_err();
+        let msgs: Vec<&str> = errs.iter().map(|e| e.msg.as_str()).collect();
+        assert_eq!(
+            msgs,
+            [
+                "can't disable zmmul extension; m extension requires zmmul extension",
+                "extension version number parsing not currently implemented"
+            ]
         );
     }
 }

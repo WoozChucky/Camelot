@@ -6,81 +6,12 @@
  *
  * Symbols are kept in the order they are first named (the symbol table's
  * order, after locals and globals are split): every place that names one
- * does it where merlin-as does. `.L` labels go into the symbol table only if
- * a relocation still refers to them. */
+ * does it where merlin-as does. `.L` labels and section symbols go into the
+ * symbol table only if a relocation still refers to them. Mapping symbols
+ * ($x<isa>, $d) mark where code and data start, as clang marks them
+ * (mapping_symbol). */
 #include "as.h"
 #include "tables.h"
-
-/* ---- A string -> int map (open addressing) ---- */
-
-struct strmap {
-    char **keys;
-    int *values;
-    uint cap;
-    uint count;
-};
-
-static uint hash(const char *s) {
-    uint h = 2166136261u;
-    for (; *s; s++) {
-        h = (h ^ (uchar)*s) * 16777619u;
-    }
-    return h;
-}
-
-static int map_get(struct strmap *m, const char *key, int *value) {
-    if (m->cap == 0) {
-        return 0;
-    }
-    for (uint i = hash(key) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
-        if (m->keys[i] == NULL) {
-            return 0;
-        }
-        if (strcmp(m->keys[i], key) == 0) {
-            *value = m->values[i];
-            return 1;
-        }
-    }
-}
-
-static void map_put(struct strmap *m, char *key, int value);
-
-static void map_grow(struct strmap *m) {
-    struct strmap old = *m;
-    m->cap = old.cap ? old.cap * 2 : 256;
-    m->keys = calloc(m->cap, sizeof(char *));
-    m->values = calloc(m->cap, sizeof(int));
-    if (m->keys == NULL || m->values == NULL) {
-        die("out of memory");
-    }
-    m->count = 0;
-    for (uint i = 0; i < old.cap; i++) {
-        if (old.keys[i] != NULL) {
-            map_put(m, old.keys[i], old.values[i]);
-        }
-    }
-    free(old.keys);
-    free(old.values);
-}
-
-/* Sets key to value; `key` must stay alive (perm memory). */
-static void map_put(struct strmap *m, char *key, int value) {
-    if ((m->count + 1) * 2 > m->cap) {
-        map_grow(m);
-    }
-    for (uint i = hash(key) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
-        if (m->keys[i] == NULL) {
-            m->keys[i] = key;
-            m->values[i] = value;
-            m->count++;
-            return;
-        }
-        if (strcmp(m->keys[i], key) == 0) {
-            m->values[i] = value;
-            return;
-        }
-    }
-}
 
 /* ---- The assembler's state ---- */
 
@@ -123,6 +54,9 @@ static int is_stmt = 1;
 static struct row *rows;
 static uint nrows, caprows;
 static uint first_loc_line;
+/* The line of the first numbered `.file`, which makes a line table even
+ * without a `.loc` (merlin-as's first_file_line). */
+static uint first_file_line;
 
 #define DOT "."
 #define DOT_LABEL ".Ldot$"
@@ -214,6 +148,10 @@ static int find_symbol(const char *name) {
     return map_get(&by_name, name, &i) ? i : -1;
 }
 
+/* `.size`s of symbols nothing has named yet (merlin-as's pending_sizes):
+ * `.size` alone makes no symbol, as in LLVM. */
+static struct strmap pending_sizes;
+
 static int symbol_index(const char *name) {
     int i = find_symbol(name);
     if (i >= 0) {
@@ -224,6 +162,11 @@ static int symbol_index(const char *name) {
     memset(s, 0, sizeof *s);
     s->name = perm_strdup(name);
     s->section = -1;
+    int size;
+    if (map_get(&pending_sizes, name, &size)) {
+        s->size = (uint)size;
+        map_put(&pending_sizes, perm_strdup(name), 0);
+    }
     map_put(&by_name, s->name, (int)nsymbols);
     return (int)nsymbols++;
 }
@@ -500,10 +443,14 @@ static int find_section(const char *name) {
     return 0;
 }
 
+static char *section_symbol(int sec);
+
 /* Adds a section, which becomes the current one. Its alignment starts at
  * 1, except for `.text`'s, 4: LLVM makes `.text` before the first line with
  * an instruction's alignment, and no other section, code or not, has one
- * until `.align` (or `.comm`) asks. */
+ * until `.align` (or `.comm`) asks. Its section symbol is made here, where
+ * LLVM registers it (the first switch to the section), and kept only if a
+ * relocation uses it. */
 static void new_section(const char *name, struct sec_attrs attrs) {
     sections = grow(sections, &capsections, nsections + 1, sizeof(struct section));
     struct section *s = &sections[nsections];
@@ -512,6 +459,32 @@ static void new_section(const char *name, struct sec_attrs attrs) {
     s->attrs = attrs;
     s->align = strcmp(name, ".text") == 0 ? 4 : 1;
     current = (int)nsections++;
+    section_symbol(current);
+}
+
+#define MAP_CODE 1
+#define MAP_DATA 2
+
+/* Marks what comes next in the current section, code or data, with a
+ * mapping symbol where that changes (merlin-as's Assembler::mapping_symbol,
+ * clang's RISCVELFStreamer): $x<isa> before a run of instructions, $d before
+ * a run of data, even data of no bytes. A local symbol of its own, which no
+ * name finds (not in by_name). */
+static void mapping_symbol(int kind) {
+    struct section *sec = &sections[current];
+    if (sec->mapping == kind) {
+        return;
+    }
+    sec->mapping = kind;
+    symbols = grow(symbols, &capsymbols, nsymbols + 1, sizeof(struct symbol));
+    struct symbol *s = &symbols[nsymbols++];
+    memset(s, 0, sizeof *s);
+    s->name = kind == MAP_CODE ? "$x" RISCV_ARCH : "$d";
+    s->section = current;
+    s->value = sec->size;
+    s->defined = 1;
+    s->ty = SYM_MAPPING;
+    s->local = 1;
 }
 
 /* Makes the section named `name` the current one, made with the attributes
@@ -584,7 +557,12 @@ static void add_reloc(uint offset, int kind, char *symbol, i64 addend) {
     r->line = line;
 }
 
-static void align_to(uint align) {
+/* Pads the current section to a multiple of `align` and raises its
+ * alignment (merlin-as's align_with): with the byte `fill` if has_fill (in
+ * code too), else nops in code and zeros elsewhere; nothing if the padding
+ * would be longer than `max` (when has_max). Padding makes no mapping
+ * symbol. */
+static void align_with(uint align, int has_fill, uint fill, int has_max, uint max) {
     if (align <= 1) {
         return;
     }
@@ -593,14 +571,38 @@ static void align_to(uint align) {
         s->align = align;
     }
     uint pad = (align - s->size % align) % align;
-    if (is_code(s) && pad % 4 == 0 && s->size % 4 == 0) {
-        static const uchar nop[4] = {0x13, 0, 0, 0};
-        for (uint i = 0; i < pad / 4; i++) {
-            emit_bytes(nop, 4);
-        }
-    } else {
-        emit_zeros(pad);
+    if (has_max && pad > max) {
+        return;
     }
+    if (has_fill && fill != 0) {
+        uchar *bytes = tmp_alloc(pad + 1);
+        memset(bytes, (int)fill, pad);
+        emit_bytes(bytes, pad);
+        return;
+    }
+    if (has_fill || !is_code(s)) {
+        emit_zeros(pad);
+        return;
+    }
+    /* Code pads as LLVM's writeNopData pads it: a zero byte to an even
+     * offset, a c.nop (0x0001) to a multiple of 4, then nops. */
+    if (pad % 2 == 1) {
+        emit_zeros(1);
+        pad--;
+    }
+    if (pad % 4 == 2) {
+        static const uchar c_nop[2] = {0x01, 0};
+        emit_bytes(c_nop, 2);
+        pad -= 2;
+    }
+    static const uchar nop[4] = {0x13, 0, 0, 0};
+    for (uint i = 0; i < pad / 4; i++) {
+        emit_bytes(nop, 4);
+    }
+}
+
+static void align_to(uint align) {
+    align_with(align, 0, 0, 0, 0);
 }
 
 /* Gives the pending `.loc`, if any, a row at the current offset: the
@@ -632,7 +634,14 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
     }
     take_loc();
     uint base = s->size;
+    /* A label for `.` in an operand, made first, as clang makes it when it
+     * reads the operand. */
     char *dot = NULL;
+    for (int i = 0; i < n; i++) {
+        if (emits[i].has_fixup && emits[i].auipc < 0 && strcmp(emits[i].name, DOT) == 0 && dot == NULL) {
+            dot = dot_label(base);
+        }
+    }
     /* The hidden labels on auipcs a later %pcrel_lo refers to. */
     char *auipc_labels[2] = {NULL, NULL};
     for (int i = 0; i < n; i++) {
@@ -651,6 +660,8 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
             }
         }
     }
+    /* After the labels, before the symbols the operands name. */
+    mapping_symbol(MAP_CODE);
     for (int i = 0; i < n; i++) {
         uint offset = base + 4 * (uint)i;
         struct emit *e = &emits[i];
@@ -664,9 +675,6 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
                 symbol = e->name;
                 addend = e->addend;
                 if (strcmp(symbol, DOT) == 0) {
-                    if (dot == NULL) {
-                        dot = dot_label(base);
-                    }
                     symbol = dot;
                 }
                 if (e->kind == R_RISCV_PCREL_LO12_I || e->kind == R_RISCV_PCREL_LO12_S) {
@@ -753,6 +761,7 @@ static void data(struct dirarg *args, uint nargs, uint size) {
                 bytes[i] = (uchar)(v.lo >> (8 * i));
                 bytes[4 + i] = (uchar)(v.hi >> (8 * i));
             }
+            mapping_symbol(MAP_DATA);
             emit_bytes(bytes, size);
             continue;
         }
@@ -770,6 +779,8 @@ static void data(struct dirarg *args, uint nargs, uint size) {
         if (strcmp(name, DOT) == 0) {
             name = dot_label(off);
         }
+        /* After the label for `.`, before the symbol it names. */
+        mapping_symbol(MAP_DATA);
         add_reloc(off, size == 8 ? R_RISCV_64 : R_RISCV_32, name, addend);
         static const uchar zero[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         emit_bytes(zero, size);
@@ -917,6 +928,62 @@ static int is_pow2(i64 v) {
     return m.lo == 0 && m.hi == 0;
 }
 
+/* `.p2align n[, fill[, max]]` (`.align` too) and `.balign bytes[, fill[,
+ * max]]` (merlin-as's align_directive): the fill's low byte, may be left
+ * out (`,,`); a max below 1 is LLVM's error, one of at least the alignment
+ * changes nothing. */
+static void align_directive(const char *name, struct dirarg *args, uint nargs) {
+    i64 v;
+    if (!arg_const(args, nargs, 0, name, &v)) {
+        return;
+    }
+    uint align;
+    if (strcmp(name, ".balign") == 0) {
+        if (!is_pow2(v) || i64_cmp(v, i64_u(1u << 16)) > 0) {
+            error(".balign: alignment must be a power of two, at most 65536");
+            return;
+        }
+        align = v.lo;
+    } else {
+        if (!i64_in(v, i64_u(0), i64_u(17))) {
+            error(fmt("%s: power of two must be 0..16", name));
+            return;
+        }
+        align = 1u << v.lo;
+    }
+    if (nargs > 3) {
+        error(fmt("%s: expected at most an alignment, a fill and a maximum", name));
+        return;
+    }
+    int has_fill = 0;
+    uint fill = 0;
+    if (nargs > 1 && args[1].kind != DA_EMPTY) {
+        i64 f;
+        if (!arg_const(args, nargs, 1, name, &f)) {
+            return;
+        }
+        has_fill = 1;
+        fill = f.lo & 0xff;
+    }
+    int has_max = 0;
+    uint max = 0;
+    if (nargs > 2) {
+        i64 m;
+        if (!arg_const(args, nargs, 2, name, &m)) {
+            return;
+        }
+        if (i64_cmp(m, i64_u(1)) < 0) {
+            error("alignment directive can never be satisfied in this many bytes, ignoring maximum bytes expression");
+            return;
+        }
+        if (i64_cmp(m, i64_u(align)) < 0) {
+            has_max = 1;
+            max = m.lo;
+        }
+    }
+    align_with(align, has_fill, fill, has_max, max);
+}
+
 /* `.comm sym, size[, align]` for a .local symbol, or `.lcomm sym, size`:
  * zero bytes in .bss, at that alignment (`.lcomm`: 1). */
 static void common(const char *directive, struct dirarg *args, uint nargs) {
@@ -970,6 +1037,7 @@ static void common(const char *directive, struct dirarg *args, uint nargs) {
     if (symbols[i].ty == SYM_NOTYPE) {
         symbols[i].ty = SYM_OBJECT;
     }
+    mapping_symbol(MAP_DATA);
     if (size.hi != 0) {
         no_room();
     } else {
@@ -993,18 +1061,20 @@ static int is_word(struct dirarg *a, const char *word) {
     return a->kind == DA_EXPR && a->e->kind == E_SYM && strcmp(a->e->sym, word) == 0;
 }
 
-static int same_file(struct dfile *a, struct dfile *b) {
-    if (strcmp(a->dir, b->dir) != 0 || strcmp(a->name, b->name) != 0 || a->has_md5 != b->has_md5) {
-        return 0;
-    }
-    return !a->has_md5 || memcmp(a->md5, b->md5, 16) == 0;
-}
-
-/* `.file "name"` (the file's name, which merlin-as has no use for) or
- * `.file N ["dir"] "name" [md5 0x...]`: file number N of the line table.
- * `.file 0` gives the compilation directory and the main file. */
+/* `.file "name"`: an STT_FILE symbol. Or `.file N ["dir"] "name" [md5
+ * 0x...]`: file number N of the line table, which it makes even without a
+ * `.loc`. `.file 0` gives the compilation directory and the main file. */
 static void file_directive(struct dirarg *args, uint nargs) {
+    /* `.file "name"`: an STT_FILE symbol, here (merlin-as's file_directive). */
     if (nargs == 1 && args[0].kind == DA_STR) {
+        symbols = grow(symbols, &capsymbols, nsymbols + 1, sizeof(struct symbol));
+        struct symbol *f = &symbols[nsymbols++];
+        memset(f, 0, sizeof *f);
+        f->name = perm_strdup(tmp_strndup((char *)args[0].str, args[0].len));
+        f->section = -1;
+        f->defined = 1;
+        f->local = 1;
+        f->ty = SYM_FILE;
         return;
     }
     if (nargs == 0 || args[0].kind != DA_EXPR) {
@@ -1063,9 +1133,18 @@ static void file_directive(struct dirarg *args, uint nargs) {
     }
     file.dir = perm_strdup(file.dir);
     file.name = perm_strdup(file.name);
+    if (first_file_line == 0) {
+        first_file_line = line;
+    }
     if (n == 0) {
         file0 = file;
         have_file0 = 1;
+        return;
+    }
+    /* LLVM's tryGetFile: a file named as the main one, with the same checksum
+     * (or none), is file 0 and takes no number; a number is given once. */
+    if (have_file0 && strcmp(file0.name, file.name) == 0 && file0.has_md5 == file.has_md5 &&
+        (!file.has_md5 || memcmp(file0.md5, file.md5, 16) == 0)) {
         return;
     }
     if (n >= 1u << 24) {
@@ -1076,8 +1155,8 @@ static void file_directive(struct dirarg *args, uint nargs) {
         memset(&files[nfiles], 0, (n + 1 - nfiles) * sizeof(struct dfile));
         nfiles = n + 1;
     }
-    if (files[n].name != NULL && !same_file(&files[n], &file)) {
-        error(fmt("file number %u is already defined", n));
+    if (files[n].name != NULL) {
+        error("file number already allocated");
         return;
     }
     files[n] = file;
@@ -1107,8 +1186,12 @@ static void loc_directive(struct dirarg *args, uint nargs) {
     }
     uint file = nums[0];
     int defined = file == 0 ? have_file0 : file < nfiles && files[file].name != NULL;
+    if (!defined && file == 0) {
+        error(".loc: file number 0 has no .file");
+        return;
+    }
     if (!defined) {
-        error(fmt(".loc: file number %u has no .file", file));
+        error("unassigned file number in '.loc' directive");
         return;
     }
     struct loc loc;
@@ -1171,8 +1254,301 @@ static void loc_directive(struct dirarg *args, uint nargs) {
     have_loc = 1;
 }
 
-static const char *const IGNORED[] = {".ident",       ".option",        ".attribute", ".addrsig", ".addrsig_sym",
-                                      ".cfi_startproc", ".cfi_endproc", NULL};
+/* ---- The ISA a source may name (merlin-as's isa.rs) ----
+ *
+ * `.option arch` and `.attribute arch` change the ISA in clang; this one has
+ * only -march's, so one that names another is an error and one that names
+ * the same is accepted. The same: the same width and the same extensions at
+ * the same versions, with what they imply as LLVM adds it (m: zmmul; a:
+ * zaamo and zalrsc; zaamo with zalrsc: a). */
+
+#define NEXT 8
+static const char *const EXT_NAME[NEXT] = {"i", "m", "a", "zicsr", "zifencei", "zmmul", "zaamo", "zalrsc"};
+static const uint EXT_MAJOR[NEXT] = {2, 2, 2, 2, 2, 1, 1, 1};
+static const uint EXT_MINOR[NEXT] = {1, 0, 1, 0, 0, 0, 0, 0};
+enum { X_I, X_M, X_A, X_ZICSR, X_ZIFENCEI, X_ZMMUL, X_ZAAMO, X_ZALRSC };
+
+struct isa {
+    int has[NEXT];
+    uint major[NEXT];
+    uint minor[NEXT];
+};
+
+static void isa_ours(struct isa *x) {
+    for (int k = 0; k < NEXT; k++) {
+        x->has[k] = 1;
+        x->major[k] = EXT_MAJOR[k];
+        x->minor[k] = EXT_MINOR[k];
+    }
+}
+
+static int isa_same(struct isa *a, struct isa *b) {
+    for (int k = 0; k < NEXT; k++) {
+        if (a->has[k] != b->has[k]) {
+            return 0;
+        }
+        if (a->has[k] && (a->major[k] != b->major[k] || a->minor[k] != b->minor[k])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void isa_set(struct isa *x, int k, uint major, uint minor) {
+    x->has[k] = 1;
+    x->major[k] = major;
+    x->minor[k] = minor;
+}
+
+static void isa_imply(struct isa *x) {
+    if (x->has[X_M] && !x->has[X_ZMMUL]) {
+        isa_set(x, X_ZMMUL, 1, 0);
+    }
+    if (x->has[X_A]) {
+        if (!x->has[X_ZAAMO]) {
+            isa_set(x, X_ZAAMO, 1, 0);
+        }
+        if (!x->has[X_ZALRSC]) {
+            isa_set(x, X_ZALRSC, 1, 0);
+        }
+    }
+    if (x->has[X_ZAAMO] && x->has[X_ZALRSC] && !x->has[X_A]) {
+        isa_set(x, X_A, 2, 1);
+    }
+}
+
+/* The extension named by the n bytes at p; -1 if none of ours. */
+static int ext_index(const char *p, uint n) {
+    for (int k = 0; k < NEXT; k++) {
+        if (strlen(EXT_NAME[k]) == n && strncmp(EXT_NAME[k], p, n) == 0) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+static int is_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+/* Splits a trailing version (`2p1`, `2`) off the n bytes at p: the name's
+ * length in *name_len, and 1 with the version, or 0 without one. */
+static int split_version(const char *p, uint n, uint *name_len, uint *major, uint *minor) {
+    uint e = n;
+    while (e > 0 && (is_digit(p[e - 1]) || p[e - 1] == 'p')) {
+        e--;
+    }
+    while (e < n && p[e] == 'p') {
+        e++;
+    }
+    *name_len = n;
+    if (e == n) {
+        return 0;
+    }
+    uint a = 0, b = 0, i = e;
+    int ps = 0;
+    for (; i < n && is_digit(p[i]); i++) {
+        a = a * 10 + (uint)(p[i] - '0');
+    }
+    if (i < n) {
+        if (p[i] != 'p' || i + 1 >= n) {
+            return 0;
+        }
+        i++;
+        ps = 1;
+        for (; i < n && is_digit(p[i]); i++) {
+            b = b * 10 + (uint)(p[i] - '0');
+        }
+        if (i < n) {
+            return 0;
+        }
+    }
+    (void)ps;
+    *name_len = e;
+    *major = a;
+    *minor = b;
+    return 1;
+}
+
+/* Adds the extension of the n bytes at p (with its version or the default)
+ * to x; 0 if it is none of ours. */
+static int isa_add(struct isa *x, const char *p, uint n) {
+    uint len, major, minor;
+    int versioned = split_version(p, n, &len, &major, &minor);
+    int k = ext_index(p, len);
+    if (k < 0) {
+        return 0;
+    }
+    if (!versioned) {
+        major = EXT_MAJOR[k];
+        minor = EXT_MINOR[k];
+    }
+    isa_set(x, k, major, minor);
+    return 1;
+}
+
+/* A full ISA string into *x, and its width in *bits; 0 if it is none LLVM
+ * would take with these extensions. */
+static int isa_parse(const char *s, uint *bits, struct isa *x) {
+    memset(x, 0, sizeof *x);
+    if (strncmp(s, "rv32", 4) == 0) {
+        *bits = 32;
+    } else if (strncmp(s, "rv64", 4) == 0) {
+        *bits = 64;
+    } else {
+        return 0;
+    }
+    const char *p = s + 4;
+    for (uint k = 0;; k++) {
+        uint n = 0;
+        while (p[n] != 0 && p[n] != '_') {
+            n++;
+        }
+        if (n == 0) {
+            return 0;
+        }
+        if (k > 0 && (p[0] == 'z' || p[0] == 's' || p[0] == 'x')) {
+            if (!isa_add(x, p, n)) {
+                return 0;
+            }
+        } else {
+            for (uint i = 0; i < n;) {
+                if (p[i] < 'a' || p[i] > 'z' || (k == 0 && i == 0 && p[i] != 'i')) {
+                    return 0;
+                }
+                uint start = i++;
+                while (i < n && (is_digit(p[i]) || (p[i] == 'p' && i + 1 < n && is_digit(p[i + 1])))) {
+                    i++;
+                }
+                if (!isa_add(x, p + start, i - start)) {
+                    return 0;
+                }
+            }
+        }
+        if (p[n] == 0) {
+            break;
+        }
+        p += n + 1;
+    }
+    isa_imply(x);
+    return 1;
+}
+
+static uint isa_bits(void) {
+    return strncmp(RISCV_ARCH, "rv64", 4) == 0 ? 64 : 32;
+}
+
+static void isa_other(const char *directive) {
+    error(fmt("%s: merlin-as assembles only -march's ISA (%s), and this names another", directive, RISCV_ARCH));
+}
+
+/* `.attribute arch, "isa"`. */
+static void check_attribute(const char *isa) {
+    struct isa x, ours;
+    uint bits;
+    isa_ours(&ours);
+    if (!isa_parse(isa, &bits, &x) || bits != isa_bits() || !isa_same(&x, &ours)) {
+        isa_other(".attribute arch");
+    }
+}
+
+/* `.option arch, ...`: a full ISA string, or +ext and -ext items. */
+static void check_option_arch(struct dirarg *items, uint n) {
+    struct isa x, ours;
+    isa_ours(&ours);
+    isa_ours(&x);
+    if (n == 0) {
+        error(".option arch: expected an ISA, or extensions after + or -");
+        return;
+    }
+    char *first = tmp_strndup((char *)items[0].str, items[0].len);
+    if (n == 1 && strncmp(first, "rv", 2) == 0) {
+        uint bits;
+        if (!isa_parse(first, &bits, &x) || bits != isa_bits() || !isa_same(&x, &ours)) {
+            isa_other(".option arch");
+        }
+        return;
+    }
+    for (uint i = 0; i < n; i++) {
+        char *item = tmp_strndup((char *)items[i].str, items[i].len);
+        const char *name = item + 1;
+        uint len = (uint)strlen(name);
+        if (item[0] == '+') {
+            uint nl, major, minor;
+            if (split_version(name, len, &nl, &major, &minor)) {
+                error("extension version number parsing not currently implemented");
+                return;
+            }
+            int k = ext_index(name, len);
+            if (k < 0) {
+                isa_other(".option arch");
+                return;
+            }
+            isa_set(&x, k, EXT_MAJOR[k], EXT_MINOR[k]);
+        } else if (item[0] == '-') {
+            int k = ext_index(name, len);
+            const char *by = NULL;
+            if (k == X_ZMMUL && x.has[X_M]) {
+                by = "m";
+            } else if ((k == X_ZAAMO || k == X_ZALRSC) && x.has[X_A]) {
+                by = "a";
+            }
+            if (by != NULL) {
+                error(fmt("can't disable %s extension; %s extension requires %s extension", name, by, name));
+                return;
+            }
+            if (k >= 0) {
+                x.has[k] = 0;
+            }
+        } else {
+            error(fmt(".option arch: expected an ISA, or extensions after + or -, not '%s'", item));
+            return;
+        }
+        isa_imply(&x);
+    }
+    if (!isa_same(&x, &ours)) {
+        isa_other(".option arch");
+    }
+}
+
+/* `.option NAME[, ...]` (merlin-as's Assembler::option): arch and rvc must
+ * not change the ISA; the others are ignored. */
+static void option_directive(struct dirarg *args, uint nargs) {
+    if (nargs == 0) {
+        error(".option: expected an option such as push, pop or arch");
+        return;
+    }
+    char *what = tmp_strndup((char *)args[0].str, args[0].len);
+    if (strcmp(what, "arch") == 0) {
+        check_option_arch(args + 1, nargs - 1);
+    } else if (strcmp(what, "rvc") == 0) {
+        isa_other(".option rvc");
+    }
+}
+
+/* `.attribute TAG, value`: arch (5) must name -march's ISA; the others are
+ * ignored. */
+static void attribute_directive(struct dirarg *args, uint nargs) {
+    i64 v;
+    int arch = 0;
+    if (nargs > 0 && args[0].kind == DA_EXPR) {
+        if (args[0].e->kind == E_SYM) {
+            arch = strcmp(args[0].e->sym, "arch") == 0;
+        } else {
+            arch = eval(args[0].e, &v) && v.hi == 0 && v.lo == 5;
+        }
+    }
+    if (!arch) {
+        return;
+    }
+    if (nargs < 2 || args[1].kind != DA_STR) {
+        error(".attribute arch: expected a string");
+        return;
+    }
+    check_attribute(tmp_strndup((char *)args[1].str, args[1].len));
+}
+
+static const char *const IGNORED[] = {".ident", ".addrsig", ".addrsig_sym", ".cfi_startproc", ".cfi_endproc", NULL};
 
 static void directive(const char *name, struct dirarg *args, uint nargs) {
     char *msg;
@@ -1194,8 +1570,10 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         }
     } else if (strcmp(name, ".local") == 0) {
         for (uint i = 0; i < nargs; i++) {
+            /* As in LLVM, .local names the symbol: its place is here. */
             char *n = arg_name(args, nargs, i, name);
             if (n != NULL) {
+                symbols[symbol_index(n)].local = 1;
                 map_put(&locals, perm_strdup(n), 1);
             }
         }
@@ -1237,6 +1615,7 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         }
         for (uint i = 0; i < nargs; i++) {
             if (args[i].kind == DA_STR) {
+                mapping_symbol(MAP_DATA);
                 emit_bytes(args[i].str, args[i].len);
                 if (strcmp(name, ".ascii") != 0) {
                     static const uchar nul[1] = {0};
@@ -1271,6 +1650,7 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         if (!has_room(v.lo)) {
             return;
         }
+        mapping_symbol(MAP_DATA);
         uint byte = fill.lo & 0xff;
         if (byte == 0 || v.lo == 0) {
             emit_zeros(v.lo);
@@ -1279,26 +1659,8 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
             memset(bytes, (int)byte, v.lo);
             emit_bytes(bytes, v.lo);
         }
-    } else if (strcmp(name, ".align") == 0 || strcmp(name, ".p2align") == 0) {
-        /* RISC-V `.align n` means 2^n bytes, as `.p2align` does. */
-        if (!arg_const(args, nargs, 0, name, &v)) {
-            return;
-        }
-        if (!i64_in(v, i64_u(0), i64_u(17))) {
-            msg = fmt("%s: power of two must be 0..16", name);
-            error(msg);
-            return;
-        }
-        align_to(1u << v.lo);
-    } else if (strcmp(name, ".balign") == 0) {
-        if (!arg_const(args, nargs, 0, name, &v)) {
-            return;
-        }
-        if (!is_pow2(v)) {
-            error(".balign: alignment must be a power of two");
-            return;
-        }
-        align_to(v.lo);
+    } else if (strcmp(name, ".align") == 0 || strcmp(name, ".p2align") == 0 || strcmp(name, ".balign") == 0) {
+        align_directive(name, args, nargs);
     } else if (strcmp(name, ".type") == 0) {
         char *n = arg_name(args, nargs, 0, ".type");
         if (n != NULL) {
@@ -1322,8 +1684,12 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         if (n != NULL) {
             int ok = nargs > 1 && args[1].kind == DA_EXPR && eval_relative(args[1].e, &v);
             if (ok) {
-                int k = symbol_index(n);
-                symbols[k].size = v.lo;
+                int k = find_symbol(n);
+                if (k >= 0) {
+                    symbols[k].size = v.lo;
+                } else {
+                    map_put(&pending_sizes, perm_strdup(n), (int)v.lo);
+                }
             } else {
                 error(".size: expected a constant, or a difference of '.' and labels defined earlier in this "
                       "section");
@@ -1333,6 +1699,10 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         file_directive(args, nargs);
     } else if (strcmp(name, ".loc") == 0) {
         loc_directive(args, nargs);
+    } else if (strcmp(name, ".option") == 0) {
+        option_directive(args, nargs);
+    } else if (strcmp(name, ".attribute") == 0) {
+        attribute_directive(args, nargs);
     } else if (is_one_of(name, IGNORED)) {
         /* Metadata that does not change the output. */
     } else {
@@ -1592,6 +1962,7 @@ static uint section_size(const char *name) {
 static int append(const char *name, struct buf *bytes) {
     int back = current;
     switch_section(name);
+    mapping_symbol(MAP_DATA);
     int sec = current;
     buf_put(&sections[sec].data, bytes->data, bytes->len);
     sections[sec].size += bytes->len;
@@ -1602,16 +1973,20 @@ static int append(const char *name, struct buf *bytes) {
 /* Writes the rows as `.debug_line` (and its strings in `.debug_line_str`),
  * with relocations for the strings and the sections' addresses. */
 static void line_table(void) {
-    if (nrows == 0) {
+    /* A numbered .file makes the table without a .loc too, as in LLVM: the
+     * header alone, no sequence. */
+    if (nrows == 0 && first_file_line == 0) {
         return;
     }
+    uint at = nrows == 0 ? first_file_line : first_loc_line;
     if (!have_file0) {
-        error_at(first_loc_line, "line information (.loc) needs .file 0, the compilation directory and the main file");
+        error_at(at, nrows == 0 ? "a line table (.file N) needs .file 0, the compilation directory and the main file"
+                                : "line information (.loc) needs .file 0, the compilation directory and the main file");
         return;
     }
     for (uint n = 1; n < nfiles; n++) {
         if (files[n].name == NULL) {
-            error_at(first_loc_line, fmt("the line table's files must be numbered 1, 2, ...: no .file %u", n));
+            error_at(at, fmt("unassigned file number: %u for .file directives", n));
             return;
         }
     }
@@ -1633,7 +2008,7 @@ static void line_table(void) {
         r->kind = R_RISCV_32;
         r->symbol = symbol;
         r->addend = i64_u(f->off);
-        r->line = first_loc_line;
+        r->line = at;
     }
     free(t.line.data);
     free(t.line_str.data);
@@ -1663,6 +2038,25 @@ static void debug_relocs_to_sections(void) {
     }
 }
 
+/* `.riscv.attributes`, which clang writes at the end: a section of the
+ * object, data with its $d, after the source's sections and before the line
+ * table's. */
+static void attributes_section(void) {
+    int back = current;
+    struct sec_attrs a;
+    a.ty = SHT_RISCV_ATTRIBUTES;
+    a.flags = 0;
+    a.entsize = 0;
+    new_section(".riscv.attributes", a);
+    mapping_symbol(MAP_DATA);
+    struct buf b;
+    memset(&b, 0, sizeof b);
+    riscv_attributes(&b);
+    emit_bytes(b.data, b.len);
+    free(b.data);
+    current = back;
+}
+
 struct object *asm_finish(void) {
     check_pcrel_lo();
     for (uint i = 0; i < nsymbols; i++) {
@@ -1673,12 +2067,17 @@ struct object *asm_finish(void) {
         }
     }
     resolve_local_fixups();
+    /* What clang writes when the source has been read, in its order: the
+     * attributes, then the line table. */
+    attributes_section();
     line_table();
     debug_relocs_to_sections();
     if (error_count(PHASE_ASM) > 0) {
         return NULL;
     }
-    /* `.L` labels are assembler-internal: keep only those a relocation needs. */
+    /* `.L` labels are assembler-internal, and a section symbol stands in for
+     * labels: keep only those a relocation needs. A relocation names the
+     * first symbol of its name that is no mapping symbol. */
     struct strmap referenced;
     memset(&referenced, 0, sizeof referenced);
     for (uint sec = 0; sec < nsections; sec++) {
@@ -1697,8 +2096,10 @@ struct object *asm_finish(void) {
     memset(&first, 0, sizeof first);
     for (uint i = 0; i < nsymbols; i++) {
         int dummy;
-        if (!starts_with(symbols[i].name, ".L") || map_get(&referenced, symbols[i].name, &dummy)) {
-            if (!map_get(&first, symbols[i].name, &dummy)) {
+        int internal = starts_with(symbols[i].name, ".L") || symbols[i].ty == SYM_SECTION;
+        if (!internal || map_get(&referenced, symbols[i].name, &dummy)) {
+            int named = symbols[i].ty != SYM_MAPPING && symbols[i].ty != SYM_FILE;
+            if (named && !map_get(&first, symbols[i].name, &dummy)) {
                 map_put(&first, symbols[i].name, (int)obj->nsymbols);
             }
             obj->symbols[obj->nsymbols++] = symbols[i];

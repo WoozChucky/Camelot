@@ -31,7 +31,8 @@ fn assemble_rv64(asm: &str) -> Vec<u8> {
 
 /// The parts of an object that end up loaded: each allocated section's name,
 /// bytes and relocations (offset, type, symbol name), and the symbols other
-/// than section symbols.
+/// than section symbols and those of the debug information itself (the `$d`
+/// mapping symbol of each `.debug_*` section, as clang writes it).
 type Loaded = (
     Vec<(String, Vec<u8>, Vec<(u64, u32, String)>)>,
     Vec<(String, u64, u64, u8)>,
@@ -57,9 +58,13 @@ fn loaded(obj: &[u8]) -> Loaded {
         }
         sections.push((s.name.clone(), elf.section_data(s).unwrap().to_vec(), relocs));
     }
+    let in_debug = |s: &elf::Symbol| {
+        s.section()
+            .is_some_and(|i| elf.sections[i].name.starts_with(".debug_"))
+    };
     let symbols = symbols
         .iter()
-        .filter(|s| s.ty() != elf::STT_SECTION)
+        .filter(|s| s.ty() != elf::STT_SECTION && !in_debug(s))
         .map(|s| (s.name.clone(), s.value, s.size, s.info))
         .collect();
     (sections, symbols)
