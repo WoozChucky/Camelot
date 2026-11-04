@@ -131,9 +131,12 @@ Disassembly of section .text:
      1f0: c0001073     	unimp
      1f4: 0005000b     	<unknown>
      1f8: 0000100b     	<unknown>
-     1fc: 00 00 00 00  	.word	0x00000000
-     200: ff ff ff ff  	.word	0xffffffff
-     204: 0005200b     	<unknown>
+     1fc: 0000         	<unknown>
+     1fe: 0000         	<unknown>
+     200: ff           	<unknown>
+     201: ff           	<unknown>
+     202: ff           	<unknown>
+     203: 0bff 0520 1300 0005 1300     	<unknown>
 
 00000208 <edge>:
      208: 00000513     	li	a0, 0x0

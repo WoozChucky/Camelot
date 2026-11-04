@@ -1,7 +1,8 @@
 # merlin-objdump fixture: every RV32IMA/Zicsr/Zifencei/privileged encoding,
 # the operand forms where llvm-objdump picks a pseudo-instruction (and the
-# tie-breaks when both registers are zero), Xcal words, data words in code,
-# and auipc+jalr pairs whose targets the disassembler resolves (or must not).
+# tie-breaks when both registers are zero), Xcal words, words that decode
+# to nothing, data words in code, and auipc+jalr pairs whose targets the
+# disassembler resolves (or must not).
 # Built by scripts/gen-objdump-golden.sh:
 #   clang --target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32 -c -mno-relax isa.S -o isa.o
 
@@ -135,10 +136,12 @@ isa_start:
     unimp
     .insn i 0x0b, 0, x0, a0, 0
     .insn i 0x0b, 1, x0, zero, 0
-    # Data words: the assembler marks them with a $d mapping symbol, and
-    # llvm-objdump prints them as .word.
-    .word 0
-    .word 0xffffffff
+    # Words that decode to nothing, kept as code (no $d before them): .insn
+    # refuses 0, whose low bits make it a 16-bit encoding, but .fill writes
+    # no mapping symbol. llvm-objdump guesses their length from the low bits
+    # (0 is two 16-bit <unknown>s); merlin-objdump prints .word.
+    .fill 1, 4, 0
+    .insn 4, 0xffffffff
     .insn 4, 0x0005200b
 edge:
     addi a0, zero, 0

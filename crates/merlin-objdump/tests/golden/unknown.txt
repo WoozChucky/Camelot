@@ -10,6 +10,8 @@ hello-o.dr	      18: 0005000b     	xcal.dbg	a0
 hello-o.dr	      1c: 0000100b     	xcal.halt	zero
 isa-o.d	     1f4: 0005000b     	xcal.dbg	a0
 isa-o.d	     1f8: 0000100b     	xcal.halt	zero
+isa-o.d	     1fc: 00000000     	.word	0x00000000
+isa-o.d	     200: ffffffff     	.word	0xffffffff
 isa-o.d	     204: 0005200b     	.word	0x0005200b
 isa-o.d	     24c: 8ff0000f     	fence
 isa-o.d	     250: 0ff5000f     	fence
@@ -21,6 +23,8 @@ isa-o.d	     360: 1015a52f     	.word	0x1015a52f
 isa-o.d	     364: 2805a52f     	.word	0x2805a52f
 isa-o.d-no-aliases	     1f4:      	xcal.dbg	a0
 isa-o.d-no-aliases	     1f8:      	xcal.halt	zero
+isa-o.d-no-aliases	     1fc:      	.word	0x00000000
+isa-o.d-no-aliases	     200:      	.word	0xffffffff
 isa-o.d-no-aliases	     204:      	.word	0x0005200b
 isa-o.d-no-aliases	     24c:      	fence	iorw, iorw
 isa-o.d-no-aliases	     250:      	fence	iorw, iorw
