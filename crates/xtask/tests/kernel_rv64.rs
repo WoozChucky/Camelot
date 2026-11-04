@@ -477,14 +477,11 @@ fn the_rv64_kernel_runs_on_up_to_eight_harts() {
             assert_eq!(k.read64(cpu + CPU_PAGETABLE), kpt, "hart {h}");
         }
         // The other harts' stacks: a page each at its physical address for
-        // M-mode, and a kernel stack in the vmalloc area, KSTACK_SLOT
-        // aligned, for the scheduler.
+        // M-mode, freed (and its hart_boot_sp 0) once the hart runs on its
+        // kernel stack, in the vmalloc area, KSTACK_SLOT aligned, for the
+        // scheduler.
         for h in 1..harts as u64 {
-            let boot = k.read64(k.sym("hart_boot_sp") + 8 * h);
-            assert!(
-                (LOAD_ADDR..LOAD_ADDR + grail::DEFAULT_RAM_SIZE as u64).contains(&boot),
-                "{boot:#x}"
-            );
+            assert_eq!(k.read64(k.sym("hart_boot_sp") + 8 * h), 0, "hart {h}");
             let sp = k.read64(k.sym("hart_sp") + 8 * h);
             assert_eq!((sp - KSTACK_SIZE) % KSTACK_SLOT, 0, "{sp:#x}");
             let area = mode().vmalloc_start..=mode().vmalloc_start + KSTACK_SLOTS * KSTACK_SLOT;

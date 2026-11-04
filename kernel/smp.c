@@ -182,8 +182,9 @@ int smp_boot(void) {
     u32 count = 1;
     for (u32 i = 1; i < n; i++) {
         /* A page for start() in M-mode and for the jump to the high half,
-         * at its physical address; on RV64 then the hart's own kernel stack
-         * (with its guard page, vm.h), which its scheduler runs on. */
+         * at its physical address (on RV64 hart_main() frees it); on RV64
+         * then the hart's own kernel stack (with its guard page, vm.h),
+         * which its scheduler runs on. */
         u8 *boot = kalloc();
 #if __riscv_xlen == 64
         u8 *stack = boot != NULL ? kstack_alloc() : NULL;
@@ -218,6 +219,14 @@ void hart_main(void) {
     /* This hart's struct cpu, which every lock uses: first of all. */
     cpu_init();
     kvminithart();
+#if __riscv_xlen == 64
+    /* The page start() and the jump to the high half ran on (smp_boot()):
+     * this hart runs on its own kernel stack now, and M-mode needs no stack
+     * (machine_vec), so it goes back to the allocator. (On RV32 it is the
+     * hart's stack for good.) */
+    kfree(va(hart_boot_sp[cpuid()] - PGSIZE));
+    hart_boot_sp[cpuid()] = 0;
+#endif
     /* Timer ticks and IPIs, both a supervisor software interrupt. The
      * devices' interrupts stay with hart 0 (plic.c), so not SEIE. */
     w_sie(r_sie() | SIE_SSIE);

@@ -20,7 +20,9 @@
  * M-mode, which does not translate, and the jump to the high half. hart_sp[i]:
  * the top of the hart's kernel stack, which supervisor_entry loads once the
  * hart runs at its link addresses, and its scheduler runs on (on RV64 a
- * stack from kstack_alloc(), on RV32 the same page). */
+ * stack from kstack_alloc(), on RV32 the same page). On RV64 hart_main()
+ * frees the boot page once the hart is on its kernel stack, and sets
+ * hart_boot_sp[i] to 0. */
 extern uintptr hart_boot_sp[NCPU];
 extern uintptr hart_sp[NCPU];
 
