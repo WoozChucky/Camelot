@@ -41,11 +41,11 @@ Hello from Camelot!
 program exited with code 0
 ```
 
-An RV64 program (`examples/hello/hello-rv64.elf`) runs on an RV64 machine, and merlin-dbg shows its registers and addresses with 16 digits:
+An RV64 program (`examples/hello/hello-rv64.elf`) runs on an RV64 machine, and merlin-dbg shows the addresses of its frames and code with 16 digits, as GDB does, and the others without leading zeros:
 
 ```
 (merlin-dbg) x/2g $a0
-0x0000000080000050 <message>:  0x7266206f6c6c6548  0x6c656d6143206d6f
+0x80000050 <message>:  0x7266206f6c6c6548  0x6c656d6143206d6f
 (merlin-dbg) bt
 #0  0x0000000080000024 <puts+4>
 #1  0x0000000080000018 <_start+24>
@@ -269,7 +269,7 @@ An ADDR is any of these, optionally followed by `+N` or `-N`:
 - a symbol (`main`, `puts+8`);
 - a register (`$sp`, `$a0`, `$x5`, `$pc`, `$mstatus`).
 
-Symbols come from the ELF symbol table (through `elf`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one, and within its section when it has none (an assembly label), as GDB's minimal symbols are: the stack past the program's last section has no name. They have all of an address's digits: on RV64, `0x0000000080000024 <puts+4>`, as GDB shows a 64-bit target's code addresses in backtraces and disassembly. A branch's target in an instruction is as merlin-objdump and llvm-objdump write it (`beqz t2, 0x80000048 <puts+40>`).
+Symbols come from the ELF symbol table (through `elf`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one, and within its section when it has none (an assembly label), as GDB's minimal symbols are: the stack past the program's last section has no name. Where GDB pads an address with zeros to the target's width, so does merlin-dbg: in backtraces (`bt`), disassembly (`disas` and the `=>` line of each stop), `finish`'s frame, the harts' pcs, and `info breakpoints`' breakpoint addresses (GDB's Address column). That is 8 digits on RV32 and 16 on RV64: `0x0000000080000024 <puts+4>`. Everywhere else, as GDB, an address has no leading zeros: `x`'s line prefixes, `breakpoint N at ADDR`, watchpoints as they are set, hit and listed (GDB shows a watchpoint's expression), `regs`' code pointers, and a read that fails (`(cannot read past 0x80400000)`). So on RV32 only addresses below 0x10000000 look different between the two, such as a user program's `breakpoint 1 at 0x3bc4 <main>`. A branch's target in an instruction is as merlin-objdump and llvm-objdump write it (`beqz t2, 0x80000048 <puts+40>`).
 
 Each stop shows its reason, then the instruction at the pc, then its source line if the line tables have one (`kernel/main.c:275:     cpu_init();`, the text left out when the file cannot be found):
 
@@ -374,7 +374,7 @@ LLDB reads the same tables: `image lookup -a ADDR` gives the line, `breakpoint s
 
 The same on RV64 machines, against the stub's `riscv:rv64` description:
 
-- `examples/hello/hello-rv64.elf`: registers and addresses with 16 digits, `x/b`, `x/h`, `x/w` and `x/g`, steps, a backtrace, disassembly and `finish`;
+- `examples/hello/hello-rv64.elf`: frames and code addresses with 16 digits, the other addresses and `regs` in GDB's layout without leading zeros, `x/b`, `x/h`, `x/w` and `x/g`, steps, a backtrace, disassembly and `finish`;
 - `examples/smp/smp-rv64.elf` with 2 harts: harts and watchpoints;
 - `crates/merlin-dbg/tests/rv64/prog.c`, built by the test with `merlin -g` for RV64, merlin-as and merlin-ld: `break FILE:LINE`, `next` and `step` by line, `list`, a backtrace through a variadic function and five frames of a recursive one, `finish`, and a watchpoint on a 64-bit global;
 - `merlin-dbg -- ...` on an RV64 program, and an RV32 program's symbols refused for an RV64 machine.

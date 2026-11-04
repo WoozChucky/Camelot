@@ -496,7 +496,7 @@ fn stepping_through_a_user_program() {
     assert_lines(
         &out,
         &[
-            &format!("breakpoint 1 at {main_at:#010x} <main>: kernel/user/sh.c:{main}"),
+            &format!("breakpoint 1 at {main_at:#x} <main>: kernel/user/sh.c:{main}"),
             "breakpoint 1",
             &format!("kernel/user/sh.c:{main}: int main(void) {{"),
         ],
@@ -726,14 +726,14 @@ fn hello_rv64() {
         &[
             "=> 0x0000000000001000:  auipc t0, 0x0",
             "(merlin-dbg) break puts",
-            "breakpoint 1 at 0x0000000080000020 <puts>",
+            "breakpoint 1 at 0x80000020 <puts>",
             "(merlin-dbg) continue",
             "breakpoint 1",
             "=> 0x0000000080000020 <puts>:  lui t0, 0x10000",
-            "0x0000000080000050 <message>:  0x48  0x65  0x6c  0x6c  0x6f",
-            "0x0000000080000050 <message>:  0x6c6c6548  0x7266206f",
-            "0x0000000080000050 <message>:  0x7266206f6c6c6548  0x6c656d6143206d6f",
-            "0x0000000080000050 <message>:  0x6548  0x6c6c  0x206f",
+            "0x80000050 <message>:  0x48  0x65  0x6c  0x6c  0x6f",
+            "0x80000050 <message>:  0x6c6c6548  0x7266206f",
+            "0x80000050 <message>:  0x7266206f6c6c6548  0x6c656d6143206d6f",
+            "0x80000050 <message>:  0x6548  0x6c6c  0x206f",
             "=> 0x0000000080000024 <puts+4>:  mv t1, a0",
             "=> 0x0000000080000028 <puts+8>:  lbu t2, 0x0(t1)",
             "=> 0x000000008000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
@@ -794,7 +794,7 @@ fn harts_and_watchpoints_rv64() {
         &out,
         &[
             "connected: 2 harts",
-            "breakpoint 1 at 0x0000000080000070 <work>",
+            "breakpoint 1 at 0x80000070 <work>",
             "[hart 0] breakpoint 1",
             "=> 0x0000000080000070 <work>:  auipc t0, 0x0",
             "[hart 1] breakpoint 1",
@@ -803,16 +803,16 @@ fn harts_and_watchpoints_rv64() {
             "hart 0",
             // Hart 0's stack, past every section: no symbol names it.
             "(merlin-dbg) x/1g $sp",
-            "0x0000000080010470:  0x0000000000000000",
+            "0x80010470:  0x0000000000000000",
             "hart 1",
             "=> 0x0000000080000074 <work+4>:  addi t0, t0, 0x3c0",
-            "watchpoint 2 (write) at 0x0000000080000430 <counter>, 4 bytes",
-            "watchpoint 3 (read) at 0x000000008000043c <ready>, 4 bytes",
-            "[hart 0] watchpoint 2 (write) hit at 0x0000000080000430 <counter>",
+            "watchpoint 2 (write) at 0x80000430 <counter>, 4 bytes",
+            "watchpoint 3 (read) at 0x8000043c <ready>, 4 bytes",
+            "[hart 0] watchpoint 2 (write) hit at 0x80000430 <counter>",
             "=> 0x0000000080000084 <work+20>:  addi t1, t1, -0x1",
-            "[hart 1] watchpoint 2 (write) hit at 0x0000000080000430 <counter>",
-            "2    watchpoint  0x0000000080000430 <counter>, 4 bytes, write",
-            "3    watchpoint  0x000000008000043c <ready>, 4 bytes, read",
+            "[hart 1] watchpoint 2 (write) hit at 0x80000430 <counter>",
+            "2    watchpoint  0x80000430 <counter>, 4 bytes, write",
+            "3    watchpoint  0x8000043c <ready>, 4 bytes, read",
             "error: no hart 3: the machine has 2",
         ],
     );
@@ -920,7 +920,7 @@ fn source_lines_of_an_rv64_program() {
     assert_lines(
         &out,
         &[
-            &format!("breakpoint 1 at {main_at:#018x} <main>: {file}:{main}"),
+            &format!("breakpoint 1 at {main_at:#x} <main>: {file}:{main}"),
             "breakpoint 1",
             &format!("=> {main_at:#018x} <main>:  addi sp, sp, -0x10"),
             &format!("{file}:{main}: int main(void) {{"),
@@ -968,7 +968,7 @@ fn source_lines_of_an_rv64_program() {
         &out,
         &[
             &format!("line {} has no code: {file}:{main} instead", main - 1),
-            &format!("breakpoint 2 at {main_at:#018x} <main>: {file}:{main}"),
+            &format!("breakpoint 2 at {main_at:#x} <main>: {file}:{main}"),
         ],
     );
 }
@@ -1013,7 +1013,7 @@ fn stepping_through_an_rv64_program() {
     assert_lines(
         &out,
         &[
-            &format!("breakpoint 1 at {sum_at:#018x} <sum>: {file}:{sum}"),
+            &format!("breakpoint 1 at {sum_at:#x} <sum>: {file}:{sum}"),
             &format!("=> {sum_at:#018x} <sum>:  addi sp, sp, -0x50"),
         ],
     );
@@ -1054,16 +1054,16 @@ fn stepping_through_an_rv64_program() {
     assert_lines(
         &out,
         &[
-            &format!("watchpoint 2 (write) at {total_at:#018x} <total>, 8 bytes"),
-            &format!("watchpoint 2 (write) hit at {total_at:#018x} <total>"),
+            &format!("watchpoint 2 (write) at {total_at:#x} <total>, 8 bytes"),
+            &format!("watchpoint 2 (write) hit at {total_at:#x} <total>"),
             &format!(
                 "{file}:{}:     total = total + sum(3, 0x100000000L, 2L, 3L);",
                 call + 2
             ),
-            &format!("{total_at:#018x} <total>:  0x0000000000000078"),
-            &format!("watchpoint 2 (write) hit at {total_at:#018x} <total>"),
+            &format!("{total_at:#x} <total>:  0x0000000000000078"),
+            &format!("watchpoint 2 (write) hit at {total_at:#x} <total>"),
             &format!("{file}:{}:     puts(\"done\\n\");", call + 3),
-            &format!("{total_at:#018x} <total>:  0x000000010000007d"),
+            &format!("{total_at:#x} <total>:  0x000000010000007d"),
             &format!("{file}:{}:     while (*s) {{", line("    while (*s) {")),
             &format!("{file}:{}:         putc(*s);", line("        putc(*s);")),
         ],
@@ -1082,8 +1082,8 @@ fn starting_an_rv64_grail_and_the_widths_agreeing() {
         &out,
         &[
             "=> 0x0000000000001000:  auipc t0, 0x0",
-            "breakpoint 1 at 0x0000000080000020 <puts>",
-            "0x0000000080000050 <message>:  0x7266206f6c6c6548",
+            "breakpoint 1 at 0x80000020 <puts>",
+            "0x80000050 <message>:  0x7266206f6c6c6548",
             "Hello from Camelot!",
             "program exited with code 0",
         ],

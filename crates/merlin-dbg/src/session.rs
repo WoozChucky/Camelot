@@ -302,11 +302,12 @@ impl<'a, W: Write> Session<'a, W> {
         Ok(())
     }
 
-    /// `0x80000024 <puts+4>`, and `: file:line` where the line tables say.
+    /// `0x80000024 <puts+4>`, and `: file:line` where the line tables say: without
+    /// leading zeros, as GDB's `Breakpoint N at ADDR` has it.
     fn where_(&self, addr: u64) -> String {
         match self.lines.at(addr) {
-            Some(place) => format!("{}: {place}", self.show(addr)),
-            None => self.show(addr),
+            Some(place) => format!("{}: {place}", self.show_plain(addr)),
+            None => self.show_plain(addr),
         }
     }
 
@@ -358,7 +359,7 @@ impl<'a, W: Write> Session<'a, W> {
         };
         self.remote.set_watchpoint(kind, addr, len)?;
         let n = self.add_point(Point::Watch(kind, addr, len));
-        let at = self.show(addr);
+        let at = self.show_plain(addr);
         self.say(format!("watchpoint {n} ({}) at {at}, {len} bytes", kind.name()));
         Ok(())
     }
@@ -396,12 +397,14 @@ impl<'a, W: Write> Session<'a, W> {
             return;
         }
         let mut lines = vec!["Num  Type        Where".to_string()];
+        // A breakpoint's address with all its digits, as GDB's Address column has
+        // it; a watchpoint's as it would be typed, GDB's What column (its expression).
         for (n, p) in &self.points {
             lines.push(match *p {
                 Point::Break(addr) => format!("{n:<4} breakpoint  {}", self.show(addr)),
                 Point::Watch(kind, addr, len) => format!(
                     "{n:<4} watchpoint  {}, {len} bytes, {}",
-                    self.show(addr),
+                    self.show_plain(addr),
                     kind.name()
                 ),
             });
@@ -438,7 +441,7 @@ impl<'a, W: Write> Session<'a, W> {
                 _ => None,
             });
             let n = n.map_or(String::new(), |n| format!(" {n}"));
-            let at = self.show(addr);
+            let at = self.show_plain(addr);
             self.say(format!("{who}watchpoint{n} ({}) hit at {at}", kind.name()));
         } else if signal == 2 {
             self.say(format!("{who}interrupted"));
@@ -764,11 +767,11 @@ impl<'a, W: Write> Session<'a, W> {
                     false => "?".into(),
                 })
                 .collect();
-            lines.push(format!("{}:  {}", self.show(at), values.join("  ")));
+            lines.push(format!("{}:  {}", self.show_plain(at), values.join("  ")));
         }
         if bytes.len() < count * size {
             let end = self.advance(addr, bytes.len() as u64);
-            lines.push(format!("(cannot read past {})", self.hex(end)));
+            lines.push(format!("(cannot read past {end:#x})"));
         }
         self.say(lines.join("\n"));
         Ok(())
