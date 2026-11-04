@@ -8,8 +8,11 @@
 #   crates/merlin-as/tests/golden/rv64/hello.ref     the same, for RV64
 #   crates/merlin-as/tests/golden/rv64/hello.dr.txt
 #
-# Needs clang and llvm-objdump from any LLVM install (LLVM 21 for hello.dr.txt,
-# whose syntax merlin-objdump follows), plus bash (Git Bash on Windows).
+# Needs clang and llvm-objdump from any LLVM install, plus bash (Git Bash on
+# Windows). LLVM 23 made the committed files. merlin-objdump follows LLVM 21's
+# syntax, which differs from LLVM 23's in one place only, `fence w, 0` (LLVM 23
+# prints it as Zihintpause's `pause`); hello.S has no such fence, so both
+# versions write the same hello.dr.txt.
 # rv64/hello.dr.txt is not compared yet: merlin-objdump reads ELF32 only until
 # #150.
 #
@@ -33,7 +36,7 @@ trap 'rm -rf "$TMP"' EXIT
 # gen <xlen> <abi> <directory>: writes hello.ref and hello.dr.txt there.
 gen() {
   local xlen=$1 abi=$2 out="$3/hello.ref" dr="$3/hello.dr.txt"
-  local flags="--target=riscv$xlen -march=rv${xlen}im_zicsr_zifencei -mabi=$abi -mno-relax"
+  local flags="--target=riscv$xlen -march=rv${xlen}ima_zicsr_zifencei -mabi=$abi -mno-relax"
   # $flags is split into its words on purpose.
   # shellcheck disable=SC2086
   clang $flags -include "$ROOT/examples/xcal.inc" -c "$ROOT/examples/hello/hello.S" -o "$TMP/hello.o"
