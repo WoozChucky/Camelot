@@ -20,6 +20,7 @@ crates/merlin-objdump/tests/golden/*.txt text eol=lf
 crates/merlin-as/tests/golden/*.txt text eol=lf
 crates/merlin-as/tests/golden/*.ref text eol=lf
 crates/merlin-as/tests/golden/*.golden text eol=lf
+crates/merlin-as/tests/mapping/**/*.txt text eol=lf
 # llvm-readelf and llvm-dwarfdump output for the elf crate's fixtures.
 crates/elf/tests/llvm/*/*.readelf text eol=lf
 crates/elf/tests/llvm/*/*.lines text eol=lf

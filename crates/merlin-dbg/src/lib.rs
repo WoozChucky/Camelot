@@ -123,15 +123,32 @@ fn start(
         ),
     };
     let mut lines = Lines::default();
-    let symbols = match &program {
+    let (symbols, file) = match &program {
         Some(path) => {
             let file = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
             lines.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
-            Symbols::from_elf(&file).map_err(|e| format!("{path}: {e}"))?
+            let symbols = Symbols::from_elf(&file).map_err(|e| format!("{path}: {e}"))?;
+            (symbols, Some((path, file)))
         }
-        None => Symbols::default(),
+        None => (Symbols::default(), None),
     };
     let remote = Remote::connect(addr)?;
+    // The machine's width, from the stub, must be the program's: an ELF32 program's
+    // symbols would be wrong for an RV64 machine. A program of the other width is
+    // left out with a warning and the session goes on without its symbols, as GDB
+    // warns and goes on: ending it would drop the connection, which the stub takes
+    // as a detach, and a machine waiting for its debugger would run off on its own.
+    // (Started with `--`, the machine is the program's width.)
+    let (symbols, lines) = match &file {
+        Some((path, file)) => match symbols::check_xlen(file, remote.xlen) {
+            Ok(()) => (symbols, lines),
+            Err(e) => {
+                let _ = writeln!(out, "warning: {path}: {e}: going on without its symbols");
+                (Symbols::default(), Lines::default())
+            }
+        },
+        None => (symbols, lines),
+    };
     let mut session = Session::new(remote, symbols, lines, &mut *out, on_quit, interrupt);
     session.start()?;
 

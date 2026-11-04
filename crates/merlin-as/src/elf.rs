@@ -13,10 +13,12 @@
 //! section header table
 //! ```
 //!
-//! Section header order: null, user sections, .riscv.attributes, one .rela.X
-//! per section that has relocations, .symtab, .strtab, .shstrtab. (clang puts
-//! them in another order; no tool cares, and the tests compare sections, not
-//! whole files.)
+//! Section header order: null, the object's sections (the source's, then
+//! `.riscv.attributes`, then the line table's if the source did not make
+//! them, as clang orders them), one .rela.X per section that has
+//! relocations, .symtab, .strtab, .shstrtab. (clang puts `.strtab` first,
+//! with the section names in it, and each `.rela.X` after its section; no
+//! tool cares, and the tests compare sections, not whole files.)
 //!
 //! # The two classes
 //!
@@ -56,9 +58,8 @@ pub fn arch(xlen: Xlen) -> &'static str {
     }
 }
 
-// The types and flags of the sections a source makes are crate::section's;
-// these are the writer's own sections'.
-const SHT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
+// The types and flags of the object's sections are crate::section's; these
+// are the writer's own sections'.
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
@@ -71,6 +72,7 @@ const STT_NOTYPE: u8 = 0;
 const STT_OBJECT: u8 = 1;
 const STT_FUNC: u8 = 2;
 const STT_SECTION: u8 = 3;
+const STT_FILE: u8 = 4;
 const EM_RISCV: u16 = 243;
 const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
@@ -134,21 +136,27 @@ impl Class {
     }
 }
 
-/// A string table under construction.
+/// A string table under construction. A string already in it is not added
+/// again: the mapping symbols share a few names (`$d`, `$x<isa>`) among
+/// many symbols, which LLVM's string table writes once each too.
 #[derive(Default)]
-struct StrTab(Vec<u8>);
+struct StrTab(Vec<u8>, std::collections::HashMap<String, u32>);
 
 impl StrTab {
     fn new() -> Self {
-        StrTab(vec![0])
+        StrTab(vec![0], Default::default())
     }
     fn add(&mut self, s: &str) -> u32 {
         if s.is_empty() {
             return 0;
         }
+        if let Some(&off) = self.1.get(s) {
+            return off;
+        }
         let off = self.0.len() as u32;
         self.0.extend_from_slice(s.as_bytes());
         self.0.push(0);
+        self.1.insert(s.to_string(), off);
         off
     }
 }
@@ -239,26 +247,20 @@ pub fn write(obj: &Object) -> Vec<u8> {
         });
     }
 
-    let attributes = riscv_attributes(arch(obj.xlen));
-    shdrs.push(Shdr {
-        name: shstr.add(".riscv.attributes"),
-        ty: SHT_RISCV_ATTRIBUTES,
-        flags: 0,
-        offset: out.len() as u64,
-        size: attributes.len() as u64,
-        link: 0,
-        info: 0,
-        align: 1,
-        entsize: 0,
-    });
-    out.extend_from_slice(&attributes);
-
     // Symbol table: null, locals, then globals (ELF requires locals first).
-    // Undefined symbols are always global.
-    let is_global = |s: &crate::asm::Symbol| s.global || (!s.defined && s.constant.is_none());
+    // Undefined symbols are global, but those `.local` names.
+    // (`.local` keeps an undefined symbol local, as clang writes it.)
+    let is_global = |s: &crate::asm::Symbol| s.global || (!s.defined && s.constant.is_none() && !s.local);
     let mut order: Vec<usize> = (0..obj.symbols.len())
         .filter(|&i| !is_global(&obj.symbols[i]))
         .collect();
+    // The first `.file "name"`'s symbol comes before every other local, the
+    // others where the source has them: LLVM's ELFObjectWriter ("Make the
+    // first STT_FILE precede previous local symbols").
+    if let Some(k) = order.iter().position(|&i| obj.symbols[i].ty == SymType::File) {
+        let file = order.remove(k);
+        order.insert(0, file);
+    }
     let first_global = order.len() + 1;
     order.extend((0..obj.symbols.len()).filter(|&i| is_global(&obj.symbols[i])));
     let mut sym_index = vec![0u32; obj.symbols.len()];
@@ -270,13 +272,15 @@ pub fn write(obj: &Object) -> Vec<u8> {
         let ty = match s.ty {
             SymType::Func => STT_FUNC,
             SymType::Object => STT_OBJECT,
-            SymType::NoType => STT_NOTYPE,
+            SymType::NoType | SymType::Mapping => STT_NOTYPE,
             SymType::Section => STT_SECTION,
+            SymType::File => STT_FILE,
         };
         // An `.equ` constant is an absolute symbol whose value is the
         // constant: cut to 32 bits in ELF32 (as LLVM does on riscv32), whole
         // in ELF64, so `.equ K, -1` is 0xffffffff or 0xffffffffffffffff.
         let (value, shndx) = match (s.constant, s.section) {
+            _ if s.ty == SymType::File => (0, SHN_ABS),
             (Some(c), _) => match obj.xlen {
                 Xlen::Rv32 => (u64::from(c as u32), SHN_ABS),
                 Xlen::Rv64 => (c as u64, SHN_ABS),
@@ -325,7 +329,7 @@ pub fn write(obj: &Object) -> Vec<u8> {
             let sym = sym_index[obj
                 .symbols
                 .iter()
-                .position(|x| x.name == r.symbol)
+                .position(|x| x.name == r.symbol && !matches!(x.ty, SymType::Mapping | SymType::File))
                 .expect("reloc symbol exists")];
             let ty = r.kind.elf_type();
             class.put_word(&mut out, r.offset.into());

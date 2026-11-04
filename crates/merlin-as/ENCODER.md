@@ -303,7 +303,12 @@ word) or data word it appears in: each use becomes a hidden `.Ldot$N` label
 there, so `j .` and `beq a0, a1, .-8` are resolved like any local label.
 
 `.L` labels (numeric labels like `1:`, the hidden `.Lpcrel_hiN` and `.Ldot$N`) go into
-the symbol table only when a relocation still uses them, and the object
+the symbol table only when a relocation still uses them. Every section
+marks where its code and data start with clang's mapping symbols, `$x<isa>`
+before a run of instructions and `$d` before a run of data
+(`Assembler::mapping_symbol`; spec section 10 has the rules), so a
+disassembler lists a `.word` among instructions as data; `.file "name"`
+is an `STT_FILE` symbol, the first of the locals as in clang. The object
 carries the same `.riscv.attributes` as clang's for its `-march`
 (`rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0`, and
 `rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0` on
@@ -324,11 +329,6 @@ input (spec section 10):
   reports it out of range.
 - A numeric label a relocation refers to is called `.L1$0` (`1:`, first
   definition) where clang says `.Ltmp0`.
-- No `$x`/`$d` mapping symbols in the symbol table yet: they come with #192
-  (merlin-as and `/bin/as`, after #151). Until then llvm-objdump 23 (and
-  merlin-objdump) list data in a code section of a merlin-as object as
-  instructions, where clang's object lists it as `.word`, and don't forget
-  the `auipc` values behind `jalr` targets where the data starts and ends.
 - Operand forms LLVM accepts and merlin-as doesn't: `jalr rd, rs`,
   `jalr off(rs)`, `jr off(rs)`, `jr rs, off`, `call rd, sym`, `jump sym, rt`,
   `%hi(sym)` in `.insn u`, named `.insn` opcodes (`.insn r OP, ...`),
@@ -387,7 +387,12 @@ assembles in `crates/xtask/tests/selfhost.rs`.
   table.
 - `debug_line`: every `.debug_*` section and its relocations against clang's
   objects, `tests/debug_line/*.o` and, for RV64, `tests/debug_line/rv64/*.o`
-  (`rv64/merlin.s` is the RV64 version of the compiler output `merlin.s`).
+  (`rv64/merlin.s` is the RV64 version of the compiler output `merlin.s`;
+  `files.s` is a table of `.file`s without a `.loc`).
+- `mapping`: the `$x`/`$d` mapping symbols, the whole symbol table and
+  every section against clang's objects, `tests/mapping/*.o` and
+  `tests/mapping/rv64/*.o`, and merlin-objdump's listing against
+  llvm-objdump's (`*.d.txt`).
 - Unit tests in `encode.rs` (packers against the decoder, `hi_lo`, `li` and
   `li_steps` on both widths, the RV64 instructions decoded back), `asm.rs`
   (local resolution, against words from clang; data of every size), `elf.rs`
@@ -425,5 +430,7 @@ Windows); their output is committed, so `cargo test` needs none of it.
   `examples/hello/hello.S` changes.
 - `tests/debug_line/*.o` and `tests/debug_line/rv64/*.o`:
   `scripts/gen-debug-line-golden.sh`.
+- `tests/mapping/*.o`, `*.d.txt` and their `rv64/` twins:
+  `scripts/gen-mapping-golden.sh`.
 - `tests/golden/hello.elf` and `golden/rv64/hello.elf`: `cargo xtask hello`
   (merlin-as and ld.lld, both widths; LLD 23.1.4 made them).

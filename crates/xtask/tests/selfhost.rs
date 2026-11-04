@@ -5,7 +5,8 @@
 //! the shell run `as` on each file into `/out`, then reads the objects back
 //! on the host and compares them. The corpus: merlin-as's golden encodings,
 //! every hand-written `.s` of the repository, the line table corpus
-//! (`crates/merlin-as/tests/debug_line`, whose objects are clang's), and
+//! (`crates/merlin-as/tests/debug_line`, whose objects are clang's), the
+//! mapping symbol corpus (`crates/merlin-as/tests/mapping`, clang's too), and
 //! merlin's assembly for a C file, with `-g` (`.file`, `.loc` and a DWARF
 //! compile unit) and without, data of every size (`DATA`) and sections of
 //! every kind (`SECTIONS`). An ignored test adds merlin's `-g` assembly for
@@ -37,6 +38,7 @@ fn corpus(big: bool) -> Vec<(String, String)> {
         "kernel/boot",
         "crates/grail/rom",
         "crates/merlin-as/tests/debug_line",
+        "crates/merlin-as/tests/mapping",
     ] {
         let mut more: Vec<PathBuf> = std::fs::read_dir(root.join(dir))
             .unwrap()
@@ -357,6 +359,33 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
          .section .foo, \"aM\", @progbits, 1, 2\n",
         ".section .foo, \"a\", %\nnop\n",
         ".section .bss.x\nnop\n.section .b, \"aw\", @nobits\n.byte 1\n.section .debug_x\nnop\n",
+        // Another ISA than -march's (the same is accepted: lines 1 to 6 and
+        // the attribute 4), and LLVM's own errors.
+        ".option arch, rv32ima_zicsr_zifencei\n.option arch, +m, -c\n.option arch, -a\n\
+         .attribute arch, \"rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0\"\n\
+         .attribute 5, \"rv32im_zicsr_zifencei_zaamo_zalrsc\"\n.option norvc\n.attribute 4, 16\n\
+         .option arch, +zicond\n.option arch, -m\n.option arch, rv64ima_zicsr_zifencei\n.option rvc\n\
+         .option arch, rv32ima2p1_zicsr\n.attribute arch, \"rv32i2p1_m2p0\"\n.attribute 5, \"rv32gc\"\n\
+         .option arch, -zmmul\n.option arch, +m2p0\n.option arch, m\n.option arch\n.option\n\
+         .attribute arch, 5\n",
+        // The line table's files: a number given twice, the main file under
+        // a number (which leaves it unassigned), a gap, a table of .file N
+        // without .file 0 and without a .loc.
+        ".file 0 \"d\" \"a.c\"
+.file 1 \"x\" \"a.c\"
+.file 2 \"b.c\"
+.file 2 \"b.c\"
+.loc 1 3
+nop
+.loc 2 4
+nop
+",
+        ".file 1 \"a.c\"
+nop
+",
+        // Alignment: fills and maxima LLVM takes, and those it does not.
+        ".p2align 2, 0x55, 0\n.balign 8,, -1\n.p2align 3,,\n.p2align 2,\n.balign 3\n.p2align 2, 1, 2, 3\n\
+         .p2align 2, x\n.balign 8, 0, x\n.p2align 17\n",
     ];
     let inputs: Vec<(String, String)> = cases
         .iter()

@@ -33,7 +33,7 @@ tasks:
                (grail --disk target/camelot-fs.img boots it, in the default 4 MiB of RAM)
                -o PATH: output file; --size N: the image's size in blocks (1 KiB each, default
                {image_size}), the filesystem filling what the kernel leaves;
-               --no-boot: the filesystem alone, N blocks
+               --no-boot: the filesystem alone, N blocks (the same default)
   boot         build the boot ROM's disk loaders (crates/grail/rom/diskboot.elf, and
                diskboot-rv64.elf for RV64 machines) and Camelot's bootloader
                (kernel/boot/boot.elf) with merlin-as + merlin-ld
@@ -451,10 +451,12 @@ fn build_fs(f: FsArgs) -> ExitCode {
     let root = repo_root();
     let out = f.out.unwrap_or_else(|| xtask::fs::default_out(&root));
     let built = if f.no_boot {
-        let mut opts = camelot_fs::mkfs::Options::default();
-        if let Some(size) = f.size {
-            opts.size = size;
-        }
+        // As big as the root image by default, so that every program fits
+        // with the room it has there.
+        let opts = camelot_fs::mkfs::Options {
+            size: f.size.unwrap_or(xtask::fs::IMAGE_SIZE),
+            ..camelot_fs::mkfs::Options::default()
+        };
         xtask::fs::build(&root, &opts)
     } else {
         xtask::fs::build_bootable(&root, f.size.unwrap_or(xtask::fs::IMAGE_SIZE))

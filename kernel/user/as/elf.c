@@ -4,10 +4,11 @@
  *   section contents (.text, .data, ... then .rela.*, .symtab, .strtab, .shstrtab)
  *   section header table
  *
- * Section headers: null, the sections in the order the source named them,
- * .riscv.attributes, a .rela.X per section with relocations, .symtab, .strtab,
+ * Section headers: null, the object's sections (the source's in the order it
+ * named them, .riscv.attributes, then the line table's if the source did not
+ * make them), a .rela.X per section with relocations, .symtab, .strtab,
  * .shstrtab. Symbols: null, the locals, then the globals, each in the order
- * they were first named. */
+ * they were made. */
 #include "as.h"
 #include "tables.h"
 
@@ -16,19 +17,25 @@
 #define SHT_SYMTAB 2
 #define SHT_STRTAB 3
 #define SHT_RELA 4
-#define SHT_RISCV_ATTRIBUTES 0x70000003u
 #define SHF_INFO_LINK 0x40
 #define SHN_UNDEF 0
 #define SHN_ABS 0xfff1
 #define EM_RISCV 243
 
-/* A string table: no sharing, "" is offset 0, as merlin-as builds them. */
-static uint strtab_add(struct buf *t, const char *s) {
+/* A string table, as merlin-as builds them: "" is offset 0, and a string
+ * already in it (a mapping symbol's name) is not added again. `seen` maps
+ * each string to its offset. */
+static uint strtab_add(struct buf *t, struct strmap *seen, const char *s) {
     if (s[0] == 0) {
         return 0;
     }
+    int at;
+    if (map_get(seen, s, &at)) {
+        return (uint)at;
+    }
     uint off = t->len;
     buf_put(t, s, (uint)strlen(s) + 1);
+    map_put(seen, perm_strdup(s), (int)off);
     return off;
 }
 
@@ -49,7 +56,7 @@ static struct shdr *new_shdr(void) {
 /* .riscv.attributes: `A`, then the vendor subsection "riscv" holding one
  * Tag_File subsubsection with Tag_RISCV_arch = RISCV_ARCH. Lengths count
  * themselves. */
-static void riscv_attributes(struct buf *out) {
+void riscv_attributes(struct buf *out) {
     uint arch = (uint)strlen(RISCV_ARCH);
     uint file_len = 1 + 4 + 1 + arch + 1;
     buf_byte(out, 'A');
@@ -62,12 +69,15 @@ static void riscv_attributes(struct buf *out) {
 }
 
 static int is_global(struct symbol *s) {
-    /* Undefined symbols are always global. */
-    return s->global || (!s->defined && !s->has_constant);
+    /* Undefined symbols are global, but those .local names. */
+    return s->global || (!s->defined && !s->has_constant && !s->local);
 }
 
 void elf_write(struct object *obj, struct buf *out) {
     struct buf shstr, strtab, symtab;
+    struct strmap shstr_seen, strtab_seen;
+    memset(&shstr_seen, 0, sizeof shstr_seen);
+    memset(&strtab_seen, 0, sizeof strtab_seen);
     memset(&shstr, 0, sizeof shstr);
     memset(&strtab, 0, sizeof strtab);
     memset(&symtab, 0, sizeof symtab);
@@ -84,7 +94,7 @@ void elf_write(struct object *obj, struct buf *out) {
         uint offset = out->len;
         buf_put(out, s->data.data, s->data.len);
         struct shdr *h = new_shdr();
-        h->name = strtab_add(&shstr, s->name);
+        h->name = strtab_add(&shstr, &shstr_seen, s->name);
         h->ty = s->attrs.ty;
         h->flags = s->attrs.flags;
         h->offset = offset;
@@ -92,14 +102,6 @@ void elf_write(struct object *obj, struct buf *out) {
         h->align = align;
         h->entsize = s->attrs.entsize;
     }
-
-    struct shdr *attr = new_shdr();
-    attr->name = strtab_add(&shstr, ".riscv.attributes");
-    attr->ty = SHT_RISCV_ATTRIBUTES;
-    attr->offset = out->len;
-    riscv_attributes(out);
-    attr->size = out->len - attr->offset;
-    attr->align = 1;
 
     /* The symbol table: null, locals, then globals. Each symbol's index, and
      * the first index of each name, for the relocations. */
@@ -110,19 +112,38 @@ void elf_write(struct object *obj, struct buf *out) {
     buf_zeros(&symtab, 16);
     uint n = 1;
     uint first_global = 0;
+    /* The first `.file "name"`'s symbol comes before every other local, the
+     * others where the source has them (LLVM's ELFObjectWriter). */
+    int first_file = -1;
+    for (uint i = 0; i < obj->nsymbols && first_file < 0; i++) {
+        if (obj->symbols[i].ty == SYM_FILE) {
+            first_file = (int)i;
+        }
+    }
     for (int pass = 0; pass < 2; pass++) {
         if (pass == 1) {
             first_global = n;
         }
-        for (uint i = 0; i < obj->nsymbols; i++) {
+        for (int k = pass == 0 && first_file >= 0 ? -1 : 0; k < (int)obj->nsymbols; k++) {
+            uint i = k < 0 ? (uint)first_file : (uint)k;
+            if (k >= 0 && (int)i == first_file) {
+                continue;
+            }
             struct symbol *s = &obj->symbols[i];
             if (is_global(s) != pass) {
                 continue;
             }
             index[i] = n++;
-            uint ty = s->ty == SYM_FUNC ? 2 : s->ty == SYM_OBJECT ? 1 : s->ty == SYM_SECTION ? 3 : 0;
+            uint ty = s->ty == SYM_FUNC      ? 2
+                      : s->ty == SYM_OBJECT  ? 1
+                      : s->ty == SYM_SECTION ? 3
+                      : s->ty == SYM_FILE    ? 4
+                                             : 0;
             uint value, shndx;
-            if (s->has_constant) {
+            if (s->ty == SYM_FILE) {
+                value = 0;
+                shndx = SHN_ABS;
+            } else if (s->has_constant) {
                 value = s->constant.lo;
                 shndx = SHN_ABS;
             } else if (s->section >= 0) {
@@ -133,7 +154,7 @@ void elf_write(struct object *obj, struct buf *out) {
                 shndx = SHN_UNDEF;
             }
             /* A section symbol has no name: it stands for its section. */
-            buf_u32(&symtab, s->ty == SYM_SECTION ? 0 : strtab_add(&strtab, s->name));
+            buf_u32(&symtab, s->ty == SYM_SECTION ? 0 : strtab_add(&strtab, &strtab_seen, s->name));
             buf_u32(&symtab, value);
             buf_u32(&symtab, s->size);
             buf_byte(&symtab, (uint)pass << 4 | ty);
@@ -167,7 +188,7 @@ void elf_write(struct object *obj, struct buf *out) {
             buf_u32(out, r->addend.lo);
         }
         struct shdr *h = new_shdr();
-        h->name = strtab_add(&shstr, fmt(".rela%s", s->name));
+        h->name = strtab_add(&shstr, &shstr_seen, fmt(".rela%s", s->name));
         h->ty = SHT_RELA;
         h->flags = SHF_INFO_LINK;
         h->offset = offset;
@@ -181,7 +202,7 @@ void elf_write(struct object *obj, struct buf *out) {
 
     buf_align(out, 4);
     struct shdr *h = new_shdr();
-    h->name = strtab_add(&shstr, ".symtab");
+    h->name = strtab_add(&shstr, &shstr_seen, ".symtab");
     h->ty = SHT_SYMTAB;
     h->offset = out->len;
     h->size = symtab.len;
@@ -192,7 +213,7 @@ void elf_write(struct object *obj, struct buf *out) {
     buf_put(out, symtab.data, symtab.len);
 
     h = new_shdr();
-    h->name = strtab_add(&shstr, ".strtab");
+    h->name = strtab_add(&shstr, &shstr_seen, ".strtab");
     h->ty = SHT_STRTAB;
     h->offset = out->len;
     h->size = strtab.len;
@@ -200,7 +221,7 @@ void elf_write(struct object *obj, struct buf *out) {
     buf_put(out, strtab.data, strtab.len);
 
     h = new_shdr();
-    h->name = strtab_add(&shstr, ".shstrtab");
+    h->name = strtab_add(&shstr, &shstr_seen, ".shstrtab");
     h->ty = SHT_STRTAB;
     h->offset = out->len;
     h->size = shstr.len;

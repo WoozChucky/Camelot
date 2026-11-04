@@ -12,6 +12,12 @@
 //!
 //! Source-level debugging: breaking on a line of the kernel and of a user program,
 //! stepping by line, `list`, and LLDB reading the same line tables (ignored).
+//!
+//! RV64: the same on RV64 machines, which the stub describes as `riscv:rv64`:
+//! `examples/hello/hello-rv64.elf`, `examples/smp/smp-rv64.elf` with 2 harts, and
+//! `tests/rv64/prog.c`, built here with merlin -g for RV64, for the source lines,
+//! the steps and the LP64 frames. The kernel's RV64 case waits for an RV64 kernel
+//! (#154).
 
 use grail::gdb::Outcome;
 use grail::{Machine, MachineConfig, RunResult};
@@ -108,12 +114,73 @@ fn merlin_dbg(args: &[&str], commands: &str) -> String {
     stdout
 }
 
+/// A file of the test's in the temporary directory, removed when the guard is
+/// dropped: when the test ends, and when it fails part way.
+struct TempFile(PathBuf);
+
+impl TempFile {
+    /// `name` (made unique to this process) with `data` in it.
+    fn new(name: &str, data: &[u8]) -> TempFile {
+        let path = std::env::temp_dir().join(format!("merlin-dbg-{}-{name}", std::process::id()));
+        std::fs::write(&path, data).unwrap();
+        TempFile(path)
+    }
+
+    fn to_str(&self) -> &str {
+        self.0.to_str().unwrap()
+    }
+}
+
+impl std::ops::Deref for TempFile {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Checks that `out` has `lines`, in this order (other lines may come between).
 fn assert_lines(out: &str, lines: &[&str]) {
     let mut rest = out.lines();
     for want in lines {
         assert!(rest.any(|l| l == *want), "no line {want:?} (in order) in:\n{out}");
     }
+}
+
+/// The lines `out` shows for the command `cmd` (echoed as `(merlin-dbg) cmd`): those
+/// after it, up to the next command.
+fn block_after(out: &str, cmd: &str) -> String {
+    let lines: Vec<&str> = out
+        .lines()
+        .skip_while(|l| *l != cmd)
+        .skip(1)
+        .take_while(|l| !l.starts_with("(merlin-dbg) "))
+        .collect();
+    lines.join("\n")
+}
+
+/// What `regs` shows, in GDB's layout: `given`'s lines (`name`, then the value in
+/// hex at column 15, a tab and its natural form), each register they leave out a
+/// signed integer that is 0. `given` must have every pointer register (`ra`, `sp`,
+/// `gp`, `tp`, `fp`), `pc` and `priv`.
+fn gdb_regs(given: &[&str]) -> String {
+    let names = [
+        "ra", "sp", "gp", "tp", "t0", "t1", "t2", "fp", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+        "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6", "pc", "priv",
+    ];
+    let lines: Vec<String> = names
+        .iter()
+        .map(|name| {
+            let line = given.iter().find(|l| l.split(' ').next() == Some(name));
+            line.map_or(format!("{name:<15}0x0\t0"), |l| l.to_string())
+        })
+        .collect();
+    lines.join("\n")
 }
 
 /// A debugged run over `--connect` of `elf`: merlin-dbg's output, and the console's,
@@ -141,11 +208,13 @@ fn hello() {
         "examples/hello/hello.elf",
         1,
         b"",
-        "break puts\n\
+        "break *puts\n\
          continue\n\
          regs\n\
          x/5b $a0\n\
          x/2 message\n\
+         x/2g message\n\
+         x/3xh message\n\
          stepi\n\
          si 2\n\
          bt\n\
@@ -156,16 +225,16 @@ fn hello() {
         &out,
         &[
             "=> 0x00001000:  auipc t0, 0x0",
-            "(merlin-dbg) break puts",
+            "(merlin-dbg) break *puts",
             "breakpoint 1 at 0x80000020 <puts>",
             "(merlin-dbg) continue",
             "breakpoint 1",
             "=> 0x80000020 <puts>:  lui t0, 0x10000",
-            "zero 0x00000000  ra   0x80000018  sp   0x80010070  gp   0x00000000",
-            "s0   0x00000000  s1   0x00000000  a0   0x80000050  a1   0x00000000",
-            "pc   0x80000020 <puts>  mode M",
             "0x80000050 <message>:  0x48  0x65  0x6c  0x6c  0x6f",
             "0x80000050 <message>:  0x6c6c6548  0x7266206f",
+            // GDB's giants and halfwords on RV32 too.
+            "0x80000050 <message>:  0x7266206f6c6c6548  0x6c656d6143206d6f",
+            "0x80000050 <message>:  0x6548  0x6c6c  0x206f",
             "=> 0x80000024 <puts+4>:  mv t1, a0",
             "=> 0x80000028 <puts+8>:  lbu t2, 0x0(t1)",
             "=> 0x8000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
@@ -176,6 +245,21 @@ fn hello() {
             "=> 0x8000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
             "program exited with code 0",
         ],
+    );
+    // GDB's info registers: the integers signed at 32 bits.
+    assert_eq!(
+        block_after(&out, "(merlin-dbg) regs"),
+        gdb_regs(&[
+            "ra             0x80000018\t0x80000018 <_start+24>",
+            "sp             0x80010070\t0x80010070",
+            "gp             0x0\t0x0",
+            "tp             0x0\t0x0",
+            "t0             0x80000000\t-2147483648",
+            "fp             0x0\t0x0",
+            "a0             0x80000050\t-2147483568",
+            "pc             0x80000020\t0x80000020 <puts>",
+            "priv           0x3\tprv:3 [Machine]",
+        ])
     );
 }
 
@@ -202,51 +286,50 @@ fn kernel() {
          delete\n\
          continue\n",
     );
-    // Addresses from the kernel's symbols, so a rebuilt kernel does not break the test.
-    let file = std::fs::read(path("kernel/kernel.elf")).unwrap();
-    let symbols = merlin_dbg::symbols::Symbols::from_elf(&file).unwrap();
-    let kmain = symbols.lookup("kmain").unwrap();
-    let kvminit = symbols.lookup("kvminit").unwrap();
+    // Addresses from the kernel's symbols and line tables, so a rebuilt kernel does
+    // not break the test. break FUNC stops past the prologue, as GDB's does: at the
+    // function's first line of code, cpu_init() in kmain, initlock() in kvminit.
+    let (kmain, kmain_off) = past_prologue(&kernel_elf(), "kmain");
+    let (kvminit, kvminit_off) = past_prologue(&kernel_elf(), "kvminit");
+    let kmain_line = line_of("kernel/main.c", "    cpu_init();");
+    let kvminit_line = line_of("kernel/vm.c", "    initlock(&uvm_lock, \"uvm\");");
     assert_lines(
         &out,
         &[
-            &format!(
-                "breakpoint 1 at {kmain:#010x} <kmain>: kernel/main.c:{}",
-                line_of("kernel/main.c", "int kmain(void) {")
-            ),
+            &format!("breakpoint 1 at {kmain:#x} <kmain+{kmain_off}>: kernel/main.c:{kmain_line}"),
             "breakpoint 1",
-            &format!("=> {kmain:#010x} <kmain>:  addi sp, sp, -0x10"),
-            &format!("=> {:#010x} <kmain+4>:  sw ra, 0xc(sp)", kmain + 4),
-            &format!(
-                "breakpoint 2 at {kvminit:#010x} <kvminit>: kernel/vm.c:{}",
-                line_of("kernel/vm.c", "void kvminit(void) {")
-            ),
+            &format!("kernel/main.c:{kmain_line}:     cpu_init();"),
+            &format!("breakpoint 2 at {kvminit:#x} <kvminit+{kvminit_off}>: kernel/vm.c:{kvminit_line}"),
             "breakpoint 2",
-            &format!("=> {kvminit:#010x} <kvminit>:  addi sp, sp, -0x10"),
+            &format!("kernel/vm.c:{kvminit_line}:     initlock(&uvm_lock, \"uvm\");"),
         ],
     );
-    assert!(
-        out.contains(&format!(
-            "pc   {kmain:#010x} <kmain>  mode S
-"
-        )),
-        "{out}"
+    // Each stop's instruction, and stepi's: the call to cpu_init, auipc and jalr.
+    for (at, name, inst) in [
+        (kmain, format!("kmain+{kmain_off}"), "auipc ra, "),
+        (kmain + 4, format!("kmain+{}", kmain_off + 4), "jalr "),
+        (kvminit, format!("kvminit+{kvminit_off}"), ""),
+    ] {
+        let want = format!("=> {at:#010x} <{name}>:  {inst}");
+        assert!(
+            out.lines().any(|l| l.starts_with(&want)),
+            "no {want:?} in:\n{out}"
+        );
+    }
+    assert_lines(
+        &out,
+        &[
+            &format!("pc             {kmain:#x}\t{kmain:#x} <kmain+{kmain_off}>"),
+            "priv           0x1\tprv:1 [Supervisor]",
+        ],
     );
     // The backtrace: kvminit, called from kmain, called from the assembly that enters
     // S-mode (whose ra kmain saved; the chain ends there, s0 = 0).
-    let bt: Vec<&str> = out
-        .lines()
-        .skip_while(|l| *l != "(merlin-dbg) bt")
-        .skip(1)
-        .take_while(|l| l.starts_with('#'))
-        .collect();
+    let bt = backtrace_after(&out, "(merlin-dbg) bt");
     assert_eq!(bt.len(), 3, "{out}");
     assert_eq!(
         bt[0],
-        format!(
-            "#0  {kvminit:#010x} <kvminit> at kernel/vm.c:{}",
-            line_of("kernel/vm.c", "void kvminit(void) {")
-        )
+        format!("#0  {kvminit:#010x} <kvminit+{kvminit_off}> at kernel/vm.c:{kvminit_line}")
     );
     assert!(bt[1].starts_with("#1  0x") && bt[1].contains(" <kmain+"), "{out}");
     assert!(bt[1].contains(" at kernel/main.c:"), "{out}");
@@ -254,10 +337,7 @@ fn kernel() {
     let back = bt[1].trim_start_matches("#1  ").split(" at ").next().unwrap();
     // finish comes back there, and says what kvminit returned.
     assert!(
-        out.contains(&format!(
-            "run till exit, back to {back}
-=> {back}:"
-        )),
+        out.contains(&format!("run till exit, back to {back}\n=> {back}:")),
         "{out}"
     );
     assert!(out.contains("returned: a0 = "), "{out}");
@@ -265,10 +345,31 @@ fn kernel() {
         &out,
         &[
             "Num  Type        Where",
-            &format!("1    breakpoint  {kmain:#010x} <kmain>"),
-            &format!("2    breakpoint  {kvminit:#010x} <kvminit>"),
+            &format!("1    breakpoint  {kmain:#010x} <kmain+{kmain_off}>"),
+            &format!("2    breakpoint  {kvminit:#010x} <kvminit+{kvminit_off}>"),
         ],
     );
+}
+
+/// The committed kernel.
+fn kernel_elf() -> Vec<u8> {
+    std::fs::read(path("kernel/kernel.elf")).unwrap()
+}
+
+/// Where `break FUNC` puts its breakpoint in the program `file`: past the
+/// function's prologue, at its `prologue_end` row (or its second row), as GDB does.
+/// The address, and its offset into the function.
+fn past_prologue(file: &[u8], func: &str) -> (u64, u64) {
+    let symbols = merlin_dbg::symbols::Symbols::from_elf(file).unwrap();
+    let mut lines = merlin_dbg::source::Lines::default();
+    lines.add_elf(file).unwrap();
+    let entry = symbols.lookup(func).unwrap_or_else(|| panic!("no {func}"));
+    let (start, end) = symbols.range(entry).unwrap();
+    let body = lines
+        .prologue_end(start, end)
+        .unwrap_or_else(|| panic!("no lines for {func}"));
+    assert!(body > entry, "{func}'s prologue");
+    (body, body - entry)
 }
 
 /// The number of the first line of `file` (from the repository root) that starts
@@ -300,8 +401,9 @@ fn source_lines(out: &str, file: &str) -> Vec<(u32, String)> {
 
 #[test]
 fn source_lines_of_the_kernel() {
-    // kmain's first line, then line by line with next (over the calls), into a
-    // call with step, past its prologue, a backtrace with lines, and the source.
+    // A breakpoint on kmain's first line, which stops past its prologue on its
+    // body's first line; next over that line's call, into the next line's call with
+    // step, past its prologue, a backtrace with lines, and the source.
     let kmain = line_of("kernel/main.c", "int kmain(void) {");
     let out = connected(
         "kernel/kernel.elf",
@@ -310,7 +412,6 @@ fn source_lines_of_the_kernel() {
         &format!(
             "break kernel/main.c:{kmain}\n\
              continue\n\
-             next\n\
              next\n\
              step\n\
              bt\n\
@@ -322,17 +423,16 @@ fn source_lines_of_the_kernel() {
             kmain - 1
         ),
     );
-    let file = std::fs::read(path("kernel/kernel.elf")).unwrap();
-    let symbols = merlin_dbg::symbols::Symbols::from_elf(&file).unwrap();
-    let kmain_at = symbols.lookup("kmain").unwrap();
+    // kmain's first line is its prologue: the breakpoint goes past it, to the first
+    // line of its body, as GDB's does.
+    let (body_at, off) = past_prologue(&kernel_elf(), "kmain");
+    let body = line_of("kernel/main.c", "    cpu_init();");
     assert_lines(
         &out,
         &[
-            &format!("breakpoint 1 at {kmain_at:#010x} <kmain>: kernel/main.c:{kmain}"),
+            &format!("breakpoint 1 at {body_at:#x} <kmain+{off}>: kernel/main.c:{body}"),
             "breakpoint 1",
-            &format!("=> {kmain_at:#010x} <kmain>:  addi sp, sp, -0x10"),
-            &format!("kernel/main.c:{kmain}: int kmain(void) {{"),
-            "(merlin-dbg) next",
+            &format!("kernel/main.c:{body}:     cpu_init();"),
             "(merlin-dbg) next",
             "(merlin-dbg) step",
         ],
@@ -342,9 +442,9 @@ fn source_lines_of_the_kernel() {
         .iter()
         .map(|(n, _)| *n)
         .collect();
-    assert!(lines.len() >= 3, "{out}");
-    assert_eq!(lines[0], kmain);
-    assert!(lines[0] < lines[1] && lines[1] < lines[2], "{lines:?}\n{out}");
+    assert!(lines.len() >= 2, "{out}");
+    assert_eq!(lines[0], body);
+    assert!(lines[0] < lines[1], "{lines:?}\n{out}");
     // step went into the call on that line: the backtrace has the caller on it.
     let bt: Vec<&str> = out
         .lines()
@@ -355,7 +455,7 @@ fn source_lines_of_the_kernel() {
     assert!(!bt[0].contains("<kmain"), "{out}");
     assert!(bt[0].contains(" at kernel/"), "{out}");
     assert!(
-        bt[1].contains(" <kmain+") && bt[1].ends_with(&format!(" at kernel/main.c:{}", lines[2])),
+        bt[1].contains(" <kmain+") && bt[1].ends_with(&format!(" at kernel/main.c:{}", lines[1])),
         "{out}"
     );
     // list: ten numbered lines; list main.c:LINE centers on it.
@@ -372,7 +472,7 @@ fn source_lines_of_the_kernel() {
         &out,
         &[
             &format!("line {} has no code: kernel/main.c:{kmain} instead", kmain - 1),
-            &format!("breakpoint 2 at {kmain_at:#010x} <kmain>: kernel/main.c:{kmain}"),
+            &format!("breakpoint 2 at {body_at:#x} <kmain+{off}>: kernel/main.c:{body}"),
         ],
     );
 }
@@ -388,8 +488,7 @@ fn stepping_through_a_user_program() {
     // the objects; the kernel runs the same program without them. It is the first
     // user program to run, so its main is where the breakpoint stops.
     let sh = xtask::userprogs::build_named(&path("kernel/user"), "sh").unwrap();
-    let elf = std::env::temp_dir().join(format!("merlin-dbg-sh-{}.elf", std::process::id()));
-    std::fs::write(&elf, &sh.debug).unwrap();
+    let elf = TempFile::new("sh.elf", &sh.debug);
     let main = line_of("kernel/user/sh.c", "int main(void) {");
     let out = connected(
         "kernel/kernel.elf",
@@ -408,22 +507,22 @@ fn stepping_through_a_user_program() {
             elf.display()
         ),
     );
-    let _ = std::fs::remove_file(&elf);
-    let symbols = merlin_dbg::symbols::Symbols::from_elf(&sh.debug).unwrap();
-    let main_at = symbols.lookup("main").unwrap();
-    assert_lines(
-        &out,
-        &[
-            &format!("breakpoint 1 at {main_at:#010x} <main>: kernel/user/sh.c:{main}"),
-            "breakpoint 1",
-            &format!("kernel/user/sh.c:{main}: int main(void) {{"),
-        ],
-    );
+    // main's first line is its prologue: the breakpoint is past it, on a line of
+    // its body.
+    let (main_at, off) = past_prologue(&sh.debug, "main");
+    let at = format!("breakpoint 1 at {main_at:#x} <main+{off}>: kernel/user/sh.c:");
+    let set = out
+        .lines()
+        .find(|l| l.starts_with(&at))
+        .unwrap_or_else(|| panic!("no {at:?} in:\n{out}"));
+    let body: u32 = set[at.len()..].parse().unwrap();
+    assert!(body > main, "{out}");
     let lines: Vec<u32> = source_lines(&out, "kernel/user/sh.c")
         .iter()
         .map(|(n, _)| *n)
         .collect();
-    assert!(lines.len() >= 4, "{out}");
+    assert_eq!(lines[0], body, "{out}");
+    assert!(lines.len() >= 3, "{out}");
     assert!(lines.windows(2).all(|w| w[0] < w[1]), "{lines:?}\n{out}");
     assert!(out.contains(" <_start+"), "{out}");
 }
@@ -472,7 +571,7 @@ fn harts_and_watchpoints() {
         "examples/smp/smp.elf",
         2,
         b"",
-        "break work\n\
+        "break *work\n\
          continue\n\
          continue\n\
          hart\n\
@@ -501,8 +600,10 @@ fn harts_and_watchpoints() {
             "[hart 1] breakpoint 1",
             "=> 0x80000070 <work>:  auipc t0, 0x0",
             "* hart 1, M-mode, at 0x80000070 <work>",
-            "s0   0x00000001  s1   0x00000002  a0   0x00000001  a1   0x00000000",
             "hart 0",
+            // Hart 0's stack, past every section: no symbol names it.
+            "(merlin-dbg) x/1 $sp",
+            "0x80010470:  0x00000000",
             "hart 1",
             "=> 0x80000074 <work+4>:  addi t0, t0, 0x3c0",
             "watchpoint 2 (write) at 0x80000430 <counter>, 4 bytes",
@@ -515,30 +616,51 @@ fn harts_and_watchpoints() {
             "error: no hart 3: the machine has 2",
         ],
     );
+    // Hart 1's registers, the same at both widths.
+    assert_eq!(
+        block_after(&out, "(merlin-dbg) regs"),
+        gdb_regs(&[
+            "ra             0x0\t0x0",
+            "sp             0x8000f470\t0x8000f470",
+            "gp             0x0\t0x0",
+            "tp             0x0\t0x0",
+            "t0             0x30002000\t805314560",
+            "t1             0x2000004\t33554436",
+            "t2             0x1\t1",
+            "fp             0x1\t0x1",
+            "s1             0x2\t2",
+            "a0             0x1\t1",
+            "pc             0x80000070\t0x80000070 <work>",
+            "priv           0x3\tprv:3 [Machine]",
+        ])
+    );
 }
 
 #[test]
 fn starting_grail_itself() {
     // merlin-dbg -- grail-args: the machine in merlin-dbg's process, its console on
-    // merlin-dbg's stdout. Commands from a file (-x), then stdin.
-    let script = std::env::temp_dir().join(format!("merlin-dbg-{}.cmds", std::process::id()));
-    std::fs::write(&script, "# a comment\nbreak puts\ncontinue\n").unwrap();
+    // merlin-dbg's stdout. Commands from a file (-x), then stdin. puts has no line
+    // information, so break puts goes past its prologue by GDB's prologue analysis:
+    // li t0 (lui) and mv t1 (addi) are prologue to it, the lbu is not, so puts+8,
+    // the top of its loop (deleted, or each character would stop there).
+    let script = TempFile::new("script.cmds", b"# a comment\nbreak puts\ncontinue\ndelete\n");
     let out = merlin_dbg(
         &[
             "-x",
-            script.to_str().unwrap(),
+            script.to_str(),
             "--",
             path("examples/hello/hello.elf").to_str().unwrap(),
         ],
         "bogus\nx/1 nowhere\ndelete 7\ncontinue\nregs\n",
     );
-    let _ = std::fs::remove_file(&script);
     assert_lines(
         &out,
         &[
             "(merlin-dbg) break puts",
-            "breakpoint 1 at 0x80000020 <puts>",
+            "breakpoint 1 at 0x80000028 <puts+8>",
             "breakpoint 1",
+            "=> 0x80000028 <puts+8>:  lbu t2, 0x0(t1)",
+            "(merlin-dbg) delete",
             "(merlin-dbg) bogus",
             "error: unknown command 'bogus' (try help)",
             "error: no symbol 'nowhere'",
@@ -595,4 +717,470 @@ fn interrupting_a_running_machine() {
     let mut remote = merlin_dbg::remote::Remote::connect(addr).unwrap();
     remote.kill();
     assert_eq!(thread.join().unwrap(), Outcome::Killed);
+}
+
+// ---- RV64 ----
+
+#[test]
+fn hello_rv64() {
+    // hello's session on an RV64 machine: the same addresses and code, the registers
+    // and addresses with 16 digits, and x/g's 8-byte units.
+    let out = connected(
+        "examples/hello/hello-rv64.elf",
+        1,
+        b"",
+        "break *puts\n\
+         continue\n\
+         regs\n\
+         x/5b $a0\n\
+         x/2 message\n\
+         x/2g message\n\
+         x/3xh message\n\
+         stepi\n\
+         si 2\n\
+         bt\n\
+         disas $pc-8 3\n\
+         finish\n\
+         continue\n",
+    );
+    assert_lines(
+        &out,
+        &[
+            "=> 0x0000000000001000:  auipc t0, 0x0",
+            "(merlin-dbg) break *puts",
+            "breakpoint 1 at 0x80000020 <puts>",
+            "(merlin-dbg) continue",
+            "breakpoint 1",
+            "=> 0x0000000080000020 <puts>:  lui t0, 0x10000",
+            "0x80000050 <message>:  0x48  0x65  0x6c  0x6c  0x6f",
+            "0x80000050 <message>:  0x6c6c6548  0x7266206f",
+            "0x80000050 <message>:  0x7266206f6c6c6548  0x6c656d6143206d6f",
+            "0x80000050 <message>:  0x6548  0x6c6c  0x206f",
+            "=> 0x0000000080000024 <puts+4>:  mv t1, a0",
+            "=> 0x0000000080000028 <puts+8>:  lbu t2, 0x0(t1)",
+            "=> 0x000000008000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
+            "#0  0x000000008000002c <puts+12>",
+            "#1  0x0000000080000018 <_start+24>",
+            "   0x0000000080000024 <puts+4>:  mv t1, a0",
+            "   0x0000000080000028 <puts+8>:  lbu t2, 0x0(t1)",
+            "=> 0x000000008000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
+            "run till exit, back to 0x0000000080000018 <_start+24>",
+            "=> 0x0000000080000018 <_start+24>:  xcal.dbg a0",
+            "returned: a0 = 0x0000000000000014 (20)",
+            "program exited with code 0",
+        ],
+    );
+    // GDB's info registers: the integers signed at 64 bits.
+    assert_eq!(
+        block_after(&out, "(merlin-dbg) regs"),
+        gdb_regs(&[
+            "ra             0x80000018\t0x80000018 <_start+24>",
+            "sp             0x80010070\t0x80010070",
+            "gp             0x0\t0x0",
+            "tp             0x0\t0x0",
+            "t0             0x80000000\t2147483648",
+            "fp             0x0\t0x0",
+            "a0             0x80000050\t2147483728",
+            "pc             0x80000020\t0x80000020 <puts>",
+            "priv           0x3\tprv:3 [Machine]",
+        ])
+    );
+}
+
+#[test]
+fn harts_and_watchpoints_rv64() {
+    let out = connected(
+        "examples/smp/smp-rv64.elf",
+        2,
+        b"",
+        "break *work\n\
+         continue\n\
+         continue\n\
+         hart\n\
+         regs\n\
+         hart 0\n\
+         x/1g $sp\n\
+         hart 1\n\
+         si\n\
+         delete 1\n\
+         watch counter\n\
+         watch -r ready\n\
+         continue\n\
+         continue\n\
+         info breakpoints\n\
+         delete\n\
+         hart 3\n\
+         continue\n",
+    );
+    assert_lines(
+        &out,
+        &[
+            "connected: 2 harts",
+            "breakpoint 1 at 0x80000070 <work>",
+            "[hart 0] breakpoint 1",
+            "=> 0x0000000080000070 <work>:  auipc t0, 0x0",
+            "[hart 1] breakpoint 1",
+            "=> 0x0000000080000070 <work>:  auipc t0, 0x0",
+            "* hart 1, M-mode, at 0x0000000080000070 <work>",
+            "hart 0",
+            // Hart 0's stack, past every section: no symbol names it.
+            "(merlin-dbg) x/1g $sp",
+            "0x80010470:  0x0000000000000000",
+            "hart 1",
+            "=> 0x0000000080000074 <work+4>:  addi t0, t0, 0x3c0",
+            "watchpoint 2 (write) at 0x80000430 <counter>, 8 bytes",
+            "watchpoint 3 (read) at 0x8000043c <ready>, 8 bytes",
+            "[hart 0] watchpoint 2 (write) hit at 0x80000430 <counter>",
+            "=> 0x0000000080000084 <work+20>:  addi t1, t1, -0x1",
+            "[hart 1] watchpoint 2 (write) hit at 0x80000430 <counter>",
+            "2    watchpoint  0x80000430 <counter>, 8 bytes, write",
+            "3    watchpoint  0x8000043c <ready>, 8 bytes, read",
+            "error: no hart 3: the machine has 2",
+        ],
+    );
+    // Hart 1's registers, the same at both widths.
+    assert_eq!(
+        block_after(&out, "(merlin-dbg) regs"),
+        gdb_regs(&[
+            "ra             0x0\t0x0",
+            "sp             0x8000f470\t0x8000f470",
+            "gp             0x0\t0x0",
+            "tp             0x0\t0x0",
+            "t0             0x30002000\t805314560",
+            "t1             0x2000004\t33554436",
+            "t2             0x1\t1",
+            "fp             0x1\t0x1",
+            "s1             0x2\t2",
+            "a0             0x1\t1",
+            "pc             0x80000070\t0x80000070 <work>",
+            "priv           0x3\tprv:3 [Machine]",
+        ])
+    );
+}
+
+/// `tests/rv64/prog.c`'s directory, from the repository root: the compilation
+/// directory of its line tables, so they name `crates/merlin-dbg/tests/rv64/prog.c`
+/// (as the kernel's name `kernel/main.c`).
+const RV64_DIR: &str = "crates/merlin-dbg/tests/rv64";
+
+/// `tests/rv64/prog.c` and `crt0.s` built for RV64 with our tools, `prog.c` with
+/// its line tables (merlin -g), into an executable at 0x80000000 (merlin-ld's
+/// default layout), written to a file of its own for `test`, removed with the
+/// guard.
+fn rv64_program(test: &str) -> TempFile {
+    let xlen = excalibur::Xlen::Rv64;
+    let dir = path(RV64_DIR);
+    let opts = merlin::Options {
+        xlen,
+        debug: Some(merlin::DebugInfo {
+            comp_dir: RV64_DIR.into(),
+        }),
+        ..merlin::Options::default()
+    };
+    let src = std::fs::read_to_string(dir.join("prog.c")).unwrap();
+    let asm = merlin::compile_with("prog.c", &src, &opts, &merlin::no_files)
+        .unwrap_or_else(|e| panic!("merlin: {e:?}"));
+    let crt0 = std::fs::read_to_string(dir.join("crt0.s")).unwrap();
+    let as_opts = merlin_as::Options { xlen };
+    let inputs: Vec<merlin_ld::Input> = [("crt0.o", crt0), ("prog.o", asm)]
+        .into_iter()
+        .map(|(name, asm)| merlin_ld::Input {
+            name: name.into(),
+            data: merlin_as::assemble_to_elf_with(&asm, &as_opts)
+                .unwrap_or_else(|e| panic!("merlin-as {name}: {e:?}")),
+        })
+        .collect();
+    let linked = merlin_ld::link(&inputs, &merlin_ld::Options::default())
+        .unwrap_or_else(|e| panic!("merlin-ld: {e:?}"));
+    TempFile::new(&format!("rv64-{test}.elf"), &linked.elf)
+}
+
+/// The addresses of `names` in the program at `elf`, from its symbols (so that
+/// merlin's code changing does not break the tests).
+fn addresses<const N: usize>(elf: &Path, names: [&str; N]) -> [u64; N] {
+    let symbols = merlin_dbg::symbols::Symbols::from_elf(&std::fs::read(elf).unwrap()).unwrap();
+    names.map(|n| symbols.lookup(n).unwrap_or_else(|| panic!("no symbol {n}")))
+}
+
+/// The backtrace after the command `cmd` in `out`: its `#N` lines.
+fn backtrace_after<'a>(out: &'a str, cmd: &str) -> Vec<&'a str> {
+    out.lines()
+        .skip_while(|l| *l != cmd)
+        .skip(1)
+        .take_while(|l| l.starts_with('#'))
+        .collect()
+}
+
+/// The `n`th backtrace in `out` (from 0): the `#N` lines after the `n`th `bt`.
+fn nth_backtrace(out: &str, n: usize) -> Vec<&str> {
+    let mut lines = out.lines();
+    for _ in 0..=n {
+        lines.find(|l| *l == "(merlin-dbg) bt").expect("a bt");
+    }
+    lines.take_while(|l| l.starts_with('#')).collect()
+}
+
+#[test]
+fn source_lines_of_an_rv64_program() {
+    // A breakpoint on main's first line, which stops past main's prologue on the
+    // call of puts (`long f;` has no code), next by line over it to the call of
+    // fact, step into fact past its prologue, a backtrace with lines, list, and a
+    // line with no code.
+    let elf = rv64_program("lines");
+    let [fact_at] = addresses(&elf, ["fact"]);
+    let (body_at, off) = past_prologue(&std::fs::read(&*elf).unwrap(), "main");
+    let file = format!("{RV64_DIR}/prog.c");
+    let main = line_of(&file, "int main(void) {");
+    let fact = line_of(&file, "long fact(long n) {");
+    let out = connected(
+        elf.to_str(),
+        1,
+        b"",
+        &format!(
+            "break {file}:{main}\n\
+             continue\n\
+             next\n\
+             step\n\
+             bt\n\
+             list\n\
+             list prog.c:{fact}\n\
+             break prog.c:{}\n\
+             delete\n\
+             continue\n",
+            main - 1
+        ),
+    );
+    assert_lines(
+        &out,
+        &[
+            &format!("breakpoint 1 at {body_at:#x} <main+{off}>: {file}:{}", main + 2),
+            "breakpoint 1",
+            &format!("=> {body_at:#018x} <main+{off}>:  auipc a0, 0x0"),
+            &format!("{file}:{}:     puts(\"fact\\n\");", main + 2),
+        ],
+    );
+    // Each stop shows its line, with the source's text: puts's call, fact's call,
+    // then the first line of fact's body.
+    let lines: Vec<u32> = source_lines(&out, &file).iter().map(|(n, _)| *n).collect();
+    let want = [
+        line_of(&file, "    puts(\"fact\\n\");"),
+        line_of(&file, "    f = fact(5);"),
+        line_of(&file, "    if (n <= 1)"),
+    ];
+    assert_eq!(lines[..3], want, "{out}");
+    // step went into the call, past fact's prologue (which saves ra and s0 with sd):
+    // fact, called from main on that line, called from _start.
+    let bt = backtrace_after(&out, "(merlin-dbg) bt");
+    assert_eq!(bt.len(), 3, "{out}");
+    let pc = u64::from_str_radix(&bt[0]["#0  0x".len()..][..16], 16).unwrap();
+    assert!(
+        bt[0].contains(&format!(" <fact+{}>", pc - fact_at)) && pc - fact_at >= 16,
+        "{out}"
+    );
+    assert!(bt[0].ends_with(&format!(" at {file}:{}", want[2])), "{out}");
+    assert!(
+        bt[1].starts_with("#1  0x00000000800") && bt[1].contains(" <main+"),
+        "{out}"
+    );
+    assert!(bt[1].ends_with(&format!(" at {file}:{}", want[1])), "{out}");
+    assert!(bt[2].contains(" <_start+"), "{out}");
+    // list: ten numbered lines; list prog.c:LINE centers on it.
+    let listed: Vec<&str> = out
+        .lines()
+        .skip_while(|l| !l.ends_with(&format!(") list prog.c:{fact}")))
+        .skip(1)
+        .take(10)
+        .collect();
+    let source = std::fs::read_to_string(path(&file)).unwrap();
+    let text = |n: u32| source.lines().nth(n as usize - 1).unwrap().to_string();
+    assert_eq!(listed[0], format!("{}\t{}", fact - 5, text(fact - 5)));
+    assert_eq!(listed[5], format!("{fact}\tlong fact(long n) {{"));
+    // The line before main has no code: the breakpoint goes to main's, and so past
+    // its prologue.
+    assert_lines(
+        &out,
+        &[
+            &format!("line {} has no code: {file}:{main} instead", main - 1),
+            &format!("breakpoint 2 at {body_at:#x} <main+{off}>: {file}:{}", main + 2),
+        ],
+    );
+}
+
+#[test]
+fn stepping_through_an_rv64_program() {
+    // Breakpoints in sum, a variadic function (its ra and s0 below the saved
+    // argument registers, at CFA-64 and CFA-72), called from fact five deep in its
+    // recursion: on its first statement (break sum) and in its loop, at the va_arg
+    // line, both past its prologue, so that the backtraces read sum's saved ra and
+    // s0 from its frame in memory; finish, next back up the recursion, a
+    // watchpoint on a 64-bit global and its doublewords, and step into puts.
+    let elf = rv64_program("steps");
+    let [sum_at, total_at] = addresses(&elf, ["sum", "total"]);
+    let file = format!("{RV64_DIR}/prog.c");
+    let line = |start: &str| line_of(&file, start);
+    let va_arg = line("        s += va_arg(ap, long);");
+    let out = connected(
+        elf.to_str(),
+        1,
+        b"",
+        &format!(
+            "break sum\n\
+         continue\n\
+         bt\n\
+         break prog.c:{va_arg}\n\
+         continue\n\
+         bt\n\
+         finish\n\
+         next\n\
+         next\n\
+         next\n\
+         bt\n\
+         delete\n\
+         watch total\n\
+         continue\n\
+         x/1g total\n\
+         continue\n\
+         x/1g total\n\
+         delete\n\
+         step\n\
+         step\n\
+         continue\n"
+        ),
+    );
+    // break sum stops past its prologue, on its body's first line: sum's frame is
+    // built, and the backtrace reads its ra and s0 from their slots.
+    let (body_at, off) = past_prologue(&std::fs::read(&*elf).unwrap(), "sum");
+    assert_eq!(body_at - off, sum_at);
+    let sum = line("    long s = 0;");
+    let base_case = line("        return sum(1, 1L);");
+    let recursion = line("    return n * fact(n - 1);");
+    let call = line("    f = fact(5);");
+    assert_lines(
+        &out,
+        &[
+            &format!("breakpoint 1 at {body_at:#x} <sum+{off}>: {file}:{sum}"),
+            &format!("=> {body_at:#018x} <sum+{off}>:  li a0, 0x0"),
+        ],
+    );
+    // In the loop: the va_arg line, further into sum than its prologue, stays where
+    // it is.
+    let at = |l: &str| l.split(" at ").nth(1).map(str::to_string);
+    let set = out
+        .lines()
+        .find(|l| l.starts_with("breakpoint 2 at ") && l.ends_with(&format!(": {file}:{va_arg}")))
+        .unwrap_or_else(|| panic!("no breakpoint 2 at line {va_arg} in:\n{out}"));
+    assert!(set.contains(" <sum+"), "{out}");
+    assert_lines(
+        &out,
+        &[
+            "breakpoint 2",
+            &format!("{file}:{va_arg}:         s += va_arg(ap, long);"),
+        ],
+    );
+    // Both times: sum, fact(1) to fact(5), main, _start. sum's own frame (built,
+    // its ra and s0 read from CFA-64 and CFA-72) leads to fact(1).
+    let first = backtrace_after(&out, "(merlin-dbg) bt");
+    let bt = nth_backtrace(&out, 1);
+    assert_eq!(bt.len(), 8, "{out}");
+    assert_eq!(first[1..], bt[1..], "{out}");
+    assert_eq!(at(first[0]), Some(format!("{file}:{sum}")));
+    assert_eq!(at(bt[0]), Some(format!("{file}:{va_arg}")));
+    assert!(bt[1].contains(" <fact+"), "{out}");
+    assert_eq!(at(bt[1]), Some(format!("{file}:{base_case}")));
+    for f in &bt[2..6] {
+        assert!(f.contains(" <fact+"), "{out}");
+        assert_eq!(at(f), Some(format!("{file}:{recursion}")));
+    }
+    assert!(bt[6].contains(" <main+"), "{out}");
+    assert_eq!(at(bt[6]), Some(format!("{file}:{call}")));
+    assert!(bt[7].contains(" <_start+"), "{out}");
+    // finish, from the loop: back in fact(1), with sum's result.
+    let back = bt[1].trim_start_matches("#1  ").split(" at ").next().unwrap();
+    assert!(
+        out.contains(&format!("run till exit, back to {back}\n=> {back}:")),
+        "{out}"
+    );
+    assert_lines(&out, &["returned: a0 = 0x0000000000000001 (1)"]);
+    // next: fact(1)'s closing brace, then fact(2)'s line of the call, and its brace;
+    // the backtrace has lost fact(1).
+    let lines: Vec<u32> = source_lines(&out, &file).iter().map(|(n, _)| *n).collect();
+    assert_eq!(
+        lines[..6],
+        [sum, va_arg, base_case, recursion + 1, recursion, recursion + 1],
+        "{out}"
+    );
+    assert_eq!(nth_backtrace(&out, 2).len(), 6, "{out}");
+    // The watchpoint: 8 bytes of total, written twice; the second time with the
+    // high half set.
+    assert_lines(
+        &out,
+        &[
+            &format!("watchpoint 3 (write) at {total_at:#x} <total>, 8 bytes"),
+            &format!("watchpoint 3 (write) hit at {total_at:#x} <total>"),
+            &format!(
+                "{file}:{}:     total = total + sum(3, 0x100000000L, 2L, 3L);",
+                call + 2
+            ),
+            &format!("{total_at:#x} <total>:  0x0000000000000078"),
+            &format!("watchpoint 3 (write) hit at {total_at:#x} <total>"),
+            &format!("{file}:{}:     puts(\"done\\n\");", call + 3),
+            &format!("{total_at:#x} <total>:  0x000000010000007d"),
+            &format!("{file}:{}:     while (*s) {{", line("    while (*s) {")),
+            &format!("{file}:{}:         putc(*s);", line("        putc(*s);")),
+        ],
+    );
+}
+
+#[test]
+fn starting_an_rv64_grail_and_the_widths_agreeing() {
+    // merlin-dbg -- an RV64 program: the machine is RV64 (the ELF64 program made it
+    // so), and the stub says so. break puts past its prologue by GDB's analysis, as
+    // on RV32.
+    let out = merlin_dbg(
+        &["--", path("examples/hello/hello-rv64.elf").to_str().unwrap()],
+        "break puts\ncontinue\nx/1g $a0\ndelete\ncontinue\n",
+    );
+    assert_lines(
+        &out,
+        &[
+            "=> 0x0000000000001000:  auipc t0, 0x0",
+            "breakpoint 1 at 0x80000028 <puts+8>",
+            "=> 0x0000000080000028 <puts+8>:  lbu t2, 0x0(t1)",
+            "0x80000050 <message>:  0x7266206f6c6c6548",
+            "Hello from Camelot!",
+            "program exited with code 0",
+        ],
+    );
+    // An RV32 program's symbols for an RV64 machine: left out with a warning, and the
+    // session goes on without them, as GDB's does. The machine stays stopped at its
+    // first instruction, where the stub waited for merlin-dbg (dropping the
+    // connection would have let it run off), until the session runs it to a
+    // breakpoint and to its end.
+    let (m, console) = machine("examples/hello/hello-rv64.elf", 1, b"");
+    let (addr, thread) = stub(m);
+    let out = merlin_dbg(
+        &[
+            "--connect",
+            &addr.to_string(),
+            path("examples/hello/hello.elf").to_str().unwrap(),
+        ],
+        "break puts\nbreak 0x80000020\ncontinue\ncontinue\n",
+    );
+    assert_lines(
+        &out,
+        &[
+            &format!(
+                "warning: {}: an RV32 program (ELF32), but the machine is RV64: going on without its symbols",
+                path("examples/hello/hello.elf").display()
+            ),
+            "=> 0x0000000000001000:  auipc t0, 0x0",
+            "error: no symbol 'puts'",
+            "breakpoint 1 at 0x80000020",
+            "breakpoint 1",
+            "=> 0x0000000080000020:  lui t0, 0x10000",
+            "program exited with code 0",
+        ],
+    );
+    assert_eq!(thread.join().unwrap(), Outcome::Exited(0));
+    assert_eq!(console.text(), "Hello from Camelot!\n");
 }

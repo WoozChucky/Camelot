@@ -93,6 +93,9 @@ pub enum DirArg {
     Str(Vec<u8>),
     /// A number wider than 64 bits (`.file`'s MD5 checksum).
     Wide(u128),
+    /// An argument left out between two commas: the fill of
+    /// `.p2align 3,,4`.
+    Empty,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
