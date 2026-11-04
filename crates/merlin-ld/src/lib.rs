@@ -1,5 +1,7 @@
-//! merlin-ld: links ELF32 RISC-V relocatable objects into an Excalibur
-//! executable (`ET_EXEC`) that Grail loads directly.
+//! merlin-ld: links RISC-V relocatable objects into an Excalibur executable
+//! (`ET_EXEC`) that Grail loads directly. The objects are ELF32 (RV32) or
+//! ELF64 (RV64), all of one class, and the executable has their class: there
+//! is no option for it, as ld.lld needs none ([`Layout::class`]).
 //!
 //! Pipeline: [`object`] (read `.o` files) → [`layout`] (symbols, section
 //! merging, addresses; driven by a [`script`]) → [`relocate`] (copies section
@@ -53,7 +55,9 @@ pub struct ScriptSource {
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     /// `-T`; without it the default layout is used (`.text` at 0x8000_0000,
-    /// then `.rodata`, `.data`, `.bss`).
+    /// then `.rodata`, `.data`, `.bss`; [`script::DEFAULT_SCRIPT`]). For
+    /// RV64 that takes pc-relative code only (`-mcmodel=medany`): `lui
+    /// %hi(x)` cannot reach 0x8000_0000 there.
     pub script: Option<ScriptSource>,
     /// `-e`: an entry symbol or address. Overrides `ENTRY(...)`.
     pub entry: Option<String>,
@@ -75,11 +79,6 @@ pub fn layout(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
 pub fn link(inputs: &[Input], opts: &Options) -> Result<Linked, Vec<Error>> {
     let layout = layout::build(inputs, opts)?;
     let images = relocate::relocate(&layout)?;
-    // TEMPORARY (#149, until the writer learns ELF64): RV64 objects are read,
-    // laid out ([`layout`]) and relocated, but no ELF64 file is written yet.
-    if layout.class == object::Class::Elf64 {
-        return Err(vec![Error("ELF64 (RV64) output is not supported yet".into())]);
-    }
     let elf = write::write(&layout, &images);
     Ok(Linked { elf, layout })
 }

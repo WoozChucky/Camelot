@@ -1,6 +1,8 @@
 //! End-to-end tests against clang-built objects and ld.lld's output for the
 //! same inputs (`tests/fixtures`, made by clang and LLD 23.1.4; regenerate
-//! with `cargo xtask ld-fixtures`).
+//! with `cargo xtask ld-fixtures`), for RV32: the RV32 set of fixtures. The
+//! RV64 set (`tests/fixtures/rv64`) is `rv64.rs`'s; the helpers both use are
+//! in `common/mod.rs`.
 //! Each `name.ld` there lists its objects in its first comment;
 //! `name.lld.elf` is ld.lld's link, `name.expected.txt` is
 //! `llvm-readelf -S -l -s` of it and `name.objdump.txt` is `llvm-objdump -d`
@@ -24,55 +26,54 @@
 //!   on purpose (spec §10); the test pins down the difference.
 //! * `fixtures/rejects`, `fixtures/symbols`: objects for error paths.
 
+mod common;
+
+use common::{errors, input, ram, read_ours, run, script, script_file, Load, RV32};
 use grail::{Machine, RunResult};
-use merlin_ld::{Input, Options, ScriptSource};
+use merlin_ld::{Input, Options};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+// The RV32 set (`tests/fixtures`) of the helpers in common/mod.rs.
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    common::fixtures(RV32)
 }
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn input(path: &Path) -> Input {
-    Input {
-        name: path.file_name().unwrap().to_string_lossy().into_owned(),
-        data: std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
-    }
+    common::repo_root()
 }
 
 fn inputs(dir: &str, names: &[&str]) -> Vec<Input> {
-    names
-        .iter()
-        .map(|n| input(&fixtures().join(dir).join(n)))
-        .collect()
+    common::inputs(RV32, dir, names)
 }
 
-fn script_file(path: &Path) -> Option<ScriptSource> {
-    Some(ScriptSource {
-        name: path.file_name().unwrap().to_string_lossy().into_owned(),
-        text: std::fs::read_to_string(path).unwrap(),
-    })
+/// The objects a fixture script names in its `/* objects: ... */` comment
+/// (paths relative to `fixtures/`), and the script itself.
+fn case(script: &str) -> (Vec<Input>, Options) {
+    common::case(RV32, script)
 }
 
-fn script(text: &str) -> Options {
-    Options {
-        script: Some(ScriptSource {
-            name: "test.ld".into(),
-            text: text.into(),
-        }),
-        entry: None,
-    }
+/// `fixtures/<name>.expected.txt`, e.g. `expected("norelocs/link")`.
+fn expected(name: &str) -> common::Readelf {
+    common::expected(RV32, name)
 }
 
-fn errors(r: Result<impl std::fmt::Debug, Vec<merlin_ld::Error>>) -> Vec<String> {
-    r.expect_err("link should fail")
-        .into_iter()
-        .map(|e| e.0)
-        .collect()
+/// Links fixture script `name.ld` with the objects it lists, checks the result
+/// against ld.lld's (`name.expected.txt`, `name.lld.elf`, `name.objdump.txt`)
+/// and runs it in Grail, which must print `output` and exit with 0.
+fn assert_matches_ld_lld(name: &str, output: &str) -> merlin_ld::Linked {
+    common::assert_matches_ld_lld_exit(RV32, name, output, 0)
+}
+
+/// [`assert_matches_ld_lld`] for a program that exits with `exit`.
+fn assert_matches_ld_lld_exit(name: &str, output: &str, exit: u32) -> merlin_ld::Linked {
+    common::assert_matches_ld_lld_exit(RV32, name, output, exit)
+}
+
+/// The relocation types each fixture object carries, by name.
+fn reloc_types(path: &str) -> HashMap<String, usize> {
+    common::reloc_types(RV32, path)
 }
 
 fn norelocs() -> Vec<Input> {
@@ -86,126 +87,8 @@ fn norelocs_opts() -> Options {
     }
 }
 
-/// The objects a fixture script names in its `/* objects: ... */` comment
-/// (paths relative to `fixtures/`), and the script itself.
-fn case(script: &str) -> (Vec<Input>, Options) {
-    let path = fixtures().join(script);
-    let opts = Options {
-        script: script_file(&path),
-        entry: None,
-    };
-    let text = &opts.script.as_ref().unwrap().text;
-    let list = text
-        .split("*/")
-        .next()
-        .and_then(|c| c.trim().strip_prefix("/*"))
-        .and_then(|c| c.trim().strip_prefix("objects:"));
-    let objs = match list {
-        Some(list) => list
-            .split_whitespace()
-            .map(|o| input(&fixtures().join(o)))
-            .collect(),
-        // Without the comment: every object in the script's directory, in
-        // name order (as `cargo xtask ld-fixtures` links them).
-        None => {
-            let mut paths: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap())
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .filter(|p| p.extension().is_some_and(|e| e == "o"))
-                .collect();
-            paths.sort();
-            assert!(!paths.is_empty(), "{script}: no objects");
-            paths.iter().map(|p| input(p)).collect()
-        }
-    };
-    (objs, opts)
-}
-
 // ---------------------------------------------------------------------------
-// Reading `llvm-readelf -S -l -s` output (the committed expectations).
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Sect {
-    name: String,
-    ty: String,
-    addr: u32,
-    size: u32,
-    flags: String,
-    align: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Load {
-    offset: u32,
-    vaddr: u32,
-    paddr: u32,
-    filesz: u32,
-    memsz: u32,
-    flags: String,
-    align: u32,
-}
-
-#[derive(Debug, Default)]
-struct Readelf {
-    entry: u32,
-    /// Allocated sections only.
-    sections: Vec<Sect>,
-    loads: Vec<Load>,
-    /// Global and weak symbols.
-    globals: HashMap<String, u32>,
-    /// Local symbols (only read from our own output).
-    locals: Vec<(String, u32)>,
-}
-
-fn hex(s: &str) -> u32 {
-    u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap()
-}
-
-fn parse_readelf(text: &str) -> Readelf {
-    let mut r = Readelf::default();
-    for line in text.lines().map(|l| l.trim_end_matches('\r')) {
-        let t: Vec<&str> = line.split_whitespace().collect();
-        if let Some(e) = line.strip_prefix("Entry point ") {
-            r.entry = hex(e.trim());
-        } else if line.trim_start().starts_with('[') && !line.contains("[Nr]") {
-            let rest: Vec<&str> = line.split(']').nth(1).unwrap().split_whitespace().collect();
-            // name type addr off size es [flg] lk inf al
-            if rest.len() == 10 && rest[6].contains('A') {
-                r.sections.push(Sect {
-                    name: rest[0].into(),
-                    ty: rest[1].into(),
-                    addr: hex(rest[2]),
-                    size: hex(rest[4]),
-                    flags: rest[6].into(),
-                    align: rest[9].parse().unwrap(),
-                });
-            }
-        } else if t.first() == Some(&"LOAD") {
-            r.loads.push(Load {
-                offset: hex(t[1]),
-                vaddr: hex(t[2]),
-                paddr: hex(t[3]),
-                filesz: hex(t[4]),
-                memsz: hex(t[5]),
-                flags: t[6..t.len() - 1].concat(),
-                align: hex(t[t.len() - 1]),
-            });
-        } else if t.len() == 8 && (t[4] == "GLOBAL" || t[4] == "WEAK") && t[6] != "UND" {
-            // (ld.lld lists undefined weak symbols, merlin-ld leaves them out.)
-            r.globals.insert(t[7].into(), hex(t[1]));
-        }
-    }
-    r
-}
-
-/// `fixtures/<name>.expected.txt`, e.g. `expected("norelocs/link")`.
-fn expected(name: &str) -> Readelf {
-    let path = fixtures().join(format!("{name}.expected.txt"));
-    parse_readelf(&std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
-}
-
-// ---------------------------------------------------------------------------
-// Reading our own ELF output the same way, straight from the bytes.
+// Patching RV32 objects: ELF32 offsets.
 
 fn u16_at(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
@@ -248,84 +131,6 @@ fn symbol_entry(elf: &[u8], name: &str) -> usize {
         .unwrap_or_else(|| panic!("no symbol {name}"))
 }
 
-fn read_ours(elf: &[u8]) -> Readelf {
-    assert_eq!(&elf[..4], b"\x7fELF");
-    assert_eq!(u16_at(elf, 16), 2, "ET_EXEC");
-    assert_eq!(u16_at(elf, 18), 243, "EM_RISCV");
-    let mut r = Readelf {
-        entry: u32_at(elf, 24),
-        ..Default::default()
-    };
-    let (phoff, shoff) = (u32_at(elf, 28) as usize, u32_at(elf, 32) as usize);
-    let (phnum, shnum, shstrndx) = (
-        u16_at(elf, 44) as usize,
-        u16_at(elf, 48) as usize,
-        u16_at(elf, 50) as usize,
-    );
-    for i in 0..phnum {
-        let p = phoff + 32 * i;
-        assert_eq!(u32_at(elf, p), 1, "only PT_LOAD");
-        let f = u32_at(elf, p + 24);
-        let flags = [(4, "R"), (2, "W"), (1, "E")]
-            .iter()
-            .filter(|(b, _)| f & b != 0)
-            .map(|(_, s)| *s)
-            .collect();
-        r.loads.push(Load {
-            offset: u32_at(elf, p + 4),
-            vaddr: u32_at(elf, p + 8),
-            paddr: u32_at(elf, p + 12),
-            filesz: u32_at(elf, p + 16),
-            memsz: u32_at(elf, p + 20),
-            flags,
-            align: u32_at(elf, p + 28),
-        });
-    }
-    let sh = |i: usize, f: usize| u32_at(elf, shoff + 40 * i + f);
-    let shstr = sh(shstrndx, 16) as usize;
-    for i in 1..shnum {
-        let ty = sh(i, 4);
-        let flags = sh(i, 8);
-        if ty == 2 {
-            // .symtab: collect globals.
-            let (off, size, strtab) = (
-                sh(i, 16) as usize,
-                sh(i, 20) as usize,
-                sh(sh(i, 24) as usize, 16) as usize,
-            );
-            for s in (off + 16..off + size).step_by(16) {
-                let (name, value) = (cstr(elf, strtab + u32_at(elf, s) as usize), u32_at(elf, s + 4));
-                if elf[s + 12] >> 4 != 0 {
-                    r.globals.insert(name, value);
-                } else {
-                    r.locals.push((name, value));
-                }
-            }
-        }
-        if flags & 2 == 0 {
-            continue;
-        }
-        let flag_str = [(1, "W"), (2, "A"), (4, "X")]
-            .iter()
-            .filter(|(b, _)| flags & b != 0)
-            .map(|(_, s)| *s)
-            .collect();
-        r.sections.push(Sect {
-            name: cstr(elf, shstr + sh(i, 0) as usize),
-            ty: match ty {
-                1 => "PROGBITS".into(),
-                8 => "NOBITS".into(),
-                t => format!("type {t}"),
-            },
-            addr: sh(i, 12),
-            size: sh(i, 20),
-            flags: flag_str,
-            align: sh(i, 32),
-        });
-    }
-    r
-}
-
 // ---------------------------------------------------------------------------
 
 /// Acceptance: relocation-free clang objects link to the same PT_LOADs,
@@ -338,131 +143,6 @@ fn norelocs_matches_ld_lld() {
         "fixture sanity: RX, R and RW segments"
     );
     assert_matches_ld_lld("norelocs/link", "OK\n");
-}
-
-/// `(vaddr, memsz, file bytes)` of every PT_LOAD of an executable.
-fn load_images(elf: &[u8]) -> Vec<(u32, u32, Vec<u8>)> {
-    let (phoff, phnum) = (u32_at(elf, 28) as usize, u16_at(elf, 44) as usize);
-    (0..phnum)
-        .map(|i| phoff + 32 * i)
-        .filter(|&p| u32_at(elf, p) == 1)
-        .map(|p| {
-            let (off, filesz) = (u32_at(elf, p + 4) as usize, u32_at(elf, p + 16) as usize);
-            (
-                u32_at(elf, p + 8),
-                u32_at(elf, p + 20),
-                elf[off..off + filesz].to_vec(),
-            )
-        })
-        .collect()
-}
-
-/// `llvm-objdump -d` text without its first line (which names the file),
-/// line endings normalized.
-fn disassembly_body(text: &str) -> Vec<String> {
-    text.lines()
-        .map(|l| l.trim_end_matches('\r').to_string())
-        .skip_while(|l| !l.contains("file format"))
-        .skip(1)
-        .collect()
-}
-
-/// merlin-objdump's `-d` of our link against llvm-objdump's of ld.lld's
-/// (`name.objdump.txt`). Two deliberate differences (spec §10) are allowed:
-///
-/// * where LLVM prints `<unknown>` (the Xcal instructions), merlin-objdump
-///   names the instruction; the address and the word must still agree;
-/// * a symbol assigned by the script is `SHN_ABS` in merlin-ld's output, so
-///   when it shares its address with a symbol of the section, a label line
-///   may name the other one.
-fn assert_same_disassembly(name: &str, linked: &merlin_ld::Linked) {
-    let elf = &linked.elf;
-    let script_symbol = |n: &str| {
-        linked
-            .layout
-            .globals
-            .iter()
-            .any(|(g, d)| g == n && matches!(d, merlin_ld::layout::Def::Script(_)))
-    };
-    let opts = merlin_objdump::Options {
-        disassemble: true,
-        ..Default::default()
-    };
-    let ours = disassembly_body(&merlin_objdump::dump("ours.elf", elf, &opts).unwrap());
-    let path = fixtures().join(format!("{name}.objdump.txt"));
-    let lld = disassembly_body(&std::fs::read_to_string(&path).unwrap());
-    assert!(lld.len() > 3, "{name}: empty llvm-objdump listing");
-    assert_eq!(ours.len(), lld.len(), "{name}: disassembly length");
-    // `80001040 <mid>:` -> ("80001040", "mid")
-    let label = |l: &str| {
-        let (addr, rest) = l.split_once(" <")?;
-        Some((addr.to_string(), rest.strip_suffix(">:")?.to_string()))
-    };
-    for (o, l) in ours.iter().zip(&lld) {
-        if let Some(word) = l.strip_suffix("<unknown>") {
-            assert!(o.starts_with(word), "{name}:\n ours: {o}\n llvm: {l}");
-        } else if let (Some((oa, _)), Some((la, ln))) = (label(o), label(l)) {
-            assert!(
-                o == l || (oa == la && script_symbol(&ln)),
-                "{name}:\n ours: {o}\n llvm: {l}"
-            );
-        } else {
-            assert_eq!(o, l, "{name}: disassembly");
-        }
-    }
-}
-
-/// Links fixture script `name.ld` with the objects it lists, checks the result
-/// against ld.lld's (`name.expected.txt`, `name.lld.elf`, `name.objdump.txt`)
-/// and runs it in Grail, which must print `output` and exit with 0.
-fn assert_matches_ld_lld(name: &str, output: &str) -> merlin_ld::Linked {
-    assert_matches_ld_lld_exit(name, output, 0)
-}
-
-/// [`assert_matches_ld_lld`] for a program that exits with `exit`.
-fn assert_matches_ld_lld_exit(name: &str, output: &str, exit: u32) -> merlin_ld::Linked {
-    let (objs, opts) = case(&format!("{name}.ld"));
-    let linked = merlin_ld::link(&objs, &opts).unwrap_or_else(|e| panic!("{name}: {e:?}"));
-    assert!(
-        linked.layout.warnings.is_empty(),
-        "{name}: {:?}",
-        linked.layout.warnings
-    );
-    let ours = read_ours(&linked.elf);
-    let lld = expected(name);
-    assert_eq!(ours.entry, lld.entry, "{name}: entry");
-    assert_eq!(ours.sections, lld.sections, "{name}: sections");
-    assert_eq!(ours.loads, lld.loads, "{name}: PT_LOADs");
-    assert_eq!(ours.globals, lld.globals, "{name}: global symbols");
-
-    // Byte for byte: every loaded byte, relocated code and data included.
-    let lld_elf = std::fs::read(fixtures().join(format!("{name}.lld.elf"))).unwrap();
-    let (ours_img, lld_img) = (load_images(&linked.elf), load_images(&lld_elf));
-    assert_eq!(ours_img.len(), lld_img.len(), "{name}: PT_LOAD count");
-    for ((va, msz, a), (vb, mszb, b)) in ours_img.iter().zip(&lld_img) {
-        assert_eq!(
-            (va, msz, a.len()),
-            (vb, mszb, b.len()),
-            "{name}: segment at {va:#x}"
-        );
-        if let Some(i) = (0..a.len()).find(|&i| a[i] != b[i]) {
-            panic!(
-                "{name}: first difference at {:#x}: ours {:02x?}, ld.lld {:02x?}",
-                va + i as u32,
-                &a[i..(i + 8).min(a.len())],
-                &b[i..(i + 8).min(b.len())]
-            );
-        }
-    }
-    assert_same_disassembly(name, &linked);
-
-    let (_, r, out) = run(&linked.elf);
-    assert_eq!(
-        (r, out.as_str()),
-        (RunResult::Exited(exit), output),
-        "{name}: run in Grail"
-    );
-    linked
 }
 
 /// Layout edge cases against ld.lld: output sections with only empty inputs
@@ -607,22 +287,6 @@ fn norelocs_segment_contents() {
     assert_eq!(rw.mem_size, 0x148);
 }
 
-fn run(elf: &[u8]) -> (Machine, RunResult, String) {
-    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
-    // Garbage in RAM, so .bss zeroing by the loader is actually checked.
-    m.cpu.bus.ram.fill(0xa5);
-    m.cpu.bus.uart.capture = true;
-    m.load_elf(elf).unwrap();
-    let r = m.run(Some(10_000), |_| {});
-    let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
-    (m, r, out)
-}
-
-fn ram(m: &Machine, addr: u64, len: usize) -> &[u8] {
-    let off = (addr - grail::bus::RAM_BASE) as usize;
-    &m.cpu.bus.ram[off..off + len]
-}
-
 fn check_norelocs_memory(m: &Machine, layout: &merlin_ld::Layout) {
     let sym = |n: &str| layout.symbol(n).unwrap_or_else(|| panic!("{n} undefined"));
     let words: Vec<u8> = [1u32, 2, 3, 4].iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -718,12 +382,12 @@ fn hello_layout_matches_ld_lld() {
     let theirs: Vec<(String, u64, u64, u32)> = lld
         .sections
         .iter()
-        .map(|s| (s.name.clone(), s.addr.into(), s.size.into(), s.align))
+        .map(|s| (s.name.clone(), s.addr, s.size, s.align))
         .collect();
     assert_eq!(ours, theirs);
-    assert_eq!(layout.entry, u64::from(lld.entry));
+    assert_eq!(layout.entry, lld.entry);
     for (name, value) in &lld.globals {
-        assert_eq!(layout.symbol(name), Some(u64::from(*value)), "{name}");
+        assert_eq!(layout.symbol(name), Some(*value), "{name}");
     }
     assert_eq!(layout.symbol("__stack_top"), Some(0x8001_0070));
 }
@@ -767,7 +431,7 @@ fn fixture_copies_are_current() {
     };
     let shared = ["hello", "layouts", "merge", "norelocs", "rejects", "symbols"];
     let rv64_only = ["relocs"];
-    let rv64 = fixtures().join("rv64");
+    let rv64 = common::fixtures(common::RV64);
     let mut dirs: Vec<String> = std::fs::read_dir(&rv64)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -862,19 +526,6 @@ fn multiobj_matches_ld_lld_and_runs() {
     let bss = l.section(".bss").unwrap();
     assert_eq!(l.symbol("bytes_written"), Some(bss.addr));
     assert!(l.symbol("puts").unwrap() > l.symbol("_start").unwrap());
-}
-
-/// The relocation types each fixture object carries, by name.
-fn reloc_types(path: &str) -> HashMap<String, usize> {
-    let data = std::fs::read(fixtures().join(path)).unwrap();
-    let obj = merlin_ld::object::parse(path, &data).unwrap();
-    let mut n = HashMap::new();
-    for s in &obj.sections {
-        for r in &s.relocs {
-            *n.entry(merlin_ld::reloc::name(r.ty)).or_insert(0) += 1;
-        }
-    }
-    n
 }
 
 /// Acceptance: every relocation type, in both directions between objects,
@@ -1412,7 +1063,7 @@ fn locals_are_per_object() {
         .locals
         .iter()
         .filter(|(n, _)| n == "count")
-        .map(|&(_, v)| v.into())
+        .map(|&(_, v)| v)
         .collect();
     assert_eq!(counts, [data.addr, data.addr + 4]);
     assert!(!ours.globals.contains_key("count"));
@@ -1848,6 +1499,44 @@ fn segments_group_by_permissions() {
     check_norelocs_memory(&m, &linked.layout);
 }
 
+/// A segment is aligned to the largest alignment of its sections when that
+/// is more than a page, NOBITS ones included, and its file offset is
+/// congruent to its address modulo that: what ld.lld 23 writes for this
+/// script and source on both widths (checked by hand: `LOAD 0x009000
+/// 0x80001000 ... RW 0x8000`; on RV64, `rv64si-p-icache-alias` of the
+/// riscv-tests relink has such a segment).
+#[test]
+fn segments_take_the_largest_alignment_of_their_sections() {
+    let src = "    .text\n    .globl _start\n_start:\n    nop\n    .data\n    .word 1\n\
+               .section .data.big, \"aw\"\n    .p2align 13\n    .word 2\n\
+               .section .data.huge, \"aw\"\n    .p2align 14\n    .word 3\n\
+               .bss\n    .p2align 15\n    .zero 8\n";
+    let opts = script(
+        "SECTIONS { . = 0x80000000; .text : { *(.text) } . = ALIGN(0x1000); .data : { *(.data) } \
+         .big : { *(.data.big) } . = 0x80010000; .huge : { *(.data.huge) } .bss : { *(.bss) } }",
+    );
+    for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
+        let obj = Input {
+            name: "a.o".into(),
+            data: merlin_as::assemble_to_elf_with(src, &merlin_as::Options { xlen }).unwrap(),
+        };
+        let linked = merlin_ld::link(&[obj], &opts).unwrap();
+        let l: Vec<(u64, u64, u64, u64, u64)> = read_ours(&linked.elf)
+            .loads
+            .iter()
+            .map(|l| (l.offset, l.vaddr, l.filesz, l.memsz, l.align))
+            .collect();
+        assert_eq!(
+            l,
+            [
+                (0x1000, 0x8000_0000, 4, 4, 0x1000),
+                (0x9000, 0x8000_1000, 0xf004, 0x17008, 0x8000)
+            ],
+            "{xlen:?}"
+        );
+    }
+}
+
 #[test]
 fn library_members_are_linked_only_when_needed() {
     // multiobj's main.o is the program; its library holds a second main.o
@@ -2115,19 +1804,7 @@ fn line_tables_are_kept_and_relocated() {
     // changes nothing.
     assert_eq!(merlin_ld::strip_debug(&linked.elf).unwrap(), without.elf);
     assert_eq!(merlin_ld::strip_debug(&without.elf).unwrap(), without.elf);
-    // An RV64 program (with debug sections) is refused, not cut at ELF32's
-    // offsets.
-    let rv64 = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../elf/tests/llvm/rv64/prog.elf"
-    ))
-    .unwrap();
-    let err = merlin_ld::strip_debug(&rv64).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("ELF64 (RV64) files are not supported yet"),
-        "{err}"
-    );
+    // (The RV64 twin of this test is in rv64.rs.)
 }
 
 #[test]

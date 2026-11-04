@@ -809,7 +809,12 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 }
 
 /// The layout used without `-T`: `.text` at 0x8000_0000, then `.rodata`,
-/// `.data` and `.bss`, each aligned to its most-aligned input section.
+/// `.data` and `.bss`, each aligned to its most-aligned input section. The
+/// same for both classes (it was never ld.lld's script-less layout, whose
+/// image base is 0x10000). On RV64 it takes only pc-relative code
+/// (`-mcmodel=medany`): RAM at 0x8000_0000 is past what `lui %hi(x)` can
+/// reach there, `-2^31 - 0x800 <= x < 2^31 - 0x800` (ld.lld's check, in
+/// [`crate::reloc`]).
 pub const DEFAULT_SCRIPT: &str = "
 ENTRY(_start)
 SECTIONS
