@@ -238,10 +238,10 @@ extern "system" {
     pub fn SetCapture(hwnd: HWND) -> HWND;
     pub fn ReleaseCapture() -> BOOL;
     pub fn GetCapture() -> HWND;
-    #[cfg(test)]
     pub fn MoveWindow(hwnd: HWND, x: i32, y: i32, width: i32, height: i32, repaint: BOOL) -> BOOL;
-    #[cfg(test)]
     pub fn GetWindowRect(hwnd: HWND, rect: *mut RECT) -> BOOL;
+    pub fn IsZoomed(hwnd: HWND) -> BOOL;
+    pub fn IsIconic(hwnd: HWND) -> BOOL;
     pub fn SetWindowTextW(hwnd: HWND, text: *const u16) -> BOOL;
     pub fn LoadCursorW(hinst: HINSTANCE, name: *const u16) -> HCURSOR;
     pub fn GetDC(hwnd: HWND) -> HDC;

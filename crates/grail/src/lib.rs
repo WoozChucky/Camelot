@@ -249,9 +249,11 @@ impl Machine {
     /// Runs at most `steps` steps and returns how many ran, without ever sleeping: the
     /// building block for a host that schedules machines itself. A step runs one
     /// instruction on every hart ([`Cpu::step`]). Stops early when the program exits, or
-    /// at the end of a step that wrote `FB_PRESENT` (right after the instruction that
-    /// did it, on a one-hart machine), so the host can show or dump that frame. Only a
-    /// write during this call counts: a present the host has not taken yet
+    /// at the end of a step that showed a new frame (right after the instruction that
+    /// did it, on a one-hart machine), so the host can show or dump that frame: one that
+    /// wrote `FB_PRESENT` or `FB_MODE` (a modeset), or whose vertical blank made a page
+    /// flip take effect ([`framebuffer::Framebuffer::shown`]). Only a frame shown during
+    /// this call counts: a present the host has not taken yet
     /// ([`framebuffer::Framebuffer::take_present`]) does not stop the next call.
     ///
     /// With a real-time clock it also stops once the machine is ~1 ms ahead of the wall
@@ -289,14 +291,14 @@ impl Machine {
     }
 
     /// Runs at most `steps` steps (fewer when paced). Stops at exit, and right after a
-    /// `FB_PRESENT` write when `STOP_ON_PRESENT`.
+    /// new frame is shown when `STOP_ON_PRESENT`.
     fn run_steps<const STOP_ON_PRESENT: bool>(&mut self, steps: u64, trace: &mut impl FnMut(&Cpu)) -> u64 {
         let budget = match &mut self.pacer {
             None => steps,
             Some(p) => steps.min(p.allowance(Instant::now())),
         };
         let paced = self.pacer.is_some();
-        let presents = self.cpu.bus.fb.presents;
+        let shown = self.cpu.bus.fb.shown();
         let mut n = 0;
         while n < budget && self.cpu.bus.exit.is_none() {
             if paced {
@@ -313,7 +315,7 @@ impl Machine {
             }
             self.cpu.step_traced(trace);
             n += 1;
-            if STOP_ON_PRESENT && self.cpu.bus.fb.presents != presents {
+            if STOP_ON_PRESENT && self.cpu.bus.fb.shown() != shown {
                 break;
             }
         }

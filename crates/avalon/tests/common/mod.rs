@@ -533,7 +533,7 @@ timebase {hz} Hz
   CLINT     0x02000000 + 0x00010000
   PLIC      0x0c000000 + 0x04000000
   UART      0x10000000 + 0x00000100  irq 1
-  fb-ctrl   0x30000000 + 0x00001000
+  fb-ctrl   0x30000000 + 0x00001000  irq 16
   keyboard  0x30001000 + 0x00001000  irq 2
   sysinfo   0x30002000 + 0x00001000
   pointer   0x30003000 + 0x00001000  irq 11

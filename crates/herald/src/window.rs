@@ -76,7 +76,11 @@ impl View for WindowView {
 
     fn draw(&mut self, screen: &Screen) {
         assert!(Self::fits(screen.width(), screen.height()));
-        self.window.draw(Some(screen.pixels()));
+        self.window.draw(grail::framebuffer::Frame {
+            width: screen.width(),
+            height: screen.height(),
+            pixels: Some(screen.pixels()),
+        });
     }
 
     fn vm_state(&mut self, state: VmState) {

@@ -4,8 +4,8 @@ use crate::block::BlockDevice;
 use crate::boot;
 use crate::config::MachineConfig;
 use crate::cpu::Reservation;
-use crate::devices::{Clint, Plic, TestDevice, Uart, BLK_IRQ, KBD_IRQ, NET_IRQ, PTR_IRQ, UART_IRQ};
-use crate::framebuffer::{Framebuffer, VRAM_SIZE};
+use crate::devices::{Clint, Plic, TestDevice, Uart, BLK_IRQ, FB_IRQ, KBD_IRQ, NET_IRQ, PTR_IRQ, UART_IRQ};
+use crate::framebuffer::{Frame, Framebuffer, VRAM_SIZE};
 use crate::keyboard::Keyboard;
 use crate::net::NetDevice;
 use crate::pointer::Pointer;
@@ -83,7 +83,7 @@ pub fn device_table_with(_config: &MachineConfig, disks: usize, nets: usize) -> 
         dev(DeviceType::Net, base, NET_SIZE, NET_IRQ + i)
     }));
     table.extend([
-        dev(DeviceType::FbCtrl, FB_CTRL_BASE, FB_CTRL_SIZE, 0),
+        dev(DeviceType::FbCtrl, FB_CTRL_BASE, FB_CTRL_SIZE, FB_IRQ),
         dev(DeviceType::Keyboard, KBD_BASE, KBD_SIZE, KBD_IRQ),
         dev(DeviceType::Sysinfo, SYSINFO_BASE, SYSINFO_SIZE, 0),
         dev(DeviceType::Pointer, PTR_BASE, PTR_SIZE, PTR_IRQ),
@@ -166,7 +166,7 @@ impl Bus {
             clint: Clint::new(harts),
             plic: Plic::new(harts),
             uart: Uart::default(),
-            fb: Framebuffer::default(),
+            fb: Framebuffer::new(config.cpu_hz()),
             kbd: Keyboard::default(),
             ptr: Pointer::default(),
             sysinfo: Sysinfo::new(config, device_table_with(config, disks.len(), nets.len())),
@@ -304,13 +304,39 @@ impl Bus {
     /// device's line is sampled ([`Bus::update_interrupts`]).
     pub fn tick(&mut self) {
         self.clint.mtime = self.clint.mtime.wrapping_add(1);
+        self.fb.advance(1);
         self.update_interrupts();
+    }
+
+    /// Lets `ticks` ticks pass at once, with no step run, while every hart waits in
+    /// `wfi` ([`crate::cpu::Cpu::idle`] and the jump to the next timer): `mtime` and the
+    /// framebuffer's frame clock move on together.
+    pub fn skip_time(&mut self, ticks: u64) {
+        self.clint.mtime = self.clint.mtime.wrapping_add(ticks);
+        self.fb.advance(ticks);
+    }
+
+    /// Ticks that may pass at once ([`Bus::skip_time`]) before a device's own clock could
+    /// wake a waiting hart, one short of it so that the next step's tick raises the line
+    /// on time: the framebuffer's next vertical blank while its interrupt is enabled.
+    /// `None` when no device keeps time that way.
+    pub fn device_deadline(&self) -> Option<u64> {
+        self.fb
+            .vblank_irq_enabled()
+            .then(|| self.fb.ticks_to_vblank() - 1)
+    }
+
+    /// What the display shows now (spec section 9.3): from VRAM, or from the buffer in
+    /// RAM the framebuffer scans out.
+    pub fn frame(&self) -> Frame<'_> {
+        self.fb.frame(&self.ram)
     }
 
     /// Lets `ticks` idle ticks pass at once for the devices that count steps (a paced
     /// machine whose harts all wait in `wfi`, see [`crate::cpu::Cpu::idle`]): network
     /// cards still poll their backends on time, and what they receive breaks
-    /// reservations as in [`Bus::update_interrupts`].
+    /// reservations as in [`Bus::update_interrupts`]. The framebuffer's vertical blank
+    /// keeps time through [`Bus::skip_time`], which the caller has already called.
     pub fn skip(&mut self, ticks: u64) {
         let reservations = &mut self.reservations;
         for nic in &mut self.nets {
@@ -337,6 +363,7 @@ impl Bus {
         self.plic.set_level(UART_IRQ, uart);
         self.plic.set_level(KBD_IRQ, self.kbd.irq());
         self.plic.set_level(PTR_IRQ, self.ptr.irq());
+        self.plic.set_level(FB_IRQ, self.fb.irq());
         for (i, disk) in self.disks.iter().enumerate() {
             self.plic.set_level(BLK_IRQ + i as u32, disk.irq());
         }
@@ -442,6 +469,10 @@ impl Bus {
         if let Some((i, off)) = self.net_at(addr) {
             return self.nets[i].read(off, size);
         }
+        // 32-bit registers and the 64-bit `FB_SCANOUT`.
+        if let Some(off) = Self::offset_in(addr, FB_CTRL_BASE, FB_CTRL_SIZE) {
+            return self.fb.read(off, size);
+        }
         // Every other device has 32-bit registers only.
         if size == 8 {
             return Err(BusFault);
@@ -451,8 +482,6 @@ impl Bus {
             self.plic.read(off, size)
         } else if let Some(off) = at(UART_BASE, UART_SIZE) {
             self.uart.read(off, size)
-        } else if let Some(off) = at(FB_CTRL_BASE, FB_CTRL_SIZE) {
-            self.fb.read(off, size)
         } else if let Some(off) = at(KBD_BASE, KBD_SIZE) {
             self.kbd.read(off, size)
         } else if let Some(off) = at(PTR_BASE, PTR_SIZE) {
@@ -520,6 +549,13 @@ impl Bus {
                 reservations.iter_mut().for_each(|r| r.snoop(paddr, len.into()))
             });
         }
+        if let Some(off) = Self::offset_in(addr, FB_CTRL_BASE, FB_CTRL_SIZE) {
+            let written = self.fb.write(off, size, val, self.ram.len() as u64);
+            // A modeset changes the screen the pointer's positions are on.
+            let mode = self.fb.mode();
+            self.ptr.set_screen(mode.width, mode.height);
+            return written;
+        }
         // Every other device has 32-bit registers only.
         if size == 8 {
             return Err(BusFault);
@@ -530,8 +566,6 @@ impl Bus {
             self.plic.write(off, size, val)
         } else if let Some(off) = at(UART_BASE, UART_SIZE) {
             self.uart.write(off, size, val)
-        } else if let Some(off) = at(FB_CTRL_BASE, FB_CTRL_SIZE) {
-            self.fb.write(off, size, val)
         } else if let Some(off) = at(KBD_BASE, KBD_SIZE) {
             self.kbd.write(off, size, val)
         } else if let Some(off) = at(PTR_BASE, PTR_SIZE) {
@@ -826,13 +860,18 @@ mod tests {
                 );
             }
         }
-        // The UART's, keyboard's and pointer's PLIC sources are the ones the bus wires them to.
+        // The UART's, keyboard's, pointer's and framebuffer's PLIC sources are the ones
+        // the bus wires them to.
         let uart = table.iter().find(|d| d.kind == DeviceType::Uart).unwrap();
         assert_eq!(uart.irq, UART_IRQ);
         let kbd = table.iter().find(|d| d.kind == DeviceType::Keyboard).unwrap();
         assert_eq!(kbd.irq, KBD_IRQ);
         let ptr = table.iter().find(|d| d.kind == DeviceType::Pointer).unwrap();
         assert_eq!((ptr.base, ptr.irq), (PTR_BASE, PTR_IRQ));
+        let fb = table.iter().find(|d| d.kind == DeviceType::FbCtrl).unwrap();
+        assert_eq!((fb.base, fb.irq), (FB_CTRL_BASE, FB_IRQ));
+        let vram = table.iter().find(|d| d.kind == DeviceType::FbVram).unwrap();
+        assert_eq!(vram.irq, 0);
         // Disks are listed in order, each on its own source.
         let disks: Vec<_> = table.iter().filter(|d| d.kind == DeviceType::Block).collect();
         assert_eq!(disks.len(), bus.disks.len());
@@ -855,7 +894,7 @@ mod tests {
         let mut irqs: Vec<u32> = table.iter().map(|d| d.irq).filter(|&irq| irq != 0).collect();
         irqs.sort();
         irqs.dedup();
-        assert_eq!(irqs.len(), 3 + bus.disks.len() + bus.nets.len());
+        assert_eq!(irqs.len(), 4 + bus.disks.len() + bus.nets.len());
         assert!(irqs.iter().all(|&irq| irq < crate::devices::PLIC_SOURCES));
     }
 
@@ -1090,6 +1129,74 @@ mod tests {
         assert!(bus.fb.take_present());
         assert_eq!(bus.read(FB_CTRL_BASE, 1), Err(BusFault));
         assert_eq!(bus.read(FB_CTRL_BASE + 0xffc, 4), Ok(0));
+    }
+
+    /// The display controller through the bus: a modeset to a buffer in RAM, which the
+    /// frame then shows; a flip latched at the vertical blank of a tick; the vertical
+    /// blank's line on PLIC source `FB_IRQ`; `FB_SCANOUT` whole with an 8-byte access;
+    /// and the pointer clamped to the new mode.
+    #[test]
+    fn display_controller_on_the_bus() {
+        use crate::framebuffer as fb;
+        use crate::pointer::PointerInput;
+        let config = MachineConfig {
+            nominal_hz: 6000, // 100 ticks a frame
+            ..MachineConfig::with_ram(8 << 20)
+        };
+        let mut bus = Bus::new(&config, Vec::new());
+        let reg = |r: u32| FB_CTRL_BASE + u64::from(r);
+        let (a, b) = (RAM_BASE + 0x10_0000, RAM_BASE + 0x40_0000);
+        bus.write(a + 4, 4, 0x00ab_cdef).unwrap(); // pixel (1, 0) of buffer A
+        bus.write(b, 4, 0x0012_3456).unwrap(); // pixel (0, 0) of buffer B
+
+        bus.write(reg(fb::REG_SCANOUT), 8, a).unwrap();
+        assert_eq!(bus.read(reg(fb::REG_SCANOUT), 8), Ok(a));
+        assert_eq!(bus.read(reg(fb::REG_SCANOUT + 4), 4), Ok(0));
+        assert_eq!(
+            bus.read(reg(fb::REG_STATUS), 8),
+            Err(BusFault),
+            "32-bit registers"
+        );
+        bus.write(reg(fb::REG_MODE), 4, 2).unwrap(); // 1024x768
+        bus.write(reg(fb::REG_CTRL), 4, 1).unwrap();
+        assert_eq!(bus.read(reg(fb::REG_WIDTH), 4), Ok(1024));
+        let frame = bus.frame();
+        assert_eq!(
+            (frame.width, frame.height, frame.pixel(1, 0)),
+            (1024, 768, 0xab_cdef)
+        );
+        bus.ptr.push(PointerInput::move_to(5000, 5000));
+        assert_eq!(bus.ptr.position(), (1023, 767));
+
+        // A flip to B shows it from the vertical blank on, which raises the line.
+        bus.write(reg(fb::REG_SCANOUT), 8, b).unwrap();
+        bus.write(reg(fb::REG_FLIP), 4, 1).unwrap();
+        bus.write(reg(fb::REG_IRQ), 4, fb::IRQ_VBLANK_ENABLE.into())
+            .unwrap();
+        bus.write(PLIC_BASE + 4 * u64::from(FB_IRQ), 4, 1).unwrap();
+        for _ in 0..99 {
+            bus.tick();
+        }
+        assert_eq!((bus.fb.scanout(), bus.frame().pixel(0, 0)), (a, 0));
+        assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(0));
+        assert_eq!(
+            bus.device_deadline(),
+            Some(0),
+            "the next tick is the vertical blank"
+        );
+        bus.tick();
+        assert_eq!((bus.fb.scanout(), bus.frame().pixel(0, 0)), (b, 0x12_3456));
+        assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << FB_IRQ));
+        assert_eq!(bus.read(reg(fb::REG_VBLANKS), 4), Ok(1));
+
+        // Skipped time keeps the frame clock with `mtime`.
+        let mtime = bus.clint.mtime;
+        bus.skip_time(250);
+        assert_eq!(bus.clint.mtime, mtime + 250);
+        assert_eq!(bus.read(reg(fb::REG_VBLANKS), 4), Ok(3));
+        assert_eq!(bus.device_deadline(), Some(49));
+        bus.write(reg(fb::REG_IRQ), 4, 0).unwrap();
+        assert_eq!(bus.device_deadline(), None, "no interrupt, nothing to wake");
     }
 
     #[test]

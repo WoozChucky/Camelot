@@ -230,7 +230,7 @@ fn run_for_stops_right_after_present() {
     ] {
         assert_eq!(fb.pixel(x, y), expected_pixel(x, y), "pixel ({x}, {y})");
     }
-    check_colorbars_ppm(&fb.to_ppm());
+    check_colorbars_ppm(&m.cpu.bus.frame().to_ppm());
 
     // The next instruction is xcal.halt.
     assert_eq!(m.run_for(BUDGET, &mut |_| {}), 1);
