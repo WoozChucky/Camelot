@@ -792,6 +792,8 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
         // before .bss.
         "SECTIONS { . = 0x80000000; .text : { *(.text) } .x : { sym = .; } .data : { *(.data) }          . = . + 0x100; .bss : { *(.bss) } .rodata : { *(.rodata) *(.rodata.two) }          /DISCARD/ : { *(.text.gone) } }"
             .into(),
+        // A top-level `.` moved backward: the code above the rest.
+        format!("ENTRY(_start) SECTIONS {{ . = 0x80100000; .text : {{ *(.text) }} . = 0x80000000; {rest} }}"),
         // Names with dashes, unquoted (`-` is a character of a name outside
         // expressions, an operator in them), and ALIGN(0), which is 1.
         format!(
@@ -947,7 +949,19 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         (vec![start.clone()], script, "-e 0x+10"),
         (
             vec![start.clone()],
-            "SECTIONS { . = 0x1000; . = 0x10; .text : { *(.text) } x = nothere; }",
+            "SECTIONS { . = 0x1000; .text : { *(.text) . = . - 0x10; } x = nothere; }",
+            "",
+        ),
+        // A top-level `.` moved backward: the sections over each other.
+        (
+            vec![with_rodata.clone()],
+            "SECTIONS { . = 0x1000; .text : { *(.text) } . = 0x1000; .rodata : { *(.rodata) } }",
+            "",
+        ),
+        // Past 4 GiB, and the next section placed after it nonetheless.
+        (
+            vec![with_rodata.clone()],
+            "SECTIONS { . = 0xfffffff8; .text : { *(.text) . += 8; } .rodata : { *(.rodata) } }",
             "",
         ),
         (

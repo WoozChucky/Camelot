@@ -38,7 +38,14 @@
 //! - ELF32 (RV32, until #159) has 4 GiB: the location counter, script
 //!   symbols, section ends, the MEMORY region and the entry point must stay
 //!   within it, and script arithmetic is exact (`i64`, an error on overflow).
-//!   ld.lld truncates such values to 32 bits; merlin-ld says what is wrong.
+//!   A section past 4 GiB is an error in ld.lld too, with the same words as
+//!   on ELF64; the other values ld.lld truncates to 32 bits, and merlin-ld
+//!   says what is wrong.
+//!
+//! At the top level of `SECTIONS` the location counter moves anywhere, as
+//! in ld.lld: backward, and round 2^64 on ELF64 (`. += n`, `ALIGN`). Only
+//! inside an output section must it move forward. Sections that end up
+//! over each other are ld.lld's error, "virtual address range overlaps".
 //!
 //! ## Load addresses (`AT`)
 //!
@@ -207,6 +214,13 @@ fn err(msg: impl Into<String>) -> Error {
 /// an ELF64 address near the top can get there).
 fn align_up(v: u64, a: u64) -> Option<u64> {
     v.checked_next_multiple_of(a)
+}
+
+/// `v` rounded up to a multiple of `a`, a power of two, modulo 2^64: ld.lld's
+/// alignToPowerOf2, which the location counter goes through, so an ELF64
+/// address near the top aligns to 0. (ELF32's stay far below 2^64.)
+fn align_wrapping(v: u64, a: u64) -> u64 {
+    v.wrapping_add(a - 1) & !(a - 1)
 }
 
 /// The alignment an `ALIGN(n)` asks for, as ld.lld's checkAlignment reads
@@ -450,10 +464,10 @@ impl Walker<'_> {
             Expr::Align(n) => {
                 let n = self.eval(n, dot)?;
                 let a = check_alignment(n).map_err(|e| format!("ALIGN({}): {e}", self.show(n)))?;
-                // Only ELF64 can get past 2^64 (`. = ALIGN(16)` at
-                // 0xffff_ffff_ffff_fff8). ld.lld wraps to 0 and then reports a
-                // backward move; saying so here is clearer.
-                align_up(dot, a).ok_or("arithmetic overflow")?
+                // Past 2^64 it wraps to 0, as ld.lld's does (only ELF64 gets
+                // there: `. = ALIGN(16)` at 0xffff_ffff_ffff_fff8); inside
+                // a section that is then a move backward.
+                align_wrapping(dot, a)
             }
             Expr::Origin(r) | Expr::Length(r) => match &self.script.memory {
                 Some(m) if &m.name == r => match e {
@@ -494,8 +508,9 @@ impl Walker<'_> {
         }
     }
 
-    /// Runs one assignment. Returns the new location counter.
-    fn assign(&mut self, a: &Assign, dot: u64) -> u64 {
+    /// Runs one assignment, at the top level of `SECTIONS` or inside an
+    /// output section (`in_section`). Returns the new location counter.
+    fn assign(&mut self, a: &Assign, dot: u64, in_section: bool) -> u64 {
         let v = match self.eval(&a.expr, dot) {
             Ok(v) => v,
             Err(e) => {
@@ -513,22 +528,31 @@ impl Walker<'_> {
                         return dot;
                     }
                 };
+                // Inside an output section `.` only moves forward (ld.lld's
+                // setDot: "unable to move location counter ... backward").
                 // ELF32 (RV32, until #159): compared as i64s, so a negative
                 // value (`. = 0 - 1`) is a move backward. On ELF64 a `. += n`
-                // that wraps past 2^64 comes out below `dot`, backward too.
+                // or an ALIGN that wraps past 2^64 comes out below `dot`,
+                // backward too. As in ld.lld, `.` still takes the new value,
+                // and the section's end then reports what follows from it.
+                // At the top level ld.lld moves `.` anywhere, backward and
+                // round 2^64 too, and so does merlin-ld: sections that end up
+                // over each other are an error once all are placed
+                // ([`address_overlaps`]).
                 let backward = match self.class {
                     Class::Elf32 => (new as i64) < dot as i64,
                     Class::Elf64 => new < dot,
                 };
-                if backward {
+                if in_section && backward {
                     self.script_err(
                         a.line,
                         format!("cannot move the location counter backward (from {dot:#x} to {new:#x})"),
                     );
-                    return dot;
+                    return new;
                 }
                 // ELF32 (RV32, until #159): 4 GiB of address space. `.` may be
-                // exactly 2^32, the end of a section that fills it.
+                // exactly 2^32, the end of a section that fills it. A negative
+                // value reads as a u64 past it too.
                 if self.class == Class::Elf32 && new > 1 << 32 {
                     self.script_err(
                         a.line,
@@ -633,26 +657,51 @@ fn load_range_fits(class: Class, lma: u64, size: u64) -> bool {
 /// in).
 fn load_overlaps(class: Class, sections: &[OutputSection]) -> Vec<Error> {
     // (One whose load range does not fit has been reported already.)
-    let mut loaded: Vec<&OutputSection> = sections
+    let loaded = sections
         .iter()
         .filter(|s| !s.nobits && s.size > 0 && load_range_fits(class, s.lma, s.size))
+        .map(|s| (s, s.lma))
         .collect();
-    // Stable: sections at the same load address stay in script order.
-    loaded.sort_by_key(|s| s.lma);
-    // `lma + size` does not overflow: the load range fits.
-    let range = |s: &OutputSection| format!("[{:#x}, {:#x}]", s.lma, s.lma + s.size - 1);
-    loaded
+    overlaps("load address", loaded)
+}
+
+/// Sections over each other in memory, ld.lld's other check of the kind
+/// ("virtual address range overlaps"): a top-level `.` may move backward,
+/// so two sections can be given the same addresses. Every section with a
+/// size counts, NOBITS ones too. (Their ranges end below 2^64: one that
+/// does not was not placed.)
+fn address_overlaps(sections: &[OutputSection]) -> Vec<Error> {
+    overlaps(
+        "virtual address",
+        sections
+            .iter()
+            .filter(|s| s.size > 0)
+            .map(|s| (s, s.addr))
+            .collect(),
+    )
+}
+
+/// ld.lld's checkOverlap: the sections sorted by where their `what` range
+/// starts, each compared with the next one, the lower one named first (its
+/// range is the one the other starts in), with ld.lld's ranges on the same
+/// line. The sort is stable: sections that start together stay in script
+/// order.
+fn overlaps(what: &str, mut ranges: Vec<(&OutputSection, u64)>) -> Vec<Error> {
+    ranges.sort_by_key(|&(_, start)| start);
+    // `start + size` does not overflow: every range fits.
+    let range = |(s, start): (&OutputSection, u64)| format!("[{start:#x}, {:#x}]", start + s.size - 1);
+    ranges
         .windows(2)
-        .filter(|w| w[1].lma < w[0].lma + w[0].size)
+        .filter(|w| w[1].1 < w[0].1 + w[0].0.size)
         .map(|w| {
             let (a, b) = (w[0], w[1]);
             err(format!(
-                "section {} load address range overlaps with {} ({} is {}, {} is {})",
-                a.name,
-                b.name,
-                a.name,
+                "section {} {what} range overlaps with {} ({} is {}, {} is {})",
+                a.0.name,
+                b.0.name,
+                a.0.name,
                 range(a),
-                b.name,
+                b.0.name,
                 range(b)
             ))
         })
@@ -1110,12 +1159,12 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
     // they run. 0 until a section has an `AT`; every section after it
     // without one keeps its difference (see "Load addresses" above).
     let mut lma_offset: u64 = 0;
-    'commands: for (ci, cmd) in commands.iter().enumerate() {
+    for (ci, cmd) in commands.iter().enumerate() {
         w.current = None;
         match cmd {
             Command::Assign(a) => {
                 let before = dot;
-                dot = w.assign(a, dot);
+                dot = w.assign(a, dot, false);
                 if a.symbol.is_none() && dot != before {
                     dot_moved = Some(a.line);
                 }
@@ -1171,19 +1220,12 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                         Err(e) => w.script_err(o.line, e),
                     }
                 }
-                // A section, or an input in it, that would have to start past
-                // 2^64 to be aligned (only ELF64 gets that high).
-                let past_the_top = |at: u64, align: u32| {
-                    format!(
-                        "section {} exceeds available address space: {at:#x} aligned to {align:#x} is past 2^64",
-                        o.name
-                    )
-                };
+                // Aligned as ld.lld aligns the location counter, modulo 2^64:
+                // an ELF64 section at 0xffff_ffff_ffff_fff8 that wants 16
+                // goes at 0, and one whose inputs run past 2^64 is reported
+                // below, with its size.
                 let base = cursor.unwrap_or(dot);
-                let Some(start) = align_up(base, align as u64) else {
-                    w.script_err(o.line, past_the_top(base, align));
-                    continue;
-                };
+                let start = align_wrapping(base, align as u64);
                 // From here on `ADDR` of this section is `start`.
                 w.current = Some((&o.name, start));
                 // `AT(lma)`, with `.` at the section's aligned start (ld.lld:
@@ -1209,11 +1251,7 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                         Item::Input(_) => {
                             for &(oi, si) in &rules[ci][ii] {
                                 let sec = &objects[oi].sections[si];
-                                let Some(at) = align_up(d, sec.align as u64) else {
-                                    w.script_err(o.line, past_the_top(d, sec.align));
-                                    continue 'commands;
-                                };
-                                d = at;
+                                d = align_wrapping(d, sec.align as u64);
                                 w.placement[oi][si] = Some(Placed { addr: d, out: None });
                                 inputs.push(InputRef {
                                     object: oi,
@@ -1229,37 +1267,37 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                                 nobits &= sec.is_nobits();
                             }
                         }
-                        Item::Assign(a) => d = w.assign(a, d),
+                        Item::Assign(a) => d = w.assign(a, d, true),
                     }
                 }
                 let size = d.wrapping_sub(start);
-                match class {
-                    // ELF32 (RV32, until #159): `d` may be exactly 4 GiB (a
-                    // section ending at the top of the address space), but
-                    // the size must still fit in 32 bits.
-                    Class::Elf32 => {
-                        if size > u64::from(u32::MAX) || d > 1 << 32 {
-                            w.script_err(
-                                o.line,
-                                format!("section {} extends past the 4 GiB address space", o.name),
-                            );
-                            continue;
-                        }
+                // The address space, as ld.lld's checkSections sees it, with
+                // its words on both classes. ELF32 (RV32, until #159): `d`
+                // may be exactly 4 GiB (a section ending at the top of the
+                // address space), but the size must still fit in 32 bits
+                // (ld.lld would cut a 4 GiB size to 0). ELF64: the section
+                // must end below 2^64, even exactly at it is too far.
+                let past = match class {
+                    Class::Elf32 => size > u64::from(u32::MAX) || d > 1 << 32,
+                    Class::Elf64 => start.checked_add(size).is_none(),
+                };
+                if past {
+                    w.script_err(
+                        o.line,
+                        format!(
+                            "section {} at {start:#x} of size {size:#x} exceeds available address space",
+                            o.name
+                        ),
+                    );
+                    // The link fails, but as in ld.lld the location counter
+                    // goes on from the section's end (wrapped on ELF64), so
+                    // the sections after it are placed, and reported, where
+                    // ld.lld places them.
+                    dot = d;
+                    if cursor.is_some() {
+                        cursor = Some(d);
                     }
-                    // ELF64: the section must end below 2^64, even exactly at
-                    // it is too far (ld.lld's checkSections).
-                    Class::Elf64 => {
-                        if start.checked_add(size).is_none() {
-                            w.script_err(
-                                o.line,
-                                format!(
-                                    "section {} at {start:#x} of size {size:#x} exceeds available address space",
-                                    o.name
-                                ),
-                            );
-                            continue;
-                        }
-                    }
+                    continue;
                 }
                 // The load address range must fit as the address range does.
                 // The section is still placed: its addresses are right, and
@@ -1341,6 +1379,8 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
         }
     }
     errors.append(&mut w.errors);
+    // ld.lld's order: addresses, then load addresses.
+    errors.extend(address_overlaps(&w.sections));
     errors.extend(load_overlaps(class, &w.sections));
 
     // Debug information, after everything else.

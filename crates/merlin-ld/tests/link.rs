@@ -1322,6 +1322,68 @@ fn script_symbols() {
 }
 
 #[test]
+fn the_location_counter_moves_backward_at_the_top_level() {
+    // As in ld.lld: a top-level `.` may move backward, and the sections
+    // only must not end up over each other.
+    let l = merlin_ld::link(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80001000; .text : { *(.text*) } . = 0x80000000; .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+        ),
+    )
+    .unwrap();
+    let ours = read_ours(&l.elf);
+    assert_eq!(ours.sections[0].addr, 0x8000_1000);
+    assert_eq!(ours.sections[1].addr, 0x8000_0000);
+    // Going backward starts a segment, at a file offset after the one
+    // before (the second page here, as ld.lld puts it).
+    assert_eq!(ours.loads[1].vaddr, 0x8000_0000);
+    assert!(ours.loads[1].offset > ours.loads[0].offset);
+    let errs = errors(merlin_ld::layout(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) } . = 0x80000008; .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+        ),
+    ));
+    assert!(
+        errs[0]
+            .starts_with("section .text virtual address range overlaps with .rodata (.text is [0x80000000, "),
+        "{errs:?}"
+    );
+    assert!(
+        errs[1].starts_with("section .text load address range overlaps with .rodata"),
+        "{errs:?}"
+    );
+}
+
+/// After a section past the address space the location counter goes on
+/// from its end, so the sections after it are reported where ld.lld puts
+/// them, not all at the failed one's start.
+#[test]
+fn sections_after_one_past_4_gib_go_on_from_its_end() {
+    let errs = errors(merlin_ld::layout(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x100000000; .text : { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+        ),
+    ));
+    assert_eq!(errs.len(), 4, "{errs:?}");
+    assert!(
+        errs[0].starts_with("test.ld:1: section .text at 0x100000000 of size 0x"),
+        "{errs:?}"
+    );
+    for e in &errs[1..] {
+        assert!(
+            e.contains(" at 0x1000000") && !e.contains(" at 0x100000000 "),
+            "{errs:?}"
+        );
+    }
+}
+
+#[test]
 fn align_0_is_align_1() {
     // ld.lld's checkAlignment takes 0 for 1, in an expression and on a
     // section: neither moves anything (.text still goes at the alignment
@@ -1465,17 +1527,24 @@ fn layout_errors() {
              MEMORY region RAM instead; move the assignment inside the section",
         ),
         (
-            "SECTIONS { . = 0x80000000; . = 0x1000; }",
-            "test.ld:1: cannot move the location counter backward (from 0x80000000 to 0x1000)",
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) . = . - 0x1000; } }",
+            "test.ld:1: cannot move the location counter backward (from 0x80000",
         ),
+        // ld.lld's words for a section past the address space.
         (
             "SECTIONS { . = 0xfffffff0; .text : { *(.text*) } }",
-            "test.ld:1: section .text extends past the 4 GiB address space",
+            "test.ld:1: section .text at 0xfffffff0 of size 0x",
         ),
         (
             // Exactly 4 GiB long: must not wrap to an empty section.
             "SECTIONS { . = 0; .s : { . += 0x100000000; } }",
-            "test.ld:1: section .s extends past the 4 GiB address space",
+            "test.ld:1: section .s at 0x0 of size 0x100000000 exceeds available address space",
+        ),
+        (
+            // A negative location counter, at the top level, where `.` may
+            // move backward.
+            "SECTIONS { . = 0 - 1; }",
+            "test.ld:1: location counter 0xffffffffffffffff is past the 4 GiB address space",
         ),
         (
             "SECTIONS { . = 0x80000000; . += 0x7fffffffffffffff; }",

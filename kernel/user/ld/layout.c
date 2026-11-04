@@ -72,8 +72,8 @@ static int is_pow2(i64 a) {
     return !i64_eq(a, i64_u(0)) && i64_eq(i64_and(a, i64_sub(a, i64_u(1))), i64_u(0));
 }
 
-/* v rounded up to a multiple of a, a power of two (2^63 too), for
- * 0 <= v <= 2^32: (v + a - 1) & !(a - 1) in 64 bits. */
+/* v rounded up to a multiple of a, a power of two (2^63 too): (v + a - 1)
+ * & !(a - 1) modulo 2^64, as ld.lld aligns the location counter. */
 static i64 align_pow2(i64 v, i64 a) {
     i64 m = i64_sub(a, i64_u(1));
     return i64_and(i64_add(v, m), i64_not(m));
@@ -322,8 +322,9 @@ static int eval(struct expr *e, i64 dot, i64 *out, char **err) {
     }
 }
 
-/* Runs one assignment. Returns the new location counter. */
-static i64 assign(struct assign *a, i64 dot) {
+/* Runs one assignment, at the top level of SECTIONS or inside an output
+ * section (in_section). Returns the new location counter. */
+static i64 assign(struct assign *a, i64 dot, int in_section) {
     i64 v;
     char *err;
     if (!eval(a->e, dot, &v, &err)) {
@@ -340,12 +341,18 @@ static i64 assign(struct assign *a, i64 dot) {
                 return dot;
             }
         }
-        if (i64_cmp(n, dot) < 0) {
+        /* Inside an output section `.` only moves forward (a negative value
+         * is a move backward too), and as in ld.lld it still takes the new
+         * value. At the top level it moves anywhere, as in ld.lld: sections
+         * over each other are an error once all are placed. */
+        if (in_section && i64_cmp(n, dot) < 0) {
             script_err(a->line, fmt("cannot move the location counter backward (from %s to %s)", i64_hex(dot),
                                     i64_hex(n)));
-            return dot;
+            return n;
         }
-        if (i64_cmp(n, four_gib()) > 0) {
+        /* 4 GiB of address space; a negative value, read as 64 bits, is
+         * past it too. */
+        if (i64_is_neg(n) || i64_cmp(n, four_gib()) > 0) {
             script_err(a->line, fmt("location counter %s is past the 4 GiB address space", i64_hex(n)));
             return dot;
         }
@@ -873,7 +880,7 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
         }
     }
     i64 base = has_cursor ? *cursor : *dot;
-    i64 start = align_up(base, i64_u(align));
+    i64 start = align_pow2(base, i64_u(align));
     /* From here on ADDR of this section is `start`. */
     has_current = 1;
     current_name = o->name;
@@ -900,12 +907,12 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
     int nobits = 1;
     for (uint it = 0; it < o->nitems; it++) {
         if (o->items[it].is_assign) {
-            d = assign(&o->items[it].assign, d);
+            d = assign(&o->items[it].assign, d, 1);
             continue;
         }
         for (uint k = 0; k < r[it].n; k++) {
             struct section *sec = &L->objects[r[it].in[k].obj].sections[r[it].in[k].sec];
-            d = align_up(d, i64_u(sec->align));
+            d = align_pow2(d, i64_u(sec->align));
             sec->placed = PLACED;
             sec->addr = d.lo;
             sec->out = -1;
@@ -919,10 +926,18 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
             nobits &= sec->type == SHT_NOBITS;
         }
     }
-    /* d may be exactly 4 GiB, but the size must fit in 32 bits. */
+    /* d may be exactly 4 GiB, but the size must fit in 32 bits; ld.lld's
+     * words. The link fails, but as in ld.lld the location counter goes on
+     * from the section's end, so the sections after it are placed, and
+     * reported, where ld.lld places them. */
     i64 size = i64_sub(d, start);
     if (size.hi != 0 || i64_cmp(d, four_gib()) > 0) {
-        script_err(o->line, fmt("section %s extends past the 4 GiB address space", o->name));
+        script_err(o->line, fmt("section %s at %s of size %s exceeds available address space", o->name,
+                                i64_hex(start), i64_hex(size)));
+        *dot = d;
+        if (has_cursor) {
+            *cursor = d;
+        }
         return;
     }
     /* The load address range must fit as the address range does. The
@@ -991,7 +1006,7 @@ static void walk(void) {
         has_current = 0;
         if (!cmd->is_output) {
             i64 before = dot;
-            dot = assign(&cmd->assign, dot);
+            dot = assign(&cmd->assign, dot, 0);
             if (cmd->assign.symbol == NULL && !i64_eq(dot, before)) {
                 dot_moved = cmd->assign.line;
             }
@@ -1008,39 +1023,59 @@ static void walk(void) {
     has_current = 0;
 }
 
-/* Sections loaded over each other, as ld.lld's checkSections finds them
- * ("load address range overlaps"): with AT, two sections can be given load
- * addresses that overlap although their addresses do not. Only sections
- * with bytes in the file count. Like ld.lld, sort them by load address and
- * compare each with the next one, naming the lower one first. */
-static void load_overlaps(void) {
-    uint *order = xcalloc((L->nsections + 1) * sizeof(uint));
-    uint n = 0;
-    for (uint k = 0; k < L->nsections; k++) {
-        struct output_section *s = &L->sections[k];
-        /* (One whose load range does not fit has been reported already.) */
-        if (s->nobits || s->size == 0 || !load_range_fits(s->lma, s->size)) {
-            continue;
-        }
-        /* Insertion sort, stable: sections at the same load address stay
-         * in script order. These load addresses are below 4 GiB. */
-        uint j = n;
-        while (j > 0 && L->sections[order[j - 1]].lma.lo > s->lma.lo) {
+/* ld.lld's checkOverlap: the sections in `order` (n of them) sorted by
+ * where their range starts (the load address, or the address), each
+ * compared with the next one, the lower one named first, with ld.lld's
+ * ranges on the same line. The sort is stable: sections that start together
+ * stay in script order. Every range is below 4 GiB. */
+static void overlaps(const char *what, uint *order, uint n, int by_lma) {
+    for (uint i = 1; i < n; i++) {
+        uint k = order[i];
+        uint j = i;
+        while (j > 0 && (by_lma ? L->sections[order[j - 1]].lma.lo > L->sections[k].lma.lo
+                                : L->sections[order[j - 1]].addr > L->sections[k].addr)) {
             order[j] = order[j - 1];
             j--;
         }
         order[j] = k;
-        n++;
     }
     for (uint i = 0; i + 1 < n; i++) {
         struct output_section *a = &L->sections[order[i]];
         struct output_section *b = &L->sections[order[i + 1]];
-        if (i64_cmp(b->lma, i64_add(a->lma, i64_u(a->size))) < 0) {
-            error(fmt("section %s load address range overlaps with %s (%s is [0x%x, 0x%x], %s is [0x%x, 0x%x])",
-                      a->name, b->name, a->name, a->lma.lo, a->lma.lo + a->size - 1, b->name, b->lma.lo,
-                      b->lma.lo + b->size - 1));
+        i64 as = by_lma ? a->lma : i64_u(a->addr);
+        i64 bs = by_lma ? b->lma : i64_u(b->addr);
+        if (i64_cmp(bs, i64_add(as, i64_u(a->size))) < 0) {
+            error(fmt("section %s %s range overlaps with %s (%s is [0x%x, 0x%x], %s is [0x%x, 0x%x])", a->name, what,
+                      b->name, a->name, as.lo, as.lo + a->size - 1, b->name, bs.lo, bs.lo + b->size - 1));
         }
     }
+}
+
+/* Sections over each other in memory (ld.lld's "virtual address range
+ * overlaps"): a top-level `.` may move backward, so two sections can be
+ * given the same addresses. Every section with a size counts, NOBITS ones
+ * too. Then sections loaded over each other ("load address range
+ * overlaps"): with AT, two sections can be given load addresses that
+ * overlap although their addresses do not. Only sections with bytes in the
+ * file count there. */
+static void address_and_load_overlaps(void) {
+    uint *order = xcalloc((L->nsections + 1) * sizeof(uint));
+    uint n = 0;
+    for (uint k = 0; k < L->nsections; k++) {
+        if (L->sections[k].size > 0) {
+            order[n++] = k;
+        }
+    }
+    overlaps("virtual address", order, n, 0);
+    n = 0;
+    for (uint k = 0; k < L->nsections; k++) {
+        struct output_section *s = &L->sections[k];
+        /* (One whose load range does not fit has been reported already.) */
+        if (!s->nobits && s->size > 0 && load_range_fits(s->lma, s->size)) {
+            order[n++] = k;
+        }
+    }
+    overlaps("load address", order, n, 1);
     free(order);
 }
 
@@ -1224,7 +1259,7 @@ int layout_build(struct object *objects, uint nobjects, const char *name, const 
     globals();
     assign_inputs(have_script);
     walk();
-    load_overlaps();
+    address_and_load_overlaps();
     l->memory = S.has_memory;
     l->riscv_attributes = riscv_attributes_kept();
     place_debug();

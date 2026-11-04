@@ -404,6 +404,47 @@ fn rv64_layouts_have_64_bit_addresses() {
     .unwrap();
     assert_eq!(layout.section(".text").unwrap().addr, 0xffff_ffff_ffff_fff0);
 
+    // As in ld.lld, the location counter goes on from the end of a section
+    // past 2^64, wrapped: only that one is reported, and the next is at 0.
+    let two = rv64("a.o", ".text\n.globl _start\n_start: nop\nnop\n.data\n.dword 1\n");
+    let both = ".text : { *(.text) } .data : { *(.data) }";
+    assert_eq!(
+        errors(merlin_ld::layout(
+            std::slice::from_ref(&two),
+            &script(&format!("SECTIONS {{ . = 0xfffffffffffffff8; {both} }}")),
+        )),
+        ["test.ld:1: section .text at 0xfffffffffffffff8 of size 0x8 exceeds available address space"]
+    );
+    // At the top level `.` wraps round 2^64, by `+=` and by ALIGN, and a
+    // section's alignment wraps to 0 too; all of these link, as in ld.lld.
+    for (start, at) in [
+        (format!(". = 0xfffffffffffffff0; . += 0x20; {both}"), 0x10),
+        (format!(". = 0xfffffffffffffff8; . = ALIGN(16); {both}"), 0),
+        (
+            ". = 0xfffffffffffffff8; .text : ALIGN(16) { *(.text) } .data : { *(.data) }".into(),
+            0,
+        ),
+    ] {
+        let src = format!("SECTIONS {{ {start} }}");
+        let layout = merlin_ld::layout(std::slice::from_ref(&two), &script(&src))
+            .unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        assert_eq!(layout.section(".text").unwrap().addr, at, "{src}");
+    }
+    // Inside a section it is a move backward; `.` still takes the value, so
+    // that section is past 2^64 and the next ones are fine at 0.
+    assert_eq!(
+        errors(merlin_ld::layout(
+            std::slice::from_ref(&two),
+            &script(&format!(
+                "SECTIONS {{ . = 0xfffffffffffffff8; .s : {{ . = ALIGN(16); }} {both} }}"
+            )),
+        )),
+        [
+            "test.ld:1: cannot move the location counter backward (from 0xfffffffffffffff8 to 0x0)",
+            "test.ld:1: section .s at 0xfffffffffffffff8 of size 0x8 exceeds available address space"
+        ]
+    );
+
     // -e takes a 64-bit address.
     let opts = Options {
         entry: Some("0xffffffff80000000".into()),
@@ -794,8 +835,8 @@ fn layout_errors_and_the_4_gib_limits_that_are_rv32s() {
             "test.ld:1: section .data overflows MEMORY region RAM by 36 bytes",
         ),
         (
-            "SECTIONS { . = 0x80000000; . = 0x1000; }",
-            "test.ld:1: cannot move the location counter backward (from 0x80000000 to 0x1000)",
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) . = . - 0x1000; } }",
+            "test.ld:1: cannot move the location counter backward (from 0x80000",
         ),
         (
             "SECTIONS { x = ORIGIN(RAM); }",
