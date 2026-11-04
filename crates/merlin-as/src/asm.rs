@@ -38,6 +38,12 @@
 //! section holds (`NOBITS`: zeros only) and how `.align` pads it (`nop`s in
 //! code).
 //!
+//! Mapping symbols mark where code and data start in every section, as
+//! clang marks them: `$x<isa>` before a run of instructions, `$d` before a
+//! run of data ([`Assembler::mapping_symbol`]). The symbol table lists them
+//! among the other local symbols in the order clang does, the order in which
+//! the source makes them.
+//!
 //! Debug information: `.debug_*` sections are not loaded (no `SHF_ALLOC`) and
 //! hold data only. A `.word` or `.dword` there that names a `.L` label (the
 //! 8-byte addresses of RV64's DWARF) becomes a relocation against the label's
@@ -104,6 +110,20 @@ pub enum SymType {
     /// A section's own symbol (`STT_SECTION`), at its start, for relocations
     /// from debug information. Named by [`section_symbol_name`].
     Section,
+    /// A mapping symbol (psABI "Mapping Symbol"): `$x<isa>` where code
+    /// starts, `$d` where data starts. `STT_NOTYPE` and local, like a plain
+    /// label, but nothing refers to it: a label the source names `$d` is
+    /// another symbol (see [`Assembler::mapping_symbol`]).
+    Mapping,
+}
+
+/// What a mapping symbol says follows it ([`SymType::Mapping`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mapping {
+    /// Instructions: `$x<isa>`.
+    Code,
+    /// Data: `$d`.
+    Data,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +174,9 @@ pub struct Assembler {
     /// file) and the other `.file`s by number.
     file0: Option<dwarf::File>,
     files: Vec<Option<dwarf::File>>,
+    /// What each section holds at its end, for its mapping symbols
+    /// ([`Assembler::mapping_symbol`]): None until it has code or data.
+    mapping: Vec<Option<Mapping>>,
     /// The last `.loc`, until an instruction (or data) takes it.
     loc: Option<dwarf::Loc>,
     /// `.loc`'s `is_stmt`, which carries over from one to the next.
@@ -261,6 +284,7 @@ impl Assembler {
             locals: HashSet::new(),
             file0: None,
             files: Vec::new(),
+            mapping: Vec::new(),
             loc: None,
             is_stmt: true,
             rows: Vec::new(),
@@ -298,13 +322,18 @@ impl Assembler {
             }
         }
         self.resolve_local_fixups();
+        // What clang's assembler writes when the source has been read, in
+        // its order: the attributes (`RISCVTargetELFStreamer::finish`), then
+        // the line table (`MCObjectStreamer::finishImpl`).
+        self.attributes_section();
         self.line_table();
         self.debug_relocs_to_sections();
         if !self.errors.is_empty() {
             self.errors.sort_by_key(|e| e.line);
             return Err(self.errors);
         }
-        // `.L` labels are assembler-internal: keep only those a relocation needs.
+        // `.L` labels are assembler-internal, and a section symbol stands in
+        // for labels: keep only those a relocation needs.
         let referenced: HashSet<&str> = self
             .sections
             .iter()
@@ -314,7 +343,10 @@ impl Assembler {
         let symbols = self
             .symbols
             .iter()
-            .filter(|s| !s.name.starts_with(".L") || referenced.contains(s.name.as_str()))
+            .filter(|s| {
+                let internal = s.name.starts_with(".L") || s.ty == SymType::Section;
+                !internal || referenced.contains(s.name.as_str())
+            })
             .cloned()
             .collect();
         Ok(Object {
@@ -641,6 +673,13 @@ impl Assembler {
     /// `.text` at the start with the alignment of an instruction
     /// (`MCELFStreamer::initSections`), and no other section, not even code
     /// (`.text.f`, `"ax"`), gets one unless it asks.
+    ///
+    /// Its section symbol is made here too, so that it has its place among
+    /// the other symbols even if a relocation needs it only at the end (the
+    /// line table's): LLVM registers a section's symbol when it first
+    /// switches to the section (`MCELFStreamer::changeSection`), and keeps it
+    /// in the symbol table only if a relocation uses it, as [`Assembler::finish`]
+    /// does.
     fn new_section(&mut self, name: &str, attrs: Attrs) {
         self.sections.push(Section {
             name: name.to_string(),
@@ -650,7 +689,65 @@ impl Assembler {
             align: if name == ".text" { 4 } else { 1 },
             relocs: Vec::new(),
         });
+        self.mapping.push(None);
         self.current = self.sections.len() - 1;
+        self.section_symbol(self.current);
+    }
+
+    /// Marks what comes next in the current section, code or data, with a
+    /// mapping symbol where that changes, as clang's assembler does
+    /// (`RISCVELFStreamer`): the psABI's `$x<isa>` before the first
+    /// instruction of a run (`$xrv64i2p1_m2p0_..._zalrsc1p0`, the ISA of the
+    /// object's `.riscv.attributes`), `$d` before the first data. That is
+    /// what lets a disassembler tell a `.word` among instructions from an
+    /// instruction.
+    ///
+    /// Each section remembers what it had last, from its first byte: a
+    /// section starts with neither, and going back to it carries on where it
+    /// stopped. Every instruction asks for code ([`Assembler::place`]), and
+    /// every data directive for data, even one that writes no bytes
+    /// (`.zero 0`, `.ascii ""`), as LLVM's `emitBytes`, `emitFill` and
+    /// `emitValue` do; padding (`.align`) asks for neither. Each one is a
+    /// new local symbol, made after the labels the line defines (a
+    /// `.Lpcrel_hi`, a `.`) and before the symbols it is the first to name.
+    fn mapping_symbol(&mut self, kind: Mapping) {
+        let sec = self.current;
+        if self.mapping[sec] == Some(kind) {
+            return;
+        }
+        self.mapping[sec] = Some(kind);
+        let name = match kind {
+            Mapping::Code => format!("$x{}", crate::elf::arch(self.xlen)),
+            Mapping::Data => "$d".to_string(),
+        };
+        // Not in `by_name`: no reference can name it.
+        self.symbols.push(Symbol {
+            name,
+            section: Some(sec),
+            value: self.sections[sec].size,
+            global: false,
+            defined: true,
+            constant: None,
+            ty: SymType::Mapping,
+            size: 0,
+        });
+    }
+
+    /// `.riscv.attributes`, which clang writes at the end (its contents are
+    /// [`crate::elf::riscv_attributes`]): a section like the others, data
+    /// with its `$d`, after every section of the source but before the
+    /// line table's, which come after it.
+    fn attributes_section(&mut self) {
+        let back = self.current;
+        let attrs = Attrs {
+            ty: section::SHT_RISCV_ATTRIBUTES,
+            flags: 0,
+            entsize: 0,
+        };
+        self.new_section(".riscv.attributes", attrs);
+        self.mapping_symbol(Mapping::Data);
+        self.emit_bytes(&crate::elf::riscv_attributes(crate::elf::arch(self.xlen)));
+        self.current = back;
     }
 
     /// Whether `n` more bytes fit in the current section, which reports an
@@ -712,13 +809,25 @@ impl Assembler {
         }
         let sec = &mut self.sections[self.current];
         sec.align = sec.align.max(align);
-        let pad = (align - sec.size % align) % align;
-        if sec.is_code() && pad.is_multiple_of(4) && sec.size.is_multiple_of(4) {
-            for _ in 0..pad / 4 {
-                self.emit_bytes(&0x0000_0013u32.to_le_bytes()); // nop
-            }
-        } else {
-            self.emit_zeros(pad.into());
+        let mut pad = (align - sec.size % align) % align;
+        if !sec.is_code() {
+            return self.emit_zeros(pad.into());
+        }
+        // Code pads as LLVM's `RISCVAsmBackend::writeNopData` pads it: a zero
+        // byte to an even offset, then a 2-byte `c.nop` (0x0001) to a
+        // multiple of 4, then `nop`s. Only the `nop`s are ever executed (an
+        // instruction is 4-byte aligned, and merlin-as has no 16-bit ones);
+        // the bytes before them pad data, but they are LLVM's.
+        if pad % 2 == 1 {
+            self.emit_zeros(1);
+            pad -= 1;
+        }
+        if pad % 4 == 2 {
+            self.emit_bytes(&[0x01, 0x00]);
+            pad -= 2;
+        }
+        for _ in 0..pad / 4 {
+            self.emit_bytes(&0x0000_0013u32.to_le_bytes()); // nop
         }
     }
 
@@ -743,8 +852,13 @@ impl Assembler {
         }
         self.take_loc();
         let base = self.sections[self.current].size;
-        // `.` in any operand is the address of the instruction's first word.
-        let mut dot = None;
+        // `.` in any operand is the address of the instruction's first word:
+        // a label there, made first, as clang makes it when it reads the
+        // operand.
+        let names_dot = emits
+            .iter()
+            .any(|e| matches!(&e.fixup, Some(f) if matches!(&f.target, Target::Symbol { name, .. } if name == DOT)));
+        let dot = names_dot.then(|| self.dot_label(base));
         // Hidden labels on auipcs that a later %pcrel_lo in this expansion refers to.
         let mut auipc_labels: HashMap<usize, String> = HashMap::new();
         for (i, e) in emits.iter().enumerate() {
@@ -764,13 +878,16 @@ impl Assembler {
                 }
             }
         }
+        // After the labels, before the symbols the operands name (clang's
+        // `emitLabel`s, then `emitInstruction`).
+        self.mapping_symbol(Mapping::Code);
         for (i, Emit { word, fixup }) in emits.into_iter().enumerate() {
             let offset = base + 4 * i as u32;
             if let Some(f) = fixup {
                 let (symbol, addend) = match f.target {
                     Target::Symbol { mut name, addend } => {
                         if name == DOT {
-                            name = dot.get_or_insert_with(|| self.dot_label(base)).clone();
+                            name = dot.clone().expect("made above");
                         }
                         if matches!(f.kind, RelocKind::PcrelLo12I | RelocKind::PcrelLo12S) {
                             self.pcrel_lo.push((self.current, name.clone(), self.line));
@@ -844,6 +961,7 @@ impl Assembler {
                     continue;
                 }
                 let bytes = (v as u64).to_le_bytes();
+                self.mapping_symbol(Mapping::Data);
                 self.emit_bytes(&bytes[..size as usize]);
                 continue;
             }
@@ -864,6 +982,8 @@ impl Assembler {
             if name == DOT {
                 name = self.dot_label(off);
             }
+            // After the label for `.`, before the symbol it names.
+            self.mapping_symbol(Mapping::Data);
             self.add_reloc(off, kind, name, addend);
             self.emit_bytes(&[0; 8][..size as usize]);
         }
@@ -1029,6 +1149,7 @@ impl Assembler {
         if !self.has_room(n) {
             return;
         }
+        self.mapping_symbol(Mapping::Data);
         if fill == 0 {
             self.emit_zeros(n);
         } else {
@@ -1092,6 +1213,8 @@ impl Assembler {
         if self.symbols[i].ty == SymType::NoType {
             self.symbols[i].ty = SymType::Object;
         }
+        // LLVM's emitZeros: data, after the label.
+        self.mapping_symbol(Mapping::Data);
         self.emit_zeros(size as u64);
         self.current = back;
     }
@@ -1148,6 +1271,7 @@ impl Assembler {
                     match a {
                         DirArg::Str(s) => {
                             let s = s.clone();
+                            self.mapping_symbol(Mapping::Data);
                             self.emit_bytes(&s);
                             if name != ".ascii" {
                                 self.emit_bytes(&[0]);
@@ -1373,6 +1497,7 @@ impl Assembler {
     fn append(&mut self, name: &str, bytes: &[u8]) -> (usize, u32) {
         let back = self.current;
         self.switch_section(name);
+        self.mapping_symbol(Mapping::Data);
         let sec = self.current;
         let at = self.sections[sec].size;
         self.sections[sec].data.extend_from_slice(bytes);

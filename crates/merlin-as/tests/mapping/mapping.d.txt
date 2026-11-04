@@ -1,0 +1,92 @@
+
+mapping.o:	file format elf32-littleriscv
+
+Disassembly of section .text:
+
+00000000 <_start>:
+       0: 00000013     	nop
+       4: 78 56 34 12  	.word	0x12345678
+       8: 00150513     	addi	a0, a0, 0x1
+       c: 01 00 01 00  	.word	0x00010001
+      10: 00000013     	nop
+      14: 00000013     	nop
+      18: 00000013     	nop
+      1c: 00000013     	nop
+      20: 07 00 01 00  	.word	0x00010007
+      24: 13 00 00 00  	.word	0x00000013
+      28: 00c58533     	add	a0, a1, a2
+
+0000002c <lbl>:
+      2c: 00 00 00 00  	.word	0x00000000
+      30: 0180006f     	j	0x48 <fwd>
+
+00000034 <.Lpcrel_hi0>:
+      34: 00000597     	auipc	a1, 0x0
+			00000034:  R_RISCV_PCREL_HI20	other
+      38: 00058593     	mv	a1, a1
+			00000038:  R_RISCV_PCREL_LO12_I	.Lpcrel_hi0
+      3c: 00000013     	nop
+      40: 00000013     	nop
+      44: 00 00 00 00  	.word	0x00000000
+			00000044:  R_RISCV_32	fwd
+
+00000048 <fwd>:
+      48: 00008067     	ret
+      4c: 00000013     	nop
+      50: 08 00 00 00  	.word	0x00000008
+
+Disassembly of section .text.b:
+
+00000000 <.text.b>:
+       0: 68 69        	.short	0x6968
+       2: 00           	.byte	0x00
+
+Disassembly of section .text.c:
+
+00000000 <.text.c>:
+       0: 00000013     	nop
+
+Disassembly of section .text.d:
+
+00000000 <.text.d>:
+       0: 05 00 00 00  	.word	0x00000005
+
+Disassembly of section .text.i:
+
+00000000 <.text.i>:
+       0: 01 00 01 00  	.word	0x00010001
+
+Disassembly of section .text.j:
+
+00000000 <.text.j>:
+       0: 01 00 01 00  	.word	0x00010001
+       4: 13 00 00 00  	.word	0x00000013
+       8: 02 03 01 00  	.word	0x00010302
+       c: 13 00 00 00  	.word	0x00000013
+      10: 04 05 06 00  	.word	0x00060504
+      14: 13 00 00 00  	.word	0x00000013
+      18: 13 00 00 00  	.word	0x00000013
+      1c: 13 00 00 00  	.word	0x00000013
+      20: 00000013     	nop
+
+Disassembly of section .text.k:
+
+00000000 <.text.k>:
+       0: 00 00 00 00  	.word	0x00000000
+       4: 01 00 00 00  	.word	0x00000001
+       8: 02 00 00 00  	.word	0x00000002
+       c: 03 00 00 00  	.word	0x00000003
+      10: 00 00 00 00  	.word	0x00000000
+      14: 04 00 00 00  	.word	0x00000004
+      18: 00 00 00 00  	.word	0x00000000
+
+Disassembly of section .text.l:
+
+00000000 <.text.l>:
+       0: 00 00 00 00  	.word	0x00000000
+			00000000:  R_RISCV_64	other
+       4: 00 00 00 00  	.word	0x00000000
+       8: 00000013     	nop
+       c: 00 00 00 00  	.word	0x00000000
+			0000000c:  R_RISCV_32	other
+      10: 00000013     	nop
