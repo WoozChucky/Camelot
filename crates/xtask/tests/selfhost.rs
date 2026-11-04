@@ -129,7 +129,8 @@ const SECTIONS: &str = "
 
 /// Data of every size at the edges of its range, `>>` (logical) and the
 /// relocations of `.word` and `.dword`, in a section and in debug
-/// information: what no file of the corpus has all of.
+/// information, and every escape a string may hold: what no file of the
+/// corpus has all of.
 const DATA: &str = "
         .text
 f:      nop
@@ -144,6 +145,7 @@ f:      nop
 x:      .8byte x + 8, ., f + BIG + 1
         .word x, ., 1 + (BIG + f)
         .space 3, 0x1ff
+        .ascii \"\\b\\f\\n\\r\\t\\\"\\\\\\0\\12\\377\\x41\"
         .size x, 0x100000003
         .size f, -4
         .section .debug_info,\"\",@progbits
