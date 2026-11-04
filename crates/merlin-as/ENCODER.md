@@ -313,9 +313,10 @@ writer (`src/elf.rs`, whose module docs show what the class changes).
 
 For every source in `examples/` (clang assembling it with
 `-include examples/xcal.inc`), `llvm-objdump -dr` prints exactly the same text
-for our object as for clang's (on RV32; the examples come to RV64 in #151).
-The differences
-that remain on other input (spec section 10):
+for our object as for clang's, at each width the source is built for (RV64
+with the flags of the RV64 reference builds, `xtask::ld_fixtures::RV64`;
+`crates/xtask/tests/hello.rs`, below). The differences that remain on other
+input (spec section 10):
 
 - clang rewrites a branch it can't resolve or reach (to a global, an
   undefined symbol, another section, or too far) into an inverted branch over

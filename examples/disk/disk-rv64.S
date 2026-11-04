@@ -1,8 +1,9 @@
 # Block device demo for RV64 Grail (spec section 9.6; disk.S is the RV32 one). Finds
-# the first disk in the sysinfo device table, prints its size, reads sector 0 and prints it as text (up to the first
-# NUL byte), checks that a read past the end fails with error 2, then tests writing:
-# it saves the last sector, overwrites it with a pattern, reads it back, compares, and
-# writes the saved contents back, so the image is unchanged afterwards.
+# the first disk in the sysinfo device table, prints its size, reads sector 0 and
+# prints it as text (up to the first NUL byte), checks that a read past the end fails
+# with error 2, then tests writing: it saves the last sector, overwrites it with a
+# pattern, reads it back, compares, and writes the saved contents back, so the image
+# is unchanged afterwards.
 #
 # Every command waits for the disk's completion interrupt: the disk's PLIC source is
 # enabled for context 0 and mie.MEIE is set, but mstatus.MIE stays clear, so wfi wakes
