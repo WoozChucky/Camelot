@@ -539,6 +539,49 @@ mod tests {
         assert_eq!(le(&0x8000_0000_0000_0020u64.to_le_bytes()), 0x8000_0000_0000_0020);
     }
 
+    /// A stub that knows only `qSupported` (without `qXfer:features:read+`), `g`
+    /// (33 registers of `width` bytes, pc 0x80000000) and `qfThreadInfo`, and acks
+    /// everything.
+    fn plain_stub(width: usize) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut decoder = Decoder::default();
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(n @ 1..) = s.read(&mut buf) else { return };
+                for &b in &buf[..n] {
+                    let Some(Event::Packet(p)) = decoder.push(b) else {
+                        continue;
+                    };
+                    let mut pc = 0x8000_0000u64.to_le_bytes().to_vec();
+                    pc.resize(width, 0);
+                    let reply = match p.as_slice() {
+                        b"qfThreadInfo" => "m1".to_string(),
+                        b"g" => hex(&vec![0; 32 * width]) + &hex(&pc),
+                        p if p.starts_with(b"qSupported") => "PacketSize=4000".to_string(),
+                        _ => String::new(),
+                    };
+                    let _ = s.write_all(b"+");
+                    let _ = s.write_all(&packet::frame(reply.as_bytes()));
+                }
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn the_width_from_the_registers() {
+        for (width, xlen) in [(4, Xlen::Rv32), (8, Xlen::Rv64)] {
+            let mut r = Remote::connect(plain_stub(width)).unwrap();
+            assert_eq!(r.xlen, xlen);
+            assert_eq!(r.registers().unwrap()[32], 0x8000_0000);
+        }
+        let e = Remote::connect(plain_stub(2)).err().unwrap();
+        assert_eq!(e, "a register packet of 66 bytes, neither RV32's nor RV64's");
+    }
+
     #[test]
     fn widths() {
         let xml = "<?xml version=\"1.0\"?>\n<target version=\"1.0\">\n\

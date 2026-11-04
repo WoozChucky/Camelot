@@ -14,5 +14,9 @@ grail = { path = "../grail" }
 
 [dev-dependencies]
 # tests/session.rs builds a user program with its line tables, as `cargo xtask
-# kernel` does, to step through it.
+# kernel` does, to step through it, and an RV64 program (tests/rv64) with
+# merlin -g, merlin-as and merlin-ld.
 xtask = { path = "../xtask" }
+merlin = { path = "../merlin" }
+merlin-as = { path = "../merlin-as" }
+merlin-ld = { path = "../merlin-ld" }
