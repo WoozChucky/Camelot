@@ -28,12 +28,8 @@
 #include <asm.h>
 
 #if __riscv_xlen == 64
-#define LWU lwu         /* a 32-bit register, zero-extended */
-#define ADDIW addiw     /* a 32-bit counter, kept sign-extended */
 #define DEC_END 20      /* put_dec's digits: sp+0 .. sp+19, the 20 of 2^64 - 1 */
 #else
-#define LWU lw
-#define ADDIW addi
 #define DEC_END 12      /* sp+2 .. sp+11, the 10 of 2^32 - 1 */
 #endif
 

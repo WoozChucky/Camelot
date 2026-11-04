@@ -56,15 +56,9 @@
 #   merlin-ld -T crates/grail/rom/link.ld diskboot.o -o crates/grail/rom/diskboot-rv64.elf
 #
 # (`cargo test` checks the committed files are up to date). asm.h is the
-# repository's (include/asm.h), the examples' too: REG_L, REG_S, SZREG.
+# repository's (include/asm.h), the examples' too: REG_L, REG_S, SZREG, ADDW.
 
 #include <asm.h>
-
-#if __riscv_xlen == 64
-#define ADDW addw       /* a 32-bit sum, kept sign-extended */
-#else
-#define ADDW add
-#endif
 
     .equ PARK_PC,          0x1020       # the park loop
     .equ RAM_BASE,         0x80000000

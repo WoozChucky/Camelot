@@ -35,20 +35,16 @@
 # Reference build with LLVM, only for comparison:
 #
 #   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc -I include \
 #         -T examples/pointer/link.ld examples/pointer/pointer.S -o pointer.elf
 #
 # and for RV64:
 #
 #   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
 #         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
-#         -T examples/pointer/link.ld examples/pointer/pointer.S -o pointer-rv64.elf
+#         -I include -T examples/pointer/link.ld examples/pointer/pointer.S -o pointer-rv64.elf
 
-#if __riscv_xlen == 64
-#define LWU lwu         /* a 32-bit word, zero-extended */
-#else
-#define LWU lw
-#endif
+#include <asm.h>
 
     .equ FB_BASE,       0x30000000      # framebuffer registers (spec section 9.3)
     .equ FB_WIDTH,      0x00

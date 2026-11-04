@@ -10,7 +10,8 @@
  *       REG_S  ra, 16-SZREG(sp)        # sw on RV32, sd on RV64
  *
  * It uses the names Linux's arch/riscv/include/asm/asm.h gives these, so
- * code reads the same, and only those this repository's sources use.
+ * code reads the same, and only those this repository's sources use; LWU,
+ * ADDW and ADDIW, for 32-bit values, are this project's own.
  *
  * A .S file goes through the C preprocessor before the assembler (merlin -E,
  * which cargo xtask runs, or clang), and the preprocessor defines
@@ -30,6 +31,11 @@
 #define RISCV_SZPTR 8       /* a pointer's size in bytes */
 #define RISCV_LGPTR 3       /* log2 of it: an index shifted by it is an offset */
 
+/* This project's own: a 32-bit value in a register. */
+#define LWU lwu             /* load a 32-bit word, zero-extended */
+#define ADDW addw           /* add, the 32-bit sum kept sign-extended */
+#define ADDIW addiw         /* add an immediate, the same way */
+
 #elif __riscv_xlen == 32
 
 #define REG_L lw
@@ -38,6 +44,10 @@
 #define RISCV_PTR .word
 #define RISCV_SZPTR 4
 #define RISCV_LGPTR 2
+
+#define LWU lw
+#define ADDW add
+#define ADDIW addi
 
 #else
 #error "asm.h: __riscv_xlen is neither 32 nor 64 (is this a RISC-V -march?)"

@@ -72,12 +72,8 @@
 #include <asm.h>
 
 #if __riscv_xlen == 64
-#define ADDW addw       /* 32-bit sums, kept sign-extended */
-#define ADDIW addiw
 #define IP_FRAME 48     /* ip_header's frame: five registers, 16-byte aligned */
 #else
-#define ADDW add
-#define ADDIW addi
 #define IP_FRAME 32
 #endif
 
