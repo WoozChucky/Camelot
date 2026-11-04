@@ -559,12 +559,13 @@ fn a_shell_left_alone_after_its_client_has_gone_is_killed() {
     let mut a = session(&mut vm, addr);
     wait_console(&mut vm, &mut [], " connected\n", 1);
     a.send(b"exec sleep 5000\n");
-    let (session_pid, ps) = loop {
-        let ps = parse_ps(&console(&mut vm, "ps"));
-        if let Some(p) = ps.iter().find(|p| p.ppid == shd && p.name == "sleep") {
-            break (p.pid, ps);
-        }
-    };
+    let (session_pid, ps) = (0..20)
+        .find_map(|_| {
+            let ps = parse_ps(&console(&mut vm, "ps"));
+            let pid = ps.iter().find(|p| p.ppid == shd && p.name == "sleep")?.pid;
+            Some((pid, ps))
+        })
+        .unwrap_or_else(|| panic!("the session never became a sleep:\n{}", vm.out()));
     // The sleep is the session's process, shd's child, with nothing under it: no
     // shell is left but the console's.
     assert!(!ps.iter().any(|p| p.ppid == session_pid), "{ps:#?}");
