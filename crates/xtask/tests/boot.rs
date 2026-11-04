@@ -1,7 +1,10 @@
 //! Booting Camelot from its disk (issue #69, spec section 7, "Boot from disk"):
 //! the committed boot programs are what `cargo xtask boot` builds, and the root
 //! image of `cargo xtask fs`, made bootable, boots the kernel on Grail with no
-//! program, whose shell then runs programs from the disk's `/bin`. The image
+//! program, whose shell then runs programs from the disk's `/bin`. An RV64
+//! machine boots an RV64 boot block built with merlin-as and merlin-ld through
+//! the RV64 disk loader (#151; Camelot's bootloader and kernel are RV32 until
+//! #154). The image
 //! (`xtask::fs::IMAGE_SIZE` blocks, the size the spec gives) holds the disk kernel, which has no programs of its own (issue #108):
 //! it boots in a machine of the default 4 MiB, and panics when there is no shell
 //! to run.
@@ -44,10 +47,15 @@ fn committed_boot_programs_are_up_to_date() {
             p.elf_name()
         );
     }
-    // Grail's ROM is the committed loader, and mkfs takes the bootloader.
+    // Grail's ROM is the committed loader of each width, and mkfs takes the
+    // bootloader.
     assert_eq!(
         grail::boot::DISKBOOT_ELF,
         &std::fs::read(xtask::boot::DISKBOOT.elf_path(&root)).unwrap()[..]
+    );
+    assert_eq!(
+        grail::boot::DISKBOOT_RV64_ELF,
+        &std::fs::read(xtask::boot::DISKBOOT_RV64.elf_path(&root)).unwrap()[..]
     );
     let code = boot::boot_code(&xtask::boot::bootloader(&root).unwrap()).unwrap();
     assert!(code.len() <= boot::MAX_BOOT_CODE);
@@ -61,6 +69,169 @@ fn the_commands_match_the_build() {
             "merlin-as kernel/boot/boot.s -o target/boot/boot.o",
             "merlin-ld -T kernel/boot/link.ld target/boot/boot.o -o kernel/boot/boot.elf"
         ]
+    );
+    assert_eq!(
+        xtask::boot::DISKBOOT_RV64.commands(),
+        [
+            "merlin-as -march=rv64ima_zicsr_zifencei crates/grail/rom/diskboot-rv64.s \
+             -o target/boot/diskboot-rv64.o",
+            "merlin-ld -T crates/grail/rom/link.ld target/boot/diskboot-rv64.o \
+             -o crates/grail/rom/diskboot-rv64.elf"
+        ]
+    );
+    // The command lines in the loaders' comments are these.
+    let root = repo_root();
+    for p in [xtask::boot::DISKBOOT, xtask::boot::DISKBOOT_RV64] {
+        let source = std::fs::read_to_string(root.join(p.dir).join(p.source)).unwrap();
+        for cmd in p.commands() {
+            let cmd = cmd.replace("target/boot/", "");
+            assert!(source.contains(&format!("#   {cmd}\n")), "{}: {cmd}", p.source);
+        }
+    }
+}
+
+/// An RV64 boot block (#151's acceptance): built with merlin-as and merlin-ld,
+/// sealed into sectors 0 and 1 of a disk, it boots an RV64 machine with no
+/// program through the RV64 disk loader, and runs where the loader put it,
+/// with what the loader passes in a0-a2 and the 64-bit registers of version
+/// 2 of the devices (spec sections 7, 9.5 and 9.6).
+const RV64_BOOT_BLOCK: &str = r#"
+    .equ UART_BASE,    0x10000000
+    .equ SYS_RAM_SIZE, 0x10             # 64-bit
+    .equ BLK_CAPACITY, 0x00             # 64-bit
+    .equ BOOT_AREA,    0x10000
+
+    .text
+    .globl _start
+_start:
+    auipc s0, 0                         # where the ROM put the block
+    li    t0, BOOT_AREA                 # the boot area is the block's: a stack
+    add   sp, s0, t0                    # at its end, the end of RAM
+    mv    s1, a1                        # sysinfo
+    mv    s2, a2                        # the boot disk's registers
+    la    a0, s_at
+    call  puts
+    mv    a0, s0
+    call  put_hex
+    la    a0, s_hart
+    call  puts
+    csrr  a0, mhartid
+    call  put_hex
+    la    a0, s_ram
+    call  puts
+    ld    a0, SYS_RAM_SIZE(s1)
+    call  put_hex
+    la    a0, s_disk
+    call  puts
+    ld    a0, BLK_CAPACITY(s2)
+    call  put_hex
+    la    a0, s_sectors
+    call  puts
+    xcal.halt zero
+
+# puts(a0 = NUL-terminated string)
+puts:
+    li    t0, UART_BASE
+1:  lbu   t1, 0(a0)
+    beqz  t1, 2f
+    sb    t1, 0(t0)
+    addi  a0, a0, 1
+    j     1b
+2:  ret
+
+# put_hex(a0): "0x" and 16 hex digits.
+put_hex:
+    addi  sp, sp, -16
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
+    mv    s0, a0
+    li    t0, UART_BASE
+    li    t1, '0'
+    sb    t1, 0(t0)
+    li    t1, 'x'
+    sb    t1, 0(t0)
+    li    t2, 60                        # shift of the next digit
+1:  srl   t1, s0, t2
+    andi  t1, t1, 15
+    li    t3, 10
+    blt   t1, t3, 2f
+    addi  t1, t1, 'a' - 10 - '0'
+2:  addi  t1, t1, '0'
+    sb    t1, 0(t0)
+    addi  t2, t2, -4
+    bgez  t2, 1b
+    ld    s0, 0(sp)
+    ld    ra, 8(sp)
+    addi  sp, sp, 16
+    ret
+
+s_at:      .asciz "RV64 boot block at "
+s_hart:    .asciz ", hart "
+s_ram:     .asciz "\nRAM "
+s_disk:    .asciz ", disk 0 of "
+s_sectors: .asciz " sectors\n"
+"#;
+
+#[test]
+fn an_rv64_boot_block_boots_through_the_rv64_rom() {
+    // 4 GiB and 64 KiB of RAM: the boot area, the last 64 KiB, starts at
+    // 0x1_8000_0000, past 4 GiB, which only a 64-bit SYS_RAM_SIZE, BLK_DMA and
+    // pc reach.
+    let ram: u64 = (4 << 30) + (64 << 10);
+    let base = 0x8000_0000 + ram - u64::from(grail::boot::BOOT_AREA_SIZE);
+    let obj = merlin_as::assemble_to_elf_with(
+        RV64_BOOT_BLOCK,
+        &merlin_as::Options {
+            xlen: merlin_as::Xlen::Rv64,
+        },
+    )
+    .unwrap();
+    let opts = merlin_ld::Options {
+        script: Some(merlin_ld::ScriptSource {
+            name: "boot.ld".into(),
+            text: format!("ENTRY(_start)\nSECTIONS {{ . = {base:#x}; .text : {{ *(.text*) }} }}\n"),
+        }),
+        entry: None,
+    };
+    let input = merlin_ld::Input {
+        name: "boot.o".into(),
+        data: obj,
+    };
+    let linked = merlin_ld::link(&[input], &opts).unwrap();
+    assert!(linked.layout.warnings.is_empty(), "{:?}", linked.layout.warnings);
+    let elf = grail::elf::parse(&linked.elf).unwrap();
+    assert_eq!((elf.xlen, elf.entry), (grail::Xlen::Rv64, base));
+
+    // The loaded bytes, at the start of a sealed boot block.
+    let mut block = [0u8; grail::boot::BOOT_BLOCK_SIZE];
+    for seg in &elf.segments {
+        let at = (seg.paddr - base) as usize;
+        assert!(
+            at + seg.data.len() <= block.len() - 8,
+            "the program fits the block"
+        );
+        block[at..at + seg.data.len()].copy_from_slice(&seg.data);
+    }
+    grail::boot::seal(&mut block);
+    let mut disk = vec![0u8; 16 * 512];
+    disk[..block.len()].copy_from_slice(&block);
+
+    let config = MachineConfig {
+        xlen: grail::Xlen::Rv64,
+        ram_size: ram as usize,
+        disks: vec![DiskConfig::memory(disk)],
+        ..MachineConfig::default()
+    };
+    let mut m = Machine::new(config).unwrap();
+    m.boot_from_disk().unwrap();
+    m.cpu.bus.uart.capture = true;
+    assert_eq!(m.run(Some(100_000), |_| {}), RunResult::Exited(0));
+    assert_eq!(
+        String::from_utf8_lossy(&m.cpu.bus.uart.captured),
+        format!(
+            "RV64 boot block at {base:#018x}, hart 0x0000000000000000\n\
+             RAM {ram:#018x}, disk 0 of 0x0000000000000010 sectors\n"
+        )
     );
 }
 
@@ -281,6 +452,7 @@ fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     let root = repo_root();
     let read = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
     let rom = read("crates/grail/rom/diskboot.s");
+    let rom64 = read("crates/grail/rom/diskboot-rv64.s");
     let loader = read("kernel/boot/boot.s");
     let spec = read("docs/excalibur-spec.md");
     let fs_doc = read("docs/camelot-fs.md");
@@ -294,6 +466,24 @@ fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     assert_eq!(equ(&rom, "BOOT_AREA"), grail::boot::BOOT_AREA_SIZE);
     assert_eq!(equ(&rom, "EXIT_BOOT_FAILED"), grail::boot::EXIT_BOOT_FAILED);
     assert_eq!(u64::from(equ(&rom, "PARK_PC")), grail::bus::PARK_PC);
+    // The two loaders agree on everything but the registers' layout.
+    for name in [
+        "PARK_PC",
+        "RAM_BASE",
+        "BOOT_AREA",
+        "BOOT_SIZE",
+        "BOOT_SECTORS",
+        "BOOT_SIG",
+        "BOOT_MAGIC",
+        "EXIT_BOOT_FAILED",
+        "UART_BASE",
+        "SYSINFO_BASE",
+        "DISK0",
+        "CMD_READ",
+        "STATUS_DONE",
+    ] {
+        assert_eq!(equ(&rom64, name), equ(&rom, name), "{name}");
+    }
     assert!(spec.contains("exit code 0xFD") && spec.contains("0x544F_4F42"));
     // The fields the bootloader reads are where mkfs writes them.
     assert_eq!(equ(&loader, "KERNEL_SECTOR") as usize, boot::KERNEL_SECTOR_AT);

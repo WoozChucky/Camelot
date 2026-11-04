@@ -266,11 +266,12 @@ impl Bus {
 
     /// Fills the boot ROM to boot from disk 0 (spec section 7, "Boot from disk"): the
     /// stub and the park loop of [`Bus::set_boot_entry`], with the entry point at the
-    /// disk loader ([`boot::DISK_BOOT_PC`]), which this adds to the ROM.
+    /// disk loader ([`boot::DISK_BOOT_PC`]) of the machine's width, which this adds to
+    /// the ROM.
     pub fn set_disk_boot(&mut self) {
         self.set_boot_entry(boot::DISK_BOOT_PC);
         self.rom.resize((boot::DISK_BOOT_PC - BOOT_ROM_BASE) as usize, 0);
-        self.rom.extend(boot::disk_loader());
+        self.rom.extend(boot::disk_loader(self.xlen));
     }
 
     /// Hart `hart`'s LR/SC reservation.
@@ -684,7 +685,7 @@ mod tests {
             Some(0xf140_22f3),
             "csrr t0, mhartid"
         );
-        let loader = boot::disk_loader();
+        let loader = boot::disk_loader(Xlen::Rv32);
         let at = (boot::DISK_BOOT_PC - BOOT_ROM_BASE) as usize;
         assert_eq!(&bus.rom[at..], &loader[..]);
         assert!(

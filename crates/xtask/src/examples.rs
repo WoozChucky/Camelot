@@ -13,6 +13,7 @@
 //! source builds the same program with them, and the merlin-ld test fixtures
 //! (`cargo xtask ld-fixtures`) keep ld.lld's link of `hello` and `multiobj`.
 
+pub use merlin_as::Xlen;
 use std::path::{Path, PathBuf};
 
 /// One executable built from `examples/<dir>`.
@@ -161,6 +162,15 @@ pub struct Built {
     pub warnings: Vec<String>,
 }
 
+/// merlin-as's `-march=` option for `xlen`, with a space after it: none for
+/// RV32, merlin-as's default until #159.
+pub fn march_flag(xlen: Xlen) -> &'static str {
+    match xlen {
+        Xlen::Rv32 => "",
+        Xlen::Rv64 => "-march=rv64ima_zicsr_zifencei ",
+    }
+}
+
 /// The object name for a source: `hello.S` → `hello.o`.
 pub fn object_name(source: &str) -> String {
     let stem = source
@@ -180,26 +190,30 @@ pub fn build(root: &Path, ex: &Example) -> Result<Built, String> {
         ex.name,
         ex.sources,
         ex.script,
+        Xlen::Rv32,
     )
 }
 
 /// Assembles `sources` (in `dir`, which messages call `shown`) with merlin-as
-/// and links the objects with merlin-ld, with the linker script `script` in
-/// `dir` or the default layout, all in memory: how every program built with
-/// our own tools is made (the examples, the boot programs).
+/// for `xlen` and links the objects with merlin-ld, with the linker script
+/// `script` in `dir` or the default layout, all in memory: how every program
+/// built with our own tools is made (the examples, the boot programs).
+/// merlin-ld writes an ELF32 or an ELF64 executable as the objects are.
 pub fn assemble_and_link(
     dir: &Path,
     shown: &str,
     name: &str,
     sources: &[&str],
     script: Option<&str>,
+    xlen: Xlen,
 ) -> Result<Built, String> {
+    let as_opts = merlin_as::Options { xlen };
     let mut objects = Vec::new();
     for src in sources {
         let path = dir.join(src);
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let data = merlin_as::assemble_to_elf(&text).map_err(|errors| {
+        let data = merlin_as::assemble_to_elf_with(&text, &as_opts).map_err(|errors| {
             let shown = format!("{shown}/{src}");
             let lines: Vec<String> = errors
                 .iter()

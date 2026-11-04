@@ -635,27 +635,31 @@ fn narrow_stores_write_only_their_bytes() {
     }
 }
 
-/// The disk loader and the boot chain it starts are RV32 code until #151: an RV64
-/// machine refuses to boot from disk rather than running them.
+/// An RV64 machine boots from disk through the RV64 disk loader (#151): the ROM holds
+/// the loader of the machine's width, which the stub reaches through the entry
+/// doubleword (`ld`). crates/grail/tests/disk_boot.rs boots blocks on both widths.
 #[test]
-fn an_rv64_machine_does_not_boot_from_disk_yet() {
+fn an_rv64_machine_boots_from_disk_with_the_rv64_loader() {
     let disk = || grail::DiskConfig::memory(vec![0; 1 << 20]);
-    let mut m = Machine::new(MachineConfig {
-        xlen: Xlen::Rv64,
-        disks: vec![disk()],
-        ..MachineConfig::default()
-    })
-    .unwrap();
+    let at = (grail::boot::DISK_BOOT_PC - grail::bus::BOOT_ROM_BASE) as usize;
+    for xlen in [Xlen::Rv32, Xlen::Rv64] {
+        let mut m = Machine::new(MachineConfig {
+            xlen,
+            disks: vec![disk()],
+            ..MachineConfig::default()
+        })
+        .unwrap();
+        assert_eq!(m.boot_from_disk(), Ok(()));
+        assert_eq!(
+            &m.cpu.bus.rom[at..],
+            &grail::boot::disk_loader(xlen)[..],
+            "{xlen:?}"
+        );
+    }
     assert_eq!(
-        m.boot_from_disk(),
-        Err("booting from disk takes an RV32 machine: its boot code is RV32".into())
+        grail::elf::parse(grail::boot::DISKBOOT_RV64_ELF).unwrap().xlen,
+        Xlen::Rv64
     );
-    let mut m = Machine::new(MachineConfig {
-        disks: vec![disk()],
-        ..MachineConfig::default()
-    })
-    .unwrap();
-    assert_eq!(m.boot_from_disk(), Ok(()));
 }
 
 /// On a machine of several harts, loading an ELF64 program rebuilds the boot ROM for

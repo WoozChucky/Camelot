@@ -32,8 +32,9 @@ tasks:
                -o PATH: output file; --size N: the image's size in blocks (1 KiB each, default
                {image_size}), the filesystem filling what the kernel leaves;
                --no-boot: the filesystem alone, N blocks
-  boot         build the boot ROM's disk loader (crates/grail/rom/diskboot.elf) and
-               Camelot's bootloader (kernel/boot/boot.elf) with merlin-as + merlin-ld
+  boot         build the boot ROM's disk loaders (crates/grail/rom/diskboot.elf, and
+               diskboot-rv64.elf for RV64 machines) and Camelot's bootloader
+               (kernel/boot/boot.elf) with merlin-as + merlin-ld
                --check: build in memory and report stale .elf files instead of writing
                -v: print the equivalent merlin-as/merlin-ld command lines
   hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
