@@ -3,7 +3,7 @@
  * Booting. Grail starts hart 0 at the program's entry point and parks the
  * others in the boot ROM until an IPI (spec section 7, "Boot"). Hart 0 boots
  * the kernel alone, self-tests and all; then smp_boot() gives every other
- * hart a stack page (hart_stacks[], which _start reads) and wakes them all
+ * hart its stacks (hart_boot_sp[] and hart_sp[], which entry.S reads) and wakes them all
  * with one MCALL_IPI. Each comes through _start and start() as hart 0 did
  * (its own M-mode trap vector, scratch block and timer), skips clearing
  * .bss, and in S-mode runs hart_main(): its struct cpu, the kernel page
@@ -50,7 +50,8 @@
 #include "sysinfo.h"
 #include "trap.h"
 
-u32 hart_stacks[NCPU];
+uintptr hart_boot_sp[NCPU];
+uintptr hart_sp[NCPU];
 
 /* The harts running the kernel, a bit each. Bits are only ever added
  * (atomic_or), so it is read without a lock. */
@@ -63,7 +64,11 @@ static volatile u32 tlb_done[NCPU];
 /* Where the boot self-test maps its page: vmtest.c's alias address, whose
  * second-level table the kernel page table keeps, so the test adds no root
  * entry (which processes' page tables would miss, vm.h). */
+#if __riscv_xlen == 64
+#define SMP_TEST_VA (VM_TEST_AREA + 32 * LEVEL_SIZE(1))
+#else
 #define SMP_TEST_VA 0x40000000u
+#endif
 
 u32 harts_running(void) {
     return harts_up;
@@ -140,7 +145,7 @@ static int tlb_selftest(u32 others) {
         kprintf("smp: TLB self-test: out of memory\n");
         return 1;
     }
-    if (map_pages(kernel_pagetable, SMP_TEST_VA, (u32)(uintptr)page, PGSIZE, PTE_R | PTE_W) != 0) {
+    if (map_pages(kernel_pagetable, SMP_TEST_VA, pa(page), PGSIZE, PTE_R | PTE_W) != 0) {
         kprintf("smp: TLB self-test: out of memory\n");
         kfree(page);
         return 1;
@@ -176,12 +181,27 @@ int smp_boot(void) {
     u32 wake = 0;
     u32 count = 1;
     for (u32 i = 1; i < n; i++) {
-        u8 *stack = kalloc();
-        if (stack == NULL) {
+        /* A page for start() in M-mode and for the jump to the high half,
+         * at its physical address; on RV64 then the hart's own kernel stack
+         * (with its guard page, vm.h), which its scheduler runs on. */
+        u8 *boot = kalloc();
+#if __riscv_xlen == 64
+        u8 *stack = boot != NULL ? kstack_alloc() : NULL;
+        if (stack == NULL && boot != NULL) {
+            kfree(boot);
+            boot = NULL;
+        }
+#endif
+        if (boot == NULL) {
             kprintf("smp: no memory for hart %u's stack\n", i);
             break;
         }
-        hart_stacks[i] = (u32)(uintptr)stack + PGSIZE;
+        hart_boot_sp[i] = pa(boot) + PGSIZE;
+#if __riscv_xlen == 64
+        hart_sp[i] = (uintptr)stack + KSTACK_SIZE;
+#else
+        hart_sp[i] = hart_boot_sp[i];
+#endif
         wake |= 1u << i;
         count++;
     }

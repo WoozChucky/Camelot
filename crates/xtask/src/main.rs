@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use xtask::kernel::{Assembler, Build, Toolchain};
+use xtask::kernel::{Assembler, Build, Toolchain, Xlen};
 use xtask::{examples, repo_root, tools};
 
 /// The usage text, with `{image_size}` where [`usage`] puts the root image's default
@@ -24,9 +24,12 @@ tasks:
                no LLVM), with the user programs of kernel/user built the same way and embedded
                as data (their generated userprogs.s goes to target/kernel/obj with the objects),
                and kernel/kernel-disk.elf, the same kernel without the user programs built in
-               (it runs them from /bin: the kernel of a bootable root image).
+               (it runs them from /bin: the kernel of a bootable root image); then the same
+               for RV64, kernel/kernel-rv64.elf and kernel/kernel-disk-rv64.elf, a
+               higher-half kernel (no RV64 user programs yet)
                --cc clang: the reference build instead (clang -O2 + ld.lld from the official
                LLVM install, the user programs' C compiled by clang too), in target/kernel/clang
+               (RV64: target/kernel/clang/rv64)
   fs           build the root filesystem image (target/camelot-fs.img): kernel/fs/ at /,
                the user programs in /bin (merlin, merlin-as, merlin-ld; no LLVM), /dev/console,
                made bootable with kernel/boot/boot.s and kernel/kernel-disk.elf
@@ -55,10 +58,13 @@ kernel options:
   --cc merlin|clang  C compiler (default: merlin); clang is the reference build
   --clang PATH       clang to use (default: PATH, then C:\\Program Files\\LLVM\\bin)
   --lld PATH         ld.lld to use (default: next to clang, then the same search)
-  --as clang|merlin  assembler for the .s files with --cc clang (default: clang)
-  -o PATH            output file (default: kernel/kernel.elf; with --cc clang,
-                     target/kernel/clang/kernel.elf). The merlin build writes the disk
-                     kernel next to it, named with -disk (kernel-disk.elf)
+  --as clang|merlin  assembler for the .S files with --cc clang (default: clang)
+  --xlen 32|64       build only the RV32 or the RV64 kernel (default: both with merlin;
+                     with --cc clang, -o or --run, RV32)
+  -o PATH            output file (default: kernel/kernel.elf, kernel/kernel-rv64.elf; with
+                     --cc clang, target/kernel/clang/kernel.elf, .../clang/rv64/kernel.elf).
+                     The merlin build writes the disk kernel next to it, named with -disk
+                     (kernel-disk.elf, kernel-disk-rv64.elf)
   --run              run the result on Grail afterwards, with this terminal as its
                      console (type exit to stop it); exit with its exit code
   -v, --verbose      print each command (for merlin, its command-line equivalent)";
@@ -88,6 +94,7 @@ struct KernelArgs {
     out: Option<PathBuf>,
     run: bool,
     verbose: bool,
+    xlen: Option<Xlen>,
 }
 
 fn parse_kernel_args(args: &[String]) -> Result<KernelArgs, String> {
@@ -111,6 +118,13 @@ fn parse_kernel_args(args: &[String]) -> Result<KernelArgs, String> {
                     "merlin" => Cc::Merlin,
                     "clang" => Cc::Clang,
                     other => return Err(format!("unknown compiler {other} (merlin or clang)")),
+                })
+            }
+            "--xlen" => {
+                k.xlen = Some(match value("--xlen")?.as_str() {
+                    "32" => Xlen::Rv32,
+                    "64" => Xlen::Rv64,
+                    other => return Err(format!("unknown width {other} (32 or 64)")),
                 })
             }
             "--run" => k.run = true,
@@ -598,19 +612,45 @@ fn kernel(k: KernelArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // One width, or (the merlin build with no -o or --run) both.
+    let single = k.cc.unwrap_or_default() == Cc::Clang || out.is_some() || k.run;
+    let xlens: Vec<Xlen> = match k.xlen {
+        Some(x) => vec![x],
+        None if single => vec![Xlen::Rv32],
+        None => xtask::kernel::XLENS.to_vec(),
+    };
     let built = match k.cc.unwrap_or_default() {
         Cc::Merlin => {
             // The user programs' assembly (userprogs.s) is generated into the
             // object directory first: their images are part of the kernel.
-            Build {
-                out: out.unwrap_or_else(|| kernel_dir.join("kernel.elf")),
-                obj_dir: root.join("target").join("kernel").join("obj"),
-                kernel_dir,
-                toolchain: Toolchain::Merlin,
-                userprogs: None,
-                verbose: k.verbose,
+            let mut last = Err("no kernel built".to_string());
+            for &xlen in &xlens {
+                let obj = match xlen {
+                    Xlen::Rv32 => root.join("target").join("kernel").join("obj"),
+                    Xlen::Rv64 => root.join("target").join("kernel").join("rv64").join("obj"),
+                };
+                last = Build {
+                    out: out
+                        .clone()
+                        .unwrap_or_else(|| kernel_dir.join(xtask::kernel::kernel_elf(xlen))),
+                    obj_dir: obj,
+                    kernel_dir: kernel_dir.clone(),
+                    toolchain: Toolchain::Merlin,
+                    userprogs: None,
+                    verbose: k.verbose,
+                    xlen,
+                }
+                .run();
+                match &last {
+                    Ok(path) if xlens.len() > 1 && xlen != *xlens.last().unwrap() => {
+                        eprintln!("built {}", path.display());
+                        eprintln!("built {}", xtask::kernel::disk_kernel_path(path).display());
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
             }
-            .run()
+            last
         }
         Cc::Clang => {
             let Some(clang) = k.clang.or_else(|| tools::find("clang")) else {
@@ -634,10 +674,11 @@ fn kernel(k: KernelArgs) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            let work = root.join(xtask::kernel::REFERENCE_DIR);
+            let xlen = xlens[0];
+            let work = root.join(xtask::kernel::reference_dir(xlen));
             let out = out.unwrap_or_else(|| work.join("kernel.elf"));
             let assembler = k.assembler.unwrap_or(Assembler::Clang);
-            xtask::kernel::build_reference(&root, &clang, &lld, assembler, &work, &out, k.verbose)
+            xtask::kernel::build_reference_for(&root, &clang, &lld, assembler, &work, &out, k.verbose, xlen)
         }
     };
     let out = match built {
@@ -725,6 +766,7 @@ mod tests {
     fn all_options() {
         let k = parse(&[
             "--cc", "clang", "--clang", "c", "--lld", "l", "--as", "merlin", "-o", "k.elf", "--run", "-v",
+            "--xlen", "64",
         ])
         .unwrap();
         assert_eq!(
@@ -737,9 +779,12 @@ mod tests {
                 out: Some("k.elf".into()),
                 run: true,
                 verbose: true,
+                xlen: Some(Xlen::Rv64),
             }
         );
         assert_eq!(check_kernel_args(&k), Ok(()));
+        assert_eq!(parse(&["--xlen", "32"]).unwrap().xlen, Some(Xlen::Rv32));
+        assert!(parse(&["--xlen", "16"]).unwrap_err().contains("unknown width 16"));
         assert_eq!(
             parse(&["--as", "clang"]).unwrap().assembler,
             Some(Assembler::Clang)

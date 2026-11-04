@@ -1,8 +1,11 @@
-/* Camelot kernel: C entry point. entry.s sets up the stack and clears .bss,
- * start() drops to S-mode, then supervisor_entry calls kmain() on hart 0;
- * its return value becomes the exit code. After booting, kmain starts the
- * other harts, if the machine has any (smp.c), runs the user-space shell as
- * the first process, and returns when it exits. */
+/* Camelot kernel: C entry point. entry.S sets up the stack and clears .bss,
+ * start() drops to S-mode, then supervisor_entry calls kmain() on hart 0
+ * (on RV64 with paging already on, at the kernel's link addresses, through
+ * the early page table); its return value becomes the exit code. After
+ * booting, kmain starts the other harts, if the machine has any (smp.c),
+ * runs the user-space shell as the first process, and returns when it
+ * exits. The RV64 kernel has no user space yet (#155): it stops after the
+ * boot self-tests. */
 #include "bio.h"
 #include "blk.h"
 #include "blktest.h"
@@ -19,6 +22,7 @@
 #include "smp.h"
 #include "spinlock.h"
 #include "string.h"
+#include "sysinfo.h"
 #include "timer.h"
 #include "trap.h"
 #include "types.h"
@@ -71,13 +75,24 @@ static const char *const banner[] = {
 #define BOOT_FAULT_YIELD_HOLDING 14  /* a kernel process yields holding a lock */
 #define BOOT_FAULT_POP_UNMATCHED 15  /* pop_off with no push_off */
 #define BOOT_FAULT_POP_INTR_ON 16    /* pop_off with interrupts back on */
+/* RV64: a kernel process recurses until its stack runs into the guard page
+ * below it, which kernel_vec reports as a kernel stack overflow. */
+#define BOOT_FAULT_KSTACK_OVERFLOW 17
 
 /* Nothing is mapped below the boot ROM (spec section 7), so the kernel page
- * table doesn't map it either. */
+ * table doesn't map it either (on RV64 it maps nothing in the lower half). */
 #define UNMAPPED_ADDR 0x00000100
 
-/* A 4 MiB region with nothing in it (spec section 7), for BOOT_FAULT_MEGAPAGE. */
+/* A region with nothing in it, for BOOT_FAULT_MEGAPAGE: on RV32 a 4 MiB hole
+ * of the memory map (spec section 7), on RV64 what one root entry maps just
+ * past the direct map's room (Linux's KASAN shadow, unused here). */
+#if __riscv_xlen == 64
+#define EMPTY_REGION (PAGE_OFFSET + direct_map_size)
+#define EMPTY_REGION_PA 0
+#else
 #define EMPTY_REGION 0x50000000
+#define EMPTY_REGION_PA EMPTY_REGION
+#endif
 
 volatile u32 boot_fault = BOOT_FAULT_NONE;
 
@@ -111,9 +126,23 @@ static void kprintf_selftest(void) {
     expect(ksnprintf(buf, sizeof buf, "%5d", -42), "  -42");
     expect(ksnprintf(buf, sizeof buf, "%05d", -42), "-0042");
     expect(ksnprintf(buf, sizeof buf, "%2u", 12345u), "12345");
-    expect(ksnprintf(buf, sizeof buf, "%lu", 7u), "7");
+    expect(ksnprintf(buf, sizeof buf, "%lu", 7ul), "7");
+#if __riscv_xlen == 64
+    /* The 64-bit conversions (the RV32 kernel's count of checks stays what
+     * its tests expect). */
+    expect(ksnprintf(buf, sizeof buf, "%ld", -7l), "-7");
+    expect(ksnprintf(buf, sizeof buf, "%lx", 0xfffful), "ffff");
+    expect(ksnprintf(buf, sizeof buf, "%llx", 0x123456789abcdefull), "123456789abcdef");
+    expect(ksnprintf(buf, sizeof buf, "%llu", 18446744073709551615ull), "18446744073709551615");
+    expect(ksnprintf(buf, sizeof buf, "%lld", -9223372036854775807ll - 1), "-9223372036854775808");
+    expect(ksnprintf(buf, sizeof buf, "%016llx", 0x2aull), "000000000000002a");
+    expect(ksnprintf(buf, sizeof buf, "%lx", 0xffffffff80000000ul), "ffffffff80000000");
+    expect(ksnprintf(buf, sizeof buf, "%p", (void *)0xffffffff80000000ul), "0xffffffff80000000");
+    expect(ksnprintf(buf, sizeof buf, "%p", NULL), "0x0000000000000000");
+#else
     expect(ksnprintf(buf, sizeof buf, "%p", (void *)0x80000000u), "0x80000000");
     expect(ksnprintf(buf, sizeof buf, "%p", NULL), "0x00000000");
+#endif
     expect(ksnprintf(buf, sizeof buf, "%s", "excalibur"), "excalibur");
     expect(ksnprintf(buf, sizeof buf, "%4s|", "ab"), "  ab|");
     expect(ksnprintf(buf, sizeof buf, "%s", (const char *)NULL), "(null)");
@@ -160,9 +189,9 @@ static void wait_ticks(u32 count) {
 
 /* The BOOT_FAULT_ values from 5 up: each call should panic. */
 static void memory_misuse(void) {
-    u32 text = (u32)(uintptr)__text_start;
+    uintptr text = (uintptr)__text_start;
     if (boot_fault == BOOT_FAULT_REMAP) {
-        map_pages(kernel_pagetable, text, text, PGSIZE, PTE_R);
+        map_pages(kernel_pagetable, text, pa(text), PGSIZE, PTE_R);
     } else if (boot_fault == BOOT_FAULT_UNMAP) {
         /* Page 0 shares its 4 MiB region with the test device, so this finds
          * an invalid PTE in an existing second-level table. */
@@ -170,20 +199,37 @@ static void memory_misuse(void) {
     } else if (boot_fault == BOOT_FAULT_W_ONLY) {
         map_pages(kernel_pagetable, 0, 0, PGSIZE, PTE_W);
     } else if (boot_fault == BOOT_FAULT_MEGAPAGE) {
-        kernel_pagetable[VPN(EMPTY_REGION, 1)] = PA2PTE(EMPTY_REGION) | PTE_R | PTE_V;
+        /* A leaf in the root, mapping the region onto itself on RV32 and onto
+         * physical address 0 on RV64: walk() must not go through it. */
+        kernel_pagetable[VPN(EMPTY_REGION, PT_LEVELS - 1)] = PA2PTE(EMPTY_REGION_PA) | PTE_R | PTE_V;
         walk(kernel_pagetable, EMPTY_REGION, false);
     } else if (boot_fault == BOOT_FAULT_KFREE_UNALIGNED) {
         kfree((char *)kalloc() + 4);
     } else if (boot_fault == BOOT_FAULT_KFREE_KERNEL) {
         kfree(__text_start);
     } else if (boot_fault == BOOT_FAULT_KFREE_PAST_RAM) {
-        kfree((void *)(uintptr)(ram_base + ram_size));
+        kfree(va(ram_base + ram_size));
     } else {
         return;
     }
     kprintf("memory misuse %u didn't panic\n", boot_fault);
     failed++;
 }
+
+#if __riscv_xlen == 64
+/* BOOT_FAULT_KSTACK_OVERFLOW's kernel process: each call takes a few hundred
+ * bytes more of its stack, until the stack runs into its guard page. The
+ * volatile accesses keep the compiler from folding the recursion away. */
+static u32 recurse(u32 depth) {
+    volatile u8 frame[256];
+    frame[0] = (u8)depth;
+    return recurse(depth + 1) + frame[0];
+}
+
+static void overflow_stack(void) {
+    recurse(0);
+}
+#endif
 
 /* The lock the BOOT_FAULT_ values from 12 up misuse. */
 static struct spinlock fault_lock;
@@ -227,7 +273,18 @@ static void lock_misuse(void) {
 }
 
 static void deliberate_fault(void) {
-    if (boot_fault >= BOOT_FAULT_DOUBLE_ACQUIRE) {
+#if __riscv_xlen == 64
+    if (boot_fault == BOOT_FAULT_KSTACK_OVERFLOW) {
+        const char *err;
+        if (kproc_create("overflow", overflow_stack, &err) == NULL) {
+            kprintf("stack overflow: cannot start a process: %s\n", err);
+            failed++;
+            return;
+        }
+        scheduler();
+    }
+#endif
+    if (boot_fault >= BOOT_FAULT_DOUBLE_ACQUIRE && boot_fault <= BOOT_FAULT_POP_INTR_ON) {
         lock_misuse();
     } else if (boot_fault == BOOT_FAULT_ILLEGAL) {
         illegal_instruction();
@@ -237,13 +294,14 @@ static void deliberate_fault(void) {
         failed++;
     } else if (boot_fault == BOOT_FAULT_STORE_TEXT) {
         mmio_write32((uintptr)kmain, 0);
-        kprintf("store to kernel text at %p didn't fault\n", (void *)(uintptr)kmain);
+        kprintf("store to kernel text at %p didn't fault\n", (void *)kmain);
         failed++;
     } else {
         memory_misuse();
     }
 }
 
+#if __riscv_xlen == 32
 /* Starts the user-space shell (kernel/user/sh.c) as the first process and
  * runs processes until it and everything it left running have ended: from
  * the root filesystem's /bin, or the kernel's own copy (exec.h). Returns its
@@ -255,6 +313,7 @@ static int run_shell(void) {
     }
     return status;
 }
+#endif
 
 /* One line per disk blk_init() found, or says there is none. */
 static void print_disks(void) {
@@ -273,6 +332,8 @@ static void print_disks(void) {
 int kmain(void) {
     /* This hart's struct cpu, which every lock uses: first of all. */
     cpu_init();
+    /* The devices through the kernel's mappings of them (vm.h). */
+    sysinfo_map();
     uart_init();
     for (u32 i = 0; i < sizeof banner / sizeof banner[0]; i++)
         kprintf("%s", banner[i]);
@@ -286,13 +347,19 @@ int kmain(void) {
     /* The debug console works without any driver: show the failure count. */
     xcal_dbg((u32)failed);
 
-    /* Memory: every free page goes on the free list, then paging goes on.
-     * Everything from here runs with Sv32 translation. */
+    /* Memory: every free page goes on the free list, then paging goes on
+     * with the kernel page table. Everything from here runs with Sv32
+     * translation (on RV64 Sv48 or Sv39, which was on already, with the
+     * early page table: kvminithart() drops it). */
     kinit();
-    kprintf("ram: %u MiB at %p\n", ram_size >> 20, (void *)(uintptr)ram_base);
+    kprintf("ram: %lu MiB at 0x%lx\n", ram_size >> 20, ram_base);
     kvminit();
     kvminithart();
+#if __riscv_xlen == 64
+    kprintf("paging: on (%s)\n", pt_levels == 4 ? "Sv48" : "Sv39");
+#else
     kprintf("paging: on (Sv32)\n");
+#endif
     failed += vm_selftest();
 
     /* The locks of what interrupt handlers and processes share, before
@@ -316,7 +383,21 @@ int kmain(void) {
     /* The other harts, last: the self-tests above run their kernel
      * processes on hart 0 alone. */
     failed += smp_boot();
+#if __riscv_xlen == 64
+    /* How deep the kernel stacks have gone, against their KSTACK_SIZE: a
+     * quarter of it must be left. */
+    usize used = kstack_max_used();
+    kprintf("kstack: %lu of %lu bytes used at most\n", used, KSTACK_SIZE);
+    if (used > KSTACK_SIZE / 4 * 3) {
+        kprintf("kstack: less than a quarter of the stack left\n");
+        failed++;
+    }
+    /* No user space on RV64 yet (#155): the boot ends here. */
+    kprintf("user space: not on RV64 yet\n");
+    return failed;
+#else
     int status = run_shell();
     /* Failed self-tests are what the exit code reports first. */
     return failed != 0 ? failed : status;
+#endif
 }

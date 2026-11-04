@@ -1,18 +1,23 @@
 /* Privileged architecture: CSR bits (spec sections 5 and 6) and the CSR
- * accessors implemented in riscv.s (no inline asm, #15). */
+ * accessors implemented in riscv.S (no inline asm, #15).
+ *
+ * A CSR is a register's width, XLEN bits: 32 on RV32, 64 on RV64, so the
+ * accessors take and return a uintptr, as Linux's csr_read() an unsigned
+ * long. Writing a CSR back from a narrower value would clear its upper
+ * bits: mstatus's SXL and UXL (the S- and U-mode widths) and SD, say. */
 #ifndef CAMELOT_RISCV_H
 #define CAMELOT_RISCV_H
 
 #include "types.h"
 
 /* mstatus / sstatus */
-#define MSTATUS_SIE (1u << 1)
-#define MSTATUS_MIE (1u << 3)
-#define MSTATUS_SPIE (1u << 5)
-#define MSTATUS_MPIE (1u << 7)
-#define MSTATUS_SPP (1u << 8)
-#define MSTATUS_MPP_MASK (3u << 11)
-#define MSTATUS_MPP_S (1u << 11)
+#define MSTATUS_SIE (1ul << 1)
+#define MSTATUS_MIE (1ul << 3)
+#define MSTATUS_SPIE (1ul << 5)
+#define MSTATUS_MPIE (1ul << 7)
+#define MSTATUS_SPP (1ul << 8)
+#define MSTATUS_MPP_MASK (3ul << 11)
+#define MSTATUS_MPP_S (1ul << 11)
 #define SSTATUS_SIE MSTATUS_SIE
 #define SSTATUS_SPIE MSTATUS_SPIE
 #define SSTATUS_SPP MSTATUS_SPP
@@ -26,11 +31,11 @@
 #define IRQ_S_EXT 9
 #define IRQ_M_EXT 11
 
-#define MIE_MSIE (1u << IRQ_M_SOFT)
-#define MIE_MTIE (1u << IRQ_M_TIMER)
-#define SIE_SSIE (1u << IRQ_S_SOFT)
-#define SIE_SEIE (1u << IRQ_S_EXT)
-#define SIP_SSIP (1u << IRQ_S_SOFT)
+#define MIE_MSIE (1ul << IRQ_M_SOFT)
+#define MIE_MTIE (1ul << IRQ_M_TIMER)
+#define SIE_SSIE (1ul << IRQ_S_SOFT)
+#define SIE_SEIE (1ul << IRQ_S_EXT)
+#define SIP_SSIP (1ul << IRQ_S_SOFT)
 
 /* Exception causes (spec section 6). */
 #define CAUSE_INSTR_MISALIGNED 0
@@ -48,44 +53,57 @@
 #define CAUSE_LOAD_PAGE_FAULT 13
 #define CAUSE_STORE_PAGE_FAULT 15
 
-/* Top bit of xcause: the trap is an interrupt. */
-#define CAUSE_INTERRUPT 0x80000000u
+/* Top bit of xcause: the trap is an interrupt. Bit XLEN-1: 31 on RV32, 63
+ * on RV64. */
+#define CAUSE_INTERRUPT (1ul << (__riscv_xlen - 1))
 
+#if __riscv_xlen == 64
+/* satp: MODE in bits 63:60 (0 Bare, 8 Sv39, 9 Sv48), ASID in 59:44 (Camelot
+ * uses 0), and the root page table's physical page number in 43:0. */
+#define SATP_MODE_SHIFT 60
+#define SATP_MODE_SV39 (8ul << SATP_MODE_SHIFT)
+#define SATP_MODE_SV48 (9ul << SATP_MODE_SHIFT)
+#define SATP_MODE_MASK (0xful << SATP_MODE_SHIFT)
+#define SATP_PPN_MASK 0x00000fffffffffffull
+#else
 /* satp: MODE (bit 31) = 1 selects Sv32; PPN (bits 21:0) is the physical page
  * number of the root page table. */
-#define SATP_SV32 (1u << 31)
+#define SATP_SV32 (1ul << 31)
+#define SATP_MODE_MASK SATP_SV32
 #define SATP_PPN_MASK 0x003fffffu
+#endif
 
 /* M-mode CSRs (only usable before start() drops to S-mode). */
-u32 r_mstatus(void);
-void w_mstatus(u32 v);
-void w_mepc(u32 v);
-void w_mtvec(u32 v);
-void w_mscratch(u32 v);
-u32 r_medeleg(void);
-void w_medeleg(u32 v);
-u32 r_mideleg(void);
-void w_mideleg(u32 v);
-void w_mie(u32 v);
+uintptr r_mstatus(void);
+void w_mstatus(uintptr v);
+void w_mepc(uintptr v);
+void w_mtvec(uintptr v);
+void w_mscratch(uintptr v);
+uintptr r_medeleg(void);
+void w_medeleg(uintptr v);
+uintptr r_mideleg(void);
+void w_mideleg(uintptr v);
+void w_mie(uintptr v);
 /* Which counters S-mode may read: bit 1 (TM) is `time`. */
-void w_mcounteren(u32 v);
-#define MCOUNTEREN_TM (1u << 1)
+void w_mcounteren(uintptr v);
+#define MCOUNTEREN_TM (1ul << 1)
 
 /* S-mode CSRs. */
-u32 r_sstatus(void);
-void w_sstatus(u32 v);
-u32 r_sie(void);
-void w_sie(u32 v);
-u32 r_sip(void);
-void w_sip(u32 v);
-u32 r_stvec(void);
-void w_stvec(u32 v);
-u32 r_satp(void);
-void w_satp(u32 v);
+uintptr r_sstatus(void);
+void w_sstatus(uintptr v);
+uintptr r_sie(void);
+void w_sie(uintptr v);
+uintptr r_sip(void);
+void w_sip(uintptr v);
+uintptr r_stvec(void);
+void w_stvec(uintptr v);
+uintptr r_satp(void);
+void w_satp(uintptr v);
 
-/* The low word of `time` (rdtime), the CLINT's mtime: how S-mode reads the
- * clock, with no CLINT mapping (start() lets it, through mcounteren). */
-u32 r_time(void);
+/* `time` (rdtime), the CLINT's mtime, all 64 bits (on RV32 read as two
+ * halves, timeh and time, until the high half holds still): how S-mode reads
+ * the clock, with no CLINT mapping (start() lets it, through mcounteren). */
+u64 r_time(void);
 
 /* sfence.vma zero, zero: orders earlier page-table writes before later
  * translations, for every address. Grail has no TLB, so this costs nothing

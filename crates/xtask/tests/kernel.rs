@@ -2154,19 +2154,25 @@ fn kernel_c_stays_freestanding() {
 
 #[test]
 fn kernel_asm_is_merlin_dialect() {
-    // The .s files must use only what merlin-as understands (userprogs.s is
-    // generated, and assembled by merlin-as whenever the kernel is built).
+    // The assembly files must use only what merlin-as understands, once
+    // merlin has preprocessed them for each width (userprogs.s is generated,
+    // and assembled by merlin-as whenever the kernel is built).
     let sources = kernel::sources(&kernel_dir()).unwrap();
     let asm: Vec<_> = sources
         .iter()
         .filter(|s| s.lang == Lang::Asm && !s.is_generated())
         .collect();
     assert!(!asm.is_empty());
-    for s in asm {
-        let text = std::fs::read_to_string(kernel_dir().join(&s.name)).unwrap();
-        if let Err(errs) = merlin_as::assemble(&text) {
-            let errs: Vec<String> = errs.iter().map(|e| format!("{}: {e}", s.name)).collect();
-            panic!("merlin-as rejects kernel assembly:\n{}", errs.join("\n"));
+    for xlen in kernel::XLENS {
+        for s in &asm {
+            let text = kernel::assembly_of(&kernel_dir(), s, xlen).unwrap();
+            if let Err(errs) = merlin_as::assemble_with(&text, &merlin_as::Options { xlen }) {
+                let errs: Vec<String> = errs
+                    .iter()
+                    .map(|e| format!("{} ({xlen:?}): {e}", s.name))
+                    .collect();
+                panic!("merlin-as rejects kernel assembly:\n{}", errs.join("\n"));
+            }
         }
     }
 }
@@ -3702,10 +3708,12 @@ fn committed_kernel_is_what_our_toolchain_builds() {
     );
     let c = built.objects.iter().filter(|o| o.source.lang == Lang::C).count();
     assert!(c >= 20, "{c} C files");
+    // merlin's assembly of each C file, and the preprocessed text of each
+    // .S file, are kept: what merlin-as assembled.
     assert!(built
         .objects
         .iter()
-        .all(|o| o.asm.is_some() == (o.source.lang == Lang::C)));
+        .all(|o| o.asm.is_some() == (o.source.lang == Lang::C || o.source.is_preprocessed())));
 }
 
 /// The `| N | `name` | ...` rows of the table under `heading` in `doc`, as

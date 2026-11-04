@@ -19,6 +19,7 @@
 #include "spinlock.h"
 #include "sysinfo.h"
 #include "trap.h"
+#include "vm.h"
 
 /* The first field is the request state's lock, so the disk's address (what
  * the processes waiting for it sleep on) is also the lock's. */
@@ -53,9 +54,16 @@ void blk_init(void) {
         }
         struct disk *d = &disks[ndisks];
         initlock(&d->lock, "disk");
-        d->base = dev.base;
+        d->base = ioremap(dev.base, dev.size);
         d->irq = dev.irq;
+#if __riscv_xlen == 64
+        /* The kernel's sector numbers are 32-bit (the filesystem's block
+         * numbers are): it uses at most 2^32 - 1 sectors of a larger disk. */
+        u64 capacity = mmio_read64(d->base + BLK_CAPACITY);
+        d->capacity = capacity > 0xffffffffull ? 0xffffffffu : (u32)capacity;
+#else
         d->capacity = mmio_read32(d->base + BLK_CAPACITY);
+#endif
         d->read_only = (mmio_read32(d->base + BLK_FLAGS) & BLK_FLAG_READ_ONLY) != 0;
         d->busy = false;
         d->done = false;
@@ -105,10 +113,15 @@ static u32 request(u32 dev, u32 cmd, u32 sector, uintptr buf, u32 count) {
     }
     d->busy = true;
     d->done = false;
+    /* The device wants the buffer's physical address (it does not use the
+     * MMU): pa() of the kernel pointer, which on RV32 is the same number. */
+#if __riscv_xlen == 64
+    mmio_write64(d->base + BLK_SECTOR, sector);
+    mmio_write64(d->base + BLK_DMA, pa(buf));
+#else
     mmio_write32(d->base + BLK_SECTOR, sector);
-    /* The kernel's mappings are an identity map, so a kernel address is the
-     * physical address the device wants. */
-    mmio_write32(d->base + BLK_DMA, (u32)buf);
+    mmio_write32(d->base + BLK_DMA, pa(buf));
+#endif
     mmio_write32(d->base + BLK_COUNT, count);
     mmio_write32(d->base + BLK_CMD, cmd);
     /* Grail finishes the command during that store, so its interrupt is

@@ -41,6 +41,11 @@ extern struct spinlock uart_tx_lock;
 void uart_putc(char c);
 void uart_puts(const char *s);
 
+/* Writes a byte at the UART's physical address, with no lock: for the
+ * messages of the early boot code (setup_vm()), which runs with paging off
+ * before uart_init(). */
+void uart_putc_phys(char c);
+
 /* The receive interrupt handler, called by kernel_trap for PLIC_IRQ_UART:
  * moves bytes from RBR into the ring buffer until LSR.DR is clear. If the
  * buffer fills up first, it turns the receive interrupt off and leaves the

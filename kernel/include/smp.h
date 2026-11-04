@@ -14,10 +14,15 @@
 #include "types.h"
 #include "vm.h"
 
-/* The top of each hart's stack page, which _start (entry.s) loads into sp
- * on every hart but hart 0 (which has the boot stack): set by smp_boot()
- * before it wakes the hart. */
-extern u32 hart_stacks[NCPU];
+/* The stacks of every hart but hart 0 (which has the boot stack), set by
+ * smp_boot() before it wakes the hart. hart_boot_sp[i]: the physical address
+ * of the top of a page, which _start (entry.S) loads into sp for start() in
+ * M-mode, which does not translate, and the jump to the high half. hart_sp[i]:
+ * the top of the hart's kernel stack, which supervisor_entry loads once the
+ * hart runs at its link addresses, and its scheduler runs on (on RV64 a
+ * stack from kstack_alloc(), on RV32 the same page). */
+extern uintptr hart_boot_sp[NCPU];
+extern uintptr hart_sp[NCPU];
 
 /* Hart 0, after the boot self-tests: wakes the other harts, waits until
  * every one of them runs the kernel, checks that each answers a TLB
