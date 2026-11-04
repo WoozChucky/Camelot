@@ -627,8 +627,10 @@ far:    ret
 /// before, an empty section kept because `ADDR` names it), where the headers
 /// go (a page in, loaded in a segment of their own, in a read-only first
 /// section's, in a MEMORY region, without `.riscv.attributes`, without any
-/// section), a segment aligned past the page, and a section without inputs
-/// after the code.
+/// section), a segment aligned past the page, a section without inputs
+/// after the code, a run of RELRO sections, empty orphans (placed as ld.lld
+/// places them), and the file offsets of NOBITS sections and of an empty
+/// section whose segment is dropped.
 #[test]
 fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
     let objects = [object(SCRIPTED), object(FAR)];
@@ -674,8 +676,35 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
         // A section of only an assignment after the code, which is not
         // executable, and a segment aligned to 8 KiB.
         from("0x80000000", ".marker : { . += 4; } .big : ALIGN(8K) { . += 8; }"),
+        // A RELRO section, which ends its segment and counts a program
+        // header in the room.
+        "SECTIONS { . = 0x80000400; .text : { *(.text) } .rodata : { *(.rodata) } .two : { *(.rodata.two) }          .data.rel.ro : { *(.data) } .bss : { *(.bss) } /DISCARD/ : { *(.text.gone) } }"
+            .into(),
+        // An empty section alone in its run, which is dropped, and a gap
+        // before .bss.
+        "SECTIONS { . = 0x80000000; .text : { *(.text) } .x : { sym = .; } .data : { *(.data) }          . = . + 0x100; .bss : { *(.bss) } .rodata : { *(.rodata) *(.rodata.two) }          /DISCARD/ : { *(.text.gone) } }"
+            .into(),
     ];
     let mut links: Vec<(Vec<Vec<u8>>, String)> = scripts.into_iter().map(|s| (objects.to_vec(), s)).collect();
+    // Empty orphans of every rank, one of a script section's name, without
+    // MEMORY and with it.
+    let orphans = object(
+        ".section .ex, \"ax\"
+.p2align 4
+.section .er, \"a\"
+.section .ctors, \"aw\"
+         .section .sdata, \"aw\"
+.section .eb, \"aw\", @nobits
+.section .two, \"a\"
+",
+    );
+    for script in [
+        from("0x80000001", "foo = .;"),
+        "MEMORY { RAM (rwx) : ORIGIN = 0x80000000, LENGTH = 1M } SECTIONS { .text : { *(.text) } > RAM          .data : { *(.data) *(.rodata) *(.rodata.two) *(.bss) } > RAM /DISCARD/ : { *(.text.gone) } }"
+            .into(),
+    ] {
+        links.push((vec![objects[0].clone(), objects[1].clone(), orphans.clone()], script));
+    }
     // No section at all: the headers in the last page.
     links.push((
         vec![object("    .globl _start\n    .set _start, 0x80000000\n")],
@@ -829,6 +858,13 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         (
             vec![start.clone()],
             "SECTIONS { /DISCARD/ : AT(0x100) { *(.comment) } }",
+            "",
+        ),
+        // The headers in the read-only first section's segment, whose load
+        // address leaves no room below it for them.
+        (
+            vec![with_rodata.clone()],
+            "SECTIONS { . = 0x80000400; .rodata : AT(0x10) { *(.rodata) } .text : { *(.text) } }",
             "",
         ),
         // ADDR: of a section not placed yet, in its own ALIGN, of none.

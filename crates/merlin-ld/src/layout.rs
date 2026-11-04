@@ -9,7 +9,8 @@
 //! 3. Assign input sections to output sections: script order, first matching
 //!    `*(pattern)` wins, objects in command-line order, sections in file order.
 //!    An allocated input section no rule matches is an error if it is
-//!    non-empty or defines a global.
+//!    non-empty or defines a global; an empty one is an orphan, which goes
+//!    where ld.lld puts it ([`place_orphans`]).
 //! 4. Walk `SECTIONS` with the location counter, placing each input section at
 //!    its alignment and evaluating script assignments as they come. As in
 //!    ld.lld, an output section is dropped only when no input section (not
@@ -104,6 +105,14 @@ pub struct OutputSection {
     pub nobits: bool,
     /// Input sections in address order.
     pub inputs: Vec<InputRef>,
+}
+
+impl OutputSection {
+    /// ld.lld makes it RELRO ([`is_relro`]): a run of such sections ends its
+    /// `PT_LOAD` and has a `PT_GNU_RELRO` ([`crate::write::segments`]).
+    pub fn is_relro(&self) -> bool {
+        is_relro(&self.name, self.flags)
+    }
 }
 
 /// An input section placed in an output section.
@@ -651,6 +660,248 @@ fn riscv_attributes_kept(objects: &[Object], script: &Script) -> bool {
     any && !first_rule.is_some_and(|o| o.is_discard())
 }
 
+/// The names of the writable sections ld.lld makes RELRO (`isRelroSection`,
+/// on by default: `-z relro`): read-only once a dynamic loader has
+/// relocated them. A static executable has no loader to do that, but the
+/// sections still get a `PT_GNU_RELRO` and end their `PT_LOAD`
+/// ([`crate::write::segments`]). ld.lld's other RELRO sections are ones
+/// merlin-ld never makes: thread-local ones, `SHT_INIT_ARRAY` and the like
+/// (an allocated input must be `PROGBITS` or `NOBITS`), and the `.got`
+/// that ld.lld fills.
+const RELRO_NAMES: [&str; 11] = [
+    ".data.rel.ro",
+    ".bss.rel.ro",
+    ".ctors",
+    ".dtors",
+    ".jcr",
+    ".eh_frame",
+    ".fini_array",
+    ".init_array",
+    ".preinit_array",
+    ".dynamic",
+    ".toc",
+];
+
+/// Whether an output section of this name and these flags is RELRO in
+/// ld.lld: writable and named in [`RELRO_NAMES`].
+pub fn is_relro(name: &str, flags: u64) -> bool {
+    flags & SHF_WRITE != 0 && RELRO_NAMES.contains(&name)
+}
+
+/// ld.lld's sort rank of an output section (`getSectionRank`), for the links
+/// merlin-ld makes (RISC-V, no TLS, large or partitioned sections, no
+/// `--section-start`): read-only, executable, writable and executable,
+/// RELRO, writable, and within each `NOBITS` last. Only which bits two ranks
+/// differ in matters here, for placing an orphan ([`orphan_position`]).
+fn section_rank(name: &str, flags: u64, nobits: bool) -> u32 {
+    const NOT_ADDR_SET: u32 = 1 << 27; // no --section-start for it
+    const WRITE: u32 = 1 << 14;
+    const EXEC_WRITE: u32 = 1 << 13;
+    const EXEC: u32 = 1 << 12;
+    const RODATA: u32 = 1 << 11;
+    const NOT_LARGE: u32 = 1 << 9; // x86-64's large read-only data goes first
+    const NOT_RELRO: u32 = 1 << 8;
+    const NOT_TLS: u32 = 1 << 7;
+    const BSS: u32 = 1 << 6;
+    let mut rank = NOT_ADDR_SET;
+    rank |= match (flags & SHF_WRITE != 0, flags & SHF_EXECINSTR != 0) {
+        (false, false) => RODATA | NOT_LARGE,
+        (false, true) => EXEC,
+        (true, true) => EXEC_WRITE,
+        (true, false) if is_relro(name, flags) => WRITE | NOT_TLS,
+        (true, false) => WRITE | NOT_TLS | NOT_RELRO,
+    };
+    if nobits {
+        rank |= BSS;
+    }
+    // RISC-V: `.sdata` and `.sbss` next to each other, between the other
+    // data and the other NOBITS sections (for GP relaxation, as GNU ld).
+    if name == ".sdata" || (nobits && name != ".sbss") {
+        rank |= 1;
+    }
+    rank
+}
+
+/// The commands of `script` with what each `*(...)` item matched (`rules`),
+/// and the empty orphans (`orphans`, input sections no rule matched) placed
+/// among them as ld.lld places orphan sections (`addOrphanSections`,
+/// `sortSections`). Orphans of one name make one output section, the
+/// objects' in command-line order, or join the script's output section of
+/// that name, at its end. A new one goes next to the output section most like
+/// it ([`orphan_position`]), so that it shares its segment if it can; as
+/// any output section with an input, it is kept although it is empty,
+/// aligns the location counter and can make a segment of its own.
+/// The orphans that are not empty are errors (see "Placement" in the spec).
+#[allow(clippy::type_complexity)]
+fn place_orphans(
+    script: &Script,
+    rules: Vec<Vec<Vec<(usize, usize)>>>,
+    objects: &[Object],
+    orphans: &[(usize, usize)],
+) -> (Vec<Command>, Vec<Vec<Vec<(usize, usize)>>>) {
+    let mut cmds = script.commands.clone();
+    let mut rules = rules;
+    let in_script = cmds.len();
+    let mut new: Vec<(String, Vec<(usize, usize)>)> = Vec::new();
+    for &(oi, si) in orphans {
+        let name = &objects[oi].sections[si].name;
+        let named = cmds[..in_script]
+            .iter()
+            .position(|c| matches!(c, Command::Output(o) if !o.is_discard() && o.name == *name));
+        if let Some(ci) = named {
+            // ld.lld's recordSection: into the last `*(...)` if the section
+            // ends with one, else into a new one after its assignments.
+            let Command::Output(o) = &mut cmds[ci] else {
+                unreachable!()
+            };
+            if !matches!(o.items.last(), Some(Item::Input(_))) {
+                o.items.push(Item::Input(Vec::new()));
+                rules[ci].push(Vec::new());
+            }
+            rules[ci].last_mut().unwrap().push((oi, si));
+        } else if let Some((_, inputs)) = new.iter_mut().find(|(n, _)| n == name) {
+            inputs.push((oi, si));
+        } else {
+            new.push((name.clone(), vec![(oi, si)]));
+        }
+    }
+    for (name, inputs) in new {
+        cmds.push(Command::Output(script::OutputDesc {
+            name,
+            noload: false,
+            at: None,
+            align: None,
+            items: vec![Item::Input(Vec::new())],
+            region: None,
+            line: 0,
+        }));
+        rules.push(vec![inputs]);
+    }
+    // The rank of each output section with inputs (ld.lld's
+    // hasInputSections; not `/DISCARD/`, which is no output section).
+    let mut ranks: Vec<Option<u32>> = cmds
+        .iter()
+        .zip(&rules)
+        .map(|(c, r)| {
+            let Command::Output(o) = c else { return None };
+            let inputs: Vec<&(usize, usize)> = r.iter().flatten().collect();
+            if o.is_discard() || inputs.is_empty() {
+                return None;
+            }
+            let sec = |&&(oi, si): &&(usize, usize)| &objects[oi].sections[si];
+            let flags = inputs
+                .iter()
+                .map(sec)
+                .fold(SHF_ALLOC, |f, s| f | (s.flags & (SHF_WRITE | SHF_EXECINSTR)));
+            let nobits = o.noload || inputs.iter().map(sec).all(|s| s.is_nobits());
+            Some(section_rank(&o.name, flags, nobits))
+        })
+        .collect();
+    // The orphans in rank order (stable), then each moved to its place, with
+    // those of the same rank after it (ld.lld moves them in one go).
+    let mut order: Vec<usize> = (in_script..cmds.len()).collect();
+    order.sort_by_key(|&k| ranks[k]);
+    let tail: Vec<(Command, Vec<Vec<(usize, usize)>>, Option<u32>)> = order
+        .iter()
+        .map(|&k| (cmds[k].clone(), rules[k].clone(), ranks[k]))
+        .collect();
+    cmds.truncate(in_script);
+    rules.truncate(in_script);
+    ranks.truncate(in_script);
+    for (c, r, rank) in tail {
+        cmds.push(c);
+        rules.push(r);
+        ranks.push(rank);
+    }
+    // ld.lld's "horrible special case": a first `. = ...` before every
+    // section stays first, so that every section is after it.
+    let skip = |c: &Command| matches!(c, Command::Assign(a) if a.symbol.is_some());
+    let mut first = cmds.iter().position(|c| !skip(c)).unwrap_or(cmds.len());
+    if matches!(cmds.get(first), Some(Command::Assign(_))) {
+        first += 1;
+    }
+    let mut next = in_script;
+    while next < cmds.len() {
+        let rank = ranks[next];
+        let end = (next + 1..cmds.len())
+            .find(|&k| ranks[k] != rank)
+            .unwrap_or(cmds.len());
+        let pos = orphan_position(&cmds, &ranks, first, next, script.memory.is_some());
+        cmds[pos..end].rotate_right(end - next);
+        rules[pos..end].rotate_right(end - next);
+        ranks[pos..end].rotate_right(end - next);
+        next = end;
+    }
+    // An orphan's errors (an alignment past 2^64, an overflowed region) give
+    // the line of the command before it.
+    let mut line = 1;
+    for c in &mut cmds {
+        match c {
+            Command::Output(o) if o.line == 0 => o.line = line,
+            Command::Output(o) => line = o.line,
+            Command::Assign(a) => line = a.line,
+        }
+    }
+    (cmds, rules)
+}
+
+/// Where ld.lld's `findOrphanPos` puts the orphan `cmds[orphan]` among
+/// `cmds[first..orphan]`, given each command's rank if it is an output
+/// section with inputs: next to the one whose rank shares the most leading
+/// bits with its own (the first such one if the orphan ranks lower, the last
+/// one otherwise), after it if that one ranks no higher (always, with
+/// MEMORY), else before it; past symbol assignments, and at the very end if
+/// no output section with inputs follows.
+fn orphan_position(
+    cmds: &[Command],
+    ranks: &[Option<u32>],
+    first: usize,
+    orphan: usize,
+    memory: bool,
+) -> usize {
+    let sec = ranks[orphan].expect("an orphan has inputs");
+    // -1 for a command that is no output section with inputs.
+    let proximity = |rank: Option<u32>| rank.map_or(-1, |r| (r ^ sec).leading_zeros() as i32);
+    let mut best = 0;
+    let mut i = orphan;
+    for (j, &rank) in ranks.iter().enumerate().take(orphan).skip(first) {
+        let p = proximity(rank);
+        if p > best || (p == best && rank.is_some_and(|r| r <= sec)) {
+            best = p;
+            i = j;
+        }
+    }
+    if i == orphan {
+        return orphan;
+    }
+    if ranks[i].unwrap() <= sec || memory {
+        // After it, and after the sections that follow it as close.
+        let after = i + 1;
+        i = after;
+        for (j, &rank) in ranks.iter().enumerate().take(orphan).skip(after) {
+            if rank.is_none() {
+                continue;
+            }
+            if proximity(rank) != best {
+                break;
+            }
+            i = j + 1;
+        }
+    } else {
+        // Before it, and before the commands without inputs before it.
+        while i != first && ranks[i - 1].is_none() {
+            i -= 1;
+        }
+    }
+    if ranks[i..orphan].iter().all(Option::is_none) {
+        return orphan;
+    }
+    while i != orphan && matches!(&cmds[i], Command::Assign(a) if a.symbol.is_some()) {
+        i += 1;
+    }
+    i
+}
+
 pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
     // 1. Objects.
     let mut errors = Vec::new();
@@ -764,17 +1015,24 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
         }
         rules.push(per_item);
     }
+    // The empty sections no rule matches: orphans, placed as ld.lld places
+    // them ([`place_orphans`]).
+    let mut orphans = Vec::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
-            // An empty section can be left out, unless a global lives in it
-            // (that symbol would otherwise have no address).
+            if !sec.is_alloc() || assigned[oi][si] {
+                continue;
+            }
+            // An empty section is an orphan, unless a global lives in it.
             let defines_global = || {
                 obj.symbols
                     .iter()
                     .skip(1)
                     .any(|s| !s.is_local() && s.shndx as usize == si && s.shndx < SHN_LORESERVE)
             };
-            if sec.is_alloc() && !assigned[oi][si] && (sec.size > 0 || defines_global()) {
+            if sec.size == 0 && !defines_global() {
+                orphans.push((oi, si));
+            } else {
                 errors.push(err(format!(
                     "{}: section '{}' is not placed by {}",
                     obj.name,
@@ -788,6 +1046,9 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
             }
         }
     }
+    // The script's commands with the orphans in them, and what each one's
+    // `*(...)` items matched.
+    let (commands, rules) = place_orphans(&script, rules, &objects, &orphans);
 
     // 4. Addresses.
     let mut w = Walker {
@@ -828,7 +1089,7 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
     // they run. 0 until a section has an `AT`; every section after it
     // without one keeps its difference (see "Load addresses" above).
     let mut lma_offset: u64 = 0;
-    'commands: for (ci, cmd) in script.commands.iter().enumerate() {
+    'commands: for (ci, cmd) in commands.iter().enumerate() {
         w.current = None;
         match cmd {
             Command::Assign(a) => {
@@ -1166,6 +1427,12 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
         layout.warnings.push(format!(
             "cannot find entry symbol '{entry}'; defaulting to {shown}"
         ));
+    }
+
+    // 7. What the program headers would be: a placement without errors can
+    // still give the headers a load address below 0 (see write::check).
+    if errors.is_empty() {
+        errors.extend(crate::write::check(&layout).into_iter().map(err));
     }
 
     if errors.is_empty() {

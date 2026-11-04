@@ -7,7 +7,8 @@
  *   3. Input sections to output sections: script order, the first matching
  *      *(pattern) wins, objects in command-line order, sections in file
  *      order. An allocated input section no rule matches is an error if it
- *      is non-empty or defines a global.
+ *      is non-empty or defines a global; an empty one is an orphan, placed
+ *      as ld.lld places one (place_orphans).
  *   4. SECTIONS walked with the location counter, each input section placed
  *      at its alignment, the script's assignments evaluated as they come.
  *      As in ld.lld, an output section is dropped only when no input section
@@ -477,6 +478,250 @@ static int pattern_matches(struct item *it, const char *name) {
     return 0;
 }
 
+/* merlin-ld's RELRO_NAMES: the writable sections ld.lld makes RELRO, which
+ * end their PT_LOAD and have a PT_GNU_RELRO (write.c). */
+static const char *const relro_names[] = {".data.rel.ro", ".bss.rel.ro", ".ctors",     ".dtors",
+                                          ".jcr",         ".eh_frame",   ".fini_array", ".init_array",
+                                          ".preinit_array", ".dynamic",  ".toc"};
+
+int is_relro(const char *name, uint flags) {
+    if (!(flags & SHF_WRITE)) {
+        return 0;
+    }
+    for (uint i = 0; i < sizeof relro_names / sizeof relro_names[0]; i++) {
+        if (strcmp(name, relro_names[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ld.lld's sort rank of an output section (getSectionRank), as merlin-ld's
+ * section_rank: read-only, executable, writable and executable, RELRO,
+ * writable, NOBITS last within each. Never 0 (bit 27 is always set), so 0
+ * below means "no rank". */
+static uint section_rank(const char *name, uint flags, int nobits) {
+    uint rank = 1u << 27;
+    int w = (flags & SHF_WRITE) != 0, x = (flags & SHF_EXECINSTR) != 0;
+    if (!w && !x) {
+        rank |= 1u << 11 | 1u << 9;
+    } else if (x) {
+        rank |= w ? 1u << 13 : 1u << 12;
+    } else {
+        rank |= 1u << 14 | 1u << 7 | (is_relro(name, flags) ? 0 : 1u << 8);
+    }
+    if (nobits) {
+        rank |= 1u << 6;
+    }
+    /* RISC-V: .sdata and .sbss next to each other. */
+    if (strcmp(name, ".sdata") == 0 || (nobits && strcmp(name, ".sbss") != 0)) {
+        rank |= 1;
+    }
+    return rank;
+}
+
+/* The rank of a command if it is an output section with inputs (not
+ * /DISCARD/), else 0. */
+static uint command_rank(struct command *cmd, struct rule *r) {
+    if (!cmd->is_output || strcmp(cmd->out.name, DISCARD_NAME) == 0) {
+        return 0;
+    }
+    uint flags = SHF_ALLOC, ninputs = 0;
+    int nobits = 1;
+    for (uint it = 0; it < cmd->out.nitems; it++) {
+        for (uint k = 0; k < r[it].n; k++) {
+            struct section *s = &L->objects[r[it].in[k].obj].sections[r[it].in[k].sec];
+            flags |= s->flags & (SHF_WRITE | SHF_EXECINSTR);
+            nobits &= s->type == SHT_NOBITS;
+            ninputs++;
+        }
+    }
+    return ninputs == 0 ? 0 : section_rank(cmd->out.name, flags, cmd->out.noload || nobits);
+}
+
+static int leading_zeros(uint v) {
+    int n = 0;
+    while (n < 32 && !(v & (0x80000000u >> n))) {
+        n++;
+    }
+    return n;
+}
+
+static int proximity(uint rank, uint orphan) {
+    return rank == 0 ? -1 : leading_zeros(rank ^ orphan);
+}
+
+/* A symbol assignment (not `.`): an orphan goes after it. */
+static int is_symbol_assign(struct command *c) {
+    return !c->is_output && c->assign.symbol != NULL;
+}
+
+/* merlin-ld's orphan_position, ld.lld's findOrphanPos: where the orphan
+ * cmds[orphan] goes among cmds[first..orphan]. */
+static uint orphan_position(struct command *cmds, uint *rank, uint first, uint orphan, int memory) {
+    uint sec = rank[orphan];
+    int best = 0;
+    uint i = orphan;
+    for (uint j = first; j < orphan; j++) {
+        int p = proximity(rank[j], sec);
+        if (p > best || (p == best && rank[j] != 0 && rank[j] <= sec)) {
+            best = p;
+            i = j;
+        }
+    }
+    if (i == orphan) {
+        return orphan;
+    }
+    if (rank[i] <= sec || memory) {
+        /* After it, and after the sections that follow it as close. */
+        i++;
+        for (uint j = i; j < orphan; j++) {
+            if (rank[j] == 0) {
+                continue;
+            }
+            if (proximity(rank[j], sec) != best) {
+                break;
+            }
+            i = j + 1;
+        }
+    } else {
+        /* Before it, and before the commands without inputs before it. */
+        while (i != first && rank[i - 1] == 0) {
+            i--;
+        }
+    }
+    int any = 0;
+    for (uint j = i; j < orphan; j++) {
+        any |= rank[j] != 0;
+    }
+    if (!any) {
+        return orphan;
+    }
+    while (i != orphan && is_symbol_assign(&cmds[i])) {
+        i++;
+    }
+    return i;
+}
+
+/* Moves elements [mid, end) of an array of `size`-byte elements to `pos`,
+ * the ones in [pos, mid) after them (std::rotate). */
+static void rotate(void *base, uint size, uint pos, uint mid, uint end) {
+    uchar *b = base;
+    uchar *tmp = xcalloc((end - mid) * size + 1);
+    memcpy(tmp, b + mid * size, (end - mid) * size);
+    memmove(b + (pos + end - mid) * size, b + pos * size, (mid - pos) * size);
+    memcpy(b + pos * size, tmp, (end - mid) * size);
+    free(tmp);
+}
+
+/* merlin-ld's place_orphans: the empty orphans (input sections no rule
+ * matched) placed among the script's commands as ld.lld places orphans.
+ * Those of one name make one output section, or join the script's output
+ * section of that name, at its end; a new one goes next to the output
+ * section most like it (orphan_position). S.commands and rules are
+ * replaced. */
+static void place_orphans(struct pair *orphans, uint norphans) {
+    if (norphans == 0) {
+        return;
+    }
+    uint in_script = S.ncommands;
+    struct command *cmds = xcalloc((in_script + norphans + 1) * sizeof(struct command));
+    struct rule **r = xcalloc((in_script + norphans + 1) * sizeof(struct rule *));
+    memcpy(cmds, S.commands, in_script * sizeof(struct command));
+    memcpy(r, rules, in_script * sizeof(struct rule *));
+    uint n = in_script;
+    for (uint k = 0; k < norphans; k++) {
+        char *name = L->objects[orphans[k].obj].sections[orphans[k].sec].name;
+        int named = -1;
+        for (uint c = 0; c < in_script && named < 0; c++) {
+            if (cmds[c].is_output && strcmp(cmds[c].out.name, DISCARD_NAME) != 0 &&
+                strcmp(cmds[c].out.name, name) == 0) {
+                named = (int)c;
+            }
+        }
+        if (named >= 0) {
+            /* ld.lld's recordSection: into the last *(...) if the section
+             * ends with one, else into a new one after its assignments. */
+            struct output_desc *o = &cmds[named].out;
+            if (o->nitems == 0 || o->items[o->nitems - 1].is_assign) {
+                struct item *items = xcalloc((o->nitems + 1) * sizeof(struct item));
+                memcpy(items, o->items, o->nitems * sizeof(struct item));
+                struct rule *rr = xcalloc((o->nitems + 2) * sizeof(struct rule));
+                memcpy(rr, r[named], o->nitems * sizeof(struct rule));
+                o->items = items;
+                r[named] = rr;
+                o->nitems++;
+            }
+            rule_push(&r[named][o->nitems - 1], orphans[k].obj, orphans[k].sec);
+            continue;
+        }
+        uint c = in_script;
+        while (c < n && strcmp(cmds[c].out.name, name) != 0) {
+            c++;
+        }
+        if (c == n) {
+            cmds[n].is_output = 1;
+            cmds[n].out.name = name;
+            cmds[n].out.items = xcalloc(sizeof(struct item));
+            cmds[n].out.nitems = 1;
+            r[n] = xcalloc(2 * sizeof(struct rule));
+            n++;
+        }
+        rule_push(&r[c][0], orphans[k].obj, orphans[k].sec);
+    }
+    uint *rank = xcalloc((n + 1) * sizeof(uint));
+    for (uint c = 0; c < n; c++) {
+        rank[c] = command_rank(&cmds[c], r[c]);
+    }
+    /* The orphans in rank order (an insertion sort: stable). */
+    for (uint c = in_script + 1; c < n; c++) {
+        uint j = c;
+        while (j > in_script && rank[j - 1] > rank[c]) {
+            j--;
+        }
+        rotate(cmds, sizeof *cmds, j, c, c + 1);
+        rotate(r, sizeof *r, j, c, c + 1);
+        rotate(rank, sizeof *rank, j, c, c + 1);
+    }
+    /* ld.lld's "horrible special case": a first `. = ...` before every
+     * section stays first, so that every section is after it. */
+    uint first = 0;
+    while (first < n && is_symbol_assign(&cmds[first])) {
+        first++;
+    }
+    if (first < n && !cmds[first].is_output) {
+        first++;
+    }
+    /* Each orphan moved to its place, with those of the same rank after it. */
+    uint next = in_script;
+    while (next < n) {
+        uint end = next + 1;
+        while (end < n && rank[end] == rank[next]) {
+            end++;
+        }
+        uint pos = orphan_position(cmds, rank, first, next, S.has_memory);
+        rotate(cmds, sizeof *cmds, pos, next, end);
+        rotate(r, sizeof *r, pos, next, end);
+        rotate(rank, sizeof *rank, pos, next, end);
+        next = end;
+    }
+    /* An orphan's errors give the line of the command before it. */
+    uint line = 1;
+    for (uint c = 0; c < n; c++) {
+        if (!cmds[c].is_output) {
+            line = cmds[c].assign.line;
+        } else if (cmds[c].out.line == 0) {
+            cmds[c].out.line = line;
+        } else {
+            line = cmds[c].out.line;
+        }
+    }
+    free(rank);
+    S.commands = cmds;
+    S.ncommands = n;
+    rules = r;
+}
+
 static void assign_inputs(int have_script) {
     rules = xcalloc((S.ncommands + 1) * sizeof(struct rule *));
     for (uint c = 0; c < S.ncommands; c++) {
@@ -505,6 +750,9 @@ static void assign_inputs(int have_script) {
             }
         }
     }
+    /* The empty sections no rule matches: orphans (place_orphans). */
+    struct pair *orphans = NULL;
+    uint norphans = 0, caporphans = 0;
     for (uint oi = 0; oi < L->nobjects; oi++) {
         struct object *o = &L->objects[oi];
         for (uint si = 0; si < o->nsections; si++) {
@@ -512,19 +760,26 @@ static void assign_inputs(int have_script) {
             if (!is_alloc(sec) || sec->assigned) {
                 continue;
             }
-            /* An empty section can be left out, unless a global lives in it. */
+            /* An empty section is an orphan, unless a global lives in it. */
             int defines_global = 0;
             for (uint k = 1; k < o->nsymbols && !defines_global; k++) {
                 struct symbol *s = &o->symbols[k];
                 defines_global = !sym_is_local(s) && s->shndx == si && s->shndx < SHN_LORESERVE;
             }
-            if (sec->size > 0 || defines_global) {
+            if (sec->size == 0 && !defines_global) {
+                orphans = grow(orphans, &caporphans, norphans + 1, sizeof(struct pair));
+                orphans[norphans].obj = oi;
+                orphans[norphans].sec = si;
+                norphans++;
+            } else {
                 char *by = have_script ? fmt("linker script %s", script_name)
                                        : "the default layout (use a linker script with -T)";
                 error(fmt("%s: section '%s' is not placed by %s", o->name, sec->name, by));
             }
         }
     }
+    place_orphans(orphans, norphans);
+    free(orphans);
 }
 
 static uint capsections;
@@ -941,5 +1196,9 @@ int layout_build(struct object *objects, uint nobjects, const char *name, const 
     merge_warnings();
     undefined_references();
     entry_point(entry_opt);
+    /* What the program headers would be (write_check). */
+    if (errors.n == before) {
+        write_check(l);
+    }
     return errors.n == before;
 }

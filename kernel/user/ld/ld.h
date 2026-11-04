@@ -317,6 +317,8 @@ int object_symbol(struct layout *l, uint obj, uint sym, uint *out);
 int global_value(struct layout *l, const char *name, uint *out);
 int in_dropped_section(struct layout *l, uint obj, uint sym);
 int is_undefined_weak(struct layout *l, uint obj, uint sym);
+/* ld.lld makes an output section of this name and these flags RELRO. */
+int is_relro(const char *name, uint flags);
 /* S for a relocation in `obj` against `sym`: 1, or 0 with *err. */
 int reloc_symbol(struct layout *l, uint obj, uint sym, uint *out, char **err);
 
@@ -367,5 +369,7 @@ int relocate(struct layout *l, uchar ***sections, uchar ***debug);
 /* The ELF file, without the debug sections if `strip` (the same bytes as a
  * link without them: merlin-ld's strip_debug). */
 void write_elf(struct layout *l, uchar **sections, uchar **debug, int strip, struct buf *out);
+/* merlin-ld's write::check: adds the errors the program headers would have. */
+void write_check(struct layout *l);
 
 #endif

@@ -23,14 +23,19 @@
 //! file contents. A segment holding only empty sections is dropped. A
 //! section the script gives a load address (`AT(lma)`) always starts a
 //! segment of its own, as in ld.lld, and a segment's `p_paddr` is the load
-//! address of its first section (the same as `p_vaddr` without `AT`).
+//! address of its first section (the same as `p_vaddr` without `AT`). So
+//! does the section after a run of RELRO sections ([`crate::layout::is_relro`]:
+//! `.data.rel.ro`, `.ctors`, ..., which ld.lld makes read-only
+//! once a loader has relocated them), ld.lld's `relroEnd`.
 //!
 //! A segment's alignment (`p_align`) is the page size, 4 KiB, or more if one
 //! of its sections asks for more (`.p2align 13`, `ALIGN(8K)`): ld.lld's
 //! `PhdrEntry::add` raises it to every section's, so that the loader can map
 //! the segment with the section aligned. Its file offset is congruent to its
 //! address modulo that alignment (ld.lld's `computeFileOffset`), and the
-//! sections after the first follow at their distance from it.
+//! sections after the first follow at their distance from it, but for a
+//! `NOBITS` one, which is at the end of the file so far. An empty section
+//! whose segment is dropped is there too, aligned to its alignment.
 //!
 //! ## The headers
 //!
@@ -43,7 +48,8 @@
 //! 1. ld.lld makes its program headers before it knows which of them it
 //!    keeps, and sizes the table for all of them: `PT_PHDR`, a `PT_LOAD` for
 //!    the headers, one `PT_LOAD` per run of sections (an empty one too,
-//!    which it removes later), `PT_GNU_STACK`, and `PT_RISCV_ATTRIBUTES` if
+//!    which it removes later), a `PT_GNU_RELRO` per run of RELRO sections,
+//!    `PT_GNU_STACK`, and `PT_RISCV_ATTRIBUTES` if
 //!    it writes a `.riscv.attributes` section ([`Layout::riscv_attributes`]).
 //!    The first section joins the headers' `PT_LOAD` if it is read-only and
 //!    in no MEMORY region ([`Layout::memory`]): one `PT_LOAD` fewer.
@@ -64,8 +70,9 @@
 //!
 //! merlin-ld writes only the `PT_PHDR` and the `PT_LOAD`s, but it leaves the
 //! same room ([`Headers`]), so that every segment is where ld.lld puts it:
-//! after the table come zeros where ld.lld has `PT_GNU_STACK` and
-//! `PT_RISCV_ATTRIBUTES` (and the headers it counted but removed). The
+//! after the table come zeros where ld.lld has `PT_GNU_RELRO`,
+//! `PT_GNU_STACK` and `PT_RISCV_ATTRIBUTES` (and the headers it counted but
+//! removed). The
 //! `PT_PHDR` and the headers' `PT_LOAD` cover the whole room, as ld.lld's
 //! do. A program loaded from its segments (Grail, a bootloader) gets its
 //! headers too, read-only, when they are loaded: a link script keeps them
@@ -163,8 +170,10 @@ pub fn segments(layout: &Layout) -> (Headers, Vec<Segment>) {
     // (createPhdrs: a section joins a PT_LOAD only if it has the same flags
     // and MEMORY region, and the headers are in none; an `AT` on the first
     // section does not keep it out).
+    // A PT_GNU_RELRO for every run of RELRO sections counts too.
     let joins = !layout.memory && segs.first().is_some_and(|s| s.flags == PF_R);
-    let count = 2 + segs.len() - usize::from(joins) + 1 + usize::from(layout.riscv_attributes);
+    let relro = relro_runs(layout);
+    let count = 2 + segs.len() - usize::from(joins) + relro + 1 + usize::from(layout.riscv_attributes);
     let size = (class.ehdr_size() + class.phdr_size() * count) as u64;
 
     // 2. Are they loaded? Only if they fit between the start of the page of
@@ -238,8 +247,10 @@ fn runs(layout: &Layout) -> Vec<Segment> {
                 // Going backward can't be one segment. A section with its
                 // own load address starts one, as in ld.lld: one segment has
                 // one p_paddr, and the sections in it are loaded contiguously
-                // from there.
-                seg.flags != flags || s.addr < prev_end || s.at
+                // from there. So does the section after a run of RELRO
+                // sections (ld.lld's `relroEnd`), which a loader would make
+                // read-only once it has relocated them.
+                seg.flags != flags || s.addr < prev_end || s.at || (prev.is_relro() && !s.is_relro())
             }
         };
         if start_new {
@@ -265,6 +276,42 @@ fn runs(layout: &Layout) -> Vec<Segment> {
         }
     }
     segs
+}
+
+/// How many runs of consecutive RELRO output sections there are: ld.lld
+/// gives each a `PT_GNU_RELRO` (which merlin-ld does not write, but counts).
+fn relro_runs(layout: &Layout) -> usize {
+    let s = &layout.sections;
+    (0..s.len())
+        .filter(|&i| s[i].is_relro() && (i == 0 || !s[i - 1].is_relro()))
+        .count()
+}
+
+/// What the program headers of `layout` cannot be: ld.lld would write a
+/// first `PT_LOAD` whose load address range starts below 0. That happens
+/// when the read-only first section shares the headers' segment, which
+/// starts at the page below it (see "The headers"), but its load address
+/// (`AT`) is less than its distance from that page. ld.lld wraps `p_paddr`
+/// around (and cuts it to 32 bits for ELF32); as with a section's load
+/// address range, merlin-ld reports it.
+pub fn check(layout: &Layout) -> Vec<String> {
+    let (headers, segs) = segments(layout);
+    let Some(page) = headers.addr else {
+        return Vec::new();
+    };
+    let Some(seg) = segs.first().filter(|s| s.headers && !s.sections.is_empty()) else {
+        return Vec::new();
+    };
+    let s = &layout.sections[seg.sections[0]];
+    let below = s.addr - page;
+    if s.lma >= below {
+        return Vec::new();
+    }
+    vec![format!(
+        "the headers' load address range would start below 0: they share a segment with section {}, \
+         loaded at {:#x}, {below:#x} bytes after them",
+        s.name, s.lma
+    )]
 }
 
 fn put16(b: &mut Vec<u8>, v: u16) {
@@ -502,32 +549,45 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
     // holds ours: PT_PHDR if they are loaded, then the PT_LOADs.
     let mut out = vec![0u8; headers.size as usize];
 
-    // Segment contents.
-    let mut sec_offset = vec![0u64; layout.sections.len()];
-    let mut seg_offset = Vec::with_capacity(segs.len());
-    for seg in &segs {
-        let off = if seg.headers {
-            // The headers' segment maps the start of the file. Its
-            // sections, if any, are past the headers' room: the lowest
-            // section is at least that far into the page.
-            0
-        } else {
-            // Smallest offset >= current end with offset ≡ vaddr (mod p_align).
-            let (cur, align) = (out.len() as u64, seg.align);
-            let want = seg.vaddr % align;
-            cur + (want + align - cur % align) % align
-        };
-        pad_to(&mut out, off as usize);
+    // Segment contents, section by section, at the file offsets ld.lld's
+    // computeFileOffset gives them, the file's end so far being its `off`:
+    // - the first section of a segment: the first offset from there that is
+    //   congruent to its address modulo the segment's alignment (the
+    //   headers' segment maps the start of the file, its sections past the
+    //   room: the lowest section is at least that far into the page);
+    // - another NOBITS section: the end so far (it takes no file space);
+    // - another section: the segment's offset plus its distance from the
+    //   segment's start, as it is loaded;
+    // - a section in no segment (an empty one whose segment was dropped):
+    //   the end so far, aligned to the section's alignment.
+    let mut seg_of = vec![None; layout.sections.len()];
+    for (k, seg) in segs.iter().enumerate() {
         for &si in &seg.sections {
-            let s = &layout.sections[si];
-            let o = off + (s.addr - seg.vaddr);
-            sec_offset[si] = o;
-            if !s.nobits {
-                pad_to(&mut out, o as usize);
-                out.extend_from_slice(&images[si]);
-            }
+            seg_of[si] = Some(k);
         }
-        seg_offset.push(off);
+    }
+    let mut sec_offset = vec![0u64; layout.sections.len()];
+    // The headers' segment, the only one that can be without sections, is
+    // at offset 0.
+    let mut seg_offset = vec![0u64; segs.len()];
+    for (si, s) in layout.sections.iter().enumerate() {
+        let cur = out.len() as u64;
+        let o = match seg_of[si] {
+            Some(k) if segs[k].sections[0] == si && !segs[k].headers => {
+                // Smallest offset >= the end with offset ≡ vaddr (mod p_align).
+                let (vaddr, align) = (segs[k].vaddr, segs[k].align);
+                seg_offset[k] = cur + (vaddr % align + align - cur % align) % align;
+                seg_offset[k]
+            }
+            _ if s.nobits => cur,
+            None => cur.next_multiple_of(s.align.into()),
+            Some(k) => seg_offset[k] + (s.addr - segs[k].vaddr),
+        };
+        sec_offset[si] = o;
+        pad_to(&mut out, o as usize);
+        if !s.nobits {
+            out.extend_from_slice(&images[si]);
+        }
     }
     // Program headers. With the headers loaded, a PT_PHDR first: the table
     // in the headers' segment (the first one), all of the room after the
@@ -966,6 +1026,222 @@ _start:
                 after_headers(class, room, &own)
             );
         }
+    }
+
+    /// `src` assembled for `class` and linked with `script`, or the link's
+    /// errors.
+    fn link(class: Class, src: &str, script: &str) -> Result<Vec<u8>, Vec<String>> {
+        let xlen = match class {
+            Class::Elf32 => excalibur::Xlen::Rv32,
+            Class::Elf64 => excalibur::Xlen::Rv64,
+        };
+        let data = merlin_as::assemble_to_elf_with(src, &merlin_as::Options { xlen }).unwrap();
+        let opts = Options {
+            script: Some(ScriptSource {
+                name: "test.ld".into(),
+                text: script.into(),
+            }),
+            entry: None,
+        };
+        let input = Input {
+            name: "a.o".into(),
+            data,
+        };
+        crate::link(&[input], &opts)
+            .map(|l| l.elf)
+            .map_err(|e| e.into_iter().map(|e| e.0).collect())
+    }
+
+    /// The allocated sections of `src` linked with `script`: name, address,
+    /// file offset.
+    fn sections(class: Class, src: &str, script: &str) -> Vec<(String, u64, u64)> {
+        let linked = link(class, src, script).unwrap();
+        let elf = elf::Elf::parse(&linked).unwrap();
+        elf.sections
+            .iter()
+            .filter(|s| s.is_alloc())
+            .map(|s| (s.name.clone(), s.addr, s.offset))
+            .collect()
+    }
+
+    /// ld.lld's RELRO sections (`.data.rel.ro`, `.ctors`, ...): the section
+    /// after a run of them starts a PT_LOAD, and each run has a
+    /// PT_GNU_RELRO, which merlin-ld does not write but leaves room for.
+    #[test]
+    fn a_run_of_relro_sections_ends_its_segment_and_has_a_program_header() {
+        let src = "    .text\n    .globl _start\n_start:\n    nop\n    .section .data.rel.ro, \"aw\"\n    .word 1\n\
+                   \x20   .word 1\n    .data\n    .word 2\n";
+        let script = |start: u64| {
+            format!(
+                "SECTIONS {{ . = {start:#x}; .text : {{ *(.text) }} .data.rel.ro : {{ *(.data.rel.ro) }} \
+                 .data : {{ *(.data) }} }}"
+            )
+        };
+        let runs = |start: u64, off: u64| {
+            [
+                ("LOAD", off, start, start, 4, 4, "R E"),
+                ("LOAD", off + 4, start + 4, start + 4, 8, 8, "RW"),
+                ("LOAD", off + 12, start + 12, start + 12, 4, 4, "RW"),
+            ]
+        };
+        for class in [Class::Elf32, Class::Elf64] {
+            assert_eq!(
+                program_headers(class, src, &script(0x8000_0000)),
+                runs(0x8000_0000, 0x1000)
+            );
+            // PT_PHDR, the headers' PT_LOAD, three PT_LOADs, PT_GNU_RELRO,
+            // PT_GNU_STACK and PT_RISCV_ATTRIBUTES: 8.
+            let room = (class.ehdr_size() + 8 * class.phdr_size()) as u64;
+            assert_eq!(
+                program_headers(class, src, &script(0x8000_0400)),
+                after_headers(class, room, &runs(0x8000_0400, 0x400))
+            );
+        }
+
+        // Two runs, two PT_GNU_RELRO (ld.lld 23 makes one per run), and the
+        // section after each run starts a PT_LOAD.
+        let src = "    .text\n    .globl _start\n_start:\n    nop\n    .section .a, \"aw\"\n    .word 1\n\
+                   \x20   .section .b, \"aw\"\n    .word 1\n    .data\n    .word 2\n    .section .c, \"aw\"\n\
+                   \x20   .word 2\n";
+        let script =
+            "SECTIONS { . = 0x80000400; .text : { *(.text) } .ctors : { *(.a) } .data : { *(.data) } \
+                      .dtors : { *(.b) } .d2 : { *(.c) } /DISCARD/ : { *(.riscv.attributes) } }";
+        let class = Class::Elf64;
+        assert_eq!(
+            program_headers(class, src, script),
+            after_headers(
+                class,
+                64 + 9 * 56,
+                &[
+                    ("LOAD", 0x400, 0x8000_0400, 0x8000_0400, 4, 4, "R E"),
+                    ("LOAD", 0x404, 0x8000_0404, 0x8000_0404, 4, 4, "RW"),
+                    ("LOAD", 0x408, 0x8000_0408, 0x8000_0408, 8, 8, "RW"),
+                    ("LOAD", 0x410, 0x8000_0410, 0x8000_0410, 4, 4, "RW"),
+                ]
+            )
+        );
+    }
+
+    /// The headers share the read-only first section's segment, which
+    /// starts at their page: a load address (`AT`) lower than the section's
+    /// distance from that page would put them below 0.
+    #[test]
+    fn the_headers_load_address_cannot_go_below_0() {
+        let script = "SECTIONS { . = 0x80000400; .rodata : AT(0x10) { *(.rodata) } .text : { *(.text) } \
+                      .data : { *(.data) } }";
+        let want = "the headers' load address range would start below 0: they share a segment with section \
+                    .rodata, loaded at 0x10, 0x400 bytes after them";
+        for class in [Class::Elf32, Class::Elf64] {
+            assert_eq!(link(class, PROGRAM, script).unwrap_err(), [want]);
+        }
+        // Loaded high enough, they are at its load address less 0x400.
+        let script = script.replace("AT(0x10)", "AT(0x400)");
+        let [phdr, load, ..] = program_headers(Class::Elf32, PROGRAM, &script)[..] else {
+            panic!()
+        };
+        assert_eq!((phdr.3, load.3), (0x34, 0));
+    }
+
+    /// The file offsets of sections that take no file space, as ld.lld's
+    /// computeFileOffset gives them: a NOBITS section after the first of its
+    /// segment is at the end of the file so far, and an empty section whose
+    /// segment is dropped there too, aligned. Every number is ld.lld's.
+    #[test]
+    fn nobits_and_empty_sections_are_at_the_file_end_so_far() {
+        let src = format!("{PROGRAM}    .bss\n    .zero 8\n");
+        let class = Class::Elf32;
+        // .bss after a gap in the data's segment.
+        let script = "SECTIONS { . = 0x80000000; .text : { *(.text) } .data : { *(.data) } . = . + 0x100; \
+                      .bss : { *(.bss) } .rodata : { *(.rodata) } .empty : { *(.empty) } }";
+        let bss = sections(class, &src, script).into_iter().find(|s| s.0 == ".bss");
+        assert_eq!(bss, Some((".bss".into(), 0x8000_0108, 0x1008)));
+        // A NOLOAD section in the headers' segment.
+        let script = "SECTIONS { . = 0x80000400; .rodata (NOLOAD) : { *(.rodata) } .text : { *(.text) } \
+                      .data : { *(.data) } .bss : { *(.bss) } .empty : { *(.empty) } }";
+        let ro = sections(class, &src, script)
+            .into_iter()
+            .find(|s| s.0 == ".rodata");
+        assert_eq!(ro, Some((".rodata".into(), 0x8000_0400, 0x114)));
+        // An empty section alone in its run, which is dropped.
+        let script =
+            "SECTIONS { . = 0x80000000; .text : { *(.text) } .x : { sym = .; } .data : { *(.data) } \
+                      .bss : { *(.bss) } .rodata : { *(.rodata) } .empty : { *(.empty) } }";
+        let x = sections(class, &src, script).into_iter().find(|s| s.0 == ".x");
+        assert_eq!(x, Some((".x".into(), 0x8000_0004, 0x1004)));
+    }
+
+    /// An empty input section no rule matches, here `.empty` and the `.e*`
+    /// sections, is an orphan: ld.lld places it next to the output section
+    /// most like it (and before or after it by their ranks), as an output
+    /// section of its own, which is kept, aligns the location counter and
+    /// can make a segment of its own. Every order is ld.lld's.
+    #[test]
+    fn an_empty_orphan_goes_where_ld_lld_puts_it() {
+        let src = format!(
+            "{PROGRAM}    .bss\n    .zero 4\n    .section .er, \"a\"\n    .section .ex, \"ax\"\n    \
+             .p2align 4\n    .section .sdata, \"aw\"\n    .section .eb, \"aw\", @nobits\n    \
+             .section .ctors, \"aw\"\n"
+        );
+        let names = |class: Class, script: &str| -> Vec<String> {
+            sections(class, &src, script).into_iter().map(|s| s.0).collect()
+        };
+        let d = "/DISCARD/ : { *(.riscv.attributes) }";
+        for class in [Class::Elf32, Class::Elf64] {
+            let script = format!(
+                "SECTIONS {{ . = 0x80000000; .text : {{ *(.text) }} .data : {{ *(.data) *(.rodata) *(.bss) }} {d} }}"
+            );
+            assert_eq!(
+                names(class, &script),
+                [".empty", ".er", ".text", ".ex", ".ctors", ".data", ".sdata", ".eb"]
+            );
+            // With MEMORY, after the section most like it.
+            let script = format!(
+                "MEMORY {{ RAM (rwx) : ORIGIN = 0x80000000, LENGTH = 1M }} SECTIONS {{ .text : {{ *(.text) }} > RAM \
+                 .data : {{ *(.data) *(.rodata) *(.bss) }} > RAM {d} }}"
+            );
+            assert_eq!(
+                names(class, &script),
+                [".text", ".ex", ".empty", ".er", ".data", ".sdata", ".eb", ".ctors"]
+            );
+            // After a symbol assignment, which then does not see the
+            // alignment of .ex; an orphan of a script section's name joins it.
+            let script = format!(
+                "SECTIONS {{ . = 0x80000001; .text : {{ *(.text) }} foo = .; \
+                 .data : {{ *(.data) *(.rodata) *(.bss) }} .er : {{ *(.nothing) }} {d} }}"
+            );
+            let all = sections(class, &src, &script);
+            let at = |name: &str| all.iter().find(|s| s.0 == name).unwrap().1;
+            assert_eq!(
+                (at(".text"), at(".ex"), at(".data")),
+                (0x8000_0004, 0x8000_0010, 0x8000_0010)
+            );
+            let linked = link(class, &src, &script).unwrap();
+            let symbols = elf::Elf::parse(&linked).unwrap().symbols().unwrap();
+            let foo = symbols.iter().find(|s| s.name == "foo").unwrap().value;
+            assert_eq!(foo, 0x8000_0008);
+            assert!(all.iter().any(|s| s.0 == ".er"));
+        }
+        // ld.lld's evidence: .rodata and .data, and the empty .text, between
+        // them, a segment of its own, which it then drops; the headers are
+        // not loaded, as they would be without it.
+        let src =
+            "    .section .rodata, \"a\"\n    .globl _start\n_start:\n    .word 1\n    .data\n    .word 2\n";
+        let script = "SECTIONS { . = 0x800000e0; .rodata : { *(.rodata) } .data : { *(.data) } }";
+        assert_eq!(
+            program_headers(Class::Elf32, src, script),
+            [
+                ("LOAD", 0x10e0, 0x8000_00e0, 0x8000_00e0, 4, 4, "R"),
+                ("LOAD", 0x10e4, 0x8000_00e4, 0x8000_00e4, 4, 4, "RW"),
+            ]
+        );
+        assert_eq!(
+            sections(Class::Elf32, src, script),
+            [
+                (".rodata".into(), 0x8000_00e0, 0x10e0),
+                (".text".into(), 0x8000_00e4, 0x10e4),
+                (".data".into(), 0x8000_00e4, 0x10e4),
+            ]
+        );
     }
 
     /// Without any section ld.lld's lowest address is the top of the

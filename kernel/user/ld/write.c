@@ -17,15 +17,19 @@
  * at address gaps or after a NOBITS section: the file holds zeros for those
  * bytes. A segment of only empty sections is dropped. A section with an AT
  * of its own starts a segment, and a segment's p_paddr is its first
- * section's load address. Its p_align is the page, 4 KiB, or the largest
- * alignment of its sections if that is more (ld.lld's PhdrEntry::add).
+ * section's load address; so does the section after a run of RELRO sections
+ * (is_relro). Its p_align is the page, 4 KiB, or the largest alignment of
+ * its sections if that is more (ld.lld's PhdrEntry::add). A NOBITS section
+ * after the first of its segment, and an empty one whose segment is dropped
+ * (aligned), are at the end of the file so far (ld.lld's computeFileOffset).
  *
  * The headers, as ld.lld places them for a script without PHDRS:
  *
  *   1. ld.lld sizes its program header table for every header it makes
  *      before it knows which it keeps: PT_PHDR, a PT_LOAD for the headers,
- *      one PT_LOAD per run of sections (an empty one too), PT_GNU_STACK, and
- *      PT_RISCV_ATTRIBUTES if it writes a .riscv.attributes section. A
+ *      one PT_LOAD per run of sections (an empty one too), a PT_GNU_RELRO
+ *      per run of RELRO sections, PT_GNU_STACK, and PT_RISCV_ATTRIBUTES if
+ *      it writes a .riscv.attributes section. A
  *      read-only first section in no MEMORY region joins the headers'
  *      PT_LOAD: one PT_LOAD fewer.
  *   2. The headers are loaded if that room fits between the start of the
@@ -88,8 +92,10 @@ static uint runs(struct layout *l, struct segment *segs) {
             i64 prev_end = i64_add(i64_u(prev->addr), i64_u(prev->size));
             /* Going backward can't be one segment. A section with its own
              * load address starts one: a segment has one p_paddr, and its
-             * sections are loaded contiguously from there. */
-            start_new = segs[n - 1].flags != flags || i64_cmp(i64_u(s->addr), prev_end) < 0 || s->at;
+             * sections are loaded contiguously from there. So does the
+             * section after a run of RELRO sections (ld.lld's relroEnd). */
+            start_new = segs[n - 1].flags != flags || i64_cmp(i64_u(s->addr), prev_end) < 0 || s->at ||
+                        (is_relro(prev->name, prev->flags) && !is_relro(s->name, s->flags));
         }
         if (start_new) {
             memset(&segs[n], 0, sizeof segs[n]);
@@ -114,6 +120,19 @@ static uint runs(struct layout *l, struct segment *segs) {
     return n;
 }
 
+/* How many runs of consecutive RELRO output sections there are: ld.lld
+ * gives each a PT_GNU_RELRO (not written, but counted). */
+static uint relro_runs(struct layout *l) {
+    uint n = 0;
+    for (uint i = 0; i < l->nsections; i++) {
+        struct output_section *s = &l->sections[i];
+        if (is_relro(s->name, s->flags) && (i == 0 || !is_relro(s[-1].name, s[-1].flags))) {
+            n++;
+        }
+    }
+    return n;
+}
+
 /* The PT_LOAD segments into `out` (room for one more than the layout has
  * sections), the headers' one first if they are loaded, and where the
  * headers go into *h. Returns how many segments. */
@@ -125,11 +144,12 @@ static uint segments(struct layout *l, struct segment *out, struct headers *h) {
 
     /* 1. ld.lld's program header table, sized for every header it makes:
      * PT_PHDR, the headers' PT_LOAD, one PT_LOAD per run (an empty one
-     * too), PT_GNU_STACK and PT_RISCV_ATTRIBUTES. A read-only first section
-     * in no MEMORY region goes into the headers' PT_LOAD instead (an AT on
-     * it does not keep it out). */
+     * too), a PT_GNU_RELRO per run of RELRO sections, PT_GNU_STACK and
+     * PT_RISCV_ATTRIBUTES. A read-only first section in no MEMORY region
+     * goes into the headers' PT_LOAD instead (an AT on it does not keep it
+     * out). */
     int joins = !l->memory && n > 0 && segs[0].flags == PF_R;
-    uint count = 2 + n - (uint)joins + 1 + (uint)(l->riscv_attributes != 0);
+    uint count = 2 + n - (uint)joins + relro_runs(l) + 1 + (uint)(l->riscv_attributes != 0);
     h->size = 52 + 32 * count;
 
     /* 2. Are they loaded? Only if they fit between the start of the page of
@@ -185,6 +205,26 @@ static uint segments(struct layout *l, struct segment *out, struct headers *h) {
         }
     }
     return kept;
+}
+
+/* merlin-ld's write::check: ld.lld would give the headers' PT_LOAD a load
+ * address range that starts below 0, when the read-only first section
+ * shares it but is loaded (AT) less far up than its distance from the page
+ * the headers start. */
+void write_check(struct layout *l) {
+    struct segment *segs = xcalloc((l->nsections + 2) * sizeof(struct segment));
+    struct headers hd;
+    uint n = segments(l, segs, &hd);
+    if (hd.loaded && n > 0 && segs[0].headers && segs[0].n > 0) {
+        struct output_section *s = &l->sections[segs[0].first];
+        uint below = s->addr - hd.addr;
+        if (i64_cmp(s->lma, i64_u(below)) < 0) {
+            error(fmt("the headers' load address range would start below 0: they share a segment with section %s, "
+                      "loaded at 0x%x, 0x%x bytes after them",
+                      s->name, s->lma.lo, below));
+        }
+    }
+    free(segs);
 }
 
 /* A string table: names appended as they come (0 for the empty one). */
@@ -294,30 +334,50 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
     /* The room ld.lld leaves for the headers, which holds ours. */
     buf_pad(out, hd.size);
 
-    /* Segment contents. */
+    /* Segment contents, section by section, at the offsets ld.lld's
+     * computeFileOffset gives them, the end of the file so far being its
+     * `off`: the first section of a segment at the first offset from there
+     * congruent to its address modulo the segment's alignment (the headers'
+     * segment maps the start of the file); another NOBITS section at the end
+     * so far; another section at the segment's offset plus its distance from
+     * the segment's start; a section in no segment (an empty one whose
+     * segment was dropped) at the end so far, aligned to its alignment. */
     uint *sec_offset = xcalloc((l->nsections + 1) * sizeof(uint));
+    /* The headers' segment, the only one that can be without sections, is
+     * at offset 0. */
     uint *seg_offset = xcalloc((nsegs + 1) * sizeof(uint));
-    for (uint k = 0; k < nsegs; k++) {
-        uint off = 0;
-        if (!segs[k].headers) {
-            /* The smallest offset >= the end with offset = vaddr (mod
-             * p_align). The headers' segment maps the start of the file;
-             * its sections, if any, are past the room. */
-            uint cur = out->len, a = segs[k].align;
-            off = cur + (segs[k].vaddr % a + a - cur % a) % a;
-        }
-        buf_pad(out, off);
-        for (uint i = segs[k].first; i < segs[k].first + segs[k].n; i++) {
-            struct output_section *s = &l->sections[i];
-            uint o = off + (s->addr - segs[k].vaddr);
-            sec_offset[i] = o;
-            if (!s->nobits) {
-                buf_pad(out, o);
-                buf_put(out, images[i], s->size);
-            }
-        }
-        seg_offset[k] = off;
+    int *seg_of = xcalloc((l->nsections + 1) * sizeof(int));
+    for (uint i = 0; i < l->nsections; i++) {
+        seg_of[i] = -1;
     }
+    for (uint k = 0; k < nsegs; k++) {
+        for (uint i = segs[k].first; i < segs[k].first + segs[k].n; i++) {
+            seg_of[i] = (int)k;
+        }
+    }
+    for (uint i = 0; i < l->nsections; i++) {
+        struct output_section *s = &l->sections[i];
+        uint cur = out->len, o;
+        int k = seg_of[i];
+        if (k >= 0 && segs[k].n > 0 && segs[k].first == i && !segs[k].headers) {
+            /* The smallest offset >= the end with offset = vaddr (mod p_align). */
+            uint a = segs[k].align;
+            seg_offset[k] = cur + (segs[k].vaddr % a + a - cur % a) % a;
+            o = seg_offset[k];
+        } else if (s->nobits) {
+            o = cur;
+        } else if (k < 0) {
+            o = (cur + s->align - 1) / s->align * s->align;
+        } else {
+            o = seg_offset[k] + (s->addr - segs[k].vaddr);
+        }
+        sec_offset[i] = o;
+        buf_pad(out, o);
+        if (!s->nobits) {
+            buf_put(out, images[i], s->size);
+        }
+    }
+    free(seg_of);
     /* Program headers. With the headers loaded, a PT_PHDR first: the table
      * in the headers' segment (the first one), all of the room after the
      * ELF header, at the address and load address it has there. */
