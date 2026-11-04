@@ -60,16 +60,18 @@ clang --target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32 -c -mno-relax "
 ld.lld -Ttext=0x10000 -e add "$FIX/lines.o" -o "$FIX/lines.elf"
 rm "$FIX/lines.o"
 
-# RV64. relocs.S and hello.elf keep relaxation on, as on RV32 (R_RISCV_RELAX,
-# and what ld.lld makes of it); debug.c is code linked at 0x80000000, medany.
+# RV64, built as RV32 is: relocs.S, hello.o, hello.elf and debug.c with
+# relaxation on (R_RISCV_RELAX and the relocations it keeps, ADD/SUB pairs in
+# the debug sections, and what ld.lld makes of it), the rest without; debug.c
+# is code linked at 0x80000000, medany.
 CC64="clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -c"
 $CC64 -mno-relax "$FIX/rv64/isa.S" -o "$FIX/rv64/isa.o"
 $CC64 "$FIX/rv64/relocs.S" -o "$FIX/rv64/relocs.o"
-$CC64 -mno-relax -include examples/xcal.inc examples/hello/hello.S -o "$FIX/rv64/hello.o"
+$CC64 -include examples/xcal.inc examples/hello/hello.S -o "$FIX/rv64/hello.o"
 clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -nostdlib -static -fuse-ld=lld \
   -include examples/xcal.inc -T examples/hello/link.ld examples/hello/hello.S -o "$FIX/rv64/hello.elf"
 $CC64 -mno-relax "$FIX/rv64/misc.S" -o "$FIX/rv64/misc.o"
-$CC64 -mno-relax -mcmodel=medany -O1 -g -fdebug-compilation-dir=. "$FIX/debug.c" -o "$FIX/rv64/debug.o"
+$CC64 -mcmodel=medany -O1 -g -fdebug-compilation-dir=. "$FIX/debug.c" -o "$FIX/rv64/debug.o"
 $CC64 -mno-relax "$FIX/rv64/linked.S" -o "$FIX/rv64/linked.o"
 ld.lld -T "$FIX/rv64/linked.ld" "$FIX/rv64/linked.o" -o "$FIX/rv64/linked.elf"
 rm "$FIX/rv64/linked.o"
