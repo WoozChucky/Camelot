@@ -476,7 +476,7 @@ function vmPage(main, ctx, id) {
     actions,
     facts,
     el("h2", {}, "Screen"),
-    screenView(ctx, id),
+    ...screenView(ctx, id),
     el("h2", {}, "Console"),
     screen,
     consoleInput(ctx, id, error),
