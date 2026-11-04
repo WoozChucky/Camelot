@@ -469,7 +469,7 @@ impl Bus {
         if let Some((i, off)) = self.net_at(addr) {
             return self.nets[i].read(off, size);
         }
-        // 32-bit registers and the 64-bit `FB_SCANOUT`.
+        // 32-bit registers and the 64-bit `FB_SCANOUT` and `FB_CURSOR_ADDR`.
         if let Some(off) = Self::offset_in(addr, FB_CTRL_BASE, FB_CTRL_SIZE) {
             return self.fb.read(off, size);
         }
@@ -1211,6 +1211,62 @@ mod tests {
         assert_eq!(bus.device_deadline(), Some(49));
         bus.write(reg(fb::REG_IRQ), 4, 0).unwrap();
         assert_eq!(bus.device_deadline(), None, "no interrupt, nothing to wake");
+    }
+
+    /// The cursor plane through the bus, on an RV32 and an RV64 machine alike:
+    /// `FB_CURSOR_ADDR` is 64-bit at both widths (whole with an 8-byte access, or by its
+    /// halves), the other cursor registers 32-bit; what is written shows from the
+    /// vertical blank of a tick on, blended over the frame, and changes no frame.
+    #[test]
+    fn cursor_plane_on_the_bus_at_both_widths() {
+        use crate::framebuffer as fb;
+        for xlen in [Xlen::Rv32, Xlen::Rv64] {
+            let config = MachineConfig {
+                nominal_hz: 6000, // 100 ticks a frame
+                xlen,
+                ..MachineConfig::with_ram(1 << 20)
+            };
+            let mut bus = Bus::new(&config, Vec::new());
+            let reg = |r: u32| FB_CTRL_BASE + u64::from(r);
+            assert_eq!(bus.read(reg(fb::REG_VERSION), 4), Ok(2), "{xlen:?}");
+            assert_eq!(bus.read(reg(fb::REG_CURSOR_SIZE), 4), Ok(64 | 64 << 16));
+            let (a, b) = (RAM_BASE + 0x4000, RAM_BASE + 0x8000);
+            bus.write(a, 4, 0xff00_00ff).unwrap(); // image A's (0, 0): opaque blue
+            bus.write(b, 4, 0xff00_ff00).unwrap(); // image B's: opaque green
+            bus.write(VRAM_BASE + (5 * 640 + 4) * 4, 4, 0x0012_3456).unwrap();
+            bus.write(reg(fb::REG_CTRL), 4, 1).unwrap();
+
+            bus.write(reg(fb::REG_CURSOR_ADDR), 8, a).unwrap();
+            assert_eq!(bus.read(reg(fb::REG_CURSOR_ADDR), 8), Ok(a), "{xlen:?}");
+            bus.write(reg(fb::REG_CURSOR_POS), 4, 4 | 5 << 16).unwrap();
+            bus.write(reg(fb::REG_CURSOR_CTRL), 4, 1).unwrap();
+            assert_eq!(bus.read(reg(fb::REG_CURSOR_POS), 8), Err(BusFault), "{xlen:?}");
+            assert_eq!(
+                bus.write(reg(fb::REG_CURSOR_HOT), 8, 0),
+                Err(BusFault),
+                "{xlen:?}"
+            );
+            assert_eq!(
+                bus.frame().pixel(4, 5),
+                0x12_3456,
+                "not before the vertical blank"
+            );
+            for _ in 0..100 {
+                bus.tick();
+            }
+            assert_eq!(bus.frame().pixel(4, 5), 0x00_00ff, "{xlen:?}: image A");
+            assert_eq!(bus.frame().pixel(5, 5), 0x00_0000, "a clear pixel over black");
+            // B by its halves, as an RV32 driver writes it, low half first.
+            bus.write(reg(fb::REG_CURSOR_ADDR), 4, b & 0xffff_ffff).unwrap();
+            bus.write(reg(fb::REG_CURSOR_ADDR + 4), 4, b >> 32).unwrap();
+            assert_eq!(bus.read(reg(fb::REG_CURSOR_ADDR), 8), Ok(b));
+            for _ in 0..100 {
+                bus.tick();
+            }
+            assert_eq!(bus.frame().pixel(4, 5), 0x00_ff00, "{xlen:?}: image B");
+            assert_eq!(bus.read(reg(fb::REG_STATUS), 4), Ok(0));
+            assert_eq!((bus.fb.cursor_updates, bus.fb.shown()), (2, 0), "{xlen:?}");
+        }
     }
 
     #[test]

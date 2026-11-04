@@ -676,6 +676,14 @@ impl Window {
             // GDI could not read on Windows until it is committed.
             crate::ram::touch(pixels);
         }
+        // The cursor plane blended over the frame, in a copy of it: GDI draws the one
+        // picture.
+        let composited = frame.composited();
+        let frame = Frame {
+            pixels: composited.as_deref(),
+            cursor: None,
+            ..frame
+        };
         // SAFETY: a valid window handle; the DC is released before returning.
         unsafe {
             let mut client = RECT::default();
@@ -1362,6 +1370,7 @@ mod tests {
                 width: fw,
                 height: fh,
                 pixels: Some(&pixels),
+                cursor: None,
             };
             stretch_matches(frame);
         }
@@ -1578,6 +1587,7 @@ mod tests {
             width,
             height,
             pixels: None,
+            cursor: None,
         }
     }
 
@@ -1607,6 +1617,7 @@ mod tests {
                 width: FB_WIDTH,
                 height: FB_HEIGHT,
                 pixels: Some(&pixels),
+                cursor: None,
             });
             std::thread::sleep(std::time::Duration::from_millis(16));
         }

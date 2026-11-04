@@ -76,6 +76,7 @@ impl View for WindowView {
             width: screen.width(),
             height: screen.height(),
             pixels: Some(screen.pixels()),
+            cursor: None,
         });
     }
 

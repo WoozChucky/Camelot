@@ -4,11 +4,12 @@
 //! Everything happens on the calling thread, and the window belongs to this call, not to
 //! a process-wide singleton: each machine can have its own. The CPU runs until the
 //! program shows a new frame (writes `FB_PRESENT`, makes a modeset that takes effect, or
-//! a page flip takes effect at a vertical blank) or a slice of `SLICE` steps is done (or, with a real-time
-//! clock, until it is ahead of the wall clock); then the window's messages are pumped
-//! and it is redrawn on a present, on a repaint request, or when ~16 ms of host time
-//! have passed since the last redraw (~60 Hz). The window shows what the framebuffer
-//! scans out, VRAM or a buffer in RAM, at the size of its mode. Keys typed into the
+//! a page flip takes effect at a vertical blank), a vertical blank moves, shows or hides
+//! the cursor, or a slice of `SLICE` steps is done (or, with a real-time clock, until it
+//! is ahead of the wall clock); then the window's messages are pumped and it is redrawn
+//! on any of these, on a repaint request, or when ~16 ms of host time have passed since
+//! the last redraw (~60 Hz). The window shows what the framebuffer scans out, VRAM or a
+//! buffer in RAM, at the size of its mode, with the cursor plane over it. Keys typed into the
 //! keyboard device, and the mouse over it the pointer device, at the same points,
 //! between slices.
 
@@ -78,7 +79,9 @@ pub fn run(
             break Outcome::Program(RunResult::StepLimit);
         }
         steps += m.run_for(budget, &mut trace);
-        let presented = m.cpu.bus.fb.take_present();
+        // A new frame, or the cursor moved over the old one: either way the picture
+        // changed, so it is dumped and drawn.
+        let presented = m.cpu.bus.fb.take_present() | m.cpu.bus.fb.take_cursor_update();
         if presented {
             dump(m)?;
         }
