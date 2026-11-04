@@ -659,8 +659,9 @@ impl Window {
         self.state.frame.get()
     }
 
-    /// Stretches the frame over the client area; a frame with no pixels (the display
-    /// off) paints it black. A frame of another size than the last one (the guest
+    /// Stretches the frame, its cursor plane blended over it, over the client area; a
+    /// frame with no pixels (the display off) paints it black. A frame of another size
+    /// than the last one (the guest
     /// changed modes) resizes the window to show it pixel for pixel, as QEMU's window
     /// does, unless the user has maximized or minimized it; the mouse is mapped to the
     /// new size from then on.

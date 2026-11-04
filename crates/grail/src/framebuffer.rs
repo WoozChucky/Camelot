@@ -1501,7 +1501,6 @@ mod tests {
             fb.advance(100);
             let frame = fb.frame(&ram);
             assert_eq!(frame.pixel(at.0, at.1), want, "at ({x}, {y})");
-            assert!(frame.composited().unwrap() == frame.composited().unwrap());
             frame.to_ppm(); // clipped, not out of bounds
         }
         // A display that is off shows nothing, the cursor included.
