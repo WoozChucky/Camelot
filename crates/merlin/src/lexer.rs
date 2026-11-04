@@ -14,15 +14,17 @@
 //! Trigraphs (`??=`...), which C99 rewrites before anything else, are
 //! errors wherever they would change what merlin reads.
 //!
-//! Integer literals get their C type in [`finish`] (C99 6.4.4.1, with `int`
-//! and `long` both 32 bits): a decimal literal is `int` if it fits, else it
-//! would be `long long`, which merlin rejects; a hex or octal one is `int` or
-//! else `unsigned int`; `u`, `l` and `ul` suffixes pick from the unsigned
-//! and long types the same way. Character literals are `int`s holding the
-//! byte (plain `char` is unsigned, so `'ÿ'` is 255). String literals are
-//! bytes, with the escapes C has.
+//! Integer literals get their C type in [`finish`] (C99 6.4.4.1): the first
+//! of the candidate types that holds the value. A decimal literal is `int`,
+//! else `long`; a hex or octal one is `int`, `unsigned int`, `long` or
+//! `unsigned long`; `u`, `l` and `ul` suffixes start the list further on.
+//! Which types hold a value depends on the target: `long` is 32 bits on
+//! ILP32, so `2147483648` would be `long long` there, which merlin rejects,
+//! and 64 bits on LP64, where it is a `long`. Character literals are `int`s
+//! holding the byte (plain `char` is unsigned, so `'ÿ'` is 255). String
+//! literals are bytes, with the escapes C has.
 
-use crate::types::IntKind;
+use crate::types::{IntKind, Xlen};
 use crate::{Error, Pos};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,7 +212,7 @@ impl PpToken {
 pub enum Tok {
     Ident(String),
     /// An integer or character literal: its value (in range for its type) and type.
-    Num(i64, IntKind),
+    Num(i128, IntKind),
     /// A string literal's bytes, escapes decoded, without the terminating NUL.
     Str(Vec<u8>),
     Kw(Kw),
@@ -499,9 +501,9 @@ pub fn lex_pp(src: &str, file: u32) -> Result<(Vec<PpToken>, Pos), Error> {
 
 /// Lexes a whole translation unit without preprocessing it: [`lex_pp`]
 /// then [`finish`]. A `#` is an error.
-pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
+pub fn lex(src: &str, x: Xlen) -> Result<Vec<Token>, Error> {
     let (toks, end) = lex_pp(src, 0)?;
-    finish(toks, end)
+    finish(toks, end, x)
 }
 
 /// Turns preprocessing tokens into the parser's tokens (C99 translation
@@ -509,7 +511,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
 /// keywords become keywords, numbers integer constants with their C type,
 /// character constants and string literals their bytes. What is left of the
 /// preprocessor's syntax (`#`, `##`) and invalid tokens are errors.
-pub fn finish(toks: Vec<PpToken>, end: Pos) -> Result<Vec<Token>, Error> {
+pub fn finish(toks: Vec<PpToken>, end: Pos, x: Xlen) -> Result<Vec<Token>, Error> {
     let mut out = Vec::with_capacity(toks.len() + 1);
     for t in toks {
         let tok = match &t.kind {
@@ -522,11 +524,11 @@ pub fn finish(toks: Vec<PpToken>, end: Pos) -> Result<Vec<Token>, Error> {
                     Tok::Ident(t.text.clone())
                 }
             }
-            PpKind::Number => number(&t.text, t.pos)?,
+            PpKind::Number => number(&t.text, t.pos, x)?,
             PpKind::Char => {
                 let bytes = decode(&t.text, t.pos)?;
                 match bytes[..] {
-                    [b] => Tok::Num(b as i64, IntKind::Int),
+                    [b] => Tok::Num(b.into(), IntKind::Int),
                     [] => return Err(Error::new(t.pos, "empty character constant")),
                     _ => {
                         return Err(Error::new(
@@ -563,8 +565,9 @@ pub fn finish(toks: Vec<PpToken>, end: Pos) -> Result<Vec<Token>, Error> {
     Ok(out)
 }
 
-/// An integer constant and its C type, from a preprocessing number.
-pub fn number(text: &str, pos: Pos) -> Result<Tok, Error> {
+/// An integer constant and its C type on the target, from a preprocessing
+/// number.
+pub fn number(text: &str, pos: Pos, x: Xlen) -> Result<Tok, Error> {
     let IntLit {
         value,
         decimal,
@@ -583,8 +586,8 @@ pub fn number(text: &str, pos: Pos) -> Result<Tok, Error> {
     };
     // Past 64 bits it fits none of them either.
     let value = value.unwrap_or(u64::MAX);
-    match candidates.iter().find(|k| value <= k.range().1 as u64) {
-        Some(&k) => Ok(Tok::Num(value as i64, k)),
+    match candidates.iter().find(|k| i128::from(value) <= k.range(x).1) {
+        Some(&k) => Ok(Tok::Num(value.into(), k)),
         None => Err(Error::new(
             pos,
             format!(
@@ -733,14 +736,14 @@ mod tests {
     use IntKind::*;
 
     fn toks(s: &str) -> Vec<Tok> {
-        lex(s).unwrap().into_iter().map(|t| t.tok).collect()
+        lex(s, Xlen::Rv32).unwrap().into_iter().map(|t| t.tok).collect()
     }
 
     fn err(s: &str) -> String {
-        lex(s).unwrap_err().to_string()
+        lex(s, Xlen::Rv32).unwrap_err().to_string()
     }
 
-    fn num(s: &str) -> (i64, IntKind) {
+    fn num(s: &str) -> (i128, IntKind) {
         match toks(s)[..] {
             [Tok::Num(v, k), Tok::Eof] => (v, k),
             ref t => panic!("{s}: {t:?}"),
@@ -861,6 +864,29 @@ mod tests {
     }
 
     #[test]
+    fn integer_literal_types_on_lp64() {
+        let num = |s: &str| match lex(s, Xlen::Rv64).unwrap()[..] {
+            [Token {
+                tok: Tok::Num(v, k), ..
+            }, _] => (v, k),
+            ref t => panic!("{s}: {t:?}"),
+        };
+        // `long` is 64 bits: what does not fit `int` (or `unsigned int`) is
+        // `long` (or `unsigned long`).
+        assert_eq!(num("2147483647"), (0x7fff_ffff, Int));
+        assert_eq!(num("2147483648"), (0x8000_0000, Long));
+        assert_eq!(num("0x80000000"), (0x8000_0000, UInt));
+        assert_eq!(num("4294967296u"), (1 << 32, ULong));
+        assert_eq!(num("0x100000000"), (1 << 32, Long));
+        assert_eq!(num("9223372036854775807"), (i64::MAX.into(), Long));
+        assert_eq!(num("0x8000000000000000"), (1 << 63, ULong));
+        assert_eq!(num("18446744073709551615u"), (u64::MAX.into(), ULong));
+        assert_eq!(num("0xffffffffL"), (0xffff_ffff, Long));
+        // A decimal literal past LONG_MAX would be long long in C.
+        assert!(lex("9223372036854775808", Xlen::Rv64).is_err());
+    }
+
+    #[test]
     fn character_literals() {
         assert_eq!(num("'a'"), (97, Int));
         assert_eq!(num("'\\n'"), (10, Int));
@@ -913,7 +939,7 @@ mod tests {
         assert_eq!(toks("\"é\""), [Tok::Str("é".as_bytes().to_vec()), Tok::Eof]);
         assert_eq!(err("\"abc\nd\""), "1:1: unterminated string literal");
         assert_eq!(err("\"abc"), "1:1: unterminated string literal");
-        let t = lex(r#"x = "a\tb";"#).unwrap();
+        let t = lex(r#"x = "a\tb";"#, Xlen::Rv32).unwrap();
         assert_eq!(t[2].text, r#""a\tb""#);
         assert_eq!(t[2].describe(), "string literal");
     }
@@ -957,7 +983,7 @@ mod tests {
 
     #[test]
     fn tokens_keep_their_source_text() {
-        let t = lex("0x7f 017 x1 <= 'a' 10u").unwrap();
+        let t = lex("0x7f 017 x1 <= 'a' 10u", Xlen::Rv32).unwrap();
         let text: Vec<&str> = t.iter().map(|t| t.text.as_str()).collect();
         assert_eq!(text, ["0x7f", "017", "x1", "<=", "'a'", "10u", ""]);
         assert_eq!(t[0].describe(), "'0x7f'");
@@ -968,7 +994,7 @@ mod tests {
     #[test]
     fn comments_and_positions() {
         let src = "// line comment\n  /* block\n comment */ x /**/ +\n\t1";
-        let t = lex(src).unwrap();
+        let t = lex(src, Xlen::Rv32).unwrap();
         let got: Vec<(Tok, Pos, Pos)> = t.into_iter().map(|t| (t.tok, t.pos, t.end)).collect();
         assert_eq!(
             got,
@@ -1027,7 +1053,7 @@ mod tests {
         // the next line to it, anywhere: in literals, tokens, comments.
         assert_eq!(toks("char *s = \"a\\\nb\";")[4], Tok::Str(b"ab".to_vec()));
         assert_eq!(toks("char *s = \"a\\ \r\nb\";")[4], Tok::Str(b"ab".to_vec()));
-        let t = lex("in\\\nt x;").unwrap();
+        let t = lex("in\\\nt x;", Xlen::Rv32).unwrap();
         assert_eq!(t[0].tok, Tok::Kw(Kw::Int));
         assert_eq!(t[0].text, "int");
         // Positions are where the characters were written.
@@ -1085,7 +1111,7 @@ mod tests {
         );
         assert_eq!(t[1].text, "'t @");
         assert_eq!(
-            finish(t, end).unwrap_err().to_string(),
+            finish(t, end, Xlen::Rv32).unwrap_err().to_string(),
             "1:4: unterminated character literal"
         );
         // Files are told apart by number.
@@ -1095,7 +1121,7 @@ mod tests {
 
     #[test]
     fn crlf_line_endings() {
-        let t = lex("int\r\nx").unwrap();
+        let t = lex("int\r\nx", Xlen::Rv32).unwrap();
         assert_eq!(t[1].pos, Pos::new(2, 1));
     }
 }

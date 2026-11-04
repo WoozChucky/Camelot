@@ -639,6 +639,7 @@ fn multi_file_programs_run_in_grail() {
             include_dirs: case.include.iter().cloned().collect(),
             macros: Vec::new(),
             debug: None,
+            xlen: merlin::types::Xlen::Rv32,
         };
         let mut objs = vec![pipeline.crt0.clone()];
         for c in &case.c_files {
@@ -716,6 +717,7 @@ fn kernel_sources_compile() {
             include_dirs: includes,
             macros: Vec::new(),
             debug: None,
+            xlen: merlin::types::Xlen::Rv32,
         };
         for f in files {
             count += 1;

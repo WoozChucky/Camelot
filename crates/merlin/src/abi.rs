@@ -31,7 +31,7 @@
 //! even-register alignment the psABI asks of those never comes up, and
 //! without floating point the hardware-float rules do not apply.
 
-use crate::types::{FuncType, Type};
+use crate::types::{ptr_size, FuncType, Type, Xlen};
 
 /// How one argument (or result) travels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,27 +54,28 @@ impl Pass {
     }
 }
 
-/// How a value of type `ty` (complete, not void) travels.
-pub fn classify(ty: &Type) -> Pass {
+/// How a value of type `ty` (complete, not void) travels on the target.
+pub fn classify(ty: &Type, x: Xlen) -> Pass {
     if !ty.is_record() {
         return Pass::Scalar;
     }
-    match ty.size().expect("a complete struct or union") {
-        0..=4 => Pass::Words(1),
-        5..=8 => Pass::Words(2),
+    let word = ptr_size(x);
+    match ty.size(x).expect("a complete struct or union") {
+        n if n <= word => Pass::Words(1),
+        n if n <= 2 * word => Pass::Words(2),
         _ => Pass::Ref,
     }
 }
 
 /// Whether a function returning `ret` gets the address for its result as a
-/// hidden first argument (a struct or union bigger than 8 bytes).
-pub fn returns_in_memory(ret: &Type) -> bool {
-    ret.is_record() && classify(ret) == Pass::Ref
+/// hidden first argument (a struct or union bigger than two registers).
+pub fn returns_in_memory(ret: &Type, x: Xlen) -> bool {
+    ret.is_record() && classify(ret, x) == Pass::Ref
 }
 
 /// Where each named parameter of a function goes: see [`call_arguments`].
-pub fn arguments(f: &FuncType) -> (Vec<(usize, Pass)>, usize) {
-    call_arguments(&f.ret, &f.params)
+pub fn arguments(f: &FuncType, x: Xlen) -> (Vec<(usize, Pass)>, usize) {
+    call_arguments(&f.ret, &f.params, x)
 }
 
 /// Where each argument of a call goes, given the function's result type and
@@ -82,11 +83,11 @@ pub fn arguments(f: &FuncType) -> (Vec<(usize, Pass)>, usize) {
 /// its first word (words below [`ARG_REGS`] are registers, `aN` for word N)
 /// and how it is passed, plus the number of words taken in all (counting the
 /// hidden result address). Every type must be complete.
-pub fn call_arguments(ret: &Type, args: &[Type]) -> (Vec<(usize, Pass)>, usize) {
-    let mut next = usize::from(returns_in_memory(ret));
+pub fn call_arguments(ret: &Type, args: &[Type], x: Xlen) -> (Vec<(usize, Pass)>, usize) {
+    let mut next = usize::from(returns_in_memory(ret, x));
     let mut out = Vec::with_capacity(args.len());
     for a in args {
-        let pass = classify(a);
+        let pass = classify(a, x);
         out.push((next, pass));
         next += pass.registers();
     }
@@ -109,25 +110,25 @@ mod tests {
 
     fn record(size: u32) -> Type {
         let r = Record::new(false, Some("s".into()), Pos::default());
-        r.complete(vec![(
-            "bytes".into(),
-            Type::array(Type::Int(IntKind::Char), Some(size)),
-        )]);
+        r.complete(
+            vec![("bytes".into(), Type::array(Type::Int(IntKind::Char), Some(size)))],
+            Xlen::Rv32,
+        );
         Type::Record(r)
     }
 
     #[test]
     fn classification() {
-        assert_eq!(classify(&Type::INT), Pass::Scalar);
-        assert_eq!(classify(&Type::ptr(Type::Void)), Pass::Scalar);
-        assert_eq!(classify(&record(1)), Pass::Words(1));
-        assert_eq!(classify(&record(4)), Pass::Words(1));
-        assert_eq!(classify(&record(5)), Pass::Words(2));
-        assert_eq!(classify(&record(8)), Pass::Words(2));
-        assert_eq!(classify(&record(9)), Pass::Ref);
-        assert!(returns_in_memory(&record(12)));
-        assert!(!returns_in_memory(&record(8)));
-        assert!(!returns_in_memory(&Type::INT));
+        assert_eq!(classify(&Type::INT, Xlen::Rv32), Pass::Scalar);
+        assert_eq!(classify(&Type::ptr(Type::Void), Xlen::Rv32), Pass::Scalar);
+        assert_eq!(classify(&record(1), Xlen::Rv32), Pass::Words(1));
+        assert_eq!(classify(&record(4), Xlen::Rv32), Pass::Words(1));
+        assert_eq!(classify(&record(5), Xlen::Rv32), Pass::Words(2));
+        assert_eq!(classify(&record(8), Xlen::Rv32), Pass::Words(2));
+        assert_eq!(classify(&record(9), Xlen::Rv32), Pass::Ref);
+        assert!(returns_in_memory(&record(12), Xlen::Rv32));
+        assert!(!returns_in_memory(&record(8), Xlen::Rv32));
+        assert!(!returns_in_memory(&Type::INT, Xlen::Rv32));
     }
 
     #[test]
@@ -137,7 +138,7 @@ mod tests {
             params: vec![Type::INT, record(6), record(16), record(2)],
             variadic: false,
         };
-        let (regs, total) = arguments(&f);
+        let (regs, total) = arguments(&f, Xlen::Rv32);
         assert_eq!(
             regs,
             [
@@ -154,7 +155,7 @@ mod tests {
             params: vec![Type::INT],
             variadic: false,
         };
-        assert_eq!(arguments(&f), (vec![(1, Pass::Scalar)], 2));
+        assert_eq!(arguments(&f, Xlen::Rv32), (vec![(1, Pass::Scalar)], 2));
         // Past a7, words go on the stack; a pair may straddle a7 and the stack.
         let args = [
             Type::INT,
@@ -167,7 +168,7 @@ mod tests {
             record(8),
             Type::INT,
         ];
-        let (words, total) = call_arguments(&Type::INT, &args);
+        let (words, total) = call_arguments(&Type::INT, &args, Xlen::Rv32);
         assert_eq!(words[7..], [(7, Pass::Words(2)), (9, Pass::Scalar)]);
         assert_eq!((total, stack_words(total)), (10, 2));
         assert_eq!(stack_words(3), 0);

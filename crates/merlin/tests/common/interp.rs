@@ -29,7 +29,10 @@
 use merlin::abi::{self, Pass};
 use merlin::ast::*;
 use merlin::consteval::{self, Base, Const};
-use merlin::types::Type;
+use merlin::types::{Type, Xlen};
+
+/// The interpreter runs RV32 programs.
+const X: Xlen = Xlen::Rv32;
 use std::collections::HashMap;
 
 /// Runs `entry()` and returns its result. Uses a thread with a big stack, since
@@ -146,7 +149,7 @@ fn symbol(d: &Declarator) -> String {
 }
 
 fn size_of(ty: &Type) -> u32 {
-    ty.size().expect("sema: objects have complete types")
+    ty.size(X).expect("sema: objects have complete types")
 }
 
 struct Interp<'a> {
@@ -188,7 +191,7 @@ pub const POISON: u8 = 0xa5;
 impl<'a> Interp<'a> {
     /// Reserves memory for an object of type `ty` at `*top`, zeroed.
     fn alloc_at(mem: &mut [u8], top: &mut u32, limit: u32, ty: &Type) -> u32 {
-        let align = ty.align().max(1);
+        let align = ty.align(X).max(1);
         let addr = top.div_ceil(align) * align;
         let size = size_of(ty);
         *top = addr + size;
@@ -297,7 +300,7 @@ impl<'a> Interp<'a> {
                 self.mem[addr as usize..addr as usize + n].copy_from_slice(&b[..n]);
             }
             (_, Init::Expr(e)) => {
-                let v = match consteval::eval(e).ok_or("initializer is not constant")? {
+                let v = match consteval::eval(e, X).ok_or("initializer is not constant")? {
                     Const::Int(v, _) => v as u32,
                     Const::Addr { base: None, offset } => offset as u32,
                     Const::Addr {
@@ -348,13 +351,13 @@ impl<'a> Interp<'a> {
         }
         if f.variadic {
             let extra = &args[named..];
-            let words: usize = extra.iter().map(|(_, t)| abi::classify(t).registers()).sum();
+            let words: usize = extra.iter().map(|(_, t)| abi::classify(t, X).registers()).sum();
             // At least a word, so that the area has an address of its own.
             let area_ty = Type::array(Type::INT, Some(words.max(1) as u32));
             let mut at = self.alloc_frame(&area_ty);
             frame.push(at);
             for (v, t) in extra {
-                let pass = abi::classify(t);
+                let pass = abi::classify(t, X);
                 match pass {
                     Pass::Scalar => self.store(at, &Type::INT, *v)?,
                     Pass::Words(_) => self.copy(at, *v, t)?,
@@ -739,7 +742,7 @@ impl<'a> Interp<'a> {
             ExprKind::VaArg(ap) => {
                 let a = self.addr(ap, frame)?;
                 let at = self.load(a, &ap.ty)?;
-                let pass = abi::classify(&e.ty);
+                let pass = abi::classify(&e.ty, X);
                 self.store(a, &ap.ty, at.wrapping_add(4 * pass.registers() as u32))?;
                 match pass {
                     Pass::Scalar => self.load(at, &e.ty)?,
@@ -758,7 +761,7 @@ impl<'a> Interp<'a> {
 /// bits.
 fn convert(v: u32, ty: &Type) -> u32 {
     match ty.unqual() {
-        Type::Int(k) => k.wrap(v as i64) as u32,
+        Type::Int(k) => k.wrap(v.into(), X) as u32,
         Type::Void => 0,
         _ => v,
     }

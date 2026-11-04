@@ -304,7 +304,7 @@ use crate::ast::*;
 use crate::consteval::{self, Base, Const};
 use crate::debug::{DebugInfo, Lines};
 use crate::sema::arith_type;
-use crate::types::{FuncType, IntKind, Type};
+use crate::types::{FuncType, IntKind, Type, Xlen};
 use crate::Error;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -336,7 +336,15 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
         }
     }
 
+    let xlen = prog.xlen;
+    if xlen == Xlen::Rv64 {
+        return Err(Error::new(
+            crate::Pos::default(),
+            "merlin cannot generate RV64 code yet",
+        ));
+    }
     let mut file = FileGen {
+        xlen,
         out: String::new(),
         section: "",
         labels: 0,
@@ -357,17 +365,18 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
                 let Type::Func(ft) = f.ty() else {
                     unreachable!("a function's type")
                 };
-                let (_, named_words) = abi::arguments(&ft);
+                let (_, named_words) = abi::arguments(&ft, xlen);
                 let va_save = if f.variadic {
                     4 * (abi::ARG_REGS - named_words.min(abi::ARG_REGS)) as i32
                 } else {
                     0
                 };
-                let Some((offsets, frame)) = layout(&f.locals, SAVED_REGS + va_save) else {
+                let Some((offsets, frame)) = layout(&f.locals, SAVED_REGS + va_save, xlen) else {
                     let msg = format!("the locals of '{}' need a stack frame larger than 2 GiB", f.name);
                     return Err(Error::new(f.pos, msg));
                 };
                 let mut g = FuncGen {
+                    xlen,
                     func: f,
                     offsets,
                     frame,
@@ -418,19 +427,19 @@ const MAX_FRAME: i64 = i32::MAX as i64 & !15;
 /// (`ra`, `s0` and a variadic function's saved registers): its offset from
 /// `s0`, and the frame size (a multiple of 16, the convention's stack
 /// alignment). `None` if the frame would be larger than [`MAX_FRAME`].
-fn layout(locals: &[Local], header: i32) -> Option<(Vec<i32>, i32)> {
+fn layout(locals: &[Local], header: i32, x: Xlen) -> Option<(Vec<i32>, i32)> {
     // In i64: each local is at most `i32::MAX` bytes, but their sum need not be.
     let mut off = -i64::from(header);
     let mut offsets = Vec::with_capacity(locals.len());
     for l in locals {
-        let mut size = l.ty.size().expect("sema: locals have complete types");
+        let mut size = l.ty.size(x).expect("sema: locals have complete types");
         // Arrays and structs are word-aligned so that clearing them can use
         // `sw`, and a struct's slot is a whole number of words, so that one
         // arriving in registers can be stored with `sw` (see [`abi`]).
         let align = if l.ty.is_array() || l.ty.is_record() {
-            l.ty.align().max(4)
+            l.ty.align(x).max(4)
         } else {
-            l.ty.align()
+            l.ty.align(x)
         };
         if l.ty.is_record() {
             size = size.next_multiple_of(4);
@@ -457,10 +466,10 @@ struct ArgLayout {
 }
 
 impl ArgLayout {
-    fn new(ft: &FuncType, args: &[Expr]) -> ArgLayout {
+    fn new(ft: &FuncType, args: &[Expr], x: Xlen) -> ArgLayout {
         let mut types = ft.params.clone();
         types.extend(args[ft.params.len()..].iter().map(|a| a.ty.clone()));
-        let (words, used) = abi::call_arguments(&ft.ret, &types);
+        let (words, used) = abi::call_arguments(&ft.ret, &types, x);
         ArgLayout { types, words, used }
     }
 }
@@ -486,10 +495,10 @@ fn fits_imm12(v: i32) -> bool {
 }
 
 /// The load that brings a value of type `ty` into a register, widened.
-fn load_op(ty: &Type) -> &'static str {
+fn load_op(ty: &Type, x: Xlen) -> &'static str {
     match ty.unqual() {
         // `_Bool` holds 0 or 1: `lbu`.
-        Type::Int(k) => match (k.size(), k.signed()) {
+        Type::Int(k) => match (k.size(x), k.signed()) {
             (1, true) => "lb",
             (1, false) => "lbu",
             (2, true) => "lh",
@@ -502,8 +511,8 @@ fn load_op(ty: &Type) -> &'static str {
 }
 
 /// The store that writes a value of type `ty` (its low bytes) to memory.
-fn store_op(ty: &Type) -> &'static str {
-    match ty.size() {
+fn store_op(ty: &Type, x: Xlen) -> &'static str {
+    match ty.size(x) {
         Some(1) => "sb",
         Some(2) => "sh",
         Some(4) => "sw",
@@ -519,6 +528,8 @@ fn log2(n: u32) -> Option<u32> {
 /// What is shared by the whole file: the output, the label counter and the
 /// string literals seen so far.
 struct FileGen {
+    /// The target.
+    xlen: Xlen,
     out: String,
     /// The section the output is in.
     section: &'static str,
@@ -573,7 +584,9 @@ impl FileGen {
         } else {
             self.switch(".bss");
         }
-        let size = d.ty.size().expect("sema: definitions have complete types");
+        let size =
+            d.ty.size(self.xlen)
+                .expect("sema: definitions have complete types");
         let storage = if d.storage == Storage::Static {
             "static "
         } else {
@@ -588,8 +601,8 @@ impl FileGen {
         if d.storage != Storage::Static && !sym.contains('.') {
             let _ = writeln!(self.out, "    .globl {sym}");
         }
-        if d.ty.align() > 1 {
-            let _ = writeln!(self.out, "    .balign {}", d.ty.align());
+        if d.ty.align(self.xlen) > 1 {
+            let _ = writeln!(self.out, "    .balign {}", d.ty.align(self.xlen));
         }
         // An object symbol with its size, as for functions: debuggers and
         // tests find what an address belongs to from the symbol table.
@@ -609,7 +622,7 @@ impl FileGen {
         match (ty.unqual(), init) {
             // A subobject a designator skipped: zero.
             (_, Init::List(items, _)) if items.is_empty() => {
-                out.push(format!(".zero {}", ty.size().expect("a complete type")));
+                out.push(format!(".zero {}", ty.size(self.xlen).expect("a complete type")));
             }
             (Type::Record(r), Init::List(items, _)) if r.union => {
                 // The member the union is initialized with is the last item.
@@ -617,7 +630,7 @@ impl FileGen {
                 let k = items.len() - 1;
                 let m = &body.members[k];
                 self.data(&m.ty, &items[k], out);
-                let size = m.ty.size().expect("complete member");
+                let size = m.ty.size(self.xlen).expect("complete member");
                 if body.size > size {
                     out.push(format!(".zero {}", body.size - size));
                 }
@@ -633,7 +646,7 @@ impl FileGen {
                         out.push(format!(".zero {}", m.offset - at));
                     }
                     self.data(&m.ty, item, out);
-                    at = m.offset + m.ty.size().expect("complete member");
+                    at = m.offset + m.ty.size(self.xlen).expect("complete member");
                 }
                 if body.size > at {
                     out.push(format!(".zero {}", body.size - at));
@@ -643,7 +656,7 @@ impl FileGen {
                 for item in items {
                     self.data(elem, item, out);
                 }
-                let rest = (*n as usize - items.len()) as u32 * elem.size().unwrap();
+                let rest = (*n as usize - items.len()) as u32 * elem.size(self.xlen).unwrap();
                 if rest > 0 {
                     out.push(format!(".zero {rest}"));
                 }
@@ -663,8 +676,8 @@ impl FileGen {
                 }
             }
             (_, Init::Expr(e)) => {
-                let value = consteval::eval(e).expect("sema: static initializers are constant");
-                let directive = match ty.size() {
+                let value = consteval::eval(e, self.xlen).expect("sema: static initializers are constant");
+                let directive = match ty.size(self.xlen) {
                     Some(1) => ".byte",
                     Some(2) => ".half",
                     _ => ".word",
@@ -781,6 +794,8 @@ enum Place {
 /// Per-function code generator state. `'a` is the tree's lifetime, `'f` the
 /// (shorter) borrow of the file's state.
 struct FuncGen<'a, 'f> {
+    /// The target.
+    xlen: Xlen,
     func: &'a Function,
     /// Offset from `s0` of each local.
     offsets: Vec<i32>,
@@ -991,13 +1006,13 @@ impl<'a> FuncGen<'a, '_> {
             let off = self.offset(ret_ptr);
             self.access_local("sw", "a0", off);
         }
-        let (words, _) = abi::arguments(&ft);
+        let (words, _) = abi::arguments(&ft, self.xlen);
         for (i, (p, (word, pass))) in f.params.iter().zip(words).enumerate() {
             let off = self.offsets[i];
             match pass {
                 Pass::Scalar => {
                     let reg = self.incoming(word);
-                    self.access_local(store_op(&p.ty), &reg, off);
+                    self.access_local(store_op(&p.ty, self.xlen), &reg, off);
                 }
                 // A small struct: its words, as they lie in memory (the slot is
                 // a whole number of words).
@@ -1274,7 +1289,7 @@ impl<'a> FuncGen<'a, '_> {
                 self.expr(cond);
                 for &(value, id) in cases {
                     // The bit pattern: an `unsigned` 0xffffffff is `li t0, -1`.
-                    self.li("t0", IntKind::Int.wrap(value) as i32);
+                    self.li("t0", IntKind::Int.wrap(value, self.xlen) as i32);
                     let target = self.case_label(id);
                     self.branch("beq", "a0, t0", &target);
                 }
@@ -1335,7 +1350,7 @@ impl<'a> FuncGen<'a, '_> {
                 self.copy("a1", "a0", ty);
             }
             None => {
-                let Pass::Words(n) = abi::classify(ty) else {
+                let Pass::Words(n) = abi::classify(ty, self.xlen) else {
                     unreachable!("a big result has a result address")
                 };
                 self.ins("mv", "t1, a0");
@@ -1358,7 +1373,7 @@ impl<'a> FuncGen<'a, '_> {
         // object, then store what the initializer gives.
         if d.ty.is_array() || (d.ty.is_record() && matches!(init, Init::List(..))) {
             self.comment(format!("{} = ...", d.ty.declare(&d.name)));
-            self.clear_local(off, d.ty.size().unwrap() as i32);
+            self.clear_local(off, d.ty.size(self.xlen).unwrap() as i32);
         }
         self.init_local(&d.ty, init, off);
     }
@@ -1372,7 +1387,7 @@ impl<'a> FuncGen<'a, '_> {
             // is one of these.)
             (_, Init::List(items, _)) if items.is_empty() => {}
             (Type::Array(elem, _), Init::List(items, _)) => {
-                let size = elem.size().unwrap() as i32;
+                let size = elem.size(self.xlen).unwrap() as i32;
                 for (i, item) in items.iter().enumerate() {
                     self.init_local(elem, item, off + i as i32 * size);
                 }
@@ -1406,7 +1421,7 @@ impl<'a> FuncGen<'a, '_> {
             }
             (_, Init::Expr(e)) => {
                 self.expr(e);
-                self.access_local(store_op(ty), "a0", off);
+                self.access_local(store_op(ty, self.xlen), "a0", off);
             }
             _ => unreachable!("sema checked initializer shapes"),
         }
@@ -1440,7 +1455,7 @@ impl<'a> FuncGen<'a, '_> {
         match &e.kind {
             ExprKind::Num(v) => {
                 // The bit pattern: an `unsigned int` 0xffffffff is `li a0, -1`.
-                self.li("a0", IntKind::Int.wrap(*v) as i32);
+                self.li("a0", IntKind::Int.wrap(*v, self.xlen) as i32);
             }
             ExprKind::Str(bytes) => {
                 let label = self.file.string(bytes);
@@ -1452,7 +1467,7 @@ impl<'a> FuncGen<'a, '_> {
                     if e.ty.is_addressed() {
                         self.add_imm("a0", "s0", off); // an array or struct: its address
                     } else {
-                        self.access_local(load_op(&e.ty), "a0", off);
+                        self.access_local(load_op(&e.ty, self.xlen), "a0", off);
                     }
                 }
                 Some(VarRef::Global(sym)) => {
@@ -1495,14 +1510,14 @@ impl<'a> FuncGen<'a, '_> {
                 self.pop("a1"); // a1 = the target's value, a0 = value
                 let (t, v) = (target.ty.decay(), value.ty.decay());
                 self.binary(*op, &t, &v);
-                let result = arith_type(*op, &t, &v).expect("sema checked the operands");
+                let result = arith_type(*op, &t, &v, self.xlen).expect("sema checked the operands");
                 self.convert(&result, &target.ty);
                 self.store_place(place, &target.ty);
             }
             ExprKind::IncDec { inc, prefix, target } => {
                 let ty = &target.ty;
                 let step = match ty.unqual() {
-                    Type::Ptr(to) => to.size().expect("sema: pointer to a complete type") as i32,
+                    Type::Ptr(to) => to.size(self.xlen).expect("sema: pointer to a complete type") as i32,
                     _ => 1,
                 };
                 let delta = if *inc { step } else { -step };
@@ -1575,10 +1590,10 @@ impl<'a> FuncGen<'a, '_> {
             }
             // A constant converted (`char c = 1;`): just the converted value.
             ExprKind::Cast { x, .. } if e.ty.is_integer() && matches!(x.kind, ExprKind::Num(_)) => {
-                let Some(Const::Int(v, _)) = consteval::eval(e) else {
+                let Some(Const::Int(v, _)) = consteval::eval(e, self.xlen) else {
                     unreachable!("an integer literal cast to an integer type is constant")
                 };
-                self.li("a0", IntKind::Int.wrap(v) as i32);
+                self.li("a0", IntKind::Int.wrap(v, self.xlen) as i32);
             }
             ExprKind::Cast { x, .. } => {
                 self.expr(x);
@@ -1635,7 +1650,7 @@ impl<'a> FuncGen<'a, '_> {
         let off = self.offset(local.expect("sema gives compound literals a local"));
         self.comment(format!("compound literal ({ty})"));
         if ty.is_array() || ty.is_record() {
-            self.clear_local(off, ty.size().expect("complete") as i32);
+            self.clear_local(off, ty.size(self.xlen).expect("complete") as i32);
         }
         self.init_local(ty, init, off);
         self.add_imm("a0", "s0", off);
@@ -1658,14 +1673,14 @@ impl<'a> FuncGen<'a, '_> {
     /// its words. A scalar is loaded from there; a small struct's value is
     /// its address, there; a big one's address is the word there.
     fn va_arg(&mut self, ap: &'a Expr, ty: &Type) {
-        let pass = abi::classify(ty);
+        let pass = abi::classify(ty, self.xlen);
         let place = self.place(ap);
         self.load_place(&place, &ap.ty);
         self.ins("mv", "t1, a0");
         self.add_imm("a0", "a0", 4 * pass.registers() as i32);
         self.store_place(place, &ap.ty);
         match pass {
-            Pass::Scalar => self.ins(load_op(ty), "a0, 0(t1)"),
+            Pass::Scalar => self.ins(load_op(ty, self.xlen), "a0, 0(t1)"),
             Pass::Words(_) => self.ins("mv", "a0, t1"),
             Pass::Ref => self.ins("lw", "a0, 0(t1)"),
         }
@@ -1675,7 +1690,7 @@ impl<'a> FuncGen<'a, '_> {
     /// and functions are not loaded: their value is that address.
     fn load(&mut self, ty: &Type) {
         if !ty.is_addressed() {
-            self.ins(load_op(ty), "a0, 0(a0)");
+            self.ins(load_op(ty, self.xlen), "a0, 0(a0)");
         }
     }
 
@@ -1725,7 +1740,7 @@ impl<'a> FuncGen<'a, '_> {
     /// Loads the value at a place into `a0`; a pushed address stays pushed.
     fn load_place(&mut self, place: &Place, ty: &Type) {
         match place {
-            Place::Frame(off) => self.access_local(load_op(ty), "a0", *off),
+            Place::Frame(off) => self.access_local(load_op(ty, self.xlen), "a0", *off),
             Place::Pushed => {
                 self.ins("lw", "a0, 0(sp)"); // the address, left on the stack
                 self.load(ty);
@@ -1736,10 +1751,10 @@ impl<'a> FuncGen<'a, '_> {
     /// Stores `a0` to a place, popping a pushed address.
     fn store_place(&mut self, place: Place, ty: &Type) {
         match place {
-            Place::Frame(off) => self.access_local(store_op(ty), "a0", off),
+            Place::Frame(off) => self.access_local(store_op(ty, self.xlen), "a0", off),
             Place::Pushed => {
                 self.pop("a1");
-                self.ins(store_op(ty), "a0, 0(a1)");
+                self.ins(store_op(ty, self.xlen), "a0, 0(a1)");
             }
         }
     }
@@ -1758,8 +1773,8 @@ impl<'a> FuncGen<'a, '_> {
         }
         if let (Type::Int(f), Type::Int(t)) = (from, to) {
             // A narrower or equal type whose values all fit is already right.
-            let fits = (f.size() < t.size() && (t.signed() || !f.signed()))
-                || (f.size() == t.size() && f.signed() == t.signed());
+            let fits = (f.size(self.xlen) < t.size(self.xlen) && (t.signed() || !f.signed()))
+                || (f.size(self.xlen) == t.size(self.xlen) && f.signed() == t.signed());
             if fits {
                 return;
             }
@@ -1771,8 +1786,8 @@ impl<'a> FuncGen<'a, '_> {
     /// back by its signedness.
     fn wrap_int(&mut self, ty: &Type) {
         let Some(k) = ty.int_kind() else { return };
-        let shift = 32 - 8 * k.size();
-        match (k.size(), k.signed()) {
+        let shift = 32 - 8 * k.size(self.xlen);
+        match (k.size(self.xlen), k.signed()) {
             _ if k == IntKind::Bool => self.ins("snez", "a0, a0"),
             (4, _) => {}
             (1, false) => self.ins("andi", "a0, a0, 255"),
@@ -1803,7 +1818,12 @@ impl<'a> FuncGen<'a, '_> {
         // signedness; a pointer compares as an unsigned address.
         let unsigned = l.is_unsigned() || r.is_unsigned();
         let pick = |s: &'static str, u: &'static str| if unsigned { u } else { s };
-        let elem_size = |t: &Type| t.pointee().and_then(Type::size).expect("sema: complete pointee");
+        let x = self.xlen;
+        let elem_size = |t: &Type| {
+            t.pointee()
+                .and_then(|t| t.size(x))
+                .expect("sema: complete pointee")
+        };
         match op {
             BinOp::Add => {
                 // A pointer plus an integer moves by whole elements.
@@ -1883,11 +1903,11 @@ impl<'a> FuncGen<'a, '_> {
             .and_then(Type::func_type)
             .expect("sema: the callee is a function")
             .clone();
-        let layout = ArgLayout::new(&ft, args);
+        let layout = ArgLayout::new(&ft, args, self.xlen);
         let (types, regs, used) = (&layout.types, &layout.words, layout.used);
         let direct = callee.direct_callee();
         if used > abi::ARG_REGS {
-            let hidden = if abi::returns_in_memory(&ft.ret) {
+            let hidden = if abi::returns_in_memory(&ft.ret, self.xlen) {
                 result
             } else {
                 None
@@ -1939,7 +1959,7 @@ impl<'a> FuncGen<'a, '_> {
             }
         }
         // A big struct result goes to the hidden local: its address in a0.
-        if abi::returns_in_memory(&ft.ret) {
+        if abi::returns_in_memory(&ft.ret, self.xlen) {
             let off = self.offset(result.expect("sema: a struct result has a local"));
             self.add_imm("a0", "s0", off);
         }
@@ -1972,7 +1992,7 @@ impl<'a> FuncGen<'a, '_> {
     fn call_result(&mut self, ft: &FuncType, result: Option<LocalId>) {
         if let Some(result) = result {
             let off = self.offset(result);
-            if let Pass::Words(n) = abi::classify(&ft.ret) {
+            if let Pass::Words(n) = abi::classify(&ft.ret, self.xlen) {
                 for w in 0..n {
                     self.access_local("sw", &format!("a{w}"), off + 4 * w as i32);
                 }
@@ -2107,8 +2127,8 @@ impl<'a> FuncGen<'a, '_> {
     /// boundary, so its word is put together from aligned bytes or halves
     /// (in `t0`); bytes past the struct's end read as zero.
     fn load_word(&mut self, reg: &str, src: &str, w: u32, ty: &Type) {
-        let size = ty.size().expect("a complete struct");
-        let unit = ty.align().min(4);
+        let size = ty.size(self.xlen).expect("a complete struct");
+        let unit = ty.align(self.xlen).min(4);
         if unit == 4 {
             self.ins("lw", format!("{reg}, {}({src})", 4 * w));
             return;
@@ -2135,8 +2155,8 @@ impl<'a> FuncGen<'a, '_> {
     /// misaligned: unrolled up to 16 units, a loop beyond. Clobbers `t0`, and
     /// `t1-t3` for the loop.
     fn copy(&mut self, dst: &str, src: &str, ty: &Type) {
-        let size = ty.size().expect("sema: a complete struct");
-        let unit = ty.align().min(4);
+        let size = ty.size(self.xlen).expect("sema: a complete struct");
+        let unit = ty.align(self.xlen).min(4);
         let (load, store) = match unit {
             1 => ("lbu", "sb"),
             2 => ("lhu", "sh"),
@@ -2315,7 +2335,7 @@ mod tests {
     fn locals(decls: &str) -> (Vec<i32>, i32) {
         let p = crate::parse(&format!("int f() {{ {decls} }}")).unwrap();
         let f = p.funcs().next().unwrap();
-        layout(&f.locals, SAVED_REGS).unwrap()
+        layout(&f.locals, SAVED_REGS, Xlen::Rv32).unwrap()
     }
 
     #[test]
@@ -2344,7 +2364,9 @@ mod tests {
         );
         let p = crate::parse("int f() { char a[2147483600]; }").unwrap();
         assert_eq!(
-            layout(&p.funcs().next().unwrap().locals, SAVED_REGS).unwrap().1,
+            layout(&p.funcs().next().unwrap().locals, SAVED_REGS, Xlen::Rv32)
+                .unwrap()
+                .1,
             2147483616
         );
     }

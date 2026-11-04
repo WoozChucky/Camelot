@@ -27,7 +27,7 @@
 //!   apostrophe in a sentence too).
 //! * `#error` stops with its text; `#line N "name"` renumbers the lines
 //!   that follow; `#` alone does nothing. Any other directive is an error.
-//! * `__FILE__` and `__LINE__`, and a few predefined macros ([`PREDEFINED`]).
+//! * `__FILE__` and `__LINE__`, and a few predefined macros ([`predefined`]).
 //!
 //! ## Macro replacement
 //!
@@ -57,6 +57,7 @@
 //! their own.
 
 use crate::lexer::{self, PpKind, PpToken};
+use crate::types::Xlen;
 use crate::{Error, Pos};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
@@ -72,8 +73,9 @@ pub enum CmdMacro {
     Undef(String),
 }
 
-/// What the command line tells the preprocessor.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// What the command line tells the compiler: the preprocessor's options,
+/// the target and `-g`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     /// `-I`: where `#include` looks, in order (after the including file's
     /// own directory, for `#include "..."`).
@@ -82,29 +84,55 @@ pub struct Options {
     pub macros: Vec<CmdMacro>,
     /// `-g`: debug information, for the code generator.
     pub debug: Option<crate::DebugInfo>,
+    /// `-march`: RV32 (ILP32) or RV64 (LP64).
+    pub xlen: Xlen,
+}
+
+impl Default for Options {
+    /// No `-I`, `-D` or `-g`, for RV32 (the default until #159).
+    fn default() -> Options {
+        Options {
+            include_dirs: Vec::new(),
+            macros: Vec::new(),
+            debug: None,
+            xlen: Xlen::Rv32,
+        }
+    }
 }
 
 /// Reads the file at a path for `#include`, or `None` if there is none.
 pub type Loader<'a> = &'a dyn Fn(&Path) -> Option<String>;
 
 /// Macros every translation unit starts with. merlin compiles freestanding
-/// C99 for RISC-V ILP32, with plain `char` unsigned, so it says what clang
-/// says for `--target=riscv32 -ffreestanding -std=c99` about those, and
-/// `__merlin__` says who is compiling.
-pub const PREDEFINED: &[(&str, &str)] = &[
-    ("__STDC__", "1"),
-    ("__STDC_VERSION__", "199901L"),
-    ("__STDC_HOSTED__", "0"),
-    ("__merlin__", "1"),
-    ("__riscv", "1"),
-    ("__riscv_xlen", "32"),
-    ("__ILP32__", "1"),
-    ("__CHAR_BIT__", "8"),
-    ("__CHAR_UNSIGNED__", "1"),
-    ("__SIZEOF_INT__", "4"),
-    ("__SIZEOF_LONG__", "4"),
-    ("__SIZEOF_POINTER__", "4"),
-];
+/// C99 for RISC-V, ILP32 on RV32 and LP64 on RV64, with plain `char`
+/// unsigned, so it says what clang says for `--target=riscv32 -mabi=ilp32`
+/// and `--target=riscv64 -mabi=lp64` (`-ffreestanding -std=c99`) about
+/// those, and `__merlin__` says who is compiling.
+pub fn predefined(x: Xlen) -> Vec<(&'static str, &'static str)> {
+    let mut macros = vec![
+        ("__STDC__", "1"),
+        ("__STDC_VERSION__", "199901L"),
+        ("__STDC_HOSTED__", "0"),
+        ("__merlin__", "1"),
+        ("__riscv", "1"),
+    ];
+    match x {
+        Xlen::Rv32 => macros.extend([("__riscv_xlen", "32"), ("_ILP32", "1"), ("__ILP32__", "1")]),
+        Xlen::Rv64 => macros.extend([("__riscv_xlen", "64"), ("_LP64", "1"), ("__LP64__", "1")]),
+    }
+    let (long, pointer) = match x {
+        Xlen::Rv32 => ("4", "4"),
+        Xlen::Rv64 => ("8", "8"),
+    };
+    macros.extend([
+        ("__CHAR_BIT__", "8"),
+        ("__CHAR_UNSIGNED__", "1"),
+        ("__SIZEOF_INT__", "4"),
+        ("__SIZEOF_LONG__", long),
+        ("__SIZEOF_POINTER__", pointer),
+    ]);
+    macros
+}
 
 /// How deeply `#include`s may nest (clang's limit too).
 const MAX_INCLUDE_DEPTH: usize = 200;
@@ -364,7 +392,7 @@ impl Pp<'_> {
     fn run(&mut self, src: &str) -> Result<(Vec<PpToken>, Pos), Error> {
         // The predefined macros, then -D and -U, as directives of their own
         // files.
-        let mut builtin: String = PREDEFINED
+        let mut builtin: String = predefined(self.opts.xlen)
             .iter()
             .map(|(name, value)| format!("#define {name} {value}\n"))
             .collect();
@@ -1829,6 +1857,7 @@ puts( "The first, second, and third items." );
         );
         // `<...>` and `"..."` both look in the -I directories, in order.
         let opts = Options {
+            xlen: Xlen::Rv32,
             include_dirs: vec![PathBuf::from("inc"), PathBuf::from("sub")],
             macros: Vec::new(),
             debug: None,
@@ -2137,6 +2166,7 @@ puts( "The first, second, and third items." );
     #[test]
     fn command_line_macros() {
         let opts = Options {
+            xlen: Xlen::Rv32,
             include_dirs: Vec::new(),
             macros: vec![
                 CmdMacro::Define("ONE".into()),
@@ -2152,6 +2182,7 @@ puts( "The first, second, and third items." );
         let out = run(&[], "ONE TWO F(3) GONE __merlin__ __STDC_VERSION__", &opts).unwrap();
         assert_eq!(words(&out.tokens), same("1 22 (3+1) GONE __merlin__ 199901L"));
         let opts = Options {
+            xlen: Xlen::Rv32,
             include_dirs: Vec::new(),
             macros: vec![CmdMacro::Define("1X".into())],
             debug: None,
@@ -2168,6 +2199,16 @@ puts( "The first, second, and third items." );
             pp("__STDC__ __STDC_HOSTED__ __merlin__ __riscv __riscv_xlen __ILP32__ __CHAR_UNSIGNED__"),
             same("1 0 1 1 32 1 1")
         );
+        let names =
+            "__riscv_xlen _ILP32 __ILP32__ _LP64 __LP64__ __SIZEOF_INT__ __SIZEOF_LONG__ __SIZEOF_POINTER__";
+        assert_eq!(pp(names), same("32 1 1 _LP64 __LP64__ 4 4 4"));
+        // RV64 is LP64, as clang's `--target=riscv64 -mabi=lp64` says.
+        let opts = Options {
+            xlen: Xlen::Rv64,
+            ..Options::default()
+        };
+        let out = run(&[], names, &opts).unwrap();
+        assert_eq!(words(&out.tokens), same("64 _ILP32 __ILP32__ 1 1 4 8 8"));
     }
 
     #[test]

@@ -352,4 +352,63 @@ fn usage_errors() {
     let out = merlin(&[Path::new("--help")]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("--dump-ast"));
+
+    // -march names one of the two ISAs, and -mabi the ABI that goes with it
+    // (anything else is an unknown ABI to clang, as here).
+    let out = merlin(&[Path::new("-march=rv64gc"), Path::new("a.c")]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).starts_with(
+            "merlin: unsupported -march 'rv64gc' (merlin takes rv32ima_zicsr_zifencei or \
+             rv64ima_zicsr_zifencei)"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    for args in [
+        &["-mabi=lp64"][..],
+        &["-march=rv64ima_zicsr_zifencei", "-mabi=ilp32"],
+    ] {
+        let mut args: Vec<&Path> = args.iter().map(Path::new).collect();
+        args.push(Path::new("a.c"));
+        let out = merlin(&args);
+        assert_eq!(out.status.code(), Some(2));
+        let abi = args[args.len() - 2].to_string_lossy().replace("-mabi=", "");
+        assert!(
+            stderr(&out).starts_with(&format!("merlin: unknown target ABI '{abi}'")),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+/// `-march` picks the target: LP64 types for RV64.
+#[test]
+fn march_picks_the_target() {
+    let t = TempSrc::new("march", "t.c", "unsigned long n = sizeof(long[2]);\n");
+    let dump = |args: &[&str]| {
+        let mut all: Vec<&Path> = args.iter().map(Path::new).collect();
+        all.extend([Path::new("--dump-ast"), &t.file]);
+        let out = merlin(&all);
+        assert!(out.status.success(), "{}", stderr(&out));
+        String::from_utf8_lossy(&out.stdout).replace('\r', "")
+    };
+    assert!(dump(&[]).contains("Num 8 : unsigned int"), "{}", dump(&[]));
+    for rv64 in [
+        &["-march=rv64ima_zicsr_zifencei"][..],
+        &["-march=rv64ima_zicsr_zifencei", "-mabi=lp64"],
+        &["-mabi=lp64", "-march=rv64ima_zicsr_zifencei"],
+    ] {
+        let ast = dump(rv64);
+        assert!(ast.contains("Num 16 : unsigned long"), "{ast}");
+    }
+    let ast = dump(&[
+        "-march=rv64ima_zicsr_zifencei",
+        "-march=rv32ima_zicsr_zifencei",
+        "-mabi=ilp32",
+    ]);
+    assert!(
+        ast.contains("Num 8 : unsigned int"),
+        "the last -march wins: {ast}"
+    );
 }

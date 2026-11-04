@@ -47,6 +47,7 @@ pub fn compile_c(dir: &Path, file: &str, include_dirs: &[&str], comp_dir: &str) 
     let opts = merlin::Options {
         include_dirs: include_dirs.iter().map(PathBuf::from).collect(),
         macros: Vec::new(),
+        xlen: merlin::types::Xlen::Rv32,
         debug: DEBUG_INFO.get().then(|| merlin::DebugInfo {
             comp_dir: comp_dir.into(),
         }),
