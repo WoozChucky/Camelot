@@ -526,34 +526,33 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
     if objects.is_empty() {
         return Err(vec![err("no input files")]);
     }
-    // The executable is of its objects' class (ld.lld needs no option for it
-    // either).
-    let class = objects[0].class;
-
-    // Script. Its numbers and arithmetic depend on the class.
     let (script_name, src) = match &opts.script {
         Some(s) => (s.name.as_str(), s.text.as_str()),
         None => (DEFAULT_SCRIPT_NAME, script::DEFAULT_SCRIPT),
     };
-    let script = script::parse(src, class).map_err(|e| vec![err(format!("{script_name}:{e}"))])?;
-    // `OUTPUT_FORMAT(elf64-littleriscv)` with RV32 objects, or the other way
-    // round: every object of the other class is an error, ld.lld's
-    // `a.o is incompatible with elf32-littleriscv`.
-    if let Some(format) = script.format {
-        let wrong: Vec<Error> = objects
-            .iter()
-            .filter(|o| o.class != format)
-            .map(|o| {
-                err(format!(
-                    "{} is incompatible with {}",
-                    o.name,
-                    script::format_name(format)
-                ))
-            })
-            .collect();
-        if !wrong.is_empty() {
-            return Err(wrong);
-        }
+    // The class of the executable, as ld.lld picks it (it needs no option
+    // either): the script's `OUTPUT_FORMAT` if it names one, else the first
+    // object's. Every object must have it, or the link stops:
+    // `b.o is incompatible with a.o`, or `a.o is incompatible with
+    // elf32-littleriscv`.
+    let declared = script::declared_format(src);
+    let (class, against) = match declared {
+        Some(format) => (format, script::format_name(format)),
+        None => (objects[0].class, objects[0].name.as_str()),
+    };
+    let wrong = object::check_classes(class, against, &objects);
+
+    // Script. Its numbers and arithmetic depend on the class. ld.lld reads
+    // the script before it compares the classes, so a script's own errors
+    // come first; but its numbers are 64-bit whatever the class. So when an
+    // object is of the wrong class the script is read for ELF64, where no
+    // value is refused for being past 4 GiB, and its errors are the ones
+    // ld.lld gives before it refuses the objects.
+    let read_for = if wrong.is_empty() { class } else { Class::Elf64 };
+    let script = script::parse(src, read_for).map_err(|e| vec![err(format!("{script_name}:{e}"))])?;
+    debug_assert_eq!(script.format, declared);
+    if !wrong.is_empty() {
+        return Err(wrong);
     }
 
     // 2. Globals.

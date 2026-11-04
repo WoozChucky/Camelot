@@ -75,6 +75,11 @@ pub fn layout(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
 pub fn link(inputs: &[Input], opts: &Options) -> Result<Linked, Vec<Error>> {
     let layout = layout::build(inputs, opts)?;
     let images = relocate::relocate(&layout)?;
+    // TEMPORARY (#149, until the writer learns ELF64): RV64 objects are read,
+    // laid out ([`layout`]) and relocated, but no ELF64 file is written yet.
+    if layout.class == object::Class::Elf64 {
+        return Err(vec![Error("ELF64 (RV64) output is not supported yet".into())]);
+    }
     let elf = write::write(&layout, &images);
     Ok(Linked { elf, layout })
 }
@@ -90,5 +95,11 @@ pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, Error> {
 /// only when they define something still undefined, like an archive's:
 /// [`library`]), after them in library order.
 pub fn link_with_library(inputs: &[Input], library: &[Input], opts: &Options) -> Result<Linked, Vec<Error>> {
-    link(&library::with_needed(inputs, library)?, opts)
+    // The members are compared with the executable's class before the link,
+    // which may come from the script's OUTPUT_FORMAT.
+    let format = opts
+        .script
+        .as_ref()
+        .and_then(|s| script::declared_format(&s.text));
+    link(&library::with_needed_for(inputs, library, format)?, opts)
 }

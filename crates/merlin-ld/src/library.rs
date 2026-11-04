@@ -20,8 +20,11 @@
 //! The members that are pulled in are linked after the program's objects, in
 //! library order, whatever order they were found in, so the output depends
 //! only on which members are needed.
+//!
+//! Every member must still be of the executable's class, needed or not, as
+//! ld.lld checks its lazy objects ([`object::check_classes`]).
 
-use crate::object::{self, Object};
+use crate::object::{self, Class, Object};
 use crate::{Error, Input};
 use std::collections::BTreeSet;
 
@@ -61,10 +64,37 @@ fn parse_all(inputs: &[Input]) -> Result<Vec<Object>, Vec<Error>> {
 }
 
 /// Which members of `library` linking `inputs` needs: their indexes, in
-/// library order.
+/// library order. For a link without `OUTPUT_FORMAT`: [`needed_for`].
 pub fn needed(inputs: &[Input], library: &[Input]) -> Result<Vec<usize>, Vec<Error>> {
+    needed_for(inputs, library, None)
+}
+
+/// [`needed`], for a link whose script's `OUTPUT_FORMAT` names `format`
+/// ([`crate::script::declared_format`]), if it has one.
+///
+/// Every object and every member, needed or not, must be of the
+/// executable's class: `format`'s, else the first object's. ld.lld checks
+/// its lazy objects (`--start-lib`) too, in command-line order. merlin-ld
+/// is given the program's objects and the library apart, so it checks the
+/// objects and then the members, against the first program object (ld.lld,
+/// given a library member first, says only `a.o is incompatible`).
+pub fn needed_for(
+    inputs: &[Input],
+    library: &[Input],
+    format: Option<Class>,
+) -> Result<Vec<usize>, Vec<Error>> {
     let objects = parse_all(inputs)?;
     let members = parse_all(library)?;
+    if let Some(first) = objects.first() {
+        let (class, against) = match format {
+            Some(f) => (f, crate::script::format_name(f)),
+            None => (first.class, first.name.as_str()),
+        };
+        let wrong = object::check_classes(class, against, objects.iter().chain(&members));
+        if !wrong.is_empty() {
+            return Err(wrong);
+        }
+    }
     let mut defined: BTreeSet<&str> = objects.iter().flat_map(defines).collect();
     let mut undefined: BTreeSet<&str> = objects
         .iter()
@@ -100,7 +130,17 @@ pub fn needed(inputs: &[Input], library: &[Input]) -> Result<Vec<usize>, Vec<Err
 /// `inputs` followed by the members of `library` they need ([`needed`]):
 /// what to hand the linker.
 pub fn with_needed(inputs: &[Input], library: &[Input]) -> Result<Vec<Input>, Vec<Error>> {
-    let needed = needed(inputs, library)?;
+    with_needed_for(inputs, library, None)
+}
+
+/// [`with_needed`] for a script whose `OUTPUT_FORMAT` names `format`
+/// ([`needed_for`]).
+pub fn with_needed_for(
+    inputs: &[Input],
+    library: &[Input],
+    format: Option<Class>,
+) -> Result<Vec<Input>, Vec<Error>> {
+    let needed = needed_for(inputs, library, format)?;
     let mut all = inputs.to_vec();
     all.extend(needed.into_iter().map(|i| library[i].clone()));
     Ok(all)
@@ -121,16 +161,27 @@ mod tests {
                 .iter()
                 .position(|s| s.name == name)
                 .unwrap_or_else(|| panic!("no symbol {name}"));
-            let entsize = (symtab.entsize as usize).max(elf::SYM_SIZE);
-            // st_info is byte 12 of the entry.
-            symtab.offset as usize + i * entsize + 12
+            let entsize = (symtab.entsize as usize).max(parsed.class.sym_size());
+            // st_info is byte 12 of an ELF32 entry, after st_name, st_value
+            // and st_size; ELF64 moves it up to byte 4, before the 8-byte
+            // st_value and st_size.
+            let st_info = match parsed.class {
+                Class::Elf32 => 12,
+                Class::Elf64 => 4,
+            };
+            symtab.offset as usize + i * entsize + st_info
         };
         elf[info_at] = (elf::STB_WEAK << 4) | (elf[info_at] & 0xf);
     }
 
-    /// An object from merlin-as: `defs` defined as globals in `.text`,
+    /// An RV32 object from merlin-as: `defs` defined as globals in `.text`,
     /// `refs` referred to from `.data`, `weak` as weak references.
     fn obj(name: &str, defs: &[&str], refs: &[&str], weak: &[&str]) -> Input {
+        obj_of(Class::Elf32, name, defs, refs, weak)
+    }
+
+    /// [`obj`] of either class: an RV64 object for `Class::Elf64`.
+    fn obj_of(class: Class, name: &str, defs: &[&str], refs: &[&str], weak: &[&str]) -> Input {
         let mut src = String::from("    .text\n");
         for d in defs {
             src.push_str(&format!("    .globl {d}\n{d}:\n    nop\n"));
@@ -139,7 +190,12 @@ mod tests {
         for r in refs.iter().chain(weak) {
             src.push_str(&format!("    .word {r}\n"));
         }
-        let mut data = merlin_as::assemble_to_elf(&src).unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+        let xlen = match class {
+            Class::Elf32 => excalibur::Xlen::Rv32,
+            Class::Elf64 => excalibur::Xlen::Rv64,
+        };
+        let mut data = merlin_as::assemble_to_elf_with(&src, &merlin_as::Options { xlen })
+            .unwrap_or_else(|e| panic!("{e:?}\n{src}"));
         for w in weak {
             make_weak(&mut data, w);
         }
@@ -205,5 +261,73 @@ mod tests {
         let errs = needed(&program, &bad).unwrap_err();
         assert_eq!(errs.len(), 1);
         assert!(errs[0].0.starts_with("junk.o: "), "{:?}", errs);
+    }
+
+    fn messages(r: Result<Vec<usize>, Vec<Error>>) -> Vec<String> {
+        r.unwrap_err().into_iter().map(|e| e.0).collect()
+    }
+
+    #[test]
+    fn rv64_members_are_pulled_in_as_rv32_ones() {
+        let rv64 =
+            |name, defs: &[&str], refs: &[&str], weak: &[&str]| obj_of(Class::Elf64, name, defs, refs, weak);
+        let o = object::parse("a.o", &rv64("a.o", &["f"], &["g"], &["h"]).data).unwrap();
+        assert_eq!(o.class, Class::Elf64);
+        // make_weak found st_info in the 24-byte entry: h is not needed.
+        assert_eq!(needs(&o).collect::<Vec<_>>(), ["g"]);
+        let program = [rv64("main.o", &["main"], &["printf"], &["malloc"])];
+        let library = [
+            rv64("malloc.o", &["malloc"], &[], &[]),
+            rv64("printf.o", &["printf"], &["write"], &[]),
+            rv64("usys.o", &["write"], &[], &[]),
+        ];
+        assert_eq!(needed(&program, &library).unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn every_member_must_have_the_programs_class() {
+        let program = [
+            obj_of(Class::Elf64, "main.o", &["main"], &["f"], &[]),
+            obj_of(Class::Elf64, "more.o", &[], &[], &[]),
+        ];
+        // Members of the other class are errors even when nothing needs
+        // them, as ld.lld checks its lazy objects: all of them, in order,
+        // compared with the first program object.
+        let library = [
+            obj("a32.o", &["a"], &[], &[]),
+            obj_of(Class::Elf64, "f.o", &["f"], &[], &[]),
+            obj("b32.o", &["b"], &[], &[]),
+        ];
+        assert_eq!(
+            messages(needed(&program, &library)),
+            [
+                "a32.o is incompatible with main.o",
+                "b32.o is incompatible with main.o"
+            ]
+        );
+        // A program object of the other class comes first, as it does on
+        // ld.lld's command line.
+        let mixed = [program[0].clone(), obj("c32.o", &[], &[], &[])];
+        assert_eq!(
+            messages(needed(&mixed, &library)),
+            [
+                "c32.o is incompatible with main.o",
+                "a32.o is incompatible with main.o",
+                "b32.o is incompatible with main.o"
+            ]
+        );
+        // With an OUTPUT_FORMAT, every object and member is compared with it.
+        assert_eq!(
+            messages(needed_for(&program, &library[1..2], Some(Class::Elf32))),
+            [
+                "main.o is incompatible with elf32-littleriscv",
+                "more.o is incompatible with elf32-littleriscv",
+                "f.o is incompatible with elf32-littleriscv"
+            ]
+        );
+        assert_eq!(
+            needed_for(&program, &library[1..2], Some(Class::Elf64)).unwrap(),
+            [0]
+        );
     }
 }

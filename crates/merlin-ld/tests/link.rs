@@ -1662,7 +1662,11 @@ fn rejects_bad_objects() {
     let reject = |name: &str| std::fs::read(fixtures().join("rejects").join(name)).unwrap();
     let cases: Vec<(Vec<u8>, &str)> = vec![
         (b"hello".to_vec(), "x.o: not an ELF file"),
-        (patched(4, &[2]), "x.o: not a 32-bit ELF file"),
+        // ELFCLASS64 is RV64 (tests/rv64.rs); 3 is no class.
+        (
+            patched(4, &[3]),
+            "x.o: not a 32- or 64-bit ELF file (EI_CLASS is 3)",
+        ),
         (patched(5, &[2]), "x.o: not a little-endian ELF file"),
         (patched(16, &[2, 0]), "x.o: an executable (e_type 2)"),
         (patched(18, &[62, 0]), "x.o: e_machine is 62, not RISC-V"),

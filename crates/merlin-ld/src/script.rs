@@ -267,6 +267,42 @@ pub fn format_name(class: Class) -> &'static str {
     }
 }
 
+/// The class an `OUTPUT_FORMAT` name stands for, if merlin-ld knows it.
+fn format_class(name: &str) -> Option<Class> {
+    [Class::Elf32, Class::Elf64]
+        .into_iter()
+        .find(|&c| format_name(c) == name)
+}
+
+/// The class `src`'s `OUTPUT_FORMAT` names (its first argument, the one
+/// ld.lld goes by), found without reading the rest of the script: `None`
+/// if it has none, or one [`parse`] will refuse.
+///
+/// The executable's class is the script's when it names one, else the
+/// first object's, and ld.lld compares every object (library members too)
+/// with it. So the layout and [`crate::library`] need it before the script
+/// is parsed: the layout to know which class to parse the script for.
+pub fn declared_format(src: &str) -> Option<Class> {
+    let toks = lex(src).ok()?;
+    // Commands are the words at the top level, outside every `( )` and
+    // `{ }`; like the parser, take the first OUTPUT_FORMAT's first argument.
+    let mut depth = 0usize;
+    for (i, (t, _)) in toks.iter().enumerate() {
+        match t {
+            Tok::Punct("(" | "{") => depth += 1,
+            Tok::Punct(")" | "}") => depth = depth.saturating_sub(1),
+            Tok::Word(w) if depth == 0 && w == "OUTPUT_FORMAT" => {
+                return match (toks.get(i + 1), toks.get(i + 2)) {
+                    (Some((Tok::Punct("("), _)), Some((Tok::Word(f) | Tok::Str(f), _))) => format_class(f),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Parses a number: decimal or `0x` hex, with an optional `K` or `M` suffix
 /// (ld.lld has no `G` either). ELF64 takes any `u64`; ELF32 (RV32, until
 /// #159) only values up to `i64::MAX`, the type its scripts are evaluated in.
@@ -385,18 +421,14 @@ impl Parser {
                     // first; merlin-ld also wants the others to be names it knows.
                     loop {
                         let fmt = self.word_or_str("an output format")?;
-                        let class = match fmt.as_str() {
-                            "elf32-littleriscv" => Class::Elf32,
-                            "elf64-littleriscv" => Class::Elf64,
-                            _ => {
-                                return error(
-                                    line,
-                                    format!(
-                                        "OUTPUT_FORMAT({fmt}): only elf32-littleriscv and elf64-littleriscv \
-                                         are supported"
-                                    ),
-                                )
-                            }
+                        let Some(class) = format_class(&fmt) else {
+                            return error(
+                                line,
+                                format!(
+                                    "OUTPUT_FORMAT({fmt}): only elf32-littleriscv and elf64-littleriscv \
+                                     are supported"
+                                ),
+                            );
                         };
                         script.format.get_or_insert(class);
                         if !self.eat(",") {
@@ -1038,6 +1070,37 @@ mod tests {
         .unwrap();
         assert_eq!(s.format, Some(Class::Elf64));
         assert_eq!(parse("ENTRY(_start)", Class::Elf32).unwrap().format, None);
+        // declared_format finds the same name without parsing the script.
+        for (src, want) in [
+            (r#"OUTPUT_FORMAT("elf64-littleriscv")"#, Some(Class::Elf64)),
+            (
+                r#"ENTRY(_start) OUTPUT_FORMAT("elf32-littleriscv", "elf64-littleriscv")"#,
+                Some(Class::Elf32),
+            ),
+            (
+                "MEMORY { RAM (rwx) : ORIGIN = 0, LENGTH = 4 }\nOUTPUT_FORMAT(\"elf64-littleriscv\")",
+                Some(Class::Elf64),
+            ),
+            // The first command counts, as in the parser.
+            (
+                r#"OUTPUT_FORMAT("elf32-littleriscv") OUTPUT_FORMAT("elf64-littleriscv")"#,
+                Some(Class::Elf32),
+            ),
+            ("ENTRY(_start)", None),
+        ] {
+            assert_eq!(declared_format(src), want, "{src}");
+            assert_eq!(parse(src, Class::Elf64).unwrap().format, want, "{src}");
+        }
+        // And nothing where the parser finds no OUTPUT_FORMAT it knows.
+        for src in [
+            r#"OUTPUT_FORMAT("elf64-bigriscv")"#,
+            "OUTPUT_FORMAT",
+            // A word among a command's arguments, or in SECTIONS, is no command.
+            "ENTRY(OUTPUT_FORMAT) SECTIONS { OUTPUT_FORMAT = 1; }",
+            "/* unterminated",
+        ] {
+            assert_eq!(declared_format(src), None, "{src}");
+        }
         assert_eq!(
             err("OUTPUT_FORMAT(\"elf32-littleriscv\", \"elf64-bigriscv\")"),
             "1: OUTPUT_FORMAT(elf64-bigriscv): only elf32-littleriscv and elf64-littleriscv are supported"
