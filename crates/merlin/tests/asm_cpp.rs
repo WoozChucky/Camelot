@@ -1,6 +1,8 @@
 //! merlin's preprocessor in assembler-with-cpp mode against clang's (#193):
-//! every `.S` source of the repository (the examples, the boot ROM) and
-//! `include/asm.h`, preprocessed for RV32 and for RV64 with
+//! every `.S` source of the repository (the examples, the boot ROM,
+//! merlin-ld's and merlin-objdump's test fixtures: every `.S` file outside
+//! `target/` and hidden directories) and `include/asm.h`, preprocessed for
+//! RV32 and for RV64 with
 //! `-I include`, must come out of `merlin -E` exactly as out of
 //! `clang -E -x assembler-with-cpp`, but for two things clang writes that
 //! merlin does not:
@@ -24,25 +26,25 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The sources: every `.S` of `examples/*/` and `crates/grail/rom`, and the
+/// The sources: every `.S` file of the repository (but in `target/` and in
+/// directories whose name starts with `.`, `.git` and worktrees), and the
 /// header, relative to the repository root with `/`.
 fn sources(root: &Path) -> Vec<String> {
-    let mut found = vec!["include/asm.h".to_string()];
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root.join("examples"))
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.is_dir())
-        .collect();
-    dirs.push(root.join("crates/grail/rom"));
-    for dir in dirs {
-        for f in std::fs::read_dir(&dir).unwrap() {
-            let p = f.unwrap().path();
-            if p.extension().is_some_and(|e| e == "S") {
-                let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
-                found.push(rel);
+    fn walk(root: &Path, dir: &Path, found: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let name = p.file_name().unwrap().to_string_lossy();
+            if p.is_dir() {
+                if name != "target" && !name.starts_with('.') {
+                    walk(root, &p, found);
+                }
+            } else if p.extension().is_some_and(|e| e == "S") {
+                found.push(p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"));
             }
         }
     }
+    let mut found = vec!["include/asm.h".to_string()];
+    walk(root, root, &mut found);
     found.sort();
     found
 }
@@ -113,7 +115,15 @@ fn merlin_e(root: &Path, source: &str, x: Xlen) -> String {
 fn assembler_with_cpp_matches_clang() {
     let root = repo_root();
     let sources = sources(&root);
-    assert!(sources.len() > 15, "{sources:?}");
+    // The examples, the boot ROM and the fixtures of both tools.
+    for dir in [
+        "examples/",
+        "crates/grail/rom/",
+        "crates/merlin-ld/tests/",
+        "crates/merlin-objdump/tests/",
+    ] {
+        assert!(sources.iter().any(|s| s.starts_with(dir)), "{dir} in {sources:?}");
+    }
     let mut wrong = Vec::new();
     for source in &sources {
         for x in [Xlen::Rv32, Xlen::Rv64] {

@@ -76,6 +76,9 @@
 //!   replaced in it, as assembly comments must. A line with only `#` is
 //!   still the null directive, and a directive's name always means the
 //!   directive, so a comment may not start with `# if` or `# define`.
+//!   C's comments are still comments: a `/*` in such a line (a glob such
+//!   as `examples/*/`) starts one that runs to the next `*/`, lines of
+//!   code in between, as in clang.
 //! * `__ASSEMBLER__` is defined, and `__STDC_VERSION__` and `__STDC_HOSTED__`
 //!   are what clang gives a `.S` file ([`predefined`]).
 //! * Pasting two tokens that do not form one (`. ## name`) is no error: they
