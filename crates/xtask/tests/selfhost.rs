@@ -30,7 +30,13 @@ const PROMPT: &str = "$ ";
 /// references are.
 fn corpus(big: bool) -> Vec<(String, String)> {
     let root = repo_root();
-    let assembly = |p: &std::path::Path| p.extension().is_some_and(|x| x == "s" || x == "S");
+    // Assembly sources, not the preprocessed linker script (kernel.lds.S).
+    let assembly = |p: &std::path::Path| {
+        p.extension().is_some_and(|x| x == "s" || x == "S")
+            && !p
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(".lds.S"))
+    };
     let mut files: Vec<PathBuf> = vec![root.join("crates/merlin-as/tests/golden/encode.s")];
     for dir in [
         "kernel",
@@ -70,13 +76,15 @@ fn corpus(big: bool) -> Vec<(String, String)> {
                 .unwrap()
                 .to_string_lossy()
                 .replace('\\', "/");
-            let text = xtask::examples::assembly_of(
-                &root,
-                &rel,
-                &[xtask::examples::INCLUDE_DIR],
-                xtask::examples::Xlen::Rv32,
-            )
-            .unwrap();
+            // The kernel's own sources also include its headers
+            // (kernel/include), as `cargo xtask kernel` builds them.
+            let kernel_dirs = [xtask::examples::INCLUDE_DIR, "kernel/include"];
+            let dirs: &[&str] = if rel.starts_with("kernel/") {
+                &kernel_dirs
+            } else {
+                &[xtask::examples::INCLUDE_DIR]
+            };
+            let text = xtask::examples::assembly_of(&root, &rel, dirs, xtask::examples::Xlen::Rv32).unwrap();
             let name = rel.strip_suffix(".S").map_or(rel.clone(), |s| format!("{s}.s"));
             (name.replace('/', "_"), text)
         })

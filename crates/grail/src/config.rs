@@ -61,6 +61,21 @@ pub struct MachineConfig {
     /// ([`crate::Machine::load_elf`]). RV32 by default while both widths exist (#159
     /// removes RV32).
     pub xlen: Xlen,
+    /// The paging modes an RV64 hart implements: Sv39 and Sv48 by default, or Sv39
+    /// only, as on most RV64 boards (`--paging sv39`, #172): `satp` then refuses a
+    /// write of MODE 9 (WARL, spec section 5), which is how software finds out. An
+    /// RV32 hart has Sv32 whatever this says.
+    pub paging: Paging,
+}
+
+/// What [`MachineConfig::paging`] lets an RV64 hart translate with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Paging {
+    /// Sv48 and Sv39 (and Bare).
+    #[default]
+    Sv48,
+    /// Sv39 (and Bare) only: no Sv48.
+    Sv39,
 }
 
 /// One network card of a [`MachineConfig`]: what it is plugged into, its address, and
@@ -284,6 +299,7 @@ impl Default for MachineConfig {
             disks: Vec::new(),
             nets: Vec::new(),
             xlen: Xlen::Rv32,
+            paging: Paging::Sv48,
         }
     }
 }
@@ -413,6 +429,15 @@ pub fn parse_xlen(s: &str) -> Result<Xlen, String> {
         "32" => Ok(Xlen::Rv32),
         "64" => Ok(Xlen::Rv64),
         s => Err(format!("'{s}' is not a register width (32 or 64)")),
+    }
+}
+
+/// Parses a `--paging` value: `sv48` (Sv48 and Sv39) or `sv39` (Sv39 only).
+pub fn parse_paging(s: &str) -> Result<Paging, String> {
+    match s.trim() {
+        "sv48" => Ok(Paging::Sv48),
+        "sv39" => Ok(Paging::Sv39),
+        s => Err(format!("'{s}' is not a paging mode (sv39 or sv48)")),
     }
 }
 

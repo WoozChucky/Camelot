@@ -3,8 +3,8 @@
 //! image of `cargo xtask fs`, made bootable, boots the kernel on Grail with no
 //! program, whose shell then runs programs from the disk's `/bin`. An RV64
 //! machine boots an RV64 boot block built with merlin-as and merlin-ld through
-//! the RV64 disk loader (#151; Camelot's bootloader and kernel are RV32 until
-//! #154). The image
+//! the RV64 disk loader (#151; Camelot's RV64 bootloader and kernel boot from
+//! disk in tests/kernel_rv64.rs, #154). The image
 //! (`xtask::fs::IMAGE_SIZE` blocks, the size the spec gives) holds the disk kernel, which has no programs of its own (issue #108):
 //! it boots in a machine of the default 4 MiB, and panics when there is no shell
 //! to run.
@@ -68,7 +68,8 @@ fn the_commands_match_the_build() {
     assert_eq!(
         xtask::boot::BOOTLOADER.commands(),
         [
-            "merlin-as kernel/boot/boot.s -o target/boot/boot.o",
+            "merlin -E -I include kernel/boot/boot.S -o target/boot/boot.s",
+            "merlin-as target/boot/boot.s -o target/boot/boot.o",
             "merlin-ld -T kernel/boot/link.ld target/boot/boot.o -o kernel/boot/boot.elf"
         ]
     );
@@ -85,7 +86,7 @@ fn the_commands_match_the_build() {
     );
     // The command lines in the loader's comments are these, for both widths.
     let root = repo_root();
-    for p in [xtask::boot::DISKBOOT, xtask::boot::DISKBOOT_RV64] {
+    for p in xtask::boot::PROGRAMS {
         let source = std::fs::read_to_string(root.join(p.dir).join(p.source)).unwrap();
         for cmd in p.commands() {
             let cmd = cmd.replace(&format!("{}/", p.obj_dir()), "");
@@ -530,7 +531,8 @@ fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     };
     let rom = assembly("crates/grail/rom/diskboot.S", Xlen::Rv32);
     let rom64 = assembly("crates/grail/rom/diskboot.S", Xlen::Rv64);
-    let loader = read("kernel/boot/boot.s");
+    let loader = assembly("kernel/boot/boot.S", Xlen::Rv32);
+    let loader64 = assembly("kernel/boot/boot.S", Xlen::Rv64);
     let spec = read("docs/excalibur-spec.md");
     let fs_doc = read("docs/camelot-fs.md");
 
@@ -583,15 +585,19 @@ fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     }
     assert!(unchecked.is_empty(), "no RV64 source defines {unchecked:?}");
     assert!(spec.contains("exit code 0xFD") && spec.contains("0x544F_4F42"));
-    // The fields the bootloader reads are where mkfs writes them.
-    assert_eq!(equ(&loader, "KERNEL_SECTOR") as usize, boot::KERNEL_SECTOR_AT);
-    assert_eq!(equ(&loader, "KERNEL_SECTORS") as usize, boot::KERNEL_SECTORS_AT);
-    assert_eq!(equ(&loader, "HEADERS_SIZE") as usize, boot::KERNEL_HEADERS);
-    assert_eq!(
-        u64::from(equ(&loader, "BOOT_ENTRY")),
-        grail::boot::BOOT_ENTRY_ADDR
-    );
-    assert_eq!(equ(&loader, "RAM_BASE"), boot::RAM_BASE);
+    // The fields the bootloader reads are where mkfs writes them, at both
+    // widths, and the ELF layouts each width's loader reads are the elf
+    // crate's.
+    for loader in [&loader, &loader64] {
+        assert_eq!(equ(loader, "KERNEL_SECTOR") as usize, boot::KERNEL_SECTOR_AT);
+        assert_eq!(equ(loader, "KERNEL_SECTORS") as usize, boot::KERNEL_SECTORS_AT);
+        assert_eq!(equ(loader, "HEADERS_SIZE") as usize, boot::KERNEL_HEADERS);
+        assert_eq!(u64::from(equ(loader, "BOOT_ENTRY")), grail::boot::BOOT_ENTRY_ADDR);
+        assert_eq!(equ(loader, "RAM_BASE"), boot::RAM_BASE);
+        assert_eq!(equ(loader, "EXIT_BOOT_FAILED"), 0xfc);
+    }
+    assert_eq!(equ(&loader, "PHDR_SIZE") as usize, elf::PHDR_SIZE);
+    assert_eq!(equ(&loader64, "PHDR_SIZE") as usize, elf::PHDR64_SIZE);
     for (at, field) in [
         (boot::KERNEL_SECTOR_AT, "kernel_sector"),
         (boot::KERNEL_SECTORS_AT, "kernel_sectors"),

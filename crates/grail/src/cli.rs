@@ -5,7 +5,8 @@
 use crate::config::DiskSource;
 use crate::net::Hub;
 use crate::{
-    parse_clock, parse_harts, parse_ram_size, parse_xlen, DiskConfig, Machine, MachineConfig, NetConfig,
+    parse_clock, parse_harts, parse_paging, parse_ram_size, parse_xlen, DiskConfig, Machine, MachineConfig,
+    NetConfig,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -31,6 +32,9 @@ for the Camelot kernel (spec section 7, \"Boot from disk\").
                   a nominal 10 MHz clock to software
   --xlen 32|64    the harts' width, RV32 or RV64 (default 32; an ELF64 program
                   makes the machine RV64)
+  --paging MODE   the paging modes of an RV64 hart: sv48 (Sv48 and Sv39, the
+                  default) or sv39 (Sv39 only, as on most RV64 boards: satp then
+                  refuses Sv48)
   --harts N       N harts (cores), 1 to 8 (default 1). They share memory and
                   devices and take turns, one instruction each per step, so
                   with --clock each runs at FREQ. Hart 0 starts the program;
@@ -141,6 +145,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, Error> {
             "--clock" => config.clock_hz = Some(parsed("--clock", value("--clock")?, parse_clock)?),
             "--harts" => config.harts = parsed("--harts", value("--harts")?, parse_harts)?,
             "--xlen" => config.xlen = parsed("--xlen", value("--xlen")?, parse_xlen)?,
+            "--paging" => config.paging = parsed("--paging", value("--paging")?, parse_paging)?,
             "--disk" | "--disk-ro" => {
                 let disk = parsed(&a, value(&a)?, DiskConfig::parse)?;
                 config.disks.push(disk.with_read_only(a == "--disk-ro"));
@@ -312,6 +317,10 @@ mod tests {
         let o = parse(args("--xlen 64 p.elf")).unwrap();
         assert_eq!(o.config.xlen, crate::Xlen::Rv64);
         assert!(parse(args("--xlen 128 p.elf")).is_err());
+        assert_eq!(o.config.paging, crate::Paging::Sv48);
+        let o = parse(args("--xlen 64 --paging sv39 p.elf")).unwrap();
+        assert_eq!(o.config.paging, crate::Paging::Sv39);
+        assert!(parse(args("--paging sv32 p.elf")).is_err());
         assert_eq!(parse(args("-h")).err(), Some(Error::Help));
         assert_eq!(
             parse(args("")).err(),

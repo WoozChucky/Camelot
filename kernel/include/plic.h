@@ -9,10 +9,13 @@
 #include "types.h"
 
 #define PLIC_BASE 0x0c000000
-#define PLIC_PRIORITY(src) (PLIC_BASE + 4 * (src))
-#define PLIC_ENABLE(ctx) (PLIC_BASE + 0x2000 + 0x80 * (ctx))
-#define PLIC_THRESHOLD(ctx) (PLIC_BASE + 0x200000 + 0x1000 * (ctx))
-#define PLIC_CLAIM(ctx) (PLIC_BASE + 0x200004 + 0x1000 * (ctx))
+#define PLIC_SIZE 0x04000000
+/* Register offsets from the PLIC's base (plic.c reaches them through its
+ * mapping, ioremap(), vm.h). */
+#define PLIC_PRIORITY(src) (4 * (src))
+#define PLIC_ENABLE(ctx) (0x2000 + 0x80 * (ctx))
+#define PLIC_THRESHOLD(ctx) (0x200000 + 0x1000 * (ctx))
+#define PLIC_CLAIM(ctx) (0x200004 + 0x1000 * (ctx))
 
 /* Context 1: hart 0 in S-mode. (Context 0 is M-mode, which the kernel leaves
  * alone: mie.MEIE stays clear.) */

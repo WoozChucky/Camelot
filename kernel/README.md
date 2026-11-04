@@ -78,7 +78,7 @@ root: the kernel replays its log if a crash left a transaction there, lists
 `/` and runs its filesystem self-test (spec section 10, "Kernel
 filesystem"). `cargo xtask fs` builds the root image with the user programs
 in `/bin` and the files of `fs/` at `/`, no LLVM needed. The image is
-bootable: it holds the bootloader (`boot/boot.s`) in its boot block and
+bootable: it holds the bootloader (`boot/boot.S`) in its boot block and
 the disk kernel, `kernel-disk.elf`, after the filesystem, so Grail can boot
 it with no program (spec section 7, "Boot from disk"; `docs/camelot-fs.md`,
 "Booting"), in the default 4 MiB of RAM. The bootloader prints one line,
@@ -354,11 +354,63 @@ process yield while it holds a spinlock (`panic: sched: holding a lock
 other than proc_lock`), 15 calls `pop_off()` with no `push_off()` and 16
 turns interrupts on under a `push_off()` before its `pop_off()`.
 
+## RV64: a higher-half kernel (#154)
+
+The same sources build an RV64 kernel too, `kernel-rv64.elf` (and
+`kernel-disk-rv64.elf`, the same kernel for now: there are no RV64 user
+programs to build in until #156), with merlin's LP64 code and the same
+linker script, `kernel.lds.S`, preprocessed for RV64. It runs as Linux's riscv64 kernel does (spec section 10,
+"The RV64 kernel"):
+
+```
+grail kernel/kernel-rv64.elf                     # Sv48, the default hart
+grail --paging sv39 --harts 4 kernel/kernel-rv64.elf
+```
+
+- The image is linked at 0xffff_ffff_8000_0000 and loaded at 0x8000_0000
+  (`AT` in `kernel.lds.S`). `entry.S` starts at the physical address with
+  paging off; `setup_vm()` (`vm.c`) probes `satp` for Sv48, falling back to
+  Sv39, and builds the early page table, which maps the image at both
+  addresses; every hart turns paging on and jumps to the high address;
+  `kvminit()` builds the final table, which drops the identity mapping.
+- All of RAM is in a direct map at `PAGE_OFFSET` (0xffff_af80_0000_0000 in
+  Sv48); the kernel stacks at the start of the vmalloc area, then the
+  devices, mapped as their drivers ask (`ioremap()`, which finds them room,
+  as Linux's does); sysinfo and the UART in the fixmap for the boot. `pa()` and `va()` convert
+  between kernel pointers and physical addresses, as Linux's `__pa` and
+  `__va`: `kalloc()` returns direct-map pointers, and page tables, `satp`
+  and the devices' DMA registers take physical ones.
+- Kernel stacks are 16 KiB with an unmapped guard page below, and a stack
+  that overflows is reported as `panic: kernel stack overflow in <name>`.
+  A freed stack stays mapped in its hart's cache (two at most, Linux's
+  `NR_CACHED_STACKS`); the others are unmapped and their pages freed where
+  no lock is held (`kstack_reclaim()`).
+- The boot runs every self-test, on 1 to 8 harts, from the ROM or from a
+  disk (`boot/boot.S` builds `boot-rv64.elf` too), and ends with `user
+  space: not on RV64 yet` and the failure count as the exit code.
+
+```
+...
+paging: on (Sv48)
+vm self-test: 26/26 passed
+...
+kstack self-test: 3/3 passed
+smp: 4 harts running
+kstack: 880 of 16384 bytes used at most
+user space: not on RV64 yet
+```
+
+`cargo xtask kernel` builds both widths; `--xlen 64` builds the RV64 one
+alone, and `--cc clang --xlen 64` its reference build (clang
+`--target=riscv64-unknown-elf -march=rv64ima_zicsr -mabi=lp64
+-mcmodel=medany`, in `target/kernel/clang/rv64`). Its tests are
+`crates/xtask/tests/kernel_rv64.rs`.
+
 ## Locking
 
 Every structure that more than one thread, a thread and an interrupt
 handler, or more than one hart can reach is protected by a
-lock (spec section 10, "Kernel locking"). Spinlocks (`spinlock.s`,
+lock (spec section 10, "Kernel locking"). Spinlocks (`spinlock.S`,
 `include/spinlock.h`) are xv6's: `acquire()` turns interrupts off on the
 hart and spins on an `amoswap.w`; `release()` turns them back on once the
 last lock is gone. Code that must wait sleeps with `sleep(chan, lk)`, which
@@ -411,15 +463,15 @@ one process.
 
 | File | What it does |
 |---|---|
-| `entry.s` | `_start` (M-mode): early trap vector, stack (hart 0's, or the one `smp_boot()` gave another hart), zero `.bss` (hart 0 only), `call start`, `mret` to S-mode. `supervisor_entry`: hart 0 calls `kmain`, then `machine_halt` with its return value; the others call `hart_main`. Also `xcal_dbg`/`xcal_halt` for C and the early trap handler (prints `mcause`, `mepc`, `mtval`, exits 0xff) |
+| `entry.S` | `_start` (M-mode): early trap vector, stack (hart 0's, or the one `smp_boot()` gave another hart), zero `.bss` (hart 0 only), `call start`, `mret` to S-mode. `supervisor_entry`: hart 0 calls `kmain`, then `machine_halt` with its return value; the others call `hart_main`. Also `xcal_dbg`/`xcal_halt` for C and the early trap handler (prints `mcause`, `mepc`, `mtval`, exits 0xff). On RV64, with paging off: `setup_vm()` on hart 0, `satp` = the early table, the jump to the link addresses (adding `va_kernel_pa_offset`), the high stack, `stvec`. The early page tables and the harts' overflow stacks |
 | `start.c` | `start()`, on each hart: M-mode setup: `medeleg`/`mideleg`, `stvec`, `mtvec`, the hart's `mscratch` block, its first timer interrupt, `mstatus.MPP = S`, `mepc` |
-| `machine.s` | `machine_vec`, the M-mode trap handler: forwards the machine timer (marking a tick) and IPIs (the machine software interrupt) to S-mode as SSIP, serves machine calls (`MCALL_HALT`, `MCALL_IPI`). `machine_halt()` and `machine_ipi()` make them from S-mode |
-| `kernelvec.s` | `kernel_vec`, the trap vector for traps from S-mode: saves x1-x31 and the trap CSRs as a `struct trap_frame` on the stack, calls `kernel_trap`, restores, `sret`. Also `illegal_instruction()` for the panic tests |
-| `uservec.s` | `user_vec`, the trap vector for traps from U-mode: saves the user registers in the thread's trap frame (`sscratch`), calls `user_trap` on the thread's kernel stack; `user_return`: frame to registers, `sret` to U-mode |
+| `machine.S` | `machine_vec`, the M-mode trap handler: forwards the machine timer (marking a tick) and IPIs (the machine software interrupt) to S-mode as SSIP, serves machine calls (`MCALL_HALT`, `MCALL_IPI`). `machine_halt()` and `machine_ipi()` make them from S-mode |
+| `kernelvec.S` | `kernel_vec`, the trap vector for traps from S-mode: saves x1-x31 and the trap CSRs as a `struct trap_frame` on the stack, calls `kernel_trap`, restores, `sret`. Also `illegal_instruction()` for the panic tests. On RV64 it checks first that the frame fits on the stack (one bit of `sp`, the stacks being 32 KiB aligned) and sends a kernel stack overflow to the hart's overflow stack and `kstack_overflow()` |
+| `uservec.S` | `user_vec`, the trap vector for traps from U-mode: saves the user registers in the thread's trap frame (`sscratch`), calls `user_trap` on the thread's kernel stack; `user_return`: frame to registers, `sret` to U-mode |
 | `trap.c` | `kernel_trap()`: counts timer ticks (hart 0's wake sleepers), serves TLB shootdowns, claims/completes PLIC interrupts and runs the console's or a disk's handler, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `user_trap()`: a tick yields, an ecall goes to `syscall()`, a fault kills the process; `user_trap_return()`, `trap_init()`, `panic()` |
 | `proc.c` | processes and threads: `proc_create()` (slots, kernel stack, page table, ELF, stack with the arguments, descriptors 0-2 and working directory inherited), `proc_exec_load()` and `proc_exec_commit()` (a new address space for the same process, loaded first; then the other threads ended and the old space freed), `kproc_create()` (a kernel process running a C function), `proc_run_init()` (the shell, with the console as descriptors 0-2), the round-robin `scheduler()` over the threads on every hart (idling in `wfi` while nothing is runnable, woken by an IPI when something is), `yield()`, `sleep()`/`wakeup()`, `proc_exit()` (ending every thread first), `proc_kill()`, `proc_wait()`, `proc_sbrk()`, `thread_create()`/`thread_exit()`/`thread_join()`, `futex_wait()`/`futex_wake()`, and the descriptor table under its lock (`fd_get()`, `fd_install()`, `fd_take()`, `proc_cwd()`) |
-| `swtch.s` | `swtch()`: saves `ra`, `sp`, `s0`-`s11` and loads another thread's |
-| `spinlock.s` | `acquire()`/`release()` (an `amoswap.w` loop; panics on a lock acquired twice or released unheld), `holding()`, `push_off()`/`pop_off()` (nested interrupt disabling), `mycpu()` (`&cpus[tp]`) |
+| `swtch.S` | `swtch()`: saves `ra`, `sp`, `s0`-`s11` and loads another thread's |
+| `spinlock.S` | `acquire()`/`release()` (an `amoswap.w` loop; panics on a lock acquired twice or released unheld), `holding()`, `push_off()`/`pop_off()` (nested interrupt disabling), `mycpu()` (`&cpus[tp]`) |
 | `spinlock.c` | `cpus[]`, the per-hart state; `initlock()`, `cpu_init()`, `cpuid()`, and the panic messages that name the lock and the hart |
 | `smp.c` | the other harts: `smp_boot()` (stacks, the IPI that wakes them, the TLB shootdown self-test), `hart_main()`, `tlb_shootdown()`/`tlb_serve()` |
 | `sleeplock.c` | sleep locks (xv6's), held across sleeps: `acquiresleep()`/`releasesleep()`, for the buffers, the inodes and each process's heap |
@@ -431,9 +483,9 @@ one process.
 | `pipe.c` | pipes (xv6's): a 512-byte buffer in a page, readers and writers sleeping on each other, end of input when the writers are gone, `-EPIPE` when the readers are |
 | `user/` | the user programs (`*.c`, `*.s`), their runtime (`crt0.s`, `usys.s`, `user.h`), the C library (`lib/`) and linker script `user.ld`, built with merlin, merlin-as and merlin-ld and embedded in `kernel.elf` through `userprogs.s`, which the build generates (not a file here: see "Building") |
 | `kalloc.c` | physical page allocator: `kinit()` reads RAM's base and size from sysinfo and frees every page from `__kernel_end` to the end of RAM; `kalloc()`, `kzalloc()`, `kfree()`, `kfree_pages()` |
-| `vm.c` | Sv32 page tables: `walk()`, `map_pages()`, `unmap_pages()`, `pagetable_create()`/`pagetable_free()`; `kvminit()` builds the kernel page table, `kvminithart()` turns paging on; user address spaces: `uvm_create()`/`uvm_free()`, `uvm_range_ok()`, `copyin()`, `copyout()`, `copyinstr()` |
+| `vm.c` | page tables (Sv32; on RV64 Sv48 or Sv39, with the levels the boot chose): `walk()`, `map_pages()`, `unmap_pages()`, `pagetable_create()`/`pagetable_free()`; `kvminit()` builds the kernel page table, `kvminithart()` turns paging on; user address spaces: `uvm_create()`/`uvm_free()`, `uvm_range_ok()`, `copyin()`, `copyout()`, `copyinstr()`; `ioremap()`; the kernel stacks (`kstack_alloc()`: on RV64 16 KiB in the vmalloc area with a guard page); on RV64 `setup_vm()`, the early page table and the `satp` probe |
 | `vmtest.c` | the memory self-tests: allocate and free every page, `kzalloc()` and `pagetable_create()` clear a reused dirty page, a second mapping of one page, store page faults on text and rodata, building and freeing a page table |
-| `probe.s` | `probe_load()`/`probe_store()`: a word access that returns the trap cause instead of panicking (`kernel_trap` resumes them at `probe_fault`) |
+| `probe.S` | `probe_load()`/`probe_store()`: a word access that returns the trap cause instead of panicking (`kernel_trap` resumes them at `probe_fault`) |
 | `sysinfo.c` | reads Grail's sysinfo block: registers and the device table |
 | `timer.c` | `timebase_hz()` (sysinfo's `SYS_TIMEBASE_HZ`, read once), `timer_interval()`, `timer_init()` |
 | `plic.c` | `plic_init()` (UART source enabled for hart 0's S-mode context, which takes every device interrupt), `plic_enable()` (another source, such as a disk's), `plic_claim()`, `plic_complete()` |
@@ -445,15 +497,15 @@ one process.
 | `fstest.c` | `fs_boot()`: mounts disk 0 in a kernel process, lists `/`, runs the filesystem self-test (and, with `fs_test` patched to 2, its transactions; to 3, filling the disk) |
 | `net/` | the network stack (`docs/camelot-net.md`), a file per layer: `nic.c` (the card driver: descriptor rings, `nic_intr()`, the transmit queue), `pbuf.c` (the buffer pool), `ether.c`, `arp.c` (the cache), `ip.c` (checks, routing, loopback), `icmp.c` (echo, `icmp_ping()`), `udp.c` (the kernel-internal socket API, the echo service), `tcp.c` (connections, retransmission, the kernel-internal socket API), `dhcp.c` (the client), `net.c` (configuration, `net_boot()`, the counters, `net_timer()`, the `netinfo`/`netconf`/`ping` system calls), `socket.c` (the socket system calls: sockets behind file descriptors) |
 | `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin`, and `/dev/console` is made too |
-| `boot/` | the bootloader of a bootable disk (`boot.s`, linked by `link.ld` into the committed `boot.elf` with `cargo xtask boot`): the boot block, which loads the kernel ELF stored after the filesystem; `camelot-fs mkfs --boot` installs it |
-| `riscv.s` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()`, `wfi()`, the atomics `atomic_swap()`/`atomic_add()`/`atomic_or()`, and `fence_rw()` |
+| `boot/` | the bootloader of a bootable disk (`boot.S`, linked by `link.ld` into the committed `boot.elf` for RV32 and `boot-rv64.elf` for RV64 with `cargo xtask boot`): the boot block, which loads the kernel ELF stored after the filesystem; `camelot-fs mkfs --boot` installs it |
+| `riscv.S` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()`, `wfi()`, the atomics `atomic_swap()`/`atomic_add()`/`atomic_or()`, and `fence_rw()` |
 | `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, the network cards (`net_init`), ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, the filesystem (`fs_boot`), the network's address (`net_boot`), the other harts (`smp_boot`), then the user-space shell as the first process |
 | `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |
 | `console.c` | the console device (`read` and `write` on it): `console_read()` (line editing and echo: backspace, CR/LF/CR LF, Ctrl-D; sleeps until a line is complete), `console_write()`, `console_intr()` (the UART interrupt, waking readers) |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `libgcc.c` | `__divdi3`, `__udivdi3`, `__moddi3`, `__umoddi3`, `__muldi3`: the C library's (`user/lib/libgcc.c`), for `long long` division on RV32 |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |
-| `kernel.ld` | layout: `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end` |
+| `kernel.lds.S` | the layout, one linker script for both widths, preprocessed first (`merlin -E -P`, as Linux's `vmlinux.lds.S`): `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end`; on RV64 linked at 0xffff_ffff_8000_0000 and loaded at 0x8000_0000 (`AT`), the boot stack 32 KiB aligned |
 | `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct thread`, `struct user_program`, sleep and wakeup, the thread and futex calls), `context.h` (`struct context`, `swtch`), `spinlock.h` (`struct spinlock`, `struct cpu`, `NCPU`), `smp.h`, `sleeplock.h`, `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
 | `kernel.elf` | the prebuilt image, with the user programs built in, committed so `cargo test` and Grail need no build |
 | `kernel-disk.elf` | the prebuilt disk kernel: the same objects without the user programs, which a bootable root image holds (`cargo xtask fs`) |
@@ -479,23 +531,28 @@ generated by every build and is not a source here (it used to be committed;
 a stale copy in this directory is now an error): `cargo xtask kernel` writes
 it to `target/kernel/obj` with the objects, and it is a source like the
 others, linked in its name order. Then it compiles every `*.c` and
-assembles every `*.s` in this directory, in name order, and links with
-`kernel.ld`. By hand, from this directory, with the tools' command lines
+assembles every `*.S` in this directory, in name order (a `.S` file goes
+through the C preprocessor first, `merlin -E`, so that one source serves
+both widths: `#include <asm.h>` from the repository's `include/`, #193),
+and links with `kernel.lds.S`, the linker script, preprocessed the same way
+but without line markers (`-P`), which a linker script can't have. By hand, from this directory, with the tools' command lines
 (`cargo run -p merlin --`, and so on), the kernel build is:
 
 ```
 merlin -g -fdebug-compilation-dir=kernel -I include main.c -o main.c.s   # and each other .c
 merlin-as main.c.s -o main.c.o
-merlin-as entry.s -o entry.s.o               # and each other .s
+merlin -E -I ../include -I include entry.S -o entry.S.s   # and each other .S
+merlin-as entry.S.s -o entry.S.o
 merlin-as userprogs.s -o userprogs.s.o       # the generated one (in target/kernel/obj)
 merlin -g -fdebug-compilation-dir=kernel -I include net/arp.c -o net/arp.c.s   # the network stack's too
-merlin-ld -T kernel.ld -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf.c.o entry.s.o \
-       exec.c.o file.c.o fs.c.o fstest.c.o kalloc.c.o kernelvec.s.o kprintf.c.o libgcc.c.o log.c.o machine.s.o \
+merlin -E -P -I ../include -I include kernel.lds.S -o kernel.lds
+merlin-ld -T kernel.lds -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf.c.o entry.S.o \
+       exec.c.o file.c.o fs.c.o fstest.c.o kalloc.c.o kernelvec.S.o kprintf.c.o libgcc.c.o log.c.o machine.S.o \
        main.c.o net/arp.c.o net/dhcp.c.o net/ether.c.o net/icmp.c.o net/ip.c.o net/net.c.o \
-       net/nic.c.o net/pbuf.c.o net/tcp.c.o net/udp.c.o pipe.c.o plic.c.o probe.s.o proc.c.o riscv.s.o \
-       sleeplock.c.o smp.c.o spinlock.c.o spinlock.s.o start.c.o \
-       string.c.o swtch.s.o syscall.c.o sysfile.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
-       userprogs.s.o uservec.s.o vm.c.o vmtest.c.o
+       net/nic.c.o net/pbuf.c.o net/tcp.c.o net/udp.c.o pipe.c.o plic.c.o probe.S.o proc.c.o riscv.S.o \
+       sleeplock.c.o smp.c.o spinlock.c.o spinlock.S.o start.c.o \
+       string.c.o swtch.S.o syscall.c.o sysfile.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
+       userprogs.s.o uservec.S.o vm.c.o vmtest.c.o
 ```
 
 (`-g` writes line tables for merlin-dbg, which are not loaded; the
@@ -524,12 +581,13 @@ clang --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 -mno-relax -
       -std=c11 -O2 -ffreestanding -fno-builtin -nostdinc -nostdlib -fno-pic -fno-common -fno-ident \
       -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
       -Wall -Wextra -Werror -S sh.c -o .../user/sh.s    # in user/, and each other .c
-clang --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 -mno-relax -c entry.s -o entry.s.o   # and each other .s
+clang --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 -mno-relax -I../include -Iinclude \
+      -c entry.S -o entry.S.o                                      # and each other .S
 clang --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 -mno-relax -mcmodel=medany \
       -std=c11 -O2 -ffreestanding -fno-builtin -nostdinc -nostdlib -fno-pic -fno-common -fno-ident \
       -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
       -Wall -Wextra -Werror -Iinclude -c main.c -o main.c.o        # and each other .c
-ld.lld -T kernel.ld -o kernel.elf bio.c.o blk.c.o ... vmtest.c.o     # the same objects as above
+ld.lld -T kernel.lds -o kernel.elf bio.c.o blk.c.o ... vmtest.c.o    # the same objects and script as above
 ```
 
 `--as merlin` assembles the `.s` files with merlin-as instead (bootstrapping

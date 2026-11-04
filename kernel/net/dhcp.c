@@ -150,7 +150,7 @@ static bool await(struct udp_sock *s, u8 *buf, u32 xid, u32 want, u32 deadline, 
         if ((i32)left <= 0) {
             return false;
         }
-        int n = udp_recvfrom(s, NULL, (u32)(uintptr)buf, PBUF_SIZE, NULL, NULL, left);
+        int n = udp_recvfrom(s, NULL, (uintptr)buf, PBUF_SIZE, NULL, NULL, left);
         if (n < 0) {
             return false;
         }
@@ -182,13 +182,13 @@ int dhcp_configure(void) {
         xid++;
         struct answer offer;
         u32 len = build(msg, DISCOVER, xid, 0, 0);
-        udp_sendto(s, IP_BROADCAST, DHCP_SERVER_PORT, NULL, (u32)(uintptr)msg, len);
+        udp_sendto(s, IP_BROADCAST, DHCP_SERVER_PORT, NULL, (uintptr)msg, len);
         if (!await(s, buf, xid, OFFER, ticks + DHCP_TIMEOUT, &offer) || offer.addr == 0) {
             continue;
         }
         struct answer ack;
         len = build(msg, REQUEST, xid, offer.addr, offer.server);
-        udp_sendto(s, IP_BROADCAST, DHCP_SERVER_PORT, NULL, (u32)(uintptr)msg, len);
+        udp_sendto(s, IP_BROADCAST, DHCP_SERVER_PORT, NULL, (uintptr)msg, len);
         if (!await(s, buf, xid, ACK, ticks + DHCP_TIMEOUT, &ack) || ack.type != ACK || ack.addr == 0) {
             continue;
         }

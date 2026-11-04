@@ -77,8 +77,8 @@ static const char *const reg_names[32] = {
     "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6", /* x24-x31 */
 };
 
-const char *trap_cause_name(u32 cause) {
-    u32 code = cause & ~CAUSE_INTERRUPT;
+const char *trap_cause_name(uintptr cause) {
+    uintptr code = cause & ~CAUSE_INTERRUPT;
     const char *name = NULL;
     if (cause & CAUSE_INTERRUPT) {
         if (code < 12) {
@@ -133,12 +133,11 @@ void panic(const char *msg) {
     halt_after_panic();
 }
 
-/* panic() for a trap: the cause, the trap CSRs and every register. */
-static void trap_panic(struct trap_frame *f) {
-    panic_begin();
-    kprintf("panic: %s\n", trap_cause_name(f->scause));
-    kprintf("  scause 0x%08x  sepc 0x%08x  stval 0x%08x  sstatus 0x%08x\n", f->scause, f->sepc, f->stval,
-            f->sstatus);
+/* The trap CSRs, how the active page table maps stval for a page fault, and
+ * every register. */
+static void trap_report(struct trap_frame *f) {
+    kprintf("  scause " REG_FMT "  sepc " REG_FMT "  stval " REG_FMT "  sstatus " REG_FMT "\n", f->scause,
+            f->sepc, f->stval, f->sstatus);
     /* The kernel's mappings are the same in every page table, so the active
      * one, a process's or the kernel's, shows how the kernel saw stval. */
     pagetable_t pt = vm_active_pagetable();
@@ -146,13 +145,41 @@ static void trap_panic(struct trap_frame *f) {
         vm_print_mapping(pt, f->stval);
     }
     for (int i = 1; i < 32; i++) {
-        kprintf("  %3s %08x", reg_names[i], f->regs[i]);
+        kprintf("  %3s " REG_HEX, reg_names[i], f->regs[i]);
         if (i % 4 == 0 || i == 31) {
             kprintf("\n");
         }
     }
+}
+
+/* panic() for a trap: the cause, the trap CSRs and every register. */
+static void trap_panic(struct trap_frame *f) {
+    panic_begin();
+    kprintf("panic: %s\n", trap_cause_name(f->scause));
+    trap_report(f);
     halt_after_panic();
 }
+
+#if __riscv_xlen == 64
+void kstack_overflow(struct trap_frame *f) {
+    panic_begin();
+    /* The stack sp was on, or ran out of: the KSTACK_SIZE bytes at a
+     * KSTACK_SLOT boundary, which sp is less than KSTACK_SIZE above or below
+     * (vm.h). */
+    uintptr sp = f->regs[REG_SP];
+    uintptr bottom = (sp + KSTACK_SIZE) & ~(KSTACK_SLOT - 1);
+    struct thread *t = mythread();
+    if (t != NULL) {
+        kprintf("panic: kernel stack overflow in %s (hart %u)\n", t->proc->name, cpuid());
+    } else {
+        kprintf("panic: kernel stack overflow on hart %u's boot stack\n", cpuid());
+    }
+    kprintf("  sp " REG_FMT ", the stack " REG_FMT "-" REG_FMT "\n", sp, bottom, bottom + KSTACK_SIZE);
+    kprintf("  %s\n", trap_cause_name(f->scause));
+    trap_report(f);
+    halt_after_panic();
+}
+#endif
 
 /* A supervisor external interrupt: claim the source from the PLIC, service
  * the device, complete. sip.SEIP follows the PLIC's line, so there is nothing
@@ -179,12 +206,12 @@ static bool probe_fixup(struct trap_frame *f) {
     if (f->scause & CAUSE_INTERRUPT) {
         return false;
     }
-    if (f->sepc != (u32)(uintptr)probe_load_insn && f->sepc != (u32)(uintptr)probe_store_insn) {
+    if (f->sepc != (uintptr)probe_load_insn && f->sepc != (uintptr)probe_store_insn) {
         return false;
     }
     f->regs[REG_A0] = f->scause;
     f->regs[REG_A1] = f->stval;
-    f->sepc = (u32)(uintptr)probe_fault;
+    f->sepc = (uintptr)probe_fault;
     return true;
 }
 
@@ -214,8 +241,9 @@ static void clock_tick(void) {
 static bool soft_interrupt(void) {
     w_sip(r_sip() & ~SIP_SSIP);
     tlb_serve();
-    u32 *scratch = &machine_scratch[cpuid() * MSCRATCH_WORDS];
-    if (atomic_swap(&scratch[MSCRATCH_TICK], 0) == 0) {
+    uintptr *scratch = &machine_scratch[cpuid() * MSCRATCH_WORDS];
+    /* The tick slot's low 32 bits, as machine_vec writes it. */
+    if (atomic_swap((volatile u32 *)&scratch[MSCRATCH_TICK], 0) == 0) {
         return false;
     }
     clock_tick();
@@ -251,14 +279,14 @@ static bool stack_fault(struct trap_frame *f) {
     if (proc_grow_stack(f->stval) == 0) {
         return true;
     }
-    kprintf("pid %u (%s): no memory to grow its stack to 0x%08x\n", p->pid, p->name, f->stval);
+    kprintf("pid %u (%s): no memory to grow its stack to " REG_FMT "\n", p->pid, p->name, f->stval);
     return false;
 }
 
 void user_trap(struct trap_frame *f) {
     /* From here on, a trap is the kernel's own. Interrupts stay off (the trap
      * cleared sstatus.SIE) until the process is back in U-mode. */
-    w_stvec((u32)(uintptr)kernel_vec);
+    w_stvec((uintptr)kernel_vec);
     if (f->scause == (CAUSE_INTERRUPT | IRQ_S_SOFT)) {
         /* A tick ends the process's time slice; an IPI alone doesn't. */
         if (soft_interrupt()) {
@@ -287,7 +315,7 @@ void user_trap_return(struct trap_frame *f) {
     /* No interrupt from here to sret: stvec is about to point at user_vec,
      * which only works for traps from U-mode. */
     intr_off();
-    w_stvec((u32)(uintptr)user_vec);
+    w_stvec((uintptr)user_vec);
     /* user_vec's tp for the next trap: this hart's id. */
     f->kernel_tp = cpuid();
     /* sret goes to U-mode (SPP = 0) and turns interrupts on there (SPIE). */
@@ -295,7 +323,7 @@ void user_trap_return(struct trap_frame *f) {
     user_return(f);
 }
 
-bool is_page_fault(u32 scause) {
+bool is_page_fault(uintptr scause) {
     return scause == CAUSE_INSTR_PAGE_FAULT || scause == CAUSE_LOAD_PAGE_FAULT ||
            scause == CAUSE_STORE_PAGE_FAULT;
 }
