@@ -6,23 +6,18 @@
 //! line and its text.
 
 use crate::frames::{self, Regs};
-use crate::remote::{self, Remote, StopEvent, Watch};
+use crate::remote::{self, hex_value, wrap, Remote, StopEvent, Watch};
 use crate::source::{Lines, Place};
-use crate::symbols::Symbols;
+use crate::symbols::{self, Symbols};
 use excalibur::{Inst, Syntax, Xlen};
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
 
-/// RV32 code until merlin-dbg learns RV64 (#153).
-fn decode(w: u32) -> Inst {
-    excalibur::decode(w, Xlen::Rv32)
-}
-
 /// A breakpoint or a watchpoint, numbered from 1 as they are set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Point {
-    Break(u32),
-    Watch(Watch, u32, u32),
+    Break(u64),
+    Watch(Watch, u64, u64),
 }
 
 /// Whether the session goes on after a command.
@@ -43,6 +38,9 @@ pub enum OnQuit {
 
 pub struct Session<'a, W: Write> {
     remote: Remote,
+    /// The machine's width, which the stub gave: how its code decodes, how wide its
+    /// registers and addresses are.
+    xlen: Xlen,
     symbols: Symbols,
     lines: Lines,
     /// The source line shown last: an instruction step on the same line does
@@ -63,12 +61,13 @@ type Result<T> = std::result::Result<T, String>;
 
 /// A stop as [`Session::resume`] gives it: the hart, the watchpoint hit (its kind and
 /// address), and the signal (5 for a trap, 2 for an interrupt).
-type Halt = (usize, Option<(Watch, u32)>, u8);
+type Halt = (usize, Option<(Watch, u64)>, u8);
 
 const HELP: &str = "\
-break|b ADDR            set a breakpoint (ADDR: 0x80000000, 1234, main, main+8, $ra)
+break|b FUNC            set a breakpoint on FUNC past its prologue (break *FUNC: at its start)
+break|b ADDR            ... at ADDR (0x80000000, 1234, main+8, $ra)
 break|b FILE:LINE       ... on a source line (kernel/main.c:42, or main.c:42)
-watch [-r|-a] ADDR [N]  stop after a write (-r read, -a either) of N bytes at ADDR (4)
+watch [-r|-a] ADDR [N]  stop after a write (-r read, -a either) of N bytes at ADDR
 delete|d [N]            delete breakpoint or watchpoint N, or all of them
 info breakpoints|i b    list breakpoints and watchpoints
 continue|c              run until something stops the machine (Ctrl-C to interrupt)
@@ -80,8 +79,8 @@ finish                  run until the current function returns
 list|l [FILE:]LINE|FUNC show ten source lines around LINE; list alone goes on
 directory DIR           look for source files in DIR first
 add-symbol-file FILE    add the symbols and lines of another program (a user one)
-regs|info registers     the selected hart's registers
-x/N[w|b] ADDR           N words (w) or bytes (b) of memory at ADDR
+regs|info registers     the selected hart's registers, as GDB shows them
+x/N[b|h|w|g] ADDR       N bytes (b), halfwords (h), words (w) or giants (g, 8) at ADDR
 disas [ADDR] [N]        disassemble N instructions (8) from ADDR (the pc)
 bt|backtrace            the call stack, by frame pointer
 hart [N]                list the harts, or select hart N
@@ -97,6 +96,7 @@ impl<'a, W: Write> Session<'a, W> {
         interrupt: &'a AtomicBool,
     ) -> Self {
         Session {
+            xlen: remote.xlen,
             remote,
             symbols,
             lines,
@@ -236,23 +236,29 @@ impl<'a, W: Write> Session<'a, W> {
     // ---- Expressions ----
 
     /// An address or a value: a number (`0x80000000`, `1234`), a symbol, a register
-    /// (`$sp`, `$a0`, `$x5`, `$pc`), each optionally `+N` or `-N`.
-    fn eval(&mut self, expr: &str) -> Result<u32> {
+    /// (`$sp`, `$a0`, `$x5`, `$pc`), each optionally `+N` or `-N`. As wide as the
+    /// machine's addresses: on RV32 the arithmetic wraps at 2^32, and a number
+    /// must fit in 32 bits.
+    fn eval(&mut self, expr: &str) -> Result<u64> {
         let expr = expr.trim();
         if let Some(i) = expr.rfind(['+', '-']).filter(|&i| i > 0) {
             let base = self.eval(&expr[..i])?;
             let off = parse_number(expr[i + 1..].trim()).ok_or_else(|| format!("bad offset in '{expr}'"))?;
-            return Ok(if &expr[i..i + 1] == "+" {
+            let v = if &expr[i..i + 1] == "+" {
                 base.wrapping_add(off)
             } else {
                 base.wrapping_sub(off)
-            });
+            };
+            return Ok(wrap(self.xlen, v));
         }
         if let Some(reg) = expr.strip_prefix('$') {
-            let n = register_number(reg).ok_or_else(|| format!("no register ${reg}"))?;
+            let n = register_number(reg, self.xlen).ok_or_else(|| format!("no register ${reg}"))?;
             return self.remote.register(n);
         }
         if let Some(n) = parse_number(expr) {
+            if wrap(self.xlen, n) != n {
+                return Err(format!("{expr} is past the end of a 32-bit address space"));
+            }
             return Ok(n);
         }
         self.symbols
@@ -282,9 +288,25 @@ impl<'a, W: Write> Session<'a, W> {
                 if place.line != line {
                     self.say(format!("line {line} has no code: {place} instead"));
                 }
+                // A line whose code is a function's prologue (its first line, the
+                // one with its name) means the function past its prologue, as GDB
+                // has it (skip_prologue_sal); a line further in stays where it is.
                 addrs
+                    .into_iter()
+                    .map(|addr| match self.symbols.containing(addr) {
+                        Some((_, start)) => addr.max(self.skip_prologue(start)),
+                        None => addr,
+                    })
+                    .collect()
             }
-            None => vec![self.eval(expr)?],
+            // `break *ADDR`: exactly there, as in GDB.
+            None if expr.starts_with('*') => vec![self.eval(&expr[1..])?],
+            // A function's name (a symbol in code) means the function past its
+            // prologue, as GDB's `break FUNC`; anything else is an exact address.
+            None => match self.symbols.code(expr) {
+                Some(entry) => vec![self.skip_prologue(entry)],
+                None => vec![self.eval(expr)?],
+            },
         };
         for addr in addrs {
             if !self.has_breakpoint(addr) {
@@ -297,12 +319,46 @@ impl<'a, W: Write> Session<'a, W> {
         Ok(())
     }
 
-    /// `0x80000024 <puts+4>`, and `: file:line` where the line tables say.
-    fn where_(&self, addr: u32) -> String {
-        match self.lines.at(addr) {
-            Some(place) => format!("{}: {place}", self.symbols.show(addr)),
-            None => self.symbols.show(addr),
+    /// Where `break` puts a breakpoint on the function at `entry`: past its
+    /// prologue, as GDB finds it (`skip_prologue_sal`, then `riscv_skip_prologue`).
+    /// From the line tables when the function has them ([`Lines::prologue_end`]:
+    /// its `prologue_end` row, else its second row), else by GDB's prologue
+    /// analysis of its code ([`frames::scan_prologue`]).
+    fn skip_prologue(&mut self, entry: u64) -> u64 {
+        let (start, end) = self
+            .symbols
+            .range(entry)
+            .unwrap_or((entry, entry.wrapping_add(1)));
+        match self.lines.prologue_end(start, end) {
+            Some(body) => body.max(entry),
+            None => frames::scan_prologue(&mut self.remote, entry, self.xlen),
         }
+    }
+
+    /// `0x80000024 <puts+4>`, and `: file:line` where the line tables say: without
+    /// leading zeros, as GDB's `Breakpoint N at ADDR` has it.
+    fn where_(&self, addr: u64) -> String {
+        match self.lines.at(addr) {
+            Some(place) => format!("{}: {place}", self.show_plain(addr)),
+            None => self.show_plain(addr),
+        }
+    }
+
+    /// `0x80000024 <puts+4>` with all of an address's digits (16 on RV64), as GDB
+    /// shows a code address in a frame and in disassembly.
+    fn show(&self, addr: u64) -> String {
+        self.symbols.show(addr, self.xlen)
+    }
+
+    /// `0x80000024 <puts+4>` without leading zeros, as GDB shows an address
+    /// everywhere else: `x`, `break`'s and `watch`'s messages, a code pointer's value.
+    fn show_plain(&self, addr: u64) -> String {
+        self.symbols.show_plain(addr)
+    }
+
+    /// A register's value in hex, with all its digits.
+    fn hex(&self, v: u64) -> String {
+        hex_value(v, self.xlen)
     }
 
     /// `add-symbol-file FILE`.
@@ -311,13 +367,14 @@ impl<'a, W: Write> Session<'a, W> {
             return Err("add-symbol-file needs a file".into());
         }
         let file = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        symbols::check_xlen(&file, self.xlen).map_err(|e| format!("{path}: {e}"))?;
         self.symbols.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
         self.lines.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
         self.say(format!("added the symbols of {path}"));
         Ok(())
     }
 
-    fn has_breakpoint(&self, addr: u32) -> bool {
+    fn has_breakpoint(&self, addr: u64) -> bool {
         self.points.iter().any(|(_, p)| *p == Point::Break(addr))
     }
 
@@ -329,15 +386,28 @@ impl<'a, W: Write> Session<'a, W> {
             _ => (Watch::Write, args),
         };
         let (addr, len) = match args {
-            [addr] => (self.eval(addr)?, 4),
+            [addr] => (self.eval(addr)?, self.watch_len(addr)),
             [addr, len] => (self.eval(addr)?, parse_number(len).ok_or("bad length")?),
             _ => return Err("watch [-r|-a] ADDR [LEN]".into()),
         };
         self.remote.set_watchpoint(kind, addr, len)?;
         let n = self.add_point(Point::Watch(kind, addr, len));
-        let at = self.symbols.show(addr);
+        let at = self.show_plain(addr);
         self.say(format!("watchpoint {n} ({}) at {at}, {len} bytes", kind.name()));
         Ok(())
+    }
+
+    /// How many bytes `watch ADDR` watches without a length. GDB watches an
+    /// expression's value, as many bytes as its type has: here, when ADDR is a
+    /// symbol with a size in the symbol table (a C variable), that size, at most 8
+    /// (a register's worth on RV64, what `long` and pointers take); else a
+    /// register's worth, 4 bytes on RV32 and 8 on RV64.
+    fn watch_len(&self, expr: &str) -> u64 {
+        let register = u64::from(self.xlen.bits() / 8);
+        match self.symbols.size(expr.trim()) {
+            Some(size) => size.min(8),
+            None => register,
+        }
     }
 
     fn delete(&mut self, args: &[&str]) -> Result<()> {
@@ -373,12 +443,14 @@ impl<'a, W: Write> Session<'a, W> {
             return;
         }
         let mut lines = vec!["Num  Type        Where".to_string()];
+        // A breakpoint's address with all its digits, as GDB's Address column has
+        // it; a watchpoint's as it would be typed, GDB's What column (its expression).
         for (n, p) in &self.points {
             lines.push(match *p {
-                Point::Break(addr) => format!("{n:<4} breakpoint  {}", self.symbols.show(addr)),
+                Point::Break(addr) => format!("{n:<4} breakpoint  {}", self.show(addr)),
                 Point::Watch(kind, addr, len) => format!(
                     "{n:<4} watchpoint  {}, {len} bytes, {}",
-                    self.symbols.show(addr),
+                    self.show_plain(addr),
                     kind.name()
                 ),
             });
@@ -406,7 +478,7 @@ impl<'a, W: Write> Session<'a, W> {
     }
 
     /// Reports why the machine stopped at the selected hart's pc.
-    fn report(&mut self, hart: usize, watch: Option<(Watch, u32)>, signal: u8) -> Result<()> {
+    fn report(&mut self, hart: usize, watch: Option<(Watch, u64)>, signal: u8) -> Result<()> {
         let pc = self.remote.register(remote::PC)?;
         let who = self.hart_prefix(hart);
         if let Some((kind, addr)) = watch {
@@ -415,7 +487,7 @@ impl<'a, W: Write> Session<'a, W> {
                 _ => None,
             });
             let n = n.map_or(String::new(), |n| format!(" {n}"));
-            let at = self.symbols.show(addr);
+            let at = self.show_plain(addr);
             self.say(format!("{who}watchpoint{n} ({}) hit at {at}", kind.name()));
         } else if signal == 2 {
             self.say(format!("{who}interrupted"));
@@ -476,7 +548,7 @@ impl<'a, W: Write> Session<'a, W> {
 
     /// One instruction of the selected hart, shown only if something else stopped
     /// the machine. The new pc, or `None` then (or once the program has exited).
-    fn step_quietly(&mut self) -> Result<Option<u32>> {
+    fn step_quietly(&mut self) -> Result<Option<u64>> {
         let hart = self.remote.selected()?;
         let Some((stopped, watch, signal)) = self.resume(Some(hart))? else {
             return Ok(None);
@@ -489,14 +561,26 @@ impl<'a, W: Write> Session<'a, W> {
         Ok(Some(pc))
     }
 
+    /// The instruction at `pc`, decoded for the machine's width.
+    fn inst_at(&mut self, pc: u64) -> Option<Inst> {
+        let word = self.remote.read_word(pc)?;
+        Some(excalibur::decode(word, self.xlen))
+    }
+
+    /// The address `n` bytes past `addr` (code or data), wrapping as the machine's
+    /// addresses do.
+    fn advance(&self, addr: u64, n: u64) -> u64 {
+        wrap(self.xlen, addr.wrapping_add(n))
+    }
+
     /// Where a call at `pc` returns to: after a `jal`/`jalr` that links (`call`,
     /// `jal f`), or after the `auipc ra` + `jalr ra` pair of a far call. `None` if
     /// the instruction there is no call.
-    fn call_at(&mut self, pc: u32) -> Option<u32> {
-        match self.remote.read_word(pc).map(decode) {
-            Some(Inst::Jal { rd, .. } | Inst::Jalr { rd, .. }) if rd != 0 => Some(pc.wrapping_add(4)),
-            Some(Inst::Auipc { rd: 1, .. }) => match self.remote.read_word(pc.wrapping_add(4)).map(decode) {
-                Some(Inst::Jalr { rd: 1, rs1: 1, .. }) => Some(pc.wrapping_add(8)),
+    fn call_at(&mut self, pc: u64) -> Option<u64> {
+        match self.inst_at(pc) {
+            Some(Inst::Jal { rd, .. } | Inst::Jalr { rd, .. }) if rd != 0 => Some(self.advance(pc, 4)),
+            Some(Inst::Auipc { rd: 1, .. }) => match self.inst_at(self.advance(pc, 4)) {
+                Some(Inst::Jalr { rd: 1, rs1: 1, .. }) => Some(self.advance(pc, 8)),
                 _ => None,
             },
             _ => None,
@@ -531,10 +615,7 @@ impl<'a, W: Write> Session<'a, W> {
                 self.show_pc()?;
                 return Ok(false);
             }
-            let returning = matches!(
-                self.remote.read_word(pc).map(decode),
-                Some(Inst::Jalr { rd: 0, rs1: 1, .. })
-            );
+            let returning = matches!(self.inst_at(pc), Some(Inst::Jalr { rd: 0, rs1: 1, .. }));
             pc = match self.call_at(pc) {
                 Some(ret) if over => match self.run_to(ret, |sp, sp0| sp >= sp0, false)? {
                     true => ret,
@@ -543,7 +624,7 @@ impl<'a, W: Write> Session<'a, W> {
                 Some(ret) => {
                     // Into the call: one step for `jal`/`jalr`, two for `auipc` + `jalr`.
                     let mut at = pc;
-                    for _ in 0..(ret - pc) / 4 {
+                    for _ in 0..wrap(self.xlen, ret.wrapping_sub(pc)) / 4 {
                         match self.step_quietly()? {
                             Some(next) => at = next,
                             None => return Ok(false),
@@ -591,12 +672,13 @@ impl<'a, W: Write> Session<'a, W> {
         let Some(caller) = frames.get(1) else {
             return Err("cannot find the caller (no frame above this one)".into());
         };
-        let at = self.symbols.show(caller.pc);
+        let at = self.show(caller.pc);
         self.say(format!("run till exit, back to {at}"));
         // Back in the caller, sp is above where it is now (or the same, from a leaf).
         if self.run_to(caller.pc, |sp, sp0| sp >= sp0, true)? {
             let a0 = self.remote.register(10)?;
-            self.say(format!("returned: a0 = {a0:#010x} ({})", a0 as i32));
+            let signed = self.signed(a0);
+            self.say(format!("returned: a0 = {} ({signed})", self.hex(a0)));
         }
         Ok(())
     }
@@ -606,7 +688,7 @@ impl<'a, W: Write> Session<'a, W> {
     /// a temporary breakpoint. Another stop (a breakpoint, a watchpoint, an interrupt,
     /// the end) is reported and ends the run. True if it got there, where the pc is
     /// shown if `show` says so.
-    fn run_to(&mut self, target: u32, stack_ok: impl Fn(u32, u32) -> bool, show: bool) -> Result<bool> {
+    fn run_to(&mut self, target: u64, stack_ok: impl Fn(u64, u64) -> bool, show: bool) -> Result<bool> {
         let hart = self.remote.selected()?;
         let sp0 = self.remote.register(2)?;
         let temporary = !self.has_breakpoint(target);
@@ -648,36 +730,60 @@ impl<'a, W: Write> Session<'a, W> {
 
     // ---- Looking ----
 
+    /// `regs`, `info registers`: GDB's layout for RISC-V, a register to a line, its
+    /// name, its value in hex (no leading zeros) and then as its type in GDB's
+    /// target description shows it. `ra` and `pc` are code pointers (with their
+    /// symbol), `sp`, `gp`, `tp` and `fp` (`s0`) data pointers, and the rest signed
+    /// integers of the register's width. `zero` is left out, as GDB leaves it, and
+    /// `priv` (the privilege mode) comes last, as `info registers priv` shows it.
     fn regs(&mut self) -> Result<()> {
         let r = self.remote.registers()?;
         let mut lines = Vec::new();
-        for row in 0..8 {
-            let line: Vec<String> = (0..4)
-                .map(|col| {
-                    let n = row * 4 + col;
-                    format!("{:<4} {:#010x}", excalibur::reg::abi_name(n as u8), r[n])
-                })
-                .collect();
-            lines.push(line.join("  "));
+        let line = |name: &str, hex: String, natural: String| format!("{name:<15}{hex}\t{natural}");
+        for (n, &v) in r.iter().enumerate().take(32).skip(1) {
+            // GDB calls x8 fp.
+            let name = if n == 8 {
+                "fp"
+            } else {
+                excalibur::reg::abi_name(n as u8)
+            };
+            let natural = match n {
+                1 => self.show_plain(v),
+                2 | 3 | 4 | 8 => format!("{v:#x}"),
+                _ => self.signed(v).to_string(),
+            };
+            lines.push(line(name, format!("{v:#x}"), natural));
         }
-        let mode = match self.remote.register(remote::PRIV) {
-            Ok(0) => "U",
-            Ok(1) => "S",
-            Ok(3) => "M",
-            _ => "?",
-        };
-        lines.push(format!("pc   {}  mode {mode}", self.symbols.show(r[32])));
+        lines.push(line("pc", format!("{:#x}", r[32]), self.show_plain(r[32])));
+        if let Ok(p) = self.remote.register(remote::PRIV) {
+            let mode = match p {
+                0 => "User/Application",
+                1 => "Supervisor",
+                2 => "Hypervisor",
+                3 => "Machine",
+                _ => "INVALID",
+            };
+            lines.push(line("priv", format!("{p:#x}"), format!("prv:{p} [{mode}]")));
+        }
         self.say(lines.join("\n"));
         Ok(())
     }
 
-    /// `x/N[w|b] ADDR`.
+    /// A register's value as a signed number of the register's width.
+    fn signed(&self, v: u64) -> i64 {
+        match self.xlen {
+            Xlen::Rv32 => i64::from(v as u32 as i32),
+            Xlen::Rv64 => v as i64,
+        }
+    }
+
+    /// `x/N[b|h|w|g] ADDR`: GDB's unit letters, a byte, a halfword, a word (the
+    /// default) and a giant (8 bytes), at both widths; `x`, hex, is the only format,
+    /// and may come before or after the unit. As many on a line as GDB puts.
     fn examine(&mut self, format: &str, addr: &str) -> Result<()> {
         let format = format.strip_prefix('/').unwrap_or(format);
-        let (count, unit) = match format.strip_suffix(['w', 'b', 'x']) {
-            Some(n) => (n, format.chars().last().unwrap()),
-            None => (format, 'w'),
-        };
+        let count = format.trim_end_matches(['b', 'h', 'w', 'g', 'x']);
+        let unit = format[count.len()..].chars().rfind(|&c| c != 'x').unwrap_or('w');
         let count = if count.is_empty() {
             1
         } else {
@@ -687,41 +793,45 @@ impl<'a, W: Write> Session<'a, W> {
             return Err("x/N ADDR".into());
         }
         let addr = self.eval(addr)?;
-        let size = if unit == 'b' { 1 } else { 4 };
-        let per_line = if unit == 'b' { 8 } else { 4 };
+        let (size, per_line) = match unit {
+            'b' => (1, 8),
+            'h' => (2, 8),
+            'w' => (4, 4),
+            _ => (8, 2),
+        };
         let bytes = self.remote.read_memory(addr, count * size)?;
         let mut lines = Vec::new();
         for (i, chunk) in bytes.chunks(per_line * size).enumerate() {
-            let at = addr.wrapping_add((i * per_line * size) as u32);
+            let at = self.advance(addr, (i * per_line * size) as u64);
             let values: Vec<String> = chunk
                 .chunks(size)
-                .map(|v| match *v {
-                    [b] => format!("{b:#04x}"),
-                    [a, b, c, d] => format!("{:#010x}", u32::from_le_bytes([a, b, c, d])),
-                    _ => "?".into(),
+                .map(|v| match v.len() == size {
+                    true => {
+                        let n = v.iter().rev().fold(0u64, |n, &b| n << 8 | u64::from(b));
+                        format!("{n:#0digits$x}", digits = 2 + 2 * size)
+                    }
+                    false => "?".into(),
                 })
                 .collect();
-            lines.push(format!("{}:  {}", self.symbols.show(at), values.join("  ")));
+            lines.push(format!("{}:  {}", self.show_plain(at), values.join("  ")));
         }
         if bytes.len() < count * size {
-            lines.push(format!(
-                "(cannot read past {:#010x})",
-                addr.wrapping_add(bytes.len() as u32)
-            ));
+            let end = self.advance(addr, bytes.len() as u64);
+            lines.push(format!("(cannot read past {end:#x})"));
         }
         self.say(lines.join("\n"));
         Ok(())
     }
 
-    fn disas_line(&mut self, pc: u32, here: bool) -> String {
+    fn disas_line(&mut self, pc: u64, here: bool) -> String {
         let mark = if here { "=>" } else { "  " };
-        let at = self.symbols.show(pc);
+        let at = self.show(pc);
         match self.remote.read_word(pc) {
             Some(word) => {
-                let d = decode(word).format(Some(u64::from(pc)), Syntax::objdump(Xlen::Rv32));
+                let d = excalibur::decode(word, self.xlen).format(Some(pc), Syntax::objdump(self.xlen));
                 let target = d
                     .target
-                    .and_then(|t| self.symbols.describe(t as u32))
+                    .and_then(|t| self.symbols.describe(wrap(self.xlen, t)))
                     .map_or(String::new(), |s| format!(" <{s}>"));
                 format!("{mark} {at}:  {d}{target}")
             }
@@ -741,7 +851,7 @@ impl<'a, W: Write> Session<'a, W> {
         };
         let lines: Vec<String> = (0..count)
             .map(|i| {
-                let at = start.wrapping_add(4 * i);
+                let at = self.advance(start, 4 * i);
                 self.disas_line(at, at == pc)
             })
             .collect();
@@ -755,6 +865,7 @@ impl<'a, W: Write> Session<'a, W> {
             pc: r[32],
             ra: r[1],
             fp: r[8],
+            xlen: self.xlen,
         };
         let symbols = &self.symbols;
         Ok(frames::backtrace(&mut self.remote, regs, |pc| {
@@ -772,8 +883,8 @@ impl<'a, W: Write> Session<'a, W> {
                 // instruction before, on the line that made the call.
                 let looked_up = if i == 0 { f.pc } else { f.pc.wrapping_sub(4) };
                 match self.lines.at(looked_up) {
-                    Some(place) => format!("#{i}  {} at {place}", self.symbols.show(f.pc)),
-                    None => format!("#{i}  {}", self.symbols.show(f.pc)),
+                    Some(place) => format!("#{i}  {} at {place}", self.show(f.pc)),
+                    None => format!("#{i}  {}", self.show(f.pc)),
                 }
             })
             .collect();
@@ -843,7 +954,7 @@ impl<'a, W: Write> Session<'a, W> {
             let pc = self.remote.register(remote::PC)?;
             let info = self.remote.hart_info(h).unwrap_or_else(|_| format!("hart {h}"));
             let mark = if h == selected { "*" } else { " " };
-            lines.push(format!("{mark} {info}, at {}", self.symbols.show(pc)));
+            lines.push(format!("{mark} {info}, at {}", self.show(pc)));
         }
         self.remote.select(selected)?;
         self.say(lines.join("\n"));
@@ -876,21 +987,23 @@ fn source_line(s: &str) -> Option<(&str, u32)> {
 fn count(args: &[&str]) -> Result<u32> {
     match args.first() {
         None => Ok(1),
-        Some(n) => parse_number(n).ok_or_else(|| format!("bad count '{n}'")),
+        Some(n) => parse_number(n)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| format!("bad count '{n}'")),
     }
 }
 
-/// `0x...` hex or decimal.
-pub fn parse_number(s: &str) -> Option<u32> {
+/// `0x...` hex or decimal, up to 64 bits.
+pub fn parse_number(s: &str) -> Option<u64> {
     match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
         None => s.parse().ok(),
     }
 }
 
 /// GDB's number for a register name: `pc`, `x0`-`x31`, an ABI name (`fp` too), a CSR
-/// name, or `priv`.
-pub fn register_number(name: &str) -> Option<usize> {
+/// name (those the machine's width has: RV64 has no `cycleh`), or `priv`.
+pub fn register_number(name: &str, xlen: Xlen) -> Option<usize> {
     match name {
         "pc" => return Some(remote::PC),
         "fp" => return Some(8),
@@ -903,7 +1016,7 @@ pub fn register_number(name: &str) -> Option<usize> {
     if let Some(r) = excalibur::reg::parse(name) {
         return Some(r as usize);
     }
-    excalibur::csr::parse(name, Xlen::Rv32).map(remote::csr)
+    excalibur::csr::parse(name, xlen).map(remote::csr)
 }
 
 #[cfg(test)]
@@ -926,15 +1039,21 @@ mod tests {
     fn numbers_and_registers() {
         assert_eq!(parse_number("0x80000000"), Some(0x8000_0000));
         assert_eq!(parse_number("42"), Some(42));
+        assert_eq!(parse_number("0xffffffff80000000"), Some(0xffff_ffff_8000_0000));
         assert_eq!(parse_number("main"), None);
-        assert_eq!(register_number("sp"), Some(2));
-        assert_eq!(register_number("x31"), Some(31));
-        assert_eq!(register_number("x32"), None);
-        assert_eq!(register_number("fp"), Some(8));
-        assert_eq!(register_number("s0"), Some(8));
-        assert_eq!(register_number("pc"), Some(32));
-        assert_eq!(register_number("mstatus"), Some(65 + 0x300));
-        assert_eq!(register_number("priv"), Some(4161));
-        assert_eq!(register_number("nope"), None);
+        for xlen in [Xlen::Rv32, Xlen::Rv64] {
+            assert_eq!(register_number("sp", xlen), Some(2));
+            assert_eq!(register_number("x31", xlen), Some(31));
+            assert_eq!(register_number("x32", xlen), None);
+            assert_eq!(register_number("fp", xlen), Some(8));
+            assert_eq!(register_number("s0", xlen), Some(8));
+            assert_eq!(register_number("pc", xlen), Some(32));
+            assert_eq!(register_number("mstatus", xlen), Some(65 + 0x300));
+            assert_eq!(register_number("priv", xlen), Some(4161));
+            assert_eq!(register_number("nope", xlen), None);
+        }
+        // The high halves of the counters are RV32's alone.
+        assert_eq!(register_number("cycleh", Xlen::Rv32), Some(65 + 0xc80));
+        assert_eq!(register_number("cycleh", Xlen::Rv64), None);
     }
 }
