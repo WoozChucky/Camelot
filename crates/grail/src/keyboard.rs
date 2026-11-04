@@ -113,6 +113,10 @@ pub mod usage {
     pub const NON_US_BACKSLASH: u16 = 0x64;
     /// The Menu key ("Keyboard Application").
     pub const APPLICATION: u16 = 0x65;
+    /// Hangul/English toggle on a Korean keyboard ("Keyboard LANG1").
+    pub const LANG1: u16 = 0x90;
+    /// Hanja conversion on a Korean keyboard ("Keyboard LANG2").
+    pub const LANG2: u16 = 0x91;
     // The modifiers, 0xe0 to 0xe7: the eight bits of a boot keyboard report's first
     // byte, in the same order.
     pub const LEFT_CTRL: u16 = 0xe0;
