@@ -691,7 +691,8 @@ fn every_enum_tag_is_the_documented_one() {
         (false, true, false, false, 0b0010),
         (false, false, true, false, 0b0100),
         (false, false, false, true, 0b1000),
-        (true, true, true, true, 0b1111),
+        (true, true, true, false, 0b0111),
+        (false, true, true, true, 0b1110),
     ] {
         let msg = Message::KeyInput {
             vm: 1,

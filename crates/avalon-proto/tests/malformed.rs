@@ -326,6 +326,12 @@ fn invalid_payloads() -> Vec<(&'static str, u16, Vec<u8>)> {
             cat(&[&le(1), &[0, 0, 0, 0]]),
         ),
         ("key flags", ty::KEY_INPUT, cat(&[&le(1), &[b'a', 0x10, 0x04, 0]])),
+        // Release (bit 0) and repeat (bit 3): a repeat is a press.
+        (
+            "key repeat on a release",
+            ty::KEY_INPUT,
+            cat(&[&le(1), &[b'a', 0x09, 0x04, 0]]),
+        ),
         (
             "pointer motion tag",
             ty::POINTER_INPUT,
@@ -416,6 +422,17 @@ fn encoder_refuses_what_the_decoder_would_reject() {
                 ctrl: false,
                 repeat: false,
                 usage: 0,
+            },
+        },
+        Message::KeyInput {
+            vm: 1,
+            key: KeyEvent {
+                code: b'a',
+                release: true,
+                shift: false,
+                ctrl: false,
+                repeat: true,
+                usage: 0x04,
             },
         },
         Message::BlockRead {

@@ -79,7 +79,7 @@ Decoding is strict:
 Rules beyond the field types, enforced by both the encoder and the decoder (`Message::check`):
 
 - `ScreenFrame`: `width` and `height` non-zero, `pixels` exactly `width × height × 4` bytes.
-- `KeyInput`: key code and usage not both 0; flag bits other than 0-3 clear.
+- `KeyInput`: key code and usage not both 0; flag bits other than 0-3 clear; the repeat flag (bit 3) only on a press (bit 0 clear).
 - `PointerInput`: button bits other than 0-2 clear.
 - `BlockRead`: `count` from 1 to `MAX_BLOCK_SECTORS` (2048).
 - `BlockData`, `BlockWrite`: `data` a non-zero whole number of 512-byte sectors, at most 2048 sectors (1 MiB).
@@ -144,7 +144,7 @@ On a command line a disk is one argument (the crate's `DiskSource::parse`): `lak
 
 **DeviceEntry**, one entry of the guest's sysinfo device table (Excalibur spec section 9.5): `kind: u32` (the device type code), `base: u32`, `size: u32`, `irq: u32` (PLIC source, 0 = none). The type code is passed through raw, so new device types need no protocol change.
 
-**KeyEvent**, a key for the guest's keyboard device (Excalibur spec section 9.4), in both of the device's forms, since a viewer does not know which mode the guest chose: `code: u8` (ASCII mode's key code, from the spec's table; 0 for a key that types nothing, such as a modifier alone or Home), `flags: u8` (bit 0 release, bit 1 Shift, bit 2 Ctrl, bit 3 repeat: a press of a key already down, the viewer's auto-repeat; other bits must be 0), `usage: u16` (raw mode's USB HID usage of the physical key, Keyboard/Keypad page; 0 if the viewer does not know it). `code` and `usage` are not both 0. The device keeps the form of its mode: in ASCII mode the code with Shift and Ctrl (a repeat is another press), in raw mode the usage and the release bit (a repeat is dropped). A browser's `KeyboardEvent.code` gives the usage directly, through `grail::keyboard::usage::from_dom_code`; Grail's window gets it from the scan code.
+**KeyEvent**, a key for the guest's keyboard device (Excalibur spec section 9.4), in both of the device's forms, since a viewer does not know which mode the guest chose: `code: u8` (ASCII mode's key code, from the spec's table; 0 for a key that types nothing, such as a modifier alone or Home), `flags: u8` (bit 0 release, bit 1 Shift, bit 2 Ctrl, bit 3 repeat: a press of a key already down, the viewer's auto-repeat, so never with bit 0; other bits must be 0), `usage: u16` (raw mode's USB HID usage of the physical key, Keyboard/Keypad page; 0 if the viewer does not know it). `code` and `usage` are not both 0. The device keeps the form of its mode: in ASCII mode the code with Shift and Ctrl (a repeat is another press), in raw mode the usage and the release bit (a repeat is dropped). A browser's `KeyboardEvent.code` gives the usage directly, through `grail::keyboard::usage::from_dom_code`; Grail's window gets it from the scan code.
 
 **PointerChange**, one change of a viewer's pointer for the guest's pointer device (Excalibur spec section 9.7): `motion: PointerMotion`, `buttons: u8` (the buttons held after the change: bit 0 left, bit 1 right, bit 2 middle, as in the device's `PTR_BUTTONS`; other bits must be 0), `wheel: i8` (notches turned, positive away from the user).
 

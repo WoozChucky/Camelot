@@ -412,7 +412,8 @@ pub fn samples() -> Vec<Message> {
         (b'a', false, false, false, false, 0),
         (b'A', false, true, false, false, 0x04),
         (b'c', true, false, true, false, 0x06),
-        (0x9b, true, true, true, true, 0x45),
+        (0x9b, false, true, true, true, 0x45),
+        (0x9b, true, true, true, false, 0x45),
         (0, false, false, false, true, 0xe1),
         (0, true, false, false, false, 0xffff),
     ] {

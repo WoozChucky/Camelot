@@ -369,7 +369,7 @@ pub struct KeyEvent {
     /// Ctrl was held (for ASCII mode).
     pub ctrl: bool,
     /// A press of a key already down (the viewer's auto-repeat): another press in
-    /// ASCII mode, nothing in raw mode.
+    /// ASCII mode, nothing in raw mode. Never set on a release.
     pub repeat: bool,
     /// Raw mode's USB HID usage of the physical key (Keyboard/Keypad page); 0 if the
     /// viewer does not know it.
@@ -991,6 +991,9 @@ impl Message {
             }
             Message::KeyInput { key, .. } if key.code == 0 && key.usage == 0 => {
                 return invalid("key with code 0 and usage 0".into())
+            }
+            Message::KeyInput { key, .. } if key.repeat && key.release => {
+                return invalid("a repeat is a press, not a release".into())
             }
             Message::PointerInput { pointer, .. } if pointer.buttons & !POINTER_BUTTONS != 0 => {
                 return invalid(format!("reserved pointer buttons {:#04x}", pointer.buttons));
