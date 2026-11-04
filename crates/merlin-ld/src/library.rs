@@ -20,6 +20,10 @@
 //! The members that are pulled in are linked after the program's objects, in
 //! library order, whatever order they were found in, so the output depends
 //! only on which members are needed.
+//!
+//! Every member must still be of the executable's class, needed or not, as
+//! ld.lld checks its lazy objects, in command-line order with the other
+//! files ([`object::check_classes`]).
 
 use crate::object::{self, Object};
 use crate::{Error, Input};
@@ -61,21 +65,43 @@ fn parse_all(inputs: &[Input]) -> Result<Vec<Object>, Vec<Error>> {
 }
 
 /// Which members of `library` linking `inputs` needs: their indexes, in
-/// library order.
+/// library order, for a link without a script (`cargo xtask kernel` links
+/// each user program with the C library this way). The files are checked
+/// as [`crate::link_with_library`] checks them: the objects, then the
+/// members, each of the first object's class.
 pub fn needed(inputs: &[Input], library: &[Input]) -> Result<Vec<usize>, Vec<Error>> {
     let objects = parse_all(inputs)?;
     let members = parse_all(library)?;
-    let mut defined: BTreeSet<&str> = objects.iter().flat_map(defines).collect();
-    let mut undefined: BTreeSet<&str> = objects
-        .iter()
-        .flat_map(needs)
-        .filter(|n| !defined.contains(n))
-        .collect();
-    let mut pulled = vec![false; members.len()];
+    if let Some(first) = objects.first() {
+        let files = objects
+            .iter()
+            .map(|o| (o, false))
+            .chain(members.iter().map(|m| (m, true)));
+        let wrong = object::check_classes(first.class, None, files);
+        if !wrong.is_empty() {
+            return Err(wrong);
+        }
+    }
+    let all: Vec<&Object> = objects.iter().chain(&members).collect();
+    let lazy: Vec<bool> = (0..all.len()).map(|i| i >= objects.len()).collect();
+    let pulled = pulled(&all, &lazy);
+    Ok((0..members.len())
+        .filter(|&i| pulled[objects.len() + i])
+        .collect())
+}
+
+/// Which of a link's files are library members it pulls in: `files` in
+/// command-line order, `lazy` saying which are members. The others are
+/// always linked.
+pub(crate) fn pulled(files: &[&Object], lazy: &[bool]) -> Vec<bool> {
+    let program = files.iter().zip(lazy).filter(|&(_, &l)| !l).map(|(o, _)| *o);
+    let mut defined: BTreeSet<&str> = program.clone().flat_map(defines).collect();
+    let mut undefined: BTreeSet<&str> = program.flat_map(needs).filter(|n| !defined.contains(n)).collect();
+    let mut pulled = vec![false; files.len()];
     loop {
         let mut progress = false;
-        for (i, m) in members.iter().enumerate() {
-            if pulled[i] || !defines(m).any(|n| undefined.contains(n)) {
+        for (i, m) in files.iter().enumerate() {
+            if !lazy[i] || pulled[i] || !defines(m).any(|n| undefined.contains(n)) {
                 continue;
             }
             pulled[i] = true;
@@ -94,7 +120,7 @@ pub fn needed(inputs: &[Input], library: &[Input]) -> Result<Vec<usize>, Vec<Err
             break;
         }
     }
-    Ok((0..members.len()).filter(|&i| pulled[i]).collect())
+    pulled
 }
 
 /// `inputs` followed by the members of `library` they need ([`needed`]):
@@ -109,6 +135,7 @@ pub fn with_needed(inputs: &[Input], library: &[Input]) -> Result<Vec<Input>, Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::Class;
 
     /// Makes global symbol `name` of the object `elf` weak (merlin-as has no
     /// `.weak`): its binding in `.symtab` becomes `STB_WEAK`.
@@ -121,16 +148,27 @@ mod tests {
                 .iter()
                 .position(|s| s.name == name)
                 .unwrap_or_else(|| panic!("no symbol {name}"));
-            let entsize = (symtab.entsize as usize).max(elf::SYM_SIZE);
-            // st_info is byte 12 of the entry.
-            symtab.offset as usize + i * entsize + 12
+            let entsize = (symtab.entsize as usize).max(parsed.class.sym_size());
+            // st_info is byte 12 of an ELF32 entry, after st_name, st_value
+            // and st_size; ELF64 moves it up to byte 4, before the 8-byte
+            // st_value and st_size.
+            let st_info = match parsed.class {
+                Class::Elf32 => 12,
+                Class::Elf64 => 4,
+            };
+            symtab.offset as usize + i * entsize + st_info
         };
         elf[info_at] = (elf::STB_WEAK << 4) | (elf[info_at] & 0xf);
     }
 
-    /// An object from merlin-as: `defs` defined as globals in `.text`,
+    /// An RV32 object from merlin-as: `defs` defined as globals in `.text`,
     /// `refs` referred to from `.data`, `weak` as weak references.
     fn obj(name: &str, defs: &[&str], refs: &[&str], weak: &[&str]) -> Input {
+        obj_of(Class::Elf32, name, defs, refs, weak)
+    }
+
+    /// [`obj`] of either class: an RV64 object for `Class::Elf64`.
+    fn obj_of(class: Class, name: &str, defs: &[&str], refs: &[&str], weak: &[&str]) -> Input {
         let mut src = String::from("    .text\n");
         for d in defs {
             src.push_str(&format!("    .globl {d}\n{d}:\n    nop\n"));
@@ -139,7 +177,12 @@ mod tests {
         for r in refs.iter().chain(weak) {
             src.push_str(&format!("    .word {r}\n"));
         }
-        let mut data = merlin_as::assemble_to_elf(&src).unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+        let xlen = match class {
+            Class::Elf32 => excalibur::Xlen::Rv32,
+            Class::Elf64 => excalibur::Xlen::Rv64,
+        };
+        let mut data = merlin_as::assemble_to_elf_with(&src, &merlin_as::Options { xlen })
+            .unwrap_or_else(|e| panic!("{e:?}\n{src}"));
         for w in weak {
             make_weak(&mut data, w);
         }
@@ -205,5 +248,107 @@ mod tests {
         let errs = needed(&program, &bad).unwrap_err();
         assert_eq!(errs.len(), 1);
         assert!(errs[0].0.starts_with("junk.o: "), "{:?}", errs);
+    }
+
+    fn messages(r: Result<Vec<usize>, Vec<Error>>) -> Vec<String> {
+        r.unwrap_err().into_iter().map(|e| e.0).collect()
+    }
+
+    #[test]
+    fn rv64_members_are_pulled_in_as_rv32_ones() {
+        let rv64 =
+            |name, defs: &[&str], refs: &[&str], weak: &[&str]| obj_of(Class::Elf64, name, defs, refs, weak);
+        let o = object::parse("a.o", &rv64("a.o", &["f"], &["g"], &["h"]).data).unwrap();
+        assert_eq!(o.class, Class::Elf64);
+        // make_weak found st_info in the 24-byte entry: h is not needed.
+        assert_eq!(needs(&o).collect::<Vec<_>>(), ["g"]);
+        let program = [rv64("main.o", &["main"], &["printf"], &["malloc"])];
+        let library = [
+            rv64("malloc.o", &["malloc"], &[], &[]),
+            rv64("printf.o", &["printf"], &["write"], &[]),
+            rv64("usys.o", &["write"], &[], &[]),
+        ];
+        assert_eq!(needed(&program, &library).unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn every_member_must_have_the_programs_class() {
+        let program = [
+            obj_of(Class::Elf64, "main.o", &["main"], &["f"], &[]),
+            obj_of(Class::Elf64, "more.o", &[], &[], &[]),
+        ];
+        // Members of the other class are errors even when nothing needs
+        // them, as ld.lld checks its lazy objects: all of them, in order,
+        // compared with the first program object.
+        let library = [
+            obj("a32.o", &["a"], &[], &[]),
+            obj_of(Class::Elf64, "f.o", &["f"], &[], &[]),
+            obj("b32.o", &["b"], &[], &[]),
+        ];
+        assert_eq!(
+            messages(needed(&program, &library)),
+            [
+                "a32.o is incompatible with main.o",
+                "b32.o is incompatible with main.o"
+            ]
+        );
+        // A program object of the other class comes first, as it does on
+        // ld.lld's command line.
+        let mixed = [program[0].clone(), obj("c32.o", &[], &[], &[])];
+        assert_eq!(
+            messages(needed(&mixed, &library)),
+            [
+                "c32.o is incompatible with main.o",
+                "a32.o is incompatible with main.o",
+                "b32.o is incompatible with main.o"
+            ]
+        );
+    }
+
+    #[test]
+    fn classes_are_checked_in_command_line_order() {
+        let parse = |i: Input| object::parse(&i.name.clone(), &i.data).unwrap();
+        let a64 = parse(obj_of(Class::Elf64, "a64.o", &[], &[], &[]));
+        let b64 = parse(obj_of(Class::Elf64, "b64.o", &[], &[], &[]));
+        let b32 = parse(obj("b32.o", &[], &[], &[]));
+        let c32 = parse(obj("c32.o", &[], &[], &[]));
+        let check = |class, format, files: &[(&Object, bool)]| -> Vec<String> {
+            object::check_classes(class, format, files.iter().copied())
+                .into_iter()
+                .map(|e| e.0)
+                .collect()
+        };
+        // `a64.o --start-lib b32.o --end-lib c32.o`: in that order, as ld.lld.
+        assert_eq!(
+            check(Class::Elf64, None, &[(&a64, false), (&b32, true), (&c32, false)]),
+            [
+                "b32.o is incompatible with a64.o",
+                "c32.o is incompatible with a64.o"
+            ]
+        );
+        // `--start-lib b32.o --end-lib a64.o b64.o`: the class is the library
+        // member's, and before any other file has it ld.lld names nothing.
+        assert_eq!(
+            check(Class::Elf32, None, &[(&b32, true), (&a64, false), (&b64, false)]),
+            ["a64.o is incompatible", "b64.o is incompatible"]
+        );
+        // `--start-lib b32.o --end-lib c32.o a64.o`: then c32.o has it.
+        assert_eq!(
+            check(Class::Elf32, None, &[(&b32, true), (&c32, false), (&a64, false)]),
+            ["a64.o is incompatible with c32.o"]
+        );
+        // With an OUTPUT_FORMAT, every file is compared with it.
+        assert_eq!(
+            check(
+                Class::Elf32,
+                Some(Class::Elf32),
+                &[(&a64, false), (&b32, false), (&b64, true)]
+            ),
+            [
+                "a64.o is incompatible with elf32-littleriscv",
+                "b64.o is incompatible with elf32-littleriscv"
+            ]
+        );
+        assert!(check(Class::Elf64, Some(Class::Elf64), &[(&a64, false), (&b64, true)]).is_empty());
     }
 }

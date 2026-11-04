@@ -106,12 +106,11 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // In command-line order, which ld.lld reads them in, library members too.
     let mut files = Vec::new();
-    let mut library = Vec::new();
     for (name, lib) in inputs {
         match std::fs::read(&name) {
-            Ok(data) if lib => library.push(Input { name, data }),
-            Ok(data) => files.push(Input { name, data }),
+            Ok(data) => files.push((Input { name, data }, lib)),
             Err(e) => {
                 eprintln!("merlin-ld: cannot read {name}: {e}");
                 return ExitCode::from(2);
@@ -128,7 +127,8 @@ fn main() -> ExitCode {
         }
     }
 
-    match merlin_ld::link_with_library(&files, &library, &opts) {
+    let files: Vec<(&Input, bool)> = files.iter().map(|(i, lib)| (i, *lib)).collect();
+    match merlin_ld::link_files(&files, &opts) {
         Ok(linked) => {
             for w in &linked.layout.warnings {
                 eprintln!("merlin-ld: warning: {w}");

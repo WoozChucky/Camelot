@@ -2,20 +2,32 @@
  * "Linker scripts"):
  *
  *     OUTPUT_ARCH(riscv)                       optional; must say riscv
- *     OUTPUT_FORMAT("elf32-littleriscv")       optional
+ *     OUTPUT_FORMAT("elf32-littleriscv")       optional; elf32-littleriscv or
+ *                                              elf64-littleriscv, the objects' class
  *     ENTRY(symbol)
  *     MEMORY { RAM (rwx) : ORIGIN = expr, LENGTH = expr }      at most one region
  *     SECTIONS
  *     {
  *         . = expr;   . += expr;   symbol = expr;
  *         .name : { *(pattern pattern ...) ... . = ALIGN(n); . += n; symbol = expr; } > RAM
- *         .name (NOLOAD) : ALIGN(n) { ... } > RAM    both optional
+ *         .name (NOLOAD) : AT(lma) ALIGN(n) { ... } > RAM    each optional, in this order
  *         /DISCARD/ : { *(pattern ...) }
  *     }
  *
  * Expressions: numbers (16, 0x80000000, 64K, 128M), `.`, symbols, ALIGN(n),
- * ORIGIN(region), LENGTH(region), parentheses, + and -. Comments are
- * slash-star ones. Anything else is an error naming what was found. */
+ * ORIGIN(region), LENGTH(region), ADDR(section), parentheses, + and -.
+ * Comments are slash-star ones. Anything else is an error naming what was
+ * found.
+ *
+ * AT(lma) gives an output section a load address (the p_paddr of its
+ * segment) other than the address it runs at; ADDR(section) is an output
+ * section's address, as in Linux's `AT(ADDR(.text) - LOAD_OFFSET)`. layout.c
+ * explains what they mean.
+ *
+ * The objects are RV32 here (object.c reads ELF32 only, until #157), so a
+ * script's values are merlin-ld's ELF32 ones: exact 64-bit numbers up to
+ * 2^63 - 1, an overflow an error, the 4 GiB address space checked where a
+ * value is used. */
 #include "ld.h"
 
 const char DEFAULT_SCRIPT[] = "\n"
@@ -33,6 +45,9 @@ const char DEFAULT_SCRIPT[] = "\n"
 static uint err_line;
 static char *err_msg;
 
+/* Whether the script is read for ELF64 (script_parse's elf64). */
+static int elf64;
+
 static int fail(uint line, char *msg) {
     err_line = line;
     err_msg = msg;
@@ -47,17 +62,24 @@ struct tok {
     int kind;
     char *text;
     uint line;
+    /* Whether it follows the token before with nothing between them, no
+     * space and no comment (read_name joins such runs). */
+    int glued;
 };
 
 static struct tok *toks;
 static uint ntoks, captoks;
 static uint pos;
+/* Whether the next token follows the last one directly. */
+static int adjacent;
 
 static void push_tok(int kind, char *text, uint line) {
     toks = grow(toks, &captoks, ntoks + 1, sizeof(struct tok));
     toks[ntoks].kind = kind;
     toks[ntoks].text = text;
     toks[ntoks].line = line;
+    toks[ntoks].glued = adjacent;
+    adjacent = 1;
     ntoks++;
 }
 
@@ -91,14 +113,17 @@ static const char *const PUNCTS[] = {"{", "}", "(", ")", ":", ";", ",", "=", ">"
 static int lex(const char *src) {
     uint line = 1;
     ntoks = 0;
+    adjacent = 0;
     const char *p = src;
     while (*p) {
         int c = (uchar)*p;
         if (c == '\n') {
             line++;
             p++;
+            adjacent = 0;
         } else if (is_space(c)) {
             p++;
+            adjacent = 0;
         } else if (c == '/') {
             p++;
             if (strncmp(p, "DISCARD/", 8) == 0) {
@@ -125,6 +150,7 @@ static int lex(const char *src) {
                 }
                 prev = ch;
             }
+            adjacent = 0;
         } else if (c == '"') {
             p++;
             const char *s = p;
@@ -165,9 +191,38 @@ static int lex(const char *src) {
     return 1;
 }
 
+/* ---- Output formats ---- */
+
+const char *format_name(int format) {
+    return format == FORMAT_ELF64 ? "elf64-littleriscv" : "elf32-littleriscv";
+}
+
+/* The class an OUTPUT_FORMAT name stands for; FORMAT_NONE if merlin-ld does
+ * not know it. ld.lld takes a -freebsd suffix too. */
+static int format_class(const char *name) {
+    uint n = (uint)strlen(name);
+    if (n > 8 && strcmp(name + n - 8, "-freebsd") == 0) {
+        n -= 8;
+    }
+    if (n == 17 && strncmp(name, "elf32-littleriscv", 17) == 0) {
+        return FORMAT_ELF32;
+    }
+    if (n == 17 && strncmp(name, "elf64-littleriscv", 17) == 0) {
+        return FORMAT_ELF64;
+    }
+    return FORMAT_NONE;
+}
+
 /* ---- Numbers and globs ---- */
 
-int parse_number(const char *w, i64 *out) {
+/* a > b, as unsigned 64-bit numbers. */
+static int ugt(i64 a, i64 b) {
+    return a.hi != b.hi ? a.hi > b.hi : a.lo > b.lo;
+}
+
+/* parse_number, for an ELF64 script (wide) or an ELF32 one: up to 2^64 - 1,
+ * or up to i64::MAX. */
+static int number(const char *w, i64 *out, int wide) {
     uint n = (uint)strlen(w);
     if (n == 0) {
         return 0;
@@ -180,10 +235,12 @@ int parse_number(const char *w, i64 *out) {
         mult = 1024 * 1024;
         n--;
     }
-    /* i64::MAX, the most either form may be before the multiplier. */
-    i64 max;
+    /* The most either form may be before the multiplier, and a tenth of it. */
+    i64 max, tenth;
     max.lo = 0xffffffffu;
-    max.hi = 0x7fffffffu;
+    max.hi = wide ? 0xffffffffu : 0x7fffffffu;
+    tenth.lo = wide ? 0x99999999u : 0xccccccccu;
+    tenth.hi = wide ? 0x19999999u : 0x0cccccccu;
     i64 v = i64_u(0);
     if (n >= 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X')) {
         if (n == 2) {
@@ -195,7 +252,7 @@ int parse_number(const char *w, i64 *out) {
                      : c >= 'a' && c <= 'f' ? (uint)(c - 'a' + 10)
                      : c >= 'A' && c <= 'F' ? (uint)(c - 'A' + 10)
                                             : 16;
-            if (d >= 16 || i64_cmp(v, i64_sar(max, 4)) > 0) {
+            if (d >= 16 || ugt(v, i64_shr(max, 4))) {
                 return 0;
             }
             v = i64_add(i64_shl(v, 4), i64_u(d));
@@ -208,28 +265,29 @@ int parse_number(const char *w, i64 *out) {
             if (w[i] < '0' || w[i] > '9') {
                 return 0;
             }
-            i64 ten = i64_mul(v, i64_u(10));
-            i64 q;
-            i64_div(max, i64_u(10), &q);
-            if (i64_cmp(v, q) > 0) {
+            if (ugt(v, tenth)) {
                 return 0;
             }
+            i64 ten = i64_mul(v, i64_u(10));
             v = i64_add(ten, i64_u((uint)(w[i] - '0')));
-            if (i64_is_neg(v)) {
+            /* Past max, or round 2^64. */
+            if (ugt(v, max) || ugt(ten, v)) {
                 return 0;
             }
         }
     }
     if (mult != 1) {
-        i64 q;
-        i64_div(max, i64_u(mult), &q);
-        if (i64_cmp(v, q) > 0) {
+        if (ugt(v, i64_shr(max, mult == 1024 ? 10 : 20))) {
             return 0;
         }
         v = i64_mul(v, i64_u(mult));
     }
     *out = v;
     return 1;
+}
+
+int parse_number(const char *w, i64 *out) {
+    return number(w, out, 0);
 }
 
 int glob_match(const char *p, const char *n) {
@@ -268,6 +326,60 @@ int expr_uses_dot(struct expr *e) {
     }
     if (e->kind == X_ADD || e->kind == X_SUB) {
         return expr_uses_dot(e->a) || expr_uses_dot(e->b);
+    }
+    return 0;
+}
+
+/* ld.lld's expressionsUseSymbols: ADDR and ORIGIN name no symbol. */
+int expr_uses_symbols(struct expr *e) {
+    if (e->kind == X_SYMBOL) {
+        return 1;
+    }
+    if (e->kind == X_ALIGN) {
+        return expr_uses_symbols(e->a);
+    }
+    if (e->kind == X_ADD || e->kind == X_SUB) {
+        return expr_uses_symbols(e->a) || expr_uses_symbols(e->b);
+    }
+    return 0;
+}
+
+static int expr_names_addr(struct expr *e, const char *name) {
+    if (e == NULL) {
+        return 0;
+    }
+    if (e->kind == X_ADDR) {
+        return strcmp(e->name, name) == 0;
+    }
+    if (e->kind == X_ALIGN) {
+        return expr_names_addr(e->a, name);
+    }
+    if (e->kind == X_ADD || e->kind == X_SUB) {
+        return expr_names_addr(e->a, name) || expr_names_addr(e->b, name);
+    }
+    return 0;
+}
+
+/* ld.lld's usedInExpression: an empty section still has an address, which
+ * the expression needs. */
+int script_names_addr(struct script *s, const char *name) {
+    for (uint c = 0; c < s->ncommands; c++) {
+        struct command *cmd = &s->commands[c];
+        if (!cmd->is_output) {
+            if (expr_names_addr(cmd->assign.e, name)) {
+                return 1;
+            }
+            continue;
+        }
+        struct output_desc *o = &cmd->out;
+        if (expr_names_addr(o->at, name) || expr_names_addr(o->align, name)) {
+            return 1;
+        }
+        for (uint i = 0; i < o->nitems; i++) {
+            if (o->items[i].is_assign && expr_names_addr(o->items[i].assign.e, name)) {
+                return 1;
+            }
+        }
     }
     return 0;
 }
@@ -331,18 +443,43 @@ static int word(const char *what, char **out) {
     return fail(line, fmt("expected %s, found %s", what, shown(t)));
 }
 
-/* A word or a quoted string, as in OUTPUT_ARCH("riscv"). */
-static int word_or_str(const char *what, char **out) {
+static int is_dash(struct tok *t) {
+    return t->kind == TK_PUNCT && strcmp(t->text, "-") == 0;
+}
+
+/* A name: a section name, a pattern, a symbol an assignment sets, a region,
+ * a format. ld.lld's lexer reads these outside expressions, where `-` is a
+ * character of a name as letters are, so elf64-littleriscv and *(.text-x)
+ * are one token each, while inside an expression a-b is a - b. This lexer
+ * keeps `-` apart and joins it back here: the name is the word or `-` there
+ * and every word and `-` that follows it with nothing between them. */
+static int read_name(const char *what, char **out) {
     uint line = cur_line();
     struct tok *t = next();
     if (t == NULL) {
         return 0;
     }
-    if (t->kind == TK_WORD || t->kind == TK_STR) {
+    if (t->kind != TK_WORD && !is_dash(t)) {
+        return fail(line, fmt("expected %s, found %s", what, shown(t)));
+    }
+    char *name = t->text;
+    while (pos < ntoks && toks[pos].glued && (toks[pos].kind == TK_WORD || is_dash(&toks[pos]))) {
+        name = fmt("%s%s", name, toks[pos].text);
+        pos++;
+    }
+    *out = name;
+    return 1;
+}
+
+/* A name or a quoted string, as in OUTPUT_ARCH("riscv"). */
+static int name_or_str(const char *what, char **out) {
+    struct tok *t = peek();
+    if (t != NULL && t->kind == TK_STR) {
+        pos++;
         *out = t->text;
         return 1;
     }
-    return fail(line, fmt("expected %s, found %s", what, shown(t)));
+    return read_name(what, out);
 }
 
 static struct expr *new_expr(int kind) {
@@ -368,7 +505,7 @@ static int atom(struct expr **out) {
     }
     if (w[0] >= '0' && w[0] <= '9') {
         struct expr *e = new_expr(X_NUM);
-        if (!parse_number(w, &e->num)) {
+        if (!number(w, &e->num, elf64)) {
             return fail(line, fmt("bad number '%s'", w));
         }
         *out = e;
@@ -397,7 +534,12 @@ static int atom(struct expr **out) {
         }
     } else if (strcmp(w, "ORIGIN") == 0 || strcmp(w, "LENGTH") == 0) {
         e = new_expr(w[0] == 'O' ? X_ORIGIN : X_LENGTH);
-        if (!word("a memory region name", &e->name)) {
+        if (!read_name("a memory region name", &e->name)) {
+            return 0;
+        }
+    } else if (strcmp(w, "ADDR") == 0) {
+        e = new_expr(X_ADDR);
+        if (!read_name("a section name", &e->name)) {
             return 0;
         }
     } else {
@@ -447,7 +589,12 @@ static int const_eval(struct expr *e, i64 *out) {
         return 0;
     }
     i64 r = e->kind == X_ADD ? i64_add(a, b) : i64_sub(a, b);
-    /* checked_add / checked_sub: no signed overflow. */
+    /* ELF64: modulo 2^64. ELF32: checked_add / checked_sub, no signed
+     * overflow. */
+    if (elf64) {
+        *out = r;
+        return 1;
+    }
     int na = i64_is_neg(a), nb = i64_is_neg(b) ^ (e->kind == X_SUB), nr = i64_is_neg(r);
     if (e->kind == X_SUB && b.hi == 0x80000000u && b.lo == 0) {
         /* -i64::MIN does not exist: a - MIN overflows unless a < 0. */
@@ -500,7 +647,7 @@ static int memory(struct script *s) {
     while (!eat("}")) {
         uint line = cur_line();
         char *name;
-        if (!word("a memory region name", &name)) {
+        if (!read_name("a memory region name", &name)) {
             return 0;
         }
         if (have) {
@@ -525,16 +672,23 @@ static int memory(struct script *s) {
             !region_field(LENGTH_NAMES, &length)) {
             return 0;
         }
-        if (!fits_u32(origin)) {
-            return fail(line, fmt("MEMORY ORIGIN %s does not fit in 32 bits", i64_hex(origin)));
-        }
-        if (!fits_u32(length)) {
-            return fail(line, fmt("MEMORY LENGTH %s does not fit in 32 bits", i64_hex(length)));
-        }
-        /* origin + length > 2^32: the region may end exactly at 4 GiB. */
-        i64 end = i64_add(origin, length);
-        if (end.hi > 1 || (end.hi == 1 && end.lo != 0)) {
-            return fail(line, fmt("MEMORY region %s extends past 4 GiB", name));
+        if (elf64) {
+            /* ELF64: the region ends below 2^64. */
+            if (ugt(origin, i64_add(origin, length))) {
+                return fail(line, fmt("MEMORY region %s extends past the 64-bit address space", name));
+            }
+        } else {
+            if (!fits_u32(origin)) {
+                return fail(line, fmt("MEMORY ORIGIN %s does not fit in 32 bits", i64_hex(origin)));
+            }
+            if (!fits_u32(length)) {
+                return fail(line, fmt("MEMORY LENGTH %s does not fit in 32 bits", i64_hex(length)));
+            }
+            /* origin + length > 2^32: the region may end exactly at 4 GiB. */
+            i64 end = i64_add(origin, length);
+            if (end.hi > 1 || (end.hi == 1 && end.lo != 0)) {
+                return fail(line, fmt("MEMORY region %s extends past 4 GiB", name));
+            }
         }
         have = 1;
         s->has_memory = 1;
@@ -560,7 +714,8 @@ static int assign(char *name, uint line, struct assign *a) {
 }
 
 /* The rest of an output section after its name, its (NOLOAD) and the colon:
- * [ALIGN(n)] { items } [> REGION]. */
+ * [AT(lma)] [ALIGN(n)] { items } [> REGION]. ld.lld reads AT and ALIGN in
+ * that order only (`ALIGN(n) AT(lma)` is its "{ expected, but got AT"). */
 static int output_section(char *name, int noload, uint line, struct output_desc *o) {
     memset(o, 0, sizeof *o);
     o->name = name;
@@ -569,16 +724,19 @@ static int output_section(char *name, int noload, uint line, struct output_desc 
     if (strcmp(name, ".") == 0) {
         return fail(line, fmt("'%s' is not a valid output section name", name));
     }
+    /* A /DISCARD/'s NOLOAD and AT are read, as ld.lld reads them, and
+     * mean nothing; its ALIGN is checked (layout.c). */
     int discard = strcmp(name, DISCARD_NAME) == 0;
-    if (discard && noload) {
-        return fail(line, "/DISCARD/ cannot be NOLOAD");
-    }
     struct tok *t = peek();
+    if (t != NULL && t->kind == TK_WORD && strcmp(t->text, "AT") == 0) {
+        pos++;
+        if (!expect("(") || !expr(&o->at) || !expect(")")) {
+            return 0;
+        }
+        t = peek();
+    }
     if (t != NULL && t->kind == TK_WORD && strcmp(t->text, "ALIGN") == 0) {
         uint aline = cur_line();
-        if (discard) {
-            return fail(aline, "/DISCARD/ cannot have an ALIGN");
-        }
         pos++;
         if (!expect("(") || !expr(&o->align)) {
             return 0;
@@ -589,10 +747,14 @@ static int output_section(char *name, int noload, uint line, struct output_desc 
         if (!expect(")")) {
             return 0;
         }
-    } else if (t == NULL) {
+        t = peek();
+    }
+    if (t == NULL) {
         return fail(cur_line(), "unexpected end of script");
-    } else if (!(t->kind == TK_PUNCT && strcmp(t->text, "{") == 0)) {
-        return fail(cur_line(), fmt("unsupported syntax after '%s :': found %s (only ALIGN(n) may come before '{')",
+    }
+    if (!(t->kind == TK_PUNCT && strcmp(t->text, "{") == 0)) {
+        return fail(cur_line(), fmt("unsupported syntax after '%s :': found %s (only AT(lma) and then ALIGN(n) may "
+                                    "come before '{')",
                                     name, shown(t)));
     }
     if (!expect("{")) {
@@ -602,7 +764,7 @@ static int output_section(char *name, int noload, uint line, struct output_desc 
     while (!eat("}")) {
         uint iline = cur_line();
         char *w;
-        if (!word("an input section list or an assignment", &w)) {
+        if (!read_name("an input section list or an assignment", &w)) {
             return 0;
         }
         if (is("=") || is("+=")) {
@@ -638,7 +800,7 @@ static int output_section(char *name, int noload, uint line, struct output_desc 
         while (!eat(")")) {
             uint pline = cur_line();
             char *p;
-            if (!word("a section name pattern", &p)) {
+            if (!read_name("a section name pattern", &p)) {
                 return 0;
             }
             if (is("(")) {
@@ -660,7 +822,7 @@ static int output_section(char *name, int noload, uint line, struct output_desc 
         if (discard) {
             return fail(cur_line(), "/DISCARD/ cannot go in a memory region");
         }
-        if (!word("a memory region name", &o->region)) {
+        if (!read_name("a memory region name", &o->region)) {
             return 0;
         }
     }
@@ -676,7 +838,7 @@ static int sections(struct script *s) {
     while (!eat("}")) {
         uint line = cur_line();
         char *name;
-        if (!word("a section name, '.' or a symbol", &name)) {
+        if (!read_name("a section name, '.' or a symbol", &name)) {
             return 0;
         }
         s->commands = grow(s->commands, &cap, s->ncommands + 1, sizeof(struct command));
@@ -717,8 +879,21 @@ static int sections(struct script *s) {
             return fail(line, fmt("unsupported linker script command '%s'", name));
         }
         return fail(line, fmt("unsupported syntax after '%s': found %s (output sections are `name [(NOLOAD)] : "
-                              "[ALIGN(n)] { ... }`, without an address or other attributes)",
+                              "[AT(lma)] [ALIGN(n)] { ... }`, without an address or other attributes)",
                               name, shown(t)));
+    }
+    return 1;
+}
+
+/* One argument of OUTPUT_FORMAT, a name merlin-ld knows. */
+static int format_arg(uint line, int *format) {
+    char *f;
+    if (!name_or_str("an output format", &f)) {
+        return 0;
+    }
+    *format = format_class(f);
+    if (*format == FORMAT_NONE) {
+        return fail(line, fmt("OUTPUT_FORMAT(%s): only elf32-littleriscv and elf64-littleriscv are supported", f));
     }
     return 1;
 }
@@ -732,12 +907,12 @@ static int script(struct script *s) {
             return 0;
         }
         if (strcmp(kw, "ENTRY") == 0) {
-            if (!expect("(") || !word("an entry symbol", &s->entry) || !expect(")")) {
+            if (!expect("(") || !read_name("an entry symbol", &s->entry) || !expect(")")) {
                 return 0;
             }
         } else if (strcmp(kw, "OUTPUT_ARCH") == 0) {
             char *arch;
-            if (!expect("(") || !word_or_str("an architecture", &arch)) {
+            if (!expect("(") || !name_or_str("an architecture", &arch)) {
                 return 0;
             }
             char low[8];
@@ -756,20 +931,24 @@ static int script(struct script *s) {
             if (!expect("(")) {
                 return 0;
             }
-            for (;;) {
-                char *f;
-                if (!word_or_str("an output format", &f)) {
+            /* OUTPUT_FORMAT(name) or OUTPUT_FORMAT(default, big, little), one
+             * argument or three, as ld.lld takes them: it goes by the first;
+             * merlin-ld also wants the others to be names it knows. */
+            int first;
+            if (!format_arg(line, &first)) {
+                return 0;
+            }
+            if (eat(",")) {
+                int other;
+                if (!format_arg(line, &other) || !expect(",") || !format_arg(line, &other)) {
                     return 0;
-                }
-                if (strcmp(f, "elf32-littleriscv") != 0) {
-                    return fail(line, fmt("OUTPUT_FORMAT(%s): only elf32-littleriscv is supported", f));
-                }
-                if (!eat(",")) {
-                    break;
                 }
             }
             if (!expect(")")) {
                 return 0;
+            }
+            if (s->format == FORMAT_NONE) {
+                s->format = first;
             }
         } else if (strcmp(kw, "MEMORY") == 0) {
             if (seen_memory) {
@@ -797,8 +976,9 @@ static int script(struct script *s) {
     return 1;
 }
 
-int script_parse(const char *src, struct script *out, uint *line, char **msg) {
+int script_parse(const char *src, struct script *out, uint *line, char **msg, int for_elf64) {
     memset(out, 0, sizeof *out);
+    elf64 = for_elf64;
     pos = 0;
     if (!lex(src) || !script(out)) {
         *line = err_line;

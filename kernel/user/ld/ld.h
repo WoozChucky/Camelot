@@ -19,8 +19,9 @@
  *   tables.c    the elf crate's (crates/xtask/src/c_tables.rs)
  *
  * The 64-bit arithmetic merlin-ld does with Rust's i64 and u64 (addresses
- * up to 4 GiB exactly, relocation ranges) is lib/i64.c's. Not here: the
- * link map (merlin-ld's --Map). */
+ * up to 4 GiB exactly, load addresses, relocation ranges, R_RISCV_64) is
+ * lib/i64.c's. Not here: the link map (merlin-ld's --Map), and RV64
+ * (ELF64 objects and executables, #157). */
 #ifndef LD_H
 #define LD_H
 
@@ -86,8 +87,8 @@ int umap_get(struct uintmap *m, uint key, int *value);
 void umap_put(struct uintmap *m, uint key, int value);
 
 /* ---- Objects (object.c) ---- */
-/* The ELF constants (SHT_*, SHF_*, SHN_*, STB_*, STT_*) are tables.h's,
- * generated from the elf crate's. */
+/* The ELF constants (SHT_*, SHF_*, SHN_*, STB_*, STT_*, PT_*, PF_*) are
+ * tables.h's, generated from the elf crate's. */
 
 /* One Elf32_Rela. */
 struct rela {
@@ -157,18 +158,22 @@ struct input {
 };
 
 /* ---- Libraries (library.c) ---- */
-/* Parses `inputs` and the members of `library` they need (merlin-ld's
- * with_needed), which follow them in library order. Returns the objects
- * and their count in *n, or NULL after adding errors. */
-struct object *parse_with_needed(struct input *inputs, uint ninputs, struct input *library, uint nlibrary,
-                                 uint *n);
+/* Parses the n files of a command line, in its order, lazy[i] saying which
+ * are library members, compares their classes and picks the members the
+ * others need (merlin-ld's layout::read, check_classes and library::pulled):
+ * the files that are not members, in order, then the members needed, in
+ * library order. `format` is the class the script's OUTPUT_FORMAT names,
+ * which every file must have. Returns the objects and their count in *count,
+ * or NULL after adding errors; NULL too when errors were added before (the
+ * script's), once every file is parsed. */
+struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, int format, uint *count);
 
 /* ---- Linker scripts (script.c) ---- */
-enum { X_NUM, X_DOT, X_SYMBOL, X_ALIGN, X_ORIGIN, X_LENGTH, X_ADD, X_SUB };
+enum { X_NUM, X_DOT, X_SYMBOL, X_ALIGN, X_ORIGIN, X_LENGTH, X_ADDR, X_ADD, X_SUB };
 struct expr {
     int kind;
     i64 num;
-    char *name; /* X_SYMBOL; X_ORIGIN, X_LENGTH: the region */
+    char *name; /* X_SYMBOL; X_ORIGIN, X_LENGTH: the region; X_ADDR: the output section */
     struct expr *a;
     struct expr *b;
 };
@@ -192,6 +197,7 @@ struct item {
 struct output_desc {
     char *name;
     int noload;
+    struct expr *at;    /* AT(lma), the load address; NULL: none */
     struct expr *align; /* NULL: none */
     struct item *items;
     uint nitems;
@@ -205,8 +211,12 @@ struct command {
     struct output_desc out;
 };
 
+/* The classes OUTPUT_FORMAT names: elf32-littleriscv, elf64-littleriscv. */
+enum { FORMAT_NONE, FORMAT_ELF32, FORMAT_ELF64 };
+
 struct script {
     char *entry;
+    int format; /* OUTPUT_FORMAT's first argument; FORMAT_NONE: none */
     int has_memory;
     char *region_name;
     uint origin;
@@ -217,12 +227,23 @@ struct script {
 
 #define DISCARD_NAME "/DISCARD/"
 extern const char DEFAULT_SCRIPT[];
-/* Parses a script. 0 with *line and *msg set on an error. */
-int script_parse(const char *src, struct script *out, uint *line, char **msg);
+/* Parses a script, for ELF32 (its exact values and 4 GiB limits) or, when
+ * elf64 is set, for ELF64 (64-bit values, wrapping), as merlin-ld reads it
+ * first, for the errors ld.lld gives whatever the class. 0 with *line and
+ * *msg set on an error. */
+int script_parse(const char *src, struct script *out, uint *line, char **msg, int elf64);
+/* "elf32-littleriscv" or "elf64-littleriscv". */
+const char *format_name(int format);
 /* A number: decimal or 0x hex, with an optional K or M. */
 int parse_number(const char *w, i64 *out);
 int glob_match(const char *pattern, const char *name);
 int expr_uses_dot(struct expr *e);
+/* Whether the value depends on a symbol (ld.lld keeps an empty section
+ * whose AT or ALIGN does). */
+int expr_uses_symbols(struct expr *e);
+/* Whether some expression of the script names output section `name` with
+ * ADDR(...) (ld.lld keeps such a section even if it is empty). */
+int script_names_addr(struct script *s, const char *name);
 
 /* ---- The layout (layout.c) ---- */
 struct input_ref {
@@ -234,7 +255,16 @@ struct input_ref {
 struct output_section {
     char *name;
     uint addr;
+    /* 1 for an empty section at exactly 4 GiB (addr is then 0), the one
+     * address past 32 bits a section may have on ELF32: merlin-ld keeps it
+     * 64-bit, and so it is above every other section, not below. */
+    uint addr_hi;
     uint size;
+    /* The load address (LMA, the segment's p_paddr): addr unless the script
+     * says otherwise with AT. 64 bits, as merlin-ld's u64: a load range past
+     * 4 GiB is an error, and the section is still placed. */
+    i64 lma;
+    int at; /* the section has an AT of its own: it starts a segment */
     uint align;
     uint flags;
     int nobits;
@@ -276,6 +306,12 @@ struct layout {
     uint nglobals;
     struct strmap global_index;
     uint entry;
+    /* The script has a MEMORY region, which every output section is in:
+     * such a section never shares a segment with the headers (write.c). */
+    int memory;
+    /* ld.lld would write a .riscv.attributes section, and so a
+     * PT_RISCV_ATTRIBUTES program header, which write.c leaves room for. */
+    int riscv_attributes;
 };
 
 /* merlin-ld's layout::build: 0 after adding errors. */
@@ -286,16 +322,19 @@ int object_symbol(struct layout *l, uint obj, uint sym, uint *out);
 int global_value(struct layout *l, const char *name, uint *out);
 int in_dropped_section(struct layout *l, uint obj, uint sym);
 int is_undefined_weak(struct layout *l, uint obj, uint sym);
+/* ld.lld makes an output section of this name and these flags RELRO. */
+int is_relro(const char *name, uint flags);
 /* S for a relocation in `obj` against `sym`: 1, or 0 with *err. */
 int reloc_symbol(struct layout *l, uint obj, uint sym, uint *out, char **err);
 
 /* ---- Relocations (reloc.c, relocate.c) ---- */
-enum { RE_OK, RE_UNSUPPORTED, RE_NEEDS_RELAXATION, RE_OUT_OF_RANGE, RE_MISALIGNED, RE_TRUNCATED, RE_MISSING_HI20,
-       RE_LO12_ADDEND };
+enum { RE_OK, RE_UNSUPPORTED, RE_ALIGN_PADDING, RE_OUT_OF_RANGE, RE_MISALIGNED, RE_RANGE_AND_ALIGN, RE_TRUNCATED,
+       RE_MISSING_HI20, RE_LO12_ADDEND };
 
-/* What a failed relocation says: the value and its bounds (OUT_OF_RANGE),
- * the value and the alignment, in min (MISALIGNED), the bytes needed and
- * left (TRUNCATED). */
+/* What a failed relocation says: the value and its bounds (OUT_OF_RANGE,
+ * and RANGE_AND_ALIGN, an odd offset out of range: two errors, misaligned
+ * by 2 too), the value and the alignment, in min (MISALIGNED), the bytes
+ * needed and left (TRUNCATED). */
 struct reloc_error {
     i64 value;
     i64 min;
@@ -310,6 +349,9 @@ struct hi_site {
     int addend;
 };
 struct reloc_context {
+    /* The relocations patch a section that is not loaded (debug
+     * information), where R_RISCV_64 is sign-extended from 32 bits. */
+    int debug;
     struct uintmap by_place;
     struct hi_site *sites;
     uint nsites;
@@ -317,9 +359,10 @@ struct reloc_context {
 };
 
 /* Patches `bytes` (`have` of them, from the place to the end of the input
- * section) for one relocation. Returns RE_OK or what is wrong (nothing is
- * written then). */
-int reloc_apply(uint type, uint place, uint sym, int addend, uchar *bytes, uint have, struct reloc_context *ctx,
+ * section) for one relocation. S, `sym`, is 64 bits, as merlin-ld's u64: an
+ * address, or -A for debug information of discarded code. Returns RE_OK or
+ * what is wrong (nothing is written then). */
+int reloc_apply(uint type, uint place, i64 sym, int addend, uchar *bytes, uint have, struct reloc_context *ctx,
                 struct reloc_error *e);
 /* A relocation type's psABI name (or "relocation type N"). */
 const char *reloc_type_name(uint type);
@@ -332,5 +375,7 @@ int relocate(struct layout *l, uchar ***sections, uchar ***debug);
 /* The ELF file, without the debug sections if `strip` (the same bytes as a
  * link without them: merlin-ld's strip_debug). */
 void write_elf(struct layout *l, uchar **sections, uchar **debug, int strip, struct buf *out);
+/* merlin-ld's write::check: adds the errors the program headers would have. */
+void write_check(struct layout *l);
 
 #endif

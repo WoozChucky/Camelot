@@ -15,10 +15,10 @@ relax_fn:                           # relax_word = lib_double(a0) + lib_value
     add   a0, a0, t0
     lui   t1, %hi(relax_word)       # HI20 + RELAX
     sw    a0, %lo(relax_word)(t1)   # LO12_S + RELAX
-    li    t2, 3                     # a local loop: the assembler resolves it
-1:  addi  t2, t2, -1
-    beqz  t2, 2f
-    j     1b
+    li    t2, 3                     # a local loop: clang 23 marks the j
+1:  addi  t2, t2, -1                # relaxable, so the branch over it and
+    beqz  t2, 2f                    # the j stay relocations: BRANCH .Ltmp1,
+    j     1b                        # JAL .Ltmp0 + RELAX
 2:  lw    ra, 12(sp)
     addi  sp, sp, 16
     ret

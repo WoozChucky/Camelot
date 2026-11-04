@@ -1,5 +1,7 @@
-//! merlin-ld: links ELF32 RISC-V relocatable objects into an Excalibur
-//! executable (`ET_EXEC`) that Grail loads directly.
+//! merlin-ld: links RISC-V relocatable objects into an Excalibur executable
+//! (`ET_EXEC`) that Grail loads directly. The objects are ELF32 (RV32) or
+//! ELF64 (RV64), all of one class, and the executable has their class: there
+//! is no option for it, as ld.lld needs none ([`Layout::class`]).
 //!
 //! Pipeline: [`object`] (read `.o` files) → [`layout`] (symbols, section
 //! merging, addresses; driven by a [`script`]) → [`relocate`] (copies section
@@ -53,7 +55,9 @@ pub struct ScriptSource {
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     /// `-T`; without it the default layout is used (`.text` at 0x8000_0000,
-    /// then `.rodata`, `.data`, `.bss`).
+    /// then `.rodata`, `.data`, `.bss`; [`script::DEFAULT_SCRIPT`]). For
+    /// RV64 that takes pc-relative code only (`-mcmodel=medany`): `lui
+    /// %hi(x)` cannot reach 0x8000_0000 there.
     pub script: Option<ScriptSource>,
     /// `-e`: an entry symbol or address. Overrides `ENTRY(...)`.
     pub entry: Option<String>,
@@ -73,7 +77,11 @@ pub fn layout(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
 
 /// Links `inputs` into an executable.
 pub fn link(inputs: &[Input], opts: &Options) -> Result<Linked, Vec<Error>> {
-    let layout = layout::build(inputs, opts)?;
+    finish(layout::build(inputs, opts)?)
+}
+
+/// Relocates and writes a finished layout.
+fn finish(layout: Layout) -> Result<Linked, Vec<Error>> {
     let images = relocate::relocate(&layout)?;
     let elf = write::write(&layout, &images);
     Ok(Linked { elf, layout })
@@ -90,5 +98,30 @@ pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, Error> {
 /// only when they define something still undefined, like an archive's:
 /// [`library`]), after them in library order.
 pub fn link_with_library(inputs: &[Input], library: &[Input], opts: &Options) -> Result<Linked, Vec<Error>> {
-    link(&library::with_needed(inputs, library)?, opts)
+    let files: Vec<(&Input, bool)> = inputs
+        .iter()
+        .map(|i| (i, false))
+        .chain(library.iter().map(|i| (i, true)))
+        .collect();
+    link_files(&files, opts)
+}
+
+/// Links the files of a command line, in its order, each with whether it
+/// is a library member (between `--start-lib` and `--end-lib`): what
+/// merlin-ld's command line does. The members are linked only when needed
+/// ([`library`]), after the other files, in library order, but the script
+/// and every file are read, and their classes compared, in command-line
+/// order, as ld.lld does ([`layout::read`]): so are their errors.
+pub fn link_files(files: &[(&Input, bool)], opts: &Options) -> Result<Linked, Vec<Error>> {
+    let (objects, script, class) = layout::read(files, opts)?;
+    let lazy: Vec<bool> = files.iter().map(|&(_, lazy)| lazy).collect();
+    let pulled = library::pulled(&objects.iter().collect::<Vec<_>>(), &lazy);
+    let (program, members): (Vec<_>, Vec<_>) = objects
+        .into_iter()
+        .zip(lazy)
+        .zip(pulled)
+        .filter(|&((_, lazy), pulled)| !lazy || pulled)
+        .partition(|&((_, lazy), _)| !lazy);
+    let objects = program.into_iter().chain(members).map(|((o, _), _)| o).collect();
+    finish(layout::build_from(objects, script, class, opts)?)
 }

@@ -38,8 +38,11 @@ tasks:
                -v: print the equivalent merlin-as/merlin-ld command lines
   hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
                with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
-  ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj, llvm-objdump);
+  ld-fixtures  regenerate crates/merlin-ld/tests/fixtures, the RV32 set and the RV64 set in
+               fixtures/rv64 (clang, ld.lld, llvm-readobj, llvm-objdump);
                takes --clang, --lld and -v like kernel
+               --out DIR: regenerate into DIR (new or empty) from copies of the sources instead,
+               leaving the committed files as they are (diff -r shows what would change)
   ci           the tests GitHub's CI runs: the important, quick ones (unit tests, the
                toolchain against its references, the committed binaries current, the
                kernel boots, the documents); the whole suite is cargo test --release
@@ -131,6 +134,37 @@ fn check_kernel_args(k: &KernelArgs) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `cargo xtask ld-fixtures`'s options: the LLVM tools, as for `kernel`, and
+/// where to write.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LdFixturesArgs {
+    clang: Option<PathBuf>,
+    lld: Option<PathBuf>,
+    /// `--out DIR`: regenerate into DIR instead of the committed fixtures.
+    out: Option<PathBuf>,
+    verbose: bool,
+}
+
+fn parse_ld_fixtures_args(args: &[String]) -> Result<LdFixturesArgs, String> {
+    let mut l = LdFixturesArgs::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
+        match a.as_str() {
+            "--clang" => l.clang = Some(value("--clang")?.into()),
+            "--lld" => l.lld = Some(value("--lld")?.into()),
+            "--out" => l.out = Some(value("--out")?.into()),
+            "-v" | "--verbose" => l.verbose = true,
+            other => {
+                return Err(format!(
+                    "unknown option {other} (ld-fixtures takes --clang, --lld, --out and -v)"
+                ))
+            }
+        }
+    }
+    Ok(l)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -234,12 +268,8 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Some("ld-fixtures") => match parse_kernel_args(&args[1..]) {
-            Ok(k) if k.assembler.is_none() && k.cc.is_none() && k.out.is_none() && !k.run => ld_fixtures(k),
-            Ok(_) => {
-                eprintln!("xtask: ld-fixtures takes only --clang, --lld and -v\n{}", usage());
-                ExitCode::from(2)
-            }
+        Some("ld-fixtures") => match parse_ld_fixtures_args(&args[1..]) {
+            Ok(l) => ld_fixtures(l),
             Err(e) => {
                 eprintln!("xtask: {e}\n{}", usage());
                 ExitCode::from(2)
@@ -482,7 +512,7 @@ fn hello(k: KernelArgs) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn ld_fixtures(k: KernelArgs) -> ExitCode {
+fn ld_fixtures(k: LdFixturesArgs) -> ExitCode {
     let Some(clang) = k.clang.or_else(|| tools::find("clang")) else {
         eprintln!("xtask: clang not found; pass --clang PATH");
         return ExitCode::FAILURE;
@@ -506,7 +536,17 @@ fn ld_fixtures(k: KernelArgs) -> ExitCode {
         objdump,
         verbose: k.verbose,
     };
-    let fixtures = root.join("crates/merlin-ld/tests/fixtures");
+    let mut fixtures = root.join(xtask::ld_fixtures::FIXTURES);
+    if let Some(out) = k.out {
+        // A scratch copy of the sources, regenerated there (compare with diff -r).
+        fixtures = match xtask::ld_fixtures::prepare_out(&fixtures, &out) {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("xtask: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    }
     match xtask::ld_fixtures::run(&fixtures, &root.join("examples"), &t) {
         Ok(files) => {
             eprintln!("wrote {} files in {}", files.len(), fixtures.display());
@@ -727,6 +767,27 @@ mod tests {
         assert!(parse_examples(&["--run"])
             .unwrap_err()
             .contains("unknown option --run"));
+    }
+
+    #[test]
+    fn ld_fixtures_args() {
+        let parse = |v: &[&str]| parse_ld_fixtures_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(parse(&[]).unwrap(), LdFixturesArgs::default());
+        assert_eq!(
+            parse(&["--clang", "c", "--lld", "l", "--out", "scratch", "-v"]).unwrap(),
+            LdFixturesArgs {
+                clang: Some("c".into()),
+                lld: Some("l".into()),
+                out: Some("scratch".into()),
+                verbose: true,
+            }
+        );
+        assert!(parse(&["--out"]).unwrap_err().contains("--out needs a value"));
+        // The kernel's other options mean nothing here.
+        for other in ["-o", "--cc", "--as", "--run"] {
+            let err = parse(&[other, "x"]).unwrap_err();
+            assert!(err.starts_with(&format!("unknown option {other} ")), "{err}");
+        }
     }
 
     #[test]

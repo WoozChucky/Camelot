@@ -220,12 +220,13 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    /* In command-line order, which ld.lld reads them in, library members
+     * too. */
     struct input *files = xcalloc((nnames + 1) * sizeof(struct input));
-    struct input *library = xcalloc((nnames + 1) * sizeof(struct input));
-    uint nlibrary = 0;
-    nfiles = 0;
+    int *lazy = xcalloc((nnames + 1) * sizeof(int));
     for (uint i = 0; i < nnames; i++) {
-        struct input *in = names[i].lib ? &library[nlibrary++] : &files[nfiles++];
+        struct input *in = &files[i];
+        lazy[i] = names[i].lib;
         int err;
         in->name = names[i].name;
         in->data = read_file(in->name, &in->len, &err);
@@ -245,8 +246,22 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* ld.lld's order (merlin-ld's layout::read): the script first, read for
+     * ELF64 as ld.lld reads it (64-bit values whatever the class), so its
+     * errors come first; then every file, in command-line order; and only
+     * when all of that read, the classes, the script's OUTPUT_FORMAT's if it
+     * names one. layout_build reads the script again, for ELF32. */
+    struct script read64;
+    uint line;
+    char *msg;
+    int format = FORMAT_NONE;
+    if (script_parse(script_text != NULL ? script_text : DEFAULT_SCRIPT, &read64, &line, &msg, 1)) {
+        format = read64.format;
+    } else {
+        error(fmt("%s:%u: %s", script != NULL ? script : "<default layout>", line, msg));
+    }
     uint nobjects;
-    struct object *objects = parse_with_needed(files, nfiles, library, nlibrary, &nobjects);
+    struct object *objects = parse_with_needed(files, lazy, nnames, format, &nobjects);
     struct layout layout;
     uchar **images, **debug;
     if (objects == NULL || !layout_build(objects, nobjects, script, script_text, entry, &layout) ||

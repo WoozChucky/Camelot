@@ -44,6 +44,17 @@ pub fn disk_loader() -> Vec<u8> {
     let elf = crate::elf::parse(DISKBOOT_ELF).expect("rom/diskboot.elf is an ELF file");
     let mut code = Vec::new();
     for seg in &elf.segments {
+        // The ELF header and the program headers: they fit below the loader
+        // in its page, so the linker loads them at the page's start, 0x1000,
+        // in a segment of their own (ld.lld's rule, which merlin-ld follows).
+        // That is where the ROM has its stub; they are not the loader's.
+        if seg.paddr < DISK_BOOT_PC {
+            assert!(
+                seg.data.starts_with(b"\x7fELF"),
+                "only the headers go below the loader"
+            );
+            continue;
+        }
         let at = (seg.paddr - DISK_BOOT_PC) as usize;
         code.resize(code.len().max(at + seg.mem_size as usize), 0);
         code[at..at + seg.data.len()].copy_from_slice(&seg.data);
@@ -97,6 +108,15 @@ mod tests {
         assert!(DISK_BOOT_PC as usize - BOOT_ROM_BASE as usize + code.len() <= 0x1000);
         let elf = crate::elf::parse(DISKBOOT_ELF).unwrap();
         assert_eq!(elf.entry, DISK_BOOT_PC, "the loader starts at its first byte");
+        // The headers' segment, at the start of the ROM, is left out.
+        let below: Vec<u64> = elf
+            .segments
+            .iter()
+            .map(|s| s.paddr)
+            .filter(|&a| a < DISK_BOOT_PC)
+            .collect();
+        assert_eq!(below, [BOOT_ROM_BASE]);
+        assert_eq!(&code[..4], &0xf140_22f3u32.to_le_bytes(), "csrr t0, mhartid");
     }
 
     #[test]

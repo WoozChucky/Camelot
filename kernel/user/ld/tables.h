@@ -16,6 +16,7 @@
 #define SHT_REL 0x9
 #define SHT_GROUP 0x11
 #define SHT_SYMTAB_SHNDX 0x12
+#define SHT_RISCV_ATTRIBUTES 0x70000003
 #define SHF_WRITE 0x1
 #define SHF_ALLOC 0x2
 #define SHF_EXECINSTR 0x4
@@ -34,6 +35,11 @@
 #define STT_SECTION 0x3
 #define STT_FILE 0x4
 #define STT_TLS 0x6
+#define PT_LOAD 0x1
+#define PT_PHDR 0x6
+#define PF_X 0x1
+#define PF_W 0x2
+#define PF_R 0x4
 
 /* Relocation types (psABI numbers). */
 #define R_RISCV_NONE 0

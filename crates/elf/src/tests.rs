@@ -251,11 +251,91 @@ fn rejects_wrong_files() {
     assert!(Elf::parse(&bad).err().unwrap().0.contains("RISC-V"));
 }
 
+/// The offsets of `e_phoff`, `e_phnum` and `e_shstrndx`: the fields after
+/// the three address-sized ones move up by 12 bytes in ELF64.
+fn header_offsets(class: Class) -> (usize, usize, usize) {
+    match class {
+        Class::Elf32 => (28, 44, 50),
+        Class::Elf64 => (32, 56, 62),
+    }
+}
+
+#[test]
+fn truncation_errors_name_the_bytes() {
+    for class in [Class::Elf32, Class::Elf64] {
+        let good = build_object(false, class);
+        // In the file header: e_version is bytes 20..24 in both classes.
+        assert_eq!(
+            Elf::parse(&good[..22]).err().unwrap().0,
+            "truncated file (needs bytes 0x14..0x18)"
+        );
+        // A section header is read whole: a cut in the middle of the third
+        // one names all of its bytes.
+        let shoff = Elf::parse(&good).unwrap().header.shoff as usize;
+        let third = shoff + 2 * class.shdr_size();
+        let cut = &good[..third + 10];
+        assert_eq!(
+            Elf::parse(cut).err().unwrap().0,
+            format!(
+                "truncated file (needs bytes {third:#x}..{:#x})",
+                third + class.shdr_size()
+            ),
+            "{class:?}"
+        );
+    }
+}
+
+#[test]
+fn section_names_come_only_from_a_string_table() {
+    for class in [Class::Elf32, Class::Elf64] {
+        let (_, _, shstrndx) = header_offsets(class);
+        let good = build_object(false, class);
+        // e_shstrndx naming .text (1), past the table (9) or none (0):
+        // the file still parses, its sections without names.
+        for index in [1u16, 9, 0] {
+            let mut bad = good.clone();
+            bad[shstrndx..shstrndx + 2].copy_from_slice(&index.to_le_bytes());
+            let elf = Elf::parse(&bad).unwrap();
+            assert_eq!(elf.sections.len(), 6, "{class:?} {index}");
+            assert!(
+                elf.sections.iter().all(|s| s.name.is_empty()),
+                "{class:?} {index}"
+            );
+        }
+        // A name offset past the end of the string table is an error.
+        let shoff = Elf::parse(&good).unwrap().header.shoff as usize;
+        let mut bad = good.clone();
+        let sh_name = shoff + class.shdr_size();
+        bad[sh_name..sh_name + 4].copy_from_slice(&0x99u32.to_le_bytes());
+        assert_eq!(
+            Elf::parse(&bad).err().unwrap().0,
+            "string offset 0x99 outside its string table"
+        );
+    }
+}
+
+#[test]
+fn parse_sections_only_reads_no_program_headers() {
+    for class in [Class::Elf32, Class::Elf64] {
+        let (phoff, phnum, _) = header_offsets(class);
+        let good = build_object(false, class);
+        // An object claiming 3 program headers far past its end.
+        let mut stray = good.clone();
+        stray[phnum..phnum + 2].copy_from_slice(&3u16.to_le_bytes());
+        stray[phoff..phoff + 4].copy_from_slice(&0xf_fff0u32.to_le_bytes());
+        assert!(Elf::parse(&stray).err().unwrap().0.starts_with("truncated file"));
+        let elf = Elf::parse_sections_only(&stray).unwrap();
+        assert!(elf.segments.is_empty());
+        assert_eq!(elf.sections, Elf::parse(&good).unwrap().sections);
+    }
+}
+
 /// Every truncation and a few thousand random corruptions of real files must
 /// give errors, never panics, through every accessor.
 #[test]
 fn corrupt_files_do_not_panic() {
     fn exercise(bytes: &[u8]) {
+        let _ = Elf::parse_sections_only(bytes);
         let Ok(elf) = Elf::parse(bytes) else { return };
         for s in &elf.sections {
             let _ = elf.section_data(s);

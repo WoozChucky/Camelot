@@ -1,8 +1,13 @@
 //! The `--Map` file: where every output section, input section and named
 //! symbol ended up.
+//!
+//! This is merlin-ld's own format, not ld.lld's. Addresses and sizes are
+//! printed as wide as the executable's: 8 hex digits for ELF32, 16 for ELF64
+//! (`0x80000000`, `0x0000000080000000`). A section loaded somewhere else
+//! than it runs (`AT(lma)`) says where: `(load 0x...)`.
 
 use crate::layout::{Def, Layout};
-use crate::object::{STT_FILE, STT_SECTION};
+use crate::object::{Class, STT_FILE, STT_SECTION};
 use std::fmt::Write;
 
 /// Symbols worth listing: skips section/file symbols, assembler temporaries
@@ -16,24 +21,39 @@ fn listed(name: &str, ty: u8) -> bool {
 }
 
 pub fn map(layout: &Layout) -> String {
+    // `0x` and 8 or 16 digits: the width of an address in the executable.
+    let width = match layout.class {
+        Class::Elf32 => 10,
+        Class::Elf64 => 18,
+    };
+    let hex = |v: u64| format!("{v:#0width$x}");
     let mut m = String::new();
     let _ = writeln!(m, "merlin-ld link map\n");
     match &layout.entry_symbol {
         Some(s) => {
-            let _ = writeln!(m, "Entry point: {:#010x} ({s})\n", layout.entry);
+            let _ = writeln!(m, "Entry point: {} ({s})\n", hex(layout.entry));
         }
         None => {
-            let _ = writeln!(m, "Entry point: {:#010x}\n", layout.entry);
+            let _ = writeln!(m, "Entry point: {}\n", hex(layout.entry));
         }
     }
-    let _ = writeln!(m, "{:<20} {:<10} {:<10} Align", "Section", "Address", "Size");
+    let _ = writeln!(
+        m,
+        "{:<20} {:<width$} {:<width$} Align",
+        "Section", "Address", "Size"
+    );
     for os in &layout.sections {
+        let load = if os.lma != os.addr {
+            format!("  (load {})", hex(os.lma))
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             m,
-            "{:<20} {:#010x} {:#010x} {}{}",
+            "{:<20} {} {} {}{}{load}",
             os.name,
-            os.addr,
-            os.size,
+            hex(os.addr),
+            hex(os.size),
             os.align,
             if os.nobits { "  (nobits)" } else { "" }
         );
@@ -42,10 +62,13 @@ pub fn map(layout: &Layout) -> String {
             let sec = &obj.sections[i.section];
             let _ = writeln!(
                 m,
-                "    {:#010x} {:#010x} {}({})",
-                i.addr, sec.size, obj.name, sec.name
+                "    {} {} {}({})",
+                hex(i.addr),
+                hex(sec.size),
+                obj.name,
+                sec.name
             );
-            let mut syms: Vec<(u32, &str)> = obj
+            let mut syms: Vec<(u64, &str)> = obj
                 .symbols
                 .iter()
                 .enumerate()
@@ -54,7 +77,7 @@ pub fn map(layout: &Layout) -> String {
                 .collect();
             syms.sort();
             for (addr, name) in syms {
-                let _ = writeln!(m, "        {addr:#010x} {name}");
+                let _ = writeln!(m, "        {} {name}", hex(addr));
             }
         }
     }
@@ -69,7 +92,7 @@ pub fn map(layout: &Layout) -> String {
     if !script.is_empty() {
         let _ = writeln!(m, "\nLinker script symbols");
         for (v, n) in script {
-            let _ = writeln!(m, "    {v:#010x} {n}");
+            let _ = writeln!(m, "    {} {n}", hex(v));
         }
     }
     m

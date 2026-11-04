@@ -25,19 +25,6 @@ static int state(struct strmap *m, char *name) {
     return v;
 }
 
-/* Parses every input, adding an error for each that is not an object. */
-static struct object *parse_all(struct input *inputs, uint n) {
-    struct object *objects = xcalloc((n ? n : 1) * sizeof(struct object));
-    uint before = errors.n;
-    for (uint i = 0; i < n; i++) {
-        char *err;
-        if (!object_parse(inputs[i].name, inputs[i].data, inputs[i].len, &objects[i], &err)) {
-            error(fmt("%s: %s", inputs[i].name, err));
-        }
-    }
-    return errors.n == before ? objects : NULL;
-}
-
 /* Marks what `o` defines (no longer undefined). */
 static void add_defines(struct strmap *names, struct object *o) {
     for (uint k = 1; k < o->nsymbols; k++) {
@@ -58,32 +45,51 @@ static void add_needs(struct strmap *names, struct object *o) {
     }
 }
 
-struct object *parse_with_needed(struct input *inputs, uint ninputs, struct input *library, uint nlibrary,
-                                 uint *n) {
-    struct object *objects = parse_all(inputs, ninputs);
-    if (objects == NULL) {
+struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, int format, uint *count) {
+    struct object *objects = xcalloc((n ? n : 1) * sizeof(struct object));
+    for (uint i = 0; i < n; i++) {
+        char *err;
+        if (!object_parse(inputs[i].name, inputs[i].data, inputs[i].len, &objects[i], &err)) {
+            error(fmt("%s: %s", inputs[i].name, err));
+        }
+    }
+    /* The script's errors, then the files', all of them, and the link stops. */
+    if (errors.n != 0) {
         return NULL;
     }
-    struct object *members = parse_all(library, nlibrary);
-    if (members == NULL) {
+    /* Every file, a member too, needed or not, must be of the executable's
+     * class, the script's OUTPUT_FORMAT's if it names one, as ld.lld checks
+     * its lazy objects too, in command-line order: merlin-ld's
+     * check_classes. The files read here are all ELF32 (object.c refuses
+     * the others, until #157), so only an elf64-littleriscv format can be
+     * another class, and then each of them is: all are reported and the
+     * link stops. */
+    if (format == FORMAT_ELF64) {
+        for (uint i = 0; i < n; i++) {
+            error(fmt("%s is incompatible with %s", objects[i].name, format_name(format)));
+        }
         return NULL;
     }
     struct strmap names;
     memset(&names, 0, sizeof names);
-    for (uint i = 0; i < ninputs; i++) {
-        add_defines(&names, &objects[i]);
+    for (uint i = 0; i < n; i++) {
+        if (!lazy[i]) {
+            add_defines(&names, &objects[i]);
+        }
     }
-    for (uint i = 0; i < ninputs; i++) {
-        add_needs(&names, &objects[i]);
+    for (uint i = 0; i < n; i++) {
+        if (!lazy[i]) {
+            add_needs(&names, &objects[i]);
+        }
     }
-    uchar *pulled = xcalloc(nlibrary + 1);
+    uchar *pulled = xcalloc(n + 1);
     for (;;) {
         int progress = 0;
-        for (uint i = 0; i < nlibrary; i++) {
-            if (pulled[i]) {
+        for (uint i = 0; i < n; i++) {
+            if (!lazy[i] || pulled[i]) {
                 continue;
             }
-            struct object *m = &members[i];
+            struct object *m = &objects[i];
             int wanted = 0;
             for (uint k = 1; k < m->nsymbols && !wanted; k++) {
                 wanted = defines(&m->symbols[k]) && (state(&names, m->symbols[k].name) & UNDEFINED);
@@ -100,18 +106,19 @@ struct object *parse_with_needed(struct input *inputs, uint ninputs, struct inpu
             break;
         }
     }
-    uint count = ninputs;
-    for (uint i = 0; i < nlibrary; i++) {
-        count += pulled[i];
-    }
-    struct object *all = xcalloc((count ? count : 1) * sizeof(struct object));
-    memcpy(all, objects, ninputs * sizeof(struct object));
-    uint k = ninputs;
-    for (uint i = 0; i < nlibrary; i++) {
-        if (pulled[i]) {
-            all[k++] = members[i];
+    /* The files that are not members, in order, then the members needed. */
+    struct object *all = xcalloc((n ? n : 1) * sizeof(struct object));
+    uint k = 0;
+    for (uint i = 0; i < n; i++) {
+        if (!lazy[i]) {
+            all[k++] = objects[i];
         }
     }
-    *n = count;
+    for (uint i = 0; i < n; i++) {
+        if (pulled[i]) {
+            all[k++] = objects[i];
+        }
+    }
+    *count = k;
     return all;
 }

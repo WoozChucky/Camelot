@@ -17,8 +17,8 @@ use std::collections::HashSet;
 /// addresses of the sites whose symbol has no value (undefined, or in a
 /// section that is not loaded): that is reported once, at the `PCREL_HI20`,
 /// so the `PCREL_LO12` paired with it says nothing more.
-pub fn context(layout: &Layout) -> (Context, HashSet<u32>) {
-    let mut ctx = Context::default();
+pub fn context(layout: &Layout) -> (Context, HashSet<u64>) {
+    let mut ctx = Context::new(layout.class);
     let mut failed = HashSet::new();
     for os in &layout.sections {
         for i in &os.inputs {
@@ -76,13 +76,23 @@ pub fn relocate(layout: &Layout) -> Result<Images, Vec<Error>> {
 }
 
 /// The debug sections: their inputs one after another, relocated. A
-/// relocation against a place that is not in the executable (a section
-/// `/DISCARD/` threw away, or one not loaded) writes 0, as ld.lld does: the
-/// debug information of code that is gone points nowhere.
+/// relocation against a symbol that is not in the executable (in a section
+/// `/DISCARD/` threw away or one not loaded, or a weak reference nobody
+/// defines, see [`Layout::in_dropped_section`]) writes ld.lld's tombstone:
+/// the debug information of code that is gone points nowhere. That is 0,
+/// except in `.debug_loc` and `.debug_ranges`, where it is 1: there a pair of
+/// zeros ends a DWARF 4 location or range list (and -1, the other choice,
+/// selects a base address), so ld.lld writes 1, as GNU ld does in
+/// `.debug_ranges`.
 fn debug(layout: &Layout, errors: &mut Vec<Error>) -> Vec<Vec<u8>> {
-    let ctx = Context::default();
+    let ctx = Context::debug(layout.class);
     let mut images = Vec::new();
     for ds in &layout.debug {
+        let tombstone: u64 = if ds.name == ".debug_loc" || ds.name == ".debug_ranges" {
+            1
+        } else {
+            0
+        };
         let mut img = vec![0; ds.size as usize];
         for i in &ds.inputs {
             let obj = &layout.objects[i.object];
@@ -102,8 +112,17 @@ fn debug(layout: &Layout, errors: &mut Vec<Error>) -> Vec<Vec<u8>> {
                     )));
                     continue;
                 }
+                // S = tombstone - A, modulo 2^64, so that S + A, the value
+                // written, is the tombstone for R_RISCV_32 (an offset) and
+                // R_RISCV_64 (an address) alike, whatever the addend. Any
+                // other type (an ADD/SUB half of a label difference) gets
+                // S = 0, as ld.lld gives a symbol without a section.
                 let sym = if layout.in_dropped_section(i.object, r.sym as usize) {
-                    Ok(0u32.wrapping_sub(r.addend as u32))
+                    Ok(if r.ty == reloc::R_RISCV_32 || r.ty == reloc::R_RISCV_64 {
+                        tombstone.wrapping_sub(r.addend as u64)
+                    } else {
+                        0
+                    })
                 } else {
                     layout.reloc_symbol(i.object, r.sym as usize)
                 };
@@ -117,12 +136,7 @@ fn debug(layout: &Layout, errors: &mut Vec<Error>) -> Vec<Vec<u8>> {
                 let place = i.addr.wrapping_add(r.offset);
                 let bytes = &mut img[place as usize..start + sec.data.len()];
                 if let Err(e) = reloc::apply(r.ty, place, sym, r.addend, bytes, &ctx) {
-                    let sym_name = obj.symbol_display_name(r.sym);
-                    errors.push(Error(format!(
-                        "{}: {}",
-                        obj.name,
-                        describe(e, &ty, sym_name, &at, sec, r)
-                    )));
+                    report(errors, obj, e, sec, r);
                 }
             }
         }
@@ -164,7 +178,6 @@ fn loaded(layout: &Layout) -> Result<Vec<Vec<u8>>, Vec<Error>> {
             let sec = &obj.sections[i.section];
             for r in &sec.relocs {
                 let ty = reloc::name(r.ty);
-                let sym_name = obj.symbol_display_name(r.sym);
                 let at = format!("{}+{:#x}", sec.name, r.offset);
                 if r.ty == reloc::R_RISCV_NONE || r.ty == reloc::R_RISCV_RELAX {
                     // Hints that patch nothing: R_RISCV_RELAX marks the
@@ -219,11 +232,7 @@ fn loaded(layout: &Layout) -> Result<Vec<Vec<u8>>, Vec<Error>> {
                 let end = (i.addr - os.addr) as usize + sec.data.len();
                 let bytes = &mut images[oi][start..end];
                 if let Err(e) = reloc::apply(r.ty, place, sym, r.addend, bytes, &ctx) {
-                    errors.push(Error(format!(
-                        "{}: {}",
-                        obj.name,
-                        describe(e, &ty, sym_name, &at, sec, r)
-                    )));
+                    report(&mut errors, obj, e, sec, r);
                 }
             }
         }
@@ -243,14 +252,40 @@ fn is_jump(ty: u32) -> bool {
     )
 }
 
+/// Reports a relocation [`reloc::apply`] refused in `obj`: one error, or
+/// two for an offset out of range and odd, as ld.lld reports it.
+fn report(errors: &mut Vec<Error>, obj: &Object, e: RelocError, sec: &Section, r: &Rela) {
+    let ty = reloc::name(r.ty);
+    let at = format!("{}+{:#x}", sec.name, r.offset);
+    let sym = obj.symbol_display_name(r.sym);
+    let mut push = |e| {
+        errors.push(Error(format!(
+            "{}: {}",
+            obj.name,
+            describe(e, &ty, sym, &at, sec, r)
+        )))
+    };
+    if let RelocError::OutOfRangeMisaligned { value, align, .. } = e {
+        push(e);
+        push(RelocError::Misaligned { value, align });
+    } else {
+        push(e);
+    }
+}
+
 /// The message for a relocation [`reloc::apply`] refused. `at` is
 /// `section+offset`; the caller prefixes the file name.
 fn describe(e: RelocError, ty: &str, sym: &str, at: &str, sec: &Section, r: &Rela) -> String {
     match e {
         RelocError::Unsupported => format!("unsupported relocation {ty} against '{sym}' at {at}"),
-        RelocError::NeedsRelaxation => format!(
-            "{ty} at {at} needs linker relaxation, which merlin-ld does not do; assemble with -mno-relax"
+        RelocError::AlignPadding => format!(
+            "{ty} at {at}: merlin-ld does not delete alignment padding as ld.lld does; \
+             assemble with -mno-relax"
         ),
+        // Two errors, the range first: [`report`] gives both.
+        RelocError::OutOfRangeMisaligned { value, min, max, .. } => {
+            describe(RelocError::OutOfRange { value, min, max }, ty, sym, at, sec, r)
+        }
         RelocError::OutOfRange { value, min, max } => format!(
             "relocation {ty} out of range for '{sym}' at {at}: {value} is not in [{min}, {max}]"
         ),

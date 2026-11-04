@@ -128,8 +128,14 @@ static int header(uint *shoff, uint *shentsize, uint *shnum, uint *shstrndx, cha
     if (!rd_u8(i64_u(4), &v)) {
         return 0;
     }
-    if (v != 1) {
-        *err = "not a 32-bit ELF file (EI_CLASS is not ELFCLASS32)";
+    /* merlin-ld's message for a class that is neither; ELFCLASS64 objects
+     * (RV64) are merlin-ld's only, until /bin/ld links RV64 (#157). */
+    if (v != 1 && v != 2) {
+        *err = fmt("not a 32- or 64-bit ELF file (EI_CLASS is %u)", v);
+        return 0;
+    }
+    if (v == 2) {
+        *err = "64-bit ELF objects are not supported by this ld";
         return 0;
     }
     if (!rd_u8(i64_u(5), &v)) {
@@ -195,20 +201,30 @@ static int parse(const char *name, struct object *o, char **err) {
         *err = fmt("e_shentsize is %u, expected 40", shentsize);
         return 0;
     }
+    /* Each section header is read whole, as the elf crate merlin-ld reads
+     * objects with does: a file cut inside one needs all of its 40 bytes. */
     struct shdr *hdrs = xcalloc(shnum * sizeof(struct shdr));
     for (uint i = 0; i < shnum; i++) {
-        i64 h = i64_add(i64_u(shoff), i64_u(i * 40));
-        struct shdr *s = &hdrs[i];
-        if (!rd_u32(h, &s->name) || !rd_u32(i64_add(h, i64_u(4)), &s->type) ||
-            !rd_u32(i64_add(h, i64_u(8)), &s->flags) || !rd_u32(i64_add(h, i64_u(16)), &s->offset) ||
-            !rd_u32(i64_add(h, i64_u(20)), &s->size) || !rd_u32(i64_add(h, i64_u(24)), &s->link) ||
-            !rd_u32(i64_add(h, i64_u(28)), &s->info) || !rd_u32(i64_add(h, i64_u(32)), &s->align) ||
-            !rd_u32(i64_add(h, i64_u(36)), &s->entsize)) {
+        uchar *p = rd_bytes(i64_add(i64_u(shoff), i64_u(i * 40)), 40);
+        if (p == NULL) {
             return 0;
         }
+        struct shdr *s = &hdrs[i];
+        s->name = le32(p);
+        s->type = le32(p + 4);
+        s->flags = le32(p + 8);
+        s->offset = le32(p + 16);
+        s->size = le32(p + 20);
+        s->link = le32(p + 24);
+        s->info = le32(p + 28);
+        s->align = le32(p + 32);
+        s->entsize = le32(p + 36);
     }
+    /* Then every section's name, from the section header string table
+     * (SHN_UNDEF, 0, would mean there is none), before any section is
+     * looked at. */
     uchar *shstrtab;
-    if (shstrndx >= shnum || hdrs[shstrndx].type != SHT_STRTAB) {
+    if (shstrndx == 0 || shstrndx >= shnum || hdrs[shstrndx].type != SHT_STRTAB) {
         *err = fmt("e_shstrndx %u is not a string table", shstrndx);
         return 0;
     }
@@ -216,16 +232,18 @@ static int parse(const char *name, struct object *o, char **err) {
         return 0;
     }
     uint shstrlen = contents_len(&hdrs[shstrndx]);
-
     o->sections = xcalloc(shnum * sizeof(struct section));
     o->nsections = shnum;
     for (uint i = 0; i < shnum; i++) {
-        struct shdr *h = &hdrs[i];
-        struct section *sec = &o->sections[i];
-        char *sname;
-        if (!cstr(shstrtab, shstrlen, h->name, &sname)) {
+        if (!cstr(shstrtab, shstrlen, hdrs[i].name, &o->sections[i].name)) {
             return 0;
         }
+    }
+
+    for (uint i = 0; i < shnum; i++) {
+        struct shdr *h = &hdrs[i];
+        struct section *sec = &o->sections[i];
+        char *sname = sec->name;
         if (h->type == SHT_REL) {
             *err = fmt("section '%s' is SHT_REL; RISC-V objects use SHT_RELA", sname);
             return 0;
@@ -251,16 +269,25 @@ static int parse(const char *name, struct object *o, char **err) {
             *err = fmt("section '%s' is in a section group (COMDAT), not supported", sname);
             return 0;
         }
+        /* The alignment of a section that holds code or data (ld.lld checks
+         * no other), a power of two; 0 means 1. */
+        uint align = 1;
+        if (h->type != SHT_NULL && h->type != SHT_SYMTAB && h->type != SHT_STRTAB && h->type != SHT_RELA) {
+            align = h->align ? h->align : 1;
+            if (align & (align - 1)) {
+                *err = fmt("section '%s' has sh_addralign 0x%x, not a power of 2", sname, align);
+                return 0;
+            }
+        }
         sec->data = file;
         if (i != 0 && !contents(h, &sec->data)) {
             return 0;
         }
         sec->datalen = i == 0 ? 0 : contents_len(h);
-        sec->name = sname;
         sec->type = h->type;
         sec->flags = h->flags;
         sec->size = h->size;
-        sec->align = h->align ? h->align : 1;
+        sec->align = align;
         sec->entsize = h->entsize;
         sec->out = -1;
     }
@@ -291,10 +318,17 @@ static int parse(const char *name, struct object *o, char **err) {
             *err = fmt("symbol table entry size is %u, expected 16", h->entsize);
             return 0;
         }
+        if (h->size % 16) {
+            *err = fmt("section '%s' has sh_size 0x%x, not a multiple of its sh_entsize (16)",
+                       o->sections[symtab].name, h->size);
+            return 0;
+        }
         uchar *data;
         if (!contents(h, &data)) {
             return 0;
         }
+        /* Every entry is read (its name too) before any is checked, as the
+         * elf crate reads them for merlin-ld. */
         uint n = contents_len(h) / 16;
         o->symbols = xcalloc((n ? n : 1) * sizeof(struct symbol));
         for (uint k = 0; k < n; k++) {
@@ -308,10 +342,10 @@ static int parse(const char *name, struct object *o, char **err) {
             sym->bind = e[12] >> 4;
             sym->type = e[12] & 0xf;
             sym->shndx = (uint)e[14] | (uint)e[15] << 8;
-            o->nsymbols++;
-            if (k == 0) {
-                continue;
-            }
+        }
+        o->nsymbols = n;
+        for (uint k = 1; k < n; k++) {
+            struct symbol *sym = &o->symbols[k];
             if (sym->shndx == SHN_COMMON) {
                 *err = fmt("common symbol '%s' is not supported (define it in .bss, or compile with -fno-common)",
                            sym->name);

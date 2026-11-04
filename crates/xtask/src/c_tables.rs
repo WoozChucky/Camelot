@@ -12,7 +12,8 @@
 //!   [`AS_TABLES_H`] declares the tables and defines the constants;
 //!   [`AS_TABLES_C`] defines the tables, once for the whole program.
 //! - The linker (`kernel/user/ld`): the ELF constants (section types and
-//!   flags, symbol bindings and types, special section indices) and the
+//!   flags, symbol bindings and types, special section indices, program
+//!   header types and flags) and the
 //!   relocation types' numbers and names (`elf::reloc_name`, which
 //!   merlin-ld's messages use), all the elf crate's, in [`LD_TABLES_H`] and
 //!   [`LD_TABLES_C`].
@@ -78,6 +79,7 @@ fn elf_constants() -> Vec<(&'static str, u64)> {
         ("SHT_REL", SHT_REL.into()),
         ("SHT_GROUP", SHT_GROUP.into()),
         ("SHT_SYMTAB_SHNDX", SHT_SYMTAB_SHNDX.into()),
+        ("SHT_RISCV_ATTRIBUTES", SHT_RISCV_ATTRIBUTES.into()),
         ("SHF_WRITE", SHF_WRITE),
         ("SHF_ALLOC", SHF_ALLOC),
         ("SHF_EXECINSTR", SHF_EXECINSTR),
@@ -96,6 +98,11 @@ fn elf_constants() -> Vec<(&'static str, u64)> {
         ("STT_SECTION", STT_SECTION.into()),
         ("STT_FILE", STT_FILE.into()),
         ("STT_TLS", STT_TLS.into()),
+        ("PT_LOAD", PT_LOAD.into()),
+        ("PT_PHDR", PT_PHDR.into()),
+        ("PF_X", PF_X.into()),
+        ("PF_W", PF_W.into()),
+        ("PF_R", PF_R.into()),
     ]
 }
 

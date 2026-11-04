@@ -1,5 +1,8 @@
 //! End-to-end tests against clang-built objects and ld.lld's output for the
-//! same inputs (`tests/fixtures`, regenerate with `cargo xtask ld-fixtures`).
+//! same inputs (`tests/fixtures`, made by clang and LLD 23.1.4; regenerate
+//! with `cargo xtask ld-fixtures`), for RV32: the RV32 set of fixtures. The
+//! RV64 set (`tests/fixtures/rv64`) is `rv64.rs`'s; the helpers both use are
+//! in `common/mod.rs`.
 //! Each `name.ld` there lists its objects in its first comment;
 //! `name.lld.elf` is ld.lld's link, `name.expected.txt` is
 //! `llvm-readelf -S -l -s` of it and `name.objdump.txt` is `llvm-objdump -d`
@@ -11,65 +14,71 @@
 //!
 //! * `fixtures/norelocs`: three relocation-free objects.
 //! * `fixtures/layouts`: layout edge cases (empty and assignment-only output
-//!   sections, gaps, NOBITS before PROGBITS, `. +=` sections).
+//!   sections, gaps, NOBITS before PROGBITS, `. +=` sections, a first
+//!   section not at a page start, with and without the headers loaded).
 //! * `fixtures/hello`: `examples/hello/hello.S` assembled by clang.
 //! * `fixtures/multiobj`: `examples/multiobj`, two objects that call and
 //!   point into each other.
 //! * `fixtures/relocs`: every relocation type, across objects, at the edges
 //!   of their ranges; one object built with relaxation (`R_RISCV_RELAX`).
+//! * `fixtures/data64`: `.dword sym + A` (R_RISCV_64) on RV32, in `.data`
+//!   and in a debug section, which ld.lld fills differently.
+//! * `fixtures/at`: `AT(lma)` load addresses: on the first section only, on
+//!   a section right after one with the same permissions, in the middle
+//!   (`.data` copied from its load address, a NOLOAD `.bss` after it), and
+//!   the empty sections ld.lld drops or keeps.
 //! * `fixtures/merge`: mergeable strings, where merlin-ld differs from ld.lld
 //!   on purpose (spec §10); the test pins down the difference.
 //! * `fixtures/rejects`, `fixtures/symbols`: objects for error paths.
 
+mod common;
+
+use common::{errors, input, ram, read_ours, run, script, script_file, Load, RV32};
 use grail::{Machine, RunResult};
-use merlin_ld::{Input, Options, ScriptSource};
+use merlin_ld::{Input, Options};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+// The RV32 set (`tests/fixtures`) of the helpers in common/mod.rs.
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    common::fixtures(RV32)
 }
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn input(path: &Path) -> Input {
-    Input {
-        name: path.file_name().unwrap().to_string_lossy().into_owned(),
-        data: std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
-    }
+    common::repo_root()
 }
 
 fn inputs(dir: &str, names: &[&str]) -> Vec<Input> {
-    names
-        .iter()
-        .map(|n| input(&fixtures().join(dir).join(n)))
-        .collect()
+    common::inputs(RV32, dir, names)
 }
 
-fn script_file(path: &Path) -> Option<ScriptSource> {
-    Some(ScriptSource {
-        name: path.file_name().unwrap().to_string_lossy().into_owned(),
-        text: std::fs::read_to_string(path).unwrap(),
-    })
+/// The objects a fixture script names in its `/* objects: ... */` comment
+/// (paths relative to `fixtures/`), and the script itself.
+fn case(script: &str) -> (Vec<Input>, Options) {
+    common::case(RV32, script)
 }
 
-fn script(text: &str) -> Options {
-    Options {
-        script: Some(ScriptSource {
-            name: "test.ld".into(),
-            text: text.into(),
-        }),
-        entry: None,
-    }
+/// `fixtures/<name>.expected.txt`, e.g. `expected("norelocs/link")`.
+fn expected(name: &str) -> common::Readelf {
+    common::expected(RV32, name)
 }
 
-fn errors(r: Result<impl std::fmt::Debug, Vec<merlin_ld::Error>>) -> Vec<String> {
-    r.expect_err("link should fail")
-        .into_iter()
-        .map(|e| e.0)
-        .collect()
+/// Links fixture script `name.ld` with the objects it lists, checks the result
+/// against ld.lld's (`name.expected.txt`, `name.lld.elf`, `name.objdump.txt`)
+/// and runs it in Grail, which must print `output` and exit with 0.
+fn assert_matches_ld_lld(name: &str, output: &str) -> merlin_ld::Linked {
+    common::assert_matches_ld_lld_exit(RV32, name, output, 0)
+}
+
+/// [`assert_matches_ld_lld`] for a program that exits with `exit`.
+fn assert_matches_ld_lld_exit(name: &str, output: &str, exit: u32) -> merlin_ld::Linked {
+    common::assert_matches_ld_lld_exit(RV32, name, output, exit)
+}
+
+/// The relocation types each fixture object carries, by name.
+fn reloc_types(path: &str) -> HashMap<String, usize> {
+    common::reloc_types(RV32, path)
 }
 
 fn norelocs() -> Vec<Input> {
@@ -83,126 +92,8 @@ fn norelocs_opts() -> Options {
     }
 }
 
-/// The objects a fixture script names in its `/* objects: ... */` comment
-/// (paths relative to `fixtures/`), and the script itself.
-fn case(script: &str) -> (Vec<Input>, Options) {
-    let path = fixtures().join(script);
-    let opts = Options {
-        script: script_file(&path),
-        entry: None,
-    };
-    let text = &opts.script.as_ref().unwrap().text;
-    let list = text
-        .split("*/")
-        .next()
-        .and_then(|c| c.trim().strip_prefix("/*"))
-        .and_then(|c| c.trim().strip_prefix("objects:"));
-    let objs = match list {
-        Some(list) => list
-            .split_whitespace()
-            .map(|o| input(&fixtures().join(o)))
-            .collect(),
-        // Without the comment: every object in the script's directory, in
-        // name order (as `cargo xtask ld-fixtures` links them).
-        None => {
-            let mut paths: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap())
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .filter(|p| p.extension().is_some_and(|e| e == "o"))
-                .collect();
-            paths.sort();
-            assert!(!paths.is_empty(), "{script}: no objects");
-            paths.iter().map(|p| input(p)).collect()
-        }
-    };
-    (objs, opts)
-}
-
 // ---------------------------------------------------------------------------
-// Reading `llvm-readelf -S -l -s` output (the committed expectations).
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Sect {
-    name: String,
-    ty: String,
-    addr: u32,
-    size: u32,
-    flags: String,
-    align: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Load {
-    offset: u32,
-    vaddr: u32,
-    paddr: u32,
-    filesz: u32,
-    memsz: u32,
-    flags: String,
-    align: u32,
-}
-
-#[derive(Debug, Default)]
-struct Readelf {
-    entry: u32,
-    /// Allocated sections only.
-    sections: Vec<Sect>,
-    loads: Vec<Load>,
-    /// Global and weak symbols.
-    globals: HashMap<String, u32>,
-    /// Local symbols (only read from our own output).
-    locals: Vec<(String, u32)>,
-}
-
-fn hex(s: &str) -> u32 {
-    u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap()
-}
-
-fn parse_readelf(text: &str) -> Readelf {
-    let mut r = Readelf::default();
-    for line in text.lines().map(|l| l.trim_end_matches('\r')) {
-        let t: Vec<&str> = line.split_whitespace().collect();
-        if let Some(e) = line.strip_prefix("Entry point ") {
-            r.entry = hex(e.trim());
-        } else if line.trim_start().starts_with('[') && !line.contains("[Nr]") {
-            let rest: Vec<&str> = line.split(']').nth(1).unwrap().split_whitespace().collect();
-            // name type addr off size es [flg] lk inf al
-            if rest.len() == 10 && rest[6].contains('A') {
-                r.sections.push(Sect {
-                    name: rest[0].into(),
-                    ty: rest[1].into(),
-                    addr: hex(rest[2]),
-                    size: hex(rest[4]),
-                    flags: rest[6].into(),
-                    align: rest[9].parse().unwrap(),
-                });
-            }
-        } else if t.first() == Some(&"LOAD") {
-            r.loads.push(Load {
-                offset: hex(t[1]),
-                vaddr: hex(t[2]),
-                paddr: hex(t[3]),
-                filesz: hex(t[4]),
-                memsz: hex(t[5]),
-                flags: t[6..t.len() - 1].concat(),
-                align: hex(t[t.len() - 1]),
-            });
-        } else if t.len() == 8 && (t[4] == "GLOBAL" || t[4] == "WEAK") && t[6] != "UND" {
-            // (ld.lld lists undefined weak symbols, merlin-ld leaves them out.)
-            r.globals.insert(t[7].into(), hex(t[1]));
-        }
-    }
-    r
-}
-
-/// `fixtures/<name>.expected.txt`, e.g. `expected("norelocs/link")`.
-fn expected(name: &str) -> Readelf {
-    let path = fixtures().join(format!("{name}.expected.txt"));
-    parse_readelf(&std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
-}
-
-// ---------------------------------------------------------------------------
-// Reading our own ELF output the same way, straight from the bytes.
+// Patching RV32 objects: ELF32 offsets.
 
 fn u16_at(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
@@ -245,84 +136,6 @@ fn symbol_entry(elf: &[u8], name: &str) -> usize {
         .unwrap_or_else(|| panic!("no symbol {name}"))
 }
 
-fn read_ours(elf: &[u8]) -> Readelf {
-    assert_eq!(&elf[..4], b"\x7fELF");
-    assert_eq!(u16_at(elf, 16), 2, "ET_EXEC");
-    assert_eq!(u16_at(elf, 18), 243, "EM_RISCV");
-    let mut r = Readelf {
-        entry: u32_at(elf, 24),
-        ..Default::default()
-    };
-    let (phoff, shoff) = (u32_at(elf, 28) as usize, u32_at(elf, 32) as usize);
-    let (phnum, shnum, shstrndx) = (
-        u16_at(elf, 44) as usize,
-        u16_at(elf, 48) as usize,
-        u16_at(elf, 50) as usize,
-    );
-    for i in 0..phnum {
-        let p = phoff + 32 * i;
-        assert_eq!(u32_at(elf, p), 1, "only PT_LOAD");
-        let f = u32_at(elf, p + 24);
-        let flags = [(4, "R"), (2, "W"), (1, "E")]
-            .iter()
-            .filter(|(b, _)| f & b != 0)
-            .map(|(_, s)| *s)
-            .collect();
-        r.loads.push(Load {
-            offset: u32_at(elf, p + 4),
-            vaddr: u32_at(elf, p + 8),
-            paddr: u32_at(elf, p + 12),
-            filesz: u32_at(elf, p + 16),
-            memsz: u32_at(elf, p + 20),
-            flags,
-            align: u32_at(elf, p + 28),
-        });
-    }
-    let sh = |i: usize, f: usize| u32_at(elf, shoff + 40 * i + f);
-    let shstr = sh(shstrndx, 16) as usize;
-    for i in 1..shnum {
-        let ty = sh(i, 4);
-        let flags = sh(i, 8);
-        if ty == 2 {
-            // .symtab: collect globals.
-            let (off, size, strtab) = (
-                sh(i, 16) as usize,
-                sh(i, 20) as usize,
-                sh(sh(i, 24) as usize, 16) as usize,
-            );
-            for s in (off + 16..off + size).step_by(16) {
-                let (name, value) = (cstr(elf, strtab + u32_at(elf, s) as usize), u32_at(elf, s + 4));
-                if elf[s + 12] >> 4 != 0 {
-                    r.globals.insert(name, value);
-                } else {
-                    r.locals.push((name, value));
-                }
-            }
-        }
-        if flags & 2 == 0 {
-            continue;
-        }
-        let flag_str = [(1, "W"), (2, "A"), (4, "X")]
-            .iter()
-            .filter(|(b, _)| flags & b != 0)
-            .map(|(_, s)| *s)
-            .collect();
-        r.sections.push(Sect {
-            name: cstr(elf, shstr + sh(i, 0) as usize),
-            ty: match ty {
-                1 => "PROGBITS".into(),
-                8 => "NOBITS".into(),
-                t => format!("type {t}"),
-            },
-            addr: sh(i, 12),
-            size: sh(i, 20),
-            flags: flag_str,
-            align: sh(i, 32),
-        });
-    }
-    r
-}
-
 // ---------------------------------------------------------------------------
 
 /// Acceptance: relocation-free clang objects link to the same PT_LOADs,
@@ -337,137 +150,15 @@ fn norelocs_matches_ld_lld() {
     assert_matches_ld_lld("norelocs/link", "OK\n");
 }
 
-/// `(vaddr, memsz, file bytes)` of every PT_LOAD of an executable.
-fn load_images(elf: &[u8]) -> Vec<(u32, u32, Vec<u8>)> {
-    let (phoff, phnum) = (u32_at(elf, 28) as usize, u16_at(elf, 44) as usize);
-    (0..phnum)
-        .map(|i| phoff + 32 * i)
-        .filter(|&p| u32_at(elf, p) == 1)
-        .map(|p| {
-            let (off, filesz) = (u32_at(elf, p + 4) as usize, u32_at(elf, p + 16) as usize);
-            (
-                u32_at(elf, p + 8),
-                u32_at(elf, p + 20),
-                elf[off..off + filesz].to_vec(),
-            )
-        })
-        .collect()
-}
-
-/// `llvm-objdump -d` text without its first line (which names the file),
-/// line endings normalized.
-fn disassembly_body(text: &str) -> Vec<String> {
-    text.lines()
-        .map(|l| l.trim_end_matches('\r').to_string())
-        .skip_while(|l| !l.contains("file format"))
-        .skip(1)
-        .collect()
-}
-
-/// merlin-objdump's `-d` of our link against llvm-objdump's of ld.lld's
-/// (`name.objdump.txt`). Two deliberate differences (spec §10) are allowed:
-///
-/// * where LLVM prints `<unknown>` (the Xcal instructions), merlin-objdump
-///   names the instruction; the address and the word must still agree;
-/// * a symbol assigned by the script is `SHN_ABS` in merlin-ld's output, so
-///   when it shares its address with a symbol of the section, a label line
-///   may name the other one.
-fn assert_same_disassembly(name: &str, linked: &merlin_ld::Linked) {
-    let elf = &linked.elf;
-    let script_symbol = |n: &str| {
-        linked
-            .layout
-            .globals
-            .iter()
-            .any(|(g, d)| g == n && matches!(d, merlin_ld::layout::Def::Script(_)))
-    };
-    let opts = merlin_objdump::Options {
-        disassemble: true,
-        ..Default::default()
-    };
-    let ours = disassembly_body(&merlin_objdump::dump("ours.elf", elf, &opts).unwrap());
-    let path = fixtures().join(format!("{name}.objdump.txt"));
-    let lld = disassembly_body(&std::fs::read_to_string(&path).unwrap());
-    assert!(lld.len() > 3, "{name}: empty llvm-objdump listing");
-    assert_eq!(ours.len(), lld.len(), "{name}: disassembly length");
-    // `80001040 <mid>:` -> ("80001040", "mid")
-    let label = |l: &str| {
-        let (addr, rest) = l.split_once(" <")?;
-        Some((addr.to_string(), rest.strip_suffix(">:")?.to_string()))
-    };
-    for (o, l) in ours.iter().zip(&lld) {
-        if let Some(word) = l.strip_suffix("<unknown>") {
-            assert!(o.starts_with(word), "{name}:\n ours: {o}\n llvm: {l}");
-        } else if let (Some((oa, _)), Some((la, ln))) = (label(o), label(l)) {
-            assert!(
-                o == l || (oa == la && script_symbol(&ln)),
-                "{name}:\n ours: {o}\n llvm: {l}"
-            );
-        } else {
-            assert_eq!(o, l, "{name}: disassembly");
-        }
-    }
-}
-
-/// Links fixture script `name.ld` with the objects it lists, checks the result
-/// against ld.lld's (`name.expected.txt`, `name.lld.elf`, `name.objdump.txt`)
-/// and runs it in Grail, which must print `output` and exit with 0.
-fn assert_matches_ld_lld(name: &str, output: &str) -> merlin_ld::Linked {
-    assert_matches_ld_lld_exit(name, output, 0)
-}
-
-/// [`assert_matches_ld_lld`] for a program that exits with `exit`.
-fn assert_matches_ld_lld_exit(name: &str, output: &str, exit: u32) -> merlin_ld::Linked {
-    let (objs, opts) = case(&format!("{name}.ld"));
-    let linked = merlin_ld::link(&objs, &opts).unwrap_or_else(|e| panic!("{name}: {e:?}"));
-    assert!(
-        linked.layout.warnings.is_empty(),
-        "{name}: {:?}",
-        linked.layout.warnings
-    );
-    let ours = read_ours(&linked.elf);
-    let lld = expected(name);
-    assert_eq!(ours.entry, lld.entry, "{name}: entry");
-    assert_eq!(ours.sections, lld.sections, "{name}: sections");
-    assert_eq!(ours.loads, lld.loads, "{name}: PT_LOADs");
-    assert_eq!(ours.globals, lld.globals, "{name}: global symbols");
-
-    // Byte for byte: every loaded byte, relocated code and data included.
-    let lld_elf = std::fs::read(fixtures().join(format!("{name}.lld.elf"))).unwrap();
-    let (ours_img, lld_img) = (load_images(&linked.elf), load_images(&lld_elf));
-    assert_eq!(ours_img.len(), lld_img.len(), "{name}: PT_LOAD count");
-    for ((va, msz, a), (vb, mszb, b)) in ours_img.iter().zip(&lld_img) {
-        assert_eq!(
-            (va, msz, a.len()),
-            (vb, mszb, b.len()),
-            "{name}: segment at {va:#x}"
-        );
-        if let Some(i) = (0..a.len()).find(|&i| a[i] != b[i]) {
-            panic!(
-                "{name}: first difference at {:#x}: ours {:02x?}, ld.lld {:02x?}",
-                va + i as u32,
-                &a[i..(i + 8).min(a.len())],
-                &b[i..(i + 8).min(b.len())]
-            );
-        }
-    }
-    assert_same_disassembly(name, &linked);
-
-    let (_, r, out) = run(&linked.elf);
-    assert_eq!(
-        (r, out.as_str()),
-        (RunResult::Exited(exit), output),
-        "{name}: run in Grail"
-    );
-    linked
-}
-
 /// Layout edge cases against ld.lld: output sections with only empty inputs
 /// (they still align), with only assignments (kept, PROGBITS, flags of the
-/// previous section), with only `. +=` (PROGBITS with file contents), with
+/// previous section but never executable), with only `. +=` (PROGBITS with file contents), with
 /// nothing (dropped), a symbol before the first section with MEMORY (0), a
 /// gap and NOBITS before PROGBITS inside one PT_LOAD, an empty R section
-/// between RX and RW (no PT_LOAD of its own), a weak definition.
+/// between RX and RW (no PT_LOAD of its own), a weak definition, and where
+/// the file starts when the first section is not at the start of a page:
+/// a page in, or after the headers, loaded below the section (in a PT_LOAD
+/// of their own, or in a read-only first section's) with a PT_PHDR.
 #[test]
 fn layout_edge_cases_match_ld_lld() {
     let mut names: Vec<String> = std::fs::read_dir(fixtures().join("layouts"))
@@ -483,9 +174,13 @@ fn layout_edge_cases_match_ld_lld() {
             "layouts/attrs",
             "layouts/empty",
             "layouts/gap",
+            "layouts/headers",
+            "layouts/headers-ro",
             "layouts/inside",
+            "layouts/no-inputs",
             "layouts/nobits-first",
-            "layouts/page-gap"
+            "layouts/page-gap",
+            "layouts/unaligned"
         ]
     );
     for name in &names {
@@ -502,6 +197,26 @@ fn layout_edge_cases_match_ld_lld() {
     assert_eq!((stack.ty.as_str(), stack.flags.as_str()), ("PROGBITS", "WA"));
     assert_eq!(expected("layouts/gap").loads.len(), 2);
     assert_eq!(expected("layouts/nobits-first").loads.len(), 3);
+    // Sections without inputs are never executable: `.marker`, after the
+    // code, is read-only and goes with .rodata.
+    let none = expected("layouts/no-inputs");
+    let flags: Vec<(&str, &str)> = none
+        .sections
+        .iter()
+        .map(|s| (s.name.as_str(), s.flags.as_str()))
+        .collect();
+    assert_eq!(
+        flags,
+        [
+            (".text", "AX"),
+            (".marker", "A"),
+            (".rodata", "A"),
+            (".data", "WA"),
+            (".tag", "WA"),
+            (".bss", "WA")
+        ]
+    );
+    assert_eq!(none.loads.len(), 3);
     // Output section attributes (kernel/kernel.ld's): ALIGN(n) raises the
     // alignment and never lowers it, NOLOAD makes even PROGBITS input and
     // an assignment-only section NOBITS, /DISCARD/ drops a section and its
@@ -517,6 +232,47 @@ fn layout_edge_cases_match_ld_lld() {
     assert!(!attrs.globals.contains_key("dropped"));
     assert_eq!(attrs.globals["__end"], 0x8000_2000);
     assert_eq!(attrs.loads.len(), 3);
+    // The headers (0x114 bytes: the ELF header and 7 program headers) don't
+    // fit in the 0x100 bytes below .text: not loaded, and .text a page in.
+    let unaligned = expected("layouts/unaligned");
+    assert_eq!(unaligned.phdr, None);
+    assert_eq!(
+        (unaligned.loads[0].offset, unaligned.loads[0].vaddr),
+        (0x1000 + 0x100, 0x8000_0100)
+    );
+    // They fit in 0x400: loaded at the page, in a segment of their own
+    // before the code's, the program header table in it.
+    let headers = expected("layouts/headers");
+    let hdr = Load {
+        offset: 0,
+        vaddr: 0x8000_0000,
+        paddr: 0x8000_0000,
+        filesz: 0x114,
+        memsz: 0x114,
+        flags: "R".into(),
+        align: 0x1000,
+    };
+    assert_eq!(headers.loads[0], hdr);
+    assert_eq!(
+        (headers.loads[1].offset, headers.loads[1].flags.as_str()),
+        (0x400, "RE")
+    );
+    let phdr = headers.phdr.unwrap();
+    assert_eq!((phdr.offset, phdr.vaddr, phdr.filesz), (52, 0x8000_0034, 0xe0));
+    // Or in .rodata's, which then starts at the page, its load address
+    // moved down with it.
+    let ro = expected("layouts/headers-ro");
+    assert_eq!(ro.loads.len(), 3);
+    assert_eq!(
+        (
+            ro.loads[0].offset,
+            ro.loads[0].vaddr,
+            ro.loads[0].paddr,
+            ro.loads[0].flags.as_str()
+        ),
+        (0, 0x8010_0000, 0x8000_0000, "R")
+    );
+    assert_eq!(ro.phdr.unwrap().paddr, 0x8000_0034);
 }
 
 /// What /DISCARD/ throws away cannot be referred to: ld.lld's "relocation
@@ -604,22 +360,6 @@ fn norelocs_segment_contents() {
     assert_eq!(rw.mem_size, 0x148);
 }
 
-fn run(elf: &[u8]) -> (Machine, RunResult, String) {
-    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
-    // Garbage in RAM, so .bss zeroing by the loader is actually checked.
-    m.cpu.bus.ram.fill(0xa5);
-    m.cpu.bus.uart.capture = true;
-    m.load_elf(elf).unwrap();
-    let r = m.run(Some(10_000), |_| {});
-    let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
-    (m, r, out)
-}
-
-fn ram(m: &Machine, addr: u32, len: usize) -> &[u8] {
-    let off = (u64::from(addr) - grail::bus::RAM_BASE) as usize;
-    &m.cpu.bus.ram[off..off + len]
-}
-
 fn check_norelocs_memory(m: &Machine, layout: &merlin_ld::Layout) {
     let sym = |n: &str| layout.symbol(n).unwrap_or_else(|| panic!("{n} undefined"));
     let words: Vec<u8> = [1u32, 2, 3, 4].iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -667,8 +407,8 @@ fn default_layout() {
     assert_eq!(l.entry_symbol.as_deref(), Some("_start"));
     for w in l.sections.windows(2) {
         assert!(w[1].addr >= w[0].addr + w[0].size);
-        assert_eq!(w[1].addr % w[1].align, 0);
-        assert!(w[1].addr - (w[0].addr + w[0].size) < w[1].align);
+        assert_eq!(w[1].addr % u64::from(w[1].align), 0);
+        assert!(w[1].addr - (w[0].addr + w[0].size) < u64::from(w[1].align));
     }
     assert!(l.sections[3].nobits);
     let (m, r, out) = run(&linked.elf);
@@ -707,12 +447,12 @@ fn hello_layout_matches_ld_lld() {
     };
     let layout = merlin_ld::layout(&objs, &opts).unwrap();
     let lld = expected("hello/link");
-    let ours: Vec<(String, u32, u32, u32)> = layout
+    let ours: Vec<(String, u64, u64, u32)> = layout
         .sections
         .iter()
         .map(|s| (s.name.clone(), s.addr, s.size, s.align))
         .collect();
-    let theirs: Vec<(String, u32, u32, u32)> = lld
+    let theirs: Vec<(String, u64, u64, u32)> = lld
         .sections
         .iter()
         .map(|s| (s.name.clone(), s.addr, s.size, s.align))
@@ -725,22 +465,62 @@ fn hello_layout_matches_ld_lld() {
     assert_eq!(layout.symbol("__stack_top"), Some(0x8001_0070));
 }
 
-/// `fixtures/hello` and `fixtures/multiobj` are built from copies of the
-/// examples' sources and scripts; if an example changes, its fixture (the
-/// objects and their ld.lld listings) is stale until `cargo xtask ld-fixtures`
-/// runs again.
+/// Some fixture sources are copies, which `cargo xtask ld-fixtures` makes
+/// before it builds anything: `fixtures/hello` and `fixtures/multiobj` of
+/// the examples' sources and scripts, and the RV64 set's directories that
+/// work on both widths (`SHARED_WITH_RV64` in crates/xtask/src/ld_fixtures.rs)
+/// of the RV32 set's. If an original changes, its copy (and the objects and
+/// ld.lld listings made from it) is stale until the tool runs again.
 #[test]
-fn example_fixtures_are_current() {
+fn fixture_copies_are_current() {
+    let read = |p: PathBuf| {
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+            .replace("\r\n", "\n")
+    };
+    let stale = "changed: run `cargo xtask ld-fixtures`";
     let copies = [
         ("hello", &["hello.S", "link.ld"][..]),
         ("multiobj", &["main.S", "print.S", "link.ld"]),
     ];
     for (dir, files) in copies {
         for f in files {
-            let read = |p: PathBuf| std::fs::read_to_string(&p).unwrap().replace("\r\n", "\n");
             assert!(
                 read(repo_root().join("examples").join(dir).join(f)) == read(fixtures().join(dir).join(f)),
-                "examples/{dir}/{f} changed: run `cargo xtask ld-fixtures`"
+                "examples/{dir}/{f} {stale}"
+            );
+        }
+    }
+
+    // The sources (.S and .ld) of a fixture directory, by name.
+    let sources = |dir: PathBuf| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".S") || n.ends_with(".ld"))
+            .collect();
+        v.sort();
+        v
+    };
+    let shared = ["hello", "layouts", "merge", "norelocs", "rejects", "symbols"];
+    let rv64_only = ["at", "relocs"];
+    let rv64 = common::fixtures(common::RV64);
+    let mut dirs: Vec<String> = std::fs::read_dir(&rv64)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    dirs.sort();
+    let mut known: Vec<&str> = shared.iter().chain(&rv64_only).copied().collect();
+    known.sort();
+    assert_eq!(dirs, known, "the RV64 set's directories: copies and its own");
+    for dir in shared {
+        let files = sources(fixtures().join(dir));
+        assert!(!files.is_empty(), "{dir}");
+        assert_eq!(sources(rv64.join(dir)), files, "rv64/{dir}: {stale}");
+        for f in files {
+            assert!(
+                read(fixtures().join(dir).join(&f)) == read(rv64.join(dir).join(&f)),
+                "{dir}/{f} {stale}"
             );
         }
     }
@@ -821,19 +601,6 @@ fn multiobj_matches_ld_lld_and_runs() {
     assert!(l.symbol("puts").unwrap() > l.symbol("_start").unwrap());
 }
 
-/// The relocation types each fixture object carries, by name.
-fn reloc_types(path: &str) -> HashMap<String, usize> {
-    let data = std::fs::read(fixtures().join(path)).unwrap();
-    let obj = merlin_ld::object::parse(path, &data).unwrap();
-    let mut n = HashMap::new();
-    for s in &obj.sections {
-        for r in &s.relocs {
-            *n.entry(merlin_ld::reloc::name(r.ty)).or_insert(0) += 1;
-        }
-    }
-    n
-}
-
 /// Acceptance: every relocation type, in both directions between objects,
 /// at the edges of the BRANCH and JAL ranges, at the %hi/%lo rounding edge,
 /// with addends and against an undefined weak symbol, gives ld.lld's bytes.
@@ -862,7 +629,13 @@ fn relocs_match_ld_lld() {
         "main.o is built with -mno-relax"
     );
     let relax = reloc_types("relocs/relax.o");
-    assert_eq!(relax.get("R_RISCV_RELAX"), Some(&5), "{relax:?}");
+    // A hint for each relaxable instruction: the call, both halves of the lw,
+    // the lui and the sw, and the loop's j, which clang 23 leaves to the
+    // linker together with the branch over it (relax.S).
+    assert_eq!(relax.get("R_RISCV_RELAX"), Some(&6), "{relax:?}");
+    for ty in ["R_RISCV_BRANCH", "R_RISCV_JAL"] {
+        assert_eq!(relax.get(ty), Some(&1), "{ty}: {relax:?}");
+    }
     assert_eq!(reloc_types("rejects/align.o").get("R_RISCV_ALIGN"), Some(&1));
 
     let linked = assert_matches_ld_lld("relocs/link", "OK\n");
@@ -875,6 +648,134 @@ fn relocs_match_ld_lld() {
     let edges = l.symbol("branch_edges").unwrap();
     assert_eq!(edges - l.symbol("branch_back").unwrap(), 4096);
     assert_eq!(l.symbol("branch_fwd").unwrap() - (edges + 4), 4092);
+}
+
+/// `.dword sym + A` (R_RISCV_64) on RV32 gives ld.lld's bytes: in `.data`,
+/// S + A in 64 bits (the program checks the words at run time); in a debug
+/// section, the 32-bit S + A sign-extended, as ld.lld's relocateNonAlloc
+/// writes it.
+#[test]
+fn data64_matches_ld_lld() {
+    let types = reloc_types("data64/data64.o");
+    assert_eq!(types.get("R_RISCV_64"), Some(&8), "{types:?}");
+    let linked = assert_matches_ld_lld("data64/link", "OK\n");
+
+    let lld_file = std::fs::read(fixtures().join("data64/link.lld.elf")).unwrap();
+    let debug_info = |file: &[u8]| -> Vec<u8> {
+        let e = elf::Elf::parse(file).unwrap();
+        let s = e.sections.iter().find(|s| s.name == ".debug_info").unwrap();
+        e.section_data(s).unwrap().to_vec()
+    };
+    let ours = debug_info(&linked.elf);
+    assert_eq!(ours, debug_info(&lld_file), ".debug_info");
+    // What the comparison is about, spelled out: `target` (0x800000d0) and
+    // `target + 0x7fffffff`, loaded and not.
+    let target = linked.layout.symbol("target").unwrap();
+    assert_eq!(target, 0x8000_00d0);
+    let dwords = |b: &[u8]| -> Vec<u64> {
+        b.chunks(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    assert_eq!(
+        dwords(&ours),
+        [
+            0xffff_ffff_8000_00d0,
+            0xffff_ffff_8000_00cf,
+            0xcf,
+            0xffff_ffff_ffff_ffff
+        ]
+    );
+    let data = linked
+        .layout
+        .sections
+        .iter()
+        .position(|s| s.name == ".data")
+        .unwrap();
+    let images = merlin_ld::relocate::relocate(&linked.layout).unwrap();
+    assert_eq!(
+        dwords(&images.sections[data][..32]),
+        [0x8000_00d0, 0x8000_00cf, 0x1_0000_00cf, 0xffff_ffff]
+    );
+}
+
+/// `AT(lma)` against ld.lld (fixtures/at): the program is linked to run at
+/// 0x8000_0000 and Grail loads it at its load addresses (the segments'
+/// p_paddr) and starts it at its entry point's, so it runs where it is
+/// loaded (all it uses is pc-relative) or copies .data to where it runs.
+#[test]
+fn load_addresses_match_ld_lld() {
+    let mut names: Vec<String> = std::fs::read_dir(fixtures().join("at"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ld"))
+        .map(|p| format!("at/{}", p.file_stem().unwrap().to_string_lossy()))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["at/first", "at/kept", "at/middle", "at/split"]);
+    let linked: HashMap<&str, merlin_ld::Linked> = names
+        .iter()
+        .map(|n| (n.as_str(), assert_matches_ld_lld(n, "OK\n")))
+        .collect();
+    // Spot checks, so a broken fixture can't make both sides agree on
+    // nonsense: (flags, vaddr, paddr) of each PT_LOAD.
+    let loads = |name: &str| -> Vec<(String, u64, u64)> {
+        expected(name)
+            .loads
+            .iter()
+            .map(|l| (l.flags.clone(), l.vaddr, l.paddr))
+            .collect()
+    };
+    let load = |f: &str, vaddr, paddr| (f.to_string(), vaddr, paddr);
+    // AT on .text only: the same segments as without it, each 1 MiB up; the
+    // entry point is where _start runs.
+    assert_eq!(
+        loads("at/first"),
+        [
+            load("RE", 0x8000_0000, 0x8010_0000),
+            load("R", 0x8000_00ec, 0x8010_00ec),
+            load("RW", 0x8000_00f0, 0x8010_00f0)
+        ]
+    );
+    assert_eq!(expected("at/first").entry, 0x8000_0000);
+    let first = &linked["at/first"].layout;
+    let sec = |l: &merlin_ld::Layout, name: &str| l.section(name).unwrap().clone();
+    assert!(sec(first, ".text").at && !sec(first, ".rodata").at);
+    assert_eq!(sec(first, ".bss").lma, sec(first, ".bss").addr + 0x10_0000);
+    // AT(.) on .text2: a segment of its own, though it follows .text with the
+    // same permissions and is loaded where it runs.
+    assert_eq!(
+        loads("at/split"),
+        [
+            load("RE", 0x8000_0000, 0x8000_0000),
+            load("RE", 0x8000_0090, 0x8000_0090),
+            load("R", 0x8000_00f4, 0x8000_00f4),
+            load("RW", 0x8000_00f8, 0x8000_00f8)
+        ]
+    );
+    // AT in the middle: .data (and the NOLOAD .bss after it) loaded right
+    // after .rodata, running a page later.
+    assert_eq!(
+        loads("at/middle"),
+        [
+            load("RE", 0x8000_0000, 0x8000_0000),
+            load("R", 0x8000_00ec, 0x8000_00ec),
+            load("RW", 0x8000_1000, 0x8000_00f0)
+        ]
+    );
+    assert_eq!(expected("at/middle").globals["__data_load"], 0x8000_00f0);
+    let middle = &linked["at/middle"].layout;
+    assert_eq!(sec(middle, ".bss").lma, 0x8000_0100);
+    // The empty sections: .dropped is dropped and its AT ignored, .kept's
+    // AT moves everything, .named and .aligned are kept.
+    let kept = expected("at/kept");
+    let names: Vec<&str> = kept.sections.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [".kept", ".text", ".named", ".aligned", ".rodata", ".data", ".bss"]
+    );
+    assert_eq!(kept.globals["__named"], 0x8000_00ec);
+    assert!(kept.loads.iter().all(|l| l.paddr == l.vaddr + 0x10_0000));
 }
 
 /// A jump or call to an undefined weak symbol aims at itself (as in ld.lld):
@@ -936,7 +837,7 @@ fn weak_reference_defined_elsewhere_reaches_the_definition() {
         .iter()
         .filter(|r| r.sym as usize == weak)
     {
-        let p = base + r.offset;
+        let p = u32::try_from(base + r.offset).unwrap();
         let to = match excalibur::decode(word(p), excalibur::Xlen::Rv32) {
             Inst::Jal { imm, .. } | Inst::Branch { imm, .. } => p.wrapping_add(imm as u32),
             Inst::Auipc { imm: hi, .. } => match excalibur::decode(word(p + 4), excalibur::Xlen::Rv32) {
@@ -946,7 +847,11 @@ fn weak_reference_defined_elsewhere_reaches_the_definition() {
             other => panic!("unexpected {other:?}"),
         };
         let ty = merlin_ld::reloc::name(r.ty);
-        assert_eq!(to, target, "{ty} at {p:#x} goes to {to:#x}, not lib_inc");
+        assert_eq!(
+            u64::from(to),
+            target,
+            "{ty} at {p:#x} goes to {to:#x}, not lib_inc"
+        );
         kinds.push(ty);
     }
     assert_eq!(kinds, ["R_RISCV_CALL_PLT", "R_RISCV_JAL", "R_RISCV_BRANCH"]);
@@ -1071,15 +976,13 @@ fn branch_and_jump_range_errors() {
     let objs = inputs("relocs", &["main.o", "lib.o", "relax.o"]);
     // .high 4 bytes too far, .low 4 bytes too low, and .text.branch (8 KiB)
     // between main.o's checks and lib.o.
-    let errs = errors(merlin_ld::link(
-        &objs,
-        &script(
-            "ENTRY(_start) SECTIONS { . = 0x7ffffffc; .low : { *(.low) } . = 0x80100000; \
-             .text : { *(.text.start) *(.text.branch) *(.text*) } .rodata : { *(.rodata*) } \
-             .data : { *(.data*) } .bss : { *(.bss*) } __stack_top = . + 4K; \
-             . = 0x80200004; .high : { *(.high) } }",
-        ),
-    ));
+    let far = script(
+        "ENTRY(_start) SECTIONS { . = 0x7ffffffc; .low : { *(.low) } . = 0x80100000; \
+         .text : { *(.text.start) *(.text.branch) *(.text*) } .rodata : { *(.rodata*) } \
+         .data : { *(.data*) } .bss : { *(.bss*) } __stack_top = . + 4K; \
+         . = 0x80200004; .high : { *(.high) } }",
+    );
+    let errs = errors(merlin_ld::link(&objs, &far));
     // lib_check's `bne a0, t0, fail` is 0x3c into lib.o's .text, 8280 bytes
     // after `fail` once .text.branch is in between; main.o's branch to the
     // weak (but defined) lib_inc is about as far the other way. Were it taken for
@@ -1088,13 +991,13 @@ fn branch_and_jump_range_errors() {
         errs,
         [
             "main.o: relocation R_RISCV_JAL out of range for 'high_target' at .text.start+0x4: 1048576 is not \
-             in [-1048576, 1048574]",
+             in [-1048576, 1048575]",
             "main.o: relocation R_RISCV_JAL out of range for 'low_target' at .text.start+0x8: -1048580 is not \
-             in [-1048576, 1048574]",
+             in [-1048576, 1048575]",
             "main.o: relocation R_RISCV_BRANCH out of range for 'lib_inc' at .text.start+0x268: 8444 is not \
-             in [-4096, 4094]",
+             in [-4096, 4095]",
             "lib.o: relocation R_RISCV_BRANCH out of range for 'fail' at .text+0x3c: -8280 is not in [-4096, \
-             4094]",
+             4095]",
         ]
     );
 
@@ -1120,6 +1023,19 @@ fn branch_and_jump_range_errors() {
           1048573 is not a multiple of 2"
         ]
     );
+    // Odd and out of range: both errors, the range first, as ld.lld
+    // reports them ("out of range: 1048577 is not in [-1048576, 1048575]",
+    // then "improper alignment").
+    let errs = errors(merlin_ld::link(&objs, &far));
+    assert_eq!(
+        errs[..2],
+        [
+            "main.o: relocation R_RISCV_JAL out of range for 'high_target' at .text.start+0x4: \
+             1048577 is not in [-1048576, 1048575]",
+            "main.o: relocation R_RISCV_JAL against 'high_target' at .text.start+0x4 is misaligned: offset \
+             1048577 is not a multiple of 2",
+        ]
+    );
 }
 
 /// A relocation patches only its own input section, even when another input
@@ -1143,7 +1059,10 @@ fn relocation_stops_at_its_input_section() {
     let (_, opts) = case("relocs/link.ld");
     let layout = merlin_ld::layout(&objs, &opts).unwrap();
     let text = layout.section(".text").unwrap();
-    let next = text.inputs.iter().position(|i| i.addr == text.addr + size);
+    let next = text
+        .inputs
+        .iter()
+        .position(|i| i.addr == text.addr + u64::from(size));
     assert!(next.is_some(), "another input section follows .text.start");
     assert_eq!(
         errors(merlin_ld::link(&objs, &opts)),
@@ -1167,16 +1086,12 @@ fn data_word_relocations() {
     let linked = merlin_ld::link(&[obj(src)], &Options::default()).unwrap();
     let data = linked.layout.section(".data").unwrap();
     let elf = grail::elf::parse(&linked.elf).unwrap();
-    let seg = elf
-        .segments
-        .iter()
-        .find(|s| s.paddr == u64::from(data.addr))
-        .unwrap();
+    let seg = elf.segments.iter().find(|s| s.paddr == data.addr).unwrap();
     let words: Vec<u32> = seg.data[..16]
         .chunks(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    assert_eq!(words, [0x8000_0000, 0x8000_0008, 0, data.addr + 16]);
+    assert_eq!(words, [0x8000_0000, 0x8000_0008, 0, data.addr as u32 + 16]);
 
     // _start is at 0x80000004: one more than 0xffffffff.
     let errs = errors(merlin_ld::link(
@@ -1194,10 +1109,21 @@ fn data_word_relocations() {
     );
 }
 
-/// R_RISCV_ALIGN only makes sense with relaxation; R_RISCV_RELAX is ignored
-/// (relocs/relax.o, above).
+/// Label differences and set values (ADD/SUB/SET, 32_PCREL) give ld.lld's
+/// bytes. In debug information on RV32 each value is sign-extended from 32
+/// bits first (ld.lld: `.dword gone - _start` is 0x8000_0000 there, gone
+/// being 0).
 #[test]
-fn align_needs_relaxation() {
+fn label_differences_and_sets() {
+    let ranges = common::assert_diffs(merlin_as::assemble_to_elf(common::DIFFS).unwrap());
+    assert_eq!(ranges, [0, 0, 0, 0x80, 0, 0, 0, 0, 4, 0, 0, 0]);
+}
+
+/// R_RISCV_ALIGN is refused: ld.lld deletes the padding beyond what the
+/// alignment needs, with --no-relax too, and merlin-ld does not.
+/// R_RISCV_RELAX is ignored (relocs/relax.o, above).
+#[test]
+fn align_padding_is_refused() {
     let errs = errors(merlin_ld::link(
         &inputs("rejects", &["align.o"]),
         &Options::default(),
@@ -1205,8 +1131,8 @@ fn align_needs_relaxation() {
     assert_eq!(
         errs,
         [
-            "align.o: R_RISCV_ALIGN at .text+0x4 needs linker relaxation, which merlin-ld does not do; \
-          assemble with -mno-relax"
+            "align.o: R_RISCV_ALIGN at .text+0xc: merlin-ld does not delete alignment padding as ld.lld \
+             does; assemble with -mno-relax"
         ]
     );
 }
@@ -1307,7 +1233,7 @@ fn locals_are_per_object() {
     assert_eq!(ram(&m, data.addr, 8), &[1, 0, 0, 0, 2, 0, 0, 0]);
     // Both are in the output .symtab, as locals, at their own addresses.
     let ours = read_ours(&linked.elf);
-    let counts: Vec<u32> = ours
+    let counts: Vec<u64> = ours
         .locals
         .iter()
         .filter(|(n, _)| n == "count")
@@ -1393,6 +1319,89 @@ fn script_symbols() {
     assert_eq!(l.symbol("alias"), Some(l.symbol("table").unwrap() + 4));
     let text = l.section(".text").unwrap();
     assert_eq!(l.symbol("t_end"), Some(text.addr + text.size));
+}
+
+#[test]
+fn the_location_counter_moves_backward_at_the_top_level() {
+    // As in ld.lld: a top-level `.` may move backward, and the sections
+    // only must not end up over each other.
+    let l = merlin_ld::link(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80001000; .text : { *(.text*) } . = 0x80000000; .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+        ),
+    )
+    .unwrap();
+    let ours = read_ours(&l.elf);
+    assert_eq!(ours.sections[0].addr, 0x8000_1000);
+    assert_eq!(ours.sections[1].addr, 0x8000_0000);
+    // Going backward starts a segment, at a file offset after the one
+    // before (the second page here, as ld.lld puts it).
+    assert_eq!(ours.loads[1].vaddr, 0x8000_0000);
+    assert!(ours.loads[1].offset > ours.loads[0].offset);
+    let errs = errors(merlin_ld::layout(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) } . = 0x80000008; .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+        ),
+    ));
+    assert!(
+        errs[0]
+            .starts_with("section .text virtual address range overlaps with .rodata (.text is [0x80000000, "),
+        "{errs:?}"
+    );
+    assert!(
+        errs[1].starts_with("section .text load address range overlaps with .rodata"),
+        "{errs:?}"
+    );
+}
+
+/// After a section past the address space the location counter goes on
+/// from its end, so the sections after it are reported where ld.lld puts
+/// them, not all at the failed one's start.
+#[test]
+fn sections_after_one_past_4_gib_go_on_from_its_end() {
+    let errs = errors(merlin_ld::layout(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x100000000; .text : { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+        ),
+    ));
+    assert_eq!(errs.len(), 4, "{errs:?}");
+    assert!(
+        errs[0].starts_with("test.ld:1: section .text at 0x100000000 of size 0x"),
+        "{errs:?}"
+    );
+    for e in &errs[1..] {
+        assert!(
+            e.contains(" at 0x1000000") && !e.contains(" at 0x100000000 "),
+            "{errs:?}"
+        );
+    }
+}
+
+#[test]
+fn align_0_is_align_1() {
+    // ld.lld's checkAlignment takes 0 for 1, in an expression and on a
+    // section: neither moves anything (.text still goes at the alignment
+    // of its inputs).
+    let rest = ".rodata : { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) }";
+    for (src, at) in [
+        (
+            format!("SECTIONS {{ . = 0x80000001; . = ALIGN(0); .text : {{ *(.text*) }} {rest} }}"),
+            0x8000_0004,
+        ),
+        (
+            format!("SECTIONS {{ . = 0x80000000; .text : ALIGN(0) {{ *(.text*) }} {rest} }}"),
+            0x8000_0000,
+        ),
+    ] {
+        let l = merlin_ld::layout(&norelocs(), &script(&src)).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        assert_eq!(l.section(".text").unwrap().addr, at, "{src}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1518,17 +1527,24 @@ fn layout_errors() {
              MEMORY region RAM instead; move the assignment inside the section",
         ),
         (
-            "SECTIONS { . = 0x80000000; . = 0x1000; }",
-            "test.ld:1: cannot move the location counter backward (from 0x80000000 to 0x1000)",
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) . = . - 0x1000; } }",
+            "test.ld:1: cannot move the location counter backward (from 0x80000",
         ),
+        // ld.lld's words for a section past the address space.
         (
             "SECTIONS { . = 0xfffffff0; .text : { *(.text*) } }",
-            "test.ld:1: section .text extends past the 4 GiB address space",
+            "test.ld:1: section .text at 0xfffffff0 of size 0x",
         ),
         (
             // Exactly 4 GiB long: must not wrap to an empty section.
             "SECTIONS { . = 0; .s : { . += 0x100000000; } }",
-            "test.ld:1: section .s extends past the 4 GiB address space",
+            "test.ld:1: section .s at 0x0 of size 0x100000000 exceeds available address space",
+        ),
+        (
+            // A negative location counter, at the top level, where `.` may
+            // move backward.
+            "SECTIONS { . = 0 - 1; }",
+            "test.ld:1: location counter 0xffffffffffffffff is past the 4 GiB address space",
         ),
         (
             "SECTIONS { . = 0x80000000; . += 0x7fffffffffffffff; }",
@@ -1536,7 +1552,22 @@ fn layout_errors() {
         ),
         ("SECTIONS { x = 0x100000000; }", "test.ld:1: value 0x100000000 of 'x' does not fit in 32 bits"),
         ("SECTIONS { x = ORIGIN(RAM); }", "test.ld:1: unknown memory region 'RAM'"),
-        ("SECTIONS { . = ALIGN(0); }", "test.ld:1: ALIGN(0): alignment must be positive"),
+        // ld.lld's checkAlignment, in expressions and on sections, and
+        // merlin-ld's limit of 2^31 on a section's.
+        (
+            "SECTIONS { . = 0x80000001; . = ALIGN(3); }",
+            "test.ld:1: ALIGN(3): alignment must be power of 2",
+        ),
+        ("SECTIONS { . = ALIGN(0 - 16); }", "test.ld:1: ALIGN(-16): alignment must be power of 2"),
+        (
+            "SECTIONS { .text : ALIGN(24) { *(.text*) } }",
+            "test.ld:1: ALIGN(24) of section .text: alignment must be power of 2",
+        ),
+        (
+            "SECTIONS { .text : ALIGN(0x100000000) { *(.text*) } }",
+            "test.ld:1: ALIGN(4294967296) of section .text: alignment must be at most 2^31 (ld.lld keeps 32 \
+             bits of a section's alignment and would ignore this one)",
+        ),
         ("SECTIONS { .text : { KEEP(*(.text)) } }", "test.ld:1: only '*(...)' input section lists are supported"),
     ];
     for (src, want) in cases {
@@ -1601,7 +1632,11 @@ fn rejects_bad_objects() {
     let reject = |name: &str| std::fs::read(fixtures().join("rejects").join(name)).unwrap();
     let cases: Vec<(Vec<u8>, &str)> = vec![
         (b"hello".to_vec(), "x.o: not an ELF file"),
-        (patched(4, &[2]), "x.o: not a 32-bit ELF file"),
+        // ELFCLASS64 is RV64 (tests/rv64.rs); 3 is no class.
+        (
+            patched(4, &[3]),
+            "x.o: not a 32- or 64-bit ELF file (EI_CLASS is 3)",
+        ),
         (patched(5, &[2]), "x.o: not a little-endian ELF file"),
         (patched(16, &[2, 0]), "x.o: an executable (e_type 2)"),
         (patched(18, &[62, 0]), "x.o: e_machine is 62, not RISC-V"),
@@ -1656,6 +1691,30 @@ fn rejects_bad_objects() {
             },
             "x.o: section '.rela.text.start' is SHT_REL; RISC-V objects use SHT_RELA",
         ),
+        // ld.lld: "x.o:(.text): sh_addralign is not a power of 2" (ELF32's
+        // sh_addralign at 32). A symbol table's alignment it does not check.
+        (
+            {
+                let mut b = good.clone();
+                let t = shdr(&b, ".text");
+                b[t + 32..t + 36].copy_from_slice(&12u32.to_le_bytes());
+                b
+            },
+            "x.o: section '.text' has sh_addralign 0xc, not a power of 2",
+        ),
+        // ld.lld: "section [index 5] has an invalid sh_size (N) which is not
+        // a multiple of its sh_entsize (16)" (ELF32's sh_size at 20).
+        (
+            {
+                let mut b = good.clone();
+                let s = shdr(&b, ".symtab");
+                let size = u32::from_le_bytes(b[s + 20..s + 24].try_into().unwrap());
+                b[s + 20..s + 24].copy_from_slice(&(size + 4).to_le_bytes());
+                b[s + 32..s + 36].copy_from_slice(&3u32.to_le_bytes());
+                b
+            },
+            "x.o: section '.symtab' has sh_size 0x",
+        ),
         (
             reject("nonalloc.o"),
             "x.o: global symbol 'g' is defined in section '.note.camelot', which is not loaded",
@@ -1676,6 +1735,159 @@ fn rejects_bad_objects() {
         errors(merlin_ld::link(&[], &Options::default())),
         ["no input files"]
     );
+}
+
+/// `ADDR(section)`: the address of an output section placed before, or of
+/// the one being placed, in its own AT and assignments. What ld.lld gives
+/// for this script and these objects (checked by hand: x 0x80000028, y
+/// 0x80000040, z 0x80000004, .data's segment at paddr 0x80100040).
+#[test]
+fn addr_is_an_output_sections_address() {
+    let l = merlin_ld::layout(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) } .rodata : { *(.rodata*) } x = ADDR(.rodata); \
+             .data : AT(ADDR(.data) + 0x100000) { y = ADDR(.data); *(.data*) } .bss : { *(.bss*) } \
+             z = ADDR(.text) + 4; }",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        (l.symbol("x"), l.symbol("y"), l.symbol("z")),
+        (Some(0x8000_0028), Some(0x8000_0040), Some(0x8000_0004))
+    );
+    let data = l.section(".data").unwrap();
+    assert_eq!((data.addr, data.lma, data.at), (0x8000_0040, 0x8010_0040, true));
+    // .bss has no AT and keeps .data's difference.
+    let bss = l.section(".bss").unwrap();
+    assert_eq!((bss.lma - bss.addr, bss.at), (0x10_0000, false));
+}
+
+/// The load address errors: AT ranges that overlap (ld.lld's
+/// checkSections, with its ranges on the same line), that run past 4 GiB
+/// on RV32 (where ld.lld truncates), and ADDR of what has no address yet.
+#[test]
+fn load_address_errors() {
+    let cases: &[(&str, &str)] = &[
+        (
+            // ld.lld: "section .text load address range overlaps with
+            // .rodata", ">>> .text range is [0x80100000, 0x80100027]",
+            // ">>> .rodata range is [0x80100010, 0x80100027]".
+            "SECTIONS { . = 0x80000000; .text : AT(0x80100000) { *(.text*) } \
+             .rodata : AT(0x80100010) { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) } }",
+            "section .text load address range overlaps with .rodata (.text is [0x80100000, 0x80100027], \
+             .rodata is [0x80100010, 0x80100027])",
+        ),
+        (
+            // .bss loaded over .text too, but it loads no bytes (NOBITS).
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : AT(0x80000000) { *(.data*) } .bss : AT(0x80000000) { *(.bss*) } }",
+            "section .text load address range overlaps with .data (.text is [0x80000000, 0x80000027], \
+             .data is [0x80000000, 0x80000023])",
+        ),
+        (
+            "SECTIONS { . = 0x80000000; .text : AT(0xffffffe0) { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+            "test.ld:1: section .text load address range extends past the 4 GiB address space",
+        ),
+        (
+            // A negative load address (RV32 scripts compute in i64).
+            "SECTIONS { . = 0x80000000; .text : AT(0 - 1) { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+            "test.ld:1: section .text load address range extends past the 4 GiB address space",
+        ),
+        (
+            "SECTIONS { x = ADDR(.nope); .text : { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+            "test.ld:1: undefined section .nope",
+        ),
+        (
+            // ld.lld would go round again; merlin-ld walks the script once.
+            "SECTIONS { x = ADDR(.data); .text : { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+            "test.ld:1: section '.data' is used before it is placed",
+        ),
+        (
+            // A section's ALIGN decides where it starts: its ADDR is not
+            // known yet there.
+            "SECTIONS { .text : { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : ALIGN(ADDR(.data) - ADDR(.data) + 16) { *(.data*) } .bss : { *(.bss*) } }",
+            "test.ld:1: section '.data' is used before it is placed",
+        ),
+        (
+            // Without a /DISCARD/ in the script, ld.lld's words.
+            "SECTIONS { .text : { *(.text*) } .rodata : { *(.rodata*) } .data : { *(.data*) } \
+             .bss : { *(.bss*) } x = ADDR(/DISCARD/); }",
+            "test.ld:1: undefined section /DISCARD/",
+        ),
+        (
+            // ld.lld reads a /DISCARD/'s ALIGN as any other's.
+            "SECTIONS { .text : { *(.text*) } /DISCARD/ : ALIGN(3) { *(.comment) } }",
+            "test.ld:1: ALIGN(3) of section /DISCARD/: alignment must be power of 2",
+        ),
+        (
+            // ld.lld: "{ expected, but got AT".
+            "SECTIONS { .text : ALIGN(4) AT(0x80100000) { *(.text*) } }",
+            "test.ld:1: unsupported syntax after '.text :': found 'AT' (only AT(lma) and then ALIGN(n) may \
+             come before '{')",
+        ),
+    ];
+    for (src, want) in cases {
+        let errs = errors(merlin_ld::layout(&norelocs(), &script(src)));
+        assert!(
+            errs.iter().any(|e| e == want),
+            "{src}\n got {errs:?}\nwant {want}"
+        );
+    }
+    // As in ld.lld: a /DISCARD/'s NOLOAD and AT mean nothing (the AT is
+    // not even evaluated), and its ADDR is 0, when the script has one.
+    let l = merlin_ld::layout(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : AT(ADDR(/DISCARD/) + 0x1000) { *(.data*) } .bss : { *(.bss*) } x = ADDR(/DISCARD/); \
+             /DISCARD/ (NOLOAD) : AT(nowhere) ALIGN(16) { *(.comment) } }",
+        ),
+    )
+    .unwrap();
+    assert_eq!(l.symbol("x"), Some(0));
+    assert_eq!(l.section(".data").unwrap().lma, 0x1000);
+    // A load address range may end exactly at 4 GiB (ld.lld links this).
+    let l = merlin_ld::layout(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80000000; .text : AT(0xffffffd8) { *(.text*) } \
+             .rodata : AT(0x80100000) { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) } }",
+        ),
+    )
+    .unwrap();
+    let text = l.section(".text").unwrap();
+    assert_eq!(text.lma + text.size, 1 << 32);
+    // Every section after one past 4 GiB keeps its difference, and is past
+    // it too: each one is reported.
+    let errs = errors(merlin_ld::layout(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80000000; .text : AT(0xffffffe0) { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+        ),
+    ));
+    assert_eq!(errs.len(), 4, "{errs:?}");
+}
+
+/// A section loaded somewhere else than it runs says where in the map.
+#[test]
+fn map_file_shows_load_addresses() {
+    let (objs, opts) = case("at/middle.ld");
+    let linked = merlin_ld::link(&objs, &opts).unwrap();
+    let map = merlin_ld::map::map(&linked.layout);
+    for want in [
+        "\n.rodata              0x800000ec 0x00000004 1\n",
+        "\n.data                0x80001000 0x00000008 4096  (load 0x800000f0)\n",
+        "\n.bss                 0x80001010 0x00000010 16  (nobits)  (load 0x80000100)\n",
+    ] {
+        assert!(map.contains(want), "map lacks {want:?}:\n{map}");
+    }
 }
 
 #[test]
@@ -1741,6 +1953,44 @@ fn segments_group_by_permissions() {
     .unwrap();
     let (m, _, _) = run(&linked.elf);
     check_norelocs_memory(&m, &linked.layout);
+}
+
+/// A segment is aligned to the largest alignment of its sections when that
+/// is more than a page, NOBITS ones included, and its file offset is
+/// congruent to its address modulo that: what ld.lld 23 writes for this
+/// script and source on both widths (checked by hand: `LOAD 0x009000
+/// 0x80001000 ... RW 0x8000`; on RV64, `rv64si-p-icache-alias` of the
+/// riscv-tests relink has such a segment).
+#[test]
+fn segments_take_the_largest_alignment_of_their_sections() {
+    let src = "    .text\n    .globl _start\n_start:\n    nop\n    .data\n    .word 1\n\
+               .section .data.big, \"aw\"\n    .p2align 13\n    .word 2\n\
+               .section .data.huge, \"aw\"\n    .p2align 14\n    .word 3\n\
+               .bss\n    .p2align 15\n    .zero 8\n";
+    let opts = script(
+        "SECTIONS { . = 0x80000000; .text : { *(.text) } . = ALIGN(0x1000); .data : { *(.data) } \
+         .big : { *(.data.big) } . = 0x80010000; .huge : { *(.data.huge) } .bss : { *(.bss) } }",
+    );
+    for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
+        let obj = Input {
+            name: "a.o".into(),
+            data: merlin_as::assemble_to_elf_with(src, &merlin_as::Options { xlen }).unwrap(),
+        };
+        let linked = merlin_ld::link(&[obj], &opts).unwrap();
+        let l: Vec<(u64, u64, u64, u64, u64)> = read_ours(&linked.elf)
+            .loads
+            .iter()
+            .map(|l| (l.offset, l.vaddr, l.filesz, l.memsz, l.align))
+            .collect();
+        assert_eq!(
+            l,
+            [
+                (0x1000, 0x8000_0000, 4, 4, 0x1000),
+                (0x9000, 0x8000_1000, 0xf004, 0x17008, 0x8000)
+            ],
+            "{xlen:?}"
+        );
+    }
 }
 
 #[test]
@@ -2010,19 +2260,7 @@ fn line_tables_are_kept_and_relocated() {
     // changes nothing.
     assert_eq!(merlin_ld::strip_debug(&linked.elf).unwrap(), without.elf);
     assert_eq!(merlin_ld::strip_debug(&without.elf).unwrap(), without.elf);
-    // An RV64 program (with debug sections) is refused, not cut at ELF32's
-    // offsets.
-    let rv64 = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../elf/tests/llvm/rv64/prog.elf"
-    ))
-    .unwrap();
-    let err = merlin_ld::strip_debug(&rv64).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("ELF64 (RV64) files are not supported yet"),
-        "{err}"
-    );
+    // (The RV64 twin of this test is in rv64.rs.)
 }
 
 #[test]
@@ -2049,4 +2287,76 @@ gone:
     let seqs = &elf.line_tables().unwrap()[0].sequences;
     let starts: Vec<(u64, u32)> = seqs.iter().map(|s| (s.rows[0].addr, s.rows[0].line)).collect();
     assert_eq!(starts, [(0x1000, 1), (0, 7)]);
+}
+
+/// The same with the discarded code at an offset in its section: the line
+/// table's address is `.text.gone + 4`, a relocation with addend 4, and it
+/// still becomes 0 (ld.lld writes 0 whatever the addend).
+#[test]
+fn debug_information_of_discarded_code_with_an_addend_points_nowhere() {
+    let src = "        .file 0 \"src\" \"a.c\"
+        .text
+        .globl _start
+_start:
+        .loc 0 1 0
+        nop
+        .section .text.gone
+        nop
+gone:
+        .loc 0 7 0
+        nop
+";
+    let obj = Input {
+        name: "a.o".into(),
+        data: merlin_as::assemble_to_elf(src).unwrap(),
+    };
+    let parsed = merlin_ld::object::parse("a.o", &obj.data).unwrap();
+    let line = parsed.sections.iter().find(|s| s.name == ".debug_line").unwrap();
+    assert!(line.relocs.iter().any(|r| r.addend == 4), "{:?}", line.relocs);
+    let opts = script("SECTIONS { . = 0x1000; .text : { *(.text) } /DISCARD/ : { *(.text.gone) } }");
+    let linked = merlin_ld::link(&[obj], &opts).unwrap();
+    let elf = elf::Elf::parse(&linked.elf).unwrap();
+    let seqs = &elf.line_tables().unwrap()[0].sequences;
+    let starts: Vec<(u64, u32)> = seqs.iter().map(|s| (s.rows[0].addr, s.rows[0].line)).collect();
+    assert_eq!(starts, [(0x1000, 1), (0, 7)]);
+}
+
+/// A reference from one object's debug information to a global another
+/// object defines in code /DISCARD/ threw away, and to a weak symbol nobody
+/// defines, points nowhere too: ld.lld's tombstone, 0, but 1 in
+/// `.debug_ranges` and `.debug_loc` (where 0, 0 ends a list). The bytes are
+/// ld.lld 23's for these objects (common::TOMBSTONES), the same on RV64
+/// (rv64.rs).
+#[test]
+fn debug_information_of_a_discarded_global_points_nowhere() {
+    let asm = |src| merlin_as::assemble_to_elf(src).unwrap();
+    common::assert_tombstones(asm(common::TOMBSTONES), asm(common::TOMBSTONES_GONE));
+}
+
+/// OUTPUT_FORMAT names the class the objects must have: with RV32 objects,
+/// `elf64-littleriscv` makes every one of them an error, as in ld.lld
+/// (`a.o is incompatible with elf64-littleriscv`), and `elf32-littleriscv`
+/// links as without it.
+#[test]
+fn output_format_must_match_the_objects() {
+    let sections = "SECTIONS { . = 0x80000000; .text : { *(.text*) } .data : { *(.data* .rodata* .bss*) } }";
+    assert_eq!(
+        errors(merlin_ld::layout(
+            &norelocs(),
+            &script(&format!("OUTPUT_FORMAT(\"elf64-littleriscv\") {sections}"))
+        )),
+        [
+            "start.o is incompatible with elf64-littleriscv",
+            "data.o is incompatible with elf64-littleriscv",
+            "more.o is incompatible with elf64-littleriscv",
+        ]
+    );
+    let with = merlin_ld::link(
+        &norelocs(),
+        &script(&format!("OUTPUT_FORMAT(\"elf32-littleriscv\") {sections}")),
+    )
+    .unwrap();
+    let without = merlin_ld::link(&norelocs(), &script(sections)).unwrap();
+    assert_eq!(with.layout.class, elf::Class::Elf32);
+    assert_eq!(with.elf, without.elf);
 }

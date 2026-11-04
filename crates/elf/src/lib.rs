@@ -42,6 +42,8 @@ pub const SHT_NOBITS: u32 = 8;
 pub const SHT_REL: u32 = 9;
 pub const SHT_GROUP: u32 = 17;
 pub const SHT_SYMTAB_SHNDX: u32 = 18;
+/// `.riscv.attributes` (the psABI's build attributes: `Tag_RISCV_arch`, ...).
+pub const SHT_RISCV_ATTRIBUTES: u32 = 0x7000_0003;
 
 // Section flags (`sh_flags` is 4 bytes in ELF32 and 8 in ELF64).
 pub const SHF_WRITE: u64 = 0x1;
@@ -268,25 +270,28 @@ pub struct Elf<'a> {
     pub sections: Vec<Section>,
 }
 
+/// The error of a read past the end of the file: which bytes it needed,
+/// `truncated file (needs bytes 0x18c..0x1b4)` (as merlin-ld and the C
+/// linker on Camelot word it). The end is computed in 128 bits, so it is the
+/// true one even when `off + len` does not fit a `usize`.
+fn truncated(off: usize, len: usize) -> Error {
+    let end = off as u128 + len as u128;
+    Error(format!("truncated file (needs bytes {off:#x}..{end:#x})"))
+}
+
 fn u16_at(data: &[u8], off: usize) -> Result<u16, Error> {
-    match data.get(off..off.saturating_add(2)) {
-        Some(b) => Ok(u16::from_le_bytes([b[0], b[1]])),
-        None => err("truncated file"),
-    }
+    let b = bytes_at(data, off, 2)?;
+    Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
 fn u32_at(data: &[u8], off: usize) -> Result<u32, Error> {
-    match data.get(off..off.saturating_add(4)) {
-        Some(b) => Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-        None => err("truncated file"),
-    }
+    let b = bytes_at(data, off, 4)?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 fn u64_at(data: &[u8], off: usize) -> Result<u64, Error> {
-    match data.get(off..off.saturating_add(8)) {
-        Some(b) => Ok(u64::from_le_bytes(b.try_into().unwrap())),
-        None => err("truncated file"),
-    }
+    let b = bytes_at(data, off, 8)?;
+    Ok(u64::from_le_bytes(b.try_into().unwrap()))
 }
 
 /// An address-sized field (`Elf32_Addr`/`Elf64_Addr`, `_Off`, `_Xword`): 4
@@ -305,16 +310,15 @@ fn idx(v: u64) -> usize {
 }
 
 fn bytes_at(data: &[u8], off: usize, len: usize) -> Result<&[u8], Error> {
-    match off.checked_add(len).and_then(|end| data.get(off..end)) {
-        Some(b) => Ok(b),
-        None => err("truncated file"),
-    }
+    off.checked_add(len)
+        .and_then(|end| data.get(off..end))
+        .ok_or_else(|| truncated(off, len))
 }
 
 /// Reads a NUL-terminated string at `off`; a missing terminator ends at the end of `data`.
 fn cstr(data: &[u8], off: usize) -> Result<String, Error> {
     let Some(s) = data.get(off..) else {
-        return err(format!("string offset {off:#x} out of range"));
+        return err(format!("string offset {off:#x} outside its string table"));
     };
     let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
     Ok(String::from_utf8_lossy(&s[..end]).into_owned())
@@ -324,6 +328,18 @@ impl<'a> Elf<'a> {
     /// Parses the header, program headers and section headers of a
     /// little-endian RISC-V file of either class.
     pub fn parse(data: &'a [u8]) -> Result<Elf<'a>, Error> {
+        Elf::parse_with(data, true)
+    }
+
+    /// Like [`Elf::parse`], but reads no program headers ([`Elf::segments`]
+    /// stays empty): how a linker reads a relocatable object (`.o`), whose
+    /// program header table, if it has one, means nothing. ld.lld does not
+    /// read it either, so a stray `e_phnum` is no error.
+    pub fn parse_sections_only(data: &'a [u8]) -> Result<Elf<'a>, Error> {
+        Elf::parse_with(data, false)
+    }
+
+    fn parse_with(data: &'a [u8], with_segments: bool) -> Result<Elf<'a>, Error> {
         if bytes_at(data, 0, 4)? != b"\x7fELF" {
             return err("missing magic");
         }
@@ -359,7 +375,7 @@ impl<'a> Elf<'a> {
         }
 
         let mut segments = Vec::new();
-        if header.phnum > 0 {
+        if with_segments && header.phnum > 0 {
             if (header.phentsize as usize) < class.phdr_size() {
                 return err("e_phentsize too small");
             }
@@ -421,9 +437,14 @@ impl<'a> Elf<'a> {
                     entsize: addr_at(class, data, after + 8 + a)?,
                 });
             }
+            // Names come from the section header string table, when
+            // e_shstrndx names one: SHN_UNDEF (0) means there is none, and
+            // a section of another type is not read as one (the names stay
+            // empty, and a reader that requires them, such as merlin-ld,
+            // says what e_shstrndx points at).
             if let Some(strtab) = sections
                 .get(header.shstrndx as usize)
-                .filter(|_| header.shstrndx != 0)
+                .filter(|s| header.shstrndx != 0 && s.ty == SHT_STRTAB)
             {
                 let names = bytes_at(data, idx(strtab.offset), idx(strtab.size))?;
                 for (s, &off) in sections.iter_mut().zip(&name_offsets) {

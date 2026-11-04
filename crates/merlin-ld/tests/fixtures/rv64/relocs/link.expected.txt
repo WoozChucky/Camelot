@@ -1,0 +1,128 @@
+There are 11 section headers, starting at offset 0x5d40:
+
+Section Headers:
+  [Nr] Name              Type            Address          Off    Size   ES Flg Lk Inf Al
+  [ 0]                   NULL            0000000000000000 000000 000000 00      0   0  0
+  [ 1] .low              PROGBITS        0000000080000000 001000 00001c 00 WAX  0   0  1
+  [ 2] .text             PROGBITS        0000000080100000 002000 0025bc 00  AX  0   0  4
+  [ 3] .rodata           PROGBITS        00000000801025c0 0045c0 00004c 00   A  0   0  8
+  [ 4] .data             PROGBITS        0000000080102610 004610 000030 00  WA  0   0  8
+  [ 5] .high             PROGBITS        0000000080200000 005000 000008 00  AX  0   0  1
+  [ 6] .riscv.attributes RISCV_ATTRIBUTES 0000000000000000 005008 000055 00      0   0  1
+  [ 7] .comment          PROGBITS        0000000000000000 00505d 000063 01  MS  0   0  1
+  [ 8] .symtab           SYMTAB          0000000000000000 0050c0 000780 18     10  43  8
+  [ 9] .shstrtab         STRTAB          0000000000000000 005840 000055 00      0   0  1
+  [10] .strtab           STRTAB          0000000000000000 005895 0004a7 00      0   0  1
+Key to Flags:
+  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
+  L (link order), O (extra OS processing required), G (group), T (TLS),
+  C (compressed), x (unknown), o (OS specific), E (exclude),
+  R (retain), p (processor specific)
+
+Elf file type is EXEC (Executable file)
+Entry point 0x80100000
+There are 7 program headers, starting at offset 64
+
+Program Headers:
+  Type           Offset   VirtAddr           PhysAddr           FileSiz  MemSiz   Flg Align
+  LOAD           0x001000 0x0000000080000000 0x0000000080000000 0x00001c 0x00001c RWE 0x1000
+  LOAD           0x002000 0x0000000080100000 0x0000000080100000 0x0025bc 0x0025bc R E 0x1000
+  LOAD           0x0045c0 0x00000000801025c0 0x00000000801025c0 0x00004c 0x00004c R   0x1000
+  LOAD           0x004610 0x0000000080102610 0x0000000080102610 0x000030 0x000030 RW  0x1000
+  LOAD           0x005000 0x0000000080200000 0x0000000080200000 0x000008 0x000008 R E 0x1000
+  GNU_STACK      0x000000 0x0000000000000000 0x0000000000000000 0x000000 0x000000 RW  0x0
+  ATTRIBUTES     0x005008 0x0000000000000000 0x0000000000000000 0x000055 0x000055 R   0x1
+
+ Section to Segment mapping:
+  Segment Sections...
+   00     .low 
+   01     .text 
+   02     .rodata 
+   03     .data 
+   04     .high 
+   05     
+   06     .riscv.attributes 
+   None   .comment .symtab .shstrtab .strtab 
+
+Symbol table '.symtab' contains 80 entries:
+   Num:    Value          Size Type    Bind   Vis       Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   UND 
+     1: 0000000080100000     0 NOTYPE  LOCAL  DEFAULT     2 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+     2: 000000008010001c     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi0
+     3: 000000008010006c     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi1
+     4: 0000000080100078     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi2
+     5: 00000000801000b8     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi3
+     6: 00000000801000ec     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi4
+     7: 0000000080102610     0 NOTYPE  LOCAL  DEFAULT     4 counter
+     8: 00000000801000f4     0 NOTYPE  LOCAL  DEFAULT     2 .Ltmp0
+     9: 0000000080100104     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi5
+    10: 000000008010013c     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi6
+    11: 0000000080100144     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi7
+    12: 00000000801001e0     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi8
+    13: 00000000801001e8     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi9
+    14: 0000000080100208     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi10
+    15: 0000000080100210     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi11
+    16: 0000000080100244     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi12
+    17: 00000000801002b4     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi13
+    18: 00000000801025f8     0 NOTYPE  LOCAL  DEFAULT     3 table32
+    19: 00000000801002c0     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi14
+    20: 0000000080100320     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi15
+    21: 00000000801025c0     0 NOTYPE  LOCAL  DEFAULT     3 table64
+    22: 0000000080100344     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi16
+    23: 00000000801004c4     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi17
+    24: 0000000080100510     0 NOTYPE  LOCAL  DEFAULT     2 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+    25: 00000000801005b4     0 NOTYPE  LOCAL  DEFAULT     2 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+    26: 0000000080000000     0 NOTYPE  LOCAL  DEFAULT     1 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+    27: 0000000080000010     0 NOTYPE  LOCAL  DEFAULT     1 .Lpcrel_hi18
+    28: 0000000080200000     0 NOTYPE  LOCAL  DEFAULT     5 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+    29: 00000000801025c0     0 NOTYPE  LOCAL  DEFAULT     3 $d
+    30: 0000000080102610     0 NOTYPE  LOCAL  DEFAULT     4 $d
+    31: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
+    32: 0000000080100520     0 NOTYPE  LOCAL  DEFAULT     2 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+    33: 0000000080100550     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi0
+    34: 0000000080102618     0 NOTYPE  LOCAL  DEFAULT     4 $d
+    35: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
+    36: 000000008010056c     0 NOTYPE  LOCAL  DEFAULT     2 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+    37: 000000008010057c     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi0
+    38: 0000000080100588     0 NOTYPE  LOCAL  DEFAULT     2 .Lpcrel_hi1
+    39: 000000008010059c     0 NOTYPE  LOCAL  DEFAULT     2 .Ltmp0
+    40: 00000000801005a8     0 NOTYPE  LOCAL  DEFAULT     2 .Ltmp1
+    41: 0000000080102638     0 NOTYPE  LOCAL  DEFAULT     4 $d
+    42: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS $d
+    43: 0000000080100000     0 NOTYPE  GLOBAL DEFAULT     2 _start
+    44: 0000000080200000     0 NOTYPE  GLOBAL DEFAULT     5 high_target
+    45: 0000000080000008     0 NOTYPE  GLOBAL DEFAULT     1 low_target
+    46: 000000008010050c     0 NOTYPE  GLOBAL DEFAULT     2 fail
+    47: 0000000080103640     0 NOTYPE  GLOBAL DEFAULT     4 __stack_top
+    48: 0000000080100520     0 NOTYPE  GLOBAL DEFAULT     2 lib_double
+    49: 0000000080100528     0 NOTYPE  GLOBAL DEFAULT     2 lib_calls_back
+    50: 0000000080102618     0 NOTYPE  GLOBAL DEFAULT     4 lib_value
+    51: 0000000080102630     0 NOTYPE  GLOBAL DEFAULT     4 lib_word
+    52: 0000000080100550     0 NOTYPE  GLOBAL DEFAULT     2 lib_check
+    53: 0000000080102628     0 NOTYPE  GLOBAL DEFAULT     4 lib_scratch
+    54: 0000000012345800     0 NOTYPE  GLOBAL DEFAULT   ABS hi_round
+    55: 000000007ffff7ff     0 NOTYPE  GLOBAL DEFAULT   ABS hi_max
+    56: ffffffff7ffff800     0 NOTYPE  GLOBAL DEFAULT   ABS hi_min
+    57: ffffffff80000000     0 NOTYPE  GLOBAL DEFAULT   ABS kernel_base
+    58: 00000000801001e0     0 NOTYPE  GLOBAL DEFAULT     2 pc_max_site
+    59: 0000000080100208     0 NOTYPE  GLOBAL DEFAULT     2 pc_min_site
+    60: 00000001000ff9df     0 NOTYPE  GLOBAL DEFAULT     2 pc_max
+    61: 00000000000ffa08     0 NOTYPE  GLOBAL DEFAULT     2 pc_min
+    62: 0000000080100234     0 NOTYPE  GLOBAL DEFAULT     2 call_max_site
+    63: 000000008010023c     0 NOTYPE  GLOBAL DEFAULT     2 call_min_site
+    64: 00000001000ffa33     0 NOTYPE  GLOBAL DEFAULT     2 call_max
+    65: 00000000000ffa3c     0 NOTYPE  GLOBAL DEFAULT     2 call_min
+    66: 0000000080102620     0 NOTYPE  GLOBAL DEFAULT     4 lib_ptr
+    67: 0000000080000010     0 NOTYPE  GLOBAL DEFAULT     1 low_weak
+    68: 0000000000000000     0 NOTYPE  WEAK   DEFAULT   UND missing
+    69: 0000000080100564     0 NOTYPE  GLOBAL DEFAULT     2 lib_inc
+    70: 00000000801015b4     0 NOTYPE  GLOBAL DEFAULT     2 branch_edges
+    71: 000000008010056c     0 NOTYPE  GLOBAL DEFAULT     2 relax_fn
+    72: 0000000080102638     0 NOTYPE  GLOBAL DEFAULT     4 relax_word
+    73: 0000000010000000     0 NOTYPE  GLOBAL DEFAULT   ABS uart
+    74: 0000000080100510     0 NOTYPE  GLOBAL DEFAULT     2 main_helper
+    75: 0000000080100518     0 NOTYPE  GLOBAL DEFAULT     2 main_tail
+    76: 00000000801005b4     0 NOTYPE  GLOBAL DEFAULT     2 branch_back
+    77: 00000000801025b4     0 NOTYPE  GLOBAL DEFAULT     2 branch_fwd
+    78: 123456789abcdef0     0 NOTYPE  GLOBAL DEFAULT   ABS far64
+    79: fffffffffffffff0     0 NOTYPE  GLOBAL DEFAULT   ABS top64
