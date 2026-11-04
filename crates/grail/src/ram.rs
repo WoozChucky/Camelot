@@ -173,7 +173,7 @@ mod windows {
     use super::COMMIT_CHUNK;
     use std::ffi::c_void;
     use std::ptr::null_mut;
-    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
     use std::sync::Once;
 
     const MEM_COMMIT: u32 = 0x1000;
@@ -212,39 +212,45 @@ mod windows {
         fn AddVectoredExceptionHandler(first: u32, handler: Handler) -> *mut c_void;
     }
 
-    /// One reserved RAM: `base` and `len`, 0 while the slot is free. The handler reads
-    /// the list without a lock (it runs in the middle of whatever faulted, any thread,
-    /// so it must not wait or allocate); slots are never freed, only reused.
+    /// One reserved RAM, `base` and `len`, in a slot of a list the handler reads
+    /// without a lock: it runs in the middle of whatever faulted, on any thread, so it
+    /// must not wait or allocate. Slots are never freed, only reused.
+    ///
+    /// `state` says what the slot is. Only a `LIVE` slot's `base` and `len` are a pair,
+    /// and nobody but its owner (the `Ram`, when it is dropped) takes a live slot back:
+    /// looking for a free slot claims `FREE` ones only, so a live region never drops out
+    /// of the handler's sight, as it would if every slot passed were locked to look at.
     pub struct Region {
         base: AtomicUsize,
         len: AtomicUsize,
-        /// The slot being set up or taken down: `base`/`len` are not a pair yet.
-        busy: AtomicUsize,
+        state: AtomicU8,
         next: AtomicPtr<Region>,
     }
+
+    const FREE: u8 = 0;
+    /// Being set up or taken down: not a region the handler may use.
+    const CLAIMED: u8 = 1;
+    const LIVE: u8 = 2;
 
     static REGIONS: AtomicPtr<Region> = AtomicPtr::new(null_mut());
     static INSTALL: Once = Once::new();
 
-    /// A free slot, taken, or a new one pushed on the list.
+    /// A free slot, claimed, or a new one pushed on the list.
     fn take_slot() -> &'static Region {
         let mut at = REGIONS.load(Ordering::Acquire);
         while let Some(r) = unsafe { at.as_ref() } {
-            if r.busy
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            if r.state
+                .compare_exchange(FREE, CLAIMED, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                if r.len.load(Ordering::Acquire) == 0 {
-                    return r;
-                }
-                r.busy.store(0, Ordering::Release);
+                return r;
             }
             at = r.next.load(Ordering::Acquire);
         }
         let r: &'static Region = Box::leak(Box::new(Region {
             base: AtomicUsize::new(0),
             len: AtomicUsize::new(0),
-            busy: AtomicUsize::new(1),
+            state: AtomicU8::new(CLAIMED),
             next: AtomicPtr::new(null_mut()),
         }));
         let mut head = REGIONS.load(Ordering::Acquire);
@@ -271,34 +277,31 @@ mod windows {
             return Err(std::io::Error::last_os_error().to_string());
         }
         let r = take_slot();
-        r.base.store(p as usize, Ordering::Release);
-        r.len.store(len, Ordering::Release);
-        r.busy.store(0, Ordering::Release);
+        r.base.store(p as usize, Ordering::Relaxed);
+        r.len.store(len, Ordering::Relaxed);
+        // Publishes base and len: the handler reads them only after seeing LIVE.
+        r.state.store(LIVE, Ordering::Release);
         Ok((p.cast(), r))
     }
 
     pub fn release(ptr: *mut u8, r: &'static Region) {
-        // Out of the list first, so the handler no longer commits anything here.
-        while r
-            .busy
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            std::hint::spin_loop();
-        }
-        r.len.store(0, Ordering::Release);
-        r.base.store(0, Ordering::Release);
+        // Out of the handler's sight first, so it commits nothing here any more. The
+        // owner is the only one to take a live slot back, and nothing touches its RAM
+        // while it is dropped.
+        r.state.store(CLAIMED, Ordering::Release);
         unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) };
-        r.busy.store(0, Ordering::Release);
+        r.len.store(0, Ordering::Relaxed);
+        r.base.store(0, Ordering::Relaxed);
+        r.state.store(FREE, Ordering::Release);
     }
 
     /// The region `addr` is in, as (base, len).
     fn region_of(addr: usize) -> Option<(usize, usize)> {
         let mut at = REGIONS.load(Ordering::Acquire);
         while let Some(r) = unsafe { at.as_ref() } {
-            if r.busy.load(Ordering::Acquire) == 0 {
-                let (base, len) = (r.base.load(Ordering::Acquire), r.len.load(Ordering::Acquire));
-                if len != 0 && addr >= base && addr - base < len {
+            if r.state.load(Ordering::Acquire) == LIVE {
+                let (base, len) = (r.base.load(Ordering::Relaxed), r.len.load(Ordering::Relaxed));
+                if addr >= base && addr - base < len {
                     return Some((base, len));
                 }
             }
@@ -404,6 +407,41 @@ mod tests {
         std::fs::write(&path, &fresh[COMMIT_CHUNK..]).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), vec![0; COMMIT_CHUNK]);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn first_touches_while_others_come_and_go() {
+        // Some threads make and drop RAMs all the time (looking for free slots, and
+        // freeing theirs), while others take first touches of RAM that stays: each
+        // touch must find its region whatever the others are doing to the list. (A
+        // version that locked each slot it looked at hid live regions from the handler
+        // for a moment, and a touch then crashed the process.)
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let mut ram = Ram::new(COMMIT_CHUNK).unwrap();
+                        ram[0] = 1;
+                    }
+                });
+            }
+            let touchers: Vec<_> = (0..4)
+                .map(|t| {
+                    s.spawn(move || {
+                        let mut ram = Ram::new(512 * COMMIT_CHUNK).unwrap();
+                        for chunk in 0..512 {
+                            ram[chunk * COMMIT_CHUNK + t] = chunk as u8;
+                        }
+                        (0..512).all(|chunk| ram[chunk * COMMIT_CHUNK + t] == chunk as u8)
+                    })
+                })
+                .collect();
+            for t in touchers {
+                assert!(t.join().unwrap());
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
     }
 
     #[test]
