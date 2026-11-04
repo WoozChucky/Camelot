@@ -670,6 +670,10 @@ mod tests {
             "rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0",
             "rv32iq2p0",
             "rv64e2p0",
+            // A version is an unsigned 32-bit number, leading zeros allowed.
+            "rv32i4294967295p0",
+            "rv32i2p4294967295",
+            "rv32i04294967295p00004294967295",
         ] {
             assert_eq!(check_isa(ok), Ok(()), "{ok}");
         }
@@ -691,6 +695,10 @@ mod tests {
             ("rv32i2p1_m2px", "failed to parse minor version number"),
             ("rv32i2p1_m2p99999999999", "failed to parse minor version number"),
             ("rv32i2p1_m99999999999p0", "failed to parse major version number"),
+            // Just past 2^32 - 1.
+            ("rv32i2p4294967296", "failed to parse minor version number"),
+            ("rv32i4294967296p0", "failed to parse major version number"),
+            ("rv64i2p1_m4294967296p0", "failed to parse major version number"),
             ("rv32i2p1_2p0", "missing extension name"),
             ("rv32i2p1_z2p0", "'z' must be followed by a letter"),
             ("rv32i2p1_s1p0", "'s' must be followed by a letter"),
