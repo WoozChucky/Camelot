@@ -21,9 +21,15 @@ use xtask::{kernel, repo_root, toolchain, userprogs};
 const PROMPT: &str = "$ ";
 
 /// The corpus: (name on the image, text); `big` adds merlin's assembly
-/// for the shell and the kernel's vm.c.
+/// for the shell and the kernel's vm.c. RV32 sources only: /bin/as writes
+/// RV32 until #157, so the RV64 ones (`<name>-rv64.s`, `<name>-rv64.S`)
+/// are left out, as merlin-as's RV64 references are.
 fn corpus(big: bool) -> Vec<(String, String)> {
     let root = repo_root();
+    let rv32 = |p: &PathBuf| {
+        !p.file_stem()
+            .is_some_and(|s| s.to_string_lossy().ends_with("-rv64"))
+    };
     let mut files: Vec<PathBuf> = vec![root.join("crates/merlin-as/tests/golden/encode.s")];
     for dir in [
         "kernel",
@@ -35,7 +41,7 @@ fn corpus(big: bool) -> Vec<(String, String)> {
         let mut more: Vec<PathBuf> = std::fs::read_dir(root.join(dir))
             .unwrap()
             .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|x| x == "s"))
+            .filter(|p| p.extension().is_some_and(|x| x == "s") && rv32(p))
             .collect();
         more.sort();
         files.extend(more);
@@ -46,7 +52,7 @@ fn corpus(big: bool) -> Vec<(String, String)> {
         if dir.is_dir() {
             for f in std::fs::read_dir(&dir).unwrap() {
                 let p = f.unwrap().path();
-                if p.extension().is_some_and(|x| x == "s" || x == "S") {
+                if p.extension().is_some_and(|x| x == "s" || x == "S") && rv32(&p) {
                     examples.push(p);
                 }
             }
