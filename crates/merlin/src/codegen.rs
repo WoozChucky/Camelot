@@ -2392,15 +2392,15 @@ impl<'a> FuncGen<'a, '_> {
     ///     beqz  t0, .L.shl.N
     ///     sll   a1, a2, a0       # n >= 32: hi = lo << (n - 32), lo = 0
     ///     li    a0, 0
-    ///     j     .L.shift.N
+    ///     j     .L.shift.M
     ///   .L.shl.N:                # n < 32
+    ///     not   t2, a0           # 31 - n, in its low 5 bits
     ///     sll   a1, a3, a0       # hi << n
     ///     srli  t1, a2, 1        # | lo >> (32 - n)
-    ///     not   t2, a0
     ///     srl   t1, t1, t2
     ///     or    a1, a1, t1
     ///     sll   a0, a2, a0       # lo << n
-    ///   .L.shift.N:
+    ///   .L.shift.M:
     /// ```
     fn pair_shift(&mut self, left: bool, unsigned: bool) {
         let small = self.new_label(if left { "shl" } else { "shr" });
