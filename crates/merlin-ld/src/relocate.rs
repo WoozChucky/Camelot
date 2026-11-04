@@ -17,8 +17,8 @@ use std::collections::HashSet;
 /// addresses of the sites whose symbol has no value (undefined, or in a
 /// section that is not loaded): that is reported once, at the `PCREL_HI20`,
 /// so the `PCREL_LO12` paired with it says nothing more.
-pub fn context(layout: &Layout) -> (Context, HashSet<u32>) {
-    let mut ctx = Context::default();
+pub fn context(layout: &Layout) -> (Context, HashSet<u64>) {
+    let mut ctx = Context::new(layout.class);
     let mut failed = HashSet::new();
     for os in &layout.sections {
         for i in &os.inputs {
@@ -80,7 +80,7 @@ pub fn relocate(layout: &Layout) -> Result<Images, Vec<Error>> {
 /// `/DISCARD/` threw away, or one not loaded) writes 0, as ld.lld does: the
 /// debug information of code that is gone points nowhere.
 fn debug(layout: &Layout, errors: &mut Vec<Error>) -> Vec<Vec<u8>> {
-    let ctx = Context::default();
+    let ctx = Context::new(layout.class);
     let mut images = Vec::new();
     for ds in &layout.debug {
         let mut img = vec![0; ds.size as usize];
@@ -102,8 +102,9 @@ fn debug(layout: &Layout, errors: &mut Vec<Error>) -> Vec<Vec<u8>> {
                     )));
                     continue;
                 }
+                // S = -A, modulo 2^64, so that S + A, the value written, is 0.
                 let sym = if layout.in_dropped_section(i.object, r.sym as usize) {
-                    Ok(0u32.wrapping_sub(r.addend as u32))
+                    Ok(0u64.wrapping_sub(r.addend as u64))
                 } else {
                     layout.reloc_symbol(i.object, r.sym as usize)
                 };

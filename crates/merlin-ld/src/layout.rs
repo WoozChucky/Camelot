@@ -22,9 +22,24 @@
 //! its name, the objects' in command-line order, as ld.lld does without a rule
 //! for them. Those sections have no address; a symbol in one is its offset
 //! there (see [`Layout::debug`]).
+//!
+//! ## Two widths
+//!
+//! The executable has the class of its objects ([`Layout::class`]): ELF32
+//! for RV32, ELF64 for RV64. Addresses and sizes are `u64` for both. What
+//! differs is how far they go and how the script computes:
+//!
+//! - ELF64 has the whole 64-bit address space, and script arithmetic is
+//!   `u64` modulo 2^64, as ld.lld's (`0 - 1` is `0xffff_ffff_ffff_ffff`). A
+//!   section may not run past 2^64 (ld.lld's `checkSections`: "exceeds
+//!   available address space").
+//! - ELF32 (RV32, until #159) has 4 GiB: the location counter, script
+//!   symbols, section ends, the MEMORY region and the entry point must stay
+//!   within it, and script arithmetic is exact (`i64`, an error on overflow).
+//!   ld.lld truncates such values to 32 bits; merlin-ld says what is wrong.
 
 use crate::object::{
-    self, Object, SHF_ALLOC, SHF_EXECINSTR, SHF_MERGE, SHF_STRINGS, SHF_WRITE, SHN_ABS, SHN_LORESERVE,
+    self, Class, Object, SHF_ALLOC, SHF_EXECINSTR, SHF_MERGE, SHF_STRINGS, SHF_WRITE, SHN_ABS, SHN_LORESERVE,
     SHN_UNDEF, STT_SECTION,
 };
 use crate::script::{self, Assign, Command, Expr, Item, Script};
@@ -38,13 +53,19 @@ pub const DEFAULT_SCRIPT_NAME: &str = "<default layout>";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputSection {
     pub name: String,
-    pub addr: u32,
-    pub size: u32,
+    /// The address the section runs at (its VMA).
+    pub addr: u64,
+    pub size: u64,
+    /// The address it is loaded at (its LMA, the segment's `p_paddr`); the
+    /// same as `addr` until a script sets one with `AT(...)`.
+    pub lma: u64,
+    /// The script gave this section its own `AT(...)`: it starts a segment.
+    pub at: bool,
     /// Largest alignment of its input sections.
     pub align: u32,
     /// `SHF_ALLOC` plus the union of the inputs' `SHF_WRITE` / `SHF_EXECINSTR`;
     /// without inputs, the flags of the previous section that had some.
-    pub flags: u32,
+    pub flags: u64,
     /// Occupies no file space (`.bss`): every input is `SHT_NOBITS`
     /// (and there is at least one), or the script says `(NOLOAD)`.
     pub nobits: bool,
@@ -59,7 +80,7 @@ pub struct InputRef {
     pub object: usize,
     /// ELF section index within that object.
     pub section: usize,
-    pub addr: u32,
+    pub addr: u64,
 }
 
 /// Where a global symbol's definition lives.
@@ -68,13 +89,13 @@ pub enum Def {
     /// `objects[obj].symbols[sym]`.
     Object { obj: usize, sym: usize },
     /// Assigned by the linker script.
-    Script(u32),
+    Script(u64),
 }
 
 /// Where an input section ended up.
 #[derive(Debug, Clone, Copy)]
 struct Placed {
-    addr: u32,
+    addr: u64,
     /// Index into [`Layout::sections`], or `None` if its output section was
     /// not created (a layout error).
     out: Option<usize>,
@@ -86,11 +107,11 @@ struct Placed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebugSection {
     pub name: String,
-    pub size: u32,
+    pub size: u64,
     pub align: u32,
     /// `SHF_MERGE | SHF_STRINGS` when every input has them (string tables).
-    pub flags: u32,
-    pub entsize: u32,
+    pub flags: u64,
+    pub entsize: u64,
     pub inputs: Vec<InputRef>,
 }
 
@@ -101,6 +122,8 @@ pub fn is_debug(sec: &object::Section) -> bool {
 
 #[derive(Debug)]
 pub struct Layout {
+    /// The class of the executable: its objects' (the first one's).
+    pub class: Class,
     pub objects: Vec<Object>,
     pub sections: Vec<OutputSection>,
     /// The debug sections, by name in the order the inputs first have them.
@@ -108,7 +131,7 @@ pub struct Layout {
     /// Defined globals in first-definition order. Script assignments override
     /// object definitions of the same name.
     pub globals: Vec<(String, Def)>,
-    pub entry: u32,
+    pub entry: u64,
     /// The entry symbol's name, unless the entry is a number or a fallback.
     pub entry_symbol: Option<String>,
     pub warnings: Vec<String>,
@@ -118,7 +141,7 @@ pub struct Layout {
     discarded: HashSet<(usize, usize)>,
     /// `(object, section)` of a debug input section: its offset in its
     /// output section.
-    debug_offsets: HashMap<(usize, usize), u32>,
+    debug_offsets: HashMap<(usize, usize), u64>,
     global_index: HashMap<String, usize>,
 }
 
@@ -126,13 +149,25 @@ fn err(msg: impl Into<String>) -> Error {
     Error(msg.into())
 }
 
-fn align_up(v: u64, a: u64) -> u64 {
-    v.div_ceil(a) * a
+/// `v` rounded up to a multiple of `a`; `None` if that is past 2^64 (only
+/// an ELF64 address near the top can get there).
+fn align_up(v: u64, a: u64) -> Option<u64> {
+    v.checked_next_multiple_of(a)
+}
+
+/// The address of a symbol `value` bytes into a section at `base`. ELF32
+/// (RV32, until #159): addresses are 32 bits and wrap at 4 GiB, as they
+/// always have in merlin-ld (a symbol defined far past its section's end).
+fn symbol_address(class: Class, base: u64, value: u64) -> u64 {
+    match class {
+        Class::Elf32 => u64::from((base as u32).wrapping_add(value as u32)),
+        Class::Elf64 => base.wrapping_add(value),
+    }
 }
 
 impl Layout {
     /// The final address of a global symbol (object- or script-defined).
-    pub fn symbol(&self, name: &str) -> Option<u32> {
+    pub fn symbol(&self, name: &str) -> Option<u64> {
         let &i = self.global_index.get(name)?;
         self.def_value(self.globals[i].1)
     }
@@ -141,7 +176,7 @@ impl Layout {
         self.sections.iter().find(|s| s.name == name)
     }
 
-    pub fn def_value(&self, d: Def) -> Option<u32> {
+    pub fn def_value(&self, d: Def) -> Option<u64> {
         match d {
             Def::Script(v) => Some(v),
             Def::Object { obj, sym } => self.object_symbol(obj, sym),
@@ -150,20 +185,20 @@ impl Layout {
 
     /// The address of a symbol defined in `obj`; `None` if it is undefined
     /// there or its section is not loaded.
-    pub fn object_symbol(&self, obj: usize, sym: usize) -> Option<u32> {
+    pub fn object_symbol(&self, obj: usize, sym: usize) -> Option<u64> {
         let s = &self.objects[obj].symbols[sym];
         match s.shndx {
             SHN_UNDEF => None,
             SHN_ABS => Some(s.value),
             sec => self
                 .section_base(obj, sec as usize)
-                .map(|a| a.wrapping_add(s.value)),
+                .map(|a| symbol_address(self.class, a, s.value)),
         }
     }
 
     /// Where an input section starts: its address if it is loaded, its
     /// offset in its output section if it is debug information.
-    fn section_base(&self, obj: usize, sec: usize) -> Option<u32> {
+    fn section_base(&self, obj: usize, sec: usize) -> Option<u64> {
         self.input_addr(obj, sec)
             .or_else(|| self.debug_offsets.get(&(obj, sec)).copied())
     }
@@ -178,7 +213,7 @@ impl Layout {
     }
 
     /// Address of an input section, if it was placed.
-    pub fn input_addr(&self, obj: usize, sec: usize) -> Option<u32> {
+    pub fn input_addr(&self, obj: usize, sec: usize) -> Option<u64> {
         self.placement.get(obj)?.get(sec)?.map(|p| p.addr)
     }
 
@@ -189,7 +224,7 @@ impl Layout {
     }
 
     /// S for a relocation in `obj` against its symbol `sym`.
-    pub fn reloc_symbol(&self, obj: usize, sym: usize) -> Result<u32, String> {
+    pub fn reloc_symbol(&self, obj: usize, sym: usize) -> Result<u64, String> {
         let o = &self.objects[obj];
         let s = &o.symbols[sym];
         if sym == 0 {
@@ -246,6 +281,7 @@ impl Layout {
 
 /// Mutable state while walking `SECTIONS`.
 struct Walker<'a> {
+    class: Class,
     script_name: &'a str,
     script: &'a Script,
     objects: &'a [Object],
@@ -263,27 +299,60 @@ impl Walker<'_> {
             .push(err(format!("{}:{line}: {}", self.script_name, msg.into())));
     }
 
-    fn eval(&self, e: &Expr, dot: u64) -> Result<i64, String> {
+    /// `a + b` in script arithmetic. ELF64: modulo 2^64, as ld.lld computes
+    /// (`. = 0xffffffff80000000 + 0x80000000` is 0). ELF32 (RV32, until #159):
+    /// the values are `i64`s (see [`Walker::eval`]) and the sum is exact, an
+    /// overflow an error.
+    fn add(&self, a: u64, b: u64) -> Result<u64, String> {
+        match self.class {
+            Class::Elf32 => (a as i64)
+                .checked_add(b as i64)
+                .map(|v| v as u64)
+                .ok_or("arithmetic overflow".into()),
+            Class::Elf64 => Ok(a.wrapping_add(b)),
+        }
+    }
+
+    /// `a - b`, as [`Walker::add`].
+    fn sub(&self, a: u64, b: u64) -> Result<u64, String> {
+        match self.class {
+            Class::Elf32 => (a as i64)
+                .checked_sub(b as i64)
+                .map(|v| v as u64)
+                .ok_or("arithmetic overflow".into()),
+            Class::Elf64 => Ok(a.wrapping_sub(b)),
+        }
+    }
+
+    /// The value of a script expression with the location counter at `dot`.
+    ///
+    /// The result is a `u64` on both classes. ELF64 reads it as one: a 64-bit
+    /// address, any of them. ELF32 (RV32, until #159) reads its bits as an
+    /// `i64` (`v as i64`), the type merlin-ld's RV32 scripts have always been
+    /// evaluated in: numbers up to `i64::MAX`, exact `+` and `-`, so `0 - 1`
+    /// is -1, which the uses then refuse (a backward location counter, a
+    /// symbol that does not fit in 32 bits) rather than wrap.
+    fn eval(&self, e: &Expr, dot: u64) -> Result<u64, String> {
         Ok(match e {
             Expr::Num(n) => *n,
-            Expr::Dot => dot as i64,
+            Expr::Dot => dot,
             Expr::Symbol(name) => {
-                let value =
-                    self.global_index
-                        .get(name)
-                        .and_then(|&i| match self.globals[i].1 {
-                            Def::Script(v) => Some(v),
-                            Def::Object { obj, sym } => {
-                                let s = &self.objects[obj].symbols[sym];
-                                match s.shndx {
-                                    SHN_ABS => Some(s.value),
-                                    sec => self.placement[obj][sec as usize]
-                                        .map(|p| p.addr.wrapping_add(s.value)),
-                                }
+                let value = self
+                    .global_index
+                    .get(name)
+                    .and_then(|&i| match self.globals[i].1 {
+                        Def::Script(v) => Some(v),
+                        Def::Object { obj, sym } => {
+                            let s = &self.objects[obj].symbols[sym];
+                            match s.shndx {
+                                SHN_ABS => Some(s.value),
+                                sec => self.placement[obj][sec as usize]
+                                    .map(|p| symbol_address(self.class, p.addr, s.value)),
                             }
-                        });
+                        }
+                    });
                 match value {
-                    Some(v) => v as i64,
+                    Some(v) => v,
                     None if self.global_index.contains_key(name) => {
                         return Err(format!("symbol '{name}' is used before its section is placed"))
                     }
@@ -292,27 +361,38 @@ impl Walker<'_> {
             }
             Expr::Align(n) => {
                 let n = self.eval(n, dot)?;
-                if n <= 0 {
-                    return Err(format!("ALIGN({n}): alignment must be positive"));
+                // ELF32 (RV32, until #159): a negative i64 is not an alignment either.
+                let positive = match self.class {
+                    Class::Elf32 => (n as i64) > 0,
+                    Class::Elf64 => n > 0,
+                };
+                if !positive {
+                    return Err(format!("ALIGN({}): alignment must be positive", self.show(n)));
                 }
-                align_up(dot, n as u64) as i64
+                // Only ELF64 can get past 2^64 (`. = ALIGN(16)` at
+                // 0xffff_ffff_ffff_fff8). ld.lld wraps to 0 and then reports a
+                // backward move; saying so here is clearer.
+                align_up(dot, n).ok_or("arithmetic overflow")?
             }
             Expr::Origin(r) | Expr::Length(r) => match &self.script.memory {
                 Some(m) if &m.name == r => match e {
-                    Expr::Origin(_) => m.origin as i64,
-                    _ => m.length as i64,
+                    Expr::Origin(_) => m.origin,
+                    _ => m.length,
                 },
                 _ => return Err(format!("unknown memory region '{r}'")),
             },
-            Expr::Add(a, b) => self
-                .eval(a, dot)?
-                .checked_add(self.eval(b, dot)?)
-                .ok_or("arithmetic overflow")?,
-            Expr::Sub(a, b) => self
-                .eval(a, dot)?
-                .checked_sub(self.eval(b, dot)?)
-                .ok_or("arithmetic overflow")?,
+            Expr::Add(a, b) => self.add(self.eval(a, dot)?, self.eval(b, dot)?)?,
+            Expr::Sub(a, b) => self.sub(self.eval(a, dot)?, self.eval(b, dot)?)?,
         })
+    }
+
+    /// A script value as a message shows it in decimal: signed on ELF32 (RV32,
+    /// until #159), where values are `i64`s, unsigned on ELF64.
+    fn show(&self, v: u64) -> String {
+        match self.class {
+            Class::Elf32 => (v as i64).to_string(),
+            Class::Elf64 => v.to_string(),
+        }
     }
 
     /// Runs one assignment. Returns the new location counter.
@@ -326,39 +406,49 @@ impl Walker<'_> {
         };
         match &a.symbol {
             None => {
-                let new = if a.add {
-                    (dot as i64).checked_add(v)
-                } else {
-                    Some(v)
+                let new = if a.add { self.add(dot, v) } else { Ok(v) };
+                let new = match new {
+                    Ok(new) => new,
+                    Err(e) => {
+                        self.script_err(a.line, e);
+                        return dot;
+                    }
                 };
-                let Some(new) = new else {
-                    self.script_err(a.line, "arithmetic overflow");
-                    return dot;
+                // ELF32 (RV32, until #159): compared as i64s, so a negative
+                // value (`. = 0 - 1`) is a move backward. On ELF64 a `. += n`
+                // that wraps past 2^64 comes out below `dot`, backward too.
+                let backward = match self.class {
+                    Class::Elf32 => (new as i64) < dot as i64,
+                    Class::Elf64 => new < dot,
                 };
-                if new < dot as i64 {
+                if backward {
                     self.script_err(
                         a.line,
                         format!("cannot move the location counter backward (from {dot:#x} to {new:#x})"),
                     );
                     return dot;
                 }
-                if new > 1 << 32 {
+                // ELF32 (RV32, until #159): 4 GiB of address space. `.` may be
+                // exactly 2^32, the end of a section that fills it.
+                if self.class == Class::Elf32 && new > 1 << 32 {
                     self.script_err(
                         a.line,
                         format!("location counter {new:#x} is past the 4 GiB address space"),
                     );
                     return dot;
                 }
-                new as u64
+                new
             }
             Some(name) => {
-                let Ok(v) = u32::try_from(v) else {
+                // ELF32 (RV32, until #159): a symbol's value is 32 bits (ld.lld
+                // would truncate it). Read as an i64, so -1 does not fit either.
+                if self.class == Class::Elf32 && u32::try_from(v as i64).is_err() {
                     self.script_err(
                         a.line,
                         format!("value {v:#x} of '{name}' does not fit in 32 bits"),
                     );
                     return dot;
-                };
+                }
                 // A script assignment overrides an object's definition (as in ld.lld).
                 match self.global_index.get(name) {
                     Some(&i) => self.globals[i].1 = Def::Script(v),
@@ -382,7 +472,7 @@ fn merge_warnings(layout: &Layout) -> Vec<String> {
     let mut warnings = Vec::new();
     for os in &layout.sections {
         // ld.lld merges within one output section, per (flags, entsize, align).
-        let mut seen: HashSet<(u32, u32, u32, &[u8])> = HashSet::new();
+        let mut seen: HashSet<(u64, u64, u32, &[u8])> = HashSet::new();
         let mut dup_bytes = 0usize;
         for i in &os.inputs {
             let sec = &layout.objects[i.object].sections[i.section];
@@ -436,13 +526,35 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
     if objects.is_empty() {
         return Err(vec![err("no input files")]);
     }
+    // The executable is of its objects' class (ld.lld needs no option for it
+    // either).
+    let class = objects[0].class;
 
-    // Script.
+    // Script. Its numbers and arithmetic depend on the class.
     let (script_name, src) = match &opts.script {
         Some(s) => (s.name.as_str(), s.text.as_str()),
         None => (DEFAULT_SCRIPT_NAME, script::DEFAULT_SCRIPT),
     };
-    let script = script::parse(src).map_err(|e| vec![err(format!("{script_name}:{e}"))])?;
+    let script = script::parse(src, class).map_err(|e| vec![err(format!("{script_name}:{e}"))])?;
+    // `OUTPUT_FORMAT(elf64-littleriscv)` with RV32 objects, or the other way
+    // round: every object of the other class is an error, ld.lld's
+    // `a.o is incompatible with elf32-littleriscv`.
+    if let Some(format) = script.format {
+        let wrong: Vec<Error> = objects
+            .iter()
+            .filter(|o| o.class != format)
+            .map(|o| {
+                err(format!(
+                    "{} is incompatible with {}",
+                    o.name,
+                    script::format_name(format)
+                ))
+            })
+            .collect();
+        if !wrong.is_empty() {
+            return Err(wrong);
+        }
+    }
 
     // 2. Globals.
     let mut globals: Vec<(String, Def)> = Vec::new();
@@ -539,6 +651,7 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
 
     // 4. Addresses.
     let mut w = Walker {
+        class,
         script_name,
         script: &script,
         objects: &objects,
@@ -553,13 +666,13 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
     // The location counter starts at 0, also with MEMORY (as in ld.lld): only
     // output sections go at the region's next free address.
     let mut dot: u64 = 0;
-    let mut cursor: Option<u64> = region.map(|r| r.origin as u64);
+    let mut cursor: Option<u64> = region.map(|r| r.origin);
     // Line of the last top-level `.` move since the previous output section.
     let mut dot_moved: Option<usize> = None;
     // Flags of the last output section that had input sections; an output
     // section without any inherits them (as in ld.lld).
     let mut prev_flags = SHF_ALLOC;
-    for (ci, cmd) in script.commands.iter().enumerate() {
+    'commands: for (ci, cmd) in script.commands.iter().enumerate() {
         match cmd {
             Command::Assign(a) => {
                 let before = dot;
@@ -590,23 +703,38 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                     .unwrap_or(1);
                 // `.name : ALIGN(n) { ... }`: at least n, like an input that
                 // aligned (ld.lld's sh_addralign is the larger of the two).
+                // At most 2^31 on both classes: ld.lld keeps a section's
+                // alignment in 32 bits on RV64 too, and ignores a larger one.
+                // (On ELF32 a negative i64 reads as a u64 far above 2^31.)
                 if let Some(e) = &o.align {
                     match w.eval(e, dot) {
-                        Ok(n) if n > 0 && (n as u64).is_power_of_two() && n <= 1 << 31 => {
-                            align = align.max(n as u32)
+                        Ok(n) if n.is_power_of_two() && n <= 1 << 31 => align = align.max(n as u32),
+                        Ok(n) => {
+                            let shown = w.show(n);
+                            w.script_err(
+                                o.line,
+                                format!(
+                                    "ALIGN({shown}) of section {}: alignment must be a power of two",
+                                    o.name
+                                ),
+                            )
                         }
-                        Ok(n) => w.script_err(
-                            o.line,
-                            format!(
-                                "ALIGN({n}) of section {}: alignment must be a power of two",
-                                o.name
-                            ),
-                        ),
                         Err(e) => w.script_err(o.line, e),
                     }
                 }
+                // A section, or an input in it, that would have to start past
+                // 2^64 to be aligned (only ELF64 gets that high).
+                let past_the_top = |at: u64, align: u32| {
+                    format!(
+                        "section {} exceeds available address space: {at:#x} aligned to {align:#x} is past 2^64",
+                        o.name
+                    )
+                };
                 let base = cursor.unwrap_or(dot);
-                let start = align_up(base, align as u64);
+                let Some(start) = align_up(base, align as u64) else {
+                    w.script_err(o.line, past_the_top(base, align));
+                    continue;
+                };
                 let mut d = start;
                 let mut inputs = Vec::new();
                 let mut flags = SHF_ALLOC;
@@ -616,17 +744,22 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                         Item::Input(_) => {
                             for &(oi, si) in &rules[ci][ii] {
                                 let sec = &objects[oi].sections[si];
-                                d = align_up(d, sec.align as u64);
-                                w.placement[oi][si] = Some(Placed {
-                                    addr: d as u32,
-                                    out: None,
-                                });
+                                let Some(at) = align_up(d, sec.align as u64) else {
+                                    w.script_err(o.line, past_the_top(d, sec.align));
+                                    continue 'commands;
+                                };
+                                d = at;
+                                w.placement[oi][si] = Some(Placed { addr: d, out: None });
                                 inputs.push(InputRef {
                                     object: oi,
                                     section: si,
-                                    addr: d as u32,
+                                    addr: d,
                                 });
-                                d += sec.size as u64;
+                                // Wrapping, as ld.lld's location counter: an
+                                // ELF64 section that runs past 2^64 is
+                                // reported once its size is known, below.
+                                // ELF32's `d` stays far below 2^64.
+                                d = d.wrapping_add(sec.size);
                                 flags |= sec.flags & (SHF_WRITE | SHF_EXECINSTR);
                                 nobits &= sec.is_nobits();
                             }
@@ -634,18 +767,35 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                         Item::Assign(a) => d = w.assign(a, d),
                     }
                 }
-                // `d` may be exactly 4 GiB (a section ending at the top of the
-                // address space), but the size must still fit in 32 bits.
-                let size = match u32::try_from(d - start) {
-                    Ok(size) if d <= 1 << 32 => size,
-                    _ => {
-                        w.script_err(
-                            o.line,
-                            format!("section {} extends past the 4 GiB address space", o.name),
-                        );
-                        continue;
+                let size = d.wrapping_sub(start);
+                match class {
+                    // ELF32 (RV32, until #159): `d` may be exactly 4 GiB (a
+                    // section ending at the top of the address space), but
+                    // the size must still fit in 32 bits.
+                    Class::Elf32 => {
+                        if size > u64::from(u32::MAX) || d > 1 << 32 {
+                            w.script_err(
+                                o.line,
+                                format!("section {} extends past the 4 GiB address space", o.name),
+                            );
+                            continue;
+                        }
                     }
-                };
+                    // ELF64: the section must end below 2^64, even exactly at
+                    // it is too far (ld.lld's checkSections).
+                    Class::Elf64 => {
+                        if start.checked_add(size).is_none() {
+                            w.script_err(
+                                o.line,
+                                format!(
+                                    "section {} at {start:#x} of size {size:#x} exceeds available address space",
+                                    o.name
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+                }
                 if inputs.is_empty() {
                     // Only assignments (`. += n`, symbols): like ld.lld, a
                     // PROGBITS section with the previous section's flags.
@@ -670,7 +820,8 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                             ),
                         );
                     }
-                    let end = r.origin as u64 + r.length as u64;
+                    // script::parse made sure this does not overflow.
+                    let end = r.origin + r.length;
                     if d > end {
                         w.script_err(
                             o.line,
@@ -690,8 +841,11 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                 }
                 w.sections.push(OutputSection {
                     name: o.name.clone(),
-                    addr: start as u32,
+                    addr: start,
                     size,
+                    // Loaded where it runs: merlin-ld has no AT(...) yet.
+                    lma: start,
+                    at: false,
                     align,
                     flags,
                     nobits,
@@ -730,7 +884,8 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
             if sec.flags & merge != out.flags || sec.entsize != out.entsize {
                 (out.flags, out.entsize) = (0, 0);
             }
-            let at = align_up(out.size as u64, sec.align as u64) as u32;
+            // Debug sections hold file contents: far below 2^64.
+            let at = align_up(out.size, sec.align as u64).expect("debug sections fit in 64 bits");
             out.align = out.align.max(sec.align);
             out.inputs.push(InputRef {
                 object: oi,
@@ -743,6 +898,7 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
     }
 
     let mut layout = Layout {
+        class,
         objects: Vec::new(),
         sections: w.sections,
         debug,
@@ -780,10 +936,13 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
         (None, Some(e)) => (e.clone(), false),
         (None, None) => ("_start".to_string(), false),
     };
-    if let Some(n) = script::parse_number(&entry) {
-        match u32::try_from(n) {
-            Ok(v) => layout.entry = v,
-            Err(_) => errors.push(err(format!("entry address {entry} does not fit in 32 bits"))),
+    if let Some(n) = script::parse_number(&entry, class) {
+        // ELF32 (RV32, until #159): e_entry is 32 bits (ld.lld would truncate
+        // it). ELF64 takes any address, `-e 0xffffffff80000000` too.
+        if class == Class::Elf32 && u32::try_from(n).is_err() {
+            errors.push(err(format!("entry address {entry} does not fit in 32 bits")));
+        } else {
+            layout.entry = n;
         }
     } else if let Some(v) = layout.symbol(&entry) {
         layout.entry = v;
@@ -798,8 +957,13 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
             .or(layout.sections.first())
             .map_or(0, |s| s.addr);
         layout.entry = fallback;
+        // An address as wide as the class's: 8 or 16 hex digits.
+        let shown = match class {
+            Class::Elf32 => format!("{fallback:#010x}"),
+            Class::Elf64 => format!("{fallback:#018x}"),
+        };
         layout.warnings.push(format!(
-            "cannot find entry symbol '{entry}'; defaulting to {fallback:#010x}"
+            "cannot find entry symbol '{entry}'; defaulting to {shown}"
         ));
     }
 

@@ -616,8 +616,8 @@ fn run(elf: &[u8]) -> (Machine, RunResult, String) {
     (m, r, out)
 }
 
-fn ram(m: &Machine, addr: u32, len: usize) -> &[u8] {
-    let off = (u64::from(addr) - grail::bus::RAM_BASE) as usize;
+fn ram(m: &Machine, addr: u64, len: usize) -> &[u8] {
+    let off = (addr - grail::bus::RAM_BASE) as usize;
     &m.cpu.bus.ram[off..off + len]
 }
 
@@ -668,8 +668,8 @@ fn default_layout() {
     assert_eq!(l.entry_symbol.as_deref(), Some("_start"));
     for w in l.sections.windows(2) {
         assert!(w[1].addr >= w[0].addr + w[0].size);
-        assert_eq!(w[1].addr % w[1].align, 0);
-        assert!(w[1].addr - (w[0].addr + w[0].size) < w[1].align);
+        assert_eq!(w[1].addr % u64::from(w[1].align), 0);
+        assert!(w[1].addr - (w[0].addr + w[0].size) < u64::from(w[1].align));
     }
     assert!(l.sections[3].nobits);
     let (m, r, out) = run(&linked.elf);
@@ -708,20 +708,20 @@ fn hello_layout_matches_ld_lld() {
     };
     let layout = merlin_ld::layout(&objs, &opts).unwrap();
     let lld = expected("hello/link");
-    let ours: Vec<(String, u32, u32, u32)> = layout
+    let ours: Vec<(String, u64, u64, u32)> = layout
         .sections
         .iter()
         .map(|s| (s.name.clone(), s.addr, s.size, s.align))
         .collect();
-    let theirs: Vec<(String, u32, u32, u32)> = lld
+    let theirs: Vec<(String, u64, u64, u32)> = lld
         .sections
         .iter()
-        .map(|s| (s.name.clone(), s.addr, s.size, s.align))
+        .map(|s| (s.name.clone(), s.addr.into(), s.size.into(), s.align))
         .collect();
     assert_eq!(ours, theirs);
-    assert_eq!(layout.entry, lld.entry);
+    assert_eq!(layout.entry, u64::from(lld.entry));
     for (name, value) in &lld.globals {
-        assert_eq!(layout.symbol(name), Some(*value), "{name}");
+        assert_eq!(layout.symbol(name), Some(u64::from(*value)), "{name}");
     }
     assert_eq!(layout.symbol("__stack_top"), Some(0x8001_0070));
 }
@@ -943,7 +943,7 @@ fn weak_reference_defined_elsewhere_reaches_the_definition() {
         .iter()
         .filter(|r| r.sym as usize == weak)
     {
-        let p = base + r.offset;
+        let p = u32::try_from(base + r.offset).unwrap();
         let to = match excalibur::decode(word(p), excalibur::Xlen::Rv32) {
             Inst::Jal { imm, .. } | Inst::Branch { imm, .. } => p.wrapping_add(imm as u32),
             Inst::Auipc { imm: hi, .. } => match excalibur::decode(word(p + 4), excalibur::Xlen::Rv32) {
@@ -953,7 +953,11 @@ fn weak_reference_defined_elsewhere_reaches_the_definition() {
             other => panic!("unexpected {other:?}"),
         };
         let ty = merlin_ld::reloc::name(r.ty);
-        assert_eq!(to, target, "{ty} at {p:#x} goes to {to:#x}, not lib_inc");
+        assert_eq!(
+            u64::from(to),
+            target,
+            "{ty} at {p:#x} goes to {to:#x}, not lib_inc"
+        );
         kinds.push(ty);
     }
     assert_eq!(kinds, ["R_RISCV_CALL_PLT", "R_RISCV_JAL", "R_RISCV_BRANCH"]);
@@ -1150,7 +1154,10 @@ fn relocation_stops_at_its_input_section() {
     let (_, opts) = case("relocs/link.ld");
     let layout = merlin_ld::layout(&objs, &opts).unwrap();
     let text = layout.section(".text").unwrap();
-    let next = text.inputs.iter().position(|i| i.addr == text.addr + size);
+    let next = text
+        .inputs
+        .iter()
+        .position(|i| i.addr == text.addr + u64::from(size));
     assert!(next.is_some(), "another input section follows .text.start");
     assert_eq!(
         errors(merlin_ld::link(&objs, &opts)),
@@ -1174,16 +1181,12 @@ fn data_word_relocations() {
     let linked = merlin_ld::link(&[obj(src)], &Options::default()).unwrap();
     let data = linked.layout.section(".data").unwrap();
     let elf = grail::elf::parse(&linked.elf).unwrap();
-    let seg = elf
-        .segments
-        .iter()
-        .find(|s| s.paddr == u64::from(data.addr))
-        .unwrap();
+    let seg = elf.segments.iter().find(|s| s.paddr == data.addr).unwrap();
     let words: Vec<u32> = seg.data[..16]
         .chunks(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    assert_eq!(words, [0x8000_0000, 0x8000_0008, 0, data.addr + 16]);
+    assert_eq!(words, [0x8000_0000, 0x8000_0008, 0, data.addr as u32 + 16]);
 
     // _start is at 0x80000004: one more than 0xffffffff.
     let errs = errors(merlin_ld::link(
@@ -1314,11 +1317,11 @@ fn locals_are_per_object() {
     assert_eq!(ram(&m, data.addr, 8), &[1, 0, 0, 0, 2, 0, 0, 0]);
     // Both are in the output .symtab, as locals, at their own addresses.
     let ours = read_ours(&linked.elf);
-    let counts: Vec<u32> = ours
+    let counts: Vec<u64> = ours
         .locals
         .iter()
         .filter(|(n, _)| n == "count")
-        .map(|&(_, v)| v)
+        .map(|&(_, v)| v.into())
         .collect();
     assert_eq!(counts, [data.addr, data.addr + 4]);
     assert!(!ours.globals.contains_key("count"));
@@ -2056,4 +2059,64 @@ gone:
     let seqs = &elf.line_tables().unwrap()[0].sequences;
     let starts: Vec<(u64, u32)> = seqs.iter().map(|s| (s.rows[0].addr, s.rows[0].line)).collect();
     assert_eq!(starts, [(0x1000, 1), (0, 7)]);
+}
+
+/// The same with the discarded code at an offset in its section: the line
+/// table's address is `.text.gone + 4`, a relocation with addend 4, and it
+/// still becomes 0 (ld.lld writes 0 whatever the addend).
+#[test]
+fn debug_information_of_discarded_code_with_an_addend_points_nowhere() {
+    let src = "        .file 0 \"src\" \"a.c\"
+        .text
+        .globl _start
+_start:
+        .loc 0 1 0
+        nop
+        .section .text.gone
+        nop
+gone:
+        .loc 0 7 0
+        nop
+";
+    let obj = Input {
+        name: "a.o".into(),
+        data: merlin_as::assemble_to_elf(src).unwrap(),
+    };
+    let parsed = merlin_ld::object::parse("a.o", &obj.data).unwrap();
+    let line = parsed.sections.iter().find(|s| s.name == ".debug_line").unwrap();
+    assert!(line.relocs.iter().any(|r| r.addend == 4), "{:?}", line.relocs);
+    let opts = script("SECTIONS { . = 0x1000; .text : { *(.text) } /DISCARD/ : { *(.text.gone) } }");
+    let linked = merlin_ld::link(&[obj], &opts).unwrap();
+    let elf = elf::Elf::parse(&linked.elf).unwrap();
+    let seqs = &elf.line_tables().unwrap()[0].sequences;
+    let starts: Vec<(u64, u32)> = seqs.iter().map(|s| (s.rows[0].addr, s.rows[0].line)).collect();
+    assert_eq!(starts, [(0x1000, 1), (0, 7)]);
+}
+
+/// OUTPUT_FORMAT names the class the objects must have: with RV32 objects,
+/// `elf64-littleriscv` makes every one of them an error, as in ld.lld
+/// (`a.o is incompatible with elf64-littleriscv`), and `elf32-littleriscv`
+/// links as without it.
+#[test]
+fn output_format_must_match_the_objects() {
+    let sections = "SECTIONS { . = 0x80000000; .text : { *(.text*) } .data : { *(.data* .rodata* .bss*) } }";
+    assert_eq!(
+        errors(merlin_ld::layout(
+            &norelocs(),
+            &script(&format!("OUTPUT_FORMAT(\"elf64-littleriscv\") {sections}"))
+        )),
+        [
+            "start.o is incompatible with elf64-littleriscv",
+            "data.o is incompatible with elf64-littleriscv",
+            "more.o is incompatible with elf64-littleriscv",
+        ]
+    );
+    let with = merlin_ld::link(
+        &norelocs(),
+        &script(&format!("OUTPUT_FORMAT(\"elf32-littleriscv\") {sections}")),
+    )
+    .unwrap();
+    let without = merlin_ld::link(&norelocs(), &script(sections)).unwrap();
+    assert_eq!(with.layout.class, elf::Class::Elf32);
+    assert_eq!(with.elf, without.elf);
 }

@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! OUTPUT_ARCH(riscv)                       optional; must say riscv
-//! OUTPUT_FORMAT("elf32-littleriscv")       optional; must say elf32-littleriscv
+//! OUTPUT_FORMAT("elf32-littleriscv")       optional; elf32-littleriscv or
+//!                                          elf64-littleriscv, the objects' class
 //! ENTRY(symbol)
 //! MEMORY { RAM (rwx) : ORIGIN = expr, LENGTH = expr }      at most one region
 //! SECTIONS
@@ -17,12 +18,24 @@
 //! Expressions: numbers (`16`, `0x80000000`, `64K`, `128M`), `.`, symbols,
 //! `ALIGN(n)`, `ORIGIN(region)`, `LENGTH(region)`, parentheses, `+` and `-`.
 //! Comments are `/* ... */`. Anything else is an error naming what was found.
+//!
+//! A script is read for the class of the objects it links ([`parse`] takes
+//! it). With ELF64 (RV64) objects, values are 64-bit addresses: numbers go up
+//! to 2^64 - 1 and `+` and `-` wrap modulo 2^64, as in ld.lld. With ELF32
+//! (RV32, until #159) they are exact `i64`s, as merlin-ld has always read
+//! them: numbers up to 2^63 - 1, an overflow is an error, and the 4 GiB
+//! address space is checked where a value is used (MEMORY here, the rest in
+//! [`crate::layout`]).
 
+use elf::Class;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Script {
     pub entry: Option<String>,
+    /// `OUTPUT_FORMAT(...)`'s first argument, which ld.lld goes by: the class
+    /// the objects must have.
+    pub format: Option<Class>,
     pub memory: Option<Region>,
     /// The contents of `SECTIONS`, in order.
     pub commands: Vec<Command>,
@@ -31,8 +44,10 @@ pub struct Script {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Region {
     pub name: String,
-    pub origin: u32,
-    pub length: u32,
+    /// `origin + length` does not overflow: [`parse`] checks it (within
+    /// 4 GiB on ELF32, within 2^64 on ELF64).
+    pub origin: u64,
+    pub length: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +102,8 @@ pub enum Item {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
-    Num(i64),
+    /// A number, as [`parse_number`] reads it for the script's class.
+    Num(u64),
     Dot,
     Symbol(String),
     Align(Box<Expr>),
@@ -243,8 +259,18 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, ScriptError> {
     Ok(toks)
 }
 
-/// Parses a number: decimal or `0x` hex, with an optional `K` or `M` suffix.
-pub fn parse_number(w: &str) -> Option<i64> {
+/// The `OUTPUT_FORMAT` name of a class: `elf32-littleriscv` or `elf64-littleriscv`.
+pub fn format_name(class: Class) -> &'static str {
+    match class {
+        Class::Elf32 => "elf32-littleriscv",
+        Class::Elf64 => "elf64-littleriscv",
+    }
+}
+
+/// Parses a number: decimal or `0x` hex, with an optional `K` or `M` suffix
+/// (ld.lld has no `G` either). ELF64 takes any `u64`; ELF32 (RV32, until
+/// #159) only values up to `i64::MAX`, the type its scripts are evaluated in.
+pub fn parse_number(w: &str, class: Class) -> Option<u64> {
     let (digits, mult) = match w.as_bytes().last()? {
         b'K' | b'k' => (&w[..w.len() - 1], 1024),
         b'M' | b'm' => (&w[..w.len() - 1], 1024 * 1024),
@@ -255,18 +281,23 @@ pub fn parse_number(w: &str) -> Option<i64> {
         if h.is_empty() || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
-        i64::from_str_radix(h, 16).ok()?
+        u64::from_str_radix(h, 16).ok()?
     } else if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-        digits.parse::<i64>().ok()?
+        digits.parse::<u64>().ok()?
     } else {
         return None;
     };
-    v.checked_mul(mult)
+    let v = v.checked_mul(mult)?;
+    match class {
+        Class::Elf32 => (v <= i64::MAX as u64).then_some(v),
+        Class::Elf64 => Some(v),
+    }
 }
 
 struct Parser {
     toks: Vec<(Tok, usize)>,
     pos: usize,
+    class: Class,
 }
 
 impl Parser {
@@ -325,6 +356,7 @@ impl Parser {
     fn script(&mut self) -> Result<Script, ScriptError> {
         let mut script = Script {
             entry: None,
+            format: None,
             memory: None,
             commands: Vec::new(),
         };
@@ -349,14 +381,24 @@ impl Parser {
                 }
                 "OUTPUT_FORMAT" => {
                     self.expect("(")?;
+                    // `OUTPUT_FORMAT(default, big, little)`: ld.lld goes by the
+                    // first; merlin-ld also wants the others to be names it knows.
                     loop {
                         let fmt = self.word_or_str("an output format")?;
-                        if fmt != "elf32-littleriscv" {
-                            return error(
-                                line,
-                                format!("OUTPUT_FORMAT({fmt}): only elf32-littleriscv is supported"),
-                            );
-                        }
+                        let class = match fmt.as_str() {
+                            "elf32-littleriscv" => Class::Elf32,
+                            "elf64-littleriscv" => Class::Elf64,
+                            _ => {
+                                return error(
+                                    line,
+                                    format!(
+                                        "OUTPUT_FORMAT({fmt}): only elf32-littleriscv and elf64-littleriscv \
+                                         are supported"
+                                    ),
+                                )
+                            }
+                        };
+                        script.format.get_or_insert(class);
                         if !self.eat(",") {
                             break;
                         }
@@ -404,14 +446,31 @@ impl Parser {
             let origin = self.region_field(&["ORIGIN", "org", "o"])?;
             self.expect(",")?;
             let length = self.region_field(&["LENGTH", "len", "l"])?;
-            let to_u32 = |v: i64, what: &str| {
-                u32::try_from(v)
-                    .or_else(|_| error(line, format!("MEMORY {what} {v:#x} does not fit in 32 bits")))
-            };
-            let origin = to_u32(origin, "ORIGIN")?;
-            let length = to_u32(length, "LENGTH")?;
-            if origin as u64 + length as u64 > 1 << 32 {
-                return error(line, format!("MEMORY region {name} extends past 4 GiB"));
+            match self.class {
+                // ELF32 (RV32, until #159): the region is within 4 GiB, said
+                // here with its line. The values are i64s (`o = 0 - 1` is -1).
+                Class::Elf32 => {
+                    let to_u32 = |v: u64, what: &str| {
+                        let v = v as i64;
+                        u32::try_from(v)
+                            .or_else(|_| error(line, format!("MEMORY {what} {v:#x} does not fit in 32 bits")))
+                    };
+                    let (o, l) = (to_u32(origin, "ORIGIN")?, to_u32(length, "LENGTH")?);
+                    if o as u64 + l as u64 > 1 << 32 {
+                        return error(line, format!("MEMORY region {name} extends past 4 GiB"));
+                    }
+                }
+                // ELF64: the region ends below 2^64. ld.lld computes its end
+                // modulo 2^64, so one that reaches 2^64 ends at 0 and no
+                // section fits in it; an error here says why.
+                Class::Elf64 => {
+                    if origin.checked_add(length).is_none() {
+                        return error(
+                            line,
+                            format!("MEMORY region {name} extends past the 64-bit address space"),
+                        );
+                    }
+                }
             }
             region = Some(Region { name, origin, length });
         }
@@ -419,7 +478,7 @@ impl Parser {
     }
 
     /// `ORIGIN = constant-expr`.
-    fn region_field(&mut self, names: &[&str]) -> Result<i64, ScriptError> {
+    fn region_field(&mut self, names: &[&str]) -> Result<u64, ScriptError> {
         let line = self.line();
         let w = self.word(names[0])?;
         if !names.contains(&w.as_str()) {
@@ -427,7 +486,7 @@ impl Parser {
         }
         self.expect("=")?;
         let e = self.expr()?;
-        const_eval(&e).ok_or_else(|| ScriptError {
+        const_eval(&e, self.class).ok_or_else(|| ScriptError {
             line,
             msg: format!("{} must be a constant expression", names[0]),
         })
@@ -619,10 +678,12 @@ impl Parser {
             return Ok(Expr::Dot);
         }
         if w.as_bytes()[0].is_ascii_digit() {
-            return parse_number(&w).map(Expr::Num).ok_or_else(|| ScriptError {
-                line,
-                msg: format!("bad number '{w}'"),
-            });
+            return parse_number(&w, self.class)
+                .map(Expr::Num)
+                .ok_or_else(|| ScriptError {
+                    line,
+                    msg: format!("bad number '{w}'"),
+                });
         }
         if !self.is("(") {
             if w.contains(['*', '?']) {
@@ -648,19 +709,30 @@ impl Parser {
     }
 }
 
-/// Evaluates an expression made only of numbers.
-fn const_eval(e: &Expr) -> Option<i64> {
-    match e {
-        Expr::Num(n) => Some(*n),
-        Expr::Add(a, b) => const_eval(a)?.checked_add(const_eval(b)?),
-        Expr::Sub(a, b) => const_eval(a)?.checked_sub(const_eval(b)?),
-        _ => None,
+/// Evaluates an expression made only of numbers, with the class's
+/// arithmetic: modulo 2^64 on ELF64, exact `i64` on ELF32 (RV32, until #159),
+/// where an overflow makes it no constant.
+fn const_eval(e: &Expr, class: Class) -> Option<u64> {
+    let (a, b) = match e {
+        Expr::Num(n) => return Some(*n),
+        Expr::Add(a, b) | Expr::Sub(a, b) => (const_eval(a, class)?, const_eval(b, class)?),
+        _ => return None,
+    };
+    let add = matches!(e, Expr::Add(..));
+    match class {
+        Class::Elf32 => {
+            let (a, b) = (a as i64, b as i64);
+            let v = if add { a.checked_add(b) } else { a.checked_sub(b) };
+            v.map(|v| v as u64)
+        }
+        Class::Elf64 => Some(if add { a.wrapping_add(b) } else { a.wrapping_sub(b) }),
     }
 }
 
-pub fn parse(src: &str) -> Result<Script, ScriptError> {
+/// Parses a linker script for objects of class `class`.
+pub fn parse(src: &str, class: Class) -> Result<Script, ScriptError> {
     let toks = lex(src)?;
-    let script = Parser { toks, pos: 0 }.script()?;
+    let script = Parser { toks, pos: 0, class }.script()?;
     // `> REGION` must name the region, and only when there is one.
     for c in &script.commands {
         if let Command::Output(o) = c {
@@ -723,13 +795,13 @@ mod tests {
     use super::*;
 
     fn err(src: &str) -> String {
-        parse(src).unwrap_err().to_string()
+        parse(src, Class::Elf32).unwrap_err().to_string()
     }
 
     #[test]
     fn parses_hello_link_ld() {
         let src = include_str!("../../../examples/hello/link.ld");
-        let s = parse(src).unwrap();
+        let s = parse(src, Class::Elf32).unwrap();
         assert_eq!(s.entry.as_deref(), Some("_start"));
         assert_eq!(
             s.memory,
@@ -794,7 +866,7 @@ mod tests {
     #[test]
     fn parses_the_kernels_script() {
         // kernel/kernel.ld: ALIGN(n) after the colon, NOLOAD, /DISCARD/.
-        let s = parse(include_str!("../../../kernel/kernel.ld")).unwrap();
+        let s = parse(include_str!("../../../kernel/kernel.ld"), Class::Elf32).unwrap();
         let outs: Vec<&OutputDesc> = s
             .commands
             .iter()
@@ -831,30 +903,92 @@ mod tests {
         assert_eq!(outs[0].region.as_deref(), Some("RAM"));
         assert_eq!(outs[5].region, None);
         // `/DISCARD/` reads as one word wherever it is.
-        let s = parse("SECTIONS{/DISCARD/:{*(.x)}}").unwrap();
+        let s = parse("SECTIONS{/DISCARD/:{*(.x)}}", Class::Elf32).unwrap();
         assert!(matches!(&s.commands[0], Command::Output(o) if o.is_discard()));
     }
 
     #[test]
     fn default_script_parses() {
-        let s = parse(DEFAULT_SCRIPT).unwrap();
+        let s = parse(DEFAULT_SCRIPT, Class::Elf32).unwrap();
         assert_eq!(s.commands.len(), 5);
         assert!(s.memory.is_none());
     }
 
     #[test]
     fn numbers() {
-        assert_eq!(parse_number("16"), Some(16));
-        assert_eq!(parse_number("0x80000000"), Some(0x8000_0000));
-        assert_eq!(parse_number("64K"), Some(65536));
-        assert_eq!(parse_number("128M"), Some(128 << 20));
-        assert_eq!(parse_number("0x10K"), Some(16 * 1024));
-        assert_eq!(parse_number("12a"), None);
-        assert_eq!(parse_number("K"), None);
+        assert_eq!(parse_number("16", Class::Elf32), Some(16));
+        assert_eq!(parse_number("0x80000000", Class::Elf32), Some(0x8000_0000));
+        assert_eq!(parse_number("64K", Class::Elf32), Some(65536));
+        assert_eq!(parse_number("128M", Class::Elf32), Some(128 << 20));
+        assert_eq!(parse_number("0x10K", Class::Elf32), Some(16 * 1024));
+        assert_eq!(parse_number("12a", Class::Elf32), None);
+        assert_eq!(parse_number("K", Class::Elf32), None);
         // No sign after 0x (an -e argument can have one; script words can't).
-        assert_eq!(parse_number("0x+10"), None);
-        assert_eq!(parse_number("0x-10"), None);
-        assert_eq!(parse_number("0x"), None);
+        assert_eq!(parse_number("0x+10", Class::Elf32), None);
+        assert_eq!(parse_number("0x-10", Class::Elf32), None);
+        assert_eq!(parse_number("0x", Class::Elf32), None);
+    }
+
+    #[test]
+    fn numbers_per_class() {
+        // ELF64: every u64, and nothing past it.
+        let n64 = |w| parse_number(w, Class::Elf64);
+        assert_eq!(n64("0xffffffff80000000"), Some(0xffff_ffff_8000_0000));
+        assert_eq!(n64("0xffffffffffffffff"), Some(u64::MAX));
+        assert_eq!(n64("18446744073709551615"), Some(u64::MAX));
+        assert_eq!(n64("0x10000000000000000"), None);
+        assert_eq!(n64("0x4000000000000000K"), None);
+        assert_eq!(n64("16M"), Some(16 << 20));
+        // No G suffix, as in ld.lld (`malformed number: 1G`).
+        assert_eq!(n64("1G"), None);
+        // ELF32 (RV32): up to i64::MAX, the type its scripts compute in.
+        assert_eq!(
+            parse_number("0x7fffffffffffffff", Class::Elf32),
+            Some(i64::MAX as u64)
+        );
+        assert_eq!(parse_number("0x8000000000000000", Class::Elf32), None);
+        assert_eq!(parse_number("0x20000000000000K", Class::Elf32), None);
+        let e = parse("SECTIONS { . = 0x10000000000000000; }", Class::Elf64).unwrap_err();
+        assert_eq!(e.to_string(), "1: bad number '0x10000000000000000'");
+        let e = parse("SECTIONS { . = 1G; }", Class::Elf64).unwrap_err();
+        assert_eq!(e.to_string(), "1: bad number '1G'");
+    }
+
+    #[test]
+    fn elf64_memory_regions() {
+        // ELF64 constants wrap modulo 2^64, as ld.lld computes: 0 - 0x80000000
+        // is the top 2 GiB, where a higher-half kernel links.
+        let s = parse("MEMORY { RAM : o = 0 - 0x80000000, l = 128M }", Class::Elf64).unwrap();
+        let m = s.memory.unwrap();
+        assert_eq!((m.origin, m.length), (0xffff_ffff_8000_0000, 128 << 20));
+        // Up to the last byte below 2^64, but not to 2^64 itself.
+        parse(
+            "MEMORY { RAM : o = 0xffffffff80000000, l = 0x7fffffff }",
+            Class::Elf64,
+        )
+        .unwrap();
+        let e = parse(
+            "\nMEMORY { RAM : o = 0xffffffff80000000, l = 0x80000000 }",
+            Class::Elf64,
+        )
+        .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "2: MEMORY region RAM extends past the 64-bit address space"
+        );
+        // No 4 GiB limit on ELF64.
+        parse("MEMORY { RAM : o = 0x100000000, l = 0x100000000 }", Class::Elf64).unwrap();
+        // ELF32 (RV32) keeps it, and reads 0 - 1 as -1.
+        assert!(parse("MEMORY { RAM : o = 0x100000000, l = 1 }", Class::Elf32)
+            .unwrap_err()
+            .to_string()
+            .contains("MEMORY ORIGIN 0x100000000 does not fit in 32 bits"));
+        assert_eq!(
+            parse("MEMORY { RAM : o = 0 - 1, l = 1 }", Class::Elf32)
+                .unwrap_err()
+                .to_string(),
+            "1: MEMORY ORIGIN 0xffffffffffffffff does not fit in 32 bits"
+        );
     }
 
     #[test]
@@ -862,6 +996,7 @@ mod tests {
         let s = parse(
             "/* header\n comment */ MEMORY { ram : org = 0x1000 + 0x10, len = 2K - 16 }\n\
              SECTIONS { top = ORIGIN(ram) + LENGTH(ram) - (4 + 4); . = ALIGN(8) ; }",
+            Class::Elf32,
         )
         .unwrap();
         let m = s.memory.unwrap();
@@ -885,9 +1020,28 @@ mod tests {
 
     #[test]
     fn quoted_arch_and_format() {
-        parse("OUTPUT_ARCH( \"riscv\" ) OUTPUT_FORMAT(\"elf32-littleriscv\")").unwrap();
+        let s = parse(
+            "OUTPUT_ARCH( \"riscv\" ) OUTPUT_FORMAT(\"elf32-littleriscv\")",
+            Class::Elf32,
+        )
+        .unwrap();
+        assert_eq!(s.format, Some(Class::Elf32));
         assert!(err("OUTPUT_ARCH(i386)").contains("only riscv"));
-        assert!(err("OUTPUT_FORMAT(\"elf64-littleriscv\")").contains("elf32-littleriscv"));
+        // Either class is recorded, whatever the objects' (the layout
+        // compares them); the first argument is the one that counts.
+        let s = parse("OUTPUT_FORMAT(\"elf64-littleriscv\")", Class::Elf32).unwrap();
+        assert_eq!(s.format, Some(Class::Elf64));
+        let s = parse(
+            "OUTPUT_FORMAT(\"elf64-littleriscv\", \"elf32-littleriscv\", \"elf64-littleriscv\")",
+            Class::Elf64,
+        )
+        .unwrap();
+        assert_eq!(s.format, Some(Class::Elf64));
+        assert_eq!(parse("ENTRY(_start)", Class::Elf32).unwrap().format, None);
+        assert_eq!(
+            err("OUTPUT_FORMAT(\"elf32-littleriscv\", \"elf64-bigriscv\")"),
+            "1: OUTPUT_FORMAT(elf64-bigriscv): only elf32-littleriscv and elf64-littleriscv are supported"
+        );
     }
 
     #[test]
@@ -978,7 +1132,11 @@ mod tests {
 
     #[test]
     fn error_lines() {
-        let e = parse("ENTRY(_start)\n\nSECTIONS {\n  .text : { FOO(*) }\n}").unwrap_err();
+        let e = parse(
+            "ENTRY(_start)\n\nSECTIONS {\n  .text : { FOO(*) }\n}",
+            Class::Elf32,
+        )
+        .unwrap_err();
         assert_eq!(e.line, 4);
     }
 

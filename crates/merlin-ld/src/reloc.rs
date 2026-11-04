@@ -57,6 +57,7 @@
 //! is taken modulo 2^32 and is never out of range (ld.lld does the same on
 //! RV32). Only `R_RISCV_32`, `BRANCH` and `JAL` can overflow.
 
+use elf::Class;
 use std::collections::HashMap;
 
 pub const R_RISCV_NONE: u32 = 0;
@@ -87,17 +88,30 @@ pub fn name(ty: u32) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HiSite {
     /// S: the HI20's symbol address.
-    pub sym: u32,
+    pub sym: u64,
     /// A: the HI20's addend.
-    pub addend: i32,
+    pub addend: i64,
 }
 
 /// Link-wide facts a single relocation may need beyond its own fields.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Context {
+    /// The class of the executable: ELF32 (RV32) or ELF64 (RV64), whose
+    /// instructions compute addresses in 32 or 64 bits.
+    pub class: Class,
     /// Every `R_RISCV_PCREL_HI20` in the link, keyed by its place (the `auipc`'s
     /// address). The HI20's P is the key itself.
-    pub pcrel_hi20: HashMap<u32, HiSite>,
+    pub pcrel_hi20: HashMap<u64, HiSite>,
+}
+
+impl Context {
+    /// The context of a link of `class` objects, with no PCREL_HI20 sites yet.
+    pub fn new(class: Class) -> Context {
+        Context {
+            class,
+            pcrel_hi20: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,15 +238,20 @@ fn check_offset(value: i64, bits: u32) -> Result<u32, RelocError> {
 }
 
 /// Patches `bytes` for one relocation. See the module documentation.
+///
+/// `place`, `sym` and `addend` are P, S and A at ELF64's widths. On RV32 P
+/// and S are below 2^32 and A is a 32-bit addend, so the `i64` arithmetic
+/// below is exact. (A debug relocation against discarded code has S = -A, as
+/// a `u64`: see [`crate::relocate`].)
 pub fn apply(
     ty: u32,
-    place: u32,
-    sym: u32,
-    addend: i32,
+    place: u64,
+    sym: u64,
+    addend: i64,
     bytes: &mut [u8],
     ctx: &Context,
 ) -> Result<(), RelocError> {
-    let (s, a, p) = (sym as i64, addend as i64, place as i64);
+    let (s, a, p) = (sym as i64, addend, place as i64);
 
     // How many bytes each type patches; check them before touching anything.
     let need = match ty {
@@ -306,7 +325,7 @@ pub fn apply(
                 return Err(RelocError::PcrelLo12Addend);
             }
             let hi = ctx.pcrel_hi20.get(&sym).ok_or(RelocError::MissingPcrelHi20)?;
-            let value = (hi.sym as i64 + hi.addend as i64 - s) as u32;
+            let value = (hi.sym as i64 + hi.addend - s) as u32;
             if ty == R_RISCV_PCREL_LO12_I {
                 set_i(inst, lo12(value))
             } else {
@@ -342,7 +361,7 @@ mod tests {
     const JALR_RA: u32 = 0x0000_80e7; // jalr  ra, 0(ra)
 
     fn run(ty: u32, place: u32, sym: u32, addend: i32, words: &[u32]) -> Result<Vec<u32>, RelocError> {
-        run_ctx(ty, place, sym, addend, words, &Context::default())
+        run_ctx(ty, place, sym, addend, words, &Context::new(Class::Elf32))
     }
 
     fn run_ctx(
@@ -355,7 +374,7 @@ mod tests {
     ) -> Result<Vec<u32>, RelocError> {
         let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let before = bytes.clone();
-        let r = apply(ty, place, sym, addend, &mut bytes, ctx);
+        let r = apply(ty, place.into(), sym.into(), addend.into(), &mut bytes, ctx);
         if r.is_err() {
             assert_eq!(bytes, before, "a failed relocation must not write");
         }
@@ -539,8 +558,14 @@ mod tests {
             (0x0000_1000, 0xffff_f800, 0),
         ] {
             let w = run(R_RISCV_PCREL_HI20, auipc, s, a, &[AUIPC_A0]).unwrap();
-            let mut ctx = Context::default();
-            ctx.pcrel_hi20.insert(auipc, HiSite { sym: s, addend: a });
+            let mut ctx = Context::new(Class::Elf32);
+            ctx.pcrel_hi20.insert(
+                auipc.into(),
+                HiSite {
+                    sym: s.into(),
+                    addend: a.into(),
+                },
+            );
             let lo_i = run_ctx(R_RISCV_PCREL_LO12_I, auipc + 4, auipc, 0, &[ADDI_A0], &ctx).unwrap();
             let lo_s = run_ctx(R_RISCV_PCREL_LO12_S, auipc + 8, auipc, 0, &[SW_A1_A0], &ctx).unwrap();
             let target = s.wrapping_add(a as u32);
@@ -559,7 +584,7 @@ mod tests {
     fn pcrel_lo12_uses_the_hi20_not_its_own_place() {
         // The addi is far from the auipc (after a loop, say): its own P must
         // not enter the computation.
-        let mut ctx = Context::default();
+        let mut ctx = Context::new(Class::Elf32);
         ctx.pcrel_hi20.insert(
             0x8000_0000,
             HiSite {
@@ -634,7 +659,7 @@ mod tests {
             [0xffff_ffff]
         );
         assert_eq!(
-            apply(R_RISCV_RELAX, 0, 0, 0, &mut [], &Context::default()),
+            apply(R_RISCV_RELAX, 0, 0, 0, &mut [], &Context::new(Class::Elf32)),
             Ok(())
         );
         assert_eq!(run(R_RISCV_NONE, 0, 0, 0, &[7]).unwrap(), [7]);
@@ -658,7 +683,7 @@ mod tests {
         );
         let mut two = [0u8; 2];
         assert_eq!(
-            apply(R_RISCV_32, 0, 0, 0, &mut two, &Context::default()),
+            apply(R_RISCV_32, 0, 0, 0, &mut two, &Context::new(Class::Elf32)),
             Err(RelocError::Truncated { need: 4, have: 2 })
         );
     }

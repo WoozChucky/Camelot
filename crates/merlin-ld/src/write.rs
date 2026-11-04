@@ -18,6 +18,11 @@
 //! segment does not split at address gaps or after a NOBITS section: the file
 //! holds zeros for those bytes and `p_filesz` runs to the last section with
 //! file contents. A segment holding only empty sections is dropped.
+//!
+//! The layout's addresses and sizes are `u64`; this writer makes ELF32 files
+//! only (the class of every object merlin-ld reads so far), whose fields
+//! are 32 bits. The layout keeps an ELF32 link below 4 GiB, so each `as u32`
+//! below marked "ELF32" loses nothing.
 
 use crate::layout::{Def, Layout};
 use crate::object::{
@@ -25,7 +30,7 @@ use crate::object::{
 };
 use crate::relocate::Images;
 
-pub const PAGE: u32 = 0x1000;
+pub const PAGE: u64 = 0x1000;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
@@ -40,15 +45,15 @@ const EM_RISCV: u16 = 243;
 /// A `PT_LOAD` segment: a run of output sections.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
-    pub vaddr: u32,
-    pub filesz: u32,
-    pub memsz: u32,
+    pub vaddr: u64,
+    pub filesz: u64,
+    pub memsz: u64,
     pub flags: u32,
     /// Indices into [`Layout::sections`].
     pub sections: Vec<usize>,
 }
 
-fn pflags(shflags: u32) -> u32 {
+fn pflags(shflags: u64) -> u32 {
     let mut f = PF_R;
     if shflags & SHF_WRITE != 0 {
         f |= PF_W;
@@ -68,9 +73,9 @@ pub fn segments(layout: &Layout) -> Vec<Segment> {
             None => true,
             Some(seg) => {
                 let prev = &layout.sections[*seg.sections.last().unwrap()];
-                let prev_end = prev.addr as u64 + prev.size as u64;
+                let prev_end = prev.addr + prev.size;
                 // Going backward can't be one segment.
-                seg.flags != flags || (s.addr as u64) < prev_end
+                seg.flags != flags || s.addr < prev_end
             }
         };
         if start_new {
@@ -137,10 +142,11 @@ fn symtab(layout: &Layout, strtab: &mut StrTab) -> (Vec<u8>, u32) {
                 .map_or(SHN_ABS, |o| o as u16 + 1),
         )
     };
-    let mut entry = |out: &mut Vec<u8>, name: &str, value: u32, size: u32, info: u8, shndx: u16| {
+    let mut entry = |out: &mut Vec<u8>, name: &str, value: u64, size: u64, info: u8, shndx: u16| {
         put32(out, strtab.add(name));
-        put32(out, value);
-        put32(out, size);
+        // ELF32: layout guarantees < 2^32 (symbol values and sizes).
+        put32(out, value as u32);
+        put32(out, size as u32);
         out.push(info);
         out.push(0);
         put16(out, shndx);
@@ -185,11 +191,11 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
     let mut out = vec![0u8; phoff + 32 * segs.len()];
 
     // Segment contents.
-    let mut sec_offset = vec![0u32; layout.sections.len()];
+    let mut sec_offset = vec![0u64; layout.sections.len()];
     let mut seg_offset = Vec::with_capacity(segs.len());
     for seg in &segs {
         // Smallest offset >= current end with offset ≡ vaddr (mod PAGE).
-        let cur = out.len() as u32;
+        let cur = out.len() as u64;
         let want = seg.vaddr % PAGE;
         let off = cur + (want + PAGE - cur % PAGE) % PAGE;
         pad_to(&mut out, off as usize);
@@ -206,15 +212,16 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
     }
     for (i, seg) in segs.iter().enumerate() {
         let mut ph = Vec::with_capacity(32);
+        // ELF32: layout guarantees < 2^32 (offsets, addresses and sizes).
         for v in [
             PT_LOAD,
-            seg_offset[i],
-            seg.vaddr,
-            seg.vaddr,
-            seg.filesz,
-            seg.memsz,
+            seg_offset[i] as u32,
+            seg.vaddr as u32,
+            seg.vaddr as u32,
+            seg.filesz as u32,
+            seg.memsz as u32,
             seg.flags,
-            PAGE,
+            PAGE as u32,
         ] {
             put32(&mut ph, v);
         }
@@ -237,16 +244,17 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
         out.extend_from_slice(img);
     }
 
-    // Section headers.
+    // Section headers. ELF32: layout guarantees < 2^32 (flags, addresses,
+    // offsets and sizes).
     let mut shdrs: Vec<[u32; 10]> = vec![[0; 10]];
     for (i, s) in layout.sections.iter().enumerate() {
         shdrs.push([
             shstrtab.add(&s.name),
             if s.nobits { SHT_NOBITS } else { SHT_PROGBITS },
-            s.flags,
-            s.addr,
-            sec_offset[i],
-            s.size,
+            s.flags as u32,
+            s.addr as u32,
+            sec_offset[i] as u32,
+            s.size as u32,
             0,
             0,
             s.align,
@@ -282,14 +290,14 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
         shdrs.push([
             shstrtab.add(&ds.name),
             SHT_PROGBITS,
-            ds.flags,
+            ds.flags as u32,
             0,
             off,
-            ds.size,
+            ds.size as u32,
             0,
             0,
             ds.align,
-            ds.entsize,
+            ds.entsize as u32,
         ]);
     }
     let shstrtab_name = shstrtab.add(".shstrtab");
@@ -322,7 +330,7 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
     put16(&mut hdr, ET_EXEC);
     put16(&mut hdr, EM_RISCV);
     put32(&mut hdr, 1); // e_version
-    put32(&mut hdr, layout.entry);
+    put32(&mut hdr, layout.entry as u32); // ELF32: layout guarantees < 2^32
     put32(&mut hdr, if segs.is_empty() { 0 } else { phoff as u32 });
     put32(&mut hdr, shoff);
     put32(&mut hdr, 0); // e_flags: ilp32 soft-float, no RVC

@@ -4,38 +4,43 @@
 //!
 //! Sections and symbols keep their ELF indices, so a relocation's symbol index
 //! and a symbol's `st_shndx` can be used directly.
+//!
+//! Sizes, flags, symbol values, relocation offsets and addends are held at
+//! ELF64's widths (`u64`, `i64`), whatever the class of the file, so the rest
+//! of the linker has one set of types for RV32 and RV64; an ELF32 file's
+//! fields are zero-extended (sign-extended for the addend). The class itself
+//! is kept in [`Object::class`].
 
 // The ELF constants, the elf crate's (shared with merlin-objdump, and generated into
-// the C linker's tables by crates/xtask/src/c_tables.rs).
+// the C linker's tables by crates/xtask/src/c_tables.rs). Its section flags are 8
+// bytes, the size of ELF64's sh_flags, as Section::flags is.
 pub use elf::{
-    EM_RISCV, ET_REL, SHN_ABS, SHN_COMMON, SHN_LORESERVE, SHN_UNDEF, SHT_GROUP, SHT_NOBITS, SHT_NULL,
-    SHT_PROGBITS, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB, SHT_SYMTAB_SHNDX, STB_GLOBAL, STB_LOCAL,
-    STB_WEAK, STT_FILE, STT_NOTYPE, STT_SECTION, STT_TLS,
+    Class, EM_RISCV, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHF_GROUP, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE,
+    SHN_ABS, SHN_COMMON, SHN_LORESERVE, SHN_UNDEF, SHT_GROUP, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL,
+    SHT_RELA, SHT_STRTAB, SHT_SYMTAB, SHT_SYMTAB_SHNDX, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE,
+    STT_NOTYPE, STT_SECTION, STT_TLS,
 };
 
-// The section flags merlin-ld uses. The elf crate's are 8 bytes, the size of
-// ELF64's sh_flags; ELF32's, the class merlin-ld reads and writes, is 4.
-pub const SHF_WRITE: u32 = elf::SHF_WRITE as u32;
-pub const SHF_ALLOC: u32 = elf::SHF_ALLOC as u32;
-pub const SHF_EXECINSTR: u32 = elf::SHF_EXECINSTR as u32;
-pub const SHF_MERGE: u32 = elf::SHF_MERGE as u32;
-pub const SHF_STRINGS: u32 = elf::SHF_STRINGS as u32;
-pub const SHF_GROUP: u32 = elf::SHF_GROUP as u32;
-pub const SHF_TLS: u32 = elf::SHF_TLS as u32;
+/// One `Elf32_Rela` or `Elf64_Rela` entry, the elf crate's: `offset` is the
+/// offset of the patched bytes from the start of the section, `ty` an
+/// `R_RISCV_*` number, `sym` an index into [`Object::symbols`].
+pub use elf::Rela;
 
 #[derive(Debug, Clone)]
 pub struct Section {
     pub name: String,
     pub ty: u32,
-    pub flags: u32,
+    pub flags: u64,
     /// File contents; empty for `SHT_NOBITS`.
     pub data: Vec<u8>,
     /// Size in memory (`sh_size`), also for `SHT_NOBITS`.
-    pub size: u32,
-    /// Alignment in bytes, at least 1.
+    pub size: u64,
+    /// Alignment in bytes, at least 1. 32 bits on both classes: ld.lld keeps
+    /// an input section's alignment in 32 bits too, and refuses an ELF64
+    /// `sh_addralign` above 2^32 ("section sh_addralign is too large").
     pub align: u32,
     /// `sh_entsize`: the entry size of a `SHF_MERGE` section.
-    pub entsize: u32,
+    pub entsize: u64,
     /// Relocations that patch this section (from the `.rela` section whose
     /// `sh_info` points here).
     pub relocs: Vec<Rela>,
@@ -50,23 +55,11 @@ impl Section {
     }
 }
 
-/// One `Elf32_Rela` entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rela {
-    /// Offset of the patched bytes from the start of the section.
-    pub offset: u32,
-    /// `ELF32_R_TYPE(r_info)`, an `R_RISCV_*` number.
-    pub ty: u32,
-    /// `ELF32_R_SYM(r_info)`, an index into [`Object::symbols`].
-    pub sym: u32,
-    pub addend: i32,
-}
-
 #[derive(Debug, Clone)]
 pub struct Symbol {
     pub name: String,
-    pub value: u32,
-    pub size: u32,
+    pub value: u64,
+    pub size: u64,
     pub bind: u8,
     pub ty: u8,
     pub shndx: u16,
@@ -88,6 +81,9 @@ impl Symbol {
 pub struct Object {
     /// File name, used as the prefix of every diagnostic about this object.
     pub name: String,
+    /// ELF32 (RV32) or ELF64 (RV64), from `e_ident[EI_CLASS]`: the class of
+    /// the executable, whose layout takes it from the first object.
+    pub class: Class,
     /// Indexed by ELF section index; entry 0 is the null section.
     pub sections: Vec<Section>,
     /// Indexed by symbol table index; entry 0 is the null symbol.
@@ -143,13 +139,13 @@ fn cstr(table: &[u8], off: u32) -> Result<String, String> {
 struct Shdr {
     name: u32,
     ty: u32,
-    flags: u32,
+    flags: u64,
     offset: u32,
-    size: u32,
+    size: u64,
     link: u32,
     info: u32,
     align: u32,
-    entsize: u32,
+    entsize: u64,
 }
 
 /// Parses a relocatable object. Errors don't include the file name; the
@@ -200,6 +196,7 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
     if shnum == 0 {
         return Ok(Object {
             name: name.to_string(),
+            class: Class::Elf32,
             sections: Vec::new(),
             symbols: Vec::new(),
         });
@@ -214,13 +211,13 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
         hdrs.push(Shdr {
             name: r.u32(h)?,
             ty: r.u32(h + 4)?,
-            flags: r.u32(h + 8)?,
+            flags: u64::from(r.u32(h + 8)?),
             offset: r.u32(h + 16)?,
-            size: r.u32(h + 20)?,
+            size: u64::from(r.u32(h + 20)?),
             link: r.u32(h + 24)?,
             info: r.u32(h + 28)?,
             align: r.u32(h + 32)?,
-            entsize: r.u32(h + 36)?,
+            entsize: u64::from(r.u32(h + 36)?),
         });
     }
     let contents = |h: &Shdr| -> Result<&[u8], String> {
@@ -299,8 +296,8 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
             let info = e.u8(12)?;
             let sym = Symbol {
                 name: cstr(strtab, e.u32(0)?)?,
-                value: e.u32(4)?,
-                size: e.u32(8)?,
+                value: u64::from(e.u32(4)?),
+                size: u64::from(e.u32(8)?),
                 bind: info >> 4,
                 ty: info & 0xf,
                 shndx: e.u16(14)?,
@@ -365,10 +362,10 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
             let e = Reader(e);
             let info = e.u32(4)?;
             let rela = Rela {
-                offset: e.u32(0)?,
+                offset: u64::from(e.u32(0)?),
                 ty: info & 0xff,
                 sym: info >> 8,
-                addend: e.u32(8)? as i32,
+                addend: i64::from(e.u32(8)? as i32),
             };
             if rela.sym as usize >= symbols.len() {
                 return Err(format!(
@@ -383,6 +380,7 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
 
     Ok(Object {
         name: name.to_string(),
+        class: Class::Elf32,
         sections,
         symbols,
     })

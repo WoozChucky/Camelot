@@ -45,7 +45,7 @@ pub fn map(layout: &Layout) -> String {
                 "    {:#010x} {:#010x} {}({})",
                 i.addr, sec.size, obj.name, sec.name
             );
-            let mut syms: Vec<(u32, &str)> = obj
+            let mut syms: Vec<(u64, &str)> = obj
                 .symbols
                 .iter()
                 .enumerate()
