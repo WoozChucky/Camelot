@@ -37,6 +37,11 @@ pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_KEYUP: u32 = 0x0101;
 pub const WM_SYSKEYDOWN: u32 = 0x0104;
 pub const WM_SYSKEYUP: u32 = 0x0105;
+/// The character of an Alt chord, from `TranslateMessage`; `DefWindowProcW` turns it
+/// into a menu mnemonic (`SC_KEYMENU`), or a beep when there is no menu.
+pub const WM_SYSCHAR: u32 = 0x0106;
+/// Key message `lParam` bit 24: an extended key (scan code prefixed with 0xE0).
+pub const KF_EXTENDED_LPARAM: isize = 1 << 24;
 pub const WM_SYSCOMMAND: u32 = 0x0112;
 pub const WM_MOUSEMOVE: u32 = 0x0200;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
@@ -84,6 +89,9 @@ pub const VK_F10: u32 = 0x79;
 pub const VK_F12: u32 = 0x7b;
 pub const VK_LCONTROL: u32 = 0xa2;
 pub const VK_RCONTROL: u32 = 0xa3;
+
+/// `MapVirtualKeyW` map type: virtual key to scan code, 0xE0xx for extended keys.
+pub const MAPVK_VK_TO_VSC_EX: u32 = 4;
 
 /// `ToUnicode` flag: do not change the keyboard state (dead keys), Windows 10 1607+.
 pub const TOUNICODE_KEEP_STATE: u32 = 1 << 2;
@@ -256,6 +264,7 @@ extern "system" {
     pub fn GetKeyState(vkey: i32) -> i16;
     pub fn GetKeyboardState(state: *mut u8) -> BOOL;
     pub fn ToUnicode(vkey: u32, scan: u32, state: *const u8, buf: *mut u16, len: i32, flags: u32) -> i32;
+    pub fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
     #[cfg(target_pointer_width = "64")]
     pub fn SetWindowLongPtrW(hwnd: HWND, index: i32, value: isize) -> isize;
     #[cfg(target_pointer_width = "64")]

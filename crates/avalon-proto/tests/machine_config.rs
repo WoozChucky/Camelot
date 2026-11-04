@@ -320,12 +320,16 @@ fn device_table_mirrors_sysinfo() {
 fn keys_and_pixels_mirror_grail() {
     let grail::keyboard::KeyEvent {
         code,
+        usage: _,
         release,
+        repeat: _,
         shift,
         ctrl,
     } = grail::keyboard::KeyEvent {
         code: b'q',
+        usage: 0,
         release: true,
+        repeat: false,
         shift: false,
         ctrl: true,
     };

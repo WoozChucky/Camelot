@@ -131,6 +131,8 @@ impl Screen {
         let Some(w) = &mut self.window else {
             return true;
         };
+        // The keys are the window's or the program's by the mode it chose last.
+        w.set_raw_keys(m.cpu.bus.kbd.raw());
         if !w.pump() {
             return false;
         }

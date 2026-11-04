@@ -651,10 +651,10 @@ impl Vm {
     /// [`MAX_INPUT_QUEUE`] keys are waiting already.
     pub fn key_input(&self, id: u64, key: KeyEvent) -> bool {
         let key = keyboard::KeyEvent {
-            code: key.code,
             release: key.release,
             shift: key.shift,
             ctrl: key.ctrl,
+            ..keyboard::KeyEvent::press(key.code)
         };
         self.input_event(id, |inner| queue(&mut inner.keys, key))
     }

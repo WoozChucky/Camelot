@@ -225,8 +225,10 @@ impl Machine {
 
     /// Hands a key event to the keyboard device (spec section 9.4). This is the one way
     /// in for every host-side producer: the framebuffer window, tests, or a remote
-    /// client. Returns false if the event was dropped: its code is not in the spec's key
-    /// code table (see [`keyboard::code::is_valid`]), or the keyboard FIFO is full.
+    /// client. The event carries both forms of the key, its ASCII-mode code and its
+    /// raw-mode HID usage, and the device queues the one of the mode the program chose.
+    /// Returns false if the event was dropped: it has no valid form in that mode (see
+    /// [`keyboard::Keyboard::push`]), or the keyboard FIFO is full.
     pub fn key_event(&mut self, ev: KeyEvent) -> bool {
         self.cpu.bus.kbd.push(ev)
     }
