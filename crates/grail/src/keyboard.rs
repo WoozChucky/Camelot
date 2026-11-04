@@ -158,7 +158,9 @@ pub mod usage {
     }
 
     /// The keys hosts can report, in usage order: those of a 104- or 105-key PC
-    /// keyboard, F13 to F24, the Japanese and Korean keys, Power and the volume keys.
+    /// keyboard, F13 to F24, the Japanese and Korean keys (Lang1 to Lang4), Power and
+    /// the volume keys. A few keys have other names too ([`WIN_ALIASES`],
+    /// [`DOM_ALIASES`]).
     /// Usage 0x32 (the ISO "#~" key, next to Enter) is missing on purpose: Windows and
     /// browsers report it as the US backslash key, 0x31, which is at the same place,
     /// and Linux's HID driver gives the two the same key code.
@@ -285,6 +287,8 @@ pub mod usage {
         k(0x8b, 0x7b, "NonConvert"),
         k(0x90, 0x72, "Lang1"),
         k(0x91, 0x71, "Lang2"),
+        k(0x92, 0x78, "Lang3"),
+        k(0x93, 0x77, "Lang4"),
         k(0xe0, 0x1d, "ControlLeft"),
         k(0xe1, 0x2a, "ShiftLeft"),
         k(0xe2, 0x38, "AltLeft"),
@@ -295,16 +299,36 @@ pub mod usage {
         k(0xe7, 0xe05c, "MetaRight"),
     ];
 
-    /// The usage of the key Windows reports as scan code `win` ([`Key::win`]), if it
-    /// is one of [`KEYS`].
+    /// Scan codes Windows reports for a key besides its own ([`Key::win`]), with the
+    /// key's usage. A PC keyboard sends other codes for two keys under a modifier, and
+    /// Windows' HID driver makes them up from the same USB usage: Pause with Ctrl held
+    /// (Break) is E0 46, Print Screen with Alt held (SysRq) is 54. The key is the
+    /// same one, as Linux's `atkbd` maps them (KEY_PAUSE and KEY_SYSRQ).
+    pub const WIN_ALIASES: &[(u16, u16)] = &[(0xe046, PAUSE), (0x54, PRINT_SCREEN)];
+
+    /// `KeyboardEvent.code` names that older browsers gave a key, with its usage: the
+    /// Windows keys were `OSLeft` and `OSRight` (Firefox before 118), and the volume
+    /// keys `VolumeMute`, `VolumeUp` and `VolumeDown`.
+    pub const DOM_ALIASES: &[(&str, u16)] = &[
+        ("OSLeft", LEFT_GUI),
+        ("OSRight", RIGHT_GUI),
+        ("VolumeMute", 0x7f),
+        ("VolumeUp", 0x80),
+        ("VolumeDown", 0x81),
+    ];
+
+    /// The usage of the key Windows reports as scan code `win` ([`Key::win`], or one
+    /// of [`WIN_ALIASES`]), if it is one of [`KEYS`].
     pub fn from_win_scan(win: u16) -> Option<u16> {
-        KEYS.iter().find(|k| k.win == win).map(|k| k.usage)
+        let alias = || WIN_ALIASES.iter().find(|a| a.0 == win).map(|a| a.1);
+        KEYS.iter().find(|k| k.win == win).map(|k| k.usage).or_else(alias)
     }
 
-    /// The usage of the key a browser reports as `KeyboardEvent.code` `dom`, if it is
-    /// one of [`KEYS`].
+    /// The usage of the key a browser reports as `KeyboardEvent.code` `dom` (or one of
+    /// [`DOM_ALIASES`]), if it is one of [`KEYS`].
     pub fn from_dom_code(dom: &str) -> Option<u16> {
-        KEYS.iter().find(|k| k.dom == dom).map(|k| k.usage)
+        let alias = || DOM_ALIASES.iter().find(|a| a.0 == dom).map(|a| a.1);
+        KEYS.iter().find(|k| k.dom == dom).map(|k| k.usage).or_else(alias)
     }
 }
 
@@ -852,6 +876,33 @@ mod tests {
         for (u, dom) in named {
             assert_eq!(at(u), dom, "usage {u:#x}");
         }
+        assert_eq!((at(LANG1), at(LANG2)), ("Lang1", "Lang2"));
+        assert_eq!((at(0x92), at(0x93)), ("Lang3", "Lang4"));
+    }
+
+    #[test]
+    fn aliases_name_keys_of_the_table() {
+        use usage::*;
+        // An alias is no key's own code, and names a key of the table.
+        for &(win, u) in WIN_ALIASES {
+            assert!(KEYS.iter().all(|k| k.win != win), "{win:#x}");
+            assert!(KEYS.iter().any(|k| k.usage == u), "{win:#x}");
+            assert_eq!(from_win_scan(win), Some(u));
+        }
+        for &(dom, u) in DOM_ALIASES {
+            assert!(KEYS.iter().all(|k| k.dom != dom), "{dom}");
+            assert!(KEYS.iter().any(|k| k.usage == u), "{dom}");
+            assert_eq!(from_dom_code(dom), Some(u));
+        }
+        // Ctrl+Break is Pause, Alt+Print Screen (SysRq) is Print Screen.
+        assert_eq!(from_win_scan(0xe046), Some(PAUSE));
+        assert_eq!(from_win_scan(0x54), Some(PRINT_SCREEN));
+        assert_eq!(from_win_scan(0x46), Some(SCROLL_LOCK), "without E0, Scroll Lock");
+        assert_eq!(from_dom_code("OSLeft"), from_dom_code("MetaLeft"));
+        assert_eq!(from_dom_code("OSRight"), from_dom_code("MetaRight"));
+        assert_eq!(from_dom_code("VolumeMute"), from_dom_code("AudioVolumeMute"));
+        assert_eq!(from_dom_code("VolumeUp"), from_dom_code("AudioVolumeUp"));
+        assert_eq!(from_dom_code("VolumeDown"), from_dom_code("AudioVolumeDown"));
     }
 
     #[test]

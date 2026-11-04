@@ -334,10 +334,22 @@ fn special_code(vk: u32) -> Option<u8> {
 /// The scan code of a key message, as [`usage::Key::win`] gives it: `lParam` bits
 /// 16-23, plus 0xe000 for an extended key (bit 24). A message with none (synthesized
 /// from a virtual key alone, as some remote-control programs send) gets the scan code
-/// the keyboard layout gives the virtual key.
+/// the keyboard layout gives the virtual key. `VK_PACKET`, a character sent as a key
+/// (`SendInput` with `KEYEVENTF_UNICODE`), has none: its `wScan` is the character's
+/// UTF-16 unit, which lands in the scan code field and names no key.
 fn win_scan(vk: u32, lparam: LPARAM) -> u16 {
+    if vk == VK_PACKET {
+        return 0;
+    }
     let scan = (lparam >> 16) as u16 & 0xff;
     match (scan, lparam & KF_EXTENDED_LPARAM != 0) {
+        // The layout gives no key of the table for these: Num Lock is 0x45 there,
+        // which Windows' messages give Pause; Pause is 0xE11D (its set 1 E1 1D 45)
+        // and Print Screen 0x54 (SysRq). Ctrl+Pause comes as VK_CANCEL. They get what
+        // their key messages carry.
+        (0, _) if vk == VK_NUMLOCK => 0xe045,
+        (0, _) if vk == VK_PAUSE || vk == VK_CANCEL => 0x45,
+        (0, _) if vk == VK_SNAPSHOT => 0xe037,
         (0, _) => {
             // SAFETY: no pointers involved.
             let scan = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX) } as u16;
@@ -1022,6 +1034,36 @@ mod tests {
         assert_eq!(win_scan(VK_HOME, 1), SC_HOME);
         assert_eq!(win_scan(VK_NUMPAD7, 1), SC_KP7);
         assert_eq!(usage::from_win_scan(win_scan(VK_LWIN, 1)), Some(usage::LEFT_GUI));
+        for (vk, u) in [
+            (VK_NUMLOCK, usage::NUM_LOCK),
+            (VK_PAUSE, usage::PAUSE),
+            (VK_CANCEL, usage::PAUSE),
+            (VK_SNAPSHOT, usage::PRINT_SCREEN),
+        ] {
+            assert_eq!(usage::from_win_scan(win_scan(vk, 1)), Some(u), "vk {vk:#x}");
+        }
+        // With their scan codes, as the keyboard sends them: Num Lock is extended,
+        // Ctrl+Pause (Break) is E0 46, Alt+Print Screen (SysRq) is 54.
+        assert_eq!(
+            usage::from_win_scan(win_scan(VK_NUMLOCK, lp(0x45, true))),
+            Some(usage::NUM_LOCK)
+        );
+        assert_eq!(
+            usage::from_win_scan(win_scan(VK_PAUSE, lp(0x45, false))),
+            Some(usage::PAUSE)
+        );
+        assert_eq!(
+            usage::from_win_scan(win_scan(VK_CANCEL, lp(0x46, true))),
+            Some(usage::PAUSE)
+        );
+        assert_eq!(
+            usage::from_win_scan(win_scan(VK_SNAPSHOT, lp(0x54, false))),
+            Some(usage::PRINT_SCREEN)
+        );
+        // A character sent as a key: whatever its scan code field holds, no key.
+        assert_eq!(win_scan(VK_PACKET, lp(0x41, false)), 0);
+        assert_eq!(win_scan(VK_PACKET, lp(0xe9, true)), 0);
+        assert_eq!(win_scan(VK_PACKET, 1), 0);
     }
 
     #[test]
