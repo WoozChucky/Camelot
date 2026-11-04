@@ -24,6 +24,7 @@
 //! to viewers.
 
 use crate::bus::{BusFault, RAM_BASE};
+use crate::mmio::{self, Field};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -140,6 +141,30 @@ const STATUS_ERRORS: u32 = STATUS_BAD_MODE | STATUS_BAD_SCANOUT;
 pub const IRQ_VBLANK_ENABLE: u32 = 1 << 0;
 /// `FB_IRQ` bit 1 (write 1 to clear): a vertical blank happened since it was cleared.
 pub const IRQ_VBLANK: u32 = 1 << 1;
+
+/// The control block's registers, as [`mmio::Field`] names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reg {
+    Width,
+    Height,
+    Stride,
+    Format,
+    Ctrl,
+    Present,
+    Version,
+    Modes,
+    Mode,
+    ModeSel,
+    ModeWidth,
+    ModeHeight,
+    ModeStride,
+    Status,
+    /// 64-bit.
+    Scanout,
+    Flip,
+    Irq,
+    Vblanks,
+}
 
 /// What the display shows: the current mode's size and, while the display is enabled,
 /// its pixels.
@@ -263,25 +288,35 @@ impl Framebuffer {
         self.period
     }
 
-    /// Whether `off` and `size` are an access to `FB_SCANOUT`: 8 bytes at its start, or
-    /// either 4-byte half.
-    fn is_scanout(off: u32, size: u32) -> bool {
-        off & !7 == REG_SCANOUT && (size == 4 || size == 8 && off == REG_SCANOUT)
+    /// What the 4-byte-aligned offset `off` holds: a 32-bit register, a half of the
+    /// 64-bit `FB_SCANOUT`, or nothing.
+    fn field(off: u32) -> Field<Reg> {
+        Field::Word(match off {
+            REG_WIDTH => Reg::Width,
+            REG_HEIGHT => Reg::Height,
+            REG_STRIDE => Reg::Stride,
+            REG_FORMAT => Reg::Format,
+            REG_CTRL => Reg::Ctrl,
+            REG_PRESENT => Reg::Present,
+            REG_VERSION => Reg::Version,
+            REG_MODES => Reg::Modes,
+            REG_MODE => Reg::Mode,
+            REG_MODE_SEL => Reg::ModeSel,
+            REG_MODE_WIDTH => Reg::ModeWidth,
+            REG_MODE_HEIGHT => Reg::ModeHeight,
+            REG_MODE_STRIDE => Reg::ModeStride,
+            REG_STATUS => Reg::Status,
+            REG_SCANOUT => return Field::Low(Reg::Scanout),
+            o if o == REG_SCANOUT + 4 => return Field::High(Reg::Scanout),
+            REG_FLIP => Reg::Flip,
+            REG_IRQ => Reg::Irq,
+            REG_VBLANKS => Reg::Vblanks,
+            _ => return Field::Unused,
+        })
     }
 
-    /// Registers are 32-bit, except `FB_SCANOUT`, which is 64-bit and takes 8-byte
-    /// accesses or its 4-byte halves. Unknown offsets read as 0.
-    pub fn read(&mut self, off: u32, size: u32) -> Result<u64, BusFault> {
-        if Self::is_scanout(off, size) {
-            return Ok(match (off, size) {
-                (REG_SCANOUT, 8) => self.scanout_reg,
-                (REG_SCANOUT, _) => self.scanout_reg & 0xffff_ffff,
-                _ => self.scanout_reg >> 32,
-            });
-        }
-        if size != 4 {
-            return Err(BusFault);
-        }
+    /// The value of register `reg`.
+    fn value(&self, reg: Reg) -> u64 {
         let mode = self.mode();
         let sel = MODES.get(self.mode_sel as usize);
         let flip = if self.pending.is_some() {
@@ -289,57 +324,73 @@ impl Framebuffer {
         } else {
             0
         };
-        Ok(u64::from(match off {
-            REG_WIDTH => mode.width,
-            REG_HEIGHT => mode.height,
-            REG_STRIDE => mode.stride(),
-            REG_FORMAT => FB_FORMAT_XRGB8888,
-            REG_CTRL => self.ctrl,
-            REG_VERSION => FB_VERSION,
-            REG_MODES => MODES.len() as u32,
-            REG_MODE => self.mode,
-            REG_MODE_SEL => self.mode_sel,
-            REG_MODE_WIDTH => sel.map_or(0, |m| m.width),
-            REG_MODE_HEIGHT => sel.map_or(0, |m| m.height),
-            REG_MODE_STRIDE => sel.map_or(0, |m| m.stride()),
-            REG_STATUS => self.errors | flip,
-            REG_IRQ => self.irq,
-            REG_VBLANKS => self.vblanks as u32,
-            _ => 0, // FB_PRESENT and FB_FLIP are write-only
-        }))
+        u64::from(match reg {
+            Reg::Width => mode.width,
+            Reg::Height => mode.height,
+            Reg::Stride => mode.stride(),
+            Reg::Format => FB_FORMAT_XRGB8888,
+            Reg::Ctrl => self.ctrl,
+            Reg::Version => FB_VERSION,
+            Reg::Modes => MODES.len() as u32,
+            Reg::Mode => self.mode,
+            Reg::ModeSel => self.mode_sel,
+            Reg::ModeWidth => sel.map_or(0, |m| m.width),
+            Reg::ModeHeight => sel.map_or(0, |m| m.height),
+            Reg::ModeStride => sel.map_or(0, |m| m.stride()),
+            Reg::Status => self.errors | flip,
+            Reg::Scanout => return self.scanout_reg,
+            Reg::Irq => self.irq,
+            Reg::Vblanks => self.vblanks as u32,
+            Reg::Present | Reg::Flip => 0, // write-only
+        })
     }
 
-    /// Writes to read-only registers and unknown offsets are ignored. `ram_len` is the
-    /// size of RAM, which a scanout buffer must lie in.
+    /// Reads a register, at the widths of spec section 9 ([`mmio::access`]): 32-bit
+    /// registers take 4-byte accesses, `FB_SCANOUT` an 8-byte one or either 4-byte half,
+    /// and unused offsets read as 0 at 4 and 8 bytes. `FB_SCANOUT` is 64-bit on an RV32
+    /// machine too (it has no version 1 layout), so the device takes 8-byte accesses at
+    /// both widths.
+    pub fn read(&mut self, off: u32, size: u32) -> Result<u64, BusFault> {
+        let access = mmio::access(off, size, true, Self::field)?;
+        Ok(access.read(|reg| self.value(reg)))
+    }
+
+    /// Writes a register, at the same widths as [`Framebuffer::read`]. Writes to
+    /// read-only registers and unused offsets are ignored. `ram_len` is the size of RAM,
+    /// which a scanout buffer must lie in.
     pub fn write(&mut self, off: u32, size: u32, val: u64, ram_len: u64) -> Result<(), BusFault> {
-        if Self::is_scanout(off, size) {
-            self.scanout_reg = match (off, size) {
-                (REG_SCANOUT, 8) => val,
-                (REG_SCANOUT, _) => self.scanout_reg & !0xffff_ffff | val & 0xffff_ffff,
-                _ => self.scanout_reg & 0xffff_ffff | val << 32,
-            };
+        let access = mmio::access(off, size, true, Self::field)?;
+        let Some(reg) = access.reg() else {
             return Ok(());
-        }
-        if size != 4 {
-            return Err(BusFault);
-        }
-        let val = val as u32;
-        match off {
-            REG_CTRL => self.ctrl = val & CTRL_ENABLE,
-            REG_PRESENT => {
+        };
+        let word = val as u32;
+        match reg {
+            // A half keeps the other: only a modeset or a flip acts on the value.
+            Reg::Scanout => self.scanout_reg = access.merge(self.scanout_reg, val),
+            Reg::Ctrl => self.ctrl = word & CTRL_ENABLE,
+            Reg::Present => {
                 self.present = true;
                 self.presents += 1;
             }
-            REG_MODE => self.set_mode(val, ram_len),
-            REG_MODE_SEL => self.mode_sel = val,
-            REG_STATUS => self.errors &= !(val & STATUS_ERRORS),
-            REG_FLIP => self.flip(ram_len),
-            REG_IRQ => {
+            Reg::Mode => self.set_mode(word, ram_len),
+            Reg::ModeSel => self.mode_sel = word,
+            Reg::Status => self.errors &= !(word & STATUS_ERRORS),
+            Reg::Flip => self.flip(ram_len),
+            Reg::Irq => {
                 // Bit 0 takes the value written; writing 1 to bit 1 clears it.
-                let pending = self.irq & IRQ_VBLANK & !(val & IRQ_VBLANK);
-                self.irq = pending | val & IRQ_VBLANK_ENABLE;
+                let pending = self.irq & IRQ_VBLANK & !(word & IRQ_VBLANK);
+                self.irq = pending | word & IRQ_VBLANK_ENABLE;
             }
-            _ => {}
+            Reg::Width
+            | Reg::Height
+            | Reg::Stride
+            | Reg::Format
+            | Reg::Version
+            | Reg::Modes
+            | Reg::ModeWidth
+            | Reg::ModeHeight
+            | Reg::ModeStride
+            | Reg::Vblanks => {} // read-only
         }
         Ok(())
     }
@@ -588,10 +639,15 @@ mod tests {
         let mut fb = Framebuffer::default();
         assert_eq!(fb.read(REG_WIDTH, 1), Err(BusFault));
         assert_eq!(fb.read(REG_WIDTH, 2), Err(BusFault));
-        assert_eq!(fb.read(REG_WIDTH, 8), Err(BusFault));
+        assert_eq!(fb.read(REG_WIDTH, 8), Err(BusFault), "two 32-bit registers");
         assert_eq!(fb.write(REG_CTRL, 1, 1, RAM), Err(BusFault));
         assert_eq!(fb.write(REG_PRESENT, 2, 1, RAM), Err(BusFault));
         assert_eq!(fb.write(REG_MODE, 8, 1, RAM), Err(BusFault));
+        assert_eq!(
+            fb.read(REG_VBLANKS, 8),
+            Err(BusFault),
+            "a 32-bit register and unused space"
+        );
         assert_eq!(fb.read(REG_SCANOUT, 2), Err(BusFault));
         assert_eq!(
             fb.read(REG_SCANOUT + 4, 8),
@@ -602,6 +658,34 @@ mod tests {
         assert!(!fb.enabled());
         assert!(!fb.take_present());
         assert_eq!(fb.read(REG_SCANOUT, 8), Ok(0));
+    }
+
+    /// Spec section 9: unused offsets read as 0 and ignore writes at every width the
+    /// device takes, 8 bytes included, since `FB_SCANOUT` takes them; the bytes inside
+    /// `FB_SCANOUT` that start no half (0x39 to 0x3b) are unused too. Other widths
+    /// fault there as anywhere.
+    #[test]
+    fn unused_offsets_read_as_zero_at_four_and_eight_bytes() {
+        let mut fb = Framebuffer::default();
+        fb.write(REG_SCANOUT, 8, 0x1234_5678_9abc_d000, RAM).unwrap();
+        for off in [0x50, 0x100, 0xff8] {
+            assert_eq!(fb.read(off, 8), Ok(0), "{off:#x}");
+            assert_eq!(fb.read(off, 4), Ok(0), "{off:#x}");
+            assert_eq!(fb.write(off, 8, !0, RAM), Ok(()), "{off:#x}");
+            assert_eq!(fb.write(off, 4, !0, RAM), Ok(()), "{off:#x}");
+            assert_eq!(fb.read(off, 1), Err(BusFault), "{off:#x}");
+            assert_eq!(fb.write(off, 2, 0, RAM), Err(BusFault), "{off:#x}");
+        }
+        assert_eq!(fb.read(0xffc, 4), Ok(0));
+        for off in [REG_SCANOUT + 1, REG_SCANOUT + 2, REG_SCANOUT + 3] {
+            assert_eq!(fb.read(off, 4), Ok(0), "{off:#x}");
+            assert_eq!(fb.write(off, 4, 0, RAM), Ok(()), "{off:#x}");
+        }
+        assert_eq!(fb.read(REG_SCANOUT + 2, 8), Err(BusFault), "misaligned");
+        // Nothing changed: not the scanout, not the display, no present.
+        assert_eq!(fb.read(REG_SCANOUT, 8), Ok(0x1234_5678_9abc_d000));
+        assert_eq!((fb.ctrl, fb.mode(), fb.presents), (0, MODES[0], 0));
+        assert!(!fb.present_pending());
     }
 
     #[test]

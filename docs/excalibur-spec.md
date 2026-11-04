@@ -479,7 +479,7 @@ Grail also redraws at ~60 Hz on its own, so `FB_PRESENT` is optional. Host side:
 
 Details:
 
-- Unused offsets in 0x3000_0000 - 0x3000_0FFF read as 0 and ignore writes, as do writes to the read-only registers. `FB_PRESENT` and `FB_FLIP` read as 0.
+- Unused offsets in 0x3000_0000 - 0x3000_0FFF read as 0 and ignore writes at 4 and 8 bytes, the widths the device takes (section 9, "Register widths"; 8 bytes on an RV32 machine too, since `FB_SCANOUT` takes them there), as do writes to the read-only registers. Other widths fault there too. `FB_PRESENT` and `FB_FLIP` read as 0.
 - `FB_CTRL` bits other than bit 0 are reserved, read as 0, as are `FB_STATUS` bits 31:3 and `FB_IRQ` bits 31:2. At reset: `FB_CTRL` 0 (the display starts disabled), mode 0, `FB_SCANOUT` 0 and VRAM shown, no flip pending, `FB_STATUS` 0, `FB_IRQ` 0, `FB_VBLANKS` 0, the first vertical blank a frame away, and no present pending.
 - While the display is disabled it shows black; VRAM and the RAM buffers keep their contents and can be drawn into before enabling.
 - VRAM is plain memory: byte, halfword, word and doubleword accesses, same alignment rules as RAM (section 4). It resets to 0. The top byte of each pixel is ignored, in VRAM and in RAM buffers alike. Byte order in memory is B, G, R, X, which is also a 32-bpp Windows DIB, so Grail blits it without conversion.

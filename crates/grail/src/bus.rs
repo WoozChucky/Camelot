@@ -1132,6 +1132,10 @@ mod tests {
         assert!(bus.fb.take_present());
         assert_eq!(bus.read(FB_CTRL_BASE, 1), Err(BusFault));
         assert_eq!(bus.read(FB_CTRL_BASE + 0xffc, 4), Ok(0));
+        // FB_SCANOUT takes 8-byte accesses, so unused space does too (spec section 9).
+        assert_eq!(bus.read(FB_CTRL_BASE + 0xff8, 8), Ok(0));
+        assert_eq!(bus.write(FB_CTRL_BASE + 0x100, 8, !0), Ok(()));
+        assert_eq!(bus.read(FB_CTRL_BASE + 0x100, 8), Ok(0));
     }
 
     /// The display controller through the bus: a modeset to a buffer in RAM, which the
