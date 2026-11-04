@@ -16,8 +16,8 @@
 //! RV64: the same on RV64 machines, which the stub describes as `riscv:rv64`:
 //! `examples/hello/hello-rv64.elf`, `examples/smp/smp-rv64.elf` with 2 harts, and
 //! `tests/rv64/prog.c`, built here with merlin -g for RV64, for the source lines,
-//! the steps and the LP64 frames. The kernel's RV64 case waits for an RV64 kernel
-//! (#154).
+//! the steps and the LP64 frames, and the RV64 kernel (#154), linked high and run
+//! with Sv48 on.
 
 use grail::gdb::Outcome;
 use grail::{Machine, MachineConfig, RunResult};
@@ -349,6 +349,59 @@ fn kernel() {
             &format!("2    breakpoint  {kvminit:#010x} <kvminit+{kvminit_off}>"),
         ],
     );
+}
+
+#[test]
+fn the_rv64_kernel() {
+    // The RV64 kernel (#154) runs at its link addresses, high in the address space,
+    // with Sv48 on: a breakpoint by symbol is a link address, which the hart's pc is
+    // once the kernel has jumped there, and the stub reads the stack through the
+    // page table.
+    let file = std::fs::read(path("kernel/kernel-rv64.elf")).unwrap();
+    let out = connected(
+        "kernel/kernel-rv64.elf",
+        1,
+        b"",
+        "break kmain\n\
+         continue\n\
+         regs\n\
+         break kvminit\n\
+         continue\n\
+         bt\n\
+         delete\n\
+         continue\n",
+    );
+    let (kmain, kmain_off) = past_prologue(&file, "kmain");
+    let (kvminit, kvminit_off) = past_prologue(&file, "kvminit");
+    assert!(kmain >= 0xffff_ffff_8000_0000, "{kmain:#x}");
+    let kmain_line = line_of("kernel/main.c", "    cpu_init();");
+    let kvminit_line = line_of("kernel/vm.c", "    initlock(&uvm_lock, \"uvm\");");
+    assert_lines(
+        &out,
+        &[
+            &format!("breakpoint 1 at {kmain:#x} <kmain+{kmain_off}>: kernel/main.c:{kmain_line}"),
+            "breakpoint 1",
+            &format!("kernel/main.c:{kmain_line}:     cpu_init();"),
+            &format!("pc             {kmain:#x}\t{kmain:#x} <kmain+{kmain_off}>"),
+            "priv           0x1\tprv:1 [Supervisor]",
+            &format!("breakpoint 2 at {kvminit:#x} <kvminit+{kvminit_off}>: kernel/vm.c:{kvminit_line}"),
+            "breakpoint 2",
+            &format!("kernel/vm.c:{kvminit_line}:     initlock(&uvm_lock, \"uvm\");"),
+        ],
+    );
+    // kvminit, called from kmain, called from the assembly that entered S-mode:
+    // frames read through the page table, addresses with 16 digits.
+    let bt = backtrace_after(&out, "(merlin-dbg) bt");
+    assert_eq!(bt.len(), 3, "{out}");
+    assert_eq!(
+        bt[0],
+        format!("#0  {kvminit:#018x} <kvminit+{kvminit_off}> at kernel/vm.c:{kvminit_line}")
+    );
+    assert!(
+        bt[1].starts_with("#1  0xffffffff8") && bt[1].contains(" <kmain+"),
+        "{out}"
+    );
+    assert!(bt[2].contains(" <supervisor_entry+"), "{out}");
 }
 
 /// The committed kernel.

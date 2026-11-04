@@ -3,8 +3,8 @@
 //! image of `cargo xtask fs`, made bootable, boots the kernel on Grail with no
 //! program, whose shell then runs programs from the disk's `/bin`. An RV64
 //! machine boots an RV64 boot block built with merlin-as and merlin-ld through
-//! the RV64 disk loader (#151; Camelot's bootloader and kernel are RV32 until
-//! #154). The image
+//! the RV64 disk loader (#151; Camelot's RV64 bootloader and kernel boot from
+//! disk in tests/kernel_rv64.rs, #154). The image
 //! (`xtask::fs::IMAGE_SIZE` blocks, the size the spec gives) holds the disk kernel, which has no programs of its own (issue #108):
 //! it boots in a machine of the default 4 MiB, and panics when there is no shell
 //! to run.
