@@ -42,6 +42,7 @@
 use crate::ast::*;
 use crate::reloc::{Emit, RelocKind, Target};
 use crate::{dwarf, encode, Error};
+use excalibur::Xlen;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,9 +109,14 @@ pub struct Symbol {
 pub struct Object {
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
+    /// The width it was assembled for: the ELF writer makes an ELF32 object
+    /// for RV32 and an ELF64 one for RV64.
+    pub xlen: Xlen,
 }
 
 pub struct Assembler {
+    /// RV32 or RV64, for the whole file (`-march=`).
+    xlen: Xlen,
     sections: Vec<Section>,
     current: usize,
     symbols: Vec<Symbol>,
@@ -148,6 +154,13 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    /// The width being assembled for. The encoder asks it to choose between
+    /// the RV32 and RV64 forms of an instruction (shift amounts, `li`) and
+    /// to refuse the instructions of the other width.
+    pub fn xlen(&self) -> Xlen {
+        self.asm.xlen
+    }
+
     /// Evaluates an expression made only of numbers and `.equ` constants.
     /// Returns None if it mentions a label or a `%modifier`.
     pub fn constant(&self, e: &Expr) -> Option<i64> {
@@ -188,10 +201,15 @@ impl Ctx<'_> {
     }
 
     /// A CSR operand: a name like `mstatus` or a number like `0x300`.
+    ///
+    /// Names are those of the width being assembled
+    /// ([`excalibur::csr::rv32_only`]): the high halves of 64-bit registers
+    /// (`cycleh`, `mstatush`, ...) and the odd `pmpcfg`s exist only on RV32,
+    /// where a CSR holds 32 bits, so on RV64 they are no CSR name. A number is
+    /// any 12-bit address on either width, as LLVM takes it.
     pub fn csr(&self, e: &Expr) -> Option<u16> {
         if let Expr::Sym(name) = e {
-            // merlin-as assembles RV32 until #148.
-            if let Some(addr) = excalibur::csr::parse(name, excalibur::Xlen::Rv32) {
+            if let Some(addr) = excalibur::csr::parse(name, self.asm.xlen) {
                 return Some(addr);
             }
         }
@@ -201,8 +219,10 @@ impl Ctx<'_> {
 }
 
 impl Assembler {
-    pub fn new() -> Self {
+    /// An assembler for `xlen` (RV32 or RV64) with an empty `.text` section.
+    pub fn new(xlen: Xlen) -> Self {
         let mut a = Assembler {
+            xlen,
             sections: Vec::new(),
             current: 0,
             symbols: Vec::new(),
@@ -273,6 +293,7 @@ impl Assembler {
         Ok(Object {
             sections: self.sections,
             symbols,
+            xlen: self.xlen,
         })
     }
 
@@ -371,7 +392,9 @@ impl Assembler {
                 let (hi, lo) = encode::hi_lo(distance as i32);
                 (encode::u_imm(hi), Some(encode::i_imm(lo)))
             }
-            Abs32 | Hi20 | Lo12I | Lo12S => unreachable!("absolute relocations are never resolved"),
+            Abs32 | Abs64 | Hi20 | Lo12I | Lo12S => {
+                unreachable!("absolute relocations are never resolved")
+            }
         };
         let data = &mut self.sections[section].data;
         let at = offset as usize;
@@ -1216,8 +1239,9 @@ impl Assembler {
 }
 
 impl Default for Assembler {
+    /// RV32, until the migration to RV64 ends (#159).
     fn default() -> Self {
-        Self::new()
+        Self::new(Xlen::Rv32)
     }
 }
 
@@ -1286,7 +1310,7 @@ mod tests {
     /// Feeds `place` the words an encoder would return, one instruction per
     /// line, with `labels` defined just before the instruction on that line.
     fn assemble(lines: &[(&[&str], Emit)]) -> Result<Object, Vec<Error>> {
-        let mut a = Assembler::new();
+        let mut a = Assembler::new(Xlen::Rv32);
         for (i, (labels, emit)) in lines.iter().enumerate() {
             a.line = i + 1;
             for l in *labels {
@@ -1328,7 +1352,7 @@ mod tests {
 
     #[test]
     fn pcrel_lo_label_in_another_section_is_an_error() {
-        let mut a = Assembler::new();
+        let mut a = Assembler::new(Xlen::Rv32);
         a.line = 1;
         a.label("1");
         a.place("test", vec![hi("target")]);

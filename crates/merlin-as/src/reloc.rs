@@ -6,6 +6,8 @@
 pub enum RelocKind {
     /// 32-bit absolute address, for `.word sym`.
     Abs32,
+    /// 64-bit absolute address: `.dword sym`, and RV64 DWARF addresses.
+    Abs64,
     /// B-type branch offset (beq, bne, ...).
     Branch,
     /// J-type jump offset (jal).
@@ -30,8 +32,10 @@ impl RelocKind {
     /// Every kind, for tables generated from this one (the C assembler's),
     /// in [`RelocKind::index`] order: a new kind needs an arm there, which
     /// the compiler asks for, and a place here, which the test checks.
-    pub const ALL: [RelocKind; 10] = [
+    /// The order is the psABI's numbering, so the C header lists them that way.
+    pub const ALL: [RelocKind; 11] = [
         RelocKind::Abs32,
+        RelocKind::Abs64,
         RelocKind::Branch,
         RelocKind::Jal,
         RelocKind::CallPlt,
@@ -47,21 +51,23 @@ impl RelocKind {
     pub fn index(self) -> usize {
         match self {
             RelocKind::Abs32 => 0,
-            RelocKind::Branch => 1,
-            RelocKind::Jal => 2,
-            RelocKind::CallPlt => 3,
-            RelocKind::PcrelHi20 => 4,
-            RelocKind::PcrelLo12I => 5,
-            RelocKind::PcrelLo12S => 6,
-            RelocKind::Hi20 => 7,
-            RelocKind::Lo12I => 8,
-            RelocKind::Lo12S => 9,
+            RelocKind::Abs64 => 1,
+            RelocKind::Branch => 2,
+            RelocKind::Jal => 3,
+            RelocKind::CallPlt => 4,
+            RelocKind::PcrelHi20 => 5,
+            RelocKind::PcrelLo12I => 6,
+            RelocKind::PcrelLo12S => 7,
+            RelocKind::Hi20 => 8,
+            RelocKind::Lo12I => 9,
+            RelocKind::Lo12S => 10,
         }
     }
 
     pub fn elf_type(self) -> u32 {
         match self {
             RelocKind::Abs32 => 1,
+            RelocKind::Abs64 => 2,
             RelocKind::Branch => 16,
             RelocKind::Jal => 17,
             RelocKind::CallPlt => 19,
@@ -77,6 +83,7 @@ impl RelocKind {
     pub fn name(self) -> &'static str {
         match self {
             RelocKind::Abs32 => "R_RISCV_32",
+            RelocKind::Abs64 => "R_RISCV_64",
             RelocKind::Branch => "R_RISCV_BRANCH",
             RelocKind::Jal => "R_RISCV_JAL",
             RelocKind::CallPlt => "R_RISCV_CALL_PLT",
@@ -139,5 +146,9 @@ mod tests {
         // Every index has its kind: none is missing from ALL.
         let max = RelocKind::ALL.iter().map(|k| k.index()).max().unwrap();
         assert_eq!(max + 1, RelocKind::ALL.len());
+        // In psABI number order, as the comment on ALL says.
+        assert!(RelocKind::ALL
+            .windows(2)
+            .all(|w| w[0].elf_type() < w[1].elf_type()));
     }
 }

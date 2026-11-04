@@ -609,3 +609,45 @@ fn cli_reports_file_and_line() {
     );
     assert!(!wrote_object, "no object should be written on error");
 }
+
+/// `-march=` picks the width for the whole file: `cycleh`, the high half of
+/// the cycle counter, is a CSR on RV32 only, so the same source assembles for
+/// one width and not the other. An ISA merlin-as does not implement is a usage
+/// error (status 2), not an assembly error.
+#[test]
+fn cli_takes_the_width_from_march() {
+    let dir = std::env::temp_dir().join(format!("merlin-as-march-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("cycleh.s");
+    let output = dir.join("cycleh.o");
+    std::fs::write(&input, "    csrr a0, cycleh\n").unwrap();
+    let run = |march: Option<&str>| {
+        let _ = std::fs::remove_file(&output);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_merlin-as"));
+        cmd.args(march).arg("-o").arg(&output).arg(&input);
+        let out = cmd.output().unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            output.exists(),
+        )
+    };
+    let default = run(None);
+    let rv32 = run(Some("-march=rv32ima_zicsr_zifencei"));
+    let rv64 = run(Some("-march=rv64ima_zicsr_zifencei"));
+    let other = run(Some("-march=rv64gc"));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(default, (Some(0), String::new(), true));
+    assert_eq!(rv32, (Some(0), String::new(), true));
+    let (code, stderr, wrote) = rv64;
+    assert_eq!((code, wrote), (Some(1), false), "stderr: {stderr}");
+    assert!(
+        stderr.starts_with(&format!("{}:1: error: ", input.display())),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("'cycleh'"), "{stderr:?}");
+    let (code, stderr, wrote) = other;
+    assert_eq!((code, wrote), (Some(2), false), "stderr: {stderr}");
+    assert!(stderr.contains("unsupported -march 'rv64gc'"), "{stderr:?}");
+}
