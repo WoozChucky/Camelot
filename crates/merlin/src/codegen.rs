@@ -382,7 +382,7 @@
 use crate::abi::{self, Pass};
 use crate::ast::*;
 use crate::consteval::{self, Base, Const};
-use crate::debug::{DebugInfo, Lines};
+use crate::debug::{DebugInfo, Lines, Location, Scope, Var};
 use crate::sema::arith_type;
 use crate::types::{ptr_size, FuncType, IntKind, Type, Xlen};
 use crate::Error;
@@ -464,6 +464,7 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
                     ret_label: format!(".L.return.{}", f.name),
                     statics: Vec::new(),
                     after_prologue: false,
+                    scopes: Vec::new(),
                 };
                 g.function(body);
                 let (lines, statics) = (g.lines, g.statics);
@@ -479,12 +480,16 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
             Item::Decl(decls) => {
                 for d in decls.iter().filter(|d| d.define) {
                     file.variable(d);
+                    if let (Some(dbg), Some(VarRef::Global(sym))) = (file.debug.as_mut(), &d.var) {
+                        let external = d.storage != Storage::Static;
+                        dbg.global(&d.name, sym, &d.ty, &d.spelled, d.pos, external);
+                    }
                 }
             }
         }
     }
     file.strings();
-    if let Some(d) = &file.debug {
+    if let Some(d) = &mut file.debug {
         file.out.push_str(&d.sections());
     }
     Ok(file.out)
@@ -929,6 +934,9 @@ struct FuncGen<'a, 'f> {
     /// With `-g`: a `.loc` has been written since the function's first, so
     /// the next is not the one that ends the prologue.
     after_prologue: bool,
+    /// With `-g`: the scopes being generated, the function's body first and
+    /// the innermost block last, with the variables declared in each.
+    scopes: Vec<Scope>,
 }
 
 impl<'a> FuncGen<'a, '_> {
@@ -1198,6 +1206,7 @@ impl<'a> FuncGen<'a, '_> {
         if let Some(d) = self.file.debug.as_mut() {
             let lines = d.loc(f.pos, Some(0), false);
             self.lines.extend(lines.into_iter().map(Line::Text));
+            self.scopes.push(Scope::default());
         }
 
         // Prologue: save ra and the caller's s0, set up s0, make room for locals.
@@ -1274,9 +1283,15 @@ impl<'a> FuncGen<'a, '_> {
         // Falling off the end returns 0. A final `return` needs no jump to the
         // epilogue, which comes right after it. Either way what follows comes
         // from the closing brace.
-        let returned = self.lines.last() == Some(&Line::Insn(insn_text("j", &self.ret_label), 4));
-        if returned {
-            self.lines.pop();
+        // (`-g`'s labels at the end of a block are not code: the jump may be
+        // just before them.)
+        let last = self
+            .lines
+            .iter()
+            .rposition(|l| !matches!(l, Line::Label(n) if n.starts_with(".Ldbg.")));
+        let returned = last.is_some_and(|i| self.lines[i] == Line::Insn(insn_text("j", &self.ret_label), 4));
+        if let (true, Some(i)) = (returned, last) {
+            self.lines.remove(i);
         }
         self.loc(f.end);
         if !returned {
@@ -1296,9 +1311,14 @@ impl<'a> FuncGen<'a, '_> {
         self.ins(load, format!("s0, {}(sp)", top - va_save - 2 * w));
         self.ins("addi", format!("sp, sp, {top}"));
         self.ins("ret", "");
-        if let Some(d) = self.file.debug.as_mut() {
+        if self.file.debug.is_some() {
             let end = format!(".Lfunc_end.{}", f.name);
-            d.function(&f.name, &end, f.pos, !f.is_static && !f.inline_only);
+            let params = self.debug_params();
+            let body = self.scopes.pop().expect("the function's scope");
+            let d = self.file.debug.as_mut().expect("-g");
+            let ret = (&f.ret, &f.ret_spelled);
+            let external = !f.is_static && !f.inline_only;
+            d.function(&f.name, &end, f.pos, external, ret, params, f.variadic, body);
             self.lines.push(Line::Label(end));
         }
         self.lines.push(Line::Text(format!(".size {0}, . - {0}", f.name)));
@@ -1339,9 +1359,66 @@ impl<'a> FuncGen<'a, '_> {
         }
     }
 
+    /// `-g`: the parameters, each in its slot.
+    fn debug_params(&mut self) -> Vec<Var> {
+        let f = self.func;
+        let Some(d) = self.file.debug.as_mut() else {
+            return Vec::new();
+        };
+        f.params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let at = Location::Frame(self.offsets[i]);
+                d.var(&p.name, &p.ty, &p.spelled, p.pos, at)
+            })
+            .collect()
+    }
+
+    /// `-g`: the variables `decls` declares, in the innermost scope: a local
+    /// in its slot, a `static` local at its symbol. (A block's `extern`
+    /// declaration defines nothing.)
+    fn debug_decls(&mut self, decls: &[Declarator]) {
+        let Some(d) = self.file.debug.as_mut() else {
+            return;
+        };
+        for decl in decls {
+            let at = match &decl.var {
+                Some(VarRef::Local(id)) => Location::Frame(self.offsets[id.0]),
+                Some(VarRef::Global(sym)) if decl.storage == Storage::Static => Location::Symbol(sym.clone()),
+                _ => continue,
+            };
+            let v = d.var(&decl.name, &decl.ty, &decl.spelled, decl.pos, at);
+            self.scopes.last_mut().expect("a scope").push(v);
+        }
+    }
+
     // ---- statements ----
 
+    /// A statement. With `-g`, a block, and a `for` that declares its
+    /// variable, is a scope of its own, with labels around its code.
     fn stmt(&mut self, s: &'a Stmt) {
+        let scoped = match &s.kind {
+            StmtKind::Block(_) => true,
+            StmtKind::For { init: Some(init), .. } => matches!(init.kind, StmtKind::Decl(_)),
+            _ => false,
+        };
+        let Some(d) = self.file.debug.as_mut().filter(|_| scoped) else {
+            return self.unscoped_stmt(s);
+        };
+        let (begin, end) = d.block_labels();
+        self.label(&begin);
+        self.scopes.push(Scope::new(begin, end.clone()));
+        self.unscoped_stmt(s);
+        self.label(&end);
+        let inner = self.scopes.pop().expect("the block's scope");
+        self.scopes
+            .last_mut()
+            .expect("the enclosing scope")
+            .add_block(inner);
+    }
+
+    fn unscoped_stmt(&mut self, s: &'a Stmt) {
         debug_assert_eq!(self.depth, 0, "temporaries left on the stack between statements");
         // `-g`: a statement with code of its own starts a line. A loop's parts
         // and a declaration's initializers get theirs where they are made.
@@ -1364,6 +1441,7 @@ impl<'a> FuncGen<'a, '_> {
                 }
             }
             StmtKind::Decl(decls) => {
+                self.debug_decls(decls);
                 for d in decls {
                     if d.init.is_some() && matches!(d.var, Some(VarRef::Local(_))) {
                         self.loc(d.pos);

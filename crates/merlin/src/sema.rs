@@ -1626,6 +1626,7 @@ impl<'a> FnChecker<'a> {
             init: Some(init),
             var: Some(VarRef::Global(name.clone())),
             define: true,
+            spelled: Default::default(),
             pos,
         });
         Ok(name)

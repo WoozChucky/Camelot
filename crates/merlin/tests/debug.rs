@@ -281,3 +281,298 @@ fn the_command_line_takes_g() {
     assert!(!run(&[]).contains(".file"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The program the variable tests describe: a typedef of a struct that points
+/// to itself, a union, an enum, arrays, a function pointer, const and volatile,
+/// globals and a `static` local, parameters, and locals in nested blocks.
+const VARS: &str = "\
+typedef struct node {
+    int value;
+    struct node *next;
+} Node;
+union word { unsigned u; unsigned char b[4]; };
+enum color { RED, GREEN = 5, BLUE };
+typedef enum color color_t;
+Node head;
+static short grid[2][3];
+const char *volatile name;
+int (*pick)(int, ...);
+long walk(Node *list, color_t c) {
+    static int calls;
+    long sum = 0;
+    calls++;
+    {
+        union word w;
+        w.u = c;
+        for (int i = 0; i < 2; i++) {
+            Node *p = list;
+            sum += p->value + w.b[0] + grid[i][1];
+        }
+    }
+    return sum;
+}
+";
+
+/// The entries merlin writes for [`VARS`], read back with `elf::dies` from the
+/// object (its relocations applied): a function's parameters and locals where
+/// its frame has them, the blocks around the code that declares them, globals
+/// at their symbols, and every type, at both widths.
+#[test]
+fn variables_and_types_are_described() {
+    use elf::dies::{dw, Attr, Die, InfoUnit};
+    for x in [Xlen::Rv32, Xlen::Rv64] {
+        let opts = Options {
+            xlen: x,
+            ..debug_opts("dir")
+        };
+        let asm = merlin::compile_with("v.c", VARS, &opts, &merlin::no_files).unwrap();
+        let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options { xlen: x }).unwrap();
+        let elf = elf::Elf::parse(&obj).unwrap();
+        let units = elf.debug_entries().unwrap();
+        assert_eq!(units.len(), 1);
+        let u: &InfoUnit = &units[0];
+        let ptr = u64::from(x.bits() / 8);
+        assert_eq!(u.addr_size as u64, ptr);
+        let at = |i: usize| &u.dies[i];
+        let named = |tag: u64, name: &str| {
+            u.dies
+                .iter()
+                .position(|d| d.tag == tag && d.name() == Some(name))
+                .unwrap_or_else(|| panic!("no {name} ({x:?}) in\n{asm}"))
+        };
+        let ty = |d: &Die| u.index_of(d.reference(dw::AT_TYPE).expect("a type")).unwrap();
+        // A type as C writes it, from its entries.
+        fn spell(u: &InfoUnit, i: Option<usize>) -> String {
+            let Some(i) = i else {
+                return "void".into();
+            };
+            let d = &u.dies[i];
+            let inner = || d.reference(dw::AT_TYPE).and_then(|o| u.index_of(o));
+            match d.tag {
+                dw::TAG_BASE_TYPE | dw::TAG_TYPEDEF => d.name().unwrap().to_string(),
+                dw::TAG_STRUCTURE_TYPE => format!("struct {}", d.name().unwrap()),
+                dw::TAG_UNION_TYPE => format!("union {}", d.name().unwrap()),
+                dw::TAG_ENUMERATION_TYPE => format!("enum {}", d.name().unwrap()),
+                dw::TAG_POINTER_TYPE => format!("{} *", spell(u, inner())),
+                dw::TAG_CONST_TYPE => format!("const {}", spell(u, inner())),
+                dw::TAG_VOLATILE_TYPE => format!("volatile {}", spell(u, inner())),
+                dw::TAG_ARRAY_TYPE => {
+                    let dims: String = d
+                        .children
+                        .iter()
+                        .map(|&c| format!("[{}]", u.dies[c].unsigned(dw::AT_COUNT).unwrap()))
+                        .collect();
+                    format!("{}{dims}", spell(u, inner()))
+                }
+                dw::TAG_SUBROUTINE_TYPE => {
+                    let params: Vec<String> = d
+                        .children
+                        .iter()
+                        .map(|&c| match u.dies[c].tag {
+                            dw::TAG_UNSPECIFIED_PARAMETERS => "...".to_string(),
+                            _ => spell(u, u.dies[c].reference(dw::AT_TYPE).and_then(|o| u.index_of(o))),
+                        })
+                        .collect();
+                    format!("{}({})", spell(u, inner()), params.join(", "))
+                }
+                t => panic!("tag {t:#x}"),
+            }
+        }
+        let type_of = |i: usize| spell(u, Some(ty(at(i))));
+
+        // The function: its frame base is s0, and each parameter and local is
+        // where the assembly's header comment says its slot is.
+        let walk = named(dw::TAG_SUBPROGRAM, "walk");
+        assert_eq!(at(walk).block(dw::AT_FRAME_BASE), Some(&[0x58][..]));
+        assert_eq!(type_of(walk), "long");
+        assert!(at(walk).flag(dw::AT_EXTERNAL));
+        let slot = |what: &str| -> Vec<u8> {
+            let line = asm
+                .lines()
+                .find(|l| l.contains(&format!("(s0)  {what}")))
+                .unwrap_or_else(|| panic!("no slot for {what} in\n{asm}"));
+            let off: i64 = line
+                .trim_start_matches(['#', ' '])
+                .split('(')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut b = vec![0x91];
+            let mut v = off;
+            loop {
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if (v == 0 && byte & 0x40 == 0) || (v == -1 && byte & 0x40 != 0) {
+                    b.push(byte);
+                    return b;
+                }
+                b.push(byte | 0x80);
+            }
+        };
+        let children = |i: usize| at(i).children.clone();
+        let kids = children(walk);
+        let list = kids[0];
+        assert_eq!(
+            (at(list).tag, at(list).name()),
+            (dw::TAG_FORMAL_PARAMETER, Some("list"))
+        );
+        assert_eq!(
+            at(list).block(dw::AT_LOCATION).unwrap(),
+            slot("param struct node *list").as_slice()
+        );
+        assert_eq!(type_of(list), "Node *");
+        assert_eq!(type_of(kids[1]), "color_t");
+        assert_eq!(at(kids[1]).unsigned(dw::AT_DECL_LINE), Some(12));
+        // The static local is at its symbol, the other in the frame.
+        let calls = kids[2];
+        assert_eq!(at(calls).name(), Some("calls"));
+        let loc = at(calls).block(dw::AT_LOCATION).unwrap();
+        assert_eq!((loc[0], loc.len() as u64), (0x03, 1 + ptr), "DW_OP_addr");
+        assert_eq!(at(kids[3]).name(), Some("sum"));
+        assert_eq!(
+            at(kids[3]).block(dw::AT_LOCATION).unwrap(),
+            slot("local long sum").as_slice()
+        );
+        // The block of `w`, and in it the `for`'s, with `i` and its body's,
+        // with `p`: each inside the one around it.
+        let block = kids[4];
+        assert_eq!(at(block).tag, dw::TAG_LEXICAL_BLOCK);
+        let (wlo, whi) = at(walk).ranges[0];
+        let inside = |inner: usize, outer: (u64, u64)| {
+            let (lo, hi) = at(inner).ranges[0];
+            assert!(outer.0 <= lo && lo < hi && hi <= outer.1, "{x:?}");
+            (lo, hi)
+        };
+        let b1 = inside(block, (wlo, whi));
+        let w = children(block)[0];
+        assert_eq!((at(w).name(), type_of(w).as_str()), (Some("w"), "union word"));
+        let for_block = children(block)[1];
+        let b2 = inside(for_block, b1);
+        assert_eq!(at(children(for_block)[0]).name(), Some("i"));
+        let body = children(for_block)[1];
+        inside(body, b2);
+        let p = children(body)[0];
+        assert_eq!((at(p).name(), type_of(p).as_str()), (Some("p"), "Node *"));
+        assert_eq!(
+            at(p).block(dw::AT_LOCATION).unwrap(),
+            slot("local struct node *p").as_slice()
+        );
+
+        // The globals, at their symbols (relocated in the object: section
+        // offsets), with their types.
+        let symbols = elf.symbols().unwrap();
+        for (name, spelled) in [
+            ("head", "Node"),
+            ("grid", "short[2][3]"),
+            // A volatile pointer to const char (the test's spelling is
+            // prefix, outermost first).
+            ("name", "volatile const char *"),
+            ("pick", "int(int, ...) *"),
+        ] {
+            let g = named(dw::TAG_VARIABLE, name);
+            assert_eq!(at(g).parent, Some(0));
+            assert_eq!(type_of(g), spelled, "{name}");
+            let loc = at(g).block(dw::AT_LOCATION).unwrap();
+            let sym = symbols.iter().find(|s| s.name == name).unwrap();
+            let addr = loc[1..].iter().rev().fold(0u64, |a, &b| a << 8 | u64::from(b));
+            assert_eq!((loc[0], addr), (0x03, sym.value), "{name}");
+            assert_eq!(at(g).flag(dw::AT_EXTERNAL), name != "grid", "{name}");
+        }
+
+        // The struct, the union and the enum, laid out for the target.
+        let node = named(dw::TAG_STRUCTURE_TYPE, "node");
+        assert_eq!(at(node).unsigned(dw::AT_BYTE_SIZE), Some(2 * ptr));
+        let members: Vec<(String, String, Option<u64>)> = children(node)
+            .iter()
+            .map(|&m| {
+                let d = at(m);
+                (
+                    d.name().unwrap().to_string(),
+                    type_of(m),
+                    d.unsigned(dw::AT_DATA_MEMBER_LOCATION),
+                )
+            })
+            .collect();
+        assert_eq!(
+            members,
+            [
+                ("value".to_string(), "int".to_string(), Some(0)),
+                ("next".to_string(), "struct node *".to_string(), Some(ptr)),
+            ]
+        );
+        let word = named(dw::TAG_UNION_TYPE, "word");
+        assert_eq!(at(word).unsigned(dw::AT_BYTE_SIZE), Some(4));
+        assert!(children(word)
+            .iter()
+            .all(|&m| at(m).attr(dw::AT_DATA_MEMBER_LOCATION).is_none()));
+        assert_eq!(type_of(children(word)[1]), "unsigned char[4]");
+        let color = named(dw::TAG_ENUMERATION_TYPE, "color");
+        assert_eq!(type_of(color), "unsigned int");
+        let constants: Vec<(&str, Option<i64>)> = children(color)
+            .iter()
+            .map(|&e| {
+                (
+                    at(e).name().unwrap(),
+                    at(e).attr(dw::AT_CONST_VALUE).and_then(Attr::signed),
+                )
+            })
+            .collect();
+        assert_eq!(
+            constants,
+            [("RED", Some(0)), ("GREEN", Some(5)), ("BLUE", Some(6))]
+        );
+        assert_eq!(type_of(named(dw::TAG_TYPEDEF, "color_t")), "enum color");
+        // Plain char is unsigned on RISC-V; every type is described once.
+        let char_ = named(dw::TAG_BASE_TYPE, "char");
+        assert_eq!(at(char_).unsigned(dw::AT_ENCODING), Some(dw::ATE_UNSIGNED_CHAR));
+        let ints = u
+            .dies
+            .iter()
+            .filter(|d| d.tag == dw::TAG_BASE_TYPE && d.name() == Some("int"));
+        assert_eq!(ints.count(), 1);
+    }
+}
+
+/// llvm-dwarfdump finds nothing wrong with the debug information of any test
+/// case, at either width, linked. Ignored: it needs llvm-dwarfdump (`LLVM_DWARFDUMP`
+/// names it if it is not on the PATH).
+#[test]
+#[ignore]
+fn llvm_dwarfdump_verifies_every_case() {
+    let tool = std::env::var("LLVM_DWARFDUMP").unwrap_or_else(|_| "llvm-dwarfdump".into());
+    let dir = std::env::temp_dir().join(format!("merlin-verify-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for x in [Xlen::Rv32, Xlen::Rv64] {
+        let opts = Options {
+            xlen: x,
+            ..debug_opts("tests/cases")
+        };
+        let as_opts = merlin_as::Options { xlen: x };
+        let mut sources: Vec<(String, String)> = cases()
+            .iter()
+            .map(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read_to_string(p).unwrap())
+            })
+            .collect();
+        sources.push(("v.c".into(), VARS.into()));
+        for (name, src) in sources {
+            let asm = merlin::compile_with(&name, &src, &opts, &merlin::no_files).unwrap();
+            let obj = merlin_as::assemble_to_elf_with(&asm, &as_opts).unwrap();
+            let file = dir.join(format!("{name}-{}.o", x.bits()));
+            std::fs::write(&file, &obj).unwrap();
+            let out = std::process::Command::new(&tool)
+                .arg("--verify")
+                .arg(&file)
+                .output()
+                .unwrap_or_else(|e| panic!("cannot run {tool}: {e}"));
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && text.contains("No errors."),
+                "{name} ({x:?}):\n{text}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

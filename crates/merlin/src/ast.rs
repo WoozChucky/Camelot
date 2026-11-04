@@ -19,7 +19,7 @@
 //! Typedefs, struct tags and enum constants are gone even earlier: the parser
 //! resolves them, so the tree only has types and numbers.
 
-use crate::types::{Type, Xlen};
+use crate::types::{Spelled, Type, Xlen};
 use crate::Pos;
 use std::fmt::Write;
 
@@ -76,6 +76,8 @@ pub enum Storage {
 pub struct Function {
     pub name: String,
     pub ret: Type,
+    /// How the return type was spelled (for `-g`).
+    pub ret_spelled: Spelled,
     pub params: Vec<Param>,
     /// `...` ends the parameter list.
     pub variadic: bool,
@@ -126,6 +128,8 @@ pub struct Param {
     /// parameters.
     pub ty: Type,
     pub pos: Pos,
+    /// How its type was spelled (for `-g`).
+    pub spelled: Spelled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +160,8 @@ pub struct Declarator {
     /// else the first that is not `extern`).
     pub define: bool,
     pub pos: Pos,
+    /// How its type was spelled (for `-g`).
+    pub spelled: Spelled,
 }
 
 /// An initializer: `= expr` or `= { ... }`.

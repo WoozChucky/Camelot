@@ -87,7 +87,10 @@
 use crate::ast::*;
 use crate::consteval;
 use crate::lexer::{Kw, Tok, Token};
-use crate::types::{align_up, common, ptr_size, IntKind, Quals, Record, Type, Xlen, MAX_OBJECT_SIZE};
+use crate::types::{
+    align_up, common, ptr_size, EnumType, IntKind, Quals, Record, Spelled, Spelling, Type, TypedefName, Xlen,
+    MAX_OBJECT_SIZE,
+};
 use crate::{Error, Pos};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -114,7 +117,10 @@ pub fn parse(toks: &[Token], xlen: Xlen) -> Result<Program, Error> {
     let mut file = Scope::default();
     file.names.insert(
         "__builtin_va_list".to_string(),
-        (Name::Typedef(Type::ptr(Type::Void)), Pos::default()),
+        (
+            Name::Typedef(Type::ptr(Type::Void), Spelled::default()),
+            Pos::default(),
+        ),
     );
     let mut p = Parser {
         toks,
@@ -229,14 +235,16 @@ struct Specs {
     /// enum tag, or enumeration constants), so they may end the declaration
     /// with no declarator: `struct point { int x, y; };`.
     declares: bool,
+    /// How the type was spelled: a typedef name or an enum (for `-g`).
+    spelled: Spelled,
 }
 
 /// What an ordinary identifier (C's namespace of variables, functions,
 /// typedef names and enumeration constants) means to the parser.
 #[derive(Clone, Debug, PartialEq)]
 enum Name {
-    /// A typedef name, and the type it stands for.
-    Typedef(Type),
+    /// A typedef name, the type it stands for, and the name as a spelling.
+    Typedef(Type, Spelled),
     /// An enumeration constant and its value (an `int`).
     EnumConst(i128),
     /// A variable or function, and its declared type: resolved by sema, but
@@ -248,8 +256,8 @@ enum Name {
 #[derive(Clone)]
 enum Tag {
     Record(Arc<Record>),
-    /// An enum: the integer type it is.
-    Enum(Type),
+    /// An enum: the integer type it is, and the enum as a spelling.
+    Enum(Type, Spelled),
 }
 
 /// One block scope: the file, a function's parameters and body, a block, a
@@ -392,8 +400,16 @@ impl Parser<'_> {
     /// The type a typedef name in scope stands for.
     fn typedef(&self, name: &str) -> Option<&Type> {
         match self.lookup_name(name) {
-            Some(Name::Typedef(t)) => Some(t),
+            Some(Name::Typedef(t, _)) => Some(t),
             _ => None,
+        }
+    }
+
+    /// A typedef name in scope as a spelling.
+    fn typedef_spelling(&self, name: &str) -> Spelled {
+        match self.lookup_name(name) {
+            Some(Name::Typedef(_, s)) => s.clone(),
+            _ => Spelled::default(),
         }
     }
 
@@ -429,8 +445,10 @@ impl Parser<'_> {
                 ))
             }
             Some((prev, _)) if *prev == what && !matches!(what, Name::EnumConst(_)) => Ok(()),
-            Some((Name::Typedef(prev), _)) if matches!(what, Name::Typedef(_)) => {
-                let Name::Typedef(new) = what else { unreachable!() };
+            Some((Name::Typedef(prev, _), _)) if matches!(what, Name::Typedef(..)) => {
+                let Name::Typedef(new, _) = what else {
+                    unreachable!()
+                };
                 Err(Error::new(
                     pos,
                     format!("typedef redefinition with different types ('{new}' vs '{prev}')"),
@@ -605,6 +623,7 @@ impl Parser<'_> {
         let mut quals = Quals::NONE;
         // A struct, union or enum, or a typedef name: a type on its own.
         let mut named: Option<Type> = None;
+        let mut spelled = Spelled::default();
         let mut declares = false;
         // How many times each type keyword appears.
         let (mut void, mut char, mut short, mut int, mut long, mut signed, mut unsigned, mut bool_) =
@@ -621,6 +640,7 @@ impl Parser<'_> {
                         && self.typedef(&name).is_some() =>
                 {
                     named = self.typedef(&name).cloned();
+                    spelled = self.typedef_spelling(&name);
                     self.advance();
                     continue;
                 }
@@ -672,12 +692,15 @@ impl Parser<'_> {
                     if named.is_some() || void + char + short + int + long + signed + unsigned + bool_ > 0 {
                         return Err(Error::new(start, "invalid combination of type specifiers"));
                     }
-                    let (ty, d) = self.nested(|p| match k {
+                    let (ty, d, s) = self.nested(|p| match k {
                         Kw::Enum => p.enum_spec(pos),
-                        _ => p.record_spec(k == Kw::Union, pos),
+                        _ => p
+                            .record_spec(k == Kw::Union, pos)
+                            .map(|(t, d)| (t, d, Spelled::default())),
                     })?;
                     named = Some(ty);
                     declares = d;
+                    spelled = s;
                     continue;
                 }
                 Kw::Void => &mut void,
@@ -764,6 +787,7 @@ impl Parser<'_> {
             class,
             inline,
             declares,
+            spelled,
         })
     }
 
@@ -831,7 +855,7 @@ impl Parser<'_> {
     /// `{ member-decl+ }`: the members, laid out into `record`.
     fn record_body(&mut self, record: &Record) -> Result<(), Error> {
         let open = self.expect_punct("{")?;
-        let mut members: Vec<(String, Type)> = Vec::new();
+        let mut members: Vec<(String, Type, Spelled, Pos)> = Vec::new();
         let mut seen: HashMap<String, Pos> = HashMap::new();
         // The layout so far, to reject a struct too big before laying it out.
         let mut end = 0u64;
@@ -881,7 +905,7 @@ impl Parser<'_> {
                 if end > MAX_OBJECT_SIZE {
                     return Err(Error::new(d.pos, format!("{} is too large", record.keyword())));
                 }
-                members.push((d.name, d.ty));
+                members.push((d.name, d.ty, specs.spelled.clone(), d.pos));
                 if !self.eat_punct(",") {
                     break;
                 }
@@ -893,12 +917,16 @@ impl Parser<'_> {
         }
         if align_up(
             end,
-            members.iter().map(|(_, t)| t.align(self.xlen)).max().unwrap_or(1),
+            members
+                .iter()
+                .map(|(_, t, _, _)| t.align(self.xlen))
+                .max()
+                .unwrap_or(1),
         ) > MAX_OBJECT_SIZE
         {
             return Err(Error::new(open, format!("{} is too large", record.keyword())));
         }
-        record.complete(members, self.xlen);
+        record.complete_spelled(members, self.xlen);
         Ok(())
     }
 
@@ -906,7 +934,7 @@ impl Parser<'_> {
     /// (so `B = A + 1` works), or a reference to a defined tag. An enum type
     /// is `unsigned int` when no constant is negative and `int` otherwise
     /// (clang's and GCC's choice for C); the constants themselves are `int`s.
-    fn enum_spec(&mut self, kw_pos: Pos) -> Result<(Type, bool), Error> {
+    fn enum_spec(&mut self, kw_pos: Pos) -> Result<(Type, bool, Spelled), Error> {
         let tag = match self.peek().clone() {
             Tok::Ident(name) => Some((name, self.advance().pos)),
             _ => None,
@@ -916,7 +944,7 @@ impl Parser<'_> {
                 return Err(self.unexpected("a name or '{' after 'enum'"));
             };
             return match self.lookup_tag(&name) {
-                Some(Tag::Enum(ty)) => Ok((ty.clone(), false)),
+                Some(Tag::Enum(ty, s)) => Ok((ty.clone(), false, s.clone())),
                 Some(Tag::Record(_)) => Err(Error::new(
                     pos,
                     format!("use of '{name}' with tag type that does not match previous declaration"),
@@ -937,10 +965,10 @@ impl Parser<'_> {
         let (int_min, int_max) = IntKind::Int.range(self.xlen);
         let mut next = 0i128;
         let mut negative = false;
-        let mut count = 0;
+        let mut constants = Vec::new();
         loop {
             if self.eat_punct("}") {
-                if count == 0 {
+                if constants.is_empty() {
                     return Err(Error::new(kw_pos, "use of empty enum"));
                 }
                 break;
@@ -963,16 +991,22 @@ impl Parser<'_> {
             self.bind_name(&name, Name::EnumConst(value), pos)?;
             negative |= value < 0;
             next = value + 1;
-            count += 1;
+            constants.push((name, value));
             if !self.eat_punct(",") && !self.is_punct("}") {
                 return Err(self.unexpected("',' or '}' in the enum"));
             }
         }
         let ty = if negative { Type::INT } else { Type::UINT };
+        let spelled = Spelled(Some(Spelling::Enum(Arc::new(EnumType {
+            tag: tag.as_ref().map(|(n, _)| n.clone()),
+            ty: ty.clone(),
+            constants,
+            pos: kw_pos,
+        }))));
         if let Some((name, _)) = tag {
-            self.bind_tag(&name, Tag::Enum(ty.clone()));
+            self.bind_tag(&name, Tag::Enum(ty.clone(), spelled.clone()));
         }
-        Ok((ty, true))
+        Ok((ty, true, spelled))
     }
 
     /// `const`, `volatile` and `restrict` after a `*`.
@@ -1255,6 +1289,7 @@ impl Parser<'_> {
                 name: d.name,
                 ty,
                 pos,
+                spelled: specs.spelled.clone(),
             });
             if self.eat_punct(")") {
                 return Ok((params, false));
@@ -1381,6 +1416,7 @@ impl Parser<'_> {
                 var: None,
                 define: false,
                 pos: d.pos,
+                spelled: specs.spelled.clone(),
             });
             if !self.eat_punct(",") {
                 break;
@@ -1400,7 +1436,13 @@ impl Parser<'_> {
                     "illegal initializer (only variables can be initialized)",
                 ));
             }
-            self.bind_name(&d.name, Name::Typedef(d.ty), d.pos)?;
+            let spelling = Spelled(Some(Spelling::Typedef(Arc::new(TypedefName {
+                name: d.name.clone(),
+                ty: d.ty.clone(),
+                spelled: specs.spelled.clone(),
+                pos: d.pos,
+            }))));
+            self.bind_name(&d.name, Name::Typedef(d.ty, spelling), d.pos)?;
             if !self.eat_punct(",") {
                 break;
             }
@@ -1494,6 +1536,7 @@ impl Parser<'_> {
                             name: String::new(),
                             ty: t.clone(),
                             pos: d.pos,
+                            spelled: Spelled::default(),
                         })
                         .collect()
                 })
@@ -2032,7 +2075,7 @@ impl Parser<'_> {
                         self.advance();
                         return Ok(Expr::new(ExprKind::Num(v), pos));
                     }
-                    Some(Name::Typedef(_)) => {
+                    Some(Name::Typedef(..)) => {
                         return Err(Error::new(
                             pos,
                             format!("unexpected type name '{name}': expected expression"),
@@ -2101,6 +2144,7 @@ fn function(d: Decl, params: Vec<Param>, specs: &Specs, body: Option<Vec<Stmt>>,
     Function {
         name: d.name,
         ret,
+        ret_spelled: specs.spelled.clone(),
         params,
         variadic,
         is_static: specs.class == Class::Static,

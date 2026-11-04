@@ -3693,13 +3693,19 @@ fn committed_kernel_is_what_our_toolchain_builds() {
     let names = program_names();
     assert_eq!(programs(&built.elf) as usize, names.len());
     assert_eq!(programs(&disk), 0);
-    // Under a quarter of the size: the programs were most of it.
-    assert!(
-        disk.len() * 4 < built.elf.len(),
-        "{} of {}",
-        disk.len(),
-        built.elf.len()
-    );
+    // Under a quarter of the loaded bytes: the programs were most of them. (The
+    // files also hold the kernel's debug information, which is not loaded.)
+    let loaded = |file: &[u8]| -> u64 {
+        let parsed = elf::Elf::parse(file).unwrap();
+        parsed
+            .segments
+            .iter()
+            .filter(|s| s.ty == elf::PT_LOAD)
+            .map(|s| s.filesz)
+            .sum()
+    };
+    let (disk_loaded, full_loaded) = (loaded(&disk), loaded(&built.elf));
+    assert!(disk_loaded * 4 < full_loaded, "{disk_loaded} of {full_loaded}");
     let c = built.objects.iter().filter(|o| o.source.lang == Lang::C).count();
     assert!(c >= 20, "{c} C files");
     assert!(built
