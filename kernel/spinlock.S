@@ -33,10 +33,15 @@
 
     .text
 
-/* u32 r_tp(void) */
+/* u32 r_tp(void)
+ *
+ * A u32 result is returned sign-extended from bit 31 on RV64, as the ABI
+ * keeps every 32-bit value in a register (and the compiler's comparisons
+ * rely on it): ADDIW (asm.h) makes one of tp, whatever its upper half holds
+ * (illegal_instruction() fills tp with a pattern before it faults). */
     .globl r_tp
 r_tp:
-    mv    a0, tp
+    ADDIW a0, tp, 0
     ret
 
 /* struct cpu *mycpu(void) { return &cpus[tp]; }
