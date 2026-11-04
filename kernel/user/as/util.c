@@ -156,9 +156,20 @@ void *grow(void *p, uint *cap, uint need, uint size) {
     if (need <= *cap) {
         return p;
     }
+    /* Double the capacity until it holds need, but stop at need itself
+     * when doubling would pass 2^32 (a uint doubled past 0x80000000 is 0,
+     * and the loop would never end), and refuse a byte count that does
+     * not fit in 32 bits: no Camelot process has that much memory. */
     uint c = *cap ? *cap : 8;
     while (c < need) {
+        if (c > 0xffffffffu / 2) {
+            c = need;
+            break;
+        }
         c *= 2;
+    }
+    if (size != 0 && c > 0xffffffffu / size) {
+        die("out of memory");
     }
     void *q = realloc(p, c * size);
     if (q == NULL) {
@@ -171,6 +182,9 @@ void *grow(void *p, uint *cap, uint need, uint size) {
 /* ---- Byte buffers ---- */
 
 void buf_put(struct buf *b, const void *p, uint n) {
+    if (b->len + n < b->len) {
+        die("out of memory");
+    }
     b->data = grow(b->data, &b->cap, b->len + n, 1);
     memcpy(b->data + b->len, p, n);
     b->len += n;
