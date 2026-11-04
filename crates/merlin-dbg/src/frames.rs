@@ -433,6 +433,83 @@ mod tests {
         reads_prologues(&RV64);
     }
 
+    /// `tests/rv64/prog.c` (with `crt0.s`) built for `xlen` with merlin, merlin-as and
+    /// merlin-ld, as `tests/session.rs` builds it: its loaded words, and its symbols.
+    fn merlin_program(xlen: Xlen) -> (Words, crate::symbols::Symbols) {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/rv64");
+        let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}")).unwrap();
+        let opts = merlin::Options {
+            xlen,
+            ..merlin::Options::default()
+        };
+        let asm = merlin::compile_with("prog.c", &read("prog.c"), &opts, &merlin::no_files)
+            .unwrap_or_else(|e| panic!("merlin: {e:?}"));
+        let as_opts = merlin_as::Options { xlen };
+        let inputs: Vec<merlin_ld::Input> = [("crt0.o", read("crt0.s")), ("prog.o", asm)]
+            .into_iter()
+            .map(|(name, asm)| merlin_ld::Input {
+                name: name.into(),
+                data: merlin_as::assemble_to_elf_with(&asm, &as_opts)
+                    .unwrap_or_else(|e| panic!("merlin-as {name}: {e:?}")),
+            })
+            .collect();
+        let linked = merlin_ld::link(&inputs, &merlin_ld::Options::default())
+            .unwrap_or_else(|e| panic!("merlin-ld: {e:?}"));
+        let file = elf::Elf::parse(&linked.elf).unwrap();
+        let mut mem = Words::default();
+        const PT_LOAD: u32 = 1;
+        for seg in file.segments.iter().filter(|p| p.ty == PT_LOAD) {
+            let (words, _) = file.segment_data(seg).unwrap().as_chunks::<4>();
+            for (i, &w) in words.iter().enumerate() {
+                mem.code.insert(seg.vaddr + 4 * i as u64, u32::from_le_bytes(w));
+            }
+        }
+        (mem, crate::symbols::Symbols::from_elf(&linked.elf).unwrap())
+    }
+
+    /// The prologues above are merlin's own: prog.c's sum (variadic, one named
+    /// parameter, as kprintf) and fact (not), compiled for each width, start with
+    /// exactly those words, and their slots are where the module doc's formula
+    /// puts them (ra at CFA - W*(9 - k), s0 at CFA - W*(10 - k), k = 1).
+    #[test]
+    fn the_prologues_are_merlins() {
+        for w in [&RV32, &RV64] {
+            let (mut mem, symbols) = merlin_program(w.xlen);
+            let words =
+                |mem: &mut Words, at: u64| -> Vec<u32> { (0..4).map(|i| mem.code[&(at + 4 * i)]).collect() };
+            let sum = symbols.lookup("sum").unwrap();
+            assert_eq!(words(&mut mem, sum), w.variadic, "{:?} sum", w.xlen);
+            let reg = i64::from(w.xlen.bits() / 8);
+            assert_eq!(w.variadic_slots, (-reg * 8, -reg * 9));
+            assert_eq!(
+                prologue(&mut mem, sum, w.xlen),
+                Some(Prologue {
+                    fp_set_at: sum + 12,
+                    fp: 0,
+                    ra_slot: w.variadic_slots.0,
+                    s0_slot: w.variadic_slots.1
+                })
+            );
+            let fact = symbols.lookup("fact").unwrap();
+            assert_eq!(
+                words(&mut mem, fact),
+                [ADDI_SP_M16, w.save_ra, w.save_s0, ADDI_S0_16],
+                "{:?} fact",
+                w.xlen
+            );
+            assert_eq!(w.slots, (-reg, -reg * 2));
+            assert_eq!(
+                prologue(&mut mem, fact, w.xlen),
+                Some(Prologue {
+                    fp_set_at: fact + 12,
+                    fp: 0,
+                    ra_slot: w.slots.0,
+                    s0_slot: w.slots.1
+                })
+            );
+        }
+    }
+
     /// GDB's prologue analysis, for `break FUNC` on a function without lines.
     #[test]
     fn scans_prologues_as_gdb() {

@@ -336,7 +336,7 @@ In each case `ra` holds the return address and `s0` is still the caller's frame 
 
 **Trap handlers** are not calls either. A backtrace from inside one ends at the handler, or carries on with whatever `s0` the interrupted code had.
 
-`crates/merlin-dbg/src/frames.rs` has the unwinder and its unit tests.
+`crates/merlin-dbg/src/frames.rs` has the unwinder and its unit tests. They read prologues made of merlin's instruction words, and one of them builds `tests/rv64/prog.c` with merlin for RV32 and RV64 and reads the real `sum` (variadic) and `fact`, so that those words are merlin's own.
 
 ### Source lines
 
@@ -382,7 +382,7 @@ The same on RV64 machines, against the stub's `riscv:rv64` description:
 
 - `examples/hello/hello-rv64.elf`: frames and code addresses with 16 digits, the other addresses and `regs` in GDB's layout without leading zeros, `x/b`, `x/h`, `x/w` and `x/g`, steps, a backtrace, disassembly and `finish`;
 - `examples/smp/smp-rv64.elf` with 2 harts: harts and watchpoints;
-- `crates/merlin-dbg/tests/rv64/prog.c`, built by the test with `merlin -g` for RV64, merlin-as and merlin-ld: `break FILE:LINE`, `next` and `step` by line, `list`, a backtrace through a variadic function and five frames of a recursive one, `finish`, and a watchpoint on a 64-bit global;
+- `crates/merlin-dbg/tests/rv64/prog.c`, built by the test with `merlin -g` for RV64, merlin-as and merlin-ld: `break FILE:LINE`, `next` and `step` by line, `list`, a backtrace through a variadic function from inside it, past its prologue (its own frame read from memory: its `ra` and `s0` at CFA - 64 and CFA - 72), and five frames of a recursive one, `finish`, and a watchpoint on a 64-bit global;
 - `merlin-dbg -- ...` on an RV64 program, and an RV32 program's symbols left out for an RV64 machine: the session goes on, the machine stopped at its first instruction until it is run to a breakpoint.
 
 The kernel's RV64 case follows once the kernel is RV64 (#154). `src/remote.rs`'s unit tests give it a stub with no target description, whose width comes from the `g` reply.

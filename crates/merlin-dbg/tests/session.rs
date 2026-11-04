@@ -911,6 +911,15 @@ fn backtrace_after<'a>(out: &'a str, cmd: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// The `n`th backtrace in `out` (from 0): the `#N` lines after the `n`th `bt`.
+fn nth_backtrace(out: &str, n: usize) -> Vec<&str> {
+    let mut lines = out.lines();
+    for _ in 0..=n {
+        lines.find(|l| *l == "(merlin-dbg) bt").expect("a bt");
+    }
+    lines.take_while(|l| l.starts_with('#')).collect()
+}
+
 #[test]
 fn source_lines_of_an_rv64_program() {
     // A breakpoint on main's first line, which stops past main's prologue on the
@@ -999,19 +1008,26 @@ fn source_lines_of_an_rv64_program() {
 
 #[test]
 fn stepping_through_an_rv64_program() {
-    // A breakpoint in sum, a variadic function (its ra and s0 below the saved
-    // argument registers), called from fact five deep in its recursion: the
-    // backtrace, finish, next back up the recursion, a watchpoint on a 64-bit
-    // global and its doublewords, and step into puts.
+    // Breakpoints in sum, a variadic function (its ra and s0 below the saved
+    // argument registers, at CFA-64 and CFA-72), called from fact five deep in its
+    // recursion: on its first statement (break sum) and in its loop, at the va_arg
+    // line, both past its prologue, so that the backtraces read sum's saved ra and
+    // s0 from its frame in memory; finish, next back up the recursion, a
+    // watchpoint on a 64-bit global and its doublewords, and step into puts.
     let elf = rv64_program("steps");
     let [sum_at, total_at] = addresses(&elf, ["sum", "total"]);
     let file = format!("{RV64_DIR}/prog.c");
     let line = |start: &str| line_of(&file, start);
+    let va_arg = line("        s += va_arg(ap, long);");
     let out = connected(
         elf.to_str(),
         1,
         b"",
-        "break sum\n\
+        &format!(
+            "break sum\n\
+         continue\n\
+         bt\n\
+         break prog.c:{va_arg}\n\
          continue\n\
          bt\n\
          finish\n\
@@ -1028,7 +1044,8 @@ fn stepping_through_an_rv64_program() {
          delete\n\
          step\n\
          step\n\
-         continue\n",
+         continue\n"
+        ),
     );
     // break sum stops past its prologue, on its body's first line: sum's frame is
     // built, and the backtrace reads its ra and s0 from their slots.
@@ -1045,11 +1062,29 @@ fn stepping_through_an_rv64_program() {
             &format!("=> {body_at:#018x} <sum+{off}>:  li a0, 0x0"),
         ],
     );
-    // sum, fact(1) to fact(5), main, _start.
+    // In the loop: the va_arg line, further into sum than its prologue, stays where
+    // it is.
     let at = |l: &str| l.split(" at ").nth(1).map(str::to_string);
-    let bt = backtrace_after(&out, "(merlin-dbg) bt");
+    let set = out
+        .lines()
+        .find(|l| l.starts_with("breakpoint 2 at ") && l.ends_with(&format!(": {file}:{va_arg}")))
+        .unwrap_or_else(|| panic!("no breakpoint 2 at line {va_arg} in:\n{out}"));
+    assert!(set.contains(" <sum+"), "{out}");
+    assert_lines(
+        &out,
+        &[
+            "breakpoint 2",
+            &format!("{file}:{va_arg}:         s += va_arg(ap, long);"),
+        ],
+    );
+    // Both times: sum, fact(1) to fact(5), main, _start. sum's own frame (built,
+    // its ra and s0 read from CFA-64 and CFA-72) leads to fact(1).
+    let first = backtrace_after(&out, "(merlin-dbg) bt");
+    let bt = nth_backtrace(&out, 1);
     assert_eq!(bt.len(), 8, "{out}");
-    assert_eq!(at(bt[0]), Some(format!("{file}:{sum}")));
+    assert_eq!(first[1..], bt[1..], "{out}");
+    assert_eq!(at(first[0]), Some(format!("{file}:{sum}")));
+    assert_eq!(at(bt[0]), Some(format!("{file}:{va_arg}")));
     assert!(bt[1].contains(" <fact+"), "{out}");
     assert_eq!(at(bt[1]), Some(format!("{file}:{base_case}")));
     for f in &bt[2..6] {
@@ -1059,7 +1094,7 @@ fn stepping_through_an_rv64_program() {
     assert!(bt[6].contains(" <main+"), "{out}");
     assert_eq!(at(bt[6]), Some(format!("{file}:{call}")));
     assert!(bt[7].contains(" <_start+"), "{out}");
-    // finish: back in fact(1), with sum's result.
+    // finish, from the loop: back in fact(1), with sum's result.
     let back = bt[1].trim_start_matches("#1  ").split(" at ").next().unwrap();
     assert!(
         out.contains(&format!("run till exit, back to {back}\n=> {back}:")),
@@ -1070,26 +1105,24 @@ fn stepping_through_an_rv64_program() {
     // the backtrace has lost fact(1).
     let lines: Vec<u32> = source_lines(&out, &file).iter().map(|(n, _)| *n).collect();
     assert_eq!(
-        lines[..5],
-        [sum, base_case, recursion + 1, recursion, recursion + 1],
+        lines[..6],
+        [sum, va_arg, base_case, recursion + 1, recursion, recursion + 1],
         "{out}"
     );
-    let second = out.replacen("(merlin-dbg) bt", "", 1);
-    let bt = backtrace_after(&second, "(merlin-dbg) bt");
-    assert_eq!(bt.len(), 6, "{out}");
+    assert_eq!(nth_backtrace(&out, 2).len(), 6, "{out}");
     // The watchpoint: 8 bytes of total, written twice; the second time with the
     // high half set.
     assert_lines(
         &out,
         &[
-            &format!("watchpoint 2 (write) at {total_at:#x} <total>, 8 bytes"),
-            &format!("watchpoint 2 (write) hit at {total_at:#x} <total>"),
+            &format!("watchpoint 3 (write) at {total_at:#x} <total>, 8 bytes"),
+            &format!("watchpoint 3 (write) hit at {total_at:#x} <total>"),
             &format!(
                 "{file}:{}:     total = total + sum(3, 0x100000000L, 2L, 3L);",
                 call + 2
             ),
             &format!("{total_at:#x} <total>:  0x0000000000000078"),
-            &format!("watchpoint 2 (write) hit at {total_at:#x} <total>"),
+            &format!("watchpoint 3 (write) hit at {total_at:#x} <total>"),
             &format!("{file}:{}:     puts(\"done\\n\");", call + 3),
             &format!("{total_at:#x} <total>:  0x000000010000007d"),
             &format!("{file}:{}:     while (*s) {{", line("    while (*s) {")),
