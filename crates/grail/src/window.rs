@@ -13,7 +13,7 @@
 //! host can show several machines' framebuffers at once. The only process-wide thing
 //! is the window class, which Windows registers once per process anyway.
 
-use crate::framebuffer::{FB_HEIGHT, FB_WIDTH};
+use crate::framebuffer::{Frame, FB_HEIGHT, FB_WIDTH};
 use crate::keyboard::{code, KeyEvent};
 use crate::pointer::{Motion, PointerInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT};
 use crate::win32::*;
@@ -41,12 +41,16 @@ struct State {
     /// Wheel motion not yet reported: less than a notch (precise touchpads and wheels
     /// send fractions of `WHEEL_DELTA`).
     wheel: Cell<i32>,
+    /// The size of the frame last drawn, in pixels: the framebuffer's mode, which the
+    /// mouse's positions are mapped to.
+    frame: Cell<(u32, u32)>,
 }
 
 impl State {
     fn new() -> Self {
         State {
             down: RefCell::new(vec![0; 256]),
+            frame: Cell::new((FB_WIDTH, FB_HEIGHT)),
             ..State::default()
         }
     }
@@ -146,7 +150,7 @@ impl State {
                 // Client coordinates, signed (negative left of or above the client
                 // area while the mouse is captured).
                 let (x, y) = (lparam as u16 as i16 as i32, (lparam >> 16) as u16 as i16 as i32);
-                let pos = client_to_fb(x, y, width, height);
+                let pos = client_to_fb(x, y, width, height, self.frame.get());
                 let buttons = mk_buttons(wparam);
                 if pos.is_some() || buttons != self.buttons.get() {
                     self.mouse(pos, buttons, 0);
@@ -180,18 +184,19 @@ fn mk_buttons(wparam: WPARAM) -> u8 {
 }
 
 /// The framebuffer pixel shown at point (`x`, `y`) of a client area `width` × `height`
-/// pixels, which the frame is stretched over (`Window::draw`). Points outside the client
-/// area (a drag that leaves the window) give pixels outside the framebuffer; the pointer
-/// device clamps them. `None` while the client area is empty (minimized).
-fn client_to_fb(x: i32, y: i32, width: i32, height: i32) -> Option<(i32, i32)> {
+/// pixels, which a frame of `frame` (width, height) pixels is stretched over
+/// (`Window::draw`). Points outside the client area (a drag that leaves the window) give
+/// pixels outside the framebuffer; the pointer device clamps them. `None` while the
+/// client area is empty (minimized).
+fn client_to_fb(x: i32, y: i32, width: i32, height: i32, frame: (u32, u32)) -> Option<(i32, i32)> {
     if width <= 0 || height <= 0 {
         return None;
     }
     // The stretch (COLORONCOLOR) gives each client pixel the frame pixel under its
-    // centre: client pixel `x` shows frame pixel floor((x + 1/2) * FB_WIDTH / width).
+    // centre: client pixel `x` shows frame pixel floor((x + 1/2) * frame width / width).
     let scale =
         |v: i32, fb: u32, client: i32| ((2 * v as i64 + 1) * fb as i64).div_euclid(2 * client as i64) as i32;
-    Some((scale(x, FB_WIDTH, width), scale(y, FB_HEIGHT, height)))
+    Some((scale(x, frame.0, width), scale(y, frame.1, height)))
 }
 
 /// Spec key code of a key that is not a printable character, from its virtual-key code.
@@ -440,11 +445,27 @@ impl Window {
         }
     }
 
-    /// Stretches the frame over the client area. `pixels` is top-down XRGB8888 rows of
-    /// `FB_WIDTH` pixels (the VRAM layout); `None` paints the display black.
-    pub fn draw(&self, pixels: Option<&[u8]>) {
+    /// The size of the frame last drawn: the mouse's positions are in its pixels.
+    pub fn frame_size(&self) -> (u32, u32) {
+        self.state.frame.get()
+    }
+
+    /// Stretches the frame over the client area; a frame with no pixels (the display
+    /// off) paints it black. A frame of another size than the last one (the guest
+    /// changed modes) resizes the window to show it pixel for pixel, as QEMU's window
+    /// does, unless the user has maximized or minimized it; the mouse is mapped to the
+    /// new size from then on.
+    pub fn draw(&self, frame: Frame) {
         if !self.is_open() {
             return;
+        }
+        if self.state.frame.replace((frame.width, frame.height)) != (frame.width, frame.height) {
+            self.fit_to(frame.width, frame.height);
+        }
+        if let Some(pixels) = frame.pixels {
+            // A scanout buffer may be RAM the guest has never touched, which the host's
+            // GDI could not read on Windows until it is committed.
+            crate::ram::touch(pixels);
         }
         // SAFETY: a valid window handle; the DC is released before returning.
         unsafe {
@@ -454,28 +475,83 @@ impl Window {
             if hdc.is_null() {
                 return;
             }
-            stretch(
-                hdc,
-                client.right - client.left,
-                client.bottom - client.top,
-                pixels,
-            );
+            stretch(hdc, client.right - client.left, client.bottom - client.top, frame);
             ReleaseDC(self.hwnd, hdc);
+        }
+    }
+
+    /// Gives the window a client area of `width` × `height` pixels, keeping its top
+    /// left corner, unless it is maximized or minimized. It stays on its monitor's work
+    /// area ([`fitted`]): a mode bigger than the screen (1920x1080 on a 1080p monitor,
+    /// once the borders and the title bar are counted) gets a smaller window, which the
+    /// frame is stretched to as always.
+    fn fit_to(&self, width: u32, height: u32) {
+        // SAFETY: a valid window handle, and structs the calls fill in (MONITORINFO with
+        // its size set, as GetMonitorInfoW requires).
+        unsafe {
+            if IsZoomed(self.hwnd) != 0 || IsIconic(self.hwnd) != 0 {
+                return;
+            }
+            let (mut outer, mut client) = (RECT::default(), RECT::default());
+            GetWindowRect(self.hwnd, &mut outer);
+            GetClientRect(self.hwnd, &mut client);
+            let extra = (
+                (outer.right - outer.left) - client.right,
+                (outer.bottom - outer.top) - client.bottom,
+            );
+            let mut monitor = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..MONITORINFO::default()
+            };
+            let on = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+            let work = (GetMonitorInfoW(on, &mut monitor) != 0).then_some(monitor.rcWork);
+            let to = fitted(outer, extra, width, height, work);
+            MoveWindow(
+                self.hwnd,
+                to.left,
+                to.top,
+                to.right - to.left,
+                to.bottom - to.top,
+                1,
+            );
         }
     }
 }
 
-/// Stretches the frame (`Window::draw`'s `pixels`) over `width` x `height` pixels at
-/// the top left of `hdc`. `client_to_fb` inverts this mapping.
+/// Where a window whose outer rectangle is `outer` goes for a client area of `width` ×
+/// `height`, `extra` being what its frame adds (borders, title bar): at its top left
+/// corner, but inside `work`, its monitor's work area, when that is known. There it is
+/// no bigger than the work area, and moved up or left as far as needed for its right
+/// and bottom edges to be in it, so that the title bar stays on screen.
+fn fitted(outer: RECT, extra: (i32, i32), width: u32, height: u32, work: Option<RECT>) -> RECT {
+    let mut w = (width as i32).saturating_add(extra.0);
+    let mut h = (height as i32).saturating_add(extra.1);
+    let (mut left, mut top) = (outer.left, outer.top);
+    if let Some(work) = work {
+        w = w.min(work.right - work.left);
+        h = h.min(work.bottom - work.top);
+        left = left.min(work.right - w).max(work.left);
+        top = top.min(work.bottom - h).max(work.top);
+    }
+    RECT {
+        left,
+        top,
+        right: left + w,
+        bottom: top + h,
+    }
+}
+
+/// Stretches `frame` (`Window::draw`'s) over `width` x `height` pixels at the top left
+/// of `hdc`. `client_to_fb` inverts this mapping.
 ///
 /// # Safety
 /// `hdc` must be a valid device context.
-unsafe fn stretch(hdc: HDC, width: i32, height: i32, pixels: Option<&[u8]>) {
+unsafe fn stretch(hdc: HDC, width: i32, height: i32, frame: Frame) {
     const BLACK: [u8; 4] = [0; 4];
-    let (bits, w, h): (*const c_void, i32, i32) = match pixels {
+    let (bits, w, h): (*const c_void, i32, i32) = match frame.pixels {
         Some(p) => {
-            assert_eq!(p.len(), (FB_WIDTH * FB_HEIGHT * 4) as usize);
-            (p.as_ptr().cast(), FB_WIDTH as i32, FB_HEIGHT as i32)
+            assert_eq!(p.len(), frame.width as usize * frame.height as usize * 4);
+            (p.as_ptr().cast(), frame.width as i32, frame.height as i32)
         }
         None => (BLACK.as_ptr().cast(), 1, 1),
     };
@@ -617,42 +693,98 @@ mod tests {
         assert!(st.keys.take().is_empty());
     }
 
+    /// A window resized for a new mode keeps its corner when it fits on the monitor's
+    /// work area, and otherwise shrinks to it and moves back onto it.
+    #[test]
+    fn a_resized_window_stays_on_its_monitor() {
+        let rect = |left, top, right, bottom| RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let pos = |r: RECT| (r.left, r.top, r.right - r.left, r.bottom - r.top);
+        // A 1080p monitor with a 48-pixel taskbar; the frame adds 16 x 39.
+        let work = Some(rect(0, 0, 1920, 1032));
+        let extra = (16, 39);
+        let outer = rect(100, 50, 100 + 656, 50 + 519);
+        // 800x600 fits where the window is.
+        assert_eq!(pos(fitted(outer, extra, 800, 600, work)), (100, 50, 816, 639));
+        // 1280x1024 fits across but not down: as tall as the work area, from its top.
+        assert_eq!(pos(fitted(outer, extra, 1280, 1024, work)), (100, 0, 1296, 1032));
+        // 1920x1080 fits neither way: the whole work area.
+        assert_eq!(pos(fitted(outer, extra, 1920, 1080, work)), (0, 0, 1920, 1032));
+        // Near the right edge, it moves left as far as it must.
+        let right = rect(1500, 50, 1500 + 656, 50 + 519);
+        assert_eq!(pos(fitted(right, extra, 800, 600, work)), (1104, 50, 816, 639));
+        // A second monitor left of the first, at negative coordinates.
+        let left_monitor = Some(rect(-1280, 0, 0, 984));
+        let on_it = rect(-1200, 100, -1200 + 656, 100 + 519);
+        assert_eq!(
+            pos(fitted(on_it, extra, 1280, 720, left_monitor)),
+            (-1280, 100, 1280, 759)
+        );
+        // No monitor known: just the size asked for.
+        assert_eq!(
+            pos(fitted(right, extra, 1920, 1080, None)),
+            (1500, 50, 1936, 1119)
+        );
+    }
+
     #[test]
     fn client_points_map_to_framebuffer_pixels() {
         // The window's usual size: one to one.
-        assert_eq!(client_to_fb(0, 0, 640, 480), Some((0, 0)));
-        assert_eq!(client_to_fb(639, 479, 640, 480), Some((639, 479)));
-        assert_eq!(client_to_fb(123, 45, 640, 480), Some((123, 45)));
+        assert_eq!(client_to_fb(0, 0, 640, 480, VGA), Some((0, 0)));
+        assert_eq!(client_to_fb(639, 479, 640, 480, VGA), Some((639, 479)));
+        assert_eq!(client_to_fb(123, 45, 640, 480, VGA), Some((123, 45)));
         // Stretched to twice the size: two client pixels per frame pixel.
-        assert_eq!(client_to_fb(1, 1, 1280, 960), Some((0, 0)));
-        assert_eq!(client_to_fb(2, 3, 1280, 960), Some((1, 1)));
-        assert_eq!(client_to_fb(1279, 959, 1280, 960), Some((639, 479)));
+        assert_eq!(client_to_fb(1, 1, 1280, 960, VGA), Some((0, 0)));
+        assert_eq!(client_to_fb(2, 3, 1280, 960, VGA), Some((1, 1)));
+        assert_eq!(client_to_fb(1279, 959, 1280, 960, VGA), Some((639, 479)));
         // Shrunk, and stretched unevenly: the frame pixel under each client pixel's
         // centre.
-        assert_eq!(client_to_fb(0, 0, 320, 240), Some((1, 1)));
-        assert_eq!(client_to_fb(319, 239, 320, 240), Some((639, 479)));
-        assert_eq!(client_to_fb(100, 100, 1000, 200), Some((64, 241)));
-        assert_eq!(client_to_fb(1, 0, 960, 720), Some((1, 0)));
+        assert_eq!(client_to_fb(0, 0, 320, 240, VGA), Some((1, 1)));
+        assert_eq!(client_to_fb(319, 239, 320, 240, VGA), Some((639, 479)));
+        assert_eq!(client_to_fb(100, 100, 1000, 200, VGA), Some((64, 241)));
+        assert_eq!(client_to_fb(1, 0, 960, 720, VGA), Some((1, 0)));
         // Outside the client area (a captured drag): outside the frame, rounded down,
         // for the device to clamp.
-        assert_eq!(client_to_fb(-1, -3, 1280, 960), Some((-1, -2)));
-        assert_eq!(client_to_fb(1280, 2000, 1280, 960), Some((640, 1000)));
+        assert_eq!(client_to_fb(-1, -3, 1280, 960, VGA), Some((-1, -2)));
+        assert_eq!(client_to_fb(1280, 2000, 1280, 960, VGA), Some((640, 1000)));
         // Minimized.
-        assert_eq!(client_to_fb(5, 5, 0, 0), None);
-        assert_eq!(client_to_fb(5, 5, 640, 0), None);
+        assert_eq!(client_to_fb(5, 5, 0, 0, VGA), None);
+        assert_eq!(client_to_fb(5, 5, 640, 0, VGA), None);
+        // Another mode: its pixels, whatever the window's size.
+        assert_eq!(client_to_fb(639, 479, 640, 480, (1920, 1080)), Some((1918, 1078)));
+        assert_eq!(client_to_fb(799, 599, 800, 600, (800, 600)), Some((799, 599)));
     }
+
+    /// The size of the default mode's frame.
+    const VGA: (u32, u32) = (FB_WIDTH, FB_HEIGHT);
 
     /// `client_to_fb` is what `stretch` (the drawing) shows: a frame whose pixels hold
     /// their own coordinates is stretched into a memory bitmap of each size, and every
-    /// pixel of it must be the frame pixel `client_to_fb` names. Needs no desktop.
+    /// pixel of it must be the frame pixel `client_to_fb` names, for a frame of the
+    /// default mode and of the largest. Needs no desktop.
     #[test]
     fn client_to_fb_matches_the_stretch() {
-        let mut frame = Vec::with_capacity((FB_WIDTH * FB_HEIGHT * 4) as usize);
-        for y in 0..FB_HEIGHT {
-            for x in 0..FB_WIDTH {
-                frame.extend_from_slice(&(x | y << 12).to_le_bytes());
+        for (fw, fh) in [VGA, (1920, 1080)] {
+            let mut pixels = Vec::with_capacity((fw * fh * 4) as usize);
+            for y in 0..fh {
+                for x in 0..fw {
+                    pixels.extend_from_slice(&(x | y << 12).to_le_bytes());
+                }
             }
+            let frame = Frame {
+                width: fw,
+                height: fh,
+                pixels: Some(&pixels),
+            };
+            stretch_matches(frame);
         }
+    }
+
+    fn stretch_matches(frame: Frame) {
         for (width, height) in [
             (640, 480),
             (1280, 960),
@@ -689,14 +821,14 @@ mod tests {
                 let bitmap = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
                 assert!(!bitmap.is_null() && !bits.is_null());
                 let old = SelectObject(dc, bitmap);
-                stretch(dc, width, height, Some(&frame));
+                stretch(dc, width, height, frame);
                 let shown = std::slice::from_raw_parts(bits as *const u32, (width * height) as usize);
                 let mut wrong = 0;
                 let mut first = None;
                 for (i, &px) in shown.iter().enumerate() {
                     let (x, y) = (i as i32 % width, i as i32 / width);
                     let at = (px as i32 & 0xfff, px as i32 >> 12);
-                    if client_to_fb(x, y, width, height) != Some(at) {
+                    if client_to_fb(x, y, width, height, (frame.width, frame.height)) != Some(at) {
                         wrong += 1;
                         first.get_or_insert((x, y, at));
                     }
@@ -706,7 +838,8 @@ mod tests {
                 DeleteDC(dc);
                 assert_eq!(
                     wrong, 0,
-                    "{width}x{height}: first (client x, client y, frame pixel shown) {first:?}"
+                    "{}x{} on {width}x{height}: first (client x, client y, frame pixel shown) {first:?}",
+                    frame.width, frame.height
                 );
             }
         }
@@ -852,6 +985,23 @@ mod tests {
         assert!(st.pointer.take().is_empty(), "nothing held, nothing to release");
     }
 
+    /// A `width` × `height` frame of a display that is off.
+    fn off(width: u32, height: u32) -> Frame<'static> {
+        Frame {
+            width,
+            height,
+            pixels: None,
+        }
+    }
+
+    /// The size of `w`'s client area.
+    fn client_size(w: &Window) -> (i32, i32) {
+        let mut client = RECT::default();
+        // SAFETY: a valid window handle and a RECT it fills in.
+        unsafe { GetClientRect(w.hwnd, &mut client) };
+        (client.right - client.left, client.bottom - client.top)
+    }
+
     /// Needs a desktop session, so it does not run in CI:
     /// `cargo test -p grail --release -- --ignored window`.
     #[test]
@@ -866,11 +1016,45 @@ mod tests {
         let start = std::time::Instant::now();
         while start.elapsed() < std::time::Duration::from_millis(500) {
             assert!(w.pump());
-            w.draw(Some(&pixels));
+            w.draw(Frame {
+                width: FB_WIDTH,
+                height: FB_HEIGHT,
+                pixels: Some(&pixels),
+            });
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
-        w.draw(None);
+        w.draw(off(FB_WIDTH, FB_HEIGHT));
         assert!(w.pump());
+        // A frame of another mode resizes the window to it, and maps the mouse to it.
+        w.draw(off(800, 600));
+        assert!(w.pump());
+        assert_eq!(client_size(&w), (800, 600));
+        assert_eq!(w.frame_size(), (800, 600));
+        // One bigger than any monitor stays on the monitor's work area.
+        w.draw(off(8000, 8000));
+        assert!(w.pump());
+        // SAFETY: a valid window handle, and structs the calls fill in.
+        let (outer, work) = unsafe {
+            let mut outer = RECT::default();
+            GetWindowRect(w.hwnd, &mut outer);
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..MONITORINFO::default()
+            };
+            let on = MonitorFromWindow(w.hwnd, MONITOR_DEFAULTTONEAREST);
+            assert_ne!(GetMonitorInfoW(on, &mut info), 0);
+            (outer, info.rcWork)
+        };
+        assert!(
+            outer.left >= work.left
+                && outer.top >= work.top
+                && outer.right <= work.right
+                && outer.bottom <= work.bottom,
+            "window {:?} outside the work area {:?}",
+            (outer.left, outer.top, outer.right, outer.bottom),
+            (work.left, work.top, work.right, work.bottom)
+        );
+        assert_eq!(w.frame_size(), (8000, 8000), "the mouse maps to the frame");
         drop(w);
         // A second window on the same thread still works after the first was destroyed.
         let mut w = Window::open("Grail window test 2").unwrap();
@@ -897,7 +1081,7 @@ mod tests {
         }
         assert!(!a.pump(), "A is closed");
         assert!(b.pump(), "B is still open");
-        b.draw(None);
+        b.draw(off(FB_WIDTH, FB_HEIGHT));
         drop(a);
         assert!(b.pump());
         drop(b);

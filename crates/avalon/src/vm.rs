@@ -15,15 +15,19 @@
 //!
 //! The screen (the framebuffer) streams to the clients attached to it, the viewers
 //! (protocol doc, section 6.4). The VM keeps one [`Screen`]: exactly what every viewer
-//! has been sent. Between slices the thread compares the framebuffer with it and sends
-//! the rectangles that changed to every viewer; an unchanged screen sends nothing. Two
-//! limits keep a busy guest from flooding the link:
+//! has been sent. Between slices the thread compares what the framebuffer scans out
+//! (VRAM or a buffer in RAM, at its mode's size) with it and sends the rectangles that
+//! changed to every viewer; an unchanged screen sends nothing. A screen whose size
+//! changed (the guest set another mode) starts again at the new size: `ScreenResized`
+//! to every viewer, then the whole screen. Two limits keep a busy guest from flooding
+//! the link:
 //!
 //! - **Rate**: the thread looks at the screen at most once per [`SCREEN_INTERVAL`]
 //!   (~30 times a second), however often the guest redraws. Changes between two looks
 //!   go out together, as their final pixels.
-//! - **Backlog**: a viewer with more than [`SCREEN_BACKLOG`] bytes still queued (a slow
-//!   link) is sent no rectangles, and is marked behind. Once its queue has drained it
+//! - **Backlog**: a viewer with more than [`screen_backlog`] bytes still queued (a slow
+//!   link), a little over one full frame of the screen, is sent no rectangles, and is
+//!   marked behind. Once its queue has drained it
 //!   gets one full frame, which brings it level with the others. So a slow viewer sees
 //!   fewer frames rather than falling ever further behind and being cut off.
 //!
@@ -87,11 +91,34 @@ const PARKED_NAP: Duration = Duration::from_millis(50);
 /// the viewers, however fast the guest draws.
 pub const SCREEN_INTERVAL: Duration = Duration::from_millis(33);
 
-/// A viewer with more than this many bytes queued and not yet written is sent no
-/// screen updates until it has caught up (then one full frame). A little over one full
-/// 640x480 frame (1.2 MB), and well below [`crate::MAX_QUEUED`], where a client is cut
-/// off.
-pub const SCREEN_BACKLOG: usize = 2 * 1024 * 1024;
+/// The least backlog a viewer has ([`screen_backlog`]), whatever the screen's size: what
+/// it was when every screen was 640x480, 1.7 full frames of it.
+pub const SCREEN_BACKLOG_MIN: usize = 2 * 1024 * 1024;
+/// How much more than one full frame of the screen a viewer's backlog is.
+pub const SCREEN_BACKLOG_MARGIN: usize = 512 * 1024;
+
+/// A viewer with more than this many bytes queued and not yet written is sent no screen
+/// updates until it has caught up (then one full frame). It follows the size of the
+/// screen, `width` × `height`: a little over one full frame of it
+/// ([`SCREEN_BACKLOG_MARGIN`] more), and at least [`SCREEN_BACKLOG_MIN`]. So a slow viewer
+/// of a small screen falls no further behind (in frames, and in time on its link) than it
+/// would if no bigger screen could be shown; one of a screen in the framebuffer's largest
+/// mode (1920x1080, 8.3 MB a frame) may have 8.4 MiB queued, below [`crate::MAX_QUEUED`]
+/// by more than two more full frames, so a viewer that is held back is never cut off.
+pub const fn screen_backlog(width: u32, height: u32) -> usize {
+    let backlog = width as usize * height as usize * 4 + SCREEN_BACKLOG_MARGIN;
+    if backlog > SCREEN_BACKLOG_MIN {
+        backlog
+    } else {
+        SCREEN_BACKLOG_MIN
+    }
+}
+const _: () = {
+    let largest = grail::framebuffer::MODES[grail::framebuffer::MODES.len() - 1];
+    let backlog = screen_backlog(largest.width, largest.height) as u64;
+    assert!(backlog > grail::framebuffer::MAX_FRAME_SIZE);
+    assert!(crate::outbox::MAX_QUEUED as u64 > backlog + 2 * grail::framebuffer::MAX_FRAME_SIZE);
+};
 
 /// Most keys, and most pointer changes, waiting for the machine. The devices' own
 /// FIFOs hold 64; more than this waiting means the guest is not reading them (or is
@@ -160,7 +187,7 @@ struct Inner {
 /// A client attached to the screen.
 struct Viewer {
     outbox: Arc<Outbox>,
-    /// Updates were held back from it (its queue was over [`SCREEN_BACKLOG`]): it gets a
+    /// Updates were held back from it (its queue was over [`screen_backlog`]): it gets a
     /// full frame once it has caught up.
     behind: bool,
 }
@@ -727,8 +754,10 @@ impl Vm {
                 machine.pointer_event(change);
             }
             let steps = machine.run_for(SLICE, &mut |_| {});
-            // `run_for` ends a slice early once the guest has written FB_PRESENT, until
-            // the host takes that frame: take it, or every later slice is a single step.
+            // `run_for` ends a slice early once the guest has shown a new frame (written
+            // FB_PRESENT, made a modeset that took effect, or a page flip took effect at a
+            // vertical blank), until the host takes that frame: take it, or every later
+            // slice is a single step.
             // The screen goes out at the pace of `look`, not on presents: viewers see
             // the framebuffer, presented or not, as Grail's window does.
             machine.cpu.bus.fb.take_present();
@@ -813,23 +842,48 @@ impl Vm {
 
     /// Captures the screen if the machine has run since the last capture, and sends
     /// the rectangles that changed to every viewer that keeps up. A viewer over
-    /// [`SCREEN_BACKLOG`] gets nothing and is marked behind; a viewer that is behind
+    /// [`screen_backlog`] of the screen gets nothing and is marked behind; a viewer that is behind
     /// gets a full frame once it is under it again (or at once when `last`).
+    ///
+    /// The screen is what the framebuffer scans out, at its mode's size. When the guest
+    /// has changed modes, the screen starts again at the new size: every viewer, behind
+    /// or not, is sent `ScreenResized`, and the new screen goes out whole, as a full
+    /// frame would.
     fn update_viewers(&self, inner: &mut Inner, machine: &Machine, last: bool) {
         inner.screen_looked = Some(Instant::now());
+        let id = self.id;
+        let mut resized = None;
         let rects = if std::mem::take(&mut inner.screen_owed) {
-            let fb = &machine.cpu.bus.fb;
             // A display that is off shows black, as Grail's window does.
-            inner.screen.update(fb.enabled().then_some(fb.vram.as_slice()))
+            let frame = machine.cpu.bus.frame();
+            if (frame.width, frame.height) == (inner.screen.width(), inner.screen.height()) {
+                inner.screen.update(frame.pixels)
+            } else {
+                inner.screen = Screen::new(frame.width, frame.height);
+                inner.screen.update(frame.pixels);
+                resized = Some(event_frame(&Message::ScreenResized {
+                    vm: id,
+                    width: frame.width,
+                    height: frame.height,
+                    format: PIXEL_FORMAT_XRGB8888,
+                }));
+                vec![inner.screen.bounds()]
+            }
         } else {
             Vec::new()
         };
-        let id = self.id;
         let Inner { viewers, screen, .. } = inner;
         let frames: Vec<Frame> = rects.iter().map(|&r| event_frame(&screen.frame(id, r))).collect();
+        let backlog = screen_backlog(screen.width(), screen.height());
         let mut full = None;
         viewers.retain_mut(|v| {
-            let keeping_up = v.outbox.queued() <= SCREEN_BACKLOG;
+            // Every viewer learns the new size, so that what it is sent next fits.
+            if let Some(resized) = &resized {
+                if !v.outbox.event(resized) {
+                    return false;
+                }
+            }
+            let keeping_up = v.outbox.queued() <= backlog;
             if v.behind {
                 if !(keeping_up || last) {
                     return true;
@@ -891,13 +945,14 @@ fn pointer_input(change: PointerChange) -> PointerInput {
 /// Whether a full-speed machine is stalled in `wfi` with only an external interrupt
 /// (input) left to wake it: every hart waits with no interrupt pending, and no hart's
 /// timer can fire (it is masked or not set; a set timer would end the wait at the next
-/// step).
+/// step), nor the framebuffer's vertical blank (its interrupt is off).
 fn parked(machine: &Machine) -> bool {
     let cpu = &machine.cpu;
     let timer_armed = |hart: &grail::cpu::Hart| {
         hart.csr.mie & (1 << IRQ_M_TIMER) != 0 && cpu.bus.clint.mtimecmp[hart.id as usize] != u64::MAX
     };
-    cpu.all_idle() && !cpu.harts().iter().any(timer_armed)
+    // A vertical blank whose interrupt is enabled wakes a hart as a timer would.
+    cpu.all_idle() && !cpu.harts().iter().any(timer_armed) && cpu.bus.device_deadline().is_none()
 }
 
 fn event_frame(msg: &Message) -> Frame {
@@ -938,6 +993,33 @@ mod tests {
     use super::*;
     use crate::switch::Switch;
     use grail::net::MacAddr;
+
+    /// The backlog is a little over one full frame of the screen, at least 2 MiB, and
+    /// leaves room under the queue's limit in every mode.
+    #[test]
+    fn the_backlog_follows_the_screen() {
+        use grail::framebuffer::{MAX_FRAME_SIZE, MODES};
+        assert_eq!(
+            screen_backlog(640, 480),
+            SCREEN_BACKLOG_MIN,
+            "as for 640x480 before"
+        );
+        assert_eq!(screen_backlog(1, 1), SCREEN_BACKLOG_MIN);
+        assert_eq!(
+            screen_backlog(1920, 1080),
+            1920 * 1080 * 4 + SCREEN_BACKLOG_MARGIN
+        );
+        assert_eq!(screen_backlog(1280, 1024), 5 * 1024 * 1024 + 512 * 1024);
+        for mode in MODES {
+            let backlog = screen_backlog(mode.width, mode.height) as u64;
+            assert!(backlog > mode.frame_size(), "{mode:?}");
+            assert!(
+                backlog < mode.frame_size() + 2 * 1024 * 1024,
+                "under two frames of 640x480 more than one of {mode:?}"
+            );
+            assert!(crate::MAX_QUEUED as u64 > backlog + 2 * MAX_FRAME_SIZE);
+        }
+    }
 
     #[test]
     fn scrollback_keeps_the_latest_bytes() {

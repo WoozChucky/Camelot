@@ -481,7 +481,7 @@ fn sysinfo_lists_the_disks() {
   UART      0x10000000 + 0x00000100  irq 1
   block     0x10001000 + 0x00001000  irq 3
   block     0x10002000 + 0x00001000  irq 4
-  fb-ctrl   0x30000000 + 0x00001000
+  fb-ctrl   0x30000000 + 0x00001000  irq 16
   keyboard  0x30001000 + 0x00001000  irq 2
   sysinfo   0x30002000 + 0x00001000
   pointer   0x30003000 + 0x00001000  irq 11

@@ -28,7 +28,9 @@ pub use server::{
     parse_listen, parse_max_ram, Config, Server, ServerThread, ShutdownHandle, VmDebug, DEFAULT_MAX_RAM,
     HANDSHAKE_TIMEOUT,
 };
-pub use vm::{MAX_INPUT_QUEUE, SCREEN_BACKLOG, SCREEN_INTERVAL, SCROLLBACK};
+pub use vm::{
+    screen_backlog, MAX_INPUT_QUEUE, SCREEN_BACKLOG_MARGIN, SCREEN_BACKLOG_MIN, SCREEN_INTERVAL, SCROLLBACK,
+};
 
 /// Locks `m`, carrying on if a thread panicked while holding it: the server's state
 /// stays usable for every other VM and client.

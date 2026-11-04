@@ -158,6 +158,12 @@ pub fn samples() -> Vec<Message> {
             height: 480,
             format: PIXEL_FORMAT_XRGB8888,
         },
+        ScreenResized {
+            vm: 4,
+            width: 1920,
+            height: 1080,
+            format: PIXEL_FORMAT_XRGB8888,
+        },
         ScreenFrame {
             vm: 4,
             x: 0,

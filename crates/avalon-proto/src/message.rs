@@ -48,6 +48,7 @@ pub mod ty {
     pub const KEY_INPUT: u16 = 0x0304;
     pub const SCREEN_DETACH: u16 = 0x0305;
     pub const POINTER_INPUT: u16 = 0x0306;
+    pub const SCREEN_RESIZED: u16 = 0x0307;
     // Block I/O.
     pub const BLOCK_OPEN: u16 = 0x0401;
     pub const BLOCK_OPENED: u16 = 0x0402;
@@ -109,6 +110,7 @@ pub const CATALOGUE: &[(u16, &str, MessageKind)] = {
         (ty::KEY_INPUT, "KeyInput", Event),
         (ty::SCREEN_DETACH, "ScreenDetach", Request),
         (ty::POINTER_INPUT, "PointerInput", Event),
+        (ty::SCREEN_RESIZED, "ScreenResized", Event),
         (ty::BLOCK_OPEN, "BlockOpen", Request),
         (ty::BLOCK_OPENED, "BlockOpened", Reply),
         (ty::BLOCK_READ, "BlockRead", Request),
@@ -168,6 +170,12 @@ pub enum MessageKind {
 /// Pixel format of `ScreenFrame`: little-endian words `0x00RRGGBB` (bytes B, G, R, X),
 /// the same as Grail's VRAM (`FB_FORMAT` 0, Excalibur spec section 9.3).
 pub const PIXEL_FORMAT_XRGB8888: u32 = 0;
+
+/// Bytes a `ScreenFrame`'s length field counts besides its pixels: the message type (2),
+/// `vm`, `x`, `y`, `width` and `height` (4 each) and the pixels' length (4). A rectangle
+/// of `n` pixel bytes fits in one frame if `n + SCREEN_FRAME_OVERHEAD` is at most
+/// [`crate::MAX_FRAME_LEN`].
+pub const SCREEN_FRAME_OVERHEAD: usize = 2 + 5 * 4 + 4;
 
 /// RAM size of [`HardwareProfile::default`], as for `grail::DEFAULT_RAM_SIZE`.
 pub const DEFAULT_RAM_SIZE: u64 = 4 * 1024 * 1024;
@@ -759,6 +767,15 @@ pub enum Message {
         vm: u32,
         pointer: PointerChange,
     },
+    /// Server: the VM's screen is now `width` × `height` in `format` (the guest changed
+    /// modes). The viewer's screen starts again from black at that size; a full
+    /// `ScreenFrame` follows.
+    ScreenResized {
+        vm: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+    },
 
     // ---- Block I/O (Lake) ----
     /// Attach a disk image. Answered by `BlockOpened` with a handle for the requests
@@ -901,6 +918,7 @@ impl Message {
             KeyInput { .. } => ty::KEY_INPUT,
             ScreenDetach { .. } => ty::SCREEN_DETACH,
             PointerInput { .. } => ty::POINTER_INPUT,
+            ScreenResized { .. } => ty::SCREEN_RESIZED,
             BlockOpen { .. } => ty::BLOCK_OPEN,
             BlockOpened { .. } => ty::BLOCK_OPENED,
             BlockRead { .. } => ty::BLOCK_READ,
@@ -1072,6 +1090,12 @@ impl Message {
             }
             ConsoleDetach { vm } | ScreenDetach { vm } => w.u32(*vm),
             ScreenAttached {
+                vm,
+                width,
+                height,
+                format,
+            }
+            | ScreenResized {
                 vm,
                 width,
                 height,
@@ -1292,6 +1316,12 @@ impl Message {
             ty::CONSOLE_DETACH => ConsoleDetach { vm: r.u32()? },
             ty::SCREEN_ATTACH => ScreenAttach { vm: get_vm_ref(r)? },
             ty::SCREEN_ATTACHED => ScreenAttached {
+                vm: r.u32()?,
+                width: r.u32()?,
+                height: r.u32()?,
+                format: r.u32()?,
+            },
+            ty::SCREEN_RESIZED => ScreenResized {
                 vm: r.u32()?,
                 width: r.u32()?,
                 height: r.u32()?,

@@ -107,6 +107,12 @@ pub const EXAMPLES: &[Example] = &[
         script: Some("link.ld"),
     },
     Example {
+        name: "flip",
+        dir: "flip",
+        sources: &["flip.S"],
+        script: Some("link.ld"),
+    },
+    Example {
         name: "net-ping",
         dir: "net",
         sources: &["ping.S", "netlib.S"],
