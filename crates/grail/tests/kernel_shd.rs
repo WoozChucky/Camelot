@@ -537,3 +537,63 @@ fn a_hang_up_ends_background_jobs_and_typed_ahead_sessions() {
     );
     finish(vm, shd, pages);
 }
+
+/// Turns a shell may outlive its client by, alone, before shd kills it, and how long a
+/// turn is in timer ticks (`LINGER_TURNS` and `TEND_USEC` in kernel/user/shd.c; the
+/// kernel ticks 10 times a second and rounds SO_RCVTIMEO up to whole ticks).
+const LINGER_TURNS: u32 = 2;
+const TURN_TICKS: u32 = 5;
+
+#[test]
+fn a_shell_left_alone_after_its_client_has_gone_is_killed() {
+    // Issue #127: the session's shell outlives its client with nothing under it for
+    // shd to kill, and neither reads its input nor ends: here it has replaced itself
+    // with `exec sleep 5000` (POSIX's exec, kernel/user/sh.c), so the session's
+    // process is a sleep with no children. Once the client has closed its side, shd
+    // finds the connection gone with every byte read and no descendant to kill,
+    // waits LINGER_TURNS turns, then logs the hang-up and kills the process itself;
+    // the session ends with the killed status, and nothing of it is left behind.
+    let (mut vm, addr) = shd_vm();
+    let pages = warm_up(&mut vm);
+    let shd = start_shd(&mut vm, "");
+    let mut a = session(&mut vm, addr);
+    wait_console(&mut vm, &mut [], " connected\n", 1);
+    a.send(b"exec sleep 5000\n");
+    let (session_pid, ps) = loop {
+        let ps = parse_ps(&console(&mut vm, "ps"));
+        if let Some(p) = ps.iter().find(|p| p.ppid == shd && p.name == "sleep") {
+            break (p.pid, ps);
+        }
+    };
+    // The sleep is the session's process, shd's child, with nothing under it: no
+    // shell is left but the console's.
+    assert!(!ps.iter().any(|p| p.ppid == session_pid), "{ps:#?}");
+    assert_eq!(ps.iter().filter(|p| p.name == "sh").count(), 1, "{ps:#?}");
+    // exec printed nothing: no prompt, no error.
+    a.pump();
+    assert_eq!(a.text(), GREETING);
+
+    let closed_at = vm.read_var("ticks");
+    a.close();
+    wait_console(&mut vm, &mut [], " hung up\n", 1);
+    let lingered = vm.read_var("ticks") - closed_at;
+    assert!(
+        lingered >= LINGER_TURNS * TURN_TICKS,
+        "hung up {lingered} ticks after the client left:\n{}",
+        vm.out()
+    );
+    wait_console(&mut vm, &mut [], " ended, exit -1\n", 1);
+    assert_eq!(
+        shd_log(&vm.out()),
+        [
+            "[] 10.0.2.2: connected",
+            "[] 10.0.2.2: hung up",
+            "[] 10.0.2.2: ended, exit -1",
+        ]
+    );
+    wait_gone(&mut vm, "sleep");
+    let ps = parse_ps(&console(&mut vm, "ps"));
+    let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["sh", "shd", "ps"], "{ps:#?}");
+    finish(vm, shd, pages);
+}
