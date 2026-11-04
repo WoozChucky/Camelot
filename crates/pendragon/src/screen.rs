@@ -757,6 +757,7 @@ fn serve(
     });
     let mut to_avalon = conn.try_clone().map_err(io::Error::other)?;
     let avalon_socket = conn.get_ref().try_clone()?;
+    ws.set_read_timeout(Some(POLL))?;
     shared.page.text(&screen_json(vm, width, height))?;
     shared.page.text(&state_json(state))?;
     let pump = {
@@ -766,7 +767,7 @@ fn serve(
             .spawn(move || pump(conn, &shared, state))?
     };
 
-    ws.set_read_timeout(Some(POLL))?;
+    // From here on nothing returns early: the pump must be stopped and joined.
     let mut reader = Reader::new(MAX_MESSAGE);
     reader.push(&rest);
     let mut input = Input::new();
@@ -803,7 +804,11 @@ fn serve(
                         closing = Some(Instant::now());
                     }
                     Incoming::Text(_) | Incoming::Binary(_) => {}
-                    Incoming::Ping(payload) => shared.page.message(OP_PONG, &payload)?,
+                    Incoming::Ping(payload) => {
+                        if shared.page.message(OP_PONG, &payload).is_err() {
+                            break;
+                        }
+                    }
                     Incoming::Pong(_) => {}
                     // The page closes: answer with its code (section 5.5.1), and the
                     // connection ends. A close answering ours ends it too.
@@ -836,7 +841,9 @@ fn serve(
                     break;
                 }
             } else if heard.elapsed() >= ping {
-                shared.page.message(OP_PING, b"")?;
+                if shared.page.message(OP_PING, b"").is_err() {
+                    break;
+                }
                 pinged = Some(Instant::now());
             }
         }
@@ -874,12 +881,11 @@ fn serve(
 
 /// The pump thread: Avalon's frames to the page, until the session ends.
 fn pump(mut conn: Connection<TcpStream>, shared: &Shared, state: VmState) {
-    let end = pump_until_end(&mut conn, shared, state);
-    shared.ended.store(true, Ordering::SeqCst);
-    if let Some((code, reason)) = end {
+    if let Some((code, reason)) = pump_until_end(&mut conn, shared, state) {
         let _ = shared.page.text(&end_json(&reason));
         shared.page.close(Some(code), &reason);
     }
+    shared.ended.store(true, Ordering::SeqCst);
 }
 
 /// Relays frames until the session ends: the close code and reason to give the page,
