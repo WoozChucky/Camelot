@@ -52,7 +52,7 @@ const STEPS: &[Step] = &[
         args: &["-p", "merlin-ld", "--tests"],
     },
     Step {
-        what: "merlin-objdump against llvm-objdump",
+        what: "merlin-objdump against llvm-objdump, both widths",
         args: &["-p", "merlin-objdump", "--tests"],
     },
     Step {

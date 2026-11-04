@@ -13,7 +13,7 @@ pub const USAGE: &str = "usage: merlin-objdump <options> file...
   -p, --private-headers   program headers
   -s, --full-contents     hex dump of every section
   -l, --line-numbers      with -d, the source file:line of the instructions
-                          (from the .debug_line line tables)
+                          (from the line tables of the compile units)
   -M no-aliases           real instructions instead of pseudo-instructions
                           (also -Mno-aliases, --disassembler-options=no-aliases)
   --no-show-raw-insn      do not print instruction words

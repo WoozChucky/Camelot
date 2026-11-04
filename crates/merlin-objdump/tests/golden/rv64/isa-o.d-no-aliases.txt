@@ -1,0 +1,115 @@
+
+crates/merlin-objdump/tests/fixtures/rv64/isa.o:	file format elf64-littleriscv
+
+Disassembly of section .text:
+
+0000000000000000 <isa_start>:
+       0:      	lui	a0, 0x80000
+       4:      	lui	t6, 0xfffff
+       8:      	auipc	a1, 0xfffff
+       c:      	auipc	s0, 0x80000
+      10:      	ld	a0, -0x8(sp)
+      14:      	ld	t6, 0x7f8(s0)
+      18:      	sd	a1, 0x0(sp)
+      1c:      	sd	ra, -0x800(s1)
+      20:      	lwu	a2, 0x4(a0)
+      24:      	lw	a3, 0x0(a0)
+      28:      	addi	a0, zero, -0x1
+      2c:      	addiw	a0, a1, -0x1
+      30:      	addiw	a0, a1, 0x0
+      34:      	addiw	zero, a1, 0x0
+      38:      	slli	a0, a1, 0x3f
+      3c:      	srli	a0, a1, 0x20
+      40:      	srai	a0, a1, 0x3f
+      44:      	slli	a0, a1, 0x1f
+      48:      	slliw	a0, a1, 0x1f
+      4c:      	srliw	a0, a1, 0x0
+      50:      	sraiw	a0, a1, 0x1f
+      54:      	addw	a0, a1, a2
+      58:      	subw	a0, a1, a2
+      5c:      	subw	a0, zero, a2
+      60:      	sllw	a0, a1, a2
+      64:      	srlw	a0, a1, a2
+      68:      	sraw	a0, a1, a2
+      6c:      	mul	a0, a1, a2
+      70:      	mulh	a0, a1, a2
+      74:      	mulhsu	a0, a1, a2
+      78:      	mulhu	a0, a1, a2
+      7c:      	div	a0, a1, a2
+      80:      	divu	a0, a1, a2
+      84:      	rem	a0, a1, a2
+      88:      	remu	a0, a1, a2
+      8c:      	mulw	a0, a1, a2
+      90:      	divw	a0, a1, a2
+      94:      	divuw	a0, a1, a2
+      98:      	remw	a0, a1, a2
+      9c:      	remuw	a0, a1, a2
+      a0:      	csrrs	a0, cycle, zero
+      a4:      	csrrs	a0, 0xc80, zero
+      a8:      	csrrs	a0, 0x310, zero
+      ac:      	csrrs	a0, satp, zero
+      b0:      	csrrs	a0, mstatus, zero
+      b4:      	csrrw	zero, mtvec, t0
+      b8:      	sfence.vma	a0, a1
+      bc:      	<unknown>
+      c0:      	<unknown>
+      c4:      	<unknown>
+      c8:      	<unknown>
+      cc:      	<unknown>
+      d0:      	<unknown>
+      d4:      	<unknown>
+      d8:      	<unknown>
+      dc: ff ff ff ff  	.word	0xffffffff
+      e0: 88 77 66 55  	.word	0x55667788
+      e4: 44 33 22 11  	.word	0x11223344
+
+00000000000000e8 <atomics>:
+      e8:      	lr.d	a0, (a1)
+      ec:      	lr.d.aq	t0, (s1)
+      f0:      	lr.d.rl	zero, (t6)
+      f4:      	lr.d.aqrl	a5, (sp)
+      f8:      	sc.d	a0, a1, (a2)
+      fc:      	sc.d.aqrl	a5, zero, (a7)
+     100:      	amoswap.d	a0, a1, (a2)
+     104:      	amoadd.d.aq	a3, a4, (a5)
+     108:      	amoxor.d.rl	s6, s7, (s8)
+     10c:      	amoand.d.aqrl	a6, a7, (ra)
+     110:      	amoor.d	zero, a2, (tp)
+     114:      	amomin.d	a5, s2, (t2)
+     118:      	amomax.d	a5, s2, (t2)
+     11c:      	amominu.d	a5, s2, (t2)
+     120:      	amomaxu.d	t3, tp, (a7)
+     124:      	lr.w	a0, (a1)
+     128:      	amoadd.w	a0, a1, (a2)
+     12c:      	<unknown>
+
+0000000000000130 <calls>:
+     130:      	auipc	t0, 0x0
+     134:      	jalr	ra, 0x8(t0) <calls+0x8>
+     138:      	auipc	t1, 0x80000
+     13c:      	jalr	ra, 0x0(t1) <calls+0xffffffff80000008>
+     140:      	auipc	t1, 0xfffff
+     144:      	jalr	zero, -0x4(t1) <calls+0xfffffffffffff00c>
+     148:      	lui	a0, 0x80000
+     14c:      	jalr	ra, 0x10(a0)
+     150:      	auipc	a1, 0x0
+     154:      	addi	a1, a1, 0x4
+     158:      	jalr	ra, 0x0(a1)
+     15c:      	auipc	a2, 0x0
+     160:      	ld	a2, 0x0(a2)
+     164:      	jalr	ra, 0x0(a2)
+     168:      	auipc	a3, 0x0
+     16c:      	addiw	a3, a3, 0x0
+     170:      	jalr	ra, 0x0(a3)
+     174:      	auipc	a3, 0x0
+     178:      	sd	a3, 0x0(a3)
+     17c:      	lr.d	a4, (a3)
+     180:      	amoadd.d	a4, a3, (a3)
+     184:      	jalr	ra, 0x0(a3) <calls+0x44>
+     188:      	auipc	a3, 0x0
+     18c: 00 00 00 00  	.word	0x00000000
+     190:      	jalr	ra, 0x0(a3)
+     194:      	jal	zero, 0x194 <calls+0x64>
+     198:      	jal	ra, 0x130 <calls>
+     19c:      	bne	a0, zero, 0x1a4 <calls+0x74>
+     1a0:      	jal	zero, 0x1a0 <calls+0x70>

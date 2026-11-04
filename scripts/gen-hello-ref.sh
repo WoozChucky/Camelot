@@ -9,12 +9,8 @@
 #   crates/merlin-as/tests/golden/rv64/hello.dr.txt
 #
 # Needs clang and llvm-objdump from any LLVM install, plus bash (Git Bash on
-# Windows). LLVM 23 made the committed files. merlin-objdump follows LLVM 21's
-# syntax, which differs from LLVM 23's in one place only, `fence w, 0` (LLVM 23
-# prints it as Zihintpause's `pause`); hello.S has no such fence, so both
-# versions write the same hello.dr.txt.
-# rv64/hello.dr.txt is not compared yet: merlin-objdump reads ELF32 only until
-# #150.
+# Windows). LLVM 23 made the committed files, and merlin-objdump prints what
+# llvm-objdump 23 prints.
 #
 # Relaxation is off: with it on, clang adds R_RISCV_RELAX next to every
 # relocation and leaves calls to the linker, which merlin-as never does.

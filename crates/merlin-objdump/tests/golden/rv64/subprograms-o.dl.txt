@@ -1,0 +1,28 @@
+
+crates/merlin-objdump/tests/fixtures/rv64/subprograms.o:	file format elf64-littleriscv
+
+Disassembly of section .text:
+
+0000000000000000 <f>:
+; f():
+; /src/sub.c:1
+       0: 00000013     	nop
+       4: 00000013     	nop
+; outer():
+; /src/sub.c:2
+       8: 00000013     	nop
+       c: 00000013     	nop
+; inlined():
+; /src/sub.c:3
+      10: 00000013     	nop
+      14: 00000013     	nop
+; _Z6linkedv():
+; /src/sub.c:4
+      18: 00000013     	nop
+      1c: 00000013     	nop
+; declared():
+; /src/sub.c:5
+      20: 00000013     	nop
+      24: 00000013     	nop
+; /src/sub.c:6
+      28: 00000013     	nop

@@ -11,8 +11,8 @@
 //!   does: the +-2 GiB window of lui, auipc and call, R_RISCV_64 data; and a
 //!   higher-half program, linked at 0xffffffff80000000 and loaded in RAM with
 //!   `AT(ADDR(.x) - OFFSET)`); the others are copies of the RV32 set's
-//!   sources. Their `.objdump.txt` files are compared from #150, when
-//!   merlin-objdump reads ELF64.
+//!   sources. Their `.objdump.txt` files are compared with merlin-objdump's
+//!   listing, as the RV32 set's are.
 //! * The ELF64 file merlin-ld writes, its map, its line tables (R_RISCV_64
 //!   addresses) and `strip_debug` of it.
 //! * Every check of the object reader on ELF64's layout: its record sizes

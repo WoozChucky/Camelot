@@ -20,11 +20,14 @@ fn main() -> ExitCode {
     let mut status = ExitCode::SUCCESS;
     let mut stdout = std::io::stdout().lock();
     for file in &files {
-        let result = std::fs::read(file)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| merlin_objdump::dump(file, &bytes, &opts).map_err(|e| e.to_string()));
+        let result = std::fs::read(file).map_err(|e| e.to_string()).and_then(|bytes| {
+            merlin_objdump::dump_with_warnings(file, &bytes, &opts).map_err(|e| e.to_string())
+        });
         match result {
-            Ok(text) => {
+            Ok((text, warnings)) => {
+                for w in warnings {
+                    eprintln!("{}", w.line("merlin-objdump", file));
+                }
                 if stdout.write_all(text.as_bytes()).is_err() {
                     // Closed pipe (`merlin-objdump -d x | head`): nothing left to do.
                     return status;

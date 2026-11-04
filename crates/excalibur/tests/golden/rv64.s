@@ -180,8 +180,6 @@ fwd:
 	# MISC-MEM and SYSTEM.
 	fence	iorw, iorw
 	fence	rw, rw
-	# (Not `fence w, 0`: LLVM 23 prints it as Zihintpause's `pause`, LLVM 21
-	# and excalibur, without Zihintpause, as `fence w, 0`; a unit test has it.)
 	fence.tso
 	fence.i
 	ecall
@@ -193,6 +191,32 @@ fwd:
 	sfence.vma	a0
 	sfence.vma	a0, a1
 	unimp
+
+	# Hints LLVM 23 names (Excalibur executes them as the instructions they
+	# are): Zihintpause's pause (fence w, 0), Zihintntl's ntl.* (add zero,
+	# zero, x2..x5), Zicfilp's lpad (auipc zero), aliases; Zicbop's
+	# prefetches (ori zero with imm[4:0] 0, 1 or 3), instructions. Next to
+	# them, the neighbours that are none of these.
+	fence	w, 0
+	fence	0, w
+	add	zero, zero, ra
+	add	zero, zero, sp
+	add	zero, zero, gp
+	add	zero, zero, tp
+	add	zero, zero, t0
+	add	zero, zero, t1
+	add	sp, zero, sp
+	auipc	zero, 0x1
+	auipc	zero, 0xfffff
+	ori	zero, a0, 0x20
+	ori	zero, a0, 0x21
+	ori	zero, a0, 0x22
+	ori	zero, a0, 0x23
+	ori	zero, a0, 0x24
+	ori	zero, zero, 0
+	ori	zero, a1, -2048
+	ori	zero, a1, -31
+	ori	ra, a0, 0x20
 
 	# CSRs: named, numbered, and the RV32-only ones, which RV64 prints
 	# by number.

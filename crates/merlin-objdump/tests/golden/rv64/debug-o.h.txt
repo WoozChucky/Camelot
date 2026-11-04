@@ -1,0 +1,29 @@
+
+crates/merlin-objdump/tests/fixtures/rv64/debug.o:	file format elf64-littleriscv
+
+Sections:
+Idx Name                    Size     VMA              Type
+  0                         00000000 0000000000000000 
+  1 .strtab                 0000015c 0000000000000000 
+  2 .text                   00000044 0000000000000000 TEXT
+  3 .rela.text              00000060 0000000000000000 
+  4 .debug_loclists         00000023 0000000000000000 DEBUG
+  5 .rela.debug_loclists    00000090 0000000000000000 
+  6 .debug_abbrev           00000083 0000000000000000 DEBUG
+  7 .debug_info             00000066 0000000000000000 DEBUG
+  8 .rela.debug_info        000000d8 0000000000000000 
+  9 .debug_str_offsets      00000024 0000000000000000 DEBUG
+ 10 .rela.debug_str_offsets 000000a8 0000000000000000 
+ 11 .debug_str              0000009e 0000000000000000 DEBUG
+ 12 .debug_addr             00000020 0000000000000000 DEBUG
+ 13 .rela.debug_addr        00000048 0000000000000000 
+ 14 .comment                00000066 0000000000000000 
+ 15 .note.GNU-stack         00000000 0000000000000000 
+ 16 .riscv.attributes       00000057 0000000000000000 
+ 17 .debug_frame            00000048 0000000000000000 DEBUG
+ 18 .rela.debug_frame       00000090 0000000000000000 
+ 19 .debug_line             0000008f 0000000000000000 DEBUG
+ 20 .rela.debug_line        000000d8 0000000000000000 
+ 21 .debug_line_str         0000005c 0000000000000000 DEBUG
+ 22 .llvm_addrsig           00000000 0000000000000000 
+ 23 .symtab                 00000420 0000000000000000 

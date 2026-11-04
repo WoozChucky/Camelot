@@ -45,13 +45,22 @@ pub struct Sequence {
 /// sequences.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineTable {
+    /// Where the table starts in `.debug_line`: what the `DW_AT_stmt_list`
+    /// of the compile unit it belongs to says.
+    pub offset: u64,
     pub version: u16,
     /// Full paths, by file number: directory and name joined with `/`
     /// (relative ones are relative to the compilation directory, DWARF 5's
     /// directory 0). In DWARF 4 and before, files count from 1 and entry 0
     /// is empty, and relative paths lack the compilation directory, which
-    /// only the compile unit (`.debug_info`) has.
+    /// only the compile unit (`.debug_info`) has: see [`LineTable::file_path`].
     pub files: Vec<String>,
+    /// The directories as the header lists them, by number (DWARF 4 and
+    /// before count them from 1: entry 0 is empty).
+    pub dirs: Vec<String>,
+    /// The files as the header lists them, by number: name and directory
+    /// number (entry 0 empty before DWARF 5, as in `files`).
+    pub entries: Vec<(String, u64)>,
     pub sequences: Vec<Sequence>,
 }
 
@@ -60,6 +69,78 @@ impl LineTable {
     pub fn path(&self, n: usize) -> &str {
         self.files.get(n).map_or("?", |s| s.as_str())
     }
+
+    /// The path of file `n` as LLVM's symbolizer gives it (llvm-objdump
+    /// `-l`, `DWARFDebugLine::Prologue::getFileNameByIndex` for an absolute
+    /// path), `comp_dir` being the compile unit's `DW_AT_comp_dir`: a name
+    /// that is absolute is the path; any other goes after its directory, and
+    /// that after `comp_dir`, unless the directory is absolute or is DWARF
+    /// 5's directory 0 (the compilation directory itself). None for a number
+    /// the table does not have (0 before DWARF 5, where files count from 1).
+    pub fn file_path(&self, n: usize, comp_dir: &str) -> Option<String> {
+        if n >= self.entries.len() || (self.version < 5 && n == 0) {
+            return None;
+        }
+        let (name, dir) = &self.entries[n];
+        if is_absolute_llvm(name) {
+            return Some(name.clone());
+        }
+        // `dirs` is numbered as the file entries number it, in every version.
+        let include_dir = usize::try_from(*dir)
+            .ok()
+            .and_then(|d| self.dirs.get(d))
+            .map_or("", |d| d.as_str());
+        let mut path = String::new();
+        if (self.version < 5 || *dir != 0) && !comp_dir.is_empty() && !is_absolute_llvm(include_dir) {
+            append(&mut path, comp_dir);
+        }
+        append(&mut path, include_dir);
+        append(&mut path, name);
+        Some(path)
+    }
+}
+
+/// LLVM's `isPathAbsoluteOnWindowsOrPosix`: `/x`, or a Windows path with a
+/// root name and a root directory: a drive (`C:\x`, `C:/x`) or a network
+/// name (`\\host\x`). `\x` and `C:x` are relative (to a drive, to a drive's
+/// directory).
+fn is_absolute_llvm(p: &str) -> bool {
+    let (name, rest) = root_name(p);
+    p.starts_with('/') || (!name.is_empty() && rest.starts_with(is_sep))
+}
+
+/// Either of Windows' separators.
+fn is_sep(c: char) -> bool {
+    c == '/' || c == '\\'
+}
+
+/// A Windows path's root name and the rest: a drive (`C:`) or a network name
+/// (two separators and a name up to the next one, `\\host`), or none.
+fn root_name(p: &str) -> (&str, &str) {
+    let b = p.as_bytes();
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        p.split_at(2)
+    } else if b.len() >= 3 && is_sep(b[0] as char) && is_sep(b[1] as char) && !is_sep(b[2] as char) {
+        p.split_at(p[2..].find(is_sep).map_or(p.len(), |i| i + 2))
+    } else {
+        ("", p)
+    }
+}
+
+/// LLVM's `sys::path::append` of one component in Windows style (where the
+/// reference files are made, so both separators count), joining with `/`:
+/// after a path that ends with a separator, the component without its
+/// leading ones; else a separator first, unless the path is empty or the
+/// component starts with a separator or a root name.
+fn append(path: &mut String, component: &str) {
+    if path.ends_with(is_sep) {
+        path.push_str(component.trim_start_matches(is_sep));
+        return;
+    }
+    if !(path.is_empty() || component.starts_with(is_sep) || !root_name(component).0.is_empty()) {
+        path.push('/');
+    }
+    path.push_str(component);
 }
 
 /// Whether a path is absolute, on Unix or Windows (`/x`, `\x`, `C:\x`).
@@ -274,20 +355,11 @@ pub fn parse(
         }
         let lengths = c.bytes(opcode_base as usize - 1)?.to_vec();
 
-        let files = if version >= 5 {
-            let dirs = entries(&mut c, &strs)?;
-            let comp = dirs.first().map_or("", |(d, _)| d.as_str());
-            entries(&mut c, &strs)?
-                .into_iter()
-                .map(|(name, dir)| {
-                    let d = dirs.get(dir as usize).map_or("", |(d, _)| d.as_str());
-                    if dir == 0 || is_absolute(d) {
-                        join(d, &name)
-                    } else {
-                        join(&join(comp, d), &name)
-                    }
-                })
-                .collect()
+        // The directories and the files, numbered as the files' entries
+        // number them: DWARF 4 and before count both from 1.
+        let (dirs, file_entries) = if version >= 5 {
+            let dirs = entries(&mut c, &strs)?.into_iter().map(|(d, _)| d).collect();
+            (dirs, entries(&mut c, &strs)?)
         } else {
             let mut dirs = vec![String::new()];
             loop {
@@ -297,23 +369,51 @@ pub fn parse(
                 }
                 dirs.push(d);
             }
-            let mut files = vec![String::new()];
+            let mut files = vec![(String::new(), 0)];
             loop {
                 let name = c.cstr()?;
                 if name.is_empty() {
                     break;
                 }
-                let dir = c.uleb()? as usize;
+                let dir = c.uleb()?;
                 c.uleb()?; // modification time
                 c.uleb()?; // length
-                files.push(join(dirs.get(dir).map_or("", |d| d.as_str()), &name));
+                files.push((name, dir));
             }
-            files
+            (dirs, files)
         };
+        let dir_of = |n: u64| {
+            usize::try_from(n)
+                .ok()
+                .and_then(|n| dirs.get(n))
+                .map_or("", |d| d.as_str())
+        };
+        let files = file_entries
+            .iter()
+            .enumerate()
+            .map(|(i, (name, dir))| {
+                let d = dir_of(*dir);
+                if version < 5 {
+                    // Entry 0 is no file.
+                    if i == 0 {
+                        String::new()
+                    } else {
+                        join(d, name)
+                    }
+                } else if *dir == 0 || is_absolute(d) {
+                    join(d, name)
+                } else {
+                    join(&join(dir_of(0), d), name)
+                }
+            })
+            .collect();
 
         let mut table = LineTable {
+            offset: at as u64,
             version,
             files,
+            dirs,
+            entries: file_entries,
             sequences: Vec::new(),
         };
         c.at = program;
@@ -428,9 +528,10 @@ fn run(
     Ok(())
 }
 
-/// Applies one relocation of `.debug_line` at `at` with the value `v` (S + A),
-/// as a linker would. Returns false for a type a line table does not use, or
-/// a field outside `data`.
+/// Applies one relocation of a debug section at `at` with the value `v` (S + A),
+/// as a linker would. Returns false for a type debug information does not use
+/// (or whose unrelocated value LLVM reads, the ULEB128 ones), or a field
+/// outside `data`.
 ///
 /// R_RISCV_32 and R_RISCV_64 write an address, 4 bytes on RV32 and 8 on RV64.
 /// With linker relaxation, address advances are differences of two labels:
@@ -463,28 +564,37 @@ fn relocate(data: &mut [u8], at: usize, ty: u32, v: u64) -> bool {
     true
 }
 
+/// A debug section's bytes, its relocations applied in a relocatable object,
+/// and for each address field relocated (`R_RISCV_32`, `R_RISCV_64`) the
+/// section its symbol is in.
+pub(crate) struct Relocated {
+    pub data: Vec<u8>,
+    pub sections: HashMap<usize, usize>,
+}
+
 impl Elf<'_> {
-    /// The line tables of `.debug_line` (none if there is no such section).
-    /// In a relocatable object its relocations are applied first.
-    pub fn line_tables(&self) -> Result<Vec<LineTable>, Error> {
-        let named = |n: &str| self.sections.iter().position(|s| s.name == n);
-        let Some(li) = named(".debug_line") else {
-            return Ok(Vec::new());
+    /// The index of the section named `name`.
+    pub(crate) fn section_named(&self, name: &str) -> Option<usize> {
+        self.sections.iter().position(|s| s.name == name)
+    }
+
+    /// The bytes of section `name` (none if there is no such section), as
+    /// they are read for debug information: in a relocatable object with the
+    /// relocations applied that LLVM's DWARF reader applies. That leaves out
+    /// `R_RISCV_SET_ULEB128` and `R_RISCV_SUB_ULEB128`, whose unrelocated
+    /// value (the assembler's) is already right.
+    pub(crate) fn relocated(&self, name: &str) -> Result<Option<Relocated>, Error> {
+        let Some(index) = self.section_named(name) else {
+            return Ok(None);
         };
-        let data_of = |n: &str| -> Result<&[u8], Error> {
-            match named(n) {
-                Some(i) => self.section_data(&self.sections[i]),
-                None => Ok(&[]),
-            }
-        };
-        let mut line = self.section_data(&self.sections[li])?.to_vec();
+        let mut data = self.section_data(&self.sections[index])?.to_vec();
         let mut sections = HashMap::new();
         if self.header.ty == ET_REL {
             let symbols = self.symbols()?;
             let relas: Vec<&Section> = self
                 .sections
                 .iter()
-                .filter(|s| s.ty == SHT_RELA && s.info as usize == li)
+                .filter(|s| s.ty == SHT_RELA && s.info as usize == index)
                 .collect();
             for rel in relas {
                 for r in self.relocations(rel)? {
@@ -496,7 +606,7 @@ impl Elf<'_> {
                     let Ok(at) = usize::try_from(r.offset) else {
                         continue;
                     };
-                    if !relocate(&mut line, at, r.ty, v) {
+                    if !relocate(&mut data, at, r.ty, v) {
                         continue;
                     }
                     if r.ty == 1 || r.ty == 2 {
@@ -507,11 +617,28 @@ impl Elf<'_> {
                 }
             }
         }
+        Ok(Some(Relocated { data, sections }))
+    }
+
+    /// The bytes of section `name`, or none.
+    pub(crate) fn data_of(&self, name: &str) -> Result<&[u8], Error> {
+        match self.section_named(name) {
+            Some(i) => self.section_data(&self.sections[i]),
+            None => Ok(&[]),
+        }
+    }
+
+    /// The line tables of `.debug_line` (none if there is no such section).
+    /// In a relocatable object its relocations are applied first.
+    pub fn line_tables(&self) -> Result<Vec<LineTable>, Error> {
+        let Some(line) = self.relocated(".debug_line")? else {
+            return Ok(Vec::new());
+        };
         parse(
-            &line,
-            data_of(".debug_line_str")?,
-            data_of(".debug_str")?,
-            &sections,
+            &line.data,
+            self.data_of(".debug_line_str")?,
+            self.data_of(".debug_str")?,
+            &line.sections,
             self.class.addr_size(),
         )
     }
@@ -519,8 +646,42 @@ impl Elf<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, relocate};
+    use super::{parse, relocate, LineTable};
     use std::collections::HashMap;
+
+    /// LLVM's getFileNameByIndex: the compile unit's directory before a
+    /// relative directory, but not before DWARF 5's directory 0 or an
+    /// absolute one; DWARF 4 counts files from 1.
+    #[test]
+    fn file_paths_as_llvm_makes_them() {
+        let table = |version, dirs: &[&str], entries: &[(&str, u64)]| LineTable {
+            offset: 0,
+            version,
+            files: Vec::new(),
+            dirs: dirs.iter().map(|d| d.to_string()).collect(),
+            entries: entries.iter().map(|&(n, d)| (n.to_string(), d)).collect(),
+            sequences: Vec::new(),
+        };
+        let v5 = table(
+            5,
+            &["/cu", "inc", "/abs"],
+            &[("a.c", 0), ("b.h", 1), ("c.h", 2), ("/x/d.h", 1)],
+        );
+        assert_eq!(v5.file_path(0, "/cu").as_deref(), Some("/cu/a.c"));
+        assert_eq!(v5.file_path(1, "/unit").as_deref(), Some("/unit/inc/b.h"));
+        assert_eq!(v5.file_path(2, "/unit").as_deref(), Some("/abs/c.h"));
+        assert_eq!(v5.file_path(3, "/unit").as_deref(), Some("/x/d.h"));
+        assert_eq!(v5.file_path(4, "/unit"), None);
+        let v4 = table(4, &["", "inc/"], &[("", 0), ("a.c", 0), ("b.h", 1), ("c.h", 7)]);
+        assert_eq!(v4.file_path(0, "build"), None);
+        assert_eq!(v4.file_path(1, "build").as_deref(), Some("build/a.c"));
+        assert_eq!(v4.file_path(2, "build").as_deref(), Some("build/inc/b.h"));
+        assert_eq!(v4.file_path(2, "").as_deref(), Some("inc/b.h"));
+        // A directory number out of range is none; a separator already
+        // there is not doubled.
+        assert_eq!(v4.file_path(3, r"C:\b").as_deref(), Some(r"C:\b/c.h"));
+        assert_eq!(v4.file_path(3, r"C:\b\").as_deref(), Some(r"C:\b\c.h"));
+    }
 
     /// A DWARF 4 line table (no address size in its header) for one file,
     /// `a.c`, running `program`.

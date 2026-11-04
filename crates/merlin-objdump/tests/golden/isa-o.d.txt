@@ -151,99 +151,119 @@ Disassembly of section .text:
      22c: c0002073     	rdcycle	zero
      230: 30002073     	csrr	zero, mstatus
      234: 30001073     	csrw	mstatus, zero
-     238: 00200033     	add	zero, zero, sp
-     23c: 02056013     	ori	zero, a0, 0x20
-     240: 0100000f     	fence	w, 0
-     244: 8ff0000f     	<unknown>
-     248: 0ff5000f     	<unknown>
-     24c: 0ff0008f     	<unknown>
-     250: 0015c513     	xori	a0, a1, 0x1
-     254: 10000067     	jr	0x100(zero) <isa_start+0x100>
+     238: 00200033     	ntl.p1
+     23c: 02056013     	prefetch.i	0x20(a0)
+     240: 02356013     	prefetch.w	0x20(a0)
+     244: 00001017     	lpad	0x1
+     248: 0100000f     	pause
+     24c: 8ff0000f     	<unknown>
+     250: 0ff5000f     	<unknown>
+     254: 0ff0008f     	<unknown>
+     258: 0015c513     	xori	a0, a1, 0x1
+     25c: 10000067     	jr	0x100(zero) <isa_start+0x100>
 
-00000258 <calls>:
-     258: 00000297     	auipc	t0, 0x0
-     25c: 008280e7     	jalr	0x8(t0) <calls+0x8>
-     260: 00001317     	auipc	t1, 0x1
-     264: ffc30067     	jr	-0x4(t1) <atomics+0xf48>
-     268: 00000537     	lui	a0, 0x0
-     26c: 010500e7     	jalr	0x10(a0)
-     270: 00000597     	auipc	a1, 0x0
-     274: 00458593     	addi	a1, a1, 0x4
-     278: 000580e7     	jalr	a1
-     27c: 00000617     	auipc	a2, 0x0
-     280: 0000         	<unknown>
-     282: 0000         	<unknown>
-     284: 000600e7     	jalr	a2
-     288: 00000697     	auipc	a3, 0x0
-     28c: 0006a703     	lw	a4, 0x0(a3)
-     290: 000680e7     	jalr	a3 <calls+0x30>
-     294: 00000697     	auipc	a3, 0x0
-     298: 30200073     	mret
-     29c: 000680e7     	jalr	a3
-     2a0: 00000697     	auipc	a3, 0x0
-     2a4: 00000073     	ecall
-     2a8: 000680e7     	jalr	a3 <calls+0x48>
-     2ac: 00000697     	auipc	a3, 0x0
-     2b0: 0005000b     	<unknown>
-     2b4: 000680e7     	jalr	a3
-     2b8: 00000697     	auipc	a3, 0x0
-     2bc: 00051263     	bnez	a0, 0x2c0 <calls+0x68>
-     2c0: 000680e7     	jalr	a3
-     2c4: 00000697     	auipc	a3, 0x0
-
-000002c8 <second>:
+00000260 <calls>:
+     260: 00000297     	auipc	t0, 0x0
+     264: 008280e7     	jalr	0x8(t0) <calls+0x8>
+     268: 00001317     	auipc	t1, 0x1
+     26c: ffc30067     	jr	-0x4(t1) <wrap+0xea0>
+     270: 00000537     	lui	a0, 0x0
+     274: 010500e7     	jalr	0x10(a0)
+     278: 00000597     	auipc	a1, 0x0
+     27c: 00458593     	addi	a1, a1, 0x4
+     280: 000580e7     	jalr	a1
+     284: 00000617     	auipc	a2, 0x0
+     288: 00 00 00 00  	.word	0x00000000
+     28c: 000600e7     	jalr	a2
+     290: 00000697     	auipc	a3, 0x0
+     294: 0006a703     	lw	a4, 0x0(a3)
+     298: 000680e7     	jalr	a3 <calls+0x30>
+     29c: 00000697     	auipc	a3, 0x0
+     2a0: 30200073     	mret
+     2a4: 000680e7     	jalr	a3
+     2a8: 00000697     	auipc	a3, 0x0
+     2ac: 00000073     	ecall
+     2b0: 000680e7     	jalr	a3 <calls+0x48>
+     2b4: 00000697     	auipc	a3, 0x0
+     2b8: 0005000b     	<unknown>
+     2bc: 000680e7     	jalr	a3
+     2c0: 00000697     	auipc	a3, 0x0
+     2c4: 00051263     	bnez	a0, 0x2c8 <calls+0x68>
      2c8: 000680e7     	jalr	a3
-
-000002cc <regs>:
      2cc: 00000697     	auipc	a3, 0x0
-     2d0: 000006b7     	lui	a3, 0x0
-     2d4: 000680e7     	jalr	a3
-     2d8: 00000697     	auipc	a3, 0x0
-     2dc: 300026f3     	csrr	a3, mstatus
-     2e0: 000680e7     	jalr	a3
-     2e4: 00000697     	auipc	a3, 0x0
-     2e8: 000280e7     	jalr	t0
-     2ec: 000680e7     	jalr	a3
-     2f0: 00000697     	auipc	a3, 0x0
-     2f4: 8ff0000f     	<unknown>
-     2f8: 000680e7     	jalr	a3
-     2fc: 00000697     	auipc	a3, 0x0
-     300: 0010100f     	<unknown>
-     304: 000680e7     	jalr	a3
-     308: 00000697     	auipc	a3, 0x0
-     30c: 0ff0000f     	fence
-     310: 000680e7     	jalr	a3 <regs+0x3c>
 
-00000314 <atomics>:
-     314: 1005a52f     	lr.w	a0, (a1)
-     318: 1404a2af     	lr.w.aq	t0, (s1)
-     31c: 120fa02f     	lr.w.rl	zero, (t6)
-     320: 160127af     	lr.w.aqrl	a5, (sp)
-     324: 18b6252f     	sc.w	a0, a1, (a2)
-     328: 1c63a2af     	sc.w.aq	t0, t1, (t2)
-     32c: 1b29a4af     	sc.w.rl	s1, s2, (s3)
-     330: 1e08a7af     	sc.w.aqrl	a5, zero, (a7)
-     334: 08b6252f     	amoswap.w	a0, a1, (a2)
-     338: 04e7a6af     	amoadd.w.aq	a3, a4, (a5)
-     33c: 237c2b2f     	amoxor.w.rl	s6, s7, (s8)
-     340: 6710a82f     	amoand.w.aqrl	a6, a7, (ra)
-     344: 40c2202f     	amoor.w	zero, a2, (tp)
-     348: 8523a7af     	amomin.w.aq	a5, s2, (t2)
-     34c: a3c52aaf     	amomax.w.rl	s5, t3, (a0)
-     350: c7f6ac2f     	amominu.w.aqrl	s8, t6, (a3)
-     354: e048ae2f     	amomaxu.w	t3, tp, (a7)
-     358: 1015a52f     	<unknown>
-     35c: 2805a52f     	<unknown>
-     360: 00000697     	auipc	a3, 0x0
-     364: 08b526af     	amoswap.w	a3, a1, (a0)
-     368: 000680e7     	jalr	a3
-     36c: 00000697     	auipc	a3, 0x0
-     370: 18b526af     	sc.w	a3, a1, (a0)
-     374: 000680e7     	jalr	a3
-     378: 00000697     	auipc	a3, 0x0
-     37c: 100526af     	lr.w	a3, (a0)
-     380: 000680e7     	jalr	a3
-     384: 00000697     	auipc	a3, 0x0
-     388: 1006a72f     	lr.w	a4, (a3)
-     38c: 00d6a72f     	amoadd.w	a4, a3, (a3)
-     390: 000680e7     	jalr	a3 <atomics+0x70>
+000002d0 <second>:
+     2d0: 000680e7     	jalr	a3
+
+000002d4 <regs>:
+     2d4: 00000697     	auipc	a3, 0x0
+     2d8: 000006b7     	lui	a3, 0x0
+     2dc: 000680e7     	jalr	a3
+     2e0: 00000697     	auipc	a3, 0x0
+     2e4: 300026f3     	csrr	a3, mstatus
+     2e8: 000680e7     	jalr	a3
+     2ec: 00000697     	auipc	a3, 0x0
+     2f0: 000280e7     	jalr	t0
+     2f4: 000680e7     	jalr	a3
+     2f8: 00000697     	auipc	a3, 0x0
+     2fc: 8ff0000f     	<unknown>
+     300: 000680e7     	jalr	a3
+     304: 00000697     	auipc	a3, 0x0
+     308: 0010100f     	<unknown>
+     30c: 000680e7     	jalr	a3
+     310: 00000697     	auipc	a3, 0x0
+     314: 0ff0000f     	fence
+     318: 000680e7     	jalr	a3 <regs+0x3c>
+
+0000031c <atomics>:
+     31c: 1005a52f     	lr.w	a0, (a1)
+     320: 1404a2af     	lr.w.aq	t0, (s1)
+     324: 120fa02f     	lr.w.rl	zero, (t6)
+     328: 160127af     	lr.w.aqrl	a5, (sp)
+     32c: 18b6252f     	sc.w	a0, a1, (a2)
+     330: 1c63a2af     	sc.w.aq	t0, t1, (t2)
+     334: 1b29a4af     	sc.w.rl	s1, s2, (s3)
+     338: 1e08a7af     	sc.w.aqrl	a5, zero, (a7)
+     33c: 08b6252f     	amoswap.w	a0, a1, (a2)
+     340: 04e7a6af     	amoadd.w.aq	a3, a4, (a5)
+     344: 237c2b2f     	amoxor.w.rl	s6, s7, (s8)
+     348: 6710a82f     	amoand.w.aqrl	a6, a7, (ra)
+     34c: 40c2202f     	amoor.w	zero, a2, (tp)
+     350: 8523a7af     	amomin.w.aq	a5, s2, (t2)
+     354: a3c52aaf     	amomax.w.rl	s5, t3, (a0)
+     358: c7f6ac2f     	amominu.w.aqrl	s8, t6, (a3)
+     35c: e048ae2f     	amomaxu.w	t3, tp, (a7)
+     360: 1015a52f     	<unknown>
+     364: 2805a52f     	<unknown>
+     368: 00000697     	auipc	a3, 0x0
+     36c: 08b526af     	amoswap.w	a3, a1, (a0)
+     370: 000680e7     	jalr	a3
+     374: 00000697     	auipc	a3, 0x0
+     378: 18b526af     	sc.w	a3, a1, (a0)
+     37c: 000680e7     	jalr	a3
+     380: 00000697     	auipc	a3, 0x0
+     384: 100526af     	lr.w	a3, (a0)
+     388: 000680e7     	jalr	a3
+     38c: 00000697     	auipc	a3, 0x0
+     390: 1006a72f     	lr.w	a4, (a3)
+     394: 00d6a72f     	amoadd.w	a4, a3, (a3)
+     398: 000680e7     	jalr	a3 <atomics+0x70>
+
+0000039c <data>:
+     39c: 00000013     	nop
+		...
+     3b0: 44 33 22 11  	.word	0x11223344
+     3b4: 01 02 03 04  	.word	0x04030201
+     3b8: 05           	.byte	0x05
+
+000003b9 <data_mid>:
+     3b9: 06 07 08 09  	.word	0x09080706
+     3bd: 00 0a        	.short	0x0a00
+     3bf: 00           	.byte	0x00
+     3c0: 00000013     	nop
+
+000003c4 <wrap>:
+     3c4: c01ff06f     	j	0xffffffc4 <wrap+0xfffffffffffffc00>
+     3c8: fffff317     	auipc	t1, 0xfffff
+     3cc: 000300e7     	jalr	t1 <wrap+0xfffffffffffff004>
+     3d0: 800510e3     	bnez	a0, 0xfffffbd0 <wrap+0xfffffffffffff80c>
