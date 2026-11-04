@@ -13,6 +13,7 @@ use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::{boot, fsck, read::Fs, BSIZE};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::collections::BTreeSet;
+use xtask::examples::Xlen;
 use xtask::kernel::BOOT_MAX_STEPS;
 use xtask::repo_root;
 
@@ -74,18 +75,20 @@ fn the_commands_match_the_build() {
     assert_eq!(
         xtask::boot::DISKBOOT_RV64.commands(),
         [
-            "merlin-as -march=rv64ima_zicsr_zifencei crates/grail/rom/diskboot-rv64.s \
-             -o target/boot/diskboot-rv64.o",
-            "merlin-ld -T crates/grail/rom/link.ld target/boot/diskboot-rv64.o \
+            "merlin -E -march=rv64ima_zicsr_zifencei -I include crates/grail/rom/diskboot.S \
+             -o target/boot/rv64/diskboot.s",
+            "merlin-as -march=rv64ima_zicsr_zifencei target/boot/rv64/diskboot.s \
+             -o target/boot/rv64/diskboot.o",
+            "merlin-ld -T crates/grail/rom/link.ld target/boot/rv64/diskboot.o \
              -o crates/grail/rom/diskboot-rv64.elf"
         ]
     );
-    // The command lines in the loaders' comments are these.
+    // The command lines in the loader's comments are these, for both widths.
     let root = repo_root();
     for p in [xtask::boot::DISKBOOT, xtask::boot::DISKBOOT_RV64] {
         let source = std::fs::read_to_string(root.join(p.dir).join(p.source)).unwrap();
         for cmd in p.commands() {
-            let cmd = cmd.replace("target/boot/", "");
+            let cmd = cmd.replace(&format!("{}/", p.obj_dir()), "");
             assert!(source.contains(&format!("#   {cmd}\n")), "{}: {cmd}", p.source);
         }
     }
@@ -521,8 +524,12 @@ const V2_REGISTERS: &[(&str, u32)] = {
 fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     let root = repo_root();
     let read = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
-    let rom = read("crates/grail/rom/diskboot.s");
-    let rom64 = read("crates/grail/rom/diskboot-rv64.s");
+    // A `.S` source as merlin-as gets it at each width: preprocessed.
+    let assembly = |path: &str, xlen| {
+        xtask::examples::assembly_of(&root, path, &[xtask::examples::INCLUDE_DIR], xlen).unwrap()
+    };
+    let rom = assembly("crates/grail/rom/diskboot.S", Xlen::Rv32);
+    let rom64 = assembly("crates/grail/rom/diskboot.S", Xlen::Rv64);
     let loader = read("kernel/boot/boot.s");
     let spec = read("docs/excalibur-spec.md");
     let fs_doc = read("docs/camelot-fs.md");
@@ -554,24 +561,15 @@ fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     ] {
         assert_eq!(equ(&rom64, name), equ(&rom, name), "{name}");
     }
-    // The RV64 loader's and the RV64 examples' device registers are where
-    // version 2 of each interface has them (spec sections 9.5, 9.6, 9.8).
-    let mut rv64 = vec![("crates/grail/rom/diskboot-rv64.s".to_string(), rom64.clone())];
-    for dir in std::fs::read_dir(root.join("examples")).unwrap() {
-        let dir = dir.unwrap().path();
-        if !dir.is_dir() {
-            continue;
-        }
-        for f in std::fs::read_dir(&dir).unwrap() {
-            let f = f.unwrap().path();
-            let assembly = f.extension().is_some_and(|e| e == "S" || e == "s");
-            if assembly
-                && f.file_stem()
-                    .is_some_and(|s| s.to_string_lossy().ends_with("-rv64"))
-            {
-                let text = std::fs::read_to_string(&f).unwrap();
-                rv64.push((f.strip_prefix(&root).unwrap().display().to_string(), text));
-            }
+    // The RV64 loader's and the RV64 examples' device registers (their RV64
+    // builds) are where version 2 of each interface has them (spec sections
+    // 9.5, 9.6, 9.8).
+    let mut rv64 = vec![("crates/grail/rom/diskboot.S".to_string(), rom64.clone())];
+    for ex in xtask::examples::EXAMPLES {
+        for s in ex.sources {
+            let path = format!("{}/{s}", ex.dir_name());
+            let text = assembly(&path, Xlen::Rv64);
+            rv64.push((path, text));
         }
     }
     let mut unchecked: BTreeSet<&str> = V2_REGISTERS.iter().map(|&(name, _)| name).collect();

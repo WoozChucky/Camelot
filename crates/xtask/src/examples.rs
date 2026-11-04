@@ -1,17 +1,19 @@
 //! `cargo xtask examples`: builds every program in `examples/` with our own
-//! tools, merlin-as and merlin-ld (roadmap step 6, spec section 10). No LLVM
-//! is involved: both tools are linked into xtask as libraries, the same code
-//! their command-line programs run.
+//! tools, merlin, merlin-as and merlin-ld (roadmap step 6, spec section 10).
+//! No LLVM is involved: the tools are linked into xtask as libraries, the
+//! same code their command-line programs run.
 //!
 //! [`EXAMPLES`] lists each executable: its sources, assembled one by one into
 //! objects, and its linker script (or merlin-ld's default layout). Each one is
 //! built for both widths ([`XLENS`]) while Excalibur moves to RV64 (#141):
 //! RV32 into `examples/<dir>/<name>.elf`, and RV64 (#151) into
-//! `examples/<dir>/<name>-rv64.elf`, from [`Example::rv64_sources`]: the RV32
-//! source where it is the same at both widths, its `-rv64` version where
-//! RV64 needs other code (pointers and return addresses saved with `sd`, bit
-//! 63 for interrupt causes, version 2 of the devices' registers). #159
-//! removes RV32, and the RV64 sources then take the RV32 ones' names.
+//! `examples/<dir>/<name>-rv64.elf`, from the same sources (#193). A `.S`
+//! source is assembly that goes through the C preprocessor first, as in
+//! Linux and with clang: merlin's, in assembler-with-cpp mode, for the width
+//! (`__riscv_xlen` is 32 or 64), with `-I include` to find `include/asm.h`,
+//! whose `REG_L`, `REG_S` and `SZREG` are named as Linux names them. Where RV64 needs other
+//! code (bit 63 for interrupt causes, version 2 of the devices' registers),
+//! `#if __riscv_xlen == 64` chooses it. #159 removes RV32.
 //!
 //! The linked executables are committed, so Grail runs them without building
 //! anything, and `cargo test` rebuilds each one and checks that the committed
@@ -32,12 +34,8 @@ pub struct Example {
     pub name: &'static str,
     /// Directory under `examples/`.
     pub dir: &'static str,
-    /// Assembly sources in `dir`, in link order.
+    /// Assembly sources in `dir`, in link order, the same for both widths.
     pub sources: &'static [&'static str],
-    /// The RV64 build's sources in `dir`, in link order: a source of
-    /// [`Example::sources`] where both widths share it, else its `-rv64`
-    /// version.
-    pub rv64_sources: &'static [&'static str],
     /// Linker script in `dir`, the same for both widths; `None` for
     /// merlin-ld's default layout.
     pub script: Option<&'static str>,
@@ -52,98 +50,84 @@ pub const EXAMPLES: &[Example] = &[
         name: "hello",
         dir: "hello",
         sources: &["hello.S"],
-        rv64_sources: &["hello.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "multiobj",
         dir: "multiobj",
         sources: &["main.S", "print.S"],
-        rv64_sources: &["main-rv64.S", "print.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "muldiv",
         dir: "muldiv",
         sources: &["muldiv.S"],
-        rv64_sources: &["muldiv-rv64.S"],
         script: None,
     },
     Example {
         name: "sysinfo",
         dir: "sysinfo",
         sources: &["sysinfo.S"],
-        rv64_sources: &["sysinfo-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "disk",
         dir: "disk",
         sources: &["disk.S"],
-        rv64_sources: &["disk-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "uart-echo",
         dir: "uart-echo",
         sources: &["uart-echo.S"],
-        rv64_sources: &["uart-echo-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "colorbars",
         dir: "colorbars",
         sources: &["colorbars.S"],
-        rv64_sources: &["colorbars.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "kbd-echo",
         dir: "kbd-echo",
         sources: &["kbd-echo.S"],
-        rv64_sources: &["kbd-echo-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "kbd-echo-irq",
         dir: "kbd-echo",
         sources: &["kbd-echo-irq.S"],
-        rv64_sources: &["kbd-echo-irq-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "pointer",
         dir: "pointer",
         sources: &["pointer.S"],
-        rv64_sources: &["pointer-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "net-ping",
         dir: "net",
         sources: &["ping.S", "netlib.S"],
-        rv64_sources: &["ping.S", "netlib-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "net-pong",
         dir: "net",
         sources: &["pong.S", "netlib.S"],
-        rv64_sources: &["pong.S", "netlib-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "net-user",
         dir: "net",
         sources: &["user.S", "netlib.S"],
-        rv64_sources: &["user-rv64.S", "netlib-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "smp",
         dir: "smp",
         sources: &["smp.S"],
-        rv64_sources: &["smp-rv64.S"],
         script: Some("link.ld"),
     },
 ];
@@ -151,6 +135,10 @@ pub const EXAMPLES: &[Example] = &[
 /// The clang-only macros that let clang assemble `xcal.dbg`/`xcal.halt`
 /// (`-include` it), relative to the repository root.
 pub const XCAL_INCLUDE: &str = "examples/xcal.inc";
+
+/// Where the `.S` sources find `#include <asm.h>` (`-I`), relative to the
+/// repository root: the examples', the boot ROM's and merlin-ld's fixtures'.
+pub const INCLUDE_DIR: &str = "include";
 
 /// The example called `name`.
 pub fn find(name: &str) -> Option<&'static Example> {
@@ -163,12 +151,9 @@ impl Example {
         root.join("examples").join(self.dir)
     }
 
-    /// The sources of the `xlen` build, in link order.
-    pub fn sources_for(&self, xlen: Xlen) -> &'static [&'static str] {
-        match xlen {
-            Xlen::Rv32 => self.sources,
-            Xlen::Rv64 => self.rv64_sources,
-        }
+    /// `examples/<dir>`, relative to the repository root, with `/`.
+    pub fn dir_name(&self) -> String {
+        format!("examples/{}", self.dir)
     }
 
     /// The `xlen` executable's file name: `<name>.elf`, `<name>-rv64.elf`.
@@ -198,9 +183,23 @@ pub struct Object {
     pub data: Vec<u8>,
 }
 
+/// One source of a build, as merlin-as got it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assembly {
+    /// The name of the file `cargo xtask examples` leaves it in: `hello.s`
+    /// for `hello.S` (`merlin -E`'s output), or the source's own name for a
+    /// `.s` one.
+    pub name: String,
+    /// The text: the preprocessed source, or the source itself.
+    pub text: String,
+}
+
 /// The result of [`build`].
 #[derive(Debug)]
 pub struct Built {
+    /// One per source, in [`Example::sources`] order: what merlin-as
+    /// assembled.
+    pub assembly: Vec<Assembly>,
     /// One per source, in [`Example::sources`] order.
     pub objects: Vec<Object>,
     /// The linked executable.
@@ -209,8 +208,8 @@ pub struct Built {
     pub warnings: Vec<String>,
 }
 
-/// merlin-as's `-march=` option for `xlen`, with a space after it: none for
-/// RV32, merlin-as's default until #159.
+/// merlin's and merlin-as's `-march=` option for `xlen`, with a space after
+/// it: none for RV32, the tools' default until #159.
 pub fn march_flag(xlen: Xlen) -> &'static str {
     match xlen {
         Xlen::Rv32 => "",
@@ -220,57 +219,114 @@ pub fn march_flag(xlen: Xlen) -> &'static str {
 
 /// The object name for a source: `hello.S` → `hello.o`.
 pub fn object_name(source: &str) -> String {
-    let stem = source
-        .strip_suffix(".S")
-        .or_else(|| source.strip_suffix(".s"))
-        .unwrap_or(source);
-    format!("{stem}.o")
+    format!("{}.o", stem(source))
 }
 
-/// Assembles each source of `ex`'s `xlen` build with merlin-as and links the
-/// objects with merlin-ld, all in memory. Errors look like the tools' own
-/// messages (`examples/hello/hello.S:12: error: ...`, `merlin-ld: error: ...`).
+/// The name of what merlin-as assembles for a source: `hello.S` → `hello.s`
+/// (the preprocessed text), and a `.s` source itself.
+pub fn assembly_name(source: &str) -> String {
+    format!("{}.s", stem(source))
+}
+
+fn stem(source: &str) -> &str {
+    source
+        .strip_suffix(".S")
+        .or_else(|| source.strip_suffix(".s"))
+        .unwrap_or(source)
+}
+
+/// Whether a source goes through the preprocessor: a `.S` one, as clang
+/// decides.
+pub fn preprocessed(source: &str) -> bool {
+    source.ends_with(".S")
+}
+
+/// The text merlin-as assembles for the source `shown` (its path relative to
+/// `root`, with `/`; the name its line markers and errors give): a `.S` file
+/// preprocessed by merlin for `xlen` as assembler-with-cpp, with `#include`
+/// looking in `include_dirs` (relative to `root`), as `merlin -E` writes it;
+/// a `.s` file as it is.
+pub fn assembly_of(root: &Path, shown: &str, include_dirs: &[&str], xlen: Xlen) -> Result<String, String> {
+    let path = root.join(shown);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if !preprocessed(shown) {
+        return Ok(text);
+    }
+    let opts = merlin::Options {
+        include_dirs: include_dirs.iter().map(PathBuf::from).collect(),
+        xlen: match xlen {
+            Xlen::Rv32 => merlin::types::Xlen::Rv32,
+            Xlen::Rv64 => merlin::types::Xlen::Rv64,
+        },
+        ..merlin::Options::default()
+    };
+    let load = |p: &Path| std::fs::read_to_string(root.join(p)).ok();
+    merlin::preprocess_asm(shown, &text, &opts, &load).map_err(|errors| {
+        let lines: Vec<String> = errors.iter().map(|e| e.render(shown)).collect();
+        lines.join("\n")
+    })
+}
+
+/// Assembles each source of `ex`'s `xlen` build with merlin-as (after
+/// merlin's preprocessor, for a `.S` one) and links the objects with
+/// merlin-ld, all in memory. Errors look like the tools' own messages
+/// (`examples/hello/hello.S:12: error: ...`, `merlin-ld: error: ...`).
 pub fn build(root: &Path, ex: &Example, xlen: Xlen) -> Result<Built, String> {
     assemble_and_link(
-        &ex.dir(root),
-        &format!("examples/{}", ex.dir),
+        root,
+        &ex.dir_name(),
         ex.name,
-        ex.sources_for(xlen),
+        ex.sources,
+        &[INCLUDE_DIR],
         ex.script,
         xlen,
     )
 }
 
-/// Assembles `sources` (in `dir`, which messages call `shown`) with merlin-as
-/// for `xlen` and links the objects with merlin-ld, with the linker script
-/// `script` in `dir` or the default layout, all in memory: how every program
-/// built with our own tools is made (the examples, the boot programs).
-/// merlin-ld writes an ELF32 or an ELF64 executable as the objects are.
+/// Assembles `sources` (in `dir`, relative to `root`, with `/`) with
+/// merlin-as for `xlen`, a `.S` one preprocessed first ([`assembly_of`],
+/// with `include_dirs`), and links the objects with merlin-ld, with the
+/// linker script `script` in `dir` or the default layout, all in memory: how
+/// every program built with our own tools is made (the examples, the boot
+/// programs). merlin-ld writes an ELF32 or an ELF64 executable as the
+/// objects are. An assembler error names the line of the source it comes
+/// from, through the preprocessed text's line markers.
 pub fn assemble_and_link(
-    dir: &Path,
-    shown: &str,
+    root: &Path,
+    dir: &str,
     name: &str,
     sources: &[&str],
+    include_dirs: &[&str],
     script: Option<&str>,
     xlen: Xlen,
 ) -> Result<Built, String> {
     let as_opts = merlin_as::Options { xlen };
+    let mut assembly = Vec::new();
     let mut objects = Vec::new();
     for src in sources {
-        let path = dir.join(src);
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let shown = format!("{dir}/{src}");
+        let text = assembly_of(root, &shown, include_dirs, xlen)?;
         let data = merlin_as::assemble_to_elf_with(&text, &as_opts).map_err(|errors| {
-            let shown = format!("{shown}/{src}");
             let lines: Vec<String> = errors
                 .iter()
-                .map(|e| match e.line {
-                    0 => format!("{shown}: error: {}", e.msg),
-                    n => format!("{shown}:{n}: error: {}", e.msg),
+                .map(|e| {
+                    let at = match e.line {
+                        0 => None,
+                        n if preprocessed(src) => merlin::preprocess::source_line(&text, n),
+                        n => Some((shown.clone(), n)),
+                    };
+                    match at {
+                        Some((file, n)) => format!("{file}:{n}: error: {}", e.msg),
+                        None => format!("{shown}: error: {}", e.msg),
+                    }
                 })
                 .collect();
             lines.join("\n")
         })?;
+        assembly.push(Assembly {
+            name: assembly_name(src),
+            text,
+        });
         objects.push(Object {
             name: object_name(src),
             data,
@@ -279,7 +335,7 @@ pub fn assemble_and_link(
 
     let mut opts = merlin_ld::Options::default();
     if let Some(script) = script {
-        let path = dir.join(script);
+        let path = root.join(dir).join(script);
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         opts.script = Some(merlin_ld::ScriptSource {
@@ -299,6 +355,7 @@ pub fn assemble_and_link(
         format!("linking {name}:\n{}", lines.join("\n"))
     })?;
     Ok(Built {
+        assembly,
         objects,
         elf: linked.elf,
         warnings: linked.layout.warnings,
@@ -326,10 +383,10 @@ pub fn check(root: &Path, ex: &Example, xlen: Xlen, built: &Built) -> Status {
     }
 }
 
-/// Where `cargo xtask examples` leaves the objects of `ex`'s `xlen` build,
-/// relative to the repository root: `target/examples/<dir>` for RV32 and
-/// `target/examples/rv64/<dir>` for RV64 (both builds may share a source,
-/// and so an object's name).
+/// Where `cargo xtask examples` leaves the preprocessed sources and the
+/// objects of `ex`'s `xlen` build, relative to the repository root:
+/// `target/examples/<dir>` for RV32 and `target/examples/rv64/<dir>` for
+/// RV64 (both builds have the same sources, and so the same names).
 pub fn obj_dir_name(ex: &Example, xlen: Xlen) -> String {
     match xlen {
         Xlen::Rv32 => format!("target/examples/{}", ex.dir),
@@ -342,38 +399,60 @@ pub fn obj_dir(root: &Path, ex: &Example, xlen: Xlen) -> PathBuf {
     root.join(obj_dir_name(ex, xlen))
 }
 
-/// Writes the objects to [`obj_dir`] and the executable to
-/// [`Example::elf_path`], under `root`.
+/// Writes the preprocessed sources and the objects to [`obj_dir`] and the
+/// executable to [`Example::elf_path`], under `root`.
 pub fn write(root: &Path, ex: &Example, xlen: Xlen, built: &Built) -> std::io::Result<()> {
     let objs = obj_dir(root, ex, xlen);
     std::fs::create_dir_all(&objs)?;
+    for (src, a) in ex.sources.iter().zip(&built.assembly) {
+        if preprocessed(src) {
+            std::fs::write(objs.join(&a.name), &a.text)?;
+        }
+    }
     for o in &built.objects {
         std::fs::write(objs.join(&o.name), &o.data)?;
     }
     std::fs::write(ex.elf_path(root, xlen), &built.elf)
 }
 
+/// The command lines that make `source` (in `dir`, relative to the
+/// repository root) into an object in `obj_dir` for `xlen`, as a user would
+/// type them from the repository root: `merlin -E` for a `.S` one (with `-I`
+/// for each of `include_dirs`), then merlin-as.
+pub fn assemble_commands(
+    dir: &str,
+    source: &str,
+    include_dirs: &[&str],
+    xlen: Xlen,
+    obj_dir: &str,
+) -> Vec<String> {
+    let obj = format!("{obj_dir}/{}", object_name(source));
+    if !preprocessed(source) {
+        return vec![format!("merlin-as {}{dir}/{source} -o {obj}", march_flag(xlen))];
+    }
+    let includes: String = include_dirs.iter().map(|d| format!("-I {d} ")).collect();
+    let asm = format!("{obj_dir}/{}", assembly_name(source));
+    vec![
+        format!("merlin -E {}{includes}{dir}/{source} -o {asm}", march_flag(xlen)),
+        format!("merlin-as {}{asm} -o {obj}", march_flag(xlen)),
+    ]
+}
+
 /// The command lines [`build`] stands for, as a user would type them from the
-/// repository root, with the objects in `obj_dir`. merlin-ld needs no option
-/// for RV64: the objects' class makes the executable's.
+/// repository root, with the preprocessed sources and the objects in
+/// `obj_dir`. merlin-ld needs no option for RV64: the objects' class makes
+/// the executable's.
 pub fn commands(ex: &Example, xlen: Xlen, obj_dir: &str) -> Vec<String> {
-    let sources = ex.sources_for(xlen);
-    let mut cmds: Vec<String> = sources
+    let mut cmds: Vec<String> = ex
+        .sources
         .iter()
-        .map(|s| {
-            format!(
-                "merlin-as {}examples/{}/{s} -o {obj_dir}/{}",
-                march_flag(xlen),
-                ex.dir,
-                object_name(s)
-            )
-        })
+        .flat_map(|s| assemble_commands(&ex.dir_name(), s, &[INCLUDE_DIR], xlen, obj_dir))
         .collect();
     let mut ld = String::from("merlin-ld");
     if let Some(script) = ex.script {
         ld += &format!(" -T examples/{}/{script}", ex.dir);
     }
-    for s in sources {
+    for s in ex.sources {
         ld += &format!(" {obj_dir}/{}", object_name(s));
     }
     ld += &format!(" -o {}", ex.elf_name(xlen));
@@ -399,6 +478,9 @@ mod tests {
         assert_eq!(object_name("hello.S"), "hello.o");
         assert_eq!(object_name("crt0.s"), "crt0.o");
         assert_eq!(object_name("odd"), "odd.o");
+        assert_eq!(assembly_name("hello.S"), "hello.s");
+        assert_eq!(assembly_name("crt0.s"), "crt0.s");
+        assert!(preprocessed("hello.S") && !preprocessed("crt0.s"));
     }
 
     #[test]
@@ -427,69 +509,68 @@ mod tests {
         );
     }
 
-    /// Every RV64 source is an RV32 one or its `-rv64` version, in the same
-    /// place in the link order.
-    #[test]
-    fn rv64_sources_follow_the_rv32_ones() {
-        for e in EXAMPLES {
-            assert_eq!(e.sources.len(), e.rv64_sources.len(), "{}", e.name);
-            for (&s32, &s64) in e.sources.iter().zip(e.rv64_sources) {
-                let rv64 = format!("{}-rv64.S", s32.strip_suffix(".S").unwrap());
-                assert!(s64 == s32 || s64 == rv64, "{}: {s64} for {s32}", e.name);
-            }
-        }
-    }
-
     #[test]
     fn command_lines() {
         assert_eq!(
             commands(find("multiobj").unwrap(), Xlen::Rv32, "obj"),
             [
-                "merlin-as examples/multiobj/main.S -o obj/main.o",
-                "merlin-as examples/multiobj/print.S -o obj/print.o",
+                "merlin -E -I include examples/multiobj/main.S -o obj/main.s",
+                "merlin-as obj/main.s -o obj/main.o",
+                "merlin -E -I include examples/multiobj/print.S -o obj/print.s",
+                "merlin-as obj/print.s -o obj/print.o",
                 "merlin-ld -T examples/multiobj/link.ld obj/main.o obj/print.o -o examples/multiobj/multiobj.elf",
             ]
         );
         assert_eq!(
-            commands(find("muldiv").unwrap(), Xlen::Rv32, "o"),
+            commands(find("muldiv").unwrap(), Xlen::Rv64, "o"),
             [
-                "merlin-as examples/muldiv/muldiv.S -o o/muldiv.o",
-                "merlin-ld o/muldiv.o -o examples/muldiv/muldiv.elf",
+                "merlin -E -march=rv64ima_zicsr_zifencei -I include examples/muldiv/muldiv.S \
+                 -o o/muldiv.s",
+                "merlin-as -march=rv64ima_zicsr_zifencei o/muldiv.s -o o/muldiv.o",
+                "merlin-ld o/muldiv.o -o examples/muldiv/muldiv-rv64.elf",
             ]
         );
         assert_eq!(
-            commands(find("multiobj").unwrap(), Xlen::Rv64, "obj"),
-            [
-                "merlin-as -march=rv64ima_zicsr_zifencei examples/multiobj/main-rv64.S -o obj/main-rv64.o",
-                "merlin-as -march=rv64ima_zicsr_zifencei examples/multiobj/print.S -o obj/print.o",
-                "merlin-ld -T examples/multiobj/link.ld obj/main-rv64.o obj/print.o \
-                 -o examples/multiobj/multiobj-rv64.elf",
-            ]
+            assemble_commands("kernel/boot", "boot.s", &[], Xlen::Rv32, "o"),
+            ["merlin-as kernel/boot/boot.s -o o/boot.o"]
         );
     }
 
     /// `cargo xtask examples [--check]` on a scratch tree: a missing, a
-    /// written (up-to-date) and a changed (stale) executable.
+    /// written (up-to-date) and a changed (stale) executable, from a `.S`
+    /// source with a header and a `.s` one.
     #[test]
     fn check_and_write() {
         let root = std::env::temp_dir().join(format!("xtask-examples-check-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("examples").join("two");
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(root.join(INCLUDE_DIR)).unwrap();
         std::fs::write(
-            dir.join("a.S"),
-            "    .globl _start\n_start:\n    call f\n    xcal.halt a0\n",
+            root.join(INCLUDE_DIR).join("asm.h"),
+            "#if __riscv_xlen == 64\n#define CODE 64\n#else\n#define CODE 32\n#endif\n",
         )
         .unwrap();
-        std::fs::write(dir.join("b.S"), "    .globl f\nf:\n    li a0, 7\n    ret\n").unwrap();
+        std::fs::write(
+            dir.join("a.S"),
+            "#include <asm.h>\n    .globl _start\n_start:\n    call f\n    li a0, CODE\n    xcal.halt a0\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("b.s"), "    .globl f\nf:\n    li a0, 7\n    ret\n").unwrap();
         let ex = Example {
             name: "two",
             dir: "two",
-            sources: &["a.S", "b.S"],
-            rv64_sources: &["a.S", "b.S"],
+            sources: &["a.S", "b.s"],
             script: None,
         };
         let built = build(&root, &ex, Xlen::Rv32).unwrap();
+        assert_eq!(
+            built.assembly[0].text,
+            // After the marker of the end of asm.h, one space: clang's spacing.
+            "# 1 \"examples/two/a.S\"\n# 1 \"include/asm.h\" 1\n# 2 \"examples/two/a.S\" 2\n \
+             .globl _start\n_start:\n    call f\n    li a0, 32\n    xcal.halt a0\n"
+        );
+        assert_eq!(built.assembly[1].name, "b.s");
 
         match check(&root, &ex, Xlen::Rv32, &built) {
             Status::Unreadable(e) => assert!(e.starts_with("cannot read "), "{e}"),
@@ -505,6 +586,10 @@ mod tests {
                 o.data
             );
         }
+        assert_eq!(
+            std::fs::read_to_string(obj_dir(&root, &ex, x).join("a.s")).unwrap(),
+            built.assembly[0].text
+        );
         assert_eq!(check(&root, &ex, x, &built), Status::UpToDate);
 
         // One byte more, one byte changed: both stale.
@@ -522,9 +607,10 @@ mod tests {
         assert_eq!(check(&root, &ex, x, &built), Status::UpToDate);
 
         // The RV64 build of the same sources is another file, an ELF64 one, with
-        // objects of its own.
+        // objects of its own and the other branch of the `#if`.
         let built64 = build(&root, &ex, Xlen::Rv64).unwrap();
         assert_eq!(built64.elf[4], 2, "ELFCLASS64");
+        assert!(built64.assembly[0].text.contains("li a0, 64"));
         assert!(matches!(
             check(&root, &ex, Xlen::Rv64, &built64),
             Status::Unreadable(_)
@@ -536,21 +622,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Errors name the source's file and line, through the preprocessor's
+    /// line markers, a header's too.
     #[test]
     fn assembler_errors_name_the_file_and_line() {
         let root = std::env::temp_dir().join(format!("xtask-examples-{}", std::process::id()));
         let dir = root.join("examples").join("bad");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("bad.S"), "    nop\n    frobnicate a0\n").unwrap();
+        std::fs::create_dir_all(root.join(INCLUDE_DIR)).unwrap();
+        std::fs::write(root.join(INCLUDE_DIR).join("asm.h"), "\n    oops\n").unwrap();
+        std::fs::write(dir.join("bad.S"), "# comment\n    nop\n\n    frobnicate a0\n").unwrap();
         let ex = Example {
             name: "bad",
             dir: "bad",
             sources: &["bad.S"],
-            rv64_sources: &["bad.S"],
             script: None,
         };
         let err = build(&root, &ex, Xlen::Rv32).unwrap_err();
-        assert!(err.starts_with("examples/bad/bad.S:2: error: "), "{err}");
+        assert!(err.starts_with("examples/bad/bad.S:4: error: "), "{err}");
+        std::fs::write(dir.join("bad.S"), "#include <asm.h>\n").unwrap();
+        let err = build(&root, &ex, Xlen::Rv32).unwrap_err();
+        assert!(err.starts_with("include/asm.h:2: error: "), "{err}");
+        // The preprocessor's own.
+        std::fs::write(dir.join("bad.S"), "#if\n").unwrap();
+        let err = build(&root, &ex, Xlen::Rv32).unwrap_err();
+        assert!(err.starts_with("examples/bad/bad.S:1:"), "{err}");
 
         // Assembles, but nothing defines `missing`.
         std::fs::write(

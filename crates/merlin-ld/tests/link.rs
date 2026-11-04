@@ -468,10 +468,10 @@ fn hello_layout_matches_ld_lld() {
 
 /// Some fixture sources are copies, which `cargo xtask ld-fixtures` makes
 /// before it builds anything: `fixtures/hello` and `fixtures/multiobj` of
-/// the examples' sources and scripts, `fixtures/rv64/multiobj` of the RV64
-/// build's (`main-rv64.S` and `print.S`), and the RV64 set's directories that
-/// work on both widths (`SHARED_WITH_RV64` in crates/xtask/src/ld_fixtures.rs)
-/// of the RV32 set's. If an original changes, its copy (and the objects and
+/// the examples' sources and scripts (one source for both widths), and the
+/// RV64 set's directories that work on both widths (`SHARED_WITH_RV64` in
+/// crates/xtask/src/ld_fixtures.rs, `hello` and `multiobj` among them) of
+/// the RV32 set's. If an original changes, its copy (and the objects and
 /// ld.lld listings made from it) is stale until the tool runs again.
 #[test]
 fn fixture_copies_are_current() {
@@ -485,7 +485,7 @@ fn fixture_copies_are_current() {
     let copies = [
         (fixtures(), "hello", &["hello.S", "link.ld"][..]),
         (fixtures(), "multiobj", &["main.S", "print.S", "link.ld"]),
-        (rv64.clone(), "multiobj", &["main-rv64.S", "print.S", "link.ld"]),
+        (rv64.clone(), "multiobj", &["main.S", "print.S", "link.ld"]),
     ];
     for (set, dir, files) in copies {
         for f in files {
@@ -506,8 +506,10 @@ fn fixture_copies_are_current() {
         v.sort();
         v
     };
-    let shared = ["hello", "layouts", "merge", "norelocs", "rejects", "symbols"];
-    let rv64_only = ["at", "multiobj", "relocs"];
+    let shared = [
+        "hello", "layouts", "merge", "multiobj", "norelocs", "rejects", "symbols",
+    ];
+    let rv64_only = ["at", "relocs"];
     let mut dirs: Vec<String> = std::fs::read_dir(&rv64)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())

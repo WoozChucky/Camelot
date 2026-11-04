@@ -647,16 +647,16 @@ fn hello_matches_ld_lld_and_runs() {
     );
 }
 
-/// examples/multiobj's RV64 build, two clang objects (`main-rv64.S`,
+/// examples/multiobj's RV64 build, two clang objects (`main.S`,
 /// `print.S`): calls, pc-relative addresses and `.dword` pointers from one into
 /// the other (R_RISCV_64), `.data` written at run time and `.bss` (link.rs's
 /// twin).
 #[test]
 fn multiobj_matches_ld_lld_and_runs() {
     for (obj, ty) in [
-        ("multiobj/main-rv64.o", "R_RISCV_CALL_PLT"),
-        ("multiobj/main-rv64.o", "R_RISCV_64"),
-        ("multiobj/main-rv64.o", "R_RISCV_PCREL_HI20"),
+        ("multiobj/main.o", "R_RISCV_CALL_PLT"),
+        ("multiobj/main.o", "R_RISCV_64"),
+        ("multiobj/main.o", "R_RISCV_PCREL_HI20"),
         ("multiobj/print.o", "R_RISCV_PCREL_LO12_I"),
     ] {
         assert!(reloc_types(obj).contains_key(ty), "{obj} has no {ty}");

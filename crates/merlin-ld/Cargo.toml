@@ -15,4 +15,6 @@ elf = { path = "../elf" }
 excalibur = { path = "../excalibur" }
 grail = { path = "../grail" }
 merlin-as = { path = "../merlin-as" }
+# The examples are .S files: merlin preprocesses them for each width.
+merlin = { path = "../merlin" }
 merlin-objdump = { path = "../merlin-objdump" }

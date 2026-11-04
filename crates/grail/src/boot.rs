@@ -3,10 +3,11 @@
 //! first two sectors, 1 KiB) into the last 64 KiB of RAM, checks its signature and
 //! checksum, and jumps to it, like a PC's BIOS loading the master boot record.
 //!
-//! The loader is real code in the ROM, run by hart 0 like any program: its source is
-//! `rom/diskboot.s` for an RV32 machine and `rom/diskboot-rv64.s` for an RV64 one,
-//! built with merlin-as and merlin-ld into the committed `rom/diskboot.elf` and
-//! `rom/diskboot-rv64.elf` (`cargo xtask boot`), which Grail includes here. What the
+//! The loader is real code in the ROM, run by hart 0 like any program: its source,
+//! `rom/diskboot.S`, is preprocessed for each width (merlin -E) and built with
+//! merlin-as and merlin-ld into the committed `rom/diskboot.elf` for an RV32 machine
+//! and `rom/diskboot-rv64.elf` for an RV64 one (`cargo xtask boot`), which Grail
+//! includes here. What the
 //! boot block does next is up to whoever wrote it; Camelot's (`kernel/boot/boot.s`)
 //! loads the kernel ELF that `camelot-fs mkfs` installed after the filesystem.
 
@@ -37,10 +38,10 @@ pub const BOOT_AREA_SIZE: u32 = 0x1_0000;
 /// read error, a bad checksum, a trap before the boot block set its own `mtvec`).
 pub const EXIT_BOOT_FAILED: u32 = 0xfd;
 
-/// The disk loader of RV32 machines, built from `rom/diskboot.s` (`cargo xtask boot`).
+/// The disk loader of RV32 machines, built from `rom/diskboot.S` (`cargo xtask boot`).
 pub const DISKBOOT_ELF: &[u8] = include_bytes!("../rom/diskboot.elf");
 
-/// The disk loader of RV64 machines, built from `rom/diskboot-rv64.s` (`cargo xtask
+/// The disk loader of RV64 machines, the RV64 build of `rom/diskboot.S` (`cargo xtask
 /// boot`).
 pub const DISKBOOT_RV64_ELF: &[u8] = include_bytes!("../rom/diskboot-rv64.elf");
 

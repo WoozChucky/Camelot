@@ -314,6 +314,49 @@ fn preprocessor_options() {
     assert!(err.contains("defs.h:1:12: error:"), "{err}");
 }
 
+/// A `.S` file (or `-x assembler-with-cpp`) is preprocessed as assembly with
+/// -E, for the width -march gives, and is never compiled.
+#[test]
+fn assembly_is_only_preprocessed() {
+    let src = "# A comment\n#if __riscv_xlen == 64\n    ld a0, 0(sp)\n#else\n    lw a0, 0(sp)\n#endif\n";
+    let t = TempSrc::new("asm-cpp", "main.S", src);
+    let file = t.file.display().to_string().replace('\\', "\\\\");
+    let flag = |s: &'static str| PathBuf::from(s);
+    let out = merlin(&[&flag("-E"), &t.file]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        text,
+        format!("# 1 \"{file}\"\n # A comment\n\n\n\n    lw a0, 0(sp)\n")
+    );
+    let out = merlin(&[&flag("-E"), &flag("-march=rv64ima_zicsr_zifencei"), &t.file]);
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        text,
+        format!("# 1 \"{file}\"\n # A comment\n\n    ld a0, 0(sp)\n")
+    );
+    // `-x` says so for any name; `-x c` makes the same file C, where `# A`
+    // is no directive.
+    let other = t.dir.join("main.asm");
+    std::fs::write(&other, src).unwrap();
+    let out = merlin(&[&flag("-E"), &flag("-x"), &flag("assembler-with-cpp"), &other]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = merlin(&[&flag("-E"), &flag("-xc"), &t.file]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("invalid preprocessing directive '#A'"),
+        "{}",
+        stderr(&out)
+    );
+    // Assembly is not compiled; merlin-as assembles it.
+    let out = merlin(&[&t.file]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("assembler-with-cpp input is only preprocessed (-E)"));
+    let out = merlin(&[&flag("-x"), &flag("fortran"), &t.file]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).starts_with("merlin: language not recognized: 'fortran'"));
+}
+
 #[test]
 fn codegen_errors_use_file_line_col_format() {
     let t = TempSrc::new(

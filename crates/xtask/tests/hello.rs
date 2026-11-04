@@ -83,9 +83,10 @@ fn objdump(objdump: &Path, obj: &Path) -> String {
     String::from_utf8(out.stdout).unwrap().replace('\r', "")
 }
 
-/// Every example source, at each width it is built for: clang assembles them
-/// too, with the Xcal mnemonics from `examples/xcal.inc` (RV64 with the flags
-/// of the RV64 reference builds, `xtask::ld_fixtures::RV64`).
+/// Every example source, at each width: merlin-as assembles what merlin's
+/// preprocessor makes of it, and clang assembles it too, preprocessing it
+/// itself, with the Xcal mnemonics from `examples/xcal.inc` (RV64 with the
+/// flags of the RV64 reference builds, `xtask::ld_fixtures::RV64`).
 #[test]
 fn objdump_of_merlin_as_objects_matches_clang() {
     let tools = tools::find("clang").and_then(|clang| {
@@ -99,7 +100,7 @@ fn objdump_of_merlin_as_objects_matches_clang() {
     let mut sources = std::collections::BTreeSet::new();
     for e in examples::EXAMPLES {
         for xlen in examples::XLENS {
-            for s in e.sources_for(xlen) {
+            for s in e.sources {
                 sources.insert((xlen == examples::Xlen::Rv64, format!("{}/{s}", e.dir)));
             }
         }
@@ -116,7 +117,13 @@ fn objdump_of_merlin_as_objects_matches_clang() {
 
         let ours = scratch(&format!("objdump-merlin-{name}"));
         std::fs::create_dir_all(&ours).unwrap();
-        let text = std::fs::read_to_string(&src).unwrap();
+        let text = examples::assembly_of(
+            &repo_root(),
+            &format!("examples/{example}"),
+            &[examples::INCLUDE_DIR],
+            xlen,
+        )
+        .unwrap();
         let opts = merlin_as::Options { xlen };
         let data = merlin_as::assemble_to_elf_with(&text, &opts).unwrap();
         std::fs::write(ours.join(&obj), data).unwrap();
@@ -137,6 +144,8 @@ fn objdump_of_merlin_as_objects_matches_clang() {
         let status = clang_cmd
             .arg("-include")
             .arg(repo_root().join(examples::XCAL_INCLUDE))
+            .arg("-I")
+            .arg(repo_root().join(examples::INCLUDE_DIR))
             .arg(&src)
             .arg("-o")
             .arg(theirs.join(&obj))

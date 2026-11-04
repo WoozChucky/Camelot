@@ -22,15 +22,15 @@ use xtask::{kernel, repo_root, toolchain, userprogs};
 const PROMPT: &str = "$ ";
 
 /// The corpus: (name on the image, text); `big` adds merlin's assembly
-/// for the shell and the kernel's vm.c. RV32 sources only: /bin/as writes
-/// RV32 until #157, so the RV64 ones (`<name>-rv64.s`, `<name>-rv64.S`)
-/// are left out, as merlin-as's RV64 references are.
+/// for the shell and the kernel's vm.c. A `.S` source (the examples, the
+/// boot ROM) goes in as merlin's preprocessor makes it for RV32, as `cargo
+/// xtask examples` gives it to merlin-as (Camelot has no preprocessor), and
+/// is named `.s` on the image. RV32 only: /bin/as writes RV32 until #157, so
+/// the RV64 builds of those sources are left out, as merlin-as's RV64
+/// references are.
 fn corpus(big: bool) -> Vec<(String, String)> {
     let root = repo_root();
-    let rv32 = |p: &PathBuf| {
-        !p.file_stem()
-            .is_some_and(|s| s.to_string_lossy().ends_with("-rv64"))
-    };
+    let assembly = |p: &std::path::Path| p.extension().is_some_and(|x| x == "s" || x == "S");
     let mut files: Vec<PathBuf> = vec![root.join("crates/merlin-as/tests/golden/encode.s")];
     for dir in [
         "kernel",
@@ -43,7 +43,7 @@ fn corpus(big: bool) -> Vec<(String, String)> {
         let mut more: Vec<PathBuf> = std::fs::read_dir(root.join(dir))
             .unwrap()
             .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|x| x == "s") && rv32(p))
+            .filter(|p| assembly(p))
             .collect();
         more.sort();
         files.extend(more);
@@ -54,7 +54,7 @@ fn corpus(big: bool) -> Vec<(String, String)> {
         if dir.is_dir() {
             for f in std::fs::read_dir(&dir).unwrap() {
                 let p = f.unwrap().path();
-                if p.extension().is_some_and(|x| x == "s" || x == "S") && rv32(&p) {
+                if assembly(&p) {
                     examples.push(p);
                 }
             }
@@ -65,12 +65,20 @@ fn corpus(big: bool) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = files
         .iter()
         .map(|p| {
-            let name = p
+            let rel = p
                 .strip_prefix(&root)
                 .unwrap()
                 .to_string_lossy()
-                .replace(['/', '\\'], "_");
-            (name, std::fs::read_to_string(p).unwrap())
+                .replace('\\', "/");
+            let text = xtask::examples::assembly_of(
+                &root,
+                &rel,
+                &[xtask::examples::INCLUDE_DIR],
+                xtask::examples::Xlen::Rv32,
+            )
+            .unwrap();
+            let name = rel.strip_suffix(".S").map_or(rel.clone(), |s| format!("{s}.s"));
+            (name.replace('/', "_"), text)
         })
         .collect();
     // merlin's assembly, as the kernel and the programs are built (-g), and
@@ -563,7 +571,9 @@ fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
 
 /// #23's acceptance: `hello` assembled and linked inside Camelot, by `/bin/as`
 /// and `/bin/ld`, is the host's `examples/hello/hello.elf` byte for byte, and
-/// it runs (on a machine of its own: it is a bare-metal program).
+/// it runs (on a machine of its own: it is a bare-metal program). Camelot has
+/// no preprocessor: `/bin/as` gets hello.S as merlin's makes it on the host,
+/// the text the host's merlin-as assembles.
 #[test]
 fn hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs() {
     let root = repo_root();
@@ -573,12 +583,15 @@ fn hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs() {
         host.elf,
         std::fs::read(ex.elf_path(&root, xtask::examples::Xlen::Rv32)).unwrap()
     );
-    let files: Vec<(String, Vec<u8>)> = ["hello.S", "link.ld"]
-        .iter()
-        .map(|f| (format!("/src/{f}"), std::fs::read(ex.dir(&root).join(f)).unwrap()))
-        .collect();
+    let files: Vec<(String, Vec<u8>)> = vec![
+        ("/src/hello.s".into(), host.assembly[0].text.clone().into_bytes()),
+        (
+            "/src/link.ld".into(),
+            std::fs::read(ex.dir(&root).join("link.ld")).unwrap(),
+        ),
+    ];
     let commands = [
-        "as /src/hello.S -o /out/hello.o",
+        "as /src/hello.s -o /out/hello.o",
         "ld -T /src/link.ld /out/hello.o -o /out/hello",
     ];
     let input = format!("{}\nexit 0\n", commands.join("\n"));

@@ -121,6 +121,7 @@ dependencies = [
  "elf",
  "excalibur",
  "grail",
+ "merlin",
  "merlin-as",
  "merlin-objdump",
 ]

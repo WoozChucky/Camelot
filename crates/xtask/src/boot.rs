@@ -1,12 +1,13 @@
 //! `cargo xtask boot`: the two programs that run before the kernel when a
 //! machine boots from its disk (spec section 7, "Boot from disk"), built with
-//! our own tools, merlin-as and merlin-ld, as the examples are; no LLVM.
+//! our own tools, merlin (its preprocessor), merlin-as and merlin-ld, as the
+//! examples are; no LLVM.
 //!
-//! * Grail's boot ROM disk loader, `crates/grail/rom/diskboot.s`: reads the
-//!   boot block of disk 0 and jumps to it. Grail includes the linked
-//!   `diskboot.elf` in the boot ROM of an RV32 machine, and the same loader
-//!   for RV64, `diskboot-rv64.s` linked into `diskboot-rv64.elf`, in an RV64
-//!   machine's (#151).
+//! * Grail's boot ROM disk loader, `crates/grail/rom/diskboot.S`: reads the
+//!   boot block of disk 0 and jumps to it. One source for both widths
+//!   (#193), preprocessed for each as the examples are: Grail includes the
+//!   RV32 build, `diskboot.elf`, in the boot ROM of an RV32 machine, and the
+//!   RV64 one, `diskboot-rv64.elf`, in an RV64 machine's (#151).
 //! * Camelot's bootloader, `kernel/boot/boot.s`: the boot block, which loads
 //!   the kernel ELF stored after the filesystem. `camelot-fs mkfs --boot`
 //!   (and `cargo xtask fs`) install the linked `boot.elf`.
@@ -35,17 +36,18 @@ pub struct Program {
 pub const DISKBOOT: Program = Program {
     name: "diskboot",
     dir: "crates/grail/rom",
-    source: "diskboot.s",
+    source: "diskboot.S",
     script: "link.ld",
     elf: "diskboot.elf",
     xlen: Xlen::Rv32,
 };
 
-/// The boot ROM's disk loader, for RV64 machines: the same linker script.
+/// The boot ROM's disk loader, for RV64 machines: the same source and linker
+/// script.
 pub const DISKBOOT_RV64: Program = Program {
     name: "diskboot-rv64",
     dir: "crates/grail/rom",
-    source: "diskboot-rv64.s",
+    source: "diskboot.S",
     script: "link.ld",
     elf: "diskboot-rv64.elf",
     xlen: Xlen::Rv64,
@@ -74,33 +76,45 @@ impl Program {
         format!("{}/{}", self.dir, self.elf)
     }
 
+    /// Where the commands leave the preprocessed source and the object:
+    /// `target/boot`, and `target/boot/rv64` for RV64 (one source serves
+    /// both widths).
+    pub fn obj_dir(&self) -> &'static str {
+        match self.xlen {
+            Xlen::Rv32 => "target/boot",
+            Xlen::Rv64 => "target/boot/rv64",
+        }
+    }
+
     /// The equivalent command lines.
-    pub fn commands(&self) -> [String; 2] {
-        let obj = format!("target/boot/{}", examples::object_name(self.source));
-        [
-            format!(
-                "merlin-as {}{}/{} -o {obj}",
-                examples::march_flag(self.xlen),
-                self.dir,
-                self.source
-            ),
-            format!(
-                "merlin-ld -T {}/{} {obj} -o {}",
-                self.dir,
-                self.script,
-                self.elf_name()
-            ),
-        ]
+    pub fn commands(&self) -> Vec<String> {
+        let obj_dir = self.obj_dir();
+        let mut cmds = examples::assemble_commands(
+            self.dir,
+            self.source,
+            &[examples::INCLUDE_DIR],
+            self.xlen,
+            obj_dir,
+        );
+        cmds.push(format!(
+            "merlin-ld -T {}/{} {obj_dir}/{} -o {}",
+            self.dir,
+            self.script,
+            examples::object_name(self.source),
+            self.elf_name()
+        ));
+        cmds
     }
 }
 
 /// Builds `p` in memory.
 pub fn build(root: &Path, p: &Program) -> Result<Built, String> {
     examples::assemble_and_link(
-        &root.join(p.dir),
+        root,
         p.dir,
         p.name,
         &[p.source],
+        &[examples::INCLUDE_DIR],
         Some(p.script),
         p.xlen,
     )

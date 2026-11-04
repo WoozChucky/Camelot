@@ -2,14 +2,16 @@
 #
 #   cargo xtask examples hello
 #
-# which does the same as
+# which does the same as (a .S file goes through the C preprocessor first, merlin -E)
 #
-#   merlin-as examples/hello/hello.S -o hello.o
+#   merlin -E -I include examples/hello/hello.S -o hello.s
+#   merlin-as hello.s -o hello.o
 #   merlin-ld -T examples/hello/link.ld hello.o -o examples/hello/hello.elf
 #
-# and, for RV64 (the same source: nothing in it depends on the width), the same as
+# and, for RV64 (nothing in it depends on the width), the same as
 #
-#   merlin-as -march=rv64ima_zicsr_zifencei examples/hello/hello.S -o hello.o
+#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/hello/hello.S -o hello.s
+#   merlin-as -march=rv64ima_zicsr_zifencei hello.s -o hello.o
 #   merlin-ld -T examples/hello/link.ld hello.o -o examples/hello/hello-rv64.elf
 #
 # Reference build with LLVM, only for comparison (same loaded bytes; the

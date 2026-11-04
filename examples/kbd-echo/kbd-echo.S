@@ -14,18 +14,35 @@
 #
 #   cargo run --release -p grail -- --fb examples/kbd-echo/kbd-echo.elf
 #
-# kbd-echo-rv64.S is the same program for RV64 machines.
+# (kbd-echo-rv64.elf on an RV64 machine).
 #
 # Built with our own tools by `cargo xtask examples kbd-echo`, which does the same as
 #
-#   merlin-as examples/kbd-echo/kbd-echo.S -o kbd-echo.o
+#   merlin -E -I include examples/kbd-echo/kbd-echo.S -o kbd-echo.s
+#   merlin-as kbd-echo.s -o kbd-echo.o
 #   merlin-ld -T examples/kbd-echo/link.ld kbd-echo.o -o examples/kbd-echo/kbd-echo.elf
+#
+# and, for RV64 (the same code: putkey saves ra and its argument with REG_S, which is
+# sd there; sw would keep only the low 32 bits of ra, and lw sign-extend them, which
+# breaks a return address at 0x8000_0000 and up), the same as
+#
+#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/kbd-echo/kbd-echo.S -o kbd-echo.s
+#   merlin-as -march=rv64ima_zicsr_zifencei kbd-echo.s -o kbd-echo.o
+#   merlin-ld -T examples/kbd-echo/link.ld kbd-echo.o -o examples/kbd-echo/kbd-echo-rv64.elf
 #
 # Reference build with LLVM, only for comparison:
 #
 #   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc -I include \
 #         -T examples/kbd-echo/link.ld examples/kbd-echo/kbd-echo.S -o kbd-echo.elf
+#
+# and for RV64:
+#
+#   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
+#         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -I include -T examples/kbd-echo/link.ld examples/kbd-echo/kbd-echo.S -o kbd-echo-rv64.elf
+
+#include <asm.h>
 
     .equ KBD_BASE,      0x30001000
     .equ KBD_STATUS,    0               # bit 0: event available
@@ -74,8 +91,8 @@ done:
 # putkey(a0 = key code): echoes one key as described at the top.
 putkey:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    a0, 8(sp)
+    REG_S ra, 16-SZREG(sp)
+    REG_S a0, 16-2*SZREG(sp)
     li    t0, KEY_BACKSPACE
     bne   a0, t0, 1f
     call  putc                          # "\b \b"
@@ -90,15 +107,15 @@ putkey:
     j     9f
 2:  li    a0, '['                       # 0x80 and up: [hex]
     call  putc
-    lw    a0, 8(sp)
+    REG_L a0, 16-2*SZREG(sp)
     srli  a0, a0, 4
     call  puthex
-    lw    a0, 8(sp)
+    REG_L a0, 16-2*SZREG(sp)
     andi  a0, a0, 0xf
     call  puthex
     li    a0, ']'
     call  putc
-9:  lw    ra, 12(sp)
+9:  REG_L ra, 16-SZREG(sp)
     addi  sp, sp, 16
     ret
 

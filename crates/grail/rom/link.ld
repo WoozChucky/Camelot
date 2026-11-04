@@ -1,4 +1,4 @@
-/* The boot ROM's disk loader (diskboot.s, and diskboot-rv64.s for RV64
+/* The boot ROM's disk loader (diskboot.S, built for RV32 and for RV64
  * machines): at 0x1100 in the boot ROM, after the stub (0x1000) and the park
  * loop (0x1020). Code and strings only, all in .text. An ELF32 file's ELF and
  * program headers fit in the 0x100 bytes below it in its page, so the linker

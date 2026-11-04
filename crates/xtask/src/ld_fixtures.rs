@@ -32,13 +32,13 @@
 //!
 //! The fixtures in [`FROM_EXAMPLES`] (`hello`, `multiobj`) are copied from
 //! `examples/` first, so they always follow the examples (a test checks the
-//! copies), and so are the RV64 builds' sources of the ones in
-//! [`FROM_EXAMPLES_RV64`] (`multiobj`'s `main-rv64.S` and `print.S`; the RV64
-//! `hello` is a shared copy of the RV32 one, as `hello.S` is the same at both
-//! widths). Their ld.lld links are the references the examples built with our
-//! own tools are compared with (`crates/xtask/tests/examples.rs`). Every
-//! source is assembled with `-include examples/xcal.inc`, which teaches clang
-//! the Xcal mnemonics the examples use.
+//! copies), and the RV64 set shares them ([`SHARED_WITH_RV64`]): an example
+//! has one source for both widths (#193), preprocessed by clang with
+//! `__riscv_xlen` for each. Their ld.lld links are the references the
+//! examples built with our own tools are compared with
+//! (`crates/xtask/tests/examples.rs`). Every source is assembled with
+//! `-include examples/xcal.inc`, which teaches clang the Xcal mnemonics the
+//! examples use, and `-I include`, where `asm.h` is.
 //!
 //! Objects are built with `-mno-relax` and linked with `--no-relax`: merlin-ld
 //! does no linker relaxation, and ld.lld must not shrink code either or the
@@ -102,18 +102,14 @@ pub const FROM_EXAMPLES: &[(&str, &[&str])] = &[
     ("multiobj", &["main.S", "print.S", "link.ld"]),
 ];
 
-/// Fixture directories of the RV64 set copied from `examples/<same name>`:
-/// the sources of the example's RV64 build and its linker script, linked in
-/// name order like the RV32 copies.
-pub const FROM_EXAMPLES_RV64: &[(&str, &[&str])] = &[("multiobj", &["main-rv64.S", "print.S", "link.ld"])];
-
 /// Fixture directories of the RV32 set whose sources (`.S` and `.ld`) the
 /// RV64 set has too, copied into `fixtures/rv64/<same name>`: they assemble,
-/// link and run the same on both widths. Not `relocs`, `data64` (RV32's
-/// R_RISCV_64), `at` (RV64 has its own, a higher-half program) or
-/// `multiobj` (its `.word` pointers would be sign-extended by RV64's `lw`:
-/// the RV64 set copies the RV64 example's sources, [`FROM_EXAMPLES_RV64`]).
-pub const SHARED_WITH_RV64: &[&str] = &["hello", "layouts", "merge", "norelocs", "rejects", "symbols"];
+/// link and run on both widths (`multiobj` through `asm.h`'s `RISCV_PTR`
+/// and `REG_L`, as the example does). Not `relocs`, `data64` (RV32's
+/// R_RISCV_64) or `at` (RV64 has its own, a higher-half program).
+pub const SHARED_WITH_RV64: &[&str] = &[
+    "hello", "layouts", "merge", "multiobj", "norelocs", "rejects", "symbols",
+];
 
 /// The default: no `R_RISCV_RELAX` or `R_RISCV_ALIGN` in the object.
 pub const NO_RELAX: &str = "-mno-relax";
@@ -248,27 +244,27 @@ pub fn prepare_out(fixtures: &Path, out: &Path) -> Result<PathBuf, String> {
 }
 
 /// Regenerates everything under `fixtures` (see the module documentation):
-/// the copies of the examples ([`FROM_EXAMPLES`], [`FROM_EXAMPLES_RV64`]) and
-/// of the shared sources ([`copy_shared`]), then every set's objects and links
-/// ([`SETS`]). `examples` is the repository's `examples` directory. Returns
-/// the files written.
-pub fn run(fixtures: &Path, examples: &Path, tools: &Tools) -> Result<Vec<PathBuf>, String> {
-    let copies = FROM_EXAMPLES.iter().map(|c| (fixtures.to_path_buf(), c));
-    let copies = copies.chain(FROM_EXAMPLES_RV64.iter().map(|c| (fixtures.join(RV64.dir), c)));
-    for (set_dir, (dir, copied)) in copies {
-        let to = set_dir.join(dir);
+/// the copies of the examples ([`FROM_EXAMPLES`]) and of the shared sources
+/// ([`copy_shared`]), then every set's objects and links ([`SETS`]).
+/// `root` is the repository's root, where `examples/` and `include/` are.
+/// Returns the files written.
+pub fn run(fixtures: &Path, root: &Path, tools: &Tools) -> Result<Vec<PathBuf>, String> {
+    let examples = root.join("examples");
+    for (dir, copied) in FROM_EXAMPLES {
+        let to = fixtures.join(dir);
         std::fs::create_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
         for f in *copied {
             std::fs::copy(examples.join(dir).join(f), to.join(f))
                 .map_err(|e| format!("copying examples/{dir}/{f}: {e}"))?;
         }
     }
-    // After the examples: `hello` is shared too.
+    // After the examples: `hello` and `multiobj` are shared too.
     copy_shared(fixtures)?;
     let xcal = examples.join("xcal.inc");
+    let include = root.join(crate::examples::INCLUDE_DIR);
     let mut written = Vec::new();
     for set in SETS {
-        written.extend(build_set(fixtures, set, &xcal, tools)?);
+        written.extend(build_set(fixtures, set, &xcal, &include, tools)?);
     }
     Ok(written)
 }
@@ -324,7 +320,13 @@ pub fn set_dirs(fixtures: &Path, set: &Set) -> Result<Vec<PathBuf>, String> {
 
 /// Builds one set: every source's object with the set's flags, then every
 /// script's link, listing and disassembly.
-fn build_set(fixtures: &Path, set: &Set, xcal: &Path, tools: &Tools) -> Result<Vec<PathBuf>, String> {
+fn build_set(
+    fixtures: &Path,
+    set: &Set,
+    xcal: &Path,
+    include: &Path,
+    tools: &Tools,
+) -> Result<Vec<PathBuf>, String> {
     let root = fixtures.join(set.dir);
     let dirs = set_dirs(fixtures, set)?;
     let mut written = Vec::new();
@@ -336,6 +338,7 @@ fn build_set(fixtures: &Path, set: &Set, xcal: &Path, tools: &Tools) -> Result<V
             let source = std::fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?;
             let mut args: Vec<OsString> = asm_flags(set, &source).into_iter().map(OsString::from).collect();
             args.extend(["-include".into(), xcal.as_os_str().to_os_string()]);
+            args.extend(["-I".into(), include.as_os_str().to_os_string()]);
             args.extend([file_name(&src), "-o".into(), file_name(&obj)]);
             tools.exec(&tools.clang, &args, dir)?;
             written.push(obj);
@@ -407,25 +410,17 @@ mod tests {
 
     #[test]
     fn copied_examples_follow_the_examples_table() {
-        use crate::examples::Xlen;
-        let copies = FROM_EXAMPLES.iter().map(|c| (Xlen::Rv32, c));
-        for (xlen, (dir, files)) in copies.chain(FROM_EXAMPLES_RV64.iter().map(|c| (Xlen::Rv64, c))) {
+        for (dir, files) in FROM_EXAMPLES {
             let ex = crate::examples::find(dir).unwrap();
-            let sources = ex.sources_for(xlen);
-            let mut want = sources.to_vec();
+            let mut want = ex.sources.to_vec();
             want.extend(ex.script);
             assert_eq!(*files, want.as_slice(), "{dir}");
             // ld.lld gets the objects in name order: it must be the build's order.
-            let mut sorted = sources.to_vec();
+            let mut sorted = ex.sources.to_vec();
             sorted.sort_unstable();
-            assert_eq!(sorted, sources, "{dir}");
-        }
-        // The RV64 hello is the shared copy of the RV32 one: one source.
-        let hello = crate::examples::find("hello").unwrap();
-        assert_eq!(hello.sources, hello.rv64_sources);
-        assert!(SHARED_WITH_RV64.contains(&"hello"));
-        for (dir, _) in FROM_EXAMPLES_RV64 {
-            assert!(!SHARED_WITH_RV64.contains(dir), "{dir}");
+            assert_eq!(sorted, ex.sources, "{dir}");
+            // One source for both widths: the RV64 set has the same copy.
+            assert!(SHARED_WITH_RV64.contains(dir), "{dir}");
         }
     }
 

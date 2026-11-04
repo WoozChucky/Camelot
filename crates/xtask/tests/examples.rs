@@ -302,10 +302,7 @@ fn sources_on_disk() -> BTreeSet<String> {
 fn every_example_source_is_built() {
     let listed: BTreeSet<String> = EXAMPLES
         .iter()
-        .flat_map(|e| {
-            let sources = e.sources.iter().chain(e.rv64_sources);
-            sources.map(move |s| format!("{}/{s}", e.dir))
-        })
+        .flat_map(|e| e.sources.iter().map(move |s| format!("{}/{s}", e.dir)))
         .collect();
     assert_eq!(
         listed,
@@ -316,12 +313,12 @@ fn every_example_source_is_built() {
 
 /// The command lines at the top of each example's first source are the ones
 /// `cargo xtask examples -v` prints for it, at each width, with the objects in
-/// the current directory: a source both widths share gives both builds.
+/// the current directory: one source gives both builds.
 #[test]
 fn the_sources_give_their_build_commands() {
     for ex in EXAMPLES {
         for xlen in XLENS {
-            let first = ex.sources_for(xlen)[0];
+            let first = ex.sources[0];
             let text = std::fs::read_to_string(ex.dir(&repo_root()).join(first)).unwrap();
             for cmd in examples::commands(ex, xlen, "OBJ") {
                 let cmd = cmd.replace("OBJ/", "");
@@ -526,7 +523,7 @@ fn disk_example_needs_its_disk() {
 /// strings, the counter in the other object's .bss and the .data pointers.
 #[test]
 fn multiobj_needs_both_objects() {
-    for (xlen, main_o) in [(Xlen::Rv32, "main.o"), (Xlen::Rv64, "main-rv64.o")] {
+    for (xlen, main_o) in [(Xlen::Rv32, "main.o"), (Xlen::Rv64, "main.o")] {
         multiobj_needs_both(xlen, main_o);
     }
 }
