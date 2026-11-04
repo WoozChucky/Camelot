@@ -522,7 +522,10 @@ fn check_screen(width: u32, height: u32, format: u32) -> Result<(), String> {
 }
 
 /// The page's end of the WebSocket, for both threads: messages go out whole, one at a
-/// time, and nothing after the close frame (RFC 6455 section 5.5.1).
+/// time, and nothing after the close frame (RFC 6455 section 5.5.1). A write that
+/// fails may have left part of a frame on the wire, after which no byte means what
+/// it says: the page counts as closed then too, and gets nothing more, not even the
+/// close frame (the connection is failed, section 7.1.7).
 struct Page {
     stream: Mutex<(TcpStream, bool)>,
 }
@@ -534,8 +537,11 @@ impl Page {
         if *closed {
             return Ok(());
         }
-        stream.write_all(frame)?;
-        stream.flush()
+        let sent = stream.write_all(frame).and_then(|()| stream.flush());
+        if sent.is_err() {
+            *closed = true;
+        }
+        sent
     }
 
     fn message(&self, opcode: u8, payload: &[u8]) -> io::Result<()> {
@@ -1407,6 +1413,25 @@ mod tests {
         assert_eq!(msg[..2], [0x82, 24]);
         assert_eq!(msg[2..18], [3, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0]);
         assert_eq!(msg[18..], [0x11, 0x22, 0x33, 0xff, 0xff, 0xee, 0xdd, 0xff]);
+    }
+
+    /// After a write that failed, which may have left part of a frame on the wire,
+    /// the page counts as closed: neither a message nor the close frame is written
+    /// after it, so the page never reads them as the rest of the torn frame.
+    #[test]
+    fn nothing_follows_a_failed_write() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        // Every write fails from here, the same way on every system.
+        stream.shutdown(Shutdown::Write).unwrap();
+        let page = Page {
+            stream: Mutex::new((stream, false)),
+        };
+        assert!(page.send(&frame_message(0, 0, 1, 1, &[0; 4])).is_err());
+        assert!(crate::console::lock(&page.stream).1, "closed");
+        assert!(page.text("after").is_ok(), "dropped, as after a close frame");
+        assert!(!page.close(Some(CLOSE_NORMAL), "bye"), "no close frame either");
     }
 
     #[test]
