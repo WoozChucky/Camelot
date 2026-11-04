@@ -238,8 +238,8 @@ fn hello() {
             "=> 0x80000024 <puts+4>:  mv t1, a0",
             "=> 0x80000028 <puts+8>:  lbu t2, 0x0(t1)",
             "=> 0x8000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
-            "#0  0x8000002c <puts+12>",
-            "#1  0x80000018 <_start+24>",
+            "#0  0x8000002c in puts ()",
+            "#1  0x80000018 in _start ()",
             "   0x80000024 <puts+4>:  mv t1, a0",
             "   0x80000028 <puts+8>:  lbu t2, 0x0(t1)",
             "=> 0x8000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
@@ -323,21 +323,22 @@ fn kernel() {
             "priv           0x1\tprv:1 [Supervisor]",
         ],
     );
-    // The backtrace: kvminit, called from kmain, called from the assembly that enters
-    // S-mode (whose ra kmain saved; the chain ends there, s0 = 0).
+    // The backtrace, as GDB's: kvminit, stopped at the start of a line (so without
+    // its pc), called from kmain, called from the assembly that enters S-mode
+    // (whose ra kmain saved; the chain ends there, s0 = 0), which has no debug
+    // information.
     let bt = backtrace_after(&out, "(merlin-dbg) bt");
     assert_eq!(bt.len(), 3, "{out}");
-    assert_eq!(
-        bt[0],
-        format!("#0  {kvminit:#010x} <kvminit+{kvminit_off}> at kernel/vm.c:{kvminit_line}")
+    assert_eq!(bt[0], format!("#0  kvminit () at kernel/vm.c:{kvminit_line}"));
+    assert!(
+        bt[1].starts_with("#1  0x") && bt[1].contains(" in kmain () at kernel/main.c:"),
+        "{out}"
     );
-    assert!(bt[1].starts_with("#1  0x") && bt[1].contains(" <kmain+"), "{out}");
-    assert!(bt[1].contains(" at kernel/main.c:"), "{out}");
-    assert!(bt[2].contains(" <supervisor_entry+"), "{out}");
-    let back = bt[1].trim_start_matches("#1  ").split(" at ").next().unwrap();
+    assert!(bt[2].ends_with(" in supervisor_entry ()"), "{out}");
+    let back = frame_pc(bt[1]);
     // finish comes back there, and says what kvminit returned.
     assert!(
-        out.contains(&format!("run till exit, back to {back}\n=> {back}:")),
+        out.contains(&format!("run till exit, back to {back} <kmain+")),
         "{out}"
     );
     assert!(out.contains("returned: a0 = "), "{out}");
@@ -349,6 +350,12 @@ fn kernel() {
             &format!("2    breakpoint  {kvminit:#010x} <kvminit+{kvminit_off}>"),
         ],
     );
+}
+
+/// The pc a backtrace's line gives a caller's frame: `#1  0x80001234 in f () ...`.
+fn frame_pc(line: &str) -> &str {
+    let rest = &line[line.find("  0x").expect("a frame's pc") + 2..];
+    rest.split(' ').next().unwrap()
 }
 
 /// The committed kernel.
@@ -452,10 +459,10 @@ fn source_lines_of_the_kernel() {
         .skip(1)
         .take_while(|l| l.starts_with('#'))
         .collect();
-    assert!(!bt[0].contains("<kmain"), "{out}");
+    assert!(!bt[0].contains(" kmain "), "{out}");
     assert!(bt[0].contains(" at kernel/"), "{out}");
     assert!(
-        bt[1].contains(" <kmain+") && bt[1].ends_with(&format!(" at kernel/main.c:{}", lines[1])),
+        bt[1].contains(" in kmain () at ") && bt[1].ends_with(&format!(" at kernel/main.c:{}", lines[1])),
         "{out}"
     );
     // list: ten numbered lines; list main.c:LINE centers on it.
@@ -524,7 +531,7 @@ fn stepping_through_a_user_program() {
     assert_eq!(lines[0], body, "{out}");
     assert!(lines.len() >= 3, "{out}");
     assert!(lines.windows(2).all(|w| w[0] < w[1]), "{lines:?}\n{out}");
-    assert!(out.contains(" <_start+"), "{out}");
+    assert!(out.contains(" in _start ()\n"), "{out}");
 }
 
 /// LLDB (from the LLVM installer) reads the kernel's line tables: an address's
@@ -759,8 +766,8 @@ fn hello_rv64() {
             "=> 0x0000000080000024 <puts+4>:  mv t1, a0",
             "=> 0x0000000080000028 <puts+8>:  lbu t2, 0x0(t1)",
             "=> 0x000000008000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
-            "#0  0x000000008000002c <puts+12>",
-            "#1  0x0000000080000018 <_start+24>",
+            "#0  0x000000008000002c in puts ()",
+            "#1  0x0000000080000018 in _start ()",
             "   0x0000000080000024 <puts+4>:  mv t1, a0",
             "   0x0000000080000028 <puts+8>:  lbu t2, 0x0(t1)",
             "=> 0x000000008000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
@@ -868,19 +875,23 @@ const RV64_DIR: &str = "crates/merlin-dbg/tests/rv64";
 /// default layout), written to a file of its own for `test`, removed with the
 /// guard.
 fn rv64_program(test: &str) -> TempFile {
-    let xlen = excalibur::Xlen::Rv64;
-    let dir = path(RV64_DIR);
+    program(RV64_DIR, "prog.c", excalibur::Xlen::Rv64, &format!("rv64-{test}"))
+}
+
+/// `dir/file` (a directory from the repository root) and tests/rv64/crt0.s built
+/// for `xlen` with our tools, `file` with its debug information (merlin -g, `dir`
+/// its compilation directory), into an executable at 0x80000000, written to a
+/// file named for `test`, removed with the guard.
+fn program(dir: &str, file: &str, xlen: excalibur::Xlen, test: &str) -> TempFile {
     let opts = merlin::Options {
         xlen,
-        debug: Some(merlin::DebugInfo {
-            comp_dir: RV64_DIR.into(),
-        }),
+        debug: Some(merlin::DebugInfo { comp_dir: dir.into() }),
         ..merlin::Options::default()
     };
-    let src = std::fs::read_to_string(dir.join("prog.c")).unwrap();
-    let asm = merlin::compile_with("prog.c", &src, &opts, &merlin::no_files)
+    let src = std::fs::read_to_string(path(dir).join(file)).unwrap();
+    let asm = merlin::compile_with(file, &src, &opts, &merlin::no_files)
         .unwrap_or_else(|e| panic!("merlin: {e:?}"));
-    let crt0 = std::fs::read_to_string(dir.join("crt0.s")).unwrap();
+    let crt0 = std::fs::read_to_string(path(RV64_DIR).join("crt0.s")).unwrap();
     let as_opts = merlin_as::Options { xlen };
     let inputs: Vec<merlin_ld::Input> = [("crt0.o", crt0), ("prog.o", asm)]
         .into_iter()
@@ -892,7 +903,7 @@ fn rv64_program(test: &str) -> TempFile {
         .collect();
     let linked = merlin_ld::link(&inputs, &merlin_ld::Options::default())
         .unwrap_or_else(|e| panic!("merlin-ld: {e:?}"));
-    TempFile::new(&format!("rv64-{test}.elf"), &linked.elf)
+    TempFile::new(&format!("{test}.elf"), &linked.elf)
 }
 
 /// The addresses of `names` in the program at `elf`, from its symbols (so that
@@ -972,18 +983,24 @@ fn source_lines_of_an_rv64_program() {
     // fact, called from main on that line, called from _start.
     let bt = backtrace_after(&out, "(merlin-dbg) bt");
     assert_eq!(bt.len(), 3, "{out}");
-    let pc = u64::from_str_radix(&bt[0]["#0  0x".len()..][..16], 16).unwrap();
+    let stop = out
+        .lines()
+        .find(|l| l.starts_with("=> 0x") && l.contains(" <fact+"))
+        .unwrap_or_else(|| panic!("no stop in fact in:\n{out}"));
+    let pc = u64::from_str_radix(&stop["=> 0x".len()..][..16], 16).unwrap();
     assert!(
-        bt[0].contains(&format!(" <fact+{}>", pc - fact_at)) && pc - fact_at >= 16,
+        stop.contains(&format!(" <fact+{}>", pc - fact_at)) && pc - fact_at >= 16,
         "{out}"
     );
-    assert!(bt[0].ends_with(&format!(" at {file}:{}", want[2])), "{out}");
+    // fact's frame, with its argument; main's, with its pc (the call's return
+    // address); _start's, without debug information.
+    assert_eq!(bt[0], format!("#0  fact (n=5) at {file}:{}", want[2]), "{out}");
     assert!(
-        bt[1].starts_with("#1  0x00000000800") && bt[1].contains(" <main+"),
+        bt[1].starts_with("#1  0x00000000800") && bt[1].contains(" in main () at "),
         "{out}"
     );
     assert!(bt[1].ends_with(&format!(" at {file}:{}", want[1])), "{out}");
-    assert!(bt[2].contains(" <_start+"), "{out}");
+    assert!(bt[2].ends_with(" in _start ()"), "{out}");
     // list: ten numbered lines; list prog.c:LINE centers on it.
     let listed: Vec<&str> = out
         .lines()
@@ -1085,19 +1102,21 @@ fn stepping_through_an_rv64_program() {
     assert_eq!(first[1..], bt[1..], "{out}");
     assert_eq!(at(first[0]), Some(format!("{file}:{sum}")));
     assert_eq!(at(bt[0]), Some(format!("{file}:{va_arg}")));
-    assert!(bt[1].contains(" <fact+"), "{out}");
+    // Each frame with its arguments: sum's count, then fact's n from 1 up to 5.
+    assert!(bt[0].contains(" sum (n="), "{out}");
+    assert!(bt[1].contains(" in fact (n=1) at "), "{out}");
     assert_eq!(at(bt[1]), Some(format!("{file}:{base_case}")));
-    for f in &bt[2..6] {
-        assert!(f.contains(" <fact+"), "{out}");
+    for (i, f) in bt[2..6].iter().enumerate() {
+        assert!(f.contains(&format!(" in fact (n={}) at ", i + 2)), "{out}");
         assert_eq!(at(f), Some(format!("{file}:{recursion}")));
     }
-    assert!(bt[6].contains(" <main+"), "{out}");
+    assert!(bt[6].contains(" in main () at "), "{out}");
     assert_eq!(at(bt[6]), Some(format!("{file}:{call}")));
-    assert!(bt[7].contains(" <_start+"), "{out}");
+    assert!(bt[7].ends_with(" in _start ()"), "{out}");
     // finish, from the loop: back in fact(1), with sum's result.
-    let back = bt[1].trim_start_matches("#1  ").split(" at ").next().unwrap();
+    let back = frame_pc(bt[1]);
     assert!(
-        out.contains(&format!("run till exit, back to {back}\n=> {back}:")),
+        out.contains(&format!("run till exit, back to {back} <fact+")),
         "{out}"
     );
     assert_lines(&out, &["returned: a0 = 0x0000000000000001 (1)"]);
@@ -1183,4 +1202,294 @@ fn starting_an_rv64_grail_and_the_widths_agreeing() {
     );
     assert_eq!(thread.join().unwrap(), Outcome::Exited(0));
     assert_eq!(console.text(), "Hello from Camelot!\n");
+}
+
+/// `tests/vars/vars.c`'s directory, from the repository root.
+const VARS_DIR: &str = "crates/merlin-dbg/tests/vars";
+
+/// The output of each command in `out`, in order: what follows its echoed line.
+fn replies(out: &str, commands: &[&str]) -> Vec<String> {
+    let mut rest = out;
+    commands
+        .iter()
+        .map(|c| {
+            let echo = format!("(merlin-dbg) {c}\n");
+            let at = rest.find(&echo).unwrap_or_else(|| panic!("no {c:?} in:\n{out}"));
+            rest = &rest[at + echo.len()..];
+            let end = rest.find("(merlin-dbg) ").unwrap_or(rest.len());
+            rest[..end].trim_end().to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn variables_and_types() {
+    // tests/vars/vars.c at both widths: stopped in walk three deep in its
+    // recursion, the arguments and locals of each frame (up and down), globals of
+    // every kind of type, members, elements, pointers followed, the types, and a
+    // function's struct arguments.
+    let file = format!("{VARS_DIR}/vars.c");
+    let add = line_of(&file, "    sum += list->value;");
+    let rec = line_of(&file, "        sum = walk(list->next, depth + 1);");
+    let call = line_of(&file, "        counter = walk(&nodes[0], 0) + inner;");
+    let area_call = line_of(
+        &file,
+        "    total = (count_t)area(box.corners[0], box.corners[1]);",
+    );
+    let commands = [
+        "bt",
+        "info args",
+        "info locals",
+        "print list",
+        "print *list",
+        "print list->value",
+        "print nodes",
+        "print nodes[1].next->value + 1",
+        "print box",
+        "print box.corners[1].y",
+        "print box.name",
+        "print *box.name",
+        "print grid",
+        "print grid[1][2]",
+        "print &counter",
+        "print/x counter",
+        "print big",
+        "print walk",
+        "print sizeof(Node)",
+        "print &nodes[2] - &nodes[0]",
+        "ptype Node",
+        "ptype box",
+        "ptype enum color",
+        "ptype walk",
+        "ptype list",
+        "whatis nodes",
+        "whatis Node",
+        "whatis total",
+        "whatis *box.name",
+        "up",
+        "info args",
+        "up 2",
+        "info locals",
+        "print w.bytes",
+        "print letter",
+        "print depth",
+        "down",
+        "print depth",
+        "frame 0",
+        "print nope",
+    ];
+    for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
+        let elf = program(VARS_DIR, "vars.c", xlen, &format!("vars-{}", xlen.bits()));
+        let [nodes, counter, walk] = addresses(&elf, ["nodes", "counter", "walk"]);
+        let ptr = u64::from(xlen.bits() / 8);
+        let node = |i: u64| match i {
+            0 => format!("{nodes:#x} <nodes>"),
+            i => format!("{:#x} <nodes+{}>", nodes + i * 2 * ptr, i * 2 * ptr),
+        };
+        let script = format!(
+            "break vars.c:{add}\ncontinue\n{}\ndelete\nbreak area\ncontinue\nbt\ninfo args\nprint b.x - a.x\n\
+             delete\ncontinue\n",
+            commands.join("\n")
+        );
+        let out = connected(elf.to_str(), 1, b"", &script);
+        let r = replies(&out, &commands);
+        let at = |line: u32| format!("at {file}:{line}");
+        // The backtrace: the innermost frame without its pc (it is at the start of
+        // its line), the callers with theirs, each with its arguments and line.
+        let bt: Vec<&str> = r[0].lines().collect();
+        assert_eq!(bt.len(), 5, "{out}");
+        assert_eq!(bt[0], format!("#0  walk (list={}, depth=2) {}", node(2), at(add)));
+        for (i, depth) in [(1, 1), (2, 0)] {
+            assert!(bt[i].starts_with(&format!("#{i}  0x")), "{out}");
+            let want = format!(" in walk (list={}, depth={depth}) {}", node(depth), at(rec));
+            assert!(bt[i].ends_with(&want), "{} in:\n{out}", want);
+        }
+        assert!(bt[3].ends_with(&format!(" in main () {}", at(call))), "{out}");
+        assert!(bt[4].ends_with(" in _start ()"), "{out}");
+        let want = [
+            format!("list = {}\ndepth = 2", node(2)),
+            "calls = 3\nsum = 0".to_string(),
+            format!("$1 = (Node *) {}", node(2)),
+            "$2 = {value = 30, next = 0x0}".to_string(),
+            "$3 = 30".to_string(),
+            format!(
+                "$4 = {{{{value = 10, next = {}}}, {{value = 20, next = {}}}, {{value = 30, next = 0x0}}}}",
+                node(1),
+                node(2)
+            ),
+            "$5 = 31".to_string(),
+        ];
+        assert_eq!(r[1..8], want, "{out}");
+        assert!(
+            r[8].starts_with("$6 = {color = BLUE, corners = {{x = 1, y = 2}, {x = 30, y = 40}}, name = 0x")
+        );
+        assert!(r[8].ends_with(" \"box\"}"), "{out}");
+        assert_eq!(r[9], "$7 = 40");
+        assert!(
+            r[10].starts_with("$8 = 0x") && r[10].ends_with(" \"box\""),
+            "{out}"
+        );
+        let want = [
+            "$9 = 98 'b'".to_string(),
+            "$10 = {{1, 2, 3}, {4, 5, 6}}".to_string(),
+            "$11 = 6".to_string(),
+            format!("$12 = (int *) {counter:#x} <counter>"),
+            "$13 = 0x3".to_string(),
+            "$14 = -5".to_string(),
+            format!("$15 = {{int (Node *, int)}} {walk:#x} <walk>"),
+            format!("$16 = {}", 2 * ptr),
+            "$17 = 2".to_string(),
+            "type = struct node {\n    int value;\n    struct node *next;\n}".to_string(),
+            "type = struct shape {\n    enum color color;\n    struct point corners[2];\n    const char *name;\n}"
+                .to_string(),
+            "type = enum color {RED, GREEN = 5, BLUE}".to_string(),
+            "type = int (Node *, int)".to_string(),
+            "type = struct node {\n    int value;\n    struct node *next;\n} *".to_string(),
+            "type = Node [3]".to_string(),
+            "type = struct node".to_string(),
+            "type = count_t".to_string(),
+            "type = const char".to_string(),
+        ];
+        assert_eq!(r[11..29], want, "{out}");
+        // up: walk one level out, its line the call's.
+        assert!(r[29].starts_with("#1  0x"), "{out}");
+        assert!(r[29].contains(&format!(" in walk (list={}, depth=1) {}\n", node(1), at(rec))));
+        assert!(r[29].ends_with(&format!(
+            "{file}:{rec}:         sum = walk(list->next, depth + 1);"
+        )));
+        assert_eq!(r[30], format!("list = {}\ndepth = 1", node(1)));
+        // Two more: main, whose block's local comes first.
+        assert!(r[31].contains(&format!(" in main () {}\n", at(call))), "{out}");
+        assert_eq!(
+            r[32..37],
+            [
+                "inner = 6\nw = {u = 287454020, bytes = \"D3\\\"\\021\"}\nletter = 65 'A'\ni = 3",
+                "$18 = \"D3\\\"\\021\"",
+                "$19 = 65 'A'",
+                "error: no symbol \"depth\" in current context",
+                &format!(
+                    "#2  {} in walk (list={}, depth=0) {}\n{file}:{rec}:         sum = walk(list->next, depth + 1);",
+                    frame_pc(bt[2]),
+                    node(0),
+                    at(rec)
+                ),
+            ],
+            "{out}"
+        );
+        assert_eq!(r[37], "$20 = 0");
+        assert!(r[38].starts_with("#0  walk (list="), "{out}");
+        assert_eq!(r[39], "error: no symbol \"nope\" in current context");
+        // area's struct arguments: `...` in a backtrace, as GDB's frame-arguments
+        // scalars, and in full in info args.
+        assert_lines(
+            &out,
+            &[
+                &format!(
+                    "#0  area (a=..., b=...) at {file}:{}",
+                    line_of(&file, "    int w = b.x - a.x;")
+                ),
+                "(merlin-dbg) info args",
+                "a = {x = 1, y = 2}",
+                "b = {x = 30, y = 40}",
+                "$21 = 29",
+            ],
+        );
+        assert!(out.contains(&format!(" in main () {}\n", at(area_call))), "{out}");
+    }
+}
+
+#[test]
+fn variables_in_the_kernel() {
+    // The shell's first system call, a write: sys_write, called from syscall,
+    // called from user_trap, which the trap vector (assembly) jumped to from U-mode:
+    // the chain of frames ends there, at the program's s0. Each frame's arguments,
+    // the trap frame's members and its registers (an array), and the process (a
+    // struct reached by a pointer, its name a char array).
+    let out = connected(
+        "kernel/kernel.elf",
+        1,
+        b"hello\nexit\n",
+        "break sys_write\n\
+         continue\n\
+         bt\n\
+         info args\n\
+         print f->scause\n\
+         print f->regs[17]\n\
+         up\n\
+         info locals\n\
+         print p->name\n\
+         print p->pid\n\
+         print num\n\
+         whatis p\n\
+         ptype f\n\
+         up\n\
+         info args\n\
+         delete\n\
+         continue\n",
+    );
+    let line = |file: &str, start: &str| format!("{file}:{}", line_of(file, start));
+    let bt = backtrace_after(&out, "(merlin-dbg) bt");
+    assert_eq!(bt.len(), 3, "{out}");
+    let f = bt[0]
+        .strip_prefix("#0  sys_write (f=")
+        .and_then(|r| r.split(')').next())
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(f.starts_with("0x"), "{out}");
+    // sys_write's first line of code, the one after its name's.
+    let body = format!(
+        "kernel/sysfile.c:{}",
+        line_of("kernel/sysfile.c", "int sys_write(struct trap_frame *f) {") + 1
+    );
+    assert_eq!(bt[0], format!("#0  sys_write (f={f}) at {body}"));
+    assert!(bt[1].ends_with(&format!(
+        " in syscall (f={f}) at {}",
+        line("kernel/syscall.c", "        ret = sys_write(f);")
+    )));
+    assert!(bt[2].ends_with(&format!(
+        " in user_trap (f={f}) at {}",
+        line("kernel/trap.c", "        syscall(f);")
+    )));
+    let r = replies(
+        &out,
+        &[
+            "info args",
+            "print f->scause",
+            "print f->regs[17]",
+            "up",
+            "info locals",
+            "print p->name",
+            "print p->pid",
+            "print num",
+            "whatis p",
+            "ptype f",
+            "up",
+            "info args",
+        ],
+    );
+    assert_eq!(r[0], format!("f = {f}"));
+    assert_eq!(r[1], "$1 = 8", "{out}"); // CAUSE_ECALL_U
+    assert_eq!(r[2], "$2 = 2", "{out}"); // a7: SYS_write
+    assert!(
+        r[3].starts_with("#1  0x") && r[3].contains(" in syscall (f="),
+        "{out}"
+    );
+    // syscall's locals: the process, the call's number, the stack pointer.
+    let locals: Vec<&str> = r[4].lines().collect();
+    assert!(locals.iter().any(|l| l.starts_with("p = 0x")), "{out}");
+    assert!(locals.contains(&"num = 2"), "{out}");
+    assert!(locals.iter().any(|l| l.starts_with("sp = ")), "{out}");
+    assert_eq!(r[5], "$3 = \"sh\", '\\000' <repeats 13 times>", "{out}");
+    assert_eq!(r[6], "$4 = 1", "{out}");
+    assert_eq!(r[7], "$5 = 2", "{out}");
+    assert_eq!(r[8], "type = struct proc *");
+    assert!(
+        r[9].starts_with("type = struct trap_frame {\n    u32 regs[32];\n    u32 sepc;\n"),
+        "{out}"
+    );
+    assert!(r[9].ends_with("} *"), "{out}");
+    assert!(
+        r[10].starts_with("#2  0x") && r[10].contains(" in user_trap (f="),
+        "{out}"
+    );
+    assert_eq!(r[11], format!("f = {f}"));
 }

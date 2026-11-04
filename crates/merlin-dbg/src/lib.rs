@@ -4,6 +4,7 @@
 //! - [`remote`]: the protocol client, talking to Grail's stub (`grail --gdb`);
 //! - [`symbols`]: names from the program's ELF symbol table;
 //! - [`source`]: source lines, from the program's DWARF line tables;
+//! - [`vars`]: variables and types, from the program's DWARF debugging information;
 //! - [`frames`]: backtraces by frame pointer (the frame layout is explained there);
 //! - [`session`]: the commands;
 //! - [`run`]: the command line, which connects to a stub or starts a machine in this
@@ -14,6 +15,7 @@ pub mod remote;
 pub mod session;
 pub mod source;
 pub mod symbols;
+pub mod vars;
 
 use remote::Remote;
 use session::{Flow, OnQuit, Session};
@@ -28,8 +30,9 @@ pub const USAGE: &str = "usage: merlin-dbg [--connect ADDR] [-x FILE] [program.e
 
 Debugs a program running in Grail, at the machine level: breakpoints,
 watchpoints, steps, registers, memory, disassembly and backtraces; and by
-source line where the program has line tables (merlin -g): break FILE:LINE,
-step and next by line, list. Sources are found relative to the current
+source line and variable where the program has debug information (merlin
+-g): break FILE:LINE, step and next by line, list, print, info locals,
+info args, ptype, frames with their arguments, up and down. Sources are found relative to the current
 directory (directory DIR adds others).
 
   --connect ADDR  the GDB stub of a running grail --gdb (default 127.0.0.1:1234):
@@ -123,10 +126,12 @@ fn start(
         ),
     };
     let mut lines = Lines::default();
+    let mut debug = vars::Debug::default();
     let (symbols, file) = match &program {
         Some(path) => {
             let file = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
             lines.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
+            debug.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
             let symbols = Symbols::from_elf(&file).map_err(|e| format!("{path}: {e}"))?;
             (symbols, Some((path, file)))
         }
@@ -139,17 +144,17 @@ fn start(
     // warns and goes on: ending it would drop the connection, which the stub takes
     // as a detach, and a machine waiting for its debugger would run off on its own.
     // (Started with `--`, the machine is the program's width.)
-    let (symbols, lines) = match &file {
+    let (symbols, lines, debug) = match &file {
         Some((path, file)) => match symbols::check_xlen(file, remote.xlen) {
-            Ok(()) => (symbols, lines),
+            Ok(()) => (symbols, lines, debug),
             Err(e) => {
                 let _ = writeln!(out, "warning: {path}: {e}: going on without its symbols");
-                (Symbols::default(), Lines::default())
+                (Symbols::default(), Lines::default(), vars::Debug::default())
             }
         },
-        None => (symbols, lines),
+        None => (symbols, lines, debug),
     };
-    let mut session = Session::new(remote, symbols, lines, &mut *out, on_quit, interrupt);
+    let mut session = Session::new(remote, symbols, lines, debug, &mut *out, on_quit, interrupt);
     session.start()?;
 
     // The script, then stdin. Commands that do not come from a terminal are echoed, so

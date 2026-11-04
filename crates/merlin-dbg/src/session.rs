@@ -3,12 +3,16 @@
 //!
 //! With line tables ([`Lines`]) the session works by source line too: `break
 //! FILE:LINE`, `step` and `next` by line, `list`, and every stop says the file,
-//! line and its text.
+//! line and its text. With the rest of the debugging information ([`Debug`]) it
+//! knows the variables and types: `print`, `info locals`, `info args`, `ptype`,
+//! `whatis`, the arguments of each frame in a backtrace, and `frame`, `up` and
+//! `down` to choose the frame those look in.
 
 use crate::frames::{self, Regs};
 use crate::remote::{self, hex_value, wrap, Remote, StopEvent, Watch};
 use crate::source::{Lines, Place};
 use crate::symbols::{self, Symbols};
+use crate::vars::{self, Debug, Eval};
 use excalibur::{Inst, Syntax, Xlen};
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
@@ -43,6 +47,12 @@ pub struct Session<'a, W: Write> {
     xlen: Xlen,
     symbols: Symbols,
     lines: Lines,
+    debug: Debug,
+    /// The frame `print`, `info locals` and `info args` look in (0, the innermost,
+    /// at every stop), which `frame`, `up` and `down` choose.
+    frame: usize,
+    /// How many values `print` has shown (`$1`, `$2`, ...).
+    printed: usize,
     /// The source line shown last: an instruction step on the same line does
     /// not show it again.
     shown: Option<Place>,
@@ -82,7 +92,11 @@ add-symbol-file FILE    add the symbols and lines of another program (a user one
 regs|info registers     the selected hart's registers, as GDB shows them
 x/N[b|h|w|g] ADDR       N bytes (b), halfwords (h), words (w) or giants (g, 8) at ADDR
 disas [ADDR] [N]        disassemble N instructions (8) from ADDR (the pc)
-bt|backtrace            the call stack, by frame pointer
+bt|backtrace            the call stack, by frame pointer, with arguments and lines
+frame|f [N], up [N], down [N]  select frame N (or N frames out, or in)
+print|p[/x] EXPR        an expression's value (variables, p->next, a[i], *p, &x)
+info locals|args        the selected frame's local variables or arguments
+ptype EXPR|TYPE         a type, with a struct's members; whatis: just its name
 hart [N]                list the harts, or select hart N
 quit|q                  leave (the machine is killed, or left running with --connect)";
 
@@ -91,6 +105,7 @@ impl<'a, W: Write> Session<'a, W> {
         remote: Remote,
         symbols: Symbols,
         lines: Lines,
+        debug: Debug,
         out: W,
         on_quit: OnQuit,
         interrupt: &'a AtomicBool,
@@ -100,6 +115,9 @@ impl<'a, W: Write> Session<'a, W> {
             remote,
             symbols,
             lines,
+            debug,
+            frame: 0,
+            printed: 0,
             shown: None,
             listed: None,
             out,
@@ -185,7 +203,10 @@ impl<'a, W: Write> Session<'a, W> {
                 Some("breakpoints" | "b" | "break" | "watchpoints") => self.info_breakpoints(),
                 Some("registers" | "r" | "reg") => self.regs()?,
                 Some("harts" | "threads") => self.harts()?,
-                _ => return Err("info breakpoints, info registers or info harts".into()),
+                Some("locals") => self.info_locals()?,
+                Some("args") => self.info_args()?,
+                Some("frame") => self.select_frame(self.frame)?,
+                _ => return Err("info breakpoints, registers, harts, locals, args or frame".into()),
             },
             "continue" | "c" => self.continue_()?,
             "stepi" | "si" => {
@@ -223,6 +244,32 @@ impl<'a, W: Write> Session<'a, W> {
             "regs" | "registers" => self.regs()?,
             "disas" | "disassemble" => self.disas(&args)?,
             "bt" | "backtrace" | "where" => self.backtrace()?,
+            "frame" | "f" => match args.first() {
+                None => self.select_frame(self.frame)?,
+                Some(n) => self.select_frame(parse_number(n).ok_or("frame needs a frame number")? as usize)?,
+            },
+            "up" => {
+                let n = count(&args)? as usize;
+                self.select_frame(self.frame + n)?
+            }
+            "down" => {
+                let n = count(&args)? as usize;
+                if self.frame == 0 {
+                    return Err("bottom (innermost) frame selected; you cannot go down".into());
+                }
+                self.select_frame(self.frame.saturating_sub(n))?
+            }
+            "ptype" => self.ptype(rest, true)?,
+            "whatis" => self.ptype(rest, false)?,
+            _ if cmd == "print"
+                || cmd == "p"
+                || cmd == "inspect"
+                || cmd.starts_with("print/")
+                || cmd.starts_with("p/") =>
+            {
+                let format = cmd.split_once('/').map(|(_, f)| f);
+                self.print_(rest, format)?
+            }
             "hart" | "thread" => match args.first() {
                 None => self.harts()?,
                 Some(n) => self.select_hart(n)?,
@@ -370,6 +417,7 @@ impl<'a, W: Write> Session<'a, W> {
         symbols::check_xlen(&file, self.xlen).map_err(|e| format!("{path}: {e}"))?;
         self.symbols.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
         self.lines.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
+        self.debug.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
         self.say(format!("added the symbols of {path}"));
         Ok(())
     }
@@ -463,6 +511,8 @@ impl<'a, W: Write> Session<'a, W> {
     /// Resumes (a step of `step`'s hart, or every hart) and reports the stop. Returns
     /// the stop, or `None` once the program has exited.
     fn resume(&mut self, step: Option<usize>) -> Result<Option<Halt>> {
+        // Every stop selects the innermost frame again.
+        self.frame = 0;
         if step.is_none() {
             // After a run, the stop shows its source line whatever it is.
             self.shown = None;
@@ -875,19 +925,182 @@ impl<'a, W: Write> Session<'a, W> {
 
     fn backtrace(&mut self) -> Result<()> {
         let frames = self.frames()?;
-        let lines: Vec<String> = frames
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                // A caller's pc is the return address: its call is the
-                // instruction before, on the line that made the call.
-                let looked_up = if i == 0 { f.pc } else { f.pc.wrapping_sub(4) };
-                match self.lines.at(looked_up) {
-                    Some(place) => format!("#{i}  {} at {place}", self.show(f.pc)),
-                    None => format!("#{i}  {}", self.show(f.pc)),
-                }
-            })
+        let regs = self.remote.registers()?;
+        let contexts = frame_contexts(&frames, &regs);
+        let lines: Vec<String> = (0..frames.len())
+            .map(|i| self.frame_line(i, &frames, &contexts[i]))
             .collect();
+        self.say(lines.join("\n"));
+        Ok(())
+    }
+
+    /// Frame `i` as GDB's backtrace shows it: `#1  0x... in walk (list=0x80001010
+    /// <nodes+8>, depth=1) at vars.c:29`. The address is left out of the innermost
+    /// frame when its pc starts a line; the arguments come from the debugging
+    /// information and the name from it or the symbols (`??` without either).
+    fn frame_line(&mut self, i: usize, frames: &[frames::Frame], ctx: &vars::Frame) -> String {
+        let pc = frames[i].pc;
+        // A caller's pc is the return address: its call is the instruction
+        // before, on the line (and in the block) that made the call.
+        let looked_up = if i == 0 { pc } else { pc.wrapping_sub(4) };
+        let place = self.lines.at(looked_up);
+        let address = if i == 0 && place.is_some() && self.lines.starts_statement(pc) {
+            String::new()
+        } else {
+            format!("{} in ", self.hex(pc))
+        };
+        let func = self.debug.function_at(ctx.pc);
+        let (name, args) = match func {
+            Some(f) => {
+                let name = self.debug.name(f).unwrap_or("??").to_string();
+                let mut eval = Eval {
+                    debug: &self.debug,
+                    symbols: &self.symbols,
+                    target: &mut self.remote,
+                    frame: Some(ctx.clone()),
+                    xlen: self.xlen,
+                };
+                (name, eval.show_args(f))
+            }
+            None => (
+                self.symbols
+                    .containing(looked_up)
+                    .map_or("??".to_string(), |(n, _)| n.to_string()),
+                String::new(),
+            ),
+        };
+        let at = place.map_or(String::new(), |p| format!(" at {p}"));
+        format!("#{i}  {address}{name} ({args}){at}")
+    }
+
+    /// The selected frame's registers, as far as they are known.
+    fn frame_context(&mut self) -> Result<Option<vars::Frame>> {
+        let frames = self.frames()?;
+        if self.frame >= frames.len() {
+            self.frame = 0;
+        }
+        let regs = self.remote.registers()?;
+        Ok(frame_contexts(&frames, &regs).into_iter().nth(self.frame))
+    }
+
+    /// `frame N`, `up`, `down`: selects frame `n` and shows it, and its line.
+    fn select_frame(&mut self, n: usize) -> Result<()> {
+        let frames = self.frames()?;
+        if n >= frames.len() {
+            return Err("initial frame selected; you cannot go up".into());
+        }
+        self.frame = n;
+        let regs = self.remote.registers()?;
+        let contexts = frame_contexts(&frames, &regs);
+        let line = self.frame_line(n, &frames, &contexts[n]);
+        self.say(line);
+        let pc = if n == 0 {
+            frames[0].pc
+        } else {
+            frames[n].pc.wrapping_sub(4)
+        };
+        if let Some(place) = self.lines.at(pc) {
+            let line = match self.lines.text(&place.file, place.line) {
+                Some(text) => format!("{place}: {text}"),
+                None => place.to_string(),
+            };
+            self.say(line);
+            self.listed = Some((place.file.clone(), place.line.saturating_sub(5).max(1)));
+        }
+        Ok(())
+    }
+
+    /// An evaluator in the selected frame.
+    fn eval_in_frame(&mut self) -> Result<Eval<'_, crate::remote::Remote>> {
+        let frame = self.frame_context()?;
+        Ok(Eval {
+            debug: &self.debug,
+            symbols: &self.symbols,
+            target: &mut self.remote,
+            frame,
+            xlen: self.xlen,
+        })
+    }
+
+    /// `print EXPR`, `print/x EXPR`.
+    fn print_(&mut self, expr: &str, format: Option<&str>) -> Result<()> {
+        let hex = match format {
+            None | Some("d") => false,
+            Some("x") => true,
+            Some(f) => return Err(format!("undefined output format \"{f}\"")),
+        };
+        if expr.is_empty() {
+            return Err("print needs an expression".into());
+        }
+        let mut eval = self.eval_in_frame()?;
+        let v = eval.value(expr)?;
+        let shown = eval.show(&v, true, hex)?;
+        self.printed += 1;
+        let n = self.printed;
+        self.say(format!("${n} = {shown}"));
+        Ok(())
+    }
+
+    /// `ptype` (`full`) and `whatis`, of a type name or an expression.
+    fn ptype(&mut self, arg: &str, full: bool) -> Result<()> {
+        if arg.is_empty() {
+            return Err("ptype and whatis need an expression or a type".into());
+        }
+        let mut eval = self.eval_in_frame()?;
+        let text = match eval.type_name(arg) {
+            Some(t) if full => self.debug.ptype(&t),
+            Some(t) => self.debug.whatis_type(&t),
+            None => {
+                let v = eval.value(arg)?;
+                let t = eval.type_of(&v);
+                if full {
+                    self.debug.ptype(&t)
+                } else {
+                    self.debug.declare(&t, "")
+                }
+            }
+        };
+        self.say(format!("type = {text}"));
+        Ok(())
+    }
+
+    /// `info locals`: the variables of the selected frame's blocks, the
+    /// innermost first, as GDB lists them.
+    fn info_locals(&mut self) -> Result<()> {
+        let Some(ctx) = self.frame_context()? else {
+            return Err("no frame selected".into());
+        };
+        let Some(func) = self.debug.function_at(ctx.pc) else {
+            self.say("No symbol table info available.");
+            return Ok(());
+        };
+        let vars: Vec<_> = self.debug.locals(func, ctx.pc).into_iter().flatten().collect();
+        if vars.is_empty() {
+            self.say("No locals.");
+            return Ok(());
+        }
+        let mut eval = self.eval_in_frame()?;
+        let lines = eval.show_vars(&vars);
+        self.say(lines.join("\n"));
+        Ok(())
+    }
+
+    /// `info args`: the selected frame's arguments.
+    fn info_args(&mut self) -> Result<()> {
+        let Some(ctx) = self.frame_context()? else {
+            return Err("no frame selected".into());
+        };
+        let Some(func) = self.debug.function_at(ctx.pc) else {
+            self.say("No symbol table info available.");
+            return Ok(());
+        };
+        let params = self.debug.params(func);
+        if params.is_empty() {
+            self.say("No arguments.");
+            return Ok(());
+        }
+        let mut eval = self.eval_in_frame()?;
+        let lines = eval.show_vars(&params);
         self.say(lines.join("\n"));
         Ok(())
     }
@@ -976,6 +1189,35 @@ impl<'a, W: Write> Session<'a, W> {
 const STEP_LIMIT: u32 = 1_000_000;
 
 /// `FILE:LINE` (a file name, a colon, a decimal line number), if `s` is one.
+/// The registers each frame has, as far as they are known: all of them in the
+/// innermost; in a caller its frame pointer, and its `sp`, which is where the frame
+/// it called began (that frame's CFA, its `s0`) or, past a frame not built yet
+/// (whose `s0` is still the caller's), that frame's own `sp`. The pc to look its
+/// scopes up at is the call's for a caller.
+fn frame_contexts(frames: &[frames::Frame], regs: &[u64]) -> Vec<vars::Frame> {
+    let mut out: Vec<vars::Frame> = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        let mut r = [None; 32];
+        if i == 0 {
+            for (n, v) in regs.iter().take(32).enumerate() {
+                r[n] = Some(*v);
+            }
+            r[0] = Some(0);
+        } else {
+            let callee = &frames[i - 1];
+            r[8] = Some(f.fp);
+            r[2] = if callee.fp != f.fp {
+                Some(callee.fp)
+            } else {
+                out[i - 1].regs[2]
+            };
+        }
+        let pc = if i == 0 { f.pc } else { f.pc.wrapping_sub(1) };
+        out.push(vars::Frame { pc, regs: r });
+    }
+    out
+}
+
 fn source_line(s: &str) -> Option<(&str, u32)> {
     let (file, line) = s.rsplit_once(':')?;
     let line = line.trim().parse::<u32>().ok().filter(|&l| l > 0)?;
