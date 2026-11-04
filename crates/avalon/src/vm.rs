@@ -19,8 +19,11 @@
 //! (VRAM or a buffer in RAM, at its mode's size) with it and sends the rectangles that
 //! changed to every viewer; an unchanged screen sends nothing. A screen whose size
 //! changed (the guest set another mode) starts again at the new size: `ScreenResized`
-//! to every viewer, then the whole screen. Two limits keep a busy guest from flooding
-//! the link:
+//! to every viewer, then the whole screen. The framebuffer's cursor plane is not in the
+//! screen: the VM keeps a [`Cursor`] too, what the viewers have of it, and each look
+//! sends after the rectangles what changed of it, its image (`CursorShape`) or its place
+//! (`CursorPosition`), so a cursor that moves sends no rectangle. Two limits keep a busy
+//! guest from flooding the link:
 //!
 //! - **Rate**: the thread looks at the screen at most once per [`SCREEN_INTERVAL`]
 //!   (~30 times a second), however often the guest redraws. Changes between two looks
@@ -63,8 +66,9 @@ use crate::outbox::Outbox;
 use crate::switch::Card;
 use crate::{lock, Fail};
 use avalon_proto::{
-    AttachKind, DeviceEntry, DeviceSpec, ErrorCode, Frame, HardwareProfile, KeyEvent, Message, NetSpec,
-    PointerChange, PointerMotion, Screen, VmDetails, VmState, VmSummary, PIXEL_FORMAT_XRGB8888,
+    AttachKind, Cursor, CursorView, DeviceEntry, DeviceSpec, ErrorCode, Frame, HardwareProfile, KeyEvent,
+    Message, NetSpec, PointerChange, PointerMotion, Screen, VmDetails, VmState, VmSummary,
+    PIXEL_FORMAT_XRGB8888,
 };
 use excalibur::csr::IRQ_M_TIMER;
 use grail::framebuffer::{FB_HEIGHT, FB_WIDTH};
@@ -179,6 +183,8 @@ struct Inner {
     viewers: Vec<Viewer>,
     /// The screen as the viewers have it: what was captured last.
     screen: Screen,
+    /// The cursor as the viewers have it, captured with the screen.
+    cursor: Cursor,
     /// The machine has run since the last capture, so its framebuffer may differ.
     screen_owed: bool,
     /// When the screen was last looked at, for [`SCREEN_INTERVAL`].
@@ -356,6 +362,7 @@ impl Vm {
                 consoles: Vec::new(),
                 viewers: Vec::new(),
                 screen: Screen::new(FB_WIDTH, FB_HEIGHT),
+                cursor: Cursor::default(),
                 screen_owed: false,
                 screen_looked: None,
                 keys: VecDeque::new(),
@@ -719,7 +726,9 @@ impl Vm {
             format: PIXEL_FORMAT_XRGB8888,
         });
         let full = event_frame(&inner.screen.frame(self.id, inner.screen.bounds()));
-        if client.event(&full) {
+        // Then the cursor, its image and, if it shows, its place.
+        let cursor = inner.cursor.messages(self.id);
+        if client.event(&full) && cursor.iter().all(|m| client.event(&event_frame(m))) {
             match inner.viewers.iter_mut().find(|v| v.outbox.id == client.id) {
                 Some(v) => v.behind = false,
                 None => inner.viewers.push(Viewer::new(client)),
@@ -931,8 +940,10 @@ impl Vm {
         self.update_viewers(inner, machine, true);
     }
 
-    /// Captures the screen if the machine has run since the last capture, and sends
-    /// the rectangles that changed to every viewer that keeps up. A viewer over
+    /// Captures the screen and the cursor if the machine has run since the last
+    /// capture, and sends the rectangles that changed to every viewer that keeps up,
+    /// then what changed of the cursor to every viewer (protocol doc, section 6.4,
+    /// **Cursor**: a few bytes, which a viewer that is behind gets as well). A viewer over
     /// [`screen_backlog`] of the screen gets nothing and is marked behind; a viewer that is behind
     /// gets a full frame once it is under it again (or at once when `last`).
     ///
@@ -944,9 +955,20 @@ impl Vm {
         inner.screen_looked = Some(Instant::now());
         let id = self.id;
         let mut resized = None;
+        let mut cursor = Vec::new();
         let rects = if std::mem::take(&mut inner.screen_owed) {
-            // A display that is off shows black, as Grail's window does.
+            // A display that is off shows black, as Grail's window does, and no cursor.
             let frame = machine.cpu.bus.frame();
+            let shown = frame.cursor.map(|c| CursorView {
+                width: c.width,
+                height: c.height,
+                hot_x: c.hot_x,
+                hot_y: c.hot_y,
+                pixels: c.pixels,
+                x: c.x,
+                y: c.y,
+            });
+            cursor = inner.cursor.update(id, shown).iter().map(event_frame).collect();
             if (frame.width, frame.height) == (inner.screen.width(), inner.screen.height()) {
                 inner.screen.update(frame.pixels)
             } else {
@@ -974,7 +996,8 @@ impl Vm {
         let frames: Vec<Frame> = rects.iter().map(|&r| event_frame(&screen.frame(id, r))).collect();
         let backlog = screen_backlog(screen.width(), screen.height());
         let mut full = None;
-        // Whether viewer `v` stays: false once its client is gone (or cut off).
+        // Whether viewer `v` stays after its screen's part: false once its client is
+        // gone (or cut off).
         let mut send = |v: &mut Viewer| {
             // Every viewer learns the new size, so that what it is sent next fits.
             if let Some(resized) = &resized {
@@ -1002,7 +1025,7 @@ impl Vm {
             frames.iter().all(|f| v.outbox.event(f))
         };
         for mut v in std::mem::take(viewers) {
-            if send(&mut v) {
+            if send(&mut v) && cursor.iter().all(|f| v.outbox.event(f)) {
                 viewers.push(v);
             } else {
                 // Gone, as if it had detached: what it held is let go.

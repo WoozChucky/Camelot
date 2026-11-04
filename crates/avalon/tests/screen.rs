@@ -171,6 +171,60 @@ fn a_mode_change_resizes_the_viewers_and_sends_a_full_frame() {
     server.stop().unwrap();
 }
 
+/// A guest that moves the framebuffer's cursor over a frame it draws once
+/// (`examples/cursor`): the viewer gets the cursor's image once, in `CursorShape`, and
+/// its places in `CursorPosition`, and no frame after the first of those, since moving
+/// the cursor changes no pixel of the screen; it ends with Grail's frame, without the
+/// cursor, and the cursor where the guest left it. A viewer attaching afterwards gets
+/// the image and the place after the full frame.
+#[test]
+fn a_moving_cursor_sends_its_places_and_no_frames() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "cursor", profile(16, None), example("cursor"));
+    let mut viewer = Viewer::attach(&server, VmRef::Id(id));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    viewer.wait_for_event(exited(id));
+
+    assert!(
+        viewer.screen.pixels() == grail_screen(&example("cursor")),
+        "the frames rebuild Grail's frame, which has no cursor in it"
+    );
+    let (first, _) = viewer.cursor_messages.first().expect("cursor messages");
+    assert_eq!(*first, viewer.rects.len(), "no frame after the cursor showed");
+    let shapes = viewer
+        .cursor_messages
+        .iter()
+        .filter(|(_, m)| matches!(m, Message::CursorShape { .. }))
+        .count();
+    assert_eq!(shapes, 1, "the image once");
+    for (_, m) in &viewer.cursor_messages {
+        if let Message::CursorShape { vm, .. } | Message::CursorPosition { vm, .. } = m {
+            assert_eq!(*vm, id);
+        }
+    }
+    let (image, x, y) = viewer.cursor.shown().expect("the cursor shows");
+    assert_eq!((x, y), (0, 0), "the path's last place");
+    assert_eq!(
+        (image.width, image.height, image.hot_x, image.hot_y),
+        (64, 64, 0, 0)
+    );
+    let pixel = |x: usize, y: usize| &image.pixels[(y * 64 + x) * 4..][..4];
+    assert_eq!(pixel(0, 0), [0, 0, 0, 0xff], "the tip, opaque black");
+    assert_eq!(pixel(1, 2), [0xff; 4], "inside, opaque white");
+    assert_eq!(pixel(0, 16), [0x80, 0, 0, 0x80], "the tail, blue half covered");
+    assert_eq!(pixel(40, 40), [0; 4], "clear");
+
+    let late = Viewer::attach(&server, VmRef::Id(id));
+    assert!(late.screen == viewer.screen);
+    let mut late = late;
+    late.wait_until(|v| v.cursor.visible, "the cursor's place");
+    assert_eq!(late.cursor, viewer.cursor);
+    assert_eq!(late.cursor_messages.len(), 2, "the image, then the place");
+    assert!(late.cursor_messages.iter().all(|(frames, _)| *frames == 1));
+    server.stop().unwrap();
+}
+
 /// A guest that waits for input with its screen drawn sends nothing more; a pointer
 /// change moves its cursor, which sends only the tiles that changed; Esc ends it.
 #[test]

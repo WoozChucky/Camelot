@@ -1,4 +1,4 @@
-# Avalon Protocol v9
+# Avalon Protocol v10
 
 The wire protocol of the Avalon platform. Every program in it speaks this protocol:
 
@@ -291,6 +291,8 @@ Codes are grouped by their high byte. Req = request, Rep = reply, Ev = event; C�
 | 0x0305 | `ScreenDetach` | Req | C→S | `Ok` |
 | 0x0306 | `PointerInput` | Ev | C→S | |
 | 0x0307 | `ScreenResized` | Ev | S→C | |
+| 0x0308 | `CursorShape` | Ev | S→C | |
+| 0x0309 | `CursorPosition` | Ev | S→C | |
 | **0x04xx** | **block I/O** (Lake) | | | |
 | 0x0401 | `BlockOpen` | Req | C→S | `BlockOpened` |
 | 0x0402 | `BlockOpened` | Rep | S→C | |
@@ -329,11 +331,11 @@ Any request can also be answered by `Error`. A server answers requests from a gr
 | `Ping` | `token: u32` |
 | `Pong` | `token: u32` (the `Ping`'s) |
 
-Example, `Hello` version 9 from agent `"rt"`:
+Example, `Hello` version 10 from agent `"rt"`:
 
 ```
-0e 00 00 00  01 00  41 56 4c 4e  09 00  02 00 00 00  72 74
-length 14    Hello  "AVLN"       v9     agent "rt"
+0e 00 00 00  01 00  41 56 4c 4e  0a 00  02 00 00 00  72 74
+length 14    Hello  "AVLN"       v10    agent "rt"
 ```
 
 ### 6.2 VM control
@@ -392,8 +394,12 @@ The screen is the VM's framebuffer (Excalibur spec section 9.3); the input goes 
 | `ScreenDetach` | `vm: u32` | the VM keeps running; the keys and buttons this viewer held are released (Input, below). Errors: `NoSuchVm`, `InvalidState` (this connection is not attached to it) |
 | `PointerInput` | `vm: u32`, `pointer: PointerChange` | for the VM's pointer device, as if the mouse moved over Grail's window |
 | `ScreenResized` | `vm: u32`, `width: u32`, `height: u32`, `format: u32` | the VM's screen has a new size (the guest changed modes): the viewer's screen starts again from black at `width × height`, in `format`, and a full `ScreenFrame` follows. Sent to every viewer, one that is behind included (see **Backlog**) |
+| `CursorShape` | `vm: u32`, `width: u32`, `height: u32`, `hot_x: u32`, `hot_y: u32`, `pixels: bytes` | the image of the VM's cursor from now on (**Cursor**, below): `width × height` pixels, each 1 to `MAX_CURSOR_SIZE` (256), rows top to bottom, `width × height × 4` bytes of ARGB8888 with premultiplied alpha; its hotspot at (`hot_x`, `hot_y`), inside it. Anything else is malformed |
+| `CursorPosition` | `vm: u32`, `visible: bool`, `x: i32`, `y: i32` | whether the VM's cursor is shown and where: its image's top left pixel at (`x`, `y`) of the screen, which may be negative or past the screen's size (the image then hangs off an edge). While `visible` is false, `x` and `y` mean nothing |
 
 Format 0 is XRGB8888: each pixel a little-endian word `0x00RRGGBB` (bytes B, G, R, X), the same as Grail's VRAM. A display the guest has turned off (`FB_CTRL.ENABLE` clear) is black, as in Grail's window.
+
+**Cursor.** The framebuffer's cursor plane (Excalibur spec section 9.3: an image the display blends over the frame where the guest puts it) is not in the frames: it goes to the viewers apart from them, as VNC's cursor pseudo-encoding and SPICE's cursor channel send a cursor, so that a cursor that moves sends a `CursorPosition` of 19 bytes and no `ScreenFrame`. Its image goes in a `CursorShape` when it changes, its place in a `CursorPosition` when it moves, shows or hides; a viewer starts with no image and a hidden cursor, keeps the last image it was sent (also while the cursor is hidden, and across `ScreenResized`: the cursor stays where it is on the new screen), and draws it over its screen while the last `CursorPosition` says it is visible, blending each pixel with OVER on premultiplied alpha, each colour `cursor + screen × (255 − A) / 255` (rounded to the nearest, at most 255), as Grail's window does. The server sends `CursorShape` before the first `CursorPosition` that shows the cursor. Both go at the pace of the screen (**Rate**, below), at each look, after its frames: what a look sends is the screen and the cursor at that moment. A viewer that attaches gets, after the full frame, the cursor's image if there is one and, if it is shown, its place. The crate's `Cursor` is both ends of this, as `Screen` is for the frames: `Cursor::update` gives the messages that bring the viewers to the cursor the framebuffer shows, and a viewer applies them with `Cursor::apply`. A viewer that draws the cursor at its own mouse pointer, rather than where the guest put it, places it by its hotspot: Avalon's guests set the hotspot for that (the spec's `FB_CURSOR_HOT`, as KMS's cursor planes of virtual hardware have one). Herald draws it where the guest put it.
 
 **Modes.** The screen is what the framebuffer scans out, at the size of its mode: the built-in VRAM at 640 × 480 by default, or a buffer in RAM in another mode, up to 1920 × 1080 (Excalibur spec section 9.3). When the guest changes modes, the next look at the screen (below) finds a new size: the server starts its `Screen` again at that size, sends `ScreenResized` and then the whole new screen as one `ScreenFrame`, and goes on with changed rectangles as before. A viewer that gets `ScreenResized` makes a new screen of that size (black) and resizes its view; Herald's window takes the new size, as Grail's does. A guest that changes modes and back between two looks sends nothing about it: viewers see the screen, not the modesets.
 
@@ -476,11 +482,11 @@ Avalon's VMs talk to each other over virtual Ethernet switches, kept by the serv
 
 ## 7. Versioning
 
-- The protocol version is a `u16`, currently **8** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
+- The protocol version is a `u16`, currently **10** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
 - Any change to the catalogue bumps the version: a new message type, a new field, a new enum variant or tag, a changed layout or a changed rule. (Unknown codes and tags are errors in the decoder, so an old peer could not read them anyway.)
 - Three things never change, in any version, so that peers of different versions can always tell each other so: the frame header (`u32` length, `u16` type), the `Hello` and `Welcome` messages (codes 0x0001 and 0x0002 and their layouts) and the `Error` message (code 0x0003 and its layout). Error codes are never reused or renumbered; new ones may be added with a version bump.
 - Things that are deliberately open-ended and need no new version: `DeviceEntry.kind` (sysinfo device type codes come from the Excalibur spec), `ScreenAttached.format` values a server chooses to send, free-text fields.
-- This document describes version 9. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
+- This document describes version 10. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
 
 History:
 
@@ -495,6 +501,7 @@ History:
 | 7 | `DiskCreate`'s `source` field (after `sectors`): a new image that is a copy of an existing one (section 6.6, **Cloning**) |
 | 8 | `ScreenResized` (0x0307): a VM's screen changes size when its guest changes the framebuffer's mode (section 6.4, **Modes**), followed by a full frame; screens up to 1920 × 1080, with Avalon's viewer backlog following the screen's size (`screen_backlog`, a little over one full frame: 2 MiB at 640 × 480, as before, up to 8.4 MiB at 1920 × 1080) and its limit on a client's queued output 32 MiB (section 8), which was 8 MiB for 640 × 480 screens |
 | 9 | `KeyEvent` carries the physical key for the keyboard's raw mode (Excalibur spec section 9.4): the `usage` field (`u16`, after `flags`) and the repeat flag (bit 3); `code` may be 0 when `usage` is not; the repeat flag only on a press; a viewer that goes (`ScreenDetach`, or its connection ends) has the keys and buttons it held released (section 6.4, **Input**) |
+| 10 | `CursorShape` (0x0308) and `CursorPosition` (0x0309): the framebuffer's cursor plane (Excalibur spec section 9.3) goes to the viewers apart from the frames, its image when it changes and its place when it moves (section 6.4, **Cursor**), up to `MAX_CURSOR_SIZE` (256) pixels each way |
 
 ## 8. Limits
 
@@ -513,6 +520,7 @@ History:
 | DHCP leases | 240 per gateway (10.0.2.15 to 10.0.2.254) | |
 | learned addresses | 4096 per switch, forgotten after 300 s | |
 | screen updates | at most one look every 33 ms per VM | Avalon (`SCREEN_INTERVAL`) |
+| `MAX_CURSOR_SIZE` | 256 pixels each way | `CursorShape` (more is malformed) |
 | screen size | 1920 × 1080 at most (8.3 MB in format 0, so a full frame fits in `MAX_FRAME_LEN`) | Grail's largest mode |
 | viewer backlog | a little over one full frame of the screen queued (its bytes and 512 KiB, at least 2 MiB), then no screen updates until it drains | Avalon (`screen_backlog`) |
 | input waiting | 256 keys and 256 pointer changes per VM | Avalon (`MAX_INPUT_QUEUE`) |
