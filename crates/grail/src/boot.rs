@@ -12,14 +12,14 @@
 use crate::bus::BOOT_ROM_BASE;
 
 /// Where the disk loader starts in the boot ROM, after the stub (0x1000) and the park
-/// loop (0x1020). The stub jumps here through the entry word when the machine boots
+/// loop (0x1020). The stub jumps here through the entry point when the machine boots
 /// from disk.
-pub const DISK_BOOT_PC: u32 = BOOT_ROM_BASE + 0x100;
+pub const DISK_BOOT_PC: u64 = BOOT_ROM_BASE + 0x100;
 
-/// The ROM's entry word (0x1010): where the stub and the park loop jump. It is the
-/// ROM's one writable word (32-bit stores), so that a bootloader can point harts woken
-/// later at the kernel it started.
-pub const BOOT_ENTRY_ADDR: u32 = BOOT_ROM_BASE + 0x10;
+/// The ROM's entry point (0x1010): where the stub and the park loop jump, a doubleword
+/// (RV32: the word). It is the ROM's one writable location (8-byte stores; RV32: 4-byte
+/// ones), so that a bootloader can point harts woken later at the kernel it started.
+pub const BOOT_ENTRY_ADDR: u64 = BOOT_ROM_BASE + 0x10;
 
 /// The boot block: sectors 0 and 1 of disk 0.
 pub const BOOT_BLOCK_SIZE: usize = 1024;
@@ -44,7 +44,7 @@ pub fn disk_loader() -> Vec<u8> {
     let elf = crate::elf::parse(DISKBOOT_ELF).expect("rom/diskboot.elf is an ELF file");
     let mut code = Vec::new();
     for seg in &elf.segments {
-        let at = (seg.paddr - u64::from(DISK_BOOT_PC)) as usize;
+        let at = (seg.paddr - DISK_BOOT_PC) as usize;
         code.resize(code.len().max(at + seg.mem_size as usize), 0);
         code[at..at + seg.data.len()].copy_from_slice(&seg.data);
     }
@@ -53,9 +53,9 @@ pub fn disk_loader() -> Vec<u8> {
 
 /// Where the boot block goes on a machine with `ram_size` bytes of RAM: `None` if the
 /// RAM is smaller than the boot area, which [`crate::Machine::boot_from_disk`] refuses.
-pub fn boot_block_addr(ram_size: usize) -> Option<u32> {
-    let ram = u32::try_from(ram_size).ok()?;
-    Some(crate::bus::RAM_BASE + ram.checked_sub(BOOT_AREA_SIZE)?)
+pub fn boot_block_addr(ram_size: usize) -> Option<u64> {
+    let ram = ram_size as u64;
+    Some(crate::bus::RAM_BASE + ram.checked_sub(BOOT_AREA_SIZE.into())?)
 }
 
 /// Whether the boot ROM accepts `block` (at least [`BOOT_BLOCK_SIZE`] bytes; the rest
@@ -96,11 +96,7 @@ mod tests {
         assert!(code.len() > 100);
         assert!(DISK_BOOT_PC as usize - BOOT_ROM_BASE as usize + code.len() <= 0x1000);
         let elf = crate::elf::parse(DISKBOOT_ELF).unwrap();
-        assert_eq!(
-            elf.entry,
-            u64::from(DISK_BOOT_PC),
-            "the loader starts at its first byte"
-        );
+        assert_eq!(elf.entry, DISK_BOOT_PC, "the loader starts at its first byte");
     }
 
     #[test]

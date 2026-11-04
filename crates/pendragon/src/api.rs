@@ -835,7 +835,7 @@ struct Create {
 
 /// `{"name", "ram", "clock", "harts", "disks": [{"source", "read_only"}], "nets":
 /// [{"switch", "mac"}], "camelot", "program", "start"}`: `ram`, `clock` and `harts` as
-/// Round Table's `--ram`, `--clock` and `--harts` take them (a number of MiB, a frequency
+/// Round Table's `--ram`, `--clock` and `--harts` take them (MiB, or with M/MiB or G/GiB, a frequency
 /// with Hz/kHz/MHz, a number of harts; an empty clock is full speed, an empty hart count
 /// one hart), each disk source a path on Avalon's host or `lake://ADDR/NAME`, each
 /// network card the switch to plug it into (empty or null: none) and its MAC address
@@ -1294,7 +1294,7 @@ mod tests {
             (r#"{"name": "a", "program": "A"}"#, "program: not base64"),
             (
                 r#"{"name": "a", "program": "AA==", "ram": "0"}"#,
-                "ram: 0 MiB is out of range",
+                "ram: 0 is out of range",
             ),
             (
                 r#"{"name": "a", "program": "AA==", "ram": 64}"#,

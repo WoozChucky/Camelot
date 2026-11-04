@@ -61,7 +61,12 @@ pub fn card_configs(vm: &str, profile: &HardwareProfile) -> Result<Vec<CardConfi
 /// (`grail::lake::LakeDisk`), which attaches the image for as long as the VM's machine
 /// exists. Only the disk names are checked here; whether an image exists and can be
 /// attached is Lake's to say, when the machine is built.
-pub fn machine_config(profile: &HardwareProfile) -> Result<MachineConfig, String> {
+///
+/// The VM is as wide as its `program`: RV64 if it is ELF64 (as `Machine::load_elf`
+/// would make it), else RV32, also for a VM that boots from disk (its boot chain is
+/// RV32 until #151). Its RAM is checked against that width's limit (Grail's
+/// `max_ram_size`: 1 TiB, 2 GiB on RV32).
+pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<MachineConfig, String> {
     let HardwareProfile {
         ram_size,
         clock_hz,
@@ -93,9 +98,8 @@ pub fn machine_config(profile: &HardwareProfile) -> Result<MachineConfig, String
         disks,
         // The server makes the cards (`card_configs`).
         nets: Vec::new(),
-        // The protocol has no width yet (#158): RV32, unless the VM's program is ELF64,
-        // which makes it RV64 when it is loaded.
-        xlen: Xlen::Rv32,
+        // The protocol has no width yet (#158): the program's.
+        xlen: grail::elf::class(program).unwrap_or(Xlen::Rv32),
     };
     config.validate()?;
     Ok(config)
@@ -132,7 +136,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            machine_config(&profile).unwrap(),
+            machine_config(&profile, &[]).unwrap(),
             MachineConfig {
                 ram_size: 64 * MIB,
                 clock_hz: Some(2_000_000),
@@ -148,7 +152,7 @@ mod tests {
             }
         );
         assert_eq!(
-            machine_config(&HardwareProfile::default()).unwrap(),
+            machine_config(&HardwareProfile::default(), &[]).unwrap(),
             MachineConfig::default()
         );
     }
@@ -193,7 +197,7 @@ mod tests {
             ]
         );
         // The disks are the machine's; the cards are not in its config.
-        let config = machine_config(&profile).unwrap();
+        let config = machine_config(&profile, &[]).unwrap();
         assert_eq!(config.disks, [DiskConfig::file("a.img")]);
         assert!(config.nets.is_empty());
         assert_eq!(card_configs("web", &HardwareProfile::default()), Ok(Vec::new()));
@@ -224,6 +228,24 @@ mod tests {
             ..HardwareProfile::default()
         };
         assert_eq!(card_configs("vm", &four).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_vm_is_as_wide_as_its_program() {
+        // An ELF64 program makes the VM RV64, which takes more than RV32's 2 GiB; only
+        // the header's class is read here.
+        let big = HardwareProfile::with_ram(16 << 30);
+        let elf64 = b"\x7fELF\x02\x01\x01";
+        let config = machine_config(&big, elf64).unwrap();
+        assert_eq!((config.xlen, config.ram_size), (Xlen::Rv64, 16 << 30));
+        for program in [&b"\x7fELF\x01\x01\x01"[..], &[]] {
+            let e = machine_config(&big, program).unwrap_err();
+            assert!(e.contains("an RV32 machine has at most 2 GiB"), "{e}");
+        }
+        assert_eq!(
+            machine_config(&HardwareProfile::default(), &[]).unwrap().xlen,
+            Xlen::Rv32
+        );
     }
 
     #[test]
@@ -292,7 +314,7 @@ mod tests {
                 "lake://127.0.0.1:7401/Root",
             ),
         ] {
-            let err = machine_config(&profile).unwrap_err();
+            let err = machine_config(&profile, &[]).unwrap_err();
             assert!(err.contains(why), "{profile:?}: {err}");
         }
     }

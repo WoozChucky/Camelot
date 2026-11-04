@@ -199,7 +199,7 @@ fn boot(image: Vec<u8>, how: Boot) -> Run {
     let file = committed_elf();
     let elf = grail::elf::parse(&file).unwrap();
     m.load_elf(&file).unwrap();
-    let fs_test = elf.symbol("fs_test").expect("no fs_test in the kernel") as u32;
+    let fs_test = elf.symbol("fs_test").expect("no fs_test in the kernel");
     m.cpu.bus.load(fs_test, &how.fs_test.to_le_bytes()).unwrap();
     m.set_uart_input(kernel::typed(how.input));
     let result = match how.stop_after {

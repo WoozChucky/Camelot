@@ -29,7 +29,7 @@ const A7: u32 = 17;
 const ZERO: u32 = 0;
 
 /// The word the reservation tests fight over.
-const DATA: u32 = RAM_BASE + 0x8000;
+const DATA: u64 = RAM_BASE + 0x8000;
 
 fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
     ((imm as u32) & 0xfff) << 20 | rs1 << 15 | rd << 7 | 0x13
@@ -73,8 +73,8 @@ fn amoadd(rd: u32, rs2: u32, rs1: u32) -> u32 {
 }
 
 /// Where hart `i`'s code goes.
-fn code(hart: usize) -> u32 {
-    RAM_BASE + 0x100 * hart as u32
+fn code(hart: usize) -> u64 {
+    RAM_BASE + 0x100 * hart as u64
 }
 
 fn config(harts: usize) -> MachineConfig {
@@ -94,7 +94,7 @@ fn start(m: &mut Machine, hart: usize, program: &[u32]) {
     let bytes: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     m.cpu.bus.load(code(hart), &bytes).unwrap();
     let h = m.cpu.hart_mut(hart);
-    h.pc = code(hart).into();
+    h.pc = code(hart);
     h.waiting = false;
 }
 
@@ -115,7 +115,7 @@ fn harts_are_validated_and_counted() {
         assert_eq!(m.cpu.harts().len(), n);
         assert_eq!(m.cpu.bus.harts(), n);
         assert_eq!(m.config().harts, n);
-        assert_eq!(m.cpu.bus.read(SYSINFO_BASE + 0x20, 4), Ok(n as u32), "SYS_HARTS");
+        assert_eq!(m.cpu.bus.read(SYSINFO_BASE + 0x20, 4), Ok(n as u64), "SYS_HARTS");
         assert_eq!(m.cpu.bus.clint.msip.len(), n);
         assert_eq!(m.cpu.bus.plic.contexts(), 2 * n);
     }
@@ -127,7 +127,7 @@ fn reset_state_and_mhartid() {
     for (i, h) in m.cpu.harts().iter().enumerate() {
         assert_eq!(h.id, i as u32);
         assert_eq!(h.mode, Mode::M);
-        assert_eq!(h.pc, u64::from(if i == 0 { BOOT_ROM_BASE } else { PARK_PC }));
+        assert_eq!(h.pc, if i == 0 { BOOT_ROM_BASE } else { PARK_PC });
         assert!(!h.waiting);
     }
     for i in 0..4 {
@@ -138,7 +138,7 @@ fn reset_state_and_mhartid() {
     assert_eq!(ids, [0, 1, 2, 3]);
     // Between steps the Cpu reads as hart 0.
     assert_eq!(m.cpu.id, 0);
-    assert_eq!(m.cpu.pc, u64::from(code(0) + 4));
+    assert_eq!(m.cpu.pc, code(0) + 4);
 }
 
 #[test]
@@ -204,10 +204,10 @@ fn the_boot_rom_parks_the_other_harts_until_an_ipi() {
     steps(&mut m, 50);
     let a1 = |m: &Machine| -> Vec<u64> { m.cpu.harts().iter().map(|h| h.x[A1 as usize]).collect() };
     assert_eq!(a1(&m), [0x10, 0, 0]);
-    assert_eq!(m.cpu.hart(0).pc, u64::from(code(0) + 4));
+    assert_eq!(m.cpu.hart(0).pc, code(0) + 4);
     for h in &m.cpu.harts()[1..] {
         assert!(h.waiting, "hart {} waits for its IPI", h.id);
-        assert!((PARK_PC..PARK_PC + 0x40).contains(&(h.pc as u32)));
+        assert!((PARK_PC..PARK_PC + 0x40).contains(&h.pc));
         assert_eq!(h.csr.mie, 1 << IRQ_M_SOFT);
         assert_eq!(h.mip(&m.cpu.bus), 0);
     }
@@ -217,7 +217,7 @@ fn the_boot_rom_parks_the_other_harts_until_an_ipi() {
     steps(&mut m, 50);
     assert_eq!(a1(&m), [0x10, 0, 0x12]);
     let h2 = m.cpu.hart(2);
-    assert_eq!(h2.pc, u64::from(code(0) + 4));
+    assert_eq!(h2.pc, code(0) + 4);
     assert_eq!(h2.mode, Mode::M);
     assert_eq!(h2.csr.mie, 0, "the ROM leaves mie as it found it");
     assert!(!m.cpu.bus.clint.msip[2], "and acknowledged the IPI");
@@ -237,7 +237,7 @@ fn the_boot_rom_parks_the_other_harts_until_an_ipi() {
 fn clint_registers_per_hart() {
     let mut m = machine(2);
     let bus = &mut m.cpu.bus;
-    let r = |bus: &mut grail::bus::Bus, off: u32| bus.read(CLINT_BASE + off, 4).unwrap();
+    let r = |bus: &mut grail::bus::Bus, off: u64| bus.read(CLINT_BASE + off, 4).unwrap();
     bus.write(CLINT_BASE + 4, 4, 1).unwrap(); // msip[1]
     assert_eq!([r(bus, 0), r(bus, 4)], [0, 1]);
     assert_eq!(bus.clint.msip, [false, true]);
@@ -251,7 +251,7 @@ fn clint_registers_per_hart() {
     bus.write(CLINT_BASE + 0x400c, 4, 5).unwrap();
     assert_eq!(bus.clint.mtimecmp, [u64::MAX, 0x5_0000_1234]);
     assert_eq!([r(bus, 0x4008), r(bus, 0x400c)], [0x1234, 5]);
-    assert_eq!([r(bus, 0x4000), r(bus, 0x4004)], [u32::MAX, u32::MAX]);
+    assert_eq!([r(bus, 0x4000), r(bus, 0x4004)], [u64::from(u32::MAX); 2]);
 
     let mip = |m: &Machine, hart: usize| m.cpu.hart(hart).mip(&m.cpu.bus);
     assert_eq!(mip(&m, 0), 0);
@@ -270,8 +270,8 @@ fn clint_registers_per_hart() {
 #[test]
 fn plic_contexts_per_hart() {
     let mut m = machine(2);
-    let enable = |ctx: u32| PLIC_BASE + PLIC_ENABLE + PLIC_ENABLE_STRIDE * ctx;
-    let claim = |ctx: u32| PLIC_BASE + PLIC_CONTEXT + PLIC_CONTEXT_STRIDE * ctx + 4;
+    let enable = |ctx: u32| PLIC_BASE + u64::from(PLIC_ENABLE + PLIC_ENABLE_STRIDE * ctx);
+    let claim = |ctx: u32| PLIC_BASE + u64::from(PLIC_CONTEXT + PLIC_CONTEXT_STRIDE * ctx + 4);
     let mip = |m: &Machine, hart: usize| m.cpu.hart(hart).mip(&m.cpu.bus);
     let bus = &mut m.cpu.bus;
     bus.write(PLIC_BASE + 4, 4, 1).unwrap(); // source 1, priority 1
@@ -305,9 +305,9 @@ fn harts_take_turns_one_instruction_each() {
     }
     let mut order = Vec::new();
     for _ in 0..4 {
-        m.cpu.step_traced(&mut |cpu| order.push((cpu.id, cpu.pc as u32)));
+        m.cpu.step_traced(&mut |cpu| order.push((cpu.id, cpu.pc)));
     }
-    let want: Vec<(u32, u32)> = (0..4)
+    let want: Vec<(u32, u64)> = (0..4)
         .flat_map(|step| (0..3).map(move |i| (i as u32, code(i) + 4 * (step % 2))))
         .collect();
     assert_eq!(order, want, "hart 0, 1, 2 in every step");
@@ -338,7 +338,7 @@ fn wfi_on_one_hart_does_not_stall_the_others() {
     assert_eq!(m.cpu.hart(1).csr.minstret, 1, "only the wfi");
     steps(&mut m, 900);
     assert!(!m.cpu.hart(1).waiting, "the timer woke it");
-    assert_eq!(m.cpu.hart(1).pc, u64::from(code(1) + 4));
+    assert_eq!(m.cpu.hart(1).pc, code(1) + 4);
 }
 
 #[test]
@@ -423,15 +423,15 @@ fn race(other: &[u32]) -> (u64, Machine) {
     start(&mut m, 1, other);
     for h in 0..2 {
         let hart = m.cpu.hart_mut(h);
-        hart.set_reg(A0 as u8, DATA.into());
-        hart.set_reg(A1 as u8, (DATA + 8).into());
+        hart.set_reg(A0 as u8, DATA);
+        hart.set_reg(A1 as u8, DATA + 8);
         hart.x[A4 as usize] = 0x44;
         hart.x[A5 as usize] = 0x55;
-        hart.x[A6 as usize] = UART_BASE.into();
+        hart.x[A6 as usize] = UART_BASE;
     }
     m.cpu.bus.uart.capture = true;
     steps(&mut m, 3);
-    assert_eq!(m.cpu.hart(0).pc, u64::from(code(0) + 12), "no trap");
+    assert_eq!(m.cpu.hart(0).pc, code(0) + 12, "no trap");
     (m.cpu.hart(0).x[A3 as usize], m)
 }
 
@@ -485,13 +485,13 @@ fn an_interrupt_breaks_only_its_own_harts_reservation() {
     m.cpu.bus.load(code(1) + 0x40, &handler).unwrap();
     for h in 0..2 {
         let hart = m.cpu.hart_mut(h);
-        hart.set_reg(A0 as u8, DATA.into());
-        hart.set_reg(A1 as u8, (DATA + 8).into());
+        hart.set_reg(A0 as u8, DATA);
+        hart.set_reg(A1 as u8, DATA + 8);
         hart.x[A4 as usize] = 0x44;
         hart.x[A5 as usize] = 0x55;
     }
     let h1 = m.cpu.hart_mut(1);
-    h1.csr.mtvec = (code(1) + 0x40).into();
+    h1.csr.mtvec = code(1) + 0x40;
     h1.csr.mie = 1 << IRQ_M_SOFT;
     h1.csr.mstatus |= excalibur::csr::MSTATUS_MIE;
     m.cpu.step(); // both lr.w
@@ -504,10 +504,10 @@ fn an_interrupt_breaks_only_its_own_harts_reservation() {
         1 << 31 | u64::from(IRQ_M_SOFT),
         "hart 1 took the IPI"
     );
-    assert_eq!(h1.pc, u64::from(code(1) + 0x44), "and ran its handler's sc.w");
+    assert_eq!(h1.pc, code(1) + 0x44, "and ran its handler's sc.w");
     assert_eq!(h1.x[T1 as usize], 1, "hart 1's sc.w fails");
     assert_eq!(m.cpu.bus.read(DATA + 8, 4), Ok(0));
-    assert_eq!(m.cpu.hart(0).pc, u64::from(code(0) + 20));
+    assert_eq!(m.cpu.hart(0).pc, code(0) + 20);
     assert_eq!(m.cpu.hart(0).x[A3 as usize], 0, "hart 0's sc.w succeeds");
     assert_eq!(m.cpu.bus.read(DATA, 4), Ok(0x44));
 }
@@ -522,9 +522,9 @@ fn disk_commands_break_every_reservation() {
         .unwrap();
         start(&mut m, 0, &[lr(A2, A0), NOP, sc(A3, A4, A0), STOP]);
         start(&mut m, 1, &[sw(A5, A6, 0), STOP]);
-        m.cpu.hart_mut(0).set_reg(A0 as u8, DATA.into());
+        m.cpu.hart_mut(0).set_reg(A0 as u8, DATA);
         m.cpu.hart_mut(1).x[A5 as usize] = val.into();
-        m.cpu.hart_mut(1).x[A6 as usize] = (BLK_BASE + reg).into();
+        m.cpu.hart_mut(1).x[A6 as usize] = BLK_BASE + u64::from(reg);
         steps(&mut m, 3);
         assert_eq!(m.cpu.hart(0).x[A3 as usize], want, "register {reg:#x}");
     }
@@ -594,7 +594,7 @@ fn paced_harts_idle_until_the_earliest_timer() {
         }
     }
     assert!(!m.cpu.hart(1).waiting);
-    assert_eq!(m.cpu.hart(1).pc, u64::from(code(1) + 4));
+    assert_eq!(m.cpu.hart(1).pc, code(1) + 4);
     assert!(m.cpu.hart(0).waiting, "hart 0's timer is later");
     assert!(m.cpu.bus.clint.mtime >= 1500);
 }

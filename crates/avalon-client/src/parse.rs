@@ -9,10 +9,17 @@ use std::net::{IpAddr, SocketAddr};
 /// case; no unit = Hz), as Grail's `--clock` does: `10MHz`, `500kHz`, `1.5MHz`, `5Hz`.
 pub use grail::parse_clock;
 
-/// Parses a `--ram` value, a whole number of MiB from 1 to 2048 (Grail's `--ram`).
-/// Returns bytes.
+/// Parses a `--ram` value as Grail's `--ram` does: MiB, or a number with a unit,
+/// `M`/`MiB` or `G`/`GiB` in any case, 1 MiB to 1 TiB (an RV32 VM, which every VM is
+/// until its program is ELF64, takes at most 2 GiB: the server says so). Returns bytes.
 pub fn parse_ram(s: &str) -> Result<u64, String> {
-    grail::parse_ram_mib(s).map(|bytes| bytes as u64)
+    grail::parse_ram_size(s).map(|bytes| bytes as u64)
+}
+
+/// Parses a RAM budget (Pendragon's `--avalon-max-ram`, as Avalon's `--max-ram`):
+/// `--ram`'s syntax, at least 1 MiB and no upper limit. Returns bytes.
+pub fn parse_budget(s: &str) -> Result<u64, String> {
+    grail::parse_size(s)
 }
 
 /// Parses a `--harts` value, a whole number from 1 to 8 (Grail's `--harts`).
@@ -83,7 +90,8 @@ pub fn parse_disk_source(s: &str) -> Result<DiskSource, String> {
 /// Parses a disk size: a whole number with an optional unit, any case: none or `B`
 /// for bytes, `K`/`KiB`, `M`/`MiB`, `G`/`GiB` (powers of 1024), or `S`/`sector(s)` for
 /// 512-byte sectors (`64MiB`, `1G`, `2048s`). The size must be a non-zero whole number
-/// of sectors, at most what a Grail disk can have. Returns sectors.
+/// of sectors, at most what a Grail disk shows an RV32 machine (2^32 - 1 sectors, which
+/// is also Lake's largest image). Returns sectors.
 pub fn parse_disk_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let bad = || format!("'{s}' is not a disk size (examples: 64MiB, 512K, 1G, 2048s)");
@@ -99,7 +107,12 @@ pub fn parse_disk_size(s: &str) -> Result<u64, String> {
         _ => return Err(bad()),
     };
     let n: u64 = number.parse().map_err(|_| bad())?;
-    let too_big = || format!("{s} is too big (at most {} sectors)", grail::block::MAX_SECTORS);
+    let too_big = || {
+        format!(
+            "{s} is too big (at most {} sectors)",
+            grail::block::V1_MAX_SECTORS
+        )
+    };
     let bytes = n.checked_mul(scale).ok_or_else(too_big)?;
     if bytes == 0 || !bytes.is_multiple_of(SECTOR_SIZE as u64) {
         return Err(format!(
@@ -107,7 +120,7 @@ pub fn parse_disk_size(s: &str) -> Result<u64, String> {
         ));
     }
     let sectors = bytes / SECTOR_SIZE as u64;
-    if sectors > grail::block::MAX_SECTORS {
+    if sectors > grail::block::V1_MAX_SECTORS {
         return Err(too_big());
     }
     Ok(sectors)
@@ -268,9 +281,12 @@ mod tests {
     fn ram_and_clock_are_grails() {
         assert_eq!(parse_ram("64"), Ok(64 << 20));
         assert_eq!(parse_ram("2048"), Ok(2048 << 20));
+        assert_eq!(parse_ram("64MiB"), Ok(64 << 20));
+        assert_eq!(parse_ram("16G"), Ok(16 << 30));
+        assert_eq!(parse_ram("1024GiB"), Ok(1 << 40));
         assert!(parse_ram("0").is_err());
-        assert!(parse_ram("2049").is_err());
-        assert!(parse_ram("64MiB").is_err());
+        assert!(parse_ram("1025G").is_err());
+        assert!(parse_ram("64MB").is_err());
         assert_eq!(parse_clock("10MHz"), Ok(10_000_000));
         assert_eq!(parse_clock("1.5mhz"), Ok(1_500_000));
         assert!(parse_clock("0").is_err());
@@ -333,7 +349,7 @@ mod tests {
         ok("1 sector", 1);
         ok("1Sector", 1);
         ok("2047GiB", 2047 << 21);
-        ok("4294967295s", grail::block::MAX_SECTORS);
+        ok("4294967295s", grail::block::V1_MAX_SECTORS);
         for bad in [
             "",
             "0",

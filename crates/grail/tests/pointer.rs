@@ -16,14 +16,14 @@ use grail::{Machine, RunResult};
 use std::path::Path;
 
 const MEIP: u64 = 1 << IRQ_M_EXT;
-const PTR_STATUS: u32 = PTR_BASE;
-const PTR_EVENT: u32 = PTR_BASE + 0x4;
-const PTR_EVENT_XY: u32 = PTR_BASE + 0x8;
-const PTR_CTRL: u32 = PTR_BASE + 0xc;
-const PTR_POS: u32 = PTR_BASE + 0x10;
-const PENDING: u32 = PLIC_BASE + 0x1000;
-const ENABLE0: u32 = PLIC_BASE + 0x2000;
-const CLAIM0: u32 = PLIC_BASE + 0x20_0004;
+const PTR_STATUS: u64 = PTR_BASE;
+const PTR_EVENT: u64 = PTR_BASE + 0x4;
+const PTR_EVENT_XY: u64 = PTR_BASE + 0x8;
+const PTR_CTRL: u64 = PTR_BASE + 0xc;
+const PTR_POS: u64 = PTR_BASE + 0x10;
+const PENDING: u64 = PLIC_BASE + 0x1000;
+const ENABLE0: u64 = PLIC_BASE + 0x2000;
+const CLAIM0: u64 = PLIC_BASE + 0x20_0004;
 const LOAD_ACCESS_FAULT: u64 = 5;
 const STORE_ACCESS_FAULT: u64 = 7;
 
@@ -33,20 +33,20 @@ fn bare_machine(program: &[u32]) -> Machine {
     let mut code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     code.extend(std::iter::repeat_n([0x13, 0, 0, 0], 64).flatten()); // nops
     m.cpu.bus.load(RAM_BASE, &code).unwrap();
-    m.cpu.pc = RAM_BASE.into();
-    m.cpu.csr.mtvec = (RAM_BASE + 0x80).into();
+    m.cpu.pc = RAM_BASE;
+    m.cpu.csr.mtvec = RAM_BASE + 0x80;
     m
 }
 
-fn read(m: &mut Machine, addr: u32) -> u32 {
-    m.cpu.bus.read(addr, 4).unwrap()
+fn read(m: &mut Machine, addr: u64) -> u32 {
+    m.cpu.bus.read(addr, 4).unwrap() as u32
 }
 
 #[test]
 fn line_reaches_the_plic_only_with_ptr_ctrl_set() {
     let mut m = bare_machine(&[]);
     let bus = &mut m.cpu.bus;
-    bus.write(PLIC_BASE + 4 * PTR_IRQ, 4, 1).unwrap();
+    bus.write(PLIC_BASE + 4 * u64::from(PTR_IRQ), 4, 1).unwrap();
     bus.write(ENABLE0, 4, 1 << PTR_IRQ).unwrap();
 
     assert!(m.pointer_event(PointerInput::move_to(5, 6)));
@@ -54,7 +54,7 @@ fn line_reaches_the_plic_only_with_ptr_ctrl_set() {
     assert_eq!(read(&mut m, PENDING), 0, "PTR_CTRL.0 is clear");
     assert_eq!(m.cpu.mip() & MEIP, 0);
 
-    m.cpu.bus.write(PTR_CTRL, 4, CTRL_IRQ_ENABLE).unwrap();
+    m.cpu.bus.write(PTR_CTRL, 4, CTRL_IRQ_ENABLE.into()).unwrap();
     m.cpu.step();
     assert_eq!(read(&mut m, PENDING), 1 << PTR_IRQ);
     assert_eq!(m.cpu.mip() & MEIP, MEIP);
@@ -64,7 +64,7 @@ fn line_reaches_the_plic_only_with_ptr_ctrl_set() {
     assert_eq!(read(&mut m, PTR_EVENT), 0x8000_0000);
     assert_eq!(read(&mut m, PTR_EVENT_XY), 5 | 6 << 16);
     assert_eq!(read(&mut m, PTR_STATUS), 0);
-    m.cpu.bus.write(CLAIM0, 4, PTR_IRQ).unwrap();
+    m.cpu.bus.write(CLAIM0, 4, PTR_IRQ.into()).unwrap();
     m.cpu.step();
     assert_eq!(read(&mut m, PENDING), 0);
     assert_eq!(m.cpu.mip() & MEIP, 0);
@@ -74,9 +74,10 @@ fn line_reaches_the_plic_only_with_ptr_ctrl_set() {
 fn line_stays_high_until_the_fifo_is_drained() {
     let mut m = bare_machine(&[]);
     let bus = &mut m.cpu.bus;
-    bus.write(PLIC_BASE + 4 * PTR_IRQ, 4, 1).unwrap();
+    bus.write(PLIC_BASE + 4 * u64::from(PTR_IRQ), 4, 1).unwrap();
     bus.write(ENABLE0, 4, 1 << PTR_IRQ).unwrap();
-    bus.write(PTR_CTRL, 4, CTRL_IRQ_ENABLE | CTRL_RELATIVE).unwrap();
+    bus.write(PTR_CTRL, 4, u64::from(CTRL_IRQ_ENABLE | CTRL_RELATIVE))
+        .unwrap();
     m.pointer_event(PointerInput::move_by(3, -2));
     m.pointer_event(PointerInput::buttons(BUTTON_RIGHT).with_wheel(-1));
 
@@ -86,7 +87,7 @@ fn line_stays_high_until_the_fifo_is_drained() {
         assert_eq!(read(&mut m, CLAIM0), PTR_IRQ);
         assert_eq!(read(&mut m, PTR_EVENT), event);
         assert_eq!(read(&mut m, PTR_EVENT_XY), xy);
-        m.cpu.bus.write(CLAIM0, 4, PTR_IRQ).unwrap();
+        m.cpu.bus.write(CLAIM0, 4, PTR_IRQ.into()).unwrap();
     }
     m.cpu.step();
     assert_eq!(read(&mut m, CLAIM0), 0, "one claim per event, then idle");
@@ -99,19 +100,19 @@ fn narrow_accesses_fault_and_pop_nothing() {
     let lh = (4 << 20) | (6 << 15) | (1 << 12) | (5 << 7) | 0x03;
     let sb = (5 << 20) | (6 << 15) | (12 << 7) | 0x23;
     let mut m = bare_machine(&[lh]);
-    m.cpu.x[6] = PTR_BASE.into();
+    m.cpu.x[6] = PTR_BASE;
     m.pointer_event(PointerInput::move_to(1, 1));
     m.cpu.step();
     assert_eq!(m.cpu.csr.mcause, LOAD_ACCESS_FAULT);
-    assert_eq!(m.cpu.csr.mtval, u64::from(PTR_EVENT));
+    assert_eq!(m.cpu.csr.mtval, PTR_EVENT);
     assert_eq!(m.cpu.bus.ptr.len(), 1);
 
     let mut m = bare_machine(&[sb]);
     m.cpu.x[5] = CTRL_IRQ_ENABLE.into();
-    m.cpu.x[6] = PTR_BASE.into();
+    m.cpu.x[6] = PTR_BASE;
     m.cpu.step();
     assert_eq!(m.cpu.csr.mcause, STORE_ACCESS_FAULT);
-    assert_eq!(m.cpu.csr.mtval, u64::from(PTR_CTRL));
+    assert_eq!(m.cpu.csr.mtval, PTR_CTRL);
     assert_eq!(m.cpu.bus.ptr.ctrl, 0);
 }
 
@@ -119,7 +120,7 @@ fn narrow_accesses_fault_and_pop_nothing() {
 fn every_machine_has_its_own_pointer() {
     let mut a = Machine::with_ram(64 * 1024);
     let mut b = Machine::with_ram(64 * 1024);
-    a.cpu.bus.write(PTR_CTRL, 4, CTRL_RELATIVE).unwrap();
+    a.cpu.bus.write(PTR_CTRL, 4, CTRL_RELATIVE.into()).unwrap();
     assert!(a.pointer_event(PointerInput::move_to(10, 10)));
     assert!(b.pointer_event(PointerInput::move_to(20, 30).with_buttons(BUTTON_LEFT)));
     assert_eq!(read(&mut a, PTR_POS), 10 | 10 << 16);

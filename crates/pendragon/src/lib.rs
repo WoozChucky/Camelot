@@ -58,9 +58,9 @@ carries this launch's token.
                   (default 127.0.0.1:7400)
   --lake ADDR     Lake's address: host:port, or a host alone for port 7401
                   (default 127.0.0.1:7401)
-  --avalon-max-ram MiB
+  --avalon-max-ram SIZE
                   Avalon's RAM budget (its --max-ram), shown against the RAM
-                  in use (default 4096)
+                  in use: MiB, or with M/MiB, G/GiB or T/TiB (default 4096)
   --allow-host NAME
                   another name the pages may be reached by (repeatable), for
                   --listen on an interface other than loopback: camelot.lan,
@@ -123,13 +123,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<Config>, String> {
             }
             "--lake" => config.lake = parse_addr(&value, default_port(DEFAULT_LAKE_ADDR)).map_err(with)?,
             "--avalon-max-ram" => {
-                let mib = value
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|&m| m > 0 && value.bytes().all(|b| b.is_ascii_digit()))
-                    .and_then(|m| m.checked_mul(1024 * 1024))
-                    .ok_or_else(|| with(format!("'{value}' is not a whole number of MiB (at least 1)")))?;
-                config.avalon_max_ram = mib;
+                config.avalon_max_ram = avalon_client::parse::parse_budget(&value).map_err(with)?;
             }
             _ => config
                 .allow_hosts
@@ -183,7 +177,7 @@ mod tests {
             ("--lake a --lake b", "--lake is given twice"),
             (
                 "--avalon-max-ram 0",
-                "--avalon-max-ram: '0' is not a whole number",
+                "--avalon-max-ram: 0 is too small (at least 1 MiB)",
             ),
             ("--avalon-max-ram 1.5", "--avalon-max-ram: '1.5'"),
             ("--avalon-max-ram 99999999999999999", "--avalon-max-ram: "),

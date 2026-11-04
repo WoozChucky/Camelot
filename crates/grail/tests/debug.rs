@@ -17,14 +17,14 @@ fn read(path: &str) -> Vec<u8> {
     std::fs::read(root().join(path)).unwrap()
 }
 
-fn symbol(elf: &[u8], name: &str) -> u32 {
+fn symbol(elf: &[u8], name: &str) -> u64 {
     let elf = elf::Elf::parse(elf).unwrap();
     let symbols = elf.symbols().unwrap();
     symbols
         .iter()
         .find(|s| s.name == name)
         .unwrap_or_else(|| panic!("no symbol {name}"))
-        .value as u32
+        .value
 }
 
 /// A shared buffer the UART writes to.
@@ -103,8 +103,8 @@ fn breakpoint_step_and_continue_on_hello() {
     let puts = symbol(&elf, "puts");
     let (mut m, out) = machine(&elf, 1, 4, b"");
     let mut trace = |_: &Cpu| {};
-    assert!(m.set_breakpoint(puts));
-    assert!(!m.set_breakpoint(puts), "already set");
+    assert!(m.set_breakpoint(puts).unwrap());
+    assert!(!m.set_breakpoint(puts).unwrap(), "already set");
     assert_eq!(
         m.debug_continue(u64::MAX, &mut trace),
         Some(Stop::Breakpoint { hart: 0, pc: puts })
@@ -138,7 +138,7 @@ fn a_budget_returns_control_and_a_resume_steps_over_the_breakpoint() {
     let mut trace = |_: &Cpu| {};
     // `mv t1, a0`, before the loop: hit once.
     let loop_top = symbol(&elf, "puts") + 4;
-    m.set_breakpoint(loop_top);
+    m.set_breakpoint(loop_top).unwrap();
     assert_eq!(m.debug_continue(3, &mut trace), None, "3 steps are not enough");
     let mut hits = 0;
     while let Some(Stop::Breakpoint { pc, .. }) = m.debug_continue(u64::MAX, &mut trace) {
@@ -150,7 +150,7 @@ fn a_budget_returns_control_and_a_resume_steps_over_the_breakpoint() {
     // then an exit.
     let (mut m, _) = machine(&elf, 1, 4, b"");
     let lbu = symbol(&elf, "puts") + 8;
-    m.set_breakpoint(lbu);
+    m.set_breakpoint(lbu).unwrap();
     let mut hits = 0;
     let stop = loop {
         match m.debug_continue(u64::MAX, &mut trace) {
@@ -178,7 +178,7 @@ fn watchpoints_stop_after_the_access() {
         panic!()
     };
     assert_eq!((hit.hart, hit.kind, hit.addr), (0, WatchKind::Read, message + 2));
-    assert_eq!(m.reg(7), b'l' as u32, "the load completed: t2 = 'l'");
+    assert_eq!(m.reg(7), u64::from(b'l'), "the load completed: t2 = 'l'");
     assert_eq!(m.pc(), symbol(&elf, "puts") + 12, "pc after the load");
     assert!(m.clear_watchpoint(message + 2, 1, WatchKind::Read));
 
@@ -209,14 +209,14 @@ fn watchpoints_stop_after_the_access() {
 /// Debugs `elf` with breakpoints at `stops`, stepping `steps` instructions at each
 /// stop, and checks the run is the one an undebugged machine makes: the same turns,
 /// output and exit code.
-fn same_run_debugged(elf: &[u8], harts: usize, ram: usize, input: &[u8], stops: &[u32], steps: usize) {
+fn same_run_debugged(elf: &[u8], harts: usize, ram: usize, input: &[u8], stops: &[u64], steps: usize) {
     let (mut plain, plain_out) = machine(elf, harts, ram, input);
     let (code, expected) = undebugged(&mut plain);
 
     let (mut m, out) = machine(elf, harts, ram, input);
     let mut turns = Turns::new();
     for &pc in stops {
-        m.set_breakpoint(pc);
+        m.set_breakpoint(pc).unwrap();
     }
     let mut stopped = 0;
     let mut trace = turns.trace();
@@ -264,7 +264,7 @@ fn harts_stop_between_turns() {
     // Every hart works: hart 0 once it has woken the others, hart 1 once woken.
     let (mut m, _) = machine(&smp, 2, 4, b"");
     let mut trace = |_: &Cpu| {};
-    m.set_breakpoint(work);
+    m.set_breakpoint(work).unwrap();
     assert_eq!(
         m.debug_continue(u64::MAX, &mut trace),
         Some(Stop::Breakpoint { hart: 0, pc: work })
@@ -289,7 +289,7 @@ fn harts_stop_between_turns() {
     assert_eq!(m.debug_step(&mut trace), Stop::Stepped { hart: 1 });
     assert_eq!(m.pc(), work + 4);
     assert_eq!(m.cpu.next_hart(), 0);
-    assert_eq!(m.cpu.hart(0).pc as u32, hart0, "hart 0 has not run");
+    assert_eq!(m.cpu.hart(0).pc, hart0, "hart 0 has not run");
     let _ = hart0;
     // Stepping hart 1 again: hart 0 takes its turn first, then hart 1 its.
     m.debug_step(&mut trace);
@@ -298,7 +298,7 @@ fn harts_stop_between_turns() {
     m.select_hart(0).unwrap();
     m.debug_step(&mut trace);
     assert_eq!(m.cpu.next_hart(), 1);
-    assert_eq!(m.cpu.hart(1).pc as u32, work + 8);
+    assert_eq!(m.cpu.hart(1).pc, work + 8);
     assert!(m.select_hart(2).is_err());
 
     // Watching the shared counter: each stop is one hart's amoadd.w, adding 1.

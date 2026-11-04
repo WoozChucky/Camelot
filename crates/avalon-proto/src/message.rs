@@ -181,7 +181,8 @@ pub const DEFAULT_HARTS: u32 = 1;
 /// The server validates it as Grail does and answers `InvalidProfile` if it is wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareProfile {
-    /// RAM size in bytes: a non-zero multiple of 4 KiB, at most 2 GiB.
+    /// RAM size in bytes: a non-zero multiple of 4 KiB, at most 1 TiB (2 GiB for an RV32
+    /// VM, which a VM is unless its program is ELF64).
     pub ram_size: u64,
     /// Real-time clock in instructions per second, or `None` to run at full speed.
     pub clock_hz: Option<u32>,

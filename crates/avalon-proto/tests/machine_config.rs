@@ -11,7 +11,9 @@
 use avalon_proto::{
     DeviceEntry, DeviceSpec, DiskSpec, HardwareProfile, KeyEvent, Message, NetSpec, PIXEL_FORMAT_XRGB8888,
 };
-use grail::config::{DiskSource, NetSource, DEFAULT_NOMINAL_HZ, MAX_HARTS, MAX_RAM_SIZE, MIB};
+use grail::config::{
+    DiskSource, NetSource, DEFAULT_NOMINAL_HZ, MAX_HARTS, MAX_RAM_SIZE, MAX_RAM_SIZE_RV32, MIB,
+};
 use grail::net::{Hub, MacAddr};
 use grail::{DiskConfig, MachineConfig, NetConfig};
 
@@ -166,7 +168,9 @@ fn configs_survive_the_wire() {
     let configs = [
         MachineConfig::default(),
         MachineConfig::with_ram(MIB),
-        MachineConfig::with_ram(MAX_RAM_SIZE),
+        // The protocol has no width (#158): its VMs are RV32 unless their program is
+        // ELF64, so the most a profile on its own takes is RV32's.
+        MachineConfig::with_ram(MAX_RAM_SIZE_RV32),
         MachineConfig {
             ram_size: 64 * MIB,
             clock_hz: Some(2_000_000),
@@ -239,6 +243,7 @@ fn invalid_profiles_decode_and_are_left_to_the_server() {
     for bad in [
         HardwareProfile::with_ram(0),
         HardwareProfile::with_ram(4095),
+        HardwareProfile::with_ram(MAX_RAM_SIZE_RV32 as u64 + 4096),
         HardwareProfile::with_ram(MAX_RAM_SIZE as u64 + 4096),
         HardwareProfile::with_ram(u64::MAX),
         HardwareProfile {
@@ -285,21 +290,29 @@ fn device_table_mirrors_sysinfo() {
             } = e;
             DeviceEntry {
                 kind: kind as u32,
-                base,
-                size,
+                base: u32::try_from(base).expect("devices are below 4 GiB"),
+                size: u32::try_from(size).expect("devices are below 4 GiB"),
                 irq,
             }
         })
         .collect();
     // What a running guest reads from its own sysinfo block.
     let mut machine = grail::Machine::new(config).unwrap();
-    let read = |m: &mut grail::Machine, off: u32| m.cpu.bus.read(grail::bus::SYSINFO_BASE + off, 4).unwrap();
+    let read = |m: &mut grail::Machine, off: u32| {
+        m.cpu
+            .bus
+            .read(grail::bus::SYSINFO_BASE + u64::from(off), 4)
+            .unwrap()
+    };
     let count = read(&mut machine, grail::sysinfo::REG_DEV_COUNT);
     assert_eq!(count as usize, table.len());
     for (i, entry) in table.iter().enumerate() {
         let at = grail::sysinfo::DEV_TABLE + i as u32 * grail::sysinfo::DEV_ENTRY_SIZE;
-        let words: Vec<u32> = (0..4).map(|w| read(&mut machine, at + 4 * w)).collect();
-        assert_eq!(words, [entry.kind, entry.base, entry.size, entry.irq]);
+        let words: Vec<u64> = (0..4).map(|w| read(&mut machine, at + 4 * w)).collect();
+        assert_eq!(
+            words,
+            [entry.kind, entry.base, entry.size, entry.irq].map(u64::from)
+        );
     }
 }
 

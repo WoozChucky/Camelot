@@ -109,11 +109,11 @@ pub fn function(name: &str) -> Range<u32> {
 }
 
 pub fn peek(cpu: &Cpu, addr: u32) -> u32 {
-    cpu.bus.peek(addr).unwrap()
+    cpu.bus.peek(addr.into()).unwrap()
 }
 
 pub fn peek_byte(bus: &grail::bus::Bus, addr: u32) -> u8 {
-    (bus.peek(addr & !3).unwrap() >> (8 * (addr & 3))) as u8
+    (bus.peek((addr & !3).into()).unwrap() >> (8 * (addr & 3))) as u8
 }
 
 /// The name of the process whose `struct proc` is at `p`.
@@ -126,7 +126,7 @@ pub fn proc_name(cpu: &Cpu, p: u32) -> String {
 }
 
 pub fn free_pages(m: &Machine, elf: &grail::elf::Elf) -> u32 {
-    m.cpu.bus.peek(sym(elf, "nfree")).unwrap()
+    m.cpu.bus.peek(sym(elf, "nfree").into()).unwrap()
 }
 
 /// The lines between the last echo of `command` and the next prompt.
@@ -210,14 +210,14 @@ impl LockWatch {
         if is_user && !self.was_user[h] {
             let me = self.cpus + cpu.id * CPU_SIZE;
             assert_eq!(
-                cpu.bus.peek(me + CPU_NOFF),
+                cpu.bus.peek(u64::from(me + CPU_NOFF)),
                 Some(0),
                 "push_off() depth on hart {h} in U-mode at {:#x}",
                 cpu.pc
             );
             for &(name, lock) in &self.locks {
                 assert_ne!(
-                    cpu.bus.peek(lock + LOCK_CPU),
+                    cpu.bus.peek(u64::from(lock + LOCK_CPU)),
                     Some(me),
                     "{name} held by hart {h} in U-mode at {:#x}",
                     cpu.pc

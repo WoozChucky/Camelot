@@ -13,11 +13,16 @@ use gateway::{Gateway, HostFwd};
 use std::path::PathBuf;
 
 pub const MIB: usize = 1024 * 1024;
+pub const GIB: usize = 1024 * MIB;
 /// RAM size when nothing else is asked for.
 pub const DEFAULT_RAM_SIZE: usize = 4 * MIB;
-/// RAM must end at or below 4 GiB: everything from `RAM_BASE` to the top of the address
-/// space, 2 GiB.
-pub const MAX_RAM_SIZE: usize = (u32::MAX - RAM_BASE) as usize + 1;
+/// The most RAM a machine has: 1 TiB, the memory controller's limit (spec section 7),
+/// ending at 0x100_7FFF_FFFF, well inside the 48-bit physical address space. Backed
+/// lazily ([`crate::ram::Ram`]), so it costs the host what the guest touches.
+pub const MAX_RAM_SIZE: usize = 1 << 40;
+/// The most an RV32 machine has: everything from `RAM_BASE` to the top of its 32-bit
+/// address space, 2 GiB.
+pub const MAX_RAM_SIZE_RV32: usize = (u32::MAX as u64 - RAM_BASE) as usize + 1;
 /// RAM is handed out in whole 4 KiB pages.
 pub const RAM_GRANULE: usize = 4096;
 /// Clock frequency the machine reports when it is not paced to a real-time clock.
@@ -33,7 +38,7 @@ pub const MAX_HARTS: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineConfig {
     /// RAM size in bytes, mapped at `RAM_BASE`. A non-zero multiple of 4 KiB, at most
-    /// [`MAX_RAM_SIZE`].
+    /// [`max_ram_size`] for the machine's width (1 TiB, or 2 GiB on RV32).
     pub ram_size: usize,
     /// Real-time mode: run this many steps (instructions, and so `mtime` ticks) per
     /// wall-clock second. `None` runs at full speed, deterministically.
@@ -300,9 +305,14 @@ impl MachineConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         let ram = self.ram_size;
-        if ram == 0 || ram > MAX_RAM_SIZE || !ram.is_multiple_of(RAM_GRANULE) {
+        let max = max_ram_size(self.xlen);
+        if ram == 0 || ram > max || !ram.is_multiple_of(RAM_GRANULE) {
+            let width = match self.xlen {
+                Xlen::Rv32 => "an RV32 machine has at most 2 GiB",
+                Xlen::Rv64 => "a machine has at most 1 TiB",
+            };
             return Err(format!(
-                "RAM size {ram:#x} must be a non-zero multiple of 4 KiB, at most {MAX_RAM_SIZE:#x} (2 GiB)"
+                "RAM size {ram:#x} must be a non-zero multiple of 4 KiB, at most {max:#x} ({width})"
             ));
         }
         if self.clock_hz == Some(0) || self.nominal_hz == 0 {
@@ -344,19 +354,57 @@ impl MachineConfig {
     }
 }
 
-/// Parses a `--ram` value: a whole number of MiB, from 1 up to what fits between
-/// `RAM_BASE` and the top of the address space (2048). Returns the size in bytes.
-pub fn parse_ram_mib(s: &str) -> Result<usize, String> {
-    const MAX_MIB: usize = MAX_RAM_SIZE / MIB;
-    let s = s.trim();
-    let mib: usize = match s.parse() {
-        Ok(n) if s.bytes().all(|b| b.is_ascii_digit()) => n,
-        _ => return Err(format!("'{s}' is not a whole number of MiB")),
-    };
-    if !(1..=MAX_MIB).contains(&mib) {
-        return Err(format!("{mib} MiB is out of range (1 to {MAX_MIB} MiB)"));
+/// The most RAM a machine of width `xlen` has: [`MAX_RAM_SIZE`], or
+/// [`MAX_RAM_SIZE_RV32`] on RV32.
+pub fn max_ram_size(xlen: Xlen) -> usize {
+    match xlen {
+        Xlen::Rv32 => MAX_RAM_SIZE_RV32,
+        Xlen::Rv64 => MAX_RAM_SIZE,
     }
-    Ok(mib * MIB)
+}
+
+/// A size of memory as people type it: a whole number of MiB, or a whole number with a
+/// unit, `M`/`MiB`, `G`/`GiB` or `T`/`TiB` in any case (`64`, `64M`, `16G`, `2TiB`).
+/// `Ok(None)` if it is one but does not fit in 64 bits.
+fn size_in_bytes(s: &str) -> Result<Option<u64>, String> {
+    let bad = || format!("'{s}' is not a RAM size (examples: 64, 64M, 512MiB, 16G, 16GiB)");
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (number, unit) = s.split_at(split);
+    let scale: u64 = match unit.to_ascii_lowercase().as_str() {
+        "" | "m" | "mib" => 1 << 20,
+        "g" | "gib" => 1 << 30,
+        "t" | "tib" => 1 << 40,
+        _ => return Err(bad()),
+    };
+    if number.is_empty() {
+        return Err(bad());
+    }
+    Ok(number.parse::<u64>().ok().and_then(|n| n.checked_mul(scale)))
+}
+
+/// Parses a size of memory with no limit but 64 bits (a RAM budget: Avalon's
+/// `--max-ram`): the syntax of `--ram` ([`parse_ram_size`]), at least 1 MiB. Returns
+/// bytes.
+pub fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    match size_in_bytes(s)? {
+        Some(0) => Err(format!("{s} is too small (at least 1 MiB)")),
+        Some(size) => Ok(size),
+        None => Err(format!("{s} does not fit in 64 bits")),
+    }
+}
+
+/// Parses a `--ram` value (spec section 7, "RAM"): a whole number of MiB, or a whole
+/// number with a unit, `M`/`MiB`, `G`/`GiB` or `T`/`TiB` in any case (`64`, `64M`,
+/// `16G`, `16GiB`, `1T`). From 1 MiB to 1 TiB; an RV32 machine takes at most 2 GiB,
+/// which the machine's validation says ([`MachineConfig::validate`]). Returns the size
+/// in bytes.
+pub fn parse_ram_size(s: &str) -> Result<usize, String> {
+    let s = s.trim();
+    match size_in_bytes(s)? {
+        Some(size) if (MIB as u64..=MAX_RAM_SIZE as u64).contains(&size) => Ok(size as usize),
+        _ => Err(format!("{s} is out of range (1 MiB to 1 TiB)")),
+    }
 }
 
 /// Parses an `--xlen` value: `32` (RV32) or `64` (RV64).
@@ -450,13 +498,30 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_sizes_and_zero_clocks() {
-        assert_eq!(MAX_RAM_SIZE, 0x8000_0000);
-        for ram in [4096, 64 * 1024, MIB, MAX_RAM_SIZE] {
+        assert_eq!(MAX_RAM_SIZE_RV32, 0x8000_0000);
+        assert_eq!(MAX_RAM_SIZE, 0x100_0000_0000);
+        // RAM ends at 0x100_7FFF_FFFF at most: 48-bit physical addresses.
+        assert_eq!(RAM_BASE + MAX_RAM_SIZE as u64 - 1, 0x100_7fff_ffff);
+        let rv64 = |ram_size| MachineConfig {
+            ram_size,
+            xlen: Xlen::Rv64,
+            ..MachineConfig::default()
+        };
+        for ram in [4096, 64 * 1024, MIB, MAX_RAM_SIZE_RV32] {
             assert_eq!(MachineConfig::with_ram(ram).validate(), Ok(()), "{ram:#x}");
+            assert_eq!(rv64(ram).validate(), Ok(()), "{ram:#x}");
         }
-        for ram in [0, 1, 4095, 4097, MAX_RAM_SIZE + RAM_GRANULE] {
+        for ram in [MAX_RAM_SIZE_RV32 + RAM_GRANULE, 16 * GIB, MAX_RAM_SIZE] {
+            assert_eq!(rv64(ram).validate(), Ok(()), "{ram:#x}");
+            let e = MachineConfig::with_ram(ram).validate().unwrap_err();
+            assert!(e.contains("an RV32 machine has at most 2 GiB"), "{e}");
+        }
+        for ram in [0, 1, 4095, 4097] {
             assert!(MachineConfig::with_ram(ram).validate().is_err(), "{ram:#x}");
+            assert!(rv64(ram).validate().is_err(), "{ram:#x}");
         }
+        let e = rv64(MAX_RAM_SIZE + RAM_GRANULE).validate().unwrap_err();
+        assert!(e.contains("a machine has at most 1 TiB"), "{e}");
         let zero_clock = MachineConfig {
             clock_hz: Some(0),
             ..MachineConfig::default()
@@ -704,37 +769,64 @@ mod tests {
     }
 
     #[test]
-    fn ram_accepts_1_to_2048_mib() {
-        assert_eq!(parse_ram_mib("1"), Ok(MIB));
-        assert_eq!(parse_ram_mib("128"), Ok(128 * MIB));
-        assert_eq!(parse_ram_mib("2048"), Ok(0x8000_0000));
-        assert_eq!(parse_ram_mib(" 64 "), Ok(64 * MIB));
-        for good in ["1", "16", "2048"] {
-            let size = parse_ram_mib(good).unwrap();
+    fn ram_sizes_in_mib_or_gib() {
+        for (s, size) in [
+            ("1", MIB),
+            ("128", 128 * MIB),
+            ("2048", 2 * GIB),
+            (" 64 ", 64 * MIB),
+            ("64M", 64 * MIB),
+            ("64m", 64 * MIB),
+            ("64MiB", 64 * MIB),
+            ("64mib", 64 * MIB),
+            ("16G", 16 * GIB),
+            ("16g", 16 * GIB),
+            ("16GiB", 16 * GIB),
+            ("16GIB", 16 * GIB),
+            ("1024G", MAX_RAM_SIZE),
+            ("1048576", MAX_RAM_SIZE),
+            ("1T", MAX_RAM_SIZE),
+            ("1tib", MAX_RAM_SIZE),
+        ] {
+            assert_eq!(parse_ram_size(s), Ok(size), "{s:?}");
+        }
+        for good in ["1", "16", "2048", "2G"] {
+            let size = parse_ram_size(good).unwrap();
             assert_eq!(MachineConfig::with_ram(size).validate(), Ok(()));
         }
     }
 
     #[test]
+    fn budgets_take_the_same_sizes_without_the_ram_limit() {
+        assert_eq!(parse_size("4096"), Ok(4 << 30));
+        assert_eq!(parse_size("2T"), Ok(2 << 40));
+        assert_eq!(parse_size("16384G"), Ok(16 << 40));
+        assert_eq!(parse_size(" 512MiB "), Ok(512 << 20));
+        assert!(parse_size("0").unwrap_err().contains("at least 1 MiB"));
+        assert!(parse_size("99999999999T").unwrap_err().contains("64 bits"));
+        assert!(parse_size("64MB").unwrap_err().contains("is not a RAM size"));
+    }
+
+    #[test]
     fn ram_rejects_out_of_range_and_garbage() {
-        for bad in [
+        for big in [
             "0",
-            "2049",
-            "4096",
+            "0G",
+            "1025G",
+            "1048577",
+            "2T",
             "99999999999999999999999",
-            "-1",
-            "+5",
-            "1.5",
-            "12M",
-            "128MiB",
-            "",
-            "abc",
-            "0x10",
+            "99999999999999999G",
         ] {
-            assert!(parse_ram_mib(bad).is_err(), "{bad:?} accepted");
+            let e = parse_ram_size(big).unwrap_err();
+            assert!(e.contains("out of range (1 MiB to 1 TiB)"), "{big:?}: {e}");
         }
-        assert!(parse_ram_mib("0").unwrap_err().contains("1 to 2048 MiB"));
-        assert!(parse_ram_mib("abc").unwrap_err().contains("not a whole number"));
+        for bad in [
+            "-1", "+5", "1.5", "1.5G", "12K", "12KiB", "12P", "G", "", "abc", "0x10", "64 M", "64MB",
+        ] {
+            let e = parse_ram_size(bad).unwrap_err();
+            assert!(e.contains("is not a RAM size"), "{bad:?}: {e}");
+        }
     }
 
     #[test]

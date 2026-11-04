@@ -187,7 +187,7 @@ fn bare_machine(config: MachineConfig, program: &[u32]) -> Machine {
     let mut m = Machine::new(config).unwrap();
     let code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     m.cpu.bus.load(RAM_BASE, &code).unwrap();
-    m.cpu.pc = RAM_BASE.into();
+    m.cpu.pc = RAM_BASE;
     m
 }
 
@@ -229,7 +229,7 @@ fn wfi_program(when: u32, mie: u32) -> Vec<u32> {
     const T0: u32 = 5;
     const T1: u32 = 6;
     let mut p = Vec::new();
-    p.extend(li(T0, CLINT_BASE + 0x4000)); // t0 = &mtimecmp
+    p.extend(li(T0, (CLINT_BASE + 0x4000) as u32)); // t0 = &mtimecmp
     p.extend(li(T1, when));
     p.push(0x0062_a023); // sw   t1, 0(t0)
     p.push(0x0002_a223); // sw   zero, 4(t0)
@@ -425,13 +425,12 @@ fn cli_rejects_bad_ram_and_clock_values() {
     for (args, message) in [
         (
             &["--ram", "0", elf][..],
-            "--ram: 0 MiB is out of range (1 to 2048 MiB)",
+            "--ram: 0 is out of range (1 MiB to 1 TiB)",
         ),
-        (&["--ram", "2049", elf], "--ram: 2049 MiB is out of range"),
-        (
-            &["--ram", "lots", elf],
-            "--ram: 'lots' is not a whole number of MiB",
-        ),
+        (&["--ram", "1025G", elf], "--ram: 1025G is out of range"),
+        (&["--ram", "lots", elf], "--ram: 'lots' is not a RAM size"),
+        // An RV32 program's machine has at most 2 GiB.
+        (&["--ram", "4G", elf], "an RV32 machine has at most 2 GiB"),
         (
             &["--clock", "0", elf],
             "--clock: the clock must be faster than 0 Hz",
@@ -516,8 +515,9 @@ fn usage_documents_clock_and_its_units() {
         "--clock FREQ",
         "Hz, kHz or MHz",
         "--clock 1.5MHz",
-        "--ram MiB",
-        "1 to 2048",
+        "--ram SIZE",
+        "1 MiB to 1 TiB",
+        "--ram 16G",
         "--harts N",
     ] {
         assert!(usage.contains(text), "usage lacks {text:?}:\n{usage}");
@@ -526,7 +526,7 @@ fn usage_documents_clock_and_its_units() {
     assert_eq!(grail::DEFAULT_RAM_SIZE, 4 << 20);
     assert_eq!(grail::MachineConfig::default().ram_size, grail::DEFAULT_RAM_SIZE);
     assert!(
-        usage.contains("--ram MiB       RAM size in MiB, 1 to 2048 (default 4)\n"),
+        usage.contains("most 2 GiB (default 4 MiB). Backed lazily"),
         "{usage}"
     );
 }

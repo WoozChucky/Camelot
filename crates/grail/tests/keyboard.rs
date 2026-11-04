@@ -11,12 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const MEIP: u64 = 1 << IRQ_M_EXT;
-const KBD_STATUS: u32 = KBD_BASE;
-const KBD_DATA: u32 = KBD_BASE + 4;
-const KBD_CTRL: u32 = KBD_BASE + 8;
-const PENDING: u32 = PLIC_BASE + 0x1000;
-const ENABLE0: u32 = PLIC_BASE + 0x2000;
-const CLAIM0: u32 = PLIC_BASE + 0x20_0004;
+const KBD_STATUS: u64 = KBD_BASE;
+const KBD_DATA: u64 = KBD_BASE + 4;
+const KBD_CTRL: u64 = KBD_BASE + 8;
+const PENDING: u64 = PLIC_BASE + 0x1000;
+const ENABLE0: u64 = PLIC_BASE + 0x2000;
+const CLAIM0: u64 = PLIC_BASE + 0x20_0004;
 const LOAD_ACCESS_FAULT: u64 = 5;
 
 fn example(name: &str) -> PathBuf {
@@ -55,17 +55,18 @@ fn bare_machine(program: &[u32]) -> Machine {
     let mut code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     code.extend(std::iter::repeat_n([0x13, 0, 0, 0], 64).flatten()); // nops
     m.cpu.bus.load(RAM_BASE, &code).unwrap();
-    m.cpu.pc = RAM_BASE.into();
-    m.cpu.csr.mtvec = (RAM_BASE + 0x80).into();
+    m.cpu.pc = RAM_BASE;
+    m.cpu.csr.mtvec = RAM_BASE + 0x80;
     m
 }
 
 #[test]
 fn line_reaches_the_plic_only_with_kbd_ctrl_set() {
     let mut m = bare_machine(&[]);
+    let irq = u64::from(KBD_IRQ);
     let bus = &mut m.cpu.bus;
-    bus.write(PLIC_BASE + 4 * KBD_IRQ, 4, 1).unwrap();
-    bus.write(ENABLE0, 4, 1 << KBD_IRQ).unwrap();
+    bus.write(PLIC_BASE + 4 * irq, 4, 1).unwrap();
+    bus.write(ENABLE0, 4, 1 << irq).unwrap();
 
     m.key_event(KeyEvent::press(b'a'));
     m.cpu.step();
@@ -74,14 +75,14 @@ fn line_reaches_the_plic_only_with_kbd_ctrl_set() {
 
     m.cpu.bus.write(KBD_CTRL, 4, 1).unwrap();
     m.cpu.step();
-    assert_eq!(m.cpu.bus.read(PENDING, 4).unwrap(), 1 << KBD_IRQ);
+    assert_eq!(m.cpu.bus.read(PENDING, 4).unwrap(), 1 << irq);
     assert_eq!(m.cpu.mip() & MEIP, MEIP);
 
     // Claim, drain, complete: nothing left.
-    assert_eq!(m.cpu.bus.read(CLAIM0, 4).unwrap(), KBD_IRQ);
-    assert_eq!(m.cpu.bus.read(KBD_DATA, 4).unwrap(), b'a' as u32);
+    assert_eq!(m.cpu.bus.read(CLAIM0, 4).unwrap(), irq);
+    assert_eq!(m.cpu.bus.read(KBD_DATA, 4).unwrap(), u64::from(b'a'));
     assert_eq!(m.cpu.bus.read(KBD_STATUS, 4).unwrap(), 0);
-    m.cpu.bus.write(CLAIM0, 4, KBD_IRQ).unwrap();
+    m.cpu.bus.write(CLAIM0, 4, irq).unwrap();
     m.cpu.step();
     assert_eq!(m.cpu.bus.read(PENDING, 4).unwrap(), 0);
     assert_eq!(m.cpu.mip() & MEIP, 0);
@@ -90,18 +91,19 @@ fn line_reaches_the_plic_only_with_kbd_ctrl_set() {
 #[test]
 fn line_stays_high_until_the_fifo_is_drained() {
     let mut m = bare_machine(&[]);
+    let irq = u64::from(KBD_IRQ);
     let bus = &mut m.cpu.bus;
-    bus.write(PLIC_BASE + 4 * KBD_IRQ, 4, 1).unwrap();
-    bus.write(ENABLE0, 4, 1 << KBD_IRQ).unwrap();
+    bus.write(PLIC_BASE + 4 * irq, 4, 1).unwrap();
+    bus.write(ENABLE0, 4, 1 << irq).unwrap();
     bus.write(KBD_CTRL, 4, 1).unwrap();
     m.key_event(KeyEvent::press(b'x'));
     m.key_event(KeyEvent::release(b'x'));
 
-    for want in [b'x' as u32, b'x' as u32 | 0x100] {
+    for want in [u64::from(b'x'), u64::from(b'x') | 0x100] {
         m.cpu.step();
-        assert_eq!(m.cpu.bus.read(CLAIM0, 4).unwrap(), KBD_IRQ);
+        assert_eq!(m.cpu.bus.read(CLAIM0, 4).unwrap(), irq);
         assert_eq!(m.cpu.bus.read(KBD_DATA, 4).unwrap(), want);
-        m.cpu.bus.write(CLAIM0, 4, KBD_IRQ).unwrap();
+        m.cpu.bus.write(CLAIM0, 4, irq).unwrap();
     }
     m.cpu.step();
     assert_eq!(
@@ -115,11 +117,11 @@ fn line_stays_high_until_the_fifo_is_drained() {
 fn byte_loads_from_kbd_data_fault_and_pop_nothing() {
     // lb t0, 4(t1) with t1 = KBD_BASE
     let mut m = bare_machine(&[(4 << 20) | (6 << 15) | (5 << 7) | 0x03]);
-    m.cpu.x[6] = KBD_BASE.into();
+    m.cpu.x[6] = KBD_BASE;
     m.key_event(KeyEvent::press(b'z'));
     m.cpu.step();
     assert_eq!(m.cpu.csr.mcause, LOAD_ACCESS_FAULT);
-    assert_eq!(m.cpu.csr.mtval, u64::from(KBD_DATA));
+    assert_eq!(m.cpu.csr.mtval, KBD_DATA);
     assert_eq!(m.cpu.bus.kbd.len(), 1);
 }
 

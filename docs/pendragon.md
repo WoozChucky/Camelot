@@ -5,7 +5,7 @@ Pendragon (`crates/pendragon`) serves a browser page for the Avalon platform: th
 Everything is std only and written in the crate: a small HTTP/1.1 server on `std::net` (`http.rs`), JSON (`json.rs`) and base64 (`base64.rs`) for the API, and the page itself, plain HTML, JavaScript and CSS (`src/ui/`) built into the binary with `include_str!`. There is no frontend build step.
 
 ```
-pendragon [--listen ADDR] [--avalon ADDR] [--lake ADDR] [--avalon-max-ram MiB] [--allow-host NAME]...
+pendragon [--listen ADDR] [--avalon ADDR] [--lake ADDR] [--avalon-max-ram SIZE] [--allow-host NAME]...
 ```
 
 | Option | Default | Meaning |
@@ -13,7 +13,7 @@ pendragon [--listen ADDR] [--avalon ADDR] [--lake ADDR] [--avalon-max-ram MiB] [
 | `--listen` | `127.0.0.1:7402` | where to serve the page (a host alone means port 7402) |
 | `--avalon` | `127.0.0.1:7400` | Avalon's address (a host alone means port 7400) |
 | `--lake` | `127.0.0.1:7401` | Lake's address (a host alone means port 7401) |
-| `--avalon-max-ram` | 4096 | Avalon's RAM budget in MiB (its `--max-ram`), for the overview: the protocol does not report it |
+| `--avalon-max-ram` | 4096 | Avalon's RAM budget (its `--max-ram`), in MiB or with `M`/`MiB`, `G`/`GiB` or `T`/`TiB`, for the overview: the protocol does not report it |
 | `--allow-host` | | another `Host` the page may be reached by (repeatable; see below) |
 
 Pendragon prints the URL to open on stdout, alone on its line: `http://127.0.0.1:7402/?token=<64 hex digits>`. `cargo xtask up` starts it with Avalon and Lake, and prints the URL again once all three are up (README, *Quick start*).
@@ -58,7 +58,7 @@ Every route is under `/api/`, takes and returns JSON (`Content-Type: application
 
 | Status | When |
 |---|---|
-| 400 | the request itself is wrong: bad JSON, a missing or unknown field, a value Round Table would refuse too (`ram: 0 MiB is out of range`) |
+| 400 | the request itself is wrong: bad JSON, a missing or unknown field, a value Round Table would refuse too (`ram: 0 is out of range (1 MiB to 1 TiB)`) |
 | 403 | the checks of section 1 |
 | 404 | `NoSuchVm`, `NoSuchDisk`, `NoSuchSwitch`, `NoSuchCard`, an unknown route |
 | 405 | a route that does not take that method |
@@ -72,7 +72,7 @@ A VM in a path (`{vm}`) is its id (all digits) or its name, as on Round Table's 
 |---|---|
 | `GET /api/overview` | both servers' health (`ok`, `server` name or `error`), VM counts by state, RAM in use (the sum of every VM's RAM, which Avalon holds from create to destroy) against the budget, disk count, attached count and total size, and `consoles`: how many consoles Pendragon has open |
 | `GET /api/vms` | every VM: `id`, `name`, `state` (`created`, `running`, `paused`, `stopped`, `exited`), `state_text`, `exit_code`, `ram`, `clock_hz` (null: full speed), `nominal_hz`, their `*_text` forms, `harts`, `disks` (`source`, `read_only`, `lake`: `{addr, name}` or null, `held`: whether the VM still holds it), `nets` (`card` number, `mac`, `switch` it is plugged into or null, as they are now) and the `actions` its state allows |
-| `POST /api/vms` | create: `{"name", "ram", "clock", "harts", "disks": [{"source", "read_only"}], "nets": [{"switch", "mac"}], "camelot", "program", "start"}`. `ram`, `clock` and `harts` are text as `--ram`, `--clock` and `--harts` take them (MiB; `10MHz`, `500kHz`, `5Hz`; 1 to 8; empty for the defaults: 4 MiB, full speed, one hart), each disk source a path on Avalon's host or `lake://ADDR/NAME`, each network card's switch a name (empty or null: unplugged) and its `mac` `xx:xx:xx:xx:xx:xx` (empty or null: Avalon makes one up), as `--net SWITCH,mac=...` takes them; the cards come after the disks in the profile. `program` is the ELF file in base64; it may be left out when there is a disk, and the VM boots from the first. `camelot: true` makes a Camelot VM instead, as `round-table create --camelot` does: Lake copies its image `os-base` to `<name>-disk0` (see below), which goes before the other disks, and the VM boots from it; it takes no `program` (400). 201 `{"id", "name", "started", "disk"}`, `disk` the Camelot VM's copy or null |
+| `POST /api/vms` | create: `{"name", "ram", "clock", "harts", "disks": [{"source", "read_only"}], "nets": [{"switch", "mac"}], "camelot", "program", "start"}`. `ram`, `clock` and `harts` are text as `--ram`, `--clock` and `--harts` take them (MiB, or with `M`/`MiB` or `G`/`GiB`; `10MHz`, `500kHz`, `5Hz`; 1 to 8; empty for the defaults: 4 MiB, full speed, one hart), each disk source a path on Avalon's host or `lake://ADDR/NAME`, each network card's switch a name (empty or null: unplugged) and its `mac` `xx:xx:xx:xx:xx:xx` (empty or null: Avalon makes one up), as `--net SWITCH,mac=...` takes them; the cards come after the disks in the profile. `program` is the ELF file in base64; it may be left out when there is a disk, and the VM boots from the first. `camelot: true` makes a Camelot VM instead, as `round-table create --camelot` does: Lake copies its image `os-base` to `<name>-disk0` (see below), which goes before the other disks, and the VM boots from it; it takes no `program` (400). 201 `{"id", "name", "started", "disk"}`, `disk` the Camelot VM's copy or null |
 | `GET /api/vms/{vm}` | one VM, as in the list, plus `steps` and `devices` (the guest's sysinfo table) |
 | `POST /api/vms/{vm}/{action}` | `start`, `pause`, `resume`, `stop` or `destroy` |
 | `GET /api/vms/{vm}/console?from=N&tap=T&wait=MS` | console output from byte offset `N` (below) |

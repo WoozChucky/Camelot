@@ -97,6 +97,54 @@ fn le(v: u32) -> String {
     v.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// An RV64 register's value as the stub sends it: 8 bytes, little-endian, in hex.
+fn le64(v: u64) -> String {
+    v.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A program for an RV64 machine, as an ELF64 file in the temporary directory (named
+/// after `name`): one `PT_LOAD` segment at the start of RAM, its entry, holding
+///
+/// ```text
+/// 0x80000000  addi a0, zero, 5
+/// 0x80000004  slli a0, a0, 40     a0 = 0x500_0000_0000, past 32 bits
+/// 0x80000008  addi a1, a0, 1
+/// 0x8000000c  j .
+/// ```
+fn rv64_program(name: &str) -> PathBuf {
+    let words: [u32; 4] = [
+        0x0050_0513, // addi a0, zero, 5
+        0x0285_1513, // slli a0, a0, 40
+        0x0015_0593, // addi a1, a0, 1
+        0x0000_006f, // j .
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut f = vec![0u8; 64 + 56];
+    f[..8].copy_from_slice(b"\x7fELF\x02\x01\x01\0");
+    f[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    f[18..20].copy_from_slice(&243u16.to_le_bytes()); // EM_RISCV
+    f[20..24].copy_from_slice(&1u32.to_le_bytes());
+    f[24..32].copy_from_slice(&0x8000_0000u64.to_le_bytes()); // e_entry
+    f[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    f[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    f[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    f[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+    f[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+    let ph = &mut f[64..];
+    ph[..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    ph[4..8].copy_from_slice(&5u32.to_le_bytes()); // R + X
+    ph[8..16].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+    ph[16..24].copy_from_slice(&0x8000_0000u64.to_le_bytes()); // p_vaddr
+    ph[24..32].copy_from_slice(&0x8000_0000u64.to_le_bytes()); // p_paddr
+    ph[32..40].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_filesz
+    ph[40..48].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_memsz
+    ph[48..56].copy_from_slice(&4u64.to_le_bytes()); // p_align
+    f.extend_from_slice(&code);
+    let path = std::env::temp_dir().join(format!("grail-gdb-{name}-{}.elf", std::process::id()));
+    std::fs::write(&path, f).unwrap();
+    path
+}
+
 #[test]
 fn gdb_wait_breaks_steps_and_runs_to_the_end() {
     let hello = "examples/hello/hello.elf";
@@ -127,6 +175,39 @@ fn gdb_wait_breaks_steps_and_runs_to_the_end() {
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "Hello from Camelot!\n");
+}
+
+#[test]
+fn an_rv64_machine_is_debugged_with_64_bit_registers() {
+    // The same protocol, as wide as the machine: the description says riscv:rv64,
+    // and the registers, the pc and the addresses are 64-bit.
+    let program = rv64_program("rv64");
+    let (child, addr) = grail(&["--gdb-wait"], program.to_str().unwrap());
+    let mut c = Client::connect(addr);
+    c.ask("qSupported:swbreak+");
+    let xml = c.ask("qXfer:features:read:target.xml:0,3fff");
+    assert!(xml.contains("<architecture>riscv:rv64</architecture>"), "{xml}");
+    assert!(xml.contains("bitsize=\"64\""), "{xml}");
+    assert_eq!(c.ask("?"), format!("T02thread:1;20:{};", le64(0x1000)));
+    assert_eq!(c.ask("Z0,80000008,4"), "OK");
+    assert_eq!(
+        c.ask("c"),
+        format!("T05swbreak:;thread:1;20:{};", le64(0x8000_0008))
+    );
+    let g = c.ask("g");
+    assert_eq!(g.len(), 33 * 16);
+    assert_eq!(&g[10 * 16..11 * 16], le64(5 << 40), "a0");
+    assert_eq!(c.ask("pa"), le64(5 << 40));
+    assert_eq!(c.ask("s"), format!("T05thread:1;20:{};", le64(0x8000_000c)));
+    assert_eq!(c.ask("pb"), le64((5 << 40) + 1), "a1");
+    assert_eq!(c.ask("m80000000,4"), "13055000");
+    assert_eq!(c.ask(&format!("Pa={}", le64(0x1234_5678_9abc_def0))), "OK");
+    assert_eq!(c.ask("pa"), le64(0x1234_5678_9abc_def0));
+    c.stream.write_all(&packet::frame(b"k")).unwrap();
+    assert_eq!(c.event(), Event::Ack);
+    assert_eq!(c.event(), Event::Packet(b"X09".to_vec()));
+    drop(child.wait_with_output().unwrap());
+    std::fs::remove_file(program).unwrap();
 }
 
 #[test]
@@ -235,4 +316,46 @@ fn lldb_breaks_steps_and_reads_registers() {
     }
     let out = child.wait_with_output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "Hello from Camelot!\n");
+}
+
+/// LLDB attached to an RV64 machine, as to an RV32 one above: it breaks at an address,
+/// reads 64-bit registers and steps. Ignored, for the same reasons.
+#[test]
+#[ignore]
+fn lldb_debugs_an_rv64_machine() {
+    let lldb = std::env::var("LLDB").unwrap_or_else(|_| "lldb".into());
+    let program = rv64_program("lldb");
+    let (child, addr) = grail(&["--gdb-wait"], program.to_str().unwrap());
+    let script = [
+        format!("target create {}", program.display()),
+        format!("gdb-remote {addr}"),
+        "breakpoint set --address 0x80000008".into(),
+        "continue".into(),
+        "register read pc a0".into(),
+        "stepi".into(),
+        "register read pc a1".into(),
+        "process kill".into(),
+    ];
+    let mut cmd = Command::new(&lldb);
+    cmd.arg("-b");
+    for line in &script {
+        cmd.args(["-o", line]);
+    }
+    let out = cmd.output().unwrap_or_else(|e| panic!("cannot run {lldb}: {e}"));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let checks: [&[&str]; 4] = [
+        &["stop reason = breakpoint 1.1"],
+        &["pc = 0x0000000080000008"],
+        &["a0 = 0x0000050000000000"],
+        &["a1 = 0x0000050000000001"],
+    ];
+    for parts in checks {
+        assert!(
+            text.lines().any(|l| parts.iter().all(|p| l.contains(p))),
+            "no line with {parts:?} in:\n{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    drop(child.wait_with_output());
+    std::fs::remove_file(program).unwrap();
 }

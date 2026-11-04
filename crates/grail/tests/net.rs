@@ -180,8 +180,8 @@ const WFI: u32 = 0x1050_0073;
 const HALT: u32 = 0x0000_006f;
 
 /// Where [`bare_machine`] keeps the receive ring (one descriptor) and its 2 KiB buffer.
-const RX_RING: u32 = RAM_BASE + 0x1000;
-const RX_BUF: u32 = RAM_BASE + 0x2000;
+const RX_RING: u64 = RAM_BASE + 0x1000;
+const RX_BUF: u64 = RAM_BASE + 0x2000;
 
 /// A machine with `code` at `RAM_BASE` (in M-mode, no boot ROM) and its first card's
 /// receive ring set up with one buffer.
@@ -192,14 +192,19 @@ fn bare_machine(config: MachineConfig, code: &[u32]) -> Machine {
     bus.load(RAM_BASE, &bytes).unwrap();
     bus.write(RX_RING, 4, RX_BUF).unwrap();
     bus.write(RX_RING + 4, 4, 0x800).unwrap();
-    bus.write(NET_BASE + net::REG_RX_BASE, 4, RX_RING).unwrap();
-    bus.write(NET_BASE + net::REG_RX_SIZE, 4, 1).unwrap();
-    bus.write(NET_BASE + net::REG_RX_TAIL, 4, 1).unwrap();
-    m.cpu.pc = RAM_BASE.into();
+    bus.write(card_reg(net::REG_RX_BASE), 4, RX_RING).unwrap();
+    bus.write(card_reg(net::REG_RX_SIZE), 4, 1).unwrap();
+    bus.write(card_reg(net::REG_RX_TAIL), 4, 1).unwrap();
+    m.cpu.pc = RAM_BASE;
     m
 }
 
-fn word(m: &mut Machine, addr: u32) -> u32 {
+/// The address of card 0's register `off`.
+fn card_reg(off: u32) -> u64 {
+    NET_BASE + u64::from(off)
+}
+
+fn word(m: &mut Machine, addr: u64) -> u64 {
     m.cpu.bus.read(addr, 4).unwrap()
 }
 
@@ -210,7 +215,7 @@ fn word(m: &mut Machine, addr: u32) -> u32 {
 fn received_frames_break_a_reservation() {
     // lr.w; a loop of 2 * POLL_STEPS steps, so the card polls in it; sc.w.
     let code = [lr_w(T0, A0), DEC_T1, BNEZ_T1_BACK, sc_w(T3, A1, A0), HALT];
-    const SC: u32 = 0x1111_1111;
+    const SC: u64 = 0x1111_1111;
     let cases = [
         // (reserved word, a frame arrives, sc.w succeeds, the word afterwards)
         (RX_BUF, true, false, 0xabab_abab),
@@ -228,18 +233,18 @@ fn received_frames_break_a_reservation() {
         if frame {
             peer.send(&[0xab; 60]).unwrap();
         }
-        m.cpu.set_reg(A0 as u8, addr.into());
-        m.cpu.x[A1] = SC.into();
+        m.cpu.set_reg(A0 as u8, addr);
+        m.cpu.x[A1] = SC;
         m.cpu.x[T1] = net::POLL_STEPS.into();
         for _ in 0..10_000 {
-            if m.cpu.pc == u64::from(RAM_BASE + 16) {
+            if m.cpu.pc == RAM_BASE + 16 {
                 break;
             }
             m.cpu.step();
         }
-        assert_eq!(m.cpu.pc, u64::from(RAM_BASE + 16), "{addr:#x}: no trap");
-        let head = word(&mut m, NET_BASE + net::REG_RX_HEAD);
-        assert_eq!(head, frame as u32, "{addr:#x}: the frame arrived in the loop");
+        assert_eq!(m.cpu.pc, RAM_BASE + 16, "{addr:#x}: no trap");
+        let head = word(&mut m, card_reg(net::REG_RX_HEAD));
+        assert_eq!(head, frame as u64, "{addr:#x}: the frame arrived in the loop");
         assert_eq!(m.cpu.x[T3], !stores as u64, "{addr:#x}: sc.w result");
         assert_eq!(word(&mut m, addr), want, "{addr:#x}: what the card wrote stays");
     }
@@ -262,23 +267,20 @@ fn received_frames_break_every_harts_reservation() {
     // descriptor's length and status.
     for (id, addr) in [(0, RX_RING + 4), (1, RX_BUF), (2, RX_BUF + 64)] {
         let hart = m.cpu.hart_mut(id);
-        hart.pc = RAM_BASE.into();
+        hart.pc = RAM_BASE;
         hart.waiting = false;
-        hart.set_reg(A0 as u8, addr.into());
+        hart.set_reg(A0 as u8, addr);
         hart.x[A1] = 0x1111_1111;
         hart.x[T1] = net::POLL_STEPS.into();
     }
     for _ in 0..10_000 {
-        if m.cpu.harts().iter().all(|h| h.pc == u64::from(RAM_BASE + 16)) {
+        if m.cpu.harts().iter().all(|h| h.pc == RAM_BASE + 16) {
             break;
         }
         m.cpu.step();
     }
-    assert!(
-        m.cpu.harts().iter().all(|h| h.pc == u64::from(RAM_BASE + 16)),
-        "no trap"
-    );
-    assert_eq!(word(&mut m, NET_BASE + net::REG_RX_HEAD), 1, "the frame arrived");
+    assert!(m.cpu.harts().iter().all(|h| h.pc == RAM_BASE + 16), "no trap");
+    assert_eq!(word(&mut m, card_reg(net::REG_RX_HEAD)), 1, "the frame arrived");
     let sc: Vec<u64> = m.cpu.harts().iter().map(|h| h.x[T3]).collect();
     assert_eq!(sc, [1, 1, 0], "only hart 2's line was not written");
     assert_eq!(word(&mut m, RX_BUF), 0xabab_abab);
@@ -299,7 +301,7 @@ fn paced_idle_cards_poll_and_break_reservations() {
     let mut m = bare_machine(config, &[lr_w(T0, A0), WFI, sc_w(T3, A1, A0), HALT]);
     let mut peer = hub.attach();
     peer.send(&[0xab; 60]).unwrap();
-    m.cpu.set_reg(A0 as u8, RX_BUF.into());
+    m.cpu.set_reg(A0 as u8, RX_BUF);
     m.cpu.x[A1] = 0x1111_1111;
     m.cpu.csr.mie = 1 << 7; // MTIE
     m.cpu.bus.clint.mtimecmp[0] = 3000;
@@ -308,11 +310,11 @@ fn paced_idle_cards_poll_and_break_reservations() {
     // more step. Only 3 ticks ran one by one, fewer than POLL_STEPS: the card polls only
     // because the skipped ticks count.
     assert_eq!(m.run_for(u64::MAX, &mut |_| {}), 1000);
-    assert_eq!(m.cpu.pc, u64::from(RAM_BASE + 8), "in wfi");
-    assert_eq!(word(&mut m, NET_BASE + net::REG_RX_HEAD), 1, "the card polled");
+    assert_eq!(m.cpu.pc, RAM_BASE + 8, "in wfi");
+    assert_eq!(word(&mut m, card_reg(net::REG_RX_HEAD)), 1, "the card polled");
 
     for _ in 0..1000 {
-        if m.cpu.pc == u64::from(RAM_BASE + 12) {
+        if m.cpu.pc == RAM_BASE + 12 {
             break;
         }
         if let Some(d) = m.pace_delay() {
@@ -320,11 +322,7 @@ fn paced_idle_cards_poll_and_break_reservations() {
         }
         m.run_for(u64::MAX, &mut |_| {});
     }
-    assert_eq!(
-        m.cpu.pc,
-        u64::from(RAM_BASE + 12),
-        "woke up at the timer and ran sc.w"
-    );
+    assert_eq!(m.cpu.pc, RAM_BASE + 12, "woke up at the timer and ran sc.w");
     assert_eq!(m.cpu.x[T3], 1, "sc.w failed");
     assert_eq!(word(&mut m, RX_BUF), 0xabab_abab);
 }
@@ -346,9 +344,9 @@ fn paced_idle_cards_break_every_harts_reservation() {
     // timer at tick 3000 (interrupts off, so no trap).
     for (id, addr) in [(0, RX_BUF), (1, RX_BUF + 32)] {
         let hart = m.cpu.hart_mut(id);
-        hart.pc = RAM_BASE.into();
+        hart.pc = RAM_BASE;
         hart.waiting = false;
-        hart.set_reg(A0 as u8, addr.into());
+        hart.set_reg(A0 as u8, addr);
         hart.x[A1] = 0x1111_1111;
         hart.csr.mie = 1 << 7; // MTIE
         m.cpu.bus.clint.mtimecmp[id] = 3000;
@@ -356,9 +354,9 @@ fn paced_idle_cards_break_every_harts_reservation() {
     // Only a few ticks of the first batch run one by one: the card polls in the skip.
     assert_eq!(m.run_for(u64::MAX, &mut |_| {}), 1000);
     assert!(m.cpu.all_idle());
-    assert_eq!(word(&mut m, NET_BASE + net::REG_RX_HEAD), 1, "the card polled");
+    assert_eq!(word(&mut m, card_reg(net::REG_RX_HEAD)), 1, "the card polled");
     for _ in 0..1000 {
-        if m.cpu.harts().iter().all(|h| h.pc == u64::from(RAM_BASE + 12)) {
+        if m.cpu.harts().iter().all(|h| h.pc == RAM_BASE + 12) {
             break;
         }
         if let Some(d) = m.pace_delay() {
@@ -367,7 +365,7 @@ fn paced_idle_cards_break_every_harts_reservation() {
         m.run_for(u64::MAX, &mut |_| {});
     }
     assert!(
-        m.cpu.harts().iter().all(|h| h.pc == u64::from(RAM_BASE + 12)),
+        m.cpu.harts().iter().all(|h| h.pc == RAM_BASE + 12),
         "both ran sc.w"
     );
     let sc: Vec<u64> = m.cpu.harts().iter().map(|h| h.x[T3]).collect();
@@ -378,8 +376,8 @@ fn paced_idle_cards_break_every_harts_reservation() {
 
 /// Where [`transmit_completions_break_every_harts_reservation`] keeps its transmit
 /// ring (one descriptor) and the frame.
-const TX_RING: u32 = RAM_BASE + 0x3000;
-const TX_BUF: u32 = RAM_BASE + 0x3100;
+const TX_RING: u64 = RAM_BASE + 0x3000;
+const TX_BUF: u64 = RAM_BASE + 0x3100;
 /// `sw t2, 0(t4)`.
 const SW_T2_T4: u32 = 0x007e_a023;
 const NOP: u32 = 0x0000_0013;
@@ -409,37 +407,31 @@ fn transmit_completions_break_every_harts_reservation() {
     bus.load(RAM_BASE + 0x100, &ringer).unwrap();
     bus.write(TX_RING, 4, TX_BUF).unwrap();
     bus.write(TX_RING + 4, 4, 0xffff_0000 | 60).unwrap(); // length 60, status not yet set
-    bus.write(NET_BASE + net::REG_TX_BASE, 4, TX_RING).unwrap();
-    bus.write(NET_BASE + net::REG_TX_SIZE, 4, 1).unwrap();
+    bus.write(card_reg(net::REG_TX_BASE), 4, TX_RING).unwrap();
+    bus.write(card_reg(net::REG_TX_SIZE), 4, 1).unwrap();
     let h0 = m.cpu.hart_mut(0);
-    h0.pc = (RAM_BASE + 0x100).into();
+    h0.pc = RAM_BASE + 0x100;
     h0.x[7] = 1; // t2: the new TX_TAIL
-    h0.x[29] = (NET_BASE + net::REG_TX_TAIL).into(); // t4
-                                                     // Hart 1 reserves the descriptor's length and status, hart 2 the frame (only read,
-                                                     // and in another 64-byte line).
+    h0.x[29] = card_reg(net::REG_TX_TAIL); // t4
+                                           // Hart 1 reserves the descriptor's length and status, hart 2 the frame (only read,
+                                           // and in another 64-byte line).
     for (id, addr) in [(1, TX_RING + 4), (2, TX_BUF)] {
         let hart = m.cpu.hart_mut(id);
-        hart.pc = RAM_BASE.into();
+        hart.pc = RAM_BASE;
         hart.waiting = false;
-        hart.set_reg(A0 as u8, addr.into());
+        hart.set_reg(A0 as u8, addr);
         hart.x[A1] = 0x1111_1111;
         hart.x[T1] = 10;
     }
     for _ in 0..200 {
         m.cpu.step();
     }
-    assert_eq!(
-        m.cpu.hart(0).pc,
-        u64::from(RAM_BASE + 0x110),
-        "hart 0 rang the doorbell"
-    );
+    assert_eq!(m.cpu.hart(0).pc, RAM_BASE + 0x110, "hart 0 rang the doorbell");
     assert!(
-        m.cpu.harts()[1..]
-            .iter()
-            .all(|h| h.pc == u64::from(RAM_BASE + 16)),
+        m.cpu.harts()[1..].iter().all(|h| h.pc == RAM_BASE + 16),
         "no trap"
     );
-    assert_eq!(word(&mut m, NET_BASE + net::REG_TX_HEAD), 1, "the frame went");
+    assert_eq!(word(&mut m, card_reg(net::REG_TX_HEAD)), 1, "the frame went");
     let sc: Vec<u64> = m.cpu.harts()[1..].iter().map(|h| h.x[T3]).collect();
     assert_eq!(sc, [1, 0], "only hart 2's line was not written");
     assert_eq!(word(&mut m, TX_RING + 4), 60, "the card's length and status stay");

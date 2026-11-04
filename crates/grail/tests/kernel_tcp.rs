@@ -768,7 +768,7 @@ fn timed_until(
                     for a in answer(&s) {
                         host.send(frame(&a));
                     }
-                    got.push((cpu.bus.read_mem(ticks, 4).unwrap(), s));
+                    got.push((cpu.bus.read_mem(ticks, 4).unwrap() as u32, s));
                 }
             }
         });

@@ -20,11 +20,11 @@ const SSIP: u64 = 1 << IRQ_S_SOFT;
 const T0: u32 = 5;
 const T1: u32 = 6;
 
-const PENDING: u32 = PLIC_BASE + 0x1000;
-const ENABLE0: u32 = PLIC_BASE + 0x2000;
-const ENABLE1: u32 = PLIC_BASE + 0x2080;
-const CLAIM0: u32 = PLIC_BASE + 0x20_0004;
-const CLAIM1: u32 = PLIC_BASE + 0x20_1004;
+const PENDING: u64 = PLIC_BASE + 0x1000;
+const ENABLE0: u64 = PLIC_BASE + 0x2000;
+const ENABLE1: u64 = PLIC_BASE + 0x2080;
+const CLAIM0: u64 = PLIC_BASE + 0x20_0004;
+const CLAIM1: u64 = PLIC_BASE + 0x20_1004;
 
 /// mcause codes of the exceptions these tests expect.
 const INSTR_ACCESS_FAULT: u64 = 1;
@@ -32,7 +32,7 @@ const LOAD_ACCESS_FAULT: u64 = 5;
 const STORE_ACCESS_FAULT: u64 = 7;
 
 /// Where `machine()` points mtvec: a run of nops past the program.
-const HANDLER: u32 = RAM_BASE + 0x40;
+const HANDLER: u64 = RAM_BASE + 0x40;
 
 const WFI: u32 = 0x1050_0073;
 
@@ -62,8 +62,8 @@ fn machine(program: &[u32]) -> (Machine, Sender<u8>) {
     let mut code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
     code.extend(std::iter::repeat_n([0x13, 0, 0, 0], 64).flatten()); // nops
     m.cpu.bus.load(RAM_BASE, &code).unwrap();
-    m.cpu.pc = RAM_BASE.into();
-    m.cpu.csr.mtvec = HANDLER.into();
+    m.cpu.pc = RAM_BASE;
+    m.cpu.csr.mtvec = HANDLER;
     let (tx, rx) = channel();
     let bus = &mut m.cpu.bus;
     bus.uart.input = Some(rx);
@@ -90,7 +90,7 @@ fn uart_byte_raises_meip_through_context_0() {
     assert_eq!(m.cpu.mip() & MEIP, 0);
 
     // Read RBR (line drops), complete: nothing pending any more.
-    assert_eq!(m.cpu.bus.read(UART_BASE, 1).unwrap(), b'a' as u32);
+    assert_eq!(m.cpu.bus.read(UART_BASE, 1).unwrap(), u64::from(b'a'));
     m.cpu.bus.write(CLAIM0, 4, 1).unwrap();
     m.cpu.step();
     assert_eq!(m.cpu.mip() & MEIP, 0);
@@ -104,18 +104,18 @@ fn context_1_raises_seip_and_traps_into_s_mode_when_delegated() {
     m.cpu.csr.mideleg = SEIP;
     m.cpu.csr.mie = SEIP;
     m.cpu.csr.mstatus = MSTATUS_SIE;
-    m.cpu.csr.stvec = (RAM_BASE + 0x100).into();
+    m.cpu.csr.stvec = RAM_BASE + 0x100;
 
     m.cpu.step(); // one nop, nothing pending
-    assert_eq!(m.cpu.pc, u64::from(RAM_BASE + 4));
+    assert_eq!(m.cpu.pc, RAM_BASE + 4);
 
     tx.send(b'z').unwrap();
     m.cpu.step();
     assert_eq!(m.cpu.mip() & (MEIP | SEIP), SEIP);
     assert_eq!(m.cpu.mode, Mode::S);
-    assert_eq!(m.cpu.pc, u64::from(RAM_BASE + 0x100));
+    assert_eq!(m.cpu.pc, RAM_BASE + 0x100);
     assert_eq!(m.cpu.csr.scause, INTERRUPT_BIT | u64::from(IRQ_S_EXT));
-    assert_eq!(m.cpu.csr.sepc, u64::from(RAM_BASE + 4));
+    assert_eq!(m.cpu.csr.sepc, RAM_BASE + 4);
 
     assert_eq!(m.cpu.bus.read(CLAIM0, 4).unwrap(), 0, "not enabled for context 0");
     assert_eq!(m.cpu.bus.read(CLAIM1, 4).unwrap(), 1);
@@ -127,11 +127,11 @@ fn undelegated_sei_traps_into_m_mode() {
     m.cpu.bus.write(ENABLE1, 4, 1 << 1).unwrap();
     m.cpu.mode = Mode::U;
     m.cpu.csr.mie = SEIP;
-    m.cpu.csr.mtvec = (RAM_BASE + 0x200).into();
+    m.cpu.csr.mtvec = RAM_BASE + 0x200;
     tx.send(b'z').unwrap();
     m.cpu.step();
     assert_eq!(m.cpu.mode, Mode::M);
-    assert_eq!(m.cpu.pc, u64::from(RAM_BASE + 0x200));
+    assert_eq!(m.cpu.pc, RAM_BASE + 0x200);
     assert_eq!(m.cpu.csr.mcause, INTERRUPT_BIT | u64::from(IRQ_S_EXT));
 }
 
@@ -161,7 +161,7 @@ fn meip_is_read_only_and_csrs_does_not_latch_plic_seip() {
     assert_eq!(m.cpu.csr.mip, 0);
 
     // Once the PLIC drops SEIP, mip shows nothing left over from the read-modify-writes.
-    assert_eq!(m.cpu.bus.read(UART_BASE, 1).unwrap(), b'q' as u32);
+    assert_eq!(m.cpu.bus.read(UART_BASE, 1).unwrap(), u64::from(b'q'));
     assert_eq!(m.cpu.bus.read(CLAIM1, 4).unwrap(), 1);
     assert_eq!(
         m.cpu.bus.read(CLAIM0, 4).unwrap(),
@@ -211,19 +211,19 @@ fn narrow_plic_accesses_from_the_hart_raise_access_faults() {
         store_insn(0, T0, T1, 4), // sb t0, 4(t1)
     ];
     let (mut m, _tx) = machine(&program);
-    m.cpu.x[T1 as usize] = PLIC_BASE.into();
+    m.cpu.x[T1 as usize] = PLIC_BASE;
     m.cpu.x[T0 as usize] = 7;
 
     m.cpu.step();
     assert_eq!(m.cpu.csr.mcause, LOAD_ACCESS_FAULT);
-    assert_eq!(m.cpu.csr.mtval, u64::from(PLIC_BASE + 4));
-    assert_eq!(m.cpu.csr.mepc, u64::from(RAM_BASE));
+    assert_eq!(m.cpu.csr.mtval, PLIC_BASE + 4);
+    assert_eq!(m.cpu.csr.mepc, RAM_BASE);
     assert_eq!(m.cpu.x[T0 as usize], 7, "rd not written");
 
-    m.cpu.pc = (RAM_BASE + 4).into();
+    m.cpu.pc = RAM_BASE + 4;
     m.cpu.step();
     assert_eq!(m.cpu.csr.mcause, STORE_ACCESS_FAULT);
-    assert_eq!(m.cpu.csr.mtval, u64::from(PLIC_BASE + 4));
+    assert_eq!(m.cpu.csr.mtval, PLIC_BASE + 4);
     assert_eq!(m.cpu.bus.read(PLIC_BASE + 4, 4).unwrap(), 1, "priority unchanged");
 }
 
@@ -252,12 +252,12 @@ fn assert_source_1_unclaimed(m: &mut Machine) {
 #[test]
 fn fetching_from_the_plic_is_an_access_fault_and_claims_nothing() {
     let mut m = machine_with_claimable_uart(&[]);
-    m.cpu.pc = CLAIM0.into();
+    m.cpu.pc = CLAIM0;
     m.cpu.step();
     assert_eq!(m.cpu.csr.mcause, INSTR_ACCESS_FAULT);
-    assert_eq!(m.cpu.csr.mtval, u64::from(CLAIM0));
-    assert_eq!(m.cpu.csr.mepc, u64::from(CLAIM0));
-    assert_eq!(m.cpu.pc, u64::from(HANDLER));
+    assert_eq!(m.cpu.csr.mtval, CLAIM0);
+    assert_eq!(m.cpu.csr.mepc, CLAIM0);
+    assert_eq!(m.cpu.pc, HANDLER);
     assert_source_1_unclaimed(&mut m);
 }
 
@@ -270,16 +270,13 @@ fn page_table_walks_into_the_plic_are_access_faults_and_claim_nothing() {
     let vaddr: u64 = 1 << 22;
     m.cpu.x[T1 as usize] = vaddr;
     m.cpu.csr.mstatus = MSTATUS_MPRV | (1 << MSTATUS_MPP_SHIFT);
-    m.cpu.csr.satp = (1 << 31) | u64::from((CLAIM0 & !0xfff) >> 12);
-    assert_eq!(
-        ((m.cpu.csr.satp & 0x3f_ffff) << 12) + (vaddr >> 22) * 4,
-        CLAIM0.into()
-    );
+    m.cpu.csr.satp = (1 << 31) | ((CLAIM0 & !0xfff) >> 12);
+    assert_eq!(((m.cpu.csr.satp & 0x3f_ffff) << 12) + (vaddr >> 22) * 4, CLAIM0);
 
     m.cpu.step();
     assert_eq!(m.cpu.csr.mcause, LOAD_ACCESS_FAULT);
     assert_eq!(m.cpu.csr.mtval, vaddr);
-    assert_eq!(m.cpu.csr.mepc, u64::from(RAM_BASE));
+    assert_eq!(m.cpu.csr.mepc, RAM_BASE);
     m.cpu.csr.mstatus = 0;
     m.cpu.csr.satp = 0;
     assert_source_1_unclaimed(&mut m);

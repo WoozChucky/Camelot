@@ -616,7 +616,7 @@ fn run(elf: &[u8]) -> (Machine, RunResult, String) {
 }
 
 fn ram(m: &Machine, addr: u32, len: usize) -> &[u8] {
-    let off = (addr - grail::bus::RAM_BASE) as usize;
+    let off = (u64::from(addr) - grail::bus::RAM_BASE) as usize;
     &m.cpu.bus.ram[off..off + len]
 }
 

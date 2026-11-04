@@ -7,10 +7,9 @@
 //! The three modes share one walk ([`walk`]), driven by a [`Scheme`]: how many levels,
 //! how wide a PTE is, how many bits of the virtual address index each level.
 //!
-//! The bus still takes 32-bit physical addresses and accesses of at most 4 bytes
-//! (#147 widens it): a physical address above 4 GiB is an access fault, and an
-//! 8-byte access to memory is made as two 4-byte ones, the low word first. Devices
-//! refuse 8-byte accesses.
+//! Physical addresses go to the bus as they are: one past what the machine has (RAM
+//! ends at 1 TiB, every device is below 4 GiB) is an access fault there, so the walk
+//! needs no check of its own for the 48-bit physical address width.
 
 use super::csr::{SATP_MODE_SV39, SATP_MODE_SV48, SATP_RV64_MODE_SHIFT, SATP_RV64_PPN};
 use super::{Hart, Mode};
@@ -124,15 +123,10 @@ impl WalkError {
 }
 
 /// Reads the `size`-byte (4 or 8) PTE at physical address `addr`. Page tables must live
-/// in memory: a PTE address on a device, or above the bus's 4 GiB, is an access fault.
+/// in memory ([`Bus::read_mem`]): a PTE address on a device, or where nothing is, is an
+/// access fault.
 fn read_pte(bus: &Bus, addr: u64, size: u32) -> Result<u64, BusFault> {
-    let a = bus_addr(addr, size)?;
-    let lo = bus.read_mem(a, 4)?;
-    if size == 4 {
-        return Ok(lo.into());
-    }
-    let hi = bus.read_mem(a + 4, 4)?;
-    Ok(u64::from(lo) | u64::from(hi) << 32)
+    bus.read_mem(addr, size)
 }
 
 /// Walks the page table rooted at physical page `root` for `vaddr`, down to its leaf,
@@ -183,31 +177,6 @@ fn walk(bus: &Bus, scheme: Scheme, root: u64, vaddr: u64) -> Result<Leaf, WalkEr
         level -= 1;
         table = ppn << PAGE_SHIFT;
     }
-}
-
-/// The bus address of the `size` bytes at physical address `paddr`: the bus takes
-/// 32-bit addresses (#147 widens it), so bytes above 4 GiB are unmapped.
-fn bus_addr(paddr: u64, size: u32) -> Result<u32, BusFault> {
-    let addr = u32::try_from(paddr).map_err(|_| BusFault)?;
-    addr.checked_add(size - 1).ok_or(BusFault)?;
-    Ok(addr)
-}
-
-/// Reads `size` (1, 2, 4 or 8) bytes at physical address `paddr`, zero-extended. 8
-/// bytes are read only from RAM, VRAM or the boot ROM, as two words.
-fn read_phys(bus: &mut Bus, paddr: u64, size: u32) -> Result<u64, BusFault> {
-    let addr = bus_addr(paddr, size)?;
-    if size < 8 {
-        return bus.read(addr, size).map(u64::from);
-    }
-    // RAM or VRAM ([`Bus::is_memory`]), else the boot ROM (which `read_mem` reads too).
-    let in_rom = || bus.read_mem(addr, 4).is_ok() && bus.read_mem(addr + 4, 4).is_ok();
-    if !bus.is_memory(addr, 8) && !in_rom() {
-        return Err(BusFault);
-    }
-    let lo = bus.read(addr, 4)?;
-    let hi = bus.read(addr + 4, 4)?;
-    Ok(u64::from(lo) | u64::from(hi) << 32)
 }
 
 impl Hart {
@@ -305,8 +274,8 @@ impl Hart {
     pub fn fetch(&mut self, bus: &mut Bus, pc: u64) -> Result<u32, Trap> {
         let paddr = self.translate(bus, pc, Access::Fetch)?;
         // Only memory is executable: fetching from a device is an access fault.
-        bus_addr(paddr, 4)
-            .and_then(|a| bus.read_mem(a, 4))
+        bus.read_mem(paddr, 4)
+            .map(|word| word as u32)
             .map_err(|_| Trap::new(Access::Fetch.access_fault(), pc))
     }
 
@@ -316,8 +285,10 @@ impl Hart {
             return Err(Trap::new(Access::Load.misaligned(), vaddr));
         }
         let paddr = self.translate(bus, vaddr, Access::Load)?;
-        let v = read_phys(bus, paddr, size).map_err(|_| Trap::new(Access::Load.access_fault(), vaddr))?;
-        bus.watches.note(self.id, vaddr as u32, size, true, false);
+        let v = bus
+            .read(paddr, size)
+            .map_err(|_| Trap::new(Access::Load.access_fault(), vaddr))?;
+        bus.watches.note(self.id, vaddr, size, true, false);
         Ok(v)
     }
 
@@ -329,14 +300,14 @@ impl Hart {
         let paddr = self.translate(bus, vaddr, Access::Store)?;
         self.write_phys(bus, paddr, size, val)
             .map_err(|_| Trap::new(Access::Store.access_fault(), vaddr))?;
-        bus.watches.note(self.id, vaddr as u32, size, false, true);
+        bus.watches.note(self.id, vaddr, size, false, true);
         Ok(())
     }
 
     /// Reads `size` bytes at physical address `paddr` (an atomic's, whose address
     /// [`Hart::atomic_paddr`] checked), zero-extended.
     pub(super) fn read_phys(&self, bus: &mut Bus, paddr: u64, size: u32) -> Result<u64, BusFault> {
-        read_phys(bus, paddr, size)
+        bus.read(paddr, size)
     }
 
     /// Every write the hart makes goes through here (`sb`/`sh`/`sw`/`sd`, `sc`, AMOs,
@@ -346,8 +317,7 @@ impl Hart {
     /// start a DMA into RAM (see [`super::Reservation`]). An A/D update counts because
     /// software may be updating that PTE with `lr`/`sc`, and its `sc` must not overwrite
     /// the bit the hardware just set. Only the low `size` bytes of `val` reach the bus
-    /// (a device sees the byte an `sb` stored, not the whole register). 8 bytes are
-    /// written only to RAM or VRAM.
+    /// (a device sees the byte an `sb` stored, not the whole register).
     pub(super) fn write_phys(
         &mut self,
         bus: &mut Bus,
@@ -355,17 +325,9 @@ impl Hart {
         size: u32,
         val: u64,
     ) -> Result<(), BusFault> {
-        let addr = bus_addr(paddr, size)?;
-        if size < 8 {
-            let low_bytes = (1u64 << (8 * size)) - 1;
-            bus.write(addr, size, (val & low_bytes) as u32)?;
-        } else if bus.is_memory(addr, 8) {
-            bus.write(addr, 4, val as u32)?;
-            bus.write(addr + 4, 4, (val >> 32) as u32)?;
-        } else {
-            return Err(BusFault);
-        }
-        bus.snoop_store(self.id as usize, addr, size);
+        let low_bytes = u64::MAX >> (64 - 8 * size);
+        bus.write(paddr, size, val & low_bytes)?;
+        bus.snoop_store(self.id as usize, paddr, size);
         Ok(())
     }
 }

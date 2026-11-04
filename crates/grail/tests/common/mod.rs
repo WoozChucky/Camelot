@@ -50,7 +50,7 @@ pub struct Vm {
     pub input: Sender<u8>,
     /// The address of the packet buffer pool's free count (`free_count` in
     /// kernel/net/pbuf.c).
-    pub free_count: u32,
+    pub free_count: u64,
 }
 
 impl Vm {
@@ -83,9 +83,9 @@ impl Vm {
         let elf = grail::elf::parse(&file).unwrap();
         for (name, value) in patches {
             let addr = elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"));
-            m.cpu.bus.load(addr as u32, &value.to_le_bytes()).unwrap();
+            m.cpu.bus.load(addr, &value.to_le_bytes()).unwrap();
         }
-        let free_count = elf.symbol("free_count").expect("no symbol free_count") as u32;
+        let free_count = elf.symbol("free_count").expect("no symbol free_count");
         let (input, rx) = channel();
         m.set_uart_input(rx);
         Vm { m, input, free_count }
@@ -108,7 +108,7 @@ impl Vm {
 
     /// The 32-bit kernel variable `name`, read from RAM.
     pub fn read_var(&self, name: &str) -> u32 {
-        self.m.cpu.bus.read_mem(var_addr(name), 4).unwrap()
+        self.m.cpu.bus.read_mem(var_addr(name), 4).unwrap() as u32
     }
 
     /// Sets the 32-bit kernel variable `name` in RAM (one the kernel clears while it
@@ -119,13 +119,13 @@ impl Vm {
 }
 
 /// The address of the kernel variable `name`, looked up in kernel.elf once.
-pub fn var_addr(name: &str) -> u32 {
-    static ADDRS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+pub fn var_addr(name: &str) -> u64 {
+    static ADDRS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
     let mut addrs = ADDRS.get_or_init(Default::default).lock().unwrap();
     *addrs.entry(name.to_string()).or_insert_with(|| {
         let file = kernel_elf();
         let elf = grail::elf::parse(&file).unwrap();
-        elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}")) as u32
+        elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"))
     })
 }
 
@@ -179,7 +179,12 @@ pub fn assert_buffers_back(vm: &mut Vm) {
         vm.m.run_for(SLICE, &mut |_| {});
     }
     let free = vm.m.cpu.bus.read_mem(vm.free_count, 4).unwrap();
-    assert_eq!(free, NPBUF - NIC_RX_RING, "packet buffers leaked:\n{}", vm.out());
+    assert_eq!(
+        free,
+        u64::from(NPBUF - NIC_RX_RING),
+        "packet buffers leaked:\n{}",
+        vm.out()
+    );
 }
 
 /// Leaves the shell; the machine must stop with status 0.

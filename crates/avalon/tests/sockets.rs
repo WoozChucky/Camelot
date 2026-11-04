@@ -62,7 +62,7 @@ impl Vm {
             ("net_static_gateway", 0),
         ] {
             let addr = elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"));
-            m.cpu.bus.load(addr as u32, &u32::to_le_bytes(value)).unwrap();
+            m.cpu.bus.load(addr, &u32::to_le_bytes(value)).unwrap();
         }
         let (input, rx) = channel();
         m.set_uart_input(rx);

@@ -6,6 +6,9 @@
 //! Harts are the protocol's threads: hart `i` is thread `i + 1` (thread ids are
 //! positive; 0 means "any" and -1 "all").
 //!
+//! Registers travel as wide as the machine's harts: 4 bytes on RV32, 8 on RV64, each
+//! little-endian in hex ([`target::reg_bytes`]). Addresses are up to 64 bits.
+//!
 //! A packet the stub does not know gets an empty reply, which tells the client it is
 //! not supported. A known packet with arguments it cannot parse gets `E01`; a memory
 //! access that fails `E14` (EFAULT); a thread or hart that does not exist `E22`
@@ -15,7 +18,7 @@ use super::packet;
 use super::target::{self, Reg, GENERAL_REGS};
 use crate::cpu::Mode;
 use crate::debug::{Space, Stop, WatchKind};
-use crate::Machine;
+use crate::{Machine, Xlen};
 
 /// What to do after a packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,20 +55,23 @@ pub struct Stub {
     no_ack: bool,
     /// The client understands the `swbreak` stop reason (`qSupported`).
     swbreak: bool,
-    /// The target description, made once.
-    xml: String,
     /// The hart `c` and `s` act on, from `Hc`; `None` is "any" (the selected hart).
     resume_hart: Option<usize>,
     last_stop: StopReason,
 }
 
+impl Default for Stub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Stub {
-    /// A stub for `m`, which is stopped.
-    pub fn new(m: &Machine) -> Stub {
+    /// A stub for a machine that is stopped.
+    pub fn new() -> Stub {
         Stub {
             no_ack: false,
             swbreak: false,
-            xml: target::xml(m),
             resume_hart: None,
             last_stop: StopReason::Interrupted,
         }
@@ -114,7 +120,7 @@ impl Stub {
             StopReason::Interrupted => (2, String::new()),
         };
         // The pc comes along (register 0x20), saving the client a round trip.
-        let pc = hex_word(m.pc());
+        let pc = hex_reg(m, m.pc());
         format!("T{signal:02x}{why}thread:{:x};20:{pc};", m.selected_hart() + 1).into_bytes()
     }
 
@@ -242,7 +248,7 @@ impl Stub {
                 reply("OK")
             }
             "qXfer" => match rest.strip_prefix("features:read:target.xml:") {
-                Some(range) => self.read_xml(range),
+                Some(range) => read_xml(m, range),
                 None => reply(""),
             },
             "qfThreadInfo" => {
@@ -264,7 +270,7 @@ impl Stub {
             // LLDB's register descriptions, one per packet. LLDB builds without XML
             // support (its Windows builds) ask for these instead of target.xml.
             _ if name.starts_with("qRegisterInfo") => match usize::from_str_radix(&name[13..], 16) {
-                Ok(n) => match target::lldb_register_info(n) {
+                Ok(n) => match target::lldb_register_info(n, target::reg_bytes(m)) {
                     Some(info) => reply(&info),
                     None => Action::Reply(error(0x45)),
                 },
@@ -272,50 +278,57 @@ impl Stub {
             },
             // LLDB's: what the target is, since there is no host OS to ask.
             "qHostInfo" | "qProcessInfo" => {
-                let triple = hex_bytes(b"riscv32-unknown-unknown-elf");
+                let triple = match m.config().xlen {
+                    Xlen::Rv32 => hex_bytes(b"riscv32-unknown-unknown-elf"),
+                    Xlen::Rv64 => hex_bytes(b"riscv64-unknown-unknown-elf"),
+                };
                 let pid = if name == "qProcessInfo" { "pid:1;" } else { "" };
-                reply(&format!("{pid}triple:{triple};endian:little;ptrsize:4;"))
+                let ptrsize = target::reg_bytes(m);
+                reply(&format!("{pid}triple:{triple};endian:little;ptrsize:{ptrsize};"))
             }
             _ => reply(""),
         }
     }
-
-    /// `qXfer:features:read:target.xml:off,len`: `m` and a part of the description, or
-    /// `l` and its last part.
-    fn read_xml(&self, range: &str) -> Action {
-        let Some((off, len)) = range.split_once(',') else {
-            return Action::Reply(malformed());
-        };
-        let (Some(off), Some(len)) = (hex(off.as_bytes()), hex(len.as_bytes())) else {
-            return Action::Reply(malformed());
-        };
-        let xml = self.xml.as_bytes();
-        let start = (off as usize).min(xml.len());
-        let end = start.saturating_add(len as usize).min(xml.len());
-        let mut out = vec![if end == xml.len() { b'l' } else { b'm' }];
-        out.extend(packet::escape(&xml[start..end]));
-        Action::Reply(out)
-    }
 }
 
-/// `g`: `x0`-`x31` and `pc`, each as 4 little-endian bytes in hex.
+/// `qXfer:features:read:target.xml:off,len`: `m` and a part of the description, or `l`
+/// and its last part. The description is made at each request, so it is the machine's
+/// as it is now (a program loaded after the stub was made may have made it RV64).
+fn read_xml(m: &Machine, range: &str) -> Action {
+    let Some((off, len)) = range.split_once(',') else {
+        return Action::Reply(malformed());
+    };
+    let (Some(off), Some(len)) = (hex(off.as_bytes()), hex(len.as_bytes())) else {
+        return Action::Reply(malformed());
+    };
+    let xml = target::xml(m);
+    let xml = xml.as_bytes();
+    let start = (off as usize).min(xml.len());
+    let end = start.saturating_add(len as usize).min(xml.len());
+    let mut out = vec![if end == xml.len() { b'l' } else { b'm' }];
+    out.extend(packet::escape(&xml[start..end]));
+    Action::Reply(out)
+}
+
+/// `g`: `x0`-`x31` and `pc`, each little-endian in hex.
 fn read_general(m: &Machine) -> Action {
-    let mut s = String::with_capacity(GENERAL_REGS * 8);
+    let mut s = String::with_capacity(GENERAL_REGS * 2 * target::reg_bytes(m));
     for r in 0..32 {
-        s.push_str(&hex_word(m.reg(r)));
+        s.push_str(&hex_reg(m, m.reg(r)));
     }
-    s.push_str(&hex_word(m.pc()));
+    s.push_str(&hex_reg(m, m.pc()));
     reply(&s)
 }
 
 /// `G data`: writes as many of `g`'s registers as `data` holds.
 fn write_general(m: &mut Machine, args: &[u8]) -> Result<Action, Vec<u8>> {
     let bytes = unhex_bytes(args).ok_or_else(malformed)?;
-    if !bytes.len().is_multiple_of(4) || bytes.len() > GENERAL_REGS * 4 {
+    let width = target::reg_bytes(m);
+    if !bytes.len().is_multiple_of(width) || bytes.len() > GENERAL_REGS * width {
         return Err(malformed());
     }
-    for (i, w) in bytes.chunks(4).enumerate() {
-        let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+    for (i, w) in bytes.chunks(width).enumerate() {
+        let v = le(w);
         if i == target::PC {
             m.set_pc(v);
         } else {
@@ -332,9 +345,9 @@ fn read_register(m: &Machine, args: &[u8]) -> Result<Action, Vec<u8>> {
         Reg::X(r) => m.reg(r),
         Reg::Pc => m.pc(),
         Reg::Csr(a) => m.csr(a).ok_or_else(|| error(1))?,
-        Reg::Priv => m.mode() as u32,
+        Reg::Priv => m.mode() as u64,
     };
-    Ok(reply(&hex_word(v)))
+    Ok(reply(&hex_reg(m, v)))
 }
 
 /// `P n=value`.
@@ -342,10 +355,10 @@ fn write_register(m: &mut Machine, args: &[u8]) -> Result<Action, Vec<u8>> {
     let i = args.iter().position(|&b| b == b'=').ok_or_else(malformed)?;
     let n = hex(&args[..i]).ok_or_else(malformed)? as usize;
     let bytes = unhex_bytes(&args[i + 1..]).ok_or_else(malformed)?;
-    let [a, b, c, d] = bytes[..] else {
+    if bytes.len() != target::reg_bytes(m) {
         return Err(malformed());
-    };
-    let v = u32::from_le_bytes([a, b, c, d]);
+    }
+    let v = le(&bytes);
     match Reg::from_number(n).ok_or_else(|| error(1))? {
         Reg::X(r) => m.set_reg(r, v),
         Reg::Pc => m.set_pc(v),
@@ -354,13 +367,13 @@ fn write_register(m: &mut Machine, args: &[u8]) -> Result<Action, Vec<u8>> {
                 return Err(error(1));
             }
         }
-        Reg::Priv => m.set_mode(Mode::from_bits(v.into())),
+        Reg::Priv => m.set_mode(Mode::from_bits(v)),
     }
     Ok(reply("OK"))
 }
 
 /// `addr,len` of the memory packets.
-fn addr_len(args: &[u8]) -> Option<(u32, usize)> {
+fn addr_len(args: &[u8]) -> Option<(u64, usize)> {
     let i = args.iter().position(|&b| b == b',')?;
     Some((hex(&args[..i])?, hex(&args[i + 1..])? as usize))
 }
@@ -414,7 +427,7 @@ fn point(m: &mut Machine, set: bool, args: &[u8]) -> Result<Action, Vec<u8>> {
     let watch = match ty {
         b"0" | b"1" => {
             if set {
-                m.set_breakpoint(addr);
+                m.set_breakpoint(addr).map_err(|_| error(22))?;
             } else {
                 m.clear_breakpoint(addr);
             }
@@ -458,21 +471,26 @@ fn malformed() -> Vec<u8> {
     error(1)
 }
 
-/// A hex number, at most 32 bits.
-fn hex(s: &[u8]) -> Option<u32> {
-    if s.is_empty() || s.len() > 8 {
+/// A hex number, at most 64 bits.
+fn hex(s: &[u8]) -> Option<u64> {
+    if s.is_empty() || s.len() > 16 {
         return None;
     }
-    u32::from_str_radix(std::str::from_utf8(s).ok()?, 16).ok()
+    u64::from_str_radix(std::str::from_utf8(s).ok()?, 16).ok()
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A register's value: its 4 bytes, little-endian, in hex.
-fn hex_word(v: u32) -> String {
-    hex_bytes(&v.to_le_bytes())
+/// A register's value as `m`'s harts hold it: its 4 or 8 bytes, little-endian, in hex.
+fn hex_reg(m: &Machine, v: u64) -> String {
+    hex_bytes(&v.to_le_bytes()[..target::reg_bytes(m)])
+}
+
+/// Little-endian bytes (at most 8) as a number.
+fn le(bytes: &[u8]) -> u64 {
+    bytes.iter().rev().fold(0, |v, &b| v << 8 | u64::from(b))
 }
 
 fn unhex_bytes(s: &[u8]) -> Option<Vec<u8>> {
@@ -487,8 +505,14 @@ fn unhex_bytes(s: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::RAM_BASE;
     use crate::MachineConfig;
+
+    const RAM_BASE: u64 = crate::bus::RAM_BASE;
+
+    /// A 32-bit register's value as an RV32 machine's packets carry it.
+    fn hex_word(v: u32) -> String {
+        hex_bytes(&v.to_le_bytes())
+    }
 
     /// A machine of `harts` harts with 64 KiB of RAM, and its stub.
     fn setup(harts: usize) -> (Machine, Stub) {
@@ -497,7 +521,7 @@ mod tests {
             ..MachineConfig::with_ram(64 * 1024)
         };
         let m = Machine::new(config).unwrap();
-        let stub = Stub::new(&m);
+        let stub = Stub::new();
         (m, stub)
     }
 
@@ -530,7 +554,7 @@ mod tests {
             "m1000",
             "m1000,",
             "mzz,4",
-            "m123456789,4",
+            "m12345678901234567,4",
             "M1000,4",
             "M1000,4:12",
             "M1000,2:1234zz",
@@ -670,7 +694,7 @@ mod tests {
         for r in 1..32u32 {
             all.push_str(&hex_word(r * 0x100));
         }
-        all.push_str(&hex_word(RAM_BASE + 8));
+        all.push_str(&hex_word(RAM_BASE as u32 + 8));
         assert_eq!(ask(&mut m, &mut stub, &format!("G{all}")), "OK");
         assert_eq!(m.reg(31), 0x1f00);
         assert_eq!(m.pc(), RAM_BASE + 8);
@@ -698,10 +722,10 @@ mod tests {
             "length mismatch"
         );
         // The boot ROM reads; device registers and holes do not.
-        m.cpu.bus.set_boot_entry(RAM_BASE);
+        m.cpu.bus.set_boot_entry(crate::bus::RAM_BASE);
         assert_eq!(
             ask(&mut m, &mut stub, "m1000,4"),
-            hex_word(m.cpu.bus.read_mem(0x1000, 4).unwrap())
+            hex_word(m.cpu.bus.read_mem(0x1000, 4).unwrap() as u32)
         );
         assert_ne!(ask(&mut m, &mut stub, "m1000,4"), "00000000");
         assert_eq!(ask(&mut m, &mut stub, "m10000000,1"), "E0e", "UART");
@@ -724,7 +748,7 @@ mod tests {
         // 0x4000_0000 onto RAM (PPN 0x80000), readable, in S-mode with paging on.
         let root = RAM_BASE + 0x1000;
         let pte: u32 = (0x80000 << 10) | 0b1111; // V R W X
-        let slot = root + (0x4000_0000u32 >> 22) * 4;
+        let slot = root + (0x4000_0000u64 >> 22) * 4;
         m.write_memory(slot, &pte.to_le_bytes(), Space::Physical);
         m.write_memory(RAM_BASE, &[0xaa, 0xbb], Space::Physical);
         assert!(m.set_csr(0x180, (1 << 31) | (root >> 12)));
@@ -774,7 +798,10 @@ mod tests {
         assert_eq!(ask(&mut m, &mut stub, "Hg2"), "OK");
         assert_eq!(m.selected_hart(), 1);
         assert_eq!(ask(&mut m, &mut stub, "qC"), "QC2");
-        assert_eq!(ask(&mut m, &mut stub, "p20"), hex_word(crate::bus::PARK_PC));
+        assert_eq!(
+            ask(&mut m, &mut stub, "p20"),
+            hex_word(crate::bus::PARK_PC as u32)
+        );
         assert_eq!(ask(&mut m, &mut stub, "Hg0"), "OK", "any: unchanged");
         assert_eq!(m.selected_hart(), 1);
         assert_eq!(ask(&mut m, &mut stub, "Hg3"), "E16");
@@ -799,6 +826,137 @@ mod tests {
         assert_eq!(stub.handle(&mut m, b"vKill;1"), Action::Kill);
         assert_eq!(stub.handle(&mut m, b"D"), Action::Detach);
         assert_eq!(stub.handle(&mut m, b"D;1"), Action::Detach);
+    }
+
+    /// An RV64 machine of `ram` bytes, and its stub.
+    fn setup64(ram: usize) -> (Machine, Stub) {
+        let m = Machine::new(MachineConfig {
+            xlen: crate::Xlen::Rv64,
+            ..MachineConfig::with_ram(ram)
+        })
+        .unwrap();
+        let stub = Stub::new();
+        (m, stub)
+    }
+
+    #[test]
+    fn an_rv64_machine_has_64_bit_registers_and_addresses() {
+        // 6 GiB of RAM (lazily backed: only what is touched costs), so that memory
+        // past 4 GiB can be read and written.
+        let (mut m, mut stub) = setup64(6 << 30);
+        m.set_reg(1, 0x1122_3344_5566_7788);
+        let g = ask(&mut m, &mut stub, "g");
+        assert_eq!(g.len(), 33 * 16);
+        assert_eq!(&g[16..32], "8877665544332211");
+        assert_eq!(&g[32 * 16..], "0010000000000000", "pc = 0x1000");
+        assert_eq!(ask(&mut m, &mut stub, "p1"), "8877665544332211");
+        // misa: MXL = 2 in its top bits.
+        let misa = ask(&mut m, &mut stub, &format!("p{:x}", 65 + 0x301));
+        assert_eq!(
+            misa,
+            hex_bytes(&crate::cpu::misa(crate::Xlen::Rv64).to_le_bytes())
+        );
+        assert_eq!(ask(&mut m, &mut stub, "p1041"), "0300000000000000", "M-mode");
+        assert_eq!(ask(&mut m, &mut stub, "P5=efcdab8967452301"), "OK");
+        assert_eq!(m.reg(5), 0x0123_4567_89ab_cdef);
+        assert_eq!(
+            ask(&mut m, &mut stub, "P5=78563412"),
+            "E01",
+            "4 bytes for a 64-bit register"
+        );
+        let mut all = String::new();
+        for r in 0..32u64 {
+            all.push_str(&hex_bytes(&(r << 40).to_le_bytes()));
+        }
+        all.push_str(&hex_bytes(&(RAM_BASE + 8).to_le_bytes()));
+        assert_eq!(ask(&mut m, &mut stub, &format!("G{all}")), "OK");
+        assert_eq!(m.reg(31), 31 << 40);
+        assert_eq!(m.pc(), RAM_BASE + 8);
+        assert_eq!(ask(&mut m, &mut stub, "g"), all);
+        // Memory past 4 GiB, in M-mode where addresses are physical.
+        let high = RAM_BASE + (5 << 30);
+        assert_eq!(ask(&mut m, &mut stub, &format!("M{high:x},2:abcd")), "OK");
+        assert_eq!(ask(&mut m, &mut stub, &format!("m{high:x},2")), "abcd");
+        // Breakpoints and watchpoints anywhere in the 64-bit space.
+        assert_eq!(ask(&mut m, &mut stub, "Z0,ffffffc000001000,4"), "OK");
+        assert_eq!(m.breakpoints().collect::<Vec<_>>(), [0xffff_ffc0_0000_1000]);
+        assert_eq!(ask(&mut m, &mut stub, "Z2,fffffffffffffff8,8"), "OK");
+        assert_eq!(
+            ask(&mut m, &mut stub, "Z2,fffffffffffffffc,8"),
+            "E16",
+            "past 2^64"
+        );
+        // The stop reply's pc is 8 bytes.
+        let r = stub.stopped(
+            &mut m,
+            StopReason::Machine(Stop::Breakpoint {
+                hart: 0,
+                pc: 0xffff_ffc0_0000_1000,
+            }),
+        );
+        assert_eq!(r, b"T05thread:1;20:0800008000000000;");
+        let host = ask(&mut m, &mut stub, "qHostInfo");
+        assert!(
+            host.contains(&hex_bytes(b"riscv64-unknown-unknown-elf")),
+            "{host}"
+        );
+        assert!(host.ends_with("ptrsize:8;"), "{host}");
+        assert!(ask(&mut m, &mut stub, "qRegisterInfo1").contains("bitsize:64;offset:8;"));
+    }
+
+    /// The whole target description `stub` gives for `m`, read in parts as a client does.
+    fn read_description(m: &mut Machine, stub: &mut Stub) -> String {
+        let mut xml = String::new();
+        loop {
+            let part = ask(
+                m,
+                stub,
+                &format!("qXfer:features:read:target.xml:{:x},800", xml.len()),
+            );
+            xml.push_str(&part[1..]);
+            if part.starts_with('l') {
+                return xml;
+            }
+            assert!(part.starts_with('m'), "{part}");
+        }
+    }
+
+    #[test]
+    fn the_description_is_the_machines_as_it_is_asked_for() {
+        // The stub keeps no description of its own: it describes the machine it is
+        // handed at each request, so it cannot describe a machine that is no longer so.
+        let (mut m32, mut stub) = setup(1);
+        let (mut m64, _) = setup64(64 * 1024);
+        let xml = read_description(&mut m32, &mut stub);
+        assert!(xml.contains("<architecture>riscv:rv32</architecture>"));
+        assert_eq!(xml, target::xml(&m32));
+        let xml = read_description(&mut m64, &mut stub);
+        assert!(xml.contains("<architecture>riscv:rv64</architecture>"));
+        assert_eq!(xml, target::xml(&m64));
+    }
+
+    #[test]
+    fn an_rv32_machine_has_no_addresses_past_4_gib() {
+        let (mut m, mut stub) = setup(1);
+        assert_eq!(ask(&mut m, &mut stub, "m100001000,4"), "E0e");
+        assert_eq!(ask(&mut m, &mut stub, "Z2,fffffffc,4"), "OK");
+        assert_eq!(ask(&mut m, &mut stub, "Z2,fffffffe,4"), "E16", "past 2^32");
+        assert_eq!(ask(&mut m, &mut stub, "Z0,fffffffc,4"), "OK");
+        assert_eq!(
+            ask(&mut m, &mut stub, "Z0,100001000,4"),
+            "E16",
+            "a breakpoint past 2^32"
+        );
+        assert_eq!(m.breakpoints().collect::<Vec<_>>(), [0xffff_fffc]);
+        assert_eq!(
+            ask(&mut m, &mut stub, "P5=efcdab8967452301"),
+            "E01",
+            "8 bytes for a 32-bit register"
+        );
+        // A value too wide for the hart's registers keeps its low 32 bits.
+        m.set_reg(6, 0x1_2345_6789);
+        assert_eq!(m.reg(6), 0x2345_6789);
+        assert_eq!(ask(&mut m, &mut stub, "p6"), "89674523");
     }
 
     #[test]

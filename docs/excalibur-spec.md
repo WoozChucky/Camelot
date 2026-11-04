@@ -291,9 +291,9 @@ Camelot uses Sv48: 128 TiB of user address space and as much for the kernel, for
 
 **RV32:** Sv32 walks 2 levels of 1024 4-byte PTEs (PPN in bits 31:10) with 4 MiB megapages, and has no canonical-address rule. Its 22-bit PPNs make 34-bit physical addresses: a table or a page at or above 4 GiB is an access fault, as there is nothing there.
 
-RAM: `--ram SIZE` takes a whole number of MiB, or a number with a unit, `M`/`MiB` or `G`/`GiB`, case-insensitive (`--ram 64`, `--ram 64M`, `--ram 16G`).
+RAM: `--ram SIZE` takes a whole number of MiB, or a number with a unit, `M`/`MiB`, `G`/`GiB` or `T`/`TiB`, case-insensitive (`--ram 64`, `--ram 64M`, `--ram 16G`, `--ram 1T`). Avalon's RAM budget (`--max-ram`, and Pendragon's `--avalon-max-ram`) takes the same syntax, with no upper limit.
 - **Limits:** from 1 MiB to 1 TiB, the memory controller's limit. Anything else is rejected with an error. RV32: 1 to 2048 MiB, the most that fits between 0x8000_0000 and the top of the 32-bit address space.
-- **Lazy backing:** as QEMU does, Grail backs RAM lazily. It reserves the size in the host's address space and commits host memory a page at a time, the first time the guest touches the page, so a large machine costs the host only what its guest uses. A size the host cannot reserve is refused when the machine is made.
+- **Lazy backing:** as QEMU does, Grail backs RAM lazily. It reserves the size in the host's address space and commits host memory a page at a time (64 KiB at a time on Windows), the first time the guest touches the page, so a large machine costs the host only what its guest uses. A size the host cannot reserve is refused when the machine is made.
 - **Default:** without `--ram` a machine has 4 MiB, as does a VM on Avalon whose profile leaves the size at its default (`avalon_proto::DEFAULT_RAM_SIZE`, Round Table's and Pendragon's `--ram`). That is enough for Camelot booted from its root image ("Kernel filesystem", "Root image"), and for every example. Programs that need more say so with `--ram`.
 - **As a library**, Grail accepts any non-zero multiple of 4 KiB up to 1 TiB (RV32: 2 GiB).
 - **Avalon's RAM budget** counts each VM's installed size, what it may use, not what it has touched so far, so the budget stays a guarantee with lazily backed RAM.
@@ -347,6 +347,7 @@ The whole 64 KiB area is the boot block's to use (stack, buffers); the RAM below
 
 Debugging: a machine can be debugged through Grail's debug interface (`grail::debug`), and over TCP with the GDB remote serial protocol (`grail --gdb ADDR`, with `--gdb-wait` to start stopped at the first instruction; `docs/merlin-dbg.md` lists the packets). The rules:
 
+- **Width:** the interface and the stub are as wide as the machine. Addresses, registers, the pc and CSRs are 64-bit values; on an RV32 machine they are its 32-bit ones (registers read as their low 32 bits), and a virtual address past 4 GiB is not in its address space. The stub describes `riscv:rv32` or `riscv:rv64`, with registers of that width.
 - **Breakpoints** are held by the emulator, not written into memory. A hart stops before executing an instruction whose virtual address has one, when it is about to execute it rather than take an interrupt or wait in `wfi`.
 - **Watchpoints** stop the machine right after a load, store, `lr`, successful `sc` or AMO of any hart touches a watched virtual address range. Fetches, page-table walks and device DMA don't count.
 - **Stops** happen between two harts' turns of a step, and the machine resumes at the turn where it stopped. Resuming first executes the instruction a hart stopped at, even if it has a breakpoint.
@@ -649,7 +650,7 @@ An Ethernet card, so machines can network. It sends and receives raw Ethernet II
 
 The ring bases are 64-bit registers; the others are 32-bit.
 
-**Descriptors** are 16 bytes, little-endian like everything else, and naturally aligned: a ring's `BASE` is a multiple of 16, as virtio requires of its descriptor table (an e1000 wants 128). A `BASE` that is not is refused: the register keeps the value written (it reads back), the ring's `SIZE` becomes 0, and `NET_ERROR` becomes 4. Alignment depends only on the low bits, so a `BASE` written by halves is checked the same way whichever half comes first:
+**Descriptors** are 16 bytes, little-endian like everything else, and naturally aligned: a ring's `BASE` is a multiple of 16, as virtio requires of its descriptor table (an e1000 wants 128). A `BASE` that is not is refused: the register keeps the value written (it reads back), the ring's `SIZE` becomes 0, and `NET_ERROR` becomes 4; so is a non-zero `SIZE` written while `BASE` is not a multiple of 16. Alignment depends only on the low bits, so a `BASE` written by halves is checked the same way whichever half comes first:
 
 | Offset | Field | Notes |
 |---|---|---|

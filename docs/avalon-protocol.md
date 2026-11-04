@@ -112,7 +112,7 @@ Round Table and Herald take a VM argument that is all digits as an id, anything 
 
 | Field | Type | Meaning |
 |---|---|---|
-| `ram_size` | `u64` | RAM in bytes: a non-zero multiple of 4 KiB, at most 2 GiB (Excalibur spec section 7). The protocol has no default; `HardwareProfile::default()` and the clients have Grail's, 4 MiB (`DEFAULT_RAM_SIZE`) |
+| `ram_size` | `u64` | RAM in bytes: a non-zero multiple of 4 KiB, at most 1 TiB, or 2 GiB for an RV32 VM (Excalibur spec section 7, "RAM"). Until the protocol carries a width (#158), a VM is RV64 if its program is ELF64 and RV32 otherwise, booting from disk included. Avalon's RAM budget counts the whole size, lazily backed or not. The protocol has no default; `HardwareProfile::default()` and the clients have Grail's, 4 MiB (`DEFAULT_RAM_SIZE`) |
 | `clock_hz` | `option<u32>` | real-time clock in instructions per second; none = run at full speed |
 | `nominal_hz` | `u32` | clock reported to the guest when `clock_hz` is none (Grail's default: 10 000 000) |
 | `harts` | `u32` | number of harts, 1 to 8 (Excalibur spec section 7, "Harts"; Grail's default: 1). The clock is per hart |

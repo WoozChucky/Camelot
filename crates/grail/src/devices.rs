@@ -79,35 +79,40 @@ impl Clint {
         }
     }
 
-    pub fn read(&mut self, off: u32, size: u32) -> Result<u32, BusFault> {
-        if size != 4 {
-            return Err(BusFault);
-        }
-        let half = |v: u64, high: bool| if high { (v >> 32) as u32 } else { v as u32 };
-        Ok(match self.reg(off) {
-            ClintReg::Msip(hart) => self.msip[hart] as u32,
-            ClintReg::Mtimecmp { hart, high } => half(self.mtimecmp[hart], high),
-            ClintReg::Mtime { high } => half(self.mtime, high),
-            ClintReg::Reserved => 0,
+    /// Reads a register. `msip` is 32-bit, so it takes 4-byte reads only; `mtimecmp`
+    /// and `mtime` are 64-bit, read whole with an 8-byte read or by their 4-byte halves
+    /// (spec section 7). Reserved offsets read as 0 at either width.
+    pub fn read(&mut self, off: u32, size: u32) -> Result<u64, BusFault> {
+        let half = |v: u64, high: bool| if high { v >> 32 } else { v & 0xffff_ffff };
+        Ok(match (self.reg(off), size) {
+            (ClintReg::Msip(hart), 4) => self.msip[hart] as u64,
+            (ClintReg::Mtimecmp { hart, high }, 4) => half(self.mtimecmp[hart], high),
+            (ClintReg::Mtimecmp { hart, high: false }, 8) => self.mtimecmp[hart],
+            (ClintReg::Mtime { high }, 4) => half(self.mtime, high),
+            (ClintReg::Mtime { high: false }, 8) => self.mtime,
+            (ClintReg::Reserved, 4 | 8) => 0,
+            _ => return Err(BusFault),
         })
     }
 
-    pub fn write(&mut self, off: u32, size: u32, val: u32) -> Result<(), BusFault> {
-        if size != 4 {
-            return Err(BusFault);
-        }
+    /// Writes a register, with the widths [`Clint::read`] takes. A 4-byte write to one
+    /// half of a 64-bit register leaves the other half as it was.
+    pub fn write(&mut self, off: u32, size: u32, val: u64) -> Result<(), BusFault> {
         let set_half = |old: &mut u64, high: bool| {
             *old = if high {
-                (*old & 0xffff_ffff) | ((val as u64) << 32)
+                (*old & 0xffff_ffff) | (val << 32)
             } else {
-                (*old & !0xffff_ffff) | val as u64
+                (*old & !0xffff_ffff) | (val & 0xffff_ffff)
             }
         };
-        match self.reg(off) {
-            ClintReg::Msip(hart) => self.msip[hart] = val & 1 != 0,
-            ClintReg::Mtimecmp { hart, high } => set_half(&mut self.mtimecmp[hart], high),
-            ClintReg::Mtime { high } => set_half(&mut self.mtime, high),
-            ClintReg::Reserved => {}
+        match (self.reg(off), size) {
+            (ClintReg::Msip(hart), 4) => self.msip[hart] = val & 1 != 0,
+            (ClintReg::Mtimecmp { hart, high }, 4) => set_half(&mut self.mtimecmp[hart], high),
+            (ClintReg::Mtimecmp { hart, high: false }, 8) => self.mtimecmp[hart] = val,
+            (ClintReg::Mtime { high }, 4) => set_half(&mut self.mtime, high),
+            (ClintReg::Mtime { high: false }, 8) => self.mtime = val,
+            (ClintReg::Reserved, 4 | 8) => {}
+            _ => return Err(BusFault),
         }
         Ok(())
     }
@@ -462,6 +467,35 @@ mod tests {
         c.mtimecmp[1] = 10;
         c.mtimecmp[0] = 20;
         assert_eq!(c.next_deadline(), Some(10));
+    }
+
+    #[test]
+    fn clint_64_bit_registers_take_whole_and_half_accesses() {
+        let mut c = Clint::new(2);
+        // mtimecmp[1] whole, then each half read back.
+        c.write(0x4008, 8, 0x1122_3344_5566_7788).unwrap();
+        assert_eq!(c.mtimecmp[1], 0x1122_3344_5566_7788);
+        assert_eq!(c.read(0x4008, 4), Ok(0x5566_7788));
+        assert_eq!(c.read(0x400c, 4), Ok(0x1122_3344));
+        // A half write keeps the other half; an 8-byte read sees both.
+        c.write(0x400c, 4, 0xaabb_ccdd).unwrap();
+        assert_eq!(c.read(0x4008, 8), Ok(0xaabb_ccdd_5566_7788));
+        // mtime the same way.
+        c.write(CLINT_MTIME, 8, 0x0000_0001_ffff_fffe).unwrap();
+        assert_eq!(c.mtime, 0x0000_0001_ffff_fffe);
+        assert_eq!(c.read(CLINT_MTIME + 4, 4), Ok(1));
+        assert_eq!(c.read(CLINT_MTIME, 8), Ok(0x0000_0001_ffff_fffe));
+        // msip is 32-bit: no 8-byte access, even to a pair of them.
+        assert_eq!(c.read(0, 8), Err(BusFault));
+        assert_eq!(c.write(0, 8, 1), Err(BusFault));
+        assert_eq!(c.msip, [false, false]);
+        // An 8-byte access to a register's high half straddles two registers.
+        assert_eq!(c.read(0x400c, 8), Err(BusFault));
+        assert_eq!(c.write(CLINT_MTIME + 4, 8, 0), Err(BusFault));
+        // Reserved offsets (no hart 2) read as 0 and ignore writes at either width.
+        assert_eq!(c.read(0x4010, 8), Ok(0));
+        c.write(0x4010, 8, 5).unwrap();
+        assert_eq!(c.mtimecmp, [u64::MAX, 0xaabb_ccdd_5566_7788]);
     }
 
     #[test]

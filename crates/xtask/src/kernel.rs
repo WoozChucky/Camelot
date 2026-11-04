@@ -813,7 +813,7 @@ mod tests {
                 .unwrap()
                 .symbol("user_program_count")
                 .unwrap();
-            m.cpu.bus.peek(at as u32).unwrap()
+            m.cpu.bus.peek(at).unwrap()
         };
         assert!(programs(&elf) > 0);
         assert_eq!(programs(&disk), 0);

@@ -234,8 +234,9 @@ impl Vm {
             .iter()
             .map(|d| DeviceEntry {
                 kind: d.kind as u32,
-                base: d.base,
-                size: d.size,
+                // Every device is below 4 GiB; the protocol's 32-bit fields widen with #158.
+                base: u32::try_from(d.base).expect("devices are below 4 GiB"),
+                size: u32::try_from(d.size).expect("devices are below 4 GiB"),
                 irq: d.irq,
             })
             .collect();

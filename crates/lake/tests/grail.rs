@@ -197,11 +197,11 @@ fn a_server_that_goes_away_is_an_io_error() {
             (block::REG_SECTOR, 1),
             (block::REG_COUNT, 2),
             (block::REG_DMA, RAM_BASE),
-            (block::REG_CMD, cmd),
+            (block::REG_CMD, cmd.into()),
         ] {
             dev.write(reg, 4, val, &mut ram).unwrap();
         }
-        dev.read(block::REG_ERROR, 4).unwrap()
+        dev.read(block::REG_ERROR, 4).unwrap() as u32
     };
     assert_eq!(cmd(&mut dev, block::CMD_WRITE), block::error::NONE);
     assert_eq!(cmd(&mut dev, block::CMD_READ), block::error::NONE);
@@ -219,8 +219,12 @@ fn a_server_that_goes_away_is_an_io_error() {
     }
     // The device's own checks still come first.
     dev.write(block::REG_SECTOR, 4, 100, &mut ram).unwrap();
-    dev.write(block::REG_CMD, 4, block::CMD_READ, &mut ram).unwrap();
-    assert_eq!(dev.read(block::REG_ERROR, 4).unwrap(), block::error::OUT_OF_RANGE);
+    dev.write(block::REG_CMD, 4, block::CMD_READ.into(), &mut ram)
+        .unwrap();
+    assert_eq!(
+        dev.read(block::REG_ERROR, 4).unwrap(),
+        block::error::OUT_OF_RANGE.into()
+    );
     drop(dev);
 
     // And with no server at all, the disk cannot be opened.
@@ -319,12 +323,12 @@ fn command(dev: &mut BlockDevice, ram: &mut [u8], sector: u32, cmd: u32) -> u32 
     for (reg, val) in [
         (block::REG_SECTOR, sector),
         (block::REG_COUNT, 1),
-        (block::REG_DMA, RAM_BASE),
+        (block::REG_DMA, RAM_BASE as u32),
         (block::REG_CMD, cmd),
     ] {
-        dev.write(reg, 4, val, ram).unwrap();
+        dev.write(reg, 4, val.into(), ram).unwrap();
     }
-    dev.read(block::REG_ERROR, 4).unwrap()
+    dev.read(block::REG_ERROR, 4).unwrap() as u32
 }
 
 #[test]
@@ -413,5 +417,5 @@ fn dropping_a_disk_detaches_its_image_before_returning() {
 
 #[test]
 fn lake_images_fit_a_grail_disk() {
-    assert_eq!(lake::MAX_IMAGE_SECTORS, block::MAX_SECTORS);
+    assert_eq!(lake::MAX_IMAGE_SECTORS, block::V1_MAX_SECTORS);
 }

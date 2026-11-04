@@ -78,15 +78,11 @@ pub fn parse_listen(s: &str) -> Result<SocketAddr, String> {
     avalon_proto::parse_listen(s, default_port(DEFAULT_AVALON_ADDR))
 }
 
-/// Parses a `--max-ram` value, a whole number of MiB (at least 1). Returns bytes.
+/// Parses a `--max-ram` value: MiB, or a number with a unit, `M`/`MiB`, `G`/`GiB` or
+/// `T`/`TiB` (`4096`, `64G`, `2T`), at least 1 MiB: `--ram`'s syntax without its 1 TiB
+/// limit (Grail's `parse_size`). Returns bytes.
 pub fn parse_max_ram(s: &str) -> Result<u64, String> {
-    let s = s.trim();
-    match s.parse::<u64>() {
-        Ok(mib) if mib > 0 && s.bytes().all(|b| b.is_ascii_digit()) => mib
-            .checked_mul(MIB)
-            .ok_or_else(|| format!("{mib} MiB is too large")),
-        _ => Err(format!("'{s}' is not a whole number of MiB (at least 1)")),
-    }
+    grail::parse_size(s)
 }
 
 /// A bound server, ready to [`Server::run`].
@@ -519,7 +515,8 @@ impl Shared {
     /// other request.
     fn create(&self, name: String, profile: HardwareProfile, program: &[u8]) -> Result<u32, Fail> {
         validate_name(&name).map_err(|e| Fail::new(ErrorCode::InvalidName, e))?;
-        let config = machine_config(&profile).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
+        let config =
+            machine_config(&profile, program).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
         let cards = card_configs(&name, &profile).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
         // Checked again when the cards are plugged in, in case a switch is deleted
         // meanwhile; this saves building a machine that cannot be plugged in.
@@ -629,12 +626,16 @@ impl Shared {
         cards: &[CardConfig],
         program: &[u8],
     ) -> Result<Vm, Fail> {
-        // Grail allocates RAM with no way to fail but aborting the process, so make
-        // sure the host can give it first.
-        if Vec::<u8>::new().try_reserve_exact(config.ram_size).is_err() {
+        // Grail backs RAM lazily (spec section 7, "RAM"): the size is reserved in the
+        // host's address space, not allocated, and a size the host cannot reserve is
+        // refused. Reserved here, and let go at once, so that refusal is the budget's
+        // answer, OverBudget, rather than a bad profile when the machine is built.
+        // Committing the whole size first (as an allocation would) would undo the lazy
+        // backing, and refuse any VM bigger than the host's memory.
+        if let Err(e) = grail::ram::Ram::new(config.ram_size) {
             return Err(Fail::new(
                 ErrorCode::OverBudget,
-                format!("the host cannot allocate {} of RAM", show_size(profile.ram_size)),
+                format!("{} of RAM: {e}", show_size(profile.ram_size)),
             ));
         }
         let cards = cards
@@ -1100,7 +1101,9 @@ mod tests {
     fn max_ram_values() {
         assert_eq!(parse_max_ram("1").unwrap(), MIB);
         assert_eq!(parse_max_ram(" 4096 ").unwrap(), DEFAULT_MAX_RAM);
-        for bad in ["0", "-1", "+5", "1.5", "64MiB", "", "99999999999999999999"] {
+        assert_eq!(parse_max_ram("64MiB").unwrap(), 64 * MIB);
+        assert_eq!(parse_max_ram("2T").unwrap(), 2 << 40);
+        for bad in ["0", "-1", "+5", "1.5", "64MB", "", "99999999999999999999"] {
             assert!(parse_max_ram(bad).is_err(), "{bad}");
         }
         assert!(parse_max_ram(&(u64::MAX / MIB + 1).to_string()).is_err());
