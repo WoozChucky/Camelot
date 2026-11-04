@@ -185,6 +185,10 @@ pub enum PpKind {
     /// (C99 6.10.3.3); never in the lexer's output, never in the
     /// preprocessor's.
     Placemarker,
+    /// A directive the preprocessor passes on, a whole line as `-E` writes
+    /// it (`#pragma weird a`, `#ident "x"`, as clang does); never in the
+    /// lexer's output, and nothing to the parser.
+    Directive,
 }
 
 /// A preprocessing token, as the preprocessor sees it.
@@ -569,7 +573,7 @@ pub fn finish(toks: Vec<PpToken>, end: Pos, x: Xlen) -> Result<Vec<Token>, Error
             }
             PpKind::Punct(p) => Tok::Punct(p),
             PpKind::Invalid(msg) => return Err(Error::new(t.pos, msg.clone())),
-            PpKind::Placemarker => continue,
+            PpKind::Placemarker | PpKind::Directive => continue,
         };
         out.push(Token {
             tok,

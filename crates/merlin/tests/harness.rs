@@ -69,7 +69,9 @@
 //!       cargo test -p merlin --test harness -- --ignored multi_file_clang
 //!
 //! * `predefined_macros_match_clang`: every macro merlin predefines (but
-//!   `__merlin__`) has the value clang's `-E -dM` gives it. Needs clang.
+//!   `__merlin__`) has the value clang's `-E -dM` gives it, and merlin has
+//!   every one clang has about the ISA, the ABI and the language, in C and
+//!   in assembly. Needs clang.
 //!
 //!       cargo test -p merlin --test harness -- --ignored predefined_macros
 //!
@@ -1036,30 +1038,61 @@ fn assembles_like_clang(x: Xlen) {
     assert_eq!(compare("big-frames", &big_frames_asm(x)), Ok(()));
 }
 
-/// Every macro merlin predefines but `__merlin__` is one clang predefines
-/// too, with the same value, for `-ffreestanding -std=c99` on each width
-/// (`clang -E -dM`). Needs clang.
+/// merlin's predefined macros are clang's, for `-mcmodel=medany` on each
+/// width (`clang -E -dM`), in C (`-ffreestanding -std=c99`) and in assembly
+/// (`.S`): every macro merlin predefines but `__merlin__` is one clang
+/// predefines too, with the same value, and every one clang predefines
+/// about the ISA (`__riscv*`), the ABI (`_ILP32`, `_LP64`...), the object
+/// format (`__ELF__`), the language (`__STDC*__`, `__ASSEMBLER__`) is one
+/// merlin predefines. Needs clang.
 #[test]
 #[ignore = "needs clang on PATH"]
 fn predefined_macros_match_clang() {
+    use merlin::preprocess::Lang;
+    let ours = [
+        "__ELF__",
+        "__ASSEMBLER__",
+        "__STDC__",
+        "__STDC_VERSION__",
+        "__STDC_HOSTED__",
+        "_ILP32",
+        "__ILP32__",
+        "_LP64",
+        "__LP64__",
+    ];
     for x in WIDTHS {
-        let scratch = Scratch::new(&format!("predefined-{}", width(x)));
-        let empty = scratch.path("empty.c");
-        std::fs::write(&empty, "").unwrap();
-        let out = clang(x)
-            .args(["-ffreestanding", "-std=c99", "-E", "-dM"])
-            .arg(&empty)
-            .output()
-            .expect("cannot run clang");
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        let text = String::from_utf8(out.stdout).unwrap();
-        let clang: std::collections::HashMap<&str, &str> = text
-            .lines()
-            .filter_map(|l| l.strip_prefix("#define ")?.split_once(' '))
-            .collect();
-        for (name, value) in merlin::preprocess::predefined(x) {
-            if name != "__merlin__" {
-                assert_eq!(clang.get(name), Some(&value), "{name} ({})", width(x));
+        for (lang, file, flags) in [
+            (Lang::C, "empty.c", &["-ffreestanding", "-std=c99"][..]),
+            (Lang::AssemblerWithCpp, "empty.S", &[][..]),
+        ] {
+            let what = format!("{} {lang:?}", width(x));
+            let scratch = Scratch::new(&format!("predefined-{}", width(x)));
+            let empty = scratch.path(file);
+            std::fs::write(&empty, "").unwrap();
+            let out = clang(x)
+                .arg("-mcmodel=medany")
+                .args(flags)
+                .args(["-E", "-dM"])
+                .arg(&empty)
+                .output()
+                .expect("cannot run clang");
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let text = String::from_utf8(out.stdout).unwrap();
+            let clang: std::collections::HashMap<&str, &str> = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("#define ")?.split_once(' '))
+                .collect();
+            let merlin: std::collections::HashMap<&str, &str> =
+                merlin::preprocess::predefined(x, lang).into_iter().collect();
+            for (name, value) in &merlin {
+                if *name != "__merlin__" {
+                    assert_eq!(clang.get(name), Some(value), "{name} ({what})");
+                }
+            }
+            for (name, value) in &clang {
+                if name.starts_with("__riscv") || ours.contains(name) {
+                    assert_eq!(merlin.get(name), Some(value), "{name} ({what}): merlin lacks it");
+                }
             }
         }
     }

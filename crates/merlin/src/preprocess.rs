@@ -14,7 +14,13 @@
 //!   from a macro (`#include HEADER`). Includes nest up to 200 deep.
 //!   `#pragma once` makes a file include only once; include guards
 //!   (`#ifndef X` / `#define X` ... `#endif`) work like in any compiler.
-//!   Other pragmas are ignored, as C says.
+//!   A header found next to the file that includes it is named by that
+//!   file's directory, `.` for one named without a directory, as clang
+//!   names it: `./sub/s.h` next to `b.c` (`__FILE__`, errors, line tables).
+//! * Any other pragma means nothing to merlin (C says to ignore it) and,
+//!   as in clang, is passed on, `#pragma` and its tokens unreplaced, on a
+//!   line of its own ([`PpKind::Directive`], which the parser skips), and
+//!   so is `#ident "string"` (`#sccs`), macros replaced.
 //! * `#define NAME tokens` and `#define F(a, b) tokens` (with `...` and
 //!   `__VA_ARGS__`), `#undef`. Defining a macro again is an error unless the
 //!   definitions are the same (C99 6.10.3p2), except from the command line
@@ -70,7 +76,8 @@
 //!   replaced in it, as assembly comments must. A line with only `#` is
 //!   still the null directive, and a directive's name always means the
 //!   directive, so a comment may not start with `# if` or `# define`.
-//! * `__ASSEMBLER__` is defined.
+//! * `__ASSEMBLER__` is defined, and `__STDC_VERSION__` and `__STDC_HOSTED__`
+//!   are what clang gives a `.S` file ([`predefined`]).
 //! * Pasting two tokens that do not form one (`. ## name`) is no error: they
 //!   stay two, written with nothing between them, unless the second is a
 //!   token of the macro's body with a space before it (`call f ## @plt`
@@ -172,15 +179,53 @@ pub type Loader<'a> = &'a dyn Fn(&Path) -> Option<String>;
 /// C99 for RISC-V, ILP32 on RV32 and LP64 on RV64, with plain `char`
 /// unsigned, so it says what clang says for `--target=riscv32 -mabi=ilp32`
 /// and `--target=riscv64 -mabi=lp64` (`-ffreestanding -std=c99`) about
-/// those, and `__merlin__` says who is compiling.
-pub fn predefined(x: Xlen) -> Vec<(&'static str, &'static str)> {
-    let mut macros = vec![
-        ("__STDC__", "1"),
-        ("__STDC_VERSION__", "199901L"),
-        ("__STDC_HOSTED__", "0"),
-        ("__merlin__", "1"),
-        ("__riscv", "1"),
-    ];
+/// those, and `__merlin__` says who is compiling. The ISA is the one
+/// `-march` names (`rv32ima_zicsr_zifencei`, `rv64ima_zicsr_zifencei`),
+/// and the code model `medany`, the one merlin's code follows (globals and
+/// calls through `auipc`, pc-relative, what clang's `-mcmodel=medany`
+/// writes): clang's macros for that `-march` and `-mcmodel=medany`.
+///
+/// Assembly (`lang`) also has `__ASSEMBLER__`, and the C standard clang
+/// gives a `.S` file when told none (as the sources' clang commands build
+/// them): C17, hosted.
+pub fn predefined(x: Xlen, lang: Lang) -> Vec<(&'static str, &'static str)> {
+    let mut macros = match lang {
+        Lang::C => vec![
+            ("__STDC__", "1"),
+            ("__STDC_VERSION__", "199901L"),
+            ("__STDC_HOSTED__", "0"),
+        ],
+        Lang::AssemblerWithCpp => vec![
+            ("__STDC__", "1"),
+            ("__STDC_VERSION__", "201710L"),
+            ("__STDC_HOSTED__", "1"),
+            ("__ASSEMBLER__", "1"),
+        ],
+    };
+    macros.extend([("__merlin__", "1"), ("__ELF__", "1"), ("__riscv", "1")]);
+    // The ISA, as clang 23 says it: each extension as `__riscv_<name>` with
+    // its version (2.1 is 2001000; M brings Zmmul, A brings Zaamo and
+    // Zalrsc), and what they add up to (`mul`, `div`, `atomic`...), the same
+    // on both widths; soft-float, no misaligned accesses.
+    macros.extend([
+        ("__riscv_i", "2001000"),
+        ("__riscv_m", "2000000"),
+        ("__riscv_a", "2001000"),
+        ("__riscv_zicsr", "2000000"),
+        ("__riscv_zifencei", "2000000"),
+        ("__riscv_zmmul", "1000000"),
+        ("__riscv_zaamo", "1000000"),
+        ("__riscv_zalrsc", "1000000"),
+        ("__riscv_mul", "1"),
+        ("__riscv_div", "1"),
+        ("__riscv_muldiv", "1"),
+        ("__riscv_atomic", "1"),
+        ("__riscv_arch_test", "1"),
+        ("__riscv_float_abi_soft", "1"),
+        ("__riscv_misaligned_avoid", "1"),
+        ("__riscv_v_intrinsic", "1000000"),
+        ("__riscv_cmodel_medany", "1"),
+    ]);
     match x {
         Xlen::Rv32 => macros.extend([("__riscv_xlen", "32"), ("_ILP32", "1"), ("__ILP32__", "1")]),
         Xlen::Rv64 => macros.extend([("__riscv_xlen", "64"), ("_LP64", "1"), ("__LP64__", "1")]),
@@ -899,13 +944,10 @@ impl Pp<'_> {
     fn run(&mut self, src: &str) -> Result<(Vec<PTok>, Pos), Error> {
         // The predefined macros, then -D and -U, as directives of their own
         // files.
-        let mut builtin: String = predefined(self.opts.xlen)
+        let mut builtin: String = predefined(self.opts.xlen, self.opts.lang)
             .iter()
             .map(|(name, value)| format!("#define {name} {value}\n"))
             .collect();
-        if self.asm {
-            builtin.push_str("#define __ASSEMBLER__ 1\n");
-        }
         builtin.push_str("#define __FILE__\n#define __LINE__\n");
         self.read_directives("<built-in>", &builtin)?;
         self.macros.get_mut("__FILE__").expect("defined above").kind = MacroKind::File;
@@ -1086,6 +1128,11 @@ impl Pp<'_> {
             let Some(mut t) = self.next_raw(false)? else {
                 return Ok(None);
             };
+            if t.t.kind == PpKind::Directive {
+                // A line of its own: what an empty expansion leaves is for
+                // the token after it.
+                return Ok(Some(t));
+            }
             let (bol, space, lead) = std::mem::take(&mut self.carry);
             t.t.bol |= bol;
             t.t.space |= space;
@@ -1431,9 +1478,38 @@ impl Pp<'_> {
                 if matches!(args, [t] if t.ident() == Some("once")) {
                     let file = self.stack.last().expect("a file").file;
                     self.once.insert(self.files[file as usize].path.clone());
+                    return Ok(());
                 }
-                // Other pragmas mean nothing to merlin, and C says to ignore them.
+                // Any other means nothing to merlin (C says to ignore it),
+                // and goes on as clang passes it on: `#pragma`, its tokens
+                // unreplaced, one space where the source had any.
+                let mut text = String::from("#pragma");
+                for (i, t) in args.iter().enumerate() {
+                    if i == 0 || t.space {
+                        text.push(' ');
+                    }
+                    text.push_str(&t.text);
+                }
+                self.pass_on(&hash, text);
                 Ok(())
+            }
+            "ident" | "sccs" => {
+                // `#ident "string"` (macros replaced; anything after the
+                // string is ignored, clang warns of it), passed on as
+                // `#ident` in both spellings, as clang does.
+                let toks = args.iter().cloned().map(PTok::read).collect();
+                let expanded = self.expand_alone(toks)?;
+                match expanded.first() {
+                    Some(s) if s.t.kind == PpKind::Str => {
+                        let text = format!("#ident {}", s.t.text);
+                        self.pass_on(&hash, text);
+                        Ok(())
+                    }
+                    other => Err(Error::new(
+                        other.map_or(first.end, |t| t.t.pos),
+                        "invalid #ident directive",
+                    )),
+                }
             }
             "line" => self.line(first, args),
             _ => {
@@ -1444,6 +1520,26 @@ impl Pp<'_> {
                 ))
             }
         }
+    }
+
+    /// Passes a directive on to the output as one line of `text`, in column
+    /// 1 of the line of its `#` ([`PpKind::Directive`]).
+    fn pass_on(&mut self, hash: &PpToken, text: String) {
+        let pos = Pos { col: 1, ..hash.pos };
+        self.pending.push_back(PTok {
+            t: PpToken {
+                kind: PpKind::Directive,
+                text,
+                pos,
+                end: hash.end,
+                bol: true,
+                space: false,
+            },
+            hide: HideSet::default(),
+            site: None,
+            spelled: None,
+            lead: false,
+        });
     }
 
     /// The name a `#define`, `#undef`, `#ifdef` or `#ifndef` is about.
@@ -1581,10 +1677,14 @@ impl Pp<'_> {
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_default();
+            // Named by the including file's directory, `.` for one named
+            // without (clang: `./sub/s.h` next to `b.S`, the `__FILE__` in it
+            // too; on Windows clang writes `.\sub/s.h`, merlin `/` on both).
             let shown = Path::new(&self.files[cur].name)
                 .parent()
                 .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| ".".to_string());
             dirs.push((shown, dir));
         }
         for d in &self.opts.include_dirs {
@@ -2467,7 +2567,7 @@ puts( "The first, second, and third items." );
         );
         assert_eq!(
             pp_with(&[("h.h", "__FILE__ __LINE__")], "#include \"h.h\""),
-            same(r#""h.h" 1"#)
+            same(r#""./h.h" 1"#)
         );
         // #line renumbers, and renames.
         assert_eq!(
@@ -2558,7 +2658,7 @@ puts( "The first, second, and third items." );
         assert_eq!(pp_with(&files, src), same("int g; int o; int t; int t;"));
         assert_eq!(
             err_with(&files, "#include \"self.h\""),
-            "self.h:1:10: error: #include nested too deeply"
+            "./self.h:1:10: error: #include nested too deeply"
         );
     }
 
@@ -2567,17 +2667,17 @@ puts( "The first, second, and third items." );
         let files = [("bad.h", "\n#if 1\n"), ("worse.h", "#error stop  here")];
         assert_eq!(
             err_with(&files, "#include \"bad.h\""),
-            "bad.h:2:2: error: unterminated conditional directive"
+            "./bad.h:2:2: error: unterminated conditional directive"
         );
         assert_eq!(
             err_with(&files, "#include \"worse.h\""),
-            "worse.h:1:2: error: #error stop here"
+            "./worse.h:1:2: error: #error stop here"
         );
         // A conditional must end in the file that opened it.
         let files = [("end.h", "#endif\n")];
         assert_eq!(
             err_with(&files, "#if 1\n#include \"end.h\"\n#endif"),
-            "end.h:1:2: error: #endif without #if"
+            "./end.h:1:2: error: #endif without #if"
         );
     }
 
@@ -2705,7 +2805,21 @@ puts( "The first, second, and third items." );
     #[test]
     fn directives() {
         assert_eq!(pp("#\n# /* nothing */\nx"), same("x"), "null directives");
-        assert_eq!(pp("#pragma once\n#pragma something else\nx"), same("x"));
+        // `#pragma once` is carried out; any other pragma, and `#ident`
+        // (`#sccs`) with its string, macros replaced, go on as clang passes
+        // them on, a line each, which the parser skips.
+        assert_eq!(
+            pp("#pragma once\n#pragma something  else\nx"),
+            "#pragma something else x "
+        );
+        assert_eq!(
+            pp("#define S \"s\"\n#ident S\n#sccs \"t\" junk\nx"),
+            "#ident \"s\" #ident \"t\" x "
+        );
+        assert_eq!(err("#ident x"), "main.c:1:8: error: invalid #ident directive");
+        assert_eq!(err("#sccs"), "main.c:1:6: error: invalid #ident directive");
+        let src = "#pragma weird\n#ident \"v1\"\nint main(void) { return 0; }\n";
+        assert!(crate::compile_with("main.c", src, &Options::default(), &|_| None).is_ok());
         assert_eq!(
             err("#error \"stop\" now"),
             "main.c:1:2: error: #error \"stop\" now"
@@ -2811,7 +2925,7 @@ puts( "The first, second, and third items." );
         let files = [("open.h", "#define F(a) a\nF(1")];
         assert_eq!(
             err_with(&files, "#include \"open.h\"\n)"),
-            "open.h:2:1: error: unterminated call of the function-like macro 'F'"
+            "./open.h:2:1: error: unterminated call of the function-like macro 'F'"
         );
     }
 
@@ -2863,6 +2977,21 @@ puts( "The first, second, and third items." );
         };
         let out = run(&[], names, &opts).unwrap();
         assert_eq!(words(&out.tokens), same("64 _ILP32 __ILP32__ 1 1 4 8 8"));
+        // The ISA, the code model and the object format, as clang says them
+        // for -march=rv64ima_zicsr_zifencei -mcmodel=medany; assembly is
+        // C17 and hosted to clang, and has `__ASSEMBLER__`.
+        let names = "__riscv_m __riscv_a __riscv_zicsr __riscv_muldiv __riscv_atomic \
+                     __riscv_cmodel_medany __riscv_cmodel_medlow __ELF__ __STDC_VERSION__ __STDC_HOSTED__ \
+                     __ASSEMBLER__";
+        let out = run(&[], names, &opts).unwrap();
+        assert_eq!(
+            words(&out.tokens),
+            same("2000000 2001000 2000000 1 1 1 __riscv_cmodel_medlow 1 199901L 0 __ASSEMBLER__")
+        );
+        assert_eq!(
+            asm(&[], names),
+            "# 1 \"main.S\"\n2000000 2001000 2000000 1 1 1 __riscv_cmodel_medlow 1 201710L 1 1\n"
+        );
     }
 
     #[test]
@@ -2996,16 +3125,16 @@ puts( "The first, second, and third items." );
         let text = asm(&files, src);
         assert_eq!(
             text,
-            "# 1 \"main.S\"\na\n# 1 \"i2/g.h\" 1\n# 3 \"main.S\" 2\n\n  .word 8\n# 1 \"i2/t.h\" 1\n  \
-             .word 8\n\n  .word 2\n# 6 \"main.S\" 2\nb\n\n# 1 \"i2/h1.h\" 1\n    x\n# 9 \"main.S\" 2\n\
+            "# 1 \"main.S\"\na\n# 1 \"./i2/g.h\" 1\n# 3 \"main.S\" 2\n\n  .word 8\n# 1 \"./i2/t.h\" 1\n  \
+             .word 8\n\n  .word 2\n# 6 \"main.S\" 2\nb\n\n# 1 \"./i2/h1.h\" 1\n    x\n# 9 \"main.S\" 2\n\
              # 20 \"main.S\"\n y\n# 30 \"other.S\"\n\n  y2\n# 41 \"other.S\"\nc\n"
         );
         // Each line back to where it came from.
         assert_eq!(source_line(&text, 1), None);
         assert_eq!(source_line(&text, 2), Some(("main.S".into(), 1)));
         assert_eq!(source_line(&text, 6), Some(("main.S".into(), 4)));
-        assert_eq!(source_line(&text, 8), Some(("i2/t.h".into(), 1)));
-        assert_eq!(source_line(&text, 10), Some(("i2/t.h".into(), 3)));
+        assert_eq!(source_line(&text, 8), Some(("./i2/t.h".into(), 1)));
+        assert_eq!(source_line(&text, 10), Some(("./i2/t.h".into(), 3)));
         assert_eq!(source_line(&text, 12), Some(("main.S".into(), 6)));
         assert_eq!(source_line(&text, 18), Some(("main.S".into(), 20)));
         assert_eq!(source_line(&text, 19), None);
@@ -3021,6 +3150,17 @@ puts( "The first, second, and third items." );
         assert_eq!(
             asm(&[], "#if 0\n# include nothing\n#endif\n# 12 \"x\"\n#warn\n"),
             "# 1 \"main.S\"\n\n\n\n # 12 \"x\"\n #warn\n"
+        );
+        // Pragmas but `once`, and `#ident`, pass on in column 1, as clang 23
+        // writes them: `#pragma`, then its tokens unreplaced, a space where
+        // the source had any; `#ident` and the string, macros replaced.
+        let src = "#define M 1\n  #  pragma weird(a,b)  M   x\n#pragma\n\t#pragma  x /* c */ y\n\
+                   #pragma once\n  nop\n#define S \"s\"\n# ident S\n#sccs \"q\" junk\n#define E\nE\n\
+                   #pragma after_empty\nend\n";
+        assert_eq!(
+            asm(&[], src),
+            "# 1 \"main.S\"\n\n#pragma weird(a,b) M x\n#pragma\n#pragma x y\n\n  nop\n\n#ident \"s\"\n\
+             #ident \"q\"\n\n\n#pragma after_empty\nend\n"
         );
         let opts = Options {
             lang: Lang::AssemblerWithCpp,

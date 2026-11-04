@@ -233,12 +233,14 @@ fn headers_get_their_own_file_numbers() {
     let asm = merlin::compile_with("m.c", src, &debug_opts("src"), &load).unwrap();
     assert!(asm.starts_with("    .file 0 \"src\" \"m.c\"\n"), "{asm}");
     assert!(
-        asm.contains("    .file 1 \"src\" \"inc/h.h\"\n    .loc 1 1 0\n"),
+        asm.contains("    .file 1 \"src\" \"./inc/h.h\"\n    .loc 1 1 0\n"),
         "{asm}"
     );
     let obj = merlin_as::assemble_to_elf(&asm).unwrap();
     let tables = elf::Elf::parse(&obj).unwrap().line_tables().unwrap();
-    assert_eq!(tables[0].files, ["src/m.c", "src/inc/h.h"]);
+    // Named as clang names it: next to a main file given without a
+    // directory, `./inc/h.h`.
+    assert_eq!(tables[0].files, ["src/m.c", "src/./inc/h.h"]);
     // A file without functions has nothing to describe.
     let asm = merlin::compile_with("d.c", "int x = 1;\n", &debug_opts("src"), &merlin::no_files).unwrap();
     assert!(!asm.contains(".debug_info"), "{asm}");
