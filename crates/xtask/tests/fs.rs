@@ -1558,6 +1558,31 @@ fn exec_keeps_its_redirections_or_ends_the_shell() {
         format!("{PROMPT}into the log\n{PROMPT}{PROMPT}systest: exit 5\n{PROMPT}")
     );
 
+    // `exec` alone in a background job or a pipeline, which POSIX runs in a subshell:
+    // its redirection makes the file, or empties it, and that is all, with status 0,
+    // the pipeline's (the `exit` that follows ends the shell with it).
+    let run = boot(
+        root_image(),
+        Boot {
+            input: b"echo full > /full\n\
+                exec > /full &\n\
+                systest exit 4 | exec > /made\n\
+                exit\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    assert_eq!(shell_output(&run.out, "exec > /full &"), "");
+    assert_eq!(
+        shell_output(&run.out, "systest exit 4 | exec > /made"),
+        "systest: exit 4\n"
+    );
+    fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    let fs = Fs::open(&run.disk).unwrap();
+    assert_eq!(fs.read_file("/full").unwrap(), b"");
+    assert_eq!(fs.read_file("/made").unwrap(), b"");
+
     // `exec PROG` with a redirection, PROG missing: the shell's output is /out by
     // then, with no copy of the console's kept, so the shell ends, with 127 (POSIX's
     // status for a program not found), rather than go on writing where nobody looks.

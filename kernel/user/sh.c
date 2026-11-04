@@ -44,8 +44,10 @@
  * ones for the program to inherit), so it ends, with 127 if there is no such
  * program and 126 otherwise. Without a program, `exec`'s redirections stay
  * the shell's: `exec < FILE` reads the next lines from FILE. In a pipeline
- * or a background job, which POSIX runs apart from the shell, `exec PROG`
- * runs PROG as if `exec` were not there.
+ * or a background job, which POSIX runs in a subshell, `exec` replaces the
+ * subshell, which here is the command alone: `exec NAME ...` runs the
+ * program NAME, never a built-in, and `exec > FILE` only makes FILE (or
+ * empties it), with status 0.
  *
  * Its input is usually the console, whose line discipline edits and echoes
  * a line and hands it over whole, one per read. Any other input (a network
@@ -104,6 +106,9 @@ struct cmd {
     int argc;
     char *in;
     char *out;
+    /* Set for `exec NAME ...` apart from the shell, once the `exec` is
+     * dropped: NAME is a program, never a built-in (see run_job). */
+    int program_only;
 };
 
 static int is_blank(char c) {
@@ -202,11 +207,15 @@ static void help(void) {
     printf("CMD & CMD       run the first command in the background\n");
 }
 
-/* Whether command `c` is a built-in. */
+/* Whether command `c` is one of the built-ins builtin() runs. `exec` is
+ * not: run_job deals with it before anything else. */
 static int is_builtin(const struct cmd *c) {
+    if (c->argc == 0 || c->program_only) {
+        return 0;
+    }
     const char *name = c->argv[0];
     return strcmp(name, "exit") == 0 || strcmp(name, "help") == 0 || strcmp(name, "wait") == 0 ||
-           strcmp(name, "cd") == 0 || strcmp(name, "exec") == 0;
+           strcmp(name, "cd") == 0;
 }
 
 /* Runs built-in `c`. Returns 1 if the shell should exit, with the status in
@@ -221,7 +230,7 @@ static int builtin(struct cmd *c, int *exit_status) {
         help();
     } else if (strcmp(name, "wait") == 0) {
         wait_all();
-    } else {
+    } else if (strcmp(name, "cd") == 0) {
         const char *dir = c->argv[1] != NULL ? c->argv[1] : "/";
         int r = chdir(dir);
         if (r < 0) {
@@ -237,6 +246,7 @@ static int parse_cmd(struct token *t, int n, struct cmd *c) {
     c->argc = 0;
     c->in = NULL;
     c->out = NULL;
+    c->program_only = 0;
     for (int i = 0; i < n; i++) {
         if (t[i].op == 0) {
             if (c->argc == MAXARG) {
@@ -326,12 +336,25 @@ static void close_if(int fd) {
     }
 }
 
-/* Says why program `name` can't be started: spawn's or exec's error `err`. */
+/* Whether spawn's or exec's error `err` means there is no program `name`:
+ * POSIX's status 127, where 126 is for one that is there but can't be run.
+ * A NAME is looked up in /bin, as bash looks a command up along PATH, where
+ * any lookup that fails finds nothing: -ENOENT, -ENOTDIR (/bin is not a
+ * directory) and -ENAMETOOLONG (a NAME longer than a file name can be). A
+ * path is run as it is, as bash runs one, and is missing only for -ENOENT:
+ * -ENOTDIR (a name on the way is a file) is 126, bash's "Not a directory". */
+static int not_found(const char *name, int err) {
+    if (strchr(name, '/') != NULL) {
+        return err == -ENOENT;
+    }
+    return err == -ENOENT || err == -ENOTDIR || err == -ENAMETOOLONG;
+}
+
+/* Says why program `name` can't be started: spawn's or exec's error `err`.
+ * A NAME that isn't in /bin is the usual mistake: "no such program". */
 static void cannot_start(const char *name, int err) {
-    /* A name that isn't in /bin is the usual mistake. */
     int bare = strchr(name, '/') == NULL;
-    int missing = err == -ENOENT || err == -ENAMETOOLONG;
-    const char *why = bare && missing ? "no such program" : strerror(-err);
+    const char *why = bare && not_found(name, err) ? "no such program" : strerror(-err);
     fprintf(STDERR, "sh: %s: %s\n", name, why);
 }
 
@@ -372,8 +395,7 @@ static int exec_builtin(struct cmd *c, int *exit_status) {
     if (in < 0 && out < 0) {
         return 0;
     }
-    int missing = err == -ENOENT || err == -ENAMETOOLONG || err == -ENOTDIR;
-    *exit_status = missing ? 127 : 126;
+    *exit_status = not_found(c->argv[1], err) ? 127 : 126;
     return 1;
 }
 
@@ -384,19 +406,21 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
     if (n == 1 && !background && strcmp(cmds[0].argv[0], "exec") == 0) {
         return exec_builtin(&cmds[0], exit_status);
     }
-    /* Apart from the shell, `exec PROG` is PROG: drop the word. */
+    /* In a pipeline or a background job, which POSIX runs in subshells,
+     * `exec` replaces the command's subshell, which here is the command
+     * itself. So one `exec` goes: `exec NAME ...` runs the program NAME and
+     * never a built-in (`exec cd /bin &` is /bin/cd, `exec exec echo &` is
+     * /bin/exec), and `exec` alone is left with no words, a command that
+     * only makes its redirections and ends with 0, as its subshell would. */
     for (int i = 0; i < n; i++) {
         struct cmd *c = &cmds[i];
-        while (strcmp(c->argv[0], "exec") == 0) {
-            if (c->argc == 1) {
-                fprintf(STDERR, "sh: exec: no program to run in a pipeline or the background\n");
-                return 0;
-            }
+        if (strcmp(c->argv[0], "exec") == 0) {
             /* argv[argc] is the NULL, which moves down too. */
             for (int k = 0; k < c->argc; k++) {
                 c->argv[k] = c->argv[k + 1];
             }
             c->argc--;
+            c->program_only = 1;
         }
     }
     if (n == 1 && is_builtin(&cmds[0]) && cmds[0].in == NULL && cmds[0].out == NULL) {
@@ -412,7 +436,11 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
     int console_in = dup(STDIN);
     int console_out = dup(STDOUT);
     int pids[MAX_PIPE];
+    const char *names[MAX_PIPE];
     int started = 0;
+    /* Whether the last command is an `exec` with no program, whose status,
+     * 0, is the pipeline's. */
+    int ends_with_exec = 0;
     int quit = 0;
     /* The read end of the pipe from the previous command, for this one. */
     int from_prev = -1;
@@ -448,6 +476,14 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
             close_if(out);
             out = file_out;
         }
+        if (cmds[i].argc == 0) {
+            /* `exec` alone: its files are made, and that is all. Nothing
+             * reads or writes the pipe ends it had. */
+            close_if(in);
+            close_if(out);
+            ends_with_exec = i + 1 == n;
+            continue;
+        }
         put_at(STDIN, in >= 0 ? in : console_in);
         put_at(STDOUT, out >= 0 ? out : console_out);
         close_if(in);
@@ -464,6 +500,7 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
             break;
         }
         pids[started] = pid;
+        names[started] = cmds[i].argv[0];
         started++;
     }
     close_if(from_prev);
@@ -473,8 +510,7 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
     close(console_out);
 
     for (int i = 0; i < started; i++) {
-        /* The programs are cmds[0..started), in order. */
-        const char *name = cmds[i].argv[0];
+        const char *name = names[i];
         if (background) {
             printf("[%d]\n", pids[i]);
             remember(pids[i], name);
@@ -487,6 +523,9 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
                 printf("%s: exit %d\n", name, status);
             }
         }
+    }
+    if (ends_with_exec && !background) {
+        last_status = 0;
     }
     return quit;
 }

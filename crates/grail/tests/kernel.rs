@@ -198,12 +198,18 @@ fn shell_accepts_windows_line_ends() {
 fn exec_replaces_the_shell() {
     // POSIX's `exec`: alone, it does nothing (no redirections to keep); a program that
     // can't be started is reported and the shell carries on, as is a redirection
-    // that can't be opened (there are no files without a disk); in a pipeline or a
-    // background job it runs the program as if it were not there. Then `exec PROG`
+    // that can't be opened (there are no files without a disk). Its NAME is always a
+    // program, never a built-in: `exec cd /bin` is /bin/cd, which isn't there. In a
+    // pipeline or a background job, which POSIX runs in a subshell, it replaces the
+    // command's subshell: one `exec` goes and the rest runs the program NAME, still
+    // never a built-in (`exec exit 7 &` doesn't end the shell, `exec exec echo hi &`
+    // is /bin/exec), and `exec` alone only makes its redirections. Then `exec PROG`
     // replaces the first process, so the machine stops with PROG's status: `systest
     // fds` exits 0 only with descriptors 0, 1 and 2 and no other (the shell's copies
     // above 2 are not inherited), `systest exit 3` with 3.
-    let lines = "exec\nexec nosuch\nexec > /f\necho piped | exec cat\nexec echo behind &\nwait\n";
+    let lines = "exec\nexec nosuch\nexec > /f\nexec cd /bin\nexec cd /bin &\nexec exit 7 &\n\
+                 exec exec echo hi &\nexec &\nexec > /f | cat\necho piped | exec cat\n\
+                 exec echo behind &\nwait\n";
     let (code, out) = grail(&kernel_elf(), format!("{lines}exec systest fds\n").as_bytes());
     assert_eq!(code, Some(0), "output:\n{out}");
     let shell = shell_output(&out);
@@ -212,6 +218,17 @@ fn exec_replaces_the_shell() {
          {PROMPT}exec nosuch\n\
          sh: nosuch: no such program\n\
          {PROMPT}exec > /f\n\
+         sh: /f: no such file or directory\n\
+         {PROMPT}exec cd /bin\n\
+         sh: cd: no such program\n\
+         {PROMPT}exec cd /bin &\n\
+         sh: cd: no such program\n\
+         {PROMPT}exec exit 7 &\n\
+         sh: exit: no such program\n\
+         {PROMPT}exec exec echo hi &\n\
+         sh: exec: no such program\n\
+         {PROMPT}exec &\n\
+         {PROMPT}exec > /f | cat\n\
          sh: /f: no such file or directory\n\
          {PROMPT}echo piped | exec cat\n\
          piped\n\
