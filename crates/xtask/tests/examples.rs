@@ -121,7 +121,7 @@ fn scenario_rv32(name: &str) -> Scenario {
              CLINT     0x02000000 + 0x00010000\n  \
              PLIC      0x0c000000 + 0x04000000\n  \
              UART      0x10000000 + 0x00000100  irq 1\n  \
-             fb-ctrl   0x30000000 + 0x00001000\n  \
+             fb-ctrl   0x30000000 + 0x00001000  irq 16\n  \
              keyboard  0x30001000 + 0x00001000  irq 2\n  \
              sysinfo   0x30002000 + 0x00001000\n  \
              pointer   0x30003000 + 0x00001000  irq 11\n  \
@@ -161,6 +161,8 @@ fn scenario_rv32(name: &str) -> Scenario {
         },
         // The cursor is checked in `examples_run_in_grail`.
         "pointer" => pointer_input("[dbg] pc=8000017c s4 = 0x00000003 (3)\n"),
+        // Eight frames shown; the frames are checked in `examples_run_in_grail`.
+        "flip" => plain("[dbg] pc=8000013c s4 = 0x00000008 (8)\n", 0),
         // One hart: every count is its own, and no store-conditional can fail.
         // `smp_example_runs_on_every_hart_count` runs it on more.
         "smp" => plain(
@@ -205,7 +207,7 @@ fn scenario_rv64(name: &str) -> Scenario {
              CLINT     0x0000000002000000 + 0x0000000000010000\n  \
              PLIC      0x000000000c000000 + 0x0000000004000000\n  \
              UART      0x0000000010000000 + 0x0000000000000100  irq 1\n  \
-             fb-ctrl   0x0000000030000000 + 0x0000000000001000\n  \
+             fb-ctrl   0x0000000030000000 + 0x0000000000001000  irq 16\n  \
              keyboard  0x0000000030001000 + 0x0000000000001000  irq 2\n  \
              sysinfo   0x0000000030002000 + 0x0000000000001000\n  \
              pointer   0x0000000030003000 + 0x0000000000001000  irq 11\n  \
@@ -238,6 +240,7 @@ fn scenario_rv64(name: &str) -> Scenario {
             ..plain("ok[dbg] pc=00000000800000b4 s0 = 0x0000000000000005 (5)\n", 0)
         },
         "pointer" => pointer_input("[dbg] pc=0000000080000180 s4 = 0x0000000000000003 (3)\n"),
+        "flip" => plain("[dbg] pc=000000008000013c s4 = 0x0000000000000008 (8)\n", 0),
         "smp" | "net-ping" | "net-pong" | "net-user" => scenario_rv32(name),
         other => panic!("no RV64 scenario for example {other}: add one"),
     }
@@ -385,6 +388,20 @@ fn examples_run_in_grail() {
             assert_eq!(fb.pixel(121, 90), 0x203048);
             assert_eq!(fb.pixel(50, 60), 0x203048);
             assert_eq!(fb.pixel(0, 0), 0x203048);
+        }
+        if ex.name == "flip" {
+            // 800x600 from a buffer in RAM, after one modeset and seven flips; the last
+            // frame's bands moved down 7 x 25 rows: row 0 is in band 175 / 75 = 2.
+            let fb = &m.cpu.bus.fb;
+            assert_eq!((fb.modesets, fb.flips, fb.presents), (1, 7, 0));
+            assert!(fb.scanout() >= grail::bus::RAM_BASE);
+            let frame = m.cpu.bus.frame();
+            assert_eq!((frame.width, frame.height), (800, 600));
+            assert_eq!(frame.pixel(0, 0), 0x00ffff);
+            assert_eq!(frame.pixel(799, 49), 0x00ffff);
+            assert_eq!(frame.pixel(0, 50), 0x00ff00);
+            assert_eq!(frame.pixel(799, 500), 0xffff00);
+            assert_eq!(frame.pixel(0, 599), 0x00ffff);
         }
         if let Some(img) = s.disk {
             // The write test put the last sector back as it was.

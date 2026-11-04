@@ -13,6 +13,7 @@ use crate::{ended, out_of_step, End};
 use avalon_proto::{
     kind_of, AttachKind, Connection, Error, Frame, KeyEvent, Message, MessageKind, PointerChange,
     PointerMotion, Screen, VmRef, VmState, VmSummary, PIXEL_FORMAT_XRGB8888, POINTER_BUTTONS,
+    SCREEN_FRAME_OVERHEAD,
 };
 use grail::pointer::Motion;
 use std::net::{Shutdown, TcpStream};
@@ -45,7 +46,9 @@ pub trait View {
     /// was uncovered, say).
     fn needs_redraw(&mut self) -> bool;
 
-    /// Shows `screen`.
+    /// Shows `screen`, which may have another size than the last one drawn (the guest
+    /// changed modes): the view then takes the new size, and its pointer input is in
+    /// the new screen's pixels from then on.
     fn draw(&mut self, screen: &Screen);
 
     /// The VM is now in `state`, for the view to show (in its title, say).
@@ -67,6 +70,8 @@ pub struct ScreenSession {
     pub screen: Screen,
     /// Frames received so far, the full one after the attach included.
     pub frames: u64,
+    /// Times the screen changed size (`ScreenResized`) so far.
+    pub resizes: u64,
     /// How long to wait for the server to confirm a detach (default
     /// [`crate::DETACH_TIMEOUT`]).
     pub detach_timeout: Duration,
@@ -82,7 +87,8 @@ impl ScreenSession {
     /// Attaches to `vm`'s screen on `conn` (a connection after its handshake), then asks
     /// for the VM's name and state. Fails with the server's error if there is no such
     /// VM, and with [`Error::Invalid`] for a screen this version cannot show (a format
-    /// other than XRGB8888, or an empty screen).
+    /// other than XRGB8888, an empty screen, or one larger than a frame can carry).
+    /// The screen may change size later, when the guest changes modes: `ScreenResized`.
     pub fn attach(mut conn: Connection<TcpStream>, vm: &VmRef) -> Result<ScreenSession, Error> {
         let (id, width, height) = match conn.request(&Message::ScreenAttach { vm: vm.clone() })? {
             Message::ScreenAttached {
@@ -91,11 +97,7 @@ impl ScreenSession {
                 height,
                 format,
             } => {
-                if format != PIXEL_FORMAT_XRGB8888 || Screen::byte_len(width, height).is_none() {
-                    return Err(Error::Invalid(format!(
-                        "a {width}x{height} screen in pixel format {format}, which Herald cannot show"
-                    )));
-                }
+                check_screen(width, height, format)?;
                 (vm, width, height)
             }
             other => return Err(Error::Unexpected(other.type_code())),
@@ -110,6 +112,7 @@ impl ScreenSession {
             vm,
             screen: Screen::new(width, height),
             frames: 0,
+            resizes: 0,
             detach_timeout: crate::DETACH_TIMEOUT,
             detaching: false,
             held: None,
@@ -247,6 +250,22 @@ impl ScreenSession {
                 self.frames += 1;
                 self.dirty = true;
             }
+            // The guest changed modes: a new screen, black, at the new size, which the
+            // full frame that follows fills; the view takes the size when it draws it.
+            (
+                Some(MessageKind::Event),
+                Ok(Message::ScreenResized {
+                    vm,
+                    width,
+                    height,
+                    format,
+                }),
+            ) if vm == id => {
+                check_screen(width, height, format)?;
+                self.screen = Screen::new(width, height);
+                self.resizes += 1;
+                self.dirty = true;
+            }
             (Some(MessageKind::Event), Ok(Message::VmStateChanged { vm, state })) if vm == id => {
                 self.vm.state = state;
                 view.vm_state(state);
@@ -274,6 +293,21 @@ impl ScreenSession {
         }
         Ok(None)
     }
+}
+
+/// Whether Herald can show a `width` × `height` screen in pixel format `format`, as
+/// `ScreenAttached` or `ScreenResized` gives it: XRGB8888, not empty, and no larger
+/// than a full frame the protocol can carry, its pixels and the rest of the
+/// `ScreenFrame` message in one frame. [`Error::Invalid`] if not.
+pub fn check_screen(width: u32, height: u32, format: u32) -> Result<(), Error> {
+    let room = avalon_proto::MAX_FRAME_LEN as usize - SCREEN_FRAME_OVERHEAD;
+    let fits = Screen::byte_len(width, height).is_some_and(|len| len <= room);
+    if format != PIXEL_FORMAT_XRGB8888 || !fits {
+        return Err(Error::Invalid(format!(
+            "a {width}x{height} screen in pixel format {format}, which Herald cannot show"
+        )));
+    }
+    Ok(())
 }
 
 /// The messages that carry `input` to VM `vm`: one `KeyInput` per key, one
@@ -355,7 +389,23 @@ pub fn pointer_from_grail(input: grail::pointer::PointerInput, width: u32, heigh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use avalon_proto::{POINTER_LEFT, POINTER_RIGHT};
+    use avalon_proto::{MAX_FRAME_LEN, POINTER_LEFT, POINTER_RIGHT};
+
+    /// A screen fits if its full frame does, message and all: one whose pixels alone
+    /// are under `MAX_FRAME_LEN`, but not with the `ScreenFrame` around them, does not.
+    #[test]
+    fn a_screen_fits_if_its_full_frame_does() {
+        let widest = ((MAX_FRAME_LEN as usize - SCREEN_FRAME_OVERHEAD) / 4) as u32;
+        assert!(check_screen(widest, 1, PIXEL_FORMAT_XRGB8888).is_ok());
+        assert!(check_screen(widest + 1, 1, PIXEL_FORMAT_XRGB8888).is_err());
+        assert!(
+            (widest as usize + 1) * 4 < MAX_FRAME_LEN as usize,
+            "the pixels alone fit"
+        );
+        assert!(check_screen(1920, 1080, PIXEL_FORMAT_XRGB8888).is_ok());
+        assert!(check_screen(0, 480, PIXEL_FORMAT_XRGB8888).is_err());
+        assert!(check_screen(640, 480, 1).is_err());
+    }
 
     fn to(x: u32, y: u32, buttons: u8) -> Input {
         Input::Pointer(PointerChange {

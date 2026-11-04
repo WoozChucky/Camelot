@@ -139,6 +139,9 @@ pub const PTR_IRQ: u32 = 11;
 /// PLIC interrupt source of network card 0; card `i` uses `NET_IRQ + i` (spec section
 /// 9.8).
 pub const NET_IRQ: u32 = 12;
+/// PLIC interrupt source of the framebuffer's vertical blank (spec section 9.3): the
+/// first one after the network cards' (12 to 15).
+pub const FB_IRQ: u32 = 16;
 
 /// Interrupt sources 1..=31 exist; source 0 means "no interrupt".
 pub const PLIC_SOURCES: u32 = 32;

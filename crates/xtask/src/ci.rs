@@ -13,7 +13,8 @@
 //!   fixtures current),
 //!   merlin-objdump's goldens, the compiler's end-to-end harness, riscv-tests
 //!   on Grail;
-//! - Grail's keyboard in both of its modes, through `examples/kbd-echo`;
+//! - Grail's display controller, and its keyboard in both of its modes, through
+//!   `examples/kbd-echo`;
 //! - the committed binaries are what the tools build now: the kernel, the
 //!   examples, the boot programs, hello, the disk image; and the kernel boots;
 //! - how Avalon and Lake end connections: bad handshakes, and a server's last
@@ -99,8 +100,8 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
-        what: "Grail: riscv-tests, RV64, paging and atomics semantics, disk boot, the committed disk image, \
-               the keyboard's two modes",
+        what: "Grail: riscv-tests, RV64, paging and atomics semantics, disk boot, the committed disk \
+               image, the display controller, the keyboard's two modes",
         args: &[
             "-p",
             "grail",
@@ -116,6 +117,8 @@ const STEPS: &[Step] = &[
             "disk_boot",
             "--test",
             "block",
+            "--test",
+            "framebuffer",
             "--test",
             "keyboard",
         ],

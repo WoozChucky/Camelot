@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use MessageKind::{Event, Reply, Request};
 
 /// Section 6, the message catalogue: (code, name, kind).
-const SPEC_CATALOGUE: [(u16, &str, MessageKind); 51] = [
+const SPEC_CATALOGUE: [(u16, &str, MessageKind); 52] = [
     (0x0001, "Hello", Request),
     (0x0002, "Welcome", Reply),
     (0x0003, "Error", Reply),
@@ -39,6 +39,7 @@ const SPEC_CATALOGUE: [(u16, &str, MessageKind); 51] = [
     (0x0304, "KeyInput", Event),
     (0x0305, "ScreenDetach", Request),
     (0x0306, "PointerInput", Event),
+    (0x0307, "ScreenResized", Event),
     (0x0401, "BlockOpen", Request),
     (0x0402, "BlockOpened", Reply),
     (0x0403, "BlockRead", Request),
@@ -434,6 +435,15 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                 .frame(0x0306),
         ),
         (
+            ScreenResized {
+                vm: 2,
+                width: 1024,
+                height: 768,
+                format: 0,
+            },
+            P::default().u32(2).u32(1024).u32(768).u32(0).frame(0x0307),
+        ),
+        (
             BlockOpen {
                 name: "d".into(),
                 read_only: true,
@@ -781,17 +791,17 @@ fn optional_fields_are_tagged() {
 
 #[test]
 fn doc_examples_are_exact() {
-    // Section 6.1: Hello version 8 from agent "rt".
+    // Section 6.1: Hello version 9 from agent "rt".
     assert_eq!(
         encode(&Message::Hello {
-            version: 8,
+            version: 9,
             agent: "rt".into()
         })
         .unwrap(),
-        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x08, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
+        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x09, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
     );
     // Section 7: the version this document describes.
-    assert_eq!(PROTOCOL_VERSION, 8);
+    assert_eq!(PROTOCOL_VERSION, 9);
     // Section 6.2: StartVm by id 5.
     assert_eq!(
         encode(&Message::StartVm { vm: VmRef::Id(5) }).unwrap(),
@@ -821,4 +831,31 @@ fn guest_addresses_are_the_gateways() {
         (gateway::Proto::Udp, rule.host, rule.guest)
     );
     assert_eq!(theirs.to_string(), rule.to_string());
+}
+
+/// What a `ScreenFrame`'s length field counts besides its pixels is
+/// [`SCREEN_FRAME_OVERHEAD`], so the biggest rectangle one frame carries has
+/// `MAX_FRAME_LEN - SCREEN_FRAME_OVERHEAD` bytes of pixels, and 4 more do not fit.
+#[test]
+fn a_screen_frame_carries_its_pixels_and_a_fixed_overhead() {
+    let frame = |width: u32, height: u32| Message::ScreenFrame {
+        vm: 1,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        pixels: vec![0; width as usize * height as usize * 4],
+    };
+    let bytes = encode(&frame(2, 3)).unwrap();
+    let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    assert_eq!(len, SCREEN_FRAME_OVERHEAD + 2 * 3 * 4);
+
+    let widest = ((MAX_FRAME_LEN as usize - SCREEN_FRAME_OVERHEAD) / 4) as u32;
+    let bytes = encode(&frame(widest, 1)).unwrap();
+    let len = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    assert!(len <= MAX_FRAME_LEN && len + 4 > MAX_FRAME_LEN, "{len}");
+    assert!(matches!(
+        encode(&frame(widest + 1, 1)),
+        Err(Error::FrameTooLarge(_))
+    ));
 }
