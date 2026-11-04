@@ -7,8 +7,8 @@ use crate::http::{read_request_head, Deadline, Limits, Request, Response};
 use crate::random;
 use avalon_client::Timeouts;
 use avalon_proto::{DEFAULT_AVALON_ADDR, DEFAULT_LAKE_ADDR};
-use std::io::{self, Read};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -30,11 +30,6 @@ const MAX_TURNING_AWAY: usize = 16;
 
 /// How long writing a response may take.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long, all told, a connection lingers after its response, reading what the
-/// client still sends ([`finish`]), and the most it reads meanwhile.
-const LINGER: Duration = Duration::from_secs(1);
-const LINGER_BYTES: usize = 4 * 1024 * 1024;
 
 /// How Pendragon runs.
 #[derive(Debug, Clone)]
@@ -363,17 +358,9 @@ fn with_security_headers(mut response: Response) -> Response {
 /// Ends a connection gently: says no more is coming, then reads (and drops) what the
 /// client still sends for a moment, so that closing does not reset the connection
 /// before the client has read the response (which a reset can discard). The moment is
-/// [`LINGER`] all told, however the client spreads its bytes, and at most
-/// [`LINGER_BYTES`]: a client that keeps sending cannot keep the connection.
+/// [`avalon_proto::LINGER`] all told, however the client spreads its bytes, and at most
+/// [`avalon_proto::LINGER_BYTES`]: a client that keeps sending cannot keep the
+/// connection. Avalon and Lake close their connections the same way.
 fn finish(stream: &TcpStream) {
-    let _ = stream.shutdown(Shutdown::Write);
-    let mut reader = Deadline::new(stream, LINGER);
-    let mut sink = [0u8; 8192];
-    let mut drained = 0;
-    while drained < LINGER_BYTES {
-        match reader.read(&mut sink) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => drained += n,
-        }
-    }
+    avalon_proto::close_gracefully(stream, || false);
 }

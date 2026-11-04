@@ -411,32 +411,14 @@ fn an_oversize_frame_ends_the_connection_only() {
 #[test]
 fn bad_handshakes() {
     let server = server(None);
-    // Everything the server sends before it closes the connection. (Closing with
-    // unread input may reset the connection instead of ending it cleanly.)
-    let read_all = |mut s: TcpStream| {
-        s.set_read_timeout(Some(SLOW)).unwrap();
-        let mut got = Vec::new();
-        let mut buf = [0u8; 256];
-        loop {
-            match s.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => got.extend_from_slice(&buf[..n]),
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    panic!("the server did not close the connection")
-                }
-                Err(_) => break,
-            }
-        }
-        got
-    };
+    // Everything the server sends before it closes the connection, which ends cleanly
+    // even when the server did not read all the client sent.
+    let read_all = |mut s: TcpStream| read_until_closed(&mut s, SLOW);
 
     // A stray HTTP client: "GET " reads as a 540 MB frame, refused unread.
     let mut http = TcpStream::connect(server.addr()).unwrap();
     http.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-    read_all(http);
+    assert!(read_all(http).is_empty());
 
     // Another request before Hello: an error, then the connection is closed.
     let mut early = TcpStream::connect(server.addr()).unwrap();
@@ -484,6 +466,73 @@ fn bad_handshakes() {
     server.stop().unwrap();
 }
 
+/// The server's last frame before it closes a connection arrives whole, though the
+/// client had sent more that the server never read. Closing a socket with input unread
+/// resets the connection, and a reset can throw away what was sent just before it;
+/// the server closes gracefully instead (`avalon_proto::close_gracefully`).
+#[test]
+fn the_last_frame_survives_unread_input() {
+    let server = server(None);
+    let hello = |version| {
+        encode(&Message::Hello {
+            version,
+            agent: "pipelined".into(),
+        })
+        .unwrap()
+    };
+    let ours = avalon_proto::PROTOCOL_VERSION;
+    let request = |msg: Message| encode(&msg).unwrap();
+    // A frame as the cases below name it: its message, and an Error's code.
+    let name = |m: &Message| match m {
+        Message::Error { code, .. } => format!("Error {code:?}"),
+        other => other.name().to_string(),
+    };
+    // What the client sends, all at once; then the frames it must get before the close.
+    let cases = [
+        (
+            "another version, then a request",
+            [hello(99), request(Message::ListVms)].concat(),
+            &["Welcome"][..],
+        ),
+        (
+            "a request before Hello, then another",
+            [request(Message::ListVms), request(Message::Ping { token: 1 })].concat(),
+            &["Error Unexpected"][..],
+        ),
+        (
+            "an oversize frame in a session, with some of its body",
+            [
+                hello(ours),
+                (64u32 << 20).to_le_bytes().to_vec(),
+                vec![0xee; 4096],
+            ]
+            .concat(),
+            &["Welcome", "Error Malformed"][..],
+        ),
+    ];
+    for (what, input, expected) in cases {
+        let mut s = TcpStream::connect(server.addr()).unwrap();
+        s.write_all(&input).unwrap();
+        // Done sending: a server that lingers sees the end at once.
+        s.shutdown(std::net::Shutdown::Write).unwrap();
+        // Nothing is read until the server has closed its end, so that a reset, if it
+        // sent one, has arrived before the frames are read.
+        wait_until("the connection to be forgotten", SLOW, || {
+            server.debug_connections() == 0
+        });
+        let reply = read_until_closed(&mut s, SLOW);
+        let mut got = Vec::new();
+        let mut rest = &reply[..];
+        while !rest.is_empty() {
+            let (msg, n) = avalon_proto::decode(rest).unwrap_or_else(|e| panic!("{what}: {e}"));
+            got.push(name(&msg));
+            rest = &rest[n..];
+        }
+        assert_eq!(got, expected, "{what}");
+    }
+    server.stop().unwrap();
+}
+
 #[test]
 fn a_client_that_leaves_is_detached() {
     let server = server(None);
@@ -512,7 +561,9 @@ fn a_client_that_leaves_is_detached() {
 }
 
 /// Reads what the server sends on `s` until it closes the connection; panics if it
-/// is still open after `limit`. Returns the bytes read.
+/// is still open after `limit`, or if it ends with an error (a reset) instead of a
+/// clean close, since a reset can discard what the server sent last. Returns the bytes
+/// read.
 fn read_until_closed(s: &mut TcpStream, limit: Duration) -> Vec<u8> {
     let start = Instant::now();
     let mut got = Vec::new();
@@ -527,9 +578,14 @@ fn read_until_closed(s: &mut TcpStream, limit: Duration) -> Vec<u8> {
             Err(e)
                 if matches!(
                     e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
                 ) => {}
-            Err(_) => return got,
+            Err(e) => panic!(
+                "the connection ended with an error, not a clean close ({e}), after {} bytes",
+                got.len()
+            ),
         }
     }
 }

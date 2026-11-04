@@ -113,7 +113,8 @@ impl Outbox {
         self.changed.notify_all();
     }
 
-    /// No more frames: the writer sends what is queued, then ends the connection.
+    /// No more frames: the writer sends what is queued, then stops; the caller ends
+    /// the connection once [`Outbox::wait_done`] says it has.
     pub fn close(&self) {
         lock(&self.queue).closed = true;
         self.changed.notify_all();
@@ -149,8 +150,12 @@ impl Outbox {
     }
 
     /// The writer thread's body: writes queued frames to `out` until the queue is
-    /// closed and empty, or a write fails; then ends the connection.
+    /// closed and empty, or a write fails. A failed write ends the connection (the
+    /// client is gone, so its reading thread must stop too); after the last frame, the
+    /// thread that closed the queue ends it, gracefully (`close_gracefully`, so that a
+    /// reset over input the server did not read cannot discard those last frames).
     pub fn run_writer(&self, mut out: impl Write) {
+        let mut failed = false;
         loop {
             let frame = {
                 let mut q = lock(&self.queue);
@@ -169,6 +174,7 @@ impl Outbox {
             self.changed.notify_all();
             let Some(frame) = frame else { break };
             if write_frame(&mut out, &frame).is_err() {
+                failed = true;
                 break;
             }
         }
@@ -180,7 +186,9 @@ impl Outbox {
             q.done = true;
         }
         self.changed.notify_all();
-        (self.cut_off)();
+        if failed {
+            (self.cut_off)();
+        }
     }
 }
 
@@ -220,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn frames_are_written_in_order_then_the_connection_ends() {
+    fn frames_are_written_in_order_then_the_writer_stops() {
         let (cuts, outbox) = counting();
         outbox.reply(&Message::Ok);
         assert!(outbox.event(&output(3)));
@@ -249,7 +257,8 @@ mod tests {
                 Message::Pong { token: 9 }
             ]
         );
-        assert_eq!(cuts.load(Ordering::SeqCst), 1);
+        // Not cut off: whoever closed the queue ends the connection, gracefully.
+        assert_eq!(cuts.load(Ordering::SeqCst), 0);
         assert!(outbox.wait_done(Duration::ZERO));
     }
 
@@ -297,7 +306,11 @@ mod tests {
         outbox.close();
         writer.join().unwrap();
         assert!(outbox.wait_done(Duration::from_secs(5)));
-        assert_eq!(cuts.load(Ordering::SeqCst), 1, "only by the writer, at the end");
+        assert_eq!(
+            cuts.load(Ordering::SeqCst),
+            0,
+            "waiting is not a reason to cut off"
+        );
     }
 
     #[test]

@@ -14,8 +14,8 @@
 use crate::store::{Image, Store, MAX_IMAGE_SECTORS};
 use crate::{lock, Fail};
 use avalon_proto::{
-    default_port, kind_of, type_name, Connection, Error, ErrorCode, Frame, Message, MessageKind,
-    DEFAULT_LAKE_ADDR,
+    close_gracefully, default_port, kind_of, type_name, Connection, Error, ErrorCode, Frame, Message,
+    MessageKind, DEFAULT_LAKE_ADDR,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
@@ -291,6 +291,10 @@ impl Shared {
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(POLL));
         let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+        // Closing waits for the client a moment (`close_gracefully`), unless the server
+        // is shutting down.
+        let hang_up = Arc::clone(&socket.hang_up);
+        let stopping = || hang_up.load(Ordering::SeqCst);
         let mut conn = Connection::new(socket);
         let agent = match conn.server_handshake(SERVER_NAME) {
             Ok(agent) => agent,
@@ -298,7 +302,9 @@ impl Shared {
                 if self.log {
                     eprintln!("lake: {peer}: handshake failed: {e}");
                 }
-                let _ = conn.get_ref().stream.shutdown(Shutdown::Both);
+                // The Welcome or Error just sent must not be lost to a reset over
+                // what the client sent after its first frame.
+                close_gracefully(&conn.get_ref().stream, stopping);
                 self.forget(id);
                 return;
             }
@@ -337,7 +343,8 @@ impl Shared {
         // Detach everything this connection had attached.
         let attached = session.handles.len();
         drop(session);
-        let _ = conn.get_ref().stream.shutdown(Shutdown::Both);
+        // After an oversize frame, its body is still unread behind the Error.
+        close_gracefully(&conn.get_ref().stream, stopping);
         self.forget(id);
         if self.log {
             match attached {

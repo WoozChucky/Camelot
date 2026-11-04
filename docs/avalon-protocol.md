@@ -51,6 +51,8 @@ Because a whole frame is read before its payload is decoded, a bad payload never
 
 Sending: a message that would make a frame larger than 16 MiB, or that breaks a rule of section 3, is refused by the encoder (nothing is written). A frame is written with a single write, then flushed.
 
+Closing: a server that ends a connection after a last frame (the `Welcome` or `Error` of a failed handshake, the `Error` for an oversize frame) may not have read all the client sent: the rest of the oversize frame, requests sent behind the first frame, a stray HTTP client's headers. Closing a TCP socket with input unread resets the connection, and a reset can discard what was sent just before it before the client reads it. So the server closes gracefully (the crate's `close_gracefully`): it ends its side after the last frame, then reads and drops what the client still sends until the client closes its side, for at most a second and 4 MiB, and only then closes the socket. The client sees the last frame, then a clean end of stream. A client that keeps sending past those limits may still see a reset.
+
 ## 3. Field types
 
 Payloads are sequences of fields, in the order the message tables list them, with no padding or alignment.
