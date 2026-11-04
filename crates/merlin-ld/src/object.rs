@@ -335,7 +335,10 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
             1
         } else {
             let Ok(align) = u32::try_from(h.align) else {
-                return Err(format!("section '{sname}' has sh_addralign {:#x}, too large", h.align));
+                return Err(format!(
+                    "section '{sname}' has sh_addralign {:#x}, too large",
+                    h.align
+                ));
             };
             if align > 1 && !align.is_power_of_two() {
                 return Err(format!(

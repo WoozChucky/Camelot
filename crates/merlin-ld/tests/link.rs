@@ -1030,8 +1030,8 @@ fn branch_and_jump_range_errors() {
     assert_eq!(
         errs[..2],
         [
-            "main.o: relocation R_RISCV_JAL out of range for 'high_target' at .text.start+0x4: 1048577 is not \
-             in [-1048576, 1048575]",
+            "main.o: relocation R_RISCV_JAL out of range for 'high_target' at .text.start+0x4: \
+             1048577 is not in [-1048576, 1048575]",
             "main.o: relocation R_RISCV_JAL against 'high_target' at .text.start+0x4 is misaligned: offset \
              1048577 is not a multiple of 2",
         ]

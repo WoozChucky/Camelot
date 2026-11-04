@@ -87,8 +87,11 @@
 //! |---|---|---|
 //! | ELF header | 52 bytes | 64 bytes: `e_entry`, `e_phoff`, `e_shoff` 8 bytes each |
 //! | program header | 32 bytes | 56 bytes: `p_flags` moves up, after `p_type` |
-//! | section header | 40 bytes | 64 bytes: `sh_flags`, `sh_addr`, `sh_offset`, `sh_size`, `sh_addralign`, `sh_entsize` 8 bytes |
+//! | section header | 40 bytes | 64 bytes: six fields of 8 bytes (\*) |
 //! | symbol | 16 bytes | 24 bytes: `st_info`, `st_other`, `st_shndx` move before `st_value` and `st_size` |
+//!
+//! (\*) `sh_flags`, `sh_addr`, `sh_offset`, `sh_size`, `sh_addralign` and
+//! `sh_entsize`.
 //!
 //! `.symtab` and the section header table are aligned to the size of an
 //! address (4 or 8 bytes), as ld.lld aligns them. Everything else is the
@@ -1069,7 +1072,8 @@ _start:
     /// PT_GNU_RELRO, which merlin-ld does not write but leaves room for.
     #[test]
     fn a_run_of_relro_sections_ends_its_segment_and_has_a_program_header() {
-        let src = "    .text\n    .globl _start\n_start:\n    nop\n    .section .data.rel.ro, \"aw\"\n    .word 1\n\
+        let src = "    .text\n    .globl _start\n_start:\n    nop\n\
+                   \x20   .section .data.rel.ro, \"aw\"\n    .word 1\n\
                    \x20   .word 1\n    .data\n    .word 2\n";
         let script = |start: u64| {
             format!(
@@ -1188,7 +1192,8 @@ _start:
         let d = "/DISCARD/ : { *(.riscv.attributes) }";
         for class in [Class::Elf32, Class::Elf64] {
             let script = format!(
-                "SECTIONS {{ . = 0x80000000; .text : {{ *(.text) }} .data : {{ *(.data) *(.rodata) *(.bss) }} {d} }}"
+                "SECTIONS {{ . = 0x80000000; .text : {{ *(.text) }} \
+                 .data : {{ *(.data) *(.rodata) *(.bss) }} {d} }}"
             );
             assert_eq!(
                 names(class, &script),
@@ -1196,7 +1201,8 @@ _start:
             );
             // With MEMORY, after the section most like it.
             let script = format!(
-                "MEMORY {{ RAM (rwx) : ORIGIN = 0x80000000, LENGTH = 1M }} SECTIONS {{ .text : {{ *(.text) }} > RAM \
+                "MEMORY {{ RAM (rwx) : ORIGIN = 0x80000000, LENGTH = 1M }} \
+                 SECTIONS {{ .text : {{ *(.text) }} > RAM \
                  .data : {{ *(.data) *(.rodata) *(.bss) }} > RAM {d} }}"
             );
             assert_eq!(

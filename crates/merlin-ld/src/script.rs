@@ -1249,7 +1249,8 @@ mod tests {
         for (src, want) in [
             (r#"OUTPUT_FORMAT("elf64-littleriscv")"#, Some(Class::Elf64)),
             (
-                r#"ENTRY(_start) OUTPUT_FORMAT("elf32-littleriscv", "elf64-littleriscv", "elf64-littleriscv")"#,
+                "ENTRY(_start) OUTPUT_FORMAT(\"elf32-littleriscv\", \"elf64-littleriscv\", \
+                 \"elf64-littleriscv\")",
                 Some(Class::Elf32),
             ),
             // ld.lld takes the -freebsd names too.

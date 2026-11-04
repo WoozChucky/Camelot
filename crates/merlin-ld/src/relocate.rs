@@ -279,7 +279,8 @@ fn describe(e: RelocError, ty: &str, sym: &str, at: &str, sec: &Section, r: &Rel
     match e {
         RelocError::Unsupported => format!("unsupported relocation {ty} against '{sym}' at {at}"),
         RelocError::AlignPadding => format!(
-            "{ty} at {at}: merlin-ld does not delete alignment padding as ld.lld does; assemble with -mno-relax"
+            "{ty} at {at}: merlin-ld does not delete alignment padding as ld.lld does; \
+             assemble with -mno-relax"
         ),
         // Two errors, the range first: [`report`] gives both.
         RelocError::OutOfRangeMisaligned { value, min, max, .. } => {

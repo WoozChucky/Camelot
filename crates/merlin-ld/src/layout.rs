@@ -731,13 +731,17 @@ fn riscv_attributes_kept(objects: &[Object], script: &Script) -> bool {
     let any = objects
         .iter()
         .any(|o| o.sections.iter().any(|s| s.ty == elf::SHT_RISCV_ATTRIBUTES));
-    let first_rule = script.commands.iter().find_map(|c| match c {
+    let first_rule = script.commands.iter().find_map(|c| {
+        match c {
         Command::Output(o) => o
             .items
             .iter()
-            .any(|i| matches!(i, Item::Input(p) if p.iter().any(|p| script::glob_match(p, ".riscv.attributes"))))
+            .any(|i| {
+                matches!(i, Item::Input(p) if p.iter().any(|p| script::glob_match(p, ".riscv.attributes")))
+            })
             .then_some(o),
         Command::Assign(_) => None,
+    }
     });
     any && !first_rule.is_some_and(|o| o.is_discard())
 }
@@ -1275,12 +1279,16 @@ pub(crate) fn build_from(
                                 Ok(_) => w.script_err(
                                     o.line,
                                     format!(
-                                        "ALIGN({shown}) of section {}: alignment must be at most 2^31 (ld.lld \
-                                         keeps 32 bits of a section's alignment and would ignore this one)",
+                                        "ALIGN({shown}) of section {}: alignment must be at most 2^31 \
+                                         (ld.lld keeps 32 bits of a section's alignment and would ignore \
+                                         this one)",
                                         o.name
                                     ),
                                 ),
-                                Err(e) => w.script_err(o.line, format!("ALIGN({shown}) of section {}: {e}", o.name)),
+                                Err(e) => {
+                                    let msg = format!("ALIGN({shown}) of section {}: {e}", o.name);
+                                    w.script_err(o.line, msg)
+                                }
                             }
                         }
                         Err(e) => w.script_err(o.line, e),
