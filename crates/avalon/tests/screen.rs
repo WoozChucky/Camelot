@@ -15,12 +15,23 @@ use std::time::{Duration, Instant};
 
 const FULL: u64 = 640 * 480;
 
+/// A key with an ASCII-mode code only, as a viewer that knows no usages sends it.
 fn key(code: u8, release: bool) -> KeyEvent {
     KeyEvent {
         code,
         release,
         shift: false,
         ctrl: false,
+        repeat: false,
+        usage: 0,
+    }
+}
+
+/// A key with both forms, as Herald's window sends it.
+fn key2(code: u8, usage: u16, release: bool) -> KeyEvent {
+    KeyEvent {
+        usage,
+        ..key(code, release)
     }
 }
 
@@ -118,6 +129,48 @@ fn colorbars_reach_a_viewer_as_grail_draws_them() {
     server.stop().unwrap();
 }
 
+/// A guest that changes modes (`examples/flip`, 800x600 from buffers in RAM, page
+/// flipped): a viewer attached at 640x480 is told the new size once, with
+/// `ScreenResized`, and sent the whole new screen right after it; it ends with
+/// exactly the last frame Grail shows. A viewer attaching afterwards is told the new
+/// size in `ScreenAttached`, and needs no resize.
+#[test]
+fn a_mode_change_resizes_the_viewers_and_sends_a_full_frame() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "flip", profile(16, None), example("flip"));
+    let mut viewer = Viewer::attach(&server, VmRef::Id(id));
+    assert_eq!((viewer.screen.width(), viewer.screen.height()), (640, 480));
+
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    viewer.wait_for_event(exited(id));
+    assert_eq!(viewer.resizes.len(), 1, "one mode change: {:?}", viewer.resizes);
+    let (before, width, height) = viewer.resizes[0];
+    assert_eq!((width, height), (800, 600));
+    let full = avalon_proto::Rect {
+        x: 0,
+        y: 0,
+        width: 800,
+        height: 600,
+    };
+    assert_eq!(
+        viewer.rects.get(before),
+        Some(&full),
+        "a full frame follows the resize"
+    );
+    assert!(
+        viewer.screen.pixels() == grail_screen(&example("flip")),
+        "the frames rebuild Grail's last frame"
+    );
+    assert_eq!(viewer.screen.pixel(0, 0), 0x00ffff, "the last frame's top band");
+
+    let late = Viewer::attach(&server, VmRef::Id(id));
+    assert_eq!((late.screen.width(), late.screen.height()), (800, 600));
+    assert!(late.resizes.is_empty());
+    assert!(late.screen == viewer.screen);
+    server.stop().unwrap();
+}
+
 /// A guest that waits for input with its screen drawn sends nothing more; a pointer
 /// change moves its cursor, which sends only the tiles that changed; Esc ends it.
 #[test]
@@ -200,7 +253,8 @@ fn a_busy_screen_is_rate_limited() {
 
 /// A viewer that stops reading while the whole screen changes all the time (~36 MB/s
 /// at the full rate) is sent nothing more until it reads again, so it is not cut off
-/// for falling 8 MiB behind; when it reads again it gets whole frames that apply.
+/// for falling [`avalon::MAX_QUEUED`] behind; when it reads again it gets whole frames
+/// that apply.
 #[test]
 fn a_viewer_that_stops_reading_is_held_back_not_cut_off() {
     let server = server(None);
@@ -433,6 +487,77 @@ fn keys_need_a_screen_attachment() {
     assert_eq!(console.wait_for("!"), "hi!");
     again.key(key(0x1b, false));
     again.wait_for_event(exited(id));
+    server.stop().unwrap();
+}
+
+/// A key carries both forms: the guest's keyboard mode picks the one it sees. kbd-echo
+/// switches to raw mode on F12 and prints physical keys there, Shift alone included.
+#[test]
+fn keys_reach_the_guest_in_the_mode_it_chose() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "raw", profile(1, None), example("kbd-echo"));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    let mut console = Console::attach(&server, VmRef::Id(id));
+    let mut viewer = Viewer::attach(&server, VmRef::Id(id));
+    // ASCII mode: Shift sends nothing, 'q' its character.
+    viewer.key(key2(0, 0xe1, false));
+    viewer.key(key2(b'q', 0x14, false));
+    viewer.key(key2(b'q', 0x14, true));
+    viewer.key(key2(0, 0xe1, true));
+    viewer.key(key2(0x9b, 0x45, false));
+    assert_eq!(console.wait_for("q\n"), "q\n");
+    // Raw mode: F12's release, Shift, 'q' (its repeat dropped), and a key with no
+    // usage, which raw mode cannot see.
+    viewer.key(key2(0x9b, 0x45, true));
+    viewer.key(key2(0, 0xe1, false));
+    viewer.key(key2(b'Q', 0x14, false));
+    viewer.key(KeyEvent {
+        repeat: true,
+        ..key2(b'Q', 0x14, false)
+    });
+    viewer.key(key(b'x', false));
+    viewer.key(key2(b'Q', 0x14, true));
+    viewer.key(key2(0, 0xe1, true));
+    viewer.key(key2(0x1b, 0x29, false));
+    viewer.wait_for_event(exited(id));
+    // Esc ended it, so nothing came after.
+    assert_eq!(console.wait_for("-e1 "), "q\n-45 +e1 +14 -14 -e1 ");
+    server.stop().unwrap();
+}
+
+/// A viewer that goes lets go of the keys it held, as an unplugged keyboard does: a
+/// raw-mode guest sees their releases whether the viewer detaches or its connection
+/// ends (a viewer closed with Alt+F4 must not leave Alt held).
+#[test]
+fn a_viewer_that_goes_releases_its_keys() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "release", profile(1, None), example("kbd-echo"));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    let mut console = Console::attach(&server, VmRef::Id(id));
+    let mut viewer = Viewer::attach(&server, VmRef::Id(id));
+    // F12 switches kbd-echo to raw mode (which empties the FIFO: the keys after it wait
+    // for the switch); Left Alt and 'q' go down and stay down.
+    viewer.key(key2(0x9b, 0x45, false));
+    assert_eq!(console.wait_for("\n"), "\n");
+    viewer.key(key2(0x9b, 0x45, true));
+    viewer.key(key2(0, 0xe2, false));
+    viewer.key(key2(b'q', 0x14, false));
+    assert_eq!(console.wait_for("+14 "), "\n-45 +e2 +14 ");
+    assert_eq!(viewer.request(&Message::ScreenDetach { vm: id }), Message::Ok);
+    assert_eq!(console.wait_for("-14 "), "\n-45 +e2 +14 -e2 -14 ");
+
+    // A viewer whose connection ends: Right Ctrl, held, is released.
+    let mut gone = Viewer::attach(&server, VmRef::Id(id));
+    gone.key(key2(0, 0xe4, false));
+    assert_eq!(console.wait_for("+e4 "), "\n-45 +e2 +14 -e2 -14 +e4 ");
+    gone.conn.get_ref().shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(console.wait_for("-e4 "), "\n-45 +e2 +14 -e2 -14 +e4 -e4 ");
+
+    let mut last = Viewer::attach(&server, VmRef::Id(id));
+    last.key(key2(0x1b, 0x29, false));
+    last.wait_for_event(exited(id));
     server.stop().unwrap();
 }
 

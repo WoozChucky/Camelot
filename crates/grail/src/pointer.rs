@@ -116,7 +116,7 @@ impl PointerInput {
 /// One event, as the program reads it from `PTR_EVENT` and `PTR_EVENT_XY`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PointerEvent {
-    /// Absolute: the pixel (0..FB_WIDTH, 0..FB_HEIGHT). Relative: the motion since the
+    /// Absolute: the pixel, on the screen in its current mode. Relative: the motion since the
     /// previous event (dx, dy), saturated to 16 bits.
     pub x: i16,
     pub y: i16,
@@ -160,19 +160,10 @@ impl PointerEvent {
     }
 }
 
-/// Clamps a position into the framebuffer.
-fn clamp_pos(x: i64, y: i64) -> (u16, u16) {
-    (
-        x.clamp(0, FB_WIDTH as i64 - 1) as u16,
-        y.clamp(0, FB_HEIGHT as i64 - 1) as u16,
-    )
-}
-
 fn saturate_i16(v: i64) -> i16 {
     v.clamp(i16::MIN as i64, i16::MAX as i64) as i16
 }
 
-#[derive(Default)]
 pub struct Pointer {
     fifo: VecDeque<PointerEvent>,
     /// `PTR_EVENT_XY`: the position word of the event last popped from `PTR_EVENT`.
@@ -183,11 +174,48 @@ pub struct Pointer {
     /// `PTR_BUTTONS`), including changes whose events were dropped.
     pos: (u16, u16),
     buttons: u8,
+    /// The framebuffer's size in its current mode, which positions are clamped to.
+    screen: (u16, u16),
     /// Events dropped because the FIFO was full.
     pub dropped: u64,
 }
 
+impl Default for Pointer {
+    /// The pointer at reset, on a screen of the framebuffer's default mode.
+    fn default() -> Self {
+        Pointer {
+            fifo: VecDeque::new(),
+            latched_xy: 0,
+            ctrl: 0,
+            overflow: false,
+            pos: (0, 0),
+            buttons: 0,
+            screen: (FB_WIDTH as u16, FB_HEIGHT as u16),
+            dropped: 0,
+        }
+    }
+}
+
 impl Pointer {
+    /// The screen is now `width` × `height` pixels (a modeset, spec section 9.3):
+    /// absolute positions are clamped to it from now on, and the pointer moves inside it
+    /// if it was past its edge (with no event: the program set the mode, so it knows).
+    pub fn set_screen(&mut self, width: u32, height: u32) {
+        self.screen = (
+            width.clamp(1, u16::MAX as u32) as u16,
+            height.clamp(1, u16::MAX as u32) as u16,
+        );
+        self.pos = self.clamp_pos(self.pos.0.into(), self.pos.1.into());
+    }
+
+    /// Clamps a position into the screen.
+    fn clamp_pos(&self, x: i64, y: i64) -> (u16, u16) {
+        (
+            x.clamp(0, self.screen.0 as i64 - 1) as u16,
+            y.clamp(0, self.screen.1 as i64 - 1) as u16,
+        )
+    }
+
     /// Applies a change of the host's pointer and queues the event it makes, in the
     /// mode `PTR_CTRL` selects now. Returns true if an event was queued. Returns false
     /// if it changed nothing the program can see (no motion in the current mode, the
@@ -200,12 +228,12 @@ impl Pointer {
         let (pos, delta) = match input.motion {
             Motion::None => (self.pos, (0, 0)),
             Motion::To { x, y } => {
-                let pos = clamp_pos(x as i64, y as i64);
+                let pos = self.clamp_pos(x as i64, y as i64);
                 (pos, (pos.0 as i64 - old_x, pos.1 as i64 - old_y))
             }
             // A relative device reports the motion the host saw, even against an edge.
             Motion::By { dx, dy } => (
-                clamp_pos(old_x + dx as i64, old_y + dy as i64),
+                self.clamp_pos(old_x + dx as i64, old_y + dy as i64),
                 (dx as i64, dy as i64),
             ),
         };
@@ -452,6 +480,21 @@ mod tests {
             !p.push(PointerInput::move_to(w as i32, h as i32)),
             "no motion left: no event"
         );
+    }
+
+    #[test]
+    fn positions_follow_the_screen_size() {
+        let mut p = Pointer::default();
+        p.set_screen(1920, 1080);
+        p.push(PointerInput::move_to(5000, 5000));
+        assert_eq!(pop(&mut p), Some(abs(1919, 1079, 0)));
+        assert_eq!(p.position(), (1919, 1079));
+        // Back to a smaller screen: the pointer moves inside it, with no event.
+        p.set_screen(800, 600);
+        assert_eq!(p.position(), (799, 599));
+        assert_eq!(pop(&mut p), None);
+        p.push(PointerInput::move_to(1000, 10));
+        assert_eq!(pop(&mut p), Some(abs(799, 10, 0)));
     }
 
     #[test]

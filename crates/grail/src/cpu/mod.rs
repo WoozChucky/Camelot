@@ -212,8 +212,10 @@ impl Cpu {
     /// nothing else changes. When a timer can wake a hart (its `mie.MTIE` set), it stops
     /// one tick short of that hart's `mtimecmp`, so the next step raises the timer on
     /// time; a masked timer cannot end the wait (and nothing reads `mip` meanwhile), so
-    /// it does not limit the skip. Returns the ticks skipped (0 when some hart is not
-    /// stalled or has an interrupt pending).
+    /// it does not limit the skip. A device that keeps time (the framebuffer's vertical
+    /// blank, with its interrupt enabled: [`Bus::device_deadline`]) ends it the same way.
+    /// Returns the ticks skipped (0 when some hart is not stalled or has an interrupt
+    /// pending).
     ///
     /// Device lines are not sampled during the skip, so host input that arrives in the
     /// meantime is seen at the next step: callers keep `max` small (a pacing batch).
@@ -221,8 +223,8 @@ impl Cpu {
         if self.turn != 0 || !self.all_idle() {
             return 0;
         }
-        let clint = &mut self.bus.clint;
-        let mut ticks = max;
+        let clint = &self.bus.clint;
+        let mut ticks = max.min(self.bus.device_deadline().unwrap_or(u64::MAX));
         for hart in &self.harts {
             if hart.csr.mie & (1 << IRQ_M_TIMER) != 0 {
                 let to_timer = clint.mtimecmp[hart.id as usize]
@@ -231,7 +233,7 @@ impl Cpu {
                 ticks = ticks.min(to_timer);
             }
         }
-        clint.mtime = clint.mtime.wrapping_add(ticks);
+        self.bus.skip_time(ticks);
         ticks
     }
 
@@ -273,9 +275,12 @@ impl Cpu {
         self.turn = 0;
         if self.step_idle && self.wfi_skips_to_timer {
             // Nothing to do until a timer fires or a device raises a line: skip straight
-            // to the next timer. Device lines are sampled again next step.
-            if let Some(deadline) = self.bus.clint.next_deadline() {
-                self.bus.clint.mtime = deadline;
+            // to the next timer, or to just before the next vertical blank that can
+            // interrupt. Device lines are sampled again next step.
+            let mtime = self.bus.clint.mtime;
+            let to_timer = self.bus.clint.next_deadline().map(|d| d - mtime);
+            if let Some(ticks) = [to_timer, self.bus.device_deadline()].into_iter().flatten().min() {
+                self.bus.skip_time(ticks);
             }
         }
         true

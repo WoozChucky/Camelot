@@ -65,12 +65,6 @@ fn show_screen(server: &str, addrs: &[SocketAddr], vm: &VmRef) -> Result<(), Str
     let (conn, server) = connect(server, addrs)?;
     let mut session = ScreenSession::attach(conn, vm)
         .map_err(|e| format!("cannot attach to the screen of VM {vm}: {e}"))?;
-    let (width, height) = (session.screen.width(), session.screen.height());
-    if !WindowView::fits(width, height) {
-        return Err(format!(
-            "VM {vm} has a {width}x{height} screen; Herald's window shows 640x480 ones"
-        ));
-    }
     let summary = session.vm.clone();
     let mut view = WindowView::open(&format!("Herald: VM {} '{}'", summary.id, summary.name))?;
     eprintln!(

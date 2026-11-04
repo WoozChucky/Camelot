@@ -15,15 +15,19 @@
 //!
 //! The screen (the framebuffer) streams to the clients attached to it, the viewers
 //! (protocol doc, section 6.4). The VM keeps one [`Screen`]: exactly what every viewer
-//! has been sent. Between slices the thread compares the framebuffer with it and sends
-//! the rectangles that changed to every viewer; an unchanged screen sends nothing. Two
-//! limits keep a busy guest from flooding the link:
+//! has been sent. Between slices the thread compares what the framebuffer scans out
+//! (VRAM or a buffer in RAM, at its mode's size) with it and sends the rectangles that
+//! changed to every viewer; an unchanged screen sends nothing. A screen whose size
+//! changed (the guest set another mode) starts again at the new size: `ScreenResized`
+//! to every viewer, then the whole screen. Two limits keep a busy guest from flooding
+//! the link:
 //!
 //! - **Rate**: the thread looks at the screen at most once per [`SCREEN_INTERVAL`]
 //!   (~30 times a second), however often the guest redraws. Changes between two looks
 //!   go out together, as their final pixels.
-//! - **Backlog**: a viewer with more than [`SCREEN_BACKLOG`] bytes still queued (a slow
-//!   link) is sent no rectangles, and is marked behind. Once its queue has drained it
+//! - **Backlog**: a viewer with more than [`screen_backlog`] bytes still queued (a slow
+//!   link), a little over one full frame of the screen, is sent no rectangles, and is
+//!   marked behind. Once its queue has drained it
 //!   gets one full frame, which brings it level with the others. So a slow viewer sees
 //!   fewer frames rather than falling ever further behind and being cut off.
 //!
@@ -37,7 +41,11 @@
 //!
 //! Keys and pointer changes from viewers queue here (at most [`MAX_INPUT_QUEUE`] of
 //! each) and the thread hands them to the machine's keyboard and pointer devices
-//! before its next slice, as Grail's own window does between slices.
+//! before its next slice, as Grail's own window does between slices. A viewer that
+//! goes (it detaches, or its connection ends) lets go of what it held: the VM queues
+//! a release for every key it has down and every pointer button it holds, as Linux's
+//! input core releases the keys of a keyboard that is unplugged
+//! (`input_dev_release_keys`), so a viewer closed with Alt+F4 leaves no Alt held.
 //!
 //! A VM's network cards ([`Card`]) plug into Avalon's switches. A frame queued for
 //! one of them rings the VM's bell ([`Vm::kick`]), so a machine parked in `wfi`
@@ -87,11 +95,34 @@ const PARKED_NAP: Duration = Duration::from_millis(50);
 /// the viewers, however fast the guest draws.
 pub const SCREEN_INTERVAL: Duration = Duration::from_millis(33);
 
-/// A viewer with more than this many bytes queued and not yet written is sent no
-/// screen updates until it has caught up (then one full frame). A little over one full
-/// 640x480 frame (1.2 MB), and well below [`crate::MAX_QUEUED`], where a client is cut
-/// off.
-pub const SCREEN_BACKLOG: usize = 2 * 1024 * 1024;
+/// The least backlog a viewer has ([`screen_backlog`]), whatever the screen's size: what
+/// it was when every screen was 640x480, 1.7 full frames of it.
+pub const SCREEN_BACKLOG_MIN: usize = 2 * 1024 * 1024;
+/// How much more than one full frame of the screen a viewer's backlog is.
+pub const SCREEN_BACKLOG_MARGIN: usize = 512 * 1024;
+
+/// A viewer with more than this many bytes queued and not yet written is sent no screen
+/// updates until it has caught up (then one full frame). It follows the size of the
+/// screen, `width` × `height`: a little over one full frame of it
+/// ([`SCREEN_BACKLOG_MARGIN`] more), and at least [`SCREEN_BACKLOG_MIN`]. So a slow viewer
+/// of a small screen falls no further behind (in frames, and in time on its link) than it
+/// would if no bigger screen could be shown; one of a screen in the framebuffer's largest
+/// mode (1920x1080, 8.3 MB a frame) may have 8.4 MiB queued, below [`crate::MAX_QUEUED`]
+/// by more than two more full frames, so a viewer that is held back is never cut off.
+pub const fn screen_backlog(width: u32, height: u32) -> usize {
+    let backlog = width as usize * height as usize * 4 + SCREEN_BACKLOG_MARGIN;
+    if backlog > SCREEN_BACKLOG_MIN {
+        backlog
+    } else {
+        SCREEN_BACKLOG_MIN
+    }
+}
+const _: () = {
+    let largest = grail::framebuffer::MODES[grail::framebuffer::MODES.len() - 1];
+    let backlog = screen_backlog(largest.width, largest.height) as u64;
+    assert!(backlog > grail::framebuffer::MAX_FRAME_SIZE);
+    assert!(crate::outbox::MAX_QUEUED as u64 > backlog + 2 * grail::framebuffer::MAX_FRAME_SIZE);
+};
 
 /// Most keys, and most pointer changes, waiting for the machine. The devices' own
 /// FIFOs hold 64; more than this waiting means the guest is not reading them (or is
@@ -160,9 +191,73 @@ struct Inner {
 /// A client attached to the screen.
 struct Viewer {
     outbox: Arc<Outbox>,
-    /// Updates were held back from it (its queue was over [`SCREEN_BACKLOG`]): it gets a
+    /// Updates were held back from it (its queue was over [`screen_backlog`]): it gets a
     /// full frame once it has caught up.
     behind: bool,
+    /// The keys it has down, as their presses went to the machine, in the order they
+    /// went down: released when it goes ([`Viewer::let_go`]).
+    keys: Vec<keyboard::KeyEvent>,
+    /// The pointer buttons its last pointer change held.
+    buttons: u8,
+}
+
+impl Viewer {
+    fn new(outbox: &Arc<Outbox>) -> Viewer {
+        Viewer {
+            outbox: Arc::clone(outbox),
+            behind: false,
+            keys: Vec::new(),
+            buttons: 0,
+        }
+    }
+
+    /// Key `key` went to the machine: a press is held until its release. A key is the
+    /// physical key its usage names, or, with no usage the HID page defines, its ASCII
+    /// code; one that is neither reaches no mode and is not kept. So there are at most
+    /// as many held keys as the two tables have entries.
+    fn key(&mut self, key: keyboard::KeyEvent) {
+        let Some(id) = key_id(&key) else {
+            return;
+        };
+        let at = self.keys.iter().position(|k| key_id(k) == Some(id));
+        match (key.release, at) {
+            (false, None) => self.keys.push(key),
+            (true, Some(at)) => {
+                self.keys.remove(at);
+            }
+            // A repeat of a key held, or the release of one that was not.
+            _ => {}
+        }
+    }
+
+    /// The viewer is going: queues a release for each key it has down, in the order
+    /// they went down, with the code and usage of its press, and a pointer change that
+    /// lets go of its buttons. These go past [`MAX_INPUT_QUEUE`]: there are few of
+    /// them, and a release lost would leave the key stuck.
+    fn let_go(self, keys: &mut VecDeque<keyboard::KeyEvent>, pointer: &mut VecDeque<PointerInput>) {
+        for key in self.keys {
+            keys.push_back(keyboard::KeyEvent::release(key.code).with_usage(key.usage));
+        }
+        if self.buttons != 0 {
+            pointer.push_back(PointerInput {
+                motion: Motion::None,
+                buttons: 0,
+                wheel: 0,
+            });
+        }
+    }
+}
+
+/// Which key `key` is, for [`Viewer::key`]: its usage if the HID page defines it,
+/// otherwise 0x1_0000 plus its ASCII code if the spec's table has it.
+fn key_id(key: &keyboard::KeyEvent) -> Option<u32> {
+    if keyboard::usage::is_valid(key.usage) {
+        Some(key.usage as u32)
+    } else if keyboard::code::is_valid(key.code) {
+        Some(0x1_0000 | key.code as u32)
+    } else {
+        None
+    }
 }
 
 /// Collects what a machine writes to its UART. Only the VM's own thread touches it,
@@ -627,10 +722,7 @@ impl Vm {
         if client.event(&full) {
             match inner.viewers.iter_mut().find(|v| v.outbox.id == client.id) {
                 Some(v) => v.behind = false,
-                None => inner.viewers.push(Viewer {
-                    outbox: Arc::clone(client),
-                    behind: false,
-                }),
+                None => inner.viewers.push(Viewer::new(client)),
             }
         }
         // A paused thread that owes the screen a look takes it now.
@@ -638,12 +730,19 @@ impl Vm {
         Ok(())
     }
 
-    /// Detaches client `id` from the screen. False if it was not attached.
+    /// Detaches client `id` from the screen, releasing the keys and buttons it held.
+    /// False if it was not attached.
     pub fn detach_screen(&self, id: u64) -> bool {
         let mut inner = self.lock();
-        let before = inner.viewers.len();
-        inner.viewers.retain(|v| v.outbox.id != id);
-        inner.viewers.len() != before
+        let Some(at) = inner.viewers.iter().position(|v| v.outbox.id == id) else {
+            return false;
+        };
+        let viewer = inner.viewers.remove(at);
+        let Inner { keys, pointer, .. } = &mut *inner;
+        viewer.let_go(keys, pointer);
+        inner.kick = true;
+        self.wake.notify_all();
+        true
     }
 
     /// A key from client `id` for the keyboard device. Dropped (false) unless that
@@ -652,23 +751,42 @@ impl Vm {
     pub fn key_input(&self, id: u64, key: KeyEvent) -> bool {
         let key = keyboard::KeyEvent {
             code: key.code,
+            usage: key.usage,
             release: key.release,
+            repeat: key.repeat,
             shift: key.shift,
             ctrl: key.ctrl,
         };
-        self.input_event(id, |inner| queue(&mut inner.keys, key))
+        self.input_event(id, |inner, at| {
+            let queued = queue(&mut inner.keys, key);
+            if queued {
+                inner.viewers[at].key(key);
+            }
+            queued
+        })
     }
 
     /// A pointer change from client `id` for the pointer device; dropped as
     /// [`Vm::key_input`] drops keys.
     pub fn pointer_input(&self, id: u64, change: PointerChange) -> bool {
-        self.input_event(id, |inner| queue(&mut inner.pointer, pointer_input(change)))
+        self.input_event(id, |inner, at| {
+            let queued = queue(&mut inner.pointer, pointer_input(change));
+            if queued {
+                inner.viewers[at].buttons = change.buttons;
+            }
+            queued
+        })
     }
 
-    fn input_event(&self, id: u64, push: impl FnOnce(&mut Inner) -> bool) -> bool {
+    /// Queues input from client `id` with `push`, which is given the client's place in
+    /// the viewers, if it is one and the machine can still run.
+    fn input_event(&self, id: u64, push: impl FnOnce(&mut Inner, usize) -> bool) -> bool {
         let mut inner = self.lock();
         let live = matches!(inner.state, VmState::Created | VmState::Running | VmState::Paused);
-        if inner.gone || !live || !inner.viewers.iter().any(|v| v.outbox.id == id) || !push(&mut inner) {
+        let Some(at) = inner.viewers.iter().position(|v| v.outbox.id == id) else {
+            return false;
+        };
+        if inner.gone || !live || !push(&mut inner, at) {
             return false;
         }
         inner.kick = true;
@@ -727,8 +845,10 @@ impl Vm {
                 machine.pointer_event(change);
             }
             let steps = machine.run_for(SLICE, &mut |_| {});
-            // `run_for` ends a slice early once the guest has written FB_PRESENT, until
-            // the host takes that frame: take it, or every later slice is a single step.
+            // `run_for` ends a slice early once the guest has shown a new frame (written
+            // FB_PRESENT, made a modeset that took effect, or a page flip took effect at a
+            // vertical blank), until the host takes that frame: take it, or every later
+            // slice is a single step.
             // The screen goes out at the pace of `look`, not on presents: viewers see
             // the framebuffer, presented or not, as Grail's window does.
             machine.cpu.bus.fb.take_present();
@@ -813,23 +933,56 @@ impl Vm {
 
     /// Captures the screen if the machine has run since the last capture, and sends
     /// the rectangles that changed to every viewer that keeps up. A viewer over
-    /// [`SCREEN_BACKLOG`] gets nothing and is marked behind; a viewer that is behind
+    /// [`screen_backlog`] of the screen gets nothing and is marked behind; a viewer that is behind
     /// gets a full frame once it is under it again (or at once when `last`).
+    ///
+    /// The screen is what the framebuffer scans out, at its mode's size. When the guest
+    /// has changed modes, the screen starts again at the new size: every viewer, behind
+    /// or not, is sent `ScreenResized`, and the new screen goes out whole, as a full
+    /// frame would.
     fn update_viewers(&self, inner: &mut Inner, machine: &Machine, last: bool) {
         inner.screen_looked = Some(Instant::now());
+        let id = self.id;
+        let mut resized = None;
         let rects = if std::mem::take(&mut inner.screen_owed) {
-            let fb = &machine.cpu.bus.fb;
             // A display that is off shows black, as Grail's window does.
-            inner.screen.update(fb.enabled().then_some(fb.vram.as_slice()))
+            let frame = machine.cpu.bus.frame();
+            if (frame.width, frame.height) == (inner.screen.width(), inner.screen.height()) {
+                inner.screen.update(frame.pixels)
+            } else {
+                inner.screen = Screen::new(frame.width, frame.height);
+                inner.screen.update(frame.pixels);
+                resized = Some(event_frame(&Message::ScreenResized {
+                    vm: id,
+                    width: frame.width,
+                    height: frame.height,
+                    format: PIXEL_FORMAT_XRGB8888,
+                }));
+                vec![inner.screen.bounds()]
+            }
         } else {
             Vec::new()
         };
-        let id = self.id;
-        let Inner { viewers, screen, .. } = inner;
+        let Inner {
+            viewers,
+            screen,
+            keys,
+            pointer,
+            kick,
+            ..
+        } = inner;
         let frames: Vec<Frame> = rects.iter().map(|&r| event_frame(&screen.frame(id, r))).collect();
+        let backlog = screen_backlog(screen.width(), screen.height());
         let mut full = None;
-        viewers.retain_mut(|v| {
-            let keeping_up = v.outbox.queued() <= SCREEN_BACKLOG;
+        // Whether viewer `v` stays: false once its client is gone (or cut off).
+        let mut send = |v: &mut Viewer| {
+            // Every viewer learns the new size, so that what it is sent next fits.
+            if let Some(resized) = &resized {
+                if !v.outbox.event(resized) {
+                    return false;
+                }
+            }
+            let keeping_up = v.outbox.queued() <= backlog;
             if v.behind {
                 if !(keeping_up || last) {
                     return true;
@@ -847,7 +1000,16 @@ impl Vm {
             }
             // `event` is false once the client is gone (or cut off): it is dropped.
             frames.iter().all(|f| v.outbox.event(f))
-        });
+        };
+        for mut v in std::mem::take(viewers) {
+            if send(&mut v) {
+                viewers.push(v);
+            } else {
+                // Gone, as if it had detached: what it held is let go.
+                v.let_go(keys, pointer);
+                *kick = true;
+            }
+        }
     }
 
     /// New console output: into the scrollback and to every attached client.
@@ -891,13 +1053,14 @@ fn pointer_input(change: PointerChange) -> PointerInput {
 /// Whether a full-speed machine is stalled in `wfi` with only an external interrupt
 /// (input) left to wake it: every hart waits with no interrupt pending, and no hart's
 /// timer can fire (it is masked or not set; a set timer would end the wait at the next
-/// step).
+/// step), nor the framebuffer's vertical blank (its interrupt is off).
 fn parked(machine: &Machine) -> bool {
     let cpu = &machine.cpu;
     let timer_armed = |hart: &grail::cpu::Hart| {
         hart.csr.mie & (1 << IRQ_M_TIMER) != 0 && cpu.bus.clint.mtimecmp[hart.id as usize] != u64::MAX
     };
-    cpu.all_idle() && !cpu.harts().iter().any(timer_armed)
+    // A vertical blank whose interrupt is enabled wakes a hart as a timer would.
+    cpu.all_idle() && !cpu.harts().iter().any(timer_armed) && cpu.bus.device_deadline().is_none()
 }
 
 fn event_frame(msg: &Message) -> Frame {
@@ -938,6 +1101,83 @@ mod tests {
     use super::*;
     use crate::switch::Switch;
     use grail::net::MacAddr;
+
+    /// The backlog is a little over one full frame of the screen, at least 2 MiB, and
+    /// leaves room under the queue's limit in every mode.
+    #[test]
+    fn the_backlog_follows_the_screen() {
+        use grail::framebuffer::{MAX_FRAME_SIZE, MODES};
+        assert_eq!(
+            screen_backlog(640, 480),
+            SCREEN_BACKLOG_MIN,
+            "as for 640x480 before"
+        );
+        assert_eq!(screen_backlog(1, 1), SCREEN_BACKLOG_MIN);
+        assert_eq!(
+            screen_backlog(1920, 1080),
+            1920 * 1080 * 4 + SCREEN_BACKLOG_MARGIN
+        );
+        assert_eq!(screen_backlog(1280, 1024), 5 * 1024 * 1024 + 512 * 1024);
+        for mode in MODES {
+            let backlog = screen_backlog(mode.width, mode.height) as u64;
+            assert!(backlog > mode.frame_size(), "{mode:?}");
+            assert!(
+                backlog < mode.frame_size() + 2 * 1024 * 1024,
+                "under two frames of 640x480 more than one of {mode:?}"
+            );
+            assert!(crate::MAX_QUEUED as u64 > backlog + 2 * MAX_FRAME_SIZE);
+        }
+    }
+
+    #[test]
+    fn a_viewer_lets_go_of_what_it_held() {
+        use keyboard::{code, usage, KeyEvent};
+        let mut v = Viewer::new(&Arc::new(Outbox::new(1, || {})));
+        let shift = KeyEvent::key_press(usage::LEFT_SHIFT);
+        let a = KeyEvent::press(b'A').with_usage(usage::A).with_shift(true);
+        let enter = KeyEvent::press(code::ENTER).with_usage(usage::ENTER);
+        let kp_enter = KeyEvent::press(code::ENTER).with_usage(usage::KP_ENTER);
+        let f1 = KeyEvent::press(code::F1); // a viewer that knows no usages
+        for key in [
+            shift,
+            a,
+            a.with_repeat(true),
+            enter,
+            kp_enter,
+            f1,
+            KeyEvent::release(code::ENTER).with_usage(usage::ENTER),
+            KeyEvent::key_release(usage::ESCAPE),  // never went down
+            KeyEvent::press(0).with_usage(0xffff), // no key of either table
+        ] {
+            v.key(key);
+        }
+        v.buttons = grail::pointer::BUTTON_LEFT;
+        let (mut keys, mut pointer) = (VecDeque::new(), VecDeque::new());
+        v.let_go(&mut keys, &mut pointer);
+        // Each held key once, in the order it went down, with no Shift or Ctrl; the
+        // keypad's Enter, which shares Enter's code, is still held.
+        assert_eq!(
+            Vec::from(keys),
+            [
+                KeyEvent::key_release(usage::LEFT_SHIFT),
+                KeyEvent::release(b'A').with_usage(usage::A),
+                KeyEvent::release(code::ENTER).with_usage(usage::KP_ENTER),
+                KeyEvent::release(code::F1),
+            ]
+        );
+        assert_eq!(
+            Vec::from(pointer),
+            [PointerInput {
+                motion: Motion::None,
+                buttons: 0,
+                wheel: 0
+            }]
+        );
+        // Nothing held, nothing to let go.
+        let (mut keys, mut pointer) = (VecDeque::new(), VecDeque::new());
+        Viewer::new(&Arc::new(Outbox::new(2, || {}))).let_go(&mut keys, &mut pointer);
+        assert!(keys.is_empty() && pointer.is_empty());
+    }
 
     #[test]
     fn scrollback_keeps_the_latest_bytes() {

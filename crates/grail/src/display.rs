@@ -3,10 +3,12 @@
 //!
 //! Everything happens on the calling thread, and the window belongs to this call, not to
 //! a process-wide singleton: each machine can have its own. The CPU runs until the
-//! program writes `FB_PRESENT` or a slice of `SLICE` steps is done (or, with a real-time
+//! program shows a new frame (writes `FB_PRESENT`, makes a modeset that takes effect, or
+//! a page flip takes effect at a vertical blank) or a slice of `SLICE` steps is done (or, with a real-time
 //! clock, until it is ahead of the wall clock); then the window's messages are pumped
 //! and it is redrawn on a present, on a repaint request, or when ~16 ms of host time
-//! have passed since the last redraw (~60 Hz). Keys typed into the window reach the
+//! have passed since the last redraw (~60 Hz). The window shows what the framebuffer
+//! scans out, VRAM or a buffer in RAM, at the size of its mode. Keys typed into the
 //! keyboard device, and the mouse over it the pointer device, at the same points,
 //! between slices.
 
@@ -25,7 +27,8 @@ const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
 pub struct DisplayOptions {
     /// Open a window showing the framebuffer. Ignored where `WINDOW_SUPPORTED` is false.
     pub window: bool,
-    /// Write `frame-NNNN.ppm` here on every `FB_PRESENT` and once at exit.
+    /// Write `frame-NNNN.ppm` here on every new frame shown (`FB_PRESENT`, a modeset, a
+    /// page flip taking effect) and once at exit.
     pub dump_dir: Option<PathBuf>,
     /// Window title.
     pub title: String,
@@ -58,7 +61,7 @@ pub fn run(
     };
     let mut dump = |m: &Machine| -> Result<(), String> {
         if let Some(d) = &mut dumper {
-            d.dump(&m.cpu.bus.fb)
+            d.dump(&m.cpu.bus.frame())
                 .map_err(|e| format!("cannot write frame: {e}"))?;
         }
         Ok(())
@@ -120,8 +123,7 @@ impl Screen {
     }
 
     fn draw(w: &crate::window::Window, m: &Machine) {
-        let fb = &m.cpu.bus.fb;
-        w.draw(fb.enabled().then_some(fb.vram.as_slice()));
+        w.draw(m.cpu.bus.frame());
     }
 
     /// Pumps the window, hands the keys typed into it to the machine's keyboard and what
@@ -131,6 +133,8 @@ impl Screen {
         let Some(w) = &mut self.window else {
             return true;
         };
+        // The keys are the window's or the program's by the mode it chose last.
+        w.set_raw_keys(m.cpu.bus.kbd.raw());
         if !w.pump() {
             return false;
         }
@@ -266,7 +270,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Program(RunResult::Exited(0)));
         assert_eq!(
             String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap(),
-            "hi\n[dbg] pc=8000005c s1 = 0x00000004 (4)\n"
+            "hi\n[dbg] pc=800000f0 s1 = 0x00000004 (4)\n"
         );
     }
 

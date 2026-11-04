@@ -121,8 +121,8 @@ fn grail_screen(program: &[u8]) -> Vec<u8> {
     let mut m = grail::Machine::with_ram(16 * 1024 * 1024);
     m.load_elf(program).unwrap();
     assert_eq!(m.run(Some(100_000_000), |_| {}), grail::RunResult::Exited(0));
-    assert!(m.cpu.bus.fb.enabled());
-    m.cpu.bus.fb.vram.clone()
+    // What the display shows, from VRAM or RAM, at its mode's size.
+    m.cpu.bus.frame().pixels.expect("the display is on").to_vec()
 }
 
 fn key(code: u8) -> Input {
@@ -131,6 +131,8 @@ fn key(code: u8) -> Input {
         release: false,
         shift: false,
         ctrl: false,
+        repeat: false,
+        usage: 0,
     })
 }
 
@@ -181,6 +183,35 @@ fn the_framebuffer_example_reaches_the_view() {
     assert_eq!(late.run(&mut view).unwrap(), End::VmEnded(VmState::Exited(0)));
     assert_eq!(late.screen.pixels(), expected);
     assert_eq!(late.frames, 1);
+    server.stop().unwrap();
+}
+
+/// A guest that changes modes (`examples/flip`, 800x600 page flipped from RAM): the
+/// session's screen takes the new size, and the view is drawn at it, ending with the
+/// last frame Grail shows.
+#[test]
+fn a_mode_change_resizes_the_view() {
+    let server = server();
+    let id = create(&server, "flip", example("flip"));
+    let session = attach(&server, VmRef::Id(id));
+    assert_eq!((session.screen.width(), session.screen.height()), (640, 480));
+    let running = Running::start(session);
+    wait_until("the first drawing", || running.view.draws() > 0);
+    connect(&server)
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let view = running.view.clone();
+    let (end, session) = running.end();
+    assert_eq!(end.unwrap(), End::VmEnded(VmState::Exited(0)));
+    assert_eq!(session.resizes, 1);
+    assert_eq!((session.screen.width(), session.screen.height()), (800, 600));
+    let expected = grail_screen(&example("flip"));
+    assert!(session.screen.pixels() == expected);
+    let st = view.0.lock().unwrap();
+    let drawn = st.drawn.as_ref().unwrap();
+    assert_eq!((drawn.width(), drawn.height()), (800, 600));
+    assert!(drawn.pixels() == expected, "drawn as received");
+    drop(st);
     server.stop().unwrap();
 }
 
@@ -256,6 +287,37 @@ fn closing_the_view_detaches() {
     again.view.wait_for_pixel(320, 240, 0x203048);
     again.view.send(key(0x1b));
     assert_eq!(again.end().0.unwrap(), End::VmEnded(VmState::Exited(0)));
+    server.stop().unwrap();
+}
+
+/// The input of the pump that closes the view still goes out, before the detach: a
+/// window closed with Alt+F4 sends the keys of that pump, and the releases of every key
+/// held as it went. Here the last key is the Esc that ends the guest.
+#[test]
+fn input_taken_as_the_view_closes_goes_out() {
+    let server = server();
+    let id = create(&server, "ptr", example("pointer"));
+    connect(&server)
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let running = Running::start(attach(&server, VmRef::Id(id)));
+    running.view.wait_for_pixel(320, 240, 0x203048);
+    {
+        let mut st = running.view.0.lock().unwrap();
+        st.input.push(key(0x1b));
+        st.closed = true;
+    }
+    // The Esc goes before the detach, so the guest may end before the server answers
+    // it: either way the session is over.
+    let (end, _) = running.end();
+    let end = end.unwrap();
+    assert!(
+        matches!(end, End::Detached | End::VmEnded(VmState::Exited(0))),
+        "{end:?}"
+    );
+    wait_until("the guest to take the Esc", || {
+        state(&server, id) == VmState::Exited(0)
+    });
     server.stop().unwrap();
 }
 
@@ -393,6 +455,55 @@ fn a_frame_outside_the_screen_is_an_error() {
     assert_eq!(session.screen.pixel(1, 1), 0x22);
     assert_eq!(session.screen.pixel(0, 0), 0x111111);
     assert_eq!(session.frames, 2);
+    server.join().unwrap();
+}
+
+/// `ScreenResized` starts the screen again, black, at the new size, which the frames
+/// after it fill; a resize to a screen Herald cannot show is an error.
+#[test]
+fn a_resize_makes_a_new_screen() {
+    let (addr, server) = fake_server(|mut conn| {
+        fake_screen_attach(&mut conn, 4, 4, 0);
+        let resized = |width, height, format| Message::ScreenResized {
+            vm: 1,
+            width,
+            height,
+            format,
+        };
+        for msg in [
+            // Another VM's: passed over.
+            Message::ScreenResized {
+                vm: 2,
+                width: 1,
+                height: 1,
+                format: 0,
+            },
+            resized(6, 2, 0),
+            Message::ScreenFrame {
+                vm: 1,
+                x: 5,
+                y: 1,
+                width: 1,
+                height: 1,
+                pixels: vec![0x33, 0, 0, 0],
+            },
+            resized(6, 2, 7),
+        ] {
+            conn.send(&msg).unwrap();
+        }
+        let _ = conn.recv();
+    });
+    let conn = Connection::connect(addr.as_str(), herald::AGENT).unwrap();
+    let mut session = ScreenSession::attach(conn, &VmRef::Id(1)).unwrap();
+    let mut view = FakeView::default();
+    match session.run(&mut view) {
+        Err(avalon_proto::Error::Invalid(why)) => assert!(why.contains("pixel format 7"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!((session.screen.width(), session.screen.height()), (6, 2));
+    assert_eq!(session.screen.pixel(5, 1), 0x33, "the frame after the resize");
+    assert_eq!(session.screen.pixel(0, 0), 0, "black, not the old screen");
+    assert_eq!((session.resizes, session.frames), (1, 2));
     server.join().unwrap();
 }
 

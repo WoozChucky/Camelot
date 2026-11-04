@@ -48,6 +48,7 @@ pub mod ty {
     pub const KEY_INPUT: u16 = 0x0304;
     pub const SCREEN_DETACH: u16 = 0x0305;
     pub const POINTER_INPUT: u16 = 0x0306;
+    pub const SCREEN_RESIZED: u16 = 0x0307;
     // Block I/O.
     pub const BLOCK_OPEN: u16 = 0x0401;
     pub const BLOCK_OPENED: u16 = 0x0402;
@@ -109,6 +110,7 @@ pub const CATALOGUE: &[(u16, &str, MessageKind)] = {
         (ty::KEY_INPUT, "KeyInput", Event),
         (ty::SCREEN_DETACH, "ScreenDetach", Request),
         (ty::POINTER_INPUT, "PointerInput", Event),
+        (ty::SCREEN_RESIZED, "ScreenResized", Event),
         (ty::BLOCK_OPEN, "BlockOpen", Request),
         (ty::BLOCK_OPENED, "BlockOpened", Reply),
         (ty::BLOCK_READ, "BlockRead", Request),
@@ -168,6 +170,12 @@ pub enum MessageKind {
 /// Pixel format of `ScreenFrame`: little-endian words `0x00RRGGBB` (bytes B, G, R, X),
 /// the same as Grail's VRAM (`FB_FORMAT` 0, Excalibur spec section 9.3).
 pub const PIXEL_FORMAT_XRGB8888: u32 = 0;
+
+/// Bytes a `ScreenFrame`'s length field counts besides its pixels: the message type (2),
+/// `vm`, `x`, `y`, `width` and `height` (4 each) and the pixels' length (4). A rectangle
+/// of `n` pixel bytes fits in one frame if `n + SCREEN_FRAME_OVERHEAD` is at most
+/// [`crate::MAX_FRAME_LEN`].
+pub const SCREEN_FRAME_OVERHEAD: usize = 2 + 5 * 4 + 4;
 
 /// RAM size of [`HardwareProfile::default`], as for `grail::DEFAULT_RAM_SIZE`.
 pub const DEFAULT_RAM_SIZE: u64 = 4 * 1024 * 1024;
@@ -355,18 +363,33 @@ pub enum AttachKind {
 }
 
 /// A key press or release for the guest's keyboard device (Excalibur spec section
-/// 9.4). `code` is a key code from the spec's table, never 0.
+/// 9.4), in both of the device's forms: a viewer does not know which mode the guest
+/// chose, so it sends the character typed and the physical key, and the device keeps
+/// the one of its mode. At least one of `code` and `usage` is not 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyEvent {
+    /// ASCII mode's key code, from the spec's table; 0 for a key that types nothing
+    /// (a modifier alone, Home, an accented letter).
     pub code: u8,
     pub release: bool,
+    /// Shift was held (for ASCII mode).
     pub shift: bool,
+    /// Ctrl was held (for ASCII mode).
     pub ctrl: bool,
+    /// A press of a key already down (the viewer's auto-repeat): another press in
+    /// ASCII mode, nothing in raw mode. Never set on a release.
+    pub repeat: bool,
+    /// Raw mode's USB HID usage of the physical key (Keyboard/Keypad page); 0 if the
+    /// viewer does not know it.
+    pub usage: u16,
 }
 
 const KEY_RELEASE: u8 = 1 << 0;
 const KEY_SHIFT: u8 = 1 << 1;
 const KEY_CTRL: u8 = 1 << 2;
+const KEY_REPEAT: u8 = 1 << 3;
+/// Every key flag bit; the others must be 0.
+const KEY_FLAGS: u8 = KEY_RELEASE | KEY_SHIFT | KEY_CTRL | KEY_REPEAT;
 
 /// Pointer button bits of [`PointerChange::buttons`], as in the guest's pointer device
 /// (Excalibur spec section 9.7).
@@ -759,6 +782,15 @@ pub enum Message {
         vm: u32,
         pointer: PointerChange,
     },
+    /// Server: the VM's screen is now `width` × `height` in `format` (the guest changed
+    /// modes). The viewer's screen starts again from black at that size; a full
+    /// `ScreenFrame` follows.
+    ScreenResized {
+        vm: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+    },
 
     // ---- Block I/O (Lake) ----
     /// Attach a disk image. Answered by `BlockOpened` with a handle for the requests
@@ -901,6 +933,7 @@ impl Message {
             KeyInput { .. } => ty::KEY_INPUT,
             ScreenDetach { .. } => ty::SCREEN_DETACH,
             PointerInput { .. } => ty::POINTER_INPUT,
+            ScreenResized { .. } => ty::SCREEN_RESIZED,
             BlockOpen { .. } => ty::BLOCK_OPEN,
             BlockOpened { .. } => ty::BLOCK_OPENED,
             BlockRead { .. } => ty::BLOCK_READ,
@@ -974,7 +1007,12 @@ impl Message {
                     ErrorCode::from_u16(*n)
                 ));
             }
-            Message::KeyInput { key, .. } if key.code == 0 => return invalid("key code 0".into()),
+            Message::KeyInput { key, .. } if key.code == 0 && key.usage == 0 => {
+                return invalid("key with code 0 and usage 0".into())
+            }
+            Message::KeyInput { key, .. } if key.repeat && key.release => {
+                return invalid("a repeat is a press, not a release".into())
+            }
             Message::PointerInput { pointer, .. } if pointer.buttons & !POINTER_BUTTONS != 0 => {
                 return invalid(format!("reserved pointer buttons {:#04x}", pointer.buttons));
             }
@@ -1076,6 +1114,12 @@ impl Message {
                 width,
                 height,
                 format,
+            }
+            | ScreenResized {
+                vm,
+                width,
+                height,
+                format,
             } => {
                 w.u32(*vm);
                 w.u32(*width);
@@ -1105,12 +1149,14 @@ impl Message {
                     (key.release, KEY_RELEASE),
                     (key.shift, KEY_SHIFT),
                     (key.ctrl, KEY_CTRL),
+                    (key.repeat, KEY_REPEAT),
                 ] {
                     if on {
                         flags |= bit;
                     }
                 }
                 w.u8(flags);
+                w.u16(key.usage);
             }
             PointerInput { vm, pointer } => {
                 w.u32(*vm);
@@ -1297,6 +1343,12 @@ impl Message {
                 height: r.u32()?,
                 format: r.u32()?,
             },
+            ty::SCREEN_RESIZED => ScreenResized {
+                vm: r.u32()?,
+                width: r.u32()?,
+                height: r.u32()?,
+                format: r.u32()?,
+            },
             ty::SCREEN_FRAME => ScreenFrame {
                 vm: r.u32()?,
                 x: r.u32()?,
@@ -1309,7 +1361,7 @@ impl Message {
                 let vm = r.u32()?;
                 let code = r.u8()?;
                 let flags = r.u8()?;
-                if flags & !(KEY_RELEASE | KEY_SHIFT | KEY_CTRL) != 0 {
+                if flags & !KEY_FLAGS != 0 {
                     return Err(crate::Error::Invalid(format!("reserved key flags {flags:#04x}")));
                 }
                 KeyInput {
@@ -1319,6 +1371,8 @@ impl Message {
                         release: flags & KEY_RELEASE != 0,
                         shift: flags & KEY_SHIFT != 0,
                         ctrl: flags & KEY_CTRL != 0,
+                        repeat: flags & KEY_REPEAT != 0,
+                        usage: r.u16()?,
                     },
                 }
             }

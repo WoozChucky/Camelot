@@ -13,6 +13,7 @@ use crate::{ended, out_of_step, End};
 use avalon_proto::{
     kind_of, AttachKind, Connection, Error, Frame, KeyEvent, Message, MessageKind, PointerChange,
     PointerMotion, Screen, VmRef, VmState, VmSummary, PIXEL_FORMAT_XRGB8888, POINTER_BUTTONS,
+    SCREEN_FRAME_OVERHEAD,
 };
 use grail::pointer::Motion;
 use std::net::{Shutdown, TcpStream};
@@ -45,7 +46,9 @@ pub trait View {
     /// was uncovered, say).
     fn needs_redraw(&mut self) -> bool;
 
-    /// Shows `screen`.
+    /// Shows `screen`, which may have another size than the last one drawn (the guest
+    /// changed modes): the view then takes the new size, and its pointer input is in
+    /// the new screen's pixels from then on.
     fn draw(&mut self, screen: &Screen);
 
     /// The VM is now in `state`, for the view to show (in its title, say).
@@ -67,6 +70,8 @@ pub struct ScreenSession {
     pub screen: Screen,
     /// Frames received so far, the full one after the attach included.
     pub frames: u64,
+    /// Times the screen changed size (`ScreenResized`) so far.
+    pub resizes: u64,
     /// How long to wait for the server to confirm a detach (default
     /// [`crate::DETACH_TIMEOUT`]).
     pub detach_timeout: Duration,
@@ -82,7 +87,8 @@ impl ScreenSession {
     /// Attaches to `vm`'s screen on `conn` (a connection after its handshake), then asks
     /// for the VM's name and state. Fails with the server's error if there is no such
     /// VM, and with [`Error::Invalid`] for a screen this version cannot show (a format
-    /// other than XRGB8888, or an empty screen).
+    /// other than XRGB8888, an empty screen, or one larger than a frame can carry).
+    /// The screen may change size later, when the guest changes modes: `ScreenResized`.
     pub fn attach(mut conn: Connection<TcpStream>, vm: &VmRef) -> Result<ScreenSession, Error> {
         let (id, width, height) = match conn.request(&Message::ScreenAttach { vm: vm.clone() })? {
             Message::ScreenAttached {
@@ -91,11 +97,7 @@ impl ScreenSession {
                 height,
                 format,
             } => {
-                if format != PIXEL_FORMAT_XRGB8888 || Screen::byte_len(width, height).is_none() {
-                    return Err(Error::Invalid(format!(
-                        "a {width}x{height} screen in pixel format {format}, which Herald cannot show"
-                    )));
-                }
+                check_screen(width, height, format)?;
                 (vm, width, height)
             }
             other => return Err(Error::Unexpected(other.type_code())),
@@ -110,6 +112,7 @@ impl ScreenSession {
             vm,
             screen: Screen::new(width, height),
             frames: 0,
+            resizes: 0,
             detach_timeout: crate::DETACH_TIMEOUT,
             detaching: false,
             held: None,
@@ -172,7 +175,12 @@ impl ScreenSession {
                         self.conn.send(&msg)?;
                     }
                 } else {
-                    // Closed: detach, and end once the server says so.
+                    // Closed: what the last pump took in goes first (the keys of
+                    // Alt+F4, and the releases of every key held as the window went),
+                    // then detach, and end once the server says so.
+                    for msg in input_messages(self.vm.id, &mut self.held, view.take_input()) {
+                        self.conn.send(&msg)?;
+                    }
                     self.conn.send(&Message::ScreenDetach { vm: self.vm.id })?;
                     self.detaching = true;
                     deadline = Some(Instant::now() + self.detach_timeout);
@@ -242,6 +250,22 @@ impl ScreenSession {
                 self.frames += 1;
                 self.dirty = true;
             }
+            // The guest changed modes: a new screen, black, at the new size, which the
+            // full frame that follows fills; the view takes the size when it draws it.
+            (
+                Some(MessageKind::Event),
+                Ok(Message::ScreenResized {
+                    vm,
+                    width,
+                    height,
+                    format,
+                }),
+            ) if vm == id => {
+                check_screen(width, height, format)?;
+                self.screen = Screen::new(width, height);
+                self.resizes += 1;
+                self.dirty = true;
+            }
             (Some(MessageKind::Event), Ok(Message::VmStateChanged { vm, state })) if vm == id => {
                 self.vm.state = state;
                 view.vm_state(state);
@@ -271,11 +295,26 @@ impl ScreenSession {
     }
 }
 
+/// Whether Herald can show a `width` × `height` screen in pixel format `format`, as
+/// `ScreenAttached` or `ScreenResized` gives it: XRGB8888, not empty, and no larger
+/// than a full frame the protocol can carry, its pixels and the rest of the
+/// `ScreenFrame` message in one frame. [`Error::Invalid`] if not.
+pub fn check_screen(width: u32, height: u32, format: u32) -> Result<(), Error> {
+    let room = avalon_proto::MAX_FRAME_LEN as usize - SCREEN_FRAME_OVERHEAD;
+    let fits = Screen::byte_len(width, height).is_some_and(|len| len <= room);
+    if format != PIXEL_FORMAT_XRGB8888 || !fits {
+        return Err(Error::Invalid(format!(
+            "a {width}x{height} screen in pixel format {format}, which Herald cannot show"
+        )));
+    }
+    Ok(())
+}
+
 /// The messages that carry `input` to VM `vm`: one `KeyInput` per key, one
 /// `PointerInput` per pointer change, except that a run of moves with the same
 /// buttons held and no wheel goes as its last move (a mouse reports far more moves
 /// than a guest's pointer FIFO holds; only where it ends up matters). Keys with code
-/// 0, which no key has, are dropped.
+/// 0 and usage 0, which no key has, are dropped.
 ///
 /// A button change is not part of the run around it, though Grail's window reports a
 /// press or a release as a move to where it happened, with the new buttons: the moves
@@ -290,7 +329,7 @@ pub fn input_messages(vm: u32, held: &mut Option<u8>, input: Vec<Input>) -> Vec<
     let mut last_is_run = false;
     for item in input {
         match item {
-            Input::Key(key) if key.code != 0 => {
+            Input::Key(key) if key.code != 0 || key.usage != 0 => {
                 out.push(Message::KeyInput { vm, key });
                 last_is_run = false;
             }
@@ -314,13 +353,16 @@ pub fn input_messages(vm: u32, held: &mut Option<u8>, input: Vec<Input>) -> Vec<
     out
 }
 
-/// A key from Grail's window, for the wire.
+/// A key from Grail's window, for the wire: the character typed and the physical key
+/// (its HID usage), so the guest's keyboard mode picks the one it sees.
 pub fn key_from_grail(key: grail::keyboard::KeyEvent) -> KeyEvent {
     KeyEvent {
         code: key.code,
         release: key.release,
         shift: key.shift,
         ctrl: key.ctrl,
+        repeat: key.repeat,
+        usage: key.usage,
     }
 }
 
@@ -347,7 +389,23 @@ pub fn pointer_from_grail(input: grail::pointer::PointerInput, width: u32, heigh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use avalon_proto::{POINTER_LEFT, POINTER_RIGHT};
+    use avalon_proto::{MAX_FRAME_LEN, POINTER_LEFT, POINTER_RIGHT};
+
+    /// A screen fits if its full frame does, message and all: one whose pixels alone
+    /// are under `MAX_FRAME_LEN`, but not with the `ScreenFrame` around them, does not.
+    #[test]
+    fn a_screen_fits_if_its_full_frame_does() {
+        let widest = ((MAX_FRAME_LEN as usize - SCREEN_FRAME_OVERHEAD) / 4) as u32;
+        assert!(check_screen(widest, 1, PIXEL_FORMAT_XRGB8888).is_ok());
+        assert!(check_screen(widest + 1, 1, PIXEL_FORMAT_XRGB8888).is_err());
+        assert!(
+            (widest as usize + 1) * 4 < MAX_FRAME_LEN as usize,
+            "the pixels alone fit"
+        );
+        assert!(check_screen(1920, 1080, PIXEL_FORMAT_XRGB8888).is_ok());
+        assert!(check_screen(0, 480, PIXEL_FORMAT_XRGB8888).is_err());
+        assert!(check_screen(640, 480, 1).is_err());
+    }
 
     fn to(x: u32, y: u32, buttons: u8) -> Input {
         Input::Pointer(PointerChange {
@@ -363,7 +421,24 @@ mod tests {
             release: false,
             shift: false,
             ctrl: false,
+            repeat: false,
+            usage: 0,
         })
+    }
+
+    #[test]
+    fn keys_that_type_nothing_go_by_their_usage() {
+        // Shift alone has no code but a usage: the guest sees it in raw mode.
+        let shift = KeyEvent {
+            usage: 0xe1,
+            ..match key(0) {
+                Input::Key(k) => k,
+                _ => unreachable!(),
+            }
+        };
+        let msgs = input_messages(7, &mut None, vec![Input::Key(shift), key(0)]);
+        assert_eq!(msgs, [Message::KeyInput { vm: 7, key: shift }]);
+        msgs[0].check().unwrap();
     }
 
     fn pointer_of(msg: &Message) -> PointerChange {
@@ -508,7 +583,10 @@ mod tests {
                 wheel: -128,
             }
         );
-        let k = grail::keyboard::KeyEvent::release(b'q').with_ctrl(true);
+        // Both forms of the key go out: the code and the physical key.
+        let k = grail::keyboard::KeyEvent::release(b'q')
+            .with_usage(0x14)
+            .with_ctrl(true);
         assert_eq!(
             key_from_grail(k),
             KeyEvent {
@@ -516,6 +594,20 @@ mod tests {
                 release: true,
                 shift: false,
                 ctrl: true,
+                repeat: false,
+                usage: 0x14,
+            }
+        );
+        let k = grail::keyboard::KeyEvent::key_press(0xe3).with_repeat(true);
+        assert_eq!(
+            key_from_grail(k),
+            KeyEvent {
+                code: 0,
+                release: false,
+                shift: false,
+                ctrl: false,
+                repeat: true,
+                usage: 0xe3,
             }
         );
     }

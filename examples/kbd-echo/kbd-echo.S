@@ -1,11 +1,27 @@
 # Keyboard echo for Grail, polling: waits on KBD_STATUS, pops events from KBD_DATA
-# (spec section 9.4) and echoes every key press to the UART. Releases are skipped.
+# (spec section 9.4) and echoes them to the UART. It starts in the keyboard's ASCII
+# mode, where it echoes every key press (releases are skipped):
 #
 #   printable keys, Enter, Tab   the character itself
 #   Backspace                    "\b \b" (erases the last character on a terminal)
-#   other keys (arrows, F1-F12)  their code in hex, e.g. [80] for Up, [90] for F1
+#   other keys (arrows, F1-F11)  their code in hex, e.g. [80] for Up, [90] for F1
 #   Ctrl held                    a '^' before the key, e.g. ^c for Ctrl+C
-#   Esc                          prints the number of presses seen (Esc included)
+#   F12                          switches to raw mode (KBD_CTRL bit 1)
+#
+# In raw mode it prints every event, press and release, as the key's HID usage in hex
+# (every usage a keyboard reports fits in two digits): "+04 " for a press of the key
+# A, "-04 " for its release, so Shift+a is "+e1 +04 -04 -e1 ". Modifiers alone, Alt
+# and the keys that type nothing show up too.
+#
+#   F12 (usage 45)               switches back to ASCII mode
+#
+# Switching prints a newline. The mode change empties the keyboard's FIFO, so the
+# release of the F12 that switched comes in the new mode: in raw mode it shows as a
+# "-45 " with no press before it.
+#
+# In both modes:
+#
+#   Esc (usage 29)               prints the number of presses seen (Esc included)
 #                                with xcal.dbg, then halts with exit code 0
 #
 # Key events come from the framebuffer window, so run it with --fb (Windows) and type
@@ -47,10 +63,18 @@
     .equ KBD_BASE,      0x30001000
     .equ KBD_STATUS,    0               # bit 0: event available
     .equ KBD_DATA,      4               # pops one event
+    .equ KBD_CTRL,      8
+    .equ KBD_CTRL_RAW,  2               # KBD_CTRL bit 1: raw mode
+    # ASCII mode
     .equ KBD_RELEASE,   0x100           # KBD_DATA bit 8
     .equ KBD_CTRL_HELD, 0x400           # KBD_DATA bit 10
     .equ KEY_BACKSPACE, 0x08
     .equ KEY_ESC,       0x1b
+    .equ KEY_F12,       0x9b
+    # Raw mode
+    .equ RAW_RELEASE,   16              # KBD_DATA bit 16 (as a shift amount)
+    .equ USAGE_ESCAPE,  0x29
+    .equ USAGE_F12,     0x45
 
     .equ UART_BASE,     0x10000000
     .equ UART_THR,      0
@@ -69,18 +93,55 @@ poll:
     andi  t0, t0, 1
     beqz  t0, poll
     lw    s2, KBD_DATA(s0)              # s2 = event
+    lw    t0, KBD_CTRL(s0)
+    andi  t0, t0, KBD_CTRL_RAW
+    bnez  t0, raw
     andi  t0, s2, KBD_RELEASE
     bnez  t0, poll
     addi  s1, s1, 1
     andi  s3, s2, 0xff                  # s3 = key code
     li    t0, KEY_ESC
     beq   s3, t0, done
+    li    t0, KEY_F12
+    beq   s3, t0, switch
     andi  t0, s2, KBD_CTRL_HELD
     beqz  t0, 1f
     li    a0, '^'
     call  putc
 1:  mv    a0, s3
     call  putkey
+    j     poll
+
+# A raw-mode event: s3 = usage (bits 15:0), s4 = 1 on release (bit 16).
+raw:
+    li    t0, 0xffff
+    and   s3, s2, t0
+    srli  s4, s2, RAW_RELEASE
+    bnez  s4, 1f
+    addi  s1, s1, 1                     # a press: count it, and maybe act on it
+    li    t0, USAGE_ESCAPE
+    beq   s3, t0, done
+    li    t0, USAGE_F12
+    beq   s3, t0, switch
+1:  li    a0, '+'
+    beqz  s4, 2f
+    li    a0, '-'
+2:  call  putc
+    srli  a0, s3, 4
+    call  puthex
+    andi  a0, s3, 0xf
+    call  puthex
+    li    a0, ' '
+    call  putc
+    j     poll
+
+# F12: the other mode. Changing KBD_CTRL bit 1 empties the FIFO.
+switch:
+    lw    t0, KBD_CTRL(s0)
+    xori  t0, t0, KBD_CTRL_RAW
+    sw    t0, KBD_CTRL(s0)
+    li    a0, '\n'
+    call  putc
     j     poll
 
 done:

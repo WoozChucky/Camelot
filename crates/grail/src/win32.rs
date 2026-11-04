@@ -14,6 +14,7 @@ pub type HICON = HANDLE;
 pub type HCURSOR = HANDLE;
 pub type HBRUSH = HANDLE;
 pub type HMENU = HANDLE;
+pub type HMONITOR = HANDLE;
 pub type WPARAM = usize;
 pub type LPARAM = isize;
 pub type LRESULT = isize;
@@ -37,6 +38,11 @@ pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_KEYUP: u32 = 0x0101;
 pub const WM_SYSKEYDOWN: u32 = 0x0104;
 pub const WM_SYSKEYUP: u32 = 0x0105;
+/// The character of an Alt chord, from `TranslateMessage`; `DefWindowProcW` turns it
+/// into a menu mnemonic (`SC_KEYMENU`), or a beep when there is no menu.
+pub const WM_SYSCHAR: u32 = 0x0106;
+/// Key message `lParam` bit 24: an extended key (scan code prefixed with 0xE0).
+pub const KF_EXTENDED_LPARAM: isize = 1 << 24;
 pub const WM_SYSCOMMAND: u32 = 0x0112;
 pub const WM_MOUSEMOVE: u32 = 0x0200;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
@@ -57,23 +63,36 @@ pub const WHEEL_DELTA: i32 = 120;
 /// the character of an Alt chord (Alt+Space), or 0 for a lone Alt tap or F10.
 pub const SC_KEYMENU: usize = 0xf100;
 pub const PM_REMOVE: u32 = 0x0001;
+pub const PM_NOREMOVE: u32 = 0x0000;
 
 pub const GWLP_USERDATA: i32 = -21;
 
 // Virtual-key codes (winuser.h). Letters and digits are their ASCII uppercase codes.
+/// Ctrl+Pause (Ctrl+Break).
+pub const VK_CANCEL: u32 = 0x03;
 pub const VK_BACK: u32 = 0x08;
 pub const VK_TAB: u32 = 0x09;
 pub const VK_RETURN: u32 = 0x0d;
 pub const VK_SHIFT: u32 = 0x10;
 pub const VK_CONTROL: u32 = 0x11;
 pub const VK_MENU: u32 = 0x12;
+pub const VK_PAUSE: u32 = 0x13;
 pub const VK_ESCAPE: u32 = 0x1b;
 #[cfg(test)]
 pub const VK_SPACE: u32 = 0x20;
-#[cfg(test)]
+/// Print Screen.
+pub const VK_SNAPSHOT: u32 = 0x2c;
+pub const VK_LWIN: u32 = 0x5b;
+pub const VK_RWIN: u32 = 0x5c;
+pub const VK_NUMLOCK: u32 = 0x90;
+// The modifiers by side, which GetKeyState also takes (key messages carry VK_SHIFT,
+// VK_CONTROL and VK_MENU).
 pub const VK_LSHIFT: u32 = 0xa0;
-#[cfg(test)]
+pub const VK_RSHIFT: u32 = 0xa1;
 pub const VK_LMENU: u32 = 0xa4;
+pub const VK_RMENU: u32 = 0xa5;
+/// A character sent as a key (`SendInput` with `KEYEVENTF_UNICODE`), not a key.
+pub const VK_PACKET: u32 = 0xe7;
 pub const VK_LEFT: u32 = 0x25;
 pub const VK_UP: u32 = 0x26;
 pub const VK_RIGHT: u32 = 0x27;
@@ -84,6 +103,9 @@ pub const VK_F10: u32 = 0x79;
 pub const VK_F12: u32 = 0x7b;
 pub const VK_LCONTROL: u32 = 0xa2;
 pub const VK_RCONTROL: u32 = 0xa3;
+
+/// `MapVirtualKeyW` map type: virtual key to scan code, 0xE0xx for extended keys.
+pub const MAPVK_VK_TO_VSC_EX: u32 = 4;
 
 /// `ToUnicode` flag: do not change the keyboard state (dead keys), Windows 10 1607+.
 pub const TOUNICODE_KEEP_STATE: u32 = 1 << 2;
@@ -140,6 +162,21 @@ pub struct RECT {
     pub right: i32,
     pub bottom: i32,
 }
+
+/// What `GetMonitorInfoW` fills in: the monitor's rectangle and its work area (the
+/// monitor less the taskbar and docked bars), in virtual-screen coordinates.
+#[repr(C)]
+#[derive(Default)]
+pub struct MONITORINFO {
+    /// `size_of::<MONITORINFO>()`, set by the caller.
+    pub cbSize: u32,
+    pub rcMonitor: RECT,
+    pub rcWork: RECT,
+    pub dwFlags: u32,
+}
+
+/// `MonitorFromWindow`: the monitor nearest the window when it is on none.
+pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
 #[repr(C)]
 pub struct MSG {
@@ -238,10 +275,12 @@ extern "system" {
     pub fn SetCapture(hwnd: HWND) -> HWND;
     pub fn ReleaseCapture() -> BOOL;
     pub fn GetCapture() -> HWND;
-    #[cfg(test)]
     pub fn MoveWindow(hwnd: HWND, x: i32, y: i32, width: i32, height: i32, repaint: BOOL) -> BOOL;
-    #[cfg(test)]
     pub fn GetWindowRect(hwnd: HWND, rect: *mut RECT) -> BOOL;
+    pub fn IsZoomed(hwnd: HWND) -> BOOL;
+    pub fn IsIconic(hwnd: HWND) -> BOOL;
+    pub fn MonitorFromWindow(hwnd: HWND, flags: u32) -> HMONITOR;
+    pub fn GetMonitorInfoW(monitor: HMONITOR, info: *mut MONITORINFO) -> BOOL;
     pub fn SetWindowTextW(hwnd: HWND, text: *const u16) -> BOOL;
     pub fn LoadCursorW(hinst: HINSTANCE, name: *const u16) -> HCURSOR;
     pub fn GetDC(hwnd: HWND) -> HDC;
@@ -256,6 +295,8 @@ extern "system" {
     pub fn GetKeyState(vkey: i32) -> i16;
     pub fn GetKeyboardState(state: *mut u8) -> BOOL;
     pub fn ToUnicode(vkey: u32, scan: u32, state: *const u8, buf: *mut u16, len: i32, flags: u32) -> i32;
+    pub fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
+    pub fn GetMessageTime() -> i32;
     #[cfg(target_pointer_width = "64")]
     pub fn SetWindowLongPtrW(hwnd: HWND, index: i32, value: isize) -> isize;
     #[cfg(target_pointer_width = "64")]
@@ -333,6 +374,7 @@ mod tests {
             assert_eq!(size_of::<CREATESTRUCTW>(), 48);
         }
         assert_eq!(size_of::<RECT>(), 16);
+        assert_eq!(size_of::<MONITORINFO>(), 40);
         assert_eq!(size_of::<BITMAPINFOHEADER>(), 40);
         assert_eq!(size_of::<BITMAPINFO>(), 44);
     }

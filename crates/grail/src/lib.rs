@@ -226,8 +226,10 @@ impl Machine {
 
     /// Hands a key event to the keyboard device (spec section 9.4). This is the one way
     /// in for every host-side producer: the framebuffer window, tests, or a remote
-    /// client. Returns false if the event was dropped: its code is not in the spec's key
-    /// code table (see [`keyboard::code::is_valid`]), or the keyboard FIFO is full.
+    /// client. The event carries both forms of the key, its ASCII-mode code and its
+    /// raw-mode HID usage, and the device queues the one of the mode the program chose.
+    /// Returns false if the event was dropped: it has no valid form in that mode (see
+    /// [`keyboard::Keyboard::push`]), or the keyboard FIFO is full.
     pub fn key_event(&mut self, ev: KeyEvent) -> bool {
         self.cpu.bus.kbd.push(ev)
     }
@@ -250,9 +252,12 @@ impl Machine {
     /// Runs at most `steps` steps and returns how many ran, without ever sleeping: the
     /// building block for a host that schedules machines itself. A step runs one
     /// instruction on every hart ([`Cpu::step`]). Stops early when the program exits, or
-    /// at the end of a step that wrote `FB_PRESENT` (right after the instruction that
-    /// did it, on a one-hart machine), so the host can show or dump that frame. Only a
-    /// write during this call counts: a present the host has not taken yet
+    /// at the end of a step that showed a new frame (right after the instruction that
+    /// did it, on a one-hart machine), so the host can show or dump that frame: one that
+    /// wrote `FB_PRESENT`, made a modeset that took effect (a write to `FB_MODE` the
+    /// display refused shows nothing new), or whose vertical blank made a page flip take
+    /// effect ([`framebuffer::Framebuffer::shown`]). Only a frame shown during
+    /// this call counts: a present the host has not taken yet
     /// ([`framebuffer::Framebuffer::take_present`]) does not stop the next call.
     ///
     /// With a real-time clock it also stops once the machine is ~1 ms ahead of the wall
@@ -290,14 +295,14 @@ impl Machine {
     }
 
     /// Runs at most `steps` steps (fewer when paced). Stops at exit, and right after a
-    /// `FB_PRESENT` write when `STOP_ON_PRESENT`.
+    /// new frame is shown when `STOP_ON_PRESENT`.
     fn run_steps<const STOP_ON_PRESENT: bool>(&mut self, steps: u64, trace: &mut impl FnMut(&Cpu)) -> u64 {
         let budget = match &mut self.pacer {
             None => steps,
             Some(p) => steps.min(p.allowance(Instant::now())),
         };
         let paced = self.pacer.is_some();
-        let presents = self.cpu.bus.fb.presents;
+        let shown = self.cpu.bus.fb.shown();
         let mut n = 0;
         while n < budget && self.cpu.bus.exit.is_none() {
             if paced {
@@ -314,7 +319,7 @@ impl Machine {
             }
             self.cpu.step_traced(trace);
             n += 1;
-            if STOP_ON_PRESENT && self.cpu.bus.fb.presents != presents {
+            if STOP_ON_PRESENT && self.cpu.bus.fb.shown() != shown {
                 break;
             }
         }
