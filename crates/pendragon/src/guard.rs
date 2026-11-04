@@ -29,6 +29,12 @@ use std::net::{IpAddr, SocketAddr};
 /// The header that carries the token.
 pub const TOKEN_HEADER: &str = "x-pendragon-token";
 
+/// How a page's WebSocket carries the token: a page cannot set headers of its own on
+/// a WebSocket's handshake, only the subprotocols it offers (`Sec-WebSocket-Protocol`),
+/// so it offers one more, this prefix and the token. Kubernetes passes its bearer
+/// tokens the same way. Pendragon never chooses it, so the answer does not repeat it.
+pub const TOKEN_PROTOCOL: &str = "pendragon.token.";
+
 /// Sent with every response: no framing, no MIME sniffing, no referrer (the page's
 /// URL carries the token when it is first opened), and a policy that allows only
 /// Pendragon's own script, style and requests.
@@ -123,9 +129,25 @@ impl Guard {
         }
     }
 
-    /// The request carries the token.
+    /// The request carries the token: in its header, or for the handshake of a
+    /// screen's WebSocket (the one route that is a WebSocket) in the subprotocols it
+    /// offers ([`TOKEN_PROTOCOL`]). Anywhere else the subprotocols are not looked
+    /// at: they stand in for the header only where a page has no other way, and an
+    /// upgrade to any other route is an ordinary request that wants the header.
     pub fn check_token(&self, req: &Request) -> Result<(), Refusal> {
-        match req.header(TOKEN_HEADER) {
+        let offered = || {
+            req.headers
+                .iter()
+                .filter(|(n, _)| n == "sec-websocket-protocol")
+                .flat_map(|(_, v)| v.split(','))
+                .find_map(|p| p.trim().strip_prefix(TOKEN_PROTOCOL))
+        };
+        let token = match req.header(TOKEN_HEADER) {
+            Some(token) => Some(token),
+            None if crate::api::is_screen(req) && crate::websocket::is_upgrade(req) => offered(),
+            None => None,
+        };
+        match token {
             None => Err(Refusal(
                 "no token: open the URL pendragon printed when it started (it ends in ?token=...)".into(),
             )),
@@ -218,10 +240,15 @@ mod tests {
     use super::*;
 
     fn request(headers: &[(&str, &str)], body: &[u8]) -> Request {
+        request_to("/api/vms", headers, body)
+    }
+
+    fn request_to(path: &str, headers: &[(&str, &str)], body: &[u8]) -> Request {
         Request {
             method: "POST".into(),
-            path: "/api/vms".into(),
-            segments: vec!["api".into(), "vms".into()],
+            version: "HTTP/1.1".into(),
+            path: path.into(),
+            segments: path[1..].split('/').map(String::from).collect(),
             query: vec![],
             headers: headers
                 .iter()
@@ -294,6 +321,38 @@ mod tests {
         }
         assert!(constant_time_eq(b"", b""));
         assert!(!constant_time_eq(b"a", b"b"));
+    }
+
+    /// The token in a subprotocol counts on a screen's WebSocket handshake only:
+    /// not on another route, and not without the upgrade.
+    #[test]
+    fn tokens_in_a_subprotocol() {
+        let g = guard("127.0.0.1:7402", &[]);
+        let upgrade = ("Upgrade", "websocket");
+        let offered = (
+            "Sec-WebSocket-Protocol",
+            "pendragon.screen, pendragon.token.secret",
+        );
+        let check = |path: &str, headers: &[(&str, &str)]| g.check_token(&request_to(path, headers, b""));
+        assert!(check("/api/vms/7/screen", &[upgrade, offered]).is_ok());
+        let wrong = (
+            "Sec-WebSocket-Protocol",
+            "pendragon.screen, pendragon.token.secreT",
+        );
+        let refused = check("/api/vms/7/screen", &[upgrade, wrong]).unwrap_err();
+        assert!(refused.0.starts_with("wrong token"), "{refused:?}");
+        for (path, headers) in [
+            ("/api/vms", &[upgrade, offered][..]),
+            ("/api/vms/7", &[upgrade, offered]),
+            ("/api/vms/7/console", &[upgrade, offered]),
+            ("/api/vms/7/screen", &[offered]),
+        ] {
+            let refused = check(path, headers).unwrap_err();
+            assert!(
+                refused.0.starts_with("no token"),
+                "{path} {headers:?}: {refused:?}"
+            );
+        }
     }
 
     #[test]
