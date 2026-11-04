@@ -74,6 +74,8 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     fn pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -144,12 +146,26 @@ mod tests {
         assert_eq!(read_to_clean_end(&client), b"");
     }
 
+    /// `stop` is asked again while the peer stays open and silent, not only at first:
+    /// a server shutting down while a connection lingers does not wait out [`LINGER`].
     #[test]
     fn stop_ends_the_wait() {
         let (client, server) = pair();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flip = Duration::from_millis(200);
+        let flipper = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(flip);
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
         let start = Instant::now();
-        close_gracefully(&server, || true);
-        assert!(start.elapsed() < LINGER);
+        close_gracefully(&server, || stop.load(Ordering::SeqCst));
+        let took = start.elapsed();
+        flipper.join().unwrap();
+        assert!(took >= flip, "{took:?}");
+        assert!(took < LINGER * 3 / 4, "{took:?}: not ended by stop");
         drop(client);
     }
 }
