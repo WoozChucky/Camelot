@@ -18,6 +18,7 @@
 use std::fmt;
 
 pub mod lines;
+pub mod units;
 
 // e_type
 pub const ET_NONE: u16 = 0;
@@ -88,6 +89,7 @@ pub const STT_SECTION: u8 = 3;
 pub const STT_FILE: u8 = 4;
 pub const STT_COMMON: u8 = 5;
 pub const STT_TLS: u8 = 6;
+pub const STT_GNU_IFUNC: u8 = 10;
 
 /// Sizes of the fixed-layout records of ELF32 (the ones merlin-as and
 /// merlin-ld write).

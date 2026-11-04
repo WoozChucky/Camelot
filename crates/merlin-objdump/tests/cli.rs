@@ -118,6 +118,22 @@ fn unparsable_isa_mapping_symbols_warn() {
     assert_eq!((code, err.as_str()), (0, ""));
 }
 
+/// `-l` reads `.debug_aranges` as LLVM does: in an object built with
+/// relaxation a length there is a relocation pair over a 0, which LLVM reads
+/// unrelocated, as the list's end, and warns of (its message, with our
+/// prefix). Without `-l` nothing reads it.
+#[test]
+fn a_premature_end_of_debug_aranges_warns() {
+    let file = "crates/merlin-objdump/tests/fixtures/rv64/units-aranges.o";
+    let (code, out, err) = objdump(&["-d", "-l", file]);
+    assert_eq!(code, 0);
+    let want = "address range table at offset 0x0 has a premature terminator entry at offset 0x20";
+    assert_eq!(err, format!("merlin-objdump: warning: '{file}': {want}\n"));
+    assert!(out.contains("; g():\n"), "{out}");
+    let (code, _, err) = objdump(&["-d", file]);
+    assert_eq!((code, err.as_str()), (0, ""));
+}
+
 fn fixtures() -> Vec<PathBuf> {
     let mut files = vec![root().join("examples/hello/hello.elf")];
     for f in [
@@ -129,6 +145,10 @@ fn fixtures() -> Vec<PathBuf> {
         "rv64/isa.o",
         "rv64/relocs.o",
         "rv64/linked.elf",
+        "debug.o",
+        "rv64/units.o",
+        "rv64/units-dwarf4.o",
+        "rv64/units-aranges.o",
     ] {
         files.push(root().join("crates/merlin-objdump/tests/fixtures").join(f));
     }
@@ -141,6 +161,7 @@ fn broken_files_do_not_panic() {
     let mut opts = Options {
         disassemble: true,
         contents: true,
+        line_numbers: true,
         ..Options::default()
     };
     opts.set_all_headers();

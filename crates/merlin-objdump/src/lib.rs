@@ -44,7 +44,8 @@ pub struct Options {
     /// Show the instruction word next to each instruction; `--no-show-raw-insn` clears it.
     pub raw_insn: bool,
     /// `-l`: with `-d`, the function and the source `file:line` each run of
-    /// instructions comes from (the `.debug_line` line tables).
+    /// instructions comes from (the symbol table, and the line tables of the
+    /// compile units that cover the code).
     pub line_numbers: bool,
 }
 

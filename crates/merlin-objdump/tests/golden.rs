@@ -167,6 +167,31 @@ const CASES: &[(&str, &str, &[&str])] = &[
     ("rv64/debug-o.h", RV64_DEBUG, &["-h"]),
     ("rv64/debug-o.dl", RV64_DEBUG, &["-d", "-l"]),
     ("rv64/lines-elf.dl", RV64_LINES, &["-d", "-l"]),
+    (
+        "rv64/units-o.dl",
+        "crates/merlin-objdump/tests/fixtures/rv64/units.o",
+        &["-d", "-l"],
+    ),
+    (
+        "rv64/units-dwarf4-o.dl",
+        "crates/merlin-objdump/tests/fixtures/rv64/units-dwarf4.o",
+        &["-d", "-l"],
+    ),
+    (
+        "rv64/units-aranges-o.dl",
+        "crates/merlin-objdump/tests/fixtures/rv64/units-aranges.o",
+        &["-d", "-l"],
+    ),
+    (
+        "rv64/nocu-o.dl",
+        "crates/merlin-objdump/tests/fixtures/rv64/nocu.o",
+        &["-d", "-l"],
+    ),
+    (
+        "rv64/units-elf.dl",
+        "crates/merlin-objdump/tests/fixtures/rv64/units.elf",
+        &["-d", "-l"],
+    ),
     ("rv64/linked-elf.d", RV64_LINKED, &["-d"]),
     ("rv64/linked-elf.x", RV64_LINKED, &["-x"]),
     ("rv64/linked-elf.s", RV64_LINKED, &["-s"]),

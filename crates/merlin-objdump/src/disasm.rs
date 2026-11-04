@@ -307,24 +307,33 @@ fn inst_start_padding(column: usize, raw_insn: bool) -> usize {
     }
 }
 
-/// A line table sequence for `-l`: the section it is in (in an object), its
-/// start and end, and its rows (address, path, line).
-type Sequence = (Option<usize>, u64, u64, Vec<(u64, String, u32)>);
-
-/// `-l`: where each address comes from, as llvm-objdump prints it. Before an
-/// instruction, `; name():` when the function it is in is another than the
-/// last one's, and `; file:line` when its line (the line table row at or
-/// before it) is another, or the function is. The function is the symbol
-/// LLVM's symbolizer takes: the last function, object or untyped symbol at or
-/// before the address in its section (not a mapping symbol like `$x` or a
-/// fake label `.L0 `), if the
-/// address is inside it (a symbol of size 0 runs to the next one). Unlike
-/// llvm-objdump, the line table is read without a compile unit.
+/// `-l`: where each address comes from, as llvm-objdump prints it (through
+/// LLVM's symbolizer). Before an instruction, `; name():` when the function
+/// it is in is another than the last one's, and `; file:line` when its line
+/// is another, or the function is.
+///
+/// The function is the symbol LLVM's symbolizer takes: the last function,
+/// object or untyped symbol at or before the address (not a mapping symbol
+/// like `$x` or a fake label `.L0 `) in an allocated section, if the address
+/// is inside it (a symbol of size 0 runs to the next one); in an object,
+/// whatever section it is in, all of them starting at 0. (LLVM falls back to
+/// the debug information's name for an address no symbol covers; such an
+/// address gets none here.)
+///
+/// The line is the line table row at or before the address, in the table of
+/// the compile unit whose ranges hold the address (`.debug_aranges`, or the
+/// unit's own ranges, `elf::units`): code no unit covers has no lines, and a
+/// line table no unit names (hand-written `.loc`s without a `.debug_info`)
+/// is never read. In an object the row must be in the address's section.
+/// The path is the table's, after the unit's compilation directory
+/// ([`elf::lines::LineTable::file_path`]).
 struct SourceLines {
-    sequences: Vec<Sequence>,
-    /// The symbols a function name may come from, sorted: (section, address,
-    /// size, name).
-    functions: Vec<(usize, u64, u64, String)>,
+    tables: Vec<elf::lines::LineTable>,
+    units: Vec<elf::units::CompileUnit>,
+    unit_ranges: elf::units::UnitRanges,
+    /// The symbols a function name may come from, sorted by (address, size):
+    /// (address, size, name).
+    functions: Vec<(u64, u64, String)>,
     relocatable: bool,
     /// What the last instruction's lines said: its function and its line.
     last: (Option<String>, Option<(String, u32)>),
@@ -332,61 +341,67 @@ struct SourceLines {
 
 impl SourceLines {
     fn new(elf: &Elf) -> Result<SourceLines, Error> {
-        let mut sequences = Vec::new();
-        for t in elf.line_tables()? {
-            for seq in &t.sequences {
-                let (Some(first), Some(end)) = (seq.rows.first(), seq.rows.last()) else {
-                    continue;
-                };
-                let rows = seq
-                    .rows
-                    .iter()
-                    .filter(|r| !r.end_sequence)
-                    .map(|r| (r.addr, t.path(r.file).to_string(), r.line))
-                    .collect();
-                sequences.push((seq.section, first.addr, end.addr, rows));
-            }
-        }
-        let mut functions: Vec<(usize, u64, u64, String)> = elf
+        let tables = elf.line_tables()?;
+        let units = elf.compile_units()?;
+        let unit_ranges = elf.unit_ranges(&units)?;
+        let mut functions: Vec<(u64, u64, String)> = elf
             .symbols()?
             .into_iter()
-            .filter(|s| matches!(s.ty(), elf::STT_NOTYPE | elf::STT_FUNC | elf::STT_OBJECT))
-            // Not RISC-V's mapping symbols (`$x`, `$d`) and fake labels (`.L0 `).
-            .filter(|s| !s.name.is_empty() && !s.name.starts_with('$') && !s.name.starts_with(".L0 "))
-            .filter_map(|s| {
-                let sec = s.section()?;
-                elf.sections
-                    .get(sec)?
-                    .is_alloc()
-                    .then_some((sec, s.value, s.size, s.name))
+            .filter(|s| {
+                matches!(
+                    s.ty(),
+                    elf::STT_NOTYPE | elf::STT_FUNC | elf::STT_OBJECT | elf::STT_GNU_IFUNC
+                )
             })
+            // Not RISC-V's mapping symbols (`$x`, `$d`) and fake labels (`.L0 `).
+            .filter(|s| !s.name.is_empty() && mapping_kind(&s.name).is_none() && !s.name.starts_with(".L0 "))
+            .filter(|s| {
+                s.section()
+                    .and_then(|sec| elf.sections.get(sec))
+                    .is_some_and(|sec| sec.is_alloc())
+            })
+            .map(|s| (s.value, s.size, s.name))
             .collect();
-        // By address, then size: of several at one address the biggest wins.
-        functions.sort_by_key(|f| (f.0, f.1, f.2));
+        // By address, then size (a stable sort): of several at one address
+        // the biggest wins, and of those the last.
+        functions.sort_by_key(|f| (f.0, f.1));
         Ok(SourceLines {
-            sequences,
+            tables,
+            units,
+            unit_ranges,
             functions,
             relocatable: elf.header.ty == elf::ET_REL,
             last: (None, None),
         })
     }
 
-    /// The line table row for `addr` in section `sec`: path and line.
+    /// The line for `addr` in section `sec`: path and line.
     fn row(&self, sec: usize, addr: u64) -> Option<(String, u32)> {
-        let (_, _, _, rows) = self.sequences.iter().find(|(s, start, end, _)| {
-            (!self.relocatable || *s == Some(sec)) && (*start..*end).contains(&addr)
+        let offset = self.unit_ranges.find(addr)?;
+        let unit = self
+            .units
+            .iter()
+            .find(|u| u.offset <= offset && offset < u.next)?;
+        let table = self.tables.iter().find(|t| Some(t.offset) == unit.stmt_list)?;
+        let rows = table.sequences.iter().find_map(|seq| {
+            let (first, end) = (seq.rows.first()?, seq.rows.last()?);
+            let here =
+                (!self.relocatable || seq.section == Some(sec)) && (first.addr..end.addr).contains(&addr);
+            here.then_some(&seq.rows)
         })?;
-        let i = rows.partition_point(|r| r.0 <= addr).checked_sub(1)?;
-        Some((rows[i].1.clone(), rows[i].2))
+        let rows: Vec<_> = rows.iter().filter(|r| !r.end_sequence).collect();
+        let row = rows[rows.partition_point(|r| r.addr <= addr).checked_sub(1)?];
+        let path = table.file_path(row.file, unit.comp_dir.as_deref().unwrap_or(""))?;
+        Some((path, row.line))
     }
 
     fn print(&mut self, out: &mut String, sec: usize, addr: u64) {
-        let i = self.functions.partition_point(|f| (f.0, f.1) <= (sec, addr));
+        let i = self.functions.partition_point(|f| f.0 <= addr);
         let function = i
             .checked_sub(1)
             .map(|i| &self.functions[i])
-            .filter(|(s, start, size, _)| *s == sec && (*size == 0 || addr - start < *size))
-            .map(|f| f.3.clone());
+            .filter(|(start, size, _)| *size == 0 || addr - start < *size)
+            .map(|f| f.2.clone());
         let line = self.row(sec, addr).filter(|(_, l)| *l != 0);
         let new_function = function.is_some() && function != self.last.0;
         if let (true, Some(f)) = (new_function, &function) {
@@ -613,6 +628,12 @@ pub(crate) fn disassemble(
                         Inst::Illegal(w)
                     };
                     if let Some(s) = source.as_mut() {
+                        // LLVM reads .debug_aranges at the first lookup.
+                        for w in std::mem::take(&mut s.unit_ranges.warnings) {
+                            if !warnings.contains(&w) {
+                                warnings.push(w);
+                            }
+                        }
                         s.print(out, idx, pc);
                     }
                     let d = inst.format(Some(pc), syntax);

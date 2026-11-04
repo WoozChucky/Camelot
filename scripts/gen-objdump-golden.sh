@@ -78,6 +78,14 @@ rm "$FIX/rv64/linked.o"
 $CC64 -mno-relax "$FIX/rv64/lines.s" -o "$FIX/rv64/lines.o"
 ld.lld -Ttext=0x10000 -e add "$FIX/rv64/lines.o" -o "$FIX/rv64/lines.elf"
 rm "$FIX/rv64/lines.o"
+# -l through compile units: units.c as DWARF 5, as DWARF 4 with a relative
+# compilation directory, and with .debug_aranges; nocu.s, a line table no
+# unit names; units.elf, both linked.
+$CC64 -O1 -g -fdebug-compilation-dir=. "$FIX/units.c" -o "$FIX/rv64/units.o"
+$CC64 -O1 -gdwarf-4 -fdebug-compilation-dir=build "$FIX/units.c" -o "$FIX/rv64/units-dwarf4.o"
+$CC64 -O1 -g -gdwarf-aranges -fdebug-compilation-dir=. "$FIX/units.c" -o "$FIX/rv64/units-aranges.o"
+$CC64 "$FIX/rv64/nocu.s" -o "$FIX/rv64/nocu.o"
+ld.lld -Ttext=0x10000 -e f "$FIX/rv64/units.o" "$FIX/rv64/nocu.o" -o "$FIX/rv64/units.elf"
 
 gen() { # golden-name input llvm-objdump-args...
   local name=$1 input=$2
@@ -142,6 +150,12 @@ gen rv64/debug-o.d             "$FIX/rv64/debug.o" -d
 gen rv64/debug-o.h             "$FIX/rv64/debug.o" -h
 gen_lines rv64/debug-o.dl      "$FIX/rv64/debug.o" -d -l
 gen_lines rv64/lines-elf.dl    "$FIX/rv64/lines.elf" -d -l
+gen_lines rv64/units-o.dl      "$FIX/rv64/units.o" -d -l
+gen_lines rv64/units-dwarf4-o.dl "$FIX/rv64/units-dwarf4.o" -d -l
+# Its .debug_aranges makes llvm-objdump warn on stderr of a premature end.
+gen_lines rv64/units-aranges-o.dl "$FIX/rv64/units-aranges.o" -d -l
+gen_lines rv64/nocu-o.dl       "$FIX/rv64/nocu.o" -d -l
+gen_lines rv64/units-elf.dl    "$FIX/rv64/units.elf" -d -l
 gen rv64/linked-elf.d          "$FIX/rv64/linked.elf" -d
 gen rv64/linked-elf.x          "$FIX/rv64/linked.elf" -x
 gen rv64/linked-elf.s          "$FIX/rv64/linked.elf" -s
