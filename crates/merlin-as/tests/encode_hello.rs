@@ -8,13 +8,12 @@
 //!   relocation on it. Ours must be identical: same words (the labels clang
 //!   resolves, merlin-as resolves too) and the same relocations.
 //! * `tests/golden/hello.dr.txt`: `llvm-objdump -dr` of clang's object. The
-//!   disassembly of ours by merlin-objdump (which prints what llvm-objdump 21
+//!   disassembly of ours by merlin-objdump (which prints what llvm-objdump 23
 //!   prints) must be the same text, labels and relocations included.
 //!
 //! hello.S is the same source on both widths, and assembled for RV64 it must
-//! match `tests/golden/rv64/hello.ref` (the same script) in the same way. Its
-//! `rv64/hello.dr.txt` is not compared yet: merlin-objdump reads ELF32 objects
-//! only, until #150 teaches it ELF64.
+//! match `tests/golden/rv64/hello.ref` and `tests/golden/rv64/hello.dr.txt`
+//! (the same script) in the same way.
 //!
 //! Linking the result with ld.lld and running it in Grail is checked by
 //! `crates/xtask/tests/hello.rs`.
@@ -130,11 +129,20 @@ fn hello_matches_clang_on_rv64() {
     compare(Xlen::Rv64, REF64);
 }
 
-/// RV32 only for now: the RV64 twin, against `golden/rv64/hello.dr.txt`,
-/// waits for merlin-objdump to read ELF64 (#150); today `dump` refuses it.
 #[test]
 fn hello_disassembles_like_clang() {
-    let elf = merlin_as::elf::write(&assemble(Xlen::Rv32));
+    disassembles_like_clang(Xlen::Rv32, include_str!("golden/hello.dr.txt"));
+}
+
+#[test]
+fn hello_disassembles_like_clang_on_rv64() {
+    disassembles_like_clang(Xlen::Rv64, include_str!("golden/rv64/hello.dr.txt"));
+}
+
+/// merlin-objdump's `-dr` of our object for `xlen` must be `golden`, what
+/// llvm-objdump prints of clang's.
+fn disassembles_like_clang(xlen: Xlen, golden: &str) {
+    let elf = merlin_as::elf::write(&assemble(xlen));
     let opts = merlin_objdump::Options {
         disassemble: true,
         relocs: true,
@@ -150,6 +158,6 @@ fn hello_disassembles_like_clang() {
             None => l.to_string(),
         })
         .collect();
-    let want: Vec<&str> = include_str!("golden/hello.dr.txt").lines().collect();
-    assert_eq!(ours, want);
+    let want: Vec<&str> = golden.lines().collect();
+    assert_eq!(ours, want, "{xlen:?}");
 }

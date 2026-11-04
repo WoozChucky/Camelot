@@ -11,8 +11,8 @@
 //!   does: the +-2 GiB window of lui, auipc and call, R_RISCV_64 data; and a
 //!   higher-half program, linked at 0xffffffff80000000 and loaded in RAM with
 //!   `AT(ADDR(.x) - OFFSET)`); the others are copies of the RV32 set's
-//!   sources. Their `.objdump.txt` files are compared from #150, when
-//!   merlin-objdump reads ELF64.
+//!   sources. Their `.objdump.txt` files are compared with merlin-objdump's
+//!   listing, as the RV32 set's are.
 //! * The ELF64 file merlin-ld writes, its map, its line tables (R_RISCV_64
 //!   addresses) and `strip_debug` of it.
 //! * Every check of the object reader on ELF64's layout: its record sizes
@@ -645,6 +645,34 @@ fn hello_matches_ld_lld_and_runs() {
         "hello/link",
         "Hello from Camelot!\n[dbg] pc=0000000080000018 a0 = 0x0000000000000014 (20)\n",
     );
+}
+
+/// examples/multiobj's RV64 build, two clang objects (`main-rv64.S`,
+/// `print.S`): calls, pc-relative addresses and `.dword` pointers from one into
+/// the other (R_RISCV_64), `.data` written at run time and `.bss` (link.rs's
+/// twin).
+#[test]
+fn multiobj_matches_ld_lld_and_runs() {
+    for (obj, ty) in [
+        ("multiobj/main-rv64.o", "R_RISCV_CALL_PLT"),
+        ("multiobj/main-rv64.o", "R_RISCV_64"),
+        ("multiobj/main-rv64.o", "R_RISCV_PCREL_HI20"),
+        ("multiobj/print.o", "R_RISCV_PCREL_LO12_I"),
+    ] {
+        assert!(reloc_types(obj).contains_key(ty), "{obj} has no {ty}");
+    }
+    let linked = common::assert_matches_ld_lld_exit(
+        RV64,
+        "multiobj/link",
+        "Hello from two objects!\nputs lives in print.S.\n\
+         [dbg] pc=0000000080000034 a0 = 0x000000000000002f (47)\n",
+        42,
+    );
+    let l = &linked.layout;
+    assert_eq!(l.class, Class::Elf64);
+    let bss = l.section(".bss").unwrap();
+    assert_eq!(l.symbol("bytes_written"), Some(bss.addr));
+    assert!(l.symbol("puts").unwrap() > l.symbol("_start").unwrap());
 }
 
 /// Spec §10: merlin-ld does not merge SHF_MERGE strings (link.rs's twin).

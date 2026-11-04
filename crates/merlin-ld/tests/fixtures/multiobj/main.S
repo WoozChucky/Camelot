@@ -11,6 +11,8 @@
 # starts at zero). Then it shows that count with xcal.dbg, adds one to `runs`
 # (.data, initially 41) and halts with exit code `runs`: 42.
 #
+# main-rv64.S is this object for the RV64 build.
+#
 # Built with our own tools by `cargo xtask examples multiobj`, which does the same as
 #
 #   merlin-as examples/multiobj/main.S -o main.o

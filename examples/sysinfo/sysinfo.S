@@ -7,6 +7,8 @@
 #
 # Halts with exit code 0, or 1 if there is no sysinfo block (bad magic).
 #
+# sysinfo-rv64.S is the same program for RV64 machines (version 2 of the block).
+#
 # Built with our own tools by `cargo xtask examples sysinfo`, which does the same as
 #
 #   merlin-as examples/sysinfo/sysinfo.S -o sysinfo.o

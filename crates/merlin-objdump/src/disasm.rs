@@ -1,19 +1,100 @@
 //! `-d`: disassembly of the executable sections, laid out like llvm-objdump:
 //! a `<symbol>:` label wherever a symbol starts, one line per instruction,
-//! branch targets resolved to `<symbol+offset>`, and (with `-r`) relocations
-//! under the instruction they patch.
+//! branch targets resolved to `<symbol+offset>`, data in code (what the
+//! assembler marks with a `$d` mapping symbol) as `.word`/`.short`/`.byte`,
+//! and (with `-r`) relocations under the instruction they patch.
+//!
+//! Addresses are u64 for both widths. An ELF32 file is RV32 code: the branch
+//! targets its operands show wrap at 2^32, as `excalibur` formats them. The
+//! targets symbols are looked up for, and the `auipc` values behind `jalr`
+//! targets, are 64-bit on both widths, as in LLVM.
 
 use crate::{reloc_type, reloc_value, relocation_sections, Options};
 use elf::{Elf, Error, Symbol};
-use excalibur::{decode, Inst, Syntax, Xlen};
+use excalibur::{decode, Inst, Syntax};
 use std::fmt::Write;
 
 /// A symbol that can label code or name a branch target.
 #[derive(Clone, Debug)]
 struct Label {
-    addr: u32,
+    addr: u64,
     name: String,
     ty: u8,
+}
+
+/// RISC-V's mapping symbols: `$x` (code, `$x<isa>` naming the ISA it is
+/// for, as LLVM's assembler writes them) and `$d` (data), with or without a
+/// suffix (`$x.0`, as GNU's writes them).
+fn mapping_kind(name: &str) -> Option<MapKind> {
+    if name.starts_with("$x") {
+        Some(MapKind::Code)
+    } else if name.starts_with("$d") {
+        Some(MapKind::Data)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MapKind {
+    Data,
+    Code,
+}
+
+/// Checks the ISA of a `$x<isa>` mapping symbol the way LLVM reads it
+/// (RISCVISAInfo::parseNormalizedArchString): `rv32` or `rv64`, then
+/// extensions separated by `_`, each a name and a version `<major>p<minor>`,
+/// the first being the base `i` or `e` (`rv64i2p1_m2p0_zicsr2p0`). Only the
+/// form is checked, not whether an extension exists. The error is LLVM's
+/// message.
+fn check_isa(isa: &str) -> Result<(), String> {
+    if !isa
+        .bytes()
+        .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || c == b'_')
+    {
+        return Err("string may only contain [a-z0-9_]".into());
+    }
+    let mut rest = match isa.strip_prefix("rv32").or_else(|| isa.strip_prefix("rv64")) {
+        Some(r) if r.starts_with(['i', 'e']) => r,
+        _ => return Err("arch string must begin with valid base ISA".into()),
+    };
+    let mut seen: Vec<&str> = Vec::new();
+    while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix('_') {
+            if r.is_empty() || r.starts_with('_') {
+                return Err("extension name missing after separator '_'".into());
+            }
+            rest = r;
+        }
+        let (ext, r) = rest.split_at(rest.find('_').unwrap_or(rest.len()));
+        rest = r;
+        let Some((prefix, minor)) = ext.rsplit_once('p').filter(|(_, m)| !m.is_empty()) else {
+            return Err("extension lacks version in expected format".into());
+        };
+        if minor.parse::<u32>().is_err() || !minor.bytes().all(|c| c.is_ascii_digit()) {
+            return Err("failed to parse minor version number".into());
+        }
+        let name = prefix.trim_end_matches(|c: char| c.is_ascii_digit());
+        let major = &prefix[name.len()..];
+        if major.is_empty() {
+            return Err("extension lacks version in expected format".into());
+        }
+        if name.is_empty() {
+            return Err("missing extension name".into());
+        }
+        if major.parse::<u32>().is_err() {
+            return Err("failed to parse major version number".into());
+        }
+        let first = name.as_bytes()[0];
+        if matches!(first, b'z' | b's' | b'x') && name.as_bytes().get(1).is_none_or(|c| c.is_ascii_digit()) {
+            return Err(format!("'{}' must be followed by a letter", first as char));
+        }
+        if seen.contains(&name) {
+            return Err(format!("duplicate extension '{name}'"));
+        }
+        seen.push(name);
+    }
+    Ok(())
 }
 
 /// llvm-objdump skips section and file symbols, mapping symbols (`$x`, `$d`)
@@ -21,8 +102,7 @@ struct Label {
 fn is_label(s: &Symbol) -> bool {
     !s.name.is_empty()
         && !matches!(s.ty(), elf::STT_SECTION | elf::STT_FILE)
-        && !s.name.starts_with("$x")
-        && !s.name.starts_with("$d")
+        && mapping_kind(&s.name).is_none()
         && !s.name.starts_with(".L0 ")
 }
 
@@ -35,7 +115,7 @@ struct Labels {
     /// In a `.o`, targets are only looked up in the section being disassembled.
     relocatable: bool,
     /// (address, section index) of every section, sorted by address.
-    section_addrs: Vec<(u32, usize)>,
+    section_addrs: Vec<(u64, usize)>,
 }
 
 impl Labels {
@@ -43,9 +123,8 @@ impl Labels {
         let mut per_section = vec![Vec::new(); elf.sections.len()];
         let mut absolute = Vec::new();
         for s in elf.symbols()?.iter().filter(|s| is_label(s)) {
-            // ELF32 only (`dump` checks), so every address fits in 32 bits.
             let label = Label {
-                addr: s.value as u32,
+                addr: s.value,
                 name: s.name.clone(),
                 ty: s.ty(),
             };
@@ -59,11 +138,11 @@ impl Labels {
             list.sort_by_key(key);
         }
         absolute.sort_by_key(key);
-        let mut section_addrs: Vec<(u32, usize)> = elf
+        let mut section_addrs: Vec<(u64, usize)> = elf
             .sections
             .iter()
             .enumerate()
-            .map(|(i, s)| (s.addr as u32, i))
+            .map(|(i, s)| (s.addr, i))
             .collect();
         section_addrs.sort_by_key(|&(a, _)| a);
         Ok(Labels {
@@ -78,7 +157,7 @@ impl Labels {
     /// the last symbol at or before it in the section that contains it (in an
     /// executable, the section with the highest start address not above it),
     /// falling back to absolute symbols.
-    fn lookup(&self, current: usize, target: u32) -> Option<&Label> {
+    fn lookup(&self, current: usize, target: u64) -> Option<&Label> {
         let mut candidates: Vec<&[Label]> = Vec::new();
         if self.relocatable {
             candidates.push(&self.per_section[current]);
@@ -100,9 +179,21 @@ impl Labels {
     }
 }
 
+/// Where a branch or `jal` at `pc` goes, as llvm-objdump names it: in 64
+/// bits on both widths (LLVM's MCInstrAnalysis), so on RV32 a target below
+/// 0 is not the 32-bit address the operand shows (`j 0xffffff04`) but
+/// 2^64 less a little (`<f+0xffffffffffffff04>`).
+fn branch_target(inst: &Inst, pc: u64) -> Option<u64> {
+    match *inst {
+        Inst::Jal { imm, .. } | Inst::Branch { imm, .. } => Some(pc.wrapping_add(imm as i64 as u64)),
+        _ => None,
+    }
+}
+
 /// Register values known from `auipc`, used to resolve `jalr` targets the
-/// way llvm-objdump does (`auipc ra, 0x0` / `jalr ra` → `<puts>`).
-struct RegState([Option<u32>; 32]);
+/// way llvm-objdump does (`auipc ra, 0x0` / `jalr ra` → `<puts>`). Like
+/// LLVM's, the values are 64-bit on both widths.
+struct RegState([Option<u64>; 32]);
 
 impl RegState {
     fn new() -> RegState {
@@ -116,16 +207,18 @@ impl RegState {
         self.0[0] = Some(0);
     }
 
-    fn set(&mut self, rd: u8, v: Option<u32>) {
+    fn set(&mut self, rd: u8, v: Option<u64>) {
         if rd != 0 {
             self.0[rd as usize & 31] = v;
         }
     }
 
     /// Where a `jalr` goes, if its base register is known.
-    fn jalr_target(&self, inst: &Inst) -> Option<u32> {
+    fn jalr_target(&self, inst: &Inst) -> Option<u64> {
         match *inst {
-            Inst::Jalr { rs1, imm, .. } => self.0[rs1 as usize & 31].map(|v| v.wrapping_add(imm as u32)),
+            Inst::Jalr { rs1, imm, .. } => {
+                self.0[rs1 as usize & 31].map(|v| v.wrapping_add(imm as i64 as u64))
+            }
             _ => None,
         }
     }
@@ -133,7 +226,7 @@ impl RegState {
     /// Updates the state after `inst` (decoded from `w`) at `pc`. Control
     /// flow and anything llvm cannot decode forget everything; other writes
     /// forget `rd`.
-    fn update(&mut self, inst: &Inst, w: u32, pc: u32) {
+    fn update(&mut self, inst: &Inst, w: u32, pc: u64) {
         if llvm_rejects_fence(w) {
             self.reset();
             return;
@@ -147,7 +240,7 @@ impl RegState {
             | Inst::Illegal(_)
             | Inst::XcalDbg { .. }
             | Inst::XcalHalt { .. } => self.reset(),
-            Inst::Auipc { rd, imm } => self.set(rd, Some(pc.wrapping_add(imm as u32))),
+            Inst::Auipc { rd, imm } => self.set(rd, Some(pc.wrapping_add(imm as i64 as u64))),
             Inst::Lui { rd, .. }
             | Inst::Load { rd, .. }
             | Inst::OpImm { rd, .. }
@@ -184,7 +277,7 @@ fn llvm_rejects_fence(w: u32) -> bool {
 /// A relocation ready to print under an instruction.
 struct InlineReloc {
     /// Offset from the start of the section.
-    offset: u32,
+    offset: u64,
     text: String,
 }
 
@@ -200,24 +293,48 @@ fn skippable_zeros(bytes: &[u8]) -> usize {
     }
 }
 
-/// A line table sequence for `-l`: the section it is in (in an object), its
-/// start and end, and its rows (address, path, line).
-type Sequence = (Option<usize>, u32, u32, Vec<(u32, String, u32)>);
+/// The spaces llvm-objdump puts after the address and the raw bytes of a
+/// line, `column` characters long so far, so that the tab that starts the
+/// instruction lands on its column (LLVM's AlignToInstStartColumn): the
+/// mnemonic starts at column 24 with the raw bytes shown, 16 without, or at
+/// the next tab stop when the line is already longer.
+fn inst_start_padding(column: usize, raw_insn: bool) -> usize {
+    let tab_stop = if raw_insn { 24 } else { 16 };
+    if column < tab_stop - 1 {
+        tab_stop - 1 - column
+    } else {
+        7 - column % 8
+    }
+}
 
-/// `-l`: where each address comes from, as llvm-objdump prints it. Before an
-/// instruction, `; name():` when the function it is in is another than the
-/// last one's, and `; file:line` when its line (the line table row at or
-/// before it) is another, or the function is. The function is the symbol
-/// LLVM's symbolizer takes: the last function, object or untyped symbol at or
-/// before the address in its section (not a mapping symbol like `$x` or a
-/// fake label `.L0 `), if the
-/// address is inside it (a symbol of size 0 runs to the next one). Unlike
-/// llvm-objdump, the line table is read without a compile unit.
+/// `-l`: where each address comes from, as llvm-objdump prints it (through
+/// LLVM's symbolizer). Before an instruction, `; name():` when the function
+/// it is in is another than the last one's, and `; file:line` when its line
+/// is another, or the function is.
+///
+/// The function is the symbol LLVM's symbolizer takes: the last function,
+/// object or untyped symbol at or before the address (not a mapping symbol
+/// like `$x` or a fake label `.L0 `) in an allocated section, if the address
+/// is inside it (a symbol of size 0 runs to the next one); in an object,
+/// whatever section it is in, all of them starting at 0. For an address no
+/// symbol covers, the function is the debug information's, from the compile
+/// unit that covers it ([`elf::units::function_name`]). A name is printed
+/// with `()` after it, unless it ends with them.
+///
+/// The line is the line table row at or before the address, in the table of
+/// the compile unit whose ranges hold the address (`.debug_aranges`, or the
+/// unit's own ranges, `elf::units`): code no unit covers has no lines, and a
+/// line table no unit names (hand-written `.loc`s without a `.debug_info`)
+/// is never read. In an object the row must be in the address's section.
+/// The path is the table's, after the unit's compilation directory
+/// ([`elf::lines::LineTable::file_path`]).
 struct SourceLines {
-    sequences: Vec<Sequence>,
-    /// The symbols a function name may come from, sorted: (section, address,
-    /// size, name).
-    functions: Vec<(usize, u32, u32, String)>,
+    tables: Vec<elf::lines::LineTable>,
+    units: Vec<elf::units::CompileUnit>,
+    unit_ranges: elf::units::UnitRanges,
+    /// The symbols a function name may come from, sorted by (address, size):
+    /// (address, size, name).
+    functions: Vec<(u64, u64, String)>,
     relocatable: bool,
     /// What the last instruction's lines said: its function and its line.
     last: (Option<String>, Option<(String, u32)>),
@@ -225,65 +342,77 @@ struct SourceLines {
 
 impl SourceLines {
     fn new(elf: &Elf) -> Result<SourceLines, Error> {
-        let mut sequences = Vec::new();
-        for t in elf.line_tables()? {
-            for seq in &t.sequences {
-                let (Some(first), Some(end)) = (seq.rows.first(), seq.rows.last()) else {
-                    continue;
-                };
-                let rows = seq
-                    .rows
-                    .iter()
-                    .filter(|r| !r.end_sequence)
-                    .map(|r| (r.addr as u32, t.path(r.file).to_string(), r.line))
-                    .collect();
-                sequences.push((seq.section, first.addr as u32, end.addr as u32, rows));
-            }
-        }
-        let mut functions: Vec<(usize, u32, u32, String)> = elf
+        let tables = elf.line_tables()?;
+        let units = elf.compile_units()?;
+        let unit_ranges = elf.unit_ranges(&units)?;
+        let mut functions: Vec<(u64, u64, String)> = elf
             .symbols()?
             .into_iter()
-            .filter(|s| matches!(s.ty(), elf::STT_NOTYPE | elf::STT_FUNC | elf::STT_OBJECT))
-            // Not RISC-V's mapping symbols (`$x`, `$d`) and fake labels (`.L0 `).
-            .filter(|s| !s.name.is_empty() && !s.name.starts_with('$') && !s.name.starts_with(".L0 "))
-            .filter_map(|s| {
-                let sec = s.section()?;
-                elf.sections
-                    .get(sec)?
-                    .is_alloc()
-                    .then_some((sec, s.value as u32, s.size as u32, s.name))
+            .filter(|s| {
+                matches!(
+                    s.ty(),
+                    elf::STT_NOTYPE | elf::STT_FUNC | elf::STT_OBJECT | elf::STT_GNU_IFUNC
+                )
             })
+            // Not RISC-V's mapping symbols (`$x`, `$d`) and fake labels (`.L0 `).
+            .filter(|s| !s.name.is_empty() && mapping_kind(&s.name).is_none() && !s.name.starts_with(".L0 "))
+            .filter(|s| {
+                s.section()
+                    .and_then(|sec| elf.sections.get(sec))
+                    .is_some_and(|sec| sec.is_alloc())
+            })
+            .map(|s| (s.value, s.size, s.name))
             .collect();
-        // By address, then size: of several at one address the biggest wins.
-        functions.sort_by_key(|f| (f.0, f.1, f.2));
+        // By address, then size (a stable sort): of several at one address
+        // the biggest wins, and of those the last.
+        functions.sort_by_key(|f| (f.0, f.1));
         Ok(SourceLines {
-            sequences,
+            tables,
+            units,
+            unit_ranges,
             functions,
             relocatable: elf.header.ty == elf::ET_REL,
             last: (None, None),
         })
     }
 
-    /// The line table row for `addr` in section `sec`: path and line.
-    fn row(&self, sec: usize, addr: u32) -> Option<(String, u32)> {
-        let (_, _, _, rows) = self.sequences.iter().find(|(s, start, end, _)| {
-            (!self.relocatable || *s == Some(sec)) && (*start..*end).contains(&addr)
-        })?;
-        let i = rows.partition_point(|r| r.0 <= addr).checked_sub(1)?;
-        Some((rows[i].1.clone(), rows[i].2))
+    /// The compile unit that covers `addr`: its index in `units`.
+    fn unit(&self, addr: u64) -> Option<usize> {
+        let offset = self.unit_ranges.find(addr)?;
+        self.units
+            .iter()
+            .position(|u| u.offset <= offset && offset < u.next)
     }
 
-    fn print(&mut self, out: &mut String, sec: usize, addr: u32) {
-        let i = self.functions.partition_point(|f| (f.0, f.1) <= (sec, addr));
+    /// The line for `addr` in section `sec`: path and line.
+    fn row(&self, sec: usize, addr: u64) -> Option<(String, u32)> {
+        let unit = &self.units[self.unit(addr)?];
+        let table = self.tables.iter().find(|t| Some(t.offset) == unit.stmt_list)?;
+        let rows = table.sequences.iter().find_map(|seq| {
+            let (first, end) = (seq.rows.first()?, seq.rows.last()?);
+            let here =
+                (!self.relocatable || seq.section == Some(sec)) && (first.addr..end.addr).contains(&addr);
+            here.then_some(&seq.rows)
+        })?;
+        let rows: Vec<_> = rows.iter().filter(|r| !r.end_sequence).collect();
+        let row = rows[rows.partition_point(|r| r.addr <= addr).checked_sub(1)?];
+        let path = table.file_path(row.file, unit.comp_dir.as_deref().unwrap_or(""))?;
+        Some((path, row.line))
+    }
+
+    fn print(&mut self, out: &mut String, sec: usize, addr: u64) {
+        let i = self.functions.partition_point(|f| f.0 <= addr);
         let function = i
             .checked_sub(1)
             .map(|i| &self.functions[i])
-            .filter(|(s, start, size, _)| *s == sec && (*size == 0 || addr - start < *size))
-            .map(|f| f.3.clone());
+            .filter(|(start, size, _)| *size == 0 || addr - start < *size)
+            .map(|f| f.2.clone())
+            .or_else(|| elf::units::function_name(&self.units, self.unit(addr)?, addr));
         let line = self.row(sec, addr).filter(|(_, l)| *l != 0);
         let new_function = function.is_some() && function != self.last.0;
         if let (true, Some(f)) = (new_function, &function) {
-            let _ = writeln!(out, "; {f}():");
+            let parens = if f.ends_with("()") { "" } else { "()" };
+            let _ = writeln!(out, "; {f}{parens}:");
         }
         if let Some((path, n)) = &line {
             if new_function || self.last.1.as_ref() != Some(&(path.clone(), *n)) {
@@ -294,13 +423,48 @@ impl SourceLines {
     }
 }
 
-pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result<(), Error> {
-    // RV32 until #150 reads ELF64 and RV64.
+/// One line of data in code (`$d`), as llvm-objdump prints it (LLVM's
+/// dumpELFData): a `.word` while 4 bytes are left before `end`, else a
+/// `.short`, else a `.byte`, the bytes shown one by one in file order (with
+/// or without `--no-show-raw-insn`) and the value little-endian. Returns
+/// its size.
+fn data_line(out: &mut String, pc: u64, bytes: &[u8], raw_insn: bool) -> usize {
+    let start = out.len();
+    let _ = write!(out, "{pc:8x}: ");
+    let size = match bytes.len() {
+        4.. => 4,
+        2 | 3 => 2,
+        _ => 1,
+    };
+    let bytes = &bytes[..size];
+    let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    out.push_str(&hex.join(" "));
+    let pad = inst_start_padding(out.len() - start, raw_insn);
+    out.push_str(&" ".repeat(pad));
+    let _ = match *bytes {
+        [a, b, c, d] => write!(out, "\t.word\t{:#010x}", u32::from_le_bytes([a, b, c, d])),
+        [a, b] => write!(out, "\t.short\t{:#06x}", u16::from_le_bytes([a, b])),
+        [a] => write!(out, "\t.byte\t{a:#04x}"),
+        _ => unreachable!(),
+    };
+    out.push('\n');
+    size
+}
+
+pub(crate) fn disassemble(
+    out: &mut String,
+    warnings: &mut Vec<crate::Warning>,
+    elf: &Elf,
+    opts: &Options,
+) -> Result<(), Error> {
+    let xlen = crate::xlen(elf);
     let syntax = Syntax {
         aliases: opts.aliases,
         hex: true,
-        xlen: Xlen::Rv32,
+        xlen,
+        zicbop: true,
     };
+    let width = crate::addr_width(elf);
     let mut source = if opts.line_numbers {
         Some(SourceLines::new(elf)?)
     } else {
@@ -312,46 +476,84 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
     } else {
         Vec::new()
     };
+    let symbols = elf.symbols()?;
 
     for (idx, sec) in elf.sections.iter().enumerate() {
         if !sec.is_exec() || sec.is_nobits() || sec.size == 0 {
             continue;
         }
         let data = elf.section_data(sec)?;
-        // Addresses are u64 here so a section ending at 2^32 does not wrap.
+        // u64, so an ELF32 section ending at 2^32 does not wrap (nor can an
+        // ELF64 one end past 2^64).
         let sec_start = sec.addr;
-        let end = sec_start + sec.size;
-        // An ELF32 address (`dump` reads no other class).
-        let sec_addr = sec.addr as u32;
+        let end = sec_start.saturating_add(sec.size);
         let _ = writeln!(out, "\nDisassembly of section {}:", sec.name);
 
         // A section with no symbol at its start gets one named after it. A
         // linker script can define symbols below the section start, so the
         // label goes where it keeps the list sorted, not necessarily first.
         let syms = &mut labels.per_section[idx];
-        if !syms.iter().any(|s| s.addr == sec_addr) {
+        if !syms.iter().any(|s| s.addr == sec_start) {
             let label = Label {
-                addr: sec_addr,
+                addr: sec_start,
                 name: sec.name.clone(),
                 ty: elf::STT_FUNC,
             };
-            let at = syms.partition_point(|s| s.addr < sec_addr);
+            let at = syms.partition_point(|s| s.addr < sec_start);
             syms.insert(at, label);
         }
         let syms = syms.clone();
+
+        // This section's mapping symbols, sorted (of two at one address,
+        // the code one counts, as LLVM sorts them).
+        let mut mapping: Vec<(u64, MapKind)> = symbols
+            .iter()
+            .filter(|s| s.section() == Some(idx))
+            .filter_map(|s| mapping_kind(&s.name).map(|k| (s.value, k)))
+            .collect();
+        mapping.sort();
+        // An ISA in a code mapping symbol that LLVM cannot parse gets a
+        // warning, once per name and file. Nothing else depends on the ISA:
+        // LLVM 23 decodes the same instructions whatever it names.
+        let mut isa_symbols: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| s.section() == Some(idx) && s.name.len() > 2 && s.name.starts_with("$x"))
+            .collect();
+        isa_symbols.sort_by_key(|s| s.value);
+        for s in isa_symbols {
+            if let Err(e) = check_isa(&s.name[2..]) {
+                let w = crate::Warning::Tool(format!(
+                    "could not parse ISA mapping symbol '{}': {e}; falling back to default disassembler",
+                    s.name
+                ));
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+        }
+        // What the bytes at `pc` are: those before the first mapping symbol
+        // are code.
+        let kind_at = |pc: u64| {
+            let n = mapping.partition_point(|&(a, _)| a <= pc);
+            n.checked_sub(1).map_or(MapKind::Code, |i| mapping[i].1)
+        };
+        // Where the next mapping symbol after `pc` is.
+        let next_mapping = |pc: u64| mapping.iter().map(|&(a, _)| a).find(|&a| a > pc);
 
         let mut relocs: Vec<InlineReloc> = Vec::new();
         for rs in reloc_sections.iter().filter(|rs| rs.target == idx) {
             for r in &rs.relocs {
                 // In an executable, relocation offsets are addresses.
                 let offset = if labels.relocatable {
-                    r.offset as u32
+                    r.offset
                 } else {
-                    (r.offset as u32).wrapping_sub(sec_addr)
+                    r.offset.wrapping_sub(sec_start)
                 };
+                // ELF64 indents with one tab less, the address being wider.
+                let indent = if width == 16 { "\t\t" } else { "\t\t\t" };
                 let text = format!(
-                    "\t\t\t{:08x}:  {}\t{}",
-                    sec_addr.wrapping_add(offset),
+                    "{indent}{:0width$x}:  {}\t{}",
+                    sec_start.wrapping_add(offset),
                     reloc_type(r.ty),
                     reloc_value(elf, &rs.symbols, r)
                 );
@@ -364,29 +566,39 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
         // One region per distinct symbol address, labelled with the last symbol there.
         let mut i = 0;
         while i < syms.len() {
-            let start = syms[i].addr as u64;
+            let start = syms[i].addr;
             let mut j = i;
-            while j < syms.len() && syms[j].addr as u64 == start {
+            while j < syms.len() && syms[j].addr == start {
                 j += 1;
             }
             let label = &syms[j - 1];
-            let region_end = syms.get(j).map_or(end, |s| (s.addr as u64).min(end));
+            let region_end = syms.get(j).map_or(end, |s| s.addr.min(end));
             i = j;
             if start < sec_start || start >= region_end {
                 continue;
             }
-            let _ = writeln!(out, "\n{start:08x} <{}>:", label.name);
+            let _ = writeln!(out, "\n{start:0width$x} <{}>:", label.name);
 
             let mut regs = RegState::new();
+            // The mapping symbols up to here are behind us.
+            let mut passed = mapping.partition_point(|&(a, _)| a <= start);
             let mut pc = start;
             while pc < region_end {
+                // Like llvm-objdump, a mapping symbol forgets the `auipc`
+                // values: the disassembler starts anew at each one.
+                let reached = mapping.partition_point(|&(a, _)| a <= pc);
+                if reached > passed {
+                    regs.reset();
+                    passed = reached;
+                }
                 let off = (pc - sec_start) as usize;
                 // Like llvm-objdump (without -z), a run of zero bytes inside
                 // this region and before the next shown relocation is
-                // printed as `...` instead of one line per word.
+                // printed as `...` instead of one line per word, in code
+                // and in data alike.
                 let limit = relocs
                     .peek()
-                    .map_or(region_end, |r| region_end.min(sec_start + r.offset as u64));
+                    .map_or(region_end, |r| region_end.min(sec_start.wrapping_add(r.offset)));
                 let span = data.get(off..(limit.max(pc) - sec_start) as usize).unwrap_or(&[]);
                 let skip = skippable_zeros(span);
                 if skip > 0 {
@@ -394,60 +606,76 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
                     pc += skip as u64;
                     continue;
                 }
-                // Like llvm-objdump, a word is decoded whenever the section
-                // has 4 bytes left, even if it runs past the next label.
-                let size = if end - pc >= 4 { 4 } else { 1 };
-                let (raw, w) = match data.get(off..off + size) {
-                    Some(&[a, b, c, d]) => {
-                        let w = u32::from_le_bytes([a, b, c, d]);
-                        (format!("{w:08x}"), w)
-                    }
-                    Some(&[b]) => (format!("{b:02x}"), b as u32),
-                    _ => break,
-                };
-                let inst = if size == 4 {
-                    decode(w, Xlen::Rv32)
+
+                let size = if kind_at(pc) == MapKind::Data {
+                    // Data runs to the end of the region or the next
+                    // mapping symbol, whichever comes first.
+                    let data_end = next_mapping(pc).map_or(region_end, |a| a.min(region_end));
+                    let Some(bytes) = data.get(off..(data_end - sec_start) as usize) else {
+                        break;
+                    };
+                    // (With no source lines: LLVM prints them for instructions.)
+                    data_line(out, pc, bytes, opts.raw_insn)
                 } else {
-                    Inst::Illegal(w)
-                };
-                let pc32 = pc as u32;
-                if let Some(s) = source.as_mut() {
-                    s.print(out, idx, pc32);
-                }
-                let d = inst.format(Some(u64::from(pc32)), syntax);
-                let (mnemonic, operands) = match size {
-                    1 => (".byte", format!("{w:#04x}")),
-                    _ => (d.mnemonic, d.operands),
-                };
-                let _ = write!(out, "{pc:8x}:");
-                if opts.raw_insn {
-                    let _ = write!(out, " {raw:<13}");
-                } else {
-                    out.push_str("      ");
-                }
-                let _ = write!(out, "\t{mnemonic}");
-                if !operands.is_empty() {
-                    let _ = write!(out, "\t{operands}");
-                }
-                if let Some(l) = d
-                    .target
-                    .map(|t| t as u32)
-                    .or_else(|| regs.jalr_target(&inst))
-                    .and_then(|t| labels.lookup(idx, t).map(|l| (l, t - l.addr)))
-                {
-                    match l {
-                        (l, 0) => {
-                            let _ = write!(out, " <{}>", l.name);
+                    // Like llvm-objdump, a word is decoded whenever the
+                    // section has 4 bytes left, even if it runs past the
+                    // next label.
+                    let size = if end - pc >= 4 { 4 } else { 1 };
+                    let (raw, w) = match data.get(off..off + size) {
+                        Some(&[a, b, c, d]) => {
+                            let w = u32::from_le_bytes([a, b, c, d]);
+                            (format!("{w:08x}"), w)
                         }
-                        (l, disp) => {
+                        Some(&[b]) => (format!("{b:02x}"), b as u32),
+                        _ => break,
+                    };
+                    let inst = if size == 4 {
+                        decode(w, xlen)
+                    } else {
+                        Inst::Illegal(w)
+                    };
+                    if let Some(s) = source.as_mut() {
+                        // LLVM reads .debug_aranges at the first lookup.
+                        for w in std::mem::take(&mut s.unit_ranges.warnings) {
+                            let w = crate::Warning::Dwarf(w);
+                            if !warnings.contains(&w) {
+                                warnings.push(w);
+                            }
+                        }
+                        s.print(out, idx, pc);
+                    }
+                    let d = inst.format(Some(pc), syntax);
+                    let (mnemonic, operands) = match size {
+                        1 => (".byte", format!("{w:#04x}")),
+                        _ => (d.mnemonic, d.operands),
+                    };
+                    let line_start = out.len();
+                    let _ = write!(out, "{pc:8x}:");
+                    if opts.raw_insn {
+                        let _ = write!(out, " {raw}");
+                    }
+                    let pad = inst_start_padding(out.len() - line_start, opts.raw_insn);
+                    out.push_str(&" ".repeat(pad));
+                    let _ = write!(out, "\t{mnemonic}");
+                    if !operands.is_empty() {
+                        let _ = write!(out, "\t{operands}");
+                    }
+                    if let Some((l, disp)) = branch_target(&inst, pc)
+                        .or_else(|| regs.jalr_target(&inst))
+                        .and_then(|t| labels.lookup(idx, t).map(|l| (l, t - l.addr)))
+                    {
+                        if disp == 0 {
+                            let _ = write!(out, " <{}>", l.name);
+                        } else {
                             let _ = write!(out, " <{}+{disp:#x}>", l.name);
                         }
                     }
-                }
-                out.push('\n');
-                regs.update(&inst, w, pc32);
+                    out.push('\n');
+                    regs.update(&inst, w, pc);
+                    size
+                };
 
-                let next = (off + size) as u32;
+                let next = (off + size) as u64;
                 while let Some(r) = relocs.next_if(|r| r.offset < next) {
                     let _ = writeln!(out, "{}", r.text);
                 }
@@ -456,4 +684,73 @@ pub(crate) fn disassemble(out: &mut String, elf: &Elf, opts: &Options) -> Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_isa, inst_start_padding};
+
+    /// What llvm-objdump 23 says of these ISAs in `$x<isa>` (made with
+    /// llvm-objcopy --redefine-sym on a clang object).
+    #[test]
+    fn isa_mapping_symbols_like_llvm() {
+        for ok in [
+            "rv32i2p1",
+            "rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0",
+            "rv32iq2p0",
+            "rv64e2p0",
+            // A version is an unsigned 32-bit number, leading zeros allowed.
+            "rv32i4294967295p0",
+            "rv32i2p4294967295",
+            "rv32i04294967295p00004294967295",
+        ] {
+            assert_eq!(check_isa(ok), Ok(()), "{ok}");
+        }
+        for (isa, err) in [
+            (".0", "string may only contain [a-z0-9_]"),
+            ("RV32i", "string may only contain [a-z0-9_]"),
+            ("foo", "arch string must begin with valid base ISA"),
+            ("rv32", "arch string must begin with valid base ISA"),
+            ("rv64", "arch string must begin with valid base ISA"),
+            ("rv32x", "arch string must begin with valid base ISA"),
+            ("rv64g", "arch string must begin with valid base ISA"),
+            ("rv32_", "arch string must begin with valid base ISA"),
+            ("rv32i", "extension lacks version in expected format"),
+            ("rv32i2p1_m2p0_q", "extension lacks version in expected format"),
+            ("rv32i_zfoo", "extension lacks version in expected format"),
+            ("rv32i2p1_mp0", "extension lacks version in expected format"),
+            ("rv32i2p1__m2p0", "extension name missing after separator '_'"),
+            ("rv32i2p1_", "extension name missing after separator '_'"),
+            ("rv32i2p1_m2px", "failed to parse minor version number"),
+            ("rv32i2p1_m2p99999999999", "failed to parse minor version number"),
+            ("rv32i2p1_m99999999999p0", "failed to parse major version number"),
+            // Just past 2^32 - 1.
+            ("rv32i2p4294967296", "failed to parse minor version number"),
+            ("rv32i4294967296p0", "failed to parse major version number"),
+            ("rv64i2p1_m4294967296p0", "failed to parse major version number"),
+            ("rv32i2p1_2p0", "missing extension name"),
+            ("rv32i2p1_z2p0", "'z' must be followed by a letter"),
+            ("rv32i2p1_s1p0", "'s' must be followed by a letter"),
+            ("rv32i2p1_x2p0", "'x' must be followed by a letter"),
+            ("rv32i2p1_m2p0_m2p0", "duplicate extension 'm'"),
+        ] {
+            assert_eq!(check_isa(isa), Err(err.to_string()), "{isa}");
+        }
+    }
+
+    /// LLVM's AlignToInstStartColumn: the instruction's tab lands at column
+    /// 24 (16 without raw bytes), or the next tab stop on a longer line.
+    #[test]
+    fn instruction_column() {
+        // "       0: 00000013" is 18 columns.
+        assert_eq!(inst_start_padding(18, true), 5);
+        // A 9-digit address: one column more, one space less.
+        assert_eq!(inst_start_padding(19, true), 4);
+        // 16 digits: past column 23, so to the next tab stop.
+        assert_eq!(inst_start_padding(26, true), 5);
+        assert_eq!(inst_start_padding(9, false), 6);
+        assert_eq!(inst_start_padding(17, false), 6);
+        // "      21: 00 01" (a .short with --no-show-raw-insn): none.
+        assert_eq!(inst_start_padding(15, false), 0);
+    }
 }

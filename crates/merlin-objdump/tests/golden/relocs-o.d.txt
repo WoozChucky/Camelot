@@ -30,8 +30,8 @@ Disassembly of section .text:
       3c: 00e6a023     	sw	a4, 0x0(a3)
       40: 00b50063     	beq	a0, a1, 0x40 <.Lpcrel_hi3+0x18>
       44: 000000ef     	jal	0x44 <.Lpcrel_hi3+0x1c>
-      48: 0080006f     	j	0x50 <local_label>
-      4c: 00051263     	bnez	a0, 0x50 <local_label>
+      48: 0000006f     	j	0x48 <.Lpcrel_hi3+0x20>
+      4c: 00051063     	bnez	a0, 0x4c <.Lpcrel_hi3+0x24>
 
 00000050 <local_label>:
       50: 00008067     	ret

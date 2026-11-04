@@ -10,7 +10,7 @@ Dynamic Section:
 Sections:
 Idx Name                Size     VMA      Type
   0                     00000000 00000000 
-  1 .strtab             0000009f 00000000 
+  1 .strtab             000000ca 00000000 
   2 .text               00000010 00000000 TEXT
   3 .rela.text          00000018 00000000 
   4 .data               00000004 00000000 DATA
@@ -26,7 +26,7 @@ Idx Name                Size     VMA      Type
  14 .symtab             000000e0 00000000 
 
 SYMBOL TABLE:
-00000000 l       .text	00000000 $x
+00000000 l       .text	00000000 $xrv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0
 00000000 l       .data	00000000 $d
 00000000 l       .init_array	00000000 $d
 00000000 l       .preinit_array	00000000 $d

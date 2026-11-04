@@ -79,31 +79,82 @@ fn errors_and_exit_codes() {
 }
 
 #[test]
-fn elf64_files_are_refused() {
-    // merlin-objdump prints 32-bit addresses: an RV64 file is an error, not
-    // a listing with its addresses cut short.
+fn both_widths() {
+    // An ELF64 file is RV64 code, with 16-digit addresses; an ELF32 one
+    // next to it keeps its 8 digits.
     let (code, out, err) = objdump(&[
         "-d",
+        "-f",
         "crates/elf/tests/llvm/rv64/prog.elf",
         "crates/elf/tests/llvm/rv32/prog.elf",
     ]);
-    assert_eq!(code, 1);
+    assert_eq!((code, err.as_str()), (0, ""));
     assert!(
-        err.contains(
-            "error: 'crates/elf/tests/llvm/rv64/prog.elf': bad ELF: ELF64 (RV64) is not supported yet"
-        ),
-        "{err}"
+        out.contains("rv64/prog.elf:\tfile format elf64-littleriscv\narchitecture: riscv64\n"),
+        "{out}"
     );
-    assert!(!out.contains("rv64/prog.elf"), "{out}");
+    assert!(out.contains("start address: 0x00000000800000b8\n"), "{out}");
     assert!(
-        out.contains("rv32/prog.elf:\tfile format elf32-littleriscv"),
+        out.contains("rv32/prog.elf:\tfile format elf32-littleriscv\narchitecture: riscv32\n"),
         "{out}"
     );
 }
 
+/// A mapping symbol whose ISA LLVM cannot parse gets llvm-objdump's warning
+/// on stderr, once per name; the listing is the same. The riscv-tests ELFs,
+/// built by GNU's assembler, have `$x.0`.
+#[test]
+fn unparsable_isa_mapping_symbols_warn() {
+    let (code, out, err) = objdump(&["-d", "tests/riscv-tests/rv32ui-p-add", "-t"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        err,
+        "merlin-objdump: warning: 'tests/riscv-tests/rv32ui-p-add': could not parse ISA mapping \
+         symbol '$x.0': string may only contain [a-z0-9_]; falling back to default disassembler\n"
+    );
+    assert!(out.contains("<test_2>:"), "{out}");
+    // Only the disassembly reads them.
+    let (code, _, err) = objdump(&["-t", "tests/riscv-tests/rv32ui-p-add"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+}
+
+/// `-l` reads `.debug_aranges` as LLVM does: in an object built with
+/// relaxation a length there is a relocation pair over a 0, which LLVM reads
+/// unrelocated, as the list's end, and warns of. The line is llvm-objdump's
+/// exactly: LLVM's DWARF reader names neither the program nor the file.
+/// Without `-l` nothing reads it.
+#[test]
+fn a_premature_end_of_debug_aranges_warns() {
+    let file = "crates/merlin-objdump/tests/fixtures/rv64/units-aranges.o";
+    let (code, out, err) = objdump(&["-d", "-l", file]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        err,
+        "warning: address range table at offset 0x0 has a premature terminator entry at offset 0x20\n"
+    );
+    assert!(out.contains("; g():\n"), "{out}");
+    let (code, _, err) = objdump(&["-d", file]);
+    assert_eq!((code, err.as_str()), (0, ""));
+}
+
 fn fixtures() -> Vec<PathBuf> {
     let mut files = vec![root().join("examples/hello/hello.elf")];
-    for f in ["hello.elf", "hello.o", "isa.o", "relocs.o"] {
+    for f in [
+        "hello.elf",
+        "hello.o",
+        "isa.o",
+        "relocs.o",
+        "rv64/hello.elf",
+        "rv64/isa.o",
+        "rv64/relocs.o",
+        "rv64/linked.elf",
+        "debug.o",
+        "rv64/units.o",
+        "rv64/units-dwarf4.o",
+        "rv64/units-aranges.o",
+        "subprograms.o",
+        "rv64/subprograms.o",
+    ] {
         files.push(root().join("crates/merlin-objdump/tests/fixtures").join(f));
     }
     files
@@ -115,6 +166,7 @@ fn broken_files_do_not_panic() {
     let mut opts = Options {
         disassemble: true,
         contents: true,
+        line_numbers: true,
         ..Options::default()
     };
     opts.set_all_headers();

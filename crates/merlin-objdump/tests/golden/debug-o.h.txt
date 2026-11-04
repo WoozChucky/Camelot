@@ -4,26 +4,26 @@ crates/merlin-objdump/tests/fixtures/debug.o:	file format elf32-littleriscv
 Sections:
 Idx Name                    Size     VMA      Type
   0                         00000000 00000000 
-  1 .strtab                 00000119 00000000 
+  1 .strtab                 00000144 00000000 
   2 .text                   00000044 00000000 TEXT
   3 .rela.text              00000030 00000000 
-  4 .debug_loclists         0000001b 00000000 DEBUG
-  5 .rela.debug_loclists    00000018 00000000 
-  6 .debug_abbrev           00000071 00000000 DEBUG
-  7 .debug_info             0000005f 00000000 DEBUG
+  4 .debug_loclists         00000023 00000000 DEBUG
+  5 .rela.debug_loclists    00000048 00000000 
+  6 .debug_abbrev           0000007a 00000000 DEBUG
+  7 .debug_info             0000006d 00000000 DEBUG
   8 .rela.debug_info        0000006c 00000000 
   9 .debug_str_offsets      00000024 00000000 DEBUG
  10 .rela.debug_str_offsets 00000054 00000000 
- 11 .debug_str              0000004e 00000000 DEBUG
+ 11 .debug_str              0000009e 00000000 DEBUG
  12 .debug_addr             00000014 00000000 DEBUG
  13 .rela.debug_addr        00000024 00000000 
- 14 .comment                00000016 00000000 
+ 14 .comment                00000066 00000000 
  15 .note.GNU-stack         00000000 00000000 
  16 .riscv.attributes       0000003f 00000000 
  17 .debug_frame            00000038 00000000 DEBUG
  18 .rela.debug_frame       00000048 00000000 
- 19 .debug_line             00000091 00000000 DEBUG
- 20 .rela.debug_line        0000009c 00000000 
+ 19 .debug_line             0000008b 00000000 DEBUG
+ 20 .rela.debug_line        0000006c 00000000 
  21 .debug_line_str         0000005c 00000000 DEBUG
  22 .llvm_addrsig           00000000 00000000 
  23 .symtab                 000002c0 00000000 

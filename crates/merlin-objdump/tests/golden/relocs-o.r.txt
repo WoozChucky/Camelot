@@ -33,6 +33,10 @@ OFFSET   TYPE                     VALUE
 0000003c R_RISCV_RELAX            *ABS*
 00000040 R_RISCV_BRANCH           ext_func
 00000044 R_RISCV_JAL              ext_func
+00000044 R_RISCV_RELAX            *ABS*
+00000048 R_RISCV_JAL              local_label
+00000048 R_RISCV_RELAX            *ABS*
+0000004c R_RISCV_BRANCH           local_label
 
 RELOCATION RECORDS FOR [.rodata]:
 OFFSET   TYPE                     VALUE

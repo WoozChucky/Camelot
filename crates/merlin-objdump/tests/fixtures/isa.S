@@ -1,7 +1,8 @@
 # merlin-objdump fixture: every RV32IMA/Zicsr/Zifencei/privileged encoding,
 # the operand forms where llvm-objdump picks a pseudo-instruction (and the
-# tie-breaks when both registers are zero), Xcal words, data words in code,
-# and auipc+jalr pairs whose targets the disassembler resolves (or must not).
+# tie-breaks when both registers are zero), Xcal words, words that decode
+# to nothing, data words in code, and auipc+jalr pairs whose targets the
+# disassembler resolves (or must not).
 # Built by scripts/gen-objdump-golden.sh:
 #   clang --target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32 -c -mno-relax isa.S -o isa.o
 
@@ -135,9 +136,13 @@ isa_start:
     unimp
     .insn i 0x0b, 0, x0, a0, 0
     .insn i 0x0b, 1, x0, zero, 0
-    .word 0
-    .word 0xffffffff
-    .word 0x0005200b
+    # Words that decode to nothing, kept as code (no $d before them): .insn
+    # refuses 0, whose low bits make it a 16-bit encoding, but .fill writes
+    # no mapping symbol. llvm-objdump guesses their length from the low bits
+    # (0 is two 16-bit <unknown>s); merlin-objdump prints .word.
+    .fill 1, 4, 0
+    .insn 4, 0xffffffff
+    .insn 4, 0x0005200b
 edge:
     addi a0, zero, 0
     addi zero, zero, 5
@@ -151,12 +156,16 @@ edge:
     csrrs zero, cycle, zero
     csrrs zero, mstatus, zero
     csrrw zero, mstatus, zero
+    # Hints LLVM 23 names (ntl.p1, prefetch.i, prefetch.w, lpad, pause),
+    # next to the reserved fences (fm, rs1, rd), written as instructions.
     add zero, zero, sp
     ori zero, a0, 0x20
-    .word 0x0100000f
-    .word 0x8ff0000f
-    .word 0x0ff5000f
-    .word 0x0ff0008f
+    ori zero, a0, 0x23
+    auipc zero, 1
+    .insn 4, 0x0100000f
+    .insn 4, 0x8ff0000f
+    .insn 4, 0x0ff5000f
+    .insn 4, 0x0ff0008f
     xori a0, a1, 1
     jalr zero, 0x100(zero)
 calls:
@@ -169,6 +178,7 @@ calls:
     auipc a1, 0
     addi a1, a1, 4
     jalr ra, 0(a1)
+    # Data between them: the mapping symbols around it forget everything.
     auipc a2, 0
     .word 0
     jalr ra, 0(a2)
@@ -204,10 +214,10 @@ regs:
     jalr t0
     jalr ra, 0(a3)
     auipc a3, 0
-    .word 0x8ff0000f
+    .insn 4, 0x8ff0000f
     jalr ra, 0(a3)
     auipc a3, 0
-    .word 0x0010100f
+    .insn 4, 0x0010100f
     jalr ra, 0(a3)
     auipc a3, 0
     fence
@@ -232,8 +242,8 @@ atomics:
     amominu.w.aqrl s8, t6, (a3)
     amomaxu.w t3, tp, (a7)
     # Reserved: lr.w with rs2 != 0, and amocas.w (Zacas, not in Excalibur).
-    .word 0x1015a52f
-    .word 0x2805a52f
+    .insn 4, 0x1015a52f
+    .insn 4, 0x2805a52f
     # lr/sc/amo write rd, so they forget a tracked rd; reading it as the
     # address keeps it.
     auipc a3, 0
@@ -249,3 +259,24 @@ atomics:
     lr.w a4, (a3)
     amoadd.w a4, a3, (a3)
     jalr ra, 0(a3)
+data:
+    # Data in code ($d): .word while 4 bytes are left before the next
+    # label or mapping symbol, then .short, then .byte; a run of zeros is
+    # `...` as in code.
+    nop
+    .word 0, 0, 0, 0
+    .word 0x11223344
+    .byte 1, 2, 3, 4, 5
+data_mid:
+    .byte 6, 7, 8
+    .half 9
+    .byte 10
+    .balign 4
+    nop
+wrap:
+    # Targets below 0: the operand wraps at 2^32, but LLVM looks the symbol
+    # up for the 64-bit target, as on RV64 (<data_mid+0xffffffff...>).
+    j .-0x400
+    auipc t1, 0xfffff
+    jalr ra, 0(t1)
+    bnez a0, .-0x800

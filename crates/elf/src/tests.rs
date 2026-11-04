@@ -349,6 +349,9 @@ fn corrupt_files_do_not_panic() {
         }
         let _ = elf.symbol("_start");
         let _ = elf.line_tables();
+        if let Ok(units) = elf.compile_units() {
+            let _ = elf.unit_ranges(&units);
+        }
     }
     let hello = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),

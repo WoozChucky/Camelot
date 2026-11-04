@@ -1,0 +1,23 @@
+
+crates/merlin-objdump/tests/fixtures/rv64/debug.o:	file format elf64-littleriscv
+
+Disassembly of section .text:
+
+0000000000000000 <f>:
+       0: fe010113     	addi	sp, sp, -0x20
+       4: 00113c23     	sd	ra, 0x18(sp)
+       8: 00813823     	sd	s0, 0x10(sp)
+       c: 00913423     	sd	s1, 0x8(sp)
+      10: 00050413     	mv	s0, a0
+      14: 00000097     	auipc	ra, 0x0
+      18: 000080e7     	jalr	ra <f+0x14>
+      1c: 00050493     	mv	s1, a0
+      20: 0014051b     	addiw	a0, s0, 0x1
+      24: 00000097     	auipc	ra, 0x0
+      28: 000080e7     	jalr	ra <f+0x24>
+      2c: 0095053b     	addw	a0, a0, s1
+      30: 01813083     	ld	ra, 0x18(sp)
+      34: 01013403     	ld	s0, 0x10(sp)
+      38: 00813483     	ld	s1, 0x8(sp)
+      3c: 02010113     	addi	sp, sp, 0x20
+      40: 00008067     	ret

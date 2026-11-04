@@ -4,15 +4,25 @@
 //! their command-line programs run.
 //!
 //! [`EXAMPLES`] lists each executable: its sources, assembled one by one into
-//! objects, and its linker script (or merlin-ld's default layout). The linked
-//! `examples/<dir>/<name>.elf` files are committed, so Grail runs them without
-//! building anything, and `cargo test` rebuilds each one and checks that the
-//! committed file is byte for byte what the current tools make.
+//! objects, and its linker script (or merlin-ld's default layout). Each one is
+//! built for both widths ([`XLENS`]) while Excalibur moves to RV64 (#141):
+//! RV32 into `examples/<dir>/<name>.elf`, and RV64 (#151) into
+//! `examples/<dir>/<name>-rv64.elf`, from [`Example::rv64_sources`]: the RV32
+//! source where it is the same at both widths, its `-rv64` version where
+//! RV64 needs other code (pointers and return addresses saved with `sd`, bit
+//! 63 for interrupt causes, version 2 of the devices' registers). #159
+//! removes RV32, and the RV64 sources then take the RV32 ones' names.
 //!
-//! clang and ld.lld are only a reference: the command at the top of each
-//! source builds the same program with them, and the merlin-ld test fixtures
-//! (`cargo xtask ld-fixtures`) keep ld.lld's link of `hello` and `multiobj`.
+//! The linked executables are committed, so Grail runs them without building
+//! anything, and `cargo test` rebuilds each one and checks that the committed
+//! file is byte for byte what the current tools make.
+//!
+//! clang and ld.lld are only a reference: the commands at the top of each
+//! source build the same program with them, and the merlin-ld test fixtures
+//! (`cargo xtask ld-fixtures`) keep ld.lld's link of `hello` and `multiobj`
+//! at both widths.
 
+pub use merlin_as::Xlen;
 use std::path::{Path, PathBuf};
 
 /// One executable built from `examples/<dir>`.
@@ -24,9 +34,17 @@ pub struct Example {
     pub dir: &'static str,
     /// Assembly sources in `dir`, in link order.
     pub sources: &'static [&'static str],
-    /// Linker script in `dir`; `None` for merlin-ld's default layout.
+    /// The RV64 build's sources in `dir`, in link order: a source of
+    /// [`Example::sources`] where both widths share it, else its `-rv64`
+    /// version.
+    pub rv64_sources: &'static [&'static str],
+    /// Linker script in `dir`, the same for both widths; `None` for
+    /// merlin-ld's default layout.
     pub script: Option<&'static str>,
 }
+
+/// The widths every example is built for: RV32, then RV64.
+pub const XLENS: [Xlen; 2] = [Xlen::Rv32, Xlen::Rv64];
 
 /// Every example, in the order `cargo xtask examples` builds them.
 pub const EXAMPLES: &[Example] = &[
@@ -34,84 +52,98 @@ pub const EXAMPLES: &[Example] = &[
         name: "hello",
         dir: "hello",
         sources: &["hello.S"],
+        rv64_sources: &["hello.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "multiobj",
         dir: "multiobj",
         sources: &["main.S", "print.S"],
+        rv64_sources: &["main-rv64.S", "print.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "muldiv",
         dir: "muldiv",
         sources: &["muldiv.S"],
+        rv64_sources: &["muldiv-rv64.S"],
         script: None,
     },
     Example {
         name: "sysinfo",
         dir: "sysinfo",
         sources: &["sysinfo.S"],
+        rv64_sources: &["sysinfo-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "disk",
         dir: "disk",
         sources: &["disk.S"],
+        rv64_sources: &["disk-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "uart-echo",
         dir: "uart-echo",
         sources: &["uart-echo.S"],
+        rv64_sources: &["uart-echo-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "colorbars",
         dir: "colorbars",
         sources: &["colorbars.S"],
+        rv64_sources: &["colorbars.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "kbd-echo",
         dir: "kbd-echo",
         sources: &["kbd-echo.S"],
+        rv64_sources: &["kbd-echo-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "kbd-echo-irq",
         dir: "kbd-echo",
         sources: &["kbd-echo-irq.S"],
+        rv64_sources: &["kbd-echo-irq-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "pointer",
         dir: "pointer",
         sources: &["pointer.S"],
+        rv64_sources: &["pointer-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "net-ping",
         dir: "net",
         sources: &["ping.S", "netlib.S"],
+        rv64_sources: &["ping.S", "netlib-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "net-pong",
         dir: "net",
         sources: &["pong.S", "netlib.S"],
+        rv64_sources: &["pong.S", "netlib-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "net-user",
         dir: "net",
         sources: &["user.S", "netlib.S"],
+        rv64_sources: &["user-rv64.S", "netlib-rv64.S"],
         script: Some("link.ld"),
     },
     Example {
         name: "smp",
         dir: "smp",
         sources: &["smp.S"],
+        rv64_sources: &["smp-rv64.S"],
         script: Some("link.ld"),
     },
 ];
@@ -131,14 +163,30 @@ impl Example {
         root.join("examples").join(self.dir)
     }
 
-    /// The committed executable, `examples/<dir>/<name>.elf`.
-    pub fn elf_path(&self, root: &Path) -> PathBuf {
-        self.dir(root).join(format!("{}.elf", self.name))
+    /// The sources of the `xlen` build, in link order.
+    pub fn sources_for(&self, xlen: Xlen) -> &'static [&'static str] {
+        match xlen {
+            Xlen::Rv32 => self.sources,
+            Xlen::Rv64 => self.rv64_sources,
+        }
     }
 
-    /// The executable's path relative to the repository root, with `/`.
-    pub fn elf_name(&self) -> String {
-        format!("examples/{}/{}.elf", self.dir, self.name)
+    /// The `xlen` executable's file name: `<name>.elf`, `<name>-rv64.elf`.
+    pub fn elf_file(&self, xlen: Xlen) -> String {
+        match xlen {
+            Xlen::Rv32 => format!("{}.elf", self.name),
+            Xlen::Rv64 => format!("{}-rv64.elf", self.name),
+        }
+    }
+
+    /// The committed `xlen` executable, `examples/<dir>/<elf_file>`.
+    pub fn elf_path(&self, root: &Path, xlen: Xlen) -> PathBuf {
+        self.dir(root).join(self.elf_file(xlen))
+    }
+
+    /// The `xlen` executable's path relative to the repository root, with `/`.
+    pub fn elf_name(&self, xlen: Xlen) -> String {
+        format!("examples/{}/{}", self.dir, self.elf_file(xlen))
     }
 }
 
@@ -161,6 +209,15 @@ pub struct Built {
     pub warnings: Vec<String>,
 }
 
+/// merlin-as's `-march=` option for `xlen`, with a space after it: none for
+/// RV32, merlin-as's default until #159.
+pub fn march_flag(xlen: Xlen) -> &'static str {
+    match xlen {
+        Xlen::Rv32 => "",
+        Xlen::Rv64 => "-march=rv64ima_zicsr_zifencei ",
+    }
+}
+
 /// The object name for a source: `hello.S` → `hello.o`.
 pub fn object_name(source: &str) -> String {
     let stem = source
@@ -170,36 +227,40 @@ pub fn object_name(source: &str) -> String {
     format!("{stem}.o")
 }
 
-/// Assembles each source of `ex` with merlin-as and links the objects with
-/// merlin-ld, all in memory. Errors look like the tools' own messages
-/// (`examples/hello/hello.S:12: error: ...`, `merlin-ld: error: ...`).
-pub fn build(root: &Path, ex: &Example) -> Result<Built, String> {
+/// Assembles each source of `ex`'s `xlen` build with merlin-as and links the
+/// objects with merlin-ld, all in memory. Errors look like the tools' own
+/// messages (`examples/hello/hello.S:12: error: ...`, `merlin-ld: error: ...`).
+pub fn build(root: &Path, ex: &Example, xlen: Xlen) -> Result<Built, String> {
     assemble_and_link(
         &ex.dir(root),
         &format!("examples/{}", ex.dir),
         ex.name,
-        ex.sources,
+        ex.sources_for(xlen),
         ex.script,
+        xlen,
     )
 }
 
 /// Assembles `sources` (in `dir`, which messages call `shown`) with merlin-as
-/// and links the objects with merlin-ld, with the linker script `script` in
-/// `dir` or the default layout, all in memory: how every program built with
-/// our own tools is made (the examples, the boot programs).
+/// for `xlen` and links the objects with merlin-ld, with the linker script
+/// `script` in `dir` or the default layout, all in memory: how every program
+/// built with our own tools is made (the examples, the boot programs).
+/// merlin-ld writes an ELF32 or an ELF64 executable as the objects are.
 pub fn assemble_and_link(
     dir: &Path,
     shown: &str,
     name: &str,
     sources: &[&str],
     script: Option<&str>,
+    xlen: Xlen,
 ) -> Result<Built, String> {
+    let as_opts = merlin_as::Options { xlen };
     let mut objects = Vec::new();
     for src in sources {
         let path = dir.join(src);
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let data = merlin_as::assemble_to_elf(&text).map_err(|errors| {
+        let data = merlin_as::assemble_to_elf_with(&text, &as_opts).map_err(|errors| {
             let shown = format!("{shown}/{src}");
             let lines: Vec<String> = errors
                 .iter()
@@ -254,10 +315,10 @@ pub enum Status {
     Unreadable(String),
 }
 
-/// Compares `examples/<dir>/<name>.elf` under `root` with `built`
+/// Compares the committed `xlen` executable of `ex` under `root` with `built`
 /// (`cargo xtask examples --check`).
-pub fn check(root: &Path, ex: &Example, built: &Built) -> Status {
-    let path = ex.elf_path(root);
+pub fn check(root: &Path, ex: &Example, xlen: Xlen, built: &Built) -> Status {
+    let path = ex.elf_path(root, xlen);
     match std::fs::read(&path) {
         Ok(committed) if committed == built.elf => Status::UpToDate,
         Ok(_) => Status::Stale,
@@ -265,32 +326,44 @@ pub fn check(root: &Path, ex: &Example, built: &Built) -> Status {
     }
 }
 
-/// Where `cargo xtask examples` leaves the objects of `ex`:
-/// `target/examples/<dir>` under `root`.
-pub fn obj_dir(root: &Path, ex: &Example) -> PathBuf {
-    root.join("target").join("examples").join(ex.dir)
+/// Where `cargo xtask examples` leaves the objects of `ex`'s `xlen` build,
+/// relative to the repository root: `target/examples/<dir>` for RV32 and
+/// `target/examples/rv64/<dir>` for RV64 (both builds may share a source,
+/// and so an object's name).
+pub fn obj_dir_name(ex: &Example, xlen: Xlen) -> String {
+    match xlen {
+        Xlen::Rv32 => format!("target/examples/{}", ex.dir),
+        Xlen::Rv64 => format!("target/examples/rv64/{}", ex.dir),
+    }
+}
+
+/// [`obj_dir_name`] under `root`.
+pub fn obj_dir(root: &Path, ex: &Example, xlen: Xlen) -> PathBuf {
+    root.join(obj_dir_name(ex, xlen))
 }
 
 /// Writes the objects to [`obj_dir`] and the executable to
-/// `examples/<dir>/<name>.elf`, under `root`.
-pub fn write(root: &Path, ex: &Example, built: &Built) -> std::io::Result<()> {
-    let objs = obj_dir(root, ex);
+/// [`Example::elf_path`], under `root`.
+pub fn write(root: &Path, ex: &Example, xlen: Xlen, built: &Built) -> std::io::Result<()> {
+    let objs = obj_dir(root, ex, xlen);
     std::fs::create_dir_all(&objs)?;
     for o in &built.objects {
         std::fs::write(objs.join(&o.name), &o.data)?;
     }
-    std::fs::write(ex.elf_path(root), &built.elf)
+    std::fs::write(ex.elf_path(root, xlen), &built.elf)
 }
 
 /// The command lines [`build`] stands for, as a user would type them from the
-/// repository root, with the objects in `obj_dir`.
-pub fn commands(ex: &Example, obj_dir: &str) -> Vec<String> {
-    let mut cmds: Vec<String> = ex
-        .sources
+/// repository root, with the objects in `obj_dir`. merlin-ld needs no option
+/// for RV64: the objects' class makes the executable's.
+pub fn commands(ex: &Example, xlen: Xlen, obj_dir: &str) -> Vec<String> {
+    let sources = ex.sources_for(xlen);
+    let mut cmds: Vec<String> = sources
         .iter()
         .map(|s| {
             format!(
-                "merlin-as examples/{}/{s} -o {obj_dir}/{}",
+                "merlin-as {}examples/{}/{s} -o {obj_dir}/{}",
+                march_flag(xlen),
                 ex.dir,
                 object_name(s)
             )
@@ -300,10 +373,10 @@ pub fn commands(ex: &Example, obj_dir: &str) -> Vec<String> {
     if let Some(script) = ex.script {
         ld += &format!(" -T examples/{}/{script}", ex.dir);
     }
-    for s in ex.sources {
+    for s in sources {
         ld += &format!(" {obj_dir}/{}", object_name(s));
     }
-    ld += &format!(" -o {}", ex.elf_name());
+    ld += &format!(" -o {}", ex.elf_name(xlen));
     cmds.push(ld);
     cmds
 }
@@ -333,16 +406,44 @@ mod tests {
         let e = find("kbd-echo-irq").unwrap();
         let root = Path::new("r");
         assert_eq!(
-            e.elf_path(root),
+            e.elf_path(root, Xlen::Rv32),
             root.join("examples").join("kbd-echo").join("kbd-echo-irq.elf")
         );
-        assert_eq!(e.elf_name(), "examples/kbd-echo/kbd-echo-irq.elf");
+        assert_eq!(e.elf_name(Xlen::Rv32), "examples/kbd-echo/kbd-echo-irq.elf");
+        assert_eq!(
+            e.elf_path(root, Xlen::Rv64),
+            root.join("examples")
+                .join("kbd-echo")
+                .join("kbd-echo-irq-rv64.elf")
+        );
+        assert_eq!(e.elf_name(Xlen::Rv64), "examples/kbd-echo/kbd-echo-irq-rv64.elf");
+        assert_eq!(
+            obj_dir(root, e, Xlen::Rv32),
+            root.join("target/examples/kbd-echo")
+        );
+        assert_eq!(
+            obj_dir(root, e, Xlen::Rv64),
+            root.join("target/examples/rv64/kbd-echo")
+        );
+    }
+
+    /// Every RV64 source is an RV32 one or its `-rv64` version, in the same
+    /// place in the link order.
+    #[test]
+    fn rv64_sources_follow_the_rv32_ones() {
+        for e in EXAMPLES {
+            assert_eq!(e.sources.len(), e.rv64_sources.len(), "{}", e.name);
+            for (&s32, &s64) in e.sources.iter().zip(e.rv64_sources) {
+                let rv64 = format!("{}-rv64.S", s32.strip_suffix(".S").unwrap());
+                assert!(s64 == s32 || s64 == rv64, "{}: {s64} for {s32}", e.name);
+            }
+        }
     }
 
     #[test]
     fn command_lines() {
         assert_eq!(
-            commands(find("multiobj").unwrap(), "obj"),
+            commands(find("multiobj").unwrap(), Xlen::Rv32, "obj"),
             [
                 "merlin-as examples/multiobj/main.S -o obj/main.o",
                 "merlin-as examples/multiobj/print.S -o obj/print.o",
@@ -350,10 +451,19 @@ mod tests {
             ]
         );
         assert_eq!(
-            commands(find("muldiv").unwrap(), "o"),
+            commands(find("muldiv").unwrap(), Xlen::Rv32, "o"),
             [
                 "merlin-as examples/muldiv/muldiv.S -o o/muldiv.o",
                 "merlin-ld o/muldiv.o -o examples/muldiv/muldiv.elf",
+            ]
+        );
+        assert_eq!(
+            commands(find("multiobj").unwrap(), Xlen::Rv64, "obj"),
+            [
+                "merlin-as -march=rv64ima_zicsr_zifencei examples/multiobj/main-rv64.S -o obj/main-rv64.o",
+                "merlin-as -march=rv64ima_zicsr_zifencei examples/multiobj/print.S -o obj/print.o",
+                "merlin-ld -T examples/multiobj/link.ld obj/main-rv64.o obj/print.o \
+                 -o examples/multiobj/multiobj-rv64.elf",
             ]
         );
     }
@@ -376,35 +486,53 @@ mod tests {
             name: "two",
             dir: "two",
             sources: &["a.S", "b.S"],
+            rv64_sources: &["a.S", "b.S"],
             script: None,
         };
-        let built = build(&root, &ex).unwrap();
+        let built = build(&root, &ex, Xlen::Rv32).unwrap();
 
-        match check(&root, &ex, &built) {
+        match check(&root, &ex, Xlen::Rv32, &built) {
             Status::Unreadable(e) => assert!(e.starts_with("cannot read "), "{e}"),
             other => panic!("missing executable: {other:?}"),
         }
 
-        write(&root, &ex, &built).unwrap();
-        assert_eq!(std::fs::read(ex.elf_path(&root)).unwrap(), built.elf);
+        let x = Xlen::Rv32;
+        write(&root, &ex, x, &built).unwrap();
+        assert_eq!(std::fs::read(ex.elf_path(&root, x)).unwrap(), built.elf);
         for o in &built.objects {
-            assert_eq!(std::fs::read(obj_dir(&root, &ex).join(&o.name)).unwrap(), o.data);
+            assert_eq!(
+                std::fs::read(obj_dir(&root, &ex, x).join(&o.name)).unwrap(),
+                o.data
+            );
         }
-        assert_eq!(check(&root, &ex, &built), Status::UpToDate);
+        assert_eq!(check(&root, &ex, x, &built), Status::UpToDate);
 
         // One byte more, one byte changed: both stale.
         let mut longer = built.elf.clone();
         longer.push(0);
-        std::fs::write(ex.elf_path(&root), &longer).unwrap();
-        assert_eq!(check(&root, &ex, &built), Status::Stale);
+        std::fs::write(ex.elf_path(&root, x), &longer).unwrap();
+        assert_eq!(check(&root, &ex, x, &built), Status::Stale);
         let mut changed = built.elf.clone();
         *changed.last_mut().unwrap() ^= 1;
-        std::fs::write(ex.elf_path(&root), &changed).unwrap();
-        assert_eq!(check(&root, &ex, &built), Status::Stale);
+        std::fs::write(ex.elf_path(&root, x), &changed).unwrap();
+        assert_eq!(check(&root, &ex, x, &built), Status::Stale);
 
         // Writing again brings it up to date.
-        write(&root, &ex, &built).unwrap();
-        assert_eq!(check(&root, &ex, &built), Status::UpToDate);
+        write(&root, &ex, x, &built).unwrap();
+        assert_eq!(check(&root, &ex, x, &built), Status::UpToDate);
+
+        // The RV64 build of the same sources is another file, an ELF64 one, with
+        // objects of its own.
+        let built64 = build(&root, &ex, Xlen::Rv64).unwrap();
+        assert_eq!(built64.elf[4], 2, "ELFCLASS64");
+        assert!(matches!(
+            check(&root, &ex, Xlen::Rv64, &built64),
+            Status::Unreadable(_)
+        ));
+        write(&root, &ex, Xlen::Rv64, &built64).unwrap();
+        assert_eq!(check(&root, &ex, Xlen::Rv64, &built64), Status::UpToDate);
+        assert_eq!(check(&root, &ex, x, &built), Status::UpToDate);
+        assert!(obj_dir(&root, &ex, Xlen::Rv64).join("a.o").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -418,9 +546,10 @@ mod tests {
             name: "bad",
             dir: "bad",
             sources: &["bad.S"],
+            rv64_sources: &["bad.S"],
             script: None,
         };
-        let err = build(&root, &ex).unwrap_err();
+        let err = build(&root, &ex, Xlen::Rv32).unwrap_err();
         assert!(err.starts_with("examples/bad/bad.S:2: error: "), "{err}");
 
         // Assembles, but nothing defines `missing`.
@@ -429,7 +558,7 @@ mod tests {
             "    .globl _start\n_start:\n    call missing\n",
         )
         .unwrap();
-        let err = build(&root, &ex).unwrap_err();
+        let err = build(&root, &ex, Xlen::Rv64).unwrap_err();
         assert!(
             err.contains("merlin-ld: error: bad.o: undefined reference to 'missing'"),
             "{err}"

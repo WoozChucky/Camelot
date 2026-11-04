@@ -320,15 +320,58 @@ fn disassembly_body(text: &str) -> Vec<String> {
 ///   names the instruction; the address and the word must still agree;
 /// * a symbol assigned by the script is `SHN_ABS` in merlin-ld's output, so
 ///   when it shares its address with a symbol of the section, a label line
-///   may name the other one.
+///   may name the other one; and a target outside every allocated section,
+///   which llvm-objdump names after an absolute symbol, may be named after
+///   a global absolute symbol the script assigned where ld.lld's file has
+///   another (the same address, `<call_min>` for `<missing+0xffa3c>`).
 pub fn assert_same_disassembly(set: &str, name: &str, linked: &merlin_ld::Linked) {
     let elf = &linked.elf;
+    let lld_elf = std::fs::read(fixtures(set).join(format!("{name}.lld.elf"))).unwrap();
+    // The value of the one symbol named `sym` in `file` that `keep` accepts:
+    // none if there are several (a `.Lpcrel_hiN` of two objects), so that a
+    // duplicated local name cannot stand for the wrong address.
+    let value = |file: &[u8], sym: &str, keep: &dyn Fn(&elf::Symbol) -> bool| {
+        let e = elf::Elf::parse(file).unwrap();
+        let symbols = e.symbols().unwrap();
+        let mut found = symbols.iter().filter(|s| s.name == sym && keep(s));
+        match (found.next(), found.next()) {
+            (Some(s), None) => Some(s.value),
+            _ => None,
+        }
+    };
+    // `jalr -0x800(ra) <missing+0xffa3c>` -> ("jalr -0x800(ra)", address,
+    // "missing").
+    let target = |l: &str, file: &[u8], keep: &dyn Fn(&elf::Symbol) -> bool| {
+        let (insn, t) = l.strip_suffix('>')?.rsplit_once(" <")?;
+        let (sym, off) = match t.split_once("+0x") {
+            Some((s, off)) => (s, u64::from_str_radix(off, 16).ok()?),
+            None => (t, 0),
+        };
+        Some((
+            insn.to_string(),
+            value(file, sym, keep)?.wrapping_add(off),
+            sym.to_string(),
+        ))
+    };
     let script_symbol = |n: &str| {
         linked
             .layout
             .globals
             .iter()
             .any(|(g, d)| g == n && matches!(d, merlin_ld::layout::Def::Script(_)))
+    };
+    // Our name for such a target must be a global absolute symbol (what
+    // merlin-ld makes of a script assignment), the address outside every
+    // section the program loads.
+    let absolute = |s: &elf::Symbol| s.bind() != elf::STB_LOCAL && s.shndx == elf::SHN_ABS;
+    let any = |_: &elf::Symbol| true;
+    let ours_elf = elf::Elf::parse(elf).unwrap();
+    let outside_sections = |addr: u64| {
+        ours_elf
+            .sections
+            .iter()
+            .filter(|s| s.flags & elf::SHF_ALLOC != 0)
+            .all(|s| addr < s.addr || addr - s.addr >= s.size)
     };
     let opts = merlin_objdump::Options {
         disassemble: true,
@@ -350,6 +393,13 @@ pub fn assert_same_disassembly(set: &str, name: &str, linked: &merlin_ld::Linked
         } else if let (Some((oa, _)), Some((la, ln))) = (label(o), label(l)) {
             assert!(
                 o == l || (oa == la && script_symbol(&ln)),
+                "{name}:\n ours: {o}\n llvm: {l}"
+            );
+        } else if let (true, Some((oi, ot, os)), Some((li, lt, _))) =
+            (o != l, target(o, elf, &absolute), target(l, &lld_elf, &any))
+        {
+            assert!(
+                oi == li && ot == lt && script_symbol(&os) && outside_sections(ot),
                 "{name}:\n ours: {o}\n llvm: {l}"
             );
         } else {
@@ -402,12 +452,7 @@ pub fn assert_matches_ld_lld_exit(set: &str, name: &str, output: &str, exit: u32
             );
         }
     }
-    // merlin-objdump reads ELF32 only until #150, which compares the RV64
-    // set's `.objdump.txt` files too. Until then the RV64 links are checked
-    // through their bytes, above, which says more than the listing.
-    if linked.layout.class == elf::Class::Elf32 {
-        assert_same_disassembly(set, name, &linked);
-    }
+    assert_same_disassembly(set, name, &linked);
 
     let (_, r, out) = run(&linked.elf);
     assert_eq!(

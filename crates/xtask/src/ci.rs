@@ -52,7 +52,7 @@ const STEPS: &[Step] = &[
         args: &["-p", "merlin-ld", "--tests"],
     },
     Step {
-        what: "merlin-objdump against llvm-objdump",
+        what: "merlin-objdump against llvm-objdump, both widths",
         args: &["-p", "merlin-objdump", "--tests"],
     },
     Step {
@@ -100,7 +100,7 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
-        what: "the committed examples, boot programs and hello are current",
+        what: "the committed examples, boot programs and hello are current; an RV64 boot block boots",
         args: &[
             "-p",
             "xtask",
@@ -113,6 +113,7 @@ const STEPS: &[Step] = &[
             "--",
             "committed_examples_are_current",
             "committed_boot_programs_are_up_to_date",
+            "an_rv64_boot_block_boots_through_the_rv64_rom",
             "hello",
         ],
     },

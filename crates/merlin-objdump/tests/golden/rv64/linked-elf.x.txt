@@ -1,0 +1,42 @@
+
+crates/merlin-objdump/tests/fixtures/rv64/linked.elf:	file format elf64-littleriscv
+architecture: riscv64
+start address: 0x0000000080000008
+
+Program Header:
+    LOAD off    0x0000000000001000 vaddr 0x0000000080000000 paddr 0x0000000080000000 align 2**12
+         filesz 0x0000000000000028 memsz 0x0000000000000028 flags r-x
+    LOAD off    0x0000000000002000 vaddr 0x0000000080001000 paddr 0x0000000080001000 align 2**12
+         filesz 0x0000000000000008 memsz 0x0000000000000008 flags r-x
+    LOAD off    0x0000000000002ff0 vaddr 0x00000000fffffff0 paddr 0x00000000fffffff0 align 2**12
+         filesz 0x0000000000000010 memsz 0x0000000000000010 flags r-x
+    LOAD off    0x0000000000003000 vaddr 0xffffffff80000000 paddr 0xffffffff80000000 align 2**12
+         filesz 0x0000000000000018 memsz 0x0000000000000018 flags r-x
+
+Dynamic Section:
+
+Sections:
+Idx Name          Size     VMA              Type
+  0               00000000 0000000000000000 
+  1 .text         00000028 0000000080000000 TEXT
+  2 .text.far     00000008 0000000080001000 TEXT
+  3 .text.hi      00000010 00000000fffffff0 TEXT
+  4 .text.top     00000018 ffffffff80000000 TEXT
+  5 .comment      00000063 0000000000000000 
+  6 .symtab       00000138 0000000000000000 
+  7 .shstrtab     00000047 0000000000000000 
+  8 .strtab       00000140 0000000000000000 
+
+SYMBOL TABLE:
+0000000080000000 l       .text	0000000000000000 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+0000000080001000 l       .text.far	0000000000000000 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+00000000fffffff0 l       .text.hi	0000000000000000 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+ffffffff80000000 l       .text.top	0000000000000000 $xrv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0
+0000000000000000 l       *ABS*	0000000000000000 $d
+0000000080000008 g       .text	0000000000000000 _start
+0000000080001000 g       .text.far	0000000000000000 far
+000000007fff0000 g       *ABS*	0000000000000000 abs_fn
+00000000fffffff0 g       .text.hi	0000000000000000 hi
+ffffffff80000000 g       .text.top	0000000000000000 top
+000000007ffffff0 g       .text	0000000000000000 before
+0000000080000022 g       .text	0000000000000000 mid

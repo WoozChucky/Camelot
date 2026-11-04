@@ -20,8 +20,8 @@
 //!   compilation directory, the address range of the code and the offset of
 //!   the line table (`DW_AT_stmt_list`), then one `DW_TAG_subprogram` per
 //!   function (its name, address range and line). Debuggers find line tables
-//!   through compile units: without one, lldb and llvm-objdump ignore
-//!   `.debug_line`.
+//!   through compile units: without one, lldb, llvm-objdump and
+//!   merlin-objdump ignore `.debug_line`.
 //!
 //! Addresses (`DW_FORM_addr`) are the target's: 4 bytes written `.word` on
 //! RV32, 8 bytes written `.quad` on RV64, as clang writes them, and the

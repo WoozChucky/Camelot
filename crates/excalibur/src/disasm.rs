@@ -19,8 +19,9 @@ pub struct Syntax {
     /// `sltz`, `sgtz`, `zext.b`, `beqz`/`bnez`/`blez`/`bgez`/`bltz`/`bgtz`,
     /// `j`, `jal off`, `jr`, `jalr rs`, `ret`, `fence`, `sfence.vma`,
     /// `csrr`/`csrw`/`csrs`/`csrc` and their `i` forms, `rdcycle`/`rdtime`/
-    /// `rdinstret`, and on RV32 the `h` variants). `-M no-aliases` in
-    /// llvm-objdump turns this off.
+    /// `rdinstret`, and on RV32 the `h` variants; and the hints LLVM 23
+    /// names, `pause`, `ntl.p1`/`ntl.pall`/`ntl.s1`/`ntl.all` and `lpad`).
+    /// `-M no-aliases` in llvm-objdump turns this off.
     pub aliases: bool,
     /// Immediates in hex (`0x7ff`, `-0x8`), llvm-objdump's default. In
     /// decimal mode, upper immediates (`lui`/`auipc`) and unnamed CSR numbers
@@ -29,6 +30,12 @@ pub struct Syntax {
     /// The width the code is for: branch and jump targets wrap at it, and
     /// the RV32-only CSRs have names only on RV32 (as in llvm-objdump).
     pub xlen: Xlen,
+    /// Name Zicbop's prefetch hints (`ori zero, rs1, imm` with `imm[4:0]`
+    /// 0, 1 or 3) `prefetch.i`, `prefetch.r` and `prefetch.w`, as LLVM 23
+    /// does with aliases or without. The plain form leaves them `ori`: its
+    /// output is what merlin-as assembles, and merlin-as, like clang for an
+    /// ISA without Zicbop, takes no `prefetch.*`.
+    pub zicbop: bool,
 }
 
 impl Syntax {
@@ -38,6 +45,7 @@ impl Syntax {
             aliases: true,
             hex: true,
             xlen,
+            zicbop: true,
         }
     }
 
@@ -48,6 +56,7 @@ impl Syntax {
             aliases: false,
             hex: false,
             xlen,
+            zicbop: false,
         }
     }
 }
@@ -232,6 +241,8 @@ impl Inst {
 
         let (mnemonic, operands): (&'static str, String) = match *self {
             Inst::Lui { rd, imm } => ("lui", format!("{}, {:#x}", r(rd), (imm as u32) >> 12)),
+            // `auipc zero, imm` is a hint: Zicfilp's landing pad, as LLVM 23 names it.
+            Inst::Auipc { rd: 0, imm } if a => ("lpad", format!("{:#x}", (imm as u32) >> 12)),
             Inst::Auipc { rd, imm } => ("auipc", format!("{}, {:#x}", r(rd), (imm as u32) >> 12)),
             Inst::Jal { rd, imm } => match rd {
                 0 if a => ("j", offset(imm)),
@@ -296,6 +307,23 @@ impl Inst {
                 };
                 (m, format!("{}, {}({})", r(rs2), imm(i), r(rs1)))
             }
+            // `ori zero, rs1, imm` with imm[4:0] 0, 1 or 3 is a hint: Zicbop's
+            // prefetches, which LLVM 23 decodes as instructions of their own
+            // (named without aliases too), unless `Syntax::zicbop` is off.
+            // The offset is the rest of imm.
+            Inst::OpImm {
+                op: AluOp::Or,
+                rd: 0,
+                rs1,
+                imm: i,
+            } if syntax.zicbop && matches!(i & 0x1f, 0 | 1 | 3) => {
+                let m = match i & 0x1f {
+                    0 => "prefetch.i",
+                    1 => "prefetch.r",
+                    _ => "prefetch.w",
+                };
+                (m, format!("{}({})", imm(i & !0x1f), r(rs1)))
+            }
             Inst::OpImm { op, rd, rs1, imm: i } => {
                 let alias = match (op, rd, rs1, i) {
                     (AluOp::Add, 0, 0, 0) => Some(("nop", String::new())),
@@ -325,6 +353,17 @@ impl Inst {
                 alu_imm_name(op, true),
                 format!("{}, {}, {}", r(rd), r(rs1), imm(i)),
             ),
+            // `add zero, zero, rs2` for rs2 = x2..x5 is a hint: Zihintntl's
+            // non-temporal locality hints, aliases in LLVM 23.
+            Inst::Op {
+                op: AluOp::Add,
+                rd: 0,
+                rs1: 0,
+                rs2: rs2 @ 2..=5,
+            } if a => {
+                let m = ["ntl.p1", "ntl.pall", "ntl.s1", "ntl.all"][rs2 as usize - 2];
+                (m, String::new())
+            }
             Inst::Op { op, rd, rs1, rs2 } => {
                 let alias = match (op, rs1, rs2) {
                     (AluOp::Sub, 0, _) => Some(("neg", rs2)),
@@ -396,6 +435,8 @@ impl Inst {
                 (m, format!("{}, {}, ({})", r(rd), r(rs2), r(rs1)))
             }
             Inst::Fence { pred: 0xf, succ: 0xf } if a => ("fence", String::new()),
+            // `fence w, 0` is a hint: Zihintpause's `pause`, an alias in LLVM 23.
+            Inst::Fence { pred: 0x1, succ: 0 } if a => ("pause", String::new()),
             Inst::Fence { pred, succ } => ("fence", format!("{}, {}", fence_set(pred), fence_set(succ))),
             Inst::FenceTso => ("fence.tso", String::new()),
             Inst::FenceI => ("fence.i", String::new()),
@@ -498,6 +539,7 @@ mod tests {
             aliases: false,
             hex: true,
             xlen: RV32,
+            zicbop: true,
         };
         decode(w, RV32).format(Some(0), s).to_string()
     }
@@ -529,12 +571,13 @@ mod tests {
         assert_eq!(objdump(0xc0001073, 0), "unimp");
         assert_eq!(no_aliases(0xc0001073), "unimp");
         assert_eq!(objdump(0x0330000f, 0), "fence rw, rw");
-        assert_eq!(objdump(0x0100000f, 0), "fence w, 0");
+        assert_eq!(objdump(0x0100000f, 0), "pause");
+        assert_eq!(no_aliases(0x0100000f), "fence w, 0");
         assert_eq!(objdump(0x8330000f, 0), "fence.tso");
         assert_eq!(objdump(0xffffffff, 0), ".word 0xffffffff");
     }
 
-    /// What llvm-objdump 21 prints for clang's `-march=rv32ima` encodings.
+    /// What llvm-objdump 23 prints for clang's `-march=rv32ima` encodings.
     #[test]
     fn atomics() {
         let cases = [
@@ -639,6 +682,40 @@ mod tests {
         assert_eq!(objdump(0xff858067, 0), "jr -0x8(a1)");
     }
 
+    /// The hints LLVM 23 names: Zihintpause, Zihintntl and Zicfilp's as
+    /// aliases, Zicbop's as instructions (so without aliases too).
+    #[test]
+    fn hints() {
+        let cases = [
+            (0x0100000f, "pause", "fence w, 0"),
+            (0x00200033, "ntl.p1", "add zero, zero, sp"),
+            (0x00300033, "ntl.pall", "add zero, zero, gp"),
+            (0x00400033, "ntl.s1", "add zero, zero, tp"),
+            (0x00500033, "ntl.all", "add zero, zero, t0"),
+            (0x00100033, "add zero, zero, ra", "add zero, zero, ra"),
+            (0x00600033, "add zero, zero, t1", "add zero, zero, t1"),
+            (0x00200133, "add sp, zero, sp", "add sp, zero, sp"),
+            (0x00001017, "lpad 0x1", "auipc zero, 0x1"),
+            (0xfffff017, "lpad 0xfffff", "auipc zero, 0xfffff"),
+            (0x02056013, "prefetch.i 0x20(a0)", "prefetch.i 0x20(a0)"),
+            (0x02156013, "prefetch.r 0x20(a0)", "prefetch.r 0x20(a0)"),
+            (0x02356013, "prefetch.w 0x20(a0)", "prefetch.w 0x20(a0)"),
+            (0x00006013, "prefetch.i 0x0(zero)", "prefetch.i 0x0(zero)"),
+            (0x8005e013, "prefetch.i -0x800(a1)", "prefetch.i -0x800(a1)"),
+            (0x02256013, "ori zero, a0, 0x22", "ori zero, a0, 0x22"),
+            (0x02056093, "ori ra, a0, 0x20", "ori ra, a0, 0x20"),
+        ];
+        for (w, aliases, plain) in cases {
+            assert_eq!(objdump(w, 0), aliases, "{w:#010x}");
+            assert_eq!(no_aliases(w), plain, "{w:#010x}");
+            assert_eq!(objdump64(w, 0), aliases, "{w:#010x}");
+        }
+        // The plain form (Grail's trace) is what merlin-as assembles: no
+        // prefetch.i, which needs Zicbop.
+        assert_eq!(decode(0xfe056013, RV32).to_string(), "ori zero, a0, -32");
+        assert_eq!(decode(0x0100000f, RV32).to_string(), "fence w, 0");
+    }
+
     #[test]
     fn rv32_only_csrs_by_width() {
         // csrrs a0, cycleh, zero: rdcycleh on RV32; on RV64 the CSR has no
@@ -654,6 +731,7 @@ mod tests {
             aliases: true,
             hex: false,
             xlen: RV32,
+            zicbop: true,
         };
         let f = |w| decode(w, RV32).format(None, s).to_string();
         assert_eq!(f(0x80000513), "li a0, -2048");

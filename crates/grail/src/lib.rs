@@ -204,17 +204,13 @@ impl Machine {
     /// disk's boot block into RAM and jumps to it (spec section 7, "Boot from disk";
     /// [`boot`]). The checks happen when the machine runs: a disk with no valid boot
     /// block stops it with [`boot::EXIT_BOOT_FAILED`] and a message on the UART. An
-    /// error here only if the machine has no disk, is RV64 (its boot code is RV32 until
-    /// #151), or has less RAM than the boot area ([`boot::BOOT_AREA_SIZE`], 64 KiB) the
-    /// boot block is loaded into.
+    /// error here only if the machine has no disk, or has less RAM than the boot area
+    /// ([`boot::BOOT_AREA_SIZE`], 64 KiB) the boot block is loaded into. The ROM's
+    /// loader is the one of the machine's width (RV32 or RV64), and so must be the boot
+    /// block's code.
     pub fn boot_from_disk(&mut self) -> Result<(), String> {
         if self.cpu.bus.disks.is_empty() {
             return Err("no disk to boot from".into());
-        }
-        // The disk loader in the ROM, and the boot blocks and kernels it starts, are RV32
-        // code until RV64 has a boot chain (#151, #154).
-        if self.config.xlen == Xlen::Rv64 {
-            return Err("booting from disk takes an RV32 machine: its boot code is RV32".into());
         }
         if boot::boot_block_addr(self.cpu.bus.ram.len()).is_none() {
             return Err(format!(

@@ -2,7 +2,7 @@
 crates/merlin-objdump/tests/fixtures/relocs.o:	file format elf32-littleriscv
 
 SYMBOL TABLE:
-00000000 l       .text	00000000 $x
+00000000 l       .text	00000000 $xrv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0
 00000010 l       .text	00000000 .Lpcrel_hi0
 00000000 l     O .rodata	00000010 local_data
 00000018 l       .text	00000000 .Lpcrel_hi1

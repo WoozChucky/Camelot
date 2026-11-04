@@ -313,9 +313,10 @@ writer (`src/elf.rs`, whose module docs show what the class changes).
 
 For every source in `examples/` (clang assembling it with
 `-include examples/xcal.inc`), `llvm-objdump -dr` prints exactly the same text
-for our object as for clang's (on RV32; the examples come to RV64 in #151).
-The differences
-that remain on other input (spec section 10):
+for our object as for clang's, at each width the source is built for (RV64
+with the flags of the RV64 reference builds, `xtask::ld_fixtures::RV64`;
+`crates/xtask/tests/hello.rs`, below). The differences that remain on other
+input (spec section 10):
 
 - clang rewrites a branch it can't resolve or reach (to a global, an
   undefined symbol, another section, or too far) into an inverted branch over
@@ -323,7 +324,11 @@ that remain on other input (spec section 10):
   reports it out of range.
 - A numeric label a relocation refers to is called `.L1$0` (`1:`, first
   definition) where clang says `.Ltmp0`.
-- No `$x`/`$d` mapping symbols in the symbol table.
+- No `$x`/`$d` mapping symbols in the symbol table yet: they come with #192
+  (merlin-as and `/bin/as`, after #151). Until then llvm-objdump 23 (and
+  merlin-objdump) list data in a code section of a merlin-as object as
+  instructions, where clang's object lists it as `.word`, and don't forget
+  the `auipc` values behind `jalr` targets where the data starts and ends.
 - Operand forms LLVM accepts and merlin-as doesn't: `jalr rd, rs`,
   `jalr off(rs)`, `jr off(rs)`, `jr rs, off`, `call rd, sym`, `jump sym, rt`,
   `%hi(sym)` in `.insn u`, named `.insn` opcodes (`.insn r OP, ...`),
@@ -374,8 +379,8 @@ assembles in `crates/xtask/tests/selfhost.rs`.
   `-march`.
 - `encode_hello`: hello.S against clang's object (`tests/golden/hello.ref`,
   `tests/golden/hello.dr.txt`), word for word and as `llvm-objdump -dr` text
-  (printed by merlin-objdump). On RV64 word for word (`golden/rv64/hello.ref`);
-  `golden/rv64/hello.dr.txt` waits for merlin-objdump to read ELF64 (#150).
+  (printed by merlin-objdump), and on RV64 the same against
+  `golden/rv64/hello.ref` and `golden/rv64/hello.dr.txt`.
 - `elf64`: an RV64 object read back with the `elf` crate against what clang
   writes for the same source (`--target=riscv64 -march=rv64ima_zicsr_zifencei
   -mabi=lp64 -mno-relax`): header, sections, symbols, relocations and line
@@ -393,10 +398,10 @@ merlin-as and merlin-ld, runs it in Grail and compares `hello` and
 `multiobj` with ld.lld's link of clang's objects;
 `crates/merlin-ld/tests/merlin_as_programs.rs` builds
 `examples/muldiv/muldiv.S` with merlin-as and merlin-ld and runs it in Grail;
-`crates/xtask/tests/hello.rs` runs the committed merlin-as + ld.lld build of
-hello (`tests/golden/hello.elf`) in Grail and, when LLVM is installed,
-rebuilds it and compares `llvm-objdump -dr` of every example object with
-clang's;
+`crates/xtask/tests/hello.rs` runs the committed merlin-as + ld.lld builds of
+hello (`tests/golden/hello.elf`, and `golden/rv64/hello.elf` for RV64) in
+Grail and, when LLVM is installed, rebuilds them and compares
+`llvm-objdump -dr` of every example object, RV32 and RV64, with clang's;
 `crates/xtask/tests/kernel.rs` boots the kernel with `kernel/entry.s`
 assembled by merlin-as.
 
@@ -420,4 +425,5 @@ Windows); their output is committed, so `cargo test` needs none of it.
   `examples/hello/hello.S` changes.
 - `tests/debug_line/*.o` and `tests/debug_line/rv64/*.o`:
   `scripts/gen-debug-line-golden.sh`.
-- `tests/golden/hello.elf`: `cargo xtask hello` (merlin-as and ld.lld, RV32).
+- `tests/golden/hello.elf` and `golden/rv64/hello.elf`: `cargo xtask hello`
+  (merlin-as and ld.lld, both widths; LLD 23.1.4 made them).

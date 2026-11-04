@@ -10,23 +10,25 @@ Dynamic Section:
 Sections:
 Idx Name              Size     VMA      Type
   0                   00000000 00000000 
-  1 .strtab           0000009c 00000000 
+  1 .strtab           000000d5 00000000 
   2 .text             00000000 00000000 TEXT
   3 .text.start       00000050 00000000 TEXT
-  4 .rela.text.start  00000078 00000000 
+  4 .rela.text.start  0000009c 00000000 
   5 .rodata           00000015 00000000 DATA
   6 .riscv.attributes 0000003d 00000000 
-  7 .symtab           000000d0 00000000 
+  7 .symtab           000000f0 00000000 
 
 SYMBOL TABLE:
 10000000 l       *ABS*	00000000 UART_BASE
 00000005 l       *ABS*	00000000 UART_LSR
 00000020 l       *ABS*	00000000 LSR_THRE
 00000000 l       .text.start	00000000 .Lpcrel_hi0
-00000000 l       .text.start	00000000 $x
+00000000 l       .text.start	00000000 $xrv32i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0
 00000008 l       .text.start	00000000 .Lpcrel_hi1
 00000000 l       .rodata	00000000 message
 00000020 l       .text.start	00000000 puts
+00000028 l       .text.start	00000000 .Ltmp0
+00000048 l       .text.start	00000000 .Ltmp1
 00000000 l       .rodata	00000000 $d
 00000000 l       .riscv.attributes	00000000 $d
 00000000 g       .text.start	00000000 _start
@@ -44,3 +46,6 @@ OFFSET   TYPE                     VALUE
 0000000c R_RISCV_RELAX            *ABS*
 00000010 R_RISCV_CALL_PLT         puts
 00000010 R_RISCV_RELAX            *ABS*
+0000002c R_RISCV_BRANCH           .Ltmp1
+00000044 R_RISCV_JAL              .Ltmp0
+00000044 R_RISCV_RELAX            *ABS*

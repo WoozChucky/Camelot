@@ -7,6 +7,8 @@
 # Receiving EOT (0x04, not echoed) prints the interrupt count with xcal.dbg and halts
 # with exit code 0. Any unexpected trap halts with exit code 1.
 #
+# uart-echo-rv64.S is the same program for RV64 machines.
+#
 # Built with our own tools by `cargo xtask examples uart-echo`, which does the same as
 #
 #   merlin-as examples/uart-echo/uart-echo.S -o uart-echo.o

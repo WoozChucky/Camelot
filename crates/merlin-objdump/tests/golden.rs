@@ -116,6 +116,11 @@ const CASES: &[(&str, &str, &[&str])] = &[
         &["-d", "-l"],
     ),
     (
+        "subprograms-o.dl",
+        "crates/merlin-objdump/tests/fixtures/subprograms.o",
+        &["-d", "-l"],
+    ),
+    (
         "linked-elf.d",
         "crates/merlin-objdump/tests/fixtures/linked.elf",
         &["-d"],
@@ -133,7 +138,103 @@ const CASES: &[(&str, &str, &[&str])] = &[
         &["-d", "-x"],
     ),
     ("rv32ua-p-lrsc.d", "tests/riscv-tests/rv32ua-p-lrsc", &["-d"]),
+    // RV64: ELF64 files, in golden/rv64/.
+    ("rv64/hello-elf.d", RV64_HELLO_ELF, &["-d"]),
+    (
+        "rv64/hello-elf.d-no-raw",
+        RV64_HELLO_ELF,
+        &["-d", "--no-show-raw-insn"],
+    ),
+    (
+        "rv64/hello-elf.d-no-aliases",
+        RV64_HELLO_ELF,
+        &["-d", "-M", "no-aliases"],
+    ),
+    ("rv64/hello-elf.x", RV64_HELLO_ELF, &["-x"]),
+    ("rv64/hello-elf.s", RV64_HELLO_ELF, &["-s"]),
+    ("rv64/hello-o.dr", RV64_HELLO_O, &["-dr"]),
+    ("rv64/hello-o.x", RV64_HELLO_O, &["-x"]),
+    ("rv64/isa-o.d", RV64_ISA, &["-d"]),
+    (
+        "rv64/isa-o.d-no-aliases",
+        RV64_ISA,
+        &["-d", "-M", "no-aliases", "--no-show-raw-insn"],
+    ),
+    ("rv64/relocs-o.dr", RV64_RELOCS, &["-dr"]),
+    ("rv64/relocs-o.r", RV64_RELOCS, &["-r"]),
+    ("rv64/relocs-o.t", RV64_RELOCS, &["-t"]),
+    ("rv64/relocs-o.h", RV64_RELOCS, &["-h"]),
+    ("rv64/relocs-o.x", RV64_RELOCS, &["-x"]),
+    ("rv64/relocs-o.s", RV64_RELOCS, &["-s"]),
+    ("rv64/misc-o.x", RV64_MISC, &["-x"]),
+    ("rv64/misc-o.dr", RV64_MISC, &["-dr"]),
+    ("rv64/debug-o.d", RV64_DEBUG, &["-d"]),
+    ("rv64/debug-o.h", RV64_DEBUG, &["-h"]),
+    ("rv64/debug-o.dl", RV64_DEBUG, &["-d", "-l"]),
+    ("rv64/lines-elf.dl", RV64_LINES, &["-d", "-l"]),
+    (
+        "rv64/units-o.dl",
+        "crates/merlin-objdump/tests/fixtures/rv64/units.o",
+        &["-d", "-l"],
+    ),
+    (
+        "rv64/units-dwarf4-o.dl",
+        "crates/merlin-objdump/tests/fixtures/rv64/units-dwarf4.o",
+        &["-d", "-l"],
+    ),
+    (
+        "rv64/units-aranges-o.dl",
+        "crates/merlin-objdump/tests/fixtures/rv64/units-aranges.o",
+        &["-d", "-l"],
+    ),
+    (
+        "rv64/nocu-o.dl",
+        "crates/merlin-objdump/tests/fixtures/rv64/nocu.o",
+        &["-d", "-l"],
+    ),
+    (
+        "rv64/subprograms-o.dl",
+        "crates/merlin-objdump/tests/fixtures/rv64/subprograms.o",
+        &["-d", "-l"],
+    ),
+    (
+        "rv64/units-elf.dl",
+        "crates/merlin-objdump/tests/fixtures/rv64/units.elf",
+        &["-d", "-l"],
+    ),
+    ("rv64/linked-elf.d", RV64_LINKED, &["-d"]),
+    ("rv64/linked-elf.x", RV64_LINKED, &["-x"]),
+    ("rv64/linked-elf.s", RV64_LINKED, &["-s"]),
+    (
+        "rv64/rv64ui-p-add.d",
+        "tests/riscv-tests/rv64/rv64ui-p-add",
+        &["-d"],
+    ),
+    (
+        "rv64/rv64mi-p-csr.d",
+        "tests/riscv-tests/rv64/rv64mi-p-csr",
+        &["-d"],
+    ),
+    (
+        "rv64/rv64si-p-dirty.dx",
+        "tests/riscv-tests/rv64/rv64si-p-dirty",
+        &["-d", "-x"],
+    ),
+    (
+        "rv64/rv64ua-p-lrsc.d",
+        "tests/riscv-tests/rv64/rv64ua-p-lrsc",
+        &["-d"],
+    ),
 ];
+
+const RV64_HELLO_ELF: &str = "crates/merlin-objdump/tests/fixtures/rv64/hello.elf";
+const RV64_HELLO_O: &str = "crates/merlin-objdump/tests/fixtures/rv64/hello.o";
+const RV64_ISA: &str = "crates/merlin-objdump/tests/fixtures/rv64/isa.o";
+const RV64_RELOCS: &str = "crates/merlin-objdump/tests/fixtures/rv64/relocs.o";
+const RV64_MISC: &str = "crates/merlin-objdump/tests/fixtures/rv64/misc.o";
+const RV64_DEBUG: &str = "crates/merlin-objdump/tests/fixtures/rv64/debug.o";
+const RV64_LINES: &str = "crates/merlin-objdump/tests/fixtures/rv64/lines.elf";
+const RV64_LINKED: &str = "crates/merlin-objdump/tests/fixtures/rv64/linked.elf";
 
 fn root() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
@@ -150,18 +251,18 @@ fn run(input: &str, args: &[&str]) -> String {
 
 /// The address of a disassembly line (`80000000: ...`, `      1c: ...`).
 /// Labels (`80000000 <_start>:`) and relocation lines (tab-indented) are not.
-fn insn_addr(line: &str) -> Option<u32> {
+fn insn_addr(line: &str) -> Option<u64> {
     if line.starts_with('\t') {
         return None;
     }
     let (addr, _) = line.trim_start().split_once(':')?;
-    u32::from_str_radix(addr, 16).ok()
+    u64::from_str_radix(addr, 16).ok()
 }
 
 /// The address of a label line (`80000000 <_start>:`).
-fn label_addr(line: &str) -> Option<u32> {
+fn label_addr(line: &str) -> Option<u64> {
     let (addr, rest) = line.split_once(" <")?;
-    rest.ends_with(">:").then(|| u32::from_str_radix(addr, 16).ok())?
+    rest.ends_with(">:").then(|| u64::from_str_radix(addr, 16).ok())?
 }
 
 /// Our exact lines for the instructions llvm-objdump prints as `<unknown>`,
@@ -184,19 +285,19 @@ fn compare(ours: &str, llvm: &str, unknown: &[String]) -> Vec<String> {
     // address llvm prints. llvm steps through them in 1, 2, 4 or more bytes
     // (it guesses the length from the low bits), we step in words, so our
     // lines there are checked against `unknown` instead.
-    let mut addrs: Vec<u32> = llvm
+    let mut addrs: Vec<u64> = llvm
         .lines()
         .filter_map(|l| insn_addr(l).or_else(|| label_addr(l)))
         .collect();
     addrs.sort();
     addrs.dedup();
-    let ranges: Vec<(u32, u32)> = llvm
+    let ranges: Vec<(u64, u64)> = llvm
         .lines()
         .filter(|l| l.ends_with("<unknown>"))
         .filter_map(insn_addr)
-        .map(|a| (a, addrs.iter().copied().find(|&b| b > a).unwrap_or(u32::MAX)))
+        .map(|a| (a, addrs.iter().copied().find(|&b| b > a).unwrap_or(u64::MAX)))
         .collect();
-    let is_unknown = |a: u32| ranges.iter().any(|&(start, end)| (start..end).contains(&a));
+    let is_unknown = |a: u64| ranges.iter().any(|&(start, end)| (start..end).contains(&a));
     let mut problems = Vec::new();
     let llvm_lines: Vec<&str> = llvm.lines().filter(|l| !l.ends_with("<unknown>")).collect();
     let mut our_lines = Vec::new();
@@ -300,7 +401,7 @@ fn hello_elf_every_instruction() {
         "crates/merlin-objdump/tests/fixtures/hello.elf",
         &["-d", "--no-show-raw-insn"],
     );
-    let insns = |text: &str| -> Vec<(u32, String)> {
+    let insns = |text: &str| -> Vec<(u64, String)> {
         text.lines()
             .filter_map(|l| {
                 let a = insn_addr(l)?;
