@@ -121,8 +121,10 @@ int map_pages(pagetable_t pt, uintptr va, phys_addr_t pa, usize size, u32 perm) 
     if (va % PGSIZE != 0 || pa % PGSIZE != 0 || size % PGSIZE != 0 || size == 0) {
         panic("map_pages: unaligned range");
     }
-    /* W without R is a reserved encoding; no R/W/X would be a table pointer. */
-    if ((perm & PTE_LEAF) == 0 || (perm & ~PTE_PERM_MASK) != 0 || (perm & (PTE_R | PTE_W)) == PTE_W) {
+    /* W without R is a reserved encoding; no R/W/X would be a table pointer.
+     * A, D and G come with a kernel mapping (PTE_KERNEL), never with U. */
+    if ((perm & PTE_LEAF) == 0 || (perm & ~(PTE_PERM_MASK | PTE_KERNEL)) != 0 ||
+        (perm & (PTE_R | PTE_W)) == PTE_W || ((perm & PTE_U) != 0 && (perm & PTE_KERNEL) != 0)) {
         panic("map_pages: bad permissions");
     }
     /* The last page, computed so that a range ending at the top of the
@@ -221,7 +223,8 @@ void pagetable_free(pagetable_t pt) {
  * page). Where a whole superpage is aligned in both, fits in what is left
  * and is still free in the table, one leaf maps it: one PTE instead of a
  * table of 512 (or 1024): mapping the 64 MiB PLIC page by page would be
- * 16384 PTEs, most of a boot. `size` is a whole number of pages. */
+ * 16384 PTEs, most of a boot. `size` is a whole number of pages, `perm` a
+ * PAGE_KERNEL one. */
 static void kvmmap(uintptr va, phys_addr_t pa, usize size, u32 perm) {
     usize off = 0;
     while (off < size) {
@@ -285,35 +288,38 @@ void kvminit(void) {
     uintptr rodata = (uintptr)__rodata_start;
     uintptr data = (uintptr)__data_start;
     uintptr end = (uintptr)__kernel_end;
-    if (map_pages(kernel_pagetable, text, pa(text), rodata - text, PTE_R | PTE_X) != 0 ||
-        map_pages(kernel_pagetable, rodata, pa(rodata), data - rodata, PTE_R) != 0) {
+    if (map_pages(kernel_pagetable, text, pa(text), rodata - text, PAGE_KERNEL_READ_EXEC) != 0 ||
+        map_pages(kernel_pagetable, rodata, pa(rodata), data - rodata, PAGE_KERNEL_READ) != 0) {
         panic("kvminit: out of memory");
     }
 #if __riscv_xlen == 64
-    if (map_pages(kernel_pagetable, data, pa(data), end - data, PTE_R | PTE_W) != 0) {
+    if (map_pages(kernel_pagetable, data, pa(data), end - data, PAGE_KERNEL) != 0) {
         panic("kvminit: out of memory");
     }
     /* All of RAM in the direct map (kinit has cut ram_size to what the
      * direct map holds). */
-    kvmmap((uintptr)va(ram_base), ram_base, ram_size, PTE_R | PTE_W);
+    kvmmap((uintptr)va(ram_base), ram_base, ram_size, PAGE_KERNEL);
 #else
     /* Every free page after the image: kinit has checked that the image
      * starts RAM, and RAM is mapped where it is. */
     (void)end;
-    kvmmap(data, data, ram_size - (data - ram_base), PTE_R | PTE_W);
+    kvmmap(data, data, ram_size - (data - ram_base), PAGE_KERNEL);
 #endif
 
-    /* Every MMIO range the machine has, whole pages, never executable. The
-     * table doesn't promise that devices are page aligned, so two of them can
-     * share a page: kvmmap() skips pages already mapped. */
+    /* Every MMIO range the machine has that S-mode uses, whole pages, never
+     * executable: not the CLINT and the test device, which only M-mode
+     * touches (machine_vec, at their physical addresses; start.c), as Linux
+     * under an SBI never maps them. The table doesn't promise that devices
+     * are page aligned, so two of them can share a page: kvmmap() skips
+     * pages already mapped. */
     u32 count = sysinfo_device_count();
     for (u32 i = 0; i < count; i++) {
         struct sysinfo_device dev;
         sysinfo_device(i, &dev);
-        if (dev.size != 0) {
+        if (dev.size != 0 && dev.type != DEV_CLINT && dev.type != DEV_TEST) {
             phys_addr_t first = PGROUNDDOWN(dev.base);
             usize size = PGROUNDUP(dev.base + dev.size) - first;
-            kvmmap(ioremap(first, size), first, size, PTE_R | PTE_W);
+            kvmmap(ioremap(first, size), first, size, PAGE_KERNEL);
         }
     }
 
@@ -395,7 +401,7 @@ void *kstack_alloc(void) {
     usize mapped = 0;
     while (mapped < KSTACK_SIZE) {
         void *page = kzalloc();
-        if (page == NULL || map_pages(kernel_pagetable, stack + mapped, pa(page), PGSIZE, PTE_R | PTE_W) != 0) {
+        if (page == NULL || map_pages(kernel_pagetable, stack + mapped, pa(page), PGSIZE, PAGE_KERNEL) != 0) {
             if (page != NULL) {
                 kfree(page);
             }
@@ -540,15 +546,15 @@ static void early_build(u32 levels, phys_addr_t load, phys_addr_t base, u64 size
     /* The image at both addresses, in 2 MiB leaves, R+W+X: entry.S runs at
      * the physical one until it jumps to the link one. */
     u64 image = (uintptr)__kernel_end - load;
-    early_map(load, load, image, 1, PTE_R | PTE_W | PTE_X);
-    early_map(KERNEL_LINK_ADDR, load, image, 1, PTE_R | PTE_W | PTE_X);
+    early_map(load, load, image, 1, PAGE_KERNEL_EXEC);
+    early_map(KERNEL_LINK_ADDR, load, image, 1, PAGE_KERNEL_EXEC);
     /* RAM in the direct map, in 1 GiB leaves, so kinit() and kvminit() can
      * reach every page before the final table exists (it maps RAM exactly;
      * these may run past its end, but nothing goes there). */
-    early_map(page_offset, base, size < direct_map_size ? size : direct_map_size, 2, PTE_R | PTE_W);
+    early_map(page_offset, base, size < direct_map_size ? size : direct_map_size, 2, PAGE_KERNEL);
     /* The devices' window, in 1 GiB leaves: every device is in the first
      * 2 GiB, below RAM (spec section 7). */
-    early_map(vmalloc_start, 0, 0x80000000ull, 2, PTE_R | PTE_W);
+    early_map(vmalloc_start, 0, 0x80000000ull, 2, PAGE_KERNEL);
     early_satp = satp_mode | ((uintptr)early_pg_dir >> PGSHIFT);
 }
 

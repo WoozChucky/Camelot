@@ -533,12 +533,10 @@ fn unmapped_load_and_text_store_page_fault() {
         pte_line.starts_with(&format!("  va {kmain:#018x} maps to pa {pa:#018x}, pte ")),
         "{pte_line}"
     );
-    // R+X, not W, not U (A depends on whether that page ran since the
-    // switch to the kernel page table: its first instructions ran under
-    // the early one).
+    // R+X, not W, not U, and A, D and G, which every kernel leaf has (vm.h's
+    // PTE_KERNEL): a hart that does not set A and D itself would fault.
     let flags = pte_line.rsplit(' ').next().unwrap();
-    assert_eq!(flags.len(), 8, "{pte_line}");
-    assert!(flags.starts_with('-') && flags.ends_with("-X-RV"), "{pte_line}");
+    assert_eq!(flags, "DAG-X-RV", "{pte_line}");
 }
 
 /// The panics of the memory API's and the locks' misuses.

@@ -112,7 +112,10 @@ static void test_zeroing(void) {
     kfree(pt);
 }
 
-/* Maps a page a second time, at ALIAS_VA, and writes through each address. */
+/* Maps a page a second time, at ALIAS_VA, and writes through each address.
+ * The one kernel mapping made without PTE_KERNEL's A and D, on purpose: it
+ * checks that the hart sets them (Grail manages them, spec section 5), as it
+ * does for user pages. */
 static void test_alias(void) {
     volatile u32 *page = kalloc();
     volatile u32 *alias = (volatile u32 *)ALIAS_VA;

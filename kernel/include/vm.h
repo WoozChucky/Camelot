@@ -4,7 +4,10 @@
  *
  * Page tables. A table is one 4 KiB page of PTEs. A PTE with R, W or X set
  * is a leaf; a valid one without them points at the next table down. Grail
- * sets A and D itself (hardware-managed) and has no TLB.
+ * sets A and D itself (hardware-managed) and has no TLB; a hart without that
+ * (Svade, the privileged spec's other choice) faults on an access whose
+ * leaf has A clear, or D for a store, so the kernel's own leaves are made
+ * with A and D set (PTE_KERNEL, below), as Linux makes them.
  *
  * - RV32, Sv32: two levels of 1024 4-byte PTEs. A virtual address splits
  *   10/10/12: VPN[1] (bits 31:22) indexes the root, VPN[0] (bits 21:12) a
@@ -47,12 +50,26 @@ typedef pte_t *pagetable_t; /* one page: PTES_PER_TABLE PTEs */
 #define PTE_W (1u << 2) /* writable */
 #define PTE_X (1u << 3) /* executable */
 #define PTE_U (1u << 4) /* user-mode accessible */
-#define PTE_G (1u << 5) /* global */
-#define PTE_A (1u << 6) /* accessed (set by the hardware) */
-#define PTE_D (1u << 7) /* dirty (set by the hardware) */
+#define PTE_G (1u << 5) /* global: in every address space */
+#define PTE_A (1u << 6) /* accessed (set by the hardware, or up front) */
+#define PTE_D (1u << 7) /* dirty (set by the hardware, or up front) */
 
 #define PTE_PERM_MASK (PTE_R | PTE_W | PTE_X | PTE_U)
 #define PTE_LEAF (PTE_R | PTE_W | PTE_X)
+
+/* What every leaf of the kernel's own address space has besides its
+ * permissions, as Linux's _PAGE_KERNEL: A and D set up front, so no access
+ * through it needs the hardware to set them (a hart that doesn't would
+ * fault, and kernel_trap would panic), and G, since the kernel's mappings
+ * are the same in every address space (processes share them, uvm_create()).
+ * User pages get neither: A and D are the hardware's to set (Grail does). */
+#define PTE_KERNEL (PTE_G | PTE_A | PTE_D)
+/* The kernel's leaves, by Linux's names: data, read-only data, text, and
+ * text that is written too (the early page table's image). */
+#define PAGE_KERNEL (PTE_R | PTE_W | PTE_KERNEL)
+#define PAGE_KERNEL_READ (PTE_R | PTE_KERNEL)
+#define PAGE_KERNEL_READ_EXEC (PTE_R | PTE_X | PTE_KERNEL)
+#define PAGE_KERNEL_EXEC (PTE_R | PTE_W | PTE_X | PTE_KERNEL)
 
 #if __riscv_xlen == 64
 #define PTES_PER_TABLE 512
@@ -246,8 +263,9 @@ pagetable_t pagetable_create(void);
 pte_t *walk(pagetable_t pt, uintptr va, bool alloc);
 
 /* Maps the `size` bytes at `va` to the physical range at `pa`, with
- * permissions `perm` (some of PTE_R/W/X/U). `va`, `pa` and `size` must be page
- * aligned and `size` non-zero; mapping a page that is already mapped panics.
+ * permissions `perm` (some of PTE_R/W/X/U, or a PAGE_KERNEL one: with A, D
+ * and G, never U). `va`, `pa` and `size` must be page aligned and `size`
+ * non-zero; mapping a page that is already mapped panics.
  * Returns 0, or -1 if a page table could not be allocated (the pages mapped
  * before that stay mapped). The range may end at the top of the address
  * space. */
@@ -289,7 +307,9 @@ extern uintptr kernel_satp;
 #endif
 
 /* Builds kernel_pagetable: the kernel image (text R+X, rodata R, the rest
- * R+W), all of RAM (R+W) and every device in the sysinfo table (R+W). On
+ * R+W), all of RAM (R+W) and every device in the sysinfo table that S-mode
+ * uses (R+W: all but the CLINT and the test device, which only M-mode
+ * touches), every leaf with PTE_KERNEL. On
  * RV32 every one at its physical address; on RV64 in the kernel half, the
  * image at its link address, RAM in the direct map and the devices in their
  * window, with no identity mapping left. */

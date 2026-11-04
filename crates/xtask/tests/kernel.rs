@@ -1082,26 +1082,11 @@ fn store_to_kernel_text_panics() {
             &BOOT_FAULT_STORE_TEXT.to_le_bytes(),
         )
         .unwrap();
-    // Grail sets A when an access goes through the PTE: a fetch or a load on
-    // kmain's page with paging on, before the store that faults (which sets
-    // neither A nor D). Whether one happens depends on the layout (kmain may
-    // start near the end of a page whose code all runs before paging), so
-    // watch for one.
-    let page = kmain >> 12;
-    let (mut accessed, mut faulted) = (false, false);
+    let mut faulted = false;
     let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
-        let access = mem_access(cpu);
-        if access
-            .as_ref()
-            .is_some_and(|a| a.load_rd.is_none() && a.addr == kmain)
-        {
+        if mem_access(cpu).is_some_and(|a| a.load_rd.is_none() && a.addr == kmain) {
             faulted = true;
         }
-        if faulted || cpu.mode == Mode::M || cpu.csr.satp >> 31 == 0 {
-            return;
-        }
-        let load = access.is_some_and(|a| a.load_rd.is_some() && a.addr >> 12 == page);
-        accessed |= cpu.pc as u32 >> 12 == page || load;
     });
     let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
     assert_eq!(r, RunResult::Exited(PANIC_EXIT), "output:\n{out}");
@@ -1113,14 +1098,10 @@ fn store_to_kernel_text_panics() {
     assert_eq!(cause, "store page fault");
     assert_eq!(v["scause"], STORE_PAGE_FAULT);
     assert_eq!(v["stval"], kmain);
-    // Identity mapped, R+X, never dirty, accessed as watched above.
-    let pte = (kmain >> 12) << 10 | PTE_V | PTE_R | PTE_X;
-    let (pte, flags) = if accessed {
-        (pte | PTE_A, "-A--X-RV")
-    } else {
-        (pte, "----X-RV")
-    };
-    let line = format!("\n  va {kmain:#010x} maps to pa {kmain:#010x}, pte {pte:#010x} {flags}\n");
+    // Identity mapped, R+X, with A, D and G as every kernel leaf has them
+    // (the kernel sets them, PTE_KERNEL in vm.h).
+    let pte = (kmain >> 12) << 10 | PTE_V | PTE_R | PTE_X | PTE_KERNEL;
+    let line = format!("\n  va {kmain:#010x} maps to pa {kmain:#010x}, pte {pte:#010x} DAG-X-RV\n");
     assert!(out.contains(&line), "want{line}in:\n{out}");
     let word = m.cpu.bus.peek(v["sepc"].into()).unwrap();
     assert!(
@@ -1249,8 +1230,12 @@ const PTE_X: u32 = 1 << 3;
 const PTE_U: u32 = 1 << 4;
 const PTE_G: u32 = 1 << 5;
 const PTE_A: u32 = 1 << 6;
-/// The bits of a PTE the kernel chooses; A and D are Grail's, and RSW (9:8)
-/// is for software, which the kernel doesn't use yet.
+const PTE_D: u32 = 1 << 7;
+/// What the kernel's own leaves have besides their permissions (vm.h's
+/// PTE_KERNEL, Linux's _PAGE_KERNEL): A and D set up front, and G.
+const PTE_KERNEL: u32 = PTE_G | PTE_A | PTE_D;
+/// The bits of a user PTE the kernel chooses; A and D are Grail's there, and
+/// RSW (9:8) is for software, which the kernel doesn't use yet.
 const PTE_KERNEL_BITS: u32 = PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_G;
 const PTE_RSW: u32 = 0x300;
 
@@ -1339,12 +1324,12 @@ fn check_kernel_memory(ram_mib: usize, extra_devices: &[DeviceEntry]) {
     assert!(root >= kernel_end && u64::from(root) < ram_end, "root {root:#x}");
 
     // What the kernel should map, identity, page by page: the PTE bits the
-    // kernel sets (no U, no G).
+    // kernel sets (no U; A, D and G on every leaf).
     let mut want = std::collections::BTreeMap::new();
     let mut map = |start: u64, end: u64, perm: u32| {
         for page in (start..end).step_by(PAGE as usize) {
             assert!(
-                want.insert(page as u32, perm | PTE_V).is_none(),
+                want.insert(page as u32, perm | PTE_KERNEL | PTE_V).is_none(),
                 "{page:#x} twice"
             );
         }
@@ -1357,15 +1342,19 @@ fn check_kernel_memory(ram_mib: usize, extra_devices: &[DeviceEntry]) {
     map(text.into(), rodata.into(), PTE_R | PTE_X);
     map(rodata.into(), data.into(), PTE_R);
     map(data.into(), ram_end, PTE_R | PTE_W);
-    // Every device in the sysinfo table, whole pages. Devices may share a
-    // page with each other, but not with RAM.
+    // Every device in the sysinfo table but the CLINT and the test device,
+    // which only M-mode uses, whole pages. Devices may share a page with
+    // each other, but not with RAM.
     let ram_pages = want.len();
     for dev in m.cpu.bus.sysinfo.devices() {
+        if matches!(dev.kind, DeviceType::Clint | DeviceType::TestFinisher) {
+            continue;
+        }
         let start = dev.base & !u64::from(PAGE - 1);
         let end = (dev.base + dev.size).next_multiple_of(PAGE.into());
         for page in (start..end).step_by(PAGE as usize) {
             assert!(page < u64::from(text), "device page {page:#x} in RAM");
-            want.insert(page as u32, PTE_R | PTE_W | PTE_V);
+            want.insert(page as u32, PTE_R | PTE_W | PTE_KERNEL | PTE_V);
         }
     }
     assert!(want.len() > ram_pages);
@@ -1375,7 +1364,7 @@ fn check_kernel_memory(ram_mib: usize, extra_devices: &[DeviceEntry]) {
     for &(va, pte) in &leaves {
         assert_eq!((pte >> 10) * PAGE, va, "{va:#x} not identity mapped");
         assert_eq!(pte & PTE_RSW, 0, "{va:#x}: {pte:#x}");
-        got.insert(va, pte & PTE_KERNEL_BITS);
+        got.insert(va, pte & (PTE_KERNEL_BITS | PTE_A | PTE_D));
     }
     // Compared as a whole only after spotting the first difference, since the
     // maps have tens of thousands of entries.
@@ -1440,8 +1429,8 @@ fn devices_may_share_a_page() {
             dev(DeviceType::Keyboard, grail::bus::SYSINFO_BASE - 0x80, 0x100),
             // Straddling two pages in a gap of the memory map, the second
             // of them shared with a later entry.
-            dev(DeviceType::TestFinisher, 0x2000_0800, 0x1000),
-            dev(DeviceType::TestFinisher, 0x2000_1400, 0x10),
+            dev(DeviceType::Pointer, 0x2000_0800, 0x1000),
+            dev(DeviceType::Pointer, 0x2000_1400, 0x10),
         ],
     );
 }
@@ -2479,19 +2468,18 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
         .collect();
     assert_eq!(kernel_part, kernel_all);
     assert!(kernel_part.iter().all(|(_, pte)| pte & PTE_U == 0));
-    // The kernel's own root entries below USER_TOP (the test device and the
-    // CLINT, which only M-mode uses) are not in the process's.
-    assert!(kleaves.iter().any(|(va, _)| *va < USER_TOP));
+    // The kernel maps nothing below USER_TOP (the test device and the CLINT
+    // there are M-mode's), so its global leaves never stand for a user page.
+    assert!(kleaves.iter().all(|(va, _)| *va >= USER_TOP));
     // User pages are fresh pages in free RAM.
     for (va, pte) in leaves.iter().filter(|(va, _)| *va < USER_TOP) {
         let pa = (pte >> 10) * PAGE;
         assert!(pa >= sym(&elf, "__kernel_end"), "{va:#x} at {pa:#x}");
     }
     // Its own root, two tables for user space (its segments' and its
-    // stack's) where the kernel has two for the test device and the CLINT,
-    // and the kernel's other second-level tables and megapages, shared: as
-    // many as the kernel's.
-    assert_eq!((tables, megapages), (ktables, kmegapages));
+    // stack's), where the kernel has none, and the kernel's second-level
+    // tables and megapages, shared: two more than the kernel's.
+    assert_eq!((tables, megapages), (ktables + 2, kmegapages));
 }
 
 #[test]
@@ -2817,7 +2805,7 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
         ]
     );
     let text = sym(&elf, "__text_start");
-    let pte = (text >> 12) << 10 | PTE_V | PTE_R | PTE_X | PTE_A;
+    let pte = (text >> 12) << 10 | PTE_V | PTE_R | PTE_X | PTE_KERNEL;
     let lines = command_output(&out, "badload & ding & badhalt");
     // The shell's `[2]` and `[3]` for the background programs come in
     // order, but whether before or after badload's report depends on where
@@ -2828,7 +2816,7 @@ fn faulting_programs_are_killed_and_the_rest_carry_on() {
     let want = [
         "pid 2 (badload) killed: load page fault".to_string(),
         format!("  scause 0x0000000d  sepc {badload:#010x}  stval 0x80000000"),
-        format!("  va 0x80000000 maps to pa 0x80000000, pte {pte:#010x} -A--X-RV"),
+        format!("  va 0x80000000 maps to pa 0x80000000, pte {pte:#010x} DAG-X-RV"),
         "pid 4 (badhalt) killed: illegal instruction".to_string(),
         format!("  scause 0x00000002  sepc {badhalt:#010x}  stval 0x0005100b"),
         "badhalt: exit -1".to_string(),

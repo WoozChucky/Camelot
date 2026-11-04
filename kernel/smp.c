@@ -145,7 +145,7 @@ static int tlb_selftest(u32 others) {
         kprintf("smp: TLB self-test: out of memory\n");
         return 1;
     }
-    if (map_pages(kernel_pagetable, SMP_TEST_VA, pa(page), PGSIZE, PTE_R | PTE_W) != 0) {
+    if (map_pages(kernel_pagetable, SMP_TEST_VA, pa(page), PGSIZE, PAGE_KERNEL) != 0) {
         kprintf("smp: TLB self-test: out of memory\n");
         kfree(page);
         return 1;

@@ -53,7 +53,8 @@ void start(void) {
     timer_init();
     w_mie(MIE_MTIE | MIE_MSIE);
     /* S-mode reads the clock through the time CSR, not the CLINT, which its
-     * page tables don't map (it is M-mode's). */
+     * page tables don't map (it is M-mode's, as is the test device:
+     * kvminit()). */
     w_mcounteren(MCOUNTEREN_TM);
 
     /* mret goes to supervisor_entry in S-mode. A whole-register update: on
