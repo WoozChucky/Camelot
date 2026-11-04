@@ -1493,3 +1493,156 @@ fn variables_in_the_kernel() {
     );
     assert_eq!(r[11], format!("f = {f}"));
 }
+
+/// `tests/vars/vars.c` built by clang (`CLANG`, -O0 -g) and linked by ld.lld (`LLD`)
+/// with tests/rv64/crt0.s (which merlin-as assembles: it has Grail's `xcal.halt`),
+/// for `xlen`.
+fn clang_program(xlen: excalibur::Xlen) -> TempFile {
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
+    let lld = std::env::var("LLD").unwrap_or_else(|_| format!("ld.lld{}", std::env::consts::EXE_SUFFIX));
+    let bits = xlen.bits();
+    let abi = if bits == 64 { "lp64" } else { "ilp32" };
+    let obj = TempFile::new(&format!("clang-vars-{bits}.o"), b"");
+    let out = Command::new(&clang)
+        .current_dir(path(VARS_DIR))
+        .args([
+            &format!("--target=riscv{bits}"),
+            &format!("-march=rv{bits}ima_zicsr_zifencei"),
+            &format!("-mabi={abi}"),
+            "-mcmodel=medany",
+            "-mno-relax",
+            "-O0",
+            "-g",
+            &format!("-fdebug-compilation-dir={VARS_DIR}"),
+            "-ffreestanding",
+            "-fno-builtin",
+            "-fno-pic",
+            "-c",
+            "vars.c",
+            "-o",
+        ])
+        .arg(&*obj)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let crt0 = std::fs::read_to_string(path(RV64_DIR).join("crt0.s")).unwrap();
+    let crt0 = merlin_as::assemble_to_elf_with(&crt0, &merlin_as::Options { xlen }).unwrap();
+    let crt0 = TempFile::new(&format!("clang-crt0-{bits}.o"), &crt0);
+    let elf = TempFile::new(&format!("clang-vars-{bits}.elf"), b"");
+    // Everything in RAM, from 0x80000000, as merlin-ld lays a program out.
+    let script = TempFile::new(
+        &format!("clang-vars-{bits}.ld"),
+        b"SECTIONS {\n  . = 0x80000000;\n  .text : { *(.text*) }\n  .rodata : { *(.rodata*) *(.srodata*) }\n  \
+          .data : { *(.data*) *(.sdata*) }\n  .bss : { *(.bss*) *(.sbss*) *(COMMON) }\n}\n",
+    );
+    let out = Command::new(&lld)
+        .args(["-e", "_start", "-T"])
+        .arg(&*script)
+        .arg(&*crt0)
+        .arg(&*obj)
+        .arg("-o")
+        .arg(&*elf)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {lld}: {e}"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    elf
+}
+
+/// What LLDB shows of the variables of `elf` (vars.c built by merlin or clang),
+/// stopped in walk three calls deep: `frame variable` in walk's innermost frame,
+/// one out, and in main, and `target variable` of the globals. Every number in
+/// hex, an address, is left out: the two builds lay memory out differently.
+fn lldb_variables(elf: &Path) -> Vec<String> {
+    let lldb = std::env::var("LLDB").unwrap_or_else(|_| "lldb".into());
+    let file = format!("{VARS_DIR}/vars.c");
+    let add = line_of(&file, "    sum += list->value;");
+    let (m, _console) = machine(elf.to_str().unwrap(), 1, b"");
+    let (addr, thread) = stub(m);
+    let script = [
+        format!("target create {}", elf.display()),
+        format!("gdb-remote {addr}"),
+        format!("breakpoint set -f vars.c -l {add}"),
+        "continue".into(),
+        "frame variable".into(),
+        "frame variable *list".into(),
+        "up".into(),
+        "frame variable".into(),
+        "up 2".into(),
+        "frame variable".into(),
+        "target variable counter nodes box grid big total".into(),
+        "breakpoint delete --force".into(),
+        "continue".into(),
+    ];
+    let mut cmd = Command::new(&lldb);
+    cmd.arg("-b");
+    for line in &script {
+        cmd.args(["-o", line]);
+    }
+    let out = cmd.output().unwrap_or_else(|e| panic!("cannot run {lldb}: {e}"));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        text.contains("exited with status = 0"),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(thread.join().unwrap(), Outcome::Exited(0));
+    // The variables: from each `frame variable` and `target variable` to the next
+    // command, without the addresses.
+    let mut lines = Vec::new();
+    let mut keep = false;
+    for l in text.lines() {
+        if l.starts_with("(lldb) ") {
+            keep = l.contains(" variable");
+            if keep {
+                lines.push(l.to_string());
+            }
+            continue;
+        }
+        if keep && !l.trim().is_empty() {
+            let mut s = String::new();
+            let mut rest = l;
+            while let Some(i) = rest.find("0x") {
+                s += &rest[..i];
+                let hex = rest[i + 2..]
+                    .find(|c: char| !c.is_ascii_hexdigit())
+                    .unwrap_or(rest.len() - i - 2);
+                s += "ADDR";
+                rest = &rest[i + 2 + hex..];
+            }
+            s += rest;
+            lines.push(s);
+        }
+    }
+    lines
+}
+
+/// LLDB reads merlin's debug information as it reads clang's: tests/vars/vars.c
+/// built by each, stopped at the same line, shows the same variables, of the same
+/// types, with the same values, in walk's frames and in main, and the same globals.
+/// At both widths. Ignored: it needs LLDB (with a Python runtime on the PATH on
+/// Windows, see crates/grail/tests/gdb.rs), clang and ld.lld (`LLDB`, `CLANG` and
+/// `LLD` name them if they are not on the PATH).
+#[test]
+#[ignore]
+fn lldb_reads_merlins_variables_as_clangs() {
+    for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
+        let merlin = program(VARS_DIR, "vars.c", xlen, &format!("lldb-vars-{}", xlen.bits()));
+        let clang = clang_program(xlen);
+        let ours = lldb_variables(&merlin);
+        let theirs = lldb_variables(&clang);
+        assert!(
+            ours.iter().any(|l| l.contains("(Node *) list = ADDR")),
+            "{ours:#?}"
+        );
+        assert!(ours.iter().any(|l| l.contains("(int) depth = 2")), "{ours:#?}");
+        assert!(
+            ours.iter().any(|l| l.contains("(short[2][3]) grid = {")),
+            "{ours:#?}"
+        );
+        assert!(
+            ours.iter().any(|l| l.contains("(count_t) total = 0")),
+            "{ours:#?}"
+        );
+        assert_eq!(ours, theirs, "merlin's (left) and clang's (right), {xlen:?}");
+    }
+}
