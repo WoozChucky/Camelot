@@ -793,10 +793,10 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
         "SECTIONS { . = 0x80000000; .text : { *(.text) } .x : { sym = .; } .data : { *(.data) }          . = . + 0x100; .bss : { *(.bss) } .rodata : { *(.rodata) *(.rodata.two) }          /DISCARD/ : { *(.text.gone) } }"
             .into(),
         // Names with dashes, unquoted (`-` is a character of a name outside
-        // expressions, an operator in them).
+        // expressions, an operator in them), and ALIGN(0), which is 1.
         format!(
-            "OUTPUT_FORMAT(elf32-littleriscv) ENTRY(_start) SECTIONS {{ . = 0x80000000; \
-             .text-x : {{ *(.text .text-none) }} a-b = ADDR(.text-x)-4; {rest} }}"
+            "OUTPUT_FORMAT(elf32-littleriscv) ENTRY(_start) SECTIONS {{ . = 0x80000000; . = ALIGN(0); \
+             .text-x : ALIGN(0) {{ *(.text .text-none) }} a-b = ADDR(.text-x)-4; {rest} }}"
         ),
     ];
     let mut links: Vec<(Vec<Vec<u8>>, String)> = scripts.into_iter().map(|s| (objects.to_vec(), s)).collect();
@@ -1011,6 +1011,14 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         (
             vec![start.clone()],
             "SECTIONS { . = 0x1000; x = ADDR(.text); .text : ALIGN(ADDR(.text)) { *(.text) } y = ADDR(.nope); }",
+            "",
+        ),
+        // ALIGN: not a power of two, in an expression and on a section, and
+        // a section's above 2^31.
+        (
+            vec![with_rodata.clone()],
+            "SECTIONS { . = 0x1001; . = ALIGN(3); .text : ALIGN(24) { *(.text) } \
+             .rodata : ALIGN(0x100000000) { *(.rodata) } }",
             "",
         ),
         // OUTPUT_FORMAT: an unknown name, and elf64-littleriscv with RV32

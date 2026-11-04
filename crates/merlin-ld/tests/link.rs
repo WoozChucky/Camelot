@@ -1321,6 +1321,27 @@ fn script_symbols() {
     assert_eq!(l.symbol("t_end"), Some(text.addr + text.size));
 }
 
+#[test]
+fn align_0_is_align_1() {
+    // ld.lld's checkAlignment takes 0 for 1, in an expression and on a
+    // section: neither moves anything (.text still goes at the alignment
+    // of its inputs).
+    let rest = ".rodata : { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) }";
+    for (src, at) in [
+        (
+            format!("SECTIONS {{ . = 0x80000001; . = ALIGN(0); .text : {{ *(.text*) }} {rest} }}"),
+            0x8000_0004,
+        ),
+        (
+            format!("SECTIONS {{ . = 0x80000000; .text : ALIGN(0) {{ *(.text*) }} {rest} }}"),
+            0x8000_0000,
+        ),
+    ] {
+        let l = merlin_ld::layout(&norelocs(), &script(&src)).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        assert_eq!(l.section(".text").unwrap().addr, at, "{src}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Linker-script layout.
 
@@ -1462,7 +1483,22 @@ fn layout_errors() {
         ),
         ("SECTIONS { x = 0x100000000; }", "test.ld:1: value 0x100000000 of 'x' does not fit in 32 bits"),
         ("SECTIONS { x = ORIGIN(RAM); }", "test.ld:1: unknown memory region 'RAM'"),
-        ("SECTIONS { . = ALIGN(0); }", "test.ld:1: ALIGN(0): alignment must be positive"),
+        // ld.lld's checkAlignment, in expressions and on sections, and
+        // merlin-ld's limit of 2^31 on a section's.
+        (
+            "SECTIONS { . = 0x80000001; . = ALIGN(3); }",
+            "test.ld:1: ALIGN(3): alignment must be power of 2",
+        ),
+        ("SECTIONS { . = ALIGN(0 - 16); }", "test.ld:1: ALIGN(-16): alignment must be power of 2"),
+        (
+            "SECTIONS { .text : ALIGN(24) { *(.text*) } }",
+            "test.ld:1: ALIGN(24) of section .text: alignment must be power of 2",
+        ),
+        (
+            "SECTIONS { .text : ALIGN(0x100000000) { *(.text*) } }",
+            "test.ld:1: ALIGN(4294967296) of section .text: alignment must be at most 2^31 (ld.lld keeps 32 \
+             bits of a section's alignment and would ignore this one)",
+        ),
         ("SECTIONS { .text : { KEEP(*(.text)) } }", "test.ld:1: only '*(...)' input section lists are supported"),
     ];
     for (src, want) in cases {

@@ -67,6 +67,18 @@ static i64 align_up(i64 v, i64 a) {
     return i64_add(v, i64_sub(a, r));
 }
 
+/* Whether a, as 64 bits, is a power of two. */
+static int is_pow2(i64 a) {
+    return !i64_eq(a, i64_u(0)) && i64_eq(i64_and(a, i64_sub(a, i64_u(1))), i64_u(0));
+}
+
+/* v rounded up to a multiple of a, a power of two (2^63 too), for
+ * 0 <= v <= 2^32: (v + a - 1) & !(a - 1) in 64 bits. */
+static i64 align_pow2(i64 v, i64 a) {
+    i64 m = i64_sub(a, i64_u(1));
+    return i64_and(i64_add(v, m), i64_not(m));
+}
+
 static i64 four_gib(void) {
     i64 v;
     v.lo = 0;
@@ -250,11 +262,13 @@ static int eval(struct expr *e, i64 dot, i64 *out, char **err) {
         if (!eval(e->a, dot, &a, err)) {
             return 0;
         }
-        if (i64_cmp(a, i64_u(0)) <= 0) {
-            *err = fmt("ALIGN(%s): alignment must be positive", i64_dec(a));
+        /* ld.lld's checkAlignment: 0 is 1, the rest must be powers of two
+         * (a negative value, read as 64 bits, is none but -2^63). */
+        if (!is_pow2(i64_eq(a, i64_u(0)) ? i64_u(1) : a)) {
+            *err = fmt("ALIGN(%s): alignment must be power of 2", i64_dec(a));
             return 0;
         }
-        *out = align_up(dot, a);
+        *out = align_pow2(dot, i64_eq(a, i64_u(0)) ? i64_u(1) : a);
         return 1;
     case X_ORIGIN:
     case X_LENGTH:
@@ -842,12 +856,17 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
         i64 n;
         char *err;
         if (eval(o->align, *dot, &n, &err)) {
-            int pow2 = !i64_is_neg(n) && n.hi == 0 && n.lo != 0 && (n.lo & (n.lo - 1)) == 0;
-            if (pow2 && n.lo <= 0x80000000u) {
-                align = n.lo > align ? n.lo : align;
+            /* ld.lld's checkAlignment (0 is 1), then at most 2^31. */
+            i64 a = i64_eq(n, i64_u(0)) ? i64_u(1) : n;
+            if (!is_pow2(a)) {
+                script_err(o->line,
+                           fmt("ALIGN(%s) of section %s: alignment must be power of 2", i64_dec(n), o->name));
+            } else if (a.hi != 0 || a.lo > 0x80000000u) {
+                script_err(o->line, fmt("ALIGN(%s) of section %s: alignment must be at most 2^31 (ld.lld keeps 32 "
+                                        "bits of a section's alignment and would ignore this one)",
+                                        i64_dec(n), o->name));
             } else {
-                script_err(o->line, fmt("ALIGN(%s) of section %s: alignment must be a power of two", i64_dec(n),
-                                        o->name));
+                align = a.lo > align ? a.lo : align;
             }
         } else {
             script_err(o->line, err);

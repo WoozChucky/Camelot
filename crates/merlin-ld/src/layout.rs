@@ -209,6 +209,19 @@ fn align_up(v: u64, a: u64) -> Option<u64> {
     v.checked_next_multiple_of(a)
 }
 
+/// The alignment an `ALIGN(n)` asks for, as ld.lld's checkAlignment reads
+/// it, in expressions and on sections alike: 0 is 1, and the rest must be
+/// powers of two. (On ELF32 a negative `i64` reads as a `u64`, which only
+/// -2^63 leaves a power of two.)
+fn check_alignment(n: u64) -> Result<u64, &'static str> {
+    let a = n.max(1);
+    if a.is_power_of_two() {
+        Ok(a)
+    } else {
+        Err("alignment must be power of 2")
+    }
+}
+
 /// The address of a symbol `value` bytes into a section at `base`. ELF32
 /// (RV32, until #159): addresses are 32 bits and wrap at 4 GiB, as they
 /// always have in merlin-ld (a symbol defined far past its section's end).
@@ -436,18 +449,11 @@ impl Walker<'_> {
             }
             Expr::Align(n) => {
                 let n = self.eval(n, dot)?;
-                // ELF32 (RV32, until #159): a negative i64 is not an alignment either.
-                let positive = match self.class {
-                    Class::Elf32 => (n as i64) > 0,
-                    Class::Elf64 => n > 0,
-                };
-                if !positive {
-                    return Err(format!("ALIGN({}): alignment must be positive", self.show(n)));
-                }
+                let a = check_alignment(n).map_err(|e| format!("ALIGN({}): {e}", self.show(n)))?;
                 // Only ELF64 can get past 2^64 (`. = ALIGN(16)` at
                 // 0xffff_ffff_ffff_fff8). ld.lld wraps to 0 and then reports a
                 // backward move; saying so here is clearer.
-                align_up(dot, n).ok_or("arithmetic overflow")?
+                align_up(dot, a).ok_or("arithmetic overflow")?
             }
             Expr::Origin(r) | Expr::Length(r) => match &self.script.memory {
                 Some(m) if &m.name == r => match e {
@@ -1142,21 +1148,25 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                     .unwrap_or(1);
                 // `.name : ALIGN(n) { ... }`: at least n, like an input that
                 // aligned (ld.lld's sh_addralign is the larger of the two).
-                // At most 2^31 on both classes: ld.lld keeps a section's
-                // alignment in 32 bits on RV64 too, and ignores a larger one.
-                // (On ELF32 a negative i64 reads as a u64 far above 2^31.)
+                // [`check_alignment`], then at most 2^31 on both classes:
+                // ld.lld keeps a section's alignment in 32 bits on RV64 too,
+                // and ignores a larger power of two (its 32 bits are 0).
                 if let Some(e) = &o.align {
                     match w.eval(e, dot) {
-                        Ok(n) if n.is_power_of_two() && n <= 1 << 31 => align = align.max(n as u32),
                         Ok(n) => {
                             let shown = w.show(n);
-                            w.script_err(
-                                o.line,
-                                format!(
-                                    "ALIGN({shown}) of section {}: alignment must be a power of two",
-                                    o.name
+                            match check_alignment(n) {
+                                Ok(a) if a <= 1 << 31 => align = align.max(a as u32),
+                                Ok(_) => w.script_err(
+                                    o.line,
+                                    format!(
+                                        "ALIGN({shown}) of section {}: alignment must be at most 2^31 (ld.lld \
+                                         keeps 32 bits of a section's alignment and would ignore this one)",
+                                        o.name
+                                    ),
                                 ),
-                            )
+                                Err(e) => w.script_err(o.line, format!("ALIGN({shown}) of section {}: {e}", o.name)),
+                            }
                         }
                         Err(e) => w.script_err(o.line, e),
                     }

@@ -802,8 +802,22 @@ fn layout_errors_and_the_4_gib_limits_that_are_rv32s() {
             "test.ld:1: unknown memory region 'RAM'",
         ),
         (
-            "SECTIONS { . = ALIGN(0); }",
-            "test.ld:1: ALIGN(0): alignment must be positive",
+            "SECTIONS { . = 0x80000001; . = ALIGN(3); }",
+            "test.ld:1: ALIGN(3): alignment must be power of 2",
+        ),
+        (
+            "SECTIONS { . = ALIGN(0 - 16); }",
+            "test.ld:1: ALIGN(18446744073709551600): alignment must be power of 2",
+        ),
+        (
+            "SECTIONS { .text : ALIGN(3) { *(.text*) } }",
+            "test.ld:1: ALIGN(3) of section .text: alignment must be power of 2",
+        ),
+        // A section's alignment is 32 bits in ld.lld on RV64 too.
+        (
+            "SECTIONS { .text : ALIGN(0x200000000) { *(.text*) } }",
+            "test.ld:1: ALIGN(8589934592) of section .text: alignment must be at most 2^31 (ld.lld keeps 32 \
+             bits of a section's alignment and would ignore this one)",
         ),
         (
             "SECTIONS { .text : { KEEP(*(.text)) } }",
