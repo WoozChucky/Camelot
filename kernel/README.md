@@ -451,6 +451,7 @@ one process.
 | `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |
 | `console.c` | the console device (`read` and `write` on it): `console_read()` (line editing and echo: backspace, CR/LF/CR LF, Ctrl-D; sleeps until a line is complete), `console_write()`, `console_intr()` (the UART interrupt, waking readers) |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
+| `libgcc.c` | `__divdi3`, `__udivdi3`, `__moddi3`, `__umoddi3`, `__muldi3`: the C library's (`user/lib/libgcc.c`), for `long long` division on RV32 |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |
 | `kernel.ld` | layout: `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end` |
 | `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct thread`, `struct user_program`, sleep and wakeup, the thread and futex calls), `context.h` (`struct context`, `swtch`), `spinlock.h` (`struct spinlock`, `struct cpu`, `NCPU`), `smp.h`, `sleeplock.h`, `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
@@ -489,7 +490,7 @@ merlin-as entry.s -o entry.s.o               # and each other .s
 merlin-as userprogs.s -o userprogs.s.o       # the generated one (in target/kernel/obj)
 merlin -g -fdebug-compilation-dir=kernel -I include net/arp.c -o net/arp.c.s   # the network stack's too
 merlin-ld -T kernel.ld -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf.c.o entry.s.o \
-       exec.c.o file.c.o fs.c.o fstest.c.o kalloc.c.o kernelvec.s.o kprintf.c.o log.c.o machine.s.o \
+       exec.c.o file.c.o fs.c.o fstest.c.o kalloc.c.o kernelvec.s.o kprintf.c.o libgcc.c.o log.c.o machine.s.o \
        main.c.o net/arp.c.o net/dhcp.c.o net/ether.c.o net/icmp.c.o net/ip.c.o net/net.c.o \
        net/nic.c.o net/pbuf.c.o net/tcp.c.o net/udp.c.o pipe.c.o plic.c.o probe.s.o proc.c.o riscv.s.o \
        sleeplock.c.o smp.c.o spinlock.c.o spinlock.s.o start.c.o \

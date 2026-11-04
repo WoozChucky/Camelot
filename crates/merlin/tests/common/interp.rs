@@ -4,23 +4,26 @@
 //! to tell a codegen bug from a front-end bug. It shares nothing with code
 //! generation but the checked tree: memory is a flat byte array, globals and
 //! string literals are laid out from a low address, each call's locals get a
-//! fresh area further up, and every value is 32 bits interpreted by its C type.
+//! fresh area further up, and every value is the number it is (an `i128`, in
+//! the range of its C type; a pointer is an address). The program's target
+//! gives the sizes: ILP32 on RV32, LP64 on RV64.
 //! A struct's value is its address (as an array's), and assigning, passing or
 //! returning it copies its bytes. Functions get made-up addresses below the
 //! data, so pointers to them compare and convert like any pointer but cannot
 //! be read through.
 //!
 //! Semantics match what the generated code must do on Excalibur (spec section
-//! 10, "Merlin C subset"): 32-bit wrapping arithmetic, `div`/`rem` rounding
-//! toward zero with RISC-V's results for `i32::MIN / -1` and division by zero,
-//! shifts by the low 5 bits of the amount, comparisons and `! && ||` give 0 or
-//! 1, and falling off the end of a function returns 0.
+//! 10, "Merlin C subset"): arithmetic wrapping at the width of its type (32
+//! bits for `int`, as the W instructions do on RV64), `div`/`rem` rounding
+//! toward zero with RISC-V's results for `INT_MIN / -1` and division by zero,
+//! shifts by the low 5 bits of the amount (6 for a 64-bit type), comparisons
+//! and `! && ||` give 0 or 1, and falling off the end of a function returns 0.
 //!
 //! A variadic function's extra arguments are laid out as the calling
-//! convention has them in words (see `merlin::abi`), in an area of the
-//! callee's frame that `va_start` points at: a scalar takes a word, a small
-//! struct its bytes rounded up to words, a big one a word holding the
-//! address of a copy.
+//! convention has them in words (see `merlin::abi`; a word is a register, 4
+//! or 8 bytes), in an area of the callee's frame that `va_start` points at: a
+//! scalar takes a word, a small struct its bytes rounded up to words, a big
+//! one a word holding the address of a copy.
 //!
 //! `switch` and `goto` run by seeking: the statements are walked without
 //! being run until the `case`, `default` or label is found, and run normally
@@ -29,8 +32,11 @@
 use merlin::abi::{self, Pass};
 use merlin::ast::*;
 use merlin::consteval::{self, Base, Const};
-use merlin::types::Type;
+use merlin::types::{ptr_size, IntKind, Type, Xlen};
 use std::collections::HashMap;
+
+/// A value: an integer in the range of its type, or an address.
+type Val = i128;
 
 /// Runs `entry()` and returns its result. Uses a thread with a big stack, since
 /// every interpreted call nests several Rust calls (debug builds use big frames).
@@ -62,6 +68,7 @@ const MEMORY: usize = 16 << 20;
 
 fn run_here(prog: &Program, entry: &str) -> Result<i32, String> {
     let mut it = Interp {
+        x: prog.xlen,
         funcs: HashMap::new(),
         mem: vec![0; MEMORY],
         symbols: HashMap::new(),
@@ -145,11 +152,19 @@ fn symbol(d: &Declarator) -> String {
     }
 }
 
-fn size_of(ty: &Type) -> u32 {
-    ty.size().expect("sema: objects have complete types")
+fn size_of(ty: &Type, x: Xlen) -> u32 {
+    ty.size(x).expect("sema: objects have complete types")
+}
+
+/// The address a pointer value holds, if memory has it (else one past it,
+/// which every access refuses).
+fn address(v: Val) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
 }
 
 struct Interp<'a> {
+    /// The target: sizes, and the width of arithmetic.
+    x: Xlen,
     /// Each function's name and definition, by its made-up address.
     funcs: HashMap<u32, (&'a str, Option<&'a Function>)>,
     mem: Vec<u8>,
@@ -170,7 +185,7 @@ enum Flow {
     Break,
     Continue,
     /// A value, or for a struct its address.
-    Return(u32),
+    Return(Val),
     /// A `goto` to this label, which the function seeks from its start.
     Goto(String),
 }
@@ -187,10 +202,10 @@ pub const POISON: u8 = 0xa5;
 
 impl<'a> Interp<'a> {
     /// Reserves memory for an object of type `ty` at `*top`, zeroed.
-    fn alloc_at(mem: &mut [u8], top: &mut u32, limit: u32, ty: &Type) -> u32 {
-        let align = ty.align().max(1);
+    fn alloc_at(mem: &mut [u8], top: &mut u32, limit: u32, ty: &Type, x: Xlen) -> u32 {
+        let align = ty.align(x).max(1);
         let addr = top.div_ceil(align) * align;
-        let size = size_of(ty);
+        let size = size_of(ty, x);
         *top = addr + size;
         assert!(*top < limit, "interpreter out of memory");
         mem[addr as usize..(addr + size) as usize].fill(0);
@@ -199,7 +214,7 @@ impl<'a> Interp<'a> {
 
     /// Memory for a global or a string literal, for the whole run.
     fn alloc_data(&mut self, ty: &Type) -> u32 {
-        Self::alloc_at(&mut self.mem, &mut self.data_top, FRAMES_START, ty)
+        Self::alloc_at(&mut self.mem, &mut self.data_top, FRAMES_START, ty, self.x)
     }
 
     /// Memory for a local, until its call returns. A local declared without
@@ -208,9 +223,14 @@ impl<'a> Interp<'a> {
     /// than zeros: a case that reads one gets a value no expectation is
     /// likely to match, rather than a 0 that passes here and not in Grail.
     fn alloc_frame(&mut self, ty: &Type) -> u32 {
-        let addr = Self::alloc_at(&mut self.mem, &mut self.top, MEMORY as u32, ty);
-        self.mem[addr as usize..(addr + size_of(ty)) as usize].fill(POISON);
+        let addr = Self::alloc_at(&mut self.mem, &mut self.top, MEMORY as u32, ty, self.x);
+        let size = self.size(ty);
+        self.mem[addr as usize..(addr + size) as usize].fill(POISON);
         addr
+    }
+
+    fn size(&self, ty: &Type) -> u32 {
+        size_of(ty, self.x)
     }
 
     fn check(&self, addr: u32, size: u32) -> Result<usize, String> {
@@ -225,17 +245,18 @@ impl<'a> Interp<'a> {
         Ok(addr as usize)
     }
 
-    /// Loads a value of type `ty`, widened to 32 bits by its signedness.
-    fn load(&self, addr: u32, ty: &Type) -> Result<u32, String> {
-        let size = size_of(ty);
+    /// Loads a value of type `ty`: its bytes, read as the type reads them.
+    fn load(&self, addr: u32, ty: &Type) -> Result<Val, String> {
+        let size = self.size(ty);
         let a = self.check(addr, size)?;
-        let mut bytes = [0u8; 4];
+        let mut bytes = [0u8; 16];
         bytes[..size as usize].copy_from_slice(&self.mem[a..a + size as usize]);
-        Ok(convert(u32::from_le_bytes(bytes), ty))
+        Ok(convert(i128::from_le_bytes(bytes), ty, self.x))
     }
 
-    fn store(&mut self, addr: u32, ty: &Type, v: u32) -> Result<(), String> {
-        let size = size_of(ty);
+    /// Stores the value `v` of type `ty`: its low bytes, two's complement.
+    fn store(&mut self, addr: u32, ty: &Type, v: Val) -> Result<(), String> {
+        let size = self.size(ty);
         let a = self.check(addr, size)?;
         self.mem[a..a + size as usize].copy_from_slice(&v.to_le_bytes()[..size as usize]);
         Ok(())
@@ -243,7 +264,7 @@ impl<'a> Interp<'a> {
 
     /// Copies an object of type `ty` (a struct) from `src` to `dst`.
     fn copy(&mut self, dst: u32, src: u32, ty: &Type) -> Result<(), String> {
-        let size = size_of(ty);
+        let size = self.size(ty);
         let s = self.check(src, size)?;
         let d = self.check(dst, size)?;
         self.mem.copy_within(s..s + size as usize, d);
@@ -252,9 +273,9 @@ impl<'a> Interp<'a> {
 
     /// Stores the value `v` of type `ty` at `addr`: a struct's value is the
     /// address of its bytes, which are copied.
-    fn put(&mut self, addr: u32, ty: &Type, v: u32) -> Result<(), String> {
+    fn put(&mut self, addr: u32, ty: &Type, v: Val) -> Result<(), String> {
         if ty.is_record() {
-            self.copy(addr, v, ty)
+            self.copy(addr, address(v), ty)
         } else {
             self.store(addr, ty, v)
         }
@@ -277,7 +298,7 @@ impl<'a> Interp<'a> {
             (_, Init::List(items, _)) if items.is_empty() => {}
             (Type::Array(elem, _), Init::List(items, _)) => {
                 for (i, item) in items.iter().enumerate() {
-                    self.static_init(elem, item, addr + i as u32 * size_of(elem))?;
+                    self.static_init(elem, item, addr + i as u32 * self.size(elem))?;
                 }
             }
             (Type::Record(r), Init::List(items, _)) => {
@@ -297,9 +318,9 @@ impl<'a> Interp<'a> {
                 self.mem[addr as usize..addr as usize + n].copy_from_slice(&b[..n]);
             }
             (_, Init::Expr(e)) => {
-                let v = match consteval::eval(e).ok_or("initializer is not constant")? {
-                    Const::Int(v, _) => v as u32,
-                    Const::Addr { base: None, offset } => offset as u32,
+                let v = match consteval::eval(e, self.x).ok_or("initializer is not constant")? {
+                    Const::Int(v, _) => v,
+                    Const::Addr { base: None, offset } => offset,
                     Const::Addr {
                         base: Some(base),
                         offset,
@@ -312,7 +333,7 @@ impl<'a> Interp<'a> {
                                 a
                             }
                         };
-                        at.wrapping_add(offset as u32)
+                        Val::from(at) + offset
                     }
                 };
                 self.store(addr, ty, v)?;
@@ -327,7 +348,7 @@ impl<'a> Interp<'a> {
     /// caller's hidden local) before the callee's frame goes, and that
     /// address is returned. In a variadic function, the frame's last entry
     /// is the address of the extra arguments' words.
-    fn call(&mut self, addr: u32, args: Vec<(u32, Type)>, result: Option<u32>) -> Result<u32, String> {
+    fn call(&mut self, addr: u32, args: Vec<(Val, Type)>, result: Option<u32>) -> Result<Val, String> {
         let (name, f) = *self
             .funcs
             .get(&addr)
@@ -347,24 +368,34 @@ impl<'a> Interp<'a> {
             self.put(frame[i], &f.locals[i].ty, *v)?;
         }
         if f.variadic {
-            let extra = &args[named..];
-            let words: usize = extra.iter().map(|(_, t)| abi::classify(t).registers()).sum();
-            // At least a word, so that the area has an address of its own.
-            let area_ty = Type::array(Type::INT, Some(words.max(1) as u32));
-            let mut at = self.alloc_frame(&area_ty);
-            frame.push(at);
-            for (v, t) in extra {
-                let pass = abi::classify(t);
+            // The words of all the arguments, as the calling convention
+            // numbers them (an aligned pair at an even word), from an area
+            // aligned to two words; va_start points at the first word the
+            // named ones leave.
+            let x = self.x;
+            let types: Vec<Type> = args.iter().map(|(_, t)| t.clone()).collect();
+            let (places, total) = abi::call_arguments(&f.ret, &types, named, x);
+            let (_, first) = abi::call_arguments(&f.ret, &types[..named], named, x);
+            // A word is a register: a `long` on either width.
+            let word = Type::Int(IntKind::Long);
+            let w = ptr_size(x);
+            // Two words more, so that the area is aligned and has an address
+            // of its own.
+            let area_ty = Type::array(word.clone(), Some(total as u32 + 2));
+            let base = self.alloc_frame(&area_ty).next_multiple_of(2 * w);
+            frame.push(base + w * first as u32);
+            for ((v, t), &(n, pass)) in args.iter().zip(&places).skip(named) {
+                let at = base + w * n as u32;
                 match pass {
-                    Pass::Scalar => self.store(at, &Type::INT, *v)?,
-                    Pass::Words(_) => self.copy(at, *v, t)?,
+                    Pass::Scalar => self.store(at, &word, *v)?,
+                    Pass::Pair => self.store(at, t, *v)?,
+                    Pass::Words(_) => self.copy(at, address(*v), t)?,
                     Pass::Ref => {
                         let copy = self.alloc_frame(t);
-                        self.copy(copy, *v, t)?;
-                        self.store(at, &Type::INT, copy)?;
+                        self.copy(copy, address(*v), t)?;
+                        self.store(at, &word, copy.into())?;
                     }
                 }
-                at += 4 * pass.registers() as u32;
             }
         }
         self.depth += 1;
@@ -383,8 +414,8 @@ impl<'a> Interp<'a> {
             }
         }
         if let Some(dst) = result {
-            self.copy(dst, value, &f.ret)?;
-            value = dst;
+            self.copy(dst, address(value), &f.ret)?;
+            value = dst.into();
         }
         self.depth -= 1;
         self.top = saved_top;
@@ -514,7 +545,7 @@ impl<'a> Interp<'a> {
                     let v = self.expr(cond, frame)?;
                     let target = cases
                         .iter()
-                        .find(|(value, _)| *value as u32 == v)
+                        .find(|(value, _)| *value == v)
                         .map(|&(_, id)| id)
                         .or(*default);
                     let Some(id) = target else {
@@ -534,7 +565,7 @@ impl<'a> Interp<'a> {
                     if let (Some(VarRef::Local(id)), Some(init)) = (&d.var, &d.init) {
                         let addr = frame[id.0];
                         if d.ty.is_array() || d.ty.is_record() {
-                            let size = size_of(&d.ty) as usize;
+                            let size = self.size(&d.ty) as usize;
                             self.mem[addr as usize..addr as usize + size].fill(0);
                         }
                         self.local_init(&d.ty, init, addr, frame)?;
@@ -563,7 +594,7 @@ impl<'a> Interp<'a> {
             (_, Init::List(items, _)) if items.is_empty() => {}
             (Type::Array(elem, _), Init::List(items, _)) => {
                 for (i, item) in items.iter().enumerate() {
-                    self.local_init(elem, item, addr + i as u32 * size_of(elem), frame)?;
+                    self.local_init(elem, item, addr + i as u32 * self.size(elem), frame)?;
                 }
             }
             (Type::Record(r), Init::List(items, _)) => {
@@ -603,35 +634,38 @@ impl<'a> Interp<'a> {
                     .ok_or_else(|| format!("'{s}' is never defined")),
                 None => Err("unresolved variable".into()),
             },
-            ExprKind::Deref(p) => self.expr(p, frame),
+            ExprKind::Deref(p) => Ok(address(self.expr(p, frame)?)),
             ExprKind::Str(b) => Ok(self.string(e, b)),
             ExprKind::CompoundLit { init, local } => {
                 let addr = frame[local.ok_or("compound literal without a local")?.0];
-                let size = size_of(&e.ty) as usize;
+                let size = self.size(&e.ty) as usize;
                 self.mem[addr as usize..addr as usize + size].fill(0);
                 self.local_init(&e.ty, init, addr, frame)?;
                 Ok(addr)
             }
             // `s.m`: `s`'s value is its address; `p->m`: `p` is one.
-            ExprKind::Member { base, offset, .. } => Ok(self.expr(base, frame)?.wrapping_add(*offset)),
+            ExprKind::Member { base, offset, .. } => {
+                Ok(address(self.expr(base, frame)? + Val::from(*offset)))
+            }
             _ => Err(format!("{}: not an lvalue", e.pos)),
         }
     }
 
     /// The value of an lvalue: loaded, or the address itself for an array, a
     /// struct or a function.
-    fn value_at(&self, addr: u32, ty: &Type) -> Result<u32, String> {
+    fn value_at(&self, addr: u32, ty: &Type) -> Result<Val, String> {
         if ty.is_addressed() {
-            Ok(addr)
+            Ok(addr.into())
         } else {
             self.load(addr, ty)
         }
     }
 
-    fn expr(&mut self, e: &'a Expr, frame: &[u32]) -> Result<u32, String> {
+    fn expr(&mut self, e: &'a Expr, frame: &[u32]) -> Result<Val, String> {
         self.tick()?;
+        let x = self.x;
         Ok(match &e.kind {
-            ExprKind::Num(v) => *v as u32,
+            ExprKind::Num(v) => *v,
             ExprKind::Var { .. }
             | ExprKind::Str(_)
             | ExprKind::Deref(_)
@@ -640,7 +674,7 @@ impl<'a> Interp<'a> {
                 let a = self.addr(e, frame)?;
                 self.value_at(a, &e.ty)?
             }
-            ExprKind::Addr(x) => self.addr(x, frame)?,
+            ExprKind::Addr(p) => self.addr(p, frame)?.into(),
             ExprKind::Assign { op, target, value } => {
                 let a = self.addr(target, frame)?;
                 let v = match op {
@@ -649,13 +683,13 @@ impl<'a> Interp<'a> {
                         let old = self.load(a, &target.ty)?;
                         let v = self.expr(value, frame)?;
                         let (t, vt) = (target.ty.decay(), value.ty.decay());
-                        convert(binary(*op, old, &t, v, &vt)?, &target.ty)
+                        convert(binary(*op, old, &t, v, &vt, x)?, &target.ty, x)
                     }
                 };
                 self.put(a, &target.ty, v)?;
                 // A struct assignment's value is the target.
                 if target.ty.is_record() {
-                    a
+                    a.into()
                 } else {
                     v
                 }
@@ -664,17 +698,10 @@ impl<'a> Interp<'a> {
                 let a = self.addr(target, frame)?;
                 let old = self.load(a, &target.ty)?;
                 let step = match target.ty.unqual() {
-                    Type::Ptr(t) => size_of(t),
+                    Type::Ptr(t) => self.size(t).into(),
                     _ => 1,
                 };
-                let new = convert(
-                    if *inc {
-                        old.wrapping_add(step)
-                    } else {
-                        old.wrapping_sub(step)
-                    },
-                    &target.ty,
-                );
+                let new = convert(if *inc { old + step } else { old - step }, &target.ty, x);
                 self.store(a, &target.ty, new)?;
                 if *prefix {
                     new
@@ -683,28 +710,29 @@ impl<'a> Interp<'a> {
                 }
             }
             ExprKind::Binary(BinOp::LogAnd, l, r) => {
-                (self.expr(l, frame)? != 0 && self.expr(r, frame)? != 0) as u32
+                (self.expr(l, frame)? != 0 && self.expr(r, frame)? != 0).into()
             }
             ExprKind::Binary(BinOp::LogOr, l, r) => {
-                (self.expr(l, frame)? != 0 || self.expr(r, frame)? != 0) as u32
+                (self.expr(l, frame)? != 0 || self.expr(r, frame)? != 0).into()
             }
             ExprKind::Binary(op, l, r) => {
                 let a = self.expr(l, frame)?;
                 let b = self.expr(r, frame)?;
-                binary(*op, a, &l.ty.decay(), b, &r.ty.decay())?
+                binary(*op, a, &l.ty.decay(), b, &r.ty.decay(), x)?
             }
-            ExprKind::Unary(op, x) => {
-                let v = self.expr(x, frame)?;
+            ExprKind::Unary(op, operand) => {
+                let v = self.expr(operand, frame)?;
+                // The result has the promoted type, `e.ty`.
                 match op {
-                    UnOp::Neg => v.wrapping_neg(),
+                    UnOp::Neg => convert(-v, &e.ty, x),
                     UnOp::Plus => v,
-                    UnOp::Not => (v == 0) as u32,
-                    UnOp::BitNot => !v,
+                    UnOp::Not => (v == 0).into(),
+                    UnOp::BitNot => convert(!v, &e.ty, x),
                 }
             }
-            ExprKind::Cast { x, .. } => {
-                let v = self.expr(x, frame)?;
-                convert(v, &e.ty)
+            ExprKind::Cast { x: from, .. } => {
+                let v = self.expr(from, frame)?;
+                convert(v, &e.ty, x)
             }
             ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => return Err("sizeof survived sema".into()),
             ExprKind::Cond(c, a, b) => {
@@ -723,7 +751,7 @@ impl<'a> Interp<'a> {
             } => {
                 // The callee, then the arguments left to right; C leaves the
                 // order unspecified, so harness programs must not depend on it.
-                let f = self.expr(callee, frame)?;
+                let f = address(self.expr(callee, frame)?);
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     vals.push((self.expr(a, frame)?, a.ty.decay()));
@@ -733,19 +761,26 @@ impl<'a> Interp<'a> {
             ExprKind::VaStart { ap, .. } => {
                 let a = self.addr(ap, frame)?;
                 let area = *frame.last().ok_or("va_start without a frame")?;
-                self.store(a, &ap.ty, area)?;
+                self.store(a, &ap.ty, area.into())?;
                 0
             }
             ExprKind::VaArg(ap) => {
                 let a = self.addr(ap, frame)?;
-                let at = self.load(a, &ap.ty)?;
-                let pass = abi::classify(&e.ty);
-                self.store(a, &ap.ty, at.wrapping_add(4 * pass.registers() as u32))?;
+                let mut at = self.load(a, &ap.ty)?;
+                let pass = abi::classify(&e.ty, x);
+                // An aligned pair is at the next even word.
+                if abi::aligned_pair(&e.ty, pass, x) {
+                    let align = Val::from(2 * ptr_size(x));
+                    at = (at + align - 1) / align * align;
+                }
+                let words = ptr_size(x) * pass.registers() as u32;
+                self.store(a, &ap.ty, at + Val::from(words))?;
                 match pass {
-                    Pass::Scalar => self.load(at, &e.ty)?,
+                    // A narrower scalar is in the low bytes of its word.
+                    Pass::Scalar | Pass::Pair => self.load(address(at), &e.ty)?,
                     // The struct's bytes are right there.
                     Pass::Words(_) => at,
-                    Pass::Ref => self.load(at, &Type::INT)?,
+                    Pass::Ref => self.load(address(at), &Type::ptr(Type::Void))?,
                 }
             }
             ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => return Err("va_end/va_copy survived sema".into()),
@@ -753,49 +788,81 @@ impl<'a> Interp<'a> {
     }
 }
 
-/// A 32-bit value converted to `ty`: narrow integers are cut and widened by
-/// their signedness (`_Bool` becomes 0 or 1), everything else is already 32
-/// bits.
-fn convert(v: u32, ty: &Type) -> u32 {
+/// A value converted to `ty`: an integer type wraps it to its range (C's
+/// conversions, the out-of-range signed case the two's complement way, as
+/// clang does; `_Bool` gives 0 or 1), a pointer to a pointer-sized unsigned
+/// address. Anything else is as it is.
+fn convert(v: Val, ty: &Type, x: Xlen) -> Val {
     match ty.unqual() {
-        Type::Int(k) => k.wrap(v as i64) as u32,
+        Type::Int(k) => k.wrap(v, x),
+        Type::Ptr(_) => IntKind::ULong.wrap(v, x),
         Type::Void => 0,
         _ => v,
     }
 }
 
 /// `a op b` with `a` of (decayed) type `lt` and `b` of type `rt`.
-fn binary(op: BinOp, a: u32, lt: &Type, b: u32, rt: &Type) -> Result<u32, String> {
-    let unsigned = lt.is_unsigned() || rt.is_unsigned();
-    let elem = |t: &Type| t.pointee().map(size_of).unwrap_or(1);
-    let less = |x: u32, y: u32| if unsigned { x < y } else { (x as i32) < (y as i32) };
+fn binary(op: BinOp, a: Val, lt: &Type, b: Val, rt: &Type, x: Xlen) -> Result<Val, String> {
+    let elem = |t: &Type| -> Val { t.pointee().map_or(1, |t| size_of(t, x)).into() };
+    if let (Some(lk), Some(rk)) = (lt.int_kind(), rt.int_kind()) {
+        // Integers: both operands converted to the type the operation is
+        // done in (a shift's is its left operand's promoted type), the
+        // result wrapped to it.
+        let k = match op {
+            BinOp::Shl | BinOp::Shr => lk.promoted(),
+            _ => merlin::types::common(lk, rk, x),
+        };
+        let a = k.wrap(a, x);
+        let bits = k.size(x) * 8;
+        let b = if matches!(op, BinOp::Shl | BinOp::Shr) {
+            // The hardware uses the low 5 bits of a 32-bit shift's amount,
+            // the low 6 of a 64-bit one's.
+            rk.wrap(b, x) & Val::from(bits - 1)
+        } else {
+            k.wrap(b, x)
+        };
+        let v = match op {
+            BinOp::Add => a + b,
+            BinOp::Sub => a - b,
+            BinOp::Mul => a.wrapping_mul(b),
+            // RISC-V division by zero: quotient all ones, remainder the dividend.
+            BinOp::Div if b == 0 => -1,
+            BinOp::Rem if b == 0 => a,
+            // Truncating toward zero; `INT_MIN / -1` wraps below.
+            BinOp::Div => a / b,
+            BinOp::Rem => a % b,
+            BinOp::Shl => a << b,
+            // `a` is negative only when `k` is signed: an arithmetic shift.
+            BinOp::Shr => a >> b,
+            BinOp::BitAnd => a & b,
+            BinOp::BitOr => a | b,
+            BinOp::BitXor => a ^ b,
+            BinOp::Eq => return Ok((a == b).into()),
+            BinOp::Ne => return Ok((a != b).into()),
+            BinOp::Lt => return Ok((a < b).into()),
+            BinOp::Gt => return Ok((a > b).into()),
+            BinOp::Le => return Ok((a <= b).into()),
+            BinOp::Ge => return Ok((a >= b).into()),
+            BinOp::LogAnd | BinOp::LogOr => {
+                return Err("short-circuit operators are evaluated by expr".into())
+            }
+        };
+        return Ok(k.wrap(v, x));
+    }
+    // Pointers (addresses, unsigned), with an integer or each other.
+    let addr = |v: Val| IntKind::ULong.wrap(v, x);
     Ok(match op {
-        BinOp::Add if lt.is_ptr() => a.wrapping_add(b.wrapping_mul(elem(lt))),
-        BinOp::Add if rt.is_ptr() => a.wrapping_mul(elem(rt)).wrapping_add(b),
-        BinOp::Add => a.wrapping_add(b),
-        BinOp::Sub if lt.is_ptr() && rt.is_ptr() => ((a.wrapping_sub(b) as i32) / elem(lt) as i32) as u32,
-        BinOp::Sub if lt.is_ptr() => a.wrapping_sub(b.wrapping_mul(elem(lt))),
-        BinOp::Sub => a.wrapping_sub(b),
-        BinOp::Mul => a.wrapping_mul(b),
-        // RISC-V division by zero: quotient all ones, remainder the dividend.
-        BinOp::Div if b == 0 => u32::MAX,
-        BinOp::Rem if b == 0 => a,
-        BinOp::Div if unsigned => a / b,
-        BinOp::Rem if unsigned => a % b,
-        BinOp::Div => (a as i32).wrapping_div(b as i32) as u32,
-        BinOp::Rem => (a as i32).wrapping_rem(b as i32) as u32,
-        BinOp::Shl => a << (b & 31),
-        BinOp::Shr if lt.is_unsigned() => a >> (b & 31),
-        BinOp::Shr => ((a as i32) >> (b & 31)) as u32,
-        BinOp::BitAnd => a & b,
-        BinOp::BitOr => a | b,
-        BinOp::BitXor => a ^ b,
-        BinOp::Eq => (a == b) as u32,
-        BinOp::Ne => (a != b) as u32,
-        BinOp::Lt => less(a, b) as u32,
-        BinOp::Gt => less(b, a) as u32,
-        BinOp::Le => !less(b, a) as u32,
-        BinOp::Ge => !less(a, b) as u32,
-        BinOp::LogAnd | BinOp::LogOr => return Err("short-circuit operators are evaluated by expr".into()),
+        BinOp::Add if lt.is_ptr() => addr(a + b * elem(lt)),
+        BinOp::Add => addr(a * elem(rt) + b),
+        // The difference of two pointers counts elements: a `ptrdiff_t`.
+        BinOp::Sub if rt.is_ptr() => IntKind::ptrdiff_t(x).wrap(a - b, x) / elem(lt),
+        BinOp::Sub => addr(a - b * elem(lt)),
+        BinOp::Eq => (a == b).into(),
+        BinOp::Ne => (a != b).into(),
+        BinOp::Lt => (a < b).into(),
+        BinOp::Gt => (a > b).into(),
+        BinOp::Le => (a <= b).into(),
+        BinOp::Ge => (a >= b).into(),
+        _ => return Err(format!("no pointer operator {op:?}")),
     })
 }

@@ -348,14 +348,16 @@ pub fn build_runtime(dir: &Path, cc: CCompiler) -> Result<Runtime, String> {
 /// Links program `prog` from `dir`: it compiled by `cc` (C) and assembled,
 /// then the runtime's objects and the library members it needs, linked
 /// with [`SCRIPT`], the program first. merlin-ld's warnings are errors
-/// here.
+/// here, but for clang's duplicate string literals in the reference build
+/// ([`toolchain::link_with`]).
 pub fn link_program(dir: &Path, prog: &Source, cc: CCompiler, rt: &Runtime) -> Result<Program, String> {
     let inputs = program_objects(dir, prog, cc, rt)?;
     let inputs = merlin_ld::library::with_needed(&inputs, &rt.library).map_err(|errors| {
         let lines: Vec<String> = errors.iter().map(|e| format!("merlin-ld: error: {e}")).collect();
         format!("linking {}:\n{}", prog.stem, lines.join("\n"))
     })?;
-    let debug = toolchain::link(dir, SCRIPT, &inputs, &prog.stem)?;
+    let clang = matches!(cc, CCompiler::Clang(_));
+    let debug = toolchain::link_with(dir, SCRIPT, &inputs, &prog.stem, clang)?;
     Ok(Program {
         name: prog.stem.clone(),
         elf: merlin_ld::strip_debug(&debug).map_err(|e| format!("{}: {e}", prog.stem))?,

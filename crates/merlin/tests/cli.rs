@@ -1,8 +1,10 @@
 //! Runs the `merlin` binary: snapshots, error format, exit codes.
 //!
 //! Snapshots live in `tests/snapshots/`: `<case>.ast` is compared against
-//! `merlin --dump-ast tests/cases/<case>.c`, and `<case>.s` against the
-//! assembly `merlin tests/cases/<case>.c` writes. To snapshot another case,
+//! `merlin --dump-ast tests/cases/<case>.c`, `<case>.s` against the
+//! assembly `merlin tests/cases/<case>.c` writes, and `<case>.rv64.s`
+//! against what it writes for RV64 (`-march=rv64ima_zicsr_zifencei`, LP64).
+//! To snapshot another case,
 //! create an empty `<case>.ast` or `<case>.s` there and bless. After an
 //! intended change to the tree, its printer or code generation, regenerate
 //! them (merlin itself produces them, no external tools) with
@@ -77,9 +79,15 @@ fn check_snapshot(snap: &Path, what: &str, got: &str) {
 }
 
 fn case_for(snap: &Path) -> (String, PathBuf) {
-    let name = snap.file_stem().unwrap().to_string_lossy().into_owned();
+    let stem = snap.file_stem().unwrap().to_string_lossy().into_owned();
+    let name = stem.strip_suffix(".rv64").unwrap_or(&stem).to_string();
     let case = tests_dir().join("cases").join(format!("{name}.c"));
     (name, case)
+}
+
+/// Whether a snapshot is of RV64 output: `<case>.rv64.s`.
+fn is_rv64(snap: &Path) -> bool {
+    snap.file_stem().unwrap().to_string_lossy().ends_with(".rv64")
 }
 
 #[test]
@@ -95,18 +103,24 @@ fn dump_ast_snapshots() {
     }
 }
 
-/// The generated assembly for a few cases is committed, so that every change
-/// to code generation shows up in the diff of `tests/snapshots/*.s`.
+/// The generated assembly for a few cases is committed, for RV32 and RV64,
+/// so that every change to code generation shows up in the diff of
+/// `tests/snapshots/*.s`.
 #[test]
 fn assembly_snapshots() {
     let snaps = snapshots("s");
     assert!(snaps.len() >= 2, "expected .s snapshots");
+    assert!(snaps.iter().any(|s| is_rv64(s)), "expected .rv64.s snapshots");
     let dir = std::env::temp_dir().join(format!("merlin-cli-asm-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for snap in snaps {
         let (name, case) = case_for(&snap);
-        let out_s = dir.join(format!("{name}.s"));
-        let out = merlin(&[&case, Path::new("-o"), &out_s]);
+        let out_s = dir.join(snap.file_name().unwrap());
+        let mut args: Vec<&Path> = vec![&case, Path::new("-o"), &out_s];
+        if is_rv64(&snap) {
+            args.push(Path::new("-march=rv64ima_zicsr_zifencei"));
+        }
+        let out = merlin(&args);
         assert!(out.status.success(), "{name}: {}", stderr(&out));
         let got = std::fs::read_to_string(&out_s).unwrap();
         check_snapshot(&snap, &format!("{name}: generated assembly"), &got);
@@ -352,4 +366,63 @@ fn usage_errors() {
     let out = merlin(&[Path::new("--help")]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("--dump-ast"));
+
+    // -march names one of the two ISAs, and -mabi the ABI that goes with it
+    // (anything else is an unknown ABI to clang, as here).
+    let out = merlin(&[Path::new("-march=rv64gc"), Path::new("a.c")]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).starts_with(
+            "merlin: unsupported -march 'rv64gc' (merlin takes rv32ima_zicsr_zifencei or \
+             rv64ima_zicsr_zifencei)"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    for args in [
+        &["-mabi=lp64"][..],
+        &["-march=rv64ima_zicsr_zifencei", "-mabi=ilp32"],
+    ] {
+        let mut args: Vec<&Path> = args.iter().map(Path::new).collect();
+        args.push(Path::new("a.c"));
+        let out = merlin(&args);
+        assert_eq!(out.status.code(), Some(2));
+        let abi = args[args.len() - 2].to_string_lossy().replace("-mabi=", "");
+        assert!(
+            stderr(&out).starts_with(&format!("merlin: unknown target ABI '{abi}'")),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+/// `-march` picks the target: LP64 types for RV64.
+#[test]
+fn march_picks_the_target() {
+    let t = TempSrc::new("march", "t.c", "unsigned long n = sizeof(long[2]);\n");
+    let dump = |args: &[&str]| {
+        let mut all: Vec<&Path> = args.iter().map(Path::new).collect();
+        all.extend([Path::new("--dump-ast"), &t.file]);
+        let out = merlin(&all);
+        assert!(out.status.success(), "{}", stderr(&out));
+        String::from_utf8_lossy(&out.stdout).replace('\r', "")
+    };
+    assert!(dump(&[]).contains("Num 8 : unsigned int"), "{}", dump(&[]));
+    for rv64 in [
+        &["-march=rv64ima_zicsr_zifencei"][..],
+        &["-march=rv64ima_zicsr_zifencei", "-mabi=lp64"],
+        &["-mabi=lp64", "-march=rv64ima_zicsr_zifencei"],
+    ] {
+        let ast = dump(rv64);
+        assert!(ast.contains("Num 16 : unsigned long"), "{ast}");
+    }
+    let ast = dump(&[
+        "-march=rv64ima_zicsr_zifencei",
+        "-march=rv32ima_zicsr_zifencei",
+        "-mabi=ilp32",
+    ]);
+    assert!(
+        ast.contains("Num 8 : unsigned int"),
+        "the last -march wins: {ast}"
+    );
 }

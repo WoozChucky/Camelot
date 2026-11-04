@@ -19,7 +19,7 @@
 //! Typedefs, struct tags and enum constants are gone even earlier: the parser
 //! resolves them, so the tree only has types and numbers.
 
-use crate::types::Type;
+use crate::types::{Type, Xlen};
 use crate::Pos;
 use std::fmt::Write;
 
@@ -27,6 +27,9 @@ use std::fmt::Write;
 pub struct Program {
     /// Top-level declarations and function definitions, in source order.
     pub items: Vec<Item>,
+    /// The target the program is for: its types' sizes, and the code
+    /// generated for it ([`crate::types`]).
+    pub xlen: Xlen,
 }
 
 impl Program {
@@ -251,14 +254,14 @@ pub enum StmtKind {
     Switch {
         cond: Expr,
         body: Box<Stmt>,
-        cases: Vec<(i64, usize)>,
+        cases: Vec<(i128, usize)>,
         default: Option<usize>,
     },
     /// `case expr: body`. Sema sets the value and an id, unique in the
     /// function, that its switch refers to.
     Case {
         expr: Expr,
-        value: i64,
+        value: i128,
         id: usize,
         body: Box<Stmt>,
     },
@@ -377,7 +380,7 @@ impl Expr {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExprKind {
     /// An integer or character constant, in range for its type (`ty`).
-    Num(i64),
+    Num(i128),
     /// A string literal's bytes, without the terminating NUL; its type is
     /// `char[len + 1]`.
     Str(Vec<u8>),
@@ -491,13 +494,17 @@ impl Expr {
 /// Expressions show their type after a colon; resolved variables show where they
 /// live (`#n` for local `n`, `@name` for a global symbol).
 pub fn dump(prog: &Program) -> String {
-    let mut d = Dumper { out: String::new() };
+    let mut d = Dumper {
+        out: String::new(),
+        xlen: prog.xlen,
+    };
     d.program(prog);
     d.out
 }
 
 struct Dumper {
     out: String,
+    xlen: Xlen,
 }
 
 impl Dumper {
@@ -591,7 +598,7 @@ impl Dumper {
                     match ds {
                         Designator::Member(name, _) => text += &format!(".{name}"),
                         Designator::Index(e, _) => {
-                            text += &format!("[{}]", crate::consteval::int(e).unwrap_or(0))
+                            text += &format!("[{}]", crate::consteval::int(e, self.xlen).unwrap_or(0))
                         }
                     }
                 }

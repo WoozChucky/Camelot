@@ -1,6 +1,7 @@
 // expect: 54
+// expect-lp64: 58
 // Integer literals in every base, their suffixes, and the types C gives
-// them: a hex literal too big for int is unsigned.
+// them: a hex literal too big for int is unsigned. (sizeof 1L is 8 on LP64.)
 int main() {
     int r = 0;
     r += 0x10 + 010 + 10;             // 16 + 8 + 10 = 34

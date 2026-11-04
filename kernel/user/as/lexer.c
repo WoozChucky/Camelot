@@ -245,6 +245,12 @@ static int lex_quoted(const char *s, uint len, uint i, int quote, uint line, uch
             bytes[n++] = '\t';
         } else if (e == 'r') {
             bytes[n++] = '\r';
+        } else if (e == 'b') {
+            /* Backspace and form feed, as llvm-mc reads them: clang writes
+             * bytes 8 and 12 this way. */
+            bytes[n++] = 8;
+        } else if (e == 'f') {
+            bytes[n++] = 12;
         } else if (e >= '0' && e <= '7') {
             /* Octal, one to three digits: `\0`, `\12`, `\377`. */
             uint value = e - '0';

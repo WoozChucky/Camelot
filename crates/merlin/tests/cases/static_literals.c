@@ -1,6 +1,8 @@
 // expect: 77
+// expect-lp64: 81
 // Compound literals at file scope are objects with static storage that the
-// globals' initializers point into; `sizeof expr` sizes arrays.
+// globals' initializers point into; `sizeof expr` sizes arrays (pointers
+// are 8 bytes on LP64).
 
 struct point {
     int x, y;

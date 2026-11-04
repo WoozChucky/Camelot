@@ -73,7 +73,11 @@ struct cpu {
 };
 
 #define CPU_SIZE 92
+/* An RV32 layout: on RV64 (a compiler's check of the kernel, which does not
+ * run there yet) struct cpu is re-laid out by #154. */
+#if __riscv_xlen == 32
 _Static_assert(sizeof(struct cpu) == CPU_SIZE, "spinlock.s indexes cpus[] by CPU_SIZE");
+#endif
 
 extern struct cpu cpus[NCPU];
 

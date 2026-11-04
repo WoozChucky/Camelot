@@ -4566,9 +4566,15 @@ fn run_build(elf: &[u8], disks: Vec<DiskConfig>, input: &[u8], max_steps: u64) -
 /// and the root filesystem, its programs and files. Nothing runs in the
 /// background: how programs interleave depends on where the ticks land,
 /// which differs between the builds. The disk's `/bin` holds the programs
-/// compiled by `cc`, as the kernel embeds them.
+/// compiled by `cc`, as the kernel embeds them, on a filesystem the size of
+/// the root image's (`cargo xtask fs`): filetest writes a file of 300 KiB,
+/// which merlin's bigger programs leave no room for on mkfs's default 2048
+/// blocks.
 fn sessions(cc: CCompiler) -> Vec<(&'static str, Vec<DiskConfig>, &'static [u8])> {
-    let image = xtask::fs::build_with(&repo_root(), &camelot_fs::mkfs::Options::default(), cc).unwrap();
+    let root = repo_root();
+    let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
+    let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
+    let image = xtask::fs::build_with(&root, &opts, cc).unwrap();
     vec![
         ("boot", Vec::new(), EXIT),
         (

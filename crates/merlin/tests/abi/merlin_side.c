@@ -46,6 +46,60 @@ struct big {
     int v[10];
 };
 
+/* Register-wide members: a long and a pointer are 8 bytes on RV64 (LP64),
+ * so l1 takes one register, l2, li and cl (the int and the char padded) a
+ * pair, and l3 goes by reference; on RV32 (ILP32), where they are 4 bytes,
+ * the same classes come out. */
+struct l1 {
+    long a;
+};
+
+struct l2 {
+    long a, b;
+};
+
+struct li {
+    long a;
+    int b;
+};
+
+struct cl {
+    char c;
+    long l;
+};
+
+struct l3 {
+    long a, b, c;
+};
+
+/* A long long is 64 bits on both widths: on RV32 a pair of registers, as is
+ * a struct holding one (aligned to 8, so it starts at an even register when
+ * variadic and at an even word on the stack). */
+struct q1 {
+    long long v;
+};
+
+struct iq {
+    int i;
+    long long v;
+};
+
+/* Bigger than two registers on RV32 (by reference there), two registers on
+ * RV64: 9 and 10 bytes aligned to 1 and 2, and a char before a long long
+ * (16 bytes aligned to 8). */
+struct s9 {
+    char b[9];
+};
+
+struct s10 {
+    short h[5];
+};
+
+struct cq {
+    char c;
+    long long v;
+};
+
 /* What <stdarg.h> is made of (clang's builtins, which merlin has too). */
 typedef __builtin_va_list va_list;
 #define va_start(ap, last) __builtin_va_start(ap, last)
@@ -83,6 +137,42 @@ int c_vlate(int a, int b, int c, int d, int e, int f, int g, ...);
 int c_stack(int a, int b, int c, int d, int e, int f, int g, struct s8 h, struct s12 i, char j, short k,
             struct s6 l);
 struct s12 c_stack_ret(int a, int b, int c, int d, int e, int f, int g, int h, int i);
+long c_mixw(int i, unsigned u, long l, unsigned long ul, char *p);
+int c_umax(unsigned u);
+long c_sext(int i);
+unsigned long c_zext(unsigned u);
+int c_narrow(long l);
+unsigned c_unarrow(unsigned long l);
+struct l1 c_incl1(struct l1 s);
+struct l2 c_swapl2(struct l2 s);
+struct li c_li(struct li s);
+struct cl c_cl(struct cl s);
+struct l3 c_addl3(struct l3 x, struct l3 y);
+long c_vmixw(const char *fmt, ...);
+long c_stackw(int a, int b, int c, int d, int e, int f, int g, long h, struct l2 i, unsigned j, long k);
+long long c_qadd(long long a, int b, long long c);
+unsigned long long c_qhigh(unsigned long long x);
+long long c_qlate(int a, int b, int c, int d, int e, int f, int g, long long h, long long i, int j, long long k);
+struct q1 c_qtwice(struct q1 s);
+long long c_qsum(struct iq s, struct q1 t);
+long long c_vq(const char *fmt, ...);
+long long c_vqlate(int a, int b, int c, int d, int e, int f, int g, ...);
+long long c_q67(int a, int b, int c, int d, int e, int f, long long g);
+long long c_oddstack(int a, int b, int c, int d, int e, int f, int g, int h, int i, struct s8 j, int k,
+                     struct q1 l, short m, struct s6 n);
+long long c_vq3(int a, int b, const char *fmt, ...);
+struct s9 c_rev9(struct s9 s);
+struct s10 c_neg10(struct s10 s);
+int c_late910(int a, int b, int c, int d, int e, int f, int g, struct s9 h, struct s10 i);
+long long c_v910(const char *fmt, ...);
+struct cq c_cq(struct cq s);
+long long c_cqsum(int a, struct cq s, struct cq t);
+int c_ucmp(unsigned a, unsigned b);
+unsigned c_uadd(unsigned a, unsigned b);
+unsigned c_ushr(unsigned a, int n);
+unsigned c_udiv(unsigned a, unsigned b);
+long long c_shlq(long long v, int n);
+long long c_applyq(long long (*f)(long long, int), long long v, int n);
 
 static int checks, first_failure;
 
@@ -277,6 +367,276 @@ struct s12 m_stack_ret(int a, int b, int c, int d, int e, int f, int g, int h, i
     return r;
 }
 
+/* Mixed widths. On RV64 an int and an unsigned int travel sign-extended to
+ * 64 bits, as the psABI says and clang -O1 relies on (an unsigned
+ * 0xffffffff is -1 in its register), a long and a pointer as they are; a
+ * 32-bit result comes back sign-extended too. */
+long m_mixw(int i, unsigned u, long l, unsigned long ul, char *p) {
+    return i + (long)(u >> 4) + l + (long)(ul >> 4) + (p[1] - '0');
+}
+
+int m_umax(unsigned u) {
+    return u == 0xffffffffu;
+}
+
+long m_sext(int i) {
+    return i;
+}
+
+unsigned long m_zext(unsigned u) {
+    return u;
+}
+
+int m_narrow(long l) {
+    return l;
+}
+
+unsigned m_unarrow(unsigned long l) {
+    return l;
+}
+
+struct l1 m_incl1(struct l1 s) {
+    s.a++;
+    return s;
+}
+
+struct l2 m_swapl2(struct l2 s) {
+    long t = s.a;
+    s.a = s.b;
+    s.b = t;
+    return s;
+}
+
+struct li m_li(struct li s) {
+    s.a += s.b;
+    s.b = -s.b;
+    return s;
+}
+
+struct cl m_cl(struct cl s) {
+    s.c++;
+    s.l = -s.l;
+    return s;
+}
+
+struct l3 m_addl3(struct l3 x, struct l3 y) {
+    struct l3 r;
+    r.a = x.a + y.a;
+    r.b = x.b + y.b;
+    r.c = x.c + y.c;
+    return r;
+}
+
+/* Letters of fmt: i an int, u an unsigned and L an unsigned long (both
+ * shifted right by 4, so that the sums stay in range on RV32 too), l a long,
+ * p a char pointer (its first char), q a struct l2, t a struct li and T a
+ * struct l3 (by reference). */
+long m_vmixw(const char *fmt, ...) {
+    va_list ap;
+    long s = 0;
+    va_start(ap, fmt);
+    for (; *fmt; fmt++) {
+        if (*fmt == 'i') {
+            s += va_arg(ap, int);
+        } else if (*fmt == 'u') {
+            s += va_arg(ap, unsigned) >> 4;
+        } else if (*fmt == 'l') {
+            s += va_arg(ap, long);
+        } else if (*fmt == 'L') {
+            s += (long)(va_arg(ap, unsigned long) >> 4);
+        } else if (*fmt == 'p') {
+            s += *va_arg(ap, char *);
+        } else if (*fmt == 'q') {
+            struct l2 v = va_arg(ap, struct l2);
+            s += v.a * 10 + v.b;
+        } else if (*fmt == 't') {
+            struct li v = va_arg(ap, struct li);
+            s += v.a * 10 + v.b;
+        } else if (*fmt == 'T') {
+            struct l3 v = va_arg(ap, struct l3);
+            s += v.a + v.b + v.c;
+        }
+    }
+    va_end(ap);
+    return s;
+}
+
+/* Past a7: h, a long, is the last register; i, a pair, j and k are on the
+ * stack. */
+long m_stackw(int a, int b, int c, int d, int e, int f, int g, long h, struct l2 i, unsigned j, long k) {
+    return a + b + c + d + e + f + g + h * 10 + i.a * 100 + i.b + (long)(j >> 4) + k;
+}
+
+long long m_qadd(long long a, int b, long long c) {
+    return a + b + c;
+}
+
+unsigned long long m_qhigh(unsigned long long x) {
+    return x >> 32;
+}
+
+/* h starts in a7 on RV32, its high word at 0(sp); i, j and k are on the
+ * stack, i and k from an even word. */
+long long m_qlate(int a, int b, int c, int d, int e, int f, int g, long long h, long long i, int j, long long k) {
+    return a + b + c + d + e + f + g + h * 2 + i * 3 + j + k * 5;
+}
+
+struct q1 m_qtwice(struct q1 s) {
+    s.v *= 2;
+    return s;
+}
+
+long long m_qsum(struct iq s, struct q1 t) {
+    return s.i + s.v + t.v;
+}
+
+/* Letters of fmt: i an int, q a long long, s a struct q1. */
+long long m_vq(const char *fmt, ...) {
+    va_list ap;
+    long long s = 0;
+    va_start(ap, fmt);
+    for (; *fmt; fmt++) {
+        if (*fmt == 'i') {
+            s += va_arg(ap, int);
+        } else if (*fmt == 'q') {
+            s += va_arg(ap, long long);
+        } else {
+            struct q1 v = va_arg(ap, struct q1);
+            s += v.v;
+        }
+    }
+    va_end(ap);
+    return s;
+}
+
+/* Seven named ints: on RV32 the variadic pair skips a7. */
+long long m_vqlate(int a, int b, int c, int d, int e, int f, int g, ...) {
+    va_list ap;
+    long long x;
+    va_start(ap, g);
+    x = va_arg(ap, long long);
+    va_end(ap);
+    return x + a + b + c + d + e + f + g;
+}
+
+/* g in a6:a7 on RV32. */
+long long m_q67(int a, int b, int c, int d, int e, int f, long long g) {
+    return a + b + c + d + e + f + g * 3;
+}
+
+/* Past a7 on RV32: i at 0(sp), j (a struct s8, aligned to 4) from the odd
+ * word 4(sp), k at 12(sp), l (aligned to 8) at 16(sp), m at 24(sp) and n (a
+ * struct s6) from the odd word 28(sp); on RV64 each from an 8-byte slot. */
+long long m_oddstack(int a, int b, int c, int d, int e, int f, int g, int h, int i, struct s8 j, int k,
+                     struct q1 l, short m, struct s6 n) {
+    return a + b + c + d + e + f + g + h + i * 10 + j.x * 100 + j.y + k * 1000 + l.v + m + n.a + n.b + n.c;
+}
+
+/* Three named arguments, an odd number: on RV32 a variadic long long or
+ * struct q1 after them starts at an even register, a4 (a3 left out), and
+ * one that would start in a7 goes to the stack instead. Letters of fmt: i
+ * an int, q a long long, s a struct q1. */
+long long m_vq3(int a, int b, const char *fmt, ...) {
+    va_list ap;
+    long long s = a + b;
+    va_start(ap, fmt);
+    for (; *fmt; fmt++) {
+        if (*fmt == 'i') {
+            s += va_arg(ap, int);
+        } else if (*fmt == 'q') {
+            s += va_arg(ap, long long);
+        } else {
+            struct q1 v = va_arg(ap, struct q1);
+            s += v.v;
+        }
+    }
+    va_end(ap);
+    return s;
+}
+
+struct s9 m_rev9(struct s9 s) {
+    struct s9 r;
+    int i;
+    for (i = 0; i < 9; i++)
+        r.b[i] = s.b[8 - i];
+    return r;
+}
+
+struct s10 m_neg10(struct s10 s) {
+    int i;
+    for (i = 0; i < 5; i++)
+        s.h[i] = -s.h[i];
+    return s;
+}
+
+/* h after seven ints: on RV64 its first 8 bytes in a7 and the last at
+ * 0(sp), i at 8(sp) and 16(sp); on RV32 their copies' addresses in a7 and
+ * at 0(sp). */
+int m_late910(int a, int b, int c, int d, int e, int f, int g, struct s9 h, struct s10 i) {
+    return a + b + c + d + e + f + g + h.b[0] + h.b[8] * 10 + i.h[0] + i.h[4] * 100;
+}
+
+/* Letters of fmt: i an int, 9 a struct s9, 0 a struct s10, c a struct cq. */
+long long m_v910(const char *fmt, ...) {
+    va_list ap;
+    long long s = 0;
+    va_start(ap, fmt);
+    for (; *fmt; fmt++) {
+        if (*fmt == 'i') {
+            s += va_arg(ap, int);
+        } else if (*fmt == '9') {
+            struct s9 v = va_arg(ap, struct s9);
+            s += v.b[0] + v.b[8] * 10;
+        } else if (*fmt == '0') {
+            struct s10 v = va_arg(ap, struct s10);
+            s += v.h[0] + v.h[4] * 100;
+        } else {
+            struct cq v = va_arg(ap, struct cq);
+            s += v.c + v.v;
+        }
+    }
+    va_end(ap);
+    return s;
+}
+
+struct cq m_cq(struct cq s) {
+    s.c++;
+    s.v = -s.v;
+    return s;
+}
+
+long long m_cqsum(int a, struct cq s, struct cq t) {
+    return a + s.c + s.v + t.c * 10 + t.v;
+}
+
+/* On RV64 an unsigned int travels sign-extended, an argument and a result
+ * alike, and clang -O1 compares and passes on such registers as they are:
+ * 0x80000000 is 0xffffffff80000000 in one. */
+int m_ucmp(unsigned a, unsigned b) {
+    return (a < b) + 2 * (a == 0x80000000u) + 4 * (b == 0xffffffffu) + 8 * (a > 0x7fffffffu);
+}
+
+unsigned m_uadd(unsigned a, unsigned b) {
+    return a + b;
+}
+
+unsigned m_ushr(unsigned a, int n) {
+    return a >> n;
+}
+
+unsigned m_udiv(unsigned a, unsigned b) {
+    return a / b;
+}
+
+long long m_shlq(long long v, int n) {
+    return v << n;
+}
+
+/* A call through a pointer to a function returning a long long. */
+long long m_applyq(long long (*f)(long long, int), long long v, int n) {
+    return f(v, n) + 1;
+}
+
 int main(void) {
     int n = 0x1fffd; /* -3 as a signed char or short, 65533 as an unsigned short */
     int inner;
@@ -290,6 +650,19 @@ int main(void) {
     struct s12 v = {1, 2, 3}, sum;
     struct big b;
     signed char sc = -3;
+    long big;
+    unsigned long ubig;
+    struct l1 lone;
+    struct l2 ltwo;
+    struct li lint;
+    struct cl chl;
+    struct l3 lthree;
+    long long qbig;
+    struct q1 qone;
+    struct iq qmix;
+    struct s9 s9 = {{1, 0, 0, 0, 0, 0, 0, 0, 9}};
+    struct s10 s10 = {{2, 0, 0, 0, -3}};
+    struct cq cqv;
 
     check(c_inc1(one).c == 'b');
     check(one.c == 'a');
@@ -342,6 +715,92 @@ int main(void) {
     check(v.a == 1);
     sum = c_stack_ret(1, 2, 3, 4, 5, 6, 7, 8, 9);
     check(sum.a == 6 && sum.b == 15 && sum.c == 65);
+    /* Mixed widths, register-wide structs, and their variadic and stack
+     * arguments. */
+    big = (long)1 << (8 * sizeof(long) - 4);
+    ubig = ~0ul << 31;
+    check(c_mixw(-5, 0xffffffffu, big, ubig, "x7") == -5 + 0x0fffffff + big + (long)(ubig >> 4) + 7);
+    check(c_umax(0xffffffffu) && !c_umax(0x7fffffffu));
+    check(c_sext(-5) == -5 && c_sext(0x7fffffff) == 0x7fffffff);
+    check(c_zext(0xffffffffu) == 4294967295u && c_zext(0x80000000u) > 0);
+    check(c_narrow((long)(ubig | 5)) == -2147483643);
+    check(c_unarrow(ubig) == 0x80000000u && c_unarrow(ubig) > 0);
+    lone.a = big;
+    check(c_incl1(lone).a == big + 1);
+    ltwo.a = big;
+    ltwo.b = -7;
+    ltwo = c_swapl2(ltwo);
+    check(ltwo.a == -7 && ltwo.b == big);
+    lint.a = big;
+    lint.b = -3;
+    lint = c_li(lint);
+    check(lint.a == big - 3 && lint.b == 3);
+    chl.c = 'a';
+    chl.l = big;
+    chl = c_cl(chl);
+    check(chl.c == 'b' && chl.l == -big);
+    lthree.a = big;
+    lthree.b = 2;
+    lthree.c = -big;
+    lthree = c_addl3(lthree, lthree);
+    check(lthree.a == 2 * big && lthree.b == 4 && lthree.c == -2 * big);
+    ltwo.a = 3;
+    ltwo.b = 4;
+    lint.a = 5;
+    lint.b = 6;
+    check(c_vmixw("iulLpqtT", -1, 0xffffffffu, big, ubig, "z", ltwo, lint, lthree) ==
+          -1 + 0x0fffffff + big + (long)(ubig >> 4) + 'z' + 34 + 56 + 4);
+    check(c_vmixw("TtqpLlui", lthree, lint, ltwo, "z", ubig, big, 0xffffffffu, -1) ==
+          4 + 56 + 34 + 'z' + (long)(ubig >> 4) + big + 0x0fffffff - 1);
+    check(c_stackw(1, 2, 3, 4, 5, 6, 7, -2, ltwo, 0xffffffffu, big) == 28 - 20 + 304 + 0x0fffffff + big);
+    /* long long: pairs in registers, across a7, on the stack, variadic. */
+    qbig = 0x100000000LL;
+    qone.v = 5000000000LL;
+    qmix.i = 7;
+    qmix.v = -3000000000LL;
+    check(c_qadd(qbig, -1, qbig) == 0x1ffffffffLL && c_qadd(-1, -1, -1) == -3);
+    check(c_qhigh(0xabcdef0123456789ULL) == 0xabcdef01ULL);
+    check(c_qlate(1, 2, 3, 4, 5, 6, 7, qbig, -qbig, 9, qbig) == 28 + 4 * qbig + 9);
+    check(c_qtwice(qone).v == 10000000000LL);
+    check(c_qsum(qmix, qone) == 2000000007LL);
+    check(c_vq("iqisq", 1, qbig, 2, qone, -qbig) == 3 + 5000000000LL);
+    check(c_vq("iiiiiiq", 1, 2, 3, 4, 5, 6, qbig) == qbig + 21);
+    check(c_vqlate(1, 2, 3, 4, 5, 6, 7, qbig) == qbig + 28);
+    /* More pairs: in a6:a7, at odd stack words, after an odd number of
+     * named arguments; 9- and 10-byte structs, a char before a long long,
+     * unsigned ints sign-extended on RV64, a pointer to a function
+     * returning a long long. */
+    cqv.c = 'a';
+    cqv.v = -qbig;
+    check(c_q67(1, 2, 3, 4, 5, 6, qbig) == 21 + 3 * qbig);
+    check(c_oddstack(1, 2, 3, 4, 5, 6, 7, 8, 9, p, 4, qone, -2, six[1]) ==
+          36 + 90 + 4 * 100 + 3 + 4000 + qone.v - 2 + 20);
+    check(c_vq("q", qbig) == qbig && c_vq("s", qone) == qone.v);
+    check(c_vq("iiiiis", 1, 2, 3, 4, 5, qone) == 15 + qone.v);
+    check(c_vq("iiiiiis", 1, 2, 3, 4, 5, 6, qone) == 21 + qone.v);
+    check(c_vq3(1, 2, "qiqs", qbig, 3, -qbig, qone) == 6 + qone.v);
+    check(c_vq3(1, 2, "iiiq", 3, 4, 5, qbig) == 15 + qbig);
+    check(c_vq3(1, 2, "iiiis", 3, 4, 5, 6, qone) == 21 + qone.v);
+    s9 = c_rev9(s9);
+    check(s9.b[0] == 9 && s9.b[8] == 1 && s9.b[4] == 0);
+    s10 = c_neg10(s10);
+    check(s10.h[0] == -2 && s10.h[4] == 3);
+    check(c_late910(1, 2, 3, 4, 5, 6, 7, s9, s10) == 28 + 9 + 10 - 2 + 300);
+    check(c_v910("90ci", s9, s10, cqv, 5) == 19 + 298 + 'a' - qbig + 5);
+    check(c_v910("iiiiii9", 1, 2, 3, 4, 5, 6, s9) == 21 + 19);
+    check(c_v910("iiiiiii0c", 1, 2, 3, 4, 5, 6, 7, s10, cqv) == 28 + 298 + 'a' - qbig);
+    cqv = c_cq(cqv);
+    check(cqv.c == 'b' && cqv.v == qbig);
+    check(c_cqsum(3, cqv, cqv) == 3 + 'b' + qbig + 'b' * 10 + qbig);
+    check(c_ucmp(0x80000000u, 0xffffffffu) == 15 && c_ucmp(5, 3) == 0);
+    check(c_uadd(0x7fffffffu, 1) == 0x80000000u && c_uadd(0xffffffffu, 2) == 1);
+    check(c_ushr(0x80000000u, 0) == 0x80000000u && c_ushr(0xffffffffu, 4) == 0x0fffffffu);
+    check(c_udiv(0xfffffffeu, 1) == 0xfffffffeu && c_udiv(0xffffffffu, 2) == 0x7fffffffu);
+    check(c_ucmp(c_uadd(0x7fffffffu, 1), c_udiv(0xffffffffu, 1)) == 15);
+    check(m_ucmp(c_ushr(0x80000000u, 0), c_uadd(0xfffffffeu, 1)) == 15);
+    check(c_applyq(c_shlq, qbig, 3) == (qbig << 3) + 1);
+    check(c_applyq(m_shlq, 5, 40) == (5LL << 40) + 1);
+    check(m_applyq(c_shlq, 3, 33) == (3LL << 33) + 1);
     inner = c_calls_merlin();
     /* merlin calling itself, the same way. */
     check(m_sumbig(m_big(0)) == 45);
