@@ -497,6 +497,8 @@ impl Framebuffer {
         }
     }
 
+    /// Whether `FB_CTRL` enables the display. Only the picture depends on it (black while
+    /// disabled): the frame clock, flips, modesets and the interrupt run either way.
     pub fn enabled(&self) -> bool {
         self.ctrl & CTRL_ENABLE != 0
     }
@@ -971,6 +973,26 @@ mod tests {
         let header = b"P6\n640 480\n255\n";
         assert_eq!(ppm.len(), header.len() + 640 * 480 * 3);
         assert!(ppm[header.len()..].iter().all(|&b| b == 0));
+    }
+
+    /// Disabling the display blanks the picture only, as VGA's screen-off bit does: the
+    /// modeset, the flip at the vertical blank, `FB_VBLANKS` and the interrupt go on.
+    #[test]
+    fn a_disabled_display_keeps_its_timing() {
+        let mut fb = Framebuffer::new(6000); // 100 ticks a frame
+        w(&mut fb, REG_IRQ, u64::from(IRQ_VBLANK_ENABLE));
+        let (a, b) = (RAM_BASE + 0x10_0000, RAM_BASE + 0x40_0000);
+        fb.write(REG_SCANOUT, 8, a, RAM).unwrap();
+        w(&mut fb, REG_MODE, 1);
+        assert_eq!((fb.mode(), fb.scanout(), fb.modesets), (MODES[1], a, 1));
+        fb.write(REG_SCANOUT, 8, b, RAM).unwrap();
+        w(&mut fb, REG_FLIP, 1);
+        fb.advance(100);
+        assert_eq!((fb.scanout(), fb.flips, fb.vblanks), (b, 1, 1));
+        assert_eq!(r(&mut fb, REG_STATUS), 0, "the flip took effect");
+        assert!(fb.irq(), "the vertical blank interrupts");
+        let frame = fb.frame(&[]);
+        assert_eq!((frame.width, frame.height, frame.pixels), (800, 600, None));
     }
 
     #[test]
