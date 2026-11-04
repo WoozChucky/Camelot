@@ -53,17 +53,28 @@ pub const DISKBOOT_RV64: Program = Program {
     xlen: Xlen::Rv64,
 };
 
-/// Camelot's bootloader.
+/// Camelot's bootloader, for RV32 machines and kernels.
 pub const BOOTLOADER: Program = Program {
     name: "boot",
     dir: "kernel/boot",
-    source: "boot.s",
+    source: "boot.S",
     script: "link.ld",
     elf: "boot.elf",
     xlen: Xlen::Rv32,
 };
 
-pub const PROGRAMS: &[Program] = &[DISKBOOT, DISKBOOT_RV64, BOOTLOADER];
+/// Camelot's bootloader for RV64 machines, which loads the RV64 kernel
+/// (ELF64): the same source and linker script.
+pub const BOOTLOADER_RV64: Program = Program {
+    name: "boot-rv64",
+    dir: "kernel/boot",
+    source: "boot.S",
+    script: "link.ld",
+    elf: "boot-rv64.elf",
+    xlen: Xlen::Rv64,
+};
+
+pub const PROGRAMS: &[Program] = &[DISKBOOT, DISKBOOT_RV64, BOOTLOADER, BOOTLOADER_RV64];
 
 impl Program {
     /// The committed executable under `root`.
@@ -123,4 +134,9 @@ pub fn build(root: &Path, p: &Program) -> Result<Built, String> {
 /// The bootloader's executable as the current source builds it.
 pub fn bootloader(root: &Path) -> Result<Vec<u8>, String> {
     Ok(build(root, &BOOTLOADER)?.elf)
+}
+
+/// The RV64 bootloader's executable as the current source builds it.
+pub fn bootloader_rv64(root: &Path) -> Result<Vec<u8>, String> {
+    Ok(build(root, &BOOTLOADER_RV64)?.elf)
 }

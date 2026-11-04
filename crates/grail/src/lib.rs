@@ -37,8 +37,8 @@ pub mod window;
 use block::{BlockBackend, BlockDevice};
 use bus::{Bus, Exit, MAX_DISKS, MAX_NETS};
 pub use config::{
-    max_ram_size, parse_clock, parse_harts, parse_ram_size, parse_size, parse_xlen, DiskConfig,
-    MachineConfig, NetConfig, DEFAULT_RAM_SIZE, MAX_HARTS,
+    max_ram_size, parse_clock, parse_harts, parse_paging, parse_ram_size, parse_size, parse_xlen, DiskConfig,
+    MachineConfig, NetConfig, Paging, DEFAULT_RAM_SIZE, MAX_HARTS,
 };
 use cpu::Cpu;
 pub use excalibur::Xlen;
@@ -134,6 +134,7 @@ impl Machine {
             nets.push(NetDevice::new(mac, backend));
         }
         let mut cpu = Cpu::new(Bus::with_nets(&config, disks, nets)?);
+        cpu.set_paging(config.paging);
         let pacer = config.clock_hz.map(Pacer::new);
         // With a real-time clock a wfi takes real time; see `run_steps`.
         cpu.wfi_skips_to_timer = pacer.is_none();

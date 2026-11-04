@@ -38,6 +38,24 @@ pub const LOCK_CPU: u32 = 4;
 pub const PROC_NAME: u32 = 8;
 pub const PROC_PARENT: u32 = 24;
 
+/// The same layouts in the RV64 kernel (`kernel/kernel-rv64.elf`, #154),
+/// where pointers and saved registers are 8 bytes and a pointer after a u32
+/// starts on the next 8-byte boundary (the `#if __riscv_xlen == 64` sides of
+/// kernel/include/spinlock.h, whose `_Static_assert`s check them).
+pub mod rv64 {
+    /// `sizeof(struct cpu)`: hart `h`'s entry is at `cpus + h * CPU_SIZE`.
+    pub const CPU_SIZE: u64 = 168;
+    pub const CPU_PROC: u64 = 0;
+    pub const CPU_NOFF: u64 = 8;
+    pub const CPU_INTENA: u64 = 12;
+    pub const CPU_HARTID: u64 = 16;
+    pub const CPU_CONTEXT: u64 = 24;
+    pub const CPU_PAGETABLE: u64 = 136;
+    pub const CPU_THREAD: u64 = 160;
+    /// Offset of the holding cpu in `struct spinlock`.
+    pub const LOCK_CPU: u64 = 8;
+}
+
 /// The kernel's spinlocks that are variables of their own (the per-pipe,
 /// per-disk and the log's live inside other structures).
 pub const NAMED_LOCKS: [&str; 10] = [

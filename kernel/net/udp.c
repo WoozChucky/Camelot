@@ -107,7 +107,7 @@ static int output(struct pbuf *p, u32 src, u32 sport, u32 dst, u32 dport, u32 le
     return ip_output(p, src, dst, IP_PROTO_UDP, ulen);
 }
 
-int udp_sendto(struct udp_sock *s, u32 dst, u32 port, pagetable_t pt, u32 src, u32 len) {
+int udp_sendto(struct udp_sock *s, u32 dst, u32 port, pagetable_t pt, uintptr src, u32 len) {
     if (len > UDP_MAX_DATA) {
         return -EMSGSIZE;
     }
@@ -117,7 +117,7 @@ int udp_sendto(struct udp_sock *s, u32 dst, u32 port, pagetable_t pt, u32 src, u
     }
     /* Straight into the frame, from wherever the data is. */
     if (pt == NULL) {
-        memcpy(p->data + UDP_DATA, (const void *)(uintptr)src, len);
+        memcpy(p->data + UDP_DATA, (const void *)src, len);
     } else if (copyin(pt, p->data + UDP_DATA, src, len) < 0) {
         pbuf_free(p);
         return -EFAULT;
@@ -126,7 +126,7 @@ int udp_sendto(struct udp_sock *s, u32 dst, u32 port, pagetable_t pt, u32 src, u
     return err < 0 ? err : (int)len;
 }
 
-int udp_recvfrom(struct udp_sock *s, pagetable_t pt, u32 dst, u32 size, u32 *from, u32 *port, u32 timeout) {
+int udp_recvfrom(struct udp_sock *s, pagetable_t pt, uintptr dst, u32 size, u32 *from, u32 *port, u32 timeout) {
     u32 start = ticks;
     for (;;) {
         struct pbuf *p = pbuf_pop(&s->queue);
@@ -134,7 +134,7 @@ int udp_recvfrom(struct udp_sock *s, pagetable_t pt, u32 dst, u32 size, u32 *fro
             u32 len = p->len - p->off;
             u32 n = len < size ? len : size;
             if (pt == NULL) {
-                memcpy((void *)(uintptr)dst, p->data + p->off, n);
+                memcpy((void *)dst, p->data + p->off, n);
             } else if (copyout(pt, dst, p->data + p->off, n) < 0) {
                 pbuf_free(p);
                 return -EFAULT;

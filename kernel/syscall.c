@@ -146,9 +146,9 @@ void syscall(struct trap_frame *f) {
      * down to it, so that a buffer there the program hasn't touched yet (a
      * big local array passed to read()) is user memory like any other. A
      * thread whose stack is on the heap has sp outside the stack's range. */
-    u32 sp = f->regs[REG_SP];
+    uintptr sp = f->regs[REG_SP];
     if (sp >= USER_STACK_LIMIT && sp < p->stack_low && proc_grow_stack(sp) == -ENOMEM) {
-        kprintf("pid %u (%s) killed: no memory to grow its stack to 0x%08x\n", p->pid, p->name, sp);
+        kprintf("pid %u (%s) killed: no memory to grow its stack to " REG_FMT "\n", p->pid, p->name, sp);
         proc_exit(-1);
     }
     bool net = is_net_call(num);
