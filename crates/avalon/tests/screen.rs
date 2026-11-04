@@ -159,8 +159,11 @@ fn a_busy_screen_is_rate_limited() {
     let mut rt = connect(&server);
     let id = create(&mut rt, "busy", profile(1, None), pixel_counter());
     rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
-    let mut viewer = Viewer::attach(&server, VmRef::Id(id));
+    // From before the attach: the server sends updates from the moment it has
+    // attached the viewer, which may be well before `attach` returns on a busy
+    // machine, and every one of them is counted.
     let start = Instant::now();
+    let mut viewer = Viewer::attach(&server, VmRef::Id(id));
     viewer.idle(Duration::from_secs(1));
     let elapsed = start.elapsed();
     let updates = viewer.rects.len() - 1;
