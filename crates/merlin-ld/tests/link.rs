@@ -451,7 +451,7 @@ fn fixture_copies_are_current() {
         v
     };
     let shared = ["hello", "layouts", "merge", "norelocs", "rejects", "symbols"];
-    let rv64_only = ["relocs"];
+    let rv64_only = ["at", "relocs"];
     let rv64 = common::fixtures(common::RV64);
     let mut dirs: Vec<String> = std::fs::read_dir(&rv64)
         .unwrap()
@@ -645,6 +645,85 @@ fn data64_matches_ld_lld() {
         dwords(&images.sections[data][..32]),
         [0x8000_00d0, 0x8000_00cf, 0x1_0000_00cf, 0xffff_ffff]
     );
+}
+
+/// `AT(lma)` against ld.lld (fixtures/at): the program is linked to run at
+/// 0x8000_0000 and Grail loads it at its load addresses (the segments'
+/// p_paddr) and starts it at its entry point's, so it runs where it is
+/// loaded (all it uses is pc-relative) or copies .data to where it runs.
+#[test]
+fn load_addresses_match_ld_lld() {
+    let mut names: Vec<String> = std::fs::read_dir(fixtures().join("at"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ld"))
+        .map(|p| format!("at/{}", p.file_stem().unwrap().to_string_lossy()))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["at/first", "at/kept", "at/middle", "at/split"]);
+    let linked: HashMap<&str, merlin_ld::Linked> = names
+        .iter()
+        .map(|n| (n.as_str(), assert_matches_ld_lld(n, "OK\n")))
+        .collect();
+    // Spot checks, so a broken fixture can't make both sides agree on
+    // nonsense: (flags, vaddr, paddr) of each PT_LOAD.
+    let loads = |name: &str| -> Vec<(String, u64, u64)> {
+        expected(name)
+            .loads
+            .iter()
+            .map(|l| (l.flags.clone(), l.vaddr, l.paddr))
+            .collect()
+    };
+    let load = |f: &str, vaddr, paddr| (f.to_string(), vaddr, paddr);
+    // AT on .text only: the same segments as without it, each 1 MiB up; the
+    // entry point is where _start runs.
+    assert_eq!(
+        loads("at/first"),
+        [
+            load("RE", 0x8000_0000, 0x8010_0000),
+            load("R", 0x8000_00ec, 0x8010_00ec),
+            load("RW", 0x8000_00f0, 0x8010_00f0)
+        ]
+    );
+    assert_eq!(expected("at/first").entry, 0x8000_0000);
+    let first = &linked["at/first"].layout;
+    let sec = |l: &merlin_ld::Layout, name: &str| l.section(name).unwrap().clone();
+    assert!(sec(first, ".text").at && !sec(first, ".rodata").at);
+    assert_eq!(sec(first, ".bss").lma, sec(first, ".bss").addr + 0x10_0000);
+    // AT(.) on .text2: a segment of its own, though it follows .text with the
+    // same permissions and is loaded where it runs.
+    assert_eq!(
+        loads("at/split"),
+        [
+            load("RE", 0x8000_0000, 0x8000_0000),
+            load("RE", 0x8000_0090, 0x8000_0090),
+            load("R", 0x8000_00f4, 0x8000_00f4),
+            load("RW", 0x8000_00f8, 0x8000_00f8)
+        ]
+    );
+    // AT in the middle: .data (and the NOLOAD .bss after it) loaded right
+    // after .rodata, running a page later.
+    assert_eq!(
+        loads("at/middle"),
+        [
+            load("RE", 0x8000_0000, 0x8000_0000),
+            load("R", 0x8000_00ec, 0x8000_00ec),
+            load("RW", 0x8000_1000, 0x8000_00f0)
+        ]
+    );
+    assert_eq!(expected("at/middle").globals["__data_load"], 0x8000_00f0);
+    let middle = &linked["at/middle"].layout;
+    assert_eq!(sec(middle, ".bss").lma, 0x8000_0100);
+    // The empty sections: .dropped is dropped and its AT ignored, .kept's
+    // AT moves everything, .named and .aligned are kept.
+    let kept = expected("at/kept");
+    let names: Vec<&str> = kept.sections.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [".kept", ".text", ".named", ".aligned", ".rodata", ".data", ".bss"]
+    );
+    assert_eq!(kept.globals["__named"], 0x8000_00ec);
+    assert!(kept.loads.iter().all(|l| l.paddr == l.vaddr + 0x10_0000));
 }
 
 /// A jump or call to an undefined weak symbol aims at itself (as in ld.lld):
@@ -1453,6 +1532,145 @@ fn rejects_bad_objects() {
         errors(merlin_ld::link(&[], &Options::default())),
         ["no input files"]
     );
+}
+
+/// `ADDR(section)`: the address of an output section placed before, or of
+/// the one being placed, in its own AT and assignments. What ld.lld gives
+/// for this script and these objects (checked by hand: x 0x80000028, y
+/// 0x80000040, z 0x80000004, .data's segment at paddr 0x80100040).
+#[test]
+fn addr_is_an_output_sections_address() {
+    let l = merlin_ld::layout(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) } .rodata : { *(.rodata*) } x = ADDR(.rodata); \
+             .data : AT(ADDR(.data) + 0x100000) { y = ADDR(.data); *(.data*) } .bss : { *(.bss*) } \
+             z = ADDR(.text) + 4; }",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        (l.symbol("x"), l.symbol("y"), l.symbol("z")),
+        (Some(0x8000_0028), Some(0x8000_0040), Some(0x8000_0004))
+    );
+    let data = l.section(".data").unwrap();
+    assert_eq!((data.addr, data.lma, data.at), (0x8000_0040, 0x8010_0040, true));
+    // .bss has no AT and keeps .data's difference.
+    let bss = l.section(".bss").unwrap();
+    assert_eq!((bss.lma - bss.addr, bss.at), (0x10_0000, false));
+}
+
+/// The load address errors: AT ranges that overlap (ld.lld's
+/// checkSections, with its ranges on the same line), that run past 4 GiB
+/// on RV32 (where ld.lld truncates), and ADDR of what has no address yet.
+#[test]
+fn load_address_errors() {
+    let cases: &[(&str, &str)] = &[
+        (
+            // ld.lld: "section .text load address range overlaps with
+            // .rodata", ">>> .text range is [0x80100000, 0x80100027]",
+            // ">>> .rodata range is [0x80100010, 0x80100027]".
+            "SECTIONS { . = 0x80000000; .text : AT(0x80100000) { *(.text*) } \
+             .rodata : AT(0x80100010) { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) } }",
+            "section .text load address range overlaps with .rodata (.text is [0x80100000, 0x80100027], \
+             .rodata is [0x80100010, 0x80100027])",
+        ),
+        (
+            // .bss loaded over .text too, but it loads no bytes (NOBITS).
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : AT(0x80000000) { *(.data*) } .bss : AT(0x80000000) { *(.bss*) } }",
+            "section .text load address range overlaps with .data (.text is [0x80000000, 0x80000027], \
+             .data is [0x80000000, 0x80000023])",
+        ),
+        (
+            "SECTIONS { . = 0x80000000; .text : AT(0xffffffe0) { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+            "test.ld:1: section .text load address range extends past the 4 GiB address space",
+        ),
+        (
+            // A negative load address (RV32 scripts compute in i64).
+            "SECTIONS { . = 0x80000000; .text : AT(0 - 1) { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+            "test.ld:1: section .text load address range extends past the 4 GiB address space",
+        ),
+        (
+            "SECTIONS { x = ADDR(.nope); .text : { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+            "test.ld:1: undefined section .nope",
+        ),
+        (
+            // ld.lld would go round again; merlin-ld walks the script once.
+            "SECTIONS { x = ADDR(.data); .text : { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+            "test.ld:1: section '.data' is used before it is placed",
+        ),
+        (
+            // A section's ALIGN decides where it starts: its ADDR is not
+            // known yet there.
+            "SECTIONS { .text : { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : ALIGN(ADDR(.data) - ADDR(.data) + 16) { *(.data*) } .bss : { *(.bss*) } }",
+            "test.ld:1: section '.data' is used before it is placed",
+        ),
+        (
+            // ld.lld gives it a nonsense value (a symbol with st_shndx 0xffff).
+            "SECTIONS { .text : { *(.text*) } .rodata : { *(.rodata*) } .data : { *(.data*) } \
+             .bss : { *(.bss*) } x = ADDR(/DISCARD/); /DISCARD/ : { *(.comment) } }",
+            "test.ld:1: undefined section /DISCARD/",
+        ),
+        (
+            "SECTIONS { .text : { *(.text*) } /DISCARD/ : AT(0) { *(.comment) } }",
+            "test.ld:1: /DISCARD/ cannot have an AT",
+        ),
+        (
+            // ld.lld: "{ expected, but got AT".
+            "SECTIONS { .text : ALIGN(4) AT(0x80100000) { *(.text*) } }",
+            "test.ld:1: unsupported syntax after '.text :': found 'AT' (only AT(lma) and then ALIGN(n) may \
+             come before '{')",
+        ),
+    ];
+    for (src, want) in cases {
+        let errs = errors(merlin_ld::layout(&norelocs(), &script(src)));
+        assert!(
+            errs.iter().any(|e| e == want),
+            "{src}\n got {errs:?}\nwant {want}"
+        );
+    }
+    // A load address range may end exactly at 4 GiB (ld.lld links this).
+    let l = merlin_ld::layout(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80000000; .text : AT(0xffffffd8) { *(.text*) } \
+             .rodata : AT(0x80100000) { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) } }",
+        ),
+    )
+    .unwrap();
+    let text = l.section(".text").unwrap();
+    assert_eq!(text.lma + text.size, 1 << 32);
+    // Every section after one past 4 GiB keeps its difference, and is past
+    // it too: each one is reported.
+    let errs = errors(merlin_ld::layout(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80000000; .text : AT(0xffffffe0) { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : { *(.data*) } .bss : { *(.bss*) } }",
+        ),
+    ));
+    assert_eq!(errs.len(), 4, "{errs:?}");
+}
+
+/// A section loaded somewhere else than it runs says where in the map.
+#[test]
+fn map_file_shows_load_addresses() {
+    let (objs, opts) = case("at/middle.ld");
+    let linked = merlin_ld::link(&objs, &opts).unwrap();
+    let map = merlin_ld::map::map(&linked.layout);
+    for want in [
+        "\n.rodata              0x800000ec 0x00000004 1\n",
+        "\n.data                0x80001000 0x00000008 4096  (load 0x800000f0)\n",
+        "\n.bss                 0x80001010 0x00000010 16  (nobits)  (load 0x80000100)\n",
+    ] {
+        assert!(map.contains(want), "map lacks {want:?}:\n{map}");
+    }
 }
 
 #[test]

@@ -853,6 +853,123 @@ fn map_file() {
     assert!(map.contains("    0xffffffff80000018 top"), "{map}");
 }
 
+/// A higher-half program against ld.lld (rv64/at): linked to run at
+/// 0xffffffff80000000 and loaded at 0x8000_0000 by AT, in the form of
+/// Linux's riscv vmlinux.lds (`AT(ADDR(.x) - LOAD_OFFSET)`) and with
+/// `AT(. - OFFSET)`. Grail loads it at its load addresses and starts it at
+/// its entry point's, paging off; the program checks that it runs
+/// 0xffffffff00000000 below its link address, with `.dword _start`
+/// (R_RISCV_64), `lui %hi(_start)` and `.word _start` (R_RISCV_32, the
+/// address being a sign-extended 32-bit one) holding that address.
+#[test]
+fn higher_half_load_addresses_match_ld_lld() {
+    let mut names: Vec<String> = std::fs::read_dir(fixtures().join("at"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ld"))
+        .map(|p| format!("at/{}", p.file_stem().unwrap().to_string_lossy()))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["at/kernel", "at/split"]);
+    for name in &names {
+        assert_matches_ld_lld(name, "OK\n");
+    }
+    let types = reloc_types("at/kernel.o");
+    for t in [
+        "R_RISCV_64",
+        "R_RISCV_32",
+        "R_RISCV_HI20",
+        "R_RISCV_LO12_I",
+        "R_RISCV_PCREL_HI20",
+    ] {
+        assert!(types.contains_key(t), "{t}: {types:?}");
+    }
+    // Spot checks: (flags, vaddr, paddr) of each PT_LOAD.
+    let loads = |name: &str| -> Vec<(String, u64, u64)> {
+        expected(name)
+            .loads
+            .iter()
+            .map(|l| (l.flags.clone(), l.vaddr, l.paddr))
+            .collect()
+    };
+    let load = |f: &str, vaddr, paddr| (f.to_string(), vaddr, paddr);
+    assert_eq!(
+        loads("at/kernel"),
+        [
+            load("RE", 0xffff_ffff_8000_0000, 0x8000_0000),
+            load("R", 0xffff_ffff_8000_1000, 0x8000_1000),
+            load("RW", 0xffff_ffff_8000_2000, 0x8000_2000)
+        ]
+    );
+    assert_eq!(expected("at/kernel").entry, 0xffff_ffff_8000_0000);
+    // .text2 is 64-aligned: `.` in its AT is its start once aligned.
+    assert_eq!(
+        loads("at/split"),
+        [
+            load("RE", 0xffff_ffff_8000_0000, 0x8000_0000),
+            load("RE", 0xffff_ffff_8000_0080, 0x8000_0080),
+            load("R", 0xffff_ffff_8000_012c, 0x8000_012c),
+            load("RW", 0xffff_ffff_8000_0130, 0x8000_0130)
+        ]
+    );
+    // The map gives load addresses 16 digits wide.
+    let (objs, opts) = case("at/kernel.ld");
+    let linked = merlin_ld::link(&objs, &opts).unwrap();
+    let map = merlin_ld::map::map(&linked.layout);
+    let want = ".text                0xffffffff80000000 0x0000000000000104 4  (load 0x0000000080000000)";
+    assert!(map.contains(want), "map lacks {want:?}:\n{map}");
+}
+
+/// ELF64 load addresses wrap modulo 2^64 as addresses do (`AT(. - OFFSET)`
+/// is an ordinary higher-half form), but a load range may not run past
+/// 2^64: ld.lld writes such a segment (p_paddr + p_memsz wraps), merlin-ld
+/// reports it. No 4 GiB limit, which is RV32's.
+#[test]
+fn rv64_load_address_limits() {
+    let objs = norelocs();
+    let errs = errors(merlin_ld::layout(
+        &objs,
+        &script(
+            "SECTIONS { . = 0x80000000; .text : AT(0xfffffffffffffff0) { *(.text*) } \
+             .rodata : AT(0x1000) { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) } }",
+        ),
+    ));
+    assert_eq!(
+        errs,
+        ["test.ld:1: section .text load address range extends past the 64-bit address space"]
+    );
+    // Its end must be below 2^64, as a section's end address must (ld.lld's
+    // checkSections): .text (0x28 bytes) may be loaded 8 bytes below the
+    // top but not 0x28 below. Past 4 GiB is fine.
+    let at = |lma: &str| {
+        merlin_ld::layout(
+            &objs,
+            &script(&format!(
+                "SECTIONS {{ . = 0x80000000; .text : AT({lma}) {{ *(.text*) }} \
+                 .rodata : AT(0x100000000) {{ *(.rodata*) }} .data : {{ *(.data*) }} .bss : {{ *(.bss*) }} }}"
+            )),
+        )
+    };
+    let l = at("0xffffffffffffffd0").unwrap();
+    let (text, bss) = (l.section(".text").unwrap(), l.section(".bss").unwrap());
+    assert_eq!(text.lma + text.size, 0xffff_ffff_ffff_fff8);
+    assert_eq!(bss.lma, bss.addr - 0x8000_0028 + 0x1_0000_0000);
+    assert_eq!(
+        errors(at("0xffffffffffffffd8")),
+        ["test.ld:1: section .text load address range extends past the 64-bit address space"]
+    );
+    // A negative difference wraps: the higher-half form, with ADDR.
+    let l = merlin_ld::layout(
+        &objs,
+        &script(
+            "SECTIONS { . = 0xffffffff80000000; .text : AT(ADDR(.text) - 0xffffffff00000000) { *(.text*) } \
+             .rodata : { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) } }",
+        ),
+    )
+    .unwrap();
+    assert!(l.sections.iter().all(|s| s.lma == s.addr - 0xffff_ffff_0000_0000));
+}
+
 /// link.rs's twin: the members of a library are linked only when needed.
 /// rv64/relocs' main.o and relax.o are the program; the library holds a
 /// second main.o, norelocs' more.o (which nothing needs) and lib.o.

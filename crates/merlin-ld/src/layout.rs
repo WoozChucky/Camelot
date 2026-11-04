@@ -37,6 +37,37 @@
 //!   symbols, section ends, the MEMORY region and the entry point must stay
 //!   within it, and script arithmetic is exact (`i64`, an error on overflow).
 //!   ld.lld truncates such values to 32 bits; merlin-ld says what is wrong.
+//!
+//! ## Load addresses (`AT`)
+//!
+//! A section runs at its address (VMA, [`OutputSection::addr`]) and is
+//! loaded at its load address (LMA, [`OutputSection::lma`], its segment's
+//! `p_paddr`). They are the same unless the script says otherwise with
+//! `.name : AT(lma) { ... }`: a kernel linked in the top 2 GiB of the address
+//! space, which paging maps there, has to be loaded somewhere in RAM first,
+//! and Linux's riscv `vmlinux.lds` says where with
+//! `AT(ADDR(.x) - LOAD_OFFSET)`. What ld.lld does, and merlin-ld with it:
+//!
+//! - `.` in the `AT` expression is the section's start, aligned
+//!   (`AT(. - OFFSET)` is the same as `AT(ADDR(.x) - OFFSET)`).
+//! - The difference LMA - VMA (modulo 2^64) carries on: a section without
+//!   an `AT` is loaded at its address plus the difference of the last
+//!   section that had one (NOLOAD ones too, empty ones too), 0 at first.
+//!   So one `AT` on the first section moves the whole image.
+//! - A section dropped for being empty evaluates nothing: its `AT` sets no
+//!   difference.
+//! - A section with an `AT` starts a segment of its own, even when it
+//!   follows the previous one with the same permissions ([`OutputSection::at`],
+//!   [`crate::write::segments`]). So every section of a segment has the same
+//!   difference, and the segment's `p_paddr` is its first section's LMA.
+//! - Two sections with file contents must not be loaded over each other
+//!   (ld.lld's "load address range overlaps").
+//! - File offsets follow the addresses, not the load addresses, and the
+//!   entry point is an address.
+//!
+//! `ADDR(.x)` is the address of output section `.x`: one already placed,
+//! or the one being placed (in its `AT` and its assignments). A section an
+//! `ADDR` names is kept even if it is empty, as in ld.lld.
 
 use crate::object::{
     self, Class, Object, SHF_ALLOC, SHF_EXECINSTR, SHF_MERGE, SHF_STRINGS, SHF_WRITE, SHN_ABS, SHN_LORESERVE,
@@ -291,6 +322,12 @@ struct Walker<'a> {
     globals: Vec<(String, Def)>,
     global_index: HashMap<String, usize>,
     sections: Vec<OutputSection>,
+    /// The output section being placed and its start, once that is known:
+    /// what `ADDR` of it is, in its `AT` and among its assignments.
+    current: Option<(&'a str, u64)>,
+    /// The names of the script's output sections (not `/DISCARD/`): an
+    /// `ADDR` of one not placed yet names a later one.
+    script_sections: HashSet<&'a str>,
     errors: Vec<Error>,
 }
 
@@ -381,6 +418,24 @@ impl Walker<'_> {
                     _ => m.length,
                 },
                 _ => return Err(format!("unknown memory region '{r}'")),
+            },
+            // The address (VMA) of an output section: one already placed,
+            // or the one being placed once its start is known (in its own
+            // `AT`, not in its `ALIGN`, which that start depends on).
+            // merlin-ld walks the script once, so a later section has no
+            // address yet: an error, where ld.lld would go round again
+            // with the addresses of the first pass, as for symbols.
+            Expr::Addr(name) => match self.current {
+                Some((cur, start)) if cur == name => start,
+                _ => match self.sections.iter().find(|s| &s.name == name) {
+                    Some(s) => s.addr,
+                    None if self.script_sections.contains(name.as_str()) => {
+                        return Err(format!("section '{name}' is used before it is placed"))
+                    }
+                    // ld.lld's words. (A section of the script that ADDR names
+                    // is never dropped, so only an unknown name gets here.)
+                    None => return Err(format!("undefined section {name}")),
+                },
             },
             Expr::Add(a, b) => self.add(self.eval(a, dot)?, self.eval(b, dot)?)?,
             Expr::Sub(a, b) => self.sub(self.eval(a, dot)?, self.eval(b, dot)?)?,
@@ -509,6 +564,56 @@ fn merge_warnings(layout: &Layout) -> Vec<String> {
         }
     }
     warnings
+}
+
+/// Whether a section loaded at `lma` with `size` bytes fits the class's
+/// address space, as its address range must. ELF32 (RV32, until #159):
+/// within 4 GiB, which ld.lld does not check (it truncates `p_paddr` to 32
+/// bits). ELF64: below 2^64, which ld.lld does not check either (`p_paddr +
+/// p_memsz` would wrap); merlin-ld says so rather than write a segment that
+/// ends before it starts.
+fn load_range_fits(class: Class, lma: u64, size: u64) -> bool {
+    let end = lma.checked_add(size);
+    match class {
+        Class::Elf32 => end.is_some_and(|end| end <= 1 << 32),
+        Class::Elf64 => end.is_some(),
+    }
+}
+
+/// Sections loaded over each other, as ld.lld's checkSections finds them
+/// ("load address range overlaps"): with `AT`, two sections can be given
+/// load addresses that overlap although their addresses do not, and a
+/// loader would write one's bytes over the other's. Only sections with
+/// bytes in the file count (not empty or NOBITS ones, which load nothing).
+/// Like ld.lld, sort them by load address and compare each with the next
+/// one, naming the lower one first (its range is the one the other starts
+/// in).
+fn load_overlaps(class: Class, sections: &[OutputSection]) -> Vec<Error> {
+    // (One whose load range does not fit has been reported already.)
+    let mut loaded: Vec<&OutputSection> = sections
+        .iter()
+        .filter(|s| !s.nobits && s.size > 0 && load_range_fits(class, s.lma, s.size))
+        .collect();
+    // Stable: sections at the same load address stay in script order.
+    loaded.sort_by_key(|s| s.lma);
+    // `lma + size` does not overflow: the load range fits.
+    let range = |s: &OutputSection| format!("[{:#x}, {:#x}]", s.lma, s.lma + s.size - 1);
+    loaded
+        .windows(2)
+        .filter(|w| w[1].lma < w[0].lma + w[0].size)
+        .map(|w| {
+            let (a, b) = (w[0], w[1]);
+            err(format!(
+                "section {} load address range overlaps with {} ({} is {}, {} is {})",
+                a.name,
+                b.name,
+                a.name,
+                range(a),
+                b.name,
+                range(b)
+            ))
+        })
+        .collect()
 }
 
 pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
@@ -660,8 +765,20 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
         globals,
         global_index,
         sections: Vec::new(),
+        current: None,
+        script_sections: script
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::Output(o) if !o.is_discard() => Some(o.name.as_str()),
+                _ => None,
+            })
+            .collect(),
         errors: Vec::new(),
     };
+    // The sections an `ADDR(...)` names somewhere in the script: kept even
+    // without inputs (ld.lld's usedInExpression).
+    let addr_named: HashSet<&str> = script.addr_names().into_iter().collect();
     let region = script.memory.as_ref();
     // The location counter starts at 0, also with MEMORY (as in ld.lld): only
     // output sections go at the region's next free address.
@@ -670,9 +787,14 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
     // Line of the last top-level `.` move since the previous output section.
     let mut dot_moved: Option<usize> = None;
     // Flags of the last output section that had input sections; an output
-    // section without any inherits them (as in ld.lld).
+    // section without any inherits their SHF_ALLOC and SHF_WRITE (as in ld.lld).
     let mut prev_flags = SHF_ALLOC;
+    // LMA - VMA (modulo 2^64): where sections are loaded relative to where
+    // they run. 0 until a section has an `AT`; every section after it
+    // without one keeps its difference (see "Load addresses" above).
+    let mut lma_offset: u64 = 0;
     'commands: for (ci, cmd) in script.commands.iter().enumerate() {
+        w.current = None;
         match cmd {
             Command::Assign(a) => {
                 let before = dot;
@@ -691,9 +813,15 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                 let all_inputs = rules[ci].iter().flatten();
                 // ld.lld's rule: an output section is dropped only if no input
                 // section matched it (not even an empty one) and it has no
-                // assignments. Zero-size inputs still align it.
+                // assignments. Zero-size inputs still align it. Nor is one
+                // dropped that an expression needs: one an `ADDR` names
+                // (usedInExpression) or one whose `AT` or `ALIGN` uses a
+                // symbol (expressionsUseSymbols). A dropped section
+                // evaluates nothing, so its `AT` changes no load address.
                 let has_assign = o.items.iter().any(|i| matches!(i, Item::Assign(_)));
-                if all_inputs.clone().next().is_none() && !has_assign {
+                let needed = addr_named.contains(o.name.as_str())
+                    || o.at.iter().chain(&o.align).any(Expr::uses_symbols);
+                if all_inputs.clone().next().is_none() && !has_assign && !needed {
                     continue;
                 }
                 let mut align = all_inputs
@@ -735,6 +863,22 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                     w.script_err(o.line, past_the_top(base, align));
                     continue;
                 };
+                // From here on `ADDR` of this section is `start`.
+                w.current = Some((&o.name, start));
+                // `AT(lma)`, with `.` at the section's aligned start (ld.lld:
+                // `AT(. - OFFSET)` is LMA = VMA - OFFSET). It sets the offset
+                // the sections after this one keep.
+                let mut at = false;
+                if let Some(e) = &o.at {
+                    match w.eval(e, start) {
+                        Ok(lma) => {
+                            lma_offset = lma.wrapping_sub(start);
+                            at = true;
+                        }
+                        Err(e) => w.script_err(o.line, e),
+                    }
+                }
+                let lma = start.wrapping_add(lma_offset);
                 let mut d = start;
                 let mut inputs = Vec::new();
                 let mut flags = SHF_ALLOC;
@@ -796,6 +940,22 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                         }
                     }
                 }
+                // The load address range must fit as the address range does.
+                // The section is still placed: its addresses are right, and
+                // the sections after it go where they should.
+                if !load_range_fits(class, lma, size) {
+                    let space = match class {
+                        Class::Elf32 => "the 4 GiB",
+                        Class::Elf64 => "the 64-bit",
+                    };
+                    w.script_err(
+                        o.line,
+                        format!(
+                            "section {} load address range extends past {space} address space",
+                            o.name
+                        ),
+                    );
+                }
                 if inputs.is_empty() {
                     // Only assignments (`. += n`, symbols): like ld.lld, a
                     // PROGBITS section with the previous section's flags, but
@@ -847,9 +1007,8 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                     name: o.name.clone(),
                     addr: start,
                     size,
-                    // Loaded where it runs: merlin-ld has no AT(...) yet.
-                    lma: start,
-                    at: false,
+                    lma,
+                    at,
                     align,
                     flags,
                     nobits,
@@ -861,6 +1020,7 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
         }
     }
     errors.append(&mut w.errors);
+    errors.extend(load_overlaps(class, &w.sections));
 
     // Debug information, after everything else.
     let mut debug: Vec<DebugSection> = Vec::new();

@@ -11,7 +11,7 @@
 //! directories built with its own clang flags: RV32 ([`RV32`]) in
 //! `fixtures/` itself and RV64 ([`RV64`]) in `fixtures/rv64/`. The RV64 set
 //! has sources of its own (`rv64/relocs`: what RV64 code can reach is not
-//! what RV32's can) and copies of the RV32 sources that work on both widths
+//! what RV32's can; `rv64/at`: a higher-half program) and copies of the RV32 sources that work on both widths
 //! unchanged ([`SHARED_WITH_RV64`]), which [`run`] makes first, as it copies
 //! the examples, and a test checks.
 //!
@@ -102,8 +102,9 @@ pub const FROM_EXAMPLES: &[(&str, &[&str])] = &[
 /// Fixture directories of the RV32 set whose sources (`.S` and `.ld`) the
 /// RV64 set has too, copied into `fixtures/rv64/<same name>`: they assemble,
 /// link and run the same on both widths. Not `relocs`, `data64` (RV32's
-/// R_RISCV_64) or `multiobj` (its `.word` pointers would be sign-extended by
-/// RV64's `lw`; #151 brings RV64 examples).
+/// R_RISCV_64), `at` (RV64 has its own, a higher-half program) or
+/// `multiobj` (its `.word` pointers would be sign-extended by RV64's `lw`;
+/// #151 brings RV64 examples).
 pub const SHARED_WITH_RV64: &[&str] = &["hello", "layouts", "merge", "norelocs", "rejects", "symbols"];
 
 /// The default: no `R_RISCV_RELAX` or `R_RISCV_ALIGN` in the object.

@@ -10,14 +10,21 @@
 //! {
 //!     . = expr;   . += expr;   symbol = expr;
 //!     .name : { *(pattern pattern ...) ... . = ALIGN(n); . += n; symbol = expr; } > RAM
-//!     .name (NOLOAD) : ALIGN(n) { ... } > RAM    both optional
+//!     .name (NOLOAD) : AT(lma) ALIGN(n) { ... } > RAM    each optional, in this order
 //!     /DISCARD/ : { *(pattern ...) }
 //! }
 //! ```
 //!
 //! Expressions: numbers (`16`, `0x80000000`, `64K`, `128M`), `.`, symbols,
-//! `ALIGN(n)`, `ORIGIN(region)`, `LENGTH(region)`, parentheses, `+` and `-`.
-//! Comments are `/* ... */`. Anything else is an error naming what was found.
+//! `ALIGN(n)`, `ORIGIN(region)`, `LENGTH(region)`, `ADDR(section)`,
+//! parentheses, `+` and `-`. Comments are `/* ... */`. Anything else is an
+//! error naming what was found.
+//!
+//! `AT(lma)` gives an output section a load address (LMA) other than the
+//! address it runs at (its VMA): the `p_paddr` of its segment, where a
+//! loader puts its bytes. Linux's riscv `vmlinux.lds` writes it
+//! `AT(ADDR(.text) - LOAD_OFFSET)`, so `ADDR(section)`, an output section's
+//! address, comes with it. [`crate::layout`] explains what they mean.
 //!
 //! A script is read for the class of the objects it links ([`parse`] takes
 //! it). With ELF64 (RV64) objects, values are 64-bit addresses: numbers go up
@@ -74,7 +81,11 @@ pub struct OutputDesc {
     /// `(NOLOAD)`: the section takes no file space (`SHT_NOBITS`), whatever
     /// its inputs are.
     pub noload: bool,
-    /// `ALIGN(n)` after the colon: the section starts at least this aligned.
+    /// `AT(lma)` after the colon: the section is loaded at `lma` (its load
+    /// address, `p_paddr`) rather than where it runs.
+    pub at: Option<Expr>,
+    /// `ALIGN(n)` after the colon (after `AT`): the section starts at least
+    /// this aligned.
     pub align: Option<Expr>,
     pub items: Vec<Item>,
     /// `> REGION`.
@@ -109,6 +120,8 @@ pub enum Expr {
     Align(Box<Expr>),
     Origin(String),
     Length(String),
+    /// `ADDR(section)`: the address of an output section.
+    Addr(String),
     Add(Box<Expr>, Box<Expr>),
     Sub(Box<Expr>, Box<Expr>),
 }
@@ -118,9 +131,61 @@ impl Expr {
     pub fn uses_dot(&self) -> bool {
         match self {
             Expr::Dot | Expr::Align(_) => true,
-            Expr::Num(_) | Expr::Symbol(_) | Expr::Origin(_) | Expr::Length(_) => false,
+            Expr::Num(_) | Expr::Symbol(_) | Expr::Origin(_) | Expr::Length(_) | Expr::Addr(_) => false,
             Expr::Add(a, b) | Expr::Sub(a, b) => a.uses_dot() || b.uses_dot(),
         }
+    }
+
+    /// Whether the value depends on a symbol. ld.lld keeps an output section
+    /// without inputs if its `AT` or `ALIGN` does (its
+    /// `expressionsUseSymbols`): the expression must still be evaluated, and
+    /// an error reported if it cannot be. `ADDR` and `ORIGIN` name no symbol.
+    pub fn uses_symbols(&self) -> bool {
+        match self {
+            Expr::Symbol(_) => true,
+            Expr::Align(n) => n.uses_symbols(),
+            Expr::Num(_) | Expr::Dot | Expr::Origin(_) | Expr::Length(_) | Expr::Addr(_) => false,
+            Expr::Add(a, b) | Expr::Sub(a, b) => a.uses_symbols() || b.uses_symbols(),
+        }
+    }
+
+    /// Appends the output sections the expression names with `ADDR(...)`.
+    fn addr_names<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Expr::Addr(name) => out.push(name),
+            Expr::Align(n) => n.addr_names(out),
+            Expr::Add(a, b) | Expr::Sub(a, b) => {
+                a.addr_names(out);
+                b.addr_names(out);
+            }
+            Expr::Num(_) | Expr::Dot | Expr::Symbol(_) | Expr::Origin(_) | Expr::Length(_) => {}
+        }
+    }
+}
+
+impl Script {
+    /// The output sections some expression of the script names with
+    /// `ADDR(...)`, anywhere in it. ld.lld keeps such a section even when
+    /// nothing goes in it (its `usedInExpression`): an empty section still
+    /// has an address, which the expression needs.
+    pub fn addr_names(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        for c in &self.commands {
+            match c {
+                Command::Assign(a) => a.expr.addr_names(&mut out),
+                Command::Output(o) => {
+                    for e in o.at.iter().chain(&o.align) {
+                        e.addr_names(&mut out);
+                    }
+                    for i in &o.items {
+                        if let Item::Assign(a) = i {
+                            a.expr.addr_names(&mut out);
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -584,7 +649,9 @@ impl Parser {
     }
 
     /// The rest of an output section after its name, its `(NOLOAD)` and the
-    /// colon: `[ALIGN(n)] { items } [> REGION]`.
+    /// colon: `[AT(lma)] [ALIGN(n)] { items } [> REGION]`. ld.lld reads `AT`
+    /// and `ALIGN` in that order only (`ALIGN(n) AT(lma)` is its
+    /// "{ expected, but got AT").
     fn output_section(&mut self, name: String, noload: bool, line: usize) -> Result<OutputDesc, ScriptError> {
         if name == "." {
             return error(line, format!("'{name}' is not a valid output section name"));
@@ -593,6 +660,20 @@ impl Parser {
         if discard && noload {
             return error(line, "/DISCARD/ cannot be NOLOAD");
         }
+        let at = match self.peek() {
+            Some(Tok::Word(w)) if w == "AT" => {
+                let aline = self.line();
+                if discard {
+                    return error(aline, "/DISCARD/ cannot have an AT");
+                }
+                self.pos += 1;
+                self.expect("(")?;
+                let e = self.expr()?;
+                self.expect(")")?;
+                Some(e)
+            }
+            _ => None,
+        };
         let align = match self.peek() {
             Some(Tok::Word(w)) if w == "ALIGN" => {
                 let aline = self.line();
@@ -608,17 +689,21 @@ impl Parser {
                 self.expect(")")?;
                 Some(e)
             }
-            Some(Tok::Punct("{")) => None,
+            _ => None,
+        };
+        match self.peek() {
+            Some(Tok::Punct("{")) => {}
             Some(t) => {
                 return error(
                     self.line(),
                     format!(
-                        "unsupported syntax after '{name} :': found {t} (only ALIGN(n) may come before '{{')"
+                        "unsupported syntax after '{name} :': found {t} (only AT(lma) and then ALIGN(n) may \
+                         come before '{{')"
                     ),
                 )
             }
             None => return error(self.line(), "unexpected end of script"),
-        };
+        }
         self.expect("{")?;
         let mut items = Vec::new();
         while !self.eat("}") {
@@ -678,6 +763,7 @@ impl Parser {
         Ok(OutputDesc {
             name,
             noload,
+            at,
             align,
             items,
             region,
@@ -734,6 +820,7 @@ impl Parser {
             }
             "ORIGIN" => Expr::Origin(self.word("a memory region name")?),
             "LENGTH" => Expr::Length(self.word("a memory region name")?),
+            "ADDR" => Expr::Addr(self.word("a section name")?),
             _ => return error(line, format!("unsupported function '{w}' in expression")),
         };
         self.expect(")")?;
@@ -944,6 +1031,67 @@ mod tests {
         assert!(matches!(&s.commands[0], Command::Output(o) if o.is_discard()));
     }
 
+    /// Linux's form (riscv vmlinux.lds): `AT(ADDR(.x) - LOAD_OFFSET)`, then
+    /// `ALIGN(n)`, with or without `(NOLOAD)`.
+    #[test]
+    fn parses_at_and_addr() {
+        let s = parse(
+            "SECTIONS {\n\
+             . = 0xffffffff80000000;\n\
+             .text : AT(ADDR(.text) - 0xffffffff00000000) { *(.text) }\n\
+             .data : AT(. - 0xffffffff00000000) ALIGN(4096) { x = ADDR(.text); *(.data) }\n\
+             .bss (NOLOAD) : AT(lma) { *(.bss) }\n\
+             .rodata : ALIGN(16) { *(.rodata) }\n\
+             end = ADDR(.bss) + 4;\n\
+             }",
+            Class::Elf64,
+        )
+        .unwrap();
+        let outs: Vec<&OutputDesc> = s
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::Output(o) => Some(o),
+                Command::Assign(_) => None,
+            })
+            .collect();
+        let offset = || Box::new(Expr::Num(0xffff_ffff_0000_0000));
+        assert_eq!(
+            outs[0].at,
+            Some(Expr::Sub(Box::new(Expr::Addr(".text".into())), offset()))
+        );
+        assert_eq!(outs[0].align, None);
+        assert_eq!(outs[1].at, Some(Expr::Sub(Box::new(Expr::Dot), offset())));
+        assert_eq!(outs[1].align, Some(Expr::Num(4096)));
+        assert_eq!(
+            outs[1].items[0],
+            Item::Assign(Assign {
+                symbol: Some("x".into()),
+                add: false,
+                expr: Expr::Addr(".text".into()),
+                line: 4
+            })
+        );
+        assert!(outs[2].noload);
+        assert_eq!(outs[2].at, Some(Expr::Symbol("lma".into())));
+        assert_eq!(
+            (outs[3].at.as_ref(), outs[3].align.as_ref()),
+            (None, Some(&Expr::Num(16)))
+        );
+        // Every section an ADDR names, wherever it is: in an AT, in an
+        // assignment inside a section and at the top level.
+        assert_eq!(s.addr_names(), [".text", ".text", ".bss"]);
+        // ADDR does not use the location counter or a symbol; `.` and a
+        // symbol do, also inside ALIGN.
+        let at = |i: usize| outs[i].at.as_ref().unwrap();
+        assert!(!at(0).uses_dot() && !at(0).uses_symbols());
+        assert!(at(1).uses_dot() && !at(1).uses_symbols());
+        assert!(at(2).uses_symbols());
+        let align_of_sym = Expr::Align(Box::new(Expr::Symbol("n".into())));
+        assert!(align_of_sym.uses_symbols());
+        assert!(!Expr::Origin("RAM".into()).uses_symbols());
+    }
+
     #[test]
     fn default_script_parses() {
         let s = parse(DEFAULT_SCRIPT, Class::Elf32).unwrap();
@@ -1146,9 +1294,31 @@ mod tests {
                 "expected ':' after '.bss (NOLOAD)'",
             ),
             (
-                "SECTIONS { .text : AT(0x100) { *(.text) } }",
-                "only ALIGN(n) may come before '{'",
+                "SECTIONS { .text : ALIGN(4) AT(0x100) { *(.text) } }",
+                "1: unsupported syntax after '.text :': found 'AT' (only AT(lma) and then ALIGN(n) may come \
+                 before '{')",
             ),
+            (
+                "SECTIONS { .text : AT(0x100) AT(0x200) { *(.text) } }",
+                "found 'AT' (only AT(lma) and then ALIGN(n)",
+            ),
+            (
+                "SECTIONS { .text : AT(0x100) FOO { *(.text) } }",
+                "found 'FOO' (only AT(lma) and then ALIGN(n)",
+            ),
+            ("SECTIONS { .text : AT(0x100, 4) { } }", "expected ')', found ','"),
+            ("SECTIONS { .text : AT 0x100 { } }", "expected '(', found '0x100'"),
+            (
+                "SECTIONS { /DISCARD/ : AT(0x100) { *(.comment) } }",
+                "/DISCARD/ cannot have an AT",
+            ),
+            ("SECTIONS { x = ADDR(); }", "expected a section name, found ')'"),
+            ("SECTIONS { x = ADDR(.text, 4); }", "expected ')', found ','"),
+            (
+                "SECTIONS { x = LOADADDR(.text); }",
+                "unsupported function 'LOADADDR'",
+            ),
+            ("MEMORY { a : o = ADDR(.text), l = 1 }", "constant expression"),
             ("SECTIONS { .text : ALIGN(4, 8) { } }", "one-argument form"),
             (
                 "SECTIONS { /DISCARD/ (NOLOAD) : { *(.comment) } }",
