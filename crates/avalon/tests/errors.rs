@@ -364,6 +364,8 @@ fn misdirected_and_malformed_frames() {
             release: false,
             shift: false,
             ctrl: false,
+            repeat: false,
+            usage: 0x04,
         },
     })
     .unwrap();

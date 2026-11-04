@@ -131,6 +131,8 @@ fn key(code: u8) -> Input {
         release: false,
         shift: false,
         ctrl: false,
+        repeat: false,
+        usage: 0,
     })
 }
 

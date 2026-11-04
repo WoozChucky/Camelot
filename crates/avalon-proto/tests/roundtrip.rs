@@ -121,10 +121,32 @@ fn field_layouts_match_the_protocol_doc() {
             release: true,
             shift: false,
             ctrl: true,
+            repeat: false,
+            usage: 0x06,
         },
     })
     .unwrap();
-    assert_eq!(key, [8, 0, 0, 0, 0x04, 0x03, 1, 0, 0, 0, b'c', 0b101]);
+    assert_eq!(
+        key,
+        [10, 0, 0, 0, 0x04, 0x03, 1, 0, 0, 0, b'c', 0b101, 0x06, 0x00]
+    );
+    // A key that types nothing goes by its usage alone; an auto-repeat has bit 3.
+    let shift = encode(&Message::KeyInput {
+        vm: 1,
+        key: KeyEvent {
+            code: 0,
+            release: false,
+            shift: true,
+            ctrl: false,
+            repeat: true,
+            usage: 0xe1,
+        },
+    })
+    .unwrap();
+    assert_eq!(
+        shift,
+        [10, 0, 0, 0, 0x04, 0x03, 1, 0, 0, 0, 0, 0b1010, 0xe1, 0x00]
+    );
 }
 
 #[test]
@@ -269,7 +291,7 @@ fn a_bad_event_before_the_reply_does_not_shift_replies() {
     // A KeyInput with a reserved flag bit and a VmStateChanged with an unknown state
     // tag arrive before the replies. Both are set aside as errors for `recv`; each
     // request still gets its own reply.
-    let mut input = raw_frame(ty::KEY_INPUT, &[1, 0, 0, 0, b'a', 0x80]);
+    let mut input = raw_frame(ty::KEY_INPUT, &[1, 0, 0, 0, b'a', 0x80, 0x04, 0x00]);
     input.extend(raw_frame(ty::VM_STATE_CHANGED, &[1, 0, 0, 0, 9]));
     let mut conn = Connection::new(bad_then(
         input,

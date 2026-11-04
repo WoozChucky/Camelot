@@ -408,9 +408,11 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                     release: false,
                     shift: true,
                     ctrl: false,
+                    repeat: false,
+                    usage: 0x0e,
                 },
             },
-            P::default().u32(1).u8(b'k').u8(0b010).frame(0x0304),
+            P::default().u32(1).u8(b'k').u8(0b010).u16(0x0e).frame(0x0304),
         ),
         (ScreenDetach { vm: 5 }, P::default().u32(5).frame(0x0305)),
         (
@@ -684,11 +686,12 @@ fn every_enum_tag_is_the_documented_one() {
         let msg = Message::Detached { vm: 1, kind };
         assert_eq!(encode(&msg).unwrap(), P::default().u32(1).u8(tag).frame(0x010D));
     }
-    for (release, shift, ctrl, flags) in [
-        (true, false, false, 0b001),
-        (false, true, false, 0b010),
-        (false, false, true, 0b100),
-        (true, true, true, 0b111),
+    for (release, shift, ctrl, repeat, flags) in [
+        (true, false, false, false, 0b0001),
+        (false, true, false, false, 0b0010),
+        (false, false, true, false, 0b0100),
+        (false, false, false, true, 0b1000),
+        (true, true, true, true, 0b1111),
     ] {
         let msg = Message::KeyInput {
             vm: 1,
@@ -697,11 +700,13 @@ fn every_enum_tag_is_the_documented_one() {
                 release,
                 shift,
                 ctrl,
+                repeat,
+                usage: 0x1234,
             },
         };
         assert_eq!(
             encode(&msg).unwrap(),
-            P::default().u32(1).u8(1).u8(flags).frame(0x0304)
+            P::default().u32(1).u8(1).u8(flags).u16(0x1234).frame(0x0304)
         );
     }
     for (motion, fields) in [
@@ -775,17 +780,17 @@ fn optional_fields_are_tagged() {
 
 #[test]
 fn doc_examples_are_exact() {
-    // Section 6.1: Hello version 7 from agent "rt".
+    // Section 6.1: Hello version 8 from agent "rt".
     assert_eq!(
         encode(&Message::Hello {
-            version: 7,
+            version: 8,
             agent: "rt".into()
         })
         .unwrap(),
-        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x07, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
+        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x08, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
     );
     // Section 7: the version this document describes.
-    assert_eq!(PROTOCOL_VERSION, 7);
+    assert_eq!(PROTOCOL_VERSION, 8);
     // Section 6.2: StartVm by id 5.
     assert_eq!(
         encode(&Message::StartVm { vm: VmRef::Id(5) }).unwrap(),

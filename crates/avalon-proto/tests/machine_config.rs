@@ -318,28 +318,28 @@ fn device_table_mirrors_sysinfo() {
 
 #[test]
 fn keys_and_pixels_mirror_grail() {
+    // Field for field: a protocol key is Grail's key event, both forms of the key.
     let grail::keyboard::KeyEvent {
         code,
-        usage: _,
+        usage,
         release,
-        repeat: _,
+        repeat,
         shift,
         ctrl,
-    } = grail::keyboard::KeyEvent {
-        code: b'q',
-        usage: 0,
-        release: true,
-        repeat: false,
-        shift: false,
-        ctrl: true,
-    };
+    } = grail::keyboard::KeyEvent::release(b'q')
+        .with_usage(grail::keyboard::usage::A + 16)
+        .with_ctrl(true);
     let key = KeyEvent {
         code,
         release,
         shift,
         ctrl,
+        repeat,
+        usage,
     };
     assert!(grail::keyboard::code::is_valid(key.code));
+    assert!(grail::keyboard::usage::is_valid(key.usage));
+    assert!(Message::KeyInput { vm: 1, key }.check().is_ok());
     assert_eq!(PIXEL_FORMAT_XRGB8888, grail::framebuffer::FB_FORMAT_XRGB8888);
 }
 

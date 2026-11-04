@@ -275,7 +275,7 @@ impl ScreenSession {
 /// `PointerInput` per pointer change, except that a run of moves with the same
 /// buttons held and no wheel goes as its last move (a mouse reports far more moves
 /// than a guest's pointer FIFO holds; only where it ends up matters). Keys with code
-/// 0, which no key has, are dropped.
+/// 0 and usage 0, which no key has, are dropped.
 ///
 /// A button change is not part of the run around it, though Grail's window reports a
 /// press or a release as a move to where it happened, with the new buttons: the moves
@@ -290,7 +290,7 @@ pub fn input_messages(vm: u32, held: &mut Option<u8>, input: Vec<Input>) -> Vec<
     let mut last_is_run = false;
     for item in input {
         match item {
-            Input::Key(key) if key.code != 0 => {
+            Input::Key(key) if key.code != 0 || key.usage != 0 => {
                 out.push(Message::KeyInput { vm, key });
                 last_is_run = false;
             }
@@ -314,13 +314,16 @@ pub fn input_messages(vm: u32, held: &mut Option<u8>, input: Vec<Input>) -> Vec<
     out
 }
 
-/// A key from Grail's window, for the wire.
+/// A key from Grail's window, for the wire: the character typed and the physical key
+/// (its HID usage), so the guest's keyboard mode picks the one it sees.
 pub fn key_from_grail(key: grail::keyboard::KeyEvent) -> KeyEvent {
     KeyEvent {
         code: key.code,
         release: key.release,
         shift: key.shift,
         ctrl: key.ctrl,
+        repeat: key.repeat,
+        usage: key.usage,
     }
 }
 
@@ -363,7 +366,24 @@ mod tests {
             release: false,
             shift: false,
             ctrl: false,
+            repeat: false,
+            usage: 0,
         })
+    }
+
+    #[test]
+    fn keys_that_type_nothing_go_by_their_usage() {
+        // Shift alone has no code but a usage: the guest sees it in raw mode.
+        let shift = KeyEvent {
+            usage: 0xe1,
+            ..match key(0) {
+                Input::Key(k) => k,
+                _ => unreachable!(),
+            }
+        };
+        let msgs = input_messages(7, &mut None, vec![Input::Key(shift), key(0)]);
+        assert_eq!(msgs, [Message::KeyInput { vm: 7, key: shift }]);
+        msgs[0].check().unwrap();
     }
 
     fn pointer_of(msg: &Message) -> PointerChange {
@@ -508,7 +528,10 @@ mod tests {
                 wheel: -128,
             }
         );
-        let k = grail::keyboard::KeyEvent::release(b'q').with_ctrl(true);
+        // Both forms of the key go out: the code and the physical key.
+        let k = grail::keyboard::KeyEvent::release(b'q')
+            .with_usage(0x14)
+            .with_ctrl(true);
         assert_eq!(
             key_from_grail(k),
             KeyEvent {
@@ -516,6 +539,20 @@ mod tests {
                 release: true,
                 shift: false,
                 ctrl: true,
+                repeat: false,
+                usage: 0x14,
+            }
+        );
+        let k = grail::keyboard::KeyEvent::key_press(0xe3).with_repeat(true);
+        assert_eq!(
+            key_from_grail(k),
+            KeyEvent {
+                code: 0,
+                release: false,
+                shift: false,
+                ctrl: false,
+                repeat: true,
+                usage: 0xe3,
             }
         );
     }
