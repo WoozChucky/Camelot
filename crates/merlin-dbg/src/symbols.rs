@@ -122,6 +122,12 @@ impl Symbols {
         self.by_name.get(name).map(|&i| self.all[i].addr)
     }
 
+    /// The size symbol `name` has in the symbol table, if it has one (not 0).
+    pub fn size(&self, name: &str) -> Option<u64> {
+        let s = &self.all[*self.by_name.get(name)?];
+        (s.size != 0).then_some(s.size)
+    }
+
     /// The address of symbol `name` if it is in code (a function, or an assembly
     /// label in `.text`): what `break NAME` skips the prologue of.
     pub fn code(&self, name: &str) -> Option<u64> {
@@ -223,6 +229,7 @@ mod tests {
             assert_eq!(s.code("puts"), Some(0x8000_0020));
             assert_eq!(s.code("message"), None, "data");
             assert_eq!(s.code("nowhere"), None);
+            assert_eq!(s.size("message"), None, "a label has no size");
         }
         let s = Symbols::from_elf(&read("examples/hello/hello.elf")).unwrap();
         assert_eq!(s.show(0x8000_0024, Xlen::Rv32), "0x80000024 <puts+4>");
@@ -261,6 +268,9 @@ mod tests {
         assert_eq!(s.describe(0x8000_0090).as_deref(), Some("twice+4"));
         assert_eq!(s.range(0x8000_0090), Some((0x8000_008c, 0x8000_00b8)));
         assert_eq!(s.lookup("counter"), Some(0x8000_2178));
+        // An int's size, which `watch counter` watches; a function's.
+        assert_eq!(s.size("counter"), Some(4));
+        assert_eq!(s.size("twice"), Some(0x2c));
         let mut lines = crate::source::Lines::default();
         lines.add_elf(&elf).unwrap();
         let at = |a| lines.at(a).map(|p| p.to_string());

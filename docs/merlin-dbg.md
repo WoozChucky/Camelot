@@ -227,7 +227,7 @@ Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 |---|---|
 | `break ADDR`, `b` | breakpoint at ADDR |
 | `break FILE:LINE` | breakpoint on a source line (`kernel/main.c:273`, or `main.c:273`): see "Source lines" |
-| `watch [-r\|-a] ADDR [LEN]` | watchpoint on LEN bytes (4) at ADDR: writes, `-r` reads, `-a` either |
+| `watch [-r\|-a] ADDR [LEN]` | watchpoint on LEN bytes at ADDR: writes, `-r` reads, `-a` either. Without LEN, as GDB watches as many bytes as an expression's type has: the size of the symbol ADDR names in the symbol table (a C variable's, `watch total` on a `long` watches 8 bytes), at most 8, or else a register's worth (4 bytes on RV32, 8 on RV64), for an assembly label or an address |
 | `delete [N]`, `d` | deletes breakpoint or watchpoint N, or all of them |
 | `info breakpoints`, `i b` | lists them |
 | `continue`, `c` | runs every hart until something stops the machine |

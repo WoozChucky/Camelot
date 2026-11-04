@@ -806,13 +806,13 @@ fn harts_and_watchpoints_rv64() {
             "0x80010470:  0x0000000000000000",
             "hart 1",
             "=> 0x0000000080000074 <work+4>:  addi t0, t0, 0x3c0",
-            "watchpoint 2 (write) at 0x80000430 <counter>, 4 bytes",
-            "watchpoint 3 (read) at 0x8000043c <ready>, 4 bytes",
+            "watchpoint 2 (write) at 0x80000430 <counter>, 8 bytes",
+            "watchpoint 3 (read) at 0x8000043c <ready>, 8 bytes",
             "[hart 0] watchpoint 2 (write) hit at 0x80000430 <counter>",
             "=> 0x0000000080000084 <work+20>:  addi t1, t1, -0x1",
             "[hart 1] watchpoint 2 (write) hit at 0x80000430 <counter>",
-            "2    watchpoint  0x80000430 <counter>, 4 bytes, write",
-            "3    watchpoint  0x8000043c <ready>, 4 bytes, read",
+            "2    watchpoint  0x80000430 <counter>, 8 bytes, write",
+            "3    watchpoint  0x8000043c <ready>, 8 bytes, read",
             "error: no hart 3: the machine has 2",
         ],
     );
@@ -996,7 +996,7 @@ fn stepping_through_an_rv64_program() {
          next\n\
          bt\n\
          delete\n\
-         watch total 8\n\
+         watch total\n\
          continue\n\
          x/1g total\n\
          continue\n\

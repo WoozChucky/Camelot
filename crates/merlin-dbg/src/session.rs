@@ -66,7 +66,7 @@ type Halt = (usize, Option<(Watch, u64)>, u8);
 const HELP: &str = "\
 break|b ADDR            set a breakpoint (ADDR: 0x80000000, 1234, main, main+8, $ra)
 break|b FILE:LINE       ... on a source line (kernel/main.c:42, or main.c:42)
-watch [-r|-a] ADDR [N]  stop after a write (-r read, -a either) of N bytes at ADDR (4)
+watch [-r|-a] ADDR [N]  stop after a write (-r read, -a either) of N bytes at ADDR
 delete|d [N]            delete breakpoint or watchpoint N, or all of them
 info breakpoints|i b    list breakpoints and watchpoints
 continue|c              run until something stops the machine (Ctrl-C to interrupt)
@@ -353,7 +353,7 @@ impl<'a, W: Write> Session<'a, W> {
             _ => (Watch::Write, args),
         };
         let (addr, len) = match args {
-            [addr] => (self.eval(addr)?, 4),
+            [addr] => (self.eval(addr)?, self.watch_len(addr)),
             [addr, len] => (self.eval(addr)?, parse_number(len).ok_or("bad length")?),
             _ => return Err("watch [-r|-a] ADDR [LEN]".into()),
         };
@@ -362,6 +362,19 @@ impl<'a, W: Write> Session<'a, W> {
         let at = self.show_plain(addr);
         self.say(format!("watchpoint {n} ({}) at {at}, {len} bytes", kind.name()));
         Ok(())
+    }
+
+    /// How many bytes `watch ADDR` watches without a length. GDB watches an
+    /// expression's value, as many bytes as its type has: here, when ADDR is a
+    /// symbol with a size in the symbol table (a C variable), that size, at most 8
+    /// (a register's worth on RV64, what `long` and pointers take); else a
+    /// register's worth, 4 bytes on RV32 and 8 on RV64.
+    fn watch_len(&self, expr: &str) -> u64 {
+        let register = u64::from(self.xlen.bits() / 8);
+        match self.symbols.size(expr.trim()) {
+            Some(size) => size.min(8),
+            None => register,
+        }
     }
 
     fn delete(&mut self, args: &[&str]) -> Result<()> {
