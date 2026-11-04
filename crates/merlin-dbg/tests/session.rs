@@ -1088,24 +1088,35 @@ fn starting_an_rv64_grail_and_the_widths_agreeing() {
             "program exited with code 0",
         ],
     );
-    // An RV32 program's symbols for an RV64 machine: refused, and the machine,
-    // left alone, runs on to its end.
+    // An RV32 program's symbols for an RV64 machine: left out with a warning, and the
+    // session goes on without them, as GDB's does. The machine stays stopped at its
+    // first instruction, where the stub waited for merlin-dbg (dropping the
+    // connection would have let it run off), until the session runs it to a
+    // breakpoint and to its end.
     let (m, console) = machine("examples/hello/hello-rv64.elf", 1, b"");
     let (addr, thread) = stub(m);
-    let out = Command::new(env!("CARGO_BIN_EXE_merlin-dbg"))
-        .args([
+    let out = merlin_dbg(
+        &[
             "--connect",
             &addr.to_string(),
             path("examples/hello/hello.elf").to_str().unwrap(),
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        text.contains("hello.elf: an RV32 program (ELF32), but the machine is RV64"),
-        "{text}"
+        ],
+        "break puts\nbreak 0x80000020\ncontinue\ncontinue\n",
+    );
+    assert_lines(
+        &out,
+        &[
+            &format!(
+                "warning: {}: an RV32 program (ELF32), but the machine is RV64: going on without its symbols",
+                path("examples/hello/hello.elf").display()
+            ),
+            "=> 0x0000000000001000:  auipc t0, 0x0",
+            "error: no symbol 'puts'",
+            "breakpoint 1 at 0x80000020",
+            "breakpoint 1",
+            "=> 0x0000000080000020:  lui t0, 0x10000",
+            "program exited with code 0",
+        ],
     );
     assert_eq!(thread.join().unwrap(), Outcome::Exited(0));
     assert_eq!(console.text(), "Hello from Camelot!\n");

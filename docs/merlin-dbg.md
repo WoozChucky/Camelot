@@ -221,7 +221,7 @@ merlin-dbg [-x FILE] -- [grail options] program.elf
 
 Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 
-**The machine's width** (RV32 or RV64) comes from the stub, as GDB takes it: the target description's `<architecture>`, `riscv:rv32` or `riscv:rv64` (`qXfer:features:read:target.xml`). A stub without a description is asked for its registers instead, and the length of the `g` reply, 33 registers of 4 or 8 bytes, gives the width. The width decides how the code decodes and disassembles, how wide registers, addresses and saved frame slots are, and which CSR names exist (RV64 has no `cycleh`). A program must be of the machine's width, an ELF32 one for RV32 and ELF64 for RV64: one of the other width is refused (`program.elf: an RV32 program (ELF32), but the machine is RV64`), at the start and by `add-symbol-file`, as its symbols would be wrong for the machine. On RV32, address arithmetic wraps at 2^32 and an address past it is refused.
+**The machine's width** (RV32 or RV64) comes from the stub, as GDB takes it: the target description's `<architecture>`, `riscv:rv32` or `riscv:rv64` (`qXfer:features:read:target.xml`). A stub without a description is asked for its registers instead, and the length of the `g` reply, 33 registers of 4 or 8 bytes, gives the width. The width decides how the code decodes and disassembles, how wide registers, addresses and saved frame slots are, and which CSR names exist (RV64 has no `cycleh`). A program must be of the machine's width, an ELF32 one for RV32 and ELF64 for RV64: the symbols of one of the other width would be wrong for the machine. With `--connect`, such a program is left out with a warning, and the session goes on without its symbols, as GDB warns and goes on (`warning: program.elf: an RV32 program (ELF32), but the machine is RV64: going on without its symbols`). Ending the session instead would drop the connection, which the stub takes as a detach, and a machine waiting for its debugger would run off on its own. `add-symbol-file` refuses one with the same error, and the session goes on. (With `--`, Grail makes the machine as wide as the program.) On RV32, address arithmetic wraps at 2^32 and an address past it is refused.
 
 | Command | What it does |
 |---|---|
@@ -377,7 +377,7 @@ The same on RV64 machines, against the stub's `riscv:rv64` description:
 - `examples/hello/hello-rv64.elf`: frames and code addresses with 16 digits, the other addresses and `regs` in GDB's layout without leading zeros, `x/b`, `x/h`, `x/w` and `x/g`, steps, a backtrace, disassembly and `finish`;
 - `examples/smp/smp-rv64.elf` with 2 harts: harts and watchpoints;
 - `crates/merlin-dbg/tests/rv64/prog.c`, built by the test with `merlin -g` for RV64, merlin-as and merlin-ld: `break FILE:LINE`, `next` and `step` by line, `list`, a backtrace through a variadic function and five frames of a recursive one, `finish`, and a watchpoint on a 64-bit global;
-- `merlin-dbg -- ...` on an RV64 program, and an RV32 program's symbols refused for an RV64 machine.
+- `merlin-dbg -- ...` on an RV64 program, and an RV32 program's symbols left out for an RV64 machine: the session goes on, the machine stopped at its first instruction until it is run to a breakpoint.
 
 The kernel's RV64 case follows once the kernel is RV64 (#154). `src/remote.rs`'s unit tests give it a stub with no target description, whose width comes from the `g` reply.
 

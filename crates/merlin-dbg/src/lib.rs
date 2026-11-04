@@ -133,11 +133,22 @@ fn start(
         None => (Symbols::default(), None),
     };
     let remote = Remote::connect(addr)?;
-    // The machine's width, from the stub, is the program's (an ELF32 program on an
-    // RV64 machine would have the wrong symbols, and no RV32 code runs there).
-    if let Some((path, file)) = &file {
-        symbols::check_xlen(file, remote.xlen).map_err(|e| format!("{path}: {e}"))?;
-    }
+    // The machine's width, from the stub, must be the program's: an ELF32 program's
+    // symbols would be wrong for an RV64 machine. A program of the other width is
+    // left out with a warning and the session goes on without its symbols, as GDB
+    // warns and goes on: ending it would drop the connection, which the stub takes
+    // as a detach, and a machine waiting for its debugger would run off on its own.
+    // (Started with `--`, the machine is the program's width.)
+    let (symbols, lines) = match &file {
+        Some((path, file)) => match symbols::check_xlen(file, remote.xlen) {
+            Ok(()) => (symbols, lines),
+            Err(e) => {
+                let _ = writeln!(out, "warning: {path}: {e}: going on without its symbols");
+                (Symbols::default(), Lines::default())
+            }
+        },
+        None => (symbols, lines),
+    };
     let mut session = Session::new(remote, symbols, lines, &mut *out, on_quit, interrupt);
     session.start()?;
 
