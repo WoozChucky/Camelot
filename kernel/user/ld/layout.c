@@ -296,7 +296,12 @@ static int eval(struct expr *e, i64 dot, i64 *out, char **err) {
         }
         for (uint c = 0; c < S.ncommands; c++) {
             struct command *cmd = &S.commands[c];
-            if (cmd->is_output && strcmp(cmd->out.name, DISCARD_NAME) != 0 && strcmp(cmd->out.name, e->name) == 0) {
+            if (cmd->is_output && strcmp(cmd->out.name, e->name) == 0) {
+                /* /DISCARD/ has no address: 0, as in ld.lld. */
+                if (strcmp(e->name, DISCARD_NAME) == 0) {
+                    *out = i64_u(0);
+                    return 1;
+                }
                 *err = fmt("section '%s' is used before it is placed", e->name);
                 return 0;
             }
@@ -1011,6 +1016,18 @@ static void walk(void) {
                 dot_moved = cmd->assign.line;
             }
         } else if (strcmp(cmd->out.name, DISCARD_NAME) == 0) {
+            /* ld.lld ignores a /DISCARD/'s AT and NOLOAD, but its ALIGN
+             * goes through checkAlignment. */
+            if (cmd->out.align != NULL) {
+                i64 n;
+                char *err;
+                if (!eval(cmd->out.align, dot, &n, &err)) {
+                    script_err(cmd->out.line, err);
+                } else if (!is_pow2(i64_eq(n, i64_u(0)) ? i64_u(1) : n)) {
+                    script_err(cmd->out.line,
+                               fmt("ALIGN(%s) of section %s: alignment must be power of 2", i64_dec(n), DISCARD_NAME));
+                }
+            }
             for (uint it = 0; it < cmd->out.nitems; it++) {
                 for (uint k = 0; k < rules[c][it].n; k++) {
                     L->objects[rules[c][it].in[k].obj].sections[rules[c][it].in[k].sec].discarded = 1;

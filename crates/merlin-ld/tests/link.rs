@@ -1815,14 +1815,15 @@ fn load_address_errors() {
             "test.ld:1: section '.data' is used before it is placed",
         ),
         (
-            // ld.lld gives it a nonsense value (a symbol with st_shndx 0xffff).
+            // Without a /DISCARD/ in the script, ld.lld's words.
             "SECTIONS { .text : { *(.text*) } .rodata : { *(.rodata*) } .data : { *(.data*) } \
-             .bss : { *(.bss*) } x = ADDR(/DISCARD/); /DISCARD/ : { *(.comment) } }",
+             .bss : { *(.bss*) } x = ADDR(/DISCARD/); }",
             "test.ld:1: undefined section /DISCARD/",
         ),
         (
-            "SECTIONS { .text : { *(.text*) } /DISCARD/ : AT(0) { *(.comment) } }",
-            "test.ld:1: /DISCARD/ cannot have an AT",
+            // ld.lld reads a /DISCARD/'s ALIGN as any other's.
+            "SECTIONS { .text : { *(.text*) } /DISCARD/ : ALIGN(3) { *(.comment) } }",
+            "test.ld:1: ALIGN(3) of section /DISCARD/: alignment must be power of 2",
         ),
         (
             // ld.lld: "{ expected, but got AT".
@@ -1838,6 +1839,19 @@ fn load_address_errors() {
             "{src}\n got {errs:?}\nwant {want}"
         );
     }
+    // As in ld.lld: a /DISCARD/'s NOLOAD and AT mean nothing (the AT is
+    // not even evaluated), and its ADDR is 0, when the script has one.
+    let l = merlin_ld::layout(
+        &norelocs(),
+        &script(
+            "SECTIONS { . = 0x80000000; .text : { *(.text*) } .rodata : { *(.rodata*) } \
+             .data : AT(ADDR(/DISCARD/) + 0x1000) { *(.data*) } .bss : { *(.bss*) } x = ADDR(/DISCARD/); \
+             /DISCARD/ (NOLOAD) : AT(nowhere) ALIGN(16) { *(.comment) } }",
+        ),
+    )
+    .unwrap();
+    assert_eq!(l.symbol("x"), Some(0));
+    assert_eq!(l.section(".data").unwrap().lma, 0x1000);
     // A load address range may end exactly at 4 GiB (ld.lld links this).
     let l = merlin_ld::layout(
         &norelocs(),

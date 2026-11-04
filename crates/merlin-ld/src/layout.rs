@@ -490,6 +490,17 @@ impl Walker<'_> {
                     None if self.script_sections.contains(name.as_str()) => {
                         return Err(format!("section '{name}' is used before it is placed"))
                     }
+                    // /DISCARD/ has no address: 0, as in ld.lld, when the
+                    // script has one.
+                    None if name == script::OutputDesc::DISCARD
+                        && self
+                            .script
+                            .commands
+                            .iter()
+                            .any(|c| matches!(c, Command::Output(o) if o.is_discard())) =>
+                    {
+                        0
+                    }
                     // ld.lld's words. (A section of the script that ADDR names
                     // is never dropped, so only an unknown name gets here.)
                     None => return Err(format!("undefined section {name}")),
@@ -1215,6 +1226,19 @@ pub(crate) fn build_from(
             // address, so a reference to them is an error (see
             // `Layout::reloc_symbol`).
             Command::Output(o) if o.is_discard() => {
+                // ld.lld ignores a /DISCARD/'s AT and NOLOAD, but its ALIGN
+                // goes through checkAlignment.
+                if let Some(e) = &o.align {
+                    match w.eval(e, dot) {
+                        Ok(n) => {
+                            if let Err(e) = check_alignment(n) {
+                                let msg = format!("ALIGN({}) of section {}: {e}", w.show(n), o.name);
+                                w.script_err(o.line, msg);
+                            }
+                        }
+                        Err(e) => w.script_err(o.line, e),
+                    }
+                }
                 w.discarded.extend(rules[ci].iter().flatten().copied());
             }
             Command::Output(o) => {

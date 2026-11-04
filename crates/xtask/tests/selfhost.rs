@@ -792,8 +792,14 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
         // before .bss.
         "SECTIONS { . = 0x80000000; .text : { *(.text) } .x : { sym = .; } .data : { *(.data) }          . = . + 0x100; .bss : { *(.bss) } .rodata : { *(.rodata) *(.rodata.two) }          /DISCARD/ : { *(.text.gone) } }"
             .into(),
-        // A top-level `.` moved backward: the code above the rest.
-        format!("ENTRY(_start) SECTIONS {{ . = 0x80100000; .text : {{ *(.text) }} . = 0x80000000; {rest} }}"),
+        // A top-level `.` moved backward: the code above the rest; with
+        // OUTPUT_FORMAT's three arguments, a -freebsd name, and ADDR of
+        // /DISCARD/, which is 0.
+        format!(
+            "OUTPUT_FORMAT(\"elf32-littleriscv-freebsd\", \"elf32-littleriscv\", \"elf32-littleriscv\") \
+             ENTRY(_start) SECTIONS {{ . = 0x80100000; .text : {{ *(.text) }} . = 0x80000000; \
+             gone = ADDR(/DISCARD/); {rest} }}"
+        ),
         // Names with dashes, unquoted (`-` is a character of a name outside
         // expressions, an operator in them), and ALIGN(0), which is 1.
         format!(
@@ -993,7 +999,8 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         (vec![shdr_field(start.clone(), ".text", 32, |_| 12)], script, ""),
         (vec![shdr_field(start.clone(), ".symtab", 20, |size| size + 4)], script, ""),
         // Load addresses: two sections loaded over each other, a load range
-        // past 4 GiB, AT after ALIGN, /DISCARD/ with an AT.
+        // past 4 GiB, AT after ALIGN, /DISCARD/ with an ALIGN not a power of
+        // two (its NOLOAD and AT mean nothing, as in ld.lld).
         (
             vec![with_rodata.clone()],
             "SECTIONS { . = 0x1000; .text : { *(.text) } .rodata : AT(0x1000) { *(.rodata) } }",
@@ -1011,7 +1018,7 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         ),
         (
             vec![start.clone()],
-            "SECTIONS { /DISCARD/ : AT(0x100) { *(.comment) } }",
+            "SECTIONS { /DISCARD/ (NOLOAD) : AT(nowhere) ALIGN(3) { *(.comment) } }",
             "",
         ),
         // The headers in the read-only first section's segment, whose load

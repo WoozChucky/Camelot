@@ -198,12 +198,16 @@ const char *format_name(int format) {
 }
 
 /* The class an OUTPUT_FORMAT name stands for; FORMAT_NONE if merlin-ld does
- * not know it. */
+ * not know it. ld.lld takes a -freebsd suffix too. */
 static int format_class(const char *name) {
-    if (strcmp(name, "elf32-littleriscv") == 0) {
+    uint n = (uint)strlen(name);
+    if (n > 8 && strcmp(name + n - 8, "-freebsd") == 0) {
+        n -= 8;
+    }
+    if (n == 17 && strncmp(name, "elf32-littleriscv", 17) == 0) {
         return FORMAT_ELF32;
     }
-    if (strcmp(name, "elf64-littleriscv") == 0) {
+    if (n == 17 && strncmp(name, "elf64-littleriscv", 17) == 0) {
         return FORMAT_ELF64;
     }
     return FORMAT_NONE;
@@ -720,15 +724,11 @@ static int output_section(char *name, int noload, uint line, struct output_desc 
     if (strcmp(name, ".") == 0) {
         return fail(line, fmt("'%s' is not a valid output section name", name));
     }
+    /* A /DISCARD/'s NOLOAD and AT are read, as ld.lld reads them, and
+     * mean nothing; its ALIGN is checked (layout.c). */
     int discard = strcmp(name, DISCARD_NAME) == 0;
-    if (discard && noload) {
-        return fail(line, "/DISCARD/ cannot be NOLOAD");
-    }
     struct tok *t = peek();
     if (t != NULL && t->kind == TK_WORD && strcmp(t->text, "AT") == 0) {
-        if (discard) {
-            return fail(cur_line(), "/DISCARD/ cannot have an AT");
-        }
         pos++;
         if (!expect("(") || !expr(&o->at) || !expect(")")) {
             return 0;
@@ -737,9 +737,6 @@ static int output_section(char *name, int noload, uint line, struct output_desc 
     }
     if (t != NULL && t->kind == TK_WORD && strcmp(t->text, "ALIGN") == 0) {
         uint aline = cur_line();
-        if (discard) {
-            return fail(aline, "/DISCARD/ cannot have an ALIGN");
-        }
         pos++;
         if (!expect("(") || !expr(&o->align)) {
             return 0;
@@ -888,6 +885,19 @@ static int sections(struct script *s) {
     return 1;
 }
 
+/* One argument of OUTPUT_FORMAT, a name merlin-ld knows. */
+static int format_arg(uint line, int *format) {
+    char *f;
+    if (!name_or_str("an output format", &f)) {
+        return 0;
+    }
+    *format = format_class(f);
+    if (*format == FORMAT_NONE) {
+        return fail(line, fmt("OUTPUT_FORMAT(%s): only elf32-littleriscv and elf64-littleriscv are supported", f));
+    }
+    return 1;
+}
+
 static int script(struct script *s) {
     int seen_sections = 0, seen_memory = 0;
     while (peek() != NULL) {
@@ -921,28 +931,24 @@ static int script(struct script *s) {
             if (!expect("(")) {
                 return 0;
             }
-            /* OUTPUT_FORMAT(default, big, little): ld.lld goes by the first;
+            /* OUTPUT_FORMAT(name) or OUTPUT_FORMAT(default, big, little), one
+             * argument or three, as ld.lld takes them: it goes by the first;
              * merlin-ld also wants the others to be names it knows. */
-            for (;;) {
-                char *f;
-                if (!name_or_str("an output format", &f)) {
+            int first;
+            if (!format_arg(line, &first)) {
+                return 0;
+            }
+            if (eat(",")) {
+                int other;
+                if (!format_arg(line, &other) || !expect(",") || !format_arg(line, &other)) {
                     return 0;
-                }
-                int format = format_class(f);
-                if (format == FORMAT_NONE) {
-                    return fail(line, fmt("OUTPUT_FORMAT(%s): only elf32-littleriscv and elf64-littleriscv are "
-                                          "supported",
-                                          f));
-                }
-                if (s->format == FORMAT_NONE) {
-                    s->format = format;
-                }
-                if (!eat(",")) {
-                    break;
                 }
             }
             if (!expect(")")) {
                 return 0;
+            }
+            if (s->format == FORMAT_NONE) {
+                s->format = first;
             }
         } else if (strcmp(kw, "MEMORY") == 0) {
             if (seen_memory) {

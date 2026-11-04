@@ -20,6 +20,11 @@
 //! parentheses, `+` and `-`. Comments are `/* ... */`. Anything else is an
 //! error naming what was found.
 //!
+//! Names (section names, patterns, the symbols assignments set, regions,
+//! formats) take `-` as ld.lld's lexer does outside expressions
+//! (`OUTPUT_FORMAT(elf64-littleriscv)`, `*(.text-x)`); in an expression
+//! `a-b` is `a - b` ([`Parser::name`]).
+//!
 //! `AT(lma)` gives an output section a load address (LMA) other than the
 //! address it runs at (its VMA): the `p_paddr` of its segment, where a
 //! loader puts its bytes. Linux's riscv `vmlinux.lds` writes it
@@ -348,7 +353,9 @@ pub fn format_name(class: Class) -> &'static str {
 }
 
 /// The class an `OUTPUT_FORMAT` name stands for, if merlin-ld knows it.
+/// ld.lld takes a `-freebsd` suffix too (`elf64-littleriscv-freebsd`).
 fn format_class(name: &str) -> Option<Class> {
+    let name = name.strip_suffix("-freebsd").unwrap_or(name);
     [Class::Elf32, Class::Elf64]
         .into_iter()
         .find(|&c| format_name(c) == name)
@@ -496,25 +503,18 @@ impl Parser {
                 }
                 "OUTPUT_FORMAT" => {
                     self.expect("(")?;
-                    // `OUTPUT_FORMAT(default, big, little)`: ld.lld goes by the
-                    // first; merlin-ld also wants the others to be names it knows.
-                    loop {
-                        let fmt = self.name_or_str("an output format")?;
-                        let Some(class) = format_class(&fmt) else {
-                            return error(
-                                line,
-                                format!(
-                                    "OUTPUT_FORMAT({fmt}): only elf32-littleriscv and elf64-littleriscv \
-                                     are supported"
-                                ),
-                            );
-                        };
-                        script.format.get_or_insert(class);
-                        if !self.eat(",") {
-                            break;
-                        }
+                    // `OUTPUT_FORMAT(name)` or `OUTPUT_FORMAT(default, big,
+                    // little)`, one argument or three, as ld.lld takes them:
+                    // it goes by the first; merlin-ld also wants the others
+                    // to be names it knows.
+                    let first = self.format_arg(line)?;
+                    if self.eat(",") {
+                        self.format_arg(line)?;
+                        self.expect(",")?;
+                        self.format_arg(line)?;
                     }
                     self.expect(")")?;
+                    script.format.get_or_insert(first);
                 }
                 "MEMORY" => {
                     if seen_memory {
@@ -535,6 +535,15 @@ impl Parser {
             self.eat(";");
         }
         Ok(script)
+    }
+
+    /// One argument of `OUTPUT_FORMAT`, a name merlin-ld knows.
+    fn format_arg(&mut self, line: usize) -> Result<Class, ScriptError> {
+        let fmt = self.name_or_str("an output format")?;
+        format_class(&fmt).ok_or_else(|| ScriptError {
+            line,
+            msg: format!("OUTPUT_FORMAT({fmt}): only elf32-littleriscv and elf64-littleriscv are supported"),
+        })
     }
 
     fn memory(&mut self) -> Result<Option<Region>, ScriptError> {
@@ -671,16 +680,11 @@ impl Parser {
         if name == "." {
             return error(line, format!("'{name}' is not a valid output section name"));
         }
+        // A /DISCARD/'s NOLOAD and AT are read, as ld.lld reads them, and
+        // mean nothing; its ALIGN is checked ([`crate::layout`]).
         let discard = name == OutputDesc::DISCARD;
-        if discard && noload {
-            return error(line, "/DISCARD/ cannot be NOLOAD");
-        }
         let at = match self.peek() {
             Some(Tok::Word(w)) if w == "AT" => {
-                let aline = self.line();
-                if discard {
-                    return error(aline, "/DISCARD/ cannot have an AT");
-                }
                 self.pos += 1;
                 self.expect("(")?;
                 let e = self.expr()?;
@@ -692,9 +696,6 @@ impl Parser {
         let align = match self.peek() {
             Some(Tok::Word(w)) if w == "ALIGN" => {
                 let aline = self.line();
-                if discard {
-                    return error(aline, "/DISCARD/ cannot have an ALIGN");
-                }
                 self.pos += 1;
                 self.expect("(")?;
                 let e = self.expr()?;
@@ -1248,9 +1249,15 @@ mod tests {
         for (src, want) in [
             (r#"OUTPUT_FORMAT("elf64-littleriscv")"#, Some(Class::Elf64)),
             (
-                r#"ENTRY(_start) OUTPUT_FORMAT("elf32-littleriscv", "elf64-littleriscv")"#,
+                r#"ENTRY(_start) OUTPUT_FORMAT("elf32-littleriscv", "elf64-littleriscv", "elf64-littleriscv")"#,
                 Some(Class::Elf32),
             ),
+            // ld.lld takes the -freebsd names too.
+            (
+                r#"OUTPUT_FORMAT("elf64-littleriscv-freebsd")"#,
+                Some(Class::Elf64),
+            ),
+            ("OUTPUT_FORMAT(elf32-littleriscv-freebsd)", Some(Class::Elf32)),
             (
                 "MEMORY { RAM (rwx) : ORIGIN = 0, LENGTH = 4 }\nOUTPUT_FORMAT(\"elf64-littleriscv\")",
                 Some(Class::Elf64),
@@ -1266,9 +1273,19 @@ mod tests {
             assert_eq!(parse(src, Class::Elf64).unwrap().format, want, "{src}");
         }
         assert_eq!(
-            err("OUTPUT_FORMAT(\"elf32-littleriscv\", \"elf64-bigriscv\")"),
+            err("OUTPUT_FORMAT(\"elf32-littleriscv\", \"elf64-bigriscv\", \"elf32-littleriscv\")"),
             "1: OUTPUT_FORMAT(elf64-bigriscv): only elf32-littleriscv and elf64-littleriscv are supported"
         );
+        // A /DISCARD/'s NOLOAD, AT and ALIGN are read, as ld.lld reads them.
+        let s = parse(
+            "SECTIONS { /DISCARD/ (NOLOAD) : AT(nowhere) ALIGN(16) { *(.comment) } }",
+            Class::Elf64,
+        )
+        .unwrap();
+        let Command::Output(o) = &s.commands[0] else {
+            panic!()
+        };
+        assert!(o.is_discard() && o.at.is_some() && o.align.is_some());
     }
 
     #[test]
@@ -1403,10 +1420,6 @@ mod tests {
             ),
             ("SECTIONS { .text : AT(0x100, 4) { } }", "expected ')', found ','"),
             ("SECTIONS { .text : AT 0x100 { } }", "expected '(', found '0x100'"),
-            (
-                "SECTIONS { /DISCARD/ : AT(0x100) { *(.comment) } }",
-                "/DISCARD/ cannot have an AT",
-            ),
             ("SECTIONS { x = ADDR(); }", "expected a section name, found ')'"),
             ("SECTIONS { x = ADDR(.text, 4); }", "expected ')', found ','"),
             (
@@ -1415,13 +1428,14 @@ mod tests {
             ),
             ("MEMORY { a : o = ADDR(.text), l = 1 }", "constant expression"),
             ("SECTIONS { .text : ALIGN(4, 8) { } }", "one-argument form"),
+            // OUTPUT_FORMAT takes one argument or three, as in ld.lld.
             (
-                "SECTIONS { /DISCARD/ (NOLOAD) : { *(.comment) } }",
-                "/DISCARD/ cannot be NOLOAD",
+                r#"OUTPUT_FORMAT("elf64-littleriscv", "elf64-littleriscv")"#,
+                "expected ',', found ')'",
             ),
             (
-                "SECTIONS { /DISCARD/ : ALIGN(4) { *(.comment) } }",
-                "/DISCARD/ cannot have an ALIGN",
+                r#"OUTPUT_FORMAT("elf64-littleriscv", "elf64-littleriscv", "elf64-littleriscv", "x")"#,
+                "expected ')', found ','",
             ),
             (
                 "SECTIONS { /DISCARD/ : { x = .; } }",
