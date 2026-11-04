@@ -7,7 +7,16 @@
 typedef unsigned char uchar;
 typedef unsigned short ushort;
 typedef unsigned int uint;
+
+/* The system call ABI's types, Linux's: a `long` wide, so 64 bits on RV64
+ * (LP64) and 32 on RV32 (ILP32). A size, a count of bytes or an error, a
+ * file offset, a time in seconds, an integer that holds a pointer. */
 typedef unsigned long size_t;
+typedef long ssize_t;
+typedef long off_t;
+typedef long time_t;
+typedef long intptr_t;
+typedef unsigned long uintptr_t;
 
 #define NULL ((void *)0)
 
@@ -94,11 +103,12 @@ typedef unsigned long size_t;
 #define T_PIPE 4
 #define T_SOCKET 5
 
+/* 16 bytes on RV32, 24 on RV64 (the size a 64-bit off_t). */
 struct stat {
     uint ino;     /* the inode; 0 for a pipe or the shell's console */
     ushort type;  /* T_DIR, T_FILE, T_DEVICE, T_PIPE or T_SOCKET */
     ushort nlink; /* directory entries naming it; a socket: 0 once its other end hung up */
-    uint size;    /* bytes; for a pipe, those waiting to be read */
+    off_t size;   /* bytes; for a pipe, those waiting to be read */
     ushort major; /* a device's numbers */
     ushort minor;
 };
@@ -110,12 +120,12 @@ struct dirent {
     char name[DIRSIZ];
 };
 
-/* What procs stores for each process: 32 bytes. */
+/* What procs stores for each process: 32 bytes on RV32, 40 on RV64. */
 struct procinfo {
     uint pid;
-    uint ppid;  /* its parent's pid, 0 if it has none */
-    uint state; /* PROC_RUNNABLE, PROC_RUNNING, PROC_ZOMBIE or PROC_SLEEPING */
-    uint size;  /* the end of its heap: program, data and heap, from 0 */
+    uint ppid;   /* its parent's pid, 0 if it has none */
+    uint state;  /* PROC_RUNNABLE, PROC_RUNNING, PROC_ZOMBIE or PROC_SLEEPING */
+    size_t size; /* the end of its heap: program, data and heap, from 0 */
     char name[16];
 };
 
@@ -199,10 +209,10 @@ struct ping_reply {
 #define SOL_SOCKET 1   /* setsockopt: the socket's own options */
 #define SO_RCVTIMEO 20 /* how long recv and accept wait (a struct timeval) */
 
-/* A time: seconds and microseconds. */
+/* A time: seconds and microseconds, two longs, as Linux's. */
 struct timeval {
-    int tv_sec;
-    int tv_usec;
+    time_t tv_sec;
+    long tv_usec;
 };
 
 /* An address in network byte order (big-endian): use htonl and ntohl. */
@@ -222,20 +232,22 @@ struct sockaddr_in {
     uchar sin_zero[8];
 };
 
-/* The system calls. */
+/* The system calls, with Linux's types: a call that returns a count of
+ * bytes returns an ssize_t, lseek an off_t; sbrk the old end of the heap,
+ * a pointer, or minus an error number as a pointer ((long)p < 0). */
 void exit(int status);
-int write(int fd, const void *buf, uint len);
-int read(int fd, void *buf, uint len);
+ssize_t write(int fd, const void *buf, size_t len);
+ssize_t read(int fd, void *buf, size_t len);
 int getpid(void);
 int yield(void);
 int sleep(uint ticks);
 int spawn(const char *path, char *const argv[]);
 int wait(int pid, int *status);
-int sbrk(int increment);
+void *sbrk(long increment);
 uint uptime(void);
 int open(const char *path, int flags);
 int close(int fd);
-int lseek(int fd, int offset, int whence);
+off_t lseek(int fd, off_t offset, int whence);
 int fstat(int fd, struct stat *st);
 int mkdir(const char *path);
 int unlink(const char *path);
@@ -255,10 +267,10 @@ int bind(int fd, const struct sockaddr_in *addr);
 int listen(int fd, int backlog);
 int accept(int fd, struct sockaddr_in *addr);
 int connect(int fd, const struct sockaddr_in *addr);
-int send(int fd, const void *buf, uint len);
-int recv(int fd, void *buf, uint len);
-int sendto(int fd, const void *buf, uint len, const struct sockaddr_in *to);
-int recvfrom(int fd, void *buf, uint len, struct sockaddr_in *from);
+ssize_t send(int fd, const void *buf, size_t len);
+ssize_t recv(int fd, void *buf, size_t len);
+ssize_t sendto(int fd, const void *buf, size_t len, const struct sockaddr_in *to);
+ssize_t recvfrom(int fd, void *buf, size_t len, struct sockaddr_in *from);
 int shutdown(int fd, int how);
 int getsockname(int fd, struct sockaddr_in *addr);
 int getpeername(int fd, struct sockaddr_in *addr);
@@ -269,8 +281,9 @@ int thread_join(int tid, int *status);
 int gettid(void);
 int futex_wait(int *addr, int val);
 int futex_wake(int *addr, int n);
-/* Any call by number (for tests). */
-int syscall(int number, uint a0, uint a1, uint a2);
+/* Any call by number (for tests): its result, a long, as the kernel left
+ * it in a0. */
+long syscall(long number, long a0, long a1, long a2);
 
 /* ---- The C library (lib/, see lib/README.md) ---- */
 
@@ -334,8 +347,14 @@ int memcmp(const void *a, const void *b, size_t n);
  * after "0"); *end (if `end` isn't NULL) is where it stopped, `s` itself
  * when there were no digits. A number out of range gives LONG_MAX, or
  * LONG_MIN with a '-', as in C (*end is still past all its digits). */
-#define LONG_MAX 2147483647
+#ifdef _LP64
+#define LONG_MAX 0x7fffffffffffffffL
+#else
+#define LONG_MAX 2147483647L
+#endif
 #define LONG_MIN (-LONG_MAX - 1)
+#define INT_MAX 2147483647
+#define INT_MIN (-INT_MAX - 1)
 int atoi(const char *s);
 long strtol(const char *s, char **end, int base);
 

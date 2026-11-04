@@ -19,6 +19,7 @@
 //! cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf
 //! ```
 
+use crate::toolchain::Xlen;
 use crate::userprogs::{self, CCompiler};
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::BSIZE;
@@ -64,6 +65,27 @@ pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>,
     fs.add_device(&format!("{DEV}/console"), CONSOLE_MAJOR, 0)?;
     fs.mkdir(BIN)?;
     for prog in userprogs::build_all_with(&userprogs::user_dir(root), cc)? {
+        fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;
+    }
+    Ok(fs.finish())
+}
+
+/// The root filesystem of the `xlen` kernel, `opts`' shape: on RV32
+/// [`build`]'s; on RV64 the same files with the programs built for RV64 in
+/// `/bin`, those the RV64 kernel embeds ([`userprogs::build_embedded_for`]:
+/// not `as` and `ld`, which write RV32 code until #157). What the RV64
+/// kernel's tests boot from disk; the RV64 root image `cargo xtask fs`
+/// makes is #156's.
+pub fn build_for(root: &Path, opts: &Options, xlen: Xlen) -> Result<Vec<u8>, String> {
+    if xlen == Xlen::Rv32 {
+        return build(root, opts);
+    }
+    let mut fs = Mkfs::new(opts)?;
+    fs.add_host_dir(&root.join(ROOT_DIR), "/")?;
+    fs.mkdir(DEV)?;
+    fs.add_device(&format!("{DEV}/console"), CONSOLE_MAJOR, 0)?;
+    fs.mkdir(BIN)?;
+    for prog in userprogs::build_embedded_for(&userprogs::user_dir(root), xlen)? {
         fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;
     }
     Ok(fs.finish())

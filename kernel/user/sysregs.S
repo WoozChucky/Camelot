@@ -12,6 +12,19 @@
 # exits 0; or, at the first register that changed, exits with 32 times the
 # case's index plus the register's number (a0's for a wrong result).
 
+# Both widths: the cases are 32-bit words, which lw sign-extends, as the
+# kernel sign-extends a result, and the cursor is a pointer, a register
+# wide (REG_S and REG_L, glibc's sys/asm.h names, as lib/thread.S).
+#if __riscv_xlen == 64
+#define REG_S sd
+#define REG_L ld
+#define PTR .dword
+#else
+#define REG_S sw
+#define REG_L lw
+#define PTR .word
+#endif
+
     .equ SYS_write, 2
     .equ SYS_read, 3
     .equ SYS_getpid, 4
@@ -27,8 +40,11 @@
     .equ CASE, 20
     .equ MSG_LEN, 15
     .equ OK_LEN, 36
-    # A result that isn't checked (getpid's, sbrk's, uptime's).
-    .equ ANY, 0x80000000
+    # A result that isn't checked (getpid's, sbrk's, uptime's). Negative, so
+    # that li makes the value lw reads from a case on RV64 too, where every
+    # word of a case is sign-extended, as the kernel sign-extends a result:
+    # a 32-bit -EBADF in a case must equal all 64 bits of a0.
+    .equ ANY, -0x80000000
     # t6 points at the case while the arguments are loaded, and is the first
     # register checked after the call, with none to spare: it holds a value
     # one addi takes back to zero.
@@ -39,11 +55,11 @@
 main:
     la    t0, cases
     la    t1, cursor
-    sw    t0, 0(t1)
+    REG_S t0, 0(t1)
 
 next:
     la    t6, cursor
-    lw    t6, 0(t6)             # the case
+    REG_L t6, 0(t6)             # the case
     lw    a7, 0(t6)             # its call number, or -1 after the last one
     bltz  a7, done
     lw    a0, 4(t6)
@@ -88,7 +104,7 @@ next:
     li    t6, 0x01010101
     bne   ra, t6, bad_ra
     la    sp, cursor
-    lw    sp, 0(sp)
+    REG_L sp, 0(sp)
     # a0: the result, unless the case has none to check.
     lw    t6, 16(sp)
     li    ra, ANY
@@ -179,7 +195,7 @@ next:
     # On to the next case.
     addi  sp, sp, CASE
     la    t6, cursor
-    sw    sp, 0(t6)
+    REG_S sp, 0(t6)
     j     next
 
 done:
@@ -200,7 +216,7 @@ bad_ra:
     li    ra, 1
 bad_case:
     la    sp, cursor
-    lw    sp, 0(sp)
+    REG_L sp, 0(sp)
 # ra is the register's number, sp the case: exit with 32 * index + number.
 bad:
     la    t6, cases
@@ -231,5 +247,6 @@ ok:
 
     .data
 # The case being run: in memory, since every register is in use.
+    .align 3
 cursor:
-    .word 0
+    PTR 0

@@ -50,17 +50,17 @@ long strtol(const char *s, char **end, int base) {
     /* The magnitude may reach LONG_MAX, or one more for a negative number
      * (LONG_MIN). Past that the value stays at the limit, but the digits
      * are still read to their end. */
-    uint limit = negative ? 0x80000000u : 0x7fffffffu;
-    uint n = 0;
+    unsigned long limit = negative ? 0ul - (unsigned long)LONG_MIN : (unsigned long)LONG_MAX;
+    unsigned long n = 0;
     const char *first = p;
     if (base >= 2 && base <= 36) {
         while (digit_value(*p) < base) {
-            uint d = (uint)digit_value(*p);
+            unsigned long d = (unsigned long)digit_value(*p);
             /* n * base + d > limit, without overflowing to find out. */
-            if (n > (limit - d) / (uint)base) {
+            if (n > (limit - d) / (unsigned long)base) {
                 n = limit;
             } else {
-                n = n * (uint)base + d;
+                n = n * (unsigned long)base + d;
             }
             p++;
         }
@@ -69,5 +69,5 @@ long strtol(const char *s, char **end, int base) {
         *end = (char *)(p == first ? s : p);
     }
     /* Negated as unsigned, so LONG_MIN works. */
-    return negative ? (long)(0u - n) : (long)n;
+    return negative ? (long)(0ul - n) : (long)n;
 }

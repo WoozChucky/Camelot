@@ -363,13 +363,12 @@ pub fn userprogs(kernel_dir: &Path) -> Result<String, String> {
     crate::userprogs::generated(&kernel_dir.join(USER_DIR))
 }
 
-/// [`userprogs`] for the `xlen` kernel: the RV64 kernel has no programs of
-/// its own until the user programs are built for RV64 (#156), so its table is
-/// [`crate::userprogs::empty`], as the disk kernel's.
+/// [`userprogs`] for the `xlen` kernel: on RV64 the programs built for RV64
+/// ([`crate::userprogs::generated_for`]).
 pub fn userprogs_for(kernel_dir: &Path, xlen: Xlen) -> Result<String, String> {
     match xlen {
         Xlen::Rv32 => userprogs(kernel_dir),
-        Xlen::Rv64 => Ok(crate::userprogs::empty()),
+        Xlen::Rv64 => crate::userprogs::generated_for(&kernel_dir.join(USER_DIR), xlen),
     }
 }
 
@@ -626,12 +625,6 @@ impl Build {
             return Ok(None);
         }
         let path = self.kernel_dir.join(self.userprogs_path());
-        if self.xlen == Xlen::Rv64 && self.userprogs.is_none() {
-            // No RV64 user programs yet (#156).
-            let text = crate::userprogs::empty();
-            std::fs::write(&path, &text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-            return Ok(Some(text));
-        }
         if self.userprogs.is_some() {
             let text =
                 std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -643,11 +636,25 @@ impl Build {
                 self.userprogs_path().display()
             );
         }
-        let programs = crate::userprogs::build_all(&self.kernel_dir.join(USER_DIR))?;
-        let text = crate::userprogs::generate(
-            &crate::userprogs::embedded(&programs),
-            crate::userprogs::CCompiler::Merlin,
-        );
+        let user = self.kernel_dir.join(USER_DIR);
+        let (programs, text) = match self.xlen {
+            Xlen::Rv32 => {
+                let programs = crate::userprogs::build_all(&user)?;
+                let text = crate::userprogs::generate(
+                    &crate::userprogs::embedded(&programs),
+                    crate::userprogs::CCompiler::Merlin,
+                );
+                (programs, text)
+            }
+            // The programs the RV64 kernel embeds: /bin/as and /bin/ld are
+            // RV32 programs until #157.
+            Xlen::Rv64 => {
+                let programs = crate::userprogs::build_embedded_for(&user, self.xlen)?;
+                let text =
+                    crate::userprogs::generate_for(&programs, crate::userprogs::CCompiler::Merlin, self.xlen);
+                (programs, text)
+            }
+        };
         std::fs::write(&path, &text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         // The programs with their debug information, for merlin-dbg's
         // `add-symbol-file` (the kernel embeds them without).

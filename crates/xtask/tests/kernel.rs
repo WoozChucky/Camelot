@@ -3779,6 +3779,11 @@ fn the_system_call_document_matches_the_code() {
     };
     assert_eq!(defines(&header, "SYS_"), sys(&calls), "syscall.h");
     assert_eq!(defines(&usys, "SYS_"), sys(&calls), "usys.s");
+    // A call's declaration in user.h: `type name(...);`, or `type *name(...);`
+    // for one that returns a pointer (sbrk).
+    let declares = |l: &str, name: &str| {
+        (l.contains(&format!(" {name}(")) || l.contains(&format!(" *{name}("))) && l.ends_with(");")
+    };
     for (_, name) in &calls {
         // A stub in usys.s that uses the number, and a declaration in user.h.
         assert!(
@@ -3788,9 +3793,7 @@ fn the_system_call_document_matches_the_code() {
             "usys.s: no stub for {name}"
         );
         assert!(
-            user_h
-                .lines()
-                .any(|l| l.contains(&format!(" {name}(")) && l.ends_with(");")),
+            user_h.lines().any(|l| declares(l, name)),
             "user.h: no declaration of {name}"
         );
     }
@@ -3806,10 +3809,7 @@ fn the_system_call_document_matches_the_code() {
         let [args, returns] = cells[..] else {
             panic!("{name}: {cells:?}");
         };
-        let decl = user_h
-            .lines()
-            .find(|l| l.contains(&format!(" {name}(")) && l.ends_with(");"))
-            .unwrap();
+        let decl = user_h.lines().find(|l| declares(l, &name)).unwrap();
         let params = &decl[decl.find('(').unwrap() + 1..decl.len() - 2];
         let params = if params == "void" { "" } else { params };
         assert_eq!(

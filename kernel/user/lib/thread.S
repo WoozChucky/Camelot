@@ -6,6 +6,20 @@
 # thread_entry to start at instead, with the function and its argument on
 # the new stack, where thread_entry finds them, calls the function, and
 # ends the thread with what it returns.
+#
+# Both widths: the two slots are pointers, a register wide, stored and
+# loaded with REG_S and REG_L (glibc's sys/asm.h names): sw and lw on RV32,
+# sd and ld on RV64.
+
+#if __riscv_xlen == 64
+#define REG_S sd
+#define REG_L ld
+#define SZREG 8
+#else
+#define REG_S sw
+#define REG_L lw
+#define SZREG 4
+#endif
 
     .text
 
@@ -17,16 +31,16 @@ thread_start:
     add   a2, a2, a3            # the top of the stack,
     andi  a2, a2, -16           # 16-byte aligned, as the ABI wants sp
     addi  a2, a2, -16           # and a slot for fn and arg on it
-    sw    a0, 0(a2)
-    sw    a1, 4(a2)
+    REG_S a0, 0(a2)
+    REG_S a1, SZREG(a2)
     la    a0, thread_entry
     mv    a1, a2                # (the argument is unused)
     tail  thread_create         # its result is ours
 
 # The new thread: sp points at fn and arg. fn's frame goes below them.
 thread_entry:
-    lw    t0, 0(sp)
-    lw    a0, 4(sp)
+    REG_L t0, 0(sp)
+    REG_L a0, SZREG(sp)
     jalr  t0
     call  thread_exit           # fn's return value is already in a0
 1:  j     1b                    # thread_exit never returns

@@ -44,8 +44,19 @@
 /* The console's device number (CONSOLE in kernel/include/file.h). */
 #define CONSOLE 1
 #define PAGE 4096
-/* Where the heap may grow to (USER_LOAD_TOP in kernel/include/vm.h). */
-#define USER_LOAD_TOP 0x0b7ff000
+/* Where the heap may grow to (USER_LOAD_TOP in kernel/include/vm.h): a
+ * guard page under the stack's 8 MiB under USER_TOP. USER_TOP is 0x0c000000
+ * on RV32, and on RV64 depends on the paging mode, so main() finds it: the
+ * arguments are in the stack's last page. */
+static unsigned long user_top;
+#define USER_LOAD_TOP (user_top - (8ul << 20) - PAGE)
+/* An address in the kernel's part of the address space: its first page on
+ * RV32, the kernel image's link address on RV64 (the upper half). */
+#ifdef _LP64
+#define KERNEL_ADDR 0xffffffff80000000ul
+#else
+#define KERNEL_ADDR 0x80000000ul
+#endif
 
 static int checks;
 static int failures;
@@ -58,12 +69,18 @@ static void check(int ok, const char *what) {
     }
 }
 
-static void check_eq(int got, int want, const char *what) {
+static void check_eq(long got, long want, const char *what) {
     checks++;
     if (got != want) {
         failures++;
-        printf("systest: FAILED: %s: got %d, want %d\n", what, got, want);
+        printf("systest: FAILED: %s: got %ld, want %ld\n", what, got, want);
     }
+}
+
+/* sbrk's result as a number: the old end of the heap, or minus an error
+ * number. */
+static long brk_by(long increment) {
+    return (long)sbrk(increment);
 }
 
 /* systest sbrk N: grows the heap by N bytes, and prints
@@ -72,13 +89,13 @@ static void check_eq(int got, int want, const char *what) {
  * through: then the call must have changed nothing, the pages it had mapped
  * already given back. Exits 0 if the heap is as it should be afterwards. */
 static int grow(int n) {
-    int base = sbrk(0);
-    int got = sbrk(n);
-    printf("systest: sbrk %d: %d\n", n, got < 0 ? got : 0);
+    long base = brk_by(0);
+    long got = brk_by(n);
+    printf("systest: sbrk %d: %d\n", n, got < 0 ? (int)got : 0);
     if (got >= 0) {
-        return got == base && sbrk(0) == base + n ? 0 : 1;
+        return got == base && brk_by(0) == base + n ? 0 : 1;
     }
-    if (sbrk(0) != base) {
+    if (brk_by(0) != base) {
         return 2;
     }
     /* Nothing is mapped past the end: wait checks that it can store the
@@ -87,7 +104,7 @@ static int grow(int n) {
         return 3;
     }
     /* And the heap grows again from there. */
-    if (sbrk(PAGE) != base) {
+    if (brk_by(PAGE) != base) {
         return 4;
     }
     *(int *)base = 1;
@@ -106,7 +123,7 @@ static int pipe_write(int n) {
         for (int i = 0; i < m; i++) {
             buf[i] = pattern(done + i);
         }
-        if (write(STDOUT, buf, (uint)m) != m) {
+        if (write(STDOUT, buf, (size_t)m) != m) {
             return 1;
         }
         done += m;
@@ -179,7 +196,7 @@ static int exec_fail(void) {
     }
     many[MAXARG + 1] = NULL;
     if (exec("/bin/nope", NULL) != -ENOENT || exec("", NULL) != -ENOENT ||
-        exec("/bin/systest", many) != -E2BIG || exec("/bin/systest", (char **)0x80000000u) != -EFAULT) {
+        exec("/bin/systest", many) != -E2BIG || exec("/bin/systest", (char **)KERNEL_ADDR) != -EFAULT) {
         return 1;
     }
     return 0;
@@ -243,7 +260,7 @@ static int child(int argc, char **argv) {
         }
         /* The strings and the array are on the stack, above sp. */
         int here;
-        if ((uint)argv < (uint)&here || (uint)argv[0] < (uint)argv) {
+        if ((uintptr_t)argv < (uintptr_t)&here || (uintptr_t)argv[0] < (uintptr_t)argv) {
             return 1;
         }
         return 0;
@@ -277,6 +294,17 @@ static void test_simple_calls(void) {
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
     check_eq(syscall(47, 0, 0, 0), -ENOSYS, "call 47");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
+    /* The result is a long, sign-extended in a0: an error is negative
+     * whatever the width, as a long and as an ssize_t (read's). */
+    char c;
+    long r = syscall(3, STDOUT, (long)&c, 1);
+    check(r == -(long)EBADF && r < 0, "a negative result is a negative long");
+    check(read(STDOUT, &c, 1) == -(ssize_t)EBADF, "and a negative ssize_t");
+    check((unsigned long)r >> (8 * sizeof(long) - 1) == 1, "its top bit set");
+#ifdef _LP64
+    /* The number is all of a7, as on Linux: 2^32 + 4 is not getpid (4). */
+    check_eq(syscall(0x100000004l, 0, 0, 0), -ENOSYS, "call 2^32 + 4");
+#endif
 }
 
 static void test_files(void) {
@@ -379,11 +407,11 @@ static void test_spawn_and_wait(void) {
 }
 
 static void test_sbrk(void) {
-    int base = sbrk(0);
+    long base = brk_by(0);
     check(base > 0 && base % PAGE == 0, "the heap starts on a page boundary");
-    check(base > (int)(uint)test_sbrk, "above the program");
-    check_eq(sbrk(3 * PAGE + 10), base, "grow by three pages and a bit");
-    check_eq(sbrk(0), base + 3 * PAGE + 10, "the new end");
+    check(base > (long)(uintptr_t)test_sbrk, "above the program");
+    check_eq(brk_by(3 * PAGE + 10), base, "grow by three pages and a bit");
+    check_eq(brk_by(0), base + 3 * PAGE + 10, "the new end");
     char *heap = (char *)base;
     int zero = 1;
     for (int i = 0; i < 3 * PAGE + 10; i++) {
@@ -394,24 +422,25 @@ static void test_sbrk(void) {
     check_eq(heap[PAGE + 5], (char)(PAGE + 5), "and takes stores");
     /* The pages beyond the end are not mapped: a write from there fails. */
     check_eq(write(STDOUT, heap + 4 * PAGE, 1), -EFAULT, "nothing past the last page");
-    check_eq(sbrk(-(2 * PAGE + 20)), base + 3 * PAGE + 10, "shrink");
+    check_eq(brk_by(-(2 * PAGE + 20)), base + 3 * PAGE + 10, "shrink");
     check_eq(write(STDOUT, heap + 2 * PAGE, 1), -EFAULT, "the freed page is gone");
     check_eq(heap[PAGE - 11], (char)(PAGE - 11), "the kept bytes are still there");
-    check_eq(sbrk(PAGE), base + PAGE - 10, "grow again");
+    check_eq(brk_by(PAGE), base + PAGE - 10, "grow again");
     zero = 1;
     for (int i = PAGE - 10; i < 2 * PAGE - 10; i++) {
         zero &= heap[i] == 0;
     }
     check(zero, "regrown memory reads zero, the kept page's tail too");
     check_eq(heap[100], 100, "and the rest is kept");
-    int end = base + 2 * PAGE - 10;
-    check_eq(sbrk(-(1 << 30)), -EINVAL, "shrink below the start");
-    check_eq(sbrk(base - end - 1), -EINVAL, "shrink one byte below the start");
-    check_eq(sbrk(USER_LOAD_TOP - end + 1), -ENOMEM, "grow one byte into the guard page");
-    check_eq(sbrk(0x7fffffff), -ENOMEM, "grow past the end of user space");
-    check_eq(sbrk(0), end, "failed calls change nothing");
-    check_eq(sbrk(base - end), end, "back to empty");
-    check_eq(sbrk(0), base, "empty");
+    long end = base + 2 * PAGE - 10;
+    check_eq(brk_by(-(1 << 30)), -EINVAL, "shrink below the start");
+    check_eq(brk_by(base - end - 1), -EINVAL, "shrink one byte below the start");
+    check_eq(brk_by((long)USER_LOAD_TOP - end + 1), -ENOMEM, "grow one byte into the guard page");
+    check_eq(brk_by(LONG_MAX), -ENOMEM, "grow past the end of user space");
+    check_eq(brk_by(LONG_MIN), -EINVAL, "shrink by the most there is");
+    check_eq(brk_by(0), end, "failed calls change nothing");
+    check_eq(brk_by(base - end), end, "back to empty");
+    check_eq(brk_by(0), base, "empty");
     check_eq(write(STDOUT, heap, 1), -EFAULT, "with no page left");
 }
 
@@ -688,7 +717,7 @@ static void test_procs_and_kill(void) {
     }
     struct procinfo *p = find_proc(info, n, me);
     check(p != NULL && p->state == PROC_RUNNING && strcmp(p->name, "systest") == 0, "this one is running");
-    check(p != NULL && (int)p->size == sbrk(0), "its size is the end of its heap");
+    check(p != NULL && (long)p->size == brk_by(0), "its size is the end of its heap");
     p = find_proc(info, n, child);
     check(p != NULL && (int)p->ppid == me && p->state == PROC_SLEEPING, "the sleeper is this one's child");
     check_eq(procs(NULL, 0), n, "procs counts with no room");
@@ -851,6 +880,7 @@ static void test_network_without_a_card(void) {
 }
 
 int main(int argc, char **argv) {
+    user_top = ((uintptr_t)argv[0] + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
     if (argc > 1) {
         return child(argc, argv);
     }

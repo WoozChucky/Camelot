@@ -63,18 +63,18 @@ there is a filesystem to look it up in.
 | Number | Name | Arguments | Returns |
 |---|---|---|---|
 | 1 | `exit` | `int status` | does not return |
-| 2 | `write` | `int fd, const void *buf, uint len` | bytes written; `-EBADF`, `-EFAULT`, `-EPIPE`, `-ENOSPC`, `-EFBIG`, `-EINVAL`, `-ENOMEM` |
-| 3 | `read` | `int fd, void *buf, uint len` | bytes read, 0 at the end of the input; `-EBADF`, `-EFAULT`, `-ENOMEM` |
+| 2 | `write` | `int fd, const void *buf, size_t len` | bytes written; `-EBADF`, `-EFAULT`, `-EPIPE`, `-ENOSPC`, `-EFBIG`, `-EINVAL`, `-ENOMEM` |
+| 3 | `read` | `int fd, void *buf, size_t len` | bytes read, 0 at the end of the input; `-EBADF`, `-EFAULT`, `-ENOMEM` |
 | 4 | `getpid` | | the caller's pid |
 | 5 | `yield` | | 0 |
 | 6 | `sleep` | `uint ticks` | 0 |
 | 7 | `spawn` | `const char *path, char *const argv[]` | the child's pid; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-EAGAIN`, `-ENOMEM`, `-EFAULT` |
 | 8 | `wait` | `int pid, int *status` | the pid of the child collected; `-ECHILD`, `-EFAULT` |
-| 9 | `sbrk` | `int increment` | the old end of the heap; `-ENOMEM`, `-EINVAL` |
+| 9 | `sbrk` | `long increment` | the old end of the heap, a pointer; `-ENOMEM`, `-EINVAL` |
 | 10 | `uptime` | | timer ticks since boot |
 | 11 | `open` | `const char *path, int flags` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EISDIR`, `-ENODEV`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
 | 12 | `close` | `int fd` | 0; `-EBADF` |
-| 13 | `lseek` | `int fd, int offset, int whence` | the new offset; `-EBADF`, `-ESPIPE`, `-EINVAL` |
+| 13 | `lseek` | `int fd, off_t offset, int whence` | the new offset; `-EBADF`, `-ESPIPE`, `-EINVAL` |
 | 14 | `fstat` | `int fd, struct stat *st` | 0; `-EBADF`, `-EFAULT` |
 | 15 | `mkdir` | `const char *path` | 0; `-EEXIST`, `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-ENOSPC`, `-EROFS`, `-EFAULT` |
 | 16 | `unlink` | `const char *path` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EINVAL`, `-ENOTEMPTY`, `-EROFS`, `-EFAULT` |
@@ -93,10 +93,10 @@ there is a filesystem to look it up in.
 | 29 | `listen` | `int fd, int backlog` | 0; `-EBADF`, `-ENOTSOCK`, `-EOPNOTSUPP`, `-EINVAL` |
 | 30 | `accept` | `int fd, struct sockaddr_in *addr` | a new descriptor; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EOPNOTSUPP`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EAGAIN`, `-EINTR` |
 | 31 | `connect` | `int fd, const struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EINVAL`, `-EISCONN`, `-ENETUNREACH`, `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT`, `-ENOBUFS`, `-EADDRINUSE`, `-EINTR` |
-| 32 | `send` | `int fd, const void *buf, uint len` | bytes sent; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EPIPE`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EDESTADDRREQ`, `-EMSGSIZE`, `-ENETUNREACH`, `-ENOBUFS`, `-EINTR` |
-| 33 | `recv` | `int fd, void *buf, uint len` | bytes received, 0 at the end; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EINVAL`, `-EAGAIN`, `-EINTR` |
-| 34 | `sendto` | `int fd, const void *buf, uint len, const struct sockaddr_in *to` | bytes sent; `send`'s errors, `-EFAULT` also for `to`, `-EAFNOSUPPORT`, `-EINVAL`, `-EADDRINUSE` |
-| 35 | `recvfrom` | `int fd, void *buf, uint len, struct sockaddr_in *from` | bytes received; `recv`'s errors (`-EFAULT` also for `from`) |
+| 32 | `send` | `int fd, const void *buf, size_t len` | bytes sent; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EPIPE`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EDESTADDRREQ`, `-EMSGSIZE`, `-ENETUNREACH`, `-ENOBUFS`, `-EINTR` |
+| 33 | `recv` | `int fd, void *buf, size_t len` | bytes received, 0 at the end; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EINVAL`, `-EAGAIN`, `-EINTR` |
+| 34 | `sendto` | `int fd, const void *buf, size_t len, const struct sockaddr_in *to` | bytes sent; `send`'s errors, `-EFAULT` also for `to`, `-EAFNOSUPPORT`, `-EINVAL`, `-EADDRINUSE` |
+| 35 | `recvfrom` | `int fd, void *buf, size_t len, struct sockaddr_in *from` | bytes received; `recv`'s errors (`-EFAULT` also for `from`) |
 | 36 | `shutdown` | `int fd, int how` | 0; `-EBADF`, `-ENOTSOCK`, `-EINVAL`, `-ENOTCONN`, `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT` |
 | 37 | `getsockname` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT` |
 | 38 | `getpeername` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN` |

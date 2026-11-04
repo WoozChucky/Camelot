@@ -39,11 +39,11 @@ static void check(int ok, const char *what) {
     }
 }
 
-static void check_eq(int got, int want, const char *what) {
+static void check_eq(long got, long want, const char *what) {
     checks++;
     if (got != want) {
         failures++;
-        printf("filetest: FAILED: %s: got %d, want %d\n", what, got, want);
+        printf("filetest: FAILED: %s: got %ld, want %ld\n", what, got, want);
     }
 }
 
@@ -150,6 +150,20 @@ static void test_read_write_seek(void) {
     check_eq(lseek(fd, 0x7fffffff, SEEK_CUR), -EINVAL, "an offset that would overflow");
     check_eq(lseek(fd, -10, SEEK_END), 4990, "seek from the end");
     check_eq(read(fd, buf, 20), 10, "read the last 10 bytes");
+#ifdef _LP64
+    /* RV64: an off_t is 64 bits, all of them the offset. Past the end is
+     * past the largest file too (2^32 blocks of 1 KiB, 2^42 bytes), and
+     * fails the same way, never as the offset's low 32 bits would: 2^32 +
+     * 100 is not 100. */
+    check(sizeof(off_t) == 8 && sizeof(st.size) == 8 && sizeof(struct stat) == 24, "a 64-bit off_t");
+    check_eq(lseek(fd, 0x100000000l + 100, SEEK_SET), -EINVAL, "2^32 + 100 is past the end, not 100");
+    check_eq(lseek(fd, 0x40000000000l + 1, SEEK_SET), -EINVAL, "past the largest file");
+    check_eq(lseek(fd, LONG_MAX, SEEK_SET), -EINVAL, "LONG_MAX");
+    check_eq(lseek(fd, LONG_MAX, SEEK_END), -EINVAL, "LONG_MAX from the end");
+    check_eq(lseek(fd, LONG_MIN, SEEK_END), -EINVAL, "LONG_MIN from the end");
+    check_eq(lseek(fd, -0x100000000l + 4990, SEEK_END), -EINVAL, "before the start by 2^32 - 10");
+    check_eq(lseek(fd, 0, SEEK_CUR), 4990, "and the offset is where it was");
+#endif
     check_eq(lseek(fd, 100, SEEK_SET), 100, "seek into the middle");
     check_eq(write(fd, "XYZ", 3), 3, "write in the middle");
     check_eq(lseek(fd, -3, SEEK_CUR), 100, "seek back over it");

@@ -1,7 +1,7 @@
 //! The user programs embedded in the kernel (`kernel/user/`, spec section 10,
 //! "Kernel processes").
 //!
-//! Every `kernel/user/*.c` and `*.s` is one program, but for the runtime
+//! Every `kernel/user/*.c`, `*.s` and `*.S` is one program, but for the runtime
 //! linked into each of them ([`RUNTIME`]: `crt0.s` and the system call stubs
 //! `usys.s`), and so is every subdirectory but `lib/`: a program of several
 //! files (`kernel/user/as/*.c` is `as`), each compiled and assembled on its
@@ -27,9 +27,15 @@
 //! compile the C files to assembly instead ([`compile_clang`], into a
 //! scratch directory) and builds the same programs from that
 //! ([`build_all_with`], [`CCompiler::Clang`]).
+//!
+//! Both widths (#141): the RV32 kernel's programs are ILP32 RV32 ELF32
+//! executables, the RV64 kernel's LP64 RV64 ELF64 ones ([`build_all_for`],
+//! [`generate_for`]), from the same sources: merlin compiles the C for the
+//! width, and a `.S` file is preprocessed for it first (`#if __riscv_xlen`),
+//! as the kernel's are; a `.s` file is the same text for both.
 
 use crate::kernel::TARGET_FLAGS;
-use crate::toolchain;
+use crate::toolchain::{self, Xlen};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,6 +49,10 @@ pub const RUNTIME: &[&str] = &["crt0.s", "usys.s"];
 pub const LIB_DIR: &str = "lib";
 /// The linker script every program is linked with.
 pub const SCRIPT: &str = "user.ld";
+/// Programs written in RV32 assembly that only the RV32 kernel builds in
+/// (#156 ports them, or #159 drops them with RV32).
+pub const RV32_ONLY: &[&str] = &[];
+
 /// Programs the root image's `/bin` holds but the kernel does not build in:
 /// they read and write files, which a machine without a disk has none of,
 /// and their copies would not fit in the 2 MiB the kernel boots in (`as` is
@@ -98,6 +108,9 @@ pub const C_FLAGS: &[&str] = &[
 pub enum Lang {
     C,
     Asm,
+    /// Assembly with C preprocessor directives (`.S`), preprocessed by merlin
+    /// for the width being built.
+    AsmCpp,
     /// A program of several files, in the subdirectory of its name: the
     /// `.c` and `.s` files there are its parts ([`Source::parts`]).
     Dir,
@@ -119,6 +132,7 @@ impl Source {
         match self.lang {
             Lang::C => format!("{}.c", self.stem),
             Lang::Asm => format!("{}.s", self.stem),
+            Lang::AsmCpp => format!("{}.S", self.stem),
             Lang::Dir => format!("{}/", self.stem),
         }
     }
@@ -148,6 +162,11 @@ impl Source {
             Some(Source {
                 stem: stem.to_string(),
                 lang: Lang::C,
+            })
+        } else if let Some(stem) = file.strip_suffix(".S") {
+            Some(Source {
+                stem: stem.to_string(),
+                lang: Lang::AsmCpp,
             })
         } else {
             file.strip_suffix(".s").map(|stem| Source {
@@ -196,8 +215,8 @@ pub fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-/// Every `.c` and `.s` file directly in `dir`, the runtime's included, by
-/// file name.
+/// Every `.c`, `.s` and `.S` file directly in `dir`, the runtime's included,
+/// by file name.
 pub fn sources(dir: &Path) -> Result<Vec<Source>, String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
     let mut out = Vec::new();
@@ -284,17 +303,27 @@ pub fn program_names(dir: &Path) -> Result<Vec<String>, String> {
     Ok(programs(dir)?.into_iter().map(|s| s.stem).collect())
 }
 
-/// The assembly for `src` (in `dir`): the file itself, merlin's output for
-/// a C file, or clang's. Also returns the name errors in it are shown under.
-fn asm_text(dir: &Path, src: &Source, cc: CCompiler) -> Result<(String, String), String> {
+/// The assembly for `src` (in `dir`) for `xlen`: the file itself, a `.S`
+/// file as merlin preprocesses it, merlin's output for a C file, or clang's.
+/// Also returns the name errors in it are shown under.
+fn asm_text(dir: &Path, src: &Source, cc: CCompiler, xlen: Xlen) -> Result<(String, String), String> {
     let read = |path: &Path| {
         std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
     };
     match (src.lang, cc) {
         (Lang::Asm, _) => Ok((format!("{USER_DIR}/{}", src.file()), read(&dir.join(src.file()))?)),
+        (Lang::AsmCpp, _) => {
+            let text = toolchain::preprocess_asm(dir, &src.file(), &[], xlen).map_err(|e| {
+                e.lines()
+                    .map(|l| format!("{USER_DIR}/{l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
+            Ok((format!("{USER_DIR}/{}", src.file()), text))
+        }
         (Lang::C, CCompiler::Merlin) => {
             // Errors read `kernel/user/x.c:line:col: error: ...`.
-            let asm = toolchain::compile_c(dir, &src.file(), &[], USER_DIR).map_err(|e| {
+            let asm = toolchain::compile_c_for(dir, &src.file(), &[], USER_DIR, xlen).map_err(|e| {
                 e.lines()
                     .map(|l| format!("{USER_DIR}/{l}"))
                     .collect::<Vec<_>>()
@@ -315,34 +344,46 @@ fn runtime() -> Vec<Source> {
     RUNTIME.iter().filter_map(|f| Source::from_file(f)).collect()
 }
 
-/// `src` (in `dir`) compiled by `cc` if it is C, and assembled.
-fn object(dir: &Path, src: &Source, cc: CCompiler) -> Result<merlin_ld::Input, String> {
-    let (shown, text) = asm_text(dir, src, cc)?;
+/// `src` (in `dir`) compiled by `cc` if it is C (preprocessed if it is
+/// `.S`), and assembled, for `xlen`.
+fn object(dir: &Path, src: &Source, cc: CCompiler, xlen: Xlen) -> Result<merlin_ld::Input, String> {
+    let (shown, text) = asm_text(dir, src, cc, xlen)?;
     Ok(merlin_ld::Input {
         name: format!("{}.o", src.file()),
-        data: toolchain::assemble(&shown, &text)?,
+        data: toolchain::assemble_for(&shown, &text, xlen)?,
     })
 }
 
 /// What every program is linked with: the runtime's objects, and the
-/// library's, of which each program takes the ones it needs.
+/// library's, of which each program takes the ones it needs, built for
+/// `xlen`.
 pub struct Runtime {
     pub objects: Vec<merlin_ld::Input>,
     pub library: Vec<merlin_ld::Input>,
+    pub xlen: Xlen,
 }
 
-/// Builds the [`RUNTIME`] and the library in `dir`, their C compiled by
-/// `cc`.
+/// Builds the [`RUNTIME`] and the library in `dir` for RV32, their C
+/// compiled by `cc`.
 pub fn build_runtime(dir: &Path, cc: CCompiler) -> Result<Runtime, String> {
+    build_runtime_for(dir, cc, Xlen::Rv32)
+}
+
+/// [`build_runtime`] for `xlen`.
+pub fn build_runtime_for(dir: &Path, cc: CCompiler, xlen: Xlen) -> Result<Runtime, String> {
     let objects = runtime()
         .iter()
-        .map(|s| object(dir, s, cc))
+        .map(|s| object(dir, s, cc, xlen))
         .collect::<Result<_, _>>()?;
     let library = library(dir)?
         .iter()
-        .map(|s| object(dir, s, cc))
+        .map(|s| object(dir, s, cc, xlen))
         .collect::<Result<_, _>>()?;
-    Ok(Runtime { objects, library })
+    Ok(Runtime {
+        objects,
+        library,
+        xlen,
+    })
 }
 
 /// Links program `prog` from `dir`: it compiled by `cc` (C) and assembled,
@@ -366,7 +407,8 @@ pub fn link_program(dir: &Path, prog: &Source, cc: CCompiler, rt: &Runtime) -> R
 }
 
 /// The objects [`link_program`] links `prog` from before the library's: its
-/// own (each part compiled by `cc` and assembled), then the runtime's.
+/// own (each part compiled by `cc` and assembled, for the runtime's width),
+/// then the runtime's.
 pub fn program_objects(
     dir: &Path,
     prog: &Source,
@@ -375,7 +417,7 @@ pub fn program_objects(
 ) -> Result<Vec<merlin_ld::Input>, String> {
     let mut inputs = Vec::new();
     for part in prog.parts(dir)? {
-        inputs.push(object(dir, &part, cc)?);
+        inputs.push(object(dir, &part, cc, rt.xlen)?);
     }
     inputs.extend(rt.objects.iter().cloned());
     Ok(inputs)
@@ -410,6 +452,36 @@ pub fn build_all_with(dir: &Path, cc: CCompiler) -> Result<Vec<Program>, String>
         .iter()
         .map(|prog| link_program(dir, prog, cc, &rt))
         .collect()
+}
+
+/// Builds the programs of `dir` the `xlen` kernel embeds ([`embedded`]: all
+/// but [`DISK_ONLY`]), by name, with our own tools. On RV64 also not
+/// [`RV32_ONLY`], which are RV32 assembly.
+pub fn build_embedded_for(dir: &Path, xlen: Xlen) -> Result<Vec<Program>, String> {
+    let progs: Vec<Source> = programs(dir)?
+        .into_iter()
+        .filter(|p| !DISK_ONLY.contains(&p.stem.as_str()))
+        .filter(|p| xlen == Xlen::Rv32 || !RV32_ONLY.contains(&p.stem.as_str()))
+        .collect();
+    let rt = build_runtime_for(dir, CCompiler::Merlin, xlen)?;
+    progs
+        .iter()
+        .map(|prog| link_program(dir, prog, CCompiler::Merlin, &rt))
+        .collect()
+}
+
+/// [`build_named`] for `xlen`.
+pub fn build_named_for(dir: &Path, name: &str, xlen: Xlen) -> Result<Program, String> {
+    let prog = programs(dir)?
+        .into_iter()
+        .find(|s| s.stem == name)
+        .ok_or_else(|| format!("no program called {name} in {}", dir.display()))?;
+    link_program(
+        dir,
+        &prog,
+        CCompiler::Merlin,
+        &build_runtime_for(dir, CCompiler::Merlin, xlen)?,
+    )
 }
 
 /// Builds every program in `dir` with our own tools, by name.
@@ -510,12 +582,20 @@ fn emit_bytes(out: &mut String, bytes: &[u8]) {
     }
 }
 
-/// The text of the kernel's `userprogs.s` for `programs`: the table
-/// `user_programs` (one `struct user_program { const char *name; const u8
-/// *elf; u32 size; }` per program, in order), `user_program_count`, then the
-/// names and the images, each image 4-byte aligned under a global label
-/// `user_elf_<name>`. `cc` is what compiled their C, which the header says.
+/// The text of the RV32 kernel's `userprogs.s` for `programs`
+/// ([`generate_for`]).
 pub fn generate<P: std::borrow::Borrow<Program>>(programs: &[P], cc: CCompiler) -> String {
+    generate_for(programs, cc, Xlen::Rv32)
+}
+
+/// The text of the `xlen` kernel's `userprogs.s` for `programs`: the table
+/// `user_programs` (one `struct user_program { const char *name; const u8
+/// *elf; u32 size; }` per program, in order: 12 bytes on RV32, `.word`s; 24
+/// on RV64, two `.dword` pointers, the size and a word of padding, the
+/// table 8-byte aligned), `user_program_count`, then the names and the
+/// images, each image 4-byte aligned under a global label
+/// `user_elf_<name>`. `cc` is what compiled their C, which the header says.
+pub fn generate_for<P: std::borrow::Borrow<Program>>(programs: &[P], cc: CCompiler, xlen: Xlen) -> String {
     let programs: &[&Program] = &programs.iter().map(|p| p.borrow()).collect::<Vec<_>>();
     let mut s = String::new();
     let cc = match cc {
@@ -535,17 +615,29 @@ pub fn generate<P: std::borrow::Borrow<Program>>(programs: &[P], cc: CCompiler) 
          #   struct user_program {{ const char *name; const u8 *elf; u32 size; }};\n\
          \n\
          \x20   .section .rodata\n\
-         \x20   .align 2\n\
+         \x20   .align {align}\n\
          \x20   .globl user_programs\n\
-         user_programs:\n"
+         user_programs:\n",
+        align = match xlen {
+            Xlen::Rv32 => 2,
+            Xlen::Rv64 => 3,
+        }
     );
     for p in programs {
-        let _ = writeln!(
-            s,
-            "    .word user_name_{0}, user_elf_{0}, {1}",
-            p.name,
-            p.elf.len()
-        );
+        let _ = match xlen {
+            Xlen::Rv32 => writeln!(
+                s,
+                "    .word user_name_{0}, user_elf_{0}, {1}",
+                p.name,
+                p.elf.len()
+            ),
+            Xlen::Rv64 => writeln!(
+                s,
+                "    .dword user_name_{0}, user_elf_{0}\n    .word {1}, 0",
+                p.name,
+                p.elf.len()
+            ),
+        };
     }
     let _ = write!(
         s,
@@ -589,6 +681,15 @@ pub fn empty() -> String {
 /// the [`DISK_ONLY`] ones.
 pub fn generated(dir: &Path) -> Result<String, String> {
     Ok(generate(&embedded(&build_all(dir)?), CCompiler::Merlin))
+}
+
+/// [`generated`] for `xlen` ([`build_embedded_for`], [`generate_for`]).
+pub fn generated_for(dir: &Path, xlen: Xlen) -> Result<String, String> {
+    Ok(generate_for(
+        &build_embedded_for(dir, xlen)?,
+        CCompiler::Merlin,
+        xlen,
+    ))
 }
 
 #[cfg(test)]

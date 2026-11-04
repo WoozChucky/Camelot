@@ -4,8 +4,8 @@
  * the early page table); its return value becomes the exit code. After
  * booting, kmain starts the other harts, if the machine has any (smp.c),
  * runs the user-space shell as the first process, and returns when it
- * exits. The RV64 kernel has no user space yet (#155): it stops after the
- * boot self-tests. */
+ * exits: on RV64 a 64-bit program in the lower half of the address space
+ * (vm.h), with the LP64 system call ABI (syscall.h). */
 #include "bio.h"
 #include "blk.h"
 #include "blktest.h"
@@ -318,7 +318,6 @@ static void deliberate_fault(void) {
     }
 }
 
-#if __riscv_xlen == 32
 /* Starts the user-space shell (kernel/user/sh.c) as the first process and
  * runs processes until it and everything it left running have ended: from
  * the root filesystem's /bin, or the kernel's own copy (exec.h). Returns its
@@ -330,7 +329,6 @@ static int run_shell(void) {
     }
     return status;
 }
-#endif
 
 /* One line per disk blk_init() found, or says there is none. */
 static void print_disks(void) {
@@ -414,12 +412,8 @@ int kmain(void) {
         kprintf("kstack: less than a quarter of the stack left\n");
         failed++;
     }
-    /* No user space on RV64 yet (#155): the boot ends here. */
-    kprintf("user space: not on RV64 yet\n");
-    return failed;
-#else
+#endif
     int status = run_shell();
     /* Failed self-tests are what the exit code reports first. */
     return failed != 0 ? failed : status;
-#endif
 }

@@ -8,24 +8,24 @@
 #include "types.h"
 #include "vm.h"
 
-int sys_read(struct trap_frame *f);
-int sys_write(struct trap_frame *f);
-int sys_open(struct trap_frame *f);
-int sys_close(struct trap_frame *f);
-int sys_lseek(struct trap_frame *f);
-int sys_fstat(struct trap_frame *f);
-int sys_mkdir(struct trap_frame *f);
-int sys_unlink(struct trap_frame *f);
-int sys_link(struct trap_frame *f);
-int sys_chdir(struct trap_frame *f);
-int sys_dup(struct trap_frame *f);
-int sys_pipe(struct trap_frame *f);
+long sys_read(struct trap_frame *f);
+long sys_write(struct trap_frame *f);
+long sys_open(struct trap_frame *f);
+long sys_close(struct trap_frame *f);
+long sys_lseek(struct trap_frame *f);
+long sys_fstat(struct trap_frame *f);
+long sys_mkdir(struct trap_frame *f);
+long sys_unlink(struct trap_frame *f);
+long sys_link(struct trap_frame *f);
+long sys_chdir(struct trap_frame *f);
+long sys_dup(struct trap_frame *f);
+long sys_pipe(struct trap_frame *f);
 
 /* Copies the path at user address `va` in `pt` to `buf` (MAXPATH + 1
  * bytes). Returns 0; -EFAULT if a byte up to its NUL is not readable user
  * memory (a path too long is still read to its end, so a bad pointer is
  * reported as one); -ENAMETOOLONG if it is longer than MAXPATH; -ENOENT if
  * it is empty. */
-int fetch_path(pagetable_t pt, u32 va, char *buf);
+int fetch_path(pagetable_t pt, uintptr va, char *buf);
 
 #endif

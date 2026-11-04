@@ -26,12 +26,12 @@ void pipeclose(struct pipe *p, bool writable);
  * pipe is empty and a write end is open: returns what was there, at most
  * `n` bytes, or 0 once it is empty with no writer left. `dst` has been
  * checked. */
-int piperead(struct pipe *p, pagetable_t pt, u32 dst, u32 n);
+isize piperead(struct pipe *p, pagetable_t pt, uintptr dst, usize n);
 
 /* Writes the `n` bytes at user address `src`, sleeping whenever the pipe
  * is full. Returns `n`; or, once no read end is open, the bytes written so
  * far, or -EPIPE if there were none. `src` has been checked. */
-int pipewrite(struct pipe *p, pagetable_t pt, u32 src, u32 n);
+isize pipewrite(struct pipe *p, pagetable_t pt, uintptr src, usize n);
 
 /* The bytes waiting in `p` (fstat's size). */
 u32 pipe_bytes(struct pipe *p);

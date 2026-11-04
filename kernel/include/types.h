@@ -21,6 +21,15 @@ typedef unsigned long usize;
 typedef signed long isize;
 typedef unsigned long uintptr;
 
+/* The system call ABI's types, Linux's (docs/camelot-syscalls.md): a file
+ * offset (off_t) and a time in seconds (time_t) are a `long`, so 64 bits on
+ * RV64 (LP64) and 32 on RV32 (ILP32, where an offset past 2^31 - 1 has no
+ * value, as on 32-bit Linux without O_LARGEFILE). A user address is a
+ * uintptr, a byte count a usize and a count or an error an isize (size_t
+ * and ssize_t). */
+typedef long off_t;
+typedef long time_t;
+
 /* A physical address, as page-table entries, satp and the devices' DMA
  * registers take them; a kernel pointer is a virtual address, and pa() and
  * va() (vm.h) convert between the two, as Linux's phys_addr_t, __pa and

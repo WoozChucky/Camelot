@@ -2,7 +2,7 @@
  * Language, section 8.7).
  *
  * The heap is a run of blocks. Each starts with a header: its size, in
- * 8-byte units counting the header itself, and, while it is free, a link to
+ * header-sized units counting the header itself, and, while it is free, a link to
  * the next free block. The free blocks form a list in address order, so a
  * block being freed can be merged with a free neighbour on either side.
  * malloc takes the first free block that is big enough (first fit), cutting
@@ -15,8 +15,10 @@
  * instruction each way when there is only one thread. */
 #include "../user.h"
 
-/* 8 bytes: a pointer and a size, which is also the alignment every block
- * gets. */
+/* A pointer and a size: 8 bytes on RV32, 16 on RV64 (the pointer's 8 and
+ * the size's 4, padded to the pointer's alignment), which is also the
+ * alignment every block gets: on RV64 the ABI's largest, 16, as glibc's
+ * malloc gives. */
 struct header {
     struct header *next; /* the next free block, while this one is free */
     uint units;          /* the block's size, in headers, its own included */
@@ -78,8 +80,8 @@ static struct header *more(uint units) {
     if (units > 0x7fffffffu / UNIT) {
         return NULL;
     }
-    int got = sbrk((int)(units * UNIT));
-    if (got < 0) {
+    char *got = sbrk((long)(units * UNIT));
+    if ((long)got < 0) {
         return NULL;
     }
     struct header *b = (struct header *)got;
@@ -127,7 +129,8 @@ void *malloc(size_t n) {
 }
 
 void *calloc(size_t count, size_t size) {
-    if (size != 0 && count > 0xffffffffu / size) {
+    /* count * size must not wrap around (a size_t). */
+    if (size != 0 && count > (size_t)-1 / size) {
         return NULL;
     }
     void *p = malloc(count * size);

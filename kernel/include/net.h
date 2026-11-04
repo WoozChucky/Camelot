@@ -209,9 +209,9 @@ u32 net_usec(u32 mtime_delta);
 u32 net_now(void);
 
 /* The system calls (docs/camelot-syscalls.md): netinfo, netconf, ping. */
-int net_sys_info(u32 uinfo);
+int net_sys_info(uintptr uinfo);
 int net_sys_conf(u32 addr, u32 mask, u32 gateway);
-int net_sys_ping(u32 addr, u32 seq, u32 ureply);
+int net_sys_ping(u32 addr, u32 seq, uintptr ureply);
 
 /* "a.b.c.d" of `addr` into `buf` (16 bytes). Returns buf. */
 char *ip_str(u32 addr, char *buf);
@@ -567,8 +567,8 @@ struct socket {
 
 /* read() and write() on a socket: recv() and send(). The user range has
  * been checked (fileread, filewrite). */
-int socket_read(struct socket *s, pagetable_t pt, u32 dst, u32 n);
-int socket_write(struct socket *s, pagetable_t pt, u32 src, u32 n);
+isize socket_read(struct socket *s, pagetable_t pt, uintptr dst, usize n);
+isize socket_write(struct socket *s, pagetable_t pt, uintptr src, usize n);
 /* fstat()'s size: the bytes a read would get now (a stream's), or the
  * length of the next datagram. */
 u32 socket_bytes(struct socket *s);
@@ -583,19 +583,22 @@ bool socket_hung_up(struct socket *s);
  * udp_close(), and the slot is free. */
 void socket_close(struct socket *s);
 
-/* The system calls (docs/camelot-syscalls.md, "Sockets"). */
+/* The system calls (docs/camelot-syscalls.md, "Sockets"): user addresses
+ * are uintptr, lengths usize, and send and receive return the bytes or an
+ * error, an isize (Linux's ssize_t). A length over INT_MAX is taken as
+ * INT_MAX, as Linux's sendto and recvfrom take it: no call moves more. */
 int sock_sys_socket(u32 domain, u32 type, u32 protocol);
-int sock_sys_bind(u32 fd, u32 uaddr);
+int sock_sys_bind(u32 fd, uintptr uaddr);
 int sock_sys_listen(u32 fd, u32 backlog);
-int sock_sys_accept(u32 fd, u32 uaddr);
-int sock_sys_connect(u32 fd, u32 uaddr);
-int sock_sys_send(u32 fd, u32 ubuf, u32 len);
-int sock_sys_recv(u32 fd, u32 ubuf, u32 len);
-int sock_sys_sendto(u32 fd, u32 ubuf, u32 len, u32 uaddr);
-int sock_sys_recvfrom(u32 fd, u32 ubuf, u32 len, u32 uaddr);
+int sock_sys_accept(u32 fd, uintptr uaddr);
+int sock_sys_connect(u32 fd, uintptr uaddr);
+isize sock_sys_send(u32 fd, uintptr ubuf, usize len);
+isize sock_sys_recv(u32 fd, uintptr ubuf, usize len);
+isize sock_sys_sendto(u32 fd, uintptr ubuf, usize len, uintptr uaddr);
+isize sock_sys_recvfrom(u32 fd, uintptr ubuf, usize len, uintptr uaddr);
 int sock_sys_shutdown(u32 fd, u32 how);
-int sock_sys_name(u32 fd, u32 uaddr, bool peer);
-int sock_sys_setsockopt(u32 fd, u32 level, u32 option, u32 uvalue, u32 len);
+int sock_sys_name(u32 fd, uintptr uaddr, bool peer);
+int sock_sys_setsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, u32 len);
 
 /* ---- DHCP (dhcp.c) ---- */
 

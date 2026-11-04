@@ -3,6 +3,11 @@
  * a0-a5; the result comes back in a0, a negative value being an error, minus
  * one of the E* numbers below. Every other register is preserved.
  *
+ * The widths are Linux's (LP64 on RV64, ILP32 on RV32): every argument and
+ * the result are a register wide, a call returns a `long`, sign-extended in
+ * a0 (so -EFAULT is negative to a 64-bit program too), a user address is a
+ * pointer, a size a size_t and a file offset an off_t (types.h).
+ *
  * kernel/user/usys.s (the stubs) and kernel/user/user.h (the error numbers)
  * have their own copies of these numbers, and the document a table of them;
  * a test checks that all four agree. */
@@ -130,17 +135,18 @@
 /* The longest path a call takes, without its NUL. */
 #define MAXPATH 127
 
-/* What fstat stores: 16 bytes. `type` is the inode's (T_DIR, T_FILE or
- * T_DEVICE, fs.h), T_PIPE or T_SOCKET; `ino` and `nlink` are 0 for a pipe
- * and for the console the first process got without opening a path, and a
- * pipe's size is the bytes waiting in it. A socket's size is the bytes a
- * read would get now, and its nlink 1, or 0 once nothing more will arrive
- * (socket_hung_up(), net.h). */
+/* What fstat stores: 16 bytes on RV32, 24 on RV64, where the size is a
+ * 64-bit off_t (padded to 8 bytes on both sides). `type` is the inode's
+ * (T_DIR, T_FILE or T_DEVICE, fs.h), T_PIPE or T_SOCKET; `ino` and `nlink`
+ * are 0 for a pipe and for the console the first process got without
+ * opening a path, and a pipe's size is the bytes waiting in it. A socket's
+ * size is the bytes a read would get now, and its nlink 1, or 0 once
+ * nothing more will arrive (socket_hung_up(), net.h). */
 struct stat {
     u32 ino;
     u16 type;
     u16 nlink;
-    u32 size;
+    off_t size;
     u16 major;
     u16 minor;
 };
@@ -148,7 +154,8 @@ struct stat {
 #define T_PIPE 4
 #define T_SOCKET 5
 
-/* What procs stores for each process: 32 bytes. `state` is one of the
+/* What procs stores for each process: 32 bytes on RV32, 40 on RV64, where
+ * `size`, an address, is 64-bit (and 8-byte aligned). `state` is one of the
  * PROC_ values (proc.h), `ppid` 0 for a process without a parent, `size`
  * the end of its heap (its program, data and heap, from address 0), 0 for
  * a kernel process. */
@@ -156,7 +163,7 @@ struct procinfo {
     u32 pid;
     u32 ppid;
     u32 state;
-    u32 size;
+    usize size;
     char name[16];
 };
 
@@ -237,10 +244,11 @@ struct ping_reply {
 #define SOL_SOCKET 1  /* setsockopt: the socket's own options */
 #define SO_RCVTIMEO 20 /* how long recv and accept wait: a struct timeval */
 
-/* A time: seconds and microseconds (Linux's 32-bit layout). */
+/* A time: seconds and microseconds, two longs, as Linux's (8 bytes on
+ * RV32, 16 on RV64). */
 struct timeval {
-    i32 tv_sec;
-    i32 tv_usec;
+    time_t tv_sec;
+    long tv_usec;
 };
 
 /* An IPv4 address and port, as Linux lays it out (16 bytes): the port and

@@ -182,24 +182,24 @@ static void set_name(struct proc *p, const char *name) {
  * points frame `f`'s sp, a0 and a1 at them:
  *
  *   USER_TOP    the strings, argv[0]'s first, NUL-terminated
- *               padding to a multiple of 4
- *   argv        argv[0] ... argv[argc - 1], then a NULL
+ *               padding to a pointer's size (4 bytes on RV32, 8 on RV64)
+ *   argv        argv[0] ... argv[argc - 1], then a NULL: a pointer each
  *               padding to a multiple of 16
  *   sp          the program's first stack frame grows down from here
  *
  * ARG_MAX and MAXARG keep all of it well inside the page. */
 static void push_args(struct trap_frame *f, u8 *stack, const struct proc_args *args) {
-    u32 strings = USER_TOP - args->len;
-    u32 argv = (strings & ~3u) - 4 * (args->argc + 1);
+    uintptr strings = USER_TOP - args->len;
+    uintptr argv = (strings & ~(uintptr)(sizeof(uintptr) - 1)) - sizeof(uintptr) * (args->argc + 1);
     memcpy(stack + (strings - USER_STACK), args->strings, args->len);
-    u32 *slots = (u32 *)(stack + (argv - USER_STACK));
-    u32 at = strings;
+    uintptr *slots = (uintptr *)(stack + (argv - USER_STACK));
+    uintptr at = strings;
     for (u32 i = 0; i < args->argc; i++) {
         slots[i] = at;
         at += strlen(args->strings + (at - strings)) + 1;
     }
     slots[args->argc] = 0;
-    f->regs[REG_SP] = argv & ~15u;
+    f->regs[REG_SP] = argv & ~(uintptr)15;
     f->regs[REG_A0] = args->argc;
     f->regs[REG_A1] = argv;
 }
@@ -337,13 +337,13 @@ static struct trap_frame *frame_of(struct thread *t) {
  * with "WHO: PATH: REASON" printed, leaving `f` alone and nothing
  * allocated. */
 static pagetable_t build_space(const struct elf_file *prog, const char *who, const char *path,
-                               const struct proc_args *args, struct trap_frame *f, u32 *heap, int *err) {
+                               const struct proc_args *args, struct trap_frame *f, uintptr *heap, int *err) {
     pagetable_t pt = uvm_create();
     if (pt == NULL) {
         *err = -ENOMEM;
         return NULL;
     }
-    u32 entry, end;
+    uintptr entry, end;
     const char *load_err = elf_load(pt, prog, &entry, &end);
     if (load_err != NULL) {
         if (strcmp(load_err, ELF_OUT_OF_MEMORY) == 0) {
@@ -381,7 +381,7 @@ int proc_create(const struct elf_file *prog, const char *path, const char *name,
         return err;
     }
     t->frame = frame_of(t);
-    u32 heap;
+    uintptr heap;
     p->pagetable = build_space(prog, "spawn", path, args, t->frame, &heap, &err);
     if (p->pagetable == NULL) {
         proc_unalloc(p, t);
@@ -1005,7 +1005,7 @@ int proc_harts(struct hartinfo *out, int max) {
     return n;
 }
 
-int proc_wait(int pid, u32 status) {
+int proc_wait(int pid, uintptr status) {
     struct proc *p = myproc();
     struct thread *t = mythread();
     if (status != 0 && !uvm_range_ok(p->pagetable, status, sizeof(int), PTE_W)) {
@@ -1048,12 +1048,12 @@ int proc_wait(int pid, u32 status) {
     }
 }
 
-int proc_grow_stack(u32 va) {
+int proc_grow_stack(uintptr va) {
     struct proc *p = myproc();
     if (va < USER_STACK_LIMIT || va >= USER_TOP) {
         return -EFAULT;
     }
-    u32 low = PGROUNDDOWN(va);
+    uintptr low = PGROUNDDOWN(va);
     /* stack_low only moves down, so a stale look can only send us to the
      * lock for nothing. */
     if (low >= p->stack_low) {
@@ -1062,7 +1062,7 @@ int proc_grow_stack(u32 va) {
     acquiresleep(&p->heap_lock);
     int r = 0;
     while (p->stack_low > low) {
-        u32 a = p->stack_low - PGSIZE;
+        uintptr a = p->stack_low - PGSIZE;
         void *mem = kzalloc();
         if (mem == NULL || map_pages(p->pagetable, a, pa(mem), PGSIZE, PTE_U | PTE_R | PTE_W) != 0) {
             /* What was mapped stays: the stack is just shorter. */
@@ -1081,24 +1081,23 @@ int proc_grow_stack(u32 va) {
     return r;
 }
 
-int proc_sbrk(i32 increment) {
+long proc_sbrk(long increment) {
     struct proc *p = myproc();
     /* One sbrk() at a time: two threads mapping the same new page, or one
      * freeing what the other maps, would break the page table. */
     acquiresleep(&p->heap_lock);
-    u32 old = p->brk;
-    int r = (int)old;
+    uintptr old = p->brk;
     if (increment > 0) {
-        u32 grow = (u32)increment;
+        uintptr grow = (uintptr)increment;
         if (grow > USER_LOAD_TOP - old) {
             releasesleep(&p->heap_lock);
             return -ENOMEM;
         }
-        u32 end = old + grow;
+        uintptr end = old + grow;
         /* Map the pages from the first one not yet mapped up to the new
          * end; on failure, unmap them again. */
-        u32 first = PGROUNDUP(old);
-        for (u32 a = first; a < end; a += PGSIZE) {
+        uintptr first = PGROUNDUP(old);
+        for (uintptr a = first; a < end; a += PGSIZE) {
             void *mem = kzalloc();
             if (mem == NULL || map_pages(p->pagetable, a, pa(mem), PGSIZE, PTE_U | PTE_R | PTE_W) != 0) {
                 if (mem != NULL) {
@@ -1113,13 +1112,14 @@ int proc_sbrk(i32 increment) {
         }
         p->brk = end;
     } else if (increment < 0) {
-        u32 shrink = 0u - (u32)increment;
+        /* -increment as an unsigned number: right even for LONG_MIN. */
+        uintptr shrink = 0 - (uintptr)increment;
         if (shrink > old - p->heap_base) {
             releasesleep(&p->heap_lock);
             return -EINVAL;
         }
-        u32 end = old - shrink;
-        u32 keep = PGROUNDUP(end);
+        uintptr end = old - shrink;
+        uintptr keep = PGROUNDUP(end);
         /* The end moves first, so that nothing takes the pages for heap
          * any more; then they go, shot down on every hart that runs one of
          * the process's threads (unmap_pages). */
@@ -1136,10 +1136,11 @@ int proc_sbrk(i32 increment) {
         }
     }
     releasesleep(&p->heap_lock);
-    return r;
+    /* The old break, a user address: below USER_TOP, so never negative. */
+    return (long)old;
 }
 
-int thread_create(u32 entry, u32 arg, u32 stack) {
+int thread_create(uintptr entry, uintptr arg, uintptr stack) {
     struct proc *p = myproc();
     /* The pointers first: the code must be there to run, and the new
      * thread's first stack frame must have room below `stack`. */
@@ -1196,7 +1197,7 @@ void thread_exit(int status) {
     thread_end(t, status);
 }
 
-int thread_join(int tid, u32 status) {
+int thread_join(int tid, uintptr status) {
     struct proc *p = myproc();
     struct thread *me = mythread();
     if (status != 0 && !uvm_range_ok(p->pagetable, status, sizeof(int), PTE_W)) {
@@ -1240,7 +1241,7 @@ int thread_join(int tid, u32 status) {
     }
 }
 
-int futex_wait(u32 addr, u32 val) {
+int futex_wait(uintptr addr, u32 val) {
     struct proc *p = myproc();
     struct thread *t = mythread();
     if (addr % 4 != 0) {
@@ -1276,7 +1277,7 @@ int futex_wait(u32 addr, u32 val) {
     return r;
 }
 
-int futex_wake(u32 addr, i32 n) {
+int futex_wake(uintptr addr, i32 n) {
     struct proc *p = myproc();
     if (addr % 4 != 0) {
         return -EINVAL;
