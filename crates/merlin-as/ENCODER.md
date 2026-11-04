@@ -323,7 +323,11 @@ that remain on other input (spec section 10):
   reports it out of range.
 - A numeric label a relocation refers to is called `.L1$0` (`1:`, first
   definition) where clang says `.Ltmp0`.
-- No `$x`/`$d` mapping symbols in the symbol table.
+- No `$x`/`$d` mapping symbols in the symbol table yet: they come with #192
+  (merlin-as and `/bin/as`, after #151). Until then llvm-objdump 23 (and
+  merlin-objdump) list data in a code section of a merlin-as object as
+  instructions, where clang's object lists it as `.word`, and don't forget
+  the `auipc` values behind `jalr` targets where the data starts and ends.
 - Operand forms LLVM accepts and merlin-as doesn't: `jalr rd, rs`,
   `jalr off(rs)`, `jr off(rs)`, `jr rs, off`, `call rd, sym`, `jump sym, rt`,
   `%hi(sym)` in `.insn u`, named `.insn` opcodes (`.insn r OP, ...`),
