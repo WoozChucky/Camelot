@@ -35,19 +35,51 @@
 # Exit code 0 after `q`, 1 without a network card, 2 on a DHCP NAK, a refused or reset
 # connection or a send error.
 #
-# user-rv64.S is the same program for RV64 machines.
+# On RV64 machines (net-user-rv64.elf) the functions save ra and the s registers
+# with REG_S (sd), in frames of SZREG-sized slots, and the TCP sequence numbers,
+# 32-bit words, are added with addw and addiw (ADDW, ADDIW), modulo 2^32 like the
+# fields they go to.
 #
 # Built with our own tools by `cargo xtask examples net-user`, which does the same as
 #
-#   merlin-as examples/net/user.S -o user.o
-#   merlin-as examples/net/netlib.S -o netlib.o
+#   merlin -E -I include examples/net/user.S -o user.s
+#   merlin-as user.s -o user.o
+#   merlin -E -I include examples/net/netlib.S -o netlib.s
+#   merlin-as netlib.s -o netlib.o
 #   merlin-ld -T examples/net/link.ld user.o netlib.o -o examples/net/net-user.elf
+#
+# and, for RV64, the same as
+#
+#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/net/user.S -o user.s
+#   merlin-as -march=rv64ima_zicsr_zifencei user.s -o user.o
+#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/net/netlib.S -o netlib.s
+#   merlin-as -march=rv64ima_zicsr_zifencei netlib.s -o netlib.o
+#   merlin-ld -T examples/net/link.ld user.o netlib.o -o examples/net/net-user-rv64.elf
 #
 # Reference build with LLVM, only for comparison:
 #
 #   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc -I include \
 #         -T examples/net/link.ld examples/net/user.S examples/net/netlib.S -o net-user.elf
+#
+# and for RV64:
+#
+#   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
+#         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -I include -T examples/net/link.ld examples/net/user.S examples/net/netlib.S \
+#         -o net-user-rv64.elf
+
+#include <asm.h>
+
+#if __riscv_xlen == 64
+#define ADDW addw       /* 32-bit sums, kept sign-extended */
+#define ADDIW addiw
+#define IP_FRAME 48     /* ip_header's frame: five registers, 16-byte aligned */
+#else
+#define ADDW add
+#define ADDIW addi
+#define IP_FRAME 32
+#endif
 
     .equ UART_BASE,       0x10000000
     .equ UART_RBR,        0             # receive buffer
@@ -153,7 +185,7 @@ halt:
 # DISCOVER, wait for an OFFER, REQUEST the offered address, wait for the ACK.
 dhcp:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
+    REG_S ra, 16-SZREG(sp)
     li    a0, DHCP_DISCOVER
     call  dhcp_message
     li    a0, DHCP_OFFER
@@ -184,17 +216,17 @@ dhcp:
 1:  la    a0, s_nak
     call  puts
     li    a0, 1
-2:  lw    ra, 12(sp)
+2:  REG_L ra, 16-SZREG(sp)
     addi  sp, sp, 16
     ret
 
 # dhcp_message(a0 = message type): broadcasts a DISCOVER, or a REQUEST for the
 # address in `offered` from the server in `server_id`.
 dhcp_message:
-    addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s1, 8(sp)
-    sw    s2, 4(sp)
+    addi  sp, sp, -4*SZREG
+    REG_S ra, 3*SZREG(sp)
+    REG_S s1, 2*SZREG(sp)
+    REG_S s2, SZREG(sp)
     mv    s2, a0
     la    s1, txbuf
     addi  s1, s1, UDP_DATA          # s1 = the BOOTP message
@@ -267,21 +299,21 @@ dhcp_message:
     mv    a1, a0
     mv    a0, s1
     call  net_send
-    lw    s2, 4(sp)
-    lw    s1, 8(sp)
-    lw    ra, 12(sp)
-    addi  sp, sp, 16
+    REG_L s2, SZREG(sp)
+    REG_L s1, 2*SZREG(sp)
+    REG_L ra, 3*SZREG(sp)
+    addi  sp, sp, 4*SZREG
     ret
 
 # dhcp_reply(a0 = message type wanted) -> a0 = that type, or DHCP_NAK. Waits for a
 # server's reply to our transaction; from the wanted one it keeps the address
 # offered (yiaddr), the server's identifier and its MAC address (the gateway's).
 dhcp_reply:
-    addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s1, 8(sp)
-    sw    s2, 4(sp)
-    sw    s3, 0(sp)
+    addi  sp, sp, -4*SZREG
+    REG_S ra, 3*SZREG(sp)
+    REG_S s1, 2*SZREG(sp)
+    REG_S s2, SZREG(sp)
+    REG_S s3, 0(sp)
     mv    s3, a0
 1:  call  net_poll
     beqz  a0, 1b
@@ -343,11 +375,11 @@ dhcp_reply:
     j     9f
 8:  call  net_release               # not for us: next frame
     j     1b
-9:  lw    s3, 0(sp)
-    lw    s2, 4(sp)
-    lw    s1, 8(sp)
-    lw    ra, 12(sp)
-    addi  sp, sp, 16
+9:  REG_L s3, 0(sp)
+    REG_L s2, SZREG(sp)
+    REG_L s1, 2*SZREG(sp)
+    REG_L ra, 3*SZREG(sp)
+    addi  sp, sp, 4*SZREG
     ret
 
 # dhcp_option(a0 = BOOTP message, a1 = option code) -> a0 = the option's data, or
@@ -377,12 +409,12 @@ dhcp_option:
 # length. Fills txbuf's Ethernet header (from this card) and IPv4 header (from my_ip,
 # TTL 64, with its checksum).
 ip_header:
-    addi  sp, sp, -32
-    sw    ra, 28(sp)
-    sw    s1, 24(sp)
-    sw    s2, 20(sp)
-    sw    s3, 16(sp)
-    sw    s4, 12(sp)
+    addi  sp, sp, -IP_FRAME
+    REG_S ra, IP_FRAME-SZREG(sp)
+    REG_S s1, IP_FRAME-2*SZREG(sp)
+    REG_S s2, IP_FRAME-3*SZREG(sp)
+    REG_S s3, IP_FRAME-4*SZREG(sp)
+    REG_S s4, IP_FRAME-5*SZREG(sp)
     mv    s1, a0
     mv    s2, a1
     mv    s3, a2
@@ -428,12 +460,12 @@ ip_header:
     addi  a0, s4, 24
     call  put16
     addi  a0, s2, L4_OFF
-    lw    s4, 12(sp)
-    lw    s3, 16(sp)
-    lw    s2, 20(sp)
-    lw    s1, 24(sp)
-    lw    ra, 28(sp)
-    addi  sp, sp, 32
+    REG_L s4, IP_FRAME-5*SZREG(sp)
+    REG_L s3, IP_FRAME-4*SZREG(sp)
+    REG_L s2, IP_FRAME-3*SZREG(sp)
+    REG_L s1, IP_FRAME-2*SZREG(sp)
+    REG_L ra, IP_FRAME-SZREG(sp)
+    addi  sp, sp, IP_FRAME
     ret
 
 # csum(a0 = address, a1 = length, a2 = running sum) -> a0 = the sum plus the bytes
@@ -476,11 +508,11 @@ csum_fold:
 # Connects to 10.0.2.2:port, sends the greeting, prints what arrives, and closes
 # after the host does.
 tcp_client:
-    addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s1, 8(sp)
-    sw    s2, 4(sp)
-    sw    s3, 0(sp)
+    addi  sp, sp, -4*SZREG
+    REG_S ra, 3*SZREG(sp)
+    REG_S s1, 2*SZREG(sp)
+    REG_S s2, SZREG(sp)
+    REG_S s3, 0(sp)
     la    t0, tcp_rport
     sh    a0, 0(t0)
     mv    s1, a0
@@ -516,7 +548,7 @@ tcp_client:
     beqz  t0, 1b
     la    t0, seg_seq
     lw    t1, 0(t0)
-    addi  t1, t1, 1                 # their SYN takes one sequence number
+    ADDIW t1, t1, 1                 # their SYN takes one sequence number
     la    t0, rcv_nxt
     sw    t1, 0(t0)
     li    a0, TCP_ACK               # connected
@@ -565,21 +597,21 @@ reset:
     call  puts
     li    a0, 1
 tcp_return:                         # the epilogue of tcp_client and tcp_server
-    lw    s3, 0(sp)
-    lw    s2, 4(sp)
-    lw    s1, 8(sp)
-    lw    ra, 12(sp)
-    addi  sp, sp, 16
+    REG_L s3, 0(sp)
+    REG_L s2, SZREG(sp)
+    REG_L s1, 2*SZREG(sp)
+    REG_L ra, 3*SZREG(sp)
+    addi  sp, sp, 4*SZREG
     ret
 
 # tcp_server(a0 = port) -> a0 = 0, or 1 if the connection was reset. Waits for a SYN
 # to the port, accepts, echoes every byte back, and closes after the peer does.
 tcp_server:
-    addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s1, 8(sp)
-    sw    s2, 4(sp)
-    sw    s3, 0(sp)
+    addi  sp, sp, -4*SZREG
+    REG_S ra, 3*SZREG(sp)
+    REG_S s1, 2*SZREG(sp)
+    REG_S s2, SZREG(sp)
+    REG_S s3, 0(sp)
     la    t0, tcp_lport
     sh    a0, 0(t0)
     mv    s1, a0
@@ -606,7 +638,7 @@ tcp_server:
     call  memcpy
     la    t0, seg_seq
     lw    t1, 0(t0)
-    addi  t1, t1, 1
+    ADDIW t1, t1, 1
     la    t0, rcv_nxt
     sw    t1, 0(t0)
     la    a0, s_accepted            # "accepted from 10.0.2.2:PORT"
@@ -670,10 +702,10 @@ tcp_server:
 # a2 is 0.
 tcp_send:
     addi  sp, sp, -32
-    sw    ra, 28(sp)
-    sw    s1, 24(sp)
-    sw    s2, 20(sp)
-    sw    s3, 16(sp)
+    REG_S ra, 32-SZREG(sp)
+    REG_S s1, 32-2*SZREG(sp)
+    REG_S s2, 32-3*SZREG(sp)
+    REG_S s3, 32-4*SZREG(sp)
     mv    s1, a0
     mv    s3, a2
     la    a0, txbuf                 # the data, after the headers
@@ -737,17 +769,17 @@ tcp_send:
     bnez  a0, send_failed
     la    t0, snd_nxt               # the sequence numbers used
     lw    t1, 0(t0)
-    add   t1, t1, s3
+    ADDW  t1, t1, s3
     andi  t2, s1, TCP_FIN
-    add   t1, t1, t2
+    ADDW  t1, t1, t2
     srli  t2, s1, 1                 # TCP_SYN is bit 1
     andi  t2, t2, 1
-    add   t1, t1, t2
+    ADDW  t1, t1, t2
     sw    t1, 0(t0)
-    lw    s3, 16(sp)
-    lw    s2, 20(sp)
-    lw    s1, 24(sp)
-    lw    ra, 28(sp)
+    REG_L s3, 32-4*SZREG(sp)
+    REG_L s2, 32-3*SZREG(sp)
+    REG_L s1, 32-2*SZREG(sp)
+    REG_L ra, 32-SZREG(sp)
     addi  sp, sp, 32
     ret
 send_failed:
@@ -760,11 +792,11 @@ send_failed:
 # acknowledgment numbers, source and payload length go to seg_*, the payload to
 # rxdata. Other frames are dropped.
 tcp_recv:
-    addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s1, 8(sp)
-    sw    s2, 4(sp)
-    sw    s3, 0(sp)
+    addi  sp, sp, -4*SZREG
+    REG_S ra, 3*SZREG(sp)
+    REG_S s1, 2*SZREG(sp)
+    REG_S s2, SZREG(sp)
+    REG_S s3, 0(sp)
 1:  call  net_poll
     beqz  a0, 1b
     bnez  a2, 8f
@@ -827,11 +859,11 @@ tcp_recv:
     call  net_release
     la    t0, seg_flags
     lw    a0, 0(t0)
-    lw    s3, 0(sp)
-    lw    s2, 4(sp)
-    lw    s1, 8(sp)
-    lw    ra, 12(sp)
-    addi  sp, sp, 16
+    REG_L s3, 0(sp)
+    REG_L s2, SZREG(sp)
+    REG_L s1, 2*SZREG(sp)
+    REG_L ra, 3*SZREG(sp)
+    addi  sp, sp, 4*SZREG
     ret
 8:  call  net_release
     j     1b
@@ -842,7 +874,7 @@ tcp_recv:
 # and FIN is cleared from a0. rcv_nxt moves past what was taken.
 tcp_take:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
+    REG_S ra, 16-SZREG(sp)
     call  tcp_recv
     la    t0, seg_len
     lw    t1, 0(t0)
@@ -857,14 +889,14 @@ tcp_take:
     la    t0, rcv_nxt
     lw    t3, 0(t0)
     bne   t2, t3, 1f
-    add   t3, t3, t1                # past the data
+    ADDW  t3, t3, t1                # past the data
     andi  t2, a0, TCP_FIN
-    add   t3, t3, t2                # and the FIN
+    ADDW  t3, t3, t2                # and the FIN
     sw    t3, 0(t0)
     mv    a1, t1
     j     2f
 1:  andi  a0, a0, -2                # out of sequence: not a FIN we can take
-2:  lw    ra, 12(sp)
+2:  REG_L ra, 16-SZREG(sp)
     addi  sp, sp, 16
     ret
 
@@ -872,7 +904,7 @@ tcp_take:
 # (snd_nxt), 1 if it reset the connection instead.
 tcp_wait_ack:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
+    REG_S ra, 16-SZREG(sp)
 1:  call  tcp_recv
     andi  t0, a0, TCP_RST
     bnez  t0, 2f
@@ -886,7 +918,7 @@ tcp_wait_ack:
     li    a0, 0
     j     3f
 2:  li    a0, 1
-3:  lw    ra, 12(sp)
+3:  REG_L ra, 16-SZREG(sp)
     addi  sp, sp, 16
     ret
 
@@ -938,10 +970,10 @@ parse_dec:
 
 # put_ip(a0 = address of 4 bytes): "10.0.2.15".
 put_ip:
-    addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s1, 8(sp)
-    sw    s2, 4(sp)
+    addi  sp, sp, -4*SZREG
+    REG_S ra, 3*SZREG(sp)
+    REG_S s1, 2*SZREG(sp)
+    REG_S s2, SZREG(sp)
     mv    s1, a0
     addi  s2, a0, 4
     j     2f
@@ -951,10 +983,10 @@ put_ip:
     call  put_dec
     addi  s1, s1, 1
     bne   s1, s2, 1b
-    lw    s2, 4(sp)
-    lw    s1, 8(sp)
-    lw    ra, 12(sp)
-    addi  sp, sp, 16
+    REG_L s2, SZREG(sp)
+    REG_L s1, 2*SZREG(sp)
+    REG_L ra, 3*SZREG(sp)
+    addi  sp, sp, 4*SZREG
     ret
 
 # put16(a0 = address, a1 = value): the low 16 bits, big-endian. Clobbers t0.

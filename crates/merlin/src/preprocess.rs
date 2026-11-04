@@ -405,9 +405,9 @@ impl Output {
         for (_, mark) in marks {
             p.mark(*mark);
         }
-        if p.started {
-            p.out.push('\n');
-        }
+        // clang ends the output with a newline whatever came last, which
+        // after a marker (or nothing) is an empty line.
+        p.out.push('\n');
         p.out
     }
 }

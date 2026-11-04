@@ -44,14 +44,18 @@ pub fn output(xlen: Xlen) -> &'static str {
     }
 }
 
-/// Assembles hello.S with merlin-as for `xlen` into `work_dir/hello.o`, links
-/// it into `work_dir/hello.elf` with `lld` (which takes the width from the
-/// object), and returns the executable's bytes.
+/// Assembles hello.S with merlin-as for `xlen` (after merlin's preprocessor,
+/// as every `.S` file) into `work_dir/hello.o`, links it into
+/// `work_dir/hello.elf` with `lld` (which takes the width from the object),
+/// and returns the executable's bytes.
 pub fn build(root: &Path, lld: &Path, work_dir: &Path, xlen: Xlen, verbose: bool) -> Result<Vec<u8>, String> {
     let example = root.join("examples").join("hello");
-    let src_path = example.join("hello.S");
-    let src =
-        std::fs::read_to_string(&src_path).map_err(|e| format!("cannot read {}: {e}", src_path.display()))?;
+    let src = crate::examples::assembly_of(
+        root,
+        "examples/hello/hello.S",
+        &[crate::examples::INCLUDE_DIR],
+        xlen,
+    )?;
     let obj = merlin_as::assemble_to_elf_with(&src, &merlin_as::Options { xlen }).map_err(|errs| {
         let lines: Vec<String> = errs.iter().map(|e| format!("hello.S: {e}")).collect();
         format!("merlin-as failed:\n{}", lines.join("\n"))

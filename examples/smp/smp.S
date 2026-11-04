@@ -17,18 +17,44 @@
 #   grail examples/smp/smp.elf
 #   grail --harts 4 examples/smp/smp.elf
 #
-# smp-rv64.S is the same program for RV64 machines.
+# (smp-rv64.elf on RV64 machines).
 #
 # Built with our own tools by `cargo xtask examples smp`, which does the same as
 #
-#   merlin-as examples/smp/smp.S -o smp.o
+#   merlin -E -I include examples/smp/smp.S -o smp.s
+#   merlin-as smp.s -o smp.o
 #   merlin-ld -T examples/smp/link.ld smp.o -o examples/smp/smp.elf
+#
+# and, for RV64 (the same code: SYS_HARTS is at 0x28, version 2 of sysinfo, spec
+# section 9.5, the functions save ra with REG_S, sd there, and put_dec has room for
+# the 20 digits of 2^64 - 1; the counters stay 32-bit words, added to with amoadd.w
+# and lr.w/sc.w at both widths), the same as
+#
+#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/smp/smp.S -o smp.s
+#   merlin-as -march=rv64ima_zicsr_zifencei smp.s -o smp.o
+#   merlin-ld -T examples/smp/link.ld smp.o -o examples/smp/smp-rv64.elf
 #
 # Reference build with LLVM, only for comparison:
 #
 #   clang --target=riscv32 -march=rv32ima_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc -I include \
 #         -T examples/smp/link.ld examples/smp/smp.S -o smp.elf
+#
+# and for RV64:
+#
+#   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
+#         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -I include -T examples/smp/link.ld examples/smp/smp.S -o smp-rv64.elf
+
+#include <asm.h>
+
+#if __riscv_xlen == 64
+#define LWU lwu         /* a 32-bit word, zero-extended */
+#define DEC_END 20      /* put_dec's digits: sp+0 .. sp+19, the 20 of 2^64 - 1 */
+#else
+#define LWU lw
+#define DEC_END 12      /* sp+2 .. sp+11, the 10 of 2^32 - 1 */
+#endif
 
     .equ UART_BASE,       0x10000000
     .equ UART_LSR,        5
@@ -36,7 +62,11 @@
 
     .equ CLINT_BASE,      0x02000000    # hart i's msip at +4*i
     .equ SYSINFO_BASE,    0x30002000
+#if __riscv_xlen == 64
+    .equ SYS_HARTS,       0x28
+#else
     .equ SYS_HARTS,       0x20
+#endif
 
     .equ MIE_MSIE,        0x8           # mie bit 3: machine software interrupt
     .equ MSTATUS_MIE,     0x8           # mstatus bit 3: M-mode interrupts on
@@ -55,7 +85,7 @@ _start:
     slli  t0, s0, STACK_SHIFT
     sub   sp, sp, t0
     li    t0, SYSINFO_BASE
-    lw    s1, SYS_HARTS(t0)         # s1 = number of harts
+    LWU   s1, SYS_HARTS(t0)         # s1 = number of harts
     bnez  s0, work
 
     # Hart 0: say how many harts there are, then wake the others, one IPI each.
@@ -231,7 +261,7 @@ ipi_handler:
 # " = <n> x 1000", n = s1.
 harts_times:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
+    REG_S ra, 16-SZREG(sp)
     la    a0, s_equals
     call  puts
     mv    a0, s1
@@ -240,7 +270,7 @@ harts_times:
     call  puts
     li    a0, ITERATIONS
     call  put_dec
-    lw    ra, 12(sp)
+    REG_L ra, 16-SZREG(sp)
     addi  sp, sp, 16
     ret
 
@@ -256,22 +286,23 @@ putc:
 # puts(a0 = NUL-terminated string)
 puts:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
+    REG_S ra, 16-SZREG(sp)
     mv    a1, a0
 1:  lbu   a0, 0(a1)
     beqz  a0, 2f
     call  putc
     addi  a1, a1, 1
     j     1b
-2:  lw    ra, 12(sp)
+2:  REG_L ra, 16-SZREG(sp)
     addi  sp, sp, 16
     ret
 
-# put_dec(a0 = unsigned value): decimal, no padding.
+# put_dec(a0 = unsigned value): decimal, no padding, up to the 10 digits of
+# 2^32 - 1, or the 20 of 2^64 - 1 on RV64.
 put_dec:
     addi  sp, sp, -32
-    sw    ra, 28(sp)
-    addi  a1, sp, 12                # digits go backwards into sp+2 .. sp+11
+    REG_S ra, 32-SZREG(sp)
+    addi  a1, sp, DEC_END           # digits go backwards into the bytes below sp+DEC_END
     li    a2, 10
 1:  remu  a3, a0, a2
     divu  a0, a0, a2
@@ -279,12 +310,12 @@ put_dec:
     addi  a1, a1, -1
     sb    a3, 0(a1)
     bnez  a0, 1b
-    addi  a2, sp, 12
+    addi  a2, sp, DEC_END
 2:  lbu   a0, 0(a1)
     call  putc
     addi  a1, a1, 1
     bne   a1, a2, 2b
-    lw    ra, 28(sp)
+    REG_L ra, 32-SZREG(sp)
     addi  sp, sp, 32
     ret
 

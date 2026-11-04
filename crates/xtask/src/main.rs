@@ -560,7 +560,7 @@ fn ld_fixtures(k: LdFixturesArgs) -> ExitCode {
             }
         };
     }
-    match xtask::ld_fixtures::run(&fixtures, &root.join("examples"), &t) {
+    match xtask::ld_fixtures::run(&fixtures, &root, &t) {
         Ok(files) => {
             eprintln!("wrote {} files in {}", files.len(), fixtures.display());
             ExitCode::SUCCESS

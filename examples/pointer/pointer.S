@@ -16,18 +16,39 @@
 #
 #   cargo run --release -p grail -- --fb examples/pointer/pointer.elf
 #
-# pointer-rv64.S is the same program for RV64 machines.
+# (pointer-rv64.elf on an RV64 machine).
 #
 # Built with our own tools by `cargo xtask examples pointer`, which does the same as
 #
-#   merlin-as examples/pointer/pointer.S -o pointer.o
+#   merlin -E -I include examples/pointer/pointer.S -o pointer.s
+#   merlin-as pointer.s -o pointer.o
 #   merlin-ld -T examples/pointer/link.ld pointer.o -o examples/pointer/pointer.elf
+#
+# and, for RV64 (the same code: mcause's interrupt bit, CAUSE_MEI, is bit 63, a
+# position word is read zero-extended, with lwu, and its x taken from bits 15:0 with
+# shifts of 48, XLEN - 16: shifts of 16 would keep bits 47:0), the same as
+#
+#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/pointer/pointer.S -o pointer.s
+#   merlin-as -march=rv64ima_zicsr_zifencei pointer.s -o pointer.o
+#   merlin-ld -T examples/pointer/link.ld pointer.o -o examples/pointer/pointer-rv64.elf
 #
 # Reference build with LLVM, only for comparison:
 #
 #   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
 #         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
 #         -T examples/pointer/link.ld examples/pointer/pointer.S -o pointer.elf
+#
+# and for RV64:
+#
+#   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
+#         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -T examples/pointer/link.ld examples/pointer/pointer.S -o pointer-rv64.elf
+
+#if __riscv_xlen == 64
+#define LWU lwu         /* a 32-bit word, zero-extended */
+#else
+#define LWU lw
+#endif
 
     .equ FB_BASE,       0x30000000      # framebuffer registers (spec section 9.3)
     .equ FB_WIDTH,      0x00
@@ -62,7 +83,11 @@
 
     .equ MIE_MEIE,      0x800           # mie bit 11
     .equ MSTATUS_MIE,   0x8
+#if __riscv_xlen == 64
+    .equ CAUSE_MEI,     0x800000000000000b # interrupt bit 63, cause 11
+#else
     .equ CAUSE_MEI,     0x8000000b
+#endif
 
     .equ CURSOR_ROWS,   12              # rows in `arrow`, 8 pixels each
 
@@ -94,7 +119,7 @@ _start:
 
     # The cursor where the pointer is now, then the display on.
     li    t0, PTR_BASE
-    lw    t1, PTR_POS(t0)
+    LWU   t1, PTR_POS(t0)
     call  set_position
     lw    s3, PTR_BUTTONS(t0)
     call  draw
@@ -161,14 +186,14 @@ pointer:
     beqz  t2, 2f
     lw    t2, PTR_EVENT(t0)             # pops one event...
     andi  s3, t2, 7
-    lw    t1, PTR_EVENT_XY(t0)          # ...and this is its position
+    LWU   t1, PTR_EVENT_XY(t0)          # ...and this is its position
     call  set_position
     addi  s4, s4, 1
     j     1b
 2:  andi  t1, t1, PTR_OVERFLOW          # t1 = the last status read
     beqz  t1, 3f
     # Events were dropped: the current state says where the pointer ended up.
-    lw    t1, PTR_POS(t0)
+    LWU   t1, PTR_POS(t0)
     call  set_position
     lw    s3, PTR_BUTTONS(t0)
     li    t1, PTR_OVERFLOW
@@ -191,10 +216,11 @@ fail:
     li    t0, 1
     xcal.halt t0
 
-# set_position(t1 = position word): s1 = x (bits 15:0), s2 = y (bits 31:16).
+# set_position(t1 = position word, zero-extended): s1 = x (bits 15:0), s2 = y
+# (bits 31:16).
 set_position:
-    slli  s1, t1, 16
-    srli  s1, s1, 16
+    slli  s1, t1, __riscv_xlen - 16
+    srli  s1, s1, __riscv_xlen - 16
     srli  s2, t1, 16
     ret
 

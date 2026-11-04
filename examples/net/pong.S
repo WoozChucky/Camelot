@@ -17,27 +17,32 @@
 #
 # Built with our own tools by `cargo xtask examples net-pong`, which does the same as
 #
-#   merlin-as examples/net/pong.S -o pong.o
-#   merlin-as examples/net/netlib.S -o netlib.o
+#   merlin -E -I include examples/net/pong.S -o pong.s
+#   merlin-as pong.s -o pong.o
+#   merlin -E -I include examples/net/netlib.S -o netlib.s
+#   merlin-as netlib.s -o netlib.o
 #   merlin-ld -T examples/net/link.ld pong.o netlib.o -o examples/net/net-pong.elf
 #
-# and, for RV64 (the same file, with the RV64 driver), the same as
+# and, for RV64 (the same code here; the driver has what differs), the same as
 #
-#   merlin-as -march=rv64ima_zicsr_zifencei examples/net/pong.S -o pong.o
-#   merlin-as -march=rv64ima_zicsr_zifencei examples/net/netlib-rv64.S -o netlib-rv64.o
-#   merlin-ld -T examples/net/link.ld pong.o netlib-rv64.o -o examples/net/net-pong-rv64.elf
+#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/net/pong.S -o pong.s
+#   merlin-as -march=rv64ima_zicsr_zifencei pong.s -o pong.o
+#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/net/netlib.S -o netlib.s
+#   merlin-as -march=rv64ima_zicsr_zifencei netlib.s -o netlib.o
+#   merlin-ld -T examples/net/link.ld pong.o netlib.o -o examples/net/net-pong-rv64.elf
 #
 # Reference build with LLVM, only for comparison:
 #
 #   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc -I include \
 #         -T examples/net/link.ld examples/net/pong.S examples/net/netlib.S -o net-pong.elf
 #
 # and for RV64:
 #
 #   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
 #         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
-#         -T examples/net/link.ld examples/net/pong.S examples/net/netlib-rv64.S -o net-pong-rv64.elf
+#         -I include -T examples/net/link.ld examples/net/pong.S examples/net/netlib.S \
+#         -o net-pong-rv64.elf
 
     .equ FRAME_SIZE,      1536
 

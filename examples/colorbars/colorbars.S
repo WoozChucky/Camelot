@@ -3,12 +3,14 @@
 #
 # Built with our own tools by `cargo xtask examples colorbars`, which does the same as
 #
-#   merlin-as examples/colorbars/colorbars.S -o colorbars.o
+#   merlin -E -I include examples/colorbars/colorbars.S -o colorbars.s
+#   merlin-as colorbars.s -o colorbars.o
 #   merlin-ld -T examples/colorbars/link.ld colorbars.o -o examples/colorbars/colorbars.elf
 #
-# and, for RV64 (the same source: the framebuffer's registers and pixels are 32-bit words), the same as
+# and, for RV64 (the same code: the framebuffer's registers and pixels are 32-bit words), the same as
 #
-#   merlin-as -march=rv64ima_zicsr_zifencei examples/colorbars/colorbars.S -o colorbars.o
+#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/colorbars/colorbars.S -o colorbars.s
+#   merlin-as -march=rv64ima_zicsr_zifencei colorbars.s -o colorbars.o
 #   merlin-ld -T examples/colorbars/link.ld colorbars.o -o examples/colorbars/colorbars-rv64.elf
 #
 # Reference build with LLVM, only for comparison:
