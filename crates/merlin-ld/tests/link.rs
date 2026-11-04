@@ -147,7 +147,7 @@ fn norelocs_matches_ld_lld() {
 
 /// Layout edge cases against ld.lld: output sections with only empty inputs
 /// (they still align), with only assignments (kept, PROGBITS, flags of the
-/// previous section), with only `. +=` (PROGBITS with file contents), with
+/// previous section but never executable), with only `. +=` (PROGBITS with file contents), with
 /// nothing (dropped), a symbol before the first section with MEMORY (0), a
 /// gap and NOBITS before PROGBITS inside one PT_LOAD, an empty R section
 /// between RX and RW (no PT_LOAD of its own), a weak definition.
@@ -167,6 +167,7 @@ fn layout_edge_cases_match_ld_lld() {
             "layouts/empty",
             "layouts/gap",
             "layouts/inside",
+            "layouts/no-inputs",
             "layouts/nobits-first",
             "layouts/page-gap"
         ]
@@ -185,6 +186,26 @@ fn layout_edge_cases_match_ld_lld() {
     assert_eq!((stack.ty.as_str(), stack.flags.as_str()), ("PROGBITS", "WA"));
     assert_eq!(expected("layouts/gap").loads.len(), 2);
     assert_eq!(expected("layouts/nobits-first").loads.len(), 3);
+    // Sections without inputs are never executable: `.marker`, after the
+    // code, is read-only and goes with .rodata.
+    let none = expected("layouts/no-inputs");
+    let flags: Vec<(&str, &str)> = none
+        .sections
+        .iter()
+        .map(|s| (s.name.as_str(), s.flags.as_str()))
+        .collect();
+    assert_eq!(
+        flags,
+        [
+            (".text", "AX"),
+            (".marker", "A"),
+            (".rodata", "A"),
+            (".data", "WA"),
+            (".tag", "WA"),
+            (".bss", "WA")
+        ]
+    );
+    assert_eq!(none.loads.len(), 3);
     // Output section attributes (kernel/kernel.ld's): ALIGN(n) raises the
     // alignment and never lowers it, NOLOAD makes even PROGBITS input and
     // an assignment-only section NOBITS, /DISCARD/ drops a section and its

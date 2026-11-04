@@ -64,7 +64,8 @@ pub struct OutputSection {
     /// Largest alignment of its input sections.
     pub align: u32,
     /// `SHF_ALLOC` plus the union of the inputs' `SHF_WRITE` / `SHF_EXECINSTR`;
-    /// without inputs, the flags of the previous section that had some.
+    /// without inputs, the `SHF_ALLOC` and `SHF_WRITE` of the previous section
+    /// that had some (never `SHF_EXECINSTR`, as in ld.lld).
     pub flags: u64,
     /// Occupies no file space (`.bss`): every input is `SHT_NOBITS`
     /// (and there is at least one), or the script says `(NOLOAD)`.
@@ -797,8 +798,12 @@ pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
                 }
                 if inputs.is_empty() {
                     // Only assignments (`. += n`, symbols): like ld.lld, a
-                    // PROGBITS section with the previous section's flags.
-                    flags = prev_flags;
+                    // PROGBITS section with the previous section's flags, but
+                    // only SHF_ALLOC and SHF_WRITE of them (ld.lld's
+                    // adjustOutputSections leaves SHF_EXECINSTR out, so that
+                    // such a section after the code is not executable: it
+                    // goes with the data that follows it).
+                    flags = prev_flags & (SHF_ALLOC | SHF_WRITE);
                     nobits = false;
                 } else {
                     prev_flags = flags;

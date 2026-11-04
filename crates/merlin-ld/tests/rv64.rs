@@ -488,7 +488,7 @@ fn layout_edge_cases_match_ld_lld() {
         .map(|p| format!("layouts/{}", p.file_stem().unwrap().to_string_lossy()))
         .collect();
     names.sort();
-    assert_eq!(names.len(), 6, "{names:?}");
+    assert_eq!(names.len(), 7, "{names:?}");
     for name in &names {
         assert_matches_ld_lld(name, "OK\n");
     }
@@ -500,6 +500,9 @@ fn layout_edge_cases_match_ld_lld() {
     let attrs = expected("layouts/attrs");
     assert_eq!(attrs.globals["__end"], 0x8000_2000);
     assert_eq!(attrs.loads.len(), 3);
+    let marker = expected("layouts/no-inputs");
+    let marker = marker.sections.iter().find(|s| s.name == ".marker").unwrap();
+    assert_eq!(marker.flags, "A", "no inputs after the code: not executable");
 }
 
 /// examples/hello assembled for RV64 by clang: xcal.dbg prints 64-bit
