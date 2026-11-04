@@ -1,74 +1,101 @@
 //! Stress test: every riscv-tests program, relinked by merlin-ld from the
-//! object it was built from (`tests/riscv-tests/obj`, written by
-//! `scripts/build-riscv-tests.sh` with `-mno-relax`), must give the same
-//! loaded bytes as the committed ld.lld executable (`tests/riscv-tests/<name>`)
-//! and pass in Grail.
+//! object it was built from (`scripts/build-riscv-tests.sh`, with
+//! `-mno-relax`), must give the same loaded bytes as the committed ld.lld
+//! executable and pass in Grail. Two suites: RV32 (`tests/riscv-tests`,
+//! objects in `obj/`) and RV64 (`tests/riscv-tests/rv64`, objects in
+//! `rv64/obj/`), each with its env's `link.ld`.
+//!
+//! The RV64 executables were linked by the LLD merlin-ld follows (23.1.4),
+//! and relinking their objects with it gives the same files, so their
+//! program headers are compared whole too: offsets, load addresses, sizes,
+//! flags and alignment. The RV32 ones come from older LLDs (18 and 21), whose
+//! `.comment` moves what follows it, so only their addresses and contents are.
+//! The RV64 objects carry only PC-relative relocations (PCREL_HI20 and its
+//! LO12_I and LO12_S): R_RISCV_64 and the range edges are the fixtures'
+//! (`tests/rv64.rs`).
 
 use grail::{Machine, RunResult};
 use merlin_ld::{Input, Options, ScriptSource};
 use std::path::{Path, PathBuf};
 
-/// Not run, as in Grail's own riscv-tests runner: it expects misaligned
-/// accesses to work in hardware, which Excalibur traps instead (spec §4).
-/// Its bytes are still compared.
-const NOT_RUN: &[&str] = &["rv32ui-p-ma_data"];
-
-fn dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/riscv-tests")
+/// One suite: a directory of executables, with their objects and the
+/// script in its `obj/`.
+struct Suite {
+    /// Relative to `tests/riscv-tests`.
+    dir: &'static str,
+    /// The name every executable of the suite starts with.
+    prefix: &'static str,
+    /// Not run, as in Grail's own riscv-tests runner: it expects misaligned
+    /// accesses to work in hardware, which Excalibur traps instead (spec
+    /// §4). Its bytes are still compared.
+    not_run: &'static str,
+    /// The references are from the same LLD: compare every program header
+    /// field, not only the addresses and the bytes.
+    same_lld: bool,
 }
 
-fn u16_at(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([b[o], b[o + 1]])
-}
-fn u32_at(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+const RV32: Suite = Suite {
+    dir: "",
+    prefix: "rv32",
+    not_run: "rv32ui-p-ma_data",
+    same_lld: false,
+};
+
+const RV64: Suite = Suite {
+    dir: "rv64",
+    prefix: "rv64",
+    not_run: "rv64ui-p-ma_data",
+    same_lld: true,
+};
+
+fn dir(suite: &Suite) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/riscv-tests")
+        .join(suite.dir)
 }
 
-/// `(vaddr, memsz, file bytes)` of every PT_LOAD of an executable.
-fn load_images(elf: &[u8]) -> Vec<(u32, u32, Vec<u8>)> {
-    let (phoff, phnum) = (u32_at(elf, 28) as usize, u16_at(elf, 44) as usize);
-    (0..phnum)
-        .map(|i| phoff + 32 * i)
-        .filter(|&p| u32_at(elf, p) == 1)
-        .map(|p| {
-            let (off, filesz) = (u32_at(elf, p + 4) as usize, u32_at(elf, p + 16) as usize);
-            (
-                u32_at(elf, p + 8),
-                u32_at(elf, p + 20),
-                elf[off..off + filesz].to_vec(),
-            )
-        })
+/// The PT_LOADs of an executable (either class), with their file bytes.
+fn loads(file: &[u8]) -> Result<Vec<(elf::ProgramHeader, Vec<u8>)>, String> {
+    let e = elf::Elf::parse(file).map_err(|e| e.to_string())?;
+    e.segments
+        .iter()
+        .filter(|p| p.ty == elf::PT_LOAD)
+        .map(|p| Ok((p.clone(), e.segment_data(p).map_err(|e| e.to_string())?.to_vec())))
         .collect()
 }
 
 /// Links `name.o` and checks it; the error says what went wrong.
-fn check(name: &str, opts: &Options) -> Result<(), String> {
-    let obj = dir().join("obj").join(format!("{name}.o"));
+fn check(suite: &Suite, name: &str, opts: &Options) -> Result<(), String> {
+    let obj = dir(suite).join("obj").join(format!("{name}.o"));
     let inputs = [Input {
         name: format!("{name}.o"),
         data: std::fs::read(&obj).map_err(|e| format!("{}: {e}", obj.display()))?,
     }];
     let linked = merlin_ld::link(&inputs, opts).map_err(|e| format!("link: {e:?}"))?;
-    let lld = std::fs::read(dir().join(name)).map_err(|e| format!("ld.lld executable: {e}"))?;
-    let (ours, theirs) = (load_images(&linked.elf), load_images(&lld));
+    let lld = std::fs::read(dir(suite).join(name)).map_err(|e| format!("ld.lld executable: {e}"))?;
+    let (ours, theirs) = (loads(&linked.elf)?, loads(&lld)?);
     if ours.len() != theirs.len() {
         return Err(format!("{} PT_LOADs, ld.lld has {}", ours.len(), theirs.len()));
     }
-    for ((va, msz, a), (vb, mszb, b)) in ours.iter().zip(&theirs) {
-        if (va, msz, a.len()) != (vb, mszb, b.len()) {
+    for ((a, a_bytes), (b, b_bytes)) in ours.iter().zip(&theirs) {
+        let (va, vb) = (a.vaddr, b.vaddr);
+        if (va, a.memsz, a.filesz) != (vb, b.memsz, b.filesz) {
             return Err(format!(
-                "segment {va:#x} ({msz:#x} bytes, {:#x} in the file), ld.lld: {vb:#x} ({mszb:#x}, {:#x})",
-                a.len(),
-                b.len()
+                "segment {va:#x} ({:#x} bytes, {:#x} in the file), ld.lld: {vb:#x} ({:#x}, {:#x})",
+                a.memsz, a.filesz, b.memsz, b.filesz
             ));
         }
-        if let Some(i) = (0..a.len()).find(|&i| a[i] != b[i]) {
-            return Err(format!("first differing byte at {:#x}", va + i as u32));
+        if suite.same_lld && a != b {
+            return Err(format!("segment {va:#x}: {a:x?}, ld.lld: {b:x?}"));
+        }
+        if let Some(i) = (0..a_bytes.len()).find(|&i| a_bytes[i] != b_bytes[i]) {
+            return Err(format!("first differing byte at {:#x}", va + i as u64));
         }
     }
-    if NOT_RUN.contains(&name) {
+    if name == suite.not_run {
         return Ok(());
     }
+    // An ELF64 file makes the machine RV64.
     let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.cpu.bus.uart.capture = true;
     m.load_elf(&linked.elf).map_err(|e| format!("load: {e}"))?;
@@ -79,9 +106,9 @@ fn check(name: &str, opts: &Options) -> Result<(), String> {
     }
 }
 
-#[test]
-fn riscv_tests_relinked_by_merlin_ld() {
-    let script = dir().join("obj/link.ld");
+/// Relinks every program of `suite`; returns how many there were.
+fn relink(suite: &Suite) -> usize {
+    let script = dir(suite).join("obj/link.ld");
     let opts = Options {
         script: Some(ScriptSource {
             name: "link.ld".into(),
@@ -89,7 +116,7 @@ fn riscv_tests_relinked_by_merlin_ld() {
         }),
         entry: None,
     };
-    let mut names: Vec<String> = std::fs::read_dir(dir().join("obj"))
+    let mut names: Vec<String> = std::fs::read_dir(dir(suite).join("obj"))
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| p.extension().is_some_and(|e| e == "o"))
@@ -97,18 +124,18 @@ fn riscv_tests_relinked_by_merlin_ld() {
         .collect();
     names.sort();
     // One object per prebuilt executable.
-    let mut elfs: Vec<String> = std::fs::read_dir(dir())
+    let mut elfs: Vec<String> = std::fs::read_dir(dir(suite))
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .filter(|n| n.starts_with("rv32"))
+        .filter(|n| n.starts_with(suite.prefix))
         .collect();
     elfs.sort();
     assert_eq!(names, elfs);
-    assert!(names.len() > 60, "{} objects", names.len());
+    assert!(names.iter().any(|n| n == suite.not_run));
 
     let failures: Vec<String> = names
         .iter()
-        .filter_map(|n| check(n, &opts).err().map(|e| format!("{n}: {e}")))
+        .filter_map(|n| check(suite, n, &opts).err().map(|e| format!("{n}: {e}")))
         .collect();
     assert!(
         failures.is_empty(),
@@ -117,4 +144,17 @@ fn riscv_tests_relinked_by_merlin_ld() {
         names.len(),
         failures.join("\n")
     );
+    names.len()
+}
+
+#[test]
+fn riscv_tests_relinked_by_merlin_ld() {
+    let n = relink(&RV32);
+    assert!(n > 60, "{n} objects");
+}
+
+#[test]
+fn rv64_riscv_tests_relinked_by_merlin_ld() {
+    let n = relink(&RV64);
+    assert!(n > 100, "{n} objects");
 }
