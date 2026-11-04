@@ -55,6 +55,35 @@
 //! Tokens of the body take the position of the macro's name where it was
 //! used, so errors in the expansion point there; tokens of an argument keep
 //! their own.
+//!
+//! ## Assembly (`-x assembler-with-cpp`)
+//!
+//! `.S` files are assembly run through this preprocessor first, as clang
+//! and GCC run them through theirs ([`Lang::AssemblerWithCpp`]); that is
+//! how one source serves both widths, with `#if __riscv_xlen == 64` and
+//! Linux's `REG_L`/`REG_S` macros. Everything above holds, with what clang
+//! changes for assembly:
+//!
+//! * `#` at the start of a line followed by anything but a directive's name
+//!   (`# a comment`, `# 2^64 - 1`, `#` then a number too, which C would read
+//!   as a line marker) is no directive: the line passes through, macros
+//!   replaced in it, as assembly comments must. A line with only `#` is
+//!   still the null directive, and a directive's name always means the
+//!   directive, so a comment may not start with `# if` or `# define`.
+//! * `__ASSEMBLER__` is defined.
+//! * Pasting two tokens that do not form one (`. ## name`) is no error: they
+//!   stay two, written with nothing between them.
+//! * Trigraphs are characters, and what is no C token (`$`, `@`, `\`)
+//!   passes through ([`lexer::lex_pp_asm`]).
+//!
+//! The output is text for the assembler ([`Output::print_asm`]), written as
+//! clang writes it, so that `merlin -E` and `clang -E` print the same thing
+//! for a `.S` file: every token on the line it came from, with blank lines
+//! or a line marker (`# 120 "file.S"`) to keep the numbering, and markers
+//! where an `#include`d file starts (`# 1 "dir/asm.h" 1`) and ends (`# 5
+//! "file.S" 2`); see [`Output::print_asm`] for the spacing. merlin-as reads
+//! the markers as the comments they are, and [`source_line`] maps a line of
+//! the output back to the file and line it came from, for its errors.
 
 use crate::lexer::{self, PpKind, PpToken};
 use crate::types::Xlen;
@@ -86,16 +115,50 @@ pub struct Options {
     pub debug: Option<crate::DebugInfo>,
     /// `-march`: RV32 (ILP32) or RV64 (LP64).
     pub xlen: Xlen,
+    /// `-x`: what the input is.
+    pub lang: Lang,
 }
 
 impl Default for Options {
-    /// No `-I`, `-D` or `-g`, for RV32 (the default until #159).
+    /// No `-I`, `-D` or `-g`, C for RV32 (the default until #159).
     fn default() -> Options {
         Options {
             include_dirs: Vec::new(),
             macros: Vec::new(),
             debug: None,
             xlen: Xlen::Rv32,
+            lang: Lang::C,
+        }
+    }
+}
+
+/// The language of the input, as clang's `-x` names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lang {
+    /// `-x c`: C, compiled (`.c` files).
+    C,
+    /// `-x assembler-with-cpp`: assembly, only preprocessed (`.S` files);
+    /// see the module's documentation.
+    AssemblerWithCpp,
+}
+
+impl Lang {
+    /// The language of `-x NAME`.
+    pub fn from_name(name: &str) -> Option<Lang> {
+        match name {
+            "c" => Some(Lang::C),
+            "assembler-with-cpp" => Some(Lang::AssemblerWithCpp),
+            _ => None,
+        }
+    }
+
+    /// The language clang gives a file by its name: `.S` (and `.sx`) are
+    /// assembler-with-cpp, anything else C.
+    pub fn of_file(name: &str) -> Lang {
+        if name.ends_with(".S") || name.ends_with(".sx") {
+            Lang::AssemblerWithCpp
+        } else {
+            Lang::C
         }
     }
 }
@@ -190,6 +253,34 @@ pub fn predefined(x: Xlen) -> Vec<(&'static str, &'static str)> {
 /// How deeply `#include`s may nest (clang's limit too).
 const MAX_INCLUDE_DEPTH: usize = 200;
 
+/// Every directive's name clang knows. In assembly, `#` and any other word
+/// starts no directive.
+const DIRECTIVES: &[&str] = &[
+    "define",
+    "undef",
+    "include",
+    "include_next",
+    "import",
+    "if",
+    "ifdef",
+    "ifndef",
+    "elif",
+    "elifdef",
+    "elifndef",
+    "else",
+    "endif",
+    "line",
+    "error",
+    "warning",
+    "pragma",
+    "ident",
+    "sccs",
+    "assert",
+    "unassert",
+    "embed",
+    "__include_macros",
+];
+
 /// The preprocessed translation unit.
 #[derive(Debug)]
 pub struct Output {
@@ -202,6 +293,36 @@ pub struct Output {
     /// and the name in the `#include`) and the predefined and command-line
     /// macros (`<built-in>`, `<command line>`).
     pub files: Vec<String>,
+    /// How each token is laid out, for [`Output::print_asm`].
+    layout: Vec<Layout>,
+    /// Where files start and end and `#line` renumbers, after how many tokens.
+    marks: Vec<(usize, Mark)>,
+}
+
+/// Where a token of the output goes, for [`Output::print_asm`].
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+    /// It starts a line (a macro's expansion starts one where its name did).
+    bol: bool,
+    /// The line and column it is shown at: its own, or where the outermost
+    /// macro that produced it was used.
+    at: Pos,
+    /// Where its characters are written (see [`PTok::spelled`]).
+    spelled: Option<(Pos, Pos)>,
+    /// Whitespace before it on its line (see [`PTok::lead`]).
+    lead: bool,
+}
+
+/// A change of file in the output: a line marker.
+#[derive(Clone, Copy, Debug)]
+enum Mark {
+    /// An `#include`d file starts; the `#include` is on `line` of the file
+    /// that includes it.
+    Enter { line: u32, file: u32 },
+    /// It has ended: the file that included it goes on at `line`.
+    Exit { line: u32, file: u32 },
+    /// `#line`: the next line is `line` of `file`.
+    Rename { line: u32, file: u32 },
 }
 
 impl Output {
@@ -210,6 +331,264 @@ impl Output {
         name_files(&self.files, &mut errors);
         errors
     }
+
+    /// The text of preprocessed assembly, for the assembler, as clang's
+    /// `-E` writes it (`PrintPreprocessedOutput.cpp`): a line marker
+    /// `# 1 "file.S"` first, then each token on the line it came from (a
+    /// macro's expansion on the line of the macro's name):
+    ///
+    /// * To get to the line of a token that starts one, a newline ends the
+    ///   current line, and the blank lines in between are written out if
+    ///   there are at most 8 lines to go; past that (or going back) a line
+    ///   marker `# N "file"` says where the next line is.
+    /// * The first token of a new line is indented to its column (`#` in
+    ///   column 1 gets one space, so that it reads as no directive), and so
+    ///   is the first token of a file, on the line its marker gives. After
+    ///   the marker of `#line` or of the end of an `#include`d file, though,
+    ///   a token on the marker's line gets one space if it had any before
+    ///   it, as on any other line.
+    /// * Between tokens on a line: one space where the source had
+    ///   whitespace, and one where two tokens that were not written next to
+    ///   each other would otherwise read as something else ([`avoid_concat`]).
+    /// * Entering an `#include`d file writes `# 1 "name" 1`, leaving it
+    ///   `# N "file" 2` with the line after the `#include`, and `#line` a
+    ///   marker for the line it gives.
+    ///
+    /// clang also writes markers for its `<built-in>` and `<command line>`
+    /// macros, which merlin leaves out.
+    pub fn print_asm(&self) -> String {
+        let mut p = Printer {
+            out: String::new(),
+            line: 1,
+            file: 0,
+            files: &self.files,
+            started: false,
+            entered: true,
+        };
+        p.line_marker(1, "");
+        let mut marks = self.marks.iter().peekable();
+        let (mut prev, mut prev_prev): (Option<usize>, Option<usize>) = (None, None);
+        for (i, (t, l)) in self.tokens.iter().zip(&self.layout).enumerate() {
+            while let Some((_, mark)) = marks.next_if(|(at, _)| *at <= i) {
+                p.mark(*mark);
+            }
+            let new_line = l.bol && (p.move_to_line(l.at.line) | std::mem::take(&mut p.entered));
+            if new_line {
+                let mut col = l.at.col;
+                if col == 1 && l.lead {
+                    col = 2;
+                }
+                if col <= 1 && t.is_punct("#") {
+                    p.out.push(' ');
+                }
+                for _ in 1..col {
+                    p.out.push(' ');
+                }
+            } else if l.lead
+                || (p.started
+                    && prev.is_some_and(|k| {
+                        avoid_concat(
+                            prev_prev.map(|j| (&self.tokens[j], &self.layout[j])),
+                            (&self.tokens[k], &self.layout[k]),
+                            (t, l),
+                        )
+                    }))
+            {
+                p.out.push(' ');
+            }
+            p.out.push_str(&t.text);
+            p.started = true;
+            p.entered = false;
+            prev_prev = prev;
+            prev = Some(i);
+        }
+        for (_, mark) in marks {
+            p.mark(*mark);
+        }
+        if p.started {
+            p.out.push('\n');
+        }
+        p.out
+    }
+}
+
+/// The state of [`Output::print_asm`].
+struct Printer<'a> {
+    out: String,
+    /// The line of the file being written that the output is on.
+    line: u32,
+    /// That file.
+    file: u32,
+    files: &'a [String],
+    /// Tokens have been written on the current line.
+    started: bool,
+    /// No token has been written since a file was entered: the next one is
+    /// indented, even on the line of the marker.
+    entered: bool,
+}
+
+impl Printer<'_> {
+    /// `# N "file"` and `extra` (` 1` entering a file, ` 2` leaving one),
+    /// on a line of its own: the next line is line `line`.
+    fn line_marker(&mut self, line: u32, extra: &str) {
+        if std::mem::take(&mut self.started) {
+            self.out.push('\n');
+        }
+        let name = escape(&self.files[self.file as usize]);
+        self.out.push_str(&format!("# {line} \"{name}\"{extra}\n"));
+    }
+
+    /// Goes to line `line` of the current file (clang's `MoveToLine`): one
+    /// newline to the next line, newlines up to 8 lines ahead, else a line
+    /// marker. Whether the output is now at the start of a line.
+    fn move_to_line(&mut self, line: u32) -> bool {
+        let moved = if self.line == line {
+            false
+        } else if line == self.line + 1 {
+            self.out.push('\n');
+            true
+        } else {
+            if line > self.line && line - self.line <= 8 {
+                for _ in self.line..line {
+                    self.out.push('\n');
+                }
+            } else {
+                self.line_marker(line, "");
+            }
+            true
+        };
+        if moved {
+            self.started = false;
+        }
+        self.line = line;
+        moved
+    }
+
+    fn mark(&mut self, mark: Mark) {
+        match mark {
+            Mark::Enter { line, file } => {
+                self.move_to_line(line);
+                self.file = file;
+                self.line = 1;
+                self.line_marker(1, " 1");
+                self.entered = true;
+            }
+            Mark::Exit { line, file } => {
+                self.file = file;
+                self.line = line;
+                self.line_marker(line, " 2");
+                self.entered = false;
+            }
+            Mark::Rename { line, file } => {
+                self.file = file;
+                self.line = line;
+                self.line_marker(line, "");
+                self.entered = false;
+            }
+        }
+    }
+}
+
+/// Whether `tok` needs a space after `prev` (and `prev_prev` before it),
+/// though the source had none: clang's `TokenConcatenation::AvoidConcat`,
+/// for C. Never for two tokens written next to each other (in the source
+/// or in one macro's body), which read as two already; otherwise when
+/// writing them together could read as other tokens, judged by `prev`'s
+/// kind and the first character of `tok`, as clang judges it: `-` then
+/// `-` or `>`, a number then a letter, a digit, `_`, `.`, `+` or `-`, an
+/// identifier then an identifier or a number, an operator then `=`...
+fn avoid_concat(
+    prev_prev: Option<(&PpToken, &Layout)>,
+    (prev, pl): (&PpToken, &Layout),
+    (tok, tl): (&PpToken, &Layout),
+) -> bool {
+    if let (Some((_, pend)), Some((tpos, _))) = (pl.spelled, tl.spelled) {
+        if pend == tpos {
+            return false;
+        }
+    }
+    let first = tok.text.chars().next().unwrap_or(' ');
+    let punct = |p: &PpToken| match p.kind {
+        PpKind::Punct(s) => s,
+        _ => "",
+    };
+    let (p, t) = (punct(prev), punct(tok));
+    // `&=`, `+=`, `==`, `<<=`...: an operator then `=` or `==`.
+    if matches!(
+        p,
+        "&" | "+" | "-" | "/" | "<" | ">" | "|" | "%" | "*" | "!" | "<<" | ">>" | "^" | "="
+    ) && matches!(t, "=" | "==")
+    {
+        return true;
+    }
+    match prev.kind {
+        PpKind::Ident => match tok.kind {
+            PpKind::Number => first != '.',
+            PpKind::Ident => true,
+            // L"x", u8"x": a string's prefix.
+            PpKind::Str | PpKind::Char => matches!(prev.text.as_str(), "L" | "u" | "U" | "u8"),
+            _ => false,
+        },
+        PpKind::Number => first.is_ascii_alphanumeric() || matches!(first, '_' | '.' | '+' | '-'),
+        PpKind::Punct(_) => match p {
+            "." => {
+                (first == '.' && prev_prev.is_some_and(|(pp, _)| pp.is_punct("."))) || first.is_ascii_digit()
+            }
+            "&" => first == '&',
+            "+" => first == '+',
+            "-" => first == '-' || first == '>',
+            "/" => first == '*' || first == '/',
+            "<" => matches!(first, '<' | ':' | '%'),
+            ">" => first == '>',
+            "|" => first == '|',
+            "%" => first == '>' || first == ':',
+            ":" => first == '>',
+            "#" => matches!(first, '#' | '@' | '%'),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The file and line a line of [`Output::print_asm`]'s text comes from,
+/// as its line markers say (line numbers from 1); `None` for a marker's
+/// own line, or before the first.
+pub fn source_line(text: &str, line: usize) -> Option<(String, usize)> {
+    let mut at: Option<(String, usize)> = None;
+    for (n, l) in text.lines().enumerate() {
+        if let Some(marker) = line_marker(l) {
+            if n + 1 == line {
+                return None;
+            }
+            at = Some(marker);
+            continue;
+        }
+        if n + 1 == line {
+            return at;
+        }
+        if let Some((_, k)) = &mut at {
+            *k += 1;
+        }
+    }
+    None
+}
+
+/// A line marker's line and file: `# 12 "file.S"` and any flags after it.
+fn line_marker(l: &str) -> Option<(String, usize)> {
+    let rest = l.strip_prefix("# ")?;
+    let (n, rest) = rest.split_once(' ')?;
+    let n: usize = n.parse().ok()?;
+    let rest = rest.strip_prefix('"')?;
+    let mut name = String::new();
+    let mut chars = rest.chars();
+    loop {
+        match chars.next()? {
+            '"' => break,
+            '\\' => name.push(chars.next()?),
+            c => name.push(c),
+        }
+    }
+    Some((name, n))
 }
 
 fn name_files(files: &[String], errors: &mut [Error]) {
@@ -238,11 +617,33 @@ pub fn preprocess(name: &str, src: &str, opts: &Options, load: Loader) -> Result
         isolated: false,
         conds: Vec::new(),
         command_line: true,
+        asm: opts.lang == Lang::AssemblerWithCpp,
+        guards: HashMap::new(),
+        emitted: 0,
+        marks: Vec::new(),
+        carry: (false, false, false),
     };
     let result = pp.run(src);
     let files: Vec<String> = pp.files.into_iter().map(|f| f.name).collect();
     match result {
-        Ok((tokens, end)) => Ok(Output { tokens, end, files }),
+        Ok((toks, end)) => {
+            let layout = toks
+                .iter()
+                .map(|t| Layout {
+                    bol: t.t.bol,
+                    at: t.site.unwrap_or(t.t.pos),
+                    spelled: t.spelled,
+                    lead: t.lead,
+                })
+                .collect();
+            Ok(Output {
+                tokens: toks.into_iter().map(|t| t.t).collect(),
+                end,
+                files,
+                layout,
+                marks: pp.marks,
+            })
+        }
         Err(mut e) => {
             name_files(&files, std::slice::from_mut(&mut e));
             Err(e)
@@ -331,11 +732,41 @@ fn hide_intersection(a: &HideSet, b: &HideSet) -> HideSet {
     Rc::new(a.iter().filter(|n| b.contains(n)).cloned().collect())
 }
 
-/// A token and its hide set.
+/// A token and its hide set, and where it comes from, for
+/// [`Output::print_asm`].
 #[derive(Clone, Debug)]
 struct PTok {
     t: PpToken,
     hide: HideSet,
+    /// For a token a macro's expansion produced: where the outermost macro
+    /// was used (clang's *expansion location*), the line and column it is
+    /// shown at.
+    site: Option<Pos>,
+    /// Where its characters are written, in a file or in a macro's body;
+    /// `None` for one the preprocessor made (`#x`, `a ## b`, `__LINE__`).
+    /// Two tokens written next to each other need no space between them.
+    spelled: Option<(Pos, Pos)>,
+    /// clang's *leading space*: whitespace (or a comment) before it on its
+    /// own line, which [`PpToken::space`] also says for a newline. Macro
+    /// expansion moves it about as it moves `space`.
+    lead: bool,
+}
+
+impl PTok {
+    /// A token as read from a file.
+    fn read(t: PpToken) -> PTok {
+        let spelled = Some((t.pos, t.end));
+        // What comes before the first token of a line is on that line only
+        // if it is not in column 1.
+        let lead = t.space && (!t.bol || t.pos.col > 1);
+        PTok {
+            t,
+            hide: HideSet::default(),
+            site: None,
+            spelled,
+            lead,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -408,6 +839,9 @@ struct Cursor {
     /// How many conditionals were open when it was entered: the ones it
     /// opens must be closed in it.
     conds: usize,
+    /// For an `#include`d file: the line the file that includes it goes on
+    /// at, after the directive.
+    back: Option<u32>,
 }
 
 /// An open `#if` (or `#ifdef`, `#ifndef`).
@@ -439,16 +873,37 @@ struct Pp<'a> {
     /// Reading the predefined and command-line macros, which may be defined
     /// again.
     command_line: bool,
+    /// Preprocessing assembly ([`Lang::AssemblerWithCpp`]).
+    asm: bool,
+    /// The include guard of each file read that has one (see [`guard`]).
+    guards: HashMap<PathBuf, String>,
+    /// How many tokens have come out so far, where [`Pp::marks`] are.
+    emitted: usize,
+    /// Where files start and end, after how many tokens.
+    marks: Vec<(usize, Mark)>,
+    /// A macro that expanded to nothing started a line, or had a space
+    /// before it: the next token takes that over (as in clang, so that
+    /// `EMPTY li a0, 1` is indented like `li a0, 1`). Its `bol`, `space`
+    /// and `lead`.
+    carry: (bool, bool, bool),
 }
 
 impl Pp<'_> {
-    fn run(&mut self, src: &str) -> Result<(Vec<PpToken>, Pos), Error> {
+    /// Splits a file into tokens, as C or as assembly.
+    fn lex(&self, text: &str, file: u32) -> Result<(Vec<PpToken>, Pos), Error> {
+        lexer::lex_pp_in(text, file, self.asm)
+    }
+
+    fn run(&mut self, src: &str) -> Result<(Vec<PTok>, Pos), Error> {
         // The predefined macros, then -D and -U, as directives of their own
         // files.
         let mut builtin: String = predefined(self.opts.xlen)
             .iter()
             .map(|(name, value)| format!("#define {name} {value}\n"))
             .collect();
+        if self.asm {
+            builtin.push_str("#define __ASSEMBLER__ 1\n");
+        }
         builtin.push_str("#define __FILE__\n#define __LINE__\n");
         self.read_directives("<built-in>", &builtin)?;
         self.macros.get_mut("__FILE__").expect("defined above").kind = MacroKind::File;
@@ -470,11 +925,12 @@ impl Pp<'_> {
         }
         self.command_line = false;
 
-        let (toks, end) = lexer::lex_pp(src, 0)?;
+        let (toks, end) = self.lex(src, 0)?;
         self.enter(toks, 0);
         let mut out = Vec::new();
         while let Some(t) = self.next()? {
-            out.push(t.t);
+            out.push(t);
+            self.emitted += 1;
         }
         Ok((out, end))
     }
@@ -502,6 +958,7 @@ impl Pp<'_> {
             file,
             line_delta: 0,
             conds: self.conds.len(),
+            back: None,
         });
     }
 
@@ -526,9 +983,22 @@ impl Pp<'_> {
         t
     }
 
-    /// Whether the innermost file's next token starts a directive.
+    /// Whether the innermost file's next token starts a directive: a `#`
+    /// that starts a line, and in assembly only one followed by a
+    /// directive's name or by nothing (`# a comment` is assembly).
     fn at_directive(&self) -> bool {
-        self.peek_file().is_some_and(|t| t.bol && t.is_punct("#"))
+        let Some(cur) = self.stack.last() else {
+            return false;
+        };
+        if !cur.toks.get(cur.i).is_some_and(|t| t.bol && t.is_punct("#")) {
+            return false;
+        }
+        !self.asm
+            || match cur.toks.get(cur.i + 1) {
+                None => true,
+                Some(n) if n.bol => true,
+                Some(n) => n.ident().is_some_and(|name| DIRECTIVES.contains(&name)),
+            }
     }
 
     /// The tokens of the innermost file up to the end of the line.
@@ -548,6 +1018,10 @@ impl Pp<'_> {
                 self.conds.last().expect("checked").pos,
                 "unterminated conditional directive",
             ));
+        }
+        if let (Some(line), Some(parent)) = (cur.back, self.stack.last()) {
+            let file = parent.file;
+            self.marks.push((self.emitted, Mark::Exit { line, file }));
         }
         Ok(())
     }
@@ -582,11 +1056,14 @@ impl Pp<'_> {
                 self.directive()?;
                 continue;
             }
-            let t = self.take_file();
-            return Ok(Some(PTok {
-                t,
-                hide: HideSet::default(),
-            }));
+            let mut t = PTok::read(self.take_file());
+            // A `#` that starts no directive (in assembly) is written with a
+            // space before it, even in column 1, so that it reads as none
+            // again (clang's output does this).
+            if t.t.bol && t.t.is_punct("#") {
+                t.lead = true;
+            }
+            return Ok(Some(t));
         }
     }
 
@@ -604,9 +1081,13 @@ impl Pp<'_> {
     /// The next token after macro replacement, or `None` at the end.
     fn next(&mut self) -> Result<Option<PTok>, Error> {
         loop {
-            let Some(t) = self.next_raw(false)? else {
+            let Some(mut t) = self.next_raw(false)? else {
                 return Ok(None);
             };
+            let (bol, space, lead) = std::mem::take(&mut self.carry);
+            t.t.bol |= bol;
+            t.t.space |= space;
+            t.lead |= lead;
             let Some(name) = t.t.ident() else {
                 return Ok(Some(t));
             };
@@ -627,7 +1108,7 @@ impl Pp<'_> {
                 MacroKind::Line => vec![self.made(&t, PpKind::Number, t.t.pos.line.to_string())],
                 MacroKind::Object => {
                     let hide = hide_union(&t.hide, &Rc::new(vec![name]));
-                    self.substitute(&m, &[], &hide, &t.t, t.t.end)?
+                    self.substitute(&m, &[], &hide, &t, t.t.end)?
                 }
                 MacroKind::Function { params, variadic } => {
                     if !self.lparen_follows() {
@@ -635,9 +1116,12 @@ impl Pp<'_> {
                     }
                     let (args, rparen) = self.arguments(&t.t, params.len(), *variadic)?;
                     let hide = hide_union(&hide_intersection(&t.hide, &rparen.hide), &Rc::new(vec![name]));
-                    self.substitute(&m, &args, &hide, &t.t, rparen.t.end)?
+                    self.substitute(&m, &args, &hide, &t, rparen.t.end)?
                 }
             };
+            if expansion.is_empty() {
+                self.carry = (t.t.bol, t.t.space, t.lead);
+            }
             for t in expansion.into_iter().rev() {
                 self.pending.push_front(t);
             }
@@ -652,10 +1136,13 @@ impl Pp<'_> {
                 text,
                 pos: at.t.pos,
                 end: at.t.end,
-                bol: false,
+                bol: at.t.bol,
                 space: at.t.space,
             },
             hide: at.hide.clone(),
+            site: Some(at.site.unwrap_or(at.t.pos)),
+            spelled: None,
+            lead: at.lead,
         }
     }
 
@@ -664,6 +1151,7 @@ impl Pp<'_> {
     fn expand_alone(&mut self, toks: Vec<PTok>) -> Result<Vec<PTok>, Error> {
         let saved = std::mem::replace(&mut self.pending, toks.into());
         let was_isolated = std::mem::replace(&mut self.isolated, true);
+        let carry = std::mem::take(&mut self.carry);
         let mut out = Vec::new();
         let result = loop {
             match self.next() {
@@ -674,6 +1162,7 @@ impl Pp<'_> {
         };
         self.pending = saved;
         self.isolated = was_isolated;
+        self.carry = carry;
         result
     }
 
@@ -738,14 +1227,24 @@ impl Pp<'_> {
 
     /// The expansion of macro `m` used at `at` (ending at `end`), with these
     /// arguments, every token's hide set extended by `hide`.
+    ///
+    /// The spaces between the tokens are clang's (which `-E` output shows):
+    /// a body token keeps the one before it in the definition, except right
+    /// after `##`; what an argument gives starts with the space before the
+    /// parameter in the body, not with the one it had in the call (`[x]`
+    /// with `( a )` is `[a]`); and an empty argument hands its space on to
+    /// what comes next. The first token takes the spacing of the macro's
+    /// name, and whether it started a line.
     fn substitute(
         &mut self,
         m: &Macro,
         args: &[Vec<PTok>],
         hide: &HideSet,
-        at: &PpToken,
+        at_tok: &PTok,
         end: Pos,
     ) -> Result<Vec<PTok>, Error> {
+        let site = Some(at_tok.site.unwrap_or(at_tok.t.pos));
+        let at = &at_tok.t;
         // A body token, where the macro was used.
         let here = |t: &PpToken| PTok {
             t: PpToken {
@@ -755,6 +1254,9 @@ impl Pp<'_> {
                 ..t.clone()
             },
             hide: HideSet::default(),
+            site,
+            spelled: Some((t.pos, t.end)),
+            lead: t.space,
         };
         let placemarker = || PTok {
             t: PpToken {
@@ -766,14 +1268,23 @@ impl Pp<'_> {
                 space: false,
             },
             hide: HideSet::default(),
+            site,
+            spelled: None,
+            lead: false,
         };
+        let (at_lead, at_bol) = (at_tok.lead, at_tok.t.bol);
         let mut out: Vec<PTok> = Vec::new();
         // A `##` was just seen: the next tokens' first is pasted to the last one out.
         let mut paste = false;
+        // The next token out gets a space before it (clang's `NextTokGetsSpace`).
+        let mut space = false;
         let body = &m.body;
         let mut i = 0;
         while i < body.len() {
             let t = &body[i];
+            if i > 0 && t.space && !body[i - 1].is_punct("##") {
+                space = true;
+            }
             let next_is_paste = body.get(i + 1).is_some_and(|n| n.is_punct("##"));
             // In a function-like macro, `#` is always before a parameter
             // (`define` checks).
@@ -781,8 +1292,9 @@ impl Pp<'_> {
                 .get(i + 1)
                 .and_then(|n| m.param(n))
                 .filter(|_| t.is_punct("#"));
-            let piece: Vec<PTok> = if t.is_punct("##") {
+            let mut piece: Vec<PTok> = if t.is_punct("##") {
                 paste = true;
+                space = false;
                 i += 1;
                 continue;
             } else if let Some(p) = stringized {
@@ -791,6 +1303,7 @@ impl Pp<'_> {
                 i += 1;
                 let mut s = here(t);
                 s.t.kind = PpKind::Str;
+                s.spelled = None;
                 s.t.text = stringize(arg).ok_or_else(|| {
                     Error::new(
                         at.pos,
@@ -814,12 +1327,20 @@ impl Pp<'_> {
                 vec![here(t)]
             };
             i += 1;
+            // What comes out for this body token starts with the space it
+            // gets, and (for an argument) no longer starts a line; the rest
+            // of an argument keeps its own, as in clang, line starts too.
+            if let Some(first) = piece.first_mut().filter(|f| f.t.kind != PpKind::Placemarker) {
+                first.t.space = std::mem::take(&mut space);
+                first.lead = first.t.space;
+                first.t.bol = false;
+            }
             let mut piece = piece.into_iter();
             if paste {
                 paste = false;
                 let left = out.pop().expect("'##' is never first in a body");
                 match piece.next() {
-                    Some(right) => out.push(glue(left, right)?),
+                    Some(right) => out.extend(glue(left, right, self.asm)?),
                     None => out.push(left), // an argument that expanded to nothing
                 }
             }
@@ -830,9 +1351,12 @@ impl Pp<'_> {
         out.retain(|t| t.t.kind != PpKind::Placemarker);
         for t in &mut out {
             t.hide = hide_union(&t.hide, hide);
+            t.site = site;
         }
         if let Some(first) = out.first_mut() {
             first.t.space = at.space;
+            first.lead = at_lead;
+            first.t.bol = at_bol;
         }
         Ok(out)
     }
@@ -1028,13 +1552,7 @@ impl Pp<'_> {
             Some(h) => h,
             None => {
                 // `#include MACRO`: replace, then it must be one of the two forms.
-                let toks = args
-                    .iter()
-                    .map(|t| PTok {
-                        t: t.clone(),
-                        hide: HideSet::default(),
-                    })
-                    .collect();
+                let toks = args.iter().cloned().map(PTok::read).collect();
                 let expanded: Vec<PpToken> = self.expand_alone(toks)?.into_iter().map(|t| t.t).collect();
                 header_name(&expanded)?.ok_or_else(|| {
                     Error::new(
@@ -1073,6 +1591,17 @@ impl Pp<'_> {
             if self.once.contains(&path) {
                 return Ok(());
             }
+            // A file wholly inside `#ifndef X` ... `#endif` is not read again
+            // once X is defined (clang's and GCC's multiple-include
+            // optimization): nothing of it would come out, and no line
+            // marker says it was entered.
+            if self
+                .guards
+                .get(&path)
+                .is_some_and(|g| self.macros.contains_key(g))
+            {
+                return Ok(());
+            }
             if self.stack.len() >= MAX_INCLUDE_DEPTH {
                 return Err(Error::new(pos, "#include nested too deeply"));
             }
@@ -1081,9 +1610,22 @@ impl Pp<'_> {
             } else {
                 format!("{}/{header}", shown.trim_end_matches(['/', '\\']))
             };
-            let id = self.new_file(name, path);
-            let (toks, _) = lexer::lex_pp(&text, id)?;
+            let id = self.new_file(name, path.clone());
+            let (toks, _) = self.lex(&text, id)?;
+            if let Some(g) = guard(&toks) {
+                self.guards.insert(path, g);
+            }
+            // The file that includes it goes on after the directive's line.
+            let back = args.last().map_or(directive.end.line, |t| t.end.line) + 1;
+            self.marks.push((
+                self.emitted,
+                Mark::Enter {
+                    line: directive.pos.line,
+                    file: id,
+                },
+            ));
             self.enter(toks, id);
+            self.stack.last_mut().expect("entered").back = Some(back);
             return Ok(());
         }
         Err(Error::new(pos, format!("'{header}' file not found")))
@@ -1092,13 +1634,7 @@ impl Pp<'_> {
     /// `#line N` or `#line N "name"` (after macro replacement): the next
     /// line is line N (of a file called `name`).
     fn line(&mut self, directive: &PpToken, args: &[PpToken]) -> Result<(), Error> {
-        let toks = args
-            .iter()
-            .map(|t| PTok {
-                t: t.clone(),
-                hide: HideSet::default(),
-            })
-            .collect();
+        let toks = args.iter().cloned().map(PTok::read).collect();
         let toks: Vec<PpToken> = self.expand_alone(toks)?.into_iter().map(|t| t.t).collect();
         let bad = || {
             Error::new(
@@ -1130,6 +1666,8 @@ impl Pp<'_> {
         if let Some(id) = renamed {
             cur.file = id;
         }
+        let file = cur.file;
+        self.marks.push((self.emitted, Mark::Rename { line: n, file }));
         Ok(())
     }
 
@@ -1223,10 +1761,7 @@ impl Pp<'_> {
             let t = &args[i];
             i += 1;
             if t.ident() != Some("defined") {
-                toks.push(PTok {
-                    t: t.clone(),
-                    hide: HideSet::default(),
-                });
+                toks.push(PTok::read(t.clone()));
                 continue;
             }
             let paren = args.get(i).is_some_and(|t| t.is_punct("("));
@@ -1250,14 +1785,11 @@ impl Pp<'_> {
                 i += 1;
             }
             let value = if self.macros.contains_key(name) { "1" } else { "0" };
-            toks.push(PTok {
-                t: PpToken {
-                    kind: PpKind::Number,
-                    text: value.to_string(),
-                    ..t.clone()
-                },
-                hide: HideSet::default(),
-            });
+            toks.push(PTok::read(PpToken {
+                kind: PpKind::Number,
+                text: value.to_string(),
+                ..t.clone()
+            }));
         }
         let toks: Vec<PpToken> = self.expand_alone(toks)?.into_iter().map(|t| t.t).collect();
         let mut e = Eval {
@@ -1291,6 +1823,52 @@ fn no_more(rest: &[PpToken], directive: &str) -> Result<(), Error> {
         )),
         None => Ok(()),
     }
+}
+
+/// The include guard of a file, from its tokens: `X` when its first line is
+/// `#ifndef X` (or `#if !defined X`, `#if !defined(X)`) and the `#endif`
+/// that closes it is its last, with no `#elif` or `#else` of that `#if`
+/// between them, as clang's multiple-include optimization asks.
+fn guard(toks: &[PpToken]) -> Option<String> {
+    let mut lines: Vec<&[PpToken]> = Vec::new();
+    let mut start = 0;
+    for k in 1..=toks.len() {
+        if k == toks.len() || toks[k].bol {
+            lines.push(&toks[start..k]);
+            start = k;
+        }
+    }
+    let directive = |line: &[PpToken]| match line {
+        [h, d, ..] if h.is_punct("#") => d.ident().map(str::to_string),
+        _ => None,
+    };
+    let name = match lines.first()? {
+        [_, _, x] if directive(lines[0]).as_deref() == Some("ifndef") => x.ident()?,
+        [_, _, not, d, x] | [_, _, not, d, _, x, _]
+            if directive(lines[0]).as_deref() == Some("if")
+                && not.is_punct("!")
+                && d.ident() == Some("defined")
+                && (lines[0].len() == 5 || (lines[0][4].is_punct("(") && lines[0][6].is_punct(")"))) =>
+        {
+            x.ident()?
+        }
+        _ => return None,
+    };
+    let mut depth = 0;
+    for (k, line) in lines.iter().enumerate() {
+        match directive(line).as_deref() {
+            Some("if" | "ifdef" | "ifndef") => depth += 1,
+            Some("elif" | "elifdef" | "elifndef" | "else") if depth == 1 => return None,
+            Some("endif") => {
+                depth -= 1;
+                if depth == 0 {
+                    return (k == lines.len() - 1).then(|| name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `"file"` or `<file>` at the start of an `#include`'s tokens, with
@@ -1365,15 +1943,17 @@ fn stringize(arg: &[PTok]) -> Option<String> {
 }
 
 /// `left ## right`: the two spellings joined, which must read as one token.
-fn glue(left: PTok, right: PTok) -> Result<PTok, Error> {
+/// In assembly (`asm`) two that do not stay two, with no space between
+/// them, as clang leaves them (`. ## name` is `.name`).
+fn glue(left: PTok, right: PTok, asm: bool) -> Result<Vec<PTok>, Error> {
     if left.t.kind == PpKind::Placemarker {
-        return Ok(right);
+        return Ok(vec![right]);
     }
     if right.t.kind == PpKind::Placemarker {
-        return Ok(left);
+        return Ok(vec![left]);
     }
     let text = format!("{}{}", left.t.text, right.t.text);
-    let one = match lexer::lex_pp(&text, left.t.pos.file) {
+    let one = match lexer::lex_pp_in(&text, left.t.pos.file, asm) {
         Ok((toks, _))
             if toks.len() == 1 && toks[0].text == text && !matches!(toks[0].kind, PpKind::Invalid(_)) =>
         {
@@ -1382,15 +1962,24 @@ fn glue(left: PTok, right: PTok) -> Result<PTok, Error> {
         _ => None,
     };
     let Some(kind) = one else {
+        if asm {
+            let mut right = right;
+            right.t.space = false;
+            right.lead = false;
+            return Ok(vec![left, right]);
+        }
         return Err(Error::new(
             left.t.pos,
             format!("pasting formed '{text}', an invalid preprocessing token"),
         ));
     };
-    Ok(PTok {
+    Ok(vec![PTok {
         t: PpToken { kind, text, ..left.t },
         hide: left.hide,
-    })
+        site: left.site,
+        spelled: None,
+        lead: left.lead,
+    }])
 }
 
 /// A value in `#if` arithmetic: 64 bits, signed (`intmax_t`) or not
@@ -1914,6 +2503,7 @@ puts( "The first, second, and third items." );
             include_dirs: vec![PathBuf::from("inc"), PathBuf::from("sub")],
             macros: Vec::new(),
             debug: None,
+            lang: Lang::C,
         };
         let src = "#include <d.h>\n#include \"d.h\"\n#include <c.h>\n#define H <b.h>\n#include H";
         let out = run(&files, src, &opts).unwrap();
@@ -2231,6 +2821,7 @@ puts( "The first, second, and third items." );
                 CmdMacro::Undef("__merlin__".into()),
             ],
             debug: None,
+            lang: Lang::C,
         };
         let out = run(&[], "ONE TWO F(3) GONE __merlin__ __STDC_VERSION__", &opts).unwrap();
         assert_eq!(words(&out.tokens), same("1 22 (3+1) GONE __merlin__ 199901L"));
@@ -2239,6 +2830,7 @@ puts( "The first, second, and third items." );
             include_dirs: Vec::new(),
             macros: vec![CmdMacro::Define("1X".into())],
             debug: None,
+            lang: Lang::C,
         };
         assert_eq!(
             run(&[], "", &opts).unwrap_err().render("main.c"),
@@ -2322,5 +2914,119 @@ puts( "The first, second, and third items." );
              int h = x+ +y;\n"
         );
         assert_eq!(words(&lexer::lex_pp(&text, 0).unwrap().0), words(&out.tokens));
+    }
+
+    /// `main.S` with these other files around it, preprocessed as assembly
+    /// with `-I i2`, as text.
+    fn asm(files: &[(&str, &str)], src: &str) -> String {
+        let files: HashMap<PathBuf, String> = files
+            .iter()
+            .map(|(name, text)| (normalize(Path::new(name)), text.to_string()))
+            .collect();
+        let load = move |p: &Path| files.get(p).cloned();
+        let opts = Options {
+            lang: Lang::AssemblerWithCpp,
+            include_dirs: vec![PathBuf::from("i2")],
+            ..Options::default()
+        };
+        preprocess("main.S", src, &opts, &load)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .print_asm()
+    }
+
+    /// What clang 23's `-E -x assembler-with-cpp` prints for the same file
+    /// (but its markers for `<built-in>` and `<command line>`): comments
+    /// pass through, macros replaced in them (but between apostrophes:
+    /// `'t R '` is a character constant), C comments go, spaces as clang
+    /// puts them, `##` that forms no token leaves two.
+    #[test]
+    fn assembly_is_written_as_clang_writes_it() {
+        let src = "#define R lw\n#define E\n#define F(x) [x]\n#define P(a, b) a ## b\n\
+                   # A comment: don't R 'a' R, R\n  # 2^64 - 1, R\n#\n\
+                   \tli\ta0, 'a'\t\t# it's R\n  E li a0, 1\n R E R\n\
+                   \x20 x = -R -1 R- 1+R R+1 F( a ) F(1)+1 F(-)-1\n\
+                   \x20 P(., R) P(1, 2) P(x, +) .P(L, 1): ?? =??=\n\
+                   \x20 la a0, $x@ \\rs1 /* a C comment */ // to the end\n\
+                   \x20 F(a\nb) F(c\n  d) z\n";
+        assert_eq!(
+            asm(&[], src),
+            "# 1 \"main.S\"\n\n\n\n\n # A comment: don't R 'a' R, R\n  # 2^64 - 1, lw\n\n \
+             li a0, 'a' # it's R\n    li a0, 1\n lw lw\n  x = -lw -1 lw- 1+lw lw+1 [a] [1]+1 [-]-1\n  \
+             .lw 12 x+ .L1: ?? =??=\n  la a0, $x@ \\rs1\n  [a b] [c\n   d] z\n"
+        );
+        // `__ASSEMBLER__`, and the width.
+        assert_eq!(asm(&[], "__ASSEMBLER__ __riscv_xlen"), "# 1 \"main.S\"\n1 32\n");
+    }
+
+    /// Blank lines up to 8, a marker past that; the markers of `#include`
+    /// (a guarded file is not read again) and `#line`. clang names a header
+    /// next to a main file given without a directory `./i2/g.h`.
+    #[test]
+    fn assembly_line_markers() {
+        let files = [
+            (
+                "i2/g.h",
+                "/* a guard */\n#ifndef G_H\n#define G_H\n#define SZ 8\n#endif\n",
+            ),
+            ("i2/t.h", "  .word SZ\n\n  .word 2\n"),
+            ("i2/h1.h", "  E x\n"),
+        ];
+        let src = "a\n#include \"i2/g.h\"\n#include <g.h>\n  .word SZ\n#include \"i2/t.h\"\nb\n\
+                   #define E\n#include \"i2/h1.h\"\n#line 20\n  E y\n#line 30 \"other.S\"\n\
+                   #define Q\n  y2\n\n\n\n\n\n\n\n\n\nc\n";
+        let text = asm(&files, src);
+        assert_eq!(
+            text,
+            "# 1 \"main.S\"\na\n# 1 \"i2/g.h\" 1\n# 3 \"main.S\" 2\n\n  .word 8\n# 1 \"i2/t.h\" 1\n  \
+             .word 8\n\n  .word 2\n# 6 \"main.S\" 2\nb\n\n# 1 \"i2/h1.h\" 1\n    x\n# 9 \"main.S\" 2\n\
+             # 20 \"main.S\"\n y\n# 30 \"other.S\"\n\n  y2\n# 41 \"other.S\"\nc\n"
+        );
+        // Each line back to where it came from.
+        assert_eq!(source_line(&text, 1), None);
+        assert_eq!(source_line(&text, 2), Some(("main.S".into(), 1)));
+        assert_eq!(source_line(&text, 6), Some(("main.S".into(), 4)));
+        assert_eq!(source_line(&text, 8), Some(("i2/t.h".into(), 1)));
+        assert_eq!(source_line(&text, 10), Some(("i2/t.h".into(), 3)));
+        assert_eq!(source_line(&text, 12), Some(("main.S".into(), 6)));
+        assert_eq!(source_line(&text, 18), Some(("main.S".into(), 20)));
+        assert_eq!(source_line(&text, 19), None);
+        assert_eq!(source_line(&text, 21), Some(("other.S".into(), 31)));
+        assert_eq!(source_line(&text, 23), Some(("other.S".into(), 41)));
+        assert_eq!(source_line(&text, 24), None);
+    }
+
+    /// Which `#` lines are directives in assembly, and errors.
+    #[test]
+    fn assembly_directives() {
+        // Only a directive's name makes one; `#if` in a comment is one.
+        assert_eq!(
+            asm(&[], "#if 0\n# include nothing\n#endif\n# 12 \"x\"\n#warn\n"),
+            "# 1 \"main.S\"\n\n\n\n # 12 \"x\"\n #warn\n"
+        );
+        let opts = Options {
+            lang: Lang::AssemblerWithCpp,
+            ..Options::default()
+        };
+        let e = preprocess("main.S", "# if the disk is there\n", &opts, &crate::no_files).unwrap_err();
+        assert_eq!(
+            e.render("main.S"),
+            "main.S:1:10: error: unexpected 'disk' in preprocessor expression"
+        );
+        // C keeps its errors: an unknown directive, a bad paste, a trigraph.
+        assert!(err("#warn\n").contains("invalid preprocessing directive"));
+        assert!(err("#define P(a, b) a ## b\nP(., x)").contains("pasting formed '.x'"));
+        assert!(err("??=").contains("trigraphs"));
+        // The guard of a file is its first `#ifndef` only if it closes last.
+        let toks = |s: &str| lexer::lex_pp(s, 0).unwrap().0;
+        assert_eq!(guard(&toks("#ifndef A\n#endif\n")), Some("A".into()));
+        assert_eq!(guard(&toks("#if !defined(A)\nx\n#endif")), Some("A".into()));
+        assert_eq!(guard(&toks("#if !defined A\n#endif")), Some("A".into()));
+        assert_eq!(guard(&toks("#ifndef A\n#endif\nx")), None);
+        assert_eq!(guard(&toks("x\n#ifndef A\n#endif")), None);
+        assert_eq!(guard(&toks("#ifndef A\n#else\n#endif")), None);
+        assert_eq!(
+            guard(&toks("#ifndef A\n#if 1\n#else\n#endif\n#endif")),
+            Some("A".into())
+        );
     }
 }

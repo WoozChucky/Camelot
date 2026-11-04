@@ -51,6 +51,7 @@ pub fn compile_c(dir: &Path, file: &str, include_dirs: &[&str], comp_dir: &str) 
         debug: DEBUG_INFO.get().then(|| merlin::DebugInfo {
             comp_dir: comp_dir.into(),
         }),
+        lang: merlin::Lang::C,
     };
     let load = |p: &Path| std::fs::read_to_string(dir.join(p)).ok();
     merlin::compile_with(file, &src, &opts, &load).map_err(|errors| {

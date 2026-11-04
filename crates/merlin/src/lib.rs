@@ -11,6 +11,10 @@
 //! expressions, and [`abi`] says how arguments and results travel (the
 //! RISC-V integer calling convention).
 //!
+//! The preprocessor also serves assembly: [`preprocess_asm`] runs a `.S`
+//! file through it as `clang -E -x assembler-with-cpp` does, for merlin-as
+//! (how one source serves RV32 and RV64, with `__riscv_xlen`).
+//!
 //! The language (spec section 10) is a subset of C99 without floating point:
 //! the C99 preprocessor, the integer types (`_Bool`, `char`, `short`, `int`,
 //! `long`, `long long`, signed and unsigned), `enum`, pointers (to
@@ -34,7 +38,7 @@ pub mod sema;
 pub mod types;
 
 pub use debug::DebugInfo;
-pub use preprocess::{CmdMacro, Loader, Options};
+pub use preprocess::{CmdMacro, Lang, Loader, Options};
 use std::fmt;
 use std::path::Path;
 
@@ -163,6 +167,19 @@ pub fn preprocess(
     load: Loader,
 ) -> Result<preprocess::Output, Vec<Error>> {
     preprocess::preprocess(name, src, opts, load).map_err(|e| vec![e])
+}
+
+/// Preprocesses an assembly source (a `.S` file, `-x assembler-with-cpp`)
+/// for [`Options::xlen`] into the text merlin-as assembles, as `clang -E`
+/// writes it (see [`preprocess::Output::print_asm`]); [`Options::lang`] is
+/// taken to be [`Lang::AssemblerWithCpp`]. Errors in headers have their
+/// [`Error::file`] set.
+pub fn preprocess_asm(name: &str, src: &str, opts: &Options, load: Loader) -> Result<String, Vec<Error>> {
+    let opts = Options {
+        lang: Lang::AssemblerWithCpp,
+        ..opts.clone()
+    };
+    preprocess(name, src, &opts, load).map(|pp| pp.print_asm())
 }
 
 /// Preprocesses, lexes, parses and checks one translation unit. The

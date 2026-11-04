@@ -1,6 +1,6 @@
-//! `merlin [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]] [-U name] [-g] [-E | --dump-ast] input.c...`
+//! `merlin [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]] [-U name] [-g] [-x LANG] [-E | --dump-ast] input.c...`
 
-use merlin::{CmdMacro, Options};
+use merlin::{CmdMacro, Lang, Options};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -22,9 +22,14 @@ const USAGE: &str = "usage: merlin [options] input.c...
                     the directory -g says file names are relative to
                     (default: the current directory)
   -E                preprocess only: print the tokens after preprocessing
+  -x LANG           what the inputs after it are: c, or assembler-with-cpp
+                    (assembly for merlin-as, only preprocessed: -E); without
+                    it, .S files are assembler-with-cpp and the rest C
   --dump-ast        print the checked syntax tree to stdout instead of compiling
 
-Each input is a translation unit, compiled to its own assembly file.";
+Each input is a translation unit, compiled to its own assembly file. A .S
+file is preprocessed (-E) as clang -E -x assembler-with-cpp does, with
+__ASSEMBLER__ and the target's __riscv_xlen defined, for merlin-as.";
 
 /// The compiler recurses once per nesting level (at most
 /// [`merlin::parser::MAX_DEPTH`]). Unoptimized builds use several KiB per level,
@@ -60,6 +65,9 @@ fn run() -> ExitCode {
     let mut debug = false;
     let mut comp_dir = None;
     let mut abi = None;
+    // `-x LANG` applies to the inputs after it, as in clang; `None` goes by
+    // each file's name.
+    let mut lang: Option<Lang> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         // `-I dir` or `-Idir`, and the same for -D, -U and -o.
@@ -112,8 +120,19 @@ fn run() -> ExitCode {
                 Some(u) if !u.is_empty() => opts.macros.push(CmdMacro::Undef(u)),
                 _ => return usage_error("-U needs a macro name"),
             },
+            _ if a.starts_with("-x") => match value("-x") {
+                Some(l) if l == "none" => lang = None,
+                Some(l) => match Lang::from_name(&l) {
+                    Some(l) => lang = Some(l),
+                    None => return usage_error(&format!("language not recognized: '{l}'")),
+                },
+                None => return usage_error("-x needs a language"),
+            },
             _ if a.starts_with('-') => return usage_error(&format!("unknown option {a}")),
-            _ => inputs.push(a),
+            _ => {
+                let l = lang.unwrap_or_else(|| Lang::of_file(&a));
+                inputs.push((a, l));
+            }
         }
     }
     // The ABI must be the ISA's, whichever of the two came first; clang calls
@@ -136,8 +155,20 @@ fn run() -> ExitCode {
     if output.is_some() && inputs.len() > 1 {
         return usage_error("-o needs a single input file");
     }
+    // Assembly is only preprocessed: merlin-as assembles it.
+    if let Some((a, _)) = inputs.iter().find(|(_, l)| *l == Lang::AssemblerWithCpp) {
+        if mode != Mode::Preprocess {
+            return usage_error(&format!(
+                "{a}: assembler-with-cpp input is only preprocessed (-E); merlin-as assembles the output"
+            ));
+        }
+    }
     let mut status = ExitCode::SUCCESS;
-    for input in &inputs {
+    for (input, lang) in &inputs {
+        let opts = Options {
+            lang: *lang,
+            ..opts.clone()
+        };
         if let Err(code) = translate(input, output.as_deref(), mode, &opts) {
             status = code;
         }
@@ -156,6 +187,9 @@ fn translate(input: &str, output: Option<&str>, mode: Mode, opts: &Options) -> R
     };
     let result = match mode {
         Mode::Compile => merlin::compile_with(input, &src, opts, &merlin::read_file),
+        Mode::Preprocess if opts.lang == Lang::AssemblerWithCpp => {
+            merlin::preprocess_asm(input, &src, opts, &merlin::read_file)
+        }
         Mode::Preprocess => merlin::preprocess(input, &src, opts, &merlin::read_file)
             .map(|pp| merlin::preprocess::spell(&pp.tokens)),
         Mode::DumpAst => {

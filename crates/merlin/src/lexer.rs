@@ -14,6 +14,12 @@
 //! Trigraphs (`??=`...), which C99 rewrites before anything else, are
 //! errors wherever they would change what merlin reads.
 //!
+//! Assembly preprocessed as C (`.S` files, [`lex_pp_asm`]) is split into the
+//! same tokens, as clang's `-x assembler-with-cpp` splits it: what is no C
+//! token (`$`, `@`, `\`, an apostrophe with no closing one on its line)
+//! passes through as it is, and trigraphs are only characters (clang leaves
+//! them alone in its default GNU mode, and only warns).
+//!
 //! Integer literals get their C type in [`finish`] (C99 6.4.4.1): the first
 //! of the candidate types that holds the value. A decimal literal is `int`,
 //! `long` or `long long`; a hex or octal one may also be the unsigned type
@@ -311,6 +317,8 @@ struct Lexer {
     newline: bool,
     /// Whitespace or a comment was skipped since the last token.
     space: bool,
+    /// Assembler-with-cpp: trigraphs are characters like any other.
+    asm: bool,
 }
 
 impl Lexer {
@@ -342,7 +350,7 @@ impl Lexer {
 
     /// The error for a trigraph here, if one starts here.
     fn trigraph(&self) -> Result<(), Error> {
-        if !self.at_trigraph() {
+        if self.asm || !self.at_trigraph() {
             return Ok(());
         }
         let msg = format!(
@@ -451,11 +459,24 @@ impl Lexer {
 /// comment and trigraphs are errors here; anything else that is no token
 /// becomes a [`PpKind::Invalid`] one.
 pub fn lex_pp(src: &str, file: u32) -> Result<(Vec<PpToken>, Pos), Error> {
+    lex_pp_in(src, file, false)
+}
+
+/// [`lex_pp`] for assembly preprocessed as C (`clang -x assembler-with-cpp`):
+/// the same tokens, but trigraphs are never errors. An unterminated `/*`
+/// comment still is, as in clang.
+pub fn lex_pp_asm(src: &str, file: u32) -> Result<(Vec<PpToken>, Pos), Error> {
+    lex_pp_in(src, file, true)
+}
+
+/// [`lex_pp`] (`asm` false) or [`lex_pp_asm`].
+pub fn lex_pp_in(src: &str, file: u32, asm: bool) -> Result<(Vec<PpToken>, Pos), Error> {
     let mut lx = Lexer {
         src: splice(src, file),
         i: 0,
         newline: true,
         space: false,
+        asm,
     };
     let mut out = Vec::new();
     loop {
@@ -1130,6 +1151,20 @@ mod tests {
         // Files are told apart by number.
         let (t, _) = lex_pp("x", 3).unwrap();
         assert_eq!(t[0].pos, Pos::in_file(3, 1, 1));
+    }
+
+    /// Assembly is split as C is, but a trigraph is three characters.
+    #[test]
+    fn assembly_tokens() {
+        let (t, _) = lex_pp_asm("  la a0, $x@ \\rs1 ??= 'c' # it's\n", 0).unwrap();
+        let got: Vec<&str> = t.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(
+            got,
+            ["la", "a0", ",", "$", "x", "@", "\\", "rs1", "?", "?", "=", "'c'", "#", "it", "'s"]
+        );
+        assert!(matches!(t[3].kind, PpKind::Invalid(_)));
+        assert!(lex_pp("??=", 0).is_err());
+        assert!(lex_pp_asm("/* x", 0).is_err());
     }
 
     #[test]
