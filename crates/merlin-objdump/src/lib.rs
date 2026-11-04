@@ -93,9 +93,32 @@ pub fn dump(name: &str, data: &[u8], opts: &Options) -> Result<String, Error> {
     dump_with_warnings(name, data, opts).map(|(text, _)| text)
 }
 
+/// A warning llvm-objdump prints on stderr while it dumps a file, in one of
+/// its two forms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Warning {
+    /// llvm-objdump's own, `llvm-objdump: warning: 'file': message`, which
+    /// merlin-objdump prints with its own name (an unparsable `$x<isa>`).
+    Tool(String),
+    /// LLVM's DWARF reader's, `warning: message`, with no program or file
+    /// name, which merlin-objdump prints the same (a premature end of
+    /// `.debug_aranges`).
+    Dwarf(String),
+}
+
+impl Warning {
+    /// The line on stderr, as `program` prints it for `file`.
+    pub fn line(&self, program: &str, file: &str) -> String {
+        match self {
+            Warning::Tool(m) => format!("{program}: warning: '{file}': {m}"),
+            Warning::Dwarf(m) => format!("warning: {m}"),
+        }
+    }
+}
+
 /// [`dump`], and the warnings llvm-objdump would print on stderr for the
-/// file (without its `llvm-objdump: warning: 'file': ` prefix), in order.
-pub fn dump_with_warnings(name: &str, data: &[u8], opts: &Options) -> Result<(String, Vec<String>), Error> {
+/// file, in order.
+pub fn dump_with_warnings(name: &str, data: &[u8], opts: &Options) -> Result<(String, Vec<Warning>), Error> {
     let elf = Elf::parse(data)?;
     let mut out = String::new();
     let mut warnings = Vec::new();

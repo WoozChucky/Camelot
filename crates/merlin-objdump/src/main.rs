@@ -26,7 +26,7 @@ fn main() -> ExitCode {
         match result {
             Ok((text, warnings)) => {
                 for w in warnings {
-                    eprintln!("merlin-objdump: warning: '{file}': {w}");
+                    eprintln!("{}", w.line("merlin-objdump", file));
                 }
                 if stdout.write_all(text.as_bytes()).is_err() {
                     // Closed pipe (`merlin-objdump -d x | head`): nothing left to do.

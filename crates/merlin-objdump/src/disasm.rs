@@ -453,7 +453,7 @@ fn data_line(out: &mut String, pc: u64, bytes: &[u8], raw_insn: bool) -> usize {
 
 pub(crate) fn disassemble(
     out: &mut String,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<crate::Warning>,
     elf: &Elf,
     opts: &Options,
 ) -> Result<(), Error> {
@@ -522,10 +522,10 @@ pub(crate) fn disassemble(
         isa_symbols.sort_by_key(|s| s.value);
         for s in isa_symbols {
             if let Err(e) = check_isa(&s.name[2..]) {
-                let w = format!(
+                let w = crate::Warning::Tool(format!(
                     "could not parse ISA mapping symbol '{}': {e}; falling back to default disassembler",
                     s.name
-                );
+                ));
                 if !warnings.contains(&w) {
                     warnings.push(w);
                 }
@@ -637,6 +637,7 @@ pub(crate) fn disassemble(
                     if let Some(s) = source.as_mut() {
                         // LLVM reads .debug_aranges at the first lookup.
                         for w in std::mem::take(&mut s.unit_ranges.warnings) {
+                            let w = crate::Warning::Dwarf(w);
                             if !warnings.contains(&w) {
                                 warnings.push(w);
                             }

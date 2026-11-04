@@ -120,15 +120,18 @@ fn unparsable_isa_mapping_symbols_warn() {
 
 /// `-l` reads `.debug_aranges` as LLVM does: in an object built with
 /// relaxation a length there is a relocation pair over a 0, which LLVM reads
-/// unrelocated, as the list's end, and warns of (its message, with our
-/// prefix). Without `-l` nothing reads it.
+/// unrelocated, as the list's end, and warns of. The line is llvm-objdump's
+/// exactly: LLVM's DWARF reader names neither the program nor the file.
+/// Without `-l` nothing reads it.
 #[test]
 fn a_premature_end_of_debug_aranges_warns() {
     let file = "crates/merlin-objdump/tests/fixtures/rv64/units-aranges.o";
     let (code, out, err) = objdump(&["-d", "-l", file]);
     assert_eq!(code, 0);
-    let want = "address range table at offset 0x0 has a premature terminator entry at offset 0x20";
-    assert_eq!(err, format!("merlin-objdump: warning: '{file}': {want}\n"));
+    assert_eq!(
+        err,
+        "warning: address range table at offset 0x0 has a premature terminator entry at offset 0x20\n"
+    );
     assert!(out.contains("; g():\n"), "{out}");
     let (code, _, err) = objdump(&["-d", file]);
     assert_eq!((code, err.as_str()), (0, ""));
