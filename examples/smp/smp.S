@@ -17,6 +17,8 @@
 #   grail examples/smp/smp.elf
 #   grail --harts 4 examples/smp/smp.elf
 #
+# smp-rv64.S is the same program for RV64 machines.
+#
 # Built with our own tools by `cargo xtask examples smp`, which does the same as
 #
 #   merlin-as examples/smp/smp.S -o smp.o

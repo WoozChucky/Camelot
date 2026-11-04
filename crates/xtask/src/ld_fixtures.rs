@@ -32,7 +32,10 @@
 //!
 //! The fixtures in [`FROM_EXAMPLES`] (`hello`, `multiobj`) are copied from
 //! `examples/` first, so they always follow the examples (a test checks the
-//! copies). Their ld.lld links are the references the examples built with our
+//! copies), and so are the RV64 builds' sources of the ones in
+//! [`FROM_EXAMPLES_RV64`] (`multiobj`'s `main-rv64.S` and `print.S`; the RV64
+//! `hello` is a shared copy of the RV32 one, as `hello.S` is the same at both
+//! widths). Their ld.lld links are the references the examples built with our
 //! own tools are compared with (`crates/xtask/tests/examples.rs`). Every
 //! source is assembled with `-include examples/xcal.inc`, which teaches clang
 //! the Xcal mnemonics the examples use.
@@ -99,12 +102,17 @@ pub const FROM_EXAMPLES: &[(&str, &[&str])] = &[
     ("multiobj", &["main.S", "print.S", "link.ld"]),
 ];
 
+/// Fixture directories of the RV64 set copied from `examples/<same name>`:
+/// the sources of the example's RV64 build and its linker script, linked in
+/// name order like the RV32 copies.
+pub const FROM_EXAMPLES_RV64: &[(&str, &[&str])] = &[("multiobj", &["main-rv64.S", "print.S", "link.ld"])];
+
 /// Fixture directories of the RV32 set whose sources (`.S` and `.ld`) the
 /// RV64 set has too, copied into `fixtures/rv64/<same name>`: they assemble,
 /// link and run the same on both widths. Not `relocs`, `data64` (RV32's
 /// R_RISCV_64), `at` (RV64 has its own, a higher-half program) or
-/// `multiobj` (its `.word` pointers would be sign-extended by RV64's `lw`;
-/// #151 brings RV64 examples).
+/// `multiobj` (its `.word` pointers would be sign-extended by RV64's `lw`:
+/// the RV64 set copies the RV64 example's sources, [`FROM_EXAMPLES_RV64`]).
 pub const SHARED_WITH_RV64: &[&str] = &["hello", "layouts", "merge", "norelocs", "rejects", "symbols"];
 
 /// The default: no `R_RISCV_RELAX` or `R_RISCV_ALIGN` in the object.
@@ -240,13 +248,15 @@ pub fn prepare_out(fixtures: &Path, out: &Path) -> Result<PathBuf, String> {
 }
 
 /// Regenerates everything under `fixtures` (see the module documentation):
-/// the copies of the examples ([`FROM_EXAMPLES`]) and of the shared sources
-/// ([`copy_shared`]), then every set's objects and links ([`SETS`]).
-/// `examples` is the repository's `examples` directory. Returns the files
-/// written.
+/// the copies of the examples ([`FROM_EXAMPLES`], [`FROM_EXAMPLES_RV64`]) and
+/// of the shared sources ([`copy_shared`]), then every set's objects and links
+/// ([`SETS`]). `examples` is the repository's `examples` directory. Returns
+/// the files written.
 pub fn run(fixtures: &Path, examples: &Path, tools: &Tools) -> Result<Vec<PathBuf>, String> {
-    for (dir, copied) in FROM_EXAMPLES {
-        let to = fixtures.join(dir);
+    let copies = FROM_EXAMPLES.iter().map(|c| (fixtures.to_path_buf(), c));
+    let copies = copies.chain(FROM_EXAMPLES_RV64.iter().map(|c| (fixtures.join(RV64.dir), c)));
+    for (set_dir, (dir, copied)) in copies {
+        let to = set_dir.join(dir);
         std::fs::create_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
         for f in *copied {
             std::fs::copy(examples.join(dir).join(f), to.join(f))
@@ -397,15 +407,25 @@ mod tests {
 
     #[test]
     fn copied_examples_follow_the_examples_table() {
-        for (dir, files) in FROM_EXAMPLES {
+        use crate::examples::Xlen;
+        let copies = FROM_EXAMPLES.iter().map(|c| (Xlen::Rv32, c));
+        for (xlen, (dir, files)) in copies.chain(FROM_EXAMPLES_RV64.iter().map(|c| (Xlen::Rv64, c))) {
             let ex = crate::examples::find(dir).unwrap();
-            let mut want = ex.sources.to_vec();
+            let sources = ex.sources_for(xlen);
+            let mut want = sources.to_vec();
             want.extend(ex.script);
             assert_eq!(*files, want.as_slice(), "{dir}");
             // ld.lld gets the objects in name order: it must be the build's order.
-            let mut sorted = ex.sources.to_vec();
+            let mut sorted = sources.to_vec();
             sorted.sort_unstable();
-            assert_eq!(sorted, ex.sources, "{dir}");
+            assert_eq!(sorted, sources, "{dir}");
+        }
+        // The RV64 hello is the shared copy of the RV32 one: one source.
+        let hello = crate::examples::find("hello").unwrap();
+        assert_eq!(hello.sources, hello.rv64_sources);
+        assert!(SHARED_WITH_RV64.contains(&"hello"));
+        for (dir, _) in FROM_EXAMPLES_RV64 {
+            assert!(!SHARED_WITH_RV64.contains(dir), "{dir}");
         }
     }
 

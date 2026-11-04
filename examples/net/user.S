@@ -35,6 +35,8 @@
 # Exit code 0 after `q`, 1 without a network card, 2 on a DHCP NAK, a refused or reset
 # connection or a send error.
 #
+# user-rv64.S is the same program for RV64 machines.
+#
 # Built with our own tools by `cargo xtask examples net-user`, which does the same as
 #
 #   merlin-as examples/net/user.S -o user.o

@@ -25,8 +25,8 @@
 #   <hex offset> <word> [<R_RISCV_TYPE> <symbol>[+hexaddend]]
 # with <auipc> for the hidden label a %pcrel_lo relocation points at.
 #
-# The linked image of merlin-as's output (crates/merlin-as/tests/golden/hello.elf)
-# is rebuilt by `cargo xtask hello` instead.
+# The linked images of merlin-as's output (crates/merlin-as/tests/golden/hello.elf
+# and golden/rv64/hello.elf) are rebuilt by `cargo xtask hello` instead.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 GOLDEN="$ROOT/crates/merlin-as/tests/golden"

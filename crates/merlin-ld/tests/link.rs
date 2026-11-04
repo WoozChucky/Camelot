@@ -467,7 +467,8 @@ fn hello_layout_matches_ld_lld() {
 
 /// Some fixture sources are copies, which `cargo xtask ld-fixtures` makes
 /// before it builds anything: `fixtures/hello` and `fixtures/multiobj` of
-/// the examples' sources and scripts, and the RV64 set's directories that
+/// the examples' sources and scripts, `fixtures/rv64/multiobj` of the RV64
+/// build's (`main-rv64.S` and `print.S`), and the RV64 set's directories that
 /// work on both widths (`SHARED_WITH_RV64` in crates/xtask/src/ld_fixtures.rs)
 /// of the RV32 set's. If an original changes, its copy (and the objects and
 /// ld.lld listings made from it) is stale until the tool runs again.
@@ -479,14 +480,16 @@ fn fixture_copies_are_current() {
             .replace("\r\n", "\n")
     };
     let stale = "changed: run `cargo xtask ld-fixtures`";
+    let rv64 = common::fixtures(common::RV64);
     let copies = [
-        ("hello", &["hello.S", "link.ld"][..]),
-        ("multiobj", &["main.S", "print.S", "link.ld"]),
+        (fixtures(), "hello", &["hello.S", "link.ld"][..]),
+        (fixtures(), "multiobj", &["main.S", "print.S", "link.ld"]),
+        (rv64.clone(), "multiobj", &["main-rv64.S", "print.S", "link.ld"]),
     ];
-    for (dir, files) in copies {
+    for (set, dir, files) in copies {
         for f in files {
             assert!(
-                read(repo_root().join("examples").join(dir).join(f)) == read(fixtures().join(dir).join(f)),
+                read(repo_root().join("examples").join(dir).join(f)) == read(set.join(dir).join(f)),
                 "examples/{dir}/{f} {stale}"
             );
         }
@@ -503,8 +506,7 @@ fn fixture_copies_are_current() {
         v
     };
     let shared = ["hello", "layouts", "merge", "norelocs", "rejects", "symbols"];
-    let rv64_only = ["at", "relocs"];
-    let rv64 = common::fixtures(common::RV64);
+    let rv64_only = ["at", "multiobj", "relocs"];
     let mut dirs: Vec<String> = std::fs::read_dir(&rv64)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())

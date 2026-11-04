@@ -14,6 +14,8 @@
 #
 #   cargo run --release -p grail -- --fb examples/kbd-echo/kbd-echo-irq.elf
 #
+# kbd-echo-irq-rv64.S is the same program for RV64 machines.
+#
 # Built with our own tools by `cargo xtask examples kbd-echo-irq`, which does the same as
 #
 #   merlin-as examples/kbd-echo/kbd-echo-irq.S -o kbd-echo-irq.o

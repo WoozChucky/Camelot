@@ -13,6 +13,9 @@
 #             one at RX_HEAD with the next frame, writes the frame's length and a
 #             status into its descriptor, and moves RX_HEAD past it. When no buffer
 #             is free, the frame is dropped and counted in NET_RX_DROPPED.
+#
+# netlib-rv64.S is the same driver for RV64 machines: 16-byte descriptors and
+# 64-bit ring bases (version 2 of the card's interface).
 
     .equ UART_BASE,       0x10000000
     .equ UART_LSR,        5

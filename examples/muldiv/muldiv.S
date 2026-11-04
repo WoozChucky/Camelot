@@ -3,6 +3,8 @@
 # INT_MIN / -1). Prints the number of cases with xcal.dbg and exits with 0
 # when every result is right, or with the number of the first wrong case.
 #
+# muldiv-rv64.S checks the M extension of RV64 machines.
+#
 # Built with our own tools by `cargo xtask examples muldiv`, which does the same as
 #
 #   merlin-as examples/muldiv/muldiv.S -o muldiv.o

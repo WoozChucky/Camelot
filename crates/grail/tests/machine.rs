@@ -65,6 +65,29 @@ timebase {hz} Hz
     )
 }
 
+/// What the RV64 build of `examples/sysinfo` prints: version 2 of the block, with
+/// addresses and sizes in 16 hex digits.
+fn sysinfo_output_rv64(ram_mib: u32, hz: u32, real_time: bool) -> String {
+    let kind = if real_time { "real time" } else { "nominal" };
+    format!(
+        "sysinfo v2
+RAM      {ram_mib} MiB at 0x0000000080000000
+CPU      {hz} Hz ({kind})
+timebase {hz} Hz
+9 devices:
+  test      0x0000000000100000 + 0x0000000000001000
+  CLINT     0x0000000002000000 + 0x0000000000010000
+  PLIC      0x000000000c000000 + 0x0000000004000000
+  UART      0x0000000010000000 + 0x0000000000000100  irq 1
+  fb-ctrl   0x0000000030000000 + 0x0000000000001000
+  keyboard  0x0000000030001000 + 0x0000000000001000  irq 2
+  sysinfo   0x0000000030002000 + 0x0000000000001000
+  pointer   0x0000000030003000 + 0x0000000000001000  irq 11
+  fb-vram   0x0000000031000000 + 0x000000000012c000
+"
+    )
+}
+
 #[test]
 fn machine_is_send() {
     fn assert_send<T: Send + 'static>() {}
@@ -394,6 +417,23 @@ fn cli_ram_and_clock_flags_reach_sysinfo() {
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
         sysinfo_output(2048, 10_000_000, false)
+    );
+
+    // The RV64 build reads version 2's registers: SYS_FLAGS, with the real-time
+    // bit, at 0x20 rather than 0x18, and the 64-bit SYS_RAM_SIZE (8 GiB).
+    let rv64 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/sysinfo/sysinfo-rv64.elf");
+    let rv64 = rv64.to_str().unwrap();
+    let out = grail(&["--ram", "64", "--clock", "1.5MHz", rv64]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        sysinfo_output_rv64(64, 1_500_000, true)
+    );
+    let out = grail(&["--ram", "8G", rv64]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        sysinfo_output_rv64(8192, 10_000_000, false)
     );
 }
 

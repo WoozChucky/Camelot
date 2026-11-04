@@ -1,6 +1,8 @@
 # Grail's boot ROM, disk part: boots a machine started with no program from its
 # disk 0, like a PC's BIOS loading the master boot record (spec section 7,
-# "Boot from disk").
+# "Boot from disk"). This is the loader of RV32 machines; diskboot-rv64.s is
+# the same for RV64 ones, and Grail puts the one of the machine's width in its
+# ROM (src/boot.rs).
 #
 # The ROM's stub at 0x1000 jumps here (its entry word at 0x1010 points here)
 # with a0 = 0. This code:

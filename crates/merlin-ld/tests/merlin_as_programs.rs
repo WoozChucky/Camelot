@@ -9,6 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 const MULDIV: &str = include_str!("../../../examples/muldiv/muldiv.S");
+const MULDIV_RV64: &str = include_str!("../../../examples/muldiv/muldiv-rv64.S");
 
 /// Assembles, links and runs `src`; returns how it ended and what it printed.
 fn build_and_run(src: &str) -> (RunResult, String) {
@@ -65,31 +66,35 @@ fn merlin_ld(dir: &Path, args: &[&str]) -> String {
 
 /// The commands at the top of `examples/multiobj/main.S`, with the merlin-ld
 /// binary: two objects and a script in, the committed executable out (which
-/// `cargo xtask examples` builds by linking in memory).
+/// `cargo xtask examples` builds by linking in memory). Then the same for the
+/// RV64 build, at the top of `main-rv64.S`: `main-rv64.o` and `print.o`
+/// assembled for RV64 into `multiobj-rv64.elf`.
 #[test]
 fn multiobj_example_with_the_merlin_ld_binary() {
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/multiobj");
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("merlin-as-programs-multiobj");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    for src in ["main", "print"] {
-        let text = std::fs::read_to_string(example.join(format!("{src}.S"))).unwrap();
-        let obj = merlin_as::assemble_to_elf(&text).unwrap_or_else(|e| panic!("{src}.S: {e:?}"));
-        std::fs::write(dir.join(format!("{src}.o")), obj).unwrap();
-    }
-    std::fs::copy(example.join("link.ld"), dir.join("link.ld")).unwrap();
+    for (xlen, main, out) in [
+        (Xlen::Rv32, "main", "multiobj.elf"),
+        (Xlen::Rv64, "main-rv64", "multiobj-rv64.elf"),
+    ] {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("merlin-as-programs-{main}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let opts = merlin_as::Options { xlen };
+        for src in [main, "print"] {
+            let text = std::fs::read_to_string(example.join(format!("{src}.S"))).unwrap();
+            let obj =
+                merlin_as::assemble_to_elf_with(&text, &opts).unwrap_or_else(|e| panic!("{src}.S: {e:?}"));
+            std::fs::write(dir.join(format!("{src}.o")), obj).unwrap();
+        }
+        std::fs::copy(example.join("link.ld"), dir.join("link.ld")).unwrap();
 
-    let err = merlin_ld(
-        &dir,
-        &["-T", "link.ld", "main.o", "print.o", "-o", "multiobj.elf"],
-    );
-    assert_eq!(err, "");
-    let ours = std::fs::read(dir.join("multiobj.elf")).unwrap();
-    let committed = std::fs::read(example.join("multiobj.elf")).unwrap();
-    assert!(
-        ours == committed,
-        "examples/multiobj/multiobj.elf is not the CLI's link"
-    );
+        let main_o = format!("{main}.o");
+        let err = merlin_ld(&dir, &["-T", "link.ld", &main_o, "print.o", "-o", out]);
+        assert_eq!(err, "");
+        let ours = std::fs::read(dir.join(out)).unwrap();
+        let committed = std::fs::read(example.join(out)).unwrap();
+        assert!(ours == committed, "examples/multiobj/{out} is not the CLI's link");
+    }
     // (No output section of multiobj takes input from both objects, so the
     // object order does not move anything it loads; concatenating the same
     // section from several objects is covered by the fixtures in
@@ -99,8 +104,10 @@ fn multiobj_example_with_the_merlin_ld_binary() {
 // ---------------------------------------------------------------------------
 // RV64: merlin-as objects assembled for `rv64ima_zicsr_zifencei`, linked
 // into ELF64 executables with the default layout (pc-relative code at
-// 0x8000_0000) and run on an RV64 Grail machine, which an ELF64 file makes.
-// The sources are here until #151 brings RV64 examples.
+// 0x8000_0000) and run on an RV64 Grail machine, which an ELF64 file makes:
+// the RV64 build of examples/muldiv (#151), then programs of this file that
+// check what no example does, `ld`/`sd` of a symbol's address and `.dword`
+// pointers from each object into the other.
 
 /// Assembles `src` for RV64 into an object named `name`.
 fn rv64_object(name: &str, src: &str) -> Input {
@@ -125,6 +132,27 @@ fn link_and_run(objs: &[Input]) -> (Vec<u8>, RunResult, String) {
     let r = m.run(Some(100_000), |_| {});
     let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
     (linked.elf, r, out)
+}
+
+/// `examples/muldiv/muldiv-rv64.S`: every M instruction at 64 bits and the W
+/// ones, including division by zero, `INT64_MIN / -1` and `INT32_MIN / -1`,
+/// gives the result the RISC-V spec requires; and a wrong expectation stops at
+/// its case.
+#[test]
+fn muldiv_rv64_example_passes_in_grail() {
+    let (_, r, out) = link_and_run(&[rv64_object("muldiv-rv64.o", MULDIV_RV64)]);
+    assert_eq!(r, RunResult::Exited(0), "output: {out}");
+    assert!(out.ends_with("a0 = 0x000000000000001d (29)\n"), "{out}");
+
+    let wrong = MULDIV_RV64.replacen("li    t0, -5", "li    t0, -4", 1); // case 10: -21 / 4
+    assert_ne!(wrong, MULDIV_RV64);
+    let (_, r, _) = link_and_run(&[rv64_object("muldiv-rv64.o", &wrong)]);
+    assert_eq!(r, RunResult::Exited(10));
+    // Division by zero must not trap: the quotient is all ones (case 19).
+    let wrong = MULDIV_RV64.replacen("li    t0, 0xffffffffffffffff", "li    t0, 0", 1);
+    assert_ne!(wrong, MULDIV_RV64);
+    let (_, r, _) = link_and_run(&[rv64_object("muldiv-rv64.o", &wrong)]);
+    assert_eq!(r, RunResult::Exited(19));
 }
 
 /// One object: a pointer to 64-bit data (`.dword`, R_RISCV_64) reached

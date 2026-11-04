@@ -4,12 +4,14 @@
 //! checksum, and jumps to it, like a PC's BIOS loading the master boot record.
 //!
 //! The loader is real code in the ROM, run by hart 0 like any program: its source is
-//! `rom/diskboot.s`, built with merlin-as and merlin-ld into the committed
-//! `rom/diskboot.elf` (`cargo xtask boot`), which Grail includes here. What the boot
-//! block does next is up to whoever wrote it; Camelot's (`kernel/boot/boot.s`) loads
-//! the kernel ELF that `camelot-fs mkfs` installed after the filesystem.
+//! `rom/diskboot.s` for an RV32 machine and `rom/diskboot-rv64.s` for an RV64 one,
+//! built with merlin-as and merlin-ld into the committed `rom/diskboot.elf` and
+//! `rom/diskboot-rv64.elf` (`cargo xtask boot`), which Grail includes here. What the
+//! boot block does next is up to whoever wrote it; Camelot's (`kernel/boot/boot.s`)
+//! loads the kernel ELF that `camelot-fs mkfs` installed after the filesystem.
 
 use crate::bus::BOOT_ROM_BASE;
+use excalibur::Xlen;
 
 /// Where the disk loader starts in the boot ROM, after the stub (0x1000) and the park
 /// loop (0x1020). The stub jumps here through the entry point when the machine boots
@@ -35,18 +37,32 @@ pub const BOOT_AREA_SIZE: u32 = 0x1_0000;
 /// read error, a bad checksum, a trap before the boot block set its own `mtvec`).
 pub const EXIT_BOOT_FAILED: u32 = 0xfd;
 
-/// The disk loader, built from `rom/diskboot.s` (`cargo xtask boot`).
+/// The disk loader of RV32 machines, built from `rom/diskboot.s` (`cargo xtask boot`).
 pub const DISKBOOT_ELF: &[u8] = include_bytes!("../rom/diskboot.elf");
 
-/// The disk loader's code: the bytes of [`DISKBOOT_ELF`], which go at
-/// [`DISK_BOOT_PC`].
-pub fn disk_loader() -> Vec<u8> {
-    let elf = crate::elf::parse(DISKBOOT_ELF).expect("rom/diskboot.elf is an ELF file");
+/// The disk loader of RV64 machines, built from `rom/diskboot-rv64.s` (`cargo xtask
+/// boot`).
+pub const DISKBOOT_RV64_ELF: &[u8] = include_bytes!("../rom/diskboot-rv64.elf");
+
+/// The disk loader of an `xlen` machine: [`DISKBOOT_ELF`] or [`DISKBOOT_RV64_ELF`].
+pub fn disk_loader_elf(xlen: Xlen) -> &'static [u8] {
+    match xlen {
+        Xlen::Rv32 => DISKBOOT_ELF,
+        Xlen::Rv64 => DISKBOOT_RV64_ELF,
+    }
+}
+
+/// The disk loader's code for an `xlen` machine: the bytes of [`disk_loader_elf`],
+/// which go at [`DISK_BOOT_PC`].
+pub fn disk_loader(xlen: Xlen) -> Vec<u8> {
+    let elf = crate::elf::parse(disk_loader_elf(xlen)).expect("the disk loader is an ELF file");
+    assert_eq!(elf.xlen, xlen, "the disk loader is built for the machine's width");
     let mut code = Vec::new();
     for seg in &elf.segments {
-        // The ELF header and the program headers: they fit below the loader
-        // in its page, so the linker loads them at the page's start, 0x1000,
-        // in a segment of their own (ld.lld's rule, which merlin-ld follows).
+        // The ELF header and the program headers of an ELF32 file: they fit
+        // below the loader in its page, so the linker loads them at the page's
+        // start, 0x1000, in a segment of their own (ld.lld's rule, which
+        // merlin-ld follows; an ELF64 file's are too big for the 0x100 bytes).
         // That is where the ROM has its stub; they are not the loader's.
         if seg.paddr < DISK_BOOT_PC {
             assert!(
@@ -103,20 +119,29 @@ mod tests {
 
     #[test]
     fn the_loader_fits_the_rom() {
-        let code = disk_loader();
-        assert!(code.len() > 100);
-        assert!(DISK_BOOT_PC as usize - BOOT_ROM_BASE as usize + code.len() <= 0x1000);
-        let elf = crate::elf::parse(DISKBOOT_ELF).unwrap();
-        assert_eq!(elf.entry, DISK_BOOT_PC, "the loader starts at its first byte");
-        // The headers' segment, at the start of the ROM, is left out.
-        let below: Vec<u64> = elf
-            .segments
-            .iter()
-            .map(|s| s.paddr)
-            .filter(|&a| a < DISK_BOOT_PC)
-            .collect();
-        assert_eq!(below, [BOOT_ROM_BASE]);
-        assert_eq!(&code[..4], &0xf140_22f3u32.to_le_bytes(), "csrr t0, mhartid");
+        for xlen in [Xlen::Rv32, Xlen::Rv64] {
+            let code = disk_loader(xlen);
+            assert!(code.len() > 100);
+            assert!(DISK_BOOT_PC as usize - BOOT_ROM_BASE as usize + code.len() <= 0x1000);
+            let elf = crate::elf::parse(disk_loader_elf(xlen)).unwrap();
+            assert_eq!(elf.xlen, xlen);
+            assert_eq!(elf.entry, DISK_BOOT_PC, "the loader starts at its first byte");
+            // The headers' segment, at the start of the ROM, is left out. The
+            // ELF64 headers don't fit below the loader, so they are not loaded.
+            let below: Vec<u64> = elf
+                .segments
+                .iter()
+                .map(|s| s.paddr)
+                .filter(|&a| a < DISK_BOOT_PC)
+                .collect();
+            let headers: &[u64] = match xlen {
+                Xlen::Rv32 => &[BOOT_ROM_BASE],
+                Xlen::Rv64 => &[],
+            };
+            assert_eq!(below, headers, "{xlen:?}");
+            assert_eq!(&code[..4], &0xf140_22f3u32.to_le_bytes(), "csrr t0, mhartid");
+        }
+        assert_ne!(disk_loader(Xlen::Rv32), disk_loader(Xlen::Rv64));
     }
 
     #[test]

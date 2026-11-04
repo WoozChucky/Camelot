@@ -24,11 +24,23 @@
 #   merlin-as examples/net/netlib.S -o netlib.o
 #   merlin-ld -T examples/net/link.ld ping.o netlib.o -o examples/net/net-ping.elf
 #
+# and, for RV64 (the same file, with the RV64 driver), the same as
+#
+#   merlin-as -march=rv64ima_zicsr_zifencei examples/net/ping.S -o ping.o
+#   merlin-as -march=rv64ima_zicsr_zifencei examples/net/netlib-rv64.S -o netlib-rv64.o
+#   merlin-ld -T examples/net/link.ld ping.o netlib-rv64.o -o examples/net/net-ping-rv64.elf
+#
 # Reference build with LLVM, only for comparison:
 #
 #   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
 #         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
 #         -T examples/net/link.ld examples/net/ping.S examples/net/netlib.S -o net-ping.elf
+#
+# and for RV64:
+#
+#   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
+#         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -T examples/net/link.ld examples/net/ping.S examples/net/netlib-rv64.S -o net-ping-rv64.elf
 
     .equ FRAME_SIZE,      1536
     .equ TIMEOUT,         200000        # polls of the receive ring before giving up

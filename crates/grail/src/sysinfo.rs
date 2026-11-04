@@ -55,6 +55,11 @@ pub mod v2 {
     /// Bytes per device table entry: type (+0), irq (+4), base (+8, 64-bit), size
     /// (+0x10, 64-bit).
     pub const DEV_ENTRY_SIZE: u32 = 24;
+    /// The fields of a device table entry, as offsets into it.
+    pub const DEV_TYPE: u32 = 0x00;
+    pub const DEV_IRQ: u32 = 0x04;
+    pub const DEV_BASE: u32 = 0x08;
+    pub const DEV_SIZE: u32 = 0x10;
     /// Entries that fit in the 4 KiB block.
     pub const DEV_MAX: usize = ((0x1000 - DEV_TABLE) / DEV_ENTRY_SIZE) as usize;
 }
@@ -206,11 +211,11 @@ impl Sysinfo {
                     return Field::Unused;
                 };
                 return match (o - DEV_TABLE) % v2::DEV_ENTRY_SIZE {
-                    0x00 => Field::Word(d.kind as u64),
-                    0x04 => Field::Word(d.irq.into()),
-                    0x08 => Field::Low(d.base),
-                    0x0c => Field::High(d.base),
-                    0x10 => Field::Low(d.size),
+                    v2::DEV_TYPE => Field::Word(d.kind as u64),
+                    v2::DEV_IRQ => Field::Word(d.irq.into()),
+                    v2::DEV_BASE => Field::Low(d.base),
+                    f if f == v2::DEV_BASE + 4 => Field::High(d.base),
+                    v2::DEV_SIZE => Field::Low(d.size),
                     _ => Field::High(d.size),
                 };
             }
