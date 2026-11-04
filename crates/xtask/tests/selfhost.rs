@@ -351,6 +351,18 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
          .section .foo, \"aM\", @progbits, 1, 2\n",
         ".section .foo, \"a\", %\nnop\n",
         ".section .bss.x\nnop\n.section .b, \"aw\", @nobits\n.byte 1\n.section .debug_x\nnop\n",
+        // Another ISA than -march's (the same is accepted: lines 1 to 6 and
+        // the attribute 4), and LLVM's own errors.
+        ".option arch, rv32ima_zicsr_zifencei\n.option arch, +m, -c\n.option arch, -a\n\
+         .attribute arch, \"rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0\"\n\
+         .attribute 5, \"rv32im_zicsr_zifencei_zaamo_zalrsc\"\n.option norvc\n.attribute 4, 16\n\
+         .option arch, +zicond\n.option arch, -m\n.option arch, rv64ima_zicsr_zifencei\n.option rvc\n\
+         .option arch, rv32ima2p1_zicsr\n.attribute arch, \"rv32i2p1_m2p0\"\n.attribute 5, \"rv32gc\"\n\
+         .option arch, -zmmul\n.option arch, +m2p0\n.option arch, m\n.option arch\n.option\n\
+         .attribute arch, 5\n",
+        // Alignment: fills and maxima LLVM takes, and those it does not.
+        ".p2align 2, 0x55, 0\n.balign 8,, -1\n.p2align 3,,\n.p2align 2,\n.balign 3\n.p2align 2, 1, 2, 3\n\
+         .p2align 2, x\n.balign 8, 0, x\n.p2align 17\n",
     ];
     let inputs: Vec<(String, String)> = cases
         .iter()

@@ -1193,6 +1193,53 @@ impl Assembler {
         self.align_with(align, fill, max);
     }
 
+    /// `.option NAME[, ...]`, its arguments as the parser wrote them, one
+    /// string each (`arch`, `+zicond`, `rv32ima_zicsr`). `arch` and `rvc`
+    /// change the ISA in clang, which merlin-as never does: one that names
+    /// another ISA than `-march`'s is an error ([`crate::isa`]), and the
+    /// same ISA is accepted. The others change nothing merlin-as writes
+    /// (`push`, `pop`, `norvc`, `relax`, `norelax`, `pic`, `nopic`) or are
+    /// unknown, which LLVM only warns about: they are ignored.
+    fn option(&mut self, args: &[DirArg]) {
+        let items: Vec<String> = args
+            .iter()
+            .map(|a| match a {
+                DirArg::Str(s) => String::from_utf8_lossy(s).into_owned(),
+                _ => String::new(),
+            })
+            .collect();
+        let result = match items.first().map(String::as_str) {
+            None => Err(".option: expected an option such as push, pop or arch".into()),
+            Some("arch") => crate::isa::check_option_arch(&items[1..], self.xlen),
+            Some("rvc") => Err(crate::isa::rvc(self.xlen)),
+            _ => Ok(()),
+        };
+        if let Err(msg) = result {
+            self.error(msg);
+        }
+    }
+
+    /// `.attribute TAG, value`: `arch` (tag 5) must name `-march`'s ISA
+    /// ([`crate::isa`]): merlin-as writes `-march`'s `Tag_RISCV_arch`
+    /// whatever the source says. The other attributes are ignored.
+    fn attribute(&mut self, args: &[DirArg]) {
+        let arch = match args.first() {
+            Some(DirArg::Expr(Expr::Sym(t))) => t == "arch",
+            Some(DirArg::Expr(e)) => self.eval(e) == Some(5),
+            _ => false,
+        };
+        if !arch {
+            return;
+        }
+        let result = match args.get(1) {
+            Some(DirArg::Str(s)) => crate::isa::check_attribute(&String::from_utf8_lossy(s), self.xlen),
+            _ => Err(".attribute arch: expected a string".into()),
+        };
+        if let Err(msg) = result {
+            self.error(msg);
+        }
+    }
+
     /// `.space n[, fill]` (and its other names, `.zero` and `.skip`): `n`
     /// bytes of `fill`, zero if it is left out. As in LLVM, only the low
     /// byte of `fill` counts (`.space 3, 0x1ff` is three 0xff), and a
@@ -1390,8 +1437,9 @@ impl Assembler {
             ".file" => self.file_directive(args),
             ".loc" => self.loc_directive(args),
             // Accepted and ignored: metadata that does not change the output.
-            ".ident" | ".option" | ".attribute" | ".addrsig" | ".addrsig_sym" | ".cfi_startproc"
-            | ".cfi_endproc" => {}
+            ".option" => self.option(args),
+            ".attribute" => self.attribute(args),
+            ".ident" | ".addrsig" | ".addrsig_sym" | ".cfi_startproc" | ".cfi_endproc" => {}
             _ => self.error(format!("unknown directive '{name}'")),
         }
     }

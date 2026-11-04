@@ -29,6 +29,9 @@ lbl:
 	.word	fwd
 	.option	push
 	.option	norelax
+	# The same ISA in LLVM's eyes: no new $x.
+	.option	arch, +m, -c
+	.option	arch, -a
 fwd:
 	ret
 	.option	pop

@@ -1226,8 +1226,301 @@ static void loc_directive(struct dirarg *args, uint nargs) {
     have_loc = 1;
 }
 
-static const char *const IGNORED[] = {".ident",       ".option",        ".attribute", ".addrsig", ".addrsig_sym",
-                                      ".cfi_startproc", ".cfi_endproc", NULL};
+/* ---- The ISA a source may name (merlin-as's isa.rs) ----
+ *
+ * `.option arch` and `.attribute arch` change the ISA in clang; this one has
+ * only -march's, so one that names another is an error and one that names
+ * the same is accepted. The same: the same width and the same extensions at
+ * the same versions, with what they imply as LLVM adds it (m: zmmul; a:
+ * zaamo and zalrsc; zaamo with zalrsc: a). */
+
+#define NEXT 8
+static const char *const EXT_NAME[NEXT] = {"i", "m", "a", "zicsr", "zifencei", "zmmul", "zaamo", "zalrsc"};
+static const uint EXT_MAJOR[NEXT] = {2, 2, 2, 2, 2, 1, 1, 1};
+static const uint EXT_MINOR[NEXT] = {1, 0, 1, 0, 0, 0, 0, 0};
+enum { X_I, X_M, X_A, X_ZICSR, X_ZIFENCEI, X_ZMMUL, X_ZAAMO, X_ZALRSC };
+
+struct isa {
+    int has[NEXT];
+    uint major[NEXT];
+    uint minor[NEXT];
+};
+
+static void isa_ours(struct isa *x) {
+    for (int k = 0; k < NEXT; k++) {
+        x->has[k] = 1;
+        x->major[k] = EXT_MAJOR[k];
+        x->minor[k] = EXT_MINOR[k];
+    }
+}
+
+static int isa_same(struct isa *a, struct isa *b) {
+    for (int k = 0; k < NEXT; k++) {
+        if (a->has[k] != b->has[k]) {
+            return 0;
+        }
+        if (a->has[k] && (a->major[k] != b->major[k] || a->minor[k] != b->minor[k])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void isa_set(struct isa *x, int k, uint major, uint minor) {
+    x->has[k] = 1;
+    x->major[k] = major;
+    x->minor[k] = minor;
+}
+
+static void isa_imply(struct isa *x) {
+    if (x->has[X_M] && !x->has[X_ZMMUL]) {
+        isa_set(x, X_ZMMUL, 1, 0);
+    }
+    if (x->has[X_A]) {
+        if (!x->has[X_ZAAMO]) {
+            isa_set(x, X_ZAAMO, 1, 0);
+        }
+        if (!x->has[X_ZALRSC]) {
+            isa_set(x, X_ZALRSC, 1, 0);
+        }
+    }
+    if (x->has[X_ZAAMO] && x->has[X_ZALRSC] && !x->has[X_A]) {
+        isa_set(x, X_A, 2, 1);
+    }
+}
+
+/* The extension named by the n bytes at p; -1 if none of ours. */
+static int ext_index(const char *p, uint n) {
+    for (int k = 0; k < NEXT; k++) {
+        if (strlen(EXT_NAME[k]) == n && strncmp(EXT_NAME[k], p, n) == 0) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+static int is_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+/* Splits a trailing version (`2p1`, `2`) off the n bytes at p: the name's
+ * length in *name_len, and 1 with the version, or 0 without one. */
+static int split_version(const char *p, uint n, uint *name_len, uint *major, uint *minor) {
+    uint e = n;
+    while (e > 0 && (is_digit(p[e - 1]) || p[e - 1] == 'p')) {
+        e--;
+    }
+    while (e < n && p[e] == 'p') {
+        e++;
+    }
+    *name_len = n;
+    if (e == n) {
+        return 0;
+    }
+    uint a = 0, b = 0, i = e;
+    int ps = 0;
+    for (; i < n && is_digit(p[i]); i++) {
+        a = a * 10 + (uint)(p[i] - '0');
+    }
+    if (i < n) {
+        if (p[i] != 'p' || i + 1 >= n) {
+            return 0;
+        }
+        i++;
+        ps = 1;
+        for (; i < n && is_digit(p[i]); i++) {
+            b = b * 10 + (uint)(p[i] - '0');
+        }
+        if (i < n) {
+            return 0;
+        }
+    }
+    (void)ps;
+    *name_len = e;
+    *major = a;
+    *minor = b;
+    return 1;
+}
+
+/* Adds the extension of the n bytes at p (with its version or the default)
+ * to x; 0 if it is none of ours. */
+static int isa_add(struct isa *x, const char *p, uint n) {
+    uint len, major, minor;
+    int versioned = split_version(p, n, &len, &major, &minor);
+    int k = ext_index(p, len);
+    if (k < 0) {
+        return 0;
+    }
+    if (!versioned) {
+        major = EXT_MAJOR[k];
+        minor = EXT_MINOR[k];
+    }
+    isa_set(x, k, major, minor);
+    return 1;
+}
+
+/* A full ISA string into *x, and its width in *bits; 0 if it is none LLVM
+ * would take with these extensions. */
+static int isa_parse(const char *s, uint *bits, struct isa *x) {
+    memset(x, 0, sizeof *x);
+    if (strncmp(s, "rv32", 4) == 0) {
+        *bits = 32;
+    } else if (strncmp(s, "rv64", 4) == 0) {
+        *bits = 64;
+    } else {
+        return 0;
+    }
+    const char *p = s + 4;
+    for (uint k = 0;; k++) {
+        uint n = 0;
+        while (p[n] != 0 && p[n] != '_') {
+            n++;
+        }
+        if (n == 0) {
+            return 0;
+        }
+        if (k > 0 && (p[0] == 'z' || p[0] == 's' || p[0] == 'x')) {
+            if (!isa_add(x, p, n)) {
+                return 0;
+            }
+        } else {
+            for (uint i = 0; i < n;) {
+                if (p[i] < 'a' || p[i] > 'z' || (k == 0 && i == 0 && p[i] != 'i')) {
+                    return 0;
+                }
+                uint start = i++;
+                while (i < n && (is_digit(p[i]) || (p[i] == 'p' && i + 1 < n && is_digit(p[i + 1])))) {
+                    i++;
+                }
+                if (!isa_add(x, p + start, i - start)) {
+                    return 0;
+                }
+            }
+        }
+        if (p[n] == 0) {
+            break;
+        }
+        p += n + 1;
+    }
+    isa_imply(x);
+    return 1;
+}
+
+static uint isa_bits(void) {
+    return strncmp(RISCV_ARCH, "rv64", 4) == 0 ? 64 : 32;
+}
+
+static void isa_other(const char *directive) {
+    error(fmt("%s: merlin-as assembles only -march's ISA (%s), and this names another", directive, RISCV_ARCH));
+}
+
+/* `.attribute arch, "isa"`. */
+static void check_attribute(const char *isa) {
+    struct isa x, ours;
+    uint bits;
+    isa_ours(&ours);
+    if (!isa_parse(isa, &bits, &x) || bits != isa_bits() || !isa_same(&x, &ours)) {
+        isa_other(".attribute arch");
+    }
+}
+
+/* `.option arch, ...`: a full ISA string, or +ext and -ext items. */
+static void check_option_arch(struct dirarg *items, uint n) {
+    struct isa x, ours;
+    isa_ours(&ours);
+    isa_ours(&x);
+    if (n == 0) {
+        error(".option arch: expected an ISA, or extensions after + or -");
+        return;
+    }
+    char *first = tmp_strndup((char *)items[0].str, items[0].len);
+    if (n == 1 && strncmp(first, "rv", 2) == 0) {
+        uint bits;
+        if (!isa_parse(first, &bits, &x) || bits != isa_bits() || !isa_same(&x, &ours)) {
+            isa_other(".option arch");
+        }
+        return;
+    }
+    for (uint i = 0; i < n; i++) {
+        char *item = tmp_strndup((char *)items[i].str, items[i].len);
+        const char *name = item + 1;
+        uint len = (uint)strlen(name);
+        if (item[0] == '+') {
+            uint nl, major, minor;
+            if (split_version(name, len, &nl, &major, &minor)) {
+                error("extension version number parsing not currently implemented");
+                return;
+            }
+            int k = ext_index(name, len);
+            if (k < 0) {
+                isa_other(".option arch");
+                return;
+            }
+            isa_set(&x, k, EXT_MAJOR[k], EXT_MINOR[k]);
+        } else if (item[0] == '-') {
+            int k = ext_index(name, len);
+            const char *by = NULL;
+            if (k == X_ZMMUL && x.has[X_M]) {
+                by = "m";
+            } else if ((k == X_ZAAMO || k == X_ZALRSC) && x.has[X_A]) {
+                by = "a";
+            }
+            if (by != NULL) {
+                error(fmt("can't disable %s extension; %s extension requires %s extension", name, by, name));
+                return;
+            }
+            if (k >= 0) {
+                x.has[k] = 0;
+            }
+        } else {
+            error(fmt(".option arch: expected an ISA, or extensions after + or -, not '%s'", item));
+            return;
+        }
+        isa_imply(&x);
+    }
+    if (!isa_same(&x, &ours)) {
+        isa_other(".option arch");
+    }
+}
+
+/* `.option NAME[, ...]` (merlin-as's Assembler::option): arch and rvc must
+ * not change the ISA; the others are ignored. */
+static void option_directive(struct dirarg *args, uint nargs) {
+    if (nargs == 0) {
+        error(".option: expected an option such as push, pop or arch");
+        return;
+    }
+    char *what = tmp_strndup((char *)args[0].str, args[0].len);
+    if (strcmp(what, "arch") == 0) {
+        check_option_arch(args + 1, nargs - 1);
+    } else if (strcmp(what, "rvc") == 0) {
+        isa_other(".option rvc");
+    }
+}
+
+/* `.attribute TAG, value`: arch (5) must name -march's ISA; the others are
+ * ignored. */
+static void attribute_directive(struct dirarg *args, uint nargs) {
+    i64 v;
+    int arch = 0;
+    if (nargs > 0 && args[0].kind == DA_EXPR) {
+        if (args[0].e->kind == E_SYM) {
+            arch = strcmp(args[0].e->sym, "arch") == 0;
+        } else {
+            arch = eval(args[0].e, &v) && v.hi == 0 && v.lo == 5;
+        }
+    }
+    if (!arch) {
+        return;
+    }
+    if (nargs < 2 || args[1].kind != DA_STR) {
+        error(".attribute arch: expected a string");
+        return;
+    }
+    check_attribute(tmp_strndup((char *)args[1].str, args[1].len));
+}
+
+static const char *const IGNORED[] = {".ident", ".addrsig", ".addrsig_sym", ".cfi_startproc", ".cfi_endproc", NULL};
 
 static void directive(const char *name, struct dirarg *args, uint nargs) {
     char *msg;
@@ -1372,6 +1665,10 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         file_directive(args, nargs);
     } else if (strcmp(name, ".loc") == 0) {
         loc_directive(args, nargs);
+    } else if (strcmp(name, ".option") == 0) {
+        option_directive(args, nargs);
+    } else if (strcmp(name, ".attribute") == 0) {
+        attribute_directive(args, nargs);
     } else if (is_one_of(name, IGNORED)) {
         /* Metadata that does not change the output. */
     } else {
