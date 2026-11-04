@@ -45,8 +45,9 @@
 //!   `// expect: N`.
 //! * `kernel_sources_compile`: merlin compiles every C file of the Camelot
 //!   kernel and its user programs (`kernel/*.c`, `kernel/user/*.c`), and
-//!   merlin-as assembles the result, on both widths (on RV64 the kernel's
-//!   checks of its RV32 layouts fail, and only those, until #154). Nothing
+//!   merlin-as assembles the result, every file on both widths (on RV64 the
+//!   kernel's headers leave out their three checks of RV32 structure sizes,
+//!   `CPU_SIZE`, `THREAD_SIZE` and `PROC_SIZE`, until #154 and #155). Nothing
 //!   runs here: `cargo xtask kernel` builds the kernel this way, and xtask's
 //!   tests boot it.
 //!
@@ -888,11 +889,12 @@ fn multi_file_clang(x: Xlen) {
 /// user programs compiles with merlin, with the include directories `cargo xtask
 /// kernel` gives clang, and the result assembles, for RV32 and for RV64.
 ///
-/// On RV64 the user programs compile and assemble. The kernel's own files
-/// check, with `_Static_assert`, that their structures have the RV32 sizes
-/// its assembly and tests index them by (`CPU_SIZE`, `PROC_SIZE`...), and
-/// those fail until the kernel moves to RV64 (#154, #155): there, every
-/// error must be one of those, so the rest of each file passes the front end.
+/// Every file must compile and assemble cleanly on both widths. Three of the
+/// kernel's `_Static_assert`s check RV32 layouts its assembly and tests index
+/// structures by (`CPU_SIZE` in `spinlock.h`, `THREAD_SIZE` and `PROC_SIZE` in
+/// `proc.h`): the headers make them for `__riscv_xlen == 32` only, until the
+/// kernel moves to RV64 (#154, #155). Every other check, such as `fs.h`'s
+/// on-disk layouts, holds on RV64 too.
 #[test]
 fn kernel_sources_compile() {
     for x in WIDTHS {
@@ -919,7 +921,6 @@ fn kernel_sources(x: Xlen) {
             include_dirs: includes,
             ..options(x)
         };
-        let kernel_side = !dir.ends_with("user");
         for f in files {
             count += 1;
             let name = f.file_name().unwrap().to_string_lossy().into_owned();
@@ -927,14 +928,6 @@ fn kernel_sources(x: Xlen) {
                 Ok(asm) => {
                     if let Err(errs) = merlin_as::assemble_to_elf_with(&asm, &as_options(x)) {
                         failures.push(format!("  {name}: merlin-as: {:?}", errs.first()));
-                    }
-                }
-                Err(errs) if x == Xlen::Rv64 && kernel_side => {
-                    if let Some(e) = errs
-                        .iter()
-                        .find(|e| !e.msg.starts_with("static assertion failed"))
-                    {
-                        failures.push(format!("  {name}: {}", e.render(&name)));
                     }
                 }
                 Err(errs) => failures.push(format!("  {name}: {}", errs[0].render(&name))),
