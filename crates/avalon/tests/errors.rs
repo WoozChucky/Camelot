@@ -511,14 +511,17 @@ fn the_last_frame_survives_unread_input() {
         ),
     ];
     for (what, input, expected) in cases {
+        let finished = server.debug_connections_finished();
         let mut s = TcpStream::connect(server.addr()).unwrap();
         s.write_all(&input).unwrap();
         // Done sending: a server that lingers sees the end at once.
         s.shutdown(std::net::Shutdown::Write).unwrap();
-        // Nothing is read until the server has closed its end, so that a reset, if it
-        // sent one, has arrived before the frames are read.
-        wait_until("the connection to be forgotten", SLOW, || {
-            server.debug_connections() == 0
+        // Nothing is read until the server has closed the socket (the count of closed
+        // connections grows only then, while the count of open ones is also 0 before
+        // the server accepts), so that a reset, if it sent one, is on its way before
+        // the frames are read.
+        wait_until("the connection to be closed", SLOW, || {
+            server.debug_connections_finished() > finished
         });
         let reply = read_until_closed(&mut s, SLOW);
         let mut got = Vec::new();

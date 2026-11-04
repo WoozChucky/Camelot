@@ -131,6 +131,9 @@ struct Clients {
     next_id: u64,
     live: HashMap<u64, Client>,
     threads: Vec<JoinHandle<()>>,
+    /// Connections whose threads have finished with them, their sockets closed: only
+    /// ever grows (for tests, [`ServerThread::debug_connections_finished`]).
+    finished: u64,
 }
 
 struct Client {
@@ -271,6 +274,14 @@ impl ServerThread {
         lock(&self.handle.shared.clients).live.len()
     }
 
+    /// For tests: how many connections the server has finished with and closed, ever.
+    /// Unlike [`ServerThread::debug_connections`], which is also 0 before the server has
+    /// accepted a connection, this says that a connection has been closed.
+    #[doc(hidden)]
+    pub fn debug_connections_finished(&self) -> u64 {
+        lock(&self.handle.shared.clients).finished
+    }
+
     /// Shuts the server down and waits until it has.
     pub fn stop(self) -> io::Result<()> {
         self.handle.shutdown();
@@ -316,7 +327,13 @@ impl Shared {
         let shared = Arc::clone(&self);
         let spawned = std::thread::Builder::new()
             .name(format!("client-{id}"))
-            .spawn(move || shared.serve(id, socket));
+            .spawn(move || {
+                Arc::clone(&shared).serve(id, socket);
+                // The socket is closed now: `serve`'s handles are gone, and so is the
+                // one in `live`, which it removed (unless its writer was left blocked,
+                // in which case the writer's handle closes it when the writer ends).
+                lock(&shared.clients).finished += 1;
+            });
         if let Ok(thread) = spawned {
             clients.live.insert(
                 id,
@@ -349,8 +366,8 @@ impl Shared {
         // Reads wake up this often to see whether the connection is being ended.
         let _ = stream.set_read_timeout(Some(POLL));
         let hang_up = Arc::clone(&socket.hang_up);
-        // Closing waits for the client a moment (`close_gracefully`), unless the server
-        // is shutting down.
+        // Closing waits for the client a moment (`close_gracefully`), unless the
+        // connection is being hung up (server shutdown or cut-off).
         let stopped = Arc::clone(&socket.hang_up);
         let stopping = || stopped.load(Ordering::SeqCst);
         let (Ok(cut), Ok(out)) = (stream.try_clone(), stream.try_clone()) else {
