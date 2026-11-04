@@ -171,6 +171,12 @@ pub enum MessageKind {
 /// the same as Grail's VRAM (`FB_FORMAT` 0, Excalibur spec section 9.3).
 pub const PIXEL_FORMAT_XRGB8888: u32 = 0;
 
+/// Bytes a `ScreenFrame`'s length field counts besides its pixels: the message type (2),
+/// `vm`, `x`, `y`, `width` and `height` (4 each) and the pixels' length (4). A rectangle
+/// of `n` pixel bytes fits in one frame if `n + SCREEN_FRAME_OVERHEAD` is at most
+/// [`crate::MAX_FRAME_LEN`].
+pub const SCREEN_FRAME_OVERHEAD: usize = 2 + 5 * 4 + 4;
+
 /// RAM size of [`HardwareProfile::default`], as for `grail::DEFAULT_RAM_SIZE`.
 pub const DEFAULT_RAM_SIZE: u64 = 4 * 1024 * 1024;
 /// Nominal clock of [`HardwareProfile::default`], as for Grail's default.

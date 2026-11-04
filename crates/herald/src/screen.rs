@@ -13,6 +13,7 @@ use crate::{ended, out_of_step, End};
 use avalon_proto::{
     kind_of, AttachKind, Connection, Error, Frame, KeyEvent, Message, MessageKind, PointerChange,
     PointerMotion, Screen, VmRef, VmState, VmSummary, PIXEL_FORMAT_XRGB8888, POINTER_BUTTONS,
+    SCREEN_FRAME_OVERHEAD,
 };
 use grail::pointer::Motion;
 use std::net::{Shutdown, TcpStream};
@@ -291,9 +292,11 @@ impl ScreenSession {
 
 /// Whether Herald can show a `width` × `height` screen in pixel format `format`, as
 /// `ScreenAttached` or `ScreenResized` gives it: XRGB8888, not empty, and no larger
-/// than a full frame the protocol can carry. [`Error::Invalid`] if not.
+/// than a full frame the protocol can carry, its pixels and the rest of the
+/// `ScreenFrame` message in one frame. [`Error::Invalid`] if not.
 pub fn check_screen(width: u32, height: u32, format: u32) -> Result<(), Error> {
-    let fits = Screen::byte_len(width, height).is_some_and(|len| len < avalon_proto::MAX_FRAME_LEN as usize);
+    let room = avalon_proto::MAX_FRAME_LEN as usize - SCREEN_FRAME_OVERHEAD;
+    let fits = Screen::byte_len(width, height).is_some_and(|len| len <= room);
     if format != PIXEL_FORMAT_XRGB8888 || !fits {
         return Err(Error::Invalid(format!(
             "a {width}x{height} screen in pixel format {format}, which Herald cannot show"
@@ -378,7 +381,23 @@ pub fn pointer_from_grail(input: grail::pointer::PointerInput, width: u32, heigh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use avalon_proto::{POINTER_LEFT, POINTER_RIGHT};
+    use avalon_proto::{MAX_FRAME_LEN, POINTER_LEFT, POINTER_RIGHT};
+
+    /// A screen fits if its full frame does, message and all: one whose pixels alone
+    /// are under `MAX_FRAME_LEN`, but not with the `ScreenFrame` around them, does not.
+    #[test]
+    fn a_screen_fits_if_its_full_frame_does() {
+        let widest = ((MAX_FRAME_LEN as usize - SCREEN_FRAME_OVERHEAD) / 4) as u32;
+        assert!(check_screen(widest, 1, PIXEL_FORMAT_XRGB8888).is_ok());
+        assert!(check_screen(widest + 1, 1, PIXEL_FORMAT_XRGB8888).is_err());
+        assert!(
+            (widest as usize + 1) * 4 < MAX_FRAME_LEN as usize,
+            "the pixels alone fit"
+        );
+        assert!(check_screen(1920, 1080, PIXEL_FORMAT_XRGB8888).is_ok());
+        assert!(check_screen(0, 480, PIXEL_FORMAT_XRGB8888).is_err());
+        assert!(check_screen(640, 480, 1).is_err());
+    }
 
     fn to(x: u32, y: u32, buttons: u8) -> Input {
         Input::Pointer(PointerChange {

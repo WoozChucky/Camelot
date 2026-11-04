@@ -826,3 +826,30 @@ fn guest_addresses_are_the_gateways() {
     );
     assert_eq!(theirs.to_string(), rule.to_string());
 }
+
+/// What a `ScreenFrame`'s length field counts besides its pixels is
+/// [`SCREEN_FRAME_OVERHEAD`], so the biggest rectangle one frame carries has
+/// `MAX_FRAME_LEN - SCREEN_FRAME_OVERHEAD` bytes of pixels, and 4 more do not fit.
+#[test]
+fn a_screen_frame_carries_its_pixels_and_a_fixed_overhead() {
+    let frame = |width: u32, height: u32| Message::ScreenFrame {
+        vm: 1,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        pixels: vec![0; width as usize * height as usize * 4],
+    };
+    let bytes = encode(&frame(2, 3)).unwrap();
+    let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    assert_eq!(len, SCREEN_FRAME_OVERHEAD + 2 * 3 * 4);
+
+    let widest = ((MAX_FRAME_LEN as usize - SCREEN_FRAME_OVERHEAD) / 4) as u32;
+    let bytes = encode(&frame(widest, 1)).unwrap();
+    let len = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    assert!(len <= MAX_FRAME_LEN && len + 4 > MAX_FRAME_LEN, "{len}");
+    assert!(matches!(
+        encode(&frame(widest + 1, 1)),
+        Err(Error::FrameTooLarge(_))
+    ));
+}
