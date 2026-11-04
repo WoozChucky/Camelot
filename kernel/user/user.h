@@ -293,8 +293,10 @@ i64 i64_mul(i64 a, i64 b);
  * 0 when there is no result (b is 0, or i64::MIN / -1). */
 int i64_div(i64 a, i64 b, i64 *q);
 int i64_rem(i64 a, i64 b, i64 *r);
-/* Shifts by the low 6 bits of n (wrapping_shl, wrapping_shr: arithmetic). */
+/* Shifts by the low 6 bits of n (wrapping_shl; wrapping_shr of the value
+ * as a u64, logical, and as an i64, arithmetic). */
 i64 i64_shl(i64 a, uint n);
+i64 i64_shr(i64 a, uint n);
 i64 i64_sar(i64 a, uint n);
 i64 i64_and(i64 a, i64 b);
 i64 i64_or(i64 a, i64 b);

@@ -41,6 +41,8 @@ pub enum BinOp {
     Div,
     Rem,
     Shl,
+    /// `>>`: a logical shift, of the value's 64 bits, as LLVM's ELF
+    /// assemblers do (`-16 >> 2` is 0x3ffffffffffffffc).
     Shr,
     And,
     Or,

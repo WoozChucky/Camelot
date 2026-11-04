@@ -74,6 +74,7 @@ extern const struct as_op2 CSR_NAMES[];
 
 /* Relocation types (psABI numbers): what the assembler calls a fixup's kind too. */
 #define R_RISCV_32 1
+#define R_RISCV_64 2
 #define R_RISCV_BRANCH 16
 #define R_RISCV_JAL 17
 #define R_RISCV_CALL_PLT 19

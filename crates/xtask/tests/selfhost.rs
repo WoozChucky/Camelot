@@ -7,7 +7,7 @@
 //! every hand-written `.s` of the repository, the line table corpus
 //! (`crates/merlin-as/tests/debug_line`, whose objects are clang's), and
 //! merlin's assembly for a C file, with `-g` (`.file`, `.loc` and a DWARF
-//! compile unit) and without. An ignored test adds merlin's `-g` assembly
+//! compile unit) and without, and data of every size (`DATA`). An ignored test adds merlin's `-g` assembly
 //! for two big C files, the shell and the kernel's vm.c.
 
 use camelot_fs::mkfs::{Mkfs, Options};
@@ -81,8 +81,30 @@ fn corpus(big: bool) -> Vec<(String, String)> {
         assert!(text.contains(".loc "), "{file} has no line information");
         out.push((format!("{}_{file}.g.s", dir.replace('/', "_")), text));
     }
+    out.push(("data.s".into(), DATA.into()));
     out
 }
+
+/// Data of every size at the edges of its range, `>>` (logical) and the
+/// relocations of `.word` and `.dword`, in a section and in debug
+/// information: what no file of the corpus has all of.
+const DATA: &str = "
+        .text
+f:      nop
+.Lend:  nop
+        .data
+        .byte 255, -128, -16 >> 62
+        .half -32768, 0xffff
+        .word 0xffffffff, -0x80000000, 0x80000000 >> 31
+        .equ BIG, 0x7fffffffffffffff
+        .dword -16 >> 2, 1 << 63 >> 63, BIG + 1
+        .quad -1
+x:      .8byte x + 8, ., f + BIG + 1
+        .word x, ., 1 + (BIG + f)
+        .section .debug_info,\"\",@progbits
+        .quad .Lend
+        .dword f + 2, .Lend - f
+";
 
 /// The name a file of the corpus has on the image: short enough for a
 /// directory entry (DIRSIZ, kernel/include/fs.h).
@@ -237,6 +259,8 @@ fn the_assembler_on_camelot_reports_merlin_as_errors() {
         "    .equ x, 1 / 0\n",
         "    addi a0, a1,\n    .bogus 1\n",
         "    .ascii \"\\q\"\n",
+        // Data must fit its size; only .word and .dword hold an address.
+        "    .byte 1, 256\n    .half x\n    .word -16 >> 2\n    .4byte -0x80000001\n",
         // Line information (merlin-as's line_information_errors, and more).
         ".loc 0 1 0\nnop\n",
         ".file 1 \"a.c\"\n.loc 1 1 0\nnop\n",

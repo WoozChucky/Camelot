@@ -321,7 +321,9 @@ static int eval(struct expr *e, i64 *out) {
             *out = i64_shl(a, b.lo);
             return 1;
         case B_SHR:
-            *out = i64_sar(a, b.lo);
+            /* Logical, as in LLVM (and merlin-as): -16 >> 2 is
+             * 0x3ffffffffffffffc. */
+            *out = i64_shr(a, b.lo);
             return 1;
         case B_AND:
             *out = i64_and(a, b);
@@ -674,6 +676,20 @@ static char *arg_name(struct dirarg *args, uint nargs, uint i, const char *what)
     return NULL;
 }
 
+/* Whether v can be written in size bytes, as a signed or an unsigned value
+ * (merlin-as's fits_in_bytes, LLVM's isIntN || isUIntN). */
+static int fits_in_bytes(i64 v, uint size) {
+    if (size >= 8) {
+        return 1;
+    }
+    i64 top = i64_shl(i64_u(1), 8 * size);
+    i64 bottom = i64_neg(i64_shl(i64_u(1), 8 * size - 1));
+    return i64_in(v, bottom, top);
+}
+
+/* .byte, .half, .word and .dword: merlin-as's Assembler::data. A number
+ * must fit; a symbol's address is R_RISCV_32 in a .word and R_RISCV_64 in
+ * a .dword. */
 static void data(struct dirarg *args, uint nargs, uint size) {
     if (nargs > 0) {
         take_loc();
@@ -686,6 +702,12 @@ static void data(struct dirarg *args, uint nargs, uint size) {
         struct expr *e = args[k].e;
         i64 v;
         if (eval(e, &v) || eval_relative(e, &v)) {
+            if (!fits_in_bytes(v, size)) {
+                char *msg;
+                msg = fmt("data value %s does not fit in %u %s", i64_dec(v), size, size == 1 ? "byte" : "bytes");
+                error(msg);
+                continue;
+            }
             uchar bytes[8];
             for (uint i = 0; i < 4; i++) {
                 bytes[i] = (uchar)(v.lo >> (8 * i));
@@ -694,22 +716,23 @@ static void data(struct dirarg *args, uint nargs, uint size) {
             emit_bytes(bytes, size);
             continue;
         }
+        if (size != 4 && size != 8) {
+            error("only .word and .dword can hold a symbol address");
+            continue;
+        }
         char *name;
         i64 addend;
-        int sym = ctx_symbol(e, &name, &addend);
-        if (size == 4 && sym) {
-            uint off = sections[current].size;
-            if (strcmp(name, DOT) == 0) {
-                name = dot_label(off);
-            }
-            add_reloc(off, R_RISCV_32, name, addend);
-            static const uchar zero[4] = {0, 0, 0, 0};
-            emit_bytes(zero, 4);
-        } else if (size == 4) {
+        if (!ctx_symbol(e, &name, &addend)) {
             error("expected a constant or symbol(+offset)");
-        } else {
-            error("only .word can hold a symbol address");
+            continue;
         }
+        uint off = sections[current].size;
+        if (strcmp(name, DOT) == 0) {
+            name = dot_label(off);
+        }
+        add_reloc(off, size == 8 ? R_RISCV_64 : R_RISCV_32, name, addend);
+        static const uchar zero[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        emit_bytes(zero, size);
     }
 }
 
@@ -1050,6 +1073,8 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         data(args, nargs, 2);
     } else if (strcmp(name, ".word") == 0 || strcmp(name, ".long") == 0 || strcmp(name, ".4byte") == 0) {
         data(args, nargs, 4);
+    } else if (strcmp(name, ".dword") == 0 || strcmp(name, ".quad") == 0 || strcmp(name, ".8byte") == 0) {
+        data(args, nargs, 8);
     } else if (strcmp(name, ".ascii") == 0 || strcmp(name, ".asciz") == 0 || strcmp(name, ".string") == 0) {
         if (nargs > 0) {
             take_loc();
