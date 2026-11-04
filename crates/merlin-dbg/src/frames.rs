@@ -219,13 +219,13 @@ pub fn backtrace(mem: &mut impl Memory, regs: Regs, function: impl Fn(u64) -> Op
         }
         // A return address is just past the call: the call is in the caller's function.
         let pro = prologue_of(mem, wrap(xlen, pc.wrapping_sub(4)));
-        let Some((next_pc, next_fp)) = caller(mem, pro, fp, xlen) else {
+        let Some((caller_pc, caller_fp)) = caller(mem, pro, fp, xlen) else {
             break;
         };
-        if next_fp != 0 && next_fp <= fp {
+        if caller_fp != 0 && caller_fp <= fp {
             break;
         }
-        (pc, fp) = (next_pc, next_fp);
+        (pc, fp) = (caller_pc, caller_fp);
     }
     frames
 }
@@ -234,9 +234,12 @@ pub fn backtrace(mem: &mut impl Memory, regs: Regs, function: impl Fn(u64) -> Op
 /// and whose `s0` is `fp`.
 fn caller(mem: &mut impl Memory, pro: Option<Prologue>, fp: u64, xlen: Xlen) -> Option<(u64, u64)> {
     let p = pro?;
-    let cfa = fp.wrapping_sub(p.fp as u64);
-    let ra = mem.xword(wrap(xlen, cfa.wrapping_add(p.ra_slot as u64)))?;
-    let s0 = mem.xword(wrap(xlen, cfa.wrapping_add(p.s0_slot as u64)))?;
+    // The CFA first: s0 is `p.fp` bytes from it.
+    let cfa = wrap(xlen, fp.wrapping_sub(p.fp as u64));
+    // Then the saved registers, in their slots below the CFA.
+    let slot = |off: i64| wrap(xlen, cfa.wrapping_add(off as u64));
+    let ra = mem.xword(slot(p.ra_slot))?;
+    let s0 = mem.xword(slot(p.s0_slot))?;
     Some((ra, s0))
 }
 

@@ -511,9 +511,10 @@ impl<'a, W: Write> Session<'a, W> {
         Some(excalibur::decode(word, self.xlen))
     }
 
-    /// `n` bytes past `pc`, wrapping as the machine's addresses do.
-    fn next_pc(&self, pc: u64, n: u64) -> u64 {
-        wrap(self.xlen, pc.wrapping_add(n))
+    /// The address `n` bytes past `addr` (code or data), wrapping as the machine's
+    /// addresses do.
+    fn advance(&self, addr: u64, n: u64) -> u64 {
+        wrap(self.xlen, addr.wrapping_add(n))
     }
 
     /// Where a call at `pc` returns to: after a `jal`/`jalr` that links (`call`,
@@ -521,9 +522,9 @@ impl<'a, W: Write> Session<'a, W> {
     /// the instruction there is no call.
     fn call_at(&mut self, pc: u64) -> Option<u64> {
         match self.inst_at(pc) {
-            Some(Inst::Jal { rd, .. } | Inst::Jalr { rd, .. }) if rd != 0 => Some(self.next_pc(pc, 4)),
-            Some(Inst::Auipc { rd: 1, .. }) => match self.inst_at(self.next_pc(pc, 4)) {
-                Some(Inst::Jalr { rd: 1, rs1: 1, .. }) => Some(self.next_pc(pc, 8)),
+            Some(Inst::Jal { rd, .. } | Inst::Jalr { rd, .. }) if rd != 0 => Some(self.advance(pc, 4)),
+            Some(Inst::Auipc { rd: 1, .. }) => match self.inst_at(self.advance(pc, 4)) {
+                Some(Inst::Jalr { rd: 1, rs1: 1, .. }) => Some(self.advance(pc, 8)),
                 _ => None,
             },
             _ => None,
@@ -725,7 +726,7 @@ impl<'a, W: Write> Session<'a, W> {
         let bytes = self.remote.read_memory(addr, count * size)?;
         let mut lines = Vec::new();
         for (i, chunk) in bytes.chunks(per_line * size).enumerate() {
-            let at = self.next_pc(addr, (i * per_line * size) as u64);
+            let at = self.advance(addr, (i * per_line * size) as u64);
             let values: Vec<String> = chunk
                 .chunks(size)
                 .map(|v| match v.len() == size {
@@ -739,7 +740,7 @@ impl<'a, W: Write> Session<'a, W> {
             lines.push(format!("{}:  {}", self.show(at), values.join("  ")));
         }
         if bytes.len() < count * size {
-            let end = self.next_pc(addr, bytes.len() as u64);
+            let end = self.advance(addr, bytes.len() as u64);
             lines.push(format!("(cannot read past {})", self.hex(end)));
         }
         self.say(lines.join("\n"));
@@ -774,7 +775,7 @@ impl<'a, W: Write> Session<'a, W> {
         };
         let lines: Vec<String> = (0..count)
             .map(|i| {
-                let at = self.next_pc(start, 4 * i);
+                let at = self.advance(start, 4 * i);
                 self.disas_line(at, at == pc)
             })
             .collect();
