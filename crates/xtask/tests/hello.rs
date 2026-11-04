@@ -68,8 +68,9 @@ fn objdump(objdump: &Path, obj: &Path) -> String {
     String::from_utf8(out.stdout).unwrap().replace('\r', "")
 }
 
-/// Every example source: clang assembles them too, with the Xcal mnemonics
-/// from `examples/xcal.inc`.
+/// Every example source, at each width it is built for: clang assembles them
+/// too, with the Xcal mnemonics from `examples/xcal.inc` (RV64 with the flags
+/// of the RV64 reference builds, `xtask::ld_fixtures::RV64`).
 #[test]
 fn objdump_of_merlin_as_objects_matches_clang() {
     let tools = tools::find("clang").and_then(|clang| {
@@ -80,25 +81,45 @@ fn objdump_of_merlin_as_objects_matches_clang() {
         eprintln!("skipped: clang or llvm-objdump not found");
         return;
     };
-    let sources = examples::EXAMPLES
-        .iter()
-        .flat_map(|e| e.sources.iter().map(move |s| format!("{}/{s}", e.dir)));
-    for example in sources {
+    let mut sources = std::collections::BTreeSet::new();
+    for e in examples::EXAMPLES {
+        for xlen in examples::XLENS {
+            for s in e.sources_for(xlen) {
+                sources.insert((xlen == examples::Xlen::Rv64, format!("{}/{s}", e.dir)));
+            }
+        }
+    }
+    for (rv64, example) in sources {
         let src = repo_root().join("examples").join(&example);
-        let name = example.replace(['/', '.'], "-");
+        let xlen = if rv64 {
+            examples::Xlen::Rv64
+        } else {
+            examples::Xlen::Rv32
+        };
+        let name = format!("{}-{xlen:?}", example.replace(['/', '.'], "-"));
         let obj = format!("{name}.o");
 
         let ours = scratch(&format!("objdump-merlin-{name}"));
         std::fs::create_dir_all(&ours).unwrap();
         let text = std::fs::read_to_string(&src).unwrap();
-        std::fs::write(ours.join(&obj), merlin_as::assemble_to_elf(&text).unwrap()).unwrap();
+        let opts = merlin_as::Options { xlen };
+        let data = merlin_as::assemble_to_elf_with(&text, &opts).unwrap();
+        std::fs::write(ours.join(&obj), data).unwrap();
 
         let theirs = scratch(&format!("objdump-clang-{name}"));
         std::fs::create_dir_all(&theirs).unwrap();
-        let status = Command::new(&clang)
-            .args(kernel::TARGET_FLAGS)
-            .arg("-march=rv32ima_zicsr_zifencei")
-            .arg("-c")
+        let mut clang_cmd = Command::new(&clang);
+        if rv64 {
+            clang_cmd
+                .args(xtask::ld_fixtures::RV64.flags)
+                .arg(xtask::ld_fixtures::NO_RELAX);
+        } else {
+            clang_cmd
+                .args(kernel::TARGET_FLAGS)
+                .arg("-march=rv32ima_zicsr_zifencei")
+                .arg("-c");
+        }
+        let status = clang_cmd
             .arg("-include")
             .arg(repo_root().join(examples::XCAL_INCLUDE))
             .arg(&src)
@@ -112,6 +133,6 @@ fn objdump_of_merlin_as_objects_matches_clang() {
             objdump(&llvm_objdump, &ours.join(&obj)),
             objdump(&llvm_objdump, &theirs.join(&obj)),
         );
-        assert_eq!(ours, theirs, "{example}");
+        assert_eq!(ours, theirs, "{example} ({xlen:?})");
     }
 }

@@ -16,6 +16,8 @@
 #
 #   cargo run --release -p grail -- --fb examples/pointer/pointer.elf
 #
+# pointer-rv64.S is the same program for RV64 machines.
+#
 # Built with our own tools by `cargo xtask examples pointer`, which does the same as
 #
 #   merlin-as examples/pointer/pointer.S -o pointer.o

@@ -14,8 +14,10 @@ tasks:
                images directory (target/platform/images) as the image os-base, and run Lake,
                Avalon and Pendragon until Ctrl-C. --demo also starts a Camelot VM, vm001;
                cargo xtask up --help lists the options
-  examples     build every example (or the ones named) with merlin-as + merlin-ld into
-               examples/<dir>/<name>.elf; no LLVM needed. Objects go to target/examples.
+  examples     build every example (or the ones named) with merlin-as + merlin-ld, for
+               RV32 into examples/<dir>/<name>.elf and for RV64 into
+               examples/<dir>/<name>-rv64.elf; no LLVM needed. Objects go to
+               target/examples (RV64: target/examples/rv64).
                --check: build in memory and report stale .elf files instead of writing
                -v: print the equivalent merlin-as/merlin-ld command lines
   kernel       build kernel/kernel.elf with our own toolchain (merlin, merlin-as, merlin-ld;
@@ -323,10 +325,11 @@ fn up(options: xtask::up::Options) -> ExitCode {
 }
 
 /// `cargo xtask examples`: merlin-as + merlin-ld for every example (or the
-/// named ones). Writes each object to `target/examples/<dir>/` and each
-/// executable over the committed `examples/<dir>/<name>.elf`; with `--check`,
-/// writes nothing and fails if a committed executable is not what the current
-/// tools build.
+/// named ones), at both widths. Writes each object to `target/examples/<dir>/`
+/// (RV64: `target/examples/rv64/<dir>/`) and each executable over the
+/// committed `examples/<dir>/<name>.elf` (RV64: `<name>-rv64.elf`); with
+/// `--check`, writes nothing and fails if a committed executable is not what
+/// the current tools build.
 fn build_examples(args: ExamplesArgs) -> ExitCode {
     let root = repo_root();
     let selected: Vec<&examples::Example> = if args.names.is_empty() {
@@ -334,14 +337,17 @@ fn build_examples(args: ExamplesArgs) -> ExitCode {
     } else {
         args.names.iter().filter_map(|n| examples::find(n)).collect()
     };
+    let builds = selected
+        .into_iter()
+        .flat_map(|ex| examples::XLENS.map(|xlen| (ex, xlen)));
     let mut failed = false;
-    for ex in selected {
+    for (ex, xlen) in builds {
         if args.verbose {
-            for cmd in examples::commands(ex, &format!("target/examples/{}", ex.dir)) {
+            for cmd in examples::commands(ex, xlen, &examples::obj_dir_name(ex, xlen)) {
                 eprintln!("{cmd}");
             }
         }
-        let built = match examples::build(&root, ex) {
+        let built = match examples::build(&root, ex, xlen) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("{e}");
@@ -353,12 +359,12 @@ fn build_examples(args: ExamplesArgs) -> ExitCode {
             eprintln!("merlin-ld: warning: {w}");
         }
         if args.check {
-            match examples::check(&root, ex, &built) {
-                examples::Status::UpToDate => eprintln!("{} is up to date", ex.elf_name()),
+            match examples::check(&root, ex, xlen, &built) {
+                examples::Status::UpToDate => eprintln!("{} is up to date", ex.elf_name(xlen)),
                 examples::Status::Stale => {
                     eprintln!(
                         "{} is out of date: run `cargo xtask examples {}`",
-                        ex.elf_name(),
+                        ex.elf_name(xlen),
                         ex.name
                     );
                     failed = true;
@@ -370,8 +376,8 @@ fn build_examples(args: ExamplesArgs) -> ExitCode {
             }
             continue;
         }
-        match examples::write(&root, ex, &built) {
-            Ok(()) => eprintln!("built {}", ex.elf_name()),
+        match examples::write(&root, ex, xlen, &built) {
+            Ok(()) => eprintln!("built {}", ex.elf_name(xlen)),
             Err(e) => {
                 eprintln!("xtask: cannot write {}: {e}", ex.name);
                 failed = true;

@@ -1,17 +1,20 @@
 //! Every example built with our own tools, merlin-as + merlin-ld, as
-//! `cargo xtask examples` builds it (roadmap step 6, issue #8). No LLVM:
+//! `cargo xtask examples` builds it (roadmap step 6, issue #8), for RV32 and
+//! for RV64 (#151). No LLVM:
 //!
-//! * the committed `examples/<dir>/<name>.elf` files are exactly what the
-//!   current tools build from the sources;
-//! * each freshly built program runs in Grail, with input where it reads some
-//!   (UART bytes, key events, pointer input, a disk, another machine on a
-//!   network), and prints what it should and exits
-//!   with the right code;
+//! * the committed `examples/<dir>/<name>.elf` and `<name>-rv64.elf` files are
+//!   exactly what the current tools build from the sources;
+//! * each freshly built program runs in Grail, on a machine of its width, with
+//!   input where it reads some (UART bytes, key events, pointer input, a disk,
+//!   another machine on a network), and prints what it should and exits with
+//!   the right code. Both widths print the same, apart from what the width
+//!   changes: `xcal.dbg`'s 16-digit pc and register, the addresses the
+//!   programs print in 16 hex digits, sysinfo's version 2, muldiv's cases;
 //! * `hello` and `multiobj` load byte for byte like ld.lld's link of clang's
 //!   objects (the references in `crates/merlin-ld/tests/fixtures`, made by
-//!   `cargo xtask ld-fixtures`), and merlin-objdump's disassembly of them is
-//!   llvm-objdump's of ld.lld's. What differs outside the loaded bytes is
-//!   pinned down here and listed in docs/excalibur-spec.md section 10.
+//!   `cargo xtask ld-fixtures`), and merlin-objdump's disassembly of the RV32
+//!   ones is llvm-objdump's of ld.lld's. What differs outside the loaded bytes
+//!   is pinned down here and listed in docs/excalibur-spec.md section 10.
 
 use elf::{Elf, PT_GNU_STACK, PT_LOAD, PT_RISCV_ATTRIBUTES, SHF_ALLOC, SHT_SYMTAB};
 use grail::block::SECTOR_SIZE;
@@ -22,14 +25,14 @@ use grail::{DiskConfig, Machine, MachineConfig, NetConfig, RunResult};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
-use xtask::examples::{self, Example, EXAMPLES};
+use xtask::examples::{self, Example, Xlen, EXAMPLES, XLENS};
 use xtask::repo_root;
 
 /// Enough for colorbars, which writes every pixel of the 640x480 framebuffer.
 const MAX_STEPS: u64 = 20_000_000;
 
-fn build(ex: &Example) -> examples::Built {
-    examples::build(&repo_root(), ex).unwrap_or_else(|e| panic!("{}: {e}", ex.name))
+fn build(ex: &Example, xlen: Xlen) -> examples::Built {
+    examples::build(&repo_root(), ex, xlen).unwrap_or_else(|e| panic!("{} ({xlen:?}): {e}", ex.name))
 }
 
 fn example(name: &str) -> &'static Example {
@@ -63,15 +66,41 @@ fn typed(text: &str) -> Vec<KeyEvent> {
     keys
 }
 
-fn scenario(name: &str) -> Scenario {
-    let plain = |output, exit| Scenario {
+/// What `name` gets and must do on an `xlen` machine.
+fn scenario(name: &str, xlen: Xlen) -> Scenario {
+    match xlen {
+        Xlen::Rv32 => scenario_rv32(name),
+        Xlen::Rv64 => scenario_rv64(name),
+    }
+}
+
+/// A scenario with no input.
+fn plain(output: &'static str, exit: u32) -> Scenario {
+    Scenario {
         stdin: b"",
         keys: Vec::new(),
         pointer: Vec::new(),
         disk: None,
         output,
         exit,
-    };
+    }
+}
+
+/// The pointer events of the `pointer` example: three, read in one interrupt (the
+/// pointer's priority is above the keyboard's), then Esc.
+fn pointer_input(output: &'static str) -> Scenario {
+    Scenario {
+        pointer: vec![
+            PointerInput::move_to(50, 60),
+            PointerInput::buttons(BUTTON_LEFT),
+            PointerInput::move_to(120, 90).with_buttons(BUTTON_LEFT),
+        ],
+        keys: vec![KeyEvent::press(code::ESC)],
+        ..plain(output, 0)
+    }
+}
+
+fn scenario_rv32(name: &str) -> Scenario {
     match name {
         "hello" => plain("Hello from Camelot!\n[dbg] pc=80000018 a0 = 0x00000014 (20)\n", 0),
         // Both strings (47 bytes, counted in print.S's .bss), then exit code
@@ -130,22 +159,8 @@ fn scenario(name: &str) -> Scenario {
             keys: typed("ok"),
             ..plain("ok[dbg] pc=800000b0 s0 = 0x00000005 (5)\n", 0)
         },
-        // Three pointer events, read in one interrupt (the pointer's priority is
-        // above the keyboard's), then Esc. The cursor is checked in
-        // `examples_run_in_grail`.
-        "pointer" => Scenario {
-            pointer: vec![
-                PointerInput::move_to(50, 60),
-                PointerInput::buttons(BUTTON_LEFT),
-                PointerInput::move_to(120, 90).with_buttons(BUTTON_LEFT),
-            ],
-            keys: vec![KeyEvent::press(code::ESC)],
-            ..plain(
-                "[dbg] pc=8000017c s4 = 0x00000003 (3)
-",
-                0,
-            )
-        },
+        // The cursor is checked in `examples_run_in_grail`.
+        "pointer" => pointer_input("[dbg] pc=8000017c s4 = 0x00000003 (3)\n"),
         // One hart: every count is its own, and no store-conditional can fail.
         // `smp_example_runs_on_every_hart_count` runs it on more.
         "smp" => plain(
@@ -163,17 +178,83 @@ fn scenario(name: &str) -> Scenario {
     }
 }
 
+/// The RV64 builds: what the RV32 ones print, but `xcal.dbg` shows the 64-bit pc and
+/// register, the programs print addresses and sizes in 16 hex digits, sysinfo is
+/// version 2, and muldiv has its RV64 cases. A pc can differ where the RV64 code
+/// does (`li` of a 64-bit interrupt cause takes one instruction more).
+fn scenario_rv64(name: &str) -> Scenario {
+    match name {
+        "hello" => plain(
+            "Hello from Camelot!\n[dbg] pc=0000000080000018 a0 = 0x0000000000000014 (20)\n",
+            0,
+        ),
+        "multiobj" => plain(
+            "Hello from two objects!\nputs lives in print.S.\n\
+             [dbg] pc=0000000080000034 a0 = 0x000000000000002f (47)\n",
+            42,
+        ),
+        // All 29 cases passed.
+        "muldiv" => plain("[dbg] pc=0000000080000328 a0 = 0x000000000000001d (29)\n", 0),
+        "sysinfo" => plain(
+            "sysinfo v2\n\
+             RAM      4 MiB at 0x0000000080000000\n\
+             CPU      10000000 Hz (nominal)\n\
+             timebase 10000000 Hz\n\
+             9 devices:\n  \
+             test      0x0000000000100000 + 0x0000000000001000\n  \
+             CLINT     0x0000000002000000 + 0x0000000000010000\n  \
+             PLIC      0x000000000c000000 + 0x0000000004000000\n  \
+             UART      0x0000000010000000 + 0x0000000000000100  irq 1\n  \
+             fb-ctrl   0x0000000030000000 + 0x0000000000001000\n  \
+             keyboard  0x0000000030001000 + 0x0000000000001000  irq 2\n  \
+             sysinfo   0x0000000030002000 + 0x0000000000001000\n  \
+             pointer   0x0000000030003000 + 0x0000000000001000  irq 11\n  \
+             fb-vram   0x0000000031000000 + 0x000000000012c000\n",
+            0,
+        ),
+        "disk" => Scenario {
+            disk: Some(DISK_IMG),
+            ..plain(
+                "disk 0x0000000010001000, irq 3: 8 sectors\n\
+                 sector 0:\n\
+                 Hello from sector 0 of disk.img!\n\
+                 This text is on the disk image, not in the program.\n\
+                 read past the end: error 2\n\
+                 write/read-back of sector 7: ok\n",
+                0,
+            )
+        },
+        "uart-echo" => Scenario {
+            stdin: b"hi\n\x04",
+            ..plain("hi\n[dbg] pc=00000000800000b0 s0 = 0x0000000000000004 (4)\n", 0)
+        },
+        "colorbars" => plain("", 0),
+        "kbd-echo" => Scenario {
+            keys: typed("ok"),
+            ..plain("ok[dbg] pc=000000008000005c s1 = 0x0000000000000003 (3)\n", 0)
+        },
+        "kbd-echo-irq" => Scenario {
+            keys: typed("ok"),
+            ..plain("ok[dbg] pc=00000000800000b4 s0 = 0x0000000000000005 (5)\n", 0)
+        },
+        "pointer" => pointer_input("[dbg] pc=0000000080000180 s4 = 0x0000000000000003 (3)\n"),
+        "smp" | "net-ping" | "net-pong" | "net-user" => scenario_rv32(name),
+        other => panic!("no RV64 scenario for example {other}: add one"),
+    }
+}
+
 /// The image `examples/disk` reads, relative to the repository root.
 const DISK_IMG: &str = "examples/disk/disk.img";
 
-/// Runs `elf` on a default machine whose RAM starts as garbage (so `.bss`
-/// must really be zeroed by the loader) with the scenario's input.
-fn run(elf: &[u8], s: &Scenario) -> (RunResult, String, Machine) {
+/// Runs `elf` on a default machine of its width whose RAM starts as garbage (so
+/// `.bss` must really be zeroed by the loader) with the scenario's input.
+fn run(elf: &[u8], xlen: Xlen, s: &Scenario) -> (RunResult, String, Machine) {
     let disks = match s.disk {
         Some(img) => vec![DiskConfig::memory(std::fs::read(repo_root().join(img)).unwrap())],
         None => Vec::new(),
     };
     let mut m = Machine::new(MachineConfig {
+        xlen,
         disks,
         ..MachineConfig::default()
     })
@@ -193,6 +274,7 @@ fn run(elf: &[u8], s: &Scenario) -> (RunResult, String, Machine) {
         assert!(m.key_event(k), "keyboard FIFO full");
     }
     let r = m.run(Some(MAX_STEPS), |_| {});
+    assert_eq!(m.cpu.xlen(), xlen, "the program is as wide as the machine");
     let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
     (r, out, m)
 }
@@ -220,7 +302,10 @@ fn sources_on_disk() -> BTreeSet<String> {
 fn every_example_source_is_built() {
     let listed: BTreeSet<String> = EXAMPLES
         .iter()
-        .flat_map(|e| e.sources.iter().map(move |s| format!("{}/{s}", e.dir)))
+        .flat_map(|e| {
+            let sources = e.sources.iter().chain(e.rv64_sources);
+            sources.map(move |s| format!("{}/{s}", e.dir))
+        })
         .collect();
     assert_eq!(
         listed,
@@ -229,32 +314,58 @@ fn every_example_source_is_built() {
     );
 }
 
+/// The command lines at the top of each example's first source are the ones
+/// `cargo xtask examples -v` prints for it, at each width, with the objects in
+/// the current directory: a source both widths share gives both builds.
 #[test]
-fn committed_examples_are_current() {
+fn the_sources_give_their_build_commands() {
     for ex in EXAMPLES {
-        let built = build(ex);
-        assert!(built.warnings.is_empty(), "{}: {:?}", ex.name, built.warnings);
-        let path = ex.elf_path(&repo_root());
-        let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        assert!(
-            committed == built.elf,
-            "{} is not what merlin-as + merlin-ld build: run `cargo xtask examples {}` and commit it",
-            ex.elf_name(),
-            ex.name
-        );
+        for xlen in XLENS {
+            let first = ex.sources_for(xlen)[0];
+            let text = std::fs::read_to_string(ex.dir(&repo_root()).join(first)).unwrap();
+            for cmd in examples::commands(ex, xlen, "OBJ") {
+                let cmd = cmd.replace("OBJ/", "");
+                assert!(text.contains(&format!("#   {cmd}\n")), "{first}: {cmd}");
+            }
+        }
     }
 }
 
-/// Acceptance of #8: every example, built from source with our tools, runs.
+#[test]
+fn committed_examples_are_current() {
+    for ex in EXAMPLES {
+        for xlen in XLENS {
+            let built = build(ex, xlen);
+            assert!(built.warnings.is_empty(), "{}: {:?}", ex.name, built.warnings);
+            let path = ex.elf_path(&repo_root(), xlen);
+            let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(
+                committed == built.elf,
+                "{} is not what merlin-as + merlin-ld build: run `cargo xtask examples {}` and commit it",
+                ex.elf_name(xlen),
+                ex.name
+            );
+            let class = Elf::parse(&committed).unwrap().class;
+            let want = match xlen {
+                Xlen::Rv32 => elf::Class::Elf32,
+                Xlen::Rv64 => elf::Class::Elf64,
+            };
+            assert_eq!(class, want, "{}", ex.elf_name(xlen));
+        }
+    }
+}
+
+/// Acceptance of #8, and of #151 for RV64: every example, built from source with
+/// our tools, runs.
 #[test]
 fn examples_run_in_grail() {
-    for ex in EXAMPLES {
-        let s = scenario(ex.name);
-        let (r, out, mut m) = run(&build(ex).elf, &s);
+    for (ex, xlen) in EXAMPLES.iter().flat_map(|e| XLENS.map(|x| (e, x))) {
+        let s = scenario(ex.name, xlen);
+        let (r, out, mut m) = run(&build(ex, xlen).elf, xlen, &s);
         assert_eq!(
             (r, out.as_str()),
             (RunResult::Exited(s.exit), s.output),
-            "{}",
+            "{} ({xlen:?})",
             ex.name
         );
         if ex.name == "colorbars" {
@@ -297,60 +408,70 @@ fn examples_run_in_grail() {
 #[test]
 fn interactive_examples_wait_for_input() {
     for name in ["uart-echo", "kbd-echo", "kbd-echo-irq", "pointer"] {
-        let idle = Scenario {
-            stdin: b"",
-            keys: Vec::new(),
-            pointer: Vec::new(),
-            disk: None,
-            output: "",
-            exit: 0,
-        };
-        let (r, out, _) = run(&build(example(name)).elf, &idle);
-        assert_eq!((r, out.as_str()), (RunResult::StepLimit, ""), "{name}");
+        for xlen in XLENS {
+            let idle = plain("", 0);
+            let (r, out, _) = run(&build(example(name), xlen).elf, xlen, &idle);
+            assert_eq!((r, out.as_str()), (RunResult::StepLimit, ""), "{name} ({xlen:?})");
+        }
     }
 }
 
 /// `examples/net`: ping and pong, freshly built, on two machines connected by a
-/// hub. Pong starts first, so its card has buffers when ping's frame comes.
+/// hub, at each width (the RV64 card has 16-byte descriptors and a 64-bit
+/// address, printed in 16 digits). Pong starts first, so its card has buffers
+/// when ping's frame comes.
 #[test]
 fn net_examples_talk_over_a_hub() {
-    let hub = Hub::new();
-    let boot = |name: &str| {
-        let config = MachineConfig {
-            nets: vec![NetConfig::hub(&hub)],
-            ..MachineConfig::default()
+    for xlen in XLENS {
+        let hub = Hub::new();
+        let boot = |name: &str| {
+            let config = MachineConfig {
+                xlen,
+                nets: vec![NetConfig::hub(&hub)],
+                ..MachineConfig::default()
+            };
+            let mut m = Machine::new(config).unwrap();
+            m.cpu.bus.uart.capture = true;
+            m.load_elf(&build(example(name), xlen).elf).unwrap();
+            m
         };
-        let mut m = Machine::new(config).unwrap();
-        m.cpu.bus.uart.capture = true;
-        m.load_elf(&build(example(name)).elf).unwrap();
-        m
-    };
-    let mut ping = boot("net-ping");
-    let mut pong = boot("net-pong");
-    pong.run_for(20_000, &mut |_| {});
-    for _ in 0..1000 {
-        ping.run_for(1000, &mut |_| {});
-        pong.run_for(1000, &mut |_| {});
+        let mut ping = boot("net-ping");
+        let mut pong = boot("net-pong");
+        pong.run_for(20_000, &mut |_| {});
+        for _ in 0..1000 {
+            ping.run_for(1000, &mut |_| {});
+            pong.run_for(1000, &mut |_| {});
+        }
+        let out = |m: &mut Machine| String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
+        let card = match xlen {
+            Xlen::Rv32 => "net 0x10009000",
+            Xlen::Rv64 => "net 0x0000000010009000",
+        };
+        assert_eq!(
+            (ping.exit_code(), out(&mut ping)),
+            (
+                Some(0),
+                format!(
+                    "{card}, irq 12, mac 02:ca:00:00:00:01, link up\n\
+                     sent 60 bytes to ff:ff:ff:ff:ff:ff\n\
+                     received 60 bytes from 02:ca:00:00:00:02, type 0x88b5: Hello back from pong!\n"
+                )
+            ),
+            "{xlen:?}"
+        );
+        assert_eq!(
+            (pong.exit_code(), out(&mut pong)),
+            (
+                Some(0),
+                format!(
+                    "{card}, irq 12, mac 02:ca:00:00:00:02, link up\n\
+                     received 60 bytes from 02:ca:00:00:00:01, type 0x88b5: Hello from ping!\n\
+                     sent 60 bytes to 02:ca:00:00:00:01\n"
+                )
+            ),
+            "{xlen:?}"
+        );
     }
-    let out = |m: &mut Machine| String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
-    assert_eq!(
-        (ping.exit_code(), out(&mut ping).as_str()),
-        (
-            Some(0),
-            "net 0x10009000, irq 12, mac 02:ca:00:00:00:01, link up\n\
-             sent 60 bytes to ff:ff:ff:ff:ff:ff\n\
-             received 60 bytes from 02:ca:00:00:00:02, type 0x88b5: Hello back from pong!\n"
-        )
-    );
-    assert_eq!(
-        (pong.exit_code(), out(&mut pong).as_str()),
-        (
-            Some(0),
-            "net 0x10009000, irq 12, mac 02:ca:00:00:00:02, link up\n\
-             received 60 bytes from 02:ca:00:00:00:01, type 0x88b5: Hello from ping!\n\
-             sent 60 bytes to 02:ca:00:00:00:01\n"
-        )
-    );
 }
 
 /// `examples/smp`, freshly built, on 2 to 8 harts: hart 0 wakes the others with
@@ -359,9 +480,13 @@ fn net_examples_talk_over_a_hub() {
 /// share of the IPIs.
 #[test]
 fn smp_example_runs_on_every_hart_count() {
-    let elf = build(example("smp")).elf;
-    for harts in 2..=grail::MAX_HARTS {
+    for (xlen, harts) in XLENS
+        .into_iter()
+        .flat_map(|x| (2..=grail::MAX_HARTS).map(move |h| (x, h)))
+    {
+        let elf = build(example("smp"), xlen).elf;
         let mut m = Machine::new(MachineConfig {
+            xlen,
             harts,
             ..MachineConfig::default()
         })
@@ -391,31 +516,31 @@ fn smp_example_runs_on_every_hart_count() {
 /// disk is what it reads.
 #[test]
 fn disk_example_needs_its_disk() {
-    let no_disk = Scenario {
-        stdin: b"",
-        keys: Vec::new(),
-        pointer: Vec::new(),
-        disk: None,
-        output: "",
-        exit: 1,
-    };
-    let (r, _, _) = run(&build(example("disk")).elf, &no_disk);
-    assert_eq!(r, RunResult::Exited(1));
+    for xlen in XLENS {
+        let (r, _, _) = run(&build(example("disk"), xlen).elf, xlen, &plain("", 1));
+        assert_eq!(r, RunResult::Exited(1), "{xlen:?}");
+    }
 }
 
 /// The multi-object example breaks if a cross-object reference is wrong: the
-/// strings, the counter in the other object's .bss and the .data word.
+/// strings, the counter in the other object's .bss and the .data pointers.
 #[test]
 fn multiobj_needs_both_objects() {
+    for (xlen, main_o) in [(Xlen::Rv32, "main.o"), (Xlen::Rv64, "main-rv64.o")] {
+        multiobj_needs_both(xlen, main_o);
+    }
+}
+
+fn multiobj_needs_both(xlen: Xlen, main_o: &str) {
     let ex = example("multiobj");
-    let built = build(ex);
+    let built = build(ex, xlen);
     assert_eq!(
         built.objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
-        ["main.o", "print.o"]
+        [main_o, "print.o"]
     );
     // main.o alone: puts, the strings and the counter are print.S's.
     let main = merlin_ld::Input {
-        name: "main.o".into(),
+        name: main_o.into(),
         data: built.objects[0].data.clone(),
     };
     let script = std::fs::read_to_string(ex.dir(&repo_root()).join("link.ld")).unwrap();
@@ -512,7 +637,7 @@ fn llvm_style_disassembly(name: &str, elf: &[u8]) -> String {
 /// with relaxation off; see the reference command at the top of each source).
 fn assert_like_ld_lld(name: &str) {
     let ex = example(name);
-    let ours_bytes = build(ex).elf;
+    let ours_bytes = build(ex, Xlen::Rv32).elf;
     let lld_bytes = std::fs::read(fixture(ex.dir, "link.lld.elf")).unwrap();
     let (ours, lld) = (Elf::parse(&ours_bytes).unwrap(), Elf::parse(&lld_bytes).unwrap());
 
@@ -564,7 +689,7 @@ fn multiobj_is_like_ld_lld() {
 /// `cargo xtask hello` image) and the full chain load the same image.
 #[test]
 fn hello_linked_by_ld_lld_or_merlin_ld_loads_the_same() {
-    let ours = build(example("hello")).elf;
+    let ours = build(example("hello"), Xlen::Rv32).elf;
     let lld = std::fs::read(repo_root().join(xtask::hello::GOLDEN)).unwrap();
     assert_eq!(
         xtask::hello::loaded_image(&ours).unwrap(),

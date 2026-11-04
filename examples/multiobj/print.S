@@ -1,5 +1,6 @@
 # The second object of examples/multiobj (see main.S): a puts that counts what
-# it writes, and the strings main.S prints.
+# it writes, and the strings main.S prints. The RV64 build links it with
+# main-rv64.S: nothing here depends on the width.
 
     .equ UART_BASE, 0x10000000
     .equ UART_LSR,  5

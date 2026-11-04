@@ -19,6 +19,8 @@
 # and of sector 7. crates/grail/tests/block.rs builds the same bytes and checks the
 # committed file against them (set GRAIL_WRITE_DISK_IMG=1 to rewrite it from there).
 #
+# disk-rv64.S is the same program for RV64 machines.
+#
 # Built with our own tools by `cargo xtask examples disk`, which does the same as
 #
 #   merlin-as examples/disk/disk.S -o disk.o

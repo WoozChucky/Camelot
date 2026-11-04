@@ -531,8 +531,11 @@ fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
 fn hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs() {
     let root = repo_root();
     let ex = xtask::examples::find("hello").unwrap();
-    let host = xtask::examples::build(&root, ex).unwrap();
-    assert_eq!(host.elf, std::fs::read(ex.elf_path(&root)).unwrap());
+    let host = xtask::examples::build(&root, ex, xtask::examples::Xlen::Rv32).unwrap();
+    assert_eq!(
+        host.elf,
+        std::fs::read(ex.elf_path(&root, xtask::examples::Xlen::Rv32)).unwrap()
+    );
     let files: Vec<(String, Vec<u8>)> = ["hello.S", "link.ld"]
         .iter()
         .map(|f| (format!("/src/{f}"), std::fs::read(ex.dir(&root).join(f)).unwrap()))
