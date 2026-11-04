@@ -385,7 +385,9 @@ The same on RV64 machines, against the stub's `riscv:rv64` description:
 - `crates/merlin-dbg/tests/rv64/prog.c`, built by the test with `merlin -g` for RV64, merlin-as and merlin-ld: `break FILE:LINE`, `next` and `step` by line, `list`, a backtrace through a variadic function from inside it, past its prologue (its own frame read from memory: its `ra` and `s0` at CFA - 64 and CFA - 72), and five frames of a recursive one, `finish`, and a watchpoint on a 64-bit global;
 - `merlin-dbg -- ...` on an RV64 program, and an RV32 program's symbols left out for an RV64 machine: the session goes on, the machine stopped at its first instruction until it is run to a breakpoint.
 
-The kernel's RV64 case follows once the kernel is RV64 (#154). `src/remote.rs`'s unit tests give it a stub with no target description, whose width comes from the `g` reply.
+- `kernel/kernel-rv64.elf` (#154), the higher-half kernel: `break kmain` and `break kvminit` at their link addresses (0xffff_ffff_8...), stopped in S-mode with Sv48 on, `regs`, and a backtrace of three frames read through the page table, down to `supervisor_entry`.
+
+`src/remote.rs`'s unit tests give it a stub with no target description, whose width comes from the `g` reply.
 
 ## What's next
 

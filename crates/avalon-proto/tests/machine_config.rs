@@ -70,6 +70,7 @@ fn profile_from(config: &MachineConfig, switches: Switches) -> Result<HardwarePr
         // The protocol carries no width until #158: every VM is RV32 (an ELF64 program
         // makes it RV64 when loaded).
         xlen: _,
+        paging: _,
     } = config.clone();
     let mut devices: Vec<DeviceSpec> = disks.iter().map(disk_spec_from).collect::<Result<_, _>>()?;
     for net in &nets {
@@ -123,6 +124,7 @@ fn config_from(profile: &HardwareProfile, switches: Switches) -> Result<MachineC
         disks,
         nets,
         xlen: grail::Xlen::Rv32,
+        paging: grail::Paging::Sv48,
     };
     config.validate()?;
     Ok(config)
@@ -179,6 +181,7 @@ fn configs_survive_the_wire() {
             disks: Vec::new(),
             nets: Vec::new(),
             xlen: grail::Xlen::Rv32,
+            paging: grail::Paging::Sv48,
         },
         MachineConfig {
             ram_size: 4096,
@@ -188,6 +191,7 @@ fn configs_survive_the_wire() {
             disks: Vec::new(),
             nets: Vec::new(),
             xlen: grail::Xlen::Rv32,
+            paging: grail::Paging::Sv48,
         },
         MachineConfig {
             disks: vec![

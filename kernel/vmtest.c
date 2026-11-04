@@ -5,15 +5,24 @@
 #include "kprintf.h"
 #include "memlayout.h"
 #include "probe.h"
+#include "proc.h"
 #include "riscv.h"
 #include "vm.h"
 
-/* Nothing in the memory map lives at these addresses (spec section 7), so the
- * tests can map them freely. The two pages at SPLIT_VA straddle a 4 MiB
- * boundary: they use two second-level tables. */
+/* Nothing lives at these addresses, so the tests can map them freely: on
+ * RV32 holes in the memory map (spec section 7), on RV64 the vmalloc area's
+ * part for tests (VM_TEST_AREA, vm.h), where the kernel has made no table
+ * below the root's yet. The two pages at SPLIT_VA straddle a boundary of
+ * what one lowest-level table maps (4 MiB on RV32, 2 MiB on RV64): they use
+ * two of them. */
+#if __riscv_xlen == 64
+#define ALIAS_VA (VM_TEST_AREA + LEVEL_SIZE(1))
+#define RANGE_VA (VM_TEST_AREA + 16 * LEVEL_SIZE(1))
+#else
 #define ALIAS_VA 0x40000000u
-#define SPLIT_VA (ALIAS_VA - PGSIZE)
 #define RANGE_VA 0x50000000u
+#endif
+#define SPLIT_VA (ALIAS_VA - PGSIZE)
 
 static int passed;
 static int failed;
@@ -27,24 +36,27 @@ static void check(bool ok, const char *what) {
     }
 }
 
-static bool is_free_ram(u32 a) {
-    return a % PGSIZE == 0 && a >= (u32)(uintptr)__kernel_end && a - ram_base < ram_size;
+/* Whether kernel pointer `p` is a free page's: page aligned, and its
+ * physical address in RAM after the kernel. */
+static bool is_free_ram(void *p) {
+    phys_addr_t a = pa(p);
+    return a % PGSIZE == 0 && a >= pa(__kernel_end) && a - ram_base < ram_size;
 }
 
 /* Takes every page off the free list, counting them, then puts them all back.
  * The pages are chained through their first word while out. */
 static void test_alloc_all(void) {
     u32 before = kfree_pages();
-    u32 *chain = NULL;
+    uintptr *chain = NULL;
     u32 n = 0;
     bool in_range = true;
     for (;;) {
-        u32 *p = kalloc();
+        uintptr *p = kalloc();
         if (p == NULL) {
             break;
         }
-        in_range = in_range && is_free_ram((u32)(uintptr)p);
-        *p = (u32)(uintptr)chain;
+        in_range = in_range && is_free_ram(p);
+        *p = (uintptr)chain;
         chain = p;
         n++;
     }
@@ -53,11 +65,10 @@ static void test_alloc_all(void) {
     check(kfree_pages() == 0 && kalloc() == NULL, "kalloc returns NULL when out of pages");
     /* Out of memory: no new table, and a mapping that needs one fails. */
     check(pagetable_create() == NULL, "pagetable_create fails when out of pages");
-    check(map_pages(kernel_pagetable, ALIAS_VA, (u32)(uintptr)chain, PGSIZE, PTE_R | PTE_W) == -1,
+    check(map_pages(kernel_pagetable, ALIAS_VA, pa(chain), PGSIZE, PTE_R | PTE_W) == -1,
           "map_pages fails when it can't allocate a page table");
-
     for (u32 i = 0; i < n; i++) {
-        u32 *next = (u32 *)(uintptr)*chain;
+        uintptr *next = (uintptr *)*chain;
         kfree(chain);
         chain = next;
     }
@@ -97,16 +108,19 @@ static void test_zeroing(void) {
 
     dirty = dirty_page();
     pagetable_t pt = pagetable_create();
-    check(pt != NULL && pt == dirty && is_zero_page(pt), "pagetable_create clears a dirty page");
+    check(pt != NULL && (void *)pt == (void *)dirty && is_zero_page((const u32 *)pt),
+          "pagetable_create clears a dirty page");
     kfree(pt);
 }
 
-/* Maps a page a second time, at ALIAS_VA, and writes through each address. */
+/* Maps a page a second time, at ALIAS_VA, and writes through each address.
+ * The one kernel mapping made without PTE_KERNEL's A and D, on purpose: it
+ * checks that the hart sets them (Grail manages them, spec section 5), as it
+ * does for user pages. */
 static void test_alias(void) {
     volatile u32 *page = kalloc();
     volatile u32 *alias = (volatile u32 *)ALIAS_VA;
-    check(map_pages(kernel_pagetable, ALIAS_VA, (u32)(uintptr)page, PGSIZE, PTE_R | PTE_W) == 0,
-          "map a second mapping");
+    check(map_pages(kernel_pagetable, ALIAS_VA, pa(page), PGSIZE, PTE_R | PTE_W) == 0, "map a second mapping");
     sfence_vma();
 
     alias[0] = 0xc0ffee01u;
@@ -116,7 +130,7 @@ static void test_alias(void) {
 
     /* Grail manages A and D: the stores above set both. */
     pte_t *pte = walk(kernel_pagetable, ALIAS_VA, false);
-    check(pte != NULL && PTE2PA(*pte) == (u32)(uintptr)page &&
+    check(pte != NULL && PTE2PA(*pte) == pa(page) &&
               (*pte & (PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_A | PTE_D)) ==
                   (PTE_V | PTE_R | PTE_W | PTE_A | PTE_D),
           "the alias PTE has the page, R+W and A+D");
@@ -127,7 +141,7 @@ static void test_alias(void) {
     sfence_vma();
     check(kfree_pages() == free_before + 1, "unmap_pages frees the page");
     u32 val = 0;
-    u32 stval = 0;
+    uintptr stval = 0;
     check(probe_load((const u32 *)ALIAS_VA, &val, &stval) == CAUSE_LOAD_PAGE_FAULT && stval == ALIAS_VA,
           "a load from an unmapped page is a load page fault");
     stval = 0;
@@ -137,16 +151,16 @@ static void test_alias(void) {
 
 /* Kernel text and rodata are read-only; data is writable. */
 static void test_protection(void) {
-    u32 *text = (u32 *)(uintptr)__text_start;
-    u32 *rodata = (u32 *)(uintptr)__rodata_start;
+    u32 *text = (u32 *)__text_start;
+    u32 *rodata = (u32 *)__rodata_start;
     u32 first = *text;
     u32 val = 0;
-    u32 stval = 0;
-    check(probe_store(text, 0, &stval) == CAUSE_STORE_PAGE_FAULT && stval == (u32)(uintptr)text,
+    uintptr stval = 0;
+    check(probe_store(text, 0, &stval) == CAUSE_STORE_PAGE_FAULT && stval == (uintptr)text,
           "a store to kernel text is a store page fault");
     check(probe_load(text, &val, &stval) == 0 && val == first, "kernel text is readable and unchanged");
     stval = 0;
-    check(probe_store(rodata, 0, &stval) == CAUSE_STORE_PAGE_FAULT && stval == (u32)(uintptr)rodata,
+    check(probe_store(rodata, 0, &stval) == CAUSE_STORE_PAGE_FAULT && stval == (uintptr)rodata,
           "a store to rodata is a store page fault");
     static u32 data_word;
     check(probe_store(&data_word, 0x600du, &stval) == 0 && data_word == 0x600du, "data is writable");
@@ -157,14 +171,15 @@ static void test_protection(void) {
 static void test_pagetable(void) {
     u32 before = kfree_pages();
     pagetable_t pt = pagetable_create();
-    u32 p = (u32)(uintptr)kalloc();
-    u32 q = (u32)(uintptr)kalloc();
-    check(pt != NULL && p != 0 && q != 0, "allocate a page table and two pages");
-
-    /* Two pages either side of a 4 MiB boundary: two second-level tables. */
+    void *pp = kalloc();
+    void *qq = kalloc();
+    check(pt != NULL && pp != NULL && qq != NULL, "allocate a page table and two pages");
+    phys_addr_t p = pa(pp);
+    phys_addr_t q = pa(qq);
+    /* Two pages either side of a boundary: two lowest-level tables. */
     check(map_pages(pt, SPLIT_VA, p, PGSIZE, PTE_R | PTE_W) == 0 &&
               map_pages(pt, SPLIT_VA + PGSIZE, q, PGSIZE, PTE_R) == 0,
-          "map two pages across a 4 MiB boundary");
+          "map two pages across a table boundary");
     pte_t *a = walk(pt, SPLIT_VA, false);
     pte_t *b = walk(pt, SPLIT_VA + PGSIZE, false);
     check(a != NULL && *a == (PA2PTE(p) | PTE_R | PTE_W | PTE_V) && b != NULL &&
@@ -197,3 +212,47 @@ int vm_selftest(void) {
     kprintf("vm self-test: %d/%d passed\n", passed, passed + failed);
     return failed;
 }
+
+#if __riscv_xlen == 64
+/* A kernel process that ends at once: what kstack_selftest() runs. */
+static void kstack_noop(void) {
+}
+
+/* NPROC kernel processes at once, run until all have ended. */
+static void kstack_round(void) {
+    for (u32 i = 0; i < NPROC; i++) {
+        const char *err;
+        if (kproc_create("kstack", kstack_noop, &err) == NULL) {
+            check(false, "start a kernel process");
+        }
+    }
+    scheduler();
+}
+
+/* The pages of every kernel stack in kstack_count()'s `stacks`. */
+static u32 stack_pages(u32 stacks) {
+    return stacks * (u32)(KSTACK_SIZE / PGSIZE);
+}
+
+int kstack_selftest(void) {
+    passed = 0;
+    failed = 0;
+    /* A first round, for the page tables the stacks' slots may need. */
+    kstack_round();
+    struct kstack_counts n;
+    kstack_count(&n);
+    u32 before = kfree_pages() + stack_pages(n.cached);
+    /* More threads end than this hart caches stacks for: the rest are
+     * deferred and unmapped by the scheduler as soon as it holds no lock. */
+    for (u32 round = 0; round < 3; round++) {
+        kstack_round();
+    }
+    kstack_count(&n);
+    check(n.deferred == 0, "no freed kernel stack is left to unmap");
+    check(n.mapped == n.cached && n.cached <= NR_CACHED_STACKS,
+          "only this hart's cached kernel stacks stay mapped");
+    check(kfree_pages() + stack_pages(n.cached) == before, "every other kernel stack's pages come back");
+    kprintf("kstack self-test: %d/%d passed\n", passed, passed + failed);
+    return failed;
+}
+#endif

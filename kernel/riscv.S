@@ -1,6 +1,7 @@
 # CSR accessors for C (include/riscv.h). The kernel keeps CSR access in
 # assembly instead of inline asm, which Merlin won't support (#15). Each is a
-# leaf function: argument in a0, result in a0.
+# leaf function: argument in a0, result in a0, a whole register (XLEN bits)
+# on either width, so nothing here depends on it but r_time.
 
     .text
 
@@ -59,9 +60,21 @@ w_mcounteren:
     csrw  mcounteren, a0
     ret
 
+# u64 r_time(void). On RV64 one read. On RV32 the 64-bit counter is two
+# CSRs, time and timeh, which can't be read at once: read the high half, the
+# low half, then the high half again, and start over if it changed (the low
+# half wrapped in between). The result is in a1:a0, as a u64 is returned on
+# RV32.
     .globl r_time
 r_time:
+#if __riscv_xlen == 64
     csrr  a0, time
+#else
+1:  csrr  a1, timeh
+    csrr  a0, time
+    csrr  t0, timeh
+    bne   a1, t0, 1b
+#endif
     ret
 
     .globl r_sstatus

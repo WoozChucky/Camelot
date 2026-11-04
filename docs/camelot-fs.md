@@ -500,20 +500,31 @@ log. (In version 1 it could not have been a file anyway: the disk kernel,
 about 300 KiB, was bigger than the largest file.) The price is that the
 kernel cannot be replaced from inside Camelot; mkfs installs it.
 
-The bootloader (`kernel/boot/boot.s`) reads the kernel's first 1 KiB and
-loads every `PT_LOAD` segment of it to its physical address, as Grail's ELF
-loader would: the whole sectors of the segment's file bytes straight to the
+The bootloader (`kernel/boot/boot.S`) is one source for both widths: an
+RV32 machine's boot block is `boot.elf`, which loads an ELF32 kernel, an
+RV64 machine's `boot-rv64.elf`, which loads an ELF64 one (`camelot-fs mkfs
+--boot` refuses a bootloader and a kernel of different widths), reading the
+disk's version 2 registers. It reads the kernel's first 1 KiB and loads
+every `PT_LOAD` segment of it to its physical address (`p_paddr`, which for
+the RV64 kernel, linked at 0xffff_ffff_8000_0000, is not its `p_vaddr`), as
+Grail's ELF loader would: the whole sectors of the segment's file bytes straight to the
 address with the disk's DMA, the last partial sector through a buffer, then
 zeros up to `p_memsz`. It refuses (printing `boot: <why>` and stopping with
 exit code 0xFC) a block with `kernel_sectors` 0, a read error, a kernel that
-is not an ELF32 little-endian RISC-V `ET_EXEC` with its program headers in
-its first 1 KiB, a segment with file bytes whose file offset is not a
+is not a little-endian RISC-V `ET_EXEC` of its width (ELF32, ELF64) with its
+program headers in its first 1 KiB, a segment with file bytes whose file offset is not a
 multiple of 512 (merlin-ld and ld.lld place segments at page offsets) or
 that runs past `kernel_sectors` (a `.bss`-only segment, `p_filesz` 0, reads
 nothing, so its offset is not checked), and a segment outside RAM or
-reaching into the 64 KiB the bootloader runs in. Then it writes the kernel's entry point to the boot
-ROM's entry word, so harts the kernel wakes go there too, and jumps to it
-with a0 = 0 and a1 = the sysinfo block. On success it prints one line,
+reaching into the 64 KiB the bootloader runs in. Then it writes the kernel's
+entry point to the boot ROM's entry word (a doubleword on RV64), so harts
+the kernel wakes go there too, and jumps to it with a0 = 0 and a1 = the
+sysinfo block: the load address of `e_entry`, `p_paddr + (e_entry -
+p_vaddr)` of the segment that holds it, since the kernel starts with paging
+off (mkfs checks that a segment holds it). mkfs stores only what the
+bootloader loads of the kernel, with the section header fields of the ELF
+header cleared at the offsets of its class (`e_shoff` at 32 in ELF32, at 40
+in ELF64). On success it prints one line,
 `boot: kernel at sector 0x...`.
 
 ## Changes

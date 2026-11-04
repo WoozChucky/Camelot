@@ -24,16 +24,26 @@ static void emit_pad(struct out *o, char pad, int n) {
 }
 
 /* Prints `val` in `base` (10 or 16) with an optional minus sign, padded to
- * `width` with spaces before the sign or zeros after it. */
-static void emit_number(struct out *o, u32 val, u32 base, bool negative, int width, bool zero_pad) {
-    char digits[10]; /* 4294967295 has 10 digits; 0xffffffff has 8 */
+ * `width` with spaces before the sign or zeros after it. A value that fits
+ * in 32 bits is divided as a u32: on RV32 a 64-bit division is a call to
+ * __udivdi3 (libgcc.c), many times slower, and nearly every number the
+ * kernel prints is small. */
+static void emit_number(struct out *o, u64 val, u32 base, bool negative, int width, bool zero_pad) {
+    char digits[20]; /* 18446744073709551615 has 20 digits; 2^64 - 1 in hex 16 */
     int n = 0;
-    do {
-        u32 d = val % base;
+    while (val >> 32 != 0) {
+        u32 d = (u32)(val % base);
         digits[n] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
         n++;
         val /= base;
-    } while (val != 0);
+    }
+    u32 low = (u32)val;
+    do {
+        u32 d = low % base;
+        digits[n] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+        n++;
+        low /= base;
+    } while (low != 0);
 
     int len = n + (negative ? 1 : 0);
     if (!zero_pad) {
@@ -75,7 +85,12 @@ int kvformat(kputc_fn put, void *ctx, const char *fmt, va_list ap) {
             width = width * 10 + (*fmt - '0');
             fmt++;
         }
-        if (*fmt == 'l') {
+        /* Length: none (int), `l` (long: a register's width, 32 or 64
+         * bits) or `ll` (long long: 64 bits on both widths), as in C's
+         * printf and Linux's printk. */
+        int longs = 0;
+        while (*fmt == 'l' && longs < 2) {
+            longs++;
             fmt++;
         }
 
@@ -93,22 +108,37 @@ int kvformat(kputc_fn put, void *ctx, const char *fmt, va_list ap) {
 
         switch (conv) {
         case 'd': {
-            i32 v = va_arg(ap, i32);
-            /* Negate as unsigned so INT_MIN works. */
-            u32 mag = v < 0 ? 0u - (u32)v : (u32)v;
+            i64 v;
+            if (longs == 2) {
+                v = va_arg(ap, i64);
+            } else if (longs == 1) {
+                v = va_arg(ap, isize);
+            } else {
+                v = va_arg(ap, i32);
+            }
+            /* Negate as unsigned so the most negative value works. */
+            u64 mag = v < 0 ? 0ull - (u64)v : (u64)v;
             emit_number(&o, mag, 10, v < 0, width, zero_pad);
             break;
         }
         case 'u':
-            emit_number(&o, va_arg(ap, u32), 10, false, width, zero_pad);
+        case 'x': {
+            u64 v;
+            if (longs == 2) {
+                v = va_arg(ap, u64);
+            } else if (longs == 1) {
+                v = va_arg(ap, usize);
+            } else {
+                v = va_arg(ap, u32);
+            }
+            emit_number(&o, v, conv == 'u' ? 10 : 16, false, width, zero_pad);
             break;
-        case 'x':
-            emit_number(&o, va_arg(ap, u32), 16, false, width, zero_pad);
-            break;
+        }
         case 'p':
+            /* Every hex digit of a pointer: 8 on RV32, 16 on RV64. */
             emit(&o, '0');
             emit(&o, 'x');
-            emit_number(&o, (u32)(uintptr)va_arg(ap, void *), 16, false, 8, true);
+            emit_number(&o, (uintptr)va_arg(ap, void *), 16, false, (int)(2 * sizeof(void *)), true);
             break;
         case 's': {
             const char *s = va_arg(ap, const char *);

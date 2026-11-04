@@ -6,7 +6,10 @@
 #include "spinlock.h"
 #include "sysinfo.h"
 
-/* The timebase, read once from sysinfo (0 until then). */
+/* The timebase, read once from sysinfo (0 until then): by hart 0's
+ * timer_init(), in M-mode before kmain, where sysinfo is at its physical
+ * address. The other harts' timer_init() find it here, so M-mode reads
+ * sysinfo only that once (sysinfo.c). */
 static u32 timebase;
 
 u32 timebase_hz(void) {
@@ -30,10 +33,14 @@ u32 timer_interval(void) {
 void timer_init(void) {
     u32 hart = r_tp();
     u32 interval = timer_interval();
-    u32 *scratch = &machine_scratch[hart * MSCRATCH_WORDS];
+    uintptr *scratch = &machine_scratch[hart * MSCRATCH_WORDS];
     scratch[MSCRATCH_INTERVAL] = interval;
-    scratch[MSCRATCH_MTIMECMP] = CLINT_MTIMECMP_LO(hart);
+    scratch[MSCRATCH_MTIMECMP] = CLINT_MTIMECMP(hart);
 
+#if __riscv_xlen == 64
+    /* mtimecmp = mtime + interval, each one access. */
+    mmio_write64(CLINT_MTIMECMP(hart), mmio_read64(CLINT_MTIME) + interval);
+#else
     /* Read the 64-bit mtime as two halves: retry if the low word wrapped
      * between the reads. */
     u32 hi;
@@ -50,4 +57,5 @@ void timer_init(void) {
     mmio_write32(CLINT_MTIMECMP_HI(hart), 0xffffffffu);
     mmio_write32(CLINT_MTIMECMP_LO(hart), cmp_lo);
     mmio_write32(CLINT_MTIMECMP_HI(hart), cmp_hi);
+#endif
 }

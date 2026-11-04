@@ -7,10 +7,10 @@
 #include "types.h"
 
 /* *val = *addr. Returns 0, or the scause of the fault, with stval in *stval. */
-u32 probe_load(const u32 *addr, u32 *val, u32 *stval);
+uintptr probe_load(const u32 *addr, u32 *val, uintptr *stval);
 
 /* *addr = val. Returns 0, or the scause of the fault, with stval in *stval. */
-u32 probe_store(u32 *addr, u32 val, u32 *stval);
+uintptr probe_store(u32 *addr, u32 val, uintptr *stval);
 
 /* Labels inside probe.s, declared as functions only to take their addresses:
  * the probes' faulting instructions and where a fault resumes. */
