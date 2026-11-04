@@ -203,13 +203,14 @@ fn exec_replaces_the_shell() {
     // pipeline or a background job, which POSIX runs in a subshell, it replaces the
     // command's subshell: one `exec` goes and the rest runs the program NAME, still
     // never a built-in (`exec exit 7 &` doesn't end the shell, `exec exec echo hi &`
-    // is /bin/exec), and `exec` alone only makes its redirections. Then `exec PROG`
-    // replaces the first process, so the machine stops with PROG's status: `systest
-    // fds` exits 0 only with descriptors 0, 1 and 2 and no other (the shell's copies
-    // above 2 are not inherited), `systest exit 3` with 3.
+    // is /bin/exec), and `exec` alone only makes its redirections. A shell reading a
+    // pipe is not interactive: a failed `exec` ends it, with 127 for no such program.
+    // Then `exec PROG` replaces the first process, so the machine stops with PROG's
+    // status: `systest fds` exits 0 only with descriptors 0, 1 and 2 and no other (the
+    // shell's copies above 2 are not inherited), `systest exit 3` with 3.
     let lines = "exec\nexec nosuch\nexec > /f\nexec cd /bin\nexec cd /bin &\nexec exit 7 &\n\
                  exec exec echo hi &\nexec &\nexec > /f | cat\necho piped | exec cat\n\
-                 exec echo behind &\nwait\n";
+                 echo exec nosuch | sh\nexec echo behind &\nwait\n";
     let (code, out) = grail(&kernel_elf(), format!("{lines}exec systest fds\n").as_bytes());
     assert_eq!(code, Some(0), "output:\n{out}");
     let shell = shell_output(&out);
@@ -232,6 +233,9 @@ fn exec_replaces_the_shell() {
          sh: /f: no such file or directory\n\
          {PROMPT}echo piped | exec cat\n\
          piped\n\
+         {PROMPT}echo exec nosuch | sh\n\
+         {SHELL_BANNER}{PROMPT}sh: nosuch: no such program\n\
+         sh: exit 127\n\
          {PROMPT}exec echo behind &\n"
     );
     assert!(shell.starts_with(&want_start), "{shell}");

@@ -1531,7 +1531,7 @@ fn the_shell_runs_programs_from_bin_and_redirects_through_files_and_pipes() {
 }
 
 #[test]
-fn exec_keeps_its_redirections_or_ends_the_shell() {
+fn exec_keeps_its_redirections_or_gives_them_to_its_program() {
     // The shell's `exec` without a program: its redirections stay the shell's, POSIX's
     // way. `exec > /log` sends the shell's output (its prompts and its programs') to
     // /log from then on; `exec < /script` reads the next lines from /script, a byte at
@@ -1583,25 +1583,101 @@ fn exec_keeps_its_redirections_or_ends_the_shell() {
     assert_eq!(fs.read_file("/full").unwrap(), b"");
     assert_eq!(fs.read_file("/made").unwrap(), b"");
 
-    // `exec PROG` with a redirection, PROG missing: the shell's output is /out by
-    // then, with no copy of the console's kept, so the shell ends, with 127 (POSIX's
-    // status for a program not found), rather than go on writing where nobody looks.
+    // `exec PROG` with redirections that works: PROG gets the files at 0 and 1 and
+    // nothing else, the shell's copies of the console having closed on exec
+    // (`systest fds` exits 0 only with descriptors 0 to 2 open), and its status stops
+    // the machine.
     let run = boot(
         root_image(),
         Boot {
-            input: b"exec nosuch > /out\necho not run > /not-run\n",
+            input: b"echo in > /in\nexec systest fds < /in > /fds\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    let fs = Fs::open(&run.disk).unwrap();
+    assert_eq!(fs.read_file("/fds").unwrap(), b"");
+}
+
+#[test]
+fn a_failed_exec_ends_only_a_shell_that_is_not_interactive() {
+    // POSIX: when `exec PROG` fails, an interactive shell carries on and any other
+    // ends. On the console the shell is interactive: it puts its own input and output
+    // back from the copies it kept, says why, and goes on, the status 127 for no such
+    // program (what `exit` gives at the end) and 1 for a redirection it couldn't
+    // make. `sh < FILE` is not: a failed exec ends it, with 127, 126 for a program
+    // that is there but can't be run (a directory), or 1, and nothing after it runs.
+    // The scripts are typed into `cat`, each ended by Ctrl-D on an empty line.
+    let input: &[u8] = b"exec nosuch > /out\n\
+        echo still here\n\
+        exec cat < /missing\n\
+        echo and here\n\
+        cat > /s1\n\
+        echo before\n\
+        exec nosuch > /out1\n\
+        echo not run > /not-run\n\
+        \x04cat > /s2\n\
+        exec /bin\n\
+        echo not run > /not-run\n\
+        \x04cat > /s3\n\
+        exec cat < /missing\n\
+        echo not run > /not-run\n\
+        \x04sh < /s1\n\
+        sh < /s2\n\
+        sh < /s3\n\
+        exec nosuch\n\
+        exit\n";
+    let run = boot(
+        root_image(),
+        Boot {
+            input,
             max_steps: SHELL_MAX_STEPS,
             ..READ
         },
     );
     assert_eq!(run.result, RunResult::Exited(127), "{}", run.out);
+    let out = &run.out;
     assert_eq!(
-        shell_output(&run.out, "exec nosuch > /out"),
+        shell_output(out, "exec nosuch > /out"),
         "sh: nosuch: no such program\n"
     );
+    assert_eq!(shell_output(out, "echo still here"), "still here\n");
+    assert_eq!(
+        shell_output(out, "exec cat < /missing"),
+        "sh: /missing: no such file or directory\n"
+    );
+    assert_eq!(shell_output(out, "echo and here"), "and here\n");
+    // What each script printed: the second shell's banner and prompts (it reads its
+    // input a line at a time without echoing it), its error, and the first shell's
+    // report of its status.
+    let after = |command: &str| {
+        let typed = format!("{PROMPT}{command}\n");
+        let at = out
+            .find(&typed)
+            .unwrap_or_else(|| panic!("no `{command}` in:\n{out}"));
+        &out[at + typed.len()..]
+    };
+    for (script, printed) in [
+        (
+            "sh < /s1",
+            "$ before\n$ sh: nosuch: no such program\nsh: exit 127\n",
+        ),
+        ("sh < /s2", "$ sh: /bin: not a regular file\nsh: exit 126\n"),
+        (
+            "sh < /s3",
+            "$ sh: /missing: no such file or directory\nsh: exit 1\n",
+        ),
+    ] {
+        let want = format!("{SHELL_BANNER}{printed}{PROMPT}");
+        assert!(after(script).starts_with(&want), "{script}: {out}");
+    }
+    assert_eq!(shell_output(out, "exec nosuch"), "sh: nosuch: no such program\n");
     fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
     let fs = Fs::open(&run.disk).unwrap();
     assert_eq!(fs.read_file("/out").unwrap(), b"");
+    assert_eq!(fs.read_file("/out1").unwrap(), b"");
     assert!(fs.lookup("/not-run").is_err());
 }
 

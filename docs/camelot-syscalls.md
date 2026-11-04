@@ -726,8 +726,10 @@ gets 0, 1 and 2 from its parent at `spawn`, whatever they are by then: the
 shell redirects a program's input or output by putting a file or a pipe at
 0 or 1 (`close`, then `dup` or `open`, which take the lowest free number),
 spawning it, and putting its own back from copies it keeps above 2, which
-no child inherits. So does `exec`, which keeps every descriptor but those
-that close on exec.
+no child inherits. For `exec PROG > FILE`, where PROG keeps every
+descriptor but those that close on exec, the shell makes its copies with
+`fcntl`'s `F_DUPFD_CLOEXEC`: the kernel closes them as PROG starts, and if
+PROG can't be started the shell puts its own back from them.
 
 ## Paths
 

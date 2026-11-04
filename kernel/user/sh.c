@@ -28,21 +28,27 @@
  *   sh: NAME: REASON     when a program can't be started, a file can't be
  *                        opened, or a line makes no sense
  *
- * Built-ins: help, exit [N], wait, cd [DIR], exec [PROG [ARG...]]. They run
- * in the shell itself, with its redirections, but can't be part of a
- * pipeline. The shell ends with `exit`, or at the end of the input (Ctrl-D
- * on an empty line), with the status N or else the last foreground
- * program's; when it is the first process, the kernel then stops the
- * machine with it.
+ * Built-ins: help, exit [N], wait, cd [DIR], and exec [PROG [ARG...]] (see
+ * below). The first four run in the shell itself, with its redirections,
+ * but can't be part of a pipeline. The shell ends with `exit`, or at the end
+ * of the input (Ctrl-D on an empty line), with the status N or else the last
+ * foreground program's; when it is the first process, the kernel then stops
+ * the machine with it.
  *
  * `exec PROG [ARG...]` is POSIX's: the program replaces the shell in its
  * process (the kernel's exec), with the same pid, parent, descriptors and
  * children, so the shell's parent waits for the program instead, and the
- * program's status is the session's. If the program can't be started, the
- * shell says so and carries on, unless the line redirected its input or
- * output: those are the shell's own by then (it keeps no copy of its old
- * ones for the program to inherit), so it ends, with 127 if there is no such
- * program and 126 otherwise. Without a program, `exec`'s redirections stay
+ * program's status is the session's. The command's redirections are the
+ * program's: the shell keeps its own input and output in copies from
+ * descriptor 10 up that close on exec (fcntl's F_DUPFD_CLOEXEC, as bash
+ * keeps them), puts the files at 0 and 1 and execs, and the kernel closes
+ * the copies as the program starts, so it gets nothing else. If the program
+ * can't be started, the shell puts its own back from the copies and says
+ * so. Then, as POSIX has it, an interactive shell carries on, and any other
+ * ends: with 127 if there is no such program, 126 if it is there but can't
+ * be run, and 1 if a redirection can't be made. The shell is interactive if
+ * its input was the console or a connection when it started (`sh < FILE`
+ * and `CMD | sh` are not). Without a program, `exec`'s redirections stay
  * the shell's: `exec < FILE` reads the next lines from FILE. In a pipeline
  * or a background job, which POSIX runs in a subshell, `exec` replaces the
  * subshell, which here is the command alone: `exec NAME ...` runs the
@@ -92,6 +98,15 @@ static int last_status;
  * the top. */
 static int console_input;
 static int connection_input;
+
+/* Whether the shell is interactive, as POSIX means it: its input was the
+ * console or a connection when it started (see the top; a later `exec <
+ * FILE` doesn't change it, as in bash). */
+static int interactive;
+
+/* Where the shell keeps copies of its descriptors meanwhile: 10 and up, as
+ * bash does (POSIX leaves descriptors 0 to 9 to the user). */
+#define SAVED_FD 10
 
 /* A token of a line: a word, or an operator ('&', '|', '<', '>'). */
 struct token {
@@ -366,16 +381,70 @@ static void look_at_input(void) {
     connection_input = got_stat && st.type == T_SOCKET;
 }
 
+/* `exec` failed with `status`: the last status, and, unless the shell is
+ * interactive, its end (see the top). Returns 1 if the shell should exit,
+ * with the status in *exit_status. */
+static int exec_failed(int status, int *exit_status) {
+    last_status = status;
+    if (interactive) {
+        return 0;
+    }
+    *exit_status = status;
+    return 1;
+}
+
+/* A copy of descriptor `fd` from SAVED_FD up that closes on exec, or -1
+ * having said why there is none. */
+static int save_fd(int fd) {
+    int copy = fcntl(fd, F_DUPFD_CLOEXEC, SAVED_FD);
+    if (copy < 0) {
+        fprintf(STDERR, "sh: exec: cannot keep descriptor %d: %s\n", fd, strerror(-copy));
+    }
+    return copy;
+}
+
+/* Puts descriptor `fd` back from save_fd()'s `copy`, if there is one, and
+ * closes the copy. */
+static void restore_fd(int fd, int copy) {
+    if (copy >= 0) {
+        put_at(fd, copy);
+        close(copy);
+    }
+}
+
 /* `exec [PROG [ARG...]]`, alone in the foreground (see the top). Returns 1
- * if the shell should exit, with the status in *exit_status: PROG could not
- * be started after the redirections took the shell's own input or output. */
+ * if the shell should exit, with the status in *exit_status: a shell that
+ * is not interactive, where PROG could not be started or a redirection
+ * could not be made. */
 static int exec_builtin(struct cmd *c, int *exit_status) {
     int in = -1;
     int out = -1;
     if (open_files(c, &in, &out) < 0) {
+        return exec_failed(1, exit_status);
+    }
+    if (c->argc == 1) {
+        /* No program: the redirections become the shell's own. */
+        if (in >= 0) {
+            put_at(STDIN, in);
+            close(in);
+        }
+        if (out >= 0) {
+            put_at(STDOUT, out);
+            close(out);
+        }
+        look_at_input();
         return 0;
     }
-    /* No copies kept: the program gets the shell's descriptors, nothing else. */
+    /* The shell's own, kept where the program won't get them. */
+    int saved_in = in >= 0 ? save_fd(STDIN) : -1;
+    int saved_out = out >= 0 ? save_fd(STDOUT) : -1;
+    if ((in >= 0 && saved_in < 0) || (out >= 0 && saved_out < 0)) {
+        close_if(in);
+        close_if(out);
+        close_if(saved_in);
+        close_if(saved_out);
+        return exec_failed(1, exit_status);
+    }
     if (in >= 0) {
         put_at(STDIN, in);
         close(in);
@@ -384,19 +453,13 @@ static int exec_builtin(struct cmd *c, int *exit_status) {
         put_at(STDOUT, out);
         close(out);
     }
-    if (c->argc == 1) {
-        look_at_input();
-        return 0;
-    }
     char path[MAXPATH + 2];
     int err = exec(program_path(c->argv[1], path), &c->argv[1]);
-    /* Still here: the program couldn't start, and nothing else changed. */
+    /* Still here: the program couldn't start, and the copies are open. */
+    restore_fd(STDIN, saved_in);
+    restore_fd(STDOUT, saved_out);
     cannot_start(c->argv[1], err);
-    if (in < 0 && out < 0) {
-        return 0;
-    }
-    *exit_status = not_found(c->argv[1], err) ? 127 : 126;
-    return 1;
+    return exec_failed(not_found(c->argv[1], err) ? 127 : 126, exit_status);
 }
 
 /* Runs the pipeline cmds[0..n), in the background or not. Returns 1 if the
@@ -622,6 +685,7 @@ static int read_line(char *buf) {
 int main(void) {
     char line[LINE_SIZE];
     look_at_input();
+    interactive = console_input || connection_input;
     printf("Type help for the list of commands.\n");
     for (;;) {
         printf(PROMPT);
