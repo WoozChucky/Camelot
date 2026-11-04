@@ -18,6 +18,7 @@ pub use csr::{misa, Csrs};
 pub use reservation::Reservation;
 
 use crate::bus::Bus;
+use crate::config::Paging;
 use crate::trap::{interrupt_bit, Exception, Trap};
 use excalibur::csr::*;
 use excalibur::{decode, AluOp, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, Xlen};
@@ -65,6 +66,9 @@ pub struct Hart {
     /// The register width: what the hart's instruction words mean, and how wide its
     /// registers, addresses and CSRs are.
     xlen: Xlen,
+    /// Whether an RV64 hart implements Sv48 (besides Sv39): `satp` refuses MODE 9
+    /// without it ([`Cpu::set_paging`]).
+    pub(crate) sv48: bool,
 }
 
 /// Every hart of a machine, and the bus they share. Grail runs the harts on one host
@@ -153,6 +157,14 @@ impl Cpu {
         self.bus.set_xlen(xlen);
         for hart in &mut self.harts {
             hart.xlen = xlen;
+        }
+    }
+
+    /// Makes every hart implement the paging modes `paging` names (an RV64 hart's:
+    /// with [`Paging::Sv39`], `satp` refuses Sv48).
+    pub fn set_paging(&mut self, paging: Paging) {
+        for hart in &mut self.harts {
+            hart.sv48 = paging == Paging::Sv48;
         }
     }
 
@@ -295,6 +307,7 @@ impl Hart {
             waiting: false,
             instret_written: false,
             xlen,
+            sv48: true,
         }
     }
 

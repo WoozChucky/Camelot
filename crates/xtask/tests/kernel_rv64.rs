@@ -26,10 +26,53 @@ use xtask::{repo_root, tools};
 /// Where the image is linked (kernel/kernel64.ld) and loaded.
 const KERNEL_LINK_ADDR: u64 = 0xffff_ffff_8000_0000;
 const LOAD_ADDR: u64 = 0x8000_0000;
-/// The direct map's base in Sv48 (vm.h, Linux's PAGE_OFFSET).
-const PAGE_OFFSET_SV48: u64 = 0xffff_af80_0000_0000;
-/// The vmalloc area's start in Sv48, where the devices' window begins.
-const VMALLOC_START_SV48: u64 = 0xffff_8f80_0000_0000;
+/// What depends on the paging mode the kernel chose (vm.h, Linux's
+/// vm-layout.rst): Sv48 on a hart that has it, Sv39 on one without.
+#[derive(Clone, Copy, Debug)]
+struct Mode {
+    paging: grail::Paging,
+    name: &'static str,
+    levels: u32,
+    satp_mode: u64,
+    /// The direct map's base (Linux's PAGE_OFFSET).
+    page_offset: u64,
+    /// The vmalloc area's start, where the devices' window begins.
+    vmalloc_start: u64,
+    /// The kernel's root entries in use at the end of the boot: the
+    /// devices, the kernel stacks (in Sv39 a root entry of their own), the
+    /// direct map of 4 MiB of RAM, the image.
+    root_entries: &'static [usize],
+}
+
+const SV48: Mode = Mode {
+    paging: grail::Paging::Sv48,
+    name: "Sv48",
+    levels: 4,
+    satp_mode: 9 << 60,
+    page_offset: 0xffff_af80_0000_0000,
+    vmalloc_start: 0xffff_8f80_0000_0000,
+    root_entries: &[287, 351, 511],
+};
+
+const SV39: Mode = Mode {
+    paging: grail::Paging::Sv39,
+    name: "Sv39",
+    levels: 3,
+    satp_mode: 8 << 60,
+    page_offset: 0xffff_ffd6_0000_0000,
+    vmalloc_start: 0xffff_ffc6_0000_0000,
+    root_entries: &[280, 284, 344, 510],
+};
+
+thread_local! {
+    /// The paging mode the harts of this thread's machines have: Sv48 (and
+    /// Sv39), or Sv39 only (`the_rv64_kernel_falls_back_to_sv39`).
+    static MODE: std::cell::Cell<Mode> = const { std::cell::Cell::new(SV48) };
+}
+
+fn mode() -> Mode {
+    MODE.get()
+}
 /// The kernel stacks' size and slot (vm.h).
 const KSTACK_SIZE: u64 = 16 * 1024;
 const KSTACK_SLOT: u64 = 2 * KSTACK_SIZE;
@@ -56,7 +99,7 @@ const BOOT_FAULT_KSTACK_OVERFLOW: u32 = 17;
 
 /// What the RV64 kernel prints from the banner to the ticks, with the
 /// `[dbg]` line's pc masked.
-const BOOT_OUTPUT: &str = concat!(
+const BOOT_OUTPUT_TEMPLATE: &str = concat!(
     xtask::banner!(),
     "\
 Camelot v0.1.0 booting...
@@ -64,7 +107,7 @@ kprintf: d=-42 u=4294967295 x=cafef00d p=0x0000000080000000 s=excalibur c=K %=%
 kprintf self-test: 33/33 passed
 [dbg] pc=................ a0 = 0x0000000000000000 (0)
 ram: 4 MiB at 0x80000000
-paging: on (Sv48)
+paging: on (MODE)
 vm self-test: 26/26 passed
 timer: 10 Hz tick, 10000000 Hz timebase
 disk: none
@@ -80,6 +123,11 @@ tick 9
 tick 10
 "
 );
+
+/// The boot's output to the ticks for the mode the harts have.
+fn boot_output() -> String {
+    BOOT_OUTPUT_TEMPLATE.replace("(MODE)", &format!("({})", mode().name))
+}
 
 fn committed() -> Vec<u8> {
     let path = repo_root().join("kernel").join(kernel::KERNEL_ELF_RV64);
@@ -127,6 +175,7 @@ impl Kernel {
             harts,
             ram_size: ram,
             xlen: grail::Xlen::Rv64,
+            paging: mode().paging,
             ..MachineConfig::default()
         })
         .unwrap();
@@ -274,18 +323,21 @@ fn the_rv64_kernel_boots_through_its_self_tests() {
     let out = k.printed();
     assert_eq!(r, RunResult::Exited(0), "output:\n{out}");
     let rest = mask_dbg_pc(&out);
-    assert!(rest.starts_with(BOOT_OUTPUT), "output:\n{out}");
-    let rest = &rest[BOOT_OUTPUT.len()..];
+    let boot = boot_output();
+    assert!(rest.starts_with(&boot), "output:\n{out}");
+    let rest = &rest[boot.len()..];
     let lines: Vec<&str> = rest.lines().collect();
     assert!(lines[0].starts_with("kstack: "), "{rest}");
     assert_eq!(lines[1..], ["user space: not on RV64 yet"], "{rest}");
 
-    // The layout's variables: Sv48 on a hart that has it, Linux's values.
-    assert_eq!(k.read32(k.sym("pt_levels")), 4);
-    assert_eq!(k.read64(k.sym("satp_mode")), 9 << 60);
-    assert_eq!(k.read64(k.sym("page_offset")), PAGE_OFFSET_SV48);
-    assert_eq!(k.read64(k.sym("vmalloc_start")), VMALLOC_START_SV48);
-    assert_eq!(k.read64(k.sym("va_pa_offset")), PAGE_OFFSET_SV48 - LOAD_ADDR);
+    // The layout's variables: Sv48 on a hart that has it, else Sv39, with
+    // Linux's values for the mode.
+    let mode = mode();
+    assert_eq!(k.read32(k.sym("pt_levels")), mode.levels);
+    assert_eq!(k.read64(k.sym("satp_mode")), mode.satp_mode);
+    assert_eq!(k.read64(k.sym("page_offset")), mode.page_offset);
+    assert_eq!(k.read64(k.sym("vmalloc_start")), mode.vmalloc_start);
+    assert_eq!(k.read64(k.sym("va_pa_offset")), mode.page_offset - LOAD_ADDR);
     assert_eq!(
         k.read64(k.sym("va_kernel_pa_offset")),
         KERNEL_LINK_ADDR - LOAD_ADDR
@@ -293,8 +345,11 @@ fn the_rv64_kernel_boots_through_its_self_tests() {
     // The kernel's page table: a direct-map pointer, in satp's form in
     // kernel_satp, and hart 0's struct cpu has it.
     let kpt = k.read64(k.sym("kernel_pagetable"));
-    assert_eq!(kpt >> 44, PAGE_OFFSET_SV48 >> 44, "{kpt:#x}");
-    assert_eq!(k.read64(k.sym("kernel_satp")), 9 << 60 | k.pa(kpt) >> 12);
+    assert!(
+        kpt >= mode.page_offset && kpt < mode.page_offset + (4 << 20),
+        "{kpt:#x}"
+    );
+    assert_eq!(k.read64(k.sym("kernel_satp")), mode.satp_mode | k.pa(kpt) >> 12);
     let cpus = k.sym("cpus");
     assert_eq!(k.read64(cpus + CPU_PAGETABLE), kpt);
     // Every lock let go, hart 0 out of push_off.
@@ -314,13 +369,13 @@ fn the_page_table_maps_the_kernel_half_only() {
     let root: Vec<u64> = (0..512).map(|i| k.read64_pa(kpt + 8 * i)).collect();
     // Nothing in the lower half: the identity mapping is gone.
     assert!(root[..256].iter().all(|&e| e & 1 == 0), "lower half mapped");
-    // The image (root entry 511), the direct map (351) and the vmalloc area
-    // (287) are there.
-    for (i, what) in [(511, "image"), (351, "direct map"), (287, "vmalloc area")] {
-        assert_eq!(root[i] & 0xf, 1, "{what}: root[{i}] = {:#x}", root[i]);
-    }
+    // The vmalloc area (the devices, the kernel stacks), the direct map and
+    // the image, each through a table under the root.
     let used: Vec<usize> = (256..512).filter(|&i| root[i] & 1 != 0).collect();
-    assert_eq!(used, [287, 351, 511]);
+    assert_eq!(used, mode().root_entries);
+    for &i in mode().root_entries {
+        assert_eq!(root[i] & 0xf, 1, "root[{i}] = {:#x}", root[i]);
+    }
 }
 
 impl Kernel {
@@ -359,7 +414,7 @@ fn the_rv64_kernel_runs_on_up_to_eight_harts() {
             );
             let sp = k.read64(k.sym("hart_sp") + 8 * h);
             assert_eq!((sp - KSTACK_SIZE) % KSTACK_SLOT, 0, "{sp:#x}");
-            assert!(sp > VMALLOC_START_SV48 + (4 << 30), "{sp:#x}");
+            assert!(sp > mode().vmalloc_start + (4 << 30), "{sp:#x}");
             // The scheduler isn't running a thread of a process at the end.
             assert_eq!(k.read64(cpus + h * CPU_SIZE + CPU_THREAD), 0);
         }
@@ -406,7 +461,7 @@ fn illegal_instruction_panics_with_a_64_bit_register_dump() {
     let (k, r, out) = run_with_fault(BOOT_FAULT_ILLEGAL);
     assert_eq!(r, RunResult::Exited(PANIC_EXIT), "output:\n{out}");
     let before = &out[..out.find("panic: ").unwrap()];
-    assert_eq!(mask_dbg_pc(before), BOOT_OUTPUT);
+    assert_eq!(mask_dbg_pc(before), boot_output());
     let (cause, v) = parse_panic(&out);
     assert_eq!(cause, "illegal instruction");
     assert_eq!(v["scause"], 2);
@@ -521,7 +576,7 @@ fn a_kernel_stack_overflow_hits_the_guard_page_and_is_reported() {
         .collect();
     assert_eq!(range[1] - range[0], KSTACK_SIZE);
     assert_eq!(range[0] % KSTACK_SLOT, 0);
-    assert!(range[0] > VMALLOC_START_SV48, "{report}");
+    assert!(range[0] > mode().vmalloc_start, "{report}");
     // The fault itself: a store to the guard page, the page below the
     // stack, from the recursion (not from kernel_vec: the frame went to the
     // overflow stack instead).
@@ -578,6 +633,7 @@ fn the_rv64_kernel_boots_from_disk() {
         let mut m = Machine::new(MachineConfig {
             harts,
             xlen: grail::Xlen::Rv64,
+            paging: mode().paging,
             disks: vec![grail::DiskConfig::memory(image.clone())],
             ..MachineConfig::default()
         })
@@ -598,7 +654,10 @@ fn the_rv64_kernel_boots_from_disk() {
             )),
             "{out}"
         );
-        assert!(out.contains("\npaging: on (Sv48)\n"), "{out}");
+        assert!(
+            out.contains(&format!("\npaging: on ({})\n", mode().name)),
+            "{out}"
+        );
         assert!(out.contains("\ndisk 0: 4096 sectors (2048 KiB), irq "), "{out}");
         // The disk driver's DMA (physical addresses of direct-map buffers),
         // the filesystem on it, and their self-tests.
@@ -652,6 +711,9 @@ fn the_rv64_reference_builds_pass_the_same_tests() {
         let elf = reference_build(assembler, name);
         assert_ne!(elf, committed(), "{name}: the reference build is merlin's");
         UNDER_TEST.with(|u| *u.borrow_mut() = Some(elf));
+        MODE.set(SV48);
+        the_rv64_kernel_falls_back_to_sv39();
+        MODE.set(SV48);
         the_rv64_kernel_is_linked_high_and_loaded_low();
         the_rv64_kernel_boots_through_its_self_tests();
         the_page_table_maps_the_kernel_half_only();
@@ -664,4 +726,23 @@ fn the_rv64_reference_builds_pass_the_same_tests() {
         a_kernel_stack_overflow_hits_the_guard_page_and_is_reported();
         the_rv64_kernel_boots_from_disk();
     }
+}
+
+#[test]
+fn the_rv64_kernel_falls_back_to_sv39() {
+    // A hart without Sv48 (Grail's --paging sv39): satp refuses MODE 9, the
+    // kernel's probe sees it and builds its tables for Sv39, with Linux's
+    // Sv39 layout; the image's address is the same. Every test above but
+    // the build's own, on such harts.
+    MODE.set(SV39);
+    the_rv64_kernel_boots_through_its_self_tests();
+    the_page_table_maps_the_kernel_half_only();
+    the_rv64_kernel_runs_on_up_to_eight_harts();
+    the_rv64_kernel_takes_ram_from_sysinfo();
+    kernel_stacks_keep_a_margin();
+    illegal_instruction_panics_with_a_64_bit_register_dump();
+    unmapped_load_and_text_store_page_fault();
+    misuses_panic();
+    a_kernel_stack_overflow_hits_the_guard_page_and_is_reported();
+    the_rv64_kernel_boots_from_disk();
 }

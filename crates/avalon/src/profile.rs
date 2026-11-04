@@ -100,6 +100,8 @@ pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<Machi
         nets: Vec::new(),
         // The protocol has no width yet (#158): the program's.
         xlen: grail::elf::class(program).unwrap_or(Xlen::Rv32),
+        // Nor paging modes (#158): Sv48 and Sv39, the default.
+        paging: grail::Paging::Sv48,
     };
     config.validate()?;
     Ok(config)
@@ -149,6 +151,7 @@ mod tests {
                 ],
                 nets: Vec::new(),
                 xlen: Xlen::Rv32,
+                paging: grail::Paging::Sv48,
             }
         );
         assert_eq!(
