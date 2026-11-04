@@ -544,7 +544,12 @@ static void add_reloc(uint offset, int kind, char *symbol, i64 addend) {
     r->line = line;
 }
 
-static void align_to(uint align) {
+/* Pads the current section to a multiple of `align` and raises its
+ * alignment (merlin-as's align_with): with the byte `fill` if has_fill (in
+ * code too), else nops in code and zeros elsewhere; nothing if the padding
+ * would be longer than `max` (when has_max). Padding makes no mapping
+ * symbol. */
+static void align_with(uint align, int has_fill, uint fill, int has_max, uint max) {
     if (align <= 1) {
         return;
     }
@@ -553,7 +558,16 @@ static void align_to(uint align) {
         s->align = align;
     }
     uint pad = (align - s->size % align) % align;
-    if (!is_code(s)) {
+    if (has_max && pad > max) {
+        return;
+    }
+    if (has_fill && fill != 0) {
+        uchar *bytes = tmp_alloc(pad + 1);
+        memset(bytes, (int)fill, pad);
+        emit_bytes(bytes, pad);
+        return;
+    }
+    if (has_fill || !is_code(s)) {
         emit_zeros(pad);
         return;
     }
@@ -572,6 +586,10 @@ static void align_to(uint align) {
     for (uint i = 0; i < pad / 4; i++) {
         emit_bytes(nop, 4);
     }
+}
+
+static void align_to(uint align) {
+    align_with(align, 0, 0, 0, 0);
 }
 
 /* Gives the pending `.loc`, if any, a row at the current offset: the
@@ -895,6 +913,62 @@ static int is_pow2(i64 v) {
     }
     i64 m = i64_and(v, i64_sub(v, i64_u(1)));
     return m.lo == 0 && m.hi == 0;
+}
+
+/* `.p2align n[, fill[, max]]` (`.align` too) and `.balign bytes[, fill[,
+ * max]]` (merlin-as's align_directive): the fill's low byte, may be left
+ * out (`,,`); a max below 1 is LLVM's error, one of at least the alignment
+ * changes nothing. */
+static void align_directive(const char *name, struct dirarg *args, uint nargs) {
+    i64 v;
+    if (!arg_const(args, nargs, 0, name, &v)) {
+        return;
+    }
+    uint align;
+    if (strcmp(name, ".balign") == 0) {
+        if (!is_pow2(v) || i64_cmp(v, i64_u(1u << 16)) > 0) {
+            error(".balign: alignment must be a power of two, at most 65536");
+            return;
+        }
+        align = v.lo;
+    } else {
+        if (!i64_in(v, i64_u(0), i64_u(17))) {
+            error(fmt("%s: power of two must be 0..16", name));
+            return;
+        }
+        align = 1u << v.lo;
+    }
+    if (nargs > 3) {
+        error(fmt("%s: expected at most an alignment, a fill and a maximum", name));
+        return;
+    }
+    int has_fill = 0;
+    uint fill = 0;
+    if (nargs > 1 && args[1].kind != DA_EMPTY) {
+        i64 f;
+        if (!arg_const(args, nargs, 1, name, &f)) {
+            return;
+        }
+        has_fill = 1;
+        fill = f.lo & 0xff;
+    }
+    int has_max = 0;
+    uint max = 0;
+    if (nargs > 2) {
+        i64 m;
+        if (!arg_const(args, nargs, 2, name, &m)) {
+            return;
+        }
+        if (i64_cmp(m, i64_u(1)) < 0) {
+            error("alignment directive can never be satisfied in this many bytes, ignoring maximum bytes expression");
+            return;
+        }
+        if (i64_cmp(m, i64_u(align)) < 0) {
+            has_max = 1;
+            max = m.lo;
+        }
+    }
+    align_with(align, has_fill, fill, has_max, max);
 }
 
 /* `.comm sym, size[, align]` for a .local symbol, or `.lcomm sym, size`:
@@ -1262,26 +1336,8 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
             memset(bytes, (int)byte, v.lo);
             emit_bytes(bytes, v.lo);
         }
-    } else if (strcmp(name, ".align") == 0 || strcmp(name, ".p2align") == 0) {
-        /* RISC-V `.align n` means 2^n bytes, as `.p2align` does. */
-        if (!arg_const(args, nargs, 0, name, &v)) {
-            return;
-        }
-        if (!i64_in(v, i64_u(0), i64_u(17))) {
-            msg = fmt("%s: power of two must be 0..16", name);
-            error(msg);
-            return;
-        }
-        align_to(1u << v.lo);
-    } else if (strcmp(name, ".balign") == 0) {
-        if (!arg_const(args, nargs, 0, name, &v)) {
-            return;
-        }
-        if (!is_pow2(v)) {
-            error(".balign: alignment must be a power of two");
-            return;
-        }
-        align_to(v.lo);
+    } else if (strcmp(name, ".align") == 0 || strcmp(name, ".p2align") == 0 || strcmp(name, ".balign") == 0) {
+        align_directive(name, args, nargs);
     } else if (strcmp(name, ".type") == 0) {
         char *n = arg_name(args, nargs, 0, ".type");
         if (n != NULL) {

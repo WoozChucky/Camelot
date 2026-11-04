@@ -7,9 +7,10 @@
 //!   padding, empty data, `.insn`, `.option`, `.comm`, every section kind),
 //!   against clang's objects next to them, `*.o` and `rv64/*.o`
 //!   (scripts/gen-mapping-golden.sh): the whole symbol table, every field,
-//!   in clang's order. And `merlin-objdump -d -r` of ours against
-//!   `llvm-objdump -d -r` of clang's (`*.d.txt`), the listing the mapping
-//!   symbols decide, and the bytes of the padding with it.
+//!   in clang's order, and every section's header and contents (the
+//!   padding of `align.s`'s alignments with a fill and a maximum). And
+//!   `merlin-objdump -d -r` of ours against `llvm-objdump -d -r` of
+//!   clang's (`*.d.txt`), the listing the mapping symbols decide.
 //! * The line table corpus, `tests/debug_line` (clang's objects too, with
 //!   line tables): the same symbols, but for the labels clang makes for its
 //!   line table where merlin-as uses section symbols (`.L0 `,
@@ -45,6 +46,25 @@ fn symbols(file: &[u8]) -> Vec<Sym> {
                 s.name.clone()
             };
             (name, s.value, s.size, s.info, s.other, place)
+        })
+        .collect()
+}
+
+/// A section: name, type, flags, size, alignment, entry size, contents.
+type Sect = (String, u32, u64, u64, u64, u64, Vec<u8>);
+
+/// The sections of an object but its symbol, string and relocation tables
+/// (which clang orders otherwise): name, type, flags, size, alignment,
+/// entry size and contents, in their order. The padding's bytes are in the
+/// contents, and the alignment a padding left out still raises.
+fn sections(file: &[u8]) -> Vec<Sect> {
+    let elf = elf::Elf::parse(file).unwrap();
+    elf.sections[1..]
+        .iter()
+        .filter(|s| ![elf::SHT_SYMTAB, elf::SHT_STRTAB, elf::SHT_RELA].contains(&s.ty))
+        .map(|s| {
+            let data = elf.section_data(s).unwrap().to_vec();
+            (s.name.clone(), s.ty, s.flags, s.size, s.align, s.entsize, data)
         })
         .collect()
 }
@@ -122,7 +142,7 @@ fn clang_names(mut syms: Vec<Sym>) -> Vec<Sym> {
 
 fn check_mapping_corpus(xlen: Xlen) {
     let names = names("mapping", xlen);
-    assert_eq!(names, ["dot", "mapping"], "{xlen:?}");
+    assert_eq!(names, ["align", "dot", "mapping"], "{xlen:?}");
     for name in &names {
         let ours = assemble(&source("mapping", name, xlen), xlen);
         let clang = std::fs::read(objects("mapping", xlen).join(format!("{name}.o"))).unwrap();
@@ -133,6 +153,7 @@ fn check_mapping_corpus(xlen: Xlen) {
             code(xlen)
         );
         assert_eq!(listing(&o), listing(&c), "{name}.s, {xlen:?}: symbols");
+        assert_eq!(sections(&ours), sections(&clang), "{name}.s, {xlen:?}: sections");
 
         // The listing: the same data among the same instructions, labels
         // and relocations, and the padding's bytes.

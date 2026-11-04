@@ -147,7 +147,8 @@ struct operand {
     int int_token;    /* OPD_MEM: the offset was one integer token, or none */
 };
 
-enum { DA_EXPR, DA_STR, DA_WIDE };
+/* DA_EMPTY: an argument left out between commas (the fill of `.p2align 3,,4`). */
+enum { DA_EXPR, DA_STR, DA_WIDE, DA_EMPTY };
 struct dirarg {
     int kind;
     struct expr *e;

@@ -804,12 +804,33 @@ impl Assembler {
     }
 
     fn align_to(&mut self, align: u32) {
+        self.align_with(align, None, None);
+    }
+
+    /// Pads the current section to a multiple of `align` and raises its
+    /// alignment to it, as LLVM's `emitValueToAlignment` and
+    /// `emitCodeAlignment` do: with `fill` bytes if one is given (in code
+    /// too: an explicit fill is never `nop`s), else as the section pads, `nop`s
+    /// in code and zeros elsewhere. A padding longer than `max` bytes is left
+    /// out, but the section's alignment is raised all the same. Padding is
+    /// neither code nor data: it makes no mapping symbol.
+    fn align_with(&mut self, align: u32, fill: Option<u8>, max: Option<u32>) {
         if align <= 1 {
             return;
         }
         let sec = &mut self.sections[self.current];
         sec.align = sec.align.max(align);
         let mut pad = (align - sec.size % align) % align;
+        if max.is_some_and(|m| pad > m) {
+            return;
+        }
+        if let Some(f) = fill {
+            return if f == 0 {
+                self.emit_zeros(pad.into())
+            } else {
+                self.emit_bytes(&vec![f; pad as usize])
+            };
+        }
         if !sec.is_code() {
             return self.emit_zeros(pad.into());
         }
@@ -1124,6 +1145,54 @@ impl Assembler {
         }
     }
 
+    /// `.p2align n[, fill[, max]]` (RISC-V's `.align` is the same) and
+    /// `.balign bytes[, fill[, max]]`, as LLVM's `parseDirectiveAlign` reads
+    /// them: the fill may be left out between the commas (`.p2align 3,,4`).
+    /// Only the fill's low byte counts (`0x1ff` is 0xff, `-1` too). A `max`
+    /// below 1 is LLVM's error; one of at least the alignment changes
+    /// nothing (LLVM warns that it has no effect).
+    fn align_directive(&mut self, name: &str, args: &[DirArg]) {
+        let Some(n) = self.arg_const(args, 0, name) else {
+            return;
+        };
+        let align = if name == ".balign" {
+            if n <= 0 || n & (n - 1) != 0 || n > 1 << 16 {
+                return self.error(".balign: alignment must be a power of two, at most 65536");
+            }
+            n as u32
+        } else {
+            if !(0..=16).contains(&n) {
+                return self.error(format!("{name}: power of two must be 0..16"));
+            }
+            1 << n
+        };
+        if args.len() > 3 {
+            return self.error(format!(
+                "{name}: expected at most an alignment, a fill and a maximum"
+            ));
+        }
+        let fill = match args.get(1) {
+            None | Some(DirArg::Empty) => None,
+            Some(_) => match self.arg_const(args, 1, name) {
+                Some(f) => Some(f as u8),
+                None => return,
+            },
+        };
+        let max = match args.get(2) {
+            None => None,
+            Some(_) => match self.arg_const(args, 2, name) {
+                Some(m) if m < 1 => {
+                    return self.error(
+                        "alignment directive can never be satisfied in this many bytes, ignoring maximum bytes                          expression",
+                    )
+                }
+                Some(m) => (m < i64::from(align)).then_some(m as u32),
+                None => return,
+            },
+        };
+        self.align_with(align, fill, max);
+    }
+
     /// `.space n[, fill]` (and its other names, `.zero` and `.skip`): `n`
     /// bytes of `fill`, zero if it is left out. As in LLVM, only the low
     /// byte of `fill` counts (`.space 3, 0x1ff` is three 0xff), and a
@@ -1283,22 +1352,7 @@ impl Assembler {
             }
             ".zero" | ".space" | ".skip" => self.space(name, args),
             // RISC-V `.align n` means 2^n bytes, same as `.p2align`.
-            ".align" | ".p2align" => {
-                if let Some(n) = self.arg_const(args, 0, name) {
-                    if !(0..=16).contains(&n) {
-                        return self.error(format!("{name}: power of two must be 0..16"));
-                    }
-                    self.align_to(1 << n);
-                }
-            }
-            ".balign" => {
-                if let Some(n) = self.arg_const(args, 0, name) {
-                    if n <= 0 || n & (n - 1) != 0 {
-                        return self.error(".balign: alignment must be a power of two");
-                    }
-                    self.align_to(n as u32);
-                }
-            }
+            ".align" | ".p2align" | ".balign" => self.align_directive(name, args),
             ".type" => {
                 if let Some(n) = self.arg_name(args, 0, ".type") {
                     let ty = match args.get(1) {

@@ -127,6 +127,7 @@ impl Parser<'_> {
                 let args = match name.as_str() {
                     ".file" | ".loc" => self.spaced_args()?,
                     ".section" => self.section_args()?,
+                    ".align" | ".p2align" | ".balign" => self.args(true)?,
                     _ => self.dir_args()?,
                 };
                 out.push(Stmt {
@@ -160,12 +161,20 @@ impl Parser<'_> {
     }
 
     fn dir_args(&mut self) -> Result<Vec<DirArg>, Error> {
+        self.args(false)
+    }
+
+    /// Arguments separated by commas; with `empty`, one may be left out
+    /// after a comma when another comma follows (the fill of `.p2align 3,,4`,
+    /// as LLVM reads it; a trailing comma is still an error).
+    fn args(&mut self, empty: bool) -> Result<Vec<DirArg>, Error> {
         let mut args = Vec::new();
         if matches!(self.peek(), Tok::Newline) {
             return Ok(args);
         }
         loop {
             match self.peek().clone() {
+                Tok::Punct(',') if empty && !args.is_empty() => args.push(DirArg::Empty),
                 Tok::Str(s) => {
                     self.pos += 1;
                     args.push(DirArg::Str(s));

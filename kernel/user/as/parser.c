@@ -357,8 +357,10 @@ static struct dirarg *new_arg(struct stmt *s, uint *cap) {
     return a;
 }
 
-/* A directive's arguments: expressions or strings, separated by commas. */
-static int dir_args(struct stmt *s) {
+/* A directive's arguments: expressions or strings, separated by commas.
+ * With `empty`, one may be left out after a comma when another comma
+ * follows (the fill of `.p2align 3,,4`, as LLVM reads it). */
+static int dir_args(struct stmt *s, int empty) {
     if (peek()->kind == T_NEWLINE) {
         return 0;
     }
@@ -366,7 +368,9 @@ static int dir_args(struct stmt *s) {
     for (;;) {
         struct dirarg *a = new_arg(s, &cap);
         struct token *t = peek();
-        if (t->kind == T_STR) {
+        if (empty && s->nargs > 1 && is_punct(t, ',')) {
+            a->kind = DA_EMPTY;
+        } else if (t->kind == T_STR) {
             pos++;
             a->kind = DA_STR;
             a->str = (uchar *)t->text;
@@ -543,7 +547,9 @@ int parse_statement(struct token *t, int n, struct stmt **out) {
         } else if (strcmp(head->text, ".section") == 0) {
             r = section_args(s);
         } else {
-            r = dir_args(s);
+            int align = strcmp(head->text, ".align") == 0 || strcmp(head->text, ".p2align") == 0 ||
+                        strcmp(head->text, ".balign") == 0;
+            r = dir_args(s, align);
         }
         if (r < 0) {
             return -1;
