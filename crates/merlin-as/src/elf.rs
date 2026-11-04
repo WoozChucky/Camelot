@@ -127,8 +127,8 @@ impl Class {
 
     /// Appends an address, offset or size field. In ELF32 the value must fit
     /// in 4 bytes: everything this writer puts there does (file offsets and
-    /// section sizes are 32-bit in [`Object`], and an RV32 constant is cut to
-    /// 32 bits before it gets here).
+    /// section sizes are 32-bit in [`Object`], and an RV32 constant or
+    /// symbol size is cut to 32 bits before it gets here).
     fn put_word(&self, b: &mut Vec<u8>, v: u64) {
         if self.word == 4 {
             debug_assert!(u32::try_from(v).is_ok(), "{v:#x} in a 4-byte ELF32 field");
@@ -313,10 +313,11 @@ pub fn write(obj: &Object) -> Vec<u8> {
         let other = 0; // st_other: default visibility
         match obj.xlen {
             // Elf32_Sym: st_name, st_value, st_size, st_info, st_other, st_shndx.
+            // The size is cut to the field's 32 bits, as LLVM writes it.
             Xlen::Rv32 => {
                 put32(&mut symtab, name);
                 class.put_word(&mut symtab, value);
-                class.put_word(&mut symtab, s.size.into());
+                class.put_word(&mut symtab, u64::from(s.size as u32));
                 symtab.extend_from_slice(&[info, other]);
                 put16(&mut symtab, shndx);
             }
@@ -326,7 +327,7 @@ pub fn write(obj: &Object) -> Vec<u8> {
                 symtab.extend_from_slice(&[info, other]);
                 put16(&mut symtab, shndx);
                 class.put_word(&mut symtab, value);
-                class.put_word(&mut symtab, s.size.into());
+                class.put_word(&mut symtab, s.size);
             }
         }
     }

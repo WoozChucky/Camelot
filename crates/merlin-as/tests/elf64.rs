@@ -161,6 +161,36 @@ fn symbols_are_clangs() {
 }
 
 #[test]
+fn symbol_sizes_are_as_wide_as_the_class() {
+    // `.size` takes any constant, as clang does, and st_size holds its bits:
+    // all 64 in ELF64, the low 32 in ELF32 (llvm-readelf -s of clang's
+    // objects for riscv64 and riscv32).
+    let src = "a: nop\nb: nop\nc: nop\nd: nop\n\
+               .size a, 0x100000000\n.size b, 0x1ffffffff\n.size c, -4\n.size d, . - d\n";
+    let sizes = |xlen| {
+        let bytes = merlin_as::assemble_to_elf_with(src, &Options { xlen }).expect("assembles");
+        let file = elf::Elf::parse(&bytes).expect("parses");
+        let symbols = file.symbols().unwrap();
+        symbols[1..]
+            .iter()
+            .map(|s| (s.name.clone(), s.size))
+            .collect::<Vec<_>>()
+    };
+    let want = |sizes: [u64; 4]| {
+        ["a", "b", "c", "d"]
+            .map(String::from)
+            .into_iter()
+            .zip(sizes)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        sizes(Xlen::Rv64),
+        want([0x1_0000_0000, 0x1_ffff_ffff, 0xffff_ffff_ffff_fffc, 4])
+    );
+    assert_eq!(sizes(Xlen::Rv32), want([0, 0xffff_ffff, 0xffff_fffc, 4]));
+}
+
+#[test]
 fn relocations_are_clangs() {
     let bytes = object(SRC);
     let file = elf::Elf::parse(&bytes).expect("parses");

@@ -101,6 +101,9 @@ f:      nop
         .quad -1
 x:      .8byte x + 8, ., f + BIG + 1
         .word x, ., 1 + (BIG + f)
+        .space 3, 0x1ff
+        .size x, 0x100000003
+        .size f, -4
         .section .debug_info,\"\",@progbits
         .quad .Lend
         .dword f + 2, .Lend - f

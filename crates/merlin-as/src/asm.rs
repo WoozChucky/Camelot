@@ -103,7 +103,9 @@ pub struct Symbol {
     /// Set for `.equ`/`.set` constants.
     pub constant: Option<i64>,
     pub ty: SymType,
-    pub size: u32,
+    /// `st_size`, as `.size` gave it: 64 bits, which an ELF32 object cuts
+    /// to 32.
+    pub size: u64,
 }
 
 /// The assembled result, ready for [`crate::elf::write`].
@@ -943,7 +945,7 @@ impl Assembler {
         let off = self.sections[self.current].size;
         self.define(&sym, self.current, off);
         let i = self.symbol_index(&sym);
-        self.symbols[i].size = size as u32;
+        self.symbols[i].size = size as u64;
         if self.symbols[i].ty == SymType::NoType {
             self.symbols[i].ty = SymType::Object;
         }
@@ -1047,18 +1049,21 @@ impl Assembler {
             }
             ".size" => {
                 // `.size f, . - f` (merlin's), `.size f, .Lfunc_end0 - f`
-                // (clang's) or a constant.
+                // (clang's) or a constant. Any value is taken, as LLVM
+                // takes it: its bits are the symbol's st_size, cut to the
+                // 32 bits of an ELF32 field by the writer (clang riscv32
+                // writes 0 for 0x100000000 and 0xfffffffc for -4).
                 if let Some(n) = self.arg_name(args, 0, ".size") {
                     let v = match args.get(1) {
                         Some(DirArg::Expr(e)) => self.eval_relative(e),
                         _ => None,
                     };
                     match v {
-                        Some(v) if (0..=u32::MAX as i64).contains(&v) => {
+                        Some(v) => {
                             let s = self.symbol_index(&n);
-                            self.symbols[s].size = v as u32;
+                            self.symbols[s].size = v as u64;
                         }
-                        _ => self.error(
+                        None => self.error(
                             ".size: expected a constant, or a difference of '.' and labels \
                              defined earlier in this section",
                         ),
@@ -1741,7 +1746,6 @@ w:      .word 0, 0, 0
             "    .text\n    .size f, . - f\nf: nop\n",
             "    .text\nf: nop\n    .size f, . * f\n",
             "    .text\nf: nop\n    .size f\n",
-            "    .text\nf: nop\n    .size f, -4\n",
             // An offset that does not cancel out is not a size.
             "    .text\n    nop\nf: nop\n    .size f, f\n",
             "    .text\n    nop\nf: nop\n    .size f, . + f\n",
@@ -1750,6 +1754,13 @@ w:      .word 0, 0, 0
             let errs = crate::assemble(bad).unwrap_err();
             assert!(errs[0].msg.contains(".size: expected"), "{bad:?}: {errs:?}");
         }
+        // Any constant is a size, as in LLVM, a negative or a 64-bit one
+        // too: the ELF writer cuts it to 32 bits in an ELF32 object.
+        let obj = crate::assemble("f: nop\n.size f, -4\ng: nop\n.size g, 0x100000000\n").unwrap();
+        assert_eq!(
+            (sym(&obj, "f").size, sym(&obj, "g").size),
+            (-4i64 as u64, 0x1_0000_0000)
+        );
     }
 
     #[test]

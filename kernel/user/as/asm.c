@@ -1182,11 +1182,13 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         }
     } else if (strcmp(name, ".size") == 0) {
         /* `.size f, . - f` (merlin's), `.size f, .Lfunc_end0 - f` (clang's)
-         * or a constant. */
+         * or a constant. Any value is taken, as LLVM takes it, and an
+         * ELF32 st_size keeps its low 32 bits (clang riscv32 writes 0 for
+         * 0x100000000 and 0xfffffffc for -4). */
         char *n = arg_name(args, nargs, 0, ".size");
         if (n != NULL) {
             int ok = nargs > 1 && args[1].kind == DA_EXPR && eval_relative(args[1].e, &v);
-            if (ok && v.hi == 0) {
+            if (ok) {
                 int k = symbol_index(n);
                 symbols[k].size = v.lo;
             } else {
