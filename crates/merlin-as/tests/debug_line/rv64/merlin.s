@@ -1,7 +1,9 @@
-# ../merlin.s written by hand as merlin -g is to write it for RV64 (LP64,
-# #152): the same m.c and the same line table, with what changes with the
-# width. Registers are saved and pushed 8 bytes at a time (sd/ld), ints stay
-# 4 bytes (sw/lw, and addw/addiw/mulw on them), and in .debug_info the address
+# merlin -g -fdebug-compilation-dir=src -march=rv64ima_zicsr_zifencei m.c:
+# ../merlin.s for RV64 (LP64), the same m.c and the same line table, with
+# what changes with the width (written by hand first, it is what merlin
+# writes since #152). Registers are saved and pushed 8 bytes at a time
+# (sd/ld), ints stay 4 bytes (sw/lw, and addw/addiw/mulw on them), and in
+# .debug_info the address
 # size is 8 and every DW_FORM_addr (the low pcs) is a .quad, which takes an
 # R_RISCV_64; lengths and offsets stay 4 bytes (DWARF32). m.c, whose header
 # inc/h.h has a function (static int twice(int x) { return x * 2; }):
