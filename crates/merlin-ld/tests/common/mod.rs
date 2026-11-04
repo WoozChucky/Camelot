@@ -435,3 +435,76 @@ pub fn ram(m: &Machine, addr: u64, len: usize) -> &[u8] {
     let off = (addr - grail::bus::RAM_BASE) as usize;
     &m.cpu.bus.ram[off..off + len]
 }
+
+/// Debug information of one object that refers to `gone`, a global another
+/// object defines in code `/DISCARD/` throws away ([`TOMBSTONES_GONE`]),
+/// and to `wu`, a weak reference nobody defines (merlin-as has no `.weak`:
+/// [`weaken`] makes it one). Linked by ld.lld 23 with [`TOMBSTONES_LD`], on
+/// RV32 and RV64 alike, its sections hold the tombstone, 0, except in
+/// `.debug_ranges` and `.debug_loc`, where it is 1 ([`TOMBSTONES_WANT`]).
+pub const TOMBSTONES: &str = "
+        .text
+        .globl _start
+_start: nop
+        .section .debug_info, \"\", @progbits
+        .dword gone + 4
+        .word gone
+        .dword wu + 4
+        .word wu + 4
+        .section .debug_ranges, \"\", @progbits
+        .word gone + 4
+        .dword gone + 4
+        .dword wu + 4
+        .section .debug_loc, \"\", @progbits
+        .dword gone + 4
+        .word wu
+";
+pub const TOMBSTONES_GONE: &str = ".section .text.gone, \"ax\"\n.globl gone\ngone: nop\n";
+pub const TOMBSTONES_LD: &str = "SECTIONS { . = 0x1000; .text : { *(.text) } /DISCARD/ : { *(.text.gone) } }";
+pub const TOMBSTONES_WANT: [(&str, &[u8]); 3] = [
+    (".debug_info", &[0; 24]),
+    (
+        ".debug_ranges",
+        &[1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+    ),
+    (".debug_loc", &[1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]),
+];
+
+/// Links [`TOMBSTONES`] and checks its debug sections hold ld.lld's bytes.
+pub fn assert_tombstones(a: Vec<u8>, b: Vec<u8>) {
+    let objs = [
+        Input {
+            name: "a.o".into(),
+            data: weaken(a, "wu"),
+        },
+        Input {
+            name: "b.o".into(),
+            data: b,
+        },
+    ];
+    let linked = merlin_ld::link(&objs, &script(TOMBSTONES_LD)).unwrap();
+    let elf = elf::Elf::parse(&linked.elf).unwrap();
+    for (name, want) in TOMBSTONES_WANT {
+        let s = elf.sections.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(elf.section_data(s).unwrap(), want, "{name}");
+    }
+}
+
+/// `obj` (ELF32 or ELF64) with its global symbol `name` made weak.
+pub fn weaken(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
+    let elf = elf::Elf::parse(&obj).unwrap();
+    let symtab = elf.sections.iter().find(|s| s.ty == elf::SHT_SYMTAB).unwrap();
+    let strtab = elf.sections[symtab.link as usize].offset as usize;
+    // st_info: after st_name in ELF64; after st_name, st_value and st_size
+    // in ELF32.
+    let info = if elf.class == elf::Class::Elf64 { 4 } else { 12 };
+    let at = (0..symtab.size / symtab.entsize)
+        .map(|i| (symtab.offset + i * symtab.entsize) as usize)
+        .find(|&e| {
+            let n = strtab + u32::from_le_bytes(obj[e..e + 4].try_into().unwrap()) as usize;
+            obj[n..].split(|&b| b == 0).next() == Some(name.as_bytes())
+        })
+        .unwrap_or_else(|| panic!("no symbol {name}"));
+    obj[at + info] = (elf::STB_WEAK << 4) | (obj[at + info] & 0xf);
+    obj
+}

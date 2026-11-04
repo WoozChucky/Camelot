@@ -187,8 +187,10 @@ static uchar **loaded(struct layout *l) {
 }
 
 /* The debug sections: their inputs one after another, relocated. A
- * relocation against a place that is not in the executable (code /DISCARD/
- * threw away, or not loaded) writes 0, as ld.lld does. */
+ * relocation against a symbol that is not in the executable (code /DISCARD/
+ * threw away or not loaded, a weak reference nobody defines) writes ld.lld's
+ * tombstone: 0, or 1 in .debug_loc and .debug_ranges, where a pair of zeros
+ * ends a DWARF 4 list. */
 static uchar **debug(struct layout *l) {
     /* No PCREL_HI20 sites; R_RISCV_64 as in a section not loaded. */
     struct reloc_context none;
@@ -197,6 +199,7 @@ static uchar **debug(struct layout *l) {
     uchar **images = xcalloc((l->ndebug + 1) * sizeof(uchar *));
     for (uint k = 0; k < l->ndebug; k++) {
         struct debug_section *ds = &l->debug[k];
+        uint tombstone = strcmp(ds->name, ".debug_loc") == 0 || strcmp(ds->name, ".debug_ranges") == 0;
         images[k] = xcalloc(ds->size);
         for (uint j = 0; j < ds->ninputs; j++) {
             struct input_ref *in = &ds->inputs[j];
@@ -216,11 +219,11 @@ static uchar **debug(struct layout *l) {
                 uint value;
                 char *e;
                 if (in_dropped_section(l, in->object, r->sym)) {
-                    /* S = -A, modulo 2^64, so that S + A, the value written,
-                     * is 0 for R_RISCV_32 (an offset) and R_RISCV_64 (an
-                     * address) alike, whatever the addend: ld.lld writes 0
-                     * there too. */
-                    sym = i64_neg(i64_of(r->addend));
+                    /* S = tombstone - A, modulo 2^64, so that S + A, the
+                     * value written, is the tombstone for R_RISCV_32 (an
+                     * offset) and R_RISCV_64 (an address) alike, whatever
+                     * the addend. */
+                    sym = i64_sub(i64_u(tombstone), i64_of(r->addend));
                 } else if (reloc_symbol(l, in->object, r->sym, &value, &e)) {
                     sym = i64_u(value);
                 } else {

@@ -257,12 +257,27 @@ impl Layout {
             .or_else(|| self.debug_offsets.get(&(obj, sec)).copied())
     }
 
-    /// Whether `sym` of `obj` is in a section that is neither loaded nor
-    /// debug information, or that `/DISCARD/` threw away. Debug information
-    /// may point at such places (the code of a discarded function); there
-    /// the linker writes 0, as ld.lld does.
+    /// Whether symbol `sym` of `obj`, as the link resolves it, has no place
+    /// in the executable: it is defined in a section that is neither loaded
+    /// nor debug information, or that `/DISCARD/` threw away (a global
+    /// counts by its definition, in whichever object that is), or it is a
+    /// weak reference nobody defines. Debug information may point at such
+    /// symbols (the code of a discarded function); there the linker writes
+    /// a tombstone, as ld.lld's `relocateNonAlloc` does for a symbol without
+    /// an output section. Absolute and script symbols have their values.
     pub fn in_dropped_section(&self, obj: usize, sym: usize) -> bool {
-        let s = &self.objects[obj].symbols[sym];
+        let mut s = &self.objects[obj].symbols[sym];
+        let mut obj = obj;
+        if sym != 0 && !s.is_local() {
+            match self.global_index.get(&s.name).map(|&i| self.globals[i].1) {
+                Some(Def::Object { obj: o, sym: d }) => {
+                    obj = o;
+                    s = &self.objects[o].symbols[d];
+                }
+                Some(Def::Script(_)) => return false,
+                None => return s.is_weak(),
+            }
+        }
         s.shndx != SHN_UNDEF && s.shndx < SHN_LORESERVE && self.section_base(obj, s.shndx as usize).is_none()
     }
 

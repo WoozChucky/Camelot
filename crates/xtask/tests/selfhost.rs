@@ -593,7 +593,9 @@ fn shdr_field(mut obj: Vec<u8>, name: &str, field: usize, f: impl Fn(u32) -> u32
 /// code, read-only data, data with `.dword` (R_RISCV_64) and `.word`
 /// pointers, a section the scripts throw away, and debug information
 /// pointing at all of them (R_RISCV_64 and R_RISCV_32 in a section that is
-/// not loaded, at discarded code with a positive addend too).
+/// not loaded, at discarded code with a positive addend too, at a global
+/// [`FAR`] defines in discarded code and at `wu`, made a weak reference
+/// nobody defines: tombstones, 1 in `.debug_ranges` and `.debug_loc`).
 const SCRIPTED: &str = "
         .text
         .globl _start
@@ -624,14 +626,46 @@ table:  .dword _start
         .word _start
         .dword gone + 4
         .word gone + 4
+        .dword fargone + 4
+        .word wu + 4
+        .section .debug_ranges, \"\", @progbits
+        .word gone + 4
+        .dword fargone + 4
+        .section .debug_loc, \"\", @progbits
+        .dword wu + 4
+        .word fargone
 ";
 
-/// The other object of [`SCRIPTED`]'s links.
+/// The other object of [`SCRIPTED`]'s links, with a global in code the
+/// scripts throw away, which [`SCRIPTED`]'s debug information refers to.
 const FAR: &str = "
         .text
         .globl far
 far:    ret
+        .section .text.gone, \"ax\"
+        .globl fargone
+fargone: nop
 ";
+
+/// `obj`, an ELF32 object, with its global symbol `name` made weak
+/// (merlin-as has no `.weak`).
+fn weaken(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
+    let at = {
+        let elf = elf::Elf::parse(&obj).unwrap();
+        let symtab = elf.sections.iter().find(|s| s.ty == elf::SHT_SYMTAB).unwrap();
+        let strtab = elf.sections[symtab.link as usize].offset as usize;
+        (0..symtab.size / 16)
+            .map(|i| (symtab.offset + i * 16) as usize)
+            .find(|&e| {
+                let n = strtab + u32::from_le_bytes(obj[e..e + 4].try_into().unwrap()) as usize;
+                obj[n..].split(|&b| b == 0).next() == Some(name.as_bytes())
+            })
+            .unwrap()
+    };
+    // st_info, after st_name, st_value and st_size.
+    obj[at + 12] = (elf::STB_WEAK << 4) | (obj[at + 12] & 0xf);
+    obj
+}
 
 /// Links that succeed, linked on Camelot as merlin-ld links them, byte for
 /// byte, with the debug information and without it (`-S`): load addresses
@@ -646,7 +680,7 @@ far:    ret
 /// section whose segment is dropped.
 #[test]
 fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
-    let objects = [object(SCRIPTED), object(FAR)];
+    let objects = [weaken(object(SCRIPTED), "wu"), object(FAR)];
     // `.text`, `more`, the rest from `start`.
     let rest = ".rodata : { *(.rodata) } .two : { *(.rodata.two) } .data : { *(.data) } .bss : { *(.bss) } \
                 /DISCARD/ : { *(.text.gone) }";

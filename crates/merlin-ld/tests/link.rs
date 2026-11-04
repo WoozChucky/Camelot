@@ -2180,6 +2180,18 @@ gone:
     assert_eq!(starts, [(0x1000, 1), (0, 7)]);
 }
 
+/// A reference from one object's debug information to a global another
+/// object defines in code /DISCARD/ threw away, and to a weak symbol nobody
+/// defines, points nowhere too: ld.lld's tombstone, 0, but 1 in
+/// `.debug_ranges` and `.debug_loc` (where 0, 0 ends a list). The bytes are
+/// ld.lld 23's for these objects (common::TOMBSTONES), the same on RV64
+/// (rv64.rs).
+#[test]
+fn debug_information_of_a_discarded_global_points_nowhere() {
+    let asm = |src| merlin_as::assemble_to_elf(src).unwrap();
+    common::assert_tombstones(asm(common::TOMBSTONES), asm(common::TOMBSTONES_GONE));
+}
+
 /// OUTPUT_FORMAT names the class the objects must have: with RV32 objects,
 /// `elf64-littleriscv` makes every one of them an error, as in ld.lld
 /// (`a.o is incompatible with elf64-littleriscv`), and `elf32-littleriscv`

@@ -1208,3 +1208,14 @@ gone:
     want.extend_from_slice(&0x1004u64.to_le_bytes());
     assert_eq!(elf.section_data(info).unwrap(), want);
 }
+
+/// link.rs's test of a global defined in discarded code and a weak symbol
+/// nobody defines, on RV64: the same tombstones as ld.lld's, 0 in
+/// `.debug_info` and 1 in `.debug_ranges` and `.debug_loc`.
+#[test]
+fn debug_information_of_a_discarded_global_points_nowhere() {
+    common::assert_tombstones(
+        rv64("a.o", common::TOMBSTONES).data,
+        rv64("b.o", common::TOMBSTONES_GONE).data,
+    );
+}

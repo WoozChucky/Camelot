@@ -125,9 +125,25 @@ int global_value(struct layout *l, const char *name, uint *out) {
     return global_def_value(&l->globals[i], out);
 }
 
+/* Whether symbol `sym` of `obj`, as the link resolves it, has no place in
+ * the executable: defined in a section not loaded or thrown away (a global
+ * by its definition, in whichever object that is), or a weak reference
+ * nobody defines. Debug information gets ld.lld's tombstone there. */
 int in_dropped_section(struct layout *l, uint obj, uint sym) {
     struct symbol *s = &l->objects[obj].symbols[sym];
     uint base;
+    if (sym != 0 && !sym_is_local(s)) {
+        int i;
+        if (!map_get(&l->global_index, s->name, &i)) {
+            return sym_is_weak(s);
+        }
+        struct global *g = &l->globals[i];
+        if (g->obj < 0) {
+            return 0;
+        }
+        obj = (uint)g->obj;
+        s = &l->objects[obj].symbols[g->sym];
+    }
     return s->shndx != SHN_UNDEF && s->shndx < SHN_LORESERVE && !section_base(obj, s->shndx, &base);
 }
 

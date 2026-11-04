@@ -76,13 +76,23 @@ pub fn relocate(layout: &Layout) -> Result<Images, Vec<Error>> {
 }
 
 /// The debug sections: their inputs one after another, relocated. A
-/// relocation against a place that is not in the executable (a section
-/// `/DISCARD/` threw away, or one not loaded) writes 0, as ld.lld does: the
-/// debug information of code that is gone points nowhere.
+/// relocation against a symbol that is not in the executable (in a section
+/// `/DISCARD/` threw away or one not loaded, or a weak reference nobody
+/// defines, see [`Layout::in_dropped_section`]) writes ld.lld's tombstone:
+/// the debug information of code that is gone points nowhere. That is 0,
+/// except in `.debug_loc` and `.debug_ranges`, where it is 1: there a pair of
+/// zeros ends a DWARF 4 location or range list (and -1, the other choice,
+/// selects a base address), so ld.lld writes 1, as GNU ld does in
+/// `.debug_ranges`.
 fn debug(layout: &Layout, errors: &mut Vec<Error>) -> Vec<Vec<u8>> {
     let ctx = Context::debug(layout.class);
     let mut images = Vec::new();
     for ds in &layout.debug {
+        let tombstone: u64 = if ds.name == ".debug_loc" || ds.name == ".debug_ranges" {
+            1
+        } else {
+            0
+        };
         let mut img = vec![0; ds.size as usize];
         for i in &ds.inputs {
             let obj = &layout.objects[i.object];
@@ -102,11 +112,11 @@ fn debug(layout: &Layout, errors: &mut Vec<Error>) -> Vec<Vec<u8>> {
                     )));
                     continue;
                 }
-                // S = -A, modulo 2^64, so that S + A, the value written, is
-                // 0 for R_RISCV_32 (an offset) and R_RISCV_64 (an address)
-                // alike, whatever the addend: ld.lld writes 0 there too.
+                // S = tombstone - A, modulo 2^64, so that S + A, the value
+                // written, is the tombstone for R_RISCV_32 (an offset) and
+                // R_RISCV_64 (an address) alike, whatever the addend.
                 let sym = if layout.in_dropped_section(i.object, r.sym as usize) {
-                    Ok(0u64.wrapping_sub(r.addend as u64))
+                    Ok(tombstone.wrapping_sub(r.addend as u64))
                 } else {
                     layout.reloc_symbol(i.object, r.sym as usize)
                 };
