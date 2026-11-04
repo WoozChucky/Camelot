@@ -54,13 +54,16 @@ pagetable_t kernel_pagetable;
 static struct spinlock uvm_lock;
 
 #if __riscv_xlen == 64
-/* The kernel stacks (kstack_alloc()). kstack_next: the next slot never
- * handed out, from KSTACK_AREA up; kstack_cache: the stacks given back, each
- * holding the next one's address in its top word. Under kstack_lock, which
- * is a leaf of the lock order but for kalloc's. */
-static struct spinlock kstack_lock;
+/* The vmalloc area's state, under vmalloc_lock, which also keeps two harts
+ * from making the same table under its root entry at once (Linux's
+ * init_mm.page_table_lock): a leaf of the lock order but for kalloc's.
+ * kstack_next: the next stack slot never handed out, from KSTACK_AREA up;
+ * kstack_cache: the stacks given back, each holding the next one's address
+ * in its top word; ioremap_next: where the next device mapping may go. */
+static struct spinlock vmalloc_lock;
 static uintptr kstack_next;
 static uintptr kstack_cache;
+static uintptr ioremap_next;
 #endif
 
 #if __riscv_xlen == 64
@@ -68,12 +71,17 @@ u32 pt_levels;
 uintptr satp_mode;
 uintptr page_offset;
 uintptr vmalloc_start;
+uintptr fixaddr_top;
 u64 direct_map_size;
 uintptr va_pa_offset;
 uintptr va_kernel_pa_offset;
 uintptr user_top;
 uintptr early_satp;
 uintptr kernel_satp;
+/* The early page table and the pool of EARLY_TABLES (vm.h) its lower tables
+ * come from, in .bss (entry.S, page aligned). */
+extern pte_t early_pg_dir[];
+extern pte_t early_tables[];
 #endif
 
 pagetable_t pagetable_create(void) {
@@ -265,10 +273,37 @@ static void kvmmap(uintptr va, phys_addr_t pa, usize size, u32 perm) {
 
 uintptr ioremap(phys_addr_t p, usize size) {
 #if __riscv_xlen == 64
-    if (p >= IO_WINDOW_SIZE || size > IO_WINDOW_SIZE - p) {
-        panic("ioremap: a device outside the devices' window");
+    if (kernel_pagetable == NULL) {
+        panic("ioremap: before kvminit");
     }
-    return VMALLOC_START + p;
+    /* Whole pages: the registers' offset in the first is kept. */
+    phys_addr_t first = PGROUNDDOWN(p);
+    if (size == 0 || p + size < p || PGROUNDUP(p + size) < p + size) {
+        panic("ioremap: bad range");
+    }
+    usize len = PGROUNDUP(p + size) - first;
+    /* Aligned to the mapping's size, up to the largest leaf (Linux's
+     * IOREMAP_MAX_ORDER, a PUD): where the physical address is aligned as
+     * well, kvmmap() then uses superpages. */
+    usize align = PGSIZE;
+    while (align < len && align < LEVEL_SIZE(MAX_LEAF_LEVEL)) {
+        align <<= 1;
+    }
+    acquire(&vmalloc_lock);
+    uintptr va = (ioremap_next + align - 1) & ~(align - 1);
+    if (va < ioremap_next || va > VM_TEST_AREA || len > VM_TEST_AREA - va) {
+        release(&vmalloc_lock);
+        panic("ioremap: the vmalloc area is full");
+    }
+    ioremap_next = va + len;
+    kvmmap(va, first, len, PAGE_KERNEL);
+    release(&vmalloc_lock);
+    /* A new mapping: this hart's TLB may not hold the old, invalid entry
+     * (the ISA lets it cache one). The drivers ioremap() as the boot starts
+     * them, on hart 0 before the other harts run (smp_boot()), whose first
+     * switch to the kernel page table fences. */
+    sfence_vma();
+    return va + (p - first);
 #else
     (void)size;
     return p;
@@ -299,12 +334,19 @@ void kvminit(void) {
     /* All of RAM in the direct map (kinit has cut ram_size to what the
      * direct map holds). */
     kvmmap((uintptr)va(ram_base), ram_base, ram_size, PAGE_KERNEL);
+    /* The fixmap, through the early page table's own tables for it, which
+     * nothing else uses (as Linux's setup_vm_final() links fixmap_pgd_next
+     * into swapper_pg_dir): sysinfo and the UART stay reachable where the
+     * boot reached them until their drivers ioremap() them, a panic's report
+     * included. */
+    u32 fix = VPN(fix_to_virt(FIX_SYSINFO), PT_LEVELS - 1);
+    kernel_pagetable[fix] = early_pg_dir[fix];
+    /* The devices: their drivers ioremap() them, from the vmalloc area. */
 #else
     /* Every free page after the image: kinit has checked that the image
      * starts RAM, and RAM is mapped where it is. */
     (void)end;
     kvmmap(data, data, ram_size - (data - ram_base), PAGE_KERNEL);
-#endif
 
     /* Every MMIO range the machine has that S-mode uses, whole pages, never
      * executable: not the CLINT and the test device, which only M-mode
@@ -319,21 +361,23 @@ void kvminit(void) {
         if (dev.size != 0 && dev.type != DEV_CLINT && dev.type != DEV_TEST) {
             phys_addr_t first = PGROUNDDOWN(dev.base);
             usize size = PGROUNDUP(dev.base + dev.size) - first;
-            kvmmap(ioremap(first, size), first, size, PAGE_KERNEL);
+            kvmmap(first, first, size, PAGE_KERNEL);
         }
     }
+#endif
 
 #if __riscv_xlen == 64
-    /* The kernel stacks' part of the vmalloc area gets its table under the
-     * root now, so that the stacks mapped later, whatever the process, are
+    /* The vmalloc area's root entry gets its table now, so that what is
+     * mapped there later (kernel stacks, devices), whatever the process, is
      * in every process's root table, which copies the kernel's root entries
      * (uvm_create()). */
     int at;
-    if (lookup(kernel_pagetable, KSTACK_AREA, PT_LEVELS - 2, true, &at) == NULL) {
+    if (lookup(kernel_pagetable, VMALLOC_START, PT_LEVELS - 2, true, &at) == NULL) {
         panic("kvminit: out of memory");
     }
-    initlock(&kstack_lock, "kstack");
+    initlock(&vmalloc_lock, "vmalloc");
     kstack_next = KSTACK_AREA;
+    ioremap_next = IOREMAP_START;
     kernel_satp = MAKE_SATP(kernel_pagetable);
 #endif
 }
@@ -379,18 +423,17 @@ void vm_print_mapping(pagetable_t pt, uintptr va) {
 
 #if __riscv_xlen == 64
 void *kstack_alloc(void) {
-    acquire(&kstack_lock);
+    acquire(&vmalloc_lock);
     if (kstack_cache != 0) {
         uintptr stack = kstack_cache;
         kstack_cache = *(uintptr *)(stack + KSTACK_SIZE - sizeof(uintptr));
-        release(&kstack_lock);
+        release(&vmalloc_lock);
         return (void *)stack;
     }
-    /* A new slot. They stay inside the root entry kvminit() made a table
-     * for, below the self-tests' part of it. */
+    /* A new slot, of KSTACK_SLOTS. */
     uintptr stack = kstack_next;
-    if (stack + KSTACK_SLOT > VM_TEST_AREA) {
-        release(&kstack_lock);
+    if (stack == IOREMAP_START) {
+        release(&vmalloc_lock);
         return NULL;
     }
     kstack_next = stack + KSTACK_SLOT;
@@ -409,7 +452,7 @@ void *kstack_alloc(void) {
         }
         mapped += PGSIZE;
     }
-    release(&kstack_lock);
+    release(&vmalloc_lock);
     if (mapped < KSTACK_SIZE) {
         /* Out of memory: the pages go back (the slot is not used again). */
         if (mapped != 0) {
@@ -421,10 +464,10 @@ void *kstack_alloc(void) {
 }
 
 void kstack_free(void *stack) {
-    acquire(&kstack_lock);
+    acquire(&vmalloc_lock);
     *(uintptr *)((uintptr)stack + KSTACK_SIZE - sizeof(uintptr)) = kstack_cache;
     kstack_cache = (uintptr)stack;
-    release(&kstack_lock);
+    release(&vmalloc_lock);
 }
 
 /* How much of the stack at [bottom, bottom + size) has been used: the
@@ -442,14 +485,14 @@ usize kstack_max_used(void) {
     /* Hart 0's boot stack (entry.S zeroes it), then every slot handed out:
      * all are mapped, in use or cached. */
     usize most = stack_used((uintptr)__stack_bottom, KSTACK_SIZE);
-    acquire(&kstack_lock);
+    acquire(&vmalloc_lock);
     for (uintptr s = KSTACK_AREA; s < kstack_next; s += KSTACK_SLOT) {
         usize used = stack_used(s, KSTACK_SIZE);
         if (used > most) {
             most = used;
         }
     }
-    release(&kstack_lock);
+    release(&vmalloc_lock);
     return most;
 }
 #else
@@ -469,10 +512,6 @@ usize kstack_max_used(void) {
 /* ---- The early page table (RV64), with paging off ---- */
 
 #if __riscv_xlen == 64
-/* The early page table and the pool of EARLY_TABLES (vm.h) its lower tables
- * come from, in .bss (entry.S, page aligned). */
-extern pte_t early_pg_dir[];
-extern pte_t early_tables[];
 static u32 early_used;
 
 /* Everything below runs with paging off, at the image's physical address:
@@ -505,19 +544,30 @@ static pagetable_t early_table(void) {
     return t;
 }
 
-/* Maps [va, va + size) to `pa` in the early page table with leaves at
- * `level`; size is rounded up to whole leaves. */
-static void early_map(uintptr va, phys_addr_t pa, u64 size, int level, u32 perm) {
-    for (u64 off = 0; off < size; off += LEVEL_SIZE(level)) {
+/* Maps [va, va + size) to `pa` in the early page table, `size` a whole
+ * number of pages: each stretch with the largest leaf, up to level `max`,
+ * that both addresses are aligned to and the rest of the range covers, as
+ * kvmmap() does, so nothing past the range is mapped. */
+static void early_map(uintptr va, phys_addr_t pa, u64 size, int max, u32 perm) {
+    u64 off = 0;
+    while (off < size) {
+        uintptr a = va + off;
+        phys_addr_t p = pa + off;
+        int level = max;
+        while (level > 0 && (a % LEVEL_SIZE(level) != 0 || p % LEVEL_SIZE(level) != 0 ||
+                             size - off < LEVEL_SIZE(level))) {
+            level--;
+        }
         pagetable_t t = early_pg_dir;
         for (int l = (int)pt_levels - 1; l > level; l--) {
-            pte_t *pte = &t[VPN(va + off, l)];
+            pte_t *pte = &t[VPN(a, l)];
             if ((*pte & PTE_V) == 0) {
                 *pte = PA2PTE((uintptr)early_table()) | PTE_V;
             }
             t = (pagetable_t)PTE2PA(*pte);
         }
-        t[VPN(va + off, level)] = PA2PTE(pa + off) | perm | PTE_V;
+        t[VPN(a, level)] = PA2PTE(p) | perm | PTE_V;
+        off += LEVEL_SIZE(level);
     }
 }
 
@@ -529,12 +579,14 @@ static void early_build(u32 levels, phys_addr_t load, phys_addr_t base, u64 size
         satp_mode = SATP_MODE_SV48;
         page_offset = PAGE_OFFSET_SV48;
         vmalloc_start = VMALLOC_START_SV48;
+        fixaddr_top = FIXADDR_TOP_SV48;
         direct_map_size = DIRECT_MAP_SIZE_SV48;
         user_top = 1ul << 47;
     } else {
         satp_mode = SATP_MODE_SV39;
         page_offset = PAGE_OFFSET_SV39;
         vmalloc_start = VMALLOC_START_SV39;
+        fixaddr_top = FIXADDR_TOP_SV39;
         direct_map_size = DIRECT_MAP_SIZE_SV39;
         user_top = 1ul << 38;
     }
@@ -543,18 +595,21 @@ static void early_build(u32 levels, phys_addr_t load, phys_addr_t base, u64 size
     for (u32 i = 0; i < PTES_PER_TABLE; i++) {
         early_pg_dir[i] = 0;
     }
-    /* The image at both addresses, in 2 MiB leaves, R+W+X: entry.S runs at
-     * the physical one until it jumps to the link one. */
-    u64 image = (uintptr)__kernel_end - load;
+    /* The image at both addresses, in 2 MiB leaves (the last one rounded up,
+     * as Linux maps the kernel in early_pg_dir), R+W+X: entry.S runs at the
+     * physical one until it jumps to the link one. */
+    u64 image = ((uintptr)__kernel_end - load + LEVEL_SIZE(1) - 1) & ~(LEVEL_SIZE(1) - 1);
     early_map(load, load, image, 1, PAGE_KERNEL_EXEC);
     early_map(KERNEL_LINK_ADDR, load, image, 1, PAGE_KERNEL_EXEC);
-    /* RAM in the direct map, in 1 GiB leaves, so kinit() and kvminit() can
-     * reach every page before the final table exists (it maps RAM exactly;
-     * these may run past its end, but nothing goes there). */
-    early_map(page_offset, base, size < direct_map_size ? size : direct_map_size, 2, PAGE_KERNEL);
-    /* The devices' window, in 1 GiB leaves: every device is in the first
-     * 2 GiB, below RAM (spec section 7). */
-    early_map(vmalloc_start, 0, 0x80000000ull, 2, PAGE_KERNEL);
+    /* All of RAM in the direct map, so kinit() and kvminit() can reach
+     * every page before the final table exists: exactly RAM (what the
+     * direct map holds of it, whole pages), 1 GiB leaves, then 2 MiB and
+     * 4 KiB ones for its end. */
+    u64 ram = (size < direct_map_size ? size : direct_map_size) & ~(PGSIZE - 1);
+    early_map(page_offset, base, ram, 2, PAGE_KERNEL);
+    /* The fixmap: the devices used before ioremap() works, a page each. */
+    early_map(fix_to_virt(FIX_SYSINFO), SYSINFO_BASE, PGSIZE, 0, PAGE_KERNEL);
+    early_map(fix_to_virt(FIX_UART), UART_BASE, PGSIZE, 0, PAGE_KERNEL);
     early_satp = satp_mode | ((uintptr)early_pg_dir >> PGSHIFT);
 }
 
@@ -590,6 +645,12 @@ void setup_vm(void) {
     if ((got & SATP_MODE_MASK) != SATP_MODE_SV48) {
         early_build(3, load, base, size);
     }
+    /* From here on, until their drivers ioremap() them, sysinfo and the
+     * UART are reached through the fixmap: as soon as paging is on, a
+     * panic's report gets out (the variables are written here at their
+     * physical addresses, the same memory). */
+    sysinfo_regs = fix_to_virt(FIX_SYSINFO);
+    uart_regs = fix_to_virt(FIX_UART);
 }
 #endif
 

@@ -36,11 +36,12 @@ struct Mode {
     satp_mode: u64,
     /// The direct map's base (Linux's PAGE_OFFSET).
     page_offset: u64,
-    /// The vmalloc area's start, where the devices' window begins.
+    /// The vmalloc area's start, where the kernel stacks begin, and the
+    /// devices' mappings after them.
     vmalloc_start: u64,
-    /// The kernel's root entries in use at the end of the boot: the
-    /// devices, the kernel stacks (in Sv39 a root entry of their own), the
-    /// direct map of 4 MiB of RAM, the image.
+    /// The kernel's root entries in use at the end of the boot: the fixmap,
+    /// the vmalloc area (the kernel stacks and the devices), the direct map
+    /// of 4 MiB of RAM, the image.
     root_entries: &'static [usize],
 }
 
@@ -51,7 +52,7 @@ const SV48: Mode = Mode {
     satp_mode: 9 << 60,
     page_offset: 0xffff_af80_0000_0000,
     vmalloc_start: 0xffff_8f80_0000_0000,
-    root_entries: &[287, 351, 511],
+    root_entries: &[282, 287, 351, 511],
 };
 
 const SV39: Mode = Mode {
@@ -61,7 +62,7 @@ const SV39: Mode = Mode {
     satp_mode: 8 << 60,
     page_offset: 0xffff_ffd6_0000_0000,
     vmalloc_start: 0xffff_ffc6_0000_0000,
-    root_entries: &[280, 284, 344, 510],
+    root_entries: &[275, 280, 344, 510],
 };
 
 thread_local! {
@@ -73,9 +74,11 @@ thread_local! {
 fn mode() -> Mode {
     MODE.get()
 }
-/// The kernel stacks' size and slot (vm.h).
+/// The kernel stacks' size and slot, and how many slots there are, at the
+/// start of the vmalloc area (vm.h).
 const KSTACK_SIZE: u64 = 16 * 1024;
 const KSTACK_SLOT: u64 = 2 * KSTACK_SIZE;
+const KSTACK_SLOTS: u64 = 64;
 const PANIC_EXIT: u32 = 0xfe;
 
 /// `boot_fault` values (kernel/main.c).
@@ -369,13 +372,58 @@ fn the_page_table_maps_the_kernel_half_only() {
     let root: Vec<u64> = (0..512).map(|i| k.read64_pa(kpt + 8 * i)).collect();
     // Nothing in the lower half: the identity mapping is gone.
     assert!(root[..256].iter().all(|&e| e & 1 == 0), "lower half mapped");
-    // The vmalloc area (the devices, the kernel stacks), the direct map and
-    // the image, each through a table under the root.
+    // The fixmap, the vmalloc area (the kernel stacks, the devices), the
+    // direct map and the image, each through a table under the root.
     let used: Vec<usize> = (256..512).filter(|&i| root[i] & 1 != 0).collect();
     assert_eq!(used, mode().root_entries);
     for &i in mode().root_entries {
         assert_eq!(root[i] & 0xf, 1, "root[{i}] = {:#x}", root[i]);
     }
+    // The fixmap's entry is the early page table's own, as Linux shares its
+    // fixmap tables between early_pg_dir and swapper_pg_dir.
+    let early = k.pa(k.sym("early_pg_dir"));
+    let fix = mode().root_entries[0];
+    assert_eq!(root[fix], k.read64_pa(early + 8 * fix as u64));
+
+    // The devices the kernel uses, ioremap()ed after the kernel stacks,
+    // each in its own place: sysinfo and the UART, which the boot reached
+    // through the fixmap first. Every leaf has A, D and G.
+    let ioremap = mode().vmalloc_start + KSTACK_SLOTS * KSTACK_SLOT;
+    for (name, pa) in [
+        ("sysinfo_regs", 0x3000_2000),
+        ("uart_regs", grail::bus::UART_BASE),
+    ] {
+        let va = k.read64(k.sym(name));
+        assert!(
+            va >= ioremap && va < mode().vmalloc_start + (1 << 30),
+            "{name} {va:#x}"
+        );
+        let (got, pte) = k
+            .translate(kpt, va)
+            .unwrap_or_else(|| panic!("{name} {va:#x} unmapped"));
+        assert_eq!(got, pa, "{name}");
+        assert_eq!(pte & 0xff, 0xe7, "{name}: {pte:#x}");
+    }
+    // Nothing the kernel doesn't use: the CLINT and the test device are
+    // M-mode's, and no driver asked for the framebuffer.
+    let mapped = |pa: u64| {
+        (0..(256u64 << 20) >> 12).any(|i| {
+            k.translate(kpt, ioremap + (i << 12))
+                .is_some_and(|(p, _)| p == pa)
+        })
+    };
+    assert!(!mapped(grail::bus::CLINT_BASE), "the CLINT is mapped");
+    assert!(!mapped(grail::bus::TEST_DEV_BASE), "the test device is mapped");
+    assert!(!mapped(grail::bus::FB_CTRL_BASE), "the framebuffer is mapped");
+    assert!(mapped(grail::bus::PLIC_BASE), "the PLIC is not mapped");
+
+    // The early page table maps RAM exactly, and no devices but the
+    // fixmap's: its direct map ends with RAM.
+    let ram_end = mode().page_offset + grail::DEFAULT_RAM_SIZE as u64;
+    assert!(k.translate(early, ram_end - 4096).is_some());
+    assert!(k.translate(early, ram_end).is_none());
+    assert!(k.translate(early, mode().vmalloc_start).is_none());
+    assert!(k.translate(early, mode().vmalloc_start + 0x1000_0000).is_none());
 }
 
 impl Kernel {
@@ -383,6 +431,26 @@ impl Kernel {
         let lo = self.m.cpu.bus.peek(pa).unwrap() as u64;
         let hi = self.m.cpu.bus.peek(pa + 4).unwrap() as u64;
         lo | hi << 32
+    }
+
+    /// What the page table whose root is at physical address `root` maps
+    /// `va` to: the physical address and the leaf PTE, or None.
+    fn translate(&self, root: u64, va: u64) -> Option<(u64, u64)> {
+        let mut table = root;
+        for level in (0..mode().levels).rev() {
+            let vpn = va >> (12 + 9 * level) & 0x1ff;
+            let pte = self.read64_pa(table + 8 * vpn);
+            if pte & 1 == 0 {
+                return None;
+            }
+            let pa = (pte >> 10 & 0xfff_ffff_ffff) << 12;
+            if pte & 0xe != 0 {
+                let offset = va & ((1u64 << (12 + 9 * level)) - 1);
+                return Some((pa + offset, pte));
+            }
+            table = pa;
+        }
+        None
     }
 }
 
@@ -414,7 +482,8 @@ fn the_rv64_kernel_runs_on_up_to_eight_harts() {
             );
             let sp = k.read64(k.sym("hart_sp") + 8 * h);
             assert_eq!((sp - KSTACK_SIZE) % KSTACK_SLOT, 0, "{sp:#x}");
-            assert!(sp > mode().vmalloc_start + (4 << 30), "{sp:#x}");
+            let area = mode().vmalloc_start..=mode().vmalloc_start + KSTACK_SLOTS * KSTACK_SLOT;
+            assert!(area.contains(&sp), "{sp:#x}");
             // The scheduler isn't running a thread of a process at the end.
             assert_eq!(k.read64(cpus + h * CPU_SIZE + CPU_THREAD), 0);
         }
@@ -598,7 +667,11 @@ fn a_kernel_stack_overflow_hits_the_guard_page_and_is_reported() {
         .collect();
     assert_eq!(range[1] - range[0], KSTACK_SIZE);
     assert_eq!(range[0] % KSTACK_SLOT, 0);
-    assert!(range[0] > mode().vmalloc_start, "{report}");
+    assert!(range[0] >= mode().vmalloc_start, "{report}");
+    assert!(
+        range[1] <= mode().vmalloc_start + KSTACK_SLOTS * KSTACK_SLOT,
+        "{report}"
+    );
     // The fault itself: a store to the guard page, the page below the
     // stack, from the recursion (not from kernel_vec: the frame went to the
     // overflow stack instead).

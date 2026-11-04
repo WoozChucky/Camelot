@@ -335,8 +335,7 @@ static void print_disks(void) {
 int kmain(void) {
     /* This hart's struct cpu, which every lock uses: first of all. */
     cpu_init();
-    /* The devices through the kernel's mappings of them (vm.h). */
-    sysinfo_map();
+    /* The UART where the boot reaches it: on RV64 the fixmap (vm.h). */
     uart_init();
     for (u32 i = 0; i < sizeof banner / sizeof banner[0]; i++)
         kprintf("%s", banner[i]);
@@ -358,6 +357,9 @@ int kmain(void) {
     kprintf("ram: %lu MiB at 0x%lx\n", ram_size >> 20, ram_base);
     kvminit();
     kvminithart();
+    /* From here on the devices through ioremap() (vm.h). */
+    sysinfo_map();
+    uart_map();
 #if __riscv_xlen == 64
     kprintf("paging: on (%s)\n", pt_levels == 4 ? "Sv48" : "Sv39");
 #else

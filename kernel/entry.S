@@ -22,9 +22,9 @@
 # va_kernel_pa_offset, the distance between the two, as Linux's
 # relocate_enable_mmu adds va_pa_offset. In S-mode, still with paging off,
 # hart 0 builds the early page table (setup_vm(), vm.c): the image at both
-# addresses, RAM in the direct map, the devices in their window. Every hart
-# then turns paging on with it, jumps to the high address of the next
-# instruction, and from there on runs high; kvminit() and kvminithart()
+# addresses, RAM in the direct map, sysinfo and the UART in the fixmap.
+# Every hart then turns paging on with it, jumps to the high address of the
+# next instruction, and from there on runs high; kvminit() and kvminithart()
 # replace the early table with the final one, which has no identity mapping.
 # M-mode keeps running at physical addresses (machine.S): it doesn't
 # translate.

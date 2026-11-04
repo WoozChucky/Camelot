@@ -1,6 +1,7 @@
-/* Reading Grail's sysinfo block (spec section 9.5), at its physical address
- * until kmain maps it (sysinfo_map()), then through the kernel's mapping: on
- * RV32 the same address, on RV64 its place in the devices' window. */
+/* Reading Grail's sysinfo block (spec section 9.5) through sysinfo_regs: its
+ * physical address, which is its mapping on RV32 (and RV64's with paging
+ * off); on RV64 the fixmap's page from setup_vm() on, then the kernel's
+ * ioremap() of it (sysinfo_map()). */
 #include "sysinfo.h"
 #include "mmio.h"
 #include "trap.h"

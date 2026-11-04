@@ -121,15 +121,18 @@ extern uintptr satp_mode;
  *                     with 1 GiB and 2 MiB leaves where alignment allows
  *   VMALLOC_START     Sv48 0xffff_8f80_0000_0000 (32 TiB, to PAGE_OFFSET)
  *                     Sv39 0xffff_ffc6_0000_0000 (64 GiB)
- *                     the vmalloc/ioremap area: first the devices, each at
- *                     VMALLOC_START + its physical address (ioremap(): every
- *                     device of the machine is below IO_WINDOW_SIZE, 4 GiB),
- *                     then the kernel stacks (kstack_alloc(), from
- *                     KSTACK_AREA)
- *
- * Linux's ioremap() finds free room in the vmalloc area for each call;
- * Camelot's maps each device at a fixed distance from its physical address,
- * since its devices sit in the bottom 4 GiB and are all mapped at boot.
+ *                     the vmalloc/ioremap area; Camelot uses what its first
+ *                     root entry holds (kvminit() makes the table under it,
+ *                     before any process copies the kernel's root entries):
+ *                     the kernel stacks (kstack_alloc(), KSTACK_AREA), then
+ *                     the devices (ioremap(), IOREMAP_START), then the
+ *                     paging self-tests' pages (VM_TEST_AREA)
+ *   FIXADDR_TOP       Sv48 0xffff_8d7f_ff00_0000
+ *                     Sv39 0xffff_ffc4_ff00_0000
+ *                     the fixmap, a page per slot down from FIXADDR_TOP
+ *                     (fix_to_virt()): the devices the boot uses before
+ *                     ioremap() works, sysinfo and the UART, as Linux's
+ *                     earlycon uses FIX_EARLYCON_MEM_BASE
  *
  * The values that depend on the mode are variables, set at boot, as Linux's
  * kernel_map and PAGE_OFFSET are: the image's link address is the same in
@@ -140,8 +143,10 @@ extern uintptr satp_mode;
 #define PAGE_OFFSET_SV39 0xffffffd600000000ull
 #define VMALLOC_START_SV48 0xffff8f8000000000ull
 #define VMALLOC_START_SV39 0xffffffc600000000ull
-/* The devices' window at the start of the vmalloc area. */
-#define IO_WINDOW_SIZE 0x100000000ull
+/* Linux's FIXADDR_TOP: PCI_IO_START, 16 MiB below VMEMMAP_START, which is
+ * VMEMMAP_SIZE (2 TiB in Sv48, 4 GiB in Sv39) below VMALLOC_START. */
+#define FIXADDR_TOP_SV48 0xffff8d7fff000000ull
+#define FIXADDR_TOP_SV39 0xffffffc4ff000000ull
 /* The direct map's room: from PAGE_OFFSET up to the next region (the KASAN
  * shadow in Linux's tables, unused here), 64 TiB in Sv48, 128 GiB in Sv39.
  * RAM beyond it is left out (kinit says how much). */
@@ -152,6 +157,7 @@ extern uintptr satp_mode;
 #ifndef __ASSEMBLER__
 extern uintptr page_offset;   /* PAGE_OFFSET */
 extern uintptr vmalloc_start; /* VMALLOC_START */
+extern uintptr fixaddr_top;   /* FIXADDR_TOP */
 extern u64 direct_map_size;   /* the most of RAM the direct map holds */
 /* A direct-map pointer minus its physical address: PAGE_OFFSET minus RAM's
  * base (Linux's kernel_map.va_pa_offset). */
@@ -164,6 +170,21 @@ extern uintptr va_kernel_pa_offset;
 #endif
 #define PAGE_OFFSET page_offset
 #define VMALLOC_START vmalloc_start
+#define FIXADDR_TOP fixaddr_top
+
+/* The fixmap's slots, Linux's enum fixed_addresses: a page each, slot i at
+ * FIXADDR_TOP - i pages (FIX_HOLE, slot 0, is never mapped). setup_vm()
+ * maps them in the early page table, and kvminit() keeps them in the final
+ * one, as Linux's setup_vm_final() keeps its fixmap. */
+#ifndef __ASSEMBLER__
+enum fixed_addresses {
+    FIX_HOLE,
+    FIX_SYSINFO, /* the sysinfo block, until sysinfo_map() */
+    FIX_UART,    /* the UART's registers, until uart_map() */
+    FIX_COUNT,
+};
+#endif
+#define fix_to_virt(slot) (FIXADDR_TOP - ((uintptr)(slot) << PGSHIFT))
 
 /* The physical address of kernel pointer `v`: a direct-map pointer, or one
  * into the kernel image (its code, data and boot stack), as Linux's __pa().
@@ -185,10 +206,16 @@ static inline phys_addr_t kernel_pa(uintptr v) {
 #define va(p) ((void *)(uintptr)(p))
 #endif
 
-/* The kernel's address of the device registers at physical address `p`
- * (`size` bytes, all mapped by kvminit(), which maps every device in the
- * sysinfo table): VMALLOC_START + p on RV64, p itself on RV32. Panics if the
- * range is outside the devices' window. After paging is on. */
+/* The kernel's address of the `size` device registers at physical address
+ * `p`, anywhere in the physical address space: on RV64 a new mapping of
+ * them, whole pages, in free room of the vmalloc area (from IOREMAP_START),
+ * aligned to their size up to a 1 GiB leaf so that they get the largest
+ * leaves their physical address allows (the PLIC's 64 MiB in 2 MiB ones),
+ * as Linux's ioremap() finds room with get_vm_area() and maps with huge
+ * pages; on RV32, where kvminit() maps every device the kernel uses at its
+ * physical address, `p` itself. Never unmapped (no driver goes away).
+ * After kvminit(), with no spinlock held but kmem's; panics if the area is
+ * full. */
 #ifndef __ASSEMBLER__
 uintptr ioremap(phys_addr_t p, usize size);
 #endif
@@ -210,14 +237,15 @@ uintptr ioremap(phys_addr_t p, usize size);
 #define KSTACK_SHIFT 14
 #define KSTACK_SIZE (_UL(1) << KSTACK_SHIFT)
 #define KSTACK_SLOT (2 * KSTACK_SIZE)
-/* Where the stacks start: after the devices' window. They take what one
- * root entry of the vmalloc area holds (kvminit() makes that entry, before
- * the first process copies the kernel's root entries). */
-#define KSTACK_AREA (VMALLOC_START + IO_WINDOW_SIZE)
-/* The second half of that root entry's room: for the paging self-tests
- * (vmtest.c, smp.c), which map and unmap pages there. The stacks end below
- * it: 256 GiB of them in Sv48, 512 MiB (16384 stacks) in Sv39. */
-#define VM_TEST_AREA (KSTACK_AREA + LEVEL_SIZE(PT_LEVELS - 1) / 2)
+/* Where the stacks are: KSTACK_SLOTS slots at the start of the vmalloc
+ * area (2 MiB; the slot below the first is not the kernel's, and unmapped). */
+#define KSTACK_SLOTS 64
+#define KSTACK_AREA VMALLOC_START
+/* Then the devices' mappings (ioremap()), up to VM_TEST_AREA. */
+#define IOREMAP_START (KSTACK_AREA + KSTACK_SLOTS * KSTACK_SLOT)
+/* The second half of the vmalloc area's first root entry: for the paging
+ * self-tests (vmtest.c, smp.c), which map and unmap pages there. */
+#define VM_TEST_AREA (VMALLOC_START + LEVEL_SIZE(PT_LEVELS - 1) / 2)
 /* Each hart's overflow stack, for the report of an overflow: kernel_vec
  * puts the frame at overflow_stacks + (hart + 1) * OVERFLOW_STACK_SIZE
  * (Linux's OVERFLOW_STACK_SIZE, 4 KiB; entry.S reserves NCPU of them). */
@@ -285,10 +313,12 @@ void pagetable_free(pagetable_t pt);
 
 #if __riscv_xlen == 64
 /* The early page table's lower tables (vm.c, setup_vm()), a page each, in
- * .bss after early_pg_dir, the root (entry.S): Sv48 needs at most seven,
- * two under the root for each of the image's two addresses, two for the
- * direct map of 1 TiB, one for the devices. */
-#define EARLY_TABLES 8
+ * .bss after early_pg_dir, the root (entry.S). Sv48 needs at most eleven:
+ * two under the root for each of the image's two addresses (2 MiB leaves),
+ * for the direct map of Grail's most RAM, 1 TiB, two tables of 1 GiB
+ * leaves and one each of 2 MiB and 4 KiB leaves for its end, and three for
+ * the fixmap's pages. Sv39 needs six. */
+#define EARLY_TABLES 11
 #endif
 
 #ifndef __ASSEMBLER__
@@ -296,9 +326,12 @@ void pagetable_free(pagetable_t pt);
 /* With paging off, on hart 0, before anything else in S-mode (entry.S):
  * probes the paging mode, reads RAM from sysinfo and builds the early page
  * table, which maps the kernel image at its physical address and at its
- * link address, RAM in the direct map and the devices' window, with
- * superpages. Leaves early_satp, which entry.S writes to satp on every hart
- * before it jumps to the high addresses. */
+ * link address (2 MiB leaves, as Linux's early_pg_dir), all of RAM in the
+ * direct map, exactly, with the largest leaves that fit, and the fixmap's
+ * sysinfo and UART pages, the only devices the boot uses before ioremap()
+ * works; points sysinfo_regs and uart_regs at those. Leaves early_satp,
+ * which entry.S writes to satp on every hart before it jumps to the high
+ * addresses. */
 void setup_vm(void);
 extern uintptr early_satp;
 /* satp for kernel_pagetable, set by kvminit(): what the other harts switch
@@ -306,13 +339,13 @@ extern uintptr early_satp;
 extern uintptr kernel_satp;
 #endif
 
-/* Builds kernel_pagetable: the kernel image (text R+X, rodata R, the rest
- * R+W), all of RAM (R+W) and every device in the sysinfo table that S-mode
+/* Builds kernel_pagetable, every leaf with PTE_KERNEL: the kernel image
+ * (text R+X, rodata R, the rest R+W) and all of RAM (R+W). On RV32 at their
+ * physical addresses, with every device in the sysinfo table that S-mode
  * uses (R+W: all but the CLINT and the test device, which only M-mode
- * touches), every leaf with PTE_KERNEL. On
- * RV32 every one at its physical address; on RV64 in the kernel half, the
- * image at its link address, RAM in the direct map and the devices in their
- * window, with no identity mapping left. */
+ * touches); on RV64 in the kernel half, the image at its link address, RAM
+ * in the direct map and the fixmap, with no identity mapping left: the
+ * devices are mapped as their drivers ask (ioremap()). */
 void kvminit(void);
 
 /* Turns paging on with kernel_pagetable (satp, then sfence.vma). On RV64 this

@@ -14,11 +14,11 @@
 
 struct spinlock uart_tx_lock;
 
-/* Where the registers are reached: the kernel's mapping of UART_BASE, set by
- * uart_init() (ioremap(), vm.h). Before that its physical address, which is
- * its mapping on RV32, so a panic that comes before uart_init() (one at
- * kmain's first instruction, say) still gets out there. */
-static uintptr uart = UART_BASE;
+/* Where the registers are reached (uart.h): UART_BASE, which is the UART's
+ * mapping on RV32; on RV64 the fixmap's page from setup_vm() on, before
+ * paging is on (vm.h); the kernel's ioremap() of it from uart_map() on. So
+ * a panic at kmain's first instruction still gets out. */
+uintptr uart_regs = UART_BASE;
 
 /* The receive ring buffer, filled by uart_intr (in the trap handler) and
  * drained by uart_rx_pop, both under the console's lock. The indices count
@@ -36,9 +36,12 @@ static volatile bool rx_stalled;
 
 void uart_init(void) {
     initlock(&uart_tx_lock, "uart");
-    uart = ioremap(UART_BASE, PGSIZE);
-    mmio_write8(uart + UART_LCR, UART_LCR_8N1);
-    mmio_write8(uart + UART_IER, UART_IER_ERBFI);
+    mmio_write8(uart_regs + UART_LCR, UART_LCR_8N1);
+    mmio_write8(uart_regs + UART_IER, UART_IER_ERBFI);
+}
+
+void uart_map(void) {
+    uart_regs = ioremap(UART_BASE, PGSIZE);
 }
 
 void uart_putc(char c) {
@@ -46,9 +49,9 @@ void uart_putc(char c) {
      * panicking one no longer takes uart_tx_lock, so nothing else would
      * keep this byte out of its report. */
     panic_stop_others();
-    while ((mmio_read8(uart + UART_LSR) & UART_LSR_THRE) == 0) {
+    while ((mmio_read8(uart_regs + UART_LSR) & UART_LSR_THRE) == 0) {
     }
-    mmio_write8(uart + UART_THR, (u8)c);
+    mmio_write8(uart_regs + UART_THR, (u8)c);
 }
 
 void uart_puts(const char *s) {
@@ -67,16 +70,16 @@ void uart_putc_phys(char c) {
 void uart_intr(void) {
     /* Drain RBR until LSR.DR clears, which lowers the UART's interrupt line;
      * kernel_trap then completes the claim. */
-    while (mmio_read8(uart + UART_LSR) & UART_LSR_DR) {
+    while (mmio_read8(uart_regs + UART_LSR) & UART_LSR_DR) {
         if (rx_head - rx_tail == UART_RX_SIZE) {
             /* Full. Leaving the byte in RBR keeps the line high, so the
              * interrupt would fire again as soon as this one completes and the
              * console would never get to run: turn it off instead. */
             rx_stalled = true;
-            mmio_write8(uart + UART_IER, 0);
+            mmio_write8(uart_regs + UART_IER, 0);
             return;
         }
-        rx_buf[rx_head % UART_RX_SIZE] = mmio_read8(uart + UART_RBR);
+        rx_buf[rx_head % UART_RX_SIZE] = mmio_read8(uart_regs + UART_RBR);
         rx_head = rx_head + 1;
     }
 }
@@ -92,7 +95,7 @@ bool uart_rx_pop(char *c) {
          * at the first free byte, or a long paste would take one interrupt
          * per byte.) */
         rx_stalled = false;
-        mmio_write8(uart + UART_IER, UART_IER_ERBFI);
+        mmio_write8(uart_regs + UART_IER, UART_IER_ERBFI);
     }
     return true;
 }

@@ -374,8 +374,9 @@ grail --paging sv39 --harts 4 kernel/kernel-rv64.elf
   addresses; every hart turns paging on and jumps to the high address;
   `kvminit()` builds the final table, which drops the identity mapping.
 - All of RAM is in a direct map at `PAGE_OFFSET` (0xffff_af80_0000_0000 in
-  Sv48), the devices in a window at the start of the vmalloc area
-  (`ioremap()`), the kernel stacks after it. `pa()` and `va()` convert
+  Sv48); the kernel stacks at the start of the vmalloc area, then the
+  devices, mapped as their drivers ask (`ioremap()`, which finds them room,
+  as Linux's does); sysinfo and the UART in the fixmap for the boot. `pa()` and `va()` convert
   between kernel pointers and physical addresses, as Linux's `__pa` and
   `__va`: `kalloc()` returns direct-map pointers, and page tables, `satp`
   and the devices' DMA registers take physical ones.

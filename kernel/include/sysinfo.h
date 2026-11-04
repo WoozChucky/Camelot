@@ -77,13 +77,13 @@ struct sysinfo_device {
 };
 
 /* Where the block's registers are reached: SYSINFO_BASE, its physical
- * address, until kmain() maps it through ioremap() (sysinfo_map()). M-mode
- * reads it only once, on hart 0 before kmain (timer.c), and setup_vm() reads
- * it at its physical address itself. */
+ * address (M-mode reads it once, on hart 0 before kmain, timer.c, and so
+ * does setup_vm() with paging off); on RV64 the fixmap's page from setup_vm()
+ * on (vm.h); then its ioremap() mapping (sysinfo_map()). */
 extern uintptr sysinfo_regs;
 
-/* Points sysinfo_regs at the block's mapping in the kernel half. Once paging
- * is on, before anything else reads the block (on RV32 it changes nothing). */
+/* Points sysinfo_regs at the block's ioremap() mapping, once kvminit() has
+ * made ioremap() work (on RV32 it changes nothing). */
 void sysinfo_map(void);
 
 /* Reads 32-bit register `off`. */
