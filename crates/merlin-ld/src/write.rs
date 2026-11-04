@@ -867,8 +867,10 @@ _start:
     /// The room is for what ld.lld counts, not for what merlin-ld writes: no
     /// PT_RISCV_ATTRIBUTES without a `.riscv.attributes` (thrown away here),
     /// and a PT_LOAD for an empty run of sections, which ld.lld removes after
-    /// it has sized the table (so the table has room for 8 program headers
-    /// where ld.lld lists 6, and merlin-ld 5).
+    /// it has sized the table (so at 0x8000_0190 the table has room for 8
+    /// program headers, where ld.lld lists 7: PT_PHDR, the headers'
+    /// PT_LOAD, three more PT_LOADs, PT_GNU_STACK and PT_RISCV_ATTRIBUTES;
+    /// merlin-ld writes 5 of them).
     #[test]
     fn the_room_is_for_the_headers_ld_lld_counts() {
         let discard = "/DISCARD/ : { *(.riscv.attributes) }";
