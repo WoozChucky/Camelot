@@ -70,8 +70,14 @@ const CLOSE_WAIT: Duration = Duration::from_secs(2);
 /// screen whose VM ended, ping, or shut down.
 const POLL: Duration = Duration::from_millis(100);
 
-/// How long writing one message to the page may take.
+/// How long the page may take no part of what Pendragon writes before it is dropped:
+/// each [`WRITE_CHUNK`] must be taken within this of the one before, however long a
+/// whole frame takes (a full 1080p frame is nearly 8 MiB, slow over a slow link).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The unit of progress writing to the page: [`write_progressing`] hands the system
+/// at most this much at a time, each piece with its own [`WRITE_TIMEOUT`].
+const WRITE_CHUNK: usize = 16 * 1024;
 
 /// How long a detach waits for Avalon's answer before the session is closed anyway.
 const DETACH_WAIT: Duration = Duration::from_secs(2);
@@ -537,7 +543,7 @@ impl Page {
         if *closed {
             return Ok(());
         }
-        let sent = stream.write_all(frame).and_then(|()| stream.flush());
+        let sent = write_progressing(stream, frame);
         if sent.is_err() {
             *closed = true;
         }
@@ -564,9 +570,39 @@ impl Page {
         let payload = code.map(|c| close_payload(c, reason)).unwrap_or_default();
         let mut frame = frame_header(OP_CLOSE, payload.len());
         frame.extend_from_slice(&payload);
-        let _ = stream.write_all(&frame).and_then(|()| stream.flush());
+        let _ = write_progressing(stream, &frame);
         true
     }
+}
+
+/// Writes `bytes` to the page, [`WRITE_CHUNK`] at a time, each within
+/// [`WRITE_TIMEOUT`]: a page that reads slowly but reads is kept, one that stops is
+/// dropped. The socket's own timeout cannot say that alone, as it means different
+/// things: on Linux it bounds each wait for room in the socket's buffer, so a write
+/// times out only when nothing moves; on Windows it bounds the whole of a `send`, so
+/// a large frame to a slow page would time out while it moves. A deadline per chunk,
+/// the timeout set to what is left of it before each write, is the same on both.
+fn write_progressing(stream: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
+    for chunk in bytes.chunks(WRITE_CHUNK) {
+        let deadline = Instant::now() + WRITE_TIMEOUT;
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "the page takes nothing"));
+            }
+            // Set on the very handle written (on Windows a cloned handle keeps
+            // timeouts of its own).
+            stream.set_write_timeout(Some(left))?;
+            match stream.write(rest) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => rest = &rest[n..],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What the two threads of a screen share.
@@ -749,9 +785,6 @@ fn serve(
     closing_down: &AtomicBool,
 ) -> io::Result<()> {
     let page = ws.try_clone()?;
-    // Set on this handle too: on Windows a cloned socket handle keeps timeouts of its
-    // own. A page that takes no frame for this long is given up on.
-    page.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let shared = Arc::new(Shared {
         vm,
         page: Page {
